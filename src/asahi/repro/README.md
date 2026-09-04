@@ -160,10 +160,12 @@ That const/dynamic split matches the hardware behavior exactly:
 constant-shift forms compute correctly on the M1, dynamic-shift forms
 miscompile. HYPOTHESIS: `bfeil` with a register offset is broken on
 G13 - either the hardware does not support it the way the compiler
-assumes, or the encoding path for register offsets is wrong. The
-unsigned bitfield extract") suggests the constant-only assumption was
-known when the signed lowering was written (1636037b664, 2023-05-20);
-`fuse_ubfe` postdates that constraint (7193849f302, 2023-10-01).
+assumes, or the encoding path for register offsets is wrong. This is
+inference from the lowering shape plus the receipts; it is not a
+documented upstream limitation, and the in-tree comment about constant
+bitfield extracts (agx_nir_algebraic.py:81) is about constant WIDTH,
+not constant offset. `fuse_ubfe` fuses dynamic offsets with constant
+width by design ("get the win everywhere", 7193849f302).
 
 If this hypothesis is right, the minimal change is to gate `fuse_ubfe`
 to constant offsets, leaving `ushr + iand`, which lowers to the
@@ -183,8 +185,9 @@ load path.
 
 Capturing the miscompiled ISA on Apple hardware settles it: run any
 case under the Honeykrisp driver with `AGX_DEBUG=shaders` to dump NIR
-and AGX IR for the case shaders (the flag is wired in
-src/asahi/vulkan/hk_shader.c via src/asahi/compiler/agx_debug.c), and
+and AGX IR for the case shaders (the flag is the compiler's debug
+option list in src/asahi/compiler/agx_debug.c, applied by the Vulkan
+driver at shader compile time in src/asahi/vulkan/hk_shader.c), and
 compare the dynamic-shift dispatch against the constant-shift control
 in the same run. The case pair to diff is arm A against arm C, or case
 5 against a constant-shift variant.
