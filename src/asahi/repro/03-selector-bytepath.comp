@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 #version 450
 /*
  * Case 3, arms A/C - per-byte bool AND with a wide op selector.

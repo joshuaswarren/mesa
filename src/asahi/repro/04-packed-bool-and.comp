@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 #version 450
 /*
  * Case 4 - shift-then-mask byte extraction corrupting packed bool

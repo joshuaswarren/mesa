@@ -18,7 +18,7 @@ by CI. glslangValidator compiles the shaders; the harness in vk.c and
 repro.c is about 500 lines and does one dispatch per arm.
 
 Verification of record for this branch: llvmpipe (Mesa LLVM 15.0.6,
-Vulkan 1.3.230), all eleven case arms PASS, exit 0.
+Vulkan 1.3.230), all nine case runs pass (eleven PASS checks), exit 0.
 
 ## The five defects
 
@@ -196,7 +196,7 @@ in the same run. The case pair to diff is arm A against arm C, or case
   in /tmp on the M1 and are not preserved; these shaders are
   reconstructions of the documented probe shapes, not copies.
 - Verified here only on llvmpipe (Mesa LLVM 15.0.6, Vulkan 1.3.230):
-  all eleven case arms pass, exit 0. llvmpipe computing the expected
+  all nine case runs pass (eleven PASS checks), exit 0. llvmpipe computing the expected
   values proves the shaders and checks are correct on a conformant
   driver; it proves nothing about Honeykrisp, which is exactly the
   point - every observed failure above was invisible on llvmpipe.
