@@ -1,4 +1,9 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT  * Hardware verdict (jwm1, 1.4.354, 2026-09-03): DOES NOT
+ * REPRODUCE - 33/33 correct, three identical passes, while the
+ * same construct in case 3 arm B's shape fails on the same build.
+ * The receipts predicted this context sensitivity; kept and
+ * labeled per the README's misses paragraph.
+*/
 #version 450
 /*
  * Case 4 - shift-then-mask byte extraction corrupting packed bool

@@ -1,4 +1,9 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT  * Hardware verdict (jwm1, 1.4.354, 2026-09-03): DOES NOT
+ * REPRODUCE - copy matches all 200 words, three identical passes.
+ * Either the reconstruction lost the original probe's trigger or the
+ * load defect was fixed; the run cannot separate these. Kept and
+ * labeled per the README's misses paragraph.
+*/
 #version 450
 /*
  * Case 1 - SSBO word loads inside a multi-iteration grid-stride loop.

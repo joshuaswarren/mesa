@@ -1,9 +1,11 @@
 Standalone reproductions for five Honeykrisp shader miscompiles.
 
 Each case is a Vulkan compute shader plus a check that runs on any
-Vulkan 1.1 device. On conformant drivers all cases pass. On the affected
-Honeykrisp build they fail with the wrong values listed below, which the
-mlx-omarchy project measured on real Apple M1 hardware.
+Vulkan 1.1 device. On conformant drivers all cases pass. On Apple M1
+under Honeykrisp (Vulkan API 1.4.354, 2026-09-03, three identical
+passes per case), cases 2, 3, and 5 reproduce with the signatures the
+mlx-omarchy project measured, and cases 1 and 4 do not reproduce -
+both outcomes are reported below and in each case header.
 
 Build and run:
 
@@ -31,23 +33,46 @@ Vulkan 1.3.230), all nine case runs pass (eleven PASS checks), exit 0.
 | 5 | 05-reduce-load-truthy | the same dynamic shift in reduce_general's load_truthy | reduce == 1 over all-true input | reduce == 0 from n >= 5; mx.any drops a True at index >= 4 |
 
 Every case file carries the same information in its header comment,
-with the receipt that recorded the observed values.
+with the receipt that recorded the observed values, plus the hardware
+verdict from the run below.
 
-## Hardware and driver
+## Hardware verdicts (2026-09-03)
 
-All observed values come from the mlx-omarchy project's receipts,
-measured on one machine: jwm1-linux, Apple M1 (G13G B1, 8 GB), running
-Omarchy with Mesa's Honeykrisp Vulkan driver.
+Run by the mlx-omarchy project on jwm1 (Apple M1, G13G B1), Mesa
+Honeykrisp, Vulkan API 1.4.354, three passes per case, byte-identical
+across passes. Raw logs: ~/benchq/logs/mesa-pass{1,2,3}.log on that
+machine; AGX_MESA_DEBUG=shaders dumps for every case in
+~/benchq/logs/mesa-dump-case{1,2,3,4,5,50}.log.
 
-- Cases 1 and 4: Vulkan API 1.4.354 per the receipts. The 2026-09-02
-  receipts disagree with each other (1.4.354 in one, 1.4.357 in
-  another, both dated the same day), so the exact driver build per case
-  is uncertain. Case 2: 1.4.357 per its receipt. Case 5: no API version
-  recorded.
-- The mlx-omarchy receipts do not record the Mesa commit. The defects
-  are present in the 1.4.354/1.4.357 builds shipped by Omarchy in
-  August/September 2026. Nobody has re-run these exact shaders on
-  Apple hardware yet; that is the first thing to do with this branch.
+| Case | Verdict | Observed on hardware |
+| ---- | ------- | -------------------- |
+| 1 word load | does NOT reproduce | copy matches all 200 words |
+| 2 scan | REPRODUCES | out[255] == 32; 252/256 wrong |
+| 3 arm A (selector + dynamic shift) | REPRODUCES | 24/33 wrong (got 0, want 1) |
+| 3 arm B (no selector + dynamic shift) | REPRODUCES | 24/33 wrong, identical to arm A |
+| 3 arm C (selector + constant shift) | PASS | 33/33 correct |
+| 3 arm D (no selector + constant shift) | PASS | 33/33 correct |
+| 4 packed bool AND | does NOT reproduce | 33/33 correct |
+| 5 reduce n=64 | REPRODUCES | reduce[0] == 0; 48/64 truthy reads wrong |
+| 5 reduce n=33 | REPRODUCES | 24/33 wrong; truthy correct only at 0-3 and 16-19, matching the recorded map |
+
+Two readings on each miss, and we cannot separate them from this run:
+
+- Case 1: either the reconstruction lost the trigger (the original
+  probe's exact shape is not preserved), or the driver fixed the load
+  defect. Cases 2/5 still failing on the same build says the extraction
+  family is alive; it says nothing about the separate load path.
+- Case 4: the same construct DOES fail in arm B's shape (case 3) on
+  the same build, so the extraction defect is real here; this kernel
+  shape computes correctly. The receipts warned that byte-extraction
+  sites are shape- and context-sensitive on this hardware; case 4 is
+  the demonstration. The receipt's 13/33 signature came from the full
+  logical_or.comp shader, not from this reduced form.
+
+The receipts' observed values in the table above were measured on the
+1.4.354/1.4.357 builds of August/September 2026; those receipts do not
+record the Mesa commit, and the same-day receipts disagree on the API
+version (1.4.354 vs 1.4.357). Today's build reports 1.4.354.
 
 ## What each defect shipped as a workaround
 
@@ -82,64 +107,66 @@ same hardware, and the affected suite goes green.
    Commit: https://github.com/joshuaswarren/mlx-omarchy/commit/cf68e7dedf5c6c86428c77e3c86cddde0ca0091b
    Probe artifacts: https://github.com/joshuaswarren/mlx-omarchy/tree/main/receipts/boolall-2026-09-03
 
-## The family claim: hypothesis, with a named confound
+## The family claim: confirmed on device for these shaders
 
-CLAIM (hypothesis): cases 2, 4, and 5 are one defect - Honeykrisp
-miscompiles dynamic byte extraction, a shift by a data-dependent amount
-feeding a mask. Case 3 is "observed with" the family, not proven part
-of it. Case 1 has a different signature.
+CLAIM: cases 2, 3, and 5 are one defect - Honeykrisp miscompiles
+dynamic byte extraction, a shift by a data-dependent amount feeding a
+mask. The claim now rests on paired controls run in THIS directory's
+shaders on the affected hardware, not only on mlx-omarchy's kernels:
+on jwm1 (2026-09-03), arms A and B (dynamic shift, with and without
+the wide selector) both fail 24/33 identically, while arms C and D
+(constant-shift chain) compute 33/33 correctly on the same device in
+the same runs.
 
-Evidence for the claim, strongest first:
+Evidence, strongest first:
 
-- Cases 4 and 5 hold everything constant except the extraction form and
-  swap results: dynamic shift wrong, constant-shift select chain
-  correct, on the same device, in repeated runs. That is an A/B result,
-  not a correlation.
+- The case 3 matrix resolves its own confound. Arms A and B failing
+  identically means the wide selector is neither necessary nor the
+  trigger: the dynamic shift alone explains both. Arms C and D passing
+  on the same device and run is the paired-control A/B result for the
+  extraction hypothesis in these exact shaders.
 - Case 2 pins the shift amount itself: the input word is a constant
-  0x00010001 in every variant, so the input cannot be the variable. The
-  same scan fed by constant shifts computes 128 correctly; fed by the
-  dynamic shift it computes 32.
-- Case 5's fix was applied without any other change to the reduction
-  and turned 85 of 366 failing boundary checks into 0, twice on device.
-  The cause is pinned per the workaround, not guessed.
+  0x00010001 in every variant, so the input cannot be the variable. On
+  hardware the scan produces 32, the receipt's window-64 signature.
+- Case 5 reproduces with the recorded 33-element map: truthy reads
+  correct only at positions 0-3 and 16-19, falsy elsewhere. The
+  raw-word control in the same run matches the input, so the buffer
+  content is correct and the reads are what fail.
+- mlx-omarchy's original A/B results stand: in cases 4 and 5's
+  kernels, swapping only the extraction form flipped suite results,
+  repeated on device.
 
-The named confound, and why case 3 is demoted:
+Honest misses, reported not dropped:
 
-- The original evidence for case 3 is a pair: a wide-selector shader
-  was red and a selector-free control was green. But the control shared
-  the same dynamic byte extraction, so if the extraction alone
-  miscompiles, both results are explained without any selector effect.
-  The same mlx-omarchy commit also fixed an unrelated
-  output-initialization defect (missing ClearU32 before atomicOr),
-  which poisoned composed bool operations on its own.
-- Case 3 therefore ships as a four-arm matrix instead of a claim. Arms
-  A and C run under the wide selector with dynamic and constant
-  extraction; arms B and D run selector-free with the same two
-  extractions. The decision table is in the shader header. Running the
-  matrix on affected hardware either separates the selector from the
-  shift or collapses case 3 into the family; both outcomes sharpen the
-  picture, and no outcome is claimed in advance.
+- Case 4 does not reproduce on this build, while the same construct
+  in arm B's shape does. The receipts predicted exactly this:
+  byte-extraction sites on this hardware are shape- and
+  context-sensitive, and no form is safe by default. Case 4 is kept
+  as the demonstration of that context sensitivity, and as a
+  re-derivation target.
+- Case 1 does not reproduce. Either the reconstruction lost the
+  original probe's trigger or the load defect was fixed; the run
+  cannot separate these. Cases 2 and 5 still failing on the same
+  build says the extraction family is alive, and case 1 was always a
+  separate signature.
 
-What we cannot claim:
+What we still cannot claim:
 
-- One single compiler-level origin is NOT established by the receipts.
-  The A/B results prove the trigger construct per site. They do not
-  prove the compiler folds all sites through one faulty path.
-- Case 5's recorded 33-element map shows truthy reads correct exactly
-  at positions 0-3 and 16-19 - the words whose byte addresses are
-  16-byte aligned - and falsy elsewhere. That is case 1's signature
-  (word loads read correctly only at 16-byte-aligned addresses)
-  appearing inside case 5's extraction defect. Two readings fit: the
-  extraction defect and the load defect share a deeper origin in
-  addressing, or two distinct defects produce matching shadows at this
-  shape. A single-shader probe crossing load alignment against shift
-  dynamicness, per word, would separate them.
+- One single compiler-level origin is named only as a hypothesis (next
+  section). The A/B results prove the trigger construct per shader,
+  not that the compiler folds them through one faulty path.
+- Case 5's hardware map (correct only at the 16-byte-aligned words)
+  echoes case 1's signature inside case 5's extraction defect. Whether
+  the two share a deeper origin in addressing remains open; the
+  single-shader probe crossing load alignment against shift
+  dynamicness would settle it.
 
 Falsification: any case that miscompiles with a dynamic shift but
 computes correctly when the SAME value reaches it through a
 constant-shift select chain would refute the extraction hypothesis for
-that case. The mlx-omarchy receipts report the opposite result at every
-site probed so far.
+that case. Every probed site so far reports the opposite result - the
+mlx-omarchy receipts across their kernels, and arms C/D of this branch
+on jwm1 today.
 
 ## Where the origin may live in Mesa: one hypothesis, no patch
 
@@ -158,14 +185,19 @@ hardware `bfeil` for that. So in Mesa:
 
 That const/dynamic split matches the hardware behavior exactly:
 constant-shift forms compute correctly on the M1, dynamic-shift forms
-miscompile. HYPOTHESIS: `bfeil` with a register offset is broken on
+miscompile - now measured in this directory's own shaders, not only in
+the receipts. HYPOTHESIS: `bfeil` with a register offset is broken on
 G13 - either the hardware does not support it the way the compiler
 assumes, or the encoding path for register offsets is wrong. This is
-inference from the lowering shape plus the receipts; it is not a
-documented upstream limitation, and the in-tree comment about constant
-bitfield extracts (agx_nir_algebraic.py:81) is about constant WIDTH,
-not constant offset. `fuse_ubfe` fuses dynamic offsets with constant
-width by design ("get the win everywhere", 7193849f302).
+inference from the lowering shape plus the hardware results; it is not
+a documented upstream limitation, and the in-tree comment about
+constant bitfield extracts (agx_nir_algebraic.py:81) is about constant
+WIDTH, not constant offset. `fuse_ubfe` fuses dynamic offsets with
+constant width by design ("get the win everywhere", 7193849f302). The
+AGX_MESA_DEBUG=shaders dumps captured alongside the hardware run can
+confirm or kill this directly: if the failing dynamic-shift paths
+carry `bfeil` with a register offset while the passing constant-shift
+paths use an immediate, the hypothesis is confirmed at the ISA level.
 
 If this hypothesis is right, the minimal change is to gate `fuse_ubfe`
 to constant offsets, leaving `ushr + iand`, which lowers to the
@@ -183,15 +215,14 @@ contribution. Case 1 (word loads) is NOT explained by this hypothesis;
 it has no shift, and its 16-byte alignment signature points at the
 load path.
 
-Capturing the miscompiled ISA on Apple hardware settles it: run any
-case under the Honeykrisp driver with `AGX_MESA_DEBUG=shaders` to dump
-NIR and AGX IR for the case shaders (the option list and the
-`AGX_MESA_DEBUG` lookup live in src/asahi/compiler/agx_compile.c; the
-Vulkan driver applies the flags at shader compile time in
-src/asahi/vulkan/hk_shader.c), and
-compare the dynamic-shift dispatch against the constant-shift control
-in the same run. The case pair to diff is arm A against arm C, or case
-5 against a constant-shift variant.
+Capturing the miscompiled ISA settles the origin hypothesis: the
+hardware run above already captured AGX_MESA_DEBUG=shaders dumps for
+every case (paths in the Hardware verdicts section). Diffing arm A
+against arm C, or case 5 against a constant-shift variant, shows
+whether the failing dynamic-shift paths carry bfeil with a register
+offset. The flag is the compiler's debug option list in
+src/asahi/compiler/agx_compile.c; the Vulkan driver applies it at
+shader compile time in src/asahi/vulkan/hk_shader.c.
 
 ## Provenance and limits
 
@@ -199,11 +230,13 @@ in the same run. The case pair to diff is arm A against arm C, or case
   from its receipts. The original probe programs were throwaway files
   in /tmp on the M1 and are not preserved; these shaders are
   reconstructions of the documented probe shapes, not copies.
-- Verified here only on llvmpipe (Mesa LLVM 15.0.6, Vulkan 1.3.230):
-  all nine case runs pass (eleven PASS checks), exit 0. llvmpipe computing the expected
-  values proves the shaders and checks are correct on a conformant
-  driver; it proves nothing about Honeykrisp, which is exactly the
-  point - every observed failure above was invisible on llvmpipe.
-- Case 3's observed column is the weakest: see the confound section.
-- The driver versions and the wrong values are quoted from the
-  receipts. Nothing on this branch has been run on Apple hardware.
+- Verified on llvmpipe (Mesa LLVM 15.0.6, Vulkan 1.3.230): all nine
+  case runs pass (eleven PASS checks), exit 0, proving the shaders and
+  checks are correct on a conformant driver.
+- Verified on Apple M1 under Honeykrisp (Vulkan API 1.4.354) on
+  2026-09-03: cases 2, 3, and 5 reproduce with the receipt signatures;
+  cases 1 and 4 do not reproduce, and are kept and labeled as misses
+  with both readings. See "Hardware verdicts" above.
+- The receipts' driver versions and wrong values are quoted from the
+  mlx-omarchy receipts; the 2026-09-03 hardware verdicts were measured
+  by this project on jwm1 and are quoted from that run's logs.

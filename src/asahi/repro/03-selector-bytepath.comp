@@ -1,4 +1,8 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: MIT  * Hardware verdict (jwm1, 1.4.354, 2026-09-03): arm A REPRODUCES
+ * (24/33 wrong, got 0 want 1); arm C PASSES 33/33, same device and
+ * run, three identical passes. The dynamic shift alone is the
+ * trigger; the selector is not causal.
+*/
 #version 450
 /*
  * Case 3, arms A/C - per-byte bool AND with a wide op selector.
