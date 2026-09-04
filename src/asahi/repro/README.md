@@ -184,10 +184,11 @@ it has no shift, and its 16-byte alignment signature points at the
 load path.
 
 Capturing the miscompiled ISA on Apple hardware settles it: run any
-case under the Honeykrisp driver with `AGX_DEBUG=shaders` to dump NIR
-and AGX IR for the case shaders (the flag is the compiler's debug
-option list in src/asahi/compiler/agx_debug.c, applied by the Vulkan
-driver at shader compile time in src/asahi/vulkan/hk_shader.c), and
+case under the Honeykrisp driver with `AGX_MESA_DEBUG=shaders` to dump
+NIR and AGX IR for the case shaders (the option list and the
+`AGX_MESA_DEBUG` lookup live in src/asahi/compiler/agx_compile.c; the
+Vulkan driver applies the flags at shader compile time in
+src/asahi/vulkan/hk_shader.c), and
 compare the dynamic-shift dispatch against the constant-shift control
 in the same run. The case pair to diff is arm A against arm C, or case
 5 against a constant-shift variant.
