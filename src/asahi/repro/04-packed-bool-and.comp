@@ -25,12 +25,16 @@
  * here are all-true, so every output byte must be 1. Verified on
  * llvmpipe.
  *
- * Observed on jwm1 (Apple M1, G13G B1, Mesa Honeykrisp, per receipt
- * Vulkan API 1.4.354): 13 of 33 output bytes wrong in the LogicalAnd
- * case through the original shader. The shipped workaround replaced the
- * dynamic shift with four constant shifts picked by a select chain
- * (BYTE_AT), which turned the suite green on device, three repeated
- * runs.
+ * Receipt (mlx-omarchy, jwm1, Apple M1, G13G B1, Mesa Honeykrisp,
+ * per receipt Vulkan API 1.4.354): 13 of 33 output bytes wrong in the
+ * LogicalAnd case through the original shader. The shipped workaround
+ * replaced the dynamic shift with four constant shifts picked by a
+ * select chain (BYTE_AT), which turned the suite green on device,
+ * three repeated runs.
+ * 2026-09-03 verdict on jwm1 (same API string): DOES NOT REPRODUCE in
+ * this reduced shape - 33/33 correct - while the same construct in
+ * case 3 arm B's shape fails on the same build. The receipts'
+ * context-sensitivity warning, demonstrated.
  */
 
 layout(local_size_x = 32) in;

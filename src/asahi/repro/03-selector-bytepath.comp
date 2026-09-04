@@ -12,8 +12,12 @@
  * whose wide op selector dispatches many operations over a per-byte
  * packed-bool path. The fix moved them to a selector-free shader. The
  * receipt records suite-level reds, not per-byte values, and the same
- * commit also fixed an unrelated output-initialization defect, so this
- * case claims "observed with", not "caused by".
+ * commit also fixed an unrelated output-initialization defect, so the
+ * original evidence could not separate the selector from the shift.
+ * The 2026-09-03 hardware matrix settles it: arms A and B (dynamic
+ * shift, with and without the selector) fail identically, arms C and
+ * D (constant shift) pass - the dynamic shift alone is causal, and
+ * the selector is not.
  *
  * The shader holds two variables behind push constants:
  *   const_shift = 0: byte extraction with a data-dependent shift

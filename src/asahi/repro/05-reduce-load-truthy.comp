@@ -26,7 +26,7 @@
  * inputs, out_reduce == 1 and every out_truthy[i] == 1. Verified on
  * llvmpipe.
  *
- * Observed on jwm1 (Apple M1, G13G B1, Mesa Honeykrisp; exact API
+ * Receipt (mlx-omarchy, jwm1, Apple M1, G13G B1, Mesa Honeykrisp; exact API
  * version not recorded in the receipt): mx.all returned False for
  * all-true input at every n >= 5, mx.any dropped a lone True at index 4
  * or beyond, and (2, n) axis reductions broke from n = 3. The recorded

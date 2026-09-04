@@ -17,8 +17,8 @@
  * Expected: out[lane] = lane / 2 + 1; out[255] == 128.
  * Verified on llvmpipe.
  *
- * Observed on jwm1 (Apple M1, G13G B1, Mesa Honeykrisp, Vulkan API
- * 1.4.357): out[255] == 32, exactly a window-64 scan - the later
+ * Receipt (mlx-omarchy, jwm1, Apple M1, G13G B1, Mesa Honeykrisp,
+ * Vulkan API 1.4.357): out[255] == 32, exactly a window-64 scan - the later
  * Hillis-Steele steps stop propagating. The receipt proved the trigger is
  * the dynamic shift itself: the same scan fed by constant per-lane shifts
  * dispatched through an if/else chain, a byte-table select, or a uvec4

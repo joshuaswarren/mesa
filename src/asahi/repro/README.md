@@ -24,13 +24,13 @@ Vulkan 1.3.230), all nine case runs pass (eleven PASS checks), exit 0.
 
 ## The five defects
 
-| # | Case | Trigger | Expected | Observed on M1 |
-| - | ---- | ------- | -------- | -------------- |
-| 1 | 01-word-load-divergent-loop | SSBO word load hoisted into a multi-iteration grid-stride loop | out[w] == in[w] for 200 words | only words with (w & 3) == 0 read back; the rest read 0 |
-| 2 | 02-scan-dynamic-shift | data-dependent shift `(w >> ((lane & 3) * 8)) & 0xFF` feeding a shared-memory Hillis-Steele scan | out[255] == 128 | out[255] == 32, a window-64 scan; later steps stop propagating |
-| 3 | 03 matrix, arms A-D | bool comparison under a wide op selector over a per-byte path | all 33 outputs == 1 in every arm | suite-level wrong values in the combined shader; exact wrong bytes not recorded |
-| 4 | 04-packed-bool-and | the same dynamic shift in packed-bool logical AND | all 33 outputs == 1 | 13 of 33 bytes wrong; 15 of 33 against a scalar true |
-| 5 | 05-reduce-load-truthy | the same dynamic shift in reduce_general's load_truthy | reduce == 1 over all-true input | reduce == 0 from n >= 5; mx.any drops a True at index >= 4 |
+| # | Case | Trigger | Expected | Receipt (mlx-omarchy) | Verdict 2026-09-03 |
+| - | ---- | ------- | -------- | --------------------- | ------------------ |
+| 1 | 01-word-load-divergent-loop | SSBO word load hoisted into a multi-iteration grid-stride loop | out[w] == in[w] for 200 words | only words with (w & 3) == 0 read back; the rest read 0 | does NOT reproduce |
+| 2 | 02-scan-dynamic-shift | data-dependent shift `(w >> ((lane & 3) * 8)) & 0xFF` feeding a shared-memory Hillis-Steele scan | out[255] == 128 | out[255] == 32, a window-64 scan; later steps stop propagating | REPRODUCES (252/256 wrong) |
+| 3 | 03 matrix, arms A-D | dynamic byte extraction under a per-byte path; selector ruled out by arms A/B vs C/D | all 33 outputs == 1 in every arm | suite-level wrong values in the combined shader; exact wrong bytes not recorded | A and B REPRODUCE (24/33); C and D PASS |
+| 4 | 04-packed-bool-and | the same dynamic shift in packed-bool logical AND | all 33 outputs == 1 | 13 of 33 bytes wrong; 15 of 33 against a scalar true | does NOT reproduce |
+| 5 | 05-reduce-load-truthy | the same dynamic shift in reduce_general's load_truthy | reduce == 1 over all-true input | reduce == 0 from n >= 5; mx.any drops a True at index >= 4 | REPRODUCES (receipt map exact) |
 
 Every case file carries the same information in its header comment,
 with the receipt that recorded the observed values, plus the hardware
@@ -76,10 +76,14 @@ version (1.4.354 vs 1.4.357). Today's build reports 1.4.354.
 
 ## What each defect shipped as a workaround
 
-mlx-omarchy works around all five in its own shaders. The workarounds
-are the evidence that each trigger is real: each one swaps the
-miscompiling construct for a construct that computes correctly on the
-same hardware, and the affected suite goes green.
+mlx-omarchy works around all five in its own shaders. For cases 2, 3,
+and 5 the workarounds double as on-device evidence verified in this
+directory: the dynamic-shift arm fails and the constant-shift control
+computes correctly on the same device and run. For cases 1 and 4 the
+receipts show the suite going green after the workaround, but these
+reduced standalone shaders do not fire on the 2026-09-03 build, so
+for them the workaround evidence lives in the original kernels, not
+here.
 
 1. One straight-line word load per thread at the top of the function,
    byte skew for misalignment, no loop-carried loads. The probe ladder
@@ -166,7 +170,10 @@ computes correctly when the SAME value reaches it through a
 constant-shift select chain would refute the extraction hypothesis for
 that case. Every probed site so far reports the opposite result - the
 mlx-omarchy receipts across their kernels, and arms C/D of this branch
-on jwm1 today.
+on jwm1 today. One boundary on the claim: case 4 shows a reduced
+dynamic-shift shape that does NOT miscompile on this build, so the
+defect is shape- and context-sensitive, not a blanket property of
+every dynamic shift on the device.
 
 ## Where the origin may live in Mesa: one hypothesis, no patch
 

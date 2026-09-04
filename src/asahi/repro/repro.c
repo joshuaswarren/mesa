@@ -38,7 +38,8 @@ fill_inputs(void)
 static bool
 check1(const struct hk_case *c, const uint32_t *out[HK_MAX_SSBOS])
 {
-   printf("  observed on M1: out[w] == 0 unless (w & 3) == 0\n");
+   printf("  receipt: out[w] == 0 unless (w & 3) == 0;\n"
+          "  2026-09-03 on jwm1: does not reproduce\n");
    return hk_check_words("copy", out[1], c->data[0], 200);
 }
 
@@ -51,7 +52,8 @@ check2(const struct hk_case *c, const uint32_t *out[HK_MAX_SSBOS])
    uint32_t want[256];
    for (unsigned i = 0; i < 256; i++)
       want[i] = i / 2u + 1u;
-   printf("  observed on M1: out[255] == 32 (window-64 scan)\n");
+   printf("  observed on jwm1 2026-09-03: out[255] == 32\n"
+          "  (window-64 scan, 252/256 wrong, three identical passes)\n");
    return hk_check_words("scan", out[0], want, 256);
 }
 
@@ -80,8 +82,8 @@ check4(const struct hk_case *c, const uint32_t *out[HK_MAX_SSBOS])
    uint32_t want[33];
    for (unsigned i = 0; i < 33; i++)
       want[i] = 1u;
-   printf("  observed on M1: 13 of 33 bytes wrong (LogicalAnd case),\n"
-          "  15 of 33 against a scalar true\n");
+   printf("  receipt: 13 of 33 bytes wrong (LogicalAnd case);\n"
+          "  2026-09-03 on jwm1: does not reproduce in this shape\n");
    return hk_check_words("and", out[2], want, 33);
 }
 
@@ -94,9 +96,8 @@ check_reduce(const struct hk_case *c, const uint32_t *out[HK_MAX_SSBOS])
    uint32_t words = (n + 3u) / 4u;
    bool ok = true;
 
-   printf("  observed on M1: reduce == 0 for all-true input at n >= 5;\n"
-          "  33-element map: truthy reads correct only at positions 0-3\n"
-          "  and 16-19, falsy elsewhere\n");
+   printf("  observed on jwm1 2026-09-03: reduce == 0; n=33 map matches\n"
+          "  the receipt exactly (truthy correct only at 0-3 and 16-19)\n");
 
    if (out[1][0] != 1u) {
       printf("  reduce[0]: got %u, want 1\n", out[1][0]);

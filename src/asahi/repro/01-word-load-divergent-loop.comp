@@ -25,9 +25,12 @@
  *
  * Expected: out[w] == in[w] for all 200 words. Verified on llvmpipe.
  *
- * Observed on jwm1 (Apple M1, G13G B1, Mesa Honeykrisp, Vulkan API
- * 1.4.354): only words whose byte address is 16-byte aligned read back,
- * that is words with (w & 3) == 0. Every other word reads 0.
+ * Receipt (mlx-omarchy, jwm1, Apple M1, G13G B1, Mesa Honeykrisp,
+ * Vulkan API 1.4.354): only words whose byte address is 16-byte
+ * aligned read back, that is words with (w & 3) == 0. Every other
+ * word reads 0.
+ * 2026-09-03 verdict on jwm1 (same API string): DOES NOT REPRODUCE -
+ * the copy matches all 200 words. See the README's misses paragraph.
  */
 
 layout(local_size_x = 64) in;
