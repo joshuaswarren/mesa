@@ -1,0 +1,60 @@
+#version 450
+/*
+ * Case 3, arm B/D - the same per-byte bool AND, no wide selector.
+ *
+ * This is the shape the mlx-omarchy fix shipped (compare_bool.comp):
+ * the comparison lives in a shader with no wide op selector. Pair it
+ * with 03-selector-bytepath.comp; the two arms of this file share the
+ * push-constant protocol. See the decision table in that file's header.
+ *
+ *   const_shift = 0: arm B - dynamic-shift extraction, selector-free
+ *                      (the receipt's green control)
+ *   const_shift = 1: arm D - constant-shift chain, selector-free
+ *                      (baseline of known-good constructs)
+ *
+ * Expected on any conformant driver (verified on llvmpipe, both arms):
+ * out[i] == 1 for all 33 elements, all-true inputs.
+ */
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Push {
+   uint const_shift; /* 0 = dynamic shift, 1 = constant-shift chain */
+   uint op;          /* unused here; layout matches the selector shader */
+   uint n;
+   uint pad;
+};
+
+layout(set = 0, binding = 0) buffer A { uint a_words[]; };
+layout(set = 0, binding = 1) buffer B { uint b_words[]; };
+layout(set = 0, binding = 2) buffer Out { uint out_byte[]; };
+
+uint
+byte_dyn(uint w, uint i)
+{
+   return (w >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+uint
+byte_const(uint w, uint i)
+{
+   uint b = i & 3u;
+   return b == 0u ? (w & 0xFFu)
+                  : (b == 1u ? ((w >> 8u) & 0xFFu)
+                             : (b == 2u ? ((w >> 16u) & 0xFFu)
+                                        : ((w >> 24u) & 0xFFu)));
+}
+
+void
+main()
+{
+   uint g = gl_GlobalInvocationID.x;
+   for (uint i = g; i < n; i += 64u) {
+      uint pick = const_shift;
+      uint ba = pick == 0u ? byte_dyn(a_words[i >> 2u], i)
+                           : byte_const(a_words[i >> 2u], i);
+      uint bb = pick == 0u ? byte_dyn(b_words[i >> 2u], i)
+                           : byte_const(b_words[i >> 2u], i);
+      out_byte[i] = (ba != 0u && bb != 0u) ? 1u : 0u;
+   }
+}

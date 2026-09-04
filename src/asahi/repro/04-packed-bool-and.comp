@@ -1,0 +1,47 @@
+#version 450
+/*
+ * Case 4 - shift-then-mask byte extraction corrupting packed bool
+ * logical AND.
+ *
+ * mlx-omarchy receipt: 2026-09-02-m1-red-suites-root-cause.md, "Root
+ * cause 2" (commit 959c7a0): the same construct as case 2 survived in
+ * four more shaders. In logical_or.comp it corrupted 13 of 33 bytes in
+ * the 33-element LogicalAnd case, and 15 of 33 against a scalar true.
+ * In scatter.comp ops 1/6/7 it dropped two of six word-lane bool scatter
+ * writes. In select.comp's float path it picked the wrong operand.
+ *
+ * Computes: element-wise logical AND of two arrays of 33 packed bools
+ * (4 per 32-bit word, 9 words). Each element's byte is extracted with a
+ * data-dependent shift, exactly the construct from the receipts:
+ *   b = (word[i >> 2] >> ((i & 3) * 8)) & 0xFF
+ *
+ * Expected: out[i] == 1 exactly when both input bits are 1. The inputs
+ * here are all-true, so every output byte must be 1. Verified on
+ * llvmpipe.
+ *
+ * Observed on jwm1 (Apple M1, G13G B1, Mesa Honeykrisp, per receipt
+ * Vulkan API 1.4.354): 13 of 33 output bytes wrong in the LogicalAnd
+ * case through the original shader. The shipped workaround replaced the
+ * dynamic shift with four constant shifts picked by a select chain
+ * (BYTE_AT), which turned the suite green on device, three repeated
+ * runs.
+ */
+
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0) buffer A { uint a_words[]; };
+layout(set = 0, binding = 1) buffer B { uint b_words[]; };
+layout(set = 0, binding = 2) buffer Out { uint out_byte[]; };
+
+void
+main()
+{
+   const uint n = 33u;
+   uint g = gl_GlobalInvocationID.x;
+   for (uint i = g; i < n; i += 32u) {
+      uint sh = (i & 3u) * 8u;
+      uint ba = (a_words[i >> 2u] >> sh) & 0xFFu;
+      uint bb = (b_words[i >> 2u] >> sh) & 0xFFu;
+      out_byte[i] = (ba != 0u && bb != 0u) ? 1u : 0u;
+   }
+}

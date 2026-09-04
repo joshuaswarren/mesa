@@ -1,0 +1,94 @@
+#version 450
+/*
+ * Case 5 - the same dynamic byte extraction inside reduce_general's
+ * load_truthy.
+ *
+ * mlx-omarchy commits cf68e7d (fix), 132bb0f (hardware map), and the
+ * receipts/boolall-2026-09-03/ probe artifacts.
+ *
+ * Computes: a whole-array logical AND (mx.all) over n packed bools, with
+ * the load written the way reduce_general.comp's load_truthy was
+ * written before the fix:
+ *   bool load_truthy(uint i) {
+ *      uint w = in_words[i >> 2];
+ *      return ((w >> ((i & 3u) * 8u)) & 0xFFu) != 0u;
+ *   }
+ * Each thread combines a strided subset sequentially in a loop, then a
+ * shared-memory tree ANDs the 64 lanes. The shader also dumps every
+ * element's truthy read and the raw input words, so a failing device can
+ * be mapped element by element.
+ *
+ * Expected (two runs from the host): for the all-true n=64 and n=33
+ * inputs, out_reduce == 1 and every out_truthy[i] == 1. Verified on
+ * llvmpipe.
+ *
+ * Observed on jwm1 (Apple M1, G13G B1, Mesa Honeykrisp; exact API
+ * version not recorded in the receipt): mx.all returned False for
+ * all-true input at every n >= 5, mx.any dropped a lone True at index 4
+ * or beyond, and (2, n) axis reductions broke from n = 3. The recorded
+ * 33-element hardware map showed truthy reads correct only at positions
+ * 0-3 and 16-19 - the words whose byte addresses are 16-byte aligned -
+ * and falsy everywhere else. In other words, reads beyond the first
+ * word returned falsy bytes. The shipped fix replaced the dynamic
+ * shift with the constant-shift select chain; 366 boundary checks plus
+ * the full battery passed twice on device.
+ */
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Push {
+   uint n;
+   uint pad0;
+   uint pad1;
+   uint pad2;
+};
+
+layout(set = 0, binding = 0) buffer In  { uint in_words[]; };
+layout(set = 0, binding = 1) buffer R   { uint out_reduce; };
+layout(set = 0, binding = 2) buffer T   { uint out_truthy[]; };
+layout(set = 0, binding = 3) buffer W   { uint out_words[]; };
+
+shared uint s_and[64];
+
+bool
+load_truthy(uint i)
+{
+   uint w = in_words[i >> 2u];
+   return ((w >> ((i & 3u) * 8u)) & 0xFFu) != 0u;
+}
+
+void
+main()
+{
+   uint g = gl_GlobalInvocationID.x;
+
+   /* Diagnostics: per-element truthy reads and the raw input words. */
+   for (uint i = g; i < 64u; i += 64u)
+      out_truthy[i] = (i < n) ? (load_truthy(i) ? 1u : 0u) : 2u;
+   {
+      uint words = (n + 3u) / 4u;
+      for (uint w = g; w < words; w += 64u)
+         out_words[w] = in_words[w];
+   }
+
+   /* The reduction itself: sequential per-thread, then a tree AND. */
+   bool acc = true;
+   for (uint j = g; j < n; j += 64u)
+      acc = acc && load_truthy(j);
+
+   s_and[g] = acc ? 1u : 0u;
+   barrier();
+
+   for (uint d = 32u; d >= 1u; d >>= 1u) {
+      uint v = 1u;
+      if (g < d)
+         v = s_and[g + d];
+      barrier();
+      if (g < d)
+         s_and[g] &= v;
+      barrier();
+   }
+
+   if (g == 0u)
+      out_reduce = s_and[0];
+}

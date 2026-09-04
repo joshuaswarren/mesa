@@ -1,0 +1,84 @@
+#version 450
+/*
+ * Case 3, arms A/C - per-byte bool AND with a wide op selector.
+ *
+ * mlx-omarchy commit 3c7d257 (2026-09-02): bool comparison kernels
+ * returned wrong values when they lived in the logical_or.comp shader,
+ * whose wide op selector dispatches many operations over a per-byte
+ * packed-bool path. The fix moved them to a selector-free shader. The
+ * receipt records suite-level reds, not per-byte values, and the same
+ * commit also fixed an unrelated output-initialization defect, so this
+ * case claims "observed with", not "caused by".
+ *
+ * The shader holds two variables behind push constants:
+ *   const_shift = 0: byte extraction with a data-dependent shift
+ *                    (arm A - the construct under suspicion)
+ *   const_shift = 1: four constant shifts picked by a select chain
+ *                    (arm C - separates the selector from the shift)
+ * The wide switch is always present in the compiled unit, and op 0 is
+ * the bool comparison under test; the other cases make the selector
+ * wide, mirroring the original shader's shape.
+ *
+ * Run all four arms (A, B, C, D in repro.c) on the same device:
+ *   A bad, B good, C good, D good -> selector x dynamic-shift interaction
+ *   A bad, B bad                  -> the dynamic shift alone explains it
+ *   A bad, C bad                  -> the selector alone explains it
+ *
+ * Expected on any conformant driver (verified on llvmpipe, all arms):
+ * out[i] == 1 for all 33 elements, all-true inputs.
+ */
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Push {
+   uint const_shift; /* 0 = dynamic shift, 1 = constant-shift chain */
+   uint op;          /* selector value; op 0 is the checked comparison */
+   uint n;
+   uint pad;
+};
+
+layout(set = 0, binding = 0) buffer A { uint a_words[]; };
+layout(set = 0, binding = 1) buffer B { uint b_words[]; };
+layout(set = 0, binding = 2) buffer Out { uint out_byte[]; };
+
+uint
+byte_dyn(uint w, uint i)
+{
+   return (w >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+uint
+byte_const(uint w, uint i)
+{
+   uint b = i & 3u;
+   return b == 0u ? (w & 0xFFu)
+                  : (b == 1u ? ((w >> 8u) & 0xFFu)
+                             : (b == 2u ? ((w >> 16u) & 0xFFu)
+                                        : ((w >> 24u) & 0xFFu)));
+}
+
+void
+main()
+{
+   uint g = gl_GlobalInvocationID.x;
+   for (uint i = g; i < n; i += 64u) {
+      uint pick = const_shift;
+      uint ba = pick == 0u ? byte_dyn(a_words[i >> 2u], i)
+                           : byte_const(a_words[i >> 2u], i);
+      uint bb = pick == 0u ? byte_dyn(b_words[i >> 2u], i)
+                           : byte_const(b_words[i >> 2u], i);
+
+      uint r;
+      switch (op) {
+      case 0u:  r = (ba != 0u && bb != 0u) ? 1u : 0u; break;
+      case 1u:  r = ba + bb; break;
+      case 2u:  r = ba * bb; break;
+      case 3u:  r = max(ba, bb); break;
+      case 4u:  r = min(ba, bb); break;
+      case 5u:  r = ba - bb; break;
+      case 6u:  r = ba ^ bb; break;
+      default:  r = ba | bb; break;
+      }
+      out_byte[i] = r;
+   }
+}
