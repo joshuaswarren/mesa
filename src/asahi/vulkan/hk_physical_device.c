@@ -55,6 +55,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_bind_memory2 = true,
       .KHR_buffer_device_address = true,
       .KHR_calibrated_timestamps = true,
+      .KHR_cooperative_matrix = getenv("AGX_SIMDMAT") != NULL,
       .KHR_copy_commands2 = true,
       .KHR_create_renderpass2 = true,
       .KHR_dedicated_allocation = true,
@@ -238,6 +239,10 @@ hk_get_device_features(
    struct vk_features *features)
 {
    *features = (struct vk_features){
+      /* VK_KHR_cooperative_matrix (G13 HW 8x8x8, gated by AGX_SIMDMAT) */
+      .cooperativeMatrix = getenv("AGX_SIMDMAT") != NULL,
+      .cooperativeMatrixRobustBufferAccess = false,
+
       /* Vulkan 1.0 */
       .robustBufferAccess = true,
       .fullDrawIndexUint32 = true,
@@ -820,6 +825,8 @@ hk_get_device_properties(const struct agx_device *dev,
 
       /* Vulkan 1.1 properties */
       .subgroupSize = 32,
+      .cooperativeMatrixSupportedStages =
+         getenv("AGX_SIMDMAT") ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
       .subgroupSupportedStages =
          VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_ALL_GRAPHICS,
       .subgroupSupportedOperations =
@@ -1517,4 +1524,35 @@ hk_GetPhysicalDeviceMultisamplePropertiesEXT(
    } else {
       pMultisampleProperties->maxSampleLocationGridSize = (VkExtent2D){0, 0};
    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+   VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
+   VkCooperativeMatrixPropertiesKHR *pProperties)
+{
+   VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
+   (void)pdev;
+   VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixPropertiesKHR, out, pProperties,
+                          pPropertyCount);
+
+   if (getenv("AGX_SIMDMAT")) {
+      /* Hardware 8x8x8 fp32 matrix MAC (simd_matrix_fmadd32). */
+      vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p)
+      {
+         p->sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+         p->pNext = NULL;
+         p->MSize = 8;
+         p->NSize = 8;
+         p->KSize = 8;
+         p->AType = VK_COMPONENT_TYPE_FLOAT32_KHR;
+         p->BType = VK_COMPONENT_TYPE_FLOAT32_KHR;
+         p->CType = VK_COMPONENT_TYPE_FLOAT32_KHR;
+         p->ResultType = VK_COMPONENT_TYPE_FLOAT32_KHR;
+         p->saturatingAccumulation = VK_FALSE;
+         p->scope = VK_SCOPE_SUBGROUP_KHR;
+      }
+   }
+
+   return vk_outarray_status(&out);
 }

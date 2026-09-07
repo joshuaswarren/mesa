@@ -217,6 +217,13 @@ iunop("ffs",       0b11)
 op("fadd", encoding = (0x2A, 4, 6), srcs = 2, is_float = True)
 op("ffma", encoding = (0x3A, 6, 8), srcs = 3, is_float = True)
 op("fmul", encoding = (0x1A, 4, 6), srcs = 2, is_float = True)
+
+# Apple G13 hardware matrix multiply-accumulate: D = A*B + C over an 8x8x8 tile,
+# SIMD-group-wide (RE'd from Metal simdgroup_multiply_accumulate codegen).
+# opcode 0x6F, bit27 fixed, bit26 = precision (1 = fp32, 0 = fp16).
+# A/B/C/D are paired-register operands; bit63 is applied in agx_pack.c.
+op("simd_matrix_fmadd32", encoding = (0x6F | (0x1 << 26) | (0x1 << 27), 8, _), srcs = 3, is_float = True)
+op("simd_matrix_fmadd16", encoding = (0x6F | (0x1 << 27), 8, _), srcs = 3, is_float = True)
 op("hadd", encoding = (0x26, 4, 6), srcs = 2, is_float = True)
 op("hfma", encoding = (0x36, 6, 8), srcs = 3, is_float = True)
 op("hmul", encoding = (0x16, 4, 6), srcs = 2, is_float = True)

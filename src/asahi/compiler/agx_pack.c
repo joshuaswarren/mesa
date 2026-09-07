@@ -510,6 +510,13 @@ agx_pack_alu(struct util_dynarray *emission, agx_instr *I)
    else if (info.immediates & (AGX_IMMEDIATE_FCOND | AGX_IMMEDIATE_ICOND))
       raw |= (uint64_t)(I->fcond) << 61;
 
+   /* Apple's hardware matrix multiply-accumulate sets bit 63; the generic
+    * ALU packer doesn't, so set it here.
+    */
+   if (I->op == AGX_OPCODE_SIMD_MATRIX_FMADD32 ||
+       I->op == AGX_OPCODE_SIMD_MATRIX_FMADD16)
+      raw |= (uint64_t)1 << 63;
+
    /* Determine length bit */
    unsigned length = encoding.length_short;
    if (I->op == AGX_OPCODE_MOV_IMM && I->dest[0].size == AGX_SIZE_16)

@@ -185,6 +185,10 @@ agx_write_registers(const agx_instr *I, unsigned d)
       return 6;
    case AGX_OPCODE_COLLECT:
       return I->nr_srcs * agx_size_align_16(I->src[0].size);
+   case AGX_OPCODE_SIMD_MATRIX_FMADD32:
+   case AGX_OPCODE_SIMD_MATRIX_FMADD16:
+      /* paired-register fragment (2 elements/lane) */
+      return agx_index_size_16(I->dest[d]);
    default:
       return size;
    }
@@ -351,6 +355,11 @@ agx_read_registers(const agx_instr *I, unsigned s)
          return size * 2;
       else
          return size;
+
+   case AGX_OPCODE_SIMD_MATRIX_FMADD32:
+   case AGX_OPCODE_SIMD_MATRIX_FMADD16:
+      /* paired-register fragment operands (2 elements/lane) */
+      return agx_index_size_16(I->src[s]);
 
    default:
       return size;

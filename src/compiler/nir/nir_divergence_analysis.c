@@ -217,6 +217,13 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
                      (state->options & nir_divergence_across_subgroups);
       break;
 
+   case nir_intrinsic_simd_matrix_fmadd_agx:
+      /* Apple G13 hardware matrix MAC: each lane gets its own fragment of the
+       * 8x8 result -> divergent.
+       */
+      is_divergent = true;
+      break;
+
    case nir_intrinsic_as_uniform:
    case nir_intrinsic_read_invocation:
    case nir_intrinsic_read_first_invocation:

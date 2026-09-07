@@ -1697,6 +1697,17 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
       return agx_quad_ballot_to(b, dst, agx_src_index(&instr->src[0]));
    }
 
+   case nir_intrinsic_simd_matrix_fmadd_agx: {
+      /* Apple G13 hardware 8x8x8 matrix MAC: D = A*B + C, SIMD-group-wide.
+       * Each operand is this lane's 2 fragment elements (a 32-bit register pair).
+       */
+      agx_simd_matrix_fmadd32_to(b, dst, agx_src_index(&instr->src[0]),
+                                 agx_src_index(&instr->src[1]),
+                                 agx_src_index(&instr->src[2]));
+      agx_emit_cached_split(b, dst, 2);
+      return NULL;
+   }
+
    case nir_intrinsic_doorbell_agx: {
       return agx_doorbell(b, nir_src_as_uint(instr->src[0]));
    }
@@ -3589,6 +3600,13 @@ agx_preprocess_nir(nir_shader *nir)
 {
    if (!nir)
       return;
+
+   /* Lower VK_KHR_cooperative_matrix to the G13 HW matrix instruction before
+    * vars_to_scratch can spill the 8x8 cmat temps. Gated so default Honeykrisp
+    * does not compile experimental coopmat shaders.
+    */
+   if (getenv("AGX_SIMDMAT"))
+      NIR_PASS(_, nir, agx_nir_lower_simdmat, 32);
 
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
 

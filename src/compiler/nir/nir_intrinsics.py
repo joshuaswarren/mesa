@@ -2475,6 +2475,12 @@ intrinsic("load_active_subgroup_invocation_agx", dest_comp=1, flags=[CAN_ELIMINA
 # Equivalent to popcount(ballot(true))
 intrinsic("load_active_subgroup_count_agx", dest_comp=1, flags=[CAN_ELIMINATE])
 
+# Apple G13 hardware matrix multiply-accumulate (simd_matrix_fmadd32). One
+# SIMD-group-wide 8x8x8 tile: D = A*B + C. Per-invocation each operand is the
+# lane's 2 fragment elements (a register pair). src order: A, B, C.
+intrinsic("simd_matrix_fmadd_agx", src_comp=[2, 2, 2], dest_comp=2,
+          bit_sizes=[32], flags=[CAN_ELIMINATE])
+
 # Like ballot() but only within a quad.
 intrinsic("quad_ballot_agx", src_comp=[1], dest_comp=1, flags=[CAN_ELIMINATE])
 
