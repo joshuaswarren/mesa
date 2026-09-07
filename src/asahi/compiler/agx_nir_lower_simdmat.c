@@ -326,7 +326,7 @@ lower_muladd(nir_builder *b, nir_intrinsic_instr *intr)
          for (unsigned k = 0; k < nblk; k++) {
             nir_def *as = subblk(b, a, di * nblk + k);
             nir_def *bs = subblk(b, bb, k * nblk + dj);
-            acc = nir_simd_matrix_fmadd_agx(b, acc_bits, as, bs, acc);
+            acc = nir_simd_matrix_fmadd_agx(b, as, bs, acc);
          }
          dch[sb * 2] = nir_channel(b, acc, 0);
          dch[sb * 2 + 1] = nir_channel(b, acc, 1);
