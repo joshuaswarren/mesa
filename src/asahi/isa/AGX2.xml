@@ -979,6 +979,28 @@
     <ins name="asrh" opcode="111"/>
   </group>
 
+  <ins name="simd_matrix_fmadd32" length="8">
+    <exact bit="0:5">101111</exact>
+    <exact bit="26">1</exact>
+    <exact bit="27">1</exact>
+    <exact bit="63">1</exact>
+    <fdest1/>
+    <fsrc1/>
+    <fsrc2/>
+    <fsrc3/>
+  </ins>
+
+  <ins name="simd_matrix_fmadd16" length="8">
+    <exact bit="0:5">101111</exact>
+    <exact bit="26">0</exact>
+    <exact bit="27">1</exact>
+    <exact bit="63">1</exact>
+    <hdest1/>
+    <hsrc1/>
+    <hsrc2/>
+    <hsrc3/>
+  </ins>
+
   <ins name="ffma" length="6/8">
     <exact bit="0:5">111010</exact>
     <fdest1/>
