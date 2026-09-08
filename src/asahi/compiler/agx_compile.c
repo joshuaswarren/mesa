@@ -2742,46 +2742,6 @@ agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
 }
 
 static bool
-agx_lower_sincos_filter(const nir_instr *instr, UNUSED const void *_)
-{
-   if (instr->type != nir_instr_type_alu)
-      return false;
-
-   nir_alu_instr *alu = nir_instr_as_alu(instr);
-   return alu->op == nir_op_fsin || alu->op == nir_op_fcos;
-}
-
-/* Sine and cosine are implemented via the sin_pt_1 and sin_pt_2 opcodes for
- * heavy lifting. sin_pt_2 implements sinc in the first quadrant, expressed in
- * turns (sin (tau x) / x), while sin_pt_1 implements a piecewise sign/offset
- * fixup to transform a quadrant angle [0, 4] to [-1, 1]. The NIR opcode
- * fsin_agx models the fixup, sinc, and multiply to obtain sine, so we just
- * need to change units from radians to quadrants modulo turns. Cosine is
- * implemented by shifting by one quadrant: cos(x) = sin(x + tau/4).
- */
-
-static nir_def *
-agx_lower_sincos_impl(struct nir_builder *b, nir_instr *instr, UNUSED void *_)
-{
-   nir_alu_instr *alu = nir_instr_as_alu(instr);
-   nir_def *x = nir_mov_alu(b, alu->src[0], 1);
-   nir_def *turns = nir_fmul_imm(b, x, M_1_PI * 0.5f);
-
-   if (alu->op == nir_op_fcos)
-      turns = nir_fadd_imm(b, turns, 0.25f);
-
-   nir_def *quadrants = nir_fmul_imm(b, nir_ffract(b, turns), 4.0);
-   return nir_fsin_agx(b, quadrants);
-}
-
-static bool
-agx_lower_sincos(nir_shader *shader)
-{
-   return nir_shader_lower_instructions(shader, agx_lower_sincos_filter,
-                                        agx_lower_sincos_impl, NULL);
-}
-
-static bool
 agx_lower_front_face(struct nir_builder *b, nir_intrinsic_instr *intr,
                      UNUSED void *data)
 {
@@ -3551,56 +3511,6 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    return offset;
 }
 
-/*
- * The hardware frcp instruction is sometimes off by 1 ULP. For correctly
- * rounded frcp, a refinement step is required. This routine has been
- * exhaustively tested with a modified math_bruteforce.
- *
- * While Khronos APIs allow 2.5 ULP error for divides, nir_lower_idiv relies on
- * correctly rounded frcp. This is therefore load bearing for integer division
- * on all APIs.
- */
-static nir_def *
-libagx_frcp(nir_builder *b, nir_def *x)
-{
-   nir_def *u = nir_frcp(b, x);
-
-   /* Do 1 Newton-Raphson refinement step.
-    *
-    * Define f(u) = xu - 1. Then f(u) = 0 iff u = 1/x. Newton's method gives:
-    *
-    * u_2 = u - f(u) / f'(u) = u - (xu - 1) / x
-    *
-    * Our original guess is close, so we approximate (1 / x) by u:
-    *
-    * u_2 = u - u(xu - 1) = u + u(1 - xu)
-    *     = fma(fma(-x, u, 1), u, u)
-    */
-   nir_def *one = nir_imm_float(b, 1.0);
-   nir_def *u_2 = nir_ffma(b, nir_ffma(b, nir_fneg(b, x), u, one), u, u);
-
-   /* If the original value was infinite, frcp will generate the correct zero.
-    * However, the Newton-Raphson step would multiply 0 * Inf and get a NaN. So
-    * skip the refinement step for infinite inputs. We do this backwards,
-    * checking whether the refined result is NaN, since we can implement this
-    * check in a single fcmpsel instruction. The other case where the refinement
-    * is NaN is a NaN input, in which skipping refinement is acceptable.
-    */
-   return nir_bcsel(b, nir_fisnan(b, u_2), u, u_2);
-}
-
-static bool
-agx_nir_lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *_)
-{
-   if (alu->op != nir_op_frcp || !nir_alu_instr_is_exact(alu) ||
-       alu->def.bit_size != 32)
-      return false;
-
-   b->cursor = nir_before_instr(&alu->instr);
-   nir_def_replace(&alu->def, libagx_frcp(b, nir_ssa_for_alu_src(b, alu, 0)));
-   return true;
-}
-
 /* Preprocess NIR independent of shader state */
 void
 agx_preprocess_nir(nir_shader *nir)
@@ -3632,7 +3542,7 @@ agx_preprocess_nir(nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_alu);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, nir_lower_flrp, 16 | 32 | 64, false);
-   NIR_PASS(_, nir, agx_lower_sincos);
+   NIR_PASS(_, nir, agx_nir_lower_sincos);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, agx_lower_front_face,
             nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, agx_nir_lower_subgroups);
@@ -3655,9 +3565,11 @@ agx_preprocess_nir(nir_shader *nir)
 
    NIR_PASS(_, nir, nir_lower_idiv, &idiv_options);
 
-   /* Has to run after nir_lower_idiv */
-   NIR_PASS(_, nir, nir_shader_alu_pass, agx_nir_lower_fdiv,
-            nir_metadata_control_flow, NULL);
+   /* Has to run after nir_lower_idiv, and before the log lowering so the
+    * reciprocals it builds are not refined twice.
+    */
+   NIR_PASS(_, nir, agx_nir_lower_fdiv);
+   NIR_PASS(_, nir, agx_nir_lower_log);
 
    NIR_PASS(_, nir, nir_opt_deref);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);

@@ -347,7 +347,6 @@ agx_round_registers(unsigned halfregs)
 }
 
 static const nir_shader_compiler_options agx_nir_options = {
-   .lower_fdiv = true,
    .float_mul_add16 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .lower_flrp16 = true,
