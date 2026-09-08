@@ -1,0 +1,882 @@
+Function "mlx::core::eval" not defined.
+Breakpoint 1 (mlx::core::eval) pending.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/libthread_db.so.1".
+[New Thread 0xffffe15bb160 (LWP 287489)]
+[New Thread 0xffffca7ff160 (LWP 287490)]
+[New Thread 0xffffc9fef160 (LWP 287491)]
+[New Thread 0xffffc97df160 (LWP 287492)]
+[New Thread 0xffffc8fcf160 (LWP 287493)]
+[New Thread 0xffffc87bf160 (LWP 287494)]
+[New Thread 0xffffc7faf160 (LWP 287495)]
+[New Thread 0xffffc779f160 (LWP 287496)]
+[New Thread 0xffffc6f8f160 (LWP 287498)]
+
+Thread 1 "python" hit Breakpoint 1, 0x0000fffff3f8ffa4 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+Hardware watchpoint 2: *(unsigned long*)0xaaaaab5d5b08
+WATCH HIT value=0x1
+#0  0x0000fffff3e35c94 in mlx::core::array::set_data(mlx::core::allocator::Buffer, std::function<void (mlx::core::allocator::Buffer)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff4fe1270 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#2  0x0000fffff5082c38 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#3  0x0000fffff4fbd4a8 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#4  0x0000fffff50860a0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff7a2ce70 in ?? () from /usr/lib/libpython3.14.so.1.0
+#6  0x0000fffff7a2d650 in ?? () from /usr/lib/libpython3.14.so.1.0
+#7  0x0000fffff793f818 in PyNumber_Multiply () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0x0
+#0  0x0000fffff772e79c in memset () from /usr/lib/libc.so.6
+#1  0x0000ffffe1ea121c in ?? () from /usr/lib/libvulkan_asahi.so
+#2  0x0000ffffe1f69720 in ?? () from /usr/lib/libvulkan_asahi.so
+#3  0x0000fffff49eff3c in mlx::core::omarchy::CommandEncoder::acquire_descriptor_set(mlx::core::omarchy::ComputeRuntime&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f0b4c in mlx::core::omarchy::CommandEncoder::dispatch_compute(mlx::core::omarchy::ComputeKernel, std::span<mlx::core::omarchy::ComputeBinding const, 18446744073709551615ul>, mlx::core::omarchy::ComputeParams const&, unsigned int, unsigned int, unsigned int) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4a22ea4 in mlx::core::Reduce::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0x80
+#0  0x0000ffffe1f69760 in ?? () from /usr/lib/libvulkan_asahi.so
+#1  0x0000fffff49eff3c in mlx::core::omarchy::CommandEncoder::acquire_descriptor_set(mlx::core::omarchy::ComputeRuntime&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f0b4c in mlx::core::omarchy::CommandEncoder::dispatch_compute(mlx::core::omarchy::ComputeKernel, std::span<mlx::core::omarchy::ComputeBinding const, 18446744073709551615ul>, mlx::core::omarchy::ComputeParams const&, unsigned int, unsigned int, unsigned int) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff4a22ea4 in mlx::core::Reduce::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xfffff7850968
+#0  0x0000fffff7728838 in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff77289f0 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#3  0x0000fffff3f9810c in std::pair<std::__detail::_Node_iterator<std::pair<unsigned long const, int>, false, false>, bool> std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_emplace_uniq<std::pair<unsigned long const, int> >(std::pair<unsigned long const, int>&&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8e858 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x6b8defc847bbe64a
+#0  0x0000fffff772820c in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff77289f0 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#3  0x0000fffff3f9810c in std::pair<std::__detail::_Node_iterator<std::pair<unsigned long const, int>, false, false>, bool> std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_emplace_uniq<std::pair<unsigned long const, int> >(std::pair<unsigned long const, int>&&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8e858 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff7728048 in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff77289f0 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#3  0x0000fffff3f9810c in std::pair<std::__detail::_Node_iterator<std::pair<unsigned long const, int>, false, false>, bool> std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_emplace_uniq<std::pair<unsigned long const, int> >(std::pair<unsigned long const, int>&&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8e858 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xaaaaab614e70
+#0  0x0000fffff3f98130 in std::pair<std::__detail::_Node_iterator<std::pair<unsigned long const, int>, false, false>, bool> std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_emplace_uniq<std::pair<unsigned long const, int> >(std::pair<unsigned long const, int>&&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3f8e858 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0xfffff7850978
+#0  0x0000fffff77261dc in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff7727388 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff77274f0 in ?? () from /usr/lib/libc.so.6
+#3  0x0000fffff3f981dc in std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_erase(unsigned long, std::__detail::_Hash_node_base*, std::__detail::_Hash_node<std::pair<unsigned long const, int>, false>*) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8da18 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xaaaaab40adc0
+#0  0x0000fffff77261e8 in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff7727388 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff77274f0 in ?? () from /usr/lib/libc.so.6
+#3  0x0000fffff3f981dc in std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_erase(unsigned long, std::__detail::_Hash_node_base*, std::__detail::_Hash_node<std::pair<unsigned long const, int>, false>*) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8da18 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xfffff7850968
+#0  0x0000fffff7728838 in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff77289f0 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#3  0x0000fffff3f9810c in std::pair<std::__detail::_Node_iterator<std::pair<unsigned long const, int>, false, false>, bool> std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_emplace_uniq<std::pair<unsigned long const, int> >(std::pair<unsigned long const, int>&&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8e858 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x6b8defc847bbe64a
+#0  0x0000fffff772820c in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff77289f0 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#3  0x0000fffff3f9810c in std::pair<std::__detail::_Node_iterator<std::pair<unsigned long const, int>, false, false>, bool> std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_emplace_uniq<std::pair<unsigned long const, int> >(std::pair<unsigned long const, int>&&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8e858 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff7728048 in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff77289f0 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#3  0x0000fffff3f9810c in std::pair<std::__detail::_Node_iterator<std::pair<unsigned long const, int>, false, false>, bool> std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_emplace_uniq<std::pair<unsigned long const, int> >(std::pair<unsigned long const, int>&&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8e858 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xaaaaab5c8420
+#0  0x0000fffff3f98130 in std::pair<std::__detail::_Node_iterator<std::pair<unsigned long const, int>, false, false>, bool> std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_emplace_uniq<std::pair<unsigned long const, int> >(std::pair<unsigned long const, int>&&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3f8e858 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0x6b8defc847bbe64a
+#0  0x0000fffff772a40c in free () from /usr/lib/libc.so.6
+#1  0x0000fffff3f981dc in std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_erase(unsigned long, std::__detail::_Hash_node_base*, std::__detail::_Hash_node<std::pair<unsigned long const, int>, false>*) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8da18 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff7729cb4 in malloc () from /usr/lib/libc.so.6
+#1  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#2  0x0000fffff49f3fe8 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xaaaaab5ea150
+#0  0x0000fffff49f4028 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0xfffff7850978
+#0  0x0000fffff77261dc in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff7727388 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff77274f0 in ?? () from /usr/lib/libc.so.6
+#3  0x0000fffff49f433c in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xaaaaab5cd770
+#0  0x0000fffff77261e8 in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff7727388 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff77274f0 in ?? () from /usr/lib/libc.so.6
+#3  0x0000fffff3e39e50 in mlx::core::array::ArrayDesc::~ArrayDesc() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e35f10 in mlx::core::array::~array() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3e36258 in mlx::core::array::detach() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f8e118 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xaaaaab616f40
+#0  0x0000fffff772606c in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff7726184 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff7727388 in ?? () from /usr/lib/libc.so.6
+#3  0x0000fffff77274f0 in ?? () from /usr/lib/libc.so.6
+#4  0x0000fffff3e36258 in mlx::core::array::detach() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f8e118 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0x6b8defc847bbe64a
+#0  0x0000fffff7728310 in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff77289f0 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#3  0x0000fffff49d436c in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff49f79ec in mlx::core::Event::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3e36684 in mlx::core::array::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0x0
+#0  0x0000fffff7729cb4 in malloc () from /usr/lib/libc.so.6
+#1  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#2  0x0000fffff3efc7b4 in mlx::core::split(mlx::core::array const&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, int, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3efd1c0 in mlx::core::split(mlx::core::array const&, int, int, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3efd54c in mlx::core::split(mlx::core::array const&, int, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f76ce8 in mlx::core::random::split(mlx::core::array const&, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff5073cdc in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff50764e8 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x3
+#0  0x0000fffff3efc7c8 in mlx::core::split(mlx::core::array const&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, int, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3efd1c0 in mlx::core::split(mlx::core::array const&, int, int, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3efd54c in mlx::core::split(mlx::core::array const&, int, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f76ce8 in mlx::core::random::split(mlx::core::array const&, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff5073cdc in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff50764e8 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff50860a0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0x400000003
+#0  0x0000fffff3efc7cc in mlx::core::split(mlx::core::array const&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, int, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3efd1c0 in mlx::core::split(mlx::core::array const&, int, int, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3efd54c in mlx::core::split(mlx::core::array const&, int, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f76ce8 in mlx::core::random::split(mlx::core::array const&, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff5073cdc in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff50764e8 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff50860a0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0x6b8defc847bbe64a
+#0  0x0000fffff772a40c in free () from /usr/lib/libc.so.6
+#1  0x0000fffff3efc9e8 in mlx::core::split(mlx::core::array const&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, int, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3efd1c0 in mlx::core::split(mlx::core::array const&, int, int, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3efd54c in mlx::core::split(mlx::core::array const&, int, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f76ce8 in mlx::core::random::split(mlx::core::array const&, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff5073cdc in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff50764e8 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff50860a0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff7729cb4 in malloc () from /usr/lib/libc.so.6
+#1  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#2  0x0000fffff3ec5de8 in std::vector<mlx::core::array, std::allocator<mlx::core::array> >::vector(std::initializer_list<mlx::core::array>, std::allocator<mlx::core::array> const&) [clone .constprop.0] () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3ecf90c in mlx::core::reshape(mlx::core::array const&, mlx::core::SmallVector<int, 10ul, std::allocator<int> >, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f76d34 in mlx::core::random::split(mlx::core::array const&, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff5073cdc in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff50764e8 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff50860a0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xaaaaab56c370
+#0  0x0000fffff3ec5e00 in std::vector<mlx::core::array, std::allocator<mlx::core::array> >::vector(std::initializer_list<mlx::core::array>, std::allocator<mlx::core::array> const&) [clone .constprop.0] () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3ecf90c in mlx::core::reshape(mlx::core::array const&, mlx::core::SmallVector<int, 10ul, std::allocator<int> >, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f76d34 in mlx::core::random::split(mlx::core::array const&, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff5073cdc in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#4  0x0000fffff50764e8 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff50860a0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+#7  0x0000fffff7b17284 in _PyEval_EvalFrameDefault () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0xfffff7850978
+#0  0x0000fffff77261dc in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff7727388 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff77274f0 in ?? () from /usr/lib/libc.so.6
+#3  0x0000fffff3e39e50 in mlx::core::array::ArrayDesc::~ArrayDesc() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e35f10 in mlx::core::array::~array() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3e36258 in mlx::core::array::detach() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f8e118 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xaaaaab572500
+#0  0x0000fffff77261e8 in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff7727388 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff77274f0 in ?? () from /usr/lib/libc.so.6
+#3  0x0000fffff3e39e50 in mlx::core::array::ArrayDesc::~ArrayDesc() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e35f10 in mlx::core::array::~array() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3e36258 in mlx::core::array::detach() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f8e118 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xaaaaab4f8610
+#0  0x0000fffff49d43ec in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49f79ec in mlx::core::Event::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e36684 in mlx::core::array::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f90100 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff3e35bfc in mlx::core::array::set_data(mlx::core::allocator::Buffer, std::function<void (mlx::core::allocator::Buffer)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff4fe1270 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#2  0x0000fffff5082828 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#3  0x0000fffff50762fc in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#4  0x0000fffff50860a0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+#6  0x0000fffff7b17284 in _PyEval_EvalFrameDefault () from /usr/lib/libpython3.14.so.1.0
+#7  0x0000fffff7b21f10 in ?? () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0xfffff4feb130
+#0  0x0000fffff3e35c1c in mlx::core::array::set_data(mlx::core::allocator::Buffer, std::function<void (mlx::core::allocator::Buffer)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff4fe1270 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#2  0x0000fffff5082828 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#3  0x0000fffff50762fc in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#4  0x0000fffff50860a0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+#6  0x0000fffff7b17284 in _PyEval_EvalFrameDefault () from /usr/lib/libpython3.14.so.1.0
+#7  0x0000fffff7b21f10 in ?? () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0x0
+#0  0x0000fffff3e36b4c in mlx::core::array::set_data(mlx::core::allocator::Buffer, unsigned long, mlx::core::SmallVector<long, 10ul, std::allocator<long> >, mlx::core::array::Flags, long, std::function<void (mlx::core::allocator::Buffer)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3ff2b0c in mlx::core::set_binary_op_output_data(mlx::core::array const&, mlx::core::array const&, mlx::core::array&, mlx::core::BinaryOpType, std::function<mlx::core::allocator::Buffer (unsigned long)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff4a0ab80 in mlx::core::(anonymous namespace)::dispatch_elementwise(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned int, std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&, mlx::core::Stream const&) [clone .isra.0] () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff4a0e134 in mlx::core::Subtract::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xfffff3e3a320
+#0  0x0000fffff3e36b6c in mlx::core::array::set_data(mlx::core::allocator::Buffer, unsigned long, mlx::core::SmallVector<long, 10ul, std::allocator<long> >, mlx::core::array::Flags, long, std::function<void (mlx::core::allocator::Buffer)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3ff2b0c in mlx::core::set_binary_op_output_data(mlx::core::array const&, mlx::core::array const&, mlx::core::array&, mlx::core::BinaryOpType, std::function<mlx::core::allocator::Buffer (unsigned long)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff4a0ab80 in mlx::core::(anonymous namespace)::dispatch_elementwise(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned int, std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&, mlx::core::Stream const&) [clone .isra.0] () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff4a0e134 in mlx::core::Subtract::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xaaaaab551f50
+#0  0x0000fffff49d43ec in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49f79ec in mlx::core::Event::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e36684 in mlx::core::array::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f90100 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff3e35bfc in mlx::core::array::set_data(mlx::core::allocator::Buffer, std::function<void (mlx::core::allocator::Buffer)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff4a012e8 in mlx::core::RandomBits::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xfffff3e3a320
+#0  0x0000fffff3e35c1c in mlx::core::array::set_data(mlx::core::allocator::Buffer, std::function<void (mlx::core::allocator::Buffer)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff4a012e8 in mlx::core::RandomBits::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d302c in mlx::core::omarchy::VulkanAllocator::malloc(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49fbe80 in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49dae1c in mlx::core::omarchy::CommandEncoder::add_temporary(mlx::core::array const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f42f8 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x33
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f6f0c in mlx::core::Event::signal(mlx::core::Stream) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8e190 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49f79ec in mlx::core::Event::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e36684 in mlx::core::array::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f90100 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xaaaaab60f160
+#0  0x0000fffff49d43ec in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49f79ec in mlx::core::Event::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e36684 in mlx::core::array::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f90100 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff3e35bfc in mlx::core::array::set_data(mlx::core::allocator::Buffer, std::function<void (mlx::core::allocator::Buffer)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff4a012e8 in mlx::core::RandomBits::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xfffff3e3a320
+#0  0x0000fffff3e35c1c in mlx::core::array::set_data(mlx::core::allocator::Buffer, std::function<void (mlx::core::allocator::Buffer)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff4a012e8 in mlx::core::RandomBits::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d302c in mlx::core::omarchy::VulkanAllocator::malloc(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff4a33ae8 in mlx::core::(anonymous namespace)::dispatch_matmul(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&, float, float, bool, mlx::core::Stream const&) [clone .isra.0] () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff4a3854c in mlx::core::fast::ScaledDotProductAttention::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, std::vector<mlx::core::array, std::allocator<mlx::core::array> >&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49f480c in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49dae1c in mlx::core::omarchy::CommandEncoder::add_temporary(mlx::core::array const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff4a38574 in mlx::core::fast::ScaledDotProductAttention::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, std::vector<mlx::core::array, std::allocator<mlx::core::array> >&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f480c in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x35
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f6f0c in mlx::core::Event::signal(mlx::core::Stream) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8e190 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49f79ec in mlx::core::Event::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e36684 in mlx::core::array::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f90100 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xfffff7850968
+#0  0x0000fffff7728838 in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff77289f0 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#3  0x0000fffff3f9810c in std::pair<std::__detail::_Node_iterator<std::pair<unsigned long const, int>, false, false>, bool> std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_emplace_uniq<std::pair<unsigned long const, int> >(std::pair<unsigned long const, int>&&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8e858 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x6b8defc847bbe64a
+#0  0x0000fffff772820c in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff77289f0 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#3  0x0000fffff3f9810c in std::pair<std::__detail::_Node_iterator<std::pair<unsigned long const, int>, false, false>, bool> std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_emplace_uniq<std::pair<unsigned long const, int> >(std::pair<unsigned long const, int>&&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8e858 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff7728048 in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff77289f0 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff3b54084 in operator new(unsigned long) () from /usr/lib/libstdc++.so.6
+#3  0x0000fffff3f9810c in std::pair<std::__detail::_Node_iterator<std::pair<unsigned long const, int>, false, false>, bool> std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_emplace_uniq<std::pair<unsigned long const, int> >(std::pair<unsigned long const, int>&&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8e858 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xaaaaab5fa890
+#0  0x0000fffff3f98130 in std::pair<std::__detail::_Node_iterator<std::pair<unsigned long const, int>, false, false>, bool> std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_emplace_uniq<std::pair<unsigned long const, int> >(std::pair<unsigned long const, int>&&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3f8e858 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0xfffff7850978
+#0  0x0000fffff77261dc in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff7727388 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff77274f0 in ?? () from /usr/lib/libc.so.6
+#3  0x0000fffff3f981dc in std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_erase(unsigned long, std::__detail::_Hash_node_base*, std::__detail::_Hash_node<std::pair<unsigned long const, int>, false>*) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8da18 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xaaaaab572070
+#0  0x0000fffff77261e8 in ?? () from /usr/lib/libc.so.6
+#1  0x0000fffff7727388 in ?? () from /usr/lib/libc.so.6
+#2  0x0000fffff77274f0 in ?? () from /usr/lib/libc.so.6
+#3  0x0000fffff3f981dc in std::_Hashtable<unsigned long, std::pair<unsigned long const, int>, std::allocator<std::pair<unsigned long const, int> >, std::__detail::_Select1st, std::equal_to<unsigned long>, std::hash<unsigned long>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, false, true> >::_M_erase(unsigned long, std::__detail::_Hash_node_base*, std::__detail::_Hash_node<std::pair<unsigned long const, int>, false>*) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8da18 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xaaaaab60f3a0
+#0  0x0000fffff49d43ec in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49f79ec in mlx::core::Event::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e36684 in mlx::core::array::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f90100 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff3e35bfc in mlx::core::array::set_data(mlx::core::allocator::Buffer, std::function<void (mlx::core::allocator::Buffer)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3f7cf04 in void mlx::core::array::init<mlx::core::_MLX_Float16*>(mlx::core::_MLX_Float16*) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f780d0 in mlx::core::random::uniform(mlx::core::array const&, mlx::core::array const&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::Dtype, std::optional<mlx::core::array> const&, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff5076358 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#4  0x0000fffff50860a0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+#6  0x0000fffff7b17284 in _PyEval_EvalFrameDefault () from /usr/lib/libpython3.14.so.1.0
+#7  0x0000fffff7b21f10 in ?? () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0xfffff3e3a320
+#0  0x0000fffff3e35c1c in mlx::core::array::set_data(mlx::core::allocator::Buffer, std::function<void (mlx::core::allocator::Buffer)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3f7cf04 in void mlx::core::array::init<mlx::core::_MLX_Float16*>(mlx::core::_MLX_Float16*) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f780d0 in mlx::core::random::uniform(mlx::core::array const&, mlx::core::array const&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::Dtype, std::optional<mlx::core::array> const&, std::variant<std::monostate, mlx::core::Stream, mlx::core::ThreadLocalStream, mlx::core::Device, mlx::core::Device::DeviceType>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff5076358 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#4  0x0000fffff50860a0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+#6  0x0000fffff7b17284 in _PyEval_EvalFrameDefault () from /usr/lib/libpython3.14.so.1.0
+#7  0x0000fffff7b21f10 in ?? () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0x0
+#0  0x0000fffff49d302c in mlx::core::omarchy::VulkanAllocator::malloc(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3ff2aa0 in mlx::core::set_binary_op_output_data(mlx::core::array const&, mlx::core::array const&, mlx::core::array&, mlx::core::BinaryOpType, std::function<mlx::core::allocator::Buffer (unsigned long)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff4a0ab80 in mlx::core::(anonymous namespace)::dispatch_elementwise(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned int, std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&, mlx::core::Stream const&) [clone .isra.0] () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff4a0e134 in mlx::core::Subtract::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49dae1c in mlx::core::omarchy::CommandEncoder::add_temporary(mlx::core::array const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f42f8 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x38
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f6f0c in mlx::core::Event::signal(mlx::core::Stream) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8e190 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49f79ec in mlx::core::Event::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e36684 in mlx::core::array::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f90100 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49dae1c in mlx::core::omarchy::CommandEncoder::add_temporary(mlx::core::array const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f42f8 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x3a
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f6f0c in mlx::core::Event::signal(mlx::core::Stream) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8e190 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49f79ec in mlx::core::Event::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e36684 in mlx::core::array::wait() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f90100 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49dae1c in mlx::core::omarchy::CommandEncoder::add_temporary(mlx::core::array const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f42f8 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x3c
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f6f0c in mlx::core::Event::signal(mlx::core::Stream) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8e190 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49ef5d4 in mlx::core::omarchy::CommandEncoder::join_last_completion() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49dae1c in mlx::core::omarchy::CommandEncoder::add_temporary(mlx::core::array const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff4a22d58 in mlx::core::Reduce::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x3f
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f6f0c in mlx::core::Event::signal(mlx::core::Stream) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8e190 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49ef5d4 in mlx::core::omarchy::CommandEncoder::join_last_completion() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49f41a4 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0x43
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f2d10 in mlx::core::omarchy::CommandEncoder::synchronize() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49ef5d4 in mlx::core::omarchy::CommandEncoder::join_last_completion() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49f41a4 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0x46
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f2d10 in mlx::core::omarchy::CommandEncoder::synchronize() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49ef5d4 in mlx::core::omarchy::CommandEncoder::join_last_completion() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49dae1c in mlx::core::omarchy::CommandEncoder::add_temporary(mlx::core::array const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f42f8 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x49
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f2d10 in mlx::core::omarchy::CommandEncoder::synchronize() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49ef5d4 in mlx::core::omarchy::CommandEncoder::join_last_completion() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49f41a4 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0x4c
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f2d10 in mlx::core::omarchy::CommandEncoder::synchronize() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49ef5d4 in mlx::core::omarchy::CommandEncoder::join_last_completion() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49f41a4 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0x4f
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f2d10 in mlx::core::omarchy::CommandEncoder::synchronize() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49ef5d4 in mlx::core::omarchy::CommandEncoder::join_last_completion() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49dae1c in mlx::core::omarchy::CommandEncoder::add_temporary(mlx::core::array const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f42f8 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x52
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f2d10 in mlx::core::omarchy::CommandEncoder::synchronize() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49ef5d4 in mlx::core::omarchy::CommandEncoder::join_last_completion() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49dae1c in mlx::core::omarchy::CommandEncoder::add_temporary(mlx::core::array const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f42f8 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x55
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f2d10 in mlx::core::omarchy::CommandEncoder::synchronize() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d41fc in mlx::core::omarchy::VulkanAllocator::release_quarantine(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49ea170 in mlx::core::omarchy::CompletionDispatcher::drain_through(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49eabf0 in mlx::core::omarchy::CompletionDispatcher::wait(unsigned long) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49ef5d4 in mlx::core::omarchy::CommandEncoder::join_last_completion() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xffffffffffffffff
+#0  0x0000fffff49f41a4 in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff796c854 in PyObject_Vectorcall () from /usr/lib/libpython3.14.so.1.0
+WATCH HIT value=0x58
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f2d10 in mlx::core::omarchy::CommandEncoder::synchronize() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff49f9530 in mlx::core::copy_gpu_inplace(mlx::core::array const&, mlx::core::array&, mlx::core::SmallVector<int, 10ul, std::allocator<int> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, mlx::core::SmallVector<long, 10ul, std::allocator<long> > const&, long, long, mlx::core::CopyType, mlx::core::Stream const&, std::optional<mlx::core::array>, std::optional<mlx::core::array>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49fbf0c in mlx::core::copy_gpu(mlx::core::array const&, mlx::core::array&, mlx::core::CopyType, mlx::core::Stream const&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff4a5112c in mlx::core::Full::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0x0
+#0  0x0000fffff49d3f80 in mlx::core::omarchy::VulkanAllocator::free(mlx::core::allocator::Buffer) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff3e3a268 in std::_Sp_counted_ptr_inplace<mlx::core::array::Data, std::allocator<void>, (__gnu_cxx::_Lock_policy)2>::_M_dispose() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3e3a01c in mlx::core::array::ArrayDesc::~ArrayDesc() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3e35f10 in mlx::core::array::~array() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e36258 in mlx::core::array::detach() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f8e118 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+WATCH HIT value=0xfffff3e3a320
+#0  0x0000fffff3e35c1c in mlx::core::array::set_data(mlx::core::allocator::Buffer, std::function<void (mlx::core::allocator::Buffer)>) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff4a33b20 in mlx::core::(anonymous namespace)::dispatch_matmul(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&, float, float, bool, mlx::core::Stream const&) [clone .isra.0] () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff4a35c48 in mlx::core::Matmul::eval_gpu(std::vector<mlx::core::array, std::allocator<mlx::core::array> > const&, mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff49f40dc in mlx::core::gpu::eval(mlx::core::array&) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3f8eb48 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#6  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#7  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+WATCH HIT value=0x5a
+#0  0x0000fffff49f1f50 in mlx::core::omarchy::CommandEncoder::submit() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#1  0x0000fffff49f6f0c in mlx::core::Event::signal(mlx::core::Stream) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3f8e190 in mlx::core::eval_impl(std::vector<mlx::core::array, std::allocator<mlx::core::array> >, bool) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3f900f0 in mlx::core::eval(std::vector<mlx::core::array, std::allocator<mlx::core::array> >) () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff3e3699c in mlx::core::array::eval() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#5  0x0000fffff4fcb37c in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#6  0x0000fffff4fb7868 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#7  0x0000fffff5084fa0 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+
+Thread 1 "python" received signal SIGBUS, Bus error.
+0x000000000000005a in ?? ()
+#0  0x000000000000005a in ?? ()
+#1  0x0000fffff3e3a280 in std::_Sp_counted_ptr_inplace<mlx::core::array::Data, std::allocator<void>, (__gnu_cxx::_Lock_policy)2>::_M_dispose() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#2  0x0000fffff3e3a01c in mlx::core::array::ArrayDesc::~ArrayDesc() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#3  0x0000fffff3e35f10 in mlx::core::array::~array() () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/lib/libmlx.so
+#4  0x0000fffff508bc80 in ?? () from /home/joshuawarren/mlx-omarchy-qual/receipts-m1/upstream-suite-py/venv-pytest/lib/python3.14/site-packages/mlx/core.cpython-314-aarch64-linux-gnu.so
+#5  0x0000fffff79e8884 in _Py_Dealloc () from /usr/lib/libpython3.14.so.1.0
+pc             0x5a                0x5a
+x0             0xaaaaab5d5af8      187649996184312

@@ -1,0 +1,114 @@
+tokens 2048
+[probe] pipeline kernel=44 bytes=0xffff95a283ec size=3256
+[probe] pipeline kernel=46 bytes=0xffff95a26b00 size=3176
+[probe] pipeline kernel=102 bytes=0xffff959c2ab8 size=3308
+[probe] pipeline kernel=139 bytes=0xffff9596ecc8 size=3748
+[probe] pipeline kernel=99 bytes=0xffff959c5404 size=4108
+[probe] pipeline kernel=1 bytes=0xffff95a2f00c size=20808
+[hkql 123695.656] cmdbuf 0xaaaacc2b5dc0: CDM calls=11 cmds=17 flushes=17 merged=13 linked=1 timeline=1 gpu_done=1
+[hkql 123695.656] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[probe] pipeline kernel=163 bytes=0xffff959dc228 size=8612
+[hkql 123695.763] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=2 gpu_done=1
+[hkql 123695.763] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[probe] pipeline kernel=3 bytes=0xffff95a40a34 size=1672
+[probe] pipeline kernel=0 bytes=0xffff95a29f08 size=20740
+[probe] pipeline kernel=48 bytes=0xffff95a254a4 size=2648
+[probe] pipeline kernel=20 bytes=0xffff95a18278 size=6508
+[probe] pipeline kernel=26 bytes=0xffff959ef7dc size=3592
+[probe] pipeline kernel=5 bytes=0xffff95a3f370 size=1672
+[hkql 123695.961] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=3 gpu_done=2
+[hkql 123695.961] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123698.563] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=4 gpu_done=3
+[hkql 123698.563] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123698.673] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=5 gpu_done=4
+[hkql 123698.673] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123701.276] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=6 gpu_done=5
+[hkql 123701.276] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123701.386] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=7 gpu_done=6
+[hkql 123701.386] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123703.988] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=8 gpu_done=7
+[hkql 123703.988] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123704.098] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=9 gpu_done=8
+[hkql 123704.098] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123706.700] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=10 gpu_done=9
+[hkql 123706.701] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123706.810] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=11 gpu_done=10
+[hkql 123706.810] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123709.413] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=12 gpu_done=11
+[hkql 123709.413] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123709.522] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=13 gpu_done=12
+[hkql 123709.522] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123712.125] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=14 gpu_done=13
+[hkql 123712.125] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123712.233] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=15 gpu_done=14
+[hkql 123712.233] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123714.835] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=16 gpu_done=15
+[hkql 123714.835] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123714.945] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=17 gpu_done=16
+[hkql 123714.945] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123717.547] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=18 gpu_done=17
+[hkql 123717.547] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123717.657] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=19 gpu_done=18
+[hkql 123717.657] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123720.260] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=20 gpu_done=19
+[hkql 123720.260] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123720.369] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=21 gpu_done=20
+[hkql 123720.369] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123722.971] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=22 gpu_done=21
+[hkql 123722.972] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123723.081] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=23 gpu_done=22
+[hkql 123723.081] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123725.684] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=24 gpu_done=23
+[hkql 123725.684] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123725.794] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=25 gpu_done=24
+[hkql 123725.794] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123728.396] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=26 gpu_done=25
+[hkql 123728.397] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123728.506] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=27 gpu_done=26
+[hkql 123728.506] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123731.109] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=28 gpu_done=27
+[hkql 123731.109] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123731.218] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=29 gpu_done=28
+[hkql 123731.219] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123733.821] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=30 gpu_done=29
+[hkql 123733.821] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123733.931] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=31 gpu_done=30
+[hkql 123733.931] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123736.533] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=32 gpu_done=31
+[hkql 123736.534] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123736.643] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=33 gpu_done=32
+[hkql 123736.643] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123739.246] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=34 gpu_done=33
+[hkql 123739.246] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123739.355] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=35 gpu_done=34
+[hkql 123739.355] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123741.957] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=36 gpu_done=35
+[hkql 123741.958] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123742.067] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=37 gpu_done=36
+[hkql 123742.067] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123744.670] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=38 gpu_done=37
+[hkql 123744.670] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123744.779] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=39 gpu_done=38
+[hkql 123744.779] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123747.382] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=40 gpu_done=39
+[hkql 123747.382] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123747.491] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=41 gpu_done=40
+[hkql 123747.492] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123750.094] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=42 gpu_done=41
+[hkql 123750.094] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123750.204] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=43 gpu_done=42
+[hkql 123750.204] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123752.806] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=44 gpu_done=43
+[hkql 123752.807] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123752.916] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=45 gpu_done=44
+[hkql 123752.916] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123755.519] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=46 gpu_done=45
+[hkql 123755.519] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123755.628] cmdbuf 0xaaaacc2b5dc0: CDM calls=29 cmds=43 flushes=43 merged=35 linked=1 timeline=47 gpu_done=46
+[hkql 123755.629] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123758.231] cmdbuf 0xaaaacc2b5dc0: CDM calls=1 cmds=1 flushes=1 merged=0 linked=0 timeline=48 gpu_done=47
+[hkql 123758.231] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123758.439] cmdbuf 0xaaaacc2b5dc0: CDM calls=24 cmds=34 flushes=34 merged=28 linked=1 timeline=49 gpu_done=48
+[hkql 123758.439] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=3
+{"status": "error", "wall_s": 72.83288278899272, "n": 2048, "error": "[omarchy] Vulkan timeline counter failed to advance for 10000 ms (last observed=0, target=1). The device may be hung; no CPU fallback is available."}
+rc=2 wall=93
