@@ -1,0 +1,8 @@
+asahi_icd.aarch64.json chain32 sin: timing_ms median=6.643 min=6.637 max=17.900 reps=9
+asahi_icd.aarch64.json chain32 log: timing_ms median=2.572 min=2.475 max=5.979 reps=9
+asahi_icd.aarch64.json chain32 div: timing_ms median=2.842 min=2.753 max=8.456 reps=9
+asahi_icd.aarch64.json chain32 mul: timing_ms median=2.469 min=2.428 max=2.974 reps=9
+icd-precise-math.json chain32 sin: timing_ms median=39.606 min=39.542 max=47.437 reps=9
+icd-precise-math.json chain32 log: timing_ms median=34.762 min=34.705 max=43.516 reps=9
+icd-precise-math.json chain32 div: timing_ms median=7.242 min=7.207 max=16.537 reps=9
+icd-precise-math.json chain32 mul: timing_ms median=2.438 min=2.421 max=2.929 reps=9
