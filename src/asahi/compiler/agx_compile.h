@@ -7,6 +7,7 @@
 
 #include "compiler/nir/nir.h"
 #include "util/shader_stats.h"
+#include "util/u_debug.h"
 #include "util/u_dynarray.h"
 #include "util/u_tristate.h"
 #include "shader_enums.h"
@@ -317,6 +318,15 @@ struct agx_shader_key {
 uint64_t agx_gather_texcoords(nir_shader *nir);
 
 void agx_preprocess_nir(nir_shader *nir);
+
+/* VK_KHR_cooperative_matrix on the G13 simd_matrix unit. On by default;
+ * AGX_SIMDMAT=0 disables it.
+ */
+static inline bool
+agx_simdmat_enabled(void)
+{
+   return debug_get_bool_option("AGX_SIMDMAT", true);
+}
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
 bool agx_nir_lower_interpolation(nir_shader *s);

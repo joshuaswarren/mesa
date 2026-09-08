@@ -38,7 +38,7 @@
  * what Apple's own mul_mm emits), fmadd16 with fp16 A/B. fp32 A/B with an fp16
  * accumulator is not advertised and not lowered.
  *
- * Gated by AGX_SIMDMAT at the call site.
+ * On by default; AGX_SIMDMAT=0 disables it at the call site.
  */
 
 #include "util/macros.h"

@@ -55,7 +55,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_bind_memory2 = true,
       .KHR_buffer_device_address = true,
       .KHR_calibrated_timestamps = true,
-      .KHR_cooperative_matrix = getenv("AGX_SIMDMAT") != NULL,
+      .KHR_cooperative_matrix = agx_simdmat_enabled(),
       .KHR_copy_commands2 = true,
       .KHR_create_renderpass2 = true,
       .KHR_dedicated_allocation = true,
@@ -239,8 +239,8 @@ hk_get_device_features(
    struct vk_features *features)
 {
    *features = (struct vk_features){
-      /* VK_KHR_cooperative_matrix (G13 HW 8x8x8, gated by AGX_SIMDMAT) */
-      .cooperativeMatrix = getenv("AGX_SIMDMAT") != NULL,
+      /* VK_KHR_cooperative_matrix (G13 HW 8x8x8, AGX_SIMDMAT=0 disables) */
+      .cooperativeMatrix = agx_simdmat_enabled(),
       .cooperativeMatrixRobustBufferAccess = false,
 
       /* Vulkan 1.0 */
@@ -826,7 +826,7 @@ hk_get_device_properties(const struct agx_device *dev,
       /* Vulkan 1.1 properties */
       .subgroupSize = 32,
       .cooperativeMatrixSupportedStages =
-         getenv("AGX_SIMDMAT") ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
+         agx_simdmat_enabled() ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
       .subgroupSupportedStages =
          VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_ALL_GRAPHICS,
       .subgroupSupportedOperations =
@@ -1536,7 +1536,7 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
    VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixPropertiesKHR, out, pProperties,
                           pPropertyCount);
 
-   if (getenv("AGX_SIMDMAT")) {
+   if (agx_simdmat_enabled()) {
       /* G13 hardware 8x8x8 matrix MAC (simd_matrix_fmadd16/32). The unit
        * takes fp16 or fp32 A/B and accumulates in fp32 (fmadd32) or fp16
        * (fmadd16); 16x16x16 is a 2x2x2 tiling of 8x8x8 ops in
