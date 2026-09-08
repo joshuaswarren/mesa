@@ -57,9 +57,11 @@ div_rn(nir_builder *b, nir_def *a, nir_def *d)
 }
 
 static bool
-lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *_)
+lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *data)
 {
-   if (alu->op != nir_op_frcp && alu->op != nir_op_fdiv)
+   bool fdiv_only = *(bool *)data;
+
+   if (alu->op != nir_op_fdiv && (alu->op != nir_op_frcp || fdiv_only))
       return false;
 
    if (alu->def.bit_size == 64)
@@ -91,7 +93,24 @@ lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *_)
 bool
 agx_nir_lower_fdiv(nir_shader *s)
 {
-   return nir_shader_alu_pass(s, lower_fdiv, nir_metadata_control_flow, NULL);
+   bool fdiv_only = false;
+   return nir_shader_alu_pass(s, lower_fdiv, nir_metadata_control_flow,
+                              &fdiv_only);
+}
+
+/*
+ * Passes that run after agx_preprocess_nir still emit fdiv: nir_lower_int64
+ * (f2u64/f2i64 divide by 2^32, and lower_fmod turns the frem into a second
+ * fdiv) and agx_nir_lower_interpolation (perspective divide). Lower only fdiv
+ * here so the reciprocals built by the first pass and by the log lowering are
+ * not refined a second time.
+ */
+bool
+agx_nir_lower_fdiv_late(nir_shader *s)
+{
+   bool fdiv_only = true;
+   return nir_shader_alu_pass(s, lower_fdiv, nir_metadata_control_flow,
+                              &fdiv_only);
 }
 
 /*

@@ -23,6 +23,7 @@ bool agx_nir_lower_clip_distance(struct nir_shader *s);
 bool agx_nir_lower_subgroups(struct nir_shader *s);
 bool agx_nir_lower_fminmax(struct nir_shader *s);
 bool agx_nir_lower_fdiv(struct nir_shader *s);
+bool agx_nir_lower_fdiv_late(struct nir_shader *s);
 bool agx_nir_lower_log(struct nir_shader *s);
 bool agx_nir_lower_sincos(struct nir_shader *s);
 
