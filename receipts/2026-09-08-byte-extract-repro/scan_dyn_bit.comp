@@ -1,0 +1,28 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer In { uint v[]; } in_data;
+layout(set = 0, binding = 1, std430) readonly buffer Idx { uint v[]; } idx_data;
+layout(set = 0, binding = 2, std430) writeonly buffer Out { uint v[]; } out_data;
+layout(push_constant) uniform P { uint count; } params;
+shared uint s_scan[256];
+void main() {
+  uint g = gl_GlobalInvocationID.x;
+  uint lane = gl_LocalInvocationID.x;
+  uint bit = 0u;
+  if (g < params.count) {
+    uint word = in_data.v[g >> 2u];
+    uint sel = g & 3u;
+    uint byte = sel == 0u ? (word & 0xFFu) : sel == 1u ? ((word >> 8u) & 0xFFu) : sel == 2u ? ((word >> 16u) & 0xFFu) : (word >> 24u);
+    bit = byte != 0u ? 1u : 0u;
+  }
+  s_scan[lane] = bit;
+  barrier();
+  for (uint offset = 1u; offset < 256u; offset <<= 1u) {
+    uint add = 0u;
+    if (lane >= offset) { add = s_scan[lane - offset]; }
+    barrier();
+    s_scan[lane] += add;
+    barrier();
+  }
+  if (g < params.count) out_data.v[g] = s_scan[lane];
+}

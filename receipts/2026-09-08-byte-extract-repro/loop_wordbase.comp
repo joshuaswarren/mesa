@@ -1,0 +1,17 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer In { uint v[]; } in_data;
+layout(set = 0, binding = 1, std430) readonly buffer Idx { uint v[]; } idx_data;
+layout(set = 0, binding = 2, std430) writeonly buffer Out { uint v[]; } out_data;
+layout(push_constant) uniform P { uint count; } params;
+void main() {
+  uint g = gl_GlobalInvocationID.x;
+  if (g >= params.count) return;
+  uint group = g / 32u; uint lane = g - group * 32u; uint acc = 0u;
+  uint word_base = group * 8u;
+  for (uint w = 0u; w < 8u; ++w) {
+    uint word = in_data.v[word_base + w];
+    acc += ((word >> (8u * (lane & 3u))) & 0xFFu) * (w + 1u);
+  }
+  out_data.v[g] = acc;
+}
