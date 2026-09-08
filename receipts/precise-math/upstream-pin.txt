@@ -1,0 +1,20 @@
+== asahi_icd.aarch64.json
+upstream log(3) pin: got 1.0986121892929077 (0x3f8c9f53) want 1.0986123085021973 (0x3f8c9f54) -> FAIL
+divide 80/25: got 0x404ccccc want 0x404ccccd -> FAIL
+divide 10/25: got 0x3ecccccc want 0x3ecccccd -> FAIL
+sin(100000) got 0.0368072204 want 0.035748798 ulp 284118 | cos got -0.999322295 want -0.999360807 ulp 646 -> FAIL
+sin(99000) got 0.848120272 want 0.846455381 ulp 27932 | cos got -0.529803574 want -0.532459658 ulp 44562 -> FAIL
+sin(60000) got 0.958703399 want 0.95746675 ulp 20748 | cos got -0.284407526 want -0.288543623 ulp 138784 -> FAIL
+sin(10000) got -0.304929197 want -0.305614389 ulp 22991 | cos got -0.952374935 want -0.952155368 ulp 3684 -> FAIL
+sin(1000) got 0.826860607 want 0.826879541 ulp 318 | cos got 0.562406838 want 0.562379076 ulp 466 -> FAIL
+SOME FAILED
+== icd-precise-math.json
+upstream log(3) pin: got 1.0986123085021973 (0x3f8c9f54) want 1.0986123085021973 (0x3f8c9f54) -> PASS
+divide 80/25: got 0x404ccccd want 0x404ccccd -> PASS
+divide 10/25: got 0x3ecccccd want 0x3ecccccd -> PASS
+sin(100000) got 0.0357487984 want 0.035748798 ulp 0 | cos got -0.9993608 want -0.999360807 ulp 0 -> PASS
+sin(99000) got 0.846455395 want 0.846455381 ulp 0 | cos got -0.532459676 want -0.532459658 ulp 0 -> PASS
+sin(60000) got 0.957466722 want 0.95746675 ulp 0 | cos got -0.288543612 want -0.288543623 ulp 0 -> PASS
+sin(10000) got -0.305614382 want -0.305614389 ulp 0 | cos got -0.952155352 want -0.952155368 ulp 0 -> PASS
+sin(1000) got 0.826879561 want 0.826879541 ulp 0 | cos got 0.562379062 want 0.562379076 ulp 0 -> PASS
+ALL PASS

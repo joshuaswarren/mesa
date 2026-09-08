@@ -1,0 +1,10 @@
+asahi_icd.aarch64.json sin: timing_ms median=2.474 min=2.440 max=2.958 reps=15
+asahi_icd.aarch64.json cos: timing_ms median=2.452 min=2.425 max=2.941 reps=15
+asahi_icd.aarch64.json div: timing_ms median=2.431 min=2.398 max=2.831 reps=15
+asahi_icd.aarch64.json log: timing_ms median=2.446 min=2.415 max=2.884 reps=15
+asahi_icd.aarch64.json mul: timing_ms median=2.447 min=2.425 max=2.903 reps=15
+icd-precise-math.json sin: timing_ms median=2.463 min=2.413 max=4.057 reps=15
+icd-precise-math.json cos: timing_ms median=2.449 min=2.407 max=4.100 reps=15
+icd-precise-math.json div: timing_ms median=2.446 min=2.404 max=2.913 reps=15
+icd-precise-math.json log: timing_ms median=2.458 min=2.431 max=3.930 reps=15
+icd-precise-math.json mul: timing_ms median=2.436 min=2.398 max=2.849 reps=15
