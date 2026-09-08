@@ -1,0 +1,241 @@
+diff --git i/src/asahi/lib/agx_bo.c w/src/asahi/lib/agx_bo.c
+index e28bcc4..903cc52 100644
+--- i/src/asahi/lib/agx_bo.c
++++ w/src/asahi/lib/agx_bo.c
+@@ -342,7 +342,10 @@ agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo)
+       if (dev->debug & AGX_DBG_TRACE)
+          agxdecode_track_free(dev->agxdecode, bo);
+ 
+-      if (!agx_bo_cache_put(dev, bo))
++      static int nocache = -1;
++      if (nocache < 0)
++         nocache = getenv("HK_QL_NOCACHE") != NULL;
++      if (nocache || !agx_bo_cache_put(dev, bo))
+          agx_bo_free(dev, bo);
+    }
+ 
+diff --git i/src/asahi/vulkan/hk_device_memory.c w/src/asahi/vulkan/hk_device_memory.c
+index dde1437..1f17bda 100644
+--- i/src/asahi/vulkan/hk_device_memory.c
++++ w/src/asahi/vulkan/hk_device_memory.c
+@@ -5,6 +5,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ #include "hk_device_memory.h"
++#include <errno.h>
++#include <stdio.h>
+ 
+ #include "hk_device.h"
+ #include "hk_entrypoints.h"
+@@ -183,8 +185,13 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+    uint32_t alignment = 16384; /* Apple page size */
+ 
+    struct hk_memory_heap *heap = &pdev->mem_heaps[type->heapIndex];
+-   if (p_atomic_read(&heap->used) > heap->size)
++   if (p_atomic_read(&heap->used) > heap->size) {
++      fprintf(stderr, "[hkql] OOM(pre): req=%llu used=%llu heap=%llu\n",
++              (unsigned long long)pAllocateInfo->allocationSize,
++              (unsigned long long)p_atomic_read(&heap->used),
++              (unsigned long long)heap->size);
+       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   }
+ 
+    const uint64_t aligned_size =
+       align64(pAllocateInfo->allocationSize, alignment);
+@@ -215,6 +222,10 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+ 
+       mem->bo = agx_bo_create(&dev->dev, aligned_size, 0, flags, "App memory");
+       if (!mem->bo) {
++         fprintf(stderr, "[hkql] OOM(bo_create): req=%llu used=%llu heap=%llu errno=%d\n",
++                 (unsigned long long)aligned_size,
++                 (unsigned long long)p_atomic_read(&heap->used),
++                 (unsigned long long)heap->size, errno);
+          result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+          goto fail_alloc;
+       }
+@@ -245,6 +256,9 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+ 
+    uint64_t heap_used = p_atomic_add_return(&heap->used, mem->bo->size);
+    if (heap_used > heap->size) {
++      fprintf(stderr, "[hkql] OOM(heap): req=%llu used=%llu heap=%llu\n",
++              (unsigned long long)aligned_size, (unsigned long long)heap_used,
++              (unsigned long long)heap->size);
+       hk_FreeMemory(device, hk_device_memory_to_handle(mem), pAllocator);
+       return vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                        "Out of heap memory");
+diff --git i/src/asahi/vulkan/hk_event.c w/src/asahi/vulkan/hk_event.c
+index fea5829..0b2522e 100644
+--- i/src/asahi/vulkan/hk_event.c
++++ w/src/asahi/vulkan/hk_event.c
+@@ -12,6 +12,17 @@
+ #include "hk_device.h"
+ #include "hk_entrypoints.h"
+ 
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++static double
++hk_ql_now(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return ts.tv_sec + ts.tv_nsec * 1e-9;
++}
++
+ #define HK_EVENT_MEM_SIZE sizeof(VkResult)
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
+@@ -61,6 +72,9 @@ hk_GetEventStatus(VkDevice device, VkEvent _event)
+ {
+    VK_FROM_HANDLE(hk_event, event, _event);
+ 
++   if (getenv("HK_QL_DEBUG"))
++      fprintf(stderr, "[hkql %.3f] GetEventStatus %p -> %d\n", hk_ql_now(),
++              (void *)event, *event->status);
+    return *event->status;
+ }
+ 
+@@ -92,6 +106,9 @@ hk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
+    VK_FROM_HANDLE(hk_event, event, _event);
+ 
+    perf_debug(cmd, "Set event");
++   if (getenv("HK_QL_DEBUG"))
++      fprintf(stderr, "[hkql %.3f] CmdSetEvent %p cmd %p\n", hk_ql_now(),
++              (void *)event, (void *)cmd);
+    hk_cmd_buffer_end_compute(cmd);
+    hk_cmd_buffer_end_graphics(cmd);
+    hk_queue_write(cmd, event->bo->va->addr, VK_EVENT_SET, false);
+diff --git i/src/asahi/vulkan/hk_queue.c w/src/asahi/vulkan/hk_queue.c
+index e7e6aec..31aed09 100644
+--- i/src/asahi/vulkan/hk_queue.c
++++ w/src/asahi/vulkan/hk_queue.c
+@@ -36,6 +36,15 @@
+ #include "vk_drm_syncobj.h"
+ #include "vk_sync.h"
+ 
++#include <time.h>
++static double
++hk_ql_now(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return ts.tv_sec + ts.tv_nsec * 1e-9;
++}
++
+ /*
+  * We need to specially handle submits with no control streams. The kernel
+  * can't accept empty submits, but we can end up here in Vulkan for
+@@ -269,7 +278,13 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
+       virt.extres = util_dynarray_begin(&dev->external_bos.list);
+    }
+ 
++   double t0 = hk_ql_now();
+    int ret = dev->dev.ops.submit(&dev->dev, submit, &virt);
++   if (getenv("HK_QL_DEBUG"))
++      fprintf(stderr,
++              "[hkql %.3f] submit ioctl ret=%d took %.3f s cmdbuf_size=%u in=%u out=%u\n",
++              hk_ql_now(), ret, hk_ql_now() - t0, submit->cmdbuf_size,
++              submit->in_sync_count, submit->out_sync_count);
+ 
+    if (dev->dev.is_virtio)
+       u_rwlock_rdunlock(&dev->external_bos.lock);
+@@ -799,7 +814,18 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
+    for (unsigned i = 0; i < submit->signal_count; ++i) {
+       asahi_fill_sync(&syncs[wait_count + i], submit->signals[i].sync,
+                       submit->signals[i].signal_value);
++      if (getenv("HK_QL_DEBUG"))
++         fprintf(stderr, "[hkql %.3f]   signal[%u] syncobj=%u type=%u value=%llu flags=%x\n",
++                 hk_ql_now(), i, syncs[wait_count + i].handle,
++                 syncs[wait_count + i].sync_type,
++                 (unsigned long long)syncs[wait_count + i].timeline_value,
++                 submit->signals[i].sync->flags);
+    }
++   if (getenv("HK_QL_DEBUG"))
++      for (unsigned i = 0; i < wait_count; ++i)
++         fprintf(stderr, "[hkql %.3f]   wait[%u] syncobj=%u type=%u value=%llu\n",
++                 hk_ql_now(), i, syncs[i].handle, syncs[i].sync_type,
++                 (unsigned long long)syncs[i].timeline_value);
+ 
+    /* Signal progress on the queue itself */
+    syncs[wait_count + submit->signal_count] = (struct drm_asahi_sync){
+@@ -825,6 +851,17 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
+          util_dynarray_append(&payload, header);
+ 
+          if (cs->type == HK_CS_CDM) {
++            if (getenv("HK_QL_DEBUG")) {
++               uint64_t done = 0;
++               drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1);
++               fprintf(stderr,
++                       "[hkql %.3f] cmdbuf %p: CDM calls=%u cmds=%u flushes=%u merged=%u linked=%d timeline=%llu gpu_done=%llu\n",
++                       hk_ql_now(), (void *)cmdbuf, cs->stats.calls,
++                       cs->stats.cmds, cs->stats.flushes, cs->stats.merged,
++                       cs->stream_linked,
++                       (unsigned long long)queue->drm.timeline_value,
++                       (unsigned long long)done);
++            }
+             perf_debug(
+                cmdbuf,
+                "%u: Submitting CDM with %u API calls, %u dispatches, %u flushes, %u merged",
+diff --git i/src/vulkan/runtime/vk_drm_syncobj.c w/src/vulkan/runtime/vk_drm_syncobj.c
+index 57de98e..07c0ad5 100644
+--- i/src/vulkan/runtime/vk_drm_syncobj.c
++++ w/src/vulkan/runtime/vk_drm_syncobj.c
+@@ -22,6 +22,8 @@
+  */
+ 
+ #include "vk_drm_syncobj.h"
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ #include <sched.h>
+ #include <xf86drm.h>
+@@ -56,6 +58,10 @@ vk_drm_syncobj_init(struct vk_device *device,
+       flags |= DRM_SYNCOBJ_CREATE_SIGNALED;
+ 
+    int err = device->sync->create(device->sync, flags, &sobj->syncobj);
++   if (getenv("HK_QL_DEBUG"))
++      fprintf(stderr, "[hkql]   syncobj_create -> %u timeline=%d initial=%llu err=%d\n",
++              sobj->syncobj, !!(sync->flags & VK_SYNC_IS_TIMELINE),
++              (unsigned long long)initial_value, err);
+    if (err < 0) {
+       return vk_errorf(device, VK_ERROR_OUT_OF_HOST_MEMORY,
+                        "DRM_IOCTL_SYNCOBJ_CREATE failed: %m");
+@@ -80,6 +86,8 @@ vk_drm_syncobj_finish(struct vk_device *device,
+ {
+    struct vk_drm_syncobj *sobj = to_drm_syncobj(sync);
+ 
++   if (getenv("HK_QL_DEBUG"))
++      fprintf(stderr, "[hkql]   syncobj_destroy %u\n", sobj->syncobj);
+    ASSERTED int err = device->sync->destroy(device->sync, sobj->syncobj);
+    assert(err == 0);
+ }
+@@ -92,6 +100,10 @@ vk_drm_syncobj_signal(struct vk_device *device,
+    struct vk_drm_syncobj *sobj = to_drm_syncobj(sync);
+ 
+    int err;
++   if (getenv("HK_QL_DEBUG"))
++      fprintf(stderr, "[hkql]   syncobj_host_signal %u value=%llu timeline=%d\n",
++              sobj->syncobj, (unsigned long long)value,
++              !!(sync->flags & VK_SYNC_IS_TIMELINE));
+    if (sync->flags & VK_SYNC_IS_TIMELINE)
+       err = device->sync->timeline_signal(device->sync, &sobj->syncobj, &value, 1);
+    else
+@@ -160,6 +172,9 @@ vk_drm_syncobj_get_value(struct vk_device *device,
+    struct vk_drm_syncobj *sobj = to_drm_syncobj(sync);
+ 
+    int err = device->sync->query(device->sync, &sobj->syncobj, value, 1, 0);
++   if (getenv("HK_QL_DEBUG"))
++      fprintf(stderr, "[hkql]   get_value syncobj=%u -> %llu (err=%d) dst=%p\n",
++              sobj->syncobj, (unsigned long long)*value, err, (void *)value);
+    if (err) {
+       return vk_errorf(device, VK_ERROR_UNKNOWN,
+                        "DRM_IOCTL_SYNCOBJ_QUERY failed: %m");
+@@ -174,6 +189,8 @@ vk_drm_syncobj_reset(struct vk_device *device,
+ {
+    struct vk_drm_syncobj *sobj = to_drm_syncobj(sync);
+ 
++   if (getenv("HK_QL_DEBUG"))
++      fprintf(stderr, "[hkql]   syncobj_reset %u\n", sobj->syncobj);
+    int err = device->sync->reset(device->sync, &sobj->syncobj, 1);
+    if (err) {
+       return vk_errorf(device, VK_ERROR_UNKNOWN,

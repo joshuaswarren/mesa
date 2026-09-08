@@ -1,0 +1,3 @@
+tokens 2048
+[hkql] OOM(heap): req=8388608 used=8114569216 heap=8113881088
+{"status": "error", "wall_s": 6.795924949998152, "n": 2048, "error": "[omarchy] dt.AllocateMemory(device().handle(), &mai, nullptr, &buf->memory) failed with VK_ERROR_OUT_OF_DEVICE_MEMORY"}

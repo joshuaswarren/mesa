@@ -1,0 +1,92 @@
+tokens 2048
+[hkql 123493.285] CmdSetEvent 0xaaaaced17280 cmd 0xaaaacedc4ea0
+[hkql 123493.670] cmdbuf 0xaaaacedc4ea0: CDM calls=257 cmds=258 flushes=259 merged=257 linked=1 timeline=1 gpu_done=1
+[hkql 123493.670] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=0 out=2
+[hkql 123493.670] CmdSetEvent 0xaaaace561a20 cmd 0xaaaacedc9e60
+[hkql 123495.098] cmdbuf 0xaaaacedc9e60: CDM calls=256 cmds=257 flushes=258 merged=256 linked=1 timeline=2 gpu_done=0
+[hkql 123495.098] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=1 out=2
+[hkql 123495.098] CmdSetEvent 0xaaaace5d5a90 cmd 0xaaaacedb4110
+[hkql 123496.909] cmdbuf 0xaaaacedb4110: CDM calls=69 cmds=70 flushes=71 merged=69 linked=1 timeline=3 gpu_done=0
+[hkql 123496.909] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=1 out=3
+[hkql 123497.015] GetEventStatus 0xaaaaced17280 -> 3
+[hkql 123497.120] GetEventStatus 0xaaaaced17280 -> 3
+[hkql 123497.223] GetEventStatus 0xaaaaced17280 -> 3
+[hkql 123497.334] GetEventStatus 0xaaaaced17280 -> 3
+[hkql 123497.440] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123497.549] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123497.655] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123497.760] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123497.864] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123497.967] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123498.071] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123498.178] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123498.279] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123498.383] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123498.488] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123498.592] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123498.695] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123498.800] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123498.903] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123499.008] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123499.111] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123499.215] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123499.321] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123499.423] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123499.527] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123499.631] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123499.735] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123499.840] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123499.943] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123500.047] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123500.152] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123500.256] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123500.360] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123500.464] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123500.568] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123500.674] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123500.776] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123500.879] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123500.984] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123501.090] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123501.192] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123501.296] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123501.399] GetEventStatus 0xaaaace561a20 -> 3
+[hkql 123501.504] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123501.608] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123501.713] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123501.815] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123501.920] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123502.023] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123502.128] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123502.232] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123502.336] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123502.440] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123502.544] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123502.647] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123502.752] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123502.856] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123502.960] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123503.064] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123503.168] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123503.272] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123503.376] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123503.480] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123503.583] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123503.688] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123503.792] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123503.895] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123503.999] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123504.104] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123504.208] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123504.312] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123504.416] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123504.520] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123504.624] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123504.728] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123504.831] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123504.936] GetEventStatus 0xaaaace5d5a90 -> 3
+[hkql 123505.287] CmdSetEvent 0xaaaaced17280 cmd 0xaaaacedc4ea0
+[hkql 123505.292] cmdbuf 0xaaaacedc4ea0: CDM calls=1 cmds=2 flushes=3 merged=1 linked=1 timeline=4 gpu_done=3
+[hkql 123505.292] submit ioctl ret=0 took 0.000 s cmdbuf_size=72 in=1 out=3
+{"status": "ok", "wall_s": 11.965207126006135, "n": 2048, "argmax": 3974}
+rc=0 wall=16
