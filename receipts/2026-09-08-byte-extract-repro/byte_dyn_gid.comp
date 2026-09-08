@@ -1,0 +1,11 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer In { uint v[]; } in_data;
+layout(set = 0, binding = 1, std430) readonly buffer Idx { uint v[]; } idx_data;
+layout(set = 0, binding = 2, std430) writeonly buffer Out { uint v[]; } out_data;
+layout(push_constant) uniform P { uint count; } params;
+void main() {
+  uint g = gl_GlobalInvocationID.x;
+  if (g >= params.count) return;
+  out_data.v[g] = (in_data.v[g >> 2u] >> (8u * (g & 3u))) & 0xFFu;
+}
