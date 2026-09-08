@@ -1014,6 +1014,26 @@ kill_source(struct ra_ctx *rctx, const agx_instr *I, unsigned s)
    BITSET_CLEAR_COUNT(rctx->used_regs[cls], reg, count);
 }
 
+/* A killed source may be freed before the destination is allocated so the
+ * destination can reuse its registers. The G13 matrix unit reads its A/B
+ * fragments while it writes D: with fp16 A and fp32 D the pair D = A*B+C where
+ * D overlaps A returned zeros (16x16 f16/f32 coopmat, sub-block 3). Apple's
+ * compiler only ever emits D == C, so keep A and B live until D is placed.
+ */
+static bool
+early_killable(const agx_instr *I, unsigned s)
+{
+   if (!I->src[s].kill || I->src[s].memory)
+      return false;
+
+   if ((I->op == AGX_OPCODE_SIMD_MATRIX_FMADD32 ||
+        I->op == AGX_OPCODE_SIMD_MATRIX_FMADD16) &&
+       s < 2)
+      return false;
+
+   return true;
+}
+
 static void
 try_kill_early_sources(struct ra_ctx *rctx, const agx_instr *I,
                        unsigned first_source, unsigned last_source,
@@ -1034,7 +1054,7 @@ try_kill_early_sources(struct ra_ctx *rctx, const agx_instr *I,
       return;
 
    for (unsigned s = first_source; s <= last_source; ++s) {
-      if (I->src[s].kill && !I->src[s].memory) {
+      if (early_killable(I, s)) {
          kill_source(rctx, I, s);
          rctx->early_killed = true;
          I->src[s].kill = false;
@@ -1132,7 +1152,7 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          unsigned start = 0;
 
          agx_foreach_ssa_src(I, s) {
-            if (I->src[s].kill && !I->src[s].memory) {
+            if (early_killable(I, s)) {
                unsigned reg = rctx->ssa_to_reg[I->src[s].value];
 
                if (start == end || end != reg) {

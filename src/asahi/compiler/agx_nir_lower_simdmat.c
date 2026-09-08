@@ -26,18 +26,19 @@
  * muladd does blocked GEMM: D[di][dj] = C[di][dj] + sum_k A[di][k]*B[k][dj],
  * i.e. nblk^3 HW fmadds (8 for 16x16).
  *
- * !!! UNVERIFIED for N=16 / fp16 (no GPU available to the impl fork): the 8x8
- * fp32 sub-block is GPU-verified, but (a) that the 4 sub-blocks tile the 16x16
- * in this row-major-block order and (b) that fmadd16 uses the SAME fragment
- * layout as fmadd32 are ASSUMPTIONS. Discriminating oracles: an 8x8 fp16 golden
- * (gpu_check16) isolates (b); a 16x16 golden isolates (a). If 16x16 output is
- * block-permuted vs golden, fix the sb<->(bi,bj) mapping in subblk()/load_store.
+ * GPU-verified exact (identity, ones, random-integer and random-float inputs,
+ * row- and column-major, 2026-09-08 on M1 G13G) for every advertised shape:
+ * N in {8,16} x {fp32 A/B/C, fp16 A/B + fp32 C, fp16 A/B/C}. The 16x16
+ * sub-block order above and the fp16 fragment layout (same lane mapping, two
+ * halves in one 32-bit register) are what the hardware uses.
  *
- * Precision: operands carry their bit size (fp16 A/B -> fmadd16; fp32 -> fmadd32,
- * selected in agx_compile.c). For an fp16xfp16->fp32 (f32acc) shape, A/B are
- * up-converted to fp32 here so the accumulate uses the verified fmadd32 layout.
+ * Precision: the accumulator type selects the opcode (fp16 C -> fmadd16, fp32
+ * C -> fmadd32, in agx_compile.c); A/B are passed at their own width. Verified
+ * operand forms: fmadd32 with fp32 or fp16 A/B (the fp16 A/B, fp32 C form is
+ * what Apple's own mul_mm emits), fmadd16 with fp16 A/B. fp32 A/B with an fp16
+ * accumulator is not advertised and not lowered.
  *
- * Gated by AGX_SIMDMAT (8x8) or AGX_COOPMAT+AGX_HWMAT (16x16) at the call site.
+ * Gated by AGX_SIMDMAT at the call site.
  */
 
 #include "util/macros.h"
@@ -307,12 +308,12 @@ lower_muladd(nir_builder *b, nir_intrinsic_instr *intr)
    nir_def *bb = load_src(b, intr->src[2]);
    nir_def *c = load_src(b, intr->src[3]);
 
-   /* Accumulate in the C type. If A/B are narrower (fp16 -> fp32 acc),
-    * up-convert so the HW op uses the GPU-verified fmadd32 fragment layout. */
-   if (in_bits != acc_bits) {
-      a = nir_f2fN(b, a, acc_bits);
-      bb = nir_f2fN(b, bb, acc_bits);
-   }
+   /* The HW op accumulates in the C type and takes A/B at their own width
+    * (fp16 A/B with fp32 C is the mixed-precision form Apple's own mul_mm
+    * emits: simd_matrix_fmadd32 rN_rN+1, rMl_rMh, rKl_rKh, rN_rN+1). Only a
+    * wider A/B than C (fp32 A/B, fp16 acc) needs a convert, and no shape
+    * advertises that. */
+   assert(in_bits <= acc_bits);
 
    /* Blocked GEMM over the 8x8 sub-blocks: D[di][dj] = C[di][dj] +
     * sum_k A[di][k] * B[k][dj]. Each term is ONE HW matrix fmadd
@@ -326,7 +327,7 @@ lower_muladd(nir_builder *b, nir_intrinsic_instr *intr)
          for (unsigned k = 0; k < nblk; k++) {
             nir_def *as = subblk(b, a, di * nblk + k);
             nir_def *bs = subblk(b, bb, k * nblk + dj);
-            acc = nir_simd_matrix_fmadd_agx(b, as, bs, acc);
+            acc = nir_simd_matrix_fmadd_agx(b, acc_bits, as, bs, acc);
          }
          dch[sb * 2] = nir_channel(b, acc, 0);
          dch[sb * 2 + 1] = nir_channel(b, acc, 1);

@@ -1699,11 +1699,18 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
 
    case nir_intrinsic_simd_matrix_fmadd_agx: {
       /* Apple G13 hardware 8x8x8 matrix MAC: D = A*B + C, SIMD-group-wide.
-       * Each operand is this lane's 2 fragment elements (a 32-bit register pair).
+       * Each operand is this lane's 2 fragment elements: a 32-bit register
+       * pair for fp32, one 32-bit register (two halves) for fp16. The
+       * accumulator precision picks the opcode; A/B carry their own size
+       * bits, so fmadd32 with fp16 A/B is the mixed-precision form.
        */
-      agx_simd_matrix_fmadd32_to(b, dst, agx_src_index(&instr->src[0]),
-                                 agx_src_index(&instr->src[1]),
-                                 agx_src_index(&instr->src[2]));
+      agx_index a = agx_src_index(&instr->src[0]);
+      agx_index bm = agx_src_index(&instr->src[1]);
+      agx_index c = agx_src_index(&instr->src[2]);
+      if (instr->def.bit_size == 16)
+         agx_simd_matrix_fmadd16_to(b, dst, a, bm, c);
+      else
+         agx_simd_matrix_fmadd32_to(b, dst, a, bm, c);
       agx_emit_cached_split(b, dst, 2);
       return NULL;
    }
