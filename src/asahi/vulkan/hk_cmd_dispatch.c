@@ -48,9 +48,19 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
    assert(cs->current + AGX_CDM_BARRIER_LENGTH < cs->end &&
           "caller must ensure space");
 
-   cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
-   cs->stats.flushes++;
+   if (HK_PERF(dev, NOCDMBARRIER)) {
+      /* Perftest only: launch with no cache maintenance at all. */
+   } else if (HK_PERF(dev, USCCDMBARRIER)) {
+      /* Perftest only: keep the USC cache invalidate, drop the rest. */
+      cs->current = agx_cdm_barrier_usc(cs->current);
+   } else {
+      cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
+   }
+
+   if (!HK_PERF(dev, NOCDMBARRIER))
+      cs->stats.flushes++;
 }
+
 
 void
 hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,

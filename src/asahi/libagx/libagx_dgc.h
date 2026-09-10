@@ -415,6 +415,22 @@ agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
    return out;
 }
 
+/*
+ * Minimal variant of agx_cdm_barrier: invalidate the USC cache only. Used by
+ * the Vulkan driver for launches whose results are consumed by another compute
+ * launch through the same (L2-backed) storage path, where the PBE/texture
+ * cache maintenance of the full barrier is not required.
+ */
+static inline GLOBAL uint32_t *
+agx_cdm_barrier_usc(GLOBAL uint32_t *out)
+{
+   agx_push(out, CDM_BARRIER, cfg) {
+      cfg.usc_cache_inval = true;
+   }
+
+   return out;
+}
+
 static inline GLOBAL uint32_t *
 agx_vdm_return(GLOBAL uint32_t *out)
 {

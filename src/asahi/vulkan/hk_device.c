@@ -43,7 +43,10 @@ static const struct debug_named_value hk_perf_options[] = {
    {"noborder",  HK_PERF_NOBORDER, "Disable custom border colour emulation"},
    {"nobarrier", HK_PERF_NOBARRIER,"Ignore pipeline barriers"},
    {"batch",     HK_PERF_BATCH,    "Batch submissions"},
-   {"norobust",  HK_PERF_NOROBUST, "Disable robustness"},
+   {"nocdmbarrier", HK_PERF_NOCDMBARRIER,
+    "Omit the per-launch CDM barrier entirely"},
+   {"usccdmbarrier", HK_PERF_USCCDMBARRIER,
+    "Reduce the per-launch CDM barrier to a USC cache invalidate"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
