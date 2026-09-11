@@ -142,17 +142,23 @@ for start in range(32):
     ])
 
 # ushr uses only the low 5 bits of its count (SM5 semantics), and the main
-# nir_opt_algebraic has already stripped explicit masks on that basis.
-# ubitfield_extract (bfeil) does not wrap: an offset >= 32 reads as zero on
-# the hardware. lower_sm5_shift runs after this pass, so a ushr fused here is
-# never masked by it; keep the modulo unless the count is a constant in range.
+# nir_opt_algebraic has already stripped explicit masks on that basis. Fuse to
+# ubfe, not ubitfield_extract: ubfe is defined to take its offset and width
+# modulo 32, which is exactly ushr's behaviour, so the fused form cannot be
+# poisoned by a later pass reasoning about an out-of-range bitfield_extract.
+#
+# The hardware is the part that does not wrap: bfeil reads zero for an offset
+# >= 32, and lower_sm5_shift runs after this pass, so a ushr consumed here is
+# never masked by it. Keep an explicit modulo unless the count is a constant
+# already in range; it costs nothing, because it CSEs with the mask the shader
+# had before the fusion.
 fuse_ubfe = []
 for bits in range(1, 32):
     fuse_ubfe.extend([
         (('iand', ('ushr', 'a@32', '#b(is_ult_32)'), (1 << bits) - 1),
-         ('ubitfield_extract', a, b, bits)),
+         ('ubfe', a, b, bits)),
         (('iand', ('ushr', 'a@32', 'b(is_not_const)'), (1 << bits) - 1),
-         ('ubitfield_extract', a, ('iand', b, 31), bits)),
+         ('ubfe', a, ('iand', b, 31), bits)),
     ])
 
 # (x * y) + s = (x * y) + (s << 0)
