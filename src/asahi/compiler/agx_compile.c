@@ -2031,6 +2031,24 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
       return agx_bfeil_to(b, dst, i0, s0, s1, m);
    }
 
+   case nir_op_ubfe: {
+      /* SM5 semantics: offset and width are both taken modulo 32. The width is
+       * a constant here because agx_nir_fuse_algebraic_late is the only thing
+       * that forms ubfe (has_bfe is not advertised, so NIR never generates
+       * it), and that pass masks the offset for the same reason
+       * ubitfield_extract needed it: bfeil does not wrap on the hardware.
+       */
+      unsigned m = nir_alu_src_as_uint(instr->src[2]) & 0x1F;
+
+      /* Unlike ubitfield_extract, a width of zero reads as zero here rather
+       * than meaning "all 32 bits", so it cannot share the masking above.
+       */
+      if (m == 0)
+         return agx_mov_imm_to(b, dst, 0);
+
+      return agx_bfeil_to(b, dst, i0, s0, s1, m);
+   }
+
    case nir_op_bcsel:
       return agx_icmpsel_to(b, dst, s0, i0, s2, s1, AGX_ICOND_UEQ);
 
