@@ -3530,6 +3530,11 @@ agx_preprocess_nir(nir_shader *nir)
       NIR_PASS(_, nir, agx_nir_lower_simdmat, 32);
 
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   /* Unroll simd-matrix loops: the loop-carried aligned accumulator pair
+    * ping-pongs through two MOVs per iteration on a ~16-cycle HW op, so
+    * amortizing loop control and pair copies over several fmadds is a
+    * direct throughput win. See fma-ceiling receipt 2026-09-11. */
+   NIR_PASS(_, nir, agx_nir_unroll_simdmat_loops);
 
    /* Lower large arrays to scratch and small arrays to csel */
    NIR_PASS(_, nir, nir_lower_vars_to_scratch, 256,

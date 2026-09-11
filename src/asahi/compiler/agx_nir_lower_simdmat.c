@@ -44,6 +44,7 @@
 #include "util/macros.h"
 #include "compiler/nir/nir_builder.h"
 #include "agx_compiler.h"
+#include "agx_nir.h"
 
 #define SIMDMAT_SUBGROUP 32
 
@@ -542,4 +543,53 @@ agx_nir_lower_simdmat(nir_shader *shader, unsigned subgroup_size)
 
    _mesa_hash_table_destroy(tm, NULL);
    return progress;
+}
+
+/* Loops that carry the hardware simd-matrix accumulator ping-pong their
+ * aligned 64-bit register pairs through two MOVs per iteration, and pay
+ * loop-control issue slots, on a fmadd that already occupies ~16 cycles
+ * per 8x8x8 tile. Marking these loops for the NIR unroller amortizes the
+ * pair copies and loop control over several matrix FMADDs per control
+ * block. Measured on M1 (fma-ceiling receipt 2026-09-11): the zero-traffic
+ * coopMatMulAdd ceiling is 1690 GFLOP/s against a 2303 GFLOP/s scalar FMA
+ * ceiling on the same device; the AGX loop body is
+ *   mov rA, in0; mov rA+1, in1; simd_matrix_fmadd32; iadd; jmp
+ * so roughly a quarter of the issue slots are overhead.
+ */
+static bool
+mark_simdmat_loops(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_simd_matrix_fmadd_agx)
+               continue;
+            for (struct nir_cf_node *n = instr->block->cf_node.parent; n;
+                 n = n->parent) {
+               if (n->type == nir_cf_node_loop) {
+                  nir_loop *loop = nir_cf_node_as_loop(n);
+                  if (loop->control != nir_loop_control_unroll) {
+                     loop->control = nir_loop_control_unroll;
+                     progress = true;
+                  }
+                  break;
+               }
+            }
+         }
+      }
+   }
+   return progress;
+}
+
+bool
+agx_nir_unroll_simdmat_loops(nir_shader *nir)
+{
+   if (!mark_simdmat_loops(nir))
+      return false;
+
+   return nir_opt_loop_unroll(nir);
 }

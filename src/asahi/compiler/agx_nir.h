@@ -27,6 +27,7 @@ bool agx_nir_lower_fdiv_late(struct nir_shader *s);
 bool agx_nir_lower_log(struct nir_shader *s);
 bool agx_nir_lower_sincos(struct nir_shader *s);
 
+bool agx_nir_unroll_simdmat_loops(struct nir_shader *shader);
 bool agx_nir_lower_texture_early(struct nir_shader *s, bool support_lod_bias);
 bool agx_nir_lower_texture(struct nir_shader *s);
 bool agx_nir_lower_multisampled_image_store(struct nir_shader *s);
