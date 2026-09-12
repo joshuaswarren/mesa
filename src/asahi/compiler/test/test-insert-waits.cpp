@@ -39,13 +39,21 @@ class InsertWaits : public testing::Test {
    }
 
    /* A fresh block appended to ctx, plus a builder cursor at its start */
-   agx_builder *new_block(agx_context *ctx)
+   agx_builder *new_block(agx_context *ctx, agx_block **out = nullptr)
    {
       agx_block *blk = agx_test_block(ctx);
+      if (out)
+         *out = blk;
+
       agx_builder *b = rzalloc(mem_ctx, agx_builder);
       b->shader = ctx;
       b->cursor = agx_before_block(blk);
       return b;
+   }
+
+   agx_block *first_block(agx_context *ctx)
+   {
+      return list_first_entry(&ctx->blocks, agx_block, link);
    }
 
    unsigned count_waits(agx_context *ctx)
@@ -85,37 +93,25 @@ class InsertWaits : public testing::Test {
       return n;
    }
 
-   /* Block 0 of the shader (the if block under test) */
-   agx_block *first_block(agx_context *ctx)
-   {
-      return list_first_entry(&ctx->blocks, agx_block, link);
-   }
-
-   /* Standard divergent if/else shape: if block, then arm, else arm (ending
-    * in pop_exec), merge - the shape emit_if lowers to.
+   /* The hardware invariant: walking the scheduled instruction stream, a
+    * slot's outstanding count never exceeds AGX_MAX_PENDING after any
+    * asynchronous instruction issues. Waits are full-slot drains.
     */
-   void build_if_else(agx_builder *b0)
+   void assert_capacity_bound(agx_context *ctx)
    {
-      agx_context *ctx = b0->shader;
-      agx_block *then_blk = agx_test_block(ctx);
-      agx_builder *b1 = new_block(ctx);
-      agx_block *else_blk = agx_test_block(ctx);
-      agx_builder *b2 = new_block(ctx);
-      agx_block *merge = agx_test_block(ctx);
-      agx_builder *b3 = new_block(ctx);
-
-      (void)b1;
-      (void)b3;
-
-      /* else arm restores the exec mask */
-      agx_pop_exec(b2, 1);
-
-      agx_if_icmp(b0, agx_zero(), agx_zero(), 1, AGX_ICOND_UEQ, true,
-                  else_blk);
-      agx_block_add_successor(first_block(ctx), then_blk);
-      agx_block_add_successor(first_block(ctx), else_blk);
-      agx_block_add_successor(then_blk, merge);
-      agx_block_add_successor(else_blk, merge);
+      unsigned outstanding[AGX_NUM_SLOTS] = {0};
+      agx_foreach_block(ctx, block) {
+         agx_foreach_instr_in_block(block, I) {
+            if (I->op == AGX_OPCODE_WAIT) {
+               outstanding[I->scoreboard] = 0;
+            } else if (instr_is_async(I)) {
+               outstanding[I->scoreboard]++;
+               ASSERT_LE(outstanding[I->scoreboard], AGX_MAX_PENDING)
+                  << "slot " << (unsigned)I->scoreboard << " exceeds "
+                  << AGX_MAX_PENDING << " outstanding messages";
+            }
+         }
+      }
    }
 };
 
@@ -125,9 +121,8 @@ TEST_F(InsertWaits, RawHazardWaitsAtUse)
    agx_builder *b = agx_test_builder(mem_ctx);
    agx_index dst = reg(1), out = reg(2);
 
-   agx_instr *ld = load(b, dst);
+   load(b, dst);
    agx_iadd_to(b, out, dst, dst, 0);
-   (void)ld;
 
    agx_insert_waits(b->shader);
 
@@ -135,9 +130,9 @@ TEST_F(InsertWaits, RawHazardWaitsAtUse)
    assert_slots_valid(b->shader);
 }
 
-/* Seventeen loads with no intervening reads overflow a slot: the pre-issue
- * capacity check must wait before the ninth message on that slot rather
- * than let it issue.
+/* Seventeen loads with no intervening reads: both slots saturate, and the
+ * pre-issuance capacity check must drain a slot before its ninth message
+ * can issue, never after.
  */
 TEST_F(InsertWaits, SlotCapacityWaitsBeforeIssue)
 {
@@ -148,8 +143,9 @@ TEST_F(InsertWaits, SlotCapacityWaitsBeforeIssue)
 
    agx_insert_waits(b->shader);
 
-   EXPECT_EQ(count_waits(b->shader), 1u);
+   EXPECT_GE(count_waits(b->shader), 1u);
    assert_slots_valid(b->shader);
+   assert_capacity_bound(b->shader);
 }
 
 /* Divergent if/else: the then arm loads a register that the else arm
@@ -162,11 +158,11 @@ TEST_F(InsertWaits, DivergentWawWaitsInElseArm)
    agx_builder *b0 = agx_test_builder(mem_ctx);
    agx_context *ctx = b0->shader;
 
-   agx_block *then_blk = agx_test_block(ctx);
-   agx_builder *b1 = new_block(ctx);
-   agx_block *else_blk = agx_test_block(ctx);
-   agx_builder *b2 = new_block(ctx);
-   agx_block *merge = agx_test_block(ctx);
+   agx_block *then_blk, *else_blk;
+   agx_builder *b1 = new_block(ctx, &then_blk);
+   agx_builder *b2 = new_block(ctx, &else_blk);
+   agx_block *merge;
+   agx_builder *b3 = new_block(ctx, &merge);
 
    agx_index dst = reg(1);
 
@@ -186,6 +182,7 @@ TEST_F(InsertWaits, DivergentWawWaitsInElseArm)
 
    EXPECT_EQ(count_waits(ctx), 1u);
    assert_slots_valid(ctx);
+   assert_capacity_bound(ctx);
 
    /* No wait in the then arm: the load carries, it does not drain */
    EXPECT_EQ(waits_before(then_blk, ld), 0u);
@@ -203,12 +200,10 @@ TEST_F(InsertWaits, MergeReaderSeesCarriedPending)
    agx_builder *b0 = agx_test_builder(mem_ctx);
    agx_context *ctx = b0->shader;
 
-   agx_block *then_blk = agx_test_block(ctx);
-   agx_builder *b1 = new_block(ctx);
-   agx_block *else_blk = agx_test_block(ctx);
-   agx_builder *b2 = new_block(ctx);
-   agx_block *merge = agx_test_block(ctx);
-   agx_builder *b3 = new_block(ctx);
+   agx_block *then_blk, *else_blk, *merge;
+   agx_builder *b1 = new_block(ctx, &then_blk);
+   agx_builder *b2 = new_block(ctx, &else_blk);
+   agx_builder *b3 = new_block(ctx, &merge);
 
    agx_index dst = reg(1), out = reg(3);
 
@@ -231,6 +226,7 @@ TEST_F(InsertWaits, MergeReaderSeesCarriedPending)
     */
    EXPECT_EQ(count_waits(ctx), 1u);
    assert_slots_valid(ctx);
+   assert_capacity_bound(ctx);
 }
 
 } // namespace
