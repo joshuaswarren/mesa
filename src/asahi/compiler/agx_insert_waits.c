@@ -275,6 +275,8 @@ agx_insert_waits_regions(agx_context *ctx)
 
                   if (merge->index > else_blk->index) {
                      struct frame *f = &frames[nr_frames++];
+                     fprintf(stderr, "AGXWAITS push frame blk%u else%u merge%u\n",
+                             block->index, f->else_index, f->merge_index);
                      slots_copy(f->entry, slots);
                      slots_zero(f->then_exit);
                      f->else_index = else_blk->index;
