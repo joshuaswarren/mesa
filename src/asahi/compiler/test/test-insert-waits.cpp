@@ -30,6 +30,17 @@ class InsertWaits : public testing::Test {
    enum agx_format i32 = AGX_FORMAT_I32;
    unsigned mask1 = BITFIELD_MASK(1);
 
+   /* Mirror of the pass's internal constants (static in
+    * agx_insert_waits.c); keep in sync when re-proving the contract.
+    */
+   static constexpr unsigned NumSlots = 2;
+   static constexpr unsigned MaxPending = 8;
+
+   static bool is_async(agx_instr *I)
+   {
+      return agx_opcodes_info[I->op].immediates & AGX_IMMEDIATE_SCOREBOARD;
+   }
+
    agx_index reg(unsigned n) { return agx_register(n * 2, AGX_SIZE_32); }
 
    agx_instr *load(agx_builder *b, agx_index dst)
@@ -99,16 +110,16 @@ class InsertWaits : public testing::Test {
     */
    void assert_capacity_bound(agx_context *ctx)
    {
-      unsigned outstanding[AGX_NUM_SLOTS] = {0};
+      unsigned outstanding[NumSlots] = {0};
       agx_foreach_block(ctx, block) {
          agx_foreach_instr_in_block(block, I) {
             if (I->op == AGX_OPCODE_WAIT) {
                outstanding[I->scoreboard] = 0;
-            } else if (instr_is_async(I)) {
+            } else if (is_async(I)) {
                outstanding[I->scoreboard]++;
-               ASSERT_LE(outstanding[I->scoreboard], AGX_MAX_PENDING)
+               ASSERT_LE(outstanding[I->scoreboard], MaxPending)
                   << "slot " << (unsigned)I->scoreboard << " exceeds "
-                  << AGX_MAX_PENDING << " outstanding messages";
+                  << MaxPending << " outstanding messages";
             }
          }
       }
@@ -162,7 +173,7 @@ TEST_F(InsertWaits, DivergentWawWaitsInElseArm)
    agx_builder *b1 = new_block(ctx, &then_blk);
    agx_builder *b2 = new_block(ctx, &else_blk);
    agx_block *merge;
-   agx_builder *b3 = new_block(ctx, &merge);
+   (void)new_block(ctx, &merge);
 
    agx_index dst = reg(1);
 
