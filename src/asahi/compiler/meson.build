@@ -111,7 +111,7 @@ if with_tests
          'test/test-minifloat.cpp',
          'test/test-optimizer.cpp',
          'test/test-lower-pseudo.cpp',
-         'test/test-lower-parallel-copy.cpp',
+         'test/test-insert-waits.cpp',
          'test/test-lower-spill.cpp',
          'test/test-repair-ssa.cpp',
       ),
