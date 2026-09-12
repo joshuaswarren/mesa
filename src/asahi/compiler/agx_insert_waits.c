@@ -10,6 +10,21 @@
 #define AGX_MAX_PENDING (8)
 
 /*
+ * The scoreboarding immediate is packed into 2 bits of every asynchronous
+ * instruction, so at most 4 slots exist. Divergent if/else regions lower to
+ * exec-mask fallthrough rather than real branches, so pending messages may be
+ * carried across those block boundaries and waited at first use instead of
+ * being drained at every block exit.
+ */
+#define AGX_NUM_SLOTS (4)
+
+/* Maximum nesting of divergent if/else regions tracked for cross-block
+ * scoreboard state. Beyond this we fall back to conservative per-block
+ * draining.
+ */
+#define AGX_MAX_FRAMES (64)
+
+/*
  * Returns whether an instruction is asynchronous and needs a scoreboard slot
  */
 static bool
@@ -44,106 +59,259 @@ agx_insert_waits_trivial(agx_context *ctx, agx_block *block)
 }
 
 /*
- * Insert waits within a block, assuming scoreboard slots have already been
- * assigned. This waits for everything at the end of the block, rather than
- * doing something more intelligent/global. This should be optimized.
- *
- * XXX: Do any instructions read their sources asynchronously?
+ * Open divergent if/else region. Divergent control flow lowers to exec-mask
+ * push/pop with fallthrough, so a load issued in the then arm is still in
+ * flight at the merge; the merge seeds the union of both arms' pending state.
+ */
+struct frame {
+   /* Pending state on entry to the if, inherited by both arms */
+   struct slot entry[AGX_NUM_SLOTS];
+
+   /* Pending state left by the last block of the then arm */
+   struct slot then_exit[AGX_NUM_SLOTS];
+
+   /* Index of the else block (target of the if) */
+   unsigned else_index;
+
+   /* Index of the block following the if/else region */
+   unsigned merge_index;
+
+   /* Whether the else arm has been entered */
+   bool else_seen;
+};
+
+static void
+slots_copy(struct slot *dst, const struct slot *src)
+{
+   for (unsigned s = 0; s < AGX_NUM_SLOTS; ++s)
+      dst[s] = src[s];
+}
+
+static void
+slots_zero(struct slot *dst)
+{
+   for (unsigned s = 0; s < AGX_NUM_SLOTS; ++s) {
+      BITSET_ZERO(dst[s].writes);
+      dst[s].nr_pending = 0;
+   }
+}
+
+static void
+slots_union(struct slot *dst, const struct slot *src)
+{
+   for (unsigned s = 0; s < AGX_NUM_SLOTS; ++s) {
+      BITSET_OR(dst[s].writes, dst[s].writes, src[s].writes);
+      dst[s].nr_pending = MAX2(dst[s].nr_pending, src[s].nr_pending);
+   }
+}
+
+/* Terminator (last flow instruction) of a block, or NULL */
+static agx_instr *
+block_terminator(agx_block *block)
+{
+   agx_foreach_instr_in_block_rev(block, I) {
+      if (!instr_after_logical_end(I))
+         return NULL;
+
+      return I;
+   }
+
+   return NULL;
+}
+
+static bool
+is_mask_branch(agx_instr *I)
+{
+   return I && (I->op == AGX_OPCODE_IF_ICMP || I->op == AGX_OPCODE_IF_FCMP);
+}
+
+/*
+ * Assign scoreboard slots to asynchronous instructions and insert waits for
+ * the appropriate hazard tracking, carrying pending state across the
+ * exec-mask boundaries of divergent if/else regions. Only real branches,
+ * loop back-edges and barriers force pending messages to complete.
  */
 static void
-agx_insert_waits_local(agx_context *ctx, agx_block *block)
+agx_insert_waits_regions(agx_context *ctx)
 {
-   struct slot slots[2] = {0};
+   struct slot slots[AGX_NUM_SLOTS] = {0};
+   struct frame frames[AGX_MAX_FRAMES];
+   unsigned nr_frames = 0;
 
-   agx_foreach_instr_in_block_safe(block, I) {
+   /* Blocks are walked (and indexed) in source order, so the i'th block
+    * visited has index i.
+    */
+   agx_block **order = calloc(ctx->num_blocks, sizeof(agx_block *));
+
+   agx_foreach_block(ctx, block) {
+      order[block->index] = block;
+
+      /* Resolve region boundaries keyed by block index */
+      while (nr_frames > 0) {
+         struct frame *f = &frames[nr_frames - 1];
+
+         if (!f->else_seen && block->index == f->else_index) {
+            slots_copy(f->then_exit, slots);
+            slots_copy(slots, f->entry);
+            f->else_seen = true;
+            continue;
+         } else if (block->index == f->merge_index) {
+            slots_union(slots, f->then_exit);
+            nr_frames--;
+            continue;
+         }
+
+         break;
+      }
+
       uint8_t wait_mask = 0;
 
-      /* Check for read-after-write */
-      agx_foreach_src(I, s) {
-         if (I->src[s].type != AGX_INDEX_REGISTER)
-            continue;
+      agx_foreach_instr_in_block_safe(block, I) {
+         /* Check for read-after-write */
+         agx_foreach_src(I, s) {
+            if (I->src[s].type != AGX_INDEX_REGISTER)
+               continue;
 
-         unsigned nr_read = agx_index_size_16(I->src[s]);
-         for (unsigned slot = 0; slot < ARRAY_SIZE(slots); ++slot) {
-            if (BITSET_TEST_COUNT(slots[slot].writes, I->src[s].value, nr_read))
-               wait_mask |= BITSET_BIT(slot);
+            unsigned nr_read = agx_index_size_16(I->src[s]);
+            for (unsigned slot = 0; slot < ARRAY_SIZE(slots); ++slot) {
+               if (BITSET_TEST_COUNT(slots[slot].writes, I->src[s].value,
+                                     nr_read))
+                  wait_mask |= BITSET_BIT(slot);
+            }
+         }
+
+         /* Check for write-after-write */
+         agx_foreach_dest(I, d) {
+            if (I->dest[d].type != AGX_INDEX_REGISTER)
+               continue;
+
+            unsigned nr_writes = agx_index_size_16(I->dest[d]);
+            for (unsigned slot = 0; slot < ARRAY_SIZE(slots); ++slot) {
+               if (BITSET_TEST_COUNT(slots[slot].writes, I->dest[d].value,
+                                     nr_writes))
+                  wait_mask |= BITSET_BIT(slot);
+            }
+         }
+
+         /* Check for barriers */
+         if (I->op == AGX_OPCODE_THREADGROUP_BARRIER ||
+             I->op == AGX_OPCODE_MEMORY_BARRIER) {
+
+            for (unsigned slot = 0; slot < ARRAY_SIZE(slots); ++slot) {
+               if (slots[slot].nr_pending)
+                  wait_mask |= BITSET_BIT(slot);
+            }
+         }
+
+         /* Try to assign a free slot */
+         if (instr_is_async(I)) {
+            for (unsigned slot = 0; slot < ARRAY_SIZE(slots); ++slot) {
+               if (slots[slot].nr_pending == 0) {
+                  I->scoreboard = slot;
+                  break;
+               }
+            }
+         }
+
+         /* Check for slot overflow */
+         if (instr_is_async(I) &&
+             slots[I->scoreboard].nr_pending >= AGX_MAX_PENDING)
+            wait_mask |= BITSET_BIT(I->scoreboard);
+
+         /* Insert the appropriate waits, clearing the slots */
+         u_foreach_bit(slot, wait_mask) {
+            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+            agx_wait(&b, slot);
+
+            BITSET_ZERO(slots[slot].writes);
+            slots[slot].nr_pending = 0;
+         }
+
+         /* Record access */
+         if (instr_is_async(I)) {
+            agx_foreach_dest(I, d) {
+               if (agx_is_null(I->dest[d]))
+                  continue;
+
+               assert(I->dest[d].type == AGX_INDEX_REGISTER);
+               BITSET_SET_COUNT(slots[I->scoreboard].writes,
+                                I->dest[d].value,
+                                agx_index_size_16(I->dest[d]));
+            }
+
+            slots[I->scoreboard].nr_pending++;
          }
       }
 
-      /* Check for write-after-write */
-      agx_foreach_dest(I, d) {
-         if (I->dest[d].type != AGX_INDEX_REGISTER)
-            continue;
+      /* Decide whether pending messages must complete before leaving the
+       * block. Inside a tracked divergent region they may carry across the
+       * exec-mask fallthrough; everything else drains as before.
+       */
+      bool carry = false;
 
-         unsigned nr_writes = agx_index_size_16(I->dest[d]);
-         for (unsigned slot = 0; slot < ARRAY_SIZE(slots); ++slot) {
-            if (BITSET_TEST_COUNT(slots[slot].writes, I->dest[d].value,
-                                  nr_writes))
-               wait_mask |= BITSET_BIT(slot);
+      if (block != agx_exit_block(ctx)) {
+         agx_instr *term = block_terminator(block);
+
+         if (is_mask_branch(term) && term->target &&
+             nr_frames < AGX_MAX_FRAMES) {
+            agx_block *then_blk = block->successors[0];
+            agx_block *else_blk = block->successors[1];
+
+            /* Shape checks: then arm contiguous and non-empty, else arm
+             * present, merge well-formed. Anything unexpected falls back to
+             * draining.
+             */
+            if (then_blk && else_blk && term->target == else_blk &&
+                then_blk->index == block->index + 1 &&
+                then_blk->index + 1 == else_blk->index) {
+
+               agx_block *end_then =
+                  else_blk->index ? order[else_blk->index - 1] : NULL;
+
+               if (end_then == then_blk && !end_then->unconditional_jumps &&
+                   end_then->successors[0] && !end_then->successors[1]) {
+
+                  agx_block *merge = end_then->successors[0];
+
+                  if (merge->index > else_blk->index) {
+                     struct frame *f = &frames[nr_frames++];
+                     slots_copy(f->entry, slots);
+                     slots_zero(f->then_exit);
+                     f->else_index = else_blk->index;
+                     f->merge_index = merge->index;
+                     f->else_seen = false;
+                     carry = true;
+                  }
+               }
+            }
+         }
+
+         /* Last block of the then arm carries into the else arm */
+         if (!carry && nr_frames > 0) {
+            struct frame *f = &frames[nr_frames - 1];
+
+            if (!f->else_seen && block->index == f->else_index - 1)
+               carry = true;
+            else if (f->else_seen && block->index == f->merge_index - 1)
+               carry = true;
          }
       }
 
-      /* Check for barriers */
-      if (I->op == AGX_OPCODE_THREADGROUP_BARRIER ||
-          I->op == AGX_OPCODE_MEMORY_BARRIER) {
+      if (!carry) {
+         agx_builder b =
+            agx_init_builder(ctx, agx_after_block_logical(block));
 
          for (unsigned slot = 0; slot < ARRAY_SIZE(slots); ++slot) {
-            if (slots[slot].nr_pending)
-               wait_mask |= BITSET_BIT(slot);
-         }
-      }
-
-      /* Try to assign a free slot */
-      if (instr_is_async(I)) {
-         for (unsigned slot = 0; slot < ARRAY_SIZE(slots); ++slot) {
-            if (slots[slot].nr_pending == 0) {
-               I->scoreboard = slot;
-               break;
+            if (slots[slot].nr_pending) {
+               agx_wait(&b, slot);
+               BITSET_ZERO(slots[slot].writes);
+               slots[slot].nr_pending = 0;
             }
          }
       }
-
-      /* Check for slot overflow */
-      if (instr_is_async(I) &&
-          slots[I->scoreboard].nr_pending >= AGX_MAX_PENDING)
-         wait_mask |= BITSET_BIT(I->scoreboard);
-
-      /* Insert the appropriate waits, clearing the slots */
-      u_foreach_bit(slot, wait_mask) {
-         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-         agx_wait(&b, slot);
-
-         BITSET_ZERO(slots[slot].writes);
-         slots[slot].nr_pending = 0;
-      }
-
-      /* Record access */
-      if (instr_is_async(I)) {
-         agx_foreach_dest(I, d) {
-            if (agx_is_null(I->dest[d]))
-               continue;
-
-            assert(I->dest[d].type == AGX_INDEX_REGISTER);
-            BITSET_SET_COUNT(slots[I->scoreboard].writes, I->dest[d].value,
-                             agx_index_size_16(I->dest[d]));
-         }
-
-         slots[I->scoreboard].nr_pending++;
-      }
    }
 
-   /* If there are outstanding messages, wait for them. We don't do this for the
-    * exit block, though, since nothing else will execute in the shader so
-    * waiting is pointless.
-    */
-   if (block != agx_exit_block(ctx)) {
-      agx_builder b = agx_init_builder(ctx, agx_after_block_logical(block));
-
-      for (unsigned slot = 0; slot < ARRAY_SIZE(slots); ++slot) {
-         if (slots[slot].nr_pending)
-            agx_wait(&b, slot);
-      }
-   }
+   free(order);
 }
 
 /*
@@ -153,10 +321,10 @@ agx_insert_waits_local(agx_context *ctx, agx_block *block)
 void
 agx_insert_waits(agx_context *ctx)
 {
-   agx_foreach_block(ctx, block) {
-      if (agx_compiler_debug & AGX_DBG_WAIT)
+   if (agx_compiler_debug & AGX_DBG_WAIT) {
+      agx_foreach_block(ctx, block)
          agx_insert_waits_trivial(ctx, block);
-      else
-         agx_insert_waits_local(ctx, block);
+   } else {
+      agx_insert_waits_regions(ctx);
    }
 }
