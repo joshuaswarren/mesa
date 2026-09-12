@@ -154,8 +154,23 @@ agx_insert_waits_regions(agx_context *ctx)
             slots_copy(f->then_exit, slots);
             slots_copy(slots, f->entry);
             f->else_seen = true;
+
+            /* The then arm is complete, so its last block is now known
+             * (blocks are visited in index order). Resolve the merge from
+             * its fallthrough successor; on any unexpected shape, fold the
+             * then arm's pending state in now and retire the frame.
+             */
+            agx_block *end_then = order[f->else_index - 1];
+
+            if (!end_then->unconditional_jumps &&
+                end_then->successors[0] && !end_then->successors[1] &&
+                end_then->successors[0]->index > f->else_index)
+               f->merge_index = end_then->successors[0]->index;
+            else
+               slots_union(slots, f->then_exit);
             continue;
-         } else if (block->index == f->merge_index) {
+         } else if (f->merge_index != UINT_MAX &&
+                    block->index == f->merge_index) {
             slots_union(slots, f->then_exit);
             nr_frames--;
             continue;
@@ -248,54 +263,31 @@ agx_insert_waits_regions(agx_context *ctx)
        * exec-mask fallthrough; everything else drains as before.
        */
       bool carry = false;
-      static int dbg = -1;
-      if (dbg < 0) dbg = getenv("AGXWAITS_DEBUG") ? 1 : 0;
 
       if (block != agx_exit_block(ctx)) {
          agx_instr *term = block_terminator(block);
-
-         if (dbg)
-            fprintf(stderr,
-                    "AGXWAITS blk%u term=%d s0=%d s1=%d tgt=%d uj=%d mbr=%d\n",
-                    block->index, term ? (int)term->op : -1,
-                    block->successors[0] ? (int)block->successors[0]->index : -1,
-                    block->successors[1] ? (int)block->successors[1]->index : -1,
-                    (term && term->target) ? (int)term->target->index : -1,
-                    block->unconditional_jumps, is_mask_branch(term) ? 1 : 0);
 
          if (is_mask_branch(term) && term->target &&
              nr_frames < AGX_MAX_FRAMES) {
             agx_block *then_blk = block->successors[0];
             agx_block *else_blk = block->successors[1];
 
-            /* Shape checks: then arm contiguous and non-empty, else arm
-             * present, merge well-formed. Anything unexpected falls back to
-             * draining.
+            /* Shape checks on the local structure: the then arm starts at
+             * the layout successor and the else block is the branch target.
+             * The merge is resolved when the else arm is entered, since
+             * blocks after the current one are not yet known here.
              */
-            if (then_blk && else_blk && term->target == else_blk &&
-                then_blk->index == block->index + 1 &&
-                then_blk->index + 1 == else_blk->index) {
+            if (then_blk && else_blk && term->target &&
+                term->target->index == else_blk->index &&
+                then_blk->index == block->index + 1) {
 
-               agx_block *end_then =
-                  else_blk->index ? order[else_blk->index - 1] : NULL;
-
-               if (end_then == then_blk && !end_then->unconditional_jumps &&
-                   end_then->successors[0] && !end_then->successors[1]) {
-
-                  agx_block *merge = end_then->successors[0];
-
-                  if (merge->index > else_blk->index) {
-                     struct frame *f = &frames[nr_frames++];
-                     fprintf(stderr, "AGXWAITS push frame blk%u else%u merge%u\n",
-                             block->index, f->else_index, f->merge_index);
-                     slots_copy(f->entry, slots);
-                     slots_zero(f->then_exit);
-                     f->else_index = else_blk->index;
-                     f->merge_index = merge->index;
-                     f->else_seen = false;
-                     carry = true;
-                  }
-               }
+               struct frame *f = &frames[nr_frames++];
+               slots_copy(f->entry, slots);
+               slots_zero(f->then_exit);
+               f->else_index = else_blk->index;
+               f->merge_index = UINT_MAX;
+               f->else_seen = false;
+               carry = true;
             }
          }
 
@@ -305,7 +297,8 @@ agx_insert_waits_regions(agx_context *ctx)
 
             if (!f->else_seen && block->index == f->else_index - 1)
                carry = true;
-            else if (f->else_seen && block->index == f->merge_index - 1)
+            else if (f->else_seen && f->merge_index != UINT_MAX &&
+                     block->index == f->merge_index - 1)
                carry = true;
          }
       }
