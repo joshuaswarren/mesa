@@ -10,14 +10,18 @@
 #define AGX_MAX_PENDING (8)
 
 /*
- * The scoreboarding immediate is packed into 2 bits of every asynchronous
- * instruction, so at most 4 slots exist. Divergent if/else regions lower to
- * exec-mask fallthrough rather than real branches, so pending messages may be
- * carried across those block boundaries and waited at first use instead of
- * being drained at every block exit.
+ * The scoreboard index is one bit in the IR ("Scoreboard index, 0 or 1",
+ * agx_instr::scoreboard in agx_compiler.h) and at most two bits in any
+ * encoder, with texture sample packing a single bit (agx_pack.c). Two
+ * slots is the documented hardware configuration; it still batches the
+ * guarded loads of the target kernels across both slots.
  */
-#define AGX_NUM_SLOTS (4)
+#define AGX_NUM_SLOTS (2)
 
+/* Widening AGX_NUM_SLOTS past the IR field width silently truncates every
+ * slot assignment above 1; re-prove the hardware contract before changing.
+ */
+_Static_assert(AGX_NUM_SLOTS <= 2, "agx_instr::scoreboard is a 1-bit field");
 /* Maximum nesting of divergent if/else regions tracked for cross-block
  * scoreboard state. Beyond this we fall back to conservative per-block
  * draining.
@@ -60,21 +64,18 @@ agx_insert_waits_trivial(agx_context *ctx, agx_block *block)
 
 /*
  * Open divergent if/else region. Divergent control flow lowers to exec-mask
- * push/pop with fallthrough, so a load issued in the then arm is still in
- * flight at the merge; the merge seeds the union of both arms' pending state.
+ * push/pop with fallthrough (emit_if in agx_compile.c: the else arm begins
+ * with an unconditional else_fcmp, and a pop_exec is appended after the
+ * logical end of the last block of the else arm for every region), so a load
+ * issued in the then arm is still in flight inside the else arm and at the
+ * merge.
  */
 struct frame {
-   /* Pending state on entry to the if, inherited by both arms */
+   /* Pending state on entry to the if, unioned into the else arm */
    struct slot entry[AGX_NUM_SLOTS];
-
-   /* Pending state left by the last block of the then arm */
-   struct slot then_exit[AGX_NUM_SLOTS];
 
    /* Index of the else block (target of the if) */
    unsigned else_index;
-
-   /* Index of the block following the if/else region */
-   unsigned merge_index;
 
    /* Whether the else arm has been entered */
    bool else_seen;
@@ -87,30 +88,26 @@ slots_copy(struct slot *dst, const struct slot *src)
       dst[s] = src[s];
 }
 
-static void
-slots_zero(struct slot *dst)
-{
-   for (unsigned s = 0; s < AGX_NUM_SLOTS; ++s) {
-      BITSET_ZERO(dst[s].writes);
-      dst[s].nr_pending = 0;
-   }
-}
-
 /*
- * Merge two arms' pending state at a divergent merge. Scoreboard queues are
- * per-lane hardware state (the same accounting the straight-line path relies
- * on), and the two arms of a divergent if/else are mutually exclusive per
- * lane, so a lane has at most max(then, else) outstanding messages per slot,
- * never the sum. The write sets still union: a post-merge reader can be fed
- * by either arm depending on the lane's path, so pending writes from both
- * arms must trigger the wait.
+ * Merge carried state at an else arrival. The write sets union so any later
+ * reader waits for whichever arm's pending write it must order against:
+ * register allocation runs before this pass, so a physical register written
+ * by the then arm may legally be rewritten by the else arm, and an in-flight
+ * writeback races that rewrite unless the else arm sees the pending state.
+ *
+ * Pending counts sum rather than max: the pass assumes nothing about whether
+ * scoreboard queues are per-lane or shared per subgroup, so carried state
+ * must assume both contributions are outstanding. Sums are clamped, and any
+ * slot driven past AGX_MAX_PENDING by a merge is force-drained at the merge,
+ * so the bound holds under either accounting.
  */
 static void
 slots_union(struct slot *dst, const struct slot *src)
 {
    for (unsigned s = 0; s < AGX_NUM_SLOTS; ++s) {
       BITSET_OR(dst[s].writes, dst[s].writes, src[s].writes);
-      dst[s].nr_pending = MAX2(dst[s].nr_pending, src[s].nr_pending);
+      dst[s].nr_pending =
+         MIN2(dst[s].nr_pending + src[s].nr_pending, 4 * AGX_MAX_PENDING);
    }
 }
 
@@ -139,6 +136,14 @@ is_mask_branch(agx_instr *I)
  * the appropriate hazard tracking, carrying pending state across the
  * exec-mask boundaries of divergent if/else regions. Only real branches,
  * loop back-edges and barriers force pending messages to complete.
+ *
+ * Regions close lazily: every if/else region ends with a pop_exec appended
+ * after the logical end of the last else-arm block, so a frame is closed
+ * when a block is entered whose predecessor ends with pop_exec and which
+ * lies past the region's else block. No merge index is resolved up front,
+ * so every CFG shape a region can have is handled by the same rule. When a
+ * frame fails to close, carried state only over-approximates the hardware's
+ * pending messages, which costs extra waits at first use and nothing else.
  */
 static void
 agx_insert_waits_regions(agx_context *ctx)
@@ -163,44 +168,47 @@ agx_insert_waits_regions(agx_context *ctx)
          struct frame *f = &frames[nr_frames - 1];
 
          if (!f->else_seen && block->index == f->else_index) {
-            /* The then arm's pending state is saved, not dropped: the else
-             * arm runs with the state from before the if (SSA dominance
-             * means it cannot read a then-only definition), and the merge
-             * seeds the union of both arms' state below.
+            /* Else arrival: the then arm's pending writes stay in flight
+             * (masked lanes skipped issuing them, the hardware did not
+             * complete them), so the else arm must see the union of the
+             * entry and then-exit state.
              */
-            slots_copy(f->then_exit, slots);
-            slots_copy(slots, f->entry);
+            fprintf(stderr, "AGXWAITS: blk%u else-arrival frame=%u\n",
+                    block->index, nr_frames - 1);
+            slots_union(slots, f->entry);
             f->else_seen = true;
 
-            /* The then arm is complete, so its last block is now known
-             * (blocks are visited in index order). Resolve the merge from
-             * its fallthrough successor; on any unexpected shape, fold the
-             * then arm's pending state in now and retire the frame.
-             */
-            agx_block *end_then = order[f->else_index - 1];
+            uint8_t overflow = 0;
 
-            if (!end_then->unconditional_jumps &&
-                end_then->successors[0] && !end_then->successors[1] &&
-                end_then->successors[0]->index > f->else_index) {
-               f->merge_index = end_then->successors[0]->index;
-               fprintf(stderr,
-                       "AGXWAITS: blk%u else-arrival frame=%u merge=%u\n",
-                       block->index, nr_frames - 1, f->merge_index);
-            } else {
-               slots_union(slots, f->then_exit);
-               fprintf(stderr,
-                       "AGXWAITS: blk%u else-arrival frame=%u FOLD shape\n",
+            for (unsigned s = 0; s < AGX_NUM_SLOTS; ++s) {
+               if (slots[s].nr_pending > AGX_MAX_PENDING)
+                  overflow |= BITSET_BIT(s);
+            }
+
+            u_foreach_bit(slot, overflow) {
+               agx_builder b =
+                  agx_init_builder(ctx, agx_before_block(block));
+               agx_wait(&b, slot);
+
+               BITSET_ZERO(slots[slot].writes);
+               slots[slot].nr_pending = 0;
+            }
+
+            if (overflow) {
+               fprintf(stderr, "AGXWAITS: blk%u overflow-drain mask=%x\n",
+                       block->index, overflow);
+            }
+
+            continue;
+         } else if (f->else_seen && block->index > f->else_index) {
+            agx_instr *prev_term = block_terminator(order[block->index - 1]);
+
+            if (prev_term && prev_term->op == AGX_OPCODE_POP_EXEC) {
+               fprintf(stderr, "AGXWAITS: blk%u close frame=%u\n",
                        block->index, nr_frames - 1);
                nr_frames--;
+               continue;
             }
-            continue;
-         } else if (f->merge_index != UINT_MAX &&
-                    block->index == f->merge_index) {
-            slots_union(slots, f->then_exit);
-            fprintf(stderr, "AGXWAITS: blk%u merge-arrival frame=%u\n",
-                    block->index, nr_frames - 1);
-            nr_frames--;
-            continue;
          }
 
          break;
@@ -286,20 +294,16 @@ agx_insert_waits_regions(agx_context *ctx)
       }
 
       /* Decide whether pending messages must complete before leaving the
-       * block. Inside a tracked divergent region they may carry across the
-       * exec-mask fallthrough; everything else drains as before.
+       * block. Inside a tracked divergent region, a fallthrough edge stays
+       * in the same masked execution, so state carries; real control
+       * transfers drain as before. An else arm's last block ends with
+       * pop_exec and falls through into the merge, which the close rule has
+       * not seen yet, so it carries explicitly.
        */
       bool carry = false;
 
       if (block != agx_exit_block(ctx)) {
          agx_instr *term = block_terminator(block);
-
-         if (is_mask_branch(term) && !term->target)
-            fprintf(stderr, "AGXWAITS: blk%u reject target=NULL\n",
-                    block->index);
-         else if (is_mask_branch(term) && nr_frames >= AGX_MAX_FRAMES)
-            fprintf(stderr, "AGXWAITS: blk%u reject frames-full\n",
-                    block->index);
 
          if (is_mask_branch(term) && term->target &&
              nr_frames < AGX_MAX_FRAMES) {
@@ -308,18 +312,14 @@ agx_insert_waits_regions(agx_context *ctx)
 
             /* Shape checks on the local structure: the then arm starts at
              * the layout successor and the else block is the branch target.
-             * The merge is resolved when the else arm is entered, since
-             * blocks after the current one are not yet known here.
              */
-            if (then_blk && else_blk && term->target &&
+            if (then_blk && else_blk &&
                 term->target->index == else_blk->index &&
                 then_blk->index == block->index + 1) {
 
                struct frame *f = &frames[nr_frames++];
                slots_copy(f->entry, slots);
-               slots_zero(f->then_exit);
                f->else_index = else_blk->index;
-               f->merge_index = UINT_MAX;
                f->else_seen = false;
                carry = true;
                fprintf(stderr, "AGXWAITS: blk%u ACCEPT frame=%u else=%u\n",
@@ -332,17 +332,15 @@ agx_insert_waits_regions(agx_context *ctx)
                        then_blk ? (int)then_blk->index : -1,
                        else_blk ? (int)else_blk->index : -1);
             }
-         }
-
-         /* Last block of the then arm carries into the else arm */
-         if (!carry && nr_frames > 0) {
-            struct frame *f = &frames[nr_frames - 1];
-
-            if (!f->else_seen && block->index == f->else_index - 1)
-               carry = true;
-            else if (f->else_seen && f->merge_index != UINT_MAX &&
-                     block->index == f->merge_index - 1)
-               carry = true;
+         } else if (is_mask_branch(term) && !term->target) {
+            fprintf(stderr, "AGXWAITS: blk%u reject target=NULL\n",
+                    block->index);
+         } else if (is_mask_branch(term) && nr_frames >= AGX_MAX_FRAMES) {
+            fprintf(stderr, "AGXWAITS: blk%u reject frames-full\n",
+                    block->index);
+         } else if (nr_frames > 0 && !block->unconditional_jumps &&
+                    (!term || term->op == AGX_OPCODE_POP_EXEC)) {
+            carry = true;
          }
       }
 
