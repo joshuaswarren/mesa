@@ -157,13 +157,13 @@ agx_insert_waits_regions(agx_context *ctx)
     */
    agx_block **order = calloc(ctx->num_blocks, sizeof(agx_block *));
    fprintf(stderr, "AGXWAITS: enter shader=%s blocks=%u\n",
-           ctx->nir->info.name ? ctx->nir->info.name : "(unnamed)",
+           (ctx->nir && ctx->nir->info.name) ? ctx->nir->info.name
+                                             : "(unnamed)",
            ctx->num_blocks);
 
    agx_foreach_block(ctx, block) {
       order[block->index] = block;
 
-      /* Resolve region boundaries keyed by block index */
       while (nr_frames > 0) {
          struct frame *f = &frames[nr_frames - 1];
 
