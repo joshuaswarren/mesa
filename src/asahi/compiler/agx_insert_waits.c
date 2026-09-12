@@ -344,7 +344,7 @@ agx_insert_waits_regions(agx_context *ctx)
          }
       }
 
-      if (!carry) {
+      if (!carry && block != agx_exit_block(ctx)) {
          unsigned drained = 0;
          agx_builder b =
             agx_init_builder(ctx, agx_after_block_logical(block));
