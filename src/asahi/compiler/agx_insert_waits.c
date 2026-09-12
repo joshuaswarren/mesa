@@ -96,6 +96,15 @@ slots_zero(struct slot *dst)
    }
 }
 
+/*
+ * Merge two arms' pending state at a divergent merge. Scoreboard queues are
+ * per-lane hardware state (the same accounting the straight-line path relies
+ * on), and the two arms of a divergent if/else are mutually exclusive per
+ * lane, so a lane has at most max(then, else) outstanding messages per slot,
+ * never the sum. The write sets still union: a post-merge reader can be fed
+ * by either arm depending on the lane's path, so pending writes from both
+ * arms must trigger the wait.
+ */
 static void
 slots_union(struct slot *dst, const struct slot *src)
 {
@@ -142,6 +151,9 @@ agx_insert_waits_regions(agx_context *ctx)
     * visited has index i.
     */
    agx_block **order = calloc(ctx->num_blocks, sizeof(agx_block *));
+   fprintf(stderr, "AGXWAITS: enter shader=%s blocks=%u\n",
+           ctx->nir->info.name ? ctx->nir->info.name : "(unnamed)",
+           ctx->num_blocks);
 
    agx_foreach_block(ctx, block) {
       order[block->index] = block;
@@ -151,6 +163,11 @@ agx_insert_waits_regions(agx_context *ctx)
          struct frame *f = &frames[nr_frames - 1];
 
          if (!f->else_seen && block->index == f->else_index) {
+            /* The then arm's pending state is saved, not dropped: the else
+             * arm runs with the state from before the if (SSA dominance
+             * means it cannot read a then-only definition), and the merge
+             * seeds the union of both arms' state below.
+             */
             slots_copy(f->then_exit, slots);
             slots_copy(slots, f->entry);
             f->else_seen = true;
@@ -164,14 +181,24 @@ agx_insert_waits_regions(agx_context *ctx)
 
             if (!end_then->unconditional_jumps &&
                 end_then->successors[0] && !end_then->successors[1] &&
-                end_then->successors[0]->index > f->else_index)
+                end_then->successors[0]->index > f->else_index) {
                f->merge_index = end_then->successors[0]->index;
-            else
+               fprintf(stderr,
+                       "AGXWAITS: blk%u else-arrival frame=%u merge=%u\n",
+                       block->index, nr_frames - 1, f->merge_index);
+            } else {
                slots_union(slots, f->then_exit);
+               fprintf(stderr,
+                       "AGXWAITS: blk%u else-arrival frame=%u FOLD shape\n",
+                       block->index, nr_frames - 1);
+               nr_frames--;
+            }
             continue;
          } else if (f->merge_index != UINT_MAX &&
                     block->index == f->merge_index) {
             slots_union(slots, f->then_exit);
+            fprintf(stderr, "AGXWAITS: blk%u merge-arrival frame=%u\n",
+                    block->index, nr_frames - 1);
             nr_frames--;
             continue;
          }
@@ -179,9 +206,9 @@ agx_insert_waits_regions(agx_context *ctx)
          break;
       }
 
-      uint8_t wait_mask = 0;
-
       agx_foreach_instr_in_block_safe(block, I) {
+         uint8_t wait_mask = 0;
+
          /* Check for read-after-write */
          agx_foreach_src(I, s) {
             if (I->src[s].type != AGX_INDEX_REGISTER)
@@ -267,6 +294,13 @@ agx_insert_waits_regions(agx_context *ctx)
       if (block != agx_exit_block(ctx)) {
          agx_instr *term = block_terminator(block);
 
+         if (is_mask_branch(term) && !term->target)
+            fprintf(stderr, "AGXWAITS: blk%u reject target=NULL\n",
+                    block->index);
+         else if (is_mask_branch(term) && nr_frames >= AGX_MAX_FRAMES)
+            fprintf(stderr, "AGXWAITS: blk%u reject frames-full\n",
+                    block->index);
+
          if (is_mask_branch(term) && term->target &&
              nr_frames < AGX_MAX_FRAMES) {
             agx_block *then_blk = block->successors[0];
@@ -288,6 +322,15 @@ agx_insert_waits_regions(agx_context *ctx)
                f->merge_index = UINT_MAX;
                f->else_seen = false;
                carry = true;
+               fprintf(stderr, "AGXWAITS: blk%u ACCEPT frame=%u else=%u\n",
+                       block->index, nr_frames - 1, f->else_index);
+            } else {
+               fprintf(stderr,
+                       "AGXWAITS: blk%u reject shape tgt=%d s0=%d s1=%d\n",
+                       block->index,
+                       term->target ? (int)term->target->index : -1,
+                       then_blk ? (int)then_blk->index : -1,
+                       else_blk ? (int)else_blk->index : -1);
             }
          }
 
@@ -304,6 +347,7 @@ agx_insert_waits_regions(agx_context *ctx)
       }
 
       if (!carry) {
+         unsigned drained = 0;
          agx_builder b =
             agx_init_builder(ctx, agx_after_block_logical(block));
 
@@ -312,8 +356,15 @@ agx_insert_waits_regions(agx_context *ctx)
                agx_wait(&b, slot);
                BITSET_ZERO(slots[slot].writes);
                slots[slot].nr_pending = 0;
+               drained++;
             }
          }
+
+         if (drained)
+            fprintf(stderr, "AGXWAITS: blk%u drain slots=%u\n",
+                    block->index, drained);
+      } else {
+         fprintf(stderr, "AGXWAITS: blk%u carry\n", block->index);
       }
    }
 
