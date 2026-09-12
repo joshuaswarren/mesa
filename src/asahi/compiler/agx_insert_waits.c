@@ -248,9 +248,20 @@ agx_insert_waits_regions(agx_context *ctx)
        * exec-mask fallthrough; everything else drains as before.
        */
       bool carry = false;
+      static int dbg = -1;
+      if (dbg < 0) dbg = getenv("AGXWAITS_DEBUG") ? 1 : 0;
 
       if (block != agx_exit_block(ctx)) {
          agx_instr *term = block_terminator(block);
+
+         if (dbg)
+            fprintf(stderr,
+                    "AGXWAITS blk%u term=%d s0=%d s1=%d tgt=%d uj=%d mbr=%d\n",
+                    block->index, term ? (int)term->op : -1,
+                    block->successors[0] ? (int)block->successors[0]->index : -1,
+                    block->successors[1] ? (int)block->successors[1]->index : -1,
+                    (term && term->target) ? (int)term->target->index : -1,
+                    block->unconditional_jumps, is_mask_branch(term) ? 1 : 0);
 
          if (is_mask_branch(term) && term->target &&
              nr_frames < AGX_MAX_FRAMES) {
