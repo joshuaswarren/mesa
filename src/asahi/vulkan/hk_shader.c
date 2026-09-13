@@ -101,10 +101,9 @@ hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
 {
    static_assert(sizeof(pdev->dev.debug) == sizeof(uint32_t));
    return pdev->dev.debug |
-          ((uint64_t)agx_simdmat_enabled() << 32) |
-          ((uint64_t)(getenv("AGX_DECODE_Q4") != NULL) << 33) |
-          ((uint64_t)(getenv("AGX_HWMAT_NO_FLATADDR") != NULL) << 34) |
-          ((uint64_t)(getenv("AGX_HWMAT_VEC2") != NULL) << 35);
+         ((uint64_t)agx_simdmat_enabled() << 32) |
+         ((uint64_t)(getenv("AGX_DECODE_Q4") != NULL) << 33) |
+         ((uint64_t)(getenv("AGX_HWMAT_VEC2") != NULL) << 35);
 }
 
 const nir_shader_compiler_options *

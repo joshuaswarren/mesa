@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 
-OPTIONS = ("AGX_SIMDMAT", "AGX_DECODE_Q4", "AGX_HWMAT_NO_FLATADDR", "AGX_HWMAT_VEC2")
+OPTIONS = ("AGX_SIMDMAT", "AGX_DECODE_Q4", "AGX_HWMAT_VEC2")
 
 
 def inspect(options):
