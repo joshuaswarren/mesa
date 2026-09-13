@@ -1,0 +1,17 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer In { vec4 v[]; } inp;
+layout(std430, binding = 1) writeonly buffer Out { float o[]; } outp;
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  vec4 x = inp.v[i];
+  precise float t = log2(x.w);
+  precise float literal = t * 0.6931471805599453;
+  precise float from_buffer = t * x.z;
+  outp.o[i * 6 + 0] = x.x / x.y;
+  outp.o[i * 6 + 1] = 1.0 / x.y;
+  outp.o[i * 6 + 2] = literal;
+  outp.o[i * 6 + 3] = from_buffer;
+  outp.o[i * 6 + 4] = t;
+  outp.o[i * 6 + 5] = log(x.w);
+}
