@@ -99,8 +99,12 @@ shared_var_info(const struct glsl_type *type, unsigned *size, unsigned *align)
 uint64_t
 hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
 {
-   /* This could be optimized but it doesn't matter */
-   return pdev->dev.debug;
+   static_assert(sizeof(pdev->dev.debug) == sizeof(uint32_t));
+   return pdev->dev.debug |
+          ((uint64_t)agx_simdmat_enabled() << 32) |
+          ((uint64_t)(getenv("AGX_DECODE_Q4") != NULL) << 33) |
+          ((uint64_t)(getenv("AGX_HWMAT_NO_FLATADDR") != NULL) << 34) |
+          ((uint64_t)(getenv("AGX_HWMAT_VEC2") != NULL) << 35);
 }
 
 const nir_shader_compiler_options *

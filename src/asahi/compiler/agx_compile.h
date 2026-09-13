@@ -319,13 +319,11 @@ uint64_t agx_gather_texcoords(nir_shader *nir);
 
 void agx_preprocess_nir(nir_shader *nir);
 
-/* VK_KHR_cooperative_matrix on the G13 simd_matrix unit. On by default;
- * AGX_SIMDMAT=0 disables it.
- */
+/* Experimental VK_KHR_cooperative_matrix support; AGX_SIMDMAT=1 opts in. */
 static inline bool
 agx_simdmat_enabled(void)
 {
-   return debug_get_bool_option("AGX_SIMDMAT", true);
+   return debug_get_bool_option("AGX_SIMDMAT", false);
 }
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
