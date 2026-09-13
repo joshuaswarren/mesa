@@ -3541,11 +3541,28 @@ agx_preprocess_nir(nir_shader *nir)
    if (!nir)
       return;
 
-   /* Lower VK_KHR_cooperative_matrix to the G13 HW matrix instruction before
-    * vars_to_scratch can spill the 8x8 cmat temps. AGX_SIMDMAT=0 skips it.
+   /* Lower VK_KHR_cooperative_matrix before vars_to_scratch can spill the cmat
+    * temps. The G13 matrix tile spans all 32 lanes of a subgroup, so the HW
+    * path requires fully-populated subgroups: compute stage, static workgroup
+    * size, size a multiple of 32. Everything else lowers through the software
+    * path (agx_nir_lower_cmat.c) -- a valid shader is never rejected. Opt-in
+    * via AGX_SIMDMAT=1 (default off).
     */
-   if (agx_simdmat_enabled())
-      NIR_PASS(_, nir, agx_nir_lower_simdmat, 32);
+   if (agx_simdmat_enabled()) {
+      bool full_subgroups =
+         nir->info.stage == MESA_SHADER_COMPUTE &&
+         !nir->info.workgroup_size_variable &&
+         nir->info.workgroup_size[0] && nir->info.workgroup_size[1] &&
+         nir->info.workgroup_size[2] &&
+         (((uint64_t)nir->info.workgroup_size[0] *
+              nir->info.workgroup_size[1] * nir->info.workgroup_size[2]) %
+          32) == 0;
+
+      if (full_subgroups)
+         NIR_PASS(_, nir, agx_nir_lower_simdmat, 32);
+      else
+         NIR_PASS(_, nir, agx_nir_lower_cmat);
+   }
 
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
 

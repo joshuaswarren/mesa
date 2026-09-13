@@ -18,6 +18,7 @@ libasahi_agx_files = files(
   'agx_nir_lower_shared_bitsize.c',
   'agx_nir_lower_subgroups.c',
   'agx_nir_lower_simdmat.c',
+  'agx_nir_lower_cmat.c',
   'agx_nir_lower_texture.c',
   'agx_nir_opt_preamble.c',
   'agx_lower_64bit.c',
