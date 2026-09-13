@@ -402,6 +402,9 @@
 6f8e46608000         simd     r3h, r3l, prefix, xor
 6f9a4c600080         simd     r6h, r6l, prefix, iadd
 6f9d4c620080         simd     r7, r6, prefix, iadd
+6f08c2680cc80080     simd_matrix_fmadd16 r2l, ^r1l, ^r3l, ^r4l
+6f08c26c0cc80080     simd_matrix_fmadd32 r2l, ^r1l.abs.neg, ^r3l, ^r4l
+ef08c2680cc80080     simd_matrix_fmadd16 $r2l, ^r1l, ^r3l, ^r4l
 7101040000620f00     smpi     r0_r1_r2_r3, ts0, ss0, r2, 0, 2d, xyzw, auto_lod, a
 72001004             mov      r0l, thread_in_grid_x
 72021104             mov      r0h, thread_in_grid_y
