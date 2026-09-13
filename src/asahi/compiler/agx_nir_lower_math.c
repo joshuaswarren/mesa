@@ -20,40 +20,62 @@
  * reassociating or contracting them.
  */
 
-/*
- * Correctly rounded 1/x. One Newton-Raphson step on the hardware rcp:
- *
- *    u_2 = u + u(1 - xu) = fma(fma(-x, u, 1), u, u)
- *
- * exhaustively verified upstream with a modified math_bruteforce. If u is
- * infinite (x zero or flushed), the refinement is NaN, so keep u.
- */
+/* The caller keeps x near one so the Newton residual cannot flush. */
 static nir_def *
-rcp_rn(nir_builder *b, nir_def *x)
+rcp_normal(nir_builder *b, nir_def *x)
 {
    nir_def *u = nir_frcp(b, x);
-   nir_def *one = nir_imm_float(b, 1.0);
-   nir_def *u_2 = nir_ffma(b, nir_ffma(b, nir_fneg(b, x), u, one), u, u);
-   return nir_bcsel(b, nir_fisnan(b, u_2), u, u_2);
+   return nir_ffma(b, nir_ffma(b, nir_fneg(b, x), u,
+                              nir_imm_float(b, 1.0)), u, u);
 }
 
-/*
- * Correctly rounded a/b (Markstein). With y = RN(1/b) and q = RN(a y), the
- * residual r = a - b q is exact in an fma and q + r y rounds to RN(a/b) for
- * normal operands. If the refinement produces NaN (b zero, q infinite), q
- * already holds the IEEE result for that case. A zero q is also final (a zero
- * or the quotient flushed) and keeps its sign, which the refinement would
- * lose.
- */
+/* Normalize before refinement; exponent restoration must flush the exact
+ * quotient before rounding, including values just below the normal boundary. */
 static nir_def *
 div_rn(nir_builder *b, nir_def *a, nir_def *d)
 {
-   nir_def *y = rcp_rn(b, d);
-   nir_def *q = nir_fmul(b, a, y);
-   nir_def *r = nir_ffma(b, nir_fneg(b, d), q, a);
-   nir_def *q_2 = nir_ffma(b, r, y, q);
-   nir_def *keep = nir_ior(b, nir_fisnan(b, q_2), nir_feq_imm(b, q, 0.0));
-   return nir_bcsel(b, keep, q, q_2);
+   nir_def *aa = nir_iand_imm(b, a, 0x7fffffff);
+   nir_def *dd = nir_iand_imm(b, d, 0x7fffffff);
+   nir_def *ea = nir_ushr_imm(b, aa, 23);
+   nir_def *ed = nir_ushr_imm(b, dd, 23);
+   nir_def *ma = nir_ior_imm(b, nir_iand_imm(b, aa, 0x7fffff), 0x3f800000);
+   nir_def *md = nir_ior_imm(b, nir_iand_imm(b, dd, 0x7fffff), 0x3f800000);
+   nir_def *y = rcp_normal(b, md);
+   nir_def *q = nir_fmul(b, ma, y);
+   nir_def *r = nir_ffma(b, nir_fneg(b, md), q, ma);
+   q = nir_ffma(b, r, y, q);
+   r = nir_ffma(b, nir_fneg(b, md), q, ma);
+   nir_def *half = nir_ishl_imm(b, nir_iadd_imm(b, nir_ushr_imm(b, q, 23), -24), 23);
+   nir_def *up = nir_fmul(b, md, half);
+   nir_def *down = nir_bcsel(b, nir_ieq_imm(b, nir_iand_imm(b, q, 0x7fffff), 0),
+                              nir_fmul_imm(b, up, 0.5), up);
+   nir_def *odd = nir_ine_imm(b, nir_iand_imm(b, q, 1), 0);
+   nir_def *inc = nir_ior(b, nir_flt(b, up, r), nir_iand(b, nir_feq(b, up, r), odd));
+   nir_def *nr = nir_fneg(b, r);
+   nir_def *dec = nir_ior(b, nir_flt(b, down, nr), nir_iand(b, nir_feq(b, down, nr), odd));
+   q = nir_isub(b, nir_iadd(b, q, nir_b2i32(b, inc)), nir_b2i32(b, dec));
+   nir_def *e = nir_isub(b, ea, ed);
+   nir_def *out = nir_iadd(b, q, nir_ishl_imm(b, e, 23));
+   nir_def *under = nir_ior(b, nir_ilt_imm(b, e, -126),
+      nir_iand(b, nir_ieq_imm(b, e, -126), nir_ult(b, ma, md)));
+   out = nir_bcsel(b, under, nir_imm_int(b, 0), out);
+   nir_def *over = nir_ige_imm(b, nir_iadd(b, e, nir_ushr_imm(b, q, 23)), 255);
+   out = nir_bcsel(b, over, nir_imm_int(b, 0x7f800000), out);
+   nir_def *az = nir_ieq_imm(b, ea, 0), *dz = nir_ieq_imm(b, ed, 0);
+   nir_def *ai = nir_ieq_imm(b, ea, 255), *di = nir_ieq_imm(b, ed, 255);
+   out = nir_bcsel(b, nir_ior(b, az, di), nir_imm_int(b, 0), out);
+   out = nir_bcsel(b, nir_ior(b, dz, ai), nir_imm_int(b, 0x7f800000), out);
+   out = nir_ior(b, out, nir_iand_imm(b, nir_ixor(b, a, d), 0x80000000));
+   nir_def *invalid = nir_ior(b, nir_ugt_imm(b, aa, 0x7f800000),
+                                nir_ugt_imm(b, dd, 0x7f800000));
+   invalid = nir_ior(b, invalid, nir_ior(b, nir_iand(b, az, dz), nir_iand(b, ai, di)));
+   return nir_bcsel(b, invalid, nir_imm_int(b, 0x7fc00000), out);
+}
+
+static nir_def *
+rcp_rn(nir_builder *b, nir_def *x)
+{
+   return div_rn(b, nir_imm_float(b, 1.0), x);
 }
 
 static bool
@@ -114,7 +136,7 @@ agx_nir_lower_fdiv_late(nir_shader *s)
 }
 
 /*
- * Natural log and log2 as double-float (fp32 pair) arithmetic.
+ * Log2 as double-float (fp32 pair) arithmetic.
  *
  * x = 2^e m with m in [sqrt(1/2), sqrt(2)). With s = (m - 1) / (m + 1),
  *
@@ -123,8 +145,7 @@ agx_nir_lower_fdiv_late(nir_shader *s)
  * s is kept as a pair (s, s_lo) from one correctly rounded division plus the
  * fma residual, the cubic term is kept as a pair, and the terms are summed
  * with Fast2Sum so the value handed to the final rounding carries about 40
- * bits. That makes the exact cases (powers of two, log(3)) come out correctly
- * rounded and everything else faithful, without any table.
+ * bits without a lookup table.
  */
 struct log_parts {
    nir_def *e;    /* exponent as float */
@@ -162,7 +183,7 @@ log_core(nir_builder *b, nir_def *x)
    nir_def *d_lo = fast2sum_lo(b, two, f, d);
 
    /* s = f / (d + d_lo) as a pair */
-   nir_def *y = rcp_rn(b, d);
+   nir_def *y = rcp_normal(b, d);
    nir_def *s = nir_fmul(b, f, y);
    nir_def *r = nir_ffma(b, nir_fneg(b, s), d, f);
    s = nir_ffma(b, r, y, s);
@@ -226,26 +247,6 @@ log_special(nir_builder *b, nir_def *x)
 }
 
 static nir_def *
-soft_log(nir_builder *b, nir_def *x)
-{
-   struct log_parts l = log_core(b, x);
-
-   /* ln2 split so e * LN2_HI is exact for |e| < 2^8 */
-   nir_def *a = nir_fmul_imm(b, l.e, 0.693145751953125);
-   nir_def *bb = nir_fmul_imm(b, l.s, 2.0);
-   nir_def *h = nir_fadd(b, a, bb);
-   nir_def *lo = fast2sum_lo(b, a, bb, h);
-   nir_def *h2 = nir_fadd(b, h, l.t_hi);
-   nir_def *lo2 = fast2sum_lo(b, h, l.t_hi, h2);
-
-   nir_def *small = nir_fadd(b, lo, lo2);
-   small = nir_fadd(b, small, l.t_lo);
-   small = nir_fadd(b, small, nir_fmul_imm(b, l.s_lo, 2.0));
-   small = nir_ffma(b, l.e, nir_imm_float(b, 1.428606765330187e-06), small);
-   return nir_fadd(b, h2, small);
-}
-
-static nir_def *
 soft_log2(nir_builder *b, nir_def *x)
 {
    struct log_parts l = log_core(b, x);
@@ -269,54 +270,6 @@ soft_log2(nir_builder *b, nir_def *x)
    return nir_fadd(b, h2, nir_fadd(b, nir_fadd(b, lo, lo2), pl));
 }
 
-static const uint32_t LN2_F32_BITS = 0x3f317218;
-
-static bool
-src_is_ln2(nir_alu_instr *alu, unsigned i)
-{
-   nir_scalar s = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), i);
-   return nir_scalar_is_const(s) && nir_scalar_as_uint(s) == LN2_F32_BITS;
-}
-
-static bool
-src_is_flog2(nir_alu_instr *alu, unsigned i)
-{
-   nir_scalar s = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), i);
-   return nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_flog2;
-}
-
-/* nir_flog builds fmul(flog2(x), ln2); catch that before the flog2 goes. */
-static bool
-lower_log(nir_builder *b, nir_alu_instr *alu, void *_)
-{
-   if (alu->op != nir_op_fmul || alu->def.bit_size != 32 ||
-       alu->def.num_components != 1)
-      return false;
-
-   unsigned li;
-   if (src_is_flog2(alu, 0) && src_is_ln2(alu, 1))
-      li = 0;
-   else if (src_is_flog2(alu, 1) && src_is_ln2(alu, 0))
-      li = 1;
-   else
-      return false;
-
-   nir_scalar log = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), li);
-   nir_scalar xs = nir_scalar_chase_alu_src(log, 0);
-
-   b->cursor = nir_before_instr(&alu->instr);
-   b->fp_math_ctrl = nir_fp_no_fast_math;
-   nir_def *x = nir_channel(b, xs.def, xs.comp);
-   nir_def *res = nir_bcsel(b, is_positive_normal(b, x), soft_log(b, x),
-                            log_special(b, x));
-   nir_def_replace(&alu->def, res);
-
-   if (nir_def_is_unused(log.def))
-      nir_instr_remove(nir_def_instr(log.def));
-
-   return true;
-}
-
 static bool
 lower_log2(nir_builder *b, nir_alu_instr *alu, void *_)
 {
@@ -335,11 +288,7 @@ lower_log2(nir_builder *b, nir_alu_instr *alu, void *_)
 bool
 agx_nir_lower_log(nir_shader *s)
 {
-   bool progress =
-      nir_shader_alu_pass(s, lower_log, nir_metadata_control_flow, NULL);
-   progress |=
-      nir_shader_alu_pass(s, lower_log2, nir_metadata_control_flow, NULL);
-   return progress;
+   return nir_shader_alu_pass(s, lower_log2, nir_metadata_control_flow, NULL);
 }
 
 /*
@@ -569,9 +518,10 @@ lower_sincos(nir_builder *b, nir_instr *instr, UNUSED void *_)
    nir_def *nan = nir_imm_float(b, NAN);
    v = nir_bcsel(b, nir_flt_imm(b, ax, INFINITY), v, nan);
 
-   /* sin(+-0) = +-0 exactly (the reduction returns +0 for -0) */
+   /* Preserve the sign of zero, including inputs flushed by fp32 arithmetic. */
    if (alu->op == nir_op_fsin)
-      v = nir_bcsel(b, nir_feq_imm(b, x, 0.0), x, v);
+      v = nir_bcsel(b, nir_feq_imm(b, x, 0.0),
+                   nir_iand_imm(b, x, 0x80000000), v);
 
    if (bit_size == 16)
       v = nir_f2f16(b, v);
