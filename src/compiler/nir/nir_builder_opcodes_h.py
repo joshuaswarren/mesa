@@ -226,7 +226,7 @@ nir_${prefix}le_imm(nir_builder *build, nir_def *src1, uint64_t src2)
 #endif /* _NIR_BUILDER_OPCODES_ */"""
 
 from nir_opcodes import opcodes, type_size, type_base_type
-from nir_intrinsics import INTR_OPCODES, WRITE_MASK, ALIGN_MUL, IO_SEMANTICS, DEST_TYPE, SRC_TYPE
+from nir_intrinsics import INTR_OPCODES, WRITE_MASK, ALIGN_MUL, IO_SEMANTICS, DEST_TYPE, SRC_TYPE, FP_MATH_CTRL
 from mako.template import Template
 
 # List of intrinsics that also need a nir_build_ prefixed factory macro.
@@ -257,4 +257,5 @@ print(Template(template).render(opcodes=opcodes,
                                 IO_SEMANTICS=IO_SEMANTICS,
                                 DEST_TYPE=DEST_TYPE,
                                 SRC_TYPE=SRC_TYPE,
+                                FP_MATH_CTRL=FP_MATH_CTRL,
                                 build_prefixed_intrinsics=build_prefixed_intrinsics))
