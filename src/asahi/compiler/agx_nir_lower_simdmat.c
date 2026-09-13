@@ -26,11 +26,9 @@
  * muladd does blocked GEMM: D[di][dj] = C[di][dj] + sum_k A[di][k]*B[k][dj],
  * i.e. nblk^3 HW fmadds (8 for 16x16).
  *
- * GPU-verified exact (identity, ones, random-integer and random-float inputs,
- * row- and column-major, 2026-09-08 on M1 G13G) for every advertised shape:
- * N in {8,16} x {fp32 A/B/C, fp16 A/B + fp32 C, fp16 A/B/C}. The 16x16
- * sub-block order above and the fp16 fragment layout (same lane mapping, two
- * halves in one 32-bit register) are what the hardware uses.
+ * The M1 integer-input battery covered 48 shape/type/layout cases, including
+ * live-C and D != C forms. It does not establish bit-exact results for
+ * arbitrary floating-point inputs or other GPU generations.
  *
  * Precision: the accumulator type selects the opcode (fp16 C -> fmadd16, fp32
  * C -> fmadd32, in agx_compile.c); A/B are passed at their own width. Verified
@@ -38,7 +36,13 @@
  * what Apple's own mul_mm emits), fmadd16 with fp16 A/B. fp32 A/B with an fp16
  * accumulator is not advertised and not lowered.
  *
- * On by default; AGX_SIMDMAT=0 disables it at the call site.
+ * Opt-in via AGX_SIMDMAT=1 (default off). The hardware tile needs ALL 32
+ * lanes of a subgroup, so this path is only correct when every subgroup of
+ * the dispatch is fully populated: the caller (agx_preprocess_nir) routes
+ * here only for compute shaders with a static workgroup size that is a
+ * multiple of 32; everything else (partial tail subgroup, runtime-variable
+ * size) lowers through the software path in agx_nir_lower_cmat.c instead.
+ * A valid shader is never rejected.
  */
 
 #include "util/macros.h"
@@ -141,13 +145,22 @@ lower_load_store(nir_builder *b, struct hash_table *tm, nir_intrinsic_instr *int
     * the contiguous within-row index below. Casting to scalar here (as a
     * previous version did) made the major stride off by the buffer vec width,
     * which silently corrupted every vec2-backed load/store. */
-   const uint32_t ptr_stride =
-      glsl_get_bit_size(deref->type) / 8 * glsl_get_vector_elements(deref->type);
+   const unsigned nvec = glsl_get_vector_elements(deref->type);
+   const unsigned scalar_bytes = glsl_get_bit_size(deref->type) / 8;
+   const uint32_t ptr_stride = scalar_bytes * nvec;
    deref = nir_build_deref_cast(b, &deref->def, deref->modes, deref->type,
                                 ptr_stride);
    const struct glsl_type *ct = remap_type(tm, cmat_deref->type);
    cmat_deref =
       nir_build_deref_cast(b, &cmat_deref->def, cmat_deref->modes, ct, 0);
+
+   /* The buffer element width need not match the matrix component width (an
+    * fp32 matrix behind a uint16_t* / uint8_t*). Addressing below counts
+    * buffer elements; the component-typed sdref steps by tsz, so indices are
+    * rescaled exactly to component steps -- matrix data alignment makes the
+    * division exact. */
+   const bool width_matched = scalar_bytes == tsz;
+
 
    nir_def *lane = nir_load_subgroup_invocation(b);
    nir_def *row, *col;
@@ -168,18 +181,15 @@ lower_load_store(nir_builder *b, struct hash_table *tm, nir_intrinsic_instr *int
    /* Flatten the two-level (major ptr_as_array -> cast -> minor ptr_as_array)
     * address into a single scalar index = major*nvec + minor on a scalar-cast
     * deref built ONCE. Same byte address (major steps whole vecN elements =
-    * nvec scalars; minor steps scalars), but one address computation per element
-    * instead of two -- the lowering's address arithmetic is the matmul's #1 cost
-    * (pt7). Default ON (opt out via AGX_HWMAT_NO_FLATADDR); verified MUL_MAT
-    * 947/947 + PPL 1.0162, pp512 177.1 -> 179.4. */
-   const bool flataddr = getenv("AGX_HWMAT_NO_FLATADDR") == NULL;
-   const unsigned nvec = glsl_get_vector_elements(deref->type);
+    * nvec scalars; minor steps scalars), but one address computation per
+    * element instead of two -- the lowering's address arithmetic is the
+    * matmul's #1 cost (pt7). Verified MUL_MAT 947/947 + PPL 1.0162,
+    * pp512 177.1 -> 179.4. */
    nir_deref_instr *sdref =
-      flataddr ? nir_build_deref_cast(b, &deref->def, deref->modes,
-                                      glsl_scalar_type(desc.element_type), tsz)
-               : NULL;
+      nir_build_deref_cast(b, &deref->def, deref->modes,
+                           glsl_scalar_type(desc.element_type), tsz);
 
-   /* VEC2 fragment loads (AGX_HWMAT_VEC2, default ON): load the contiguous
+   /* VEC2 fragment loads (opt-in via AGX_HWMAT_VEC2): load the contiguous
     * (col,col+1) row-major pair as ONE i16,xy load instead of two i16,x scalars.
     * pt11 found this perf-neutral ALONE, but macOS RE of Apple's pp512=270 kernel
     * (RECIPE 2026-06-22) shows Apple emits paired i16,xy loads, ALL hoisted into one
@@ -187,9 +197,9 @@ lower_load_store(nir_builder *b, struct hash_table *tm, nir_intrinsic_instr *int
     * 24 distinct fragment regs (vs ~12 reused) so the post-RA scheduler can hoist all
     * loads (kills the 42 waits -> ~1). flat is even (frag_rc col is always x2) so the
     * pair is vec2-aligned. Row-major (A) only; col-major (B) pair is strided. */
-   const bool vec2ld = getenv("AGX_HWMAT_VEC2") != NULL;
+   const bool vec2ld = getenv("AGX_HWMAT_VEC2") != NULL && width_matched;
    nir_deref_instr *v2dref =
-      (flataddr && vec2ld)
+      vec2ld
          ? nir_build_deref_cast(b, &deref->def, deref->modes,
                                 glsl_vector_type(desc.element_type, 2), 2 * tsz)
          : NULL;
@@ -201,9 +211,10 @@ lower_load_store(nir_builder *b, struct hash_table *tm, nir_intrinsic_instr *int
       for (unsigned bj = 0; bj < nblk; bj++) {
          unsigned sb = bi * nblk + bj;
          for (unsigned e = 0; e < 2; e++) {
-            /* logical element (bi*8+row, bj*8+col+e). The strided (major) axis
-             * is addressed in buffer-element units on the still-vecN deref; the
-             * contiguous (minor) axis in scalar units after casting down. */
+            /* logical element (bi*8+row, bj*8+col+e). Pointer contract (as
+             * in the lvp lowering): the Stride operand and the major axis
+             * count pointer elements (scalar_bytes*nvec bytes each); the
+             * contiguous minor axis counts matrix components (tsz each). */
             bool colmaj = (layout == GLSL_MATRIX_LAYOUT_COLUMN_MAJOR);
             nir_def *lr = nir_u2uN(b, nir_iadd_imm(b, row, bi * 8), idx_bits);
             nir_def *lc =
@@ -211,25 +222,24 @@ lower_load_store(nir_builder *b, struct hash_table *tm, nir_intrinsic_instr *int
             nir_def *major = nir_imul(b, colmaj ? lc : lr, str);
             nir_def *minor = colmaj ? lr : lc;
             nir_deref_instr *it;
-            nir_def *flat = NULL;
-            if (flataddr) {
-               /* flat (scalar units) = major*nvec + minor */
-               flat = nir_iadd(b, nir_imul_imm(b, major, nvec), minor);
-               it = nir_build_deref_ptr_as_array(b, sdref, flat);
-            } else {
-               it = nir_build_deref_ptr_as_array(b, deref, major);
-               it = nir_build_deref_cast(b, &it->def, deref->modes,
-                                         glsl_scalar_type(desc.element_type), tsz);
-               it = nir_build_deref_ptr_as_array(b, it, minor);
-            }
+            /* Component index = row_bytes / tsz + minor, with the row counted
+             * in pointer elements (major includes the Stride multiply). The
+             * division is by a constant and exact whenever the row stride is
+             * component-aligned, which the cooperative matrix memory alignment
+             * rules require; for width-matched buffers it folds to
+             * major*nvec + minor. No byte-width accesses are emitted. */
+            nir_def *row_comps = nir_udiv_imm(
+               b, nir_imul_imm(b, major, scalar_bytes * nvec), tsz);
+            nir_def *flat = nir_iadd(b, row_comps, minor);
+            it = nir_build_deref_ptr_as_array(b, sdref, flat);
             /* INLINE Q4_0 DECODE (env-gated, A-operand): instead of loading f16,
              * decode a quantized weight directly from a 4-byte-aligned padded-Q4_0
              * buffer (block = 20 bytes = 10 u16: [d:f16][16B qs][2B pad]) using the
              * linear weight index `flat`. Eliminates the f16 dequant-staging phase
              * that bounds the Q4 matmul (LAB_NOTEBOOK pt43-45). PROTOTYPE: assumes
              * deref base = buffer start (flat = absolute linear index). */
-            if (is_load && flataddr && getenv("AGX_DECODE_Q4") &&
-                desc.use == GLSL_CMAT_USE_A) {
+            if (is_load && getenv("AGX_DECODE_Q4") &&
+                desc.use == GLSL_CMAT_USE_A && width_matched) {
                /* AMORTIZED: decode BOTH elements (e=0,1) of this sub-block from ONE
                 * scale + ONE qbyte load (they are the lo/hi nibble of the same byte
                 * in the padded-Q4 format). Only run at e==0; e==1 is filled here. */
@@ -360,13 +370,19 @@ lower_length(nir_builder *b, nir_intrinsic_instr *intr)
 
 /* Element-wise ops on the packed fragment. binary/scalar/unary/extract/insert/
  * bitcast never move data between lanes, so they act identically on the SW and
- * the HW (frag_rc) layouts: just operate per-vec-component. */
+ * the HW (frag_rc) layouts: just operate per-vec-component. The intrinsic's
+ * fp_math_ctrl (NoContraction from SPIR-V, which survives NIR only because
+ * nir_builder_opcodes_h now defaults it from the builder) is carried onto the
+ * rebuilt ALU so a precise X*s+Y is not contracted into ffma later. */
 static bool
 lower_binary_op(nir_builder *b, nir_intrinsic_instr *intr)
 {
    nir_def *a = load_src(b, intr->src[1]);
    nir_def *c = load_src(b, intr->src[2]);
+   unsigned save = b->fp_math_ctrl;
+   b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
    store_src(b, intr->src[0], nir_build_alu2(b, nir_intrinsic_alu_op(intr), a, c));
+   b->fp_math_ctrl = save;
    nir_instr_remove(&intr->instr);
    return true;
 }
@@ -375,7 +391,10 @@ static bool
 lower_unary_op(nir_builder *b, nir_intrinsic_instr *intr)
 {
    nir_def *a = load_src(b, intr->src[1]);
+   unsigned save = b->fp_math_ctrl;
+   b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
    store_src(b, intr->src[0], nir_build_alu1(b, nir_intrinsic_alu_op(intr), a));
+   b->fp_math_ctrl = save;
    nir_instr_remove(&intr->instr);
    return true;
 }
@@ -384,8 +403,11 @@ static bool
 lower_scalar_op(nir_builder *b, nir_intrinsic_instr *intr)
 {
    nir_def *a = load_src(b, intr->src[1]);
+   unsigned save = b->fp_math_ctrl;
+   b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
    store_src(b, intr->src[0],
              nir_build_alu2(b, nir_intrinsic_alu_op(intr), a, intr->src[2].ssa));
+   b->fp_math_ctrl = save;
    nir_instr_remove(&intr->instr);
    return true;
 }
@@ -440,7 +462,10 @@ lower_convert(nir_builder *b, nir_intrinsic_instr *intr)
          nir_get_nir_type_for_glsl_base_type(sd.element_type),
          nir_get_nir_type_for_glsl_base_type(dd.element_type),
          nir_rounding_mode_undef);
+      unsigned save = b->fp_math_ctrl;
+      b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
       ret = nir_build_alu1(b, op, src);
+      b->fp_math_ctrl = save;
    }
    store_src(b, intr->src[0], ret);
    nir_instr_remove(&intr->instr);
