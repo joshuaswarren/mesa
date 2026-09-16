@@ -379,6 +379,10 @@ agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
       // cfg.unk_20 = true;
       // cfg.unk_24 = true; if clustered?
       if (chip == AGX_CHIP_G13X) {
+         /* G13X (t600x, M1 Pro/Max, G13C cores; agx_device.c maps
+          * generation 13 + multi-cluster here): this block plus
+          * unk_5/6/8 is the driver's own designed pre-sink emission,
+          * i.e. the sourced minimal set for these dies. */
          cfg.unk_4 = true;
          // cfg.unk_26 = true;
       }
@@ -401,7 +405,7 @@ agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
        * let's just set these after every launch to be safe. We can revisit in
        * the future when we figure out what the bits mean.
        */
-      if (chip != AGX_CHIP_G13G) {
+      if (chip != AGX_CHIP_G13G && chip != AGX_CHIP_G13X) {
          cfg.unk_0 = true;
          cfg.unk_1 = true;
          cfg.unk_2 = true;
