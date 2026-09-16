@@ -53,6 +53,9 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
    } else if (HK_PERF(dev, USCCDMBARRIER)) {
       /* Perftest only: keep the USC cache invalidate, drop the rest. */
       cs->current = agx_cdm_barrier_usc(cs->current);
+   } else if (dev->cdm_barrier_mask != 0xFFFFFFFFu) {
+      cs->current =
+         agx_cdm_barrier_masked(cs->current, dev->dev.chip, dev->cdm_barrier_mask);
    } else {
       cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
    }
@@ -74,7 +77,8 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
 
-   hk_cdm_cache_flush(dev, cs);
+   if (!hk_app_barrier)
+      hk_cdm_cache_flush(dev, cs);
 }
 
 void

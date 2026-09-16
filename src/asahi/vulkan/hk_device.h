@@ -99,6 +99,9 @@ struct hk_device {
 
    uint32_t perftest;
 
+   /* HK_CDMBARBITS: 0xFFFFFFFF = unset, kitchen sink as before. */
+   uint32_t cdm_barrier_mask;
+
    struct {
       struct u_rwlock lock;
       struct util_dynarray list;
@@ -119,6 +122,12 @@ enum hk_perftest {
 };
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)
+
+/* HK_APPBAR: per-launch CDM maintenance is skipped; app-recorded pipeline
+ * barriers append one CDM barrier to the stream instead (Vulkan memory
+ * model). Diagnostic knob; default off. */
+extern bool hk_app_barrier;
+
 
 static inline struct hk_physical_device *
 hk_device_physical(struct hk_device *dev)

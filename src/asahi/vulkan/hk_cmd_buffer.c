@@ -340,6 +340,16 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * here is necessary to properly handle graphics->compute dependencies.
     *
     * XXX: perf. */
+   struct hk_cs *pre_cdm = cmd->current_cs.cs;
+   if (hk_app_barrier && pre_cdm && pre_cdm->type == HK_CS_CDM &&
+       pre_cdm->stats.cmds > 0 && pre_cdm->current) {
+      /* Record the app's memory dependency into the stream so it survives
+       * merge_control_streams: one CDM barrier before the batch ends. */
+      hk_ensure_cs_has_space(cmd, pre_cdm, AGX_CDM_BARRIER_LENGTH);
+      pre_cdm->current =
+         agx_cdm_barrier(pre_cdm->current, hk_cmd_buffer_device(cmd)->dev.chip);
+      pre_cdm->stats.flushes++;
+   }
    hk_cmd_buffer_end_compute(cmd);
    hk_cmd_buffer_end_graphics(cmd);
 }

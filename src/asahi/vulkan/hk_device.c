@@ -38,6 +38,8 @@
 #include <xf86drm.h>
 
 /* clang-format off */
+bool hk_app_barrier = false;
+
 static const struct debug_named_value hk_perf_options[] = {
    {"notess",    HK_PERF_NOTESS,   "Skip draws with tessellation"},
    {"noborder",  HK_PERF_NOBORDER, "Disable custom border colour emulation"},
@@ -328,6 +330,13 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    }
 
    dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
+   dev->cdm_barrier_mask = 0xFFFFFFFFu;
+   hk_app_barrier = debug_get_bool_option("HK_APPBAR", false);
+   {
+      const char *m = getenv("HK_CDMBARBITS");
+      if (m && *m)
+         dev->cdm_barrier_mask = (uint32_t)strtoul(m, NULL, 16);
+   }
 
    if (instance->drirc.misc.disable_border_emulation) {
       dev->perftest |= HK_PERF_NOBORDER;

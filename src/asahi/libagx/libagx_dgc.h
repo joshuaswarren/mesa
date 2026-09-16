@@ -431,6 +431,41 @@ agx_cdm_barrier_usc(GLOBAL uint32_t *out)
    return out;
 }
 
+/*
+ * Runtime-masked variant of the kitchen-sink CDM barrier. Bit i of mask
+ * enables field i (bit 3 = usc_cache_inval); used to bisect which barrier
+ * bits the hardware actually needs between launches. The full mask
+ * (0xFFFFF) reproduces agx_cdm_barrier's emission exactly.
+ */
+static inline GLOBAL uint32_t *
+agx_cdm_barrier_masked(GLOBAL uint32_t *out, enum agx_chip chip, uint32_t mask)
+{
+   agx_push(out, CDM_BARRIER, cfg) {
+      cfg.unk_0 = (mask & (1u << 0)) != 0;
+      cfg.unk_1 = (mask & (1u << 1)) != 0;
+      cfg.unk_2 = (mask & (1u << 2)) != 0;
+      cfg.usc_cache_inval = (mask & (1u << 3)) != 0;
+      cfg.unk_4 = (mask & (1u << 4)) != 0;
+      cfg.unk_5 = (mask & (1u << 5)) != 0;
+      cfg.unk_6 = (mask & (1u << 6)) != 0;
+      cfg.unk_7 = (mask & (1u << 7)) != 0;
+      cfg.unk_8 = (mask & (1u << 8)) != 0;
+      cfg.unk_9 = (mask & (1u << 9)) != 0;
+      cfg.unk_10 = (mask & (1u << 10)) != 0;
+      cfg.unk_11 = (mask & (1u << 11)) != 0;
+      cfg.unk_12 = (mask & (1u << 12)) != 0;
+      cfg.unk_13 = (mask & (1u << 13)) != 0;
+      cfg.unk_14 = (mask & (1u << 14)) != 0;
+      cfg.unk_15 = (mask & (1u << 15)) != 0;
+      cfg.unk_16 = (mask & (1u << 16)) != 0;
+      cfg.unk_17 = (mask & (1u << 17)) != 0;
+      cfg.unk_18 = (mask & (1u << 18)) != 0;
+      cfg.unk_19 = (mask & (1u << 19)) != 0;
+   }
+
+   return out;
+}
+
 static inline GLOBAL uint32_t *
 agx_vdm_return(GLOBAL uint32_t *out)
 {
