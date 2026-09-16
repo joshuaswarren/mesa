@@ -372,22 +372,10 @@ static inline GLOBAL uint32_t *
 agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
 {
    agx_push(out, CDM_BARRIER, cfg) {
-      cfg.unk_5 = true;
-      cfg.unk_6 = true;
-      cfg.unk_8 = true;
       // cfg.unk_11 = true;
       // cfg.unk_20 = true;
       // cfg.unk_24 = true; if clustered?
-      if (chip == AGX_CHIP_G13X) {
-         /* G13X (t600x, M1 Pro/Max, G13C cores; agx_device.c maps
-          * generation 13 + multi-cluster here): the designed pre-sink
-          * set {4,5,6,8} was measured on jw16 (12-round interleaved,
-          * pins 48/48, suite 22694 green): short +13.0% but ctx1053
-          * -3.17% -- the KV-stream leg regresses. Keep the full sink
-          * on G13X until a set that holds both legs is found. */
-         cfg.unk_4 = true;
-         // cfg.unk_26 = true;
-      }
+      // cfg.unk_26 = true;
       if (chip == AGX_CHIP_G13G) {
          /* G13G (t8103, M1): the kitchen-sink bits below cost ~10 us per
           * dispatch in real dependent compute chains (Qwen decode: ~2.1 ms
@@ -397,17 +385,37 @@ agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
           * measure +3.05% ctx1053 decode on jwm1. Other chips keep the
           * full sink until measured there. */
          cfg.unk_4 = true;
+         cfg.unk_5 = true;
+         cfg.unk_6 = true;
          cfg.unk_7 = true;
-      }
+         cfg.unk_8 = true;
+      } else if (chip == AGX_CHIP_G13X) {
+         /* G13X (t600x, M1 Pro/Max, G13C cores; agx_device.c maps
+          * generation 13 + multi-cluster here): the designed set {4,5,6,8}
+          * trades ctx1053 for short on jw16 (12-round packaged pair, pins
+          * 48/48: short 190.66 sink / 215.47 designed; ctx 142.12 sink /
+          * 137.62 designed). This candidate adds the one NAMED maintenance
+          * bit - USC cache inval (bit 3, Asahi Lina's identification) - to
+          * the designed set, arming no sink-only bits (their subsets are
+          * pathological or digest-breaking on G13X). Outcome:
+          * ane-linux-experiments receipts/2026-09-16-termA addendum 4. */
+         cfg.usc_cache_inval = true;
+         cfg.unk_4 = true;
+         cfg.unk_5 = true;
+         cfg.unk_6 = true;
+         cfg.unk_8 = true;
+      } else {
+         cfg.unk_5 = true;
+         cfg.unk_6 = true;
+         cfg.unk_8 = true;
 
-      /* With multiple launches in the same CDM stream, we can get cache
-       * coherency (? or sync?) issues. We hit this with blits, which need - in
-       * between dispatches - need the PBE cache to be flushed and the texture
-       * cache to be invalidated. Until we know what bits mean what exactly,
-       * let's just set these after every launch to be safe. We can revisit in
-       * the future when we figure out what the bits mean.
-       */
-      if (chip != AGX_CHIP_G13G) {
+         /* With multiple launches in the same CDM stream, we can get cache
+          * coherency (? or sync?) issues. We hit this with blits, which need - in
+          * between dispatches - need the PBE cache to be flushed and the texture
+          * cache to be invalidated. Until we know what bits mean what exactly,
+          * let's just set these after every launch to be safe. We can revisit in
+          * the future when we figure out what the bits mean.
+          */
          cfg.unk_0 = true;
          cfg.unk_1 = true;
          cfg.unk_2 = true;
