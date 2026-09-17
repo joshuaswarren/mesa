@@ -45,11 +45,18 @@ void
 hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
 {
    assert(cs->type == HK_CS_CDM);
-   assert(cs->current + AGX_CDM_BARRIER_LENGTH < cs->end &&
-          "caller must ensure space");
+
+   /* Launches defer their barrier so dependent compute chains run
+    * back-to-back; this helper emits the pending barrier at the next
+    * non-launch boundary and is a no-op when the chain is already closed. */
+   if (!cs->cdm_barrier_pending)
+      return;
+
+   hk_ensure_cs_has_space(cs->cmd, cs, AGX_CDM_BARRIER_LENGTH);
 
    cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
    cs->stats.flushes++;
+   cs->cdm_barrier_pending = false;
 }
 
 void
@@ -64,7 +71,9 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
 
-   hk_cdm_cache_flush(dev, cs);
+   /* Defer the barrier: the next dependent launch chains onto this one and
+    * hk_cdm_cache_flush emits the barrier at the next non-launch boundary. */
+   cs->cdm_barrier_pending = true;
 }
 
 void
@@ -114,6 +123,10 @@ dispatch(struct hk_cmd_buffer *cmd, struct agx_grid grid)
       grid.count[0] *= local_size.x;
       grid.count[1] *= local_size.y;
       grid.count[2] *= local_size.z;
+   } else {
+      /* The grid is read from memory at execution time: close the previous
+       * chain before the launch rather than deferring the barrier past it. */
+      hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
    }
 
    hk_dispatch_with_local_size(cmd, cs, s, grid, local_size);

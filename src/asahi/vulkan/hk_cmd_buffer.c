@@ -317,6 +317,11 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
     */
    list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
       if (cs->type == HK_CS_CDM) {
+         /* Close any chain still open at terminate time: unmerged tails
+          * (timestamps, NOMERGE, non-adjacent streams) keep their barrier,
+          * merged chains closed with one barrier at their tail. */
+         hk_cdm_cache_flush(dev, cs);
+
          cs->current = agx_cdm_terminate(cs->current);
       }
    }

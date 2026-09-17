@@ -358,6 +358,12 @@ struct hk_cs {
    /* Whether there is more than just the root chunk */
    bool stream_linked;
 
+   /* CDM only: whether a CDM_BARRIER is pending at the current stream
+    * position. Launches defer the barrier so dependent compute chains run
+    * back-to-back; hk_cdm_cache_flush emits it at the next non-launch
+    * boundary or at stream end. */
+   bool cdm_barrier_pending;
+
    /* Whether the sampler heap is required. Although we always must maintain the
     * heap for correctness, it's often not necessary since we can push lots of
     * samplers (especially for GL/DX11-era engines).
@@ -430,7 +436,16 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
 
    agx_cdm_jump(a->current, b->addr);
    a->current = b->current;
+   /* a continues writing at b's tail: track b's chunk/end so tail writes
+    * (pending barrier, terminate) bounds-check against the right chunk. */
+   a->chunk = b->chunk;
+   a->end = b->end;
    a->stream_linked = true;
+
+   /* Chain-batch across the seam: b's launches follow a's without an
+    * intervening CDM_BARRIER. a's pending barrier is elided (the chains join)
+    * and b's pending state carries forward to a's tail. */
+   a->cdm_barrier_pending = b->cdm_barrier_pending;
 
    a->uses_sampler_heap |= b->uses_sampler_heap;
    a->scratch.cs.main |= b->scratch.cs.main;
@@ -684,6 +699,8 @@ hk_cs_destroy(struct hk_cs *cs)
 
 void hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
+void hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs);
+
 static void
 hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
                                    struct hk_cs **ptr)
@@ -692,10 +709,16 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
       struct hk_cs *cs = *ptr;
 
       /* This control stream may write immediates as it ends. Queue the writes
-       * now that we're done emitting everything else.
+       * now that we're done emitting everything else. hk_dispatch_imm_writes
+       * flushes the pending chain barrier before its own launches.
        */
       if (cs->imm_writes.size) {
          hk_dispatch_imm_writes(cmd, cs);
+
+         /* Writes must be visible system-wide before whatever follows: close
+          * the chain here rather than deferring across a merge seam. */
+         if (cs->type == HK_CS_CDM)
+            hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
       }
    }
 
@@ -826,8 +849,6 @@ uint32_t hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
 
 void hk_usc_upload_spilled_rt_descs(struct agx_usc_builder *b,
                                     struct hk_cmd_buffer *cmd);
-
-void hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs);
 
 void hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
                                  struct agx_cdm_launch_word_0_packed launch,
