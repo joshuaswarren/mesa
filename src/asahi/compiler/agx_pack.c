@@ -746,7 +746,14 @@ agx_pack_instr(struct util_dynarray *emission, struct util_dynarray *fixups,
       unsigned O = agx_pack_memory_index(I, I->src[offset_src], &Ot);
       unsigned u1 = is_uniform_store ? 0 : 1; // XXX
       unsigned u3 = 0;
-      unsigned u4 = is_uniform_store ? 0 : I->coherent ? 7 : 4;
+      /* Term B A/B (2026-09-16): device loads carry coherency 7 instead of
+       * 4. Coherency affects caching, not values; measured on jw16 against
+       * the SdpaDecodeNativeF16 KV stream. Experiment, not for landing
+       * without a receipt.
+       */
+      unsigned u4 = is_uniform_store ? 0
+         : (I->op == AGX_OPCODE_DEVICE_LOAD) ? 7
+         : I->coherent ? 7 : 4;
       unsigned u5 = 0;
       bool L = true; /* TODO: when would you want short? */
 
