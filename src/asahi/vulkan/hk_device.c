@@ -1108,6 +1108,12 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
    dev->dev.compute_timeout_ms = instance->drirc.misc.compute_timeout_ms;
 
+   /* Bounded poll before blocking syncobj waits (see vk_device.sync_wait_poll_us).
+    * Off by default; pays CPU to skip wake-up latency on short submit->signal
+    * round trips. */
+   dev->vk.sync_wait_poll_us =
+      CLAMP(debug_get_num_option("HK_SUBMIT_POLL_US", 0), 0, 1000000);
+
    /* Native graphics compiles the emulation in only once a custom border
     * sampler exists, and most samples then pay one branch, so D3D content keeps
     * its correct borders there. */
