@@ -18,12 +18,41 @@ agx_vma_heap(struct agx_device *dev, enum agx_va_flags flags)
    return &dev->main_heap;
 }
 
+bool
+agx_va_capture_valid(const struct agx_device *dev, uint64_t addr,
+                     uint64_t size_B, uint64_t align_B)
+{
+   if (!dev->replay_heap_initialized)
+      return false;
+
+   const uint64_t end = dev->replay_start + dev->replay_size;
+
+   /* Written to never wrap: size_B comes from the application. */
+   if (size_B > dev->replay_size || dev->guard_size > dev->replay_size - size_B)
+      return false;
+   if (addr < dev->replay_start || addr >= end)
+      return false;
+   if (align_B == 0 || addr % align_B != 0)
+      return false;
+
+   return addr - dev->replay_start <=
+          dev->replay_size - (size_B + dev->guard_size);
+}
+
 struct agx_va *
 agx_va_alloc(struct agx_device *dev, uint64_t size_B, uint64_t align_B,
              enum agx_va_flags flags, uint64_t fixed_va)
 {
    assert((fixed_va != 0) == !!(flags & AGX_VA_FIXED));
    assert((fixed_va % align_B) == 0);
+
+   /* A fixed capture/replay request outside the range is not a request the
+    * heap can answer: util_vma_heap_alloc_addr asserts on a range that wraps.
+    * The caller checks agx_va_capture_valid to tell it from a range in use.
+    */
+   if ((flags & AGX_VA_FIXED) && (flags & AGX_VA_CAPTURE_REPLAY) &&
+       !agx_va_capture_valid(dev, fixed_va, size_B, align_B))
+      return NULL;
 
    /* All allocations need a guard at the end to prevent overreads.
     *

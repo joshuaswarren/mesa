@@ -43,7 +43,8 @@ agx_g17p_vdm_alias_heap_init(struct util_vma_heap *heap)
 bool
 agx_capture_replay_heap_init(struct util_vma_heap *main_heap,
                              struct util_vma_heap *replay_heap,
-                             uint64_t user_size)
+                             uint64_t user_size, uint64_t *out_base,
+                             uint64_t *out_size)
 {
    const uint64_t alignment = UINT64_C(1) << 30;
    const uint64_t size = MIN2(user_size / 8, UINT64_C(64) << 30) &
@@ -55,6 +56,8 @@ agx_capture_replay_heap_init(struct util_vma_heap *main_heap,
    if (!base)
       return false;
    util_vma_heap_init(replay_heap, base, size);
+   *out_base = base;
+   *out_size = size;
    return true;
 }
 

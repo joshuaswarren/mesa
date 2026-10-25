@@ -190,6 +190,9 @@ struct agx_device {
    struct util_vma_heap replay_heap;
    /* Heap selection must stay stable when replay_heap.free_size reaches 0. */
    bool replay_heap_initialized;
+   /* The capture/replay range, for validating a replayed address. */
+   uint64_t replay_start;
+   uint64_t replay_size;
    /* Native command-pool BO aliases with representable 32-bit context offsets.
     * Protected by vma_lock like the other heaps. */
    struct util_vma_heap g17p_vdm_alias_heap;
@@ -533,6 +536,10 @@ struct agx_va *agx_va_alloc(struct agx_device *dev, uint64_t size_B,
                             uint64_t align_B, enum agx_va_flags flags,
                             uint64_t fixed_va);
 void agx_va_free(struct agx_device *dev, struct agx_va *va, bool unbind);
+
+/* Whether a fixed range, with its guard, lies inside the capture/replay range. */
+bool agx_va_capture_valid(const struct agx_device *dev, uint64_t addr,
+                          uint64_t size_B, uint64_t align_B);
 
 static inline struct drm_asahi_cmd_header
 agx_cmd_header(bool compute, uint16_t barrier_vdm, uint16_t barrier_cdm)
