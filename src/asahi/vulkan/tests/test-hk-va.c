@@ -100,20 +100,35 @@ main(void)
    agx_va_free(dev, a, false);
 
    /* Ordinary allocations never land in the range, even when the ordinary
-    * heap runs dry. */
-   for (unsigned i = 0; i < 64; ++i) {
+    * heap runs dry. The ordinary heap holds 960 GiB, so 4 GiB steps run it
+    * dry after about 240 successes; the cap only stops a runaway loop. */
+   enum { MAX_FILL = 512 };
+   struct agx_va *filled[MAX_FILL];
+   unsigned n_filled = 0;
+   while (n_filled < MAX_FILL) {
       struct agx_va *va = agx_va_alloc(dev, 4ull << 30, PAGE, 0, 0);
       if (!va)
          break;
       CHECK(!inside(dev, va));
+      filled[n_filled++] = va;
    }
+   CHECK(n_filled >= 200 && n_filled < MAX_FILL);
+
+   /* With the ordinary heap dry, a small ordinary request either fails or
+    * lands outside the range, and an oversized one fails. */
+   struct agx_va *small = agx_va_alloc(dev, sz, PAGE, 0, 0);
+   CHECK(!small || !inside(dev, small));
+   agx_va_free(dev, small, false);
    struct agx_va *big = agx_va_alloc(dev, 4 * USER_SIZE, PAGE, 0, 0);
    CHECK(!big);
 
-   /* Replay buffers without an address come from the range. */
+   /* Replay buffers without an address come from the range, dry heap or not. */
    struct agx_va *r = agx_va_alloc(dev, sz, PAGE, AGX_VA_CAPTURE_REPLAY, 0);
    CHECK(r && inside(dev, r));
    agx_va_free(dev, r, false);
+
+   for (unsigned i = 0; i < n_filled; ++i)
+      agx_va_free(dev, filled[i], false);
 
    close_va(dev);
 
