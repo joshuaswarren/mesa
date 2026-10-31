@@ -542,8 +542,30 @@ hk_cmd_resolve_compute_border(struct hk_cmd_buffer *cmd)
    }
 }
 
-void
-hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
+/* Whether a strong flush recorded for `dev` with this request has memory
+ * scope: always on M5, on request on G17P. */
+static bool
+hk_cdm_flush_has_memory_scope(const struct hk_device *dev, bool memory)
+{
+   return agx_chip_g17_m5(dev->dev.chip) ||
+          (memory && dev->dev.chip == AGX_CHIP_G17P);
+}
+
+bool
+hk_cdm_visibility_flush_needed(const struct hk_device *dev,
+                               const struct hk_cs *cs, bool memory)
+{
+   if (cs->stats.cmds == 0)
+      return false;
+   if (cs->current != cs->strong_flush_end)
+      return true;
+   /* M5's strong flushes already have memory scope. */
+   return memory && dev->dev.chip == AGX_CHIP_G17P &&
+          cs->current != cs->memory_flush_end;
+}
+
+static void
+hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
 {
    assert(cs->type == HK_CS_CDM);
    assert(cs->current + AGX_CDM_BARRIER_LENGTH < cs->end &&
@@ -557,10 +579,17 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
    case AGX_CS_GENERATION_G15:
    case AGX_CS_GENERATION_HAL200:
    case AGX_CS_GENERATION_HAL300: {
+      const bool memory_scope = hk_cdm_flush_has_memory_scope(dev, memory);
+
       /* A strong flush already ends the stream: every launch has one in its
        * tail, and a second barrier with no launch between them is not a
-       * shape Apple's CDM emitter produces. */
-      if (cs->current == cs->strong_flush_end)
+       * shape Apple's CDM emitter produces. On M5 that flush already has
+       * memory scope; on G17P a request for it strengthens the record in
+       * place below. */
+      const bool upgrade_strong = cs->current == cs->strong_flush_end;
+      if (upgrade_strong &&
+          (!memory_scope || agx_chip_g17_m5(dev->dev.chip) ||
+           cs->current == cs->memory_flush_end))
          return;
 
       /* Apple's CommandEncodingNext emitter uses flags=5 for its strong
@@ -571,7 +600,7 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
          .chip = dev->dev.chip,
          .flags = 0x5,
          .wide_visibility = agx_chip_cdm_wide_visibility(dev->dev.chip),
-         .flush_memory = agx_chip_g17_m5(dev->dev.chip),
+         .flush_memory = memory_scope,
       };
       uint8_t packed[AGX3_CDM_BARRIER_SIZE];
       if (!agx3_cdm_barrier_pack(&info, packed)) {
@@ -586,13 +615,16 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
        * When an API operation immediately needs a cache flush, strengthen
        * that record in place. Apple's emitter does not produce adjacent weak
        * and strong barriers, and retaining the weak record buys no ordering
-       * while making the control stream larger. */
-      if (cs->current == cs->weak_barrier_end) {
+       * while making the control stream larger. A strong record that lacks
+       * the requested memory scope is strengthened the same way. */
+      if (upgrade_strong || cs->current == cs->weak_barrier_end) {
          memcpy((uint8_t *)cs->current - sizeof(packed), packed,
                 sizeof(packed));
          cs->strong_flush_end = cs->current;
          cs->weak_barrier_end = NULL;
-         cs->stats.flushes++;
+         cs->memory_flush_end = memory_scope ? cs->current : NULL;
+         if (!upgrade_strong)
+            cs->stats.flushes++;
          return;
       }
 
@@ -601,6 +633,7 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
       cs->current = (uint32_t *)((uint8_t *)cs->current + sizeof(packed));
       cs->strong_flush_end = cs->current;
       cs->weak_barrier_end = NULL;
+      cs->memory_flush_end = memory_scope ? cs->current : NULL;
       /* A barrier that opens the stream is the post-graphics strong flush.
        * It is canonical here and only here; record it so a later inline
        * concatenation can fold it into the preceding stream's trailing
@@ -620,6 +653,18 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
    }
 
    cs->stats.flushes++;
+}
+
+void
+hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
+{
+   hk_cdm_flush(dev, cs, false);
+}
+
+void
+hk_cdm_visibility_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
+{
+   hk_cdm_flush(dev, cs, memory);
 }
 
 void

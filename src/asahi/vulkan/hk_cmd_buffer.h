@@ -1079,6 +1079,11 @@ struct hk_cs {
     * emitting two adjacent barriers. */
    void *weak_barrier_end;
 
+   /* AGX3 CDM: the value of current just after a strong flush that also has
+    * memory scope (AGX3_CDM_BARRIER_FLUSH_MEMORY). On M5 every strong flush
+    * has it; on G17P only the flushes hk_cdm_visibility_flush() asks for. */
+   void *memory_flush_end;
+
    /* AGX3 CDM: the value of current just after a standalone barrier that is
     * the stream's *first* record. Apple's emitter only opens a stream with a
     * barrier (the strong flush that makes a preceding render visible), so a
@@ -1388,8 +1393,15 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
       const size_t b_skip = (b_opens_with_barrier && a_ends_with_barrier)
                                ? AGX3_CDM_BARRIER_SIZE
                                : 0;
-      if (b_skip)
-         memcpy(dst - AGX3_CDM_BARRIER_SIZE, b->start, AGX3_CDM_BARRIER_SIZE);
+      const bool a_memory = (uint8_t *)a->current == (uint8_t *)a->memory_flush_end;
+      if (b_skip) {
+         /* b's strong flush must not drop the memory scope a's trailing
+          * record carried for the work before it. */
+         uint32_t word = agx3_cmdstream_load_le32(b->start);
+         if (a_memory)
+            word |= AGX3_CDM_BARRIER_FLUSH_MEMORY;
+         agx3_cmdstream_store_le32(dst - AGX3_CDM_BARRIER_SIZE, word);
+      }
 
       memcpy(dst, (const uint8_t *)b->start + b_skip, b_size - b_skip);
       a->current = dst + (b_size - b_skip);
@@ -1408,6 +1420,12 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
             ? dst + ((uint8_t *)b->weak_barrier_end - (uint8_t *)b->start) -
                  b_skip
             : NULL;
+      a->memory_flush_end =
+         b->memory_flush_end
+            ? dst + ((uint8_t *)b->memory_flush_end - (uint8_t *)b->start) -
+                 b_skip
+         : (a_memory && b_skip && a->current == dst) ? dst
+                                                     : NULL;
       a->app_dispatch_end = NULL;
    } else {
       void *link_end =
@@ -1419,6 +1437,7 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
       a->stream_linked |= linked || b->stream_linked;
       a->strong_flush_end = b->strong_flush_end;
       a->weak_barrier_end = b->weak_barrier_end;
+      a->memory_flush_end = b->memory_flush_end;
       a->app_dispatch_end = NULL;
    }
 
@@ -2529,6 +2548,19 @@ void hk_usc_upload_spilled_rt_descs(struct agx_usc_builder *b,
                                     struct hk_cmd_buffer *cmd);
 
 void hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs);
+
+/* As hk_cdm_cache_flush(), for a flush an application dependency asks for.
+ * With `memory`, the flush also has memory scope on G17P (M5 flushes always
+ * do): needed for host availability, and for device dependencies once the
+ * same memory may be reached through more than one virtual address
+ * (hk_cdm_alias_scope()). A trailing strong flush without memory scope is
+ * upgraded in place. The caller ensures space for one barrier record. */
+void hk_cdm_visibility_flush(struct hk_device *dev, struct hk_cs *cs,
+                             bool memory);
+
+/* Whether hk_cdm_visibility_flush(dev, cs, memory) would record anything. */
+bool hk_cdm_visibility_flush_needed(const struct hk_device *dev,
+                                    const struct hk_cs *cs, bool memory);
 
 void hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
                                  struct agx_cdm_launch_word_0_packed launch,

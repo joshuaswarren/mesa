@@ -1149,12 +1149,15 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    /* Compute work that stays in the open compute stream is ordered by the
     * stream itself; what it needs at a barrier is visibility. Every native
     * launch ends in a weak ordering barrier record, and the strong cache
-    * flush is that same record with Apple's flags, upgraded in place. */
+    * flush is that same record with Apple's flags, upgraded in place. While
+    * memory can be reached through two addresses, the flush needs memory
+    * scope (hk_cdm_alias_scope()). */
    struct hk_cs *cs = cmd->current_cs.cs;
+   const bool alias_scope = hk_cdm_alias_scope(dev);
    if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) && dst_kinds &&
-       cs->stats.cmds > 0 && cs->current != cs->strong_flush_end) {
+       hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
       hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
-      hk_cdm_cache_flush(dev, cs);
+      hk_cdm_visibility_flush(dev, cs, alias_scope);
    }
 
    hk_sync_barrier(cmd, src_kinds, dst_kinds);
@@ -1162,7 +1165,11 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    /* A barrier-only command buffer otherwise records no GPU work, so it
     * cannot make a preceding fragment store visible to the host. Emit the
     * native strong CDM cache-maintenance record only when the API requests
-    * host-read availability, in a stream ordered after the source scope. */
+    * host-read availability, in a stream ordered after the source scope.
+    * The host reads memory, so on G17P the record has memory scope: a strong
+    * flush alone leaves the data in the GPU caches, and the end of the
+    * command does not reliably write it back before completion is reported
+    * when render work shares the queue. */
    if ((dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
        hk_dependency_has_host_read(pDependencyInfo)) {
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
@@ -1175,7 +1182,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          return;
 
       hk_ensure_cs_has_space(cmd, flush, AGX3_CDM_BARRIER_SIZE);
-      hk_cdm_cache_flush(dev, flush);
+      hk_cdm_visibility_flush(dev, flush, true);
    }
 
    /* The dependency this barrier recorded is the one a continued instance
@@ -4450,9 +4457,10 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
     * order everything recorded from now on after them, as
     * hk_CmdPipelineBarrier2() does outside a render pass. */
    struct hk_cs *cs = cmd->current_cs.cs;
-   if (cs && cs->stats.cmds > 0 && cs->current != cs->strong_flush_end) {
+   const bool alias_scope = hk_cdm_alias_scope(dev);
+   if (cs && hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
       hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
-      hk_cdm_cache_flush(dev, cs);
+      hk_cdm_visibility_flush(dev, cs, alias_scope);
    }
    hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_ALL);
    cmd->state.deferred_clear_flushing = false;

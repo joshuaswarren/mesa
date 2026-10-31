@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "util/u_atomic.h"
 #include "util/u_queue.h"
 
 #include "asahi/lib/agx_device.h"
@@ -126,6 +127,10 @@ struct hk_device {
    struct agx_device dev;
    /* Scratch-filled sparse VA (M5: bounded by sparseAddressSpaceSize). */
    uint64_t sparse_scratch_B;
+   /* Live buffers and image planes with a GPU virtual address of their own
+    * (sparse binding, capture/replay buffers), atomic. Their memory is also
+    * mapped at another address, see hk_cdm_alias_scope(). */
+   uint32_t va_alias_resources;
    /* One bit per main-heap page: only unbound sparse buffer pages are set. */
    struct agx_bo *physical_sparse_map;
    struct agxdecode_ctx *decode_ctx;
@@ -346,6 +351,43 @@ enum hk_perftest {
 };
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)
+
+/* G17P GPU caches are tagged by virtual address: a strong CDM flush makes a
+ * write visible only to reads through the same mapping. While any resource
+ * maps memory at a second address, an application dependency between
+ * compute or transfer work in one stream needs the memory-scope flush
+ * (hk_cdm_visibility_flush()). Devices that never create such a resource
+ * keep the ordinary strong flush.
+ *
+ * The state is read when a barrier is recorded. A resource the command
+ * buffer references exists by then, and it counts from creation, so later
+ * sparse binds are covered. The flush goes into the open compute stream,
+ * and only when that stream already holds work
+ * (hk_cdm_visibility_flush_needed()). It writes back every dirty line, so
+ * the writes it covers include those of earlier streams and earlier
+ * command buffers. A barrier recorded with no open compute stream holding
+ * work records no flush. This includes the first barrier of a command
+ * buffer and barriers after the stream was closed, for example by a
+ * timestamp or query copy. Earlier writes read through another address
+ * after such a barrier have no memory-scope flush between them. Whether
+ * the hardware returns stale data in that case has not been tested. When
+ * the open stream holds work unrelated to the source, the flush goes at its
+ * end, but a graphics destination is still ordered only after the source's
+ * stream, so it can start before the flush. Not covered: a
+ * resource created after the command buffer was recorded and reached
+ * through a path recording did not see, that is a device address the
+ * command buffer reads indirectly, or a descriptor set bound at recording
+ * and updated after it (descriptorBinding*UpdateAfterBind). Graphics-only
+ * sources also do not request memory scope: attachment or shader writes
+ * through a sparse image followed by transfer or compute reads through a
+ * plain alias receive the ordinary post-graphics strong flush. That case
+ * has not been hardware-tested. */
+static inline bool
+hk_cdm_alias_scope(const struct hk_device *dev)
+{
+   return dev->dev.chip == AGX_CHIP_G17P &&
+          p_atomic_read(&dev->va_alias_resources) != 0;
+}
 
 static inline struct hk_physical_device *
 hk_device_physical(struct hk_device *dev)

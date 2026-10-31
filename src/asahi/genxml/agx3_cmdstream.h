@@ -94,8 +94,10 @@ struct agx3_cdm_barrier_info {
     * 0x600215fe for a nonzero visibility: the ordinary word with 0x2009e
     * set. */
    bool wide_visibility;
-   /* HAL300 memory visibility also requires the low cache-scope bits.
-    * The ordering-only record leaves these clear. */
+   /* Memory-scope flush (AGX3_CDM_BARRIER_FLUSH_MEMORY): the strong flush
+    * (flags 5) alone makes writes visible only to later reads through the
+    * same virtual address. The ordering-only record leaves these bits clear.
+    * See agx3_cdm_barrier_flush_memory_grounded(). */
    bool flush_memory;
 };
 
@@ -605,6 +607,39 @@ agx3_cdm_barrier_wide_visibility_grounded(enum agx_chip chip)
 
 #define AGX3_CDM_BARRIER_WIDE_VISIBILITY UINT32_C(0x0002009e)
 
+/* Cache-scope bits 4:2 of the CDM barrier word, set only on a strong (flags 5)
+ * record.  Bit 4 writes the GPU's cached data back to memory: the GPU caches
+ * are tagged by virtual address, so without it a write is visible only to
+ * later reads through the same mapping, and a read of the same memory
+ * through another mapping (a sparse binding and a plain buffer over the same
+ * pages, or a sparse buffer's read-only shadow) returns stale memory.  The
+ * host reads memory, so host availability needs it too.  Bits 3:2 are the
+ * lower cache-scope bits that both Apple-grounded forms set together with
+ * bit 4: HAL300's memory-visibility record (0x6000157c) and the G15/G16G
+ * wide-visibility word (AGX3_CDM_BARRIER_WIDE_VISIBILITY, bits 7, 4:1 and
+ * 17).  On G17P, bit 4 alone was enough on hardware and bits 3:2 alone had no
+ * effect; the record keeps the grounded three-bit form. */
+#define AGX3_CDM_BARRIER_FLUSH_MEMORY UINT32_C(0x0000001c)
+
+/* Where the memory-scope flush is grounded: HAL300 (G17G/G17S/G17C) from
+ * Apple's emitter, and G17P (HAL200) from a hardware A/B in which only the
+ * memory-scope record made a transfer write visible through a second mapping
+ * within one command (and compute results visible to the host when render
+ * and compute shared a queue). */
+static inline bool
+agx3_cdm_barrier_flush_memory_grounded(enum agx_chip chip)
+{
+   switch (chip) {
+   case AGX_CHIP_G17P:
+   case AGX_CHIP_G17G:
+   case AGX_CHIP_G17S:
+   case AGX_CHIP_G17C:
+      return true;
+   default:
+      return false;
+   }
+}
+
 static inline uint32_t
 agx3_cdm_barrier_word(uint8_t flags)
 {
@@ -628,15 +663,15 @@ agx3_cdm_barrier_pack(const struct agx3_cdm_barrier_info *info,
         !agx3_cdm_barrier_wide_visibility_grounded(info->chip)))
       return false;
 
-   const bool gen7 = info->chip == AGX_CHIP_G17G ||
-                     info->chip == AGX_CHIP_G17S || info->chip == AGX_CHIP_G17C;
-   if (info->flush_memory && (!gen7 || info->flags != 5))
+   if (info->flush_memory &&
+       (!agx3_cdm_barrier_flush_memory_grounded(info->chip) ||
+        info->flags != 5))
       return false;
    agx3_cmdstream_store_le32(
       packed, agx3_cdm_barrier_word(info->flags) |
                  (info->wide_visibility ? AGX3_CDM_BARRIER_WIDE_VISIBILITY
                                         : 0) |
-                 (info->flush_memory ? 0x1c : 0));
+                 (info->flush_memory ? AGX3_CDM_BARRIER_FLUSH_MEMORY : 0));
    return true;
 }
 
@@ -662,13 +697,14 @@ agx3_cdm_barrier_unpack(enum agx_chip chip, const void *packed,
       word &= ~AGX3_CDM_BARRIER_WIDE_VISIBILITY;
    }
 
-   const bool flush_memory = (word & 0x1c) == 0x1c;
-   const bool gen7 = chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-                     chip == AGX_CHIP_G17C;
-   if ((word & 0x1c) && (!gen7 || !flush_memory))
+   const bool flush_memory = (word & AGX3_CDM_BARRIER_FLUSH_MEMORY) ==
+                             AGX3_CDM_BARRIER_FLUSH_MEMORY;
+   if ((word & AGX3_CDM_BARRIER_FLUSH_MEMORY) &&
+       (!agx3_cdm_barrier_flush_memory_grounded(chip) || !flush_memory))
       return false;
    const uint32_t optional_mask = UINT32_C(0x00001c02) |
-                                 (flush_memory ? 0x1c : 0);
+                                 (flush_memory ? AGX3_CDM_BARRIER_FLUSH_MEMORY
+                                               : 0);
    if ((word & ~optional_mask) != UINT32_C(0x60000160))
       return false;
 

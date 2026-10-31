@@ -1701,6 +1701,9 @@ hk_image_plane_alloc_vma(struct hk_device *dev, struct hk_image_plane *plane,
          plane->addr = 0;
          return result;
       }
+      /* Bound memory is reached through this plane's own address as well
+       * (hk_cdm_alias_scope()); hk_image_plane_finish() drops the count. */
+      p_atomic_inc(&dev->va_alias_resources);
    }
 
    if (sparse_resident) {
@@ -1734,6 +1737,8 @@ hk_image_plane_finish(struct hk_device *dev, struct hk_image_plane *plane,
 {
    if (plane->va) {
       agx_va_free(&dev->dev, plane->va, true);
+      plane->va = NULL;
+      p_atomic_dec(&dev->va_alias_resources);
    }
    hk_release_sparse_scratch(dev, plane->sparse_scratch_B);
    plane->sparse_scratch_B = 0;

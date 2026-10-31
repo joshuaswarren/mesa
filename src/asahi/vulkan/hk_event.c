@@ -125,6 +125,17 @@ hk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
    hk_sync_dependency_kinds(pDependencyInfo, hk_sync_image_class(cmd),
                             &src_kinds, &dst_kinds);
 
+   /* The wait orders later work behind this stream's source work, but on
+    * G17P a read through another address of the same memory also needs
+    * the source writes flushed with memory scope (hk_cdm_alias_scope()). */
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_cs *cs = cmd->current_cs.cs;
+   if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
+       hk_cdm_alias_scope(dev) && hk_cdm_visibility_flush_needed(dev, cs, true)) {
+      hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+      hk_cdm_visibility_flush(dev, cs, true);
+   }
+
    hk_event_write(cmd, event, src_kinds, VK_EVENT_SET);
 }
 

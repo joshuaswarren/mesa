@@ -884,19 +884,37 @@ test_agx3_cdm_barrier(void)
       }
    }
 
-   /* Native HAL300 full-memory record. Ordering flags alone do not make
-    * writes visible through another virtual mapping of the same memory. */
-   for (unsigned i = 0; i < ARRAY_SIZE(gen7); ++i) {
+   /* Memory-scope record on HAL300 and G17P. Ordering flags alone do not
+    * make writes visible through another virtual mapping of the same
+    * memory. */
+   const enum agx_chip memory_scope[] = {
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17P,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(memory_scope); ++i) {
       struct agx3_cdm_barrier_info full = {
-         .chip = gen7[i], .flags = 5, .flush_memory = true,
+         .chip = memory_scope[i], .flags = 5, .flush_memory = true,
       }, decoded;
       uint8_t packed[AGX3_CDM_BARRIER_SIZE];
+      CHECK_EQ(agx3_cdm_barrier_flush_memory_grounded(full.chip), true);
       CHECK_EQ(agx3_cdm_barrier_pack(&full, packed), true);
       CHECK_EQ(agx3_cmdstream_load_le32(packed), 0x6000157c);
       CHECK_EQ(agx3_cdm_barrier_unpack(full.chip, packed, sizeof(packed), &decoded), true);
       CHECK_EQ(decoded.flush_memory, true);
       CHECK_EQ(decoded.flags, 5);
-      full.chip = AGX_CHIP_G17P;
+      /* Only the strong record takes the memory scope. */
+      full.flags = 0;
+      CHECK_EQ(agx3_cdm_barrier_pack(&full, packed), false);
+      /* A partial scope is not a grounded record. */
+      agx3_cmdstream_store_le32(packed, 0x60001570);
+      CHECK_EQ(agx3_cdm_barrier_unpack(memory_scope[i], packed, sizeof(packed), &decoded), false);
+   }
+   const enum agx_chip no_memory_scope[] = {AGX_CHIP_G15S, AGX_CHIP_G16G};
+   for (unsigned i = 0; i < ARRAY_SIZE(no_memory_scope); ++i) {
+      struct agx3_cdm_barrier_info full = {
+         .chip = no_memory_scope[i], .flags = 5, .flush_memory = true,
+      };
+      uint8_t packed[AGX3_CDM_BARRIER_SIZE];
+      CHECK_EQ(agx3_cdm_barrier_flush_memory_grounded(full.chip), false);
       CHECK_EQ(agx3_cdm_barrier_pack(&full, packed), false);
    }
 

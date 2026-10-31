@@ -340,6 +340,11 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       }
    }
 
+   /* Bound memory is reached through this buffer's own address as well as
+    * the memory's, or other resources' (hk_cdm_alias_scope()). */
+   if (buffer->va)
+      p_atomic_inc(&dev->va_alias_resources);
+
    *pBuffer = hk_buffer_to_handle(buffer);
 
    return VK_SUCCESS;
@@ -361,6 +366,7 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
 
    if (buffer->va) {
       agx_va_free(&dev->dev, buffer->va, true);
+      p_atomic_dec(&dev->va_alias_resources);
    }
    hk_release_sparse_scratch(dev, buffer->sparse_scratch_B);
 

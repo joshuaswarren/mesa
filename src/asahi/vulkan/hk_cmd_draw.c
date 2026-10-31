@@ -3558,11 +3558,12 @@ hk_xfer_order(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
    /* Each launch ends in a weak ordering record; strengthen the last one
     * into a cache flush, as a barrier does (hk_CmdPipelineBarrier2()). */
+   const bool alias_scope = hk_cdm_alias_scope(dev);
    for (unsigned i = 0; i < n; ++i) {
       struct hk_cs *w = flush[i];
-      if (w->stats.cmds > 0 && w->current != w->strong_flush_end) {
+      if (hk_cdm_visibility_flush_needed(dev, w, alias_scope)) {
          hk_ensure_cs_has_space(cmd, w, AGX3_CDM_BARRIER_SIZE);
-         hk_cdm_cache_flush(dev, w);
+         hk_cdm_visibility_flush(dev, w, alias_scope);
       }
    }
 
