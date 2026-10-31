@@ -11,6 +11,8 @@
 #include "util/u_debug.h"
 #include "agx_compiler.h"
 #include "util/bitset.h"
+#include "util/set.h"
+#include "util/u_dynarray.h"
 #include "nir.h"
 #include "nir_builder_opcodes.h"
 #include "nir_intrinsics.h"
@@ -316,15 +318,112 @@ instr_cost(nir_instr *instr, const void *data)
    }
 }
 
+/* Uniform slots run out in big shaders. Code under an if may never run, so
+ * divide its claim on them per level: otherwise the many small loads of a
+ * cold branch outbid the vectors every fragment reads, and the shader spills
+ * to hold those. The rewrite cost scales the same way, so this reorders the
+ * candidates without dropping any while slots are free.
+ *
+ * data is the set of ifs that stay branches (surviving_branches), NULL for no
+ * weighting. An if that the later nir_opt_peephole_select turns into selects
+ * runs for every invocation that reaches it, so it does not count. A loop
+ * leaves the weight as is. */
+static bool
+is_branch(const struct set *branches, nir_cf_node *node)
+{
+   return node && _mesa_set_search(branches, node);
+}
+
+static float
+execution_weight(nir_block *block, const struct set *branches)
+{
+   float weight = 1.0f;
+   if (!branches)
+      return weight;
+   for (nir_cf_node *node = block->cf_node.parent; node; node = node->parent) {
+      if (is_branch(branches, node))
+         weight /= 8.0f;
+   }
+   return weight;
+}
+
+static void
+collect_ifs(struct exec_list *list, struct util_dynarray *ifs)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         util_dynarray_append(ifs, nif);
+         collect_ifs(&nif->then_list, ifs);
+         collect_ifs(&nif->else_list, ifs);
+      } else if (node->type == nir_cf_node_loop) {
+         collect_ifs(&nir_cf_node_as_loop(node)->body, ifs);
+      }
+   }
+}
+
+/* The ifs of the main program that are still branches once flatten, the
+ * nir_opt_peephole_select that runs after the constant program is formed,
+ * has seen it. Found by forming an unweighted constant program on a clone and
+ * flattening that, so the rule is the select pass's own. Without flatten,
+ * every if is a branch. */
+static struct set *
+surviving_branches(nir_shader *nir, const nir_opt_preamble_options *options,
+                   const unsigned *sizes,
+                   const nir_opt_peephole_select_options *flatten)
+{
+   struct set *branches = _mesa_pointer_set_create(NULL);
+   struct util_dynarray ifs, clone_ifs, left;
+   util_dynarray_init(&ifs, NULL);
+   util_dynarray_init(&clone_ifs, NULL);
+   util_dynarray_init(&left, NULL);
+   collect_ifs(&nir_shader_get_entrypoint(nir)->body, &ifs);
+
+   if (flatten && ifs.size) {
+      unsigned used[nir_preamble_num_classes];
+      memcpy(used, sizes, sizeof(used));
+
+      nir_shader *clone = nir_shader_clone(NULL, nir);
+      collect_ifs(&nir_shader_get_entrypoint(clone)->body, &clone_ifs);
+      nir_opt_preamble(clone, options, used);
+      nir_opt_peephole_select(clone, flatten);
+      collect_ifs(&nir_shader_get_entrypoint(clone)->body, &left);
+
+      /* Both walks see the same ifs in the same order, and the select pass
+       * creates no ifs. */
+      struct set *standing = _mesa_pointer_set_create(NULL);
+      util_dynarray_foreach(&left, nir_if *, nif)
+         _mesa_set_add(standing, *nif);
+      for (unsigned i = 0; i < util_dynarray_num_elements(&ifs, nir_if *);
+           ++i) {
+         if (_mesa_set_search(standing, *util_dynarray_element(
+                                           &clone_ifs, nir_if *, i)))
+            _mesa_set_add(branches,
+                          *util_dynarray_element(&ifs, nir_if *, i));
+      }
+      _mesa_set_destroy(standing, NULL);
+      ralloc_free(clone);
+   } else {
+      util_dynarray_foreach(&ifs, nir_if *, nif)
+         _mesa_set_add(branches, *nif);
+   }
+
+   util_dynarray_fini(&ifs);
+   util_dynarray_fini(&clone_ifs);
+   util_dynarray_fini(&left);
+   return branches;
+}
+
 static float
 instr_cost_g17p(nir_instr *instr, const void *data)
 {
+   float weight = execution_weight(instr->block, data);
    if (instr->type == nir_instr_type_alu) {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
       if (alu->op == nir_op_fabs && alu->def.bit_size <= 32)
-         return 1.0f;
+         return weight;
    }
-   return instr_cost(instr, data);
+   return instr_cost(instr, data) * weight;
 }
 
 /* G17P's vertex output store reads its 16-bit index from the uniform file
@@ -390,7 +489,14 @@ rewrite_cost(nir_def *def, const void *data)
 static float
 rewrite_cost_g17p(nir_def *def, const void *data)
 {
-   return rewrite_cost_impl(def, true);
+   /* A phi is worth what its arms are, one if deeper than it sits. */
+   nir_block *block = nir_def_block(def);
+   float weight = execution_weight(block, data);
+   if (data && nir_def_instr(def)->type == nir_instr_type_phi &&
+       is_branch(data, nir_cf_node_prev(&block->cf_node)))
+      weight /= 8.0f;
+
+   return rewrite_cost_impl(def, true) * weight;
 }
 
 /* AGX3C publishes constant-program results with 32-bit uniform copies only
@@ -880,7 +986,8 @@ widen_half_exports(nir_shader *nir)
 
 bool
 agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
-                     bool agx3c)
+                     bool agx3c,
+                     const nir_opt_peephole_select_options *flatten)
 {
    bool progress = false;
    nir_opt_preamble_options options = preamble_options;
@@ -894,6 +1001,12 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
       options.def_size = agx3c ? def_size_agx3c : def_size_agx3b;
       options.instr_cost_cb = agx3c ? instr_cost : instr_cost_g17p;
       options.rewrite_cost_cb = agx3c ? rewrite_cost_agx3c : rewrite_cost_g17p;
+   }
+   /* Every AGX3B chip: the uniform file it fills is the encoding's. */
+   struct set *branches = NULL;
+   if (g17p && !agx3c) {
+      branches = surviving_branches(nir, &options, sizes, flatten);
+      options.cb_data = branches;
    }
    bool speculative = false;
    if (g17p && !agx3c && nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -932,6 +1045,7 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
    NIR_PASS(progress, nir, nir_shader_intrinsics_pass, lower_preamble,
             nir_metadata_control_flow, heap);
 
+   _mesa_set_destroy(branches, NULL);
    return progress;
 }
 

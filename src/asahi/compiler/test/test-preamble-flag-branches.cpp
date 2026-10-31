@@ -63,7 +63,7 @@ run_flag(bool late)
 
    nir_validate_shader(b.shader, "before preamble");
    unsigned sizes[] = {4, 0, 0};
-   EXPECT_TRUE(agx_nir_opt_preamble(b.shader, sizes, true, false));
+   EXPECT_TRUE(agx_nir_opt_preamble(b.shader, sizes, true, false, NULL));
    if (late) {
       EXPECT_TRUE(agx_nir_export_select_flags_as_halves(b.shader, true));
    }

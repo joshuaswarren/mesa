@@ -654,6 +654,7 @@ if with_tests
          'test/test-demote-early-kill.cpp',
          'test/test-preamble-half-word-exports.cpp',
          'test/test-quad-control.cpp',
+         'test/test-preamble-priority.cpp',
          'test/test-signed-zero-fma.cpp',
          'test/test-negated-minifloat.cpp',
          'test/test-dual-absolute-select.cpp',

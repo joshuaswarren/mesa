@@ -38,7 +38,7 @@ check_payload(unsigned bits, unsigned heap = 24, bool g17p = true)
       agx_test_load_preamble(&b, 1, 32, 28, nir_preamble_class_image);
    nir_validate_shader(b.shader, "before preamble");
    unsigned sizes[] = {28, 1000, 1000};
-   ASSERT_TRUE(agx_nir_opt_preamble(b.shader, sizes, g17p, false));
+   ASSERT_TRUE(agx_nir_opt_preamble(b.shader, sizes, g17p, false, NULL));
    bool occupied[512] = {};
    unsigned payload_stores = 0, payload_loads = 0, stores = 0;
    nir_foreach_function_impl(impl, b.shader) {
@@ -117,7 +117,7 @@ TEST(AGXPreamblePayload, LegacyImageClassSlots)
       nir_store_uvs_agx(&b, nir_channel(&b, value, 0), nir_imm_int(&b, i));
    }
    unsigned sizes[] = {28, 0, 0};
-   ASSERT_TRUE(agx_nir_opt_preamble(b.shader, sizes, false, false));
+   ASSERT_TRUE(agx_nir_opt_preamble(b.shader, sizes, false, false, NULL));
    EXPECT_EQ(sizes[1], 4u);
    unsigned seen = 0;
    nir_foreach_function_impl(impl, b.shader) {

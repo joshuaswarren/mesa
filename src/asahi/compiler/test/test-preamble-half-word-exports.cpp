@@ -36,7 +36,7 @@ TEST_F(PreambleHalfExports, TakeAWholeWord)
                                .range = 1 << 16));
 
    unsigned sizes[] = {1, 1000, 1000};
-   ASSERT_TRUE(agx_nir_opt_preamble(b.shader, sizes, true, false));
+   ASSERT_TRUE(agx_nir_opt_preamble(b.shader, sizes, true, false, NULL));
 
    unsigned stores = 0;
    nir_foreach_block(block, nir_shader_get_preamble(b.shader)) {
