@@ -26,22 +26,32 @@ static unsigned failures;
    } while (0)
 
 static struct agx_device *
-open_va(void)
+open_va_gated(bool init_replay)
 {
    struct agx_device *dev = calloc(1, sizeof(*dev));
    simple_mtx_init(&dev->vma_lock, mtx_plain);
    dev->guard_size = PAGE;
    util_vma_heap_init(&dev->main_heap, USER_START, USER_SIZE);
-   dev->replay_heap_initialized = agx_capture_replay_heap_init(
-      &dev->main_heap, &dev->replay_heap, USER_SIZE, &dev->replay_start,
-      &dev->replay_size);
+   /* Base policy: chips outside the native-AGX3/M5 gate never reserve the
+    * capture/replay range and leave the heap unavailable. */
+   dev->replay_heap_initialized = init_replay &&
+      agx_capture_replay_heap_init(&dev->main_heap, &dev->replay_heap,
+                                   USER_SIZE, &dev->replay_start,
+                                   &dev->replay_size);
    return dev;
+}
+
+static struct agx_device *
+open_va(void)
+{
+   return open_va_gated(true);
 }
 
 static void
 close_va(struct agx_device *dev)
 {
-   util_vma_heap_finish(&dev->replay_heap);
+   if (dev->replay_heap_initialized)
+      util_vma_heap_finish(&dev->replay_heap);
    util_vma_heap_finish(&dev->main_heap);
    simple_mtx_destroy(&dev->vma_lock);
    free(dev);
@@ -131,6 +141,34 @@ main(void)
       agx_va_free(dev, filled[i], false);
 
    close_va(dev);
+
+   /* A device with the heap unavailable, as on chips outside the base
+    * native-AGX3/M5 gate: nothing may dereference the uninitialized heap.
+    * Opened after dev is closed so the devices cannot share memory. */
+   struct agx_device *gated = open_va_gated(false);
+   CHECK(!gated->replay_heap_initialized);
+   CHECK(gated->replay_start == 0 && gated->replay_size == 0);
+   CHECK(!agx_va_capture_valid(gated, start, sz, PAGE));
+   CHECK(!agx_va_capture_valid(gated, 0, sz, PAGE));
+   CHECK(!agx_va_alloc(gated, sz, PAGE, AGX_VA_CAPTURE_REPLAY | AGX_VA_FIXED,
+                       start + 8 * PAGE));
+   struct agx_va *g = agx_va_alloc(gated, 4ull << 30, PAGE, 0, 0);
+   CHECK(g && g->addr >= USER_START);
+   agx_va_free(gated, g, false);
+   /* The whole user window, range region included, is ordinary VA here:
+    * floor(1 TiB / (4 GiB + guard)) allocations fit, then it runs dry. */
+   unsigned g_n = 0;
+   while (g_n < MAX_FILL) {
+      struct agx_va *va = agx_va_alloc(gated, 4ull << 30, PAGE, 0, 0);
+      if (!va)
+         break;
+      filled[g_n++] = va;
+   }
+   CHECK(g_n == 255);
+   CHECK(!agx_va_alloc(gated, 4ull << 30, PAGE, 0, 0));
+   while (g_n)
+      agx_va_free(gated, filled[--g_n], false);
+   close_va(gated);
 
    if (failures) {
       fprintf(stderr, "%u checks failed\n", failures);
