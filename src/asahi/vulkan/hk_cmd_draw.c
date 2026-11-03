@@ -12637,9 +12637,7 @@ static void
 hk_g17p_note_layer_zero_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-       cmd->state.gfx.render.view_mask ||
-       cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] ||
-       cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL]) {
+       cmd->state.gfx.render.view_mask) {
       cs->g17p_layer_zero_unknown = true;
       return;
    }
