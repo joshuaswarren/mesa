@@ -87,9 +87,14 @@ static_assert(sizeof(struct agx_unlinked_uvs_layout) == 88, "packed");
 /* Supply the API's default Layer for drivers transporting it as a varying. */
 bool agx_nir_lower_default_layer(struct nir_shader *s);
 
+/* A non-negative layer_zero_root_offset names a 16-bit root table field that,
+ * when set, sends the fixed-function layer to zero. The varying a fragment
+ * shader reads keeps the written value.
+ */
 bool agx_nir_lower_uvs(struct nir_shader *s,
                        struct agx_unlinked_uvs_layout *layout,
-                       bool layer_as_varying, bool canonical);
+                       bool layer_as_varying, bool canonical,
+                       int layer_zero_root_offset);
 
 /**
  * Represents a linked UVS layout.

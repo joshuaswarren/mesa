@@ -4242,7 +4242,7 @@ hk_g17p_saturate_layer_viewport(nir_builder *b, nir_intrinsic_instr *intr,
 static void
 hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
                bool kill_psiz, bool layer_as_varying, bool default_layer,
-               bool clip_m1_1)
+               bool clip_m1_1, int layer_zero_root_offset)
 {
    /* Point size must be clamped, excessively large points don't render
     * properly on G13.
@@ -4278,7 +4278,8 @@ hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
     * the canonical layout, whose indices are constants.
     */
    NIR_PASS(_, nir, agx_nir_lower_uvs, &shader->info.uvs,
-            layer_as_varying, dev->dev.chip == AGX_CHIP_G17P);
+            layer_as_varying, dev->dev.chip == AGX_CHIP_G17P,
+            layer_zero_root_offset);
 }
 
 /* G17P unrolls per-sample fragment execution for a pipeline that fixes two or
@@ -5497,7 +5498,10 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
             NIR_PASS(_, nir, agx_nir_preserve_position_order);
          hk_lower_hw_vs(dev, nir, shader, kill_psiz,
                         agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip),
-                        default_layer, hk_clip_m1_1(dev, features));
+                        default_layer, hk_clip_m1_1(dev, features),
+                        agx_native_graphics(&dev->dev)
+                           ? hk_root_descriptor_offset(draw.no_attachments)
+                           : -1);
          outputs = nir->info.outputs_written;
       } else {
          NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
@@ -7610,7 +7614,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       /* An M5 mesh layer/viewport is also a user word (see
        * agx_m5_mesh_gather_varyings), as for the M5 vertex stage. */
       agx_nir_lower_uvs(layout.shader, &shader->info.uvs,
-                        m5_mesh && layout_ok && varyings.lv, false);
+                        m5_mesh && layout_ok && varyings.lv, false, -1);
       shader->info.uvs.mesh_primitive_page = varyings.primitive_stride_B != 0;
       shader->info.mesh.primitive_stride_B = varyings.primitive_stride_B;
       if (!m5_mesh)
@@ -7864,7 +7868,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       }
       hk_lower_hw_vs(dev, rast, shader, false,
                      agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip),
-                     true, hk_clip_m1_1(dev, features));
+                     true, hk_clip_m1_1(dev, features),
+                     agx_native_graphics(&dev->dev)
+                        ? hk_root_descriptor_offset(draw.no_attachments)
+                        : -1);
       shader->info.gs = count_variant->info.gs;
       main_variant->info.gs = count_variant->info.gs;
 

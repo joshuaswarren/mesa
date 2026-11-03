@@ -4697,6 +4697,18 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    hk_attachment_init(&render->depth_att, pRenderingInfo->pDepthAttachment);
    hk_attachment_init(&render->stencil_att, pRenderingInfo->pStencilAttachment);
 
+   /* vkd3d-proton renders without attachments at the Vulkan maximum, layers
+    * included, which cannot fit in a tiler allocation. Nothing is stored per
+    * layer, so one hardware layer serves all of them. */
+   bool no_attachments = agx_native_graphics(&dev->dev) && !render->view_mask &&
+                         !render->depth_att.iview && !render->stencil_att.iview;
+   for (uint32_t i = 0; i < render->color_att_count; i++)
+      no_attachments &= !render->color_att[i].iview;
+   if (cmd->state.gfx.descriptors.root.draw.no_attachments != no_attachments) {
+      cmd->state.gfx.descriptors.root.draw.no_attachments = no_attachments;
+      cmd->state.gfx.descriptors.root_dirty = true;
+   }
+
    if (unlikely(dev->frame_anatomy)) {
       /* Frame anatomy profiler: compression state of each colour target. */
       for (uint32_t i = 0; i < render->color_att_count; i++) {
@@ -12639,6 +12651,11 @@ hk_g17p_note_layer_zero_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
        cmd->state.gfx.render.view_mask) {
       cs->g17p_layer_zero_unknown = true;
+      return;
+   }
+
+   if (cmd->state.gfx.descriptors.root.draw.no_attachments) {
+      cs->g17p_layer_zero_draws++;
       return;
    }
 
