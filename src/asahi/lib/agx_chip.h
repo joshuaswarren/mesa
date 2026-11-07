@@ -728,8 +728,6 @@ bool agx_params_m5_supported(
 bool agx_params_native_kernel_abi_supported(
    const struct drm_asahi_params_global *params);
 
-bool agx_params_fixup_upstream_uapi(struct drm_asahi_params_global *params);
-
 /* Exact product name when the chip identity maps to one unambiguous SoC.
  * Variant letters are not marketing tiers: notably, G17P is A18 Pro rather
  * than an M5 variant. Returns NULL when one chip identity spans products. */
