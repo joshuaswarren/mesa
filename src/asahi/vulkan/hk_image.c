@@ -11,6 +11,7 @@
 #include "agx_bg_eot_key.h"
 #include "hk_native_descriptor.h"
 #include "asahi/layout/layout.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "util/bitscan.h"
 #include "util/format/u_format.h"
@@ -726,7 +727,8 @@ hk_can_compress_format(const struct agx_device *dev, VkFormat format)
 bool
 hk_interchange_format(const struct agx_device *dev, VkFormat format)
 {
-   if (dev->chip != AGX_CHIP_G17P || (dev->debug & AGX_DBG_NOCOMPRESS))
+   if (!agx_chip_has_cap(dev->chip, AGX_CAP_GEN9_2D_COMPRESSION) ||
+       (dev->debug & AGX_DBG_NOCOMPRESS))
       return false;
 
    switch (format) {
@@ -1546,9 +1548,11 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
          return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
                           "interchange modifier on an ineligible image");
 
-      /* The row pitch is part of the modifier's contract with appledrm. */
+      /* Per pixel row: matches ail_get_wsi_stride_B() (1/16 of the 16x16
+       * macroblock row pitch) so DRM core's pitch * height check and
+       * vkGetImageSubresourceLayout() agree with explicit modifier imports. */
       const uint64_t pitch_B = DIV_ROUND_UP(pCreateInfo->extent.width, 16) *
-                               256 * vk_format_get_blocksize(pCreateInfo->format);
+                               16 * vk_format_get_blocksize(pCreateInfo->format);
       if (mod_explicit_info &&
           mod_explicit_info->pPlaneLayouts[0].rowPitch != pitch_B)
          return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,

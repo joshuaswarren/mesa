@@ -288,10 +288,15 @@ TEST(Linear, Packed422Rows)
 }
 
 /*
- * G17P Interchange (DRM_FORMAT_MOD_APPLE_INTERCHANGE).  The row
- * pitch, data size and header offset are the contract with appledrm, which
- * requires pitch == ceil(w/16)*1024, header offset == data size and a buffer
+ * Compressed Interchange (DRM_FORMAT_MOD_APPLE_INTERCHANGE; gated per chip by
+ * AGX_CAP_GEN9_2D_COMPRESSION).  The macroblock row pitch, data size
+ * and header offset are the contract with appledrm, which lays out
+ * pitch == ceil(w/16)*1024, header offset == data size and a buffer
  * of at least data + (8 << (log2ceil(tiles_x) + log2ceil(tiles_y))) bytes.
+ * appledrm derives that layout itself and ignores the framebuffer pitch, but
+ * DRM core checks (height - 1) * pitch + width * cpp against the buffer, so
+ * the pitch handed to the window system is per pixel row: a sixteenth of the
+ * macroblock row.
  */
 static void
 check_interchange(unsigned w, unsigned h)
@@ -317,7 +322,8 @@ check_interchange(unsigned w, unsigned h)
       8ull << (util_logbase2_ceil(tx) + util_logbase2_ceil(ty));
 
    EXPECT_EQ(ail_get_interchange_stride_B(&layout), pitch);
-   EXPECT_EQ(ail_get_wsi_stride_B(&layout, 0), pitch);
+   EXPECT_EQ(ail_get_wsi_stride_B(&layout, 0), pitch / 16);
+   EXPECT_LE((h - 1) * (pitch / 16) + w * 4, layout.size_B);
    EXPECT_EQ(layout.level_offsets_B[0], 0u);
    EXPECT_EQ(ail_get_level_size_B(&layout, 0), data);
    EXPECT_EQ(layout.layer_stride_B, data);

@@ -341,9 +341,10 @@ hk_image_aspects_to_plane(const struct hk_image *image,
 struct agx_device;
 bool hk_can_compress_format(const struct agx_device *dev, VkFormat format);
 
-/* DRM_FORMAT_MOD_APPLE_INTERCHANGE: G17P-only, single-level,
- * single-layer, single-sample 2D colour images of the 32-bit RGBA formats
- * the display coprocessor scans out.  pNext may be NULL (format queries). */
+/* DRM_FORMAT_MOD_APPLE_INTERCHANGE: single-level, single-layer,
+ * single-sample 2D colour images of the 32-bit RGBA formats the display
+ * coprocessor scans out, gated by AGX_CAP_GEN9_2D_COMPRESSION.
+ * pNext may be NULL (format queries). */
 bool hk_interchange_format(const struct agx_device *dev, VkFormat format);
 
 struct hk_cmd_buffer;

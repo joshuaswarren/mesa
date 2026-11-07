@@ -1339,11 +1339,38 @@ test_gen9_compressed_depth_array(void)
    }
 }
 
+static void
+test_dmabuf_modifier_external_only(void)
+{
+   /* AGX2 has in-place decompression, so no modifier is external-only.
+    * AGX3 keeps GPU_TILED_COMPRESSED external-only (imported from Vulkan to
+    * sample), while INTERCHANGE stays renderable for compositor scanout FBOs
+    * (protected against BO reallocation by agx_decompress() / batch reject). */
+   static const enum agx_descriptor_generation gens[] = {
+      AGX_DESCRIPTOR_GENERATION_7,
+      AGX_DESCRIPTOR_GENERATION_8,
+      AGX_DESCRIPTOR_GENERATION_9,
+      AGX_DESCRIPTOR_GENERATION_10,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(gens); ++i) {
+      const bool agx3 = agx_gallium_descriptor_generation_is_agx3(gens[i]);
+      CHECK(agx_gallium_dmabuf_modifier_external_only(
+               gens[i], DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED) == agx3);
+      CHECK(!agx_gallium_dmabuf_modifier_external_only(
+         gens[i], DRM_FORMAT_MOD_APPLE_GPU_TILED));
+      CHECK(!agx_gallium_dmabuf_modifier_external_only(
+         gens[i], DRM_FORMAT_MOD_APPLE_INTERCHANGE));
+      CHECK(!agx_gallium_dmabuf_modifier_external_only(gens[i],
+                                                       DRM_FORMAT_MOD_LINEAR));
+   }
+}
+
 int
 main(void)
 {
    test_chip_routing();
    test_feature_gates();
+   test_dmabuf_modifier_external_only();
    test_g17p_txf_sampler();
    test_native_sampler_generations();
    test_g17p_sampler_handles();

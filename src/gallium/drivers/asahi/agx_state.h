@@ -1607,6 +1607,30 @@ agx_valid_buffer_range_intersects(struct agx_resource *rsrc, unsigned start,
    return intersects;
 }
 
+/* Whether the resource is, or may be, shared with another process or the
+ * display controller. Its backing BO must never be replaced via
+ * transition_resource() or agx_shadow().
+ */
+static inline bool
+agx_resource_is_shared(const struct agx_resource *rsrc)
+{
+   return (rsrc->base.b.bind &
+           (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET)) ||
+          (rsrc->bo &&
+           (rsrc->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)));
+}
+
+/* Whether the resource is a shared/shareable compressed Interchange surface.
+ * Its backing BO cannot be reallocated uncompressed in agx_decompress(), and
+ * pixel-granular writable storage-image bindings must fail closed.
+ */
+static inline bool
+agx_resource_is_shared_interchange(const struct agx_resource *rsrc)
+{
+   return agx_resource_is_shared(rsrc) && rsrc->layout.compressed &&
+          rsrc->layout.tiling == AIL_TILING_INTERCHANGE;
+}
+
 static inline bool
 agx_resource_valid(struct agx_resource *rsrc, int level)
 {

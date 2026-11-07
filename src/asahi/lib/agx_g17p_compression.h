@@ -5,9 +5,12 @@
 
 #pragma once
 
+#include "drm-uapi/drm_fourcc.h"
 #include "util/format/u_formats.h"
+#include "agx_chip_caps.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* Colour formats whose G17P images Gallium may allocate losslessly
  * compressed.
@@ -120,4 +123,54 @@ agx_g17p_compression_color_format_16b(enum pipe_format format)
    default:
       return false;
    }
+}
+
+/* Whether a chip enables compressed 2D Interchange
+ * (DRM_FORMAT_MOD_APPLE_INTERCHANGE), sharing AGX_CAP_GEN9_2D_COMPRESSION
+ * with Gallium depth compression and Borealis interchange so they cannot drift
+ * apart (private Gen9 colour compression is gated separately by
+ * agx_chip_gen9_color_compression() for G16G and G17P). Which modifiers the
+ * display accepts comes from the display's own modifier list.
+ */
+static inline bool
+agx_chip_supports_interchange(enum agx_chip chip)
+{
+   return agx_chip_has_cap(chip, AGX_CAP_GEN9_2D_COMPRESSION);
+}
+
+/* The plain 32-bit formats an Interchange image may have. */
+static inline bool
+agx_interchange_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* The one rule for advertising and choosing Interchange: GPU capability
+ * plus format. Modifier queries and agx_interchange_allowed() share it, so
+ * other chips and formats see the modifier list they always did. */
+static inline bool
+agx_interchange_modifier_supported(enum agx_chip chip, enum pipe_format format)
+{
+   return agx_chip_supports_interchange(chip) &&
+          agx_interchange_format(format);
+}
+
+static inline bool
+agx_dmabuf_modifier_supported(enum agx_chip chip, bool nocompress,
+                              uint64_t modifier, enum pipe_format format)
+{
+   if (modifier == DRM_FORMAT_MOD_APPLE_INTERCHANGE)
+      return !nocompress && agx_interchange_modifier_supported(chip, format);
+
+   return modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED ||
+          modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED ||
+          modifier == DRM_FORMAT_MOD_LINEAR;
 }
