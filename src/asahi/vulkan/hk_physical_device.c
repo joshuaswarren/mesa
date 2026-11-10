@@ -143,6 +143,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_vulkan_memory_model = true,
       .KHR_workgroup_memory_explicit_layout = true,
       .KHR_zero_initialize_workgroup_memory = true,
+      .AMD_shader_core_properties2 = true,
       .EXT_4444_formats = true,
       .EXT_attachment_feedback_loop_layout = true,
       .EXT_blend_operation_advanced = true,
@@ -938,6 +939,9 @@ hk_get_device_properties(const struct agx_device *dev,
       /* Vulkan 1.4 properties */
       .dynamicRenderingLocalReadDepthStencilAttachments = false,
       .dynamicRenderingLocalReadMultisampledAttachments = true,
+
+      /* VK_AMD_shader_core_properties2 */
+      .activeComputeUnitCount = agx_get_num_cores(dev),
 
       /* VK_KHR_push_descriptor */
       .maxPushDescriptors = HK_MAX_PUSH_DESCRIPTORS,
