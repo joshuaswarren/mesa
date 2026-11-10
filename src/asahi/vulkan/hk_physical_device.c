@@ -1243,6 +1243,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    }
 
    bool is_asahi = (strcmp(version->name, "asahi") == 0);
+   is_asahi |= strcmp(version->name, "aurora") == 0;
    is_asahi |= strcmp(version->name, "virtio_gpu") == 0;
    drmFreeVersion(version);
 

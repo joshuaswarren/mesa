@@ -1224,7 +1224,8 @@ v3d_simulator_init(int fd)
                 sim_file->gem_type = GEM_I915;
         else if (version && strncmp(version->name, "amdgpu", version->name_len) == 0)
                 sim_file->gem_type = GEM_AMDGPU;
-        else if (version && strncmp(version->name, "asahi", version->name_len) == 0)
+        else if (version && (strncmp(version->name, "asahi", version->name_len) == 0 ||
+                             strncmp(version->name, "aurora", version->name_len) == 0))
                 sim_file->gem_type = GEM_ASAHI;
         else
                 sim_file->gem_type = GEM_DUMB;
