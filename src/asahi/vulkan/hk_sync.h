@@ -87,10 +87,10 @@ enum hk_sync_kind {
     * alias other resources, and in its pre- and post-graphics streams; a
     * render without any of those writes only its attachments, which a later
     * pre-rasterization stage can read only through an image (HK_SYNC_GFX_IMG).
-    * Every stream of another kind is counted too. On M5 a dependency from
-    * graphics work to pre-rasterization stages orders a render's vertex half
-    * only after the latest such stream on the render subqueue
-    * (hk_sync_barrier()). */
+    * Every stream of another kind is counted too. On M5 and G17P a
+    * dependency from graphics work to pre-rasterization stages orders a
+    * render's vertex half only after the latest such stream on the render
+    * subqueue (hk_sync_barrier()). */
    HK_SYNC_GFX_MEM = 1 << 5,
 };
 

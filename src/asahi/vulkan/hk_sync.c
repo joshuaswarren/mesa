@@ -551,16 +551,17 @@ hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    barrier_source_dependencies(cmd, src_kinds, dep);
 
-   /* M5: of the renders this dependency orders pre-rasterization work after,
-    * graphics or transfer, only those that wrote memory other than their
-    * attachments (HK_SYNC_GFX_MEM) can hand that work anything it reads
-    * without an image. Order the vertex half (HK_SYNC_GFX) after the latest
-    * of them; the fragment half and image-reading vertex work keep the whole
-    * dependency. The compute subqueue's requirement is unchanged: the kernel
-    * orders both halves after compute work either way. */
+   /* M5 and G17P: of the renders this dependency orders pre-rasterization
+    * work after, graphics or transfer, only those that wrote memory other
+    * than their attachments (HK_SYNC_GFX_MEM) can hand that work anything it
+    * reads without an image. Order the vertex half (HK_SYNC_GFX) after the
+    * latest of them; the fragment half and image-reading vertex work keep the
+    * whole dependency. The compute subqueue's requirement is unchanged: the
+    * kernel orders both halves after compute work either way. */
    const uint8_t render_kinds = HK_SYNC_GFX | HK_SYNC_XFER;
+   const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
    if ((src_kinds & render_kinds) && (dst_kinds & HK_SYNC_GFX) &&
-       agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) {
+       (agx_chip_g17_m5(chip) || chip == AGX_CHIP_G17P)) {
       struct hk_sync_dep vtx = dep[HK_SYNC_VDM];
       vtx.cut = memory_cut(vtx.cut);
       if (vtx.prior & render_kinds)
@@ -762,6 +763,11 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const bool xfer_render = !compute && cs->sync.kind == HK_SYNC_XFER;
    if ((cs->sync.kind != HK_SYNC_GFX && !xfer_render) ||
        slot == &cmd->current_cs.pre_gfx || slot == &cmd->current_cs.post_gfx)
+      cs->sync.kind |= HK_SYNC_GFX_MEM;
+   /* Attachment stores (clears, resolves) reach memory other resources can
+    * read whenever the attachments can alias them (hk_begin_rendering()),
+    * whether or not the stream records a draw. */
+   if (!compute && cmd->state.gfx.render.m5_attachments_reach_memory)
       cs->sync.kind |= HK_SYNC_GFX_MEM;
    cs->sync.prev_mem =
       st->last[util_logbase2(HK_SYNC_GFX_MEM)][hk_sync_sq(cs)];
