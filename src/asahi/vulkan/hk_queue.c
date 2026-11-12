@@ -2054,6 +2054,29 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                          cs->sync.prior[HK_SYNC_VDM] == 0))
                cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
 
+            /* G17P: a vertex half that still names earlier renders can use
+             * the fragment-only barriers too when the order of tiling kicks
+             * already covers what it names. A staged render takes neither
+             * the flag nor part in ta_cover: its tiling waits only for its
+             * narrower tiling prefix. */
+            if (dev->dev.chip == AGX_CHIP_G17P && !g17p_staged &&
+                !queue->sync.serialize && queue->sync.exact_prior &&
+                (dev->dev.params.features &
+                 DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)) {
+               const uint64_t base = prior_base[HK_SYNC_VDM];
+               const uint64_t whole = hk_drm_render_prefix(
+                  base, cs->sync.barrier[HK_SYNC_VDM],
+                  cs->sync.prior[HK_SYNC_VDM]);
+               const uint64_t vertex = hk_drm_render_prefix(
+                  base, cs->sync.barrier_ta[HK_SYNC_VDM],
+                  cs->sync.prior_ta[HK_SYNC_VDM]);
+               if (hk_drm_g17p_tiling_ordered(
+                      base, nr_vdm, whole, vertex,
+                      cmd.legacy.flags & DRM_ASAHI_RENDER_FRAGMENT_BARRIERS,
+                      &queue->sync.ta_cover))
+                  cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+            }
+
             /* Likewise for compute: when the vertex half depends on less
              * compute work than the fragment half (image-only producers
              * ordered by image barriers, fragment-only destinations), the

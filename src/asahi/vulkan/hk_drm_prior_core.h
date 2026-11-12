@@ -139,3 +139,37 @@ hk_drm_rebase_prior(struct drm_asahi_cmd_header *h, void *payload,
    }
    return true;
 }
+
+/* The render prefix one subqueue's fields name, as a queue ordinal (0 for
+ * none): the header barrier counts from base, the queue's render ordinal
+ * before the submission, and merges with the exact prior. */
+static inline uint64_t
+hk_drm_render_prefix(uint64_t base, uint16_t barrier, uint64_t prior)
+{
+   return barrier == DRM_ASAHI_BARRIER_NONE ? prior
+                                            : MAX2(prior, base + barrier);
+}
+
+/* G17P has no render prefix of its own for a render's tiling (vertex) half:
+ * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS moves the whole render prefix to the
+ * fragment half. The kernel starts a render's tiling kick only after the
+ * tiling kicks of the renders in its whole prefix (in order on its own
+ * physical queue, through tiling dependencies on the others once that flag
+ * is set), and a render without the flag starts tiling only once its whole
+ * prefix has finished. So when a render's whole prefix holds the latest
+ * earlier render (the render ordinal base + vdm_before), every render up to
+ * cover -- the largest whole prefix of an earlier render submitted without
+ * the flag -- has finished before its tiling starts, and a vertex half that
+ * needs no later render may leave the whole prefix to the fragment half.
+ * Returns whether the render takes the flag (flagged: it already does); a
+ * render without it raises *cover to its whole prefix. */
+static inline bool
+hk_drm_g17p_tiling_ordered(uint64_t base, uint32_t vdm_before, uint64_t whole,
+                           uint64_t vertex, bool flagged, uint64_t *cover)
+{
+   if (flagged ||
+       (whole != 0 && whole == base + vdm_before && vertex <= *cover))
+      return true;
+   *cover = MAX2(*cover, whole);
+   return false;
+}

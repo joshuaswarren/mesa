@@ -1066,6 +1066,48 @@ test_g17p_vertex_after_memory_writers(void)
      next->sync.dep_ta[HK_SYNC_VDM].cut == plain);
 }
 
+/* G17P tiling order: a render whose whole prefix holds the latest earlier
+ * render may leave a vertex requirement the earlier tiling kicks already
+ * covered to the fragment half. Writer W (ordinal 1), plain P (2), reader R
+ * (3): P's vertex half needs W, which no tiling kick covered yet; R's needs W
+ * too, which P's tiling kick (submitted with its whole prefix) covers. */
+static void
+test_g17p_tiling_order(void)
+{
+   T("render prefix of the header barrier",
+     hk_drm_render_prefix(10, 2, 0) == 12 &&
+     hk_drm_render_prefix(10, 0, 0) == 10 &&
+     hk_drm_render_prefix(10, DRM_ASAHI_BARRIER_NONE, 7) == 7 &&
+     hk_drm_render_prefix(10, 1, 12) == 12 &&
+     hk_drm_render_prefix(10, DRM_ASAHI_BARRIER_NONE, 0) == 0);
+
+   uint64_t cover = 0;
+   /* W: no render dependency. */
+   T("no render prefix is never fragment-ordered",
+     !hk_drm_g17p_tiling_ordered(0, 0, 0, 0, false, &cover) && cover == 0);
+   /* P: whole 1, vertex 1. */
+   T("vertex half naming an uncovered render keeps the prefix",
+     !hk_drm_g17p_tiling_ordered(0, 1, 1, 1, false, &cover));
+   T("a render without the flag raises the cover", cover == 1);
+   /* R: whole 2, vertex 1. */
+   uint64_t c = cover;
+   T("vertex half covered by earlier tiling",
+     hk_drm_g17p_tiling_ordered(0, 2, 2, 1, false, &c) && c == 1);
+   c = cover;
+   T("vertex half naming the previous render keeps the prefix",
+     !hk_drm_g17p_tiling_ordered(0, 2, 2, 2, false, &c) && c == 2);
+   c = cover;
+   T("whole prefix without the latest earlier render keeps the prefix",
+     !hk_drm_g17p_tiling_ordered(0, 2, 1, 0, false, &c) && c == 1);
+   c = cover;
+   T("an already flagged render leaves the cover",
+     hk_drm_g17p_tiling_ordered(0, 2, 2, 2, true, &c) && c == 1);
+   c = 39;
+   T("ordinals across submissions",
+     hk_drm_g17p_tiling_ordered(40, 0, 40, 39, false, &c) && c == 39 &&
+     !hk_drm_g17p_tiling_ordered(40, 0, 40, 40, false, &c) && c == 40);
+}
+
 /* G17P image barriers order a render's vertex half only once it draws with a
  * pre-rasterization shader that reads images (HK_SYNC_GFX_IMG). */
 static void
@@ -1461,6 +1503,7 @@ main(void)
    test_pass_software_graphics_dependencies();
    test_image_barrier_vertex_class();
    test_g17p_vertex_after_memory_writers();
+   test_g17p_tiling_order();
    test_chain_first_skips_empty_buffers();
    test_rt_kernel_gate();
    test_timestamp_execution_scopes();

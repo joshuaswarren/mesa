@@ -359,6 +359,9 @@ struct hk_sync_queue {
    uint64_t submitted[HK_SYNC_NUM_SQ];
    uint64_t last_absolute[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    uint64_t tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
+   /* G17P: the largest whole render prefix of a render submitted without
+    * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS (hk_drm_g17p_tiling_ordered()). */
+   uint64_t ta_cover;
 
    /* Tile hazards across submissions: a ring of the footprints recently
     * submitted on this queue. An entry is live until the queue timeline
