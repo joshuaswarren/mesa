@@ -14,6 +14,11 @@
 #include "asahi/compiler/agx3_compute_program.h"
 #include "asahi/compiler/agx3_graphics_program.h"
 #include "asahi/vulkan/hk_g17p_patch.h"
+#include "asahi/isa/disasm.h"
+#include "asahi/compiler/agx3_compose/agx3_compose.h"
+#include "asahi/compiler/agx3_compose/agx3_decode.h"
+#define XXH_INLINE_ALL
+#include "util/xxhash.h"
 #include "asahi/compiler/agx3_transcode.h"
 #include "asahi/compiler/agx_nir.h"
 #include "asahi/genxml/agx_pack.h"
@@ -878,6 +883,221 @@ agx_ioto_capacity(const struct agx_device *dev, size_t g17g_capacity)
    return dev->chip == AGX_CHIP_G18G ? 2 * g17g_capacity : g17g_capacity;
 }
 
+/*
+ * G18G re-encoding cache. The generators emit the same program for every
+ * draw of a shader but for the uniform table addresses, which the long (8-byte)
+ * agx3c LDIMMs carry, and re-encoding one as agx3d costs tens of microseconds:
+ * on the M6 it took over half the CPU time of a 4K60 video player. An entry
+ * keys the agx3c program with those immediates cleared and keeps its agx3d
+ * form plus, for each such LDIMM, where it went and its agx3d field vector. A
+ * hit composes those LDIMMs with this draw's immediates the way the
+ * transcoder does (agx3_compose_apple_order(), whose form, and so size, may
+ * depend on the value) and copies the rest. A size the entry was not made with
+ * re-encodes the program in full and replaces the entry.
+ *
+ * The transcoder maps an LDIMM's fields one to one, but for the USC helper
+ * base, which it doubles (0x100 and 0x200 after an SR14 rld): such an
+ * immediate stays in the key. Every other agx3d instruction only depends on
+ * its own agx3c fields and, for branches, on the layout, which a hit keeps.
+ * ASAHI_MESA_DEBUG=verify checks every hit against a full re-encoding.
+ */
+#define AGX_G18G_REENCODE_CACHE_LIMIT 128
+#define AGX_G18G_REENCODE_MAX_LDIMMS  32
+/* The agx3c/agx3d field vector index of an LDIMM's immediate */
+#define AGX3_LDIMM_IMMEDIATE_FIELD 14
+
+struct agx_g18g_reencode_ldimm {
+   uint16_t offset;
+   uint8_t size;
+   uint64_t fields[AGX3_MAX_FIELDS];
+};
+
+struct agx_g18g_reencode_entry {
+   struct agx_g18g_reencode_entry *next;
+   uint64_t hash;
+   bool api_program;
+   uint16_t shader_gprs;
+   uint16_t in_length, out_length;
+   uint8_t ldimm_count;
+   uint8_t key[AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE];
+   uint8_t out[AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE];
+   struct agx_g18g_reencode_ldimm ldimms[];
+};
+
+static simple_mtx_t agx_g18g_reencode_lock = SIMPLE_MTX_INITIALIZER;
+static struct agx_g18g_reencode_entry *agx_g18g_reencode_entries;
+static unsigned agx_g18g_reencode_count;
+
+/* The bits of a long LDIMM word that are neither its destination nor its
+ * immediate, and their value. */
+static inline void
+agx_ldimm_long_pattern(uint64_t *fixed_mask, uint64_t *opcode)
+{
+   uint64_t dest = 0;
+   for (unsigned half = 0; half < 256; ++half)
+      dest |= agx_ioto_load_ldimm_long_dest(half) ^
+              agx_ioto_load_ldimm_long_dest(0);
+   *fixed_mask = ~(dest | agx_ioto_load_ldimm_long_immediate(~0u));
+   *opcode = agx_ioto_load_ldimm_long_dest(0) & *fixed_mask;
+}
+
+/* The inverse of agx_ioto_load_ldimm_long_immediate() */
+static inline uint32_t
+agx_ldimm_long_immediate_of(uint64_t word)
+{
+   return (uint32_t)(((word >> 8) & 0x7f) | (((word >> 25) & 0x7f) << 25) |
+                     (((word >> 33) & 0xf) << 7) | (((word >> 42) & 3) << 11) |
+                     (((word >> 48) & 0xf) << 13) |
+                     (((word >> 52) & 0xff) << 17));
+}
+
+/* Split program into its key (immediates cleared) and the long LDIMMs that
+ * were cleared. False if the bytes are not a whole agx3c instruction stream
+ * or have more LDIMMs than an entry holds. */
+static bool
+agx_g18g_reencode_key(const struct agx3_g17p_graphics_program *program,
+                      uint8_t *key, unsigned *ldimm_in, uint32_t *immediates,
+                      unsigned *ldimm_count)
+{
+   uint64_t fixed_mask, opcode;
+   agx_ldimm_long_pattern(&fixed_mask, &opcode);
+   const uint64_t immediate_mask = agx_ioto_load_ldimm_long_immediate(~0u);
+
+   memcpy(key, program->bytes, program->length);
+   unsigned count = 0;
+   for (unsigned i = 0; i < program->length;) {
+      const signed n =
+         agx3c_instr_length(program->bytes + i, program->length - i, NULL);
+      if (n <= 0)
+         return false;
+      if (n == 8) {
+         uint64_t word;
+         memcpy(&word, program->bytes + i, sizeof(word));
+         word = util_le64_to_cpu(word);
+         const uint32_t immediate = agx_ldimm_long_immediate_of(word);
+         if ((word & fixed_mask) == opcode && immediate != 0x100 &&
+             immediate != 0x200) {
+            if (count == AGX_G18G_REENCODE_MAX_LDIMMS)
+               return false;
+            ldimm_in[count] = i;
+            immediates[count++] = immediate;
+            word = util_cpu_to_le64(word & ~immediate_mask);
+            memcpy(key + i, &word, sizeof(word));
+         }
+      }
+      i += n;
+   }
+   *ldimm_count = count;
+   return true;
+}
+
+static bool
+agx_g18g_transcode(struct agx3_g17p_graphics_program *program,
+                   const struct agx3_transcode_ioto *ioto, unsigned *offsets,
+                   unsigned offset_count, const char **why, unsigned *at)
+{
+   struct util_dynarray code;
+   util_dynarray_init(&code, NULL);
+   memcpy(util_dynarray_grow_bytes(&code, 1, program->length), program->bytes,
+          program->length);
+   const bool ok = agx3_transcode_agx3d_ioto_with_offsets(
+                      &code, 0, ioto, offsets, offset_count, why, at) &&
+                   code.size <= sizeof(program->bytes);
+   if (ok) {
+      memcpy(program->bytes, code.data, code.size);
+      program->length = code.size;
+   } else if (!*why) {
+      *why = "longer than the program buffer";
+   }
+   util_dynarray_fini(&code);
+   return ok;
+}
+
+static struct agx_g18g_reencode_entry *
+agx_g18g_reencode_lookup(uint64_t hash, const struct agx3_transcode_ioto *ioto,
+                         const uint8_t *key, unsigned length)
+{
+   struct agx_g18g_reencode_entry **slot = &agx_g18g_reencode_entries;
+   for (; *slot; slot = &(*slot)->next) {
+      struct agx_g18g_reencode_entry *e = *slot;
+      if (e->hash == hash && e->api_program == ioto->api_program &&
+          e->shader_gprs == ioto->shader_gprs && e->in_length == length &&
+          !memcmp(e->key, key, length)) {
+         /* Most recently used first */
+         *slot = e->next;
+         e->next = agx_g18g_reencode_entries;
+         agx_g18g_reencode_entries = e;
+         return e;
+      }
+   }
+   return NULL;
+}
+
+/* Fill e from a program just re-encoded from key, its LDIMMs (as numbered by
+ * agx_g18g_reencode_key()) now at ldimm_out. False if each of them does not
+ * decode to its immediate and compose back to the same bytes. */
+static bool
+agx_g18g_reencode_fill(struct agx_g18g_reencode_entry *e, uint64_t hash,
+                       const struct agx3_transcode_ioto *ioto,
+                       const uint8_t *key, unsigned in_length,
+                       const struct agx3_g17p_graphics_program *encoded,
+                       const unsigned *ldimm_out, const uint32_t *immediates,
+                       unsigned ldimm_count)
+{
+   e->hash = hash;
+   e->api_program = ioto->api_program;
+   e->shader_gprs = ioto->shader_gprs;
+   e->in_length = in_length;
+   e->out_length = encoded->length;
+   e->ldimm_count = ldimm_count;
+   memcpy(e->key, key, in_length);
+   memcpy(e->out, encoded->bytes, encoded->length);
+   for (unsigned k = 0; k < ldimm_count; ++k) {
+      struct agx_g18g_reencode_ldimm *l = &e->ldimms[k];
+      const unsigned at = ldimm_out[k];
+      if (at >= encoded->length)
+         return false;
+      const signed n =
+         agx3d_instr_length(encoded->bytes + at, encoded->length - at, NULL);
+      uint8_t bytes[2 * AGX3_MAX_WORDS];
+      if (n <= 0 ||
+          agx3_decode(&agx3d_table, encoded->bytes + at, n, "ldimm",
+                      l->fields) < 0 ||
+          l->fields[AGX3_LDIMM_IMMEDIATE_FIELD] != immediates[k])
+         return false;
+      const int32_t form =
+         agx3_compose_apple_order(&agx3d_table, "ldimm", l->fields, bytes);
+      if (form < 0 || agx3d_table.forms[form].size != (unsigned)n ||
+          memcmp(bytes, encoded->bytes + at, n))
+         return false;
+      l->offset = at;
+      l->size = n;
+   }
+   return true;
+}
+
+/* The agx3d program for the immediates from e, false if one of them takes
+ * another size than e was made with. */
+static bool
+agx_g18g_reencode_emit(struct agx_g18g_reencode_entry *e,
+                       const uint32_t *immediates,
+                       struct agx3_g17p_graphics_program *program)
+{
+   memcpy(program->bytes, e->out, e->out_length);
+   program->length = e->out_length;
+   for (unsigned k = 0; k < e->ldimm_count; ++k) {
+      struct agx_g18g_reencode_ldimm *l = &e->ldimms[k];
+      uint8_t bytes[2 * AGX3_MAX_WORDS];
+      l->fields[AGX3_LDIMM_IMMEDIATE_FIELD] = immediates[k];
+      const int32_t form =
+         agx3_compose_apple_order(&agx3d_table, "ldimm", l->fields, bytes);
+      if (form < 0 || agx3d_table.forms[form].size != l->size)
+         return false;
+      memcpy(program->bytes + l->offset, bytes, l->size);
+   }
+   return true;
+}
+
 /* G18G: re-encode a generated M5 Ioto program as agx3d in place. The G17G
  * programs embed no address of their own (agx_ioto_g17g_* only validate
  * program_va), so the longer agx3d text stays position-independent. */
@@ -888,6 +1108,88 @@ agx_g18g_reencode_program(const struct agx_device *dev,
 {
    if (dev->chip != AGX_CHIP_G18G)
       return true;
+
+   if (program->length <= sizeof(program->bytes)) {
+      const struct agx3_transcode_ioto ioto = {
+         .api_program = api_program,
+         .shader_gprs = shader_gprs,
+      };
+      uint8_t key[sizeof(program->bytes)];
+      unsigned ldimm_in[AGX_G18G_REENCODE_MAX_LDIMMS];
+      uint32_t immediates[AGX_G18G_REENCODE_MAX_LDIMMS];
+      unsigned ldimm_count;
+      if (agx_g18g_reencode_key(program, key, ldimm_in, immediates,
+                                &ldimm_count)) {
+         const unsigned length = program->length;
+         const uint64_t hash =
+            XXH64(key, length, shader_gprs | ((uint64_t)api_program << 16));
+         struct agx3_g17p_graphics_program agx3c = *program;
+         bool hit = false;
+         simple_mtx_lock(&agx_g18g_reencode_lock);
+         struct agx_g18g_reencode_entry *e =
+            agx_g18g_reencode_lookup(hash, &ioto, key, length);
+         if (e)
+            hit = agx_g18g_reencode_emit(e, immediates, program);
+         simple_mtx_unlock(&agx_g18g_reencode_lock);
+         if (hit) {
+            if (dev->debug & AGX_DBG_VERIFY) {
+               const char *why = NULL;
+               unsigned at = 0;
+               if (!agx_g18g_transcode(&agx3c, &ioto, NULL, 0, &why, &at) ||
+                   agx3c.length != program->length ||
+                   memcmp(agx3c.bytes, program->bytes, program->length))
+                  mesa_loge("asahi: G18G re-encoding cache hit differs from "
+                            "a full re-encoding (length %u)", length);
+            }
+            return true;
+         }
+
+         /* Re-encode in full, tracking where the LDIMMs go */
+         unsigned ldimm_out[AGX_G18G_REENCODE_MAX_LDIMMS];
+         memcpy(ldimm_out, ldimm_in, sizeof(ldimm_in[0]) * ldimm_count);
+         const char *why = NULL;
+         unsigned at = 0;
+         *program = agx3c;
+         if (!agx_g18g_transcode(program, &ioto, ldimm_out, ldimm_count, &why,
+                                 &at)) {
+            mesa_loge("asahi: G18G Ioto program not re-encoded: %s at +0x%x",
+                      why, at);
+            return false;
+         }
+         struct agx_g18g_reencode_entry *made =
+            malloc(sizeof(*made) + ldimm_count * sizeof(made->ldimms[0]));
+         if (made && !agx_g18g_reencode_fill(made, hash, &ioto, key, length,
+                                             program, ldimm_out, immediates,
+                                             ldimm_count)) {
+            free(made);
+            made = NULL;
+         }
+         if (made) {
+            simple_mtx_lock(&agx_g18g_reencode_lock);
+            /* Replaces an entry of another LDIMM size (or a concurrent fill) */
+            struct agx_g18g_reencode_entry *old =
+               agx_g18g_reencode_lookup(hash, &ioto, key, length);
+            if (old) {
+               agx_g18g_reencode_entries = old->next;
+               free(old);
+               --agx_g18g_reencode_count;
+            }
+            made->next = agx_g18g_reencode_entries;
+            agx_g18g_reencode_entries = made;
+            if (++agx_g18g_reencode_count > AGX_G18G_REENCODE_CACHE_LIMIT) {
+               struct agx_g18g_reencode_entry **slot =
+                  &agx_g18g_reencode_entries;
+               while ((*slot)->next)
+                  slot = &(*slot)->next;
+               free(*slot);
+               *slot = NULL;
+               --agx_g18g_reencode_count;
+            }
+            simple_mtx_unlock(&agx_g18g_reencode_lock);
+         }
+         return true;
+      }
+   }
 
    const struct agx3_transcode_ioto ioto = {
       .api_program = api_program,
