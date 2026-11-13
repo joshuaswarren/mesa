@@ -324,6 +324,7 @@ enum hk_meta_object_key_type {
    HK_META_OBJECT_KEY_G17P_MIP,
    HK_META_OBJECT_KEY_G17P_BUFFER_FILL_PBE,
    HK_META_OBJECT_KEY_G17P_TILED_UPLOAD,
+   HK_META_OBJECT_KEY_BUFFER_COPY_BATCH,
 };
 
 struct hk_meta_event_wait_info {
@@ -3000,6 +3001,226 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
    }
 }
 
+/* Several regions of one vkCmdCopyBuffer in one dispatch (G17P only, the
+ * chip it was measured on). vk_meta_copy_buffer_addresses() issues one
+ * dispatch per region; each costs ~1.2-1.6 us of GPU time beyond its bytes
+ * (80 regions of 4 KiB take ~100 us, the same bytes as one region ~6 us).
+ * Workgroup row y copies region y; rows shorter than the widest region end
+ * early. No source region of a copy command may overlap a destination region
+ * (VUID-VkCopyBufferInfo2-pRegions-00117) and overlapping destinations go to
+ * separate dispatches, so any order of a batch's chunks writes the same
+ * bytes. */
+#define HK_COPY_BATCH_REGIONS 10
+
+struct hk_meta_copy_batch_key {
+   enum hk_meta_object_key_type key_type;
+   uint32_t chunk_size;
+};
+
+struct hk_meta_copy_batch_info {
+   uint64_t src_addr[HK_COPY_BATCH_REGIONS];
+   uint64_t dst_addr[HK_COPY_BATCH_REGIONS];
+   uint32_t size[HK_COPY_BATCH_REGIONS];
+};
+static_assert(sizeof(struct hk_meta_copy_batch_info) <= HK_MAX_PUSH_SIZE,
+              "copy batch push data must fit the push constants");
+
+static nir_shader *
+build_copy_batch_shader(const struct hk_device *dev,
+                        const struct hk_meta_copy_batch_key *key)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL,
+                                                  "hk-meta-copy-batch");
+
+   b.shader->info.workgroup_size[0] =
+      vk_meta_buffer_access_wg_size(&dev->meta, key->chunk_size);
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   assert(util_is_power_of_two_nonzero(key->chunk_size));
+   const uint32_t bit_size = key->chunk_size <= 4 ? key->chunk_size * 8 : 32;
+   const uint32_t components = key->chunk_size <= 4 ? 1 : key->chunk_size / 4;
+
+   nir_def *global_id = nir_load_global_invocation_id(&b, 32);
+   nir_def *region = nir_channel(&b, nir_load_workgroup_id(&b), 1);
+   nir_def *offset32 =
+      nir_imul_imm(&b, nir_channel(&b, global_id, 0), key->chunk_size);
+   nir_def *size = nir_load_push_constant(
+      &b, 1, 32, nir_imul_imm(&b, region, sizeof(uint32_t)),
+      .base = offsetof(struct hk_meta_copy_batch_info, size));
+
+   nir_push_if(&b, nir_ult(&b, offset32, size));
+   {
+      nir_def *addr_offset = nir_imul_imm(&b, region, sizeof(uint64_t));
+      nir_def *src_addr = nir_load_push_constant(
+         &b, 1, 64, addr_offset,
+         .base = offsetof(struct hk_meta_copy_batch_info, src_addr));
+      nir_def *dst_addr = nir_load_push_constant(
+         &b, 1, 64, addr_offset,
+         .base = offsetof(struct hk_meta_copy_batch_info, dst_addr));
+      nir_def *offset = nir_u2u64(&b, offset32);
+      nir_def *data = nir_load_global(&b, components, bit_size,
+                                      nir_iadd(&b, src_addr, offset),
+                                      .align_mul = key->chunk_size);
+      nir_store_global(&b, data, nir_iadd(&b, dst_addr, offset),
+                       .align_mul = key->chunk_size);
+   }
+   nir_pop_if(&b, NULL);
+   return b.shader;
+}
+
+static VkResult
+get_copy_batch_pipeline(struct hk_device *dev,
+                        const struct hk_meta_copy_batch_key *key,
+                        VkPipelineLayout *layout_out, VkPipeline *pipeline_out)
+{
+   const VkPushConstantRange push_range = {
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      .offset = 0,
+      .size = sizeof(struct hk_meta_copy_batch_info),
+   };
+   VkResult result = vk_meta_get_pipeline_layout(
+      &dev->vk, &dev->meta, NULL, &push_range, key, sizeof(*key), layout_out);
+   if (unlikely(result != VK_SUCCESS))
+      return result;
+
+   VkPipeline cached = vk_meta_lookup_pipeline(&dev->meta, key, sizeof(*key));
+   if (cached != VK_NULL_HANDLE) {
+      *pipeline_out = cached;
+      return VK_SUCCESS;
+   }
+
+   const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+      .nir = build_copy_batch_shader(dev, key),
+   };
+   const VkComputePipelineCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .stage = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .pNext = &nir_info,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+         .pName = "main",
+      },
+      .layout = *layout_out,
+   };
+
+   result = vk_meta_create_compute_pipeline(&dev->vk, &dev->meta, &info, key,
+                                            sizeof(*key), pipeline_out);
+   ralloc_free(nir_info.nir);
+   return result;
+}
+
+struct hk_copy_batch {
+   struct hk_meta_copy_batch_info info;
+   uint32_t count;
+   uint32_t chunk_size;
+   uint32_t max_groups;
+   uint64_t groups;
+};
+
+static uint32_t
+hk_copy_chunk_size(uint64_t src, uint64_t dst, uint64_t size)
+{
+   /* As vk_meta_copy_buffer_addresses(): the largest power of two dividing
+    * both addresses and the size, at most a uvec4. */
+   return MIN2(16, 1u << (ffsll(src | dst | size) - 1));
+}
+
+static void
+hk_copy_batch_flush(struct hk_cmd_buffer *cmd, struct hk_copy_batch *batch)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (batch->count == 1) {
+      vk_meta_copy_buffer_addresses(&cmd->vk, &dev->meta,
+                                    batch->info.src_addr[0],
+                                    batch->info.dst_addr[0],
+                                    batch->info.size[0]);
+   } else if (batch->count > 1) {
+      const struct hk_meta_copy_batch_key key = {
+         .key_type = HK_META_OBJECT_KEY_BUFFER_COPY_BATCH,
+         .chunk_size = batch->chunk_size,
+      };
+      VkPipelineLayout layout;
+      VkPipeline pipeline;
+      VkResult result = get_copy_batch_pipeline(dev, &key, &layout, &pipeline);
+      if (unlikely(result != VK_SUCCESS)) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+      } else {
+         const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+         VkCommandBuffer command_buffer = vk_command_buffer_to_handle(&cmd->vk);
+         disp->CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                               pipeline);
+         disp->CmdPushConstants(command_buffer, layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                sizeof(batch->info), &batch->info);
+         disp->CmdDispatch(command_buffer, batch->max_groups, batch->count, 1);
+      }
+   }
+   batch->count = 0;
+   batch->max_groups = 0;
+   batch->groups = 0;
+}
+
+static bool
+hk_copy_batch_overlaps_dst(const struct hk_copy_batch *batch, uint64_t dst,
+                           uint64_t size)
+{
+   for (unsigned i = 0; i < batch->count; i++) {
+      if (dst < batch->info.dst_addr[i] + batch->info.size[i] &&
+          batch->info.dst_addr[i] < dst + size)
+         return true;
+   }
+   return false;
+}
+
+/* Queues one region. A region joins the open batch when it has the batch's
+ * chunk size, does not overlap a queued destination (so overlapping
+ * destinations keep their order) and the batch stays dense: the launched
+ * workgroups (widest region times the rows) at most twice the ones that copy,
+ * plus one 64-group row of slack (empty groups cost ~2 ns each). */
+static void
+hk_copy_batch_add(struct hk_cmd_buffer *cmd, struct hk_copy_batch *batch,
+                  uint64_t src, uint64_t dst, uint64_t size)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (!size)
+      return;
+
+   if (dev->dev.chip != AGX_CHIP_G17P || size > (1ull << 30)) {
+      /* Other chips are unmeasured. Large regions gain nothing from batching
+       * and keep the shader's 32-bit offsets far from wrapping: vk_meta
+       * copies them (in several dispatches if needed). */
+      hk_copy_batch_flush(cmd, batch);
+      vk_meta_copy_buffer_addresses(&cmd->vk, &dev->meta, src, dst, size);
+      return;
+   }
+
+   const uint32_t chunk_size = hk_copy_chunk_size(src, dst, size);
+   const uint64_t bytes_per_group =
+      vk_meta_buffer_access_wg_size(&dev->meta, chunk_size) * chunk_size;
+   const uint64_t groups = DIV_ROUND_UP(size, bytes_per_group);
+
+   if (batch->count) {
+      const uint64_t max_groups = MAX2(batch->max_groups, groups);
+      if (chunk_size != batch->chunk_size ||
+          batch->count == HK_COPY_BATCH_REGIONS ||
+          max_groups * (batch->count + 1) > 2 * (batch->groups + groups) + 64 ||
+          hk_copy_batch_overlaps_dst(batch, dst, size))
+         hk_copy_batch_flush(cmd, batch);
+   }
+
+   const uint32_t i = batch->count++;
+   batch->chunk_size = chunk_size;
+   batch->info.src_addr[i] = src;
+   batch->info.dst_addr[i] = dst;
+   batch->info.size[i] = size;
+   batch->max_groups = MAX2(batch->max_groups, groups);
+   batch->groups += groups;
+}
+
 static void
 hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info)
 {
@@ -3010,6 +3231,7 @@ hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info
        agx_chip_g17_m5(dev->dev.chip)) {
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+      struct hk_copy_batch batch = {0};
       /* Retain the aligned 16-byte bulk path even when the original
        * region has a scalar tail, as hk_cmd_copy does for libagx. */
       for (unsigned i = 0; i < info->regionCount; i++) {
@@ -3026,8 +3248,7 @@ hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info
                hk_g17p_sparse_buffer_copy(cmd, src_buffer, src, dst,
                                           region.size);
             else
-               vk_meta_copy_buffer_addresses(&cmd->vk, &dev->meta, src, dst,
-                                             region.size);
+               hk_copy_batch_add(cmd, &batch, src, dst, region.size);
             src += region.size;
             dst += region.size;
             region.size = tail;
@@ -3035,9 +3256,9 @@ hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info
          if (src_buffer->sparse_map)
             hk_g17p_sparse_buffer_copy(cmd, src_buffer, src, dst, region.size);
          else
-            vk_meta_copy_buffer_addresses(&cmd->vk, &dev->meta, src, dst,
-                                          region.size);
+            hk_copy_batch_add(cmd, &batch, src, dst, region.size);
       }
+      hk_copy_batch_flush(cmd, &batch);
       hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       return;
    }
