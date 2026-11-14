@@ -394,11 +394,12 @@ gen1_rq_alias_copies(nir_function_impl *impl)
 }
 
 /* A candidate-layout compute kernel ends with destination-less SCS loads over
- * storage its warp used: once per thread, after everything else the kernel
- * does, between a traversal barrier of the scope used ahead of a launch and
- * one of the scope a traversal program ends with. Every lane issues every
- * load. A row is what a warp reaches with four words a lane: 512 bytes. The
- * generated traversal programs end with the same kind of load.
+ * storage its warp used: once per thread that launched a query, after
+ * everything else the kernel does, between a traversal barrier of the scope
+ * used ahead of a launch and one of the scope a traversal program ends with.
+ * Every such lane issues every load. A row is what a warp reaches with four
+ * words a lane: 512 bytes. The generated traversal programs end with the same
+ * kind of load.
  *
  * By default the kernel names the per-thread storage a query of its warp
  * used: the payload records and the query block it stored to itself, and the
@@ -765,6 +766,35 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
    bool launches = false;
 
    nir_builder b = nir_builder_create(impl);
+   /* A compute kernel may launch several queries in a thread, or none, so
+    * each of its threads keeps track of whether it has launched one.
+    *
+    * What a launch needs that is the same for the whole dispatch is stored
+    * ahead of a thread's first launch only: the query context and the
+    * constant words of the warp's save area. A later query of the thread
+    * finds them in place and stores just its own ray and query words, ten
+    * SCS stores fewer than the first. ASAHI_G17P_RQ_CTX_ONCE=0 stores them
+    * ahead of every launch.
+    *
+    * A thread that launched nothing ends without the sweep documented above
+    * gen1_rq_scs_sweep(): it used none of the storage the sweep names.
+    * ASAHI_G17P_RQ_SCS_SWEEP_SKIP=0 has every thread issue it. */
+   const bool compute_candidates = layout->candidates &&
+      shader->info.stage == MESA_SHADER_COMPUTE;
+   const unsigned sweep = compute_candidates
+      ? debug_get_num_option("ASAHI_G17P_RQ_SCS_SWEEP", GEN1_RQ_SWEEP_DEFAULT)
+      : 0;
+   const bool skip_sweep = sweep &&
+      debug_get_bool_option("ASAHI_G17P_RQ_SCS_SWEEP_SKIP", true);
+   const bool context_once = compute_candidates &&
+      debug_get_bool_option("ASAHI_G17P_RQ_CTX_ONCE", true);
+   nir_variable *launched = NULL;
+   if (skip_sweep || context_once) {
+      launched = nir_local_variable_create(impl, glsl_bool_type(),
+                                           "rq_launched");
+      b.cursor = nir_before_impl(impl);
+      nir_store_var(&b, launched, nir_imm_false(&b), 1);
+   }
    util_dynarray_foreach(&ops, nir_intrinsic_instr *, op) {
       nir_intrinsic_instr *intr = *op;
       b.cursor = nir_before_instr(&intr->instr);
@@ -841,6 +871,8 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          nir_def *address = nir_load_deref(&b, as);
          nir_def *selector = nir_load_preamble(&b, 1, 64, .base = layout->bvh_uniform);
          if (layout->context_uniform) {
+            if (context_once)
+               nir_push_if(&b, nir_inot(&b, nir_load_var(&b, launched)));
             nir_def *context=nir_load_preamble(&b,1,64,.base=layout->context_uniform);
             for(unsigned i=0;i<6;i++) {
                nir_def *header = nir_load_global(&b,4,32,
@@ -866,6 +898,8 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             }
             nir_store_scs_agx(&b,nir_load_global(&b,fragment ? 4 : 2,32,
                nir_iadd_imm(&b,context,104),.align_mul=8),.base=0x6068);
+            if (context_once)
+               nir_pop_if(&b, NULL);
          }
          const bool stable_as_selector = layout->instance_traversal &&
             layout->as_table_uniform;
@@ -896,6 +930,12 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             valid_bounds = nir_iand(&b, valid_bounds,
                                     nir_ine_imm(&b, selector, 0));
          nir_push_if(&b, valid_bounds);
+         nir_def *first_launch = NULL;
+         if (launched) {
+            if (context_once)
+               first_launch = nir_inot(&b, nir_load_var(&b, launched));
+            nir_store_var(&b, launched, nir_imm_true(&b), 1);
+         }
          nir_def *base=nir_load_preamble(&b,1,64,.base=layout->payload_uniform);
          nir_def *id=nir_load_scs_thread_index_agx(&b);
          nir_def *index=nir_ishl_imm(&b,id,5);
@@ -904,6 +944,10 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             nir_imul_imm(&b,nir_ushr_imm(&b,id,5),layout->candidates ? 304*32 : layout->instance_traversal ? 0xb00 : 0x500),0x2f8000);
          nir_def *savebase=nir_load_preamble(&b,1,64,.base=layout->candidates ? 116 : 122);
          nir_def *saveindex=nir_imul_imm(&b,nir_ushr_imm(&b,id,5),12);
+         /* The words of the save area that no launch changes. The two a
+          * launch publishes are stored below, ahead of every launch. */
+         if (first_launch)
+            nir_push_if(&b, first_launch);
          nir_store_scs_uniform_agx(&b, nir_imm_ivec4(&b, 0, 0, 0, 0), savebase, saveindex,
             .base=256,.format=PIPE_FORMAT_R32_UINT,.component=2);
          nir_store_scs_uniform_agx(&b,nir_vec4(&b,
@@ -915,6 +959,8 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             nir_load_preamble(&b,1,32,.base=ift_reference_uniform),
             nir_load_preamble(&b,1,32,.base=ift_reference_uniform + 2)),
             savebase,saveindex,.base=288,.format=PIPE_FORMAT_R32_UINT,.component=2);
+         if (first_launch)
+            nir_pop_if(&b, NULL);
          nir_def *words[2];
          agx_nir_gen1_ray_core_words(&b,nir_load_deref(&b,origin),
             nir_load_deref(&b,direction),nir_load_deref(&b,tmax),lo,hi,
@@ -1141,12 +1187,13 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
    }
    /* Returns are lowered by now, so every thread reaches the end of the
     * entrypoint, whether or not it launched a ray. */
-   const unsigned sweep = debug_get_num_option("ASAHI_G17P_RQ_SCS_SWEEP",
-                                               GEN1_RQ_SWEEP_DEFAULT);
-   if (sweep && launches && layout->candidates &&
-       shader->info.stage == MESA_SHADER_COMPUTE) {
+   if (sweep && launches) {
       b.cursor = nir_after_block_before_jump(nir_impl_last_block(impl));
+      if (skip_sweep)
+         nir_push_if(&b, nir_load_var(&b, launched));
       gen1_rq_scs_sweep(&b, layout, sweep);
+      if (skip_sweep)
+         nir_pop_if(&b, NULL);
    }
    util_dynarray_fini(&ops);
    util_dynarray_foreach(&queries, struct gen1_rq_state, state)

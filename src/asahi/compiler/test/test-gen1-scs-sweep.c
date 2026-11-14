@@ -6,7 +6,13 @@
  * Lowering: which destination-less loads a candidate kernel ends with for
  * each mask, in which order, between which fences, and that general NIR
  * cleanup keeps them although nothing reads them. Without the variable there
- * are none.
+ * are none. Only a thread that launched a query issues them, unless
+ * ASAHI_G17P_RQ_SCS_SWEEP_SKIP=0 gives them to every thread.
+ *
+ * Launch state: the query context and the constant words of the warp's save
+ * area are stored under a branch on the thread's first launch
+ * (ASAHI_G17P_RQ_CTX_ONCE). Where a kernel's only launch site is outside any
+ * loop the branch folds away, and the kernel is the same with and without it.
  *
  * Back end: a kernel carrying such loads compiles for G17P, its binary holds
  * exactly those accesses in the destination-less form between the two
@@ -31,6 +37,8 @@
 
 #define SWEEP "ASAHI_G17P_RQ_SCS_SWEEP"
 #define EXTRA "ASAHI_G17P_RQ_SCS_SWEEP_EXTRA"
+#define SKIP "ASAHI_G17P_RQ_SCS_SWEEP_SKIP"
+#define ONCE "ASAHI_G17P_RQ_CTX_ONCE"
 #define RESULT_ADDRESS 0x10004000000ull
 
 struct touch {
@@ -161,9 +169,26 @@ check_lowering(const char *mask, const char *extra, const struct touch *want,
    } while (progress);
    nir_validate_shader(b.shader, "kernel-end sweep");
 
-   /* Every touch is in the block all threads end in, after everything else
-    * that block does, and nothing follows the first one but touches. */
+   /* Every touch is in one block, after everything else that block does, and
+    * nothing follows the first one but touches. With every thread sweeping
+    * it is the block all threads end in. Otherwise that block is empty and
+    * the touches are all there is under the branch ahead of it, which is
+    * taken by the threads that launched. */
    nir_block *last = nir_impl_last_block(b.impl);
+   const char *every = getenv(SKIP);
+   if (count && !(every && !strcmp(every, "0"))) {
+      nir_cf_node *prev = nir_cf_node_prev(&last->cf_node);
+      CHECK(exec_list_is_empty(&last->instr_list));
+      CHECK(prev && prev->type == nir_cf_node_if);
+      nir_if *launched = nir_cf_node_as_if(prev);
+      CHECK(!nir_src_is_const(launched->condition));
+      CHECK(nir_if_first_else_block(launched) ==
+            nir_if_last_else_block(launched));
+      CHECK(exec_list_is_empty(
+         &nir_if_first_else_block(launched)->instr_list));
+      last = nir_if_first_then_block(launched);
+      CHECK(last == nir_if_last_then_block(launched));
+   }
    unsigned seen = 0, elsewhere = 0, stores = 0, launches = 0;
    nir_foreach_block(block, b.impl) {
       nir_foreach_instr(instr, block) {
@@ -407,14 +432,22 @@ lowering_cases(void)
    cases += 2;
 
    /* Unset: the payload records, the two other per-thread areas and the
-    * query block, and no extra storage even when a list is given. */
+    * query block, and no extra storage even when a list is given. The same
+    * loads when every thread is to issue them. */
    {
       struct touch want[64];
       const unsigned count = expected(0x43, NULL, 0, want);
       CHECK(count == 2 + 2 + 1 + 19);
       check_lowering(NULL, NULL, want, count);
       check_lowering(NULL, "0x40000/16", want, count);
-      cases += 2;
+      setenv(SKIP, "0", 1);
+      check_lowering(NULL, NULL, want, count);
+      check_mask(0x7f, NULL, NULL, 0);
+      check_lowering("0", NULL, NULL, 0);
+      setenv(SKIP, "1", 1);
+      check_lowering(NULL, NULL, want, count);
+      unsetenv(SKIP);
+      cases += 6;
    }
 
    /* Each store class alone, all of them, and both addressing forms. The
@@ -546,12 +579,173 @@ backend_cases(void)
    return cases;
 }
 
+/* Two queries one after the other in a thread, the second inside control
+ * flow, lowered under the current environment. */
+static nir_builder
+two_query_kernel(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+      &agx_nir_options, "Gen1 SCS sweep, two queries");
+   b.shader->info.workgroup_size[0] = 64;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.ray_queries = 2;
+   nir_def *id = nir_load_local_invocation_index(&b);
+   nir_def *hit[2];
+   for (unsigned q = 0; q < 2; ++q) {
+      nir_variable *query = nir_local_variable_create(b.impl,
+         glsl_uint64_t_type(), q ? "query1" : "query0");
+      query->data.ray_query = true;
+      nir_def *rq = &nir_build_deref_var(&b, query)->def;
+      if (q)
+         nir_push_if(&b, hit[0]);
+      nir_rq_initialize(&b, rq, nir_imm_int64(&b, 0x10003000000ull),
+         nir_imm_int(&b, q ? 4 : 1), nir_imm_int(&b, 255),
+         nir_imm_vec3(&b, 0, 0, 1), nir_imm_float(&b, 0.0001),
+         nir_imm_vec3(&b, 0, 0, -1), nir_imm_float(&b, 9));
+      nir_def *more = nir_rq_proceed(&b, 1, rq);
+      hit[q] = nir_inot(&b, more);
+      if (q) {
+         nir_store_global(&b, nir_iadd_imm(&b, id, 7),
+            nir_imm_int64(&b, RESULT_ADDRESS), .align_mul = 4,
+            .write_mask = 1);
+         nir_pop_if(&b, NULL);
+      }
+   }
+   nir_shader_gather_info(b.shader, b.impl);
+   const struct agx_gen1_ray_query_layout layout = {
+      .payload_uniform = 118, .bvh_uniform = 96, .status_uniform = 128,
+      .context_uniform = 160, .as_table_uniform = 164, .as_table_first = 1,
+      .launch_header = 0x210000, .instance_traversal = true,
+      .candidates = true, .compute_kernel = true,
+   };
+   CHECK(agx_nir_lower_gen1_ray_query(b.shader, &layout));
+   return b;
+}
+
+struct thread_kernel {
+   unsigned size;        /* compiled bytes */
+   unsigned in_last;     /* touches in the block all threads end in */
+   unsigned elsewhere;   /* touches anywhere else */
+   unsigned branches;    /* if nodes of the lowered kernel */
+   unsigned context;     /* stores of the query context */
+};
+
+static bool
+is_context_store(const nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   return intr->intrinsic == nir_intrinsic_store_scs_agx &&
+          nir_intrinsic_base(intr) >= 0x6000 &&
+          nir_intrinsic_base(intr) <= 0x6068;
+}
+
+/* The shape of a lowered kernel's launch state. */
+static void
+launch_shape(nir_function_impl *impl, struct thread_kernel *k)
+{
+   nir_foreach_block(block, impl) {
+      nir_cf_node *prev = nir_cf_node_prev(&block->cf_node);
+      k->branches += prev && prev->type == nir_cf_node_if;
+      unsigned stores = 0;
+      nir_foreach_instr(instr, block)
+         stores += is_context_store(instr);
+      /* A copy is seven stores in one block. */
+      CHECK(stores == 0 || stores == 7);
+      k->context += stores;
+   }
+}
+
+/* Lower and compile the two-query kernel under the current environment. A
+ * thread sweeps once, however many queries it launched. */
+static struct thread_kernel
+thread_kernel(const char *what)
+{
+   struct touch want[64];
+   const unsigned count = expected(0x43, NULL, 0, want);
+   nir_builder b = two_query_kernel();
+   struct thread_kernel k = {0};
+   unsigned launches = 0;
+   nir_block *end = nir_impl_last_block(b.impl);
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr(instr, block) {
+         if (is_touch(instr))
+            ++*(block == end ? &k.in_last : &k.elsewhere);
+         launches += instr->type == nir_instr_type_intrinsic &&
+            nir_instr_as_intrinsic(instr)->intrinsic ==
+               nir_intrinsic_intersect_ray_gen1_agx;
+      }
+   }
+   CHECK(launches == 2);
+   CHECK(k.in_last + k.elsewhere == count);
+   launch_shape(b.impl, &k);
+   CHECK(k.context == 2 * 7);
+
+   agx_preprocess_nir(b.shader);
+   struct agx_shader_key key = {
+      .dev = {.chip = AGX_CHIP_G17P, .encoding = AGX_ISA_ENCODING_AGX3B},
+      .no_preamble = true, .has_scratch = true,
+   };
+   struct agx_shader_part part = {0};
+   const bool ok = agx_compile_shader_nir(b.shader, &key, &part);
+   printf("two queries, %s: %s %s\n", what, ok ? "compiled" : "refused",
+          ok ? "" : agx_last_compile_refusal());
+   CHECK(ok && part.info.uses_ray_traversal && part.info.main_size);
+   const struct scan found =
+      scan_binary(&part, AGX_ISA_ENCODING_AGX3B, want, count);
+   CHECK(found.fence_at[1] > found.last_at);
+   k.size = part.info.main_size;
+   printf("bytes=%u gprs=%u fences=%u/%u\n", k.size, part.info.nr_gprs,
+          found.fences[0], found.fences[1]);
+   free(part.binary);
+   ralloc_free(b.shader);
+   return k;
+}
+
+/* Kernels with several queries in a thread. */
+static unsigned
+thread_cases(void)
+{
+   const unsigned count = 2 + 2 + 1 + 19;
+   set_arm(NULL, NULL);
+   unsetenv(SKIP);
+   const struct thread_kernel plain = thread_kernel("defaults");
+   CHECK(plain.in_last == 0 && plain.elsewhere == count);
+
+   setenv(SKIP, "0", 1);
+   const struct thread_kernel every = thread_kernel("every thread sweeps");
+   CHECK(every.in_last == count && every.elsewhere == 0);
+   CHECK(every.size != plain.size);
+   unsetenv(SKIP);
+
+   /* Each launch site carries two more branches for the state a thread's
+    * first launch stores: around the context copy and around the constant
+    * words of the save area. */
+   setenv(ONCE, "0", 1);
+   const struct thread_kernel each = thread_kernel("state at every launch");
+   CHECK(each.branches + 2 * 2 == plain.branches);
+   CHECK(each.elsewhere == count);
+   CHECK(each.size != plain.size);
+   unsetenv(ONCE);
+
+   /* One launch site, outside any loop: no thread can have launched before
+    * it, so the branch folds away and the kernel is the same whether or not
+    * the state is stored once. A site inside a loop keeps the branch. */
+   struct scan found;
+   const unsigned one = compile_kernel(0x43, NULL, NULL, 0, &found);
+   setenv(ONCE, "0", 1);
+   CHECK(compile_kernel(0x43, NULL, NULL, 0, &found) == one);
+   unsetenv(ONCE);
+   return 5;
+}
+
 int
 main(void)
 {
    setbuf(stdout, NULL);
    glsl_type_singleton_init_or_ref();
-   const unsigned cases = lowering_cases() + backend_cases();
+   const unsigned cases = lowering_cases() + backend_cases() + thread_cases();
    glsl_type_singleton_decref();
    printf("Gen1 SCS sweep: %u passed\n", cases);
    return 0;
