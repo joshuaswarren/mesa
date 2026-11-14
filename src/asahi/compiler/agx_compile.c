@@ -31,6 +31,7 @@
 #include "agx_opcodes.h"
 #include "agx3_pack.h"
 #include "agx3_rt_core.h"
+#include "agx3_vary_core.h"
 #include "glsl_types.h"
 #include "nir.h"
 #include "util/os_misc.h"
@@ -13293,6 +13294,49 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       }
    }
 
+   /* A relocatable vertex program lists its placeholder-index UVSWs just
+    * after the main program. Every write of a placeholder index must be
+    * listed, and each listed one must still hold its placeholder bytes, or
+    * the linker could leave a varying at the wrong index. */
+   if (ctx->key->g17p_uvs_reloc_size && !impl->function->is_preamble &&
+       ctx->stage == MESA_SHADER_VERTEX) {
+      const unsigned base = ctx->key->g17p_uvs_reloc_base;
+      unsigned placeholders = 0;
+      agx_foreach_instr_global(ctx, I) {
+         if (agx_is_vertex_store(I) && I->src[0].type == AGX_INDEX_IMMEDIATE &&
+             I->src[0].value >= base &&
+             I->src[0].value - base < ctx->key->g17p_uvs_reloc_size)
+            placeholders++;
+      }
+
+      uint8_t *relocs = ctx->agx3_uvs_relocs.data;
+      for (unsigned i = 0; i < ctx->agx3_uvs_reloc_count; ++i) {
+         uint32_t at;
+         memcpy(&at, relocs + i * AGX3_UVS_RELOC_SIZE, sizeof(at));
+         at -= offset;
+         memcpy(relocs + i * AGX3_UVS_RELOC_SIZE, &at, sizeof(at));
+      }
+
+      if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+          placeholders != ctx->agx3_uvs_reloc_count ||
+          !agx3_vary_relocate_uvsw(ctx->key->dev.encoding,
+                                   (uint8_t *)binary->data + offset,
+                                   binary->size - offset, relocs,
+                                   ctx->agx3_uvs_reloc_count, NULL)) {
+         agx_set_refusal(ctx, "relocatable UVS writes not all listed",
+                         __LINE__);
+         binary->size = initial_binary_size;
+         ralloc_free(ctx);
+         return false;
+      }
+
+      if (ctx->agx3_uvs_reloc_count) {
+         out->agx3_uvs_relocs_offset = binary->size;
+         out->agx3_uvs_reloc_count = ctx->agx3_uvs_reloc_count;
+         util_dynarray_append_dynarray(binary, &ctx->agx3_uvs_relocs);
+      }
+   }
+
    /* Packing is complete: the certificate never describes an unencodable IR.
     * No machine-code or scheduling change is made by this analysis. */
    if (agx3_cprog_certify_static_spill(ctx, imports_only_before_ra))
@@ -16134,7 +16178,10 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
          info->has_preamble = true;
       } else if (func->is_entrypoint) {
          info->main_offset = offset;
-         info->main_size = binary.size - offset;
+         /* The relocation list follows the main program. */
+         info->main_size = (info->agx3_uvs_reloc_count
+                               ? info->agx3_uvs_relocs_offset
+                               : binary.size) - offset;
       } else {
          UNREACHABLE("General functions not yet supported");
       }

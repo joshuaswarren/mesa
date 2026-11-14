@@ -17,6 +17,7 @@
 #include "agx_debug.h"
 #include "agx3_fltnorm_core.h"
 #include "agx3_pixel_core.h"
+#include "agx3_vary_core.h"
 #include "agx_device.h"
 #include "agx_pack.h"
 #include "agx_scratch.h"
@@ -300,11 +301,42 @@ agx3_uses_code_container(const struct agx_device *dev)
           dev->chip == AGX_CHIP_G18G;
 }
 
+/* Give a relocatable vertex program's varyings the indices of the bound
+ * fragment shader's layout (agx_unlinked_uvs_layout::relocatable): re-encode
+ * each listed UVSW in the linked copy of the main program. */
+static bool
+agx3_relocate_main_uvs(const struct agx_device *dev,
+                       const struct agx_shader_part *main, uint8_t *code,
+                       size_t size, const uint8_t *uvs_map)
+{
+   const struct agx_shader_info *info = &main->info;
+   const size_t bytes = (size_t)info->agx3_uvs_reloc_count * AGX3_UVS_RELOC_SIZE;
+   if (!uvs_map || !agx_chip_native_agx3(dev->chip) || !main->binary ||
+       info->agx3_uvs_relocs_offset > info->binary_size ||
+       info->binary_size - info->agx3_uvs_relocs_offset < bytes) {
+      fprintf(stderr, "agx_fast_link: vertex program needs its varying "
+                      "layout to link (%u relocations)\n",
+              info->agx3_uvs_reloc_count);
+      return false;
+   }
+
+   if (!agx3_vary_relocate_uvsw(AGX_ISA_ENCODING_AGX3B, code, size,
+                                (const uint8_t *)main->binary +
+                                   info->agx3_uvs_relocs_offset,
+                                info->agx3_uvs_reloc_count, uvs_map)) {
+      fprintf(stderr, "agx_fast_link: varying writes do not match their "
+                      "relocation list\n");
+      return false;
+   }
+
+   return true;
+}
+
 bool
 agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
               bool fragment, struct agx_shader_part *main,
               struct agx_shader_part *prolog, struct agx_shader_part *epilog,
-              unsigned nr_samples_shaded)
+              unsigned nr_samples_shaded, const uint8_t *uvs_map)
 {
    /* These literal loop fragments are AGX2 machine code. G17P exposes only
     * one sample and its Vulkan path folds sample shading before split-FS
@@ -548,6 +580,13 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
          sz -= AGX3_PIXEL_MAX_LENGTH;
       } else {
          memcpy(linked_map + offset, part_code, sz);
+         if (part == main && part->info.agx3_uvs_reloc_count &&
+             !agx3_relocate_main_uvs(dev, part, linked_map + offset, sz,
+                                     uvs_map)) {
+            agx_bo_unreference(dev, linked->bo);
+            linked->bo = NULL;
+            return false;
+         }
          if (nop_entry[i]) {
             uint8_t *gate = linked_map + offset +
                             part->info.agx3_colour_link.entry_offset;

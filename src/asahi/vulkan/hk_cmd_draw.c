@@ -7024,8 +7024,8 @@ hk_get_fast_linked_locked_vs(struct hk_device *dev, struct hk_shader *shader,
    if (!key_clone)
       return NULL;
 
-   struct hk_linked_shader *linked =
-      hk_fast_link(dev, false, shader, prolog, NULL, 0);
+   struct hk_linked_shader *linked = hk_fast_link_vertex(
+      dev, shader, prolog, key->uvs_flat, key->uvs_linear);
    if (!linked) {
       ralloc_free(key_clone);
       return NULL;
@@ -7726,10 +7726,10 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
                                                         &key->epilog);
          else if (layout)
             mono_linked = hk_fast_link_part(dev, true, layout, NULL, NULL,
-                                            NULL, 0);
+                                            NULL, 0, NULL);
          else if (mono_key_clone && !hk_g17p_mono_own_layout(shader, mono))
             mono_linked = hk_fast_link_part(dev, true, shader, mono, NULL,
-                                            NULL, 0);
+                                            NULL, 0, NULL);
          free(mono->binary);
          ralloc_free(mono);
          if (mono_linked)
@@ -10437,6 +10437,58 @@ hk_vs_link_key_build(struct hk_device *dev, struct hk_shader *sw_vs, bool hw,
    }
 }
 
+/* The bound fragment shader's flat and linear inputs among the varyings of a
+ * hardware vertex program with a relocatable UVS layout, which place them
+ * (agx_uvs_relocation_map()). Zero for any other program. */
+static void
+hk_uvs_fs_masks(struct hk_cmd_buffer *cmd, const struct hk_shader *vs,
+                uint64_t *flat, uint64_t *linear)
+{
+   const struct hk_shader *fs = hk_bound_fs(cmd);
+   const uint64_t written =
+      fs && vs->info.uvs.relocatable ? vs->info.uvs.written : 0;
+   *flat = written ? fs->info.fs.interp.flat & written : 0;
+   *linear = written ? fs->info.fs.interp.linear & written : 0;
+}
+
+/* A relocatable vertex program is linked for the fragment layout, so a new
+ * fragment shader can need a new link even when nothing else changed. */
+static bool
+hk_fast_link_vs_uvs_stale(struct hk_cmd_buffer *cmd, struct hk_shader *sw_vs)
+{
+   if (!sw_vs->info.uvs.relocatable)
+      return false;
+
+   const struct hk_fast_link_key_vs *key = &cmd->state.gfx.fast_link_vs.key;
+   uint64_t flat, linear;
+   hk_uvs_fs_masks(cmd, sw_vs, &flat, &linear);
+   return key->uvs_flat != flat || key->uvs_linear != linear;
+}
+
+/* The linked program of the hardware vertex stage: the fast-linked vertex
+ * shader, or a raster program linked without a prolog (post-tessellation,
+ * geometry), which a relocatable UVS layout links per fragment layout. NULL
+ * with the command buffer in error if that link fails. */
+static struct hk_linked_shader *
+hk_linked_hw_vs(struct hk_cmd_buffer *cmd, struct hk_shader *hw_vs,
+                struct hk_shader *sw_vs, struct hk_linked_shader *linked_vs)
+{
+   if (hw_vs == sw_vs)
+      return linked_vs;
+   if (!hw_vs->info.uvs.relocatable)
+      return hw_vs->only_linked;
+
+   uint64_t flat, linear;
+   hk_uvs_fs_masks(cmd, hw_vs, &flat, &linear);
+   struct hk_linked_shader *linked =
+      hk_only_linked_for_fs(hk_cmd_buffer_device(cmd), hw_vs, flat, linear);
+   if (!linked) {
+      mesa_loge("failed to link the vertex program for its fragment shader");
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
+   return linked;
+}
+
 static void
 hk_fill_fast_link_key_vs(struct hk_cmd_buffer *cmd, struct hk_shader *sw_vs,
                          struct hk_shader *hw_vs, bool indexed,
@@ -10449,6 +10501,7 @@ hk_fill_fast_link_key_vs(struct hk_cmd_buffer *cmd, struct hk_shader *sw_vs,
                         vk_topology_to_mesa(dyn->ia.primitive_topology),
                         indexed, index_size, restart, dyn->vi,
                         dyn->vi_binding_strides, key);
+   hk_uvs_fs_masks(cmd, sw_vs, &key->uvs_flat, &key->uvs_linear);
 }
 
 static bool
@@ -11225,7 +11278,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    if (!native_mesh && (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
         IS_DIRTY(VI_BINDING_STRIDES) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
-        vgt_dirty || !gfx->fast_link_vs.valid || sw_index_size_changed)) {
+        vgt_dirty || !gfx->fast_link_vs.valid || sw_index_size_changed ||
+        hk_fast_link_vs_uvs_stale(cmd, sw_vs))) {
       struct hk_fast_link_key_vs key;
       hk_fill_fast_link_key_vs(cmd, sw_vs, hw_vs, draw.indexed,
                                draw.index_size, draw.restart, &key);
@@ -11573,7 +11627,11 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       hk_reserve_scratch(cmd, cs, hw_vs);
 
       struct hk_linked_shader *linked_hw_vs =
-         (hw_vs == sw_vs) ? linked_vs : hw_vs->only_linked;
+         hk_linked_hw_vs(cmd, hw_vs, sw_vs, linked_vs);
+      if (!linked_hw_vs) {
+         cs->current = out;
+         return;
+      }
       const uint64_t pipeline_program = native_mesh
          ? hk_upload_native_mesh_program(cmd, hw_vs, linked_hw_vs, false, false)
          : hk_upload_usc_words(cmd, hw_vs, linked_hw_vs);
@@ -13865,7 +13923,9 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
 
       hk_reserve_scratch(cmd, cs, hw_vs);
       struct hk_linked_shader *linked_hw_vs =
-         (hw_vs == sw_vs) ? linked_vs : hw_vs->only_linked;
+         hk_linked_hw_vs(cmd, hw_vs, sw_vs, linked_vs);
+      if (!linked_hw_vs)
+         return;
       /* A record after the first of a multi-draw republishes the previous
        * record's program with its own draw parameters. */
       const uint64_t pipeline_program =

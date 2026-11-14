@@ -1490,10 +1490,44 @@ agx3_emit_ldcf(struct util_dynarray *emission, enum agx_isa_encoding enc,
           agx3_append(emission, bytes, len);
 }
 
+/* A relocatable vertex program writes each user varying at a placeholder
+ * UVS index (agx_shader_key::g17p_uvs_reloc_size). Record an immediate-index
+ * UVSW about to be appended to the emission if its index is one of them, so
+ * the linker can re-encode it for the fragment shader's layout
+ * (agx3_vary_relocate_uvsw()). Offsets are from the start of the emission
+ * until agx_compile makes them relative to the main program. */
+static void
+agx3_note_uvs_reloc(agx_context *ctx, const struct util_dynarray *emission,
+                    uint16_t index, uint16_t value, uint8_t slot,
+                    uint16_t wait_mask)
+{
+   const unsigned base = ctx->key->g17p_uvs_reloc_base;
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       ctx->stage != MESA_SHADER_VERTEX || ctx->is_preamble ||
+       index < base || index - base >= ctx->key->g17p_uvs_reloc_size)
+      return;
+
+   assert(value <= UINT8_MAX && wait_mask <= UINT8_MAX);
+   const struct agx3_uvs_reloc r = {
+      .offset = emission->size,
+      .index = index,
+      .value = value,
+      .slot = slot,
+      .wait = wait_mask,
+   };
+   if (!ctx->agx3_uvs_relocs.mem_ctx)
+      util_dynarray_init(&ctx->agx3_uvs_relocs, ctx);
+   memcpy(util_dynarray_grow_bytes(&ctx->agx3_uvs_relocs, 1,
+                                   AGX3_UVS_RELOC_SIZE),
+          &r, AGX3_UVS_RELOC_SIZE);
+   ctx->agx3_uvs_reloc_count++;
+}
+
 static bool
-agx3_emit_uvsw(struct util_dynarray *emission, enum agx_isa_encoding enc,
-               const agx_instr *I, uint16_t staging_half, uint8_t slot,
-               uint16_t wait_mask, bool defer_writeout)
+agx3_emit_uvsw(agx_context *ctx, struct util_dynarray *emission,
+               enum agx_isa_encoding enc, const agx_instr *I,
+               uint16_t staging_half, uint8_t slot, uint16_t wait_mask,
+               bool defer_writeout)
 {
    /* An unlinked vertex shader reads its user outputs' indices from the
     * linked varying layout: a 16-bit uniform, or a register when computed. */
@@ -1547,6 +1581,9 @@ agx3_emit_uvsw(struct util_dynarray *emission, enum agx_isa_encoding enc,
    if (defer_writeout)
       return true;
    const uint16_t staged = (uint16_t)(1u << (slot - 1));
+   if (!register_index && !uniform_index)
+      agx3_note_uvs_reloc(ctx, emission, index.value, staging_half, slot,
+                          staged);
    return (register_index
               ? agx3_vary_uvsw_register_index(enc, staging_half, index.value,
                                               slot, true, staged, bytes, &len)
@@ -11473,6 +11510,16 @@ agx3_apply_early_compares(agx_context *ctx, struct util_dynarray *emission,
       };
       for (unsigned r = 0; r < ARRAY_SIZE(recorded); ++r)
          ok &= !(recorded[r] >= lo && recorded[r] < c->compare_end);
+      /* So must the UVSWs it relocates (agx3_note_uvs_reloc()). */
+      for (unsigned r = 0; r < ctx->agx3_uvs_reloc_count; ++r) {
+         uint32_t at;
+         memcpy(&at,
+                (const uint8_t *)ctx->agx3_uvs_relocs.data +
+                   r * AGX3_UVS_RELOC_SIZE +
+                   offsetof(struct agx3_uvs_reloc, offset),
+                sizeof(at));
+         ok &= !((off_t)at >= lo && (off_t)at < c->compare_end);
+      }
       if (!ok)
          continue;
 
@@ -14566,7 +14613,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                outstanding &= (uint16_t)~carried;
                agx3_staging_forget(&staging_banks, staging_conflicts);
             }
-            if (!agx3_emit_uvsw(emission, enc, I, staging_half, stage_slot,
+            if (!agx3_emit_uvsw(ctx, emission, enc, I, staging_half, stage_slot,
                                 stage_wait, g17p_position_protocol ||
                                             g17p_user_output_protocol))
                AGX3_REFUSE(I);
@@ -14605,6 +14652,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                      uint8_t bytes[AGX3_VARY_MAX_LENGTH], len = 0;
                      const unsigned token =
                         (g17p_terminal_outputs ? position : component) % nslots;
+                     agx3_note_uvs_reloc(ctx, emission, component,
+                                         agx3_g17p_output_staging_half(component),
+                                         token + 1, 1u << token);
                      if (!agx3_vary_uvsw(enc,
                                           agx3_g17p_output_staging_half(component),
                                           component, token + 1, true,

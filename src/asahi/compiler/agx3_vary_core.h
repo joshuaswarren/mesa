@@ -23,6 +23,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "asahi/lib/agx_chip.h"
@@ -138,6 +139,42 @@ bool agx3_vary_uvsw_uniform_index(enum agx_isa_encoding enc, uint16_t value,
 bool agx3_vary_interp(enum agx_isa_encoding enc, uint16_t dest,
                       uint16_t coef_index, bool perspective,
                       uint8_t out[AGX3_VARY_MAX_LENGTH], uint8_t *len);
+
+/* One immediate-index UVSW of a vertex program whose user varyings a linker
+ * places: the program is compiled without its fragment shader, writes each
+ * varying at a placeholder index (agx_unlinked_uvs_layout::relocatable), and
+ * the link re-encodes the write with the index of the bound fragment shader's
+ * layout. The write's other operands are kept. Such writes are always the
+ * last use of their staging value. Entries are stored byte-packed in the
+ * shader binary (agx_shader_info::agx3_uvs_relocs_offset), so read them with
+ * memcpy.
+ */
+struct agx3_uvs_reloc {
+   /* Of the UVSW, in bytes from the start of the main program */
+   uint32_t offset;
+
+   /* Placeholder UVS index encoded there */
+   uint8_t index;
+
+   /* Staging half read, scoreboard slot and wait mask, as encoded */
+   uint8_t value;
+   uint8_t slot;
+   uint8_t wait;
+};
+
+#define AGX3_UVS_RELOC_SIZE 8u
+#define AGX3_UVS_RELOC_MAP_SIZE 256u
+
+/* Re-encode the `count` relocated UVSWs listed at `relocs` in `code`, the
+ * `size` bytes of the program they were recorded in, each with the index
+ * map[placeholder]. Every write must still hold its placeholder encoding.
+ * All writes are checked before any changes, so on failure `code` is
+ * unchanged. A NULL map only checks.
+ */
+bool agx3_vary_relocate_uvsw(enum agx_isa_encoding enc, uint8_t *code,
+                             size_t size, const uint8_t *relocs,
+                             unsigned count,
+                             const uint8_t map[AGX3_UVS_RELOC_MAP_SIZE]);
 
 #ifdef __cplusplus
 }

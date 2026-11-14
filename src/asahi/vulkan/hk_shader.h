@@ -196,6 +196,12 @@ struct hk_shader_info {
  * general case where the linked shader is already ready.
  */
 struct hk_fast_link_key_vs {
+   /* For a relocatable UVS layout (agx_unlinked_uvs_layout::relocatable),
+    * the fragment shader's flat and linear inputs among the varyings the
+    * vertex shader writes, which place them. Otherwise zero. First, so the
+    * key gains no padding. */
+   uint64_t uvs_flat, uvs_linear;
+
    struct agx_vs_prolog_key prolog;
 };
 
@@ -258,6 +264,11 @@ struct hk_shader {
     * Union with the cache to save some space?
     */
    struct hk_linked_shader *only_linked;
+
+   /* For a relocatable UVS layout linked without a prolog, the only_linked
+    * program linked for each fragment layout (hk_only_linked_for_fs()),
+    * keyed by struct hk_uvs_fs_key under linked.lock. */
+   struct hash_table *uvs_linked;
 
    /* Address to the uploaded preamble section. Preambles are uploaded
     * separately from fast-linked main shaders.
@@ -676,7 +687,8 @@ struct hk_linked_shader *hk_fast_link_part(struct hk_device *dev, bool fragment,
                                            struct agx_shader_part *main_part,
                                            struct agx_shader_part *prolog,
                                            struct agx_shader_part *epilog,
-                                           unsigned nr_samples_shaded);
+                                           unsigned nr_samples_shaded,
+                                           const uint8_t *uvs_map);
 /* A copy of `api` whose code, uniform layout and constant program are
  * `part`'s (an inline-blend program with its own constant program); takes
  * ownership of part->binary. */
@@ -689,6 +701,22 @@ struct hk_linked_shader *hk_fast_link(struct hk_device *dev, bool fragment,
                                       struct agx_shader_part *prolog,
                                       struct agx_shader_part *epilog,
                                       unsigned nr_samples_shaded);
+
+/* Link a non-fragment program. A hardware vertex program with a relocatable
+ * UVS layout (agx_unlinked_uvs_layout::relocatable) places its varyings for
+ * a fragment shader with these flat and linear inputs. */
+struct hk_linked_shader *hk_fast_link_vertex(struct hk_device *dev,
+                                             struct hk_shader *main,
+                                             struct agx_shader_part *prolog,
+                                             uint64_t flat, uint64_t linear);
+
+/* A relocatable hardware vertex program that links without a prolog (the
+ * post-tessellation or geometry raster program) linked for a fragment shader
+ * with these flat and linear inputs, cached on the shader. Otherwise
+ * shader->only_linked. */
+struct hk_linked_shader *hk_only_linked_for_fs(struct hk_device *dev,
+                                               struct hk_shader *shader,
+                                               uint64_t flat, uint64_t linear);
 
 struct hk_linked_shader *
 hk_fast_link_fragment_variant(struct hk_device *dev,

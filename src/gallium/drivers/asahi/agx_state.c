@@ -4533,7 +4533,7 @@ asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
       rzalloc(so->linked_shaders, struct agx_linked_shader);
    if (!agx_fast_link(linked, dev, so->type == MESA_SHADER_FRAGMENT,
                       &key->main->b, &prolog->b, &epilog->b,
-                      key->nr_samples_shaded)) {
+                      key->nr_samples_shaded, NULL)) {
       ralloc_free(linked);
       return NULL;
    }

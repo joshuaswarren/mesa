@@ -729,6 +729,12 @@ typedef struct {
    bool agx3_g18_mixed_protocol;
    struct agx3_colour_link_info agx3_colour_link;
 
+   /* Byte-packed struct agx3_uvs_reloc entries the packer records for a
+    * relocatable vertex program (agx_shader_key::g17p_uvs_reloc_size), their
+    * offsets from the start of the emission, and how many it recorded. */
+   struct util_dynarray agx3_uvs_relocs;
+   unsigned agx3_uvs_reloc_count;
+
    /* Promoted constants. These will be appended to the binary at the end. */
    uint16_t rodata[512];
    /* An intrinsic or ALU op this backend does not implement reached
