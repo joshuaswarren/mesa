@@ -4112,8 +4112,13 @@ hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
    if (layer_as_varying && default_layer)
       NIR_PASS(_, nir, agx_nir_lower_default_layer);
 
+   /* On G17P a vertex shader that stores a varying at a UVS index it loaded
+    * at run time can have the varying land in the wrong place while another
+    * context renders, so give a shader compiled without its fragment shader
+    * the canonical layout, whose indices are constants.
+    */
    NIR_PASS(_, nir, agx_nir_lower_uvs, &shader->info.uvs,
-            layer_as_varying);
+            layer_as_varying, dev->dev.chip == AGX_CHIP_G17P);
 }
 
 /* G17P unrolls per-sample fragment execution for a pipeline that fixes two or
@@ -7286,7 +7291,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       /* An M5 mesh layer/viewport is also a user word (see
        * agx_m5_mesh_gather_varyings), as for the M5 vertex stage. */
       agx_nir_lower_uvs(layout.shader, &shader->info.uvs,
-                        m5_mesh && layout_ok && varyings.lv);
+                        m5_mesh && layout_ok && varyings.lv, false);
       shader->info.uvs.mesh_primitive_page = varyings.primitive_stride_B != 0;
       shader->info.mesh.primitive_stride_B = varyings.primitive_stride_B;
       if (!m5_mesh)
