@@ -13301,6 +13301,11 @@ hk_draw_mesh_sw_task(struct hk_cmd_buffer *cmd, uint64_t grid,
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          return;
       }
+      /* Pool memory is recycled from earlier command buffers. A task entry
+       * must not carry an earlier draw's bytes into this one: start every
+       * entry, its payload included, from zero, as a fresh allocation does.
+       */
+      memset(entries.cpu, 0, tasks * rec.stride_B);
       rec.entries = entries.gpu;
       rec.task_count = tasks;
       for (unsigned i = 0; i < 3; ++i)
