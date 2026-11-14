@@ -1212,7 +1212,9 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
  * dependency whose first scope is all earlier commands in the given stage
  * and whose second scope is the timestamp write itself. TOP_OF_PIPE in a
  * first scope is NONE, so such a stamp may be taken at any time; it becomes
- * the start stamp of the next command. Every other stage orders the stamp
+ * the start stamp of the next command, except on chips whose start stamps
+ * latch before a command's waits (start_stamps_ordered()), where it ends the
+ * last command like any other stamp. Every other stage orders the stamp
  * after earlier work of its class, and the stamp becomes the end stamp of
  * the last command, which is then ordered after that work.
  *
@@ -1260,12 +1262,19 @@ stamp_wait(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
  * every stamp rides on a command's end: a top-of-pipe stamp (Vulkan 1.3,
  * 17.5: no first scope) on the end of the last recorded work, which may
  * latch it at any logically later point.
+ *
+ * M5 latches start stamps the same way: on G17S a top-of-pipe or host stamp
+ * after a full ALL_COMMANDS barrier reads a few microseconds before the end
+ * stamp written ahead of the barrier. Its end stamps are ordered, so it
+ * takes the same end-only path.
  */
 static bool
 start_stamps_ordered(const struct hk_cmd_buffer *cmd)
 {
    const struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   return !(agx_native_graphics(&dev->dev) && dev->dev.chip == AGX_CHIP_G17P);
+   return !((agx_native_graphics(&dev->dev) &&
+             dev->dev.chip == AGX_CHIP_G17P) ||
+            agx_chip_g17_m5(dev->dev.chip));
 }
 
 static struct hk_cs *
