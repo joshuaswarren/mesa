@@ -268,6 +268,18 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
             continue;
       }
 
+      /* The reciprocal square root takes one width for source and result
+       * (agx3_alu_hrsqrt and agx3_alu_f32rsqrt_mod). Folding an f16 widening
+       * into an f32 rsqrt would leave a half register feeding a word result,
+       * which has no encoding and fails the whole shader (an elementwise
+       * half-precision kernel). Keep the explicit widening. */
+      if (ctx->key &&
+          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+          ins->op == AGX_OPCODE_RSQRT && src.size == AGX_SIZE_32 &&
+          def->src[0].size == AGX_SIZE_16)
+         continue;
+
       /* FLTNORM and RGB10A2 packing have only captured f32 sources. Keep
        * the explicit widening used by linked half-width fragment outputs
        * before normalized packing. */

@@ -804,6 +804,10 @@ static const nir_shader_compiler_options agx_nir_options = {
    .lower_pack_unorm_4x8 = true,
    .lower_pack_snorm_4x8 = true,
    .lower_pack_64_2x32 = true,
+   /* A 64-bit value is assembled from two 32-bit register words. Keep the
+    * pack_32_2x16_split pair instead of letting nir_opt_algebraic fuse it into
+    * a four-way 16-bit pack, which has no register form here. */
+   .lower_pack_64_4x16 = true,
    .lower_unpack_half_2x16 = true,
    .lower_unpack_unorm_2x16 = true,
    .lower_unpack_snorm_2x16 = true,
