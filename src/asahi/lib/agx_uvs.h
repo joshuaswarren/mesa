@@ -51,7 +51,15 @@ struct agx_unlinked_uvs_layout {
    /* Size of the UVS_VARYINGS */
    uint8_t user_size;
 
-   bool mesh_primitive_page;
+   bool mesh_primitive_page : 1;
+
+   /* The varyings are written twice in location order, a smooth copy and
+    * then a flat copy of the same size, whatever the fragment shader's
+    * interpolation qualifiers, so the shader writes them at constant UVS
+    * indices: agx_nir_lower_uvs() with canonical, for a shader compiled
+    * without its fragment shader. user_size counts both copies.
+    */
+   bool canonical : 1;
 
    /* Number of 32-bit components written for each slot. TODO: Model 16-bit.
     *
@@ -62,12 +70,17 @@ struct agx_unlinked_uvs_layout {
 };
 static_assert(sizeof(struct agx_unlinked_uvs_layout) == 88, "packed");
 
+/* Both copies of a canonical layout's varyings fit the G17P native vertex
+ * program's 125 user words (HK_AGX3_G17P_MAX_USER_WORDS).
+ */
+#define AGX_UVS_CANONICAL_MAX_WORDS 124
+
 /* Supply the API's default Layer for drivers transporting it as a varying. */
 bool agx_nir_lower_default_layer(struct nir_shader *s);
 
 bool agx_nir_lower_uvs(struct nir_shader *s,
                        struct agx_unlinked_uvs_layout *layout,
-                       bool layer_as_varying);
+                       bool layer_as_varying, bool canonical);
 
 /**
  * Represents a linked UVS layout.
@@ -81,6 +94,11 @@ struct agx_varyings_vs {
     * next indices. Otherwise 0, aliasing position.
     */
    unsigned slots[VARYING_SLOT_MAX];
+
+   /* For a canonical layout, the distance from a slot's smooth copy to its
+    * flat copy, which flat CF bindings read. Otherwise 0.
+    */
+   unsigned flat_copy;
 };
 
 void agx_assign_uvs(struct agx_varyings_vs *varyings,

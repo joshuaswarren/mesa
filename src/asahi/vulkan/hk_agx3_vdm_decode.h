@@ -28,7 +28,7 @@ extern "C" {
  * blended fragment shaders, to 38 when agx_shader_info gains
  * needs_full_quads, and to 39 when G17P payloads record the fragment
  * twins of unlinked mesh shaders. */
-#define HK_AGX3_SHADER_BINARY_VERSION 40u
+#define HK_AGX3_SHADER_BINARY_VERSION 41u
 #define HK_CLASSIC_SHADER_BINARY_VERSION 34u
 /* AGX2 image-acquire binaries now include memory-to-texture visibility. */
 #define HK_AGX2_SHADER_BINARY_VERSION 36u

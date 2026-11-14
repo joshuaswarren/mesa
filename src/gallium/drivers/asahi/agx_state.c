@@ -2917,10 +2917,11 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          if (dev->chip == AGX_CHIP_G18G) {
             if (key->layer_as_varying)
                NIR_PASS(_, nir, agx_nir_lower_default_layer);
-            NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs, key->layer_as_varying);
+            NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs, key->layer_as_varying,
+                     false);
          } else {
             NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs,
-                     agx_native_graphics(dev));
+                     agx_native_graphics(dev), false);
          }
       } else {
          if (agx_chip_g17_m5(dev->chip) && !nir->info.vs.tes_poly)
@@ -3393,10 +3394,11 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
             key_->gs.flat_varyings & VARYING_BIT_LAYER;
          if (layer_as_varying)
             NIR_PASS(_, gs_copy, agx_nir_lower_default_layer);
-         NIR_PASS(_, gs_copy, agx_nir_lower_uvs, &uvs, layer_as_varying);
+         NIR_PASS(_, gs_copy, agx_nir_lower_uvs, &uvs, layer_as_varying,
+                  false);
       } else {
          NIR_PASS(_, gs_copy, agx_nir_lower_uvs, &uvs,
-                  agx_native_graphics(dev));
+                  agx_native_graphics(dev), false);
       }
 
       compiled->gs_copy =
