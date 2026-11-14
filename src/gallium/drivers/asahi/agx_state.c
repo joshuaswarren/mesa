@@ -1098,6 +1098,21 @@ agx_g18g_reencode_emit(struct agx_g18g_reencode_entry *e,
    return true;
 }
 
+/* Log a program the transcoder refused, and dump it under FAULTTRACE */
+static void
+agx_g18g_reencode_refused(const struct agx_device *dev,
+                          const struct agx3_g17p_graphics_program *program,
+                          const char *why, unsigned at)
+{
+   mesa_loge("asahi: G18G Ioto program not re-encoded: %s at +0x%x", why, at);
+   if (dev->debug & AGX_DBG_FAULTTRACE) {
+      fprintf(stderr, "G18G_IOTO_REFUSED length=%u data=", program->length);
+      for (unsigned i = 0; i < program->length; ++i)
+         fprintf(stderr, "%02x", program->bytes[i]);
+      fputc('\n', stderr);
+   }
+}
+
 /* G18G: re-encode a generated M5 Ioto program as agx3d in place. The G17G
  * programs embed no address of their own (agx_ioto_g17g_* only validate
  * program_va), so the longer agx3d text stays position-independent. */
@@ -1152,8 +1167,7 @@ agx_g18g_reencode_program(const struct agx_device *dev,
          *program = agx3c;
          if (!agx_g18g_transcode(program, &ioto, ldimm_out, ldimm_count, &why,
                                  &at)) {
-            mesa_loge("asahi: G18G Ioto program not re-encoded: %s at +0x%x",
-                      why, at);
+            agx_g18g_reencode_refused(dev, program, why, at);
             return false;
          }
          struct agx_g18g_reencode_entry *made =
@@ -1208,14 +1222,9 @@ agx_g18g_reencode_program(const struct agx_device *dev,
       memcpy(program->bytes, code.data, code.size);
       program->length = code.size;
    } else {
-      mesa_loge("asahi: G18G Ioto program not re-encoded: %s at +0x%x",
-                why ? why : "longer than the program buffer", at);
-      if (dev->debug & AGX_DBG_FAULTTRACE) {
-         fprintf(stderr, "G18G_IOTO_REFUSED length=%u data=", program->length);
-         for (unsigned i = 0; i < program->length; ++i)
-            fprintf(stderr, "%02x", program->bytes[i]);
-         fputc('\n', stderr);
-      }
+      agx_g18g_reencode_refused(dev, program,
+                                why ? why : "longer than the program buffer",
+                                at);
    }
    util_dynarray_fini(&code);
    return ok;
