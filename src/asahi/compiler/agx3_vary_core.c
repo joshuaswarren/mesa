@@ -5,7 +5,12 @@
 
 #include "agx3_vary_core.h"
 
+#include <assert.h>
+#include <string.h>
+
 #include "agx3_binder.h"
+
+static_assert(sizeof(struct agx3_uvs_reloc) == AGX3_UVS_RELOC_SIZE, "packed");
 
 #define KV(f, v) {(uint16_t)(f), (uint64_t)(v)}
 
@@ -364,4 +369,51 @@ agx3_vary_interp(enum agx_isa_encoding enc, uint16_t dest,
 {
    return agx3_vary_interp_at(enc, dest, coef_index, perspective,
                               AGX3_VARY_CENTER, out, len);
+}
+
+static bool
+agx3_vary_relocated_uvsw(enum agx_isa_encoding enc,
+                         const struct agx3_uvs_reloc *r, uint16_t index,
+                         uint8_t out[AGX3_VARY_MAX_LENGTH], uint8_t *len)
+{
+   return agx3_vary_uvsw(enc, r->value, index, r->slot, true, r->wait, out,
+                         len);
+}
+
+bool
+agx3_vary_relocate_uvsw(enum agx_isa_encoding enc, uint8_t *code, size_t size,
+                        const uint8_t *relocs, unsigned count,
+                        const uint8_t map[AGX3_UVS_RELOC_MAP_SIZE])
+{
+   if (count && (!code || !relocs))
+      return false;
+
+   /* Check every write, and that its new form encodes at the same length,
+    * before changing any: an encoding's length follows from its form, not
+    * from the index, so a failure here means the list does not describe
+    * this code. */
+   for (unsigned pass = 0; pass < 2; ++pass) {
+      for (unsigned i = 0; i < count; ++i) {
+         struct agx3_uvs_reloc r;
+         memcpy(&r, relocs + i * AGX3_UVS_RELOC_SIZE, sizeof(r));
+
+         uint8_t old[AGX3_VARY_MAX_LENGTH], moved[AGX3_VARY_MAX_LENGTH];
+         uint8_t old_len = 0, moved_len = 0;
+         const uint16_t index = map ? map[r.index] : r.index;
+         if (!agx3_vary_relocated_uvsw(enc, &r, r.index, old, &old_len) ||
+             !agx3_vary_relocated_uvsw(enc, &r, index, moved, &moved_len) ||
+             old_len != moved_len || r.offset > size ||
+             size - r.offset < old_len)
+            return false;
+
+         if (pass == 0) {
+            if (memcmp(code + r.offset, old, old_len))
+               return false;
+         } else {
+            memcpy(code + r.offset, moved, moved_len);
+         }
+      }
+   }
+
+   return true;
 }

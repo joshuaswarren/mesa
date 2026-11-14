@@ -61,6 +61,15 @@ struct agx_unlinked_uvs_layout {
     */
    bool canonical : 1;
 
+   /* The varyings are too many to be written twice, so the shader is
+    * compiled without its fragment shader with each one at a placeholder
+    * UVS index, the index agx_assign_uvs() gives it with no flat or linear
+    * inputs, and lists those writes (agx_shader_info::agx3_uvs_reloc_count).
+    * Linking it rewrites them for the fragment shader's qualifiers
+    * (agx_uvs_relocation_map()), so no index is computed at run time.
+    */
+   bool relocatable : 1;
+
    /* Number of 32-bit components written for each slot. TODO: Model 16-bit.
     *
     * Invariant: sum_{slot} (components[slot]) =
@@ -102,8 +111,16 @@ struct agx_varyings_vs {
 };
 
 void agx_assign_uvs(struct agx_varyings_vs *varyings,
-                    struct agx_unlinked_uvs_layout *layout, uint64_t flat_mask,
-                    uint64_t linear_mask);
+                    const struct agx_unlinked_uvs_layout *layout,
+                    uint64_t flat_mask, uint64_t linear_mask);
+
+/* For a relocatable layout, map each placeholder UVS index to the index the
+ * layout linked with these fragment interpolation qualifiers gives the same
+ * component (agx_assign_uvs()). Every other index maps to itself.
+ */
+void agx_uvs_relocation_map(const struct agx_unlinked_uvs_layout *layout,
+                            uint64_t flat_mask, uint64_t linear_mask,
+                            uint8_t map[256]);
 
 struct agx_varyings_fs;
 

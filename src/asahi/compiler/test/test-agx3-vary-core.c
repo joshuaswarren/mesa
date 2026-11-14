@@ -170,6 +170,50 @@ int main(void){
       if(agx3_vary_interp_at(AGX_ISA_ENCODING_AGX3B,0,1,true,
                              AGX3_VARY_CENTROID,out,&len)) fail++; else pass++;
    }
+   {
+      /* A vertex program compiled without its fragment shader writes its
+       * varyings at placeholder indices; the link re-encodes each listed
+       * write with the bound layout's index and keeps every other operand. */
+      struct agx3_uvs_reloc r[3] = {
+         {.index = 4, .value = 8, .slot = 1, .wait = 1},
+         {.index = 5, .value = 10, .slot = 2, .wait = 2},
+         {.index = 6, .value = 12, .slot = 3, .wait = 4},
+      };
+      uint8_t code[64], want[64], relocs[3 * AGX3_UVS_RELOC_SIZE];
+      uint8_t map[AGX3_UVS_RELOC_MAP_SIZE];
+      for (unsigned i = 0; i < AGX3_UVS_RELOC_MAP_SIZE; ++i) map[i] = i;
+      map[4] = 6; map[5] = 4; map[6] = 5;
+      memset(code, 0x06, sizeof(code)); memset(want, 0x06, sizeof(want));
+      unsigned at = 2; bool ok = true;
+      for (unsigned i = 0; i < 3; ++i) {
+         uint8_t len = 0, len2 = 0;
+         r[i].offset = at;
+         ok &= agx3_vary_uvsw(AGX_ISA_ENCODING_AGX3B, r[i].value, r[i].index,
+                              r[i].slot, true, r[i].wait, code + at, &len);
+         ok &= agx3_vary_uvsw(AGX_ISA_ENCODING_AGX3B, r[i].value,
+                              map[r[i].index], r[i].slot, true, r[i].wait,
+                              want + at, &len2);
+         ok &= len == len2;
+         memcpy(relocs + i * AGX3_UVS_RELOC_SIZE, &r[i], sizeof(r[i]));
+         at += len + 2;
+      }
+      uint8_t orig[64]; memcpy(orig, code, sizeof(code));
+      /* Checking alone (no map) leaves the bytes as they are. */
+      ok &= agx3_vary_relocate_uvsw(AGX_ISA_ENCODING_AGX3B, code, at, relocs,
+                                    3, NULL) && !memcmp(code, orig, sizeof(code));
+      /* A list that does not describe the code changes nothing. */
+      code[r[2].offset + 1] ^= 1;
+      ok &= !agx3_vary_relocate_uvsw(AGX_ISA_ENCODING_AGX3B, code, at, relocs,
+                                     3, map);
+      code[r[2].offset + 1] ^= 1;
+      ok &= !memcmp(code, orig, sizeof(code));
+      ok &= !agx3_vary_relocate_uvsw(AGX_ISA_ENCODING_AGX3B, code,
+                                     r[2].offset + 2, relocs, 3, map) &&
+            !memcmp(code, orig, sizeof(code));
+      ok &= agx3_vary_relocate_uvsw(AGX_ISA_ENCODING_AGX3B, code, at, relocs,
+                                    3, map) && !memcmp(code, want, sizeof(code));
+      if (ok) pass++; else fail++;
+   }
    if(fail){ fprintf(stderr,"agx3_vary_core: %u of %zu failed\n",fail,vary_vec_count); return 1; }
    printf("agx3_vary_core: all %u varying ops reproduced\n",pass); return 0;
 }

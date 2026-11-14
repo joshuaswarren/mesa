@@ -82,6 +82,7 @@
 #include "vk_shader_module.h"
 #include "vk_ycbcr_conversion.h"
 
+#include "asahi/compiler/agx3_vary_core.h"
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/compiler/agx_nir.h"
 #include "asahi/compiler/agx_nir_texture.h"
@@ -3660,7 +3661,7 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
 
    if (!shader->linked.ht) {
       /* If we only have a single variant, link now. */
-      shader->only_linked = hk_fast_link(dev, false, shader, NULL, NULL, 0);
+      shader->only_linked = hk_fast_link_vertex(dev, shader, NULL, 0, 0);
       if (!shader->only_linked)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
@@ -5372,6 +5373,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       !shader->info.fs.m5_inline_sample_shading &&
       !shader->info.agx3_gen1_fragment_rq;
 
+   const bool relocatable_uvs = hw && nir->info.stage == MESA_SHADER_VERTEX &&
+                                shader->info.uvs.relocatable;
    struct agx_shader_key backend_key = {
       .reserved_preamble = root + (4 * (1 + set_count)),
       .g17p_texture_uniform_base = texture_uniform_base,
@@ -5386,6 +5389,12 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          agx_native_graphics(&dev->dev) && hw &&
          hk_g17p_sparse_vertex_outputs(&nir->info, sw_stage,
                                        xfb_info && xfb_info->output_count),
+      /* The placeholder indices of a relocatable UVS layout, which the
+       * fast link rewrites for the bound fragment shader. */
+      .g17p_uvs_reloc_base = relocatable_uvs
+                                ? shader->info.uvs.group_offs[UVS_VARYINGS]
+                                : 0,
+      .g17p_uvs_reloc_size = relocatable_uvs ? shader->info.uvs.user_size : 0,
       /* The fragment constant program is formed only when the fragment reads
        * descriptor-backed memory (UBO/SSBO/texture/image) it can hoist. A
        * push-constant-only fragment keeps uniform DMA: its CProg measured
@@ -5657,6 +5666,7 @@ hk_g17p_layout_shader_create(struct hk_device *dev, const struct hk_shader *api,
    s->preamble_addr = 0;
    memset(&s->linked, 0, sizeof(s->linked));
    s->only_linked = NULL;
+   s->uvs_linked = NULL;
    s->g17p_mono_nir = NULL;
    s->g17p_mono_nir_size = 0;
 
@@ -5709,6 +5719,13 @@ hk_shader_destroy(struct hk_device *dev, struct hk_shader *s,
 
    if (s->only_linked)
       hk_destroy_linked_shader(dev, s->only_linked);
+
+   if (s->uvs_linked) {
+      hash_table_foreach(s->uvs_linked, entry) {
+         hk_destroy_linked_shader(dev, entry->data);
+      }
+      _mesa_hash_table_destroy(s->uvs_linked, NULL);
+   }
 
    if (s->linked.ht) {
       hash_table_foreach(s->linked.ht, entry) {
@@ -8739,6 +8756,7 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
       *dst = *src;
       memset(&dst->linked, 0, sizeof(dst->linked));
       dst->only_linked = NULL;
+      dst->uvs_linked = NULL;
       dst->bo = NULL;
       /* The clone owns its own copy of the inline-blend NIR. */
       dst->g17p_mono_nir = NULL;
@@ -9402,7 +9420,62 @@ hk_fast_link(struct hk_device *dev, bool fragment, struct hk_shader *main,
              unsigned nr_samples_shaded)
 {
    return hk_fast_link_part(dev, fragment, main, NULL, prolog, epilog,
-                            nr_samples_shaded);
+                            nr_samples_shaded, NULL);
+}
+
+struct hk_linked_shader *
+hk_fast_link_vertex(struct hk_device *dev, struct hk_shader *main,
+                    struct agx_shader_part *prolog, uint64_t flat,
+                    uint64_t linear)
+{
+   uint8_t map[AGX3_UVS_RELOC_MAP_SIZE];
+   const bool relocatable = main->info.uvs.relocatable;
+   if (relocatable)
+      agx_uvs_relocation_map(&main->info.uvs, flat, linear, map);
+
+   return hk_fast_link_part(dev, false, main, NULL, prolog, NULL, 0,
+                            relocatable ? map : NULL);
+}
+
+struct hk_uvs_fs_key {
+   uint64_t flat, linear;
+};
+DERIVE_HASH_TABLE(hk_uvs_fs_key);
+
+struct hk_linked_shader *
+hk_only_linked_for_fs(struct hk_device *dev, struct hk_shader *shader,
+                      uint64_t flat, uint64_t linear)
+{
+   const uint64_t written = shader->info.uvs.written;
+   const struct hk_uvs_fs_key key = {flat & written, linear & written};
+
+   /* only_linked itself places the varyings for no flat or linear input. */
+   if (!shader->info.uvs.relocatable || (!key.flat && !key.linear))
+      return shader->only_linked;
+
+   struct hk_linked_shader *linked = NULL;
+   simple_mtx_lock(&shader->linked.lock);
+   if (!shader->uvs_linked)
+      shader->uvs_linked = hk_uvs_fs_key_table_create(NULL);
+
+   struct hash_entry *ent =
+      shader->uvs_linked ? _mesa_hash_table_search(shader->uvs_linked, &key)
+                         : NULL;
+   if (ent) {
+      linked = ent->data;
+   } else if (shader->uvs_linked) {
+      struct hk_uvs_fs_key *clone =
+         ralloc_memdup(shader->uvs_linked, &key, sizeof(key));
+      linked = clone ? hk_fast_link_vertex(dev, shader, NULL, key.flat,
+                                           key.linear)
+                     : NULL;
+      if (linked)
+         _mesa_hash_table_insert(shader->uvs_linked, clone, linked);
+      else
+         ralloc_free(clone);
+   }
+   simple_mtx_unlock(&shader->linked.lock);
+   return linked;
 }
 
 /* Prove the complete new loader before exposing a specialized executable.
@@ -9542,14 +9615,14 @@ struct hk_linked_shader *
 hk_fast_link_part(struct hk_device *dev, bool fragment, struct hk_shader *main,
                   struct agx_shader_part *main_part,
                   struct agx_shader_part *prolog, struct agx_shader_part *epilog,
-                  unsigned nr_samples_shaded)
+                  unsigned nr_samples_shaded, const uint8_t *uvs_map)
 {
    struct hk_linked_shader *s = rzalloc(NULL, struct hk_linked_shader);
    if (!s)
       return NULL;
    if (!agx_fast_link(&s->b, &dev->dev, fragment,
                       main_part ? main_part : &main->b, prolog, epilog,
-                      nr_samples_shaded)) {
+                      nr_samples_shaded, uvs_map)) {
       ralloc_free(s);
       return NULL;
    }

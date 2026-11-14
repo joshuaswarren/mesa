@@ -302,6 +302,13 @@ struct agx_shader_info {
 
    struct agx2_stats stats;
 
+   /* G17P vertex program with a relocatable UVS layout: the immediate-index
+    * UVSWs the linker rewrites, agx3_uvs_reloc_count byte-packed
+    * struct agx3_uvs_reloc entries (agx3_vary_core.h) stored in the binary at
+    * agx3_uvs_relocs_offset, just after the main program. */
+   uint32_t agx3_uvs_relocs_offset;
+   uint16_t agx3_uvs_reloc_count;
+
    /* Main of this part begins with G17P FLTNORM carrying f68. The linker
     * clears it if another part precedes this one in the executable. */
    bool agx3_fltnorm_start;
@@ -638,6 +645,13 @@ struct agx_shader_key {
     * values GS produced. Both may therefore have a sparse terminal UVS
     * suffix. */
    bool g17p_sparse_vertex_outputs;
+
+   /* A G17P hardware vertex program with a relocatable UVS layout
+    * (agx_unlinked_uvs_layout::relocatable): its writes to UVS indices
+    * [g17p_uvs_reloc_base, g17p_uvs_reloc_base + g17p_uvs_reloc_size) are
+    * placeholders, recorded for the linker (agx_shader_info::
+    * agx3_uvs_reloc_count). Zero size records nothing. */
+   uint8_t g17p_uvs_reloc_base, g17p_uvs_reloc_size;
 
    /* G17P multi-target epilog: bit n is set when a colour target of the
     * framebuffer starts at tile byte n. Apple's fragments select a written

@@ -11,6 +11,7 @@
 #include "agx_helpers.h"
 #include "agx_pack.h"
 #include "agx_uvs.h"
+#include "agx3_vary_core.h"
 #include "nir_builder_opcodes.h"
 #include "nir_intrinsics.h"
 #include "nir_intrinsics_indices.h"
@@ -40,6 +41,9 @@ struct ctx {
     * one copy (the distance to the flat copy). */
    uint8_t canonical_offs[VARYING_SLOT_MAX];
    unsigned canonical_copy;
+
+   /* Relocatable layouts: each slot's placeholder UVS index. */
+   uint8_t placeholder[VARYING_SLOT_MAX];
 };
 
 static enum uvs_group
@@ -102,7 +106,9 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    enum uvs_group group = group_for_varying(sem.location);
 
    nir_def *base;
-   if (group == UVS_VARYINGS && ctx->layout->canonical)
+   if (group == UVS_VARYINGS && ctx->layout->relocatable)
+      base = nir_imm_intN_t(b, ctx->placeholder[sem.location], 16);
+   else if (group == UVS_VARYINGS && ctx->layout->canonical)
       base = nir_imm_intN_t(b,
                             ctx->layout->group_offs[group] +
                                ctx->canonical_offs[sem.location],
@@ -180,6 +186,21 @@ write_layer_viewport_sysval(struct ctx *ctx)
    nir_store_uvs_agx(
       &b, packed,
       nir_imm_int(&b, ctx->layout->group_offs[UVS_LAYER_VIEWPORT]));
+}
+
+/* A user varying stored at a computed offset (an array indexed at run time)
+ * has no constant UVS index to relocate. */
+static bool
+has_indirect_varying(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   bool *indirect = data;
+   if (intr->intrinsic == nir_intrinsic_store_output &&
+       group_for_varying(nir_intrinsic_io_semantics(intr).location) ==
+          UVS_VARYINGS &&
+       !nir_src_is_const(intr->src[1]))
+      *indirect = true;
+
+   return false;
 }
 
 static bool
@@ -263,15 +284,25 @@ agx_nir_lower_uvs(nir_shader *s, struct agx_unlinked_uvs_layout *layout,
     * varyings by the fragment shader's interpolation qualifiers, with UVS
     * indices loaded at run time. With canonical, write them in location order
     * twice instead, a smooth copy and a flat copy (agx_assign_uvs()), so the
-    * indices are constants. Both copies must fit the native user-word limit;
-    * a larger shader keeps the qualifier-ordered layout.
+    * indices are constants. Both copies must fit the native user-word limit.
+    * A larger shader keeps the qualifier-ordered layout, but is relocatable:
+    * it writes each varying at a constant placeholder index that linking it
+    * with the fragment shader rewrites (agx_uvs_relocation_map()).
     */
    struct ctx ctx = {
       .layout = layout,
       .layer_as_varying = layer_as_varying,
    };
-   layout->canonical = canonical && !s->info.known_interpolation_qualifiers &&
-                       2 * sizes[UVS_VARYINGS] <= AGX_UVS_CANONICAL_MAX_WORDS;
+   const bool unlinked = canonical && !s->info.known_interpolation_qualifiers;
+   layout->canonical =
+      unlinked && 2 * sizes[UVS_VARYINGS] <= AGX_UVS_CANONICAL_MAX_WORDS;
+   layout->relocatable = false;
+   if (unlinked && !layout->canonical) {
+      bool indirect = false;
+      nir_shader_intrinsics_pass(s, has_indirect_varying, nir_metadata_all,
+                                 &indirect);
+      layout->relocatable = !indirect;
+   }
    if (layout->canonical) {
       unsigned offs = 0;
       u_foreach_bit64(loc, layout->written) {
@@ -290,6 +321,17 @@ agx_nir_lower_uvs(nir_shader *s, struct agx_unlinked_uvs_layout *layout,
 
    layout->size = offs;
    layout->user_size = sizes[UVS_VARYINGS];
+
+   if (layout->relocatable) {
+      struct agx_varyings_vs placeholder;
+      agx_assign_uvs(&placeholder, layout, 0, 0);
+
+      u_foreach_bit64(loc, layout->written) {
+         assert(placeholder.slots[loc] + layout->components[loc] <=
+                AGX3_UVS_RELOC_MAP_SIZE);
+         ctx.placeholder[loc] = placeholder.slots[loc];
+      }
+   }
 
    /* Now lower in terms of the unlinked layout */
    NIR_PASS(progress, s, nir_shader_intrinsics_pass, lower,
@@ -340,8 +382,8 @@ agx_nir_lower_uvs(nir_shader *s, struct agx_unlinked_uvs_layout *layout,
 
 void
 agx_assign_uvs(struct agx_varyings_vs *varyings,
-               struct agx_unlinked_uvs_layout *layout, uint64_t flat_mask,
-               uint64_t linear_mask)
+               const struct agx_unlinked_uvs_layout *layout,
+               uint64_t flat_mask, uint64_t linear_mask)
 {
    *varyings = (struct agx_varyings_vs){0};
 
@@ -415,6 +457,34 @@ agx_assign_uvs(struct agx_varyings_vs *varyings,
       cfg.smooth = 0;
       cfg.flat = 0;
       cfg.linear = 0;
+   }
+}
+
+static_assert(AGX3_UVS_RELOC_MAP_SIZE == 256, "agx_uvs.h");
+
+void
+agx_uvs_relocation_map(const struct agx_unlinked_uvs_layout *layout,
+                       uint64_t flat_mask, uint64_t linear_mask,
+                       uint8_t map[AGX3_UVS_RELOC_MAP_SIZE])
+{
+   for (unsigned i = 0; i < AGX3_UVS_RELOC_MAP_SIZE; ++i)
+      map[i] = i;
+
+   if (!layout->relocatable)
+      return;
+
+   /* The placeholders are the indices of the layout linked with no flat or
+    * linear inputs (agx_nir_lower_uvs()). */
+   struct agx_varyings_vs placeholder, linked;
+   agx_assign_uvs(&placeholder, layout, 0, 0);
+   agx_assign_uvs(&linked, layout, flat_mask, linear_mask);
+
+   u_foreach_bit64(loc, layout->written) {
+      for (unsigned c = 0; c < layout->components[loc]; ++c) {
+         assert(placeholder.slots[loc] + c < AGX3_UVS_RELOC_MAP_SIZE);
+         assert(linked.slots[loc] + c < AGX3_UVS_RELOC_MAP_SIZE);
+         map[placeholder.slots[loc] + c] = linked.slots[loc] + c;
+      }
    }
 }
 
