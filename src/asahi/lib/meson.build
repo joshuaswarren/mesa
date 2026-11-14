@@ -226,6 +226,19 @@ if with_tests
     suite : ['asahi'],
   )
   test(
+    'asahi-g18g-reencode-cache',
+    executable(
+      'asahi-g18g-reencode-cache',
+      files('tests/test-g18g-reencode-cache.c'),
+      include_directories : [inc_asahi, inc_include, inc_src],
+      dependencies : [idep_agx_pack, idep_mesautil, idep_nir],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
     'asahi-usc-base-page',
     executable(
       'asahi-usc-base-page',

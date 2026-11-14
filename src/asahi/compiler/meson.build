@@ -61,6 +61,7 @@ libasahi_agx_files = files(
   'agx3_compose/agx3c_tables.c',
   'agx3_compose/agx3d_tables.c',
   'agx3_transcode.c',
+  'agx3_reencode_cache.c',
   'agx3_binder.c',
   'agx3_atomic_core.c',
   'agx3_cf_core.c',
