@@ -435,8 +435,7 @@ main(void)
    test_device_with_rt("ordinary features with ray query", &ordinary_rq);
 
    setenv("ASAHI_G17P_RT_DISABLE", "1", 1);
-   test_device_without_rt("G17P, ray query, RT disabled", AGX_CHIP_G17P,
-                          rt_kernel, &rq);
+   test_device_with_rt("ray query ignores the retired environment opt-out", &rq);
    unsetenv("ASAHI_G17P_RT_DISABLE");
 
    test_cache_key();

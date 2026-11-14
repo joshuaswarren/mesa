@@ -96,8 +96,7 @@ hk_g17p_rt_enabled(const struct agx_device *dev)
 {
    return dev->chip == AGX_CHIP_G17P &&
           (dev->params.features & HK_G17P_RT_KERNEL_FEATURES) ==
-             HK_G17P_RT_KERNEL_FEATURES &&
-          !debug_get_bool_option("ASAHI_G17P_RT_DISABLE", false);
+             HK_G17P_RT_KERNEL_FEATURES;
 }
 
 /* T6040's 25G83 firmware does not yet admit intersection/SCS commands. AS
@@ -112,8 +111,7 @@ hk_g16s_as_enabled(const struct agx_device *dev)
    const uint64_t required = DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |
                              DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD;
    return agx_is_m4_pro(dev) &&
-          (dev->params.features & required) == required &&
-          !debug_get_bool_option("ASAHI_G17P_RT_DISABLE", false);
+          (dev->params.features & required) == required;
 }
 
 static inline bool
