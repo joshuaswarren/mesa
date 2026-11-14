@@ -730,6 +730,40 @@ agx_chip_from_identity(const struct drm_asahi_params_global *params)
    }
 }
 
+/* The chip a GPU device tree compatible of the form "apple,agx-g<generation>
+ * <variant>" names ("apple,agx-g17d" is G17D), through agx_chip_from_identity()
+ * given the generation and variant alone; UNKNOWN for any other string, such
+ * as an SoC compatible ("apple,agx-t6050"). A compatible carries no SoC ID, so
+ * where agx_chip_from_identity() also reads the kernel's chip ID (the M4 Pro
+ * and M4 Max on the G17 runtime, G17P there) this gives the generation's own
+ * row (G16S, G16C): for a chip-wide bit only, such as
+ * agx_chip_gl_through_zink(), which none of those rows has. For code that
+ * reads the device tree without opening the device, such as the loader.
+ */
+static inline enum agx_chip
+agx_chip_from_compatible(const char *compatible)
+{
+   static const char prefix[] = "apple,agx-g";
+   struct drm_asahi_params_global params = {0};
+   const char *c = compatible;
+
+   for (unsigned i = 0; i < sizeof(prefix) - 1; ++i, ++c) {
+      if (!c || *c != prefix[i])
+         return AGX_CHIP_UNKNOWN;
+   }
+   if (*c < '1' || *c > '9')
+      return AGX_CHIP_UNKNOWN;
+   for (; *c >= '0' && *c <= '9'; ++c) {
+      params.gpu_generation = params.gpu_generation * 10 + (*c - '0');
+      if (params.gpu_generation > 99)
+         return AGX_CHIP_UNKNOWN;
+   }
+   if (*c < 'a' || *c > 'z' || c[1] != '\0')
+      return AGX_CHIP_UNKNOWN;
+   params.gpu_variant = *c - 'a' + 'A';
+   return agx_chip_from_identity(&params);
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif
