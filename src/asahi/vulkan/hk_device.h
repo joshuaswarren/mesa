@@ -172,6 +172,9 @@ struct hk_device {
    struct hk_texel_windows *texel_windows;
 
    struct vk_meta_device meta;
+   /* G17P PBE buffer fills recorded so far, atomic. Their sweep direction
+    * alternates, see hk_g17p_fill_buffer_pbe(). */
+   uint32_t g17p_fills;
 
    /* Parameters for Mesa's common acceleration-structure builder. */
    struct vk_acceleration_structure_build_args accel_struct_args;
