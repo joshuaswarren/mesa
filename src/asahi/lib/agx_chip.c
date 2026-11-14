@@ -596,34 +596,19 @@ agx_params_m5_supported(const struct drm_asahi_params_global *params)
    const enum agx_chip chip = agx_chip_from_params(params);
    return (chip == AGX_CHIP_G17G && params->chip_id == 0x8142 &&
            params->num_clusters_total == 1) ||
+          /* T6050 M5 Pro (J714s/J716s): G17S, one die, two clusters. */
+          (chip == AGX_CHIP_G17S && params->chip_id == 0x6050 &&
+           params->num_clusters_total == 2) ||
           /* T6050 M5 Max (J716c): G17C, one die, four clusters. */
           (chip == AGX_CHIP_G17C && params->chip_id == 0x6050 &&
            params->num_clusters_total == 4);
-}
-
-bool
-agx_params_m5_bringup_supported(const struct drm_asahi_params_global *params)
-{
-   if (!params || params->num_dies != 1 ||
-       params->usc_generation != AGX_ISA_AGX3 ||
-       params->gpu_hal_generation != DRM_ASAHI_GPU_HAL_300)
-      return false;
-
-   const enum agx_chip chip = agx_chip_from_params(params);
-   return (chip == AGX_CHIP_G17G && params->chip_id == 0x8142 &&
-           params->num_clusters_total == 1) ||
-          (chip == AGX_CHIP_G17S && params->chip_id == 0x6050) ||
-          /* T6050 M5 Max (J716c): G17C, one die, four clusters. */
-          (chip == AGX_CHIP_G17C && params->chip_id == 0x6050 &&
-           params->num_clusters_total == 4);
-
 }
 
 /*
  * The M6 bring-up contract: the J873's G18G (chip 0x8152, one die, USC 3).
  * The shim's G18G profile and the J873 G18G kernel driver both publish HAL
  * 300 until the uAPI has a PI_400 value. Like the M5 contract above, it is
- * honoured only with ASAHI_G18G_BRINGUP set; see agx_open_device.
+ * admitted by its exact hardware identity; see agx_open_device.
  */
 bool
 agx_params_g18g_bringup_supported(const struct drm_asahi_params_global *params)

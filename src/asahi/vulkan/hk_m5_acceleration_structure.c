@@ -1361,8 +1361,7 @@ hk_cmd_fill_buffer_addr(VkCommandBuffer commandBuffer, VkDeviceAddress addr,
 VkResult
 hk_m5_backend_device_init_accel_struct_state(struct hk_device *dev)
 {
-   dev->m5_native_as = agx_chip_g17_m5(dev->dev.chip) &&
-      debug_get_bool_option("ASAHI_M5_NATIVE_AS", false);
+   dev->m5_native_as = agx_chip_g17_m5(dev->dev.chip);
    dev->accel_struct_args = (struct vk_acceleration_structure_build_args){
       .subgroup_size = 32,
       .bvh_bounds_offset = dev->m5_native_as ? 0x50 :

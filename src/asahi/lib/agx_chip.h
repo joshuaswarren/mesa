@@ -712,15 +712,14 @@ bool agx_chip_driver_supported(enum agx_chip chip);
 bool agx_params_driver_supported(
    const struct drm_asahi_params_global *params);
 
-/* Exact M6 (G18G) kernel contract for explicitly opted-in driver
- * integration; agx_params_m5_bringup_supported below is the M5 one. This is
- * not a declaration of a complete or conformant device path. */
+/* Exact M6 (G18G) kernel contract admitted by default. This is not a
+ * declaration of a complete or conformant device path. */
 bool agx_params_g18g_bringup_supported(
    const struct drm_asahi_params_global *params);
 
-/* Exact M5 (T8142, G17G) and M5 Max (T6050, G17C) kernel contracts the
- * driver admits. This is not a declaration of a complete or conformant device
- * path. */
+/* Exact M5 (T8142, G17G), M5 Pro (T6050, G17S) and M5 Max (T6050, G17C)
+ * kernel contracts the driver admits. This is not a declaration of a complete
+ * or conformant device path. */
 bool agx_params_m5_supported(
    const struct drm_asahi_params_global *params);
 
@@ -734,12 +733,6 @@ bool agx_params_fixup_upstream_uapi(struct drm_asahi_params_global *params);
  * Variant letters are not marketing tiers: notably, G17P is A18 Pro rather
  * than an M5 variant. Returns NULL when one chip identity spans products. */
 const char *agx_chip_exact_product_name(enum agx_chip chip);
-
-/* libagx_g13{g,x} contains AGX2 machine code and USC records. It must never be
- * selected for an AGX3 device, even when no current draw is expected to call a
- * precompiled helper. */
-bool agx_params_m5_bringup_supported(
-   const struct drm_asahi_params_global *params);
 
 bool agx_chip_uses_legacy_precompiled_programs(enum agx_chip chip);
 
@@ -756,21 +749,12 @@ agx_chip_g17_m5(enum agx_chip chip)
 }
 
 /* Every AGX3B part carries the 8x8 f16/f32 matmad backing a subgroup-scope
- * cooperative matrix (see hk_physical_device.c), but the extension is only
- * advertised by default on parts whose dEQP-VK.compute.*cooperative_matrix*
- * run has passed on real silicon. Every other AGX3B part stays opt-in via
- * ASAHI_AGX3B_COOPERATIVE_MATRIX=1 until it earns its own hardware CTS pass. */
+ * cooperative matrix. M5 has its own AGX3C encoding and matrix16 support. */
 static inline bool
-agx_chip_cooperative_matrix_qualified(enum agx_chip chip)
+agx_chip_cooperative_matrix_supported(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G16S:
-      /* M4 Pro (J616s): dEQP coopmat A/B 1269 pass / 0 fail, 0 regressions,
-       * matrixmuladd 240/240. */
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B ||
+          agx_chip_g17_m5(chip);
 }
 
 /* Stable name for diagnostics, e.g. "G15X". Never NULL. */

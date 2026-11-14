@@ -6484,32 +6484,23 @@ TEST(NativeForms, Agx3bMatmad8x8Field74IsWaitSlot5NotCZero)
    EXPECT_EQ((out[2] >> 1) & 1, 1);
 }
 
-/*
- * The AGX3B cooperative-matrix default is decided per chip
- * (agx_chip_cooperative_matrix_qualified, consumed by hk_physical_device.c):
- * a part advertises coopmat by default only after its own hardware dEQP
- * coopmat run passes. G16S (J616s, M4 Pro) has one; every other AGX3B part
- * exposes the same encoder path but stays opt-in via
- * ASAHI_AGX3B_COOPERATIVE_MATRIX=1 until it earns its own pass. This pins the
- * table so no part is flipped on by default without a hardware pass, and
- * confirms each listed part really is an AGX3B encoding (so the hk gate, which
- * keys on the encoding, actually reaches it).
- */
-TEST(NativeForms, Agx3bCoopmatDefaultIsPerChipQualified)
+/* The implemented cooperative-matrix path is enabled for every AGX3B
+ * encoding and for M5. Earlier AGX2 devices do not gain the extension. */
+TEST(NativeForms, CooperativeMatrixDefaultsFollowTheImplementedEncoding)
 {
-   /* G16S is the only hardware-qualified AGX3B part today, and it is AGX3B. */
-   EXPECT_TRUE(agx_chip_cooperative_matrix_qualified(AGX_CHIP_G16S));
+   /* G16S and the other AGX3B parts use the same 8x8 path. */
+   EXPECT_TRUE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G16S));
    EXPECT_EQ(agx_chip_isa_encoding(AGX_CHIP_G16S), AGX_ISA_ENCODING_AGX3B);
 
-   /* Every other AGX3B part is AGX3B (gate-reachable) yet default-off. */
+   /* All AGX3B parts advertise the implemented path by default. */
    for (enum agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G17A, AGX_CHIP_G16P,
                               AGX_CHIP_G16G, AGX_CHIP_G16C, AGX_CHIP_G15G,
                               AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D}) {
       EXPECT_EQ(agx_chip_isa_encoding(chip), AGX_ISA_ENCODING_AGX3B);
-      EXPECT_FALSE(agx_chip_cooperative_matrix_qualified(chip));
+      EXPECT_TRUE(agx_chip_cooperative_matrix_supported(chip));
    }
 
-   /* M5 (AGX3C) and AGX2 parts never gate on this table. */
-   EXPECT_FALSE(agx_chip_cooperative_matrix_qualified(AGX_CHIP_G17G));
-   EXPECT_FALSE(agx_chip_cooperative_matrix_qualified(AGX_CHIP_G13G));
+   /* M5 has the AGX3C path; AGX2 has neither implementation. */
+   EXPECT_TRUE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G17G));
+   EXPECT_FALSE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G13G));
 }

@@ -1066,21 +1066,14 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * encoder from the wrong generation.
     */
    const bool m5 = agx_params_m5_supported(&dev->params);
-   const bool m5_bringup =
-      !m5 && debug_get_bool_option("ASAHI_M5_BRINGUP", false) &&
-      agx_params_m5_bringup_supported(&dev->params);
-   if (m5_bringup)
-      fprintf(stderr, "Experimental M5 HAL300 integration enabled; general rendering is unqualified\n");
    /* M6: the G18G records are the M5 ones (agx_chip_hal300_records) and its
     * code is G17G-family (agx3c) code re-encoded as agx3d
     * (agx_gather_device_key). */
    const bool g18g_bringup =
-      debug_get_bool_option("ASAHI_G18G_BRINGUP", true) &&
       agx_params_g18g_bringup_supported(&dev->params);
    if (g18g_bringup)
       fprintf(stderr, "Experimental M6 G18G integration enabled (M5 paths, agx3d code); rendering is unqualified\n");
-   if (!agx_params_driver_supported(&dev->params) && !m5 && !m5_bringup &&
-       !g18g_bringup) {
+   if (!agx_params_driver_supported(&dev->params) && !m5 && !g18g_bringup) {
       if (dev->chip == AGX_CHIP_UNKNOWN) {
          fprintf(stderr,
                  "Unsupported Apple GPU architecture G%u (variant 0x%x, %u "

@@ -290,6 +290,17 @@ main(void)
    assert(agx_chip_usc_helper_table_slots(AGX_CHIP_G17P, 6) == 6);
    assert(agx_chip_usc_helper_table_slots(AGX_CHIP_G17P, 10) == 10);
 
+   /* Implemented matrix paths are available without process flags. */
+   const enum agx_chip matrix_chips[] = {
+      AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
+      AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(matrix_chips); ++i)
+      assert(agx_chip_cooperative_matrix_supported(matrix_chips[i]));
+   assert(!agx_chip_cooperative_matrix_supported(AGX_CHIP_G13G));
+   assert(!agx_chip_cooperative_matrix_supported(AGX_CHIP_G14X));
+
    /* The M5 Max (T6050, G17C) is admitted with its four clusters only, by
     * default and on the M5 bring-up path. */
    struct drm_asahi_params_global t6050c = g15_params('C', 0x6050, 4);
@@ -297,34 +308,50 @@ main(void)
    t6050c.gpu_hal_generation = DRM_ASAHI_GPU_HAL_300;
    assert(agx_chip_from_params(&t6050c) == AGX_CHIP_G17C);
    assert(agx_chip_g17_m5(AGX_CHIP_G17C));
-   assert(agx_params_m5_bringup_supported(&t6050c));
    assert(agx_params_m5_supported(&t6050c));
    assert(!agx_params_driver_supported(&t6050c));
 
    bad = t6050c;
    bad.num_clusters_total = 2;
-   assert(!agx_params_m5_bringup_supported(&bad));
    assert(!agx_params_m5_supported(&bad));
 
    bad = t6050c;
    bad.chip_id = 0x6051;
-   assert(!agx_params_m5_bringup_supported(&bad));
    assert(!agx_params_m5_supported(&bad));
 
    bad = t6050c;
    bad.num_dies = 2;
-   assert(!agx_params_m5_bringup_supported(&bad));
    assert(!agx_params_m5_supported(&bad));
 
    bad = t6050c;
    bad.gpu_hal_generation = DRM_ASAHI_GPU_HAL_200;
    assert(!agx_params_m5_supported(&bad));
 
-   /* The M5 Pro (T6050, G17S) stays on the bring-up path. */
+   /* M5 Pro's exact shipping topology is admitted without an environment
+    * override. Another topology remains unsupported. */
+   struct drm_asahi_params_global t6050s = g15_params('S', 0x6050, 2);
+   t6050s.gpu_generation = 17;
+   t6050s.gpu_hal_generation = DRM_ASAHI_GPU_HAL_300;
+   assert(agx_chip_from_params(&t6050s) == AGX_CHIP_G17S);
+   assert(agx_params_m5_supported(&t6050s));
+
+   bad = t6050s;
+   bad.num_dies = 2;
+   assert(!agx_params_m5_supported(&bad));
+   bad = t6050s;
+   bad.chip_id = 0x6051;
+   assert(!agx_params_m5_supported(&bad));
+   bad = t6050s;
+   bad.gpu_hal_generation = DRM_ASAHI_GPU_HAL_200;
+   assert(!agx_params_m5_supported(&bad));
+   bad = t6050s;
+   bad.usc_generation = 2;
+   assert(!agx_params_m5_supported(&bad));
+
+   /* Four clusters do not describe an M5 Pro. */
    bad = t6050c;
    bad.gpu_variant = 'S';
    assert(agx_chip_from_params(&bad) == AGX_CHIP_G17S);
-   assert(agx_params_m5_bringup_supported(&bad));
    assert(!agx_params_m5_supported(&bad));
 
    /* The M5 (T8142, G17G) is admitted by its exact kernel identity. */

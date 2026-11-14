@@ -2,14 +2,12 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
 #include "compiler/nir/nir.h"
 #include "compiler/shader_enums.h"
 #include "drm-uapi/asahi_drm.h"
 
 
-enum hk_mesh_mode { HK_MESH_MODE_OFF=0, HK_MESH_MODE_NATIVE_PROBE };
+enum hk_mesh_mode { HK_MESH_MODE_NATIVE_PROBE };
 
 /* A native G17P mesh launch runs at most this many mesh workgroups: a larger
  * child grid launches none. A draw's mesh workgroups therefore go out in
@@ -36,9 +34,7 @@ hk_mesh_launch_rows(uint32_t x)
    return (per / slices) * slices;
 }
 static inline enum hk_mesh_mode hk_mesh_mode(void) {
-   const char *mode=getenv("ASAHI_MESH");
-   return mode && !strcmp(mode,"native-probe") ? HK_MESH_MODE_NATIVE_PROBE
-                                               : HK_MESH_MODE_OFF;
+   return HK_MESH_MODE_NATIVE_PROBE;
 }
 
 /* M5 task (object) shaders, in native-probe mesh mode on G17S. taskShader is

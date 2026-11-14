@@ -9,8 +9,8 @@ cc -Wall -Wextra -O2 g17g_zink_draw.c -lEGL -lGL -o g17g_zink_draw
 ```
 
 Select the experimental M5 ICD and matching Mesa libraries when running it.
-Set `ASAHI_M5_BRINGUP=1`, `MESA_LOADER_DRIVER_OVERRIDE=zink`, and
-`GALLIUM_DRIVER=zink`. The default path checks all 65,536 RGBA pixels returned
+Set `MESA_LOADER_DRIVER_OVERRIDE=zink` and `GALLIUM_DRIVER=zink` to
+select Zink for this specific probe. The default path checks all 65,536 RGBA pixels returned
 by `glReadPixels` against `ff470dff`. `--submit-only` deliberately skips that
 check and must not be interpreted as rendering proof.
 

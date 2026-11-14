@@ -2200,43 +2200,23 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.KHR_ray_tracing_position_fetch = true;
    }
 
-   /* Explicit bring-up profile for the native M5 acceleration structure
-    * builder. Nothing traverses the native format yet, so ray queries and
-    * ray tracing pipelines stay off. */
-   if (agx_chip_g17_m5(pdev->dev.chip) &&
-       debug_get_bool_option("ASAHI_M5_NATIVE_AS", false)) {
+   /* The native M5 builder is available by default. Traversal is not
+    * implemented for this format, so ray queries and ray pipelines stay off. */
+   if (agx_chip_g17_m5(pdev->dev.chip)) {
       supported_extensions.KHR_acceleration_structure = true;
       supported_extensions.KHR_deferred_host_operations = true;
    }
-   /* The 8x8 f16/f32 matmad underlying a subgroup-scope cooperative matrix
-    * exists on the AGX3B ISA (G15/G16/G17P) just as it does on the M5 AGX3C
-    * encoding; only the M5-exclusive 16x16 GEMM needs the kernel
-    * DRM_ASAHI_FEATURE_COMPUTE_MATRIX, and the 8x8 matmad dispatch never sets
-    * uses_matrix16, so AGX3B coopmat is purely a userspace capability. The
-    * default is decided per chip: a part advertises coopmat only once its
-    * dEQP-VK.compute.*cooperative_matrix* run has passed on real silicon
-    * (agx_chip_cooperative_matrix_qualified, G16S today); every other AGX3B
-    * part stays opt-in via ASAHI_AGX3B_COOPERATIVE_MATRIX=1. The env var
-    * overrides the default either way. M5 behaviour is unchanged.
-    *
-    * The qualification is per product, not per architecture profile: an M4
-    * Pro on the G17 kernel runtime takes the G17P profile (agx_chip.c) but
-    * is the same G16S silicon, so it keeps its default too. */
-   const bool m5_cmat = agx_chip_g17_m5(pdev->dev.chip) &&
-      debug_get_bool_option("ASAHI_M5_COOPERATIVE_MATRIX", true);
-   const bool agx3b_cmat =
-      agx_chip_isa_encoding(pdev->dev.chip) == AGX_ISA_ENCODING_AGX3B &&
-      debug_get_bool_option(
-         "ASAHI_AGX3B_COOPERATIVE_MATRIX",
-         agx_chip_cooperative_matrix_qualified(pdev->dev.chip) ||
-            agx_is_m4_pro(&pdev->dev));
-   supported_extensions.KHR_cooperative_matrix = m5_cmat || agx3b_cmat;
+   /* The implemented cooperative-matrix paths are selected by ISA, without
+    * a process-wide feature opt-in. */
+   const bool m5_cmat = agx_chip_g17_m5(pdev->dev.chip);
+   supported_extensions.KHR_cooperative_matrix =
+      agx_chip_cooperative_matrix_supported(pdev->dev.chip);
 
    /* bf16 inputs ride the same 8x8 form, but no AGX3B bf16 matmad has been
     * witnessed from Apple yet, so KHR_shader_bfloat16 stays M5-only until a
     * fixture (and bf16 CTS) proves it on AGX3B. */
    supported_extensions.KHR_shader_bfloat16 =
-      m5_cmat && debug_get_bool_option("ASAHI_M5_BFLOAT16", true);
+      m5_cmat;
 
    /* Most of VK_NV_cooperative_matrix2 (flexible dimensions, tensor
     * addressing, block loads, per-element operations, reductions) is lowered

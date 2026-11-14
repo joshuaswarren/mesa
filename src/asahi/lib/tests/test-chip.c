@@ -324,32 +324,32 @@ test_independent_generation_axes(void)
       .gpu_hal_generation = DRM_ASAHI_GPU_HAL_300,
    };
    CHECK(!agx_params_driver_supported(&m5));
-   CHECK(agx_params_m5_bringup_supported(&m5));
+   CHECK(agx_params_m5_supported(&m5));
    m5.chip_id = 0x8140;
-   CHECK(!agx_params_m5_bringup_supported(&m5));
+   CHECK(!agx_params_m5_supported(&m5));
    m5.chip_id = 0x8142;
    m5.gpu_variant = 'P';
-   CHECK(!agx_params_m5_bringup_supported(&m5));
+   CHECK(!agx_params_m5_supported(&m5));
    m5.gpu_variant = 'G';
    m5.num_dies = 2;
-   CHECK(!agx_params_m5_bringup_supported(&m5));
+   CHECK(!agx_params_m5_supported(&m5));
    m5.num_dies = 1;
    m5.num_clusters_total = 2;
-   CHECK(!agx_params_m5_bringup_supported(&m5));
+   CHECK(!agx_params_m5_supported(&m5));
    m5.num_clusters_total = 1;
    m5.usc_generation = 2;
-   CHECK(!agx_params_m5_bringup_supported(&m5));
+   CHECK(!agx_params_m5_supported(&m5));
    m5.usc_generation = 3;
    m5.gpu_hal_generation = DRM_ASAHI_GPU_HAL_200;
-   CHECK(!agx_params_m5_bringup_supported(&m5));
-   CHECK(!agx_params_m5_bringup_supported(NULL));
+   CHECK(!agx_params_m5_supported(&m5));
+   CHECK(!agx_params_m5_supported(NULL));
 
    /* The M5 bring-up contract must not admit the M6. */
    struct drm_asahi_params_global m6 = m5;
    m6.gpu_generation = 18;
    m6.chip_id = 0x8152;
    CHECK_EQ(agx_chip_from_params(&m6), AGX_CHIP_G18G);
-   CHECK(!agx_params_m5_bringup_supported(&m6));
+   CHECK(!agx_params_m5_supported(&m6));
    CHECK(!agx_params_driver_supported(&m6));
 
    CHECK(agx_chip_uses_legacy_precompiled_programs(AGX_CHIP_G13G));
