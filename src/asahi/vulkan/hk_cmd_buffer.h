@@ -849,6 +849,10 @@ struct hk_graphics_state {
     * NULL to draw with the bound fragment shader itself. */
    struct hk_api_shader *mesh_fs;
 
+   /* The zs_self_dep twin of the bound fragment shader while a dynamic
+    * depth/stencil feedback loop is enabled (hk_fbl_twin()), or NULL. */
+   struct hk_api_shader *fbl_fs;
+
    /* Vertex buffers */
    struct hk_addr_range vb[AGX_MAX_VBUFS];
 

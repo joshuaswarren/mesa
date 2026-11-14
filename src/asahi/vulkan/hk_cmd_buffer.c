@@ -1285,7 +1285,8 @@ hk_g17p_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
       return false;
 
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
-   struct hk_api_shader *fs = gfx->shaders[MESA_SHADER_FRAGMENT];
+   struct hk_api_shader *fs =
+      gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
    if (!vs || !fs || fs->g17p_sample_variants)
       return false;
 

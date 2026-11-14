@@ -138,6 +138,11 @@ struct hk_fs_key {
     */
    bool static_a2c : 1;
 
+   /** The bound depth/stencil feedback loop is only known at draw time, so
+    * keep the NIR to compile the zs_self_dep twin (hk_fbl_twin()).
+    */
+   bool dynamic_zs_self_dep : 1;
+
    uint8_t pad[3];
 };
 
@@ -745,6 +750,28 @@ hk_remove_unused_color_store(UNUSED nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* Whether a fragment shader may draw in a depth/stencil feedback loop that
+ * only the draw-time state reveals: shader objects, a dynamic loop, or a
+ * fragment library whose output interface comes later. A shader object's
+ * binary may load on any device with the feature, so it follows the physical
+ * device. Internal shaders have no features. */
+static bool
+hk_fs_zs_self_dep_dynamic(const struct vk_physical_device *pdev,
+                          const struct vk_graphics_pipeline_state *state,
+                          const struct vk_features *features)
+{
+   if (!features)
+      return false;
+   if (!state)
+      return pdev->supported_features.attachmentFeedbackLoopDynamicState;
+
+   return features->attachmentFeedbackLoopDynamicState &&
+          (BITSET_TEST(state->dynamic,
+                       MESA_VK_DYNAMIC_ATTACHMENT_FEEDBACK_LOOP_ENABLE) ||
+           !(state->cal || BITSET_TEST(state->dynamic,
+                                       MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP)));
+}
+
 static void
 hk_prune_unused_fragment_colors(nir_shader *nir, const struct hk_fs_key *key)
 {
@@ -953,6 +980,9 @@ hk_hash_graphics_state(struct vk_physical_device *device,
       hk_populate_fs_key(&key, state,
                          container_of(device, struct hk_physical_device, vk)
                             ->dev.chip);
+      key.dynamic_zs_self_dep =
+         !key.zs_self_dep &&
+         hk_fs_zs_self_dep_dynamic(device, state, features);
       _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
    }
 
@@ -5747,6 +5777,7 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
       free(twin);
    }
    hk_border_source_destroy(dev, obj->mesh_source);
+   hk_border_source_destroy(dev, obj->fbl_source);
 
    if (obj->binary_cache_entry)
       hk_shader_binary_cache_entry_unref(dev, obj->binary_cache_entry);
@@ -6926,6 +6957,42 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       util_dynarray_fini(&ifs);
    }
 
+   union hk_key key_tmp = {0}, *key = NULL;
+   bool has_key = false;
+   if (twin_of) {
+      key_tmp = twin_of->key;
+      has_key = twin_of->has_key;
+   } else if (info->stage == MESA_SHADER_FRAGMENT) {
+      hk_populate_fs_key(&key_tmp.fs, state, dev->dev.chip);
+      key_tmp.fs.dynamic_zs_self_dep =
+         !key_tmp.fs.zs_self_dep &&
+         hk_fs_zs_self_dep_dynamic(dev->vk.physical, state, vk_features);
+      has_key = true;
+   } else if (info->stage == MESA_SHADER_VERTEX) {
+      hk_populate_vs_key(&key_tmp.vs, state);
+      key_tmp.vs.no_default_layer = no_default_layer;
+      has_key = true;
+   }
+
+   /* A fragment shader whose depth/stencil feedback loop is only known at
+    * draw time keeps this NIR to compile its zs_self_dep twin from. */
+   void *fbl_nir = NULL;
+   size_t fbl_nir_size = 0;
+   if (info->stage == MESA_SHADER_FRAGMENT && !mesh_fs &&
+       key_tmp.fs.dynamic_zs_self_dep && !key_tmp.fs.zs_self_dep) {
+      struct blob blob;
+      blob_init(&blob);
+      nir_serialize(&blob, nir, false);
+      if (blob.out_of_memory) {
+         blob_finish(&blob);
+         free(border_nir);
+         free(mesh_nir);
+         ralloc_free(nir);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      blob_finish_get_buffer(&blob, &fbl_nir, &fbl_nir_size);
+   }
+
    /* Per-primitive inputs read zero without a mesh shader's records: a mesh
     * draw uses the twin instead. */
    if (dev->dev.chip == AGX_CHIP_G17P &&
@@ -6939,23 +7006,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                                                    mesh_fs ? mesh_fs : &no_mesh)) {
          free(border_nir);
          free(mesh_nir);
+         free(fbl_nir);
          ralloc_free(nir);
          return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
       }
-   }
-
-   union hk_key key_tmp = {0}, *key = NULL;
-   bool has_key = false;
-   if (twin_of) {
-      key_tmp = twin_of->key;
-      has_key = twin_of->has_key;
-   } else if (info->stage == MESA_SHADER_FRAGMENT) {
-      hk_populate_fs_key(&key_tmp.fs, state, dev->dev.chip);
-      has_key = true;
-   } else if (info->stage == MESA_SHADER_VERTEX) {
-      hk_populate_vs_key(&key_tmp.vs, state);
-      key_tmp.vs.no_default_layer = no_default_layer;
-      has_key = true;
    }
 
    if (info->stage == MESA_SHADER_FRAGMENT)
@@ -6989,6 +7043,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    if (obj == NULL) {
       free(border_nir);
       free(mesh_nir);
+      free(fbl_nir);
       ralloc_free(nir);
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
@@ -7014,7 +7069,17 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       if (!obj->mesh_source)
          free(mesh_nir);
    }
-   if ((border_nir && !obj->border_source) || (mesh_nir && !obj->mesh_source)) {
+   if (fbl_nir) {
+      union hk_key fbl_key = key_tmp;
+      fbl_key.fs.zs_self_dep = true;
+      obj->fbl_source = hk_compile_source_create(
+         fbl_nir, fbl_nir_size, &fbl_key, has_key, info, features,
+         static_set_mask);
+      if (!obj->fbl_source)
+         free(fbl_nir);
+   }
+   if ((border_nir && !obj->border_source) || (mesh_nir && !obj->mesh_source) ||
+       (fbl_nir && !obj->fbl_source)) {
       ralloc_free(nir);
       hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -7759,10 +7824,10 @@ hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
    return result;
 }
 
-struct hk_api_shader *
-hk_border_twin(struct hk_device *dev, struct hk_api_shader *obj)
+static struct hk_api_shader *
+hk_source_twin(struct hk_device *dev, struct hk_api_shader *obj,
+               struct hk_border_source *src)
 {
-   struct hk_border_source *src = obj->border_source;
    struct hk_api_shader *twin = p_atomic_read(&src->twin);
    if (twin)
       return twin;
@@ -7775,6 +7840,18 @@ hk_border_twin(struct hk_device *dev, struct hk_api_shader *obj)
    twin = src->twin;
    simple_mtx_unlock(&src->lock);
    return twin;
+}
+
+struct hk_api_shader *
+hk_border_twin(struct hk_device *dev, struct hk_api_shader *obj)
+{
+   return hk_source_twin(dev, obj, obj->border_source);
+}
+
+struct hk_api_shader *
+hk_fbl_twin(struct hk_device *dev, struct hk_api_shader *obj)
+{
+   return hk_source_twin(dev, obj, obj->fbl_source);
 }
 
 VkResult
@@ -8386,12 +8463,16 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
     * shader is right on any device that has the feature; without it, only on
     * one that did not enable it. */
    const bool clip_z = variant_flags & 128;
+   const unsigned variant_flags2 = blob_read_uint8(blob);
+   const bool has_fbl_source = variant_flags2 & 1;
    /* Graphics, compute, task and mesh stages. */
    if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES ||
        (clip_z ? !dev->vk.physical->supported_features.depthClipControl
                : dev->vk.enabled_features.depthClipControl) ||
        (has_mesh_source && (stage != MESA_SHADER_FRAGMENT ||
                             dev->dev.chip != AGX_CHIP_G17P)) ||
+       (variant_flags2 & ~1u) ||
+       (has_fbl_source && stage != MESA_SHADER_FRAGMENT) ||
        (has_source && !sample_variants) ||
        (m5_sample_variants &&
         (!sample_variants || !agx_chip_g17_m5(dev->dev.chip))) ||
@@ -8491,6 +8572,14 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
 
    if (has_mesh_source) {
       VkResult result = hk_border_source_deserialize(&obj->mesh_source, blob);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, result);
+      }
+   }
+
+   if (has_fbl_source) {
+      VkResult result = hk_border_source_deserialize(&obj->fbl_source, blob);
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, result);
@@ -8618,6 +8707,18 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
    if (src_obj->mesh_source) {
       obj->mesh_source = hk_border_source_clone(src_obj->mesh_source);
       if (!obj->mesh_source) {
+         hk_border_source_destroy(dev, obj->border_source);
+         hk_fs_sample_source_destroy(obj->sample_source);
+         vk_shader_free(&dev->vk, pAllocator, &obj->vk);
+         hk_shader_binary_cache_entry_unref(dev, entry);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+   }
+
+   if (src_obj->fbl_source) {
+      obj->fbl_source = hk_border_source_clone(src_obj->fbl_source);
+      if (!obj->fbl_source) {
+         hk_border_source_destroy(dev, obj->mesh_source);
          hk_border_source_destroy(dev, obj->border_source);
          hk_fs_sample_source_destroy(obj->sample_source);
          vk_shader_free(&dev->vk, pAllocator, &obj->vk);
@@ -8826,6 +8927,7 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
                              (obj->g17p_sample_variants == 4 ? 32 : 0) |
                              (obj->mesh_source ? 64 : 0) |
                              (obj->clip_m1_1 ? 128 : 0));
+   blob_write_uint8(blob, obj->fbl_source ? 1 : 0);
 
    hk_foreach_variant(obj, shader) {
       const unsigned i = shader - obj->variants;
@@ -8876,9 +8978,11 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
    }
 
    /* A shader compiled without custom-border emulation keeps what its
-    * emulating twin compiles from, and a G17P fragment shader compiled
-    * without its mesh shader what its mesh twins compile from. */
-   const struct hk_border_source *sources[] = {border, obj->mesh_source};
+    * emulating twin compiles from, a G17P fragment shader compiled without
+    * its mesh shader what its mesh twins compile from, and a fragment shader
+    * with a dynamic feedback loop what its zs_self_dep twin compiles from. */
+   const struct hk_border_source *sources[] = {border, obj->mesh_source,
+                                               obj->fbl_source};
    for (unsigned i = 0; i < ARRAY_SIZE(sources); ++i) {
       if (!sources[i])
          continue;

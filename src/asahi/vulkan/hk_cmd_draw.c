@@ -5858,7 +5858,9 @@ hk_rast_prim(struct hk_cmd_buffer *cmd)
 static struct hk_api_shader *
 hk_bound_fs_obj(struct hk_graphics_state *gfx)
 {
-   return gfx->mesh_fs ? gfx->mesh_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
+   if (gfx->mesh_fs)
+      return gfx->mesh_fs;
+   return gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
 }
 
 static struct hk_shader *
@@ -6555,7 +6557,8 @@ hk_select_mesh_fs(struct hk_cmd_buffer *cmd)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   struct hk_api_shader *fs = gfx->shaders[MESA_SHADER_FRAGMENT];
+   struct hk_api_shader *fs =
+      gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
    struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
    struct hk_api_shader *twin = NULL;
 
@@ -6579,10 +6582,39 @@ hk_select_mesh_fs(struct hk_cmd_buffer *cmd)
    }
 }
 
+/* A fragment shader whose depth/stencil feedback loop is dynamic draws with
+ * its zs_self_dep twin while the loop includes depth or stencil, as a
+ * pipeline created with the depth/stencil feedback-loop flag would. */
+static void
+hk_select_fbl_fs(struct hk_cmd_buffer *cmd)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_api_shader *fs = gfx->shaders[MESA_SHADER_FRAGMENT];
+   struct hk_api_shader *twin = NULL;
+
+   if (fs->fbl_source &&
+       (cmd->vk.dynamic_graphics_state.feedback_loops &
+        (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
+      twin = hk_fbl_twin(hk_cmd_buffer_device(cmd), fs);
+      if (!twin)
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   if (gfx->fbl_fs != twin) {
+      gfx->fbl_fs = twin;
+      gfx->shaders_dirty |= BITFIELD_BIT(MESA_SHADER_FRAGMENT);
+   }
+}
+
 static void
 hk_flush_shaders(struct hk_cmd_buffer *cmd)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if ((gfx->shaders_dirty & BITFIELD_BIT(MESA_SHADER_FRAGMENT)) ||
+       BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+                   MESA_VK_DYNAMIC_ATTACHMENT_FEEDBACK_LOOP_ENABLE))
+      hk_select_fbl_fs(cmd);
+
    if (gfx->shaders_dirty & (BITFIELD_BIT(MESA_SHADER_FRAGMENT) |
                              BITFIELD_BIT(MESA_SHADER_MESH)))
       hk_select_mesh_fs(cmd);

@@ -441,6 +441,10 @@ struct hk_api_shader {
    struct hk_border_source *mesh_source;
    struct hk_mesh_fs_twin *mesh_twins;
 
+   /* Non-NULL for a fragment shader whose depth/stencil feedback loop is only
+    * known at draw time: what its zs_self_dep twin compiles from. */
+   struct hk_border_source *fbl_source;
+
    struct hk_shader variants[];
 };
 
@@ -448,6 +452,12 @@ struct hk_api_shader {
  * on first use. Thread-safe; NULL if it cannot be built. */
 struct hk_api_shader *hk_border_twin(struct hk_device *dev,
                                      struct hk_api_shader *obj);
+
+/* The twin of a fragment shader with a feedback-loop source, compiled for a
+ * depth/stencil feedback loop and built on first use. Thread-safe; NULL if it
+ * cannot be built. */
+struct hk_api_shader *hk_fbl_twin(struct hk_device *dev,
+                                  struct hk_api_shader *obj);
 
 /* The twin of a fragment shader with a mesh source that reads per-primitive
  * inputs from the records of this G17P mesh variant, built on first use.
