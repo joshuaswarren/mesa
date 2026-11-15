@@ -298,6 +298,29 @@ if with_tests
       suite : ['asahi'],
     )
 
+    # The internal-stage launch helper (inline in hk_cmd_buffer.h) with its
+    # launches and barriers recorded.
+    test(
+      'hk_internal_stage_flush',
+      executable(
+        'hk_internal_stage_flush_test',
+        files('tests/test-hk-internal-stage-flush.c'),
+        include_directories : [
+          include_directories('.'),
+          inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
+          inc_virtio_gpu, inc_virtio_vdrm,
+        ],
+        dependencies : [
+          idep_nir_headers, idep_mesautil, idep_libagx,
+          idep_libagx_shaders_h, idep_agx_pack,
+          idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+        ],
+        link_args : [ld_args_gc_sections],
+        gnu_symbol_visibility : 'hidden',
+      ),
+      suite : ['asahi'],
+    )
+
     # Exercise the real resolver; unused command-recording entry points in
     # hk_sync.c need no device implementation in this CPU-only executable.
     test(
