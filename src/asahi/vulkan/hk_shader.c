@@ -5534,6 +5534,28 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
        nir->info.stage == MESA_SHADER_FRAGMENT && !backend_key.no_preamble)
       compiled = hk_g17p_compile_fs_cprog(&nir, &backend_key, shader);
+   /* An M5 compute constant program can need a form the AGX3 packer does not
+    * encode, such as a 16-bit uniform write beside a used uniform half.
+    * Compile such a kernel without its constant program, as M5 runs the
+    * compute variants of graphics stages, rather than refusing the pipeline.
+    * Kernels that compile with one are unchanged. */
+   if (!compiled && m5_compute_cprog && !backend_key.no_preamble) {
+      nir_shader *attempt = nir_shader_clone(NULL, nir);
+      compiled = attempt &&
+                 agx_compile_shader_nir(attempt, &backend_key, &shader->b);
+      if (compiled) {
+         ralloc_free(nir);
+         nir = attempt;
+      } else {
+         mesa_logw("M5 compute constant program failed to compile (%s); "
+                   "compiling without it", agx_last_compile_refusal());
+         ralloc_free(attempt);
+         memset(&shader->b, 0, sizeof(shader->b));
+         backend_key.agx3_native_cprog = false;
+         backend_key.no_preamble = true;
+         backend_key.g17p_uniform_dma = false;
+      }
+   }
    if (!compiled)
       compiled = agx_compile_shader_nir(nir, &backend_key, &shader->b);
 
