@@ -7277,7 +7277,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       bool layout_ok = m5_mesh ? agx_m5_mesh_gather_varyings(nir, &varyings)
                               : agx_gen1_mesh_gather_varyings(nir, &varyings);
       varyings.clip_m1_1 = clip_m1_1 && dev->dev.chip == AGX_CHIP_G17P;
-      if (dev->dev.chip == AGX_CHIP_G17P &&
+      if ((dev->dev.chip == AGX_CHIP_G17P || m5_mesh) &&
           nir->info.mesh.primitive_type == MESA_PRIM_LINES)
          varyings.line_bias_root_B = hk_root_descriptor_offset(line_y_bias);
 

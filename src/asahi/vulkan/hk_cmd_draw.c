@@ -11174,7 +11174,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
-   if (IS_DIRTY(VP_VIEWPORTS) && dev->dev.chip == AGX_CHIP_G17P) {
+   if (IS_DIRTY(VP_VIEWPORTS) &&
+       (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip))) {
       const float height = dyn->vp.viewports[0].height;
       const float bias = height != 0.0f ? 1.0f / (32.0f * height) : 0.0f;
       if (desc->root.line_y_bias != bias) {

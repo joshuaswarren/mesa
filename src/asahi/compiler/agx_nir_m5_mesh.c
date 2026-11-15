@@ -138,6 +138,10 @@ struct mesh_layout {
     * slot (M5_PV_*). */
    bool provoking;
    unsigned slot_map;
+
+   /* Line meshes with a row bias (m5_mesh_line_bias): one byte per API
+    * vertex, nonzero when the vertex ends a line drawn toward +y. */
+   unsigned line_marks;
 };
 
 /* Export slot map word of the provoking-vertex form: the primitive whose
@@ -659,6 +663,112 @@ m5_mesh_rendezvous(nir_builder *b)
                .memory_modes = nir_var_mem_shared);
 }
 
+/* Lines drawn toward +y (agx_m5_mesh_varyings::line_bias_root_B).
+ *
+ * As on G17P (agx_nir_lower_gen1_mesh), the rasterizer puts a line endpoint
+ * that lies exactly on a pixel row boundary into the row above, where
+ * Vulkan's diamond is open, so a line drawn toward +y covers rows one too
+ * high. Move the vertices of such lines a fraction of a pixel toward +y (the
+ * root holds that step in NDC, signed by the viewport's y direction). A
+ * vertex shared with a line drawn the other way moves too; off a boundary
+ * the step changes nothing.
+ *
+ * This moves the API vertices where the body stored them, once the body
+ * and the cull move are done and before anything copies vertex words, so
+ * the private vertices of the private-vertex form and the private
+ * provoking copies of the provoking-vertex form take the moved positions.
+ * Every lane takes part, with a rendezvous between the steps, since SIMD
+ * group 0 can have fewer lanes than there are vertices or primitives; the
+ * rendezvous that follows (unweld copy, provoking epilogue or export)
+ * publishes the last step.
+ */
+static void
+m5_mesh_line_bias(nir_builder *b, const nir_shader *s,
+                  const struct mesh_layout *layout, unsigned root_B)
+{
+   const unsigned max_vertices = s->info.mesh.max_vertices_out;
+   const unsigned max_primitives = s->info.mesh.max_primitives_out;
+   const unsigned lanes = s->info.workgroup_size[0] *
+                          s->info.workgroup_size[1] *
+                          s->info.workgroup_size[2];
+   /* Position y and w of API vertex 0. */
+   const unsigned y_plane = vertex_plane_address(layout, 1);
+   const unsigned w_plane = vertex_plane_address(layout, 3);
+   nir_def *index = nir_load_local_invocation_index(b);
+
+   /* Clear the marks. The body never touches them, so this needs no
+    * rendezvous before it. */
+   const unsigned words = DIV_ROUND_UP(max_vertices, 4);
+   for (unsigned w = 0; w < words; w += lanes) {
+      nir_def *word = nir_iadd_imm(b, index, w);
+      nir_push_if(b, nir_ult_imm(b, word, words));
+      nir_store_shared(b, nir_imm_int(b, 0),
+         nir_iadd_imm(b, nir_imul_imm(b, word, 4), layout->line_marks),
+         .write_mask = 1, .align_mul = 4);
+      nir_pop_if(b, NULL);
+   }
+   m5_mesh_rendezvous(b);
+
+   /* Mark both ends of every kept line drawn toward +y in front of the
+    * eye. */
+   nir_def *bias = nir_load_global_constant(b, 1, 32,
+      nir_iadd_imm(b, nir_load_root_agx(b), root_B),
+      .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+   nir_def *primitives = nir_umin(b, nir_u2u32(b, nir_load_shared(b, 1, 16,
+      nir_imm_int(b, layout->primitive_count), .align_mul = 2)),
+      nir_imm_int(b, max_primitives));
+   for (unsigned base = 0; base < max_primitives; base += lanes) {
+      nir_def *j = nir_iadd_imm(b, index, base);
+      nir_push_if(b, nir_ult(b, j, primitives));
+      nir_def *ends[2], *ndc_y[2], *ok = nir_imm_true(b);
+      for (unsigned c = 0; c < 2; ++c) {
+         /* An out-of-range index stays within the planes and marks. */
+         ends[c] = nir_umin(b, nir_u2u32(b, nir_load_shared(b, 1, 8,
+            nir_iadd_imm(b, nir_imul_imm(b, j, 2), layout->output_base + c),
+            .align_mul = 1)), nir_imm_int(b, max_vertices - 1));
+         nir_def *at = nir_imul_imm(b, ends[c], 4);
+         nir_def *y = nir_load_shared(b, 1, 32, nir_iadd_imm(b, at, y_plane),
+                                      .align_mul = 4);
+         nir_def *w = nir_load_shared(b, 1, 32, nir_iadd_imm(b, at, w_plane),
+                                      .align_mul = 4);
+         ok = nir_iand(b, ok, nir_flt(b, nir_imm_float(b, 0.0f), w));
+         ndc_y[c] = nir_fdiv(b, y, w);
+      }
+      nir_def *toward = nir_flt(b, nir_imm_float(b, 0.0f),
+         nir_fmul(b, nir_fsub(b, ndc_y[1], ndc_y[0]), bias));
+      nir_push_if(b, nir_iand(b, ok, toward));
+      for (unsigned c = 0; c < 2; ++c) {
+         nir_store_shared(b, nir_imm_intN_t(b, 1, 8),
+                          nir_iadd_imm(b, ends[c], layout->line_marks),
+                          .write_mask = 1, .align_mul = 1);
+      }
+      nir_pop_if(b, NULL);
+      nir_pop_if(b, NULL);
+   }
+   m5_mesh_rendezvous(b);
+
+   /* Move every marked API vertex: y += step * w. */
+   nir_def *vertices = nir_umin(b, nir_u2u32(b, nir_load_shared(b, 1, 16,
+      nir_imm_int(b, layout->vertex_count), .align_mul = 2)),
+      nir_imm_int(b, max_vertices));
+   for (unsigned base = 0; base < max_vertices; base += lanes) {
+      nir_def *i = nir_iadd_imm(b, index, base);
+      nir_push_if(b, nir_ult(b, i, vertices));
+      nir_def *marked = nir_u2u32(b, nir_load_shared(b, 1, 8,
+         nir_iadd_imm(b, i, layout->line_marks), .align_mul = 1));
+      nir_push_if(b, nir_ine_imm(b, marked, 0));
+      nir_def *at = nir_imul_imm(b, i, 4);
+      nir_def *y = nir_load_shared(b, 1, 32, nir_iadd_imm(b, at, y_plane),
+                                   .align_mul = 4);
+      nir_def *w = nir_load_shared(b, 1, 32, nir_iadd_imm(b, at, w_plane),
+                                   .align_mul = 4);
+      nir_store_shared(b, nir_ffma(b, bias, w, y), nir_iadd_imm(b, at, y_plane),
+                       .write_mask = 1, .align_mul = 4);
+      nir_pop_if(b, NULL);
+      nir_pop_if(b, NULL);
+   }
+}
+
 /* Per-primitive words on the provoking vertex (mesh_layout_provoking).
  *
  * A native M5 mesh draw takes flat inputs from the vertex its PPP
@@ -933,6 +1043,23 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
    if (provoking ? !layout.export_vertices
                  : layout.output_base + layout.bytes > 32768)
       return false;
+   /* The row bias of lines (m5_mesh_line_bias) leaves the output form and
+    * slot count as they are. The provoking-vertex form keeps its marks in
+    * the slot map, which nothing uses before the epilogue clears it; the
+    * other forms append them where they fit, and export the lines unmoved
+    * where they do not. */
+   bool line_bias = varyings->line_bias_root_B && prim_vertices(s) == 2;
+   if (line_bias && layout.provoking) {
+      assert(layout.export_vertices >= s->info.mesh.max_vertices_out);
+      layout.line_marks = layout.slot_map;
+   } else if (line_bias) {
+      const unsigned marks = ALIGN_POT(s->info.mesh.max_vertices_out, 64);
+      line_bias = layout.output_base + layout.bytes + marks <= 32768;
+      if (line_bias) {
+         layout.line_marks = layout.output_base + layout.bytes;
+         layout.bytes += marks;
+      }
+   }
    unsigned physical_threads=MAX2(threads,MIN2(layout.export_vertices,32));
    bool counts=false;
    nir_foreach_function_impl(impl,s) {
@@ -1154,6 +1281,8 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
          nir_imm_int(&b, layout.primitive_count), .write_mask = 1, .align_mul = 2);
       nir_pop_if(&b, NULL);
    }
+   if (line_bias)
+      m5_mesh_line_bias(&b, s, &layout, varyings->line_bias_root_B);
    if (layout.unweld) {
       /* Per-primitive words have no native vertex form here. Give every
        * primitive private vertices: copy each referenced vertex's
