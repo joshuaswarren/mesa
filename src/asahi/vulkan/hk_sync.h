@@ -87,10 +87,10 @@ enum hk_sync_kind {
     * alias other resources, and in its pre- and post-graphics streams; a
     * render without any of those writes only its attachments, which a later
     * pre-rasterization stage can read only through an image (HK_SYNC_GFX_IMG).
-    * Every stream of another kind is counted too. On M5 a dependency from
-    * graphics work to pre-rasterization stages orders a render's vertex half
-    * only after the latest such stream on the render subqueue
-    * (hk_sync_barrier()). */
+    * Every stream of another kind is counted too. On M5 and G17P a
+    * dependency from graphics work to pre-rasterization stages orders a
+    * render's vertex half only after the latest such stream on the render
+    * subqueue (hk_sync_barrier()). */
    HK_SYNC_GFX_MEM = 1 << 5,
 };
 
@@ -359,6 +359,9 @@ struct hk_sync_queue {
    uint64_t submitted[HK_SYNC_NUM_SQ];
    uint64_t last_absolute[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    uint64_t tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
+   /* G17P: the largest whole render prefix of a render submitted without
+    * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS (hk_drm_g17p_tiling_ordered()). */
+   uint64_t ta_cover;
 
    /* Tile hazards across submissions: a ring of the footprints recently
     * submitted on this queue. An entry is live until the queue timeline

@@ -1015,6 +1015,107 @@ test_pass_software_graphics_dependencies(void)
  * command belongs to the first command buffer that emits a stream: chaining
  * onto a subqueue with no earlier command gives the kernel a barrier it
  * rejects with EINVAL. */
+/* G17P, like M5: a dependency from graphics to every stage (Kyty records
+ * ALL_COMMANDS -> ALL_COMMANDS for guest flushes) orders the next render's
+ * vertex half only after renders that wrote memory other than their
+ * attachments; its fragment half waits on everything. Other chips keep the
+ * whole dependency for both halves. */
+static void
+test_g17p_vertex_after_memory_writers(void)
+{
+   for (unsigned writes = 0; writes < 2; ++writes) {
+      struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G17P, true);
+      struct hk_cs *writer = add(cmd, false);
+      hk_sync_note_memory_write(cmd, writer);
+      hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+      struct hk_cs *plain = add(cmd, false);
+      if (writes)
+         hk_sync_note_memory_write(cmd, plain);
+      hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+      struct hk_cs *next = add(cmd, false);
+      T("G17P fragment half waits on the previous render",
+        next->sync.dep[HK_SYNC_VDM].cut == plain);
+      T("G17P vertex half waits on the latest memory writer",
+        next->sync.dep_ta[HK_SYNC_VDM].cut == (writes ? plain : writer));
+      struct hk_queue *queue = new_queue(true);
+      T("G17P memory-writer submit", submit(queue, cmd));
+      T("G17P resolved vertex half",
+        next->sync.barrier[HK_SYNC_VDM] == 2 &&
+        next->sync.barrier_ta[HK_SYNC_VDM] == (writes ? 2 : 1) &&
+        next->sync.ta_split == !writes);
+
+      /* The requirement carried into a later submission (the second
+       * barrier's) narrows the same way. */
+      struct hk_cmd_buffer *later = timestamp_cmd(AGX_CHIP_G17P, true);
+      struct hk_cs *carried = add(later, false);
+      T("G17P carried submit", submit(queue, later));
+      T("G17P carried vertex half",
+        carried->sync.prior[HK_SYNC_VDM] == 2 &&
+        carried->sync.prior_ta[HK_SYNC_VDM] == (writes ? 2 : 1));
+   }
+
+   /* A render whose attachments can alias other memory writes memory with
+    * its loads and stores alone: a draw-less clear or resolve. */
+   struct hk_cmd_buffer *clear = timestamp_cmd(AGX_CHIP_G17P, true);
+   clear->state.gfx.render.m5_attachments_reach_memory = true;
+   struct hk_cs *cleared = add(clear, false);
+   clear->state.gfx.render.m5_attachments_reach_memory = false;
+   hk_sync_barrier(clear, HK_SYNC_ALL, HK_SYNC_ALL);
+   struct hk_cs *after_clear = add(clear, false);
+   T("G17P aliasing attachments without a draw count as a memory writer",
+     (cleared->sync.kind & HK_SYNC_GFX_MEM) &&
+     after_clear->sync.dep_ta[HK_SYNC_VDM].cut == cleared);
+
+   struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G15S, true);
+   struct hk_cs *plain = add(cmd, false);
+   hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+   struct hk_cs *next = add(cmd, false);
+   T("other chips: vertex half keeps the whole dependency",
+     next->sync.dep_ta[HK_SYNC_VDM].cut == plain);
+}
+
+/* G17P tiling order: a render whose whole prefix holds the latest earlier
+ * render may leave a vertex requirement the earlier tiling kicks already
+ * covered to the fragment half. Writer W (ordinal 1), plain P (2), reader R
+ * (3): P's vertex half needs W, which no tiling kick covered yet; R's needs W
+ * too, which P's tiling kick (submitted with its whole prefix) covers. */
+static void
+test_g17p_tiling_order(void)
+{
+   T("render prefix of the header barrier",
+     hk_drm_render_prefix(10, 2, 0) == 12 &&
+     hk_drm_render_prefix(10, 0, 0) == 10 &&
+     hk_drm_render_prefix(10, DRM_ASAHI_BARRIER_NONE, 7) == 7 &&
+     hk_drm_render_prefix(10, 1, 12) == 12 &&
+     hk_drm_render_prefix(10, DRM_ASAHI_BARRIER_NONE, 0) == 0);
+
+   uint64_t cover = 0;
+   /* W: no render dependency. */
+   T("no render prefix is never fragment-ordered",
+     !hk_drm_g17p_tiling_ordered(0, 0, 0, 0, false, &cover) && cover == 0);
+   /* P: whole 1, vertex 1. */
+   T("vertex half naming an uncovered render keeps the prefix",
+     !hk_drm_g17p_tiling_ordered(0, 1, 1, 1, false, &cover));
+   T("a render without the flag raises the cover", cover == 1);
+   /* R: whole 2, vertex 1. */
+   uint64_t c = cover;
+   T("vertex half covered by earlier tiling",
+     hk_drm_g17p_tiling_ordered(0, 2, 2, 1, false, &c) && c == 1);
+   c = cover;
+   T("vertex half naming the previous render keeps the prefix",
+     !hk_drm_g17p_tiling_ordered(0, 2, 2, 2, false, &c) && c == 2);
+   c = cover;
+   T("whole prefix without the latest earlier render keeps the prefix",
+     !hk_drm_g17p_tiling_ordered(0, 2, 1, 0, false, &c) && c == 1);
+   c = cover;
+   T("an already flagged render leaves the cover",
+     hk_drm_g17p_tiling_ordered(0, 2, 2, 2, true, &c) && c == 1);
+   c = 39;
+   T("ordinals across submissions",
+     hk_drm_g17p_tiling_ordered(40, 0, 40, 39, false, &c) && c == 39 &&
+     !hk_drm_g17p_tiling_ordered(40, 0, 40, 40, false, &c) && c == 40);
+}
+
 /* G17P image barriers order a render's vertex half only once it draws with a
  * pre-rasterization shader that reads images (HK_SYNC_GFX_IMG). */
 static void
@@ -1409,6 +1510,8 @@ main(void)
    test_loaded_color_preservation();
    test_pass_software_graphics_dependencies();
    test_image_barrier_vertex_class();
+   test_g17p_vertex_after_memory_writers();
+   test_g17p_tiling_order();
    test_chain_first_skips_empty_buffers();
    test_rt_kernel_gate();
    test_timestamp_execution_scopes();

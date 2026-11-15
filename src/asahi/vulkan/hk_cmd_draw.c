@@ -1777,9 +1777,17 @@ static void
 hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   /* G17P publishes no render resources. hk_flush_gfx_state() has already
+    * added the memory writes of every bound program to the stream. */
+   if (dev->dev.chip == AGX_CHIP_G17P) {
+      if (cs->m5_shader_writes_memory || gfx->xfb_enabled ||
+          gfx->render.m5_attachments_reach_memory)
+         hk_sync_note_memory_write(cmd, cs);
+      return;
+   }
    if (!agx_chip_g17_m5(dev->dev.chip))
       return;
-   struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_shader *vs = hk_bound_hw_vs(gfx);
    struct hk_linked_shader *linked_vs = vs && vs->only_linked
       ? vs->only_linked : gfx->linked[MESA_SHADER_VERTEX];
@@ -13276,6 +13284,7 @@ hk_record_mesh_launch(struct hk_cmd_buffer *cmd, uint32_t draw_id)
    cs->stats.calls++;
    hk_upload_stat(cmd, draws, 1);
    hk_note_pre_raster_images(cmd, cs);
+   hk_m5_note_render_resources(cmd, cs);
    cs->stats.cmds++;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
    gfx->dirty = gfx->shaders_dirty = gfx->linked_dirty = 0;
