@@ -1490,8 +1490,8 @@ pick_collect_affinity(struct ra_ctx *rctx, agx_instr *I, unsigned d,
  * RGBA8 payload, `collect(fltnorm, fltnorm)` whose halves already sit in an
  * aligned pair inside the bank, that forced a parallel copy: one extra MOV in
  * front of every LSTCOL, on the fragment's critical tail. Apple's G17P
- * fragments store the FLTNORM pair directly (fs-apple.bin +0x198/+0x1a8:
- * fltnorm r2h, pixwait, lstcol r2).
+ * fragments store the FLTNORM pair directly: FLTNORM writes one half of the
+ * payload pair in place, then PIXWAIT, then LSTCOL stores the pair, no MOV.
  *
  * Try the ordinary collect/move affinity first, but accept it only when the
  * whole region is free, aligned, and inside [dest_minimum, dest_limit). This
