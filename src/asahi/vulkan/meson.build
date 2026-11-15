@@ -667,7 +667,9 @@ if with_tests
     link_args : [ld_args_gc_sections, hk_wrap_test_link_args,
       '-Wl,--wrap=agx_bo_bind', '-Wl,--wrap=agx_bo_cache_evict_all',
       '-Wl,--wrap=agx_bo_export',
-      '-Wl,--wrap=hk_get_cgroup_memory_available', '-Wl,--wrap=__vk_errorf']),
+      '-Wl,--wrap=hk_get_cgroup_memory_available', '-Wl,--wrap=__vk_errorf',
+      '-Wl,--wrap=os_get_available_system_memory',
+      '-Wl,--wrap=os_get_total_physical_memory']),
     suite : ['asahi'])
   test('hk_tes_query', executable('hk_tes_query_test', files('tests/test-hk-tes-query.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
