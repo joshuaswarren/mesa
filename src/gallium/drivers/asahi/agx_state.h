@@ -564,6 +564,12 @@ struct agx_encoder {
  * two 64K-primitive draws); 64K passed. Keep a margin below that. */
 #define AGX_G17G_RENDER_PRIMS (32 * 1024)
 
+/* Primitives per G17G render of draws without a tessellation stage. 512K
+ * small depth-tested triangles in one render draw the image the split
+ * renders draw, at 1024x1024 and at 3456x2160, on an M5 Pro; more has not
+ * been tried. */
+#define AGX_G17G_RENDER_PRIMS_PLAIN (512 * 1024)
+
 struct agx_batch {
    struct agx_context *ctx;
    struct pipe_framebuffer_state key;
@@ -582,6 +588,9 @@ struct agx_batch {
 
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;
+   /* G17G: this render holds the output of a tessellation stage and keeps
+    * to AGX_G17G_RENDER_PRIMS. */
+   bool g17g_small_budget;
 
    struct agx_tilebuffer_layout tilebuffer_layout;
 
@@ -983,6 +992,10 @@ struct agx_context {
     * (agx_g17g_mrt_one_pass). */
    bool g17g_mrt_spill;
 
+   /* Whether the bound framebuffer's spilled attachments can be described
+    * (agx_g17g_mrt_spills_encodable), once it has been worked out. */
+   bool g17g_mrt_spills_known, g17g_mrt_spills_ok;
+
    /* G17G renders one layer at a time (agx_g17g_bind_layer): while a draw
     * or clear of a layered framebuffer is split, the bound framebuffer holds
     * one layer's views. g17g_layered_fb is the application's framebuffer
@@ -1207,6 +1220,10 @@ void agx_g17g_layered_clear(struct agx_context *ctx, unsigned buffers,
                             uint8_t stencil_clear_mask,
                             const union pipe_color_union *color,
                             double depth, unsigned stencil);
+bool agx_g17g_level_renderable(struct agx_context *ctx,
+                               struct pipe_resource *prsc,
+                               enum pipe_format format, unsigned level,
+                               unsigned layer);
 void agx_g17g_split_mrt_clear(struct agx_context *ctx, unsigned buffers,
                               uint32_t color_clear_mask,
                               uint8_t stencil_clear_mask,

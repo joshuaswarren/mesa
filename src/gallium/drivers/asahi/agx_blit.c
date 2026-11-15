@@ -517,7 +517,9 @@ agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
          (struct pipe_sampler_view **)ctx->stage[MESA_SHADER_FRAGMENT].textures);
    }
 
-   if (!(op & ASAHI_DISABLE_RENDER_COND)) {
+   /* Saving the condition is what lets u_blitter turn it off for the
+    * operation and restore it afterwards. */
+   if (op & ASAHI_DISABLE_RENDER_COND) {
       util_blitter_save_render_condition(blitter,
                                          (struct pipe_query *)ctx->cond_query,
                                          ctx->cond_cond, ctx->cond_mode);
@@ -1040,12 +1042,20 @@ agx_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
                              src_level, src_box);
 }
 
-/* G17G: generate mipmaps on the CPU. The blitter renders into the levels
- * above the base, which the native PBE profile refuses (only level 0 of a
- * single-level 2D target is proven), so those batches were dropped while
- * the generation reported success. Box-filter 2x2 (2x2x2 for 3D) in float
- * through texture maps; sRGB unpacks to linear and packs back. Returning
- * false leaves compressed, integer and depth formats to the generic path.
+/* G17G: generate mipmaps on the CPU where the GPU cannot. The blitter
+ * renders into the levels above the base, and a render whose target the
+ * native PBE profile refuses is dropped while the generation reports
+ * success. Box-filter 2x2 (2x2x2 for 3D) in float through texture maps;
+ * sRGB unpacks to linear and packs back. Returning false leaves compressed,
+ * integer and depth formats to the generic path.
+ *
+ * The profile does take a level of a 2D texture (a one-level image at the
+ * level's offset, agx_batch_upload_pbe_internal), and then the blitter is
+ * the right tool: the CPU path waits for the GPU, reads the base level back
+ * and uploads every level, 74 ms for a 3456x2160 RGBA8 texture on an M5 Pro
+ * against 1 ms rendered. Such a texture goes to the generic path when every
+ * level it would render into passes a dry run of that PBE.
+ * ASAHI_M5_CPU_MIPMAP=1 keeps the CPU path, for comparison.
  */
 bool
 agx_generate_mipmap_g17g(struct pipe_context *pctx, struct pipe_resource *prsc,
@@ -1062,6 +1072,18 @@ agx_generate_mipmap_g17g(struct pipe_context *pctx, struct pipe_resource *prsc,
        util_format_is_depth_or_stencil(format) || prsc->nr_samples > 1 ||
        !unpack || !unpack->unpack_rgba || !pack || !pack->pack_rgba_float)
       return false;
+
+   if (prsc->target == PIPE_TEXTURE_2D &&
+       !debug_get_bool_option("ASAHI_M5_CPU_MIPMAP", false)) {
+      bool renderable = true;
+      for (unsigned level = base_level + 1;
+           level <= last_level && renderable; ++level) {
+         renderable = agx_g17g_level_renderable(agx_context(pctx), prsc,
+                                                format, level, 0);
+      }
+      if (renderable)
+         return false;
+   }
 
    const bool is_3d = prsc->target == PIPE_TEXTURE_3D;
    const unsigned bs = util_format_get_blocksize(format);

@@ -425,6 +425,7 @@ agx_batch_init(struct agx_context *ctx,
    batch->draws_refused = 0;
    batch->draws = 0;
    batch->g17g_prims = 0;
+   batch->g17g_small_budget = false;
    batch->incoherent_writes = false;
    agx_bo_unreference(dev, batch->sampler_heap.bo);
    batch->sampler_heap.bo = NULL;

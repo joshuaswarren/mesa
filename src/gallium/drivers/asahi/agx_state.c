@@ -1489,6 +1489,7 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
       return;
 
    util_copy_framebuffer_state(&ctx->framebuffer, state);
+   ctx->g17g_mrt_spills_known = false;
 
    /* The frontend still reads and resolves the window's multisample colour
     * attachment. G17G/G18G's direct EOT resolve only writes the single-sample
@@ -2272,6 +2273,36 @@ agx_batch_upload_pbe(struct agx_batch *batch,
 {
    return agx_batch_upload_pbe_internal(batch, out, view, block_access,
       arrays_as_2d, force_2d_array, emrt, false, NULL);
+}
+
+/*
+ * Whether a render into one level and layer of a texture can be stored: a
+ * dry run of the end-of-tile PBE the tile program would use
+ * (agx_build_native_g17g_bg_eot). A render whose PBE has no encoding is
+ * dropped while the draw reports success, so callers that can do the work
+ * another way ask first.
+ */
+bool
+agx_g17g_level_renderable(struct agx_context *ctx, struct pipe_resource *prsc,
+                          enum pipe_format format, unsigned level,
+                          unsigned layer)
+{
+   /* The packer only reads the device through the batch. */
+   struct agx_batch scratch = {.ctx = ctx};
+   struct agx_gallium_pbe_descriptor pbe;
+   struct pipe_image_view view = {
+      .resource = prsc,
+      .format = util_format_linear(format),
+      .access = PIPE_IMAGE_ACCESS_READ_WRITE,
+      .shader_access = PIPE_IMAGE_ACCESS_READ_WRITE,
+      .u.tex.single_layer_view = true,
+      .u.tex.first_layer = layer,
+      .u.tex.last_layer = layer,
+      .u.tex.level = level,
+   };
+
+   return agx_batch_upload_pbe(&scratch, &pbe, &view, true, true, false,
+                               false);
 }
 
 /* Likewise constant buffers, textures, and samplers are handled in a common
@@ -14433,6 +14464,7 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
       batch = agx_get_batch(ctx);
       /* Still a render of its own (agx_draw_vbo()). */
       batch->g17g_prims = AGX_G17G_RENDER_PRIMS;
+      batch->g17g_small_budget = true;
    }
 
    agx_batch_init_state(batch);
@@ -14986,7 +15018,62 @@ agx_g17g_split_mrt_draw(struct agx_context *ctx,
  * and the others are spilled, loaded and stored by the fragments as images
  * (agx_build_tilebuffer_layout_rt0_resident). Single-sample only, and
  * attachment 0 must exist to be the resident one.
+ *
+ * Every other draw runs in one pass too when its spilled attachments can be
+ * described (agx_g17g_mrt_spills_encodable). The split costs far more than
+ * the repeated draw: its passes share the depth attachment, the first
+ * writing it and the others testing against it, so each pass flushes the
+ * batch of the one before and every application draw becomes a render per
+ * attachment. ASAHI_M5_MRT_SPLIT=1 keeps the split for those draws.
  */
+
+/* The fragment shader addresses at most four attachments as images: with
+ * more, attachments 4 and up keep their old contents (piglit
+ * bound-resource-limits, arb_texture_barrier-blending-in-shader with eight
+ * textures). */
+#define AGX_G17G_ONE_PASS_MAX_CBUFS 4
+
+/*
+ * Whether each attachment has the texture and PBE descriptors the fragments
+ * load and store the spilled ones through
+ * (agx_upload_spilled_rt_descriptors). A
+ * batch with one that has none is dropped whole, so such a framebuffer
+ * keeps the split.
+ */
+static bool
+agx_g17g_mrt_spills_encodable(struct agx_context *ctx)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   const enum agx_descriptor_generation generation =
+      agx_gallium_descriptor_generation(dev->chip);
+   /* The packers only read the device through the batch. */
+   struct agx_batch scratch = {.ctx = ctx};
+
+   if (ctx->framebuffer.nr_cbufs > AGX_G17G_ONE_PASS_MAX_CBUFS)
+      return false;
+
+   /* Attachment 0 too: the table holds an entry for every attachment. */
+   for (unsigned rt = 0; rt < ctx->framebuffer.nr_cbufs; ++rt) {
+      const struct pipe_surface *surf = &ctx->framebuffer.cbufs[rt];
+      if (!surf->texture)
+         continue;
+
+      struct agx_gallium_texture_descriptor texture;
+      struct agx_gallium_pbe_descriptor pbe;
+      struct pipe_image_view view = image_view_for_surface(surf);
+      struct pipe_sampler_view sampler_view = sampler_view_for_surface(surf);
+      sampler_view.target = PIPE_TEXTURE_2D_ARRAY;
+
+      if (!agx_pack_texture(generation, &texture, agx_resource(surf->texture),
+                            surf->format, &sampler_view) ||
+          !agx_batch_upload_pbe_internal(&scratch, &pbe, &view, false, false,
+                                         true, true, false, NULL))
+         return false;
+   }
+
+   return true;
+}
+
 static bool
 agx_g17g_mrt_one_pass(struct agx_context *ctx)
 {
@@ -14998,8 +15085,18 @@ agx_g17g_mrt_one_pass(struct agx_context *ctx)
        util_framebuffer_get_num_layers(&ctx->framebuffer) > 1)
       return false;
 
-   return (vs && vs->info.writes_memory) ||
-          (fs && (fs->info.writes_memory || fs->info.uses_fbfetch));
+   if ((vs && vs->info.writes_memory) ||
+       (fs && (fs->info.writes_memory || fs->info.uses_fbfetch)))
+      return true;
+
+   if (debug_get_bool_option("ASAHI_M5_MRT_SPLIT", false))
+      return false;
+
+   if (!ctx->g17g_mrt_spills_known) {
+      ctx->g17g_mrt_spills_ok = agx_g17g_mrt_spills_encodable(ctx);
+      ctx->g17g_mrt_spills_known = true;
+   }
+   return ctx->g17g_mrt_spills_ok;
 }
 
 static void
@@ -15469,9 +15566,16 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
 
    /* A G17G render holds a bounded number of primitives: two million
     * tessellated triangles in one render timed out and left the GPU dead
-    * (tessellation.invariance). Start a new render past the budget. */
+    * (tessellation.invariance). Start a new render past the budget.
+    *
+    * The small budget is for the output of a tessellation stage, where the
+    * timeouts were seen, on the GPU or on the CPU (agx_swtnl.c). A render of
+    * plain draws takes AGX_G17G_RENDER_PRIMS_PLAIN: every render started for
+    * the budget loads and stores the whole framebuffer again.
+    * ASAHI_M5_RENDER_PRIMS sets another budget for those, for comparison. */
    const bool g17g_budget =
       agx_chip_g17_m5(agx_device(pctx->screen)->chip) && !indirect;
+   const bool g17g_small = info->mode == MESA_PRIM_PATCHES || ctx->swtnl_inner;
    /* A tessellated draw's output count is unknown here: give it a render of
     * its own. */
    const uint64_t prims =
@@ -15482,11 +15586,16 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
                                                      draws->count) *
               info->instance_count;
    if (g17g_budget && ctx->batch && ctx->batch->g17g_prims &&
-       ctx->batch->g17g_prims + prims > AGX_G17G_RENDER_PRIMS)
+       ctx->batch->g17g_prims + prims >
+          (g17g_small || ctx->batch->g17g_small_budget
+              ? AGX_G17G_RENDER_PRIMS
+              : debug_get_num_option("ASAHI_M5_RENDER_PRIMS",
+                                     AGX_G17G_RENDER_PRIMS_PLAIN)))
       agx_flush_batch_for_reason(ctx, ctx->batch, "G17G primitive budget");
 
    struct agx_batch *batch = agx_get_batch(ctx);
    batch->g17g_prims += prims;
+   batch->g17g_small_budget |= g17g_budget && g17g_small;
    uint64_t ib = 0;
    size_t ib_extent = 0;
 
