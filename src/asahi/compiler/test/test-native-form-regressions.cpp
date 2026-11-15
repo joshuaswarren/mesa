@@ -4601,14 +4601,13 @@ TEST(NativeForms, M5MeshPrimitiveDeclarationsRespectWrittenMask)
             .src_type = nir_type_float32,
             .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
       }
-      EXPECT_EQ(agx_nir_lower_m5_mesh_triangle_probe(b.shader), !written);
-      if (written) {
-         EXPECT_EQ(b.shader->info.shared_size, 0u);
-         EXPECT_EQ(b.shader->info.workgroup_size[0], 1u);
-      } else {
-         EXPECT_EQ(b.shader->info.shared_size, 4928u);
-         nir_validate_shader(b.shader, "mesh unused primitive declaration");
-      }
+      /* A written per-primitive word would need 768 private vertices; the
+       * provoking vertex carries it instead (mesh_layout_provoking): 784
+       * index and count bytes, 8 planes of 256 slots, then the slot map. */
+      ASSERT_TRUE(agx_nir_lower_m5_mesh_triangle_probe(b.shader));
+      EXPECT_EQ(b.shader->info.shared_size, written ? 10048u : 4928u);
+      EXPECT_EQ(b.shader->info.mesh.max_vertices_out, 256u);
+      nir_validate_shader(b.shader, "mesh primitive declaration");
       ralloc_free(b.shader);
    }
 }
@@ -5930,6 +5929,160 @@ TEST(NativeForms, M5MeshPerPrimitiveRefusalsLeaveShaderUntouched)
    ASSERT_TRUE(agx_nir_lower_m5_mesh(s,&v));
    EXPECT_EQ(s->info.mesh.max_vertices_out,255u);
    nir_validate_shader(s,"mesh 85 primitives");ralloc_free(s);
+}
+
+/* A mesh of `locations` per-primitive uvec4 words whose private vertices
+ * do not fit: the shapes of mesh_shader.ext.smoke.*_lib (256 triangles),
+ * misc.max_lines (255 lines) and properties.max_mesh_output_size_*_per_primitive
+ * (96 points, 19 locations). */
+static nir_shader *
+m5_mesh_provoking_shader(mesa_prim primitive, unsigned vertices,
+                         unsigned primitives, unsigned locations, bool cull)
+{
+   const unsigned corners =
+      primitive == MESA_PRIM_POINTS ? 1 : primitive == MESA_PRIM_LINES ? 2 : 3;
+   const bool points = primitive == MESA_PRIM_POINTS;
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, &agx_nir_options, "mesh provoking words");
+   b.shader->info.io_lowered = true;
+   b.shader->info.workgroup_size[0] = 1;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.mesh.max_vertices_out = vertices;
+   b.shader->info.mesh.max_primitives_out = primitives;
+   b.shader->info.mesh.primitive_type = primitive;
+   const uint64_t words = BITFIELD64_RANGE(VARYING_SLOT_VAR0, locations);
+   b.shader->info.outputs_written = VARYING_BIT_POS |
+      VARYING_BIT_PRIMITIVE_INDICES | words | (points ? VARYING_BIT_PSIZ : 0) |
+      (cull ? VARYING_BIT_CULL_PRIMITIVE : 0);
+   b.shader->info.per_primitive_outputs = VARYING_BIT_PRIMITIVE_INDICES | words |
+      (cull ? VARYING_BIT_CULL_PRIMITIVE : 0);
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, vertices),
+                                      nir_imm_int(&b, primitives), nir_imm_int(&b, 0));
+   nir_store_per_vertex_output(&b, nir_imm_vec4(&b, 0, 0, 0, 1), lane,
+      nir_imm_int(&b, 0), .write_mask = 15, .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   if (points)
+      nir_store_per_vertex_output(&b, nir_imm_float(&b, 1), lane,
+         nir_imm_int(&b, 0), .write_mask = 1, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
+   nir_def *index[3] = {lane, nir_iadd_imm(&b, lane, 1), nir_iadd_imm(&b, lane, 2)};
+   nir_store_per_primitive_output(&b, nir_vec(&b, index, corners), lane,
+      nir_imm_int(&b, 0), .write_mask = BITFIELD_MASK(corners),
+      .src_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES, .num_slots = 1});
+   for (unsigned l = 0; l < locations; ++l) {
+      nir_store_per_primitive_output(&b, nir_imm_ivec4(&b, l, 1, 2, 3), lane,
+         nir_imm_int(&b, 0), .write_mask = 15, .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0 + l, .num_slots = 1});
+   }
+   if (cull)
+      nir_store_per_primitive_output(&b, nir_imm_false(&b), lane,
+         nir_imm_int(&b, 0), .write_mask = 1, .src_type = nir_type_bool1,
+         .io_semantics = {.location = VARYING_SLOT_CULL_PRIMITIVE, .num_slots = 1});
+   return b.shader;
+}
+
+static bool
+m5_test_provoking_last(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   if (i->intrinsic != nir_intrinsic_load_provoking_last)
+      return false;
+   b->cursor = nir_before_instr(&i->instr);
+   nir_def_replace(&i->def, nir_imm_int(b, *(const bool *)data ? -1 : 0));
+   return true;
+}
+
+/* Per-primitive words on the provoking vertex: the export slots are the API
+ * vertices plus private provoking copies, the threadgroup memory holds each
+ * per-primitive word once, and a line or triangle mesh reads the provoking
+ * selector from the draw (load_provoking_last). */
+TEST(NativeForms, M5MeshProvokingVertexCarriesPrimitiveWords)
+{
+   const struct {
+      mesa_prim primitive;
+      unsigned vertices, primitives, locations;
+      bool cull;
+      unsigned slots, shared;
+   } rows[] = {
+      /* 784 index/count bytes, 8 planes x 256 slots, 1 KiB slot map. */
+      {MESA_PRIM_TRIANGLES, 256, 256, 1, false, 256, 10048},
+      /* The same, then 256 cull bytes. */
+      {MESA_PRIM_TRIANGLES, 256, 256, 1, true, 256, 10304},
+      /* 528 index/count bytes, 8 planes x 256 slots, slot map. */
+      {MESA_PRIM_LINES, 256, 255, 1, false, 256, 9792},
+      /* 112 index/count bytes, 81 planes x 96 slots, slot map; private
+       * vertices would need 62336 bytes. No room for private copies. */
+      {MESA_PRIM_POINTS, 96, 96, 19, false, 96, 31616},
+   };
+   for (const auto &r : rows) {
+      for (bool last : {false, true}) {
+         nir_shader *s = m5_mesh_provoking_shader(r.primitive, r.vertices,
+            r.primitives, r.locations, r.cull);
+         struct agx_m5_mesh_varyings v;
+         ASSERT_TRUE(agx_m5_mesh_gather_varyings(s, &v));
+         EXPECT_FALSE(v.lv);
+         EXPECT_EQ(v.cull_primitive, r.cull);
+         v.dynamic = false;
+         ASSERT_TRUE(agx_nir_lower_m5_mesh(s, &v)) << r.primitive;
+         EXPECT_EQ(s->info.mesh.max_vertices_out, r.slots);
+         EXPECT_EQ(s->info.shared_size, r.shared);
+         EXPECT_EQ(s->info.workgroup_size[0], 32u);
+         nir_validate_shader(s, "mesh provoking words");
+         unsigned provoking = 0, uvst = 0, uvb = 0;
+         nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+            nir_foreach_instr(in, block) {
+               if (in->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+               EXPECT_NE(i->intrinsic, nir_intrinsic_store_per_primitive_output);
+               EXPECT_NE(i->intrinsic, nir_intrinsic_store_per_vertex_output);
+               EXPECT_NE(i->intrinsic, nir_intrinsic_load_mesh_primitive_storage_agx);
+               provoking += i->intrinsic == nir_intrinsic_load_provoking_last;
+               uvb += i->intrinsic == nir_intrinsic_allocate_mesh_uvb_agx;
+               uvst += i->intrinsic == nir_intrinsic_store_mesh_uvb_agx &&
+                       !nir_intrinsic_flags(i);
+            }
+         }
+         /* A point is its own provoking vertex. */
+         EXPECT_EQ(provoking, r.primitive == MESA_PRIM_POINTS ? 0u : 1u);
+         EXPECT_EQ(uvb, 1u);
+         EXPECT_EQ(uvst, DIV_ROUND_UP(r.slots, 32) * v.size);
+         NIR_PASS(_, s, nir_shader_intrinsics_pass, m5_test_provoking_last,
+                  nir_metadata_control_flow, &last);
+         agx_preprocess_nir_m5(s);
+         agx_shader_key key = {};
+         key.dev.chip = AGX_CHIP_G17S;
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.no_preamble = true;
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(s, &key, &part))
+            << agx_last_compile_refusal();
+         free(part.binary);
+         ralloc_free(s);
+      }
+   }
+}
+
+/* Shapes whose private vertices fit keep them, with no provoking selector:
+ * 85 triangles (255 private vertices) of per-primitive words. */
+TEST(NativeForms, M5MeshFittingPrimitiveWordsKeepPrivateVertices)
+{
+   nir_shader *s = m5_mesh_provoking_shader(MESA_PRIM_TRIANGLES, 256, 85, 1, false);
+   struct agx_m5_mesh_varyings v;
+   ASSERT_TRUE(agx_m5_mesh_gather_varyings(s, &v));
+   ASSERT_TRUE(agx_nir_lower_m5_mesh(s, &v));
+   EXPECT_EQ(s->info.mesh.max_vertices_out, 255u);
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(in, block) {
+         if (in->type == nir_instr_type_intrinsic) {
+            EXPECT_NE(nir_instr_as_intrinsic(in)->intrinsic,
+                      nir_intrinsic_load_provoking_last);
+         }
+      }
+   }
+   nir_validate_shader(s, "mesh fitting primitive words");
+   ralloc_free(s);
 }
 
 TEST(NativeForms, M5MeshPrimitiveIdIsAPrimitiveWord)
