@@ -10374,7 +10374,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       if (byte_indices)
          NIR_PASS(_, nir, agx_nir_lower_subgroups_g17p);
       else if (m5)
-         NIR_PASS(_, nir, agx_nir_lower_subgroups_m5, !g18_scans);
+         NIR_PASS(_, nir, agx_nir_lower_subgroups_m5, !g18_scans, !g18_scans);
       else
          NIR_PASS(_, nir, agx_nir_lower_subgroups);
    }
@@ -13869,7 +13869,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    if (g17p)
       NIR_PASS(_, nir, agx_nir_lower_subgroups_g17p);
    else if (m5)
-      NIR_PASS(_, nir, agx_nir_lower_subgroups_m5, !g18g);
+      NIR_PASS(_, nir, agx_nir_lower_subgroups_m5, !g18g, !g18g);
    else
       NIR_PASS(_, nir, agx_nir_lower_subgroups);
    NIR_PASS(_, nir, nir_lower_all_phis_to_scalar);
