@@ -2500,9 +2500,15 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    /* Two application dispatches in a row need no barrier between them: drop
     * the previous one's weak tail, which nothing else has followed or
-    * strengthened, and let this launch's own tail end the stream instead. */
+    * strengthened, and let this launch's own tail end the stream instead.
+    * As on M5, a kernel with a large per-thread scratch frame keeps its
+    * barrier. */
    const bool app_dispatch =
       (!cmd->in_meta && s && s->info.stage == MESA_SHADER_COMPUTE &&
+       linked &&
+       MAX3(s->b.info.scratch_size, linked->b.scratch_size,
+            linked->b.agx3_spectpr_scratch_size) <=
+          HK_M5_OVERLAP_MAX_SCRATCH_B &&
        agx_chip_elide_app_dispatch_barrier(dev->dev.chip)) ||
       /* An acceleration-structure build orders every launch that depends on
        * another with a pipeline barrier, which strengthens the earlier

@@ -523,12 +523,13 @@ agx_chip_cdm_wide_visibility(enum agx_chip chip)
  * flush, link, stream end) still follows a barrier.  On the M5 Max (G17C)
  * the barrier holds the next launch until every kernel launched before it
  * has finished; without it the threadgroups of consecutive launches run
- * side by side.  G17G and G17S keep the barrier: the change is not measured
- * there. */
+ * side by side.  The M4 Pro (G17P) takes the same rule.  G17G and G17S keep
+ * the barrier: the change is not measured there. */
 static inline bool
 agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
 {
-   return agx_chip_native_g15(chip) || chip == AGX_CHIP_G17C;
+   return agx_chip_native_g15(chip) || chip == AGX_CHIP_G17C ||
+          chip == AGX_CHIP_G17P;
 }
 
 /* Number of helper-table slots in the USC code-container lead block.  G15
