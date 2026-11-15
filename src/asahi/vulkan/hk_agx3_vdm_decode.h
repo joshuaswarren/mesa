@@ -27,9 +27,10 @@ extern "C" {
 /* AGX3 moves to 37 when M5 binaries begin to keep the NIR of uniform-colour
  * blended fragment shaders, to 38 when agx_shader_info gains
  * needs_full_quads, to 39 when G17P payloads record the fragment
- * twins of unlinked mesh shaders, and to 42 when unlinked G17P vertex
- * shaders over the canonical size carry relocatable varying writes. */
-#define HK_AGX3_SHADER_BINARY_VERSION 42u
+ * twins of unlinked mesh shaders, to 42 when unlinked G17P vertex
+ * shaders over the canonical size carry relocatable varying writes, and to 43
+ * when agx_shader_info gains launch_size. */
+#define HK_AGX3_SHADER_BINARY_VERSION 43u
 #define HK_CLASSIC_SHADER_BINARY_VERSION 34u
 /* AGX2 image-acquire binaries now include memory-to-texture visibility. */
 #define HK_AGX2_SHADER_BINARY_VERSION 36u

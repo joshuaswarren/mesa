@@ -285,6 +285,11 @@ struct agx_shader_info {
    /* Workgroup size */
    uint16_t workgroup_size[3];
 
+   /* Hardware workgroup size for a direct launch in groups: workgroup_size, or
+    * the smaller shape of agx_nir_lower_workgroup_split(). Zero (not set by
+    * the driver) means workgroup_size. */
+   uint16_t launch_size[3];
+
    /* Exact AGX3 direct-launch ShaderInfo producers. Resource-info queries
     * come from NIR. Every backend lowering which emits a ray traversal/query
     * opcode must set uses_ray_traversal as well; ray_queries alone is not a

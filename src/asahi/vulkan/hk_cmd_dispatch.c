@@ -2847,6 +2847,16 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
       grid.count[2] *= local_size.z;
    }
 
+   /* The grid in threads is the same for any workgroup shape: a direct
+    * launch of a shader whose builtins do not depend on the hardware
+    * workgroup uses its smaller hardware workgroup
+    * (agx_nir_lower_workgroup_split). */
+   if (!agx_is_indirect(grid) && !in_threads && s->b.info.launch_size[0]) {
+      local_size = agx_workgroup(s->b.info.launch_size[0],
+                                 s->b.info.launch_size[1],
+                                 s->b.info.launch_size[2]);
+   }
+
    if (cs->g18_dispatch_sealed) {
       cs = hk_cmd_buffer_get_cs(cmd, true);
       if (!cs)

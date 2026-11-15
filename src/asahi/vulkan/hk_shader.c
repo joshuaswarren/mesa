@@ -5516,6 +5516,16 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       }
    }
 
+   /* An M4 Pro API compute shader that shares nothing across its workgroup
+    * may launch its big workgroups as smaller hardware workgroups
+    * (agx_nir_lower_workgroup_split, hk dispatch_grid). Measured on T6040
+    * only, so A18 Pro keeps the API shape. */
+   uint16_t launch_size[3] = {0};
+   if (agx_is_m4_pro(&dev->dev) && sw_stage == MESA_SHADER_COMPUTE &&
+       nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
+       agx_workgroup_split_size(nir, launch_size))
+      NIR_PASS(_, nir, agx_nir_lower_workgroup_split, launch_size);
+
    /* G17P hardware vertex programs (API VS, GS raster and native TES
     * variants) run per-draw uniform work once in a native vertex constant
     * program, as Apple's compiler does: e.g. ProjMat * ModelViewMat. */
@@ -5574,6 +5584,12 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                        "AGX backend cannot encode shader for %s",
                        agx_chip_name(dev->dev.chip));
    }
+
+   /* hk_lower_nir() already cleared info.ray_queries; the ray context of a
+    * traversal shader is built for the API workgroup size, so keep it. The
+    * rewritten builtins are exact for that size too. */
+   if (launch_size[0] && !shader->b.info.uses_ray_traversal)
+      memcpy(shader->b.info.launch_size, launch_size, sizeof(launch_size));
 
    shader->code_ptr = shader->b.binary;
    shader->code_size = shader->b.info.binary_size;
