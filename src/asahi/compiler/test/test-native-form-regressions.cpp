@@ -6085,6 +6085,149 @@ TEST(NativeForms, M5MeshFittingPrimitiveWordsKeepPrivateVertices)
    ralloc_free(s);
 }
 
+static bool
+m5_test_root_address(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   (void)data;
+   if (i->intrinsic != nir_intrinsic_load_root_agx)
+      return false;
+   b->cursor = nir_before_instr(&i->instr);
+   nir_def_replace(&i->def, nir_imm_int64(b, 0x100000));
+   return true;
+}
+
+struct m5_line_bias_counts {
+   unsigned roots, root_B, fdiv, ffma, rendezvous;
+};
+
+static m5_line_bias_counts
+m5_test_line_bias_counts(nir_shader *s)
+{
+   m5_line_bias_counts n = {};
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(in, block) {
+         if (in->type == nir_instr_type_alu) {
+            n.fdiv += nir_instr_as_alu(in)->op == nir_op_fdiv;
+            n.ffma += nir_instr_as_alu(in)->op == nir_op_ffma;
+            continue;
+         }
+         if (in->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+         n.rendezvous += i->intrinsic == nir_intrinsic_barrier &&
+                         nir_intrinsic_execution_scope(i) == SCOPE_WORKGROUP;
+         if (i->intrinsic != nir_intrinsic_load_root_agx)
+            continue;
+         n.roots++;
+         nir_foreach_use(use, &i->def) {
+            nir_alu_instr *add = nir_instr_as_alu(nir_src_use_instr(use));
+            EXPECT_EQ(add->op, nir_op_iadd);
+            for (unsigned k = 0; k < 2; ++k) {
+               if (nir_src_is_const(add->src[k].src))
+                  n.root_B = nir_src_as_uint(add->src[k].src);
+            }
+         }
+      }
+   }
+   return n;
+}
+
+/* Lines drawn toward +y move by the root's row step (m5_mesh_line_bias) in
+ * every output form, which stays as it is: the same slot count, and the
+ * same threadgroup memory but for the mark bytes. The welded and
+ * private-vertex forms append one mark byte per API vertex; the
+ * provoking-vertex form of misc.max_lines (255 lines of a per-primitive
+ * colour) keeps them in its slot map. */
+TEST(NativeForms, M5MeshLineRowBias)
+{
+   const unsigned root_B = 0x2f4;
+   const struct {
+      unsigned vertices, primitives, locations;
+      bool cull;
+      unsigned slots, marks, shared;
+   } rows[] = {
+      /* Welded: no per-primitive words. */
+      {256, 255, 0, false, 256, 256, 0},
+      /* 64 private vertices, cull bytes, then the marks. */
+      {64, 32, 1, true, 64, 64, 0},
+      /* misc.max_lines: 9792 bytes with or without the bias. */
+      {256, 255, 1, false, 256, 0, 9792},
+   };
+   for (const auto &r : rows) {
+      for (bool last : {false, true}) {
+         nir_shader *plain = m5_mesh_provoking_shader(MESA_PRIM_LINES,
+            r.vertices, r.primitives, r.locations, r.cull);
+         nir_shader *s = m5_mesh_provoking_shader(MESA_PRIM_LINES,
+            r.vertices, r.primitives, r.locations, r.cull);
+         struct agx_m5_mesh_varyings v;
+         ASSERT_TRUE(agx_m5_mesh_gather_varyings(plain, &v));
+         v.dynamic = false;
+         ASSERT_TRUE(agx_nir_lower_m5_mesh(plain, &v));
+         ASSERT_TRUE(agx_m5_mesh_gather_varyings(s, &v));
+         v.dynamic = false;
+         v.line_bias_root_B = root_B;
+         ASSERT_TRUE(agx_nir_lower_m5_mesh(s, &v)) << r.locations;
+         nir_validate_shader(s, "mesh line row bias");
+         EXPECT_EQ(s->info.mesh.max_vertices_out, r.slots);
+         EXPECT_EQ(plain->info.mesh.max_vertices_out, r.slots);
+         EXPECT_EQ(s->info.shared_size, plain->info.shared_size + r.marks);
+         if (r.shared) {
+            EXPECT_EQ(s->info.shared_size, r.shared);
+         }
+         EXPECT_EQ(s->info.workgroup_size[0], plain->info.workgroup_size[0]);
+         /* One root load at the given offset and two more rendezvous. The
+          * passes are unrolled per workgroup-sized chunk, as gen1's are per
+          * 32 lanes: two NDC divisions per chunk of primitives and one move
+          * per chunk of vertices. */
+         const unsigned lanes = s->info.workgroup_size[0] *
+                                s->info.workgroup_size[1] *
+                                s->info.workgroup_size[2];
+         ASSERT_GT(lanes, 0u);
+         const m5_line_bias_counts a = m5_test_line_bias_counts(plain);
+         const m5_line_bias_counts n = m5_test_line_bias_counts(s);
+         EXPECT_EQ(a.roots, 0u);
+         EXPECT_EQ(n.roots, 1u);
+         EXPECT_EQ(n.root_B, root_B);
+         EXPECT_EQ(n.fdiv, a.fdiv + 2 * DIV_ROUND_UP(r.primitives, lanes));
+         EXPECT_EQ(n.ffma, a.ffma + DIV_ROUND_UP(r.vertices, lanes));
+         EXPECT_EQ(n.rendezvous, a.rendezvous + 2);
+         ralloc_free(plain);
+         NIR_PASS(_, s, nir_shader_intrinsics_pass, m5_test_root_address,
+                  nir_metadata_control_flow, NULL);
+         NIR_PASS(_, s, nir_shader_intrinsics_pass, m5_test_provoking_last,
+                  nir_metadata_control_flow, &last);
+         agx_preprocess_nir_m5(s);
+         agx_shader_key key = {};
+         key.dev.chip = AGX_CHIP_G17S;
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.no_preamble = true;
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(s, &key, &part))
+            << agx_last_compile_refusal();
+         free(part.binary);
+         ralloc_free(s);
+      }
+   }
+   /* Triangles and points take no row bias: they lower as without it. */
+   for (auto primitive : {MESA_PRIM_TRIANGLES, MESA_PRIM_POINTS}) {
+      nir_shader *plain = m5_mesh_provoking_shader(primitive, 96, 32, 1, false);
+      nir_shader *s = m5_mesh_provoking_shader(primitive, 96, 32, 1, false);
+      struct agx_m5_mesh_varyings v;
+      ASSERT_TRUE(agx_m5_mesh_gather_varyings(plain, &v));
+      ASSERT_TRUE(agx_nir_lower_m5_mesh(plain, &v));
+      ASSERT_TRUE(agx_m5_mesh_gather_varyings(s, &v));
+      v.line_bias_root_B = root_B;
+      ASSERT_TRUE(agx_nir_lower_m5_mesh(s, &v)) << primitive;
+      EXPECT_EQ(s->info.shared_size, plain->info.shared_size);
+      EXPECT_EQ(s->info.mesh.max_vertices_out, plain->info.mesh.max_vertices_out);
+      EXPECT_EQ(m5_test_line_bias_counts(s).roots, 0u);
+      EXPECT_EQ(m5_test_line_bias_counts(s).rendezvous,
+                m5_test_line_bias_counts(plain).rendezvous);
+      ralloc_free(plain);
+      ralloc_free(s);
+   }
+}
+
 TEST(NativeForms, M5MeshPrimitiveIdIsAPrimitiveWord)
 {
    /* A mesh-written gl_PrimitiveID is a flat user word of the primitive's

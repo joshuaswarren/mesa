@@ -46,8 +46,8 @@ struct agx_m5_mesh_varyings {
    /* G17P: remap position z from [-w, w] at the export
     * (agx_nir_lower_gen1_mesh), whatever the shape of the position stores. */
    bool clip_m1_1;
-   /* G17P lines: root byte offset of the signed line row bias (0: none),
-    * see agx_nir_lower_gen1_mesh. */
+   /* G17P and M5 lines: root byte offset of the signed line row bias
+    * (0: none), see agx_nir_lower_gen1_mesh and m5_mesh_line_bias. */
    uint16_t line_bias_root_B;
 };
 

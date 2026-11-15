@@ -288,8 +288,8 @@ struct hk_root_descriptor_table {
    /* G17P: which launch of a mesh draw this is (HK_MESH_LAUNCH_WGS). */
    uint32_t mesh_launch;
 
-   /* G17P mesh lines: 1/64 pixel along +y in NDC for viewport 0, signed by
-    * its y direction (agx_nir_lower_gen1_mesh). */
+   /* G17P and M5 mesh lines: 1/64 pixel along +y in NDC for viewport 0,
+    * signed by its y direction (agx_nir_lower_gen1_mesh, m5_mesh_line_bias). */
    float line_y_bias;
 
    /* G17P mesh-only draw: nonzero when the draw's grid is known at recording
