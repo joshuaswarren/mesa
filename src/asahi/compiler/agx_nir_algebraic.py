@@ -447,6 +447,48 @@ fold_selected_f2i32 = [
      ('f2i32', ('bcsel', a, b, c))),
 ]
 
+# A sign-extended byte converted to float: (x << (24 - 8k)) >> 24 is three
+# instructions on M5 (insert, arithmetic shift, word conversion). int2flt has a
+# signed-byte form that reads the low eight bits of a half register, so convert
+# the byte from the half that holds it: free for bytes 0 and 2 of a word, one
+# 16-bit shift for bytes 1 and 3 of a word. The emitter feeds the conversion
+# the u2u8's source directly (agx_emit_alu, i2f of an 8-bit value).
+fold_byte_to_float = []
+for conv in ['i2f32', 'i2f16']:
+    fold_byte_to_float.extend([
+        ((conv, ('ishr', ('ishl', ('u2u32', 'a@16'), 24), 24)),
+         (conv, ('u2u8', a))),
+        ((conv, ('ishr', ('ishl', ('u2u32', 'a@16'), 16), 24)),
+         (conv, ('u2u8', ('ushr', a, 8)))),
+        ((conv, ('ishr', ('ishl', 'a@32', 24), 24)),
+         (conv, ('u2u8', ('unpack_32_2x16_split_x', a)))),
+        ((conv, ('ishr', ('ishl', 'a@32', 16), 24)),
+         (conv, ('u2u8', ('ushr', ('unpack_32_2x16_split_x', a), 8)))),
+        ((conv, ('ishr', ('ishl', 'a@32', 8), 24)),
+         (conv, ('u2u8', ('unpack_32_2x16_split_y', a)))),
+        ((conv, ('ibitfield_extract', 'a@32', 0, 8)),
+         (conv, ('u2u8', ('unpack_32_2x16_split_x', a)))),
+        ((conv, ('ibitfield_extract', 'a@32', 8, 8)),
+         (conv, ('u2u8', ('ushr', ('unpack_32_2x16_split_x', a), 8)))),
+        ((conv, ('ibitfield_extract', 'a@32', 16, 8)),
+         (conv, ('u2u8', ('unpack_32_2x16_split_y', a)))),
+    ])
+
+# The same for unsigned bytes 0 and 2 of a word ((x >> 8k) & 0xff: an AND or
+# a bitfield extract, then a word conversion), into the unsigned-byte form of
+# int2flt (float32 results only). Bytes 1 and 3 cost two either way.
+fold_ubyte_to_float = [
+    (('u2f32', ('iand', ('u2u32', 'a@16'), 0xff)), ('u2f32', ('u2u8', a))),
+    (('u2f32', ('iand', 'a@32', 0xff)),
+     ('u2f32', ('u2u8', ('unpack_32_2x16_split_x', a)))),
+    (('u2f32', ('iand', ('ushr', 'a@32', 16), 0xff)),
+     ('u2f32', ('u2u8', ('unpack_32_2x16_split_y', a)))),
+    (('u2f32', ('ubitfield_extract', 'a@32', 0, 8)),
+     ('u2f32', ('u2u8', ('unpack_32_2x16_split_x', a)))),
+    (('u2f32', ('ubitfield_extract', 'a@32', 16, 8)),
+     ('u2f32', ('u2u8', ('unpack_32_2x16_split_y', a)))),
+]
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--import-path', required=True)
@@ -499,6 +541,10 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
                                       fold_extract16_bfe).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_doubled_add",
                                       fuse_doubled_add).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_fold_byte_to_float",
+                                      fold_byte_to_float).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_fold_ubyte_to_float",
+                                      fold_ubyte_to_float).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fold_d3d_float_to_int",
                                       fold_d3d_float_to_int).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_algebraic_late",
