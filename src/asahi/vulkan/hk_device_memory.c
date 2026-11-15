@@ -20,11 +20,43 @@
 
 #include "asahi/lib/agx_device.h"
 #include "util/log.h"
+#include "util/os_misc.h"
 
 #include <errno.h>
 #include <inttypes.h>
 #include <string.h>
 #include <sys/mman.h>
+
+/* GPU memory is system memory that the kernel cannot evict or swap, and
+ * heapBudget is only advisory, so the heap limit alone lets a process (or
+ * several) take every free page and invoke the OOM killer on the desktop.
+ * Refuse an allocation of 1 MiB or more that would leave less than
+ * max(1 GiB, 2% of RAM) available. Applications that allocate per tensor
+ * (tens of MiB per call) are covered. Smaller allocations always pass:
+ * below the reserve every vkAllocateMemory would fail, including ones the
+ * compositor needs.
+ */
+#define HK_MEMORY_RESERVE_MIN   (1ull << 30)
+#define HK_MEMORY_CHECK_MIN     (1ull << 20)
+
+static bool
+hk_system_memory_fits(uint64_t size)
+{
+   uint64_t available, total;
+
+   if (size < HK_MEMORY_CHECK_MIN)
+      return true;
+
+   /* If the kernel does not tell us, only the heap limit applies. */
+   if (!os_get_available_system_memory(&available))
+      return true;
+
+   uint64_t reserve = HK_MEMORY_RESERVE_MIN;
+   if (os_get_total_physical_memory(&total))
+      reserve = MAX2(reserve, total / 50);
+
+   return available >= size + reserve;
+}
 
 /* Supports opaque fd only */
 const VkExternalMemoryProperties hk_opaque_fd_mem_props = {
@@ -356,6 +388,16 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          flags |= AGX_BO_NO_CACHE;
       if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
          flags |= AGX_BO_WRITEBACK;
+
+      /* A BO from the cache allocates nothing new. If the kernel purged it
+       * meanwhile, one allocation can still pass the check. */
+      if (!hk_system_memory_fits(aligned_size) &&
+          !agx_bo_cache_has(&dev->dev, aligned_size, 64 * 1024, flags)) {
+         result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                            "Not enough free system memory for %" PRIu64
+                            " MiB", aligned_size >> 20);
+         goto fail_alloc;
+      }
 
       /* D3D12 promises 64 KiB alignment for heap addresses, and this costs
        * only virtual address space. */

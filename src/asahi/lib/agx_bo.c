@@ -152,6 +152,16 @@ agx_bo_cache_advise_willneed(struct agx_device *dev, struct agx_bo *bo)
    return retained;
 }
 
+/* Whether a cached BO can serve this request. Never hand out more than 2x
+ * oversized BOs. */
+static bool
+agx_bo_cache_entry_fits(const struct agx_bo *entry, size_t size, size_t align,
+                        uint32_t flags)
+{
+   return entry->size >= size && entry->flags == flags &&
+          entry->size <= 2 * size && align <= entry->align;
+}
+
 struct agx_bo *
 agx_bo_cache_fetch(struct agx_device *dev, size_t size, size_t align,
                    uint32_t flags, const bool dontwait)
@@ -165,14 +175,7 @@ agx_bo_cache_fetch(struct agx_device *dev, size_t size, size_t align,
 
    /* Iterate the bucket looking for something suitable */
    list_for_each_entry_safe(struct agx_bo, entry, bucket, bucket_link) {
-      if (entry->size < size || entry->flags != flags)
-         continue;
-
-      /* Do not return more than 2x oversized BOs. */
-      if (entry->size > 2 * size)
-         continue;
-
-      if (align > entry->align)
+      if (!agx_bo_cache_entry_fits(entry, size, align, flags))
          continue;
 
       agx_bo_cache_remove_locked(dev, entry);
@@ -201,6 +204,29 @@ agx_bo_cache_fetch(struct agx_device *dev, size_t size, size_t align,
    }
 
    return bo;
+}
+
+/* Whether agx_bo_create() would be served from the cache, without taking the
+ * BO. Advisory: another thread can take it first. Mirrors the size and
+ * alignment rounding of agx_bo_create(). */
+bool
+agx_bo_cache_has(struct agx_device *dev, size_t size, size_t align,
+                 uint32_t flags)
+{
+   size = ALIGN_POT(size, AIL_PAGESIZE);
+   align = MAX2(align, AIL_PAGESIZE);
+
+   simple_mtx_lock(&dev->bo_cache.lock);
+   bool found = false;
+   list_for_each_entry(struct agx_bo, entry, agx_bucket(dev, size, flags),
+                       bucket_link) {
+      if (agx_bo_cache_entry_fits(entry, size, align, flags)) {
+         found = true;
+         break;
+      }
+   }
+   simple_mtx_unlock(&dev->bo_cache.lock);
+   return found;
 }
 
 static void
