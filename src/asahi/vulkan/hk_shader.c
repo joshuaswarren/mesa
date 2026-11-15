@@ -8170,15 +8170,16 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                   BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32), 0);
    }
 
-   /* The same holds for an M5 mesh shader, and there it decides whether the
-    * pipeline can be built at all: agx_nir_lower_m5_mesh gives every
-    * primitive private vertices when a per-primitive user word is written
-    * (agx_m5_mesh_unwelds), and refuses once corners * max_primitives
-    * exceeds the 256 vertices its 8-bit index bytes can name. A fragmentless
-    * triangle mesh declaring max_primitives=256 with a per-primitive colour
-    * (dEQP-VK.mesh_shader.ext.smoke.monolithic.
-    * mesh_shader_triangle_rasterization_disabled) needs 768 and was refused
-    * for a word nothing reads. Layer, viewport, primitive ID, clip and cull
+   /* The same holds for an M5 mesh shader, and there it also decides the
+    * output form: agx_nir_lower_m5_mesh gives every primitive private
+    * vertices when a per-primitive user word is written
+    * (agx_m5_mesh_unwelds), and once corners * max_primitives exceeds the
+    * 256 vertices its 8-bit index bytes can name it carries the words on
+    * provoking vertices instead (mesh_layout_provoking), with a serial pass
+    * per workgroup. A fragmentless triangle mesh declaring max_primitives=256
+    * with a per-primitive colour (dEQP-VK.mesh_shader.ext.smoke.monolithic.
+    * mesh_shader_triangle_rasterization_disabled) needs neither for a word
+    * nothing reads. Layer, viewport, primitive ID, clip and cull
     * words stay: they are not in VAR0..VAR31. A shader that reads its
     * outputs back is left alone (the lowering refuses those regardless). */
    if (agx_chip_g17_m5(dev->dev.chip) && shader_count > 0 &&

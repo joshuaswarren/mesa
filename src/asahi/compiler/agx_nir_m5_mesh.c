@@ -130,7 +130,22 @@ struct mesh_layout {
    unsigned primitive_source, primitive_stride;
    int16_t layer_plane, viewport_plane;
    int16_t vertex_plane[M5_MESH_MAX_PLANES], primitive_plane[M5_MESH_MAX_PLANES];
+
+   /* Per-primitive words on the provoking vertex (mesh_layout_provoking):
+    * the export region holds the API vertices in place, then private
+    * provoking vertices; the body stages primitive j's words in the
+    * primitive planes of export slot j. slot_map holds one word per export
+    * slot (M5_PV_*). */
+   bool provoking;
+   unsigned slot_map;
 };
+
+/* Export slot map word of the provoking-vertex form: the primitive whose
+ * words the slot takes plus one (0: none), the API vertex a private
+ * provoking vertex copies, and whether the slot is such a copy. */
+#define M5_PV_PRIMITIVE_MASK 0xffffu
+#define M5_PV_VERTEX_SHIFT   16
+#define M5_PV_COPY           (1u << 24)
 
 /* Index bytes per primitive. Native G17G point and line witnesses
  * (lane-mesh/cwit-meshtopo mpt/mln) store one and two packed index bytes per
@@ -228,6 +243,75 @@ mesh_layout(const nir_shader *s, const struct agx_m5_mesh_varyings *varyings)
    layout.primitive_source = base + primitive_source;
    layout.bytes = ALIGN_POT(primitive_source +
                             primitive_planes * layout.primitive_stride, 64);
+   return layout;
+}
+
+/* The provoking-vertex form of per-primitive user and primitive ID words,
+ * for meshes whose private vertices do not fit (agx_nir_lower_m5_mesh).
+ * Export slot k holds API vertex k in place, so per-vertex stores land
+ * where the non-per-primitive layout puts them, and the body stages
+ * primitive j's words in the primitive planes of slot j; slots past the
+ * API vertices take private provoking vertices. The slot count is the
+ * largest that fits the threadgroup memory, between max(vertices,
+ * primitives) and min(256, vertices + primitives). export_vertices is 0
+ * when even the smallest does not fit. Layer and viewport words are not
+ * taken: they keep the private-vertex form. */
+static struct mesh_layout
+mesh_layout_provoking(const nir_shader *s,
+                      const struct agx_m5_mesh_varyings *varyings)
+{
+   const unsigned base = ALIGN_POT(s->info.shared_size, 64);
+   const unsigned max_vertices = s->info.mesh.max_vertices_out;
+   const unsigned max_primitives = s->info.mesh.max_primitives_out;
+   const unsigned count = ALIGN_POT(prim_vertices(s) * max_primitives, 16);
+   const unsigned position = count + 16;
+   const unsigned cull_bytes =
+      varyings->cull_primitive ? ALIGN_POT(max_primitives, 64) : 0;
+   struct mesh_layout layout = {
+      .output_base = base, .primitive_count = base + count,
+      .vertex_count = base + count + 4, .position = base + position,
+      .planes = varyings->size,
+      .storage_probe = getenv("ASAHI_MESH_PP_PROBE") != NULL &&
+                       (!strcmp(getenv("ASAHI_MESH_PP_PROBE"), "1") ||
+                        !strcmp(getenv("ASAHI_MESH_PP_PROBE"), "payload")),
+      .varyings = varyings,
+      .layer_plane = -1, .viewport_plane = -1,
+      .provoking = true,
+   };
+   const unsigned smallest = ALIGN_POT(MAX2(max_vertices, max_primitives), 4);
+   const unsigned largest = MIN2(256, ALIGN_POT(max_vertices + max_primitives, 4));
+   for (unsigned slots = largest; slots >= smallest; slots -= 4) {
+      /* Planes, then one map word per slot, then the cull bytes. */
+      const unsigned map = position + varyings->size * 4 * slots;
+      const unsigned cull = ALIGN_POT(map + 4 * slots, 64);
+      if (base + cull + cull_bytes <= 32768) {
+         layout.export_vertices = slots;
+         layout.plane_stride = 4 * slots;
+         layout.slot_map = base + map;
+         layout.cull = varyings->cull_primitive ? base + cull : 0;
+         layout.bytes = cull + cull_bytes;
+         break;
+      }
+   }
+   for (unsigned plane = 0; plane < M5_MESH_MAX_PLANES; ++plane)
+      layout.vertex_plane[plane] = layout.primitive_plane[plane] = -1;
+   for (unsigned plane = 0; plane < MIN2(varyings->size, M5_MESH_MAX_PLANES); ++plane) {
+      bool primitive = false;
+      for (unsigned slot = 0; slot < 64; ++slot) {
+         primitive |= varyings->primitive_comps[slot] &&
+                      plane >= varyings->first[slot] &&
+                      plane < varyings->first[slot] + varyings->components[slot];
+      }
+      /* Primitive words are addressed through primitive_source and
+       * primitive_stride like the private-vertex form, here the export
+       * planes themselves. */
+      if (primitive)
+         layout.primitive_plane[plane] = plane;
+      else
+         layout.vertex_plane[plane] = plane;
+   }
+   layout.primitive_source = layout.position;
+   layout.primitive_stride = layout.plane_stride;
    return layout;
 }
 
@@ -566,6 +650,216 @@ varyings_valid(const struct agx_m5_mesh_varyings *v)
    return user + 4 + lv + v->clip_distance_count == v->size;
 }
 
+static void
+m5_mesh_rendezvous(nir_builder *b)
+{
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_shared);
+}
+
+/* Per-primitive words on the provoking vertex (mesh_layout_provoking).
+ *
+ * A native M5 mesh draw takes flat inputs from the vertex its PPP
+ * flat-shading selector names, the draw's provoking vertex (see the native
+ * mesh note at fields.flat_shading_vertex in hk_cmd_draw.c), and the draw
+ * root carries the same selector (load_provoking_last). Per-primitive words
+ * are flat inputs (agx_nir_lower_m5_mesh_fragment), so only the provoking
+ * vertex of a primitive needs them; its other corners keep naming API
+ * vertices, whose vertex words every copy shares.
+ *
+ * In primitive order, invocation 0 gives every primitive a provoking export
+ * slot: the API vertex itself when no earlier primitive took it or took it
+ * with the same words; otherwise the next slot past the API vertices, a
+ * private copy of that vertex, which the primitive's provoking index byte
+ * then names. SIMD group 0 then copies the vertex words of the private
+ * copies and moves into every slot the primitive words staged at the slot
+ * of its primitive, one plane at a time: all lanes read before a rendezvous
+ * and write after it, so no move reads a word another move replaced.
+ * Primitive order, winding and interpolated values are unchanged. Once the
+ * slots run out, a primitive keeps the shared provoking vertex and with it
+ * the words of the primitive that took the vertex first.
+ */
+static void
+m5_mesh_provoking_epilogue(nir_builder *b, const nir_shader *s,
+                           nir_function_impl *impl,
+                           const struct mesh_layout *layout)
+{
+   const unsigned corners = prim_vertices(s);
+   const unsigned max_vertices = s->info.mesh.max_vertices_out;
+   const unsigned max_primitives = s->info.mesh.max_primitives_out;
+   const unsigned slots = layout->export_vertices;
+   const unsigned lanes = s->info.workgroup_size[0] *
+                          s->info.workgroup_size[1] *
+                          s->info.workgroup_size[2];
+   unsigned primitive_planes[M5_MESH_MAX_PLANES], vertex_planes[M5_MESH_MAX_PLANES];
+   unsigned np = 0, nv = 0;
+   for (unsigned plane = 0; plane < MIN2(layout->planes, M5_MESH_MAX_PLANES); ++plane) {
+      if (layout->primitive_plane[plane] >= 0)
+         primitive_planes[np++] = plane;
+      else
+         vertex_planes[nv++] = plane;
+   }
+
+   /* Every API output store (and cull move) is done: clear the slot map. */
+   m5_mesh_rendezvous(b);
+   nir_def *index = nir_load_local_invocation_index(b);
+   for (unsigned w = 0; w < slots; w += lanes) {
+      nir_def *slot = nir_iadd_imm(b, index, w);
+      nir_push_if(b, nir_ult_imm(b, slot, slots));
+      nir_store_shared(b, nir_imm_int(b, 0),
+         nir_iadd_imm(b, nir_imul_imm(b, slot, 4), layout->slot_map),
+         .write_mask = 1, .align_mul = 4);
+      nir_pop_if(b, NULL);
+   }
+   m5_mesh_rendezvous(b);
+
+   nir_variable *jv = nir_local_variable_create(impl, glsl_uint_type(), "pv_j");
+   nir_variable *kv = nir_local_variable_create(impl, glsl_uint_type(), "pv_k");
+   nir_push_if(b, nir_ieq_imm(b, index, 0));
+   {
+      nir_def *primitives = nir_umin(b, nir_u2u32(b, nir_load_shared(b, 1, 16,
+         nir_imm_int(b, layout->primitive_count), .align_mul = 2)),
+         nir_imm_int(b, max_primitives));
+      nir_def *vertices = nir_umin(b, nir_u2u32(b, nir_load_shared(b, 1, 16,
+         nir_imm_int(b, layout->vertex_count), .align_mul = 2)),
+         nir_imm_int(b, max_vertices));
+      /* An out-of-range index names the last API vertex, never a copy. */
+      nir_def *last = nir_iadd_imm(b, nir_umax(b, vertices, nir_imm_int(b, 1)), -1);
+      nir_def *corner = nir_imm_int(b, 0);
+      if (corners > 1) {
+         corner = nir_bcsel(b, nir_ine_imm(b, nir_load_provoking_last(b), 0),
+                            nir_imm_int(b, corners - 1), corner);
+      }
+      nir_store_var(b, jv, nir_imm_int(b, 0), 1);
+      nir_store_var(b, kv, vertices, 1);
+      nir_push_loop(b);
+      {
+         nir_def *j = nir_load_var(b, jv);
+         nir_break_if(b, nir_uge(b, j, primitives));
+         nir_def *at = nir_iadd(b, nir_imul_imm(b, j, corners),
+                                nir_iadd_imm(b, corner, layout->output_base));
+         nir_def *vertex = nir_umin(b, nir_u2u32(b, nir_load_shared(b, 1, 8, at,
+            .align_mul = 1)), last);
+         nir_def *entry = nir_iadd_imm(b, nir_imul_imm(b, vertex, 4),
+                                       layout->slot_map);
+         nir_def *owner = nir_iand_imm(b, nir_load_shared(b, 1, 32, entry,
+            .align_mul = 4), M5_PV_PRIMITIVE_MASK);
+         nir_def *tag = nir_iadd_imm(b, j, 1);
+         nir_push_if(b, nir_ieq_imm(b, owner, 0));
+         {
+            nir_store_shared(b, tag, entry, .write_mask = 1, .align_mul = 4);
+         }
+         nir_push_else(b, NULL);
+         {
+            nir_def *mine = nir_imul_imm(b, j, 4);
+            nir_def *theirs = nir_imul_imm(b, nir_iadd_imm(b, owner, -1), 4);
+            nir_def *same = nir_imm_true(b);
+            for (unsigned q = 0; q < np; ++q) {
+               const unsigned base = layout->primitive_source +
+                                     layout->primitive_stride * primitive_planes[q];
+               same = nir_iand(b, same, nir_ieq(b,
+                  nir_load_shared(b, 1, 32, nir_iadd_imm(b, mine, base), .align_mul = 4),
+                  nir_load_shared(b, 1, 32, nir_iadd_imm(b, theirs, base), .align_mul = 4)));
+            }
+            nir_def *k = nir_load_var(b, kv);
+            nir_push_if(b, nir_iand(b, nir_inot(b, same), nir_ult_imm(b, k, slots)));
+            {
+               nir_store_shared(b, nir_ior_imm(b, nir_ior(b, tag,
+                  nir_ishl_imm(b, vertex, M5_PV_VERTEX_SHIFT)), M5_PV_COPY),
+                  nir_iadd_imm(b, nir_imul_imm(b, k, 4), layout->slot_map),
+                  .write_mask = 1, .align_mul = 4);
+               nir_store_shared(b, nir_u2u8(b, k), at, .write_mask = 1,
+                                .align_mul = 1);
+               nir_store_var(b, kv, nir_iadd_imm(b, k, 1), 1);
+            }
+            nir_pop_if(b, NULL);
+         }
+         nir_pop_if(b, NULL);
+         nir_store_var(b, jv, nir_iadd_imm(b, j, 1), 1);
+      }
+      nir_pop_loop(b, NULL);
+      /* The exported vertex count: API vertices plus private copies. */
+      nir_store_shared(b, nir_u2u16(b, nir_load_var(b, kv)),
+         nir_imm_int(b, layout->vertex_count), .write_mask = 1, .align_mul = 2);
+   }
+   nir_pop_if(b, NULL);
+   m5_mesh_rendezvous(b);
+
+   /* SIMD group 0, slot lane + 32t: move[t] is the byte offset of the
+    * staging slot whose primitive words the slot takes, or ~0. Step 0
+    * copies vertex words and reads the first primitive plane; step n
+    * writes plane n - 1 and reads plane n, which no write of the step
+    * touches. */
+   const unsigned batches = DIV_ROUND_UP(slots, 32);
+   nir_variable *move[256 / 32], *word[256 / 32];
+   assert(batches <= ARRAY_SIZE(move));
+   for (unsigned t = 0; t < batches; ++t) {
+      move[t] = nir_local_variable_create(impl, glsl_uint_type(), "pv_move");
+      word[t] = nir_local_variable_create(impl, glsl_uint_type(), "pv_word");
+   }
+   for (unsigned step = 0; step <= np; ++step) {
+      nir_push_if(b, nir_ieq_imm(b, nir_load_subgroup_id(b), 0));
+      nir_def *lane = nir_load_subgroup_invocation(b);
+      nir_def *exported = step == 0 ? nir_u2u32(b, nir_load_shared(b, 1, 16,
+         nir_imm_int(b, layout->vertex_count), .align_mul = 2)) : NULL;
+      for (unsigned t = 0; t < batches; ++t) {
+         nir_def *slot = nir_iadd_imm(b, lane, 32 * t);
+         nir_def *target = nir_imul_imm(b, slot, 4);
+         if (step == 0) {
+            nir_store_var(b, move[t], nir_imm_int(b, -1), 1);
+            nir_push_if(b, nir_ult(b, slot, exported));
+            {
+               nir_def *entry = nir_load_shared(b, 1, 32,
+                  nir_iadd_imm(b, target, layout->slot_map), .align_mul = 4);
+               nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, entry, M5_PV_COPY), 0));
+               {
+                  /* Private copies sit past the API vertices they copy. */
+                  nir_def *source = nir_imul_imm(b, nir_iand_imm(b,
+                     nir_ushr_imm(b, entry, M5_PV_VERTEX_SHIFT), 0xff), 4);
+                  for (unsigned q = 0; q < nv; ++q) {
+                     const unsigned base = layout->position +
+                                           layout->plane_stride * vertex_planes[q];
+                     nir_store_shared(b, nir_load_shared(b, 1, 32,
+                        nir_iadd_imm(b, source, base), .align_mul = 4),
+                        nir_iadd_imm(b, target, base), .write_mask = 1,
+                        .align_mul = 4);
+                  }
+               }
+               nir_pop_if(b, NULL);
+               nir_def *tag = nir_iand_imm(b, entry, M5_PV_PRIMITIVE_MASK);
+               nir_def *from = nir_iadd_imm(b, tag, -1);
+               nir_push_if(b, nir_iand(b, nir_ine_imm(b, tag, 0),
+                                       nir_ine(b, from, slot)));
+               nir_store_var(b, move[t], nir_imul_imm(b, from, 4), 1);
+               nir_pop_if(b, NULL);
+            }
+            nir_pop_if(b, NULL);
+         } else {
+            const unsigned base = layout->primitive_source +
+               layout->primitive_stride * primitive_planes[step - 1];
+            nir_push_if(b, nir_ine_imm(b, nir_load_var(b, move[t]), UINT32_MAX));
+            nir_store_shared(b, nir_load_var(b, word[t]),
+               nir_iadd_imm(b, target, base), .write_mask = 1, .align_mul = 4);
+            nir_pop_if(b, NULL);
+         }
+         if (step < np) {
+            const unsigned base = layout->primitive_source +
+               layout->primitive_stride * primitive_planes[step];
+            nir_def *from = nir_load_var(b, move[t]);
+            nir_push_if(b, nir_ine_imm(b, from, UINT32_MAX));
+            nir_store_var(b, word[t], nir_load_shared(b, 1, 32,
+               nir_iadd_imm(b, from, base), .align_mul = 4), 1);
+            nir_pop_if(b, NULL);
+         }
+      }
+      nir_pop_if(b, NULL);
+      if (step < np)
+         m5_mesh_rendezvous(b);
+   }
+}
+
 bool
 agx_nir_lower_m5_mesh_triangle_probe(nir_shader *s)
 {
@@ -588,6 +882,10 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
    if (varyings->cull_primitive)
       primitive_slots |= VARYING_BIT_CULL_PRIMITIVE;
    const bool unweld = agx_m5_mesh_unwelds(varyings);
+   /* Without layer or viewport words, per-primitive words can instead
+    * travel on the provoking vertex alone (mesh_layout_provoking), where
+    * private vertices for every corner do not fit. */
+   const bool provoking_ok = unweld && !varyings->lv;
    unsigned threads=s->info.workgroup_size[0]*s->info.workgroup_size[1]*
                     s->info.workgroup_size[2];
    if(s->info.stage!=MESA_SHADER_MESH || s->info.shared_size>32768 ||
@@ -611,17 +909,29 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
                                                       VARYING_BIT_PRIMITIVE_ID)) |
                                   VARYING_BIT_PSIZ) ||
       /* Every primitive gets private vertices within the native
-       * 256-vertex output limit. */
-      (unweld && prim_vertices(s) * s->info.mesh.max_primitives_out > 256) ||
+       * 256-vertex output limit, or its provoking vertex carries its words. */
+      (unweld && !provoking_ok &&
+       prim_vertices(s) * s->info.mesh.max_primitives_out > 256) ||
       varyings->clip_distance_count != s->info.clip_distance_array_size ||
       !varyings_valid(varyings))
       return false;
-   struct mesh_layout layout = mesh_layout(s, varyings);
-   if (varyings->cull_primitive) {
+   bool provoking = provoking_ok &&
+      prim_vertices(s) * s->info.mesh.max_primitives_out > 256;
+   struct mesh_layout layout = provoking ? mesh_layout_provoking(s, varyings)
+                                         : mesh_layout(s, varyings);
+   if (!provoking && varyings->cull_primitive) {
       layout.cull = layout.output_base + layout.bytes;
       layout.bytes += ALIGN_POT(s->info.mesh.max_primitives_out, 64);
    }
-   if (layout.output_base + layout.bytes > 32768)
+   /* Private vertices hold every per-primitive word twice (source and
+    * export copy); the provoking-vertex form holds it once. */
+   if (!provoking && provoking_ok &&
+       layout.output_base + layout.bytes > 32768) {
+      provoking = true;
+      layout = mesh_layout_provoking(s, varyings);
+   }
+   if (provoking ? !layout.export_vertices
+                 : layout.output_base + layout.bytes > 32768)
       return false;
    unsigned physical_threads=MAX2(threads,MIN2(layout.export_vertices,32));
    bool counts=false;
@@ -823,6 +1133,17 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
                nir_store_shared(&b, word, nir_iadd_imm(&b, nir_imul_imm(&b, k, 4), base),
                   .write_mask = 1, .align_mul = 4);
             }
+            /* The provoking-vertex form stages primitive words in the
+             * primitive planes of the export region (vertex planes stay). */
+            for (unsigned plane = 0; layout.provoking && plane < layout.planes; ++plane) {
+               if (layout.primitive_plane[plane] < 0)
+                  continue;
+               const unsigned base = layout.primitive_source + layout.primitive_stride * plane;
+               nir_def *word = nir_load_shared(&b, 1, 32,
+                  nir_iadd_imm(&b, nir_imul_imm(&b, j, 4), base), .align_mul = 4);
+               nir_store_shared(&b, word, nir_iadd_imm(&b, nir_imul_imm(&b, k, 4), base),
+                  .write_mask = 1, .align_mul = 4);
+            }
             nir_store_var(&b, kv, nir_iadd_imm(&b, k, 1), 1);
          }
          nir_pop_if(&b, NULL);
@@ -902,6 +1223,8 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
       }
       nir_pop_if(&b, NULL);
    }
+   if (layout.provoking)
+      m5_mesh_provoking_epilogue(&b, s, impl, &layout);
    nir_barrier(&b,.execution_scope=SCOPE_WORKGROUP,.memory_scope=SCOPE_WORKGROUP,
                   .memory_semantics=NIR_MEMORY_ACQ_REL,.memory_modes=nir_var_mem_shared);
    /* Native write_uvb helpers execute on SIMD group0 after rendezvous. */
@@ -911,6 +1234,9 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
    if (layout.unweld) {
       p = nir_umin(&b, p, nir_imm_intN_t(&b, max_primitives, 16));
       v = nir_imul_imm(&b, p, prim_vertices(s));
+   } else if (layout.provoking) {
+      /* The epilogue stored the exported vertex count, at most the slots. */
+      p = nir_umin(&b, p, nir_imm_intN_t(&b, max_primitives, 16));
    }
    nir_allocate_mesh_uvb_agx(&b,p,v);
    nir_def *lane=nir_load_subgroup_invocation(&b);
@@ -958,7 +1284,7 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
    /* The native output limits describe the exported vertices. */
    s->info.mesh.max_vertices_out=layout.export_vertices;
    nir_progress(true,impl,nir_metadata_none);
-   if (varyings->cull_primitive)
+   if (varyings->cull_primitive || layout.provoking)
       NIR_PASS(_, s, nir_lower_vars_to_ssa);
    return true;
 }
