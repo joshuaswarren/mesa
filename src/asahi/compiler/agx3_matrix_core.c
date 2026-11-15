@@ -8,27 +8,30 @@ agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
 {
    if (!d)
       return false;
+   const bool agx3b = encoding == AGX_ISA_ENCODING_AGX3B;
    unsigned type = d->input_type ? d->input_type : AGX3_MATRIX_INPUT_F16;
    unsigned align_mask = type == AGX3_MATRIX_INPUT_F16 ? 3 : 1;
-   unsigned source_max = type == AGX3_MATRIX_INPUT_F32 ? 252 : 254;
+   unsigned dest_max = agx3b ? 188 : 252;
+   unsigned source_max =
+      type == AGX3_MATRIX_INPUT_F32 ? dest_max : (agx3b ? 190 : 254);
 
    /*
     * The 8x8 matrix multiply-add (f16/bf16/f32 inputs, f32 accumulator)
-    * exists both on the M5 AGX3C encoding (G17G/G17S) and on the AGX3B
-    * encoding that covers G15/G16 and G17P (M4 Pro, A18 Pro). The shared
-    * "f32matmad8x8" form carries every input type in the type field, so one
-    * builder serves both; only the witnessed selector constants, the
-    * c-is-zero marker and the scoreboard-wait field range differ between the
-    * two encodings. The 16x16 GEMM form (agx3_matrix_encode_gemm16) is M5
-    * only, so this is the sole matrix instruction AGX3B offers.
+    * exists both on the M5 AGX3C encoding (G17G/G17S/G17C) and on the AGX3B
+    * encoding that covers G15/G16 and G17P (M4 Pro, M4 Max, A18 Pro). The
+    * shared "f32matmad8x8" form carries every input type in the type field, so
+    * one builder serves both; only the general register file ceiling (192
+    * halves on AGX3B vs 256 on AGX3C), the witnessed selector constants and
+    * the scoreboard-wait field range differ between the two encodings. The
+    * 16x16 GEMM form (agx3_matrix_encode_gemm16) is M5 only, so this is the
+    * sole matrix instruction AGX3B offers.
     */
-   const bool agx3b = encoding == AGX_ISA_ENCODING_AGX3B;
    if ((encoding != AGX_ISA_ENCODING_AGX3C && !agx3b) || !out || !length ||
        (type != AGX3_MATRIX_INPUT_F16 && type != AGX3_MATRIX_INPUT_F32 &&
         type != AGX3_MATRIX_INPUT_BF16) ||
-       (d->dest & align_mask) || d->dest > 252 ||
+       (d->dest & align_mask) || d->dest > dest_max ||
        (d->a & 1) || d->a > source_max || (d->b & 1) || d->b > source_max ||
-       (!d->c_zero && ((d->c & align_mask) || d->c > 252)) ||
+       (!d->c_zero && ((d->c & align_mask) || d->c > dest_max)) ||
        (d->c_zero && (d->c || d->cache[2] || d->discard[2])))
       return false;
 

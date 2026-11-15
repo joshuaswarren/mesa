@@ -14076,10 +14076,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             /* 8x8 matmad is available on AGX3B (G15/G16/G17P) as well as M5
              * (AGX3C); the encoder packs the right form for each. The 16x16
              * GEMM above stays AGX3C only. */
+            const unsigned wait_max =
+               enc == AGX_ISA_ENCODING_AGX3B ? 0x3f : 0xff;
             if ((enc != AGX_ISA_ENCODING_AGX3C &&
                  enc != AGX_ISA_ENCODING_AGX3B) || ctx->is_preamble ||
                 ctx->stage != MESA_SHADER_COMPUTE || I->nr_dests != 1 ||
-                I->nr_srcs != 3 || I->saturate || wait > 0xff ||
+                I->nr_srcs != 3 || I->saturate || wait > wait_max ||
                 !agx3_src_is_register(I->dest[0]) || I->dest[0].memory ||
                 I->dest[0].size != AGX_SIZE_32 ||
                 agx_channels(I->dest[0]) != 2)
