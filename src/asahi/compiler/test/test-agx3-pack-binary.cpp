@@ -10836,6 +10836,104 @@ TEST_F(AGX3PackBinary, G17GRepeatedHalfLiteralExportsStayEncodableAfterRA)
    }
 }
 
+/* AGX3C keeps plain half registers that two FFMAs read in place
+ * (agx_lower_agx3_fma_sources): every mixed shape, at either destination
+ * size, packs after register allocation as the two FFMAs, with no widening
+ * move. Also with abs/neg on one half operand next to a plain one, and with a
+ * uniform addend, which agx_lower_uniform_sources copies to a register when a
+ * half register operand remains. */
+TEST_F(AGX3PackBinary, AGX3CMixedFMAHalfRegistersPackAfterRA)
+{
+   for (auto chip : {AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C}) {
+      key.dev.chip = chip;
+      SCOPED_TRACE(chip);
+      for (unsigned half_mask = 1; half_mask < 8; ++half_mask) {
+         for (unsigned dest_size : {32u, 16u}) {
+            /* 0: plain; 1: abs/neg on the first half operand; 2: uniform addend
+             */
+            for (unsigned variant = 0; variant < 3; ++variant) {
+               for (unsigned mods = 1; mods < (variant == 1 ? 4u : 2u);
+                    ++mods) {
+                  SCOPED_TRACE(half_mask);
+                  SCOPED_TRACE(dest_size);
+                  SCOPED_TRACE(variant);
+                  SCOPED_TRACE(mods);
+                  agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C);
+                  b->shader->stage = MESA_SHADER_VERTEX;
+                  b->shader->nir = rzalloc(mem_ctx, nir_shader);
+                  b->shader->nir->info.stage = MESA_SHADER_VERTEX;
+                  agx_index src[3];
+                  bool half_gpr[3] = {false}, modified[3] = {false};
+                  bool first_half = true;
+                  for (unsigned s = 0; s < 3; ++s) {
+                     const bool half = half_mask & BITFIELD_BIT(s);
+                     if (variant == 2 && s == 2) {
+                        src[s] =
+                           agx_uniform(8, half ? AGX_SIZE_16 : AGX_SIZE_32);
+                        continue;
+                     }
+                     src[s] = agx_mov_imm(b, half ? 16 : 32,
+                                          half ? 0x3c00 + s : 0x3f800000 + s);
+                     half_gpr[s] = half;
+                     if (half && variant == 1 && first_half) {
+                        src[s].abs = mods & 1;
+                        src[s].neg = mods & 2;
+                        modified[s] = true;
+                     }
+                     first_half &= !half;
+                  }
+                  agx_instr *fmas[2];
+                  for (unsigned f = 0; f < 2; ++f) {
+                     agx_index result = agx_temp(
+                        b->shader, dest_size == 16 ? AGX_SIZE_16 : AGX_SIZE_32);
+                     fmas[f] = agx_ffma_to(b, result, src[0], src[1], src[2]);
+                     agx_index wide = result;
+                     if (dest_size == 16) {
+                        wide = agx_temp(b->shader, AGX_SIZE_32);
+                        agx_fmov_to(b, wide, result);
+                     }
+                     agx_st_vary(b, agx_immediate(f), wide);
+                  }
+                  agx_stop(b);
+
+                  agx_lower_agx3_fma_sources(b->shader);
+                  for (agx_instr *fma : fmas) {
+                     for (unsigned s = 0; s < 3; ++s) {
+                        if (!half_gpr[s])
+                           continue;
+                        EXPECT_EQ(fma->src[s].size, AGX_SIZE_16) << s;
+                        EXPECT_EQ(fma->src[s].abs, modified[s] && (mods & 1))
+                           << s;
+                        EXPECT_EQ(fma->src[s].neg, modified[s] && (mods & 2))
+                           << s;
+                     }
+                  }
+                  /* No widening move reads a half register operand. */
+                  agx_foreach_instr_global(b->shader, I) {
+                     if (I->op != AGX_OPCODE_FADD)
+                        continue;
+                     for (unsigned s = 0; s < 3; ++s) {
+                        if (half_gpr[s] && I->src[0].type == AGX_INDEX_NORMAL)
+                           EXPECT_NE(I->src[0].value, src[s].value) << s;
+                     }
+                  }
+                  agx_lower_uniform_sources(b->shader);
+                  agx_dce(b->shader, true);
+                  agx_ra(b->shader);
+                  agx_lower_pseudo(b->shader);
+
+                  unsigned fused = 0;
+                  agx_foreach_instr_global(b->shader, I)
+                     fused += I->op == AGX_OPCODE_FFMA;
+                  EXPECT_EQ(fused, 2u);
+                  EXPECT_FALSE(pack(b).empty());
+               }
+            }
+         }
+      }
+   }
+}
+
 TEST_F(AGX3PackBinary, G17GMixedFMAKeepsFusedOperationThroughPacking)
 {
    key.dev.emit_agx3d = true;
