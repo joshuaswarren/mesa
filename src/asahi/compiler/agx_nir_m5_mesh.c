@@ -1546,7 +1546,13 @@ agx_nir_lower_m5_task_payload(nir_shader *s, unsigned max_payload_B,
 /* Native object->mesh record at the payload address (SR62/SR63): native G17G
  * witnesses (lane-mesh nwit2 otpg/mtpg) store the child grid
  * (threadgroups_per_grid) at +0 and the payload from +16; the mesh reads its
- * threadgroups_per_grid from +0 after the payload-entry barrier. */
+ * threadgroups_per_grid from +0 after the payload-entry barrier.
+ *
+ * Only a mesh that reads threadgroups_per_grid needs that record. For any
+ * other mesh the object writes no record and both stages put the payload at
+ * +0. With the record, a full 1 KiB payload measured as lost workgroups of
+ * the last children (those reading its last words), consistent with the
+ * next task's record landing on them. */
 #define M5_TASK_RECORD_PAYLOAD 16
 
 static bool
@@ -1631,10 +1637,13 @@ agx_nir_lower_m5_task_probe(nir_shader *s)
  * invocations run on three physical lanes with the API body under its exact
  * invocation mask. Payload accesses use the native SR62/SR63 payload
  * address; callers bound max_payload_B to what the running kernel backs
- * (zero refuses every payload access).
+ * (zero refuses every payload access). grid_record also stores the child grid
+ * at +0 of the payload address and moves the payload to +16, for a mesh that
+ * reads its threadgroups_per_grid (agx_nir_lower_m5_mesh_task_record); the
+ * mesh must then address the payload from +16 too, and from +0 without it.
  */
 bool
-agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool record)
+agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool grid_record)
 {
    const unsigned threads = s->info.workgroup_size[0] *
                             s->info.workgroup_size[1] *
@@ -1681,7 +1690,7 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool record)
    const bool alias_grid = grid + 16 > 32768;
    if (!launches || s->info.shared_size > 32768 ||
        !agx_nir_lower_m5_task_payload(s, max_payload_B,
-                                      record ? M5_TASK_RECORD_PAYLOAD : 0))
+                                      grid_record ? M5_TASK_RECORD_PAYLOAD : 0))
       return false;
    /* SPIR-V EmitMeshTasksEXT terminates the invocation: vtn follows the
     * launch with a halt, which would skip the child-count epilogue appended
@@ -1708,8 +1717,11 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool record)
     * threadgroup grid, the rendezvous and the payload-exit barrier of
     * _agc.object.write_childcount. (The latter shape faulted once on R239
     * with no 0x1ca48 mesh rendering buffer bound; it stays behind the
-    * payload limit.) */
-   const bool direct = !record && !s->info.task_payload_size && !payload_access;
+    * payload limit.) The direct form keys off that limit, not off the grid
+    * record: a payload-free object on a kernel that backs the payload keeps
+    * the rendezvous form, record or not. */
+   const bool direct = !max_payload_B && !s->info.task_payload_size &&
+                       !payload_access;
    nir_function_impl *entry = nir_shader_get_entrypoint(s);
    nir_variable *grid_var = NULL;
    if (direct) {
@@ -1729,7 +1741,7 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool record)
       nir_builder b = nir_builder_at(nir_before_impl(entry));
       nir_store_var(&b, grid_var, nir_imm_ivec3(&b, 0, 0, 0), 7);
    } else {
-      if (record) {
+      if (grid_record) {
          /* Native object shaders also publish the child grid at +0 of the
           * record for the mesh stage's threadgroups_per_grid. */
          nir_foreach_block(block, entry) {

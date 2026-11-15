@@ -43,7 +43,9 @@ static inline enum hk_mesh_mode hk_mesh_mode(void) {
  * to bind the TA mesh rendering buffer (0x1ca48) to task kicks, which it
  * reports with DRM_ASAHI_FEATURE_TASK_MESH_STORAGE; taskShader is
  * advertised only then. Without it only payload-free task shaders are
- * accepted. */
+ * accepted. hk_m5_task_record() reports that kernel storage; whether a task
+ * also writes the child grid at +0 is decided per task/mesh pair
+ * (hk_mesh_info::m5_no_grid_record). */
 static inline bool hk_m5_task_enabled(void) {
    return hk_mesh_mode()==HK_MESH_MODE_NATIVE_PROBE;
 }
@@ -78,6 +80,14 @@ struct hk_mesh_info {
    uint8_t prim;
    uint8_t clip_distance_array_size;
    uint8_t cull_distance_array_size;
+
+   /* M5 task and mesh shaders compiled together whose mesh never reads
+    * gl_NumWorkGroups (hk_compile_shaders()): the task writes no child grid
+    * record and both put the payload at +0 of the payload address. Every
+    * other M5 task and mesh shader on a kernel with task mesh storage keeps
+    * the grid at +0 and the payload at +16. A task and a mesh shader drawn
+    * together always agree. */
+   bool m5_no_grid_record;
 
    
    uint32_t payload_size_B;

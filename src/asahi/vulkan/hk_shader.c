@@ -6884,7 +6884,9 @@ hk_compile_source_create(void *nir, size_t nir_size, const union hk_key *key,
 
 /* twin_of: compile a twin of the shader that saved these inputs, with
  * custom-border emulation; mesh_fs: the twin is the fragment shader for a
- * G17P mesh shader with these per-primitive records (hk_mesh_fs_twin()). */
+ * G17P mesh shader with these per-primitive records (hk_mesh_fs_twin());
+ * m5_no_grid_record: an M5 task or mesh shader compiled with its partner
+ * stage, leaving the grid record out (hk_m5_no_grid_record()). */
 static VkResult
 hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *info,
                   const struct vk_graphics_pipeline_state *state,
@@ -6893,6 +6895,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   const struct hk_border_source *twin_of,
                   const struct agx_m5_mesh_varyings *mesh_fs,
                   bool no_default_layer, int vs_covers,
+                  bool m5_no_grid_record,
                   struct hk_api_shader **shader_out)
 {
    VkResult result;
@@ -7233,6 +7236,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       shader->info.mesh.prim = nir->info.mesh.primitive_type;
       shader->info.mesh.reads_draw_id = mesh_reads_draw_id;
       shader->info.mesh.reads_num_workgroups = mesh_reads_num_workgroups;
+      shader->info.mesh.m5_no_grid_record = m5_no_grid_record;
       for (unsigned i = 0; i < 3; ++i)
          shader->info.mesh.local_size[i] = nir->info.workgroup_size[i];
       
@@ -7377,7 +7381,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
           !(m5_mesh ? (hk_m5_task_enabled()
                           ? agx_nir_lower_m5_task_payload(nir,
                                hk_m5_task_payload_limit(dev->dev.params.features),
-                               hk_m5_task_record(dev->dev.params.features) ? 16 : 0)
+                               hk_m5_task_record(dev->dev.params.features) &&
+                                  !m5_no_grid_record ? 16 : 0)
                           : agx_nir_lower_m5_task_payload_probe(nir))
                     : agx_nir_lower_gen1_task_payload_probe(nir)) ||
           !(m5_mesh ? agx_nir_lower_m5_mesh(nir, &varyings)
@@ -7500,7 +7505,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
           !(hk_m5_task_enabled()
                ? agx_nir_lower_m5_task(nir,
                     hk_m5_task_payload_limit(dev->dev.params.features),
-                    hk_m5_task_record(dev->dev.params.features))
+                    hk_m5_task_record(dev->dev.params.features) &&
+                       !m5_no_grid_record)
                : agx_nir_lower_m5_task_probe(nir))) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
@@ -7522,6 +7528,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          obj->variants[0].info.mesh.reads_draw_id = mesh_reads_draw_id;
          obj->variants[0].info.mesh.reads_num_workgroups =
             mesh_reads_num_workgroups;
+         obj->variants[0].info.mesh.m5_no_grid_record = m5_no_grid_record;
       }
    } else if (sw_stage == MESA_SHADER_GEOMETRY) {
       struct hk_shader *main_variant = hk_main_gs_variant(obj);
@@ -7848,7 +7855,7 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
                   struct hk_api_shader **shader_out)
 {
    return hk_compile_shader_impl(dev, info, state, features, allocator, NULL,
-                                 NULL, false, -1, shader_out);
+                                 NULL, false, -1, false, shader_out);
 }
 
 static VkResult
@@ -7873,8 +7880,12 @@ hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
       .set_layout_count = src->set_layout_count,
    };
    struct hk_api_shader *shader = NULL;
+   /* A twin keeps the payload layout of the shader it stands in for: it is
+    * drawn with the same partner stage. */
+   const bool m5_no_grid_record = obj->variants[0].info.mesh.m5_no_grid_record;
    VkResult result = hk_compile_shader_impl(dev, &info, NULL, NULL, NULL, src,
-                                            mesh_fs, false, -1, &shader);
+                                            mesh_fs, false, -1,
+                                            m5_no_grid_record, &shader);
    *built = result == VK_SUCCESS ? shader : NULL;
    return result;
 }
@@ -8065,6 +8076,37 @@ hk_fs_mesh_builtin_per_primitive(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* M5 task and mesh shaders agree on where the task payload sits at the
+ * payload address. A mesh that reads gl_NumWorkGroups takes it from the
+ * child grid record the task writes at +0, with the payload from +16
+ * (hk_m5_mesh_task_grid()). Any other mesh needs no record, so the pair can
+ * drop it and keep the payload at +0, but only when both are compiled here
+ * together, linked: the stages of a pipeline, or shader objects created with
+ * VK_SHADER_CREATE_LINK_STAGE_BIT_EXT, which must be bound together. A task
+ * or mesh shader compiled alone may be drawn with any partner, so it keeps
+ * the record layout, as do both stages of every other pairing. Run before
+ * hk_m5_mesh_task_grid() and hk_lower_nir(), with the same gl_NumWorkGroups
+ * test as the former. */
+static bool
+hk_m5_no_grid_record(const struct hk_device *dev, uint32_t shader_count,
+                     const struct vk_shader_compile_info *infos)
+{
+   if (dev->dev.chip != AGX_CHIP_G17S ||
+       !hk_m5_task_record(dev->dev.params.features))
+      return false;
+   const struct vk_shader_compile_info *task = NULL, *mesh = NULL;
+   for (uint32_t i = 0; i < shader_count; i++) {
+      if (infos[i].stage == MESA_SHADER_TASK)
+         task = &infos[i];
+      else if (infos[i].stage == MESA_SHADER_MESH)
+         mesh = &infos[i];
+   }
+   return task && mesh &&
+          (task->flags & VK_SHADER_CREATE_LINK_STAGE_BIT_EXT) &&
+          (mesh->flags & VK_SHADER_CREATE_LINK_STAGE_BIT_EXT) &&
+          !hk_nir_reads_intrinsic(mesh->nir, nir_intrinsic_load_num_workgroups);
+}
+
 static VkResult
 hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                    struct vk_shader_compile_info *infos,
@@ -8079,6 +8121,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    for (uint32_t i = 0; i < shader_count; i++)
       vs_covers[i] = -1;
    bool has_mesh = false;
+   const bool m5_no_grid_record =
+      hk_m5_no_grid_record(dev, shader_count, infos);
 
    /* Lower shaders, notably lowering I/O. This is a prerequisite for
     * intershader optimization.
@@ -8275,9 +8319,13 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       const bool no_default_layer =
          !fs_reads_layer && infos[i].stage == MESA_SHADER_VERTEX &&
          infos[i].next_stage_mask == VK_SHADER_STAGE_FRAGMENT_BIT;
+      const bool no_grid_record =
+         m5_no_grid_record && (infos[i].stage == MESA_SHADER_TASK ||
+                               infos[i].stage == MESA_SHADER_MESH);
       VkResult result =
          hk_compile_shader_impl(dev, &infos[i], state, features, pAllocator,
                                 NULL, NULL, no_default_layer, vs_covers[i],
+                                no_grid_record,
                                 (struct hk_api_shader **)&shaders_out[i]);
       if (result != VK_SUCCESS) {
          /* Clean up all the shaders before this point */
