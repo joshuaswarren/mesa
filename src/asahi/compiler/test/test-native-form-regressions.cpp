@@ -4959,6 +4959,84 @@ TEST(NativeForms, Gen1MeshClipCullPointSizeFollowHardwareUVSOrder)
    }
 }
 
+TEST(NativeForms, Gen1MeshLayerExportsFromThreadgroupMemory)
+{
+   /* A per-primitive layer (hk's multiview lowering writes one) reaches the
+    * exported layer/viewport vertex word from threadgroup memory: the export
+    * must not read it back from the primitive's record in device memory. The
+    * record keeps its copy for a fragment shader reading gl_Layer.
+    *
+    * near: the shader's own threadgroup memory leaves room for the export
+    * arena (1,920 + 1,792 bytes from 28,992) but not for the 128 bytes of
+    * layer words; it still compiles, keeps the arena, and reads the record. */
+   for (unsigned variant = 0; variant < 3; ++variant) {
+      const bool cull = variant == 1, near = variant == 2;
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_MESH, &agx_nir_options, "gen1 mesh layer");
+      b.shader->info.io_lowered = true;
+      b.shader->info.workgroup_size[0] = 40;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.mesh.max_vertices_out = 64;
+      b.shader->info.mesh.max_primitives_out = 32;
+      b.shader->info.mesh.primitive_type = MESA_PRIM_LINES;
+      b.shader->info.shared_size = near ? 28992 : 0;
+      b.shader->info.outputs_written = VARYING_BIT_POS | VARYING_BIT_LAYER |
+         VARYING_BIT_PRIMITIVE_INDICES | (cull ? VARYING_BIT_CULL_PRIMITIVE : 0);
+      b.shader->info.per_primitive_outputs = VARYING_BIT_LAYER |
+         VARYING_BIT_PRIMITIVE_INDICES | (cull ? VARYING_BIT_CULL_PRIMITIVE : 0);
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 64),
+                                       nir_imm_int(&b, 32), nir_imm_int(&b, 0));
+      nir_store_per_vertex_output(&b, nir_imm_vec4(&b, 0, 0, 0, 1), lane,
+         nir_imm_int(&b, 0), .write_mask = 15, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_primitive_output(&b, nir_imm_ivec2(&b, 0, 1), lane,
+         nir_imm_int(&b, 0), .write_mask = 3, .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+      if (cull) {
+         nir_store_per_primitive_output(&b, nir_imm_false(&b), lane,
+            nir_imm_int(&b, 0), .write_mask = 1, .src_type = nir_type_bool1,
+            .io_semantics = {.location = VARYING_SLOT_CULL_PRIMITIVE,
+                             .num_slots = 1});
+      }
+      nir_store_per_primitive_output(&b, nir_imm_int(&b, 1), lane,
+         nir_imm_int(&b, 0), .write_mask = 1, .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_LAYER, .num_slots = 1});
+      struct agx_m5_mesh_varyings v;
+      ASSERT_TRUE(agx_gen1_mesh_gather_varyings(b.shader, &v));
+      EXPECT_TRUE(v.lv);
+      EXPECT_EQ(v.primitive_stride_B, 4u);
+      const unsigned shared_before = b.shader->info.shared_size;
+      ASSERT_TRUE(agx_nir_lower_gen1_mesh(b.shader, &v));
+      nir_validate_shader(b.shader, "gen1 mesh layer");
+      unsigned global_loads = 0, global_stores = 0;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(in, block) {
+            if (in->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+            global_loads += i->intrinsic == nir_intrinsic_load_global;
+            global_stores += i->intrinsic == nir_intrinsic_store_global;
+         }
+      }
+      /* Culling still moves the records themselves (one load per record
+       * word); near the limit the export reads the layer from the record;
+       * nothing else reads device memory. */
+      EXPECT_EQ(global_loads, (cull || near) ? 1u : 0u);
+      EXPECT_GE(global_stores, 1u);
+      EXPECT_LE(b.shader->info.shared_size, 32768u);
+      if (near) {
+         /* The export arena is kept: 2 private vertices per line. */
+         EXPECT_EQ(b.shader->info.mesh.max_vertices_out, 64u);
+         EXPECT_EQ(b.shader->info.shared_size, 28992u + 1920u + 1792u);
+      } else {
+         EXPECT_GE(b.shader->info.shared_size, shared_before + 4u * 32u);
+      }
+      ralloc_free(b.shader);
+   }
+}
+
 TEST(NativeForms, M5MeshVaryingRefusalsLeaveShaderUntouched)
 {
    /* A placement that does not cover every written component is refused. */
