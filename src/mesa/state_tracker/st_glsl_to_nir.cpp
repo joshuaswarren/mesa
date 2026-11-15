@@ -803,7 +803,7 @@ st_link_shader(struct gl_context *ctx, struct gl_shader_program *prog,
 
       if (!i) {
          spirv = (prog->Shaders[i]->spirv_data != NULL);
-      } else if (spirv && !prog->Shaders[i]->spirv_data) {
+      } else if (spirv != (prog->Shaders[i]->spirv_data != NULL)) {
          /* The GL_ARB_gl_spirv spec adds a new bullet point to the list of
           * reasons LinkProgram can fail:
           *
