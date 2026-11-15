@@ -1785,3 +1785,36 @@ TEST_F(Optimizer, Agx3bFoldsUnmodifiedHalfGprIntoFfma)
          << c.name;
    }
 }
+
+/* A constant index folds into a device load only while the index at its
+ * scale plus the load's byte displacement is still a signed 16-bit offset.
+ */
+static enum agx_index_type
+device_load_index_type(void *mem_ctx, uint32_t index, int16_t displacement)
+{
+   agx_builder *b = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   b->shader->key = &key;
+
+   agx_index idx = agx_mov_imm(b, 32, index);
+   agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *load = agx_device_load_to(b, out, agx_register(0, AGX_SIZE_64),
+                                        idx, AGX_FORMAT_I32, 1, 0, false);
+   load->memory_byte_offset = displacement;
+   agx_unit_test(b, out);
+
+   agx_optimizer_forward(b->shader);
+   return load->src[1].type;
+}
+
+TEST_F(Optimizer, DeviceLoadImmediateIndexKeepsItsDisplacementEncodable)
+{
+   /* 32764 + (8 << 2) = 32796 does not fit, so the index stays a register. */
+   EXPECT_EQ(device_load_index_type(mem_ctx, 8, 32764), AGX_INDEX_NORMAL);
+   EXPECT_EQ(device_load_index_type(mem_ctx, 8, -32768), AGX_INDEX_IMMEDIATE);
+   EXPECT_EQ(device_load_index_type(mem_ctx, 0, 32764), AGX_INDEX_IMMEDIATE);
+   EXPECT_EQ(device_load_index_type(mem_ctx, 8, 0), AGX_INDEX_IMMEDIATE);
+   EXPECT_EQ(device_load_index_type(mem_ctx, 8, 32735), AGX_INDEX_IMMEDIATE);
+   EXPECT_EQ(device_load_index_type(mem_ctx, 8, 32736), AGX_INDEX_NORMAL);
+}

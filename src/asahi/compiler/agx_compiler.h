@@ -1470,6 +1470,47 @@ agx3_m5_fcmpsel_uniform_cmp0(const agx_instr *I, unsigned *condition,
    return true;
 }
 
+/* The byte offset an AGX3 device access encodes for an immediate index: the
+ * index at the access's full scale (I->shift, plus log2 of the element size
+ * unless the index already counts bytes) plus the instruction's byte
+ * displacement. The encoding holds a signed 16-bit byte offset, so this is
+ * false when the sum does not fit, or for a format with no device width.
+ * agx3_translate_mem() encodes the sum and the optimizer checks it before it
+ * inlines a constant index, so both follow this one rule. */
+static inline bool
+agx3_mem_immediate_byte_offset(const agx_instr *I, uint32_t index,
+                               int32_t *bytes)
+{
+   unsigned w;
+   switch (I->format) {
+   case AGX_FORMAT_I8:
+      w = 0;
+      break;
+   case AGX_FORMAT_I16:
+   case AGX_FORMAT_F16:
+      w = 1;
+      break;
+   case AGX_FORMAT_I32:
+      w = 2;
+      break;
+   default:
+      return false;
+   }
+
+   const unsigned shift =
+      (unsigned)I->shift + (I->memory_index_is_bytes ? 0 : w);
+   /* A nonzero index at a scale of 2^16 or more is past any int16 sum. */
+   if (index && shift >= 16)
+      return false;
+
+   const int64_t sum =
+      ((int64_t)index << (index ? shift : 0)) + I->memory_byte_offset;
+   if (sum < INT16_MIN || sum > INT16_MAX)
+      return false;
+   *bytes = (int32_t)sum;
+   return true;
+}
+
 struct agx_copy {
    /* Base register destination of the copy */
    unsigned dest;
