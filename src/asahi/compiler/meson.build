@@ -680,6 +680,7 @@ if with_tests
          'test/test-device-load-batches.cpp',
          'test/test-fuse-lea-constants.cpp',
          'test/test-divergence-load-agx.cpp',
+         'test/test-m5-half-widen-once.cpp',
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',
          'test/test-flatten-loads.cpp',
