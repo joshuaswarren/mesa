@@ -110,6 +110,8 @@ _mesa_spirv_shader_binary(struct gl_context *ctx,
    for (int i = 0; i < n; ++i) {
       struct gl_shader *sh = shaders[i];
 
+      simple_mtx_lock(&sh->Mutex);
+
       spirv_data = rzalloc(NULL, struct gl_shader_spirv_data);
       _mesa_shader_spirv_data_reference(&sh->spirv_data, spirv_data);
       _mesa_spirv_module_reference(&spirv_data->SpirVModule, module);
@@ -123,6 +125,8 @@ _mesa_spirv_shader_binary(struct gl_context *ctx,
 
       ralloc_free(sh->ir);
       sh->ir = NULL;
+
+      simple_mtx_unlock(&sh->Mutex);
    }
 }
 
@@ -360,13 +364,20 @@ _mesa_SpecializeShaderARB(GLuint shader,
    if (!sh)
       return;
 
+   /* Held until the shader is specialized, so that a concurrent
+    * glShaderSource or glShaderBinary cannot replace the SPIR-V data.
+    */
+   simple_mtx_lock(&sh->Mutex);
+
    if (!sh->spirv_data) {
+      simple_mtx_unlock(&sh->Mutex);
       _mesa_error(ctx, GL_INVALID_OPERATION,
                   "glSpecializeShaderARB(not SPIR-V)");
       return;
    }
 
    if (sh->CompileStatus) {
+      simple_mtx_unlock(&sh->Mutex);
       _mesa_error(ctx, GL_INVALID_OPERATION,
                   "glSpecializeShaderARB(already specialized)");
       return;
@@ -412,16 +423,19 @@ _mesa_SpecializeShaderARB(GLuint shader,
    case SPIRV_VERIFY_OK:
       break;
    case SPIRV_VERIFY_PARSER_ERROR:
+      simple_mtx_unlock(&sh->Mutex);
       _mesa_error(ctx, GL_INVALID_VALUE,
                   "glSpecializeShaderARB(failed to parse entry point \"%s\""
                   " for shader)", pEntryPoint);
       goto end;
    case SPIRV_VERIFY_ENTRY_POINT_NOT_FOUND:
+      simple_mtx_unlock(&sh->Mutex);
       _mesa_error(ctx, GL_INVALID_VALUE,
                   "glSpecializeShaderARB(could not find entry point \"%s\""
                   " for shader)", pEntryPoint);
       goto end;
    case SPIRV_VERIFY_UNKNOWN_SPEC_INDEX:
+      simple_mtx_unlock(&sh->Mutex);
       for (unsigned i = 0; i < numSpecializationConstants; ++i) {
          const struct nir_spirv_specialization_entry *entry = &spec->entries[i];
          if (entry->defined_on_module == false) {
@@ -453,6 +467,8 @@ _mesa_SpecializeShaderARB(GLuint shader,
       spirv_data->SpecializationConstantsIndex[i] = pConstantIndex[i];
       spirv_data->SpecializationConstantsValue[i] = pConstantValue[i];
    }
+
+   simple_mtx_unlock(&sh->Mutex);
 
  end:
    vtn_free_specialization(spec);

@@ -1094,11 +1094,18 @@ get_shaderiv(struct gl_context *ctx, GLuint name, GLenum pname, GLint *params)
       *params = shader->CompileStatus ? GL_TRUE : GL_FALSE;
       break;
    case GL_INFO_LOG_LENGTH:
+      /* The strings can be replaced by a compile or by a link in another
+       * context (the shader cache fallback recompile).
+       */
+      simple_mtx_lock(&shader->Mutex);
       *params = (shader->InfoLog && shader->InfoLog[0] != '\0') ?
          strlen(shader->InfoLog) + 1 : 0;
+      simple_mtx_unlock(&shader->Mutex);
       break;
    case GL_SHADER_SOURCE_LENGTH:
+      simple_mtx_lock(&shader->Mutex);
       *params = shader->Source ? strlen((char *) shader->Source) + 1 : 0;
+      simple_mtx_unlock(&shader->Mutex);
       break;
    case GL_SPIR_V_BINARY_ARB:
       *params = (shader->spirv_data != NULL);
@@ -1159,7 +1166,9 @@ get_shader_info_log(struct gl_context *ctx, GLuint shader, GLsizei bufSize,
       return;
    }
 
+   simple_mtx_lock(&sh->Mutex);
    _mesa_copy_string(infoLog, bufSize, length, sh->InfoLog);
+   simple_mtx_unlock(&sh->Mutex);
 }
 
 
@@ -1181,7 +1190,10 @@ get_shader_source(struct gl_context *ctx, GLuint shader, GLsizei maxLength,
    if (!sh) {
       return;
    }
+
+   simple_mtx_lock(&sh->Mutex);
    _mesa_copy_string(sourceOut, maxLength, length, sh->Source);
+   simple_mtx_unlock(&sh->Mutex);
 }
 
 
@@ -1195,6 +1207,8 @@ set_shader_source(struct gl_shader *sh, const GLchar *source,
 {
    assert(sh);
 
+   simple_mtx_lock(&sh->Mutex);
+
    /* The GL_ARB_gl_spirv spec adds the following to the end of the description
     * of ShaderSource:
     *
@@ -1202,8 +1216,14 @@ set_shader_source(struct gl_shader *sh, const GLchar *source,
     *    ShaderBinary command), that association is broken. Upon successful
     *    completion of this command the SPIR_V_BINARY_ARB state of <shader>
     *    is set to FALSE."
+    *
+    * The specialized SPIR-V was the shader's only executable, and the new
+    * GLSL source has not been compiled, so the shader is not compiled.
     */
-   _mesa_shader_spirv_data_reference(&sh->spirv_data, NULL);
+   if (sh->spirv_data) {
+      _mesa_shader_spirv_data_reference(&sh->spirv_data, NULL);
+      sh->CompileStatus = COMPILE_FAILURE;
+   }
 
    if (sh->CompileStatus == COMPILE_SKIPPED && !sh->FallbackSource) {
       /* If shader was previously compiled back-up the source in case of cache
@@ -1219,6 +1239,8 @@ set_shader_source(struct gl_shader *sh, const GLchar *source,
    }
 
    memcpy(sh->source_blake3, original_blake3, BLAKE3_OUT_LEN);
+
+   simple_mtx_unlock(&sh->Mutex);
 }
 
 static void
@@ -1239,6 +1261,8 @@ _mesa_compile_shader(struct gl_context *ctx, struct gl_shader *sh)
    if (!sh)
       return;
 
+   simple_mtx_lock(&sh->Mutex);
+
    /* The GL_ARB_gl_spirv spec says:
     *
     *    "Add a new error for the CompileShader command:
@@ -1247,6 +1271,7 @@ _mesa_compile_shader(struct gl_context *ctx, struct gl_shader *sh)
     *      state of <shader> is TRUE."
     */
    if (sh->spirv_data) {
+      simple_mtx_unlock(&sh->Mutex);
       _mesa_error(ctx, GL_INVALID_OPERATION, "glCompileShader(SPIR-V)");
       return;
    }
@@ -1290,6 +1315,8 @@ _mesa_compile_shader(struct gl_context *ctx, struct gl_shader *sh)
                      sh->Name, sh->InfoLog);
       }
    }
+
+   simple_mtx_unlock(&sh->Mutex);
 }
 
 
@@ -1395,8 +1422,6 @@ link_program(struct gl_context *ctx, struct gl_shader_program *shProg,
       }
    }
 
-   capture_shader_program(ctx, shProg);
-
    unsigned programs_in_use = 0;
    if (ctx->_Shader)
       for (unsigned stage = 0; stage < MESA_SHADER_MESH_STAGES; stage++) {
@@ -1409,7 +1434,20 @@ link_program(struct gl_context *ctx, struct gl_shader_program *shProg,
    ensure_builtin_types(ctx);
 
    FLUSH_VERTICES(ctx, 0, 0);
-   st_link_shader(ctx, shProg);
+
+   /* Locked only after the flush: drawing takes locks that a glthread batch
+    * may hold while it compiles one of these shaders.
+    */
+   struct gl_shader_link_locks locks;
+   if (!_mesa_lock_attached_shaders(ctx, shProg, &locks)) {
+      _mesa_error(ctx, GL_OUT_OF_MEMORY, "glLinkProgram");
+      return;
+   }
+
+   capture_shader_program(ctx, shProg);
+   st_link_shader(ctx, shProg, &locks);
+
+   _mesa_unlock_attached_shaders(ctx, &locks);
 
    /* From section 7.3 (Program Objects) of the OpenGL 4.5 spec:
     *

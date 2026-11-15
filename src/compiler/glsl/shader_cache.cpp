@@ -82,7 +82,8 @@ create_binding_str(const char *key, unsigned value, void *closure)
 
 void
 shader_cache_write_program_metadata(struct gl_context *ctx,
-                                    struct gl_shader_program *prog)
+                                    struct gl_shader_program *prog,
+                                    const cache_key *shader_keys)
 {
    struct disk_cache *cache = ctx->Cache;
    if (!cache)
@@ -120,10 +121,8 @@ shader_cache_write_program_metadata(struct gl_context *ctx,
    if (!cache_item_metadata.keys)
       goto fail;
 
-   for (unsigned i = 0; i < prog->NumShaders; i++) {
-      memcpy(cache_item_metadata.keys[i], prog->Shaders[i]->disk_cache_blake3,
-             sizeof(cache_key));
-   }
+   for (unsigned i = 0; i < prog->NumShaders; i++)
+      memcpy(cache_item_metadata.keys[i], shader_keys[i], sizeof(cache_key));
 
    disk_cache_put(cache, prog->data->blake3, metadata.data, metadata.size,
                   &cache_item_metadata);

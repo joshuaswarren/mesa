@@ -28,8 +28,11 @@
 extern "C" {
 #endif
 
+struct gl_shader_link_locks;
+
 void
-st_link_shader(struct gl_context *ctx, struct gl_shader_program *prog);
+st_link_shader(struct gl_context *ctx, struct gl_shader_program *prog,
+               struct gl_shader_link_locks *locks);
 
 #ifdef __cplusplus
 }
