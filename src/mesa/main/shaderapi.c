@@ -1216,8 +1216,14 @@ set_shader_source(struct gl_shader *sh, const GLchar *source,
     *    ShaderBinary command), that association is broken. Upon successful
     *    completion of this command the SPIR_V_BINARY_ARB state of <shader>
     *    is set to FALSE."
+    *
+    * The specialized SPIR-V was the shader's only executable, and the new
+    * GLSL source has not been compiled, so the shader is not compiled.
     */
-   _mesa_shader_spirv_data_reference(&sh->spirv_data, NULL);
+   if (sh->spirv_data) {
+      _mesa_shader_spirv_data_reference(&sh->spirv_data, NULL);
+      sh->CompileStatus = COMPILE_FAILURE;
+   }
 
    if (sh->CompileStatus == COMPILE_SKIPPED && !sh->FallbackSource) {
       /* If shader was previously compiled back-up the source in case of cache
