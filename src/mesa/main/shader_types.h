@@ -37,6 +37,7 @@
 #include "program/prog_parameter.h"
 #include "util/mesa-blake3.h"
 #include "util/mesa-blake3.h"
+#include "util/simple_mtx.h"
 #include "compiler/shader_info.h"
 #include "compiler/list.h"
 #include "compiler/glsl/ir_list.h"
@@ -254,6 +255,12 @@ struct gl_shader
 
    /* ARB_gl_spirv related data */
    struct gl_shader_spirv_data *spirv_data;
+
+   /**
+    * Held while the source or compile results above are replaced, and while
+    * a link reads them, since another context may be doing either.
+    */
+   simple_mtx_t Mutex;
 };
 
 /**

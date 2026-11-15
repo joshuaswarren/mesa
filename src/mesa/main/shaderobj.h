@@ -88,6 +88,22 @@ _mesa_new_shader(GLuint name, mesa_shader_stage type);
 extern void
 _mesa_delete_shader(struct gl_context *ctx, struct gl_shader *sh);
 
+/** The attached shaders a link has locked and referenced. */
+struct gl_shader_link_locks {
+   struct gl_shader **shaders;
+   unsigned count;
+   struct gl_shader *inline_shaders[8];
+};
+
+extern bool
+_mesa_lock_attached_shaders(struct gl_context *ctx,
+                            const struct gl_shader_program *shProg,
+                            struct gl_shader_link_locks *locks);
+
+extern void
+_mesa_unlock_attached_shaders(struct gl_context *ctx,
+                              struct gl_shader_link_locks *locks);
+
 extern void
 _mesa_delete_linked_shader(struct gl_context *ctx,
                            struct gl_linked_shader *sh);

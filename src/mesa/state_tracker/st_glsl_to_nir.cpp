@@ -436,11 +436,16 @@ st_nir_lower_wpos_ytransform(struct nir_shader *nir,
 
 static bool
 st_link_glsl_to_nir(struct gl_context *ctx,
-                    struct gl_shader_program *shader_program)
+                    struct gl_shader_program *shader_program,
+                    struct gl_shader_link_locks *locks)
 {
    struct st_context *st = st_context(ctx);
    struct gl_linked_shader *linked_shader[MESA_SHADER_MESH_STAGES];
    unsigned num_shaders = 0;
+
+   /* A program restored from the disk cache reads no attached shader. */
+   if (shader_program->data->LinkStatus == LINKING_SKIPPED)
+      _mesa_unlock_attached_shaders(ctx, locks);
 
    /* Return early if we are loading the shader from on-disk cache */
    if (st_load_nir_from_disk_cache(ctx, shader_program)) {
@@ -455,6 +460,11 @@ st_link_glsl_to_nir(struct gl_context *ctx,
       if (!gl_nir_link_glsl(ctx, shader_program))
          return GL_FALSE;
    }
+
+   /* The linked shaders are copies; nothing below reads the attached
+    * shaders, so other contexts may compile them during the backend compile.
+    */
+   _mesa_unlock_attached_shaders(ctx, locks);
 
    for (unsigned i = 0; i < MESA_SHADER_MESH_STAGES; i++) {
       if (shader_program->_LinkedShaders[i])
@@ -772,7 +782,8 @@ st_finalize_nir(struct st_context *st, struct gl_program *prog,
  * Link a GLSL shader program.  Called via glLinkProgram().
  */
 void
-st_link_shader(struct gl_context *ctx, struct gl_shader_program *prog)
+st_link_shader(struct gl_context *ctx, struct gl_shader_program *prog,
+               struct gl_shader_link_locks *locks)
 {
    unsigned int i;
    bool spirv = false;
@@ -826,7 +837,20 @@ st_link_shader(struct gl_context *ctx, struct gl_shader_program *prog)
       prog->SamplersValidated = GL_TRUE;
    }
 
-   if (prog->data->LinkStatus && !st_link_glsl_to_nir(ctx, prog)) {
+#ifdef ENABLE_SHADER_CACHE
+   /* Copied while the attached shaders are locked: the link releases them
+    * before the backend compile, after which another context may free them.
+    */
+   cache_key *cache_keys = NULL;
+   if (ctx->Cache && prog->data->LinkStatus == LINKING_SUCCESS && !spirv) {
+      cache_keys = (cache_key *) malloc(prog->NumShaders * sizeof(cache_key));
+      for (i = 0; cache_keys && i < prog->NumShaders; i++)
+         memcpy(cache_keys[i], prog->Shaders[i]->disk_cache_blake3,
+                sizeof(cache_key));
+   }
+#endif
+
+   if (prog->data->LinkStatus && !st_link_glsl_to_nir(ctx, prog, locks)) {
       prog->data->LinkStatus = LINKING_FAILURE;
    }
 
@@ -834,8 +858,12 @@ st_link_shader(struct gl_context *ctx, struct gl_shader_program *prog)
       _mesa_create_program_resource_hash(prog);
 
    /* Return early if we are loading the shader from on-disk cache */
-   if (prog->data->LinkStatus == LINKING_SKIPPED)
+   if (prog->data->LinkStatus == LINKING_SKIPPED) {
+#ifdef ENABLE_SHADER_CACHE
+      free(cache_keys);
+#endif
       return;
+   }
 
    if (ctx->_Shader->Flags & GLSL_DUMP) {
       if (!prog->data->LinkStatus) {
@@ -849,8 +877,9 @@ st_link_shader(struct gl_context *ctx, struct gl_shader_program *prog)
    }
 
 #ifdef ENABLE_SHADER_CACHE
-   if (prog->data->LinkStatus)
-      shader_cache_write_program_metadata(ctx, prog);
+   if (prog->data->LinkStatus && cache_keys)
+      shader_cache_write_program_metadata(ctx, prog, cache_keys);
+   free(cache_keys);
 #endif
 }
 

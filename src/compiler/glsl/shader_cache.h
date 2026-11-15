@@ -31,7 +31,8 @@ struct gl_shader_program;
 
 void
 shader_cache_write_program_metadata(struct gl_context *ctx,
-                                    struct gl_shader_program *prog);
+                                    struct gl_shader_program *prog,
+                                    const cache_key *shader_keys);
 
 bool
 shader_cache_read_program_metadata(struct gl_context *ctx,

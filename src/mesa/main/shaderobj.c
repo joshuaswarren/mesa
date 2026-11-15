@@ -111,6 +111,7 @@ _mesa_new_shader(GLuint name, mesa_shader_stage stage)
       shader->Stage = stage;
       shader->Name = name;
       shader->RefCount = 1;
+      simple_mtx_init(&shader->Mutex, mtx_plain);
    }
    return shader;
 }
@@ -127,7 +128,81 @@ _mesa_delete_shader(struct gl_context *ctx, struct gl_shader *sh)
    free((void *)sh->FallbackSource);
    free(sh->Label);
    ralloc_free(sh->nir);
+   simple_mtx_destroy(&sh->Mutex);
    ralloc_free(sh);
+}
+
+
+static int
+compare_shader_addresses(const void *a, const void *b)
+{
+   const uintptr_t x = (uintptr_t)*(struct gl_shader *const *)a;
+   const uintptr_t y = (uintptr_t)*(struct gl_shader *const *)b;
+
+   return x < y ? -1 : x > y;
+}
+
+
+/**
+ * Lock and reference the program's attached shaders for a link, so that no
+ * other context can recompile or replace them while the link reads them.
+ * They are locked in address order so that links sharing shaders cannot
+ * deadlock, and later unlocked from this snapshot, not from the program.
+ */
+bool
+_mesa_lock_attached_shaders(struct gl_context *ctx,
+                            const struct gl_shader_program *shProg,
+                            struct gl_shader_link_locks *locks)
+{
+   const unsigned n = shProg->NumShaders;
+
+   locks->count = 0;
+   locks->shaders = locks->inline_shaders;
+   if (n > ARRAY_SIZE(locks->inline_shaders)) {
+      locks->shaders = malloc(n * sizeof(*locks->shaders));
+      if (!locks->shaders) {
+         locks->shaders = locks->inline_shaders;
+         return false;
+      }
+   }
+
+   if (n) {
+      memcpy(locks->shaders, shProg->Shaders, n * sizeof(*locks->shaders));
+      qsort(locks->shaders, n, sizeof(*locks->shaders),
+            compare_shader_addresses);
+   }
+
+   for (unsigned i = 0; i < n; i++) {
+      struct gl_shader *sh = locks->shaders[i];
+
+      if (locks->count && locks->shaders[locks->count - 1] == sh)
+         continue;
+
+      p_atomic_inc(&sh->RefCount);
+      simple_mtx_lock(&sh->Mutex);
+      locks->shaders[locks->count++] = sh;
+   }
+
+   return true;
+}
+
+
+/** Unlock what _mesa_lock_attached_shaders() locked; safe to call twice. */
+void
+_mesa_unlock_attached_shaders(struct gl_context *ctx,
+                              struct gl_shader_link_locks *locks)
+{
+   for (unsigned i = 0; i < locks->count; i++)
+      simple_mtx_unlock(&locks->shaders[i]->Mutex);
+
+   for (unsigned i = 0; i < locks->count; i++)
+      _reference_shader(ctx, &locks->shaders[i], NULL, false);
+
+   if (locks->shaders != locks->inline_shaders)
+      free(locks->shaders);
+
+   locks->shaders = locks->inline_shaders;
+   locks->count = 0;
 }
 
 
