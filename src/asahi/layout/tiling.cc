@@ -410,7 +410,7 @@ ail_lines_tile(T *tile, uint8_t *linear, unsigned linear_pitch_B, unsigned area,
    const unsigned *offs = tab->offs;
    bool neon = tab->neon;
 #if defined(__aarch64__)
-   uint8x16x4_t perm = vld1q_u8_x4(ail_line_perms<T, is_store>.p);
+   uint8x16x4_t perm = vld1q_u8_x4((ail_line_perms<T, is_store>.p));
 #endif
 
    for (unsigned i = 0; i < area; i += 64 / sizeof(T)) {
@@ -447,7 +447,7 @@ ail_lines_interior(T *tile, uint8_t *linear, unsigned linear_pitch_B,
    unsigned step_y = ail_space_bits(line_h) << 1;
    unsigned x_start = ail_space_bits(dx0), y_offs = ail_space_bits(dy0) << 1;
 #if defined(__aarch64__)
-   uint8x16x4_t perm = vld1q_u8_x4(ail_line_perms<T, is_store>.p);
+   uint8x16x4_t perm = vld1q_u8_x4((ail_line_perms<T, is_store>.p));
 #endif
 
    for (unsigned dy = dy0; dy < dy1; dy += line_h) {
