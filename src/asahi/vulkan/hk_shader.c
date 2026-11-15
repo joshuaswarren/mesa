@@ -1004,6 +1004,17 @@ hk_hash_graphics_state(struct vk_physical_device *device,
                           sizeof(no_fragment_shader));
    }
 
+   /* M5 removes user varyings from the mesh shader of a fragmentless
+    * pipeline (hk_m5_prune_fragmentless_mesh_outputs), so that mesh shader
+    * compiles differently for a pre-rasterization library. */
+   if (agx_chip_g17_m5(((struct hk_physical_device *)device)->dev.chip) &&
+       (stages & VK_SHADER_STAGE_MESH_BIT_EXT) &&
+       !(stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
+      const bool no_fragment_shader = hk_pipeline_has_no_fragment_shader(state);
+      _mesa_blake3_update(&blake3_ctx, &no_fragment_shader,
+                          sizeof(no_fragment_shader));
+   }
+
    /* M5 triangle mesh point-size removal is a pipeline-only lowering. */
    if (agx_chip_g17_m5(((struct hk_physical_device *)device)->dev.chip) &&
        (stages & VK_SHADER_STAGE_MESH_BIT_EXT)) {
@@ -8157,6 +8168,28 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       if (last->info.stage <= MESA_SHADER_GEOMETRY)
          NIR_PASS(_, last, nir_remove_outputs, MESA_SHADER_FRAGMENT,
                   BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32), 0);
+   }
+
+   /* The same holds for an M5 mesh shader, and there it decides whether the
+    * pipeline can be built at all: agx_nir_lower_m5_mesh gives every
+    * primitive private vertices when a per-primitive user word is written
+    * (agx_m5_mesh_unwelds), and refuses once corners * max_primitives
+    * exceeds the 256 vertices its 8-bit index bytes can name. A fragmentless
+    * triangle mesh declaring max_primitives=256 with a per-primitive colour
+    * (dEQP-VK.mesh_shader.ext.smoke.monolithic.
+    * mesh_shader_triangle_rasterization_disabled) needs 768 and was refused
+    * for a word nothing reads. Layer, viewport, primitive ID, clip and cull
+    * words stay: they are not in VAR0..VAR31. A shader that reads its
+    * outputs back is left alone (the lowering refuses those regardless). */
+   if (agx_chip_g17_m5(dev->dev.chip) && shader_count > 0 &&
+       hk_pipeline_has_no_fragment_shader(state)) {
+      nir_shader *last = shaders[shader_count - 1];
+      if (last->info.stage == MESA_SHADER_MESH) {
+         nir_shader_gather_info(last, nir_shader_get_entrypoint(last));
+         if (!last->info.outputs_read)
+            NIR_PASS(_, last, nir_remove_outputs, MESA_SHADER_FRAGMENT,
+                     BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32), 0);
+      }
    }
 
    struct hk_fs_key color_key;
