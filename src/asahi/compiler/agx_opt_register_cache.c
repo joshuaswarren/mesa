@@ -245,6 +245,32 @@ agx_opt_register_cache(agx_context *ctx)
             assert(!(I->src[s].discard && I->src[s].cache));
          }
 
+         /* M5 (AGX3C): a register read by more than one source of the same
+          * instruction is not discarded by any of them. With both sources
+          * discarding, allocate_uvb with the primitive and vertex counts in
+          * one register (point meshes) read the wrong vertex count; the
+          * discard appears to take effect before the later read. Not
+          * setting a discard is always safe: it only gives up a register
+          * cache saving. */
+         if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
+            agx_foreach_reg_src(I, s) {
+               if (!I->src[s].discard)
+                  continue;
+               const unsigned a = I->src[s].value;
+               const unsigned an = agx_index_size_16(I->src[s]);
+               agx_foreach_reg_src(I, t) {
+                  if (t == s)
+                     continue;
+                  const unsigned b = I->src[t].value;
+                  const unsigned bn = agx_index_size_16(I->src[t]);
+                  if (a < b + bn && b < a + an) {
+                     I->src[s].discard = false;
+                     break;
+                  }
+               }
+            }
+         }
+
          postra_liveness_ins(live, I);
       }
    }
