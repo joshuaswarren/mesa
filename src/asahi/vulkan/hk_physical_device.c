@@ -2212,11 +2212,12 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    supported_extensions.KHR_cooperative_matrix =
       agx_chip_cooperative_matrix_supported(pdev->dev.chip);
 
-   /* bf16 inputs ride the same 8x8 form, but no AGX3B bf16 matmad has been
-    * witnessed from Apple yet, so KHR_shader_bfloat16 stays M5-only until a
-    * fixture (and bf16 CTS) proves it on AGX3B. */
+   /* bf16 inputs ride the same 8x8 matmad form on AGX3B: a bf16 value
+    * widens to f32 exactly, so a bf16 product accumulated in f32 matches an
+    * f32 matmad of the same values bit for bit. bf16 therefore follows the
+    * cooperative matrix paths on both encodings. */
    supported_extensions.KHR_shader_bfloat16 =
-      m5_cmat;
+      agx_chip_cooperative_matrix_supported(pdev->dev.chip);
 
    /* Most of VK_NV_cooperative_matrix2 (flexible dimensions, tensor
     * addressing, block loads, per-element operations, reductions) is lowered

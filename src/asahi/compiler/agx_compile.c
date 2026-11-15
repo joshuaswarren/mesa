@@ -15852,9 +15852,11 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    nir_shader_compiler_options agx3_options;
    if (is_agx3) {
       agx3_options = *original_options;
-      if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
-         /* f2bf rounds to nearest even here; the shared lowering, which
-          * truncates, is left only bf2f. */
+      if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C ||
+          key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
+         /* Neither encoding has a bf16 conversion. f2bf rounds to nearest
+          * even here; the shared lowering, which truncates, is left only
+          * bf2f. */
          NIR_PASS(_, nir, agx_nir_lower_f2bf_rtne);
          agx3_options.lower_bfloat16_conversions = true;
       }
