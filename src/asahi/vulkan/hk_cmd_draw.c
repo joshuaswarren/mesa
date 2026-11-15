@@ -1847,7 +1847,9 @@ hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
                                  : 3;
       programs[2].usage_flags = DRM_ASAHI_RENDER_PROGRAM_OBJECT;
       /* A task stage compiled for the native object->mesh record asks the
-       * kernel for the TA mesh rendering buffer that backs it. */
+       * kernel for the TA mesh rendering buffer that backs it. That buffer
+       * backs the payload too, so a task whose mesh reads no grid
+       * (hk_mesh_info::m5_no_grid_record) asks for it the same way. */
       if (task && hk_m5_task_record(dev->dev.params.features))
          programs[2].usage_flags |= DRM_ASAHI_RENDER_PROGRAM_TASK;
    }
@@ -11703,7 +11705,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                return;
             }
             /* Native object->mesh kicks (native726 mesh-object, 0x1ca48
-             * bound) set tail[0]; task kicks with the native record do too.
+             * bound) set tail[0]; task kicks with the native record do too,
+             * with or without the grid at +0 (the buffer stays bound).
              * Payload-free task kicks without it keep the mesh-only value. */
             if ((task && hk_m5_task_record(dev->dev.params.features)) ||
                 debug_get_option_mesh_pp_tail0())
@@ -13511,6 +13514,10 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
+      /* Only a task and mesh shader compiled together leave the grid record
+       * out, and those are only drawn together (hk_m5_no_grid_record()). */
+      assert(task->info.mesh.m5_no_grid_record ==
+             mesh_info->m5_no_grid_record);
       if (task_gpu_dispatch) {
          struct agx_ptr flag = hk_pool_alloc(cmd, 4, 4);
          if (!flag.cpu) {

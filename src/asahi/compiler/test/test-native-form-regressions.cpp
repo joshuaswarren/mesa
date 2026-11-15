@@ -4458,6 +4458,122 @@ TEST(NativeForms, M5TaskGridFitsFullThreadgroupMemory)
    }
 }
 
+/* The constant byte offset past the payload address of a lowered payload
+ * access, or UINT64_MAX if the address is not payload address + constant. */
+static uint64_t
+m5_payload_access_offset(nir_def *addr)
+{
+   nir_scalar a = nir_scalar_resolved(addr, 0);
+   if (!nir_scalar_is_alu(a) || nir_scalar_alu_op(a) != nir_op_iadd)
+      return UINT64_MAX;
+   for (unsigned k = 0; k < 2; ++k) {
+      nir_scalar c = nir_scalar_chase_alu_src(a, k);
+      if (nir_scalar_is_const(c))
+         return nir_scalar_as_uint(c);
+   }
+   return UINT64_MAX;
+}
+
+/* Without the grid record (a mesh that never reads gl_NumWorkGroups) the
+ * task stores no child grid at the payload address and both stages address
+ * the payload from +0; with it, the grid takes +0 and the payload starts at
+ * +16. A payload word at byte 1020 is the last of a full 1 KiB payload. */
+TEST(NativeForms, M5TaskPayloadAtZeroWithoutGridRecord)
+{
+   for (bool grid_record : {false, true}) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_TASK,
+         &agx_nir_options, "task payload layout");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.task_payload_size = 1024;
+      nir_store_task_payload(&b, nir_imm_int(&b, 7), nir_imm_int(&b, 1020),
+                             .align_mul = 4);
+      nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 256, 1, 1));
+      ASSERT_TRUE(agx_nir_lower_m5_task(b.shader, 16384, grid_record));
+      nir_validate_shader(b.shader, "task payload layout");
+      NIR_PASS(_, b.shader, nir_opt_constant_folding);
+      unsigned grid_stores = 0, payload_stores = 0;
+      uint64_t payload_offset = UINT64_MAX;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(in, block) {
+            if (in->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+            EXPECT_NE(i->intrinsic, nir_intrinsic_store_task_payload);
+            if (i->intrinsic != nir_intrinsic_store_global)
+               continue;
+            if (i->src[0].ssa->num_components == 3) {
+               grid_stores++;
+            } else {
+               payload_stores++;
+               payload_offset = m5_payload_access_offset(i->src[1].ssa);
+            }
+         }
+      }
+      EXPECT_EQ(grid_stores, grid_record ? 1u : 0u);
+      EXPECT_EQ(payload_stores, 1u);
+      EXPECT_EQ(payload_offset, grid_record ? 1036u : 1020u);
+      ralloc_free(b.shader);
+   }
+
+   /* The mesh side of the same two layouts. */
+   for (unsigned base : {0u, 16u}) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_MESH,
+         &agx_nir_options, "mesh payload layout");
+      b.shader->info.task_payload_size = 1024;
+      nir_def *value = nir_load_task_payload(&b, 1, 32, nir_imm_int(&b, 1020),
+                                             .align_mul = 4);
+      nir_store_global(&b, value, nir_imm_int64(&b, 0x2000000),
+                       .write_mask = 1, .align_mul = 4);
+      ASSERT_TRUE(agx_nir_lower_m5_task_payload(b.shader, 16384, base));
+      nir_validate_shader(b.shader, "mesh payload layout");
+      NIR_PASS(_, b.shader, nir_opt_constant_folding);
+      uint64_t load_offset = UINT64_MAX;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(in, block) {
+            if (in->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+            EXPECT_NE(i->intrinsic, nir_intrinsic_load_task_payload);
+            if (i->intrinsic == nir_intrinsic_load_global)
+               load_offset = m5_payload_access_offset(i->src[0].ssa);
+         }
+      }
+      EXPECT_EQ(load_offset, 1020u + base);
+      ralloc_free(b.shader);
+   }
+}
+
+/* A payload-free task on a kernel that backs the payload keeps the
+ * rendezvous form without the grid record: only a kernel without payload
+ * storage takes the direct form. */
+TEST(NativeForms, M5PayloadFreeTaskWithoutGridRecordKeepsRendezvous)
+{
+   for (unsigned max_payload_B : {0u, 16384u}) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_TASK,
+         &agx_nir_options, "payload-free task");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 2, 1, 1));
+      ASSERT_TRUE(agx_nir_lower_m5_task(b.shader, max_payload_B, false));
+      nir_validate_shader(b.shader, "payload-free task");
+      bool exit_barrier = false, global_stores = false;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(in, block) {
+            if (in->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+            exit_barrier |=
+               i->intrinsic == nir_intrinsic_object_payload_exit_barrier_agx;
+            global_stores |= i->intrinsic == nir_intrinsic_store_global;
+         }
+      }
+      EXPECT_EQ(exit_barrier, max_payload_B != 0);
+      EXPECT_FALSE(global_stores);
+      ralloc_free(b.shader);
+   }
+}
+
 TEST(NativeForms, M5MeshUserSharedBarrierCompile)
 {
    for (unsigned shared : {0u,4u,64u,128u}) {
