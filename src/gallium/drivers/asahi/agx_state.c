@@ -100,9 +100,8 @@ static const uint8_t agx_g17p_native_write_control[32] = {
  * the page holding kick 19's image) and is left zero here, as Mesa's G18G
  * sampler slots already are past their first quadword; if it is a
  * border-colour pointer, clamp-to-edge never reads it. */
-static const uint8_t agx_g18g_native_write_state1[32] = {
-   0x00, 0x00, 0x0f, 0x08, 0x00, 0x07, 0x00, 0x00,
-};
+static const uint8_t agx_g18g_native_write_state1[32] =
+   AGX_G18G_WRITE_STATE1_INIT;
 
 #include "agx_device.h"
 #include "agx_disk_cache.h"

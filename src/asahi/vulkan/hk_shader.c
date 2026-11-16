@@ -4838,6 +4838,21 @@ hk_vs_covers_clip_square(const nir_shader *vs)
    return true;
 }
 
+/* G18G compute: keep a lowered clone of the shader if its pass succeeded,
+ * otherwise drop the clone and keep the shader as it was. */
+static bool
+hk_g18g_keep_lowered(nir_shader **nir, nir_shader *clone, bool lowered)
+{
+   if (!lowered) {
+      ralloc_free(clone);
+      return false;
+   }
+
+   ralloc_free(*nir);
+   *nir = clone;
+   return true;
+}
+
 /* G18G compute: whether an image access is left on the AGX2 bindless or
  * deref form. Such accesses compiled but silently did nothing on G18G when
  * tested, so they are refused at dispatch. bindless_image_agx only forms a
@@ -4985,13 +5000,41 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       }
    } else if (dev->dev.chip == AGX_CHIP_G18G &&
               nir->info.stage == MESA_SHADER_COMPUTE) {
-      nir_shader *candidate = nir_shader_clone(NULL, nir);
-      if (candidate && agx_nir_lower_g17p_indexed_samplers(candidate)) {
-         ralloc_free(nir);
-         nir = candidate;
-         shader->info.agx3_indexed_sampler_valid = true;
+      /* The storage routes go first: the state-0 route takes a single
+       * storage image (write-only, or Gallium's read-write texture/PBE
+       * pair) and declines shaders with texture instructions, which the
+       * indexed sampler lowering would otherwise claim -- including the
+       * image_load of a read-write image, which that lowering cannot encode
+       * on G18G. Then several images in one set, then textures and images
+       * through per-dispatch tables, then the indexed samplers. */
+      struct agx_g17p_storage_image_binding storage;
+      struct agx_g18g_table_binding tables;
+      nir_shader *c = nir_shader_clone(NULL, nir);
+      bool storage_ok = hk_g18g_keep_lowered(
+         &nir, c, c && agx_nir_lower_g18g_storage_image(c, &storage));
+      if (!storage_ok) {
+         c = nir_shader_clone(NULL, nir);
+         storage_ok = hk_g18g_keep_lowered(
+            &nir, c, c && agx_nir_lower_g18g_storage_images(c, &storage));
+      }
+
+      if (storage_ok) {
+         shader->info.agx3_storage_image_valid = true;
+         shader->info.agx3_storage_image = storage;
       } else {
-         ralloc_free(candidate);
+         c = nir_shader_clone(NULL, nir);
+         if (hk_g18g_keep_lowered(
+                &nir, c, c && agx_nir_lower_g18g_combined_tables(c, &tables))) {
+            shader->info.agx3_storage_image_valid = true;
+            shader->info.agx3_storage_image =
+               (struct agx_g17p_storage_image_binding){0};
+            shader->info.agx3_g18_tables_valid = true;
+            shader->info.agx3_g18_tables = tables;
+         } else {
+            c = nir_shader_clone(NULL, nir);
+            shader->info.agx3_indexed_sampler_valid = hk_g18g_keep_lowered(
+               &nir, c, c && agx_nir_lower_g17p_indexed_samplers(c));
+         }
       }
       shader->info.g18_unlowered_image = hk_g18g_has_unlowered_image(nir);
    } else if (agx_native_graphics(&dev->dev) &&
@@ -5403,7 +5446,10 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       }
    }
 
-   unsigned root = (shader->info.agx3_storage_image_valid ||
+   unsigned root =
+      dev->dev.chip == AGX_CHIP_G18G && shader->info.agx3_storage_image_valid
+         ? AGX_G18G_STORAGE_ROOT_HALFS
+      : (shader->info.agx3_storage_image_valid ||
                     shader->info.agx3_sampled_storage_valid ||
                     shader->info.agx3_indexed_storage_valid)
                       ? AGX_G17P_STORAGE_ROOT_HALFS

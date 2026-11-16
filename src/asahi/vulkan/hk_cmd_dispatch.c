@@ -19,6 +19,7 @@
 #include "hk_sampler_index.h"
 #include "hk_g17p_patch.h"
 #include "hk_descriptor_set.h"
+#include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
 #include "hk_gen1_rt_indirect_contract.h"
 #include "hk_entrypoints.h"
@@ -43,6 +44,9 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* The G18G image-write state record (AGX_G18G_WRITE_STATE1_INIT). */
+static const uint8_t hk_g18g_write_state1[32] = AGX_G18G_WRITE_STATE1_INIT;
 
 /* Diagnostic controls, read once: these are consulted per dispatch, and an
  * uncached getenv() scans the whole environment. */
@@ -2558,7 +2562,8 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                 s->b.info.agx3_spectpr_scratch_size ||
                 s->b.info.nr_preamble_gprs)) ||
        (g18 && s->info.g18_unlowered_image) ||
-       s->info.agx3_txf_texture_valid || s->info.agx3_storage_image_valid ||
+       s->info.agx3_txf_texture_valid ||
+       (s->info.agx3_storage_image_valid && !g18) ||
        s->info.agx3_sampled_storage_valid || s->info.agx3_indexed_storage_valid ||
        !local_size.x || !local_size.y || !local_size.z ||
        (uint64_t)local_size.x * local_size.y * local_size.z > 1024) {
@@ -2601,6 +2606,108 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       if (dev->sampled_images.bo)
          hk_cmd_buffer_retain_bo(cmd, dev->sampled_images.bo);
       hk_cmd_buffer_retain_bo(cmd, dev->samplers.table.bo);
+   }
+   if (g18 && s->info.agx3_storage_image_valid &&
+       s->info.agx3_g18_tables_valid) {
+      /* Textures + storage images: build the texture-state and sampler
+       * tables from the bound sets (agx_nir_lower_g18g_combined_tables). */
+      const struct agx_g18g_table_binding *t = &s->info.agx3_g18_tables;
+      uint8_t tex[AGX_G18G_TABLE_MAX_TEXTURES][32];
+      uint8_t smp[AGX_G18G_TABLE_MAX_SAMPLERS][32];
+      memset(smp, 0, sizeof(smp));
+      memcpy(smp[0], hk_g18g_write_state1, sizeof(hk_g18g_write_state1));
+      bool ok =
+         t->texture_count && t->texture_count <= AGX_G18G_TABLE_MAX_TEXTURES &&
+         t->sampler_count < AGX_G18G_TABLE_MAX_SAMPLERS &&
+         (!t->sampler_count ||
+          (dev->samplers.table.map && dev->samplers.table.desc_size == 32));
+      for (unsigned i = 0; ok && i < t->texture_count; ++i) {
+         const struct agx_g18g_table_entry *e = &t->textures[i];
+         const struct hk_descriptor_set *set =
+            e->set < HK_MAX_SETS ? descriptors->sets[e->set] : NULL;
+         /* The tables snapshot set memory when the dispatch is recorded:
+          * refuse sets that may legally change after binding. */
+         if (!set || !set->mapped_ptr || e->offset_B > set->size ||
+             set->size - e->offset_B < 32 ||
+             (set->layout->vk.flags &
+              VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT))
+            ok = false;
+         else
+            memcpy(tex[i], (const uint8_t *)set->mapped_ptr + e->offset_B, 32);
+      }
+      for (unsigned i = 0; ok && i < t->sampler_count; ++i) {
+         const struct agx_g18g_table_entry *e = &t->samplers[i];
+         const struct hk_descriptor_set *set =
+            e->set < HK_MAX_SETS ? descriptors->sets[e->set] : NULL;
+         uint16_t published;
+         if (!set || !set->mapped_ptr || e->offset_B > set->size ||
+             set->size - e->offset_B < sizeof(published) ||
+             (set->layout->vk.flags &
+              VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)) {
+            ok = false;
+            break;
+         }
+         memcpy(&published, (const uint8_t *)set->mapped_ptr + e->offset_B,
+                sizeof(published));
+         const uint16_t native = hk_sampler_heap_index(
+            set->layout->native_sampler_indices, published);
+         if (native >= dev->samplers.table.alloc) {
+            ok = false;
+            break;
+         }
+         memcpy(smp[1 + i],
+                (const uint8_t *)dev->samplers.table.map + native * 32u, 32);
+      }
+      if (!ok) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      const uint64_t tex_va =
+         hk_pool_upload(cmd, tex, 32u * t->texture_count, 64);
+      const uint64_t smp_va =
+         hk_pool_upload(cmd, smp, 32u * (1u + t->sampler_count), 64);
+      const uint64_t pointers[2] = {tex_va, smp_va};
+      texture_pointers = tex_va && smp_va
+                            ? hk_pool_upload(cmd, pointers, sizeof(pointers), 8)
+                            : 0;
+      if (!texture_pointers) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+   } else if (g18 && s->info.agx3_storage_image_valid) {
+      /* One image, or several in one set: the table in the descriptor set
+       * (the resolved PBE, or {texture, PBE} pairs) and the G18G
+       * write-state record. */
+      const unsigned table_set = s->info.agx3_storage_image.set;
+      if (table_set >= HK_MAX_SETS) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      const uint64_t set_address = descriptors->root.sets[table_set];
+      const uint32_t set_size = descriptors->set_sizes[table_set];
+      /* Read-write: the {texture, PBE} pair as Gallium's two-entry table. */
+      const uint32_t pbe_offset =
+         s->info.agx3_storage_image.write_only
+            ? s->info.agx3_storage_image.pbe_offset_B
+            : s->info.agx3_storage_image.texture_offset_B;
+      const uint32_t table_size =
+         s->info.agx3_storage_image.table_size_B
+            ? s->info.agx3_storage_image.table_size_B
+            : (s->info.agx3_storage_image.write_only ? 32 : 64);
+      if (!set_address || pbe_offset > set_size ||
+          set_size - pbe_offset < table_size) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      const uint64_t write_state = hk_pool_upload(
+         cmd, hk_g18g_write_state1, sizeof(hk_g18g_write_state1), 32);
+      const uint64_t pointers[2] = {set_address + pbe_offset, write_state};
+      texture_pointers =
+         write_state ? hk_pool_upload(cmd, pointers, sizeof(pointers), 8) : 0;
+      if (!texture_pointers) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
    }
    if (!root || (s->info.agx3_indexed_sampler_valid && !texture_pointers)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);

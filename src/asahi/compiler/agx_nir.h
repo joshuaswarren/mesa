@@ -209,6 +209,14 @@ struct agx_g17p_combined_sampler_binding {
  * PBE and a sampler-shaped state record (native run112 kick 19 launch 1
  * loads exactly these 16 bytes into u0..u3). */
 #define AGX_G18G_STORAGE_ROOT_HALFS 8u
+/* Initializer of that 32-byte state record, shared by Gallium and hk. It is
+ * also entry 0 of the sampler table on the G18G image-write routes. Moved
+ * unchanged from Gallium's agx_g18g_native_write_state1 (agx_state.c), whose
+ * comment records where the value comes from and how it decodes. */
+#define AGX_G18G_WRITE_STATE1_INIT                                             \
+   {                                                                           \
+      0x00, 0x00, 0x0f, 0x08, 0x00, 0x07, 0x00, 0x00,                          \
+   }
 struct agx_g17p_txf_binding {
    uint32_t texture_offset_B;
 };
@@ -219,6 +227,11 @@ struct agx_g17p_storage_image_binding {
    uint32_t texture_offset_B;
    uint32_t pbe_offset_B;
    bool write_only;
+   /* G18G multi-image table: bytes from texture_offset_B the state table
+    * spans (0 = one image: 32 write-only, else 64). */
+   uint32_t table_size_B;
+   /* G18G: descriptor set holding the table (0 for the older routes). */
+   uint8_t set;
 };
 
 /* Apple's sampled-texture-to-write-image kernel ABI places a sampled texture,
@@ -275,6 +288,36 @@ bool agx_nir_lower_g17p_txf(
  * texture-state 0 / PBE-state 0. Every other image shape stays fail-closed. */
 bool agx_nir_lower_g17p_storage_image(
    struct nir_shader *s, struct agx_g17p_storage_image_binding *binding);
+
+/* G18G: the same state-0 route for one storage image of any colour format,
+ * write-only or read-write (a {texture, PBE} table of two entries). */
+bool agx_nir_lower_g18g_storage_image(
+   struct nir_shader *s, struct agx_g17p_storage_image_binding *binding);
+
+/* G18G: several storage images in one descriptor set through one state
+ * table spanning their descriptors (binding->table_size_B). */
+bool agx_nir_lower_g18g_storage_images(
+   struct nir_shader *shader, struct agx_g17p_storage_image_binding *binding);
+
+/* G18G per-dispatch native tables (agx_nir_lower_g18g_combined_tables):
+ * sampled textures and storage images in one compute shader, in any sets. */
+#define AGX_G18G_TABLE_MAX_TEXTURES 16
+#define AGX_G18G_TABLE_MAX_SAMPLERS 8
+struct agx_g18g_table_entry {
+   uint8_t set;
+   uint32_t offset_B;
+};
+struct agx_g18g_table_binding {
+   /* Texture-state entries: 32-byte copies from set memory. */
+   uint8_t texture_count;
+   /* Sampler entries 1..: heap records named by the published 16-bit index
+    * at (set, offset_B); entry 0 is the G18G write-state record. */
+   uint8_t sampler_count;
+   struct agx_g18g_table_entry textures[AGX_G18G_TABLE_MAX_TEXTURES];
+   struct agx_g18g_table_entry samplers[AGX_G18G_TABLE_MAX_SAMPLERS - 1];
+};
+bool agx_nir_lower_g18g_combined_tables(struct nir_shader *shader,
+                                        struct agx_g18g_table_binding *binding);
 
 /* Lower Gallium's exact write-only scalar-integer image state to native
  * G17P PBE state 0. The caller publishes the resolved PBE pointer and native
