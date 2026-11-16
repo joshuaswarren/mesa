@@ -173,9 +173,17 @@ struct hk_vs_key {
 };
 static_assert(sizeof(struct hk_vs_key) == 260, "packed");
 
+struct hk_mesh_key {
+   /** An M5 mesh shader compiled without a fragment shader: write a zero
+    * gl_PrimitiveLayerEXT for every primitive (hk_m5_mesh_default_layer()).
+    */
+   bool default_layer;
+};
+
 union hk_key {
    struct hk_vs_key vs;
    struct hk_fs_key fs;
+   struct hk_mesh_key mesh;
 };
 
 static void
@@ -3910,6 +3918,88 @@ hk_mesh_default_point_size(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* Whether a lowered store writes this varying slot. */
+static bool
+hk_store_writes_slot(const nir_intrinsic_instr *intr, gl_varying_slot slot)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_store_output:
+   case nir_intrinsic_store_per_vertex_output:
+   case nir_intrinsic_store_per_primitive_output:
+   case nir_intrinsic_store_per_view_output:
+      break;
+   default:
+      return false;
+   }
+   const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   return sem.location <= slot && slot < sem.location + sem.num_slots;
+}
+
+/* A fragment shader reading gl_Layer links that input to the layer word of
+ * the mesh shader's UVS, and an M5 mesh shader that writes neither
+ * gl_PrimitiveLayerEXT nor gl_ViewportIndex has no such word. A vertex shader
+ * compiled without its fragment shader gets a zero layer output for that
+ * reason (agx_nir_lower_default_layer()). Give an M5 mesh shader compiled
+ * without its fragment shader the same: store gl_PrimitiveLayerEXT = 0 for
+ * every primitive the workgroup may output, as an application would, so that
+ * agx_m5_mesh_gather_varyings() and agx_nir_lower_m5_mesh() treat it like an
+ * application-written per-primitive layer. The stores come first in main,
+ * where every invocation of the workgroup executes them. A written viewport
+ * already exports a zero layer word.
+ *
+ * Runs on lowered I/O, after nir_lower_io_to_scalar(), and returns whether
+ * it added the stores.
+ */
+static bool
+hk_m5_mesh_default_layer(nir_shader *nir)
+{
+   const unsigned prims = nir->info.mesh.max_primitives_out;
+   const unsigned threads = nir->info.workgroup_size[0] *
+                            nir->info.workgroup_size[1] *
+                            nir->info.workgroup_size[2];
+   if (nir->info.stage != MESA_SHADER_MESH ||
+       (nir->info.outputs_written & (VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT)) ||
+       nir->info.workgroup_size_variable || prims == 0 || threads == 0)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (hk_store_writes_slot(intr, VARYING_SLOT_LAYER) ||
+             hk_store_writes_slot(intr, VARYING_SLOT_VIEWPORT))
+            return false;
+      }
+   }
+
+   /* Invocation i stores primitives i, i + threads, ... below prims. */
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   for (unsigned first = 0; first < prims; first += threads) {
+      nir_def *prim = nir_iadd_imm(&b, lane, first);
+      nir_if *partial = NULL;
+      if (first + threads > prims)
+         partial = nir_push_if(&b, nir_ult_imm(&b, prim, prims));
+      /* nir_lower_io's form of a gl_PrimitiveLayerEXT store. */
+      nir_store_per_primitive_output(&b, nir_imm_int(&b, 0), prim,
+                                     nir_imm_int(&b, 0), .base = 0,
+                                     .range = 1, .write_mask = 1,
+                                     .component = 0,
+                                     .src_type = nir_type_int32,
+                                     .io_semantics = {
+                                        .location = VARYING_SLOT_LAYER,
+                                        .num_slots = 1});
+      if (partial)
+         nir_pop_if(&b, partial);
+   }
+
+   nir->info.outputs_written |= VARYING_BIT_LAYER;
+   nir->info.per_primitive_outputs |= VARYING_BIT_LAYER;
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
 static bool
 kill_mesh_triangle_psiz_write(nir_builder *b, nir_intrinsic_instr *intr,
                                void *data)
@@ -6901,6 +6991,8 @@ hk_compile_source_create(void *nir, size_t nir_size, const union hk_key *key,
 /* twin_of: compile a twin of the shader that saved these inputs, with
  * custom-border emulation; mesh_fs: the twin is the fragment shader for a
  * G17P mesh shader with these per-primitive records (hk_mesh_fs_twin());
+ * mesh_default_layer: an M5 mesh shader compiled without a fragment shader
+ * (hk_m5_mesh_default_layer());
  * m5_no_grid_record: an M5 task or mesh shader compiled with its partner
  * stage, leaving the grid record out (hk_m5_no_grid_record()). */
 static VkResult
@@ -6910,8 +7002,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   const VkAllocationCallbacks *pAllocator,
                   const struct hk_border_source *twin_of,
                   const struct agx_m5_mesh_varyings *mesh_fs,
-                  bool no_default_layer, int vs_covers,
-                  bool m5_no_grid_record,
+                  bool no_default_layer, bool mesh_default_layer,
+                  int vs_covers, bool m5_no_grid_record,
                   struct hk_api_shader **shader_out)
 {
    VkResult result;
@@ -7046,6 +7138,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       hk_populate_vs_key(&key_tmp.vs, state);
       key_tmp.vs.no_default_layer = no_default_layer;
       has_key = true;
+   } else if (info->stage == MESA_SHADER_MESH) {
+      /* Only the twins this shader keeps the NIR for read it back. */
+      key_tmp.mesh.default_layer = mesh_default_layer;
    }
 
    /* A fragment shader whose depth/stencil feedback loop is only known at
@@ -7294,6 +7389,18 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          NIR_PASS(_, nir, agx_nir_lower_cull_distance_vs);
       }
       const bool m5_mesh = agx_chip_g17_m5(dev->dev.chip);
+      /* The layer word gives every primitive private vertices, which must
+       * fit the native output limits (agx_nir_lower_m5_mesh()). Keep the
+       * shader as it was to compile instead where they do not. */
+      nir_shader *m5_without_layer = NULL;
+      if (dev->dev.chip == AGX_CHIP_G17S && key_tmp.mesh.default_layer) {
+         m5_without_layer = nir_shader_clone(NULL, nir);
+         if (m5_without_layer && !hk_m5_mesh_default_layer(nir)) {
+            ralloc_free(m5_without_layer);
+            m5_without_layer = NULL;
+         }
+      }
+   m5_mesh_layout:;
       bool layout_ok = m5_mesh ? agx_m5_mesh_gather_varyings(nir, &varyings)
                               : agx_gen1_mesh_gather_varyings(nir, &varyings);
       varyings.clip_m1_1 = clip_m1_1 && dev->dev.chip == AGX_CHIP_G17P;
@@ -7393,6 +7500,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          varyings.clip_distance_first == shader->info.uvs.group_offs[UVS_CLIP_DIST];
       layout_ok &= !m5_mesh || !varyings.lv ||
          varyings.lv_first == shader->info.uvs.group_offs[UVS_LAYER_VIEWPORT];
+      /* Nor may the layer word take the user words past what a draw links
+       * (hk_g17p_smooth_varyings_supported_uncached()). */
+      layout_ok &= !m5_without_layer ||
+         shader->info.uvs.user_size <= HK_AGX3_G17P_MAX_USER_WORDS;
       if (!layout_ok ||
           !(m5_mesh ? (hk_m5_task_enabled()
                           ? agx_nir_lower_m5_task_payload(nir,
@@ -7403,10 +7514,29 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                     : agx_nir_lower_gen1_task_payload_probe(nir)) ||
           !(m5_mesh ? agx_nir_lower_m5_mesh(nir, &varyings)
                     : agx_nir_lower_gen1_mesh(nir, &varyings))) {
+         if (m5_without_layer) {
+            /* Drop this attempt, which the payload lowering may already
+             * have changed, and lay out the shader as it was before the
+             * layer stores, as without them. */
+            ralloc_free(nir);
+            nir = m5_without_layer;
+            m5_without_layer = NULL;
+            memset(&shader->info.uvs, 0, sizeof(shader->info.uvs));
+            goto m5_mesh_layout;
+         }
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
                           "native mesh layout outside captured triangle contract");
+      }
+      if (key_tmp.mesh.default_layer) {
+         const bool m5_default_layer = m5_without_layer != NULL;
+         ralloc_free(m5_without_layer);
+         if (m5_default_layer)
+            shader->info.mesh.primitive_outputs |= VARYING_BIT_LAYER;
+         /* A twin compiles with what this shader compiled with. */
+         if (obj->border_source)
+            obj->border_source->key.mesh.default_layer = m5_default_layer;
       }
       /* Per-primitive outputs can raise the exported vertex count. */
       shader->info.mesh.max_vertices = nir->info.mesh.max_vertices_out;
@@ -7871,7 +8001,7 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
                   struct hk_api_shader **shader_out)
 {
    return hk_compile_shader_impl(dev, info, state, features, allocator, NULL,
-                                 NULL, false, -1, false, shader_out);
+                                 NULL, false, false, -1, false, shader_out);
 }
 
 static VkResult
@@ -7900,7 +8030,7 @@ hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
     * drawn with the same partner stage. */
    const bool m5_no_grid_record = obj->variants[0].info.mesh.m5_no_grid_record;
    VkResult result = hk_compile_shader_impl(dev, &info, NULL, NULL, NULL, src,
-                                            mesh_fs, false, -1,
+                                            mesh_fs, false, false, -1,
                                             m5_no_grid_record, &shader);
    *built = result == VK_SUCCESS ? shader : NULL;
    return result;
@@ -8319,9 +8449,10 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
     * else consumes the output, and its UVS words would be stored for every
     * vertex. A vertex shader compiled alone keeps it for whichever fragment
     * shader it meets. */
-   bool fs_reads_layer = true;
+   bool fs_reads_layer = true, has_fragment = false;
    for (uint32_t i = 0; i < shader_count; i++) {
       if (shaders[i]->info.stage == MESA_SHADER_FRAGMENT) {
+         has_fragment = true;
          nir_shader_gather_info(shaders[i],
                                 nir_shader_get_entrypoint(shaders[i]));
          fs_reads_layer =
@@ -8330,6 +8461,15 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                         SYSTEM_VALUE_LAYER_ID);
       }
    }
+
+   /* An M5 mesh shader compiled without a fragment shader, alone or with
+    * its task shader, writes a zero layer when it writes none
+    * (hk_m5_mesh_default_layer()): a pre-rasterization library or an
+    * unlinked shader object may meet a fragment shader that reads gl_Layer.
+    * A complete pipeline without a fragment shader cannot. */
+   const bool mesh_default_layer =
+      dev->dev.chip == AGX_CHIP_G17S && !has_fragment &&
+      !hk_pipeline_has_no_fragment_shader(state);
 
    for (uint32_t i = 0; i < shader_count; i++) {
       const bool no_default_layer =
@@ -8340,8 +8480,10 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                                infos[i].stage == MESA_SHADER_MESH);
       VkResult result =
          hk_compile_shader_impl(dev, &infos[i], state, features, pAllocator,
-                                NULL, NULL, no_default_layer, vs_covers[i],
-                                no_grid_record,
+                                NULL, NULL, no_default_layer,
+                                mesh_default_layer &&
+                                   infos[i].stage == MESA_SHADER_MESH,
+                                vs_covers[i], no_grid_record,
                                 (struct hk_api_shader **)&shaders_out[i]);
       if (result != VK_SUCCESS) {
          /* Clean up all the shaders before this point */
