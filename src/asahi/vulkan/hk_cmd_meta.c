@@ -4609,7 +4609,11 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
       return;
    }
 
-   bool gfx = hk_copy_requires_gfx(dst_image);
+   /* On G18G the compute upload's bindless image store compiled but wrote
+    * nothing when tested (with the 64-byte storage-image descriptor; the
+    * cause was not isolated). Its draws work, so upload through the common
+    * graphics copy. */
+   bool gfx = hk_copy_requires_gfx(dst_image) || dev->dev.chip == AGX_CHIP_G18G;
    if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
       uint8_t plane;
       VkFormat format;
@@ -4949,6 +4953,7 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
     * reinterpretation without the AGX2 compute imageblock protocol. */
    bool gfx = agx_native_graphics(&dev->dev) ||
               agx_chip_g17_m5(dev->dev.chip) ||
+              dev->dev.chip == AGX_CHIP_G18G || /* see the upload above */
               hk_copy_requires_gfx(dst_image);
    VkPipelineBindPoint bind_point = hk_bind_point(gfx);
 
