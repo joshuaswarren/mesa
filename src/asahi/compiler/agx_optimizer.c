@@ -343,12 +343,20 @@ image_write_source_can_be_immediate(agx_instr *I, unsigned s)
  * native G17G code selects constants such as 1.0. Fold one whose bits
  * do not fit the integer immediate, opposite a selected register only: the
  * two-immediate form takes raw bits. Compare-select fusion creates most of
- * these selects after immediate inlining, so run it after fusing as well. */
+ * these selects after immediate inlining, so run it after fusing as well.
+ *
+ * Not on G18G (emit_agx3d): its compare-select packers take selected
+ * immediates as integer bit patterns and none reads
+ * fcmpsel_minifloat_select, so 1.0 folded to the minifloat 0x30 selected
+ * the integer 48, a denormal that reads as 0.0. That zeroed the coverage
+ * multiplier of Skia's FillRRectOp (Chromium canvas fillRect and arcs
+ * vanished). The constant stays in a register. */
 static void
 agx_optimizer_minifloat_select(agx_context *ctx, agx_instr **defs,
                                agx_instr *I)
 {
    if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       ctx->key->dev.emit_agx3d ||
        ctx->agx3_reg_float_consts ||
        I->op != AGX_OPCODE_FCMPSEL || I->nr_srcs != 4 ||
        I->fcmpsel_minifloat_select || I->saturate ||
