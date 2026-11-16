@@ -291,6 +291,13 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       c->flags |= DRM_ASAHI_RENDER_FEW_PRIMITIVES;
    }
 
+   /* The A18 Pro loses the vertex output of the mesh workgroup in flight when
+    * the tiler heap runs out mid-draw. Ask the kernel to size the heap for
+    * mesh output before the render. */
+   if ((dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT) &&
+       cs->g17p_mesh_output)
+      c->flags |= DRM_ASAHI_RENDER_MESH_OUTPUT;
+
    if (agx_chip_g17_m5(dev->dev.chip))
       c->flags |= hk_m5_shader_write_class_flags(dev->dev.params.features,
                                                 cs->m5_shader_writes_memory);

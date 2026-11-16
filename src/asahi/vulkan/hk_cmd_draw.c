@@ -13261,6 +13261,7 @@ hk_record_mesh_launch(struct hk_cmd_buffer *cmd, uint32_t draw_id)
       return;
 
    cs->g17p_primitive_bound = UINT64_MAX;
+   cs->g17p_mesh_output = true;
 
    if (tail) {
       uint32_t draw_state_offset;

@@ -1268,6 +1268,12 @@ struct hk_cs {
     * pass, not a part split off or continued. */
    bool g17p_pass_begins, g17p_pass_ends;
 
+   /* A G17P mesh launch is recorded into this render stream. The A18 Pro
+    * loses the vertex output of the mesh workgroup in flight whenever the
+    * tiler heap runs out mid-draw, so the submission asks the kernel to size
+    * the heap for mesh output first (DRM_ASAHI_RENDER_MESH_OUTPUT). */
+   bool g17p_mesh_output;
+
    /* Consecutive GPU query resets share one strong flush, at the first
     * consumer or the end of the stream. G13 never sets this. */
    bool query_reset_pending;
