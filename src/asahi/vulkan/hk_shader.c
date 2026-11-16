@@ -5411,8 +5411,16 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    /* Stage lowering can introduce driver sysvals (for example discard's
     * no_epilog_discard mask). hk_lower_uvs_index turns those into root
     * accesses, so gather the resource requirement after that pass and before
-    * lower_uniforms removes the load_root_agx markers. */
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
+    * lower_uniforms removes the load_root_agx markers.
+    *
+    * G18G publishes its graphics and compute uniforms through the same
+    * range builders (hk_g17p_graphics_uniform_ranges(), which G18G's
+    * hk_upload_usc_words_internal() calls), so it needs the flag too:
+    * without it a shader that reads the root but binds no descriptor set --
+    * push constants -- got no root range and read its push constants from
+    * address 0 + offset, i.e. as zero. */
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
+       dev->dev.chip == AGX_CHIP_G18G) {
       shader->info.agx3_uses_root = hk_nir_uses_root(nir);
       shader->info.agx3_root_reads = hk_nir_root_reads(nir);
    }
