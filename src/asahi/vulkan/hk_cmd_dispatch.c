@@ -2578,16 +2578,20 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const uint64_t root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
    uint64_t texture_pointers = 0;
    if (s->info.agx3_indexed_sampler_valid) {
-      if (!dev->sampled_images.bo || !dev->sampled_images.bo->va ||
+      /* The sampled-image heap may be a chunked table (no single BO): its
+       * fixed base_va is the heap address, as on the M5 path. */
+      if (!dev->sampled_images.base_va ||
           !dev->samplers.table.bo || !dev->samplers.table.bo->va) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
       const uint64_t pointers[] = {
-         dev->sampled_images.bo->va->addr, dev->samplers.table.bo->va->addr,
+         dev->sampled_images.base_va,
+         dev->samplers.table.bo->va->addr,
       };
       texture_pointers = hk_pool_upload(cmd, pointers, sizeof(pointers), 8);
-      hk_cmd_buffer_retain_bo(cmd, dev->sampled_images.bo);
+      if (dev->sampled_images.bo)
+         hk_cmd_buffer_retain_bo(cmd, dev->sampled_images.bo);
       hk_cmd_buffer_retain_bo(cmd, dev->samplers.table.bo);
    }
    if (!root || (s->info.agx3_indexed_sampler_valid && !texture_pointers)) {
