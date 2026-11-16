@@ -5028,10 +5028,18 @@ agx_update_fs(struct agx_batch *batch)
     * Link the epilog against a range after the main shader's complete uniform
     * footprint. The graphics program builder publishes that exact range.
     */
-   if ((agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip)) &&
+   /* G18G: agx_build_agx3_graphics_program() publishes a textured fragment's
+    * blend constants at this same relocated base (the chip-independent G17P
+    * uniform-file rule), so the epilog must be linked against it there too.
+    * Without that the epilog read the legacy halves 4..11, which hold the
+    * sampler pointer, and every constant-colour blend from a textured
+    * fragment used a constant of zero (Qt Quick's default text material). */
+   const bool g18g = dev->chip == AGX_CHIP_G18G;
+   if ((agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip) || g18g) &&
        agx_nr_tex_descriptors(batch, ctx->fs) != 0 &&
        !agx_g17p_fragment_blend_constant_base(
-          dev->chip, ctx->fs, &link_key.epilog.fs.blend_constant_base)) {
+          g18g ? AGX_CHIP_G17P : dev->chip, ctx->fs,
+          &link_key.epilog.fs.blend_constant_base)) {
       mesa_loge("asahi: fragment blend constants exceed the native "
                 "uniform file");
       ctx->linked.fs = NULL;
