@@ -27,6 +27,9 @@ struct agx_texture_lower_options {
     * GL 4.6 campaign qualified. */
    bool g18g;
    bool buffer_metadata;
+   /* AGX_NIR_TEXTURE_IMAGE_SIDEBAND: Gen10 image atomics read their
+    * addressing word after the texture/PBE pair, not from the PBE. */
+   bool image_sideband;
    agx_buffer_texture_metadata_cb buffer_metadata_cb;
    /* Formatless image loads still need view-bounds robustness. */
    bool robust_formatless_images;
@@ -1398,7 +1401,7 @@ txs_for_image(nir_builder *b, nir_intrinsic_instr *intr,
 static nir_def *
 image_texel_address(nir_builder *b, nir_intrinsic_instr *intr,
                     bool return_index, bool gen9, bool gen10,
-                    bool buffer_metadata)
+                    bool buffer_metadata, bool image_sideband)
 {
    /* First, calculate the address of the PBE descriptor */
    nir_def *desc_address =
@@ -1446,10 +1449,15 @@ image_texel_address(nir_builder *b, nir_intrinsic_instr *intr,
        * tail after the texture/PBE pair on both Gen9 and Gen10. Gallium's
        * plain Gen10 descriptors instead keep it in the PBE's last eight
        * bytes. Select the offset from the descriptor ABI, not just the GPU
-       * generation. */
+       * generation. A caller without the metadata record whose storage
+       * image descriptors still carry the tail
+       * (AGX_NIR_TEXTURE_IMAGE_SIDEBAND) reads it there too; its texel
+       * buffers keep the plain Gen10 form. */
+      const bool sideband =
+         buffer_metadata || (image_sideband && dim != GLSL_SAMPLER_DIM_BUF);
       nir_def *sw_address =
          nir_iadd_imm(b, desc_address,
-                      gen10 && !buffer_metadata
+                      gen10 && !sideband
                          ? AGX_GEN10_IMAGE_ATOMIC_SW_OFFSET
                          : AGX_G17P_IMAGE_ATOMIC_SW_FROM_PBE);
       if (dim == GLSL_SAMPLER_DIM_MS) {
@@ -1739,7 +1747,8 @@ lower_images(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_def_rewrite_uses(&intr->def,
                            image_texel_address(b, intr, false, gen9,
                                                options && options->gen10,
-                                               options && options->buffer_metadata));
+                                               options && options->buffer_metadata,
+                                               options && options->image_sideband));
       return true;
 
    case nir_intrinsic_is_sparse_texels_resident:
@@ -2088,13 +2097,16 @@ lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
 {
    bool progress = false;
    const bool g18g = generation & AGX_NIR_TEXTURE_GENERATION_G18G;
-   generation &= ~AGX_NIR_TEXTURE_GENERATION_G18G;
+   const bool image_sideband = generation & AGX_NIR_TEXTURE_IMAGE_SIDEBAND;
+   generation &= ~(AGX_NIR_TEXTURE_GENERATION_G18G |
+                   AGX_NIR_TEXTURE_IMAGE_SIDEBAND);
    const bool gen9 = generation == 9;
    const struct agx_texture_lower_options options = {
       .gen9 = gen9,
       .gen10 = generation == 10,
       .g18g = g18g && generation == 10,
       .buffer_metadata = buffer_metadata,
+      .image_sideband = image_sideband,
       .buffer_metadata_cb = buffer_metadata_cb,
       .robust_formatless_images = robust_formatless_images,
       .robust_texel_fetch = robust_texel_fetch,
@@ -2238,7 +2250,8 @@ lower_multisampled_store(nir_builder *b, nir_intrinsic_instr *intr,
          intr->src[1].ssa, nir_u2u32(b, intr->src[2].ssa),
          nir_imm_int(b, util_format_get_blocksize(nir_intrinsic_format(intr))));
    } else {
-      index_px = nir_u2u32(b, image_texel_address(b, intr, true, false, false, false));
+      index_px = nir_u2u32(b, image_texel_address(b, intr, true, false, false, false,
+                                                     false));
    }
    nir_def *coord2d = coords_for_buffer_texture(b, index_px);
 

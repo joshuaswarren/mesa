@@ -3616,8 +3616,13 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
                   (void *)dev);
       }
 
+      /* G18G storage images use the 96-byte record, whose image-atomic
+       * word hk_descriptor_set.c writes after the texture/PBE pair. */
       NIR_PASS(_, nir, agx_nir_lower_texture_for_generation,
-               agx_chip_descriptor_generation(dev->dev.chip));
+               agx_chip_descriptor_generation(dev->dev.chip) |
+                  (dev->dev.chip == AGX_CHIP_G18G
+                      ? AGX_NIR_TEXTURE_IMAGE_SIDEBAND
+                      : 0));
    }
    NIR_PASS(_, nir, agx_nir_lower_multisampled_image_store);
 

@@ -107,6 +107,14 @@ bool agx_nir_lower_texture(struct nir_shader *s);
  * agx_nir_lower_multisampled_image_store_for_generation(); the pass lowers
  * for the remaining descriptor generation (10). */
 #define AGX_NIR_TEXTURE_GENERATION_G18G (1u << 8)
+/* A caller whose Gen10 storage descriptors keep the image-atomic addressing
+ * word after the texture/PBE pair (AGX_G17P_IMAGE_ATOMIC_SW_OFFSET, as
+ * Honeykrisp's 96-byte storage record does) without the buffer-metadata
+ * record ORs this into the generation it passes to
+ * agx_nir_lower_texture_for_generation(). Without it, Gen10 image atomics
+ * read the word from the PBE's last eight bytes, where Gallium keeps it.
+ * Texel-buffer atomics are not affected. */
+#define AGX_NIR_TEXTURE_IMAGE_SIDEBAND (1u << 9)
 bool agx_nir_lower_texture_for_generation(struct nir_shader *s, unsigned generation);
 /* robust_formatless_images: formatless image loads have not been lowered for
  * view-bounds robustness and require it. */
