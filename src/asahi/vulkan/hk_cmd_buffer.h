@@ -1179,6 +1179,12 @@ struct hk_cs {
    bool gen1_native_vertex_rq;
    bool m5_matrix_ops;
 
+   /* Threads of the application's direct dispatches in this stream, and
+    * whether it holds an indirect one (hk_queue::sib only takes streams with
+    * enough work to overlap). */
+   uint64_t sib_threads;
+   bool sib_indirect;
+
    /* At least one AS-build dispatch or compute transfer is in this stream. */
    bool as_build;
    /* M5: a pre-rasterization program recorded in this CS keeps state in

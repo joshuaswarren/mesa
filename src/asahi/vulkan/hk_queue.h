@@ -99,6 +99,10 @@ struct hk_queue {
       uint32_t next;
       /* Sibling kernel queue IDs ([0] unused), UINT32_MAX until first use. */
       uint32_t id[HK_QUEUE_SIBLINGS_MAX];
+      /* Earlier submissions in flight before a sibling takes one. */
+      uint32_t min_in_flight;
+      /* Fewest application dispatch threads a stream needs to go to one. */
+      uint64_t min_threads;
       /* Commands submitted to each kernel queue, per subqueue. */
       uint64_t submitted[HK_QUEUE_SIBLINGS_MAX][HK_SYNC_NUM_SQ];
       /* A sibling has run work since the primary kernel queue started, so

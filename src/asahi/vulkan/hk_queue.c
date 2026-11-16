@@ -1451,13 +1451,15 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
    return vk_common_QueueBindSparse(_queue, bindInfoCount, pBindInfo, fence);
 }
 
-/* A submission a sibling kernel queue may run (hk_queue::sib): it depends on
- * no earlier submission (every stream's prior is zero or names a command of
- * this submission, see resolve_one) and holds only plain compute streams,
- * without query access, timestamps, scratch or ray queries. Anything that
- * needs the primary kernel queue's own state stays there. */
+/* A submission a sibling kernel queue may run (hk_queue::sib): its streams
+ * dispatch at least sib.min_threads threads each (or only internal work), it
+ * depends on no earlier submission (every stream's prior is zero or names a
+ * command of this submission, see resolve_one) and holds only plain compute
+ * streams, without query access, timestamps, scratch or ray queries.
+ * Anything that needs the primary kernel queue's own state stays there. */
 static bool
-hk_sibling_eligible(struct hk_device *dev, const struct vk_queue_submit *submit,
+hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
+                    const struct vk_queue_submit *submit,
                     const uint64_t base[HK_SYNC_NUM_SQ], unsigned command_count,
                     bool kernel_cumulative)
 {
@@ -1473,6 +1475,11 @@ hk_sibling_eligible(struct hk_device *dev, const struct vk_queue_submit *submit,
          (struct hk_cmd_buffer *)submit->command_buffers[i];
 
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         /* Overlapping kicks of a few threads costs more in ordering than it
+          * gains (a 32-thread dispatch stream at depth 4 ran 13% slower). */
+         if (cs->sib_threads && !cs->sib_indirect &&
+             cs->sib_threads < queue->sib.min_threads)
+            return false;
          if (cs->type != HK_CS_CDM || cs->query_access ||
              cs->timestamp.start.handle || cs->timestamp.end.handle ||
              cs->scratch.cs.main || cs->scratch.cs.preamble ||
@@ -1489,6 +1496,28 @@ hk_sibling_eligible(struct hk_device *dev, const struct vk_queue_submit *submit,
    }
 
    return true;
+}
+
+/* Whether a sibling kernel queue may take the next eligible submission: at
+ * least sib.min_in_flight earlier submissions of this queue are still in
+ * flight (submitted_point is the queue timeline's last point before this
+ * submission). Two kicks run at once on sibling queues, so each takes about
+ * twice as long; with only one other submission in flight both then finish
+ * together and the GPU idles for the whole completion-to-resubmit round trip
+ * (a depth-2 compute stream ran 19% slower with siblings on the M4 Pro).
+ * With work queued behind them, the overlap fills the launch and drain gaps
+ * between kicks instead. */
+static bool
+hk_sibling_deep(struct hk_device *dev, struct hk_queue *queue,
+                uint64_t submitted_point)
+{
+   uint64_t done = 0;
+
+   if (!queue->sib.min_in_flight)
+      return true;
+   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1))
+      return false;
+   return submitted_point >= done + queue->sib.min_in_flight;
 }
 
 /* A stream's prior in the ordinals of the kernel queue it is sent to: a
@@ -1779,8 +1808,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
    bool sib_earlier = false;
    if (queue->sib.count > 1 && !replaced && !flush_sstt && !unlikely(anatomy) &&
-       hk_sibling_eligible(dev, submit, prior_base, command_count,
-                           kernel_cumulative)) {
+       hk_sibling_eligible(dev, queue, submit, prior_base, command_count,
+                           kernel_cumulative) &&
+       hk_sibling_deep(dev, queue, first_chunk_point - 1)) {
       sib_target = queue->sib.next;
       queue->sib.next = (queue->sib.next + 1) % queue->sib.count;
       if (sib_target && queue->sib.id[sib_target] == UINT32_MAX) {
@@ -2473,9 +2503,15 @@ hk_queue_create(struct hk_device *dev,
        queue->sync.exact_prior &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)) {
+      /* The M4 Pro runs two compute kicks of one context at once. */
       queue->sib.count = CLAMP(
-         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES", 1), 1,
-         HK_QUEUE_SIBLINGS_MAX);
+         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES",
+                              agx_is_m4_pro(&dev->dev) ? 3 : 1),
+         1, HK_QUEUE_SIBLINGS_MAX);
+      queue->sib.min_in_flight =
+         debug_get_num_option("ASAHI_G17P_SIBLING_MIN_IN_FLIGHT", 2);
+      queue->sib.min_threads =
+         debug_get_num_option("ASAHI_G17P_SIBLING_MIN_THREADS", 65536);
    }
    queue->drm.render_rq = false;
    queue->drm.virt_ring_idx = drm_priority + 1;

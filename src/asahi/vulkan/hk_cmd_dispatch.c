@@ -2869,6 +2869,14 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
          return;
    }
    hk_dispatch_with_local_size(cmd, cs, s, grid, local_size);
+   if (agx_is_indirect(grid)) {
+      cs->sib_indirect = true;
+   } else {
+      const uint64_t threads =
+         (uint64_t)grid.count[0] * grid.count[1] * grid.count[2];
+      cs->sib_threads = threads > UINT64_MAX - cs->sib_threads
+                           ? UINT64_MAX : cs->sib_threads + threads;
+   }
    if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
       hk_frame_anatomy_note_fs(cs, s);
       const uint64_t wg = agx_workgroup_threads(local_size);
