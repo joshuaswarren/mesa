@@ -1230,7 +1230,17 @@ get_image_copy_descriptor_set_layout(struct vk_device *device,
       },
       {
          .binding = BINDING_INPUT,
-         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
+         /* Image sources are written as SAMPLED_IMAGE. On G18G a sampled
+          * image binding keeps its heap index at +68, a texel buffer one at
+          * +4, and the shader addresses the binding by this declared type:
+          * declaring a texel buffer made image-source copies fetch through a
+          * garbage heap index (correct only for a 64-texel-wide image). */
+         .descriptorType =
+            container_of(device, struct hk_device, vk)->dev.chip ==
+                     AGX_CHIP_G18G &&
+                  type != BUF2IMG
+               ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+               : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
          .descriptorCount = 1,
          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
       },
