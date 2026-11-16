@@ -21332,6 +21332,19 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                    !agx3_fuse_compact_minifloat_wait(emission, enc, I,
                                                      &encoded_wait))
                   AGX3_REFUSE(I);
+               /* Neither form has a field for slot 7 or 8, which AGX3C hands
+                * out once more results are in flight: hk's image-to-buffer
+                * copy loads four texels a thread, and its UNORM repack
+                * sat(texel + -0.0) can wait on a texel load that got slot 8.
+                * Retire such a wait through the band carrier on the
+                * destination, as the uniform-to-register copy does, and add
+                * with no wait. */
+               if (encoded_wait & ~UINT16_C(0x3f)) {
+                  if (!agx3_retire_result_wait(emission, enc, I,
+                                               encoded_wait))
+                     AGX3_REFUSE(I);
+                  encoded_wait = 0;
+               }
                encoded = (agx_is_g18g(&ctx->key->dev)
                            ? agx3_alu_fadd_minifloat_mod_g18g
                            : agx3_alu_fadd_minifloat_mod)(
