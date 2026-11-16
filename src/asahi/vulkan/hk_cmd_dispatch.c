@@ -2557,11 +2557,19 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        (g18 && (s->b.info.scratch_size || linked->b.scratch_size ||
                 s->b.info.agx3_spectpr_scratch_size ||
                 s->b.info.nr_preamble_gprs)) ||
+       (g18 && s->info.g18_unlowered_image) ||
        s->info.agx3_txf_texture_valid || s->info.agx3_storage_image_valid ||
        s->info.agx3_sampled_storage_valid || s->info.agx3_indexed_storage_valid ||
        !local_size.x || !local_size.y || !local_size.z ||
        (uint64_t)local_size.x * local_size.y * local_size.z > 1024) {
-      mesa_loge("AGX3 native compute: unsupported shader or indirect/shared-memory launch");
+      mesa_loge(
+         "AGX3 native compute: unsupported shader or indirect/shared-memory launch"
+         " (scratch %u/%u, spectpr scratch %u, preamble GPRs %u,"
+         " unlowered image access %d, shared memory %u B)",
+         s ? s->b.info.scratch_size : 0, linked ? linked->b.scratch_size : 0,
+         s ? s->b.info.agx3_spectpr_scratch_size : 0,
+         s ? s->b.info.nr_preamble_gprs : 0,
+         s ? s->info.g18_unlowered_image : 0, s ? s->b.info.local_size : 0);
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }

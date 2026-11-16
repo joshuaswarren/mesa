@@ -4838,6 +4838,32 @@ hk_vs_covers_clip_square(const nir_shader *vs)
    return true;
 }
 
+/* G18G compute: whether an image access is left on the AGX2 bindless or
+ * deref form. Such accesses compiled but silently did nothing on G18G when
+ * tested, so they are refused at dispatch. bindless_image_agx only forms a
+ * descriptor handle (the indexed sampler route keeps it); it is not an
+ * access. */
+static bool
+hk_g18g_has_unlowered_image(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const char *name =
+               nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic]
+                  .name;
+            if ((!strncmp(name, "bindless_image_", 15) &&
+                 strcmp(name, "bindless_image_agx")) ||
+                !strncmp(name, "image_deref_", 12))
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 static VkResult
 hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                nir_shader *nir, VkShaderCreateFlagsEXT shader_flags,
@@ -4967,6 +4993,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       } else {
          ralloc_free(candidate);
       }
+      shader->info.g18_unlowered_image = hk_g18g_has_unlowered_image(nir);
    } else if (agx_native_graphics(&dev->dev) &&
               nir->info.stage == MESA_SHADER_COMPUTE) {
       /* Descriptor buffers keep only the heap-indexed paths, which never
