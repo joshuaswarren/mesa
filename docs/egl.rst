@@ -92,6 +92,15 @@ at runtime
    This changes the log level of the main library and the drivers. The
    valid values are: ``debug``, ``info``, ``warning``, and ``fatal``.
 
+``MESA_EGL_WL_SCANOUT``
+   ``WxH``. On Wayland, a window surface whose buffers are exactly ``W``
+   by ``H`` pixels presents the opaque variant of its format, as
+   ``EGL_EXT_present_opaque`` does, in a ``LINEAR`` buffer when the
+   compositor accepts one, so the compositor can scan it out directly.
+   Surfaces of any other size are unchanged. The driconf option
+   ``egl_wl_scanout_size`` sets the same value per application; the
+   environment variable takes precedence. Unset by default.
+
 Packaging
 ---------
 
