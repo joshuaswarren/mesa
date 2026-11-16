@@ -177,7 +177,7 @@ agx_instr_accepts_uniform(enum agx_isa_encoding encoding, enum agx_opcode op,
 
       /* Apple's G17P loop
        * test compares a GPR with an aligned 32-bit uniform in one icmp
-       * (fs-apple.bin +0xbc 0a832307060007020000: f18 = u6, f24 = 3), so
+       * (the uniform's half index in f18, operand class f24 = 3), so
        * keep the uniform as the second operand instead of copying it into
        * a GPR on every iteration. */
       return (encoding == AGX_ISA_ENCODING_AGX3B ||
@@ -881,7 +881,7 @@ agx_lower_uniform_sources(agx_context *ctx)
             I->op == AGX_OPCODE_BREAK_IF_ICMP;
          /* An aligned 32-bit
           * uniform against an 8-bit immediate is one native icmp (Apple's
-          * G17P loop guard, fs-apple.bin +0x0c: u6 == 0). Keep the uniform
+          * G17P loop guard, e.g. u6 == 0). Keep the uniform
           * in place instead of copying it into a GPR first; the packer
           * emits agx3_cf_icmp_uniform_imm() for either operand order. */
          const bool uniform_imm_compare =

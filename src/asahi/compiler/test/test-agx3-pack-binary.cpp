@@ -16145,7 +16145,7 @@ TEST_F(AGX3PackBinary, G17GArrayShadowDump)
 TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
 {
    uint8_t out[16], len;
-   { /* Native terrain main+0x350, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {40, 16, 32};
       const bool live[3] = {false, true, false}, discard[3] = {false, false, true};
       const uint8_t expected[] = {0x29, 0x91, 0x26, 0x29, 0x82, 0x20, 0x42, 0x02, 0x00, 0x04};
@@ -16153,7 +16153,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x360, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {28, 8, 0};
       const bool live[3] = {false, false, false}, discard[3] = {true, true, false};
       const uint8_t expected[] = {0x09, 0x09, 0x3d, 0x1d, 0x41, 0x20, 0x00, 0x08};
@@ -16161,7 +16161,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x368, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {30, 10, 0};
       const bool live[3] = {false, false, false}, discard[3] = {true, true, false};
       const uint8_t expected[] = {0x19, 0x0b, 0x3d, 0x1f, 0x41, 0x00, 0x00, 0x08};
@@ -16169,7 +16169,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x370, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {2, 12, 0};
       const bool live[3] = {false, false, false}, discard[3] = {true, true, false};
       const uint8_t expected[] = {0x39, 0x0d, 0x3d, 0x03, 0x41, 0x00, 0x00, 0x08};
@@ -16177,7 +16177,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x37c, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {4, 14, 0};
       const bool live[3] = {false, false, false}, discard[3] = {true, true, false};
       const uint8_t expected[] = {0x49, 0x0f, 0x3d, 0x05, 0x41, 0x00, 0x00, 0x08};
@@ -16185,7 +16185,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x3a6, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {42, 16, 12};
       const bool live[3] = {false, true, false}, discard[3] = {false, false, true};
       const uint8_t expected[] = {0x59, 0x91, 0x26, 0x2b, 0x81, 0x0c, 0x42, 0x02};
@@ -16193,7 +16193,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x3ae, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {44, 16, 20};
       const bool live[3] = {false, true, false}, discard[3] = {false, false, true};
       const uint8_t expected[] = {0x69, 0x91, 0x26, 0x2d, 0x81, 0x14, 0x42, 0x02};
@@ -16201,7 +16201,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x3e4, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {46, 16, 12};
       const bool live[3] = {false, false, false}, discard[3] = {false, true, true};
       const uint8_t expected[] = {0x79, 0x11, 0x2e, 0x2f, 0x81, 0x0c, 0x42, 0x02};
@@ -16209,7 +16209,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x404, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {4, 6, 8};
       const bool live[3] = {false, false, false}, discard[3] = {true, true, true};
       const uint8_t expected[] = {0x89, 0x07, 0x3e, 0x05, 0x82, 0x08, 0x42, 0x00, 0x00, 0x14};

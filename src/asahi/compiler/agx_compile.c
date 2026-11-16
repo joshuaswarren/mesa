@@ -15923,10 +15923,11 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                    stage == MESA_SHADER_FRAGMENT));
 
    /* Apple's G17P loops are a
-    * guard plus a bottom-tested body (fs/cs-apple.bin: the backedge target
-    * is the first xorshift `sll`, `icmp` sits mid-body and `cndlt; b` end
-    * the body). Rotate single-exit counted loops the same way before the
-    * main optimization loop, so the copied test is optimized with the rest. */
+    * guard plus a bottom-tested body (fragment and compute alike: the
+    * backedge targets the first body instruction, `icmp` sits mid-body and
+    * `cndlt; b` end the body). Rotate single-exit counted loops the same
+    * way before the main optimization loop, so the copied test is optimized
+    * with the rest. */
    if (is_agx3) {
       /* Uniform loops only (bw_copy regression, see nir_opt_loop.c). */
       nir_divergence_analysis(nir);
@@ -15943,7 +15944,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
     * nir_opt_if runs happened before it. On AGX3 that shape costs a CNDST
     * plus a CNDEF (else flip) per invocation; inverted it is one inverted
     * CNDST, the empty else is removed by agx_opt_empty_else, and the guard
-    * matches Apple's (fs-apple.bin +0x76 cndst invert, no else). */
+    * matches Apple's (one inverted cndst, no else). */
    if (is_agx3)
       NIR_PASS(_, nir, nir_opt_if_empty_then);
 

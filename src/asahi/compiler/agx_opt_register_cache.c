@@ -276,8 +276,8 @@ agx_opt_register_cache(agx_context *ctx)
    }
 
    /* Apple's G17P fragment loop test keeps
-    * its counter operand in the register cache (fs-apple.bin +0xbc, f11 on
-    * `icmp i, u6`). The block-local analysis above cannot: the counter's next
+    * its counter operand in the register cache (the f11 hint on the icmp's
+    * counter source). The block-local analysis above cannot: the counter's next
     * reads are at the top of the loop, across the back edge. Cache a loop
     * compare's register source when the loop header reads it with an ALU
     * instruction before writing it, unless this read is its last use. */

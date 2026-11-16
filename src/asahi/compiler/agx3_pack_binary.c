@@ -8064,7 +8064,7 @@ agx3_emit_cf_compare(struct util_dynarray *emission, enum agx_isa_encoding enc,
     * 8-bit immediate, in either operand order, kept in place by
     * agx_lower_uniform_sources(). Canonicalize the uniform to the first
     * operand (swapping the relation, as the register/immediate path below
-    * does) and emit Apple's loop-guard form (fs-apple.bin +0x0c). */
+    * does) and emit the uniform/immediate icmp loop-guard form. */
    if (!is_float && (enc == AGX_ISA_ENCODING_AGX3B ||
                      enc == AGX_ISA_ENCODING_AGX3C)) {
       const bool uniform_first = agx3_cf_uniform32(I->src[0]) &&
@@ -11291,13 +11291,13 @@ agx3_post_ra_hint(agx_index index)
  * [1, 2, 0] (isa/AGX3b.xml, e.g. sll f68/f69/f70 at 22:23/20:21/18:19, iadd
  * f55/f56/f57 at the same bits), so a field value of 0 encodes as 0b01.
  * Apple's G17P compiler sets the first two of them to 2 (bits 20..23 = 0)
- * only on the instruction at a loop's backward-branch target: fs-apple.bin
- * +0x8c `2700040403003600f0100100` and cs-apple.bin +0x6e
- * `2700040603083600f0100100`; no other witnessed Apple instruction has a
- * non-zero value there. Mesa always emitted 0. Semantics are unknown; this
- * reproduces only Apple's exact use: an allowlisted integer/conversion ALU
- * form (opcode bits 0..10 and length from AGX3b.xml) that begins a loop
- * header, whose bits 18..23 still hold the default 0b010101. */
+ * only on the instruction at a loop's backward-branch target, a 12-byte
+ * `sll` in both the fragment and the compute loop; no other witnessed Apple
+ * instruction has a non-zero value there. Mesa always emitted 0. Semantics
+ * are unknown; this reproduces only Apple's exact use: an allowlisted
+ * integer/conversion ALU form (opcode bits 0..10 and length from AGX3b.xml)
+ * that begins a loop header, whose bits 18..23 still hold the default
+ * 0b010101. */
 static const struct {
    uint16_t opcode;
    uint8_t length;
@@ -11322,7 +11322,7 @@ agx3_apply_loop_head_hints(agx_context *ctx, struct util_dynarray *emission)
          continue;
       uint8_t *bytes = (uint8_t *)emission->data + block->offset;
       const uint16_t opcode = (uint16_t)(bytes[0] | ((bytes[1] & 0x7) << 8));
-      /* Only Apple's witnessed form, the 12-byte `sll` (fs/cs-apple.bin). */
+      /* Only Apple's witnessed form, the 12-byte `sll` at a loop head. */
       if (opcode != 0x027)
          continue;
       bool ok = false;
@@ -11346,9 +11346,9 @@ agx3_apply_loop_head_hints(agx_context *ctx, struct util_dynarray *emission)
 
 /* Early compares.
  *
- * Apple's G17P loops test the counter as soon as it is final: in
- * fs-apple.bin the `icmp` sits right after `i++` (+0xbc) and its `cndlt`
- * six instructions later at the bottom of the body (+0xec). Our emission
+ * Apple's G17P loops test the counter as soon as it is final: in a
+ * fragment loop the `icmp` sits right after `i++` and its `cndlt` comes
+ * six instructions later at the bottom of the body. Our emission
  * always writes a control-flow compare immediately before the CND that
  * consumes it. This moves an integer loop/if compare back to just after the
  * last definition of its register sources, leaving the CND in place.
@@ -11456,8 +11456,8 @@ agx3_apply_early_compares(agx_context *ctx, struct util_dynarray *emission,
           * AGX3 (agx3_try_control_flow) and changes neither the exec mask nor
           * any flag slot, so an empty BEGIN_CF span is crossable. Without
           * this the first compare of a shader (e.g. a loop guard) is pinned
-          * against its CNDST; Apple hoists it (fs-apple.bin +0x0c icmp, four
-          * instructions ahead of the cndst at +0x76). */
+          * against its CNDST; Apple hoists it (the guard icmp sits four
+          * instructions ahead of its cndst). */
          if (x->I->op == AGX_OPCODE_BEGIN_CF &&
              !x->wait && !x->slot && x->start == sp[from].start) {
             from--;
