@@ -746,6 +746,10 @@ typedef struct {
    /* Halves taken off the spill budget after a failed allocation, so the
     * live-range shuffle gets free room (agx_compile_function_nir retries). */
    unsigned ra_budget_cut;
+   /* Set by agx_ra_impl() while it assigns registers: a failed allocation
+    * that has no legal region left at all leaves RA through it (a
+    * jmp_buf *), see find_best_region_to_evict(). */
+   void *ra_abort;
 } agx_context;
 
 static inline void

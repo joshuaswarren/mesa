@@ -13083,9 +13083,14 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       }
    }
    if (disable_remat)
-      AGX_PASS(ctx, agx_ra_without_remat);
+      agx_ra_without_remat(ctx);
    else
-      AGX_PASS(ctx, agx_ra);
+      agx_ra(ctx);
+
+   /* A failed allocation is refused and retried below; its AIR is not a
+    * program to validate (agx_validate exits on it). */
+   if (!ctx->ra_failed)
+      agx_validate(ctx, disable_remat ? "agx_ra_without_remat" : "agx_ra");
 
    /* The occupancy rematerialization attempt has already modified AIR.
     * Discard the entire context; changing its budget cannot undo spills. */
