@@ -4967,6 +4967,27 @@ agx_update_fs(struct agx_batch *batch)
                               : 0,
    };
    agx_fs_epilog_apply_device_policy(dev->chip, &link_key.epilog.fs);
+   /* A fully masked G18 draw with no shader side effects uses the
+    * colour-free ISP state (fragment_writes_nothing). Do not invent tile
+    * loads/stores just to preserve its colour: those prevent the linker
+    * from recognizing the no-op fragment, and the resulting multisample
+    * preservation program cannot run for stencil-only browser draws.
+    *
+    * Keep preservation when any part can update coverage, depth, stencil,
+    * memory or another colour attachment. Such programs are not no-ops.
+    */
+   if (dev->chip == AGX_CHIP_G18G && agx_g18_native_mixed_enabled() &&
+       !(ctx->blend->store &
+         (PIPE_CLEAR_COLOR0 * BITFIELD_MASK(batch->key.nr_cbufs))) &&
+       ctx->fs->b.info.tag_write_disable &&
+       !link_key.prolog.fs.cull_distance_size &&
+       !link_key.prolog.fs.polygon_stipple &&
+       link_key.prolog.fs.api_sample_mask == 0xff &&
+       !link_key.epilog.fs.defer_api_sample_mask &&
+       !link_key.epilog.fs.link.write_z && !link_key.epilog.fs.link.write_s &&
+       !link_key.epilog.fs.link.sample_shading &&
+       !ctx->blend->key.alpha_to_coverage)
+      link_key.epilog.fs.preserve_zero_mask = false;
    /* G17S (and G17C, the same core) share G17P's tile behaviour: a covered
     * fragment with no tile store still dirties the tile, which then stores
     * undefined colour at EOT. Measured on the M5 Pro: a draw with every
