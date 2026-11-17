@@ -2462,8 +2462,25 @@ glsl_type_size(const struct glsl_type *type, bool bindless)
  * This must run on the last pre-rasterization stage, since that is the stage
  * whose layer output the rasterizer consumes: see hk_lower_multiview_stage().
  */
+/* A multiview fragment shader's gl_Layer is the view index, as
+ * hk_lower_multiview() makes the last pre-rasterization stage write it. Read
+ * it from the root, like gl_ViewIndex: a G17P mesh shader carries no
+ * per-primitive layer for it (hk_lower_multiview()). */
+static bool
+hk_lower_multiview_fs_layer(nir_builder *b, nir_intrinsic_instr *intr,
+                            UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_layer_id)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_u2uN(b, nir_load_view_index(b),
+                                        intr->def.bit_size));
+   return true;
+}
+
 static void
-hk_lower_multiview(nir_shader *nir)
+hk_lower_multiview(nir_shader *nir, bool g17p)
 {
    /* If there's an existing layer ID write, ignore it. This avoids validation
     * splat with vk_meta.
@@ -2492,6 +2509,36 @@ hk_lower_multiview(nir_shader *nir)
    nir_builder b = nir_builder_at(nir->info.stage == MESA_SHADER_GEOMETRY
                                      ? nir_before_impl(impl)
                                      : nir_after_impl(impl));
+
+   if (nir->info.stage == MESA_SHADER_MESH && g17p &&
+       !nir_find_variable_with_location(nir, nir_var_shader_out,
+                                        VARYING_SLOT_VIEWPORT)) {
+      /* The view is the same for the whole workgroup, so on G17P it goes to
+       * every vertex's layer word (agx_nir_lower_gen1_mesh, vertex_layer):
+       * a per-primitive layer would give each primitive private vertices
+       * and a primitive record. Stored first, before any early return: a
+       * vertex word nothing writes is undefined. */
+      const unsigned verts = nir->info.mesh.max_vertices_out;
+      const unsigned threads = nir->info.workgroup_size[0] *
+                               nir->info.workgroup_size[1] *
+                               nir->info.workgroup_size[2];
+      b.cursor = nir_before_impl(impl);
+      nir_variable *layer = nir_variable_create(
+         nir, nir_var_shader_out, glsl_array_type(glsl_uint_type(), verts, 0),
+         "view_layer");
+      layer->data.location = VARYING_SLOT_LAYER;
+      nir_def *view = nir_load_view_index(&b);
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      for (unsigned first = 0; first < verts; first += threads) {
+         nir_def *vertex = nir_iadd_imm(&b, lane, first);
+         nir_push_if(&b, nir_ult_imm(&b, vertex, verts));
+         nir_store_deref(&b, nir_build_deref_array(&b,
+                            nir_build_deref_var(&b, layer), vertex), view, 1);
+         nir_pop_if(&b, NULL);
+      }
+      nir->info.outputs_written |= VARYING_BIT_LAYER;
+      return;
+   }
 
    if (nir->info.stage == MESA_SHADER_MESH) {
       /* Every primitive the workgroup may output goes to the view's layer. */
@@ -3223,7 +3270,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
 
    if (is_multiview &&
        hk_lower_multiview_stage(nir->info.stage, next_stage_mask))
-      hk_lower_multiview(nir);
+      hk_lower_multiview(nir, dev->dev.chip == AGX_CHIP_G17P);
+
+   if (is_multiview && nir->info.stage == MESA_SHADER_FRAGMENT &&
+       dev->dev.chip == AGX_CHIP_G17P)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_lower_multiview_fs_layer,
+               nir_metadata_control_flow, NULL);
 
    if (nir->info.stage == MESA_SHADER_TESS_EVAL) {
       NIR_PASS(_, nir, nir_lower_patch_vertices,
