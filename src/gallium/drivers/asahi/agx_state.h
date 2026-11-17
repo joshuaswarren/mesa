@@ -389,6 +389,8 @@ struct agx_uncompiled_shader {
    struct blob early_serialized_nir;
    struct blob serialized_nir;
    uint8_t nir_blake3[BLAKE3_KEY_LEN];
+   /* GLSL source hash (shader_info::source_blake3), for profiles. */
+   uint32_t source_hash;
 
    struct {
       uint64_t inputs_flat_shaded;
@@ -579,6 +581,8 @@ struct agx_batch {
    uint32_t failed_syncobjs[2];
    bool submit_quarantined;
    uint32_t draws;
+   /* Source hash of the last fragment shader drawn (ASAHI_MESA_DEBUG=stats). */
+   uint32_t last_fs_source;
 
    /* Executable storage is owned by this batch's pipeline pool. */
    uint64_t g17p_fragment_program;

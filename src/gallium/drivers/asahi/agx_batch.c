@@ -476,20 +476,32 @@ agx_batch_print_stats(struct agx_device *dev, struct agx_batch *batch)
 
    struct agx_timestamps *ts = agx_batch_timestamps(batch);
 
-   if (batch->cdm.bo) {
-      float time = (ts->comp_end - ts->comp_start) /
-                   (float)dev->params.command_timestamp_frequency_hz;
+   const double hz = (double)dev->params.command_timestamp_frequency_hz;
 
-      mesa_logw("[Batch %d] Compute: %.06f\n", batch_idx, time);
+   /* One line per command, for per-pass profiles: start, GPU microseconds,
+    * and what the pass renders. */
+   if (batch->cdm.bo && !batch->compute_dropped && ts->comp_end > ts->comp_start) {
+      mesa_logw("AGXPROF C start=%llu us=%.1f\n",
+                (unsigned long long)ts->comp_start,
+                (ts->comp_end - ts->comp_start) * 1e6 / hz);
    }
 
-   if (batch->vdm.bo) {
-      float time_vtx = (ts->vtx_end - ts->vtx_start) /
-                       (float)dev->params.command_timestamp_frequency_hz;
-      float time_frag = (ts->frag_end - ts->frag_start) /
-                        (float)dev->params.command_timestamp_frequency_hz;
-      mesa_logw("[Batch %d] vtx %.06f frag %.06f\n", batch_idx, time_vtx,
-                time_frag);
+   if (batch->vdm.bo && ts->frag_end > ts->vtx_start) {
+      char fmts[160] = "";
+      for (unsigned i = 0; i < batch->key.nr_cbufs; i++) {
+         const struct pipe_surface *cb = &batch->key.cbufs[i];
+         if (cb->texture)
+            snprintf(fmts + strlen(fmts), sizeof(fmts) - strlen(fmts), "%s%s",
+                     i ? "," : "", util_format_short_name(cb->format));
+      }
+      const struct pipe_surface *zs = &batch->key.zsbuf;
+      mesa_logw("AGXPROF R start=%llu us=%.1f %ux%u draws=%u cb=%s zs=%s "
+                "clear=%x load=%x fs=%08x\n",
+                (unsigned long long)ts->vtx_start,
+                (ts->frag_end - ts->vtx_start) * 1e6 / hz, batch->key.width,
+                batch->key.height, batch->draws, fmts[0] ? fmts : "-",
+                zs->texture ? util_format_short_name(zs->format) : "-",
+                batch->clear, batch->load, batch->last_fs_source);
    }
 }
 

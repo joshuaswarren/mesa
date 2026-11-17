@@ -4071,6 +4071,10 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    nir_serialize(&so->serialized_nir, nir, true);
    _mesa_blake3_compute(so->serialized_nir.data, so->serialized_nir.size,
                       so->nir_blake3);
+   so->source_hash = (uint32_t)nir->info.source_blake3[0] << 24 |
+                     (uint32_t)nir->info.source_blake3[1] << 16 |
+                     (uint32_t)nir->info.source_blake3[2] << 8 |
+                     nir->info.source_blake3[3];
 
    so->has_xfb_info = (nir->xfb_info != NULL);
 
@@ -16174,6 +16178,8 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    assert(batch == agx_get_batch(ctx) && "batch should not change under us");
 
    batch->draws++;
+   if (ctx->stage[MESA_SHADER_FRAGMENT].shader)
+      batch->last_fs_source = ctx->stage[MESA_SHADER_FRAGMENT].shader->source_hash;
 
    if (unlikely(dev->debug & AGX_DBG_PERF))
       ctx->perf.draws++;
