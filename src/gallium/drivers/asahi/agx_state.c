@@ -14872,6 +14872,34 @@ agx_legalize_feedback_loop_surf(struct agx_context *ctx,
       agx_flush_writer(ctx, rsrc, "Feedback loop");
 }
 
+/*
+ * The sampler views a stage's shader can read: the bindful textures, the only
+ * views agx_upload_textures() gives the hardware. A stage without a shader
+ * reads none.
+ */
+static unsigned
+agx_nr_textures_read(const struct agx_context *ctx, mesa_shader_stage stage)
+{
+   const struct agx_stage *s = &ctx->stage[stage];
+
+   if (!s->shader)
+      return 0;
+
+   return MIN2(s->texture_count, s->shader->info.nr_bindful_textures);
+}
+
+/*
+ * Only views the draw's shaders read can form a loop. Gallium keeps a view
+ * bound until it is replaced, and st/mesa leaves a stage's views alone while
+ * the bound program samples nothing there, so a view of an attachment is
+ * often still bound when nothing reads it: a shadow map sampled by the main
+ * pass, then rendered again by a depth-only program without samplers.
+ * Counting such a view would decompress the attachment for good. So skip the
+ * compute stage, whose dispatches never run inside a draw, and the slots a
+ * stage's shader does not read. Which slots those are depends on the shader,
+ * so check a stage again when its shader changes as well as its views; a new
+ * framebuffer or batch dirties every stage.
+ */
 static void
 agx_legalize_feedback_loops(struct agx_context *ctx)
 {
@@ -14880,10 +14908,19 @@ agx_legalize_feedback_loops(struct agx_context *ctx)
       return;
 
    for (unsigned stage = 0; stage < ARRAY_SIZE(ctx->stage); ++stage) {
-      if (!(ctx->stage[stage].dirty & AGX_STAGE_DIRTY_IMAGE))
+      if (stage == MESA_SHADER_COMPUTE)
          continue;
 
-      for (unsigned i = 0; i < ctx->stage[stage].texture_count; ++i) {
+      bool new_shader =
+         (stage == MESA_SHADER_VERTEX && (ctx->dirty & AGX_DIRTY_VS_PROG)) ||
+         (stage == MESA_SHADER_FRAGMENT && (ctx->dirty & AGX_DIRTY_FS_PROG));
+
+      if (!(ctx->stage[stage].dirty & AGX_STAGE_DIRTY_IMAGE) && !new_shader)
+         continue;
+
+      unsigned nr_read = agx_nr_textures_read(ctx, stage);
+
+      for (unsigned i = 0; i < nr_read; ++i) {
          if (!ctx->stage[stage].textures[i])
             continue;
 
