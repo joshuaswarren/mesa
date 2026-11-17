@@ -677,7 +677,8 @@ agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
    case AGX_CHIP_G18G:
-      *out++ = 0x21000960u;
+      /* G17G also invalidates the USC cache (agx_vdm_barrier_core.h). */
+      *out++ = chip == AGX_CHIP_G17G ? 0x21000968u : 0x21000960u;
       return out;
 
    case AGX_CHIP_G16P:

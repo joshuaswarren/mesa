@@ -60,7 +60,7 @@ agx_vdm_barrier_core_pack(enum agx_chip chip, struct agx_vdm_barrier_core *out)
    if (!out || !agx_vdm_barrier_core_supported(chip))
       return false;
 
-   agx_store_le32(out->bytes, AGX_VDM_BARRIER_CORE_WORD);
+   agx_store_le32(out->bytes, agx_vdm_barrier_core_word(chip));
    out->length = AGX_VDM_BARRIER_CORE_LENGTH;
    return true;
 }
@@ -72,5 +72,5 @@ agx_vdm_barrier_core_unpack(enum agx_chip chip, const void *bytes, size_t size)
        !agx_vdm_barrier_core_supported(chip))
       return false;
 
-   return agx_load_le32(bytes) == AGX_VDM_BARRIER_CORE_WORD;
+   return agx_load_le32(bytes) == agx_vdm_barrier_core_word(chip);
 }
