@@ -2524,6 +2524,32 @@ agx_nir_lower_g18_image_index(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* AGX_FS_CPROG=0 compiles G17P fragments without constant programs. */
+static bool
+agx_g17p_fs_cprog_enabled(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("AGX_FS_CPROG");
+      on = !(e && e[0] == '0');
+   }
+   return on;
+}
+
+/* hk_g17p_native_cprog_qualified(): the bounded native protocol launches it */
+static bool
+agx_g17p_fs_cprog_qualified(const struct agx_shader_info *info)
+{
+   return info->has_preamble && info->preamble_size &&
+          info->agx3_preamble_staging_known && info->nr_preamble_gprs &&
+          info->nr_preamble_gprs <= 256 &&
+          (info->preamble_scratch_size ==
+              info->agx3_preamble_inputs.storage_bytes ||
+           agx3_cprog_static_spill_info_valid(info)) &&
+          (!!info->agx3_preamble_inputs.count ==
+           info->agx3_preamble_tps_inputs);
+}
+
 /*
  * Compile a NIR shader. The only lowering left at this point is sysvals. The
  * shader key should have already been applied. agx_compile_variant may call
@@ -2725,7 +2751,35 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
       }
    }
 
-   if (!agx_compile_shader_nir(nir, &key, &compiled->b)) {
+   /* G17P fragment constant program, as hk_g17p_compile_fs_cprog(): a fragment
+    * that reads descriptor-backed memory compiles a clone with the native
+    * constant program and keeps it only when the native protocol can launch
+    * it; anything else compiles as before, without a preamble. */
+   bool fs_cprog_done = false;
+   if (agx_chip_native_preamble(dev->chip) && stage == MESA_SHADER_FRAGMENT &&
+       !secondary && !internal_kernel && key.no_preamble &&
+       agx_g17p_fs_cprog_enabled() &&
+       (nir->info.num_ubos || nir->info.num_ssbos || nir->info.num_textures ||
+        nir->info.num_images)) {
+      nir_shader *attempt = nir_shader_clone(NULL, nir);
+      struct agx_shader_key ckey = key;
+      ckey.no_preamble = false;
+      ckey.g17p_native_uniforms = true;
+      if (attempt && agx_compile_shader_nir(attempt, &ckey, &compiled->b)) {
+         if (!compiled->b.info.has_preamble ||
+             agx_g17p_fs_cprog_qualified(&compiled->b.info)) {
+            fs_cprog_done = true;
+         } else {
+            free(compiled->b.binary);
+            memset(&compiled->b, 0, sizeof(compiled->b));
+         }
+      } else {
+         memset(&compiled->b, 0, sizeof(compiled->b));
+      }
+      ralloc_free(attempt);
+   }
+
+   if (!fs_cprog_done && !agx_compile_shader_nir(nir, &key, &compiled->b)) {
       /* Fail closed and say so. agx_compile_shader_nir() zeroes its output on
        * refusal, so what comes back here is an empty shader part with no
        * binary and no BO. Record that on the variant: the draw and dispatch
@@ -6523,8 +6577,21 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
 {
    struct agx_context *ctx = batch->ctx;
    struct agx_device *dev = agx_device(ctx->base.screen);
+   /* Only a fragment constant program the native protocol launches */
+   const bool fs_cprog = cs->stage == MESA_SHADER_FRAGMENT &&
+                         cs->b.info.has_preamble &&
+                         agx_g17p_fs_cprog_qualified(&cs->b.info);
    if (!linked || !linked->bo || !linked->bo->va || !linked->size ||
-       cs->b.info.has_preamble || cs->b.info.preamble_scratch_size)
+       ((cs->b.info.has_preamble || cs->b.info.preamble_scratch_size) &&
+        !fs_cprog))
+      return 0;
+   if (fs_cprog && (!cs->bo || !cs->bo->va ||
+                    cs->b.info.preamble_offset > cs->b.info.binary_size ||
+                    cs->b.info.preamble_size >
+                       cs->b.info.binary_size - cs->b.info.preamble_offset ||
+                    (cs->b.info.agx3_preamble_tps_inputs &&
+                     cs->b.info.preamble_scratch_size <
+                        cs->b.info.agx3_preamble_inputs.storage_bytes)))
       return 0;
 
    /* Indirect records change their vertex parameters, not their fragment
@@ -6669,6 +6736,11 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
                                           &capacity))
       return 0;
 
+   /* The constant program branches to its code in the shader's own upload;
+    * the loader grows by that branch and its prelude only. */
+   if (fs_cprog)
+      capacity += 512;
+
    struct agx_bo *program_bo = NULL;
    struct agx_ptr t = agx_pool_alloc_aligned_with_bo(
       &batch->pipeline_pool, capacity, AGX_IOTO_PROGRAM_ALIGNMENT,
@@ -6682,7 +6754,7 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
       cs->stage == MESA_SHADER_FRAGMENT
          ? linked->fragment_control.opaque[0] >> 29
          : AGX_PASS_TYPE_OPAQUE;
-   const struct agx3_g17p_graphics_program_desc desc = {
+   struct agx3_g17p_graphics_program_desc desc = {
       .program_va = t.gpu,
       .shader_va = linked->bo->va->addr + linked->entry_offset,
       .uniform_ranges = ranges,
@@ -6703,6 +6775,21 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
          .tile_size_px = batch->tilebuffer_layout.tile_size,
       },
    };
+   if (fs_cprog) {
+      /* As hk_upload_g17p_graphics_program(): the main shader's own upload
+       * holds the constant program; linking relocates only the main part. */
+      const struct agx_shader_info *pi = &cs->b.info;
+      desc.constant_program = (struct agx_ioto_constant_program){
+         .code = (const uint8_t *)agx_bo_map(cs->bo) + pi->preamble_offset,
+         .code_size = pi->preamble_size,
+         .code_va = cs->bo->va->addr + pi->preamble_offset,
+         .absolute_branch = true,
+         .request_prelude = pi->agx3_preamble_uniform_inputs,
+      };
+      if (pi->agx3_preamble_tps_inputs)
+         desc.cprog_inputs = &pi->agx3_preamble_inputs;
+   }
+
    size_t program_length;
    if (!agx_g17p_graphics_program_cached(dev->chip, linked, &desc, t.cpu,
                                          capacity, &program_length))
