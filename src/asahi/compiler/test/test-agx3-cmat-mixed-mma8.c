@@ -8,6 +8,10 @@
  * f32 dequantized weights) must be legalized in the cooperative-matrix
  * lowering by widening both operands to f32, which is exact for f16 and
  * bf16, before the instruction is emitted.
+ *
+ * An f16 accumulator is widened into the f32 matmad and rounded back after
+ * each product; the chained f16-accumulator case checks that the rounding
+ * survives optimization.
  */
 
 #include "agx_compile.h"
@@ -77,9 +81,36 @@ scan_muladd_types(nir_shader *nir, bool expect_f32)
    return true;
 }
 
+/* Whether every product's accumulator comes through an f16 rounding */
+static bool
+products_rounded(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                nir_instr_as_intrinsic(instr)->intrinsic !=
+                   nir_intrinsic_cmat_muladd_agx)
+               continue;
+            nir_scalar c = nir_scalar_resolved(
+               nir_instr_as_intrinsic(instr)->src[2].ssa, 0);
+            if (nir_scalar_is_alu(c) &&
+                nir_scalar_alu_op(c) == nir_op_f2f32 &&
+                nir_src_bit_size(nir_def_as_alu(c.def)->src[0].src) == 16)
+               continue;
+            if (nir_scalar_is_const(c))
+               continue;
+            return false;
+         }
+      }
+   }
+   return true;
+}
+
 static bool
 compile_mma8(enum glsl_base_type type_a, enum glsl_base_type type_b,
-             enum agx_isa_encoding encoding, const char *name)
+             enum glsl_base_type type_c, enum agx_isa_encoding encoding,
+             const char *name)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, &agx_nir_options, "8x8 mixed cmat %s", name);
@@ -94,9 +125,9 @@ compile_mma8(enum glsl_base_type type_a, enum glsl_base_type type_b,
    nir_variable *vb =
       nir_local_variable_create(b.impl, cmat_type(type_b, GLSL_CMAT_USE_B), "b");
    nir_variable *vc = nir_local_variable_create(
-      b.impl, cmat_type(GLSL_TYPE_FLOAT, GLSL_CMAT_USE_ACCUMULATOR), "c");
+      b.impl, cmat_type(type_c, GLSL_CMAT_USE_ACCUMULATOR), "c");
    nir_variable *vd = nir_local_variable_create(
-      b.impl, cmat_type(GLSL_TYPE_FLOAT, GLSL_CMAT_USE_ACCUMULATOR), "d");
+      b.impl, cmat_type(type_c, GLSL_CMAT_USE_ACCUMULATOR), "d");
 
    nir_deref_instr *da = nir_build_deref_var(&b, va);
    nir_deref_instr *db = nir_build_deref_var(&b, vb);
@@ -105,9 +136,13 @@ compile_mma8(enum glsl_base_type type_a, enum glsl_base_type type_b,
 
    nir_cmat_construct(&b, &da->def, elem_imm(&b, type_a, 1.0));
    nir_cmat_construct(&b, &db->def, elem_imm(&b, type_b, 1.0));
-   nir_cmat_construct(&b, &dc->def, nir_imm_float(&b, 0.0));
+   nir_cmat_construct(&b, &dc->def, elem_imm(&b, type_c, 0.0));
    nir_cmat_muladd(&b, &dd->def, &da->def, &db->def, &dc->def);
-   nir_def *elt = nir_cmat_extract(&b, 32, &dd->def, nir_imm_int(&b, 0));
+   /* A second product on the first one's result */
+   nir_cmat_muladd(&b, &dc->def, &da->def, &db->def, &dd->def);
+   nir_cmat_copy(&b, &dd->def, &dc->def);
+   nir_def *elt = nir_cmat_extract(&b, glsl_base_type_bit_size(type_c),
+                                   &dd->def, nir_imm_int(&b, 0));
    nir_store_shared(&b, elt, nir_imm_int(&b, 0), .align_mul = 4);
 
    if (!agx_nir_lower_cmat(b.shader)) {
@@ -122,6 +157,15 @@ compile_mma8(enum glsl_base_type type_a, enum glsl_base_type type_b,
    }
 
    agx_preprocess_nir(b.shader);
+
+   /* A 16-bit accumulator is the type the shader asked for: each product
+    * must still be rounded to it, not carried in f32 to the next one. */
+   if (type_c == GLSL_TYPE_FLOAT16 && !products_rounded(b.shader)) {
+      fprintf(stderr, "%s: f16 accumulator carried in f32 between products\n",
+              name);
+      ralloc_free(b.shader);
+      return false;
+   }
 
    struct agx_shader_key key = {0};
    key.dev.encoding = encoding;
@@ -146,24 +190,26 @@ main(void)
    glsl_type_singleton_init_or_ref();
    bool pass = true;
    const struct {
-      enum glsl_base_type a, b;
+      enum glsl_base_type a, b, c;
       enum agx_isa_encoding enc;
       const char *name;
    } cases[] = {
-      {GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT, AGX_ISA_ENCODING_AGX3B,
-       "f16 x f32 on AGX3B"},
-      {GLSL_TYPE_FLOAT, GLSL_TYPE_FLOAT16, AGX_ISA_ENCODING_AGX3B,
-       "f32 x f16 on AGX3B"},
-      {GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT16, AGX_ISA_ENCODING_AGX3B,
-       "f16 x f16 on AGX3B"},
-      {GLSL_TYPE_FLOAT, GLSL_TYPE_FLOAT, AGX_ISA_ENCODING_AGX3B,
-       "f32 x f32 on AGX3B"},
-      {GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT, AGX_ISA_ENCODING_AGX3C,
-       "f16 x f32 on AGX3C"},
+      {GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT, GLSL_TYPE_FLOAT,
+       AGX_ISA_ENCODING_AGX3B, "f16 x f32 on AGX3B"},
+      {GLSL_TYPE_FLOAT, GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT,
+       AGX_ISA_ENCODING_AGX3B, "f32 x f16 on AGX3B"},
+      {GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT,
+       AGX_ISA_ENCODING_AGX3B, "f16 x f16 on AGX3B"},
+      {GLSL_TYPE_FLOAT, GLSL_TYPE_FLOAT, GLSL_TYPE_FLOAT,
+       AGX_ISA_ENCODING_AGX3B, "f32 x f32 on AGX3B"},
+      {GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT, GLSL_TYPE_FLOAT,
+       AGX_ISA_ENCODING_AGX3C, "f16 x f32 on AGX3C"},
+      {GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT16,
+       AGX_ISA_ENCODING_AGX3B, "f16 x f16 + f16 on AGX3B"},
    };
 
    for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
-      if (!compile_mma8(cases[i].a, cases[i].b, cases[i].enc, cases[i].name)) {
+      if (!compile_mma8(cases[i].a, cases[i].b, cases[i].c, cases[i].enc, cases[i].name)) {
          fprintf(stderr, "FAIL %s\n", cases[i].name);
          pass = false;
       }

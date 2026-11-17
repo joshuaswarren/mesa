@@ -464,7 +464,8 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types)
               (rows == 16 &&
                 ((input == GLSL_TYPE_FLOAT16 && input_b == GLSL_TYPE_BFLOAT16) ||
                  (input == GLSL_TYPE_BFLOAT16 && input_b == GLSL_TYPE_FLOAT16)))) &&
-             (accum == GLSL_TYPE_FLOAT || accum == GLSL_TYPE_BFLOAT16) && result == accum);
+             (accum == GLSL_TYPE_FLOAT || accum == GLSL_TYPE_FLOAT16 ||
+              accum == GLSL_TYPE_BFLOAT16) && result == accum);
       nir_def *a = load_matrix(b, intr->src[1]);
       nir_def *bb = load_matrix(b, intr->src[2]);
       if (mixed_8x8) {
@@ -472,6 +473,12 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types)
          bb = convert_matrix_value(b, bb, input_b, GLSL_TYPE_FLOAT);
          input = input_b = GLSL_TYPE_FLOAT;
       }
+      /* The matmad accumulates in f32: a 16-bit accumulator is widened into
+       * it and the result rounded back once per product. The rounding is
+       * the accumulator's type, so keep it exact: fast-math folding of
+       * f2f32(f2f16(x)) to x would carry f32 accumulators of twice the
+       * registers from one product to the next. */
+      b->fp_math_ctrl = nir_fp_exact;
       nir_def *c = convert_matrix_value(b, load_matrix(b, intr->src[3]),
                                          accum, GLSL_TYPE_FLOAT);
       nir_def *value = nir_cmat_muladd_agx(b, a, bb, c, .src_type =
@@ -481,6 +488,7 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types)
          input_b == GLSL_TYPE_FLOAT ? nir_type_float32 : nir_type_float16);
       store_matrix(b, intr->src[0], convert_matrix_value(b, value,
                                                       GLSL_TYPE_FLOAT, result));
+      b->fp_math_ctrl = nir_fp_fast_math;
       break;
    }
    case nir_intrinsic_cmat_unary_op:
