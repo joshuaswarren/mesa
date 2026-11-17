@@ -3020,6 +3020,12 @@ agx_emit_image_store(agx_builder *b, nir_intrinsic_instr *instr)
             stored = nir_type_float;
             break;
          default:
+            /* Any other declared format names its data class the same way
+             * (the G18G branch below already does this): the PBE converts
+             * the four 32-bit lanes, f70 only says float or integer. */
+            if (nir_intrinsic_format(instr) != PIPE_FORMAT_NONE)
+               stored = util_format_is_pure_integer(nir_intrinsic_format(instr))
+                           ? nir_type_int : nir_type_float;
             break;
          }
       }

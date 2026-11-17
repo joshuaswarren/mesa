@@ -55,7 +55,12 @@ hk_descriptor_stride_align_for_type(
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
       *stride = hk_storage_image_descriptor_layout(
                    agx_chip_descriptor_generation(pdev->dev.chip)).stride;
-      if (agx_native_graphics(&pdev->dev) || agx_chip_g17_m5(pdev->dev.chip)) {
+      /* G18G uses the same 96-byte record: without it the image-atomic
+       * sideband (+72) did not fit the bare 64-byte texture/PBE pair, the
+       * shader read zero tile geometry there, and atomics addressed the
+       * twiddled image row-major. */
+      if (agx_native_graphics(&pdev->dev) || agx_chip_g17_m5(pdev->dev.chip) ||
+          pdev->dev.chip == AGX_CHIP_G18G) {
          *stride += HK_G17P_STORAGE_SW_SIZE;
          /* imgwci addresses PBE records in a heap, and stores treat the
           * descriptor set as that heap. The PBE descriptor starts 32 bytes
