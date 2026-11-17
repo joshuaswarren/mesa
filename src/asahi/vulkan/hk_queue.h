@@ -68,6 +68,10 @@ struct hk_queue {
    /* Kinds of streams this queue has ever run, see hk_sync.h. */
    struct hk_sync_queue sync;
 
+   /* Scratch for queue_submit: the resolved sync fields of each stream
+    * occurrence of the submission being built (hk_sync_resolve_submit()). */
+   struct util_dynarray sync_resolved;
+
    /* Compute kick (hk_compute_kick.c). watched is set at device creation
     * for a queue whose priority class has a kick queue. The rest is
     * protected by the kicker's lock. */
