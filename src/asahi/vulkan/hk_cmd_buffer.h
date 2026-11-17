@@ -1575,6 +1575,46 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
    a->stats.query_reset_flushes += b->stats.query_reset_flushes;
    a->query_access |= b->query_access;
    assert(!a->query_reset_pending && !b->query_reset_pending);
+
+   /* Frame anatomy: the merged command runs b's programs too. Without them
+    * its whole duration is charged to a's programs alone. */
+   for (unsigned j = 0; j < HK_FA_FS_MAX && b->anatomy_fs[j].fs; ++j) {
+      unsigned i = 0;
+      while (i < HK_FA_FS_MAX && a->anatomy_fs[i].fs &&
+             a->anatomy_fs[i].fs != b->anatomy_fs[j].fs)
+         ++i;
+      if (i == HK_FA_FS_MAX) {
+         a->anatomy_fs_other += b->anatomy_fs[j].draws;
+         continue;
+      }
+      a->anatomy_fs[i].fs = b->anatomy_fs[j].fs;
+      a->anatomy_fs[i].draws += b->anatomy_fs[j].draws;
+      a->anatomy_fs[i].threads += b->anatomy_fs[j].threads;
+      a->anatomy_fs[i].groups += b->anatomy_fs[j].groups;
+      a->anatomy_fs[i].indirect += b->anatomy_fs[j].indirect;
+   }
+   a->anatomy_fs_other += b->anatomy_fs_other;
+
+   for (unsigned j = 0; j < HK_FA_FS_MAX && b->anatomy_precomp[j].dispatches;
+        ++j) {
+      unsigned i = 0;
+      while (i < HK_FA_FS_MAX && a->anatomy_precomp[i].dispatches &&
+             a->anatomy_precomp[i].program != b->anatomy_precomp[j].program)
+         ++i;
+      if (i == HK_FA_FS_MAX) {
+         a->anatomy_precomp_other += b->anatomy_precomp[j].dispatches;
+         continue;
+      }
+      const uint64_t t = b->anatomy_precomp[j].threads;
+      a->anatomy_precomp[i].threads =
+         a->anatomy_precomp[i].dispatches == 0 ? t
+         : (t == UINT64_MAX || a->anatomy_precomp[i].threads == UINT64_MAX)
+            ? UINT64_MAX
+            : a->anatomy_precomp[i].threads + t;
+      a->anatomy_precomp[i].program = b->anatomy_precomp[j].program;
+      a->anatomy_precomp[i].dispatches += b->anatomy_precomp[j].dispatches;
+   }
+   a->anatomy_precomp_other += b->anatomy_precomp_other;
 }
 
 static inline uint64_t

@@ -13633,6 +13633,10 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
                               task->b.info.workgroup_size[2]);
    }
    hk_m5_note_render_resources(cmd, cs);
+   if (unlikely(dev->frame_anatomy)) {
+      hk_frame_anatomy_note_fs(cs, hk_bound_fs(cmd));
+      hk_frame_anatomy_note_vs(cs, hk_bound_hw_vs(gfx));
+   }
    cs->stats.calls++;
    hk_upload_stat(cmd, draws, 1);
    hk_note_pre_raster_images(cmd, cs);

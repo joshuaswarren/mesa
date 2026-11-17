@@ -67,6 +67,7 @@ struct hk_frame_anatomy_rec {
    uint32_t header_off;  /* payload offset of the drm_asahi_cmd_header */
    uint8_t own;          /* bit i: stamp i belongs to the profiler */
    uint8_t query;        /* bit i: stamp i belongs to a query pool */
+   uint32_t query_handle[HK_FA_STAMPS], query_offset[HK_FA_STAMPS];
    uint8_t nr_stamps;    /* 4 render, 2 compute */
    char kind;            /* 'R' render, 'C' compute */
    bool barriers_known;
@@ -111,7 +112,30 @@ struct hk_frame_anatomy {
    unsigned nr_dumped;
 
    bool merge_notes;
+
+   /* Bound timestamp query pools (hk_frame_anatomy_bind_pool), so a stamp a
+    * query owns can still be read back once its command retired. */
+   struct util_dynarray pools; /* struct hk_fa_pool */
 };
+
+struct hk_fa_pool {
+   uint32_t handle;
+   const uint64_t *map;
+   uint64_t size;
+};
+
+/* A query pool's copy of stamp i, 0 if the pool is gone. Called locked. */
+static uint64_t
+hk_fa_query_stamp(struct hk_frame_anatomy *fa,
+                  const struct hk_frame_anatomy_rec *rec, unsigned i)
+{
+   util_dynarray_foreach(&fa->pools, struct hk_fa_pool, pool) {
+      if (pool->handle == rec->query_handle[i] &&
+          rec->query_offset[i] + sizeof(uint64_t) <= pool->size)
+         return p_atomic_read(&pool->map[rec->query_offset[i] / 8]);
+   }
+   return 0;
+}
 
 void
 hk_frame_anatomy_note(struct hk_device *dev, const char *fmt, ...)
@@ -168,10 +192,28 @@ hk_fa_emit(struct hk_frame_anatomy *fa, struct hk_device *dev,
            const struct hk_frame_anatomy_rec *rec, bool complete)
 {
    uint64_t t[HK_FA_STAMPS] = {0};
+   uint8_t recovered = 0;
    if (rec->slot != UINT32_MAX) {
       for (unsigned i = 0; i < HK_FA_STAMPS; ++i) {
          if (rec->own & BITFIELD_BIT(i))
             t[i] = hk_fa_ns(dev, fa->ts_map[rec->slot * HK_FA_STAMPS + i]);
+      }
+   }
+
+   /* A stamp a query owns is the same retirement time the kernel writes for
+    * the query. The application may already have reset or reused the slot,
+    * so keep it only when it lies within a second after the stamp before.
+    */
+   for (unsigned i = 0; complete && i < rec->nr_stamps; ++i) {
+      if (!(rec->query & BITFIELD_BIT(i)))
+         continue;
+      uint64_t v = hk_fa_ns(dev, hk_fa_query_stamp(fa, rec, i));
+      uint64_t prev = 0;
+      for (unsigned j = 0; j < i; ++j)
+         prev = t[j] ? t[j] : prev;
+      if (v && prev && v >= prev && v - prev < 1000000000ull) {
+         t[i] = v;
+         recovered |= BITFIELD_BIT(i);
       }
    }
 
@@ -196,12 +238,14 @@ hk_fa_emit(struct hk_frame_anatomy *fa, struct hk_device *dev,
       fputs(" bar=?", fa->file);
    }
 
-   /* Which stamps the command carries: p profiler, q query pool, - none. */
+   /* Which stamps the command carries: p profiler, Q query pool (value
+    * read back), q query pool (unreadable), - none. */
    fputs(" ts=", fa->file);
    for (unsigned i = 0; i < rec->nr_stamps; ++i) {
-      fputc((rec->own & BITFIELD_BIT(i))     ? 'p'
-            : (rec->query & BITFIELD_BIT(i)) ? 'q'
-                                             : '-',
+      fputc((rec->own & BITFIELD_BIT(i))       ? 'p'
+            : (recovered & BITFIELD_BIT(i))    ? 'Q'
+            : (rec->query & BITFIELD_BIT(i))   ? 'q'
+                                               : '-',
             fa->file);
    }
 
@@ -365,6 +409,7 @@ hk_frame_anatomy_init(struct hk_device *dev)
 
    simple_mtx_init(&fa->lock, mtx_plain);
    util_dynarray_init(&fa->pending, NULL);
+   util_dynarray_init(&fa->pools, NULL);
 
    static const char *const mode_names[] = {"all", "edges", "none"};
    fprintf(fa->file,
@@ -418,6 +463,7 @@ hk_frame_anatomy_finish(struct hk_device *dev)
       dev->dev.ops.bo_unbind_object(&dev->dev, fa->ts_handle);
    agx_bo_unreference(&dev->dev, fa->ts_bo);
    util_dynarray_fini(&fa->pending);
+   util_dynarray_fini(&fa->pools);
    simple_mtx_destroy(&fa->lock);
    if (fa->own_file)
       fclose(fa->file);
@@ -478,6 +524,17 @@ hk_fa_new_rec(struct hk_frame_anatomy_submit *s, struct hk_device *dev,
    return rec;
 }
 
+static void
+hk_fa_note_query(struct hk_frame_anatomy_rec *rec, unsigned i,
+                 const struct drm_asahi_timestamp *ts)
+{
+   if (ts->handle) {
+      rec->query |= BITFIELD_BIT(i);
+      rec->query_handle[i] = ts->handle;
+      rec->query_offset[i] = ts->offset;
+   }
+}
+
 /* Claim stamp i of the record for the kernel to write unless a query owns it. */
 static void
 hk_fa_claim(struct hk_frame_anatomy *fa, struct hk_frame_anatomy_rec *rec,
@@ -485,7 +542,7 @@ hk_fa_claim(struct hk_frame_anatomy *fa, struct hk_frame_anatomy_rec *rec,
 {
    if (ts->handle) {
       if (ts->handle != fa->ts_handle)
-         rec->query |= BITFIELD_BIT(i);
+         hk_fa_note_query(rec, i, ts);
       return;
    }
    if (rec->slot == UINT32_MAX)
@@ -493,14 +550,6 @@ hk_fa_claim(struct hk_frame_anatomy *fa, struct hk_frame_anatomy_rec *rec,
    ts->handle = fa->ts_handle;
    ts->offset = (rec->slot * HK_FA_STAMPS + i) * sizeof(uint64_t);
    rec->own |= BITFIELD_BIT(i);
-}
-
-static void
-hk_fa_note_query(struct hk_frame_anatomy_rec *rec, unsigned i,
-                 const struct drm_asahi_timestamp *ts)
-{
-   if (ts->handle)
-      rec->query |= BITFIELD_BIT(i);
 }
 
 static void
@@ -545,15 +594,20 @@ hk_frame_anatomy_dump_nir(struct hk_device *dev, const struct hk_shader *shader,
                           struct nir_shader *nir, unsigned stage)
 {
    struct hk_frame_anatomy *fa = dev->frame_anatomy;
-   if (!fa || !fa->dump_dir || !shader->code_size ||
-       (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE &&
-        stage != MESA_SHADER_VERTEX))
+   if (!fa || !fa->dump_dir || !shader->code_size)
+      return;
+
+   /* Named by the same binary hash as the record's fs=, vs= or cs=. */
+   const char *prefix = stage == MESA_SHADER_FRAGMENT ? "fs"
+                        : stage == MESA_SHADER_COMPUTE ? "cs"
+                        : stage == MESA_SHADER_MESH    ? "ms"
+                        : stage == MESA_SHADER_VERTEX  ? "vs"
+                                                       : NULL;
+   if (!prefix)
       return;
 
    char path[512];
-   snprintf(path, sizeof(path), "%s/%s-%08x.nir", fa->dump_dir,
-            stage == MESA_SHADER_FRAGMENT ? "fs"
-            : stage == MESA_SHADER_VERTEX ? "vs" : "cs",
+   snprintf(path, sizeof(path), "%s/%s-%08x.nir", fa->dump_dir, prefix,
             _mesa_hash_data(shader->code_ptr, shader->code_size));
    if (access(path, F_OK) == 0)
       return;
@@ -1005,4 +1059,33 @@ hk_frame_anatomy_end_submit(struct hk_frame_anatomy_submit *s,
 
    util_dynarray_fini(&s->recs);
    free(s);
+}
+
+void
+hk_frame_anatomy_bind_pool(struct hk_device *dev, uint32_t handle,
+                           const void *map, uint64_t size)
+{
+   struct hk_frame_anatomy *fa = dev->frame_anatomy;
+   if (!fa || !handle || !map)
+      return;
+   struct hk_fa_pool pool = {.handle = handle, .map = map, .size = size};
+   simple_mtx_lock(&fa->lock);
+   util_dynarray_append(&fa->pools, pool);
+   simple_mtx_unlock(&fa->lock);
+}
+
+void
+hk_frame_anatomy_unbind_pool(struct hk_device *dev, uint32_t handle)
+{
+   struct hk_frame_anatomy *fa = dev->frame_anatomy;
+   if (!fa || !handle)
+      return;
+   simple_mtx_lock(&fa->lock);
+   util_dynarray_foreach(&fa->pools, struct hk_fa_pool, pool) {
+      if (pool->handle == handle) {
+         *pool = util_dynarray_pop(&fa->pools, struct hk_fa_pool);
+         break;
+      }
+   }
+   simple_mtx_unlock(&fa->lock);
 }

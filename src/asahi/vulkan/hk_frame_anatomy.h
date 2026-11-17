@@ -67,8 +67,8 @@ void hk_frame_anatomy_note_m5_fragment(struct hk_cs *cs);
 void hk_frame_anatomy_note_grid(struct hk_cs *cs, const struct hk_shader *cs_shader,
                                  uint64_t threads, uint64_t groups, bool indirect);
 
-/* HK_FRAME_ANATOMY_DUMP only: write the final NIR of a compiled fragment or
- * compute program to <dir>/{fs,cs}-<binary hash>.nir. */
+/* HK_FRAME_ANATOMY_DUMP only: write the final NIR of a compiled fragment,
+ * compute, vertex or mesh program to <dir>/{fs,cs,vs,ms}-<binary hash>.nir. */
 struct nir_shader;
 void hk_frame_anatomy_dump_nir(struct hk_device *dev,
                                const struct hk_shader *shader,
@@ -110,6 +110,12 @@ void hk_frame_anatomy_prepare(struct hk_frame_anatomy_submit *s,
 void hk_frame_anatomy_note_barriers(struct hk_frame_anatomy_submit *s,
                                     const void *payload, size_t begin,
                                     size_t end);
+
+/* Timestamp query pools bound to the kernel, whose stamps the profiler reads
+ * back for commands that end on a query instead of a profiler stamp. */
+void hk_frame_anatomy_bind_pool(struct hk_device *dev, uint32_t handle,
+                                const void *map, uint64_t size);
+void hk_frame_anatomy_unbind_pool(struct hk_device *dev, uint32_t handle);
 
 /* Queue the records for readback once queue->drm.timeline_value completes;
  * a failed result retires them immediately without timestamps. */

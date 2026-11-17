@@ -660,6 +660,8 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
          }
 
          assert(pool->handle && "handles are nonzero");
+         hk_frame_anatomy_bind_pool(dev, pool->handle, agx_bo_map(pool->bo),
+                                    pool->bo->size);
       }
 
       /* Without a binding, every query end keeps the queued store. */
@@ -715,8 +717,10 @@ hk_DestroyQueryPool(VkDevice device, VkQueryPool queryPool,
          hk_descriptor_table_remove(dev, &dev->occlusion_queries, oq_index[i]);
    }
 
-   if (pool->handle)
+   if (pool->handle) {
+      hk_frame_anatomy_unbind_pool(dev, pool->handle);
       dev->dev.ops.bo_unbind_object(&dev->dev, pool->handle);
+   }
 
    agx_bo_unreference(&dev->dev, pool->bo);
    vk_free2(&dev->vk.alloc, pAllocator, pool->oq_submit);
