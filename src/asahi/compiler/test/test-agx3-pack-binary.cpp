@@ -45,6 +45,7 @@ extern "C" {
 #include "agx3_select_core.h"
 #include "agx3_vary_core.h"
 #include "agx3_zs_core.h"
+#include "agx_mesh_abi.h"
 #include "probes/g17p-sparse-mrt.h"
 
 /* agx_nir_lower_tilebuffer's ALL_SAMPLES: the pixel-rate sample mask, and the
@@ -144,6 +145,191 @@ static bool
 int_dest_cache(void)
 {
    return true;
+}
+
+TEST_F(AGX3PackBinary, MeshExportFencesUseExactLivePhaseMasks)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->stage = MESA_SHADER_MESH;
+   agx_mov_imm_to(b, agx_register(8, AGX_SIZE_16), 32);
+   agx_mov_imm_to(b, agx_register(10, AGX_SIZE_16), 64);
+   agx_allocate_uvb_m5(b, agx_register(8, AGX_SIZE_16),
+                        agx_register(10, AGX_SIZE_16));
+   agx_index desc = agx_register(12, AGX_SIZE_32); desc.channels_m1 = 1;
+   agx_mov_imm_to(b, agx_register(12, AGX_SIZE_32), 0);
+   agx_mov_imm_to(b, agx_register(14, AGX_SIZE_32), 256);
+   agx_store_uvb_m5(b, desc, 1);
+   agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_INDICES);
+   agx_store_uvb_m5(b, desc, 0);
+   agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_VERTEX_BATCH);
+   agx_store_uvb_m5(b, desc, 0);
+   agx_stop(b);
+   const auto code = pack(b);
+   const uint8_t index[] = {0x0b,0x01,0x07,0x01,0,0x40,0,0,0,0};
+   const uint8_t vertex[] = {0x0b,0x01,0x07,0x01,0,0x80,0,0,0,0};
+   EXPECT_NE(std::search(code.begin(), code.end(), index, index + sizeof(index)), code.end());
+   EXPECT_NE(std::search(code.begin(), code.end(), vertex, vertex + sizeof(vertex)), code.end());
+   /* Neither the final export nor END gains a terminal phase wait. */
+   ASSERT_GE(code.size(), 10u);
+   EXPECT_EQ(std::vector<uint8_t>(code.end() - 4, code.end()),
+             (std::vector<uint8_t>{0x0e,0,0,0}));
+}
+
+TEST_F(AGX3PackBinary, MeshExportFenceDrainsBothPendingR0Halves)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->stage = MESA_SHADER_MESH;
+   agx_mov_imm_to(b, agx_register(8, AGX_SIZE_16), 0);
+   agx_allocate_uvb_m5(b, agx_register(8, AGX_SIZE_16),
+                        agx_register(8, AGX_SIZE_16));
+   /* Zero exports can still have unrelated explicit producers. Their two
+    * current generations must complete before the carrier touches h0/h1. */
+   agx_device_load_to(b, agx_register(0, AGX_SIZE_16),
+      agx_uniform(0, AGX_SIZE_64), agx_immediate(0), AGX_FORMAT_I16, 1, 0, false);
+   agx_device_load_to(b, agx_register(1, AGX_SIZE_16),
+      agx_uniform(0, AGX_SIZE_64), agx_immediate(2), AGX_FORMAT_I16, 1, 0, false);
+   agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_INDICES);
+   agx_iadd_to(b, agx_register(4, AGX_SIZE_16),
+      agx_register(0, AGX_SIZE_16), agx_register(1, AGX_SIZE_16), 0);
+   agx_stop(b);
+   const auto code = pack(b);
+   const uint8_t complete[] = {0x0b,0x01,0x07,0x01,0,0x60,0,0,0,0};
+   EXPECT_NE(std::search(code.begin(), code.end(), complete,
+                         complete + sizeof(complete)), code.end());
+}
+
+TEST_F(AGX3PackBinary, MeshExportFenceRefusesInvalidProtocolOrChannelReuse)
+{
+   for (unsigned bad : {0u,1u,2u,3u,4u,5u}) {
+      agx_builder *b = builder(bad == 5 ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B);
+      key.dev.chip = bad == 5 ? AGX_CHIP_G17S : AGX_CHIP_G17P;
+      b->shader->stage = MESA_SHADER_MESH;
+      agx_mov_imm_to(b, agx_register(8, AGX_SIZE_16), 1);
+      if (bad != 0)
+         agx_allocate_uvb_m5(b, agx_register(8, AGX_SIZE_16), agx_register(8, AGX_SIZE_16));
+      agx_index desc = agx_register(12, AGX_SIZE_32); desc.channels_m1 = 1;
+      if (bad == 4) {
+         agx_store_uvb_m5(b, desc, 1);
+         /* Ordinary producers are now allocated away from phase channels.
+          * Force the native ISEL pair instead: its required slot2 must not
+          * be rewritten by the policy or reuse a pending index phase. */
+         agx_index first = agx_register(4, AGX_SIZE_32);
+         agx_index second = agx_register(6, AGX_SIZE_32);
+         agx_device_load_to(b, first, agx_uniform(0, AGX_SIZE_64),
+            agx_immediate(0), AGX_FORMAT_I32, 1, 0, false);
+         agx_device_load_to(b, second, agx_uniform(0, AGX_SIZE_64),
+            agx_immediate(4), AGX_FORMAT_I32, 1, 0, false);
+         agx_icmpsel_to(b, agx_register(16, AGX_SIZE_32), first, second,
+                          first, second, AGX_ICOND_UEQ);
+      }
+      agx_fence_uvb_gen1(b, bad == 1 ? AGX_MESH_EXPORT_FENCE_VERTEX_BATCH :
+                          bad == 2 ? 2 : AGX_MESH_EXPORT_FENCE_INDICES);
+      if (bad == 3)
+         agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_INDICES);
+      agx_stop(b);
+      EXPECT_TRUE(pack(b, false).empty()) << bad;
+   }
+}
+
+/* Actual unlinked GPL failure: position UVSTs precede root-table loads of
+ * the page carrier and location0 selectors. A round-robin slot3 load after
+ * the first vertex UVST violates the phase protocol even when its result is
+ * immediately consumed by the next descriptor. Vary the incoming cursor so
+ * success cannot depend on how many API-body loads happened to precede it. */
+TEST_F(AGX3PackBinary, MeshUnlinkedSelectorsBetweenExports)
+{
+   for (bool with_system_reads : {false, true}) {
+      SCOPED_TRACE(with_system_reads);
+      for (unsigned warmup = 0; warmup < 6; ++warmup) {
+         SCOPED_TRACE(warmup);
+         agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+         key.dev.chip = AGX_CHIP_G17P;
+         b->shader->stage = MESA_SHADER_MESH;
+         for (unsigned i = 0; i < warmup; ++i)
+            agx_device_load_to(b, agx_register(32 + 2 * i, AGX_SIZE_32),
+               agx_uniform(0, AGX_SIZE_64), agx_immediate(i),
+               AGX_FORMAT_I32, 1, 0, false);
+         for (unsigned i = 0; i < warmup; ++i)
+            agx_mov_to(b, agx_register(64 + 2 * i, AGX_SIZE_32),
+                          agx_register(32 + 2 * i, AGX_SIZE_32));
+         agx_mov_imm_to(b, agx_register(8, AGX_SIZE_16), 2);
+         agx_mov_imm_to(b, agx_register(10, AGX_SIZE_16), 6);
+         agx_allocate_uvb_m5(b, agx_register(8, AGX_SIZE_16),
+                              agx_register(10, AGX_SIZE_16));
+         agx_index desc = agx_register(12, AGX_SIZE_32);
+         desc.channels_m1 = 1;
+         agx_mov_imm_to(b, agx_register(12, AGX_SIZE_32), 0);
+         agx_mov_imm_to(b, agx_register(14, AGX_SIZE_32), 0);
+         agx_store_uvb_m5(b, desc, 1);
+         agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_INDICES);
+         for (unsigned plane = 0; plane < 4; ++plane) {
+            agx_mov_imm_to(b, agx_register(12, AGX_SIZE_32), plane);
+            agx_mov_imm_to(b, agx_register(14, AGX_SIZE_32), 192 + 32 * plane);
+            agx_store_uvb_m5(b, desc, 0);
+         }
+         for (unsigned selector : {128u, 130u}) {
+            agx_device_load_to(b, agx_register(2, AGX_SIZE_32),
+               agx_uniform(0, AGX_SIZE_64), agx_immediate(selector),
+               AGX_FORMAT_I8, 1, 2, false);
+            agx_mov_to(b, agx_register(12, AGX_SIZE_32),
+                          agx_register(2, AGX_SIZE_32));
+            agx_mov_imm_to(b, agx_register(14, AGX_SIZE_32), 320);
+            agx_store_uvb_m5(b, desc, 0);
+         }
+         if (with_system_reads) {
+            /* With warmup3, old allocation used selectors4/5 then SR6/1.
+             * Restricting only the selectors instead leaves SR2/3, making
+             * the second SR collide with the still-pending vertex phase. */
+            agx_get_sr_to(b, agx_register(16, AGX_SIZE_32),
+                            AGX_SR_THREADGROUP_POSITION_IN_GRID_X);
+            agx_mov_to(b, agx_register(20, AGX_SIZE_32),
+                          agx_register(16, AGX_SIZE_32));
+            agx_get_sr_to(b, agx_register(18, AGX_SIZE_32),
+                            AGX_SR_THREADGROUP_POSITION_IN_GRID_Y);
+            agx_mov_to(b, agx_register(22, AGX_SIZE_32),
+                          agx_register(18, AGX_SIZE_32));
+         }
+         agx_stop(b);
+         /* Match production: MOV is a pseudo, lowered to a bitwise copy
+          * before native packing. Keep the actual selector/SR reads. */
+         agx_lower_pseudo(b->shader);
+         const auto code = pack(b);
+         ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+         const uint8_t index[] = {0x0b,0x01,0x07,0x01,0,0x40,0,0,0,0};
+         EXPECT_NE(std::search(code.begin(), code.end(), index,
+                               index + sizeof(index)), code.end());
+         EXPECT_EQ(std::vector<uint8_t>(code.end() - 4, code.end()),
+                   (std::vector<uint8_t>{0x0e,0,0,0}));
+      }
+   }
+}
+
+/* Choosing a non-phase channel is insufficient by itself. A selector not
+ * consumed yet must still make the existing outstanding-operation UVST gate
+ * fail closed; the policy must not become an unconditional export drain. */
+TEST_F(AGX3PackBinary, MeshUnconsumedSelectorStillRefusesExport)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->stage = MESA_SHADER_MESH;
+   agx_mov_imm_to(b, agx_register(8, AGX_SIZE_16), 1);
+   agx_allocate_uvb_m5(b, agx_register(8, AGX_SIZE_16),
+                        agx_register(8, AGX_SIZE_16));
+   agx_index desc = agx_register(12, AGX_SIZE_32);
+   desc.channels_m1 = 1;
+   agx_mov_imm_to(b, agx_register(12, AGX_SIZE_32), 0);
+   agx_mov_imm_to(b, agx_register(14, AGX_SIZE_32), 192);
+   agx_store_uvb_m5(b, desc, 1);
+   agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_INDICES);
+   agx_store_uvb_m5(b, desc, 0);
+   agx_device_load_to(b, agx_register(2, AGX_SIZE_32),
+      agx_uniform(0, AGX_SIZE_64), agx_immediate(128),
+      AGX_FORMAT_I8, 1, 2, false);
+   agx_store_uvb_m5(b, desc, 0);
+   agx_stop(b);
+   EXPECT_TRUE(pack(b, false).empty());
 }
 
 TEST_F(AGX3PackBinary, MultisampleTileBankCountsPartitionsNotStores)

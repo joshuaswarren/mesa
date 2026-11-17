@@ -46,6 +46,7 @@
 #include "agx3_rt_m5_core.h"
 #include "agx3_select_core.h"
 #include "agx3_slot_core.h"
+#include "agx_mesh_abi.h"
 #include "agx3_sr_core.h"
 #include "agx3_zs_core.h"
 #include "agx3_stage_core.h"
@@ -13320,7 +13321,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                      (I->imm == AGX3_BARRIER_SCOPE_DEVICE ||
                       I->imm == AGX3_BARRIER_SCOPE_DEVICE_FENCE ||
                       agx3_m5_rendezvous_barrier(ctx, enc, I->imm))) ||
-                    I->op == AGX_OPCODE_RT_BARRIER_GEN1;
+                    I->op == AGX_OPCODE_RT_BARRIER_GEN1 ||
+                    I->op == AGX_OPCODE_FENCE_UVB_GEN1;
          e->reissues_live_slot = I->op == AGX_OPCODE_LDCF;
          if (I->agx3_tex_coord_start)
             e->preferred_slot = native_coord_preferred_slot;
@@ -13648,6 +13650,34 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       }
    }
 
+   const bool gen1_mesh = enc == AGX_ISA_ENCODING_AGX3B &&
+      ctx->key->dev.chip == AGX_CHIP_G17P &&
+      ctx->stage == MESA_SHADER_MESH && !ctx->is_preamble;
+   if (gen1_mesh) {
+      bool exports_pending = false;
+      for (unsigned i = 0; i < count; ++i) {
+         if (ordered[i]->op == AGX_OPCODE_FENCE_UVB_GEN1)
+            exports_pending = false;
+         else if (ordered[i]->op == AGX_OPCODE_STORE_UVB_M5)
+            exports_pending = true;
+         else if (exports_pending && sl[i].is_async &&
+                  !sl[i].preferred_slot && !sl[i].transient_slots &&
+                  !sl[i].reissues_live_slot && !sl[i].join_class) {
+            /* Unlinked mesh interfaces load UVS selectors from the root
+             * table between vertex exports. Restrict every ordinary async
+             * producer in this region, not just loads: a restricted load
+             * changes the shared cursor and could otherwise move a later
+             * system-value read onto an observed phase channel.
+             * Slot 1 is outside both phase channels. Keep it an ordinary
+             * allocation so reuse retires a live generation; retain normal
+             * RAW/WAW waits and all emitter guards. Required compound,
+             * preferred, reissuable and joined protocols stay unchanged.
+             * This does not assign an implicit UVST producer or lifetime. */
+            sl[i].max_slot = 1;
+         }
+      }
+   }
+
    const struct agx3_slot_entry input_entry = {
       .token = AGX3_SLOT_CPROG_INPUT_TOKEN, .slot = 6,
    };
@@ -13891,6 +13921,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
     * agx3_r0_inflight once that instruction has been emitted. */
    uint16_t r0_issued = 0;
 
+   bool mesh_allocated = false, mesh_indices_fenced = false;
+   bool mesh_exports_pending = false;
+   unsigned mesh_vertex_fences = 0;
+
    agx_foreach_block(ctx, block) {
       block->offset = emission->size;
       block->loop_exit_offset = -1;
@@ -13957,6 +13991,51 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             image_write_slots &= (uint16_t)~(1u << (slot - 1));
          if (slot)
             outstanding |= (uint16_t)(1u << (slot - 1));
+
+         /* The native phase sequence does not establish an asynchronous
+          * UVST producer or its source-register lifetime. Do not allow an
+          * explicit producer to reuse the phase's observed wait channel
+          * after an export and before its boundary. Refuse an ambiguous
+          * lowering instead of treating a reused slot as export completion.
+          * Other explicit channels retain their ordinary dependency model. */
+         if (gen1_mesh && mesh_exports_pending && slot &&
+             (1u << (slot - 1)) == (mesh_indices_fenced ? 4u : 2u))
+            AGX3_REFUSE(I);
+
+         if (I->op == AGX_OPCODE_FENCE_UVB_GEN1) {
+            if (!gen1_mesh || !mesh_allocated || I->nr_srcs || I->nr_dests ||
+                slot || I->imm > AGX_MESH_EXPORT_FENCE_VERTEX_BATCH ||
+                (I->imm == AGX_MESH_EXPORT_FENCE_INDICES
+                    ? mesh_indices_fenced : !mesh_indices_fenced))
+               AGX3_REFUSE(I);
+            const uint16_t retire = wait | outstanding_here;
+            const uint16_t phase = I->imm == AGX_MESH_EXPORT_FENCE_INDICES ? 2 : 4;
+            const uint16_t src[] = {0, 0};
+            const enum agx3_alu_hint hints[] = {
+               AGX3_ALU_HINT_NONE, AGX3_ALU_HINT_NONE};
+            uint8_t bytes[AGX3_ALU_MAX_LENGTH], len = 0;
+            /* Drain ALL modeled explicit producers, including any pending
+             * writer of either half of r0, before this live identity reads
+             * r0. The source-less AIR fence has drain semantics in the slot
+             * pass; the emission ledger independently covers any residual.
+             * Use the exact native bitop waits, without retire-noop's extra
+             * slot6 wait. No comparison flag, nesting state or value changes.
+             * Phase masks are the G17P exporter protocol at these source
+             * boundaries, not universal UVST producer-slot assignments. */
+            if (!agx3_alu_bit_reg_native(enc, AGX3_ALU_BAND, 0, src, hints,
+                                        false, retire | phase, bytes, &len) ||
+                !agx3_append(emission, bytes, len))
+               AGX3_REFUSE(I);
+            outstanding = 0;
+            image_write_slots &= (uint16_t)~retire;
+            agx3_staging_forget(&staging_banks, retire);
+            mesh_exports_pending = false;
+            if (I->imm == AGX_MESH_EXPORT_FENCE_INDICES)
+               mesh_indices_fenced = true;
+            else
+               ++mesh_vertex_fences;
+            continue;
+         }
 
          if (I->op == AGX_OPCODE_MATMAD16_AGX3) {
             if (enc != AGX_ISA_ENCODING_AGX3C || ctx->is_preamble ||
@@ -16682,6 +16761,18 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * generation before the allocation claims the slot, then wait
              * for the allocation itself. */
             const bool alloc_slot = I->op == AGX_OPCODE_ALLOCATE_UVB_M5;
+            if (gen1_mesh) {
+               if (alloc_slot) {
+                  if (mesh_allocated)
+                     AGX3_REFUSE(I);
+                  mesh_allocated = true;
+               } else {
+                  if (!mesh_allocated || outstanding_here ||
+                      (I->imm ? mesh_indices_fenced : !mesh_indices_fenced))
+                     AGX3_REFUSE(I);
+                  mesh_exports_pending = true;
+               }
+            }
             const uint16_t pre_wait = alloc_slot ? (wait | (outstanding_here & 1u)) : wait;
             if (!encoded || (pre_wait && !agx3_retire_slots_noop(emission, enc, pre_wait)) ||
                 !agx3_append(emission, bytes, length))
@@ -23262,6 +23353,13 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
           !agx3_append(emission, bytes, len))
          goto fail;
    }
+
+   if (gen1_mesh && mesh_allocated &&
+       (!mesh_indices_fenced ||
+        (ctx->nir && ctx->nir->info.mesh.max_vertices_out &&
+         mesh_vertex_fences + 1 !=
+            DIV_ROUND_UP(ctx->nir->info.mesh.max_vertices_out, 32))))
+      AGX3_PACK_FAIL();
 
    /* Native1061's attachmentless1x/2x/4x fragment is pixel entry, final
     * release and end even when its epilog has no stores. This terminal

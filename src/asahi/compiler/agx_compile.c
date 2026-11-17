@@ -4234,6 +4234,8 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
    case nir_intrinsic_allocate_mesh_uvb_agx:
       return agx_allocate_uvb_m5(b, agx_src_index(&instr->src[0]),
                                  agx_src_index(&instr->src[1]));
+   case nir_intrinsic_fence_mesh_uvb_agx:
+      return agx_fence_uvb_gen1(b, nir_intrinsic_base(instr));
    case nir_intrinsic_store_mesh_uvb_agx:
       return agx_store_uvb_m5(b, agx_src_index(&instr->src[0]),
                               nir_intrinsic_flags(instr));

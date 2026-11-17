@@ -1017,6 +1017,11 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
    
 
 
+   /* G17P's export phases are separate from logical workgroup dimensions,
+    * API topology and the declared output limits. Complete every index
+    * batch before opening the vertex phase. This is outside the index IFs:
+    * zero and partial counts must reconverge before the phase boundary. */
+   nir_fence_mesh_uvb_agx(&b, .base = AGX_MESH_EXPORT_FENCE_INDICES);
    nir_def *selector[4 + 128] = {NULL};
    if (varyings->dynamic) {
       for (unsigned slot = 0; slot < 64; ++slot) {
@@ -1029,6 +1034,10 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
       }
    }
    for(unsigned vertex=0;vertex<s->info.mesh.max_vertices_out;vertex+=32) {
+      /* No terminal fence: only order a preceding batch before the next
+       * batch's predicate, in the same SIMD0 epilogue scope. */
+      if (vertex)
+         nir_fence_mesh_uvb_agx(&b, .base = AGX_MESH_EXPORT_FENCE_VERTEX_BATCH);
       nir_push_if(&b,nir_ult(&b,nir_iadd_imm(&b,lane,vertex),nir_u2u32(&b,v)));
       for(unsigned plane=0;plane<layout.planes;plane++) {
          const unsigned address=layout.position+layout.plane_stride*plane+4*vertex;
