@@ -925,20 +925,39 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
       if (def == NULL)
          continue; /* happens for phis in loops */
 
-      /* Preserve a pointer assembled from adjacent uniform words instead of
-       * materializing its two words in registers. M5 loads can address the
-       * complete uniform file with an aligned 64-bit base. */
-      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          I->op == AGX_OPCODE_DEVICE_LOAD && s == 0 &&
+      /* Preserve an aligned 64-bit device-load base assembled from
+       * adjacent uniform words. The native form reads those same words. */
+      if (ctx->key && I->op == AGX_OPCODE_DEVICE_LOAD && s == 0 &&
           src.size == AGX_SIZE_64 && agx_channels(src) == 1 &&
           !src.abs && !src.neg && !src.memory &&
           def->op == AGX_OPCODE_COLLECT && def->nr_srcs == 2 &&
           def->nr_dests == 1 && def->dest[0].size == AGX_SIZE_64 &&
           agx_channels(def->dest[0]) == 1 && !def->dest[0].memory &&
-          !def->saturate &&
-          debug_get_bool_option("ASAHI_M5_HIGH_UNIFORM_LOAD", true)) {
+          !def->saturate) {
          const agx_index lo = def->src[0], hi = def->src[1];
-         if (lo.type == AGX_INDEX_UNIFORM && hi.type == AGX_INDEX_UNIFORM &&
+         const bool m5_uniform_base =
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+            debug_get_bool_option("ASAHI_M5_HIGH_UNIFORM_LOAD", true);
+
+         /* G17P scalar W8 and four packed W8 components both return one
+          * physical word, and their native LDDEV reads an aligned base
+          * directly from the low uniform file. */
+         const bool g17p_w8_uniform_base =
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+            ctx->key->dev.chip == AGX_CHIP_G17P &&
+            ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
+            ctx->nir && !ctx->nir->info.internal && !ctx->key->secondary &&
+            I->format == AGX_FORMAT_I8 && !I->coherent &&
+            I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
+            agx_channels(I->dest[0]) == 1 &&
+            ((!I->memory_is_packed && I->mask == 0x1) ||
+             (I->memory_is_packed && I->mask == 0xf)) &&
+            !src.kill && !src.cache && !src.discard &&
+            !lo.kill && !lo.cache && !lo.discard &&
+            !hi.kill && !hi.cache && !hi.discard;
+
+         if ((m5_uniform_base || g17p_w8_uniform_base) &&
+             lo.type == AGX_INDEX_UNIFORM && hi.type == AGX_INDEX_UNIFORM &&
              lo.size == AGX_SIZE_32 && hi.size == AGX_SIZE_32 &&
              agx_channels(lo) == 1 && agx_channels(hi) == 1 &&
              !lo.abs && !lo.neg && !lo.memory &&
