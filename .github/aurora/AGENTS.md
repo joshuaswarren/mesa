@@ -31,11 +31,8 @@ variability that affects the comparison. Link the benchmark source and any test
 scripts, and attach or link the raw output for both runs somewhere reviewers
 can access. Call out regressions and explain any trade-offs for review.
 
-For feature enablement, benchmark an application that uses the feature. For
-example, enabling Q-op Vulkan cooperative matrices on G17P (M4 Pro, T6040)
-requires a Vulkan `llama.cpp` benchmark on that hardware. Report prompt
-processing and token generation throughput separately. Use extension and
-conformance checks as additional evidence of correctness.
+For feature enablement, benchmark an application that uses the feature. Use
+extension and conformance checks as additional evidence of correctness.
 
 ## To be expanded
 
