@@ -16,6 +16,11 @@ struct hk_device;
 /* Kernel queues one hk_queue may spread its independent work over. */
 #define HK_QUEUE_SIBLINGS_MAX 4
 
+/* Render stages with ray-query scratch, in drm_asahi_queue_create
+ * render_scs_layout order. */
+#define HK_RENDER_RQ_VERTEX   (1u << 0)
+#define HK_RENDER_RQ_FRAGMENT (1u << 1)
+
 struct hk_queue {
    struct vk_queue vk;
 
@@ -23,18 +28,13 @@ struct hk_queue {
       /* Asahi kernel queue ID, UINT32_MAX until the first GPU submission. */
       uint32_t id;
 
-      /* Whether the kernel queue reserves render ray-query scratch, which
-       * sizes its render free list for ray queries in vertex and fragment
-       * shaders. Only a queue that runs such a render gets one: the
-       * reservation multiplies the free list several times over, and the
-       * kernel places every queue's free list in one bounded window. */
-      bool render_rq;
-
-      /* The kernel queue a render ray query replaced, UINT32_MAX if none.
-       * It is destroyed once the queue timeline reaches retired_point, the
-       * last point submitted to it, or with the queue. */
-      uint32_t retired_id;
-      uint64_t retired_point;
+      /* The render stages (HK_RENDER_RQ_*) whose ray-query scratch the
+       * kernel queue reserves, which sizes its render free list. Only a
+       * queue that runs such a render gets one, and only for the stages it
+       * has run ray queries in: each stage's reservation scales with the
+       * GPU core count, and the kernel places every queue's free list as
+       * one contiguous block in one bounded window. */
+      uint8_t render_rq;
 
       /* Timeline syncobj backing the queue */
       uint32_t syncobj;
