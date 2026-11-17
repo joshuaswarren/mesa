@@ -13168,8 +13168,11 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
 
       /* hk_g17p_emit_draw() validates a direct draw as it encodes it. */
       enum agx_primitive topology = cmd->state.gfx.topology;
+      /* Admit with the chip whose Index List words agx_vdm_draw() writes
+       * below (G18G writes G17G's), not the raw chip. */
       if ((!agx_native_graphics(&dev->dev) || agx_is_indirect(draw.b)) &&
-          !agx_vdm_draw_supported(dev->dev.chip, draw, topology)) {
+          !agx_vdm_draw_supported(agx_vdm_index_list_record_chip(dev->dev.chip),
+                                  draw, topology)) {
          if (debug_get_option_m5_launch_debug())
             mesa_loge("draw admission: indexed=%u indirect=%u size=%u ib=%#llx range=%u arg=%#llx topology=%u",
                       draw.indexed, agx_is_indirect(draw.b), draw.index_size,
