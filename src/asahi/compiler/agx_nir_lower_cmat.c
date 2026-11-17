@@ -360,7 +360,8 @@ convert_matrix_value(nir_builder *b, nir_def *value,
 }
 
 static bool
-lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types)
+lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types,
+                   bool native_f16_accum8)
 {
    if (instr->type == nir_instr_type_deref) {
       nir_deref_instr *deref = nir_instr_as_deref(instr);
@@ -473,21 +474,28 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types)
          bb = convert_matrix_value(b, bb, input_b, GLSL_TYPE_FLOAT);
          input = input_b = GLSL_TYPE_FLOAT;
       }
-      /* The matmad accumulates in f32: a 16-bit accumulator is widened into
-       * it and the result rounded back once per product. The rounding is
-       * the accumulator's type, so keep it exact: fast-math folding of
-       * f2f32(f2f16(x)) to x would carry f32 accumulators of twice the
-       * registers from one product to the next. */
+      /* f32matmad8x8 and the 16x16 GEMM accumulate in f32: a 16-bit
+       * accumulator is widened into them and the result rounded back once
+       * per product. The rounding is the accumulator's type, so keep it
+       * exact: fast-math folding of f2f32(f2f16(x)) to x would carry f32
+       * accumulators of twice the registers from one product to the next. */
       b->fp_math_ctrl = nir_fp_exact;
-      nir_def *c = convert_matrix_value(b, load_matrix(b, intr->src[3]),
-                                         accum, GLSL_TYPE_FLOAT);
+      /* AGX3B's f16matmad8x8 takes an f16 accumulator as it is */
+      const bool native = native_f16_accum8 && rows == 8 &&
+                          input == GLSL_TYPE_FLOAT16 &&
+                          input_b == GLSL_TYPE_FLOAT16 &&
+                          accum == GLSL_TYPE_FLOAT16;
+      nir_def *c = load_matrix(b, intr->src[3]);
+      if (!native)
+         c = convert_matrix_value(b, c, accum, GLSL_TYPE_FLOAT);
       nir_def *value = nir_cmat_muladd_agx(b, a, bb, c, .src_type =
          input == GLSL_TYPE_BFLOAT16 ? nir_type_uint16 :
          input == GLSL_TYPE_FLOAT ? nir_type_float32 : nir_type_float16,
          .src_type2 = input_b == GLSL_TYPE_BFLOAT16 ? nir_type_uint16 :
          input_b == GLSL_TYPE_FLOAT ? nir_type_float32 : nir_type_float16);
-      store_matrix(b, intr->src[0], convert_matrix_value(b, value,
-                                                      GLSL_TYPE_FLOAT, result));
+      if (!native)
+         value = convert_matrix_value(b, value, GLSL_TYPE_FLOAT, result);
+      store_matrix(b, intr->src[0], value);
       b->fp_math_ctrl = nir_fp_fast_math;
       break;
    }
@@ -566,7 +574,7 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types)
 }
 
 bool
-agx_nir_lower_cmat(nir_shader *nir)
+agx_nir_lower_cmat(nir_shader *nir, bool native_f16_accum8)
 {
    if (nir->info.stage != MESA_SHADER_COMPUTE || !nir->info.cs.has_cooperative_matrix)
       return false;
@@ -579,7 +587,7 @@ agx_nir_lower_cmat(nir_shader *nir)
       nir_builder b = nir_builder_create(impl);
       nir_foreach_block_reverse_safe(block, impl) {
          nir_foreach_instr_reverse_safe(instr, block)
-            lower_matrix_instr(&b, instr, types);
+            lower_matrix_instr(&b, instr, types, native_f16_accum8);
       }
       nir_progress(true, impl, nir_metadata_control_flow);
    }

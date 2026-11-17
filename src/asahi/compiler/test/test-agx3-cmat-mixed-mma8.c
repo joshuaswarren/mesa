@@ -107,10 +107,28 @@ products_rounded(nir_shader *nir)
    return true;
 }
 
+/* Whether every product takes and returns f16 itself (f16matmad8x8) */
+static bool
+products_native_f16(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_cmat_muladd_agx &&
+                nir_instr_as_intrinsic(instr)->def.bit_size != 16)
+               return false;
+         }
+      }
+   }
+   return true;
+}
+
 static bool
 compile_mma8(enum glsl_base_type type_a, enum glsl_base_type type_b,
              enum glsl_base_type type_c, enum agx_isa_encoding encoding,
-             const char *name)
+             bool native, const char *name)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, &agx_nir_options, "8x8 mixed cmat %s", name);
@@ -145,7 +163,7 @@ compile_mma8(enum glsl_base_type type_a, enum glsl_base_type type_b,
                                    &dd->def, nir_imm_int(&b, 0));
    nir_store_shared(&b, elt, nir_imm_int(&b, 0), .align_mul = 4);
 
-   if (!agx_nir_lower_cmat(b.shader)) {
+   if (!agx_nir_lower_cmat(b.shader, native)) {
       fprintf(stderr, "%s: cooperative-matrix lowering did not run\n", name);
       ralloc_free(b.shader);
       return false;
@@ -160,7 +178,12 @@ compile_mma8(enum glsl_base_type type_a, enum glsl_base_type type_b,
 
    /* A 16-bit accumulator is the type the shader asked for: each product
     * must still be rounded to it, not carried in f32 to the next one. */
-   if (type_c == GLSL_TYPE_FLOAT16 && !products_rounded(b.shader)) {
+   if (native && !products_native_f16(b.shader)) {
+      fprintf(stderr, "%s: f16 accumulator not taken natively\n", name);
+      ralloc_free(b.shader);
+      return false;
+   }
+   if (type_c == GLSL_TYPE_FLOAT16 && !native && !products_rounded(b.shader)) {
       fprintf(stderr, "%s: f16 accumulator carried in f32 between products\n",
               name);
       ralloc_free(b.shader);
@@ -192,24 +215,28 @@ main(void)
    const struct {
       enum glsl_base_type a, b, c;
       enum agx_isa_encoding enc;
+      bool native;
       const char *name;
    } cases[] = {
       {GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT, GLSL_TYPE_FLOAT,
-       AGX_ISA_ENCODING_AGX3B, "f16 x f32 on AGX3B"},
+       AGX_ISA_ENCODING_AGX3B, false, "f16 x f32 on AGX3B"},
       {GLSL_TYPE_FLOAT, GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT,
-       AGX_ISA_ENCODING_AGX3B, "f32 x f16 on AGX3B"},
+       AGX_ISA_ENCODING_AGX3B, false, "f32 x f16 on AGX3B"},
       {GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT,
-       AGX_ISA_ENCODING_AGX3B, "f16 x f16 on AGX3B"},
+       AGX_ISA_ENCODING_AGX3B, false, "f16 x f16 on AGX3B"},
       {GLSL_TYPE_FLOAT, GLSL_TYPE_FLOAT, GLSL_TYPE_FLOAT,
-       AGX_ISA_ENCODING_AGX3B, "f32 x f32 on AGX3B"},
+       AGX_ISA_ENCODING_AGX3B, false, "f32 x f32 on AGX3B"},
       {GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT, GLSL_TYPE_FLOAT,
-       AGX_ISA_ENCODING_AGX3C, "f16 x f32 on AGX3C"},
+       AGX_ISA_ENCODING_AGX3C, false, "f16 x f32 on AGX3C"},
       {GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT16,
-       AGX_ISA_ENCODING_AGX3B, "f16 x f16 + f16 on AGX3B"},
+       AGX_ISA_ENCODING_AGX3B, false, "f16 x f16 + f16 on AGX3B, f32 matmad"},
+      {GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT16, GLSL_TYPE_FLOAT16,
+       AGX_ISA_ENCODING_AGX3B, true, "f16 x f16 + f16 on AGX3B, f16 matmad"},
    };
 
    for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
-      if (!compile_mma8(cases[i].a, cases[i].b, cases[i].c, cases[i].enc, cases[i].name)) {
+      if (!compile_mma8(cases[i].a, cases[i].b, cases[i].c, cases[i].enc,
+                        cases[i].native, cases[i].name)) {
          fprintf(stderr, "FAIL %s\n", cases[i].name);
          pass = false;
       }

@@ -2735,9 +2735,9 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
                 !pdev->vk.supported_features.shaderBFloat16CooperativeMatrix)
                continue;
             /* An 8x8 accumulator of the 16-bit input type takes half the
-             * registers of an f32 one; the matmad still sums in f32. f16 is
-             * listed on the AGX3B encoding (G15/G16/G17P) only: AGX3C (M5)
-             * would widen it into an f32 matmad not yet run with it. */
+             * registers of an f32 one. f16 is listed on the AGX3B encoding
+             * (G15/G16/G17P) only, where it runs on the f16matmad8x8: AGX3C
+             * (M5) would widen it into an f32 matmad not yet run with it. */
             const bool f16_accum = agx_chip_isa_encoding(pdev->dev.chip) ==
                                    AGX_ISA_ENCODING_AGX3B;
             unsigned modes = (types[i] == VK_COMPONENT_TYPE_BFLOAT16_KHR || f16_accum) ? 2 : 1;

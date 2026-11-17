@@ -3132,7 +3132,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    bool cmat_lowered = false;
    if (agx_chip_g17_m5(dev->dev.chip) ||
        agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3B)
-      NIR_PASS(cmat_lowered, nir, agx_nir_lower_cmat);
+      NIR_PASS(cmat_lowered, nir, agx_nir_lower_cmat,
+               agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3B);
 
    /* A matrix load becomes per-element loads, and a shader that loads one
     * matrix again for each matrix it multiplies with (one B tile per A row)

@@ -358,7 +358,7 @@ bool agx_nir_lower_fma_rte(struct nir_shader *shader);
 struct nir_def *agx_nir_fma_rte_fixup(struct nir_builder *b, struct nir_def *a,
                                     struct nir_def *c, struct nir_def *z,
                                     struct nir_def *native);
-bool agx_nir_lower_cmat(struct nir_shader *s);
+bool agx_nir_lower_cmat(struct nir_shader *s, bool native_f16_accum8);
 bool agx_nir_lower_cmat_calls(struct nir_shader *s);
 bool agx_nir_cmat_supported(struct nir_shader *s);
 bool agx_nir_lower_cmat_tensor(struct nir_shader *s, bool pairing);
