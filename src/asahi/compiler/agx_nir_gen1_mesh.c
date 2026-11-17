@@ -176,6 +176,16 @@ lower(nir_builder *b,nir_intrinsic_instr *i,void *data)
       b->cursor=nir_before_instr(&i->instr);
       nir_def *element=nir_imul_imm(b,i->src[1].ssa,4);
       const unsigned slot=vertex_output_slot(i);
+      if (slot == VARYING_SLOT_LAYER) {
+         /* A workgroup-uniform layer (vertex_layer): the vertex's own layer
+          * word, layer low, viewport 0 high, as the export packs it. */
+         nir_def *layer = nir_umin(b, nir_u2u32(b, i->src[0].ssa),
+                                   nir_imm_int(b, 0xffff));
+         nir_store_shared(b, layer, nir_iadd_imm(b, element,
+            layout->position + layout->plane_stride * layout->varyings->lv_first),
+            .write_mask = 1, .align_mul = 4);
+         break;
+      }
       if (slot != VARYING_SLOT_POS && !layout->varyings->components[slot])
          break;
       const unsigned first=first_plane(layout->varyings,slot);
@@ -346,6 +356,14 @@ agx_gen1_mesh_gather_varyings(const nir_shader *s,
             }
             if (slot == VARYING_SLOT_POS)
                continue;
+            if (slot == VARYING_SLOT_LAYER) {
+               /* Only hk's workgroup-uniform form (see vertex_layer). */
+               if (nir_intrinsic_component(i) != 0 ||
+                   nir_intrinsic_write_mask(i) != 1)
+                  M5_REFUSE();
+               varyings->vertex_layer = true;
+               continue;
+            }
             if (slot == VARYING_SLOT_PSIZ &&
                 s->info.mesh.primitive_type != MESA_PRIM_POINTS)
                continue;
@@ -399,8 +417,12 @@ agx_gen1_mesh_gather_varyings(const nir_shader *s,
       varyings->components[VARYING_SLOT_PSIZ] = 1;
       varyings->first[VARYING_SLOT_PSIZ] = next++;
    }
-   if (varyings->primitive_comps[VARYING_SLOT_LAYER] ||
-       varyings->primitive_comps[VARYING_SLOT_VIEWPORT]) {
+   const bool primitive_lv = varyings->primitive_comps[VARYING_SLOT_LAYER] ||
+                             varyings->primitive_comps[VARYING_SLOT_VIEWPORT];
+   /* A per-vertex layer leaves no word for a per-primitive one. */
+   if (varyings->vertex_layer && primitive_lv)
+      M5_REFUSE();
+   if (primitive_lv || varyings->vertex_layer) {
       varyings->lv = true;
       varyings->lv_first = next++;
    }
@@ -492,9 +514,13 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
       prim_vertices(s)==0 ||
       (s->info.per_primitive_outputs & ~(VARYING_BIT_PRIMITIVE_INDICES | PRIMITIVE_SLOTS |
                                          VARYING_BIT_CULL_PRIMITIVE)) ||
-      (s->info.outputs_written & ~s->info.per_primitive_outputs) & ~(VARYING_BIT_POS|VARYING_BIT_PSIZ|MESH_CLIP_SLOTS|USER_VARYINGS) ||
+      (s->info.outputs_written & ~s->info.per_primitive_outputs) &
+         ~(VARYING_BIT_POS|VARYING_BIT_PSIZ|MESH_CLIP_SLOTS|USER_VARYINGS|
+           (varyings->vertex_layer ? VARYING_BIT_LAYER : 0)) ||
       !varyings_valid(varyings))
       M5_REFUSE();
+   /* The layer and viewport words of primitives (not a vertex_layer). */
+   const bool primitive_lv = varyings->lv && !varyings->vertex_layer;
    struct mesh_layout layout = mesh_layout(s, varyings);
    if (varyings->cull_primitive) {
       layout.cull = layout.output_base + layout.bytes;
@@ -521,7 +547,7 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
    const unsigned unweld_vertices = prim_vertices(s) * s->info.mesh.max_primitives_out;
    const unsigned unweld_stride = ALIGN_POT(unweld_vertices, 4) * 4;
    const unsigned unweld_base = layout.output_base + layout.bytes;
-   const bool unweld = varyings->lv && unweld_vertices <= 256 &&
+   const bool unweld = primitive_lv && unweld_vertices <= 256 &&
       unweld_base + layout.planes * unweld_stride <= 32768;
    /* The layer and viewport the rasterizer takes from the exported vertex
     * word are staged in threadgroup memory, after the export arena. They
@@ -532,7 +558,7 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
     * (a view 1 primitive of a multiview mesh draw rasterised into layer 0).
     * A shader too close to the threadgroup memory limit keeps the read-back
     * rather than losing its export arena or failing to compile. */
-   if (varyings->lv) {
+   if (primitive_lv) {
       const unsigned lv_bytes = ALIGN_POT(4 * s->info.mesh.max_primitives_out, 64);
       const unsigned end = unweld ? unweld_base + layout.planes * unweld_stride
                                   : layout.output_base + layout.bytes;
@@ -577,6 +603,8 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
                   M5_REFUSE();
                if(slot==VARYING_SLOT_POS) {
                   if(bits!=32)M5_REFUSE();
+               } else if(slot==VARYING_SLOT_LAYER) {
+                  if(!varyings->vertex_layer || end>1)M5_REFUSE();
                } else if(slot==VARYING_SLOT_PSIZ) {
                   if(varyings->components[slot] && (bits!=32 || end>1))M5_REFUSE();
                } else if(!varyings->components[slot] ||
@@ -914,7 +942,7 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
                      layout.output_base;
       s->info.mesh.max_vertices_out = unweld_vertices;
    }
-   if (varyings->lv) {
+   if (primitive_lv) {
       nir_def *lane = nir_load_subgroup_invocation(&b);
       for (unsigned prim = 0; prim < s->info.mesh.max_primitives_out; prim += 32) {
          nir_def *index = nir_iadd_imm(&b, lane, prim);
