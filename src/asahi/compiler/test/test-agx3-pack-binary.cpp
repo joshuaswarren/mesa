@@ -16385,3 +16385,50 @@ TEST_F(AGX3PackBinary, G18GWorkgroupBarriersKeepLoadsInFlight)
                 tail);
    }
 }
+
+/* G18G: the saturated register+minifloat add that hk's image-to-buffer copy
+ * uses to repack a UNORM texel, sat(x + -0.0), has wait fields for slots 1..6
+ * only. With seven or eight loads in flight its source comes back on slot 7
+ * or 8; that wait is retired through the band carrier on the destination and
+ * the add then waits on nothing. Up to slot 6 the add carries its own wait. */
+TEST_F(AGX3PackBinary, G18GSaturatedMinifloatAddRetiresLateSlots)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G18G;
+   key.dev.emit_agx3d = true;
+   for (unsigned loads : {6u, 7u, 8u}) {
+      SCOPED_TRACE(loads);
+      agx_builder *b = builder(enc);
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->nir = rzalloc(b->shader, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+      for (unsigned n = 0; n < loads; ++n)
+         agx_device_load_to(b, agx_register(8 + 4 * n, AGX_SIZE_32),
+                            agx_uniform(16, AGX_SIZE_64), agx_immediate(n),
+                            AGX_FORMAT_I32, 1, 0, false);
+      const unsigned src = 8 + 4 * (loads - 1);
+      agx_instr *add = agx_fadd_to(b, agx_register(2, AGX_SIZE_32),
+                                   agx_register(src, AGX_SIZE_32),
+                                   agx_immediate(0x80));
+      add->saturate = true;
+      agx_stop(b);
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty());
+
+      const uint16_t wait = 1u << (loads - 1);
+      std::vector<uint8_t> tail;
+      uint8_t bytes[AGX3_ALU_MAX_LENGTH], len;
+      if (wait & ~0x3fu) {
+         ASSERT_TRUE(agx3_alu_band_identity_wait(enc, 2, wait, bytes, &len));
+         append(tail, bytes, len);
+      }
+      ASSERT_TRUE(agx3_alu_fadd_minifloat_mod_g18g(
+         enc, 2, src, 0x80, false, true, AGX3_ALU_HINT_NONE, wait & 0x3f,
+         bytes, &len));
+      append(tail, bytes, len);
+      tail.insert(tail.end(), {0x0e, 0, 0, 0});
+      ASSERT_GE(code.size(), tail.size());
+      EXPECT_EQ(std::vector<uint8_t>(code.end() - tail.size(), code.end()),
+                tail);
+   }
+}

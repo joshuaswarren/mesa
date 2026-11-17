@@ -1230,7 +1230,17 @@ get_image_copy_descriptor_set_layout(struct vk_device *device,
       },
       {
          .binding = BINDING_INPUT,
-         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
+         /* Image sources are written as SAMPLED_IMAGE. On G18G a sampled
+          * image binding keeps its heap index at +68, a texel buffer one at
+          * +4, and the shader addresses the binding by this declared type:
+          * declaring a texel buffer made image-source copies fetch through a
+          * garbage heap index (correct only for a 64-texel-wide image). */
+         .descriptorType =
+            container_of(device, struct hk_device, vk)->dev.chip ==
+                     AGX_CHIP_G18G &&
+                  type != BUF2IMG
+               ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+               : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
          .descriptorCount = 1,
          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
       },
@@ -4599,7 +4609,11 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
       return;
    }
 
-   bool gfx = hk_copy_requires_gfx(dst_image);
+   /* On G18G the compute upload's bindless image store compiled but wrote
+    * nothing when tested (with the 64-byte storage-image descriptor; the
+    * cause was not isolated). Its draws work, so upload through the common
+    * graphics copy. */
+   bool gfx = hk_copy_requires_gfx(dst_image) || dev->dev.chip == AGX_CHIP_G18G;
    if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
       uint8_t plane;
       VkFormat format;
@@ -4939,6 +4953,7 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
     * reinterpretation without the AGX2 compute imageblock protocol. */
    bool gfx = agx_native_graphics(&dev->dev) ||
               agx_chip_g17_m5(dev->dev.chip) ||
+              dev->dev.chip == AGX_CHIP_G18G || /* see the upload above */
               hk_copy_requires_gfx(dst_image);
    VkPipelineBindPoint bind_point = hk_bind_point(gfx);
 
