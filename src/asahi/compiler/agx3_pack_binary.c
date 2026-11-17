@@ -15089,12 +15089,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * mesh program is VDM-launched like a vertex program and binds its
              * textures through the vertex path, so it samples the same way. */
             const bool vertex_explicit_lod =
-               (ctx->stage == MESA_SHADER_VERTEX ||
-                ctx->stage == MESA_SHADER_GEOMETRY ||
-                ctx->stage == MESA_SHADER_TESS_CTRL ||
-                ctx->stage == MESA_SHADER_TESS_EVAL ||
-                (enc == AGX_ISA_ENCODING_AGX3B &&
-                 ctx->stage == MESA_SHADER_MESH)) &&
+               agx3_vertex_explicit_lod_stage(ctx->stage, enc) &&
                (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
                 I->lod_mode == AGX_LOD_MODE_LOD_GRAD);
             /* Relocation is an operand-ABI property. Other forms retain

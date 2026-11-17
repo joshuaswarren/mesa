@@ -195,8 +195,9 @@ agx_g17p_pack_image_atomic_sw(uint64_t level_offset_B, unsigned tile_width_px,
 /* Native texture/PBE pair, heap indices, address sideband, then padding. */
 #define AGX_G17P_EMRT_DESCRIPTOR_SIZE 96
 #define AGX_G17P_EMRT_ALIGNED_WIDTH_OFFSET 80
-/* Declines without changing the shader, so callers need no copy. */
-bool agx_nir_lower_g17p_indexed_samplers(struct nir_shader *s);
+/* Declines without changing the shader, so callers need no copy. g17p
+ * admits the shapes only G17P's backend encodes (agx_optimizer_inline_imm). */
+bool agx_nir_lower_g17p_indexed_samplers(struct nir_shader *s, bool g17p);
 bool agx_nir_lower_g17g_indexed_reads(struct nir_shader *s);
 /* Packed native32 array handles are byte offsets; sampler handles already
  * name their native entry, including the reserved texel-fetch sampler0. */
@@ -272,10 +273,12 @@ bool agx_nir_lower_g17p_indexed_storage(
  */
 /* Whether agx_nir_lower_g17p_combined_sampler() may apply: a false result
  * is final, a true one can still be refused while lowering. */
-bool agx_nir_g17p_combined_sampler_candidate(const struct nir_shader *s);
+bool agx_nir_g17p_combined_sampler_candidate(const struct nir_shader *s,
+                                             bool g17p);
 
 bool agx_nir_lower_g17p_combined_sampler(
-   struct nir_shader *s, struct agx_g17p_combined_sampler_binding *binding);
+   struct nir_shader *s, struct agx_g17p_combined_sampler_binding *binding,
+   bool g17p);
 
 /* Gen10 shares the 32-byte texture/eight-byte sampler descriptor layout.
  * Initially admit only a single 2D float sample at explicit level zero. */

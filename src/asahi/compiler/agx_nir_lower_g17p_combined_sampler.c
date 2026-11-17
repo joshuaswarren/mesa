@@ -80,7 +80,7 @@ g17p_decline(const char *why, const nir_tex_instr *tex,
 }
 
 static bool
-g17p_sample_shape(const nir_tex_instr *tex, bool m5)
+g17p_sample_shape(const nir_tex_instr *tex, bool m5, bool g17p)
 {
    const bool query_lod = tex->op == nir_texop_lod;
    const int backend_coord =
@@ -226,6 +226,12 @@ g17p_sample_shape(const nir_tex_instr *tex, bool m5)
             * handle, which has no AGX3 encoding, and the pipeline failed
             * with VK_ERROR_UNKNOWN. */
            !register_level && !register_bias &&
+           /* G17P also takes a constant level or bias: the backend keeps
+            * it in a register (agx_optimizer_inline_imm), so it is staged
+            * beside the layer like a per-lane one. */
+           !(g17p && !cube &&
+             ((tex->op == nir_texop_txl && level_src >= 0) ||
+              (tex->op == nir_texop_txb && bias_src >= 0))) &&
            tex->op != nir_texop_txd &&
            !shadow_level_zero))
          return false;
@@ -519,7 +525,7 @@ g17p_rewrite_combined_texture_crawls(nir_shader *shader, uint8_t set,
 static nir_tex_instr *
 g17p_combined_sampler_candidate(const nir_shader *shader,
                                 uint32_t *texture_offset_B,
-                                uint32_t *sampler_state_offset_B)
+                                uint32_t *sampler_state_offset_B, bool g17p)
 {
    if (!shader || (shader->info.stage != MESA_SHADER_FRAGMENT &&
                    shader->info.stage != MESA_SHADER_COMPUTE))
@@ -532,7 +538,8 @@ g17p_combined_sampler_candidate(const nir_shader *shader,
             if (instr->type != nir_instr_type_tex)
                continue;
 
-            if (sample || !g17p_sample_shape(nir_instr_as_tex(instr), false))
+            if (sample ||
+                !g17p_sample_shape(nir_instr_as_tex(instr), false, g17p))
                return NULL;
             sample = nir_instr_as_tex(instr);
          }
@@ -561,21 +568,23 @@ g17p_combined_sampler_candidate(const nir_shader *shader,
 }
 
 bool
-agx_nir_g17p_combined_sampler_candidate(const nir_shader *shader)
+agx_nir_g17p_combined_sampler_candidate(const nir_shader *shader, bool g17p)
 {
    uint32_t texture_offset_B, sampler_state_offset_B;
    return g17p_combined_sampler_candidate(shader, &texture_offset_B,
-                                          &sampler_state_offset_B) != NULL;
+                                          &sampler_state_offset_B,
+                                          g17p) != NULL;
 }
 
 bool
 agx_nir_lower_g17p_combined_sampler(
-   nir_shader *shader, struct agx_g17p_combined_sampler_binding *binding)
+   nir_shader *shader, struct agx_g17p_combined_sampler_binding *binding,
+   bool g17p)
 {
    uint32_t texture_offset_B, sampler_state_offset_B;
    nir_tex_instr *sample =
       binding ? g17p_combined_sampler_candidate(shader, &texture_offset_B,
-                                                &sampler_state_offset_B)
+                                                &sampler_state_offset_B, g17p)
               : NULL;
    if (!sample)
       return false;
@@ -646,7 +655,7 @@ agx_nir_lower_g17g_combined_sampler(
     * +40. The common pass validates a single static set-0 resource and
     * rewrites only that resource's descriptor crawls. No API LOD bias is
     * removed here: the bounded M5 shape has an explicit zero level. */
-   return agx_nir_lower_g17p_combined_sampler(shader, binding);
+   return agx_nir_lower_g17p_combined_sampler(shader, binding, false);
 }
 
 /* Ordinary native integer-coordinate read. The descriptor selects float,
@@ -854,7 +863,8 @@ heap_index_access(const nir_intrinsic_instr *image)
  * after command recording and dynamically selected array elements are visible.
  */
 static bool
-lower_indexed_samplers(nir_shader *shader, int native32_set, bool m5)
+lower_indexed_samplers(nir_shader *shader, int native32_set, bool m5,
+                       bool g17p)
 {
    if (!shader || (!g17p_explicit_lod_stage(shader->info.stage) &&
                    shader->info.stage != MESA_SHADER_FRAGMENT &&
@@ -894,7 +904,7 @@ lower_indexed_samplers(nir_shader *shader, int native32_set, bool m5)
                 tex->op != nir_texop_tg4)
                return g17p_decline("vertex_implicit_sample", tex, NULL,
                                    shader->info.stage);
-            if (!fetch && !g17p_sample_shape(tex, m5))
+            if (!fetch && !g17p_sample_shape(tex, m5, g17p))
                return g17p_decline("sample_shape", tex, NULL,
                                    shader->info.stage);
             nir_intrinsic_instr *image = nir_src_as_intrinsic(
@@ -1087,13 +1097,13 @@ agx_nir_lower_g17g_indexed_samplers(nir_shader *shader)
    /* Gen10 publishes the same software heap-index tail and reserved sampler
     * prefix as Gen9. The native opcode/staging differences stay in the M5
     * encoder; this shared lowering only translates API handles to indices. */
-   return agx_nir_lower_g17p_indexed_samplers(shader);
+   return agx_nir_lower_g17p_indexed_samplers(shader, false);
 }
 
 bool
-agx_nir_lower_g17p_indexed_samplers(nir_shader *shader)
+agx_nir_lower_g17p_indexed_samplers(nir_shader *shader, bool g17p)
 {
-   return lower_indexed_samplers(shader, -1, false);
+   return lower_indexed_samplers(shader, -1, false, g17p);
 }
 
 
@@ -1225,13 +1235,13 @@ agx_nir_lower_g17g_indexed_reads(nir_shader *shader)
          }
       }
    }
-   return reads > 0 && lower_indexed_samplers(shader, -1, true);
+   return reads > 0 && lower_indexed_samplers(shader, -1, true, false);
 }
 
 bool
 agx_nir_lower_g17p_native32_samplers(nir_shader *shader, uint8_t texture_set)
 {
-   return lower_indexed_samplers(shader, texture_set, false);
+   return lower_indexed_samplers(shader, texture_set, false, false);
 }
 
 static bool
@@ -1847,7 +1857,8 @@ agx_nir_lower_g17p_sampled_storage(
          block_count++;
          nir_foreach_instr(instr, block) {
             if (instr->type == nir_instr_type_tex) {
-               if (sample || !g17p_sample_shape(nir_instr_as_tex(instr), false))
+               if (sample ||
+                   !g17p_sample_shape(nir_instr_as_tex(instr), false, false))
                   return false;
                sample = nir_instr_as_tex(instr);
                continue;

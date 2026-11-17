@@ -1051,6 +1051,19 @@ enum agx_cursor_option {
    agx_cursor_after_instr
 };
 
+/* The stages whose AGX3 samples take an explicit level the vertex way: the
+ * packer's vertex_explicit_lod (agx3_pack_binary.c), which also lets an array
+ * comparison keep an immediate level (agx_optimizer_inline_imm). A G17P mesh
+ * program is VDM-launched like a vertex program. */
+static inline bool
+agx3_vertex_explicit_lod_stage(mesa_shader_stage stage,
+                               enum agx_isa_encoding enc)
+{
+   return stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_GEOMETRY ||
+          stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_TESS_EVAL ||
+          (enc == AGX_ISA_ENCODING_AGX3B && stage == MESA_SHADER_MESH);
+}
+
 typedef struct {
    enum agx_cursor_option option;
 

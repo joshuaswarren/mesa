@@ -545,6 +545,20 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
             (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
              I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS)))
          continue;
+      /* A G17P array comparison without an offset stages its level or bias
+       * beside the layer from a register; an immediate would share SMP's
+       * operand with that layer, which agx3_emit_texture_sample() refuses.
+       * A zero level or bias, and an explicit level in a stage the packer
+       * treats as vertex_explicit_lod, encode as immediates and keep them. */
+      if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 1 && I->shadow &&
+          !I->offset && I->dim == AGX_DIM_2D_ARRAY &&
+          ctx->key->dev.chip == AGX_CHIP_G17P &&
+          (def->dest[0].size == AGX_SIZE_16 ? _mesa_half_to_float(def->imm)
+                                            : uif(def->imm)) != 0.0f &&
+          !(I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
+            agx3_vertex_explicit_lod_stage(ctx->stage,
+                                           AGX_ISA_ENCODING_AGX3B)))
+         continue;
       /* AGX3 sampler indices past 15 have only a register form. */
       if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 4 &&
           ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2 && def->imm > 15)

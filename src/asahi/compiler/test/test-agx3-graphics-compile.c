@@ -2193,7 +2193,7 @@ test_combined_sampler_root(void)
 {
    nir_shader *shader = build_fs_texture_bias_offset_root(108, true);
    struct agx_g17p_combined_sampler_binding binding;
-   bool ok = agx_nir_lower_g17p_combined_sampler(shader, &binding);
+   bool ok = agx_nir_lower_g17p_combined_sampler(shader, &binding, true);
    unsigned roots = 0, descriptors = 0, samples = 0;
    nir_foreach_function_impl(impl, shader) {
       nir_foreach_block(block, impl) {
@@ -2395,7 +2395,7 @@ test_indexed_sampler_sets_stage(mesa_shader_stage stage)
    }
    nir_store_output(&b,result,nir_imm_int(&b,0),.write_mask=15,
                     .src_type=nir_type_float32);
-   bool ok=agx_nir_lower_g17p_indexed_samplers(b.shader);
+   bool ok=agx_nir_lower_g17p_indexed_samplers(b.shader, true);
    unsigned samples=0, arrays=0, descriptors=0, roots=0, image_loads=0,
             sampler_loads=0, set_mask=0;
    nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
@@ -2497,7 +2497,7 @@ test_indexed_storage_image_read(void)
                                 : ACCESS_NON_WRITEABLE));
       nir_export_agx(&b, nir_channel(&b, value, 0), .base = 0);
 
-      const bool lowered = agx_nir_lower_g17p_indexed_samplers(b.shader);
+      const bool lowered = agx_nir_lower_g17p_indexed_samplers(b.shader, true);
       unsigned original_handles = 0, native_handles = 0;
       unsigned heap_index_loads = 0, set4_loads = 0;
       nir_intrinsic_instr *read = NULL;
@@ -2649,7 +2649,7 @@ test_g17p_fetch_lod_compile(unsigned dynamic_bits)
    fs_store_colour(&b, &tex->def);
    b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
 
-   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader);
+   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader, true);
    const int lod = nir_tex_instr_src_index(tex, nir_tex_src_lod);
    ok &= lod >= 0 && nir_src_bit_size(tex->src[lod].src) == 32;
    if (dynamic_bits)
@@ -2709,7 +2709,7 @@ test_g17p_storage_read_zero_lod_compile(void)
          .access = ACCESS_NON_WRITEABLE);
       nir_export_agx(&b, nir_channel(&b, value, 0), .base = 0);
 
-      bool ok = mode != 0 || agx_nir_lower_g17p_indexed_samplers(b.shader);
+      bool ok = mode != 0 || agx_nir_lower_g17p_indexed_samplers(b.shader, true);
       NIR_PASS(_, b.shader, nir_shader_intrinsics_pass,
                lower_test_descriptor_set, nir_metadata_control_flow, NULL);
       agx_preprocess_nir(b.shader);
@@ -3189,7 +3189,7 @@ test_g17p_query_lod_compile(void)
                AGX_DESCRIPTOR_GENERATION_9);
       struct agx_g17p_combined_sampler_binding binding;
       bool ok = tex->coord_components == shapes[i].coords &&
-                agx_nir_lower_g17p_combined_sampler(b.shader, &binding);
+                agx_nir_lower_g17p_combined_sampler(b.shader, &binding, true);
       agx_preprocess_nir(b.shader);
       fs_lower(b.shader);
       struct agx_shader_key key = {
@@ -3613,6 +3613,86 @@ test_g17p_array_shadow_register_lod(bool bias)
    return ok;
 }
 
+/*
+ * A 2D-array comparison with a constant level or bias: SPIR-V's
+ * OpImageSampleDrefExplicitLod with a constant Lod or Bias on an arrayed
+ * image (vkd3d's SampleCmpLevel), the same shape as GLSL's textureLod() and
+ * biased texture() on sampler1DArrayShadow. G17P must admit the constant in
+ * the combined-sampler pass and keep it in a register (the immediate shares
+ * SMP's operand with the staged layer), or the whole shader declines and the
+ * pipeline fails. Without g17p the pass keeps declining it.
+ */
+static bool
+test_g17p_array_shadow_constant_lod(bool bias)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options,
+      bias ? "G17P array shadow constant bias" : "G17P array shadow constant level");
+   nir_def *bary = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *coord = nir_load_interpolated_input(
+      &b, 4, 32, bary, nir_imm_int(&b, 0), .base = 0, .component = 0,
+      .io_semantics.location = VARYING_SLOT_VAR0,
+      .io_semantics.num_slots = 1);
+   nir_def *set = nir_load_descriptor_set_agx(&b, 0);
+   nir_def *image =
+      nir_bindless_image_agx(&b, nir_imm_int(&b, 0), .desc_set = 0);
+   nir_def *heap_index = nir_load_global_constant(
+      &b, 1, 16, nir_iadd_imm(&b, set, 40), .align_mul = 2,
+      .access = ACCESS_CAN_SPECULATE);
+   nir_def *sampler = nir_bindless_sampler_agx(
+      &b, nir_imm_int(&b, 32), heap_index, .desc_set = 0);
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 5);
+   tex->op = bias ? nir_texop_txb : nir_texop_txl;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->is_array = true;
+   tex->is_shadow = true;
+   tex->is_new_style_shadow = true;
+   tex->dest_type = nir_type_float32;
+   tex->coord_components = 3;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord,
+                                     nir_trim_vector(&b, coord, 3));
+   tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_comparator,
+                                     nir_channel(&b, coord, 3));
+   tex->src[2] = nir_tex_src_for_ssa(bias ? nir_tex_src_bias : nir_tex_src_lod,
+                                     nir_imm_float(&b, bias ? 0.5f : 2.0f));
+   tex->src[3] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, image);
+   tex->src[4] = nir_tex_src_for_ssa(nir_tex_src_sampler_handle, sampler);
+   nir_def_init(&tex->instr, &tex->def, 1, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   fs_store_colour(&b, nir_replicate(&b, &tex->def, 4));
+   b.shader->info.inputs_read = BITFIELD64_BIT(VARYING_SLOT_VAR0);
+   b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+
+   NIR_PASS(_, b.shader, agx_nir_lower_texture_for_generation,
+            AGX_DESCRIPTOR_GENERATION_9);
+   struct agx_g17p_combined_sampler_binding binding;
+   const bool declined_elsewhere =
+      !agx_nir_g17p_combined_sampler_candidate(b.shader, false);
+   const bool admitted =
+      agx_nir_lower_g17p_combined_sampler(b.shader, &binding, true);
+   agx_preprocess_nir(b.shader);
+   fs_lower(b.shader);
+   struct agx_shader_key key = {0};
+   key.dev.chip = AGX_CHIP_G17P;
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.no_preamble = true;
+   key.reserved_preamble = 24;
+   struct agx_shader_part part = {0};
+   const bool compiled = admitted &&
+                         agx_compile_shader_nir(b.shader, &key, &part) &&
+                         part.binary != NULL && part.info.binary_size > 0;
+   if (!compiled || !declined_elsewhere) {
+      fprintf(stderr,
+              "G17P array shadow constant %s: declined_elsewhere=%u "
+              "admitted=%u compiled=%u\n",
+              bias ? "bias" : "level", declined_elsewhere, admitted, compiled);
+   }
+   free(part.binary);
+   ralloc_free(b.shader);
+   return compiled && declined_elsewhere;
+}
+
 static bool
 test_g17p_cube_array_shadow_dump(void)
 {
@@ -3717,7 +3797,7 @@ test_g17p_native_cube_array_sample(void)
    bool shape = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array &&
                 ci >= 0 && nir_src_num_components(tex->src[ci].src) == 4;
    bool ok = shape &&
-             agx_nir_lower_g17p_combined_sampler(b.shader, &binding) &&
+             agx_nir_lower_g17p_combined_sampler(b.shader, &binding, true) &&
              binding.texture_offset_B == 0 &&
              binding.sampler_index_offset_B == 40;
 
@@ -3856,7 +3936,7 @@ test_custom_border_samplers(bool dynamic, unsigned invalid)
                      .base = AGX_ABI_FOUT_COLOUR(0) + 2 * c);
    b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
 
-   bool lowered = agx_nir_lower_g17p_indexed_samplers(b.shader);
+   bool lowered = agx_nir_lower_g17p_indexed_samplers(b.shader, true);
    bool ok = lowered == (invalid == 0);
    if (invalid) {
       /* An unsupported third shape must not partially convert the first. */
@@ -3940,7 +4020,7 @@ test_indexed_sampler_native_indices(void)
       nir_export_agx(&b, nir_channel(&b, &tex->def, 0),
                      .base = AGX_ABI_FOUT_COLOUR(0));
 
-      bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader);
+      bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader, true);
       const int si = nir_tex_instr_src_index(
          tex, nir_tex_src_sampler_handle);
       const int ti = nir_tex_instr_src_index(
@@ -4006,7 +4086,7 @@ test_indexed_array_and_3d_compile(void)
                      .base = AGX_ABI_FOUT_COLOUR(0) + 2 * c);
    b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
 
-   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader);
+   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader, true);
    nir_tex_instr *samples[] = {array, three_d};
    for (unsigned i = 0; i < ARRAY_SIZE(samples); ++i) {
       const int ti = nir_tex_instr_src_index(
@@ -4075,7 +4155,7 @@ test_indexed_fetch_sets(void)
    }
    nir_store_output(&b,result,nir_imm_int(&b,0),.write_mask=15,
                     .src_type=nir_type_float32);
-   bool ok=agx_nir_lower_g17p_indexed_samplers(b.shader);
+   bool ok=agx_nir_lower_g17p_indexed_samplers(b.shader, true);
    unsigned samples=0, fetches=0, arrays=0, descriptors=0, roots=0, image_loads=0, sampler_loads=0, set_mask=0;
    nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
       nir_foreach_instr(instr,block) {
@@ -4172,7 +4252,7 @@ test_indexed_dynamic_fetch_lod(void)
                                 .align_mul = 16, .write_mask = 15);
             }
 
-            bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader);
+            bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader, true);
             const int li =
                nir_tex_instr_src_index(tex, nir_tex_src_lod);
             const int ti =
@@ -4249,7 +4329,7 @@ test_indexed_multisample_fetch(void)
    nir_store_output(&b, &tex->def, nir_imm_int(&b, 0), .write_mask = 15,
                     .src_type = nir_type_float32);
 
-   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader);
+   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader, true);
    const int texture =
       nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
    ok &= texture >= 0 &&
@@ -4333,7 +4413,7 @@ test_combined_sampler_integer_scope(void)
    /* Integer sampled results are a native 32-bit register shape. Keep a
     * narrower result fail-closed so widening this admission cannot silently
     * discard an unwitnessed result-width encoding. */
-   const bool ok = !agx_nir_lower_g17p_combined_sampler(shader, &binding) &&
+   const bool ok = !agx_nir_lower_g17p_combined_sampler(shader, &binding, true) &&
                    binding.texture_offset_B == UINT32_MAX &&
                    binding.sampler_index_offset_B == UINT32_MAX;
    ralloc_free(shader);
@@ -4350,7 +4430,7 @@ test_combined_sampler_scope(void)
    };
 
    const bool lowered =
-      agx_nir_lower_g17p_combined_sampler(nir, &binding);
+      agx_nir_lower_g17p_combined_sampler(nir, &binding, true);
    const bool ok = !lowered && binding.texture_offset_B == UINT32_MAX &&
                    binding.sampler_index_offset_B == UINT32_MAX;
    ralloc_free(nir);
@@ -4426,7 +4506,7 @@ test_combined_sampler_biased_and_gradient(bool gradient, bool cube)
       .texture_offset_B = UINT32_MAX,
       .sampler_index_offset_B = UINT32_MAX,
    };
-   bool ok = agx_nir_lower_g17p_combined_sampler(shader, &binding);
+   bool ok = agx_nir_lower_g17p_combined_sampler(shader, &binding, true);
    ok &= binding.texture_offset_B == 64 &&
          binding.sampler_index_offset_B == 104;
 
@@ -4764,7 +4844,7 @@ test_g17p_shadow_runtime_offset_compile(void)
    struct agx_g17p_combined_sampler_binding binding;
    bool ok = backend2 >= 0 &&
              nir_src_num_components(tex->src[backend2].src) == 2 &&
-             agx_nir_lower_g17p_combined_sampler(b.shader, &binding);
+             agx_nir_lower_g17p_combined_sampler(b.shader, &binding, true);
    agx_preprocess_nir(b.shader);
    fs_lower(b.shader);
 
@@ -5329,7 +5409,7 @@ test_indexed_compute_sample(void)
 
    NIR_PASS(_, b.shader, agx_nir_lower_texture_for_generation,
             AGX_DESCRIPTOR_GENERATION_9);
-   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader);
+   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader, true);
    const int ti = nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
    const int si = nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle);
    ok &= ti >= 0 && si >= 0 &&
@@ -5402,7 +5482,7 @@ test_indexed_compute_storage(void)
       .pbe_offset_B = UINT32_MAX,
       .pbe_set = UINT8_MAX,
    };
-   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader) &&
+   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader, true) &&
              agx_nir_lower_g17p_indexed_storage(b.shader, &binding) &&
              binding.pbe_set == 0 && binding.pbe_offset_B == 176;
 
@@ -5469,7 +5549,7 @@ test_buffer_fetch_r32_store(void)
    } while (progress);
    agx_preprocess_nir_g17p(b.shader);
    struct agx_g17p_indexed_storage_binding binding = {0};
-   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader) &&
+   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader, true) &&
              agx_nir_lower_g17p_indexed_storage(b.shader, &binding) &&
              binding.pbe_offset_B == 128 && binding.pbe_set == 0;
    NIR_PASS(_, b.shader, nir_shader_intrinsics_pass,
@@ -5542,7 +5622,7 @@ test_buffer_fetch_unorm_store_fallback(void)
    agx_preprocess_nir_g17p(b.shader);
 
    struct agx_g17p_indexed_storage_binding binding = {0};
-   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader) &&
+   bool ok = agx_nir_lower_g17p_indexed_samplers(b.shader, true) &&
              !agx_nir_lower_g17p_indexed_storage(b.shader, &binding);
    unsigned bindless_stores = 0, ordinary_stores = 0;
    nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
@@ -6677,7 +6757,7 @@ build_vs_indexed_texture_fetch(void)
    b.shader->info.outputs_written =
       VARYING_BIT_POS | BITFIELD64_BIT(VARYING_SLOT_VAR0);
 
-   if (!agx_nir_lower_g17p_indexed_samplers(b.shader)) {
+   if (!agx_nir_lower_g17p_indexed_samplers(b.shader, true)) {
       ralloc_free(b.shader);
       return NULL;
    }
@@ -6721,7 +6801,7 @@ build_vs_indexed_texture_sample(void)
    b.shader->info.outputs_written =
       VARYING_BIT_POS | BITFIELD64_BIT(VARYING_SLOT_VAR0);
 
-   if (!agx_nir_lower_g17p_indexed_samplers(b.shader)) {
+   if (!agx_nir_lower_g17p_indexed_samplers(b.shader, true)) {
       ralloc_free(b.shader);
       return NULL;
    }
@@ -8357,7 +8437,7 @@ run_case(const struct agx3_graphics_case *c, enum agx_isa_encoding enc)
 
    if (c->lower_combined_sampler) {
       struct agx_g17p_combined_sampler_binding binding;
-      if (!agx_nir_lower_g17p_combined_sampler(nir, &binding) ||
+      if (!agx_nir_lower_g17p_combined_sampler(nir, &binding, true) ||
           binding.texture_offset_B != 64 ||
           binding.sampler_index_offset_B != 104 ||
           !has_compact_native_sample(nir)) {
@@ -9125,6 +9205,11 @@ main(int argc, char **argv)
    if (!test_g17p_array_shadow_register_lod(false) ||
        !test_g17p_array_shadow_register_lod(true)) {
       fputs("test_g17p_array_shadow_register_lod failed\n", stderr);
+      all_ok = false;
+   }
+   if (!test_g17p_array_shadow_constant_lod(false) ||
+       !test_g17p_array_shadow_constant_lod(true)) {
+      fputs("test_g17p_array_shadow_constant_lod failed\n", stderr);
       all_ok = false;
    }
    RUN(test_g17p_fragment_io_matrix);

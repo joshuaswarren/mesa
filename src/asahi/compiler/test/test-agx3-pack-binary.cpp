@@ -13473,10 +13473,11 @@ TEST_F(AGX3PackBinary, IndexedShadowLevelZeroKeepsNativeHandles)
          /* A comparison stages a register level beside the operand its
           * dimension already owns -- the cube beside its face, the noncube
           * array beside its layer -- so both are native. An immediate
-          * nonzero level is not: it would have to share SMP's immediate
-          * slot with that same operand. */
-         const bool native = level == 0 || level == 2;
-         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader), native);
+          * nonzero level would have to share SMP's immediate slot with that
+          * same operand; the noncube array keeps it in a register instead
+          * (agx_optimizer_inline_imm), the cube has no such form. */
+         const bool native = level == 0 || level == 2 || !cube;
+         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader, true), native);
          if (native) {
             const int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
             const int sampler = nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle);
@@ -13536,10 +13537,11 @@ TEST_F(AGX3PackBinary, IndexedShadowGradientAndRegisterBiasKeepNativeHandles)
                           .align_mul = 4);
          /* A per-lane bias is published beside the layer or CEM's face, so
           * both dimensions take it; a constant one would have to share SMP's
-          * immediate slot with that same operand. The gradient composes with
-          * the packed layer, and the cube has no gradient form at all. */
-         const bool native = grad ? !cube : kind == 0;
-         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader), native);
+          * immediate slot with that same operand, so the noncube array keeps
+          * it in a register and the cube refuses it. The gradient composes
+          * with the packed layer, and the cube has no gradient form at all. */
+         const bool native = grad ? !cube : kind == 0 || !cube;
+         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader, true), native);
          ralloc_free(b.shader);
       }
    }
@@ -16091,7 +16093,7 @@ TEST_F(AGX3PackBinary, IndexedGatherKeepsNativeHandles)
             nir_builder_instr_insert(&b, &tex->instr);
             nir_store_global(&b, &tex->def, nir_imm_int64(&b, 0x20000),
                              .align_mul = 4);
-            ASSERT_TRUE(agx_nir_lower_g17p_indexed_samplers(b.shader));
+            ASSERT_TRUE(agx_nir_lower_g17p_indexed_samplers(b.shader, true));
             const int texture = nir_tex_instr_src_index(
                tex, nir_tex_src_texture_offset);
             ASSERT_GE(texture, 0);

@@ -4935,6 +4935,10 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       xfb_info = &shader->info.xfb_info;
    }
 
+   /* Only G17P's backend keeps an array comparison's constant level or bias
+    * in a register (agx_optimizer_inline_imm), so only G17P admits one to
+    * the sampler lowerings below. */
+   const bool g17p = dev->dev.chip == AGX_CHIP_G17P;
    if (agx_native_graphics(&dev->dev) &&
        nir->info.stage == MESA_SHADER_VERTEX) {
       /* Software vertex variants feed geometry/tessellation through CDM.
@@ -4942,7 +4946,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * as hardware VS variants; legacy descriptor-base/index operands do
        * not encode as native G17P texture fetches. Lower before changing the
        * NIR stage so both variants retain the vertex preamble convention. */
-      if (agx_nir_lower_g17p_indexed_samplers(nir)) {
+      if (agx_nir_lower_g17p_indexed_samplers(nir, g17p)) {
          shader->info.agx3_indexed_sampler_valid = true;
 
          /* Native G17P publishes texture/sampler heap pointers in halves
@@ -4972,7 +4976,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * the same register-operand SMP form selected after this rewrite. The
        * VDM-launched mesh program takes the heaps in uniform halves 0..7 like
        * the vertex program (hk_g17p_graphics_uniform_ranges()). */
-      if (agx_nir_lower_g17p_indexed_samplers(nir))
+      if (agx_nir_lower_g17p_indexed_samplers(nir, g17p))
          shader->info.agx3_indexed_sampler_valid = true;
    } else if ((agx_native_graphics(&dev->dev) ||
                dev->dev.chip == AGX_CHIP_G18G) &&
@@ -4982,12 +4986,12 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       nir_shader *candidate =
          !dev->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind &&
                !(features & HK_FEAT_DESCRIPTOR_BUFFER) &&
-               agx_nir_g17p_combined_sampler_candidate(nir)
+               agx_nir_g17p_combined_sampler_candidate(nir, g17p)
             ? nir_shader_clone(NULL, nir)
             : NULL;
       struct agx_g17p_combined_sampler_binding binding;
       if (candidate &&
-          agx_nir_lower_g17p_combined_sampler(candidate, &binding)) {
+          agx_nir_lower_g17p_combined_sampler(candidate, &binding, g17p)) {
          ralloc_free(nir);
          nir = candidate;
          shader->info.agx3_combined_sampler_valid = true;
@@ -5000,7 +5004,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          set_count = 0;
       } else {
          ralloc_free(candidate);
-         if (agx_nir_lower_g17p_indexed_samplers(nir))
+         if (agx_nir_lower_g17p_indexed_samplers(nir, g17p))
             shader->info.agx3_indexed_sampler_valid = true;
       }
    } else if (dev->dev.chip == AGX_CHIP_G18G &&
@@ -5038,7 +5042,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          } else {
             c = nir_shader_clone(NULL, nir);
             shader->info.agx3_indexed_sampler_valid = hk_g18g_keep_lowered(
-               &nir, c, c && agx_nir_lower_g17p_indexed_samplers(c));
+               &nir, c, c && agx_nir_lower_g17p_indexed_samplers(c, g17p));
          }
       }
       shader->info.g18_unlowered_image = hk_g18g_has_unlowered_image(nir);
@@ -5073,7 +5077,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
             if (candidate && record_time_sets &&
                 !dev->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind &&
                 agx_nir_lower_g17p_combined_sampler(candidate,
-                                                    &sampled_binding)) {
+                                                    &sampled_binding, g17p)) {
                ralloc_free(nir);
                nir = candidate;
                shader->info.agx3_combined_sampler_valid = true;
@@ -5085,7 +5089,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                ralloc_free(candidate);
                candidate = nir_shader_clone(NULL, nir);
                if (candidate &&
-                   agx_nir_lower_g17p_indexed_samplers(candidate)) {
+                   agx_nir_lower_g17p_indexed_samplers(candidate, g17p)) {
                   /* Keep the storage image BINDLESS alongside indexed
                    * samplers.
                    *
