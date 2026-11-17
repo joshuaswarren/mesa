@@ -73,6 +73,8 @@ struct alu_timing op_timings[] = {
     * hints; it is not a measured latency for the subsequent UVSW. */
    [AGX_OPCODE_ST_VARY_MUL_AGX3] = { F32, 2, 1 },
    [AGX_OPCODE_ST_VARY_FMA_AGX3] = { F32, 2, 1 },
+   [AGX_OPCODE_MATMAD8_AGX3]     = { F32, 4, 2 },
+   [AGX_OPCODE_MATMAD16_AGX3]    = { F32, 8, 4 },
 
    [AGX_OPCODE_HFMA]          = { F16, 2, 1 },
    [AGX_OPCODE_HADD]          = { F16, 2, 1 },
@@ -80,6 +82,8 @@ struct alu_timing op_timings[] = {
 
    [AGX_OPCODE_MOV_IMM]       = { SCIB, 1, 1 },
    [AGX_OPCODE_BITOP]         = { SCIB, 2, 1 }, /* tp might be 2 for 32-bit / no $? */
+   [AGX_OPCODE_CONVERT]       = { SCIB, 2, 1 },
+   [AGX_OPCODE_INTL]          = { SCIB, 2, 1 },
    [AGX_OPCODE_ICMPSEL]       = { SCIB, 2, 1 },
    [AGX_OPCODE_FCMPSEL]       = { SCIB, 2, 1 },
    [AGX_OPCODE_IADD]          = { SCIB, 2, 1 },
