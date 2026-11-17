@@ -1726,6 +1726,10 @@ struct hk_cmd_buffer {
       struct {
          uint64_t id, addr;
       } constant_data[MESA_SHADER_STAGES];
+      struct hk_group_count_cache_entry {
+         uint32_t x, y, z, valid;
+         uint64_t addr;
+      } group_count_cache[16];
       /* vkCmdBindDescriptorBuffersEXT() */
       uint64_t descriptor_buffers[HK_MAX_DESCRIPTOR_BUFFERS];
       struct hk_graphics_state gfx;
@@ -2715,6 +2719,8 @@ void hk_cmd_upload_draw_id(struct hk_cmd_buffer *cmd, uint32_t draw_id);
 uint64_t hk_cmd_upload_constants(struct hk_cmd_buffer *cmd,
                                  const struct hk_shader *shader,
                                  mesa_shader_stage stage);
+uint64_t hk_cmd_upload_group_count(struct hk_cmd_buffer *cmd,
+                                   VkDispatchIndirectCommand group_count);
 void hk_cmd_print_upload_stats(struct hk_cmd_buffer *cmd);
 
 uint64_t hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,

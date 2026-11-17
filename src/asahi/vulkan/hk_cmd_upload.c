@@ -189,6 +189,35 @@ hk_cmd_upload_draw_id(struct hk_cmd_buffer *cmd, uint32_t draw_id)
    hk_upload_stat(cmd, draw_id_bytes, sizeof(draw_id));
 }
 
+uint64_t
+hk_cmd_upload_group_count(struct hk_cmd_buffer *cmd,
+                          VkDispatchIndirectCommand group_count)
+{
+   const uint32_t hash =
+      ((group_count.x * 2654435761u) ^ (group_count.y * 2246822519u) ^
+       (group_count.z * 3266489917u)) >>
+      28;
+   struct hk_group_count_cache_entry *entry =
+      &cmd->state.group_count_cache[hash];
+   if (likely(entry->valid && entry->x == group_count.x &&
+              entry->y == group_count.y && entry->z == group_count.z))
+      return entry->addr;
+
+   const uint64_t addr =
+      hk_pool_upload(cmd, &group_count, sizeof(group_count), 8);
+   if (!addr) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return 0;
+   }
+
+   entry->x = group_count.x;
+   entry->y = group_count.y;
+   entry->z = group_count.z;
+   entry->valid = 1;
+   entry->addr = addr;
+   return addr;
+}
+
 void
 hk_cmd_print_upload_stats(struct hk_cmd_buffer *cmd)
 {

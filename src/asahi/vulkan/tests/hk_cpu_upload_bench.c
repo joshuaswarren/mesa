@@ -278,7 +278,20 @@ reuse_correctness(struct fixture *f)
    hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX);
    CHECK(cmd->state.upload_stats.draw_param_uploads == 1);
    CHECK(cmd->state.upload_stats.constant_uploads == 1);
+
+   const VkDispatchIndirectCommand gc_a = {32, 4, 1};
+   const VkDispatchIndirectCommand gc_b = {64, 1, 1};
+   const uint64_t gc_addr_a = hk_cmd_upload_group_count(cmd, gc_a);
+   CHECK(gc_addr_a != 0);
+   const uint32_t main_off_after_a = cmd->uploader.main.offset;
+   CHECK(hk_cmd_upload_group_count(cmd, gc_a) == gc_addr_a);
+   CHECK(cmd->uploader.main.offset == main_off_after_a);
+   const uint64_t gc_addr_b = hk_cmd_upload_group_count(cmd, gc_b);
+   CHECK(gc_addr_b != 0 && gc_addr_b != gc_addr_a);
+   CHECK(hk_cmd_upload_group_count(cmd, gc_a) == gc_addr_a);
    reset(f);
+   for (unsigned i = 0; i < ARRAY_SIZE(cmd->state.group_count_cache); ++i)
+      CHECK(!cmd->state.group_count_cache[i].valid);
 }
 
 static uint64_t
