@@ -3606,7 +3606,7 @@ static const struct wl_buffer_listener buffer_listener = {
 };
 
 static uint8_t *
-wsi_wl_alloc_image_shm(struct wsi_image *imagew, unsigned size)
+wsi_wl_alloc_image_shm(struct wsi_image *imagew, unsigned size, uint64_t align)
 {
    struct wsi_wl_image *image = (struct wsi_wl_image *)imagew;
 
@@ -3615,8 +3615,13 @@ wsi_wl_alloc_image_shm(struct wsi_image *imagew, unsigned size)
    if (fd < 0)
       return NULL;
 
-   void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+   /* Map it at the alignment the driver needs to import it. */
+   void *at = wsi_reserve_aligned(size, align);
+   void *ptr = mmap(at, size, PROT_READ | PROT_WRITE,
+                    MAP_SHARED | (at ? MAP_FIXED : 0), fd, 0);
    if (ptr == MAP_FAILED) {
+      if (at)
+         munmap(at, size);
       close(fd);
       return NULL;
    }
@@ -3647,7 +3652,7 @@ wsi_wl_image_init(struct wsi_wl_swapchain *chain,
    case WSI_WL_BUFFER_SHM_MEMCPY: {
       if (chain->buffer_type == WSI_WL_BUFFER_SHM_MEMCPY) {
          wsi_wl_alloc_image_shm(&image->base, image->base.row_pitches[0] *
-                                              chain->extent.height);
+                                              chain->extent.height, 1);
       }
       assert(image->shm_ptr != NULL);
 
