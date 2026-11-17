@@ -228,7 +228,14 @@ agxdecode_chip_from_params(const decoder_params *params)
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200)
             return AGX_CHIP_G17P;
          return AGX_CHIP_G16S;
-      case 'C': return AGX_CHIP_G16C;
+      case 'C':
+      case 'X':
+         /* As agx_chip_from_params(): the M4 Max on the G17 runtime is G17P. */
+         if (params->chip_id == 0x6041 &&
+             params->usc_generation == AGX_ISA_AGX3 &&
+             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200)
+            return AGX_CHIP_G17P;
+         return params->gpu_variant == 'C' ? AGX_CHIP_G16C : AGX_CHIP_UNKNOWN;
       default: return AGX_CHIP_UNKNOWN;
       }
    case 17:
