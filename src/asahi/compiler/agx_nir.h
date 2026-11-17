@@ -133,7 +133,7 @@ typedef struct nir_def *(*agx_buffer_texture_metadata_cb)(
    struct nir_builder *b, struct nir_tex_instr *tex);
 bool agx_nir_lower_texture_with_buffer_metadata_cb(
    struct nir_shader *s, unsigned generation,
-   agx_buffer_texture_metadata_cb buffer_metadata);
+   agx_buffer_texture_metadata_cb buffer_metadata, bool robust_texel_fetch);
 bool agx_nir_lower_multisampled_image_store(struct nir_shader *s);
 bool agx_nir_lower_multisampled_image_store_for_generation(struct nir_shader *s,
                                                          unsigned generation);

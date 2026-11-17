@@ -4007,8 +4007,19 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    const enum agx_descriptor_generation descriptor_generation =
       agx_gallium_descriptor_generation(dev->chip);
    if (agx_native_graphics(dev))
+   {
+      /* Texel fetches get G17P's explicit out-of-view predicate only in
+       * robust contexts: elsewhere an out-of-range texelFetch is undefined
+       * (GL 4.6, 8.6) and the hardware fetch is memory-safe. Shader packs'
+       * full-screen passes spent 5-7 instructions on every fetch.
+       * ASAHI_GL_ROBUST_TEXEL_FETCH=1 keeps the predicate everywhere. */
+      static int force = -1;
+      if (force < 0)
+         force = debug_get_bool_option("ASAHI_GL_ROBUST_TEXEL_FETCH", false);
       NIR_PASS(_, nir, agx_nir_lower_texture_with_buffer_metadata_cb,
-               descriptor_generation, agx_buffer_texture_metadata);
+               descriptor_generation, agx_buffer_texture_metadata,
+               robust || force);
+   }
    else
       NIR_PASS(_, nir, agx_nir_lower_texture_for_generation,
                descriptor_generation |
