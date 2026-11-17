@@ -925,4 +925,17 @@ if with_tests
     ),
     suite : ['asahi'],
   )
+
+  test(
+    'agx3_g17p_task_kernel_shared',
+    executable(
+      'agx3_g17p_task_kernel_shared_test',
+      files('test/test-agx3-g17p-task-kernel-shared.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
 endif

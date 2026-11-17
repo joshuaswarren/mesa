@@ -134,3 +134,44 @@ check_element_addend(bool bounded, unsigned addend, unsigned expected_base)
 TEST(SharedByteOffsets, NestedElementAddend) { check_element_addend(true, 18, 72); }
 TEST(SharedByteOffsets, NestedElementAddendTooLarge) { check_element_addend(true, 64, 0); }
 TEST(SharedByteOffsets, NestedElementAddendUnbounded) { check_element_addend(false, 18, 0); }
+
+/* Lowering bit size first (as agx_preprocess_nir() and deferred AGX3 compute
+ * lowering do) and then running agx_nir_lower_shared_element_index() must
+ * chase through u2u16 in 32 bits so constant byte addends still fold into
+ * .base without leaving a 16-bit ushr. */
+TEST(SharedByteOffsets, NarrowedByteOffsetElementIndexFolds)
+{
+   nir_builder b = workgroup_shader("shared-narrowed-element-index");
+   nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+   nir_intrinsic_instr *store = nir_store_shared(
+      &b, nir_imm_int(&b, 7), nir_iadd_imm(&b, nir_imul_imm(&b, tid, 8), 16),
+      .align_mul = 8);
+
+   nir_def *v = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 4);
+   v = nir_iand_imm(&b, v, 4095);
+   nir_def *loaded = nir_load_shared(&b, 1, 32, nir_iadd_imm(&b, v, 12),
+                                     .align_mul = 4);
+   nir_intrinsic_instr *load = nir_def_as_intrinsic(loaded);
+   nir_store_global(&b, loaded, nir_imm_int64(&b, 0), .align_mul = 4);
+
+   EXPECT_TRUE(agx_nir_lower_shared_bitsize(b.shader, false));
+   EXPECT_TRUE(agx_nir_lower_shared_element_index(b.shader));
+   EXPECT_TRUE(b.shader->info.shared_element_index_agx);
+   EXPECT_TRUE(agx_nir_opt_shared_byte_offsets(b.shader));
+   nir_opt_dce(b.shader);
+
+   EXPECT_EQ(nir_intrinsic_base(store), 16);
+   EXPECT_EQ(nir_intrinsic_base(load), 12);
+   EXPECT_EQ(count_alu(b.shader, nir_op_ushr), 1u);
+
+   nir_scalar narrow = nir_scalar_resolved(load->src[0].ssa, 0);
+   ASSERT_TRUE(nir_scalar_is_alu(narrow));
+   ASSERT_EQ(nir_scalar_alu_op(narrow), nir_op_u2u16);
+   nir_scalar sh = nir_scalar_chase_alu_src(narrow, 0);
+   ASSERT_TRUE(nir_scalar_is_alu(sh));
+   EXPECT_EQ(sh.def->bit_size, 32u);
+   EXPECT_EQ(nir_scalar_alu_op(sh), nir_op_ushr);
+
+   nir_validate_shader(b.shader, "shared-narrowed-element-index result");
+   ralloc_free(b.shader);
+}
