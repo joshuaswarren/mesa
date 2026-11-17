@@ -2145,6 +2145,7 @@ agx_destroy_context(struct pipe_context *pctx)
       util_blitter_destroy(ctx->blitter);
 
    util_unreference_framebuffer_state(&ctx->framebuffer);
+   util_unreference_framebuffer_state(&ctx->zs_merge_real);
 
    agx_bg_eot_cleanup(&ctx->bg_eot);
    agx_destroy_meta_shaders(ctx);

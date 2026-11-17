@@ -1478,6 +1478,91 @@ agx_upload_depth_bias(struct agx_batch *batch,
  * to add surfaces to the BO list here. Instead we added them when flushing.
  */
 
+/* AGX_ZS_MERGE=0 ends the batch at every such framebuffer switch again. */
+DEBUG_GET_ONCE_BOOL_OPTION(zs_merge, "AGX_ZS_MERGE", true)
+
+static bool
+agx_fb_has_colour(const struct pipe_framebuffer_state *fb)
+{
+   for (unsigned i = 0; i < fb->nr_cbufs; ++i) {
+      if (fb->cbufs[i].texture)
+         return true;
+   }
+   return false;
+}
+
+/* If the app binds a framebuffer with only a depth/stencil surface, and an
+ * active render batch already renders to that same surface with the same
+ * size, keep drawing into that batch: the draws are those of the batch's
+ * framebuffer with every colour write masked. Each switch otherwise ends the
+ * render pass and stores and reloads every attachment. */
+static void
+agx_try_zs_merge(struct agx_context *ctx,
+                 const struct pipe_framebuffer_state *state)
+{
+   if (!debug_get_option_zs_merge() || !state->zsbuf.texture ||
+       agx_fb_has_colour(state) || state->resolve || state->viewmask)
+      return;
+
+   struct agx_batch *best = NULL;
+   for (unsigned idx = 0; idx < AGX_MAX_BATCHES; ++idx) {
+      if (!BITSET_TEST(ctx->batches.active, idx))
+         continue;
+      struct agx_batch *b = &ctx->batches.slots[idx];
+      if (agx_batch_is_compute(b) || !agx_fb_has_colour(&b->key) ||
+          b->key.resolve || b->key.viewmask ||
+          b->key.width != state->width || b->key.height != state->height ||
+          b->key.samples != state->samples ||
+          b->key.layers != state->layers ||
+          !pipe_surface_equal(&b->key.zsbuf, &state->zsbuf))
+         continue;
+      if (!best || b->seqnum > best->seqnum)
+         best = b;
+   }
+   if (!best)
+      return;
+
+   util_copy_framebuffer_state(&ctx->zs_merge_real, state);
+   util_copy_framebuffer_state(&ctx->framebuffer, &best->key);
+   ctx->zs_merge = true;
+}
+
+/* A merged draw that samples or binds as an image one of the batch's colour
+ * targets would read memory the batch has not stored yet: undo the merge so
+ * the normal path ends the batch first. */
+static void
+agx_check_zs_merge(struct agx_context *ctx)
+{
+   if (!ctx->zs_merge)
+      return;
+
+   for (unsigned stage = 0; stage < ARRAY_SIZE(ctx->stage); ++stage) {
+      for (unsigned i = 0; i < ctx->stage[stage].texture_count; ++i) {
+         struct agx_sampler_view *tex = ctx->stage[stage].textures[i];
+         if (!tex)
+            continue;
+         for (unsigned cb = 0; cb < ctx->framebuffer.nr_cbufs; ++cb) {
+            if (ctx->framebuffer.cbufs[cb].texture == &tex->rsrc->base)
+               goto unmerge;
+         }
+      }
+      u_foreach_bit64(i, ctx->stage[stage].image_mask) {
+         struct pipe_resource *r = ctx->stage[stage].images[i].resource;
+         for (unsigned cb = 0; cb < ctx->framebuffer.nr_cbufs; ++cb) {
+            if (r && ctx->framebuffer.cbufs[cb].texture == r)
+               goto unmerge;
+         }
+      }
+   }
+   return;
+
+unmerge:
+   util_copy_framebuffer_state(&ctx->framebuffer, &ctx->zs_merge_real);
+   ctx->zs_merge = false;
+   ctx->batch = NULL;
+   agx_dirty_all(ctx);
+}
+
 static void
 agx_set_framebuffer_state(struct pipe_context *pctx,
                           const struct pipe_framebuffer_state *state)
@@ -1489,6 +1574,7 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
 
    util_copy_framebuffer_state(&ctx->framebuffer, state);
    ctx->g17g_mrt_spills_known = false;
+   ctx->zs_merge = false;
 
    /* The frontend still reads and resolves the window's multisample colour
     * attachment. G17G/G18G's direct EOT resolve only writes the single-sample
@@ -1511,6 +1597,8 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
 
    agx_legalize_compression(ctx, agx_resource(ctx->framebuffer.zsbuf.texture),
                             ctx->framebuffer.zsbuf.format);
+
+   agx_try_zs_merge(ctx, state);
 
    ctx->batch = NULL;
    agx_dirty_all(ctx);
@@ -5069,6 +5157,10 @@ agx_update_fs(struct agx_batch *batch)
 
    memcpy(&link_key.epilog.fs.blend, &ctx->blend->key,
           sizeof(link_key.epilog.fs.blend));
+   if (ctx->zs_merge) {
+      for (unsigned i = 0; i < ARRAY_SIZE(link_key.epilog.fs.blend.rt); ++i)
+         link_key.epilog.fs.blend.rt[i].colormask = 0;
+   }
 
    /* A split G17G draw (agx_g17g_split_mrt) binds attachment g17g_mrt_rt
     * alone, at slot 0, and the variant moved its output to location 0:
@@ -15655,6 +15747,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
     * getting the batch, since once we have the batch we're not allowed to flush
     * the bound render targets.
     */
+   agx_check_zs_merge(ctx);
    agx_legalize_feedback_loops(ctx);
    agx_legalize_xfb(ctx);
 
@@ -16023,8 +16116,10 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       }
 
       /* TODO: Any point to tracking load? */
-      batch->draw |= store;
-      batch->resolve |= store;
+      if (!ctx->zs_merge) {
+         batch->draw |= store;
+         batch->resolve |= store;
+      }
    }
 
    if (ctx->dirty & AGX_DIRTY_ZS) {
