@@ -44,6 +44,7 @@
 #include "util/anon_file.h"
 #include "util/perf/cpu_trace.h"
 #include "util/u_vector.h"
+#include "util/os_misc.h"
 #include "util/format/u_formats.h"
 #include "main/glconfig.h"
 #include "pipe/p_screen.h"
@@ -620,6 +621,77 @@ surface_dmabuf_feedback_tranche_formats(
    }
 }
 
+static bool
+dri2_wl_modifiers_have_common(struct u_vector *modifiers1,
+                              struct u_vector *modifiers2);
+
+/* Scanout-friendly full-screen window surfaces (driconf egl_wl_scanout_size,
+ * or MESA_EGL_WL_SCANOUT in the environment, both "WxH"; unset = off). The
+ * size is read once per display, when it is initialized.
+ *
+ * A window surface whose buffers are exactly WxH pixels (a full-screen
+ * window on a WxH output) presents the opaque twin of its format, as
+ * EGL_EXT_present_opaque does, in a LINEAR buffer when the compositor takes
+ * one. A compositor can then hand the client's buffer to a display plane
+ * that scans out neither alpha formats nor GPU layouts, instead of
+ * compositing it. Surfaces of any other size are untouched, so a windowed
+ * application keeps its translucent corners and shadows. Meant to be set per
+ * application: a full-screen surface that relies on alpha (a panel, an
+ * overlay) must not have it. */
+static void
+dri2_wl_init_scanout_size(struct dri2_egl_display *dri2_dpy)
+{
+   const char *value = os_get_option("MESA_EGL_WL_SCANOUT");
+   char *conf = NULL;
+   int w = 0, h = 0;
+
+   if (!value && dri2_dpy->dri_screen_render_gpu &&
+       dri2GalliumConfigQuerys(dri2_dpy->dri_screen_render_gpu,
+                               "egl_wl_scanout_size", &conf) == 0)
+      value = conf;
+   if (!value || sscanf(value, "%dx%d", &w, &h) != 2 || w <= 0 || h <= 0)
+      w = h = 0;
+   dri2_dpy->wl_scanout_width = w;
+   dri2_dpy->wl_scanout_height = h;
+}
+
+static bool
+dri2_wl_surf_scanout(struct dri2_egl_surface *dri2_surf)
+{
+   struct dri2_egl_display *dri2_dpy =
+      dri2_egl_display(dri2_surf->base.Resource.Display);
+
+   return dri2_surf->base.Type == EGL_WINDOW_BIT &&
+          dri2_dpy->wl_scanout_width > 0 &&
+          dri2_surf->base.Width == dri2_dpy->wl_scanout_width &&
+          dri2_surf->base.Height == dri2_dpy->wl_scanout_height;
+}
+
+static bool
+dri2_wl_surf_present_opaque(struct dri2_egl_surface *dri2_surf)
+{
+   struct dri2_egl_display *dri2_dpy =
+      dri2_egl_display(dri2_surf->base.Resource.Display);
+
+   if (dri2_surf->base.PresentOpaque)
+      return true;
+   if (!dri2_wl_surf_scanout(dri2_surf))
+      return false;
+
+   /* The explicit attribute is validated when the surface is created; do
+    * the same here, and stay translucent if the opaque twin is unusable. */
+   int visual_idx = dri2_wl_visual_idx_from_fourcc(dri2_surf->format);
+   if (visual_idx == -1)
+      return false;
+   int opaque_visual_idx = dri2_wl_visual_idx_from_fourcc(
+      dri2_wl_visuals[visual_idx].opaque_wl_drm_format);
+   return opaque_visual_idx != -1 &&
+          server_supports_format(&dri2_dpy->formats, opaque_visual_idx) &&
+          dri2_wl_modifiers_have_common(
+             &dri2_dpy->formats.modifiers[visual_idx],
+             &dri2_dpy->formats.modifiers[opaque_visual_idx]);
+}
+
 static void
 surface_dmabuf_feedback_tranche_done(
    void *data, struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback)
@@ -1119,7 +1191,7 @@ create_dri_image(struct dri2_egl_surface *dri2_surf,
 
    assert(visual_idx != -1);
 
-   if (dri2_surf->base.PresentOpaque) {
+   if (dri2_wl_surf_present_opaque(dri2_surf)) {
       uint32_t opaque_fourcc =
             dri2_wl_visuals[visual_idx].opaque_wl_drm_format;
       int opaque_visual_idx = dri2_wl_visual_idx_from_fourcc(opaque_fourcc);
@@ -1193,10 +1265,31 @@ create_dri_image(struct dri2_egl_surface *dri2_surf,
       num_modifiers = 0;
    }
 
+   /* egl_wl_scanout_size: of the modifiers the compositor takes, LINEAR. */
+   uint64_t scanout_linear = DRM_FORMAT_MOD_LINEAR;
+   uint64_t *all_modifiers = modifiers;
+   unsigned int num_all_modifiers = num_modifiers;
+   if (dri2_wl_surf_scanout(dri2_surf)) {
+      for (unsigned int i = 0; i < num_modifiers; i++) {
+         if (modifiers[i] == DRM_FORMAT_MOD_LINEAR) {
+            modifiers = &scanout_linear;
+            num_modifiers = 1;
+            break;
+         }
+      }
+   }
+
    dri2_surf->back->dri_image = dri_create_image_with_modifiers(
       dri2_dpy->dri_screen_render_gpu, dri2_surf->base.Width,
       dri2_surf->base.Height, pipe_format, use_flags,
       modifiers, num_modifiers, NULL);
+
+   /* A driver that cannot make this LINEAR gets the full list back. */
+   if (!dri2_surf->back->dri_image && modifiers == &scanout_linear)
+      dri2_surf->back->dri_image = dri_create_image_with_modifiers(
+         dri2_dpy->dri_screen_render_gpu, dri2_surf->base.Width,
+         dri2_surf->base.Height, pipe_format, use_flags, all_modifiers,
+         num_all_modifiers, NULL);
 
    if (surf_modifiers_count > 0) {
       u_vector_finish(&modifiers_subset);
@@ -1741,7 +1834,7 @@ create_wl_buffer(struct dri2_egl_display *dri2_dpy,
          close(fd);
       }
 
-      if (dri2_surf && dri2_surf->base.PresentOpaque)
+      if (dri2_surf && dri2_wl_surf_present_opaque(dri2_surf))
          fourcc = dri2_wl_visuals[visual_idx].opaque_wl_drm_format;
 
       ret = zwp_linux_buffer_params_v1_create_immed(params, width, height,
@@ -2758,6 +2851,8 @@ dri2_initialize_wayland_drm(_EGLDisplay *disp)
 
    dri2_wl_setup_swap_interval(disp);
 
+   dri2_wl_init_scanout_size(dri2_dpy);
+
 #ifdef HAVE_BIND_WL_DISPLAY
    if (dri2_dpy->wl_drm) {
       /* To use Prime, we must have _DRI_IMAGE v7 at least.
@@ -3270,6 +3365,8 @@ dri2_initialize_wayland_swrast(_EGLDisplay *disp)
    dri2_setup_screen(disp);
 
    dri2_wl_setup_swap_interval(disp);
+
+   dri2_wl_init_scanout_size(dri2_dpy);
 
    dri2_wl_add_configs_for_visuals(disp);
 
