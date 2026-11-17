@@ -474,6 +474,28 @@ agx_twiddled_allowed(const struct agx_resource *pres)
  * neither shared nor scanned out, so a feedback loop or a shader-image
  * binding reallocates it uncompressed (agx_decompress()), as on AGX2.
  */
+/* G17P depth: a private, single-level, single-layer, single-sample Z32F
+ * depth buffer, as Honeykrisp compresses (hk_g17p_compression_depth_format()).
+ * ZLS writes it compressed through the metadata agx_batch already passes, and
+ * the compressed Gen9 2D texture packet reads it. On the M4 Max this is
+ * byte-identical to plain depth through depth testing across passes,
+ * readback, sampling, shadow comparison, blits and scissored clears, and a
+ * Sodium-style terrain frame took 6-8 % less time. ASAHI_G17P_GL_DEPTH_COMPRESS=0
+ * turns it off. */
+static bool
+agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
+                                           const struct pipe_resource *templ)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("ASAHI_G17P_GL_DEPTH_COMPRESS", true);
+   return enabled && dev->chip == AGX_CHIP_G17P &&
+          templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
+          templ->array_size <= 1 && templ->last_level == 0 &&
+          templ->nr_samples <= 1 && templ->format == PIPE_FORMAT_Z32_FLOAT &&
+          !(templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DEPTH_STENCIL));
+}
+
 static bool
 agx_g17p_private_compression_allowed(const struct agx_device *dev,
                                      const struct pipe_resource *templ)
@@ -506,7 +528,8 @@ agx_compression_allowed(const struct agx_resource *pres)
     * that never need it.
     */
    if (agx_gallium_descriptor_generation_is_agx3(generation)) {
-      if (!agx_g17p_private_compression_allowed(dev, &pres->base)) {
+      if (!agx_g17p_private_compression_allowed(dev, &pres->base) &&
+          !agx_g17p_private_depth_compression_allowed(dev, &pres->base)) {
          rsrc_debug(pres, "No compression: outside the G17P policy\n");
          return false;
       }
