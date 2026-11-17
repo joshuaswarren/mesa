@@ -506,6 +506,18 @@ agx3_translate_instr(const agx_instr *I, struct agx3_sel_instr *S)
       S->src[2] = (struct agx3_sel_src){0};
    }
 
+   /* Unary bitops (NOT = ~a, MOV = a) depend only on src[0]. Drop the unread
+    * second source in the selector representation (matching SLL/LSR and IMUL
+    * above) so agx3_emit_alu() does not inspect src[1] when checking source
+    * registers, baseline lifetime bits, s1, or synchronous-prelude destination
+    * overlap on waited MOV/NOT instructions. */
+   if (S->op == AGX3_SEL_OP_BITOP && I->nr_srcs == 2 &&
+       ((I->truth_table & 0xfu) == AGX3_SEL_TT_NOT ||
+        (I->truth_table & 0xfu) == AGX3_SEL_TT_MOV)) {
+      S->nr_srcs = 1;
+      S->src[1] = (struct agx3_sel_src){0};
+   }
+
    return true;
 }
 

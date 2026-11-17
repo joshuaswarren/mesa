@@ -1,3 +1,4 @@
+#include "agx3_select_core.h"
 #include "agx3_alu_core.h"
 #include "agx3_falu_mod_core.h"
 #include "agx3_iadd_core.h"
@@ -7051,6 +7052,78 @@ TEST(NativeForms, Agx3bMatmad8x8Field74IsWaitSlot5NotCZero)
    ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &accum_wait5,
                                        out, &length));
    EXPECT_EQ((out[2] >> 1) & 1, 1);
+}
+
+/* agx_lower_pseudo lowers AGX_OPCODE_NOT to AGX_OPCODE_BITOP with a dummy
+ * immediate-zero second source. Ensure the AGX3 selector drops that ignored
+ * second source so agx3_emit_alu composes a single wait-carrying AGX3_ALU_BNOT
+ * instruction rather than emitting a separate scoreboard retire before NOT. */
+TEST(NativeForms, UnaryBitopNotFoldsScoreboardWait)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 31;
+
+   agx_device_load_to(b, agx_register(4, AGX_SIZE_32),
+                      agx_register(28, AGX_SIZE_64), agx_immediate(0),
+                      AGX_FORMAT_I32, 1, 0, false);
+   agx_index src0 = agx_register(4, AGX_SIZE_32);
+   agx_bitop_to(b, agx_register(0, AGX_SIZE_32), src0, agx_zero(),
+                AGX3_SEL_TT_NOT);
+   agx_stop(b);
+
+   util_dynarray bytes;
+   util_dynarray_init(&bytes, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &bytes));
+
+   /* 14-byte device_load + 10-byte wait-carrying AGX3B inv/BNOT + 4-byte stop
+    * = 28 bytes total (no separate scoreboard retire instruction before NOT). */
+   uint8_t expected_bnot[AGX3_ALU_MAX_LENGTH] = {};
+   uint8_t bnot_len = 0;
+   ASSERT_TRUE(agx3_alu_compose(AGX_ISA_ENCODING_AGX3B, AGX3_ALU_BNOT, 0, 4, 0,
+                                0, 0, 1u << 0, expected_bnot, &bnot_len));
+   ASSERT_EQ(bnot_len, 10u);
+   ASSERT_EQ(bytes.size, 14u + bnot_len + 4u);
+   EXPECT_EQ(memcmp((const uint8_t *)bytes.data + 14, expected_bnot, bnot_len),
+             0);
+   ralloc_free(mem);
+}
+
+/* Truth-table inversion in agx_optimizer can leave an unread register in src[1]
+ * of a unary MOV (AGX3_SEL_TT_MOV). Ensure agx3_translate_instr() drops src[1]
+ * so agx3_emit_alu()'s synchronous-prelude overlap check does not refuse a
+ * multi-slot waited MOV whose unread src[1] aliases dest. */
+TEST(NativeForms, UnaryBitopMovIgnoresUnreadSecondSourceOnMultiSlotWait)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 31;
+
+   agx_device_load_to(b, agx_register(4, AGX_SIZE_16),
+                      agx_register(28, AGX_SIZE_64), agx_immediate(0),
+                      AGX_FORMAT_I16, 1, 0, false);
+   agx_device_load_to(b, agx_register(5, AGX_SIZE_16),
+                      agx_register(28, AGX_SIZE_64), agx_immediate(2),
+                      AGX_FORMAT_I16, 1, 0, false);
+   agx_bitop_to(b, agx_register(0, AGX_SIZE_32), agx_register(4, AGX_SIZE_32),
+                agx_register(0, AGX_SIZE_32), AGX3_SEL_TT_MOV);
+   agx_stop(b);
+
+   util_dynarray bytes;
+   util_dynarray_init(&bytes, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &bytes));
+   EXPECT_GT(bytes.size, 0u);
+   ralloc_free(mem);
 }
 
 /* The implemented cooperative-matrix path is enabled for every AGX3B
