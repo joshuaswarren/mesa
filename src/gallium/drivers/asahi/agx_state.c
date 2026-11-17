@@ -15411,6 +15411,210 @@ agx_draw_patches_split(struct agx_context *ctx,
    ctx->cond_query = cond_query;
 }
 
+/* Multi-draws (glMultiDrawElements*, Sodium's terrain) arrive as one
+ * pipe_draw_vbo with hundreds of sub-draws that share every bound state.
+ * util_draw_multi() sends each through agx_draw_vbo(), which re-validates
+ * shaders, descriptors, feedback loops and queries per sub-draw: ~0.1 us of
+ * CPU each, 1.5 ms per frame at Minecraft's 15k draws. Once a full draw has
+ * left the context clean, a following sub-draw with the same state only needs
+ * its index list record: agx_encode_state() would emit nothing for it anyway.
+ * Anything that varies per sub-draw (draw ID or base parameters in uniforms,
+ * statistics, geometry or tessellation stages, transform feedback, misaligned
+ * indices) keeps the full path. AGX_FAST_MULTIDRAW=0 disables this.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(fast_multidraw, "AGX_FAST_MULTIDRAW", true)
+
+static void agx_draw_vbo(struct pipe_context *pctx,
+                         const struct pipe_draw_info *info,
+                         unsigned drawid_offset,
+                         const struct pipe_draw_indirect_info *indirect,
+                         const struct pipe_draw_start_count_bias *draws,
+                         unsigned num_draws);
+
+static bool
+agx_multidraw_state_clean(const struct agx_context *ctx)
+{
+   if (ctx->dirty)
+      return false;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(ctx->stage); ++i) {
+      if (i != MESA_SHADER_COMPUTE && ctx->stage[i].dirty)
+         return false;
+   }
+
+   return true;
+}
+
+/* Is everything agx_draw_vbo() redoes per sub-draw a function of the bound
+ * state alone? Checked once per multi-draw, after its first full draw. */
+static bool
+agx_multidraw_can_skip(struct agx_context *ctx,
+                       const struct pipe_draw_info *info)
+{
+   if (!ctx->vs || !ctx->linked.vs || !ctx->fs || !ctx->linked.fs ||
+       ctx->gs || ctx->stage[MESA_SHADER_GEOMETRY].shader ||
+       ctx->stage[MESA_SHADER_TESS_EVAL].shader || ctx->in_tess ||
+       ctx->swtnl_inner || ctx->active_draw_without_restart ||
+       ctx->streamout.num_targets || info->mode == MESA_PRIM_PATCHES)
+      return false;
+
+   if (ctx->vs->b.info.uses_draw_id || ctx->linked.vs->uses_base_param)
+      return false;
+
+   if (ctx->active_queries) {
+      if (ctx->prims_generated[0])
+         return false;
+
+      for (unsigned i = 0; i < ARRAY_SIZE(ctx->pipeline_statistics); ++i) {
+         if (ctx->pipeline_statistics[i])
+            return false;
+      }
+   }
+
+   bool xfb_passthrough = false;
+   return !agx_needs_passthrough_gs(ctx, info, NULL, &xfb_passthrough, false);
+}
+
+static void
+agx_multidraw_emit_body(struct agx_context *ctx, struct agx_batch *batch,
+                        const struct pipe_draw_info *info,
+                        const struct pipe_draw_start_count_bias *d,
+                        uint64_t ib, size_t ib_extent)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+
+   if (ctx->time_elapsed)
+      agx_batch_add_timestamp_query(batch, ctx->time_elapsed);
+
+   agx_ensure_cmdbuf_has_space(
+      batch, &batch->vdm,
+      AGX_VDM_STATE_UPDATE_LENGTH + AGX_VDM_HAL200_BIND_TAIL_LENGTH +
+         AGX_VDM_HAL200_DRAW_STATE_POINTER_LENGTH +
+         AGX_VDM_HAL200_INDEXED_DRAW_BODY_LENGTH + AGX_VDM_BARRIER_LENGTH);
+
+   struct agx_draw draw = {0};
+   if (info->index_size) {
+      draw.index_size = agx_translate_index_size(info->index_size);
+      draw.index_buffer = ib;
+      draw.index_buffer_range_B = ib_extent;
+      draw.restart = info->primitive_restart;
+      draw.indexed = true;
+      draw.index_bias = d->index_bias;
+   } else {
+      draw.start = d->start;
+   }
+   draw.b = agx_3d(d->count, info->instance_count, 1);
+
+   batch->vdm.current = agx_g17p_emit_draw_body(
+      dev->chip, batch->vdm.current, &draw, agx_primitive_for_pipe(info->mode),
+      info->restart_index, 0);
+   assert((batch->vdm.current + AGX_VDM_STREAM_LINK_LENGTH) <= batch->vdm.end &&
+          "Failed to reserve sufficient space in encoder");
+
+   batch->draws++;
+
+   if (unlikely(dev->debug & AGX_DBG_PERF))
+      ctx->perf.draws++;
+
+   /* Same limits as the end of agx_draw_vbo() */
+   if (unlikely(
+          (((batch->scissor.size / AGX_SCISSOR_LENGTH) + AGX_MAX_VIEWPORTS) >
+           UINT16_MAX) ||
+          (batch->depth_bias.size / AGX_DEPTH_BIAS_LENGTH) >= UINT16_MAX)) {
+      agx_flush_batch_for_reason(ctx, batch, "Scissor/depth bias overflow");
+   } else if (unlikely(batch->draws > 100000)) {
+      agx_flush_batch_for_reason(ctx, batch, "Absurd number of draws");
+   }
+}
+
+static void
+agx_draw_multi(struct pipe_context *pctx, const struct pipe_draw_info *info,
+               unsigned drawid_offset,
+               const struct pipe_draw_indirect_info *indirect,
+               const struct pipe_draw_start_count_bias *draws,
+               unsigned num_draws)
+{
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_device *dev = agx_device(pctx->screen);
+
+   if (indirect || !agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip) ||
+       dev->chip == AGX_CHIP_G18G || !debug_get_option_fast_multidraw()) {
+      util_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
+      return;
+   }
+
+   unsigned drawid = drawid_offset;
+   struct agx_batch *clean = NULL;
+   int can_skip = -1;
+   /* Index buffer of the clean batch: its read is already recorded */
+   uint64_t ib_base = 0;
+   size_t ib_size = 0;
+
+   for (unsigned i = 0; i < num_draws; i++) {
+      const struct pipe_draw_start_count_bias *d = &draws[i];
+
+      if (d->count && info->instance_count) {
+         const uint64_t offset = (uint64_t)d->start * info->index_size;
+         uint64_t ib = 0;
+         size_t ib_extent = 0;
+         bool fast = clean != NULL;
+
+         if (fast && info->index_size) {
+            if (info->has_user_indices) {
+               ib = agx_index_buffer_ptr(clean, info, d, &ib_extent);
+            } else if (((ib_base + offset) & 3) || offset >= ib_size) {
+               /* agx_draw_vbo() realigns these through a synchronizing map */
+               fast = false;
+            } else {
+               ib = ib_base + offset;
+               ib_extent =
+                  ALIGN_POT(MIN2(ib_size - offset,
+                                 (uint64_t)d->count * info->index_size), 4);
+            }
+         }
+
+         if (fast) {
+            agx_multidraw_emit_body(ctx, clean, info, d, ib, ib_extent);
+         } else {
+            struct agx_batch *before = ctx->batch;
+            const unsigned before_draws = before ? before->draws : 0;
+
+            agx_draw_vbo(pctx, info, drawid, NULL, d, 1);
+
+            clean = NULL;
+            if (ctx->batch && !agx_batch_is_compute(ctx->batch) &&
+                (ctx->batch != before || ctx->batch->draws != before_draws) &&
+                agx_multidraw_state_clean(ctx)) {
+               if (can_skip < 0)
+                  can_skip = agx_multidraw_can_skip(ctx, info);
+               if (can_skip)
+                  clean = ctx->batch;
+            }
+
+            /* Bindings do not change within the multi-draw, so the checks
+             * agx_draw_vbo() makes before acquiring its batch give the same
+             * answer for every later sub-draw: make them once, now that the
+             * batch exists. A feedback loop flushes or dirties here and keeps
+             * the full path. */
+            if (clean) {
+               agx_legalize_feedback_loops(ctx);
+               if (ctx->batch != clean || !agx_multidraw_state_clean(ctx))
+                  clean = NULL;
+            }
+
+            if (clean && info->index_size && !info->has_user_indices)
+               ib_base = agx_index_buffer_rsrc_ptr(clean, info, &ib_size);
+         }
+
+         if (clean && ctx->batch != clean)
+            clean = NULL;
+      }
+
+      if (info->increment_draw_id)
+         drawid++;
+   }
+}
+
 static void
 agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
              unsigned drawid_offset,
@@ -15423,7 +15627,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       return;
 
    if (num_draws > 1) {
-      util_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
+      agx_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
       return;
    }
 
