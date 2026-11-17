@@ -19,6 +19,7 @@ extern "C" {
 #include "compiler/nir/nir_builder.h"
 #include "agx_nir_m5_mesh.h"
 #include "agx3_mesh_core.h"
+#include "agx_mesh_abi.h"
 #include <gtest/gtest.h>
 #include <vector>
 #include <csignal>
@@ -6175,6 +6176,91 @@ m5_mesh_provoking_shader(mesa_prim primitive, unsigned vertices,
          nir_imm_int(&b, 0), .write_mask = 1, .src_type = nir_type_bool1,
          .io_semantics = {.location = VARYING_SLOT_CULL_PRIMITIVE, .num_slots = 1});
    return b.shader;
+}
+
+TEST(NativeForms, Gen1MeshExportFencesCoverGenericShapesAndPartialCounts)
+{
+   const struct {
+      mesa_prim topology;
+      unsigned x, y, z, vertices, primitives;
+   } rows[] = {
+      {MESA_PRIM_TRIANGLES, 3,1,1,3,1},
+      {MESA_PRIM_LINES, 16,1,1,32,16},
+      {MESA_PRIM_LINES, 32,1,1,64,32},
+      {MESA_PRIM_LINES, 10,4,1,256,256},
+      {MESA_PRIM_POINTS, 1,1,128,128,128},
+      {MESA_PRIM_LINES, 128,1,1,256,128},
+      {MESA_PRIM_POINTS, 32,1,1,33,1},
+   };
+   for (const auto &r : rows) {
+      for (unsigned count : {0u, 1u, r.vertices}) {
+         nir_shader *s = m5_mesh_provoking_shader(r.topology, r.vertices,
+                                                  r.primitives, 0, false);
+         s->info.workgroup_size[0]=r.x; s->info.workgroup_size[1]=r.y;
+         s->info.workgroup_size[2]=r.z;
+         nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+            nir_foreach_instr(in, block) {
+               if (in->type != nir_instr_type_intrinsic ||
+                   nir_instr_as_intrinsic(in)->intrinsic !=
+                      nir_intrinsic_set_vertex_and_primitive_count)
+                  continue;
+               nir_builder b = nir_builder_at(nir_before_instr(in));
+               nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+               nir_src_rewrite(&i->src[0], nir_imm_int(&b, count));
+               nir_src_rewrite(&i->src[1], nir_imm_int(&b, MIN2(count, r.primitives)));
+            }
+         }
+         struct agx_m5_mesh_varyings v;
+         ASSERT_TRUE(agx_gen1_mesh_gather_varyings(s, &v));
+         ASSERT_TRUE(agx_nir_lower_gen1_mesh(s, &v));
+         nir_validate_shader(s, "gen1 mesh export phase scopes");
+         unsigned phase=0, index_sites=0, vertex_sites=0;
+         nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+            nir_foreach_instr(in, block) {
+               if (in->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+               if (i->intrinsic == nir_intrinsic_fence_mesh_uvb_agx) {
+                  EXPECT_EQ(nir_intrinsic_base(i), phase ?
+                     AGX_MESH_EXPORT_FENCE_VERTEX_BATCH : AGX_MESH_EXPORT_FENCE_INDICES);
+                  /* Each fence is in SIMD0's then-list, after the prior
+                   * index/batch IF and before the NEXT vertex IF. This
+                   * remains true at count0, count1 and the full limit. */
+                  ASSERT_NE(block->cf_node.parent, nullptr);
+                  EXPECT_EQ(block->cf_node.parent->type, nir_cf_node_if);
+                  EXPECT_EQ(nir_cf_node_prev(&block->cf_node)->type, nir_cf_node_if);
+                  EXPECT_EQ(nir_cf_node_next(&block->cf_node)->type, nir_cf_node_if);
+                  ++phase;
+               } else if (i->intrinsic == nir_intrinsic_store_mesh_uvb_agx) {
+                  if (nir_intrinsic_flags(i)) {
+                     EXPECT_EQ(phase, 0u); ++index_sites;
+                  } else {
+                     ASSERT_GT(phase, 0u); ++vertex_sites;
+                     ASSERT_TRUE(nir_src_is_const(i->src[0]));
+                     EXPECT_EQ(nir_src_comp_as_uint(i->src[0],0) >> 16,
+                               32 * (phase - 1));
+                  }
+               }
+            }
+         }
+         EXPECT_EQ(phase, DIV_ROUND_UP(r.vertices,32));
+         const unsigned corners = r.topology == MESA_PRIM_POINTS ? 1 :
+                                  r.topology == MESA_PRIM_LINES ? 2 : 3;
+         EXPECT_EQ(index_sites, DIV_ROUND_UP(DIV_ROUND_UP(corners*r.primitives,4),32));
+         EXPECT_GT(vertex_sites, 0u);
+         ralloc_free(s);
+      }
+   }
+   /* The separate G17S exporter has no new fence or changed protocol. */
+   nir_shader *s = m5_mesh_provoking_shader(MESA_PRIM_POINTS,128,128,0,false);
+   ASSERT_TRUE(agx_nir_lower_m5_mesh_triangle_probe(s));
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(in, block) {
+         if (in->type == nir_instr_type_intrinsic)
+            EXPECT_NE(nir_instr_as_intrinsic(in)->intrinsic, nir_intrinsic_fence_mesh_uvb_agx);
+      }
+   }
+   ralloc_free(s);
 }
 
 static bool
