@@ -1821,6 +1821,27 @@ wsi_wl_surface_get_support(VkIcdSurfaceBase *surface,
 /* Catch-all. 3 images is a sound default for everything except MAILBOX. */
 #define WSI_WL_DEFAULT_NUM_IMAGES 3
 
+/* An uncapped (IMMEDIATE or MAILBOX) swapchain on a composited surface: the
+ * compositor holds the image on screen and the one it latched for the next
+ * refresh, and hands superseded images back only when it composites. With
+ * WSI_WL_BUMPED_NUM_IMAGES the application gets two images per refresh,
+ * which caps it at twice the display rate (240 fps at 120 Hz). Creating more
+ * images than requested is allowed; MESA_VK_WSI_WL_UNCAPPED_IMAGES overrides
+ * the count (4..16). */
+#define WSI_WL_UNCAPPED_NUM_IMAGES 6
+
+static uint32_t
+wsi_wl_uncapped_num_images(void)
+{
+   static int count = -1;
+   if (count < 0) {
+      const char *e = getenv("MESA_VK_WSI_WL_UNCAPPED_IMAGES");
+      int v = e ? atoi(e) : 0;
+      count = (v >= WSI_WL_BUMPED_NUM_IMAGES && v <= 16) ? v : WSI_WL_UNCAPPED_NUM_IMAGES;
+   }
+   return count;
+}
+
 static uint32_t
 wsi_wl_surface_get_min_image_count(struct wsi_wl_display *display,
                                    const VkSurfacePresentModeKHR *present_mode)
@@ -3831,7 +3852,7 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    /* We need to allocate the chain handle early, since display initialization code relies on it.
     * We do not know the actual image count until we have initialized the display handle,
     * so allocate conservatively in case we need to bump the image count. */
-   size_t size = sizeof(*chain) + MAX2(WSI_WL_BUMPED_NUM_IMAGES, pCreateInfo->minImageCount) * sizeof(chain->images[0]);
+   size_t size = sizeof(*chain) + MAX3(WSI_WL_BUMPED_NUM_IMAGES, 16u, pCreateInfo->minImageCount) * sizeof(chain->images[0]);
    chain = vk_zalloc(pAllocator, size, 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (chain == NULL)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -3910,6 +3931,15 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       bool requires_image_count_bump = min_images == WSI_WL_BUMPED_NUM_IMAGES;
       if (requires_image_count_bump)
          num_images = MAX2(min_images, num_images);
+   }
+
+   /* Uncapped presentation: enough images that the compositor's two never
+    * hold the application to twice the display rate. */
+   {
+      const VkPresentModeKHR mode = wsi_swapchain_get_present_mode(wsi_device, pCreateInfo);
+      if (!uses_present_mode_group &&
+          (mode == VK_PRESENT_MODE_IMMEDIATE_KHR || mode == VK_PRESENT_MODE_MAILBOX_KHR))
+         num_images = MAX2(num_images, wsi_wl_uncapped_num_images());
    }
 
    VkPresentModeKHR present_mode = wsi_swapchain_get_present_mode(wsi_device, pCreateInfo);
