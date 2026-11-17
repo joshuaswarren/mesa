@@ -606,7 +606,7 @@ agx_chip_uncovered_tile_ms_defect(enum agx_chip chip)
 
 /*
  * Whether that defect also reaches a reloaded attachment, which must then
- * spill. On M4 Pro (T6040, chip id 0x6040) a 2x reload keeps the whole sample:
+ * spill. On M4 Pro and M4 Max (chip ids 0x6040, 0x6041) a 2x reload keeps the whole sample:
  * kept in the tilebuffer, 149 runs of 12- and 16-byte samples passed (64x64
  * to 3456x2234, 1 to 16 layers, partly drawn tiles, every empty tile
  * processed), where the same runs at 4x lost the upper bytes in 40 of 102.
@@ -616,7 +616,8 @@ static inline bool
 agx_chip_uncovered_tile_ms_reload_defect(enum agx_chip chip, uint32_t chip_id,
                                          unsigned samples)
 {
-   if (chip == AGX_CHIP_G17P && chip_id == 0x6040 && samples == 2)
+   if (chip == AGX_CHIP_G17P && (chip_id == 0x6040 || chip_id == 0x6041) &&
+       samples == 2)
       return false;
    return agx_chip_uncovered_tile_ms_defect(chip);
 }
