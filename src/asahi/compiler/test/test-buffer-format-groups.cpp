@@ -310,8 +310,10 @@ TEST(BufferFormatGroups, GroupsIndependentReadsAndPreservesBothReadPaths)
                         uint32_t coord = index + i;
                         bool raw = rgb && coord < elements;
                         expected_raw += raw;
+                        /* Only the texture adds the tail; RGB32 reads the
+                         * view's exact address (agx_abi.h). */
                         uint32_t adjusted = coord + tail;
-                        uint64_t word = uint32_t(adjusted * 3u);
+                        uint64_t word = uint32_t(coord * 3u);
                         for (unsigned c = 0; c < 4; ++c) {
                            uint32_t expected = raw ?
                               (c < 3 ? BufferGraphEvaluator::raw_word(word + c) :
@@ -502,7 +504,7 @@ TEST(BufferFormatGroups, WalksOriginalSequencesAcrossControlFlow)
                      uint32_t coord = index+16*g+i;
                      bool raw = rgb && coord < elements;
                      uint32_t adjusted = coord+tail;
-                     uint64_t word = uint32_t(adjusted*3u);
+                     uint64_t word = uint32_t(coord*3u);
                      ASSERT_LT(output, eval.outputs.size());
                      for (unsigned c = 0; c < 4; ++c) {
                         uint32_t expected = raw ? (c < 3 ? BufferGraphEvaluator::raw_word(word+c) : 1u) : BufferGraphEvaluator::texture_word(coord >= elements ? UINT32_MAX : adjusted, c);

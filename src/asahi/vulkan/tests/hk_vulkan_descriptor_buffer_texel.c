@@ -3,10 +3,11 @@
  *
  * G17P texel buffer descriptors written by vkGetDescriptorEXT carry the same
  * software metadata (agx_abi.h) as those of a VkBufferView, which the texel
- * fetch, store and atomic lowerings read: a view of a sparse-residency buffer
- * names the buffer's residency map, from which the shader reads non-resident
- * texels as zero. The views lie in a sparse-residency buffer, which needs no
- * memory.
+ * fetch, store and atomic lowerings read: every view's metadata names its
+ * exact address (the texture's tail offset counts only texture coordinates),
+ * and a view of a sparse-residency buffer names the buffer's residency map,
+ * from which the shader reads non-resident texels as zero. The views lie in
+ * a sparse-residency buffer, which needs no memory.
  * Nothing executes on the GPU, so the test also runs under the no-op DRM
  * shim.
  */
@@ -208,12 +209,16 @@ main(void)
       /* A view in a texel window */
       texel_descriptor(types[t].type, view, 4096, desc, types[t].size);
       EXPECT(word32(desc, AGX_G17P_BUFFER_TEXTURE_SIZE_OFFSET) == 4096,
-             "%s short view: %u elements", name,
+             "%s view: %u elements", name,
              word32(desc, AGX_G17P_BUFFER_TEXTURE_SIZE_OFFSET));
+      EXPECT(word64(desc, AGX_G17P_BUFFER_TEXTURE_ADDRESS_OFFSET) == view,
+             "%s view: address 0x%llx, view at 0x%llx", name,
+             (unsigned long long)word64(desc, AGX_G17P_BUFFER_TEXTURE_ADDRESS_OFFSET),
+             (unsigned long long)view);
       const uint32_t sparse = word32(desc, AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET);
       EXPECT((sparse >> AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT) != 0 &&
                 (sparse & AGX_G17P_BUFFER_TEXTURE_SPARSE_ELSIZE_MASK) == 2,
-             "%s short view: sparse word 0x%x, not a residency map with "
+             "%s view: sparse word 0x%x, not a residency map with "
              "4-byte texels", name, sparse);
    }
 

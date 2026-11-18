@@ -154,12 +154,12 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
    const uint64_t sampled_base = g17p ? rw_base : ro_base;
 
    uint32_t tail_offset_B = view->vk.offset & 0xf;
-   /* RGB32 permits component-aligned offsets, which cannot in general be
-    * expressed as a whole-texel tail. Its G17P raw-load metadata can carry
-    * the exact address instead; the unused hardware texture stays aligned.
+   /* The G17P metadata names the view's exact address
+    * (AGX_G17P_BUFFER_TEXTURE_ADDRESS_OFFSET). RGB32 permits component-aligned
+    * offsets, which cannot in general be expressed as a whole-texel tail, and
+    * it reads only that address; its unused hardware texture stays aligned.
     */
-   const uint64_t metadata_base =
-      sampled_base + ((g17p && rgb32) ? tail_offset_B : 0);
+   const uint64_t metadata_base = sampled_base + tail_offset_B;
    if (g17p && rgb32)
       tail_offset_B = 0;
    uint32_t tail_offset_el = tail_offset_B / util_format_get_blocksize(format);
@@ -689,7 +689,7 @@ hk_texel_buffer_descriptor(struct hk_device *dev,
    const struct hk_g17p_buffer_texture_metadata metadata = {
       .elements = elements,
       .offset_el = offset_el,
-      .address = base,
+      .address = info->address,
       .rgb32 = hk_texel_rgb32(format),
       /* The buffer behind the address, as hk_CreateBufferView() knows it */
       .sparse = hk_sparse_texel_word_at(dev, info->address,
