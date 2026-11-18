@@ -33,8 +33,10 @@ struct hk_descriptor_set_binding_layout {
    /* Offset into the descriptor buffer where this descriptor lives */
    uint32_t offset;
 
-   /* Stride between array elements in the descriptor buffer */
-   uint8_t stride;
+   /* Stride between array elements in the descriptor buffer. A multi-plane
+    * sampler binding in a descriptor buffer layout takes one combined image
+    * sampler descriptor per plane. */
+   uint16_t stride;
 
    /* Index into the dynamic buffer binding array */
    uint8_t dynamic_buffer_index;

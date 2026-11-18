@@ -665,9 +665,8 @@ hk_texel_buffer_descriptor(struct hk_device *dev,
       hk_storage_image_descriptor_layout(generation);
    struct hk_native_texture_descriptor tex = {0};
    struct hk_native_pbe_descriptor pbe = {0};
+   /* Zeroed by hk_GetDescriptorEXT() */
    uint8_t *packed = out;
-
-   memset(packed, 0, AGX_G17P_BUFFER_TEXTURE_DESCRIPTOR_SIZE);
 
    const enum pipe_format format =
       info && info->address ? hk_format_to_pipe_format(info->format)
