@@ -1020,6 +1020,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  hk_vulkan_descriptor_buffer_texel = executable(
+    'hk-vulkan-descriptor-buffer-texel',
+    files('tests/hk_vulkan_descriptor_buffer_texel.c'),
+    include_directories : [inc_include, inc_src],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hk_vulkan_explicit_plane_layout = executable(
     'hk-vulkan-explicit-plane-layout',
     files('tests/hk_vulkan_explicit_plane_layout.c'),
