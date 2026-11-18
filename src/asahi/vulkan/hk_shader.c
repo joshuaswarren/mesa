@@ -1155,6 +1155,14 @@ check_in_bounds(nir_builder *b, nir_intrinsic_instr *intr)
                         nir_ushr_imm(b, bound, shift));
    }
 
+   /* Byte offsets below bound - (size - 1) fit the whole load. The
+    * saturating subtraction rejects every offset when the bound is smaller
+    * than the load. Loads of the same width can share the adjusted bound.
+    */
+   if (offset->bit_size == 32 && bound->bit_size == 32)
+      return nir_ult(b, offset,
+                     nir_usub_sat(b, bound, nir_imm_int(b, load_size - 1)));
+
    /* Otherwise bounds check in bytes */
    nir_def *sat_offset = nir_umin_imm(b, offset, UINT32_MAX - (load_size - 1));
    return nir_ult(b, nir_iadd_imm(b, sat_offset, load_size - 1), bound);
