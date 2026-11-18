@@ -1117,9 +1117,14 @@ hk_get_device_properties(const struct agx_device *dev,
 {
    const unsigned descriptor_generation =
       agx_chip_descriptor_generation(dev->chip);
+   /* Native AGX3 and every M5 part (G17G, G17S, G17C) view texel buffers
+    * through the 2D texture/PBE descriptor with the software alignment tail.
+    * G18G takes the legacy buffer-view path, which has no tail.
+    */
+   const bool agx3_texel_buffer_tail =
+      agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip);
    const bool texel_buffer_single_texel_alignment =
-      hk_descriptor_generation_is_agx2(descriptor_generation) ||
-      agx_chip_native_agx3(dev->chip);
+      hk_descriptor_generation_is_agx2(descriptor_generation) || agx3_texel_buffer_tail;
    /* G17P: what agx_nir_lower_gen1_mesh accepts and the CTS runs there
     * (misc.maximize_invocations_256); no larger mesh workgroup was run. */
    const uint32_t mesh_threads = dev->chip == AGX_CHIP_G17P ? 256 : 1024;
@@ -1185,12 +1190,13 @@ hk_get_device_properties(const struct agx_device *dev,
           agx_chip_g17_m5(dev->chip)) ? 2048 : 16384,
       .maxImageDimensionCube = 16384,
       .maxImageArrayLayers = 2048,
-      /* The G17P texture/PBE includes the software alignment tail in its
-       * height. Reserve the worst-case 15 R8 texels so a maximally sized
-       * view at a single-texel offset still fits the native 2D descriptor.
+      /* The native AGX3 and M5 texture/PBE includes the software alignment
+       * tail in its height. Reserve the worst-case 15 R8 texels so a
+       * maximally sized view at a single-texel offset still fits the native
+       * 2D descriptor.
        */
       .maxTexelBufferElements = AGX_TEXTURE_BUFFER_MAX_SIZE -
-                               (agx_chip_native_agx3(dev->chip) ? 15 : 0),
+                               (agx3_texel_buffer_tail ? 15 : 0),
       .maxUniformBufferRange = 65536,
 
       /* Storage buffers are lowered to global address arithmetic with a
