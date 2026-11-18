@@ -15828,8 +15828,10 @@ g17p_cse_shared_reads_in_phases(nir_shader *nir)
 
    nir_divergence_analysis(nir);
    nir_foreach_function_impl(impl, nir) {
-      if (impl->function->is_preamble)
+      if (impl->function->is_preamble) {
+         nir_no_progress(impl);
          continue;
+      }
 
       bool progress = false;
       nir_foreach_block(pre, impl) {
