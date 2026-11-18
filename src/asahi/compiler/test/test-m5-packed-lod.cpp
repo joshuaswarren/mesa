@@ -178,3 +178,37 @@ TEST(M5PackedLOD, Bank8MinimumOwnsCompleteStagingRange)
    }
 
 }
+
+TEST(M5PackedLOD, LastUseSplitMovesHighHalfIntoSamplerBank)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17C;
+   key.has_scratch = true;
+   agx_shader_info info = {};
+   b->shader->out = &info;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+   b->shader->nir->info.workgroup_size[0] = 32;
+   b->shader->nir->info.workgroup_size[1] = 1;
+   b->shader->nir->info.workgroup_size[2] = 1;
+
+   agx_index pair = agx_temp(b->shader, AGX_SIZE_32);
+   agx_preload_to(b, pair, agx_register(188, AGX_SIZE_32));
+   agx_instr *split = agx_split(b, 2, pair);
+   split->dest[0] = agx_temp(b->shader, AGX_SIZE_16);
+   split->dest[1] = agx_temp(b->shader, AGX_SIZE_16);
+   agx_index packed = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *pack = agx_pack_sampler_lod_agx3_to(b, packed, split->dest[0]);
+   agx_unit_test(b, split->dest[1]);
+   agx_unit_test(b, packed);
+
+   agx_ra(b->shader);
+   ASSERT_FALSE(b->shader->ra_failed);
+   EXPECT_LT(pack->src[0].value, 128u);
+   ralloc_free(mem);
+}
