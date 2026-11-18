@@ -4077,8 +4077,8 @@ hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
 
    /* On G17P a vertex shader that stores a varying at a UVS index it loaded
     * at run time can have the varying land in the wrong place while another
-    * context renders, so give a shader compiled without its fragment shader
-    * the canonical layout, whose indices are constants.
+    * context renders, so a shader compiled without its fragment shader writes
+    * each varying at a constant index that linking relocates.
     */
    NIR_PASS(_, nir, agx_nir_lower_uvs, &shader->info.uvs,
             layer_as_varying, dev->dev.chip == AGX_CHIP_G17P,

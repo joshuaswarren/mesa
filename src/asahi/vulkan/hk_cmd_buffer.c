@@ -2175,10 +2175,7 @@ hk_g17p_smooth_varyings_supported_uncached(struct hk_cmd_buffer *cmd,
              b->offset + b->count > vs->info.uvs.components[b->slot])
             return false;
          ++user_bindings;
-         unsigned slot = gfx->linked_varyings.slots[b->slot];
-         /* A canonical layout's flat inputs read the flat copy. */
-         if (slot && !b->smooth)
-            slot += gfx->linked_varyings.flat_copy;
+         const unsigned slot = gfx->linked_varyings.slots[b->slot];
          if (slot < 4 || slot + b->offset + b->count > vs->info.uvs.size)
             return false;
       }
