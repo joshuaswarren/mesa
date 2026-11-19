@@ -66,8 +66,6 @@ hk_g17p_launch_trace_enabled(void)
 }
 void hk_g17p_trace_hexdump(const char *label, uint64_t base, const void *data,
                            size_t len);
-void hk_g17p_trace_line(const char *label, uint64_t base, const void *data,
-                        size_t len);
 
 void *hk_cmd_buffer_emit_cdm_terminate(struct hk_cmd_buffer *cmd,
                                        void *current);

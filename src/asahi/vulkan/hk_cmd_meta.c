@@ -4770,121 +4770,6 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
    hk_meta_end(cmd, &save, bind_point);
 }
 
-struct hk_r32_volume_copy_push {
-   uint64_t src, dst, layer_stride;
-   uint32_t depth;
-};
-static bool
-hk_g17p_r32_volume_copy_diagnostic(
-   struct hk_cmd_buffer *cmd, struct hk_image *image,
-   const VkCopyImageToBufferInfo2 *info)
-{
-   if (!debug_get_bool_option("ASAHI_G17P_R32_3D_ADDRESS_DIAGNOSTIC", false) ||
-       !agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-       image->vk.image_type != VK_IMAGE_TYPE_3D ||
-       image->vk.format != VK_FORMAT_R32_SINT || image->plane_count != 1 ||
-       image->vk.extent.width != 1 || image->vk.extent.height != 1 ||
-       image->vk.mip_levels != 1 || image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
-       image->planes[0].layout.compressed ||
-       image->planes[0].layout.tiling != AIL_TILING_GPU ||
-       !hk_g17p_transfer_src_layout_supported(info->srcImageLayout))
-      return false;
-
-   VK_FROM_HANDLE(hk_buffer, buffer, info->dstBuffer);
-   for (unsigned r = 0; r < info->regionCount; r++) {
-      const VkBufferImageCopy2 *region = &info->pRegions[r];
-      if (region->imageSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
-          region->imageSubresource.mipLevel ||
-          region->imageSubresource.baseArrayLayer ||
-          region->imageSubresource.layerCount != 1 || region->imageOffset.x ||
-          region->imageOffset.y || region->imageOffset.z < 0 ||
-          region->imageExtent.width != 1 || region->imageExtent.height != 1 ||
-          !region->imageExtent.depth ||
-          region->imageOffset.z >= image->vk.extent.depth ||
-          region->imageExtent.depth > image->vk.extent.depth - region->imageOffset.z ||
-          (region->bufferRowLength && region->bufferRowLength != 1) ||
-          (region->bufferImageHeight && region->bufferImageHeight != 1) ||
-          (region->bufferOffset & 3) || region->bufferOffset > buffer->vk.size ||
-          (uint64_t)region->imageExtent.depth * 4 > buffer->vk.size - region->bufferOffset)
-         return false;
-   }
-
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   const struct { enum hk_meta_object_key_type type; uint32_t diagnostic; } key = {
-      HK_META_OBJECT_KEY_BLOCK_COPY, 0x52335644,
-   };
-   const VkPushConstantRange range = {
-      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-      .size = sizeof(struct hk_r32_volume_copy_push),
-   };
-   VkPipelineLayout layout;
-   VkResult result = vk_meta_get_pipeline_layout(&dev->vk, &dev->meta, NULL,
-                                                &range, &key, sizeof(key), &layout);
-   if (result != VK_SUCCESS) {
-      vk_command_buffer_set_error(&cmd->vk, result);
-      return true;
-   }
-   VkPipeline pipeline = vk_meta_lookup_pipeline(&dev->meta, &key, sizeof(key));
-   if (pipeline == VK_NULL_HANDLE) {
-      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL,
-                                                      "hk-r32-volume-address-diagnostic");
-      b.shader->info.workgroup_size[0] = 64;
-      b.shader->info.workgroup_size[1] = 1;
-      b.shader->info.workgroup_size[2] = 1;
-      nir_def *id = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
-#define r32_push(field) nir_load_push_constant(&b, 1, \
-   sizeof(((struct hk_r32_volume_copy_push *)0)->field) * 8, \
-   nir_imm_int(&b, offsetof(struct hk_r32_volume_copy_push, field)))
-      nir_push_if(&b, nir_ult(&b, id, r32_push(depth)));
-      nir_def *src = nir_iadd(&b, r32_push(src),
-                              nir_imul(&b, nir_u2u64(&b, id), r32_push(layer_stride)));
-      nir_def *dst = nir_iadd(&b, r32_push(dst),
-                              nir_ishl_imm(&b, nir_u2u64(&b, id), 2));
-      nir_store_global(&b, nir_load_global(&b, 1, 32, src, .align_mul = 4),
-                       dst, .align_mul = 4);
-      nir_pop_if(&b, NULL);
-#undef r32_push
-      const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
-         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
-         .nir = b.shader,
-      };
-      const VkComputePipelineCreateInfo pci = {
-         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                   .pNext = &nir_info, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .pName = "main"},
-         .layout = layout,
-      };
-      result = vk_meta_create_compute_pipeline(&dev->vk, &dev->meta, &pci,
-                                               &key, sizeof(key), &pipeline);
-      ralloc_free(b.shader);
-      if (result != VK_SUCCESS) {
-         vk_command_buffer_set_error(&cmd->vk, result);
-         return true;
-      }
-   }
-   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
-   VkCommandBuffer cb = vk_command_buffer_to_handle(&cmd->vk);
-   disp->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-   const struct ail_layout *ail = &image->planes[0].layout;
-   for (unsigned r = 0; r < info->regionCount; r++) {
-      const VkBufferImageCopy2 *region = &info->pRegions[r];
-      const struct hk_r32_volume_copy_push push = {
-         .src = hk_image_base_address(image, 0) +
-                ail_get_layer_level_B(ail, region->imageOffset.z, 0),
-         .dst = hk_buffer_address_rw(buffer, region->bufferOffset),
-         .layer_stride = ail->layer_stride_B,
-         .depth = region->imageExtent.depth,
-      };
-      disp->CmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                             sizeof(push), &push);
-      disp->CmdDispatch(cb, DIV_ROUND_UP(push.depth, 64), 1, 1);
-      if (cmd->current_cs.cs)
-         hk_drm_attachment_set_add(&cmd->current_cs.cs->compute_attachments,
-                                   push.dst, (uint64_t)push.depth * 4);
-   }
-   return true;
-}
-
 static void
 hk_xfer_copyimagetobuffer2(VkCommandBuffer commandBuffer,
                          const VkCopyImageToBufferInfo2 *pCopyImageToBufferInfo)
@@ -4907,8 +4792,7 @@ hk_xfer_copyimagetobuffer2(VkCommandBuffer commandBuffer,
          &plane, &format) &&
       hk_g17p_padded_rgb_layout(src_image, plane, format, &api_block_B,
                                 &physical_block_B);
-   if (hk_g17p_r32_volume_copy_diagnostic(cmd, src_image, pCopyImageToBufferInfo)) {
-   } else if (padded_rgb) {
+   if (padded_rgb) {
       if (!hk_g17p_copy_padded_rgb_buffer_image(
              cmd, src_image, pCopyImageToBufferInfo->dstBuffer,
              pCopyImageToBufferInfo->regionCount,
