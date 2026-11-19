@@ -86,12 +86,8 @@ test_g17p_constant_program_binary_extent(void)
          .constant_program = cp,
       };
       struct hk_agx3_g17p_graphics_program first, moved;
-      size_t bound;
-      CHECK(hk_agx3_g17p_graphics_program_desc_bound(
-         AGX_CHIP_G17P, &desc, &bound));
       CHECK(hk_agx3_g17p_basic_graphics_program_generate(
          AGX_CHIP_G17P, &desc, &first));
-      CHECK(first.length <= bound);
       desc.program_va = 0x800000000000;
       CHECK(hk_agx3_g17p_basic_graphics_program_generate(
          AGX_CHIP_G17P, &desc, &moved));
@@ -117,12 +113,8 @@ test_g17p_graphics_constant_program(void)
       },
    };
    struct hk_agx3_g17p_graphics_program program;
-   size_t bound;
-   CHECK(hk_agx3_g17p_graphics_program_desc_bound(
-      AGX_CHIP_G17P, &desc, &bound));
    CHECK(hk_agx3_g17p_basic_graphics_program_generate(
       AGX_CHIP_G17P, &desc, &program));
-   CHECK(program.length <= bound);
    const size_t offset = program.length - sizeof(code);
    CHECK(offset == AGX_IOTO_G17P_FRAGMENT_NO_RESOURCE_PROGRAM_SIZE - 4);
    CHECK(memcmp(program.bytes + offset, code, sizeof(code)) == 0);

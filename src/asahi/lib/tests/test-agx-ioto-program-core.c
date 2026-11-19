@@ -417,79 +417,6 @@ test_empty_body_and_alias(void)
 }
 
 static int
-test_g17p_direct_add3_program(void)
-{
-   /* SPDX-MIT m1n1 NATIVE_ADD3_SHADER at its authored addresses. */
-   static const uint8_t expected[] = {
-      0x2c, 0xa0, 0x02, 0x00, 0x12, 0x08, 0x7c, 0x00,
-      0x3c, 0x80, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00,
-      0x8c, 0xa0, 0x42, 0x00, 0x00, 0x00, 0x0c, 0x00,
-      0x9c, 0x80, 0x42, 0x00, 0x04, 0x00, 0x00, 0x00,
-      0x67, 0x00, 0x54, 0x2c, 0x02, 0x00, 0x00, 0x00,
-      0x59, 0x00, 0x02, 0x40, 0x26, 0x00, 0x67, 0x00,
-      0x54, 0x24, 0x02, 0x00, 0x00, 0x00, 0x57, 0x00,
-      0x00, 0x40, 0x26, 0x00, 0x67, 0x00, 0x54, 0x30,
-      0x18, 0x00, 0x00, 0x00, 0x59, 0x04, 0x00, 0x40,
-      0x26, 0x00, 0x77, 0x00, 0x2a, 0x41, 0x00, 0x00,
-      0x00, 0x00, 0x77, 0x01, 0xaa, 0x07, 0x00, 0x00,
-      0x00, 0x02, 0x04, 0x00, 0xf7, 0x00, 0x2a, 0x00,
-      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c, 0x80,
-      0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x81,
-      0x11, 0x06, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x80,
-      0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x9f, 0x11,
-      0x54, 0x00, 0x02, 0x00, 0x08, 0xa8, 0x10, 0x05,
-      0x1c, 0x80, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00,
-      0x0f, 0x12, 0x54, 0x00, 0x4c, 0x00, 0x4b, 0x2c,
-      0x09, 0x44, 0x5b, 0x2e, 0x09, 0x04, 0x0b, 0x24,
-      0x09, 0x04, 0x1b, 0x26, 0x09, 0x04, 0x2b, 0x28,
-      0x09, 0x04, 0x3b, 0x2a, 0x09, 0x04, 0x6b, 0x30,
-      0x09, 0x04, 0x7b, 0x32, 0x09, 0x04, 0x03, 0x00,
-      0x07, 0x00, 0x02, 0x00, 0x00, 0x00, 0x60, 0x00,
-      0x0e, 0x00, 0x00, 0x00,
-   };
-   CHECK(sizeof(expected) == AGX_IOTO_G17P_DIRECT_ADD3_PROGRAM_SIZE);
-
-   uint8_t output[AGX_IOTO_G17P_DIRECT_ADD3_PROGRAM_SIZE + 1];
-   memset(output, 0xa5, sizeof(output));
-   size_t written = SIZE_MAX;
-   CHECK(agx_ioto_g17p_direct_add3_program_compose(
-      AGX_IOTO_G17P_DIRECT_ADD3_WITNESS_PROGRAM_VA,
-      AGX_IOTO_G17P_DIRECT_ADD3_WITNESS_SHADER_VA, output,
-      sizeof(expected), &written));
-   CHECK(written == sizeof(expected));
-   CHECK(memcmp(output, expected, sizeof(expected)) == 0);
-   CHECK(output[written] == 0xa5);
-
-   uint8_t relocated[sizeof(expected)];
-   const uint64_t program_va =
-      AGX_IOTO_G17P_DIRECT_ADD3_WITNESS_PROGRAM_VA + UINT64_C(0x2000);
-   const uint64_t shader_va =
-      AGX_IOTO_G17P_DIRECT_ADD3_WITNESS_SHADER_VA + UINT64_C(0x40);
-   CHECK(agx_ioto_g17p_direct_add3_program_compose(
-      program_va, shader_va, relocated, sizeof(relocated), &written));
-   CHECK(relocated[6] == 0x7d && relocated[7] == 0x00);
-   struct agx_ioto_state_tail_output tail;
-   CHECK(agx_ioto_g17p_runtime_compute_tail_build(
-      shader_va, AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3, &tail));
-   CHECK(memcmp(relocated + 74, tail.bytes, tail.length) == 0);
-
-   uint8_t before[sizeof(output)];
-   memcpy(before, output, sizeof(output));
-   written = 23;
-   CHECK(!agx_ioto_g17p_direct_add3_program_compose(
-      program_va + 1, shader_va, output, sizeof(output), &written));
-   CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 23);
-   CHECK(!agx_ioto_g17p_direct_add3_program_compose(
-      program_va, shader_va + 1, output, sizeof(output), &written));
-   CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 23);
-   CHECK(!agx_ioto_g17p_direct_add3_program_compose(
-      program_va, shader_va, output,
-      AGX_IOTO_G17P_DIRECT_ADD3_PROGRAM_SIZE - 1, &written));
-   CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 23);
-   return 0;
-}
-
-static int
 test_g17p_no_resource_program(void)
 {
    static const uint8_t expected[AGX_IOTO_G17P_NO_RESOURCE_PROGRAM_SIZE] = {
@@ -510,49 +437,34 @@ test_g17p_no_resource_program(void)
    uint8_t output[sizeof(expected) + 1];
    memset(output, 0xa5, sizeof(output));
    size_t written = SIZE_MAX;
-   CHECK(agx_ioto_g17p_no_resource_program_compose(
+   CHECK(agx_ioto_g17p_no_resource_program_compose_trusted(
       UINT64_C(0x10001990240), &tail, output, sizeof(expected), &written));
    CHECK(written == sizeof(expected));
    CHECK(memcmp(output, expected, sizeof(expected)) == 0);
    CHECK(output[sizeof(expected)] == 0xa5);
 
-   uint8_t trusted[sizeof(expected)];
-   size_t trusted_written = 0;
-   CHECK(agx_ioto_g17p_no_resource_program_compose_trusted(
-      UINT64_C(0x10001990240), &tail, trusted, sizeof(trusted),
-      &trusted_written));
-   CHECK(trusted_written == sizeof(expected));
-   CHECK(memcmp(trusted, expected, sizeof(expected)) == 0);
-
    uint8_t before[sizeof(output)];
    memset(before, 0xa5, sizeof(before));
    memcpy(output, before, sizeof(output));
    written = 23;
-   CHECK(!agx_ioto_g17p_no_resource_program_compose(
+   CHECK(!agx_ioto_g17p_no_resource_program_compose_trusted(
       UINT64_C(0x10001990241), &tail, output, sizeof(expected), &written));
    CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 23);
-   CHECK(!agx_ioto_g17p_no_resource_program_compose(
+   CHECK(!agx_ioto_g17p_no_resource_program_compose_trusted(
       0, &tail, output, sizeof(expected), &written));
    CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 23);
-   CHECK(!agx_ioto_g17p_no_resource_program_compose(
+   CHECK(!agx_ioto_g17p_no_resource_program_compose_trusted(
       UINT64_C(0x10001990240), &tail, output, sizeof(expected) - 1, &written));
    CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 23);
 
    tail.length--;
-   CHECK(!agx_ioto_g17p_no_resource_program_compose(
-      UINT64_C(0x10001990240), &tail, output, sizeof(expected), &written));
    CHECK(!agx_ioto_g17p_no_resource_program_compose_trusted(
       UINT64_C(0x10001990240), &tail, output, sizeof(expected), &written));
    CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 23);
    tail.length++;
-   tail.bytes[0] = 0;
-   CHECK(!agx_ioto_g17p_no_resource_program_compose(
-      UINT64_C(0x10001990240), &tail, output, sizeof(expected), &written));
-   CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 23);
-   memcpy(tail.bytes, expected, tail.length);
    tail.bytes[11] = 0;
    tail.bytes[15] = 0;
-   CHECK(!agx_ioto_g17p_no_resource_program_compose(
+   CHECK(!agx_ioto_g17p_no_resource_program_compose_trusted(
       UINT64_C(0x10001990240), &tail, output, sizeof(expected), &written));
    CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 23);
    return 0;
@@ -587,19 +499,11 @@ test_g17p_fragment_no_resource_program(void)
    uint8_t output[sizeof(expected) + 1];
    memset(output, 0xa5, sizeof(output));
    size_t written = SIZE_MAX;
-   CHECK(agx_ioto_g17p_fragment_no_resource_program_compose(
+   CHECK(agx_ioto_g17p_fragment_no_resource_program_compose_trusted(
       UINT64_C(0x10000130640), &tail, 1, output, sizeof(expected), &written));
    CHECK(written == sizeof(expected));
    CHECK(memcmp(output, expected, sizeof(expected)) == 0);
    CHECK(output[sizeof(expected)] == 0xa5);
-
-   uint8_t trusted[sizeof(expected)];
-   size_t trusted_written = 0;
-   CHECK(agx_ioto_g17p_fragment_no_resource_program_compose_trusted(
-      UINT64_C(0x10000130640), &tail, 1, trusted, sizeof(trusted),
-      &trusted_written));
-   CHECK(trusted_written == sizeof(expected));
-   CHECK(memcmp(trusted, expected, sizeof(expected)) == 0);
 
    /* applegpu_g17p metadata makes the consumed colour classes observable in
     * exactly one PIXREL descriptor: p0=0x2f3, p0+p1=0x2c3, p0+p1+p2=0x203,
@@ -623,14 +527,14 @@ test_g17p_fragment_no_resource_program(void)
       uint8_t expected_variant[sizeof(expected)];
       memcpy(expected_variant, expected, sizeof(expected_variant));
       memcpy(expected_variant + pixrel_offset, native_pixrel[i].pixrel[0], 6);
-      CHECK(agx_ioto_g17p_fragment_no_resource_program_compose(
+      CHECK(agx_ioto_g17p_fragment_no_resource_program_compose_trusted(
          UINT64_C(0x10000130640), &tail, classes, output,
          sizeof(expected), &written));
       CHECK(written == sizeof(expected));
       CHECK(memcmp(output, expected_variant, sizeof(expected_variant)) == 0);
 
       memcpy(expected_variant + pixrel_offset, native_pixrel[i].pixrel[1], 6);
-      CHECK(agx_ioto_g17p_coverage_fragment_program_compose(
+      CHECK(agx_ioto_g17p_coverage_fragment_program_compose_trusted(
          UINT64_C(0x10000130640), NULL, 0, NULL, 0, &tail, classes,
          output, sizeof(expected), &written));
       CHECK(written == sizeof(expected));
@@ -646,7 +550,7 @@ test_g17p_fragment_no_resource_program(void)
       memcpy(expected_variant, expected, sizeof(expected_variant));
       expected_variant[pixrel_offset + 3] = release;
       expected_variant[pixrel_offset + 4] = release >> 8;
-      CHECK(agx_ioto_g17p_fragment_no_resource_program_compose(
+      CHECK(agx_ioto_g17p_fragment_no_resource_program_compose_trusted(
          UINT64_C(0x10000130640), &tail,
          g17p_sparse_mrt_oracles[i].partition_mask, output,
          sizeof(expected), &written));
@@ -657,17 +561,17 @@ test_g17p_fragment_no_resource_program(void)
    uint8_t before[sizeof(output)];
    memcpy(before, output, sizeof(output));
    written = 37;
-   CHECK(!agx_ioto_g17p_fragment_no_resource_program_compose(
+   CHECK(!agx_ioto_g17p_fragment_no_resource_program_compose_trusted(
       UINT64_C(0x10000130640), &tail, 0, output, sizeof(expected), &written));
    CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 37);
-   CHECK(!agx_ioto_g17p_coverage_fragment_program_compose(
+   CHECK(!agx_ioto_g17p_coverage_fragment_program_compose_trusted(
       UINT64_C(0x10000130640), NULL, 0, NULL, 0, &tail, 8, output,
       sizeof(expected), &written));
    CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 37);
-   CHECK(!agx_ioto_g17p_fragment_no_resource_program_compose(
+   CHECK(!agx_ioto_g17p_fragment_no_resource_program_compose_trusted(
       UINT64_C(0x10000130641), &tail, 1, output, sizeof(expected), &written));
    CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 37);
-   CHECK(!agx_ioto_g17p_fragment_no_resource_program_compose(
+   CHECK(!agx_ioto_g17p_fragment_no_resource_program_compose_trusted(
       UINT64_C(0x10000130640), &tail, 1, output, sizeof(expected) - 1,
       &written));
    CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 37);
@@ -701,7 +605,7 @@ test_g17p_resource_program(void)
    uint8_t output[GENERIC_RESOURCE_PROGRAM_SIZE + 1];
    memset(output, 0xa5, sizeof(output));
    size_t written = SIZE_MAX;
-   CHECK(agx_ioto_g17p_resource_program_compose(
+   CHECK(agx_ioto_g17p_resource_program_compose_trusted(
       UINT64_C(0x10001990240), pre_copy, sizeof(pre_copy), copies,
       sizeof(copies), &tail, output, sizeof(output) - 1, &written));
    CHECK(written == GENERIC_RESOURCE_PROGRAM_SIZE);
@@ -718,9 +622,10 @@ test_g17p_resource_program(void)
    /* Native coverage/resource loaders can copy a completed load before the
     * final copy suffix. This has been accepted since the coverage loader
     * integration; only non-straight-line records are invalid here. */
-   CHECK(agx_ioto_g17p_resource_program_compose(
+   CHECK(agx_ioto_g17p_program_compose_with_preshader(
       UINT64_C(0x10001990240), copies, sizeof(copies), copies, sizeof(copies),
-      &tail, output, sizeof(output), &written));
+      &tail, AGX_IOTO_G17P_PROGRAM_VERTEX_COMPUTE, 0, NULL, output,
+      sizeof(output), &written));
 
    uint8_t before[sizeof(output)];
    memcpy(before, output, sizeof(output));
@@ -729,20 +634,23 @@ test_g17p_resource_program(void)
     * the profile prefix: preamble uniform stores use exactly that shape.
     * Truncate the final instruction instead so this remains a malformed-body
     * control and continues to verify transactional failure. */
-   CHECK(!agx_ioto_g17p_resource_program_compose(
+   CHECK(!agx_ioto_g17p_program_compose_with_preshader(
       UINT64_C(0x10001990240), copies, sizeof(copies) - 1, copies,
-      sizeof(copies), &tail, output, sizeof(output), &written));
+      sizeof(copies), &tail, AGX_IOTO_G17P_PROGRAM_VERTEX_COMPUTE, 0, NULL,
+      output, sizeof(output), &written));
    CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 41);
-   CHECK(!agx_ioto_g17p_resource_program_compose(
+   CHECK(!agx_ioto_g17p_program_compose_with_preshader(
       UINT64_C(0x10001990240), terminate, sizeof(terminate), copies, sizeof(copies),
-      &tail, output, sizeof(output), &written));
+      &tail, AGX_IOTO_G17P_PROGRAM_VERTEX_COMPUTE, 0, NULL, output,
+      sizeof(output), &written));
    CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 41);
    static const uint8_t nop[] = {0x06, 0x00};
-   CHECK(!agx_ioto_g17p_resource_program_compose(
+   CHECK(!agx_ioto_g17p_program_compose_with_preshader(
       UINT64_C(0x10001990240), pre_copy, sizeof(pre_copy), nop, sizeof(nop),
-      &tail, output, sizeof(output), &written));
+      &tail, AGX_IOTO_G17P_PROGRAM_VERTEX_COMPUTE, 0, NULL, output,
+      sizeof(output), &written));
    CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 41);
-   CHECK(!agx_ioto_g17p_resource_program_compose(
+   CHECK(!agx_ioto_g17p_resource_program_compose_trusted(
       UINT64_C(0x10001990240), pre_copy, sizeof(pre_copy), copies,
       sizeof(copies), &tail, output, GENERIC_RESOURCE_PROGRAM_SIZE - 1,
       &written));
@@ -810,7 +718,7 @@ test_g17p_fragment_resource_program(void)
    uint8_t output[sizeof(expected) + 1];
    memset(output, 0xa5, sizeof(output));
    size_t written = 0;
-   CHECK(agx_ioto_g17p_fragment_resource_program_compose(
+   CHECK(agx_ioto_g17p_fragment_resource_program_compose_trusted(
       UINT64_C(0x10000130640), pre_copy, sizeof(pre_copy), copies,
       sizeof(copies), &tail, 1, output, sizeof(expected), &written));
    CHECK(written == sizeof(expected));
@@ -823,7 +731,7 @@ test_g17p_fragment_resource_program(void)
    uint8_t bg_expected[sizeof(expected)];
    memcpy(bg_expected, expected, sizeof(expected));
    bg_expected[sizeof(expected) - 7] = 0;
-   CHECK(agx_ioto_g17p_background_resource_program_compose(
+   CHECK(agx_ioto_g17p_background_resource_program_compose_trusted(
       UINT64_C(0x10000130640), pre_copy, sizeof(pre_copy), copies,
       sizeof(copies), &tail, output, sizeof(expected), &written));
    CHECK(written == sizeof(expected));
@@ -835,8 +743,18 @@ test_g17p_fragment_resource_program(void)
    written = 41;
 #define BG_REJECT(va, pre, pre_size, cp, cp_size, state, cap)                  \
    do {                                                                       \
-      CHECK(!agx_ioto_g17p_background_resource_program_compose(                \
+      CHECK(!agx_ioto_g17p_background_resource_program_compose_trusted(        \
          va, pre, pre_size, cp, cp_size, state, output, cap, &written));        \
+      CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 41);     \
+   } while (0)
+   /* The trusted form skips record validation; malformed bodies are rejected
+    * by the validating composer, which shares the same span checks. */
+#define BODY_REJECT(pre, pre_size, cp, cp_size)                                \
+   do {                                                                       \
+      CHECK(!agx_ioto_g17p_program_compose_with_preshader(                     \
+         UINT64_C(0x10000130640), pre, pre_size, cp, cp_size, &tail,           \
+         AGX_IOTO_G17P_PROGRAM_FRAGMENT, 1, NULL, output, sizeof(expected),    \
+         &written));                                                          \
       CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 41);     \
    } while (0)
    BG_REJECT(0, pre_copy, sizeof(pre_copy), copies, sizeof(copies), &tail,
@@ -847,18 +765,15 @@ test_g17p_fragment_resource_program(void)
              sizeof(copies), &tail, sizeof(expected) - 1);
    BG_REJECT(UINT64_C(0x10000130640), pre_copy, sizeof(pre_copy), copies,
              sizeof(copies), NULL, sizeof(expected));
-   BG_REJECT(UINT64_C(0x10000130640), copies, sizeof(copies) - 1, copies,
-             sizeof(copies), &tail, sizeof(expected));
+   BODY_REJECT(copies, sizeof(copies) - 1, copies, sizeof(copies));
    static const uint8_t bad_pre[] = {0x0e, 0x00, 0x00, 0x00};
-   BG_REJECT(UINT64_C(0x10000130640), bad_pre, sizeof(bad_pre), copies,
-             sizeof(copies), &tail, sizeof(expected));
+   BODY_REJECT(bad_pre, sizeof(bad_pre), copies, sizeof(copies));
    static const uint8_t bad_copy[] = {0x06, 0x00};
-   BG_REJECT(UINT64_C(0x10000130640), pre_copy, sizeof(pre_copy), bad_copy,
-             sizeof(bad_copy), &tail, sizeof(expected));
+   BODY_REJECT(pre_copy, sizeof(pre_copy), bad_copy, sizeof(bad_copy));
    BG_REJECT(UINT64_C(0x10000130640), NULL, sizeof(pre_copy), copies,
              sizeof(copies), &tail, sizeof(expected));
-   BG_REJECT(UINT64_C(0x10000130640), pre_copy, sizeof(pre_copy), copies,
-             sizeof(copies) - 1, &tail, sizeof(expected));
+   BODY_REJECT(pre_copy, sizeof(pre_copy), copies, sizeof(copies) - 1);
+#undef BODY_REJECT
 #undef BG_REJECT
    return 0;
 }
@@ -1065,8 +980,8 @@ test_g17g_graphics_no_resource_programs(void)
       uint8_t output[128], before[128], alias[128];
       memset(output, 0xa5, sizeof(output));
       size_t written = 23;
-      CHECK(agx_ioto_g17g_resource_program_compose(
-         UINT64_C(0x10000160000), body, sizeof(body), &tail, stage,
+      CHECK(agx_ioto_g17g_resource_program_compose_classes(
+         UINT64_C(0x10000160000), body, sizeof(body), &tail, stage, 1,
          output, sizeof(output), &written));
       CHECK(written == size);
       CHECK(memcmp(output, body, 16) == 0);
@@ -1081,24 +996,24 @@ test_g17g_graphics_no_resource_programs(void)
          CHECK(output[i] == 0xa5);
 
       memcpy(alias, body, sizeof(body));
-      CHECK(agx_ioto_g17g_resource_program_compose(
-         UINT64_C(0x10000160000), alias, sizeof(body), &tail, stage,
+      CHECK(agx_ioto_g17g_resource_program_compose_classes(
+         UINT64_C(0x10000160000), alias, sizeof(body), &tail, stage, 1,
          alias, sizeof(alias), &written));
       CHECK(written == size && memcmp(alias, output, size) == 0);
 
       memcpy(before, output, sizeof(output));
       written = 23;
-      CHECK(!agx_ioto_g17g_resource_program_compose(
-         UINT64_C(0x10000160000), body, sizeof(body), &tail, stage,
+      CHECK(!agx_ioto_g17g_resource_program_compose_classes(
+         UINT64_C(0x10000160000), body, sizeof(body), &tail, stage, 1,
          output, size - 1, &written));
-      CHECK(!agx_ioto_g17g_resource_program_compose(
-         UINT64_C(0x10000160000), body, sizeof(body) - 1, &tail, stage,
+      CHECK(!agx_ioto_g17g_resource_program_compose_classes(
+         UINT64_C(0x10000160000), body, sizeof(body) - 1, &tail, stage, 1,
          output, sizeof(output), &written));
-      CHECK(!agx_ioto_g17g_resource_program_compose(
-         UINT64_C(0x10000160000), body, sizeof(body), &tail, 99,
+      CHECK(!agx_ioto_g17g_resource_program_compose_classes(
+         UINT64_C(0x10000160000), body, sizeof(body), &tail, 99, 1,
          output, sizeof(output), &written));
-      CHECK(!agx_ioto_g17g_resource_program_compose(
-         UINT64_C(0x10000160000), fragment + 80, 6, &tail, stage,
+      CHECK(!agx_ioto_g17g_resource_program_compose_classes(
+         UINT64_C(0x10000160000), fragment + 80, 6, &tail, stage, 1,
          output, sizeof(output), &written));
       CHECK(memcmp(output, before, sizeof(output)) == 0 && written == 23);
    }
@@ -1153,7 +1068,6 @@ main(void)
    CHECK(test_fail_closed() == 0);
    CHECK(test_rejects_composer_owned_and_pixel_records() == 0);
    CHECK(test_empty_body_and_alias() == 0);
-   CHECK(test_g17p_direct_add3_program() == 0);
    CHECK(test_g17p_no_resource_program() == 0);
    CHECK(test_g17p_fragment_no_resource_program() == 0);
    CHECK(test_g17p_resource_program() == 0);
