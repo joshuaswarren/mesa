@@ -1162,8 +1162,20 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * scope (hk_cdm_alias_scope()). */
    struct hk_cs *cs = cmd->current_cs.cs;
    const bool alias_scope = hk_cdm_alias_scope(dev);
-   if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) && dst_kinds &&
-       hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
+   if (cs && HK_PERF(dev, WEAKBARRIER) && !alias_scope &&
+       src_kinds && !(src_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
+       dst_kinds && !(dst_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
+       !hk_sync_xfer_pending(&cmd->sync) &&
+       !hk_dependency_has_host_access(pDependencyInfo) &&
+       (cs->current == cs->weak_barrier_end ||
+        !hk_cdm_visibility_flush_needed(dev, cs, alias_scope))) {
+      /* Keep the preceding launch's weak ordering record in place (do not let
+       * the next application dispatch elide it) and skip the flags-5 cache
+       * flush when testing ordering-only compute barriers. */
+      cs->app_dispatch_end = NULL;
+   } else if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
+              dst_kinds &&
+              hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
       hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_visibility_flush(dev, cs, alias_scope);
    }

@@ -388,6 +388,11 @@ enum hk_perftest {
    HK_PERF_NOBARRIER = BITFIELD_BIT(2),
    HK_PERF_NOBATCH = BITFIELD_BIT(3),
    HK_PERF_NOROBUST = BITFIELD_BIT(4),
+   /* Keep only the preceding launch's weak ordering barrier at pure
+    * compute/transfer pipeline barriers in the same CDM stream instead of
+    * upgrading it to a strong cache flush, when memory is unaliased and no
+    * host or pending graphics transfer dependency is involved. */
+   HK_PERF_WEAKBARRIER = BITFIELD_BIT(5),
 };
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)
