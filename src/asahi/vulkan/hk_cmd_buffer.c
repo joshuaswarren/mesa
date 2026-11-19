@@ -852,7 +852,7 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
 
    list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
       /* G18G CDM streams never merge: launches would add past the
-       * HK_G18_BATCH cap and hk_cs_merge_cdm does not combine
+       * HK_G18_BATCH_LAUNCHES cap and hk_cs_merge_cdm does not combine
        * g18_compute_resources, so the merged command would keep only the
        * first stream's registers, staging and local size. */
       if (cs->type == HK_CS_CDM && last && last->type == HK_CS_CDM && !g18 &&
