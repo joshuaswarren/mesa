@@ -306,7 +306,7 @@ hk_host_maps_classify_self(const void *pointer, uint64_t size)
  * hk_host_alias.h on mremap.
  *
  * Costs two reads of /proc/self/maps up to the lines that cover the range.
- * The imports that began to alias count in alias_live (hk_device_alias_get()),
+ * The imports that began to alias count in alias_live (hk_device_alias_add()),
  * before the import is returned. */
 static VkResult
 hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
@@ -337,17 +337,19 @@ hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
       .maps_alias = hk_host_import_maps_alias(gpu_writes, cls),
    };
 
+   /* The count changes with the set, under its lock, so a free of an
+    * overlapping import never subtracts ahead of this add
+    * (hk_device_alias_add()). The patch runs after the lock is released. */
    simple_mtx_lock(&dev->host_alias.lock);
    const int began = hk_host_imports_add(&dev->host_alias.imports, &import);
+   const bool first = began > 0 && hk_device_alias_add(dev, (uint32_t)began);
    simple_mtx_unlock(&dev->host_alias.lock);
    if (began < 0)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   /* A free of an overlapping import meanwhile may have taken its count off
-    * first: the count wraps for that moment, which only asks for memory
-    * scope, and ends where the set says. */
    mem->host_alias_tracked = true;
-   hk_device_alias_get(dev, began, HK_ALIAS_CAUSE_IMPORT);
+   if (first)
+      hk_device_alias_began(dev, HK_ALIAS_CAUSE_IMPORT);
 
    if (debug_get_option_m5_host_alias_trace())
       fprintf(stderr, "M5_HOST_ALIAS import %p+%#" PRIx64 " writes=%u maps=%u "

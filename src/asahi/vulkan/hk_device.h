@@ -463,9 +463,10 @@ enum hk_perftest {
  *   import of which one of the two is GPU-writable. Not seen: pages moved by
  *   mremap after an import and imported again (hk_host_alias.h).
  *
- * Every count goes through hk_device_alias_get(), which runs the patch
- * below for all live command buffers when the count leaves 0, before the
- * call that creates the resource returns. Memory gets its second GPU address
+ * Every count goes through hk_device_alias_add(); the add that takes the
+ * count from 0 runs the patch below for all live command buffers
+ * (hk_device_alias_began()) before the call that creates the resource
+ * returns. The count never wraps (hk_device_alias_add()). Memory gets its second GPU address
  * only when such a resource is created, so the work recorded or submitted
  * before then is given memory scope at that point:
  *
@@ -575,23 +576,40 @@ enum hk_alias_cause {
 void hk_device_alias_began(struct hk_device *dev, enum hk_alias_cause cause);
 
 /* M5 with host_alias.dynamic: n more live resources through which memory
- * has or may have a second GPU address (alias_live). Called before the
- * call that creates them returns, and before memory can be bound at that
- * address; when the count leaves 0, the command buffers recorded before get
- * memory scope at their patch sites first. Safe against concurrent creation
- * and release: the count is atomic and exactly one caller sees it leave 0;
- * a caller that adds to a count another caller is still patching for is
- * covered by the check at submission (hk_queue_submit()). */
+ * has or may have a second GPU address (alias_live). Returns whether this
+ * call took the count from 0; the caller then runs hk_device_alias_began()
+ * before the call that creates the resources returns, and without holding
+ * host_alias.lock.
+ *
+ * The count never wraps, so exactly the add that takes it from 0 sees n:
+ * every resource's hk_device_alias_put() follows its own add (a resource is
+ * destroyed only after the call that created it returned), and host
+ * imports add and subtract under host_alias.lock together with the set
+ * that says how many of them alias (hk_host_import_track()). A subtraction
+ * that ran ahead of its add could cancel another resource's add back to 0
+ * and skip both its patch and the scope. A caller that adds to a count
+ * another caller is still patching for is covered by the check at
+ * submission (hk_queue_submit()). */
+static inline bool
+hk_device_alias_add(struct hk_device *dev, uint32_t n)
+{
+   if (!dev->host_alias.dynamic || n == 0)
+      return false;
+   return p_atomic_add_return(&dev->alias_live, n) == n;
+}
+
+/* hk_device_alias_add() and, when the count left 0, the patch of every live
+ * command buffer (hk_device_alias_began()), before the call that creates
+ * the resources returns. For callers that hold no lock. */
 static inline void
 hk_device_alias_get(struct hk_device *dev, uint32_t n,
                     enum hk_alias_cause cause)
 {
-   if (!dev->host_alias.dynamic || n == 0)
-      return;
-   if (p_atomic_add_return(&dev->alias_live, n) == n)
+   if (hk_device_alias_add(dev, n))
       hk_device_alias_began(dev, cause);
 }
 
+/* Undoes the add of n resources, after it (hk_device_alias_add()). */
 static inline void
 hk_device_alias_put(struct hk_device *dev, uint32_t n)
 {
