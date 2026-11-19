@@ -3098,8 +3098,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       if (regions && regions->pRegions)
          region = &regions->pRegions[i];
 
-      results[i] = swapchain->queue_present(
-         swapchain, image_index, image_signal_infos[i].present_id, region);
+      results[i] = swapchain->queue_present(swapchain, image_index,
+                                            image_signal_infos[i].present_id,
+                                            region);
       if (results[i] != VK_SUCCESS && results[i] != VK_SUBOPTIMAL_KHR)
          continue;
 
