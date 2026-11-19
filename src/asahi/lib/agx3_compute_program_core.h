@@ -32,12 +32,6 @@ struct agx3_compute_program_desc {
    struct agx3_cdm_direct_template_sources launch_sources;
 };
 
-struct agx3_g17p_direct_add3_program_desc {
-   uint64_t program_va;
-   uint64_t shader_va;
-   struct agx3_cdm_direct_template_sources launch_sources;
-};
-
 /* Runtime-built G17P Ioto program joined to the native A18 Pro CDM pointer
  * form.  The Ioto bytes remain frontend-owned; this object binds their exact
  * allocation to the launch metadata used below. */
@@ -74,10 +68,6 @@ struct agx3_compute_program {
    uint64_t shader_va;
    struct agx3_cdm_direct_template launch_template;
 
-   /* Set only after the exact G17P witness has been composed directly into
-    * the mapped allocation named by program_va. */
-   bool g17p_direct_add3_live_admitted;
-
    /* Set only after a runtime G17P Ioto program has been composed in the
     * allocation named by program_va. */
    bool g17p_native_compute_live_bound;
@@ -103,8 +93,6 @@ struct agx3_compute_program_upload {
 };
 
 #define AGX3_G17S_MINIMAL_COMPUTE_DISPATCH_SIZE \
-   (AGX3_CDM_DIRECT_LAUNCH_SIZE + 4u)
-#define AGX3_G17P_DIRECT_ADD3_DISPATCH_SIZE \
    (AGX3_CDM_DIRECT_LAUNCH_SIZE + 4u)
 #define AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE \
    (AGX3_CDM_DIRECT_LAUNCH_SIZE + 4u)
@@ -169,24 +157,6 @@ bool agx3_compute_program_prepare(const struct agx3_compute_program_desc *desc,
                                   size_t *written,
                                   struct agx3_compute_program *program);
 
-/* Compose the exact G17P direct-add3 Ioto witness and bind it to the native
- * direct-launch template. This host-only preparation does not enable Vulkan
- * compute advertisement. */
-bool agx3_g17p_direct_add3_program_prepare(
-   const struct agx3_g17p_direct_add3_program_desc *desc, void *output,
-   size_t capacity, size_t *written, struct agx3_compute_program *program);
-
-/* Transactional mapped-allocation handoff. cpu and gpu_va identify the same
- * 64-byte-aligned program allocation; success admits only this exact witness
- * for the bounded launch append below. */
-bool agx3_g17p_direct_add3_program_upload_prepare(
-   enum agx_chip chip,
-   const struct agx3_g17p_direct_add3_program_desc *desc,
-   const struct agx3_compute_program_upload *upload, size_t *written,
-   struct agx3_compute_program *program);
-
-bool agx3_g17p_direct_add3_dispatch_ready(enum agx_chip chip);
-
 /* The captured M5 direct CDM record uses the same native program-pointer
  * descriptor. Firmware must still deliver this stream through M5 SKSM. */
 bool agx3_g17g_native_compute_program_bind(
@@ -211,14 +181,6 @@ bool agx3_g17g_native_indirect_compute_launch_append(
 bool agx3_g17g_native_indirect_groups_compute_launch_append(
    const struct agx3_compute_program *program, uint64_t groups_va,
    const uint32_t local_size[3], uint8_t barrier_flags,
-   struct agx3_compute_dispatch_sink *sink);
-
-/* Append the output-positive 40-byte A18 Pro add3 launch and its flags=0
- * barrier.  The witnessed grid is fixed at 64 global threads in groups of
- * 32.  This remains a bring-up API and does not expose a Vulkan capability. */
-bool agx3_g17p_direct_add3_dispatch_append(
-   const struct agx3_compute_program *program,
-   const struct agx3_compute_direct_grid *grid,
    struct agx3_compute_dispatch_sink *sink);
 
 /* Bind a successfully composed runtime Ioto program to its native direct CDM

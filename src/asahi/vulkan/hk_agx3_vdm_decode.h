@@ -64,8 +64,6 @@ hk_shader_binary_version(enum agx_chip chip)
 #define HK_AGX3_G17P_MAX_USER_WORDS 125u
 #define HK_AGX3_G17P_MAX_COEFFICIENTS 127u
 
-bool hk_agx3_shader_binary_version_supported(uint32_t version);
-
 bool hk_agx3_vdm_program_cache_serialize(
    struct blob *blob, const struct agx_vdm_state_update_program_info *info);
 

@@ -35,12 +35,6 @@ bool hk_agx3_g17p_constant_program_from_binary(
    uint64_t allocation_va, size_t allocation_size,
    struct agx_ioto_constant_program *output);
 
-#define HK_AGX3_G17P_PRECOMPILED_DATA_MAX_SIZE 1024u
-
-bool hk_agx3_g17p_precompiled_data_pack(const void *data, size_t size,
-                                      void *output, size_t capacity,
-                                      size_t *written);
-
 struct hk_agx3_ioto_program_desc {
    uint64_t program_va;
    const void *body;
@@ -57,11 +51,6 @@ bool hk_agx3_ioto_program_generate(
 bool hk_agx3_ioto_program_generate_no_pixrel(
    enum agx_chip chip, const struct hk_agx3_ioto_program_desc *desc,
    const struct agx_ioto_preshader_desc *preshader, void *output,
-   size_t capacity, size_t *written);
-
-bool hk_agx3_g17p_no_resource_program_generate(
-   enum agx_chip chip, uint64_t program_va,
-   const struct agx_ioto_state_tail_output *packed_tail, void *output,
    size_t capacity, size_t *written);
 
 struct hk_agx3_g17p_graphics_program_desc {
@@ -223,78 +212,6 @@ bool hk_agx3_g17p_basic_graphics_program_generate(
    enum agx_chip chip, const struct hk_agx3_g17p_graphics_program_desc *desc,
    struct hk_agx3_g17p_graphics_program *program);
 
-enum hk_agx3_g17p_rt0_bg_op {
-   HK_AGX3_G17P_RT0_BG_CLEAR,
-   HK_AGX3_G17P_RT0_BG_RELOAD,
-   HK_AGX3_G17P_RT0_BG_NONE,
-};
-
-#define HK_AGX3_G17P_RGBA8_MRT_CLEAR_PUSH_HALFS 20u
-
-#define HK_AGX3_G17P_R11G11B10_MRT_CLEAR_PUSH_HALFS 18u
-
-#define HK_AGX3_G17P_WBOIT_MRT_CLEAR_PUSH_HALFS 14u
-
-#define HK_AGX3_G17P_RT0_CLEAR_PUSH_HALFS 12u
-
-bool hk_agx3_g17p_rt0_bg_resource_spec(
-   enum agx_chip chip, enum hk_agx3_g17p_rt0_bg_op op, uint64_t *resource_spec);
-
-struct hk_agx3_g17p_rt0_bg_program_desc {
-   uint64_t program_va;
-   uint64_t shader_va;
-   uint64_t clear_value_va;
-   uint64_t texture_pointer_va;
-   uint64_t sampler_pointer_va;
-   uint32_t shader_binary_size;
-   uint32_t scratch_size;
-   uint16_t nr_gprs;
-   uint16_t staging_halfs;
-   uint16_t clear_push_halfs;
-   bool staging_known;
-   enum hk_agx3_g17p_rt0_bg_op op;
-   struct agx_ioto_g17p_imageblock imageblock;
-};
-
-struct hk_agx3_g17p_rt0_bg_program {
-   uint8_t bytes[AGX_IOTO_G17P_RT0_RELOAD_PROGRAM_MAX_SIZE];
-   uint16_t length;
-};
-
-bool hk_agx3_g17p_rt0_bg_program_generate(
-   enum agx_chip chip, const struct hk_agx3_g17p_rt0_bg_program_desc *desc,
-   struct hk_agx3_g17p_rt0_bg_program *program);
-
-bool hk_agx3_g17p_rt0_bg_shader_resources_match(
-   enum hk_agx3_g17p_rt0_bg_op op, unsigned push_count, bool uses_txf);
-
-struct hk_agx3_g17p_rt0_eot_program_desc {
-   uint64_t program_va;
-   uint64_t shader_va;
-   /* Raw 32-byte-aligned GPU VA to the owned RT0 PBE32 descriptor. The
-    * CProg publishes this pointer in uniform halves 0..3, not its pointee. */
-   uint64_t pbe_argument_va;
-   /* RT0 byte offset inside one imageblock sample (native kind5 argument).
-    * Published as a zero-extended32-bit value in uniform halves4..5. */
-   uint8_t imageblock_offset_B;
-   uint8_t attachment_count;
-   uint8_t imageblock_offset1_B;
-   uint32_t shader_binary_size;
-   uint32_t scratch_size;
-   uint16_t nr_gprs;
-   uint16_t staging_halfs;
-   struct agx_ioto_g17p_imageblock imageblock;
-};
-
-struct hk_agx3_g17p_rt0_eot_program {
-   uint8_t bytes[AGX_IOTO_G17P_RT0_EOT_PROGRAM_SIZE];
-   uint16_t length;
-};
-
-bool hk_agx3_g17p_rt0_eot_program_generate(
-   enum agx_chip chip, const struct hk_agx3_g17p_rt0_eot_program_desc *desc,
-   struct hk_agx3_g17p_rt0_eot_program *program);
-
 /* Classify the ordinary non-multiview, one-layer fast path. */
 bool hk_agx3_g17p_single_layer_rendering(uint32_t view_mask,
                                         uint32_t layer_count);
@@ -318,16 +235,6 @@ bool hk_agx3_g17p_direct_color_resolve_supported(
    bool has_resolve_target, bool average_resolve, bool store_source);
 
 #define HK_AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE 6144u
-bool hk_agx3_g17p_direct_add3_program_upload_prepare(
-   enum agx_chip chip,
-   const struct agx3_g17p_direct_add3_program_desc *desc,
-   const struct agx3_compute_program_upload *upload, size_t *written,
-   struct agx3_compute_program *program);
-
-bool hk_agx3_g17p_direct_add3_dispatch_append(
-   const struct agx3_compute_program *program,
-   const struct agx3_compute_direct_grid *grid,
-   struct agx3_compute_dispatch_sink *sink);
 
 #define HK_AGX3_G17P_MAX_ROOT_SETS            16u
 
@@ -372,22 +279,6 @@ struct hk_agx3_g17p_compute_program {
 bool hk_agx3_g17p_compute_program_generate(
    enum agx_chip chip, const struct hk_agx3_g17p_compute_program_desc *desc,
    struct hk_agx3_g17p_compute_program *program);
-
-bool hk_agx3_g17p_compute_program_rebind_published(
-   struct agx3_compute_program *launch, uint64_t published_va);
-
-bool hk_agx3_g17p_compute_program_relocate_single_range(
-   enum agx_chip chip, const struct hk_agx3_g17p_compute_program_desc *desc,
-   const struct agx3_ioto_uniform_range *template_range,
-   const struct hk_agx3_g17p_compute_program *template_program,
-   struct hk_agx3_g17p_compute_program *program);
-
-bool hk_agx3_g17p_compute_program_relocate_single_range_to(
-   enum agx_chip chip, const struct hk_agx3_g17p_compute_program_desc *desc,
-   const struct agx3_ioto_uniform_range *template_range,
-   const struct hk_agx3_g17p_compute_program *template_program,
-   void *program_bytes, size_t capacity, uint16_t *program_length,
-   struct agx3_compute_program *launch);
 
 bool hk_agx3_g17p_native_compute_dispatch_append(
    const struct agx3_compute_program *program,
