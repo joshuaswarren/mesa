@@ -18,8 +18,6 @@
  * This is the shape lavapipe uses, and it is used here for the same reason:
  * the AGX3 backend has no way to branch to an address the command stream
  * supplies, so a real shader-binding-table dispatch is not expressible today.
- * docs/G17P_RAYTRACING_PIPELINE_ABI.md records what that costs and what would
- * have to be grounded to change it.
  */
 
 #ifndef HK_RAY_TRACING_PIPELINE_H
