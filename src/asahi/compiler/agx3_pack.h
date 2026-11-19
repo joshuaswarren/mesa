@@ -21,7 +21,6 @@ extern "C" {
 #define AGX3_IADD_U32_REG_REG_MAX_LENGTH 12
 #define AGX3_FADD_F32_REG_REG_LENGTH 6
 #define AGX3_FMUL_F32_REG_REG_LENGTH 6
-#define AGX3_FMUL_F32_REG_REG_LONG_LENGTH 14
 #define AGX3_FMA_F32_REG_REG_REG_MAX_LENGTH 16
 #define AGX3_FMIN_F32_REG_REG_MAX_LENGTH 14
 #define AGX3_FMAX_F32_REG_REG_MAX_LENGTH 14
@@ -30,7 +29,6 @@ extern "C" {
 #define AGX3_F32_RINT_REG_LENGTH 10
 #define AGX3_F32_RCP_REG_LENGTH 10
 #define AGX3_F32_RSQRT_REG_LENGTH 10
-#define AGX3_I32_COMPARE_SELECT_IMM_5_7_REG_REG_MAX_LENGTH 14
 #define AGX3_F32_TO_INT_RTZ_REG_LENGTH 10
 #define AGX3_BIT_AND_U32_REG_REG_LENGTH 10
 #define AGX3_BIT_OR_U32_REG_REG_LENGTH 10
@@ -42,7 +40,6 @@ extern "C" {
 #define AGX3_LSR_U32_REG_REG_MAX_LENGTH 14
 #define AGX3_IMUL_U32_REG_REG_MAX_LENGTH 14
 #define AGX3_IMADD_U32_REG_REG_REG_MAX_LENGTH 14
-#define AGX3_YIELD_I16_REG_LENGTH 6
 #define AGX3_THREADGROUP_BARRIER_LENGTH 6
 #define AGX3_SCOPED_BARRIER_MAX_LENGTH 12
 #define AGX3_SIMD_BROADCAST_F32_IMM_LENGTH 10
@@ -76,11 +73,6 @@ struct agx3_encoded_fadd_f32_reg_reg {
 
 struct agx3_encoded_fmul_f32_reg_reg {
    uint8_t bytes[AGX3_FMUL_F32_REG_REG_LENGTH];
-   uint8_t length;
-};
-
-struct agx3_encoded_fmul_f32_reg_reg_long {
-   uint8_t bytes[AGX3_FMUL_F32_REG_REG_LONG_LENGTH];
    uint8_t length;
 };
 
@@ -121,16 +113,6 @@ struct agx3_encoded_f32_rcp_reg {
 
 struct agx3_encoded_f32_rsqrt_reg {
    uint8_t bytes[AGX3_F32_RSQRT_REG_LENGTH];
-   uint8_t length;
-};
-
-enum agx3_i32_compare_predicate {
-   AGX3_I32_COMPARE_EQ = 0,
-   AGX3_I32_COMPARE_SLT = 1,
-};
-
-struct agx3_encoded_i32_compare_select_imm_5_7_reg_reg {
-   uint8_t bytes[AGX3_I32_COMPARE_SELECT_IMM_5_7_REG_REG_MAX_LENGTH];
    uint8_t length;
 };
 
@@ -191,11 +173,6 @@ struct agx3_encoded_imul_u32_reg_reg {
 
 struct agx3_encoded_imadd_u32_reg_reg_reg {
    uint8_t bytes[AGX3_IMADD_U32_REG_REG_REG_MAX_LENGTH];
-   uint8_t length;
-};
-
-struct agx3_encoded_yield_i16_reg {
-   uint8_t bytes[AGX3_YIELD_I16_REG_LENGTH];
    uint8_t length;
 };
 
@@ -383,25 +360,6 @@ bool agx3_pack_fmul_f32_reg_reg(
    uint16_t src1, struct agx3_encoded_fmul_f32_reg_reg *out);
 
 /*
- * Encode the exact fourteen-byte AGX3c register-register f32 multiply
- * selection witnessed byte-for-byte on G17G and G17S.  Their L_fmul ladders
- * are identical and directly exercise the destination field.  G17S's P2f_mul
- * specimen independently correlates f2 with the result, f35 with `src0`, and
- * f18 with `src1`; Apple's pinned AGX3c table supplies the exact deposits for
- * those same fields at encoding point 3.
- *
- * Operands are conservatively restricted to even half-register indices in
- * 0..126 because the direct target artifacts do not exercise register bit 7.
- * Only the fixed anonymous/context selection from the final L operation and
- * P2f_mul is accepted.  The alternate repeated-L selection, compact form,
- * other modifiers, and all non-AGX3c encodings fail closed.  Chip-level gates
- * remain the caller's responsibility.
- */
-bool agx3_pack_fmul_f32_reg_reg_long(
-   enum agx_isa_encoding encoding, uint16_t dest, uint16_t src0,
-   uint16_t src1, struct agx3_encoded_fmul_f32_reg_reg_long *out);
-
-/*
  * Encode the exact four-register f32 fused multiply-add selection
  * emitted by the pinned Apple compiler corpus.  P3f_fma correlates f2 with
  * the result, f35/f18 with the two multiplicands, and f52 with the addend on
@@ -557,24 +515,6 @@ bool agx3_pack_f32_rcp_reg(
 bool agx3_pack_f32_rsqrt_reg(
    enum agx_isa_encoding encoding, uint16_t dest, uint16_t src,
    struct agx3_encoded_f32_rsqrt_reg *out);
-
-/*
- * Encode the exact fused i32 compare and immediate select emitted by
- * `(a OP b) ? 5 : 7` on the nine directly witnessed compiler identities.
- * Only integer equality and signed less-than are exposed.  Independent live
- * and dual-compare kernels correlate the destination and both compare-source
- * fields, and Apple's composer reproduces every even d/a/b combination in
- * 0..126 for both predicates on each table variant.
- *
- * The fixed select literals are part of this API's name and encoding.  Other
- * predicates, arbitrary immediate or register-selected results, alternate
- * dependency contexts, high registers, scheduling, control-flow lowering,
- * and runtime use remain closed.  Chip gates belong to the caller.
- */
-bool agx3_pack_i32_compare_select_imm_5_7_reg_reg(
-   enum agx_isa_encoding encoding, enum agx3_i32_compare_predicate predicate,
-   uint16_t dest, uint16_t src0, uint16_t src1,
-   struct agx3_encoded_i32_compare_select_imm_5_7_reg_reg *out);
 
 /*
  * Encode the exact scalar f32-to-i32/u32 language-cast selections
@@ -781,25 +721,6 @@ bool agx3_pack_imadd_u32_reg_reg_reg(
    struct agx3_encoded_imadd_u32_reg_reg_reg *out);
 
 /*
- * Encode the source-grounded i16 register form of `yield`.  Forced-live
- * n=0..4 ladders correlate Apple's f2 field with the get_sr/iadd producer
- * half-registers on G15G/S/D, G16G/P/S, G17P, and G17G/S.  Independent value
- * probes change gid-relative values while holding the source register fixed;
- * the yield encoding remains unchanged.
- *
- * This is deliberately the no-kill, scheduler-neutral form: f11/f13 and all
- * common scheduler/context fields are zero.  Compiler captures establish f13
- * as source last-use/kill context and vary f16 with surrounding scheduling,
- * so neither is exposed here.  Immediate/constant operand selections, kill
- * variants, scheduler fields, G15G's standalone nops, AGX3c's unprobed ninth
- * register bit, and every unknown bit fail closed.  AGX3b is table-bounded to
- * half-registers 0..191; AGX3c is bounded to Mesa's modeled 0..255 file.
- */
-bool agx3_pack_yield_i16_reg(
-   enum agx_isa_encoding encoding, uint16_t src,
-   struct agx3_encoded_yield_i16_reg *out);
-
-/*
  * Encode the fixed workgroup barrier emitted for air.wg.barrier.
  * Forced n=0..4 occurrence ladders reproduce the exact six-byte AGX3b form on
  * G15G/G15S/G16G/G17P and the distinct six-byte AGX3c form on G17S.  Apple's
@@ -845,25 +766,6 @@ bool agx3_pack_scoped_barrier_wait(enum agx_isa_encoding encoding,
  */
 bool agx3_pack_end(enum agx_isa_encoding encoding,
                    struct agx3_encoded_end *out);
-
-/*
- * Encode a canonical terminal `end` carrying the observed one-shot
- * wait-fence attachment set.  Apple's compiler accepts only literal slots
- * 0..5 on the pinned AGX3b targets and slots 0..7 on G17G/G17S (AGX3c).
- * Consecutive waits before `end` accumulate as an idempotent, order-independent
- * bit set.  Exhaustive compiler replays cover all 64 AGX3b and 256 AGX3c sets,
- * and Apple's independently extracted `end` tables reproduce every byte.
- *
- * This API models only the dependency bits already consumed by a terminal
- * `end`.  It is not a standalone `wait.fence` instruction, does not attach a
- * wait to an arbitrary following instruction, and establishes no broader
- * scheduling, memory-ordering, lowering, or submission semantics.  AGX3b
- * slots 6 and 7 are table gaps and compiler-rejected, so masks containing
- * either bit fail closed.  All other `end` fields remain canonical zero.
- */
-bool agx3_pack_end_with_wait_fence_mask(
-   enum agx_isa_encoding encoding, uint8_t wait_fence_mask,
-   struct agx3_encoded_end *out);
 
 /*
  * Encode the fixed, zero-argument llvm.agx3.update.node intrinsic

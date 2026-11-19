@@ -286,49 +286,6 @@ agx3_pack_fmul_f32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
 }
 
 bool
-agx3_pack_fmul_f32_reg_reg_long(
-   enum agx_isa_encoding encoding, uint16_t dest, uint16_t src0,
-   uint16_t src1, struct agx3_encoded_fmul_f32_reg_reg_long *out)
-{
-   if (out == NULL || encoding != AGX_ISA_ENCODING_AGX3C || dest >= 128 ||
-       src0 >= 128 || src1 >= 128 || (dest & 1) != 0 || (src0 & 1) != 0 ||
-       (src1 & 1) != 0)
-      return false;
-
-   /*
-    * Exact f32mul.ep3 selection from the final G17G/G17S L operation and
-    * G17S P2f_mul.  Anonymous selector fields, including f46, remain fixed.
-    */
-   const uint8_t canonical[AGX3_FMUL_F32_REG_REG_LONG_LENGTH] = {
-      0x29, 0x00, 0x05, 0x10, 0x22, 0x80, 0xa0,
-      0x02, 0x1c, 0x00, 0x20, 0x00, 0x00, 0x10,
-   };
-   memcpy(out->bytes, canonical, sizeof(canonical));
-
-   /* f2: d1 -> b0[4], d2..3 -> b7[3:4], d4 -> b0[7],
-    *     d5 -> b7[5], d6 -> b2[7]. */
-   out->bytes[0] |= (dest & 0x02) << 3;
-   out->bytes[7] |= (dest & 0x0c) << 1;
-   out->bytes[0] |= (dest & 0x10) << 3;
-   out->bytes[7] |= dest & 0x20;
-   out->bytes[2] |= (dest & 0x40) << 1;
-
-   /* f35: s0[1] -> b8[7], s0[2:6] -> b9[0:4]. */
-   out->bytes[8] |= (src0 & 0x02) << 6;
-   out->bytes[9] |= (src0 & 0x7c) >> 2;
-
-   /* f18: s1[1] -> b1[1], s1[2:4] -> b3[5:7],
-    *      s1[5] -> b12[1], s1[6] -> b8[0]. */
-   out->bytes[1] |= src1 & 0x02;
-   out->bytes[3] |= (src1 & 0x1c) << 3;
-   out->bytes[12] |= (src1 & 0x20) >> 4;
-   out->bytes[8] |= (src1 & 0x40) >> 6;
-
-   out->length = sizeof(canonical);
-   return true;
-}
-
-bool
 agx3_pack_fma_f32_reg_reg_reg(
    enum agx_isa_encoding encoding, uint16_t dest, uint16_t mul0,
    uint16_t mul1, uint16_t addend,
@@ -763,79 +720,6 @@ agx3_pack_f32_rsqrt_reg(enum agx_isa_encoding encoding, uint16_t dest,
    out->bytes[8] |= (src & 0x40) >> 6;
 
    out->length = sizeof(canonical);
-   return true;
-}
-
-bool
-agx3_pack_i32_compare_select_imm_5_7_reg_reg(
-   enum agx_isa_encoding encoding, enum agx3_i32_compare_predicate predicate,
-   uint16_t dest, uint16_t src0, uint16_t src1,
-   struct agx3_encoded_i32_compare_select_imm_5_7_reg_reg *out)
-{
-   if (out == NULL || !is_agx3_encoding(encoding) ||
-       (predicate != AGX3_I32_COMPARE_EQ &&
-        predicate != AGX3_I32_COMPARE_SLT) ||
-       dest >= 128 || src0 >= 128 || src1 >= 128 || (dest & 1) != 0 ||
-       (src0 & 1) != 0 || (src1 & 1) != 0)
-      return false;
-
-   memset(out, 0, sizeof(*out));
-
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      static const uint8_t canonical_eq[] = {
-         0x02, 0x01, 0x1f, 0x01, 0x26, 0x85, 0x07, 0xc0, 0x20, 0x87,
-      };
-      static const uint8_t canonical_slt[] = {
-         0x02, 0x01, 0x1f, 0x01, 0x22, 0x85, 0x07, 0xc0, 0x20, 0x87,
-      };
-      const uint8_t *canonical = predicate == AGX3_I32_COMPARE_EQ
-                                    ? canonical_eq
-                                    : canonical_slt;
-      memcpy(out->bytes, canonical, sizeof(canonical_eq));
-
-      /* Apple f3: d1..4 -> b0[4:7], d5..6 -> b2[6:7]. */
-      out->bytes[0] |= (dest & 0x1e) << 3;
-      out->bytes[2] |= (dest & 0x60) << 1;
-
-      /* Apple f35 and f50 are contiguous even-register fields. */
-      out->bytes[1] |= src0 & 0x7e;
-      out->bytes[3] |= src1 & 0x7e;
-      out->length = sizeof(canonical_eq);
-      return true;
-   }
-
-   static const uint8_t canonical_eq[] = {
-      0x22, 0x00, 0x07, 0x0b, 0x27, 0x00, 0xac,
-      0x02, 0x02, 0x80, 0x64, 0x0c, 0x21, 0x10,
-   };
-   static const uint8_t canonical_slt[] = {
-      0x22, 0x00, 0x47, 0x0b, 0x27, 0x00, 0xac,
-      0x02, 0x02, 0x80, 0x64, 0x0c, 0x21, 0x10,
-   };
-   const uint8_t *canonical = predicate == AGX3_I32_COMPARE_EQ
-                                 ? canonical_eq
-                                 : canonical_slt;
-   memcpy(out->bytes, canonical, sizeof(canonical_eq));
-
-   /* Apple f2: d1 -> b0[4], d2..3 -> b7[3:4], d4 -> b0[7],
-    * d5 -> b7[5], d6 -> b2[7]. */
-   out->bytes[0] |= (dest & 0x02) << 3;
-   out->bytes[7] |= (dest & 0x0c) << 1;
-   out->bytes[0] |= (dest & 0x10) << 3;
-   out->bytes[7] |= dest & 0x20;
-   out->bytes[2] |= (dest & 0x40) << 1;
-
-   /* Apple f16: s0[1] -> b1[1], s0[2:4] -> b3[5:7],
-    * s0[5] -> b5[7], s0[6] -> b6[0]. */
-   out->bytes[1] |= src0 & 0x02;
-   out->bytes[3] |= (src0 & 0x1c) << 3;
-   out->bytes[5] |= (src0 & 0x20) << 2;
-   out->bytes[6] |= (src0 & 0x40) >> 6;
-
-   /* Apple f31: s1[1] -> b8[7], s1[2:6] -> b9[0:4]. */
-   out->bytes[8] |= (src1 & 0x02) << 6;
-   out->bytes[9] |= (src1 & 0x7c) >> 2;
-   out->length = sizeof(canonical_eq);
    return true;
 }
 
@@ -1549,38 +1433,6 @@ agx3_pack_imadd_u32_reg_reg_reg(
 }
 
 bool
-agx3_pack_yield_i16_reg(enum agx_isa_encoding encoding, uint16_t src,
-                        struct agx3_encoded_yield_i16_reg *out)
-{
-   if (!is_agx3_encoding(encoding) || out == NULL ||
-       src >= (encoding == AGX_ISA_ENCODING_AGX3B ? 192 : 256))
-      return false;
-
-   memset(out, 0, sizeof(*out));
-
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      const uint8_t canonical[AGX3_YIELD_I16_REG_LENGTH] = {
-         0x87, 0x04, 0x54, 0x00, 0x04, 0x00,
-      };
-      memcpy(out->bytes, canonical, sizeof(canonical));
-      out->bytes[3] = src;
-   } else {
-      const uint8_t canonical[AGX3_YIELD_I16_REG_LENGTH] = {
-         0x0f, 0x00, 0x00, 0x02, 0x00, 0x00,
-      };
-      memcpy(out->bytes, canonical, sizeof(canonical));
-
-      /* f2[0:6] -> w0[8:14], f2[7] -> w1[4].  The table also
-       * contains f2[8], but that register space is deliberately closed. */
-      out->bytes[1] = src & 0x7f;
-      out->bytes[2] = (src >> 3) & 0x10;
-   }
-
-   out->length = AGX3_YIELD_I16_REG_LENGTH;
-   return true;
-}
-
-bool
 agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
                          enum agx3_barrier_scope scope,
                          struct agx3_encoded_scoped_barrier *out)
@@ -1816,23 +1668,6 @@ agx3_pack_end(enum agx_isa_encoding encoding, struct agx3_encoded_end *out)
 
    memset(out, 0, sizeof(*out));
    out->bytes[0] = 0x0e;
-   out->length = AGX3_END_LENGTH;
-   return true;
-}
-
-bool
-agx3_pack_end_with_wait_fence_mask(enum agx_isa_encoding encoding,
-                                   uint8_t wait_fence_mask,
-                                   struct agx3_encoded_end *out)
-{
-   if (!is_agx3_encoding(encoding) || out == NULL ||
-       (encoding == AGX_ISA_ENCODING_AGX3B && (wait_fence_mask & 0xc0)))
-      return false;
-
-   memset(out, 0, sizeof(*out));
-   out->bytes[0] = 0x0e;
-   out->bytes[1] = (wait_fence_mask & 0x3f) << 2;
-   out->bytes[2] = ((wait_fence_mask >> 6) & 0x03) << 1;
    out->length = AGX3_END_LENGTH;
    return true;
 }
