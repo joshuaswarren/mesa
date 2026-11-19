@@ -1036,6 +1036,13 @@ struct agx_context {
    uint16_t sample_mask;
    struct pipe_framebuffer_state framebuffer;
 
+   /* A colourless framebuffer bound while an active render batch uses the same
+    * depth/stencil surface is drawn inside that batch with colour writes
+    * masked. framebuffer then holds that batch's key and zs_merge_real the
+    * state the app bound. */
+   bool zs_merge;
+   struct pipe_framebuffer_state zs_merge_real;
+
    uint32_t poly_stipple[32];
 
    struct pipe_query *cond_query;

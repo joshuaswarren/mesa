@@ -504,7 +504,10 @@ agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
    }
 
    if (op & ASAHI_SAVE_FRAMEBUFFER) {
-      util_blitter_save_framebuffer(blitter, &ctx->framebuffer);
+      /* Restore what the app bound, not the batch a colourless pass was
+       * merged into (agx_try_zs_merge), or later draws would write colour. */
+      util_blitter_save_framebuffer(
+         blitter, ctx->zs_merge ? &ctx->zs_merge_real : &ctx->framebuffer);
    }
 
    if (op & ASAHI_SAVE_TEXTURES) {
