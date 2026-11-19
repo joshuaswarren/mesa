@@ -115,7 +115,6 @@ agx_nir_m5_canonicalize_empty_mesh(nir_shader *s)
 struct mesh_layout {
    unsigned output_base, primitive_count, vertex_count, position;
    unsigned plane_stride, planes, bytes;
-   bool storage_probe;
    const struct agx_m5_mesh_varyings *varyings;
 
    /* Per-primitive outputs (see agx_m5_mesh_unwelds): the API body writes
@@ -199,9 +198,6 @@ mesh_layout(const nir_shader *s, const struct agx_m5_mesh_varyings *varyings)
       .vertex_count = base + count + 4, .position = base + position,
       .plane_stride = stride, .planes = varyings->size,
       .bytes = ALIGN_POT(position + varyings->size * stride, 64),
-      .storage_probe = getenv("ASAHI_MESH_PP_PROBE") != NULL &&
-                       (!strcmp(getenv("ASAHI_MESH_PP_PROBE"), "1") ||
-                        !strcmp(getenv("ASAHI_MESH_PP_PROBE"), "payload")),
       .varyings = varyings,
       .unweld = unweld,
       .export_vertices = export_vertices,
@@ -275,9 +271,6 @@ mesh_layout_provoking(const nir_shader *s,
       .output_base = base, .primitive_count = base + count,
       .vertex_count = base + count + 4, .position = base + position,
       .planes = varyings->size,
-      .storage_probe = getenv("ASAHI_MESH_PP_PROBE") != NULL &&
-                       (!strcmp(getenv("ASAHI_MESH_PP_PROBE"), "1") ||
-                        !strcmp(getenv("ASAHI_MESH_PP_PROBE"), "payload")),
       .varyings = varyings,
       .layer_plane = -1, .viewport_plane = -1,
       .provoking = true,
@@ -367,37 +360,11 @@ lower(nir_builder *b,nir_intrinsic_instr *i,void *data)
       const unsigned slot=vertex_output_slot(i);
       const unsigned first=first_plane(layout->varyings,slot);
       unsigned component=nir_intrinsic_component(i);
-      nir_def *value=widen_output(b,i,i->src[0].ssa), *probe=NULL;
-      if (slot == VARYING_SLOT_VAR0 && layout->storage_probe) {
-         /* Opt-in read-only hardware probe (ASAHI_MESH_PP_PROBE=1): publish the
-          * native per-primitive record base SR64/SR65 and the workgroup index
-          * through the flat VAR0 planes instead of the API colour. No pointer
-          * is dereferenced; the fragment dumps the raw bits as pixels. */
-         const char *pe = getenv("ASAHI_MESH_PP_PROBE");
-         const bool payload_probe = pe && !strcmp(pe, "payload");
-         nir_def *storage = payload_probe
-            ? nir_load_mesh_payload_address_agx(b)
-            : nir_load_mesh_primitive_storage_agx(b);
-         if (payload_probe) {
-            /* Bytes of SR62 (even workgroups) or SR63 (odd) as UNORM8. */
-            nir_def *odd = nir_i2b(b, nir_iand_imm(b, nir_channel(b, nir_load_workgroup_id(b), 0), 1));
-            nir_def *word = nir_bcsel(b, odd, nir_channel(b, storage, 1), nir_channel(b, storage, 0));
-            nir_def *bytes[4];
-            for (unsigned k = 0; k < 4; ++k)
-               bytes[k] = nir_fmul_imm(b, nir_u2f32(b, nir_iand_imm(b, nir_ushr_imm(b, word, 8 * k), 0xff)), 1.0 / 255.0);
-            storage = NULL;
-            probe = nir_vec(b, bytes, 4);
-         }
-         if (storage)
-         probe=nir_vec4(b,nir_channel(b,storage,0),nir_channel(b,storage,1),
-                        nir_channel(b,nir_load_workgroup_id(b),0),
-                        nir_load_local_invocation_index(b));
-      }
+      nir_def *value=widen_output(b,i,i->src[0].ssa);
       u_foreach_bit(c,nir_intrinsic_write_mask(i)) {
          nir_def *address=nir_iadd_imm(b,element,
             vertex_plane_address(layout,first+component+c));
-         nir_store_shared(b,probe ? nir_channel(b,probe,component+c)
-                                  : nir_channel(b,value,c),address,
+         nir_store_shared(b,nir_channel(b,value,c),address,
                             .write_mask=1,.align_mul=4);
          if (slot == VARYING_SLOT_CLIP_DIST0 ||
              slot == VARYING_SLOT_CLIP_DIST1) {

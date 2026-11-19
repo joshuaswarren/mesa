@@ -558,12 +558,6 @@ agx_link_varyings_vs_fs(void *out, struct agx_varyings_vs *vs,
          } else if (b.slot == VARYING_SLOT_PRIMITIVE_ID &&
                     !vs->slots[VARYING_SLOT_PRIMITIVE_ID]) {
             cfg.source = AGX_COEFFICIENT_SOURCE_PRIMITIVE_ID;
-            /* Opt-in M5 mesh diagnostic: sweep the 3-bit VIT source of the
-             * PrimitiveID row to locate the native per-primitive offset
-             * coefficient (ASAHI_MESH_PP_VIT_SOURCE=0..7). */
-            const char *probe_source = getenv("ASAHI_MESH_PP_VIT_SOURCE");
-            if (probe_source)
-               cfg.source = atoi(probe_source) & 7;
             *generate_primitive_id = true;
          } else if (b.slot == VARYING_SLOT_POS) {
             assert(b.offset >= 2 && "gl_Position.xy are not varyings");
