@@ -843,7 +843,6 @@ agx_m5_dispatch_barrier_flags(const struct agx_device *dev)
    return dev->chip == AGX_CHIP_G18G ? 0 : 5;
 }
 
-DEBUG_GET_ONCE_BOOL_OPTION(m5_swtnl_tess, "ASAHI_M5_SWTNL_TESS", false)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_gpu_tess, "ASAHI_M5_GPU_TESS", false)
 
 /* Can the CPU path (agx_swtnl.c) tessellate? The draw module tessellates only
@@ -853,7 +852,7 @@ agx_swtnl_can_tessellate(void)
 {
    static int can = -1;
    if (can < 0)
-      can = draw_get_option_use_llvm() && !getenv("AGX_SWTNL_NO_LLVM");
+      can = draw_get_option_use_llvm();
    return can;
 }
 
@@ -861,14 +860,12 @@ agx_swtnl_can_tessellate(void)
  * cannot: in a build without LLVM the draw module drops every patch. With
  * LLVM the CPU path is the qualified one. The GPU path still loses some
  * shapes, among them tessellation feeding a geometry shader, which M5 does
- * not rasterize natively yet. ASAHI_M5_SWTNL_TESS=1 forces the CPU path,
- * ASAHI_M5_GPU_TESS=1 the GPU path.
+ * not rasterize natively yet. ASAHI_M5_GPU_TESS=1 forces the GPU path.
  */
 bool
 agx_m5_gpu_tess(struct agx_context *ctx)
 {
-   if (!agx_chip_g17_m5(agx_device(ctx->base.screen)->chip) ||
-       debug_get_option_m5_swtnl_tess())
+   if (!agx_chip_g17_m5(agx_device(ctx->base.screen)->chip))
       return false;
 
    return debug_get_option_m5_gpu_tess() || !agx_swtnl_can_tessellate();
@@ -2593,18 +2590,6 @@ agx_nir_lower_g18_image_index(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
-/* AGX_FS_CPROG=0 compiles G17P fragments without constant programs. */
-static bool
-agx_g17p_fs_cprog_enabled(void)
-{
-   static int on = -1;
-   if (on < 0) {
-      const char *e = getenv("AGX_FS_CPROG");
-      on = !(e && e[0] == '0');
-   }
-   return on;
-}
-
 /* hk_g17p_native_cprog_qualified(): the bounded native protocol launches it */
 static bool
 agx_g17p_fs_cprog_qualified(const struct agx_shader_info *info)
@@ -2827,7 +2812,6 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
    bool fs_cprog_done = false;
    if (agx_chip_native_preamble(dev->chip) && stage == MESA_SHADER_FRAGMENT &&
        !secondary && !internal_kernel && key.no_preamble &&
-       agx_g17p_fs_cprog_enabled() &&
        (nir->info.num_ubos || nir->info.num_ssbos || nir->info.num_textures ||
         nir->info.num_images)) {
       nir_shader *attempt = nir_shader_clone(NULL, nir);
@@ -3352,11 +3336,8 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
           *
           * Forced-early fragments test once at the start already (the
           * unroll hoists that update ahead of the copies) and keep their
-          * order. AGX_G17P_SAMPLE_KILL_TEST_ONCE=0 keeps the per-sample
-          * tests, for comparison. */
-         const bool test_once =
-            !nir->info.fs.early_fragment_tests &&
-            debug_get_bool_option("AGX_G17P_SAMPLE_KILL_TEST_ONCE", true);
+          * order. */
+         const bool test_once = !nir->info.fs.early_fragment_tests;
          if (!test_once)
             NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
          if (!agx_nir_lower_g17p_sample_shading(nir, &epilog_key,
@@ -3376,13 +3357,10 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
             /* Kills go into the one testing update where they can: a
              * kill-only update of part of a multisampled pixel loses the
              * killed samples' previous contents. Depth/stencil exports and
-             * memory writes keep the kills where they happen.
-             * AGX_G17P_SAMPLE_KILL_ONE_UPDATE=0 keeps the kill-only updates,
-             * for comparison. */
+             * memory writes keep the kills where they happen. */
             const uint64_t zs = BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
                                 BITFIELD64_BIT(FRAG_RESULT_STENCIL);
-            if (!(nir->info.outputs_written & zs) && !nir->info.writes_memory &&
-                debug_get_bool_option("AGX_G17P_SAMPLE_KILL_ONE_UPDATE", true))
+            if (!(nir->info.outputs_written & zs) && !nir->info.writes_memory)
                NIR_PASS(_, nir, agx_nir_lower_sample_mask_one_update);
             else
                NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
@@ -3421,13 +3399,11 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
       else if (g17g_samples_unrolled && key->nr_samples > 1 &&
                !nir->info.fs.early_fragment_tests &&
                !(nir->info.outputs_written & m5_zs) &&
-               !nir->info.writes_memory &&
-               debug_get_bool_option("AGX_M5_SAMPLE_KILL_ONE_UPDATE", true))
+               !nir->info.writes_memory)
          /* The unrolled copies' kills go into the one testing update, as on
           * G17P, in M5's uniformly selected form (the draw's test selector
           * is a uniform here): a kill-only update of part of a multisampled
-          * pixel loses the killed samples' previous contents.
-          * AGX_M5_SAMPLE_KILL_ONE_UPDATE=0 keeps the kill-only updates. */
+          * pixel loses the killed samples' previous contents. */
          NIR_PASS(_, nir, agx_nir_lower_sample_mask_one_update_m5);
       else
          NIR_PASS(_, nir, agx_nir_lower_sample_mask);
@@ -15083,7 +15059,7 @@ agx_g17g_split_mrt_draw(struct agx_context *ctx,
  * the repeated draw: its passes share the depth attachment, the first
  * writing it and the others testing against it, so each pass flushes the
  * batch of the one before and every application draw becomes a render per
- * attachment. ASAHI_M5_MRT_SPLIT=1 keeps the split for those draws.
+ * attachment.
  */
 
 /* The fragment shader addresses at most four attachments as images: with
@@ -15147,9 +15123,6 @@ agx_g17g_mrt_one_pass(struct agx_context *ctx)
    if ((vs && vs->info.writes_memory) ||
        (fs && (fs->info.writes_memory || fs->info.uses_fbfetch)))
       return true;
-
-   if (debug_get_bool_option("ASAHI_M5_MRT_SPLIT", false))
-      return false;
 
    if (!ctx->g17g_mrt_spills_known) {
       ctx->g17g_mrt_spills_ok = agx_g17g_mrt_spills_encodable(ctx);
@@ -15894,9 +15867,10 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    }
 
    if (info->mode == MESA_PRIM_PATCHES) {
-      /* With ASAHI_M5_SWTNL_TESS the M5 GPUs tessellate only on the CPU
-       * (agx_swtnl_applies()): a patch draw that path cannot take (indirect,
-       * or images before rasterization) has no encoding here. */
+      /* Where the CPU path can tessellate, the M5 GPUs tessellate only
+       * there (agx_m5_gpu_tess(), agx_swtnl_applies()): a patch draw that
+       * path cannot take (indirect, or images before rasterization) has no
+       * encoding here. */
       if (agx_chip_g17_m5(agx_device(ctx->base.screen)->chip) &&
           !agx_m5_gpu_tess(ctx)) {
          agx_native_descriptor_reject_batch(batch, "tessellation outside the CPU path");
