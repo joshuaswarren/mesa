@@ -91,11 +91,16 @@ agx3_bind_fields(const struct agx3_field_kv *baseline, unsigned nbaseline,
  */
 #define AGX3_BIND_MEMO_SLOTS  1024
 #define AGX3_BIND_MEMO_FIELDS 24
+#define AGX3_BIND_MEMO_NAME   24
 
 struct agx3_bind_memo {
    uint64_t hash;
    const agx3_table *table;
+   /* The caller's string: the hash and a quick first comparison use its
+    * address, but it may be gone by the next call, so an entry keeps its own
+    * copy of the name and a hit is confirmed against that. */
    const char *mnemonic;
+   char name[AGX3_BIND_MEMO_NAME];
    int ep;
    uint8_t nfields, len;
    uint16_t field[AGX3_BIND_MEMO_FIELDS];
@@ -168,7 +173,8 @@ agx3_bind_memo_get(const struct agx3_bind_memo *key, uint8_t *out,
        e->mnemonic == key->mnemonic && e->ep == key->ep &&
        e->nfields == key->nfields &&
        !memcmp(e->field, key->field, key->nfields * sizeof(key->field[0])) &&
-       !memcmp(e->value, key->value, key->nfields * sizeof(key->value[0]))) {
+       !memcmp(e->value, key->value, key->nfields * sizeof(key->value[0])) &&
+       !strcmp(e->name, key->mnemonic)) {
       memcpy(out, e->out, e->len);
       *len = e->len;
       hit = true;
@@ -181,10 +187,13 @@ static void
 agx3_bind_memo_put(const struct agx3_bind_memo *key, const uint8_t *out,
                    uint8_t len)
 {
-   if (len == 0 || len > sizeof(key->out) || !agx3_bind_memo_lock())
+   const size_t name_len = strlen(key->mnemonic);
+   if (len == 0 || len > sizeof(key->out) || name_len >= sizeof(key->name) ||
+       !agx3_bind_memo_lock())
       return;
    struct agx3_bind_memo *e = agx3_bind_memo_slot(key);
    *e = *key;
+   memcpy(e->name, key->mnemonic, name_len + 1);
    memcpy(e->out, out, len);
    e->len = len;
    agx3_bind_memo_unlock();

@@ -13,6 +13,10 @@
  * corpus, so the second runs on a memo full of colliding entries. Each result
  * is compared with agx3_compose()/agx3_compose_apple_order() on the same
  * vector, and an encoding-point composition with the instruction's own bytes.
+ * Every composition is repeated with the name copied into one buffer that all
+ * mnemonics share, and a last one composes a different mnemonic from a
+ * remembered field vector in that buffer, so a memo that matched the name by
+ * its address alone fails.
  */
 
 #include <dirent.h>
@@ -37,9 +41,9 @@ fail(const char *what, const char *name, size_t at, const char *mnemonic)
 
 /* Compose through the binder and compare with the reference bytes. */
 static void
-bind_check(enum agx_isa_encoding enc, const char *mnemonic, int ep,
-           const struct agx3_field_kv *kv, unsigned n, const uint8_t *ref,
-           unsigned ref_len, const char *name, size_t at)
+bind_compare(enum agx_isa_encoding enc, const char *mnemonic, int ep,
+             const struct agx3_field_kv *kv, unsigned n, const uint8_t *ref,
+             unsigned ref_len, const char *name, size_t at)
 {
    uint8_t out[2 * AGX3_MAX_WORDS];
    uint8_t len = 0;
@@ -49,6 +53,24 @@ bind_check(enum agx_isa_encoding enc, const char *mnemonic, int ep,
    else if (len != ref_len || memcmp(out, ref, len))
       fail("binder differs from the table walk", name, at, mnemonic);
 }
+
+/* One buffer for every mnemonic, as a caller that builds the name in its own
+ * storage would pass it: a memo entry must not match on the address alone. */
+static char reused_name[32];
+
+static void
+bind_check(enum agx_isa_encoding enc, const char *mnemonic, int ep,
+           const struct agx3_field_kv *kv, unsigned n, const uint8_t *ref,
+           unsigned ref_len, const char *name, size_t at)
+{
+   bind_compare(enc, mnemonic, ep, kv, n, ref, ref_len, name, at);
+   snprintf(reused_name, sizeof(reused_name), "%s", mnemonic);
+   bind_compare(enc, reused_name, ep, kv, n, ref, ref_len, name, at);
+}
+
+/* The first agx3c instruction of the corpus that composes in Apple's order. */
+static const char *sample_mnemonic;
+static uint64_t sample_fields[AGX3_MAX_FIELDS];
 
 static void
 check_text(const char *name, const uint8_t *code, size_t size, bool g18g)
@@ -88,9 +110,64 @@ check_text(const char *name, const uint8_t *code, size_t size, bool g18g)
          if (apple >= 0)
             bind_check(enc, mnemonic, AGX3_BIND_APPLE_ORDER, kv, nkv, ref,
                        t->forms[apple].size, name, i);
+         if (apple >= 0 && !g18g && !sample_mnemonic) {
+            sample_mnemonic = mnemonic;
+            memcpy(sample_fields, fields, sizeof(fields));
+         }
       }
       i += n;
    }
+}
+
+/*
+ * Without the name, the memo key is the same for every mnemonic composed from
+ * one field vector. Compose the sample through the reused buffer, then another
+ * mnemonic from the same vector through the same buffer: the binder must give
+ * what the table walk gives for that mnemonic, a refusal included.
+ */
+static bool
+check_reused_name(void)
+{
+   const agx3_table *t = &agx3c_table;
+   const enum agx_isa_encoding enc = AGX_ISA_ENCODING_AGX3C;
+   if (!sample_mnemonic)
+      return false;
+
+   struct agx3_field_kv kv[AGX3_MAX_FIELDS];
+   unsigned nkv = 0;
+   for (unsigned f = 0; f < AGX3_MAX_FIELDS; ++f) {
+      if (sample_fields[f])
+         kv[nkv++] =
+            (struct agx3_field_kv){.field = f, .value = sample_fields[f]};
+   }
+
+   uint8_t ref[2 * AGX3_MAX_WORDS];
+   int32_t form =
+      agx3_compose_apple_order(t, sample_mnemonic, sample_fields, ref);
+   if (form < 0)
+      return false;
+   bind_check(enc, sample_mnemonic, AGX3_BIND_APPLE_ORDER, kv, nkv, ref,
+              t->forms[form].size, "reused name", 0);
+
+   const char *other = NULL;
+   for (uint32_t f = 0; f < t->num_forms && !other; ++f) {
+      if (strcmp(t->forms[f].mnemonic, sample_mnemonic))
+         other = t->forms[f].mnemonic;
+   }
+   if (!other)
+      return false;
+   snprintf(reused_name, sizeof(reused_name), "%s", other);
+   uint8_t out[2 * AGX3_MAX_WORDS];
+   uint8_t len = 0;
+   const bool bound = agx3_bind_compose(enc, reused_name, AGX3_BIND_APPLE_ORDER,
+                                        kv, nkv, NULL, 0, out, &len);
+   form = agx3_compose_apple_order(t, other, sample_fields, ref);
+   checks++;
+   if (bound != (form >= 0) ||
+       (bound && (len != t->forms[form].size || memcmp(out, ref, len))))
+      fail("binder differs from the table walk in a reused name buffer",
+           "reused name", 0, other);
+   return true;
 }
 
 static unsigned
@@ -142,6 +219,10 @@ main(int argc, char **argv)
       texts = check_corpus(argv[1]);
    if (!texts) {
       fprintf(stderr, "no native texts in %s\n", argv[1]);
+      return 1;
+   }
+   if (!check_reused_name()) {
+      fprintf(stderr, "no agx3c sample for the reused name check\n");
       return 1;
    }
 
