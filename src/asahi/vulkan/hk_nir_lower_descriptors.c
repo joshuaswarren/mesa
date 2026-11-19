@@ -1251,8 +1251,7 @@ lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
    if (tex->op != nir_texop_lod ||
        (ctx->descriptor_generation != 9 && ctx->descriptor_generation != 10) ||
        !mesa_shader_stage_uses_workgroup(b->shader->info.stage) ||
-       b->shader->info.derivative_group == DERIVATIVE_GROUP_NONE ||
-       agx_nir_compute_implicit_lod_diagnostic())
+       b->shader->info.derivative_group == DERIVATIVE_GROUP_NONE)
       return false;
 
    const int sampler_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);

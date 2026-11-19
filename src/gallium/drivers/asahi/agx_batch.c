@@ -2141,28 +2141,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       if (m5_split_prepass) {
          /* The M5 compute profile is grounded for a single-dispatch control
           * stream; a geometry or transform-feedback prepass emits several.
-          * Report the stream extent so a hang can be told apart from a
-          * refusal without a kernel rebuild. */
-         if (agx_env_flag(AGX_ENV_NEO_DRAW_DIAGNOSTICS)) {
-            fprintf(stderr,
-                    "NEO_PREPASS queue=%u batch=%u stream=%" PRIx64 "..%" PRIx64
-                    " stream_bytes=%" PRIu64 "\n",
-                    ctx->queue_id, agx_batch_idx(batch),
-                    (uint64_t)compute->cdm_ctrl_stream_base,
-                    (uint64_t)compute->cdm_ctrl_stream_end,
-                    (uint64_t)(compute->cdm_ctrl_stream_end -
-                               compute->cdm_ctrl_stream_base));
-            /* Dump the words so the stream can be decoded against genxml
-             * without another hardware cycle. */
-            const uint32_t *w = agx_bo_map(batch->cdm.bo);
-            const size_t n = (compute->cdm_ctrl_stream_end -
-                              compute->cdm_ctrl_stream_base) / 4;
-            fprintf(stderr, "NEO_PREPASS_WORDS");
-            for (size_t i = 0; i < n && i < 64; ++i)
-               fprintf(stderr, " %08x", w[i]);
-            fprintf(stderr, "\n");
-         }
-         /* One command per dispatch. agx_launch_internal() terminated each
+          * One command per dispatch. agx_launch_internal() terminated each
           * one where it ended and recorded its extent, so each command is
           * the single-dispatch stream the profile covers. They are ordered
           * by construction: the runtime polls for retirement inside the
@@ -2386,11 +2365,6 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       .cmdbuf_size = cmdbuf.size,
    };
 
-   if (agx_env_flag(AGX_ENV_NEO_DRAW_DIAGNOSTICS))
-      fprintf(stderr, "NEO_SUBMIT queue=%u batch=%u seq=%llu draws=%u render=%u compute=%u bytes=%zu\n",
-              ctx->queue_id, agx_batch_idx(batch), (unsigned long long)seqid,
-              batch->draws, !!render, !!compute, (size_t)cmdbuf.size);
-
    if (unlikely(dev->debug & AGX_DBG_PERF))
       ctx->submit_perf.submits++;
    if (dev->debug & AGX_DBG_FAULTTRACE) {
@@ -2403,10 +2377,6 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       ctx->submit_perf.failures++;
    const int submit_errno =
       ret < -1 ? -ret : (ret ? (errno ? errno : EIO) : 0);
-   if (agx_env_flag(AGX_ENV_NEO_DRAW_DIAGNOSTICS))
-      fprintf(stderr, "NEO_SUBMIT_RESULT queue=%u batch=%u seq=%llu ret=%d errno=%d\n",
-              ctx->queue_id, agx_batch_idx(batch), (unsigned long long)seqid,
-              ret, submit_errno);
 
    u_rwlock_rdunlock(&screen->destroy_lock);
 
