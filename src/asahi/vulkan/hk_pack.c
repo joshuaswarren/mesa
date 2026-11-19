@@ -18,8 +18,10 @@
  *
  * - M5 (HAL300) streams pack where the kernel takes their own completion
  *   flush, DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: only then does every
- *   stream end with the strong memory-scoped flush a boundary keeps
- *   (hk_EndCommandBuffer()). This holds for every M5 part.
+ *   such stream end with a strong flush (hk_EndCommandBuffer(), or an
+ *   application barrier or deferred clears at the end), and a packet's end
+ *   can carry the memory-scoped one (hk_pack_runs()). This holds for every
+ *   M5 part.
  * - HAL200 streams pack where the strong flush is the whole visibility
  *   record. G17P differs: its strong flush also has a memory-scoped form,
  *   which memory reached through a second address needs
@@ -87,9 +89,18 @@ hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
       return NULL;
 
    if (boundary == HK_PACK_BOUNDARY_VISIBLE_COMPLETION) {
-      /* The stream ends with the strong memory-scoped flush. */
-      if (!cs->visible_completion || cs->strong_flush_end != end ||
-          cs->memory_flush_end != end)
+      /* The stream ends with a strong flush: vkEndCommandBuffer upgraded a
+       * last launch's weak tail to the memory-scoped one; an application
+       * barrier at the end left one; or hk_flush_deferred_clears(), which
+       * vkEndCommandBuffer runs, left one after the clears, standing for
+       * the barriers recorded after them. The last two have memory scope
+       * only where memory may have a second address
+       * (hk_cdm_alias_scope()). Each is at least the dependency the
+       * application recorded across the boundary; the packet's end gets
+       * the memory scope (hk_pack_runs()), and this boundary exists only
+       * where the kernel accepts such a visible-completion command
+       * (hk_pack_boundary()). */
+      if (cs->strong_flush_end != end)
          return NULL;
    } else {
       /* The stream ends with an ordering barrier or a strong flush, which a
