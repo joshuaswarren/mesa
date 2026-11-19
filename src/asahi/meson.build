@@ -121,6 +121,48 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # Aliased compressed attachments over host-filled memory; recorded and
+  # submitted, not executed (the hardware run needs the GPU).
+  test(
+    'hk-g17p-garbage-metadata',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_garbage_metadata,
+      '--shim',
+      '--expect-compressed',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_MESA_DEBUG=perf',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  # Aliased compressed attachments over host-filled memory; recorded and
+  # submitted, not executed (the hardware run needs the GPU).
+  test(
+    'hk-g16s-garbage-metadata',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_garbage_metadata,
+      '--shim',
+      '--expect-compressed',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g16s',
+      'ASAHI_MESA_DEBUG=perf',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # Batched software tessellation (hk_tess_batch.h): its compute streams put
   # the direct launches of a stage back to back, which the validator admits;
   # encoded and stream-validated, not executed.
