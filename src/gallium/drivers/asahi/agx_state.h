@@ -679,6 +679,11 @@ struct agx_batch {
    struct {
       struct set *set;
       struct util_dynarray list; /* struct agx_bo * */
+      /* Byte ranges of buffer BOs this batch reads or writes, for buffers
+       * accessed only through ranged bindings. A BO in the set without an
+       * entry here counts as accessed in full. */
+      struct hash_table *ranges; /* agx_bo * -> index + 1 into range_list */
+      struct util_dynarray range_list; /* struct agx_bo_range */
    } bo_list;
 
    /* If true, this batch contains a shader with a potentially incoherent write
@@ -1524,6 +1529,10 @@ bool agx_nir_lower_g17p_storage_records(nir_shader *shader,
                                         unsigned record_size_B);
 bool agx_nir_rebind_g17g_image_loads(nir_shader *shader);
 
+struct agx_bo_range {
+   uint64_t start, end;
+};
+
 bool agx_batch_is_active(struct agx_batch *batch);
 bool agx_batch_is_submitted(struct agx_batch *batch);
 
@@ -1588,6 +1597,8 @@ void agx_memory_barrier(struct pipe_context *pctx, unsigned flags);
 void agx_batch_reads(struct agx_batch *batch, struct agx_resource *rsrc);
 void agx_batch_writes(struct agx_batch *batch, struct agx_resource *rsrc,
                       unsigned level);
+void agx_batch_reads_range(struct agx_batch *batch, struct agx_resource *rsrc,
+                           uint64_t offset, uint64_t size);
 void agx_batch_writes_range(struct agx_batch *batch, struct agx_resource *rsrc,
                             unsigned offset, unsigned size);
 void agx_batch_track_image(struct agx_batch *batch,

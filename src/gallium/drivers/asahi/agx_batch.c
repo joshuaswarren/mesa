@@ -61,6 +61,9 @@ agx_append_split_compute(struct util_dynarray *cmdbuf,
 #define foreach_submitted(ctx, idx)                                            \
    BITSET_FOREACH_SET(idx, ctx->batches.submitted, AGX_MAX_BATCHES)
 
+/* AGX_RANGE_READS=0 tracks every buffer access as the whole BO again. */
+DEBUG_GET_ONCE_BOOL_OPTION(range_reads, "AGX_RANGE_READS", true)
+
 #define batch_debug(batch, fmt, ...)                                           \
    do {                                                                        \
       if (unlikely(agx_device(batch->ctx->base.screen)->debug &                \
@@ -382,9 +385,13 @@ agx_batch_init(struct agx_context *ctx,
    if (!batch->bo_list.set) {
       batch->bo_list.set = _mesa_pointer_set_create(ctx);
       util_dynarray_init(&batch->bo_list.list, ctx);
+      batch->bo_list.ranges = _mesa_pointer_hash_table_create(ctx);
+      util_dynarray_init(&batch->bo_list.range_list, ctx);
    } else {
       _mesa_set_clear(batch->bo_list.set, NULL);
       util_dynarray_clear(&batch->bo_list.list);
+      _mesa_hash_table_clear(batch->bo_list.ranges, NULL);
+      util_dynarray_clear(&batch->bo_list.range_list);
    }
 
    if (agx_batch_is_compute(batch)) {
@@ -759,10 +766,61 @@ agx_flush_batch_for_reason(struct agx_context *ctx, struct agx_batch *batch,
       agx_flush_batch(ctx, batch);
 }
 
+#define AGX_RANGE_ALL UINT64_MAX
+
+/* Record that @batch accesses [start, end) of @rsrc's BO. A whole-resource
+ * access is recorded as [0, AGX_RANGE_ALL). */
 static void
-agx_flush_readers_except(struct agx_context *ctx, struct agx_resource *rsrc,
-                         struct agx_batch *except, const char *reason,
-                         bool sync)
+agx_batch_note_range(struct agx_batch *batch, struct agx_resource *rsrc,
+                     uint64_t start, uint64_t end)
+{
+   if (rsrc->base.target != PIPE_BUFFER)
+      return;
+
+   struct hash_entry *e =
+      _mesa_hash_table_search(batch->bo_list.ranges, rsrc->bo);
+   if (e) {
+      struct agx_bo_range *r = util_dynarray_element(
+         &batch->bo_list.range_list, struct agx_bo_range,
+         (uintptr_t)e->data - 1);
+      r->start = MIN2(r->start, start);
+      r->end = MAX2(r->end, end);
+   } else {
+      struct agx_bo_range r = {start, end};
+      util_dynarray_append(&batch->bo_list.range_list, r);
+      _mesa_hash_table_insert(
+         batch->bo_list.ranges, rsrc->bo,
+         (void *)(uintptr_t)util_dynarray_num_elements(
+            &batch->bo_list.range_list, struct agx_bo_range));
+   }
+}
+
+/* Whether @batch may touch [start, end) of @rsrc's BO. Conservative: any BO
+ * in the batch without a recorded range counts as fully accessed. */
+static bool
+agx_batch_touches_range(struct agx_batch *batch, struct agx_resource *rsrc,
+                        uint64_t start, uint64_t end)
+{
+   if (!agx_batch_uses_bo(batch, rsrc->bo))
+      return false;
+   if (rsrc->base.target != PIPE_BUFFER || (start == 0 && end == AGX_RANGE_ALL))
+      return true;
+
+   struct hash_entry *e =
+      _mesa_hash_table_search(batch->bo_list.ranges, rsrc->bo);
+   if (!e)
+      return true;
+
+   const struct agx_bo_range *r = util_dynarray_element(
+      &batch->bo_list.range_list, struct agx_bo_range, (uintptr_t)e->data - 1);
+   return r->start < end && start < r->end;
+}
+
+static void
+agx_flush_readers_except_range(struct agx_context *ctx,
+                               struct agx_resource *rsrc,
+                               struct agx_batch *except, const char *reason,
+                               bool sync, uint64_t start, uint64_t end)
 {
    unsigned idx;
 
@@ -773,7 +831,7 @@ agx_flush_readers_except(struct agx_context *ctx, struct agx_resource *rsrc,
       if (batch == except)
          continue;
 
-      if (agx_batch_uses_bo(batch, rsrc->bo)) {
+      if (agx_batch_touches_range(batch, rsrc, start, end)) {
          perf_debug_ctx(ctx, "Flush reader due to: %s\n", reason);
          agx_flush_batch(ctx, batch);
       }
@@ -793,6 +851,15 @@ agx_flush_readers_except(struct agx_context *ctx, struct agx_resource *rsrc,
          }
       }
    }
+}
+
+static void
+agx_flush_readers_except(struct agx_context *ctx, struct agx_resource *rsrc,
+                         struct agx_batch *except, const char *reason,
+                         bool sync)
+{
+   agx_flush_readers_except_range(ctx, rsrc, except, reason, sync, 0,
+                                  AGX_RANGE_ALL);
 }
 
 static void
@@ -865,10 +932,32 @@ agx_sync_writer(struct agx_context *ctx, struct agx_resource *rsrc,
    agx_flush_writer_except(ctx, rsrc, NULL, reason, true);
 }
 
+static void agx_batch_reads_internal(struct agx_batch *batch,
+                                     struct agx_resource *rsrc,
+                                     uint64_t start, uint64_t end);
+
 void
 agx_batch_reads(struct agx_batch *batch, struct agx_resource *rsrc)
 {
+   agx_batch_reads_internal(batch, rsrc, 0, AGX_RANGE_ALL);
+}
+
+void
+agx_batch_reads_range(struct agx_batch *batch, struct agx_resource *rsrc,
+                      uint64_t offset, uint64_t size)
+{
+   if (!debug_get_option_range_reads() || !size)
+      agx_batch_reads_internal(batch, rsrc, 0, AGX_RANGE_ALL);
+   else
+      agx_batch_reads_internal(batch, rsrc, offset, offset + size);
+}
+
+static void
+agx_batch_reads_internal(struct agx_batch *batch, struct agx_resource *rsrc,
+                         uint64_t start, uint64_t end)
+{
    agx_batch_add_bo(batch, rsrc->bo);
+   agx_batch_note_range(batch, rsrc, start, end);
 
    if (rsrc->separate_stencil)
       agx_batch_add_bo(batch, rsrc->separate_stencil->bo);
@@ -897,27 +986,35 @@ agx_batch_reads(struct agx_batch *batch, struct agx_resource *rsrc)
 
 static void
 agx_batch_writes_internal(struct agx_batch *batch, struct agx_resource *rsrc,
-                          unsigned level)
+                          unsigned level, uint64_t start, uint64_t end)
 {
    struct agx_context *ctx = batch->ctx;
    struct agx_batch *writer = agx_writer_get(ctx, rsrc->bo->handle);
 
    assert(batch->initialized);
 
-   agx_flush_readers_except(ctx, rsrc, batch, "Write from other batch", false);
+   if (!debug_get_option_range_reads()) {
+      start = 0;
+      end = AGX_RANGE_ALL;
+   }
+
+   agx_flush_readers_except_range(ctx, rsrc, batch, "Write from other batch",
+                                  false, start, end);
 
    BITSET_SET(rsrc->data_valid, level);
 
    /* Nothing to do if we're already writing */
-   if (writer == batch)
+   if (writer == batch) {
+      agx_batch_note_range(batch, rsrc, start, end);
       return;
+   }
 
    /* Hazard: writer-after-write, write-after-read */
    if (writer)
       agx_flush_writer(ctx, rsrc, "Multiple writers");
 
    /* Write is strictly stronger than a read */
-   agx_batch_reads(batch, rsrc);
+   agx_batch_reads_internal(batch, rsrc, start, end);
 
    writer = agx_writer_get(ctx, rsrc->bo->handle);
    assert(!writer || agx_batch_is_submitted(writer));
@@ -937,7 +1034,7 @@ void
 agx_batch_writes(struct agx_batch *batch, struct agx_resource *rsrc,
                  unsigned level)
 {
-   agx_batch_writes_internal(batch, rsrc, level);
+   agx_batch_writes_internal(batch, rsrc, level, 0, AGX_RANGE_ALL);
 
    if (rsrc->base.target == PIPE_BUFFER) {
       /* Assume BOs written by the GPU are fully valid */
@@ -951,7 +1048,7 @@ agx_batch_writes_range(struct agx_batch *batch, struct agx_resource *rsrc,
                        unsigned offset, unsigned size)
 {
    assert(rsrc->base.target == PIPE_BUFFER);
-   agx_batch_writes_internal(batch, rsrc, 0);
+   agx_batch_writes_internal(batch, rsrc, 0, offset, (uint64_t)offset + size);
    util_range_add(&rsrc->base, &rsrc->valid_buffer_range, offset,
                   offset + size);
 }
