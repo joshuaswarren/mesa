@@ -1056,7 +1056,6 @@ agx_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
  * and uploads every level, 74 ms for a 3456x2160 RGBA8 texture on an M5 Pro
  * against 1 ms rendered. Such a texture goes to the generic path when every
  * level it would render into passes a dry run of that PBE.
- * ASAHI_M5_CPU_MIPMAP=1 keeps the CPU path, for comparison.
  */
 bool
 agx_generate_mipmap_g17g(struct pipe_context *pctx, struct pipe_resource *prsc,
@@ -1074,8 +1073,7 @@ agx_generate_mipmap_g17g(struct pipe_context *pctx, struct pipe_resource *prsc,
        !unpack || !unpack->unpack_rgba || !pack || !pack->pack_rgba_float)
       return false;
 
-   if (prsc->target == PIPE_TEXTURE_2D &&
-       !debug_get_bool_option("ASAHI_M5_CPU_MIPMAP", false)) {
+   if (prsc->target == PIPE_TEXTURE_2D) {
       bool renderable = true;
       for (unsigned level = base_level + 1;
            level <= last_level && renderable; ++level) {
