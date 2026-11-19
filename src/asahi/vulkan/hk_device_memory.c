@@ -344,6 +344,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          goto fail_alloc;
       }
       assert(!(flags & ~mem->bo->flags));
+      mem->alias_import = true;
    } else if (host_info && host_info->handleType) {
       /* The pointer and the size are multiples of
        * minImportedHostPointerAlignment (VUID-VkImportMemoryHostPointerInfoEXT-
@@ -377,6 +378,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                             host_info->pHostPointer, strerror(err));
          goto fail_alloc;
       }
+      mem->alias_import = access != AGX_HOST_PTR_READ_ONLY;
    } else {
       enum agx_bo_flags flags = 0;
       if (handle_types)
@@ -471,6 +473,9 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
       hk_add_ext_bo(dev, mem->bo);
 
+   if (mem->alias_import)
+      p_atomic_inc(&dev->va_alias_resources);
+
    if (priority_info)
       hk_set_memory_priority(dev, mem, priority_info->priority);
 
@@ -536,6 +541,9 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
       agx_va_free(&dev->dev, mem->replay_va, true);
       p_atomic_dec(&dev->va_alias_resources);
    }
+
+   if (mem->alias_import)
+      p_atomic_dec(&dev->va_alias_resources);
 
    agx_bo_unreference(&dev->dev, mem->bo);
 
