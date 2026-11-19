@@ -503,18 +503,6 @@ agx_ioto_g17g_no_resource_program_compose(
 }
 
 bool
-agx_ioto_g17g_resource_program_compose(
-   uint64_t program_va, const void *body, size_t body_size,
-   const struct agx_ioto_state_tail_output *packed_tail,
-   enum agx_ioto_g17g_program_stage stage,
-   void *output, size_t capacity, size_t *written)
-{
-   return agx_ioto_g17g_resource_program_compose_classes(
-      program_va, body, body_size, packed_tail, stage, 1,
-      output, capacity, written);
-}
-
-bool
 agx_ioto_g17g_resource_program_compose_classes(
    uint64_t program_va, const void *body, size_t body_size,
    const struct agx_ioto_state_tail_output *packed_tail,
@@ -601,18 +589,14 @@ agx_ioto_g17g_resource_program_compose_classes(
    return true;
 }
 
-static bool
-g17p_fragment_no_resource_program_compose(
+bool
+agx_ioto_g17p_fragment_no_resource_program_compose_trusted(
    uint64_t program_va, const struct agx_ioto_state_tail_output *packed_tail,
-   unsigned colour_classes, void *output, size_t capacity, size_t *written,
-   bool validate_tail)
+   unsigned colour_classes, void *output, size_t capacity, size_t *written)
 {
    uint8_t pixrel[G17P_FRAGMENT_PIXREL_SIZE];
-   const bool tail_valid = validate_tail
-                              ? g17p_type0_tail_valid(packed_tail)
-                              : g17p_type0_tail_shape_valid(packed_tail);
    if (!g17p_fragment_pixrel_compose(colour_classes, false, pixrel) ||
-       !output || !written || !tail_valid ||
+       !output || !written || !g17p_type0_tail_shape_valid(packed_tail) ||
        program_va == 0 || program_va > UINT64_C(0xffffffffffff) ||
        (program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
        capacity < AGX_IOTO_G17P_FRAGMENT_NO_RESOURCE_PROGRAM_SIZE)
@@ -637,26 +621,6 @@ g17p_fragment_no_resource_program_compose(
    memcpy(output, staged, sizeof(staged));
    *written = sizeof(staged);
    return true;
-}
-
-bool
-agx_ioto_g17p_fragment_no_resource_program_compose(
-   uint64_t program_va, const struct agx_ioto_state_tail_output *packed_tail,
-   unsigned colour_classes, void *output, size_t capacity, size_t *written)
-{
-   return g17p_fragment_no_resource_program_compose(
-      program_va, packed_tail, colour_classes, output, capacity, written,
-      true);
-}
-
-bool
-agx_ioto_g17p_fragment_no_resource_program_compose_trusted(
-   uint64_t program_va, const struct agx_ioto_state_tail_output *packed_tail,
-   unsigned colour_classes, void *output, size_t capacity, size_t *written)
-{
-   return g17p_fragment_no_resource_program_compose(
-      program_va, packed_tail, colour_classes, output, capacity, written,
-      false);
 }
 
 static bool
@@ -770,19 +734,6 @@ agx_ioto_g17p_program_compose_with_preshader(
 }
 
 bool
-agx_ioto_g17p_resource_program_compose(
-   uint64_t program_va, const void *pre_copy_body, size_t pre_copy_body_size,
-   const void *copies, size_t copies_size,
-   const struct agx_ioto_state_tail_output *packed_tail, void *output,
-   size_t capacity, size_t *written)
-{
-   return g17p_resource_program_compose(
-      program_va, pre_copy_body, pre_copy_body_size, copies, copies_size,
-      packed_tail, output, capacity, written, g17p_default_profile_suffix,
-      sizeof(g17p_default_profile_suffix), true, NULL);
-}
-
-bool
 agx_ioto_g17p_resource_program_compose_trusted(
    uint64_t program_va, const void *pre_copy_body, size_t pre_copy_body_size,
    const void *copies, size_t copies_size,
@@ -793,22 +744,6 @@ agx_ioto_g17p_resource_program_compose_trusted(
       program_va, pre_copy_body, pre_copy_body_size, copies, copies_size,
       packed_tail, output, capacity, written, g17p_default_profile_suffix,
       sizeof(g17p_default_profile_suffix), false, NULL);
-}
-
-bool
-agx_ioto_g17p_fragment_resource_program_compose(
-   uint64_t program_va, const void *pre_copy_body, size_t pre_copy_body_size,
-   const void *copies, size_t copies_size,
-   const struct agx_ioto_state_tail_output *packed_tail,
-   unsigned colour_classes, void *output, size_t capacity, size_t *written)
-{
-   uint8_t pixrel[G17P_FRAGMENT_PIXREL_SIZE];
-   if (!g17p_fragment_pixrel_compose(colour_classes, false, pixrel))
-      return false;
-
-   return g17p_resource_program_compose(
-      program_va, pre_copy_body, pre_copy_body_size, copies, copies_size,
-      packed_tail, output, capacity, written, pixrel, sizeof(pixrel), true, NULL);
 }
 
 bool
@@ -825,22 +760,6 @@ agx_ioto_g17p_fragment_resource_program_compose_trusted(
    return g17p_resource_program_compose(
       program_va, pre_copy_body, pre_copy_body_size, copies, copies_size,
       packed_tail, output, capacity, written, pixrel, sizeof(pixrel), false, NULL);
-}
-
-bool
-agx_ioto_g17p_coverage_fragment_program_compose(
-   uint64_t program_va, const void *pre_copy_body, size_t pre_copy_body_size,
-   const void *copies, size_t copies_size,
-   const struct agx_ioto_state_tail_output *packed_tail,
-   unsigned colour_classes, void *output, size_t capacity, size_t *written)
-{
-   uint8_t pixrel[G17P_FRAGMENT_PIXREL_SIZE];
-   if (!g17p_fragment_pixrel_compose(colour_classes, true, pixrel))
-      return false;
-
-   return g17p_resource_program_compose(
-      program_va, pre_copy_body, pre_copy_body_size, copies, copies_size,
-      packed_tail, output, capacity, written, pixrel, sizeof(pixrel), true, NULL);
 }
 
 bool
@@ -994,19 +913,6 @@ agx_ioto_g17p_external_setup_suffix_compose(
    ((uint8_t *)output)[body_size + terminal_size] = UINT8_C(0x0e);
    *written = total;
    return true;
-}
-
-bool
-agx_ioto_g17p_background_resource_program_compose(
-   uint64_t program_va, const void *pre_copy_body, size_t pre_copy_body_size,
-   const void *copies, size_t copies_size,
-   const struct agx_ioto_state_tail_output *packed_tail, void *output,
-   size_t capacity, size_t *written)
-{
-   return g17p_resource_program_compose(
-      program_va, pre_copy_body, pre_copy_body_size, copies, copies_size,
-      packed_tail, output, capacity, written, g17p_background_pixrel,
-      sizeof(g17p_background_pixrel), true, NULL);
 }
 
 bool
