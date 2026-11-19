@@ -514,7 +514,7 @@ validate_ioto_program(const struct asahi_g17p_stream_memory *memory,
              * reads garbage. hk emits two:
              *
              *  - relative: the external-setup graphics launcher
-             *    (agx_ioto_g17p_external_setup_launcher_compose) jumps to
+             *    (agx_ioto_g17p_external_setup_launcher_compose_trusted) jumps to
              *    the persistent setup suffix holding the body and the
              *    terminator. That suffix is Ioto; keep walking it, carrying
              *    the state-tail and immediate tracking across.

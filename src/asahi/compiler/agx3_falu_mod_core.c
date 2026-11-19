@@ -80,13 +80,6 @@ slot_ok(uint16_t r, bool narrow)
    return r < 256 && (narrow || (r & 1) == 0);
 }
 
-static bool
-regs_ok(uint16_t a, uint16_t b_, uint16_t c)
-{
-   return (a & 1) == 0 && a < 256 && (b_ & 1) == 0 && b_ < 256 &&
-          (c & 1) == 0 && c < 256;
-}
-
 bool
 agx3_falu_add_mod(enum agx_isa_encoding enc, uint16_t dest, uint16_t src0,
                   uint16_t src1, const struct agx3_falu_mods *m,

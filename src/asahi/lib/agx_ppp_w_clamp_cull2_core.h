@@ -58,8 +58,6 @@ struct agx_ppp_w_clamp_cull2_core {
  * does not allocate PPP memory, emit the surrounding VDM pointer, lower API
  * state, submit a command, admit a device, or advertise a capability.
  */
-bool agx_ppp_w_clamp_cull2_core_supported(enum agx_chip chip);
-
 bool agx_ppp_w_clamp_cull2_core_pack(
    enum agx_chip chip, const struct agx_ppp_w_clamp_cull2_fields *fields,
    struct agx_ppp_w_clamp_cull2_core *out);
