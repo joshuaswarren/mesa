@@ -60,6 +60,52 @@ hk_update_physical_sparse_map(struct hk_device *dev, uint64_t address,
    return VK_SUCCESS;
 }
 
+uint32_t
+hk_buffer_sparse_texel_word(const struct hk_buffer *buffer,
+                            unsigned blocksize_B)
+{
+   /* A non-power-of-two element size (the emulated RGB32 layout) takes the
+    * raw load path, which claims residency anyway. */
+   if (!buffer || !buffer->sparse_map ||
+       !util_is_power_of_two_nonzero(blocksize_B))
+      return 0;
+
+   const uint64_t map_page = buffer->sparse_map->va->addr / AIL_PAGESIZE;
+   assert((buffer->sparse_map->va->addr % AIL_PAGESIZE) == 0);
+   /* The packed field leaves 28 bits for the map page.  Fail loudly rather
+    * than silently truncating if the VA layout ever outgrows it; a wrong map
+    * address would read residency from arbitrary memory. */
+   if (map_page >= (1u << (32 - AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT))) {
+      assert(!"sparse residency map outside the packed VA range");
+      return 0;
+   }
+   return (uint32_t)(map_page << AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT) |
+          (uint32_t)util_logbase2(blocksize_B);
+}
+
+uint32_t
+hk_sparse_texel_word_at(struct hk_device *dev, uint64_t address,
+                        unsigned blocksize_B)
+{
+   /* A buffer joins the list before vkCreateBuffer() returns it and leaves
+    * it in vkDestroyBuffer(), so a buffer an application can name an address
+    * of is already counted. */
+   if (!p_atomic_read(&dev->sparse_buffers.count))
+      return 0;
+
+   uint32_t word = 0;
+   simple_mtx_lock(&dev->sparse_buffers.lock);
+   list_for_each_entry(struct hk_buffer, buffer, &dev->sparse_buffers.list,
+                       sparse_link) {
+      if (address - buffer->va->addr < buffer->vk.size) {
+         word = hk_buffer_sparse_texel_word(buffer, blocksize_B);
+         break;
+      }
+   }
+   simple_mtx_unlock(&dev->sparse_buffers.lock);
+   return word;
+}
+
 static uint32_t
 hk_get_buffer_alignment(const struct hk_physical_device *pdev,
                         VkBufferUsageFlags2KHR usage_flags,
@@ -372,6 +418,13 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
    if (buffer->va)
       p_atomic_inc(&dev->va_alias_resources);
 
+   if (buffer->sparse_map) {
+      simple_mtx_lock(&dev->sparse_buffers.lock);
+      list_addtail(&buffer->sparse_link, &dev->sparse_buffers.list);
+      p_atomic_inc(&dev->sparse_buffers.count);
+      simple_mtx_unlock(&dev->sparse_buffers.lock);
+   }
+
    *pBuffer = hk_buffer_to_handle(buffer);
 
    return VK_SUCCESS;
@@ -388,6 +441,13 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
       return;
 
    hk_device_quiesce_lost_submissions(dev);
+
+   if (buffer->sparse_map) {
+      simple_mtx_lock(&dev->sparse_buffers.lock);
+      list_del(&buffer->sparse_link);
+      p_atomic_dec(&dev->sparse_buffers.count);
+      simple_mtx_unlock(&dev->sparse_buffers.lock);
+   }
 
    if (hk_buffer_in_physical_sparse_map(dev, buffer))
       hk_update_physical_sparse_map(dev, buffer->va->addr,

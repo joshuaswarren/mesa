@@ -2958,12 +2958,13 @@ fold_buffer_descriptor(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          value = nir_imm_int(b, f->rgb32);
          break;
       case 0x1000 + AGX_G17P_BUFFER_TEXTURE_ADDRESS_OFFSET:
+      case 0x1000 + AGX_G17P_BUFFER_TEXTURE_ADDRESS_OFFSET -
+              AGX_G17P_BUFFER_TEXTURE_PBE_OFFSET:
          value = nir_imm_int64(b, UINT64_C(0x123000000000));
          break;
       default:
          if (!f->rgb32 || intr->def.num_components != 3 ||
-             address != UINT64_C(0x123000000000) +
-                        ((uint64_t)f->coord + f->tail) * 12)
+             address != UINT64_C(0x123000000000) + (uint64_t)f->coord * 12)
             return false;
          value = nir_imm_ivec3(b, 11, 101, 83);
          f->saw_data = true;
@@ -3062,6 +3063,54 @@ test_g17p_buffer_metadata(void)
       }
    }
    return true;
+}
+
+/* A buffer atomic addresses its view from the descriptor's exact address. The
+ * tail offset counts the view's elements in its texture, which need not be the
+ * atomic's: a 32-bit atomic through an R16 view in a texel window. */
+static bool
+test_g17p_buffer_atomic_address(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "G17P buffer atomic address");
+   nir_def *pbe = nir_bindless_image_agx(&b, nir_imm_int(&b, 0), .desc_set = 0);
+   nir_def *address = nir_bindless_image_texel_address(
+      &b, 64, pbe, nir_imm_ivec4(&b, 5, 0, 0, 0), nir_imm_int(&b, 0),
+      .image_dim = GLSL_SAMPLER_DIM_BUF, .image_array = false,
+      .format = PIPE_FORMAT_R32_UINT);
+   nir_store_ssbo(&b, address, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                  .write_mask = 1, .align_mul = 8);
+   b.shader->info.num_ssbos = 1;
+   agx_nir_lower_texture_with_buffer_metadata(b.shader, 9, false, 0, false);
+
+   struct buffer_metadata_fixture f = {.elements = 64, .tail = 1 << 20};
+   bool progress;
+   do {
+      progress = nir_shader_intrinsics_pass(b.shader, fold_buffer_descriptor,
+                                            nir_metadata_control_flow, &f);
+      progress |= nir_opt_constant_folding(b.shader);
+      progress |= nir_opt_dce(b.shader);
+      progress |= nir_opt_copy_prop(b.shader);
+   } while (progress);
+
+   bool ok = false;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_store_ssbo &&
+                nir_src_is_const(intr->src[0]))
+               ok = nir_src_as_uint(intr->src[0]) ==
+                    UINT64_C(0x123000000000) + 5 * 4;
+         }
+      }
+   }
+   ralloc_free(b.shader);
+   if (!ok)
+      fprintf(stderr, "buffer atomic address counts the tail offset\n");
+   return ok;
 }
 
 static bool
@@ -8923,6 +8972,7 @@ main(int argc, char **argv)
    }
    if (argc == 2 && !strcmp(argv[1], "--buffer-metadata-only")) {
       const bool ok = test_g17p_buffer_metadata() &&
+                      test_g17p_buffer_atomic_address() &&
                       test_g17p_buffer_image_metadata() &&
                       test_buffer_fetch_r32_store() &&
                       test_buffer_fetch_unorm_store_fallback();
@@ -9121,7 +9171,7 @@ main(int argc, char **argv)
       all_ok = false;
    }
 
-   if (!test_g17p_buffer_metadata() ||
+   if (!test_g17p_buffer_metadata() || !test_g17p_buffer_atomic_address() ||
        !test_g17p_buffer_image_metadata() || !test_buffer_fetch_r32_store() ||
        !test_buffer_fetch_unorm_store_fallback()) {
       fputs("buffer metadata lowering mismatch\n", stderr);

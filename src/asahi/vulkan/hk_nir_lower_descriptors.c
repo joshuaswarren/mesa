@@ -1676,7 +1676,7 @@ lower_ssbo_resource_index(nir_builder *b, nir_intrinsic_instr *intrin,
       get_binding_layout(set, binding, ctx);
 
    nir_def *binding_addr;
-   uint8_t binding_stride;
+   uint32_t binding_stride;
    switch (binding_layout->type) {
    case VK_DESCRIPTOR_TYPE_MUTABLE_EXT:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
@@ -1714,6 +1714,7 @@ lower_ssbo_resource_index(nir_builder *b, nir_intrinsic_instr *intrin,
    }
 
    /* Tuck the stride in the top 8 bits of the binding address */
+   assert(binding_stride <= UINT8_MAX);
    binding_addr = nir_ior_imm(b, binding_addr, (uint64_t)binding_stride << 56);
 
    const uint32_t binding_size = binding_layout->array_size * binding_stride;

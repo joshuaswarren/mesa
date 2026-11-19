@@ -100,6 +100,12 @@
  * G17P sideband, AGX_G17P_IMAGE_ATOMIC_SW_FROM_PBE) in its last eight bytes,
  * which no Gen10 field occupies. */
 #define AGX_GEN10_IMAGE_ATOMIC_SW_OFFSET 24
+/* The view's element count; the texel offset of the view's first element in
+ * its native texture and PBE, which only texture and PBE coordinates add; and
+ * the exact address of the view's first element, from which everything that
+ * addresses the view as memory (atomics, residency, RGB32 reads) counts the
+ * coordinate alone.
+ */
 #define AGX_G17P_BUFFER_TEXTURE_METADATA_OFFSET 72
 #define AGX_G17P_BUFFER_TEXTURE_SIZE_OFFSET 72
 #define AGX_G17P_BUFFER_TEXTURE_TAIL_OFFSET 76

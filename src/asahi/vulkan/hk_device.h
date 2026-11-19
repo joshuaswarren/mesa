@@ -143,6 +143,15 @@ struct hk_device {
    bool may_alias_memory;
    /* One bit per main-heap page: only unbound sparse buffer pages are set. */
    struct agx_bo *physical_sparse_map;
+   /* The buffers with a residency map (hk_buffer::sparse_map), for texel
+    * buffer descriptors that name only an address (VK_EXT_descriptor_buffer,
+    * hk_sparse_texel_word_at()). */
+   struct {
+      simple_mtx_t lock;
+      struct list_head list;
+      /* Entries in list, read without the lock */
+      uint32_t count;
+   } sparse_buffers;
    /* The zeroed page every unbound sparse page maps, read-write (the
     * read-only shadow maps the zero page). It is no write sink of the
     * driver's, unlike the scratch page, so it stays zero for strict
