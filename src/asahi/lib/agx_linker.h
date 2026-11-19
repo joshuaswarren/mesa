@@ -363,6 +363,9 @@ struct agx_fs_epilog_key {
    bool sample_loop_mrt;
    bool lower_srgb;
    bool lower_r11g11b10;
+   /* Multisampled tile accesses move whole samples: U8NORM, I32 and F16, no
+    * I16 and no channel mask (G18G). */
+   bool ms_whole_sample;
    /* The layout keeps attachment 0 alone in the tilebuffer and spills the
     * others (agx_build_tilebuffer_layout_rt0_resident). */
    bool rt0_resident;

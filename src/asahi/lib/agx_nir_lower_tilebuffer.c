@@ -29,6 +29,7 @@ struct ctx {
    bool preserve_zero_mask;
    bool lower_srgb;
    bool lower_r11g11b10;
+   bool ms_whole_sample;
    bool lower_g17p_formats;
    bool x_alpha_one;
 };
@@ -117,8 +118,10 @@ load_tilebuffer(nir_builder *b, struct ctx *ctx,
                           format == PIPE_FORMAT_R16_UINT &&
                           util_format_is_pure_integer(logical_format);
 
-   /* Don't load with F16 */
-   if (f16)
+   /* Don't load with F16, except where multisampled tile accesses move whole
+    * samples (G18 at 2x/4x): those take U8NORM, I32 and F16 accesses and
+    * refuse I16, so a blended RGBA16F epilog reads its target as F16. */
+   if (f16 && !(ctx->ms_whole_sample && tib->nr_samples > 1))
       format = PIPE_FORMAT_R16_UINT;
 
    uint8_t offset_B = agx_tilebuffer_offset_B(tib, rt);
@@ -553,7 +556,7 @@ agx_nir_lower_tilebuffer_with_conversions(
    nir_shader *shader, struct agx_tilebuffer_layout *tib, uint8_t *colormasks,
    unsigned *bindless_base, nir_def *write_samples, bool *translucent,
    bool preserve_zero_mask, bool lower_srgb, bool lower_r11g11b10,
-   bool lower_g17p_formats, bool x_alpha_one)
+   bool ms_whole_sample, bool lower_g17p_formats, bool x_alpha_one)
 {
    assert(shader->info.stage == MESA_SHADER_FRAGMENT);
 
@@ -565,6 +568,7 @@ agx_nir_lower_tilebuffer_with_conversions(
       .preserve_zero_mask = preserve_zero_mask,
       .lower_srgb = lower_srgb,
       .lower_r11g11b10 = lower_r11g11b10,
+      .ms_whole_sample = ms_whole_sample,
       .lower_g17p_formats = lower_g17p_formats,
       .x_alpha_one = x_alpha_one,
    };
@@ -653,5 +657,5 @@ agx_nir_lower_tilebuffer(nir_shader *shader, struct agx_tilebuffer_layout *tib,
 {
    return agx_nir_lower_tilebuffer_with_conversions(
       shader, tib, colormasks, bindless_base, write_samples, translucent,
-      preserve_zero_mask, false, false, lower_g17p_formats, false);
+      preserve_zero_mask, false, false, false, lower_g17p_formats, false);
 }

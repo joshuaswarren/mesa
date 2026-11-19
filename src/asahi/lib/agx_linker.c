@@ -58,6 +58,7 @@ agx_fs_epilog_apply_device_policy(enum agx_chip chip,
     * PBE. */
    key->lower_srgb = chip == AGX_CHIP_G18G;
    key->lower_r11g11b10 = chip == AGX_CHIP_G18G;
+   key->ms_whole_sample = chip == AGX_CHIP_G18G;
    key->native_epilog = chip == AGX_CHIP_G18G;
    if (chip == AGX_CHIP_G18G &&
        (key->nr_samples == 1 || key->nr_samples == 2 || key->nr_samples == 4)) {

@@ -880,9 +880,17 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
 
    /* It's more efficient to use masked stores (with
     * agx_nir_lower_tilebuffer) than to emulate colour masking with
-    * nir_lower_blend.
+    * nir_lower_blend. Not where multisampled tile accesses move whole
+    * samples (ms_whole_sample, at 2x/4x): a mask that leaves some of the
+    * format's channels unwritten there reads, merges and stores each sample
+    * whole, as blending does. A mask of every channel the format has is a
+    * full one. Alpha-to-coverage keeps the masked store: its epilog computes
+    * the coverage, which the merge's per-sample stores cannot take as their
+    * mask.
     */
    uint8_t colormasks[8] = {0};
+   const bool g18_ms = key->ms_whole_sample && key->nr_samples > 1 &&
+                       !key->blend.alpha_to_coverage;
 
    for (unsigned i = 0; i < 8; ++i) {
       if (key->rt_formats[i] == PIPE_FORMAT_NONE)
@@ -897,7 +905,11 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
           */
          colormasks[i] = 0;
          opts.rt[i].colormask = (uint8_t)BITFIELD_MASK(4);
-      } else if (agx_tilebuffer_supports_mask(&tib, i)) {
+      } else if ((!g18_ms ||
+                  util_format_colormask_full(
+                     util_format_description(key->rt_formats[i]),
+                     key->blend.rt[i].colormask)) &&
+                 agx_tilebuffer_supports_mask(&tib, i)) {
          colormasks[i] = key->blend.rt[i].colormask;
          opts.rt[i].colormask = (uint8_t)BITFIELD_MASK(4);
       } else {
@@ -1099,7 +1111,7 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
    NIR_PASS(_, b->shader, agx_nir_lower_tilebuffer_with_conversions, &tib,
             colormasks, &rt_spill, store_samples, &force_translucent,
             preserve_zero_mask, key->lower_srgb, key->lower_r11g11b10,
-            key->g17p_tile_formats, key->native_epilog);
+            key->ms_whole_sample, key->g17p_tile_formats, key->native_epilog);
    const bool native_spills = key->native_spills && agx_tilebuffer_spills(&tib);
    const unsigned spill_generation = native_spills
       ? (key->native_spill_generation ? key->native_spill_generation : 9) : 0;
