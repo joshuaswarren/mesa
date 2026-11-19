@@ -319,7 +319,22 @@ static_assert(sizeof(struct hk_agx3_plan_args) == 120, "native planner push ABI"
  * node per 8-lane encoding workgroup (bvh/agx3_leaf.comp). */
 static_assert(HK_AGX3_M5_PLAN_TAIL_B == sizeof(struct hk_agx3_plan_state),
               "M5 scratch: no node-encoding dispatch arguments");
-static_assert(HK_AGX3_M5_AABB_RECORD_B == 48 &&
+struct hk_agx3_m5_aabb_record {
+   uint32_t marker; /* leaf type 24 */
+   float min[3];
+   float max[3];
+   uint32_t geometry_id; /* bit 31: opaque */
+   uint32_t primitive_id;
+   uint32_t primitive_flags; /* bit 30: optional primitive data present */
+   uint64_t primitive_data; /* relative pointer */
+};
+static_assert(offsetof(struct hk_agx3_m5_aabb_record, min) == 4 &&
+              offsetof(struct hk_agx3_m5_aabb_record, max) == 16 &&
+              offsetof(struct hk_agx3_m5_aabb_record, geometry_id) == 28 &&
+              offsetof(struct hk_agx3_m5_aabb_record, primitive_id) == 32 &&
+              offsetof(struct hk_agx3_m5_aabb_record, primitive_data) == 40,
+              "M5 bounding-box record layout (bvh/agx3_m5_legacy_leaf.comp)");
+static_assert(sizeof(struct hk_agx3_m5_aabb_record) == HK_AGX3_M5_AABB_RECORD_B &&
               HK_AGX3_M5_AABB_RECORD_B < HK_AGX3_AS_SLOT_B,
               "M5 bounding-box records pack below the slot size");
 static_assert(HK_AGX3_M5_IMAGE_ALIGN == 1024, "M5 image alignment");
@@ -481,7 +496,6 @@ hk_cmd_build_agx3_from_ir_mode(VkCommandBuffer command_buffer,
 
    const struct hk_agx3_leaf_args encode = {
       .jobs = args->jobs, .status = node_status, .job_count = args->node_bound,
-      .slot_bias = args->m5_aabb_stride,
    };
    const struct hk_agx3_envelope_args finish = {
       .jobs = args->envelope, .status = envelope_status, .job_count = 1,
@@ -702,10 +716,6 @@ hk_encode_as(VkCommandBuffer commandBuffer,
          .slot_bound = layout.slot_bound,
          .resource_id = hk_m5_as_id(dev, dst),
          .geometry_type = vk_get_as_geometry_type(state->build_info),
-         /* Native bounding-box records are 48 bytes (record class 4). The
-          * 64-byte class-5 slot form is a hardware A/B diagnostic only. */
-         .m5_aabb_stride = debug_get_num_option("ASAHI_M5_AABB_RECORD_STRIDE", 48) == 64
-                        ? 64 : 48,
       };
       VkResult result = hk_cmd_build_agx3_from_ir_mode(
          commandBuffer, &args, encode + layout.node_status,

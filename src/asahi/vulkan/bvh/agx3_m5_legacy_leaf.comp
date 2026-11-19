@@ -225,11 +225,8 @@ main()
    bool leaf = job.node_kind == HK_AGX3_NODE_LEAF;
    bool instances = job.node_kind == HK_AGX3_NODE_INSTANCES;
    bool aabbs = job.node_kind == HK_AGX3_NODE_AABBS;
-   /* Bounding-box record stride: 48 (native record class 4) by default; 64
-    * (class 5, one record per slot) is the ASAHI_M5_AABB_RECORD_STRIDE
-    * diagnostic. Both are valid Gen1 encodings; only hardware traversal
-    * distinguishes them. */
-   uint aabb_stride = HK_AGX3_GEN1 != 0 || args.slot_bias == 64u ? 64u : 48u;
+   /* Bounding-box record stride: the 48-byte native record (class 4). */
+   uint aabb_stride = HK_AGX3_GEN1 != 0 ? 64u : HK_AGX3_M5_AABB_RECORD_B;
    if (count < 1u || count > 8 ||
        job.node_kind > HK_AGX3_NODE_AABBS) {
       if (lane == 0)
@@ -327,7 +324,7 @@ main()
           * single-AABB geometries passed). */
          root[0] =
             uint64_t((instances ? 0xe1u
-                      : aabbs ? (HK_AGX3_GEN1 != 0 ? 0xa0u : ((aabb_stride == 64u ? 0xa0u : 0x80u) | 1u))
+                      : aabbs ? (HK_AGX3_GEN1 != 0 ? 0xa0u : 0x81u)
                       : 0xa0u) |
                      (leaf ? capacity << 1 : 0u) | (exponent.x << 8));
          for (uint a = 0; a < 3; ++a)
@@ -387,7 +384,7 @@ main()
       if (HK_AGX3_GEN1 != 0)
          for (uint i = 0; i < 16; ++i)
             store32(children + uint64_t(lane) * 64ul + uint64_t(i) * 4ul, 0);
-      /* 48-byte native bounding-box record at the selected record stride. */
+      /* 48-byte native bounding-box record (HK_AGX3_M5_AABB_RECORD_B). */
       uint64_t record = children + uint64_t(lane) * uint64_t(aabb_stride);
       store32(record, 0x18u);
       for (uint a = 0; a < 3; ++a) {

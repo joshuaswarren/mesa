@@ -320,7 +320,7 @@ emit(uint id)
    uint slots = leaf ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
                            ? 2u * count
                            : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
-                                ? HK_AGX3_GEN1 != 0 ? count : (count * (args.m5_aabb_stride == 64u ? 64u : 48u) + 63u) / 64u
+                                ? HK_AGX3_GEN1 != 0 ? count : (count * HK_AGX3_M5_AABB_RECORD_B + 63u) / 64u
                                 : count + (count + 3u) / 4u) : count;
    uint first = atomicAdd(DEREF(args.state).next_slot, slots);
    if (slots > args.slot_bound || first > args.slot_bound - slots) {
