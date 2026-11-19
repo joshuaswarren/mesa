@@ -78,6 +78,14 @@ lower_pack = [
      ('pack_32_2x16_split', ('ior', ('u2u16', a), ('ishl', ('u2u16', b), 8)),
                             ('ior', ('u2u16', c), ('ishl', ('u2u16', d), 8)))),
 
+    # A half taken from a word and narrowed again (u2u16(extract_u16(x, 1)),
+    # as the cooperative matrix lowering builds an operand from a 32-bit
+    # load) is the half itself. Without this the u2u32 of the rewrite below
+    # stays: a 16-to-32-bit move and a split per half, which register
+    # allocation turned into two moves per operand half.
+    (('u2u16', ('u2u32', 'a@16')), a),
+    (('u2u16', ('i2i32', 'a@16')), a),
+
     (('extract_u16', 'a@32', 0), ('u2u32', ('unpack_32_2x16_split_x', a))),
     (('extract_u16', 'a@32', 1), ('u2u32', ('unpack_32_2x16_split_y', a))),
     (('extract_i16', 'a@32', 0), ('i2i32', ('unpack_32_2x16_split_x', a))),

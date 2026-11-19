@@ -3445,6 +3445,11 @@ load("global_predicated_agx", [1, 1, 1],
 # a contiguous vec2-u32 descriptor; FLAGS selects the witnessed primitive leaf.
 intrinsic("allocate_mesh_uvb_agx", [1, 1])
 intrinsic("store_mesh_uvb_agx", [2], indices=[FLAGS])
+# G17P exporter phase boundary. BASE is enum agx_mesh_export_fence: complete
+# the index phase, or the preceding 32-vertex batch. Kept outside the export
+# predicates, including zero/partial counts. Not an API memory barrier or a
+# descriptor-lifetime annotation; no payload or SSA lifetime is introduced.
+intrinsic("fence_mesh_uvb_agx", indices=[BASE])
 # Object invocation0/1/2 publishes one child-grid dimension through UVSW.
 intrinsic("store_object_childcount_agx", [1])
 

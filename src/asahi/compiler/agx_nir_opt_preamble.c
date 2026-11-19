@@ -567,10 +567,12 @@ flag_store_value(nir_intrinsic_instr *store, bool *word)
    nir_alu_instr *sel = nir_def_as_alu_or_null(value);
    if (value->bit_size == 32 && sel && sel->op == nir_op_bcsel &&
        nir_src_bit_size(sel->src[0].src) == 1 &&
+       /* ALU sources are swizzled: a constant source can be a vector of
+        * which the select reads one component. */
        nir_src_is_const(sel->src[1].src) &&
-       nir_src_as_uint(sel->src[1].src) == 1 &&
+       nir_src_comp_as_uint(sel->src[1].src, sel->src[1].swizzle[0]) == 1 &&
        nir_src_is_const(sel->src[2].src) &&
-       nir_src_as_uint(sel->src[2].src) == 0) {
+       nir_src_comp_as_uint(sel->src[2].src, sel->src[2].swizzle[0]) == 0) {
       *word = true;
       return nir_get_scalar(sel->src[0].src.ssa, sel->src[0].swizzle[0]);
    }

@@ -289,6 +289,9 @@ struct dri2_egl_display {
    char *device_name;
    bool is_render_node;
    clockid_t presentation_clock_id;
+   /* egl_wl_scanout_size / MESA_EGL_WL_SCANOUT, read at initialization;
+    * 0 when unset. */
+   int wl_scanout_width, wl_scanout_height;
 #endif
 
 #ifdef HAVE_ANDROID_PLATFORM
