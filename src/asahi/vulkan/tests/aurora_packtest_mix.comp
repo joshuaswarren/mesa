@@ -1,0 +1,15 @@
+#version 450
+/* One round of the mix function, with no loop: packets of these stay within
+ * the static work bound. */
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer State { uint words[]; };
+layout(push_constant) uniform Step { uint from; uint to; uint salt; uint rounds; } control;
+
+void main()
+{
+    uint lane = gl_GlobalInvocationID.x;
+    uint value = words[control.from + lane] ^ control.salt;
+    value = (value ^ (value >> 13u)) * 0x85ebca6bu;
+    value = (value ^ (value >> 16u)) * 0xc2b2ae35u;
+    words[control.to + lane] = value ^ (value >> 15u);
+}

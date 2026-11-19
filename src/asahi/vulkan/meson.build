@@ -270,6 +270,29 @@ if with_tests
       suite : ['asahi'],
     )
 
+    # Submit packing: the member check, the planner and the dependency fold,
+    # resolved through the real hk_sync resolver; no device or GPU.
+    test(
+      'hk_pack',
+      executable(
+        'hk_pack_test',
+        files('tests/test-hk-pack.c', 'hk_pack.c', 'hk_sync.c'),
+        include_directories : [
+          include_directories('.'),
+          inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
+          inc_virtio_gpu, inc_virtio_vdrm,
+        ],
+        dependencies : [
+          idep_nir_headers, idep_mesautil, idep_libagx,
+          idep_libagx_shaders_h, idep_agx_pack,
+          idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+        ],
+        link_args : [ld_args_gc_sections],
+        gnu_symbol_visibility : 'hidden',
+      ),
+      suite : ['asahi'],
+    )
+
     # The deferred occlusion-availability resolver against mock control
     # streams, with the real hk_sync stream bookkeeping it drops streams from.
     test(
@@ -996,6 +1019,16 @@ if with_tests
   executable(
     'aurora-tilesubmit',
     files('tests/aurora_tilesubmit.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  # Submit packing on hardware: run with HK_PACK_CDM_SUBMIT=0 and =1.
+  executable(
+    'aurora-packtest',
+    files('tests/aurora_packtest.c'),
     include_directories : [inc_include],
     dependencies : [cc.find_library('vulkan')],
     c_args : [c_msvc_compat_args],
