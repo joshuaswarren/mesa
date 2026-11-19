@@ -10,10 +10,9 @@
  *
  * Field ids are shared by the three tables, but ep numbering, form sizes and
  * the set of fields each mnemonic consumes are not: a G17G field vector is
- * not a G18G one.  agx3_compose_mnemonic tries forms in ep order.  Apple's
- * encoder tries them by ascending size, ep breaking ties, and the two orders
- * differ for some mnemonics of each table (agx3d: the branches, rld, f32fma,
- * f32mul, ...), so callers that need Apple's choice pick the form themselves.
+ * not a G18G one.  Apple's encoder tries a mnemonic's forms by ascending
+ * size, ep breaking ties, which differs from ep order for some mnemonics of
+ * each table (agx3d: the branches, rld, f32fma, f32mul, ...), so callers that need Apple's choice pick the form themselves.
  *
  * Semantics mirror composer.py exactly and fail closed:
  *  - the caller supplies the tables' anonymous field values
@@ -82,11 +81,6 @@ bool agx3_compose(const agx3_table *t, uint32_t form,
 bool agx3_compose_known(const agx3_table *t, uint32_t form,
                         const uint64_t fields[AGX3_MAX_FIELDS],
                         const uint64_t nonzero[3], uint8_t *out);
-
-/* First form of this mnemonic whose encode succeeds; -1 if none. */
-int32_t agx3_compose_mnemonic(const agx3_table *t, const char *mnemonic,
-                              const uint64_t fields[AGX3_MAX_FIELDS],
-                              uint8_t *out, uint8_t *size);
 
 int32_t agx3_form_index(const agx3_table *t, const char *mnemonic, uint8_t ep);
 

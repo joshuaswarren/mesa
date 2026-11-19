@@ -92,17 +92,6 @@ bool agx_ioto_constant_program_emit(
    uint64_t suffix_va, struct agx_ioto_preshader_output *output);
 
 /*
- * Reproduce the size choice in setConstantCalculationProgramInfo:
- *
- *   end32 > start ? (uint32_t)(end32 - start) : alternate_end - start
- *
- * Unlike Apple's unchecked subtraction, malformed descending ranges fail.
- * `size` is unchanged on failure.
- */
-bool agx_ioto_preshader_program_size(uint32_t start, uint32_t end32,
-                                     uint64_t alternate_end, size_t *size);
-
-/*
  * Bind a nonempty compiled range to matching CPU and GPU copies of its
  * original binary. The GPU base must not refer to a separately linked main
  * shader. Both copies must contain the whole range, and its GPU extent must

@@ -7,8 +7,6 @@
 #include "drm-uapi/asahi_drm.h"
 
 
-enum hk_mesh_mode { HK_MESH_MODE_NATIVE_PROBE };
-
 /* A native G17P mesh launch runs at most this many mesh workgroups: a larger
  * child grid launches none. A draw's mesh workgroups therefore go out in
  * launches of whole rows: launch k publishes (X, rows, 1) children, and row
@@ -33,12 +31,9 @@ hk_mesh_launch_rows(uint32_t x)
    const uint32_t slices = (per + HK_MESH_LAUNCH_MAX_Y - 1) / HK_MESH_LAUNCH_MAX_Y;
    return (per / slices) * slices;
 }
-static inline enum hk_mesh_mode hk_mesh_mode(void) {
-   return HK_MESH_MODE_NATIVE_PROBE;
-}
 
-/* M5 task (object) shaders, in native-probe mesh mode on G17S. taskShader is
- * a required feature of VK_EXT_mesh_shader. The native object->mesh record
+/* M5 task (object) shaders on G17S. taskShader is a required feature of
+ * VK_EXT_mesh_shader. The native object->mesh record
  * (child grid and payload at the SR62/SR63 payload address) needs the kernel
  * to bind the TA mesh rendering buffer (0x1ca48) to task kicks, which it
  * reports with DRM_ASAHI_FEATURE_TASK_MESH_STORAGE; taskShader is
@@ -46,12 +41,8 @@ static inline enum hk_mesh_mode hk_mesh_mode(void) {
  * accepted. hk_m5_task_record() reports that kernel storage; whether a task
  * also writes the child grid at +0 is decided per task/mesh pair
  * (hk_mesh_info::m5_no_grid_record). */
-static inline bool hk_m5_task_enabled(void) {
-   return hk_mesh_mode()==HK_MESH_MODE_NATIVE_PROBE;
-}
 static inline bool hk_m5_task_record(uint64_t kernel_features) {
-   return hk_m5_task_enabled() &&
-          (kernel_features & DRM_ASAHI_FEATURE_TASK_MESH_STORAGE);
+   return kernel_features & DRM_ASAHI_FEATURE_TASK_MESH_STORAGE;
 }
 static inline unsigned hk_m5_task_payload_limit(uint64_t kernel_features) {
    return hk_m5_task_record(kernel_features) ? 16384 : 0;

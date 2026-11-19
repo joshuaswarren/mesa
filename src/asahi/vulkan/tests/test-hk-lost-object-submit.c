@@ -3,7 +3,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
-#include "util/os_time.h"
+#include "c11/threads.h"
 #include "hk_buffer.h"
 #include "hk_device.h"
 #include "hk_device_memory.h"
@@ -23,21 +23,47 @@
          abort();                                                              \
       }                                                                        \
    } while (0)
-static int entered, released, cleanup_started, cleanup_done, calls;
+/* Every flag is set under `lock` and broadcast on `cond`, so each step waits
+ * for the event it depends on rather than for a time. */
+static mtx_t lock;
+static cnd_t cond;
+static int entered, released, quiescing, returned, cleanup_done, calls;
 static bool pending_wait;
 struct test_sync {
    struct vk_sync base;
    unsigned marker;
 };
 static void
+set(int *flag)
+{
+   mtx_lock(&lock);
+   p_atomic_set(flag, 1);
+   cnd_broadcast(&cond);
+   mtx_unlock(&lock);
+}
+static void
+await_any(int *a, int *b)
+{
+   mtx_lock(&lock);
+   while (!p_atomic_read(a) && !p_atomic_read(b))
+      CHECK(cnd_wait(&cond, &lock) == thrd_success);
+   mtx_unlock(&lock);
+}
+static void
 await(int *flag)
 {
-   int64_t end = os_time_get_nano() + 2 * ONE_SECOND_IN_NS;
-   while (!p_atomic_read(flag)) {
-      CHECK(os_time_get_nano() < end);
-      const struct timespec delay = {.tv_nsec = 1000000};
-      thrd_sleep(&delay, NULL);
-   }
+   await_any(flag, flag);
+}
+/* Object teardown on a lost device joins the queue's host submissions here.
+ * Report entry so the test releases the paused submission only once the
+ * cleanup thread is committed to waiting for it. */
+void __real_vk_queue_wait_lost_submissions(struct vk_queue *queue);
+void __wrap_vk_queue_wait_lost_submissions(struct vk_queue *queue);
+void
+__wrap_vk_queue_wait_lost_submissions(struct vk_queue *queue)
+{
+   set(&quiescing);
+   __real_vk_queue_wait_lost_submissions(queue);
 }
 static VkResult
 sync_init(struct vk_device *dev, struct vk_sync *sync, uint64_t value)
@@ -68,9 +94,10 @@ sync_wait(struct vk_device *dev, struct vk_sync *sync, uint64_t value,
 {
    CHECK(flags & VK_SYNC_WAIT_PENDING);
    CHECK(pending_wait);
-   p_atomic_set(&entered, 1);
+   set(&entered);
    await(&released);
    CHECK(((struct test_sync *)sync)->marker == 1234);
+   set(&returned);
    return VK_ERROR_DEVICE_LOST;
 }
 static const struct vk_sync_type sync_type = {
@@ -89,7 +116,7 @@ static VkResult
 driver_submit(struct vk_queue *q, struct vk_queue_submit *s)
 {
    p_atomic_inc(&calls);
-   p_atomic_set(&entered, 1);
+   set(&entered);
    await(&released);
    CHECK(s->buffer_bind_count == 1 && s->image_opaque_bind_count == 1);
    VK_FROM_HANDLE(hk_buffer, buffer, s->buffer_binds[0].buffer);
@@ -101,6 +128,7 @@ driver_submit(struct vk_queue *q, struct vk_queue_submit *s)
    for (unsigned i = 0; i < s->signal_count; i++)
       CHECK(vk_sync_signal(q->base.device, s->signals[i].sync,
                            s->signals[i].signal_value) == VK_SUCCESS);
+   set(&returned);
    return VK_SUCCESS;
 }
 struct fixture {
@@ -145,9 +173,10 @@ static int
 cleanup(void *data)
 {
    struct fixture *f = data;
-   p_atomic_set(&cleanup_started, 1);
    destroy(f, f->kind);
-   p_atomic_set(&cleanup_done, 1);
+   /* The object may only go once the submission that uses it has returned. */
+   CHECK(p_atomic_read(&returned));
+   set(&cleanup_done);
    return 0;
 }
 static void
@@ -224,7 +253,7 @@ run(unsigned kind, bool wait)
                           .pSignalSemaphores = &sem,
                           .waitSemaphoreCount = wait,
                           .pWaitSemaphores = &sem};
-   entered = released = cleanup_started = cleanup_done = calls = 0;
+   entered = released = quiescing = returned = cleanup_done = calls = 0;
    pending_wait = wait;
    CHECK(vk_common_QueueBindSparse(vk_queue_to_handle(&q.vk), 1, &bi,
                                    vk_fence_to_handle(f.fence)) == VK_SUCCESS);
@@ -232,11 +261,10 @@ run(unsigned kind, bool wait)
    p_atomic_set(&dev->_lost.lost, 1);
    thrd_t thread;
    CHECK(thrd_create(&thread, cleanup, &f) == thrd_success);
-   await(&cleanup_started);
-   const struct timespec delay = {.tv_nsec = 100000000};
-   thrd_sleep(&delay, NULL);
-   CHECK(!p_atomic_read(&cleanup_done));
-   p_atomic_set(&released, 1);
+   /* Teardown must join the paused submission, not finish around it. */
+   await_any(&quiescing, &cleanup_done);
+   CHECK(p_atomic_read(&quiescing) && !p_atomic_read(&cleanup_done));
+   set(&released);
    await(&cleanup_done);
    CHECK(thrd_join(thread, NULL) == thrd_success);
    CHECK(p_atomic_read(&calls) == !wait);
@@ -253,8 +281,12 @@ run(unsigned kind, bool wait)
 int
 main(void)
 {
+   CHECK(mtx_init(&lock, mtx_plain) == thrd_success);
+   CHECK(cnd_init(&cond) == thrd_success);
    for (unsigned kind = 0; kind < 5; kind++)
       run(kind, false);
    run(3, true);
+   cnd_destroy(&cond);
+   mtx_destroy(&lock);
    return 0;
 }

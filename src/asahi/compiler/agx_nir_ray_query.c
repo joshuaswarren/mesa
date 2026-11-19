@@ -240,12 +240,3 @@ agx_nir_gen1_wait_traversal(nir_builder *b, nir_def *query_base, nir_def *lane,
    nir_pop_if(b,NULL);
    return nir_load_var(b, completed);
 }
-
-void
-agx_nir_gen1_trace_opaque(nir_builder *b, nir_def *bvh, nir_def *request,
-                         nir_def *query_base, nir_def *lane,
-                         nir_def *launch, unsigned context_uniform)
-{
-   agx_nir_gen1_trace_opaque_with_status(b, bvh, request, query_base, lane,
-                                       launch, context_uniform, 128);
-}

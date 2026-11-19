@@ -1419,7 +1419,6 @@ test_modified_minifloat_add(void)
 {
    /* Fresh Apple Metal 32023.917, applegpu_g17p: sat_only, complement,
     * sat_add, sat_neg, complement_reuse, sat_reuse, sat_pair, cache_add.
-    * Source and native objects are retained in .tmp/g17p-alpha-20260905.
     */
    const struct {
       unsigned dest, src, imm;

@@ -1341,24 +1341,6 @@ agx3_tex_encode_image_write_g18g(enum agx_isa_encoding enc,
    return true;
 }
 
-bool
-agx3_tex_encode_image_write_g18g_r32(enum agx_isa_encoding enc,
-                                     uint16_t x_half,
-                                     uint8_t out[AGX3_TEX_MAX_LENGTH],
-                                     uint8_t *len)
-{
-   /* Kick 19's vector: one integer component, 2D, index 0, slot 1. */
-   const struct agx3_image_write_g18g_desc d = {
-      .x_half = x_half,
-      .components = 1,
-      .float_data = false,
-      .dim = AGX3_IMAGE_WRITE_2D,
-      .image_index = 0,
-      .slot = 1,
-   };
-   return agx3_tex_encode_image_write_g18g(enc, &d, out, len);
-}
-
 static uint16_t
 word(const uint8_t *p, unsigned i)
 {
@@ -1635,18 +1617,6 @@ agx3_tex_stage_array_minimum_lod(enum agx_isa_encoding enc, uint16_t src,
 {
    return stage_typed_lod_half(enc, 4, src, slot, wait_mask, src_cache,
                                src_discard, AGX3_TEX_LEVEL_MINIMUM, false, out, len);
-}
-
-/* Experimental query-bias publication, validated by numeric hardware
- * readback before promotion. Query3D uses Y0/bias2; query2D uses Y2/bias4. */
-bool
-agx3_tex_stage_query_bias_g18g(bool three_d, uint16_t src, uint8_t slot,
-                                uint16_t wait_mask,
-                                uint8_t out[AGX3_TEX_MAX_LENGTH], uint8_t *len)
-{
-   return stage_typed_lod_half(AGX_ISA_ENCODING_AGX3C, three_d ? 2 : 4,
-                               src, slot, wait_mask, false, true,
-                               AGX3_TEX_LEVEL_FLOAT, false, out, len);
 }
 
 bool

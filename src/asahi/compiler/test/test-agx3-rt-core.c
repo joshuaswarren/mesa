@@ -300,8 +300,7 @@ main(void)
     *   metal-nt -arch applegpu_g17p -N <src>.mtlp-json \
     *            -platform_version macos 26.0 26.0 <src>.metallib -o <src>.nat
     *
-    * over two sources: the five ray-query kernels of
-    * .tmp/g17p-raytracing-evidence/rq.metal, and a 1/2/3/4-concurrent-query
+    * over two sources: five ray-query kernels and a 1/2/3/4-concurrent-query
     * family.  Linear-scanning both __text images yields exactly these 24
     * (f2, f24) pairs.  Each comment names one site the bytes were read at.
     *

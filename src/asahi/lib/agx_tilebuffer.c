@@ -418,15 +418,6 @@ agx_g17p_rgba8_mrt_mask(const struct agx_tilebuffer_layout *tib)
 }
 
 unsigned
-agx_g18g_rgba8_mrt_mask(const struct agx_tilebuffer_layout *tib)
-{
-   /* Native G18 clear/load/mixed/sparse capture308 binds 32-byte samples
-    * in a 32x32 single-sample tile. Keep this separate from G17P's budget. */
-   return tib && tib->tile_size == 32 * 32
-             ? agx_word_mrt_mask(tib, 32768, false, true, true) : 0;
-}
-
-unsigned
 agx_g18g_word_mrt_mask(const struct agx_tilebuffer_layout *tib)
 {
    /* Native1068's two-target sRGB clear/load/mixed renders use the same
@@ -948,14 +939,6 @@ agx_g18g_ms_mrt_mask(const struct agx_tilebuffer_layout *tib)
    return count >= 2 && count <= 3 &&
           tib->sample_size_B == ALIGN_POT(stride * count, 8)
              ? mask : 0;
-}
-
-unsigned
-agx_g17p_wide_rgba8_mrt_count(const struct agx_tilebuffer_layout *tib)
-{
-   const unsigned mask = agx_g17p_rgba8_mrt_mask(tib);
-   const unsigned count = util_bitcount(mask);
-   return count >= 3 && mask == BITFIELD_MASK(count) ? count : 0;
 }
 
 unsigned

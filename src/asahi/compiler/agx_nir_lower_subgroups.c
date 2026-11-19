@@ -258,6 +258,55 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
    }
 }
 
+/* AGX float min/max return one of their operands' bits, so
+ * agx_nir_lower_fminmax() flushes their results when the shader asks for
+ * 32-bit denormals to be flushed. A subgroup min/max can return a lane's own
+ * value without any min/max, as a reduction over one active lane or in
+ * clusters of one does, so flush the value it reduces first. A value already
+ * flushed is left alone, so every subgroup lowering can run this first.
+ */
+static bool
+is_flushed(nir_def *def)
+{
+   if (!nir_def_is_alu(def))
+      return false;
+   nir_alu_instr *alu = nir_def_as_alu(def);
+   if (alu->op == nir_op_fcanonicalize)
+      return true;
+   return alu->op == nir_op_fadd && nir_src_is_const(alu->src[1].src) &&
+          nir_src_comp_as_uint(alu->src[1].src, alu->src[1].swizzle[0]) ==
+             0x80000000u;
+}
+
+static bool
+flush_reduced_value(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if ((intr->intrinsic != nir_intrinsic_reduce &&
+        intr->intrinsic != nir_intrinsic_inclusive_scan &&
+        intr->intrinsic != nir_intrinsic_exclusive_scan) ||
+       intr->def.bit_size != 32)
+      return false;
+
+   const nir_op op = nir_intrinsic_reduction_op(intr);
+   if ((op != nir_op_fmin && op != nir_op_fmax) || is_flushed(intr->src[0].ssa))
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   b->fp_math_ctrl = nir_fp_no_fast_math;
+   nir_src_rewrite(&intr->src[0], nir_fadd_imm(b, intr->src[0].ssa, -0.0));
+   return true;
+}
+
+bool
+agx_nir_flush_subgroup_minmax(nir_shader *s)
+{
+   if (!nir_is_denorm_flush_to_zero(s->info.float_controls_execution_mode, 32))
+      return false;
+
+   return nir_shader_intrinsics_pass(s, flush_reduced_value,
+                                     nir_metadata_control_flow, NULL);
+}
+
 static bool
 agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float,
                                 bool optimize_ballot_count,
@@ -286,7 +335,9 @@ agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float,
       .subgroup_size = 32,
    };
 
-   bool progress = nir_lower_subgroups(s, &opts);
+   bool progress = agx_nir_flush_subgroup_minmax(s);
+
+   progress |= nir_lower_subgroups(s, &opts);
 
    /* Then do AGX-only lowerings on top */
    progress |= nir_shader_intrinsics_pass(s, lower, nir_metadata_control_flow,

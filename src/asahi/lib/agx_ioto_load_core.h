@@ -45,14 +45,10 @@ struct agx_ioto_cprog_inputs {
 
 /* G17P default TPS input layout: source indices are packed in increasing
  * order at TPS byte 16. Offset is relative to that payload, for
- * agx3_ioto_pack_cprog_copy(). Output arguments are unchanged on failure.
- * Frame size covers input storage only, not compiler pressure spills. */
+ * agx3_ioto_pack_cprog_copy(). Output arguments are unchanged on failure. */
 bool agx_ioto_cprog_input_offset(enum agx_chip chip,
                                 const struct agx_ioto_cprog_inputs *inputs,
                                 uint16_t source_half, uint16_t *offset_bytes);
-bool agx_ioto_cprog_input_frame(enum agx_chip chip,
-                               const struct agx_ioto_cprog_inputs *inputs,
-                               uint16_t *input_halfs, uint16_t *frame_bytes);
 
 enum agx_ioto_load_encoding {
    AGX_IOTO_LOAD_ENCODING_UNSUPPORTED = 0,
@@ -272,8 +268,6 @@ enum agx_ioto_load_alloc_result {
 };
 
 enum agx_ioto_load_encoding agx_ioto_load_target_encoding(enum agx_chip chip);
-
-bool agx_ioto_load_production_ready(enum agx_chip chip);
 
 bool agx_ioto_load_core_init(struct agx_ioto_load_core *core,
                              enum agx_chip chip, struct agx_ioto_load_sink sink,

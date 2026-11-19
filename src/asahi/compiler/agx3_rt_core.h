@@ -247,7 +247,7 @@ bool agx3_rt_inc_stk_operands(enum agx_isa_encoding enc, uint16_t operand_f2,
  * on control-flow position, not RT opcode: a continue_ray at loop re-entry
  * uses ENTRY, while a continue_ray in the spin body uses IN_LOOP.  The same
  * scopes occur before the SCS epilogue and shader end respectively.
- * See README-g17p-rt-hardware-abi.md; no wider memory semantics are inferred.
+ * No wider memory semantics are inferred.
  */
 enum agx3_rt_barrier_scope {
    AGX3_RT_BARRIER_IN_LOOP = 1,

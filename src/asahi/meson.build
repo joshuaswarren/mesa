@@ -143,6 +143,23 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # A sparse image bind as a queue's first submission, with no command buffer.
+  test(
+    'hk-g17p-sparse-bind-first-submit',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      hk_vulkan_sparse_bind_first_submit,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # Background/end-of-tile shader cache shared by command buffers recording
   # on several threads.
   test(

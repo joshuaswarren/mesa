@@ -465,6 +465,23 @@ agx_twiddled_allowed(const struct agx_resource *pres)
    return true;
 }
 
+/* G17P depth: a private, single-level, single-layer, single-sample Z32F
+ * depth buffer, as Honeykrisp compresses (hk_g17p_compression_depth_format()).
+ * ZLS writes it compressed through the metadata agx_batch already passes, and
+ * the compressed Gen9 2D texture packet reads it. On the M4 Max this is
+ * byte-identical to plain depth through depth testing across passes,
+ * readback, sampling, shadow comparison, blits and scissored clears. */
+static bool
+agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
+                                           const struct pipe_resource *templ)
+{
+   return dev->chip == AGX_CHIP_G17P &&
+          templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
+          templ->array_size <= 1 && templ->last_level == 0 &&
+          templ->nr_samples <= 1 && templ->format == PIPE_FORMAT_Z32_FLOAT &&
+          !(templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DEPTH_STENCIL));
+}
+
 /* G17P compresses a private, single-level, single-layer, single-sample 2D
  * colour image of agx_g17p_compression_color_format(): written by the
  * compressed Gen9 2D PBE (end-of-tile stores, blits, staging uploads) and
@@ -506,7 +523,8 @@ agx_compression_allowed(const struct agx_resource *pres)
     * that never need it.
     */
    if (agx_gallium_descriptor_generation_is_agx3(generation)) {
-      if (!agx_g17p_private_compression_allowed(dev, &pres->base)) {
+      if (!agx_g17p_private_compression_allowed(dev, &pres->base) &&
+          !agx_g17p_private_depth_compression_allowed(dev, &pres->base)) {
          rsrc_debug(pres, "No compression: outside the G17P policy\n");
          return false;
       }
@@ -1850,7 +1868,10 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
       c->fragment_helper.binary = agx_helper_program(&batch->ctx->bg_eot);
    }
 
-   if (batch->timestamps.size > 0) {
+   /* ASAHI_MESA_DEBUG=stats times every render (agx_batch_print_stats()). */
+   if (batch->timestamps.size > 0 ||
+       ((agx_device(batch->ctx->base.screen)->debug & AGX_DBG_STATS) &&
+        batch->ctx->timestamps)) {
       c->ts_vtx.start.handle = batch->ctx->timestamp_handle;
       c->ts_frag.end.handle = batch->ctx->timestamp_handle;
       c->ts_vtx.start.offset = timestamp_offset(batch, vtx_start);
@@ -1999,11 +2020,14 @@ agx_flush_compute(struct agx_context *ctx, struct agx_batch *batch,
       cmdbuf->helper.binary = agx_helper_program(&batch->ctx->bg_eot);
    }
 
-   if (batch->timestamps.size > 0) {
+   const bool stats = (agx_device(ctx->base.screen)->debug & AGX_DBG_STATS) &&
+                      ctx->timestamps;
+   if (batch->timestamps.size > 0 || stats) {
       cmdbuf->ts.start.handle = ctx->timestamp_handle;
       cmdbuf->ts.end.handle = ctx->timestamp_handle;
       cmdbuf->ts.start.offset = timestamp_offset(batch, comp_start);
-      cmdbuf->ts.end.offset = timestamp_offset(batch, comp_start);
+      cmdbuf->ts.end.offset = stats ? timestamp_offset(batch, comp_end)
+                                    : timestamp_offset(batch, comp_start);
    }
 }
 
@@ -2145,6 +2169,7 @@ agx_destroy_context(struct pipe_context *pctx)
       util_blitter_destroy(ctx->blitter);
 
    util_unreference_framebuffer_state(&ctx->framebuffer);
+   util_unreference_framebuffer_state(&ctx->zs_merge_real);
 
    agx_bg_eot_cleanup(&ctx->bg_eot);
    agx_destroy_meta_shaders(ctx);

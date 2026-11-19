@@ -7,8 +7,7 @@
  * layout, and the pipeline stack-size arithmetic.
  *
  * These are split out so they can be unit-tested on the host with no device,
- * no NIR and no command buffer.  The ABI they describe is documented in
- * docs/G17P_RAYTRACING_PIPELINE_ABI.md.
+ * no NIR and no command buffer.
  */
 
 #pragma once

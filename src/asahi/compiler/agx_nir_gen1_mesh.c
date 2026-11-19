@@ -494,15 +494,6 @@ varyings_valid(const struct agx_m5_mesh_varyings *v)
 }
 
 bool
-agx_nir_lower_gen1_mesh_triangle_probe(nir_shader *s)
-{
-   struct agx_m5_mesh_varyings varyings;
-   if (!agx_gen1_mesh_gather_varyings(s, &varyings))
-      M5_REFUSE();
-   return agx_nir_lower_gen1_mesh(s, &varyings);
-}
-
-bool
 agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings)
 {
    unsigned threads=s->info.workgroup_size[0]*s->info.workgroup_size[1]*
@@ -1153,57 +1144,6 @@ agx_nir_lower_gen1_task_payload_probe(nir_shader *s)
       }
    }
    nir_shader_intrinsics_pass(s,lower_payload,nir_metadata_control_flow,NULL);
-   return true;
-}
-
-static bool
-lower_launch(nir_builder *b,nir_intrinsic_instr *i,void *data)
-{
-   if (i->intrinsic!=nir_intrinsic_launch_mesh_workgroups) M5_REFUSE();
-   const unsigned grid=*(unsigned *)data;
-   b->cursor=nir_before_instr(&i->instr);
-   nir_push_if(b,nir_ieq_imm(b,nir_load_local_invocation_index(b),0));
-   nir_store_shared(b,i->src[0].ssa,nir_imm_int(b,grid),
-                       .write_mask=7,.align_mul=4);
-   nir_pop_if(b,NULL);
-   nir_instr_remove(&i->instr);
-   return true;
-}
-
-bool
-agx_nir_lower_gen1_task_probe(nir_shader *s)
-{
-   unsigned threads=s->info.workgroup_size[0]*s->info.workgroup_size[1]*
-                    s->info.workgroup_size[2];
-   if (s->info.stage!=MESA_SHADER_TASK || s->info.workgroup_size_variable ||
-       threads<3 || threads>128 || s->info.shared_size>48 ||
-       !agx_nir_lower_gen1_task_payload_probe(s)) M5_REFUSE();
-   unsigned launches=0;
-   nir_foreach_function_impl(impl,s) {
-      nir_foreach_block(block,impl) {
-         nir_foreach_instr(in,block) {
-            if (in->type==nir_instr_type_intrinsic &&
-                nir_instr_as_intrinsic(in)->intrinsic==nir_intrinsic_launch_mesh_workgroups)
-               launches++;
-         }
-      }
-   }
-   if (!launches) M5_REFUSE();
-   unsigned grid=ALIGN_POT(s->info.shared_size,16);
-   nir_shader_intrinsics_pass(s,lower_launch,nir_metadata_none,&grid);
-   nir_builder b=nir_builder_at(nir_after_cf_list(&nir_shader_get_entrypoint(s)->body));
-   nir_barrier(&b,.execution_scope=SCOPE_WORKGROUP,.memory_scope=SCOPE_WORKGROUP,
-      .memory_semantics=NIR_MEMORY_ACQ_REL,
-      .memory_modes=nir_var_mem_shared);
-
-   nir_def *lane=nir_load_local_invocation_index(&b);
-   nir_push_if(&b,nir_ult_imm(&b,lane,3));
-   nir_def *value=nir_load_shared(&b,1,32,
-      nir_iadd_imm(&b,nir_imul_imm(&b,lane,4),grid),.align_mul=4);
-   nir_store_object_childcount_agx(&b,value);
-   nir_pop_if(&b,NULL);
-   s->info.shared_size=64;
-   nir_progress(true,b.impl,nir_metadata_none);
    return true;
 }
 
