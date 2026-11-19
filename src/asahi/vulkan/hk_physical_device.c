@@ -1875,7 +1875,7 @@ hk_codegen_env_hash(void)
    static const char *const runtime_only[] = {
       "TRACE", "DUMP", "_LOG", "PERF", "VERBOSE", "DEBUG_OBJECT", "SLOW_DRAW",
       "DISK_CACHE_ID", "LAZY_GENERIC", "FORCE_GENERIC", "BIND_PREDICT",
-      "VARIANT_TRACE", "SLOW_SUBMIT", "PROLOG_DISK_CACHE",
+      "VARIANT_TRACE", "SLOW_SUBMIT", "PROLOG_DISK_CACHE", "FRAME_ANATOMY",
    };
    const char *list[512];
    unsigned n = 0;
@@ -1891,9 +1891,13 @@ hk_codegen_env_hash(void)
          for (size_t o = 0; o + l <= name_len && !skip; ++o)
             skip = !strncmp(*e + o, runtime_only[i], l);
       }
-      /* HK_PERFTEST includes code-generation choices such as noborder. */
+      /* HK_PERFTEST includes code-generation choices such as noborder.
+       * HK_FRAME_ANATOMY_DUMP writes NIR only for shaders it compiles, so a
+       * warm cache would leave the dump empty. */
       if (!skip || (name_len == strlen("HK_PERFTEST") &&
-                    !strncmp(*e, "HK_PERFTEST", name_len)))
+                    !strncmp(*e, "HK_PERFTEST", name_len)) ||
+          (name_len == strlen("HK_FRAME_ANATOMY_DUMP") &&
+           !strncmp(*e, "HK_FRAME_ANATOMY_DUMP", name_len)))
          list[n++] = *e;
    }
    qsort(list, n, sizeof(list[0]), hk_env_cmp);

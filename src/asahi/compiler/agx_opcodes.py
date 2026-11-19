@@ -485,6 +485,8 @@ op("allocate_uvb_m5", _, dests=0, srcs=2, can_eliminate=False,
    can_reorder=False, schedule_class="store", agx3_mnemonic="allocate_uvb")
 op("store_uvb_m5", _, dests=0, srcs=1, imms=[IMM], can_eliminate=False,
    can_reorder=False, schedule_class="store", agx3_mnemonic="uvst")
+op("fence_uvb_gen1", _, dests=0, srcs=0, imms=[IMM], can_eliminate=False,
+   can_reorder=False, schedule_class="barrier")
 
 op("store_object_childcount_m5", _, dests=0, srcs=1, can_eliminate=False,
    can_reorder=False, schedule_class="store", agx3_mnemonic="uvsw")

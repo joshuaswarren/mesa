@@ -482,6 +482,10 @@
    DRI_CONF_OPT_F(heap_memory_percent, def, 0.0, 1.0, \
                   "Percentage of total system memory to report as gpu heap memory (0 = driver default)")
 
+#define DRI_CONF_EGL_WL_SCANOUT_SIZE() \
+   DRI_CONF_OPT_S_NODEF(egl_wl_scanout_size, \
+                        "WxH: Wayland EGL window surfaces of exactly this buffer size present an opaque LINEAR buffer (direct scanout of a full-screen window)")
+
 /**
  * \brief Initialization configuration options
  */

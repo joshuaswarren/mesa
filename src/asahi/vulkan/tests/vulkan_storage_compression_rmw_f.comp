@@ -1,0 +1,20 @@
+/* Copyright 2026 Jonathan Goyvaerts
+ * SPDX-License-Identifier: MIT
+ */
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform image2D img;
+layout(push_constant) uniform P { float scale; uint mul_x, mul_y, mod_, add; ivec4 r; } pc;
+void main()
+{
+   uvec2 l = gl_GlobalInvocationID.xy;
+   if (l.x >= uint(pc.r.z) || l.y >= uint(pc.r.w))
+      return;
+   ivec2 p = pc.r.xy + ivec2(l);
+   if ((uint(p.x) * pc.mul_x + uint(p.y) * pc.mul_y) % pc.mod_ != 0u)
+      return;
+   vec4 v = imageLoad(img, p);
+   uvec4 k = (uvec4(round(v / pc.scale)) + pc.add) % 64u;
+   imageStore(img, p, vec4(k) * pc.scale);
+}

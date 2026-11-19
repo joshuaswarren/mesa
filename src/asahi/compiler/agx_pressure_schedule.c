@@ -729,8 +729,8 @@ ilp_place_exit_compare(agx_block *block, struct sched_node **nodes,
  * instructions ahead of LSTCOL, and the class-8 (read) wait three ahead of
  * LLDCOL, so the in-order warp could block on the pixel protocol before
  * independent arithmetic. Apple's G17P fragments put each wait immediately
- * ahead of the tile access it orders (fs-apple.bin +0x106 pixwait 8 ->
- * lldcol, +0x1a2 pixwait 4 -> lstcol), which is also what the pressure
+ * ahead of the tile access it orders (the class-8 wait right before LLDCOL,
+ * the class-4 wait right before LSTCOL), which is also what the pressure
  * scheduler's own "sink wait_pix" heuristic does.
  *
  * Move each WAIT_PIX down to just before its first dependent in the chosen

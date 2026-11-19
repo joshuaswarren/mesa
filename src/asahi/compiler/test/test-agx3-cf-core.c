@@ -669,7 +669,7 @@ test_uniform_compare(void)
                                    (struct agx3_cf_source_hints){true, false},
                                    out, &len) ||
        !hex_is(out, len, "0a832307060007020000")) {
-      fprintf(stderr, "uniform compare fs-apple +0xbc mismatch\n");
+      fprintf(stderr, "uniform compare (cached counter) mismatch\n");
       ++failures;
    }
    ++checks;
@@ -678,7 +678,7 @@ test_uniform_compare(void)
                                    (struct agx3_cf_source_hints){false, false},
                                    out, &len) ||
        !hex_is(out, len, "0a03230b060007020000")) {
-      fprintf(stderr, "uniform compare cs-apple +0x9e mismatch\n");
+      fprintf(stderr, "uniform compare (uncached counter) mismatch\n");
       ++failures;
    }
    const struct agx3_cf_source_hints none = {false, false};
@@ -701,7 +701,7 @@ test_uniform_compare(void)
 
 
 /* frg-codegen: Apple's G17P loop guard compares the trip-count uniform with
- * an immediate directly (fs-apple.bin +0x0c, 0a072380060087020000). */
+ * an immediate directly, without copying the uniform into a GPR first. */
 static void
 test_uniform_imm_compare(void)
 {
@@ -710,7 +710,7 @@ test_uniform_imm_compare(void)
    if (!agx3_cf_icmp_uniform_imm(AGX_ISA_ENCODING_AGX3B, AGX3_CF_ICOND_EQ, 0,
                                  6, 0, out, &len) ||
        !hex_is(out, len, "0a072380060087020000")) {
-      fprintf(stderr, "uniform/immediate compare fs-apple +0x0c mismatch\n");
+      fprintf(stderr, "uniform/immediate compare (loop guard) mismatch\n");
       ++failures;
    }
    /* The register form of the same compare differs only in the operand

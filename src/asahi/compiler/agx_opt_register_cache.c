@@ -245,13 +245,39 @@ agx_opt_register_cache(agx_context *ctx)
             assert(!(I->src[s].discard && I->src[s].cache));
          }
 
+         /* M5 (AGX3C): a register read by more than one source of the same
+          * instruction is not discarded by any of them. With both sources
+          * discarding, allocate_uvb with the primitive and vertex counts in
+          * one register (point meshes) read the wrong vertex count; the
+          * discard appears to take effect before the later read. Not
+          * setting a discard is always safe: it only gives up a register
+          * cache saving. */
+         if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
+            agx_foreach_reg_src(I, s) {
+               if (!I->src[s].discard)
+                  continue;
+               const unsigned a = I->src[s].value;
+               const unsigned an = agx_index_size_16(I->src[s]);
+               agx_foreach_reg_src(I, t) {
+                  if (t == s)
+                     continue;
+                  const unsigned b = I->src[t].value;
+                  const unsigned bn = agx_index_size_16(I->src[t]);
+                  if (a < b + bn && b < a + an) {
+                     I->src[s].discard = false;
+                     break;
+                  }
+               }
+            }
+         }
+
          postra_liveness_ins(live, I);
       }
    }
 
    /* Apple's G17P fragment loop test keeps
-    * its counter operand in the register cache (fs-apple.bin +0xbc, f11 on
-    * `icmp i, u6`). The block-local analysis above cannot: the counter's next
+    * its counter operand in the register cache (the f11 hint on the icmp's
+    * counter source). The block-local analysis above cannot: the counter's next
     * reads are at the top of the loop, across the back edge. Cache a loop
     * compare's register source when the loop header reads it with an ALU
     * instruction before writing it, unless this read is its last use. */

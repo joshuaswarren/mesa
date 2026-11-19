@@ -162,11 +162,10 @@ agx3_cf_icmp_reg(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
 /* Apple's G17P loop tests compare the counter register with the trip count
  * straight from the uniform file: f18 is the uniform half index, f24 = 3 its
  * operand class and f11 the register's cache hint, on the same ten-byte ep1
- * point as the register/register compare:
- *   fs-apple.bin +0xbc  0a832307060007020000  i == u6, cached i, slot 0
- *   cs-apple.bin +0x9e  0a03230b060007020000  i == u10, slot 0
- * f13 is the register's discard hint, as on the register forms. The fresh
- * G17G native ALU probe at main+0x9a uses this shape with f32=3/f33=82. */
+ * point as the register/register compare, e.g. `i == u6` with the counter
+ * cached, or `i == u10` without the hint, both in flag slot 0.
+ * f13 is the register's discard hint, as on the register forms. G17G
+ * (AGX3C) uses this shape with the additional f32=3/f33=82 selectors. */
 bool
 agx3_cf_icmp_reg_uniform32(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                            unsigned slot, uint16_t src0, uint16_t uniform,
@@ -191,10 +190,9 @@ agx3_cf_icmp_reg_uniform32(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
  * guard reads the trip count straight from the uniform file instead of
  * copying it into a GPR first. Same ten-byte ep1 point as agx3_cf_icmp_imm();
  * the first operand's class f9 = 3 selects the uniform, whose half index is
- * f3 (the register form's f2 is absent):
- *   fs-apple.bin +0x0c  0a072380060087020000  u6 == 0, slot 0
- * G17G native ALU main+0x18 witnesses the same operands with its M5
- * f32=3/f33=82 selectors. */
+ * f3 (the register form's f2 is absent), e.g. `u6 == 0` in flag slot 0.
+ * G17G (AGX3C) encodes the same operands with its M5 f32=3/f33=82
+ * selectors. */
 bool
 agx3_cf_icmp_uniform_imm(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                          unsigned slot, uint16_t uniform, uint8_t imm,

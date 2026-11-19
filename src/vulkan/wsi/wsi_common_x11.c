@@ -69,6 +69,7 @@
 
 #ifdef HAVE_SYS_SHM_H
 #include <sys/ipc.h>
+#include <sys/mman.h>
 #include <sys/shm.h>
 #endif
 
@@ -2667,7 +2668,7 @@ x11_manage_present_queue(void *state)
 }
 
 static uint8_t *
-alloc_shm(struct wsi_image *imagew, unsigned size)
+alloc_shm(struct wsi_image *imagew, unsigned size, uint64_t align)
 {
 #ifdef HAVE_SYS_SHM_H
    struct x11_image *image = (struct x11_image *)imagew;
@@ -2675,7 +2676,19 @@ alloc_shm(struct wsi_image *imagew, unsigned size)
    if (image->shmid < 0)
       return NULL;
 
-   uint8_t *addr = (uint8_t *)shmat(image->shmid, 0, 0);
+   uint8_t *addr = (uint8_t *) -1;
+#ifdef SHM_REMAP
+   /* shmat() only promises SHMLBA alignment: attach over a reservation that
+    * has the alignment the driver needs to import the segment. */
+   void *at = wsi_reserve_aligned(size, align);
+   if (at != NULL) {
+      addr = (uint8_t *)shmat(image->shmid, at, SHM_REMAP);
+      if (addr == (uint8_t *) -1)
+         munmap(at, size);
+   }
+#endif
+   if (addr == (uint8_t *) -1)
+      addr = (uint8_t *)shmat(image->shmid, 0, 0);
    /* mark the segment immediately for deletion to avoid leaks */
    shmctl(image->shmid, IPC_RMID, 0);
 
