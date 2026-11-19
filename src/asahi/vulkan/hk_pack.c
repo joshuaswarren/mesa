@@ -12,10 +12,48 @@
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
 
+/*
+ * Selected by the stream format and the kernel, never by which parts were
+ * measured:
+ *
+ * - M5 (HAL300) streams pack where the kernel takes their own completion
+ *   flush, DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: only then does every
+ *   stream end with the strong memory-scoped flush a boundary keeps
+ *   (hk_EndCommandBuffer()). This holds for every M5 part.
+ * - HAL200 streams pack where the strong flush is the whole visibility
+ *   record. G17P differs: its strong flush also has a memory-scoped form,
+ *   which memory reached through a second address needs
+ *   (hk_cdm_alias_scope()), and no boundary of this kind asks for it.
+ * - G15 streams publish an in-stream dependency with the wide barrier
+ *   (agx_chip_cdm_wide_visibility()), and AGX2 streams have neither terminate
+ *   nor tail records this checks: neither has a boundary.
+ */
+enum hk_pack_boundary
+hk_pack_boundary(const struct hk_device *dev)
+{
+   const enum agx_chip chip = dev->dev.chip;
+   if (agx_chip_g17_m5(chip)) {
+      return (dev->dev.params.features &
+              DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION)
+                ? HK_PACK_BOUNDARY_VISIBLE_COMPLETION
+                : HK_PACK_BOUNDARY_NONE;
+   }
+
+   if (agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_HAL200 &&
+       !hk_cdm_memory_scope_form(dev))
+      return HK_PACK_BOUNDARY_STRONG_FLUSH;
+
+   return HK_PACK_BOUNDARY_NONE;
+}
+
 const struct hk_cs *
 hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
                    const uint8_t *terminate, bool atomics)
 {
+   const enum hk_pack_boundary boundary = hk_pack_boundary(dev);
+   if (boundary == HK_PACK_BOUNDARY_NONE)
+      return NULL;
+
    /* Events can be observed before the submission completes, and a pending
     * top-of-pipe stamp would land on the next member's launch. */
    if (cmd->state.uses_events || cmd->sync.pending_start_ts.handle ||
@@ -48,14 +86,14 @@ hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
    if (memcmp(end, terminate, AGX3_CDM_STREAM_TERMINATE_SIZE))
       return NULL;
 
-   if (agx_chip_g17_m5(dev->dev.chip)) {
+   if (boundary == HK_PACK_BOUNDARY_VISIBLE_COMPLETION) {
       /* The stream ends with the strong memory-scoped flush. */
       if (!cs->visible_completion || cs->strong_flush_end != end ||
           cs->memory_flush_end != end)
          return NULL;
    } else {
-      /* G16G: the stream ends with an ordering barrier or a strong flush,
-       * which a boundary upgrades in place (hk_cdm_visibility_flush()). */
+      /* The stream ends with an ordering barrier or a strong flush, which a
+       * boundary upgrades in place (hk_cdm_visibility_flush()). */
       if (cs->strong_flush_end != end && cs->weak_barrier_end != end)
          return NULL;
    }
@@ -73,10 +111,9 @@ hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
    return cs;
 }
 
-void
+static void
 hk_pack_describe(struct hk_pack_member *member, const struct hk_cmd_buffer *cmd,
-                 const struct hk_cs *cs, size_t terminate_size,
-                 uint8_t render_kinds)
+                 const struct hk_cs *cs, uint8_t render_kinds)
 {
    memset(member, 0, sizeof(*member));
    if (!cs)
@@ -88,7 +125,7 @@ hk_pack_describe(struct hk_pack_member *member, const struct hk_cmd_buffer *cmd,
     * once the render subqueue ran work of it; neither does the planner. */
    member->cs = cs;
    member->bytes = (const uint8_t *)cs->current - (const uint8_t *)cs->start -
-                   terminate_size;
+                   AGX3_CDM_STREAM_TERMINATE_SIZE;
    member->kinds = cs->sync.kind;
    member->render_waits = cs->sync.dep[HK_SYNC_VDM].prior & render_kinds;
    for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k)
@@ -97,25 +134,37 @@ hk_pack_describe(struct hk_pack_member *member, const struct hk_cmd_buffer *cmd,
    member->render_ran = render_kinds != 0;
 }
 
-uint8_t
-hk_pack_render_kinds(const struct hk_cmd_buffer *cmd)
+/* The render kinds come from the fields the resolver reads, so the two agree
+ * also where a forgotten render left a command buffer's latest render of a
+ * kind on a stream of another kind (hk_sync_forget_stream()). */
+unsigned
+hk_pack_describe_submit(struct hk_pack_member *members,
+                        const struct hk_device *dev,
+                        const struct hk_sync_queue *sync,
+                        struct hk_cmd_buffer *const *cmds, unsigned n,
+                        const uint8_t *terminate, bool atomics)
 {
-   uint8_t kinds = 0;
-   list_for_each_entry(const struct hk_cs, cs, &cmd->control_streams, node) {
-      if (hk_sync_sq(cs) == HK_SYNC_VDM)
-         kinds |= cs->sync.kind;
+   unsigned eligible = 0;
+   uint8_t render_kinds = hk_sync_queue_kinds(sync, HK_SYNC_VDM);
+   for (unsigned i = 0; i < n; ++i) {
+      const struct hk_cs *cs =
+         hk_pack_run_member(dev, cmds[i], terminate, atomics);
+      hk_pack_describe(&members[i], cmds[i], cs, render_kinds);
+      render_kinds |= hk_sync_cmd_kinds(cmds[i], HK_SYNC_VDM);
+      eligible += cs != NULL;
    }
-   return kinds;
+   return eligible;
 }
 
 /* The render kinds the tails `tails` make a packet of kinds `kinds` wait
- * for: hk_pack_fold_member() folds a member's tail of each kind the packet
- * has. */
+ * for: hk_pack_fold_member() folds a member's tail of each destination class
+ * the packet's stream belongs to, as the resolver applies carried
+ * requirements (hk_sync_full_kinds()). */
 static uint8_t
 hk_pack_tail(const uint8_t tails[HK_SYNC_NUM_KINDS], uint8_t kinds)
 {
    uint8_t tail = 0;
-   u_foreach_bit(k, kinds)
+   u_foreach_bit(k, hk_sync_full_kinds(kinds))
       tail |= tails[k];
    return tail;
 }
@@ -244,8 +293,9 @@ hk_pack_fold_member(struct hk_cmd_buffer *packet, struct hk_cs *cs,
              (sq == HK_SYNC_CDM && (req->prior & *preceding_kinds)))
             packet->sync.req[k][sq].cut = cs;
          /* The members after this one wait for its tail, as separate
-          * command buffers would. */
-         if (!last && (cs->sync.kind & BITFIELD_BIT(k)))
+          * command buffers would: the resolver applies a carried
+          * requirement to each destination class of a stream. */
+         if (!last && (hk_sync_full_kinds(cs->sync.kind) & BITFIELD_BIT(k)))
             cs->sync.dep[sq].prior |= req->prior;
       }
    }

@@ -2359,17 +2359,21 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
  * buffer.
  *
  * A member boundary publishes the member's writes as the end of its own
- * command would have published them for the members after it:
+ * command would have published them for the members after it
+ * (hk_pack_boundary()):
  *
- * - M5 ends every such stream with the strong, memory-scoped flush
- *   (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION); the copy keeps it.
- * - G16G ends a stream with its last launch's ordering barrier or a strong
- *   flush, and the end of the command publishes its writes. At a boundary
- *   the record becomes the strong flush, as for a compute or transfer
- *   dependency inside one stream: on G16G (HAL200) no memory-scoped or wide
- *   form exists, and hk_cdm_alias_scope() is always false. The last
- *   member's tail stays as recorded; the packet's own end of command
- *   follows it.
+ * - Where the kernel takes a stream's own completion flush
+ *   (DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION, M5), every such stream
+ *   ends with the strong, memory-scoped flush. A boundary keeps the strong
+ *   flush and drops its memory scope, which only memory reached through a
+ *   second address needs (hk_cdm_alias_scope()); while such memory may
+ *   exist, it keeps the scope too. The packet's end keeps the whole flush.
+ * - HAL200 streams whose strong flush has no memory-scoped form (G16) end
+ *   with their last launch's ordering barrier or a strong flush, and the end
+ *   of the command publishes their writes. At a boundary the record becomes
+ *   the strong flush, as for a compute or transfer dependency inside one
+ *   stream. The last member's tail stays as recorded; the packet's own end
+ *   of command follows it.
  *
  * Work in a packet waits for whatever any member waited for, and work after
  * it waits for the whole packet. On the compute subqueue that adds no
@@ -2387,9 +2391,9 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
  * carries no more compute attachments than the kernel takes for one
  * command. A run past a bound starts a new packet.
  *
- * HK_PACK_CDM_SUBMIT=0/1 (or the older ASAHI_M5_PACK_CDM_SUBMIT) turns it
- * off or on. It defaults on for G17S, where it is measured, and for G16G,
- * whose kernel serializes every command of the device.
+ * It is on wherever a boundary is defined (hk_pack_boundary()), which the
+ * stream format and the kernel decide. HK_PACK_CDM_SUBMIT=0/1 (or the older
+ * ASAHI_M5_PACK_CDM_SUBMIT) turns it off or on there, for A/B rows.
  */
 DEBUG_GET_ONCE_OPTION(hk_pack_cdm_submit_opt, "HK_PACK_CDM_SUBMIT", NULL)
 DEBUG_GET_ONCE_OPTION(m5_pack_cdm_submit_opt, "ASAHI_M5_PACK_CDM_SUBMIT", NULL)
@@ -2407,27 +2411,14 @@ hk_pack_trace(void)
 static bool
 hk_pack_runs_enabled(const struct hk_device *dev)
 {
-   if (dev->dev.is_virtio || (dev->dev.debug & AGX_DBG_NOMERGE))
+   if (dev->dev.is_virtio || (dev->dev.debug & AGX_DBG_NOMERGE) ||
+       hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE)
       return false;
-
-   /* Where the stream ends and member boundaries are verified: M5 with
-    * visible completion, and G16G. */
-   if (agx_chip_g17_m5(dev->dev.chip)) {
-      if (!(dev->dev.params.features &
-            DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION))
-         return false;
-   } else if (dev->dev.chip != AGX_CHIP_G16G) {
-      return false;
-   }
 
    const char *opt = debug_get_option_hk_pack_cdm_submit_opt();
    if (!opt)
       opt = debug_get_option_m5_pack_cdm_submit_opt();
-   if (opt)
-      return debug_parse_bool_option(opt, false);
-
-   /* On for G17S (M5 Pro) and G16G (M4); other M5 parts opt in. */
-   return dev->dev.chip == AGX_CHIP_G17S || dev->dev.chip == AGX_CHIP_G16G;
+   return opt ? debug_parse_bool_option(opt, false) : true;
 }
 
 /* The compute attachments one packet may carry: those the kernel takes for
@@ -2451,7 +2442,9 @@ hk_pack_attachment_limit(const struct hk_device *dev)
  * queue created while a packet runs is not covered; unpacked atomic work
  * has the same exposure. The G16 kernel runs one command of the whole
  * device at a time, so nothing ever runs beside a packet there: G16G packs
- * them unless HK_PACK_ATOMICS=0. */
+ * them unless HK_PACK_ATOMICS=0. That is a property of the G16 kernel, the
+ * only one for G16G, which no uAPI feature reports yet; the chip stands for
+ * it until one does. */
 DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
 DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
 
@@ -2463,7 +2456,7 @@ hk_pack_atomics_allowed(struct hk_device *dev, const struct hk_queue *queue)
       opt = debug_get_option_m5_pack_atomics_opt();
 
    if (dev->dev.chip == AGX_CHIP_G16G)
-      return opt ? debug_parse_bool_option(opt, true) : true;
+      return opt ? debug_parse_bool_option(opt, false) : true;
 
    if (!opt || !debug_parse_bool_option(opt, false) || queue->sib.count > 1)
       return false;
@@ -2543,7 +2536,8 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
    if (!agx3_cdm_stream_terminate_pack(dev->dev.chip, terminate))
       return false;
 
-   const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+   const bool visible_completion =
+      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_VISIBLE_COMPLETION;
    const bool atomics = hk_pack_atomics_allowed(dev, queue);
    const struct hk_pack_limits limits = {
       .max_attachments = hk_pack_attachment_limit(dev),
@@ -2558,16 +2552,10 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
       return false;
    }
 
-   unsigned eligible = 0;
-   uint8_t render_kinds = queue->sync.ever[HK_SYNC_VDM];
-   for (unsigned i = 0; i < n; ++i) {
-      const struct hk_cmd_buffer *cmd =
-         (const struct hk_cmd_buffer *)submit->command_buffers[i];
-      const struct hk_cs *cs = hk_pack_run_member(dev, cmd, terminate, atomics);
-      hk_pack_describe(&members[i], cmd, cs, sizeof(terminate), render_kinds);
-      render_kinds |= hk_pack_render_kinds(cmd);
-      eligible += cs != NULL;
-   }
+   const unsigned eligible = hk_pack_describe_submit(
+      members, dev, &queue->sync,
+      (struct hk_cmd_buffer *const *)submit->command_buffers, n, terminate,
+      atomics);
 
    unsigned packed_members;
    size_t total;
@@ -2614,7 +2602,7 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
       cs->addr = out->bo->va->addr + pr->offset;
       cs->root_size = pr->bytes;
       cs->sync.seq = 1;
-      cs->visible_completion = m5;
+      cs->visible_completion = visible_completion;
       hk_drm_attachment_set_init(&cs->compute_attachments);
       util_dynarray_init(&cs->compute_resources, NULL);
 
@@ -2652,7 +2640,7 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
          hk_cs_merge_cdm_until(cs, item, item_end);
          hk_pack_dedup_resources(&cs->compute_resources, unique);
 
-         if (m5) {
+         if (visible_completion) {
             /* Each source ends with the strong memory-scoped flush. The
              * packet's end keeps it for the host and other queues, which
              * observe nothing of a packet before its completion. Between
@@ -2670,8 +2658,8 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
             }
             hk_cdm_visibility_flush(dev, cs, last || hk_cdm_alias_scope(dev));
          } else if (!last) {
-            /* G16G: the member's ordering barrier becomes the strong flush,
-             * or its strong flush stays. */
+            /* HAL200: the member's ordering barrier becomes the strong
+             * flush, or its strong flush stays. */
             hk_cdm_visibility_flush(dev, cs, false);
          }
 
@@ -2679,7 +2667,8 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
       }
 
       assert(!cs->stream_linked);
-      assert(m5 ? cs->memory_flush_end == cs->current
+      assert(visible_completion
+                ? cs->memory_flush_end == cs->current
                 : cs->strong_flush_end == cs->current ||
                      cs->weak_barrier_end == cs->current);
       memcpy(cs->current, terminate, sizeof(terminate));

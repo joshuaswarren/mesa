@@ -14,6 +14,7 @@
 struct hk_cmd_buffer;
 struct hk_cs;
 struct hk_device;
+struct hk_sync_queue;
 
 /* Submit packing (hk_queue.c, hk_pack_runs()): a run of consecutive command
  * buffers that each record one plain compute stream is submitted as one
@@ -42,9 +43,9 @@ struct hk_pack_member {
    uint8_t kinds;
    /* Render (VDM) kinds the stream itself waits for, and per stream kind k
     * those the command buffer's tail makes later streams of kind k wait for
-    * (req[k][VDM]), both only of kinds the render subqueue ran before this
-    * command buffer: other kinds resolve to no wait (hk_sync.c,
-    * resolve_prior()). */
+    * (req[k][VDM]), both only of kinds that resolve to a render wait before
+    * this command buffer (hk_sync_queue_kinds(), hk_sync_cmd_kinds()): other
+    * kinds are no wait. */
    uint8_t render_waits;
    uint8_t render_tail[HK_SYNC_NUM_KINDS];
    /* The render subqueue ran work before this command buffer. */
@@ -63,22 +64,38 @@ struct hk_pack_run {
    size_t offset, bytes;
 };
 
+/* How a member's end publishes its writes to the members after it, which
+ * decides whether a device packs at all. */
+enum hk_pack_boundary {
+   /* No boundary is defined: the device does not pack. */
+   HK_PACK_BOUNDARY_NONE,
+   /* The kernel takes each stream's own completion flush, the strong
+    * memory-scoped flush (DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION, M5
+    * streams): a member ends with it, and a boundary keeps the scope the
+    * next member needs. */
+   HK_PACK_BOUNDARY_VISIBLE_COMPLETION,
+   /* HAL200 streams whose strong flush has no memory-scoped form (G16): the
+    * kernel publishes a command's writes when it completes, and a boundary
+    * makes the member's last ordering record the strong flush, the record an
+    * in-stream compute dependency gets. */
+   HK_PACK_BOUNDARY_STRONG_FLUSH,
+};
+
+enum hk_pack_boundary hk_pack_boundary(const struct hk_device *dev);
+
 /* The single compute stream of `cmd` that a packet may copy, or NULL. */
 const struct hk_cs *hk_pack_run_member(const struct hk_device *dev,
                                        const struct hk_cmd_buffer *cmd,
                                        const uint8_t *terminate, bool atomics);
 
-/* Fills `member` for command buffer `cmd` whose stream is `cs` (or NULL).
- * `render_kinds` are the kinds the render subqueue ran before `cmd`: those
- * of the queue's earlier submissions (hk_sync_queue::ever) and of the render
- * streams of the command buffers before it in this submission
- * (hk_pack_render_kinds()). */
-void hk_pack_describe(struct hk_pack_member *member,
-                      const struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
-                      size_t terminate_size, uint8_t render_kinds);
-
-/* The kinds of the render streams of `cmd`. */
-uint8_t hk_pack_render_kinds(const struct hk_cmd_buffer *cmd);
+/* Fills members[0..n) for the command buffers of a submission to the queue
+ * whose synchronization state is `sync`, as hk_pack_plan() takes them, and
+ * returns how many may be packed. */
+unsigned hk_pack_describe_submit(struct hk_pack_member *members,
+                                 const struct hk_device *dev,
+                                 const struct hk_sync_queue *sync,
+                                 struct hk_cmd_buffer *const *cmds, unsigned n,
+                                 const uint8_t *terminate, bool atomics);
 
 /* Groups members into runs of two or more: runs[] gets them in order, with
  * byte offsets in one buffer of *total bytes. Returns the run count. */

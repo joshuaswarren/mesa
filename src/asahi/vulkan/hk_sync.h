@@ -96,6 +96,17 @@ enum hk_sync_kind {
 
 #define HK_SYNC_NUM_KINDS 6
 
+/* The destination classes a stream of the given kinds belongs to: graphics
+ * work is in every graphics class (HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG). A
+ * stream waits for the requirements carried in for each of them. */
+static inline uint8_t
+hk_sync_full_kinds(uint8_t kinds)
+{
+   return kinds & HK_SYNC_GFX
+             ? kinds | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG
+             : kinds;
+}
+
 /* Subqueue index: 0 render (VDM), 1 compute (CDM). */
 enum hk_sync_sq {
    HK_SYNC_VDM = 0,
@@ -543,4 +554,12 @@ bool hk_sync_resolve_submit(struct hk_queue *queue,
                             unsigned count, bool first_cdm_is_flush,
                             bool chain_first, uint64_t completed,
                             struct hk_sync_resolved *out);
+
+/* The kinds whose priors on subqueue `sq` hk_sync_resolve_submit() resolves
+ * to a wait, at the first command buffer of the next submission on `q`: a
+ * prior of any other kind is no wait. Each command buffer adds
+ * hk_sync_cmd_kinds() for those after it in the submission. A driver-added
+ * flush opening the payload (first_cdm_is_flush) is not counted. */
+uint8_t hk_sync_queue_kinds(const struct hk_sync_queue *q, unsigned sq);
+uint8_t hk_sync_cmd_kinds(const struct hk_cmd_buffer *cmd, unsigned sq);
 void hk_sync_load_resolved(struct hk_cs *cs, const struct hk_sync_resolved *r);

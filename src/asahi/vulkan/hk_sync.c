@@ -32,14 +32,10 @@ dep_max(struct hk_sync_dep *a, const struct hk_sync_dep *b)
    a->prior |= b->prior;
 }
 
-/* The destination classes a stream of the given kinds belongs to: graphics
- * work is in every graphics class (HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG). */
 static inline uint8_t
 full_kinds(uint8_t kinds)
 {
-   return kinds & HK_SYNC_GFX
-             ? kinds | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG
-             : kinds;
+   return hk_sync_full_kinds(kinds);
 }
 
 /* The requirement on the next stream of the given kinds: the union over the
@@ -1622,6 +1618,36 @@ resolve_absolute(const struct submit_state *ss, const struct hk_sync_dep *dep,
       value = MAX2(value, earlier);
    }
    return value;
+}
+
+/* What resolve_prior() and resolve_absolute() wait for, as kinds: a kind
+ * with a latest stream in an earlier command buffer of the submission
+ * (ss->last, from cmd->sync.last), else one the queue ran before (legacy:
+ * hk_sync_queue::ever) or holds a latest position of (exact:
+ * last_absolute). */
+uint8_t
+hk_sync_queue_kinds(const struct hk_sync_queue *q, unsigned sq)
+{
+   if (!q->exact_prior)
+      return q->ever[sq];
+
+   uint8_t kinds = 0;
+   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+      if (q->last_absolute[k][sq])
+         kinds |= BITFIELD_BIT(k);
+   }
+   return kinds;
+}
+
+uint8_t
+hk_sync_cmd_kinds(const struct hk_cmd_buffer *cmd, unsigned sq)
+{
+   uint8_t kinds = 0;
+   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+      if (cmd->sync.last[k][sq])
+         kinds |= BITFIELD_BIT(k);
+   }
+   return kinds;
 }
 
 /* Tile hazards across submissions (hk_sync.h). */

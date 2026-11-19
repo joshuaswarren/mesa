@@ -553,12 +553,11 @@ hk_cmd_resolve_compute_border(struct hk_cmd_buffer *cmd)
 }
 
 /* Whether a strong flush recorded for `dev` with this request has memory
- * scope: on request on G17P and M5. */
+ * scope: on request where the form exists (G17P and M5). */
 static bool
 hk_cdm_flush_has_memory_scope(const struct hk_device *dev, bool memory)
 {
-   return memory && (dev->dev.chip == AGX_CHIP_G17P ||
-                     agx_chip_g17_m5(dev->dev.chip));
+   return memory && hk_cdm_memory_scope_form(dev);
 }
 
 bool
