@@ -154,12 +154,12 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
    const uint64_t sampled_base = g17p ? rw_base : ro_base;
 
    uint32_t tail_offset_B = view->vk.offset & 0xf;
-   /* RGB32 permits component-aligned offsets, which cannot in general be
-    * expressed as a whole-texel tail. Its G17P raw-load metadata can carry
-    * the exact address instead; the unused hardware texture stays aligned.
+   /* The G17P metadata names the view's exact address
+    * (AGX_G17P_BUFFER_TEXTURE_ADDRESS_OFFSET). RGB32 permits component-aligned
+    * offsets, which cannot in general be expressed as a whole-texel tail, and
+    * it reads only that address; its unused hardware texture stays aligned.
     */
-   const uint64_t metadata_base =
-      sampled_base + ((g17p && rgb32) ? tail_offset_B : 0);
+   const uint64_t metadata_base = sampled_base + tail_offset_B;
    if (g17p && rgb32)
       tail_offset_B = 0;
    uint32_t tail_offset_el = tail_offset_B / util_format_get_blocksize(format);
@@ -210,23 +210,8 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
        * see AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET.  A non-power-of-two
        * element size (the emulated RGB32 layout) takes the raw load path,
        * which claims residency anyway, so leave the word zero for it. */
-      uint32_t sparse = 0;
-      const unsigned blocksize_B = util_format_get_blocksize(format);
-      if (buffer && buffer->sparse_map &&
-          util_is_power_of_two_nonzero(blocksize_B)) {
-         const uint64_t map_page = buffer->sparse_map->va->addr / AIL_PAGESIZE;
-         assert((buffer->sparse_map->va->addr % AIL_PAGESIZE) == 0);
-         /* The packed field leaves 28 bits for the map page.  Fail loudly
-          * rather than silently truncating if the VA layout ever outgrows it;
-          * a wrong map address would read residency from arbitrary memory. */
-         if (map_page < (1u << (32 - AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT))) {
-            sparse = (uint32_t)(map_page
-                                << AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT) |
-                     (uint32_t)util_logbase2(blocksize_B);
-         } else {
-            assert(!"sparse residency map outside the packed VA range");
-         }
-      }
+      const uint32_t sparse = hk_buffer_sparse_texel_word(
+         buffer, util_format_get_blocksize(format));
 
       view->buffer_metadata = (struct hk_g17p_buffer_texture_metadata){
          .elements = view->vk.elements,
@@ -665,9 +650,8 @@ hk_texel_buffer_descriptor(struct hk_device *dev,
       hk_storage_image_descriptor_layout(generation);
    struct hk_native_texture_descriptor tex = {0};
    struct hk_native_pbe_descriptor pbe = {0};
+   /* Zeroed by hk_GetDescriptorEXT() */
    uint8_t *packed = out;
-
-   memset(packed, 0, AGX_G17P_BUFFER_TEXTURE_DESCRIPTOR_SIZE);
 
    const enum pipe_format format =
       info && info->address ? hk_format_to_pipe_format(info->format)
@@ -705,8 +689,11 @@ hk_texel_buffer_descriptor(struct hk_device *dev,
    const struct hk_g17p_buffer_texture_metadata metadata = {
       .elements = elements,
       .offset_el = offset_el,
-      .address = base,
+      .address = info->address,
       .rgb32 = hk_texel_rgb32(format),
+      /* The buffer behind the address, as hk_CreateBufferView() knows it */
+      .sparse = hk_sparse_texel_word_at(dev, info->address,
+                                        util_format_get_blocksize(format)),
    };
    static_assert(sizeof(metadata) == 24, "texel-buffer software descriptor ABI");
    memcpy(packed + AGX_G17P_BUFFER_TEXTURE_METADATA_OFFSET, &metadata,

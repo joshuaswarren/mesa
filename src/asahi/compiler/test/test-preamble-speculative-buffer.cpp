@@ -47,7 +47,7 @@ run_speculative(gl_access_qualifier desc_access, unsigned index,
    NIR_PASS(_, b.shader, nir_opt_dce);
    nir_validate_shader(b.shader, "before preamble");
    unsigned sizes[] = {used_halves, 0, 0};
-   agx_nir_opt_preamble(b.shader, sizes, true, false);
+   agx_nir_opt_preamble(b.shader, sizes, true, false, NULL);
    nir_validate_shader(b.shader, "after preamble");
 
    speculative_result r = {};

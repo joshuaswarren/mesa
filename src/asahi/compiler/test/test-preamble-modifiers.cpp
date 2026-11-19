@@ -18,7 +18,7 @@ check_modifier(bool g17p, bool widen)
                          nir_imm_int(&b, 0), nir_type_float32,
                          FRAG_RESULT_DATA0);
    unsigned sizes[3] = {16, 0, 0};
-   bool progress = agx_nir_opt_preamble(b.shader, sizes, g17p, false);
+   bool progress = agx_nir_opt_preamble(b.shader, sizes, g17p, false, NULL);
    const bool hoisted = g17p && !widen;
    if (hoisted) {
       EXPECT_TRUE(progress);

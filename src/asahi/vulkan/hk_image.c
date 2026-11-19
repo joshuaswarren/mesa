@@ -655,10 +655,10 @@ hk_float_image_atomics(const struct hk_device *dev)
 
 /* Compressed data is only decodable through its own channel class. Every
  * G17P/M5 writer of a colour image is a PBE; the end-of-tile PBE may store a
- * different format from the image (hk_eot_pbe_format(): G17P packs
- * R11G11B10/RGB9E5 into R32_UINT words, M4 Pro and M5 store R11G11B10 in its
- * own class). Never compress an image whose store class would differ from the
- * class its textures read. */
+ * different format from the image (hk_eot_pbe_format(): G17P packs RGB9E5
+ * into R32_UINT words, G17P and M5 store R11G11B10 in its own class). Never
+ * compress an image whose store class would differ from the class its
+ * textures read. */
 static bool
 hk_g17p_store_class_matches(const struct agx_device *dev, VkFormat format)
 {
@@ -1344,8 +1344,8 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
       hk_m5_depth_msaa_transfer_eligible(dev->chip, plane, info,
                                          dev->params.features) ||
       m5_storage ||
-      (hk_hal200_compression_eligible(dev->chip, plane, info,
-                                      agx_is_m4_pro(dev)) &&
+      (hk_hal200_compression_eligible(dev->chip, dev->params.chip_id, plane,
+                                      info, agx_is_m4_pro(dev)) &&
        !hk_g17p_multiview_spill_risk(info, multiview)) ||
       hk_g17p_shared_compression_eligible(dev->chip, plane, info) ||
       hk_m5_color_compression_eligible(dev->chip, plane, info) ||

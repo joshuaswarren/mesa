@@ -151,6 +151,21 @@ hk_descriptor_stride_align_for_type(
    assert(*stride <= HK_MAX_DESCRIPTOR_SIZE);
 }
 
+/* Applications place descriptor buffer arrays at the reported descriptor
+ * sizes and copy descriptors of those sizes themselves. vkd3d-proton copies
+ * only 4, 8, 16, 32, 48, 64 and 128 bytes: for the G17P 72- and 96-byte
+ * records it has no copy, never maps its sampler and resource heaps, and
+ * writes the first descriptor through NULL. So descriptor buffers take every
+ * record at the next power of two, which the reported sizes and the strides
+ * of descriptor buffer layouts both use. A push layout's memory is the
+ * driver's own, so it keeps the packed stride.
+ */
+static uint32_t
+hk_descriptor_buffer_stride(uint32_t stride)
+{
+   return stride > 1 ? util_next_power_of_two(stride) : stride;
+}
+
 void
 hk_descriptor_stride_align_for_layout(
    const struct hk_physical_device *pdev, VkDescriptorSetLayoutCreateFlags flags,
@@ -179,6 +194,10 @@ hk_descriptor_stride_align_for_layout(
       }
       *stride = max_stride;
    }
+
+   if ((flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) &&
+       !(flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR))
+      *stride = hk_descriptor_buffer_stride(*stride);
 }
 
 uint32_t
@@ -188,7 +207,7 @@ hk_descriptor_buffer_size(const struct agx_device *dev, VkDescriptorType type)
       container_of(dev, struct hk_physical_device, dev);
    uint32_t stride, alignment;
    hk_descriptor_stride_align_for_type(pdev, type, NULL, &stride, &alignment);
-   return stride;
+   return hk_descriptor_buffer_stride(stride);
 }
 
 static void
@@ -380,7 +399,7 @@ hk_CreateDescriptorSetLayout(VkDevice device,
       stride *= max_plane_count;
 
       if (stride > 0) {
-         assert(stride <= UINT8_MAX);
+         assert(stride <= UINT16_MAX);
          assert(util_is_power_of_two_nonzero(alignment));
 
          buffer_size = align64(buffer_size, alignment);
@@ -490,7 +509,7 @@ hk_GetDescriptorSetLayoutSupport(
                                             type_list, &stride, &alignment);
 
       if (stride > 0) {
-         assert(stride <= UINT8_MAX);
+         assert(stride <= UINT16_MAX);
          assert(util_is_power_of_two_nonzero(alignment));
 
          if (flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) {

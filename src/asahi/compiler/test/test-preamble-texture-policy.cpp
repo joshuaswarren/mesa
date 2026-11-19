@@ -40,7 +40,7 @@ TEST(PreambleTexturePolicy, M5KeepsTextureAndConsumersInMain)
          nir_validate_shader(b.shader, "before texture preamble policy");
 
          unsigned sizes[] = {4, 1000, 1000};
-         EXPECT_TRUE(agx_nir_opt_preamble(b.shader, sizes, true, m5));
+         EXPECT_TRUE(agx_nir_opt_preamble(b.shader, sizes, true, m5, NULL));
          nir_opt_dce(b.shader);
          nir_validate_shader(b.shader, "after texture preamble policy");
 
@@ -90,7 +90,7 @@ TEST(PreambleHandlePlacement, LoadBasesMoveBelowTheHandleLimit)
       nir_intrinsic_set_align(store, 4, 0);
 
       unsigned sizes[] = {300, 1000, 1000};
-      ASSERT_TRUE(agx_nir_opt_preamble(b.shader, sizes, true, false));
+      ASSERT_TRUE(agx_nir_opt_preamble(b.shader, sizes, true, false, NULL));
       nir_opt_dce(b.shader);
 
       unsigned allocated = sizes[0];

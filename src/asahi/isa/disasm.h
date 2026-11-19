@@ -47,6 +47,17 @@ signed agx3c_instr_length(const uint8_t *code, size_t available,
 signed agx3d_instr_length(const uint8_t *code, size_t available,
                           const char **display);
 
+/* The same over the whole form table, without its index: the reference the
+ * index is tested against. */
+signed agx2_instr_length_linear(const uint8_t *code, size_t available,
+                                const char **display);
+signed agx3b_instr_length_linear(const uint8_t *code, size_t available,
+                                 const char **display);
+signed agx3c_instr_length_linear(const uint8_t *code, size_t available,
+                                 const char **display);
+signed agx3d_instr_length_linear(const uint8_t *code, size_t available,
+                                 const char **display);
+
 /*
  * Disassemble a whole shader, stopping at max_len.
  *

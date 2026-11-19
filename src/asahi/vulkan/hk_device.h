@@ -143,6 +143,15 @@ struct hk_device {
    bool may_alias_memory;
    /* One bit per main-heap page: only unbound sparse buffer pages are set. */
    struct agx_bo *physical_sparse_map;
+   /* The buffers with a residency map (hk_buffer::sparse_map), for texel
+    * buffer descriptors that name only an address (VK_EXT_descriptor_buffer,
+    * hk_sparse_texel_word_at()). */
+   struct {
+      simple_mtx_t lock;
+      struct list_head list;
+      /* Entries in list, read without the lock */
+      uint32_t count;
+   } sparse_buffers;
    /* The zeroed page every unbound sparse page maps, read-write (the
     * read-only shadow maps the zero page). It is no write sink of the
     * driver's, unlike the scratch page, so it stays zero for strict
@@ -379,6 +388,11 @@ enum hk_perftest {
    HK_PERF_NOBARRIER = BITFIELD_BIT(2),
    HK_PERF_NOBATCH = BITFIELD_BIT(3),
    HK_PERF_NOROBUST = BITFIELD_BIT(4),
+   /* Keep only the preceding launch's weak ordering barrier at pure
+    * compute/transfer pipeline barriers in the same CDM stream instead of
+    * upgrading it to a strong cache flush, when memory is unaliased and no
+    * host or pending graphics transfer dependency is involved. */
+   HK_PERF_WEAKBARRIER = BITFIELD_BIT(5),
 };
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)

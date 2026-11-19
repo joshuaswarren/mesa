@@ -184,6 +184,31 @@ libasahi_compiler = static_library(
 )
 
 if with_tests
+  # agx3_bind_compose()'s memo against the table walk, on every instruction
+  # of the native witness texts.
+  test(
+    'agx3_bind_memo',
+    executable(
+      'agx3_bind_memo_test',
+      files(
+        'agx3_binder.c',
+        'agx3_compose/agx3_compose.c',
+        'agx3_compose/agx3_decode.c',
+        'agx3_compose/agx3b_tables.c',
+        'agx3_compose/agx3c_tables.c',
+        'agx3_compose/agx3d_tables.c',
+        'test/test-agx3-bind-memo.c',
+      ),
+      c_args : [c_msvc_compat_args, no_override_init_args,
+                '-DAGX3_HAVE_AGX3D_TABLE'],
+      gnu_symbol_visibility : 'hidden',
+      include_directories : [inc_include, inc_src],
+      link_with : [libagx3c_disasm, libagx3d_disasm],
+    ),
+    suite : ['asahi'],
+    args : [meson.project_source_root() / 'src/asahi/compiler/test/native/g18g'],
+  )
+
   test(
     'agx3_subgroup_core',
     executable(
@@ -541,6 +566,19 @@ if with_tests
   )
 
   test(
+    'agx3_g17p_device_barrier',
+    executable(
+      'agx3_g17p_device_barrier_test',
+      files('test/test-agx3-g17p-device-barrier.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'agx3_pixel_core',
     executable(
       'agx3_pixel_core_test',
@@ -665,6 +703,7 @@ if with_tests
          'test/test-demote-early-kill.cpp',
          'test/test-preamble-half-word-exports.cpp',
          'test/test-quad-control.cpp',
+         'test/test-preamble-priority.cpp',
          'test/test-signed-zero-fma.cpp',
          'test/test-negated-minifloat.cpp',
          'test/test-dual-absolute-select.cpp',

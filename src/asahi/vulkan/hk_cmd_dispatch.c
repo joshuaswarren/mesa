@@ -1556,6 +1556,7 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
        * launch between them is a shape Apple's CDM emitter never produces and
        * the G17P stream oracle rejects. */
       cs->weak_barrier_end = cs->current;
+      cs->app_dispatch_end = NULL;
       if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy))
          hk_frame_anatomy_note_precomp(cs, idx, grid);
       cs->stats.cmds++;
@@ -2456,6 +2457,7 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        * launch between them is a shape Apple's CDM emitter never produces and
        * the G17P stream oracle rejects. */
       cs->weak_barrier_end = cs->current;
+      cs->app_dispatch_end = NULL;
       cs->stats.cmds++;
       return;
    }
@@ -2496,21 +2498,22 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    /* Two application dispatches in a row need no barrier between them: drop
     * the previous one's weak tail, which nothing else has followed or
     * strengthened, and let this launch's own tail end the stream instead.
-    * As on M5, a kernel with a large per-thread scratch frame keeps its
-    * barrier. */
+    * Indirect launches, ray-tracing kernels, and kernels with a large
+    * per-thread scratch frame keep their barrier. */
    const bool app_dispatch =
-      (!cmd->in_meta && s && s->info.stage == MESA_SHADER_COMPUTE &&
-       linked &&
-       MAX3(s->b.info.scratch_size, linked->b.scratch_size,
-            linked->b.agx3_spectpr_scratch_size) <=
-          HK_M5_OVERLAP_MAX_SCRATCH_B &&
-       agx_chip_elide_app_dispatch_barrier(dev->dev.chip)) ||
-      /* An acceleration-structure build orders every launch that depends on
-       * another with a pipeline barrier, which strengthens the earlier
-       * launch's tail; launches with none between them (one step of several
-       * builds, the fills after the leaves) run side by side. */
-      (cmd->state.as_build_recording && s && s->info.stage == MESA_SHADER_COMPUTE &&
-       !s->b.info.uses_ray_traversal);
+      s && s->info.stage == MESA_SHADER_COMPUTE &&
+      !s->b.info.uses_ray_traversal &&
+      !cmd->state.cs.descriptors.root.cs.trace_rays_addr &&
+      ((!cmd->in_meta && linked &&
+        MAX3(s->b.info.scratch_size, linked->b.scratch_size,
+             linked->b.agx3_spectpr_scratch_size) <=
+           HK_M5_OVERLAP_MAX_SCRATCH_B &&
+        agx_chip_elide_app_dispatch_barrier(dev->dev.chip)) ||
+       /* An acceleration-structure build orders every launch that depends on
+        * another with a pipeline barrier, which strengthens the earlier
+        * launch's tail; launches with none between them (one step of several
+        * builds, the fills after the leaves) run side by side. */
+       cmd->state.as_build_recording);
    if (app_dispatch && cs->app_dispatch_end &&
        cs->current == cs->app_dispatch_end &&
        cs->current == cs->weak_barrier_end) {

@@ -13,7 +13,7 @@
 static bool
 g16s_eligible(enum agx_chip chip, unsigned plane, const VkImageCreateInfo *info)
 {
-   return hk_hal200_compression_eligible(chip, plane, info, true);
+   return hk_hal200_compression_eligible(chip, 0x6040, plane, info, true);
 }
 
 static unsigned checks;
@@ -731,6 +731,82 @@ check_shared(void)
    CHECK(SHARED(kopper));
 }
 
+/* The M4 Max (T6041) keeps a reloaded 2x sample whole
+ * (agx_chip_uncovered_tile_ms_reload_defect()), so it takes the 2x colour
+ * attachments and 2x depth, nothing more of the M4 Pro's shapes. The A18 Pro
+ * (T8140, "Neo") does not, and keeps its 2x images plain. */
+static bool
+m4_max_eligible(enum agx_chip chip, unsigned plane,
+                const VkImageCreateInfo *info)
+{
+   return hk_hal200_compression_eligible(chip, 0x6041, plane, info, false);
+}
+
+static bool
+neo_eligible(enum agx_chip chip, unsigned plane, const VkImageCreateInfo *info)
+{
+   return hk_hal200_compression_eligible(chip, 0x8140, plane, info, false);
+}
+
+static bool (*volatile runtime_m4_max)(enum agx_chip, unsigned,
+                                       const VkImageCreateInfo *) =
+   m4_max_eligible;
+static bool (*volatile runtime_neo)(enum agx_chip, unsigned,
+                                    const VkImageCreateInfo *) = neo_eligible;
+#define M4_MAX(i) runtime_m4_max(AGX_CHIP_G17P, 0, &(i))
+#define NEO(i)    runtime_neo(AGX_CHIP_G17P, 0, &(i))
+
+static void
+check_m4_max(void)
+{
+   const VkImageUsageFlags rt =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   const VkImageUsageFlags ds = VK_IMAGE_USAGE_SAMPLED_BIT |
+                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+
+   VkImageCreateInfo c = image(VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1, rt);
+   CHECK(M4_MAX(c) && NEO(c));
+
+   c.samples = VK_SAMPLE_COUNT_2_BIT;
+   CHECK(M4_MAX(c) && !NEO(c));
+   VkImageCreateInfo x = c;
+   x.samples = VK_SAMPLE_COUNT_4_BIT;
+   CHECK(!M4_MAX(x));
+   x = c;
+   x.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+   CHECK(!M4_MAX(x));
+   x = c;
+   x.arrayLayers = 2;
+   CHECK(!M4_MAX(x));
+   x = c;
+   x.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   CHECK(!M4_MAX(x));
+   x = c;
+   x.format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+   CHECK(!M4_MAX(x));
+
+   /* Layered colour stays on the M4 Pro. */
+   x = image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, rt);
+   x.arrayLayers = 6;
+   CHECK(!M4_MAX(x) && g16s_eligible(AGX_CHIP_G17P, 0, &x));
+
+   VkImageCreateInfo d = image(VK_FORMAT_D32_SFLOAT, 1920, 1080, 1, ds);
+   CHECK(M4_MAX(d));
+   d.samples = VK_SAMPLE_COUNT_2_BIT;
+   CHECK(M4_MAX(d) && !NEO(d));
+   d.samples = VK_SAMPLE_COUNT_4_BIT;
+   CHECK(!M4_MAX(d));
+
+   /* Depth arrays: M4 Pro only. */
+   d = image(VK_FORMAT_D32_SFLOAT, 1024, 1024, 1, ds);
+   d.arrayLayers = 4;
+   CHECK(!M4_MAX(d) && g16s_eligible(AGX_CHIP_G17P, 0, &d));
+
+   /* Other chips never. */
+   CHECK(!runtime_m4_max(AGX_CHIP_G14G, 0, &c));
+}
+
 int
 main(void)
 {
@@ -748,6 +824,7 @@ main(void)
    check_minecraft();
    check_zink();
    check_shared();
+   check_m4_max();
    printf("G17P compression policy: %u checks passed\n", checks);
    return 0;
 }

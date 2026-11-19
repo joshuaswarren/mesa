@@ -95,6 +95,7 @@ static const struct debug_named_value hk_perf_options[] = {
    {"nobarrier", HK_PERF_NOBARRIER,"Ignore pipeline barriers"},
    {"nobatch",   HK_PERF_NOBATCH,  "Disable submission batching"},
    {"norobust",  HK_PERF_NOROBUST, "Disable robustness"},
+   {"weakbarrier", HK_PERF_WEAKBARRIER, "Keep ordering-only barriers between compute dispatches"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -1229,6 +1230,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       list_inithead(&dev->vdm.full[class]);
    }
    simple_mtx_init(&dev->scratch.lock, mtx_plain);
+   simple_mtx_init(&dev->sparse_buffers.lock, mtx_plain);
+   list_inithead(&dev->sparse_buffers.list);
    simple_mtx_init(&dev->shader_binary_cache.lock, mtx_plain);
    agx_scratch_init(&dev->dev, &dev->scratch.vs);
    agx_scratch_init(&dev->dev, &dev->scratch.fs);
@@ -1356,6 +1359,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    agx_scratch_fini(&dev->scratch.fs);
    agx_scratch_fini(&dev->scratch.cs);
    simple_mtx_destroy(&dev->scratch.lock);
+   simple_mtx_destroy(&dev->sparse_buffers.lock);
 
    if (dev->null_fs) {
       hk_api_shader_destroy(&dev->vk, &dev->null_fs->vk, pAllocator);
