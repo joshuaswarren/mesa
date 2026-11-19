@@ -75,6 +75,23 @@ test_flags(unsigned reports, bool timestamp, bool indexed)
    }
 }
 
+/* WAIT polls memory another agent writes, so every load of the availability
+ * word and of the reports must be volatile: a load the compiler may hoist out
+ * of the polling loop would spin forever on a stale value. A runtime test
+ * cannot force the producer's store to land while the loop is already
+ * spinning, so check the property itself. */
+static_assert(
+   __builtin_types_compatible_p(
+      __typeof__(&libagx_copy_query_g17p_result),
+      void (*)(volatile uint32_t *, volatile uint64_t *, uint16_t *, uint64_t,
+               uint64_t, uint32_t, uint32_t, uint16_t, uint32_t, uint32_t)),
+   "WAIT must poll through volatile pointers");
+static_assert(
+   __builtin_types_compatible_p(
+      __typeof__(&libagx_query_available),
+      bool (*)(volatile uint32_t *, uint32_t, uint32_t)),
+   "availability must be read through a volatile pointer");
+
 static void
 test_wait(bool timestamp)
 {
@@ -91,11 +108,17 @@ test_wait(bool timestamp)
    memset(p->output, 0xa5, sizeof(p->output));
 
    /* Use a process-shared mapping, rather than racing C threads on volatile
-    * objects. A missing volatile load in the polling loop times out. */
+    * objects. The producer publishes only once the consumer has found the
+    * query unavailable and is about to wait for it. */
+   int start[2];
+   assert(pipe(start) == 0);
    pid_t child = fork();
    assert(child >= 0);
    if (child == 0) {
-      usleep(20000);
+      char go;
+      close(start[1]);
+      if (read(start[0], &go, 1) != 1)
+         _exit(1);
       p->reports[1] = UINT64_C(0x8877665544332211);
       __atomic_store_n(&p->reports[0], UINT64_C(0x1122334455667788),
                        __ATOMIC_RELEASE);
@@ -103,6 +126,18 @@ test_wait(bool timestamp)
       _exit(0);
    }
 
+   close(start[0]);
+   uint64_t output[3];
+   libagx_copy_query_g17p_result(
+      timestamp ? NULL : &p->availability, p->reports, NULL,
+      (uintptr_t)output, 0, 0,
+      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT,
+      timestamp ? 1 : 2, 0, 0);
+   assert(output[timestamp ? 1 : 2] == 0);
+   assert(write(start[1], "", 1) == 1);
+   close(start[1]);
+
+   /* Watchdog only: a correct WAIT returns as soon as the store lands. */
    alarm(5);
    libagx_copy_query_g17p_result(
       timestamp ? NULL : &p->availability, p->reports, NULL,

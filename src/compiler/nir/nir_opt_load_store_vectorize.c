@@ -1722,8 +1722,11 @@ vectorize_sorted_entries(struct vectorize_ctx *ctx, nir_function_impl *impl,
          unsigned max_hole = first->is_store ? 0 : 28;
          unsigned low_size = get_bit_size(low) / 8u * low->num_components;
          bool separate = diff > max_hole + low_size;
+         /* The entries are sorted by offset and a merge keeps the lower
+          * offset, so every later entry is at least as far away.
+          */
          if (separate)
-            continue;
+            break;
 
          if (try_vectorize(impl, ctx, low, high, first, second)) {
             low = low->is_store ? second : first;

@@ -1068,39 +1068,6 @@ lower_indexed_samplers(nir_shader *shader, int native32_set, bool m5,
 }
 
 bool
-agx_nir_lower_g17g_indexed_samplers(nir_shader *shader)
-{
-   if (!shader || shader->info.stage != MESA_SHADER_FRAGMENT)
-      return false;
-   nir_foreach_function_impl(impl, shader) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            /* The shared lowering also supports storage-image fetches on
-             * G17P. M5 currently only has the array-sample operand ABI. */
-            if (instr->type == nir_instr_type_intrinsic &&
-                nir_instr_as_intrinsic(instr)->intrinsic ==
-                   nir_intrinsic_bindless_image_load)
-               return false;
-            if (instr->type != nir_instr_type_tex)
-               continue;
-            const nir_tex_instr *tex = nir_instr_as_tex(instr);
-            const int lod = nir_tex_instr_src_index(tex, nir_tex_src_lod);
-            if (tex->op != nir_texop_txl ||
-                tex->sampler_dim != GLSL_SAMPLER_DIM_2D || !tex->is_array ||
-                tex->is_shadow || tex->dest_type != nir_type_float32 ||
-                lod < 0 || !nir_src_is_const(tex->src[lod].src) ||
-                nir_src_as_float(tex->src[lod].src) != 0.0)
-               return false;
-         }
-      }
-   }
-   /* Gen10 publishes the same software heap-index tail and reserved sampler
-    * prefix as Gen9. The native opcode/staging differences stay in the M5
-    * encoder; this shared lowering only translates API handles to indices. */
-   return agx_nir_lower_g17p_indexed_samplers(shader, false);
-}
-
-bool
 agx_nir_lower_g17p_indexed_samplers(nir_shader *shader, bool g17p)
 {
    return lower_indexed_samplers(shader, -1, false, g17p);
@@ -1236,12 +1203,6 @@ agx_nir_lower_g17g_indexed_reads(nir_shader *shader)
       }
    }
    return reads > 0 && lower_indexed_samplers(shader, -1, true, false);
-}
-
-bool
-agx_nir_lower_g17p_native32_samplers(nir_shader *shader, uint8_t texture_set)
-{
-   return lower_indexed_samplers(shader, texture_set, false, false);
 }
 
 static bool

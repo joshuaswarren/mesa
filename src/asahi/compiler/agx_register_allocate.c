@@ -2333,7 +2333,24 @@ agx_ra_assign_local(struct ra_ctx *rctx)
       /* Optimization: if a split contains the last use of a vector, the split
        * can be removed by assigning the destinations overlapping the source.
        */
-      if (I->op == AGX_OPCODE_SPLIT && I->src[0].kill) {
+      /* A killed vector may live above a sampler operand's register bank.
+       * A channel used by that sampler must take the regular parallel-copy
+       * path if it cannot inherit the vector's physical register. */
+      bool coalesce_split = I->op == AGX_OPCODE_SPLIT && I->src[0].kill;
+      if (coalesce_split &&
+          rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
+         const unsigned base = ssa_to_reg[I->src[0].value];
+         const unsigned width = agx_size_align_16(agx_split_width(I));
+         agx_foreach_ssa_dest(I, d) {
+            const unsigned reg = base + d * width;
+            if (reg < dest_minimum(rctx, I, d) ||
+                reg + width > dest_limit(rctx, I, d)) {
+               coalesce_split = false;
+               break;
+            }
+         }
+      }
+      if (coalesce_split) {
          assert(ra_class_for_index(I->src[0]) == RA_GPR);
          unsigned reg = ssa_to_reg[I->src[0].value];
          unsigned width = agx_size_align_16(agx_split_width(I));

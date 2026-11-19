@@ -788,14 +788,3 @@ bool agx3_cf_fcmp_zero(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
    return agx3_cf_fcmp_zero_imm(enc, cond, or_nan, slot, source, source_16, 0,
                                 hint, wait_mask, out, len);
 }
-
-bool agx3_cf_fcmp_minifloat(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
-                            bool or_nan, unsigned slot, uint16_t source,
-                            bool source_16, uint8_t minifloat,
-                            struct agx3_cf_source_hints hint,
-                            uint16_t wait_mask,
-                            uint8_t out[AGX3_CF_MAX_LENGTH], uint8_t *len)
-{
-   return agx3_cf_fcmp_zero_imm(enc, cond, or_nan, slot, source, source_16,
-                                minifloat, hint, wait_mask, out, len);
-}

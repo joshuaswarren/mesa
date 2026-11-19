@@ -26,7 +26,6 @@
 #include "hk_image.h"
 #include "hk_instance.h"
 #include "hk_m5_acceleration_structure.h"
-#include "hk_memory_budget_core.h"
 #include "hk_agx3_vdm_decode.h"
 #include "hk_native_descriptor.h"
 #include "hk_nir_lower_mesh.h"

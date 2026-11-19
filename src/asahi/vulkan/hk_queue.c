@@ -543,33 +543,8 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
       u_rwlock_rdunlock(&dev->external_bos.lock);
 
    if (ret) {
-      /* Opt-in diagnostic: preserve the exact rejected submission so the
-       * kernel's validation can be replayed offline. No effect unless set. */
-      const char *dump = os_get_option("ASAHI_SUBMIT_DUMP_ON_ERROR");
-      if (dump && *dump) {
-         const int err = errno;
-         static unsigned seq;
-         char path[512];
-         snprintf(path, sizeof(path), "%s/submit-%d-%u.bin", dump, (int)getpid(),
-                  p_atomic_inc_return(&seq));
-         FILE *f = fopen(path, "wb");
-         if (f) {
-            /* Header: errno, struct size, then the ioctl struct, the command
-             * stream, and the sync array (16 bytes per entry). */
-            const uint32_t hdr[4] = {(uint32_t)err, sizeof(*submit),
-                                     submit->cmdbuf_size,
-                                     submit->in_sync_count + submit->out_sync_count};
-            fwrite(hdr, sizeof(hdr), 1, f);
-            fwrite(submit, sizeof(*submit), 1, f);
-            fwrite((const void *)(uintptr_t)submit->cmdbuf, 1, submit->cmdbuf_size, f);
-            if (submit->syncs)
-               fwrite((const void *)(uintptr_t)submit->syncs,
-                      sizeof(struct drm_asahi_sync), hdr[3], f);
-            fclose(f);
-            mesa_loge("hk: rejected submission (errno %d) saved to %s", err, path);
-         }
-         errno = err;
-      }
+      /* ASAHI_MESA_DEBUG=trace decodes every command stream before it is
+       * submitted, including one the kernel rejects. */
       return vk_device_set_lost(&dev->vk,
                                 "DRM_IOCTL_ASAHI_SUBMIT failed: %m");
    }

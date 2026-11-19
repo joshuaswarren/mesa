@@ -1491,6 +1491,21 @@ agx_fb_has_colour(const struct pipe_framebuffer_state *fb)
    return false;
 }
 
+/* G17G's tile programs move one colour attachment and it renders one layer,
+ * so it draws and clears a framebuffer with more colour attachments or layers
+ * in passes that each bind part of it and then bind the whole framebuffer
+ * again (agx_g17g_split_mrt, agx_g17g_layered_draw, agx_g17g_layered_clear).
+ * Each of those binds ends a Z/S merge, after which the passes and the draws
+ * that follow would write colour the application never bound. These are the
+ * conditions under which agx_draw_vbo() and agx_clear() take those paths. */
+static bool
+agx_fb_drawn_in_passes(const struct agx_device *dev,
+                       const struct pipe_framebuffer_state *fb)
+{
+   return agx_chip_g17_m5(dev->chip) &&
+          (fb->nr_cbufs > 1 || util_framebuffer_get_num_layers(fb) > 1);
+}
+
 /* If the app binds a framebuffer with only a depth/stencil surface, and an
  * active render batch already renders to that same surface with the same
  * size, keep drawing into that batch: the draws are those of the batch's
@@ -1500,6 +1515,8 @@ static void
 agx_try_zs_merge(struct agx_context *ctx,
                  const struct pipe_framebuffer_state *state)
 {
+   const struct agx_device *dev = agx_device(ctx->base.screen);
+
    if (!debug_get_option_zs_merge() || !state->zsbuf.texture ||
        agx_fb_has_colour(state) || state->resolve || state->viewmask)
       return;
@@ -1510,6 +1527,7 @@ agx_try_zs_merge(struct agx_context *ctx,
          continue;
       struct agx_batch *b = &ctx->batches.slots[idx];
       if (agx_batch_is_compute(b) || !agx_fb_has_colour(&b->key) ||
+          agx_fb_drawn_in_passes(dev, &b->key) ||
           b->key.resolve || b->key.viewmask ||
           b->key.width != state->width || b->key.height != state->height ||
           b->key.samples != state->samples ||
@@ -3090,10 +3108,10 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
             if (key->layer_as_varying)
                NIR_PASS(_, nir, agx_nir_lower_default_layer);
             NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs, key->layer_as_varying,
-                     false);
+                     false, -1);
          } else {
             NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs,
-                     agx_native_graphics(dev), false);
+                     agx_native_graphics(dev), false, -1);
          }
       } else {
          if (agx_chip_g17_m5(dev->chip) && !nir->info.vs.tes_poly)
@@ -3567,10 +3585,10 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          if (layer_as_varying)
             NIR_PASS(_, gs_copy, agx_nir_lower_default_layer);
          NIR_PASS(_, gs_copy, agx_nir_lower_uvs, &uvs, layer_as_varying,
-                  false);
+                  false, -1);
       } else {
          NIR_PASS(_, gs_copy, agx_nir_lower_uvs, &uvs,
-                  agx_native_graphics(dev), false);
+                  agx_native_graphics(dev), false, -1);
       }
 
       compiled->gs_copy =
@@ -5124,6 +5142,27 @@ agx_update_fs(struct agx_batch *batch)
                               : 0,
    };
    agx_fs_epilog_apply_device_policy(dev->chip, &link_key.epilog.fs);
+   /* A fully masked G18 draw with no shader side effects uses the
+    * colour-free ISP state (fragment_writes_nothing). Do not invent tile
+    * loads/stores just to preserve its colour: those prevent the linker
+    * from recognizing the no-op fragment, and the resulting multisample
+    * preservation program cannot run for stencil-only browser draws.
+    *
+    * Keep preservation when any part can update coverage, depth, stencil,
+    * memory or another colour attachment. Such programs are not no-ops.
+    */
+   if (dev->chip == AGX_CHIP_G18G && agx_g18_native_mixed_enabled() &&
+       !(ctx->blend->store &
+         (PIPE_CLEAR_COLOR0 * BITFIELD_MASK(batch->key.nr_cbufs))) &&
+       ctx->fs->b.info.tag_write_disable &&
+       !link_key.prolog.fs.cull_distance_size &&
+       !link_key.prolog.fs.polygon_stipple &&
+       link_key.prolog.fs.api_sample_mask == 0xff &&
+       !link_key.epilog.fs.defer_api_sample_mask &&
+       !link_key.epilog.fs.link.write_z && !link_key.epilog.fs.link.write_s &&
+       !link_key.epilog.fs.link.sample_shading &&
+       !ctx->blend->key.alpha_to_coverage)
+      link_key.epilog.fs.preserve_zero_mask = false;
    /* G17S (and G17C, the same core) share G17P's tile behaviour: a covered
     * fragment with no tile store still dirties the tile, which then stores
     * undefined colour at EOT. Measured on the M5 Pro: a draw with every
@@ -15564,9 +15603,10 @@ agx_draw_patches_split(struct agx_context *ctx,
  * its index list record: agx_encode_state() would emit nothing for it anyway.
  * Anything that varies per sub-draw (draw ID or base parameters in uniforms,
  * statistics, geometry or tessellation stages, transform feedback, misaligned
- * indices) keeps the full path. AGX_FAST_MULTIDRAW=0 disables this.
+ * indices) keeps the full path. The record written is the HAL200 draw body
+ * of agx_g17p_emit_draw_body(), which is what every agx_native_graphics()
+ * chip encodes; other chips keep util_draw_multi().
  */
-DEBUG_GET_ONCE_BOOL_OPTION(fast_multidraw, "AGX_FAST_MULTIDRAW", true)
 
 static void agx_draw_vbo(struct pipe_context *pctx,
                          const struct pipe_draw_info *info,
@@ -15681,8 +15721,7 @@ agx_draw_multi(struct pipe_context *pctx, const struct pipe_draw_info *info,
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(pctx->screen);
 
-   if (indirect || !agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip) ||
-       dev->chip == AGX_CHIP_G18G || !debug_get_option_fast_multidraw()) {
+   if (indirect || !agx_native_graphics(dev)) {
       util_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
       return;
    }

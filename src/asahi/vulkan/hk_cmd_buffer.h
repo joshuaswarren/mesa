@@ -198,7 +198,11 @@ struct hk_root_descriptor_table {
           * sample mask; they apply it before their own coverage update.
           * Sysval fields must sit at 4-byte offsets (root table loads). */
          uint16_t alpha_to_coverage;
-         uint16_t _pad7;
+
+         /* The pass has no attachments, so no storage backs its layers: the
+          * hardware sees layer zero, while a fragment shader reading the layer
+          * still gets what the vertex stage wrote. */
+         uint16_t no_attachments;
 
          /* Mapping from varying slots written by the last vertex stage to UVS
           * indices. This mapping must be compatible with the fragment shader.
@@ -710,10 +714,6 @@ struct hk_g17p_launch {
 };
 
 struct hk_g17p_graphics_ioto_cache_entry {
-   uint16_t m5_range_count;
-   uint16_t m5_tile_size_px;
-   uint8_t m5_sample_size_B;
-   uint8_t m5_nr_samples;
    /* The loader of the last draw, the program published from it and the
     * range addresses written into it (hk_g17p_publish_gfx_loader()). */
    const struct hk_g17p_gfx_loader *loader;
