@@ -293,10 +293,23 @@ agx_has_uniform_store(const agx_context *ctx)
    return false;
 }
 
+/*
+ * A spilled copy of a uniform word can be made again at its use: the AGX3B
+ * and AGX3C copy forms read any even uniform pair into any 32-bit register.
+ * This covers the AGX3 word copy only; AGX2 reads uniforms with its own bitop
+ * and keeps its spill behaviour. Not on G18G (AGX3C re-encoded as agx3d,
+ * emit_agx3d): a rematerialized copy is placed under register pressure, where
+ * its destination is often at or above half 128, and agx3d copies into those
+ * destinations have not been verified to execute correctly (the direct agx3d
+ * encoder, agx3_copy_encode_uniform_to_reg32, only emits lower ones).
+ */
 bool
 agx_can_rematerialize_uniform(const agx_context *ctx, const agx_instr *I)
 {
-   return ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+   return ctx->key &&
+          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+            !agx_is_g18g(&ctx->key->dev))) &&
           !ctx->is_preamble && !ctx->uniforms_written &&
           I->op == AGX_OPCODE_MOV && I->nr_dests == 1 && I->nr_srcs == 1 &&
           I->dest[0].type == AGX_INDEX_NORMAL && !I->dest[0].memory &&
