@@ -51,7 +51,7 @@
  *    release); f119 is 1 in every witness and f120 is 4, which every form's
  *    predicates require. Mesa's G18G packer stages the one-component layout
  *    Apple's G18G compiler uses (data just below X, Y just above) and names
- *    X in f5 (agx3_tex_encode_image_write_g18g_r32), so the rule below only
+ *    X in f5 (agx3_tex_encode_image_write_g18g), so the rule below only
  *    adds f116 = f5 + 2, f118 = f5 - 2 and the constants, and composes
  *    kick 19's bytes exactly for X@2.
  *
@@ -786,16 +786,6 @@ agx3_transcode_agx3d(struct util_dynarray *binary, unsigned start,
 {
    return transcode(binary, start, NULL, NULL, 0, NULL, false, why,
                     fail_offset);
-}
-
-bool
-agx3_transcode_agx3d_with_offsets(struct util_dynarray *binary, unsigned start,
-                                  unsigned *offsets, unsigned count,
-                                  bool fragment_stage,
-                                  const char **why, unsigned *fail_offset)
-{
-   return transcode(binary, start, NULL, offsets, count, &fragment_stage,
-                    false, why, fail_offset);
 }
 
 bool
