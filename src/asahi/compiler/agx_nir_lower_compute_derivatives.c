@@ -118,11 +118,8 @@ agx_nir_lower_compute_derivatives(nir_shader *s)
           s->info.derivative_group != DERIVATIVE_GROUP_NONE);
 
    bool progress = false;
-   if (!debug_get_bool_option("ASAHI_G17P_COMPUTE_HW_DERIVATIVE_DIAGNOSTIC",
-                              false)) {
-      NIR_PASS(progress, s, nir_shader_intrinsics_pass, lower_derivative,
-               nir_metadata_control_flow, NULL);
-   }
+   NIR_PASS(progress, s, nir_shader_intrinsics_pass, lower_derivative,
+            nir_metadata_control_flow, NULL);
    if (!agx_nir_compute_implicit_lod_diagnostic()) {
       NIR_PASS(progress, s, nir_shader_tex_pass, lower_implicit_sample,
                nir_metadata_control_flow, NULL);

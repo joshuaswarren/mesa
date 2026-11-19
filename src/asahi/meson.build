@@ -143,6 +143,46 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # Global queue priorities: HIGH is advertised on every chip and passed to
+  # the kernel, whose refusal (no CAP_SYS_NICE: EACCES; a GPU backend without
+  # HIGH: EINVAL) is VK_ERROR_NOT_PERMITTED; REALTIME is always refused.
+  foreach chip : ['g13g', 'g17p']
+    foreach policy : ['allow', 'deny', 'unsupported']
+      test(
+        'hk-' + chip + '-global-priority-' + policy,
+        prog_python,
+        args : [
+          files('../gallium/drivers/asahi/tests/run-shim.py'),
+          libasahi_noop_drm_shim,
+          hk_vulkan_global_priority,
+        ],
+        env : [
+          'ASAHI_SHIM_CHIP=' + chip,
+          'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+        ] + (policy == 'allow' ? [] : ['ASAHI_SHIM_HIGH_PRIORITY=' + policy]),
+        depends : [_dev_icd, libvulkan_asahi],
+        suite : ['asahi'],
+      )
+    endforeach
+  endforeach
+
+  # A sparse image bind as a queue's first submission, with no command buffer.
+  test(
+    'hk-g17p-sparse-bind-first-submit',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      hk_vulkan_sparse_bind_first_submit,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # Explicit DRM plane layouts: placement, requirements, subresource layouts
   # and validation, without executing on the GPU.
   foreach chip : ['g13g', 'g17p']

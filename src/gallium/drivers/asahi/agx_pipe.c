@@ -10,7 +10,6 @@
 #include <xf86drm.h>
 #include <linux/dma-buf.h>
 #include "asahi/compiler/agx_compile.h"
-#include "asahi/compiler/agx_debug.h"
 #include "asahi/layout/layout.h"
 #include "asahi/genxml/agx3_cmdstream.h"
 #include "asahi/lib/agx_g17p_compression.h"
@@ -69,7 +68,6 @@ static const char *const agx_env_flag_names[AGX_ENV_FLAG_COUNT] = {
    [AGX_ENV_NEO_DRAW_DIAGNOSTICS] = "NEO_AGX_DRAW_DIAGNOSTICS",
    [AGX_ENV_NEO_UNIFORM_DIAGNOSTICS] = "NEO_AGX_UNIFORM_DIAGNOSTICS",
    [AGX_ENV_NEO_BINARY_DIAGNOSTICS] = "NEO_AGX_BINARY_DIAGNOSTICS",
-   [AGX_ENV_G18_RESOURCE_TRACE] = "ASAHI_G18_RESOURCE_TRACE",
    [AGX_ENV_NO_STAGED_BUFFER_WRITES] = "ASAHI_NO_STAGED_BUFFER_WRITES",
    [AGX_ENV_NO_M5_PROGRAM_CACHE] = "ASAHI_NO_M5_PROGRAM_CACHE",
    [AGX_ENV_M5_VERIFY_PROGRAM_CACHE] = "ASAHI_M5_VERIFY_PROGRAM_CACHE",
@@ -465,22 +463,12 @@ agx_twiddled_allowed(const struct agx_resource *pres)
    return true;
 }
 
-/* G17P compresses a private, single-level, single-layer, single-sample 2D
- * colour image of agx_g17p_compression_color_format(): written by the
- * compressed Gen9 2D PBE (end-of-tile stores, blits, staging uploads) and
- * read by the compressed texture descriptor, the packets Honeykrisp
- * compresses its own G17P colour images with. Nothing decompresses such an
- * image in place: its format never spills from the tilebuffer, and it is
- * neither shared nor scanned out, so a feedback loop or a shader-image
- * binding reallocates it uncompressed (agx_decompress()), as on AGX2.
- */
 /* G17P depth: a private, single-level, single-layer, single-sample Z32F
  * depth buffer, as Honeykrisp compresses (hk_g17p_compression_depth_format()).
  * ZLS writes it compressed through the metadata agx_batch already passes, and
  * the compressed Gen9 2D texture packet reads it. On the M4 Max this is
  * byte-identical to plain depth through depth testing across passes,
- * readback, sampling, shadow comparison, blits and scissored clears, and a
- * Sodium-style terrain frame took 6-8 % less time. */
+ * readback, sampling, shadow comparison, blits and scissored clears. */
 static bool
 agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
                                            const struct pipe_resource *templ)
@@ -492,6 +480,15 @@ agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
           !(templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DEPTH_STENCIL));
 }
 
+/* G17P compresses a private, single-level, single-layer, single-sample 2D
+ * colour image of agx_g17p_compression_color_format(): written by the
+ * compressed Gen9 2D PBE (end-of-tile stores, blits, staging uploads) and
+ * read by the compressed texture descriptor, the packets Honeykrisp
+ * compresses its own G17P colour images with. Nothing decompresses such an
+ * image in place: its format never spills from the tilebuffer, and it is
+ * neither shared nor scanned out, so a feedback loop or a shader-image
+ * binding reallocates it uncompressed (agx_decompress()), as on AGX2.
+ */
 static bool
 agx_g17p_private_compression_allowed(const struct agx_device *dev,
                                      const struct pipe_resource *templ)
@@ -2869,10 +2866,7 @@ agx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
    if (sample_count > 1 && sample_count != 4 && sample_count != 2)
       return false;
 
-   if (sample_count > 1 &&
-       ((agx_device(pscreen)->chip == AGX_CHIP_G18G &&
-         !agx_g18_msaa4_enabled()) ||
-        (agx_device(pscreen)->debug & AGX_DBG_NOMSAA)))
+   if (sample_count > 1 && (agx_device(pscreen)->debug & AGX_DBG_NOMSAA))
       return false;
 
    if (MAX2(sample_count, 1) != MAX2(storage_sample_count, 1))

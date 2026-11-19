@@ -850,6 +850,8 @@ enum hk_feature_key {
     * contents when a draw or dispatch is recorded away from them. The layout
     * hash carries the flag into the shader cache key. */
    HK_FEAT_DESCRIPTOR_BUFFER = BITFIELD_BIT(8),
+
+   HK_FEAT_IMAGE_VIEW_MIN_LOD = BITFIELD_BIT(9),
 };
 
 /* What a dynamic-sample-count G17P fragment shader needs to compile its
@@ -910,7 +912,8 @@ hk_make_feature_key(const struct vk_features *feats)
     * object binary must not depend on the features its device enabled, so
     * assume every state they can draw with. */
    if (!feats)
-      return HK_FEAT_CUSTOM_BORDER | HK_FEAT_DEPTH_CLIP_CONTROL;
+      return HK_FEAT_CUSTOM_BORDER | HK_FEAT_DEPTH_CLIP_CONTROL |
+             HK_FEAT_IMAGE_VIEW_MIN_LOD;
 
    return (feats->customBorderColors ? HK_FEAT_CUSTOM_BORDER : 0) |
           (feats->descriptorBindingSampledImageUpdateAfterBind
@@ -921,7 +924,8 @@ hk_make_feature_key(const struct vk_features *feats)
           (feats->pipelineRobustness ? HK_FEAT_PIPELINE_ROBUSTNESS : 0) |
           (hk_rt_features_enabled(feats) ? HK_FEAT_RAY_TRACING : 0) |
           (feats->nullDescriptor ? HK_FEAT_NULL_DESCRIPTOR : 0) |
-          (feats->depthClipControl ? HK_FEAT_DEPTH_CLIP_CONTROL : 0);
+          (feats->depthClipControl ? HK_FEAT_DEPTH_CLIP_CONTROL : 0) |
+          (feats->minLod ? HK_FEAT_IMAGE_VIEW_MIN_LOD : 0);
 }
 
 /*
@@ -1154,6 +1158,14 @@ check_in_bounds(nir_builder *b, nir_intrinsic_instr *intr)
       return nir_ult(b, nir_ushr_imm(b, offset, shift),
                         nir_ushr_imm(b, bound, shift));
    }
+
+   /* Byte offsets below bound - (size - 1) fit the whole load. The
+    * saturating subtraction rejects every offset when the bound is smaller
+    * than the load. Loads of the same width can share the adjusted bound.
+    */
+   if (offset->bit_size == 32 && bound->bit_size == 32)
+      return nir_ult(b, offset,
+                     nir_usub_sat(b, bound, nir_imm_int(b, load_size - 1)));
 
    /* Otherwise bounds check in bytes */
    nir_def *sat_offset = nir_umin_imm(b, offset, UINT32_MAX - (load_size - 1));
@@ -3394,7 +3406,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    struct hk_instance *instance = hk_physical_device_instance(
       (struct hk_physical_device *)dev->vk.physical);
 
-   if (instance->drirc.misc.image_view_min_lod) {
+   if (instance->drirc.misc.image_view_min_lod &&
+       (features & HK_FEAT_IMAGE_VIEW_MIN_LOD)) {
       NIR_PASS(_, nir, hk_nir_lower_image_view_min_lod);
    }
 
@@ -4242,7 +4255,7 @@ hk_g17p_saturate_layer_viewport(nir_builder *b, nir_intrinsic_instr *intr,
 static void
 hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
                bool kill_psiz, bool layer_as_varying, bool default_layer,
-               bool original_vertex_stage, bool clip_m1_1)
+               bool clip_m1_1, int layer_zero_root_offset)
 {
    /* Point size must be clamped, excessively large points don't render
     * properly on G13.
@@ -4263,10 +4276,11 @@ hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
    NIR_PASS(_, nir, agx_nir_lower_cull_distance_vs);
 
    /* Native fragment Layer reads use a flat coefficient, including for
-    * independently compiled stages whose VS does not explicitly write Layer. */
+    * independently compiled stages whose VS does not explicitly write Layer.
+    * This program is the last stage before the rasterizer whatever API stage
+    * it came from, so the same holds for tessellation and geometry. */
    shader->info.g17p_default_layer_zero =
-      original_vertex_stage && layer_as_varying &&
-      !nir->info.layer_viewport_relative &&
+      layer_as_varying && !nir->info.layer_viewport_relative &&
       !(nir->info.outputs_written & VARYING_BIT_LAYER);
    if (layer_as_varying && default_layer)
       NIR_PASS(_, nir, agx_nir_lower_default_layer);
@@ -4277,7 +4291,8 @@ hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
     * the canonical layout, whose indices are constants.
     */
    NIR_PASS(_, nir, agx_nir_lower_uvs, &shader->info.uvs,
-            layer_as_varying, dev->dev.chip == AGX_CHIP_G17P);
+            layer_as_varying, dev->dev.chip == AGX_CHIP_G17P,
+            layer_zero_root_offset);
 }
 
 /* G17P unrolls per-sample fragment execution for a pipeline that fixes two or
@@ -5496,8 +5511,10 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
             NIR_PASS(_, nir, agx_nir_preserve_position_order);
          hk_lower_hw_vs(dev, nir, shader, kill_psiz,
                         agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip),
-                        default_layer, sw_stage == MESA_SHADER_VERTEX,
-                        hk_clip_m1_1(dev, features));
+                        default_layer, hk_clip_m1_1(dev, features),
+                        agx_native_graphics(&dev->dev)
+                           ? hk_root_descriptor_offset(draw.no_attachments)
+                           : -1);
          outputs = nir->info.outputs_written;
       } else {
          NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
@@ -6580,7 +6597,7 @@ static bool
 hk_m5_mesh_task_grid(struct hk_device *dev, nir_shader *nir,
                      VkShaderCreateFlagsEXT flags)
 {
-   if (nir->info.stage != MESA_SHADER_MESH || !hk_m5_task_enabled() ||
+   if (nir->info.stage != MESA_SHADER_MESH ||
        (flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT) ||
        !hk_nir_reads_intrinsic(nir, nir_intrinsic_load_num_workgroups))
       return true;
@@ -7461,8 +7478,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    if (sw_stage == MESA_SHADER_MESH) {
       struct hk_shader *shader = hk_main_mesh_variant(obj);
       if (dev->dev.chip != AGX_CHIP_G17P &&
-          (dev->dev.chip != AGX_CHIP_G17S ||
-           hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE)) {
+          dev->dev.chip != AGX_CHIP_G17S) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_UNKNOWN);
@@ -7610,7 +7626,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       /* An M5 mesh layer/viewport is also a user word (see
        * agx_m5_mesh_gather_varyings), as for the M5 vertex stage. */
       agx_nir_lower_uvs(layout.shader, &shader->info.uvs,
-                        m5_mesh && layout_ok && varyings.lv, false);
+                        m5_mesh && layout_ok && varyings.lv, false, -1);
       shader->info.uvs.mesh_primitive_page = varyings.primitive_stride_B != 0;
       shader->info.mesh.primitive_stride_B = varyings.primitive_stride_B;
       if (!m5_mesh)
@@ -7647,12 +7663,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       layout_ok &= !m5_without_layer ||
          shader->info.uvs.user_size <= HK_AGX3_G17P_MAX_USER_WORDS;
       if (!layout_ok ||
-          !(m5_mesh ? (hk_m5_task_enabled()
-                          ? agx_nir_lower_m5_task_payload(nir,
-                               hk_m5_task_payload_limit(dev->dev.params.features),
-                               hk_m5_task_record(dev->dev.params.features) &&
-                                  !m5_no_grid_record ? 16 : 0)
-                          : agx_nir_lower_m5_task_payload_probe(nir))
+          !(m5_mesh ? agx_nir_lower_m5_task_payload(nir,
+                         hk_m5_task_payload_limit(dev->dev.params.features),
+                         hk_m5_task_record(dev->dev.params.features) &&
+                            !m5_no_grid_record ? 16 : 0)
                     : agx_nir_lower_gen1_task_payload_probe(nir)) ||
           !(m5_mesh ? agx_nir_lower_m5_mesh(nir, &varyings)
                     : agx_nir_lower_gen1_mesh(nir, &varyings))) {
@@ -7786,16 +7800,12 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * addressing and child-grid UVSW, never as a CDM mesh producer.
        * taskShader is advertised only with the kernel's task mesh storage
        * (hk_m5_task_record). */
-      if (hk_m5_task_enabled())
-         hk_m5_task_predicate(nir);
+      hk_m5_task_predicate(nir);
       if (dev->dev.chip != AGX_CHIP_G17S ||
-          hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE ||
-          !(hk_m5_task_enabled()
-               ? agx_nir_lower_m5_task(nir,
-                    hk_m5_task_payload_limit(dev->dev.params.features),
-                    hk_m5_task_record(dev->dev.params.features) &&
-                       !m5_no_grid_record)
-               : agx_nir_lower_m5_task_probe(nir))) {
+          !agx_nir_lower_m5_task(nir,
+              hk_m5_task_payload_limit(dev->dev.params.features),
+              hk_m5_task_record(dev->dev.params.features) &&
+                 !m5_no_grid_record)) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
@@ -7864,7 +7874,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       }
       hk_lower_hw_vs(dev, rast, shader, false,
                      agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip),
-                     true, false, hk_clip_m1_1(dev, features));
+                     true, hk_clip_m1_1(dev, features),
+                     agx_native_graphics(&dev->dev)
+                        ? hk_root_descriptor_offset(draw.no_attachments)
+                        : -1);
       shader->info.gs = count_variant->info.gs;
       main_variant->info.gs = count_variant->info.gs;
 
@@ -8411,6 +8424,20 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    bool has_mesh = false;
    const bool m5_no_grid_record =
       hk_m5_no_grid_record(dev, shader_count, infos);
+
+   for (uint32_t i = 0; i < shader_count; i++) {
+      if (hk_nir_layout_has_descriptors(infos[i].nir, infos[i].set_layout_count,
+                                        infos[i].set_layouts))
+         continue;
+
+      const mesa_shader_stage stage = infos[i].nir->info.stage;
+      for (uint32_t j = 0; j < shader_count; j++)
+         ralloc_free(infos[j].nir);
+      memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
+      return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                       "%s shader uses a descriptor missing from its pipeline "
+                       "layout", mesa_shader_stage_name(stage));
+   }
 
    /* Lower shaders, notably lowering I/O. This is a prerequisite for
     * intershader optimization.

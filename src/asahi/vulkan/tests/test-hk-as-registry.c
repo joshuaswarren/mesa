@@ -256,19 +256,6 @@ int main(void)
       }
    }
    windows();
-   /* The diagnostic live-table mode must refuse its reserved-ID boundary. */
-   util_dynarray_clear(&dev.gen1_ases);
-   dev.gen1_as_free_head = UINT32_MAX;
-   dev.gen1_rq_live_as_table = true;
-   VkAccelerationStructureKHR live[HK_GEN1_AS_TABLE_AS_SLOTS - 1];
-   for (unsigned i = 0; i < ARRAY_SIZE(live); ++i)
-      assert(create(&live[i]) == VK_SUCCESS && id(live[i]) == i + 1);
-   assert(create(&as) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
-   for (unsigned i = 0; i < ARRAY_SIZE(live); ++i)
-      destroy(live[i]);
-   assert(create(&as) == VK_SUCCESS);
-   destroy(as);
-   dev.gen1_rq_live_as_table = false;
    util_dynarray_foreach(&dev.gen1_as_windows, struct hk_gen1_as_window, win) {
       free_fake_bo(win->trampolines);
       free(win->va);

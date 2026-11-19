@@ -12,8 +12,6 @@
 #include "agx_debug.h"
 #include "shader_enums.h"
 
-DEBUG_GET_ONCE_BOOL_OPTION(m5_redundant_copies,
-                           "ASAHI_M5_REDUNDANT_COPIES", true)
 
 /* Remove bit-identical overwrites only after allocation, without extending
  * allocation live ranges. The cache pass below recomputes all use hints. */
@@ -21,8 +19,7 @@ static void
 agx3_remove_redundant_physical_copies(agx_context *ctx)
 {
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
-       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||
-       !debug_get_option_m5_redundant_copies())
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
       return;
 
    uint32_t serial = 0;

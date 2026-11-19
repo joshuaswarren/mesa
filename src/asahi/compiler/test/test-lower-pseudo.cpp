@@ -58,29 +58,79 @@ TEST_F(LowerPseudo, Not)
    CASE(agx_not_to(b, wx, wy), agx_bitop_to(b, wx, wy, agx_zero(), 0x5));
 }
 
-TEST_F(LowerPseudo, G18GMaterializesImmediateFloatAdd)
+/* No AGX3 table encodes an f32 add of two immediates, so every AGX3 encoding
+ * (agx3b, agx3c, and agx3c re-encoded as agx3d for G18G) lowers it: an exact
+ * sum folds to one literal move; modifiers or a clamp keep the add with the
+ * first constant in the destination register. */
+TEST_F(LowerPseudo, Agx3MaterializesImmediateFloatAdd)
 {
-   /* G18G only (agx_is_g18g): the G17G-family compile re-encoded as agx3d. */
-   {
+   const struct {
+      enum agx_isa_encoding encoding;
+      bool emit_agx3d;
+   } encodings[] = {
+      {AGX_ISA_ENCODING_AGX3B, false},
+      {AGX_ISA_ENCODING_AGX3C, false},
+      {AGX_ISA_ENCODING_AGX3C, true},
+   };
+
+   for (auto e : encodings) {
+      SCOPED_TRACE(e.encoding * 2 + e.emit_agx3d);
       agx_shader_key key = {};
-      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
-      key.dev.emit_agx3d = true;
-      const uint8_t constants[] = {0x00, 0x80, 0x30};
-      const uint32_t bits[] = {0x00000000, 0x80000000, 0x3f800000};
-      for (unsigned i = 0; i < 3; ++i) {
+      key.dev.encoding = e.encoding;
+      key.dev.emit_agx3d = e.emit_agx3d;
+
+      /* +0 + -0 = +0, -0 + -0 = -0, 1 + -0 = 1, 1 + 1 = 2 */
+      const uint8_t constants[] = {0x00, 0x80, 0x30, 0x30};
+      const uint8_t addends[] = {0x80, 0x80, 0x80, 0x30};
+      const uint32_t bits[] = {0x00000000, 0x80000000, 0x3f800000,
+                               0x40000000};
+      for (unsigned i = 0; i < ARRAY_SIZE(constants); ++i) {
          agx_builder *actual = agx_test_builder(mem_ctx);
          actual->shader->key = &key;
-         agx_fadd_to(actual, wx, agx_immediate(constants[i]), agx_negzero());
+         agx_fadd_to(actual, wx, agx_immediate(constants[i]),
+                     agx_immediate(addends[i]));
 
          agx_builder *expected = agx_test_builder(mem_ctx);
          expected->shader->key = &key;
          agx_mov_imm_to(expected, wx, bits[i]);
-         agx_fadd_to(expected, wx, wx, agx_negzero());
+
+         agx_lower_pseudo(actual->shader);
+         ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+      }
+
+      /* Saturated, or with a source modifier: the add stays on the GPU. */
+      for (unsigned v = 0; v < 2; ++v) {
+         agx_builder *actual = agx_test_builder(mem_ctx);
+         actual->shader->key = &key;
+         agx_index a = agx_immediate(0x30);
+         if (v == 1)
+            a = agx_neg(a);
+         agx_instr *add = agx_fadd_to(actual, wx, a, agx_negzero());
+         add->saturate = v == 0;
+
+         agx_builder *expected = agx_test_builder(mem_ctx);
+         expected->shader->key = &key;
+         agx_mov_imm_to(expected, wx, 0x3f800000);
+         agx_instr *want = agx_fadd_to(expected, wx, v == 1 ? agx_neg(wx) : wx,
+                                       agx_negzero());
+         want->saturate = v == 0;
 
          agx_lower_pseudo(actual->shader);
          ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
       }
    }
+
+   /* AGX2 encodes an immediate in either source: nothing to lower. */
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX2;
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   actual->shader->key = &key;
+   agx_fadd_to(actual, wx, agx_immediate(0x30), agx_negzero());
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   expected->shader->key = &key;
+   agx_fadd_to(expected, wx, agx_immediate(0x30), agx_negzero());
+   agx_lower_pseudo(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
 }
 
 TEST_F(LowerPseudo, LowersAgx3UnconditionalBreak)

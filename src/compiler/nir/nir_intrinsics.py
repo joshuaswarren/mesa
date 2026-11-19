@@ -2526,6 +2526,7 @@ system_value("is_first_fan_agx", 1, bit_sizes=[1])
 
 # Root descriptor address
 system_value("root_agx", 1, bit_sizes=[64])
+
 # Load a bindless sampler handle mapping a binding table sampler.
 intrinsic("load_sampler_handle_agx", [1], 1, [],
           flags=[CAN_ELIMINATE, CAN_REORDER],
@@ -2657,8 +2658,6 @@ load("constant_agx", [1, 1], [ACCESS, BASE, FORMAT, SIGN_EXTEND],
      [CAN_ELIMINATE, CAN_REORDER])
 # src[] = { value, address, index }.
 store("agx", [1, 1], [ACCESS, BASE, FORMAT, SIGN_EXTEND])
-
-
 
 # Logical complement of load_front_face, mapping to an AGX system value
 system_value("back_face_agx", 1, bit_sizes=[1, 32])

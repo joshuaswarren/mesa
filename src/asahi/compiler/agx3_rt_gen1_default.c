@@ -1,5 +1,4 @@
 #include "agx3_rt_gen1_default.h"
-#include "agx3_rt_gen1_entry.h"
 #include "agx3_binder.h"
 #include "agx3_pack.h"
 #include <string.h>
@@ -72,24 +71,6 @@ agx3_rt_gen1_default_constants(uint8_t out[AGX3_RT_GEN1_DEFAULT_CONSTANTS_SIZE])
 {
    const uint32_t words[4] = {0x0fe00200, 0x00000fff, 0, 0x40000000};
    memcpy(out, words, sizeof(words));
-}
-bool
-agx3_rt_gen1_default_entry_generate(uint64_t slot_body_va, uint8_t out[512], size_t *length)
-{
-   static const struct agx3_rt_gen1_uniform uniforms[] = {
-      {0, 20}, {2, 22}, {12, 32}, {14, 34}, {4, 24}, {6, 26}, {8, 28}, {10, 30},
-   };
-   const struct agx3_rt_gen1_entry_desc desc = {
-      .constants_va = slot_body_va + 0x10000,
-      .shader_va = slot_body_va + 64,
-      .branch_va = slot_body_va,
-      .uniforms = uniforms,
-      .constant_dwords = 6,
-      .fetch_span = 3,
-      .uniform_count = sizeof(uniforms) / sizeof(uniforms[0]),
-      .context48 = false,
-   };
-   return agx3_rt_gen1_entry_generate(&desc, out, length);
 }
 bool
 agx3_rt_gen1_runtime_code_map(uint64_t rows[AGX3_RT_GEN1_RUNTIME_MAP_ROWS][3])
@@ -341,7 +322,7 @@ agx3_rt_gen1_runtime_ift(uint8_t out[AGX3_RT_GEN1_IFT_BYTES])
    }
 }
 bool
-agx3_rt_gen1_stub_body_generate(unsigned slot, bool trap, uint8_t *out, size_t capacity, size_t *length)
+agx3_rt_gen1_stub_body_generate(unsigned slot, uint8_t *out, size_t capacity, size_t *length)
 {
    uint8_t staged[256] = {0};
    size_t used = 64;
@@ -349,23 +330,6 @@ agx3_rt_gen1_stub_body_generate(unsigned slot, bool trap, uint8_t *out, size_t c
    if (!out || !length || slot >= AGX3_RT_GEN1_RUNTIME_SLOTS) return false;
    memcpy(staged, default_body_prefix_end, sizeof(default_body_prefix_end));
    for (unsigned i = 2; i < 32; ++i) staged[2 * i] = 0x06;
-   if (trap) {
-      const uint64_t address = AGX3_RT_GEN1_RUNTIME_BASE + (uint64_t)slot * AGX3_RT_GEN1_RUNTIME_SLOT_STRIDE +
-                               AGX3_RT_GEN1_TRAP_MARKER_OFFSET - 4;
-      const uint32_t values[3] = {(uint32_t)address, (uint32_t)(address >> 32), slot + 1};
-      for (unsigned i = 0; i < 3; ++i) {
-         struct agx3_encoded_ldimm imm;
-         if (!agx3_pack_ldimm_u32(AGX_ISA_ENCODING_AGX3B, 4 + 2 * i, values[i], &imm)) return false;
-         memcpy(staged + used, imm.bytes, imm.length);
-         used += imm.length;
-      }
-      const struct agx3_field_kv fields[] = {{2, 8}, {9, 2}, {10, 2}, {13, 1}, {23, 1}, {24, 1}, {31, 4},
-                                             {38, 2}, {39, 3}, {42, 1}, {54, 1}, {71, 1}, {74, 4}};
-      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "stdev", 0, fields, sizeof(fields) / sizeof(fields[0]),
-                             NULL, 0, staged + used, &n))
-         return false;
-      used += n;
-   }
    if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "end", 0, NULL, 0, NULL, 0, staged + used, &n)) return false;
    used += n;
    if (used > capacity) return false;

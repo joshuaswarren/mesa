@@ -14,7 +14,6 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 
 static struct hk_device dev;
 static struct hk_queue queue;
@@ -75,12 +74,16 @@ free_cmd(VkDevice d, VkCommandPool pool, uint32_t count, const VkCommandBuffer *
 static VkResult VKAPI_CALL
 begin_cmd(VkCommandBuffer cmd, const VkCommandBufferBeginInfo *ci)
 {
-   /* Pool access includes recording, not just allocation/free. Check the
-    * invariant directly before the concurrent stress below. */
+   /* Pool access includes recording, not just allocation/free. The
+    * single-threaded runs in main() reach this with no other thread able to
+    * hold the lock, so it is held here by the operation being recorded.
+    * simple_mtx_assert_locked() vanishes when the headers above were
+    * compiled with NDEBUG, so read the futex word directly. */
+#if UTIL_FUTEX_SUPPORTED
+   assert(p_atomic_read(&dev.host_as.lock.val) != 0);
+#else
    simple_mtx_assert_locked(&dev.host_as.lock);
-   /* Make the shared-pool recording interval overlap reliably if only
-    * Allocate/FreeCommandBuffers are serialized. */
-   usleep(1000);
+#endif
    return step();
 }
 static VkResult VKAPI_CALL end_cmd(VkCommandBuffer cmd) { return step(); }

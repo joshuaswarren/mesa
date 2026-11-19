@@ -18,7 +18,7 @@ struct nir_def;
 /* BASE bits4..6 carry the native packed element count (1..4). */
 #define AGX_NIR_MEMORY_PACKED_COUNT_SHIFT 4u
 #define AGX_NIR_MEMORY_PACKED_COUNT_MASK (7u << AGX_NIR_MEMORY_PACKED_COUNT_SHIFT)
-/* BASE bit7 marks a late G17P W8 load whose unsigned lanes are unpacked to
+/* BASE bit7 marks a late AGX3B W8 load whose unsigned lanes are unpacked to
  * words. It does not change the memory transaction or address. */
 #define AGX_NIR_MEMORY_UNPACK_W8_WORD (1u << 7)
 /* BASE bits16..31 carry a signed byte offset that AGX3C adds to the address
@@ -73,6 +73,7 @@ bool agx_nir_lower_clip_distance(struct nir_shader *s);
 bool agx_nir_lower_subgroups(struct nir_shader *s);
 bool agx_nir_lower_subgroups_g17p(struct nir_shader *s);
 bool agx_nir_lower_subgroups_m5(struct nir_shader *s, bool native_shuffle_xor);
+bool agx_nir_flush_subgroup_minmax(struct nir_shader *s);
 bool agx_nir_lower_dynamic_shuffle_xor(struct nir_shader *s);
 bool agx_nir_lower_quad_derivative_ids(struct nir_shader *s);
 bool agx_nir_lower_compute_derivatives(struct nir_shader *s);
@@ -204,9 +205,6 @@ agx_g17p_pack_image_atomic_sw(uint64_t level_offset_B, unsigned tile_width_px,
  * admits the shapes only G17P's backend encodes (agx_optimizer_inline_imm). */
 bool agx_nir_lower_g17p_indexed_samplers(struct nir_shader *s, bool g17p);
 bool agx_nir_lower_g17g_indexed_reads(struct nir_shader *s);
-/* Packed native32 array handles are byte offsets; sampler handles already
- * name their native entry, including the reserved texel-fetch sampler0. */
-bool agx_nir_lower_g17p_native32_samplers(struct nir_shader *s, uint8_t texture_set);
 
 struct agx_g17p_combined_sampler_binding {
    uint32_t texture_offset_B;
@@ -289,7 +287,6 @@ bool agx_nir_lower_g17p_combined_sampler(
  * Initially admit only a single 2D float sample at explicit level zero. */
 bool agx_nir_lower_g17g_combined_sampler(
    struct nir_shader *s, struct agx_g17p_combined_sampler_binding *binding);
-bool agx_nir_lower_g17g_indexed_samplers(struct nir_shader *s);
 bool agx_nir_lower_g17g_indexed_reads(struct nir_shader *s);
 
 /* Turn the one statically indexed set-0 Gen9 texture used by the initial

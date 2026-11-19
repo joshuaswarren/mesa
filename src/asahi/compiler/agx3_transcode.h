@@ -20,16 +20,10 @@ bool agx3_transcode_agx3d(struct util_dynarray *binary, unsigned start,
 
 /* Relocate shader-part markers through the same instruction-boundary map
  * as branches. Offsets are relative to start and change only on success.
- * Cube gather operand layout requires the actual shader stage. */
-bool agx3_transcode_agx3d_with_offsets(struct util_dynarray *binary,
-                                      unsigned start, unsigned *offsets,
-                                      unsigned count, bool fragment_stage,
-                                      const char **why,
-                                      unsigned *fail_offset);
-
-/* As agx3_transcode_agx3d_with_offsets(). long_tile_reads: the program is a
- * G18 single-sample mixed-format fragment part (run 1139) whose whole-pixel
- * lldcol reads take Apple's long form (f79 = 2). */
+ * Cube gather operand layout requires the actual shader stage.
+ * long_tile_reads: the program is a G18 single-sample mixed-format fragment
+ * part (run 1139) whose whole-pixel lldcol reads take Apple's long form
+ * (f79 = 2). */
 bool agx3_transcode_agx3d_tile_reads(struct util_dynarray *binary,
                                      unsigned start, unsigned *offsets,
                                      unsigned count, bool fragment_stage,

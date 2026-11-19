@@ -142,15 +142,11 @@ bool agx_pbe_g18_2d_mip_pack(
    const struct agx_pbe_agx3_2d_fields *fields, uint32_t level,
    uint32_t levels, struct agx_pbe_agx3_descriptor *out);
 
-/* G18 PBE, storage-write mode: one-level uncompressed tiled array (dimension3)
- * or 3D (dimension5). Buffer is already rebased to the first addressed slice;
- * layers is the remaining layer/depth count. */
-bool agx_pbe_g18_layered_pack(
-   const struct agx_pbe_agx3_2d_fields *fields, uint32_t dimension,
-   uint32_t layers, struct agx_pbe_agx3_descriptor *out);
-
-/* The same storage-write profile with native mip selection. Base allocation
- * dimensions/address and the independently supplied page flag are preserved. */
+/* G18 PBE, storage-write mode: uncompressed tiled array (dimension3) or 3D
+ * (dimension5) with native mip selection. Buffer is already rebased to the
+ * first addressed slice; layers is the remaining layer/depth count. Base
+ * allocation dimensions/address and the independently supplied page flag are
+ * preserved. */
 bool agx_pbe_g18_layered_mip_pack(
    const struct agx_pbe_agx3_2d_fields *fields, uint32_t dimension,
    uint32_t layers, uint32_t level, uint32_t levels,

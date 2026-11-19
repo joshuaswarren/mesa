@@ -44,29 +44,6 @@ agx_ioto_preshader_target_encoding(enum agx_chip chip)
 }
 
 bool
-agx_ioto_preshader_program_size(uint32_t start, uint32_t end32,
-                                uint64_t alternate_end, size_t *size)
-{
-   if (!size)
-      return false;
-
-   uint64_t length;
-   if (end32 > start) {
-      length = (uint32_t)(end32 - start);
-   } else {
-      if (alternate_end < start)
-         return false;
-      length = alternate_end - start;
-   }
-
-   if (length > SIZE_MAX)
-      return false;
-
-   *size = (size_t)length;
-   return true;
-}
-
-bool
 agx_ioto_preshader_bind_range(const void *binary, size_t binary_size,
                               uint64_t binary_va, size_t gpu_size,
                               size_t offset, size_t size,

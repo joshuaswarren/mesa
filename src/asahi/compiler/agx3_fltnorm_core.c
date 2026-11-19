@@ -14,12 +14,6 @@
 #define KV(f, v) {(uint16_t)(f), (uint64_t)(v)}
 
 static bool
-b_only(enum agx_isa_encoding enc)
-{
-   return enc == AGX_ISA_ENCODING_AGX3B;
-}
-
-static bool
 enc_ok(enum agx_isa_encoding enc)
 {
    return enc == AGX_ISA_ENCODING_AGX3B || agx_encoding_is_g17_class(enc);

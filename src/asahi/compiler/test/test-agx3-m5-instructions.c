@@ -1431,7 +1431,7 @@ int main(void)
    const unsigned char hcompare_expected[] = {0x2a,0x02,0x2b,0x00,0x23,0x02,0xa0,0x0a,0xc0,0x81};
    if (!agx3_cf_fcmp_reg16(AGX_ISA_ENCODING_AGX3C,AGX3_CF_FCOND_EQ,
           false,0,hcompare_src,hcompare_hints,128,native,&len) ||
-       len != sizeof(hcompare_expected) || memcmp(native,hcompare_expected,len)) return 77;
+       len != sizeof(hcompare_expected) || memcmp(native,hcompare_expected,len)) return 75;
    const unsigned char hfma_expected[] = {0x38,0x02,0x06,0x02,0x23,0x20,0xa0,0x02,0x96,0x02,0x78,0x00};
    if (!agx3_alu_hfma_immediates_m5(2,2,10,20,AGX3_ALU_HINT_DISCARD,
           false,128,native,&len) || len != sizeof(hfma_expected) ||

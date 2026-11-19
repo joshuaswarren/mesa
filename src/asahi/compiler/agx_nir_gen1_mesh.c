@@ -4,10 +4,8 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_control_flow.h"
 #include "util/u_math.h"
-#include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
-#define M5_REFUSE() do { if (getenv("ASAHI_MESH_CONTRACT_DEBUG")) fprintf(stderr, "m5 mesh refuse: %s:%d\n", __func__, __LINE__); return false; } while (0)
+#define M5_REFUSE() return false
 
 struct mesh_layout {
    unsigned output_base, primitive_count, vertex_count, position;
@@ -22,84 +20,12 @@ struct mesh_layout {
     * vertex word packs them. 0 when the shader writes neither, or when the
     * words do not fit threadgroup memory: the export then reads the record. */
    unsigned lv_words, lv_bytes;
-   bool storage_probe;
-   uint64_t primitive_audit_va;
    const struct agx_m5_mesh_varyings *varyings;
 };
 
-static uint64_t
-primitive_audit_va(void)
-{
-   const char *enable = getenv("ASAHI_MESH_PP_AUDIT");
-   const char *address = getenv("ASAHI_MESH_MARKER_VA");
-   return enable && !strcmp(enable, "1") && address
-      ? strtoull(address, NULL, 0) : 0;
-}
-
-static bool
-primitive_audit_fan(void)
-{
-   const char *fan = getenv("ASAHI_MESH_PP_AUDIT_FAN");
-   return fan && !strcmp(fan, "1");
-}
-
-static unsigned
-primitive_audit_primitives(void)
-{
-   return primitive_audit_fan() ? 4 : 2;
-}
-
-static unsigned
-primitive_audit_lanes(void)
-{
-   return primitive_audit_fan() ? 8 : 4;
-}
-
-static unsigned
-primitive_audit_lane_first(void)
-{
-   return 16 * 4 * primitive_audit_primitives();
-}
-
-static unsigned
-primitive_audit_fragment_first(void)
-{
-   return primitive_audit_lane_first() + 8 * 4 * primitive_audit_lanes();
-}
-
-static bool
-native_page_carrier(void)
-{
-   const char *enable = getenv("ASAHI_MESH_NATIVE_PAGE_CARRIER");
-   return enable && !strcmp(enable, "1");
-}
-
-static unsigned
-page_carrier_words(void)
-{
-   return native_page_carrier() ? 1 : 2;
-}
-
-static void
-primitive_capture(nir_builder *b, uint64_t va, unsigned first,
-                  nir_def *record, unsigned words, nir_def **values)
-{
-   nir_def *address = nir_iadd(b, nir_imm_int64(b, va + 32 + 4 * first),
-      nir_imul_imm(b, nir_u2u64(b, record), 4 * words));
-   for (unsigned c = 0; c < words; ++c) {
-      if (values[c])
-         nir_global_atomic(b, 32, nir_iadd_imm(b, address, 4 * c),
-            nir_u2u32(b, values[c]), .atomic_op = nir_atomic_op_xchg);
-   }
-}
-
-static void
-primitive_order(nir_builder *b)
-{
-   nir_barrier(b, .execution_scope = SCOPE_NONE, .memory_scope = SCOPE_WORKGROUP,
-      .memory_semantics = NIR_MEMORY_ACQ_REL,
-      .memory_modes = nir_var_mem_global | nir_var_mem_shared);
-}
+/* The per-primitive storage address reaches the fragment stage in two flat
+ * words of AGX_MESH_PRIMITIVE_PAGE_SLOT: its low and high halves. */
+#define PAGE_CARRIER_WORDS 2
 
 static unsigned
 prim_vertices(const nir_shader *s)
@@ -129,14 +55,11 @@ mesh_layout(const nir_shader *s, const struct agx_m5_mesh_varyings *varyings)
    const unsigned position = count + 16;
    const unsigned stride = ALIGN_POT(s->info.mesh.max_vertices_out, 4) * 4;
    return (struct mesh_layout) {
-      .primitive_audit_va = primitive_audit_va(),
       .prim_vertices = prim_vertices(s),
       .output_base = base, .primitive_count = base + count,
       .vertex_count = base + count + 4, .position = base + position,
       .plane_stride = stride, .planes = varyings->size,
       .bytes = ALIGN_POT(position + varyings->size * stride, 64),
-      .storage_probe = getenv("ASAHI_MESH_PP_PROBE") != NULL &&
-                       !strcmp(getenv("ASAHI_MESH_PP_PROBE"), "1"),
       .varyings = varyings,
    };
 }
@@ -190,22 +113,11 @@ lower(nir_builder *b,nir_intrinsic_instr *i,void *data)
          break;
       const unsigned first=first_plane(layout->varyings,slot);
       unsigned component=nir_intrinsic_component(i);
-      nir_def *value=widen_output(b,i,i->src[0].ssa), *probe=NULL;
-      if (slot == VARYING_SLOT_VAR0 && layout->storage_probe) {
-         
-
-
-
-         nir_def *storage=nir_load_mesh_primitive_storage_agx(b);
-         probe=nir_vec4(b,nir_channel(b,storage,0),nir_channel(b,storage,1),
-                        nir_channel(b,nir_load_workgroup_id(b),0),
-                        nir_load_local_invocation_index(b));
-      }
+      nir_def *value=widen_output(b,i,i->src[0].ssa);
       u_foreach_bit(c,nir_intrinsic_write_mask(i)) {
          nir_def *address=nir_iadd_imm(b,element,
             layout->position+layout->plane_stride*(first+component+c));
-         nir_store_shared(b,probe ? nir_channel(b,probe,component+c)
-                                  : nir_channel(b,value,c),address,
+         nir_store_shared(b,nir_channel(b,value,c),address,
                             .write_mask=1,.align_mul=4);
          if (slot == VARYING_SLOT_CLIP_DIST0 || slot == VARYING_SLOT_CLIP_DIST1) {
             const unsigned clip = 4 * (slot - VARYING_SLOT_CLIP_DIST0) + component + c;
@@ -247,24 +159,6 @@ lower(nir_builder *b,nir_intrinsic_instr *i,void *data)
                   nir_iadd_imm(b, nir_imul_imm(b, i->src[1].ssa, 4),
                      layout->lv_words + (slot == VARYING_SLOT_VIEWPORT ? 2 : 0)),
                   .write_mask = 1, .align_mul = 2);
-            }
-            if (layout->primitive_audit_va && c == 0) {
-               nir_def *group = nir_channel(b, nir_load_workgroup_id(b), 0);
-               const unsigned primitives = primitive_audit_primitives();
-               nir_push_if(b, nir_iand(b, nir_ult_imm(b, group, 4),
-                                      nir_ult_imm(b, i->src[1].ssa, primitives)));
-               primitive_order(b);
-               nir_def *post = nir_load_global(b, 1, 32, address,
-                  .align_mul = 4, .access = ACCESS_VOLATILE);
-               nir_def *fields[16] = {nir_imm_int(b, 0x50510001), group,
-                  i->src[1].ssa, nir_load_local_invocation_index(b),
-                  nir_u2u32(b, storage), nir_u2u32(b, nir_ushr_imm(b, storage, 32)),
-                  nir_u2u32(b, address), nir_u2u32(b, nir_ushr_imm(b, address, 32)),
-                  nir_imm_int(b, nir_intrinsic_component(i) + c), nir_channel(b, value, c), post,
-                  nir_imm_int(b, 0x50510002)};
-               primitive_capture(b, layout->primitive_audit_va, 0,
-                  nir_iadd(b, nir_imul_imm(b, group, primitives), i->src[1].ssa), 16, fields);
-               nir_pop_if(b, NULL);
             }
          }
          break;
@@ -368,11 +262,8 @@ agx_gen1_mesh_gather_varyings(const nir_shader *s,
                 s->info.mesh.primitive_type != MESA_PRIM_POINTS)
                continue;
             if (slot >= 64 || !((USER_VARYINGS | VARYING_BIT_PSIZ | MESH_CLIP_SLOTS) &
-                                BITFIELD64_BIT(slot))) {
-               if (getenv("ASAHI_MESH_CONTRACT_DEBUG"))
-                  fprintf(stderr, "m5 mesh vertex slot %u\n", slot);
+                                BITFIELD64_BIT(slot)))
                M5_REFUSE();
-            }
             const unsigned end = nir_intrinsic_component(i) +
                                  util_last_bit(nir_intrinsic_write_mask(i));
             if (end > 4)
@@ -402,7 +293,7 @@ agx_gen1_mesh_gather_varyings(const nir_shader *s,
     * words, point size, layer/viewport, clip distances. */
    unsigned next = 4, slots = 0;
    if (varyings->primitive_stride_B)
-      varyings->components[AGX_MESH_PRIMITIVE_PAGE_SLOT] = page_carrier_words();
+      varyings->components[AGX_MESH_PRIMITIVE_PAGE_SLOT] = PAGE_CARRIER_WORDS;
    for (unsigned slot = VARYING_SLOT_CLIP_DIST0; slot < 64; ++slot) {
       if (!varyings->components[slot])
          continue;
@@ -440,13 +331,6 @@ agx_gen1_mesh_gather_varyings(const nir_shader *s,
 static bool
 varyings_valid(const struct agx_m5_mesh_varyings *v)
 {
-   if (getenv("ASAHI_MESH_CONTRACT_DEBUG")) {
-      fprintf(stderr, "m5 mesh layout size=%u clip=%u@%u lv=%u@%u:", v->size, v->clip_count, v->clip_first, v->lv, v->lv_first);
-      for (unsigned slot = 0; slot < 64; ++slot)
-         if (v->components[slot])
-            fprintf(stderr, " %u:%u@%u", slot, v->components[slot], v->first[slot]);
-      fprintf(stderr, "\n");
-   }
    if (v->size < 4 || v->size > 4 + 128)
       M5_REFUSE();
    uint8_t used[4 + 128] = {0};
@@ -481,7 +365,7 @@ varyings_valid(const struct agx_m5_mesh_varyings *v)
          continue;
       if ((!((USER_VARYINGS | MESH_CLIP_SLOTS) & BITFIELD64_BIT(slot)) &&
            !(slot == AGX_MESH_PRIMITIVE_PAGE_SLOT && v->primitive_stride_B != 0 &&
-             v->components[slot] == page_carrier_words())) || v->components[slot] > 4 ||
+             v->components[slot] == PAGE_CARRIER_WORDS)) || v->components[slot] > 4 ||
           v->first[slot] < 4 || v->first[slot] + v->components[slot] > v->size)
          M5_REFUSE();
       for (unsigned c = 0; c < v->components[slot]; ++c) {
@@ -491,15 +375,6 @@ varyings_valid(const struct agx_m5_mesh_varyings *v)
       user += v->components[slot];
    }
    return user + 4 == v->size;
-}
-
-bool
-agx_nir_lower_gen1_mesh_triangle_probe(nir_shader *s)
-{
-   struct agx_m5_mesh_varyings varyings;
-   if (!agx_gen1_mesh_gather_varyings(s, &varyings))
-      M5_REFUSE();
-   return agx_nir_lower_gen1_mesh(s, &varyings);
 }
 
 bool
@@ -531,13 +406,6 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
       layout.line_marks = layout.output_base + layout.bytes;
       layout.bytes += ALIGN_POT(s->info.mesh.max_vertices_out, 64);
    }
-   if (getenv("ASAHI_MESH_PP_AUDIT") &&
-       !strcmp(getenv("ASAHI_MESH_PP_AUDIT"), "1") &&
-       (!layout.primitive_audit_va || (layout.primitive_audit_va & 15) ||
-        s->info.mesh.max_vertices_out > primitive_audit_lanes() ||
-        s->info.mesh.max_primitives_out > primitive_audit_primitives() ||
-        threads > primitive_audit_lanes()))
-      M5_REFUSE();
    if (layout.output_base + layout.bytes > 32768)
       M5_REFUSE();
    /* A per-primitive layer or viewport travels in a vertex word, so
@@ -987,40 +855,12 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
       for (unsigned vertex = 0; vertex < s->info.mesh.max_vertices_out; vertex += 32) {
          nir_def *index = nir_iadd_imm(&b, lane, vertex);
          nir_push_if(&b, nir_ult(&b, index, nir_u2u32(&b, v)));
-         if (native_page_carrier()) {
-            nir_def *page = nir_unpack_64_2x32_split_x(&b,
-               nir_ushr_imm(&b, nir_pack_64_2x32(&b, storage), 16));
-            nir_store_shared(&b, page,
+         for (unsigned c = 0; c < PAGE_CARRIER_WORDS; ++c) {
+            nir_store_shared(&b, nir_channel(&b, storage, c),
                nir_iadd_imm(&b, nir_imul_imm(&b, index, 4),
                   layout.position + layout.plane_stride *
-                     varyings->first[AGX_MESH_PRIMITIVE_PAGE_SLOT]),
+                     (varyings->first[AGX_MESH_PRIMITIVE_PAGE_SLOT] + c)),
                .write_mask = 1, .align_mul = 4);
-         } else {
-            for (unsigned c = 0; c < 2; ++c) {
-               nir_store_shared(&b, nir_channel(&b, storage, c),
-                  nir_iadd_imm(&b, nir_imul_imm(&b, index, 4),
-                     layout.position + layout.plane_stride *
-                        (varyings->first[AGX_MESH_PRIMITIVE_PAGE_SLOT] + c)),
-                  .write_mask = 1, .align_mul = 4);
-            }
-         }
-         if (layout.primitive_audit_va) {
-            nir_def *group = nir_channel(&b, nir_load_workgroup_id(&b), 0);
-            nir_push_if(&b, nir_ult_imm(&b, group, 4));
-            primitive_order(&b);
-            nir_def *shared = nir_iadd_imm(&b, nir_imul_imm(&b, index, 4),
-               layout.position + layout.plane_stride *
-                  varyings->first[AGX_MESH_PRIMITIVE_PAGE_SLOT]);
-            nir_def *fields[8] = {nir_imm_int(&b, 0x50510010), index,
-               nir_channel(&b, storage, 0), nir_channel(&b, storage, 1),
-               nir_load_shared(&b, 1, 32, shared,
-                  .align_mul = 4, .access = ACCESS_VOLATILE),
-               nir_load_shared(&b, 1, 32, nir_iadd_imm(&b, shared, layout.plane_stride),
-                  .align_mul = 4, .access = ACCESS_VOLATILE), group,
-               nir_imm_int(&b, 0x50510011)};
-            primitive_capture(&b, layout.primitive_audit_va, primitive_audit_lane_first(),
-               nir_iadd(&b, nir_imul_imm(&b, group, primitive_audit_lanes()), index), 8, fields);
-            nir_pop_if(&b, NULL);
          }
          nir_pop_if(&b, NULL);
       }
@@ -1080,8 +920,6 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
       nir_pop_if(&b,NULL);
    }
    nir_pop_if(&b,NULL);
-   if (layout.primitive_audit_va)
-      nir_shader_gather_info(s, nir_shader_get_entrypoint(s));
    s->info.shared_size=layout.output_base+layout.bytes;
    s->info.outputs_written=0;s->info.per_primitive_outputs=0;
    /* Culled above: the fragment stage has no cull distances to test. */
@@ -1157,57 +995,6 @@ agx_nir_lower_gen1_task_payload_probe(nir_shader *s)
 }
 
 static bool
-lower_launch(nir_builder *b,nir_intrinsic_instr *i,void *data)
-{
-   if (i->intrinsic!=nir_intrinsic_launch_mesh_workgroups) M5_REFUSE();
-   const unsigned grid=*(unsigned *)data;
-   b->cursor=nir_before_instr(&i->instr);
-   nir_push_if(b,nir_ieq_imm(b,nir_load_local_invocation_index(b),0));
-   nir_store_shared(b,i->src[0].ssa,nir_imm_int(b,grid),
-                       .write_mask=7,.align_mul=4);
-   nir_pop_if(b,NULL);
-   nir_instr_remove(&i->instr);
-   return true;
-}
-
-bool
-agx_nir_lower_gen1_task_probe(nir_shader *s)
-{
-   unsigned threads=s->info.workgroup_size[0]*s->info.workgroup_size[1]*
-                    s->info.workgroup_size[2];
-   if (s->info.stage!=MESA_SHADER_TASK || s->info.workgroup_size_variable ||
-       threads<3 || threads>128 || s->info.shared_size>48 ||
-       !agx_nir_lower_gen1_task_payload_probe(s)) M5_REFUSE();
-   unsigned launches=0;
-   nir_foreach_function_impl(impl,s) {
-      nir_foreach_block(block,impl) {
-         nir_foreach_instr(in,block) {
-            if (in->type==nir_instr_type_intrinsic &&
-                nir_instr_as_intrinsic(in)->intrinsic==nir_intrinsic_launch_mesh_workgroups)
-               launches++;
-         }
-      }
-   }
-   if (!launches) M5_REFUSE();
-   unsigned grid=ALIGN_POT(s->info.shared_size,16);
-   nir_shader_intrinsics_pass(s,lower_launch,nir_metadata_none,&grid);
-   nir_builder b=nir_builder_at(nir_after_cf_list(&nir_shader_get_entrypoint(s)->body));
-   nir_barrier(&b,.execution_scope=SCOPE_WORKGROUP,.memory_scope=SCOPE_WORKGROUP,
-      .memory_semantics=NIR_MEMORY_ACQ_REL,
-      .memory_modes=nir_var_mem_shared);
-
-   nir_def *lane=nir_load_local_invocation_index(&b);
-   nir_push_if(&b,nir_ult_imm(&b,lane,3));
-   nir_def *value=nir_load_shared(&b,1,32,
-      nir_iadd_imm(&b,nir_imul_imm(&b,lane,4),grid),.align_mul=4);
-   nir_store_object_childcount_agx(&b,value);
-   nir_pop_if(&b,NULL);
-   s->info.shared_size=64;
-   nir_progress(true,b.impl,nir_metadata_none);
-   return true;
-}
-
-static bool
 lower_primitive_input(nir_builder *b, nir_intrinsic_instr *i, void *data)
 {
    if (i->intrinsic != nir_intrinsic_load_per_primitive_input)
@@ -1228,16 +1015,13 @@ lower_primitive_input(nir_builder *b, nir_intrinsic_instr *i, void *data)
    nir_def *base_low_cf = nir_load_coefficients_agx(b, nir_imm_int(b, 0),
       .component = 0, .interp_mode = INTERP_MODE_FLAT,
       .io_semantics = {.location = AGX_MESH_PRIMITIVE_PAGE_SLOT, .num_slots = 1});
-   nir_def *base_high_cf = native_page_carrier() ? base_low_cf :
-      nir_load_coefficients_agx(b, nir_imm_int(b, 0),
+   nir_def *base_high_cf = nir_load_coefficients_agx(b, nir_imm_int(b, 0),
       .component = 1, .interp_mode = INTERP_MODE_FLAT,
       .io_semantics = {.location = AGX_MESH_PRIMITIVE_PAGE_SLOT, .num_slots = 1});
    nir_def *low = nir_channel(b, primitive_cf, 2);
    nir_def *base_low = nir_channel(b, base_low_cf, 2);
    nir_def *base_high = nir_channel(b, base_high_cf, 2);
-   nir_def *base = native_page_carrier()
-      ? nir_ishl_imm(b, nir_u2u64(b, base_low), 16)
-      : nir_pack_64_2x32(b, nir_vec2(b, base_low, base_high));
+   nir_def *base = nir_pack_64_2x32(b, nir_vec2(b, base_low, base_high));
    /* With PPP cull2 0x2000 the primitive coefficient holds the record's word
     * offset in its 64 KiB storage page, as Apple's G16S/G17P fragment code
     * reads it (shift by 2, add the page). Read as a byte offset, a 64-workgroup
@@ -1249,45 +1033,6 @@ lower_primitive_input(nir_builder *b, nir_intrinsic_instr *i, void *data)
                           4 * (record_first + nir_intrinsic_component(i)));
    nir_def *value = nir_load_global(b, i->def.num_components, 32, address,
                                   .align_mul = 4);
-   const uint64_t va = primitive_audit_va();
-   if (va) {
-      nir_def *position = nir_load_frag_coord(b);
-      nir_def *x = nir_f2u32(b, nir_channel(b, position, 0));
-      nir_def *y = nir_f2u32(b, nir_channel(b, position, 1));
-      nir_def *group = nir_ushr_imm(b, x, 4);
-      nir_def *bottom = nir_ieq_imm(b, y, 60);
-      nir_def *sample, *right = NULL, *below = NULL, *left = NULL;
-      const bool fan = primitive_audit_fan();
-      if (fan) {
-         nir_def *column = nir_iand_imm(b, x, 15);
-         nir_def *centre = nir_ieq_imm(b, column, 8);
-         nir_def *middle = nir_ieq_imm(b, y, 32);
-         nir_def *top = nir_iand(b, centre, nir_ieq_imm(b, y, 4));
-         right = nir_iand(b, nir_ieq_imm(b, column, 14), middle);
-         below = nir_iand(b, centre, bottom);
-         left = nir_iand(b, nir_ieq_imm(b, column, 2), middle);
-         sample = nir_ior(b, nir_ior(b, top, right), nir_ior(b, below, left));
-      } else {
-         sample = nir_iand(b, nir_ieq_imm(b, nir_iand_imm(b, x, 15), 8),
-            nir_ior(b, nir_ieq_imm(b, y, 4), bottom));
-      }
-      nir_push_if(b, nir_iand(b, nir_ult_imm(b, group, 4), sample));
-      nir_def *fields[32] = {nir_imm_int(b, 0x50510030), x, y, group,
-         nir_channel(b, primitive_cf, 0), nir_channel(b, primitive_cf, 1), low,
-         nir_channel(b, base_low_cf, 0), nir_channel(b, base_low_cf, 1), base_low,
-         nir_channel(b, base_high_cf, 0), nir_channel(b, base_high_cf, 1), base_high,
-         nir_u2u32(b, address), nir_u2u32(b, nir_ushr_imm(b, address, 32)),
-         nir_channel(b, value, 0), nir_imm_int(b, nir_intrinsic_component(i)),
-         nir_imm_int(b, 0x50510031)};
-      nir_def *record = fan
-         ? nir_iadd(b, nir_imul_imm(b, group, 4),
-              nir_bcsel(b, right, nir_imm_int(b, 1),
-                 nir_bcsel(b, below, nir_imm_int(b, 2),
-                    nir_bcsel(b, left, nir_imm_int(b, 3), nir_imm_int(b, 0)))))
-         : nir_iadd(b, nir_imul_imm(b, group, 2), nir_b2i32(b, bottom));
-      primitive_capture(b, va, primitive_audit_fragment_first(), record, 32, fields);
-      nir_pop_if(b, NULL);
-   }
    if (i->def.bit_size != 32)
       value = nir_convert_to_bit_size(b, value,
          nir_alu_type_get_base_type(nir_intrinsic_dest_type(i)), i->def.bit_size);
@@ -1328,9 +1073,6 @@ agx_nir_lower_gen1_mesh_fragment_layout(nir_shader *s,
        !fragment_inputs_supported(s))
       M5_REFUSE();
    nir_shader_intrinsics_pass(s, lower_primitive_input,
-      primitive_audit_va() ? nir_metadata_none : nir_metadata_control_flow,
-      (void *)mesh);
-   if (primitive_audit_va())
-      nir_shader_gather_info(s, nir_shader_get_entrypoint(s));
+      nir_metadata_control_flow, (void *)mesh);
    return true;
 }

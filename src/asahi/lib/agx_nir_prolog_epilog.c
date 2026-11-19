@@ -1837,7 +1837,7 @@ agx_nir_fs_prolog(nir_builder *b, const void *key_)
 
    if (key->cull_distance_size) {
       NIR_PASS(_, b->shader, agx_nir_lower_cull_distance_fs,
-               key->cull_distance_size, key->native_cull_constant_planes);
+               key->cull_distance_size);
    }
 
    if (key->polygon_stipple) {
@@ -1860,9 +1860,12 @@ agx_nir_fs_prolog(nir_builder *b, const void *key_)
    NIR_PASS(_, b->shader, nir_shader_intrinsics_pass,
             lower_non_monolithic_uniforms, nir_metadata_control_flow, NULL);
    NIR_PASS(_, b->shader, lower_tests_zs, key->run_zs_tests);
-   /* G18G only for now: Gallium sets native_cull_constant_planes on G18G
-    * alone. A candidate for every chip. */
-   if (!key->run_zs_tests && key->native_cull_constant_planes)
+   /* Exact on every generation: without the tests, TARGET and LIVE are
+    * disjoint, so each update only kills. The backend (agx_compile.c) can
+    * only prove "no Z/S tests" from a constant LIVE; a register LIVE gets the
+    * testing form (wait_pix, and the testing MOVMSK on AGX3). This follows
+    * from sample_mask semantics, not from a chip. */
+   if (!key->run_zs_tests)
       NIR_PASS(_, b->shader, nir_shader_intrinsics_pass,
                lower_prolog_kill_only, nir_metadata_control_flow, NULL);
 

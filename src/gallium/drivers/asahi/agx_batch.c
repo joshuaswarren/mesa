@@ -13,7 +13,6 @@
 #include "asahi/lib/agx_va_runtime_hole.h"
 #include "asahi/lib/decode.h"
 #include "drm-uapi/dma-buf.h"
-#include "poly/tessellator.h"
 #include "util/bitset.h"
 #include "util/libsync.h"
 #include "util/u_dynarray.h"
@@ -43,13 +42,6 @@ agx_append_split_compute(struct util_dynarray *cmdbuf,
                     sizeof(struct drm_asahi_cmd_compute_with_prior));
       extended.base.legacy.flags |= DRM_ASAHI_COMPUTE_G18_RESOURCES;
       header.size = sizeof(extended);
-      if (agx_env_flag(AGX_ENV_G18_RESOURCE_TRACE)) {
-         const uint8_t *bytes = (const void *)&extended;
-         fprintf(stderr, "G18_COMPUTE_RESOURCE_PAYLOAD ");
-         for (unsigned i = 0; i < sizeof(extended); ++i)
-            fprintf(stderr, "%02x", bytes[i]);
-         fprintf(stderr, "\n");
-      }
       util_dynarray_append(cmdbuf, header);
       util_dynarray_append(cmdbuf, extended);
    } else {
@@ -1157,15 +1149,6 @@ agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
 {
    struct agx_device *dev = agx_device(ctx->base.screen);
 
-   /* Qualification must stop before the client can queue more work after a
-    * recovered submission error. Keep this independent of bounded tracing. */
-   const char *stop = getenv("G18_STOP_ON_SUBMIT_ERROR");
-   if (dev->chip == AGX_CHIP_G18G && stop && !strcmp(stop, "1")) {
-      fprintf(stderr, "G18_SUBMIT_STOP first_submit_error=%d\n", error);
-      fflush(stderr);
-      _Exit(86);
-   }
-
    for (unsigned i = 0; i < shared_bo_count; ++i) {
       if (shared_bos[i].in_syncobj)
          drmSyncobjDestroy(dev->fd, shared_bos[i].in_syncobj);
@@ -1350,13 +1333,6 @@ agx_trace_data_bo(struct agx_batch *batch, uint64_t address, size_t size)
    return NULL;
 }
 
-static bool
-agx_trace_split_enabled(struct agx_device *dev)
-{
-   const char *value = getenv("G18_TRACE_SPLIT");
-   return dev->chip == AGX_CHIP_G18G && value && !strcmp(value, "1");
-}
-
 /* G18's synchronous split-submit path has retired the input dependencies and
  * every earlier dispatch before calling this. Indirect dimensions may have
  * been produced by those jobs, so resolving them at command encoding is too
@@ -1405,151 +1381,7 @@ agx_g18_indirect_empty(struct agx_batch *batch,
       return EINVAL;
 
    *empty = !dims[0] || !dims[1] || !dims[2];
-   if (*empty && agx_trace_split_enabled(agx_device(batch->ctx->base.screen)))
-      fprintf(stderr, "G18_EMPTY_INDIRECT mode=%u grid=%u,%u,%u local=%u,%u,%u\n",
-              dispatch->trace_mode, dims[0], dims[1], dims[2],
-              dims[3], dims[4], dims[5]);
    return 0;
-}
-
-static bool
-agx_trace_producer_data(struct agx_batch *batch, unsigned capture,
-                         const char *label, uint64_t address, size_t size,
-                         void *copy)
-{
-   uint8_t first[512], second[512];
-   struct agx_bo *bo = size && size <= sizeof(first)
-                         ? agx_trace_data_bo(batch, address, size) : NULL;
-   if (!address || !bo || (bo->flags & (AGX_BO_SHARED | AGX_BO_WRITEBACK))) {
-      fprintf(stderr,
-              "G18_PRODUCER_UNAVAILABLE capture=%u label=%s address=%#" PRIx64
-              " bytes=%zu owned=%u flags=%#x\n",
-              capture, label, address, size, bo != NULL, bo ? bo->flags : 0);
-      return false;
-   }
-   const uint8_t *map = agx_bo_map(bo);
-   if (!map) {
-      fprintf(stderr, "G18_PRODUCER_UNAVAILABLE capture=%u label=%s map_failed=1\n",
-              capture, label);
-      return false;
-   }
-   const uint8_t *source = map + (address - bo->va->addr);
-   __sync_synchronize();
-   memcpy(first, source, size);
-   __sync_synchronize();
-   memcpy(second, source, size);
-   bool stable = !memcmp(first, second, size);
-   fprintf(stderr,
-           "G18_PRODUCER_DATA capture=%u label=%s address=%#" PRIx64
-           " bytes=%zu stable=%u hex=",
-           capture, label, address, size, stable);
-   for (size_t i = 0; i < size; ++i)
-      fprintf(stderr, "%02x", first[i]);
-   fprintf(stderr, "\n");
-   if (stable && copy)
-      memcpy(copy, first, size);
-   return stable;
-}
-
-static void
-agx_trace_producer_state(struct agx_batch *batch,
-                         const struct agx_cdm_dispatch *dispatch,
-                         unsigned capture)
-{
-   if (!dispatch->trace_tess_params)
-      return;
-
-   struct poly_tess_params tess;
-   if (!agx_trace_producer_data(batch, capture, "tess_params",
-                                dispatch->trace_tess_params, sizeof(tess), &tess))
-      return;
-
-   fprintf(stderr,
-           "G18_PRODUCER_TESS capture=%u patches=%u input_patch=%u output_patch=%u "
-           "tcs_stride_el=%u isolines=%u points=%u\n",
-           capture, tess.nr_patches, tess.input_patch_size, tess.output_patch_size,
-           tess.tcs_stride_el, tess.isolines, tess.points_mode);
-   agx_trace_producer_data(batch, capture, "heap", tess.heap,
-                            sizeof(struct poly_heap), NULL);
-   agx_trace_producer_data(batch, capture, "indirect_draw", tess.out_draws,
-                            5 * sizeof(uint32_t), NULL);
-   if (tess.nr_patches) {
-      unsigned words = MIN2(tess.nr_patches, 64);
-      agx_trace_producer_data(batch, capture, "counts_prefix", tess.counts,
-                               words * sizeof(uint32_t), NULL);
-      agx_trace_producer_data(batch, capture, "coord_allocs_prefix", tess.coord_allocs,
-                               words * sizeof(uint32_t), NULL);
-      words = MIN2(tess.tcs_stride_el, 64);
-      if (words)
-         agx_trace_producer_data(batch, capture, "first_tcs_patch_prefix", tess.tcs_buffer,
-                                  words * sizeof(uint32_t), NULL);
-   }
-   agx_trace_producer_data(batch, capture, "vertex_params", dispatch->trace_vertex_params,
-                            sizeof(struct poly_vertex_params), NULL);
-   agx_trace_producer_data(batch, capture, "geometry_params", dispatch->trace_geometry_params,
-                            sizeof(struct poly_geometry_params), NULL);
-}
-
-static void
-agx_trace_split_dispatch(struct agx_batch *batch,
-                         const struct agx_cdm_dispatch *dispatch,
-                         unsigned index, unsigned count, uint64_t seqid,
-                         unsigned in_sync_count)
-{
-   static unsigned captures;
-   unsigned capture = p_atomic_inc_return(&captures);
-   const uint8_t *map = agx_bo_map(batch->cdm.bo);
-   if (capture > 128 || !map || dispatch->end < dispatch->start ||
-       dispatch->end > batch->cdm.bo->size ||
-       dispatch->end - dispatch->start > 512) {
-      fprintf(stderr, "G18_SPLIT_TRACE_REFUSED capture=%u extent=%u..%u\n",
-              capture, dispatch->start, dispatch->end);
-      fflush(stderr);
-      _Exit(87);
-   }
-   fprintf(stderr,
-           "G18_SPLIT_TRACE capture=%u seq=%" PRIu64 " batch=%u dispatch=%u/%u "
-           "prior_retired=%u in_syncs=%u mode=%u global=%u,%u,%u local=%u,%u,%u "
-           "indirect=%#" PRIx64 " shader=%#" PRIx64 " program=%u texture=%u bytes=%u\n",
-           capture, seqid, agx_batch_idx(batch), index + 1, count,
-           index, in_sync_count, dispatch->trace_mode,
-           dispatch->trace_global[0], dispatch->trace_global[1], dispatch->trace_global[2],
-           dispatch->trace_local[0], dispatch->trace_local[1], dispatch->trace_local[2],
-           dispatch->trace_indirect, dispatch->trace_shader,
-           dispatch->trace_program, dispatch->texture_state, dispatch->end - dispatch->start);
-   fprintf(stderr, "G18_SPLIT_BYTES capture=%u", capture);
-   for (uint32_t i = dispatch->start; i < dispatch->end; ++i)
-      fprintf(stderr, "%s%02x", i == dispatch->start ? " " : "", map[i]);
-   fprintf(stderr, "\n");
-   if (dispatch->trace_indirect) {
-      struct agx_bo *bo = agx_trace_data_bo(batch, dispatch->trace_indirect,
-                                           6 * sizeof(uint32_t));
-      if (!bo || (bo->flags & (AGX_BO_SHARED | AGX_BO_WRITEBACK))) {
-         fprintf(stderr, "G18_SPLIT_GRID_UNAVAILABLE capture=%u owned=%u flags=%#x\n",
-                 capture, bo != NULL, bo ? bo->flags : 0);
-      } else {
-         const uint8_t *base = agx_bo_map(bo);
-         if (!base) {
-            fprintf(stderr, "G18_SPLIT_GRID_UNAVAILABLE capture=%u map_failed=1\n", capture);
-         } else {
-            uint32_t words[6], repeated[6];
-            const uint8_t *grid = base + (dispatch->trace_indirect - bo->va->addr);
-            __sync_synchronize();
-            memcpy(words, grid, sizeof(words));
-            __sync_synchronize();
-            memcpy(repeated, grid, sizeof(repeated));
-            fprintf(stderr,
-                    "G18_SPLIT_GRID capture=%u handle=%u base=%#" PRIx64 " flags=%#x stable=%u words=",
-                    capture, bo->handle, bo->va->addr, bo->flags,
-                    !memcmp(words, repeated, sizeof(words)));
-            for (unsigned i = 0; i < 6; ++i)
-               fprintf(stderr, "%s%08x", i ? "," : "", words[i]);
-            fprintf(stderr, "\n");
-         }
-      }
-   }
-   agx_trace_producer_state(batch, dispatch, capture);
-   fflush(stderr);
 }
 
 void
@@ -2224,9 +2056,6 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
                .cmdbuf = (uint64_t)(uintptr_t)(cmdbuf.data),
                .cmdbuf_size = cmdbuf.size,
             };
-            if (agx_trace_split_enabled(dev))
-               agx_trace_split_dispatch(batch, &cdm_dispatch[i], i,
-                                        m5_split_count, seqid, prepass.in_sync_count);
             int prepass_ret = dev->ops.submit(dev, &prepass, &virt);
             if (prepass_ret) {
                const int prepass_errno = prepass_ret < -1 ? -prepass_ret
@@ -2235,12 +2064,6 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
                        "DRM_IOCTL_ASAHI_SUBMIT compute dispatch %u/%u failed: %s\n",
                        i + 1, m5_split_count,
                        strerror(prepass_errno));
-               if (agx_trace_split_enabled(dev)) {
-                  fprintf(stderr, "G18_SPLIT_STOP first_submit_error=%d dispatch=%u/%u\n",
-                          prepass_errno, i + 1, m5_split_count);
-                  fflush(stderr);
-                  _Exit(86);
-               }
                drmSyncobjDestroy(dev->fd, submit_syncobj);
                u_rwlock_rdunlock(&screen->destroy_lock);
                agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
