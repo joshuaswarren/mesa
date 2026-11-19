@@ -43,6 +43,23 @@ main(void)
    assert(hk_m5_task_enabled());
    assert(!hk_m5_task_record(0));
    assert(hk_m5_task_record(DRM_ASAHI_FEATURE_TASK_MESH_STORAGE));
+
+   /* Application compute dispatch barrier elision defaults on for every chip
+    * sharing the native AGX3 CDM dispatch paths (G15, G16G/G17P HAL200, and
+    * M5 G17G/G17S/G17C HAL300), and off on AGX2 and bring-up G18G. */
+   static const enum agx_chip elide_chips[] = {
+      AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C,
+      AGX_CHIP_G16G, AGX_CHIP_G17P,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(elide_chips); ++i)
+      assert(agx_chip_elide_app_dispatch_barrier(elide_chips[i]));
+
+   assert(!agx_chip_elide_app_dispatch_barrier(AGX_CHIP_G13G));
+   assert(!agx_chip_elide_app_dispatch_barrier(AGX_CHIP_G14X));
+   assert(!agx_chip_elide_app_dispatch_barrier(AGX_CHIP_G15P));
+   assert(!agx_chip_elide_app_dispatch_barrier(AGX_CHIP_G18G));
+
    puts("native feature defaults: ok");
    return 0;
 }

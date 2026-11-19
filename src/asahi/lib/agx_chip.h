@@ -517,19 +517,25 @@ agx_chip_cdm_wide_visibility(enum agx_chip chip)
    return agx_chip_native_g15(chip);
 }
 
+/* M5 variants sharing the AGX3C instruction and HAL300 command formats. */
+static inline bool
+agx_chip_g17_m5(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
+          chip == AGX_CHIP_G17C;
+}
+
 /* Whether consecutive application dispatches of one CDM stream may omit the
  * ordering barrier between them.  Vulkan orders dispatches only through
  * explicit barriers; every other record (internal or indirect launch, cache
- * flush, link, stream end) still follows a barrier.  On the M5 Max (G17C)
- * the barrier holds the next launch until every kernel launched before it
- * has finished; without it the threadgroups of consecutive launches run
- * side by side.  The M4 Pro (G17P) takes the same rule.  G17G and G17S keep
- * the barrier: the change is not measured there. */
+ * flush, link, stream end) still follows a barrier.  On the native AGX3 CDM
+ * (G15, HAL200 and M5 HAL300) the barrier holds the next launch until every
+ * kernel launched before it has finished; without it the threadgroups of
+ * consecutive launches run side by side. */
 static inline bool
 agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
 {
-   return agx_chip_native_g15(chip) || chip == AGX_CHIP_G17C ||
-          chip == AGX_CHIP_G17P;
+   return agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip);
 }
 
 /* Number of helper-table slots in the USC code-container lead block.  G15
@@ -740,14 +746,6 @@ bool agx_chip_uses_legacy_precompiled_programs(enum agx_chip chip);
 bool agx_chip_has_hardware_ray_tracing(enum agx_chip chip);
 
 bool agx_chip_needs_scheduling_stalls(enum agx_chip chip);
-
-/* M5 variants sharing the AGX3C instruction and HAL300 command formats. */
-static inline bool
-agx_chip_g17_m5(enum agx_chip chip)
-{
-   return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
-}
 
 /* Every AGX3B part carries the 8x8 f16/f32 matmad backing a subgroup-scope
  * cooperative matrix. M5 has its own AGX3C encoding and matrix16 support. */
