@@ -314,8 +314,14 @@ hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
                      const void *pointer, uint64_t size,
                      enum hk_host_map_class before_pin)
 {
-   if (!dev->host_alias.dynamic)
+   if (!dev->host_alias.dynamic) {
+      /* Under the per-device rule nothing is tracked; say the import
+       * happened, so a trace shows whether an application imports at all. */
+      if (agx_chip_g17_m5(dev->dev.chip) && debug_get_option_m5_host_alias_trace())
+         fprintf(stderr, "M5_HOST_ALIAS import %p+%#" PRIx64 " (per-device rule)\n",
+                 pointer, size);
       return VK_SUCCESS;
+   }
 
    const uintptr_t start = (uintptr_t)pointer;
    const uintptr_t end =

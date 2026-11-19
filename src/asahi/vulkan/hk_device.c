@@ -966,6 +966,48 @@ hk_device_may_alias_memory(const struct hk_device *dev,
    return *host_only;
 }
 
+/* ASAHI_M5_HOST_ALIAS_TRACE=1: name at device creation every enabled feature
+ * or extension through which memory can get a second GPU address
+ * (hk_device_may_alias_memory()), and the rule the device took. */
+static void
+hk_device_trace_alias_reasons(const struct hk_device *dev,
+                              const struct hk_instance *instance)
+{
+   const struct vk_features *f = &dev->vk.enabled_features;
+   const struct vk_device_extension_table *ext = &dev->vk.enabled_extensions;
+   char reasons[512] = "";
+   size_t n = 0;
+#define HK_ALIAS_REASON(cond, name)                                            \
+   do {                                                                        \
+      if ((cond) && n < sizeof(reasons))                                       \
+         n += snprintf(reasons + n, sizeof(reasons) - n, " %s", name);         \
+   } while (0)
+   HK_ALIAS_REASON(f->sparseBinding, "sparseBinding");
+   HK_ALIAS_REASON(f->sparseResidencyBuffer, "sparseResidencyBuffer");
+   HK_ALIAS_REASON(f->sparseResidencyImage2D, "sparseResidencyImage2D");
+   HK_ALIAS_REASON(f->sparseResidencyImage3D, "sparseResidencyImage3D");
+   HK_ALIAS_REASON(f->sparseResidency2Samples || f->sparseResidency4Samples ||
+                      f->sparseResidency8Samples || f->sparseResidency16Samples,
+                   "sparseResidencyNSamples");
+   HK_ALIAS_REASON(f->sparseResidencyAliased, "sparseResidencyAliased");
+   HK_ALIAS_REASON(f->bufferDeviceAddressCaptureReplay ||
+                      f->bufferDeviceAddressCaptureReplayEXT,
+                   "bufferDeviceAddressCaptureReplay");
+   HK_ALIAS_REASON(f->descriptorBufferCaptureReplay,
+                   "descriptorBufferCaptureReplay");
+   HK_ALIAS_REASON(f->accelerationStructureCaptureReplay,
+                   "accelerationStructureCaptureReplay");
+   HK_ALIAS_REASON(ext->KHR_external_memory_fd, "KHR_external_memory_fd");
+   HK_ALIAS_REASON(ext->EXT_external_memory_dma_buf, "EXT_external_memory_dma_buf");
+   HK_ALIAS_REASON(ext->EXT_external_memory_host &&
+                      !instance->drirc.misc.host_memory_import_read_only,
+                   "EXT_external_memory_host(writable)");
+#undef HK_ALIAS_REASON
+   fprintf(stderr, "M5_HOST_ALIAS device rule=%s may_alias=%u reasons:%s\n",
+           dev->host_alias.dynamic ? "per-import" : "per-device",
+           dev->may_alias_memory, n ? reasons : " none");
+}
+
 /* A/B and fallback: the per-device rule for host imports, as before the
  * scope followed the live imports. */
 DEBUG_GET_ONCE_BOOL_OPTION(m5_host_alias_static, "ASAHI_M5_HOST_ALIAS_STATIC",
@@ -1041,6 +1083,9 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
          dev->may_alias_memory = false;
       }
    }
+   if (agx_chip_g17_m5(pdev->dev.chip) &&
+       debug_get_bool_option("ASAHI_M5_HOST_ALIAS_TRACE", false))
+      hk_device_trace_alias_reasons(dev, instance);
 
    drmDevicePtr drm_device = NULL;
    int ret = drmGetDeviceFromDevId(pdev->render_dev, 0, &drm_device);
