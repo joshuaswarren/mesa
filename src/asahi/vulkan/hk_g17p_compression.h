@@ -432,6 +432,15 @@ hk_g17p_shared_compression_eligible(enum agx_chip chip, unsigned plane,
  * otherwise only sampled, input-attachment and transfer usages. Shared
  * images (external memory, WSI) stay plain.
  *
+ * VK_IMAGE_CREATE_ALIAS_BIT is admitted here and by the depth policy below.
+ * Vulkan defines aliased contents only between images of identical creation
+ * parameters, which this policy maps to the same layout, metadata included,
+ * so placed aliases agree on every M5 part. The other form of ALIAS, a
+ * single-plane image sharing a plane of a multi-planar image, requires
+ * VK_IMAGE_CREATE_DISJOINT_BIT on both images; that flag stays refused, so
+ * such an image keeps the plain layout of the plane it aliases. Sparse
+ * flags stay refused.
+ *
  * Every level of a compressed mip chain is described by the level-0 surface
  * and metadata addresses plus the level fields, in the PBE and
  * texture packets alike, as native does; the hardware finds the
@@ -476,6 +485,7 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
    }
 
    const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_ALIAS_BIT |
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
    const VkImageUsageFlags allowed_usage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -600,6 +610,7 @@ hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
    }
 
    const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_ALIAS_BIT |
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
       VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
    const VkImageUsageFlags allowed_usage =

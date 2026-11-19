@@ -526,6 +526,16 @@ check_m5_depth(void)
       c = i;
       c.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
       CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      /* Placed aliases of identical parameters, both planes. */
+      c = i;
+      c.flags |= VK_IMAGE_CREATE_ALIAS_BIT;
+      for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip) {
+         CHECK(hk_m5_depth_compression_eligible((enum agx_chip)chip, 0, &c) ==
+               agx_chip_g17_m5((enum agx_chip)chip));
+         CHECK(hk_m5_depth_compression_eligible((enum agx_chip)chip, 1, &c) ==
+               (agx_chip_g17_m5((enum agx_chip)chip) &&
+                formats[f] == VK_FORMAT_D32_SFLOAT_S8_UINT));
+      }
       c = i;
       c.extent.width = 15;
       CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
@@ -611,6 +621,24 @@ check_m5_color(void)
    c = i;
    c.format = VK_FORMAT_R8G8_UNORM;
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+
+   /* A placed alias of identical parameters gets the same layout on every M5
+    * part. A single-plane alias of a multi-planar plane needs DISJOINT, which
+    * stays refused, as do sparse bindings. */
+   c = i;
+   c.flags = VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+   for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
+      CHECK(hk_m5_color_compression_eligible((enum agx_chip)chip, 0, &c) ==
+            agx_chip_g17_m5((enum agx_chip)chip));
+   c.format = VK_FORMAT_R8_UNORM;
+   c.mipLevels = 1;
+   c.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17G, 0, &c));
+   c.flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
+   for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
+      CHECK(!hk_m5_color_compression_eligible((enum agx_chip)chip, 0, &c));
+   c.flags = VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17C, 0, &c));
 }
 
 static void
