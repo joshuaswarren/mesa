@@ -169,12 +169,19 @@ struct hk_shader_info {
    unsigned agx3_root_uniform;
    bool agx3_txf_texture_valid;
    bool agx3_storage_image_valid;
+   /* G18G compute: image access left on the AGX2 bindless form, which
+    * silently did nothing on G18G when tested. Refused at dispatch. */
+   bool g18_unlowered_image;
    bool agx3_sampled_storage_valid;
    bool agx3_indexed_sampler_valid;
    bool agx3_indexed_storage_valid;
    struct agx_g17p_combined_sampler_binding agx3_combined_sampler;
    struct agx_g17p_txf_binding agx3_txf_texture;
    struct agx_g17p_storage_image_binding agx3_storage_image;
+   /* G18G: textures + storage images through per-dispatch tables (implies
+    * agx3_storage_image_valid). */
+   bool agx3_g18_tables_valid;
+   struct agx_g18g_table_binding agx3_g18_tables;
    struct agx_g17p_sampled_storage_binding agx3_sampled_storage;
    struct agx_g17p_indexed_storage_binding agx3_indexed_storage;
 

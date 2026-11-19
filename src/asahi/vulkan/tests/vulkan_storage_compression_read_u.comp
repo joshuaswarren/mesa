@@ -1,0 +1,19 @@
+/* Copyright 2026 Jonathan Goyvaerts
+ * SPDX-License-Identifier: MIT
+ */
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform uimage2D img;
+layout(set = 0, binding = 1) uniform utexture2D tex;
+layout(set = 0, binding = 2, std430) writeonly buffer O { uvec4 k[]; } o;
+layout(push_constant) uniform P { float scale; uint fetch; uint w, h; } pc;
+void main()
+{
+   uvec2 p = gl_GlobalInvocationID.xy;
+   if (p.x >= pc.w || p.y >= pc.h)
+      return;
+   uvec4 v = pc.fetch != 0u ? texelFetch(tex, ivec2(p), 0) : imageLoad(img, ivec2(p));
+   o.k[pc.fetch * pc.w * pc.h + p.y * pc.w + p.x] = uvec4(v);
+}

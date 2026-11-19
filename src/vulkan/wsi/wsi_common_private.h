@@ -58,7 +58,8 @@ struct wsi_base_image_params {
 struct wsi_cpu_image_params {
    struct wsi_base_image_params base;
 
-   uint8_t *(*alloc_shm)(struct wsi_image *image, unsigned size);
+   /* size and the returned pointer are multiples of align */
+   uint8_t *(*alloc_shm)(struct wsi_image *image, unsigned size, uint64_t align);
 };
 
 struct wsi_drm_image_params {
@@ -124,7 +125,8 @@ struct wsi_image_info {
    wsi_memory_type_select_cb select_image_memory_type;
    wsi_memory_type_select_cb select_blit_dst_memory_type;
 
-   uint8_t *(*alloc_shm)(struct wsi_image *image, unsigned size);
+   /* size and the returned pointer are multiples of align */
+   uint8_t *(*alloc_shm)(struct wsi_image *image, unsigned size, uint64_t align);
 
    VkResult (*create_mem)(const struct wsi_swapchain *chain,
                           const struct wsi_image_info *info,
@@ -618,5 +620,11 @@ wsi_metal_configure_image(const struct wsi_swapchain *chain,
 #ifdef __cplusplus
 }
 #endif
+
+/* Reserves size bytes of inaccessible address space at a multiple of align (a
+ * power of two; anything below a page means a page), for a mapping placed
+ * over it with MAP_FIXED or SHM_REMAP. NULL on failure.
+ */
+void *wsi_reserve_aligned(size_t size, uint64_t align);
 
 #endif /* WSI_COMMON_PRIVATE_H */

@@ -343,12 +343,20 @@ image_write_source_can_be_immediate(agx_instr *I, unsigned s)
  * native G17G code selects constants such as 1.0. Fold one whose bits
  * do not fit the integer immediate, opposite a selected register only: the
  * two-immediate form takes raw bits. Compare-select fusion creates most of
- * these selects after immediate inlining, so run it after fusing as well. */
+ * these selects after immediate inlining, so run it after fusing as well.
+ *
+ * Not on G18G (emit_agx3d): its compare-select packers take selected
+ * immediates as integer bit patterns and none reads
+ * fcmpsel_minifloat_select, so 1.0 folded to the minifloat 0x30 selected
+ * the integer 48, a denormal that reads as 0.0. That zeroed the coverage
+ * multiplier of Skia's FillRRectOp (Chromium canvas fillRect and arcs
+ * vanished). The constant stays in a register. */
 static void
 agx_optimizer_minifloat_select(agx_context *ctx, agx_instr **defs,
                                agx_instr *I)
 {
    if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       ctx->key->dev.emit_agx3d ||
        ctx->agx3_reg_float_consts ||
        I->op != AGX_OPCODE_FCMPSEL || I->nr_srcs != 4 ||
        I->fcmpsel_minifloat_select || I->saturate ||
@@ -536,6 +544,20 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
           !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B && s == 1 &&
             (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
              I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS)))
+         continue;
+      /* A G17P array comparison without an offset stages its level or bias
+       * beside the layer from a register; an immediate would share SMP's
+       * operand with that layer, which agx3_emit_texture_sample() refuses.
+       * A zero level or bias, and an explicit level in a stage the packer
+       * treats as vertex_explicit_lod, encode as immediates and keep them. */
+      if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 1 && I->shadow &&
+          !I->offset && I->dim == AGX_DIM_2D_ARRAY &&
+          ctx->key->dev.chip == AGX_CHIP_G17P &&
+          (def->dest[0].size == AGX_SIZE_16 ? _mesa_half_to_float(def->imm)
+                                            : uif(def->imm)) != 0.0f &&
+          !(I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
+            agx3_vertex_explicit_lod_stage(ctx->stage,
+                                           AGX_ISA_ENCODING_AGX3B)))
          continue;
       /* AGX3 sampler indices past 15 have only a register form. */
       if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 4 &&
@@ -903,20 +925,39 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
       if (def == NULL)
          continue; /* happens for phis in loops */
 
-      /* Preserve a pointer assembled from adjacent uniform words instead of
-       * materializing its two words in registers. M5 loads can address the
-       * complete uniform file with an aligned 64-bit base. */
-      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          I->op == AGX_OPCODE_DEVICE_LOAD && s == 0 &&
+      /* Preserve an aligned 64-bit device-load base assembled from
+       * adjacent uniform words. The native form reads those same words. */
+      if (ctx->key && I->op == AGX_OPCODE_DEVICE_LOAD && s == 0 &&
           src.size == AGX_SIZE_64 && agx_channels(src) == 1 &&
           !src.abs && !src.neg && !src.memory &&
           def->op == AGX_OPCODE_COLLECT && def->nr_srcs == 2 &&
           def->nr_dests == 1 && def->dest[0].size == AGX_SIZE_64 &&
           agx_channels(def->dest[0]) == 1 && !def->dest[0].memory &&
-          !def->saturate &&
-          debug_get_bool_option("ASAHI_M5_HIGH_UNIFORM_LOAD", true)) {
+          !def->saturate) {
          const agx_index lo = def->src[0], hi = def->src[1];
-         if (lo.type == AGX_INDEX_UNIFORM && hi.type == AGX_INDEX_UNIFORM &&
+         const bool m5_uniform_base =
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+            debug_get_bool_option("ASAHI_M5_HIGH_UNIFORM_LOAD", true);
+
+         /* G17P scalar W8 and four packed W8 components both return one
+          * physical word, and their native LDDEV reads an aligned base
+          * directly from the low uniform file. */
+         const bool g17p_w8_uniform_base =
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+            ctx->key->dev.chip == AGX_CHIP_G17P &&
+            ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
+            ctx->nir && !ctx->nir->info.internal && !ctx->key->secondary &&
+            I->format == AGX_FORMAT_I8 && !I->coherent &&
+            I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
+            agx_channels(I->dest[0]) == 1 &&
+            ((!I->memory_is_packed && I->mask == 0x1) ||
+             (I->memory_is_packed && I->mask == 0xf)) &&
+            !src.kill && !src.cache && !src.discard &&
+            !lo.kill && !lo.cache && !lo.discard &&
+            !hi.kill && !hi.cache && !hi.discard;
+
+         if ((m5_uniform_base || g17p_w8_uniform_base) &&
+             lo.type == AGX_INDEX_UNIFORM && hi.type == AGX_INDEX_UNIFORM &&
              lo.size == AGX_SIZE_32 && hi.size == AGX_SIZE_32 &&
              agx_channels(lo) == 1 && agx_channels(hi) == 1 &&
              !lo.abs && !lo.neg && !lo.memory &&

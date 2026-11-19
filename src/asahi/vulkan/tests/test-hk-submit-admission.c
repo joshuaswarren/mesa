@@ -323,7 +323,6 @@ run_rq(bool rq_first)
    CHECK(vk_queue_init(&queue.vk, &dev->vk, &qi, 0) == VK_SUCCESS);
    queue.vk.driver_submit = driver_submit;
    queue.drm.id = UINT32_MAX;
-   queue.drm.retired_id = UINT32_MAX;
    queue.drm.virt_ring_idx = 1;
    struct vk_command_pool pool = {.queue_family_index = 0};
    vk_object_base_init(&dev->vk, &cmd->vk.base, VK_OBJECT_TYPE_COMMAND_BUFFER);
@@ -354,15 +353,14 @@ run_rq(bool rq_first)
 
    CHECK(hk_QueueSubmit2(q, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
    CHECK(creates == 2 && submits == 1 && queue.drm.id == 42);
-   CHECK(queue.drm.render_rq == rq_first);
+   CHECK(queue.drm.render_rq == (rq_first ? HK_RENDER_RQ_FRAGMENT : 0));
    CHECK(created_layouts[0] == 0 && (created_layouts[1] != 0) == rq_first);
 
    /* A later call that needs the scratch never replaces at admission. */
    cs.gen1_native_fragment_rq = true;
    CHECK(hk_QueueSubmit2(q, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
    CHECK(creates == 2 && submits == 2 && queue.drm.id == 42);
-   CHECK(queue.drm.render_rq == rq_first);
-   CHECK(queue.drm.retired_id == UINT32_MAX);
+   CHECK(queue.drm.render_rq == (rq_first ? HK_RENDER_RQ_FRAGMENT : 0));
 
    vk_queue_finish(&queue.vk);
    CHECK(!vk_device_is_lost_no_report(&dev->vk));

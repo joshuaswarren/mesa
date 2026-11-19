@@ -1047,6 +1047,24 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  executable(
+    'vulkan-storage-compression',
+    files('tests/vulkan_storage_compression.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan'), dep_m],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  executable(
+    'vulkan-dynamic-offset-draws',
+    files('tests/vulkan_dynamic_offset_draws.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
 endif
 
 if with_tests

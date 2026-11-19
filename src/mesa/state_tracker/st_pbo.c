@@ -676,6 +676,12 @@ st_init_pbo_helpers(struct st_context *st)
    /* Rasterizer state */
    memset(&st->pbo.raster, 0, sizeof(struct pipe_rasterizer_state));
    st->pbo.raster.half_pixel_center = 1;
+   /* Every PBO vertex has z = 0 (st_pbo_draw, st_pbo_create_gs), so depth
+    * clipping changes nothing; keep it on. A zeroed state disabled it, and
+    * drivers that cannot disable depth clipping refuse such draws, which
+    * dropped every PBO upload and download. */
+   st->pbo.raster.depth_clip_near = 1;
+   st->pbo.raster.depth_clip_far = 1;
 
    const char *pbo = debug_get_option("MESA_COMPUTE_PBO", NULL);
    if (pbo) {
