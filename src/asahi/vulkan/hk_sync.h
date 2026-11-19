@@ -354,7 +354,7 @@ struct hk_sync_queue {
    bool serialize;
    /* Serialized queue that still records dependencies so a render whose
     * vertex half depends on no earlier render can order only its fragment
-    * half after the serialized prefix (HK_G13_STAGE_OVERLAP=0 disables). */
+    * half after the serialized prefix. */
    bool stage_overlap;
    uint64_t submitted[HK_SYNC_NUM_SQ];
    uint64_t last_absolute[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];

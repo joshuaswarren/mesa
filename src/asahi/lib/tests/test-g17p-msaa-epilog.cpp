@@ -324,13 +324,7 @@ TEST_F(G17PMSAAEpilog, PerSampleKillsUseOneCoverageUpdate)
       agx_nir_lower_fs_output_to_epilog_for_device(b.shader, AGX_CHIP_G17P, &link);
       ASSERT_TRUE(agx_nir_lower_g17p_sample_shading(b.shader, &link, samples));
       nir_opt_constant_folding(b.shader);
-      /* Negative control: AGX_G17P_SAMPLE_KILL_ONE_UPDATE=0 selects the
-       * lowering with a kill-only update per copy, as it does in the
-       * drivers; the expectations below must then fail. */
-      if (debug_get_bool_option("AGX_G17P_SAMPLE_KILL_ONE_UPDATE", true))
-         ASSERT_TRUE(agx_nir_lower_sample_mask_one_update(b.shader));
-      else
-         ASSERT_TRUE(agx_nir_lower_sample_mask_deferred(b.shader));
+      ASSERT_TRUE(agx_nir_lower_sample_mask_one_update(b.shader));
       nir_validate_shader(b.shader, "G17P per-sample kill coverage");
 
       unsigned updates = 0, kill_only = 0, demotes = 0;

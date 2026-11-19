@@ -12,8 +12,8 @@
  * to the fragment shader. Transform feedback from the last stage is written
  * by the draw module's stream-output stage on the way.
  *
- * Tessellation now runs on the GPU (agx_draw_patches) unless
- * ASAHI_M5_SWTNL_TESS is set.
+ * Tessellation runs here when the draw module can tessellate (an LLVM
+ * build), otherwise on the GPU (agx_draw_patches, agx_m5_gpu_tess()).
  */
 
 #include "compiler/nir/nir_builder.h"
@@ -489,9 +489,7 @@ agx_swtnl_init(struct agx_context *ctx)
       return true;
 
    /* LLVM: the interpreter has no tessellation and no 16-bit types. */
-   struct draw_context *draw =
-      getenv("AGX_SWTNL_NO_LLVM") ? draw_create_no_llvm(&ctx->base)
-                                  : draw_create(&ctx->base);
+   struct draw_context *draw = draw_create(&ctx->base);
    struct agx_swtnl_render *r = CALLOC_STRUCT(agx_swtnl_render);
    if (!draw || !r) {
       if (draw)
@@ -502,8 +500,7 @@ agx_swtnl_init(struct agx_context *ctx)
 
    /* gallivm bounds NIR constant loads in dwords, as llvmpipe sets up; the
     * default vec4 stride left only the first dword of a 16-byte buffer. */
-   if (!getenv("AGX_SWTNL_NO_LLVM"))
-      draw_set_constant_buffer_stride(draw, sizeof(float));
+   draw_set_constant_buffer_stride(draw, sizeof(float));
 
    /* The GPU rasterizes wide lines itself (GLES3 clipping.line.wide_*);
     * the draw module's wide-line stage would turn them into quads with
@@ -888,8 +885,6 @@ bool
 agx_swtnl_lower_for_draw(nir_shader *nir)
 {
    bool progress = false;
-   if (getenv("AGX_SWTNL_DUMP") && atoi(getenv("AGX_SWTNL_DUMP")) > 1)
-      nir_print_shader(nir, stderr);
    NIR_PASS(progress, nir, draw_nir_lower_opcodes);
 
    if (nir->info.stage != MESA_SHADER_TESS_CTRL)
@@ -953,8 +948,6 @@ agx_swtnl_lower_for_draw(nir_shader *nir)
 
    /* gallivm sets up its 16- and 64-bit types from the gathered bit sizes */
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-   if (getenv("AGX_SWTNL_DUMP"))
-      nir_print_shader(nir, stderr);
    return progress;
 }
 
@@ -1038,14 +1031,14 @@ agx_swtnl_delete_shader(struct agx_context *ctx, struct agx_uncompiled_shader *s
 
 /*
  * Does this draw take the CPU path? G17G, a geometry stage (or tessellation
- * with ASAHI_M5_SWTNL_TESS), and nothing the CPU copy does not see: no
- * textures, images or storage buffers before rasterization.
+ * the draw module can do, see agx_m5_gpu_tess()), and nothing the CPU copy
+ * does not see: no textures, images or storage buffers before rasterization.
  */
 bool
 agx_swtnl_applies(struct agx_context *ctx)
 {
    if (!agx_chip_g17_m5(agx_device(ctx->base.screen)->chip) ||
-       ctx->swtnl_inner || getenv("AGX_NO_SWTNL") ||
+       ctx->swtnl_inner ||
        (!ctx->stage[MESA_SHADER_GEOMETRY].shader &&
         !ctx->stage[MESA_SHADER_TESS_EVAL].shader))
       return false;
@@ -1053,7 +1046,7 @@ agx_swtnl_applies(struct agx_context *ctx)
    /* The draw module tessellates only with LLVM: without it, tessellation
     * runs on the GPU (agx_m5_gpu_tess()). */
    if (ctx->stage[MESA_SHADER_TESS_EVAL].shader &&
-       (getenv("AGX_SWTNL_NO_LLVM") || agx_m5_gpu_tess(ctx)))
+       agx_m5_gpu_tess(ctx))
       return false;
 
    for (unsigned s = 0; s < MESA_SHADER_FRAGMENT; ++s) {

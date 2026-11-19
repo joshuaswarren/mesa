@@ -2505,8 +2505,7 @@ hk_queue_create(struct hk_device *dev,
     * single-submission latency on G13 and G14. Keep upstream's payload. */
    queue->sync.stage_overlap =
       queue->sync.serialize &&
-      (dev->dev.params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
-      debug_get_bool_option("HK_G13_STAGE_OVERLAP", true);
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS);
    queue->sync.exact_prior =
       !queue->sync.serialize &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
