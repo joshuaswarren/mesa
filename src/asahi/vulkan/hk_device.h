@@ -462,9 +462,11 @@ enum hk_perftest {
  *   buffer are written as well (hk_device_patch_alias_sites()).
  * - Writes only add memory scope, and a written command buffer keeps it
  *   until it is reset or freed.
- * - Every command holding compute or transfer work ends with the
- *   memory-scoped strong flush (vkEndCommandBuffer), so what it wrote is in
- *   memory by its end. Sites cover reads by work recorded before an import;
+ * - Every compute stream holding launches ends with the memory-scoped strong
+ *   flush (vkEndCommandBuffer), so what it wrote is in memory by its end.
+ *   Graphics commands, including transfers done through a render pass, get
+ *   no such flush, as under the per-device rule, which never gave M5
+ *   graphics memory scope either. Sites cover reads by work recorded before an import;
  *   this covers writes made before it, by work that already ran, read later
  *   through the new import, through an import that replaced a freed one, or
  *   through another device's or API's import of the same pages, which
