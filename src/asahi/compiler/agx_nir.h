@@ -202,9 +202,6 @@ agx_g17p_pack_image_atomic_sw(uint64_t level_offset_B, unsigned tile_width_px,
  * admits the shapes only G17P's backend encodes (agx_optimizer_inline_imm). */
 bool agx_nir_lower_g17p_indexed_samplers(struct nir_shader *s, bool g17p);
 bool agx_nir_lower_g17g_indexed_reads(struct nir_shader *s);
-/* Packed native32 array handles are byte offsets; sampler handles already
- * name their native entry, including the reserved texel-fetch sampler0. */
-bool agx_nir_lower_g17p_native32_samplers(struct nir_shader *s, uint8_t texture_set);
 
 struct agx_g17p_combined_sampler_binding {
    uint32_t texture_offset_B;
@@ -287,7 +284,6 @@ bool agx_nir_lower_g17p_combined_sampler(
  * Initially admit only a single 2D float sample at explicit level zero. */
 bool agx_nir_lower_g17g_combined_sampler(
    struct nir_shader *s, struct agx_g17p_combined_sampler_binding *binding);
-bool agx_nir_lower_g17g_indexed_samplers(struct nir_shader *s);
 bool agx_nir_lower_g17g_indexed_reads(struct nir_shader *s);
 
 /* Turn the one statically indexed set-0 Gen9 texture used by the initial
