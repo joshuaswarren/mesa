@@ -2699,8 +2699,18 @@ static VkResult
 queue_submit(struct hk_device *dev, struct hk_queue *queue,
              struct vk_queue_submit *submit, bool *untouched)
 {
+   /* Packing copies the command buffers' streams: no patch site may be
+    * written meanwhile (host_alias.patch_lock). The copies are the only CPU
+    * reads of stream words at submission; the GPU reads each word whole. */
+   const bool alias_dynamic = dev->host_alias.dynamic;
+   if (unlikely(alias_dynamic))
+      u_rwlock_rdlock(&dev->host_alias.patch_lock);
    struct hk_packed_runs runs;
-   if (!hk_pack_runs(dev, queue, submit, &runs))
+   const bool have_runs = hk_pack_runs(dev, queue, submit, &runs);
+   if (unlikely(alias_dynamic))
+      u_rwlock_rdunlock(&dev->host_alias.patch_lock);
+
+   if (!have_runs)
       return queue_submit_recordings(dev, queue, submit, submit, NULL,
                                      untouched);
 
@@ -2740,15 +2750,12 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
    /* While a host import may alias, the command buffers recorded before it
     * get memory scope at their patch sites (hk_cdm_alias_scope()), before
-    * anything reads their streams: submit packing copies them. No site is
-    * written while they are read (host_alias.patch_lock). */
-   const bool alias_dynamic = dev->host_alias.dynamic;
-   if (unlikely(alias_dynamic)) {
-      if (p_atomic_read(&dev->host_alias_live))
-         hk_submit_patch_alias_sites(dev, submit->command_buffers,
-                                     submit->command_buffer_count);
-      u_rwlock_rdlock(&dev->host_alias.patch_lock);
-   }
+    * anything reads their streams: submit packing copies them, holding
+    * host_alias.patch_lock shared (queue_submit()). */
+   if (unlikely(dev->host_alias.dynamic) &&
+       p_atomic_read(&dev->host_alias_live))
+      hk_submit_patch_alias_sites(dev, submit->command_buffers,
+                                  submit->command_buffer_count);
 
    /* Look at the command buffers before they are submitted: once the work is
     * with the kernel it can complete, and the application may then free or
@@ -2758,8 +2765,6 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
    bool untouched;
    VkResult result = queue_submit(dev, queue, submit, &untouched);
-   if (unlikely(alias_dynamic))
-      u_rwlock_rdunlock(&dev->host_alias.patch_lock);
    if (result != VK_SUCCESS && !untouched)
       result = vk_queue_set_lost(&queue->vk, "Submit failed");
    else if (result == VK_SUCCESS && has_compute)

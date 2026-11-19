@@ -164,9 +164,9 @@ struct hk_device {
       simple_mtx_t cmd_lock;
       struct list_head cmd_buffers;
       /* Submit packing copies the streams of the command buffers it
-       * submits: a submission holds this shared until the kernel has them,
-       * and the first write of a command buffer's sites that one could see
-       * takes it exclusively (taken after cmd_lock). */
+       * submits, holding this shared (queue_submit()), and the first
+       * write of a command buffer's sites that a submission could see takes
+       * it exclusively (taken after cmd_lock). */
       struct u_rwlock patch_lock;
    } host_alias;
    /* One bit per main-heap page: only unbound sparse buffer pages are set. */

@@ -271,6 +271,25 @@ hk_GetMemoryHostPointerPropertiesEXT(
 DEBUG_GET_ONCE_BOOL_OPTION(m5_host_alias_trace, "ASAHI_M5_HOST_ALIAS_TRACE",
                            false)
 
+/* The class of the mappings over [pointer, pointer + size) in
+ * /proc/self/maps (hk_host_maps_classify_fd()); HK_HOST_MAP_OTHER when the
+ * file cannot be read. */
+static enum hk_host_map_class
+hk_host_maps_classify_self(const void *pointer, uint64_t size)
+{
+   const uintptr_t start = (uintptr_t)pointer;
+   if (size == 0 || size > UINTPTR_MAX - start)
+      return HK_HOST_MAP_OTHER;
+
+   const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+   if (fd < 0)
+      return HK_HOST_MAP_OTHER;
+   const enum hk_host_map_class cls =
+      hk_host_maps_classify_fd(fd, start, start + (uintptr_t)size);
+   close(fd);
+   return cls;
+}
+
 /* M5 with host_alias.dynamic: enter a host import into the device's set, so
  * hk_cdm_alias_scope() asks for memory scope while it may alias
  * (hk_host_import_aliases()). A GPU-writable import of pages that are all
@@ -279,15 +298,21 @@ DEBUG_GET_ONCE_BOOL_OPTION(m5_host_alias_trace, "ASAHI_M5_HOST_ALIAS_TRACE",
  * read-only one needs only private mappings: the GPU writes none of its
  * pages through it, and writes them through another address only through a
  * writable import of a shared mapping, which aliases itself, or of the same
- * pages, which overlaps it. Maps the kernel does not let us read alias.
+ * pages, which overlaps it. An import whose maps cannot be read aliases.
+ * The mappings are read before the kernel pins the pages (before_pin) and
+ * again now, and the worse of the two counts, so an application that
+ * replaces the mapping meanwhile is not taken at its word. What the maps
+ * cannot show: pages a private mapping holds that are pinned already, see
+ * hk_host_alias.h on mremap.
  *
- * Costs one read of /proc/self/maps up to the lines that cover the range.
+ * Costs two reads of /proc/self/maps up to the lines that cover the range.
  * When this is the first import that may alias, the command buffers recorded
  * before get their patch sites written (hk_device_patch_alias_sites()) before
  * the import is returned. */
 static VkResult
 hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
-                     const void *pointer, uint64_t size)
+                     const void *pointer, uint64_t size,
+                     enum hk_host_map_class before_pin)
 {
    if (!dev->host_alias.dynamic)
       return VK_SUCCESS;
@@ -295,14 +320,8 @@ hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
    const uintptr_t start = (uintptr_t)pointer;
    const uintptr_t end =
       size <= UINTPTR_MAX - start ? start + (uintptr_t)size : UINTPTR_MAX;
-   enum hk_host_map_class cls = HK_HOST_MAP_OTHER;
-   if (end != UINTPTR_MAX) {
-      const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
-      if (fd >= 0) {
-         cls = hk_host_maps_classify_fd(fd, start, end);
-         close(fd);
-      }
-   }
+   const enum hk_host_map_class cls =
+      MAX2(before_pin, hk_host_maps_classify_self(pointer, size));
 
    const bool gpu_writes = !(mem->bo->flags & AGX_BO_READONLY);
    const struct hk_host_import import = {
@@ -378,6 +397,9 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       vk_find_struct_const(pAllocateInfo->pNext,
                            MEMORY_PRIORITY_ALLOCATE_INFO_EXT);
    const VkMemoryType *type = &pdev->mem_types[pAllocateInfo->memoryTypeIndex];
+   /* The mappings over a host import before its pages are pinned
+    * (hk_host_import_track()). */
+   enum hk_host_map_class host_maps_before_pin = HK_HOST_MAP_OTHER;
 
    VkExternalMemoryHandleTypeFlagBits handle_types = 0;
    if (export_info != NULL)
@@ -457,6 +479,9 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
             ? AGX_HOST_PTR_READ_ONLY
          : instance->drirc.misc.host_memory_read_only ? AGX_HOST_PTR_ANY
                                                        : AGX_HOST_PTR_WRITABLE;
+      if (dev->host_alias.dynamic)
+         host_maps_before_pin = hk_host_maps_classify_self(
+            host_info->pHostPointer, pAllocateInfo->allocationSize);
       mem->bo = agx_bo_import_host_ptr(&dev->dev, host_info->pHostPointer,
                                        pAllocateInfo->allocationSize, access);
       if (mem->bo == NULL) {
@@ -563,7 +588,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
 
    if (host_info && host_info->handleType) {
       result = hk_host_import_track(dev, mem, host_info->pHostPointer,
-                                    mem->bo->size);
+                                    mem->bo->size, host_maps_before_pin);
       if (result != VK_SUCCESS) {
          agx_bo_unreference(&dev->dev, mem->bo);
          mem->bo = NULL;
