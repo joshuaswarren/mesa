@@ -101,7 +101,6 @@
 /* Diagnostic controls, read once: these are consulted per draw or
  * render pass, and an uncached getenv() scans the whole environment. */
 DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_msaa_pass_merge, "ASAHI_M5_MSAA_PASS_MERGE", true)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_tile_loader, "AGX_M5_VERIFY_TILE_LOADER",
                            false)
 DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_m5_wclamp,
@@ -4005,8 +4004,7 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
    const unsigned samples = render->tilebuffer.nr_samples;
    const bool msaa = samples > 1;
    const bool msaa_enabled = msaa && dev->dev.chip == AGX_CHIP_G17S &&
-      (samples == 2 || samples == 4) &&
-      debug_get_option_m5_msaa_pass_merge();
+      (samples == 2 || samples == 4);
 
    /* The instance is one ordinary render stream with draws, with no
     * pre/post-graphics streams, heap use or timestamps attached. */

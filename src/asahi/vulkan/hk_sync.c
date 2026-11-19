@@ -98,8 +98,6 @@ hk_sync_reset(struct hk_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->sync_pass_records);
 }
 
-DEBUG_GET_ONCE_BOOL_OPTION(sync_tile_index, "ASAHI_SYNC_TILE_INDEX", true)
-
 #define TILE_BUCKETS 256
 #define TILE_INDEX_NONE UINT32_MAX
 
@@ -1801,9 +1799,9 @@ hk_sync_resolve_submit(struct hk_queue *queue,
       }
    }
 
-   bool indexed = debug_get_option_sync_tile_index() &&
-      (!queue->sync.precise_tile_evictions || queue->sync.last_preserve ||
-       submit_preserves_tiles(cmdbufs, count));
+   bool indexed = !queue->sync.precise_tile_evictions ||
+                  queue->sync.last_preserve ||
+                  submit_preserves_tiles(cmdbufs, count);
    if (indexed) {
       indexed = false;
       for (unsigned i = 0; i < count && !indexed; ++i) {

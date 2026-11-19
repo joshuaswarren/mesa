@@ -1711,10 +1711,6 @@ hk_CmdPushDescriptorSetWithTemplate2KHR(
       pPushDescriptorSetWithTemplateInfo->pData);
 }
 
-DEBUG_GET_ONCE_BOOL_OPTION(m5_fragment_root_memo, "ASAHI_M5_FRAGMENT_ROOT_MEMO",
-                           true)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_fragment_root_shadow,
-                           "ASAHI_M5_FRAGMENT_ROOT_SHADOW", true)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_fragment_root_shadow,
                            "ASAHI_M5_VERIFY_FRAGMENT_ROOT_SHADOW", false)
 
@@ -3450,14 +3446,11 @@ static uint64_t
 hk_m5_fragment_root(struct hk_cmd_buffer *cmd, const struct hk_shader *s)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   const bool shadow = debug_get_option_m5_fragment_root_shadow();
 
-   if (unlikely(shadow && debug_get_option_m5_verify_fragment_root_shadow()))
+   if (unlikely(debug_get_option_m5_verify_fragment_root_shadow()))
       hk_m5_verify_fragment_root_shadow(gfx);
 
-   return hk_m5_fragment_root_select(gfx, s->info.agx3_root_reads,
-                                     debug_get_option_m5_fragment_root_memo(),
-                                     shadow);
+   return hk_m5_fragment_root_select(gfx, s->info.agx3_root_reads, true, true);
 }
 
 static uint64_t
