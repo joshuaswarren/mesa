@@ -390,30 +390,12 @@ TEST(Tilebuffer, G17PDenseWideRGBA8RenderTargets)
 
    for (unsigned count = 3; count <= AGX_MAX_RENDER_TARGETS; ++count) {
       auto tib = agx_build_tilebuffer_layout(formats, count, 1, false);
-      EXPECT_EQ(agx_g17p_wide_rgba8_mrt_count(&tib), count);
       EXPECT_TRUE(agx_g17p_rt0_tile_layout_supported(&tib));
       EXPECT_EQ(tib.sample_size_B, ((4 * count + 7) & ~7u));
       EXPECT_EQ(tib.tile_size, count >= 7 ? 32 * 16 : 32 * 32);
       for (unsigned rt = 0; rt < count; ++rt)
          EXPECT_EQ(agx_tilebuffer_offset_B(&tib, rt), 4 * rt);
-
-      auto invalid = tib;
-      invalid.logical_format[1] = PIPE_FORMAT_NONE;
-      EXPECT_EQ(agx_g17p_wide_rgba8_mrt_count(&invalid), 0u);
-      invalid = tib;
-      invalid._offset_B[count - 1] += 4;
-      EXPECT_EQ(agx_g17p_wide_rgba8_mrt_count(&invalid), 0u);
-      invalid = tib;
-      invalid.spilled[count - 1] = true;
-      EXPECT_EQ(agx_g17p_wide_rgba8_mrt_count(&invalid), 0u);
-      invalid = tib;
-      invalid.layered = true;
-      EXPECT_EQ(agx_g17p_wide_rgba8_mrt_count(&invalid), 0u);
-      invalid = tib;
-      invalid.nr_samples = 2;
-      EXPECT_EQ(agx_g17p_wide_rgba8_mrt_count(&invalid), 0u);
    }
-   EXPECT_EQ(agx_g17p_wide_rgba8_mrt_count(nullptr), 0u);
 }
 
 TEST(Tilebuffer, G17PRGB565EOTKey)

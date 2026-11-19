@@ -775,8 +775,6 @@ const char *agx_chip_name(enum agx_chip chip);
 /* Stable name for the instruction set, e.g. "AGX3". Never NULL. */
 const char *agx_isa_name(enum agx_isa isa);
 
-const char *agx_isa_encoding_name(enum agx_isa_encoding encoding);
-
 const char *agx_command_stream_generation_name(
    enum agx_command_stream_generation generation);
 

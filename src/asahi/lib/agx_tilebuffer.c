@@ -942,14 +942,6 @@ agx_g18g_ms_mrt_mask(const struct agx_tilebuffer_layout *tib)
 }
 
 unsigned
-agx_g17p_wide_rgba8_mrt_count(const struct agx_tilebuffer_layout *tib)
-{
-   const unsigned mask = agx_g17p_rgba8_mrt_mask(tib);
-   const unsigned count = util_bitcount(mask);
-   return count >= 3 && mask == BITFIELD_MASK(count) ? count : 0;
-}
-
-unsigned
 agx_tilebuffer_compact(const struct agx_tilebuffer_layout *src,
                        struct agx_tilebuffer_layout *dst,
                        uint8_t map[AGX_MAX_RENDER_TARGETS])
