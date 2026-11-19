@@ -2697,9 +2697,22 @@ hk_pack_runs(struct hk_device *dev, const struct vk_queue_submit *submit,
          hk_pack_dedup_resources(&cs->compute_resources, unique);
 
          if (m5) {
-            /* Each source ended with the strong memory-scoped flush; keep
-             * it. */
-            hk_cdm_visibility_flush(dev, cs, true);
+            /* Each source ends with the strong memory-scoped flush. The
+             * packet's end keeps it for the host and other queues, which
+             * observe nothing of a packet before its completion. Between
+             * members, the next one reads through the same addresses, so
+             * the scope is needed only where memory can also be reached
+             * through a second address (hk_cdm_alias_scope()). */
+            if (!last && !hk_cdm_alias_scope(dev) &&
+                cs->current == cs->memory_flush_end &&
+                cs->current == cs->strong_flush_end) {
+               uint8_t *word = (uint8_t *)cs->current - AGX3_CDM_BARRIER_SIZE;
+               agx3_cmdstream_store_le32(
+                  word, agx3_cmdstream_load_le32(word) &
+                           ~AGX3_CDM_BARRIER_FLUSH_MEMORY);
+               cs->memory_flush_end = NULL;
+            }
+            hk_cdm_visibility_flush(dev, cs, last || hk_cdm_alias_scope(dev));
          } else if (!last) {
             /* G16G: the member's ordering barrier becomes the strong flush,
              * or its strong flush stays. */
