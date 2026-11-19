@@ -2605,7 +2605,7 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
    if (!runs)
       return false;
 
-   unsigned run_count = 0, packed_members = 0;
+   unsigned run_count = 0, packed_members = 0, members = 0;
    struct hk_pack_run run = {0};
    uint64_t dispatches = 0, threads = 0, work = 0;
    size_t resources = 0, total = 0;
@@ -2618,8 +2618,10 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
               terminate, atomics)
          : NULL;
       size_t size = 0;
-      if (cs)
+      if (cs) {
          size = (uint8_t *)cs->current - (uint8_t *)cs->start - sizeof(terminate);
+         members++;
+      }
 
       const bool fits = cs && run.count &&
          dispatches + cs->stats.cmds <= HK_PACK_MAX_DISPATCHES &&
@@ -2669,6 +2671,8 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
    }
 
    if (!run_count) {
+      if (hk_pack_trace())
+         fprintf(stderr, "HK_PACK runs=0 eligible=%u of %u\n", members, n);
       free(runs);
       return false;
    }
@@ -2793,8 +2797,9 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
    }
 
    if (hk_pack_trace())
-      fprintf(stderr, "HK_PACK runs=%u members=%u of %u commands=%u bytes=%zu\n",
-              run_count, packed_members, n, out->command_count, total);
+      fprintf(stderr, "HK_PACK runs=%u members=%u eligible=%u of %u commands=%u "
+              "bytes=%zu\n", run_count, packed_members, members, n,
+              out->command_count, total);
    free(runs);
    return true;
 }
