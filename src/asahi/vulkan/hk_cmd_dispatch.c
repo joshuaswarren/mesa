@@ -3206,9 +3206,10 @@ hk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
    /* A residency bitmap is only useful with the helper that reads it. That
-    * helper is built for devices that enabled sparseResidencyBuffer, which is
-    * the only way to create a buffer carrying a bitmap; if it is somehow
-    * absent, keep the old behaviour rather than refusing the dispatch. */
+    * helper is built, on chips with native indirect compute, for devices that
+    * enabled sparseResidencyBuffer, which is the only way to create a buffer
+    * carrying a bitmap. Other chips have no helper: keep reading the
+    * arguments through the shadow there. */
    const bool have_sparse_helper = dev->g17p_grid_helper_sparse != NULL;
    const bool use_primary =
       agx_native_graphics(&dev->dev) && buffer->va &&

@@ -44,6 +44,7 @@
 #include "vk_debug_utils.h"
 #include "vk_device.h"
 #include "vk_drm_syncobj.h"
+#include "vk_enum_to_str.h"
 #include "vk_pipeline_cache.h"
 #include "vk_shader.h"
 
@@ -767,10 +768,11 @@ hk_g17p_grid_helper_resident(nir_builder *b, nir_def *root, nir_def *grid_addr)
  * say how many threads it launches, and an idempotent kernel is correct for
  * any answer.
  */
-static struct hk_api_shader *
+static VkResult
 hk_build_g17p_grid_helper(struct hk_device *dev,
                           const VkAllocationCallbacks *pAllocator,
-                          bool copy_geometry, bool sparse)
+                          bool copy_geometry, bool sparse,
+                          struct hk_api_shader **helper)
 {
    assert(!(copy_geometry && sparse));
 
@@ -837,37 +839,68 @@ hk_build_g17p_grid_helper(struct hk_device *dev,
       .robustness = &vk_robustness_disabled,
       .stage = MESA_SHADER_COMPUTE,
    };
-   struct hk_api_shader *helper = NULL;
-   hk_compile_shader(dev, &info, NULL, NULL, pAllocator, &helper);
-   return helper;
+   return hk_compile_shader(dev, &info, NULL, NULL, pAllocator, helper);
 }
 
 static void
+hk_destroy_g17p_grid_helpers(struct hk_device *dev,
+                             const VkAllocationCallbacks *pAllocator)
+{
+   struct hk_api_shader **helpers[] = {
+      &dev->g17p_grid_helper,
+      &dev->g17p_geometry_copy_helper,
+      &dev->g17p_grid_helper_sparse,
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(helpers); ++i) {
+      if (*helpers[i]) {
+         hk_api_shader_destroy(&dev->vk, &(*helpers[i])->vk, pAllocator);
+         *helpers[i] = NULL;
+      }
+   }
+}
+
+/* The helpers are internal shaders built from fixed NIR, like the empty
+ * fragment shader: a failure to compile one is a driver bug or an allocation
+ * failure, never a property of the application, so it fails device creation
+ * instead of leaving a device that refuses every indirect dispatch at record
+ * time. */
+static VkResult
 hk_init_g17p_grid_helper(struct hk_device *dev,
                          const VkAllocationCallbacks *pAllocator)
 {
    if (!agx_chip_native_indirect_compute(dev->dev.chip))
-      return;
+      return VK_SUCCESS;
 
-   dev->g17p_grid_helper =
-      hk_build_g17p_grid_helper(dev, pAllocator, false, false);
-   dev->g17p_geometry_copy_helper =
-      hk_build_g17p_grid_helper(dev, pAllocator, true, false);
-
-   /* A refusal is not fatal: it costs indirect dispatch, not the device. */
-   if (!dev->g17p_grid_helper || !dev->g17p_geometry_copy_helper)
-      mesa_logw("G17P indirect compute unavailable: grid helper refused");
+   VkResult result = hk_build_g17p_grid_helper(dev, pAllocator, false, false,
+                                               &dev->g17p_grid_helper);
+   if (result == VK_SUCCESS)
+      result = hk_build_g17p_grid_helper(dev, pAllocator, true, false,
+                                         &dev->g17p_geometry_copy_helper);
 
    /* Only a sparse residency buffer can carry a residency bitmap, so only a
     * device that enabled the feature can ever select this helper; skip
     * compiling it otherwise. */
-   if (!dev->vk.enabled_features.sparseResidencyBuffer)
-      return;
+   if (result == VK_SUCCESS && dev->vk.enabled_features.sparseResidencyBuffer)
+      result = hk_build_g17p_grid_helper(dev, pAllocator, false, true,
+                                         &dev->g17p_grid_helper_sparse);
 
-   dev->g17p_grid_helper_sparse =
-      hk_build_g17p_grid_helper(dev, pAllocator, false, true);
-   if (!dev->g17p_grid_helper_sparse)
-      mesa_logw("G17P sparse indirect compute unavailable: helper refused");
+   if (result == VK_SUCCESS)
+      return VK_SUCCESS;
+
+   hk_destroy_g17p_grid_helpers(dev, pAllocator);
+
+   /* Running out of memory is reported as such. Any other compiler result
+    * (FEATURE_NOT_PRESENT, UNKNOWN) describes the helper, not anything the
+    * application asked for, and is not a vkCreateDevice result an
+    * application can act on. */
+   if (result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+       result == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+      return result;
+
+   return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                    "G17P indirect grid helper failed to compile: %s",
+                    vk_Result_to_str(result));
 }
 
 /* Whether memory can be mapped at a second GPU virtual address at any time
@@ -1180,7 +1213,9 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_meta;
    }
 
-   hk_init_g17p_grid_helper(dev, pAllocator);
+   result = hk_init_g17p_grid_helper(dev, pAllocator);
+   if (result != VK_SUCCESS)
+      goto fail_null_fs;
 
    *pDevice = hk_device_to_handle(dev);
 
@@ -1209,6 +1244,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    return VK_SUCCESS;
 
+fail_null_fs:
+   hk_api_shader_destroy(&dev->vk, &dev->null_fs->vk, pAllocator);
 fail_meta:
    if (!agx_chip_g17_m5(dev->dev.chip))
       hk_gen1_rq_finish(dev);
@@ -1324,19 +1361,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       hk_api_shader_destroy(&dev->vk, &dev->null_fs->vk, pAllocator);
    }
 
-   if (dev->g17p_grid_helper) {
-      hk_api_shader_destroy(&dev->vk, &dev->g17p_grid_helper->vk, pAllocator);
-   }
-
-   if (dev->g17p_geometry_copy_helper) {
-      hk_api_shader_destroy(&dev->vk, &dev->g17p_geometry_copy_helper->vk,
-                            pAllocator);
-   }
-
-   if (dev->g17p_grid_helper_sparse) {
-      hk_api_shader_destroy(&dev->vk, &dev->g17p_grid_helper_sparse->vk,
-                            pAllocator);
-   }
+   hk_destroy_g17p_grid_helpers(dev, pAllocator);
 
    hk_destroy_sampler_heap(dev, &dev->samplers);
    hk_texel_windows_finish(dev);
