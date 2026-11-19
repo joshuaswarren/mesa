@@ -1286,9 +1286,17 @@ asahi_ioctl_queue_create(int fd, unsigned long request, void *arg)
    struct drm_asahi_queue_create *create = arg;
    static uint32_t next_queue_id = 1;
 
-   /* Model authorization and a credential change after the screen probe. */
+   /* Model authorization and a credential change after the screen probe,
+    * and ("unsupported") a GPU backend that does not schedule HIGH. The
+    * kernel reserves REALTIME everywhere. */
    static unsigned high_requests;
    const char *policy = getenv("ASAHI_SHIM_HIGH_PRIORITY");
+   if (create->priority > DRM_ASAHI_PRIORITY_HIGH ||
+       (create->priority == DRM_ASAHI_PRIORITY_HIGH && policy &&
+        !strcmp(policy, "unsupported"))) {
+      errno = EINVAL;
+      return -1;
+   }
    if (create->priority == DRM_ASAHI_PRIORITY_HIGH) {
       high_requests++;
       if (policy && (!strcmp(policy, "deny") ||
