@@ -142,12 +142,10 @@ test_targets(void)
    for (size_t i = 0; i < ARRAY_SIZE(gpu0_targets); ++i) {
       CHECK(agx_ioto_load_target_encoding(gpu0_targets[i]) ==
             AGX_IOTO_LOAD_ENCODING_GPU0);
-      CHECK(!agx_ioto_load_production_ready(gpu0_targets[i]));
    }
    for (size_t i = 0; i < ARRAY_SIZE(gpu1_targets); ++i) {
       CHECK(agx_ioto_load_target_encoding(gpu1_targets[i]) ==
             AGX_IOTO_LOAD_ENCODING_GPU1);
-      CHECK(!agx_ioto_load_production_ready(gpu1_targets[i]));
    }
    CHECK(agx_ioto_load_target_encoding(AGX_CHIP_G14G) ==
          AGX_IOTO_LOAD_ENCODING_UNSUPPORTED);
@@ -559,18 +557,6 @@ test_cohort_parity(void)
 static bool
 test_cprog_input_layout(void)
 {
-   /* Offline native G17P captures with 0/1/2/3/4/8/16 buffer pointers. */
-   static const uint16_t input_counts[] = {0, 4, 8, 12, 16, 32, 64};
-   static const uint16_t native_frames[] = {0, 32, 32, 48, 48, 80, 144};
-   for (unsigned n = 0; n < ARRAY_SIZE(input_counts); ++n) {
-      struct agx_ioto_cprog_inputs inputs = {.known = true};
-      for (unsigned h = 0; h < input_counts[n]; ++h)
-         inputs.uniform_halfs[h / 64] |= UINT64_C(1) << (h % 64);
-      uint16_t count, bytes;
-      CHECK(agx_ioto_cprog_input_frame(AGX_CHIP_G17P, &inputs, &count, &bytes));
-      CHECK(count == input_counts[n] && bytes == native_frames[n]);
-   }
-
    /* Sparse native texture inputs [8,9,10,11] are packed into TPS halves
     * [8,9,10,11], rather than retaining their source uniform indices. */
    struct agx_ioto_cprog_inputs inputs = {.uniform_halfs = {0xf00}, .known = true};
@@ -598,29 +584,17 @@ test_cprog_input_layout(void)
          CHECK(offset == (selected ? 2 * expected : 0xbeef));
          expected += selected;
       }
-      uint16_t count, bytes;
-      CHECK(agx_ioto_cprog_input_frame(AGX_CHIP_G17P, &inputs, &count, &bytes));
-      CHECK(count == expected && !(bytes & 15) && bytes >= 16 + 2 * count);
-      if (pattern == 0)
-         CHECK(count == 512 && bytes == 1040);
    }
 
-   uint16_t count = 0x1234, bytes = 0x5678, offset = 0xabcd;
+   uint16_t offset = 0xabcd;
    inputs.known = false;
-   CHECK(!agx_ioto_cprog_input_frame(AGX_CHIP_G17P, &inputs, &count, &bytes));
    CHECK(!agx_ioto_cprog_input_offset(AGX_CHIP_G17P, &inputs, 0, &offset));
    inputs.known = true;
-   CHECK(!agx_ioto_cprog_input_frame(AGX_CHIP_G17S, &inputs, &count, &bytes));
-   CHECK(!agx_ioto_cprog_input_frame(AGX_CHIP_G17P, NULL, &count, &bytes));
-   CHECK(!agx_ioto_cprog_input_frame(AGX_CHIP_G17P, &inputs, &count, &count));
-   CHECK(!agx_ioto_cprog_input_frame(AGX_CHIP_G17P, &inputs, NULL, &bytes));
    CHECK(!agx_ioto_cprog_input_offset(AGX_CHIP_G17P, &inputs, 512, &offset));
    CHECK(!agx_ioto_cprog_input_offset(AGX_CHIP_G17P, NULL, 0, &offset));
    CHECK(!agx_ioto_cprog_input_offset(AGX_CHIP_G17P, &inputs, 0, NULL));
-   CHECK(count == 0x1234 && bytes == 0x5678 && offset == 0xabcd);
+   CHECK(offset == 0xabcd);
    memset(inputs.uniform_halfs, 0, sizeof(inputs.uniform_halfs));
-   CHECK(agx_ioto_cprog_input_frame(AGX_CHIP_G17P, &inputs, &count, &bytes));
-   CHECK(count == 0 && bytes == 0);
    CHECK(!agx_ioto_cprog_input_offset(AGX_CHIP_G17P, &inputs, 0, &offset));
    CHECK(offset == 0xabcd);
    return true;

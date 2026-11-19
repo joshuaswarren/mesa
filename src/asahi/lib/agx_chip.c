@@ -687,19 +687,6 @@ agx_chip_name(enum agx_chip chip)
 }
 
 const char *
-agx_isa_encoding_name(enum agx_isa_encoding encoding)
-{
-   switch (encoding) {
-   case AGX_ISA_ENCODING_AGX2: return "agx2";
-   case AGX_ISA_ENCODING_AGX3B: return "agx3b";
-   case AGX_ISA_ENCODING_AGX3C: return "agx3c";
-   case AGX_ISA_ENCODING_AGX3D: return "agx3d";
-   case AGX_ISA_ENCODING_UNKNOWN:
-   default: return "unknown";
-   }
-}
-
-const char *
 agx_isa_name(enum agx_isa isa)
 {
    switch (isa) {

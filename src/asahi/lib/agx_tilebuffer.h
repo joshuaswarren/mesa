@@ -400,10 +400,6 @@ agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib);
  * attachment's own encoding (8-bit normalized, RGB10A2, R11G11B10F). */
 int agx_g18g_native_mixed_eot_class(enum pipe_format format);
 
-/* Dense, unspilled single-sample RGBA8 layouts with three to eight targets. */
-unsigned
-agx_g17p_wide_rgba8_mrt_count(const struct agx_tilebuffer_layout *tib);
-
 enum agx_g17p_mrt_layout {
    AGX_G17P_MRT_NONE,
    AGX_G17P_MRT_WBOIT,

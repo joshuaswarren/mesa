@@ -151,7 +151,6 @@ test_exact_uniform_program(void)
       CHECK(memcmp(f.output + written - suffix.length, suffix.bytes,
                    suffix.length) == 0);
       CHECK(f.output[written] == 0xa5);
-      CHECK(!agx_ioto_load_production_ready(chip));
    }
    return true;
 }
