@@ -13137,24 +13137,6 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
    /* Record provenance before RA can create stack instructions. */
    const bool imports_only_before_ra = agx3_cprog_spill_provenance(ctx);
-   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-       ctx->stage == MESA_SHADER_FRAGMENT && ctx->key->fs.nr_samples > 1 &&
-       debug_get_bool_option("ASAHI_M5_TILE_DATA_COPY_PROBE", false)) {
-      agx_foreach_instr_global_safe(ctx, I) {
-         if (I->op != AGX_OPCODE_ST_TILE ||
-             I->src[0].type != AGX_INDEX_NORMAL || I->src[0].memory)
-            continue;
-         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-         const unsigned channels = agx_channels(I->src[0]);
-         if (channels > 4)
-            continue;
-         agx_index parts[4];
-         agx_emit_split(&b, parts, I->src[0], channels);
-         for (unsigned c = 0; c < channels; ++c)
-            parts[c] = agx_mov(&b, parts[c]);
-         agx_replace_src(I, 0, agx_emit_collect(&b, channels, parts));
-      }
-   }
    if (disable_remat)
       agx_ra_without_remat(ctx);
    else

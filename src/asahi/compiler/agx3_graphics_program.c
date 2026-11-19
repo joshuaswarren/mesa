@@ -13,13 +13,8 @@
 #include "asahi/lib/agx_ioto_preshader_core.h"
 #include "asahi/lib/agx_ioto_state_core.h"
 #include "util/macros.h"
-#include "util/u_debug.h"
 
 #include <string.h>
-
-/* Read once: it is consulted for every background and end-of-tile program */
-DEBUG_GET_ONCE_BOOL_OPTION(zero_colour_release_diagnostic,
-                           "ASAHI_G17P_ZERO_COLOUR_RELEASE_DIAGNOSTIC", false)
 
 static bool
 graphics_state_tail(const struct agx3_g17p_graphics_program_desc *desc,
@@ -442,9 +437,7 @@ graphics_program_write_unpublished(
    /* Zero remains the conservative no-colour/default-fragment spelling.  It
     * has the same loader release mask as one active colour partition. */
    const unsigned colour_classes =
-      !desc->fragment ? 0
-      : desc->colour_classes ? desc->colour_classes
-      : debug_get_option_zero_colour_release_diagnostic() ? 0 : 1;
+      !desc->fragment ? 0 : desc->colour_classes ? desc->colour_classes : 1;
    const enum agx_ioto_g17p_program_stage stage =
       !desc->fragment ? AGX_IOTO_G17P_PROGRAM_VERTEX_COMPUTE :
       desc->writes_sample_mask ? AGX_IOTO_G17P_PROGRAM_COVERAGE_FRAGMENT :
