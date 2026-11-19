@@ -419,6 +419,11 @@ hk_frame_anatomy_init(struct hk_device *dev)
            (uint64_t)dev->dev.params.command_timestamp_frequency_hz,
            fa->every, mode_names[fa->ts_mode], (unsigned)HK_FA_RING_RECS,
            (uint64_t)dev->dev.params.features);
+   if (fa->ts_mode == HK_FA_TS_ALL)
+      fprintf(fa->file,
+              "# ts=all: cross-engine steps of sampled submits wait on the "
+              "host, so cross-engine gaps and durations in sampled submits are "
+              "inflated; use HK_FRAME_ANATOMY_TS=edges or none for timing\n");
    fprintf(fa->file,
            "# S: sampled submit. R: render stream, C: compute stream; i: "
            "hardware command index in the submit.\n"

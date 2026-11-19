@@ -201,7 +201,6 @@ struct hk_device {
    struct agx_bo *gen1_rq_state;
    struct agx_va *gen1_rq_code_alias;
    struct agx_bo *gen1_vertex_directory;
-   struct agx_va *gen1_vertex_directory_va;
    struct hash_table *gen1_vertex_tables;
    uint64_t *gen1_rq_maps;
    unsigned gen1_rq_bound_maps;

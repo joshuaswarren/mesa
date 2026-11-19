@@ -765,76 +765,6 @@ get_pipeline_spv(struct hk_device *dev, const char *name, const uint32_t *spv,
 }
 
 VkResult
-hk_cmd_encode_agx3_nodes(VkCommandBuffer command_buffer,
-                        const struct hk_agx3_leaf_args *args)
-{
-   VK_FROM_HANDLE(hk_cmd_buffer, m5_dispatch_cmd, command_buffer);
-   struct hk_device *m5_dispatch_dev = hk_cmd_buffer_device(m5_dispatch_cmd);
-   if (hk_agx3_as_format_for_chip(m5_dispatch_dev->dev.chip) == HK_AGX3_AS_FORMAT_M5)
-      return hk_m5_backend_cmd_encode_agx3_nodes(command_buffer, args);
-
-   VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX3C &&
-       !dev->g17p_native_as)
-      return VK_ERROR_FEATURE_NOT_PRESENT;
-   if (!args->job_count)
-      return VK_SUCCESS;
-
-   /* The native phase uses eight invocations per independently writable
-    * node, HK_AGX3_NODE_JOBS_PER_GROUP nodes per workgroup. Job planning
-    * bounds the count before it reaches this helper. */
-   assert(args->job_count <= UINT32_MAX / 8);
-   VkPipeline pipeline;
-   VkPipelineLayout layout;
-   VkResult result = get_pipeline_spv(
-      dev, "hk-agx3-node-encode", agx3_node_spv, sizeof(agx3_node_spv),
-      sizeof(*args), &pipeline, &layout);
-   if (result != VK_SUCCESS)
-      return result;
-
-   vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline);
-   vk_common_CmdPushConstants(command_buffer, layout,
-                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*args), args);
-   hk_cmd_dispatch_unaligned(command_buffer, args->job_count * 8, 1, 1);
-   return VK_SUCCESS;
-}
-
-VkResult
-hk_cmd_finalize_agx3_as(VkCommandBuffer command_buffer,
-                       const struct hk_agx3_envelope_args *args)
-{
-   VK_FROM_HANDLE(hk_cmd_buffer, m5_dispatch_cmd, command_buffer);
-   struct hk_device *m5_dispatch_dev = hk_cmd_buffer_device(m5_dispatch_cmd);
-   if (hk_agx3_as_format_for_chip(m5_dispatch_dev->dev.chip) == HK_AGX3_AS_FORMAT_M5)
-      return hk_m5_backend_cmd_finalize_agx3_as(command_buffer, args);
-
-   VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX3C &&
-       !dev->g17p_native_as)
-      return VK_ERROR_FEATURE_NOT_PRESENT;
-   if (!args->job_count)
-      return VK_SUCCESS;
-
-   VkPipeline pipeline;
-   VkPipelineLayout layout;
-   VkResult result = get_pipeline_spv(
-      dev, "hk-agx3-as-envelope", agx3_envelope_spv, sizeof(agx3_envelope_spv),
-      sizeof(*args), &pipeline, &layout);
-   if (result != VK_SUCCESS)
-      return result;
-
-   vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline);
-   vk_common_CmdPushConstants(command_buffer, layout,
-                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*args), args);
-   hk_cmd_dispatch_unaligned(command_buffer, ALIGN_POT(args->job_count, 64), 1, 1);
-   return VK_SUCCESS;
-}
-
-VkResult
 hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                         const struct hk_agx3_plan_args *args,
                         VkDeviceAddress node_status,
@@ -1828,7 +1758,6 @@ hk_gen1_rq_finish(struct hk_device *dev)
    dev->gen1_rq_code_alias=NULL;dev->gen1_rq_bound_maps=0;
    dev->gen1_native_rq=false;
    dev->gen1_vertex_directory = NULL;
-   dev->gen1_vertex_directory_va = NULL;
    hk_gen1_sparse_finish(dev, &dev->gen1_vertex_directory_pages);
    if (dev->gen1_vertex_tables) {
       hash_table_foreach(dev->gen1_vertex_tables, entry)
@@ -2055,12 +1984,10 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
                                HK_GEN1_AS_TABLE_ENTRIES - 1)) {
          dev->gen1_vertex_directory = *util_dynarray_element(
             &dev->gen1_vertex_directory_pages.pages, struct agx_bo *, 0);
-         dev->gen1_vertex_directory_va = dev->gen1_vertex_directory_pages.va;
       } else {
          mesa_loge("Gen1 vertex table directory unavailable");
          hk_gen1_sparse_finish(dev, &dev->gen1_vertex_directory_pages);
          dev->gen1_vertex_directory = NULL;
-         dev->gen1_vertex_directory_va = NULL;
       }
       /* GPU-only live metadata: builds/copies initialize all64 bytes. */
       const bool tables_ok =

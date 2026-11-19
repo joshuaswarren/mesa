@@ -62,7 +62,11 @@ agx_chip_from_params(const struct drm_asahi_params_global *params)
          /* The M4 Pro (T6040) on the G17 kernel runtime takes the A18 Pro's
           * contract: its firmware has the A18 Pro firmware's interface, and
           * every G16S axis in these tables (AGX3B, HAL200, Gen9, Gen4-HAL200,
-          * 32-byte sampler heap, dual submission) equals G17P's.
+          * 32-byte sampler heap, dual submission) equals G17P's. The M4 Max
+          * (T6041) below takes it for the same reason. G17P therefore names
+          * the AGX3B + HAL200 profile of three SoCs, not the A18 Pro alone:
+          * a performance gate on it needs rows on those parts (see enum
+          * agx_chip).
           */
          if (params->chip_id == 0x6040 &&
              params->usc_generation == AGX_ISA_AGX3 &&

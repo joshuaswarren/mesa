@@ -231,14 +231,6 @@ mark_mip_chain(uint32_t generation, struct agx_pbe_agx3_descriptor *out, uint32_
  * array is still dimension 3, and depth - 1 for a 3D texture.
  */
 bool
-agx_pbe_g18_layered_pack(const struct agx_pbe_agx3_2d_fields *fields,
-                         uint32_t dimension, uint32_t layers,
-                         struct agx_pbe_agx3_descriptor *out)
-{
-   return agx_pbe_g18_layered_mip_pack(fields, dimension, layers, 0, 1, out);
-}
-
-bool
 agx_pbe_g18_layered_mip_pack(const struct agx_pbe_agx3_2d_fields *fields,
                              uint32_t dimension, uint32_t layers,
                              uint32_t level, uint32_t levels,

@@ -65,6 +65,8 @@ bool agx_nir_opt_sink_loop_sample_uses(struct nir_shader *shader);
 bool agx_nir_opt_hoist_loop_samples(struct nir_shader *shader);
 bool agx_nir_fuse_algebraic_late(struct nir_shader *shader);
 bool agx_nir_fuse_doubled_add(struct nir_shader *shader);
+bool agx_nir_fold_byte_to_float(struct nir_shader *shader);
+bool agx_nir_fold_ubyte_to_float(struct nir_shader *shader);
 bool agx_nir_fence_images(struct nir_shader *shader);
 bool agx_nir_lower_layer(struct nir_shader *s);
 bool agx_nir_lower_clip_distance(struct nir_shader *s);
@@ -136,7 +138,7 @@ typedef struct nir_def *(*agx_buffer_texture_metadata_cb)(
    struct nir_builder *b, struct nir_tex_instr *tex);
 bool agx_nir_lower_texture_with_buffer_metadata_cb(
    struct nir_shader *s, unsigned generation,
-   agx_buffer_texture_metadata_cb buffer_metadata);
+   agx_buffer_texture_metadata_cb buffer_metadata, bool robust_texel_fetch);
 bool agx_nir_lower_multisampled_image_store(struct nir_shader *s);
 bool agx_nir_lower_multisampled_image_store_for_generation(struct nir_shader *s,
                                                          unsigned generation);
@@ -202,9 +204,6 @@ agx_g17p_pack_image_atomic_sw(uint64_t level_offset_B, unsigned tile_width_px,
  * admits the shapes only G17P's backend encodes (agx_optimizer_inline_imm). */
 bool agx_nir_lower_g17p_indexed_samplers(struct nir_shader *s, bool g17p);
 bool agx_nir_lower_g17g_indexed_reads(struct nir_shader *s);
-/* Packed native32 array handles are byte offsets; sampler handles already
- * name their native entry, including the reserved texel-fetch sampler0. */
-bool agx_nir_lower_g17p_native32_samplers(struct nir_shader *s, uint8_t texture_set);
 
 struct agx_g17p_combined_sampler_binding {
    uint32_t texture_offset_B;
@@ -287,7 +286,6 @@ bool agx_nir_lower_g17p_combined_sampler(
  * Initially admit only a single 2D float sample at explicit level zero. */
 bool agx_nir_lower_g17g_combined_sampler(
    struct nir_shader *s, struct agx_g17p_combined_sampler_binding *binding);
-bool agx_nir_lower_g17g_indexed_samplers(struct nir_shader *s);
 bool agx_nir_lower_g17g_indexed_reads(struct nir_shader *s);
 
 /* Turn the one statically indexed set-0 Gen9 texture used by the initial

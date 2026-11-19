@@ -20,10 +20,6 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
 #include "hk_build_interface.h"
 
-#ifndef HK_AGX3_GEN1
-#define HK_AGX3_GEN1 0
-#endif
-
 layout(local_size_x = 64) in;
 layout(push_constant) uniform CONSTS
 {
@@ -320,7 +316,7 @@ emit(uint id)
    uint slots = leaf ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
                            ? 2u * count
                            : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
-                                ? HK_AGX3_GEN1 != 0 ? count : (count * HK_AGX3_M5_AABB_RECORD_B + 63u) / 64u
+                                ? (count * HK_AGX3_M5_AABB_RECORD_B + 63u) / 64u
                                 : count + (count + 3u) / 4u) : count;
    uint first = atomicAdd(DEREF(args.state).next_slot, slots);
    if (slots > args.slot_bound || first > args.slot_bound - slots) {
@@ -436,14 +432,12 @@ void
 main()
 {
    uint id = gl_GlobalInvocationID.x;
-#if !HK_AGX3_GEN1
    /* The single-leaf phase is dispatched by the M5 backend only. */
    if (args.phase == 5) {
       if (id == 0)
          plan_single_leaf();
       return;
    }
-#endif
    if (args.phase == 0) {
       initialize(id);
       return;

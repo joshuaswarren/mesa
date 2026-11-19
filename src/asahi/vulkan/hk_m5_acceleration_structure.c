@@ -388,59 +388,6 @@ get_pipeline_spv(struct hk_device *dev, const char *name, const uint32_t *spv,
                                           name, key_size, pipeline);
 }
 
-VkResult
-hk_m5_backend_cmd_encode_agx3_nodes(VkCommandBuffer command_buffer,
-                        const struct hk_agx3_leaf_args *args)
-{
-   VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!args->job_count)
-      return VK_SUCCESS;
-
-   /* The native phase uses eight invocations per independently writable
-    * node. Job planning bounds the count before it reaches this helper. */
-   assert(args->job_count <= UINT32_MAX / 8);
-   VkPipeline pipeline;
-   VkPipelineLayout layout;
-   VkResult result = get_pipeline_spv(
-      dev, "hk-agx3-node-encode", agx3_node_spv, sizeof(agx3_node_spv),
-      sizeof(*args), &pipeline, &layout);
-   if (result != VK_SUCCESS)
-      return result;
-
-   vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline);
-   vk_common_CmdPushConstants(command_buffer, layout,
-                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*args), args);
-   hk_cmd_dispatch_unaligned(command_buffer, args->job_count * 8, 1, 1);
-   return VK_SUCCESS;
-}
-
-VkResult
-hk_m5_backend_cmd_finalize_agx3_as(VkCommandBuffer command_buffer,
-                       const struct hk_agx3_envelope_args *args)
-{
-   VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!args->job_count)
-      return VK_SUCCESS;
-
-   VkPipeline pipeline;
-   VkPipelineLayout layout;
-   VkResult result = get_pipeline_spv(
-      dev, "hk-agx3-as-envelope", agx3_envelope_spv, sizeof(agx3_envelope_spv),
-      sizeof(*args), &pipeline, &layout);
-   if (result != VK_SUCCESS)
-      return result;
-
-   vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline);
-   vk_common_CmdPushConstants(command_buffer, layout,
-                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*args), args);
-   hk_cmd_dispatch_unaligned(command_buffer, args->job_count, 1, 1);
-   return VK_SUCCESS;
-}
-
 static VkResult
 hk_cmd_build_agx3_from_ir_mode(VkCommandBuffer command_buffer,
                         const struct hk_agx3_plan_args *args,

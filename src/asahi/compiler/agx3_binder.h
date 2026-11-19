@@ -63,9 +63,6 @@ bool agx3_bind_compose(enum agx_isa_encoding encoding, const char *mnemonic,
                        const struct agx3_field_kv *overrides,
                        unsigned noverrides, uint8_t *out, uint8_t *len);
 
-/* Whether this build carries the agx3d table (AGX3_HAVE_AGX3D_TABLE). */
-bool agx3_bind_have_agx3d(void);
-
 /*
  * The encoding point a core encoder that has grounded its field vector for
  * G18G passes: its own agx3b/agx3c `ep` unchanged, Apple's order for AGX3D.

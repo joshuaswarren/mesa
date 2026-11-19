@@ -64,4 +64,13 @@ if with_tests
     ),
     suite : 'poly',
   )
+  test(
+    'poly-heap-math',
+    executable(
+      'poly-heap-math',
+      '../tests/poly_heap_math_tests.c',
+      include_directories : [inc_poly],
+    ),
+    suite : 'poly',
+  )
 endif

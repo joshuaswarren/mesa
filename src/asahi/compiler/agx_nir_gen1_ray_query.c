@@ -1220,14 +1220,6 @@ unsupported:
 }
 
 
-nir_def *
-agx_nir_gen1_candidate_count(nir_builder *b, nir_def *query, nir_def *lane)
-{
-   nir_def *word = nir_load_scs_indexed_agx(b, 1, 32, query, lane,
-      .base=1792, .component=2);
-   return nir_iand_imm(b, nir_ushr_imm(b, word, 21), 15);
-}
-
 struct agx_gen1_ray_candidate
 agx_nir_gen1_load_candidate(nir_builder *b, nir_def *query,
                            nir_def *lane, nir_def *index)

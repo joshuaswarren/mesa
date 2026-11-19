@@ -28,10 +28,6 @@
 
 #include "hk_build_interface.h"
 
-#ifndef HK_AGX3_GEN1
-#define HK_AGX3_GEN1 0
-#endif
-
 layout(local_size_x = 8) in;
 layout(push_constant) uniform CONSTS
 {
@@ -226,7 +222,7 @@ main()
    bool instances = job.node_kind == HK_AGX3_NODE_INSTANCES;
    bool aabbs = job.node_kind == HK_AGX3_NODE_AABBS;
    /* Bounding-box record stride: the 48-byte native record (class 4). */
-   uint aabb_stride = HK_AGX3_GEN1 != 0 ? 64u : HK_AGX3_M5_AABB_RECORD_B;
+   uint aabb_stride = HK_AGX3_M5_AABB_RECORD_B;
    if (count < 1u || count > 8 ||
        job.node_kind > HK_AGX3_NODE_AABBS) {
       if (lane == 0)
@@ -255,7 +251,7 @@ main()
             if (lower[lane][a] > upper[lane][a])
                atomicOr(bad, HK_AGX3_LEAF_RANGE);
          }
-         if (aabbs && HK_AGX3_GEN1 == 0) {
+         if (aabbs) {
             REF(vk_ir_aabb_node) box = REF(vk_ir_aabb_node)(
                OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
             /* The native record keeps the geometry id in the low 30 bits and
@@ -324,13 +320,13 @@ main()
           * single-AABB geometries passed). */
          root[0] =
             uint64_t((instances ? 0xe1u
-                      : aabbs ? (HK_AGX3_GEN1 != 0 ? 0xa0u : 0x81u)
+                      : aabbs ? 0x81u
                       : 0xa0u) |
                      (leaf ? capacity << 1 : 0u) | (exponent.x << 8));
          for (uint a = 0; a < 3; ++a)
             root[a + 1] = uint64_t(floatBitsToUint(base[a]) >> 16);
          root[4] = uint64_t((exponent.y << 8) | exponent.z);
-         uint child = job.child_slot + (HK_AGX3_GEN1 != 0 ? args.slot_bias : 0);
+         uint child = job.child_slot;
          root[5] = uint64_t(child >> 16);
          root[6] = uint64_t(child & 65535u);
          /* Leaf type 24 is the native bounding-box record marker. Bits 6..7
@@ -381,9 +377,6 @@ main()
    if (instances && lane < count)
       encode_instance(job, lane);
    if (aabbs && lane < count) {
-      if (HK_AGX3_GEN1 != 0)
-         for (uint i = 0; i < 16; ++i)
-            store32(children + uint64_t(lane) * 64ul + uint64_t(i) * 4ul, 0);
       /* 48-byte native bounding-box record (HK_AGX3_M5_AABB_RECORD_B). */
       uint64_t record = children + uint64_t(lane) * uint64_t(aabb_stride);
       store32(record, 0x18u);

@@ -1478,6 +1478,91 @@ agx_upload_depth_bias(struct agx_batch *batch,
  * to add surfaces to the BO list here. Instead we added them when flushing.
  */
 
+/* AGX_ZS_MERGE=0 ends the batch at every such framebuffer switch again. */
+DEBUG_GET_ONCE_BOOL_OPTION(zs_merge, "AGX_ZS_MERGE", true)
+
+static bool
+agx_fb_has_colour(const struct pipe_framebuffer_state *fb)
+{
+   for (unsigned i = 0; i < fb->nr_cbufs; ++i) {
+      if (fb->cbufs[i].texture)
+         return true;
+   }
+   return false;
+}
+
+/* If the app binds a framebuffer with only a depth/stencil surface, and an
+ * active render batch already renders to that same surface with the same
+ * size, keep drawing into that batch: the draws are those of the batch's
+ * framebuffer with every colour write masked. Each switch otherwise ends the
+ * render pass and stores and reloads every attachment. */
+static void
+agx_try_zs_merge(struct agx_context *ctx,
+                 const struct pipe_framebuffer_state *state)
+{
+   if (!debug_get_option_zs_merge() || !state->zsbuf.texture ||
+       agx_fb_has_colour(state) || state->resolve || state->viewmask)
+      return;
+
+   struct agx_batch *best = NULL;
+   for (unsigned idx = 0; idx < AGX_MAX_BATCHES; ++idx) {
+      if (!BITSET_TEST(ctx->batches.active, idx))
+         continue;
+      struct agx_batch *b = &ctx->batches.slots[idx];
+      if (agx_batch_is_compute(b) || !agx_fb_has_colour(&b->key) ||
+          b->key.resolve || b->key.viewmask ||
+          b->key.width != state->width || b->key.height != state->height ||
+          b->key.samples != state->samples ||
+          b->key.layers != state->layers ||
+          !pipe_surface_equal(&b->key.zsbuf, &state->zsbuf))
+         continue;
+      if (!best || b->seqnum > best->seqnum)
+         best = b;
+   }
+   if (!best)
+      return;
+
+   util_copy_framebuffer_state(&ctx->zs_merge_real, state);
+   util_copy_framebuffer_state(&ctx->framebuffer, &best->key);
+   ctx->zs_merge = true;
+}
+
+/* A merged draw that samples or binds as an image one of the batch's colour
+ * targets would read memory the batch has not stored yet: undo the merge so
+ * the normal path ends the batch first. */
+static void
+agx_check_zs_merge(struct agx_context *ctx)
+{
+   if (!ctx->zs_merge)
+      return;
+
+   for (unsigned stage = 0; stage < ARRAY_SIZE(ctx->stage); ++stage) {
+      for (unsigned i = 0; i < ctx->stage[stage].texture_count; ++i) {
+         struct agx_sampler_view *tex = ctx->stage[stage].textures[i];
+         if (!tex)
+            continue;
+         for (unsigned cb = 0; cb < ctx->framebuffer.nr_cbufs; ++cb) {
+            if (ctx->framebuffer.cbufs[cb].texture == &tex->rsrc->base)
+               goto unmerge;
+         }
+      }
+      u_foreach_bit64(i, ctx->stage[stage].image_mask) {
+         struct pipe_resource *r = ctx->stage[stage].images[i].resource;
+         for (unsigned cb = 0; cb < ctx->framebuffer.nr_cbufs; ++cb) {
+            if (r && ctx->framebuffer.cbufs[cb].texture == r)
+               goto unmerge;
+         }
+      }
+   }
+   return;
+
+unmerge:
+   util_copy_framebuffer_state(&ctx->framebuffer, &ctx->zs_merge_real);
+   ctx->zs_merge = false;
+   ctx->batch = NULL;
+   agx_dirty_all(ctx);
+}
+
 static void
 agx_set_framebuffer_state(struct pipe_context *pctx,
                           const struct pipe_framebuffer_state *state)
@@ -1489,6 +1574,7 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
 
    util_copy_framebuffer_state(&ctx->framebuffer, state);
    ctx->g17g_mrt_spills_known = false;
+   ctx->zs_merge = false;
 
    /* The frontend still reads and resolves the window's multisample colour
     * attachment. G17G/G18G's direct EOT resolve only writes the single-sample
@@ -1511,6 +1597,8 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
 
    agx_legalize_compression(ctx, agx_resource(ctx->framebuffer.zsbuf.texture),
                             ctx->framebuffer.zsbuf.format);
+
+   agx_try_zs_merge(ctx, state);
 
    ctx->batch = NULL;
    agx_dirty_all(ctx);
@@ -4007,8 +4095,19 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    const enum agx_descriptor_generation descriptor_generation =
       agx_gallium_descriptor_generation(dev->chip);
    if (agx_native_graphics(dev))
+   {
+      /* Texel fetches get G17P's explicit out-of-view predicate only in
+       * robust contexts: elsewhere an out-of-range texelFetch is undefined
+       * (GL 4.6, 8.6) and the hardware fetch is memory-safe. Shader packs'
+       * full-screen passes spent 5-7 instructions on every fetch.
+       * ASAHI_GL_ROBUST_TEXEL_FETCH=1 keeps the predicate everywhere. */
+      static int force = -1;
+      if (force < 0)
+         force = debug_get_bool_option("ASAHI_GL_ROBUST_TEXEL_FETCH", false);
       NIR_PASS(_, nir, agx_nir_lower_texture_with_buffer_metadata_cb,
-               descriptor_generation, agx_buffer_texture_metadata);
+               descriptor_generation, agx_buffer_texture_metadata,
+               robust || force);
+   }
    else
       NIR_PASS(_, nir, agx_nir_lower_texture_for_generation,
                descriptor_generation |
@@ -4071,6 +4170,10 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    nir_serialize(&so->serialized_nir, nir, true);
    _mesa_blake3_compute(so->serialized_nir.data, so->serialized_nir.size,
                       so->nir_blake3);
+   so->source_hash = (uint32_t)nir->info.source_blake3[0] << 24 |
+                     (uint32_t)nir->info.source_blake3[1] << 16 |
+                     (uint32_t)nir->info.source_blake3[2] << 8 |
+                     nir->info.source_blake3[3];
 
    so->has_xfb_info = (nir->xfb_info != NULL);
 
@@ -5021,6 +5124,27 @@ agx_update_fs(struct agx_batch *batch)
                               : 0,
    };
    agx_fs_epilog_apply_device_policy(dev->chip, &link_key.epilog.fs);
+   /* A fully masked G18 draw with no shader side effects uses the
+    * colour-free ISP state (fragment_writes_nothing). Do not invent tile
+    * loads/stores just to preserve its colour: those prevent the linker
+    * from recognizing the no-op fragment, and the resulting multisample
+    * preservation program cannot run for stencil-only browser draws.
+    *
+    * Keep preservation when any part can update coverage, depth, stencil,
+    * memory or another colour attachment. Such programs are not no-ops.
+    */
+   if (dev->chip == AGX_CHIP_G18G && agx_g18_native_mixed_enabled() &&
+       !(ctx->blend->store &
+         (PIPE_CLEAR_COLOR0 * BITFIELD_MASK(batch->key.nr_cbufs))) &&
+       ctx->fs->b.info.tag_write_disable &&
+       !link_key.prolog.fs.cull_distance_size &&
+       !link_key.prolog.fs.polygon_stipple &&
+       link_key.prolog.fs.api_sample_mask == 0xff &&
+       !link_key.epilog.fs.defer_api_sample_mask &&
+       !link_key.epilog.fs.link.write_z && !link_key.epilog.fs.link.write_s &&
+       !link_key.epilog.fs.link.sample_shading &&
+       !ctx->blend->key.alpha_to_coverage)
+      link_key.epilog.fs.preserve_zero_mask = false;
    /* G17S (and G17C, the same core) share G17P's tile behaviour: a covered
     * fragment with no tile store still dirties the tile, which then stores
     * undefined colour at EOT. Measured on the M5 Pro: a draw with every
@@ -5069,6 +5193,10 @@ agx_update_fs(struct agx_batch *batch)
 
    memcpy(&link_key.epilog.fs.blend, &ctx->blend->key,
           sizeof(link_key.epilog.fs.blend));
+   if (ctx->zs_merge) {
+      for (unsigned i = 0; i < ARRAY_SIZE(link_key.epilog.fs.blend.rt); ++i)
+         link_key.epilog.fs.blend.rt[i].colormask = 0;
+   }
 
    /* A split G17G draw (agx_g17g_split_mrt) binds attachment g17g_mrt_rt
     * alone, at slot 0, and the variant moved its output to location 0:
@@ -14872,6 +15000,34 @@ agx_legalize_feedback_loop_surf(struct agx_context *ctx,
       agx_flush_writer(ctx, rsrc, "Feedback loop");
 }
 
+/*
+ * The sampler views a stage's shader can read: the bindful textures, the only
+ * views agx_upload_textures() gives the hardware. A stage without a shader
+ * reads none.
+ */
+static unsigned
+agx_nr_textures_read(const struct agx_context *ctx, mesa_shader_stage stage)
+{
+   const struct agx_stage *s = &ctx->stage[stage];
+
+   if (!s->shader)
+      return 0;
+
+   return MIN2(s->texture_count, s->shader->info.nr_bindful_textures);
+}
+
+/*
+ * Only views the draw's shaders read can form a loop. Gallium keeps a view
+ * bound until it is replaced, and st/mesa leaves a stage's views alone while
+ * the bound program samples nothing there, so a view of an attachment is
+ * often still bound when nothing reads it: a shadow map sampled by the main
+ * pass, then rendered again by a depth-only program without samplers.
+ * Counting such a view would decompress the attachment for good. So skip the
+ * compute stage, whose dispatches never run inside a draw, and the slots a
+ * stage's shader does not read. Which slots those are depends on the shader,
+ * so check a stage again when its shader changes as well as its views; a new
+ * framebuffer or batch dirties every stage.
+ */
 static void
 agx_legalize_feedback_loops(struct agx_context *ctx)
 {
@@ -14880,10 +15036,19 @@ agx_legalize_feedback_loops(struct agx_context *ctx)
       return;
 
    for (unsigned stage = 0; stage < ARRAY_SIZE(ctx->stage); ++stage) {
-      if (!(ctx->stage[stage].dirty & AGX_STAGE_DIRTY_IMAGE))
+      if (stage == MESA_SHADER_COMPUTE)
          continue;
 
-      for (unsigned i = 0; i < ctx->stage[stage].texture_count; ++i) {
+      bool new_shader =
+         (stage == MESA_SHADER_VERTEX && (ctx->dirty & AGX_DIRTY_VS_PROG)) ||
+         (stage == MESA_SHADER_FRAGMENT && (ctx->dirty & AGX_DIRTY_FS_PROG));
+
+      if (!(ctx->stage[stage].dirty & AGX_STAGE_DIRTY_IMAGE) && !new_shader)
+         continue;
+
+      unsigned nr_read = agx_nr_textures_read(ctx, stage);
+
+      for (unsigned i = 0; i < nr_read; ++i) {
          if (!ctx->stage[stage].textures[i])
             continue;
 
@@ -15411,6 +15576,210 @@ agx_draw_patches_split(struct agx_context *ctx,
    ctx->cond_query = cond_query;
 }
 
+/* Multi-draws (glMultiDrawElements*, Sodium's terrain) arrive as one
+ * pipe_draw_vbo with hundreds of sub-draws that share every bound state.
+ * util_draw_multi() sends each through agx_draw_vbo(), which re-validates
+ * shaders, descriptors, feedback loops and queries per sub-draw: ~0.1 us of
+ * CPU each, 1.5 ms per frame at Minecraft's 15k draws. Once a full draw has
+ * left the context clean, a following sub-draw with the same state only needs
+ * its index list record: agx_encode_state() would emit nothing for it anyway.
+ * Anything that varies per sub-draw (draw ID or base parameters in uniforms,
+ * statistics, geometry or tessellation stages, transform feedback, misaligned
+ * indices) keeps the full path. AGX_FAST_MULTIDRAW=0 disables this.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(fast_multidraw, "AGX_FAST_MULTIDRAW", true)
+
+static void agx_draw_vbo(struct pipe_context *pctx,
+                         const struct pipe_draw_info *info,
+                         unsigned drawid_offset,
+                         const struct pipe_draw_indirect_info *indirect,
+                         const struct pipe_draw_start_count_bias *draws,
+                         unsigned num_draws);
+
+static bool
+agx_multidraw_state_clean(const struct agx_context *ctx)
+{
+   if (ctx->dirty)
+      return false;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(ctx->stage); ++i) {
+      if (i != MESA_SHADER_COMPUTE && ctx->stage[i].dirty)
+         return false;
+   }
+
+   return true;
+}
+
+/* Is everything agx_draw_vbo() redoes per sub-draw a function of the bound
+ * state alone? Checked once per multi-draw, after its first full draw. */
+static bool
+agx_multidraw_can_skip(struct agx_context *ctx,
+                       const struct pipe_draw_info *info)
+{
+   if (!ctx->vs || !ctx->linked.vs || !ctx->fs || !ctx->linked.fs ||
+       ctx->gs || ctx->stage[MESA_SHADER_GEOMETRY].shader ||
+       ctx->stage[MESA_SHADER_TESS_EVAL].shader || ctx->in_tess ||
+       ctx->swtnl_inner || ctx->active_draw_without_restart ||
+       ctx->streamout.num_targets || info->mode == MESA_PRIM_PATCHES)
+      return false;
+
+   if (ctx->vs->b.info.uses_draw_id || ctx->linked.vs->uses_base_param)
+      return false;
+
+   if (ctx->active_queries) {
+      if (ctx->prims_generated[0])
+         return false;
+
+      for (unsigned i = 0; i < ARRAY_SIZE(ctx->pipeline_statistics); ++i) {
+         if (ctx->pipeline_statistics[i])
+            return false;
+      }
+   }
+
+   bool xfb_passthrough = false;
+   return !agx_needs_passthrough_gs(ctx, info, NULL, &xfb_passthrough, false);
+}
+
+static void
+agx_multidraw_emit_body(struct agx_context *ctx, struct agx_batch *batch,
+                        const struct pipe_draw_info *info,
+                        const struct pipe_draw_start_count_bias *d,
+                        uint64_t ib, size_t ib_extent)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+
+   if (ctx->time_elapsed)
+      agx_batch_add_timestamp_query(batch, ctx->time_elapsed);
+
+   agx_ensure_cmdbuf_has_space(
+      batch, &batch->vdm,
+      AGX_VDM_STATE_UPDATE_LENGTH + AGX_VDM_HAL200_BIND_TAIL_LENGTH +
+         AGX_VDM_HAL200_DRAW_STATE_POINTER_LENGTH +
+         AGX_VDM_HAL200_INDEXED_DRAW_BODY_LENGTH + AGX_VDM_BARRIER_LENGTH);
+
+   struct agx_draw draw = {0};
+   if (info->index_size) {
+      draw.index_size = agx_translate_index_size(info->index_size);
+      draw.index_buffer = ib;
+      draw.index_buffer_range_B = ib_extent;
+      draw.restart = info->primitive_restart;
+      draw.indexed = true;
+      draw.index_bias = d->index_bias;
+   } else {
+      draw.start = d->start;
+   }
+   draw.b = agx_3d(d->count, info->instance_count, 1);
+
+   batch->vdm.current = agx_g17p_emit_draw_body(
+      dev->chip, batch->vdm.current, &draw, agx_primitive_for_pipe(info->mode),
+      info->restart_index, 0);
+   assert((batch->vdm.current + AGX_VDM_STREAM_LINK_LENGTH) <= batch->vdm.end &&
+          "Failed to reserve sufficient space in encoder");
+
+   batch->draws++;
+
+   if (unlikely(dev->debug & AGX_DBG_PERF))
+      ctx->perf.draws++;
+
+   /* Same limits as the end of agx_draw_vbo() */
+   if (unlikely(
+          (((batch->scissor.size / AGX_SCISSOR_LENGTH) + AGX_MAX_VIEWPORTS) >
+           UINT16_MAX) ||
+          (batch->depth_bias.size / AGX_DEPTH_BIAS_LENGTH) >= UINT16_MAX)) {
+      agx_flush_batch_for_reason(ctx, batch, "Scissor/depth bias overflow");
+   } else if (unlikely(batch->draws > 100000)) {
+      agx_flush_batch_for_reason(ctx, batch, "Absurd number of draws");
+   }
+}
+
+static void
+agx_draw_multi(struct pipe_context *pctx, const struct pipe_draw_info *info,
+               unsigned drawid_offset,
+               const struct pipe_draw_indirect_info *indirect,
+               const struct pipe_draw_start_count_bias *draws,
+               unsigned num_draws)
+{
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_device *dev = agx_device(pctx->screen);
+
+   if (indirect || !agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip) ||
+       dev->chip == AGX_CHIP_G18G || !debug_get_option_fast_multidraw()) {
+      util_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
+      return;
+   }
+
+   unsigned drawid = drawid_offset;
+   struct agx_batch *clean = NULL;
+   int can_skip = -1;
+   /* Index buffer of the clean batch: its read is already recorded */
+   uint64_t ib_base = 0;
+   size_t ib_size = 0;
+
+   for (unsigned i = 0; i < num_draws; i++) {
+      const struct pipe_draw_start_count_bias *d = &draws[i];
+
+      if (d->count && info->instance_count) {
+         const uint64_t offset = (uint64_t)d->start * info->index_size;
+         uint64_t ib = 0;
+         size_t ib_extent = 0;
+         bool fast = clean != NULL;
+
+         if (fast && info->index_size) {
+            if (info->has_user_indices) {
+               ib = agx_index_buffer_ptr(clean, info, d, &ib_extent);
+            } else if (((ib_base + offset) & 3) || offset >= ib_size) {
+               /* agx_draw_vbo() realigns these through a synchronizing map */
+               fast = false;
+            } else {
+               ib = ib_base + offset;
+               ib_extent =
+                  ALIGN_POT(MIN2(ib_size - offset,
+                                 (uint64_t)d->count * info->index_size), 4);
+            }
+         }
+
+         if (fast) {
+            agx_multidraw_emit_body(ctx, clean, info, d, ib, ib_extent);
+         } else {
+            struct agx_batch *before = ctx->batch;
+            const unsigned before_draws = before ? before->draws : 0;
+
+            agx_draw_vbo(pctx, info, drawid, NULL, d, 1);
+
+            clean = NULL;
+            if (ctx->batch && !agx_batch_is_compute(ctx->batch) &&
+                (ctx->batch != before || ctx->batch->draws != before_draws) &&
+                agx_multidraw_state_clean(ctx)) {
+               if (can_skip < 0)
+                  can_skip = agx_multidraw_can_skip(ctx, info);
+               if (can_skip)
+                  clean = ctx->batch;
+            }
+
+            /* Bindings do not change within the multi-draw, so the checks
+             * agx_draw_vbo() makes before acquiring its batch give the same
+             * answer for every later sub-draw: make them once, now that the
+             * batch exists. A feedback loop flushes or dirties here and keeps
+             * the full path. */
+            if (clean) {
+               agx_legalize_feedback_loops(ctx);
+               if (ctx->batch != clean || !agx_multidraw_state_clean(ctx))
+                  clean = NULL;
+            }
+
+            if (clean && info->index_size && !info->has_user_indices)
+               ib_base = agx_index_buffer_rsrc_ptr(clean, info, &ib_size);
+         }
+
+         if (clean && ctx->batch != clean)
+            clean = NULL;
+      }
+
+      if (info->increment_draw_id)
+         drawid++;
+   }
+}
+
 static void
 agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
              unsigned drawid_offset,
@@ -15423,7 +15792,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       return;
 
    if (num_draws > 1) {
-      util_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
+      agx_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
       return;
    }
 
@@ -15655,6 +16024,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
     * getting the batch, since once we have the batch we're not allowed to flush
     * the bound render targets.
     */
+   agx_check_zs_merge(ctx);
    agx_legalize_feedback_loops(ctx);
    agx_legalize_xfb(ctx);
 
@@ -16023,8 +16393,10 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       }
 
       /* TODO: Any point to tracking load? */
-      batch->draw |= store;
-      batch->resolve |= store;
+      if (!ctx->zs_merge) {
+         batch->draw |= store;
+         batch->resolve |= store;
+      }
    }
 
    if (ctx->dirty & AGX_DIRTY_ZS) {
@@ -16174,6 +16546,8 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    assert(batch == agx_get_batch(ctx) && "batch should not change under us");
 
    batch->draws++;
+   if (ctx->stage[MESA_SHADER_FRAGMENT].shader)
+      batch->last_fs_source = ctx->stage[MESA_SHADER_FRAGMENT].shader->source_hash;
 
    if (unlikely(dev->debug & AGX_DBG_PERF))
       ctx->perf.draws++;
