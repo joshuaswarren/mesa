@@ -367,7 +367,6 @@ if with_tests
       'hk_agx3_ioto_program_core_test',
       files('tests/test-hk-agx3-ioto-program-core.c',
             'hk_agx3_ioto_program_core.c',
-            '../compiler/agx_g18_gates.c',
             '../compiler/agx3_compute_program.c',
             '../compiler/agx3_graphics_program.c',
             '../compiler/agx3_m5_graphics_program.c',

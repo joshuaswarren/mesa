@@ -1254,8 +1254,7 @@ agx_emit_local_store_pixel(agx_builder *b, nir_intrinsic_instr *instr)
    if (b->shader->stage == MESA_SHADER_FRAGMENT &&
        !b->shader->key->fs.ignore_tib_dependencies &&
        agx_is_g18g(&b->shader->key->dev) &&
-       (b->shader->key->fs.nr_samples == 2 || b->shader->key->fs.nr_samples == 4) &&
-       agx_g18_msaa4_enabled())
+       (b->shader->key->fs.nr_samples == 2 || b->shader->key->fs.nr_samples == 4))
       agx_signal_pix(b, 0xC);
 
    return st;
@@ -3518,7 +3517,6 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
        * byte. Only single-sample subsets at top level take this form. */
       if (b->shader->key->dev.emit_agx3d &&
           (g18_samples == 2 || g18_samples == 4) &&
-          agx_g18_native1128_enabled() &&
           !b->shader->key->fs.inside_sample_loop &&
           !b->shader->force_early_tests_pending && !no_tests &&
           nir_intrinsic_flags(instr) == AGX_SAMPLE_MASK_SUBSET_FULL_OR_KILL &&
@@ -3824,7 +3822,7 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
            !agx_is_g18g(&b->shader->key->dev)) ||
           (agx_is_g18g(&b->shader->key->dev) &&
            (b->shader->key->fs.nr_samples == 2 ||
-            b->shader->key->fs.nr_samples == 4) && agx_g18_msaa4_enabled())) {
+            b->shader->key->fs.nr_samples == 4))) {
          /* G17P/G18G covered samples are bits 0..3 of native W16 SR39, the word
           * Apple's multisample fragments AND with each sample's bit before
           * that sample's tile store. Unlike the API input mask, this changes
@@ -3849,15 +3847,14 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
        * so scheduling and CSE cannot reuse pre-depth coverage for tile stores.
        *
        * msaa163: G18G's four-sample tile lowering (agx_nir_lower_g18_tile_
-       * samples, AGX_G18_MSAA4) leaves it too. Apple's G18 4x fragment reads
+       * samples) leaves it too. Apple's G18 4x fragment reads
        * the same W16 SR39 into a half and passes it unmodified to lstcol
        * (rld 210a42000000: f21=39, f10/f24=1). */
       assert(((b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
                !agx_is_g18g(&b->shader->key->dev)) ||
               (agx_is_g18g(&b->shader->key->dev) &&
                (b->shader->key->fs.nr_samples == 2 ||
-                b->shader->key->fs.nr_samples == 4) &&
-               agx_g18_msaa4_enabled())) &&
+                b->shader->key->fs.nr_samples == 4))) &&
              "only the G17P/G18G tile lowerings leave this for the backend");
       assert(instr->def.bit_size == 16 && "16-bit sample mask");
       return agx_get_sr_coverage_to(b, dst, AGX_SR_INPUT_SAMPLE_MASK);
@@ -12212,7 +12209,7 @@ agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
     * target whose write mask is empty, so its lowest store may sit above
     * byte zero (five of the 39 fragments). */
    if (stores[store_count - 1]->pixel_offset != 0 && !subset &&
-       !(g18 && ctx->key->g18_native_mixed && agx_g18_native_mixed_enabled()))
+       !(g18 && ctx->key->g18_native_mixed))
       return false;
 
    if (unrolled_samples) {
@@ -16216,8 +16213,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
     * the same coverage-aware register-mask lowering for the main program. */
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C && key->dev.emit_agx3d &&
        nir->info.stage == MESA_SHADER_FRAGMENT &&
-       (key->fs.nr_samples == 2 || key->fs.nr_samples == 4) &&
-       agx_g18_msaa4_enabled())
+       (key->fs.nr_samples == 2 || key->fs.nr_samples == 4))
       NIR_PASS(_, nir, agx_nir_lower_g18_tile_samples, key->fs.nr_samples);
 
    if (is_agx3 && source_imul64)

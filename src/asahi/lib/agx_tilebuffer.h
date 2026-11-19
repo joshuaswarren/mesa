@@ -358,23 +358,6 @@ unsigned agx_g18g_word_mrt_mask(const struct agx_tilebuffer_layout *tib);
 unsigned agx_g18g_raw32_mrt_mask(const struct agx_tilebuffer_layout *tib);
 unsigned agx_g18g_ms_mrt_mask(const struct agx_tilebuffer_layout *tib);
 
-/* Native-1121 mixed-format single-sample G18 layouts (run 1130): the
- * imageblock bytes of a 32x32 tile for an admitted format list (zero if none),
- * and the attachment mask of an admitted layout. kernel_native_samples: the
- * kernel advertises DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES (run 1134),
- * tested in agx_device::params.features. */
-unsigned agx_g18g_mixed_tile_bytes(const enum pipe_format *formats,
-                                   unsigned nr_cbufs, unsigned nr_samples,
-                                   bool layered, bool kernel_native_samples);
-unsigned agx_g18g_mixed_mrt_mask(const struct agx_tilebuffer_layout *tib);
-/* Whether an all-clear (has_clear) or all-reload (has_load) background of an
- * admitted mixed-format layout is witnessed. */
-bool agx_g18g_mixed_bg_witnessed(const struct agx_tilebuffer_layout *tib,
-                                 bool has_clear, bool has_load);
-/* The same layouts in compacted end-of-tile key form. */
-unsigned
-agx_g18g_mixed_compact_mrt_mask(const struct agx_tilebuffer_layout *tib);
-
 /* Native-1130 general single-sample mixed-format G18 layouts (run 1139).
  * Apple packs the attachments in index order, each at the next offset aligned
  * to its tile lane width (holes take no space), in a 32x32 tile of an
@@ -383,7 +366,10 @@ agx_g18g_mixed_compact_mrt_mask(const struct agx_tilebuffer_layout *tib);
  * attachments of witnessed formats, not owned by the RGBA8/R32 word or
  * RGBA32/RG32 paths, and a tile the kernel admits -- and zero otherwise.
  * agx_build_tilebuffer_layout_g18_mixed() builds it; the gallium layout and the
- * fragment epilog both use it, so both compute the same offsets. */
+ * fragment epilog both use it, so both compute the same offsets.
+ * kernel_native_samples: the kernel advertises
+ * DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES, tested in
+ * agx_device::params.features. */
 unsigned
 agx_g18g_native_mixed_tile_bytes(const enum pipe_format *formats,
                                  unsigned nr_cbufs, unsigned nr_samples,
