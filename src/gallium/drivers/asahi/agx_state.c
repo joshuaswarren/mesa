@@ -3186,7 +3186,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
       /* AGX3 has no equivalent of the AGX2 machine code agx_fast_link()
        * splices around a linked fragment program to run it once per sample.
        * Apple's own compiler unrolls the body instead, once per sample, in one
-       * program (probes/README-g17p-per-sample-fragment.md).
+       * program.
        *
        * An unrolled main cannot carry a separate epilog: the stores the split
        * moves out -- colour, and depth/stencil, which it defers past discards

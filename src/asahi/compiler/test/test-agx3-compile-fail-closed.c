@@ -1027,9 +1027,8 @@ check_shared_atomic_compute(enum agx_isa_encoding encoding)
 }
 
 /*
- * Mirrors src/asahi/vulkan/tests/g17p_vulkan_compute.comp -- the G17P
- * milestone probe shader -- in the shape the AGX3 backend actually receives
- * it, i.e. after Honeykrisp lowering:
+ * Mirrors the G17P milestone compute probe shader in the shape the AGX3
+ * backend actually receives it, i.e. after Honeykrisp lowering:
  *
  *   - the deliberately-oversized 65-entry constant array becomes
  *     nir->constant_data plus a load_constant, and hk_nir_lower_descriptors.c
@@ -1065,7 +1064,7 @@ check_constant_data_compute(enum agx_isa_encoding encoding, bool soft_fault)
    b.shader->info.workgroup_size[2] = 1;
 
    /* Exactly the payload nir_opt_large_constants leaves behind for
-    * g17p_vulkan_compute.comp's deltas[65].
+    * the milestone probe's deltas[65].
     */
    uint32_t deltas[65];
    for (unsigned i = 0; i < ARRAY_SIZE(deltas); ++i)
@@ -1442,7 +1441,7 @@ lower_load_constant_like_hk(nir_builder *b, nir_intrinsic_instr *intr,
 }
 
 /*
- * g17p_vulkan_compute.comp's 65-entry deltas[] in the shape glslang and
+ * The milestone probe's 65-entry deltas[] in the shape glslang and
  * nir_lower_variable_initializers hand to the driver: a function_temp array
  * filled by constant stores in one block, then read at a dynamic index.
  * 65 * 4 == 260 bytes, deliberately just over the 256-byte threshold of the

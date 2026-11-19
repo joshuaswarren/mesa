@@ -16,9 +16,8 @@
  *    fdepth, vmain and its four pipeline variants, cbits, csimd, catomic);
  *  - `applegpu-nt -platform_version macos 26.0 26.0 -arch applegpu_g17p`,
  *    which reproduces all thirteen of those shaders byte-for-byte from source
- *    and therefore serves as a probeable oracle. The probe names in the
- *    comments (fn_*, c_*) are the ones recorded in
- *    /tmp/g17p-re/notes/agx3-producers-implemented.md.
+ *    and therefore serves as a probeable oracle. The comments name each
+ *    probe kernel (fn_*, c_*).
  *
  * If any of these stops matching, the backend is emitting something Apple's
  * hardware was never asked to execute.

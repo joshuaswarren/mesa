@@ -160,7 +160,7 @@ test_shuffle_vectors(void)
 
    /*
     * Apple's own applegpu_g17p words for the immediate-lane family, one
-    * kernel per lane (.tmp/g17p-rtgaps-evidence/{bcast,shuf,quadud}.metal).
+    * kernel per lane.
     * The lane is f29 and nothing else moves with it, on all six mnemonics --
     * which is why `subgroupBroadcast(v, 31)`, the read that ends every
     * subgroup scan, needs no materialising mov any more.
@@ -356,9 +356,8 @@ test_half_broadcast_vectors(void)
    CHECK(bytes_equal(out, length, immediate_lane5, sizeof(immediate_lane5)));
 
    /* The quad selector composes with the narrowed width pair.  metal-nt
-    * -arch applegpu_g17p on `ushort`, immediate lane, identical registers
-    * (src/asahi/compiler/test/probes/g17p-vertex-quad.metal): only byte 1
-    * moves between a quad word and its SIMD control. */
+    * -arch applegpu_g17p on `ushort`, immediate lane, identical registers:
+    * only byte 1 moves between a quad word and its SIMD control. */
    static const struct {
       bool quad;
       enum agx3_subgroup_shuffle_op op;
