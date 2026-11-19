@@ -1867,7 +1867,6 @@ hk_gen1_rq_finish(struct hk_device *dev)
    dev->gen1_native_rq=false;
    hk_device_finish_gen1_as_chunks(dev);
    dev->gen1_vertex_directory = NULL;
-   dev->gen1_vertex_directory_va = NULL;
    hk_gen1_sparse_finish(dev, &dev->gen1_vertex_directory_pages);
    if (dev->gen1_vertex_tables) {
       hash_table_foreach(dev->gen1_vertex_tables, entry)
@@ -2232,12 +2231,10 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
                                HK_GEN1_AS_TABLE_ENTRIES - 1)) {
          dev->gen1_vertex_directory = *util_dynarray_element(
             &dev->gen1_vertex_directory_pages.pages, struct agx_bo *, 0);
-         dev->gen1_vertex_directory_va = dev->gen1_vertex_directory_pages.va;
       } else {
          mesa_loge("Gen1 vertex table directory unavailable");
          hk_gen1_sparse_finish(dev, &dev->gen1_vertex_directory_pages);
          dev->gen1_vertex_directory = NULL;
-         dev->gen1_vertex_directory_va = NULL;
       }
       if (dev->gen1_rq_live_as_table) {
          simple_mtx_init(&dev->gen1_as_chunk_cache_lock, mtx_plain);
