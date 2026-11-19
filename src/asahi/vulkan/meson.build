@@ -1030,7 +1030,7 @@ if with_tests
     'aurora-packtest',
     files('tests/aurora_packtest.c'),
     include_directories : [inc_include],
-    dependencies : [cc.find_library('vulkan')],
+    dependencies : [cc.find_library('vulkan'), dep_thread],
     c_args : [c_msvc_compat_args],
     gnu_symbol_visibility : 'hidden',
   )

@@ -11,14 +11,17 @@
  * packed) to cover both paths. Plain dispatches run a program without loops,
  * heavy ones a looping program, which a packet holds at most one of.
  *
- * The driver's packing trace (HK_PACK_CDM_TRACE, turned on here) is read
- * back after each case, which then reports how many command buffers were
- * packed. With HK_PACK_CDM_SUBMIT=1 a case that must pack fails if nothing
- * was packed, and with HK_PACK_CDM_SUBMIT=0 any case fails if something was.
+ * The driver's packing trace (HK_PACK_CDM_TRACE, turned on here) passes
+ * through to stderr as it is written, and each case reports how many command
+ * buffers it says were packed. With HK_PACK_CDM_SUBMIT=1 a case that must
+ * pack fails if nothing was packed, and with HK_PACK_CDM_SUBMIT=0 any case
+ * fails if something was.
  *
  * usage: aurora-packtest ITERATIONS [CASE...]
  */
+#include <errno.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -788,68 +791,152 @@ run_case(const char *name, unsigned iterations)
    return bad ? 1 : 0;
 }
 
-/* The driver's packing trace goes to a temporary file standing in for
- * stderr; trace_packed() passes what it gained to the real stderr and
- * returns the command buffers it says were packed. */
-static int trace_fd = -1, real_stderr = -1;
-static off_t trace_off;
+/* The driver's packing trace comes through a pipe standing in for stderr. A
+ * thread passes everything on to the real stderr as it arrives, so the
+ * driver's messages for a case that dies are not lost, and counts the
+ * command buffers the trace says were packed. trace_sync() returns that
+ * count once everything written before it went through. */
+#define TRACE_SYNC "\001aurora-packtest sync\n"
+
+static struct {
+   pthread_mutex_t lock;
+   pthread_cond_t cond;
+   pthread_t thread;
+   int real_stderr, read_end;
+   unsigned packed, synced, requested;
+   bool on;
+} tr = {
+   .lock = PTHREAD_MUTEX_INITIALIZER,
+   .cond = PTHREAD_COND_INITIALIZER,
+   .real_stderr = -1,
+   .read_end = -1,
+};
+
+static void
+trace_line(const char *line, size_t n)
+{
+   if (n == strlen(TRACE_SYNC) && !memcmp(line, TRACE_SYNC, n)) {
+      pthread_mutex_lock(&tr.lock);
+      tr.synced++;
+      pthread_cond_broadcast(&tr.cond);
+      pthread_mutex_unlock(&tr.lock);
+      return;
+   }
+   if (write(tr.real_stderr, line, n) < 0) {
+      /* The pass-through is best effort. */
+   }
+   unsigned runs, members;
+   if (n > 13 && !memcmp(line, "HK_PACK runs=", 13) &&
+       sscanf(line, "HK_PACK runs=%u members=%u", &runs, &members) == 2) {
+      pthread_mutex_lock(&tr.lock);
+      tr.packed += members;
+      pthread_mutex_unlock(&tr.lock);
+   }
+}
+
+static void *
+trace_thread(void *arg)
+{
+   (void)arg;
+   static char buf[16384];
+   size_t len = 0;
+   for (;;) {
+      const ssize_t got = read(tr.read_end, buf + len, sizeof(buf) - len);
+      if (got < 0 && errno == EINTR)
+         continue;
+      if (got <= 0)
+         break;
+      len += (size_t)got;
+      size_t start = 0;
+      for (size_t i = 0; i < len; ++i) {
+         if (buf[i] == '\n') {
+            trace_line(buf + start, i + 1 - start);
+            start = i + 1;
+         }
+      }
+      if (start == 0 && len == sizeof(buf)) {
+         /* A line longer than the buffer: pass it on as it is. */
+         trace_line(buf, len);
+         start = len;
+      }
+      memmove(buf, buf + start, len - start);
+      len -= start;
+   }
+   if (len)
+      trace_line(buf, len);
+   return NULL;
+}
+
+static unsigned
+trace_sync(void)
+{
+   if (!tr.on)
+      return 0;
+   fflush(stderr);
+   pthread_mutex_lock(&tr.lock);
+   const unsigned want = ++tr.requested;
+   pthread_mutex_unlock(&tr.lock);
+   if (write(2, TRACE_SYNC, strlen(TRACE_SYNC)) < 0)
+      return tr.packed;
+
+   struct timespec until;
+   clock_gettime(CLOCK_REALTIME, &until);
+   until.tv_sec += 10;
+   pthread_mutex_lock(&tr.lock);
+   while (tr.synced < want &&
+          pthread_cond_timedwait(&tr.cond, &tr.lock, &until) == 0)
+      ;
+   const unsigned packed = tr.packed;
+   pthread_mutex_unlock(&tr.lock);
+   return packed;
+}
+
+/* At exit, also through die(): what the driver wrote reaches stderr. */
+static void
+trace_end(void)
+{
+   trace_sync();
+}
 
 static void
 trace_begin(void)
 {
-   setenv("HK_PACK_CDM_TRACE", "1", 0);
-   FILE *f = tmpfile();
-   if (!f)
+   setenv("HK_PACK_CDM_TRACE", "1", 1);
+   int fds[2];
+   if (pipe(fds) < 0)
       return;
    fflush(stderr);
-   trace_fd = dup(fileno(f));
-   fclose(f);
-   real_stderr = dup(2);
-   if (trace_fd < 0 || real_stderr < 0 || dup2(trace_fd, 2) < 0)
-      trace_fd = -1;
+   tr.real_stderr = dup(2);
+   if (tr.real_stderr < 0 || dup2(fds[1], 2) < 0) {
+      close(fds[0]);
+      close(fds[1]);
+      return;
+   }
+   close(fds[1]);
+   tr.read_end = fds[0];
+   if (pthread_create(&tr.thread, NULL, trace_thread, NULL)) {
+      dup2(tr.real_stderr, 2);
+      return;
+   }
+   tr.on = true;
+   atexit(trace_end);
 }
 
-static unsigned
-trace_packed(void)
-{
-   if (trace_fd < 0)
-      return 0;
-   fflush(stderr);
-   const off_t end = lseek(trace_fd, 0, SEEK_END);
-   if (end <= trace_off)
-      return 0;
-   const size_t n = (size_t)(end - trace_off);
-   char *text = malloc(n + 1);
-   if (!text)
-      return 0;
-   const ssize_t got = pread(trace_fd, text, n, trace_off);
-   trace_off = end;
-   if (got <= 0) {
-      free(text);
-      return 0;
-   }
-   text[got] = 0;
-   if (write(real_stderr, text, (size_t)got) < 0) {
-      /* The pass-through is best effort. */
-   }
-   unsigned packed = 0;
-   for (const char *at = strstr(text, "HK_PACK runs="); at;
-        at = strstr(at + 1, "HK_PACK runs=")) {
-      unsigned runs, members;
-      if (sscanf(at, "HK_PACK runs=%u members=%u", &runs, &members) == 2)
-         packed += members;
-   }
-   free(text);
-   return packed;
-}
+/* Whether a case submitted a render on the queue. */
+static bool rendered;
 
-/* Cases whose command buffers are all plain compute work that packs. */
+/* Cases whose command buffers are all plain compute work that packs. Every
+ * command buffer of chain-all ends with an ALL -> ALL barrier, whose tail is
+ * a render wait once the queue ran a render (split-render): it must pack
+ * only before that. */
 static bool
 must_pack(const char *name)
 {
    static const char *const cases[] = {"chain242", "chain300", "loops",
                                        "chain-all", "multi", "multi-tail",
                                        "disjoint"};
+   if (!strcmp(name, "chain-all") && rendered)
+      return false;
    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
       if (!strcmp(name, cases[i]))
          return true;
@@ -857,15 +944,32 @@ must_pack(const char *name)
    return false;
 }
 
+static bool
+has_render(const struct testcase *t)
+{
+   for (unsigned i = 0; i < t->ncb; ++i)
+      for (unsigned k = 0; k < t->cb[i].nops; ++k)
+         if (t->cb[i].ops[k].kind == OP_RENDER)
+            return true;
+   return false;
+}
+
 static int
 check_case(const char *name, unsigned iterations)
 {
+   const unsigned before = trace_sync();
    const int bad = run_case(name, iterations);
-   const unsigned packed = trace_packed();
+   const unsigned packed = trace_sync() - before;
+   const bool must = must_pack(name);
+   rendered |= has_render(&T) && !needs_feature(&T);
    const char *mode = getenv("HK_PACK_CDM_SUBMIT");
    const bool on = mode && mode[0] == '1', off = mode && mode[0] == '0';
-   const bool wrong = trace_fd >= 0 &&
-                      ((on && must_pack(name) && !packed) || (off && packed));
+   if (!tr.on) {
+      /* Nothing to count: a must-pack check cannot pass. */
+      printf("%s %s trace unavailable\n", on ? "FAIL" : "WARN", name);
+      return bad + on;
+   }
+   const bool wrong = (on && must && !packed) || (off && packed);
    printf("%s %s packed_cbs=%u%s\n", wrong ? "FAIL" : "PACKED", name, packed,
           wrong ? (on ? " (must pack)" : " (packing is off)") : "");
    return bad + wrong;
