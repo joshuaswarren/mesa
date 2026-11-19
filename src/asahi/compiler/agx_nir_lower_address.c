@@ -20,10 +20,59 @@ struct match {
 struct lower_address_options {
    bool byte_indices;
    bool byte_offsets;
+   nir_shader *shader;
+   struct hash_table *ranges;
 };
 
+/* Whether value = x << amount (or x * 2^amount), a 32-bit result, equals x
+ * scaled by 2^amount in 64 bits after the access's extension: the product
+ * must not wrap, unsigned for a zero-extended index or signed for a
+ * sign-extended one. Either the instruction says so, or x is small enough.
+ */
+static bool
+scale_is_exact(const struct lower_address_options *options, nir_scalar value,
+               nir_scalar x, unsigned amount, bool sign_extend)
+{
+   if (amount == 0)
+      return true;
+
+   nir_alu_instr *alu = nir_def_as_alu(value.def);
+   if (sign_extend ? alu->no_signed_wrap : alu->no_unsigned_wrap)
+      return true;
+
+   /* A nonnegative x below 2^(31 - amount) also has no signed wrap. */
+   const uint32_t limit = (sign_extend ? INT32_MAX : UINT32_MAX) >> amount;
+   return nir_unsigned_upper_bound(options->shader, options->ranges, x) <=
+          limit;
+}
+
+/* Take value = x << amount as an index at scale amount: x itself where that
+ * is exact, and otherwise value >> amount, which is: the low amount bits of
+ * value are zero, and a logical shift (arithmetic for a sign-extended index)
+ * gives back ext(value) once the access scales it again. That costs one
+ * 32-bit shift, shared by every access to value, instead of adding the
+ * address in 64-bit ALU.
+ */
 static void
-peel_scaled_u32(nir_scalar *offset, uint8_t *shift, unsigned max_shift)
+take_scaled(nir_builder *b, const struct lower_address_options *options,
+            nir_scalar value, nir_scalar x, unsigned amount, bool sign_extend,
+            nir_scalar *offset, uint8_t *shift)
+{
+   if (scale_is_exact(options, value, x, amount, sign_extend)) {
+      *offset = x;
+   } else {
+      nir_def *v = nir_channel(b, value.def, value.comp);
+      *offset = nir_get_scalar(
+         sign_extend ? nir_ishr_imm(b, v, amount) : nir_ushr_imm(b, v, amount),
+         0);
+   }
+   *shift = amount;
+}
+
+static void
+peel_scaled_u32(nir_builder *b, const struct lower_address_options *options,
+                nir_scalar *offset, uint8_t *shift, unsigned max_shift,
+                bool sign_extend)
 {
    nir_scalar value = nir_scalar_chase_movs(*offset);
    if (!nir_scalar_is_alu(value))
@@ -33,10 +82,9 @@ peel_scaled_u32(nir_scalar *offset, uint8_t *shift, unsigned max_shift)
    if (op == nir_op_ishl) {
       nir_scalar amount = nir_scalar_chase_alu_src(value, 1);
       if (nir_scalar_is_const(amount) &&
-          nir_scalar_as_uint(amount) <= max_shift) {
-         *offset = nir_scalar_chase_alu_src(value, 0);
-         *shift = nir_scalar_as_uint(amount);
-      }
+          nir_scalar_as_uint(amount) <= max_shift)
+         take_scaled(b, options, value, nir_scalar_chase_alu_src(value, 0),
+                     nir_scalar_as_uint(amount), sign_extend, offset, shift);
       return;
    }
 
@@ -53,10 +101,9 @@ peel_scaled_u32(nir_scalar *offset, uint8_t *shift, unsigned max_shift)
          continue;
 
       const unsigned amount = util_logbase2(raw);
-      if (amount <= max_shift) {
-         *offset = nir_scalar_chase_alu_src(value, 1 - i);
-         *shift = amount;
-      }
+      if (amount <= max_shift)
+         take_scaled(b, options, value, nir_scalar_chase_alu_src(value, 1 - i),
+                     amount, sign_extend, offset, shift);
       return;
    }
 }
@@ -80,7 +127,8 @@ strip_zero_shift(nir_scalar value)
  * select the load's base-plus-index addressing mode.
  */
 static bool
-peel_u2u64_index(nir_scalar wide, nir_scalar *narrow, uint8_t *shift,
+peel_u2u64_index(nir_builder *b, const struct lower_address_options *options,
+                 nir_scalar wide, nir_scalar *narrow, uint8_t *shift,
                  unsigned max_shift)
 {
    wide = strip_zero_shift(wide);
@@ -91,7 +139,7 @@ peel_u2u64_index(nir_scalar wide, nir_scalar *narrow, uint8_t *shift,
    if (narrow->def->bit_size != 32)
       return false;
 
-   peel_scaled_u32(narrow, shift, max_shift);
+   peel_scaled_u32(b, options, narrow, shift, max_shift, false);
    return true;
 }
 
@@ -374,9 +422,10 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
             nir_scalar offset = nir_scalar_chase_alu_src(base, 1);
             uint8_t extra_shift = 0;
             if (op != nir_op_ulea_agx ||
-                !peel_u2u64_index(offset, &offset, &extra_shift,
+                !peel_u2u64_index(b, options, offset, &offset, &extra_shift,
                                   max_shift - shift))
-               peel_scaled_u32(&offset, &extra_shift, max_shift - shift);
+               peel_scaled_u32(b, options, &offset, &extra_shift,
+                               max_shift - shift, op == nir_op_ilea_agx);
 
             const unsigned total_shift = shift + extra_shift;
             if (total_shift >= format_shift ||
@@ -401,8 +450,8 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
          for (unsigned i = 0; i < 2; ++i) {
             nir_scalar narrow;
             uint8_t shift = 0;
-            if (!peel_u2u64_index(nir_scalar_chase_alu_src(base, i), &narrow,
-                                  &shift, max_shift) ||
+            if (!peel_u2u64_index(b, options, nir_scalar_chase_alu_src(base, i),
+                                  &narrow, &shift, max_shift) ||
                 (shift < format_shift &&
                  !(byte_indices && !shift_must_match && shift == 0)))
                continue;
@@ -514,9 +563,10 @@ matched:
 bool
 agx_nir_lower_address(nir_shader *nir, bool byte_indices, bool byte_offsets)
 {
-   const struct lower_address_options options = {
+   struct lower_address_options options = {
       .byte_indices = byte_indices,
       .byte_offsets = byte_offsets,
+      .shader = nir,
    };
    bool progress = false;
 
@@ -532,11 +582,17 @@ agx_nir_lower_address(nir_shader *nir, bool byte_indices, bool byte_offsets)
    /* Then, fuse as many lea as possible */
    NIR_PASS(progress, nir, agx_nir_fuse_lea);
 
-   /* Next, lower load/store using the lea's */
-   nir_foreach_function_impl(impl, nir)
+   /* Next, lower load/store using the lea's. nir_unsigned_upper_bound()
+    * caches by SSA index, which every implementation numbers from zero, so
+    * each implementation gets a table of its own.
+    */
+   nir_foreach_function_impl(impl, nir) {
       nir_metadata_require(impl, nir_metadata_dominance);
-   NIR_PASS(progress, nir, nir_shader_intrinsics_pass, pass,
-            nir_metadata_control_flow, (void *)&options);
+      options.ranges = _mesa_pointer_hash_table_create(NULL);
+      progress |= nir_function_intrinsics_pass(
+         impl, pass, nir_metadata_control_flow, (void *)&options);
+      _mesa_hash_table_destroy(options.ranges, NULL);
+   }
 
    /* Finally, lower any leftover lea instructions back to ALU to let
     * nir_opt_algebraic simplify them from here.

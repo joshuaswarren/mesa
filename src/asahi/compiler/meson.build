@@ -694,6 +694,7 @@ if with_tests
          'test/test-device-load-batches.cpp',
          'test/test-fuse-lea-constants.cpp',
          'test/test-divergence-load-agx.cpp',
+         'test/test-lower-address-exact-scale.cpp',
          'test/test-ftz-subgroup-minmax.cpp',
          'test/test-m5-half-widen-once.cpp',
          'test/test-m5-byte-to-float.cpp',
