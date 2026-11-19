@@ -80,7 +80,7 @@ g17p_decline(const char *why, const nir_tex_instr *tex,
 }
 
 static bool
-g17p_sample_shape(const nir_tex_instr *tex, bool m5)
+g17p_sample_shape(const nir_tex_instr *tex, bool m5, bool g17p)
 {
    const bool query_lod = tex->op == nir_texop_lod;
    const int backend_coord =
@@ -226,6 +226,12 @@ g17p_sample_shape(const nir_tex_instr *tex, bool m5)
             * handle, which has no AGX3 encoding, and the pipeline failed
             * with VK_ERROR_UNKNOWN. */
            !register_level && !register_bias &&
+           /* G17P also takes a constant level or bias: the backend keeps
+            * it in a register (agx_optimizer_inline_imm), so it is staged
+            * beside the layer like a per-lane one. */
+           !(g17p && !cube &&
+             ((tex->op == nir_texop_txl && level_src >= 0) ||
+              (tex->op == nir_texop_txb && bias_src >= 0))) &&
            tex->op != nir_texop_txd &&
            !shadow_level_zero))
          return false;
@@ -519,7 +525,7 @@ g17p_rewrite_combined_texture_crawls(nir_shader *shader, uint8_t set,
 static nir_tex_instr *
 g17p_combined_sampler_candidate(const nir_shader *shader,
                                 uint32_t *texture_offset_B,
-                                uint32_t *sampler_state_offset_B)
+                                uint32_t *sampler_state_offset_B, bool g17p)
 {
    if (!shader || (shader->info.stage != MESA_SHADER_FRAGMENT &&
                    shader->info.stage != MESA_SHADER_COMPUTE))
@@ -532,7 +538,8 @@ g17p_combined_sampler_candidate(const nir_shader *shader,
             if (instr->type != nir_instr_type_tex)
                continue;
 
-            if (sample || !g17p_sample_shape(nir_instr_as_tex(instr), false))
+            if (sample ||
+                !g17p_sample_shape(nir_instr_as_tex(instr), false, g17p))
                return NULL;
             sample = nir_instr_as_tex(instr);
          }
@@ -561,21 +568,23 @@ g17p_combined_sampler_candidate(const nir_shader *shader,
 }
 
 bool
-agx_nir_g17p_combined_sampler_candidate(const nir_shader *shader)
+agx_nir_g17p_combined_sampler_candidate(const nir_shader *shader, bool g17p)
 {
    uint32_t texture_offset_B, sampler_state_offset_B;
    return g17p_combined_sampler_candidate(shader, &texture_offset_B,
-                                          &sampler_state_offset_B) != NULL;
+                                          &sampler_state_offset_B,
+                                          g17p) != NULL;
 }
 
 bool
 agx_nir_lower_g17p_combined_sampler(
-   nir_shader *shader, struct agx_g17p_combined_sampler_binding *binding)
+   nir_shader *shader, struct agx_g17p_combined_sampler_binding *binding,
+   bool g17p)
 {
    uint32_t texture_offset_B, sampler_state_offset_B;
    nir_tex_instr *sample =
       binding ? g17p_combined_sampler_candidate(shader, &texture_offset_B,
-                                                &sampler_state_offset_B)
+                                                &sampler_state_offset_B, g17p)
               : NULL;
    if (!sample)
       return false;
@@ -646,7 +655,7 @@ agx_nir_lower_g17g_combined_sampler(
     * +40. The common pass validates a single static set-0 resource and
     * rewrites only that resource's descriptor crawls. No API LOD bias is
     * removed here: the bounded M5 shape has an explicit zero level. */
-   return agx_nir_lower_g17p_combined_sampler(shader, binding);
+   return agx_nir_lower_g17p_combined_sampler(shader, binding, false);
 }
 
 /* Ordinary native integer-coordinate read. The descriptor selects float,
@@ -854,7 +863,8 @@ heap_index_access(const nir_intrinsic_instr *image)
  * after command recording and dynamically selected array elements are visible.
  */
 static bool
-lower_indexed_samplers(nir_shader *shader, int native32_set, bool m5)
+lower_indexed_samplers(nir_shader *shader, int native32_set, bool m5,
+                       bool g17p)
 {
    if (!shader || (!g17p_explicit_lod_stage(shader->info.stage) &&
                    shader->info.stage != MESA_SHADER_FRAGMENT &&
@@ -894,7 +904,7 @@ lower_indexed_samplers(nir_shader *shader, int native32_set, bool m5)
                 tex->op != nir_texop_tg4)
                return g17p_decline("vertex_implicit_sample", tex, NULL,
                                    shader->info.stage);
-            if (!fetch && !g17p_sample_shape(tex, m5))
+            if (!fetch && !g17p_sample_shape(tex, m5, g17p))
                return g17p_decline("sample_shape", tex, NULL,
                                    shader->info.stage);
             nir_intrinsic_instr *image = nir_src_as_intrinsic(
@@ -1087,13 +1097,13 @@ agx_nir_lower_g17g_indexed_samplers(nir_shader *shader)
    /* Gen10 publishes the same software heap-index tail and reserved sampler
     * prefix as Gen9. The native opcode/staging differences stay in the M5
     * encoder; this shared lowering only translates API handles to indices. */
-   return agx_nir_lower_g17p_indexed_samplers(shader);
+   return agx_nir_lower_g17p_indexed_samplers(shader, false);
 }
 
 bool
-agx_nir_lower_g17p_indexed_samplers(nir_shader *shader)
+agx_nir_lower_g17p_indexed_samplers(nir_shader *shader, bool g17p)
 {
-   return lower_indexed_samplers(shader, -1, false);
+   return lower_indexed_samplers(shader, -1, false, g17p);
 }
 
 
@@ -1225,13 +1235,13 @@ agx_nir_lower_g17g_indexed_reads(nir_shader *shader)
          }
       }
    }
-   return reads > 0 && lower_indexed_samplers(shader, -1, true);
+   return reads > 0 && lower_indexed_samplers(shader, -1, true, false);
 }
 
 bool
 agx_nir_lower_g17p_native32_samplers(nir_shader *shader, uint8_t texture_set)
 {
-   return lower_indexed_samplers(shader, texture_set, false);
+   return lower_indexed_samplers(shader, texture_set, false, false);
 }
 
 static bool
@@ -1506,17 +1516,30 @@ agx_nir_lower_g17p_indexed_storage(
    return true;
 }
 
+/* any_format (G18G): the write PBE converts from its own descriptor format,
+ * so a store of any colour format may take the state-0 route
+ * (agx_nir_lower_g18g_storage_image). */
 static bool
-g17p_storage_image_shape(const nir_intrinsic_instr *intr, bool load)
+g17p_storage_image_shape(const nir_intrinsic_instr *intr, bool load,
+                         bool any_format)
 {
    const enum pipe_format format = nir_intrinsic_format(intr);
+   const bool format_ok = format == PIPE_FORMAT_R8G8B8A8_UINT ||
+                          format == PIPE_FORMAT_R32_UINT ||
+                          (any_format && format != PIPE_FORMAT_NONE);
+   /* G18G (any_format): the texture/PBE descriptors carry the dimension,
+    * so 2D arrays, cubes and 3D take the same state-0 route. */
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   const bool g18_dim_ok =
+      any_format &&
+      ((dim == GLSL_SAMPLER_DIM_2D) || (dim == GLSL_SAMPLER_DIM_CUBE) ||
+       (dim == GLSL_SAMPLER_DIM_3D && !nir_intrinsic_image_array(intr)));
+   const bool plain_2d =
+      dim == GLSL_SAMPLER_DIM_2D && !nir_intrinsic_image_array(intr);
    if (intr->intrinsic != (load ? nir_intrinsic_bindless_image_load
                                 : nir_intrinsic_bindless_image_store) ||
        (nir_intrinsic_access(intr) & ACCESS_BUFFER_AGX) ||
-       nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_2D ||
-       nir_intrinsic_image_array(intr) ||
-       (format != PIPE_FORMAT_R8G8B8A8_UINT &&
-        format != PIPE_FORMAT_R32_UINT) ||
+       (!plain_2d && !g18_dim_ok) || !format_ok ||
        nir_src_num_components(intr->src[1]) != 4 ||
        nir_src_bit_size(intr->src[1]) != 32 ||
        !nir_src_is_const(intr->src[2]) ||
@@ -1525,7 +1548,9 @@ g17p_storage_image_shape(const nir_intrinsic_instr *intr, bool load)
 
    if (load) {
       return intr->def.num_components == 4 && intr->def.bit_size == 32 &&
-             !nir_intrinsic_image_array(intr) &&
+             /* G18G also loads 2D arrays, cubes and 3D images through
+              * the table: the texture descriptor carries the dimension. */
+             (plain_2d || g18_dim_ok) &&
              nir_src_is_const(intr->src[3]) &&
              nir_src_as_uint(intr->src[3]) == 0 &&
              !(nir_intrinsic_access(intr) &
@@ -1562,9 +1587,10 @@ g17p_storage_atomic_shape(const nir_intrinsic_instr *intr,
           atomic_pbe_offset_B == pbe_offset_B;
 }
 
-bool
-agx_nir_lower_g17p_storage_image(
-   nir_shader *shader, struct agx_g17p_storage_image_binding *binding)
+static bool
+g17p_lower_storage_image(nir_shader *shader,
+                         struct agx_g17p_storage_image_binding *binding,
+                         bool any_format)
 {
    if (!shader || !binding || shader->info.stage != MESA_SHADER_COMPUTE)
       return false;
@@ -1608,12 +1634,13 @@ agx_nir_lower_g17p_storage_image(
                   return false;
             }
             if (intr->intrinsic == nir_intrinsic_bindless_image_load) {
-               if (load || !g17p_storage_image_shape(intr, true) ||
+               if (load || !g17p_storage_image_shape(intr, true, any_format) ||
                    !g17p_storage_handle_offset(intr, &texture_offset_B))
                   return false;
                load = intr;
             } else if (intr->intrinsic == nir_intrinsic_bindless_image_store) {
-               if (store || !g17p_storage_image_shape(intr, false) ||
+               if (store ||
+                   !g17p_storage_image_shape(intr, false, any_format) ||
                    !g17p_storage_handle_offset(intr, &pbe_offset_B))
                   return false;
                store = intr;
@@ -1707,6 +1734,13 @@ agx_nir_lower_g17p_storage_image(
       .write_only = load == NULL && atomics == 0,
    };
    return true;
+}
+
+bool
+agx_nir_lower_g17p_storage_image(nir_shader *shader,
+                                 struct agx_g17p_storage_image_binding *binding)
+{
+   return g17p_lower_storage_image(shader, binding, false);
 }
 
 bool
@@ -1823,7 +1857,8 @@ agx_nir_lower_g17p_sampled_storage(
          block_count++;
          nir_foreach_instr(instr, block) {
             if (instr->type == nir_instr_type_tex) {
-               if (sample || !g17p_sample_shape(nir_instr_as_tex(instr), false))
+               if (sample ||
+                   !g17p_sample_shape(nir_instr_as_tex(instr), false, false))
                   return false;
                sample = nir_instr_as_tex(instr);
                continue;
@@ -1902,5 +1937,488 @@ agx_nir_lower_g17p_sampled_storage(
       .texture_set = texture_set,
       .pbe_set = pbe_set,
    };
+   return true;
+}
+
+bool
+agx_nir_lower_g18g_storage_image(struct nir_shader *shader,
+                                 struct agx_g17p_storage_image_binding *binding)
+{
+   const bool progress = g17p_lower_storage_image(shader, binding, true);
+   if (!progress || binding->write_only)
+      return progress;
+
+   /* Read-write: Gallium's G18G form. One table holds the
+    * image's texture descriptor (entry 0, read by image_load) and its PBE
+    * (entry 1, written by image_store); the hk storage descriptor already
+    * keeps them adjacent (PBE = texture + 32). Point the store at entry 1. */
+   nir_foreach_function_impl(impl, shader) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_image_store)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_src_rewrite(&intr->src[0], nir_imm_intN_t(&b, 1, 16));
+         }
+      }
+      nir_progress(true, impl, nir_metadata_control_flow);
+   }
+   return true;
+}
+
+/* G18G, several storage images: one native state table spanning their
+ * descriptors. hk stores a storage image as texture32 then PBE32 in its
+ * descriptor set, and the G18G state-0 route reads its table straight from
+ * set memory (entry 0 = the bound address). With the table based at the
+ * lowest texture descriptor, image i loads through entry (texture_i - base) /
+ * 32 and stores through the entry after it, the read-write form
+ * agx_nir_lower_g18g_storage_image already uses for one image. Loads and
+ * stores only (hk lowers image atomics to global atomics before this pass),
+ * every image in one set; anything else declines. Runs only after the
+ * single-image route declined. */
+#define G18G_MAX_STORAGE_IMAGES 8
+
+static bool
+g18g_storage_image_key(const nir_intrinsic_instr *intr, bool load,
+                       uint32_t *key, uint8_t *set)
+{
+   uint32_t offset_B;
+   const bool shape = g17p_storage_image_shape(intr, load, true);
+   /* One table, so every image must be in one set (any set). */
+   if (!shape || !g17p_storage_handle_binding(intr, set, &offset_B) ||
+       *set >= 8 || (offset_B & 31) != 0)
+      return false;
+   if (!load) {
+      if (offset_B < 32)
+         return false;
+      offset_B -= 32;
+   }
+   *key = offset_B;
+   return true;
+}
+
+bool
+agx_nir_lower_g18g_storage_images(
+   struct nir_shader *shader, struct agx_g17p_storage_image_binding *binding)
+{
+   if (!shader || !binding || shader->info.stage != MESA_SHADER_COMPUTE)
+      return false;
+
+   uint32_t keys[G18G_MAX_STORAGE_IMAGES];
+   unsigned key_count = 0, impl_count = 0;
+   int table_set = -1;
+   bool ok = true;
+   nir_foreach_function_impl(impl, shader) {
+      impl_count++;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               ok = false;
+               continue;
+            }
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_barrier:
+               /* As the single-image route: state-0 image accesses are not
+                * ordered by a barrier that names image memory. */
+               if (nir_intrinsic_memory_modes(intr) & nir_var_image)
+                  ok = false;
+               break;
+            case nir_intrinsic_bindless_image_load:
+            case nir_intrinsic_bindless_image_store: {
+               uint32_t key;
+               uint8_t set;
+               if (!g18g_storage_image_key(
+                      intr,
+                      intr->intrinsic == nir_intrinsic_bindless_image_load,
+                      &key, &set) ||
+                   (table_set >= 0 && table_set != set)) {
+                  ok = false;
+                  break;
+               }
+               table_set = set;
+               unsigned k;
+               for (k = 0; k < key_count && keys[k] != key; ++k)
+                  ;
+               if (k == key_count) {
+                  if (key_count == G18G_MAX_STORAGE_IMAGES)
+                     ok = false;
+                  else
+                     keys[key_count++] = key;
+               }
+               break;
+            }
+            case nir_intrinsic_bindless_image_atomic:
+            case nir_intrinsic_bindless_image_atomic_swap:
+               /* hk lowers image atomics to global atomics before this pass;
+                * one still here is not a shape this table route knows. */
+               ok = false;
+               break;
+            case nir_intrinsic_bindless_image_size:
+            case nir_intrinsic_bindless_image_texel_address: {
+               /* The bounds check and texel
+                * address of a lowered atomic read the image's descriptor
+                * words directly; they need no table entry, only the set. */
+               uint8_t set;
+               uint32_t offset_B;
+               if (!g17p_storage_handle_binding(intr, &set, &offset_B) ||
+                   (table_set >= 0 && table_set != set))
+                  ok = false;
+               else
+                  table_set = set;
+               break;
+            }
+            case nir_intrinsic_bindless_image_sparse_load:
+            case nir_intrinsic_bindless_image_samples:
+            case nir_intrinsic_bindless_sampler_agx:
+               ok = false;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   /* Runs only after the single-image route declined, so one image is
+    * fine here too: in another set, or in set 0 beside descriptor reads of
+    * other images (lowered atomics) that the single route refuses. */
+   if (!ok || impl_count != 1 || table_set < 0 || key_count < 1)
+      return false;
+
+   uint32_t base = keys[0], top = keys[0];
+   for (unsigned k = 1; k < key_count; ++k) {
+      base = MIN2(base, keys[k]);
+      top = MAX2(top, keys[k]);
+   }
+   /* Keys are 32-aligned descriptor offsets: equal keys are one image. A
+    * key of one image can not fall on another image's PBE (descriptors do
+    * not overlap), so entries never alias. Bound the table size. */
+   if (top - base > 32 * 1024)
+      return false;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            const bool load =
+               intr->intrinsic == nir_intrinsic_bindless_image_load;
+            if (!load && intr->intrinsic != nir_intrinsic_bindless_image_store)
+               continue;
+            uint32_t key;
+            uint8_t set;
+            if (!g18g_storage_image_key(intr, load, &key, &set) ||
+                set != table_set)
+               return false;
+            const unsigned entry = (key - base) / 32 + (load ? 0 : 1);
+            b.cursor = nir_before_instr(instr);
+            nir_src_rewrite(&intr->src[0], nir_imm_intN_t(&b, entry, 16));
+            intr->intrinsic =
+               load ? nir_intrinsic_image_load : nir_intrinsic_image_store;
+         }
+      }
+      nir_progress(true, impl, nir_metadata_control_flow);
+   }
+   NIR_PASS(_, shader, nir_opt_dce);
+
+   /* Every descriptor access must now be gone, except reads of a table
+    * image's own descriptor words (the array layer clamp of the robust
+    * image_load lowering), which address the table's set directly. */
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_bindless_sampler_agx)
+               return false;
+            if (intr->intrinsic != nir_intrinsic_bindless_image_agx)
+               continue;
+            if (nir_intrinsic_desc_set(intr) != (unsigned)table_set ||
+                !nir_src_is_const(intr->src[0]))
+               return false;
+            nir_foreach_use(use, &intr->def) {
+               nir_instr *parent = nir_src_use_instr(use);
+               if (parent->type != nir_instr_type_intrinsic)
+                  return false;
+               nir_intrinsic_instr *user = nir_instr_as_intrinsic(parent);
+               const bool descriptor_address =
+                  user->intrinsic ==
+                     nir_intrinsic_load_from_texture_handle_agx &&
+                  user->def.num_components == 1 && user->def.bit_size == 64;
+               const bool address_use =
+                  user->intrinsic == nir_intrinsic_bindless_image_size ||
+                  user->intrinsic == nir_intrinsic_bindless_image_texel_address;
+               if (!descriptor_address && !address_use)
+                  return false;
+            }
+         }
+      }
+   }
+
+   *binding = (struct agx_g17p_storage_image_binding){
+      .texture_offset_B = base,
+      .pbe_offset_B = base + 32,
+      .write_only = false,
+      .table_size_B = top - base + 64,
+      .set = (uint8_t)table_set,
+   };
+   return true;
+}
+
+/* G18G, sampled textures and storage images in one compute shader: per-dispatch
+ * native tables. G18G has one texture-state table (storage images read their
+ * texture at entry k and write through their PBE at k + 1, the read-write form
+ * above) and one sampler table (the image write uses sampler entry 0, the
+ * G18G write-state record). Here both tables are built at dispatch from the
+ * bound descriptor sets: entries 2i / 2i + 1 are storage image i's texture and
+ * PBE, the sampled textures follow, and sampler entries 1.. are the shader's
+ * samplers (copied from the sampler heap; entry 0 stays the write state).
+ * Every texture, sampler and image access becomes an immediate table index.
+ * Constant descriptor offsets only; anything else declines. */
+static int
+g18g_table_find(const struct agx_g18g_table_entry *entries, unsigned count,
+                uint8_t set, uint32_t offset_B)
+{
+   for (unsigned i = 0; i < count; ++i) {
+      if (entries[i].set == set && entries[i].offset_B == offset_B)
+         return (int)i;
+   }
+   return -1;
+}
+
+static bool
+g18g_const_handle(nir_src *src, nir_intrinsic_op op, uint8_t *set,
+                  uint32_t *offset_B)
+{
+   nir_intrinsic_instr *h = nir_src_as_intrinsic(*src);
+   if (!h || h->intrinsic != op || nir_intrinsic_desc_set(h) >= 8 ||
+       !nir_src_is_const(h->src[0]))
+      return false;
+   *set = nir_intrinsic_desc_set(h);
+   *offset_B = nir_src_as_uint(h->src[0]);
+   return true;
+}
+
+static bool
+g18g_table_add(struct agx_g18g_table_entry *entries, unsigned *count,
+               unsigned max, uint8_t set, uint32_t offset_B)
+{
+   if (g18g_table_find(entries, *count, set, offset_B) >= 0)
+      return true;
+   if (*count == max)
+      return false;
+   entries[(*count)++] = (struct agx_g18g_table_entry){set, offset_B};
+   return true;
+}
+
+bool
+agx_nir_lower_g18g_combined_tables(struct nir_shader *shader,
+                                   struct agx_g18g_table_binding *binding)
+{
+   if (!shader || !binding || shader->info.stage != MESA_SHADER_COMPUTE)
+      return false;
+
+   struct agx_g18g_table_entry images[AGX_G18G_TABLE_MAX_TEXTURES / 2];
+   struct agx_g18g_table_entry textures[AGX_G18G_TABLE_MAX_TEXTURES];
+   struct agx_g18g_table_entry samplers[AGX_G18G_TABLE_MAX_SAMPLERS - 1];
+   unsigned image_count = 0, texture_count = 0, sampler_count = 0;
+   unsigned impl_count = 0, image_ops = 0;
+   bool ok = true;
+
+   nir_foreach_function_impl(impl, shader) {
+      impl_count++;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               uint8_t set;
+               uint32_t offset_B;
+               const int ti =
+                  nir_tex_instr_src_index(tex, nir_tex_src_texture_handle);
+               const int si =
+                  nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle);
+               if (ti < 0 ||
+                   nir_tex_instr_src_index(tex, nir_tex_src_texture_offset) >=
+                      0 ||
+                   nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset) >=
+                      0 ||
+                   !g18g_const_handle(&tex->src[ti].src,
+                                      nir_intrinsic_bindless_image_agx, &set,
+                                      &offset_B) ||
+                   (offset_B & 7) != 0 ||
+                   !g18g_table_add(textures, &texture_count,
+                                   AGX_G18G_TABLE_MAX_TEXTURES, set,
+                                   offset_B)) {
+                  ok = false;
+                  continue;
+               }
+               if (si >= 0 &&
+                   (!g18g_const_handle(&tex->src[si].src,
+                                       nir_intrinsic_bindless_sampler_agx, &set,
+                                       &offset_B) ||
+                    !g18g_table_add(samplers, &sampler_count,
+                                    AGX_G18G_TABLE_MAX_SAMPLERS - 1, set,
+                                    offset_B)))
+                  ok = false;
+               continue;
+            }
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_barrier:
+               if (nir_intrinsic_memory_modes(intr) & nir_var_image)
+                  ok = false;
+               break;
+            case nir_intrinsic_bindless_image_load:
+            case nir_intrinsic_bindless_image_store: {
+               uint32_t key;
+               uint8_t set;
+               if (!g18g_storage_image_key(
+                      intr,
+                      intr->intrinsic == nir_intrinsic_bindless_image_load,
+                      &key, &set) ||
+                   !g18g_table_add(images, &image_count,
+                                   AGX_G18G_TABLE_MAX_TEXTURES / 2, set, key))
+                  ok = false;
+               image_ops++;
+               break;
+            }
+            case nir_intrinsic_bindless_image_sparse_load:
+            case nir_intrinsic_bindless_image_atomic:
+            case nir_intrinsic_bindless_image_atomic_swap:
+            case nir_intrinsic_bindless_image_samples:
+               ok = false;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   /* Also storage images alone, when the set-0/one-set routes declined
+    * (images spread over several sets): each entry names its own set. */
+   if (!ok || impl_count != 1 || !image_ops ||
+       2 * image_count + texture_count > AGX_G18G_TABLE_MAX_TEXTURES)
+      return false;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               uint8_t set;
+               uint32_t offset_B;
+               const int ti =
+                  nir_tex_instr_src_index(tex, nir_tex_src_texture_handle);
+               if (!g18g_const_handle(&tex->src[ti].src,
+                                      nir_intrinsic_bindless_image_agx, &set,
+                                      &offset_B))
+                  return false;
+               const int t =
+                  g18g_table_find(textures, texture_count, set, offset_B);
+               unsigned sampler_entry = 0;
+               const int si =
+                  nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle);
+               if (si >= 0) {
+                  if (!g18g_const_handle(&tex->src[si].src,
+                                         nir_intrinsic_bindless_sampler_agx,
+                                         &set, &offset_B))
+                     return false;
+                  sampler_entry = 1 + g18g_table_find(samplers, sampler_count,
+                                                      set, offset_B);
+               }
+               nir_steal_tex_src(tex, nir_tex_src_texture_handle);
+               if (si >= 0)
+                  nir_steal_tex_src(tex, nir_tex_src_sampler_handle);
+               tex->texture_index = 2 * image_count + t;
+               tex->sampler_index = sampler_entry;
+               continue;
+            }
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            const bool load =
+               intr->intrinsic == nir_intrinsic_bindless_image_load;
+            if (!load && intr->intrinsic != nir_intrinsic_bindless_image_store)
+               continue;
+            uint32_t key;
+            uint8_t set;
+            if (!g18g_storage_image_key(intr, load, &key, &set))
+               return false;
+            const int i = g18g_table_find(images, image_count, set, key);
+            b.cursor = nir_before_instr(instr);
+            nir_src_rewrite(&intr->src[0],
+                            nir_imm_intN_t(&b, 2 * i + (load ? 0 : 1), 16));
+            intr->intrinsic =
+               load ? nir_intrinsic_image_load : nir_intrinsic_image_store;
+         }
+      }
+      nir_progress(true, impl, nir_metadata_control_flow);
+   }
+   NIR_PASS(_, shader, nir_opt_dce);
+
+   /* What is left of the handles may only read descriptor words directly. */
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               if (nir_tex_instr_src_index(tex, nir_tex_src_texture_handle) >=
+                      0 ||
+                   nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle) >=
+                      0)
+                  return false;
+               continue;
+            }
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_bindless_sampler_agx)
+               return false;
+            if (intr->intrinsic != nir_intrinsic_bindless_image_agx)
+               continue;
+            nir_foreach_use(use, &intr->def) {
+               nir_instr *parent = nir_src_use_instr(use);
+               if (parent->type != nir_instr_type_intrinsic)
+                  return false;
+               nir_intrinsic_instr *user = nir_instr_as_intrinsic(parent);
+               if (!(user->intrinsic ==
+                        nir_intrinsic_load_from_texture_handle_agx &&
+                     user->def.num_components == 1 &&
+                     user->def.bit_size == 64) &&
+                   user->intrinsic != nir_intrinsic_bindless_image_size &&
+                   user->intrinsic !=
+                      nir_intrinsic_bindless_image_texel_address)
+                  return false;
+            }
+         }
+      }
+   }
+
+   struct agx_g18g_table_binding out = {0};
+   for (unsigned i = 0; i < image_count; ++i) {
+      out.textures[out.texture_count++] = images[i];
+      out.textures[out.texture_count++] =
+         (struct agx_g18g_table_entry){images[i].set, images[i].offset_B + 32};
+   }
+   for (unsigned i = 0; i < texture_count; ++i)
+      out.textures[out.texture_count++] = textures[i];
+   /* The handle names the descriptor's sampler word; the published heap
+    * index sits 8 bytes after it (hk_sampled_image_descriptor_layout). */
+   for (unsigned i = 0; i < sampler_count; ++i)
+      out.samplers[out.sampler_count++] = (struct agx_g18g_table_entry){
+         samplers[i].set, samplers[i].offset_B + 8};
+   *binding = out;
    return true;
 }

@@ -11688,7 +11688,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             .raw_object_template = 0,
             
 
-            .raw_mesh_template = dev->dev.chip == AGX_CHIP_G17P ? 0 : 0x40,
+            .raw_mesh_template = 0x40,
             
 
 
@@ -11702,16 +11702,22 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                dev->dev.chip == AGX_CHIP_G17P
                   ? DIV_ROUND_UP(hw_vs->info.mesh.primitive_stride_B *
                                  hw_vs->info.mesh.max_primitives, 4) : 0,
-               dev->dev.chip == AGX_CHIP_G17P
-                  ? DIV_ROUND_UP(hw_vs->b.info.local_size, 16) : 9},
+               0},
          };
-         if (dev->dev.chip == AGX_CHIP_G17S) {
+         /* G17P replays views rather than amplifying them in hardware. Its
+          * ordinary mesh output extent uses the same encoding as G17S.
+          * Threadgroup memory is allocated separately by the shader program.
+          */
+         if (dev->dev.chip == AGX_CHIP_G17P ||
+             dev->dev.chip == AGX_CHIP_G17S) {
             if (!agx_vdm_m5_mesh_set_output_limits(
                    &state, hw_vs->info.mesh.max_vertices,
                    hw_vs->info.mesh.max_primitives, hw_vs->info.uvs.size)) {
                vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
                return;
             }
+         }
+         if (dev->dev.chip == AGX_CHIP_G17S) {
             /* Native object->mesh kicks (native726 mesh-object, 0x1ca48
              * bound) set tail[0]; task kicks with the native record do too,
              * with or without the grid at +0 (the buffer stays bound).
@@ -13168,8 +13174,11 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
 
       /* hk_g17p_emit_draw() validates a direct draw as it encodes it. */
       enum agx_primitive topology = cmd->state.gfx.topology;
+      /* Admit with the chip whose Index List words agx_vdm_draw() writes
+       * below (G18G writes G17G's), not the raw chip. */
       if ((!agx_native_graphics(&dev->dev) || agx_is_indirect(draw.b)) &&
-          !agx_vdm_draw_supported(dev->dev.chip, draw, topology)) {
+          !agx_vdm_draw_supported(agx_vdm_index_list_record_chip(dev->dev.chip),
+                                  draw, topology)) {
          if (debug_get_option_m5_launch_debug())
             mesa_loge("draw admission: indexed=%u indirect=%u size=%u ib=%#llx range=%u arg=%#llx topology=%u",
                       draw.indexed, agx_is_indirect(draw.b), draw.index_size,
@@ -13261,6 +13270,7 @@ hk_record_mesh_launch(struct hk_cmd_buffer *cmd, uint32_t draw_id)
       return;
 
    cs->g17p_primitive_bound = UINT64_MAX;
+   cs->g17p_mesh_output = true;
 
    if (tail) {
       uint32_t draw_state_offset;
@@ -13629,6 +13639,10 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
                               task->b.info.workgroup_size[2]);
    }
    hk_m5_note_render_resources(cmd, cs);
+   if (unlikely(dev->frame_anatomy)) {
+      hk_frame_anatomy_note_fs(cs, hk_bound_fs(cmd));
+      hk_frame_anatomy_note_vs(cs, hk_bound_hw_vs(gfx));
+   }
    cs->stats.calls++;
    hk_upload_stat(cmd, draws, 1);
    hk_note_pre_raster_images(cmd, cs);

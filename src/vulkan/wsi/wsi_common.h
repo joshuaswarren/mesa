@@ -73,6 +73,8 @@ struct wsi_device {
    VkExternalSemaphoreHandleTypeFlags timeline_semaphore_export_handle_types;
 
    bool has_import_memory_host;
+   /* minImportedHostPointerAlignment, when has_import_memory_host */
+   uint64_t import_memory_host_alignment;
    bool has_timeline_semaphore;
    bool has_host_query_reset;
 

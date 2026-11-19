@@ -139,8 +139,10 @@ struct var_info {
    bool found_read;
    bool duplicate;
 
-   /* Block that has all the variable stores.  All the blocks with reads
-    * should be dominated by this block.
+   /* Block of the first stores, which collect the constant data. Stores in
+    * other blocks may only write bytes the collected data already holds, with
+    * the same values. All the blocks with reads should be dominated by this
+    * block.
     */
    nir_block *block;
 
@@ -238,6 +240,23 @@ handle_constant_store(void *mem_ctx, struct var_info *info,
       write_const_value((char *)info->constant_data + offset,
                         constant, i, bit_size);
    }
+}
+
+/* Whether a constant store leaves the collected data unchanged. Bytes no
+ * earlier store wrote are zero and hold undefined values, so zero is a valid
+ * value for them as well.
+ */
+static bool
+constant_store_is_redundant(void *mem_ctx, struct var_info *info,
+                            nir_deref_instr *deref, nir_def *val,
+                            nir_component_mask_t write_mask,
+                            glsl_type_size_align_func size_align)
+{
+   void *before = ralloc_memdup(NULL, info->constant_data, info->constant_data_size);
+   handle_constant_store(mem_ctx, info, deref, val, write_mask, size_align);
+   bool same = memcmp(before, info->constant_data, info->constant_data_size) == 0;
+   ralloc_free(before);
+   return same;
 }
 
 #define NIR_SMALL_CONSTANT_MAX_ABS_VALUE 255
@@ -589,12 +608,20 @@ opt_large_constants_impl(nir_function_impl *impl,
                info->block = block;
 
             /* We only consider variables constant if they only have constant
-             * stores, all the stores come before any reads, and all stores
-             * come from the same block.  We also can't handle indirect stores.
+             * stores, all the stores come before any reads, and every store
+             * outside the first store block rewrites bytes already collected,
+             * which changes no value (SPIR-V producers store a constant array
+             * into a variable that also has it as initializer). We also can't
+             * handle indirect stores.
              */
-            if (!src_is_const || info->found_read || block != info->block ||
+            if (!src_is_const || info->found_read ||
                 nir_deref_instr_has_indirect(dst_deref)) {
                info->is_constant = false;
+            } else if (block != info->block) {
+               if (!constant_store_is_redundant(var_infos, info, dst_deref,
+                                                intrin->src[1].ssa, write_mask,
+                                                size_align))
+                  info->is_constant = false;
             } else {
                handle_constant_store(var_infos, info, dst_deref, intrin->src[1].ssa,
                                      write_mask, size_align);

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -679,6 +680,18 @@ find_best_region_to_evict(struct ra_ctx *rctx, unsigned size,
       rctx->shader->ra_failed = true;
       base = find_best_region_to_evict_impl(rctx, size, already_evicted, ~0u, 0,
                                             false, false);
+   }
+
+   /* Every region was already evicted for this value: there is nothing left
+    * to finish the allocation with. Leave RA now (agx_ra_impl() frees its
+    * state); the caller sees ra_failed and recompiles with a smaller spill
+    * budget. Continuing used to assert here in debug builds and index out of
+    * bounds in release builds (geometry shader of
+    * spirv_assembly.instruction.graphics.16bit_storage.struct_mixed_types.uniform_geom
+    * on M5: 248 registers, every 2-aligned region evicted). */
+   if (base == ~0u && rctx->shader->ra_abort) {
+      assert(rctx->shader->ra_failed);
+      longjmp(*(jmp_buf *)rctx->shader->ra_abort, 1);
    }
 
    assert(base < rctx->bound[RA_GPR] &&
@@ -1490,8 +1503,8 @@ pick_collect_affinity(struct ra_ctx *rctx, agx_instr *I, unsigned d,
  * RGBA8 payload, `collect(fltnorm, fltnorm)` whose halves already sit in an
  * aligned pair inside the bank, that forced a parallel copy: one extra MOV in
  * front of every LSTCOL, on the fragment's critical tail. Apple's G17P
- * fragments store the FLTNORM pair directly (fs-apple.bin +0x198/+0x1a8:
- * fltnorm r2h, pixwait, lstcol r2).
+ * fragments store the FLTNORM pair directly: FLTNORM writes one half of the
+ * payload pair in place, then PIXWAIT, then LSTCOL stores the pair, no MOV.
  *
  * Try the ordinary collect/move affinity first, but accept it only when the
  * whole region is free, aligned, and inside [dest_minimum, dest_limit). This
@@ -3696,6 +3709,16 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
     */
    BITSET_WORD *dest_read = agx_values_read(ctx);
 
+   /* Everything assign_local reads below was allocated above, and nothing the
+    * cleanup reads is changed after this point, so it survives a longjmp. */
+   jmp_buf ra_abort;
+   if (setjmp(ra_abort)) {
+      ctx->ra_abort = NULL;
+      free(dest_read);
+      goto cleanup;
+   }
+   ctx->ra_abort = &ra_abort;
+
    agx_foreach_block(ctx, block) {
       agx_ra_assign_local(&(struct ra_ctx){
          .shader = ctx,
@@ -3724,6 +3747,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
       });
    }
 
+   ctx->ra_abort = NULL;
    free(dest_read);
 
    ctx->max_reg = reg_count ? (reg_count - 1) : 0;
@@ -3869,6 +3893,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    if (spilling)
       agx_lower_spill(ctx);
 
+cleanup:
    agx_foreach_block(ctx, block) {
       for (unsigned i = 0; i < ARRAY_SIZE(block->reg_to_ssa_out); ++i) {
          free(block->reg_to_ssa_out[i]);

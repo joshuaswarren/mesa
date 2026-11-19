@@ -45,6 +45,7 @@ extern "C" {
 #include "agx3_select_core.h"
 #include "agx3_vary_core.h"
 #include "agx3_zs_core.h"
+#include "agx_mesh_abi.h"
 #include "probes/g17p-sparse-mrt.h"
 
 /* agx_nir_lower_tilebuffer's ALL_SAMPLES: the pixel-rate sample mask, and the
@@ -144,6 +145,191 @@ static bool
 int_dest_cache(void)
 {
    return true;
+}
+
+TEST_F(AGX3PackBinary, MeshExportFencesUseExactLivePhaseMasks)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->stage = MESA_SHADER_MESH;
+   agx_mov_imm_to(b, agx_register(8, AGX_SIZE_16), 32);
+   agx_mov_imm_to(b, agx_register(10, AGX_SIZE_16), 64);
+   agx_allocate_uvb_m5(b, agx_register(8, AGX_SIZE_16),
+                        agx_register(10, AGX_SIZE_16));
+   agx_index desc = agx_register(12, AGX_SIZE_32); desc.channels_m1 = 1;
+   agx_mov_imm_to(b, agx_register(12, AGX_SIZE_32), 0);
+   agx_mov_imm_to(b, agx_register(14, AGX_SIZE_32), 256);
+   agx_store_uvb_m5(b, desc, 1);
+   agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_INDICES);
+   agx_store_uvb_m5(b, desc, 0);
+   agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_VERTEX_BATCH);
+   agx_store_uvb_m5(b, desc, 0);
+   agx_stop(b);
+   const auto code = pack(b);
+   const uint8_t index[] = {0x0b,0x01,0x07,0x01,0,0x40,0,0,0,0};
+   const uint8_t vertex[] = {0x0b,0x01,0x07,0x01,0,0x80,0,0,0,0};
+   EXPECT_NE(std::search(code.begin(), code.end(), index, index + sizeof(index)), code.end());
+   EXPECT_NE(std::search(code.begin(), code.end(), vertex, vertex + sizeof(vertex)), code.end());
+   /* Neither the final export nor END gains a terminal phase wait. */
+   ASSERT_GE(code.size(), 10u);
+   EXPECT_EQ(std::vector<uint8_t>(code.end() - 4, code.end()),
+             (std::vector<uint8_t>{0x0e,0,0,0}));
+}
+
+TEST_F(AGX3PackBinary, MeshExportFenceDrainsBothPendingR0Halves)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->stage = MESA_SHADER_MESH;
+   agx_mov_imm_to(b, agx_register(8, AGX_SIZE_16), 0);
+   agx_allocate_uvb_m5(b, agx_register(8, AGX_SIZE_16),
+                        agx_register(8, AGX_SIZE_16));
+   /* Zero exports can still have unrelated explicit producers. Their two
+    * current generations must complete before the carrier touches h0/h1. */
+   agx_device_load_to(b, agx_register(0, AGX_SIZE_16),
+      agx_uniform(0, AGX_SIZE_64), agx_immediate(0), AGX_FORMAT_I16, 1, 0, false);
+   agx_device_load_to(b, agx_register(1, AGX_SIZE_16),
+      agx_uniform(0, AGX_SIZE_64), agx_immediate(2), AGX_FORMAT_I16, 1, 0, false);
+   agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_INDICES);
+   agx_iadd_to(b, agx_register(4, AGX_SIZE_16),
+      agx_register(0, AGX_SIZE_16), agx_register(1, AGX_SIZE_16), 0);
+   agx_stop(b);
+   const auto code = pack(b);
+   const uint8_t complete[] = {0x0b,0x01,0x07,0x01,0,0x60,0,0,0,0};
+   EXPECT_NE(std::search(code.begin(), code.end(), complete,
+                         complete + sizeof(complete)), code.end());
+}
+
+TEST_F(AGX3PackBinary, MeshExportFenceRefusesInvalidProtocolOrChannelReuse)
+{
+   for (unsigned bad : {0u,1u,2u,3u,4u,5u}) {
+      agx_builder *b = builder(bad == 5 ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B);
+      key.dev.chip = bad == 5 ? AGX_CHIP_G17S : AGX_CHIP_G17P;
+      b->shader->stage = MESA_SHADER_MESH;
+      agx_mov_imm_to(b, agx_register(8, AGX_SIZE_16), 1);
+      if (bad != 0)
+         agx_allocate_uvb_m5(b, agx_register(8, AGX_SIZE_16), agx_register(8, AGX_SIZE_16));
+      agx_index desc = agx_register(12, AGX_SIZE_32); desc.channels_m1 = 1;
+      if (bad == 4) {
+         agx_store_uvb_m5(b, desc, 1);
+         /* Ordinary producers are now allocated away from phase channels.
+          * Force the native ISEL pair instead: its required slot2 must not
+          * be rewritten by the policy or reuse a pending index phase. */
+         agx_index first = agx_register(4, AGX_SIZE_32);
+         agx_index second = agx_register(6, AGX_SIZE_32);
+         agx_device_load_to(b, first, agx_uniform(0, AGX_SIZE_64),
+            agx_immediate(0), AGX_FORMAT_I32, 1, 0, false);
+         agx_device_load_to(b, second, agx_uniform(0, AGX_SIZE_64),
+            agx_immediate(4), AGX_FORMAT_I32, 1, 0, false);
+         agx_icmpsel_to(b, agx_register(16, AGX_SIZE_32), first, second,
+                          first, second, AGX_ICOND_UEQ);
+      }
+      agx_fence_uvb_gen1(b, bad == 1 ? AGX_MESH_EXPORT_FENCE_VERTEX_BATCH :
+                          bad == 2 ? 2 : AGX_MESH_EXPORT_FENCE_INDICES);
+      if (bad == 3)
+         agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_INDICES);
+      agx_stop(b);
+      EXPECT_TRUE(pack(b, false).empty()) << bad;
+   }
+}
+
+/* Actual unlinked GPL failure: position UVSTs precede root-table loads of
+ * the page carrier and location0 selectors. A round-robin slot3 load after
+ * the first vertex UVST violates the phase protocol even when its result is
+ * immediately consumed by the next descriptor. Vary the incoming cursor so
+ * success cannot depend on how many API-body loads happened to precede it. */
+TEST_F(AGX3PackBinary, MeshUnlinkedSelectorsBetweenExports)
+{
+   for (bool with_system_reads : {false, true}) {
+      SCOPED_TRACE(with_system_reads);
+      for (unsigned warmup = 0; warmup < 6; ++warmup) {
+         SCOPED_TRACE(warmup);
+         agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+         key.dev.chip = AGX_CHIP_G17P;
+         b->shader->stage = MESA_SHADER_MESH;
+         for (unsigned i = 0; i < warmup; ++i)
+            agx_device_load_to(b, agx_register(32 + 2 * i, AGX_SIZE_32),
+               agx_uniform(0, AGX_SIZE_64), agx_immediate(i),
+               AGX_FORMAT_I32, 1, 0, false);
+         for (unsigned i = 0; i < warmup; ++i)
+            agx_mov_to(b, agx_register(64 + 2 * i, AGX_SIZE_32),
+                          agx_register(32 + 2 * i, AGX_SIZE_32));
+         agx_mov_imm_to(b, agx_register(8, AGX_SIZE_16), 2);
+         agx_mov_imm_to(b, agx_register(10, AGX_SIZE_16), 6);
+         agx_allocate_uvb_m5(b, agx_register(8, AGX_SIZE_16),
+                              agx_register(10, AGX_SIZE_16));
+         agx_index desc = agx_register(12, AGX_SIZE_32);
+         desc.channels_m1 = 1;
+         agx_mov_imm_to(b, agx_register(12, AGX_SIZE_32), 0);
+         agx_mov_imm_to(b, agx_register(14, AGX_SIZE_32), 0);
+         agx_store_uvb_m5(b, desc, 1);
+         agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_INDICES);
+         for (unsigned plane = 0; plane < 4; ++plane) {
+            agx_mov_imm_to(b, agx_register(12, AGX_SIZE_32), plane);
+            agx_mov_imm_to(b, agx_register(14, AGX_SIZE_32), 192 + 32 * plane);
+            agx_store_uvb_m5(b, desc, 0);
+         }
+         for (unsigned selector : {128u, 130u}) {
+            agx_device_load_to(b, agx_register(2, AGX_SIZE_32),
+               agx_uniform(0, AGX_SIZE_64), agx_immediate(selector),
+               AGX_FORMAT_I8, 1, 2, false);
+            agx_mov_to(b, agx_register(12, AGX_SIZE_32),
+                          agx_register(2, AGX_SIZE_32));
+            agx_mov_imm_to(b, agx_register(14, AGX_SIZE_32), 320);
+            agx_store_uvb_m5(b, desc, 0);
+         }
+         if (with_system_reads) {
+            /* With warmup3, old allocation used selectors4/5 then SR6/1.
+             * Restricting only the selectors instead leaves SR2/3, making
+             * the second SR collide with the still-pending vertex phase. */
+            agx_get_sr_to(b, agx_register(16, AGX_SIZE_32),
+                            AGX_SR_THREADGROUP_POSITION_IN_GRID_X);
+            agx_mov_to(b, agx_register(20, AGX_SIZE_32),
+                          agx_register(16, AGX_SIZE_32));
+            agx_get_sr_to(b, agx_register(18, AGX_SIZE_32),
+                            AGX_SR_THREADGROUP_POSITION_IN_GRID_Y);
+            agx_mov_to(b, agx_register(22, AGX_SIZE_32),
+                          agx_register(18, AGX_SIZE_32));
+         }
+         agx_stop(b);
+         /* Match production: MOV is a pseudo, lowered to a bitwise copy
+          * before native packing. Keep the actual selector/SR reads. */
+         agx_lower_pseudo(b->shader);
+         const auto code = pack(b);
+         ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+         const uint8_t index[] = {0x0b,0x01,0x07,0x01,0,0x40,0,0,0,0};
+         EXPECT_NE(std::search(code.begin(), code.end(), index,
+                               index + sizeof(index)), code.end());
+         EXPECT_EQ(std::vector<uint8_t>(code.end() - 4, code.end()),
+                   (std::vector<uint8_t>{0x0e,0,0,0}));
+      }
+   }
+}
+
+/* Choosing a non-phase channel is insufficient by itself. A selector not
+ * consumed yet must still make the existing outstanding-operation UVST gate
+ * fail closed; the policy must not become an unconditional export drain. */
+TEST_F(AGX3PackBinary, MeshUnconsumedSelectorStillRefusesExport)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->stage = MESA_SHADER_MESH;
+   agx_mov_imm_to(b, agx_register(8, AGX_SIZE_16), 1);
+   agx_allocate_uvb_m5(b, agx_register(8, AGX_SIZE_16),
+                        agx_register(8, AGX_SIZE_16));
+   agx_index desc = agx_register(12, AGX_SIZE_32);
+   desc.channels_m1 = 1;
+   agx_mov_imm_to(b, agx_register(12, AGX_SIZE_32), 0);
+   agx_mov_imm_to(b, agx_register(14, AGX_SIZE_32), 192);
+   agx_store_uvb_m5(b, desc, 1);
+   agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_INDICES);
+   agx_store_uvb_m5(b, desc, 0);
+   agx_device_load_to(b, agx_register(2, AGX_SIZE_32),
+      agx_uniform(0, AGX_SIZE_64), agx_immediate(128),
+      AGX_FORMAT_I8, 1, 2, false);
+   agx_store_uvb_m5(b, desc, 0);
+   agx_stop(b);
+   EXPECT_TRUE(pack(b, false).empty());
 }
 
 TEST_F(AGX3PackBinary, MultisampleTileBankCountsPartitionsNotStores)
@@ -13473,10 +13659,11 @@ TEST_F(AGX3PackBinary, IndexedShadowLevelZeroKeepsNativeHandles)
          /* A comparison stages a register level beside the operand its
           * dimension already owns -- the cube beside its face, the noncube
           * array beside its layer -- so both are native. An immediate
-          * nonzero level is not: it would have to share SMP's immediate
-          * slot with that same operand. */
-         const bool native = level == 0 || level == 2;
-         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader), native);
+          * nonzero level would have to share SMP's immediate slot with that
+          * same operand; the noncube array keeps it in a register instead
+          * (agx_optimizer_inline_imm), the cube has no such form. */
+         const bool native = level == 0 || level == 2 || !cube;
+         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader, true), native);
          if (native) {
             const int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
             const int sampler = nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle);
@@ -13536,10 +13723,11 @@ TEST_F(AGX3PackBinary, IndexedShadowGradientAndRegisterBiasKeepNativeHandles)
                           .align_mul = 4);
          /* A per-lane bias is published beside the layer or CEM's face, so
           * both dimensions take it; a constant one would have to share SMP's
-          * immediate slot with that same operand. The gradient composes with
-          * the packed layer, and the cube has no gradient form at all. */
-         const bool native = grad ? !cube : kind == 0;
-         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader), native);
+          * immediate slot with that same operand, so the noncube array keeps
+          * it in a register and the cube refuses it. The gradient composes
+          * with the packed layer, and the cube has no gradient form at all. */
+         const bool native = grad ? !cube : kind == 0 || !cube;
+         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader, true), native);
          ralloc_free(b.shader);
       }
    }
@@ -16091,7 +16279,7 @@ TEST_F(AGX3PackBinary, IndexedGatherKeepsNativeHandles)
             nir_builder_instr_insert(&b, &tex->instr);
             nir_store_global(&b, &tex->def, nir_imm_int64(&b, 0x20000),
                              .align_mul = 4);
-            ASSERT_TRUE(agx_nir_lower_g17p_indexed_samplers(b.shader));
+            ASSERT_TRUE(agx_nir_lower_g17p_indexed_samplers(b.shader, true));
             const int texture = nir_tex_instr_src_index(
                tex, nir_tex_src_texture_offset);
             ASSERT_GE(texture, 0);
@@ -16145,7 +16333,7 @@ TEST_F(AGX3PackBinary, G17GArrayShadowDump)
 TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
 {
    uint8_t out[16], len;
-   { /* Native terrain main+0x350, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {40, 16, 32};
       const bool live[3] = {false, true, false}, discard[3] = {false, false, true};
       const uint8_t expected[] = {0x29, 0x91, 0x26, 0x29, 0x82, 0x20, 0x42, 0x02, 0x00, 0x04};
@@ -16153,7 +16341,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x360, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {28, 8, 0};
       const bool live[3] = {false, false, false}, discard[3] = {true, true, false};
       const uint8_t expected[] = {0x09, 0x09, 0x3d, 0x1d, 0x41, 0x20, 0x00, 0x08};
@@ -16161,7 +16349,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x368, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {30, 10, 0};
       const bool live[3] = {false, false, false}, discard[3] = {true, true, false};
       const uint8_t expected[] = {0x19, 0x0b, 0x3d, 0x1f, 0x41, 0x00, 0x00, 0x08};
@@ -16169,7 +16357,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x370, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {2, 12, 0};
       const bool live[3] = {false, false, false}, discard[3] = {true, true, false};
       const uint8_t expected[] = {0x39, 0x0d, 0x3d, 0x03, 0x41, 0x00, 0x00, 0x08};
@@ -16177,7 +16365,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x37c, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {4, 14, 0};
       const bool live[3] = {false, false, false}, discard[3] = {true, true, false};
       const uint8_t expected[] = {0x49, 0x0f, 0x3d, 0x05, 0x41, 0x00, 0x00, 0x08};
@@ -16185,7 +16373,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x3a6, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {42, 16, 12};
       const bool live[3] = {false, true, false}, discard[3] = {false, false, true};
       const uint8_t expected[] = {0x59, 0x91, 0x26, 0x2b, 0x81, 0x0c, 0x42, 0x02};
@@ -16193,7 +16381,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x3ae, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {44, 16, 20};
       const bool live[3] = {false, true, false}, discard[3] = {false, false, true};
       const uint8_t expected[] = {0x69, 0x91, 0x26, 0x2d, 0x81, 0x14, 0x42, 0x02};
@@ -16201,7 +16389,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x3e4, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {46, 16, 12};
       const bool live[3] = {false, false, false}, discard[3] = {false, true, true};
       const uint8_t expected[] = {0x79, 0x11, 0x2e, 0x2f, 0x81, 0x0c, 0x42, 0x02};
@@ -16209,7 +16397,7 @@ TEST(AGX3VertexExportAlu, NativeTerrainProducerBytes)
       ASSERT_EQ(len, sizeof(expected));
       EXPECT_EQ(memcmp(out, expected, len), 0);
    }
-   { /* Native terrain main+0x404, exact decoded/recomposed witness. */
+   { /* Native terrain shader form, exact decoded/recomposed witness. */
       const uint16_t src[3] = {4, 6, 8};
       const bool live[3] = {false, false, false}, discard[3] = {true, true, true};
       const uint8_t expected[] = {0x89, 0x07, 0x3e, 0x05, 0x82, 0x08, 0x42, 0x00, 0x00, 0x14};
@@ -16379,6 +16567,53 @@ TEST_F(AGX3PackBinary, G18GWorkgroupBarriersKeepLoadsInFlight)
       append(tail, barrier.bytes, barrier.length);
       for (unsigned n = 0; n < 9; ++n)
          m5_store_bytes(tail, n, n < 8 ? 1u << n : 0);
+      tail.insert(tail.end(), {0x0e, 0, 0, 0});
+      ASSERT_GE(code.size(), tail.size());
+      EXPECT_EQ(std::vector<uint8_t>(code.end() - tail.size(), code.end()),
+                tail);
+   }
+}
+
+/* G18G: the saturated register+minifloat add that hk's image-to-buffer copy
+ * uses to repack a UNORM texel, sat(x + -0.0), has wait fields for slots 1..6
+ * only. With seven or eight loads in flight its source comes back on slot 7
+ * or 8; that wait is retired through the band carrier on the destination and
+ * the add then waits on nothing. Up to slot 6 the add carries its own wait. */
+TEST_F(AGX3PackBinary, G18GSaturatedMinifloatAddRetiresLateSlots)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G18G;
+   key.dev.emit_agx3d = true;
+   for (unsigned loads : {6u, 7u, 8u}) {
+      SCOPED_TRACE(loads);
+      agx_builder *b = builder(enc);
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->nir = rzalloc(b->shader, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+      for (unsigned n = 0; n < loads; ++n)
+         agx_device_load_to(b, agx_register(8 + 4 * n, AGX_SIZE_32),
+                            agx_uniform(16, AGX_SIZE_64), agx_immediate(n),
+                            AGX_FORMAT_I32, 1, 0, false);
+      const unsigned src = 8 + 4 * (loads - 1);
+      agx_instr *add = agx_fadd_to(b, agx_register(2, AGX_SIZE_32),
+                                   agx_register(src, AGX_SIZE_32),
+                                   agx_immediate(0x80));
+      add->saturate = true;
+      agx_stop(b);
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty());
+
+      const uint16_t wait = 1u << (loads - 1);
+      std::vector<uint8_t> tail;
+      uint8_t bytes[AGX3_ALU_MAX_LENGTH], len;
+      if (wait & ~0x3fu) {
+         ASSERT_TRUE(agx3_alu_band_identity_wait(enc, 2, wait, bytes, &len));
+         append(tail, bytes, len);
+      }
+      ASSERT_TRUE(agx3_alu_fadd_minifloat_mod_g18g(
+         enc, 2, src, 0x80, false, true, AGX3_ALU_HINT_NONE, wait & 0x3f,
+         bytes, &len));
+      append(tail, bytes, len);
       tail.insert(tail.end(), {0x0e, 0, 0, 0});
       ASSERT_GE(code.size(), tail.size());
       EXPECT_EQ(std::vector<uint8_t>(code.end() - tail.size(), code.end()),

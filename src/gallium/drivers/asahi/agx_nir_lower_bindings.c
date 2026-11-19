@@ -475,9 +475,14 @@ lower(nir_builder *b, nir_instr *instr, void *data)
       /* Textures are mapped 1:1, so if we can prove it fits in a texture state
        * register, use the texture state register.
        */
+      /* A G18G bindful texel fetch still needs the handle: its level/layer
+       * clamp reads the descriptor (lower_regular_texture's txf robustness),
+       * while the instruction keeps naming the texture state entry
+       * (AGX_TEXTURE_FLAG_TABLE_INDEX, below). G17P and M5 make the fetches
+       * they crawl bindless through g17p_plain_txf_crawl instead. */
       if (tex->texture_index < AGX_NUM_TEXTURE_STATE_REGS &&
           nir_tex_instr_src_index(tex, nir_tex_src_texture_offset) == -1 &&
-          !force_bindless)
+          !force_bindless && !(options->g18 && tex->op == nir_texop_txf))
          return progress;
 
       /* G17G's native fetches with a run-time level are bindful: the

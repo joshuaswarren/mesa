@@ -291,6 +291,13 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       c->flags |= DRM_ASAHI_RENDER_FEW_PRIMITIVES;
    }
 
+   /* The A18 Pro loses the vertex output of the mesh workgroup in flight when
+    * the tiler heap runs out mid-draw. Ask the kernel to size the heap for
+    * mesh output before the render. */
+   if ((dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT) &&
+       cs->g17p_mesh_output)
+      c->flags |= DRM_ASAHI_RENDER_MESH_OUTPUT;
+
    if (agx_chip_g17_m5(dev->dev.chip))
       c->flags |= hk_m5_shader_write_class_flags(dev->dev.params.features,
                                                 cs->m5_shader_writes_memory);
@@ -1225,87 +1232,105 @@ hk_sparse_submission_updates_sstt(const struct vk_queue_submit *submission)
    return false;
 }
 
-/* Whether a command buffer runs a render with ray queries in its vertex or
- * fragment stage, which needs the render ray-query scratch reservation.
+/* The render stages (HK_RENDER_RQ_*) in which a command buffer runs ray
+ * queries, each of which needs its render ray-query scratch reservation.
  */
-static bool
+static unsigned
 hk_cmd_buffer_needs_render_rq(struct hk_cmd_buffer *cmdbuf)
 {
+   unsigned stages = 0;
+
    list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
-      if (cs->type == HK_CS_VDM &&
-          (cs->gen1_native_fragment_rq || cs->gen1_native_vertex_rq))
-         return true;
+      if (cs->type != HK_CS_VDM)
+         continue;
+      if (cs->gen1_native_vertex_rq)
+         stages |= HK_RENDER_RQ_VERTEX;
+      if (cs->gen1_native_fragment_rq)
+         stages |= HK_RENDER_RQ_FRAGMENT;
    }
 
-   return false;
+   return stages;
 }
 
-static bool
+static unsigned
 hk_submit_needs_render_rq(const struct vk_queue_submit *submit)
 {
+   unsigned stages = 0;
+
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
-      if (hk_cmd_buffer_needs_render_rq(
-             (struct hk_cmd_buffer *)submit->command_buffers[i]))
-         return true;
+      stages |= hk_cmd_buffer_needs_render_rq(
+         (struct hk_cmd_buffer *)submit->command_buffers[i]);
    }
 
-   return false;
-}
-
-/* Destroy the replaced kernel queue once all its work is complete, which
- * returns its render free list to the kernel.
- */
-static void
-hk_queue_reap_retired(struct hk_device *dev, struct hk_queue *queue)
-{
-   if (queue->drm.retired_id == UINT32_MAX)
-      return;
-
-   uint64_t point = 0;
-   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &point, 1) ||
-       point < queue->drm.retired_point)
-      return;
-
-   agx_destroy_command_queue(&dev->dev, queue->drm.retired_id);
-   queue->drm.retired_id = UINT32_MAX;
+   return stages;
 }
 
 /* Create the kernel queue for the first GPU submission, or replace it with
  * one that reserves render ray-query scratch when the first render using ray
- * queries arrives. *replaced says whether a kernel queue was replaced: the
- * caller then orders the submission after every earlier one on the queue
- * timeline, and queue-local command ordinals start again.
+ * queries in a stage the queue does not reserve yet arrives. Only the stages
+ * used so far are reserved: on a 40-core G17P both stages together need a
+ * contiguous ~359 MiB render free list, which the kernel's lower window may
+ * not hold, while one stage needs ~203 MiB. *replaced says whether a kernel
+ * queue was replaced: the caller then orders the submission after every
+ * earlier one on the queue timeline, and queue-local command ordinals start
+ * again.
  */
+static void hk_queue_restart_sync(struct hk_queue *queue);
+
 static VkResult
 hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
-                    bool render_rq, bool *replaced)
+                    unsigned render_rq, bool *replaced)
 {
    *replaced = false;
-   render_rq = render_rq && (dev->gen1_native_graphics_rq ||
-                             dev->gen1_native_fragment_rq);
-   if (queue->drm.id != UINT32_MAX && (queue->drm.render_rq || !render_rq))
+   if (!dev->gen1_native_graphics_rq)
+      render_rq &= ~HK_RENDER_RQ_VERTEX;
+   if (!dev->gen1_native_fragment_rq)
+      render_rq &= ~HK_RENDER_RQ_FRAGMENT;
+   if (queue->drm.id != UINT32_MAX && !(render_rq & ~queue->drm.render_rq))
       return VK_SUCCESS;
+   /* A replacement keeps every stage the queue reserved. */
+   render_rq |= queue->drm.render_rq;
+
+   /* Destroy the kernel queue being replaced before creating the new one,
+    * once its submitted work is complete. Until then the kernel keeps its
+    * compute pool and render free list, and on a 40-core G17P the lower
+    * window cannot also hold the new queue's: the submission that needs the
+    * new reservation would wait in the kernel for memory only this queue's
+    * destruction frees. This waits at most once per stage the queue adds.
+    */
+   const bool had_queue = queue->drm.id != UINT32_MAX;
+   if (had_queue) {
+      if (drmSyncobjTimelineWait(dev->dev.fd, &queue->drm.syncobj,
+                                 &queue->drm.timeline_value, 1, INT64_MAX,
+                                 DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL))
+         return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
+                          "Waiting for the replaced kernel queue failed: %s",
+                          strerror(errno));
+      agx_destroy_command_queue(&dev->dev, queue->drm.id);
+      queue->drm.id = UINT32_MAX;
+   }
 
    /* M5 and G17P admit GPU work at the API entrypoint, before semaphore
     * payloads move (hk_queue_admits_at_entry). Other devices retain admission
     * in the serialized driver callback. Host-only synchronization does not
     * need a kernel scheduling context. */
    const uint64_t layouts[2] = {
-      render_rq && dev->gen1_native_graphics_rq ? hk_gen1_ray_query_scs_layout(dev) : 0,
-      render_rq && dev->gen1_native_fragment_rq ? hk_gen1_ray_query_scs_layout(dev) : 0};
+      (render_rq & HK_RENDER_RQ_VERTEX) ? hk_gen1_ray_query_scs_layout(dev) : 0,
+      (render_rq & HK_RENDER_RQ_FRAGMENT) ? hk_gen1_ray_query_scs_layout(dev) : 0};
    const uint32_t id = agx_create_command_queue_with_render_scs(
       &dev->dev, (enum drm_asahi_priority)(queue->drm.virt_ring_idx - 1), layouts);
    if (id != UINT32_MAX) {
-      if (queue->drm.id != UINT32_MAX) {
-         /* Earlier work may still run on the old kernel queue. */
-         assert(queue->drm.retired_id == UINT32_MAX);
-         queue->drm.retired_id = queue->drm.id;
-         queue->drm.retired_point = queue->drm.timeline_value;
-         *replaced = true;
-      }
+      *replaced = had_queue;
       queue->drm.id = id;
       queue->drm.render_rq = render_rq;
       return VK_SUCCESS;
+   }
+
+   /* The replaced queue's work is complete, so a later queue starts like a
+    * first one. Keep the stages it reserved for that queue. */
+   if (had_queue) {
+      queue->drm.render_rq = render_rq;
+      hk_queue_restart_sync(queue);
    }
 
    const int error = errno;
@@ -1352,7 +1377,7 @@ hk_queue_admits_at_entry(const struct hk_device *dev)
  * queues do not consume the device-wide pool of kernel contexts.
  */
 static VkResult
-hk_queue_admit(struct hk_queue *queue, bool render_rq)
+hk_queue_admit(struct hk_queue *queue, unsigned render_rq)
 {
    /* Admission and callbacks must use the same backing queue and lock. */
    if (queue->vk.real_queue)
@@ -1367,7 +1392,7 @@ hk_queue_admit(struct hk_queue *queue, bool render_rq)
    bool replaced;
    VkResult result = hk_queue_ensure_drm(
       hk_queue_device(queue), queue,
-      render_rq && queue->drm.id == UINT32_MAX, &replaced);
+      queue->drm.id == UINT32_MAX ? render_rq : 0, &replaced);
    assert(!replaced);
    /* Only allocation errors are retryable here. Keep the existing lost-device
     * behavior for other failures; device-creation errors such as NOT_PERMITTED
@@ -1394,7 +1419,8 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
 
       const bool rq_capable =
          dev->gen1_native_graphics_rq || dev->gen1_native_fragment_rq;
-      bool needs_queue = false, render_rq = false;
+      bool needs_queue = false;
+      unsigned render_rq = 0;
       for (uint32_t i = 0; i < submitCount; i++) {
          for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
             VK_FROM_HANDLE(hk_cmd_buffer, cmd,
@@ -1402,8 +1428,8 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
             if (list_is_empty(&cmd->control_streams))
                continue;
             needs_queue = true;
-            render_rq = render_rq ||
-                        (rq_capable && hk_cmd_buffer_needs_render_rq(cmd));
+            if (rq_capable)
+               render_rq |= hk_cmd_buffer_needs_render_rq(cmd);
          }
       }
       if (needs_queue) {
@@ -1433,7 +1459,7 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
        */
       for (uint32_t i = 0; i < bindInfoCount; i++) {
          if (pBindInfo[i].imageOpaqueBindCount || pBindInfo[i].imageBindCount) {
-            VkResult result = hk_queue_admit(queue, false);
+            VkResult result = hk_queue_admit(queue, 0);
             if (result != VK_SUCCESS)
                return result;
             break;
@@ -1444,13 +1470,15 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
    return vk_common_QueueBindSparse(_queue, bindInfoCount, pBindInfo, fence);
 }
 
-/* A submission a sibling kernel queue may run (hk_queue::sib): it depends on
- * no earlier submission (every stream's prior is zero or names a command of
- * this submission, see resolve_one) and holds only plain compute streams,
- * without query access, timestamps, scratch or ray queries. Anything that
- * needs the primary kernel queue's own state stays there. */
+/* A submission a sibling kernel queue may run (hk_queue::sib): its streams
+ * dispatch at least sib.min_threads threads each (or only internal work), it
+ * depends on no earlier submission (every stream's prior is zero or names a
+ * command of this submission, see resolve_one) and holds only plain compute
+ * streams, without query access, timestamps, scratch or ray queries.
+ * Anything that needs the primary kernel queue's own state stays there. */
 static bool
-hk_sibling_eligible(struct hk_device *dev, const struct vk_queue_submit *submit,
+hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
+                    const struct vk_queue_submit *submit,
                     const uint64_t base[HK_SYNC_NUM_SQ], unsigned command_count,
                     bool kernel_cumulative)
 {
@@ -1466,6 +1494,11 @@ hk_sibling_eligible(struct hk_device *dev, const struct vk_queue_submit *submit,
          (struct hk_cmd_buffer *)submit->command_buffers[i];
 
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         /* Overlapping kicks of a few threads costs more in ordering than it
+          * gains (a 32-thread dispatch stream at depth 4 ran 13% slower). */
+         if (cs->sib_threads && !cs->sib_indirect &&
+             cs->sib_threads < queue->sib.min_threads)
+            return false;
          if (cs->type != HK_CS_CDM || cs->query_access ||
              cs->timestamp.start.handle || cs->timestamp.end.handle ||
              cs->scratch.cs.main || cs->scratch.cs.preamble ||
@@ -1482,6 +1515,28 @@ hk_sibling_eligible(struct hk_device *dev, const struct vk_queue_submit *submit,
    }
 
    return true;
+}
+
+/* Whether a sibling kernel queue may take the next eligible submission: at
+ * least sib.min_in_flight earlier submissions of this queue are still in
+ * flight (submitted_point is the queue timeline's last point before this
+ * submission). Two kicks run at once on sibling queues, so each takes about
+ * twice as long; with only one other submission in flight both then finish
+ * together and the GPU idles for the whole completion-to-resubmit round trip
+ * (a depth-2 compute stream ran 19% slower with siblings on the M4 Pro).
+ * With work queued behind them, the overlap fills the launch and drain gaps
+ * between kicks instead. */
+static bool
+hk_sibling_deep(struct hk_device *dev, struct hk_queue *queue,
+                uint64_t submitted_point)
+{
+   uint64_t done = 0;
+
+   if (!queue->sib.min_in_flight)
+      return true;
+   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1))
+      return false;
+   return submitted_point >= done + queue->sib.min_in_flight;
 }
 
 /* A stream's prior in the ordinals of the kernel queue it is sent to: a
@@ -1543,8 +1598,6 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
          return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
       return queue_submit_empty(dev, queue, submit);
    }
-
-   hk_queue_reap_retired(dev, queue);
 
    bool replaced;
    VkResult queue_result = hk_queue_ensure_drm(
@@ -1772,8 +1825,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
    bool sib_earlier = false;
    if (queue->sib.count > 1 && !replaced && !flush_sstt && !unlikely(anatomy) &&
-       hk_sibling_eligible(dev, submit, prior_base, command_count,
-                           kernel_cumulative)) {
+       hk_sibling_eligible(dev, queue, submit, prior_base, command_count,
+                           kernel_cumulative) &&
+       hk_sibling_deep(dev, queue, first_chunk_point - 1)) {
       sib_target = queue->sib.next;
       queue->sib.next = (queue->sib.next + 1) % queue->sib.count;
       if (sib_target && queue->sib.id[sib_target] == UINT32_MAX) {
@@ -2458,7 +2512,6 @@ hk_queue_create(struct hk_device *dev,
       (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
 
    queue->drm.id = UINT32_MAX;
-   queue->drm.retired_id = UINT32_MAX;
    for (unsigned i = 0; i < HK_QUEUE_SIBLINGS_MAX; ++i)
       queue->sib.id[i] = UINT32_MAX;
    queue->sib.count = 1;
@@ -2466,11 +2519,17 @@ hk_queue_create(struct hk_device *dev,
        queue->sync.exact_prior &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)) {
+      /* The M4 Pro runs two compute kicks of one context at once. */
       queue->sib.count = CLAMP(
-         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES", 1), 1,
-         HK_QUEUE_SIBLINGS_MAX);
+         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES",
+                              agx_is_m4_pro(&dev->dev) ? 3 : 1),
+         1, HK_QUEUE_SIBLINGS_MAX);
+      queue->sib.min_in_flight =
+         debug_get_num_option("ASAHI_G17P_SIBLING_MIN_IN_FLIGHT", 2);
+      queue->sib.min_threads =
+         debug_get_num_option("ASAHI_G17P_SIBLING_MIN_THREADS", 65536);
    }
-   queue->drm.render_rq = false;
+   queue->drm.render_rq = 0;
    queue->drm.virt_ring_idx = drm_priority + 1;
 
    if (drmSyncobjCreate(dev->dev.fd, 0, &queue->drm.syncobj)) {
@@ -2532,7 +2591,7 @@ hk_queue_create(struct hk_device *dev,
       /* Without the render ray-query reservation; a render that needs it
        * replaces this kernel queue at submission. */
       bool replaced;
-      result = hk_queue_ensure_drm(dev, queue, false, &replaced);
+      result = hk_queue_ensure_drm(dev, queue, 0, &replaced);
       if (result != VK_SUCCESS) {
          hk_queue_finish(dev, queue);
          return result;
@@ -2587,8 +2646,6 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
    drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);
    if (queue->drm.id != UINT32_MAX)
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
-   if (queue->drm.retired_id != UINT32_MAX)
-      agx_destroy_command_queue(&dev->dev, queue->drm.retired_id);
    for (unsigned i = 1; i < HK_QUEUE_SIBLINGS_MAX; ++i) {
       if (queue->sib.id[i] != UINT32_MAX)
          agx_destroy_command_queue(&dev->dev, queue->sib.id[i]);

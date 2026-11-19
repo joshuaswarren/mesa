@@ -27,6 +27,7 @@
 #include "util/macros.h"
 #include "util/os_file.h"
 #include "util/os_time.h"
+#include "util/u_math.h"
 #include "util/xmlconfig.h"
 #include "vk_device.h"
 #include "vk_fence.h"
@@ -46,7 +47,28 @@
 #include <stdio.h>
 
 #ifndef _WIN32
+#include <sys/mman.h>
 #include <unistd.h>
+
+void *
+wsi_reserve_aligned(size_t size, uint64_t align)
+{
+   const uint64_t page = sysconf(_SC_PAGESIZE);
+   align = MAX2(align, page);
+   size = align64(size, page);
+   const size_t len = size + align;
+   uint8_t *base = mmap(NULL, len, PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+   if (base == MAP_FAILED)
+      return NULL;
+
+   uint8_t *addr = (uint8_t *)(uintptr_t)align64((uintptr_t)base, align);
+   if (addr > base)
+      munmap(base, addr - base);
+   if (base + len > addr + size)
+      munmap(addr + size, base + len - (addr + size));
+   return addr;
+}
 #endif
 
 uint64_t WSI_DEBUG;
@@ -105,9 +127,17 @@ wsi_device_init(struct wsi_device *wsi,
    wsi->pci_bus_info.sType =
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
    wsi->pci_bus_info.pNext = &wsi->drm_info;
+   const struct vk_device_extension_table *supported_extensions =
+      &vk_physical_device_from_handle(pdevice)->supported_extensions;
+   VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
+      .pNext = &wsi->pci_bus_info,
+   };
    VkPhysicalDeviceProperties2 pdp2 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-      .pNext = &wsi->pci_bus_info,
+      .pNext = supported_extensions->EXT_external_memory_host
+                  ? (void *)&host_props
+                  : (void *)&wsi->pci_bus_info,
    };
    GetPhysicalDeviceProperties2(pdevice, &pdp2);
 
@@ -168,10 +198,11 @@ wsi_device_init(struct wsi_device *wsi,
          wsi->timeline_semaphore_export_handle_types |= handle_type;
    }
 
-   const struct vk_device_extension_table *supported_extensions =
-      &vk_physical_device_from_handle(pdevice)->supported_extensions;
    wsi->has_import_memory_host =
       supported_extensions->EXT_external_memory_host;
+   if (wsi->has_import_memory_host)
+      wsi->import_memory_host_alignment =
+         host_props.minImportedHostPointerAlignment;
    wsi->has_present_wait = supported_extensions->KHR_present_wait ||
                            supported_extensions->KHR_present_wait2;
 
@@ -3375,9 +3406,18 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
          info->select_blit_dst_memory_type(wsi, reqs.memoryTypeBits),
    };
 
+   /* An imported host pointer and its size are multiples of
+    * minImportedHostPointerAlignment (VUID-VkImportMemoryHostPointerInfoEXT-
+    * pHostPointer-01749, VUID-VkMemoryAllocateInfo-allocationSize-01745).
+    */
    void *sw_host_ptr = NULL;
-   if (info->alloc_shm)
-      sw_host_ptr = info->alloc_shm(image, reqs.size);
+   if (info->alloc_shm) {
+      const uint64_t align = MAX2(wsi->import_memory_host_alignment, 1);
+      buf_mem_info.allocationSize = align64(reqs.size, align);
+      sw_host_ptr = info->alloc_shm(image, buf_mem_info.allocationSize, align);
+      if (sw_host_ptr == NULL)
+         buf_mem_info.allocationSize = reqs.size;
+   }
 
    VkExportMemoryAllocateInfo memory_export_info;
    VkImportMemoryHostPointerInfoEXT host_ptr_info;
@@ -3774,8 +3814,13 @@ wsi_create_cpu_linear_image_mem(const struct wsi_swapchain *chain,
    };
 
    void *sw_host_ptr = NULL;
-   if (info->alloc_shm)
-      sw_host_ptr = info->alloc_shm(image, layout.size);
+   if (info->alloc_shm) {
+      const uint64_t align = MAX2(wsi->import_memory_host_alignment, 1);
+      const uint64_t size = align64(MAX2(layout.size, reqs.size), align);
+      sw_host_ptr = info->alloc_shm(image, size, align);
+      if (sw_host_ptr != NULL)
+         memory_info.allocationSize = size;
+   }
 
    VkImportMemoryHostPointerInfoEXT host_ptr_info;
    if (sw_host_ptr != NULL) {

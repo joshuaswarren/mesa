@@ -1189,7 +1189,7 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
             nir_cf_node_as_loop(node)->control = nir_loop_control_unroll;
       }
       NIR_PASS(_, b->shader, nir_opt_constant_folding);
-      NIR_PASS(_, b->shader, agx_nir_lower_g17p_indexed_samplers);
+      NIR_PASS(_, b->shader, agx_nir_lower_g17p_indexed_samplers, false);
       NIR_PASS(_, b->shader, nir_shader_intrinsics_pass, lower_native_emrt_uniforms,
                nir_metadata_control_flow, (void *)key);
    }
