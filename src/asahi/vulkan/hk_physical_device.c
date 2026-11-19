@@ -1324,11 +1324,18 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxMeshOutputVertices = 256,
       .maxMeshOutputPrimitives = 256,
       .maxMeshOutputLayers = 8,
-      /* A multiview mesh draw replays once per view (hk_foreach_view), which
-       * works up to HK_MAX_MULTIVIEW_VIEW_COUNT. Temporarily 16: CTS
-       * mesh_shader.ext.properties.max_view_index builds its view mask as
-       * (1u << count) - 1, undefined at 32. Raise it once the CTS is fixed. */
-      .maxMeshMultiviewViewCount = features->multiviewMeshShader ? 16 : 1,
+      /* A multiview mesh draw replays once per view (hk_foreach_view walks
+       * every bit of the 32-bit view mask) and writes the view index to the
+       * layer, so mesh shaders take as many views as every other stage.
+       *
+       * VK-GL-CTS dEQP-VK.mesh_shader.ext.properties.max_view_index builds
+       * its view mask as (1u << count) - 1u, which is undefined for 32
+       * views (on AArch64 it yields 0, and only layer 0 is drawn), so that
+       * case fails against this limit until the CTS computes the mask
+       * without the overflowing shift.
+       */
+      .maxMeshMultiviewViewCount =
+         features->multiviewMeshShader ? HK_MAX_MULTIVIEW_VIEW_COUNT : 1,
       .meshOutputPerVertexGranularity = 32,
       .meshOutputPerPrimitiveGranularity = 32,
       .maxPreferredTaskWorkGroupInvocations = 32,
@@ -2234,7 +2241,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       agx_chip_g17_m5(pdev->dev.chip) || pdev->dev.chip == AGX_CHIP_G17P;
 
    supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
-      hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE &&
       (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2);
 
    /* Gen5 adds native component-wise minimum/maximum sampler reduction. */
@@ -2614,11 +2620,13 @@ hk_GetPhysicalDeviceQueueFamilyProperties2(
          if (prio) {
             STATIC_ASSERT(ARRAY_SIZE(hk_global_queue_priorities) <=
                           VK_MAX_GLOBAL_PRIORITY_SIZE_KHR);
-            /* The native kernel reserves REALTIME and only accepts HIGH on
-             * M5. Report the same classes that queue creation can admit. */
-            prio->priorityCount = agx_chip_g17_m5(pdev->dev.chip) ? 3 : 2;
+            /* The kernel reserves REALTIME. HIGH is offered on every chip:
+             * the kernel decides at queue creation whether the GPU schedules
+             * it and whether the caller may use it, and a refusal is the
+             * VK_ERROR_NOT_PERMITTED the spec allows for a supported class. */
+            prio->priorityCount = ARRAY_SIZE(hk_global_queue_priorities);
             memcpy(&prio->priorities, hk_global_queue_priorities,
-                   prio->priorityCount * sizeof(hk_global_queue_priorities[0]));
+                   sizeof(hk_global_queue_priorities));
          }
       }
    }

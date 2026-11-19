@@ -8,7 +8,6 @@
  */
 
 #include <stdint.h>
-#include "asahi/compiler/agx_debug.h"
 #include "asahi/compiler/agx_nir_texture.h"
 #include "asahi/layout/layout.h"
 #include "compiler/nir/nir_builder.h"
@@ -825,8 +824,7 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
     * texture fetches and resolves. Store them first and use the render blitter
     * to fetch and average every sample until EOT can preserve both outputs. */
    const bool g18_msaa4 =
-      agx_device(ctx->base.screen)->chip == AGX_CHIP_G18G &&
-      agx_g18_msaa4_enabled();
+      agx_device(ctx->base.screen)->chip == AGX_CHIP_G18G;
 
    /* G17G resolves through u_blitter's sample fetches instead. Attaching
     * the resolve to the batch that drew the multisample image makes its EOT

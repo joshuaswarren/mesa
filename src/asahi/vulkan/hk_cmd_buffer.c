@@ -194,8 +194,6 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    hk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
    hk_descriptor_state_fini(cmd, &cmd->state.rt.descriptors);
 
-   hk_cmd_pool_free_gen1_as_chunks(pool, &cmd->gen1_as_table_chunks);
-
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_MAIN, &cmd->uploader.main.bos);
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_USC, &cmd->uploader.usc.bos);
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_ROOT, &cmd->uploader.root.bos);
@@ -271,7 +269,6 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    list_inithead(&cmd->uploader.usc.bos);
    list_inithead(&cmd->uploader.root.bos);
    list_inithead(&cmd->vdm_allocations);
-   list_inithead(&cmd->gen1_as_table_chunks);
    list_inithead(&cmd->control_streams);
 
    *cmd_buffer_out = &cmd->vk;

@@ -92,24 +92,7 @@ hk_rt_single_kernel(const struct hk_ray_tracing_pipeline *pipeline)
 }
 
 /*
- * Publish the per-kernel threadgroup counts from the GPU and record one
- * indirect dispatch per kernel.  `record_addr` is the record the kernels will
- * read; `dims_addr` is where the three launch dimensions live right now;
- * `record_dims_addr` is where they must be copied to, or zero when the record
- * already contains them.
- */
-static bool
-hk_m5_rt_single_kick_enabled(void)
-{
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = debug_get_bool_option("ASAHI_M5_RT_SINGLE_KICK", true);
-   return enabled;
-}
-
-/*
- * Single-kick form of the per-raygen selection on M5 (default; set
- * ASAHI_M5_RT_SINGLE_KICK=0 to record K indirect dispatches instead), shaped like
+ * Single-kick form of the per-raygen selection, used on M5. It is shaped like
  * Metal's indirect command buffers (as the native M5 driver executes them):
  * the host encodes each kernel's direct launch as a template,
  * one select invocation writes the chosen launch into a slot, and the control
@@ -183,12 +166,20 @@ hk_trace_rays_single_kick(struct hk_cmd_buffer *cmd,
    cs->current = (uint32_t *)(out + AGX3_CDM_BARRIER_SIZE +
                               AGX3_CDM_STREAM_LINK_SIZE);
    cs->stats.cmds++;
-   if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false))
-      fprintf(stderr, "M5 single-kick: %u templates, slot 0x%" PRIx64 "\n",
-              count, slot.gpu);
    return true;
 }
 
+/*
+ * Publish the per-kernel threadgroup counts from the GPU and record one
+ * indirect dispatch per kernel.  `record_addr` is the record the kernels will
+ * read; `dims_addr` is where the three launch dimensions live right now;
+ * `record_dims_addr` is where they must be copied to, or zero when the record
+ * already contains them.
+ *
+ * On M5 this is done in a single kick (hk_trace_rays_single_kick()); the
+ * indirect dispatches remain for the other chips and for a pipeline whose
+ * kernels could not be templated.
+ */
 static void
 hk_trace_rays_select_and_dispatch(struct hk_cmd_buffer *cmd,
                                   struct hk_ray_tracing_pipeline *pipeline,
@@ -197,9 +188,6 @@ hk_trace_rays_select_and_dispatch(struct hk_cmd_buffer *cmd,
                                   uint64_t dims_addr)
 {
    const uint32_t count = pipeline->kernel_count;
-   if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false))
-      fprintf(stderr, "M5 trace rays: %u raygen kernels, single kick %d\n",
-              count, hk_m5_rt_single_kick_enabled());
 
    uint32_t handles[count];
    for (uint32_t k = 0; k < count; ++k)
@@ -211,7 +199,6 @@ hk_trace_rays_select_and_dispatch(struct hk_cmd_buffer *cmd,
       return;
 
    if (agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
-       hk_m5_rt_single_kick_enabled() &&
        hk_trace_rays_single_kick(cmd, pipeline, record_addr, record_dims_addr,
                                  dims_addr, handles_addr))
       return;
@@ -377,6 +364,5 @@ hk_CmdSetRayTracingPipelineStackSizeKHR(VkCommandBuffer commandBuffer,
    /* Each kernel's stack is static scratch inside its compiled binary, sized
     * at pipeline creation for maxPipelineRayRecursionDepth.  A dynamic size
     * cannot shrink it and must not grow it, so this is deliberately a no-op
-    * rather than a partial implementation.  Documented in
-    * docs/G17P_RAYTRACING_PIPELINE_ABI.md. */
+    * rather than a partial implementation. */
 }

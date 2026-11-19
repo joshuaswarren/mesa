@@ -1467,6 +1467,21 @@ agx_fb_has_colour(const struct pipe_framebuffer_state *fb)
    return false;
 }
 
+/* G17G's tile programs move one colour attachment and it renders one layer,
+ * so it draws and clears a framebuffer with more colour attachments or layers
+ * in passes that each bind part of it and then bind the whole framebuffer
+ * again (agx_g17g_split_mrt, agx_g17g_layered_draw, agx_g17g_layered_clear).
+ * Each of those binds ends a Z/S merge, after which the passes and the draws
+ * that follow would write colour the application never bound. These are the
+ * conditions under which agx_draw_vbo() and agx_clear() take those paths. */
+static bool
+agx_fb_drawn_in_passes(const struct agx_device *dev,
+                       const struct pipe_framebuffer_state *fb)
+{
+   return agx_chip_g17_m5(dev->chip) &&
+          (fb->nr_cbufs > 1 || util_framebuffer_get_num_layers(fb) > 1);
+}
+
 /* If the app binds a framebuffer with only a depth/stencil surface, and an
  * active render batch already renders to that same surface with the same
  * size, keep drawing into that batch: the draws are those of the batch's
@@ -1476,6 +1491,8 @@ static void
 agx_try_zs_merge(struct agx_context *ctx,
                  const struct pipe_framebuffer_state *state)
 {
+   const struct agx_device *dev = agx_device(ctx->base.screen);
+
    if (!debug_get_option_zs_merge() || !state->zsbuf.texture ||
        agx_fb_has_colour(state) || state->resolve || state->viewmask)
       return;
@@ -1486,6 +1503,7 @@ agx_try_zs_merge(struct agx_context *ctx,
          continue;
       struct agx_batch *b = &ctx->batches.slots[idx];
       if (agx_batch_is_compute(b) || !agx_fb_has_colour(&b->key) ||
+          agx_fb_drawn_in_passes(dev, &b->key) ||
           b->key.resolve || b->key.viewmask ||
           b->key.width != state->width || b->key.height != state->height ||
           b->key.samples != state->samples ||
@@ -1600,9 +1618,6 @@ image_view_for_surface(const struct pipe_surface *surf)
    };
 }
 
-/* msaa163 (AGX_G18_MSAA4, default off): whether the knob admits G18G
- * four-sample colour rendering at all. Off, every path below keeps its
- * existing refusal and no emitted byte changes. */
 static struct agx_tilebuffer_layout
 agx_gallium_tilebuffer_layout(const struct agx_device *dev,
                               const enum pipe_format *formats,
@@ -1620,8 +1635,7 @@ agx_gallium_tilebuffer_layout(const struct agx_device *dev,
    /* Native G18 retains three RGBA32 targets at 2x/4x: 96 KiB and 2048
     * raster samples, with the existing 32-KiB/1024-sample limits at 1x. */
    const bool g18_native = dev->chip == AGX_CHIP_G18G &&
-      (nr_samples == 1 || (agx_g18_msaa4_enabled() &&
-                          (nr_samples == 2 || nr_samples == 4)));
+      (nr_samples == 1 || nr_samples == 2 || nr_samples == 4);
    /* Native1044 keeps up to eight RGBA32 outputs resident, with a 128-byte
     * sample and 32x32 tile. Native855 (verified in 1076) shows identical
     * fragment stores, background, end-of-tile and setup programs for
@@ -1651,26 +1665,10 @@ agx_gallium_tilebuffer_layout(const struct agx_device *dev,
                                         kernel_native_samples))
       return agx_build_tilebuffer_layout_g18_mixed(formats, nr_cbufs);
 
-   /* Native1121 (run 1130): Apple keeps an admitted mixed-format layout in a
-    * 32x32 tile of its whole sample (req2-clear: specLM f19 = f20 = 5,
-    * f22 = 40, i.e. 40 KiB). Budget exactly that allocation where the kernel
-    * admits it (agx_g18g_mixed_tile_bytes); the offsets do not move. */
-   const unsigned mixed_bytes =
-      g18_native && !raw32
-         ? agx_g18g_mixed_tile_bytes(formats, nr_cbufs, nr_samples, layered,
-                                     kernel_native_samples)
-         : 0;
    return agx_build_tilebuffer_layout_with_limits(
       formats, nr_cbufs, nr_samples, layered, raw32 ? 128 : 0,
-      raw32 ? 131072 : mixed_bytes ? MAX2(mixed_bytes, 32768)
-      : g18_native ? (nr_samples == 1 ? 32768 : 98304) : 0,
+      raw32 ? 131072 : g18_native ? (nr_samples == 1 ? 32768 : 98304) : 0,
       g18_native ? (nr_samples == 1 ? 1024 : 2048) : 0);
-}
-
-static bool
-agx_g18_msaa4(const struct agx_device *dev)
-{
-   return dev->chip == AGX_CHIP_G18G && agx_g18_msaa4_enabled();
 }
 
 static bool
@@ -1793,7 +1791,7 @@ agx_g18_msaa4_storage(const struct agx_device *dev,
       (rsrc->base.target == PIPE_TEXTURE_2D && rsrc->base.array_size == 1) ||
       (rsrc->base.target == PIPE_TEXTURE_2D_ARRAY && rsrc->base.array_size >= 1);
 
-   return agx_g18_msaa4(dev) &&
+   return dev->chip == AGX_CHIP_G18G &&
           (rsrc->base.nr_samples == 2 || rsrc->base.nr_samples == 4) &&
           target_ok && rsrc->base.last_level == 0 &&
           rsrc->base.depth0 == 1 && !rsrc->layout.compressed &&
@@ -1818,7 +1816,7 @@ agx_g18_msaa4_zs_surface(const struct agx_device *dev,
     * background/end-of-tile programs. A single non-zero layer of a D32
     * array therefore selects its base address only, as colour does. */
    const bool single_d32_layer =
-      agx_g18_native1109_enabled() && surf->first_layer == surf->last_layer &&
+      surf->first_layer == surf->last_layer &&
       rsrc->layout.format == PIPE_FORMAT_Z32_FLOAT && !stencil &&
       rsrc->base.target == PIPE_TEXTURE_2D_ARRAY;
    return surf->level == 0 &&
@@ -1847,10 +1845,10 @@ static bool
 agx_g18_msaa4_tile_layout(const struct agx_device *dev,
                           const struct agx_tilebuffer_layout *tib)
 {
-   if (agx_g18_msaa4(dev) && agx_g18g_ms_mrt_mask(tib))
+   if (dev->chip == AGX_CHIP_G18G && agx_g18g_ms_mrt_mask(tib))
       return true;
 
-   if (!agx_g18_msaa4(dev) ||
+   if (dev->chip != AGX_CHIP_G18G ||
        (tib->nr_samples != 2 && tib->nr_samples != 4) ||
        (tib->sample_size_B != 8 && tib->sample_size_B != 16) ||
        tib->tile_size != (tib->nr_samples == 2 ? 32 * 32 : 32 * 16) ||
@@ -3053,10 +3051,10 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
             if (key->layer_as_varying)
                NIR_PASS(_, nir, agx_nir_lower_default_layer);
             NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs, key->layer_as_varying,
-                     false);
+                     false, -1);
          } else {
             NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs,
-                     agx_native_graphics(dev), false);
+                     agx_native_graphics(dev), false, -1);
          }
       } else {
          if (agx_chip_g17_m5(dev->chip) && !nir->info.vs.tes_poly)
@@ -3149,7 +3147,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
       /* AGX3 has no equivalent of the AGX2 machine code agx_fast_link()
        * splices around a linked fragment program to run it once per sample.
        * Apple's own compiler unrolls the body instead, once per sample, in one
-       * program (probes/README-g17p-per-sample-fragment.md).
+       * program.
        *
        * An unrolled main cannot carry a separate epilog: the stores the split
        * moves out -- colour, and depth/stencil, which it defers past discards
@@ -3171,8 +3169,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
       const bool unrolled_samples =
          ((agx_native_graphics(dev) && key->nr_samples > 1) ||
           (dev->chip == AGX_CHIP_G18G &&
-           (key->nr_samples == 2 || key->nr_samples == 4) &&
-           agx_g18_msaa4_enabled())) &&
+           (key->nr_samples == 2 || key->nr_samples == 4))) &&
          nir->info.fs.uses_sample_shading &&
          !(nir->info.outputs_written & ~zs_outputs);
 
@@ -3274,7 +3271,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          /* Nothing is left for the linker to wrap. */
          nir->info.fs.uses_sample_shading = false;
          epilog_key.sample_shading = false;
-      } else if (dev->chip == AGX_CHIP_G18G && agx_g18_msaa4_enabled() &&
+      } else if (dev->chip == AGX_CHIP_G18G &&
                  (key->nr_samples == 2 || key->nr_samples == 4) &&
                  nir->info.fs.uses_sample_shading && !nir->info.writes_memory) {
          /* Each invocation exports its own colours. The epilog repeats the
@@ -3405,7 +3402,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          NIR_PASS(_, nir, agx_nir_lower_sample_mask_one_update_m5);
       else
          NIR_PASS(_, nir, agx_nir_lower_sample_mask);
-      if (dev->chip == AGX_CHIP_G18G && agx_g18_msaa4_enabled() &&
+      if (dev->chip == AGX_CHIP_G18G &&
           (key->nr_samples == 2 || key->nr_samples == 4) &&
           !nir->info.fs.early_fragment_tests) {
          NIR_PASS(_, nir, agx_nir_mark_g18_sample_mask_tests);
@@ -3514,10 +3511,10 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          if (layer_as_varying)
             NIR_PASS(_, gs_copy, agx_nir_lower_default_layer);
          NIR_PASS(_, gs_copy, agx_nir_lower_uvs, &uvs, layer_as_varying,
-                  false);
+                  false, -1);
       } else {
          NIR_PASS(_, gs_copy, agx_nir_lower_uvs, &uvs,
-                  agx_native_graphics(dev), false);
+                  agx_native_graphics(dev), false, -1);
       }
 
       compiled->gs_copy =
@@ -4526,7 +4523,7 @@ build_g17p_fs_epilog(nir_builder *b, const void *key_)
    NIR_PASS(_, b->shader, agx_nir_lower_g17p_tile_samples, key->nr_samples);
 }
 
-/* msaa163 P6 (AGX_G18_MSAA4): G18G's per-pixel four-sample epilog stores the
+/* msaa163 P6: G18G's per-pixel four-sample epilog stores the
  * colour once through the covered-sample register, as Apple's G18 4x
  * fragment does (rld 210a42000000 ; lstcol 270605082901ad02000071440000,
  * native-msaa-reference-147). Without it the store keeps the 0xFF immediate,
@@ -4609,7 +4606,7 @@ asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
       prolog = agx_build_meta_shader_internal(
          ctx, build_fs_prolog, &key->prolog.fs, sizeof(key->prolog.fs), true,
          false, key->prolog.fs.cf_base,
-         agx_g18_msaa4(agx_device(ctx->base.screen))
+         agx_device(ctx->base.screen)->chip == AGX_CHIP_G18G
             ? key->epilog.fs.nr_samples : 0,
          false);
 
@@ -4622,7 +4619,7 @@ asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
          agx_native_graphics(agx_device(ctx->base.screen)) ||
                (agx_chip_g17_m5(chip) && key->epilog.fs.nr_samples > 1)
             ? build_g17p_fs_epilog
-         : agx_g18_msaa4(agx_device(ctx->base.screen)) &&
+         : agx_device(ctx->base.screen)->chip == AGX_CHIP_G18G &&
                (key->epilog.fs.nr_samples == 2 || key->epilog.fs.nr_samples == 4)
             ? build_g18_msaa4_fs_epilog
             : agx_nir_fs_epilog,
@@ -4998,7 +4995,7 @@ agx_update_fs(struct agx_batch *batch)
 
    /* G18 coverage updates have different encodings at 1x and 4x. Never
     * reuse a 1x discard/sample-mask program on a multisample attachment. */
-   if (agx_g18_msaa4(dev))
+   if (dev->chip == AGX_CHIP_G18G)
       key.nr_samples = nr_samples;
 
    if (ctx->stage[MESA_SHADER_FRAGMENT].shader->info.uses_fbfetch) {
@@ -5029,8 +5026,6 @@ agx_update_fs(struct agx_batch *batch)
 
       .prolog.fs.cull_distance_size =
          agx_last_uncompiled_vgt(ctx)->info.cull_distance_size,
-
-      .prolog.fs.native_cull_constant_planes = dev->chip == AGX_CHIP_G18G,
 
       .prolog.fs.polygon_stipple =
          ctx->rast->base.poly_stipple_enable &&
@@ -5080,7 +5075,7 @@ agx_update_fs(struct agx_batch *batch)
     * Keep preservation when any part can update coverage, depth, stencil,
     * memory or another colour attachment. Such programs are not no-ops.
     */
-   if (dev->chip == AGX_CHIP_G18G && agx_g18_native_mixed_enabled() &&
+   if (dev->chip == AGX_CHIP_G18G &&
        !(ctx->blend->store &
          (PIPE_CLEAR_COLOR0 * BITFIELD_MASK(batch->key.nr_cbufs))) &&
        ctx->fs->b.info.tag_write_disable &&
@@ -5111,15 +5106,15 @@ agx_update_fs(struct agx_batch *batch)
    /* Both colour parts have already been expanded over these samples. A
     * shader with memory writes retains the external-loop refusal until its
     * side effects can be predicated on each sample's live coverage. */
-   if (agx_g18_msaa4(dev) && (nr_samples == 2 || nr_samples == 4) &&
+   if (dev->chip == AGX_CHIP_G18G && (nr_samples == 2 || nr_samples == 4) &&
        ctx->fs->so && !ctx->fs->so->info.writes_memory)
       link_key.nr_samples_shaded = 0;
 
    /* A depth-only sample-shaded G18 main already contains its statically
     * unrolled depth stores. Keep write_z in the compiled shader's state
     * metadata for PPP, but do not link another store from unused exports. */
-   if (agx_g18_msaa4(dev) && (nr_samples == 2 || nr_samples == 4) && ctx->fs->so &&
-       ctx->fs->so->info.uses_sample_shading &&
+   if (dev->chip == AGX_CHIP_G18G && (nr_samples == 2 || nr_samples == 4) &&
+       ctx->fs->so && ctx->fs->so->info.uses_sample_shading &&
        !ctx->fs->epilog_key.sample_shading &&
        ctx->fs->b.info.writes_sample_mask && ctx->fs->epilog_key.write_z) {
       link_key.epilog.fs.link.write_z = false;
@@ -5917,7 +5912,7 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
       agx_batch_reads(batch, tex->rsrc);
 
       /* Admit only resources covered by the native-backed stored path. */
-      if (agx_g18_msaa4(dev) && rsrc->base.nr_samples > 1 &&
+      if (dev->chip == AGX_CHIP_G18G && rsrc->base.nr_samples > 1 &&
           !agx_g18_msaa4_storage(dev, rsrc, tex->format)) {
          agx_native_descriptor_reject_batch(batch, "G18G multisample texture");
          return;
@@ -6008,7 +6003,7 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
       if (cs->so->info.image_address_mask & BITFIELD64_BIT(i)) {
          uint32_t metadata[10];
          if (!agx_image_address_metadata(metadata, view) ||
-             (view->resource->nr_samples > 1 && !agx_g18_msaa4(dev))) {
+             (view->resource->nr_samples > 1 && dev->chip != AGX_CHIP_G18G)) {
             agx_native_descriptor_reject_batch(batch, "G18G raw image layout");
             return;
          }
@@ -6019,7 +6014,7 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
        * raw MS stores use the validated software metadata above. Neither
        * path consumes a PBE; ordinary image writes and sideband users still
        * require their own native encoding proof. */
-      if (agx_g18_msaa4(dev) && view->resource &&
+      if (dev->chip == AGX_CHIP_G18G && view->resource &&
           view->resource->nr_samples > 1 &&
           (needs_pbe || cs->so->info.reads_image_sideband ||
            !agx_g18_msaa4_storage(dev, agx_resource(view->resource),
@@ -9307,7 +9302,7 @@ agx_build_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key,
    const unsigned word_mask = dev->chip == AGX_CHIP_G18G
                                 ? agx_g18g_word_mrt_mask(&key->tib) |
                                      agx_g18g_raw32_mrt_mask(&key->tib) |
-                                     agx_g18g_mixed_mrt_mask(&key->tib) : 0;
+                                     agx_g18g_native_mixed_mask(&key->tib) : 0;
    const unsigned ms_mask = dev->chip == AGX_CHIP_G18G
                               ? agx_g18g_ms_mrt_mask(&key->tib) : 0;
    const unsigned mrt_mask = word_mask | ms_mask;
@@ -9338,11 +9333,12 @@ agx_build_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key,
       has_clear |= key->op[rt] == AGX_BG_CLEAR;
       has_load |= key->op[rt] == AGX_BG_LOAD;
    }
-   /* Native1130: a mixed-format background only for the operations its
-    * captures show (agx_tilebuffer.c, agx_g18g_native1130_mixed). */
+   /* Native1130 (run 1139): every one-batch workload of capture 1130 and
+    * every clear-only batch of capture 1121 clears all of its attachments,
+    * and every load workload of capture 1130 reloads all of them; a
+    * clear/reload mix of a mixed-format layout has no witness. */
    if (dev->chip == AGX_CHIP_G18G && !store &&
-       agx_g18g_mixed_mrt_mask(&key->tib) &&
-       !agx_g18g_mixed_bg_witnessed(&key->tib, has_clear, has_load))
+       agx_g18g_native_mixed_mask(&key->tib) && has_clear == has_load)
       return agx_reject_g17g_tile(batch, "M5 mixed-format background operation");
    const enum agx_bg_eot_op op = key->op[first_rt];
    /* The final direct resolve writes its single-sample destination. All
@@ -12255,8 +12251,8 @@ agx_g18_msaa_memory_shader(struct agx_context *ctx, struct agx_batch *batch)
     * exports, stencil and external sample loops are different contracts.
     * write_z with writes_sample_mask is the main's own DEPTHF feedback;
     * agx_update_fs clears that duplicate epilog export before linking. */
-   const bool admitted = agx_g18_msaa4(dev) && (samples == 2 || samples == 4) &&
-          fs && fs->so && fs->so->info.writes_memory &&
+   const bool admitted = dev->chip == AGX_CHIP_G18G &&
+          (samples == 2 || samples == 4) && fs && fs->so && fs->so->info.writes_memory &&
           fs->so->info.uses_sample_shading && !fs->so->info.uses_fbfetch &&
           !fs->b.info.early_fragment_tests &&
           !fs->epilog_key.sample_shading && !fs->epilog_key.loc_written &&
@@ -12268,7 +12264,8 @@ agx_g18_msaa_memory_shader(struct agx_context *ctx, struct agx_batch *batch)
               "G18_MSAA_MEMORY_PROFILE samples=%u enabled=%u sample=%u "
               "fbfetch=%u early=%u epilog_sample=%u colours=%#x "
               "write_z=%u write_s=%u write_mask=%u reads_tib=%u\n",
-              samples, agx_g18_msaa4(dev), fs->so->info.uses_sample_shading,
+              samples, dev->chip == AGX_CHIP_G18G,
+              fs->so->info.uses_sample_shading,
               fs->so->info.uses_fbfetch, fs->b.info.early_fragment_tests,
               fs->epilog_key.sample_shading, fs->epilog_key.loc_written,
               fs->epilog_key.write_z, fs->epilog_key.write_s,
@@ -12307,7 +12304,7 @@ agx_g18_msaa4_draw_admitted(struct agx_context *ctx, struct agx_batch *batch,
     * (agx_compile.c, AGX_G18_SAMPLE_MASK_SAMPLE). Admit exactly that shape:
     * every mask update of the program is the per-sample form. */
    const bool unrolled_colour_sample_discard =
-      agx_g18_native1128_enabled() && unrolled_colour &&
+      unrolled_colour &&
       !fs->b.info.early_fragment_tests &&
       fs->b.info.g18_sample_mask_forms == AGX_G18_SAMPLE_MASK_SAMPLE &&
       !fs->so->info.uses_fbfetch && !fs->b.info.reads_tib &&
@@ -12380,7 +12377,7 @@ agx_g18_msaa4_draw_admitted(struct agx_context *ctx, struct agx_batch *batch,
     * compiler metadata (METADATA root.f0.f32, read by
     * FragmentProgramVariantESLState), which Mesa leaves 0 for every program. */
    const bool per_pixel_a2c =
-      agx_g18_native1121_enabled() && ctx->blend->key.alpha_to_coverage &&
+      ctx->blend->key.alpha_to_coverage &&
       per_pixel_api_mask && !fs->so->info.uses_fbfetch &&
       fragment_pass == AGX_PASS_TYPE_PUNCH_THROUGH &&
       batch->reduced_prim == MESA_PRIM_TRIANGLES &&
@@ -12398,7 +12395,7 @@ agx_g18_msaa4_draw_admitted(struct agx_context *ctx, struct agx_batch *batch,
     * R2 word 6 (Apple's per-program compiler metadata) stays 0, as for every
     * Mesa program. */
    const bool g18_fbfetch_unrolled =
-      agx_g18_native1121_enabled() && fs && fs->so &&
+      fs && fs->so &&
       fs->so->info.uses_fbfetch && unrolled_colour &&
       fragment_pass == AGX_PASS_TYPE_TRANSLUCENT &&
       batch->reduced_prim == MESA_PRIM_TRIANGLES &&
@@ -12576,7 +12573,7 @@ agx_encode_g17g_state(struct agx_batch *batch, uint8_t *out)
         (agx_g18g_word_mrt_mask(&batch->tilebuffer_layout) ||
          agx_g18g_raw32_mrt_mask(&batch->tilebuffer_layout) ||
          agx_g18g_ms_mrt_mask(&batch->tilebuffer_layout) ||
-         agx_g18g_mixed_mrt_mask(&batch->tilebuffer_layout)));
+         agx_g18g_native_mixed_mask(&batch->tilebuffer_layout)));
    const struct pipe_surface *zsbuf = &batch->key.zsbuf;
    /* With the comparison disabled the depth unit performs no test and, per
     * the API, no write either, and a disabled stencil unit does nothing at
@@ -12904,7 +12901,7 @@ agx_encode_g17g_state(struct agx_batch *batch, uint8_t *out)
        * whose colour mask is empty, so with every mask empty the linked
        * program writes nothing and the linker marks it no_op. Apple draws
        * that with the colour-free ISP word (see the field). */
-      .fragment_writes_nothing = agx_g18_native_mixed_enabled() &&
+      .fragment_writes_nothing =
          dev->chip == AGX_CHIP_G18G && batch->key.nr_cbufs != 0 && fs->no_op,
       .fragment_pass = fragment_pass,
       /* Bit 26 of the shader's own fragment control; a discarding shader
@@ -12919,10 +12916,10 @@ agx_encode_g17g_state(struct agx_batch *batch, uint8_t *out)
        * form is AGX_G18_SAMPLE_MASK_SAMPLE. */
       .disable_tri_merging =
          (fs->fragment_control.opaque[0] & BITFIELD_BIT(26)) != 0 ||
-         (agx_g18_native1121_enabled() && dev->chip == AGX_CHIP_G18G &&
+         (dev->chip == AGX_CHIP_G18G &&
           batch->tilebuffer_layout.nr_samples > 1 &&
           ctx->blend->key.alpha_to_coverage) ||
-         (agx_g18_native1128_enabled() && dev->chip == AGX_CHIP_G18G &&
+         (dev->chip == AGX_CHIP_G18G &&
           batch->tilebuffer_layout.nr_samples > 1 &&
           ctx->fs->b.info.g18_sample_mask_forms ==
              AGX_G18_SAMPLE_MASK_SAMPLE),
@@ -15263,9 +15260,10 @@ agx_draw_patches_split(struct agx_context *ctx,
  * its index list record: agx_encode_state() would emit nothing for it anyway.
  * Anything that varies per sub-draw (draw ID or base parameters in uniforms,
  * statistics, geometry or tessellation stages, transform feedback, misaligned
- * indices) keeps the full path. AGX_FAST_MULTIDRAW=0 disables this.
+ * indices) keeps the full path. The record written is the HAL200 draw body
+ * of agx_g17p_emit_draw_body(), which is what every agx_native_graphics()
+ * chip encodes; other chips keep util_draw_multi().
  */
-DEBUG_GET_ONCE_BOOL_OPTION(fast_multidraw, "AGX_FAST_MULTIDRAW", true)
 
 static void agx_draw_vbo(struct pipe_context *pctx,
                          const struct pipe_draw_info *info,
@@ -15380,8 +15378,7 @@ agx_draw_multi(struct pipe_context *pctx, const struct pipe_draw_info *info,
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(pctx->screen);
 
-   if (indirect || !agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip) ||
-       dev->chip == AGX_CHIP_G18G || !debug_get_option_fast_multidraw()) {
+   if (indirect || !agx_native_graphics(dev)) {
       util_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
       return;
    }

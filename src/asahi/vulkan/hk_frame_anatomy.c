@@ -796,16 +796,16 @@ hk_frame_anatomy_note_fs(struct hk_cs *cs, const struct hk_shader *fs)
    if (!fs)
       return;
 
-   /* T6040's inline blend can replace the API fragment main with a
-    * monolithic program owning its constant-program layout. Counting the
-    * API main here reports only its export copies and hides the blend,
-    * registers and scratch actually launched. The linked shader owns this
-    * layout for the same lifetime as the API shader. Compute streams keep
-    * recording their compute shader, and other products keep their existing
-    * profiler output. This hook is reached only with frame anatomy enabled.
+   /* An inline blend can replace the API fragment main with a monolithic
+    * program owning its constant-program layout. Counting the API main here
+    * reports only its export copies and hides the blend, registers and
+    * scratch actually launched. The linked shader owns this layout for the
+    * same lifetime as the API shader, and only devices that launch it set
+    * it, as the uniform upload (hk_cmd_buffer.c) assumes. Compute streams
+    * keep recording their compute shader. This hook is reached only with
+    * frame anatomy enabled.
     */
-   if (cs->type == HK_CS_VDM &&
-       agx_is_m4_pro(&hk_cmd_buffer_device(cs->cmd)->dev)) {
+   if (cs->type == HK_CS_VDM) {
       const struct hk_linked_shader *linked =
          cs->cmd->state.gfx.linked[MESA_SHADER_FRAGMENT];
       if (linked && linked->g17p_layout)

@@ -6,11 +6,6 @@
 #include "agx3_resource_ir.h"
 #include "agx3_staging.h"
 #include <string.h>
-#include "util/u_debug.h"
-
-DEBUG_GET_ONCE_BOOL_OPTION(m5_scalar_3d_coords, "ASAHI_M5_SCALAR_3D_COORDS", true)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_wide_scalar_sources,
-                           "ASAHI_M5_WIDE_SCALAR_SOURCES", true)
 
 struct publication {
    agx_index coordinates, reference;
@@ -482,8 +477,7 @@ ssa_preserves_publications(const agx_instr *I)
 bool
 agx3_lower_scalar_texture_publications(agx_context *ctx)
 {
-   const bool m5 = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-      debug_get_option_m5_scalar_3d_coords();
+   const bool m5 = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
    if ((!m5 && ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B) ||
        ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
       return false;
@@ -557,18 +551,10 @@ agx3_lower_scalar_texture_publications(agx_context *ctx)
                   memmove(available, available + 1, --count * sizeof(*available));
                }
                agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-               agx_index px = x, py = y, pz = reference;
                /* The M5 publication stages x, y and z with the wide scalar
                 * COPY, which reads the whole register file, so it reads
-                * them where they live. Only the seven-bit form needs its
-                * operands in the low source bank; copies keep long-lived
-                * values out of that constraint. */
-               if (m5 && !debug_get_option_m5_wide_scalar_sources()) {
-                  px = agx_mov(&b, x);
-                  py = agx_mov(&b, y);
-                  pz = agx_mov(&b, reference);
-               }
-               agx_publish_texture_scalar_agx3(&b, px, py, pz, ++next);
+                * them where they live. */
+               agx_publish_texture_scalar_agx3(&b, x, y, reference, ++next);
                value = next;
                available[count++] = (struct scalar_publication){
                   x, y, reference, value, cost,

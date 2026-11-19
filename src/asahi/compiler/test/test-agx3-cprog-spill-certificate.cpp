@@ -172,6 +172,49 @@ TEST_F(CProgCertificate, PackBoundaryDependencyChain) {
    util_dynarray_fini(&binary);
 }
 
+/* Two 16-bit imports into the halves of one register, high half first: the
+ * second RLD must wait for the first (G17P loses a half when both are in
+ * flight). Halves of different registers stay independent. */
+static void
+pack_half_imports(agx_builder *b, unsigned first_dest, unsigned second_dest,
+                  agx3_static_spill_load_desc loads[2])
+{
+   agx_load_cprog_agx3_to(b,agx_register(first_dest,AGX_SIZE_16),17);
+   agx_load_cprog_agx3_to(b,agx_register(second_dest,AGX_SIZE_16),16);
+   agx_uniform_store(b,agx_register(0,AGX_SIZE_32),agx_immediate(64),1);
+   agx_uniform_store(b,agx_register(2,AGX_SIZE_32),agx_immediate(66),1);
+   agx_stop(b);
+   struct util_dynarray binary=UTIL_DYNARRAY_INIT;
+   ASSERT_TRUE(agx3_pack_binary(b->shader,&binary));
+   /* An RLD is 8 bytes, or 4 in its compact form (no wait). */
+   size_t offset=0;
+   for(unsigned i=0;i<2;i++) {
+      const uint8_t *code=(const uint8_t *)binary.data+offset;
+      ASSERT_GE(binary.size,offset+8);
+      const size_t length=
+         agx3_static_spill_decode_load(AGX_ISA_ENCODING_AGX3B,code,8,&loads[i])?8:4;
+      ASSERT_TRUE(length==8||
+         agx3_static_spill_decode_load(AGX_ISA_ENCODING_AGX3B,code,4,&loads[i]));
+      offset+=length;
+   }
+   util_dynarray_fini(&binary);
+}
+
+TEST_F(CProgCertificate, HalfImportsOfOneRegisterAreOrdered) {
+   agx3_static_spill_load_desc loads[2]={};
+   pack_half_imports(b,1,0,loads);
+   EXPECT_EQ(loads[0].dest,1u);EXPECT_EQ(loads[0].tps_half,9u);
+   EXPECT_EQ(loads[1].dest,0u);EXPECT_EQ(loads[1].tps_half,8u);
+   EXPECT_NE(loads[1].wait_mask&(1u<<(loads[0].slot-1)),0u);
+}
+
+TEST_F(CProgCertificate, HalfImportsOfTwoRegistersStayIndependent) {
+   agx3_static_spill_load_desc loads[2]={};
+   pack_half_imports(b,1,4,loads);
+   EXPECT_EQ(loads[0].dest,1u);EXPECT_EQ(loads[1].dest,4u);
+   EXPECT_EQ(loads[1].wait_mask&(1u<<(loads[0].slot-1)),0u);
+}
+
 TEST_F(CProgCertificate, Qualified188ByteBoundary) {
    import();auto ops=spill(188,184);EXPECT_TRUE(certify());
    ops.load->src[0]=agx_immediate(188);EXPECT_FALSE(certify());

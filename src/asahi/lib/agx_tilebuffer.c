@@ -10,7 +10,6 @@
 #include "util/format/u_format.h"
 #include "util/u_debug.h"
 #include "agx_bg_eot_key.h"
-#include "agx_debug.h"
 #include "layout.h"
 
 /* Maximum number of bytes per tile on G13G. This may change in future versions
@@ -472,11 +471,9 @@ agx_g18g_raw32_mrt_mask(const struct agx_tilebuffer_layout *tib)
        tib->layered || agx_tilebuffer_spills(tib))
       return 0;
 
-   if (agx_g18_native1109_enabled()) {
-      const unsigned rg32 = agx_g18g_rg32_pair_mask(tib);
-      if (rg32)
-         return rg32;
-   }
+   const unsigned rg32 = agx_g18g_rg32_pair_mask(tib);
+   if (rg32)
+      return rg32;
 
    /* Native855 four-target clear/load/mixed/sparse renders keep the same
     * compact sixteen-byte slots, fragment stores and BG/EOT programs for
@@ -499,65 +496,6 @@ agx_g18g_raw32_mrt_mask(const struct agx_tilebuffer_layout *tib)
              ? mask : 0;
 }
 
-/* Native1121 (Apple M6, verified capture 1121; run 1130): single-sample
- * mixed-format layouts. Apple packs the attachments in index order, each at
- * the next offset aligned to its tile lane width, with an eight-byte sample
- * and a 32x32 tile however large the sample (specLM f19/f20 = 5/5, f22 = the
- * sample size, in all 60 mix renders); the fragment, background and
- * end-of-tile programs store each attachment with its format's lane width and
- * lane count only. A layout is admitted only where one specialised capture
- * decoded all three programs completely for exactly these formats in exactly
- * these slots, and where the CTS batch drawing into it is itself grounded:
- *
- *  - req2-clear (workload 39, test stamp 76): RG32Sint@0, RGBA32Float@8,
- *    RG32Sint@24, R16Uint@32, 40-byte sample; clear background 100 B, end of
- *    tile 166 B, fragment 158 B, and its partial-render (resume/load)
- *    background, a reload of all four, 340 B;
- *  - req2-load (workload 40, test stamp 78): the same with slot 1 absent from
- *    the pass, RG32Sint@0, RG32Sint@8, R16Uint@16, 24-byte sample; reload
- *    background (also its resume background) 268 B, end of tile 136 B,
- *    fragment 108 B.
- *
- * A background is admitted only for the operations those captures show:
- * all-clear or all-reload for req2-clear's layout, all-reload for req2-load's;
- * a clear/reload mix of these formats has no witness. These offsets equal the
- * alignment-sorted layout, so no admitted layout moves. Other mixed keys stay
- * refused until a capture grounds them (req4-clear's draw writes no colour, a
- * fragment no capture shows). */
-static const struct {
-   enum pipe_format format[AGX_MAX_RENDER_TARGETS];
-   uint8_t offset_B[AGX_MAX_RENDER_TARGETS];
-   uint8_t sample_size_B;
-   bool bg_clear, bg_load;
-} agx_g18g_native1130_mixed[] = {
-   {{PIPE_FORMAT_R32G32_SINT, PIPE_FORMAT_R32G32B32A32_FLOAT,
-     PIPE_FORMAT_R32G32_SINT, PIPE_FORMAT_R16_UINT},
-    {0, 8, 24, 32}, 40, true, true},
-   {{PIPE_FORMAT_R32G32_SINT, PIPE_FORMAT_NONE, PIPE_FORMAT_R32G32_SINT,
-     PIPE_FORMAT_R16_UINT},
-    {0, 0, 8, 16}, 24, false, true},
-};
-
-static int
-agx_g18g_native1130_mixed_key(const enum pipe_format *formats,
-                              unsigned nr_cbufs)
-{
-   if (!agx_g18_native1130_enabled())
-      return -1;
-
-   for (unsigned k = 0; k < ARRAY_SIZE(agx_g18g_native1130_mixed); ++k) {
-      bool match = true;
-      for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt) {
-         const enum pipe_format f =
-            rt < nr_cbufs ? formats[rt] : PIPE_FORMAT_NONE;
-         match &= f == agx_g18g_native1130_mixed[k].format[rt];
-      }
-      if (match)
-         return k;
-   }
-   return -1;
-}
-
 /* The kernel admits a single-sample G18 render whose 32x32 utile holds at most
  * 32 KiB, or a 48..128-byte sample in steps of 16 (module 1120,
  * g17_uapi.rs translate_g18_render_command `wide_single`); a larger tile fails
@@ -572,111 +510,6 @@ agx_g18g_kernel_admits_tile(unsigned sample_B, bool kernel_native_samples)
           (sample_B >= 48 && sample_B <= 128 && !(sample_B & 15)) ||
           (kernel_native_samples &&
            (sample_B == 40 || sample_B == 56 || sample_B == 72));
-}
-
-unsigned
-agx_g18g_mixed_tile_bytes(const enum pipe_format *formats, unsigned nr_cbufs,
-                          unsigned nr_samples, bool layered,
-                          bool kernel_native_samples)
-{
-   if (agx_g18_native_mixed_enabled())
-      return agx_g18g_native_mixed_tile_bytes(formats, nr_cbufs, nr_samples,
-                                              layered, kernel_native_samples);
-
-   const int k = agx_g18g_native1130_mixed_key(formats, nr_cbufs);
-   if (k < 0 || nr_samples != 1 || layered)
-      return 0;
-
-   /* Apple keeps req2-clear's 40-byte sample in a 32x32 tile; without the
-    * module-1134 bit the layout stays refused here. */
-   const unsigned sample_B = agx_g18g_native1130_mixed[k].sample_size_B;
-   return agx_g18g_kernel_admits_tile(sample_B, kernel_native_samples)
-             ? sample_B * 32 * 32
-             : 0;
-}
-
-bool
-agx_g18g_mixed_bg_witnessed(const struct agx_tilebuffer_layout *tib,
-                            bool has_clear, bool has_load)
-{
-   /* Run 1139: every one-batch workload of capture 1130 and every clear-only
-    * batch of capture 1121 clears all of its attachments, and every load
-    * workload of capture 1130 reloads all of them; a clear/reload mix of a
-    * mixed layout has no witness. */
-   if (agx_g18_native_mixed_enabled())
-      return agx_g18g_native_mixed_mask(tib) && has_clear != has_load;
-
-   const int k = agx_g18g_native1130_mixed_key(tib->logical_format,
-                                               AGX_MAX_RENDER_TARGETS);
-   return k >= 0 && has_clear != has_load &&
-          (has_clear ? agx_g18g_native1130_mixed[k].bg_clear
-                     : agx_g18g_native1130_mixed[k].bg_load);
-}
-
-unsigned
-agx_g18g_mixed_mrt_mask(const struct agx_tilebuffer_layout *tib)
-{
-   if (agx_g18_native_mixed_enabled())
-      return agx_g18g_native_mixed_mask(tib);
-
-   if (!tib || tib->nr_samples != 1 || tib->tile_size != 32 * 32 ||
-       tib->layered || agx_tilebuffer_spills(tib))
-      return 0;
-
-   const int k = agx_g18g_native1130_mixed_key(tib->logical_format,
-                                               AGX_MAX_RENDER_TARGETS);
-   if (k < 0 || tib->sample_size_B != agx_g18g_native1130_mixed[k].sample_size_B)
-      return 0;
-
-   unsigned mask = 0;
-   for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt) {
-      if (tib->logical_format[rt] == PIPE_FORMAT_NONE)
-         continue;
-      if (tib->_offset_B[rt] != agx_g18g_native1130_mixed[k].offset_B[rt])
-         return 0;
-      mask |= BITFIELD_BIT(rt);
-   }
-   return mask;
-}
-
-/* The end-of-tile key of an admitted layout, compacted by the driver so that
- * the native program's dense PBE table and offset uniforms line up
- * (agx_tilebuffer_compact): the row's attachments in order, holes removed,
- * each keeping its offset. req2-load's end of tile (136 B) is exactly that
- * three-target program. Only end-of-tile keys may use this form. */
-unsigned
-agx_g18g_mixed_compact_mrt_mask(const struct agx_tilebuffer_layout *tib)
-{
-   /* Run 1139: holes take no space in the index-order layout, so the compacted
-    * key of an admitted layout (each attachment keeping its offset) is itself
-    * an index-order layout of the remaining formats. */
-   if (agx_g18_native_mixed_enabled())
-      return agx_g18g_native_mixed_mask(tib);
-
-   if (!agx_g18_native1130_enabled() || !tib || tib->nr_samples != 1 ||
-       tib->tile_size != 32 * 32 || tib->layered || agx_tilebuffer_spills(tib))
-      return 0;
-
-   for (unsigned k = 0; k < ARRAY_SIZE(agx_g18g_native1130_mixed); ++k) {
-      if (tib->sample_size_B != agx_g18g_native1130_mixed[k].sample_size_B)
-         continue;
-      unsigned count = 0;
-      bool match = true;
-      for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS && match; ++rt) {
-         const enum pipe_format f = agx_g18g_native1130_mixed[k].format[rt];
-         if (f == PIPE_FORMAT_NONE)
-            continue;
-         match = tib->logical_format[count] == f &&
-                 tib->_offset_B[count] ==
-                    agx_g18g_native1130_mixed[k].offset_B[rt];
-         count++;
-      }
-      for (unsigned rt = count; rt < AGX_MAX_RENDER_TARGETS && match; ++rt)
-         match = tib->logical_format[rt] == PIPE_FORMAT_NONE;
-      if (match)
-         return BITFIELD_MASK(count);
-   }
-   return 0;
 }
 
 /* Native1130 (Apple M6, verified capture 1130; run 1139): the formats of the
@@ -851,7 +684,7 @@ agx_g18g_native_mixed_tile_bytes(const enum pipe_format *formats,
                                  unsigned nr_cbufs, unsigned nr_samples,
                                  bool layered, bool kernel_native_samples)
 {
-   if (!agx_g18_native_mixed_enabled() || nr_samples != 1 || layered)
+   if (nr_samples != 1 || layered)
       return 0;
 
    for (unsigned rt = 0; rt < nr_cbufs && rt < AGX_MAX_RENDER_TARGETS; ++rt) {
@@ -876,8 +709,8 @@ agx_g18g_native_mixed_tile_bytes(const enum pipe_format *formats,
 unsigned
 agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib)
 {
-   if (!agx_g18_native_mixed_enabled() || !tib || tib->nr_samples != 1 ||
-       tib->tile_size != 32 * 32 || tib->layered || agx_tilebuffer_spills(tib))
+   if (!tib || tib->nr_samples != 1 || tib->tile_size != 32 * 32 ||
+       tib->layered || agx_tilebuffer_spills(tib))
       return 0;
 
    unsigned mask = 0;
@@ -939,14 +772,6 @@ agx_g18g_ms_mrt_mask(const struct agx_tilebuffer_layout *tib)
    return count >= 2 && count <= 3 &&
           tib->sample_size_B == ALIGN_POT(stride * count, 8)
              ? mask : 0;
-}
-
-unsigned
-agx_g17p_wide_rgba8_mrt_count(const struct agx_tilebuffer_layout *tib)
-{
-   const unsigned mask = agx_g17p_rgba8_mrt_mask(tib);
-   const unsigned count = util_bitcount(mask);
-   return count >= 3 && mask == BITFIELD_MASK(count) ? count : 0;
 }
 
 unsigned

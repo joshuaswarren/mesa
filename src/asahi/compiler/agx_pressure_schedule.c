@@ -9,7 +9,6 @@
 #include <stdio.h>
 #include <string.h>
 #include "util/dag.h"
-#include "util/u_debug.h"
 #include "agx_debug.h"
 #include "util/sparse_bitset.h"
 #include "agx_builder.h"
@@ -1273,24 +1272,17 @@ agx_ilp_schedule(agx_context *ctx)
    const bool m5 = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
    const bool m5_compute =
       m5 && ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble;
-   const bool m5_sample_probe = m5_compute &&
-      debug_get_bool_option("ASAHI_M5_SAMPLE_ILP_PROBE", false);
-   /* ASAHI_M5_ILP_PROBE keeps its whole-policy experiment. Otherwise M5
-    * compute uses only the sample-issue schedule below, as Apple's compute
-    * kernels issue independent samples back to back (svgfVariance: nine SMP
-    * in a row, then the accumulation); ASAHI_M5_SAMPLE_ILP=0 disables it. */
-   const bool m5_full = m5_compute &&
-      debug_get_bool_option("ASAHI_M5_ILP_PROBE", false);
-   const bool m5_samples = m5_compute &&
-      debug_get_bool_option("ASAHI_M5_SAMPLE_ILP", true);
-   /* Other M5 geometry-side stages (vertex and its lowered relatives) take
+   /* M5 compute uses only the sample-issue schedule below, as Apple's
+    * compute kernels issue independent samples back to back (svgfVariance:
+    * nine SMP in a row, then the accumulation).
+    *
+    * Other M5 geometry-side stages (vertex and its lowered relatives) take
     * the same occupancy-capped sample-issue schedule, but only for blocks
     * that also write memory (copy loops); everything else keeps the shared
     * AGX3 policy below. */
    const bool m5_copy = m5 && !ctx->is_preamble &&
       ctx->stage != MESA_SHADER_COMPUTE &&
-      ctx->stage != MESA_SHADER_FRAGMENT &&
-      debug_get_bool_option("ASAHI_M5_SAMPLE_ILP", true);
+      ctx->stage != MESA_SHADER_FRAGMENT;
    /* Copy blocks the M5 sample-issue schedule newly covers: every such block
     * of those other stages, and compute loop bodies. */
    bool *copy_mode = rzalloc_array(memctx, bool, MAX2(nr_blocks, 1));
@@ -1299,7 +1291,7 @@ agx_ilp_schedule(agx_context *ctx)
       return;
    }
    bool any_copy = false;
-   if (m5_copy || (m5_samples && !m5_full)) {
+   if (m5_copy || m5_compute) {
       agx_foreach_block(ctx, block) {
          if (block->index < nr_blocks &&
              (m5_copy || in_loop[block->index]) &&
@@ -1358,12 +1350,11 @@ agx_ilp_schedule(agx_context *ctx)
    /* M5 fragments: the same occupancy-capped growth as M5 compute where it
     * exceeds the G17P fragment slack below. */
    const bool m5_fragment = m5 && !ctx->is_preamble &&
-      ctx->stage == MESA_SHADER_FRAGMENT &&
-      debug_get_bool_option("ASAHI_M5_SAMPLE_ILP", true);
+      ctx->stage == MESA_SHADER_FRAGMENT;
 
    uint8_t *size16 = NULL;
    signed m5_occupancy_cap = 0;
-   if ((m5_samples && !m5_full) || m5_copy || m5_fragment) {
+   if (m5_compute || m5_copy || m5_fragment) {
       size16 = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
       if (!size16) {
          ralloc_free(memctx);
@@ -1388,9 +1379,9 @@ agx_ilp_schedule(agx_context *ctx)
    agx_foreach_block(ctx, block) {
       if (block->index >= nr_blocks)
          continue;
-      /* M5 compute: only the occupancy-capped sample-issue schedule (the
-       * whole policy under ASAHI_M5_ILP_PROBE). Other M5 stages take the
-       * shared AGX3 policy below, as agx_isa_is_agx3() gates it. */
+      /* M5 compute: only the occupancy-capped sample-issue schedule. Other
+       * M5 stages take the shared AGX3 policy below, as agx_isa_is_agx3()
+       * gates it. */
       const bool copy = copy_mode[block->index];
       const bool loop_samples = loop_sample_mode[block->index];
       /* Device loads too, in and outside loops: the pressure order places
@@ -1399,12 +1390,10 @@ agx_ilp_schedule(agx_context *ctx)
        * schedule. M5 only: not G18G, which compiles as AGX3C with
        * emit_agx3d. */
       const bool compute_loads = m5_compute && !ctx->key->dev.emit_agx3d &&
-                                 !m5_full && m5_samples && !copy;
+                                 !copy;
       const unsigned loads = compute_loads ? ilp_block_device_loads(block) : 0;
-      if ((m5_compute && !m5_full) || copy || loop_samples) {
-         if ((m5_samples || copy || loop_samples) &&
-             (!in_loop[block->index] || m5_sample_probe || copy ||
-              loop_samples || loads) &&
+      if (m5_compute || copy || loop_samples) {
+         if ((!in_loop[block->index] || copy || loop_samples || loads) &&
              ilp_block_samples(ctx, block) + loads >=
                 (loop_samples ? AGX_ILP_M5_LOOP_MIN_SAMPLES
                               : AGX_ILP_FS_MIN_SAMPLES)) {
@@ -1458,9 +1447,8 @@ agx_ilp_schedule(agx_context *ctx)
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, 8, 0, true, false, 0, 0, false,
                             false, &dag_state);
-      } else if ((!in_loop[block->index] || m5_sample_probe) &&
-                 !ctx->is_preamble &&
-                 (ctx->stage == MESA_SHADER_FRAGMENT || m5_sample_probe) &&
+      } else if (!in_loop[block->index] && !ctx->is_preamble &&
+                 ctx->stage == MESA_SHADER_FRAGMENT &&
                  ilp_block_samples(ctx, block) >= AGX_ILP_FS_MIN_SAMPLES) {
          /* The pressure schedule places each sample's consumers right after
           * it, so the program waits for one sample before issuing the next.

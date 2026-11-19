@@ -1,23 +1,20 @@
 /* Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * The G17P kernel-end SCS sweep and its switch, ASAHI_G17P_RQ_SCS_SWEEP.
+ * The G17P kernel-end SCS sweep.
  *
- * Lowering: which destination-less loads a candidate kernel ends with for
- * each mask, in which order, between which fences, and that general NIR
- * cleanup keeps them although nothing reads them. Without the variable there
- * are none. Only a thread that launched a query issues them, unless
- * ASAHI_G17P_RQ_SCS_SWEEP_SKIP=0 gives them to every thread.
+ * Lowering: which destination-less loads a candidate kernel ends with, in
+ * which order, between which fences, and that general NIR cleanup keeps them
+ * although nothing reads them. Only a thread that launched a query issues
+ * them.
  *
  * Launch state: the query context and the constant words of the warp's save
- * area are stored under a branch on the thread's first launch
- * (ASAHI_G17P_RQ_CTX_ONCE). Where a kernel's only launch site is outside any
- * loop the branch folds away, and the kernel is the same with and without it.
+ * area are stored once per thread, a copy being seven stores in one block.
  *
  * Back end: a kernel carrying such loads compiles for G17P, its binary holds
  * exactly those accesses in the destination-less form between the two
  * traversal barriers, and no ordinary SCS load takes their place. The lowered
- * query kernel itself compiles with every mask and ends with its sweep.
+ * query kernel itself compiles and ends with its sweep.
  */
 #include "agx_compile.h"
 #include "agx_debug.h"
@@ -35,10 +32,6 @@
    fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); \
 } } while (0)
 
-#define SWEEP "ASAHI_G17P_RQ_SCS_SWEEP"
-#define EXTRA "ASAHI_G17P_RQ_SCS_SWEEP_EXTRA"
-#define SKIP "ASAHI_G17P_RQ_SCS_SWEEP_SKIP"
-#define ONCE "ASAHI_G17P_RQ_CTX_ONCE"
 #define RESULT_ADDRESS 0x10004000000ull
 
 struct touch {
@@ -60,7 +53,13 @@ rows(struct touch *out, unsigned n, unsigned bytes, bool indexed)
    return n;
 }
 
-/* The documented sweep for a mask and extra per-thread sizes. */
+/* Touch lists for the back end, by store class: 1 the query block, 2 the
+ * payload records, 4 the saved context, 8 the query context, 16 addressing
+ * through a per-lane base register and no index, 32 extra per-thread storage
+ * of the given sizes, 64 the two other per-thread areas. The lowering emits
+ * SWEEP_MASK. */
+#define SWEEP_MASK 0x43
+
 static unsigned
 expected(unsigned mask, const unsigned *extra, unsigned extras,
          struct touch *out)
@@ -101,21 +100,8 @@ is_touch(const nir_instr *instr)
           (nir_intrinsic_flags(intr) & AGX_NIR_SCS_TOUCH);
 }
 
-static void
-set_arm(const char *mask, const char *extra)
-{
-   if (mask)
-      setenv(SWEEP, mask, 1);
-   else
-      unsetenv(SWEEP);
-   if (extra)
-      setenv(EXTRA, extra, 1);
-   else
-      unsetenv(EXTRA);
-}
-
-/* A one-query candidate kernel, lowered under the current environment. Its
- * result store sits inside control flow, as a real kernel's does. */
+/* A one-query candidate kernel, lowered. Its result store sits inside
+ * control flow, as a real kernel's does. */
 static nir_builder
 lowered_kernel(void)
 {
@@ -149,13 +135,10 @@ lowered_kernel(void)
    return b;
 }
 
-/* Lower the kernel under the given environment and compare its sweep with
- * `want`. */
+/* Lower the kernel and compare its sweep with `want`. */
 static void
-check_lowering(const char *mask, const char *extra, const struct touch *want,
-               unsigned count)
+check_lowering(const struct touch *want, unsigned count)
 {
-   set_arm(mask, extra);
    nir_builder b = lowered_kernel();
    bool progress;
    do {
@@ -170,13 +153,11 @@ check_lowering(const char *mask, const char *extra, const struct touch *want,
    nir_validate_shader(b.shader, "kernel-end sweep");
 
    /* Every touch is in one block, after everything else that block does, and
-    * nothing follows the first one but touches. With every thread sweeping
-    * it is the block all threads end in. Otherwise that block is empty and
-    * the touches are all there is under the branch ahead of it, which is
-    * taken by the threads that launched. */
+    * nothing follows the first one but touches. The block all threads end in
+    * is empty and the touches are all there is under the branch ahead of it,
+    * which is taken by the threads that launched. */
    nir_block *last = nir_impl_last_block(b.impl);
-   const char *every = getenv(SKIP);
-   if (count && !(every && !strcmp(every, "0"))) {
+   {
       nir_cf_node *prev = nir_cf_node_prev(&last->cf_node);
       CHECK(exec_list_is_empty(&last->instr_list));
       CHECK(prev && prev->type == nir_cf_node_if);
@@ -236,17 +217,6 @@ check_lowering(const char *mask, const char *extra, const struct touch *want,
    }
    CHECK(seen == count);
    ralloc_free(b.shader);
-}
-
-static void
-check_mask(unsigned mask, const char *extra, const unsigned *sizes,
-           unsigned extras)
-{
-   struct touch want[64];
-   char text[16];
-   snprintf(text, sizeof(text), "0x%x", mask);
-   const unsigned count = expected(mask, sizes, extras, want);
-   check_lowering(text, extra, want, count);
 }
 
 struct scan {
@@ -391,16 +361,11 @@ compile_touches(const struct touch *want, unsigned count, enum fault fault)
 
 /* The lowered query kernel through the back end. Returns its size. */
 static unsigned
-compile_kernel(unsigned mask, const char *extra, const unsigned *sizes,
-               unsigned extras, struct scan *found)
+compile_kernel(struct scan *found)
 {
    struct touch want[64];
-   char text[16];
-   snprintf(text, sizeof(text), "0x%x", mask);
-   const unsigned count = expected(mask, sizes, extras, want);
-   set_arm(text, extra);
+   const unsigned count = expected(SWEEP_MASK, NULL, 0, want);
    nir_builder b = lowered_kernel();
-   set_arm(NULL, NULL);
 
    agx_preprocess_nir(b.shader);
    struct agx_shader_key key = {
@@ -409,8 +374,8 @@ compile_kernel(unsigned mask, const char *extra, const unsigned *sizes,
    };
    struct agx_shader_part part = {0};
    const bool ok = agx_compile_shader_nir(b.shader, &key, &part);
-   printf("kernel mask=0x%x extras=%u: %s %s\n", mask, extras,
-          ok ? "compiled" : "refused", ok ? "" : agx_last_compile_refusal());
+   printf("kernel: %s %s\n", ok ? "compiled" : "refused",
+          ok ? "" : agx_last_compile_refusal());
    CHECK(ok && part.info.uses_ray_traversal && part.info.main_size);
    *found = scan_binary(&part, AGX_ISA_ENCODING_AGX3B, want, count);
    const unsigned size = part.info.main_size;
@@ -424,84 +389,23 @@ compile_kernel(unsigned mask, const char *extra, const unsigned *sizes,
 static unsigned
 lowering_cases(void)
 {
-   unsigned cases = 0;
-
-   /* Off: nothing, whatever the extra list says. */
-   check_lowering("0", NULL, NULL, 0);
-   check_lowering("0", "0x40000/16", NULL, 0);
-   cases += 2;
-
-   /* Unset: the payload records, the two other per-thread areas and the
-    * query block, and no extra storage even when a list is given. The same
-    * loads when every thread is to issue them. */
-   {
-      struct touch want[64];
-      const unsigned count = expected(0x43, NULL, 0, want);
-      CHECK(count == 2 + 2 + 1 + 19);
-      check_lowering(NULL, NULL, want, count);
-      check_lowering(NULL, "0x40000/16", want, count);
-      setenv(SKIP, "0", 1);
-      check_lowering(NULL, NULL, want, count);
-      check_mask(0x7f, NULL, NULL, 0);
-      check_lowering("0", NULL, NULL, 0);
-      setenv(SKIP, "1", 1);
-      check_lowering(NULL, NULL, want, count);
-      unsetenv(SKIP);
-      cases += 6;
-   }
-
-   /* Each store class alone, all of them, and both addressing forms. The
-    * addressing bit selects nothing, nor does the extra bit without a list. */
-   static const unsigned masks[] = {1, 2, 4, 8, 3, 0xf, 0x10, 0x11, 0x12,
-                                    0x13, 0x1c, 0x1f, 0x20, 0x30, 0x3f,
-                                    0x40, 0x43, 0x50, 0x53, 0x7f};
-   for (unsigned i = 0; i < ARRAY_SIZE(masks); ++i, ++cases)
-      check_mask(masks[i], NULL, NULL, 0);
-
+   /* The payload records, the two other per-thread areas and the query
+    * block. */
    struct touch want[64];
+   const unsigned count = expected(SWEEP_MASK, NULL, 0, want);
+   CHECK(count == 2 + 2 + 1 + 19);
+   check_lowering(want, count);
+
    CHECK(expected(1, NULL, 0, want) == 19);
    CHECK(expected(2, NULL, 0, want) == 2);
    CHECK(expected(4, NULL, 0, want) == 3);
    CHECK(expected(8, NULL, 0, want) == 7);
    CHECK(expected(0xf, NULL, 0, want) == 31);
-   CHECK(expected(0x30, NULL, 0, want) == 0);
-
-   /* Extra per-thread storage follows the payload records, and only with
-    * its bit. */
-   static const unsigned two[] = {48, 16}, one[] = {16}, odd[] = {20, 4};
-   check_mask(0x23, "0x10000/48,0x40000/16", two, 2);
-   check_mask(0x33, "0x10000/48,0x40000/16", two, 2);
-   check_mask(0x3f, "0x10000/48,0x40000/16", two, 2);
-   check_mask(0x7f, "0x10000/48,0x40000/16", two, 2);
-   check_mask(0x63, "0x10000/48,0x40000/16", two, 2);
-   check_mask(0x20, "0x40000/16", one, 1);
-   check_mask(0x30, "0x40000/16", one, 1);
-   check_mask(0x21, "0x40000/20,0x50000/4", odd, 2);
-   check_mask(3, "0x10000/48,0x40000/16", two, 2);
-   check_mask(0x1f, "0x10000/48,0x40000/16", two, 2);
-   cases += 10;
    CHECK(expected(0x40, NULL, 0, want) == 3);
-   CHECK(expected(0x43, NULL, 0, want) == 24);
+   static const unsigned two[] = {48, 16};
    CHECK(expected(0x23, two, 2, want) == 2 + 3 + 1 + 19);
    CHECK(expected(3, two, 2, want) == 21);
-
-   /* A malformed list, or storage that does not end below the query
-    * blocks, is dropped whole. */
-   static const char *const malformed[] = {
-      "0x10000", "0x10000/", "/32", "0x10000/33", "0x10001/32", "0x10000/0",
-      "0x10000/32,", "0x10000/32;0x40000/16", "0x10000/512",
-      "0x100000000/32", "0x2f8000/4", "0x2e0004/32", "0x40000/16,0x2f4000/16",
-      "0/256,0x10000/256,0x30000/16",
-   };
-   for (unsigned i = 0; i < ARRAY_SIZE(malformed); ++i, ++cases)
-      check_mask(0x23, malformed[i], NULL, 0);
-   /* The last storage that fits: 3072 threads end at the query blocks. */
-   static const unsigned fits[] = {16};
-   check_mask(0x20, "0x2ec000/16", fits, 1);
-   ++cases;
-   unsetenv(SWEEP);
-   unsetenv(EXTRA);
-   return cases;
+   return 1;
 }
 
 static unsigned
@@ -522,65 +426,18 @@ backend_cases(void)
    for (enum fault f = FAULT_USED; f <= FAULT_ENCODING; ++f, ++cases)
       CHECK(!compile_touches(want, count, f));
 
-   /* The query kernel. Unset, it has no such load; set, it keeps every
-    * traversal barrier it had and ends with one more of each scope around
-    * its sweep, the last of them behind the last load. */
-   struct scan off, on;
-   const unsigned plain = compile_kernel(0, NULL, NULL, 0, &off);
-   CHECK(off.fences[0] >= 1 && off.fences[1] >= 1);
+   /* The query kernel ends with its sweep, behind one more traversal
+    * barrier of each scope, the last of them behind the last load. */
+   struct scan on;
+   const unsigned size = compile_kernel(&on);
+   CHECK(size && on.fences[0] >= 1 && on.fences[1] >= 1);
+   CHECK(on.fence_at[0] < on.first_at && on.fence_at[1] > on.last_at);
    ++cases;
-   static const unsigned kernel[] = {1, 2, 4, 8, 3, 0xf, 0x13, 0x1f, 0x40,
-                                     0x43, 0x7f};
-   for (unsigned i = 0; i < ARRAY_SIZE(kernel); ++i, ++cases) {
-      const unsigned size = compile_kernel(kernel[i], NULL, NULL, 0, &on);
-      CHECK(size > plain);
-      CHECK(on.loads == off.loads);
-      CHECK(on.fences[0] == off.fences[0] + 1);
-      CHECK(on.fences[1] == off.fences[1] + 1);
-      CHECK(on.fence_at[1] > on.last_at);
-   }
-   static const unsigned extra_masks[] = {0x23, 0x33, 0x20};
-   for (unsigned i = 0; i < ARRAY_SIZE(extra_masks); ++i, ++cases) {
-      compile_kernel(extra_masks[i], "0x10000/48,0x40000/16", two, 2, &on);
-      CHECK(on.loads == off.loads);
-      CHECK(on.fences[0] == off.fences[0] + 1);
-      CHECK(on.fences[1] == off.fences[1] + 1);
-      CHECK(on.fence_at[1] > on.last_at);
-   }
-   /* Bits that select no storage leave the kernel as it was. */
-   static const unsigned idle[] = {0x10, 0x20, 0x30};
-   for (unsigned i = 0; i < ARRAY_SIZE(idle); ++i, ++cases) {
-      CHECK(compile_kernel(idle[i], NULL, NULL, 0, &on) == plain);
-      CHECK(on.fences[0] == off.fences[0] && on.fences[1] == off.fences[1]);
-   }
-
-   /* With the variable unset the kernel is the one mask 0x43 gives. */
-   {
-      struct touch want[64];
-      const unsigned count = expected(0x43, NULL, 0, want);
-      const unsigned selected = compile_kernel(0x43, NULL, NULL, 0, &on);
-      nir_builder b = lowered_kernel();
-      agx_preprocess_nir(b.shader);
-      struct agx_shader_key key = {
-         .dev = {.chip = AGX_CHIP_G17P, .encoding = AGX_ISA_ENCODING_AGX3B},
-         .no_preamble = true, .has_scratch = true,
-      };
-      struct agx_shader_part part = {0};
-      CHECK(agx_compile_shader_nir(b.shader, &key, &part));
-      const struct scan unset =
-         scan_binary(&part, AGX_ISA_ENCODING_AGX3B, want, count);
-      CHECK(part.info.main_size == selected && selected > plain);
-      CHECK(unset.fences[0] == on.fences[0] && unset.fences[1] == on.fences[1]);
-      CHECK(unset.loads == off.loads);
-      free(part.binary);
-      ralloc_free(b.shader);
-      ++cases;
-   }
    return cases;
 }
 
 /* Two queries one after the other in a thread, the second inside control
- * flow, lowered under the current environment. */
+ * flow, lowered. */
 static nir_builder
 two_query_kernel(void)
 {
@@ -657,13 +514,13 @@ launch_shape(nir_function_impl *impl, struct thread_kernel *k)
    }
 }
 
-/* Lower and compile the two-query kernel under the current environment. A
- * thread sweeps once, however many queries it launched. */
+/* Lower and compile the two-query kernel. A thread sweeps once, however many
+ * queries it launched. */
 static struct thread_kernel
-thread_kernel(const char *what)
+thread_kernel(void)
 {
    struct touch want[64];
-   const unsigned count = expected(0x43, NULL, 0, want);
+   const unsigned count = expected(SWEEP_MASK, NULL, 0, want);
    nir_builder b = two_query_kernel();
    struct thread_kernel k = {0};
    unsigned launches = 0;
@@ -689,7 +546,7 @@ thread_kernel(const char *what)
    };
    struct agx_shader_part part = {0};
    const bool ok = agx_compile_shader_nir(b.shader, &key, &part);
-   printf("two queries, %s: %s %s\n", what, ok ? "compiled" : "refused",
+   printf("two queries: %s %s\n", ok ? "compiled" : "refused",
           ok ? "" : agx_last_compile_refusal());
    CHECK(ok && part.info.uses_ray_traversal && part.info.main_size);
    const struct scan found =
@@ -703,41 +560,17 @@ thread_kernel(const char *what)
    return k;
 }
 
-/* Kernels with several queries in a thread. */
+/* Kernels with several queries in a thread: the sweep sits under the
+ * branch of the threads that launched, not in the block all threads end in.
+ */
 static unsigned
 thread_cases(void)
 {
    const unsigned count = 2 + 2 + 1 + 19;
-   set_arm(NULL, NULL);
-   unsetenv(SKIP);
-   const struct thread_kernel plain = thread_kernel("defaults");
-   CHECK(plain.in_last == 0 && plain.elsewhere == count);
-
-   setenv(SKIP, "0", 1);
-   const struct thread_kernel every = thread_kernel("every thread sweeps");
-   CHECK(every.in_last == count && every.elsewhere == 0);
-   CHECK(every.size != plain.size);
-   unsetenv(SKIP);
-
-   /* Each launch site carries two more branches for the state a thread's
-    * first launch stores: around the context copy and around the constant
-    * words of the save area. */
-   setenv(ONCE, "0", 1);
-   const struct thread_kernel each = thread_kernel("state at every launch");
-   CHECK(each.branches + 2 * 2 == plain.branches);
-   CHECK(each.elsewhere == count);
-   CHECK(each.size != plain.size);
-   unsetenv(ONCE);
-
-   /* One launch site, outside any loop: no thread can have launched before
-    * it, so the branch folds away and the kernel is the same whether or not
-    * the state is stored once. A site inside a loop keeps the branch. */
-   struct scan found;
-   const unsigned one = compile_kernel(0x43, NULL, NULL, 0, &found);
-   setenv(ONCE, "0", 1);
-   CHECK(compile_kernel(0x43, NULL, NULL, 0, &found) == one);
-   unsetenv(ONCE);
-   return 5;
+   const struct thread_kernel k = thread_kernel();
+   CHECK(k.in_last == 0 && k.elsewhere == count);
+   CHECK(k.branches > 0);
+   return 1;
 }
 
 int

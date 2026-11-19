@@ -39,8 +39,6 @@ main(void)
    assert(!hk_g16s_as_enabled(&dev));
    unsetenv("ASAHI_G17P_RT_DISABLE");
 
-   unsetenv("ASAHI_MESH");
-   assert(hk_m5_task_enabled());
    assert(!hk_m5_task_record(0));
    assert(hk_m5_task_record(DRM_ASAHI_FEATURE_TASK_MESH_STORAGE));
    puts("native feature defaults: ok");

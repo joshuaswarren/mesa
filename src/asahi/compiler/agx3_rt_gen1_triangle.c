@@ -4,7 +4,6 @@
 #include "agx3_isel_core.h"
 #include "agx3_cf_core.h"
 #include "agx3_pack.h"
-#include "agx3_rt_gen1_entry.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -190,11 +189,4 @@ agx3_rt_gen1_triangle_constants(const uint8_t **data, size_t *length)
 {
    *data = triangle_constants;
    *length = sizeof(triangle_constants);
-}
-bool
-agx3_rt_gen1_triangle_entry_generate(uint64_t slot_body_va, uint8_t out[AGX3_RT_GEN1_ENTRY_MAX_SIZE], size_t *length)
-{
-   static const struct agx3_rt_gen1_uniform uniforms[] = {{0,20},{2,22},{52,72},{54,74},{44,64},{46,66},{48,68},{50,70},{36,56},{38,58},{40,60},{42,62},{28,48},{30,50},{32,52},{34,54},{20,40},{22,42},{24,44},{26,46},{12,32},{14,34},{16,36},{18,38},{4,24},{6,26},{8,28},{10,30}};
-   const struct agx3_rt_gen1_entry_desc d = {.constants_va = slot_body_va + 0x10000, .shader_va = slot_body_va + 64, .branch_va = slot_body_va, .uniforms = uniforms, .constant_dwords = 26, .fetch_span = 3, .uniform_count = 28, .context48 = false};
-   return agx3_rt_gen1_entry_generate(&d, out, length);
 }

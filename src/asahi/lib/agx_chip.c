@@ -74,12 +74,11 @@ agx_chip_from_params(const struct drm_asahi_params_global *params)
             return AGX_CHIP_G17P;
          return AGX_CHIP_G16S;
       case 'C':
-      case 'X':
          if (params->chip_id == 0x6041 &&
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200)
             return AGX_CHIP_G17P;
-         return params->gpu_variant == 'C' ? AGX_CHIP_G16C : AGX_CHIP_UNKNOWN;
+         return AGX_CHIP_G16C;
       default: return AGX_CHIP_UNKNOWN;
       }
    case 17:
@@ -561,23 +560,6 @@ agx_params_native_kernel_abi_supported(
    return (params->features & required) == required;
 }
 
-bool
-agx_params_fixup_upstream_uapi(struct drm_asahi_params_global *params)
-{
-   if (!params || params->usc_generation != 0)
-      return false;
-
-   params->features &= DRM_ASAHI_FEATURE_SOFT_FAULTS;
-
-   if (params->chip_id == 0x6041 && params->gpu_generation == 16 &&
-       params->gpu_hal_generation == 0) {
-      params->usc_generation = AGX_ISA_AGX3;
-      params->gpu_hal_generation = DRM_ASAHI_GPU_HAL_200;
-   }
-
-   return true;
-}
-
 const char *
 agx_chip_exact_product_name(enum agx_chip chip)
 {
@@ -682,19 +664,6 @@ agx_chip_name(enum agx_chip chip)
    case AGX_CHIP_G17C: return "G17C";
    case AGX_CHIP_G18G: return "G18G";
    case AGX_CHIP_UNKNOWN:
-   default: return "unknown";
-   }
-}
-
-const char *
-agx_isa_encoding_name(enum agx_isa_encoding encoding)
-{
-   switch (encoding) {
-   case AGX_ISA_ENCODING_AGX2: return "agx2";
-   case AGX_ISA_ENCODING_AGX3B: return "agx3b";
-   case AGX_ISA_ENCODING_AGX3C: return "agx3c";
-   case AGX_ISA_ENCODING_AGX3D: return "agx3d";
-   case AGX_ISA_ENCODING_UNKNOWN:
    default: return "unknown";
    }
 }

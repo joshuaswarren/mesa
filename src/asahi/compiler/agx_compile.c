@@ -1254,8 +1254,7 @@ agx_emit_local_store_pixel(agx_builder *b, nir_intrinsic_instr *instr)
    if (b->shader->stage == MESA_SHADER_FRAGMENT &&
        !b->shader->key->fs.ignore_tib_dependencies &&
        agx_is_g18g(&b->shader->key->dev) &&
-       (b->shader->key->fs.nr_samples == 2 || b->shader->key->fs.nr_samples == 4) &&
-       agx_g18_msaa4_enabled())
+       (b->shader->key->fs.nr_samples == 2 || b->shader->key->fs.nr_samples == 4))
       agx_signal_pix(b, 0xC);
 
    return st;
@@ -1979,8 +1978,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
     * Extract from its packed word so a useful operation can carry the wait.
     */
    if (unpack_w8_word) {
-      assert(b->shader->key->dev.chip == AGX_CHIP_G17P &&
-             b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+      assert(b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
              b->shader->stage == MESA_SHADER_COMPUTE && !b->shader->is_preamble &&
              fmt == AGX_FORMAT_I8 && dest.size == AGX_SIZE_32 &&
              instr->def.num_components == 4 && packed_count == 0);
@@ -3519,7 +3517,6 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
        * byte. Only single-sample subsets at top level take this form. */
       if (b->shader->key->dev.emit_agx3d &&
           (g18_samples == 2 || g18_samples == 4) &&
-          agx_g18_native1128_enabled() &&
           !b->shader->key->fs.inside_sample_loop &&
           !b->shader->force_early_tests_pending && !no_tests &&
           nir_intrinsic_flags(instr) == AGX_SAMPLE_MASK_SUBSET_FULL_OR_KILL &&
@@ -3825,7 +3822,7 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
            !agx_is_g18g(&b->shader->key->dev)) ||
           (agx_is_g18g(&b->shader->key->dev) &&
            (b->shader->key->fs.nr_samples == 2 ||
-            b->shader->key->fs.nr_samples == 4) && agx_g18_msaa4_enabled())) {
+            b->shader->key->fs.nr_samples == 4))) {
          /* G17P/G18G covered samples are bits 0..3 of native W16 SR39, the word
           * Apple's multisample fragments AND with each sample's bit before
           * that sample's tile store. Unlike the API input mask, this changes
@@ -3850,15 +3847,14 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
        * so scheduling and CSE cannot reuse pre-depth coverage for tile stores.
        *
        * msaa163: G18G's four-sample tile lowering (agx_nir_lower_g18_tile_
-       * samples, AGX_G18_MSAA4) leaves it too. Apple's G18 4x fragment reads
+       * samples) leaves it too. Apple's G18 4x fragment reads
        * the same W16 SR39 into a half and passes it unmodified to lstcol
        * (rld 210a42000000: f21=39, f10/f24=1). */
       assert(((b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
                !agx_is_g18g(&b->shader->key->dev)) ||
               (agx_is_g18g(&b->shader->key->dev) &&
                (b->shader->key->fs.nr_samples == 2 ||
-                b->shader->key->fs.nr_samples == 4) &&
-               agx_g18_msaa4_enabled())) &&
+                b->shader->key->fs.nr_samples == 4))) &&
              "only the G17P/G18G tile lowerings leave this for the backend");
       assert(instr->def.bit_size == 16 && "16-bit sample mask");
       return agx_get_sr_coverage_to(b, dst, AGX_SR_INPUT_SAMPLE_MASK);
@@ -10251,7 +10247,7 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
       .ballot_components = 4,
       .subgroup_size = 32,
    };
-   bool progress = false;
+   bool progress = agx_nir_flush_subgroup_minmax(nir);
    while (nir_lower_subgroups(nir, &options))
       progress = true;
    return progress;
@@ -12213,7 +12209,7 @@ agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
     * target whose write mask is empty, so its lowest store may sit above
     * byte zero (five of the 39 fragments). */
    if (stores[store_count - 1]->pixel_offset != 0 && !subset &&
-       !(g18 && ctx->key->g18_native_mixed && agx_g18_native_mixed_enabled()))
+       !(g18 && ctx->key->g18_native_mixed))
       return false;
 
    if (unrolled_samples) {
@@ -12771,10 +12767,12 @@ agx_nir_fragment_output_temporaries(nir_shader *nir)
 
 /* Fold 8-to-32 unsigned conversion into the selected result type. The
  * four-byte transaction is still determined by the format and lane count.
+ * agx_emit_load() then extracts the lanes from the byte-packed word that a
+ * four-lane W8 load returns on AGX3B.
  */
 static bool
-g17p_fold_w8_word_unpack(nir_builder *b, nir_intrinsic_instr *load,
-                         UNUSED void *data)
+fold_w8_word_unpack(nir_builder *b, nir_intrinsic_instr *load,
+                    UNUSED void *data)
 {
    if (b->impl->function->is_preamble ||
        (load->intrinsic != nir_intrinsic_load_agx &&
@@ -15799,7 +15797,7 @@ agx_fs_takes_derivatives(nir_shader *nir)
  * Divergence is an additional refusal; correctness uses the barrier's
  * workgroup execution scope on a valid shader. */
 static bool
-g17p_shared_phase_boundary(nir_block *block, bool entry)
+shared_phase_boundary(nir_block *block, bool entry)
 {
    if (!block || block->divergent)
       return false;
@@ -15818,7 +15816,7 @@ g17p_shared_phase_boundary(nir_block *block, bool entry)
 }
 
 static bool
-g17p_shared_phase_load(const nir_intrinsic_instr *intrin, UNUSED const void *data)
+shared_phase_load(const nir_intrinsic_instr *intrin, UNUSED const void *data)
 {
    return intrin->intrinsic == nir_intrinsic_load_shared &&
           nir_intrinsic_access(intrin) == 0 && intrin->def.bit_size == 32 &&
@@ -15828,10 +15826,10 @@ g17p_shared_phase_load(const nir_intrinsic_instr *intrin, UNUSED const void *dat
 /* Check the entire structured phase for writes, not just the candidate
  * block. Two workgroup rendezvous exclude stores from peers outside it. */
 static bool
-g17p_shared_phase_readonly(nir_loop *loop)
+shared_phase_readonly(nir_loop *loop)
 {
-   if (!g17p_shared_phase_boundary(nir_loop_predecessor_block(loop), true) ||
-       !g17p_shared_phase_boundary(nir_loop_successor_block(loop), false))
+   if (!shared_phase_boundary(nir_loop_predecessor_block(loop), true) ||
+       !shared_phase_boundary(nir_loop_successor_block(loop), false))
       return false;
 
    nir_foreach_block_in_cf_node(block, &loop->cf_node) {
@@ -15842,7 +15840,7 @@ g17p_shared_phase_readonly(nir_loop *loop)
          case nir_instr_type_alu:
             break;
          case nir_instr_type_intrinsic:
-            if (!g17p_shared_phase_load(nir_instr_as_intrinsic(instr), NULL))
+            if (!shared_phase_load(nir_instr_as_intrinsic(instr), NULL))
                return false;
             break;
          case nir_instr_type_jump: {
@@ -15860,7 +15858,7 @@ g17p_shared_phase_readonly(nir_loop *loop)
 }
 
 static bool
-g17p_cse_shared_reads_in_phases(nir_shader *nir)
+cse_shared_reads_in_phases(nir_shader *nir)
 {
    bool any = false;
 
@@ -15874,7 +15872,7 @@ g17p_cse_shared_reads_in_phases(nir_shader *nir)
       bool progress = false;
       nir_foreach_block(pre, impl) {
          nir_loop *loop = nir_block_get_following_loop(pre);
-         if (!loop || !g17p_shared_phase_readonly(loop))
+         if (!loop || !shared_phase_readonly(loop))
             continue;
 
          nir_foreach_block_in_cf_node(block, &loop->cf_node) {
@@ -15888,7 +15886,7 @@ g17p_cse_shared_reads_in_phases(nir_shader *nir)
                /* Keep the first read in place. Do not mark it globally
                 * reorderable or reuse it across a dynamic iteration. */
                if (nir_instr_set_add_or_rewrite(&loads, instr,
-                                                g17p_shared_phase_load,
+                                                shared_phase_load,
                                                 NULL, NULL)) {
                   nir_instr_remove(instr);
                   progress = true;
@@ -16215,8 +16213,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
     * the same coverage-aware register-mask lowering for the main program. */
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C && key->dev.emit_agx3d &&
        nir->info.stage == MESA_SHADER_FRAGMENT &&
-       (key->fs.nr_samples == 2 || key->fs.nr_samples == 4) &&
-       agx_g18_msaa4_enabled())
+       (key->fs.nr_samples == 2 || key->fs.nr_samples == 4))
       NIR_PASS(_, nir, agx_nir_lower_g18_tile_samples, key->fs.nr_samples);
 
    if (is_agx3 && source_imul64)
@@ -16271,15 +16268,13 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, agx_nir_opt_licm, regs - 8);
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-       debug_get_bool_option("ASAHI_M5_SHARED_OFFSETS", true)) {
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
       NIR_PASS(_, nir, agx_nir_opt_shared_byte_offsets);
       NIR_PASS(_, nir, nir_opt_cse);
       NIR_PASS(_, nir, nir_opt_dce);
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-       debug_get_bool_option("ASAHI_M5_MINMAX_PROVENANCE", true)) {
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
       NIR_PASS(_, nir, agx_nir_opt_canonical_minmax);
       NIR_PASS(_, nir, nir_opt_dce);
    }
@@ -16329,15 +16324,22 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       }
    }
 
-   if (key->dev.chip == AGX_CHIP_G17P &&
-       key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-       nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
+   if (nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
        !key->secondary) {
+      /* Generic NIR: a read-only phase between two workgroup barriers sees
+       * no shared store, so this holds for every chip. */
       if (nir->info.shared_size)
-         NIR_PASS(_, nir, g17p_cse_shared_reads_in_phases);
+         NIR_PASS(_, nir, cse_shared_reads_in_phases);
 
-      NIR_PASS(_, nir, nir_shader_intrinsics_pass, g17p_fold_w8_word_unpack,
-               nir_metadata_control_flow, NULL);
+      /* Every AGX3B part returns a four-lane W8 load as one byte-packed
+       * word (the W8 path of agx_emit_load()), which the fold extracts with
+       * integer shifts. AGX2 returns one byte per 16-bit lane, so there is no
+       * word to fold to. AGX3C (M5, and G18 through it) widens bytes to
+       * 32-bit lanes with its own unpack in agx_emit_load(), so this AGX3B
+       * extraction is not its form. */
+      if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass, fold_w8_word_unpack,
+                  nir_metadata_control_flow, NULL);
    }
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))

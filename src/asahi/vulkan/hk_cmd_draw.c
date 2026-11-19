@@ -4565,6 +4565,18 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    hk_attachment_init(&render->depth_att, pRenderingInfo->pDepthAttachment);
    hk_attachment_init(&render->stencil_att, pRenderingInfo->pStencilAttachment);
 
+   /* vkd3d-proton renders without attachments at the Vulkan maximum, layers
+    * included, which cannot fit in a tiler allocation. Nothing is stored per
+    * layer, so one hardware layer serves all of them. */
+   bool no_attachments = agx_native_graphics(&dev->dev) && !render->view_mask &&
+                         !render->depth_att.iview && !render->stencil_att.iview;
+   for (uint32_t i = 0; i < render->color_att_count; i++)
+      no_attachments &= !render->color_att[i].iview;
+   if (cmd->state.gfx.descriptors.root.draw.no_attachments != no_attachments) {
+      cmd->state.gfx.descriptors.root.draw.no_attachments = no_attachments;
+      cmd->state.gfx.descriptors.root_dirty = true;
+   }
+
    if (unlikely(dev->frame_anatomy)) {
       /* Frame anatomy profiler: compression state of each colour target. */
       for (uint32_t i = 0; i < render->color_att_count; i++) {
@@ -12502,10 +12514,13 @@ static void
 hk_g17p_note_layer_zero_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-       cmd->state.gfx.render.view_mask ||
-       cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] ||
-       cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL]) {
+       cmd->state.gfx.render.view_mask) {
       cs->g17p_layer_zero_unknown = true;
+      return;
+   }
+
+   if (cmd->state.gfx.descriptors.root.draw.no_attachments) {
+      cs->g17p_layer_zero_draws++;
       return;
    }
 
@@ -13354,8 +13369,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    struct hk_api_shader *task_api = gfx->shaders[MESA_SHADER_TASK];
    const bool sw_task = task_api && dev->dev.chip == AGX_CHIP_G17P;
    if (!gfx->shaders[MESA_SHADER_MESH] ||
-       (task_api && !sw_task &&
-        (dev->dev.chip != AGX_CHIP_G17S || !hk_m5_task_enabled())) ||
+       (task_api && !sw_task && dev->dev.chip != AGX_CHIP_G17S) ||
        (dev->dev.chip != AGX_CHIP_G17P &&
         (dev->dev.chip != AGX_CHIP_G17S ||
          !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2)))) {

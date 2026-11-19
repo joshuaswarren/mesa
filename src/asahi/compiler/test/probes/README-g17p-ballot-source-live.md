@@ -18,8 +18,9 @@ Metal toolchain v27.1.5194.15, `metal-nt -arch applegpu_g17p
 | dead | `17075400020000582206` | signed less-than, src 0, dst 0, source dead |
 | live | `17075404030002182206` | signed less-than, src 0, dst 4, destination cache hint, source live |
 
-`test-agx3-subgroup-core.c` reproduces both native instructions exactly. The
-register comparison uses source field 25 for the live read and field 27 for
+`test-agx3-subgroup-core.c` reproduces the dead instruction exactly
+(`int_lt_b`) and checks the live-source form of a register comparison
+(`int_live_b`). The register comparison uses source field 25 for the live read and field 27 for
 the final read. Previously `agx3_subgroup_encode_ballot` always selected field
 27 for register comparisons, ignoring `src_live`.
 

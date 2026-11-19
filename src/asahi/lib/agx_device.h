@@ -586,15 +586,6 @@ agx_is_m4_pro(const struct agx_device *dev)
           dev->params.gpu_generation == 16 && dev->params.gpu_variant == 'S';
 }
 
-/* Product capability rollout must not follow the shared G17P architecture
- * profile: T6040 also uses that profile. Device admission checked USC/HAL. */
-static inline bool
-agx_is_a18_pro(const struct agx_device *dev)
-{
-   return dev->chip == AGX_CHIP_G17P && dev->params.chip_id == 0x8140 &&
-          dev->params.gpu_generation == 17 && dev->params.gpu_variant == 'P';
-}
-
 struct agx_va *agx_va_alloc(struct agx_device *dev, uint64_t size_B,
                             uint64_t align_B, enum agx_va_flags flags,
                             uint64_t fixed_va);

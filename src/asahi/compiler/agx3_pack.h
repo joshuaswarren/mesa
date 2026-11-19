@@ -47,9 +47,7 @@ extern "C" {
 #define AGX3_CONTINUE_RAY_MAX_LENGTH 8
 #define AGX3_CONTINUE_RAY_FIXED_FIRST_SITE_WITNESS_MAX_LENGTH 8
 #define AGX3_INC_STK_FIXED_WITNESS_LENGTH 8
-#define AGX3_UPDATE_BVH_FIXED_WITNESS_LENGTH 14
 #define AGX3_END_LENGTH 4
-#define AGX3_UPDATE_NODE_MAX_LENGTH 14
 
 struct agx3_encoded_ldimm {
    uint8_t bytes[AGX3_LDIMM_MAX_LENGTH];
@@ -229,18 +227,8 @@ struct agx3_encoded_inc_stk_fixed_witness {
    uint8_t length;
 };
 
-struct agx3_encoded_update_bvh_fixed_witness {
-   uint8_t bytes[AGX3_UPDATE_BVH_FIXED_WITNESS_LENGTH];
-   uint8_t length;
-};
-
 struct agx3_encoded_end {
    uint8_t bytes[AGX3_END_LENGTH];
-   uint8_t length;
-};
-
-struct agx3_encoded_update_node {
-   uint8_t bytes[AGX3_UPDATE_NODE_MAX_LENGTH];
    uint8_t length;
 };
 
@@ -768,17 +756,6 @@ bool agx3_pack_end(enum agx_isa_encoding encoding,
                    struct agx3_encoded_end *out);
 
 /*
- * Encode the fixed, zero-argument llvm.agx3.update.node intrinsic
- * expansion.  Apple's compiler emits a canonical barrier followed by the
- * hardware update_node operation: 6+4 bytes on AGX3b and 6+8 bytes on AGX3c.
- * Both complete sequences are exact occurrence-count isolates; no
- * operand-bearing update.bvh form is accepted here.  Every bit is canonical
- * and a byte sequence from one ISA generation is rejected by the other.
- */
-bool agx3_pack_update_node(enum agx_isa_encoding encoding,
-                           struct agx3_encoded_update_node *out);
-
-/*
  * Encode the corpus-grounded hardware `intersect_ray` instruction.
  * The encoder tables identify f5 as a 13-bit half-register field; the
  * surrounding native stream makes its SCS/ray-state role likely, but that
@@ -876,24 +853,6 @@ bool agx3_pack_inc_stk_fixed_witness(
 
 enum agx_isa_encoding
 agx3_inc_stk_witnessed_chip_encoding(enum agx_chip chip);
-
-/*
- * Encode only the exact G17S/AGX3c compiler witness for the
- * llvm.agx3.update.bvh expansion: a six-byte barrier followed by the eight-byte
- * update_bvh operation.  An n=0..4 occurrence-count isolate reproduces this
- * complete fourteen-byte sequence exactly n times.  The three n=1->2 through
- * n=3->4 steps are clean insertions after the operand setup paid by n=1.
- *
- * The intrinsic takes arguments, but those arguments have not been correlated
- * to machine fields.  The fixed-witness name is intentional: this is not a
- * general operand encoder and makes no claim about traversal or update
- * semantics.  This encoding-level API accepts the AGX3c tag but does not admit
- * a device target: AGX3b is rejected, G17G/G17C remain unproven, and every
- * noncanonical bit remains unsupported.
- */
-bool agx3_pack_update_bvh_fixed_witness(
-   enum agx_isa_encoding encoding,
-   struct agx3_encoded_update_bvh_fixed_witness *out);
 
 #ifdef __cplusplus
 }

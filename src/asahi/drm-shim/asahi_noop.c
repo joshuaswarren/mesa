@@ -238,8 +238,6 @@ static const struct drm_asahi_params_global params_g17p = {
 
 static const struct drm_asahi_params_global params_t6041 =
    SHIM_T6041_AURORA_PARAMS('C');
-static const struct drm_asahi_params_global params_t6041x =
-   SHIM_T6041_AURORA_PARAMS('X');
 
 static const struct drm_asahi_queue_limits queue_limits_g17 = {
    .max_queues = 42,
@@ -559,8 +557,6 @@ shim_params(void)
       return &params_g17s;
    if (chip && !strcmp(chip, "t6041"))
       return &params_t6041;
-   if (chip && !strcmp(chip, "t6041x"))
-      return &params_t6041x;
 
    return &params_g13g;
 }
@@ -575,8 +571,7 @@ static bool
 shim_g17_runtime(void)
 {
    const struct drm_asahi_params_global *params = shim_params();
-   return params == &params_g17p || params == &params_t6041 ||
-          params == &params_t6041x;
+   return params == &params_g17p || params == &params_t6041;
 }
 
 /* Whether the selected identity is driven by the M3 (G15) kernel, whose
@@ -1291,9 +1286,17 @@ asahi_ioctl_queue_create(int fd, unsigned long request, void *arg)
    struct drm_asahi_queue_create *create = arg;
    static uint32_t next_queue_id = 1;
 
-   /* Model authorization and a credential change after the screen probe. */
+   /* Model authorization and a credential change after the screen probe,
+    * and ("unsupported") a GPU backend that does not schedule HIGH. The
+    * kernel reserves REALTIME everywhere. */
    static unsigned high_requests;
    const char *policy = getenv("ASAHI_SHIM_HIGH_PRIORITY");
+   if (create->priority > DRM_ASAHI_PRIORITY_HIGH ||
+       (create->priority == DRM_ASAHI_PRIORITY_HIGH && policy &&
+        !strcmp(policy, "unsupported"))) {
+      errno = EINVAL;
+      return -1;
+   }
    if (create->priority == DRM_ASAHI_PRIORITY_HIGH) {
       high_requests++;
       if (policy && (!strcmp(policy, "deny") ||

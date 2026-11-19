@@ -89,6 +89,51 @@ get_binding_layout(uint32_t set, uint32_t binding,
    return &set_layout->binding[binding];
 }
 
+static bool
+layout_has_binding(uint32_t set, uint32_t binding, uint32_t set_layout_count,
+                   struct vk_descriptor_set_layout *const *set_layouts)
+{
+   return set < set_layout_count && set_layouts[set] != NULL &&
+          binding <
+             vk_to_hk_descriptor_set_layout(set_layouts[set])->binding_count;
+}
+
+/* Every descriptor the shader reaches must exist in the pipeline layout.
+ * Vulkan makes the opposite invalid usage, but descriptor lowering would
+ * dereference the missing set layout and kill the process. */
+bool
+hk_nir_layout_has_descriptors(const nir_shader *nir, uint32_t set_layout_count,
+                              struct vk_descriptor_set_layout *const *set_layouts)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic) {
+               const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_vulkan_resource_index &&
+                   !layout_has_binding(nir_intrinsic_desc_set(intr),
+                                       nir_intrinsic_binding(intr),
+                                       set_layout_count, set_layouts))
+                  return false;
+            } else if (instr->type == nir_instr_type_deref) {
+               const nir_deref_instr *deref = nir_instr_as_deref(instr);
+               if (deref->deref_type != nir_deref_type_var ||
+                   !(deref->var->data.mode & (nir_var_uniform | nir_var_image)))
+                  continue;
+               const struct glsl_type *type = glsl_without_array(deref->type);
+               if ((glsl_type_is_image(type) || glsl_type_is_sampler(type) ||
+                    glsl_type_is_texture(type)) &&
+                   !layout_has_binding(deref->var->data.descriptor_set,
+                                       deref->var->data.binding,
+                                       set_layout_count, set_layouts))
+                  return false;
+            }
+         }
+      }
+   }
+   return true;
+}
+
 static nir_def *
 load_speculatable(nir_builder *b, unsigned num_components, unsigned bit_size,
                   nir_def *addr, unsigned align)
