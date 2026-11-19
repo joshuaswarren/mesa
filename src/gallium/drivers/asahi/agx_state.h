@@ -38,30 +38,6 @@
 #include "agx_native_descriptor.h"
 #include "agx_nir_texture.h"
 
-/* Diagnostic environment switches. Some are tested on every draw or upload,
- * so each is read from the environment once and cached; getenv() scans the
- * whole environment on every call.
- */
-enum agx_env_flag {
-   AGX_ENV_NEO_DRAW_DIAGNOSTICS,
-   AGX_ENV_NEO_UNIFORM_DIAGNOSTICS,
-   AGX_ENV_NEO_BINARY_DIAGNOSTICS,
-   AGX_ENV_FLAG_COUNT,
-};
-
-/* -1 until first read, then 0 or 1. */
-extern int agx_env_flags[AGX_ENV_FLAG_COUNT];
-
-bool agx_env_flag_init(enum agx_env_flag flag);
-
-static inline bool
-agx_env_flag(enum agx_env_flag flag)
-{
-   int v = p_atomic_read_relaxed(&agx_env_flags[flag]);
-
-   return likely(v >= 0) ? v : agx_env_flag_init(flag);
-}
-
 #ifdef __GLIBC__
 #include <errno.h>
 #define agx_msg(fmt, ...)                                                      \

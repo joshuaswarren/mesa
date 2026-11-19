@@ -61,25 +61,6 @@
 #include "agx_tilebuffer.h"
 #include "shader_enums.h"
 
-int agx_env_flags[AGX_ENV_FLAG_COUNT] = {
-   [0 ... AGX_ENV_FLAG_COUNT - 1] = -1,
-};
-
-static const char *const agx_env_flag_names[AGX_ENV_FLAG_COUNT] = {
-   [AGX_ENV_NEO_DRAW_DIAGNOSTICS] = "NEO_AGX_DRAW_DIAGNOSTICS",
-   [AGX_ENV_NEO_UNIFORM_DIAGNOSTICS] = "NEO_AGX_UNIFORM_DIAGNOSTICS",
-   [AGX_ENV_NEO_BINARY_DIAGNOSTICS] = "NEO_AGX_BINARY_DIAGNOSTICS",
-};
-
-bool
-agx_env_flag_init(enum agx_env_flag flag)
-{
-   int v = getenv(agx_env_flag_names[flag]) != NULL;
-
-   p_atomic_set(&agx_env_flags[flag], v);
-   return v;
-}
-
 uint64_t agx_best_modifiers[] = {
    DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
    DRM_FORMAT_MOD_APPLE_GPU_TILED,
