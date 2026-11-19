@@ -400,11 +400,7 @@ int
 main(void)
 {
    unsetenv("ASAHI_G17P_RT_DISABLE");
-   unsetenv("ASAHI_G17P_RQ_CAPTURE_DIR");
-   unsetenv("ASAHI_G17P_RQ_BODIES_PATH");
-   unsetenv("ASAHI_G17P_RQ_MINIMAL_FROM_BLOB");
    unsetenv("ASAHI_G17P_RQ_LIVE_AS_TABLE");
-   unsetenv("ASAHI_G17P_RQ_IMAGE_DUMP");
 
    test_feature_predicate();
 

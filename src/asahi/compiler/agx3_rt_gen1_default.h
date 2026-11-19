@@ -16,5 +16,4 @@ void agx3_rt_gen1_default_constants(uint8_t out[AGX3_RT_GEN1_DEFAULT_CONSTANTS_S
 bool agx3_rt_gen1_default_entry_generate(uint64_t slot_body_va, uint8_t out[512], size_t *length);
 bool agx3_rt_gen1_runtime_code_map(uint64_t rows[AGX3_RT_GEN1_RUNTIME_MAP_ROWS][3]);
 void agx3_rt_gen1_runtime_ift(uint8_t out[AGX3_RT_GEN1_IFT_BYTES]);
-#define AGX3_RT_GEN1_TRAP_MARKER_OFFSET 0x3f00u
-bool agx3_rt_gen1_stub_body_generate(unsigned slot, bool trap, uint8_t *out, size_t capacity, size_t *length);
+bool agx3_rt_gen1_stub_body_generate(unsigned slot, uint8_t *out, size_t capacity, size_t *length);
