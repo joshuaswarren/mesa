@@ -2510,11 +2510,15 @@ hk_queue_create(struct hk_device *dev,
        queue->sync.exact_prior &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)) {
-      /* The M4 Pro runs two compute kicks of one context at once. */
+      /* G17P firmware runs compute kicks of one context from sibling
+       * kernel queues at once, so independent compute streams overlap.
+       * Measured on both G17P parts we have, with the in-flight and
+       * thread-count gates below: M4 Pro ALU d4/d16 -3.7/-3.1 %, A18 Pro
+       * bandwidth d4/d16 -25/-13 %, neither loses at depth 2 or with
+       * several processes. */
       queue->sib.count = CLAMP(
-         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES",
-                              agx_is_m4_pro(&dev->dev) ? 3 : 1),
-         1, HK_QUEUE_SIBLINGS_MAX);
+         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES", 3), 1,
+         HK_QUEUE_SIBLINGS_MAX);
       queue->sib.min_in_flight =
          debug_get_num_option("ASAHI_G17P_SIBLING_MIN_IN_FLIGHT", 2);
       queue->sib.min_threads =
