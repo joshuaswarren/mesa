@@ -7309,8 +7309,7 @@ agx_m5_graphics_program_cached(struct agx_device *dev,
                                struct agx3_g17p_graphics_program *program)
 {
    if (!agx_chip_g17_m5(dev->chip) ||
-       desc->uniform_range_count > HK_G17P_PATCH_MAX_RANGES ||
-       agx_env_flag(AGX_ENV_NO_M5_PROGRAM_CACHE))
+       desc->uniform_range_count > HK_G17P_PATCH_MAX_RANGES)
       return false;
 
    simple_mtx_lock(&agx_m5_template_lock);

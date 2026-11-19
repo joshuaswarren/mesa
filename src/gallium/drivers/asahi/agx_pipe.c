@@ -69,8 +69,6 @@ static const char *const agx_env_flag_names[AGX_ENV_FLAG_COUNT] = {
    [AGX_ENV_NEO_DRAW_DIAGNOSTICS] = "NEO_AGX_DRAW_DIAGNOSTICS",
    [AGX_ENV_NEO_UNIFORM_DIAGNOSTICS] = "NEO_AGX_UNIFORM_DIAGNOSTICS",
    [AGX_ENV_NEO_BINARY_DIAGNOSTICS] = "NEO_AGX_BINARY_DIAGNOSTICS",
-   [AGX_ENV_NO_STAGED_BUFFER_WRITES] = "ASAHI_NO_STAGED_BUFFER_WRITES",
-   [AGX_ENV_NO_M5_PROGRAM_CACHE] = "ASAHI_NO_M5_PROGRAM_CACHE",
    [AGX_ENV_M5_VERIFY_PROGRAM_CACHE] = "ASAHI_M5_VERIFY_PROGRAM_CACHE",
 };
 
@@ -1113,8 +1111,7 @@ agx_stage_buffer_write(struct agx_context *ctx, struct agx_resource *rsrc,
       return false;
 
    /* G17G copies buffers on the CPU (no precompiled kernels) */
-   if (agx_chip_g17_m5(dev->chip) || (dev->debug & AGX_DBG_NOSHADOW) ||
-       agx_env_flag(AGX_ENV_NO_STAGED_BUFFER_WRITES))
+   if (agx_chip_g17_m5(dev->chip) || (dev->debug & AGX_DBG_NOSHADOW))
       return false;
 
    if (rsrc->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE))
