@@ -152,9 +152,6 @@ struct agx_fs_prolog_key {
    /* Number of cull planes requiring lowering */
    uint8_t cull_distance_size;
 
-   /* Raw G18 constant planes carry a marker rather than zero derivatives. */
-   bool native_cull_constant_planes;
-
    /* Need to count FRAGMENT_SHADER_INVOCATIONS */
    bool statistics;
 

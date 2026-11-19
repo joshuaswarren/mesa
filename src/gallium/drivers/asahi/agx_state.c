@@ -5101,8 +5101,6 @@ agx_update_fs(struct agx_batch *batch)
       .prolog.fs.cull_distance_size =
          agx_last_uncompiled_vgt(ctx)->info.cull_distance_size,
 
-      .prolog.fs.native_cull_constant_planes = dev->chip == AGX_CHIP_G18G,
-
       .prolog.fs.polygon_stipple =
          ctx->rast->base.poly_stipple_enable &&
          rast_prim(batch->reduced_prim, ctx->rast->base.fill_front) ==
