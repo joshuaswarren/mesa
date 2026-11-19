@@ -1728,13 +1728,12 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    /* Now setup the command structs */
    struct util_dynarray payload = UTIL_DYNARRAY_INIT;
 
-   /* A small G16S submit otherwise grows the heap allocation once for its
+   /* A small submit otherwise grows the heap allocation once for its
     * header and again for the command. Keep those payloads on the stack;
     * util_dynarray moves to the heap if attachments or more commands need
     * additional space. The ioctl consumes the payload before we return.
     */
-   if (agx_is_m4_pro(&dev->dev))
-      util_dynarray_init_from_stack(&payload, alloca(1024), 1024);
+   util_dynarray_init_from_stack(&payload, alloca(1024), 1024);
 
    unsigned nr_vdm = 0, nr_cdm = 0;
 
@@ -2484,8 +2483,8 @@ hk_queue_create(struct hk_device *dev,
       list_delinit(&queue->vk.link);
 
    queue->vk.driver_submit = hk_queue_submit;
-   queue->sync.precise_tile_evictions = agx_is_m4_pro(&dev->dev);
-   queue->sync.direct_single_footprints = agx_is_m4_pro(&dev->dev);
+   queue->sync.precise_tile_evictions = true;
+   queue->sync.direct_single_footprints = true;
    queue->sync.serialize = dev->dev.params.gpu_generation >= 13 &&
                            dev->dev.params.gpu_generation <= 14;
    /* A serialized queue orders every command after both engines' complete

@@ -382,9 +382,11 @@ struct hk_sync_queue {
    struct hk_sync_recent recent[HK_SYNC_RECENT_FOOTPRINTS];
    uint32_t recent_next, recent_count;
    uint64_t recent_max, evicted;
-   /* G16S: complete writes need no preservation query against other
-    * complete writes, including entries evicted from the bounded ring.
-    * Retain all writes for a future partial-tile or sparse-layer pass.
+   /* Complete writes need no preservation query against other complete
+    * writes, including entries evicted from the bounded ring: only a
+    * preserving footprint shares a tile (footprints_share_tile()). Retain
+    * all writes for a future partial-tile or sparse-layer pass. Always set
+    * by hk_queue_create(); tests clear it to cover the conservative path.
     */
    bool precise_tile_evictions;
    /* A single command buffer already owns the complete footprint list. */

@@ -1844,7 +1844,7 @@ hk_sync_resolve_submit(struct hk_queue *queue,
     * With only one, recorded dependencies already order all its passes.
     * Publish its original records to queue history after resolving hazards,
     * avoiding an allocation and a second copy without exposing this submit
-    * as earlier history to itself. Keep other devices on their existing path.
+    * as earlier history to itself.
     */
    const bool direct_footprints =
       queue->sync.direct_single_footprints && count == 1;
