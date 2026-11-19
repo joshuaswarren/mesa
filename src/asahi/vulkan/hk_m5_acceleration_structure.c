@@ -62,25 +62,15 @@ static const uint32_t agx3_plan_spv[] = {
 #include "bvh/hk_agx3_m5_legacy_plan.spv.h"
 };
 
-static const uint32_t agx3_batch_plan_spv[] = {
-#include "bvh/hk_agx3_batch_plan.spv.h"
-};
-static const uint32_t agx3_batch_node_spv[] = {
-#include "bvh/hk_agx3_batch_leaf.spv.h"
-};
-static const uint32_t agx3_batch_envelope_spv[] = {
-#include "bvh/hk_agx3_batch_envelope.spv.h"
-};
-
 static const uint32_t agx3_refit_spv[] = {
 #include "bvh/hk_agx3_m5_legacy_refit.spv.h"
 };
 
 const uint32_t *
-hk_m5_agx3_node_encoder_spirv(bool batch, size_t *size_B)
+hk_m5_agx3_node_encoder_spirv(size_t *size_B)
 {
-   *size_B = batch ? sizeof(agx3_batch_node_spv) : sizeof(agx3_node_spv);
-   return batch ? agx3_batch_node_spv : agx3_node_spv;
+   *size_B = sizeof(agx3_node_spv);
+   return agx3_node_spv;
 }
 
 const uint32_t *
@@ -94,10 +84,6 @@ static void hk_flush_buffer_write_cp(VkCommandBuffer);
 static void hk_agx3_refit_phase(VkCommandBuffer,
    const struct vk_acceleration_structure_build_state *, unsigned);
 
-static void hk_as_phase_begin(VkCommandBuffer,
-   struct vk_acceleration_structure_build_marker *);
-static void hk_as_phase_end(VkCommandBuffer,
-   struct vk_acceleration_structure_build_marker *);
 
 /* Native tables have 16-byte entries and reserve ID zero. Keep the same
  * representable ID range as the old command-pool snapshots, without allocating
@@ -481,15 +467,6 @@ hk_cmd_build_agx3_from_ir_mode(VkCommandBuffer command_buffer,
    };
    for (unsigned i = 0; i < (single_leaf ? 1 : 5); ++i) {
       unsigned phase = single_leaf ? 5 : i;
-      if (debug_get_bool_option("ASAHI_M5_AS_PHASE_DIAG", false)) {
-         struct vk_acceleration_structure_build_marker marker = {
-            .step = VK_ACCELERATION_STRUCTURE_BUILD_STEP_TOP /* no ENCODE step upstream */,
-            .encode = {.key = 0x100 + phase, .leaf_node_count = args->leaf_bound},
-         };
-         hk_as_phase_begin(command_buffer, &marker);
-         vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                  pipeline[0]);
-      }
       struct hk_agx3_plan_args push = *args;
       push.phase = phase;
       vk_common_CmdPushConstants(command_buffer, layout[0],
@@ -513,13 +490,6 @@ hk_cmd_build_agx3_from_ir_mode(VkCommandBuffer command_buffer,
    for (unsigned step = 0; step < 2; ++step) {
       bool envelope = instances ? step == 0 : step == 1;
       unsigned stage = envelope ? 2 : 1;
-      if (debug_get_bool_option("ASAHI_M5_AS_PHASE_DIAG", false)) {
-         struct vk_acceleration_structure_build_marker marker = {
-            .step = VK_ACCELERATION_STRUCTURE_BUILD_STEP_TOP /* no ENCODE step upstream */,
-            .encode = {.key = 0x200 + stage, .leaf_node_count = args->leaf_bound},
-         };
-         hk_as_phase_begin(command_buffer, &marker);
-      }
       vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                pipeline[stage]);
       vk_common_CmdPushConstants(command_buffer, layout[stage],
@@ -888,187 +858,6 @@ hk_update_as(VkCommandBuffer commandBuffer,
 }
 
 /* Same per-AS native records, planned and encoded concurrently. */
-static VkResult
-hk_cmd_encode_agx3_batch(VkCommandBuffer command_buffer,
-                         const struct hk_agx3_batch_job *entries,
-                         uint32_t count, uint32_t map_bound,
-                         uint32_t max_node_bound)
-{
-   VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   static_assert(sizeof(struct hk_agx3_plan_args) == 120, "native plan ABI");
-   static_assert(sizeof(struct hk_agx3_batch_job) == 152, "batch array stride");
-   static_assert(sizeof(struct hk_agx3_batch_args) == 32, "batch push ABI");
-   static_assert(sizeof(struct hk_agx3_batch_map) == 8, "dense map stride");
-   static_assert(offsetof(struct hk_agx3_batch_job, first_job) == 140,
-                 "GPU-written dense offset ABI");
-
-   const struct {
-      const char *name;
-      const uint32_t *code;
-      size_t size;
-   } stages[] = {
-      {"hk-agx3-batch-plan", agx3_batch_plan_spv, sizeof(agx3_batch_plan_spv)},
-      {"hk-agx3-batch-node-encode", agx3_batch_node_spv, sizeof(agx3_batch_node_spv)},
-      {"hk-agx3-batch-as-envelope", agx3_batch_envelope_spv,
-       sizeof(agx3_batch_envelope_spv)},
-   };
-   VkPipeline pipeline[3];
-   VkPipelineLayout layout[3];
-   for (unsigned i = 0; i < ARRAY_SIZE(stages); ++i) {
-      VkResult result = get_pipeline_spv(dev, stages[i].name, stages[i].code,
-         stages[i].size, sizeof(struct hk_agx3_batch_args), &pipeline[i], &layout[i]);
-      if (result != VK_SUCCESS)
-         return result;
-   }
-   if (debug_get_bool_option("ASAHI_M5_AS_BATCH_DIAG", false))
-      fprintf(stderr, "M5_AS_BATCH builds=%u map_bound=%u max_node_bound=%u\n",
-              count, map_bound, max_node_bound);
-   const struct hk_agx3_batch_dispatch indirect = {.x = 0, .y = 1, .z = 1};
-   struct hk_agx3_batch_args push = {
-      .jobs = hk_pool_upload(cmd, entries, (size_t)count * sizeof(*entries), 8),
-      .map = hk_pool_alloc(cmd, (size_t)map_bound * sizeof(struct hk_agx3_batch_map), 8).gpu,
-      .dispatch = hk_pool_upload(cmd, &indirect, sizeof(indirect), 8),
-      .job_count = count,
-   };
-   if (!push.jobs || !push.map || !push.dispatch)
-      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   const VkMemoryBarrier barrier = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-      .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                       VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
-   };
-   bool all_single = true;
-   for (unsigned i = 0; i < count; ++i)
-      all_single &= entries[i].single_leaf != 0;
-
-   vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline[0]);
-   for (unsigned phase = 0; phase < 5; ++phase) {
-      if (all_single && (phase == 1 || phase == 2))
-         continue;
-      push.phase = phase;
-      vk_common_CmdPushConstants(command_buffer, layout[0], VK_SHADER_STAGE_COMPUTE_BIT,
-                                0, sizeof(push), &push);
-      hk_cmd_dispatch_unaligned(command_buffer, max_node_bound, count, 1);
-      vk_common_CmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-         0, 1, &barrier, 0, NULL, 0, NULL);
-   }
-
-   /* Instance metadata must precede their records, while BLAS headers follow
-    * completed nodes, just as in the existing scalar encoder. */
-   const bool instances = entries[0].plan.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR;
-   for (unsigned step = 0; step < 2; ++step) {
-      const bool envelope = instances ? step == 0 : step == 1;
-      const unsigned stage = envelope ? 2 : 1;
-      vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline[stage]);
-      vk_common_CmdPushConstants(command_buffer, layout[stage], VK_SHADER_STAGE_COMPUTE_BIT,
-                                0, sizeof(push), &push);
-      if (envelope)
-         hk_cmd_dispatch_unaligned(command_buffer, count, 1, 1);
-      else
-         hk_cmd_dispatch_indirect_addr(command_buffer, push.dispatch);
-      if (step == 0)
-         vk_common_CmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-            0, 1, &barrier, 0, NULL, 0, NULL);
-   }
-   return VK_SUCCESS;
-}
-
-static bool
-hk_native_encode_batch(VkCommandBuffer command_buffer,
-                        const struct vk_acceleration_structure_build_state *states,
-                        uint32_t count)
-{
-   if (!debug_get_bool_option("ASAHI_M5_AS_BATCH_ENCODE_PROBE", false))
-      return false;
-   VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   unsigned builds = 0;
-   for (uint32_t i = 0; i < count; ++i)
-      builds += states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE;
-   if (builds < 2)
-      return false;
-
-   /* Bounded chunks increase concurrency over the scalar path. The map's
-    * upper bound also bounds the eventual indirect X dimension without a
-    * CPU readback of GPU-produced active-node counts. */
-   const uint32_t max_builds = MIN2(1024u,
-      dev->vk.physical->properties.maxComputeWorkGroupCount[1]);
-   const uint32_t max_jobs = dev->vk.physical->properties.maxComputeWorkGroupCount[0];
-   struct hk_agx3_batch_job *entries = calloc(max_builds, sizeof(*entries));
-   if (!entries) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
-      return true;
-   }
-   VkResult result = VK_SUCCESS;
-   for (unsigned kind = 0; kind < 2 && result == VK_SUCCESS; ++kind) {
-      uint32_t used = 0, map_bound = 0, max_bound = 0;
-      for (uint32_t i = 0; i <= count && result == VK_SUCCESS; ++i) {
-         const struct vk_acceleration_structure_build_state *s = i < count ? &states[i] : NULL;
-         VkGeometryTypeKHR type = s ? vk_get_as_geometry_type(s->build_info)
-                                   : VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-         if (s && (s->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE ||
-                   (type == VK_GEOMETRY_TYPE_INSTANCES_KHR) != (kind == 1)))
-            continue;
-         struct hk_agx3_as_layout native = {0};
-         if (s && !hk_agx3_as_layout_init(s->leaf_node_count, &native)) {
-            result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-            break;
-         }
-         if (used && (!s || used == max_builds ||
-                      (uint64_t)map_bound + native.node_bound > max_jobs)) {
-            result = hk_cmd_encode_agx3_batch(command_buffer, entries, used,
-                                             map_bound, max_bound);
-            used = map_bound = max_bound = 0;
-            if (result != VK_SUCCESS)
-               break;
-         }
-         if (!s)
-            continue;
-         /* A single enormous tree keeps its already-qualified indirect path. */
-         if (native.node_bound > max_jobs) {
-            hk_encode_as(command_buffer, s);
-            continue;
-         }
-         if (s->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) {
-            hk_agx3_refit_phase(command_buffer, s, 0);
-            hk_flush_buffer_write_cp(command_buffer);
-         }
-         VK_FROM_HANDLE(vk_acceleration_structure, dst,
-                        s->build_info->dstAccelerationStructure);
-         uint64_t scratch = s->build_info->scratchData.deviceAddress;
-         uint64_t encode = scratch + s->scratch.header_offset + sizeof(struct vk_ir_header);
-         struct hk_agx3_batch_job *entry = &entries[used++];
-         *entry = (struct hk_agx3_batch_job){
-            .plan = {
-               .intermediate_bvh = scratch + s->scratch.ir_offset,
-               .header = scratch + s->scratch.header_offset,
-               .nodes = encode + native.nodes, .jobs = encode + native.jobs,
-               .envelope = encode + native.envelope, .state = encode + native.state,
-               .output_bvh = hk_as_native_va(dst),
-               .root_offset = s->leaf_node_count * hk_agx3_ir_leaf_size(type),
-               .leaf_bound = s->leaf_node_count, .node_bound = native.node_bound,
-               .slot_bound = native.slot_bound, .resource_id = hk_m5_as_id(dev, dst),
-               .geometry_type = type,
-               .m5_aabb_stride = debug_get_num_option("ASAHI_M5_AABB_RECORD_STRIDE", 48) == 64 ? 64 : 48,
-            },
-            .node_status = encode + native.node_status,
-            .envelope_status = encode + native.envelope_status,
-            .single_leaf = false,
-         };
-         map_bound += native.node_bound;
-         max_bound = MAX2(max_bound, native.node_bound);
-      }
-   }
-   free(entries);
-   if (result != VK_SUCCESS)
-      vk_command_buffer_set_error(&cmd->vk, result);
-   return true;
-}
-
 /* The upstream runtime hands encoding every state of a batch at once, after
  * the common builder finished the intermediate trees of the non-update
  * states. Keep the M5 per-state prepare/encode/update sequence inside it. */
@@ -1084,12 +873,7 @@ hk_encode_dispatch(VkCommandBuffer commandBuffer, struct vk_device *device,
 
    /* The common builder hands encoding the completed intermediate tree. */
    vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
-   /* Opt-in batched native encode (ASAHI_M5_AS_BATCH_ENCODE_PROBE): when it
-    * handles every non-update state, only updates remain. */
-   const bool batched = hk_native_encode_batch(commandBuffer, states, build_count);
    for (uint32_t i = 0; i < build_count; i++) {
-      if (batched && states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
-         continue;
       if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE) {
          hk_update_prepare(commandBuffer, &states[i], true,
                            flushed_compute_after_init_update_scratch);
@@ -1196,11 +980,6 @@ hk_build_leaves_batched(VkCommandBuffer commandBuffer, struct vk_device *device,
    free(tasks);
    if (!gpu)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   struct vk_acceleration_structure_build_marker marker = {
-      .step = VK_ACCELERATION_STRUCTURE_BUILD_STEP_BUILD_LEAVES,
-   };
-   if (args->emit_markers)
-      device->as_build_ops->begin_debug_marker(commandBuffer, &marker);
    device->dispatch_table.CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
    uint32_t limit = MIN2(device->physical->properties.maxComputeWorkGroupCount[0],
                          UINT32_MAX / 32);
@@ -1212,14 +991,10 @@ hk_build_leaves_batched(VkCommandBuffer commandBuffer, struct vk_device *device,
       device->cmd_dispatch_unaligned(commandBuffer, count * 32, 1, 1);
       first += count;
    }
-   if (args->emit_markers)
-      device->as_build_ops->end_debug_marker(commandBuffer, &marker);
    return VK_SUCCESS;
 }
 
 static const struct vk_acceleration_structure_build_ops hk_native_batched_leaf_build_ops = {
-   .begin_debug_marker = hk_as_phase_begin,
-   .end_debug_marker = hk_as_phase_end,
    .get_build_config = hk_native_build_config,
    .get_as_size = hk_get_as_size,
    .get_encode_scratch_size = hk_get_encode_scratch_size,
@@ -1229,20 +1004,7 @@ static const struct vk_acceleration_structure_build_ops hk_native_batched_leaf_b
    .build_leaves = hk_build_leaves_batched,
 };
 
-static const struct vk_acceleration_structure_build_ops hk_native_as_build_ops = {
-   .begin_debug_marker = hk_as_phase_begin,
-   .end_debug_marker = hk_as_phase_end,
-   .get_build_config = hk_native_build_config,
-   .get_as_size = hk_get_as_size,
-   .get_encode_scratch_size = hk_get_encode_scratch_size,
-   .get_update_scratch_size = hk_update_scratch_size,
-   .init_update_scratch = hk_init_update_scratch,
-   .encode = hk_encode_dispatch,
-};
-
 static const struct vk_acceleration_structure_build_ops hk_as_build_ops = {
-   .begin_debug_marker = hk_as_phase_begin,
-   .end_debug_marker = hk_as_phase_end,
    .get_as_size = hk_get_as_size,
    .get_encode_scratch_size = hk_get_encode_scratch_size,
    .encode = hk_encode_dispatch,
@@ -1309,42 +1071,6 @@ hk_flush_buffer_write_cp(VkCommandBuffer commandBuffer)
       0, 1, &barrier, 0, NULL, 0, NULL);
 }
 
-/* Explicitly opt-in build-phase witness, written to the test caller's mapped
- * buffer. Ordered markers identify the last entered phase before a hang;
- * they add work/cache flushes and must not be used by the production path. */
-static void
-hk_as_phase_write(VkCommandBuffer command_buffer,
-                  struct vk_acceleration_structure_build_marker *marker,
-                  bool end)
-{
-   const char *text = getenv("ASAHI_M5_AS_PHASE_ADDRESS");
-   if (!text)
-      return;
-   uint64_t address = strtoull(text, NULL, 0);
-   if (!address || (address & 3))
-      return;
-   hk_flush_buffer_write_cp(command_buffer);
-   struct vk_acceleration_structure_build_marker record = *marker;
-   if (end)
-      record.step |= 0x80000000u;
-   hk_write_buffer_cp(command_buffer, address, &record, sizeof(record));
-   hk_flush_buffer_write_cp(command_buffer);
-}
-
-static void
-hk_as_phase_begin(VkCommandBuffer command_buffer,
-                  struct vk_acceleration_structure_build_marker *marker)
-{
-   hk_as_phase_write(command_buffer, marker, false);
-}
-
-static void
-hk_as_phase_end(VkCommandBuffer command_buffer,
-                struct vk_acceleration_structure_build_marker *marker)
-{
-   hk_as_phase_write(command_buffer, marker, true);
-}
-
 static void
 hk_cmd_fill_buffer_addr(VkCommandBuffer commandBuffer, VkDeviceAddress addr,
                         VkDeviceSize size, uint32_t data)
@@ -1374,14 +1100,10 @@ hk_m5_backend_device_init_accel_struct_state(struct hk_device *dev)
       .morton_sort_workgroup_size = 512,
       .morton_sort_kvs_per_thread = 2,
       .propagate_cull_flags = false,
-      /* Private progress probe adds dispatches and flushes: never default.
-       * Its performance cost is unmeasured and it is not a root-cause fix. */
-      .emit_markers = debug_get_bool_option("ASAHI_M5_AS_PHASE_DIAG", false),
    };
 
-   dev->vk.as_build_ops = !dev->m5_native_as ? &hk_as_build_ops :
-      debug_get_bool_option("ASAHI_M5_BATCH_LEAVES", true)
-         ? &hk_native_batched_leaf_build_ops : &hk_native_as_build_ops;
+   dev->vk.as_build_ops = dev->m5_native_as ? &hk_native_batched_leaf_build_ops
+                                            : &hk_as_build_ops;
    dev->vk.write_buffer_cp = hk_write_buffer_cp;
    dev->vk.flush_buffer_write_cp = hk_flush_buffer_write_cp;
    dev->vk.cmd_dispatch_unaligned = hk_cmd_dispatch_unaligned;
@@ -1497,12 +1219,6 @@ hk_m5_backend_CmdBuildAccelerationStructuresKHR(
               pInfos[i].mode != VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) ||
              !compatible || (!triangles && !instances) || primitives > UINT32_MAX ||
              !hk_agx3_as_layout_init(primitives, &layout)) {
-            if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false))
-               fprintf(stderr, "M5 AS build refused: type=%u mode=%u geometries=%u geometry=%u flags=%x count=%u\n",
-                       pInfos[i].type, pInfos[i].mode, pInfos[i].geometryCount,
-                       geometry ? geometry->geometryType : ~0u,
-                       geometry ? geometry->flags : 0,
-                       ppBuildRangeInfos[i][0].primitiveCount);
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
             return;
          }

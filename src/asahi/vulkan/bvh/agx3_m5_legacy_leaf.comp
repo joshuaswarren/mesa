@@ -33,18 +33,10 @@
 #endif
 
 layout(local_size_x = 8) in;
-#ifdef HK_AGX3_BATCH
-layout(push_constant) uniform CONSTS
-{
-   hk_agx3_batch_args batch;
-};
-hk_agx3_leaf_args args;
-#else
 layout(push_constant) uniform CONSTS
 {
    hk_agx3_leaf_args args;
 };
-#endif
 
 shared vec3 vertices[24];
 shared vec3 lower[8], upper[8];
@@ -226,19 +218,6 @@ void
 main()
 {
    uint id = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
-#ifdef HK_AGX3_BATCH
-   hk_agx3_batch_map mapping = DEREF(INDEX(hk_agx3_batch_map, batch.map, id));
-   if (mapping.build >= batch.job_count)
-      return;
-   hk_agx3_batch_job entry = DEREF(INDEX(hk_agx3_batch_job, batch.jobs, mapping.build));
-   if (DEREF(entry.plan.state).error != 0)
-      return;
-   args.jobs = entry.plan.jobs;
-   args.status = entry.node_status;
-   args.job_count = DEREF(entry.plan.state).job_count;
-   args.slot_bias = entry.plan.m5_aabb_stride;
-   id = mapping.node;
-#endif
    if (id >= args.job_count)
       return;
    hk_agx3_leaf_job job = DEREF(INDEX(hk_agx3_leaf_job, args.jobs, id));

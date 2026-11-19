@@ -699,7 +699,7 @@ const uint32_t *
 hk_agx3_node_encoder_spirv(enum agx_chip chip, size_t *size_B)
 {
    return hk_agx3_as_format_for_chip(chip) == HK_AGX3_AS_FORMAT_M5
-             ? hk_m5_agx3_node_encoder_spirv(false, size_B)
+             ? hk_m5_agx3_node_encoder_spirv(size_B)
              : hk_gen1_agx3_node_encoder_spirv(false, size_B);
 }
 

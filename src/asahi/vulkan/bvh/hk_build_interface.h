@@ -417,45 +417,6 @@ struct hk_agx3_plan_args {
    uint32_t padding;
 };
 
-/* Independent ASs share dispatches, not their writable records. The planner
- * allocates a dense job map after classification; each encoder workgroup
- * still owns precisely the same native root/child region as the scalar path. */
-struct hk_agx3_batch_job {
-#ifdef VULKAN
-   hk_agx3_plan_args plan;
-#else
-   struct hk_agx3_plan_args plan;
-#endif
-   REF(uint32_t) node_status;
-   REF(uint32_t) envelope_status;
-   uint32_t single_leaf;
-   uint32_t first_job;
-   uint32_t encode_count;
-   uint32_t reserved;
-};
-struct hk_agx3_batch_map {
-   uint32_t build;
-   uint32_t node;
-};
-struct hk_agx3_batch_dispatch {
-   uint32_t x;
-   uint32_t y;
-   uint32_t z;
-   uint32_t reserved;
-};
-#ifdef VULKAN
-TYPE(hk_agx3_batch_job, 8);
-TYPE(hk_agx3_batch_map, 4);
-TYPE(hk_agx3_batch_dispatch, 4);
-#endif
-struct hk_agx3_batch_args {
-   REF(hk_agx3_batch_job) jobs;
-   REF(hk_agx3_batch_map) map;
-   REF(hk_agx3_batch_dispatch) dispatch;
-   uint32_t job_count;
-   uint32_t phase;
-};
-
 /* M5's name for hk_agx3_plan_args::plan_restored: 48, or 64 for the 64-byte
  * bounding-box record diagnostic. */
 #define m5_aabb_stride plan_restored

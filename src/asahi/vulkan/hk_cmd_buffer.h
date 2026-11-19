@@ -1816,9 +1816,9 @@ struct hk_cmd_buffer {
     * conditional rendering. */
    bool conditional_meta;
 
-   /* Single-kick vkCmdTraceRays* (ASAHI_M5_RT_SINGLE_KICK, default on): while set,
-    * hk_dispatch_m5_native writes the kernel's launch record (40-byte direct
-    * launch + barrier) here instead of into the control stream. */
+   /* Single-kick vkCmdTraceRays* on M5: while set, hk_dispatch_m5_native
+    * writes the kernel's launch record (40-byte direct launch + barrier) here
+    * instead of into the control stream. */
    uint8_t *m5_rt_capture;
    bool m5_rt_captured;
 
