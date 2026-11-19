@@ -82,7 +82,9 @@ hk_device_init_meta(struct hk_device *dev)
    dev->meta.use_gs_for_layer = false;
    dev->meta.use_layer_output = true;
    dev->meta.use_view_relative_3d_layer = agx_native_graphics(&dev->dev);
-   dev->meta.specialize_single_layer_buffer_upload = agx_is_m4_pro(&dev->dev);
+   /* hk never uses layered rendering for meta, so a one-layer attachment
+    * view always renders Layer 0: the specialization holds on every chip. */
+   dev->meta.specialize_single_layer_buffer_upload = true;
    /* Other native chips lower a stencil blit to eight bit-selective discard
     * passes. G17P exports stencil in one draw, which also resolves depth and
     * stencil together: 1.50 to 0.48 ms for a 2x D32S8 at 3456x2234. */
