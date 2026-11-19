@@ -4740,9 +4740,19 @@ agx_lower_agx3_half_converts(agx_context *ctx)
             I->src[0].value != AGX_CONVERT_S8_TO_F)))
          continue;
 
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          I->src[0].value == AGX_CONVERT_S8_TO_F &&
-          I->round == AGX_ROUND_RTE && I->dest[0].size == AGX_SIZE_16 &&
+      /* M5 converts a signed byte to a half or a float natively (every
+       * byte value at every position of a half, both result widths, tested
+       * on G17C). G18 keeps the halfword fallback below. */
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !is_g18g &&
+          I->src[0].value == AGX_CONVERT_S8_TO_F && I->round == AGX_ROUND_RTE &&
+          (I->dest[0].size == AGX_SIZE_16 || I->dest[0].size == AGX_SIZE_32) &&
+          I->src[1].size == AGX_SIZE_16 && !I->src[1].abs && !I->src[1].neg &&
+          !I->src[1].memory)
+         continue;
+
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !is_g18g &&
+          I->src[0].value == AGX_CONVERT_U8_TO_F && I->round == AGX_ROUND_RTE &&
+          I->dest[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_16 &&
           !I->src[1].abs && !I->src[1].neg && !I->src[1].memory)
          continue;
 
@@ -8683,6 +8693,20 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
       if (src_sz == 64)
          UNREACHABLE("64-bit conversions unimplemented");
 
+      /* As for i2f below: the unsigned-byte float32 conversion reads only
+       * the low eight bits of its half (agx_nir_fold_ubyte_to_float). */
+      if (src_sz == 8 && sz == 32 &&
+          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !agx_is_g18g(&b->shader->key->dev)) {
+         nir_alu_instr *narrow = nir_src_as_alu(instr->src[0].src);
+         if (narrow &&
+             (narrow->op == nir_op_u2u8 || narrow->op == nir_op_i2i8) &&
+             nir_src_bit_size(narrow->src[0].src) == 16)
+            return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_U8_TO_F),
+                                  agx_alu_src_index(b, narrow->src[0]),
+                                  AGX_ROUND_RTE);
+      }
+
       enum agx_convert mode = (src_sz == 32)   ? AGX_CONVERT_U32_TO_F
                               : (src_sz == 16) ? AGX_CONVERT_U16_TO_F
                                                : AGX_CONVERT_U8_TO_F;
@@ -8694,6 +8718,21 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
    case nir_op_i2f32: {
       if (src_sz == 64)
          UNREACHABLE("64-bit conversions unimplemented");
+
+      /* The signed-byte conversion reads only the low eight bits of its half
+       * register, so the byte of a u2u8/i2i8 of a half needs no mask
+       * (agx_nir_fold_byte_to_float). */
+      if (src_sz == 8 &&
+          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !agx_is_g18g(&b->shader->key->dev)) {
+         nir_alu_instr *narrow = nir_src_as_alu(instr->src[0].src);
+         if (narrow &&
+             (narrow->op == nir_op_u2u8 || narrow->op == nir_op_i2i8) &&
+             nir_src_bit_size(narrow->src[0].src) == 16)
+            return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_S8_TO_F),
+                                  agx_alu_src_index(b, narrow->src[0]),
+                                  AGX_ROUND_RTE);
+      }
 
       enum agx_convert mode = (src_sz == 32)   ? AGX_CONVERT_S32_TO_F
                               : (src_sz == 16) ? AGX_CONVERT_S16_TO_F
@@ -10525,6 +10564,14 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * normal late multiply pass cannot recognize fused backend opcodes. */
    if (byte_indices)
       NIR_PASS(_, nir, agx_nir_lower_imul64, false);
+
+   /* Before the shift fusions below rewrite the byte extracts it matches. */
+   /* M5 only: G18 legalizes byte conversions through its halfword forms
+    * (agx_lower_agx3_half_converts). */
+   if (m5 && !g18_scans) {
+      NIR_PASS(_, nir, agx_nir_fold_byte_to_float);
+      NIR_PASS(_, nir, agx_nir_fold_ubyte_to_float);
+   }
 
    /* Fuse add/sub/multiplies/shifts after running opt_algebraic_late to fuse
     * isub but before shifts are lowered.
