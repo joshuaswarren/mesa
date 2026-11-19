@@ -742,8 +742,7 @@ bool agx_nir_lower_clip_m1_1(struct nir_shader *s);
 bool agx_nir_clip_m1_1_complete(struct nir_shader *s);
 bool agx_nir_lower_cull_distance_vs(struct nir_shader *s);
 bool agx_nir_lower_cull_distance_fs(struct nir_shader *s,
-                                    unsigned nr_distances,
-                                    bool native_constant_planes);
+                                    unsigned nr_distances);
 bool agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
                           unsigned bit_size, unsigned num_components,
                           int64_t hole_size, nir_intrinsic_instr *low,
