@@ -6929,7 +6929,9 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
    }
    if (backend_key.g17p_emrt) {
       /* Only the image accesses may be conditional. Every resident tile
-       * operation must execute on every path through the epilog. */
+       * operation must execute on every path through the epilog; an epilog
+       * that has a conditional one is compiled without eMRT, which is
+       * correct, only slower. */
       nir_metadata_require(b.impl, nir_metadata_dominance);
       nir_foreach_block(block, b.impl) {
          nir_foreach_instr(instr, block) {
@@ -6938,12 +6940,14 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
             nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
             if ((op == nir_intrinsic_store_local_pixel_agx ||
                  op == nir_intrinsic_load_local_pixel_agx) &&
-                !nir_block_dominates(block, nir_impl_last_block(b.impl))) {
+                !nir_block_dominates(block, nir_impl_last_block(b.impl)))
                backend_key.g17p_emrt = false;
-               mesa_loge("G17P eMRT has conditional resident tile access");
-            }
          }
       }
+
+      if (!backend_key.g17p_emrt)
+         perf_debug_dev(&dev->dev, "G17P eMRT disabled for an epilog with "
+                                   "conditional resident tile access");
    }
    if (g17p_tile_partitions) {
       memcpy(backend_key.g17p_tile_partitions, g17p_tile_partitions,
