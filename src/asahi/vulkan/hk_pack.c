@@ -75,19 +75,49 @@ hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
 
 void
 hk_pack_describe(struct hk_pack_member *member, const struct hk_cmd_buffer *cmd,
-                 const struct hk_cs *cs, size_t terminate_size)
+                 const struct hk_cs *cs, size_t terminate_size,
+                 uint8_t render_kinds)
 {
    memset(member, 0, sizeof(*member));
    if (!cs)
       return;
 
+   /* A barrier records its source kinds against both subqueues
+    * (hk_sync_src_dep()), so a compute-only barrier names COMPUTE work on
+    * the render subqueue too. The resolver makes a wait of such a kind only
+    * once the render subqueue ran work of it; neither does the planner. */
    member->cs = cs;
    member->bytes = (const uint8_t *)cs->current - (const uint8_t *)cs->start -
                    terminate_size;
    member->kinds = cs->sync.kind;
-   member->render_waits = cs->sync.dep[HK_SYNC_VDM].prior;
+   member->render_waits = cs->sync.dep[HK_SYNC_VDM].prior & render_kinds;
    for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k)
-      member->render_tail |= cmd->sync.req[k][HK_SYNC_VDM].prior;
+      member->render_tail[k] =
+         cmd->sync.req[k][HK_SYNC_VDM].prior & render_kinds;
+   member->render_ran = render_kinds != 0;
+}
+
+uint8_t
+hk_pack_render_kinds(const struct hk_cmd_buffer *cmd)
+{
+   uint8_t kinds = 0;
+   list_for_each_entry(const struct hk_cs, cs, &cmd->control_streams, node) {
+      if (hk_sync_sq(cs) == HK_SYNC_VDM)
+         kinds |= cs->sync.kind;
+   }
+   return kinds;
+}
+
+/* The render kinds the tails `tails` make a packet of kinds `kinds` wait
+ * for: hk_pack_fold_member() folds a member's tail of each kind the packet
+ * has. */
+static uint8_t
+hk_pack_tail(const uint8_t tails[HK_SYNC_NUM_KINDS], uint8_t kinds)
+{
+   uint8_t tail = 0;
+   u_foreach_bit(k, kinds)
+      tail |= tails[k];
+   return tail;
 }
 
 /* Whether `m` may start a run on its own. */
@@ -112,10 +142,12 @@ hk_pack_within_bounds(const struct hk_pack_member *m,
  * waits for. A render wait is different: a later member's wait on a render
  * would hold the earlier members back too. So every member must wait for no
  * render kind beyond those the first member waits for, counting the tails of
- * the members before it, which it waits for as a separate command, and it
- * must not add synchronization kinds, whose requirements carried in from
- * earlier command buffers the packet would take on as well. Otherwise the
- * member starts a new packet.
+ * the members before it for the packet's kinds, which the packet waits for as
+ * the separate commands would (hk_pack_fold_member()). Once the
+ * render subqueue ran work, a member must not add synchronization kinds
+ * either: the packet would take on the requirements carried in for them
+ * from earlier command buffers. Otherwise the member starts a new packet.
+ * This changes only how much is packed, never which waits are kept.
  */
 unsigned
 hk_pack_plan(const struct hk_pack_member *members, unsigned n,
@@ -127,7 +159,7 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
    uint64_t dispatches = 0, threads = 0, work = 0;
    size_t resources = 0;
    uint32_t attachments = 0;
-   uint8_t kinds = 0, waits = 0, tail = 0;
+   uint8_t kinds = 0, waits = 0, tails[HK_SYNC_NUM_KINDS] = {0};
    bool loops = false;
 
    *packed_members = 0;
@@ -138,8 +170,9 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
       const struct hk_cs *cs = m ? m->cs : NULL;
 
       const bool fits = cs && run.count &&
-         !(m->kinds & ~kinds) &&
-         !((m->render_waits | tail) & ~waits) &&
+         !(m->render_ran && (m->kinds & ~kinds)) &&
+         !((m->render_waits | hk_pack_tail(tails, kinds | m->kinds)) &
+           ~waits) &&
          !(loops && cs->pack_loops) &&
          dispatches + cs->stats.cmds <= HK_PACK_MAX_DISPATCHES &&
          cs->pack_threads <= HK_PACK_MAX_THREADS - threads &&
@@ -156,7 +189,9 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
          work += cs->pack_static_work;
          resources += cs->compute_resources.size;
          attachments += cs->compute_attachments.count;
-         tail |= m->render_tail;
+         kinds |= m->kinds;
+         for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k)
+            tails[k] |= m->render_tail[k];
          loops |= cs->pack_loops;
          continue;
       }
@@ -184,7 +219,7 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
          attachments = cs->compute_attachments.count;
          kinds = m->kinds;
          waits = m->render_waits;
-         tail = m->render_tail;
+         memcpy(tails, m->render_tail, sizeof(tails));
          loops = cs->pack_loops;
       }
    }

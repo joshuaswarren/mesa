@@ -2382,7 +2382,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
  * atomics where another kernel queue could run beside the packet
  * (hk_pack_atomics_allowed()). A packet stays within the launch, thread and
  * static work bounds of hk_pack.h and holds at most one stream with a looping
- * program, so it runs about as long as its longest member could alone; it
+ * program, so at ALU rate it runs about as long as its longest member could
+ * alone (hk_pack.h says how far that holds for memory-bound programs); it
  * carries no more compute attachments than the kernel takes for one
  * command. A run past a bound starts a new packet.
  *
@@ -2558,11 +2559,13 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
    }
 
    unsigned eligible = 0;
+   uint8_t render_kinds = queue->sync.ever[HK_SYNC_VDM];
    for (unsigned i = 0; i < n; ++i) {
       const struct hk_cmd_buffer *cmd =
          (const struct hk_cmd_buffer *)submit->command_buffers[i];
       const struct hk_cs *cs = hk_pack_run_member(dev, cmd, terminate, atomics);
-      hk_pack_describe(&members[i], cmd, cs, sizeof(terminate));
+      hk_pack_describe(&members[i], cmd, cs, sizeof(terminate), render_kinds);
+      render_kinds |= hk_pack_render_kinds(cmd);
       eligible += cs != NULL;
    }
 
@@ -2750,7 +2753,7 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    VkResult result = queue_submit(dev, queue, submit, &untouched);
    if (result != VK_SUCCESS && !untouched)
       result = vk_queue_set_lost(&queue->vk, "Submit failed");
-   else if (has_compute)
+   else if (result == VK_SUCCESS && has_compute)
       hk_compute_kick_note(dev, queue);
 
    if (dev->dev.debug & AGX_DBG_SYNC) {
