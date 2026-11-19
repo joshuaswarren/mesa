@@ -6665,7 +6665,10 @@ agx3_emit_alu(struct util_dynarray *emission, enum agx_isa_encoding enc,
     * modifier would be dropped. Before this check a 32-bit iadd_sat that
     * waited on a load composed as a plain iadd. */
    bool all_sources_registers = !S->saturate && !S->shift;
-   for (unsigned i = 0; i < S->nr_srcs; ++i)
+   /* NOT's second bitop source is an ignored immediate; the unary `inv` form
+    * reads only the first (llama.cpp q3_K mat-vec: in-place NOT, wait 0xc). */
+   const unsigned nr_read = op == AGX3_ALU_BNOT ? 1 : S->nr_srcs;
+   for (unsigned i = 0; i < nr_read; ++i)
       all_sources_registers &= S->src[i].is_reg &&
                                S->src[i].size == AGX3_SEL_SIZE_32 &&
                                !S->src[i].abs && !S->src[i].neg;

@@ -176,6 +176,27 @@ TEST_F(AGX3PackBinary, MeshExportFencesUseExactLivePhaseMasks)
              (std::vector<uint8_t>{0x0e,0,0,0}));
 }
 
+/* An in-place 32-bit NOT whose halves come from two loads in flight waits on
+ * two slots. Only the unary AGX3b `inv` form carries that wait in place: the
+ * NOT's ignored second bitop source must not keep it from that form
+ * (llama.cpp's q3_K mat-vec failed to compile). */
+TEST_F(AGX3PackBinary, InPlaceNotWaitingOnTwoSlotsPacks)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_device_load_to(b, agx_register(0, AGX_SIZE_16),
+      agx_uniform(0, AGX_SIZE_64), agx_immediate(0), AGX_FORMAT_I16, 1, 0, false);
+   agx_device_load_to(b, agx_register(1, AGX_SIZE_16),
+      agx_uniform(0, AGX_SIZE_64), agx_immediate(2), AGX_FORMAT_I16, 1, 0, false);
+   agx_bitop_to(b, agx_register(0, AGX_SIZE_32), agx_register(0, AGX_SIZE_32),
+                agx_zero(), UTIL_LUT2(~a));
+   agx_device_store(b, agx_register(0, AGX_SIZE_32), agx_uniform(0, AGX_SIZE_64),
+                    agx_immediate(0), AGX_FORMAT_I32, 1, 0, false);
+   agx_stop(b);
+   EXPECT_FALSE(pack(b).empty());
+}
+
 TEST_F(AGX3PackBinary, MeshExportFenceDrainsBothPendingR0Halves)
 {
    agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
