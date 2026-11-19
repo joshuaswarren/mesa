@@ -19,15 +19,7 @@
 
 #include "asahi/layout/layout.h"
 
-#ifdef AGX_G17G_TILE_FORMAT_GATE_STANDALONE
-/* Host build without the compiler and libagx generated headers: the
- * verification command extracts agx_g17g_rt0_eot_physical_format_supported()
- * from agx_bg_eot.h into this header, so the real predicate text is what runs.
- */
-#include "agx_g17g_tile_format_gate_standalone.h"
-#else
 #include "agx_bg_eot.h"
-#endif
 
 #include <inttypes.h>
 #include <stdio.h>
