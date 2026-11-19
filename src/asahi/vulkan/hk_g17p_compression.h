@@ -36,9 +36,9 @@
  *    A multiview pass has an eight-byte budget, so on a device with the
  *    multiview feature 2x colour stays plain (hk_image.c). Input
  *    attachments stay plain.
- *  - Not R11G11B10F on M4 Pro: attachments store through the format's own
- *    class (hk_eot_pbe_format()), and a compressed tile of that class reads
- *    a NaN field back as zero, however it was written. Rendering NaN into an
+ *  - Not R11G11B10F: attachments store through the format's own class
+ *    (hk_eot_pbe_format()), and a compressed tile of that class reads a NaN
+ *    field back as zero, however it was written. Rendering NaN into an
  *    R11G11B10F attachment has to keep it, so they stay plain.
  *  - Depth: D16_UNORM, D32_SFLOAT and both planes of D32_SFLOAT_S8_UINT,
  *    one level, one layer, one sample; on M4 Pro also arrays of one level
@@ -102,10 +102,9 @@ hk_g17p_compression_color_format(VkFormat format)
    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
    case VK_FORMAT_A2B10G10R10_UINT_PACK32:
    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
-   /* Not B10G11R11_UFLOAT: G17P packs it into one tile word and stores it
-    * through an R32_UINT PBE (agx_g17p_rt0_pbe_format), a different
-    * compression class from the R11G11B10 texture that reads it back. M4 Pro
-    * stores it through its own class, which loses NaN when compressed. */
+   /* Not B10G11R11_UFLOAT: G17P packs it into one tile word, and its
+    * end-of-tile programs store that word through the format's own class
+    * (hk_eot_pbe_format()), which loses NaN when compressed. */
    case VK_FORMAT_R16G16_UNORM:
    case VK_FORMAT_R16G16_SNORM:
    case VK_FORMAT_R16G16_UINT:

@@ -259,14 +259,30 @@ hk_agx2_packed_float_copy(enum agx_chip chip, VkFormat format)
            format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32);
 }
 
-/* The format an end-of-tile PBE stores a target through. M4 Pro stores
- * R11G11B10F through its own class, under the lane class of packed 32-bit
- * formats (see hk_eot_key_format()): only that class can write it compressed,
- * and the stored bytes are the same as through R32_UINT. */
+/* Whether end-of-tile programs store R11G11B10F through its own class, under
+ * the lane class of packed 32-bit formats (see hk_eot_key_format()), rather
+ * than as the raw tile word through an R32_UINT PBE. The stored bytes are the
+ * same. The reason is the end-of-tile PBE of the G17P profile: when an
+ * end-of-tile program resolves a multisampled tile into its single-sample
+ * target, only this class averages the packed fields. Through the raw 32-bit
+ * class no resolved pixel is its samples' mean, and the wrong value changes
+ * from run to run (aurora-r11g11b10f 2, res-eot). It is also the only class
+ * that could write the format compressed. The PBE is the same on every G17P
+ * SoC, so all of them take it: measured on the M4 Pro (since c724930c) and
+ * the M4 Max; the A18 Pro has the same PBE classes and has not been measured.
+ * M5 already stores the format in its own class (agx_rt0_pbe_format()). */
+static inline bool
+hk_eot_r11g11b10_own_class(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G17P;
+}
+
+/* The format an end-of-tile PBE stores a target through. */
 static inline enum pipe_format
 hk_eot_pbe_format(const struct agx_device *dev, enum pipe_format format)
 {
-   return format == PIPE_FORMAT_R11G11B10_FLOAT && agx_is_m4_pro(dev)
+   return format == PIPE_FORMAT_R11G11B10_FLOAT &&
+                hk_eot_r11g11b10_own_class(dev)
              ? format
              : agx_rt0_pbe_format(dev->chip, format);
 }
@@ -276,7 +292,8 @@ hk_eot_pbe_format(const struct agx_device *dev, enum pipe_format format)
 static inline enum pipe_format
 hk_eot_key_format(const struct agx_device *dev, enum pipe_format format)
 {
-   return format == PIPE_FORMAT_R11G11B10_FLOAT && agx_is_m4_pro(dev)
+   return format == PIPE_FORMAT_R11G11B10_FLOAT &&
+                hk_eot_r11g11b10_own_class(dev)
              ? PIPE_FORMAT_R10G10B10A2_UNORM
              : format;
 }
