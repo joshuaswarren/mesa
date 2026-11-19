@@ -3,7 +3,8 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
-#include "util/os_time.h"
+#include "c11/threads.h"
+#include "util/simple_mtx.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_physical_device.h"
@@ -19,31 +20,48 @@
       }                                                                        \
    } while (0)
 
+#if !UTIL_FUTEX_SUPPORTED
+#error "observing contention on the backing queue lock needs futex simple_mtx"
+#endif
+
 static struct hk_queue queues[6];
-static int entered, released, finished, independent;
+static int entered, released, finished, independent, active;
+
+/* Flags change under `lock` and are broadcast on `cond`. */
+static mtx_t lock;
+static cnd_t cond;
+
+static void
+bump(int *flag)
+{
+   mtx_lock(&lock);
+   p_atomic_inc(flag);
+   cnd_broadcast(&cond);
+   mtx_unlock(&lock);
+}
 
 static void
 await(int *flag)
 {
-   int64_t end = os_time_get_nano() + 2 * ONE_SECOND_IN_NS;
-   while (!p_atomic_read(flag)) {
-      CHECK(os_time_get_nano() < end);
-      const struct timespec delay = {.tv_nsec = 1000000};
-      thrd_sleep(&delay, NULL);
-   }
+   mtx_lock(&lock);
+   while (!p_atomic_read(flag))
+      CHECK(cnd_wait(&cond, &lock) == thrd_success);
+   mtx_unlock(&lock);
 }
 
 static VkResult
 driver_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
    if (queue == &queues[2].vk) {
-      p_atomic_set(&independent, 1);
+      bump(&independent);
       return VK_SUCCESS;
    }
    CHECK(queue == &queues[0].vk);
-   p_atomic_inc(&entered);
+   CHECK(p_atomic_inc_return(&active) == 1);
+   bump(&entered);
    await(&released);
    p_atomic_inc(&finished);
+   p_atomic_dec(&active);
    return VK_SUCCESS;
 }
 
@@ -61,6 +79,8 @@ main(void)
    struct hk_device *dev = calloc(1, sizeof(*dev));
    struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
    CHECK(dev && pdev);
+   CHECK(mtx_init(&lock, mtx_plain) == thrd_success);
+   CHECK(cnd_init(&cond) == thrd_success);
    vk_object_base_init(&dev->vk, &dev->vk.base, VK_OBJECT_TYPE_DEVICE);
    dev->vk.alloc = *vk_default_allocator();
    dev->vk.physical = &pdev->vk;
@@ -97,10 +117,16 @@ main(void)
    submit(1);
    submit(2);
    await(&independent);
-   const struct timespec delay = {.tv_nsec = 20000000};
-   thrd_sleep(&delay, NULL);
+   /* The alias submission is serialized behind the paused one on the
+    * backing queue's lock. A futex simple_mtx holds 2 exactly while another
+    * thread waits for it, and only the alias' submit thread can contend
+    * here, so wait for that state; if serialization were broken the alias
+    * would enter driver_submit instead, which the loop also stops on. */
+   while (p_atomic_read(&queues[0].vk.lock.val) != 2 &&
+          p_atomic_read(&entered) == 1)
+      thrd_yield();
    CHECK(p_atomic_read(&entered) == 1);
-   p_atomic_set(&released, 1);
+   bump(&released);
 
    /* Match device teardown: aliases must stop before the backing queue. */
    while (!list_is_empty(&dev->vk.queues)) {
@@ -111,6 +137,8 @@ main(void)
    CHECK(p_atomic_read(&entered) == 2);
    CHECK(p_atomic_read(&finished) == 2);
    vk_object_base_finish(&dev->vk.base);
+   cnd_destroy(&cond);
+   mtx_destroy(&lock);
    free(pdev);
    free(dev);
    puts(

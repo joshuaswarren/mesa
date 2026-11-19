@@ -4,7 +4,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
-#include "util/os_time.h"
+#include "c11/threads.h"
 #include "hk_buffer.h"
 #include "hk_device.h"
 #include "hk_device_memory.h"
@@ -19,18 +19,29 @@
       }                                                                        \
    } while (0)
 
-static int entered, complete, binds;
+static int entered, complete, expire, binds;
 static bool wait_error, no_wait;
+
+/* Flags change under `lock` and are broadcast on `cond`. */
+static mtx_t lock;
+static cnd_t cond;
+
+static void
+set(int *flag)
+{
+   mtx_lock(&lock);
+   p_atomic_set(flag, 1);
+   cnd_broadcast(&cond);
+   mtx_unlock(&lock);
+}
 
 static void
 await(int *flag)
 {
-   int64_t end = os_time_get_nano() + 2 * ONE_SECOND_IN_NS;
-   while (!p_atomic_read(flag)) {
-      CHECK(os_time_get_nano() < end);
-      const struct timespec delay = {.tv_nsec = 1000000};
-      thrd_sleep(&delay, NULL);
-   }
+   mtx_lock(&lock);
+   while (!p_atomic_read(flag))
+      CHECK(cnd_wait(&cond, &lock) == thrd_success);
+   mtx_unlock(&lock);
 }
 
 static VkResult
@@ -66,17 +77,27 @@ sync_wait(struct vk_device *dev, struct vk_sync *sync, uint64_t value,
       return VK_SUCCESS;
 
    CHECK(value == 7);
-   p_atomic_set(&entered, 1);
+   /* Each wait is bounded so that device loss can end it. */
+   CHECK(timeout != UINT64_MAX);
+   set(&entered);
    if (wait_error)
       return VK_ERROR_UNKNOWN;
 
-   while (!p_atomic_read(&complete)) {
-      if ((uint64_t)os_time_get_nano() >= timeout)
-         return VK_TIMEOUT;
-      const struct timespec delay = {.tv_nsec = 1000000};
-      thrd_sleep(&delay, NULL);
+   /* The test decides when the bounded wait times out (`expire`), so the
+    * timeout path runs exactly when the test asks for it, whatever the clock
+    * says. */
+   VkResult result;
+   mtx_lock(&lock);
+   while (!p_atomic_read(&complete) && !p_atomic_read(&expire))
+      CHECK(cnd_wait(&cond, &lock) == thrd_success);
+   if (p_atomic_read(&complete)) {
+      result = VK_SUCCESS;
+   } else {
+      p_atomic_set(&expire, 0);
+      result = VK_TIMEOUT;
    }
-   return VK_SUCCESS;
+   mtx_unlock(&lock);
+   return result;
 }
 
 static const struct vk_sync_type sync_type = {
@@ -151,7 +172,7 @@ run(unsigned mode)
    f.submit.waits = &wait;
    f.submit.buffer_bind_count = 1;
    f.submit.buffer_binds = &info;
-   entered = binds = 0;
+   entered = expire = binds = 0;
    complete = mode == 3;
    wait_error = mode == 2;
    CHECK(vk_sync_wait(dev, &sync, 7, VK_SYNC_WAIT_PENDING, 0) == VK_SUCCESS);
@@ -160,13 +181,17 @@ run(unsigned mode)
    if (!no_wait)
       await(&entered);
    if (mode < 2) {
-      const struct timespec delay = {.tv_nsec = 20000000};
-      thrd_sleep(&delay, NULL);
+      /* The bind thread is inside the completion wait, and the wait cannot
+       * return until this thread lets it: nothing may be bound yet. */
       CHECK(!p_atomic_read(&binds));
-      if (mode == 0)
-         p_atomic_set(&complete, 1);
-      else
+      if (mode == 0) {
+         set(&complete);
+      } else {
+         /* Lose the device, then end the bounded wait in progress: the bind
+          * must notice the loss instead of waiting again. */
          p_atomic_set(&dev->_lost.lost, 1);
+         set(&expire);
+      }
    }
    CHECK(thrd_join(thread, NULL) == thrd_success);
    CHECK(f.result == (mode == 1   ? VK_ERROR_DEVICE_LOST
@@ -185,7 +210,11 @@ run(unsigned mode)
 int
 main(void)
 {
+   CHECK(mtx_init(&lock, mtx_plain) == thrd_success);
+   CHECK(cnd_init(&cond) == thrd_success);
    for (unsigned mode = 0; mode < 5; mode++)
       run(mode);
+   cnd_destroy(&cond);
+   mtx_destroy(&lock);
    return 0;
 }
