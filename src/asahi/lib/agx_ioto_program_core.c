@@ -14,46 +14,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* Exact fixed regions surrounding the runtime state tail in the SPDX-MIT
- * m1n1 NATIVE_ADD3_SHADER witness. */
-static const uint8_t g17p_direct_add3_pre_tail[] = {
-   0x2c, 0xa0, 0x02, 0x00, 0x12, 0x08, 0x7c, 0x00,
-   0x3c, 0x80, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00,
-   0x8c, 0xa0, 0x42, 0x00, 0x00, 0x00, 0x0c, 0x00,
-   0x9c, 0x80, 0x42, 0x00, 0x04, 0x00, 0x00, 0x00,
-   0x67, 0x00, 0x54, 0x2c, 0x02, 0x00, 0x00, 0x00,
-   0x59, 0x00, 0x02, 0x40, 0x26, 0x00, 0x67, 0x00,
-   0x54, 0x24, 0x02, 0x00, 0x00, 0x00, 0x57, 0x00,
-   0x00, 0x40, 0x26, 0x00, 0x67, 0x00, 0x54, 0x30,
-   0x18, 0x00, 0x00, 0x00, 0x59, 0x04, 0x00, 0x40,
-   0x26, 0x00,
-};
-
-static const uint8_t g17p_direct_add3_post_tail[] = {
-   0x1c, 0x80, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
-   0x14, 0x81, 0x11, 0x06, 0x00, 0x00, 0x00, 0x00,
-   0x0c, 0x80, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00,
-   0x9f, 0x11, 0x54, 0x00, 0x02, 0x00, 0x08, 0xa8,
-   0x10, 0x05, 0x1c, 0x80, 0x02, 0x00, 0x04, 0x00,
-   0x00, 0x00, 0x0f, 0x12, 0x54, 0x00, 0x4c, 0x00,
-   0x4b, 0x2c, 0x09, 0x44, 0x5b, 0x2e, 0x09, 0x04,
-   0x0b, 0x24, 0x09, 0x04, 0x1b, 0x26, 0x09, 0x04,
-   0x2b, 0x28, 0x09, 0x04, 0x3b, 0x2a, 0x09, 0x04,
-   0x6b, 0x30, 0x09, 0x04, 0x7b, 0x32, 0x09, 0x04,
-   0x03, 0x00, 0x07, 0x00, 0x02, 0x00, 0x00, 0x00,
-   0x60, 0x00, 0x0e, 0x00, 0x00, 0x00,
-};
-
-_Static_assert(sizeof(g17p_direct_add3_pre_tail) == 74,
-               "G17P direct-add3 pre-tail size");
-_Static_assert(sizeof(g17p_direct_add3_post_tail) == 94,
-               "G17P direct-add3 post-tail size");
-_Static_assert(sizeof(g17p_direct_add3_pre_tail) +
-                     AGX_IOTO_STATE_TAIL_TYPE0_SIZE +
-                     sizeof(g17p_direct_add3_post_tail) ==
-                  AGX_IOTO_G17P_DIRECT_ADD3_PROGRAM_SIZE,
-               "G17P direct-add3 program size");
-
 static const uint8_t
    g17p_default_profile_prefix[AGX_IOTO_G17P_DEFAULT_PROFILE_PREFIX_SIZE] = {
       0x1c, 0x80, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x81, 0x11, 0x06,
@@ -431,93 +391,12 @@ agx_ioto_straight_line_program_compose(
                                              capacity, written);
 }
 
-static bool
-agx_ioto_g17p_direct_add3_program_relocate(uint64_t program_va,
-                                           uint8_t *pre_tail)
-{
-   const uint64_t reference_va =
-      AGX_IOTO_G17P_DIRECT_ADD3_WITNESS_PROGRAM_VA;
-   const uint64_t reference_chunk = reference_va / UINT64_C(0x2000);
-   const uint64_t target_chunk = program_va / UINT64_C(0x2000);
-   const uint16_t reference_chunk_field =
-      (uint16_t)pre_tail[6] | ((uint16_t)pre_tail[7] << 8);
-   uint16_t relocated_chunk_field;
-
-   if (target_chunk >= reference_chunk) {
-      const uint64_t delta = target_chunk - reference_chunk;
-      if (delta > UINT16_MAX - reference_chunk_field)
-         return false;
-      relocated_chunk_field = (uint16_t)(reference_chunk_field + delta);
-   } else {
-      const uint64_t delta = reference_chunk - target_chunk;
-      if (delta > reference_chunk_field)
-         return false;
-      relocated_chunk_field = (uint16_t)(reference_chunk_field - delta);
-   }
-
-   const uint16_t reference_first =
-      (uint16_t)pre_tail[0] | ((uint16_t)pre_tail[1] << 8);
-   const int32_t offset_delta =
-      (int32_t)(program_va & UINT64_C(0x3ff)) -
-      (int32_t)(reference_va & UINT64_C(0x3ff));
-   const uint16_t relocated_first =
-      (uint16_t)(reference_first + offset_delta * INT32_C(64));
-
-   pre_tail[0] = (uint8_t)relocated_first;
-   pre_tail[1] = (uint8_t)(relocated_first >> 8);
-   pre_tail[6] = (uint8_t)relocated_chunk_field;
-   pre_tail[7] = (uint8_t)(relocated_chunk_field >> 8);
-   return true;
-}
-
 bool
-agx_ioto_g17p_direct_add3_program_compose(
-   uint64_t program_va, uint64_t shader_va, void *output, size_t capacity,
-   size_t *written)
-{
-   if (!output || !written || program_va == 0 || shader_va == 0 ||
-       program_va > UINT64_C(0xffffffffffff) ||
-       shader_va > UINT64_C(0xffffffffffff) ||
-       (program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
-       (shader_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
-       capacity < AGX_IOTO_G17P_DIRECT_ADD3_PROGRAM_SIZE)
-      return false;
-
-   uint8_t staged[AGX_IOTO_G17P_DIRECT_ADD3_PROGRAM_SIZE];
-   memcpy(staged, g17p_direct_add3_pre_tail,
-          sizeof(g17p_direct_add3_pre_tail));
-   if (!agx_ioto_g17p_direct_add3_program_relocate(program_va, staged))
-      return false;
-
-   struct agx_ioto_state_tail_output tail;
-   if (!agx_ioto_g17p_runtime_compute_tail_build(
-          shader_va, AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3, &tail) ||
-       tail.length != AGX_IOTO_STATE_TAIL_TYPE0_SIZE)
-      return false;
-
-   size_t offset = sizeof(g17p_direct_add3_pre_tail);
-   memcpy(staged + offset, tail.bytes, tail.length);
-   offset += tail.length;
-   memcpy(staged + offset, g17p_direct_add3_post_tail,
-          sizeof(g17p_direct_add3_post_tail));
-   offset += sizeof(g17p_direct_add3_post_tail);
-   if (offset != sizeof(staged))
-      return false;
-
-   memcpy(output, staged, sizeof(staged));
-   *written = sizeof(staged);
-   return true;
-}
-
-static bool
-g17p_no_resource_program_compose(
+agx_ioto_g17p_no_resource_program_compose_trusted(
    uint64_t program_va, const struct agx_ioto_state_tail_output *packed_tail,
-   void *output, size_t capacity, size_t *written, bool validate_tail)
+   void *output, size_t capacity, size_t *written)
 {
-   const bool tail_valid = validate_tail
-                              ? g17p_type0_tail_valid(packed_tail)
-                              : g17p_type0_tail_shape_valid(packed_tail);
-   if (!output || !written || !tail_valid ||
+   if (!output || !written || !g17p_type0_tail_shape_valid(packed_tail) ||
        program_va == 0 || program_va > UINT64_C(0xffffffffffff) ||
        (program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
        capacity < AGX_IOTO_G17P_NO_RESOURCE_PROGRAM_SIZE)
@@ -720,24 +599,6 @@ agx_ioto_g17g_resource_program_compose_classes(
    free(staged);
    *written = size;
    return true;
-}
-
-bool
-agx_ioto_g17p_no_resource_program_compose(
-   uint64_t program_va, const struct agx_ioto_state_tail_output *packed_tail,
-   void *output, size_t capacity, size_t *written)
-{
-   return g17p_no_resource_program_compose(
-      program_va, packed_tail, output, capacity, written, true);
-}
-
-bool
-agx_ioto_g17p_no_resource_program_compose_trusted(
-   uint64_t program_va, const struct agx_ioto_state_tail_output *packed_tail,
-   void *output, size_t capacity, size_t *written)
-{
-   return g17p_no_resource_program_compose(
-      program_va, packed_tail, output, capacity, written, false);
 }
 
 static bool

@@ -60,13 +60,6 @@ extern "C" {
  * resource-specifier binding. */
 #define AGX_IOTO_G17P_EOT_RESOURCE_SPEC            UINT64_C(0)
 #define AGX_IOTO_G17P_BG_RESOURCE_SPEC             UINT64_C(0x0007800000000040)
-#define AGX_IOTO_G17P_DIRECT_ADD3_PROGRAM_SIZE      196u
-#define AGX_IOTO_G17P_DIRECT_ADD3_WITNESS_SHADER_VA \
-   UINT64_C(0x100000003c0)
-
-#define AGX_IOTO_G17P_DIRECT_ADD3_WITNESS_PROGRAM_VA \
-   UINT64_C(0x100000a8000)
-
 #define AGX_IOTO_G17S_MINIMAL_COMPUTE_PROGRAM_SIZE 194u
 #define AGX_IOTO_G17S_MINIMAL_COMPUTE_WITNESS_ABSOLUTE_VA \
    UINT64_C(0x10000018020)
@@ -123,14 +116,6 @@ bool agx_ioto_straight_line_program_compose(
    const struct agx_ioto_state_tail *tail,
    const struct agx_ioto_profile_control *profile, void *output,
    size_t capacity, size_t *written);
-
-bool agx_ioto_g17p_direct_add3_program_compose(
-   uint64_t program_va, uint64_t shader_va, void *output, size_t capacity,
-   size_t *written);
-
-bool agx_ioto_g17p_no_resource_program_compose(
-   uint64_t program_va, const struct agx_ioto_state_tail_output *packed_tail,
-   void *output, size_t capacity, size_t *written);
 
 bool agx_ioto_g17p_no_resource_program_compose_trusted(
    uint64_t program_va, const struct agx_ioto_state_tail_output *packed_tail,
