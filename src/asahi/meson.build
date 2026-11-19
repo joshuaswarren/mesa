@@ -143,6 +143,26 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # Background/end-of-tile shader cache shared by command buffers recording
+  # on several threads.
+  test(
+    'hk-g17p-bg-eot-threads',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      hk_vulkan_bg_eot_threads,
+      '16', '20',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+    timeout : 120,
+  )
+
   # Explicit DRM plane layouts: placement, requirements, subresource layouts
   # and validation, without executing on the GPU.
   foreach chip : ['g13g', 'g17p']
