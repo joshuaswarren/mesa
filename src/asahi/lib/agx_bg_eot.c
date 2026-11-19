@@ -858,9 +858,9 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
    return agx_compile_bg_eot_shader(cache, b.shader, &compiler_key, NULL);
 }
 
-struct agx_bg_eot_shader *
-agx_get_bg_eot_shader(struct agx_bg_eot_cache *cache,
-                      struct agx_bg_eot_key *key)
+static struct agx_bg_eot_shader *
+agx_get_bg_eot_shader_locked(struct agx_bg_eot_cache *cache,
+                             struct agx_bg_eot_key *key)
 {
    struct hash_entry *ent = _mesa_hash_table_search(cache->ht, key);
    if (ent)
@@ -885,6 +885,21 @@ agx_get_bg_eot_shader(struct agx_bg_eot_cache *cache,
 
    ret->key = *key;
    _mesa_hash_table_insert(cache->ht, &ret->key, ret);
+   return ret;
+}
+
+/* Honeykrisp shares one cache between every command buffer of a device, and
+ * command buffers record on any thread: the lookup, the build (which
+ * allocates from cache->ht and uploads to cache->pool) and the insert all run
+ * under the lock that agx_get_precompiled() takes for the same pool.
+ */
+struct agx_bg_eot_shader *
+agx_get_bg_eot_shader(struct agx_bg_eot_cache *cache,
+                      struct agx_bg_eot_key *key)
+{
+   simple_mtx_lock(&cache->lock);
+   struct agx_bg_eot_shader *ret = agx_get_bg_eot_shader_locked(cache, key);
+   simple_mtx_unlock(&cache->lock);
    return ret;
 }
 
