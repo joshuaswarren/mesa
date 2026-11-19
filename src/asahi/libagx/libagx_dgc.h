@@ -8,6 +8,7 @@
 #include "compiler/libcl/libcl.h"
 #include "compiler/shader_enums.h"
 #include "lib/agx_chip.h"
+#include "lib/agx_vdm_barrier_core.h"
 #include "lib/agx_vdm_index_list_core.h"
 #include "agx_pack.h"
 
@@ -677,8 +678,8 @@ agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
    case AGX_CHIP_G18G:
-      /* G17G also invalidates the USC cache (agx_vdm_barrier_core.h). */
-      *out++ = chip == AGX_CHIP_G17G ? 0x21000968u : 0x21000960u;
+      /* Includes the USC cache invalidate (agx_vdm_barrier_core.h). */
+      *out++ = AGX_VDM_BARRIER_CORE_WORD;
       return out;
 
    case AGX_CHIP_G16P:
