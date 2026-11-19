@@ -43,12 +43,6 @@ agx_ioto_profile_control_pack(const struct agx_ioto_profile_control *profile,
 bool agx_ioto_g17s_minimal_profile_loader_pack(
    void *output, size_t capacity);
 
-/* Decode one record from a possibly longer stream and return its byte count. */
-bool agx_ioto_profile_control_unpack(enum agx_chip chip, const void *stream,
-                                     size_t available,
-                                     struct agx_ioto_profile_control *profile,
-                                     size_t *consumed);
-
 #ifdef __cplusplus
 }
 #endif
