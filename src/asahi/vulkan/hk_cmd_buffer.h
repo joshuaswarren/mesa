@@ -710,10 +710,6 @@ struct hk_g17p_launch {
 };
 
 struct hk_g17p_graphics_ioto_cache_entry {
-   uint16_t m5_range_count;
-   uint16_t m5_tile_size_px;
-   uint8_t m5_sample_size_B;
-   uint8_t m5_nr_samples;
    /* The loader of the last draw, the program published from it and the
     * range addresses written into it (hk_g17p_publish_gfx_loader()). */
    const struct hk_g17p_gfx_loader *loader;
