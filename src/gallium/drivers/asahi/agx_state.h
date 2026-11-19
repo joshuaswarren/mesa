@@ -46,7 +46,6 @@ enum agx_env_flag {
    AGX_ENV_NEO_DRAW_DIAGNOSTICS,
    AGX_ENV_NEO_UNIFORM_DIAGNOSTICS,
    AGX_ENV_NEO_BINARY_DIAGNOSTICS,
-   AGX_ENV_G18_RESOURCE_TRACE,
    AGX_ENV_NO_STAGED_BUFFER_WRITES,
    AGX_ENV_NO_M5_PROGRAM_CACHE,
    AGX_ENV_M5_VERIFY_PROGRAM_CACHE,
@@ -544,11 +543,10 @@ struct agx_cdm_dispatch {
    /* G18G: the command carries DRM_ASAHI_COMPUTE_USES_TEXTURE_STATE. */
    bool texture_state;
    struct drm_asahi_g18_compute_resources resources;
-   /* CPU metadata for tracing and resolving empty indirect work after its
-    * dependencies retire; never serialized into a GPU command. */
-   uint32_t trace_mode, trace_global[3], trace_local[3], trace_program;
-   uint64_t trace_indirect, trace_shader;
-   uint64_t trace_tess_params, trace_vertex_params, trace_geometry_params;
+   /* CPU metadata for resolving empty indirect work after its dependencies
+    * retire; never serialized into a GPU command. */
+   uint32_t trace_mode;
+   uint64_t trace_indirect;
 };
 
 struct agx_encoder {
