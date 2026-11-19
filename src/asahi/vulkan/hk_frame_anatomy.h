@@ -10,9 +10,23 @@
  * Enabled only by HK_FRAME_ANATOMY=<path> (or "-" for stderr). Every
  * HK_FRAME_ANATOMY_EVERY-th queue submit is sampled (default 200).
  * HK_FRAME_ANATOMY_TS selects which commands of a sampled submit get profiler
- * timestamps: "all" (default), "edges" (first and last hardware command only;
- * the M5 kernel turns every timestamped command into a host-prefix producer,
- * so this is the low-perturbation whole-submit measurement) or "none".
+ * timestamps: "all" (default), "edges" (first and last hardware command only)
+ * or "none".
+ *
+ * The profiler changes the timing it reports:
+ * - With "all", each cross-engine step of a sampled submit waits on the
+ *   host first (on the M5 the kernel turns every timestamped command into
+ *   a host-prefix producer). Gaps between render and compute work in "all"
+ *   output are largely made by the profiler. Seen on G17P (M4 Max: a
+ *   multi-pass test went from 0.53 to 3.41 ms per frame, with ~600 us
+ *   gaps between engines in a game that are not there without it) and on
+ *   the M5. Use "all" for per-command shape and relative cost inside one
+ *   engine; use "edges" (low perturbation, whole submit) or "none" for
+ *   timing.
+ * - A command's start stamp is taken before its barriers resolve, so a
+ *   per-command duration includes the wait on its dependencies.
+ * - Sampling costs time by itself: HK_FRAME_ANATOMY_EVERY=1 cost ~23 % fps
+ *   on G17P in a game even apart from "all". Keep sampling sparse.
  * When HK_FRAME_ANATOMY is unset, hk_device::frame_anatomy stays NULL and
  * every hook below reduces to one predictable NULL test; no control stream,
  * shader or kernel command is changed.

@@ -5947,8 +5947,7 @@ test_g17p_eot_block_store(void)
    /* Native mixed RGBA16F/R8 EOT at offsets0/8 and sample stride16.
     * Both physical partition quotients are zero; the partitions0/1 input
     * that produced the longer cross-partition program was an input error,
-    * not a second layout (README-g17p-wide-mrt.md). This independent native
-    * oracle is reproduced by test/probes/capture-g17p-mrt-eot.py;
+    * not a second layout. The independent native oracle has
     * SHA256 b3191cbbd673db5fb00d3e744f60ed59befad9bc19a2bf30aa9420effa63df12.
     * The driver reaches it the same way, naming each target's selector by
     * its logical format (agx_bg_eot.c), because a physical store format does

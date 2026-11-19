@@ -4740,9 +4740,19 @@ agx_lower_agx3_half_converts(agx_context *ctx)
             I->src[0].value != AGX_CONVERT_S8_TO_F)))
          continue;
 
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          I->src[0].value == AGX_CONVERT_S8_TO_F &&
-          I->round == AGX_ROUND_RTE && I->dest[0].size == AGX_SIZE_16 &&
+      /* M5 converts a signed byte to a half or a float natively (every
+       * byte value at every position of a half, both result widths, tested
+       * on G17C). G18 keeps the halfword fallback below. */
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !is_g18g &&
+          I->src[0].value == AGX_CONVERT_S8_TO_F && I->round == AGX_ROUND_RTE &&
+          (I->dest[0].size == AGX_SIZE_16 || I->dest[0].size == AGX_SIZE_32) &&
+          I->src[1].size == AGX_SIZE_16 && !I->src[1].abs && !I->src[1].neg &&
+          !I->src[1].memory)
+         continue;
+
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !is_g18g &&
+          I->src[0].value == AGX_CONVERT_U8_TO_F && I->round == AGX_ROUND_RTE &&
+          I->dest[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_16 &&
           !I->src[1].abs && !I->src[1].neg && !I->src[1].memory)
          continue;
 
@@ -6494,13 +6504,22 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          }
       }
 
-      /* A 32-bit FADD of a half and an immediate has no single AGX3C form.
-       * G17G converts first (f32add of the half and -0.0) and then adds in
-       * f32: saturate(float(h)) is f32add, f32add.sat (port/hfwit k_sat_h2f,
-       * k_h2f_mul). Widen the half the same exact way. */
+      /* A general 32-bit FADD of a half and an immediate has no single
+       * AGX3C form. G17G converts first (f32add of the half and -0.0) and
+       * then adds in f32: saturate(float(h)) is f32add, f32add.sat
+       * (port/hfwit k_sat_h2f, k_h2f_mul). Widen the half the same exact
+       * way. The exception is that conversion itself, an unsaturated
+       * f32add of the half and -0.0, which is native: widening it again
+       * would convert the same value twice (every float(half) operand of an
+       * FMA paid two). */
+      const bool half_to_float =
+         I->op == AGX_OPCODE_FADD && I->nr_srcs == 2 && !I->saturate &&
+         I->src[1].type == AGX_INDEX_IMMEDIATE &&
+         agx_is_equiv(I->src[1], agx_negzero()) && !I->src[1].abs &&
+         !I->src[1].neg && I->src[0].type != AGX_INDEX_IMMEDIATE;
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
           I->op == AGX_OPCODE_FADD && I->nr_dests == 1 && I->nr_srcs == 2 &&
-          I->dest[0].size == AGX_SIZE_32 &&
+          I->dest[0].size == AGX_SIZE_32 && !half_to_float &&
           (I->src[0].type == AGX_INDEX_IMMEDIATE ||
            I->src[1].type == AGX_INDEX_IMMEDIATE)) {
          for (unsigned s = 0; s < 2; ++s) {
@@ -8683,6 +8702,20 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
       if (src_sz == 64)
          UNREACHABLE("64-bit conversions unimplemented");
 
+      /* As for i2f below: the unsigned-byte float32 conversion reads only
+       * the low eight bits of its half (agx_nir_fold_ubyte_to_float). */
+      if (src_sz == 8 && sz == 32 &&
+          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !agx_is_g18g(&b->shader->key->dev)) {
+         nir_alu_instr *narrow = nir_src_as_alu(instr->src[0].src);
+         if (narrow &&
+             (narrow->op == nir_op_u2u8 || narrow->op == nir_op_i2i8) &&
+             nir_src_bit_size(narrow->src[0].src) == 16)
+            return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_U8_TO_F),
+                                  agx_alu_src_index(b, narrow->src[0]),
+                                  AGX_ROUND_RTE);
+      }
+
       enum agx_convert mode = (src_sz == 32)   ? AGX_CONVERT_U32_TO_F
                               : (src_sz == 16) ? AGX_CONVERT_U16_TO_F
                                                : AGX_CONVERT_U8_TO_F;
@@ -8694,6 +8727,21 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
    case nir_op_i2f32: {
       if (src_sz == 64)
          UNREACHABLE("64-bit conversions unimplemented");
+
+      /* The signed-byte conversion reads only the low eight bits of its half
+       * register, so the byte of a u2u8/i2i8 of a half needs no mask
+       * (agx_nir_fold_byte_to_float). */
+      if (src_sz == 8 &&
+          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !agx_is_g18g(&b->shader->key->dev)) {
+         nir_alu_instr *narrow = nir_src_as_alu(instr->src[0].src);
+         if (narrow &&
+             (narrow->op == nir_op_u2u8 || narrow->op == nir_op_i2i8) &&
+             nir_src_bit_size(narrow->src[0].src) == 16)
+            return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_S8_TO_F),
+                                  agx_alu_src_index(b, narrow->src[0]),
+                                  AGX_ROUND_RTE);
+      }
 
       enum agx_convert mode = (src_sz == 32)   ? AGX_CONVERT_S32_TO_F
                               : (src_sz == 16) ? AGX_CONVERT_S16_TO_F
@@ -10203,7 +10251,7 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
       .ballot_components = 4,
       .subgroup_size = 32,
    };
-   bool progress = false;
+   bool progress = agx_nir_flush_subgroup_minmax(nir);
    while (nir_lower_subgroups(nir, &options))
       progress = true;
    return progress;
@@ -10525,6 +10573,14 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * normal late multiply pass cannot recognize fused backend opcodes. */
    if (byte_indices)
       NIR_PASS(_, nir, agx_nir_lower_imul64, false);
+
+   /* Before the shift fusions below rewrite the byte extracts it matches. */
+   /* M5 only: G18 legalizes byte conversions through its halfword forms
+    * (agx_lower_agx3_half_converts). */
+   if (m5 && !g18_scans) {
+      NIR_PASS(_, nir, agx_nir_fold_byte_to_float);
+      NIR_PASS(_, nir, agx_nir_fold_ubyte_to_float);
+   }
 
    /* Fuse add/sub/multiplies/shifts after running opt_algebraic_late to fuse
     * isub but before shifts are lowered.
@@ -15828,8 +15884,10 @@ g17p_cse_shared_reads_in_phases(nir_shader *nir)
 
    nir_divergence_analysis(nir);
    nir_foreach_function_impl(impl, nir) {
-      if (impl->function->is_preamble)
+      if (impl->function->is_preamble) {
+         nir_no_progress(impl);
          continue;
+      }
 
       bool progress = false;
       nir_foreach_block(pre, impl) {

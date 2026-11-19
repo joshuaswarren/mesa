@@ -220,6 +220,20 @@ if with_tests
   )
 
   test(
+    'agx3_transcode',
+    executable(
+      'agx3_transcode_test',
+      files('test/test-agx3-transcode.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      include_directories : [inc_include, inc_src],
+      dependencies : [idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'agx3_falu_mod_core',
     executable(
       'agx3_falu_mod_core_test',
@@ -680,6 +694,9 @@ if with_tests
          'test/test-device-load-batches.cpp',
          'test/test-fuse-lea-constants.cpp',
          'test/test-divergence-load-agx.cpp',
+         'test/test-ftz-subgroup-minmax.cpp',
+         'test/test-m5-half-widen-once.cpp',
+         'test/test-m5-byte-to-float.cpp',
          'test/test-fold-narrowed-half.cpp',
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',

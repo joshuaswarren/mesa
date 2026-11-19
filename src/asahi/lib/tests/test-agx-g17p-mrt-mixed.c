@@ -403,8 +403,7 @@ decode_hex(const char *hex, uint8_t *out, unsigned capacity)
 }
 
 /* metal-nt -arch applegpu_g17p builtin end-of-tile BTNF: two, seven and eight
- * RGBA8 (internal format 2) targets in partition zero, texture type 4.
- * .tmp/cts-renderpasses-current-dd52/mixed/native/mseot_same_n{2,7,8}_t4. */
+ * RGBA8 (internal format 2) targets in partition zero, texture type 4. */
 static const struct {
    unsigned count;
    const char *hex;

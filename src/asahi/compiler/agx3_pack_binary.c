@@ -6665,7 +6665,10 @@ agx3_emit_alu(struct util_dynarray *emission, enum agx_isa_encoding enc,
     * modifier would be dropped. Before this check a 32-bit iadd_sat that
     * waited on a load composed as a plain iadd. */
    bool all_sources_registers = !S->saturate && !S->shift;
-   for (unsigned i = 0; i < S->nr_srcs; ++i)
+   /* NOT's second bitop source is an ignored immediate; the unary `inv` form
+    * reads only the first (llama.cpp q3_K mat-vec: in-place NOT, wait 0xc). */
+   const unsigned nr_read = op == AGX3_ALU_BNOT ? 1 : S->nr_srcs;
+   for (unsigned i = 0; i < nr_read; ++i)
       all_sources_registers &= S->src[i].is_reg &&
                                S->src[i].size == AGX3_SEL_SIZE_32 &&
                                !S->src[i].abs && !S->src[i].neg;
@@ -13420,6 +13423,25 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                      dest.channels_m1 = channels - 1;
                }
                nd = agx3_expand_regs(dest, e->dst, nd);
+            }
+            /* G17P TPS reloads (RLD: constant-program input imports and
+             * static spill reloads) into the two halves of one 32-bit
+             * register must not be in flight together: one half is lost.
+             * A CProg input word imported as two halves, high half first,
+             * lost its high half; waiting for the first reload, or importing
+             * the low half first, kept it. Claim the other half too, so the
+             * reload waits for a write to it in flight and later writers of
+             * it wait for the reload. */
+            if (enc == AGX_ISA_ENCODING_AGX3B && I->nr_dests == 1 &&
+                I->dest[0].size == AGX_SIZE_16 &&
+                agx_channels(I->dest[0]) == 1 &&
+                agx3_src_is_register(I->dest[0]) && !I->dest[0].memory &&
+                (I->op == AGX_OPCODE_LOAD_CPROG_AGX3 ||
+                 (I->op == AGX_OPCODE_STACK_LOAD &&
+                  !agx3_dynamic_stack_load(I)))) {
+               if (nd >= AGX3_SLOT_MAX_REGS)
+                  AGX3_PACK_FAIL();
+               e->dst[nd++] = I->dest[0].value ^ 1;
             }
          }
          for (unsigned s = 0; s < I->nr_srcs; ++s) {

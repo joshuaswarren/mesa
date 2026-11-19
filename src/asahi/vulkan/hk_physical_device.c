@@ -26,7 +26,6 @@
 #include "hk_image.h"
 #include "hk_instance.h"
 #include "hk_m5_acceleration_structure.h"
-#include "hk_memory_budget_core.h"
 #include "hk_agx3_vdm_decode.h"
 #include "hk_native_descriptor.h"
 #include "hk_nir_lower_mesh.h"
@@ -2235,7 +2234,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       agx_chip_g17_m5(pdev->dev.chip) || pdev->dev.chip == AGX_CHIP_G17P;
 
    supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
-      hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE &&
       (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2);
 
    /* Gen5 adds native component-wise minimum/maximum sampler reduction. */

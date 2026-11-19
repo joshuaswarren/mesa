@@ -377,6 +377,5 @@ hk_CmdSetRayTracingPipelineStackSizeKHR(VkCommandBuffer commandBuffer,
    /* Each kernel's stack is static scratch inside its compiled binary, sized
     * at pipeline creation for maxPipelineRayRecursionDepth.  A dynamic size
     * cannot shrink it and must not grow it, so this is deliberately a no-op
-    * rather than a partial implementation.  Documented in
-    * docs/G17P_RAYTRACING_PIPELINE_ABI.md. */
+    * rather than a partial implementation. */
 }

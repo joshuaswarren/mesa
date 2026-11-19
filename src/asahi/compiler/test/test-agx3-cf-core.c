@@ -183,8 +183,7 @@ test_half_zero_lifetime(void)
 }
 
 /*
- * Apple's own bytes for a 16-bit compare against a non-zero constant, from
- * .tmp/g17p-hyprland-cf-evidence/icmp16imm.metal via
+ * Apple's own bytes for a 16-bit compare against a non-zero constant, via
  * `metal-nt -arch applegpu_g17p`. Every kernel differs from the zero control
  * in one place only -- the constant -- and the recovered field is the same
  * f16 the 32-bit source form already uses.
@@ -254,10 +253,9 @@ test_half_immediate_compare(void)
          failures++;
    }
 
-   /* Fresh witnesses from
-    * .tmp/cts-pipeline/witness/cf-uimm16-20260914/uimm16.metal. The dead and
-    * live `ushort x < 4` kernels produce the same compact compare, while the
-    * immediate and relation fields vary independently. */
+   /* Fresh witnesses. The dead and live `ushort x < 4` kernels produce the
+    * same compact compare, while the immediate and relation fields vary
+    * independently. */
    {
       uint8_t bytes[AGX3_CF_MAX_LENGTH], length = 0;
       const struct agx3_cf_source_hints hints[] = {
@@ -596,8 +594,7 @@ test_float_minifloat_compare(void)
  * Every row below is Apple's byte-exact `metal-nt -arch applegpu_g17p` output
  * for MSL that breaks out of a `for` loop from inside N nested ifs, each
  * condition reading a distinct element of a `device const uint *` so nothing
- * can be folded, and each level storing before the next opens
- * (.tmp/g17p-deep-break-evidence/deepbreak.metal, probe2.metal).
+ * can be folded, and each level storing before the next opens.
  */
 static void
 test_deep_break_levels(void)

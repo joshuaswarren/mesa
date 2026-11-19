@@ -2212,10 +2212,10 @@ agx_nir_lower_texture_with_buffer_metadata(nir_shader *s, unsigned generation,
 bool
 agx_nir_lower_texture_with_buffer_metadata_cb(
    nir_shader *s, unsigned generation,
-   agx_buffer_texture_metadata_cb buffer_metadata)
+   agx_buffer_texture_metadata_cb buffer_metadata, bool robust_texel_fetch)
 {
-   return lower_texture(s, generation, true, false, true, 0, false,
-                        buffer_metadata);
+   return lower_texture(s, generation, true, false, robust_texel_fetch, 0,
+                        false, buffer_metadata);
 }
 
 bool

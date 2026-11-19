@@ -266,20 +266,6 @@ int32_t agx3_form_index(const agx3_table *t, const char *mnemonic, uint8_t ep)
    return -1;
 }
 
-int32_t agx3_compose_mnemonic(const agx3_table *t, const char *mnemonic,
-                              const uint64_t fields[AGX3_MAX_FIELDS],
-                              uint8_t *out, uint8_t *size)
-{
-   for (uint32_t i = 0; i < t->num_forms; i++) {
-      if (strcmp(t->forms[i].mnemonic, mnemonic)) continue;
-      if (agx3_compose(t, i, fields, out)) {
-         *size = t->forms[i].size;
-         return (int32_t)i;
-      }
-   }
-   return -1;
-}
-
 /*
  * Apple's encoder tries a mnemonic's encoding points by ascending size, the
  * ep number breaking ties, and keeps the first that encodes the field vector

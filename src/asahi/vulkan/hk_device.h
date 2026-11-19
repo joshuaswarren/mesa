@@ -216,7 +216,6 @@ struct hk_device {
    struct agx_bo *gen1_rq_state;
    struct agx_va *gen1_rq_code_alias;
    struct agx_bo *gen1_vertex_directory;
-   struct agx_va *gen1_vertex_directory_va;
    struct hash_table *gen1_vertex_tables;
    uint64_t *gen1_rq_maps;
    unsigned gen1_rq_bound_maps;
@@ -416,13 +415,14 @@ enum hk_perftest {
  * or that reach it only while they run.
  *
  * On G17P the state is read when a barrier is recorded: live sparse and
- * capture/replay resources. A resource the command buffer references exists
- * by then, and it counts from creation, so later sparse binds are covered.
- * Not covered on G17P: a resource created after the command buffer was
- * recorded and reached through a path recording did not see, that is a
- * device address the command buffer reads indirectly, or a descriptor set
- * bound at recording and updated after it (descriptorBinding*UpdateAfterBind),
- * and memory imports.
+ * capture/replay resources, and live fd imports and host imports the GPU may
+ * write (another import can map the same pages at a second address). A
+ * resource the command buffer references exists by then, and it counts from
+ * creation, so later sparse binds are covered. Not covered on G17P: a
+ * resource or import created after the command buffer was recorded and
+ * reached through a path recording did not see, that is a device address the
+ * command buffer reads indirectly, or a descriptor set bound at recording and
+ * updated after it (descriptorBinding*UpdateAfterBind).
  *
  * The flush goes into the open compute stream, and only when that stream
  * already holds work (hk_cdm_visibility_flush_needed()). It writes back every
