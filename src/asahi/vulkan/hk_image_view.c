@@ -440,8 +440,21 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
 
    }
 
-   return hk_pack_native_texture(
-      agx_chip_descriptor_generation(dev->dev.chip), out, &cfg);
+   if (!hk_pack_native_texture(agx_chip_descriptor_generation(dev->dev.chip), out, &cfg))
+      return false;
+
+   /* Only sampled and storage descriptors answer an application's size
+    * query. Input attachments are fetched as arrays, and the attachment,
+    * eMRT and background descriptors are read by driver code that does not
+    * take the level-zero lowering (AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT). */
+   if (agx_chip_texture_descriptor_spare_word(dev->dev.chip) &&
+       (sampled_like || usage == HK_DESC_USAGE_STORAGE)) {
+      hk_native_texture_set_level_zero_extent(
+         out, u_minify(cfg.width, cfg.first_level),
+         u_minify(cfg.height, cfg.first_level));
+   }
+
+   return true;
 }
 
 static bool

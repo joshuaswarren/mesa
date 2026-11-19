@@ -3460,7 +3460,11 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       /* hk_nir_lower_robust_image_access() leaves formatless loads to this
        * pass. */
       NIR_PASS(_, nir, agx_nir_lower_texture_with_buffer_metadata,
-               agx_chip_descriptor_generation(dev->dev.chip),
+               agx_chip_descriptor_generation(dev->dev.chip) |
+                  (agx_chip_texture_descriptor_spare_word(dev->dev.chip) &&
+                         !nir->info.internal
+                      ? AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT
+                      : 0),
                lower_agx3_robust_fetches, dev->dev.sparse_ro_offset,
                dev->vk.enabled_features.sparseResidencyBuffer);
    } else {

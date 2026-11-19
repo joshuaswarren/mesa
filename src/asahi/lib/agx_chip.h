@@ -582,6 +582,29 @@ agx_chip_usc_base_page_fill_returns_for(enum agx_chip chip,
           (agx_chip_native_agx3(chip) && num_clusters > 2);
 }
 
+/*
+ * Whether the texture descriptor's last word (bytes 28-31) is ignored by the
+ * texture unit and so free for the driver: Honeykrisp keeps a 2D view's
+ * level-zero extent there (AGX_GEN10_IMAGE_EXTENT_OFFSET), so a constant
+ * level-zero textureSize() is one load.
+ *
+ * True for the M5 Gen10 descriptor (G17G, G17S, G17C): the genxml layout has
+ * no field there, Gallium's G17G buffer textures keep their element count in
+ * it (AGX_GEN10_BUFFER_TEXTURE_SIZE_OFFSET), and G17C views carry the extent.
+ * AGX2 descriptors are 24 bytes and have no such word. Nothing shows that
+ * the Gen9 texture unit (G15, G16, G17P) or G18G's ignores it: no producer
+ * writes a nonzero value there on either (G17P keeps its buffer metadata in
+ * a separate record past the descriptor, and Gallium's Gen10 word is written
+ * on M5 only), so they stay off until that is measured.
+ */
+static inline bool
+agx_chip_texture_descriptor_spare_word(enum agx_chip chip)
+{
+   return agx_chip_descriptor_generation(chip) ==
+             AGX_DESCRIPTOR_GENERATION_10 &&
+          chip != AGX_CHIP_G18G;
+}
+
 /* Robust image accesses on native chips need explicit Vulkan view bounds:
  * native 2D accesses outside the view alias other texels of the image. G17P
  * lowers them together with its own hardware defects; G15 and G16 parts

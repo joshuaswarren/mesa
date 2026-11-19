@@ -8,6 +8,7 @@
 #include "asahi/lib/agx_abi.h"
 #include "asahi/lib/agx_pbe_agx3_core.h"
 #include "util/macros.h"
+#include <assert.h>
 #include "util/u_atomic.h"
 
 #include <string.h>
@@ -215,6 +216,15 @@ hk_pack_native_texture(unsigned generation,
    }
 
    return false;
+}
+
+void
+hk_native_texture_set_level_zero_extent(
+   struct hk_native_texture_descriptor *out, uint32_t width, uint32_t height)
+{
+   /* Width and height are each at most 32768 (hk_pack_native_texture). */
+   assert(width <= 0xffff && height <= 0xffff);
+   out->opaque[AGX_GEN10_IMAGE_EXTENT_OFFSET / 4] = width | (height << 16);
 }
 
 bool
