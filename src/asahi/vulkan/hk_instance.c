@@ -118,11 +118,6 @@ hk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    if (result != VK_SUCCESS)
       goto fail_alloc;
 
-   /* Keep existing error provenance visible for opt-in device-init diagnosis
-    * without requiring validation layers or changing initialization policy. */
-   if (debug_get_bool_option("ASAHI_M5_DEVICE_INIT_DIAG", false))
-      instance->vk.enable_debug_logging = true;
-
    hk_init_dri_options(instance);
 
    instance->vk.physical_devices.try_create_for_drm =
