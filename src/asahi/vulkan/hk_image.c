@@ -1359,8 +1359,8 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
          debug_get_option_m5_depth_msaa_compression(),
          debug_get_option_m5_depth_msaa_transfer()) ||
       m5_storage ||
-      (hk_hal200_compression_eligible(dev->chip, plane, info,
-                                      agx_is_m4_pro(dev)) &&
+      (hk_hal200_compression_eligible(dev->chip, dev->params.chip_id, plane,
+                                      info, agx_is_m4_pro(dev)) &&
        !hk_g17p_multiview_spill_risk(info, multiview)) ||
       hk_g17p_shared_compression_eligible(dev->chip, plane, info) ||
       hk_m5_color_compression_eligible(dev->chip, plane, info) ||
