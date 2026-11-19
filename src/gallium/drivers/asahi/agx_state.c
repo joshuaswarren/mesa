@@ -15564,9 +15564,10 @@ agx_draw_patches_split(struct agx_context *ctx,
  * its index list record: agx_encode_state() would emit nothing for it anyway.
  * Anything that varies per sub-draw (draw ID or base parameters in uniforms,
  * statistics, geometry or tessellation stages, transform feedback, misaligned
- * indices) keeps the full path. AGX_FAST_MULTIDRAW=0 disables this.
+ * indices) keeps the full path. The record written is the HAL200 draw body
+ * of agx_g17p_emit_draw_body(), which is what every agx_native_graphics()
+ * chip encodes; other chips keep util_draw_multi().
  */
-DEBUG_GET_ONCE_BOOL_OPTION(fast_multidraw, "AGX_FAST_MULTIDRAW", true)
 
 static void agx_draw_vbo(struct pipe_context *pctx,
                          const struct pipe_draw_info *info,
@@ -15681,8 +15682,7 @@ agx_draw_multi(struct pipe_context *pctx, const struct pipe_draw_info *info,
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(pctx->screen);
 
-   if (indirect || !agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip) ||
-       dev->chip == AGX_CHIP_G18G || !debug_get_option_fast_multidraw()) {
+   if (indirect || !agx_native_graphics(dev)) {
       util_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
       return;
    }
