@@ -15665,8 +15665,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
     * The small budget is for the output of a tessellation stage, where the
     * timeouts were seen, on the GPU or on the CPU (agx_swtnl.c). A render of
     * plain draws takes AGX_G17G_RENDER_PRIMS_PLAIN: every render started for
-    * the budget loads and stores the whole framebuffer again.
-    * ASAHI_M5_RENDER_PRIMS sets another budget for those, for comparison. */
+    * the budget loads and stores the whole framebuffer again. */
    const bool g17g_budget =
       agx_chip_g17_m5(agx_device(pctx->screen)->chip) && !indirect;
    const bool g17g_small = info->mode == MESA_PRIM_PATCHES || ctx->swtnl_inner;
@@ -15683,8 +15682,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
        ctx->batch->g17g_prims + prims >
           (g17g_small || ctx->batch->g17g_small_budget
               ? AGX_G17G_RENDER_PRIMS
-              : debug_get_num_option("ASAHI_M5_RENDER_PRIMS",
-                                     AGX_G17G_RENDER_PRIMS_PLAIN)))
+              : AGX_G17G_RENDER_PRIMS_PLAIN))
       agx_flush_batch_for_reason(ctx, ctx->batch, "G17G primitive budget");
 
    struct agx_batch *batch = agx_get_batch(ctx);

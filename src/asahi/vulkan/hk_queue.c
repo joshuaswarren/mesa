@@ -1470,11 +1470,38 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
    return vk_common_QueueBindSparse(_queue, bindInfoCount, pBindInfo, fence);
 }
 
+/* Sibling kernel queues (hk_queue::sib) on G17P. Measured on J616s (M4 Pro,
+ * T6040) with gpubench in f22f0908629; A18 Pro was not measured and keeps
+ * one kernel queue.
+ *
+ * Kernel queues per VkQueue on the M4 Pro, the primary included: macOS
+ * spreads one Metal queue over up to three firmware compute queues of one
+ * context and runs two kicks at once (d33c6d37328). With the two gates
+ * below, three cut ALU depth 4/16 from 285.7/283.5 to 275.0/274.7 us per
+ * submission and left depth 1-2, light compute and multi-process rows
+ * unchanged. */
+#define HK_G17P_SIBLING_QUEUES_M4_PRO 3
+static_assert(HK_G17P_SIBLING_QUEUES_M4_PRO <= HK_QUEUE_SIBLINGS_MAX,
+              "sibling kernel queue IDs do not fit hk_queue::sib.id");
+
+/* Earlier submissions still in flight before a sibling takes one
+ * (hk_sibling_deep). At depth 2 both kicks run at half speed and finish
+ * together, so the GPU idles for the completion-to-resubmit round trip:
+ * ALU depth 2 went from 286 to 340 us with siblings and no such gate. */
+#define HK_G17P_SIBLING_MIN_IN_FLIGHT 2
+
+/* Fewest application dispatch threads a stream needs to go to a sibling
+ * (hk_sibling_eligible). A 32-thread stream at depth 4 ran 13% slower on
+ * siblings, the 2.1 GFLOP ALU stream faster; 65536 lies between them but
+ * was not swept, so the crossover is not known more closely. */
+#define HK_G17P_SIBLING_MIN_THREADS 65536
+
 /* A submission a sibling kernel queue may run (hk_queue::sib): its streams
- * dispatch at least sib.min_threads threads each (or only internal work), it
- * depends on no earlier submission (every stream's prior is zero or names a
- * command of this submission, see resolve_one) and holds only plain compute
- * streams, without query access, timestamps, scratch or ray queries.
+ * dispatch at least HK_G17P_SIBLING_MIN_THREADS threads each (or only
+ * internal work), it depends on no earlier submission (every stream's prior
+ * is zero or names a command of this submission, see resolve_one) and holds
+ * only plain compute streams, without query access, timestamps, scratch or
+ * ray queries.
  * Anything that needs the primary kernel queue's own state stays there. */
 static bool
 hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
@@ -1497,7 +1524,7 @@ hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
          /* Overlapping kicks of a few threads costs more in ordering than it
           * gains (a 32-thread dispatch stream at depth 4 ran 13% slower). */
          if (cs->sib_threads && !cs->sib_indirect &&
-             cs->sib_threads < queue->sib.min_threads)
+             cs->sib_threads < HK_G17P_SIBLING_MIN_THREADS)
             return false;
          if (cs->type != HK_CS_CDM || cs->query_access ||
              cs->timestamp.start.handle || cs->timestamp.end.handle ||
@@ -1518,9 +1545,9 @@ hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
 }
 
 /* Whether a sibling kernel queue may take the next eligible submission: at
- * least sib.min_in_flight earlier submissions of this queue are still in
- * flight (submitted_point is the queue timeline's last point before this
- * submission). Two kicks run at once on sibling queues, so each takes about
+ * least HK_G17P_SIBLING_MIN_IN_FLIGHT earlier submissions of this queue are
+ * still in flight (submitted_point is the queue timeline's last point before
+ * this submission). Two kicks run at once on sibling queues, so each takes about
  * twice as long; with only one other submission in flight both then finish
  * together and the GPU idles for the whole completion-to-resubmit round trip
  * (a depth-2 compute stream ran 19% slower with siblings on the M4 Pro).
@@ -1532,11 +1559,9 @@ hk_sibling_deep(struct hk_device *dev, struct hk_queue *queue,
 {
    uint64_t done = 0;
 
-   if (!queue->sib.min_in_flight)
-      return true;
    if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1))
       return false;
-   return submitted_point >= done + queue->sib.min_in_flight;
+   return submitted_point >= done + HK_G17P_SIBLING_MIN_IN_FLIGHT;
 }
 
 /* A stream's prior in the ordinals of the kernel queue it is sent to: a
@@ -2520,14 +2545,8 @@ hk_queue_create(struct hk_device *dev,
        (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)) {
       /* The M4 Pro runs two compute kicks of one context at once. */
-      queue->sib.count = CLAMP(
-         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES",
-                              agx_is_m4_pro(&dev->dev) ? 3 : 1),
-         1, HK_QUEUE_SIBLINGS_MAX);
-      queue->sib.min_in_flight =
-         debug_get_num_option("ASAHI_G17P_SIBLING_MIN_IN_FLIGHT", 2);
-      queue->sib.min_threads =
-         debug_get_num_option("ASAHI_G17P_SIBLING_MIN_THREADS", 65536);
+      queue->sib.count =
+         agx_is_m4_pro(&dev->dev) ? HK_G17P_SIBLING_QUEUES_M4_PRO : 1;
    }
    queue->drm.render_rq = 0;
    queue->drm.virt_ring_idx = drm_priority + 1;

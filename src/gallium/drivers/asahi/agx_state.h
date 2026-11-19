@@ -564,10 +564,13 @@ struct agx_encoder {
  * two 64K-primitive draws); 64K passed. Keep a margin below that. */
 #define AGX_G17G_RENDER_PRIMS (32 * 1024)
 
-/* Primitives per G17G render of draws without a tessellation stage. 512K
- * small depth-tested triangles in one render draw the image the split
- * renders draw, at 1024x1024 and at 3456x2160, on an M5 Pro; more has not
- * been tried. */
+/* Primitives per G17G render of draws without a tessellation stage.
+ * Measured on an M5 Pro (G17S) in 6cdff78a1ac: depth-tested small triangles
+ * in draws of 16000 give the image of the 32K-split renders at 64K, 128K,
+ * 256K and 512K at 1024x1024 (arrays and indexed) and at 128K and 512K at
+ * 3456x2160 (indexed); 128K at 3456x2160 takes 2.1 ms per frame in one
+ * render and 4.1 ms split. 512K is the largest tried, not a measured
+ * limit. */
 #define AGX_G17G_RENDER_PRIMS_PLAIN (512 * 1024)
 
 struct agx_batch {
