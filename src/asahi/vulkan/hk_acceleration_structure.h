@@ -15,7 +15,7 @@ struct hk_device;
 struct hk_cmd_buffer;
 struct agx_scs_layout_gen2;
 struct vk_buffer;
-void hk_gen1_publish_buffer_as_addresses(struct hk_device *dev,
+bool hk_gen1_publish_buffer_as_addresses(struct hk_device *dev,
                                          const struct vk_buffer *buffer);
 uint64_t hk_gen1_upload_as_table(struct hk_cmd_buffer *cmd);
 uint64_t hk_gen1_as_metadata_addr(struct hk_cmd_buffer *cmd,

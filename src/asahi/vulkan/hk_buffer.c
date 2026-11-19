@@ -531,14 +531,23 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
       }
 
       VK_FROM_HANDLE(hk_device, dev, device);
+      const VkBindMemoryStatusKHR *status =
+         vk_find_struct_const(pBindInfos[i].pNext, BIND_MEMORY_STATUS_KHR);
       if (dev->g17p_native_as &&
-          (buffer->vk.usage & VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR))
-         hk_gen1_publish_buffer_as_addresses(dev, &buffer->vk);
+          (buffer->vk.usage & VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) &&
+          !hk_gen1_publish_buffer_as_addresses(dev, &buffer->vk)) {
+         /* No address space below an acceleration structure in this buffer
+          * for its traversal base. */
+         const VkResult result = vk_errorf(
+            dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+            "no traversal base for an acceleration structure in this buffer");
+         if (status != NULL && status->pResult != NULL)
+            *status->pResult = result;
+         return result;
+      }
       if (dev->m5_native_as)
          hk_m5_as_buffer_bound(dev, &buffer->vk);
 
-      const VkBindMemoryStatusKHR *status =
-         vk_find_struct_const(pBindInfos[i].pNext, BIND_MEMORY_STATUS_KHR);
       if (status != NULL && status->pResult != NULL)
          *status->pResult = VK_SUCCESS;
    }
