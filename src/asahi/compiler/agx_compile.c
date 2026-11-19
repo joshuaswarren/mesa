@@ -10251,7 +10251,7 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
       .ballot_components = 4,
       .subgroup_size = 32,
    };
-   bool progress = false;
+   bool progress = agx_nir_flush_subgroup_minmax(nir);
    while (nir_lower_subgroups(nir, &options))
       progress = true;
    return progress;
