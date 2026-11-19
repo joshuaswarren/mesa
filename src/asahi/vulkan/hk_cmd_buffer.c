@@ -659,32 +659,6 @@ hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
    return current;
 }
 
-int hk_g17p_launch_trace_state = -1;
-
-int
-hk_g17p_launch_trace_init(void)
-{
-   const int enabled = debug_get_bool_option("HK_G17P_LAUNCH_TRACE", false) ? 1 : 0;
-   hk_g17p_launch_trace_state = enabled;
-   return enabled;
-}
-
-void
-hk_g17p_trace_hexdump(const char *label, uint64_t base, const void *data,
-                      size_t len)
-{
-   const uint8_t *bytes = data;
-   fprintf(stderr, "G17P dump: %s base=%" PRIx64 " len=%zu\n", label, base,
-           len);
-   for (size_t off = 0; off < len; off += 16) {
-      fprintf(stderr, "G17P dump:   +%04zx ", off);
-      for (size_t i = 0; i < 16 && off + i < len; ++i)
-         fprintf(stderr, "%02x ", bytes[off + i]);
-      fprintf(stderr, "\n");
-   }
-   fflush(stderr);
-}
-
 void *
 hk_cmd_buffer_emit_cdm_terminate(struct hk_cmd_buffer *cmd, void *current)
 {
@@ -1719,13 +1693,6 @@ hk_CmdPushDescriptorSetWithTemplate2KHR(
       push_set, set_layout, template,
       pPushDescriptorSetWithTemplateInfo->pData);
 }
-
-DEBUG_GET_ONCE_BOOL_OPTION(m5_fragment_root_memo, "ASAHI_M5_FRAGMENT_ROOT_MEMO",
-                           true)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_fragment_root_shadow,
-                           "ASAHI_M5_FRAGMENT_ROOT_SHADOW", true)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_fragment_root_shadow,
-                           "ASAHI_M5_VERIFY_FRAGMENT_ROOT_SHADOW", false)
 
 static uint64_t
 hk_upload_native_spilled_rt_descs(struct hk_cmd_buffer *cmd)
@@ -3424,8 +3391,9 @@ refused:
    return 0;
 }
 
-/* Read the uncached mappings only for this opt-in validation oracle. Keep
- * its temporary snapshot and checks out of the normal recording path. */
+/* Read the uncached mappings only for this validation oracle
+ * (ASAHI_MESA_DEBUG=verify). Keep its temporary snapshot and checks out of
+ * the normal recording path. */
 __attribute__((cold, noinline)) static void
 hk_m5_verify_fragment_root_shadow(const struct hk_graphics_state *gfx)
 {
@@ -3458,15 +3426,13 @@ hk_m5_verify_fragment_root_shadow(const struct hk_graphics_state *gfx)
 static uint64_t
 hk_m5_fragment_root(struct hk_cmd_buffer *cmd, const struct hk_shader *s)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   const bool shadow = debug_get_option_m5_fragment_root_shadow();
 
-   if (unlikely(shadow && debug_get_option_m5_verify_fragment_root_shadow()))
+   if (unlikely(dev->dev.debug & AGX_DBG_VERIFY))
       hk_m5_verify_fragment_root_shadow(gfx);
 
-   return hk_m5_fragment_root_select(gfx, s->info.agx3_root_reads,
-                                     debug_get_option_m5_fragment_root_memo(),
-                                     shadow);
+   return hk_m5_fragment_root_select(gfx, s->info.agx3_root_reads, true, true);
 }
 
 static uint64_t

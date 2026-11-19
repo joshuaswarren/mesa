@@ -68,11 +68,6 @@ static const uint8_t hk_g18g_write_state1[32] = AGX_G18G_WRITE_STATE1_INIT;
 static_assert(HK_G18_BATCH_LAUNCHES <= 1400,
               "G18G CDM stream exceeds the kernel's stream size limit");
 
-/* Diagnostic controls, read once: these are consulted per dispatch, and an
- * uncached getenv() scans the whole environment. */
-DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_compute_loader,
-                           "AGX_M5_VERIFY_COMPUTE_LOADER", false)
 /* EXP-G1b's native access::write argument is a PBE pointer followed by a
  * pointer to this control descriptor, including when it follows a sampled
  * texture in the argument table. It is not the read_write clamp scalar. */
@@ -1789,7 +1784,6 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                       struct hk_shader *s, struct agx_grid grid,
                       struct agx_workgroup local_size)
 {
-   const char *reason = "shader profile";
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_linked_shader *linked = s ? s->only_linked : NULL;
    if (s && !linked && s->info.stage == MESA_SHADER_VERTEX)
@@ -1811,7 +1805,6 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
 
    if (s->b.info.uses_matrix16) {
-      reason = "matrix kernel feature";
       if (!(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX))
          goto refused;
       cs->m5_matrix_ops = true;
@@ -1838,14 +1831,12 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const bool collected = internal
       ? hk_g17p_internal_graphics_uniform_ranges(cmd, s, linked, root, texture_pointers, ranges, &count)
       : hk_g17p_compute_uniform_ranges(dev->dev.chip, cmd, s, root, texture_pointers, ranges, &count);
-   reason = "uniform ranges";
    if (!collected)
       goto refused;
    if (!internal && s->b.info.agx3_uniform_dma_count &&
        !hk_m5_compute_uniform_dma_ranges(cmd, s, root, ranges,
                                          ARRAY_SIZE(ranges), &count))
       goto refused;
-   reason = "program bound";
    size_t capacity;
    if (!agx3_g17g_graphics_program_bound(dev->dev.chip, ranges, count, &capacity))
       goto refused;
@@ -1871,7 +1862,6 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          ? MAX2(256u, ALIGN_POT(s->b.info.local_size, 64u)) : 0,
    };
    if (s->b.info.has_preamble) {
-      reason = "native constant-program extent";
       if (internal || !s->bo || !s->bo->va ||
           !hk_agx3_g17p_constant_program_from_binary(
              s->code_ptr, s->code_size, s->b.info.preamble_offset,
@@ -1891,17 +1881,16 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .program_va = reservation.va, .shader_va = shader_va,
    };
    struct agx3_compute_program launch;
-   reason = "program generation";
    if (loader) {
       program.length = loader->length;
       memcpy(program.bytes, loader->bytes, loader->length);
       hk_g17p_patch_plan_apply(&loader->plan, ranges, program.bytes);
-      if (debug_get_option_m5_verify_compute_loader()) {
+      if (dev->dev.debug & AGX_DBG_VERIFY) {
          struct agx3_g17p_graphics_program fresh;
          if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &fresh) ||
              fresh.length != program.length ||
              memcmp(fresh.bytes, program.bytes, program.length)) {
-            reason = "cached program byte mismatch";
+            mesa_loge("M5 cached compute launch differs from fresh composition");
             goto refused;
          }
       }
@@ -1947,7 +1936,6 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .dimensions = grid.count[2] != 1 || local_size.z != 1 ? 3
                   : grid.count[1] != 1 || local_size.y != 1 ? 2 : 1,
    };
-   reason = "dispatch record";
    const uint32_t local[3] = {local_size.x, local_size.y, local_size.z};
    if (cmd->m5_rt_capture) {
       /* Single-kick vkCmdTraceRays* (hk_cmd_trace_rays.c): produce this
@@ -2012,27 +2000,6 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->stats.cmds++;
    return;
 refused:
-   if (debug_get_option_m5_launch_debug()) {
-      fprintf(stderr, "M5 compute refused: %s stage=%u scratch=%u/%u "
-              "gprs=%u staging=%u:%u local=%u preamble=%u "
-              "textures=%u samplers=%u heap=%u txf=%u sets=%u "
-              "resource_flags=%u%u%u%u%u indirect=%u\n",
-              reason, s ? s->info.stage : 0,
-              s ? s->b.info.scratch_size : 0, linked ? linked->b.scratch_size : 0,
-              linked ? linked->b.nr_gprs : 0,
-              s ? s->b.info.agx3_staging_known : 0,
-              s ? s->b.info.agx3_staging_halfs : 0,
-              s ? s->b.info.local_size : 0, s ? s->b.info.has_preamble : 0,
-              s ? s->b.info.texture_state_count : 0,
-              s ? s->b.info.sampler_state_count : 0,
-              s ? s->b.info.uses_sampler_heap : 0,
-              linked ? linked->b.uses_txf : 0, s ? s->info.set_count : 0,
-              s ? s->info.agx3_txf_texture_valid : 0,
-              s ? s->info.agx3_storage_image_valid : 0,
-              s ? s->info.agx3_sampled_storage_valid : 0,
-              s ? s->info.agx3_indexed_storage_valid : 0,
-              s ? s->info.agx3_indexed_sampler_valid : 0, agx_is_indirect(grid));
-   }
    mesa_loge_once("M5 compute launch exceeds the current resource profile");
    vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
 }
@@ -2765,13 +2732,6 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   if (hk_g17p_launch_trace_enabled()) {
-      for (size_t i = 0; i < range_count; ++i)
-         fprintf(stderr, "M5_COMPUTE_UNIFORMS program=%" PRIx64
-                 " start=%u count=%u address=%" PRIx64 "\n",
-                program_t.gpu, ranges[i].start_halfs,
-                 ranges[i].size_halfs, ranges[i].address);
-   }
 
    const uint32_t threadgroup_bytes =
       s->b.info.local_size
@@ -2916,17 +2876,6 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          sink.length += sizeof(terminate);
          cs->g18_dispatch_sealed = true;
       }
-   }
-   if (hk_g17p_launch_trace_enabled()) {
-      fprintf(stderr, "%s native compute recorded: program=%" PRIx64
-              " bytes=%u shader=%" PRIx64 " size=%u ranges=%zu grid=%ux%ux%u local=%ux%ux%u\n",
-              agx_chip_name(dev->dev.chip), program_t.gpu,
-              program.length, shader_va, (unsigned)linked->b.size,
-              range_count, grid.count[0], grid.count[1], grid.count[2],
-              local_size.x, local_size.y, local_size.z);
-      hk_g17p_trace_hexdump("AGX3-compute-ioto", program_t.gpu,
-                            program.bytes, program.length);
-      hk_g17p_trace_hexdump("AGX3-compute-stream", cs->addr, sink.data, sink.length);
    }
    cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
    cs->stats.cmds++;

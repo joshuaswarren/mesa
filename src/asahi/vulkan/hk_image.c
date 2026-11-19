@@ -39,12 +39,6 @@
  */
 #define HK_SPARSE_ALIGN_B 65536
 
-DEBUG_GET_ONCE_BOOL_OPTION(m5_depth_msaa_transfer,
-                          "ASAHI_M5_DEPTH_MSAA_TRANSFER", true)
-
-DEBUG_GET_ONCE_BOOL_OPTION(m5_depth_msaa_compression,
-                          "ASAHI_M5_DEPTH_MSAA_COMPRESSION", true)
-
 static VkFormatFeatureFlags2
 hk_get_image_plane_format_features(struct hk_physical_device *pdev,
                                    VkFormat vk_format, VkImageTiling tiling)
@@ -393,10 +387,6 @@ vk_image_usage_to_format_features(VkImageUsageFlagBits usage_flag)
       return 0;
    }
 }
-
-/* Enable the validated multisample color layouts on G17S. */
-DEBUG_GET_ONCE_NUM_OPTION(m5_msaa_color_compression,
-                         "ASAHI_M5_MSAA_COLOR_COMPRESSION", 6)
 
 static bool
 hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
@@ -1348,16 +1338,11 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
    const bool m5_storage =
       hk_m5_storage_compression_eligible(dev, plane, info, float_image_atomics);
    bool allow_agx3 =
-      hk_m5_msaa_color_compression_eligible(
-         dev->chip, plane, info,
-         debug_get_option_m5_msaa_color_compression()) ||
-      hk_m5_depth_msaa_compression_eligible(
-         dev->chip, plane, info, dev->params.features,
-         debug_get_option_m5_depth_msaa_compression()) ||
-      hk_m5_depth_msaa_transfer_eligible(
-         dev->chip, plane, info, dev->params.features,
-         debug_get_option_m5_depth_msaa_compression(),
-         debug_get_option_m5_depth_msaa_transfer()) ||
+      hk_m5_msaa_color_compression_eligible(dev->chip, plane, info) ||
+      hk_m5_depth_msaa_compression_eligible(dev->chip, plane, info,
+                                            dev->params.features) ||
+      hk_m5_depth_msaa_transfer_eligible(dev->chip, plane, info,
+                                         dev->params.features) ||
       m5_storage ||
       (hk_hal200_compression_eligible(dev->chip, dev->params.chip_id, plane,
                                       info, agx_is_m4_pro(dev)) &&

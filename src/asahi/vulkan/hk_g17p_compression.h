@@ -516,15 +516,13 @@ hk_m5_msaa_color_compression_format(VkFormat format)
    }
 }
 
-/* Qualified multisample metadata shapes. The sample mask retains an
- * explicit diagnostic opt-out. Sharing and aliasing flags are not admitted;
- * a mutable format is, and hk_can_compress() then requires a format list of
- * compression-compatible views.
+/* Qualified multisample metadata shapes. Sharing and aliasing flags are not
+ * admitted; a mutable format is, and hk_can_compress() then requires a format
+ * list of compression-compatible views.
  */
 static inline bool
 hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
-                                     const VkImageCreateInfo *info,
-                                     unsigned enabled_samples)
+                                     const VkImageCreateInfo *info)
 {
    const VkImageUsageFlags allowed_usage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -550,7 +548,6 @@ hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
           hk_m5_msaa_color_compression_format(info->format) &&
           (info->samples == VK_SAMPLE_COUNT_2_BIT ||
            info->samples == VK_SAMPLE_COUNT_4_BIT) &&
-          (enabled_samples & info->samples) &&
           info->tiling == VK_IMAGE_TILING_OPTIMAL &&
           (info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
           !(info->usage & ~allowed_usage);
@@ -630,7 +627,7 @@ hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
 static inline bool
 hk_m5_depth_msaa_compression_eligible(enum agx_chip chip, unsigned plane,
                                      const VkImageCreateInfo *info,
-                                     uint64_t kernel_features, bool opted_in)
+                                     uint64_t kernel_features)
 {
    const uint64_t capability = DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION;
    const VkImageUsageFlags allowed_usage =
@@ -641,7 +638,7 @@ hk_m5_depth_msaa_compression_eligible(enum agx_chip chip, unsigned plane,
       plane == 0 ||
       (plane == 1 && info && info->format == VK_FORMAT_D32_SFLOAT_S8_UINT &&
        (kernel_features & DRM_ASAHI_FEATURE_M5_STENCIL_MSAA_COMPRESSION));
-   return opted_in && (kernel_features & capability) &&
+   return (kernel_features & capability) &&
           agx_chip_g17_m5(chip) && plane_ok && info && !info->pNext &&
           info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
           info->arrayLayers == 1 && info->mipLevels == 1 &&
@@ -662,15 +659,12 @@ hk_m5_depth_msaa_compression_eligible(enum agx_chip chip, unsigned plane,
 static inline bool
 hk_m5_depth_msaa_transfer_eligible(enum agx_chip chip, unsigned plane,
                                   const VkImageCreateInfo *info,
-                                  uint64_t kernel_features,
-                                  bool compression_opted_in,
-                                  bool transfer_opted_in)
+                                  uint64_t kernel_features)
 {
    const VkImageUsageFlags usage =
       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-   if (!compression_opted_in || !transfer_opted_in || !info ||
-       info->usage != usage)
+   if (!info || info->usage != usage)
       return false;
 
    if (info->pNext) {
@@ -690,6 +684,6 @@ hk_m5_depth_msaa_transfer_eligible(enum agx_chip chip, unsigned plane,
    base.pNext = NULL;
    base.usage &= ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                    VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-   return hk_m5_depth_msaa_compression_eligible(
-      chip, plane, &base, kernel_features, compression_opted_in);
+   return hk_m5_depth_msaa_compression_eligible(chip, plane, &base,
+                                                kernel_features);
 }

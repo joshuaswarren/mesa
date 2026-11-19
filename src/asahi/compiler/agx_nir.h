@@ -80,7 +80,6 @@ bool agx_nir_lower_compute_derivatives(struct nir_shader *s);
 bool agx_workgroup_split_size(const struct nir_shader *nir, uint16_t size[3]);
 bool agx_nir_lower_workgroup_split(struct nir_shader *nir,
                                    const uint16_t size[3]);
-bool agx_nir_compute_implicit_lod_diagnostic(void);
 struct nir_def *agx_nir_quad_ddx(struct nir_builder *b, struct nir_def *v);
 struct nir_def *agx_nir_quad_ddy(struct nir_builder *b, struct nir_def *v);
 

@@ -843,8 +843,6 @@ agx_m5_dispatch_barrier_flags(const struct agx_device *dev)
    return dev->chip == AGX_CHIP_G18G ? 0 : 5;
 }
 
-DEBUG_GET_ONCE_BOOL_OPTION(m5_gpu_tess, "ASAHI_M5_GPU_TESS", false)
-
 /* Can the CPU path (agx_swtnl.c) tessellate? The draw module tessellates only
  * through LLVM. */
 static bool
@@ -860,7 +858,7 @@ agx_swtnl_can_tessellate(void)
  * cannot: in a build without LLVM the draw module drops every patch. With
  * LLVM the CPU path is the qualified one. The GPU path still loses some
  * shapes, among them tessellation feeding a geometry shader, which M5 does
- * not rasterize natively yet. ASAHI_M5_GPU_TESS=1 forces the GPU path.
+ * not rasterize natively yet.
  */
 bool
 agx_m5_gpu_tess(struct agx_context *ctx)
@@ -868,7 +866,7 @@ agx_m5_gpu_tess(struct agx_context *ctx)
    if (!agx_chip_g17_m5(agx_device(ctx->base.screen)->chip))
       return false;
 
-   return debug_get_option_m5_gpu_tess() || !agx_swtnl_can_tessellate();
+   return !agx_swtnl_can_tessellate();
 }
 
 /* Room for a program's agx3d re-encoding: twice the G17G bound, which covers
@@ -3502,14 +3500,6 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          gs_copy->info.linear_varyings = key_->gs.linear_varyings;
          gs_copy->info.perspective_varyings =
             ~(key_->gs.flat_varyings | key_->gs.linear_varyings);
-      }
-      if (agx_env_flag(AGX_ENV_NEO_DRAW_DIAGNOSTICS)) {
-         fprintf(stderr,
-                 "NEO_GS_COPY link_uvs=%u known=%u flat=%llx linear=%llx\n",
-                 (unsigned)key_->gs.link_uvs,
-                 (unsigned)gs_copy->info.known_interpolation_qualifiers,
-                 (unsigned long long)key_->gs.flat_varyings,
-                 (unsigned long long)key_->gs.linear_varyings);
       }
 
       struct agx_unlinked_uvs_layout uvs = {0};
@@ -6987,10 +6977,6 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
    for (unsigned i = 0; i < cs->push_range_count; ++i) {
       const struct agx_push_range *push = &cs->push[i];
       const uint64_t table = batch->uniforms.tables[push->table];
-      if (agx_env_flag(AGX_ENV_NEO_UNIFORM_DIAGNOSTICS))
-         fprintf(stderr, "NEO_PUSH_INPUT stage=%u index=%u table=%u offset=%u start=%u halfs=%u table_gpu=%#llx\n",
-                 stage, i, push->table, push->offset, push->uniform,
-                 push->length, (unsigned long long)table);
 
       /* Fragment uniform zero is deliberately replaced by the resource pair.
        * A textured vertex/TES/copy program shifts its complete fixed ABI;
@@ -7059,19 +7045,11 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
          .size_halfs = length,
          .address = source,
       };
-      if (agx_env_flag(AGX_ENV_NEO_UNIFORM_DIAGNOSTICS))
-         fprintf(stderr, "NEO_PUSH stage=%u table=%u offset=%u start=%u halfs=%u table_gpu=%#llx source_gpu=%#llx\n",
-                 stage, push->table, push->offset, start, length,
-                 (unsigned long long)table, (unsigned long long)source);
    }
 
    if (cs->b.info.rodata.size_16) {
       const struct agx_rodata *rodata = &cs->b.info.rodata;
       const uint64_t size_B = (uint64_t)rodata->size_16 * 2;
-      if (agx_env_flag(AGX_ENV_NEO_UNIFORM_DIAGNOSTICS))
-         fprintf(stderr, "NEO_RODATA stage=%u base=%u halfs=%u offset=%u bo=%p size=%zu\n",
-                 stage, rodata->base_uniform, rodata->size_16, rodata->offset,
-                 (void *)cs->bo, cs->bo ? (size_t)cs->bo->size : 0);
       if (!cs->bo || !cs->bo->va || (rodata->base_uniform & 1) ||
           (rodata->size_16 & 1) || rodata->offset > cs->bo->size ||
           size_B > cs->bo->size - rodata->offset)
@@ -7200,27 +7178,6 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
                                t.gpu - program_bo->va->addr,
                                program_length))
       AGX3_PROGRAM_REFUSE("program upload");
-   if (agx_env_flag(AGX_ENV_NEO_BINARY_DIAGNOSTICS)) {
-      fprintf(stderr, "NEO_NATIVE stage=%u program=%#llx shader=%#llx size=%zu gprs=%u compiler_d=%u ranges=%zu\n",
-              stage, (unsigned long long)t.gpu,
-              (unsigned long long)desc.shader_va, linked->size,
-              linked->nr_gprs, linked->g17p_compiler_d, count);
-      fprintf(stderr, "NEO_IOTO stage=%u data=", stage);
-      for (size_t i = 0; i < program_length; ++i)
-         fprintf(stderr, "%02x", ((const uint8_t *)t.cpu)[i]);
-      fputc('\n', stderr);
-      if (linked->size <= 8192 &&
-          linked->entry_offset <= linked->bo->size &&
-          linked->size <= linked->bo->size - linked->entry_offset) {
-         const uint8_t *mapping = agx_bo_map(linked->bo);
-         if (mapping) {
-            fprintf(stderr, "NEO_BINARY stage=%u data=", stage);
-            for (size_t i = 0; i < linked->size; ++i)
-               fprintf(stderr, "%02x", mapping[linked->entry_offset + i]);
-            fputc('\n', stderr);
-         }
-      }
-   }
    if (full_va)
       *full_va = t.gpu;
    if (dev->chip == AGX_CHIP_G17P && cs->stage == MESA_SHADER_FRAGMENT) {
@@ -7243,8 +7200,8 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
  * with full-width LDIMMs), so one template fits every address the draw's
  * tables get, and only the shape (imageblock, range starts and sizes) keys it.
  * The bytes don't depend on the program's own address (no constant program),
- * which Honeykrisp relies on as well; ASAHI_M5_VERIFY_PROGRAM_CACHE=1 checks
- * every patched program against a fresh composition. */
+ * which Honeykrisp relies on as well; ASAHI_MESA_DEBUG=verify checks every
+ * patched program against a fresh composition. */
 struct agx_m5_graphics_template {
    struct agx_m5_graphics_template *next;
    struct agx_ioto_g17p_imageblock imageblock;
@@ -7298,8 +7255,7 @@ agx_m5_graphics_program_cached(struct agx_device *dev,
                                struct agx3_g17p_graphics_program *program)
 {
    if (!agx_chip_g17_m5(dev->chip) ||
-       desc->uniform_range_count > HK_G17P_PATCH_MAX_RANGES ||
-       agx_env_flag(AGX_ENV_NO_M5_PROGRAM_CACHE))
+       desc->uniform_range_count > HK_G17P_PATCH_MAX_RANGES)
       return false;
 
    simple_mtx_lock(&agx_m5_template_lock);
@@ -7436,10 +7392,6 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
    for (unsigned i = 0; i < cs->push_range_count; ++i) {
       const struct agx_push_range *push = &cs->push[i];
       const uint64_t table = batch->uniforms.tables[push->table];
-      if (agx_env_flag(AGX_ENV_NEO_UNIFORM_DIAGNOSTICS))
-         fprintf(stderr, "NEO_PUSH_INPUT stage=%u index=%u table=%u offset=%u start=%u halfs=%u table_gpu=%#llx\n",
-                 stage, i, push->table, push->offset, push->uniform,
-                 push->length, (unsigned long long)table);
 
       /* Fragment uniform zero is deliberately replaced by the resource pair.
        * A textured VS instead shifts its complete fixed ABI; trimming a VBO
@@ -7499,19 +7451,11 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
          .size_halfs = length,
          .address = source,
       };
-      if (agx_env_flag(AGX_ENV_NEO_UNIFORM_DIAGNOSTICS))
-         fprintf(stderr, "NEO_PUSH stage=%u table=%u offset=%u start=%u halfs=%u table_gpu=%#llx source_gpu=%#llx\n",
-                 stage, push->table, push->offset, start, length,
-                 (unsigned long long)table, (unsigned long long)source);
    }
 
    if (cs->b.info.rodata.size_16) {
       const struct agx_rodata *rodata = &cs->b.info.rodata;
       const uint64_t size_B = (uint64_t)rodata->size_16 * 2;
-      if (agx_env_flag(AGX_ENV_NEO_UNIFORM_DIAGNOSTICS))
-         fprintf(stderr, "NEO_RODATA stage=%u base=%u halfs=%u offset=%u bo=%p size=%zu\n",
-                 stage, rodata->base_uniform, rodata->size_16, rodata->offset,
-                 (void *)cs->bo, cs->bo ? (size_t)cs->bo->size : 0);
       if (!cs->bo || !cs->bo->va || (rodata->base_uniform & 1) ||
           (rodata->size_16 & 1) || count == ARRAY_SIZE(ranges) ||
           rodata->offset > cs->bo->size ||
@@ -7572,7 +7516,7 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
       AGX3_PROGRAM_REFUSE("program allocation");
    desc.program_va = t.gpu;
 
-   if (cached && agx_env_flag(AGX_ENV_M5_VERIFY_PROGRAM_CACHE)) {
+   if (cached && (dev->debug & AGX_DBG_VERIFY)) {
       struct agx3_g17p_graphics_program fresh;
       desc.patchable = true;
       const bool same =
@@ -7614,27 +7558,6 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
                                t.gpu - program_bo->va->addr,
                                program.length))
       AGX3_PROGRAM_REFUSE("program upload");
-   if (agx_env_flag(AGX_ENV_NEO_BINARY_DIAGNOSTICS)) {
-      fprintf(stderr, "NEO_NATIVE stage=%u program=%#llx shader=%#llx size=%zu gprs=%u compiler_d=%u ranges=%zu\n",
-              stage, (unsigned long long)t.gpu,
-              (unsigned long long)desc.shader_va, linked->size,
-              linked->nr_gprs, linked->g17p_compiler_d, count);
-      fprintf(stderr, "NEO_IOTO stage=%u data=", stage);
-      for (size_t i = 0; i < program.length; ++i)
-         fprintf(stderr, "%02x", program.bytes[i]);
-      fputc('\n', stderr);
-      if (linked->size <= 8192 &&
-          linked->entry_offset <= linked->bo->size &&
-          linked->size <= linked->bo->size - linked->entry_offset) {
-         const uint8_t *mapping = agx_bo_map(linked->bo);
-         if (mapping) {
-            fprintf(stderr, "NEO_BINARY stage=%u data=", stage);
-            for (size_t i = 0; i < linked->size; ++i)
-               fprintf(stderr, "%02x", mapping[linked->entry_offset + i]);
-            fputc('\n', stderr);
-         }
-      }
-   }
    if (agx_m5_render_resources(dev)) {
       /* The kernel sizes the render's pools from this (hk_cmd_draw.c,
        * hk_m5_note_render_resources): primary storage is the larger of the
@@ -12764,24 +12687,6 @@ agx_encode_g17g_state(struct agx_batch *batch, uint8_t *out)
                            fragment_pass ==
                               AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH),
                       "fragment pass type");
-      /* Retain complete linked memory-shader diagnostics for both admitted
-       * draws and the separately guarded early/depth-NEVER/multisample paths. */
-      if (dev->chip == AGX_CHIP_G18G && ctx->fs->so &&
-          ctx->fs->so->info.writes_memory && fs && fs->bo &&
-          agx_env_flag(AGX_ENV_NEO_BINARY_DIAGNOSTICS) && fs->size <= 65536 &&
-          fs->entry_offset <= fs->bo->size &&
-          fs->size <= fs->bo->size - fs->entry_offset) {
-         const uint8_t *mapping = agx_bo_map(fs->bo);
-         if (mapping) {
-            fprintf(stderr, "NEO_FRAGMENT_MEMORY_BINARY size=%zu entry=%zu "
-                    "gprs=%u samples=%u data=", (size_t)fs->size,
-                    (size_t)fs->entry_offset, fs->nr_gprs,
-                    batch->tilebuffer_layout.nr_samples);
-            for (size_t i = 0; i < fs->size; ++i)
-               fprintf(stderr, "%02x", mapping[fs->entry_offset + i]);
-            fputc('\n', stderr);
-         }
-      }
       const bool g18_late_memory =
          dev->chip == AGX_CHIP_G18G &&
          (batch->tilebuffer_layout.nr_samples == 1 ||
@@ -16220,17 +16125,6 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       }
       return;
    }
-
-   if (dev->chip == AGX_CHIP_G18G && agx_env_flag(AGX_ENV_NEO_DRAW_DIAGNOSTICS))
-      fprintf(stderr, "NEO_DRAW queue=%u batch=%u draw=%u width=%u height=%u samples=%u mode=%u count=%u count_known=%u instances=%u index_size=%u vs=%#llx fs=%#llx\n",
-              ctx->queue_id, agx_batch_idx(batch), batch->draws,
-              batch->key.width, batch->key.height, batch->key.samples,
-              info->mode, indirect ? 0 : draws->count, !indirect,
-              info->instance_count, info->index_size,
-              (unsigned long long)(ctx->linked.vs && ctx->linked.vs->bo
-                 ? ctx->linked.vs->bo->va->addr + ctx->linked.vs->entry_offset : 0),
-              (unsigned long long)(ctx->linked.fs && ctx->linked.fs->bo
-                 ? ctx->linked.fs->bo->va->addr + ctx->linked.fs->entry_offset : 0));
 
    if (!agx_native_graphics(dev) && info->index_size &&
        info->primitive_restart) {

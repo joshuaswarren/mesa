@@ -56,8 +56,6 @@
 #include "vk_drm_syncobj.h"
 #include "vk_sync.h"
 
-DEBUG_GET_ONCE_BOOL_OPTION(m5_chunk_timelines, "ASAHI_M5_CHUNK_TIMELINES", true)
-
 /* Signal scope includes all earlier commands on this Vulkan queue. A DRM
  * timeline point retains its predecessor fence chain; an individual submit's
  * aggregate fence covers only that submit. Transferring the queue point orders
@@ -1650,7 +1648,6 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    const bool chunk_timelines = cumulative_signals &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS) &&
       agx_chip_g17_m5(dev->dev.chip) &&
-      debug_get_option_m5_chunk_timelines() &&
       command_count > max_commands_per_submit(dev);
    const uint64_t point_count = chunk_timelines
       ? 1 + (command_count - 1) / max_commands_per_submit(dev) : 1;

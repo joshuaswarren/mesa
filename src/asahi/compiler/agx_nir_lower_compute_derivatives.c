@@ -45,13 +45,6 @@ agx_nir_quad_ddy(nir_builder *b, nir_def *v)
    return quad_derivative(b, v, true);
 }
 
-bool
-agx_nir_compute_implicit_lod_diagnostic(void)
-{
-   return debug_get_bool_option("ASAHI_G17P_COMPUTE_IMPLICIT_LOD_DIAGNOSTIC",
-                                false);
-}
-
 static bool
 lower_derivative(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 {
@@ -120,10 +113,8 @@ agx_nir_lower_compute_derivatives(nir_shader *s)
    bool progress = false;
    NIR_PASS(progress, s, nir_shader_intrinsics_pass, lower_derivative,
             nir_metadata_control_flow, NULL);
-   if (!agx_nir_compute_implicit_lod_diagnostic()) {
-      NIR_PASS(progress, s, nir_shader_tex_pass, lower_implicit_sample,
-               nir_metadata_control_flow, NULL);
-   }
+   NIR_PASS(progress, s, nir_shader_tex_pass, lower_implicit_sample,
+            nir_metadata_control_flow, NULL);
    return progress;
 }
 
