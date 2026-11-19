@@ -83,14 +83,6 @@ hk_hash_device_generation_contract(blake3_hasher *ctx,
    };
 
    _mesa_blake3_update(ctx, values, sizeof(values));
-
-   /* The kernel's feature bits select code paths at compile time: M5 native
-    * traversal or software ray queries, compute resources, RT-only render
-    * records. Key the caches on them so that a shader built against one
-    * kernel's features is never served on a kernel with others.
-    */
-   const uint64_t features = dev->params.features;
-   _mesa_blake3_update(ctx, &features, sizeof(features));
 }
 
 /* VK_KHR_shader_fma: G17P with its explicit-RTE tininess repair
@@ -1991,6 +1983,15 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
    _mesa_blake3_update(&blake3_ctx, &compiler_flags, sizeof(compiler_flags));
    const uint64_t env_hash = hk_codegen_env_hash();
    _mesa_blake3_update(&blake3_ctx, &env_hash, sizeof(env_hash));
+
+   /* The kernel's feature bits select code paths at compile time: M5 native
+    * traversal or software ray queries, compute resources, RT-only render
+    * records. Key the caches on them so that a shader built against one
+    * kernel's features is never served on a kernel with others. They do not
+    * change the image layout, so they stay out of optimalTilingLayoutUUID.
+    */
+   const uint64_t features = pdev->dev.params.features;
+   _mesa_blake3_update(&blake3_ctx, &features, sizeof(features));
 
    unsigned char blake3[BLAKE3_KEY_LEN];
    _mesa_blake3_final(&blake3_ctx, blake3);
