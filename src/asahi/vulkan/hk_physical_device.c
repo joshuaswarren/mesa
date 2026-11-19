@@ -1991,6 +1991,15 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
    const uint64_t env_hash = hk_codegen_env_hash();
    _mesa_blake3_update(&blake3_ctx, &env_hash, sizeof(env_hash));
 
+   /* The kernel's feature bits select code paths at compile time: M5 native
+    * traversal or software ray queries, compute resources, RT-only render
+    * records. Key the caches on them so that a shader built against one
+    * kernel's features is never served on a kernel with others. They do not
+    * change the image layout, so they stay out of optimalTilingLayoutUUID.
+    */
+   const uint64_t features = pdev->dev.params.features;
+   _mesa_blake3_update(&blake3_ctx, &features, sizeof(features));
+
    unsigned char blake3[BLAKE3_KEY_LEN];
    _mesa_blake3_final(&blake3_ctx, blake3);
 
@@ -2016,9 +2025,13 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
    static_assert(sizeof(instance->driver_build_sha) >= 20);
    char timestamp[2 * 20 + 1];
    mesa_bytes_to_hex(timestamp, instance->driver_build_sha, id_bytes);
-   const uint64_t driver_flags = hk_physical_device_compiler_flags(pdev);
-   pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags ^
-      (env_hash * UINT64_C(0xff51afd7ed558ccd)));
+   /* The disk cache follows the same identity as pipelineCacheUUID: the
+    * build, the device's generation contract and kernel features, the
+    * compiler flags and the codegen environment.
+    */
+   uint64_t identity;
+   memcpy(&identity, blake3, sizeof(identity));
+   pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, identity);
    if (pdev->vk.disk_cache != NULL) {
       hk_border_emulation_recall(pdev);
       pdev->vk.properties.pipelineBinaryInternalCache = true;
