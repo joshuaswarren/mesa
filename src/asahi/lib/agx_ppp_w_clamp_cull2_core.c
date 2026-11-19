@@ -37,13 +37,6 @@ agx_ppp_w_clamp_cull2_header(enum agx_chip chip, uint32_t *header)
 }
 
 bool
-agx_ppp_w_clamp_cull2_core_supported(enum agx_chip chip)
-{
-   uint32_t header;
-   return agx_ppp_w_clamp_cull2_header(chip, &header);
-}
-
-bool
 agx_ppp_w_clamp_cull2_core_pack(
    enum agx_chip chip, const struct agx_ppp_w_clamp_cull2_fields *fields,
    struct agx_ppp_w_clamp_cull2_core *out)
