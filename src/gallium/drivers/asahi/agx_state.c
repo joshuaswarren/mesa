@@ -1478,8 +1478,6 @@ agx_upload_depth_bias(struct agx_batch *batch,
  * to add surfaces to the BO list here. Instead we added them when flushing.
  */
 
-/* AGX_ZS_MERGE=0 ends the batch at every such framebuffer switch again. */
-DEBUG_GET_ONCE_BOOL_OPTION(zs_merge, "AGX_ZS_MERGE", true)
 
 static bool
 agx_fb_has_colour(const struct pipe_framebuffer_state *fb)
@@ -1500,7 +1498,7 @@ static void
 agx_try_zs_merge(struct agx_context *ctx,
                  const struct pipe_framebuffer_state *state)
 {
-   if (!debug_get_option_zs_merge() || !state->zsbuf.texture ||
+   if (!state->zsbuf.texture ||
        agx_fb_has_colour(state) || state->resolve || state->viewmask)
       return;
 
@@ -4099,14 +4097,10 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
       /* Texel fetches get G17P's explicit out-of-view predicate only in
        * robust contexts: elsewhere an out-of-range texelFetch is undefined
        * (GL 4.6, 8.6) and the hardware fetch is memory-safe. Shader packs'
-       * full-screen passes spent 5-7 instructions on every fetch.
-       * ASAHI_GL_ROBUST_TEXEL_FETCH=1 keeps the predicate everywhere. */
-      static int force = -1;
-      if (force < 0)
-         force = debug_get_bool_option("ASAHI_GL_ROBUST_TEXEL_FETCH", false);
+       * full-screen passes spent 5-7 instructions on every fetch. */
       NIR_PASS(_, nir, agx_nir_lower_texture_with_buffer_metadata_cb,
                descriptor_generation, agx_buffer_texture_metadata,
-               robust || force);
+               robust);
    }
    else
       NIR_PASS(_, nir, agx_nir_lower_texture_for_generation,
@@ -15585,9 +15579,8 @@ agx_draw_patches_split(struct agx_context *ctx,
  * its index list record: agx_encode_state() would emit nothing for it anyway.
  * Anything that varies per sub-draw (draw ID or base parameters in uniforms,
  * statistics, geometry or tessellation stages, transform feedback, misaligned
- * indices) keeps the full path. AGX_FAST_MULTIDRAW=0 disables this.
+ * indices) keeps the full path.
  */
-DEBUG_GET_ONCE_BOOL_OPTION(fast_multidraw, "AGX_FAST_MULTIDRAW", true)
 
 static void agx_draw_vbo(struct pipe_context *pctx,
                          const struct pipe_draw_info *info,
@@ -15703,7 +15696,7 @@ agx_draw_multi(struct pipe_context *pctx, const struct pipe_draw_info *info,
    struct agx_device *dev = agx_device(pctx->screen);
 
    if (indirect || !agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip) ||
-       dev->chip == AGX_CHIP_G18G || !debug_get_option_fast_multidraw()) {
+       dev->chip == AGX_CHIP_G18G) {
       util_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
       return;
    }

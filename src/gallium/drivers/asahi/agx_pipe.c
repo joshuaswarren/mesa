@@ -480,16 +480,12 @@ agx_twiddled_allowed(const struct agx_resource *pres)
  * the compressed Gen9 2D texture packet reads it. On the M4 Max this is
  * byte-identical to plain depth through depth testing across passes,
  * readback, sampling, shadow comparison, blits and scissored clears, and a
- * Sodium-style terrain frame took 6-8 % less time. ASAHI_G17P_GL_DEPTH_COMPRESS=0
- * turns it off. */
+ * Sodium-style terrain frame took 6-8 % less time. */
 static bool
 agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
                                            const struct pipe_resource *templ)
 {
-   static int enabled = -1;
-   if (enabled < 0)
-      enabled = debug_get_bool_option("ASAHI_G17P_GL_DEPTH_COMPRESS", true);
-   return enabled && dev->chip == AGX_CHIP_G17P &&
+   return dev->chip == AGX_CHIP_G17P &&
           templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
           templ->array_size <= 1 && templ->last_level == 0 &&
           templ->nr_samples <= 1 && templ->format == PIPE_FORMAT_Z32_FLOAT &&
