@@ -14,12 +14,9 @@
 #include "agx3_isel_core.h"
 #include "agx3_tex_core.h"
 #include "agx_test.h"
-#include "util/u_debug.h"
 
 TEST(AGX3UniformALU, PackedUniformLoadPointerBoundaries)
 {
-   const bool enabled =
-      debug_get_bool_option("ASAHI_M5_HIGH_UNIFORM_LOAD", true);
    struct test_case {
       enum agx_isa_encoding encoding;
       unsigned low, high;
@@ -58,7 +55,7 @@ TEST(AGX3UniformALU, PackedUniformLoadPointerBoundaries)
          b, agx_temp(b->shader, AGX_SIZE_32), pointer, agx_immediate(0),
          AGX_FORMAT_I32, 1, 0, false);
       agx_optimizer_forward(b->shader);
-      if (enabled && t.admitted) {
+      if (t.admitted) {
          EXPECT_EQ(load->src[0].type, AGX_INDEX_UNIFORM);
          EXPECT_EQ(load->src[0].value, t.low);
          EXPECT_EQ(load->src[0].size, AGX_SIZE_64);
@@ -180,7 +177,16 @@ TEST(AGX3UniformALU, CSEKeepsDifferentSignedZeroContracts)
    ralloc_free(mem);
 }
 
-TEST(AGX3FetchBanks, MultisampleRetirementPreservesPendingR0)
+/* Back-to-back M5 reads of four channels each; the second writes r0..r3.
+ * Returns how often the packed program carries an identity wait on r0 and on
+ * the last read's coordinates, the carrier a retirement of a recycled operand
+ * bank must use: the r0 carrier waits only for the first read, while the
+ * second still writes r0. That was the stencil resolve of
+ * dEQP-VK.renderpasses.renderpass2.depth_stencil_resolve.*.stencil_min.
+ */
+static void
+retirement_carriers(bool multisample, unsigned reads, unsigned *r0,
+                    unsigned *coords)
 {
    void *mem = ralloc_context(NULL);
    agx_shader_key key = {};
@@ -189,38 +195,65 @@ TEST(AGX3FetchBanks, MultisampleRetirementPreservesPendingR0)
    agx_builder *b = agx_test_builder(mem);
    b->shader->key = &key;
    b->shader->stage = MESA_SHADER_COMPUTE;
-   b->shader->max_reg = 95;
-   const unsigned destinations[] = {8, 0, 16, 24, 32};
-   for (unsigned i = 0; i < 5; ++i) {
-      agx_index coords = agx_register(64 + 6 * i, AGX_SIZE_32);
-      coords.channels_m1 = 2;
+   b->shader->max_reg = 125;
+   const unsigned destinations[] = {8, 0, 16, 24, 32, 40, 48, 56, 64};
+   const unsigned stride = multisample ? 6 : 4;
+   ASSERT_LE(reads, ARRAY_SIZE(destinations));
+   for (unsigned i = 0; i < reads; ++i) {
+      agx_index coord = agx_register(72 + stride * i, AGX_SIZE_32);
+      coord.channels_m1 = multisample ? 2 : 1;
       agx_index dest = agx_register(destinations[i], AGX_SIZE_32);
       dest.channels_m1 = 3;
-      agx_texture_load_to(b, dest, coords, agx_immediate(0), agx_immediate(0),
-                         agx_immediate(i), agx_immediate(0), agx_null(),
-                         AGX_DIM_2D_MS, AGX_LOD_MODE_AUTO_LOD, 15, false, false);
+      if (multisample) {
+         agx_texture_load_to(b, dest, coord, agx_immediate(0),
+                             agx_immediate(0), agx_immediate(i),
+                             agx_immediate(0), agx_null(), AGX_DIM_2D_MS,
+                             AGX_LOD_MODE_AUTO_LOD, 15, false, false);
+      } else {
+         agx_image_load_to(b, dest, coord, agx_immediate(0),
+                           agx_immediate(0), agx_immediate(i),
+                           agx_immediate(0), agx_null(), AGX_DIM_2D,
+                           AGX_LOD_MODE_AUTO_LOD, 15, false, false, false);
+      }
    }
    agx_stop(b);
    util_dynarray binary;
    util_dynarray_init(&binary, mem);
-   /* Non-array multisample reads take eight operand banks by default; the
-    * fifth read recycles a bank only with the four-bank override. */
-   setenv("ASAHI_M5_MS_FETCH_BANKS", "4", 1);
-   const bool packed = agx3_pack_binary(b->shader, &binary);
-   unsetenv("ASAHI_M5_MS_FETCH_BANKS");
-   ASSERT_TRUE(packed);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
    const uint8_t *bytes = static_cast<const uint8_t *>(binary.data);
-   for (unsigned carrier : {0u, 88u}) {
+   const unsigned carriers[2] = {0, 72 + stride * (reads - 1)};
+   unsigned *counts[2] = {r0, coords};
+   for (unsigned c = 0; c < 2; ++c) {
       uint8_t expected[AGX3_ALU_MAX_LENGTH], length = 0;
       ASSERT_TRUE(agx3_alu_band_identity_wait(AGX_ISA_ENCODING_AGX3C,
-                                            carrier, 1, expected, &length));
-      unsigned matches = 0;
+                                            carriers[c], 1, expected, &length));
+      *counts[c] = 0;
       for (unsigned i = 0; i + length <= binary.size; ++i)
-         matches += std::memcmp(bytes + i, expected, length) == 0;
-      EXPECT_EQ(matches, carrier == 88 ? 1u : 0u);
+         *counts[c] += std::memcmp(bytes + i, expected, length) == 0;
    }
    util_dynarray_fini(&binary);
    ralloc_free(mem);
+}
+
+TEST(AGX3FetchBanks, MultisampleRetirementPreservesPendingR0)
+{
+   /* Non-array multisample reads take eight operand banks, one per
+    * scoreboard slot: the ninth read takes the first read's slot and bank
+    * once that read retires, and nothing waits on r0. */
+   unsigned r0 = ~0u, coords = ~0u;
+   retirement_carriers(true, 9, &r0, &coords);
+   EXPECT_EQ(r0, 0u);
+}
+
+TEST(AGX3FetchBanks, ImageRetirementPreservesPendingR0)
+{
+   /* Image reads stage from half 16 and have six operand banks: the seventh
+    * read recycles the first bank while the second read's r0 is in flight,
+    * and carries the retirement on its own coordinates. */
+   unsigned r0 = ~0u, coords = ~0u;
+   retirement_carriers(false, 7, &r0, &coords);
+   EXPECT_EQ(r0, 0u);
+   EXPECT_EQ(coords, 1u);
 }
 
 static agx_instr *
@@ -1018,15 +1051,6 @@ TEST(AGX3ArrayStaging, ReusedCompletionSlotRetainsCoordinateConsumer)
 static void
 check_fetch_group(unsigned mode)
 {
-   struct option_guard {
-      bool had = getenv("ASAHI_M5_FETCH_REUSE") != nullptr;
-      std::string old = had ? getenv("ASAHI_M5_FETCH_REUSE") : "";
-      option_guard() { setenv("ASAHI_M5_FETCH_REUSE", "1", 1); }
-      ~option_guard() {
-         if (had) setenv("ASAHI_M5_FETCH_REUSE", old.c_str(), 1);
-         else unsetenv("ASAHI_M5_FETCH_REUSE");
-      }
-   } guard;
    void *mem = ralloc_context(NULL);
    agx_shader_key key = {};
    key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
@@ -1083,17 +1107,6 @@ TEST(AGX3FetchGroups, InterveningInstruction) { check_fetch_group(3); }
 
 TEST(AGX3FetchBanks, EightIndependentCoordinates)
 {
-   struct option_guard {
-      const char *name;
-      bool had;
-      std::string old;
-      option_guard(const char *n, const char *value) : name(n), had(getenv(n)),
-         old(had ? getenv(n) : "") { setenv(n, value, 1); }
-      ~option_guard() {
-         if (had) setenv(name, old.c_str(), 1);
-         else unsetenv(name);
-      }
-   } reuse("ASAHI_M5_FETCH_REUSE", "0"), banks("ASAHI_M5_FETCH_BANKS", "8");
    void *mem = ralloc_context(NULL);
    agx_shader_key key = {};
    key.dev.encoding = AGX_ISA_ENCODING_AGX3C;

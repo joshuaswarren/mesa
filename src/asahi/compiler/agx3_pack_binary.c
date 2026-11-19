@@ -1689,6 +1689,21 @@ agx3_tex_cube_groups_result_slot(const agx_instr *I)
  * staged half within the COPY destination field. */
 #define AGX3_STAGED_WRITE_LIMIT 128u
 
+/* Operand banks a plain M5 texel fetch may stage its coordinates in before
+ * one is recycled: one per scoreboard slot, so eight fetches can be in
+ * flight with disjoint coordinates. agx3_emit_texture_fetch further limits
+ * it to the banks that end by half 60.
+ */
+#define AGX3_M5_FETCH_BANKS 8u
+
+/* Operand banks for non-array M5 multisample reads. 062cd93 ("asahi: widen
+ * non-array M5 multisample operand banking") measured the warmed
+ * depth-pyramid pipeline at 0.674 ms with eight banks against 0.807 ms with
+ * four, at full clocks; the output oracle passed with four, eight and
+ * sixteen.
+ */
+#define AGX3_M5_MS_FETCH_BANKS 8u
+
 struct agx3_fetch_group {
    bool reuse;
    bool keep;
@@ -2363,13 +2378,12 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
    const bool banked_read = plain_bank || m5_ms_banks;
    /* Plain M5 fetch coordinates can name any aligned bank through half 60.
     * Use independent banks for all eight scoreboard slots before recycling
-    * one. The diagnostic override only restricts this proven address range. */
+    * one. */
    const unsigned plain_banks = m5 ?
-      CLAMP(debug_get_num_option("ASAHI_M5_FETCH_BANKS", 8), 1,
-            MIN2(8, 1 + (60 - staging_base) / 8)) : 2;
+      MIN2(AGX3_M5_FETCH_BANKS, 1 + (60 - staging_base) / 8) : 2;
    /* Keep independent non-array MS publications in separate operand banks. */
-   const unsigned ms_banks = m5_ms_banks && !ms_array ?
-      CLAMP(debug_get_num_option("ASAHI_M5_MS_FETCH_BANKS", 8), 1, 16) : 4;
+   const unsigned ms_banks =
+      m5_ms_banks && !ms_array ? AGX3_M5_MS_FETCH_BANKS : 4;
    const uint16_t bank_span =
       m5_ms_banks ? 8 : plain_bank ? 2 * coord_count
                                  : staging_base + 8;
@@ -12647,8 +12661,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
     * (agx3_transcode.c). */
    const bool early_compare = enc == AGX_ISA_ENCODING_AGX3B ||
       (enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
-       !ctx->is_preamble && ctx->stage == MESA_SHADER_COMPUTE &&
-       debug_get_bool_option("ASAHI_M5_EARLY_COMPARE", true));
+       !ctx->is_preamble && ctx->stage == MESA_SHADER_COMPUTE);
    struct util_dynarray spans, compares;
    util_dynarray_init(&spans, ctx);
    util_dynarray_init(&compares, ctx);
@@ -13271,10 +13284,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
    unsigned k = 0;
    unsigned vertex_loads_scheduled = 0;
-   const unsigned device_load_batch =
+   const bool batch_device_loads =
       enc == AGX_ISA_ENCODING_AGX3C && !ctx->is_preamble &&
-      ctx->stage == MESA_SHADER_COMPUTE && ctx->nir && !ctx->nir->info.internal
-         ? debug_get_num_option("ASAHI_M5_DEVICE_LOAD_BATCH", 1) : 0;
+      ctx->stage == MESA_SHADER_COMPUTE && ctx->nir && !ctx->nir->info.internal;
    agx_foreach_block(ctx, slot_block) {
       agx_foreach_instr_in_block(slot_block, I) {
          if (I->op == AGX_OPCODE_STOP)
@@ -13302,13 +13314,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          /* Native G17G loads16/loads32 issue several independent 32-bit
           * device loads on each queue before the first consumer wait.
           * Keep coherent operations and other asynchronous engines separate. */
-         if ((device_load_batch == 1 || device_load_batch == 2) &&
+         if (batch_device_loads &&
              I->op == AGX_OPCODE_DEVICE_LOAD &&
              I->format == AGX_FORMAT_I32 && !I->coherent &&
              !I->agx3_tex_coord_start) {
             e->join_class = 1;
             e->join_limit = 8;
-            e->prefer_join = device_load_batch == 2;
          }
          /* Native query-once +0x5fc reads the traversal completion byte on
           * slot8, waiting for the intersect/continue engine on that slot. */
@@ -14965,8 +14976,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             uint16_t staged_end = 0;
             const bool share_fetch_coords =
                enc == AGX_ISA_ENCODING_AGX3C &&
-               ctx->stage == MESA_SHADER_COMPUTE && staged &&
-               debug_get_bool_option("ASAHI_M5_FETCH_REUSE", true);
+               ctx->stage == MESA_SHADER_COMPUTE && staged;
             const agx_instr *next = k < count ? ordered[k] : NULL;
             fetch_group.reuse = share_fetch_coords && fetch_group.keep;
             fetch_group.keep = share_fetch_coords && next &&

@@ -16290,15 +16290,13 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, agx_nir_opt_licm, regs - 8);
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-       debug_get_bool_option("ASAHI_M5_SHARED_OFFSETS", true)) {
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
       NIR_PASS(_, nir, agx_nir_opt_shared_byte_offsets);
       NIR_PASS(_, nir, nir_opt_cse);
       NIR_PASS(_, nir, nir_opt_dce);
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-       debug_get_bool_option("ASAHI_M5_MINMAX_PROVENANCE", true)) {
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
       NIR_PASS(_, nir, agx_nir_opt_canonical_minmax);
       NIR_PASS(_, nir, nir_opt_dce);
    }

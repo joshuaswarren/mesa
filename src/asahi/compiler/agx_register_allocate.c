@@ -1146,6 +1146,13 @@ pick_transient_texture_region(struct ra_ctx *rctx, agx_instr *I, unsigned d,
  */
 #define G17P_LOW_BANK_HALVES 128
 
+/* Register budget, in halves, of M5 compute kernels that use native ray
+ * traversal. Value from 7c91dddf53f (the M5 userspace snapshot), measured on
+ * M5 hardware with the full-resolution RT workload: 160 halves was faster
+ * than 128 and 192. Not derived; the snapshot records no numbers.
+ */
+#define AGX_M5_RT_REGISTER_BUDGET 160u
+
 static bool
 prefer_high_bank(const struct ra_ctx *rctx, const agx_instr *I, unsigned d,
                  enum ra_class cls, unsigned minimum, unsigned limit)
@@ -3099,16 +3106,13 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
    /* Large native-query kernels benefit from leaving registers available for
     * more resident work, even when this introduces ordinary scratch spills.
-    * The 160-half budget improved the full-resolution M5 RT workload; 128 and
-    * 192 were slower. Ordinary compute, helpers, preambles and AGX3B retain
-    * their existing budgets. Zero explicitly restores the uncapped path.
-    * Disable the shader cache when comparing an override. */
+    * Ordinary compute, helpers, preambles and AGX3B retain their existing
+    * budgets.
+    */
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
        ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
        !ctx->key->is_helper && ctx->out->uses_ray_traversal) {
-      unsigned budget = debug_get_num_option("ASAHI_M5_RT_REGISTER_BUDGET", 160);
-      if (budget >= 128 && budget <= 240 && !(budget & 15))
-         max_possible_regs = MIN2(max_possible_regs, budget);
+      max_possible_regs = MIN2(max_possible_regs, AGX_M5_RT_REGISTER_BUDGET);
    }
 
    /* Match the CEM scratch extent reserved by agx3_pack_binary. */

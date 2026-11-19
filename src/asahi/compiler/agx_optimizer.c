@@ -936,8 +936,7 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
           !def->saturate) {
          const agx_index lo = def->src[0], hi = def->src[1];
          const bool m5_uniform_base =
-            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-            debug_get_bool_option("ASAHI_M5_HIGH_UNIFORM_LOAD", true);
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
 
          /* On AGX3B a scalar W8 load and four packed W8 components both
           * return one physical word, and the LDDEV encoding reads an aligned
@@ -1072,7 +1071,6 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
          ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
          I->op == AGX_OPCODE_TEXTURE_LOAD && s == 3 &&
          def->src[0].type == AGX_INDEX_UNIFORM &&
-         debug_get_bool_option("ASAHI_M5_UNIFORM_TEXTURE_OPERANDS", true) &&
          agx_instr_accepts_uniform(ctx->key->dev.encoding, I->op, s,
                                   def->src[0].value, def->src[0].size);
 
