@@ -13006,6 +13006,7 @@ agx_encode_g17g_state(struct agx_batch *batch, uint8_t *out)
                                  ? rast->base.sprite_coord_enable
                                  : 0,
                               &batch->generate_primitive_id);
+      agx_cf_bindings_select_perspective(t.cpu, cf);
       if (!general_varyings) {
          /* Varying Counts packs smooth at bit 0, flat at bit 8 and linear
           * (noperspective) at bit 16; the record below uses the same
