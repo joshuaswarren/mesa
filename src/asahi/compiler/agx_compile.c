@@ -4013,8 +4013,9 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
             const bool memory_only_m5 =
                b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
                memory_only;
-            const bool m5_device_rendezvous =
-               b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+            const bool device_rendezvous =
+               (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+                b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
                !memory_only &&
                nir_intrinsic_memory_scope(instr) >= SCOPE_QUEUE_FAMILY;
 
@@ -4036,9 +4037,11 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
                         ? AGX3_BARRIER_SCOPE_DEVICE_FENCE
                         : AGX3_BARRIER_SCOPE_DEVICE);
 
-               /* On M5 the workgroup barrier's device-memory form orders
-                * device memory only within the workgroup: writes before it
-                * can stay invisible to other workgroups after it, and a
+               /* On G17P and M5 the workgroup barrier's device-memory form
+                * orders device memory only within the workgroup (the other
+                * AGX3B chips are untested and take the same fence): writes
+                * before it can stay invisible to other workgroups after it,
+                * and a
                 * plain load after it can still return a line this core
                 * cached before another workgroup wrote it. At device or
                 * queue-family memory scope, follow the rendezvous with the
@@ -4046,7 +4049,7 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
                 * workgroup made before the barrier and before every load
                 * and signal after it.
                 */
-               if (m5_device_rendezvous)
+               if (device_rendezvous)
                   agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_DEVICE_FENCE);
                emitted = true;
             }
