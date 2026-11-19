@@ -11544,21 +11544,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             t.cpu, &gfx->linked_varyings, hw_vs->info.uvs.user_size,
             &linked_fs->b.cf, gfx->provoking, 0, &gfx->generate_primitive_id);
 
-         /* G17G sets up a binding with AGX2's perspective shade model (7)
-          * linearly. With a per-vertex W, the shader's divide by the
-          * interpolated 1/W then returns c * W for a value that is the same
-          * at every vertex (dEQP fill_rules.projected). Shade model 5 gives
-          * the perspective-correct coefficients there. */
-         if (dev->dev.chip == AGX_CHIP_G17G) {
-            struct agx_cf_binding_packed *packed =
-               (void *)((uint8_t *)t.cpu + AGX_CF_BINDING_HEADER_LENGTH);
-            for (unsigned i = 0; i < bindings; ++i) {
-               const struct agx_cf_binding *b = &linked_fs->b.cf.bindings[i];
-               if (b->smooth && b->perspective)
-                  packed[i].opaque[0] =
-                     (packed[i].opaque[0] & ~BITFIELD_RANGE(2, 3)) | (5u << 2);
-            }
-         }
+         if (dev->dev.chip == AGX_CHIP_G17G)
+            agx_cf_bindings_select_perspective(t.cpu, &linked_fs->b.cf);
 
          gfx->varyings = native_vit ? t.gpu : agx_usc_addr(&dev->dev, t.gpu);
       } else {
