@@ -95,7 +95,7 @@ main(void)
                            (is_m5 ? HK_AGX3_M5_NODE_GROUP_LANES
                                   : HK_AGX3_GEN1_NODE_GROUP_LANES));
       size_t own_B;
-      const uint32_t *own = is_m5 ? hk_m5_agx3_node_encoder_spirv(false, &own_B)
+      const uint32_t *own = is_m5 ? hk_m5_agx3_node_encoder_spirv(&own_B)
                                   : hk_gen1_agx3_node_encoder_spirv(false, &own_B);
       assert(own == encoder && own_B == size_B);
 
@@ -106,17 +106,15 @@ main(void)
    }
    assert(m5 == 3 && gen1 == AGX_CHIP_UNKNOWN - 3);
 
-   /* The two formats share no program, and each format's variants keep its
-    * workgroup shape: GEN1 triangle pairs, M5 batched builds. */
-   size_t gen1_B, m5_B, pairs_B, batch_B, gen1_refit_B, m5_refit_B;
+   /* The two formats share no program, and the GEN1 triangle pair variant
+    * keeps its workgroup shape. */
+   size_t gen1_B, m5_B, pairs_B, gen1_refit_B, m5_refit_B;
    const uint32_t *gen1_enc = hk_gen1_agx3_node_encoder_spirv(false, &gen1_B);
-   const uint32_t *m5_enc = hk_m5_agx3_node_encoder_spirv(false, &m5_B);
+   const uint32_t *m5_enc = hk_m5_agx3_node_encoder_spirv(&m5_B);
    const uint32_t *pairs = hk_gen1_agx3_node_encoder_spirv(true, &pairs_B);
-   const uint32_t *batch = hk_m5_agx3_node_encoder_spirv(true, &batch_B);
-   assert(gen1_enc != m5_enc && pairs != gen1_enc && batch != m5_enc);
+   assert(gen1_enc != m5_enc && pairs != gen1_enc);
    assert(gen1_B != m5_B || memcmp(gen1_enc, m5_enc, gen1_B));
    assert(spirv_local_size_x(pairs, pairs_B) == HK_AGX3_GEN1_NODE_GROUP_LANES);
-   assert(spirv_local_size_x(batch, batch_B) == HK_AGX3_M5_NODE_GROUP_LANES);
    const uint32_t *gen1_refit = hk_gen1_agx3_refit_spirv(&gen1_refit_B);
    const uint32_t *m5_refit = hk_m5_agx3_refit_spirv(&m5_refit_B);
    assert(gen1_refit != m5_refit &&

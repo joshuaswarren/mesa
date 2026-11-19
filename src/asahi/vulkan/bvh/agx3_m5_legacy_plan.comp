@@ -21,18 +21,10 @@
 #include "hk_build_interface.h"
 
 layout(local_size_x = 64) in;
-#ifdef HK_AGX3_BATCH
-layout(push_constant) uniform CONSTS
-{
-   hk_agx3_batch_args batch;
-};
-hk_agx3_plan_args args;
-#else
 layout(push_constant) uniform CONSTS
 {
    hk_agx3_plan_args args;
 };
-#endif
 
 void
 fail(uint flag)
@@ -324,7 +316,7 @@ emit(uint id)
    uint slots = leaf ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
                            ? 2u * count
                            : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
-                                ? (count * (args.m5_aabb_stride == 64u ? 64u : 48u) + 63u) / 64u
+                                ? (count * HK_AGX3_M5_AABB_RECORD_B + 63u) / 64u
                                 : count + (count + 3u) / 4u) : count;
    uint first = atomicAdd(DEREF(args.state).next_slot, slots);
    if (slots > args.slot_bound || first > args.slot_bound - slots) {
@@ -440,34 +432,6 @@ void
 main()
 {
    uint id = gl_GlobalInvocationID.x;
-#ifdef HK_AGX3_BATCH
-   uint build = gl_WorkGroupID.y;
-   if (build >= batch.job_count)
-      return;
-   REF(hk_agx3_batch_job) entry = INDEX(hk_agx3_batch_job, batch.jobs, build);
-   args = DEREF(entry).plan;
-   args.phase = batch.phase;
-   /* Snapshot the final number of independently writable jobs. Allocation
-    * is bounded by the host's sum of node bounds. Planner failures still
-    * produce mapped entries whose consumer observes the error and returns. */
-   if (args.phase == 3 && id == 0) {
-      uint count = DEREF(args.state).error == 0 ? DEREF(args.state).job_count : 0;
-      DEREF(entry).first_job = atomicAdd(DEREF(batch.dispatch).x, count);
-      DEREF(entry).encode_count = count;
-   }
-   if (args.phase == 4 && id < DEREF(entry).encode_count) {
-      hk_agx3_batch_map mapping;
-      mapping.build = build;
-      mapping.node = id;
-      DEREF(INDEX(hk_agx3_batch_map, batch.map,
-                  DEREF(entry).first_job + id)) = mapping;
-   }
-   if (DEREF(entry).single_leaf != 0) {
-      if (args.phase == 0 && id == 0)
-         plan_single_leaf();
-      return;
-   }
-#endif
    /* The single-leaf phase is dispatched by the M5 backend only. */
    if (args.phase == 5) {
       if (id == 0)
