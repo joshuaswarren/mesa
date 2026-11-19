@@ -6584,7 +6584,7 @@ static bool
 hk_m5_mesh_task_grid(struct hk_device *dev, nir_shader *nir,
                      VkShaderCreateFlagsEXT flags)
 {
-   if (nir->info.stage != MESA_SHADER_MESH || !hk_m5_task_enabled() ||
+   if (nir->info.stage != MESA_SHADER_MESH ||
        (flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT) ||
        !hk_nir_reads_intrinsic(nir, nir_intrinsic_load_num_workgroups))
       return true;
@@ -7465,8 +7465,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    if (sw_stage == MESA_SHADER_MESH) {
       struct hk_shader *shader = hk_main_mesh_variant(obj);
       if (dev->dev.chip != AGX_CHIP_G17P &&
-          (dev->dev.chip != AGX_CHIP_G17S ||
-           hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE)) {
+          dev->dev.chip != AGX_CHIP_G17S) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_UNKNOWN);
@@ -7651,12 +7650,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       layout_ok &= !m5_without_layer ||
          shader->info.uvs.user_size <= HK_AGX3_G17P_MAX_USER_WORDS;
       if (!layout_ok ||
-          !(m5_mesh ? (hk_m5_task_enabled()
-                          ? agx_nir_lower_m5_task_payload(nir,
-                               hk_m5_task_payload_limit(dev->dev.params.features),
-                               hk_m5_task_record(dev->dev.params.features) &&
-                                  !m5_no_grid_record ? 16 : 0)
-                          : agx_nir_lower_m5_task_payload_probe(nir))
+          !(m5_mesh ? agx_nir_lower_m5_task_payload(nir,
+                         hk_m5_task_payload_limit(dev->dev.params.features),
+                         hk_m5_task_record(dev->dev.params.features) &&
+                            !m5_no_grid_record ? 16 : 0)
                     : agx_nir_lower_gen1_task_payload_probe(nir)) ||
           !(m5_mesh ? agx_nir_lower_m5_mesh(nir, &varyings)
                     : agx_nir_lower_gen1_mesh(nir, &varyings))) {
@@ -7790,16 +7787,12 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * addressing and child-grid UVSW, never as a CDM mesh producer.
        * taskShader is advertised only with the kernel's task mesh storage
        * (hk_m5_task_record). */
-      if (hk_m5_task_enabled())
-         hk_m5_task_predicate(nir);
+      hk_m5_task_predicate(nir);
       if (dev->dev.chip != AGX_CHIP_G17S ||
-          hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE ||
-          !(hk_m5_task_enabled()
-               ? agx_nir_lower_m5_task(nir,
-                    hk_m5_task_payload_limit(dev->dev.params.features),
-                    hk_m5_task_record(dev->dev.params.features) &&
-                       !m5_no_grid_record)
-               : agx_nir_lower_m5_task_probe(nir))) {
+          !agx_nir_lower_m5_task(nir,
+              hk_m5_task_payload_limit(dev->dev.params.features),
+              hk_m5_task_record(dev->dev.params.features) &&
+                 !m5_no_grid_record)) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_errorf(dev, VK_ERROR_UNKNOWN,

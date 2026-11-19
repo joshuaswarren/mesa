@@ -1459,9 +1459,8 @@ agx_nir_lower_m5_mesh_fragment(nir_shader *s)
                                      nir_metadata_control_flow, NULL);
 }
 
-/* The retained native object and matching mesh both access the same pointer:
- * normalized SR62/W32 + SR63/W16. The four-byte payload limit is the actual
- * captured source contract, not a claimed hardware maximum. */
+/* The native object and matching mesh both access the same pointer:
+ * normalized SR62/W32 + SR63/W16. */
 static bool
 lower_payload(nir_builder *b,nir_intrinsic_instr *i,void *data)
 {
@@ -1506,12 +1505,6 @@ lower_payload(nir_builder *b,nir_intrinsic_instr *i,void *data)
          .access=nir_intrinsic_access(i)));
    }
    return true;
-}
-
-bool
-agx_nir_lower_m5_task_payload_probe(nir_shader *s)
-{
-   return agx_nir_lower_m5_task_payload(s, 4, 0);
 }
 
 bool
@@ -1591,44 +1584,7 @@ lower_launch(nir_builder *b,nir_intrinsic_instr *i,void *data)
    return true;
 }
 
-bool
-agx_nir_lower_m5_task_probe(nir_shader *s)
-{
-   unsigned threads=s->info.workgroup_size[0]*s->info.workgroup_size[1]*
-                    s->info.workgroup_size[2];
-   if (s->info.stage!=MESA_SHADER_TASK || s->info.workgroup_size_variable ||
-       threads<3 || threads>128 || s->info.shared_size>48 ||
-       !agx_nir_lower_m5_task_payload_probe(s)) return false;
-   unsigned launches=0;
-   nir_foreach_function_impl(impl,s) {
-      nir_foreach_block(block,impl) {
-         nir_foreach_instr(in,block) {
-            if (in->type==nir_instr_type_intrinsic &&
-                nir_instr_as_intrinsic(in)->intrinsic==nir_intrinsic_launch_mesh_workgroups)
-               launches++;
-         }
-      }
-   }
-   if (!launches) return false;
-   unsigned grid=ALIGN_POT(s->info.shared_size,16);
-   nir_shader_intrinsics_pass(s,lower_launch,nir_metadata_none,&grid);
-   nir_builder b=nir_builder_at(nir_after_cf_list(&nir_shader_get_entrypoint(s)->body));
-   nir_barrier(&b,.execution_scope=SCOPE_WORKGROUP,.memory_scope=SCOPE_WORKGROUP,
-      .memory_semantics=NIR_MEMORY_ACQ_REL,
-      .memory_modes=nir_var_mem_shared);
-   nir_object_payload_exit_barrier_agx(&b);
-   nir_def *lane=nir_load_local_invocation_index(&b);
-   nir_push_if(&b,nir_ult_imm(&b,lane,3));
-   nir_def *value=nir_load_shared(&b,1,32,
-      nir_iadd_imm(&b,nir_imul_imm(&b,lane,4),grid),.align_mul=4);
-   nir_store_object_childcount_agx(&b,value);
-   nir_pop_if(&b,NULL);
-   s->info.shared_size=64;
-   nir_progress(true,b.impl,nir_metadata_none);
-   return true;
-}
-
-/* The opt-in API task (object) stage. The child grid is published with UVSW
+/* The API task (object) stage. The child grid is published with UVSW
  * from lanes 0..2 of SIMD group 0. Payload-carrying Apple object shaders
  * store the EmitMeshTasks grid in threadgroup memory, rendezvous and pass
  * the object payload-exit barrier first (_agc.object.write_childcount);
