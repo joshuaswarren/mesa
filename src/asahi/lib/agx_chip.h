@@ -48,7 +48,17 @@ enum agx_chip {
    AGX_CHIP_G16C,
 
    /* G17P/G17A remain on the HAL200/AGX3b side of the boundary. The M5
-    * G/S/C parts use AGX3c. */
+    * G/S/C parts use AGX3c.
+    *
+    * G17P is an instruction-set and firmware-HAL profile (AGX3b shaders,
+    * HAL200 firmware interface), not one SoC. agx_chip_from_params() maps
+    * three SoCs to it: the A18 Pro (T8140, one cluster), the M4 Pro (T6040)
+    * and the M4 Max (T6041). They share the encodings, so encoding gates on
+    * G17P are exact. They differ in cluster and core counts, caches and
+    * clocks, so a performance or tuning gate on G17P is only as good as the
+    * rows behind it: give it measurements on its members (at least the A18
+    * Pro and the M4 Pro), or select it by the hardware property that is the
+    * real reason. */
    AGX_CHIP_G17P,
    AGX_CHIP_G17A,
    AGX_CHIP_G17G,

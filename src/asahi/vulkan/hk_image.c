@@ -567,11 +567,23 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
       ext->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO &&
       !ext->pNext;
 
-   /* G17P storage images stay uncompressed. hk does not initialize the
-    * compression metadata of a storage image whose contents are discarded
-    * (a transition from UNDEFINED), so an image bound to memory that held
-    * other data keeps that memory's tile words, and reads back wrong texels
-    * even after shader stores have written every texel. */
+   /* G17P storage images stay uncompressed: a shader image store through
+    * the G17P PBE does not merge into a compressed block or update its
+    * metadata. It writes the block as the block's existing metadata says,
+    * so the image decodes wrong whatever that metadata is:
+    *  - tiles a render pass or fast clear left compressed: with this rule
+    *    admitted on G17P (M4 Pro, 11-05) every format failed the scattered
+    *    imageStore steps of tests/vulkan_storage_compression.c, also without
+    *    a fast clear; a solid-mode block took the last stored value in all
+    *    of its texels.
+    *  - metadata left in reused memory (Neo, 11-12/13): images of the
+    *    half-float, R32F and RG32F formats that otherwise passed, written in
+    *    full by imageStore after a transition from UNDEFINED, read back
+    *    wrong, and RGBA8 images still did with their metadata reset.
+    * Initializing metadata on UNDEFINED would therefore not make the image
+    * correct once any other writer compresses its tiles. The storage PBE
+    * descriptor is byte-identical to the end-of-tile one, so there is no
+    * descriptor bit to fix this with. */
    if (dev->chip == AGX_CHIP_G17P)
       return false;
 
