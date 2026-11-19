@@ -3090,10 +3090,10 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
             if (key->layer_as_varying)
                NIR_PASS(_, nir, agx_nir_lower_default_layer);
             NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs, key->layer_as_varying,
-                     false);
+                     false, -1);
          } else {
             NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs,
-                     agx_native_graphics(dev), false);
+                     agx_native_graphics(dev), false, -1);
          }
       } else {
          if (agx_chip_g17_m5(dev->chip) && !nir->info.vs.tes_poly)
@@ -3567,10 +3567,10 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          if (layer_as_varying)
             NIR_PASS(_, gs_copy, agx_nir_lower_default_layer);
          NIR_PASS(_, gs_copy, agx_nir_lower_uvs, &uvs, layer_as_varying,
-                  false);
+                  false, -1);
       } else {
          NIR_PASS(_, gs_copy, agx_nir_lower_uvs, &uvs,
-                  agx_native_graphics(dev), false);
+                  agx_native_graphics(dev), false, -1);
       }
 
       compiled->gs_copy =

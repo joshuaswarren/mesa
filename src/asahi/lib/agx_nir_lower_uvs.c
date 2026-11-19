@@ -34,6 +34,7 @@ inline_uvs_index(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 struct ctx {
    nir_def *layer, *viewport;
    nir_cursor after_layer_viewport;
+   int layer_zero_root_offset;
    struct agx_unlinked_uvs_layout *layout;
    bool layer_as_varying;
 
@@ -179,6 +180,14 @@ write_layer_viewport_sysval(struct ctx *ctx)
    nir_def *layer = ctx->layer ? nir_u2u16(&b, ctx->layer) : zero;
    nir_def *viewport = ctx->viewport ? nir_u2u16(&b, ctx->viewport) : zero;
 
+   if (ctx->layer && ctx->layer_zero_root_offset >= 0) {
+      nir_def *addr = nir_iadd_imm(&b, nir_load_root_agx(&b),
+                                   ctx->layer_zero_root_offset);
+      nir_def *flag =
+         nir_load_global_constant(&b, 1, 16, addr, .align_mul = 2);
+      layer = nir_bcsel(&b, nir_ine_imm(&b, flag, 0), zero, layer);
+   }
+
    /* render_target_array_index is the low half and viewport_array_index the
     * high half on every generation, G17P included. */
    nir_def *packed = nir_pack_32_2x16_split(&b, layer, viewport);
@@ -250,7 +259,8 @@ agx_nir_lower_default_layer(nir_shader *s)
 
 bool
 agx_nir_lower_uvs(nir_shader *s, struct agx_unlinked_uvs_layout *layout,
-                  bool layer_as_varying, bool canonical)
+                  bool layer_as_varying, bool canonical,
+                  int layer_zero_root_offset)
 {
    bool progress = false;
 
@@ -292,6 +302,7 @@ agx_nir_lower_uvs(nir_shader *s, struct agx_unlinked_uvs_layout *layout,
    struct ctx ctx = {
       .layout = layout,
       .layer_as_varying = layer_as_varying,
+      .layer_zero_root_offset = layer_zero_root_offset,
    };
    const bool unlinked = canonical && !s->info.known_interpolation_qualifiers;
    layout->canonical =

@@ -198,7 +198,11 @@ struct hk_root_descriptor_table {
           * sample mask; they apply it before their own coverage update.
           * Sysval fields must sit at 4-byte offsets (root table loads). */
          uint16_t alpha_to_coverage;
-         uint16_t _pad7;
+
+         /* The pass has no attachments, so no storage backs its layers: the
+          * hardware sees layer zero, while a fragment shader reading the layer
+          * still gets what the vertex stage wrote. */
+         uint16_t no_attachments;
 
          /* Mapping from varying slots written by the last vertex stage to UVS
           * indices. This mapping must be compatible with the fragment shader.
