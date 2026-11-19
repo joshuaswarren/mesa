@@ -2234,7 +2234,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       agx_chip_g17_m5(pdev->dev.chip) || pdev->dev.chip == AGX_CHIP_G17P;
 
    supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
-      hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE &&
       (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2);
 
    /* Gen5 adds native component-wise minimum/maximum sampler reduction. */
