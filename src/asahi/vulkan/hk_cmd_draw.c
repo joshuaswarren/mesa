@@ -2139,14 +2139,6 @@ hk_build_g17g_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       if (!table)
          return (struct hk_bg_eot){0};
       ranges[0] = (struct agx3_ioto_uniform_range){0, 6, table};
-      if (debug_get_bool_option("HK_G17P_LAUNCH_TRACE", false)) {
-         fprintf(stderr, "M5 EOT resources: table=%" PRIx64 " pbe=%" PRIx64
-                         " descriptor=", table, pbe);
-         const uint8_t *bytes = (const uint8_t *)&view->planes[0].eot;
-         for (unsigned i = 0; i < sizeof(view->planes[0].eot); ++i)
-            fprintf(stderr, "%02x", bytes[i]);
-         fputc('\n', stderr);
-      }
    } else if (op == AGX_BG_CLEAR) {
       if (shader->info.push_count != AGX3_G17P_RT0_CLEAR_PUSH_HALFS ||
           shader->info.uses_txf)
@@ -2232,9 +2224,6 @@ hk_build_g17g_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       hk_cmd_publish_ioto_program(cmd, &reservation, program.length);
    if (!published)
       return (struct hk_bg_eot){0};
-   if (hk_g17p_launch_trace_enabled())
-      hk_g17p_trace_line(store ? "hal300-eot" : "hal300-background",
-                         published, map, program.length);
    return (struct hk_bg_eot){
       .usc = published,
       .rsrc_spec = store ? 0 : UINT64_C(0xffff800000000040),
