@@ -136,23 +136,29 @@ struct hk_device {
    /* Scratch-filled sparse VA (M5: bounded by sparseAddressSpaceSize). */
    uint64_t sparse_scratch_B;
    /* Live buffers and image planes with a GPU virtual address of their own
-    * (sparse binding, capture/replay buffers), atomic. Their memory is also
-    * mapped at another address, see hk_cdm_alias_scope(). */
+    * (sparse binding, capture/replay buffers), and memory mapped again for
+    * descriptor buffer capture/replay, atomic (hk_device_va_alias_get()).
+    * Their memory is also mapped at another address, see
+    * hk_cdm_alias_scope(). */
    uint32_t va_alias_resources;
    /* Whether anything this device enabled can map memory at a second GPU
     * virtual address at any time, decided at creation
     * (hk_device_may_alias_memory()). M5 uses it in place of
     * va_alias_resources, see hk_cdm_alias_scope(). */
    bool may_alias_memory;
-   /* M5 live host imports that may give memory a second GPU address
-    * (hk_host_import_aliases()), atomic. Only counted with host_alias.dynamic;
-    * hk_cdm_alias_scope() asks for memory scope while it is not 0. */
-   uint32_t host_alias_live;
+   /* M5 with host_alias.dynamic: live resources through which memory has or
+    * may have a second GPU address (hk_device_alias_get()), atomic:
+    * va_alias_resources, fd and dma-buf imports, and host imports that may
+    * alias. hk_cdm_alias_scope() asks for memory scope while it is not 0. */
+   uint32_t alias_live;
    struct {
-      /* VK_EXT_external_memory_host with GPU-writable imports was the only
-       * reason for may_alias_memory: it was left false, and the scope
-       * follows host_alias_live instead (hk_device_may_alias_memory()). */
+      /* M5: the device enabled a feature through which memory can get a
+       * second address, so the scope follows alias_live instead of
+       * may_alias_memory, which was left false
+       * (hk_device_may_alias_memory()). */
       bool dynamic;
+      /* ASAHI_M5_HOST_ALIAS_TRACE=1. */
+      bool trace;
       /* The memory-scoped strong flush, written over every patch site
        * (struct hk_alias_site). */
       uint32_t flush_word;
@@ -160,7 +166,7 @@ struct hk_device {
       simple_mtx_t lock;
       struct hk_host_imports imports;
       /* Executable command buffers with unwritten patch sites
-       * (hk_cmd_buffer::alias_link), patched when host_alias_live leaves 0. */
+       * (hk_cmd_buffer::alias_link), patched when alias_live leaves 0. */
       simple_mtx_t cmd_lock;
       struct list_head cmd_buffers;
       /* Submit packing copies the streams of the command buffers it
@@ -433,19 +439,35 @@ enum hk_perftest {
  * strong flush.
  *
  * On M5 the features through which memory can get a second GPU address are
- * looked at once, when the device is created (hk_device_may_alias_memory()).
- * A device that enabled sparse binding, capture/replay or fd imports flushes
- * with memory scope at every dependency, also in command buffers recorded
- * before such memory existed or that reach it only while they run. A device
- * that enabled none of them, nor writable host imports, never has such
- * memory. Where writable host imports are the only one (host_alias.dynamic),
- * the scope follows the imports that exist: memory scope while one of them
- * may alias (host_alias_live, hk_host_import_aliases()), that is, it is not
- * all private anonymous memory of this process, or it overlaps another live
- * import of which one of the two is GPU-writable. Not seen: pages moved by
- * mremap after an import and imported again (hk_host_alias.h). The pages of an import get
- * their second GPU address only when the import is created, so the work
- * recorded or submitted before then is given memory scope at that point:
+ * looked at once, when the device is created (hk_device_may_alias_memory()):
+ * sparse binding and residency, buffer device address, descriptor buffer
+ * and acceleration structure capture/replay, fd and dma-buf memory, and
+ * writable host imports. A device that enabled none of them never has such
+ * memory and keeps the plain flushes. On any other M5 device
+ * (host_alias.dynamic) the scope follows the resources that exist: memory
+ * scope while alias_live is not 0, the count of
+ *
+ * - live buffers and image planes with a GPU address of their own over
+ *   other memory: sparse buffers and images, buffers with a capture/replay
+ *   address, and memory mapped again in the capture/replay region for
+ *   descriptor buffers (va_alias_resources, which G17P reads alone). Each
+ *   counts from its creation, before memory can be bound to it. On M5 an
+ *   acceleration structure's address is its buffer's (also on replay,
+ *   vk_common_CreateAccelerationStructureKHR()), and image views and
+ *   samplers replay only descriptor indices, so their capture/replay adds
+ *   no address;
+ * - live fd and dma-buf imports, each for its lifetime: another import, of
+ *   this device or another, may map the same pages;
+ * - live host imports that may alias (hk_host_import_aliases()): not all
+ *   private anonymous memory of this process, or overlapping another live
+ *   import of which one of the two is GPU-writable. Not seen: pages moved by
+ *   mremap after an import and imported again (hk_host_alias.h).
+ *
+ * Every count goes through hk_device_alias_get(), which runs the patch
+ * below for all live command buffers when the count leaves 0, before the
+ * call that creates the resource returns. Memory gets its second GPU address
+ * only when such a resource is created, so the work recorded or submitted
+ * before then is given memory scope at that point:
  *
  * - Each application dependency between compute and transfer work that this
  *   rule recorded without memory scope is a patch site
@@ -456,31 +478,31 @@ enum hk_perftest {
  *   (hk_queue_submit()). Work behind a semaphore the host signals reaches
  *   the driver only once that signal is submitted (the runtime submits it
  *   from a thread that waits for VK_SYNC_WAIT_PENDING), so after every
- *   import the work may reach; work already with the kernel can reach no
- *   later import, which no host signal orders before it.
- * - When host_alias_live leaves 0, the sites of every executable command
- *   buffer are written as well (hk_device_patch_alias_sites()).
+ *   resource the work may reach; work already with the kernel can reach no
+ *   later resource, which no host signal orders before it.
+ * - When alias_live leaves 0, the sites of every executable command buffer
+ *   are written as well (hk_device_patch_alias_sites()).
  * - Writes only add memory scope, and a written command buffer keeps it
  *   until it is reset or freed.
  * - Every compute stream holding launches ends with the memory-scoped strong
  *   flush (vkEndCommandBuffer), so what it wrote is in memory by its end.
  *   Graphics commands, including transfers done through a render pass, get
  *   no such flush, as under the per-device rule, which never gave M5
- *   graphics memory scope either. Sites cover reads by work recorded before an import;
- *   this covers writes made before it, by work that already ran, read later
- *   through the new import, through an import that replaced a freed one, or
- *   through another device's or API's import of the same pages, which
+ *   graphics memory scope either. Sites cover reads by work recorded before
+ *   a resource that aliases; this covers writes made before it, by work that
+ *   already ran, read later through the new address, through a resource that
+ *   replaced a freed one, or through another device's, process's or API's
+ *   mapping of the same pages: an fd export or a host import elsewhere, which
  *   Vulkan orders after this work only at a submission boundary. Submit
- *   packing keeps that flush only at a packet's end while no import may
- *   alias.
+ *   packing keeps that flush only at a packet's end while alias_live is 0.
  * - What records no site keeps memory scope while the mode is on: the
  *   dependencies of graphics paths (transfers ordered before a draw, task
  *   launches), and all of a command buffer that uses events, since an event
  *   the host sets could let an execution that already started reach memory
- *   imported after it started (hk_cmd_alias_scope()).
+ *   aliased after it started (hk_cmd_alias_scope()).
  *
- * ASAHI_M5_HOST_ALIAS_STATIC=1 restores the per-device rule for host
- * imports (A/B and fallback).
+ * ASAHI_M5_HOST_ALIAS_STATIC=1 restores the per-device rule for every one
+ * of these features (A/B and fallback).
  *
  * On G17P the state is read when a barrier is recorded: live sparse and
  * capture/replay resources, and live fd imports and host imports the GPU may
@@ -511,7 +533,7 @@ static inline bool
 hk_cdm_alias_scope(const struct hk_device *dev)
 {
    if (agx_chip_g17_m5(dev->dev.chip))
-      return dev->may_alias_memory || p_atomic_read(&dev->host_alias_live);
+      return dev->may_alias_memory || p_atomic_read(&dev->alias_live);
 
    return dev->dev.chip == AGX_CHIP_G17P &&
           p_atomic_read(&dev->va_alias_resources) != 0;
@@ -528,7 +550,7 @@ hk_cdm_memory_scope_form(const struct hk_device *dev)
 
 /* As hk_cdm_alias_scope(), for an application dependency recorded without a
  * patch site (struct hk_alias_site): with host_alias.dynamic always, since
- * nothing would give the record memory scope once an import may alias. */
+ * nothing would give the record memory scope once a resource may alias. */
 static inline bool
 hk_cdm_alias_scope_unpatched(const struct hk_device *dev)
 {
@@ -536,9 +558,62 @@ hk_cdm_alias_scope_unpatched(const struct hk_device *dev)
 }
 
 /* Writes the patch sites of every executable command buffer that has
- * unwritten ones (host_alias.cmd_buffers), when the first host import that
- * may alias appears. Returns how many command buffers it wrote. */
+ * unwritten ones (host_alias.cmd_buffers), when the first resource that may
+ * alias appears. Returns how many command buffers it wrote. */
 unsigned hk_device_patch_alias_sites(struct hk_device *dev);
+
+/* What made alias_live leave 0 (ASAHI_M5_HOST_ALIAS_TRACE). */
+enum hk_alias_cause {
+   HK_ALIAS_CAUSE_IMPORT,
+   HK_ALIAS_CAUSE_SPARSE,
+   HK_ALIAS_CAUSE_CAPTURE_REPLAY,
+   HK_ALIAS_CAUSE_FD,
+};
+
+/* alias_live left 0: patch every live command buffer
+ * (hk_device_patch_alias_sites()). */
+void hk_device_alias_began(struct hk_device *dev, enum hk_alias_cause cause);
+
+/* M5 with host_alias.dynamic: n more live resources through which memory
+ * has or may have a second GPU address (alias_live). Called before the
+ * call that creates them returns, and before memory can be bound at that
+ * address; when the count leaves 0, the command buffers recorded before get
+ * memory scope at their patch sites first. Safe against concurrent creation
+ * and release: the count is atomic and exactly one caller sees it leave 0;
+ * a caller that adds to a count another caller is still patching for is
+ * covered by the check at submission (hk_queue_submit()). */
+static inline void
+hk_device_alias_get(struct hk_device *dev, uint32_t n,
+                    enum hk_alias_cause cause)
+{
+   if (!dev->host_alias.dynamic || n == 0)
+      return;
+   if (p_atomic_add_return(&dev->alias_live, n) == n)
+      hk_device_alias_began(dev, cause);
+}
+
+static inline void
+hk_device_alias_put(struct hk_device *dev, uint32_t n)
+{
+   if (dev->host_alias.dynamic && n)
+      p_atomic_add(&dev->alias_live, -(int32_t)n);
+}
+
+/* A buffer, image plane or memory object that maps memory at a GPU address
+ * of its own (va_alias_resources), from its creation to its destruction. */
+static inline void
+hk_device_va_alias_get(struct hk_device *dev, enum hk_alias_cause cause)
+{
+   p_atomic_inc(&dev->va_alias_resources);
+   hk_device_alias_get(dev, 1, cause);
+}
+
+static inline void
+hk_device_va_alias_put(struct hk_device *dev)
+{
+   p_atomic_dec(&dev->va_alias_resources);
+   hk_device_alias_put(dev, 1);
+}
 
 /* At submission, while an import may alias: writes the patch sites of the
  * submitted command buffers, before submit packing copies their streams. */

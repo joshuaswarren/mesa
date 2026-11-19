@@ -926,21 +926,24 @@ hk_init_g17p_grid_helper(struct hk_device *dev,
  * CPU alone. The structures of these features may only be used when they
  * are enabled, so a device that enabled none of them never has such memory.
  *
- * Sets *host_only when writable host imports are the only reason. Unlike the
- * others, those are seen as they are created, with the pages they map: on M5
- * the scope then follows the live imports that may alias instead
- * (hk_cdm_alias_scope(), hk_host_import_aliases()). An import of private
- * anonymous memory of this process (malloc, aligned_alloc, an anonymous
- * private mmap) that overlaps no other import of the device has its pages at
- * no other GPU address: they are mapped at one virtual address of the
- * process, and the GPU reaches them only through the import's own, unless
- * the application moved an imported range with mremap and imported it again
+ * On M5 every resource through which these features map memory at a second
+ * address is seen as it is created, so the scope follows the live ones
+ * instead (host_alias.dynamic, hk_cdm_alias_scope()): buffers and image
+ * planes with an address of their own and memory mapped again for
+ * descriptor buffer capture/replay (va_alias_resources), fd and dma-buf
+ * imports, and host imports that may alias (hk_host_import_aliases()). An
+ * acceleration structure's address is its buffer's, also on replay, so its
+ * capture/replay is covered by the buffer's. An import of private anonymous
+ * memory of this process (malloc, aligned_alloc, an anonymous private mmap)
+ * that overlaps no other import of the device has its pages at no other GPU
+ * address: they are mapped at one virtual address of the process, and the
+ * GPU reaches them only through the import's own, unless the application
+ * moved an imported range with mremap and imported it again
  * (hk_host_alias.h).
  */
 static bool
 hk_device_may_alias_memory(const struct hk_device *dev,
-                           const struct hk_instance *instance,
-                           bool *host_only)
+                           const struct hk_instance *instance)
 {
    const struct vk_features *f = &dev->vk.enabled_features;
    const struct vk_device_extension_table *ext = &dev->vk.enabled_extensions;
@@ -961,9 +964,8 @@ hk_device_may_alias_memory(const struct hk_device *dev,
    if (ext->KHR_external_memory_fd || ext->EXT_external_memory_dma_buf)
       return true;
 
-   *host_only = ext->EXT_external_memory_host &&
-                !instance->drirc.misc.host_memory_import_read_only;
-   return *host_only;
+   return ext->EXT_external_memory_host &&
+          !instance->drirc.misc.host_memory_import_read_only;
 }
 
 /* ASAHI_M5_HOST_ALIAS_TRACE=1: name at device creation every enabled feature
@@ -1004,12 +1006,14 @@ hk_device_trace_alias_reasons(const struct hk_device *dev,
                    "EXT_external_memory_host(writable)");
 #undef HK_ALIAS_REASON
    fprintf(stderr, "M5_HOST_ALIAS device rule=%s may_alias=%u reasons:%s\n",
-           dev->host_alias.dynamic ? "per-import" : "per-device",
+           dev->host_alias.dynamic ? "per-resource"
+           : dev->may_alias_memory ? "per-device"
+                                   : "none",
            dev->may_alias_memory, n ? reasons : " none");
 }
 
-/* A/B and fallback: the per-device rule for host imports, as before the
- * scope followed the live imports. */
+/* A/B and fallback: the per-device rule, as before the scope followed the
+ * live resources. */
 DEBUG_GET_ONCE_BOOL_OPTION(m5_host_alias_static, "ASAHI_M5_HOST_ALIAS_STATIC",
                            false)
 
@@ -1060,14 +1064,14 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    dev->vk.shader_ops = &hk_device_shader_ops;
    dev->vk.command_dispatch_table = &dev->cmd_dispatch;
-   bool host_alias_only = false;
-   dev->may_alias_memory =
-      hk_device_may_alias_memory(dev, instance, &host_alias_only);
+   dev->may_alias_memory = hk_device_may_alias_memory(dev, instance);
    simple_mtx_init(&dev->host_alias.lock, mtx_plain);
    simple_mtx_init(&dev->host_alias.cmd_lock, mtx_plain);
    list_inithead(&dev->host_alias.cmd_buffers);
    u_rwlock_init(&dev->host_alias.patch_lock);
-   if (host_alias_only && agx_chip_g17_m5(pdev->dev.chip) &&
+   dev->host_alias.trace = agx_chip_g17_m5(pdev->dev.chip) &&
+      debug_get_bool_option("ASAHI_M5_HOST_ALIAS_TRACE", false);
+   if (dev->may_alias_memory && agx_chip_g17_m5(pdev->dev.chip) &&
        !debug_get_option_m5_host_alias_static()) {
       /* The word hk_cdm_flush() records for a memory-scoped strong flush. */
       const struct agx3_cdm_barrier_info info = {
@@ -1083,8 +1087,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
          dev->may_alias_memory = false;
       }
    }
-   if (agx_chip_g17_m5(pdev->dev.chip) &&
-       debug_get_bool_option("ASAHI_M5_HOST_ALIAS_TRACE", false))
+   if (dev->host_alias.trace)
       hk_device_trace_alias_reasons(dev, instance);
 
    drmDevicePtr drm_device = NULL;

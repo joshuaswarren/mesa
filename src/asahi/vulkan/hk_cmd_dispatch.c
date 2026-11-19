@@ -750,8 +750,8 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
     * command buffer or in a later one of the same submission. While memory
     * may be mapped at a second address, end the stream with memory scope.
     * Usually this only strengthens the last launch's ordering record in
-    * place. Where only a later host import could map it there, that record
-    * is a patch site instead (hk_cdm_alias_scope()). */
+    * place. Where only a resource created later could map it there, that
+    * record is a patch site instead (hk_cdm_alias_scope()). */
    if (cs->stats.cmds == 0)
       return;
 

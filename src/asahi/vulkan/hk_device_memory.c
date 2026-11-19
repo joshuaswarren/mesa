@@ -306,9 +306,8 @@ hk_host_maps_classify_self(const void *pointer, uint64_t size)
  * hk_host_alias.h on mremap.
  *
  * Costs two reads of /proc/self/maps up to the lines that cover the range.
- * When this is the first import that may alias, the command buffers recorded
- * before get their patch sites written (hk_device_patch_alias_sites()) before
- * the import is returned. */
+ * The imports that began to alias count in alias_live (hk_device_alias_get()),
+ * before the import is returned. */
 static VkResult
 hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
                      const void *pointer, uint64_t size,
@@ -340,25 +339,20 @@ hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
 
    simple_mtx_lock(&dev->host_alias.lock);
    const int began = hk_host_imports_add(&dev->host_alias.imports, &import);
-   uint32_t live = p_atomic_read(&dev->host_alias_live);
-   if (began > 0)
-      live = p_atomic_add_return(&dev->host_alias_live, (uint32_t)began);
    simple_mtx_unlock(&dev->host_alias.lock);
+   if (began < 0)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   /* A free of an overlapping import meanwhile may have taken its count off
+    * first: the count wraps for that moment, which only asks for memory
+    * scope, and ends where the set says. */
+   mem->host_alias_tracked = true;
+   hk_device_alias_get(dev, began, HK_ALIAS_CAUSE_IMPORT);
 
    if (debug_get_option_m5_host_alias_trace())
       fprintf(stderr, "M5_HOST_ALIAS import %p+%#" PRIx64 " writes=%u maps=%u "
               "began=%d live=%u\n", pointer, size, gpu_writes, (unsigned)cls,
-              began, live);
-   if (began < 0)
-      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   mem->host_alias_tracked = true;
-   if (began > 0 && live == (uint32_t)began) {
-      const unsigned patched = hk_device_patch_alias_sites(dev);
-      if (debug_get_option_m5_host_alias_trace())
-         fprintf(stderr, "M5_HOST_ALIAS patched %u command buffers\n",
-                 patched);
-   }
+              began, p_atomic_read(&dev->alias_live));
    return VK_SUCCESS;
 }
 
@@ -371,14 +365,26 @@ hk_host_import_untrack(struct hk_device *dev, struct hk_device_memory *mem)
    simple_mtx_lock(&dev->host_alias.lock);
    const unsigned stopped =
       hk_host_imports_remove(&dev->host_alias.imports, mem);
-   const uint32_t live =
-      p_atomic_add_return(&dev->host_alias_live, -(int32_t)stopped);
+   hk_device_alias_put(dev, stopped);
    simple_mtx_unlock(&dev->host_alias.lock);
    mem->host_alias_tracked = false;
 
    if (debug_get_option_m5_host_alias_trace())
       fprintf(stderr, "M5_HOST_ALIAS free %p stopped=%u live=%u\n",
-              (void *)mem, stopped, live);
+              (void *)mem, stopped, p_atomic_read(&dev->alias_live));
+}
+
+/* Memory mapped again in the capture/replay region (replay_va) counts from
+ * its mapping to its release (hk_device_va_alias_get()). */
+static void
+hk_memory_release_replay_va(struct hk_device *dev,
+                            struct hk_device_memory *mem)
+{
+   if (!mem->replay_va)
+      return;
+   agx_va_free(&dev->dev, mem->replay_va, true);
+   mem->replay_va = NULL;
+   hk_device_va_alias_put(dev);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -568,7 +574,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        * capture/replay addresses. */
       /* The memory is reached through two read-write addresses now. */
       if (mem->replay_va)
-         p_atomic_inc(&dev->va_alias_resources);
+         hk_device_va_alias_get(dev, HK_ALIAS_CAUSE_CAPTURE_REPLAY);
    }
 
    if (mem->vk.alloc_flags &
@@ -586,6 +592,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                          mem->bo->size, 0, DRM_ASAHI_BIND_READ);
    if (ret) {
       /* The bind fails once the VM carries a sticky error. */
+      hk_memory_release_replay_va(dev, mem);
       agx_bo_unreference(&dev->dev, mem->bo);
       mem->bo = NULL;
       vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
@@ -596,11 +603,23 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       result = hk_host_import_track(dev, mem, host_info->pHostPointer,
                                     mem->bo->size, host_maps_before_pin);
       if (result != VK_SUCCESS) {
+         hk_memory_release_replay_va(dev, mem);
          agx_bo_unreference(&dev->dev, mem->bo);
          mem->bo = NULL;
          vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
          return result;
       }
+   }
+
+   /* An fd or dma-buf import has an address of its own, and another import,
+    * of this device or of another device or process, may map the same pages:
+    * it counts for its lifetime (hk_cdm_alias_scope()). An export reaches
+    * other devices and processes only across a submission boundary, after
+    * the memory-scoped flush that ends every command; brought back into this
+    * device it is an import, which counts here. */
+   if (fd_info && fd_info->handleType) {
+      mem->alias_fd = true;
+      hk_device_alias_get(dev, 1, HK_ALIAS_CAUSE_FD);
    }
 
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
@@ -670,16 +689,15 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
    /* The BO may outlive this object in the BO cache. */
    hk_set_memory_priority(dev, mem, 0.5f);
 
-   if (mem->replay_va) {
-      agx_va_free(&dev->dev, mem->replay_va, true);
-      p_atomic_dec(&dev->va_alias_resources);
-   }
+   hk_memory_release_replay_va(dev, mem);
 
    if (mem->alias_import)
       p_atomic_dec(&dev->va_alias_resources);
 
    /* No work that may still run reaches this memory any more. */
    hk_host_import_untrack(dev, mem);
+   if (mem->alias_fd)
+      hk_device_alias_put(dev, 1);
 
    agx_bo_unreference(&dev->dev, mem->bo);
 

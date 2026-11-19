@@ -183,7 +183,7 @@ hk_descriptor_state_fini(struct hk_cmd_buffer *cmd,
 /* Writes the stream words of the patch sites. M5 command memory is mapped
  * uncached (hk_g17p_cached_cmd_memory() is G17P-only), so the words need no
  * cache maintenance, only to be stored whole (the GPU may read the stream
- * meanwhile when the host-alias count leaves 0) and made visible before the
+ * meanwhile when the alias count leaves 0) and made visible before the
  * submission or host signal that lets the GPU run them. */
 void
 hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
@@ -219,7 +219,7 @@ hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
 
 /* At vkEndCommandBuffer, once nothing moves the streams any more: a command
  * buffer that uses events gets memory scope throughout
- * (hk_cmd_alias_scope()), one recorded while an import may alias by now is
+ * (hk_cmd_alias_scope()), one recorded while a resource may alias by now is
  * written at once, and any other waits in host_alias.cmd_buffers for
  * hk_device_patch_alias_sites(), besides the check at submission. */
 static void
@@ -289,6 +289,22 @@ hk_device_patch_alias_sites(struct hk_device *dev)
    }
    simple_mtx_unlock(&dev->host_alias.cmd_lock);
    return patched;
+}
+
+void
+hk_device_alias_began(struct hk_device *dev, enum hk_alias_cause cause)
+{
+   const unsigned patched = hk_device_patch_alias_sites(dev);
+   if (dev->host_alias.trace) {
+      static const char *const names[] = {
+         [HK_ALIAS_CAUSE_IMPORT] = "import",
+         [HK_ALIAS_CAUSE_SPARSE] = "sparse",
+         [HK_ALIAS_CAUSE_CAPTURE_REPLAY] = "capture-replay",
+         [HK_ALIAS_CAUSE_FD] = "fd",
+      };
+      fprintf(stderr, "M5_HOST_ALIAS began cause=%s patched=%u\n",
+              names[cause], patched);
+   }
 }
 
 void
@@ -1060,12 +1076,13 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
           * application barrier recorded without memory scope. Each command
           * then writes back what it wrote by its end, as the memory scope of
           * each barrier did under the per-device rule, so a later command
-          * reads it through any address, also through an import created in
-          * between, whose patch sites cover only the commands recorded
-          * before it (hk_cdm_alias_scope()), or through another device's or
-          * API's import of the same pages, which Vulkan orders after this
-          * work only at a submission boundary. Submit packing keeps the scope
-          * only at a packet's end while no import may alias. */
+          * reads it through any address, also through a resource that
+          * aliases created in between, whose patch sites cover only the
+          * commands recorded before it (hk_cdm_alias_scope()), or through
+          * another device's, process's or API's mapping of the same pages,
+          * which Vulkan orders after this work only at a submission
+          * boundary. Submit packing keeps the scope only at a packet's end
+          * while no resource may alias. */
          if (dev->host_alias.dynamic &&
              hk_cdm_visibility_flush_needed(dev, cs, true)) {
             if (cs->current != cs->weak_barrier_end &&

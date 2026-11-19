@@ -2748,12 +2748,12 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (vk_device_is_lost_no_report(&dev->vk))
       return VK_ERROR_DEVICE_LOST;
 
-   /* While a host import may alias, the command buffers recorded before it
-    * get memory scope at their patch sites (hk_cdm_alias_scope()), before
+   /* While a resource may alias, the command buffers recorded before it get
+    * memory scope at their patch sites (hk_cdm_alias_scope()), before
     * anything reads their streams: submit packing copies them, holding
     * host_alias.patch_lock shared (queue_submit()). */
    if (unlikely(dev->host_alias.dynamic) &&
-       p_atomic_read(&dev->host_alias_live))
+       p_atomic_read(&dev->alias_live))
       hk_submit_patch_alias_sites(dev, submit->command_buffers,
                                   submit->command_buffer_count);
 
