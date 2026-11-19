@@ -335,8 +335,6 @@ agx3_lower_m5_modified_fma_immediates(agx_context *ctx, agx_instr *I)
  * Final physical divergence disables discard hints, and post-optimizer SSA
  * reuse may differ from the original NIR use count. Pack only those operands
  * that cannot use the consuming publisher, after optimization and before RA. */
-DEBUG_GET_ONCE_BOOL_OPTION(m5_fold_constant_lod,
-                           "ASAHI_M5_FOLD_CONSTANT_LOD", true)
 
 static bool
 agx3_m5_exact_lod_immediate(float value, bool explicit_lod, uint8_t *immediate)
@@ -364,8 +362,7 @@ static void
 agx3_fold_m5_constant_lods(agx_context *ctx)
 {
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
-       ctx->stage != MESA_SHADER_FRAGMENT ||
-       !debug_get_option_m5_fold_constant_lod())
+       ctx->stage != MESA_SHADER_FRAGMENT)
       return;
 
    agx_instr **defs = calloc(ctx->alloc, sizeof(*defs));
