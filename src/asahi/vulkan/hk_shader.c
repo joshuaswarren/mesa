@@ -8425,6 +8425,20 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    const bool m5_no_grid_record =
       hk_m5_no_grid_record(dev, shader_count, infos);
 
+   for (uint32_t i = 0; i < shader_count; i++) {
+      if (hk_nir_layout_has_descriptors(infos[i].nir, infos[i].set_layout_count,
+                                        infos[i].set_layouts))
+         continue;
+
+      const mesa_shader_stage stage = infos[i].nir->info.stage;
+      for (uint32_t j = 0; j < shader_count; j++)
+         ralloc_free(infos[j].nir);
+      memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
+      return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                       "%s shader uses a descriptor missing from its pipeline "
+                       "layout", mesa_shader_stage_name(stage));
+   }
+
    /* Lower shaders, notably lowering I/O. This is a prerequisite for
     * intershader optimization.
     */

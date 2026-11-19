@@ -785,6 +785,10 @@ hk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness,
 bool hk_lower_uvs_index(nir_shader *s, mesa_shader_stage sw_stage,
                         unsigned nr_vbos, unsigned uniform_base);
 
+bool hk_nir_layout_has_descriptors(
+   const nir_shader *nir, uint32_t set_layout_count,
+   struct vk_descriptor_set_layout *const *set_layouts);
+
 bool
 hk_nir_lower_descriptors(nir_shader *nir,
                          const struct vk_pipeline_robustness_state *rs,
