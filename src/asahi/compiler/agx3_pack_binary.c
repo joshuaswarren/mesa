@@ -69,14 +69,6 @@
 #include <stdio.h>
 #include <string.h>
 
-DEBUG_GET_ONCE_BOOL_OPTION(m5_begin_cf_live, "ASAHI_M5_BEGIN_CF_LIVE", true)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_scalar_3d_coords, "ASAHI_M5_SCALAR_3D_COORDS", true)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_wide_scalar_sources,
-                           "ASAHI_M5_WIDE_SCALAR_SOURCES", true)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_fs_3d_banks, "ASAHI_M5_FS_3D_BANKS", true)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_texture_result_tokens,
-                           "ASAHI_M5_TEXTURE_RESULT_TOKENS", true)
-
 struct agx3_branch_fixup {
    agx_block *block;
    off_t offset;
@@ -1610,13 +1602,11 @@ agx3_emit_uvsw(agx_context *ctx, struct util_dynarray *emission,
  * Apple's G18G code has no such carrier: its waits sit on the consumers.
  * With the fix on, every G18G carrier takes the live form, and an r0 carrier
  * also waits every slot whose in-flight producer writes r0. Waiting a slot
- * early only costs latency. AGX_G18_CARRIER1140=0 restores the previous bytes
- * for A/B attribution.
+ * early only costs latency.
  *
  * Both values belong to the agx3_pack_binary() call on this thread, as
  * agx_refusal does in agx_compile.c: shaders compile concurrently.
  */
-DEBUG_GET_ONCE_BOOL_OPTION(agx_g18_carrier1140, "AGX_G18_CARRIER1140", true)
 static __thread bool agx3_carrier1140;
 static __thread uint16_t agx3_r0_inflight;
 
@@ -4442,8 +4432,8 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
    const unsigned max_coord = 128 - (2 * agx_channels(I->src[0]));
    const bool published_shape =
       ((enc == AGX_ISA_ENCODING_AGX3B && I->dim == AGX_DIM_2D) ||
-       (enc == AGX_ISA_ENCODING_AGX3C && three_d && !shadow && !offset &&
-        debug_get_option_m5_scalar_3d_coords())) && !query_lod &&
+       (enc == AGX_ISA_ENCODING_AGX3C && three_d && !shadow && !offset)) &&
+      !query_lod &&
       !I->src[0].memory && !I->src[0].abs && !I->src[0].neg &&
       !I->src[0].cache && !I->src[0].discard &&
       I->src[0].size == AGX_SIZE_32 &&
@@ -4626,8 +4616,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
     * mode-specific ABI; only the relocatable profile can choose a new base.
     */
    const bool m5_fragment_3d = enc == AGX_ISA_ENCODING_AGX3C && three_d &&
-      !vertex_stage && !compute_stage && implicit_lod &&
-      debug_get_option_m5_fs_3d_banks();
+      !vertex_stage && !compute_stage && implicit_lod;
    const bool m5_banked_3d = enc == AGX_ISA_ENCODING_AGX3C && three_d &&
       !shadow && !offset && !query_lod && !min_lod &&
       (((vertex_stage || compute_stage) && (immediate_lod || gradient_lod)) ||
@@ -8534,8 +8523,7 @@ agx3_try_control_flow(struct util_dynarray *emission,
     * predecessor-aware analysis this backend does not have, so it is refused.
     */
    const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
-      I->op == AGX_OPCODE_BEGIN_CF &&
-      debug_get_option_m5_begin_cf_live();
+      I->op == AGX_OPCODE_BEGIN_CF;
    if (outstanding != 0 &&
        ((!live_begin && I->op == AGX_OPCODE_BEGIN_CF) || is_if || is_while || is_break_if ||
         is_else || I->op == AGX_OPCODE_POP_EXEC || is_jump))
@@ -11711,8 +11699,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       return false;
 
    agx3_carrier1140 = enc == AGX_ISA_ENCODING_AGX3C &&
-                      ctx->key->dev.emit_agx3d &&
-                      debug_get_option_agx_g18_carrier1140();
+                      ctx->key->dev.emit_agx3d;
    agx3_r0_inflight = 0;
 
    /* MS MRT reloads reuse texture destinations for scalar sample indices.
@@ -13427,8 +13414,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                    I->gather == AGX_GATHER_NONE && !I->query_lod &&
                    d == 0 && dest.size == AGX_SIZE_32 &&
                    I->mask &&
-                   !(I->mask & ~0xfu) &&
-                   debug_get_option_m5_texture_result_tokens()) {
+                   !(I->mask & ~0xfu)) {
                   const unsigned channels = util_bitcount(I->mask);
                   if (channels < agx_channels(dest))
                      dest.channels_m1 = channels - 1;
@@ -13742,8 +13728,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       }
 
       const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
-         ordered[i]->op == AGX_OPCODE_BEGIN_CF &&
-         debug_get_option_m5_begin_cf_live();
+         ordered[i]->op == AGX_OPCODE_BEGIN_CF;
       if (agx3_is_cf_op(ordered[i]) && !live_begin) {
          cf_retired |= cf_live;
          cf_live = 0;
@@ -14149,8 +14134,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          uint16_t cf_wait = wait;
          uint16_t cf_outstanding = outstanding_here;
          const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
-            I->op == AGX_OPCODE_BEGIN_CF &&
-            debug_get_option_m5_begin_cf_live();
+            I->op == AGX_OPCODE_BEGIN_CF;
          if (agx3_is_cf_op(I) && !live_begin) {
             const uint16_t retire = (uint16_t)(cf_wait | cf_outstanding);
             if (retire != 0) {
@@ -14326,8 +14310,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             }
             const bool scalar = I->op == AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3;
             const bool m5_scalar = enc == AGX_ISA_ENCODING_AGX3C && scalar &&
-               I->nr_srcs == 3 && !agx_is_null(I->src[2]) &&
-               debug_get_option_m5_scalar_3d_coords();
+               I->nr_srcs == 3 && !agx_is_null(I->src[2]);
             if ((!m5_scalar && enc != AGX_ISA_ENCODING_AGX3B) || !slot ||
                 I->nr_srcs != (scalar ? 3 : 2) ||
                 !I->imm || I->imm > resource_capacity ||
@@ -14380,8 +14363,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                      next_src.value + (!scalar && later == 1 ? 2 : 0);
                   last &= next_reg != reg;
                }
-               const bool wide_scalar = m5_scalar &&
-                  debug_get_option_m5_wide_scalar_sources();
+               const bool wide_scalar = m5_scalar;
                const bool copied = wide_scalar
                   ? agx3_tex_stage_copy_scalar_m5(
                        base + 2 * c, reg, slot, 0, !(src.discard && last),
@@ -15208,8 +15190,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * live ranges before publishing into those locations. */
             const bool m5_fragment_3d =
                ctx->stage == MESA_SHADER_FRAGMENT &&
-               I->lod_mode == AGX_LOD_MODE_AUTO_LOD &&
-               debug_get_option_m5_fs_3d_banks();
+               I->lod_mode == AGX_LOD_MODE_AUTO_LOD;
             const bool m5_banked_3d =
                enc == AGX_ISA_ENCODING_AGX3C && I->dim == AGX_DIM_3D &&
                !I->shadow && !I->offset && !I->query_lod &&

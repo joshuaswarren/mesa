@@ -16,8 +16,6 @@
 #include "util/u_qsort.h"
 #include "util/u_debug.h"
 
-DEBUG_GET_ONCE_BOOL_OPTION(m5_wide_scalar_sources,
-                           "ASAHI_M5_WIDE_SCALAR_SOURCES", true)
 #include "agx3_copy_core.h"
 #include "agx_builder.h"
 #include "agx_compile.h"
@@ -3479,8 +3477,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          bool wide_scalar = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
             ctx->stage == MESA_SHADER_FRAGMENT &&
             I->op == AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3 &&
-            I->nr_srcs == 3 && !agx_is_null(I->src[2]) &&
-            debug_get_option_m5_wide_scalar_sources();
+            I->nr_srcs == 3 && !agx_is_null(I->src[2]);
          for (unsigned s = 0; s < I->nr_srcs && wide_scalar; ++s)
             wide_scalar &= !agx_is_null(I->src[s]) &&
                            I->src[s].size == AGX_SIZE_32;
