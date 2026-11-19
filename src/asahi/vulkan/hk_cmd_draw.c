@@ -101,11 +101,6 @@
 /* Diagnostic controls, read once: these are consulted per draw or
  * render pass, and an uncached getenv() scans the whole environment. */
 DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
-DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_m5_wclamp,
-                           "ASAHI_MESH_NATIVE_M5_WCLAMP_DIAGNOSTIC", false)
-DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_raster_enable,
-                           "ASAHI_MESH_NATIVE_RASTER_ENABLE_DIAGNOSTIC", false)
-DEBUG_GET_ONCE_BOOL_OPTION(mesh_pp_tail0, "ASAHI_MESH_PP_TAIL0", false)
 
 #define IS_DIRTY(bit) BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_##bit)
 
@@ -8771,10 +8766,7 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
       vs->info.uvs.mesh_primitive_page &&
       vs->info.mesh.primitive_stride_B != 0;
    const struct agx_ppp_w_clamp_cull2_fields w_cull2_fields = {
-      .w_clamp_raw = dev->dev.chip == AGX_CHIP_G17P &&
-                     vs->info.stage == MESA_SHADER_MESH &&
-                     debug_get_option_mesh_native_m5_wclamp()
-                        ? UINT32_C(0x00840002) : 0,
+      .w_clamp_raw = 0,
       /* The generated primitive-ID coefficient needs its rasterizer input
        * enabled as well as the matching VDM producer and output slot. */
       .cull2_raw = UINT32_C(0x80) |
@@ -11642,8 +11634,6 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
             return;
          }
-         const bool native_raster_enabled =
-            debug_get_option_mesh_native_raster_enable();
          struct agx_vdm_mesh_state_info state = {
             
 
@@ -11653,8 +11643,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                              ((hw_vs->info.uvs.size + 1) << 8)
                            : 0x500u|hw_vs->info.uvs.size,
                            dev->dev.chip == AGX_CHIP_G17P
-                              ? (native_raster_enabled && !hk_rast_discard(cmd)
-                                 ? 0x10 : 0x30) |
+                              ? 0x30 |
                                 (hw_vs->info.mesh.primitive_stride_B ? 0x80 : 0)
                               : 0, 0, 0},
             .object_pipeline = object_program,
@@ -11696,8 +11685,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
              * bound) set tail[0]; task kicks with the native record do too,
              * with or without the grid at +0 (the buffer stays bound).
              * Payload-free task kicks without it keep the mesh-only value. */
-            if ((task && hk_m5_task_record(dev->dev.params.features)) ||
-                debug_get_option_mesh_pp_tail0())
+            if (task && hk_m5_task_record(dev->dev.params.features))
                state.raw_tail[0] = 1;
          }
          if (!agx_vdm_mesh_state_pack(dev->dev.chip, &state, out)) {
