@@ -130,11 +130,11 @@ bool agx3_scs_decode_epilogue(enum agx_isa_encoding enc, const uint8_t *bytes,
                               struct agx3_scs_epilogue_desc *out);
 
 /* AGX3b destination-less load, the form every Gen1 leaf program ends with
- * (agx3_rt_gen1_*_ops.h, and the bodies in agx3_rt_gen1_body.c and
- * agx3_rt_gen1_default.c). As on AGX3c, f9=0 and f12=0: there is no
- * destination register and no scoreboard slot, so the access returns nothing
- * to the shader and nothing can wait on it; f28=1 and f80=1 are its fixed
- * controls. Do not lower it through a GPR load.
+ * (agx3_rt_gen1_*_ops.h, and the bodies in agx3_rt_gen1_default.c). As on
+ * AGX3c, f9=0 and f12=0: there is no destination register and no scoreboard
+ * slot, so the access returns nothing to the shader and nothing can wait on
+ * it; f28=1 and f80=1 are its fixed controls. Do not lower it through a GPR
+ * load.
  *
  * The address is a 32-bit GPR base plus a signed byte offset. The leaf
  * programs use that alone (f23=1). With an index (f23=2, f24=1) a 16-bit GPR
