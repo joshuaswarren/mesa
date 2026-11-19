@@ -475,8 +475,7 @@ libagx_trace_rays_select_setup(constant uint64_t *record,
 }
 
 /*
- * Single-kick variant of libagx_trace_rays_select_setup (opt-in
- * ASAHI_M5_RT_SINGLE_KICK on M5). Instead of K indirect dispatches, the host
+ * Single-kick variant of libagx_trace_rays_select_setup, used on M5. Instead of K indirect dispatches, the host
  * records one Stream Link with return into `slot`, and this invocation writes
  * the selected kernel's launch there, as Metal's indirect command buffers do
  * (a GPU-written 40-byte direct launch reached through a barrier and a link).

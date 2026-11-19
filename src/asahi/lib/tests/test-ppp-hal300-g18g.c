@@ -728,11 +728,17 @@ test_closed_forms(void)
    CHECK(!agx_vdm_index_list_indirect_pack_words_unk2(
       AGX_CHIP_G18G, 6, false, false, 0, 0, 0x10000100001, 0, 0, 7, &indirect));
    struct agx_vdm_barrier_core vdm_barrier;
+   /* Apple's word lacks the USC cache invalidate (bit 3) that we add. */
    static const uint8_t apple_vdm_barrier[] = {0x60, 0x09, 0x00, 0x21};
+   static const uint8_t packed_vdm_barrier[] = {0x68, 0x09, 0x00, 0x21};
    CHECK(agx_vdm_barrier_core_pack(AGX_CHIP_G18G, &vdm_barrier));
-   CHECK(vdm_barrier.length == sizeof(apple_vdm_barrier) &&
-         memcmp(vdm_barrier.bytes, apple_vdm_barrier,
-                sizeof(apple_vdm_barrier)) == 0);
+   CHECK(vdm_barrier.length == sizeof(packed_vdm_barrier) &&
+         memcmp(vdm_barrier.bytes, packed_vdm_barrier,
+                sizeof(packed_vdm_barrier)) == 0);
+   CHECK(agx_vdm_barrier_core_unpack(AGX_CHIP_G18G, apple_vdm_barrier,
+                                     sizeof(apple_vdm_barrier)));
+   CHECK(agx_vdm_barrier_core_unpack(AGX_CHIP_G18G, packed_vdm_barrier,
+                                     sizeof(packed_vdm_barrier)));
    CHECK(!agx_vdm_barrier_core_unpack(AGX_CHIP_G18G, apple_vdm_barrier,
                                      sizeof(apple_vdm_barrier) - 1));
    /* Stream links and tessellation still lack G18 evidence. */

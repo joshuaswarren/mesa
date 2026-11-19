@@ -524,7 +524,9 @@ write_storage_image_view_desc(struct hk_descriptor_set *set,
    if (stride >= HK_M5_STORE_WINDOW_OFFSET + HK_M5_STORE_WINDOW_SIZE)
       memcpy(packed + HK_M5_STORE_WINDOW_OFFSET, store_window,
              sizeof(store_window));
-   write_desc(set, binding, elem, packed, stride);
+   /* A descriptor buffer stride (128) exceeds the record; the caller zeroed
+    * the rest (hk_GetDescriptorEXT()). */
+   write_desc(set, binding, elem, packed, MIN2(stride, sizeof(packed)));
 }
 
 static struct hk_buffer_address
@@ -1444,6 +1446,9 @@ hk_GetDescriptorEXT(VkDevice _device,
       .stride = hk_descriptor_buffer_size(&dev->dev, type),
    };
    assert(layout->binding[0].stride <= dataSize);
+   /* The records are smaller than the power-of-two size reported for them,
+    * so give the padding a defined value. */
+   memset(pDescriptor, 0, dataSize);
 
    struct hk_descriptor_set set = {
       .layout = layout,

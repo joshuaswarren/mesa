@@ -367,7 +367,6 @@ if with_tests
       'hk_agx3_ioto_program_core_test',
       files('tests/test-hk-agx3-ioto-program-core.c',
             'hk_agx3_ioto_program_core.c',
-            '../compiler/agx_g18_gates.c',
             '../compiler/agx3_compute_program.c',
             '../compiler/agx3_graphics_program.c',
             '../compiler/agx3_m5_graphics_program.c',
@@ -1011,10 +1010,37 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  hk_vulkan_global_priority = executable(
+    'hk-vulkan-global-priority',
+    files('tests/hk_vulkan_global_priority.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hk_vulkan_sparse_bind_first_submit = executable(
     'hk-vulkan-sparse-bind-first-submit',
     files('tests/hk_vulkan_sparse_bind_first_submit.c'),
     include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  hk_vulkan_descriptor_buffer_sizes = executable(
+    'hk-vulkan-descriptor-buffer-sizes',
+    files('tests/hk_vulkan_descriptor_buffer_sizes.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  hk_vulkan_descriptor_buffer_texel = executable(
+    'hk-vulkan-descriptor-buffer-texel',
+    files('tests/hk_vulkan_descriptor_buffer_texel.c'),
+    include_directories : [inc_include, inc_src],
     dependencies : [cc.find_library('vulkan')],
     c_args : [c_msvc_compat_args],
     gnu_symbol_visibility : 'hidden',

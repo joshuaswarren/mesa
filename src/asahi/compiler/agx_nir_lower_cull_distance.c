@@ -100,8 +100,7 @@ agx_nir_lower_cull_distance_vs(nir_shader *s)
 }
 
 bool
-agx_nir_lower_cull_distance_fs(nir_shader *s, unsigned nr_distances,
-                               bool native_constant_planes)
+agx_nir_lower_cull_distance_fs(nir_shader *s, unsigned nr_distances)
 {
    assert(s->info.stage == MESA_SHADER_FRAGMENT);
    assert(nr_distances > 0);
@@ -129,22 +128,24 @@ agx_nir_lower_cull_distance_fs(nir_shader *s, unsigned nr_distances,
        */
       nir_def *zero = nir_ball(b, nir_feq_imm(b, cf, 0));
 
-      if (native_constant_planes) {
-         /* Native constant planes encode a marker in A, not a derivative.
-          * As in cf_constant_marker() in interpolation lowering, C holds
-          * the constant value when A has a small exponent and nonzero
-          * significand. Comparing the marker with floating zero would
-          * leave an all-negative cull half-space incorrectly visible.
-          */
-         nir_def *a = nir_channel(b, cf, 0);
-         nir_def *small_exponent =
-            nir_ult_imm(b, nir_iand_imm(b, a, 0x7f800000), 0x01000000);
-         nir_def *significand =
-            nir_ine_imm(b, nir_iand_imm(b, a, 0x007fffff), 0);
-         nir_def *constant = nir_iand(b, small_exponent, significand);
-         zero = nir_bcsel(b, constant,
-                          nir_feq_imm(b, nir_channel(b, cf, 2), 0), zero);
-      }
+      /* A constant plane may carry a marker in A instead of a zero
+       * derivative: a nonzero significand with exponent 0 or 1, C holding the
+       * constant (the rule cf_valid() and cf_constant_marker() in
+       * interpolation lowering use). Comparing the marker with floating zero
+       * would leave an all-negative cull half-space visible. The test is exact
+       * whether or not a GPU tags its constant planes: an untagged constant
+       * plane has A == 0 and falls through to the zero test, and a real
+       * derivative of this 0/1 quantity across a primitive inside the
+       * viewport can never be that small. So it is not a per-chip option.
+       */
+      nir_def *a = nir_channel(b, cf, 0);
+      nir_def *small_exponent =
+         nir_ult_imm(b, nir_iand_imm(b, a, 0x7f800000), 0x01000000);
+      nir_def *significand =
+         nir_ine_imm(b, nir_iand_imm(b, a, 0x007fffff), 0);
+      nir_def *constant = nir_iand(b, small_exponent, significand);
+      zero = nir_bcsel(b, constant,
+                       nir_feq_imm(b, nir_channel(b, cf, 2), 0), zero);
 
       culled = nir_ior(b, culled, zero);
    }

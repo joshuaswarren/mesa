@@ -957,37 +957,6 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
             pack_pbe(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
                      &view->planes[p].layered_eot, NULL, NULL);
       }
-      if (agx_native_graphics(&dev->dev) &&
-          image->vk.image_type == VK_IMAGE_TYPE_3D &&
-          image->vk.extent.depth > 2048 &&
-          (view->vk.view_type == VK_IMAGE_VIEW_TYPE_3D ||
-           view->vk.layer_count > 2048) &&
-          debug_get_bool_option("ASAHI_G17P_IMAGE_DESCRIPTOR_DUMP", false)) {
-         const struct ail_layout *ail = &image->planes[view->planes[p].image_plane].layout;
-         fprintf(stderr, "G17P_IMAGE view=%u extent=%u,%u,%u level=%u layers=%u baseLayer=%u format=%u tiling=%u stride=%llu size=%llu pages=%u compressed=%u sampledIndex=%u storageIndex=%u\n",
-                 view->vk.view_type, image->vk.extent.width,
-                 image->vk.extent.height, image->vk.extent.depth,
-                 view->vk.base_mip_level, view->vk.layer_count,
-                 view->vk.base_array_layer, view->vk.format, ail->tiling,
-                 (unsigned long long)ail->layer_stride_B,
-                 (unsigned long long)ail->size_B, ail->page_aligned_layers,
-                 ail->compressed, view->planes[p].sampled_heap_index,
-                 view->planes[p].storage_heap_index);
-         const uint8_t *packets[] = {
-            (const uint8_t *)&view->planes[p].sampled,
-            (const uint8_t *)&view->planes[p].ro_storage,
-            (const uint8_t *)&view->planes[p].storage,
-         };
-         for (unsigned q = 0; q < 3; q++) {
-            fprintf(stderr, "G17P_IMAGE %s=", q == 0 ? "sampled" : q == 1 ? "ro_storage" : "pbe");
-            for (unsigned byte = 0; byte < 32; byte++)
-               fprintf(stderr, "%02x", packets[q][byte]);
-            fprintf(stderr, "\n");
-         }
-         fprintf(stderr, "G17P_IMAGE atomic_sw=%016llx\n",
-                 (unsigned long long)view->planes[p].storage_atomic_sw);
-      }
-
    }
 
    return VK_SUCCESS;

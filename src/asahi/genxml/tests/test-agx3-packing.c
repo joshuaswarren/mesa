@@ -669,7 +669,7 @@ test_agx3_live_vdm_barrier(void)
       uint32_t packed[2] = {UINT32_C(0xdeadbeef), UINT32_C(0xfeedface)};
       uint32_t *end = agx_vdm_barrier(packed, grounded[i]);
       CHECK_EQ((uintptr_t)end - (uintptr_t)packed, sizeof(uint32_t));
-      CHECK_EQ(packed[0], UINT32_C(0x21000960));
+      CHECK_EQ(packed[0], UINT32_C(0x21000968));
       CHECK_EQ(packed[1], UINT32_C(0xfeedface));
    }
 

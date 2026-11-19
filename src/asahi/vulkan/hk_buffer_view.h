@@ -45,8 +45,8 @@ VkResult hk_texel_windows_init(struct hk_device *dev);
 void hk_texel_windows_finish(struct hk_device *dev);
 
 /* Write the AGX_G17P_BUFFER_TEXTURE_DESCRIPTOR_SIZE bytes of a texel buffer
- * descriptor for vkGetDescriptorEXT(); a null or unrepresentable buffer gets
- * the null descriptor. */
+ * descriptor for vkGetDescriptorEXT() into zeroed memory; a null or
+ * unrepresentable buffer gets the null descriptor. */
 void hk_texel_buffer_descriptor(struct hk_device *dev,
                                 const VkDescriptorAddressInfoEXT *info,
                                 bool storage, void *out);

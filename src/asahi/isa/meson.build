@@ -67,6 +67,22 @@ if with_tests
     args : [meson.project_source_root() / 'src/asahi/compiler/test/native/g18g'],
   )
 
+  # The indexed instruction length lookup against testing every form in
+  # order, for every encoding, on random code and the native witness texts.
+  test(
+    'agx_instr_length_index',
+    executable(
+      'agx_instr_length_index_test',
+      files('test/test-instr-length-index.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      include_directories : [inc_include, inc_src],
+      link_with : agx_disasm_libs,
+    ),
+    suite : ['asahi'],
+    args : [meson.project_source_root() / 'src/asahi/compiler/test/native/g18g'],
+  )
+
  test(
     'agx2_python_disasm',
     prog_python,

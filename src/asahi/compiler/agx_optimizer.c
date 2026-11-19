@@ -936,15 +936,14 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
           !def->saturate) {
          const agx_index lo = def->src[0], hi = def->src[1];
          const bool m5_uniform_base =
-            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-            debug_get_bool_option("ASAHI_M5_HIGH_UNIFORM_LOAD", true);
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
 
-         /* G17P scalar W8 and four packed W8 components both return one
-          * physical word, and their native LDDEV reads an aligned base
-          * directly from the low uniform file. */
-         const bool g17p_w8_uniform_base =
+         /* On AGX3B a scalar W8 load and four packed W8 components both
+          * return one physical word, and the LDDEV encoding reads an aligned
+          * base directly from the low uniform file. Both are properties of
+          * the encoding, so this holds on every AGX3B part. */
+         const bool agx3b_w8_uniform_base =
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-            ctx->key->dev.chip == AGX_CHIP_G17P &&
             ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
             ctx->nir && !ctx->nir->info.internal && !ctx->key->secondary &&
             I->format == AGX_FORMAT_I8 && !I->coherent &&
@@ -956,7 +955,7 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
             !lo.kill && !lo.cache && !lo.discard &&
             !hi.kill && !hi.cache && !hi.discard;
 
-         if ((m5_uniform_base || g17p_w8_uniform_base) &&
+         if ((m5_uniform_base || agx3b_w8_uniform_base) &&
              lo.type == AGX_INDEX_UNIFORM && hi.type == AGX_INDEX_UNIFORM &&
              lo.size == AGX_SIZE_32 && hi.size == AGX_SIZE_32 &&
              agx_channels(lo) == 1 && agx_channels(hi) == 1 &&
@@ -1072,7 +1071,6 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
          ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
          I->op == AGX_OPCODE_TEXTURE_LOAD && s == 3 &&
          def->src[0].type == AGX_INDEX_UNIFORM &&
-         debug_get_bool_option("ASAHI_M5_UNIFORM_TEXTURE_OPERANDS", true) &&
          agx_instr_accepts_uniform(ctx->key->dev.encoding, I->op, s,
                                   def->src[0].value, def->src[0].size);
 

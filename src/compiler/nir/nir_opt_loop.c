@@ -409,8 +409,6 @@ should_peel_initial_break(nir_loop *loop)
  * nir_opt_dead_cf() can later remove the outer IF statement, again.
  *
  */
-#include <stdio.h>
-#include <stdlib.h>
 static nir_loop *
 innermost_loop_of_block(nir_block *block)
 {
@@ -482,29 +480,25 @@ opt_loop_peel_initial_break(nir_loop *loop, bool rotate_counted)
       return false;
 
    /* The loop must have exactly one continue block. */
-   if (nir_block_num_preds(header_block) != 2) {
+   if (nir_block_num_preds(header_block) != 2)
       return false;
-   }
 
    nir_cf_node *if_node = nir_cf_node_next(&header_block->cf_node);
-   if (!if_node || if_node->type != nir_cf_node_if) {
+   if (!if_node || if_node->type != nir_cf_node_if)
       return false;
-   }
 
    nir_if *nif = nir_cf_node_as_if(if_node);
    nir_block *last_then = nir_if_last_then_block(nif);
    if (!nir_block_ends_in_break(last_then) ||
        !is_block_empty(nir_if_first_else_block(nif)) ||
-       !nir_is_trivial_loop_if(nif, last_then)) {
+       !nir_is_trivial_loop_if(nif, last_then))
       return false;
-   }
 
    /* If do_work_2() ends in a break or other kind of jump then we can't move
     * it to the top of the loop ahead of do_work_1().
     */
-   if (nir_block_ends_in_jump(nir_loop_last_block(loop))) {
+   if (nir_block_ends_in_jump(nir_loop_last_block(loop)))
       return false;
-   }
 
    if (rotate_counted) {
       if (!rotate_counted_loop_ok(loop, header_block, if_node))

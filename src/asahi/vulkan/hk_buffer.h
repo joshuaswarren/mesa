@@ -28,6 +28,8 @@ struct hk_buffer {
    /** One residency bit per sparse-buffer page on Gen9/Gen10 AGX3. */
    struct agx_bo *sparse_map;
    uint32_t sparse_map_entries;
+   /** Link in hk_device::sparse_buffers while sparse_map is set. */
+   struct list_head sparse_link;
 };
 
 /* VK_EXT_descriptor_buffer capture/replay data of a buffer */
@@ -137,6 +139,13 @@ VkResult hk_bind_scratch(struct hk_device *dev, struct agx_va *va,
                          unsigned offs_B, size_t size_B);
 VkResult hk_bind_unbound_sparse_buffer(struct hk_device *dev,
                                        struct agx_va *va, size_t size_B);
+
+/* The AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET word of a texel view of buffer
+ * with blocksize_B-byte texels, and of a view at address. */
+uint32_t hk_buffer_sparse_texel_word(const struct hk_buffer *buffer,
+                                     unsigned blocksize_B);
+uint32_t hk_sparse_texel_word_at(struct hk_device *dev, uint64_t address,
+                                 unsigned blocksize_B);
 
 /* Publish a bound/unbound sparse buffer range to physical pointer reads. */
 VkResult hk_update_physical_sparse_map(struct hk_device *dev, uint64_t address,

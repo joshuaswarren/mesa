@@ -29,18 +29,10 @@
 #include "hk_build_interface.h"
 
 layout(local_size_x = 8) in;
-#ifdef HK_AGX3_BATCH
-layout(push_constant) uniform CONSTS
-{
-   hk_agx3_batch_args batch;
-};
-hk_agx3_leaf_args args;
-#else
 layout(push_constant) uniform CONSTS
 {
    hk_agx3_leaf_args args;
 };
-#endif
 
 shared vec3 vertices[24];
 shared vec3 lower[8], upper[8];
@@ -222,19 +214,6 @@ void
 main()
 {
    uint id = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
-#ifdef HK_AGX3_BATCH
-   hk_agx3_batch_map mapping = DEREF(INDEX(hk_agx3_batch_map, batch.map, id));
-   if (mapping.build >= batch.job_count)
-      return;
-   hk_agx3_batch_job entry = DEREF(INDEX(hk_agx3_batch_job, batch.jobs, mapping.build));
-   if (DEREF(entry.plan.state).error != 0)
-      return;
-   args.jobs = entry.plan.jobs;
-   args.status = entry.node_status;
-   args.job_count = DEREF(entry.plan.state).job_count;
-   args.slot_bias = entry.plan.m5_aabb_stride;
-   id = mapping.node;
-#endif
    if (id >= args.job_count)
       return;
    hk_agx3_leaf_job job = DEREF(INDEX(hk_agx3_leaf_job, args.jobs, id));
@@ -242,11 +221,8 @@ main()
    bool leaf = job.node_kind == HK_AGX3_NODE_LEAF;
    bool instances = job.node_kind == HK_AGX3_NODE_INSTANCES;
    bool aabbs = job.node_kind == HK_AGX3_NODE_AABBS;
-   /* Bounding-box record stride: 48 (native record class 4) by default; 64
-    * (class 5, one record per slot) is the ASAHI_M5_AABB_RECORD_STRIDE
-    * diagnostic. Both are valid Gen1 encodings; only hardware traversal
-    * distinguishes them. */
-   uint aabb_stride = args.slot_bias == 64u ? 64u : 48u;
+   /* Bounding-box record stride: the 48-byte native record (class 4). */
+   uint aabb_stride = HK_AGX3_M5_AABB_RECORD_B;
    if (count < 1u || count > 8 ||
        job.node_kind > HK_AGX3_NODE_AABBS) {
       if (lane == 0)
@@ -344,7 +320,7 @@ main()
           * single-AABB geometries passed). */
          root[0] =
             uint64_t((instances ? 0xe1u
-                      : aabbs ? ((aabb_stride == 64u ? 0xa0u : 0x80u) | 1u)
+                      : aabbs ? 0x81u
                       : 0xa0u) |
                      (leaf ? capacity << 1 : 0u) | (exponent.x << 8));
          for (uint a = 0; a < 3; ++a)
@@ -401,7 +377,7 @@ main()
    if (instances && lane < count)
       encode_instance(job, lane);
    if (aabbs && lane < count) {
-      /* 48-byte native bounding-box record at the selected record stride. */
+      /* 48-byte native bounding-box record (HK_AGX3_M5_AABB_RECORD_B). */
       uint64_t record = children + uint64_t(lane) * uint64_t(aabb_stride);
       store32(record, 0x18u);
       for (uint a = 0; a < 3; ++a) {

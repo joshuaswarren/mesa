@@ -1308,11 +1308,19 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
       hk_queue_restart_sync(queue);
    }
 
+   /* For an elevated class the kernel answers EACCES/EPERM when the caller
+    * lacks CAP_SYS_NICE or DRM master, and EINVAL when the GPU backend does
+    * not schedule that class. Both are a refused global priority, which
+    * Vulkan reports as VK_ERROR_NOT_PERMITTED; the application can fall back
+    * to MEDIUM. */
    const int error = errno;
+   const bool elevated =
+      queue->drm.virt_ring_idx - 1 > DRM_ASAHI_PRIORITY_MEDIUM;
    const VkResult result =
       error == ENOMEM ? VK_ERROR_OUT_OF_HOST_MEMORY :
       (error == ENOSPC || error == EBUSY) ? VK_ERROR_OUT_OF_DEVICE_MEMORY :
-      (error == EPERM || error == EACCES) ? VK_ERROR_NOT_PERMITTED_EXT :
+      (error == EPERM || error == EACCES) ? VK_ERROR_NOT_PERMITTED_KHR :
+      (elevated && error == EINVAL) ? VK_ERROR_NOT_PERMITTED_KHR :
       VK_ERROR_INITIALIZATION_FAILED;
    return vk_errorf(dev, result, "DRM_IOCTL_ASAHI_QUEUE_CREATE failed: %s",
                     strerror(error));
@@ -1728,13 +1736,12 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    /* Now setup the command structs */
    struct util_dynarray payload = UTIL_DYNARRAY_INIT;
 
-   /* A small G16S submit otherwise grows the heap allocation once for its
+   /* A small submit otherwise grows the heap allocation once for its
     * header and again for the command. Keep those payloads on the stack;
     * util_dynarray moves to the heap if attachments or more commands need
     * additional space. The ioctl consumes the payload before we return.
     */
-   if (agx_is_m4_pro(&dev->dev))
-      util_dynarray_init_from_stack(&payload, alloca(1024), 1024);
+   util_dynarray_init_from_stack(&payload, alloca(1024), 1024);
 
    unsigned nr_vdm = 0, nr_cdm = 0;
 
@@ -2450,26 +2457,29 @@ hk_queue_create(struct hk_device *dev,
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
-   /* On M5, quantize relative priorities to the two unprivileged firmware
-    * classes. An explicit global class takes precedence; the kernel checks
-    * permission for elevated classes. No scheduling work is needed during
-    * submission. Elsewhere high-priority scheduling still needs kernel
-    * qualification.
+   /* The kernel reserves REALTIME on every GPU, so refuse it up front. HIGH
+    * goes to the kernel on every chip: whether the GPU backend schedules it
+    * and whether the caller may use it (CAP_SYS_NICE or DRM master) are the
+    * kernel's decisions, and hk_queue_ensure_drm reports a refusal as
+    * VK_ERROR_NOT_PERMITTED.
     */
    enum drm_asahi_priority drm_priority = translate_priority(priority);
    if (drm_priority == DRM_ASAHI_PRIORITY_REALTIME) {
       vk_free(&dev->vk.alloc, queue);
-      return VK_ERROR_NOT_PERMITTED_EXT;
+      return VK_ERROR_NOT_PERMITTED_KHR;
    }
 
-   if (agx_chip_g17_m5(dev->dev.chip)) {
-      if (!priority_info &&
-          pCreateInfo->pQueuePriorities[index_in_family] < 0.5f)
-         drm_priority = DRM_ASAHI_PRIORITY_LOW;
-   } else if (drm_priority >= DRM_ASAHI_PRIORITY_HIGH) {
-      vk_free(&dev->vk.alloc, queue);
-      return VK_ERROR_NOT_PERMITTED_EXT;
-   }
+   /* On M5, quantize relative priorities to the two unprivileged classes.
+    * M5 only: there the Vulkan queues of one priority class share a kernel
+    * queue (hk_queue_share), so the class is the only scheduling distinction
+    * left between them; this mapping was qualified with the M5 snapshot.
+    * Elsewhere each VkQueue owns its kernel queue and relative priorities
+    * stay a hint, as the spec allows. An explicit global class takes
+    * precedence. No scheduling work is needed during submission.
+    */
+   if (agx_chip_g17_m5(dev->dev.chip) && !priority_info &&
+       pCreateInfo->pQueuePriorities[index_in_family] < 0.5f)
+      drm_priority = DRM_ASAHI_PRIORITY_LOW;
 
    result = vk_queue_init(&queue->vk, &dev->vk, pCreateInfo, index_in_family);
    if (result != VK_SUCCESS) {
@@ -2484,8 +2494,8 @@ hk_queue_create(struct hk_device *dev,
       list_delinit(&queue->vk.link);
 
    queue->vk.driver_submit = hk_queue_submit;
-   queue->sync.precise_tile_evictions = agx_is_m4_pro(&dev->dev);
-   queue->sync.direct_single_footprints = agx_is_m4_pro(&dev->dev);
+   queue->sync.precise_tile_evictions = true;
+   queue->sync.direct_single_footprints = true;
    queue->sync.serialize = dev->dev.params.gpu_generation >= 13 &&
                            dev->dev.params.gpu_generation <= 14;
    /* A serialized queue orders every command after both engines' complete
@@ -2510,11 +2520,15 @@ hk_queue_create(struct hk_device *dev,
        queue->sync.exact_prior &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)) {
-      /* The M4 Pro runs two compute kicks of one context at once. */
+      /* G17P firmware runs compute kicks of one context from sibling
+       * kernel queues at once, so independent compute streams overlap.
+       * Measured on both G17P parts we have, with the in-flight and
+       * thread-count gates below: M4 Pro ALU d4/d16 -3.7/-3.1 %, A18 Pro
+       * bandwidth d4/d16 -25/-13 %, neither loses at depth 2 or with
+       * several processes. */
       queue->sib.count = CLAMP(
-         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES",
-                              agx_is_m4_pro(&dev->dev) ? 3 : 1),
-         1, HK_QUEUE_SIBLINGS_MAX);
+         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES", 3), 1,
+         HK_QUEUE_SIBLINGS_MAX);
       queue->sib.min_in_flight =
          debug_get_num_option("ASAHI_G17P_SIBLING_MIN_IN_FLIGHT", 2);
       queue->sib.min_threads =

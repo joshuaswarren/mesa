@@ -400,170 +400,15 @@ hk_CreateCommandPool(VkDevice _device,
       pool->num_free_spans[type] = 0;
    }
 
-   for (unsigned i = 0; i < 2; ++i) {
-      list_inithead(&pool->free_gen1_as_chunks[i]);
-      pool->num_free_gen1_as_chunks[i] = 0;
-   }
-
    *pCmdPool = hk_cmd_pool_to_handle(pool);
 
    return VK_SUCCESS;
 }
 
 static void
-hk_cmd_pool_destroy_gen1_as_chunk(struct hk_device *dev,
-                                  struct hk_gen1_as_table_chunk *chunk)
-{
-   agx_va_free(&dev->dev, chunk->va, true);
-   agx_bo_unreference(&dev->dev, chunk->tail);
-   agx_bo_unreference(&dev->dev, chunk->bank);
-   vk_free(&dev->vk.alloc, chunk);
-}
-
-static struct hk_gen1_as_table_chunk *
-hk_device_take_gen1_as_chunk(struct hk_device *dev, uint32_t kind)
-{
-   struct hk_gen1_as_table_chunk *chunk = NULL;
-   simple_mtx_lock(&dev->gen1_as_chunk_cache_lock);
-   if (!list_is_empty(&dev->gen1_as_free_chunks[kind])) {
-      chunk = list_first_entry(&dev->gen1_as_free_chunks[kind],
-                               struct hk_gen1_as_table_chunk, link);
-      list_del(&chunk->link);
-      --dev->gen1_as_free_chunk_count[kind];
-   }
-   simple_mtx_unlock(&dev->gen1_as_chunk_cache_lock);
-   return chunk;
-}
-
-static void
-hk_device_cache_gen1_as_chunk(struct hk_device *dev,
-                               struct hk_gen1_as_table_chunk *chunk)
-{
-   const uint32_t kind = chunk->count == 1 ? 0 : 1;
-   bool saved = false;
-   simple_mtx_lock(&dev->gen1_as_chunk_cache_lock);
-   if (dev->gen1_as_free_chunk_count[kind] == 0) {
-      chunk->next = 0;
-      list_addtail(&chunk->link, &dev->gen1_as_free_chunks[kind]);
-      ++dev->gen1_as_free_chunk_count[kind];
-      saved = true;
-   }
-   simple_mtx_unlock(&dev->gen1_as_chunk_cache_lock);
-   if (!saved)
-      hk_cmd_pool_destroy_gen1_as_chunk(dev, chunk);
-}
-
-void
-hk_device_finish_gen1_as_chunks(struct hk_device *dev)
-{
-   if (!dev->gen1_as_chunk_cache_lock_ready)
-      return;
-   for (unsigned kind = 0; kind < 2; ++kind) {
-      struct hk_gen1_as_table_chunk *chunk;
-      while ((chunk = hk_device_take_gen1_as_chunk(dev, kind)))
-         hk_cmd_pool_destroy_gen1_as_chunk(dev, chunk);
-   }
-   simple_mtx_destroy(&dev->gen1_as_chunk_cache_lock);
-   dev->gen1_as_chunk_cache_lock_ready = false;
-}
-
-VkResult
-hk_cmd_pool_alloc_gen1_as_chunk(struct hk_cmd_pool *pool, uint32_t count,
-                               struct hk_gen1_as_table_chunk **out)
-{
-   struct hk_device *dev = hk_cmd_pool_device(pool);
-   const uint32_t kind = count == 1 ? 0 : 1;
-   assert(count == 1 || count == 4);
-   if (!list_is_empty(&pool->free_gen1_as_chunks[kind])) {
-      struct hk_gen1_as_table_chunk *chunk =
-         list_first_entry(&pool->free_gen1_as_chunks[kind],
-                          struct hk_gen1_as_table_chunk, link);
-      list_del(&chunk->link);
-      --pool->num_free_gen1_as_chunks[kind];
-      chunk->next = 0;
-      *out = chunk;
-      return VK_SUCCESS;
-   }
-   struct hk_gen1_as_table_chunk *chunk =
-      hk_device_take_gen1_as_chunk(dev, kind);
-   if (chunk) {
-      chunk->next = 0;
-      *out = chunk;
-      return VK_SUCCESS;
-   }
-   chunk = vk_zalloc(&dev->vk.alloc, sizeof(*chunk), 8,
-                 VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
-   if (!chunk)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   const uint32_t prefix = HK_GEN1_AS_TABLE_AS_SLOTS * HK_GEN1_AS_TABLE_ENTRY_BYTES;
-   const uint32_t tail = HK_GEN1_RQ_PHYSICAL_SLOTS * HK_GEN1_AS_TABLE_ENTRY_BYTES;
-   chunk->count = count;
-   chunk->bank = dev->gen1_as_query_bank;
-   agx_bo_reference(chunk->bank);
-   chunk->tail = agx_bo_create(&dev->dev, count * tail, 16384,
-                               0, "Gen1 cached query table tails");
-   chunk->va = agx_va_alloc(&dev->dev, count * HK_GEN1_AS_TABLE_BYTES,
-                            16384, 0, 0);
-   if (!chunk->tail || !chunk->va || !agx_bo_map(chunk->tail) ||
-       agx_va_overlaps_runtime_graph_hole(dev->dev.chip, chunk->va->addr,
-                                         count * HK_GEN1_AS_TABLE_BYTES)) {
-      agx_va_free(&dev->dev, chunk->va, false);
-      agx_bo_unreference(&dev->dev, chunk->tail);
-      agx_bo_unreference(&dev->dev, chunk->bank);
-      vk_free(&dev->vk.alloc, chunk);
-      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   }
-   struct drm_asahi_gem_bind_op ops[8];
-   for (uint32_t i = 0; i < count; ++i) {
-      const uint64_t address = chunk->va->addr + i * HK_GEN1_AS_TABLE_BYTES;
-      ops[2 * i] = (struct drm_asahi_gem_bind_op) {
-         .flags = DRM_ASAHI_BIND_READ,
-         .handle = chunk->bank->uapi_handle,
-         .addr = address, .range = prefix,
-      };
-      ops[2 * i + 1] = (struct drm_asahi_gem_bind_op) {
-         .flags = DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE,
-         .handle = chunk->tail->uapi_handle,
-         .addr = address + prefix, .range = tail, .offset = i * tail,
-      };
-   }
-   if (dev->dev.ops.bo_bind(&dev->dev, ops, 2 * count)) {
-      hk_cmd_pool_destroy_gen1_as_chunk(hk_cmd_pool_device(pool), chunk);
-      return VK_ERROR_UNKNOWN;
-   }
-   *out = chunk;
-   return VK_SUCCESS;
-}
-
-void
-hk_cmd_pool_free_gen1_as_chunks(struct hk_cmd_pool *pool,
-                               struct list_head *chunks)
-{
-   list_for_each_entry_safe(struct hk_gen1_as_table_chunk, chunk, chunks, link) {
-      list_del(&chunk->link);
-      const uint32_t kind = chunk->count == 1 ? 0 : 1;
-      if (pool->num_free_gen1_as_chunks[kind] == 4) {
-         hk_cmd_pool_destroy_gen1_as_chunk(hk_cmd_pool_device(pool), chunk);
-      } else {
-         chunk->next = 0;
-         list_addtail(&chunk->link, &pool->free_gen1_as_chunks[kind]);
-         ++pool->num_free_gen1_as_chunks[kind];
-      }
-   }
-}
-
-static void
 hk_cmd_pool_destroy_bos(struct hk_cmd_pool *pool)
 {
    struct hk_device *dev = hk_cmd_pool_device(pool);
-   for (unsigned kind = 0; kind < 2; ++kind) {
-      list_for_each_entry_safe(struct hk_gen1_as_table_chunk, chunk,
-                               &pool->free_gen1_as_chunks[kind], link) {
-         list_del(&chunk->link);
-         hk_device_cache_gen1_as_chunk(dev, chunk);
-      }
-      pool->num_free_gen1_as_chunks[kind] = 0;
-   }
    for (enum hk_cmd_bo_type type = 0; type < HK_CMD_BO_TYPE_COUNT; ++type) {
       list_for_each_entry_safe(struct hk_cmd_bo, bo, &pool->free_bos[type],
                                link)
@@ -741,11 +586,6 @@ hk_cmd_collect_pins(const struct vk_queue_submit *submit,
 
       util_dynarray_foreach(&cmd->large_bos, struct agx_bo *, bo)
          hk_cmd_add_pin(pins, &count, HK_PIN_LARGE, *bo);
-
-      /* Native M5 only so far. The separate G17P AS-table allocator needs
-       * its own ownership pin before enabling it there.
-       */
-      assert(list_is_empty(&cmd->gen1_as_table_chunks));
    }
 
    return count;

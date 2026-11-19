@@ -17,18 +17,10 @@
 #include "hk_build_interface.h"
 
 layout(local_size_x = 64) in;
-#ifdef HK_AGX3_BATCH
-layout(push_constant) uniform CONSTS
-{
-   hk_agx3_batch_args batch;
-};
-hk_agx3_envelope_args args;
-#else
 layout(push_constant) uniform CONSTS
 {
    hk_agx3_envelope_args args;
 };
-#endif
 
 void
 store32(uint64_t address, uint value)
@@ -136,17 +128,6 @@ void
 main()
 {
    uint id = gl_GlobalInvocationID.x;
-#ifdef HK_AGX3_BATCH
-   if (id >= batch.job_count)
-      return;
-   hk_agx3_batch_job entry = DEREF(INDEX(hk_agx3_batch_job, batch.jobs, id));
-   args.jobs = entry.plan.envelope;
-   args.status = entry.envelope_status;
-   args.job_count = 1;
-   args.reserved = 0;
-   args.metadata = 0ul;
-   id = 0;
-#endif
    if (id >= args.job_count)
       return;
    hk_agx3_envelope_job job = DEREF(INDEX(hk_agx3_envelope_job, args.jobs, id));

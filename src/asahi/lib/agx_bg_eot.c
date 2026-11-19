@@ -8,7 +8,6 @@
 #include "util/simple_mtx.h"
 #include "util/u_debug.h"
 #include "agx_compile.h"
-#include "agx_debug.h"
 #include "agx3_code_container_core.h"
 #include "agx3_tile_core.h"
 #include "agx_device.h"
@@ -25,7 +24,7 @@
 #include <inttypes.h>
 #include <stdlib.h>
 
-/* msaa163 (AGX_G18_MSAA4, default off): a G18G four-sample tile. Its
+/* msaa163: a G18G two- or four-sample tile. Its
  * background stores through the SR39 register mask and its end-of-tile program
  * resolves through the ordinary 2D store (MSAA notes P4/P5). */
 static bool
@@ -33,8 +32,7 @@ agx_g18_msaa4_tib(const struct agx_device *dev,
                   const struct agx_tilebuffer_layout *tib)
 {
    return dev->chip == AGX_CHIP_G18G &&
-          (tib->nr_samples == 2 || tib->nr_samples == 4) &&
-          agx_g18_msaa4_enabled();
+          (tib->nr_samples == 2 || tib->nr_samples == 4);
 }
 
 static bool
@@ -414,7 +412,7 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
          !agx_g18_msaa4_tib(cache->dev, &key->tib),
       .fs.background = true,
       /* Native multisample backgrounds store through the coverage register,
-       * and so do G18G four-sample ones under AGX_G18_MSAA4 (msaa163). */
+       * and so do G18G four-sample ones (msaa163). */
       .fs.nr_samples =
          agx_chip_native_agx3(cache->dev->chip) ||
                agx_chip_g17_m5(cache->dev->chip) ||
@@ -514,21 +512,6 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
       b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0 + rt);
    }
 
-   /* Bring-up diagnostic for the G18 4x render hang (a 4x render with no draw
-    * stalls the 3D stage): replace the G18 4x clear-only background with an
-    * empty one. Reload backgrounds keep their program (their descriptor ABI is
-    * checked). Off by default; the image is wrong when set. */
-   bool reload = false;
-   for (unsigned rt = 0; rt < ARRAY_SIZE(key->op); ++rt)
-      reload |= key->op[rt] == AGX_BG_LOAD;
-   if (!reload && agx_g18_msaa4_tib(cache->dev, &key->tib) &&
-       debug_get_bool_option("AGX_G18_MSAA4_EMPTY_BG", false)) {
-      ralloc_free(b.shader);
-      b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, &agx_nir_options,
-                                         "agx_background_empty");
-      mesa_logw("asahi: G18 4x background replaced by an empty one (diagnostic)");
-   }
-
    return agx_compile_bg_eot_shader(cache, b.shader, &compiler_key, &key->tib);
 }
 
@@ -541,8 +524,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
                               ? agx_g18g_word_mrt_mask(&key->tib) |
                                    agx_g18g_raw32_mrt_mask(&key->tib) |
                                    agx_g18g_ms_mrt_mask(&key->tib) |
-                                   agx_g18g_mixed_mrt_mask(&key->tib) |
-                                   agx_g18g_mixed_compact_mrt_mask(&key->tib)
+                                   agx_g18g_native_mixed_mask(&key->tib)
                                  : 0;
    /* msaa163: G18G's four-sample tile is resolved at end of tile into the
     * single-sample PBE target, the shape Apple's G18 4x render uses: its
@@ -553,20 +535,6 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
    const bool g18_msaa = agx_g18_msaa4_tib(cache->dev, &key->tib);
    const bool g18_resolve =
       g18_msaa && !key->multisample_store;
-   /* Bring-up diagnostic for the G18 4x render hang: an end-of-tile program
-    * that stores nothing. It is compiled without g17g_rt0_eot, which would
-    * otherwise substitute Apple's native store text. Off by default. */
-   if (g18_resolve && debug_get_bool_option("AGX_G18_MSAA4_EMPTY_EOT", false)) {
-      nir_builder e = nir_builder_init_simple_shader(
-         MESA_SHADER_COMPUTE, &agx_nir_options, "agx_eot_empty");
-      struct agx_shader_key empty_key = {
-         .dev = agx_gather_device_key(cache->dev),
-         .reserved_preamble = key->reserved_preamble,
-         .no_preamble = true,
-      };
-      mesa_logw("asahi: G18 4x end-of-tile replaced by an empty one (diagnostic)");
-      return agx_compile_bg_eot_shader(cache, e.shader, &empty_key, NULL);
-   }
    if (g18g) {
       /* The compiler substitutes Apple's 78-byte native text for the G17G RT0
        * store, and it has that text for a U8NORM imageblock only, so the gate

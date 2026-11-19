@@ -143,6 +143,15 @@ struct hk_device {
    bool may_alias_memory;
    /* One bit per main-heap page: only unbound sparse buffer pages are set. */
    struct agx_bo *physical_sparse_map;
+   /* The buffers with a residency map (hk_buffer::sparse_map), for texel
+    * buffer descriptors that name only an address (VK_EXT_descriptor_buffer,
+    * hk_sparse_texel_word_at()). */
+   struct {
+      simple_mtx_t lock;
+      struct list_head list;
+      /* Entries in list, read without the lock */
+      uint32_t count;
+   } sparse_buffers;
    /* The zeroed page every unbound sparse page maps, read-write (the
     * read-only shadow maps the zero page). It is no write sink of the
     * driver's, unlike the scratch page, so it stays zero for strict
@@ -193,15 +202,9 @@ struct hk_device {
    struct hk_gen1_sparse_table gen1_vertex_directory_pages;
    struct agx_bo *gen1_as_metadata;
    struct agx_bo *gen1_as_addresses;
-   struct agx_bo *gen1_as_query_bank;
    struct agx_bo *gen1_as_window_roots;
    struct util_dynarray gen1_as_windows; /* struct hk_gen1_as_window */
    uint32_t gen1_as_window_hint;
-   bool gen1_rq_live_as_table;
-   bool gen1_as_chunk_cache_lock_ready;
-   simple_mtx_t gen1_as_chunk_cache_lock;
-   struct list_head gen1_as_free_chunks[2];
-   uint32_t gen1_as_free_chunk_count[2];
    struct agx_bo *gen1_rq_code, *gen1_rq_ift;
    /* Immutable generated user image, shared by all query launches. */
    struct agx_bo *gen1_rq_state;
@@ -331,10 +334,9 @@ struct hk_device {
     * runtime grid can reach the main record is for this program to publish
     * the six-u32 geometry block.  Compiled once, from NIR, through the same
     * path as any other Honeykrisp compute shader, so it uses the driver's own
-    * proven root/uniform ABI rather than a replayed one.  NULL on every other
-    * chip, and NULL on G17P if the backend refused it -- in which case
-    * indirect dispatch stays refused instead of launching a program that does
-    * not exist. */
+    * proven root/uniform ABI rather than a replayed one.  NULL on chips
+    * without native indirect compute; on those that have it, device creation
+    * fails if it does not compile. */
    struct hk_api_shader *g17p_grid_helper;
 
    /* The same contract for an indirect-local grid, which an earlier kernel
@@ -386,6 +388,11 @@ enum hk_perftest {
    HK_PERF_NOBARRIER = BITFIELD_BIT(2),
    HK_PERF_NOBATCH = BITFIELD_BIT(3),
    HK_PERF_NOROBUST = BITFIELD_BIT(4),
+   /* Keep only the preceding launch's weak ordering barrier at pure
+    * compute/transfer pipeline barriers in the same CDM stream instead of
+    * upgrading it to a strong cache flush, when memory is unaliased and no
+    * host or pending graphics transfer dependency is involved. */
+   HK_PERF_WEAKBARRIER = BITFIELD_BIT(5),
 };
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)

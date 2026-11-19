@@ -44,6 +44,7 @@
 #include "vk_debug_utils.h"
 #include "vk_device.h"
 #include "vk_drm_syncobj.h"
+#include "vk_enum_to_str.h"
 #include "vk_pipeline_cache.h"
 #include "vk_shader.h"
 
@@ -94,6 +95,7 @@ static const struct debug_named_value hk_perf_options[] = {
    {"nobarrier", HK_PERF_NOBARRIER,"Ignore pipeline barriers"},
    {"nobatch",   HK_PERF_NOBATCH,  "Disable submission batching"},
    {"norobust",  HK_PERF_NOROBUST, "Disable robustness"},
+   {"weakbarrier", HK_PERF_WEAKBARRIER, "Keep ordering-only barriers between compute dispatches"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -767,10 +769,11 @@ hk_g17p_grid_helper_resident(nir_builder *b, nir_def *root, nir_def *grid_addr)
  * say how many threads it launches, and an idempotent kernel is correct for
  * any answer.
  */
-static struct hk_api_shader *
+static VkResult
 hk_build_g17p_grid_helper(struct hk_device *dev,
                           const VkAllocationCallbacks *pAllocator,
-                          bool copy_geometry, bool sparse)
+                          bool copy_geometry, bool sparse,
+                          struct hk_api_shader **helper)
 {
    assert(!(copy_geometry && sparse));
 
@@ -837,49 +840,68 @@ hk_build_g17p_grid_helper(struct hk_device *dev,
       .robustness = &vk_robustness_disabled,
       .stage = MESA_SHADER_COMPUTE,
    };
-   struct hk_api_shader *helper = NULL;
-   hk_compile_shader(dev, &info, NULL, NULL, pAllocator, &helper);
-   return helper;
+   return hk_compile_shader(dev, &info, NULL, NULL, pAllocator, helper);
 }
 
 static void
+hk_destroy_g17p_grid_helpers(struct hk_device *dev,
+                             const VkAllocationCallbacks *pAllocator)
+{
+   struct hk_api_shader **helpers[] = {
+      &dev->g17p_grid_helper,
+      &dev->g17p_geometry_copy_helper,
+      &dev->g17p_grid_helper_sparse,
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(helpers); ++i) {
+      if (*helpers[i]) {
+         hk_api_shader_destroy(&dev->vk, &(*helpers[i])->vk, pAllocator);
+         *helpers[i] = NULL;
+      }
+   }
+}
+
+/* The helpers are internal shaders built from fixed NIR, like the empty
+ * fragment shader: a failure to compile one is a driver bug or an allocation
+ * failure, never a property of the application, so it fails device creation
+ * instead of leaving a device that refuses every indirect dispatch at record
+ * time. */
+static VkResult
 hk_init_g17p_grid_helper(struct hk_device *dev,
                          const VkAllocationCallbacks *pAllocator)
 {
    if (!agx_chip_native_indirect_compute(dev->dev.chip))
-      return;
+      return VK_SUCCESS;
 
-   dev->g17p_grid_helper =
-      hk_build_g17p_grid_helper(dev, pAllocator, false, false);
-   dev->g17p_geometry_copy_helper =
-      hk_build_g17p_grid_helper(dev, pAllocator, true, false);
-
-   /* A refusal is not fatal: it costs indirect dispatch, not the device. */
-   if (!dev->g17p_grid_helper || !dev->g17p_geometry_copy_helper)
-      mesa_logw("G17P indirect compute unavailable: grid helper refused");
+   VkResult result = hk_build_g17p_grid_helper(dev, pAllocator, false, false,
+                                               &dev->g17p_grid_helper);
+   if (result == VK_SUCCESS)
+      result = hk_build_g17p_grid_helper(dev, pAllocator, true, false,
+                                         &dev->g17p_geometry_copy_helper);
 
    /* Only a sparse residency buffer can carry a residency bitmap, so only a
     * device that enabled the feature can ever select this helper; skip
     * compiling it otherwise. */
-   if (!dev->vk.enabled_features.sparseResidencyBuffer)
-      return;
+   if (result == VK_SUCCESS && dev->vk.enabled_features.sparseResidencyBuffer)
+      result = hk_build_g17p_grid_helper(dev, pAllocator, false, true,
+                                         &dev->g17p_grid_helper_sparse);
 
-   dev->g17p_grid_helper_sparse =
-      hk_build_g17p_grid_helper(dev, pAllocator, false, true);
-   if (!dev->g17p_grid_helper_sparse)
-      mesa_logw("G17P sparse indirect compute unavailable: helper refused");
-}
+   if (result == VK_SUCCESS)
+      return VK_SUCCESS;
 
-/* Direct stderr provenance is diagnostic-only: some initialization helpers
- * return an error without passing through Vulkan's debug logger. */
-static void
-hk_device_init_diag(const void *pdev, const void *dev, const char *stage,
-                    VkResult result, int error)
-{
-   const int saved_errno = errno;
-   fprintf(stderr, "M5_DEVICE_INIT pid=%ld pdev=%p dev=%p stage=%s result=%d errno=%d\n",
-           (long)getpid(), pdev, dev, stage, (int)result, error);
-   errno = saved_errno;
+   hk_destroy_g17p_grid_helpers(dev, pAllocator);
+
+   /* Running out of memory is reported as such. Any other compiler result
+    * (FEATURE_NOT_PRESENT, UNKNOWN) describes the helper, not anything the
+    * application asked for, and is not a vkCreateDevice result an
+    * application can act on. */
+   if (result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+       result == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+      return result;
+
+   return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                    "G17P indirect grid helper failed to compile: %s",
+                    vk_Result_to_str(result));
 }
 
 /* Whether memory can be mapped at a second GPU virtual address at any time
@@ -937,26 +959,12 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
    VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
    struct hk_device *dev;
-   const bool init_diag =
-      debug_get_bool_option("ASAHI_M5_DEVICE_INIT_DIAG", false);
-   if (init_diag)
-      hk_device_init_diag(pdev, NULL, "enter", VK_SUCCESS, 0);
-
-#define HK_INIT_FAIL(label, stage, error) do { \
-   if (init_diag) \
-      hk_device_init_diag(pdev, dev, stage, result, error); \
-   goto label; \
-} while (0)
    struct hk_instance *instance = (struct hk_instance *)pdev->vk.instance;
 
    dev = vk_zalloc2(&instance->vk.alloc, pAllocator, sizeof(*dev), 8,
                     VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
-   if (!dev) {
-      if (init_diag)
-         hk_device_init_diag(pdev, NULL, "allocate-device",
-                             VK_ERROR_OUT_OF_HOST_MEMORY, 0);
+   if (!dev)
       return vk_error(pdev, VK_ERROR_OUT_OF_HOST_MEMORY);
-   }
 
    struct vk_device_dispatch_table dispatch_table;
 
@@ -986,7 +994,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    result = vk_device_init(&dev->vk, &pdev->vk, &dispatch_table, pCreateInfo,
                            pAllocator);
    if (result != VK_SUCCESS)
-      HK_INIT_FAIL(fail_alloc, "vk-device-init", 0);
+      goto fail_alloc;
 
    dev->vk.shader_ops = &hk_device_shader_ops;
    dev->vk.command_dispatch_table = &dev->cmd_dispatch;
@@ -997,17 +1005,16 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (ret != 0) {
       result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                          "Failed to get DRM device: %m");
-      HK_INIT_FAIL(fail_init, "drm-device-query", 0);
+      goto fail_init;
    }
 
    const char *path = drm_device->nodes[DRM_NODE_RENDER];
    dev->dev.fd = open(path, O_RDWR | O_CLOEXEC);
    if (dev->dev.fd < 0) {
-      const int open_error = errno;
       result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                          "failed to open device %s", path);
       drmFreeDevice(&drm_device);
-      HK_INIT_FAIL(fail_init, "open-render-node", open_error);
+      goto fail_init;
    }
 
    dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
@@ -1038,7 +1045,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (!succ) {
       result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                          "Failed to get DRM device: %m");
-      HK_INIT_FAIL(fail_fd, "agx-open-device", 0);
+      goto fail_fd;
    }
 
    vk_device_set_drm_fd(&dev->vk, dev->dev.fd);
@@ -1069,12 +1076,12 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
          "Physical sparse buffer page map");
       if (!dev->physical_sparse_map || !agx_bo_map(dev->physical_sparse_map)) {
          result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         HK_INIT_FAIL(fail_dev, "sparse-map-allocation", 0);
+         goto fail_dev;
       }
       memset(agx_bo_map(dev->physical_sparse_map), 0, bytes);
       if (agx_bo_sync_for_device(dev->physical_sparse_map, 0, bytes)) {
          result = vk_error(dev, VK_ERROR_DEVICE_LOST);
-         HK_INIT_FAIL(fail_dev, "sparse-map-sync", 0);
+         goto fail_dev;
       }
    }
 
@@ -1086,18 +1093,18 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
                                        "Sparse fill page");
       if (!dev->sparse_fill || !agx_bo_map(dev->sparse_fill)) {
          result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         HK_INIT_FAIL(fail_dev, "sparse-fill", 0);
+         goto fail_dev;
       }
       memset(agx_bo_map(dev->sparse_fill), 0, AIL_PAGESIZE);
       if (agx_bo_sync_for_device(dev->sparse_fill, 0, AIL_PAGESIZE)) {
          result = vk_error(dev, VK_ERROR_DEVICE_LOST);
-         HK_INIT_FAIL(fail_dev, "sparse-fill-sync", 0);
+         goto fail_dev;
       }
    }
 
    result = hk_init_sampler_heap(dev, &dev->samplers);
    if (result != VK_SUCCESS)
-      HK_INIT_FAIL(fail_dev, "sampler-heap", 0);
+      goto fail_dev;
 
    if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
        dev->dev.chip == AGX_CHIP_G18G) {
@@ -1107,7 +1114,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
                                         HK_DESCRIPTOR_TABLE_CHUNK_B / 32,
                                         HK_MAX_DESCRIPTORS);
       if (result != VK_SUCCESS)
-         HK_INIT_FAIL(fail_samplers, "sampled-image-table", 0);
+         goto fail_samplers;
 
       struct hk_native_texture_descriptor null_texture;
       hk_set_null_native_texture(agx_chip_descriptor_generation(dev->dev.chip),
@@ -1116,7 +1123,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       result = hk_descriptor_table_add(dev, &dev->sampled_images,
                                        &null_texture, 32, &null_index);
       if (result != VK_SUCCESS)
-         HK_INIT_FAIL(fail_sampled_images, "null-texture-descriptor", 0);
+         goto fail_sampled_images;
       assert(null_index == 0);
 
       /* Reserved right after the null texture, so their indices are the
@@ -1124,7 +1131,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       if (dev->vk.enabled_features.descriptorBuffer) {
          result = hk_texel_windows_init(dev);
          if (result != VK_SUCCESS)
-            HK_INIT_FAIL(fail_sampled_images, "texel-buffer-windows", 0);
+            goto fail_sampled_images;
       }
    }
 
@@ -1132,17 +1139,17 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       dev, &dev->occlusion_queries, sizeof(uint64_t), AGX_MAX_OCCLUSION_QUERIES,
       AGX_MAX_OCCLUSION_QUERIES);
    if (result != VK_SUCCESS)
-      HK_INIT_FAIL(fail_sampled_images, "occlusion-query-table", 0);
+      goto fail_sampled_images;
 
    result = hk_upload_rodata(dev);
    if (result != VK_SUCCESS)
-      HK_INIT_FAIL(fail_queries, "rodata", 0);
+      goto fail_queries;
 
    /* XXX: error handling, and should this even go on the device? */
    agx_bg_eot_init(&dev->bg_eot, &dev->dev);
    if (!dev->bg_eot.ht) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
-      HK_INIT_FAIL(fail_rodata, "bg-eot", 0);
+      goto fail_rodata;
    }
    hk_g17p_bg_eot_dev_cache_init(dev);
 
@@ -1153,23 +1160,23 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    if ((agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
        !hk_g17p_prewarm_poly_kernels(dev)) {
       result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-      HK_INIT_FAIL(fail_bg_eot, "poly-prewarm", 0);
+      goto fail_bg_eot;
    }
 
    result = hk_init_internal_shaders(&dev->prolog_epilog);
    if (result != VK_SUCCESS)
-      HK_INIT_FAIL(fail_bg_eot, "prolog-epilog-shaders", 0);
+      goto fail_bg_eot;
 
    result = hk_init_internal_shaders(&dev->kernels);
    if (result != VK_SUCCESS)
-      HK_INIT_FAIL(fail_internal_shaders, "internal-kernels", 0);
+      goto fail_internal_shaders;
 
    for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
       for (unsigned q = 0; q < pCreateInfo->pQueueCreateInfos[i].queueCount;
            q++) {
          result = hk_queue_init(dev, &pCreateInfo->pQueueCreateInfos[i], q);
          if (result != VK_SUCCESS)
-            HK_INIT_FAIL(fail_queues, "queue-init", 0);
+            goto fail_queues;
       }
    }
 
@@ -1179,16 +1186,16 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.mem_cache = vk_pipeline_cache_create(&dev->vk, &cache_info, NULL);
    if (dev->vk.mem_cache == NULL) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
-      HK_INIT_FAIL(fail_queues, "pipeline-cache", 0);
+      goto fail_queues;
    }
 
    result = hk_device_init_accel_struct_state(dev);
    if (result != VK_SUCCESS)
-      HK_INIT_FAIL(fail_mem_cache, "accel-struct-state", 0);
+      goto fail_mem_cache;
 
    result = hk_device_init_meta(dev);
    if (result != VK_SUCCESS)
-      HK_INIT_FAIL(fail_accel_struct, "meta", 0);
+      goto fail_accel_struct;
 
    /* Precompile an empty fragment shader that can be used to handle API-level
     * null fragment shaders. We do this at device-time to make binds cheap.
@@ -1204,10 +1211,12 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    hk_compile_shader(dev, &info, NULL, NULL, pAllocator, &dev->null_fs);
    if (!dev->null_fs) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
-      HK_INIT_FAIL(fail_meta, "empty-fragment-shader", 0);
+      goto fail_meta;
    }
 
-   hk_init_g17p_grid_helper(dev, pAllocator);
+   result = hk_init_g17p_grid_helper(dev, pAllocator);
+   if (result != VK_SUCCESS)
+      goto fail_null_fs;
 
    *pDevice = hk_device_to_handle(dev);
 
@@ -1221,6 +1230,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       list_inithead(&dev->vdm.full[class]);
    }
    simple_mtx_init(&dev->scratch.lock, mtx_plain);
+   simple_mtx_init(&dev->sparse_buffers.lock, mtx_plain);
+   list_inithead(&dev->sparse_buffers.list);
    simple_mtx_init(&dev->shader_binary_cache.lock, mtx_plain);
    agx_scratch_init(&dev->dev, &dev->scratch.vs);
    agx_scratch_init(&dev->dev, &dev->scratch.fs);
@@ -1234,10 +1245,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    hk_frame_anatomy_init(dev);
    hk_compute_kick_init(dev, instance->drirc.misc.compute_kick_ms);
 
-   if (init_diag)
-      hk_device_init_diag(pdev, dev, "success", VK_SUCCESS, 0);
    return VK_SUCCESS;
 
+fail_null_fs:
+   hk_api_shader_destroy(&dev->vk, &dev->null_fs->vk, pAllocator);
 fail_meta:
    if (!agx_chip_g17_m5(dev->dev.chip))
       hk_gen1_rq_finish(dev);
@@ -1290,7 +1301,6 @@ fail_init:
    vk_device_finish(&dev->vk);
 fail_alloc:
    vk_free(&dev->vk.alloc, dev);
-#undef HK_INIT_FAIL
    return result;
 }
 
@@ -1349,24 +1359,13 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    agx_scratch_fini(&dev->scratch.fs);
    agx_scratch_fini(&dev->scratch.cs);
    simple_mtx_destroy(&dev->scratch.lock);
+   simple_mtx_destroy(&dev->sparse_buffers.lock);
 
    if (dev->null_fs) {
       hk_api_shader_destroy(&dev->vk, &dev->null_fs->vk, pAllocator);
    }
 
-   if (dev->g17p_grid_helper) {
-      hk_api_shader_destroy(&dev->vk, &dev->g17p_grid_helper->vk, pAllocator);
-   }
-
-   if (dev->g17p_geometry_copy_helper) {
-      hk_api_shader_destroy(&dev->vk, &dev->g17p_geometry_copy_helper->vk,
-                            pAllocator);
-   }
-
-   if (dev->g17p_grid_helper_sparse) {
-      hk_api_shader_destroy(&dev->vk, &dev->g17p_grid_helper_sparse->vk,
-                            pAllocator);
-   }
+   hk_destroy_g17p_grid_helpers(dev, pAllocator);
 
    hk_destroy_sampler_heap(dev, &dev->samplers);
    hk_texel_windows_finish(dev);

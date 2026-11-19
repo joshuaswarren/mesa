@@ -15,7 +15,7 @@ struct hk_device;
 struct hk_cmd_buffer;
 struct agx_scs_layout_gen2;
 struct vk_buffer;
-void hk_gen1_publish_buffer_as_addresses(struct hk_device *dev,
+bool hk_gen1_publish_buffer_as_addresses(struct hk_device *dev,
                                          const struct vk_buffer *buffer);
 uint64_t hk_gen1_upload_as_table(struct hk_cmd_buffer *cmd);
 uint64_t hk_gen1_as_metadata_addr(struct hk_cmd_buffer *cmd,
@@ -42,7 +42,7 @@ const uint32_t *hk_agx3_node_encoder_spirv(enum agx_chip chip, size_t *size_B);
 const uint32_t *hk_agx3_refit_spirv(enum agx_chip chip, size_t *size_B);
 const uint32_t *hk_gen1_agx3_node_encoder_spirv(bool pairs, size_t *size_B);
 const uint32_t *hk_gen1_agx3_refit_spirv(size_t *size_B);
-const uint32_t *hk_m5_agx3_node_encoder_spirv(bool batch, size_t *size_B);
+const uint32_t *hk_m5_agx3_node_encoder_spirv(size_t *size_B);
 const uint32_t *hk_m5_agx3_refit_spirv(size_t *size_B);
 
 uint64_t hk_gen1_ray_query_scs_layout(const struct hk_device *dev);
