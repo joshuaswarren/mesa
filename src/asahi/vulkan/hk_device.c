@@ -933,7 +933,9 @@ hk_init_g17p_grid_helper(struct hk_device *dev,
  * anonymous memory of this process (malloc, aligned_alloc, an anonymous
  * private mmap) that overlaps no other import of the device has its pages at
  * no other GPU address: they are mapped at one virtual address of the
- * process, and the GPU reaches them only through the import's own.
+ * process, and the GPU reaches them only through the import's own, unless
+ * the application moved an imported range with mremap and imported it again
+ * (hk_host_alias.h).
  */
 static bool
 hk_device_may_alias_memory(const struct hk_device *dev,

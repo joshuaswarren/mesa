@@ -442,7 +442,8 @@ enum hk_perftest {
  * the scope follows the imports that exist: memory scope while one of them
  * may alias (host_alias_live, hk_host_import_aliases()), that is, it is not
  * all private anonymous memory of this process, or it overlaps another live
- * import of which one of the two is GPU-writable. The pages of an import get
+ * import of which one of the two is GPU-writable. Not seen: pages moved by
+ * mremap after an import and imported again (hk_host_alias.h). The pages of an import get
  * their second GPU address only when the import is created, so the work
  * recorded or submitted before then is given memory scope at that point:
  *
@@ -461,6 +462,15 @@ enum hk_perftest {
  *   buffer are written as well (hk_device_patch_alias_sites()).
  * - Writes only add memory scope, and a written command buffer keeps it
  *   until it is reset or freed.
+ * - Every command holding compute or transfer work ends with the
+ *   memory-scoped strong flush (vkEndCommandBuffer), so what it wrote is in
+ *   memory by its end. Sites cover reads by work recorded before an import;
+ *   this covers writes made before it, by work that already ran, read later
+ *   through the new import, through an import that replaced a freed one, or
+ *   through another device's or API's import of the same pages, which
+ *   Vulkan orders after this work only at a submission boundary. Submit
+ *   packing keeps that flush only at a packet's end while no import may
+ *   alias.
  * - What records no site keeps memory scope while the mode is on: the
  *   dependencies of graphics paths (transfers ordered before a draw, task
  *   launches), and all of a command buffer that uses events, since an event

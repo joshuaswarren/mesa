@@ -13,13 +13,31 @@
  *
  * What the mappings over an imported range say, best first: a range takes
  * the worst class of the mappings over it.
+ *
+ * Known limit: the maps show which mappings cover a range, not which pages
+ * they hold, and no other process interface shows whether a page is pinned
+ * already. An application that imports a range, then moves it with mremap
+ * (MREMAP_MAYMOVE, with or without MREMAP_FIXED or MREMAP_DONTUNMAP), and
+ * imports the new address as well, has the first import's pinned pages
+ * under a private anonymous mapping that overlaps no import: both imports
+ * count as private, and a write through one, a barrier and a read through
+ * the other within one submission read stale data. Across submissions the
+ * memory-scoped flush at the end of every command (vkEndCommandBuffer)
+ * still covers it. The plain move leaves the first import's range unmapped,
+ * which the extension does not allow while the import lives; with
+ * MREMAP_DONTUNMAP the old range gets new pages, so the first import is no
+ * longer coherent with the memory the application sees there either. The
+ * robust check is the kernel's: DRM_ASAHI_GEM_USERPTR reporting that a page
+ * it pinned was pinned long-term already (folio_maybe_dma_pinned()), which
+ * would count as aliasing.
  */
 enum hk_host_map_class {
    /* Private anonymous memory: no pathname, "[heap]", or an anonymous
-    * region named with PR_SET_VMA_ANON_NAME ("[anon:...]"). Its pages are
-    * mapped at this one virtual address of this process and nowhere else
-    * (mremap moves them, fork shares them only until a write, and pinning
-    * for writing breaks that sharing first). */
+    * region named with PR_SET_VMA_ANON_NAME ("[anon:...]"). Unless moved
+    * by mremap after an import (see above), its pages are mapped at this
+    * one virtual address of this process: fork gives the child copies of
+    * pinned anonymous pages instead of sharing them, and pinning for
+    * writing breaks the copy-on-write sharing of the others first. */
    HK_HOST_MAP_PRIVATE_ANON,
    /* A private mapping of a file outside /dev: until written, its pages are
     * the file's page cache, which any shared mapping of the file maps too. */

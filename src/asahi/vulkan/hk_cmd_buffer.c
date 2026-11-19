@@ -1055,6 +1055,25 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
        * with ENOTSUPP ("G18 compute admission rejected ... stream_bytes=52").
        */
       if (cs->type == HK_CS_CDM && !cs->g18_dispatch_sealed) {
+         /* With host_alias.dynamic, every stream holding work ends with the
+          * memory-scoped strong flush, also where its last record is an
+          * application barrier recorded without memory scope. Each command
+          * then writes back what it wrote by its end, as the memory scope of
+          * each barrier did under the per-device rule, so a later command
+          * reads it through any address, also through an import created in
+          * between, whose patch sites cover only the commands recorded
+          * before it (hk_cdm_alias_scope()), or through another device's or
+          * API's import of the same pages, which Vulkan orders after this
+          * work only at a submission boundary. Submit packing keeps the scope
+          * only at a packet's end while no import may alias. */
+         if (dev->host_alias.dynamic &&
+             hk_cdm_visibility_flush_needed(dev, cs, true)) {
+            if (cs->current != cs->weak_barrier_end &&
+                cs->current != cs->strong_flush_end)
+               hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+            hk_cdm_visibility_flush(dev, cs, true);
+         }
+
          /* Where the kernel lets another queue's kick wait for this stream's
           * completion in firmware, which a weak tail reports before the
           * stream's writes are visible, end the stream with the strong
