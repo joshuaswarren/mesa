@@ -41,13 +41,13 @@ jobs:
         run: |
           CC="ccache clang" CXX="ccache clang++" meson setup build \
             -Dgallium-drivers=asahi -Dvulkan-drivers=asahi \
-            -Dplatforms=wayland,x11 -Dbuild-tests=true
+            -Dplatforms=wayland,x11 -Dbuild-tests=true -Dtools=drm-shim
 
       - name: Build
         run: meson compile -C build
 
       - name: Test
-        run: meson test -C build --suite asahi --num-processes "$(nproc)" --print-errorlogs
+        run: meson test -C build --suite asahi --suite poly --num-processes "$(nproc)" --print-errorlogs
 
       - name: Upload test logs
         if: failure()
