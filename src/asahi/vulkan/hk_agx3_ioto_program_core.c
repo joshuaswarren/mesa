@@ -217,18 +217,6 @@ hk_agx3_g17p_shared_graphics_desc(
 }
 
 bool
-hk_agx3_g17p_graphics_program_desc_bound(
-   enum agx_chip chip, const struct hk_agx3_g17p_graphics_program_desc *desc,
-   size_t *size)
-{
-   if (!desc || desc->uniform_range_count > HK_AGX3_G17P_GRAPHICS_MAX_RANGES)
-      return false;
-   const struct agx3_g17p_graphics_program_desc shared_desc =
-      hk_agx3_g17p_shared_graphics_desc(desc);
-   return agx3_g17p_graphics_program_desc_bound(chip, &shared_desc, size);
-}
-
-bool
 hk_agx3_g17p_basic_graphics_program_generate(
    enum agx_chip chip, const struct hk_agx3_g17p_graphics_program_desc *desc,
    struct hk_agx3_g17p_graphics_program *program)
