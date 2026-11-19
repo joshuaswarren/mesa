@@ -104,14 +104,6 @@ bool agx3_stage_copy(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                      uint8_t slot, uint16_t wait_mask,
                      uint8_t out[AGX3_STAGE_MAX_LENGTH], uint8_t *len);
 
-bool agx3_stage_ldimm(enum agx_isa_encoding enc, uint16_t dest, uint32_t imm,
-                      bool kill, uint8_t slot, uint16_t wait_mask,
-                      uint8_t out[AGX3_STAGE_MAX_LENGTH], uint8_t *len);
-
-bool agx3_stage_clr(enum agx_isa_encoding enc, uint16_t dest, bool kill,
-                    uint8_t slot, uint8_t out[AGX3_STAGE_MAX_LENGTH],
-                    uint8_t *len);
-
 #ifdef __cplusplus
 }
 #endif

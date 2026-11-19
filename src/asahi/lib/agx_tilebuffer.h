@@ -350,7 +350,6 @@ bool agx_g17p_rt0_tile_layout_supported(
 
 /* Logical active attachment mask for compact RGBA8 storage in partition zero. */
 unsigned agx_g17p_rgba8_mrt_mask(const struct agx_tilebuffer_layout *tib);
-unsigned agx_g18g_rgba8_mrt_mask(const struct agx_tilebuffer_layout *tib);
 
 /* Compact G18 four-byte slots: RGBA8 or a scalar R32 integer/float word. */
 unsigned agx_g18g_word_mrt_mask(const struct agx_tilebuffer_layout *tib);
@@ -400,10 +399,6 @@ agx_g18g_native_mixed_mask(const struct agx_tilebuffer_layout *tib);
  * 0 8-bit integer lanes, 1 16-bit lanes, 2 32-bit lanes, 3 tile bytes in the
  * attachment's own encoding (8-bit normalized, RGB10A2, R11G11B10F). */
 int agx_g18g_native_mixed_eot_class(enum pipe_format format);
-
-/* Dense, unspilled single-sample RGBA8 layouts with three to eight targets. */
-unsigned
-agx_g17p_wide_rgba8_mrt_count(const struct agx_tilebuffer_layout *tib);
 
 enum agx_g17p_mrt_layout {
    AGX_G17P_MRT_NONE,

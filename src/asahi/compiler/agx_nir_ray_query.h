@@ -76,10 +76,6 @@ nir_def *agx_nir_gen1_trace_opaque_with_status(struct nir_builder *b, nir_def *b
                               nir_def *lane, nir_def *launch,
                               unsigned context_uniform, unsigned status_uniform);
 
-void agx_nir_gen1_trace_opaque(struct nir_builder *b, nir_def *bvh,
-                              nir_def *request, nir_def *query_base,
-                              nir_def *lane, nir_def *launch, unsigned context_uniform);
-
 #ifdef __cplusplus
 }
 #endif

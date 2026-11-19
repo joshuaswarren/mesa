@@ -102,25 +102,6 @@ test_program_cache_lifetime(void)
       },
    };
 
-   CHECK(!hk_agx3_shader_binary_version_supported(0));
-   CHECK(!hk_agx3_shader_binary_version_supported(15));
-   CHECK(!hk_agx3_shader_binary_version_supported(16));
-   CHECK(!hk_agx3_shader_binary_version_supported(17));
-   CHECK(!hk_agx3_shader_binary_version_supported(18));
-   CHECK(!hk_agx3_shader_binary_version_supported(19));
-   CHECK(!hk_agx3_shader_binary_version_supported(20));
-   CHECK(!hk_agx3_shader_binary_version_supported(21));
-   CHECK(!hk_agx3_shader_binary_version_supported(22));
-   CHECK(!hk_agx3_shader_binary_version_supported(23));
-   CHECK(!hk_agx3_shader_binary_version_supported(24));
-   CHECK(!hk_agx3_shader_binary_version_supported(25));
-   CHECK(!hk_agx3_shader_binary_version_supported(26));
-   CHECK(!hk_agx3_shader_binary_version_supported(27));
-   CHECK(hk_agx3_shader_binary_version_supported(
-      HK_AGX3_SHADER_BINARY_VERSION));
-   CHECK(!hk_agx3_shader_binary_version_supported(
-      HK_AGX3_SHADER_BINARY_VERSION + 1));
-
    CHECK(hk_agx3_vdm_live_source_layout(&expected, true, true) ==
          AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_AGX3_VERTEX_PROGRAM_VARIANT);
    CHECK(hk_agx3_vdm_live_source_layout(&expected, false, true) ==

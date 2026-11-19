@@ -77,30 +77,6 @@ bool agx3_shift_add16_encode(enum agx_isa_encoding enc,
                              uint8_t out[AGX3_WRITEOUT_MAX_LENGTH],
                              uint8_t *len);
 
-#define AGX3_WRITEOUT_SEQ_MAX 40u
-
-struct agx3_coverage_desc {
-   uint16_t sr_temp;        /* scratch 16-bit register for the SR 2 read */
-   uint16_t mid;            /* 16-bit register holding T + (T << 4) */
-   uint16_t word;           /* 16-bit register the word lands in; its 32-bit
-                             * pair is what gets staged, so it must be even */
-   uint16_t stage;          /* staging register index to copy the word into */
-   bool nibble_immediate;   /* the live-sample nibble is an immediate */
-   uint16_t nibble;         /* the immediate value, or a half-register index */
-   bool nibble_kill;        /* register nibble only */
-   uint8_t slot;            /* scoreboard slot for the staging copy */
-   uint8_t sr_slot;         /* scoreboard slot the SR read takes */
-   bool word_kill;          /* the staged word dies at the copy */
-   /* The one-bit destination hints Apple sets inconsistently; see the note on
-    * f11 in agx3_stage_core.h. Both are witnessed set and clear. */
-   bool mid_hint;
-   bool word_hint;
-};
-
-bool agx3_coverage_word(enum agx_isa_encoding enc,
-                        const struct agx3_coverage_desc *d, uint8_t *out,
-                        unsigned capacity, unsigned *len);
-
 #ifdef __cplusplus
 }
 #endif

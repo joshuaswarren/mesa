@@ -124,21 +124,6 @@ static uint64_t hk_heap(struct hk_cmd_buffer *cmd);
 static bool hk_cmd_ensure_geometry_heap(struct hk_cmd_buffer *cmd);
 static enum mesa_prim hk_gs_in_prim(struct hk_cmd_buffer *cmd);
 
-static enum libagx_program
-hk_sw_tess_program(enum tess_primitive_mode prim, enum poly_tess_mode mode)
-{
-   switch (prim) {
-   case TESS_PRIMITIVE_QUADS:
-      return LIBAGX_TESS_QUAD(mode);
-   case TESS_PRIMITIVE_TRIANGLES:
-      return LIBAGX_TESS_TRI(mode);
-   case TESS_PRIMITIVE_ISOLINES:
-      return LIBAGX_TESS_ISOLINE(mode);
-   default:
-      return LIBAGX_NUM_PROGRAMS;
-   }
-}
-
 static uint64_t hk_upload_geometry_params(struct hk_cmd_buffer *cmd,
                                           struct agx_draw draw);
 static void hk_init_tess_params(struct hk_cmd_buffer *cmd,
@@ -4697,6 +4682,18 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    hk_attachment_init(&render->depth_att, pRenderingInfo->pDepthAttachment);
    hk_attachment_init(&render->stencil_att, pRenderingInfo->pStencilAttachment);
 
+   /* vkd3d-proton renders without attachments at the Vulkan maximum, layers
+    * included, which cannot fit in a tiler allocation. Nothing is stored per
+    * layer, so one hardware layer serves all of them. */
+   bool no_attachments = agx_native_graphics(&dev->dev) && !render->view_mask &&
+                         !render->depth_att.iview && !render->stencil_att.iview;
+   for (uint32_t i = 0; i < render->color_att_count; i++)
+      no_attachments &= !render->color_att[i].iview;
+   if (cmd->state.gfx.descriptors.root.draw.no_attachments != no_attachments) {
+      cmd->state.gfx.descriptors.root.draw.no_attachments = no_attachments;
+      cmd->state.gfx.descriptors.root_dirty = true;
+   }
+
    if (unlikely(dev->frame_anatomy)) {
       /* Frame anatomy profiler: compression state of each colour target. */
       for (uint32_t i = 0; i < render->color_att_count; i++) {
@@ -6929,7 +6926,9 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
    }
    if (backend_key.g17p_emrt) {
       /* Only the image accesses may be conditional. Every resident tile
-       * operation must execute on every path through the epilog. */
+       * operation must execute on every path through the epilog; an epilog
+       * that has a conditional one is compiled without eMRT, which is
+       * correct, only slower. */
       nir_metadata_require(b.impl, nir_metadata_dominance);
       nir_foreach_block(block, b.impl) {
          nir_foreach_instr(instr, block) {
@@ -6938,12 +6937,14 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
             nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
             if ((op == nir_intrinsic_store_local_pixel_agx ||
                  op == nir_intrinsic_load_local_pixel_agx) &&
-                !nir_block_dominates(block, nir_impl_last_block(b.impl))) {
+                !nir_block_dominates(block, nir_impl_last_block(b.impl)))
                backend_key.g17p_emrt = false;
-               mesa_loge("G17P eMRT has conditional resident tile access");
-            }
          }
       }
+
+      if (!backend_key.g17p_emrt)
+         perf_debug_dev(&dev->dev, "G17P eMRT disabled for an epilog with "
+                                   "conditional resident tile access");
    }
    if (g17p_tile_partitions) {
       memcpy(backend_key.g17p_tile_partitions, g17p_tile_partitions,
@@ -12637,10 +12638,13 @@ static void
 hk_g17p_note_layer_zero_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-       cmd->state.gfx.render.view_mask ||
-       cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] ||
-       cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL]) {
+       cmd->state.gfx.render.view_mask) {
       cs->g17p_layer_zero_unknown = true;
+      return;
+   }
+
+   if (cmd->state.gfx.descriptors.root.draw.no_attachments) {
+      cs->g17p_layer_zero_draws++;
       return;
    }
 
@@ -13494,8 +13498,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    struct hk_api_shader *task_api = gfx->shaders[MESA_SHADER_TASK];
    const bool sw_task = task_api && dev->dev.chip == AGX_CHIP_G17P;
    if (!gfx->shaders[MESA_SHADER_MESH] ||
-       (task_api && !sw_task &&
-        (dev->dev.chip != AGX_CHIP_G17S || !hk_m5_task_enabled())) ||
+       (task_api && !sw_task && dev->dev.chip != AGX_CHIP_G17S) ||
        (dev->dev.chip != AGX_CHIP_G17P &&
         (dev->dev.chip != AGX_CHIP_G17S ||
          !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2)))) {

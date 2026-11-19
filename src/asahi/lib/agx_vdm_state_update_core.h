@@ -28,20 +28,6 @@ struct agx_vdm_state_update_info {
    uint32_t raw_vertex_unknown;
 };
 
-struct agx_vdm_state_update_preamble_counts {
-   uint16_t ipr_dwords;
-   uint32_t spill_dwords;
-};
-
-/* Convert G17P ShaderInfo fields 37/31 (thread-invariant IPR/spill bytes)
- * to the native 12/18-bit state-load counts. IPR allocation is rounded to an
- * even dword count. Reject overflow instead of truncating either field, and
- * clear the result on failure. This neither sets shader flags nor emits a
- * state update. Other chips need their own producer qualification. */
-bool agx_vdm_state_update_encode_preamble_counts(
-   enum agx_chip chip, uint32_t ipr_bytes, uint32_t spill_bytes,
-   struct agx_vdm_state_update_preamble_counts *counts);
-
 struct agx_vdm_state_update {
    uint8_t bytes[AGX_VDM_STATE_UPDATE_LENGTH];
    uint8_t length;
@@ -171,14 +157,6 @@ struct agx_vdm_state_update_draw_info {
  * admission.
  */
 bool agx_vdm_state_update_supported(enum agx_chip chip);
-
-/* AGX2 USC pointers are stored relative to `shader_base`, while the AGX3
- * VertexProgramVariant pipeline pair carries an absolute 48-bit GPU VA.
- * Resolve that representation boundary explicitly so live producers cannot
- * accidentally feed the legacy packed offset to the AGX3 encoder. */
-bool agx_vdm_state_update_resolve_pipeline_va(uint64_t shader_base,
-                                              uint32_t packed_usc,
-                                              uint64_t *pipeline_va);
 
 bool agx_vdm_state_update_pack(enum agx_chip chip,
                                const struct agx_vdm_state_update_info *info,

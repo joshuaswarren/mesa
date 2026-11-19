@@ -96,7 +96,7 @@ static bool
 submit(struct hk_queue *q, struct hk_cmd_buffer *c)
 {
    struct hk_cmd_buffer *cs[] = {c};
-   return hk_sync_resolve_submit(q, cs, 1, false, false, 0);
+   return hk_sync_resolve_submit(q, cs, 1, false, false, 0, NULL);
 }
 
 static struct hk_cmd_buffer *
@@ -451,11 +451,11 @@ test_precise_tile_evictions(void)
      resolved && q->sync.evicted_preserve == point && q->sync.evicted > point);
    ++q->drm.timeline_value;
    T("retired preserving pass allows complete write",
-     hk_sync_resolve_submit(q, one, 1, false, false, point) &&
+     hk_sync_resolve_submit(q, one, 1, false, false, point, NULL) &&
      write->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
    ++q->drm.timeline_value;
    T("partial pass still waits on live evicted complete writes",
-     hk_sync_resolve_submit(q, p, 1, false, false, point) &&
+     hk_sync_resolve_submit(q, p, 1, false, false, point, NULL) &&
      preserve->sync.barrier[HK_SYNC_VDM] == 0);
 
    q = new_queue(true);
@@ -463,14 +463,14 @@ test_precise_tile_evictions(void)
    q->drm.timeline_value = 1;
    struct hk_cmd_buffer *pair[] = {partial, full};
    T("partial then full in one submit retains dependency",
-     hk_sync_resolve_submit(q, pair, 2, false, false, 0) &&
+     hk_sync_resolve_submit(q, pair, 2, false, false, 0, NULL) &&
      write->sync.barrier[HK_SYNC_VDM] == preserve->sync.index);
    q = new_queue(true);
    q->sync.precise_tile_evictions = true;
    q->drm.timeline_value = 1;
    struct hk_cmd_buffer *reverse[] = {full, partial};
    T("full then partial in one submit retains dependency",
-     hk_sync_resolve_submit(q, reverse, 2, false, false, 0) &&
+     hk_sync_resolve_submit(q, reverse, 2, false, false, 0, NULL) &&
      preserve->sync.barrier[HK_SYNC_VDM] == write->sync.index);
 
    q = new_queue(true);
@@ -666,7 +666,7 @@ test_multiview_layer_preservation(void)
    sparse = render_pass(b, image, 2, true);
    struct hk_cmd_buffer *pair[] = {a, b};
    T("multiview across command buffers submit",
-     hk_sync_resolve_submit(queue, pair, 2, false, false, 0));
+     hk_sync_resolve_submit(queue, pair, 2, false, false, 0, NULL));
    T("across command buffers keeps layer store ordered",
      sparse->sync.barrier[HK_SYNC_VDM] == first->sync.index);
 
@@ -679,7 +679,7 @@ test_multiview_layer_preservation(void)
    queue->drm.timeline_value = 2;
    struct hk_cmd_buffer *single[] = {b};
    T("multiview later queue submission",
-     hk_sync_resolve_submit(queue, single, 1, false, false, 0));
+     hk_sync_resolve_submit(queue, single, 1, false, false, 0, NULL));
    T("across queue submissions waits on prior layer store",
      sparse->sync.barrier[HK_SYNC_VDM] == 0);
 }
@@ -791,7 +791,7 @@ test_loaded_color_preservation(void)
    queue = new_queue(true);
    struct hk_cmd_buffer *pair[] = {a, b};
    T("loaded color across command buffers submit",
-     hk_sync_resolve_submit(queue, pair, 2, false, false, 0));
+     hk_sync_resolve_submit(queue, pair, 2, false, false, 0, NULL));
    T("loaded color across command buffers retains compute clear",
      load->sync.barrier[HK_SYNC_CDM] == clear->sync.index &&
      load->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
@@ -802,7 +802,7 @@ test_loaded_color_preservation(void)
    pair[0] = a; pair[1] = b;
    queue = new_queue(true);
    T("unrelated color across command buffers submit",
-     hk_sync_resolve_submit(queue, pair, 2, false, false, 0));
+     hk_sync_resolve_submit(queue, pair, 2, false, false, 0, NULL));
    T("unrelated color across command buffers stays independent",
      load->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
      load->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
@@ -825,7 +825,7 @@ test_loaded_color_preservation(void)
    queue->drm.timeline_value = 2;
    struct hk_cmd_buffer *single[] = {b};
    T("loaded color consumer submission",
-     hk_sync_resolve_submit(queue, single, 1, false, false, 0));
+     hk_sync_resolve_submit(queue, single, 1, false, false, 0, NULL));
    T("loaded color waits on prior compute history",
      load->sync.barrier[HK_SYNC_CDM] == 0 &&
      load->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
@@ -854,7 +854,7 @@ test_compute_clear_layer_preservation(void)
    sparse = render_pass(b, image, 2, true);
    struct hk_cmd_buffer *pair[] = {a, b};
    T("compute clear across command buffers submit",
-     hk_sync_resolve_submit(queue, pair, 2, false, false, 0));
+     hk_sync_resolve_submit(queue, pair, 2, false, false, 0, NULL));
    T("across command buffers names compute not render engine",
      sparse->sync.barrier[HK_SYNC_CDM] == clear->sync.index &&
      sparse->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
@@ -868,12 +868,12 @@ test_compute_clear_layer_preservation(void)
    queue->drm.timeline_value = 2;
    struct hk_cmd_buffer *single[] = {b};
    T("compute clear later queue submission",
-     hk_sync_resolve_submit(queue, single, 1, false, false, 0));
+     hk_sync_resolve_submit(queue, single, 1, false, false, 0, NULL));
    T("prior compute clear hazard names only compute history",
      sparse->sync.barrier[HK_SYNC_CDM] == 0 &&
      sparse->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
    T("completed prior clear submission", hk_sync_resolve_submit(
-      queue, single, 1, false, false, 1));
+      queue, single, 1, false, false, 1, NULL));
    T("completed prior clear has no remaining hazard",
      sparse->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE);
 
@@ -1186,7 +1186,7 @@ test_image_barrier_vertex_class(void)
    queue = new_queue(true);
    struct hk_cmd_buffer *pair[] = {a, b};
    T("carried image class submit",
-     hk_sync_resolve_submit(queue, pair, 2, false, false, 0));
+     hk_sync_resolve_submit(queue, pair, 2, false, false, 0, NULL));
    T("carried image class leaves a plain vertex half unordered",
      plain->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
      plain->sync.prior_ta[HK_SYNC_VDM] == 0);
@@ -1207,7 +1207,7 @@ test_chain_first_skips_empty_buffers(void)
       struct hk_cs *render = add(b, false);
       struct hk_cmd_buffer *ecr[] = {empty, a, b};
       T("chain [empty, compute, render]",
-        hk_sync_resolve_submit(q, ecr, 3, false, true, 0));
+        hk_sync_resolve_submit(q, ecr, 3, false, true, 0, NULL));
       T("chain first command has no barrier",
         compute->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
            compute->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE);
@@ -1227,7 +1227,7 @@ test_chain_first_skips_empty_buffers(void)
       compute = add(b, true);
       struct hk_cmd_buffer *erc[] = {empty, a, b};
       T("chain [empty, render, compute]",
-        hk_sync_resolve_submit(q, erc, 3, false, true, 0));
+        hk_sync_resolve_submit(q, erc, 3, false, true, 0, NULL));
       T("chain no barrier on CDM before any compute",
         compute->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
            compute->sync.barrier[HK_SYNC_VDM] == 1 &&
@@ -1242,7 +1242,7 @@ test_chain_first_skips_empty_buffers(void)
       render = add(b, false);
       struct hk_cmd_buffer *cr[] = {a, b};
       T("chain [compute, render]",
-        hk_sync_resolve_submit(q, cr, 2, false, true, 0));
+        hk_sync_resolve_submit(q, cr, 2, false, true, 0, NULL));
       T("chain [compute, render] render follows compute",
         compute->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
            render->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
@@ -1252,9 +1252,39 @@ test_chain_first_skips_empty_buffers(void)
       q = new_queue(exact);
       struct hk_cmd_buffer *ee[] = {new_cmd(), new_cmd()};
       T("chain without commands",
-        hk_sync_resolve_submit(q, ee, 2, false, true, 0) &&
+        hk_sync_resolve_submit(q, ee, 2, false, true, 0, NULL) &&
            q->sync.submitted[HK_SYNC_VDM] == 0 &&
            q->sync.submitted[HK_SYNC_CDM] == 0);
+   }
+}
+
+/* One simultaneous-use recording twice in a submission, {a, b, a}: each
+ * occurrence resolves at its own position, so every stream waits on the one
+ * just before it and never on itself or a later command. */
+static void
+test_repeated_recording(void)
+{
+   for (unsigned mode = 0; mode < 4; ++mode) {
+      struct hk_queue *q = new_queue(mode & 1);
+      struct hk_cmd_buffer *a = new_cmd(), *b = new_cmd();
+      for (unsigned i = 0; i < 4; ++i) {
+         hk_sync_barrier(i < 2 ? a : b, HK_SYNC_ALL, HK_SYNC_ALL);
+         add(i < 2 ? a : b, true);
+      }
+      struct hk_cmd_buffer *cmds[] = {a, b, a};
+      struct hk_sync_resolved out[6];
+      T("repeated recording submission",
+        hk_sync_resolve_submit(q, cmds, 3, false, mode & 2, 0, out));
+      bool ordered = true;
+      for (unsigned i = 0; i < 6; ++i) {
+         ordered &= out[i].barrier[HK_SYNC_CDM] ==
+                       (i ? i : DRM_ASAHI_BARRIER_NONE) &&
+                    out[i].barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+                    !out[i].prior[HK_SYNC_CDM] && !out[i].prior[HK_SYNC_VDM];
+      }
+      T("repeated recording waits on the previous occurrence", ordered);
+      T("repeated recording ordinals",
+        !(mode & 1) || q->sync.submitted[HK_SYNC_CDM] == 6);
    }
 }
 
@@ -1318,7 +1348,7 @@ test_classic_submission_order(void)
             for (unsigned i = 0; i < 4; ++i)
                streams[i] = add(cmds[i * groups / 4], mix & (1u << i));
             T("classic mixed submission", hk_sync_resolve_submit(
-                 q, cmds, groups, false, false, 0));
+                 q, cmds, groups, false, false, 0, NULL));
             unsigned prefix[2] = {0, 0};
             const uint64_t base[2] = {7, 11};
             for (unsigned i = 0; i < 4; ++i) {
@@ -1346,7 +1376,7 @@ test_classic_submission_order(void)
       add(draw, false);
       struct hk_cmd_buffer *cmds[] = {empty, event, event, draw, event};
       T("classic repeated recording", hk_sync_resolve_submit(
-           q, cmds, 5, false, false, 0));
+           q, cmds, 5, false, false, 0, NULL));
       unsigned prefix[2] = {0, 0};
       const uint64_t base[2] = {7, 11};
       for (unsigned i = 0; i < 5; ++i) {
@@ -1450,10 +1480,10 @@ test_direct_single_footprints(void)
                   a->drm.timeline_value = b->drm.timeline_value = r + 1;
                   const uint64_t completed = r % 4 ? 0 : r;
                   const bool flush = r % 7 == 0, chain = r % 3 == 0;
-                  same &= hk_sync_resolve_submit(a, cmds, count, flush, chain, completed);
+                  same &= hk_sync_resolve_submit(a, cmds, count, flush, chain, completed, NULL);
                   for (unsigned j = 0; j < n; ++j)
                      saved[j] = streams[j]->sync;
-                  same &= hk_sync_resolve_submit(b, cmds, count, flush, chain, completed);
+                  same &= hk_sync_resolve_submit(b, cmds, count, flush, chain, completed, NULL);
                   for (unsigned j = 0; j < n; ++j) {
                      same &= saved[j].index == streams[j]->sync.index &&
                              saved[j].ta_split == streams[j]->sync.ta_split;
@@ -1513,6 +1543,7 @@ main(void)
    test_g17p_vertex_after_memory_writers();
    test_g17p_tiling_order();
    test_chain_first_skips_empty_buffers();
+   test_repeated_recording();
    test_rt_kernel_gate();
    test_timestamp_execution_scopes();
    test_timestamp_reused_compute();
@@ -1584,7 +1615,7 @@ main(void)
    hk_sync_barrier(a, HK_SYNC_COMPUTE, HK_SYNC_GFX);
    d = add(b, false);
    struct hk_cmd_buffer *pair[] = {a, b};
-   T("same-submit", hk_sync_resolve_submit(q, pair, 2, false, false, 0));
+   T("same-submit", hk_sync_resolve_submit(q, pair, 2, false, false, 0, NULL));
    T("same-submit keeps relative1",
      d->sync.barrier[1] == 1 && d->sync.prior[1] == 0);
    q = new_queue(true);
@@ -1597,7 +1628,7 @@ main(void)
    T("empty source no future dependency",
      d->sync.prior[1] == 0 && d->sync.barrier[1] == DRM_ASAHI_BARRIER_NONE);
    q = new_queue(true);
-   T("synthetic SSTT only", hk_sync_resolve_submit(q, NULL, 0, true, false, 0));
+   T("synthetic SSTT only", hk_sync_resolve_submit(q, NULL, 0, true, false, 0, NULL));
    T("SSTT increments actual CDM ordinal",
      q->sync.submitted[1] == 1 && q->sync.last_absolute[1][1] == 1);
    a = new_cmd();
@@ -1669,7 +1700,7 @@ main(void)
    hk_sync_barrier(a, HK_SYNC_COMPUTE, HK_SYNC_GFX);
    struct hk_cmd_buffer *single[] = {a};
    T("SSTT plus application",
-     hk_sync_resolve_submit(q, single, 1, true, false, 0));
+     hk_sync_resolve_submit(q, single, 1, true, false, 0, NULL));
    T("SSTT plus app counters", q->sync.submitted[1] == 2 &&
                                   d->sync.index == 2 &&
                                   d->sync.barrier[1] == 1);

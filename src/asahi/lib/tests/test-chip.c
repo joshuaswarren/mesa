@@ -405,12 +405,6 @@ test_classification_invariants(void)
    }
 
    CHECK(strcmp(agx_isa_name(AGX_ISA_AGX3), "AGX3") == 0);
-   CHECK(strcmp(agx_isa_encoding_name(AGX_ISA_ENCODING_AGX3B), "agx3b") ==
-         0);
-   CHECK(strcmp(agx_isa_encoding_name(AGX_ISA_ENCODING_AGX3C), "agx3c") ==
-         0);
-   CHECK(strcmp(agx_isa_encoding_name(AGX_ISA_ENCODING_AGX3D), "agx3d") ==
-         0);
    CHECK(strcmp(agx_chip_name(AGX_CHIP_G18G), "G18G") == 0);
    CHECK(strcmp(agx_chip_name(AGX_CHIP_UNKNOWN), "unknown") == 0);
 }

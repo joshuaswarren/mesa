@@ -543,33 +543,8 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
       u_rwlock_rdunlock(&dev->external_bos.lock);
 
    if (ret) {
-      /* Opt-in diagnostic: preserve the exact rejected submission so the
-       * kernel's validation can be replayed offline. No effect unless set. */
-      const char *dump = os_get_option("ASAHI_SUBMIT_DUMP_ON_ERROR");
-      if (dump && *dump) {
-         const int err = errno;
-         static unsigned seq;
-         char path[512];
-         snprintf(path, sizeof(path), "%s/submit-%d-%u.bin", dump, (int)getpid(),
-                  p_atomic_inc_return(&seq));
-         FILE *f = fopen(path, "wb");
-         if (f) {
-            /* Header: errno, struct size, then the ioctl struct, the command
-             * stream, and the sync array (16 bytes per entry). */
-            const uint32_t hdr[4] = {(uint32_t)err, sizeof(*submit),
-                                     submit->cmdbuf_size,
-                                     submit->in_sync_count + submit->out_sync_count};
-            fwrite(hdr, sizeof(hdr), 1, f);
-            fwrite(submit, sizeof(*submit), 1, f);
-            fwrite((const void *)(uintptr_t)submit->cmdbuf, 1, submit->cmdbuf_size, f);
-            if (submit->syncs)
-               fwrite((const void *)(uintptr_t)submit->syncs,
-                      sizeof(struct drm_asahi_sync), hdr[3], f);
-            fclose(f);
-            mesa_loge("hk: rejected submission (errno %d) saved to %s", err, path);
-         }
-         errno = err;
-      }
+      /* ASAHI_MESA_DEBUG=trace decodes every command stream before it is
+       * submitted, including one the kernel rejects. */
       return vk_device_set_lost(&dev->vk,
                                 "DRM_IOCTL_ASAHI_SUBMIT failed: %m");
    }
@@ -1487,6 +1462,7 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
 static bool
 hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
                     const struct vk_queue_submit *submit,
+                    const struct hk_sync_resolved *resolved,
                     const uint64_t base[HK_SYNC_NUM_SQ], unsigned command_count,
                     bool kernel_cumulative)
 {
@@ -1514,9 +1490,10 @@ hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
             return false;
 
          /* A zero barrier names every command of earlier ioctls. */
+         const struct hk_sync_resolved *r = resolved++;
          for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
-            if ((cs->sync.prior[sq] && cs->sync.prior[sq] <= base[sq]) ||
-                cs->sync.barrier[sq] == 0)
+            if ((r->prior[sq] && r->prior[sq] <= base[sq]) ||
+                r->barrier[sq] == 0)
                return false;
          }
       }
@@ -1602,10 +1579,20 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       if (queue->sync.exact_prior &&
           !hk_sync_resolve_submit(
              queue, (struct hk_cmd_buffer *const *)submit->command_buffers,
-             submit->command_buffer_count, false, false, 0))
+             submit->command_buffer_count, false, false, 0, NULL))
          return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
       return queue_submit_empty(dev, queue, submit);
    }
+
+   /* Resolved sync fields, one entry per stream occurrence: a
+    * simultaneous-use command buffer may occur more than once. A sparse bind
+    * that only flushes the sparse table has none, and resizing a never
+    * allocated array to zero returns NULL. */
+   const unsigned resolved_count = command_count - flush_sstt;
+   if (resolved_count &&
+       !util_dynarray_resize(&queue->sync_resolved, struct hk_sync_resolved,
+                             resolved_count))
+      return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    bool replaced;
    VkResult queue_result = hk_queue_ensure_drm(
@@ -1811,13 +1798,15 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
     * (hk_drm_serialize_prefix), and keeps no ordinals, so it skips this. */
    const bool resolve = !queue->sync.serialize || queue->sync.exact_prior ||
                         queue->sync.stage_overlap;
+   const struct hk_sync_resolved *resolved =
+      resolve ? queue->sync_resolved.data : NULL;
    if (resolve && !hk_sync_resolve_submit(queue,
                           (struct hk_cmd_buffer *const *)submit->command_buffers,
                           submit->command_buffer_count, flush_sstt,
                           wait_count > 0 &&
                           !(dev->dev.params.features &
                             DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS),
-                          completed)) {
+                          completed, queue->sync_resolved.data)) {
       util_dynarray_fini(&payload);
       if (unlikely(anatomy))
          hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
@@ -1833,8 +1822,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
    bool sib_earlier = false;
    if (queue->sib.count > 1 && !replaced && !flush_sstt && !unlikely(anatomy) &&
-       hk_sibling_eligible(dev, queue, submit, prior_base, command_count,
-                           kernel_cumulative) &&
+       hk_sibling_eligible(dev, queue, submit, resolved, prior_base,
+                           command_count, kernel_cumulative) &&
        hk_sibling_deep(dev, queue, first_chunk_point - 1)) {
       sib_target = queue->sib.next;
       queue->sib.next = (queue->sib.next + 1) % queue->sib.count;
@@ -1872,6 +1861,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       }
 
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         if (resolved)
+            hk_sync_load_resolved(cs, resolved++);
          struct drm_asahi_cmd_header header =
             agx_cmd_header(cs->type == HK_CS_CDM, cs->sync.barrier[HK_SYNC_VDM],
                            cs->sync.barrier[HK_SYNC_CDM]);
@@ -2662,5 +2653,6 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
          agx_destroy_command_queue(&dev->dev, queue->sib.id[i]);
    }
    agx_bo_unreference(&dev->dev, queue->g17p_sstt_flush_bo);
+   util_dynarray_fini(&queue->sync_resolved);
    vk_free(&dev->vk.alloc, queue);
 }

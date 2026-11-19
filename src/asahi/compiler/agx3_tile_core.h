@@ -35,13 +35,6 @@ bool agx3_m5_mrt_eot_generate_layered(unsigned targets, const uint8_t *selectors
                                       bool multisample, bool layered,
                                       uint8_t *output, size_t capacity,
                                       size_t *written);
-bool agx3_m5_mrt_eot_generate_typed_ms(unsigned targets, const uint8_t *selectors,
-                                       bool multisample, uint8_t *output,
-                                       size_t capacity, size_t *written);
-bool agx3_m5_mrt_eot_generate_typed(unsigned targets, const uint8_t *selectors,
-                                    uint8_t *output, size_t capacity, size_t *written);
-bool agx3_m5_mrt_eot_generate(unsigned targets, uint8_t *output,
-                              size_t capacity, size_t *written);
 
 enum agx3_tile_width {
    AGX3_TILE_W8 = 0,

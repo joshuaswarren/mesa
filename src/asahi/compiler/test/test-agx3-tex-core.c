@@ -879,9 +879,8 @@ test_sample_witnesses(void)
  * The Apple bytes quoted here were regenerated with
  * `xcrun metal-nt -arch applegpu_g17p` (Metal toolchain 27.1) and decomposed
  * with the production compose tables, which only report a field vector that
- * re-composes to the same bytes. Sources and native objects are in
- * .tmp/g17p-texgrad-evidence (fragment shapes) and the compute kernel
- * `t.sample(s, g[0], gradient2d(g[1], g[2]))`.
+ * re-composes to the same bytes. The sources are fragment shapes and the
+ * compute kernel `t.sample(s, g[0], gradient2d(g[1], g[2]))`.
  *
  * The gradient sample selects f139 = 5 and is the one sample shape that does
  * *not* set the fragment marker f156: the four staged scalars are the
@@ -2141,8 +2140,7 @@ test_register_lod(void)
  * The texel fetch's level.
  *
  * Three `metal-nt -arch applegpu_g17p` compute kernels differing only in the
- * level argument to texture2d<float>::read(), from one source file
- * (.tmp/g17p-gallium2-evidence/texlod.metal):
+ * level argument to texture2d<float>::read(), from one source file:
  *
  *   read(gid, 0)        f37 = 1, f139 = 2, f29 = 0
  *   read(gid, 2)        f37 = 1, f139 = 2, f29 = 128     -- the level x 64
@@ -4359,10 +4357,9 @@ test_g17g_sample_lod_witnesses(void)
  *
  * Witness: xcrun metal-nt -arch applegpu_g17p -N k.mtlp-json
  *          -platform_version macos 27.0 27.0 (MetalToolchain v27.1.5194.15),
- * probes/g17p-sparse-residency.{metal,mtlp-json}, __TEXT,__text of each
- * compute object.  Both arms of each pair bind the texture and sampler
- * through the same argument buffer, so the only source difference is
- * sparse_sample/sparse_read against sample/read:
+ * __TEXT,__text of each compute object.  Both arms of each pair bind the
+ * texture and sampler through the same argument buffer, so the only source
+ * difference is sparse_sample/sparse_read against sample/read:
  *
  *   sample  k_ab_dense  05800cb8b4000900920390010100802000800098
  *           k_ab_sparse 2dc00c38bc000900920392010200802028c00018

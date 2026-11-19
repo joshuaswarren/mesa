@@ -186,37 +186,6 @@ check_template_witnesses(void)
 }
 
 static int
-check_pipeline_va_resolution(void)
-{
-   uint64_t pipeline = UINT64_MAX;
-
-   CHECK(agx_vdm_state_update_resolve_pipeline_va(
-      UINT64_C(0x1000000000), UINT32_C(0x123440), &pipeline));
-   CHECK(pipeline == UINT64_C(0x1000123440));
-
-   CHECK(agx_vdm_state_update_resolve_pipeline_va(
-      UINT64_C(0x1000000000), 0, &pipeline));
-   CHECK(pipeline == UINT64_C(0x1000000000));
-
-   pipeline = UINT64_MAX;
-   CHECK(!agx_vdm_state_update_resolve_pipeline_va(
-      UINT64_C(0x1000000001), UINT32_C(0x123440), &pipeline));
-   CHECK(pipeline == 0);
-   pipeline = UINT64_MAX;
-   CHECK(!agx_vdm_state_update_resolve_pipeline_va(
-      UINT64_C(0x1000000000), UINT32_C(0x123441), &pipeline));
-   CHECK(pipeline == 0);
-   pipeline = UINT64_MAX;
-   CHECK(!agx_vdm_state_update_resolve_pipeline_va(
-      (UINT64_C(1) << 48) - 64, 64, &pipeline));
-   CHECK(pipeline == 0);
-   CHECK(!agx_vdm_state_update_resolve_pipeline_va(
-      UINT64_C(0x1000000000), 0, NULL));
-
-   return 0;
-}
-
-static int
 check_template_variants_and_selectors(void)
 {
    static const uint8_t pre_hal300_variant_bits[] = {
@@ -770,63 +739,16 @@ check_vertex_ti_resources(void)
    return 0;
 }
 
-static int
-check_preamble_resource_counts(void)
-{
-   static const struct {
-      uint32_t ipr_bytes, spill_bytes;
-      uint16_t ipr_dwords;
-      uint32_t spill_dwords;
-   } cases[] = {
-      {0, 0, 0, 0}, {1, 1, 2, 1}, {4, 4, 2, 1},
-      {5, 5, 2, 2}, {8, 8, 2, 2}, {9, 9, 4, 3},
-      {16376, 1048572, 4094, 262143},
-   };
-   struct agx_vdm_state_update_preamble_counts counts;
-   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
-      CHECK(agx_vdm_state_update_encode_preamble_counts(
-         AGX_CHIP_G17P, cases[i].ipr_bytes, cases[i].spill_bytes, &counts));
-      CHECK(counts.ipr_dwords == cases[i].ipr_dwords);
-      CHECK(counts.spill_dwords == cases[i].spill_dwords);
-      struct agx_vdm_state_update_template_info input = {
-         .raw_state_load_count_12 = counts.ipr_dwords,
-         .raw_state_load_count_18 = counts.spill_dwords,
-      };
-      struct agx_vdm_state_update_info output;
-      CHECK(agx_vdm_state_update_template_materialize(
-         AGX_CHIP_G17P, &input, &output));
-      CHECK(output.raw_vertex_shader_word0 ==
-            (UINT32_C(0x80000000) | ((uint32_t)cases[i].ipr_dwords << 8)));
-      CHECK(output.raw_pipeline_template == cases[i].spill_dwords << 3);
-   }
-
-   static const uint32_t rejected[][2] = {
-      {16377, 0}, {0, 1048573}, {UINT32_MAX, 0}, {0, UINT32_MAX},
-      {UINT32_MAX, UINT32_MAX},
-   };
-   for (unsigned i = 0; i < sizeof(rejected) / sizeof(rejected[0]); ++i) {
-      memset(&counts, 0xff, sizeof(counts));
-      CHECK(!agx_vdm_state_update_encode_preamble_counts(
-         AGX_CHIP_G17P, rejected[i][0], rejected[i][1], &counts));
-      CHECK(counts.ipr_dwords == 0 && counts.spill_dwords == 0);
-   }
-   CHECK(!agx_vdm_state_update_encode_preamble_counts(AGX_CHIP_G17P, 0, 0, NULL));
-   CHECK(!agx_vdm_state_update_encode_preamble_counts(AGX_CHIP_G13G, 0, 0, &counts));
-   CHECK(!agx_vdm_state_update_encode_preamble_counts(AGX_CHIP_G17S, 0, 0, &counts));
-   return 0;
-}
-
 int
 main(void)
 {
-   if (check_pipeline_va_resolution() || check_exact_witnesses() ||
+   if (check_exact_witnesses() ||
        check_vertex_ti_resources() ||
        check_template_witnesses() ||
        check_template_variants_and_selectors() ||
        check_template_ranges_and_rejections() ||
        check_native_draw_template_producer() || check_field_domains() ||
-       check_every_bit_classification() || check_rejections() ||
-       check_preamble_resource_counts())
+       check_every_bit_classification() || check_rejections())
       return 1;
 
    printf("agx_vdm_state_update_core: %u checks passed\n", checks);

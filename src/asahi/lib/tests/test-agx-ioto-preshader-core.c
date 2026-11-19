@@ -42,25 +42,6 @@ all_bytes(const void *data, size_t size, uint8_t value)
 }
 
 static int
-check_program_sizes(void)
-{
-   size_t size = 0xa5a5;
-   CHECK(agx_ioto_preshader_program_size(0x100, 0x180, 0, &size));
-   CHECK(size == 0x80);
-
-   CHECK(agx_ioto_preshader_program_size(0x100, 0x100, 0x345, &size));
-   CHECK(size == 0x245);
-   CHECK(agx_ioto_preshader_program_size(0x100, 0x80, 0x100, &size));
-   CHECK(size == 0);
-
-   size = 0xa5a5;
-   CHECK(!agx_ioto_preshader_program_size(0x100, 0x80, 0xff, &size));
-   CHECK(size == 0xa5a5);
-   CHECK(!agx_ioto_preshader_program_size(0, 1, 0, NULL));
-   return 0;
-}
-
-static int
 check_bound_range(void)
 {
    uint8_t binary[512] = {0};
@@ -485,7 +466,7 @@ int
 main(void)
 {
    if (check_g17p_absolute_constant_program() ||
-       check_program_sizes() || check_bound_range() || check_branch_witnesses() ||
+       check_bound_range() || check_branch_witnesses() ||
        check_constant_program_refusals())
       return 1;
 

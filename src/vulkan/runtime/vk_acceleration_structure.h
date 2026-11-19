@@ -222,6 +222,7 @@ VkResult vk_get_bvh_build_pipeline_spv(struct vk_device *device, struct vk_meta_
                                        uint32_t flags, VkPipeline *pipeline,
                                        bool unaligned_dispatch);
 
+/* Refresh leaf IR while retaining an existing internal topology. */
 VkResult vk_cmd_build_as_leaves(VkCommandBuffer commandBuffer, struct vk_device *device,
                                 struct vk_meta_device *meta,
                                 const struct vk_acceleration_structure_build_args *args,
@@ -252,12 +253,6 @@ void vk_get_as_build_sizes(VkDevice _device, VkAccelerationStructureBuildTypeKHR
                            const struct vk_acceleration_structure_build_args *args);
 
 bool vk_acceleration_struct_vtx_format_supported(VkFormat format);
-
-/* Refresh leaf IR while retaining an existing internal topology. */
-VkResult vk_cmd_build_as_leaves(VkCommandBuffer commandBuffer,
-   struct vk_device *device, struct vk_meta_device *meta,
-   const struct vk_acceleration_structure_build_args *args,
-   const struct vk_acceleration_structure_build_state *state);
 
 static inline VkGeometryTypeKHR
 vk_get_as_geometry_type(const VkAccelerationStructureBuildGeometryInfoKHR *build_info)

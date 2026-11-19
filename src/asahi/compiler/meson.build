@@ -102,7 +102,6 @@ libasahi_agx_files = files(
   'agx3_rt_gen1_clique.c',
   'agx3_rt_gen1_runtime_tables.c',
   'agx3_rt_gen1_traversal.c',
-  'agx3_rt_gen1_body.c',
   'agx3_slot_core.c',
   'agx3_resource_ir.c',
   'agx3_lower_texture_publications.c',
@@ -210,6 +209,20 @@ if with_tests
     executable(
       'agx3_tex_core_test',
       files('test/test-agx3-tex-core.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      include_directories : [inc_include, inc_src],
+      dependencies : [idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx3_transcode',
+    executable(
+      'agx3_transcode_test',
+      files('test/test-agx3-transcode.c'),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -680,6 +693,8 @@ if with_tests
          'test/test-device-load-batches.cpp',
          'test/test-fuse-lea-constants.cpp',
          'test/test-divergence-load-agx.cpp',
+         'test/test-lower-address-exact-scale.cpp',
+         'test/test-ftz-subgroup-minmax.cpp',
          'test/test-m5-half-widen-once.cpp',
          'test/test-m5-byte-to-float.cpp',
          'test/test-fold-narrowed-half.cpp',
@@ -829,19 +844,6 @@ if with_tests
     executable(
       'agx_nir_sink_loop_sample_uses_test',
       files('test/test-sink-loop-sample-uses.c'),
-      c_args : [c_msvc_compat_args, no_override_init_args],
-      gnu_symbol_visibility : 'hidden',
-      dependencies : [idep_nir, idep_mesautil],
-      link_with : [libasahi_compiler],
-    ),
-    suite : ['asahi'],
-  )
-
-  test(
-    'agx3_gen1_hit_commit',
-    executable(
-      'agx3_gen1_hit_commit_test',
-      files('test/test-gen1-hit-commit.c'),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies : [idep_nir, idep_mesautil],

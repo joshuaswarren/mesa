@@ -66,10 +66,4 @@ hk_m5_backend_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                         VkDeviceAddress node_status,
                         VkDeviceAddress envelope_status);
 VkResult
-hk_m5_backend_cmd_encode_agx3_nodes(VkCommandBuffer command_buffer,
-                        const struct hk_agx3_leaf_args *args);
-VkResult
-hk_m5_backend_cmd_finalize_agx3_as(VkCommandBuffer command_buffer,
-                       const struct hk_agx3_envelope_args *args);
-VkResult
 hk_m5_backend_device_init_accel_struct_state(struct hk_device *dev);

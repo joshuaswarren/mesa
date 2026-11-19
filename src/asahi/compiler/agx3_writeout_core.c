@@ -8,11 +8,6 @@
 #include <string.h>
 
 #include "agx3_binder.h"
-#include "agx3_sr_core.h"
-#include "agx3_stage_core.h"
-
-#define AGX3_SR_TARGET_SAMPLES 2
-
 #define KV(f, v) {(uint16_t)(f), (uint64_t)(v)}
 
 bool
@@ -69,82 +64,4 @@ agx3_shift_add16_encode(enum agx_isa_encoding enc,
    memset(out, 0, AGX3_WRITEOUT_MAX_LENGTH);
    *len = 0;
    return false;
-}
-
-bool
-agx3_coverage_word(enum agx_isa_encoding enc,
-                   const struct agx3_coverage_desc *d, uint8_t *out,
-                   unsigned capacity, unsigned *len)
-{
-   if (out == NULL || len == NULL || d == NULL)
-      return false;
-   *len = 0;
-
-   if (enc != AGX_ISA_ENCODING_AGX3B)
-      return false;
-   if ((d->word & 1) || d->word >= 256 || d->sr_temp >= 256 || d->mid >= 256)
-      return false;
-   if (d->slot < 1 || d->slot > 6 || d->sr_slot < 1 || d->sr_slot > 6)
-      return false;
-
-   uint8_t buf[AGX3_WRITEOUT_SEQ_MAX];
-   unsigned n = 0;
-   uint8_t l = 0;
-
-   /* 1. read the target-sample nibble */
-   const struct agx3_sr_desc sr = {
-      .dest = d->sr_temp,
-      .width = AGX3_SR_W16,
-      .sr = AGX3_SR_TARGET_SAMPLES,
-      .slot = d->sr_slot,
-   };
-   if (!agx3_sr_encode(enc, &sr, buf + n, &l))
-      return false;
-   n += l;
-
-   /* 2. T + (T << 4), waiting on the read */
-   const struct agx3_shift_add_desc a1 = {
-      .dest = d->mid,
-      .dest_hint = d->mid_hint,
-      .src0 = d->sr_temp,
-      .src1 = d->sr_temp,
-      .src1_kill = true,
-      .shift = 4,
-      .wait_mask = (uint16_t)(1u << (d->sr_slot - 1)),
-   };
-   if (n + AGX3_WRITEOUT_MAX_LENGTH > sizeof(buf) ||
-       !agx3_shift_add16_encode(enc, &a1, buf + n, &l))
-      return false;
-   n += l;
-
-   /* 3. N + (that << 4) */
-   const struct agx3_shift_add_desc a2 = {
-      .dest = d->word,
-      .dest_hint = d->word_hint,
-      .src0_immediate = d->nibble_immediate,
-      .src0 = d->nibble,
-      .src0_kill = d->nibble_kill,
-      .src1 = d->mid,
-      .src1_kill = true,
-      .shift = 4,
-   };
-   if (d->nibble_immediate ? d->nibble > 15 : (d->nibble >= 256))
-      return false;
-   if (n + AGX3_WRITEOUT_MAX_LENGTH > sizeof(buf) ||
-       !agx3_shift_add16_encode(enc, &a2, buf + n, &l))
-      return false;
-   n += l;
-
-   /* 4. publish it into the staging file */
-   if (n + AGX3_STAGE_MAX_LENGTH > sizeof(buf) ||
-       !agx3_stage_copy_kill(enc, d->stage, d->word, d->word_kill, d->slot, 0,
-                             buf + n, &l))
-      return false;
-   n += l;
-
-   if (n > capacity)
-      return false;
-   memcpy(out, buf, n);
-   *len = n;
-   return true;
 }

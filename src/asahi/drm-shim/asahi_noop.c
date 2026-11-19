@@ -22,8 +22,6 @@
 #include "drm-shim/drm_shim.h"
 #include "drm-uapi/asahi_drm.h"
 
-bool drm_shim_driver_prefers_first_render_node = true;
-
 /* Bind/unbind mutate the shared mapping array and own its BO references.
  * Submission validation retains pointers into that array while walking it. */
 static simple_mtx_t shim_mapping_lock = SIMPLE_MTX_INITIALIZER;
@@ -240,8 +238,6 @@ static const struct drm_asahi_params_global params_g17p = {
 
 static const struct drm_asahi_params_global params_t6041 =
    SHIM_T6041_AURORA_PARAMS('C');
-static const struct drm_asahi_params_global params_t6041x =
-   SHIM_T6041_AURORA_PARAMS('X');
 
 static const struct drm_asahi_queue_limits queue_limits_g17 = {
    .max_queues = 42,
@@ -561,8 +557,6 @@ shim_params(void)
       return &params_g17s;
    if (chip && !strcmp(chip, "t6041"))
       return &params_t6041;
-   if (chip && !strcmp(chip, "t6041x"))
-      return &params_t6041x;
 
    return &params_g13g;
 }
@@ -577,8 +571,7 @@ static bool
 shim_g17_runtime(void)
 {
    const struct drm_asahi_params_global *params = shim_params();
-   return params == &params_g17p || params == &params_t6041 ||
-          params == &params_t6041x;
+   return params == &params_g17p || params == &params_t6041;
 }
 
 /* Whether the selected identity is driven by the M3 (G15) kernel, whose

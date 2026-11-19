@@ -16,10 +16,6 @@
 
 #include "hk_build_interface.h"
 
-#ifndef HK_AGX3_GEN1
-#define HK_AGX3_GEN1 0
-#endif
-
 layout(local_size_x = 64) in;
 #ifdef HK_AGX3_BATCH
 layout(push_constant) uniform CONSTS
@@ -137,29 +133,8 @@ publish_metadata(hk_agx3_envelope_job job, uint64_t image_bytes)
 }
 
 void
-clear_instance_pointers(uint job_index, uint lane)
-{
-   hk_agx3_envelope_job job = DEREF(INDEX(hk_agx3_envelope_job, args.jobs, job_index));
-   if (job.geometry_type != VK_GEOMETRY_TYPE_INSTANCES_KHR ||
-       job.primitive_count == 0 || job.end_slot < 3 ||
-       job.output_bvh == 0 || (job.output_bvh & 63ul) != 0)
-      return;
-   uint64_t pointers = uint64_t(job.end_slot) * 64ul + uint64_t(job.leaf_bound) * 64ul;
-   uint64_t size = pointers + uint64_t(job.leaf_bound) * 16ul + 184ul;
-   if (job.output_bvh >= (1ul << 48) || size > (1ul << 48) - job.output_bvh)
-      return;
-   for (uint i = lane; i < job.leaf_bound; i += 64u) {
-      store64(job.output_bvh + pointers + uint64_t(i)*16ul, 0ul);
-      store64(job.output_bvh + pointers + uint64_t(i)*16ul + 8ul, 0ul);
-   }
-}
-
-void
 main()
 {
-   if (HK_AGX3_GEN1 != 0)
-   for (uint i = gl_WorkGroupID.x; i < args.job_count; i += gl_NumWorkGroups.x)
-      clear_instance_pointers(i, gl_LocalInvocationID.x);
    uint id = gl_GlobalInvocationID.x;
 #ifdef HK_AGX3_BATCH
    if (id >= batch.job_count)
@@ -177,7 +152,7 @@ main()
    hk_agx3_envelope_job job = DEREF(INDEX(hk_agx3_envelope_job, args.jobs, id));
    if (job.primitive_count == 0 &&
        job.opaque_build_word == HK_AGX3_PLAN_EMPTY) {
-      if (job.output_bvh == 0 || (job.output_bvh & (HK_AGX3_GEN1 != 0 ? 63ul : 1023ul)) != 0 ||
+      if (job.output_bvh == 0 || (job.output_bvh & 1023ul) != 0 ||
           job.output_bvh >= (1ul << 48) - 192ul) {
          DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_RANGE;
          return;
@@ -211,10 +186,6 @@ main()
          status |= HK_AGX3_LEAF_NONFINITE;
       if (lo[a] > hi[a])
          status |= HK_AGX3_LEAF_RANGE;
-      if (HK_AGX3_GEN1 != 0 && extent[a] == 0.0) {
-         hi[a] = lo[a] + max(abs(lo[a]), 1.0) * 1.52587890625e-05;
-         extent[a] = hi[a] - lo[a];
-      }
    }
    precise float xy = extent.x * extent.y;
    precise float xz = extent.x * extent.z;
@@ -232,7 +203,7 @@ main()
    for (uint i = 0; i < 32; ++i)
       store32(h + uint64_t(i) * 4ul, 0);
    store64(h, (instances ? 0x080000008000f032ul : 0x080000002000f032ul) |
-               (uint64_t(HK_AGX3_GEN1 != 0 && args.reserved == 2 ? 2 : 3) << 24));
+               (3ul << 24));
    store64(h + 8ul, size);
    for (uint a = 0; a < 3; ++a) {
       store32(h + 16ul + uint64_t(a) * 4ul, floatBitsToUint(lo[a]));
@@ -256,7 +227,7 @@ main()
                10, 0, 0, 0, 0, 0, inverse_bits, 0x01000000, 0x01000000,
                0x00000101, 0x00010000, 0x00010000, 0x00ff0001, 0x02000000,
                0x01000005, 0x03000000, 1, 0, 0x3f800000, 0, 0, 0, 0, 0, 0);
-   if (aabbs && HK_AGX3_GEN1 == 0) {
+   if (aabbs) {
       /* Descriptor word 16 selects the native geometry class: 4 is the
        * bounding-box class (8 is the instance class and 0/2/10 the triangle
        * classes). Word 20 mirrors word 16 in both captured triangle and
