@@ -1011,6 +1011,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  hk_vulkan_global_priority = executable(
+    'hk-vulkan-global-priority',
+    files('tests/hk_vulkan_global_priority.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hk_vulkan_explicit_plane_layout = executable(
     'hk-vulkan-explicit-plane-layout',
     files('tests/hk_vulkan_explicit_plane_layout.c'),

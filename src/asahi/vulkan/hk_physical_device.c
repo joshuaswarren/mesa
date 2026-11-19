@@ -2615,11 +2615,13 @@ hk_GetPhysicalDeviceQueueFamilyProperties2(
          if (prio) {
             STATIC_ASSERT(ARRAY_SIZE(hk_global_queue_priorities) <=
                           VK_MAX_GLOBAL_PRIORITY_SIZE_KHR);
-            /* The native kernel reserves REALTIME and only accepts HIGH on
-             * M5. Report the same classes that queue creation can admit. */
-            prio->priorityCount = agx_chip_g17_m5(pdev->dev.chip) ? 3 : 2;
+            /* The kernel reserves REALTIME. HIGH is offered on every chip:
+             * the kernel decides at queue creation whether the GPU schedules
+             * it and whether the caller may use it, and a refusal is the
+             * VK_ERROR_NOT_PERMITTED the spec allows for a supported class. */
+            prio->priorityCount = ARRAY_SIZE(hk_global_queue_priorities);
             memcpy(&prio->priorities, hk_global_queue_priorities,
-                   prio->priorityCount * sizeof(hk_global_queue_priorities[0]));
+                   sizeof(hk_global_queue_priorities));
          }
       }
    }
