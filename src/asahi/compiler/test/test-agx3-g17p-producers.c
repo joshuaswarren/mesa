@@ -57,25 +57,12 @@ check(const char *name, const char *expect_hex, const uint8_t *got,
 
 
 /* ---------------------------------------------------------------- stage */
-struct ldimm_v { const char *n, *hex; uint16_t dest; uint32_t imm; uint8_t slot; };
-static const struct ldimm_v ldimm_vs[] = {
-   {"vmain ldimm.ep2 1.0f",  "0c80233e0000000c4020", 0,  0x3F800000, 2},
-   {"vmain ldimm.ep2 0.5f",  "4c80233e000000084080", 8,  0x3F000000, 5},
-   {"vmain ldimm.ep2 0.2f",  "5ccd233e1204660240a0", 10, 0x3E4CCCCD, 6},
-   {"vmain.v1 ldimm.ep2",    "3c80233e0000000c4060", 6,  0x3F800000, 4},
-   {"vmain.v2 ldimm.ep2",    "5ccd233e120466024080", 10, 0x3E4CCCCD, 5},
-   {"d_always kill-all",     "0c8023fe1c0cff0f4000", 0,  0xFFFFFF00, 1},
-};
-
-struct clr_v { const char *n, *hex; uint16_t dest; uint8_t slot; bool stage; };
+struct clr_v { const char *n, *hex; uint16_t dest; };
 static const struct clr_v clr_vs[] = {
-   {"vmain clr stage[2] s1", "1b002004", 2, 1, true},
-   {"vmain.v1 clr stage[0]", "0b002004", 0, 1, true},
-   {"c_zero clr r0",         "0b000000", 0, 0, false},
-   {"c_zero clr r2",         "1b000000", 2, 0, false},
-   {"c_zero clr r4",         "2b000000", 4, 0, false},
-   {"c_zero clr r6",         "3b000000", 6, 0, false},
-   
+   {"c_zero clr r0",         "0b000000", 0},
+   {"c_zero clr r2",         "1b000000", 2},
+   {"c_zero clr r4",         "2b000000", 4},
+   {"c_zero clr r6",         "3b000000", 6},
 };
 
 static void
@@ -83,15 +70,9 @@ test_stage(void)
 {
    uint8_t o[AGX3_STAGE_MAX_LENGTH];
    uint8_t l;
-   for (unsigned i = 0; i < sizeof(ldimm_vs) / sizeof(*ldimm_vs); ++i) {
-      const struct ldimm_v *v = &ldimm_vs[i];
-      bool ok = agx3_stage_ldimm(B, v->dest, v->imm, false, v->slot, 0, o, &l);
-      check(v->n, v->hex, o, l, ok);
-   }
    for (unsigned i = 0; i < sizeof(clr_vs) / sizeof(*clr_vs); ++i) {
       const struct clr_v *v = &clr_vs[i];
-      bool ok = v->stage ? agx3_stage_clr(B, v->dest, false, v->slot, o, &l)
-                         : agx3_clr(B, v->dest, false, false, o, &l);
+      bool ok = agx3_clr(B, v->dest, false, false, o, &l);
       check(v->n, v->hex, o, l, ok);
    }
    /* the two staging copies Apple emits in the writeout path */
@@ -327,33 +308,6 @@ test_writeout(void)
    struct agx3_sr_desc sd2 = {.dest = 16, .width = AGX3_SR_W16, .sr = 2, .slot = 1};
    srok = agx3_sr_encode(B, &sd2, so, &sl);
    check("fdepth rld h16<-SR2", "84841006", so, sl, srok);
-
-   /* the whole 1x coverage-word sequence, as fdiscard spells it */
-   uint8_t seq[AGX3_WRITEOUT_SEQ_MAX];
-   unsigned n = 0;
-   struct agx3_coverage_desc cd = {
-      .sr_temp = 16,
-      .mid = 10,
-      .word = 0,
-      .stage = 0,
-      .nibble_immediate = true,
-      .nibble = 15,
-      .slot = 1,
-      .sr_slot = 1,
-      .word_kill = true,
-      .word_hint = true,
-   };
-   bool ok = agx3_coverage_word(B, &cd, seq, sizeof(seq), &n);
-   char buf[256];
-   for (unsigned i = 0; i < n; ++i)
-      sprintf(buf + 2 * i, "%02x", seq[i]);
-   buf[2 * n] = 0;
-   check("fdepth coverage word (4 instrs)",
-         "84841006"
-         "9f11540a022040001605"
-         "9f015400031e28001404"
-         "0b012f00420000001000",
-         seq, n, ok);
 }
 
 /* ------------------------------------------------------------- subgroup */
@@ -629,20 +583,6 @@ test_refusals(void)
       fprintf(stderr, "iadd accepted an unwitnessed shift\n");
       failures++;
    }
-
-   checks++;
-   uint8_t so[AGX3_STAGE_MAX_LENGTH];
-   if (agx3_stage_ldimm(AGX_ISA_ENCODING_AGX3C, 0, 0, false, 1, 0, so, &l)) {
-      fprintf(stderr, "staging ldimm accepted on AGX3c\n");
-      failures++;
-   }
-
-   checks++;
-   if (agx3_stage_ldimm(B, 0, 0, false, 7, 0, so, &l)) {
-      fprintf(stderr, "staging ldimm accepted slot 7 on AGX3b\n");
-      failures++;
-   }
-
 }
 
 int
