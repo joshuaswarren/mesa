@@ -53,20 +53,6 @@
 
 #include <stdio.h>
 
-extern int hk_g17p_launch_trace_state;
-int hk_g17p_launch_trace_init(void);
-
-static inline bool
-hk_g17p_launch_trace_enabled(void)
-{
-   int enabled = hk_g17p_launch_trace_state;
-   if (unlikely(enabled < 0))
-      enabled = hk_g17p_launch_trace_init();
-   return enabled != 0;
-}
-void hk_g17p_trace_hexdump(const char *label, uint64_t base, const void *data,
-                           size_t len);
-
 void *hk_cmd_buffer_emit_cdm_terminate(struct hk_cmd_buffer *cmd,
                                        void *current);
 void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,

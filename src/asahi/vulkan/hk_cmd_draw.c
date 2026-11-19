@@ -98,10 +98,6 @@
 #include "vk_util.h"
 #include "util/set.h"
 
-/* Diagnostic controls, read once: these are consulted per draw or
- * render pass, and an uncached getenv() scans the whole environment. */
-DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
-
 #define IS_DIRTY(bit) BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_##bit)
 
 #define IS_SHADER_DIRTY(bit)                                                   \
@@ -2253,21 +2249,6 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
        * Keep all attachments together on the shared shader resolve path. */
       resolving &= !shader_resolve && !agx_tilebuffer_spills(&render->tilebuffer);
    }
-   if (debug_get_option_m5_launch_debug()) {
-      for (unsigned rt = 0; rt < count; ++rt) {
-         const struct hk_image_view *view = render->color_att[rt].iview;
-         fprintf(stderr, "M5 MRT attachment %u: format=%u selector=%#x "
-                         "samples=%u resolve=%u op=%u store=%u load=%u "
-                         "offset=%u layers=%u views=%#x\n", rt,
-                 key->tib.logical_format[rt],
-                 agx_g17p_mrt_eot_selector(key->tib.logical_format[rt]),
-                 view ? view->vk.image->samples : 0,
-                 render->color_att[rt].resolve_iview != NULL, key->op[rt],
-                 info->pColorAttachments[rt].storeOp,
-                 info->pColorAttachments[rt].loadOp,
-                 key->tib._offset_B[rt], render->layer_count, render->view_mask);
-      }
-   }
    if (count != render->color_att_count || !hk_m5_mrt_layout_supported(render))
       goto unsupported;
    for (unsigned rt = 0; rt < count; ++rt) {
@@ -2353,15 +2334,6 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       for (unsigned i = 0; i < active_count; ++i) {
          const unsigned rt = active[i];
          arguments[1 + i] = agx_tilebuffer_offset_B(&key->tib, rt);
-         if (debug_get_option_m5_launch_debug()) {
-            fprintf(stderr, "M5 MRT EOT argument rt=%u pbe=%#" PRIx64
-                            " offset=%" PRIu64 " descriptor=", rt,
-                    pbes + i * sizeof(descriptors[0]), arguments[1 + i]);
-            const uint8_t *bytes = (const uint8_t *)&descriptors[i];
-            for (unsigned b = 0; b < sizeof(descriptors[0]); ++b)
-               fprintf(stderr, "%02x", bytes[b]);
-            fprintf(stderr, "\n");
-         }
       }
       uint64_t table = hk_pool_upload(cmd, arguments, 8 * (1 + active_count), 16);
       if (!table)
@@ -2425,34 +2397,6 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
    if (!hk_m5_tile_program(dev, shader, &desc, store, &program) ||
        program.length > capacity)
       goto unsupported;
-   if (debug_get_option_m5_launch_debug()) {
-      fprintf(stderr, "M5 MRT %s count=%u sampleB=%u tile=%u gprs=%u D=%u "
-                      "shader=%#" PRIx64 " mainSize=%u ioto=",
-              store ? "EOT" : "BG", count, key->tib.sample_size_B,
-              key->tib.tile_size, desc.nr_gprs, desc.compiler_d,
-              desc.shader_va, shader->info.main_size);
-      for (size_t i = 0; i < program.length; ++i)
-         fprintf(stderr, "%02x", program.bytes[i]);
-      fprintf(stderr, "\n");
-      for (unsigned i = 0; i < range_count; ++i)
-         fprintf(stderr, "M5 MRT %s range=%u start=%u size=%u address=%#" PRIx64
-                         "\n", store ? "EOT" : "BG", i,
-                 ranges[i].start_halfs, ranges[i].size_halfs, ranges[i].address);
-      if (shader->bo && shader->bo->va &&
-          desc.shader_va >= shader->bo->va->addr) {
-         const uint64_t offset = desc.shader_va - shader->bo->va->addr;
-         if (offset <= shader->bo->size &&
-             shader->info.main_size <= shader->bo->size - offset) {
-            const uint8_t *bytes = agx_bo_map(shader->bo);
-            if (bytes) {
-               fprintf(stderr, "M5 MRT %s shaderText=", store ? "EOT" : "BG");
-               for (unsigned i = 0; i < shader->info.main_size; ++i)
-                  fprintf(stderr, "%02x", bytes[offset + i]);
-               fprintf(stderr, "\n");
-            }
-         }
-      }
-   }
    memcpy(reservation.map, program.bytes, program.length);
    hk_cmd_buffer_retain_bo(cmd, shader->bo);
    uint64_t published = hk_cmd_publish_ioto_program(cmd, &reservation, program.length);
@@ -2466,17 +2410,6 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
          ? UINT64_C(0xffff800000000000) : UINT64_C(0xffff800000000040),
    };
 unsupported:
-   if (debug_get_option_m5_launch_debug())
-      mesa_loge("M5 MRT admission: store=%u shader=%u gprs=%u staging=%u "
-                "scratch=%u preamble=%u push=%u expected=%u txf=%u loads=%u "
-                "attachments=%u samples=%u sampleB=%u tile=%u",
-                store, shader != NULL, shader ? shader->info.nr_gprs : 0,
-                shader ? shader->info.agx3_staging_known : 0,
-                shader ? shader->info.scratch_size : 0,
-                shader ? shader->info.has_preamble : 0,
-                shader ? shader->info.push_count : 0, key->reserved_preamble,
-                shader ? shader->info.uses_txf : 0, loads, count,
-                key->tib.nr_samples, key->tib.sample_size_B, key->tib.tile_size);
    mesa_loge("M5 MRT BG/EOT exceeds supported tile-program profile");
    vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
    return (struct hk_bg_eot){0};
@@ -2547,17 +2480,6 @@ hk_build_m5_empty_bg_eot(struct hk_cmd_buffer *cmd,
    };
 
 unsupported:
-   if (debug_get_option_m5_launch_debug())
-      mesa_loge("M5 empty BG/EOT admission: store=%u color=%u sampleB=%u "
-                "samples=%u tile=%u layered=%u layers=%u views=%#x spills=%u "
-                "ops=%u%u%u%u%u%u%u%u",
-                store, hk_m5_has_color(&key->tib), key->tib.sample_size_B,
-                key->tib.nr_samples, key->tib.tile_size, key->tib.layered,
-                cmd->state.gfx.render.layer_count,
-                cmd->state.gfx.render.view_mask,
-                agx_tilebuffer_spills(&key->tib), key->op[0], key->op[1],
-                key->op[2], key->op[3], key->op[4], key->op[5], key->op[6],
-                key->op[7]);
    mesa_loge("M5 empty BG/EOT exceeds native no-imageblock profile");
    vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
    return (struct hk_bg_eot){0};
@@ -2751,25 +2673,6 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
          ? UINT64_C(0xffff800000000000) : UINT64_C(0xffff800000000040),
    };
 unsupported:
-   if (debug_get_option_m5_launch_debug()) {
-      mesa_loge("M5 BG/EOT admission: store=%u partial=%u op=%u attachments=%u "
-                "sampleB=%u samples=%u tile=%u layered=%u spills=%u offsetB=%u "
-                "format=%u viewformat=%u pbe=%u shader=%u gprs=%u "
-                "stagingKnown=%u scratch=%u preamble=%u push=%u txf=%u",
-                store, partial_render, op, info->colorAttachmentCount,
-                key->tib.sample_size_B, key->tib.nr_samples, key->tib.tile_size,
-                key->tib.layered, agx_tilebuffer_spills(&key->tib),
-                agx_tilebuffer_offset_B(&key->tib, 0), key->tib.logical_format[0],
-                view ? view->vk.format : VK_FORMAT_UNDEFINED,
-                view && (key->tib.layered ? view->planes[0].layered_eot_pbe_valid
-                                          : view->planes[0].eot_pbe_valid),
-                shader != NULL, shader ? shader->info.nr_gprs : 0,
-                shader ? shader->info.agx3_staging_known : 0,
-                shader ? shader->info.scratch_size : 0,
-                shader ? shader->info.has_preamble : 0,
-                shader ? shader->info.push_count : 0,
-                shader ? shader->info.uses_txf : 0);
-   }
    vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
    return (struct hk_bg_eot){0};
 }
@@ -13141,11 +13044,6 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       if ((!agx_native_graphics(&dev->dev) || agx_is_indirect(draw.b)) &&
           !agx_vdm_draw_supported(agx_vdm_index_list_record_chip(dev->dev.chip),
                                   draw, topology)) {
-         if (debug_get_option_m5_launch_debug())
-            mesa_loge("draw admission: indexed=%u indirect=%u size=%u ib=%#llx range=%u arg=%#llx topology=%u",
-                      draw.indexed, agx_is_indirect(draw.b), draw.index_size,
-                      (unsigned long long)draw.index_buffer, draw.index_buffer_range_B,
-                      (unsigned long long)draw.b.ptr, topology);
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
