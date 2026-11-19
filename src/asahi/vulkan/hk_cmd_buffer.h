@@ -1178,6 +1178,9 @@ struct hk_cs {
    uint64_t pack_static_work;
    /* A dispatch in this stream runs a program with global atomics. */
    bool uses_global_atomics;
+   /* A dispatch in this stream runs a program with a loop: pack_static_work
+    * does not bound its run time. */
+   bool pack_loops;
    /* The stream calls another stream through a link with return; its bytes
     * must stay where they were recorded. */
    bool calls_stream;
@@ -1537,6 +1540,7 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
    a->gen1_native_rq |= b->gen1_native_rq;
    a->as_build |= b->as_build;
    a->uses_global_atomics |= b->uses_global_atomics;
+   a->pack_loops |= b->pack_loops;
    a->calls_stream |= b->calls_stream;
    a->pack_dispatches += b->pack_dispatches;
    a->pack_threads = b->pack_threads > UINT64_MAX - a->pack_threads

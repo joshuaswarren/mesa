@@ -103,6 +103,8 @@ hk_files = files(
   'hk_drm_render_core.c',
   'hk_drm_render_core.h',
   'hk_execution_allowance.h',
+  'hk_pack.c',
+  'hk_pack.h',
   'hk_queue.c',
   'hk_queue.h',
   'hk_frame_anatomy.c',

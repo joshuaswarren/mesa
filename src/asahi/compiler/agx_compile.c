@@ -9397,6 +9397,7 @@ emit_loop(agx_context *ctx, nir_loop *nloop)
    ctx->loop_nesting = 0;
    ctx->total_nesting++;
    ctx->divergent_nesting += divergent;
+   ctx->out->has_loops = true;
 
    agx_block *popped_break = ctx->break_block;
 

@@ -2953,6 +2953,7 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
    }
    hk_dispatch_with_local_size(cmd, cs, s, grid, local_size);
    cs->uses_global_atomics |= s->b.info.uses_global_atomics;
+   cs->pack_loops |= s->b.info.has_loops;
    if (agx_is_indirect(grid)) {
       cs->sib_indirect = true;
    } else {
@@ -2961,9 +2962,9 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
       cs->sib_threads = threads > UINT64_MAX - cs->sib_threads
                            ? UINT64_MAX : cs->sib_threads + threads;
 
-      /* What submit packing bounds a packet with (hk_pack_runs()). Static
-       * instruction counts do not bound loops or memory waits; they only
-       * keep packets of large programs short. */
+      /* What submit packing bounds a packet with (hk_pack_plan()). Static
+       * instruction counts bound a program without loops; pack_loops marks
+       * the others, at most one of which a packet holds. */
       uint64_t work;
       if (__builtin_mul_overflow(threads, (uint64_t)s->b.info.stats.instrs,
                                  &work))
