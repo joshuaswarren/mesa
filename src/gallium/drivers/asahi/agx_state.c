@@ -12427,6 +12427,23 @@ agx_g18_msaa4_draw_admitted(struct agx_context *ctx, struct agx_batch *batch,
       batch->key.cbufs[0].format == PIPE_FORMAT_R8G8B8A8_UNORM &&
       !batch->key.zsbuf.texture && !fs->b.info.early_fragment_tests &&
       !fs->b.info.writes_sample_mask;
+   /* A blended pixel-rate draw: the epilog's unrolled sample loop reads,
+    * blends and writes each covered sample (build_g18_msaa4_fs_epilog).
+    * Measured on the M6 against llvmpipe at 2x and 4x, with and without
+    * depth/stencil, for one RGBA8 or R11G11B10F target with every channel
+    * and sample enabled: Google Maps' area fills, which were dropped. Other
+    * shapes stay refused; RGBA16F and a partial colour mask do not encode
+    * their epilog yet. */
+   const bool per_pixel_blend =
+      per_pixel_api_mask && !fs->so->info.uses_fbfetch &&
+      fragment_pass == AGX_PASS_TYPE_TRANSLUCENT &&
+      batch->reduced_prim == MESA_PRIM_TRIANGLES &&
+      batch->key.nr_cbufs == 1 &&
+      (batch->key.cbufs[0].format == PIPE_FORMAT_R8G8B8A8_UNORM ||
+       batch->key.cbufs[0].format == PIPE_FORMAT_R11G11B10_FLOAT) &&
+      ctx->blend->key.rt[0].colormask == 0xf &&
+      (ctx->sample_mask & BITFIELD_MASK(batch->tilebuffer_layout.nr_samples)) ==
+         BITFIELD_MASK(batch->tilebuffer_layout.nr_samples);
    const bool admitted = agx_g18_msaa4_tile_layout(dev, &batch->tilebuffer_layout) &&
           (no_color || agx_g18_msaa_color_surfaces(batch)) &&
           agx_g18_msaa4_zs_surface(dev, &batch->key.zsbuf) &&
@@ -12437,7 +12454,7 @@ agx_g18_msaa4_draw_admitted(struct agx_context *ctx, struct agx_batch *batch,
            (unrolled_memory &&
             (fragment_pass == AGX_PASS_TYPE_TRANSLUCENT ||
              fragment_pass == AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH)) ||
-           resident_mrt_preserve || g18_fbfetch_unrolled) &&
+           resident_mrt_preserve || g18_fbfetch_unrolled || per_pixel_blend) &&
           ctx->rast->base.multisample &&
            (per_pixel_api_mask || per_pixel_api_shader_mask ||
             unrolled_colour || unrolled_memory ||
