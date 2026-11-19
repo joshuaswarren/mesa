@@ -1491,6 +1491,21 @@ agx_fb_has_colour(const struct pipe_framebuffer_state *fb)
    return false;
 }
 
+/* G17G's tile programs move one colour attachment and it renders one layer,
+ * so it draws and clears a framebuffer with more colour attachments or layers
+ * in passes that each bind part of it and then bind the whole framebuffer
+ * again (agx_g17g_split_mrt, agx_g17g_layered_draw, agx_g17g_layered_clear).
+ * Each of those binds ends a Z/S merge, after which the passes and the draws
+ * that follow would write colour the application never bound. These are the
+ * conditions under which agx_draw_vbo() and agx_clear() take those paths. */
+static bool
+agx_fb_drawn_in_passes(const struct agx_device *dev,
+                       const struct pipe_framebuffer_state *fb)
+{
+   return agx_chip_g17_m5(dev->chip) &&
+          (fb->nr_cbufs > 1 || util_framebuffer_get_num_layers(fb) > 1);
+}
+
 /* If the app binds a framebuffer with only a depth/stencil surface, and an
  * active render batch already renders to that same surface with the same
  * size, keep drawing into that batch: the draws are those of the batch's
@@ -1500,6 +1515,8 @@ static void
 agx_try_zs_merge(struct agx_context *ctx,
                  const struct pipe_framebuffer_state *state)
 {
+   const struct agx_device *dev = agx_device(ctx->base.screen);
+
    if (!debug_get_option_zs_merge() || !state->zsbuf.texture ||
        agx_fb_has_colour(state) || state->resolve || state->viewmask)
       return;
@@ -1510,6 +1527,7 @@ agx_try_zs_merge(struct agx_context *ctx,
          continue;
       struct agx_batch *b = &ctx->batches.slots[idx];
       if (agx_batch_is_compute(b) || !agx_fb_has_colour(&b->key) ||
+          agx_fb_drawn_in_passes(dev, &b->key) ||
           b->key.resolve || b->key.viewmask ||
           b->key.width != state->width || b->key.height != state->height ||
           b->key.samples != state->samples ||
