@@ -172,14 +172,6 @@ seal_loop_headers(struct repair_ctx *ctx, struct agx_block *exit)
 static void
 agx_opt_trivial_phi(agx_context *ctx)
 {
-   /* On G17P and M5, a phi whose source was itself remapped in this round
-    * is skipped (the cycle case below). Other chips still skip every phi
-    * whose source was not remapped, which removes nothing, so their output
-    * stays unchanged.
-    */
-   const bool skip_remapped =
-      ctx->key && (ctx->key->dev.chip == AGX_CHIP_G17P ||
-                   agx_chip_g17_m5(ctx->key->dev.chip));
    agx_index *remap = calloc(ctx->alloc, sizeof(*remap));
    for (;;) {
       bool progress = false;
@@ -208,7 +200,7 @@ agx_opt_trivial_phi(agx_context *ctx)
                 * TODO: Handle cycles faster.
                 */
                if (phi->src[s].type != AGX_INDEX_NORMAL ||
-                   agx_is_null(remap[phi->src[s].value]) != skip_remapped) {
+                   !agx_is_null(remap[phi->src[s].value])) {
                   all_same = false;
                   break;
                }
