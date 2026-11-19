@@ -23,9 +23,11 @@
 #include "util/os_misc.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 /* GPU memory is system memory that the kernel cannot evict or swap, and
  * heapBudget is only advisory, so the heap limit alone lets a process (or
@@ -266,6 +268,94 @@ hk_GetMemoryHostPointerPropertiesEXT(
    return VK_SUCCESS;
 }
 
+DEBUG_GET_ONCE_BOOL_OPTION(m5_host_alias_trace, "ASAHI_M5_HOST_ALIAS_TRACE",
+                           false)
+
+/* M5 with host_alias.dynamic: enter a host import into the device's set, so
+ * hk_cdm_alias_scope() asks for memory scope while it may alias
+ * (hk_host_import_aliases()). A GPU-writable import of pages that are all
+ * private anonymous memory of this process (/proc/self/maps), and that no
+ * other live import overlaps, has its pages at no other GPU address. A
+ * read-only one needs only private mappings: the GPU writes none of its
+ * pages through it, and writes them through another address only through a
+ * writable import of a shared mapping, which aliases itself, or of the same
+ * pages, which overlaps it. Maps the kernel does not let us read alias.
+ *
+ * Costs one read of /proc/self/maps up to the lines that cover the range.
+ * When this is the first import that may alias, the command buffers recorded
+ * before get their patch sites written (hk_device_patch_alias_sites()) before
+ * the import is returned. */
+static VkResult
+hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
+                     const void *pointer, uint64_t size)
+{
+   if (!dev->host_alias.dynamic)
+      return VK_SUCCESS;
+
+   const uintptr_t start = (uintptr_t)pointer;
+   const uintptr_t end =
+      size <= UINTPTR_MAX - start ? start + (uintptr_t)size : UINTPTR_MAX;
+   enum hk_host_map_class cls = HK_HOST_MAP_OTHER;
+   if (end != UINTPTR_MAX) {
+      const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+      if (fd >= 0) {
+         cls = hk_host_maps_classify_fd(fd, start, end);
+         close(fd);
+      }
+   }
+
+   const bool gpu_writes = !(mem->bo->flags & AGX_BO_READONLY);
+   const struct hk_host_import import = {
+      .start = start,
+      .end = end,
+      .owner = mem,
+      .gpu_writes = gpu_writes,
+      .maps_alias = hk_host_import_maps_alias(gpu_writes, cls),
+   };
+
+   simple_mtx_lock(&dev->host_alias.lock);
+   const int began = hk_host_imports_add(&dev->host_alias.imports, &import);
+   uint32_t live = p_atomic_read(&dev->host_alias_live);
+   if (began > 0)
+      live = p_atomic_add_return(&dev->host_alias_live, (uint32_t)began);
+   simple_mtx_unlock(&dev->host_alias.lock);
+
+   if (debug_get_option_m5_host_alias_trace())
+      fprintf(stderr, "M5_HOST_ALIAS import %p+%#" PRIx64 " writes=%u maps=%u "
+              "began=%d live=%u\n", pointer, size, gpu_writes, (unsigned)cls,
+              began, live);
+   if (began < 0)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   mem->host_alias_tracked = true;
+   if (began > 0 && live == (uint32_t)began) {
+      const unsigned patched = hk_device_patch_alias_sites(dev);
+      if (debug_get_option_m5_host_alias_trace())
+         fprintf(stderr, "M5_HOST_ALIAS patched %u command buffers\n",
+                 patched);
+   }
+   return VK_SUCCESS;
+}
+
+static void
+hk_host_import_untrack(struct hk_device *dev, struct hk_device_memory *mem)
+{
+   if (!mem->host_alias_tracked)
+      return;
+
+   simple_mtx_lock(&dev->host_alias.lock);
+   const unsigned stopped =
+      hk_host_imports_remove(&dev->host_alias.imports, mem);
+   const uint32_t live =
+      p_atomic_add_return(&dev->host_alias_live, -(int32_t)stopped);
+   simple_mtx_unlock(&dev->host_alias.lock);
+   mem->host_alias_tracked = false;
+
+   if (debug_get_option_m5_host_alias_trace())
+      fprintf(stderr, "M5_HOST_ALIAS free %p stopped=%u live=%u\n",
+              (void *)mem, stopped, live);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                   const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMem)
@@ -356,7 +446,8 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        * hk_host_memory_read_only. With hk_host_memory_import_read_only only
        * such a range is taken, and a range the kernel can pin for writing is
        * refused, also with hk_host_memory_read_only: the GPU then writes
-       * through no host import (hk_cdm_alias_scope()).
+       * through no host import (hk_cdm_alias_scope()). Otherwise, on M5,
+       * hk_host_import_track() decides below whether this import may alias.
        */
       assert(host_info->handleType ==
              VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT);
@@ -470,6 +561,17 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    }
 
+   if (host_info && host_info->handleType) {
+      result = hk_host_import_track(dev, mem, host_info->pHostPointer,
+                                    mem->bo->size);
+      if (result != VK_SUCCESS) {
+         agx_bo_unreference(&dev->dev, mem->bo);
+         mem->bo = NULL;
+         vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+         return result;
+      }
+   }
+
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
       hk_add_ext_bo(dev, mem->bo);
 
@@ -544,6 +646,9 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
 
    if (mem->alias_import)
       p_atomic_dec(&dev->va_alias_resources);
+
+   /* No work that may still run reaches this memory any more. */
+   hk_host_import_untrack(dev, mem);
 
    agx_bo_unreference(&dev->dev, mem->bo);
 

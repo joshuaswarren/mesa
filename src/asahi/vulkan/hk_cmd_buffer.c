@@ -180,11 +180,142 @@ hk_descriptor_state_fini(struct hk_cmd_buffer *cmd,
    }
 }
 
+/* Writes the stream words of the patch sites. M5 command memory is mapped
+ * uncached (hk_g17p_cached_cmd_memory() is G17P-only), so the words need no
+ * cache maintenance, only to be stored whole (the GPU may read the stream
+ * meanwhile when the host-alias count leaves 0) and made visible before the
+ * submission or host signal that lets the GPU run them. */
+void
+hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
+{
+   if (p_atomic_read(&cmd->alias_patched) || !cmd->alias_sites.size)
+      return;
+
+   util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site)
+      __atomic_store_n(site->word, site->value, __ATOMIC_RELAXED);
+
+   __sync_synchronize();
+   if (util_has_cache_ops())
+      util_post_flush_fence();
+   p_atomic_set(&cmd->alias_patched, 1);
+}
+
+void
+hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
+                               const void *from_end, uint8_t *to, size_t skip)
+{
+   util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site) {
+      const uint8_t *word = (const uint8_t *)site->word;
+      if (word < (const uint8_t *)from || word >= (const uint8_t *)from_end)
+         continue;
+
+      /* A site in the folded leading record moves to the trailing record
+       * that absorbed it. */
+      const size_t offset = word - (const uint8_t *)from;
+      site->word = (uint32_t *)(offset < skip ? to - AGX3_CDM_BARRIER_SIZE
+                                              : to + offset - skip);
+   }
+}
+
+/* At vkEndCommandBuffer, once nothing moves the streams any more: a command
+ * buffer that uses events gets memory scope throughout
+ * (hk_cmd_alias_scope()), one recorded while an import may alias by now is
+ * written at once, and any other waits in host_alias.cmd_buffers for
+ * hk_device_patch_alias_sites(), besides the check at submission. */
+static void
+hk_cmd_buffer_end_alias_sites(struct hk_cmd_buffer *cmd)
+{
+   if (!cmd->alias_sites.size)
+      return;
+
+   if (cmd->state.uses_events) {
+      hk_cmd_buffer_patch_alias_sites(cmd);
+      return;
+   }
+
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   simple_mtx_lock(&dev->host_alias.cmd_lock);
+   const bool scope = hk_cdm_alias_scope(dev);
+   if (!scope) {
+      list_addtail(&cmd->alias_link, &dev->host_alias.cmd_buffers);
+      p_atomic_set(&cmd->alias_registered, 1);
+   }
+   simple_mtx_unlock(&dev->host_alias.cmd_lock);
+
+   if (scope)
+      hk_cmd_buffer_patch_alias_sites(cmd);
+}
+
+/* Before the recording's command memory is released. */
+static void
+hk_cmd_buffer_reset_alias_sites(struct hk_cmd_buffer *cmd)
+{
+   if (p_atomic_read(&cmd->alias_registered)) {
+      struct hk_device *dev = hk_cmd_buffer_device(cmd);
+      simple_mtx_lock(&dev->host_alias.cmd_lock);
+      if (cmd->alias_registered) {
+         list_del(&cmd->alias_link);
+         p_atomic_set(&cmd->alias_registered, 0);
+      }
+      simple_mtx_unlock(&dev->host_alias.cmd_lock);
+   }
+
+   util_dynarray_clear(&cmd->alias_sites);
+   p_atomic_set(&cmd->alias_patched, 0);
+}
+
+/* A command buffer's sites are written once, under host_alias.patch_lock
+ * held exclusively unless nothing can read its streams yet
+ * (hk_cmd_buffer_end_alias_sites()): submit packing copies a submitted
+ * command buffer's streams under the shared lock, and could otherwise copy a
+ * word half written. Each word is stored whole, so the GPU itself reads
+ * either record. */
+unsigned
+hk_device_patch_alias_sites(struct hk_device *dev)
+{
+   unsigned patched = 0;
+   simple_mtx_lock(&dev->host_alias.cmd_lock);
+   if (!list_is_empty(&dev->host_alias.cmd_buffers)) {
+      u_rwlock_wrlock(&dev->host_alias.patch_lock);
+      list_for_each_entry_safe(struct hk_cmd_buffer, cmd,
+                               &dev->host_alias.cmd_buffers, alias_link) {
+         hk_cmd_buffer_patch_alias_sites(cmd);
+         list_del(&cmd->alias_link);
+         /* After the words: a reset that sees 0 may release them. */
+         p_atomic_set(&cmd->alias_registered, 0);
+         patched++;
+      }
+      u_rwlock_wrunlock(&dev->host_alias.patch_lock);
+   }
+   simple_mtx_unlock(&dev->host_alias.cmd_lock);
+   return patched;
+}
+
+void
+hk_submit_patch_alias_sites(struct hk_device *dev,
+                            struct vk_command_buffer *const *cmds,
+                            unsigned count)
+{
+   bool unpatched = false;
+   for (unsigned i = 0; i < count && !unpatched; ++i) {
+      const struct hk_cmd_buffer *cmd = (const void *)cmds[i];
+      unpatched = cmd->alias_sites.size && !p_atomic_read(&cmd->alias_patched);
+   }
+   if (!unpatched)
+      return;
+
+   u_rwlock_wrlock(&dev->host_alias.patch_lock);
+   for (unsigned i = 0; i < count; ++i)
+      hk_cmd_buffer_patch_alias_sites((struct hk_cmd_buffer *)cmds[i]);
+   u_rwlock_wrunlock(&dev->host_alias.patch_lock);
+}
+
 static void
 hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
 {
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
    struct hk_device *dev = hk_cmd_pool_device(pool);
+   hk_cmd_buffer_reset_alias_sites(cmd);
    hk_cmd_pending_reap(dev);
 
    /* The cached span is only valid while this recording owns its leases. */
@@ -222,6 +353,7 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
 
    hk_device_quiesce_lost_submissions(hk_cmd_pool_device(pool));
    hk_free_resettable_cmd_buffer(cmd);
+   util_dynarray_fini(&cmd->alias_sites);
    util_dynarray_fini(&cmd->large_bos);
    free(cmd->retained_set);
    if (cmd->m5_pushed_images)
@@ -260,6 +392,8 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    }
 
    cmd->large_bos = UTIL_DYNARRAY_INIT;
+   cmd->alias_sites = UTIL_DYNARRAY_INIT;
+   list_inithead(&cmd->alias_link);
 
    cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
    cmd->vk.dynamic_graphics_state.ms.sample_locations =
@@ -944,6 +1078,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
     * any address embedded in the command streams. */
    hk_cmd_buffer_publish_cached_uploads(cmd);
    hk_cmd_buffer_publish_root_uploads(cmd);
+   hk_cmd_buffer_end_alias_sites(cmd);
 
    hk_cmd_print_upload_stats(cmd);
    return vk_command_buffer_end(&cmd->vk);
@@ -1133,9 +1268,10 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * launch ends in a weak ordering barrier record, and the strong cache
     * flush is that same record with Apple's flags, upgraded in place. While
     * memory can be reached through two addresses, the flush needs memory
-    * scope (hk_cdm_alias_scope()). */
+    * scope (hk_cdm_alias_scope()); where a later host import could add one,
+    * the record is a patch site. */
    struct hk_cs *cs = cmd->current_cs.cs;
-   const bool alias_scope = hk_cdm_alias_scope(dev);
+   const bool alias_scope = hk_cmd_alias_scope(cmd);
    if (cs && HK_PERF(dev, WEAKBARRIER) && !alias_scope &&
        src_kinds && !(src_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
        dst_kinds && !(dst_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
@@ -1145,13 +1281,18 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
         !hk_cdm_visibility_flush_needed(dev, cs, alias_scope))) {
       /* Keep the preceding launch's weak ordering record in place (do not let
        * the next application dispatch elide it) and skip the flags-5 cache
-       * flush when testing ordering-only compute barriers. */
+       * flush when testing ordering-only compute barriers. Where a later host
+       * import could alias, the record is a patch site like any other. */
       cs->app_dispatch_end = NULL;
+      hk_cdm_note_alias_site(cmd, cs);
    } else if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
-              dst_kinds &&
-              hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
-      hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
-      hk_cdm_visibility_flush(dev, cs, alias_scope);
+              dst_kinds) {
+      if (hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
+         hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+         hk_cdm_visibility_flush(dev, cs, alias_scope);
+      }
+      if (!alias_scope)
+         hk_cdm_note_alias_site(cmd, cs);
    }
 
    hk_sync_barrier(cmd, src_kinds, dst_kinds);
@@ -4862,11 +5003,13 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
     * order everything recorded from now on after them, as
     * hk_CmdPipelineBarrier2() does outside a render pass. */
    struct hk_cs *cs = cmd->current_cs.cs;
-   const bool alias_scope = hk_cdm_alias_scope(dev);
+   const bool alias_scope = hk_cmd_alias_scope(cmd);
    if (cs && hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
       hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_visibility_flush(dev, cs, alias_scope);
    }
+   if (cs && !alias_scope)
+      hk_cdm_note_alias_site(cmd, cs);
    hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_ALL);
    cmd->state.deferred_clear_flushing = false;
 }

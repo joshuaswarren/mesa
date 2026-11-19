@@ -687,6 +687,57 @@ hk_cdm_visibility_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
    hk_cdm_flush(dev, cs, memory);
 }
 
+bool
+hk_cmd_alias_scope(struct hk_cmd_buffer *cmd)
+{
+   const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   return hk_cdm_alias_scope(dev) ||
+          (dev->host_alias.dynamic && cmd->state.uses_events);
+}
+
+void
+hk_cdm_note_alias_site(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!dev->host_alias.dynamic || cs->stats.cmds == 0)
+      return;
+
+   /* The record just before current: the strong flush or the last
+    * launch's ordering record. A marker equal to current means it is in the
+    * chunk being written. */
+   const bool strong = cs->current == cs->strong_flush_end;
+   if (strong && cs->current == cs->memory_flush_end)
+      return;
+
+   uint32_t *word =
+      (uint32_t *)((uint8_t *)cs->current - AGX3_CDM_BARRIER_SIZE);
+   if ((strong || cs->current == cs->weak_barrier_end) &&
+       !((uintptr_t)word & (sizeof(*word) - 1))) {
+      if (cmd->alias_sites.size &&
+          util_dynarray_top_ptr(&cmd->alias_sites, struct hk_alias_site)
+                ->word == word)
+         return;
+
+      struct hk_alias_site *site =
+         util_dynarray_grow(&cmd->alias_sites, struct hk_alias_site, 1);
+      if (site) {
+         *site = (struct hk_alias_site){
+            .word = word,
+            .value = dev->host_alias.flush_word,
+         };
+         cs->alias_sites++;
+         /* A following application dispatch must not drop the record
+          * (hk_dispatch_m5_native_impl()). */
+         cs->app_dispatch_end = NULL;
+         return;
+      }
+   }
+
+   /* No record to write later: give the dependency memory scope now. */
+   hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+   hk_cdm_visibility_flush(dev, cs, true);
+}
+
 void
 hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
@@ -699,9 +750,17 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
     * command buffer or in a later one of the same submission. While memory
     * may be mapped at a second address, end the stream with memory scope.
     * Usually this only strengthens the last launch's ordering record in
-    * place. */
-   if (!hk_cdm_alias_scope(dev) || cs->stats.cmds == 0 ||
-       !hk_cdm_visibility_flush_needed(dev, cs, true))
+    * place. Where only a later host import could map it there, that record
+    * is a patch site instead (hk_cdm_alias_scope()). */
+   if (cs->stats.cmds == 0)
+      return;
+
+   if (!hk_cmd_alias_scope(cmd)) {
+      hk_cdm_note_alias_site(cmd, cs);
+      return;
+   }
+
+   if (!hk_cdm_visibility_flush_needed(dev, cs, true))
       return;
 
    hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);

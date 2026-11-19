@@ -2738,6 +2738,18 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (vk_device_is_lost_no_report(&dev->vk))
       return VK_ERROR_DEVICE_LOST;
 
+   /* While a host import may alias, the command buffers recorded before it
+    * get memory scope at their patch sites (hk_cdm_alias_scope()), before
+    * anything reads their streams: submit packing copies them. No site is
+    * written while they are read (host_alias.patch_lock). */
+   const bool alias_dynamic = dev->host_alias.dynamic;
+   if (unlikely(alias_dynamic)) {
+      if (p_atomic_read(&dev->host_alias_live))
+         hk_submit_patch_alias_sites(dev, submit->command_buffers,
+                                     submit->command_buffer_count);
+      u_rwlock_rdlock(&dev->host_alias.patch_lock);
+   }
+
    /* Look at the command buffers before they are submitted: once the work is
     * with the kernel it can complete, and the application may then free or
     * reset them while this callback is still running on a submit thread. */
@@ -2746,6 +2758,8 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
    bool untouched;
    VkResult result = queue_submit(dev, queue, submit, &untouched);
+   if (unlikely(alias_dynamic))
+      u_rwlock_rdunlock(&dev->host_alias.patch_lock);
    if (result != VK_SUCCESS && !untouched)
       result = vk_queue_set_lost(&queue->vk, "Submit failed");
    else if (result == VK_SUCCESS && has_compute)

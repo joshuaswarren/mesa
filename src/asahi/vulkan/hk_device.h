@@ -25,6 +25,7 @@
 #include "hk_private.h"
 
 #include "hk_descriptor_table.h"
+#include "hk_host_alias.h"
 #include "hk_native_sampler.h"
 #include "hk_queue.h"
 #include "vk_device.h"
@@ -34,6 +35,7 @@
 
 struct hk_physical_device;
 struct hk_shader_binary_cache_entry;
+struct vk_command_buffer;
 struct vk_pipeline_cache;
 
 #define HK_SHADER_BINARY_CACHE_MAX 16
@@ -138,9 +140,35 @@ struct hk_device {
     * mapped at another address, see hk_cdm_alias_scope(). */
    uint32_t va_alias_resources;
    /* Whether anything this device enabled can map memory at a second GPU
-    * virtual address, decided at creation (hk_device_may_alias_memory()).
-    * M5 uses it in place of va_alias_resources, see hk_cdm_alias_scope(). */
+    * virtual address at any time, decided at creation
+    * (hk_device_may_alias_memory()). M5 uses it in place of
+    * va_alias_resources, see hk_cdm_alias_scope(). */
    bool may_alias_memory;
+   /* M5 live host imports that may give memory a second GPU address
+    * (hk_host_import_aliases()), atomic. Only counted with host_alias.dynamic;
+    * hk_cdm_alias_scope() asks for memory scope while it is not 0. */
+   uint32_t host_alias_live;
+   struct {
+      /* VK_EXT_external_memory_host with GPU-writable imports was the only
+       * reason for may_alias_memory: it was left false, and the scope
+       * follows host_alias_live instead (hk_device_may_alias_memory()). */
+      bool dynamic;
+      /* The memory-scoped strong flush, written over every patch site
+       * (struct hk_alias_site). */
+      uint32_t flush_word;
+      /* The device's live host imports. */
+      simple_mtx_t lock;
+      struct hk_host_imports imports;
+      /* Executable command buffers with unwritten patch sites
+       * (hk_cmd_buffer::alias_link), patched when host_alias_live leaves 0. */
+      simple_mtx_t cmd_lock;
+      struct list_head cmd_buffers;
+      /* Submit packing copies the streams of the command buffers it
+       * submits: a submission holds this shared until the kernel has them,
+       * and the first write of a command buffer's sites that one could see
+       * takes it exclusively (taken after cmd_lock). */
+      struct u_rwlock patch_lock;
+   } host_alias;
    /* One bit per main-heap page: only unbound sparse buffer pages are set. */
    struct agx_bo *physical_sparse_map;
    /* The buffers with a residency map (hk_buffer::sparse_map), for texel
@@ -404,13 +432,43 @@ enum hk_perftest {
  * (hk_cdm_visibility_flush()). Devices without such memory keep the ordinary
  * strong flush.
  *
- * On M5 this is decided once, when the device is created
- * (hk_device_may_alias_memory()): a device that enabled no feature or
- * extension through which memory can get a second GPU address (sparse
- * binding, capture/replay, fd imports, writable host imports) never has such
- * memory, and every other device flushes with memory scope at every
- * dependency, also in command buffers recorded before such memory existed
- * or that reach it only while they run.
+ * On M5 the features through which memory can get a second GPU address are
+ * looked at once, when the device is created (hk_device_may_alias_memory()).
+ * A device that enabled sparse binding, capture/replay or fd imports flushes
+ * with memory scope at every dependency, also in command buffers recorded
+ * before such memory existed or that reach it only while they run. A device
+ * that enabled none of them, nor writable host imports, never has such
+ * memory. Where writable host imports are the only one (host_alias.dynamic),
+ * the scope follows the imports that exist: memory scope while one of them
+ * may alias (host_alias_live, hk_host_import_aliases()), that is, it is not
+ * all private anonymous memory of this process, or it overlaps another live
+ * import of which one of the two is GPU-writable. The pages of an import get
+ * their second GPU address only when the import is created, so the work
+ * recorded or submitted before then is given memory scope at that point:
+ *
+ * - Each application dependency between compute and transfer work that this
+ *   rule recorded without memory scope is a patch site
+ *   (hk_cdm_note_alias_site()): the stream word of its barrier record, over
+ *   which the memory-scoped strong flush is written (struct hk_alias_site).
+ * - A command buffer's sites are written at submission while the scope is
+ *   on, before its streams are packed or handed to the kernel
+ *   (hk_queue_submit()). Work behind a semaphore the host signals reaches
+ *   the driver only once that signal is submitted (the runtime submits it
+ *   from a thread that waits for VK_SYNC_WAIT_PENDING), so after every
+ *   import the work may reach; work already with the kernel can reach no
+ *   later import, which no host signal orders before it.
+ * - When host_alias_live leaves 0, the sites of every executable command
+ *   buffer are written as well (hk_device_patch_alias_sites()).
+ * - Writes only add memory scope, and a written command buffer keeps it
+ *   until it is reset or freed.
+ * - What records no site keeps memory scope while the mode is on: the
+ *   dependencies of graphics paths (transfers ordered before a draw, task
+ *   launches), and all of a command buffer that uses events, since an event
+ *   the host sets could let an execution that already started reach memory
+ *   imported after it started (hk_cmd_alias_scope()).
+ *
+ * ASAHI_M5_HOST_ALIAS_STATIC=1 restores the per-device rule for host
+ * imports (A/B and fallback).
  *
  * On G17P the state is read when a barrier is recorded: live sparse and
  * capture/replay resources, and live fd imports and host imports the GPU may
@@ -441,7 +499,7 @@ static inline bool
 hk_cdm_alias_scope(const struct hk_device *dev)
 {
    if (agx_chip_g17_m5(dev->dev.chip))
-      return dev->may_alias_memory;
+      return dev->may_alias_memory || p_atomic_read(&dev->host_alias_live);
 
    return dev->dev.chip == AGX_CHIP_G17P &&
           p_atomic_read(&dev->va_alias_resources) != 0;
@@ -455,6 +513,26 @@ hk_cdm_memory_scope_form(const struct hk_device *dev)
 {
    return dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip);
 }
+
+/* As hk_cdm_alias_scope(), for an application dependency recorded without a
+ * patch site (struct hk_alias_site): with host_alias.dynamic always, since
+ * nothing would give the record memory scope once an import may alias. */
+static inline bool
+hk_cdm_alias_scope_unpatched(const struct hk_device *dev)
+{
+   return hk_cdm_alias_scope(dev) || dev->host_alias.dynamic;
+}
+
+/* Writes the patch sites of every executable command buffer that has
+ * unwritten ones (host_alias.cmd_buffers), when the first host import that
+ * may alias appears. Returns how many command buffers it wrote. */
+unsigned hk_device_patch_alias_sites(struct hk_device *dev);
+
+/* At submission, while an import may alias: writes the patch sites of the
+ * submitted command buffers, before submit packing copies their streams. */
+void hk_submit_patch_alias_sites(struct hk_device *dev,
+                                 struct vk_command_buffer *const *cmds,
+                                 unsigned count);
 
 static inline struct hk_physical_device *
 hk_device_physical(struct hk_device *dev)

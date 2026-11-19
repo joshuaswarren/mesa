@@ -1124,8 +1124,13 @@ struct hk_cs {
    /* AGX3 CDM: the value of current just after a strong flush that also has
     * memory scope (AGX3_CDM_BARRIER_FLUSH_MEMORY): on G17P and M5 the
     * flushes hk_cdm_visibility_flush() asks for, and on M5 also the driver's
-    * own (hk_cdm_cache_flush()). */
+    * own (hk_cdm_cache_flush()). A patch site written later
+    * (struct hk_alias_site) does not move it. */
    void *memory_flush_end;
+
+   /* M5: patch sites recorded in this stream (hk_cmd_buffer::alias_sites),
+    * which a merge moves with its bytes. */
+   uint32_t alias_sites;
 
    /* AGX3 CDM: the value of current just after a standalone barrier that is
     * the stream's *first* record. Apple's emitter only opens a stream with a
@@ -1445,6 +1450,13 @@ hk_sync_later(struct hk_cs *a, struct hk_cs *b)
 void *hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
                                  uint64_t target, bool vdm);
 
+/* Moves the patch sites of cmd in [from, from_end), copied to `to` without
+ * their first `skip` bytes, which were folded into the record just before
+ * `to` (hk_cs_merge_cdm_until()). */
+void hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd,
+                                    const void *from, const void *from_end,
+                                    uint8_t *to, size_t skip);
+
 /*
  * Helper to merge two compute control streams, concatenating the second control
  * stream, up to b_current, to the first one. Must sync with hk_cs.
@@ -1500,6 +1512,11 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
 
       memcpy(dst, (const uint8_t *)b->start + b_skip, b_size - b_skip);
       a->current = dst + (b_size - b_skip);
+      /* b's patch sites are in the copy now. Submit packing copies other
+       * command buffers' streams, whose sites stay with their recording. */
+      if (b->alias_sites && a->cmd == b->cmd)
+         hk_cmd_buffer_move_alias_sites(a->cmd, b->start, b_current, dst,
+                                        b_skip);
 
       /* These markers point just past an emitted barrier. Preserve them in
        * the destination root so another adjacent merge still has an exact
@@ -1536,6 +1553,7 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
       a->app_dispatch_end = NULL;
    }
 
+   a->alias_sites += b->alias_sites;
    a->uses_sampler_heap |= b->uses_sampler_heap;
    a->gen1_native_rq |= b->gen1_native_rq;
    a->as_build |= b->as_build;
@@ -1882,7 +1900,46 @@ struct hk_cmd_buffer {
     * large_bos, so it dies with the recording like every other program
     * reference. */
    struct hk_ioto_arena ioto;
+
+   /* M5 with hk_device::host_alias.dynamic: the application dependencies
+    * recorded without memory scope (struct hk_alias_site), written once an
+    * import may alias (hk_cdm_alias_scope()). alias_patched (atomic) once
+    * they are; alias_registered (atomic) while alias_link is in
+    * hk_device::host_alias.cmd_buffers. */
+   struct util_dynarray alias_sites;
+   uint32_t alias_patched;
+   uint32_t alias_registered;
+   struct list_head alias_link;
 };
+
+/* A patch site: the stream word of a barrier record an application
+ * dependency was recorded with, without memory scope, because no host import
+ * could alias then (hk_cdm_alias_scope()). `value` is the memory-scoped
+ * strong flush (hk_device::host_alias.flush_word), which only strengthens
+ * the record: a weak ordering record, or a strong flush, becomes the strong
+ * flush with memory scope, as hk_cdm_flush() upgrades in place. A
+ * site stays a barrier record for the life of the recording: an application
+ * dispatch after it no longer drops it, and a merge that folds a leading
+ * barrier over it writes a barrier. */
+struct hk_alias_site {
+   uint32_t *word;
+   uint32_t value;
+};
+
+/* Whether an application dependency recorded now needs memory scope: as
+ * hk_cdm_alias_scope(), and also, with host_alias.dynamic, in a command
+ * buffer that uses events. */
+bool hk_cmd_alias_scope(struct hk_cmd_buffer *cmd);
+
+/* After an application dependency was recorded into cs without memory scope
+ * because hk_cmd_alias_scope() was false: with host_alias.dynamic, records
+ * the stream's last record as a patch site, or, without such a record,
+ * flushes with memory scope now. */
+void hk_cdm_note_alias_site(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+
+/* Writes the command buffer's patch sites, once. Callers ensure no reset
+ * runs concurrently; two writers write the same words. */
+void hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd);
 
 /* Transfer entry points bracket their recording so the streams they create
  * belong to the transfer stage class (VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT and
@@ -2451,7 +2508,8 @@ void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,
                                        void *current);
 
 /* Ends a compute stream holding launches with a flush that has memory scope
- * while hk_cdm_alias_scope() asks for it. */
+ * while hk_cmd_alias_scope() asks for it; otherwise its last record is a
+ * patch site (hk_cdm_note_alias_site()). */
 void hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 static void
