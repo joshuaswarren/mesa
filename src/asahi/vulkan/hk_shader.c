@@ -850,6 +850,8 @@ enum hk_feature_key {
     * contents when a draw or dispatch is recorded away from them. The layout
     * hash carries the flag into the shader cache key. */
    HK_FEAT_DESCRIPTOR_BUFFER = BITFIELD_BIT(8),
+
+   HK_FEAT_IMAGE_VIEW_MIN_LOD = BITFIELD_BIT(9),
 };
 
 /* What a dynamic-sample-count G17P fragment shader needs to compile its
@@ -910,7 +912,8 @@ hk_make_feature_key(const struct vk_features *feats)
     * object binary must not depend on the features its device enabled, so
     * assume every state they can draw with. */
    if (!feats)
-      return HK_FEAT_CUSTOM_BORDER | HK_FEAT_DEPTH_CLIP_CONTROL;
+      return HK_FEAT_CUSTOM_BORDER | HK_FEAT_DEPTH_CLIP_CONTROL |
+             HK_FEAT_IMAGE_VIEW_MIN_LOD;
 
    return (feats->customBorderColors ? HK_FEAT_CUSTOM_BORDER : 0) |
           (feats->descriptorBindingSampledImageUpdateAfterBind
@@ -921,7 +924,8 @@ hk_make_feature_key(const struct vk_features *feats)
           (feats->pipelineRobustness ? HK_FEAT_PIPELINE_ROBUSTNESS : 0) |
           (hk_rt_features_enabled(feats) ? HK_FEAT_RAY_TRACING : 0) |
           (feats->nullDescriptor ? HK_FEAT_NULL_DESCRIPTOR : 0) |
-          (feats->depthClipControl ? HK_FEAT_DEPTH_CLIP_CONTROL : 0);
+          (feats->depthClipControl ? HK_FEAT_DEPTH_CLIP_CONTROL : 0) |
+          (feats->minLod ? HK_FEAT_IMAGE_VIEW_MIN_LOD : 0);
 }
 
 /*
@@ -3394,7 +3398,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    struct hk_instance *instance = hk_physical_device_instance(
       (struct hk_physical_device *)dev->vk.physical);
 
-   if (instance->drirc.misc.image_view_min_lod) {
+   if (instance->drirc.misc.image_view_min_lod &&
+       (features & HK_FEAT_IMAGE_VIEW_MIN_LOD)) {
       NIR_PASS(_, nir, hk_nir_lower_image_view_min_lod);
    }
 
