@@ -184,6 +184,31 @@ libasahi_compiler = static_library(
 )
 
 if with_tests
+  # agx3_bind_compose()'s memo against the table walk, on every instruction
+  # of the native witness texts.
+  test(
+    'agx3_bind_memo',
+    executable(
+      'agx3_bind_memo_test',
+      files(
+        'agx3_binder.c',
+        'agx3_compose/agx3_compose.c',
+        'agx3_compose/agx3_decode.c',
+        'agx3_compose/agx3b_tables.c',
+        'agx3_compose/agx3c_tables.c',
+        'agx3_compose/agx3d_tables.c',
+        'test/test-agx3-bind-memo.c',
+      ),
+      c_args : [c_msvc_compat_args, no_override_init_args,
+                '-DAGX3_HAVE_AGX3D_TABLE'],
+      gnu_symbol_visibility : 'hidden',
+      include_directories : [inc_include, inc_src],
+      link_with : [libagx3c_disasm, libagx3d_disasm],
+    ),
+    suite : ['asahi'],
+    args : [meson.project_source_root() / 'src/asahi/compiler/test/native/g18g'],
+  )
+
   test(
     'agx3_subgroup_core',
     executable(

@@ -65,6 +65,46 @@ def chunk(x):
 def instr_is_trivial(I):
     return len(I.dests + I.sources + I.immediates + I.modifiers) == 0
 
+# Instruction length lookups (the transcoder and the G18G re-encoding cache
+# segment every program with them) test the forms in table order until one
+# matches. Index the forms by LENGTH_INDEX_BITS of the instruction's first 64
+# bits, the bits most forms fix: a bucket lists, in table order, the forms
+# whose fixed bits agree with the bucket's. A form whose shortest length does
+# not reach a bit does not fix it. So the first match within the bucket is the
+# first match in the whole table.
+LENGTH_INDEX_BITS = 10
+
+def length_index(instrs):
+    lengths = [min(I.length[0], I.length[-1]) for I in instrs]
+    def fixes(I, n, b):
+        return b < 8 * n and (I.exact.mask >> b) & 1
+    count = [sum(1 for I, n in zip(instrs, lengths) if fixes(I, n, b))
+             for b in range(64)]
+    bits = sorted(sorted(range(64), key=lambda b: (-count[b], b))[:LENGTH_INDEX_BITS])
+
+    buckets = [[] for _ in range(1 << LENGTH_INDEX_BITS)]
+    for i, (I, n) in enumerate(zip(instrs, lengths)):
+        mask = value = 0
+        for k, b in enumerate(bits):
+            if fixes(I, n, b):
+                mask |= 1 << k
+                value |= ((I.exact.value >> b) & 1) << k
+        for key in range(1 << LENGTH_INDEX_BITS):
+            if key & mask == value:
+                buckets[key].append(i)
+
+    start, forms = [0], []
+    for bucket in buckets:
+        forms += bucket
+        start.append(len(forms))
+    assert len(instrs) < (1 << 16) and len(forms) < (1 << 16)
+    return bits, start, forms
+
+def c_list(values, per_line=16):
+    lines = [', '.join(str(v) for v in values[i:i + per_line])
+             for i in range(0, len(values), per_line)]
+    return ',\n   '.join(lines)
+
 def extract_bits(x, bitset="r"):
     parts = []
     n = 0
@@ -174,13 +214,39 @@ ${isa_prefix}_disassemble_instr(BITSET_WORD *code, FILE *fp, unsigned offset, si
   return _disassemble_instr(code, fp, decodings, ARRAY_SIZE(decodings), available, offset, verbose);
 }
 
+<% index_bits, index_start, index_forms = length_index(list(isa.instrs.values())) %>
+static const uint8_t length_index_bits[] = {
+   ${c_list(index_bits)}
+};
+
+static const uint16_t length_index_start[] = {
+   ${c_list(index_start)}
+};
+
+static const uint16_t length_index_forms[] = {
+   ${c_list(index_forms)}
+};
+
+static const struct disasm_length_index length_index = {
+   .nr_bits = ARRAY_SIZE(length_index_bits),
+   .bits = length_index_bits,
+   .start = length_index_start,
+   .forms = length_index_forms,
+};
+
 signed
 ${isa_prefix}_instr_length(const uint8_t *code, size_t available, const char **display)
 {
-  return _instr_length(code, decodings, ARRAY_SIZE(decodings), available, display);
+  return _instr_length(code, decodings, &length_index, available, display);
+}
+
+signed
+${isa_prefix}_instr_length_linear(const uint8_t *code, size_t available, const char **display)
+{
+  return _instr_length_linear(code, decodings, ARRAY_SIZE(decodings), available, display);
 }"""
 
 try:
-    print(Template(template).render(isa = isa, isa_prefix = isa_prefix, safe_name = safe_name, chunk = chunk, instr_is_trivial = instr_is_trivial, extract_bits = extract_bits))
+    print(Template(template).render(isa = isa, isa_prefix = isa_prefix, safe_name = safe_name, chunk = chunk, instr_is_trivial = instr_is_trivial, extract_bits = extract_bits, length_index = length_index, c_list = c_list))
 except:
     print(exceptions.text_error_template().render())

@@ -200,37 +200,83 @@ print_modifier(struct disasm_ctx *ctx, const char *display, unsigned value)
    }
 }
 
+/* The forms of a table indexed by some of an instruction's first 64 bits
+ * (gen-disasm.py, length_index()): the forms of bucket `key` are
+ * forms[start[key]] up to forms[start[key + 1]], in table order. */
+struct disasm_length_index {
+   unsigned nr_bits;
+   const uint8_t *bits;
+   const uint16_t *start;
+   const uint16_t *forms;
+};
+
+/* The length of spec's instruction if the code (at most `available` bytes,
+ * zero-padded in tmp) is one, else 0: the matching rule _disassemble_instr
+ * uses. */
+static inline unsigned
+_spec_length(const BITSET_WORD *tmp, const struct disasm_spec *spec,
+             size_t available)
+{
+   const unsigned n = BITSET_TEST(tmp, spec->length_bit) ? spec->length_long
+                                                         : spec->length_short;
+   if (n > available)
+      return 0;
+
+   for (unsigned w = 0; w < AGX_DISASM_WORDS; ++w) {
+      BITSET_WORD masked = tmp[w];
+      const unsigned base = w * 4;
+      if (base >= n)
+         masked = 0;
+      else if (n - base < 4)
+         masked &= (UINT32_C(1) << ((n - base) * 8)) - 1;
+      if ((masked & spec->mask[w]) != spec->exact[w])
+         return 0;
+   }
+   return n;
+}
+
 /* The length and display name of the instruction at code, by exactly the
- * matching rule _disassemble_instr uses, without printing. -1 if no form
- * matches within `available` bytes. The display name may carry trailing
- * padding spaces. */
+ * matching rule _disassemble_instr uses, without printing: the first form in
+ * table order that matches. -1 if no form matches within `available` bytes.
+ * The display name may carry trailing padding spaces. Only the forms of the
+ * code's index bucket can match, and they keep their table order. */
 static signed
-_instr_length(const uint8_t *code, struct disasm_spec *specs,
-              unsigned nr_specs, size_t available, const char **display)
+_instr_length(const uint8_t *code, const struct disasm_spec *specs,
+              const struct disasm_length_index *index, size_t available,
+              const char **display)
+{
+   BITSET_WORD tmp[AGX_DISASM_WORDS] = {0};
+   memcpy(tmp, code, MIN2(available, sizeof(tmp)));
+
+   unsigned key = 0;
+   for (unsigned k = 0; k < index->nr_bits; ++k)
+      key |= (unsigned)BITSET_TEST(tmp, index->bits[k]) << k;
+
+   for (unsigned i = index->start[key]; i < index->start[key + 1]; ++i) {
+      const struct disasm_spec *spec = &specs[index->forms[i]];
+      const unsigned n = _spec_length(tmp, spec, available);
+      if (n) {
+         if (display)
+            *display = spec->display;
+         return n;
+      }
+   }
+   return -1;
+}
+
+/* _instr_length over the whole table, the reference for its index. */
+static signed
+_instr_length_linear(const uint8_t *code, const struct disasm_spec *specs,
+                     unsigned nr_specs, size_t available, const char **display)
 {
    BITSET_WORD tmp[AGX_DISASM_WORDS] = {0};
    memcpy(tmp, code, MIN2(available, sizeof(tmp)));
 
    for (unsigned i = 0; i < nr_specs; ++i) {
-      const struct disasm_spec *spec = &specs[i];
-      const unsigned n = BITSET_TEST(tmp, spec->length_bit) ? spec->length_long
-                                                            : spec->length_short;
-      if (n > available)
-         continue;
-
-      bool match = true;
-      for (unsigned w = 0; w < AGX_DISASM_WORDS && match; ++w) {
-         BITSET_WORD masked = tmp[w];
-         const unsigned base = w * 4;
-         if (base >= n)
-            masked = 0;
-         else if (n - base < 4)
-            masked &= (UINT32_C(1) << ((n - base) * 8)) - 1;
-         match = (masked & spec->mask[w]) == spec->exact[w];
-      }
-      if (match) {
+      const unsigned n = _spec_length(tmp, &specs[i], available);
+      if (n) {
          if (display)
-            *display = spec->display;
+            *display = specs[i].display;
          return n;
       }
    }
