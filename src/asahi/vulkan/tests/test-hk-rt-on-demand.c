@@ -156,7 +156,7 @@ rt_state_absent(const struct hk_device *dev)
           !dev->gen1_rq_instances && !dev->gen1_rq_candidates &&
           !dev->gen1_native_fragment_rq && !dev->gen1_native_graphics_rq &&
           !dev->gen1_rq_code && !dev->gen1_rq_ift && !dev->gen1_rq_state &&
-          !dev->gen1_as_query_bank && !dev->gen1_vertex_directory &&
+          !dev->gen1_vertex_directory &&
           !dev->gen1_as_lock_ready && !dev->accel_struct_args.has_update;
 }
 
@@ -167,7 +167,7 @@ rt_resources_released(const struct hk_device *dev)
    return !dev->gen1_native_rq && !dev->gen1_rq_code && !dev->gen1_rq_ift &&
           !dev->gen1_rq_state && !dev->gen1_rq_code_alias &&
           !dev->gen1_rq_maps && !dev->gen1_rq_user_image &&
-          !dev->gen1_rq_bound_maps && !dev->gen1_as_query_bank &&
+          !dev->gen1_rq_bound_maps &&
           !dev->gen1_vertex_directory && !dev->gen1_as_metadata &&
           !dev->gen1_as_addresses && !dev->gen1_as_lock_ready &&
           !dev->gen1_as_ids && !dev->gen1_vertex_tables &&
@@ -400,7 +400,6 @@ int
 main(void)
 {
    unsetenv("ASAHI_G17P_RT_DISABLE");
-   unsetenv("ASAHI_G17P_RQ_LIVE_AS_TABLE");
 
    test_feature_predicate();
 

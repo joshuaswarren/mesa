@@ -287,9 +287,6 @@ hk_gen1_as_publish_address(struct hk_device *dev, uint32_t id, uint64_t address,
       __atomic_store_n(slot, address, __ATOMIC_RELEASE);
    if (table)
       __atomic_store_n(table, base, __ATOMIC_RELEASE);
-   if (dev->gen1_as_query_bank && id < HK_GEN1_AS_TABLE_AS_SLOTS)
-      __atomic_store_n((uint64_t *)agx_bo_map(dev->gen1_as_query_bank) + 2 * id,
-                       base, __ATOMIC_RELEASE);
    util_post_flush_fence();
 }
 
@@ -584,9 +581,7 @@ hk_CreateAccelerationStructureKHR(VkDevice device,
    const uint32_t index = reuse ? dev->gen1_as_free_head :
       util_dynarray_num_elements(&dev->gen1_ases, struct hk_gen1_as_slot);
    const uint32_t id = hk_gen1_as_index_to_id(index);
-   const bool live_limit = dev->gen1_rq_live_as_table &&
-                           id >= HK_GEN1_AS_TABLE_AS_SLOTS;
-   if (!live_limit && id < HK_GEN1_AS_ID_LIMIT &&
+   if (id < HK_GEN1_AS_ID_LIMIT &&
        hk_gen1_sparse_entry(dev, &dev->gen1_as_address_pages, id) &&
        hk_gen1_sparse_entry(dev, &dev->gen1_as_table_pages, id) &&
        hk_gen1_sparse_entry(dev, &dev->gen1_as_metadata_pages, id)) {
@@ -661,36 +656,10 @@ hk_DestroyAccelerationStructureKHR(VkDevice device, VkAccelerationStructureKHR h
    vk_common_DestroyAccelerationStructureKHR(device, handle, alloc);
 }
 
-static uint64_t
-hk_gen1_upload_live_as_table(struct hk_cmd_buffer *cmd)
-{
-   struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
-   const uint32_t tail = HK_GEN1_RQ_PHYSICAL_SLOTS * HK_GEN1_AS_TABLE_ENTRY_BYTES;
-   struct hk_gen1_as_table_chunk *chunk = NULL;
-   bool first = list_is_empty(&cmd->gen1_as_table_chunks);
-   if (!first)
-      chunk = list_last_entry(&cmd->gen1_as_table_chunks,
-                             struct hk_gen1_as_table_chunk, link);
-   if (!chunk || chunk->next == chunk->count) {
-      VkResult result = hk_cmd_pool_alloc_gen1_as_chunk(pool, first ? 1 : 4,
-                                                         &chunk);
-      if (result != VK_SUCCESS) {
-         vk_command_buffer_set_error(&cmd->vk, result);
-         return 0;
-      }
-      list_addtail(&chunk->link, &cmd->gen1_as_table_chunks);
-   }
-   const uint32_t row = chunk->next++;
-   memset((uint8_t *)agx_bo_map(chunk->tail) + row * tail, 0, tail);
-   return chunk->va->addr + row * HK_GEN1_AS_TABLE_BYTES;
-}
-
 uint64_t
 hk_gen1_upload_as_table(struct hk_cmd_buffer *cmd)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (dev->gen1_rq_live_as_table)
-      return hk_gen1_upload_live_as_table(cmd);
    return dev->gen1_as_table_pages.va ? dev->gen1_as_table_pages.va->addr : 0;
 }
 
@@ -1858,7 +1827,6 @@ hk_gen1_rq_finish(struct hk_device *dev)
    dev->gen1_rq_code=NULL;dev->gen1_rq_ift=NULL;
    dev->gen1_rq_code_alias=NULL;dev->gen1_rq_bound_maps=0;
    dev->gen1_native_rq=false;
-   hk_device_finish_gen1_as_chunks(dev);
    dev->gen1_vertex_directory = NULL;
    dev->gen1_vertex_directory_va = NULL;
    hk_gen1_sparse_finish(dev, &dev->gen1_vertex_directory_pages);
@@ -1893,9 +1861,6 @@ hk_gen1_rq_finish(struct hk_device *dev)
    }
    dev->gen1_as_metadata = NULL;
    dev->gen1_as_addresses = NULL;
-   agx_bo_unreference(&dev->dev, dev->gen1_as_query_bank);
-   dev->gen1_as_query_bank = NULL;
-   dev->gen1_rq_live_as_table = false;
    dev->gen1_rq_instances=false;
 }
 
@@ -2037,8 +2002,6 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
       return vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
    dev->gen1_rq_instances = dev->gen1_native_rq;
    dev->gen1_rq_candidates = dev->gen1_rq_instances;
-   dev->gen1_rq_live_as_table = dev->gen1_rq_instances &&
-      debug_get_bool_option("ASAHI_G17P_RQ_LIVE_AS_TABLE", false);
    dev->gen1_native_fragment_rq = dev->gen1_rq_candidates &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RAY_QUERY);
    dev->gen1_native_graphics_rq = dev->gen1_native_fragment_rq;
@@ -2099,14 +2062,6 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
          dev->gen1_vertex_directory = NULL;
          dev->gen1_vertex_directory_va = NULL;
       }
-      if (dev->gen1_rq_live_as_table) {
-         simple_mtx_init(&dev->gen1_as_chunk_cache_lock, mtx_plain);
-         for (unsigned i = 0; i < 2; ++i) {
-            list_inithead(&dev->gen1_as_free_chunks[i]);
-            dev->gen1_as_free_chunk_count[i] = 0;
-         }
-         dev->gen1_as_chunk_cache_lock_ready = true;
-      }
       /* GPU-only live metadata: builds/copies initialize all64 bytes. */
       const bool tables_ok =
          hk_gen1_sparse_init(dev, &dev->gen1_as_metadata_pages,
@@ -2124,12 +2079,7 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
          hk_gen1_sparse_entry(dev, &dev->gen1_as_address_pages, 0) &&
          hk_gen1_sparse_entry(dev, &dev->gen1_as_table_pages,
                               HK_GEN1_AS_TABLE_ENTRIES - 1);
-      if (dev->gen1_rq_live_as_table)
-         dev->gen1_as_query_bank = agx_bo_create(&dev->dev,
-            HK_GEN1_AS_TABLE_AS_SLOTS * HK_GEN1_AS_TABLE_ENTRY_BYTES, 16384,
-            0, "Gen1 live AS query bank");
-      if (!tables_ok || !dev->gen1_as_ids ||
-          (dev->gen1_rq_live_as_table && !dev->gen1_as_query_bank)) {
+      if (!tables_ok || !dev->gen1_as_ids) {
          hk_gen1_rq_finish(dev);
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
@@ -2137,9 +2087,6 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
          &dev->gen1_as_metadata_pages.pages, struct agx_bo *, 0);
       dev->gen1_as_addresses = *util_dynarray_element(
          &dev->gen1_as_address_pages.pages, struct agx_bo *, 0);
-      if (dev->gen1_as_query_bank)
-         memset(agx_bo_map(dev->gen1_as_query_bank), 0,
-                HK_GEN1_AS_TABLE_AS_SLOTS * HK_GEN1_AS_TABLE_ENTRY_BYTES);
       if (dev->vk.enabled_features.accelerationStructureHostCommands) {
          VkResult result = hk_host_as_init(dev);
          if (result != VK_SUCCESS) {
@@ -2701,8 +2648,8 @@ hk_host_as_begin(struct hk_device *dev, struct hk_host_as_run *run)
    if (!dev->g17p_native_as || !dev->host_as.queue || !dev->host_as.pool)
       return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
 
-   /* Recording command buffers also accesses the shared pool's free BO and
-    * AS chunk lists. Serialize the whole synchronous operation, including
+   /* Recording command buffers also accesses the shared pool's free BO
+    * lists. Serialize the whole synchronous operation, including
     * recording and retirement, rather than just allocation and submission. */
    simple_mtx_lock(&dev->host_as.lock);
    run->locked = true;

@@ -193,15 +193,9 @@ struct hk_device {
    struct hk_gen1_sparse_table gen1_vertex_directory_pages;
    struct agx_bo *gen1_as_metadata;
    struct agx_bo *gen1_as_addresses;
-   struct agx_bo *gen1_as_query_bank;
    struct agx_bo *gen1_as_window_roots;
    struct util_dynarray gen1_as_windows; /* struct hk_gen1_as_window */
    uint32_t gen1_as_window_hint;
-   bool gen1_rq_live_as_table;
-   bool gen1_as_chunk_cache_lock_ready;
-   simple_mtx_t gen1_as_chunk_cache_lock;
-   struct list_head gen1_as_free_chunks[2];
-   uint32_t gen1_as_free_chunk_count[2];
    struct agx_bo *gen1_rq_code, *gen1_rq_ift;
    /* Immutable generated user image, shared by all query launches. */
    struct agx_bo *gen1_rq_state;
