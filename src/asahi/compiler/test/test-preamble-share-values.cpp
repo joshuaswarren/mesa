@@ -59,7 +59,7 @@ run_share(bool uniform_if, unsigned arms_sharing)
 
    nir_validate_shader(b.shader, "before preamble");
    unsigned sizes[] = {4, 0, 0};
-   EXPECT_TRUE(agx_nir_opt_preamble(b.shader, sizes, true, false));
+   EXPECT_TRUE(agx_nir_opt_preamble(b.shader, sizes, true, false, NULL));
    nir_validate_shader(b.shader, "after preamble");
 
    share_result r = {};
