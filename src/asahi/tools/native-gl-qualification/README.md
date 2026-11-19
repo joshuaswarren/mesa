@@ -7,8 +7,7 @@ Keep raw machine logs and captures private; publish only sanitized results.
 
 ## Inputs and identity
 
-Use an aarch64 overlay built from the exact candidate commit, including the
-prerequisite compiler and Zink fixes in Mesa PR 116. Record the Mesa commit,
+Use an aarch64 overlay built from the exact candidate commit. Record the Mesa commit,
 archive SHA256, ELF architecture and runtime dependencies, kernel revision,
 CTS revision, binary SHA256 and deqp-runner version. Do not mix builds between
 the two driver paths. Do not use an x86 DRM-shim build as a hardware result.
@@ -218,11 +217,11 @@ for rep in $(seq 0 7); do
 done
 ```
 
-Repetition 0 warms the cache and is excluded. The public aurora-silicon/gpubench
-currently has Vulkan and Metal executors, **no GL executor**. There is no valid
-`gpubench --api gl` command. Vulkan timings do not compare native GL with Zink.
-Record this metric as unavailable until a matching GL executor exists; do not
-invent numbers or relabel a Vulkan run. This kit has no measured Neo scores.
+Repetition 0 warms the cache and is excluded. For a gpubench comparison use
+the public aurora-silicon/gpubench GL executor, `gpubench-gl` (built with
+`-DGB_BUILD_GL=ON`), on both paths and check the renderer it reports. Vulkan
+timings do not compare native GL with Zink; do not invent numbers or relabel a
+Vulkan run. This kit has no measured Neo scores.
 
 ## Default selection and rollback
 

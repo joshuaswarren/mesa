@@ -14,7 +14,8 @@ texture witness waits at f84. Immediate alpha 1 is minifloat 0x30 at f66.
 The production encoder reproduces all seven G17P instructions and all six
 non-leading G17G/G18G instructions byte-for-byte. The two leading constant
 packs remain refused: their f102 marker needs a separately qualified G17G/G18G
-shader-part relocation path. Packed float formats and unpack remain G17P-only.
+shader-part relocation path. Packed float formats remain G17P-only; RGB10A2
+unpack has its own G17G/G18G form (`agx3_rgb10a2_unpack_encode_g18g`).
 
 Repeatable native extraction and original CTS replay artifacts are retained in
 the J873 workbench (run 277). `compile-native.py --attempt NAME`
