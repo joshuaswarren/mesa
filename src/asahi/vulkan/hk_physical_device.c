@@ -1324,11 +1324,18 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxMeshOutputVertices = 256,
       .maxMeshOutputPrimitives = 256,
       .maxMeshOutputLayers = 8,
-      /* A multiview mesh draw replays once per view (hk_foreach_view), which
-       * works up to HK_MAX_MULTIVIEW_VIEW_COUNT. Temporarily 16: CTS
-       * mesh_shader.ext.properties.max_view_index builds its view mask as
-       * (1u << count) - 1, undefined at 32. Raise it once the CTS is fixed. */
-      .maxMeshMultiviewViewCount = features->multiviewMeshShader ? 16 : 1,
+      /* A multiview mesh draw replays once per view (hk_foreach_view walks
+       * every bit of the 32-bit view mask) and writes the view index to the
+       * layer, so mesh shaders take as many views as every other stage.
+       *
+       * VK-GL-CTS dEQP-VK.mesh_shader.ext.properties.max_view_index builds
+       * its view mask as (1u << count) - 1u, which is undefined for 32
+       * views (on AArch64 it yields 0, and only layer 0 is drawn), so that
+       * case fails against this limit until the CTS computes the mask
+       * without the overflowing shift.
+       */
+      .maxMeshMultiviewViewCount =
+         features->multiviewMeshShader ? HK_MAX_MULTIVIEW_VIEW_COUNT : 1,
       .meshOutputPerVertexGranularity = 32,
       .meshOutputPerPrimitiveGranularity = 32,
       .maxPreferredTaskWorkGroupInvocations = 32,
