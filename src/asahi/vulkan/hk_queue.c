@@ -2361,8 +2361,9 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
  * commands in order, the G16 kernel one command of the device at a time).
  * Streams whose bytes depend on where they were recorded (links, calls,
  * immediate writes) or that carry queries, timestamps, events, indirect or
- * internal launches stay separate, as do streams with global atomics (see
- * hk_pack_run_member()). A packet covers at most HK_PACK_MAX_DISPATCHES
+ * internal launches stay separate, and so do streams with global atomics
+ * where another kernel queue could run beside the packet
+ * (hk_pack_atomics_allowed()). A packet covers at most HK_PACK_MAX_DISPATCHES
  * launches and the thread and static work bounds below, so one watchdog
  * allowance still covers it, and no more compute attachments than the
  * kernel takes for one command; a run past a bound starts a new packet.
@@ -2428,11 +2429,48 @@ hk_pack_attachment_limit(const struct hk_device *dev)
    return dev->dev.params.max_attachments;
 }
 
+/* Streams with global atomics are packed only where no other kernel queue
+ * of the device can run beside the packet. On M5, two kernel queues
+ * running packed atomic chains on the same memory lost contributions (root
+ * cause unknown), so such streams stay separate commands unless
+ * ASAHI_M5_PACK_ATOMICS=1 (or HK_PACK_ATOMICS=1) and the device has a
+ * single kernel queue, which runs its commands in order. A second kernel
+ * queue created while a packet runs is not covered; unpacked atomic work
+ * has the same exposure. The G16 kernel runs one command of the whole
+ * device at a time, so nothing ever runs beside a packet there: G16G packs
+ * them unless HK_PACK_ATOMICS=0. */
+DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
+DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
+
+static bool
+hk_pack_atomics_allowed(struct hk_device *dev, const struct hk_queue *queue)
+{
+   const char *opt = debug_get_option_hk_pack_atomics_opt();
+   if (!opt)
+      opt = debug_get_option_m5_pack_atomics_opt();
+
+   if (dev->dev.chip == AGX_CHIP_G16G)
+      return opt ? debug_parse_bool_option(opt, true) : true;
+
+   if (!opt || !debug_parse_bool_option(opt, false) || queue->sib.count > 1)
+      return false;
+
+   vk_foreach_queue(iter, &dev->vk) {
+      if (vk_queue_is_emulated(iter))
+         continue;
+      const struct hk_queue *other = container_of(iter, struct hk_queue, vk);
+      if (other != queue && other->drm.id != UINT32_MAX)
+         return false;
+   }
+   const struct hk_queue *as = dev->host_as.queue;
+   return !as || as == queue || as->drm.id == UINT32_MAX;
+}
+
 /* The single compute stream of a command buffer that a packet may copy,
  * or NULL. */
 static const struct hk_cs *
 hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
-                   const uint8_t *terminate)
+                   const uint8_t *terminate, bool atomics)
 {
    if (cmd->state.uses_events || !list_is_singular(&cmd->control_streams))
       return NULL;
@@ -2449,7 +2487,8 @@ hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
        cs->pack_dispatches != cs->stats.calls || !cs->pack_threads)
       return NULL;
 
-   if (cs->uses_global_atomics || cs->calls_stream || cs->stream_linked ||
+   if ((cs->uses_global_atomics && !atomics) || cs->calls_stream ||
+       cs->stream_linked ||
        cs->sib_indirect || cs->query_access || cs->query_reset_pending ||
        cs->timestamp.start.handle || cs->timestamp.end.handle ||
        cs->g17p_timestamp_query || cs->gen1_native_rq || cs->as_build ||
@@ -2544,8 +2583,8 @@ hk_pack_dedup_resources(struct util_dynarray *list, size_t unique)
 }
 
 static bool
-hk_pack_runs(struct hk_device *dev, const struct vk_queue_submit *submit,
-             struct hk_packed_runs *out)
+hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
+             const struct vk_queue_submit *submit, struct hk_packed_runs *out)
 {
    memset(out, 0, sizeof(*out));
    const unsigned n = submit->command_buffer_count;
@@ -2558,6 +2597,7 @@ hk_pack_runs(struct hk_device *dev, const struct vk_queue_submit *submit,
       return false;
 
    const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+   const bool atomics = hk_pack_atomics_allowed(dev, queue);
    const uint32_t max_attachments = hk_pack_attachment_limit(dev);
    const size_t overhead =
       sizeof(terminate) + HK_CS_SPACE_PADDING + AGX_CDM_STREAM_LINK_LENGTH;
@@ -2575,7 +2615,7 @@ hk_pack_runs(struct hk_device *dev, const struct vk_queue_submit *submit,
       const struct hk_cs *cs = i < n
          ? hk_pack_run_member(
               dev, (const struct hk_cmd_buffer *)submit->command_buffers[i],
-              terminate)
+              terminate, atomics)
          : NULL;
       size_t size = 0;
       if (cs)
@@ -2764,7 +2804,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
              struct vk_queue_submit *submit)
 {
    struct hk_packed_runs runs;
-   if (!hk_pack_runs(dev, submit, &runs))
+   if (!hk_pack_runs(dev, queue, submit, &runs))
       return queue_submit_recordings(dev, queue, submit, submit, NULL);
 
    struct vk_queue_submit effective = *submit;
