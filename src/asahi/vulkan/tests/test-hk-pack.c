@@ -38,18 +38,24 @@ test_alloc(size_t size)
 static const uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE] = {0xa5, 0x5a,
                                                                   0x0f, 0xf0};
 
+/* The chip hk_pack_run_member() checks streams for, and add_plain() builds
+ * them for. */
+static enum agx_chip chip = AGX_CHIP_G16G;
+
 static struct hk_device *
-g16g(void)
+device(void)
 {
    struct hk_device *dev = test_alloc(sizeof(*dev));
-   dev->dev.chip = AGX_CHIP_G16G;
+   dev->dev.chip = chip;
    return dev;
 }
 
 static struct hk_queue *
-new_queue(void)
+new_queue(bool exact)
 {
-   return test_alloc(sizeof(struct hk_queue));
+   struct hk_queue *q = test_alloc(sizeof(struct hk_queue));
+   q->sync.exact_prior = exact;
+   return q;
 }
 
 static struct hk_cmd_buffer *
@@ -72,8 +78,9 @@ add(struct hk_cmd_buffer *c, bool compute)
    return s;
 }
 
-/* A compute stream that packing accepts on G16G: `dispatches` direct
- * launches, a G16G ordering barrier before the terminate. */
+/* A compute stream that packing accepts on `chip`: `dispatches` direct
+ * launches, then the ordering barrier (G16G) or the strong memory-scoped
+ * flush (M5) before the terminate. */
 static struct hk_cs *
 add_plain(struct hk_cmd_buffer *c, unsigned dispatches)
 {
@@ -84,7 +91,12 @@ add_plain(struct hk_cmd_buffer *c, unsigned dispatches)
    s->start = bytes;
    s->current = bytes + body + sizeof(terminate);
    s->end = (uint8_t *)s->current + HK_CS_SPACE_PADDING;
-   s->weak_barrier_end = bytes + body;
+   if (agx_chip_g17_m5(chip)) {
+      s->visible_completion = true;
+      s->strong_flush_end = s->memory_flush_end = bytes + body;
+   } else {
+      s->weak_barrier_end = bytes + body;
+   }
    s->stats.cmds = s->stats.calls = dispatches;
    s->pack_dispatches = dispatches;
    s->pack_threads = 64ull * dispatches;
@@ -137,7 +149,7 @@ pack(struct hk_cmd_buffer **cmds, unsigned count, struct hk_cs **out)
 static const struct hk_cs *
 member(const struct hk_cmd_buffer *c, bool atomics)
 {
-   return hk_pack_run_member(g16g(), c, terminate, atomics);
+   return hk_pack_run_member(device(), c, terminate, atomics);
 }
 
 static void
@@ -196,19 +208,43 @@ test_rejections(void)
      member(own_cut, false) != NULL);
 }
 
+/* As hk_pack_runs() describes a submission to a queue that ran `ever` on
+ * its render subqueue. */
 static void
-plan(struct hk_cmd_buffer **cmds, unsigned n, struct hk_pack_run *runs,
-     unsigned *count)
+plan_on(struct hk_cmd_buffer **cmds, unsigned n, uint8_t ever, bool atomics,
+        struct hk_pack_run *runs, unsigned *count)
 {
    struct hk_pack_member members[16];
-   for (unsigned i = 0; i < n; ++i)
-      hk_pack_describe(&members[i], cmds[i], member(cmds[i], false),
-                       sizeof(terminate));
+   uint8_t render_kinds = ever;
+   for (unsigned i = 0; i < n; ++i) {
+      hk_pack_describe(&members[i], cmds[i], member(cmds[i], atomics),
+                       sizeof(terminate), render_kinds);
+      render_kinds |= hk_pack_render_kinds(cmds[i]);
+   }
    const struct hk_pack_limits limits = {.max_attachments = 16,
                                          .overhead = 64};
    unsigned packed;
    size_t total;
    *count = hk_pack_plan(members, n, &limits, runs, &packed, &total);
+}
+
+static void
+plan(struct hk_cmd_buffer **cmds, unsigned n, struct hk_pack_run *runs,
+     unsigned *count)
+{
+   plan_on(cmds, n, 0, false, runs, count);
+}
+
+/* The packet the planner forms of all of cmds[0..count). */
+static struct hk_cmd_buffer *
+pack_planned(const char *name, struct hk_cmd_buffer **cmds, unsigned count,
+             struct hk_cs **out)
+{
+   struct hk_pack_run runs[16];
+   unsigned runs_formed;
+   plan(cmds, count, runs, &runs_formed);
+   T(name, runs_formed == 1 && runs[0].first == 0 && runs[0].count == count);
+   return pack(cmds, count, out);
 }
 
 static bool
@@ -264,19 +300,22 @@ test_plan(void)
      runs_are(runs, count, 2, (unsigned[]){0, 2}, (unsigned[]){2, 2}));
 
    struct hk_cmd_buffer *later_render[] = {plain(1), after_render()};
-   plan(later_render, 2, runs, &count);
+   plan_on(later_render, 2, HK_SYNC_GFX, false, runs, &count);
    T("a member adding a render wait starts a new packet", count == 0);
+   plan(later_render, 2, runs, &count);
+   T("a render wait on a queue that never rendered is no wait",
+     runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){2}));
 
    struct hk_cmd_buffer *render_first[] = {after_render(), plain(1),
                                            after_render()};
-   plan(render_first, 3, runs, &count);
+   plan_on(render_first, 3, HK_SYNC_GFX, false, runs, &count);
    T("members waiting for no more than the first one join it",
      runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){3}));
 
    struct hk_cmd_buffer *tail = plain(1);
    hk_sync_barrier(tail, HK_SYNC_GFX, HK_SYNC_COMPUTE);
    struct hk_cmd_buffer *render_tail[] = {plain(1), tail, plain(1)};
-   plan(render_tail, 3, runs, &count);
+   plan_on(render_tail, 3, HK_SYNC_GFX, false, runs, &count);
    T("a render wait from an earlier member's tail splits before the next",
      runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){2}));
 
@@ -285,78 +324,435 @@ test_plan(void)
    add_plain(xfer, 1);
    xfer->sync.kind_override = 0;
    struct hk_cmd_buffer *kinds[] = {plain(1), xfer};
-   plan(kinds, 2, runs, &count);
-   T("a member adding a synchronization kind starts a new packet",
+   plan_on(kinds, 2, HK_SYNC_GFX, false, runs, &count);
+   T("after render work, a member adding a kind starts a new packet",
      count == 0);
+
+   /* A compute-only barrier records COMPUTE against the render subqueue
+    * too; with no COMPUTE work there, it is no render wait. The chain of
+    * command buffers recorded as {dispatch, COMPUTE -> COMPUTE barrier} is
+    * the pattern packing is for, on G16G and on M5. */
+   static const struct {
+      enum agx_chip chip;
+      const char *name;
+   } chips[] = {{AGX_CHIP_G16G, "G16G"}, {AGX_CHIP_G17S, "G17S"}};
+   for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
+      char name[128];
+#define C(text) (snprintf(name, sizeof(name), "%s: %s", chips[c].name, text), name)
+      chip = chips[c].chip;
+      struct hk_cmd_buffer *chain[9];
+      for (unsigned i = 0; i < 8; ++i) {
+         chain[i] = plain(1);
+         hk_sync_barrier(chain[i], HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
+      }
+      plan(chain, 8, runs, &count);
+      T(C("a dispatch-then-barrier chain forms one packet"),
+        runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){8}));
+      plan(chain, 3, runs, &count);
+      T(C("three of them form one packet"),
+        runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){3}));
+      struct hk_cmd_buffer *render = new_cmd();
+      add(render, false);
+      struct hk_cmd_buffer *after[9] = {render};
+      memcpy(after + 1, chain, 8 * sizeof(*chain));
+      plan(after, 9, runs, &count);
+      T(C("the chain forms one packet after a render too"),
+        runs_are(runs, count, 1, (unsigned[]){1}, (unsigned[]){8}));
+      plan_on(chain, 8, HK_SYNC_GFX, false, runs, &count);
+      T(C("the chain forms one packet on a queue that ran renders"),
+        runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){8}));
+      plan_on(chain, 8, HK_SYNC_COMPUTE, false, runs, &count);
+      T(C("compute work on the render subqueue makes the barrier a render "
+          "wait"),
+        count == 0);
+#undef C
+   }
+   chip = AGX_CHIP_G16G;
+
+   /* A tail holds later streams of the kinds it names. A packet of compute
+    * members takes none of a GFX -> GFX tail, so it forms; a GFX -> COMPUTE
+    * tail splits ("a render wait from an earlier member's tail"). */
+   struct hk_cmd_buffer *gfx_tail[4];
+   for (unsigned i = 0; i < 4; ++i) {
+      gfx_tail[i] = plain(1);
+      hk_sync_barrier(gfx_tail[i], HK_SYNC_GFX, HK_SYNC_GFX);
+   }
+   plan_on(gfx_tail, 4, HK_SYNC_GFX, false, runs, &count);
+   T("a tail for render kinds only does not split compute members",
+     runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){4}));
+
+   /* A GFX -> XFER tail on transfer members: the packet has transfer kind,
+    * so it would wait for the render before the second member. */
+   struct hk_cmd_buffer *xfer_pair[2];
+   for (unsigned i = 0; i < 2; ++i) {
+      xfer_pair[i] = new_cmd();
+      xfer_pair[i]->sync.kind_override = HK_SYNC_XFER;
+      add_plain(xfer_pair[i], 1);
+      xfer_pair[i]->sync.kind_override = 0;
+   }
+   hk_sync_barrier(xfer_pair[0], HK_SYNC_GFX, HK_SYNC_XFER);
+   plan_on(xfer_pair, 2, HK_SYNC_GFX, false, runs, &count);
+   T("a render tail of a kind the packet has splits", count == 0);
+   struct hk_cmd_buffer *compute_pair[] = {plain(1), plain(1)};
+   hk_sync_barrier(compute_pair[0], HK_SYNC_GFX, HK_SYNC_XFER);
+   plan_on(compute_pair, 2, HK_SYNC_GFX, false, runs, &count);
+   T("a render tail of a kind the packet lacks does not split",
+     runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){2}));
+
+   struct hk_cmd_buffer *xfer_plain = new_cmd();
+   xfer_plain->sync.kind_override = HK_SYNC_XFER;
+   add_plain(xfer_plain, 1);
+   xfer_plain->sync.kind_override = 0;
+   struct hk_cmd_buffer *kinds_no_render[] = {plain(1), xfer_plain};
+   plan(kinds_no_render, 2, runs, &count);
+   T("kinds may differ while the render subqueue ran nothing",
+     runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){2}));
 
    struct hk_cmd_buffer *big[] = {plain(200), plain(200)};
    plan(big, 2, runs, &count);
    T("the dispatch bound splits a run", count == 0);
 }
 
+/* The wait of `cs` on subqueue `sq` as an ordinal of the queue that had
+ * `base` commands on it before this submission; 0 for none. */
+static uint64_t
+wait_of(const struct hk_cs *cs, unsigned sq, uint64_t base, bool exact)
+{
+   const uint16_t b = cs->sync.barrier[sq];
+   if (b != DRM_ASAHI_BARRIER_NONE)
+      return base + b;
+   return exact ? cs->sync.prior[sq] : 0;
+}
+
 static void
-test_dependencies(void)
+test_dependencies(bool exact)
 {
    struct hk_cs *cs;
+   const char *mode = exact ? "exact" : "legacy";
+   char name[160];
+#define N(text) (snprintf(name, sizeof(name), "%s: %s", mode, text), name)
+   const unsigned compute = __builtin_ctz(HK_SYNC_COMPUTE);
 
-   /* (a) A member's tail cut: a later command buffer waits for the packet. */
+   /* (a) A member's tail cut: a later command buffer waits for the packet.
+    * Packed by the planner: a compute-only tail is no render wait. */
    struct hk_cmd_buffer *a = plain(1);
    hk_sync_barrier(a, HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
    struct hk_cmd_buffer *a_members[] = {a, plain(1)};
-   struct hk_cmd_buffer *packet = pack(a_members, 2, &cs);
-   T("tail cut becomes a cut on the packet",
-     packet->sync.req[__builtin_ctz(HK_SYNC_COMPUTE)][HK_SYNC_CDM].cut == cs);
+   struct hk_cmd_buffer *packet =
+      pack_planned(N("(a) the planner packs a tail-cut member"), a_members, 2,
+                   &cs);
+   T(N("(a) tail cut becomes a cut on the packet"),
+     packet->sync.req[compute][HK_SYNC_CDM].cut == cs);
    struct hk_cmd_buffer *later = plain(1);
    struct hk_cs *later_cs =
       list_first_entry(&later->control_streams, struct hk_cs, node);
+   struct hk_queue *q = new_queue(exact);
    struct hk_cmd_buffer *a_submit[] = {packet, later};
-   T("(a) resolves", resolve(new_queue(), a_submit, 2));
-   T("(a) a later command buffer waits for the packet",
-     later_cs->sync.barrier[HK_SYNC_CDM] == cs->sync.index &&
-        cs->sync.index == 1);
+   T(N("(a) resolves"), resolve(q, a_submit, 2));
+   T(N("(a) a later command buffer waits for the packet"),
+     cs->sync.index == 1 && wait_of(later_cs, HK_SYNC_CDM, 0, exact) == 1);
+
+   /* The same tail through the queue's persisted tail (exact mode: the G16
+    * kernel advertises exact priors). */
+   if (exact) {
+      a = plain(1);
+      hk_sync_barrier(a, HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
+      struct hk_cmd_buffer *a2_members[] = {a, plain(1)};
+      packet = pack_planned(N("(a) next submission: packs"), a2_members, 2,
+                            &cs);
+      q = new_queue(true);
+      struct hk_cmd_buffer *first[] = {packet};
+      T(N("(a) next submission: packet resolves"), resolve(q, first, 1));
+      const uint64_t base = q->sync.submitted[HK_SYNC_CDM];
+      later = plain(1);
+      later_cs = list_first_entry(&later->control_streams, struct hk_cs, node);
+      struct hk_cmd_buffer *second[] = {later};
+      T(N("(a) next submission: resolves"), resolve(q, second, 1));
+      T(N("(a) next submission: waits for the packet through the tail"),
+        base == 1 && wait_of(later_cs, HK_SYNC_CDM, base, true) == 1);
+   }
 
    /* (b) A tail prior naming an earlier member's kind: cut on the packet. */
    struct hk_cmd_buffer *b = new_cmd();
    hk_sync_barrier(b, HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
    add_plain(b, 1);
    struct hk_cmd_buffer *b_members[] = {plain(1), b};
-   packet = pack(b_members, 2, &cs);
-   T("(b) a prior naming an earlier member becomes a cut on the packet",
-     packet->sync.req[__builtin_ctz(HK_SYNC_COMPUTE)][HK_SYNC_CDM].cut == cs);
+   packet = pack_planned(N("(b) the planner packs a tail-prior member"),
+                         b_members, 2, &cs);
+   T(N("(b) a prior naming an earlier member becomes a cut on the packet"),
+     packet->sync.req[compute][HK_SYNC_CDM].cut == cs);
+   later = plain(1);
+   later_cs = list_first_entry(&later->control_streams, struct hk_cs, node);
+   q = new_queue(exact);
+   struct hk_cmd_buffer *b_submit[] = {packet, later};
+   T(N("(b) resolves"), resolve(q, b_submit, 2));
+   T(N("(b) a later command buffer waits for the packet"),
+     wait_of(later_cs, HK_SYNC_CDM, 0, exact) == cs->sync.index);
 
-   /* (c) A member's render wait reaches the packet's barrier. */
+   /* (c) A member's render wait reaches the packet's barrier: after a
+    * render, the first member waits for it and the next joins. */
    struct hk_cmd_buffer *render = new_cmd();
    add(render, false);
-   struct hk_cmd_buffer *c_members[] = {after_render(), plain(1)};
-   packet = pack(c_members, 2, &cs);
-   T("(c) the packet waits for the render kinds of its members",
+   struct hk_cmd_buffer *c_all[] = {render, after_render(), plain(1)};
+   struct hk_pack_run runs[4];
+   unsigned count;
+   plan(c_all, 3, runs, &count);
+   T(N("(c) the members after the render form one packet"),
+     runs_are(runs, count, 1, (unsigned[]){1}, (unsigned[]){2}));
+   packet = pack(c_all + 1, 2, &cs);
+   T(N("(c) the packet waits for the render kinds of its members"),
      cs->sync.dep[HK_SYNC_VDM].prior & HK_SYNC_GFX);
    struct hk_cmd_buffer *c_submit[] = {render, packet};
-   T("(c) resolves", resolve(new_queue(), c_submit, 2));
-   T("(c) the packet's render barrier names the render",
-     cs->sync.barrier[HK_SYNC_VDM] == 1);
+   T(N("(c) resolves"), resolve(new_queue(exact), c_submit, 2));
+   T(N("(c) the packet's render barrier names the render"),
+     wait_of(cs, HK_SYNC_VDM, 0, exact) == 1);
 
    /* (d) A render after a packet waits for the packet. */
    struct hk_cmd_buffer *d_members[] = {plain(1), plain(1)};
-   packet = pack(d_members, 2, &cs);
+   packet = pack_planned(N("(d) the planner packs two plain members"),
+                         d_members, 2, &cs);
    struct hk_cmd_buffer *d_render = new_cmd();
    hk_sync_barrier(d_render, HK_SYNC_COMPUTE, HK_SYNC_GFX);
    struct hk_cs *d_render_cs = add(d_render, false);
    struct hk_cmd_buffer *d_submit[] = {packet, d_render};
-   T("(d) resolves", resolve(new_queue(), d_submit, 2));
-   T("(d) a render after the packet waits for the packet's index",
-     d_render_cs->sync.barrier[HK_SYNC_CDM] == cs->sync.index);
+   T(N("(d) resolves"), resolve(new_queue(exact), d_submit, 2));
+   T(N("(d) a render after the packet waits for the packet's index"),
+     wait_of(d_render_cs, HK_SYNC_CDM, 0, exact) == cs->sync.index);
 
    /* The last member's tail is for later command buffers only. */
    struct hk_cmd_buffer *e_last = plain(1);
    hk_sync_barrier(e_last, HK_SYNC_GFX, HK_SYNC_COMPUTE);
    struct hk_cmd_buffer *e_members[] = {plain(1), e_last};
-   packet = pack(e_members, 2, &cs);
-   T("the last member's tail does not hold the packet back",
+   packet = pack_planned(N("(e) the planner packs a render-tail last member"),
+                         e_members, 2, &cs);
+   T(N("the last member's tail does not hold the packet back"),
      !(cs->sync.dep[HK_SYNC_VDM].prior & HK_SYNC_GFX));
-   T("the last member's tail still holds later command buffers",
-     packet->sync.req[__builtin_ctz(HK_SYNC_COMPUTE)][HK_SYNC_VDM].prior &
-        HK_SYNC_GFX);
+   T(N("the last member's tail still holds later command buffers"),
+     packet->sync.req[compute][HK_SYNC_VDM].prior & HK_SYNC_GFX);
+#undef N
+}
+
+/* The folds the planner's rules make redundant stay as defence in depth:
+ * pin them on packets built directly. */
+static void
+test_folds(void)
+{
+   struct hk_cs *cs;
+   struct hk_cmd_buffer *own[] = {plain(1), after_render()};
+   pack(own, 2, &cs);
+   T("the packet waits for every member's own render wait",
+     cs->sync.dep[HK_SYNC_VDM].prior & HK_SYNC_GFX);
+
+   struct hk_cmd_buffer *first = plain(1);
+   hk_sync_barrier(first, HK_SYNC_GFX, HK_SYNC_COMPUTE);
+   struct hk_cmd_buffer *tails[] = {first, plain(1)};
+   pack(tails, 2, &cs);
+   T("a member's tail holds the members after it",
+     cs->sync.dep[HK_SYNC_VDM].prior & HK_SYNC_GFX);
+}
+
+/* Randomized: packed and unpacked submissions resolve with no wait dropped,
+ * and no packet waits for more render work than its first member did. */
+static uint32_t rng_state;
+
+static uint32_t
+rnd(unsigned n)
+{
+   rng_state = rng_state * 1664525u + 1013904223u;
+   return (rng_state >> 8) % n;
+}
+
+struct scb {
+   bool render;
+   uint8_t kind, pre_s, pre_d, post_s, post_d;
+};
+
+static const uint8_t SRC[] = {0, 0, HK_SYNC_GFX, HK_SYNC_COMPUTE, HK_SYNC_XFER,
+                              HK_SYNC_ALL};
+static const uint8_t DST[] = {HK_SYNC_GFX, HK_SYNC_GFX_FRAG, HK_SYNC_COMPUTE,
+                              HK_SYNC_XFER, HK_SYNC_ALL,
+                              HK_SYNC_COMPUTE | HK_SYNC_XFER};
+static const uint8_t KIND[] = {HK_SYNC_COMPUTE, HK_SYNC_COMPUTE,
+                               HK_SYNC_COMPUTE, HK_SYNC_XFER,
+                               HK_SYNC_COMPUTE | HK_SYNC_XFER};
+
+static struct scb
+rand_cb(void)
+{
+   struct scb d = {0};
+   d.render = rnd(4) == 0;
+   d.kind = KIND[rnd(ARRAY_SIZE(KIND))];
+   d.pre_s = SRC[rnd(ARRAY_SIZE(SRC))];
+   d.pre_d = DST[rnd(ARRAY_SIZE(DST))];
+   d.post_s = SRC[rnd(ARRAY_SIZE(SRC))];
+   d.post_d = DST[rnd(ARRAY_SIZE(DST))];
+   return d;
+}
+
+static struct hk_cmd_buffer *
+build(const struct scb *d)
+{
+   struct hk_cmd_buffer *c = new_cmd();
+   if (d->pre_s)
+      hk_sync_barrier(c, d->pre_s, d->pre_d);
+   if (d->render) {
+      add(c, false);
+   } else {
+      c->sync.kind_override = d->kind;
+      add_plain(c, 1);
+      c->sync.kind_override = 0;
+   }
+   if (d->post_s)
+      hk_sync_barrier(c, d->post_s, d->post_d);
+   return c;
+}
+
+static struct hk_cs *
+first_cs(struct hk_cmd_buffer *c)
+{
+   return list_first_entry(&c->control_streams, struct hk_cs, node);
+}
+
+static unsigned rr_checks, rr_fails, rr_packets;
+
+static void
+rr_fail(const char *what, unsigned seed, unsigned i)
+{
+   if (rr_fails++ < 8)
+      printf("FAIL random %s seed=%u cb=%u\n", what, seed, i);
+}
+
+static void
+rr_one(unsigned seed, bool exact)
+{
+   rng_state = seed * 2654435761u + 1;
+   const unsigned n = 2 + rnd(6);
+   struct scb d[8];
+   for (unsigned i = 0; i < n; ++i)
+      d[i] = rand_cb();
+   struct scb next[2] = {rand_cb(), rand_cb()};
+   next[0].render = true;
+   next[1].render = false;
+
+   struct hk_cmd_buffer *U[8], *P[8];
+   for (unsigned i = 0; i < n; ++i) {
+      U[i] = build(&d[i]);
+      P[i] = build(&d[i]);
+   }
+
+   struct hk_pack_run runs[8];
+   unsigned count;
+   plan_on(P, n, 0, true, runs, &count);
+   rr_packets += count;
+
+   int run_of[8];
+   for (unsigned i = 0; i < n; ++i)
+      run_of[i] = -1;
+   for (unsigned r = 0; r < count; ++r)
+      for (unsigned m = 0; m < runs[r].count; ++m)
+         run_of[runs[r].first + m] = r;
+
+   struct hk_cmd_buffer *L[8];
+   struct hk_cs *pcs[8] = {0};
+   unsigned m_count = 0;
+   for (unsigned i = 0; i < n;) {
+      if (run_of[i] < 0) {
+         L[m_count++] = P[i++];
+         continue;
+      }
+      const struct hk_pack_run *pr = &runs[run_of[i]];
+      L[m_count++] = pack(&P[pr->first], pr->count, &pcs[run_of[i]]);
+      i += pr->count;
+   }
+
+   struct hk_queue *qu = new_queue(exact), *qp = new_queue(exact);
+   if (!resolve(qu, U, n) || !resolve(qp, L, m_count)) {
+      rr_fail("resolve failed", seed, 0);
+      return;
+   }
+
+   int cdm_cb[16];
+   unsigned u_cdm = 0, p_cdm = 0;
+   for (unsigned i = 0; i < n; ++i) {
+      struct hk_cs *u = first_cs(U[i]);
+      if (u->type == HK_CS_CDM)
+         cdm_cb[u->sync.index] = i, u_cdm = MAX2(u_cdm, u->sync.index);
+   }
+   for (unsigned e = 0; e < m_count; ++e) {
+      struct hk_cs *l = first_cs(L[e]);
+      if (l->type == HK_CS_CDM)
+         p_cdm = MAX2(p_cdm, l->sync.index);
+   }
+#define PIDX(i) (run_of[i] >= 0 ? pcs[run_of[i]]->sync.index                  \
+                                : first_cs(P[i])->sync.index)
+
+   for (unsigned i = 0; i < n; ++i) {
+      struct hk_cs *su = first_cs(U[i]);
+      struct hk_cs *sp = run_of[i] >= 0 ? pcs[run_of[i]] : first_cs(P[i]);
+      const uint64_t uv = wait_of(su, HK_SYNC_VDM, 0, exact);
+      const uint64_t pv = wait_of(sp, HK_SYNC_VDM, 0, exact);
+      rr_checks++;
+      if (pv < uv)
+         rr_fail("render wait dropped", seed, i);
+      if (run_of[i] >= 0 && runs[run_of[i]].first == i && pv > uv)
+         rr_fail("packet waits for more render work than its first member",
+                 seed, i);
+      const uint64_t uc = wait_of(su, HK_SYNC_CDM, 0, exact);
+      if (uc) {
+         const int target = cdm_cb[uc];
+         if (run_of[i] >= 0 && run_of[target] == run_of[i])
+            continue; /* ordered inside the packet */
+         rr_checks++;
+         if (wait_of(sp, HK_SYNC_CDM, 0, exact) < (uint64_t)PIDX(target))
+            rr_fail("compute wait dropped", seed, i);
+      }
+   }
+
+   if (!exact)
+      return;
+
+   /* A later submission waits through the persisted tail. */
+   struct hk_cmd_buffer *U2[2] = {build(&next[0]), build(&next[1])};
+   struct hk_cmd_buffer *P2[2] = {build(&next[0]), build(&next[1])};
+   const uint64_t ubase[2] = {qu->sync.submitted[0], qu->sync.submitted[1]};
+   const uint64_t pbase[2] = {qp->sync.submitted[0], qp->sync.submitted[1]};
+   if (!resolve(qu, U2, 2) || !resolve(qp, P2, 2)) {
+      rr_fail("next submission: resolve failed", seed, 0);
+      return;
+   }
+   for (unsigned i = 0; i < 2; ++i) {
+      struct hk_cs *su = first_cs(U2[i]), *sp = first_cs(P2[i]);
+      rr_checks++;
+      if (wait_of(sp, HK_SYNC_VDM, pbase[0], true) <
+          wait_of(su, HK_SYNC_VDM, ubase[0], true))
+         rr_fail("next submission: render wait dropped", seed, 100 + i);
+      const uint64_t uc = wait_of(su, HK_SYNC_CDM, ubase[1], true);
+      if (!uc)
+         continue;
+      const uint64_t want =
+         uc <= u_cdm ? (uint64_t)PIDX(cdm_cb[uc]) : uc - u_cdm + p_cdm;
+      rr_checks++;
+      if (wait_of(sp, HK_SYNC_CDM, pbase[1], true) < want)
+         rr_fail("next submission: compute wait dropped", seed, 100 + i);
+   }
+#undef PIDX
+}
+
+static void
+test_random(void)
+{
+   for (unsigned seed = 0; seed < 2000; ++seed) {
+      rr_one(seed, false);
+      rr_one(seed, true);
+      if ((seed & 7) == 7) {
+         ralloc_free(test_context);
+         test_context = ralloc_context(NULL);
+      }
+   }
+   printf("random: %u packets, %u checks, %u failures\n", rr_packets,
+          rr_checks, rr_fails);
+   T("random submissions keep every wait", rr_fails == 0);
+   T("random submissions form packets", rr_packets > 500);
 }
 
 /* hk_sync.c references these for paths the fixtures never take. */
@@ -443,7 +839,10 @@ main(void)
       return EXIT_FAILURE;
    test_rejections();
    test_plan();
-   test_dependencies();
+   test_dependencies(false);
+   test_dependencies(true);
+   test_folds();
+   test_random();
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

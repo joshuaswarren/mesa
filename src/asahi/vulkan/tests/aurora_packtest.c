@@ -11,6 +11,11 @@
  * packed) to cover both paths. Plain dispatches run a program without loops,
  * heavy ones a looping program, which a packet holds at most one of.
  *
+ * The driver's packing trace (HK_PACK_CDM_TRACE, turned on here) is read
+ * back after each case, which then reports how many command buffers were
+ * packed. With HK_PACK_CDM_SUBMIT=1 a case that must pack fails if nothing
+ * was packed, and with HK_PACK_CDM_SUBMIT=0 any case fails if something was.
+ *
  * usage: aurora-packtest ITERATIONS [CASE...]
  */
 #include <inttypes.h>
@@ -21,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <vulkan/vulkan.h>
 
 #include "aurora_packtest_shaders.h"
@@ -782,6 +788,89 @@ run_case(const char *name, unsigned iterations)
    return bad ? 1 : 0;
 }
 
+/* The driver's packing trace goes to a temporary file standing in for
+ * stderr; trace_packed() passes what it gained to the real stderr and
+ * returns the command buffers it says were packed. */
+static int trace_fd = -1, real_stderr = -1;
+static off_t trace_off;
+
+static void
+trace_begin(void)
+{
+   setenv("HK_PACK_CDM_TRACE", "1", 0);
+   FILE *f = tmpfile();
+   if (!f)
+      return;
+   fflush(stderr);
+   trace_fd = dup(fileno(f));
+   fclose(f);
+   real_stderr = dup(2);
+   if (trace_fd < 0 || real_stderr < 0 || dup2(trace_fd, 2) < 0)
+      trace_fd = -1;
+}
+
+static unsigned
+trace_packed(void)
+{
+   if (trace_fd < 0)
+      return 0;
+   fflush(stderr);
+   const off_t end = lseek(trace_fd, 0, SEEK_END);
+   if (end <= trace_off)
+      return 0;
+   const size_t n = (size_t)(end - trace_off);
+   char *text = malloc(n + 1);
+   if (!text)
+      return 0;
+   const ssize_t got = pread(trace_fd, text, n, trace_off);
+   trace_off = end;
+   if (got <= 0) {
+      free(text);
+      return 0;
+   }
+   text[got] = 0;
+   if (write(real_stderr, text, (size_t)got) < 0) {
+      /* The pass-through is best effort. */
+   }
+   unsigned packed = 0;
+   for (const char *at = strstr(text, "HK_PACK runs="); at;
+        at = strstr(at + 1, "HK_PACK runs=")) {
+      unsigned runs, members;
+      if (sscanf(at, "HK_PACK runs=%u members=%u", &runs, &members) == 2)
+         packed += members;
+   }
+   free(text);
+   return packed;
+}
+
+/* Cases whose command buffers are all plain compute work that packs. */
+static bool
+must_pack(const char *name)
+{
+   static const char *const cases[] = {"chain242", "chain300", "loops",
+                                       "chain-all", "multi", "multi-tail",
+                                       "disjoint"};
+   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+      if (!strcmp(name, cases[i]))
+         return true;
+   }
+   return false;
+}
+
+static int
+check_case(const char *name, unsigned iterations)
+{
+   const int bad = run_case(name, iterations);
+   const unsigned packed = trace_packed();
+   const char *mode = getenv("HK_PACK_CDM_SUBMIT");
+   const bool on = mode && mode[0] == '1', off = mode && mode[0] == '0';
+   const bool wrong = trace_fd >= 0 &&
+                      ((on && must_pack(name) && !packed) || (off && packed));
+   printf("%s %s packed_cbs=%u%s\n", wrong ? "FAIL" : "PACKED", name, packed,
+          wrong ? (on ? " (must pack)" : " (packing is off)") : "");
+   return bad + wrong;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -796,6 +885,7 @@ main(int argc, char **argv)
       "dup",
    };
    setvbuf(stdout, NULL, _IOLBF, 0);
+   trace_begin();
    if (argc < 2)
       die("usage: aurora-packtest ITERATIONS [CASE...]");
    setup();
@@ -803,10 +893,10 @@ main(int argc, char **argv)
    int fails = 0;
    if (argc > 2) {
       for (int i = 2; i < argc; ++i)
-         fails += run_case(argv[i], iterations);
+         fails += check_case(argv[i], iterations);
    } else {
       for (unsigned i = 0; i < sizeof(all) / sizeof(all[0]); ++i)
-         fails += run_case(all[i], iterations);
+         fails += check_case(all[i], iterations);
    }
    printf("SUMMARY %s failures=%d\n", fails ? "FAIL" : "PASS", fails);
    CHECK(vkDeviceWaitIdle(g.dev));
