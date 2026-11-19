@@ -1242,7 +1242,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    result = hk_init_g17p_grid_helper(dev, pAllocator);
    if (result != VK_SUCCESS)
-      HK_INIT_FAIL(fail_null_fs, "g17p-grid-helper", 0);
+      goto fail_null_fs;
 
    *pDevice = hk_device_to_handle(dev);
 
