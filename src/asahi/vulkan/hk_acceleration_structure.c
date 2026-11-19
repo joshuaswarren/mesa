@@ -536,22 +536,27 @@ hk_gen1_as_publish_slot(struct hk_device *dev, uint32_t index,
    return true;
 }
 
-void
+/* Publish the address of every acceleration structure placed in buffer, now
+ * that it is bound. Returns false if one of them could not get a traversal
+ * base: its table entry then does not describe it, and a ray traversal of it
+ * would read whatever the entry held before, so the bind must fail. */
+bool
 hk_gen1_publish_buffer_as_addresses(struct hk_device *dev,
                                     const struct vk_buffer *buffer)
 {
    if (!dev->g17p_native_as || !buffer->device_address)
-      return;
+      return true;
+   bool ok = true;
    simple_mtx_lock(&dev->gen1_as_lock);
    uint32_t index = 0;
    util_dynarray_foreach(&dev->gen1_ases, struct hk_gen1_as_slot, slot) {
       if (slot->as && slot->as->buffer == buffer &&
           !hk_gen1_as_publish_slot(dev, index, slot))
-         mesa_loge("G17P: no traversal base below 0x%" PRIx64 " for an "
-                   "acceleration structure", hk_gen1_as_bound_va(slot->as));
+         ok = false;
       ++index;
    }
    simple_mtx_unlock(&dev->gen1_as_lock);
+   return ok;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
