@@ -41,9 +41,9 @@ extern "C" {
  *
  * That is positionally identical to the direct launch record's own inline
  * fields (global at +0x10..+0x1b, local at +0x1c..+0x27), and it is what the
- * only known G17P grid helper actually writes -- see the provenance note on
- * the shader image below.  The first three words are therefore GLOBAL THREAD
- * counts, not threadgroup counts; the helper is what performs the multiply.
+ * only known G17P grid helper actually writes.  The first three words are
+ * therefore GLOBAL THREAD counts, not threadgroup counts; the helper is what
+ * performs the multiply.
  */
 #define AGX3_G17P_INDIRECT_GEOMETRY_WORDS 6u
 #define AGX3_G17P_INDIRECT_GEOMETRY_SIZE  (AGX3_G17P_INDIRECT_GEOMETRY_WORDS * 4u)
@@ -65,38 +65,6 @@ extern "C" {
    AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_INDIRECT_ADD3
 #define AGX3_G17P_GRID_HELPER_LDSHDR_F1                                        \
    AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_GRID_HELPER
-
-/*
- * The G17P grid-helper shader binary.
- *
- * PROVENANCE, and why this is not a guessed encoding.  These 97 bytes are the
- * verbatim __TEXT,__text of
- *
- *    metal -c gridhelper.metal -o gridhelper.air
- *    metallib gridhelper.air -o gridhelper.metallib
- *    metal-nt -arch applegpu_g17p -N gridhelper.mtlp-json \
- *             -platform_version macos 26.0 26.0 gridhelper.metallib -o gridhelper.nat
- *
- * for exactly one kernel, whose source is reproduced in
- * agx3_g17p_grid_helper_source() below.  The same 97 bytes appear verbatim as
- * the tail of the G17P grid-helper image captured in m1n1
- * (proxyclient/experiments/g17p_indirect_code.py, GRID_SETUP_PREAMBLE), whose
- * Ioto program announces LDSHDR f1 = GRID_HELPER for a shader at
- * 0x10000000400 -- the third witness already encoded in
- * agx_ioto_g17p_runtime_compute_tail_build().  Apple's own compiler and an
- * independent hardware capture therefore agree byte for byte.
- *
- * This image is the definition of the geometry contract above: the kernel
- * multiplies the indirect threadgroup counts by the threads-per-group and
- * writes the six words.  It does NOT come with a grounded uniform/argument
- * ABI: which uniform halves its three device pointers arrive in has not been
- * established offline, so this image is published as evidence and as a
- * reference for the contract, not as something a driver may launch blind.
- */
-#define AGX3_G17P_GRID_HELPER_SHADER_SIZE 97u
-
-/* The exact MSL the image was compiled from, as a NUL-terminated string. */
-const char *agx3_g17p_grid_helper_source(void);
 
 #ifdef __cplusplus
 }

@@ -17,7 +17,7 @@ agx_const_buffer_ptr(struct agx_batch *batch, struct pipe_constant_buffer *cb)
 {
    if (cb->buffer) {
       struct agx_resource *rsrc = agx_resource(cb->buffer);
-      agx_batch_reads(batch, rsrc);
+      agx_batch_reads_range(batch, rsrc, cb->buffer_offset, cb->buffer_size);
       return agx_map_gpu(rsrc) + cb->buffer_offset;
    } else {
       return 0;
@@ -238,7 +238,8 @@ agx_set_ssbo_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
                                    sb->buffer_size);
             batch->incoherent_writes = true;
          } else {
-            agx_batch_reads(batch, rsrc);
+            agx_batch_reads_range(batch, rsrc, sb->buffer_offset,
+                                  sb->buffer_size);
          }
 
          unif->ssbo_base[cb] = agx_map_gpu(rsrc) + sb->buffer_offset;

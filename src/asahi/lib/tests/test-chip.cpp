@@ -78,6 +78,8 @@ TEST(AGXChip, UncoveredTileReloadDefect)
 {
    /* M4 Pro keeps a 2x reload in the tilebuffer; 4x and A18 Pro spill. */
    EXPECT_FALSE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G17P, 0x6040, 2));
+   EXPECT_FALSE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G17P, 0x6041, 2));
+   EXPECT_TRUE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G17P, 0x6041, 4));
    EXPECT_TRUE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G17P, 0x6040, 4));
    EXPECT_TRUE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G17P, 0x8140, 2));
    EXPECT_TRUE(agx_chip_uncovered_tile_ms_reload_defect(AGX_CHIP_G17P, 0x8140, 4));

@@ -372,6 +372,18 @@ hk_compute_kick_free_mem(struct hk_device *dev, struct hk_compute_kick *k)
 void
 hk_compute_kick_init(struct hk_device *dev, unsigned period_ms)
 {
+   /* Only G17C: the kick is a property of its firmware's scheduling, not a
+    * general cure for one client's long compute command holding up the
+    * others. Measured with one client keeping GPU-filling compute commands
+    * in flight and another submitting a 512-workgroup job every 100 ms:
+    *
+    *    M1 Pro (G13S), M2 (G14G): the job waits for the running command
+    *       (500 ms commands: 500 ms; 1.5 s commands: 1.5 s). On the M1 Pro
+    *       it still waits with the kicker running and with the kernel's
+    *       compute preemption turned on.
+    *    M4 Pro (G17P): the job does not wait (10-12 ms median, 69 ms worst
+    *       beside 1.5 s commands), so there is nothing to kick.
+    */
    if (dev->dev.chip != AGX_CHIP_G17C || !period_ms)
       return;
 

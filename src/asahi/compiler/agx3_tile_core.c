@@ -182,31 +182,6 @@ agx3_m5_mrt_eot_generate_layered(unsigned targets, const uint8_t *selectors,
       multisample ? (1u << targets) - 1 : 0, layered, output, capacity, written);
 }
 
-bool
-agx3_m5_mrt_eot_generate_typed_ms(unsigned targets, const uint8_t *selectors,
-                                bool multisample, uint8_t *output,
-                                size_t capacity, size_t *written)
-{
-   return agx3_m5_mrt_eot_generate_layered(targets, selectors, multisample, false,
-                                         output, capacity, written);
-}
-
-bool
-agx3_m5_mrt_eot_generate_typed(unsigned targets, const uint8_t *selectors,
-                                uint8_t *output, size_t capacity, size_t *written)
-{
-   return agx3_m5_mrt_eot_generate_typed_ms(targets, selectors, false,
-                                            output, capacity, written);
-}
-
-bool
-agx3_m5_mrt_eot_generate(unsigned targets, uint8_t *output,
-                          size_t capacity, size_t *written)
-{
-   const uint8_t selectors[8] = {0x75,0x75,0x75,0x75,0x75,0x75,0x75,0x75};
-   return agx3_m5_mrt_eot_generate_typed(targets, selectors, output, capacity, written);
-}
-
 static bool
 is_b(enum agx_isa_encoding e)
 {

@@ -66,8 +66,6 @@ hk_g17p_launch_trace_enabled(void)
 }
 void hk_g17p_trace_hexdump(const char *label, uint64_t base, const void *data,
                            size_t len);
-void hk_g17p_trace_line(const char *label, uint64_t base, const void *data,
-                        size_t len);
 
 void *hk_cmd_buffer_emit_cdm_terminate(struct hk_cmd_buffer *cmd,
                                        void *current);
@@ -198,7 +196,11 @@ struct hk_root_descriptor_table {
           * sample mask; they apply it before their own coverage update.
           * Sysval fields must sit at 4-byte offsets (root table loads). */
          uint16_t alpha_to_coverage;
-         uint16_t _pad7;
+
+         /* The pass has no attachments, so no storage backs its layers: the
+          * hardware sees layer zero, while a fragment shader reading the layer
+          * still gets what the vertex stage wrote. */
+         uint16_t no_attachments;
 
          /* Mapping from varying slots written by the last vertex stage to UVS
           * indices. This mapping must be compatible with the fragment shader.
@@ -710,10 +712,6 @@ struct hk_g17p_launch {
 };
 
 struct hk_g17p_graphics_ioto_cache_entry {
-   uint16_t m5_range_count;
-   uint16_t m5_tile_size_px;
-   uint8_t m5_sample_size_B;
-   uint8_t m5_nr_samples;
    /* The loader of the last draw, the program published from it and the
     * range addresses written into it (hk_g17p_publish_gfx_loader()). */
    const struct hk_g17p_gfx_loader *loader;
@@ -1659,14 +1657,6 @@ struct hk_ioto_arena {
    uint64_t chunk_bytes;
 };
 
-struct hk_gen1_as_table_chunk {
-   struct list_head link;
-   struct agx_bo *tail;
-   struct agx_bo *bank;
-   struct agx_va *va;
-   uint32_t next, count;
-};
-
 #define HK_MAX_DEFERRED_CLEARS 8
 
 struct hk_cmd_buffer {
@@ -1779,7 +1769,6 @@ struct hk_cmd_buffer {
    /* Most recently addressed span. Recording often references the current
     * 4 KiB VDM chunk many times before moving to the next one. */
    struct hk_vdm_allocation *g17p_vdm_last_allocation;
-   struct list_head gen1_as_table_chunks;
 
    /* List of all recorded control streams */
    struct list_head control_streams;
@@ -1825,9 +1814,9 @@ struct hk_cmd_buffer {
     * conditional rendering. */
    bool conditional_meta;
 
-   /* Single-kick vkCmdTraceRays* (ASAHI_M5_RT_SINGLE_KICK, default on): while set,
-    * hk_dispatch_m5_native writes the kernel's launch record (40-byte direct
-    * launch + barrier) here instead of into the control stream. */
+   /* Single-kick vkCmdTraceRays* on M5: while set, hk_dispatch_m5_native
+    * writes the kernel's launch record (40-byte direct launch + barrier) here
+    * instead of into the control stream. */
    uint8_t *m5_rt_capture;
    bool m5_rt_captured;
 

@@ -1,10 +1,11 @@
 # G17G native RT0 EOT witness
 
-The existing `g17p-native-rt0-eot.btnf.hex` is a hardware-independent builtin
-factory request. Generate an independent M5 witness with the G17G target:
+The single-target RGBA8 builtin factory request is hardware-independent; it is
+not kept in this tree, but it is the one-attachment case of the request layout
+described in `README-g17g-native-rgba8-mrt8.md`. Generate an independent M5
+witness with the G17G target:
 
 ```sh
-xxd -r -p g17p-native-rt0-eot.btnf.hex > eot_rt0.btnf
 xcrun metal-nt -N eot_rt0.btnf -arch applegpu_g17g \
   -platform_version macos 26.0 26.0 -o eot_rt0.nat
 ```
@@ -61,9 +62,7 @@ GPR halves. Native loader RT-store mask is1.
 The native ESL matches the independently decoded G17P binding contract:
 qword binding0x32 loads the PBE-table pointer into uniform halves0..3;
 driver argument kind5/index0 loads the tile byte offset into halves4..5.
-The admitted tile byte offset is0. These bindings still require a G17G
-resource-loading Ioto program; compiling the shader alone does not establish
-valid command-stream construction or a successful Vulkan render.
+The admitted tile byte offset is0.
 
 The compiler recognizes the complete explicit-coordinate post-RA graph,
 requires an explicit G17G key, and rejects changed attachment index, offset,

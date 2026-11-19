@@ -988,6 +988,7 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
     * which kills without testing.  So keep the two decisions separate --
     * always honour the exported coverage, and let the flag govern only
     * whether the kill also triggers the tests. */
+   bool single_sample_coverage_applied = false;
    if (write_samples) {
       bool kills = false;
       nir_foreach_block(block, b->impl) {
@@ -1028,10 +1029,11 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
          kills = true;
       }
 
-      /* Colour stores keep their own copy of the mask either way, through
-       * agx_nir_lower_tilebuffer. */
-      if (kills)
+      if (kills) {
          b->shader->info.fs.uses_discard = true;
+         single_sample_coverage_applied =
+            key->m5_coverage && key->nr_samples == 1;
+      }
    }
 
    /* Depth/stencil writes must be deferred until after all discards,
@@ -1081,9 +1083,21 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
     * read-modify-write, as Apple's does.) */
    const bool preserve_zero_mask =
       key->preserve_zero_mask && !key->g18_native_mixed;
+   /* A single-sample tile store already observes the kill above. Passing
+    * the same dynamic mask to the store would require a per-sample MRT
+    * transaction. Image spills still need their explicit predicate.
+    */
+   nir_def *store_samples =
+      single_sample_coverage_applied && !agx_tilebuffer_spills(&tib)
+         ? NULL : write_samples;
+   if (write_samples && !store_samples) {
+      /* A masked colour store still requires a translucent pass. */
+      for (unsigned rt = 0; rt < ARRAY_SIZE(tib.logical_format); ++rt)
+         force_translucent |= tib.logical_format[rt] != PIPE_FORMAT_NONE;
+   }
    unsigned rt_spill = key->link.rt_spill_base;
    NIR_PASS(_, b->shader, agx_nir_lower_tilebuffer_with_conversions, &tib,
-            colormasks, &rt_spill, write_samples, &force_translucent,
+            colormasks, &rt_spill, store_samples, &force_translucent,
             preserve_zero_mask, key->lower_srgb, key->lower_r11g11b10,
             key->g17p_tile_formats, key->native_epilog);
    const bool native_spills = key->native_spills && agx_tilebuffer_spills(&tib);
@@ -1823,7 +1837,7 @@ agx_nir_fs_prolog(nir_builder *b, const void *key_)
 
    if (key->cull_distance_size) {
       NIR_PASS(_, b->shader, agx_nir_lower_cull_distance_fs,
-               key->cull_distance_size, key->native_cull_constant_planes);
+               key->cull_distance_size);
    }
 
    if (key->polygon_stipple) {
@@ -1846,9 +1860,12 @@ agx_nir_fs_prolog(nir_builder *b, const void *key_)
    NIR_PASS(_, b->shader, nir_shader_intrinsics_pass,
             lower_non_monolithic_uniforms, nir_metadata_control_flow, NULL);
    NIR_PASS(_, b->shader, lower_tests_zs, key->run_zs_tests);
-   /* G18G only for now: Gallium sets native_cull_constant_planes on G18G
-    * alone. A candidate for every chip. */
-   if (!key->run_zs_tests && key->native_cull_constant_planes)
+   /* Exact on every generation: without the tests, TARGET and LIVE are
+    * disjoint, so each update only kills. The backend (agx_compile.c) can
+    * only prove "no Z/S tests" from a constant LIVE; a register LIVE gets the
+    * testing form (wait_pix, and the testing MOVMSK on AGX3). This follows
+    * from sample_mask semantics, not from a chip. */
+   if (!key->run_zs_tests)
       NIR_PASS(_, b->shader, nir_shader_intrinsics_pass,
                lower_prolog_kill_only, nir_metadata_control_flow, NULL);
 

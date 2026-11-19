@@ -39,6 +39,7 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <sched.h>
 #endif
 
 
@@ -254,6 +255,24 @@ util_queue_thread_func(void *input)
 
 #if defined(__linux__)
    if (queue->flags & UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY) {
+#if defined(SCHED_BATCH)
+      struct sched_param sched_param = {0};
+
+      /* SCHED_BATCH gives the scheduler a hint that this is a latency
+       * insensitive thread.
+       *
+       * The worker sets its own policy (pid 0 = the calling thread): a
+       * sandbox that only allows scheduler calls on the caller, such as
+       * Chromium's GPU process, kills the process when another thread
+       * changes it, and a queue can be created or grow after the sandbox
+       * is up (lazily created disk cache queue, RESIZE_IF_FULL).
+       *
+       * Note that Linux only allows decreasing the priority. The original
+       * priority can't be restored.
+       */
+      sched_setscheduler(0, SCHED_BATCH, &sched_param);
+#endif
+
       /* The nice() function can only set a maximum of 19. */
       setpriority(PRIO_PROCESS, syscall(SYS_gettid), 19);
    }
@@ -333,20 +352,6 @@ util_queue_create_thread(struct util_queue *queue, unsigned index)
       return false;
    }
 
-   if (queue->flags & UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY) {
-#if defined(__linux__) && defined(SCHED_BATCH)
-      struct sched_param sched_param = {0};
-
-      /* The nice() function can only set a maximum of 19.
-       * SCHED_BATCH gives the scheduler a hint that this is a latency
-       * insensitive thread.
-       *
-       * Note that Linux only allows decreasing the priority. The original
-       * priority can't be restored.
-       */
-      pthread_setschedparam(queue->threads[index], SCHED_BATCH, &sched_param);
-#endif
-   }
    return true;
 }
 

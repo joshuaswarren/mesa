@@ -41,6 +41,10 @@ struct hk_device_memory {
 
    /* Residency preference the kernel accepted (memory priority 1.0). */
    bool keep_resident;
+
+   /* An import the GPU may write that another import can map at a second
+    * address too: counted in hk_device::va_alias_resources while it lives. */
+   bool alias_import;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_device_memory, vk.base, VkDeviceMemory,

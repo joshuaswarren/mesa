@@ -33,8 +33,7 @@ agx_instr_accepts_uniform(enum agx_isa_encoding encoding, enum agx_opcode op,
     * at a two-half boundary must be copied to a GPR pair before use. */
    const bool m5_high_load_base =
       encoding == AGX_ISA_ENCODING_AGX3C && op == AGX_OPCODE_DEVICE_LOAD &&
-      size == AGX_SIZE_64 && value <= 508 &&
-      debug_get_bool_option("ASAHI_M5_HIGH_UNIFORM_LOAD", true);
+      size == AGX_SIZE_64 && value <= 508;
    bool memory_base = (!high || m5_high_load_base) &&
       (encoding == AGX_ISA_ENCODING_AGX2 || !(value & 3));
 
@@ -70,11 +69,9 @@ agx_instr_accepts_uniform(enum agx_isa_encoding encoding, enum agx_opcode op,
    case AGX_OPCODE_IMAGE_LOAD:
    case AGX_OPCODE_TEXTURE_LOAD:
       /* The saved G17S Atrous programs read texture handles directly from
-       * aligned 64-bit uniforms (SMP kind 3), without per-lane copies.
-       * Keep the environment override for isolated regression controls. */
+       * aligned 64-bit uniforms (SMP kind 3), without per-lane copies. */
       if (encoding == AGX_ISA_ENCODING_AGX3C && op == AGX_OPCODE_TEXTURE_LOAD &&
-          src_index == 3 &&
-          debug_get_bool_option("ASAHI_M5_UNIFORM_TEXTURE_OPERANDS", true))
+          src_index == 3)
          return !high && !(value & 3) && value <= 252 && size == AGX_SIZE_64;
       /* G17P publishes a dynamic integer LOD through PACK_SMPIR from a GPR;
        * there is no witnessed uniform-file source for that operand.  Keep
@@ -181,8 +178,7 @@ agx_instr_accepts_uniform(enum agx_isa_encoding encoding, enum agx_opcode op,
        * keep the uniform as the second operand instead of copying it into
        * a GPR on every iteration. */
       return (encoding == AGX_ISA_ENCODING_AGX3B ||
-              (encoding == AGX_ISA_ENCODING_AGX3C &&
-               debug_get_bool_option("ASAHI_M5_UNIFORM_BRANCH", true))) &&
+              encoding == AGX_ISA_ENCODING_AGX3C) &&
              src_index == 1 && size == AGX_SIZE_32 && !(value & 1) &&
              value < 256;
    case AGX_OPCODE_PHI:
@@ -335,8 +331,6 @@ agx3_lower_m5_modified_fma_immediates(agx_context *ctx, agx_instr *I)
  * Final physical divergence disables discard hints, and post-optimizer SSA
  * reuse may differ from the original NIR use count. Pack only those operands
  * that cannot use the consuming publisher, after optimization and before RA. */
-DEBUG_GET_ONCE_BOOL_OPTION(m5_fold_constant_lod,
-                           "ASAHI_M5_FOLD_CONSTANT_LOD", true)
 
 static bool
 agx3_m5_exact_lod_immediate(float value, bool explicit_lod, uint8_t *immediate)
@@ -364,8 +358,7 @@ static void
 agx3_fold_m5_constant_lods(agx_context *ctx)
 {
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
-       ctx->stage != MESA_SHADER_FRAGMENT ||
-       !debug_get_option_m5_fold_constant_lod())
+       ctx->stage != MESA_SHADER_FRAGMENT)
       return;
 
    agx_instr **defs = calloc(ctx->alloc, sizeof(*defs));
@@ -887,8 +880,7 @@ agx_lower_uniform_sources(agx_context *ctx)
          const bool uniform_imm_compare =
             (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
              (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-              ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
-              debug_get_bool_option("ASAHI_M5_UNIFORM_BRANCH", true))) &&
+              ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble)) &&
             is_int_compare && I->nr_srcs == 2 &&
             I->src[s].type == AGX_INDEX_UNIFORM &&
             I->src[s].size == AGX_SIZE_32 && !(I->src[s].value & 1) &&

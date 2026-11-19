@@ -10,7 +10,6 @@ libasahi_lib_files = files(
   'agx3_cdm_direct_launch_semantic_core.h',
   'agx3_compute_program_core.c',
   'agx3_compute_program_core.h',
-  'agx3_g17p_grid_helper_core.c',
   'agx3_g17p_grid_helper_core.h',
   'agx3_code_container_core.c',
   'agx3_code_container_core.h',
@@ -28,7 +27,6 @@ libasahi_lib_files = files(
   'agx_ioto_state_core.h',
   'agx_g17p_draw_state_upload.h',
   'agx_rt_result.h',
-  'agx_rt_ift.h',
   'agx_scs_layout.c',
   'agx_scs_layout.h',
   'agx_bo.c',
@@ -69,8 +67,6 @@ libasahi_lib_files = files(
   'agx_scs_layout.c',
   'agx_scs_layout.h',
   'agx_scratch.c',
-  'agx_texture_side_entry.c',
-  'agx_texture_side_entry.h',
   'agx_vdm_barrier_core.c',
   'agx_vdm_barrier_core.h',
   'agx_vdm_hal200_bind_tail_core.c',
@@ -194,7 +190,7 @@ libasahi_lib = static_library(
 )
 
 if with_tests
-  foreach rt_test : ['rt-bvh', 'rt-ift', 'scs-layout']
+  foreach rt_test : ['rt-bvh', 'scs-layout']
     test('asahi-' + rt_test,
       executable('asahi-' + rt_test,
         ['tests/test-' + rt_test + '.c', 'agx_scs_layout.c'],
@@ -615,11 +611,6 @@ if dep_iokit.found()
 endif
 
 if with_tests
-  test('asahi-rt-payload-gen1', executable('asahi-rt-payload-gen1',
-    'tests/test-rt-payload-gen1.c',
-    c_args : ['-ffp-contract=off'],
-    include_directories : include_directories('.'),
-    dependencies : [dep_m]), suite : ['asahi'])
   test('agx3_m5_programs', executable('agx3_m5_programs',
     '../compiler/test/test-agx3-m5-program.c',
     include_directories: [inc_include, inc_src, inc_asahi],
@@ -680,12 +671,6 @@ endif
 if with_tests
   test('agx_scs_layout', executable('agx_scs_layout',
     ['tests/test-scs-layout.c', 'agx_scs_layout.c'],
-    c_args: ['-UNDEBUG'],
-    include_directories: include_directories('.')), suite: ['asahi'])
-endif
-
-if with_tests
-  test('agx_rt_ift', executable('agx_rt_ift', 'tests/test-rt-ift.c',
     c_args: ['-UNDEBUG'],
     include_directories: include_directories('.')), suite: ['asahi'])
 endif

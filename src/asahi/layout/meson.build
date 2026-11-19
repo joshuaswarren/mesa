@@ -36,4 +36,18 @@ if with_tests
     suite : ['asahi'],
     protocol : 'gtest',
   )
+
+  test(
+    'agx3_layout',
+    executable(
+      'agx3_layout_test',
+      files('tests/test-agx3-layout.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      include_directories : [inc_include, inc_src],
+      dependencies: [idep_mesautil],
+      link_with : [libasahi_layout],
+    ),
+    suite : ['asahi'],
+  )
 endif

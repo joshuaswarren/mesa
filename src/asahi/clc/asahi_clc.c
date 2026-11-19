@@ -343,7 +343,12 @@ target_supports_program(const char *target, const nir_function *func)
     *
     * G18G launches these through the G17G-family compute profile; it takes
     * the qualified list below, without fast clear and with the hardware
-    * tessellator. target_is_agx3() covers it: its target chip is G17G. */
+    * tessellator. target_is_agx3() covers it: its target chip is G17G.
+    *
+    * Tessellation runs as libagx_tess_isoline/tri/quad (libagx_tessellate is
+    * only the tessellator.h macro choosing one), qualified below for every
+    * AGX3 target. libagx_decompress is NOT qualified: it fails to compile
+    * even for strict g17p (spilling decoder), so it stays AGX2-only. */
    return !target_is_agx3(target) ||
           /* M5 native acceleration-structure copy, compaction,
            * serialization and property kernels (copy.cl, C87 GPU-side AS
@@ -446,15 +451,7 @@ target_supports_program(const char *target, const nir_function *func)
            * heap allocation and one barrier -- both already qualified here by
            * libagx_unroll_restart, which allocates from the same heap with the
            * same printf-free poly_heap_try_alloc_offs(). */
-          !strcmp(func->name, "libagx_write_adj_indices_indirect") ||
-          /* The hardware tessellator main program: called by the Vulkan
-           * driver on every chip; qualified so the compile-omission list
-           * (not a runtime refusal) names any shape the G18G encoders cannot
-           * take yet. libagx_decompress is NOT qualified: it fails to compile
-           * even for strict g17p (spilling decoder), so it stays AGX2-only.
-           * G18G only for now; a candidate for every AGX3 target. */
-          (!strcmp(target, "g18g") &&
-           !strcmp(func->name, "libagx_tessellate"));
+          !strcmp(func->name, "libagx_write_adj_indices_indirect");
 }
 
 /* AGX3 has no grounded INTL instruction encoding. Expand the 16-bit Morton

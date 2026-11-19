@@ -31,6 +31,5 @@ register choices may change with a different toolchain.
 - Buffer-store probes retain the same value across two writes through a
   dynamically loaded pointer, exposing the store's extended dependency form.
 
-The Vulkan draw-plus-blit hardware result qualifies the bounded fragment
-copy path. Native compute compilation of these probes is not evidence that
-Mesa application compute submissions work on M5.
+Native compilation of these probes is encoding evidence only, not evidence
+of how Mesa's own programs behave on M5 hardware.

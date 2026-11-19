@@ -8,7 +8,6 @@
  */
 
 #include <stdint.h>
-#include "asahi/compiler/agx_debug.h"
 #include "asahi/compiler/agx_nir_texture.h"
 #include "asahi/layout/layout.h"
 #include "compiler/nir/nir_builder.h"
@@ -504,7 +503,10 @@ agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
    }
 
    if (op & ASAHI_SAVE_FRAMEBUFFER) {
-      util_blitter_save_framebuffer(blitter, &ctx->framebuffer);
+      /* Restore what the app bound, not the batch a colourless pass was
+       * merged into (agx_try_zs_merge), or later draws would write colour. */
+      util_blitter_save_framebuffer(
+         blitter, ctx->zs_merge ? &ctx->zs_merge_real : &ctx->framebuffer);
    }
 
    if (op & ASAHI_SAVE_TEXTURES) {
@@ -822,8 +824,7 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
     * texture fetches and resolves. Store them first and use the render blitter
     * to fetch and average every sample until EOT can preserve both outputs. */
    const bool g18_msaa4 =
-      agx_device(ctx->base.screen)->chip == AGX_CHIP_G18G &&
-      agx_g18_msaa4_enabled();
+      agx_device(ctx->base.screen)->chip == AGX_CHIP_G18G;
 
    /* G17G resolves through u_blitter's sample fetches instead. Attaching
     * the resolve to the batch that drew the multisample image makes its EOT

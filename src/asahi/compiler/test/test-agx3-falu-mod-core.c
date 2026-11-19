@@ -588,8 +588,7 @@ fma_two_vectors(void)
 
 /*
  * FMA with a minifloat MULTIPLIER and modifier-bearing register operands.
- * Apple's own applegpu_g17p output for the five cells, from
- * .tmp/g17p-terrain-fma-imm-abs/fmaimm.metal; each kernel is
+ * Apple's own applegpu_g17p output for the five cells; each kernel is
  * `o[i] = fma(<k>, <b>, <c>)` over device loads, so both register operands
  * are dead after the FMA (f29/f63) and it waits on the loads' slot (f102).
  *
