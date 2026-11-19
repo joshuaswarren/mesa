@@ -230,7 +230,10 @@ struct hk_sync_stream {
    struct hk_cs *prev_mem;
 
    /* Set at submission: 1-based position among the commands of this
-    * subqueue in the ioctl being built. */
+    * subqueue in the ioctl being built. Like the resolved fields below, it
+    * describes one occurrence of the stream: a simultaneous-use command
+    * buffer may occur more than once in a submission
+    * (hk_sync_resolve_submit()). */
    uint32_t index;
 
    /* Resolved barrier fields for the ioctl being built. */
@@ -257,6 +260,15 @@ struct hk_sync_stream {
     * dependency epoch vtx_images_epoch. */
    bool vtx_images;
    uint32_t vtx_images_epoch;
+};
+
+/* The resolved fields of one occurrence of a stream in a submission. */
+struct hk_sync_resolved {
+   uint16_t barrier[HK_SYNC_NUM_SQ];
+   uint16_t barrier_ta[HK_SYNC_NUM_SQ];
+   uint64_t prior[HK_SYNC_NUM_SQ];
+   uint64_t prior_ta[HK_SYNC_NUM_SQ];
+   bool ta_split;
 };
 
 /* Per-command-buffer state. */
@@ -517,8 +529,16 @@ void hk_sync_resolve_end(struct hk_cmd_buffer *cmd);
  * command must run after; chain_first says the commands must transitively
  * follow the first hardware command (the kernel attaches the ioctl's input
  * syncs only to it).
+ *
+ * A command buffer may occur more than once in cmdbufs, and its streams then
+ * resolve differently at each occurrence. Unless out is NULL, it receives
+ * one entry per stream occurrence in submission order; the caller loads each
+ * into its stream (hk_sync_load_resolved()) before emitting it. The streams
+ * keep the fields of their last occurrence.
  */
 bool hk_sync_resolve_submit(struct hk_queue *queue,
                             struct hk_cmd_buffer *const *cmdbufs,
                             unsigned count, bool first_cdm_is_flush,
-                            bool chain_first, uint64_t completed);
+                            bool chain_first, uint64_t completed,
+                            struct hk_sync_resolved *out);
+void hk_sync_load_resolved(struct hk_cs *cs, const struct hk_sync_resolved *r);

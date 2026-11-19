@@ -10,26 +10,6 @@
 
 #include <string.h>
 
-bool
-agx_vdm_state_update_encode_preamble_counts(
-   enum agx_chip chip, uint32_t ipr_bytes, uint32_t spill_bytes,
-   struct agx_vdm_state_update_preamble_counts *counts)
-{
-   if (counts)
-      memset(counts, 0, sizeof(*counts));
-
-   /* The largest even 12-bit count is 0xffe. Validate before addition so
-    * malformed metadata cannot wrap the rounding arithmetic. */
-   if (!counts || chip != AGX_CHIP_G17P ||
-       ipr_bytes > UINT32_C(0xffe) * 4 ||
-       spill_bytes > UINT32_C(0x3ffff) * 4)
-      return false;
-
-   counts->ipr_dwords = ((ipr_bytes + 7) / 8) * 2;
-   counts->spill_dwords = (spill_bytes + 3) / 4;
-   return true;
-}
-
 /*
  * Pack/unpack the complete seven-word AGX3 VDM State Update emitted by the
  * inspected Apple VDMEncoderGen5 and VDMEncoderGen6 paths:
@@ -53,27 +33,6 @@ bool
 agx_vdm_state_update_supported(enum agx_chip chip)
 {
    return agx_vdm_state_vertex_pipeline_pair_supported(chip);
-}
-
-bool
-agx_vdm_state_update_resolve_pipeline_va(uint64_t shader_base,
-                                         uint32_t packed_usc,
-                                         uint64_t *pipeline_va)
-{
-   if (pipeline_va)
-      *pipeline_va = 0;
-
-   if (!pipeline_va || (shader_base & UINT64_C(0x3f)) != 0 ||
-       (packed_usc & UINT32_C(0x3f)) != 0 ||
-       shader_base > UINT64_MAX - packed_usc)
-      return false;
-
-   const uint64_t candidate = shader_base + packed_usc;
-   if (candidate >= (UINT64_C(1) << 48))
-      return false;
-
-   *pipeline_va = candidate;
-   return true;
 }
 
 bool

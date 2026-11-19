@@ -68,8 +68,6 @@ bool agx_nir_lower_m5_mesh(nir_shader *shader,
                            const struct agx_m5_mesh_varyings *varyings);
 
 
-bool agx_nir_lower_m5_task_payload_probe(nir_shader *shader);
-bool agx_nir_lower_m5_task_probe(nir_shader *shader);
 bool agx_nir_lower_m5_task_payload(nir_shader *shader, unsigned max_payload_B,
                                    unsigned payload_base_B);
 bool agx_nir_lower_m5_task(nir_shader *shader, unsigned max_payload_B,

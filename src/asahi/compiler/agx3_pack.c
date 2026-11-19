@@ -1672,47 +1672,6 @@ agx3_pack_end(enum agx_isa_encoding encoding, struct agx3_encoded_end *out)
    return true;
 }
 
-static const uint8_t update_node_agx3b[] = {
-   0x07, 0x04, 0x54, 0x08, 0x09, 0x00, 0xdf, 0x05, 0x54, 0x00,
-};
-
-static const uint8_t update_node_agx3c[] = {
-   0x17, 0x09, 0x00, 0x06, 0x00, 0x00, 0x27,
-   0x00, 0x01, 0x00, 0x22, 0x00, 0xad, 0x02,
-};
-
-static const uint8_t *
-update_node_encoding(enum agx_isa_encoding encoding, size_t *length)
-{
-   switch (encoding) {
-   case AGX_ISA_ENCODING_AGX3B:
-      *length = sizeof(update_node_agx3b);
-      return update_node_agx3b;
-   case AGX_ISA_ENCODING_AGX3C:
-      *length = sizeof(update_node_agx3c);
-      return update_node_agx3c;
-   default:
-      *length = 0;
-      return NULL;
-   }
-}
-
-bool
-agx3_pack_update_node(enum agx_isa_encoding encoding,
-                      struct agx3_encoded_update_node *out)
-{
-   size_t length = 0;
-   const uint8_t *canonical = update_node_encoding(encoding, &length);
-
-   if (canonical == NULL || out == NULL)
-      return false;
-
-   memset(out, 0, sizeof(*out));
-   memcpy(out->bytes, canonical, length);
-   out->length = length;
-   return true;
-}
-
 /* Direct differential pairs from Apple's instructions:
  *
  * AGX3b cases 561/470 differ only in f5=0/4.
@@ -1999,27 +1958,4 @@ agx3_inc_stk_witnessed_chip_encoding(enum agx_chip chip)
    default:
       return AGX_ISA_ENCODING_UNKNOWN;
    }
-}
-
-static const uint8_t
-   update_bvh_fixed_witness_agx3c[AGX3_UPDATE_BVH_FIXED_WITNESS_LENGTH] = {
-      /* barrier */
-      0x17, 0x09, 0x00, 0x06, 0x00, 0x00,
-      /* update_bvh */
-      0x27, 0x00, 0x21, 0x00, 0x22, 0x80, 0xac, 0x42,
-   };
-
-bool
-agx3_pack_update_bvh_fixed_witness(
-   enum agx_isa_encoding encoding,
-   struct agx3_encoded_update_bvh_fixed_witness *out)
-{
-   if (encoding != AGX_ISA_ENCODING_AGX3C || out == NULL)
-      return false;
-
-   memset(out, 0, sizeof(*out));
-   memcpy(out->bytes, update_bvh_fixed_witness_agx3c,
-          sizeof(update_bvh_fixed_witness_agx3c));
-   out->length = sizeof(update_bvh_fixed_witness_agx3c);
-   return true;
 }
