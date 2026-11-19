@@ -9,7 +9,6 @@
 #include "agx_ioto_core.h"
 #include "agx_ioto_load_core.h"
 
-#include "util/u_debug.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -86,9 +85,7 @@ static bool
 fragment_pixrel_descriptor(unsigned colour_classes, bool writes_sample_mask,
                            uint16_t *out)
 {
-   if (!out ||
-       (colour_classes == 0 &&
-        !debug_get_bool_option("ASAHI_G17P_ZERO_COLOUR_RELEASE_DIAGNOSTIC", false)) ||
+   if (!out || colour_classes == 0 ||
        colour_classes >= (1u << FRAGMENT_COLOUR_PARTITIONS))
       return false;
 

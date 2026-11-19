@@ -658,8 +658,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
    gen1_rq_alias_copies(impl);
    struct util_dynarray queries = UTIL_DYNARRAY_INIT;
    struct util_dynarray ops = UTIL_DYNARRAY_INIT;
-   unsigned refusal_line = 0;
-#define GEN1_RQ_UNSUPPORTED() do { refusal_line = __LINE__; goto unsupported; } while (0)
+#define GEN1_RQ_UNSUPPORTED() goto unsupported
    nir_foreach_function(f, shader) {
       if (!f->impl)
          continue;
@@ -826,23 +825,6 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
       nir_def *value = NULL;
       switch (intr->intrinsic) {
       case nir_intrinsic_rq_initialize:
-         if (b.shader->info.stage == MESA_SHADER_COMPUTE) {
-            const char *capture = getenv("ASAHI_G17P_CAPTURE_SCS_INDEX");
-            if (capture && *capture) {
-               char *end;
-               uint64_t target = strtoull(capture, &end, 0);
-               if (!*end && target && !(target & 15)) {
-                  nir_def *gid = nir_channel(&b,
-                     nir_load_global_invocation_id(&b, 32), 0);
-                  nir_def *physical = nir_load_scs_thread_index_agx(&b);
-                  nir_store_global(&b, nir_vec4(&b, gid, physical,
-                     nir_imm_int(&b, 0x53435349), nir_imm_int(&b, 0)),
-                     nir_iadd(&b, nir_imm_int64(&b, target),
-                        nir_u2u64(&b, nir_ishl_imm(&b, gid, 4))),
-                     .align_mul = 16, .write_mask = 15);
-               }
-            }
-         }
          nir_store_deref(&b,started,nir_imm_false(&b),1);
          nir_store_deref(&b,cursor,nir_imm_int(&b,0),1);
          nir_store_deref(&b,refills,nir_imm_int(&b,0),1);
@@ -1208,11 +1190,6 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             nir_var_shader_temp | nir_var_function_temp, NULL);
    return true;
 unsupported:
-   if (debug_get_bool_option("ASAHI_G17P_RQ_LOWERING_DIAGNOSTIC", false))
-      fprintf(stderr, "Gen1 ray-query refusal stage=%u line=%u queries=%zu operations=%zu instances=%d candidates=%d position_fetch=%d feature=%d\n",
-              shader->info.stage, refusal_line,
-              util_dynarray_num_elements(&queries, struct gen1_rq_state),
-              util_dynarray_num_elements(&ops, nir_intrinsic_instr *), layout->instance_traversal, layout->candidates, layout->position_fetch, layout->diagnostic_features);
 #undef GEN1_RQ_UNSUPPORTED
    util_dynarray_fini(&ops);
    util_dynarray_fini(&queries);

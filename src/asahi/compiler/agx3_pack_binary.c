@@ -23337,23 +23337,6 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
        !agx3_retire_slots_noop(emission, enc, outstanding))
       AGX3_PACK_FAIL();
 
-   if (ctx->key->dev.chip == AGX_CHIP_G17P &&
-       enc == AGX_ISA_ENCODING_AGX3B &&
-       ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble &&
-       !ctx->key->secondary && !ctx->key->fs.ignore_tib_dependencies &&
-       ctx->nir && !ctx->nir->info.outputs_written && count == 0 &&
-       debug_get_bool_option("ASAHI_G17P_EMPTY_FS_PIXEL_DIAGNOSTIC", false)) {
-      uint8_t bytes[AGX3_PIXEL_MAX_LENGTH], len;
-      if (!agx3_pixel_colour_entry(enc, bytes, &len) ||
-          !agx3_append(emission, bytes, len))
-         goto fail;
-      ctx->agx3_colour_link.entry_emitted = true;
-      ctx->agx3_colour_link.entry_offset = emission->size - len - initial_size;
-      if (!agx3_pixel_release(enc, 0, true, 0, bytes, &len) ||
-          !agx3_append(emission, bytes, len))
-         goto fail;
-   }
-
    if (gen1_mesh && mesh_allocated &&
        (!mesh_indices_fenced ||
         (ctx->nir && ctx->nir->info.mesh.max_vertices_out &&
