@@ -1871,15 +1871,15 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
    /* Remat can introduce dead code */
    agx_dce(ctx, false);
 
-   /* Spilled phi edges can materialize constants into memory without going
-    * through insert_spill(). Account for surviving memory values as well as
-    * ordinary spill stores: RA needs its parallel-copy scratch registers and
-    * must lower these copies to actual stack accesses after allocation.
-    * G18G only for now; candidate for all chips.
+   /* Any memory value that survives spilling is a stack slot: RA must keep
+    * its parallel-copy scratch registers to lower memory copies after
+    * allocation, and a remat-only pass that left one behind has spilled to
+    * scratch. record_spill() sets both flags at each store this pass inserts
+    * (cdfdf3baf3c added the phi-edge ones), so this normally changes nothing;
+    * it makes the RA contract follow the program itself, not the bookkeeping
+    * of every path that can create a memory value. That is generic register
+    * allocation logic, so it holds on every generation.
     */
-   if (!ctx->key || !agx_is_g18g(&ctx->key->dev))
-      return;
-
    bool memory = false;
    agx_foreach_instr_global(ctx, I) {
       agx_foreach_ssa_dest(I, d)
@@ -1889,7 +1889,7 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
    }
 
    if (memory) {
-      assert(ctx->key->has_scratch && "spilled phi needs scratch");
+      assert(ctx->key->has_scratch && "memory values need scratch");
       ctx->has_spill_pcopy_reserved = true;
       ctx->remat_fallback_spilled |= remat_only;
    }
