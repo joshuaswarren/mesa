@@ -1456,8 +1456,6 @@ agx_upload_depth_bias(struct agx_batch *batch,
  * to add surfaces to the BO list here. Instead we added them when flushing.
  */
 
-/* AGX_ZS_MERGE=0 ends the batch at every such framebuffer switch again. */
-DEBUG_GET_ONCE_BOOL_OPTION(zs_merge, "AGX_ZS_MERGE", true)
 
 static bool
 agx_fb_has_colour(const struct pipe_framebuffer_state *fb)
@@ -1495,7 +1493,7 @@ agx_try_zs_merge(struct agx_context *ctx,
 {
    const struct agx_device *dev = agx_device(ctx->base.screen);
 
-   if (!debug_get_option_zs_merge() || !state->zsbuf.texture ||
+   if (!state->zsbuf.texture ||
        agx_fb_has_colour(state) || state->resolve || state->viewmask)
       return;
 
@@ -4053,14 +4051,10 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
       /* Texel fetches get G17P's explicit out-of-view predicate only in
        * robust contexts: elsewhere an out-of-range texelFetch is undefined
        * (GL 4.6, 8.6) and the hardware fetch is memory-safe. Shader packs'
-       * full-screen passes spent 5-7 instructions on every fetch.
-       * ASAHI_GL_ROBUST_TEXEL_FETCH=1 keeps the predicate everywhere. */
-      static int force = -1;
-      if (force < 0)
-         force = debug_get_bool_option("ASAHI_GL_ROBUST_TEXEL_FETCH", false);
+       * full-screen passes spent 5-7 instructions on every fetch. */
       NIR_PASS(_, nir, agx_nir_lower_texture_with_buffer_metadata_cb,
                descriptor_generation, agx_buffer_texture_metadata,
-               robust || force);
+               robust);
    }
    else
       NIR_PASS(_, nir, agx_nir_lower_texture_for_generation,

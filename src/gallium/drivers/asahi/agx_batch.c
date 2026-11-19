@@ -53,8 +53,6 @@ agx_append_split_compute(struct util_dynarray *cmdbuf,
 #define foreach_submitted(ctx, idx)                                            \
    BITSET_FOREACH_SET(idx, ctx->batches.submitted, AGX_MAX_BATCHES)
 
-/* AGX_RANGE_READS=0 tracks every buffer access as the whole BO again. */
-DEBUG_GET_ONCE_BOOL_OPTION(range_reads, "AGX_RANGE_READS", true)
 
 #define batch_debug(batch, fmt, ...)                                           \
    do {                                                                        \
@@ -938,7 +936,7 @@ void
 agx_batch_reads_range(struct agx_batch *batch, struct agx_resource *rsrc,
                       uint64_t offset, uint64_t size)
 {
-   if (!debug_get_option_range_reads() || !size)
+   if (!size)
       agx_batch_reads_internal(batch, rsrc, 0, AGX_RANGE_ALL);
    else
       agx_batch_reads_internal(batch, rsrc, offset, offset + size);
@@ -984,11 +982,6 @@ agx_batch_writes_internal(struct agx_batch *batch, struct agx_resource *rsrc,
    struct agx_batch *writer = agx_writer_get(ctx, rsrc->bo->handle);
 
    assert(batch->initialized);
-
-   if (!debug_get_option_range_reads()) {
-      start = 0;
-      end = AGX_RANGE_ALL;
-   }
 
    agx_flush_readers_except_range(ctx, rsrc, batch, "Write from other batch",
                                   false, start, end);
