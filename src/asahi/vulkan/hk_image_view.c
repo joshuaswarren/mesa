@@ -687,7 +687,11 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
             cfg.stride = (layout->stride_el[0] / 16) * 16 - 4;
             assert(cfg.levels == 1);
          } else {
-            cfg.page_aligned_layers = layout->page_aligned_layers;
+            /* The 2D EOT view starts at this layer's surface and metadata.
+             * The array stride is not part of a compressed 2D PBE. */
+            cfg.page_aligned_layers = layout->page_aligned_layers &&
+               !(agx_chip_g17_m5(dev->dev.chip) && layout->compressed &&
+                 layers == 1 && usage == HK_DESC_USAGE_BG_EOT);
          }
 
          if (image->vk.samples > 1)

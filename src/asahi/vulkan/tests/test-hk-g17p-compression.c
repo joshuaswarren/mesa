@@ -529,9 +529,12 @@ check_m5_depth(void)
       c = i;
       c.mipLevels = 2;
       CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      /* Layered depth compresses on every M5 part. */
       c = i;
       c.arrayLayers = 2;
-      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      CHECK(hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      CHECK(hk_m5_depth_compression_eligible(AGX_CHIP_G17G, 0, &c));
+      CHECK(hk_m5_depth_compression_eligible(AGX_CHIP_G17C, 0, &c));
       c = i;
       c.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
       CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));

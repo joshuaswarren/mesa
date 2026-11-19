@@ -577,16 +577,16 @@ hk_g17p_buffer_to_image_copy_supported(
       /* Compressed D32/D16 cannot use the raw AIL upload kernel. The graphics
        * copy writes its bit-compatible R32_UINT/R16_UINT view through the
        * PBE, which also updates compression metadata. Keep this fallback
-       * bounded to the single-level 2D shapes G17P depth compression admits
+       * bounded to the single-level 2D shapes depth compression admits
        * (hk_g17p_compression.h): arrays only where the caller uploads them
-       * one layer per pass (native AGX3). A combined depth/stencil image is
-       * split into a depth plane and a stencil plane; the stencil aspect is
-       * the branch below. */
+       * one layer per pass (native AGX3 or M5). A combined depth/stencil
+       * image is split into a depth plane and a stencil plane; the stencil
+       * aspect is the branch below. */
       const bool split = copy->format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
                          copy->format == VK_FORMAT_D16_UNORM_S8_UINT;
       if (copy->plane_count != (split ? 2 : 1) ||
           copy->image_type != VK_IMAGE_TYPE_2D || copy->mip_levels != 1 ||
-          (copy->array_layers != 1 && !agx_chip_native_agx3(copy->chip)))
+          (copy->array_layers != 1 && !agx_chip_native_or_m5(copy->chip)))
          return false;
       plane_format = (copy->format == VK_FORMAT_D32_SFLOAT ||
                       copy->format == VK_FORMAT_D32_SFLOAT_S8_UINT)
@@ -599,7 +599,7 @@ hk_g17p_buffer_to_image_copy_supported(
        * bit-compatible R8_UINT view, in the same single-level 2D shapes. */
       if (copy->plane_count != 2 || copy->image_type != VK_IMAGE_TYPE_2D ||
           copy->mip_levels != 1 ||
-          (copy->array_layers != 1 && !agx_chip_native_agx3(copy->chip)))
+          (copy->array_layers != 1 && !agx_chip_native_or_m5(copy->chip)))
          return false;
       plane_format = VK_FORMAT_R8_UINT;
    } else if (copy->plane_count != 1 ||

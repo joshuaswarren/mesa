@@ -580,7 +580,7 @@ hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
  *
  * Admitted: D16_UNORM, D32_SFLOAT and both planes of D32_SFLOAT_S8_UINT
  * (stencil is read through its R8_UINT alias and copied through the same
- * graphics path), one layer, one mip, one sample,
+ * graphics path), one mip, one sample (single-layer and layered 2D arrays),
  * a depth attachment, and otherwise only sampled, input-attachment,
  * feedback-loop and transfer usages. Zink marks its depth attachments
  * sample-location compatible and feedback-loop capable, which changes
@@ -624,7 +624,7 @@ hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
       VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
 
    return info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
-          info->arrayLayers == 1 && info->mipLevels == 1 &&
+          info->mipLevels == 1 &&
           info->samples == VK_SAMPLE_COUNT_1_BIT &&
           info->tiling == VK_IMAGE_TILING_OPTIMAL &&
           !(info->flags & ~allowed_flags) &&
