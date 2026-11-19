@@ -606,13 +606,6 @@ hk_main_mesh_variant(struct hk_api_shader *obj)
    return &obj->variants[HK_MESH_VARIANT_MAIN];
 }
 
-static struct hk_shader *
-hk_rast_mesh_variant(struct hk_api_shader *obj)
-{
-   assert(obj->vk.stage == MESA_SHADER_MESH);
-   return &obj->variants[HK_MESH_VARIANT_RAST];
-}
-
 #define HK_MAX_LINKED_USC_SIZE                                                 \
    (AGX_USC_PRESHADER_LENGTH + AGX_USC_FRAGMENT_PROPERTIES_LENGTH +            \
     AGX_USC_REGISTERS_LENGTH + AGX_USC_SHADER_LENGTH + AGX_USC_SHARED_LENGTH + \

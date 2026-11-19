@@ -22,8 +22,6 @@
 #include "drm-shim/drm_shim.h"
 #include "drm-uapi/asahi_drm.h"
 
-bool drm_shim_driver_prefers_first_render_node = true;
-
 /* Bind/unbind mutate the shared mapping array and own its BO references.
  * Submission validation retains pointers into that array while walking it. */
 static simple_mtx_t shim_mapping_lock = SIMPLE_MTX_INITIALIZER;

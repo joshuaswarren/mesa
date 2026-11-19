@@ -1089,17 +1089,6 @@ g17p_external_setup_launcher_compose(
 }
 
 bool
-agx_ioto_g17p_external_setup_launcher_compose(
-   uint64_t program_va, const void *root_prefix, size_t root_prefix_size,
-   const struct agx_ioto_state_tail_output *packed_tail, uint64_t setup_va,
-   void *output, size_t capacity, size_t *written)
-{
-   return g17p_external_setup_launcher_compose(
-      program_va, root_prefix, root_prefix_size, packed_tail, setup_va,
-      output, capacity, written, false);
-}
-
-bool
 agx_ioto_g17p_external_setup_launcher_compose_trusted(
    uint64_t program_va, const void *root_prefix, size_t root_prefix_size,
    const struct agx_ioto_state_tail_output *packed_tail, uint64_t setup_va,

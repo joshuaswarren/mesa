@@ -89,15 +89,6 @@ bool agx_ioto_state_tail_pack(
    enum agx_chip chip, const struct agx_ioto_state_tail *tail,
    struct agx_ioto_state_tail_output *output);
 
-/*
- * Convenience form for a separately supplied shader VA.  The input LDSHDR
- * f0 field must be zero; the supplied VA is staged into a private copy and is
- * then subject to the same 48-bit and 64-byte-alignment validation.
- */
-bool agx_ioto_state_tail_pack_shader(
-   enum agx_chip chip, const struct agx_ioto_state_tail *tail,
-   uint64_t shader_va, struct agx_ioto_state_tail_output *output);
-
 /* Exact type-0 state tail from the live G17S minimal root-uniform/no-texture
  * compute path.  No shader-info counts are inferred into the zero payload
  * fields.  `tail` is unchanged on failure. */

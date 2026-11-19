@@ -509,19 +509,6 @@ agx_ioto_state_tail_pack(enum agx_chip chip,
 }
 
 bool
-agx_ioto_state_tail_pack_shader(
-   enum agx_chip chip, const struct agx_ioto_state_tail *tail,
-   uint64_t shader_va, struct agx_ioto_state_tail_output *output)
-{
-   if (!tail || !output || tail->ldshdr.f[0] != 0)
-      return false;
-
-   struct agx_ioto_state_tail staged = *tail;
-   staged.ldshdr.f[0] = shader_va;
-   return agx_ioto_state_tail_pack(chip, &staged, output);
-}
-
-bool
 agx_ioto_g17s_minimal_compute_tail_build(
    uint64_t shader_va, struct agx_ioto_state_tail *tail)
 {

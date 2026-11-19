@@ -73,11 +73,6 @@ struct agx3_cprog_import {
  * A 32-bit import requires both selected halves and an aligned compact word.
  * Waits are supplied by the scoreboard, including the loader's entry slot.
  * Output and written are unchanged on any failure. */
-bool agx3_cprog_input_import(const struct agx3_cprog_inputs *inputs,
-                             const struct agx3_cprog_import *desc,
-                             void *output, size_t capacity, size_t *written);
-
-
 bool agx3_cprog_input_import_encoding(
    enum agx_isa_encoding encoding, const struct agx3_cprog_inputs *inputs,
    const struct agx3_cprog_import *desc, void *output, size_t capacity,

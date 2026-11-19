@@ -253,16 +253,6 @@ bool agx_ioto_g17p_coverage_fragment_program_compose_trusted(
    const struct agx_ioto_state_tail_output *packed_tail,
    unsigned colour_classes, void *output, size_t capacity, size_t *written);
 
-/* Split form of the same G17P graphics resource program. The launcher owns
- * the draw-varying root prefix and shader-state records, then enters one
- * immutable external constant-calculation suffix. The suffix owns the
- * linked-shader setup body and the exact stage terminal protocol. Neither
- * function publishes partial output on failure. */
-bool agx_ioto_g17p_external_setup_launcher_compose(
-   uint64_t program_va, const void *root_prefix, size_t root_prefix_size,
-   const struct agx_ioto_state_tail_output *packed_tail, uint64_t setup_va,
-   void *output, size_t capacity, size_t *written);
-
 bool agx_ioto_g17p_background_resource_program_compose(
    uint64_t program_va, const void *pre_copy_body, size_t pre_copy_body_size,
    const void *copies, size_t copies_size,
@@ -299,6 +289,11 @@ bool agx_ioto_g17s_minimal_compute_program_compose_resources(
    const struct agx_ioto_g17s_minimal_compute_resources *resources,
    void *output, size_t capacity, size_t *written);
 
+/* Split form of the same G17P graphics resource program. The launcher owns
+ * the draw-varying root prefix and shader-state records, then enters one
+ * immutable external constant-calculation suffix. The suffix owns the
+ * linked-shader setup body and the exact stage terminal protocol. Neither
+ * function publishes partial output on failure. */
 bool agx_ioto_g17p_external_setup_suffix_compose(
    const void *body, size_t body_size, bool fragment, bool coverage,
    unsigned colour_classes, void *output, size_t capacity, size_t *written);

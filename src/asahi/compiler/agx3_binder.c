@@ -46,12 +46,6 @@ agx3d_table_or_null(void)
 #endif
 }
 
-bool
-agx3_bind_have_agx3d(void)
-{
-   return agx3d_table_or_null() != NULL;
-}
-
 static bool
 agx3_bind_fields(const struct agx3_field_kv *baseline, unsigned nbaseline,
                  const struct agx3_field_kv *overrides, unsigned noverrides,

@@ -417,9 +417,6 @@ bool agx3_tex_stage_array_typed_lod_g18g(uint16_t layer, uint16_t lod,
 /* agx3_tex_stage_typed_lod_at()'s PACK_SMPIR, published into G18G's level
  * word (bank + AGX3_TEX_G18G_LEVEL_WORD). The field vector is G17G's in every
  * applegpu_g18g witness above, f5 alone following the block. */
-bool agx3_tex_stage_query_bias_g18g(bool three_d, uint16_t src, uint8_t slot,
-                                    uint16_t wait_mask,
-                                    uint8_t out[AGX3_TEX_MAX_LENGTH], uint8_t *len);
 bool agx3_tex_stage_typed_lod_g18g(uint16_t bank, uint16_t src, uint8_t slot,
                                    uint16_t wait_mask, bool src_cache,
                                    bool src_discard,
@@ -737,14 +734,6 @@ struct agx3_image_write_g18g_desc {
 bool agx3_tex_encode_image_write_g18g(
    enum agx_isa_encoding enc, const struct agx3_image_write_g18g_desc *d,
    uint8_t out[AGX3_TEX_MAX_LENGTH], uint8_t *len);
-
-/* G18G's first grounded image write, native run112 kick 19: a 2D state-0
- * write of one 32-bit integer component, staged data@x_half-2, X@x_half,
- * Y@x_half+2 on staging slot 1 and signalling slot 1. */
-bool agx3_tex_encode_image_write_g18g_r32(enum agx_isa_encoding enc,
-                                          uint16_t x_half,
-                                          uint8_t out[AGX3_TEX_MAX_LENGTH],
-                                          uint8_t *len);
 
 /* A native staging COPY must preserve a coordinate GPR if later work uses
  * it. CACHE/NONE/DISCARD are independent of the staging-bank release bit. */

@@ -246,38 +246,6 @@ agx3_pack_fadd_f32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
 }
 
 bool
-agx3_unpack_fadd_f32_reg_reg(enum agx_isa_encoding encoding,
-                             const uint8_t *bytes, size_t available,
-                             uint16_t *dest, uint16_t *src0, uint16_t *src1,
-                             uint8_t *length)
-{
-   if (!is_agx3_encoding(encoding) || bytes == NULL || dest == NULL ||
-       src0 == NULL || src1 == NULL || length == NULL ||
-       available < AGX3_FADD_F32_REG_REG_LENGTH)
-      return false;
-
-   const uint16_t decoded_dest = ((bytes[0] >> 3) & 0x1e) |
-                                 ((bytes[2] >> 1) & 0x60) |
-                                 ((bytes[5] << 3) & 0x80);
-   const uint16_t decoded_src0 = (bytes[3] & 0x7e) |
-                                 ((bytes[5] << 5) & 0x80);
-   const uint16_t decoded_src1 = (bytes[1] & 0x7e) |
-                                 ((bytes[5] << 7) & 0x80);
-
-   struct agx3_encoded_fadd_f32_reg_reg canonical;
-   if (!agx3_pack_fadd_f32_reg_reg(encoding, decoded_dest, decoded_src0,
-                                   decoded_src1, &canonical) ||
-       memcmp(bytes, canonical.bytes, canonical.length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *src0 = decoded_src0;
-   *src1 = decoded_src1;
-   *length = canonical.length;
-   return true;
-}
-
-bool
 agx3_pack_fmul_f32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
                            uint16_t src0, uint16_t src1,
                            struct agx3_encoded_fmul_f32_reg_reg *out)
@@ -314,113 +282,6 @@ agx3_pack_fmul_f32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
    out->bytes[1] |= src1 & 0x7e;
 
    out->length = AGX3_FMUL_F32_REG_REG_LENGTH;
-   return true;
-}
-
-bool
-agx3_unpack_fmul_f32_reg_reg(enum agx_isa_encoding encoding,
-                             const uint8_t *bytes, size_t available,
-                             uint16_t *dest, uint16_t *src0, uint16_t *src1,
-                             uint8_t *length)
-{
-   if (!is_agx3_encoding(encoding) || bytes == NULL || dest == NULL ||
-       src0 == NULL || src1 == NULL || length == NULL ||
-       available < AGX3_FMUL_F32_REG_REG_LENGTH)
-      return false;
-
-   const uint16_t decoded_dest = ((bytes[0] >> 3) & 0x1e) |
-                                 ((bytes[2] >> 1) & 0x60);
-   const uint16_t decoded_src0 = bytes[3] & 0x7e;
-   const uint16_t decoded_src1 = bytes[1] & 0x7e;
-
-   struct agx3_encoded_fmul_f32_reg_reg canonical;
-   if (!agx3_pack_fmul_f32_reg_reg(encoding, decoded_dest, decoded_src0,
-                                   decoded_src1, &canonical) ||
-       memcmp(bytes, canonical.bytes, canonical.length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *src0 = decoded_src0;
-   *src1 = decoded_src1;
-   *length = canonical.length;
-   return true;
-}
-
-bool
-agx3_pack_fmul_f32_reg_reg_long(
-   enum agx_isa_encoding encoding, uint16_t dest, uint16_t src0,
-   uint16_t src1, struct agx3_encoded_fmul_f32_reg_reg_long *out)
-{
-   if (out == NULL || encoding != AGX_ISA_ENCODING_AGX3C || dest >= 128 ||
-       src0 >= 128 || src1 >= 128 || (dest & 1) != 0 || (src0 & 1) != 0 ||
-       (src1 & 1) != 0)
-      return false;
-
-   /*
-    * Exact f32mul.ep3 selection from the final G17G/G17S L operation and
-    * G17S P2f_mul.  Anonymous selector fields, including f46, remain fixed.
-    */
-   const uint8_t canonical[AGX3_FMUL_F32_REG_REG_LONG_LENGTH] = {
-      0x29, 0x00, 0x05, 0x10, 0x22, 0x80, 0xa0,
-      0x02, 0x1c, 0x00, 0x20, 0x00, 0x00, 0x10,
-   };
-   memcpy(out->bytes, canonical, sizeof(canonical));
-
-   /* f2: d1 -> b0[4], d2..3 -> b7[3:4], d4 -> b0[7],
-    *     d5 -> b7[5], d6 -> b2[7]. */
-   out->bytes[0] |= (dest & 0x02) << 3;
-   out->bytes[7] |= (dest & 0x0c) << 1;
-   out->bytes[0] |= (dest & 0x10) << 3;
-   out->bytes[7] |= dest & 0x20;
-   out->bytes[2] |= (dest & 0x40) << 1;
-
-   /* f35: s0[1] -> b8[7], s0[2:6] -> b9[0:4]. */
-   out->bytes[8] |= (src0 & 0x02) << 6;
-   out->bytes[9] |= (src0 & 0x7c) >> 2;
-
-   /* f18: s1[1] -> b1[1], s1[2:4] -> b3[5:7],
-    *      s1[5] -> b12[1], s1[6] -> b8[0]. */
-   out->bytes[1] |= src1 & 0x02;
-   out->bytes[3] |= (src1 & 0x1c) << 3;
-   out->bytes[12] |= (src1 & 0x20) >> 4;
-   out->bytes[8] |= (src1 & 0x40) >> 6;
-
-   out->length = sizeof(canonical);
-   return true;
-}
-
-bool
-agx3_unpack_fmul_f32_reg_reg_long(
-   enum agx_isa_encoding encoding, const uint8_t *bytes, size_t available,
-   uint16_t *dest, uint16_t *src0, uint16_t *src1, uint8_t *length)
-{
-   if (encoding != AGX_ISA_ENCODING_AGX3C || bytes == NULL || dest == NULL ||
-       src0 == NULL || src1 == NULL || length == NULL ||
-       available < AGX3_FMUL_F32_REG_REG_LONG_LENGTH)
-      return false;
-
-   const uint16_t decoded_dest = ((bytes[0] >> 3) & 0x02) |
-                                 ((bytes[7] >> 1) & 0x0c) |
-                                 ((bytes[0] >> 3) & 0x10) |
-                                 (bytes[7] & 0x20) |
-                                 ((bytes[2] >> 1) & 0x40);
-   const uint16_t decoded_src0 = ((bytes[8] >> 6) & 0x02) |
-                                 ((bytes[9] << 2) & 0x7c);
-   const uint16_t decoded_src1 = (bytes[1] & 0x02) |
-                                 ((bytes[3] >> 3) & 0x1c) |
-                                 ((bytes[12] << 4) & 0x20) |
-                                 ((bytes[8] << 6) & 0x40);
-
-   struct agx3_encoded_fmul_f32_reg_reg_long canonical;
-   if (!agx3_pack_fmul_f32_reg_reg_long(
-          encoding, decoded_dest, decoded_src0, decoded_src1, &canonical) ||
-       memcmp(bytes, canonical.bytes, canonical.length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *src0 = decoded_src0;
-   *src1 = decoded_src1;
-   *length = canonical.length;
    return true;
 }
 
@@ -493,58 +354,6 @@ agx3_pack_fma_f32_reg_reg_reg(
 }
 
 bool
-agx3_unpack_fma_f32_reg_reg_reg(
-   enum agx_isa_encoding encoding, const uint8_t *bytes, size_t available,
-   uint16_t *dest, uint16_t *mul0, uint16_t *mul1, uint16_t *addend,
-   uint8_t *length)
-{
-   const size_t expected_length =
-      encoding == AGX_ISA_ENCODING_AGX3B ? 8 :
-      encoding == AGX_ISA_ENCODING_AGX3C ? 16 : 0;
-   if (expected_length == 0 || bytes == NULL || dest == NULL || mul0 == NULL ||
-       mul1 == NULL || addend == NULL || length == NULL ||
-       available < expected_length)
-      return false;
-
-   uint16_t decoded_dest, decoded_mul0, decoded_mul1, decoded_addend;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = ((bytes[0] >> 3) & 0x1e) |
-                     ((bytes[2] >> 1) & 0x60);
-      decoded_mul0 = bytes[3] & 0x7e;
-      decoded_mul1 = bytes[1] & 0x7e;
-      decoded_addend = bytes[5] & 0x7e;
-   } else {
-      decoded_dest = ((bytes[0] >> 3) & 0x02) |
-                     ((bytes[7] >> 1) & 0x0c) |
-                     ((bytes[0] >> 3) & 0x10) | (bytes[7] & 0x20) |
-                     ((bytes[2] >> 1) & 0x40);
-      decoded_mul0 = ((bytes[8] >> 6) & 0x02) |
-                     ((bytes[9] << 2) & 0x7c);
-      decoded_mul1 = (bytes[1] & 0x02) |
-                     ((bytes[3] >> 2) & 0x0c) |
-                     ((bytes[3] >> 3) & 0x10) |
-                     ((bytes[3] >> 1) & 0x20) |
-                     ((bytes[8] << 6) & 0x40);
-      decoded_addend = (bytes[12] & 0x3e) |
-                       ((bytes[10] << 6) & 0x40);
-   }
-
-   struct agx3_encoded_fma_f32_reg_reg_reg canonical;
-   if (!agx3_pack_fma_f32_reg_reg_reg(
-          encoding, decoded_dest, decoded_mul0, decoded_mul1, decoded_addend,
-          &canonical) ||
-       memcmp(bytes, canonical.bytes, canonical.length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *mul0 = decoded_mul0;
-   *mul1 = decoded_mul1;
-   *addend = decoded_addend;
-   *length = canonical.length;
-   return true;
-}
-
-bool
 agx3_pack_fmin_f32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
                            uint16_t src0, uint16_t src1,
                            struct agx3_encoded_fmin_f32_reg_reg *out)
@@ -609,52 +418,6 @@ agx3_pack_fmin_f32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
    out->bytes[13] |= (src1 & 0x60) >> 3;
 
    out->length = sizeof(canonical);
-   return true;
-}
-
-bool
-agx3_unpack_fmin_f32_reg_reg(enum agx_isa_encoding encoding,
-                             const uint8_t *bytes, size_t available,
-                             uint16_t *dest, uint16_t *src0, uint16_t *src1,
-                             uint8_t *length)
-{
-   const size_t expected_length =
-      encoding == AGX_ISA_ENCODING_AGX3B ? 6 :
-      encoding == AGX_ISA_ENCODING_AGX3C ? 14 : 0;
-   if (expected_length == 0 || bytes == NULL || dest == NULL || src0 == NULL ||
-       src1 == NULL || length == NULL || available < expected_length)
-      return false;
-
-   uint16_t decoded_dest, decoded_src0, decoded_src1;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = ((bytes[0] >> 3) & 0x1e) |
-                     ((bytes[2] >> 1) & 0x60);
-      decoded_src0 = bytes[1] & 0x7e;
-      decoded_src1 = bytes[3] & 0x7e;
-   } else {
-      decoded_dest = ((bytes[0] >> 3) & 0x02) |
-                     ((bytes[7] >> 1) & 0x0c) |
-                     ((bytes[0] >> 3) & 0x10) | (bytes[7] & 0x20) |
-                     ((bytes[2] >> 1) & 0x40);
-      decoded_src0 = (bytes[1] & 0x02) |
-                     ((bytes[3] >> 3) & 0x1c) |
-                     ((bytes[5] >> 2) & 0x20) |
-                     ((bytes[8] << 1) & 0x04) | (bytes[8] & 0x20) |
-                     ((bytes[8] << 6) & 0x40);
-      decoded_src1 = ((bytes[3] << 1) & 0x02) |
-                     ((bytes[9] << 2) & 0x7c);
-   }
-
-   struct agx3_encoded_fmin_f32_reg_reg canonical;
-   if (!agx3_pack_fmin_f32_reg_reg(
-          encoding, decoded_dest, decoded_src0, decoded_src1, &canonical) ||
-       memcmp(bytes, canonical.bytes, canonical.length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *src0 = decoded_src0;
-   *src1 = decoded_src1;
-   *length = canonical.length;
    return true;
 }
 
@@ -727,52 +490,6 @@ agx3_pack_fmax_f32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
 }
 
 bool
-agx3_unpack_fmax_f32_reg_reg(enum agx_isa_encoding encoding,
-                             const uint8_t *bytes, size_t available,
-                             uint16_t *dest, uint16_t *src0, uint16_t *src1,
-                             uint8_t *length)
-{
-   const size_t expected_length =
-      encoding == AGX_ISA_ENCODING_AGX3B ? 6 :
-      encoding == AGX_ISA_ENCODING_AGX3C ? 14 : 0;
-   if (expected_length == 0 || bytes == NULL || dest == NULL || src0 == NULL ||
-       src1 == NULL || length == NULL || available < expected_length)
-      return false;
-
-   uint16_t decoded_dest, decoded_src0, decoded_src1;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = ((bytes[0] >> 3) & 0x1e) |
-                     ((bytes[2] >> 1) & 0x60);
-      decoded_src0 = bytes[1] & 0x7e;
-      decoded_src1 = bytes[3] & 0x7e;
-   } else {
-      decoded_dest = ((bytes[0] >> 3) & 0x02) |
-                     ((bytes[7] >> 1) & 0x0c) |
-                     ((bytes[0] >> 3) & 0x10) | (bytes[7] & 0x20) |
-                     ((bytes[2] >> 1) & 0x40);
-      decoded_src0 = (bytes[1] & 0x02) |
-                     ((bytes[3] >> 3) & 0x1c) |
-                     ((bytes[5] >> 2) & 0x20) |
-                     ((bytes[8] << 1) & 0x04) | (bytes[8] & 0x20) |
-                     ((bytes[8] << 6) & 0x40);
-      decoded_src1 = ((bytes[3] << 1) & 0x02) |
-                     ((bytes[9] << 2) & 0x7c);
-   }
-
-   struct agx3_encoded_fmax_f32_reg_reg canonical;
-   if (!agx3_pack_fmax_f32_reg_reg(
-          encoding, decoded_dest, decoded_src0, decoded_src1, &canonical) ||
-       memcmp(bytes, canonical.bytes, canonical.length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *src0 = decoded_src0;
-   *src1 = decoded_src1;
-   *length = canonical.length;
-   return true;
-}
-
-bool
 agx3_pack_i32_to_f32_reg(enum agx_isa_encoding encoding, uint16_t dest,
                          uint16_t src,
                          struct agx3_encoded_i32_to_f32_reg *out)
@@ -820,46 +537,6 @@ agx3_pack_i32_to_f32_reg(enum agx_isa_encoding encoding, uint16_t dest,
    out->bytes[8] |= (src & 0x40) >> 6;
 
    out->length = sizeof(canonical);
-   return true;
-}
-
-bool
-agx3_unpack_i32_to_f32_reg(enum agx_isa_encoding encoding,
-                           const uint8_t *bytes, size_t available,
-                           uint16_t *dest, uint16_t *src, uint8_t *length)
-{
-   const size_t expected_length =
-      encoding == AGX_ISA_ENCODING_AGX3B ? 8 :
-      encoding == AGX_ISA_ENCODING_AGX3C ? 10 : 0;
-   if (expected_length == 0 || bytes == NULL || dest == NULL || src == NULL ||
-       length == NULL || available < expected_length)
-      return false;
-
-   uint16_t decoded_dest, decoded_src;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = bytes[3] & 0x7e;
-      decoded_src = (bytes[5] >> 1) & 0x7e;
-   } else {
-      decoded_dest = ((bytes[0] >> 3) & 0x02) |
-                     ((bytes[7] >> 1) & 0x0c) |
-                     ((bytes[0] >> 3) & 0x10) | (bytes[7] & 0x20) |
-                     ((bytes[2] >> 1) & 0x40);
-      decoded_src = (bytes[1] & 0x02) |
-                    ((bytes[3] >> 2) & 0x0c) |
-                    ((bytes[3] >> 3) & 0x10) |
-                    ((bytes[3] >> 1) & 0x20) |
-                    ((bytes[8] << 6) & 0x40);
-   }
-
-   struct agx3_encoded_i32_to_f32_reg canonical;
-   if (!agx3_pack_i32_to_f32_reg(
-          encoding, decoded_dest, decoded_src, &canonical) ||
-       memcmp(bytes, canonical.bytes, canonical.length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *src = decoded_src;
-   *length = canonical.length;
    return true;
 }
 
@@ -915,46 +592,6 @@ agx3_pack_u32_to_f32_reg(enum agx_isa_encoding encoding, uint16_t dest,
 }
 
 bool
-agx3_unpack_u32_to_f32_reg(enum agx_isa_encoding encoding,
-                           const uint8_t *bytes, size_t available,
-                           uint16_t *dest, uint16_t *src, uint8_t *length)
-{
-   const size_t expected_length =
-      encoding == AGX_ISA_ENCODING_AGX3B ? 8 :
-      encoding == AGX_ISA_ENCODING_AGX3C ? 10 : 0;
-   if (expected_length == 0 || bytes == NULL || dest == NULL || src == NULL ||
-       length == NULL || available < expected_length)
-      return false;
-
-   uint16_t decoded_dest, decoded_src;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = bytes[3] & 0x7e;
-      decoded_src = (bytes[5] >> 1) & 0x7e;
-   } else {
-      decoded_dest = ((bytes[0] >> 3) & 0x02) |
-                     ((bytes[7] >> 1) & 0x0c) |
-                     ((bytes[0] >> 3) & 0x10) | (bytes[7] & 0x20) |
-                     ((bytes[2] >> 1) & 0x40);
-      decoded_src = (bytes[1] & 0x02) |
-                    ((bytes[3] >> 2) & 0x0c) |
-                    ((bytes[3] >> 3) & 0x10) |
-                    ((bytes[3] >> 1) & 0x20) |
-                    ((bytes[8] << 6) & 0x40);
-   }
-
-   struct agx3_encoded_u32_to_f32_reg canonical;
-   if (!agx3_pack_u32_to_f32_reg(
-          encoding, decoded_dest, decoded_src, &canonical) ||
-       memcmp(bytes, canonical.bytes, canonical.length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *src = decoded_src;
-   *length = canonical.length;
-   return true;
-}
-
-bool
 agx3_pack_f32_rint_reg(enum agx_isa_encoding encoding, uint16_t dest,
                        uint16_t src, struct agx3_encoded_f32_rint_reg *out)
 {
@@ -1002,42 +639,6 @@ agx3_pack_f32_rint_reg(enum agx_isa_encoding encoding, uint16_t dest,
 }
 
 bool
-agx3_unpack_f32_rint_reg(enum agx_isa_encoding encoding,
-                         const uint8_t *bytes, size_t available,
-                         uint16_t *dest, uint16_t *src, uint8_t *length)
-{
-   if (!is_agx3_encoding(encoding) || bytes == NULL || dest == NULL ||
-       src == NULL || length == NULL || available < AGX3_F32_RINT_REG_LENGTH)
-      return false;
-
-   uint16_t decoded_dest, decoded_src;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = bytes[3] & 0x7e;
-      decoded_src = (bytes[5] >> 1) & 0x7e;
-   } else {
-      decoded_dest = ((bytes[0] >> 3) & 0x02) |
-                     ((bytes[7] >> 1) & 0x0c) |
-                     ((bytes[0] >> 3) & 0x10) | (bytes[7] & 0x20) |
-                     ((bytes[2] >> 1) & 0x40);
-      decoded_src = (bytes[1] & 0x02) |
-                    ((bytes[3] >> 3) & 0x1c) |
-                    ((bytes[5] >> 2) & 0x20) |
-                    ((bytes[8] << 6) & 0x40);
-   }
-
-   struct agx3_encoded_f32_rint_reg canonical;
-   if (!agx3_pack_f32_rint_reg(
-          encoding, decoded_dest, decoded_src, &canonical) ||
-       memcmp(bytes, canonical.bytes, canonical.length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *src = decoded_src;
-   *length = canonical.length;
-   return true;
-}
-
-bool
 agx3_pack_f32_rcp_reg(enum agx_isa_encoding encoding, uint16_t dest,
                       uint16_t src, struct agx3_encoded_f32_rcp_reg *out)
 {
@@ -1076,42 +677,6 @@ agx3_pack_f32_rcp_reg(enum agx_isa_encoding encoding, uint16_t dest,
    out->bytes[8] |= (src & 0x40) >> 6;
 
    out->length = sizeof(canonical);
-   return true;
-}
-
-bool
-agx3_unpack_f32_rcp_reg(enum agx_isa_encoding encoding,
-                        const uint8_t *bytes, size_t available,
-                        uint16_t *dest, uint16_t *src, uint8_t *length)
-{
-   if (!is_agx3_encoding(encoding) || bytes == NULL || dest == NULL ||
-       src == NULL || length == NULL || available < AGX3_F32_RCP_REG_LENGTH)
-      return false;
-
-   uint16_t decoded_dest, decoded_src;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = bytes[3] & 0x7e;
-      decoded_src = (bytes[5] >> 1) & 0x7e;
-   } else {
-      decoded_dest = ((bytes[0] >> 3) & 0x02) |
-                     ((bytes[7] >> 1) & 0x0c) |
-                     ((bytes[0] >> 3) & 0x10) | (bytes[7] & 0x20) |
-                     ((bytes[2] >> 1) & 0x40);
-      decoded_src = (bytes[1] & 0x02) |
-                    ((bytes[3] >> 3) & 0x1c) |
-                    ((bytes[5] >> 2) & 0x20) |
-                    ((bytes[8] << 6) & 0x40);
-   }
-
-   struct agx3_encoded_f32_rcp_reg canonical;
-   if (!agx3_pack_f32_rcp_reg(
-          encoding, decoded_dest, decoded_src, &canonical) ||
-       memcmp(bytes, canonical.bytes, canonical.length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *src = decoded_src;
-   *length = canonical.length;
    return true;
 }
 
@@ -1156,171 +721,6 @@ agx3_pack_f32_rsqrt_reg(enum agx_isa_encoding encoding, uint16_t dest,
 
    out->length = sizeof(canonical);
    return true;
-}
-
-bool
-agx3_unpack_f32_rsqrt_reg(enum agx_isa_encoding encoding,
-                          const uint8_t *bytes, size_t available,
-                          uint16_t *dest, uint16_t *src, uint8_t *length)
-{
-   if (!is_agx3_encoding(encoding) || bytes == NULL || dest == NULL ||
-       src == NULL || length == NULL || available < AGX3_F32_RSQRT_REG_LENGTH)
-      return false;
-
-   uint16_t decoded_dest, decoded_src;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = bytes[3] & 0x7e;
-      decoded_src = (bytes[5] >> 1) & 0x7e;
-   } else {
-      decoded_dest = ((bytes[0] >> 3) & 0x02) |
-                     ((bytes[7] >> 1) & 0x0c) |
-                     ((bytes[0] >> 3) & 0x10) | (bytes[7] & 0x20) |
-                     ((bytes[2] >> 1) & 0x40);
-      decoded_src = (bytes[1] & 0x02) |
-                    ((bytes[3] >> 3) & 0x1c) |
-                    ((bytes[5] >> 2) & 0x20) |
-                    ((bytes[8] << 6) & 0x40);
-   }
-
-   struct agx3_encoded_f32_rsqrt_reg canonical;
-   if (!agx3_pack_f32_rsqrt_reg(
-          encoding, decoded_dest, decoded_src, &canonical) ||
-       memcmp(bytes, canonical.bytes, canonical.length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *src = decoded_src;
-   *length = canonical.length;
-   return true;
-}
-
-bool
-agx3_pack_i32_compare_select_imm_5_7_reg_reg(
-   enum agx_isa_encoding encoding, enum agx3_i32_compare_predicate predicate,
-   uint16_t dest, uint16_t src0, uint16_t src1,
-   struct agx3_encoded_i32_compare_select_imm_5_7_reg_reg *out)
-{
-   if (out == NULL || !is_agx3_encoding(encoding) ||
-       (predicate != AGX3_I32_COMPARE_EQ &&
-        predicate != AGX3_I32_COMPARE_SLT) ||
-       dest >= 128 || src0 >= 128 || src1 >= 128 || (dest & 1) != 0 ||
-       (src0 & 1) != 0 || (src1 & 1) != 0)
-      return false;
-
-   memset(out, 0, sizeof(*out));
-
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      static const uint8_t canonical_eq[] = {
-         0x02, 0x01, 0x1f, 0x01, 0x26, 0x85, 0x07, 0xc0, 0x20, 0x87,
-      };
-      static const uint8_t canonical_slt[] = {
-         0x02, 0x01, 0x1f, 0x01, 0x22, 0x85, 0x07, 0xc0, 0x20, 0x87,
-      };
-      const uint8_t *canonical = predicate == AGX3_I32_COMPARE_EQ
-                                    ? canonical_eq
-                                    : canonical_slt;
-      memcpy(out->bytes, canonical, sizeof(canonical_eq));
-
-      /* Apple f3: d1..4 -> b0[4:7], d5..6 -> b2[6:7]. */
-      out->bytes[0] |= (dest & 0x1e) << 3;
-      out->bytes[2] |= (dest & 0x60) << 1;
-
-      /* Apple f35 and f50 are contiguous even-register fields. */
-      out->bytes[1] |= src0 & 0x7e;
-      out->bytes[3] |= src1 & 0x7e;
-      out->length = sizeof(canonical_eq);
-      return true;
-   }
-
-   static const uint8_t canonical_eq[] = {
-      0x22, 0x00, 0x07, 0x0b, 0x27, 0x00, 0xac,
-      0x02, 0x02, 0x80, 0x64, 0x0c, 0x21, 0x10,
-   };
-   static const uint8_t canonical_slt[] = {
-      0x22, 0x00, 0x47, 0x0b, 0x27, 0x00, 0xac,
-      0x02, 0x02, 0x80, 0x64, 0x0c, 0x21, 0x10,
-   };
-   const uint8_t *canonical = predicate == AGX3_I32_COMPARE_EQ
-                                 ? canonical_eq
-                                 : canonical_slt;
-   memcpy(out->bytes, canonical, sizeof(canonical_eq));
-
-   /* Apple f2: d1 -> b0[4], d2..3 -> b7[3:4], d4 -> b0[7],
-    * d5 -> b7[5], d6 -> b2[7]. */
-   out->bytes[0] |= (dest & 0x02) << 3;
-   out->bytes[7] |= (dest & 0x0c) << 1;
-   out->bytes[0] |= (dest & 0x10) << 3;
-   out->bytes[7] |= dest & 0x20;
-   out->bytes[2] |= (dest & 0x40) << 1;
-
-   /* Apple f16: s0[1] -> b1[1], s0[2:4] -> b3[5:7],
-    * s0[5] -> b5[7], s0[6] -> b6[0]. */
-   out->bytes[1] |= src0 & 0x02;
-   out->bytes[3] |= (src0 & 0x1c) << 3;
-   out->bytes[5] |= (src0 & 0x20) << 2;
-   out->bytes[6] |= (src0 & 0x40) >> 6;
-
-   /* Apple f31: s1[1] -> b8[7], s1[2:6] -> b9[0:4]. */
-   out->bytes[8] |= (src1 & 0x02) << 6;
-   out->bytes[9] |= (src1 & 0x7c) >> 2;
-   out->length = sizeof(canonical_eq);
-   return true;
-}
-
-bool
-agx3_unpack_i32_compare_select_imm_5_7_reg_reg(
-   enum agx_isa_encoding encoding, const uint8_t *bytes, size_t available,
-   enum agx3_i32_compare_predicate *predicate, uint16_t *dest,
-   uint16_t *src0, uint16_t *src1, uint8_t *length)
-{
-   const size_t expected_length =
-      encoding == AGX_ISA_ENCODING_AGX3B ? 10 :
-      encoding == AGX_ISA_ENCODING_AGX3C ? 14 : 0;
-   if (expected_length == 0 || bytes == NULL || predicate == NULL ||
-       dest == NULL || src0 == NULL || src1 == NULL || length == NULL ||
-       available < expected_length)
-      return false;
-
-   uint16_t decoded_dest, decoded_src0, decoded_src1;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = ((bytes[0] >> 3) & 0x1e) |
-                     ((bytes[2] >> 1) & 0x60);
-      decoded_src0 = bytes[1] & 0x7e;
-      decoded_src1 = bytes[3] & 0x7e;
-   } else {
-      decoded_dest = ((bytes[0] >> 3) & 0x02) |
-                     ((bytes[7] >> 1) & 0x0c) |
-                     ((bytes[0] >> 3) & 0x10) | (bytes[7] & 0x20) |
-                     ((bytes[2] >> 1) & 0x40);
-      decoded_src0 = (bytes[1] & 0x02) |
-                     ((bytes[3] >> 3) & 0x1c) |
-                     ((bytes[5] >> 2) & 0x20) |
-                     ((bytes[6] << 6) & 0x40);
-      decoded_src1 = ((bytes[8] >> 6) & 0x02) |
-                     ((bytes[9] << 2) & 0x7c);
-   }
-
-   static const enum agx3_i32_compare_predicate predicates[] = {
-      AGX3_I32_COMPARE_EQ,
-      AGX3_I32_COMPARE_SLT,
-   };
-   for (unsigned i = 0; i < sizeof(predicates) / sizeof(predicates[0]); ++i) {
-      struct agx3_encoded_i32_compare_select_imm_5_7_reg_reg canonical;
-      if (agx3_pack_i32_compare_select_imm_5_7_reg_reg(
-             encoding, predicates[i], decoded_dest, decoded_src0,
-             decoded_src1, &canonical) &&
-          canonical.length == expected_length &&
-          memcmp(bytes, canonical.bytes, expected_length) == 0) {
-         *predicate = predicates[i];
-         *dest = decoded_dest;
-         *src0 = decoded_src0;
-         *src1 = decoded_src1;
-         *length = expected_length;
-         return true;
-      }
-   }
-
-   return false;
 }
 
 bool
@@ -1381,52 +781,6 @@ agx3_pack_f32_to_int_rtz_reg(
 
    out->length = AGX3_F32_TO_INT_RTZ_REG_LENGTH;
    return true;
-}
-
-bool
-agx3_unpack_f32_to_int_rtz_reg(
-   enum agx_isa_encoding encoding, const uint8_t *bytes, size_t available,
-   enum agx3_f32_to_int_rtz_mode *mode, uint16_t *dest, uint16_t *src,
-   uint8_t *length)
-{
-   if (!is_agx3_encoding(encoding) || bytes == NULL || mode == NULL ||
-       dest == NULL || src == NULL || length == NULL ||
-       available < AGX3_F32_TO_INT_RTZ_REG_LENGTH)
-      return false;
-
-   uint16_t decoded_dest, decoded_src;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = bytes[3] & 0x7e;
-      decoded_src = (bytes[5] >> 1) & 0x7e;
-   } else {
-      decoded_dest = ((bytes[0] >> 3) & 0x02) |
-                     ((bytes[7] >> 1) & 0x0c) |
-                     ((bytes[0] >> 3) & 0x10) | (bytes[7] & 0x20) |
-                     ((bytes[2] >> 1) & 0x40);
-      decoded_src = (bytes[1] & 0x02) |
-                    ((bytes[3] >> 3) & 0x1c) |
-                    ((bytes[5] >> 2) & 0x20) |
-                    ((bytes[8] << 6) & 0x40);
-   }
-
-   static const enum agx3_f32_to_int_rtz_mode modes[] = {
-      AGX3_F32_TO_I32_RTZ,
-      AGX3_F32_TO_U32_RTZ,
-   };
-   for (unsigned i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
-      struct agx3_encoded_f32_to_int_rtz_reg canonical;
-      if (agx3_pack_f32_to_int_rtz_reg(
-             encoding, modes[i], decoded_dest, decoded_src, &canonical) &&
-          memcmp(bytes, canonical.bytes, canonical.length) == 0) {
-         *mode = modes[i];
-         *dest = decoded_dest;
-         *src = decoded_src;
-         *length = canonical.length;
-         return true;
-      }
-   }
-
-   return false;
 }
 
 bool
@@ -2002,57 +1356,6 @@ agx3_pack_imul_u32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
 }
 
 bool
-agx3_unpack_imul_u32_reg_reg(enum agx_isa_encoding encoding,
-                             const uint8_t *bytes, size_t available,
-                             uint16_t *dest, uint16_t *src0, uint16_t *src1,
-                             uint8_t *length)
-{
-   if (!is_agx3_encoding(encoding) || bytes == NULL || dest == NULL ||
-       src0 == NULL || src1 == NULL || length == NULL)
-      return false;
-
-   const size_t expected_length =
-      encoding == AGX_ISA_ENCODING_AGX3B ? 12 : 14;
-   if (available < expected_length)
-      return false;
-
-   uint16_t decoded_dest, decoded_src0, decoded_src1;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = bytes[3];
-      decoded_src0 = ((bytes[5] >> 1) & 0x7e) |
-                     ((bytes[6] & 0x1) << 7);
-      decoded_src1 = ((bytes[6] >> 2) & 0x3e) |
-                     ((bytes[7] & 0x3) << 6);
-   } else {
-      decoded_dest = (((bytes[0] >> 4) & 0x1) << 1) |
-                     (((bytes[7] >> 3) & 0x3) << 2) |
-                     (((bytes[0] >> 7) & 0x1) << 4) |
-                     (((bytes[7] >> 5) & 0x1) << 5) |
-                     (((bytes[2] >> 7) & 0x1) << 6) |
-                     (((bytes[2] >> 3) & 0x1) << 7);
-      decoded_src0 = (bytes[1] & 0x2) |
-                     (((bytes[3] >> 5) & 0x7) << 2) |
-                     (((bytes[5] >> 7) & 0x1) << 5) |
-                     ((bytes[8] & 0x3) << 6);
-      decoded_src1 = (((bytes[8] >> 7) & 0x1) << 1) |
-                     ((bytes[9] & 0x3f) << 2);
-   }
-
-   struct agx3_encoded_imul_u32_reg_reg canonical;
-   if (!agx3_pack_imul_u32_reg_reg(encoding, decoded_dest, decoded_src0,
-                                   decoded_src1, &canonical) ||
-       canonical.length != expected_length ||
-       memcmp(bytes, canonical.bytes, expected_length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *src0 = decoded_src0;
-   *src1 = decoded_src1;
-   *length = expected_length;
-   return true;
-}
-
-bool
 agx3_pack_imadd_u32_reg_reg_reg(
    enum agx_isa_encoding encoding, uint16_t dest, uint16_t mul0,
    uint16_t mul1, uint16_t addend,
@@ -2126,119 +1429,6 @@ agx3_pack_imadd_u32_reg_reg_reg(
    out->bytes[10] |= (addend >> 6) & 0x1;
    out->bytes[12] |= addend & 0xae;
    out->length = sizeof(canonical);
-   return true;
-}
-
-bool
-agx3_unpack_imadd_u32_reg_reg_reg(
-   enum agx_isa_encoding encoding, const uint8_t *bytes, size_t available,
-   uint16_t *dest, uint16_t *mul0, uint16_t *mul1, uint16_t *addend,
-   uint8_t *length)
-{
-   if (!is_agx3_encoding(encoding) || bytes == NULL || dest == NULL ||
-       mul0 == NULL || mul1 == NULL || addend == NULL || length == NULL)
-      return false;
-
-   const size_t expected_length =
-      encoding == AGX_ISA_ENCODING_AGX3B ? 12 : 14;
-   if (available < expected_length)
-      return false;
-
-   uint16_t decoded_dest, decoded_mul0, decoded_mul1, decoded_addend;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = bytes[3];
-      decoded_mul0 = ((bytes[5] >> 1) & 0x7e) |
-                     ((bytes[6] & 0x1) << 7);
-      decoded_mul1 = ((bytes[6] >> 2) & 0x3e) |
-                     ((bytes[7] & 0x3) << 6);
-      decoded_addend = ((bytes[7] >> 3) & 0x1e) |
-                       ((bytes[8] & 0x7) << 5);
-   } else {
-      decoded_dest = (((bytes[0] >> 4) & 0x1) << 1) |
-                     (((bytes[7] >> 3) & 0x3) << 2) |
-                     (((bytes[0] >> 7) & 0x1) << 4) |
-                     (((bytes[7] >> 5) & 0x1) << 5) |
-                     (((bytes[2] >> 7) & 0x1) << 6) |
-                     (((bytes[2] >> 3) & 0x1) << 7);
-      decoded_mul0 = (bytes[1] & 0x2) |
-                     (((bytes[3] >> 5) & 0x7) << 2) |
-                     (((bytes[5] >> 7) & 0x1) << 5) |
-                     ((bytes[8] & 0x3) << 6);
-      decoded_mul1 = (((bytes[8] >> 7) & 0x1) << 1) |
-                     ((bytes[9] & 0x3f) << 2);
-      decoded_addend = (bytes[8] & 0x10) |
-                       ((bytes[10] & 0x1) << 6) |
-                       (bytes[12] & 0xae);
-   }
-
-   struct agx3_encoded_imadd_u32_reg_reg_reg canonical;
-   if (!agx3_pack_imadd_u32_reg_reg_reg(
-          encoding, decoded_dest, decoded_mul0, decoded_mul1, decoded_addend,
-          &canonical) ||
-       canonical.length != expected_length ||
-       memcmp(bytes, canonical.bytes, expected_length) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *mul0 = decoded_mul0;
-   *mul1 = decoded_mul1;
-   *addend = decoded_addend;
-   *length = expected_length;
-   return true;
-}
-
-bool
-agx3_pack_yield_i16_reg(enum agx_isa_encoding encoding, uint16_t src,
-                        struct agx3_encoded_yield_i16_reg *out)
-{
-   if (!is_agx3_encoding(encoding) || out == NULL ||
-       src >= (encoding == AGX_ISA_ENCODING_AGX3B ? 192 : 256))
-      return false;
-
-   memset(out, 0, sizeof(*out));
-
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      const uint8_t canonical[AGX3_YIELD_I16_REG_LENGTH] = {
-         0x87, 0x04, 0x54, 0x00, 0x04, 0x00,
-      };
-      memcpy(out->bytes, canonical, sizeof(canonical));
-      out->bytes[3] = src;
-   } else {
-      const uint8_t canonical[AGX3_YIELD_I16_REG_LENGTH] = {
-         0x0f, 0x00, 0x00, 0x02, 0x00, 0x00,
-      };
-      memcpy(out->bytes, canonical, sizeof(canonical));
-
-      /* f2[0:6] -> w0[8:14], f2[7] -> w1[4].  The table also
-       * contains f2[8], but that register space is deliberately closed. */
-      out->bytes[1] = src & 0x7f;
-      out->bytes[2] = (src >> 3) & 0x10;
-   }
-
-   out->length = AGX3_YIELD_I16_REG_LENGTH;
-   return true;
-}
-
-bool
-agx3_unpack_yield_i16_reg(enum agx_isa_encoding encoding,
-                          const uint8_t *bytes, size_t available,
-                          uint16_t *src, uint8_t *length)
-{
-   if (!is_agx3_encoding(encoding) || bytes == NULL || src == NULL ||
-       length == NULL || available < AGX3_YIELD_I16_REG_LENGTH)
-      return false;
-
-   const uint16_t decoded_src = encoding == AGX_ISA_ENCODING_AGX3B
-                                   ? bytes[3]
-                                   : (bytes[1] & 0x7f) |
-                                        ((bytes[2] & 0x10) << 3);
-   struct agx3_encoded_yield_i16_reg canonical;
-   if (!agx3_pack_yield_i16_reg(encoding, decoded_src, &canonical) ||
-       memcmp(bytes, canonical.bytes, AGX3_YIELD_I16_REG_LENGTH) != 0)
-      return false;
-
-   *src = decoded_src;
-   *length = AGX3_YIELD_I16_REG_LENGTH;
    return true;
 }
 
@@ -2471,49 +1661,6 @@ agx3_pack_simd_broadcast_f32_imm(
 }
 
 bool
-agx3_unpack_simd_broadcast_f32_imm(
-   enum agx_isa_encoding encoding, const uint8_t *bytes, size_t available,
-   uint16_t *dest, uint16_t *src, uint8_t *lane, uint8_t *length)
-{
-   if (!is_agx3_encoding(encoding) || bytes == NULL || dest == NULL ||
-       src == NULL || lane == NULL || length == NULL ||
-       available < AGX3_SIMD_BROADCAST_F32_IMM_LENGTH)
-      return false;
-
-   uint16_t decoded_dest, decoded_src;
-   uint8_t decoded_lane;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded_dest = bytes[3];
-      decoded_src = ((bytes[5] >> 1) & 0x7f) | ((bytes[6] & 0x1) << 7);
-      decoded_lane = (bytes[6] >> 1) & 0x7f;
-   } else {
-      decoded_dest = (((bytes[0] >> 4) & 0x1) << 1) |
-                     (((bytes[7] >> 3) & 0x3) << 2) |
-                     (((bytes[0] >> 7) & 0x1) << 4) |
-                     (((bytes[7] >> 5) & 0x1) << 5) |
-                     (((bytes[2] >> 7) & 0x1) << 6) |
-                     (((bytes[2] >> 3) & 0x1) << 7);
-      decoded_src = (bytes[1] & 0x2) |
-                    (((bytes[3] >> 5) & 0x7) << 2) |
-                    (((bytes[5] >> 7) & 0x1) << 5) |
-                    ((bytes[8] & 0x3) << 6);
-      decoded_lane = ((bytes[8] >> 6) & 0x3) | ((bytes[9] & 0x3f) << 2);
-   }
-
-   struct agx3_encoded_simd_broadcast_f32_imm canonical;
-   if (!agx3_pack_simd_broadcast_f32_imm(
-          encoding, decoded_dest, decoded_src, decoded_lane, &canonical) ||
-       memcmp(bytes, canonical.bytes, AGX3_SIMD_BROADCAST_F32_IMM_LENGTH) != 0)
-      return false;
-
-   *dest = decoded_dest;
-   *src = decoded_src;
-   *lane = decoded_lane;
-   *length = AGX3_SIMD_BROADCAST_F32_IMM_LENGTH;
-   return true;
-}
-
-bool
 agx3_pack_end(enum agx_isa_encoding encoding, struct agx3_encoded_end *out)
 {
    if (!is_agx3_encoding(encoding) || out == NULL)
@@ -2522,47 +1669,6 @@ agx3_pack_end(enum agx_isa_encoding encoding, struct agx3_encoded_end *out)
    memset(out, 0, sizeof(*out));
    out->bytes[0] = 0x0e;
    out->length = AGX3_END_LENGTH;
-   return true;
-}
-
-bool
-agx3_pack_end_with_wait_fence_mask(enum agx_isa_encoding encoding,
-                                   uint8_t wait_fence_mask,
-                                   struct agx3_encoded_end *out)
-{
-   if (!is_agx3_encoding(encoding) || out == NULL ||
-       (encoding == AGX_ISA_ENCODING_AGX3B && (wait_fence_mask & 0xc0)))
-      return false;
-
-   memset(out, 0, sizeof(*out));
-   out->bytes[0] = 0x0e;
-   out->bytes[1] = (wait_fence_mask & 0x3f) << 2;
-   out->bytes[2] = ((wait_fence_mask >> 6) & 0x03) << 1;
-   out->length = AGX3_END_LENGTH;
-   return true;
-}
-
-bool
-agx3_unpack_end_with_wait_fence_mask(enum agx_isa_encoding encoding,
-                                     const uint8_t *bytes, size_t available,
-                                     uint8_t *wait_fence_mask,
-                                     uint8_t *length)
-{
-   if (!is_agx3_encoding(encoding) || bytes == NULL ||
-       wait_fence_mask == NULL || length == NULL ||
-       available < AGX3_END_LENGTH)
-      return false;
-
-   const uint8_t decoded_mask =
-      ((bytes[1] >> 2) & 0x3f) | ((bytes[2] & 0x06) << 5);
-   struct agx3_encoded_end canonical;
-   if (!agx3_pack_end_with_wait_fence_mask(encoding, decoded_mask,
-                                           &canonical) ||
-       memcmp(bytes, canonical.bytes, AGX3_END_LENGTH) != 0)
-      return false;
-
-   *wait_fence_mask = decoded_mask;
-   *length = AGX3_END_LENGTH;
    return true;
 }
 
@@ -2604,23 +1710,6 @@ agx3_pack_update_node(enum agx_isa_encoding encoding,
    memset(out, 0, sizeof(*out));
    memcpy(out->bytes, canonical, length);
    out->length = length;
-   return true;
-}
-
-bool
-agx3_unpack_update_node(enum agx_isa_encoding encoding, const uint8_t *bytes,
-                        size_t available, uint8_t *length)
-{
-   size_t canonical_length = 0;
-   const uint8_t *canonical =
-      update_node_encoding(encoding, &canonical_length);
-
-   if (canonical == NULL || bytes == NULL || length == NULL ||
-       available < canonical_length ||
-       memcmp(bytes, canonical, canonical_length) != 0)
-      return false;
-
-   *length = canonical_length;
    return true;
 }
 
@@ -2706,48 +1795,6 @@ agx3_pack_intersect_ray(enum agx_isa_encoding encoding,
    }
 
    out->length = length;
-   return true;
-}
-
-bool
-agx3_unpack_intersect_ray(enum agx_isa_encoding encoding,
-                          const uint8_t *bytes, size_t available,
-                          uint16_t *state_register, uint8_t *length)
-{
-   const size_t expected_length =
-      encoding == AGX_ISA_ENCODING_AGX3B ? 12 :
-      encoding == AGX_ISA_ENCODING_AGX3C ? 14 : 0;
-
-   if (expected_length == 0 || bytes == NULL || state_register == NULL ||
-       length == NULL || available < expected_length)
-      return false;
-
-   uint16_t decoded;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded = bytes[3] | ((uint16_t)(bytes[4] & 0x1f) << 8);
-   } else {
-      decoded = ((uint16_t)(bytes[12] & 0x01) << 1) |
-                ((uint16_t)(bytes[12] & 0x08) >> 1) |
-                ((uint16_t)(bytes[13] & 0x02) << 2) |
-                ((uint16_t)bytes[13] & 0x0010) |
-                ((uint16_t)(bytes[12] & 0x10) << 1) |
-                ((uint16_t)bytes[13] & 0x0040) |
-                ((uint16_t)(bytes[12] & 0x40) << 1) |
-                ((uint16_t)(bytes[12] & 0x20) << 3) |
-                ((uint16_t)(bytes[13] & 0x01) << 9) |
-                ((uint16_t)(bytes[13] & 0x04) << 8) |
-                ((uint16_t)(bytes[2] & 0x40) << 5) |
-                ((uint16_t)(bytes[0] & 0x08) << 9);
-   }
-
-   struct agx3_encoded_intersect_ray canonical;
-   if (!agx3_pack_intersect_ray(encoding, decoded, &canonical) ||
-       canonical.length != expected_length ||
-       memcmp(bytes, canonical.bytes, expected_length) != 0)
-      return false;
-
-   *state_register = decoded;
-   *length = expected_length;
    return true;
 }
 
@@ -2859,45 +1906,6 @@ agx3_pack_continue_ray(enum agx_isa_encoding encoding,
    return true;
 }
 
-bool
-agx3_unpack_continue_ray(enum agx_isa_encoding encoding,
-                         const uint8_t *bytes, size_t available,
-                         uint16_t *state_register, uint8_t *length)
-{
-   const size_t expected_length =
-      encoding == AGX_ISA_ENCODING_AGX3B ? 6 :
-      encoding == AGX_ISA_ENCODING_AGX3C ? 8 : 0;
-
-   if (expected_length == 0 || bytes == NULL || state_register == NULL ||
-       length == NULL || available < expected_length)
-      return false;
-
-   uint16_t decoded;
-   if (encoding == AGX_ISA_ENCODING_AGX3B) {
-      decoded = bytes[3] | ((uint16_t)(bytes[4] & 0x1f) << 8);
-   } else {
-      decoded = ((uint16_t)(bytes[7] >> 5) & 0x0002) |
-                ((uint16_t)(bytes[4] >> 1) & 0x000c) |
-                ((uint16_t)(bytes[4] >> 3) & 0x0010) |
-                ((uint16_t)bytes[5] << 4 & 0x0060) |
-                ((uint16_t)bytes[5] << 3 & 0x0180) |
-                ((uint16_t)bytes[2] << 2 & 0x0200) |
-                ((uint16_t)bytes[3] << 8 & 0x0400) |
-                ((uint16_t)bytes[0] << 7 & 0x0800) |
-                ((uint16_t)bytes[0] << 9 & 0x1000);
-   }
-
-   struct agx3_encoded_continue_ray canonical;
-   if (!agx3_pack_continue_ray(encoding, decoded, &canonical) ||
-       canonical.length != expected_length ||
-       memcmp(bytes, canonical.bytes, expected_length) != 0)
-      return false;
-
-   *state_register = decoded;
-   *length = expected_length;
-   return true;
-}
-
 enum agx_isa_encoding
 agx3_continue_ray_witnessed_chip_encoding(enum agx_chip chip)
 {
@@ -2936,23 +1944,6 @@ agx3_pack_continue_ray_fixed_first_site_witness(
    return true;
 }
 
-bool
-agx3_unpack_continue_ray_fixed_first_site_witness(
-   enum agx_isa_encoding encoding, const uint8_t *bytes, size_t available,
-   uint8_t *length)
-{
-   uint16_t state_register = 0;
-   uint8_t decoded_length = 0;
-   if (length == NULL ||
-       !agx3_unpack_continue_ray(encoding, bytes, available, &state_register,
-                                &decoded_length) ||
-       state_register != 0)
-      return false;
-
-   *length = decoded_length;
-   return true;
-}
-
 static const uint8_t
    inc_stk_fixed_witness_agx3b[AGX3_INC_STK_FIXED_WITNESS_LENGTH] = {
       0x07, 0x00, 0x54, 0x12, 0x80, 0x00, 0x00, 0x00,
@@ -2988,21 +1979,6 @@ agx3_pack_inc_stk_fixed_witness(
    memset(out, 0, sizeof(*out));
    memcpy(out->bytes, witness, AGX3_INC_STK_FIXED_WITNESS_LENGTH);
    out->length = AGX3_INC_STK_FIXED_WITNESS_LENGTH;
-   return true;
-}
-
-bool
-agx3_unpack_inc_stk_fixed_witness(enum agx_isa_encoding encoding,
-                                  const uint8_t *bytes, size_t available,
-                                  uint8_t *length)
-{
-   const uint8_t *witness = inc_stk_fixed_witness_encoding(encoding);
-   if (witness == NULL || bytes == NULL || length == NULL ||
-       available < AGX3_INC_STK_FIXED_WITNESS_LENGTH ||
-       memcmp(bytes, witness, AGX3_INC_STK_FIXED_WITNESS_LENGTH) != 0)
-      return false;
-
-   *length = AGX3_INC_STK_FIXED_WITNESS_LENGTH;
    return true;
 }
 
@@ -3045,20 +2021,5 @@ agx3_pack_update_bvh_fixed_witness(
    memcpy(out->bytes, update_bvh_fixed_witness_agx3c,
           sizeof(update_bvh_fixed_witness_agx3c));
    out->length = sizeof(update_bvh_fixed_witness_agx3c);
-   return true;
-}
-
-bool
-agx3_unpack_update_bvh_fixed_witness(enum agx_isa_encoding encoding,
-                                     const uint8_t *bytes, size_t available,
-                                     uint8_t *length)
-{
-   if (encoding != AGX_ISA_ENCODING_AGX3C || bytes == NULL || length == NULL ||
-       available < sizeof(update_bvh_fixed_witness_agx3c) ||
-       memcmp(bytes, update_bvh_fixed_witness_agx3c,
-              sizeof(update_bvh_fixed_witness_agx3c)) != 0)
-      return false;
-
-   *length = sizeof(update_bvh_fixed_witness_agx3c);
    return true;
 }

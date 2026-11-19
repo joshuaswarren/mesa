@@ -124,21 +124,6 @@ static uint64_t hk_heap(struct hk_cmd_buffer *cmd);
 static bool hk_cmd_ensure_geometry_heap(struct hk_cmd_buffer *cmd);
 static enum mesa_prim hk_gs_in_prim(struct hk_cmd_buffer *cmd);
 
-static enum libagx_program
-hk_sw_tess_program(enum tess_primitive_mode prim, enum poly_tess_mode mode)
-{
-   switch (prim) {
-   case TESS_PRIMITIVE_QUADS:
-      return LIBAGX_TESS_QUAD(mode);
-   case TESS_PRIMITIVE_TRIANGLES:
-      return LIBAGX_TESS_TRI(mode);
-   case TESS_PRIMITIVE_ISOLINES:
-      return LIBAGX_TESS_ISOLINE(mode);
-   default:
-      return LIBAGX_NUM_PROGRAMS;
-   }
-}
-
 static uint64_t hk_upload_geometry_params(struct hk_cmd_buffer *cmd,
                                           struct agx_draw draw);
 static void hk_init_tess_params(struct hk_cmd_buffer *cmd,
@@ -6929,7 +6914,9 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
    }
    if (backend_key.g17p_emrt) {
       /* Only the image accesses may be conditional. Every resident tile
-       * operation must execute on every path through the epilog. */
+       * operation must execute on every path through the epilog; an epilog
+       * that has a conditional one is compiled without eMRT, which is
+       * correct, only slower. */
       nir_metadata_require(b.impl, nir_metadata_dominance);
       nir_foreach_block(block, b.impl) {
          nir_foreach_instr(instr, block) {
@@ -6938,12 +6925,14 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
             nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
             if ((op == nir_intrinsic_store_local_pixel_agx ||
                  op == nir_intrinsic_load_local_pixel_agx) &&
-                !nir_block_dominates(block, nir_impl_last_block(b.impl))) {
+                !nir_block_dominates(block, nir_impl_last_block(b.impl)))
                backend_key.g17p_emrt = false;
-               mesa_loge("G17P eMRT has conditional resident tile access");
-            }
          }
       }
+
+      if (!backend_key.g17p_emrt)
+         perf_debug_dev(&dev->dev, "G17P eMRT disabled for an epilog with "
+                                   "conditional resident tile access");
    }
    if (g17p_tile_partitions) {
       memcpy(backend_key.g17p_tile_partitions, g17p_tile_partitions,
