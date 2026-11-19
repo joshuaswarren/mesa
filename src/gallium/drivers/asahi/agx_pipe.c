@@ -1873,7 +1873,10 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
       c->fragment_helper.binary = agx_helper_program(&batch->ctx->bg_eot);
    }
 
-   if (batch->timestamps.size > 0) {
+   /* ASAHI_MESA_DEBUG=stats times every render (agx_batch_print_stats()). */
+   if (batch->timestamps.size > 0 ||
+       ((agx_device(batch->ctx->base.screen)->debug & AGX_DBG_STATS) &&
+        batch->ctx->timestamps)) {
       c->ts_vtx.start.handle = batch->ctx->timestamp_handle;
       c->ts_frag.end.handle = batch->ctx->timestamp_handle;
       c->ts_vtx.start.offset = timestamp_offset(batch, vtx_start);
@@ -2022,11 +2025,14 @@ agx_flush_compute(struct agx_context *ctx, struct agx_batch *batch,
       cmdbuf->helper.binary = agx_helper_program(&batch->ctx->bg_eot);
    }
 
-   if (batch->timestamps.size > 0) {
+   const bool stats = (agx_device(ctx->base.screen)->debug & AGX_DBG_STATS) &&
+                      ctx->timestamps;
+   if (batch->timestamps.size > 0 || stats) {
       cmdbuf->ts.start.handle = ctx->timestamp_handle;
       cmdbuf->ts.end.handle = ctx->timestamp_handle;
       cmdbuf->ts.start.offset = timestamp_offset(batch, comp_start);
-      cmdbuf->ts.end.offset = timestamp_offset(batch, comp_start);
+      cmdbuf->ts.end.offset = stats ? timestamp_offset(batch, comp_end)
+                                    : timestamp_offset(batch, comp_start);
    }
 }
 
