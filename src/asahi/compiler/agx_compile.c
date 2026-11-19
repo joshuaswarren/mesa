@@ -6504,13 +6504,22 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          }
       }
 
-      /* A 32-bit FADD of a half and an immediate has no single AGX3C form.
-       * G17G converts first (f32add of the half and -0.0) and then adds in
-       * f32: saturate(float(h)) is f32add, f32add.sat (port/hfwit k_sat_h2f,
-       * k_h2f_mul). Widen the half the same exact way. */
+      /* A general 32-bit FADD of a half and an immediate has no single
+       * AGX3C form. G17G converts first (f32add of the half and -0.0) and
+       * then adds in f32: saturate(float(h)) is f32add, f32add.sat
+       * (port/hfwit k_sat_h2f, k_h2f_mul). Widen the half the same exact
+       * way. The exception is that conversion itself, an unsaturated
+       * f32add of the half and -0.0, which is native: widening it again
+       * would convert the same value twice (every float(half) operand of an
+       * FMA paid two). */
+      const bool half_to_float =
+         I->op == AGX_OPCODE_FADD && I->nr_srcs == 2 && !I->saturate &&
+         I->src[1].type == AGX_INDEX_IMMEDIATE &&
+         agx_is_equiv(I->src[1], agx_negzero()) && !I->src[1].abs &&
+         !I->src[1].neg && I->src[0].type != AGX_INDEX_IMMEDIATE;
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
           I->op == AGX_OPCODE_FADD && I->nr_dests == 1 && I->nr_srcs == 2 &&
-          I->dest[0].size == AGX_SIZE_32 &&
+          I->dest[0].size == AGX_SIZE_32 && !half_to_float &&
           (I->src[0].type == AGX_INDEX_IMMEDIATE ||
            I->src[1].type == AGX_INDEX_IMMEDIATE)) {
          for (unsigned s = 0; s < 2; ++s) {
