@@ -79,6 +79,9 @@ enum agx_dbg {
    AGX_DBG_FAULTTRACE = BITFIELD_BIT(23),
    /* Decode every command stream at submit time without waiting for the GPU. */
    AGX_DBG_ASYNCTRACE = BITFIELD_BIT(24),
+   /* Check cached native launch programs and root snapshots against a fresh
+    * computation. */
+   AGX_DBG_VERIFY = BITFIELD_BIT(25),
 };
 
 /* How many power-of-two levels in the BO cache do we want? 2^14 minimum chosen

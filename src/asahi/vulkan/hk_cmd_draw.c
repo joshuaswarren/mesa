@@ -101,8 +101,6 @@
 /* Diagnostic controls, read once: these are consulted per draw or
  * render pass, and an uncached getenv() scans the whole environment. */
 DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_tile_loader, "AGX_M5_VERIFY_TILE_LOADER",
-                           false)
 DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_m5_wclamp,
                            "ASAHI_MESH_NATIVE_M5_WCLAMP_DIAGNOSTIC", false)
 DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_raster_enable,
@@ -2054,7 +2052,7 @@ hk_m5_tile_program(struct hk_device *dev, struct agx_bg_eot_shader *shader,
    program->length = selected->length;
    memcpy(program->bytes, selected->bytes, selected->length);
    hk_g17p_patch_plan_apply(&selected->plan, d->uniform_ranges, program->bytes);
-   if (debug_get_option_m5_verify_tile_loader()) {
+   if (dev->dev.debug & AGX_DBG_VERIFY) {
       struct agx3_g17p_graphics_program fresh;
       if (!agx3_g17g_tile_program_generate(dev->dev.chip, d, store, &fresh) ||
           fresh.length != program->length ||

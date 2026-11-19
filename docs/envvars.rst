@@ -2184,6 +2184,12 @@ Asahi driver environment variables
       Disable write-combining (force all allocations to be write-through). This
       may be useful for diagnosing certain performance issues. Note imported
       buffers may still be write-combined.
+   ``verify``
+      Check every native launch program built from a cached template against
+      a fresh composition, and the snapshots behind the M5 fragment root
+      selection against the published roots. Mismatches are logged; the
+      Vulkan driver also refuses the launch, or aborts on a root snapshot
+      mismatch. Slow; for debugging the caches only.
 
 .. envvar:: AGX_MESA_DEBUG
 

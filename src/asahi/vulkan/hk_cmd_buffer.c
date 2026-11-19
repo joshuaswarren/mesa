@@ -1711,9 +1711,6 @@ hk_CmdPushDescriptorSetWithTemplate2KHR(
       pPushDescriptorSetWithTemplateInfo->pData);
 }
 
-DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_fragment_root_shadow,
-                           "ASAHI_M5_VERIFY_FRAGMENT_ROOT_SHADOW", false)
-
 static uint64_t
 hk_upload_native_spilled_rt_descs(struct hk_cmd_buffer *cmd)
 {
@@ -3411,8 +3408,9 @@ refused:
    return 0;
 }
 
-/* Read the uncached mappings only for this opt-in validation oracle. Keep
- * its temporary snapshot and checks out of the normal recording path. */
+/* Read the uncached mappings only for this validation oracle
+ * (ASAHI_MESA_DEBUG=verify). Keep its temporary snapshot and checks out of
+ * the normal recording path. */
 __attribute__((cold, noinline)) static void
 hk_m5_verify_fragment_root_shadow(const struct hk_graphics_state *gfx)
 {
@@ -3445,9 +3443,10 @@ hk_m5_verify_fragment_root_shadow(const struct hk_graphics_state *gfx)
 static uint64_t
 hk_m5_fragment_root(struct hk_cmd_buffer *cmd, const struct hk_shader *s)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
 
-   if (unlikely(debug_get_option_m5_verify_fragment_root_shadow()))
+   if (unlikely(dev->dev.debug & AGX_DBG_VERIFY))
       hk_m5_verify_fragment_root_shadow(gfx);
 
    return hk_m5_fragment_root_select(gfx, s->info.agx3_root_reads, true, true);

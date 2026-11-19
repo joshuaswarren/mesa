@@ -71,8 +71,6 @@ static_assert(HK_G18_BATCH_LAUNCHES <= 1400,
 /* Diagnostic controls, read once: these are consulted per dispatch, and an
  * uncached getenv() scans the whole environment. */
 DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_compute_loader,
-                           "AGX_M5_VERIFY_COMPUTE_LOADER", false)
 /* EXP-G1b's native access::write argument is a PBE pointer followed by a
  * pointer to this control descriptor, including when it follows a sampled
  * texture in the argument table. It is not the read_write clamp scalar. */
@@ -1895,11 +1893,12 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       program.length = loader->length;
       memcpy(program.bytes, loader->bytes, loader->length);
       hk_g17p_patch_plan_apply(&loader->plan, ranges, program.bytes);
-      if (debug_get_option_m5_verify_compute_loader()) {
+      if (dev->dev.debug & AGX_DBG_VERIFY) {
          struct agx3_g17p_graphics_program fresh;
          if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &fresh) ||
              fresh.length != program.length ||
              memcmp(fresh.bytes, program.bytes, program.length)) {
+            mesa_loge("M5 cached compute launch differs from fresh composition");
             reason = "cached program byte mismatch";
             goto refused;
          }

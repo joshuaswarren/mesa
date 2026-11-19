@@ -115,6 +115,7 @@ static const struct debug_named_value agx_debug_options[] = {
    {"nomerge",   AGX_DBG_NOMERGE,  "Disable control stream merging"},
    {"faulttrace",AGX_DBG_FAULTTRACE,"Retain G18 failure diagnostics"},
    {"asynctrace",AGX_DBG_ASYNCTRACE,"Trace command streams without waiting"},
+   {"verify",    AGX_DBG_VERIFY,   "Check cached launch programs against fresh ones"},
    {"bodumpverbose", AGX_DBG_BODUMPVERBOSE,   "Include extra info with dumps"},
    DEBUG_NAMED_VALUE_END
 };

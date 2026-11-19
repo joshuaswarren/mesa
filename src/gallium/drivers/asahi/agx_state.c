@@ -7254,8 +7254,8 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
  * with full-width LDIMMs), so one template fits every address the draw's
  * tables get, and only the shape (imageblock, range starts and sizes) keys it.
  * The bytes don't depend on the program's own address (no constant program),
- * which Honeykrisp relies on as well; ASAHI_M5_VERIFY_PROGRAM_CACHE=1 checks
- * every patched program against a fresh composition. */
+ * which Honeykrisp relies on as well; ASAHI_MESA_DEBUG=verify checks every
+ * patched program against a fresh composition. */
 struct agx_m5_graphics_template {
    struct agx_m5_graphics_template *next;
    struct agx_ioto_g17p_imageblock imageblock;
@@ -7582,7 +7582,7 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
       AGX3_PROGRAM_REFUSE("program allocation");
    desc.program_va = t.gpu;
 
-   if (cached && agx_env_flag(AGX_ENV_M5_VERIFY_PROGRAM_CACHE)) {
+   if (cached && (dev->debug & AGX_DBG_VERIFY)) {
       struct agx3_g17p_graphics_program fresh;
       desc.patchable = true;
       const bool same =
