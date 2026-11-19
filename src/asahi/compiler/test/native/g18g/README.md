@@ -18,10 +18,10 @@ not produce any of it.
 
 Each `.bin` is the stage object's raw `__TEXT,__text`:
 `_agc.main.constant_program` at offset 0 (64 bytes) followed by `_agc.main`
-at offset 0x40, as `manifest.json` records under `symbols`. There are 41
-shaders (16 probe functions and 25 oracle stages), each for both
-architectures, so 82 texts. Several oracle modes share a stage, which leaves
-27 distinct G17G/G18G pairs.
+at offset 0x40, as `manifest.json` records under `symbols`. There are 128
+shaders (103 probe functions and 25 oracle stages), each for both
+architectures, so 256 texts. Several shaders share a text, which leaves
+111 distinct G17G/G18G pairs.
 
 The texts were produced with Apple metal 32023.921 (metalfe-32023.921.6),
 AIR-NT 32023.921 and Metal toolchain 27.1.266.1 on macOS 27.0 (26A428), as
@@ -40,13 +40,14 @@ no device counterpart.
 
 ## What the corpus shows
 
-- 0 of 41 G18G texts equal their G17G build. 3 have the same length:
-  `oracle.compute-add.compute`, `m5_sample_array_level_zero` and
-  `m5_half_full_add`.
-- Over the 27 distinct pairs, `_agc.main` is 2780 bytes on G17G and 3060
+- 0 of 128 G18G texts equal their G17G build. 7 have the same length:
+  `oracle.compute-add.compute`, `m5_sample_array_level_zero`,
+  `glm_fsel16_regs`, `cf_float_if`, `m5_half_full_add`, `and16_of32_live`
+  and `ld_u8_ptr`.
+- Over the 111 distinct pairs, `_agc.main` is 12128 bytes on G17G and 11744
   bytes on G18G.
-- Mesa's AGX3c disassembler, built from `src/asahi/isa/AGX3c.xml`, decodes
-  every G17G `_agc.main` here cleanly and none of the G18G ones.
+- G17G texts use the AGX3c encoding (`src/asahi/isa/AGX3c.xml`); G18G texts
+  use AGX3d (`src/asahi/isa/AGX3d.xml`).
 
 ## Regenerating
 
@@ -69,6 +70,5 @@ library label in the pipeline scripts
 (`7d3c8bbc1ca51eecf56f07f55bb872269483718fa1dbf25af78d4645b9228476`).
 
 Without the toolchain, `./build-reference.py --verify` checks the committed
-texts against `manifest.json`; the `agx3_g18g_native_corpus` meson test runs
-it. Add `--device-session` to also compare them with a capture session's
+texts against `manifest.json`. Add `--device-session` to also compare them with a capture session's
 device-compiled archives.

@@ -61,9 +61,7 @@ GPR halves. Native loader RT-store mask is1.
 The native ESL matches the independently decoded G17P binding contract:
 qword binding0x32 loads the PBE-table pointer into uniform halves0..3;
 driver argument kind5/index0 loads the tile byte offset into halves4..5.
-The admitted tile byte offset is0. These bindings still require a G17G
-resource-loading Ioto program; compiling the shader alone does not establish
-valid command-stream construction or a successful Vulkan render.
+The admitted tile byte offset is0.
 
 The compiler recognizes the complete explicit-coordinate post-RA graph,
 requires an explicit G17G key, and rejects changed attachment index, offset,
