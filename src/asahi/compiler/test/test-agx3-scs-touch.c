@@ -14,7 +14,6 @@
 
 #include "agx3_binder.h"
 #include "agx3_rt_gen1_aabb_ops.h"
-#include "agx3_rt_gen1_body.h"
 #include "agx3_rt_gen1_clique_ops.h"
 #include "agx3_rt_gen1_instance_push_ops.h"
 #include "agx3_rt_gen1_triangle_ops.h"
@@ -128,24 +127,6 @@ check_tables(void)
 static const struct agx3_scs_touch_desc leaf = {
    .base_register = 0, .component_mask = 3, .base_kill = true,
 };
-
-static void
-check_generated_body(void)
-{
-   uint8_t body[AGX3_RT_GEN1_HIT_COMMIT_MAX_SIZE];
-   size_t size = 0;
-   const bool generated = agx3_rt_gen1_hit_commit_generate(body, &size);
-   const unsigned tail = agx3_bind_form_size(ENC, "barrier", 0) +
-                         agx3_bind_form_size(ENC, "end", 0);
-   expect(generated && size >= tail + 14u, "hit-commit body", "generator", 0);
-   if (!generated || size < tail + 14u)
-      return;
-
-   uint8_t bytes[AGX3_SCS_MAX_LENGTH] = {0}, length = 0;
-   expect(agx3_scs_encode_touch(ENC, &leaf, bytes, &length) && length == 14 &&
-             !memcmp(bytes, body + size - tail - 14, 14),
-          "the body does not end with the leaf touch", "generator", 0);
-}
 
 static void
 check_indexed(void)
@@ -297,7 +278,6 @@ int
 main(void)
 {
    check_tables();
-   check_generated_body();
    check_indexed();
    check_refusals();
 

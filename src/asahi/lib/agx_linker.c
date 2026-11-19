@@ -9,7 +9,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "util/macros.h"
-#include "util/mesa-blake3.h"
 #include "util/ralloc.h"
 #include "agx_abi.h"
 #include "agx3_code_container_core.h"
@@ -712,29 +711,6 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    linked->nr_gprs = nr_gprs;
    linked->g17p_colour_classes = colour_classes;
 
-   if (dev->chip == AGX_CHIP_G18G && getenv("ASAHI_G18_RESOURCE_TRACE") &&
-       (scratch_size || agx3_spectpr_scratch_size) && size <= (SIZE_MAX - 1) / 2) {
-      /* Once per linked executable, rather than once per dispatch. Preserve
-       * the final bytes, including prolog/epilog and link-time patches. */
-      char *hex = malloc(size * 2 + 1);
-      if (hex) {
-         static const char digits[] = "0123456789abcdef";
-         blake3_hash digest;
-         char hash[BLAKE3_HEX_LEN];
-         _mesa_blake3_compute(linked_map, size, digest);
-         _mesa_blake3_format(hash, digest);
-         for (size_t i = 0; i < size; ++i) {
-            hex[2 * i] = digits[linked_map[i] >> 4];
-            hex[2 * i + 1] = digits[linked_map[i] & 15];
-         }
-         hex[size * 2] = 0;
-         fprintf(stderr,
-                 "G18_LINKED_SHADER size=%zu scratch=%u spectpr=%u blake3=%s hex=%s\n",
-                 size, scratch_size, agx3_spectpr_scratch_size, hash, hex);
-         free(hex);
-      }
-   }
-
    agx_bo_assert_range(linked->bo, code_offset, alloc_size);
 
    agx_pack(&linked->shader, USC_SHADER, cfg) {
@@ -812,7 +788,8 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
 
    /* The linked program is what runs; its parts are dumped at compile. */
    if ((agx_get_compiler_debug() & AGX_DBG_SHADERS) &&
-       (dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip))) {
+       (dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip) ||
+        dev->chip == AGX_CHIP_G18G)) {
       fprintf(stderr, "AGX3 linked: fragment=%u size=%zu hex=", fragment, size);
       for (size_t i = 0; i < size; ++i)
          fprintf(stderr, "%02x", linked_map[i]);

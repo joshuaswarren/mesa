@@ -5257,15 +5257,8 @@ TEST(NativeForms, M5NativeTriangleMeshProbeCompiles)
    agx_shader_key key={};key.dev.chip=AGX_CHIP_G17S;
    key.dev.encoding=AGX_ISA_ENCODING_AGX3C;key.no_preamble=true;
    agx_shader_part part={};
-   bool compiled=agx_compile_shader_nir(b.shader,&key,&part);
-   EXPECT_TRUE(compiled)<<agx_last_compile_refusal();
-   if(compiled){
-      printf("native-triangle-mesh binary=%u gprs=%u shared=%u scratch=%u\n",
-        part.info.binary_size,part.info.nr_gprs,part.info.local_size,part.info.scratch_size);
-      FILE *f=fopen("native-triangle-mesh.bin","wb");
-      if(f){fwrite(part.binary,1,part.info.binary_size,f);fclose(f);}
-      free(part.binary);
-   }
+   EXPECT_TRUE(agx_compile_shader_nir(b.shader,&key,&part))<<agx_last_compile_refusal();
+   free(part.binary);
    ralloc_free(b.shader);
 }
 

@@ -194,8 +194,6 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    hk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
    hk_descriptor_state_fini(cmd, &cmd->state.rt.descriptors);
 
-   hk_cmd_pool_free_gen1_as_chunks(pool, &cmd->gen1_as_table_chunks);
-
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_MAIN, &cmd->uploader.main.bos);
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_USC, &cmd->uploader.usc.bos);
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_ROOT, &cmd->uploader.root.bos);
@@ -271,7 +269,6 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    list_inithead(&cmd->uploader.usc.bos);
    list_inithead(&cmd->uploader.root.bos);
    list_inithead(&cmd->vdm_allocations);
-   list_inithead(&cmd->gen1_as_table_chunks);
    list_inithead(&cmd->control_streams);
 
    *cmd_buffer_out = &cmd->vk;
@@ -672,22 +669,6 @@ hk_g17p_launch_trace_init(void)
    return enabled;
 }
 
-/* Single line, distinct tag. The multi-line dump below has twice been reported
- * as "only the header printed", so anything that must not be lost in a log
- * filter goes through this instead. */
-void
-hk_g17p_trace_line(const char *label, uint64_t base, const void *data,
-                   size_t len)
-{
-   const uint8_t *bytes = data;
-   fprintf(stderr, "G17P %s: base=%" PRIx64 " len=%zu bytes=", label, base,
-           len);
-   for (size_t i = 0; i < len; ++i)
-      fprintf(stderr, "%02x", bytes[i]);
-   fprintf(stderr, "\n");
-   fflush(stderr);
-}
-
 void
 hk_g17p_trace_hexdump(const char *label, uint64_t base, const void *data,
                       size_t len)
@@ -701,36 +682,6 @@ hk_g17p_trace_hexdump(const char *label, uint64_t base, const void *data,
          fprintf(stderr, "%02x ", bytes[off + i]);
       fprintf(stderr, "\n");
    }
-   fflush(stderr);
-}
-
-/* w74: HK_G17P_LAUNCH_TRACE=1 dump of one graphics stage's uniform ranges, one
- * line per range. A draw's texture/descriptor/root bindings reach the shader
- * only through these ranges, so this is what to compare with the shader's
- * load_preamble/device_load bases in the AGX3 dump. */
-static void
-hk_g17p_trace_gfx_ranges(const struct hk_shader *s,
-                         const struct agx3_ioto_uniform_range *ranges,
-                         size_t count, const uint8_t *sources)
-{
-   fprintf(stderr,
-           "G17P gfx-ranges: stage=%d count=%zu root_uniform=%u set_count=%u "
-           "uses_root=%d combined_sampler=%d indexed_sampler=%d "
-           "rodata16=%u uniform_dma=%u push_count=%u\n",
-           (int)s->info.stage, count, s->info.agx3_root_uniform,
-           (unsigned)s->info.set_count, (int)s->info.agx3_uses_root,
-           (int)s->info.agx3_combined_sampler_valid,
-           (int)s->info.agx3_indexed_sampler_valid,
-           (unsigned)s->b.info.rodata.size_16,
-           (unsigned)s->b.info.agx3_uniform_dma_count,
-           (unsigned)s->b.info.push_count);
-   for (size_t i = 0; i < count; ++i)
-      fprintf(stderr,
-              "G17P gfx-range: stage=%d i=%zu start_halfs=%u size_halfs=%u "
-              "address=%" PRIx64 " source=%u\n",
-              (int)s->info.stage, i, (unsigned)ranges[i].start_halfs,
-              (unsigned)ranges[i].size_halfs, (uint64_t)ranges[i].address,
-              (unsigned)sources[i]);
    fflush(stderr);
 }
 
@@ -2785,42 +2736,6 @@ hk_g17p_graphics_uniform_ranges(
       if (!pointers_va)
          return hk_g17p_graphics_ranges_refused(range_count, count);
 
-      if (hk_g17p_launch_trace_enabled()) {
-         /* Descriptor bytes as the set holds them, the texture state the
-          * hardware will actually read (the 32-byte aligned copy), and the
-          * sampler heap element the shader's sampler index selects. */
-         const uint8_t *tex_src =
-            (const uint8_t *)set_map + binding->texture_offset_B;
-         hk_g17p_trace_line("gfx-combined-set-texture", set_addr +
-                               binding->texture_offset_B, tex_src,
-                            MIN2(set_size - binding->texture_offset_B,
-                                 (uint32_t)sizeof(struct hk_sampled_image_descriptor)));
-         fprintf(stderr,
-                 "G17P gfx-combined: set_addr=%" PRIx64 " set_size=%u "
-                 "texture_offset_B=%u sampler_index_offset_B=%u "
-                 "sampler_index=%u sampler_count=%u sampler_elem_B=%u "
-                 "tex_ptr_in=%" PRIx64 " tex_ptr_published=%" PRIx64
-                 " sampler_heap_va=%" PRIx64 " pointers_va=%" PRIx64 "\n",
-                 set_addr, set_size, binding->texture_offset_B,
-                 binding->sampler_index_offset_B, (unsigned)sampler_index,
-                 (unsigned)dev->samplers.table.alloc, sampler_element_size,
-                 pointers[0], cached->valid ? cached->published[0] : 0,
-                 pointers[1], pointers_va);
-         if (sampler_index < dev->samplers.table.alloc)
-            hk_g17p_trace_line(
-               "gfx-combined-sampler-element",
-               dev->samplers.table.bo->va->addr +
-                  (uint64_t)sampler_index * sampler_element_size,
-               hk_descriptor_table_entry(&dev->samplers.table, sampler_index),
-               sampler_element_size);
-         if (cached->valid && cached->published[0])
-            fprintf(stderr, "G17P gfx-combined: texture state %s 32-byte "
-                            "aligned\n",
-                    (cached->published[0] & (HK_G17P_TEXTURE_STATE_ALIGN - 1))
-                       ? "NOT" : "is");
-         fflush(stderr);
-      }
-
       sources[count] = HK_G17P_RANGE_SOURCE_UPLOADED;
       ranges[count++] = (struct agx3_ioto_uniform_range){
          .start_halfs = texture_uniform_base,
@@ -2842,17 +2757,6 @@ hk_g17p_graphics_uniform_ranges(
           !dev->rodata.indexed_heap_pointers)
          return hk_g17p_graphics_ranges_refused(range_count, count);
       const uint64_t pointers_va = dev->rodata.indexed_heap_pointers;
-      if (hk_g17p_launch_trace_enabled())
-         fprintf(stderr,
-                 "G17P gfx-indexed: sampled_images_base_va=%" PRIx64
-                 " sampled_image_desc_size=%u sampled_images_alloc=%u "
-                 "sampler_heap_va=%" PRIx64 " sampler_alloc=%u "
-                 "heap_pointers_va=%" PRIx64 "\n",
-                 dev->sampled_images.base_va,
-                 (unsigned)dev->sampled_images.desc_size,
-                 (unsigned)dev->sampled_images.alloc,
-                 dev->samplers.table.bo->va->addr,
-                 (unsigned)dev->samplers.table.alloc, pointers_va);
       sources[count] = HK_G17P_RANGE_SOURCE_CONSTANT;
       ranges[count++] = (struct agx3_ioto_uniform_range){
          .start_halfs = texture_uniform_base, .size_halfs = 8, .address = pointers_va,
@@ -2908,8 +2812,6 @@ hk_g17p_graphics_uniform_ranges(
                            HK_AGX3_G17P_GRAPHICS_MAX_RANGES, &count, sources))
       return hk_g17p_graphics_ranges_refused(range_count, count);
 
-   if (hk_g17p_launch_trace_enabled())
-      hk_g17p_trace_gfx_ranges(s, ranges, count, sources);
    *range_count = count;
    return count <= HK_AGX3_G17P_GRAPHICS_MAX_RANGES;
 }

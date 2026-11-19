@@ -22,18 +22,6 @@ agx_vdm_mesh_threadgroup_pack(const uint32_t size[3], uint32_t *word)
 }
 
 bool
-agx_vdm_mesh_threadgroup_unpack(uint32_t word, uint32_t size[3])
-{
-   if (!size) return false;
-   uint32_t decoded[3] = {word & 2047, (word >> 11) & 2047, word >> 22};
-   uint32_t checked;
-   if (!agx_vdm_mesh_threadgroup_pack(decoded, &checked) || checked != word)
-      return false;
-   memcpy(size,decoded,sizeof(decoded));
-   return true;
-}
-
-bool
 agx_vdm_m5_mesh_set_output_limits(struct agx_vdm_mesh_state_info *info,
                                   uint32_t max_vertices,
                                   uint32_t max_primitives,

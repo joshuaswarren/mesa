@@ -115,7 +115,6 @@ agx_nir_m5_canonicalize_empty_mesh(nir_shader *s)
 struct mesh_layout {
    unsigned output_base, primitive_count, vertex_count, position;
    unsigned plane_stride, planes, bytes;
-   bool storage_probe;
    const struct agx_m5_mesh_varyings *varyings;
 
    /* Per-primitive outputs (see agx_m5_mesh_unwelds): the API body writes
@@ -199,9 +198,6 @@ mesh_layout(const nir_shader *s, const struct agx_m5_mesh_varyings *varyings)
       .vertex_count = base + count + 4, .position = base + position,
       .plane_stride = stride, .planes = varyings->size,
       .bytes = ALIGN_POT(position + varyings->size * stride, 64),
-      .storage_probe = getenv("ASAHI_MESH_PP_PROBE") != NULL &&
-                       (!strcmp(getenv("ASAHI_MESH_PP_PROBE"), "1") ||
-                        !strcmp(getenv("ASAHI_MESH_PP_PROBE"), "payload")),
       .varyings = varyings,
       .unweld = unweld,
       .export_vertices = export_vertices,
@@ -275,9 +271,6 @@ mesh_layout_provoking(const nir_shader *s,
       .output_base = base, .primitive_count = base + count,
       .vertex_count = base + count + 4, .position = base + position,
       .planes = varyings->size,
-      .storage_probe = getenv("ASAHI_MESH_PP_PROBE") != NULL &&
-                       (!strcmp(getenv("ASAHI_MESH_PP_PROBE"), "1") ||
-                        !strcmp(getenv("ASAHI_MESH_PP_PROBE"), "payload")),
       .varyings = varyings,
       .layer_plane = -1, .viewport_plane = -1,
       .provoking = true,
@@ -367,37 +360,11 @@ lower(nir_builder *b,nir_intrinsic_instr *i,void *data)
       const unsigned slot=vertex_output_slot(i);
       const unsigned first=first_plane(layout->varyings,slot);
       unsigned component=nir_intrinsic_component(i);
-      nir_def *value=widen_output(b,i,i->src[0].ssa), *probe=NULL;
-      if (slot == VARYING_SLOT_VAR0 && layout->storage_probe) {
-         /* Opt-in read-only hardware probe (ASAHI_MESH_PP_PROBE=1): publish the
-          * native per-primitive record base SR64/SR65 and the workgroup index
-          * through the flat VAR0 planes instead of the API colour. No pointer
-          * is dereferenced; the fragment dumps the raw bits as pixels. */
-         const char *pe = getenv("ASAHI_MESH_PP_PROBE");
-         const bool payload_probe = pe && !strcmp(pe, "payload");
-         nir_def *storage = payload_probe
-            ? nir_load_mesh_payload_address_agx(b)
-            : nir_load_mesh_primitive_storage_agx(b);
-         if (payload_probe) {
-            /* Bytes of SR62 (even workgroups) or SR63 (odd) as UNORM8. */
-            nir_def *odd = nir_i2b(b, nir_iand_imm(b, nir_channel(b, nir_load_workgroup_id(b), 0), 1));
-            nir_def *word = nir_bcsel(b, odd, nir_channel(b, storage, 1), nir_channel(b, storage, 0));
-            nir_def *bytes[4];
-            for (unsigned k = 0; k < 4; ++k)
-               bytes[k] = nir_fmul_imm(b, nir_u2f32(b, nir_iand_imm(b, nir_ushr_imm(b, word, 8 * k), 0xff)), 1.0 / 255.0);
-            storage = NULL;
-            probe = nir_vec(b, bytes, 4);
-         }
-         if (storage)
-         probe=nir_vec4(b,nir_channel(b,storage,0),nir_channel(b,storage,1),
-                        nir_channel(b,nir_load_workgroup_id(b),0),
-                        nir_load_local_invocation_index(b));
-      }
+      nir_def *value=widen_output(b,i,i->src[0].ssa);
       u_foreach_bit(c,nir_intrinsic_write_mask(i)) {
          nir_def *address=nir_iadd_imm(b,element,
             vertex_plane_address(layout,first+component+c));
-         nir_store_shared(b,probe ? nir_channel(b,probe,component+c)
-                                  : nir_channel(b,value,c),address,
+         nir_store_shared(b,nir_channel(b,value,c),address,
                             .write_mask=1,.align_mul=4);
          if (slot == VARYING_SLOT_CLIP_DIST0 ||
              slot == VARYING_SLOT_CLIP_DIST1) {
@@ -1459,9 +1426,8 @@ agx_nir_lower_m5_mesh_fragment(nir_shader *s)
                                      nir_metadata_control_flow, NULL);
 }
 
-/* The retained native object and matching mesh both access the same pointer:
- * normalized SR62/W32 + SR63/W16. The four-byte payload limit is the actual
- * captured source contract, not a claimed hardware maximum. */
+/* The native object and matching mesh both access the same pointer:
+ * normalized SR62/W32 + SR63/W16. */
 static bool
 lower_payload(nir_builder *b,nir_intrinsic_instr *i,void *data)
 {
@@ -1506,12 +1472,6 @@ lower_payload(nir_builder *b,nir_intrinsic_instr *i,void *data)
          .access=nir_intrinsic_access(i)));
    }
    return true;
-}
-
-bool
-agx_nir_lower_m5_task_payload_probe(nir_shader *s)
-{
-   return agx_nir_lower_m5_task_payload(s, 4, 0);
 }
 
 bool
@@ -1591,44 +1551,7 @@ lower_launch(nir_builder *b,nir_intrinsic_instr *i,void *data)
    return true;
 }
 
-bool
-agx_nir_lower_m5_task_probe(nir_shader *s)
-{
-   unsigned threads=s->info.workgroup_size[0]*s->info.workgroup_size[1]*
-                    s->info.workgroup_size[2];
-   if (s->info.stage!=MESA_SHADER_TASK || s->info.workgroup_size_variable ||
-       threads<3 || threads>128 || s->info.shared_size>48 ||
-       !agx_nir_lower_m5_task_payload_probe(s)) return false;
-   unsigned launches=0;
-   nir_foreach_function_impl(impl,s) {
-      nir_foreach_block(block,impl) {
-         nir_foreach_instr(in,block) {
-            if (in->type==nir_instr_type_intrinsic &&
-                nir_instr_as_intrinsic(in)->intrinsic==nir_intrinsic_launch_mesh_workgroups)
-               launches++;
-         }
-      }
-   }
-   if (!launches) return false;
-   unsigned grid=ALIGN_POT(s->info.shared_size,16);
-   nir_shader_intrinsics_pass(s,lower_launch,nir_metadata_none,&grid);
-   nir_builder b=nir_builder_at(nir_after_cf_list(&nir_shader_get_entrypoint(s)->body));
-   nir_barrier(&b,.execution_scope=SCOPE_WORKGROUP,.memory_scope=SCOPE_WORKGROUP,
-      .memory_semantics=NIR_MEMORY_ACQ_REL,
-      .memory_modes=nir_var_mem_shared);
-   nir_object_payload_exit_barrier_agx(&b);
-   nir_def *lane=nir_load_local_invocation_index(&b);
-   nir_push_if(&b,nir_ult_imm(&b,lane,3));
-   nir_def *value=nir_load_shared(&b,1,32,
-      nir_iadd_imm(&b,nir_imul_imm(&b,lane,4),grid),.align_mul=4);
-   nir_store_object_childcount_agx(&b,value);
-   nir_pop_if(&b,NULL);
-   s->info.shared_size=64;
-   nir_progress(true,b.impl,nir_metadata_none);
-   return true;
-}
-
-/* The opt-in API task (object) stage. The child grid is published with UVSW
+/* The API task (object) stage. The child grid is published with UVSW
  * from lanes 0..2 of SIMD group 0. Payload-carrying Apple object shaders
  * store the EmitMeshTasks grid in threadgroup memory, rendezvous and pass
  * the object payload-exit barrier first (_agc.object.write_childcount);

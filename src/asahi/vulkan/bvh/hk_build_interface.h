@@ -404,8 +404,7 @@ struct hk_agx3_plan_args {
    uint32_t resource_id;
    uint32_t geometry_type;
    /* GEN1: phases 0..3 were replaced by a restored plan (an update): phase
-    * 4 rebuilds the jobs from the records in nodes. M5 uses this ABI word
-    * for its diagnostic bounding-box record stride, as m5_aabb_stride. */
+    * 4 rebuilds the jobs from the records in nodes. Unused on M5. */
    uint32_t plan_restored;
    VOID_REF metadata;
    uint64_t retained_offset;
@@ -417,48 +416,14 @@ struct hk_agx3_plan_args {
    uint32_t padding;
 };
 
-/* Independent ASs share dispatches, not their writable records. The planner
- * allocates a dense job map after classification; each encoder workgroup
- * still owns precisely the same native root/child region as the scalar path. */
-struct hk_agx3_batch_job {
-#ifdef VULKAN
-   hk_agx3_plan_args plan;
-#else
-   struct hk_agx3_plan_args plan;
-#endif
-   REF(uint32_t) node_status;
-   REF(uint32_t) envelope_status;
-   uint32_t single_leaf;
-   uint32_t first_job;
-   uint32_t encode_count;
-   uint32_t reserved;
-};
-struct hk_agx3_batch_map {
-   uint32_t build;
-   uint32_t node;
-};
-struct hk_agx3_batch_dispatch {
-   uint32_t x;
-   uint32_t y;
-   uint32_t z;
-   uint32_t reserved;
-};
-#ifdef VULKAN
-TYPE(hk_agx3_batch_job, 8);
-TYPE(hk_agx3_batch_map, 4);
-TYPE(hk_agx3_batch_dispatch, 4);
-#endif
-struct hk_agx3_batch_args {
-   REF(hk_agx3_batch_job) jobs;
-   REF(hk_agx3_batch_map) map;
-   REF(hk_agx3_batch_dispatch) dispatch;
-   uint32_t job_count;
-   uint32_t phase;
-};
-
-/* M5's name for hk_agx3_plan_args::plan_restored: 48, or 64 for the 64-byte
- * bounding-box record diagnostic. */
-#define m5_aabb_stride plan_restored
+/* Bytes of an M5 native bounding-box record (record class 4 in root word0
+ * bits 5..7), packed at this stride in the leaf's child region: the marker
+ * word (leaf type 24) at 0, the minimum at 4, the maximum at 16, the geometry
+ * id with the opaque flag in bit 31 at 28, the primitive id at 32, its flags
+ * word at 36 (bit 30: optional primitive data present) and the relative
+ * primitive data pointer at 40. struct hk_agx3_m5_aabb_record spells it out
+ * for the host. */
+#define HK_AGX3_M5_AABB_RECORD_B 48u
 
 #define HK_AGX3_PLAN_ENCODE_DISPATCH 32u /* bytes after hk_agx3_plan_state */
 /* hk_agx3_plan_node.depth flags of an internal node whose two children are

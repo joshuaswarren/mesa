@@ -136,20 +136,34 @@ lower(agx_builder *b, agx_instr *I)
    switch (I->op) {
 
    case AGX_OPCODE_FADD:
-      /* G18G only for now; candidate for all chips. */
-      if (agx3 && agx_is_g18g(&b->shader->key->dev) && I->nr_dests == 1 &&
-          I->nr_srcs == 2 &&
+      /* Constant propagation can leave two minifloats at a floating
+       * move/conversion. AGX2 encodes an immediate in either ALU source, but
+       * none of the AGX3 tables (agx3b, agx3c, agx3d) has an f32 add whose two
+       * operands are both immediates: every AGX3 packer refuses the pair
+       * (agx3c and agx3d always; agx3b folded only the unmodified,
+       * non-saturating pair itself). So this is an AGX3 encoding property,
+       * not a G18G one.
+       */
+      if (agx3 && agx_encoding_is_agx3(b->shader->key->dev.encoding) &&
+          I->nr_dests == 1 && I->nr_srcs == 2 &&
           I->dest[0].type == AGX_INDEX_REGISTER && !I->dest[0].memory &&
           I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1 &&
           I->src[0].type == AGX_INDEX_IMMEDIATE && I->src[0].value <= UINT8_MAX &&
           I->src[1].type == AGX_INDEX_IMMEDIATE && I->src[1].value <= UINT8_MAX &&
           !I->src[0].memory && !I->src[1].memory &&
           agx_channels(I->src[0]) == 1 && agx_channels(I->src[1]) == 1) {
-         /* Constant propagation can leave two minifloats at a floating
-          * move/conversion. Native FADD needs a register operand. Reuse
-          * the assigned destination for the exact first constant, then
-          * keep the original arithmetic and modifiers. This retains
-          * signed-zero behavior and rounding without a host-side fold. */
+         /* Unmodified and unclamped, the sum of two minifloats is exact in
+          * f32 (including the sign of a zero sum under round-to-nearest), so
+          * fold it to one literal move, the form agx3b already emitted. */
+         if (!I->saturate && !I->src[0].abs && !I->src[0].neg &&
+             !I->src[1].abs && !I->src[1].neg) {
+            const float sum = agx_minifloat_decode(I->src[0].value) +
+                              agx_minifloat_decode(I->src[1].value);
+            return agx_mov_imm_to(b, I->dest[0], fui(sum));
+         }
+
+         /* Otherwise keep the arithmetic, modifiers and clamp on the GPU:
+          * reuse the assigned destination for the exact first constant. */
          const agx_index immediate = I->src[0];
          agx_mov_imm_to(b, I->dest[0], fui(agx_minifloat_decode(immediate.value)));
          I->src[0] = agx_register(I->dest[0].value, AGX_SIZE_32);

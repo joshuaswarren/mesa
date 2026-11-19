@@ -46,7 +46,6 @@ enum agx_env_flag {
    AGX_ENV_NEO_DRAW_DIAGNOSTICS,
    AGX_ENV_NEO_UNIFORM_DIAGNOSTICS,
    AGX_ENV_NEO_BINARY_DIAGNOSTICS,
-   AGX_ENV_G18_RESOURCE_TRACE,
    AGX_ENV_NO_STAGED_BUFFER_WRITES,
    AGX_ENV_NO_M5_PROGRAM_CACHE,
    AGX_ENV_M5_VERIFY_PROGRAM_CACHE,
@@ -389,6 +388,8 @@ struct agx_uncompiled_shader {
    struct blob early_serialized_nir;
    struct blob serialized_nir;
    uint8_t nir_blake3[BLAKE3_KEY_LEN];
+   /* GLSL source hash (shader_info::source_blake3), for profiles. */
+   uint32_t source_hash;
 
    struct {
       uint64_t inputs_flat_shaded;
@@ -544,11 +545,10 @@ struct agx_cdm_dispatch {
    /* G18G: the command carries DRM_ASAHI_COMPUTE_USES_TEXTURE_STATE. */
    bool texture_state;
    struct drm_asahi_g18_compute_resources resources;
-   /* CPU metadata for tracing and resolving empty indirect work after its
-    * dependencies retire; never serialized into a GPU command. */
-   uint32_t trace_mode, trace_global[3], trace_local[3], trace_program;
-   uint64_t trace_indirect, trace_shader;
-   uint64_t trace_tess_params, trace_vertex_params, trace_geometry_params;
+   /* CPU metadata for resolving empty indirect work after its dependencies
+    * retire; never serialized into a GPU command. */
+   uint32_t trace_mode;
+   uint64_t trace_indirect;
 };
 
 struct agx_encoder {
@@ -582,6 +582,8 @@ struct agx_batch {
    uint32_t failed_syncobjs[2];
    bool submit_quarantined;
    uint32_t draws;
+   /* Source hash of the last fragment shader drawn (ASAHI_MESA_DEBUG=stats). */
+   uint32_t last_fs_source;
 
    /* Executable storage is owned by this batch's pipeline pool. */
    uint64_t g17p_fragment_program;
@@ -678,6 +680,11 @@ struct agx_batch {
    struct {
       struct set *set;
       struct util_dynarray list; /* struct agx_bo * */
+      /* Byte ranges of buffer BOs this batch reads or writes, for buffers
+       * accessed only through ranged bindings. A BO in the set without an
+       * entry here counts as accessed in full. */
+      struct hash_table *ranges; /* agx_bo * -> index + 1 into range_list */
+      struct util_dynarray range_list; /* struct agx_bo_range */
    } bo_list;
 
    /* If true, this batch contains a shader with a potentially incoherent write
@@ -1029,6 +1036,13 @@ struct agx_context {
    struct agx_streamout streamout;
    uint16_t sample_mask;
    struct pipe_framebuffer_state framebuffer;
+
+   /* A colourless framebuffer bound while an active render batch uses the same
+    * depth/stencil surface is drawn inside that batch with colour writes
+    * masked. framebuffer then holds that batch's key and zs_merge_real the
+    * state the app bound. */
+   bool zs_merge;
+   struct pipe_framebuffer_state zs_merge_real;
 
    uint32_t poly_stipple[32];
 
@@ -1523,6 +1537,10 @@ bool agx_nir_lower_g17p_storage_records(nir_shader *shader,
                                         unsigned record_size_B);
 bool agx_nir_rebind_g17g_image_loads(nir_shader *shader);
 
+struct agx_bo_range {
+   uint64_t start, end;
+};
+
 bool agx_batch_is_active(struct agx_batch *batch);
 bool agx_batch_is_submitted(struct agx_batch *batch);
 
@@ -1587,6 +1605,8 @@ void agx_memory_barrier(struct pipe_context *pctx, unsigned flags);
 void agx_batch_reads(struct agx_batch *batch, struct agx_resource *rsrc);
 void agx_batch_writes(struct agx_batch *batch, struct agx_resource *rsrc,
                       unsigned level);
+void agx_batch_reads_range(struct agx_batch *batch, struct agx_resource *rsrc,
+                           uint64_t offset, uint64_t size);
 void agx_batch_writes_range(struct agx_batch *batch, struct agx_resource *rsrc,
                             unsigned offset, unsigned size);
 void agx_batch_track_image(struct agx_batch *batch,

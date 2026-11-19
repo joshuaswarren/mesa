@@ -68,6 +68,10 @@ struct hk_queue {
    /* Kinds of streams this queue has ever run, see hk_sync.h. */
    struct hk_sync_queue sync;
 
+   /* Scratch for queue_submit: the resolved sync fields of each stream
+    * occurrence of the submission being built (hk_sync_resolve_submit()). */
+   struct util_dynarray sync_resolved;
+
    /* Compute kick (hk_compute_kick.c). watched is set at device creation
     * for a queue whose priority class has a kick queue. The rest is
     * protected by the kicker's lock. */
@@ -83,8 +87,8 @@ struct hk_queue {
       uint64_t seen;
       int64_t due_ns;
    } kick;
-   /* G17P sibling kernel queues (N = HK_G17P_SIBLING_QUEUES_M4_PRO on the
-    * M4 Pro, otherwise 1, which is off; see hk_queue.c). Submissions that depend on no earlier submission and hold only plain
+   /* G17P sibling kernel queues (N = HK_G17P_SIBLING_QUEUES on G17P,
+    * otherwise 1, which is off; see hk_queue.c). Submissions that depend on no earlier submission and hold only plain
     * compute streams take turns over N kernel queues, the primary (drm.id)
     * and N - 1 siblings, so consecutive ones may run side by side. Every
     * kernel queue signals the same timeline (drm.syncobj), whose points

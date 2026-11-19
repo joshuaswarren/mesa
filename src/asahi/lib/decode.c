@@ -228,7 +228,14 @@ agxdecode_chip_from_params(const decoder_params *params)
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200)
             return AGX_CHIP_G17P;
          return AGX_CHIP_G16S;
-      case 'C': return AGX_CHIP_G16C;
+      case 'C':
+      case 'X':
+         /* As agx_chip_from_params(): the M4 Max on the G17 runtime is G17P. */
+         if (params->chip_id == 0x6041 &&
+             params->usc_generation == AGX_ISA_AGX3 &&
+             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200)
+            return AGX_CHIP_G17P;
+         return params->gpu_variant == 'C' ? AGX_CHIP_G16C : AGX_CHIP_UNKNOWN;
       default: return AGX_CHIP_UNKNOWN;
       }
    case 17:
@@ -307,14 +314,15 @@ typedef unsigned (*decode_cmd)(struct agxdecode_ctx *ctx, const uint8_t *map,
 #define STATE_RET  (0xFFFFFFFCu)
 #define STATE_ERROR (0xFFFFFFFBu)
 
-/* Every refill, not just the first one, must stay inside a tracked BO. Only
- * G18G streams are bounded for now (a candidate for every chip); the others
- * refill a whole buffer as before. */
+/* Every refill, not just the first one, must stay inside a tracked BO: a
+ * link, call, return or refill can land in the last buffer-full of a BO, and
+ * fetching a whole buffer there overflows it (an assert, or a read past the
+ * mapping in a release build). Decoder robustness, independent of the GPU. */
 static int
-agxdecode_fetch_stream(struct agxdecode_ctx *ctx, bool bounded, uint64_t va,
-                       void *buffer, size_t size)
+agxdecode_fetch_stream(struct agxdecode_ctx *ctx, uint64_t va, void *buffer,
+                       size_t size)
 {
-   if (bounded && !lib_config.read_gpu_mem) {
+   if (!lib_config.read_gpu_mem) {
       struct agx_bo *alloc = agxdecode_find_mapped_gpu_mem_containing(ctx, va);
       if (!alloc)
          return 0;
@@ -334,8 +342,6 @@ agxdecode_stateful(struct agxdecode_ctx *ctx, uint64_t va, const char *label,
 
    uint8_t buf[1024];
    size_t size = sizeof(buf);
-   const bool g18g =
-      params && agxdecode_chip_from_params(params) == AGX_CHIP_G18G;
    if (!lib_config.read_gpu_mem) {
       struct agx_bo *alloc = agxdecode_find_mapped_gpu_mem_containing(ctx, va);
       if (!alloc) {
@@ -352,7 +358,7 @@ agxdecode_stateful(struct agxdecode_ctx *ctx, uint64_t va, const char *label,
    }
    fflush(agxdecode_dump_stream);
 
-   int len = agxdecode_fetch_stream(ctx, g18g, va, buf, size);
+   int len = agxdecode_fetch_stream(ctx, va, buf, size);
 
    int left = len;
    uint8_t *map = buf;
@@ -370,9 +376,10 @@ agxdecode_stateful(struct agxdecode_ctx *ctx, uint64_t va, const char *label,
       unsigned count =
          decoder(ctx, map, (size_t)left, &link, verbose, params, data);
 
-      /* If we fail to decode, default to a hexdump (don't hang) */
+      /* If we fail to decode, default to a hexdump (don't hang), without
+       * reading past the bytes we have. */
       if (count == 0) {
-         count = g18g ? MIN2(8, left) : 8;
+         count = MIN2(8, left);
          u_hexdump(agxdecode_dump_stream, map, count, false);
       }
 
@@ -382,7 +389,7 @@ agxdecode_stateful(struct agxdecode_ctx *ctx, uint64_t va, const char *label,
       } else if (count == STATE_LINK) {
          fprintf(agxdecode_dump_stream, "Linking to 0x%" PRIx64 "\n\n", link);
          va = link;
-         left = len = agxdecode_fetch_stream(ctx, g18g, va, buf, sizeof(buf));
+         left = len = agxdecode_fetch_stream(ctx, va, buf, sizeof(buf));
          map = buf;
       } else if (count == STATE_CALL) {
          fprintf(agxdecode_dump_stream,
@@ -391,20 +398,20 @@ agxdecode_stateful(struct agxdecode_ctx *ctx, uint64_t va, const char *label,
          assert(sp < ARRAY_SIZE(stack));
          stack[sp++] = va + 8;
          va = link;
-         left = len = agxdecode_fetch_stream(ctx, g18g, va, buf, sizeof(buf));
+         left = len = agxdecode_fetch_stream(ctx, va, buf, sizeof(buf));
          map = buf;
       } else if (count == STATE_RET) {
          assert(sp > 0);
          va = stack[--sp];
          fprintf(agxdecode_dump_stream, "Returning to 0x%" PRIx64 "\n\n", va);
-         left = len = agxdecode_fetch_stream(ctx, g18g, va, buf, sizeof(buf));
+         left = len = agxdecode_fetch_stream(ctx, va, buf, sizeof(buf));
          map = buf;
       } else if (count == STATE_ERROR) {
          fprintf(agxdecode_dump_stream,
                  "Stopping at a non-canonical command record\n");
          break;
       } else {
-         if (g18g && count > (unsigned)left) {
+         if (count > (unsigned)left) {
             fprintf(agxdecode_dump_stream, "Truncated command record\n");
             break;
          }
@@ -413,7 +420,7 @@ agxdecode_stateful(struct agxdecode_ctx *ctx, uint64_t va, const char *label,
          left -= count;
 
          if (left < 512 && len == sizeof(buf)) {
-            left = len = agxdecode_fetch_stream(ctx, g18g, va, buf, sizeof(buf));
+            left = len = agxdecode_fetch_stream(ctx, va, buf, sizeof(buf));
             map = buf;
          }
       }

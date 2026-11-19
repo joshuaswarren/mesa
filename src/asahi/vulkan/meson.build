@@ -367,7 +367,6 @@ if with_tests
       'hk_agx3_ioto_program_core_test',
       files('tests/test-hk-agx3-ioto-program-core.c',
             'hk_agx3_ioto_program_core.c',
-            '../compiler/agx_g18_gates.c',
             '../compiler/agx3_compute_program.c',
             '../compiler/agx3_graphics_program.c',
             '../compiler/agx3_m5_graphics_program.c',
@@ -1011,6 +1010,24 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  hk_vulkan_global_priority = executable(
+    'hk-vulkan-global-priority',
+    files('tests/hk_vulkan_global_priority.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  hk_vulkan_sparse_bind_first_submit = executable(
+    'hk-vulkan-sparse-bind-first-submit',
+    files('tests/hk_vulkan_sparse_bind_first_submit.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hk_vulkan_explicit_plane_layout = executable(
     'hk-vulkan-explicit-plane-layout',
     files('tests/hk_vulkan_explicit_plane_layout.c'),
@@ -1096,7 +1113,9 @@ if with_tests
     files('tests/test-hk-lost-object-submit.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
-    dependencies : [hk_deps], link_with : [libhk]),
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [hk_wrap_test_link_args,
+      '-Wl,--wrap=vk_queue_wait_lost_submissions']),
     timeout : 30, suite : ['asahi'])
 endif
 

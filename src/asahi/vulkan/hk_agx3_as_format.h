@@ -45,9 +45,10 @@ hk_agx3_as_format_for_chip(enum agx_chip chip)
 #define HK_AGX3_GEN1_PLAN_TAIL_B 48u
 #define HK_AGX3_M5_PLAN_TAIL_B   32u
 
-/* Bounding-box leaf record size. */
+/* Bounding-box leaf record size. The M5 record size,
+ * HK_AGX3_M5_AABB_RECORD_B, is defined with its layout in
+ * bvh/hk_build_interface.h, which the encoder programs share. */
 #define HK_AGX3_GEN1_AABB_RECORD_B 64u
-#define HK_AGX3_M5_AABB_RECORD_B   48u
 
 /* Lanes of one node-encoding workgroup. */
 #define HK_AGX3_GEN1_NODE_GROUP_LANES 32u

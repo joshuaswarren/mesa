@@ -43,23 +43,6 @@ agx_ioto_cprog_input_offset(enum agx_chip chip,
    return true;
 }
 
-bool
-agx_ioto_cprog_input_frame(enum agx_chip chip,
-                           const struct agx_ioto_cprog_inputs *inputs,
-                           uint16_t *input_halfs, uint16_t *frame_bytes)
-{
-   if (chip != AGX_CHIP_G17P || inputs == NULL || !inputs->known ||
-       input_halfs == NULL || frame_bytes == NULL || input_halfs == frame_bytes)
-      return false;
-
-   unsigned count = 0;
-   for (unsigned i = 0; i < AGX_IOTO_CPROG_UNIFORM_WORDS; ++i)
-      count += cprog_popcount(inputs->uniform_halfs[i]);
-   *input_halfs = count;
-   *frame_bytes = count ? (16u + 2u * count + 15u) & ~15u : 0;
-   return true;
-}
-
 static uint16_t
 load_u16(const uint8_t *bytes)
 {
@@ -93,13 +76,6 @@ agx_ioto_load_target_encoding(enum agx_chip chip)
    default:
       return AGX_IOTO_LOAD_ENCODING_UNSUPPORTED;
    }
-}
-
-bool
-agx_ioto_load_production_ready(enum agx_chip chip)
-{
-   (void)chip;
-   return false;
 }
 
 static uint8_t

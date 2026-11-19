@@ -543,33 +543,8 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
       u_rwlock_rdunlock(&dev->external_bos.lock);
 
    if (ret) {
-      /* Opt-in diagnostic: preserve the exact rejected submission so the
-       * kernel's validation can be replayed offline. No effect unless set. */
-      const char *dump = os_get_option("ASAHI_SUBMIT_DUMP_ON_ERROR");
-      if (dump && *dump) {
-         const int err = errno;
-         static unsigned seq;
-         char path[512];
-         snprintf(path, sizeof(path), "%s/submit-%d-%u.bin", dump, (int)getpid(),
-                  p_atomic_inc_return(&seq));
-         FILE *f = fopen(path, "wb");
-         if (f) {
-            /* Header: errno, struct size, then the ioctl struct, the command
-             * stream, and the sync array (16 bytes per entry). */
-            const uint32_t hdr[4] = {(uint32_t)err, sizeof(*submit),
-                                     submit->cmdbuf_size,
-                                     submit->in_sync_count + submit->out_sync_count};
-            fwrite(hdr, sizeof(hdr), 1, f);
-            fwrite(submit, sizeof(*submit), 1, f);
-            fwrite((const void *)(uintptr_t)submit->cmdbuf, 1, submit->cmdbuf_size, f);
-            if (submit->syncs)
-               fwrite((const void *)(uintptr_t)submit->syncs,
-                      sizeof(struct drm_asahi_sync), hdr[3], f);
-            fclose(f);
-            mesa_loge("hk: rejected submission (errno %d) saved to %s", err, path);
-         }
-         errno = err;
-      }
+      /* ASAHI_MESA_DEBUG=trace decodes every command stream before it is
+       * submitted, including one the kernel rejects. */
       return vk_device_set_lost(&dev->vk,
                                 "DRM_IOCTL_ASAHI_SUBMIT failed: %m");
    }
@@ -1333,11 +1308,19 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
       hk_queue_restart_sync(queue);
    }
 
+   /* For an elevated class the kernel answers EACCES/EPERM when the caller
+    * lacks CAP_SYS_NICE or DRM master, and EINVAL when the GPU backend does
+    * not schedule that class. Both are a refused global priority, which
+    * Vulkan reports as VK_ERROR_NOT_PERMITTED; the application can fall back
+    * to MEDIUM. */
    const int error = errno;
+   const bool elevated =
+      queue->drm.virt_ring_idx - 1 > DRM_ASAHI_PRIORITY_MEDIUM;
    const VkResult result =
       error == ENOMEM ? VK_ERROR_OUT_OF_HOST_MEMORY :
       (error == ENOSPC || error == EBUSY) ? VK_ERROR_OUT_OF_DEVICE_MEMORY :
-      (error == EPERM || error == EACCES) ? VK_ERROR_NOT_PERMITTED_EXT :
+      (error == EPERM || error == EACCES) ? VK_ERROR_NOT_PERMITTED_KHR :
+      (elevated && error == EINVAL) ? VK_ERROR_NOT_PERMITTED_KHR :
       VK_ERROR_INITIALIZATION_FAILED;
    return vk_errorf(dev, result, "DRM_IOCTL_ASAHI_QUEUE_CREATE failed: %s",
                     strerror(error));
@@ -1470,18 +1453,15 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
    return vk_common_QueueBindSparse(_queue, bindInfoCount, pBindInfo, fence);
 }
 
-/* Sibling kernel queues (hk_queue::sib) on G17P. Measured on J616s (M4 Pro,
- * T6040) with gpubench in f22f0908629; A18 Pro was not measured and keeps
- * one kernel queue.
- *
- * Kernel queues per VkQueue on the M4 Pro, the primary included: macOS
- * spreads one Metal queue over up to three firmware compute queues of one
- * context and runs two kicks at once (d33c6d37328). With the two gates
- * below, three cut ALU depth 4/16 from 285.7/283.5 to 275.0/274.7 us per
- * submission and left depth 1-2, light compute and multi-process rows
- * unchanged. */
-#define HK_G17P_SIBLING_QUEUES_M4_PRO 3
-static_assert(HK_G17P_SIBLING_QUEUES_M4_PRO <= HK_QUEUE_SIBLINGS_MAX,
+/* Sibling kernel queues (hk_queue::sib) on G17P: kernel queues per VkQueue,
+ * the primary included. macOS spreads one Metal queue over up to three
+ * firmware compute queues of one context and runs two kicks at once
+ * (d33c6d37328). With the two gates below, three cut M4 Pro (J616s) ALU
+ * depth 4/16 from 285.7/283.5 to 275.0/274.7 us per submission
+ * (f22f0908629), and the A18 Pro's bandwidth depth 4/16 by 25/13 %; neither
+ * part loses at depth 1-2 or with several processes. */
+#define HK_G17P_SIBLING_QUEUES 3
+static_assert(HK_G17P_SIBLING_QUEUES <= HK_QUEUE_SIBLINGS_MAX,
               "sibling kernel queue IDs do not fit hk_queue::sib.id");
 
 /* Earlier submissions still in flight before a sibling takes one
@@ -1506,6 +1486,7 @@ static_assert(HK_G17P_SIBLING_QUEUES_M4_PRO <= HK_QUEUE_SIBLINGS_MAX,
 static bool
 hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
                     const struct vk_queue_submit *submit,
+                    const struct hk_sync_resolved *resolved,
                     const uint64_t base[HK_SYNC_NUM_SQ], unsigned command_count,
                     bool kernel_cumulative)
 {
@@ -1533,9 +1514,10 @@ hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
             return false;
 
          /* A zero barrier names every command of earlier ioctls. */
+         const struct hk_sync_resolved *r = resolved++;
          for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
-            if ((cs->sync.prior[sq] && cs->sync.prior[sq] <= base[sq]) ||
-                cs->sync.barrier[sq] == 0)
+            if ((r->prior[sq] && r->prior[sq] <= base[sq]) ||
+                r->barrier[sq] == 0)
                return false;
          }
       }
@@ -1619,10 +1601,20 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       if (queue->sync.exact_prior &&
           !hk_sync_resolve_submit(
              queue, (struct hk_cmd_buffer *const *)submit->command_buffers,
-             submit->command_buffer_count, false, false, 0))
+             submit->command_buffer_count, false, false, 0, NULL))
          return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
       return queue_submit_empty(dev, queue, submit);
    }
+
+   /* Resolved sync fields, one entry per stream occurrence: a
+    * simultaneous-use command buffer may occur more than once. A sparse bind
+    * that only flushes the sparse table has none, and resizing a never
+    * allocated array to zero returns NULL. */
+   const unsigned resolved_count = command_count - flush_sstt;
+   if (resolved_count &&
+       !util_dynarray_resize(&queue->sync_resolved, struct hk_sync_resolved,
+                             resolved_count))
+      return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    bool replaced;
    VkResult queue_result = hk_queue_ensure_drm(
@@ -1766,13 +1758,12 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    /* Now setup the command structs */
    struct util_dynarray payload = UTIL_DYNARRAY_INIT;
 
-   /* A small G16S submit otherwise grows the heap allocation once for its
+   /* A small submit otherwise grows the heap allocation once for its
     * header and again for the command. Keep those payloads on the stack;
     * util_dynarray moves to the heap if attachments or more commands need
     * additional space. The ioctl consumes the payload before we return.
     */
-   if (agx_is_m4_pro(&dev->dev))
-      util_dynarray_init_from_stack(&payload, alloca(1024), 1024);
+   util_dynarray_init_from_stack(&payload, alloca(1024), 1024);
 
    unsigned nr_vdm = 0, nr_cdm = 0;
 
@@ -1828,13 +1819,15 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
     * (hk_drm_serialize_prefix), and keeps no ordinals, so it skips this. */
    const bool resolve = !queue->sync.serialize || queue->sync.exact_prior ||
                         queue->sync.stage_overlap;
+   const struct hk_sync_resolved *resolved =
+      resolve ? queue->sync_resolved.data : NULL;
    if (resolve && !hk_sync_resolve_submit(queue,
                           (struct hk_cmd_buffer *const *)submit->command_buffers,
                           submit->command_buffer_count, flush_sstt,
                           wait_count > 0 &&
                           !(dev->dev.params.features &
                             DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS),
-                          completed)) {
+                          completed, queue->sync_resolved.data)) {
       util_dynarray_fini(&payload);
       if (unlikely(anatomy))
          hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
@@ -1850,8 +1843,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
    bool sib_earlier = false;
    if (queue->sib.count > 1 && !replaced && !flush_sstt && !unlikely(anatomy) &&
-       hk_sibling_eligible(dev, queue, submit, prior_base, command_count,
-                           kernel_cumulative) &&
+       hk_sibling_eligible(dev, queue, submit, resolved, prior_base,
+                           command_count, kernel_cumulative) &&
        hk_sibling_deep(dev, queue, first_chunk_point - 1)) {
       sib_target = queue->sib.next;
       queue->sib.next = (queue->sib.next + 1) % queue->sib.count;
@@ -1889,6 +1882,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       }
 
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         if (resolved)
+            hk_sync_load_resolved(cs, resolved++);
          struct drm_asahi_cmd_header header =
             agx_cmd_header(cs->type == HK_CS_CDM, cs->sync.barrier[HK_SYNC_VDM],
                            cs->sync.barrier[HK_SYNC_CDM]);
@@ -2484,26 +2479,29 @@ hk_queue_create(struct hk_device *dev,
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
-   /* On M5, quantize relative priorities to the two unprivileged firmware
-    * classes. An explicit global class takes precedence; the kernel checks
-    * permission for elevated classes. No scheduling work is needed during
-    * submission. Elsewhere high-priority scheduling still needs kernel
-    * qualification.
+   /* The kernel reserves REALTIME on every GPU, so refuse it up front. HIGH
+    * goes to the kernel on every chip: whether the GPU backend schedules it
+    * and whether the caller may use it (CAP_SYS_NICE or DRM master) are the
+    * kernel's decisions, and hk_queue_ensure_drm reports a refusal as
+    * VK_ERROR_NOT_PERMITTED.
     */
    enum drm_asahi_priority drm_priority = translate_priority(priority);
    if (drm_priority == DRM_ASAHI_PRIORITY_REALTIME) {
       vk_free(&dev->vk.alloc, queue);
-      return VK_ERROR_NOT_PERMITTED_EXT;
+      return VK_ERROR_NOT_PERMITTED_KHR;
    }
 
-   if (agx_chip_g17_m5(dev->dev.chip)) {
-      if (!priority_info &&
-          pCreateInfo->pQueuePriorities[index_in_family] < 0.5f)
-         drm_priority = DRM_ASAHI_PRIORITY_LOW;
-   } else if (drm_priority >= DRM_ASAHI_PRIORITY_HIGH) {
-      vk_free(&dev->vk.alloc, queue);
-      return VK_ERROR_NOT_PERMITTED_EXT;
-   }
+   /* On M5, quantize relative priorities to the two unprivileged classes.
+    * M5 only: there the Vulkan queues of one priority class share a kernel
+    * queue (hk_queue_share), so the class is the only scheduling distinction
+    * left between them; this mapping was qualified with the M5 snapshot.
+    * Elsewhere each VkQueue owns its kernel queue and relative priorities
+    * stay a hint, as the spec allows. An explicit global class takes
+    * precedence. No scheduling work is needed during submission.
+    */
+   if (agx_chip_g17_m5(dev->dev.chip) && !priority_info &&
+       pCreateInfo->pQueuePriorities[index_in_family] < 0.5f)
+      drm_priority = DRM_ASAHI_PRIORITY_LOW;
 
    result = vk_queue_init(&queue->vk, &dev->vk, pCreateInfo, index_in_family);
    if (result != VK_SUCCESS) {
@@ -2518,8 +2516,8 @@ hk_queue_create(struct hk_device *dev,
       list_delinit(&queue->vk.link);
 
    queue->vk.driver_submit = hk_queue_submit;
-   queue->sync.precise_tile_evictions = agx_is_m4_pro(&dev->dev);
-   queue->sync.direct_single_footprints = agx_is_m4_pro(&dev->dev);
+   queue->sync.precise_tile_evictions = true;
+   queue->sync.direct_single_footprints = true;
    queue->sync.serialize = dev->dev.params.gpu_generation >= 13 &&
                            dev->dev.params.gpu_generation <= 14;
    /* A serialized queue orders every command after both engines' complete
@@ -2544,9 +2542,10 @@ hk_queue_create(struct hk_device *dev,
        queue->sync.exact_prior &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)) {
-      /* The M4 Pro runs two compute kicks of one context at once. */
-      queue->sib.count =
-         agx_is_m4_pro(&dev->dev) ? HK_G17P_SIBLING_QUEUES_M4_PRO : 1;
+      /* G17P firmware runs compute kicks of one context from sibling
+       * kernel queues at once, so independent compute streams overlap
+       * (see HK_G17P_SIBLING_QUEUES). */
+      queue->sib.count = HK_G17P_SIBLING_QUEUES;
    }
    queue->drm.render_rq = 0;
    queue->drm.virt_ring_idx = drm_priority + 1;
@@ -2670,5 +2669,6 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
          agx_destroy_command_queue(&dev->dev, queue->sib.id[i]);
    }
    agx_bo_unreference(&dev->dev, queue->g17p_sstt_flush_bo);
+   util_dynarray_fini(&queue->sync_resolved);
    vk_free(&dev->vk.alloc, queue);
 }

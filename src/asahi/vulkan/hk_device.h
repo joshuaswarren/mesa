@@ -193,21 +193,14 @@ struct hk_device {
    struct hk_gen1_sparse_table gen1_vertex_directory_pages;
    struct agx_bo *gen1_as_metadata;
    struct agx_bo *gen1_as_addresses;
-   struct agx_bo *gen1_as_query_bank;
    struct agx_bo *gen1_as_window_roots;
    struct util_dynarray gen1_as_windows; /* struct hk_gen1_as_window */
    uint32_t gen1_as_window_hint;
-   bool gen1_rq_live_as_table;
-   bool gen1_as_chunk_cache_lock_ready;
-   simple_mtx_t gen1_as_chunk_cache_lock;
-   struct list_head gen1_as_free_chunks[2];
-   uint32_t gen1_as_free_chunk_count[2];
    struct agx_bo *gen1_rq_code, *gen1_rq_ift;
    /* Immutable generated user image, shared by all query launches. */
    struct agx_bo *gen1_rq_state;
    struct agx_va *gen1_rq_code_alias;
    struct agx_bo *gen1_vertex_directory;
-   struct agx_va *gen1_vertex_directory_va;
    struct hash_table *gen1_vertex_tables;
    uint64_t *gen1_rq_maps;
    unsigned gen1_rq_bound_maps;
@@ -332,10 +325,9 @@ struct hk_device {
     * runtime grid can reach the main record is for this program to publish
     * the six-u32 geometry block.  Compiled once, from NIR, through the same
     * path as any other Honeykrisp compute shader, so it uses the driver's own
-    * proven root/uniform ABI rather than a replayed one.  NULL on every other
-    * chip, and NULL on G17P if the backend refused it -- in which case
-    * indirect dispatch stays refused instead of launching a program that does
-    * not exist. */
+    * proven root/uniform ABI rather than a replayed one.  NULL on chips
+    * without native indirect compute; on those that have it, device creation
+    * fails if it does not compile. */
    struct hk_api_shader *g17p_grid_helper;
 
    /* The same contract for an indirect-local grid, which an earlier kernel
@@ -407,13 +399,14 @@ enum hk_perftest {
  * or that reach it only while they run.
  *
  * On G17P the state is read when a barrier is recorded: live sparse and
- * capture/replay resources. A resource the command buffer references exists
- * by then, and it counts from creation, so later sparse binds are covered.
- * Not covered on G17P: a resource created after the command buffer was
- * recorded and reached through a path recording did not see, that is a
- * device address the command buffer reads indirectly, or a descriptor set
- * bound at recording and updated after it (descriptorBinding*UpdateAfterBind),
- * and memory imports.
+ * capture/replay resources, and live fd imports and host imports the GPU may
+ * write (another import can map the same pages at a second address). A
+ * resource the command buffer references exists by then, and it counts from
+ * creation, so later sparse binds are covered. Not covered on G17P: a
+ * resource or import created after the command buffer was recorded and
+ * reached through a path recording did not see, that is a device address the
+ * command buffer reads indirectly, or a descriptor set bound at recording and
+ * updated after it (descriptorBinding*UpdateAfterBind).
  *
  * The flush goes into the open compute stream, and only when that stream
  * already holds work (hk_cdm_visibility_flush_needed()). It writes back every

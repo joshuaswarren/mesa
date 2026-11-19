@@ -6,8 +6,9 @@ captured, it is *generated*, exactly as the single-target one is (see
 `README-g17g-native-rt0-eot.md`).
 
 The builtin request is a flatbuffer whose per-attachment record simply
-repeats. Reading the three requests already in this directory gives the rule,
-and it reproduces all three byte for byte:
+repeats. The three requests it was read from (`rt0-eot`, `raw32-mrt2` and
+`raw32-mrt3`, not kept in this tree) give the rule, and it reproduces all three
+byte for byte:
 
 * offset 0x50 — enabled RT mask, `(1 << n) - 1`
 * offset 0x54 — attachment count `n`

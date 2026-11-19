@@ -35,13 +35,6 @@ bool agx3_m5_mrt_eot_generate_layered(unsigned targets, const uint8_t *selectors
                                       bool multisample, bool layered,
                                       uint8_t *output, size_t capacity,
                                       size_t *written);
-bool agx3_m5_mrt_eot_generate_typed_ms(unsigned targets, const uint8_t *selectors,
-                                       bool multisample, uint8_t *output,
-                                       size_t capacity, size_t *written);
-bool agx3_m5_mrt_eot_generate_typed(unsigned targets, const uint8_t *selectors,
-                                    uint8_t *output, size_t capacity, size_t *written);
-bool agx3_m5_mrt_eot_generate(unsigned targets, uint8_t *output,
-                              size_t capacity, size_t *written);
 
 enum agx3_tile_width {
    AGX3_TILE_W8 = 0,
@@ -88,7 +81,7 @@ struct agx3_tile_sample {
     * Apple's G18G 4x per-pixel fragment (and its G17G twin, byte-identical
     * here) stores `rld h10 <- SR39 ; lstcol ... f44=10 f51=2 f55=1`:
     * 270605082901ad02000071440000, native-msaa-reference-147. Only the
-    * AGX_G18_MSAA4 packer sets it; loads never take it. */
+    * G18G multisample packer sets it; loads never take it. */
    bool g17_register;
 };
 
