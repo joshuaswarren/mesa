@@ -41,29 +41,6 @@ uint64_t agx_get_compiler_debug(void);
  * ("" when it succeeded), for the driver's "cannot encode" error. */
 const char *agx_last_compile_refusal(void);
 
-/* The G18G paths below used to be environment-selectable for A/B bring-up
- * and are now unconditional on G18G. Only agx3_pack_binary.c still calls
- * these; fold them into its call sites and delete them. Each one names the
- * path it gated:
- *
- *  - msaa4: G18G 2x/4x multisampling (tile layouts, sample-mask and tile
- *    lowering, epilogs, background/end-of-tile programs);
- *  - native1109: single-sample RG32 target pairs and partial RGBA8 tile
- *    stores, and a single non-zero layer of a multisample D32 array;
- *  - native1121: 2x/4x alpha-to-coverage and sample-shaded framebuffer-fetch
- *    draws and their tile and sample-mask forms;
- *  - native1128: 2x/4x per-sample discard (separate sample-mask kill and
- *    update words);
- *  - native1130 / native_mixed: single-sample mixed-format tiles laid out in
- *    attachment-index order with per-format tile stores.
- */
-static inline bool agx_g18_msaa4_enabled(void) { return true; }
-static inline bool agx_g18_native1109_enabled(void) { return true; }
-static inline bool agx_g18_native1121_enabled(void) { return true; }
-static inline bool agx_g18_native1128_enabled(void) { return true; }
-static inline bool agx_g18_native1130_enabled(void) { return true; }
-static inline bool agx_g18_native_mixed_enabled(void) { return true; }
-
 /* Fragment-structure code generation choices that remain selectable. */
 enum agx_fs_structure_flag {
    /* Compile the colour epilog into the fragment shader at link time, as

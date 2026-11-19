@@ -5112,7 +5112,7 @@ agx_update_fs(struct agx_batch *batch)
     * Keep preservation when any part can update coverage, depth, stencil,
     * memory or another colour attachment. Such programs are not no-ops.
     */
-   if (dev->chip == AGX_CHIP_G18G && agx_g18_native_mixed_enabled() &&
+   if (dev->chip == AGX_CHIP_G18G &&
        !(ctx->blend->store &
          (PIPE_CLEAR_COLOR0 * BITFIELD_MASK(batch->key.nr_cbufs))) &&
        ctx->fs->b.info.tag_write_disable &&
