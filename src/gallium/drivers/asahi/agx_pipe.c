@@ -10,7 +10,6 @@
 #include <xf86drm.h>
 #include <linux/dma-buf.h>
 #include "asahi/compiler/agx_compile.h"
-#include "asahi/compiler/agx_debug.h"
 #include "asahi/layout/layout.h"
 #include "asahi/genxml/agx3_cmdstream.h"
 #include "asahi/lib/agx_g17p_compression.h"
@@ -2873,10 +2872,7 @@ agx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
    if (sample_count > 1 && sample_count != 4 && sample_count != 2)
       return false;
 
-   if (sample_count > 1 &&
-       ((agx_device(pscreen)->chip == AGX_CHIP_G18G &&
-         !agx_g18_msaa4_enabled()) ||
-        (agx_device(pscreen)->debug & AGX_DBG_NOMSAA)))
+   if (sample_count > 1 && (agx_device(pscreen)->debug & AGX_DBG_NOMSAA))
       return false;
 
    if (MAX2(sample_count, 1) != MAX2(storage_sample_count, 1))

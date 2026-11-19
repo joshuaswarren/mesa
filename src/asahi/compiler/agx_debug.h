@@ -41,34 +41,28 @@ uint64_t agx_get_compiler_debug(void);
  * ("" when it succeeded), for the driver's "cannot encode" error. */
 const char *agx_last_compile_refusal(void);
 
-/* G18 multisample admission/code generation remains explicitly selectable. */
-bool agx_g18_msaa4_enabled(void);
-
-/* Native-1094 grounded G18 encodings (run 1109); AGX_G18_NATIVE1109=0 opts out. */
-bool agx_g18_native1109_enabled(void);
-
-/* Native-1094 grounded G18 changes of run 1121; AGX_G18_NATIVE1121=0 opts out. */
-bool agx_g18_native1121_enabled(void);
-
-/* Native-1121 grounded G18 changes of run 1128; AGX_G18_NATIVE1128=0 opts out. */
-bool agx_g18_native1128_enabled(void);
-
-/* Native-1121 grounded G18 mixed-format tile path of run 1130;
- * AGX_G18_NATIVE1130=0 opts out. */
-bool agx_g18_native1130_enabled(void);
-
-/* Native-1130 grounded general G18 single-sample mixed-format tile path of
- * run 1139 (index-order layout, partial masks, blend reads, zero masks);
- * AGX_G18_NATIVE1139=0 restores the run-1134 behaviour for A/B. */
-bool agx_g18_native1139_enabled(void);
-
-/* The run-1139 path builds on run 1130's: AGX_G18_NATIVE1130=0 restores the
- * run-1128 behaviour whatever AGX_G18_NATIVE1139 says. */
-static inline bool
-agx_g18_native_mixed_enabled(void)
-{
-   return agx_g18_native1130_enabled() && agx_g18_native1139_enabled();
-}
+/* The G18G paths below used to be environment-selectable for A/B bring-up
+ * and are now unconditional on G18G. Only agx3_pack_binary.c still calls
+ * these; fold them into its call sites and delete them. Each one names the
+ * path it gated:
+ *
+ *  - msaa4: G18G 2x/4x multisampling (tile layouts, sample-mask and tile
+ *    lowering, epilogs, background/end-of-tile programs);
+ *  - native1109: single-sample RG32 target pairs and partial RGBA8 tile
+ *    stores, and a single non-zero layer of a multisample D32 array;
+ *  - native1121: 2x/4x alpha-to-coverage and sample-shaded framebuffer-fetch
+ *    draws and their tile and sample-mask forms;
+ *  - native1128: 2x/4x per-sample discard (separate sample-mask kill and
+ *    update words);
+ *  - native1130 / native_mixed: single-sample mixed-format tiles laid out in
+ *    attachment-index order with per-format tile stores.
+ */
+static inline bool agx_g18_msaa4_enabled(void) { return true; }
+static inline bool agx_g18_native1109_enabled(void) { return true; }
+static inline bool agx_g18_native1121_enabled(void) { return true; }
+static inline bool agx_g18_native1128_enabled(void) { return true; }
+static inline bool agx_g18_native1130_enabled(void) { return true; }
+static inline bool agx_g18_native_mixed_enabled(void) { return true; }
 
 /* Fragment-structure code generation choices that remain selectable. */
 enum agx_fs_structure_flag {

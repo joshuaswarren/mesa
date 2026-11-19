@@ -8,7 +8,6 @@
 #include "util/simple_mtx.h"
 #include "util/u_debug.h"
 #include "agx_compile.h"
-#include "agx_debug.h"
 #include "agx3_code_container_core.h"
 #include "agx3_tile_core.h"
 #include "agx_device.h"
@@ -25,7 +24,7 @@
 #include <inttypes.h>
 #include <stdlib.h>
 
-/* msaa163 (AGX_G18_MSAA4, default off): a G18G four-sample tile. Its
+/* msaa163: a G18G two- or four-sample tile. Its
  * background stores through the SR39 register mask and its end-of-tile program
  * resolves through the ordinary 2D store (MSAA notes P4/P5). */
 static bool
@@ -33,8 +32,7 @@ agx_g18_msaa4_tib(const struct agx_device *dev,
                   const struct agx_tilebuffer_layout *tib)
 {
    return dev->chip == AGX_CHIP_G18G &&
-          (tib->nr_samples == 2 || tib->nr_samples == 4) &&
-          agx_g18_msaa4_enabled();
+          (tib->nr_samples == 2 || tib->nr_samples == 4);
 }
 
 static bool
@@ -414,7 +412,7 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
          !agx_g18_msaa4_tib(cache->dev, &key->tib),
       .fs.background = true,
       /* Native multisample backgrounds store through the coverage register,
-       * and so do G18G four-sample ones under AGX_G18_MSAA4 (msaa163). */
+       * and so do G18G four-sample ones (msaa163). */
       .fs.nr_samples =
          agx_chip_native_agx3(cache->dev->chip) ||
                agx_chip_g17_m5(cache->dev->chip) ||
@@ -541,8 +539,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
                               ? agx_g18g_word_mrt_mask(&key->tib) |
                                    agx_g18g_raw32_mrt_mask(&key->tib) |
                                    agx_g18g_ms_mrt_mask(&key->tib) |
-                                   agx_g18g_mixed_mrt_mask(&key->tib) |
-                                   agx_g18g_mixed_compact_mrt_mask(&key->tib)
+                                   agx_g18g_native_mixed_mask(&key->tib)
                                  : 0;
    /* msaa163: G18G's four-sample tile is resolved at end of tile into the
     * single-sample PBE target, the shape Apple's G18 4x render uses: its

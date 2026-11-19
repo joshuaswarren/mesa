@@ -4,7 +4,6 @@
 
 libasahi_agx_files = files(
   'agx_compile.c',
-  'agx_g18_gates.c',
   'agx_nir_lower_cmat.c',
   'agx_dce.c',
   'agx_liveness.c',
@@ -603,7 +602,6 @@ if with_tests
         '../lib/agx_ioto_state_core.c',
         '../lib/agx_ioto_preshader_core.c',
         '../lib/agx_ioto_program_core.c',
-        'agx_g18_gates.c',
         'test/test-agx3-graphics-program.c',
       ),
       c_args : [c_msvc_compat_args, no_override_init_args],

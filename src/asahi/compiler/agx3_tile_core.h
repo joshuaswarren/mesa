@@ -88,7 +88,7 @@ struct agx3_tile_sample {
     * Apple's G18G 4x per-pixel fragment (and its G17G twin, byte-identical
     * here) stores `rld h10 <- SR39 ; lstcol ... f44=10 f51=2 f55=1`:
     * 270605082901ad02000071440000, native-msaa-reference-147. Only the
-    * AGX_G18_MSAA4 packer sets it; loads never take it. */
+    * G18G multisample packer sets it; loads never take it. */
    bool g17_register;
 };
 

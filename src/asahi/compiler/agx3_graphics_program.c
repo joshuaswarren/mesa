@@ -9,7 +9,6 @@
 #include "agx3_copy_core.h"
 #include "agx3_ioto_load_packer.h"
 #include "agx3_pixel_core.h"
-#include "agx_debug.h"
 #include "asahi/lib/agx_ioto_preshader_core.h"
 #include "asahi/lib/agx_ioto_state_core.h"
 #include "util/macros.h"
@@ -887,8 +886,7 @@ g18g_graphics_program_generate(
         *
         * msaa163: plus exactly one multisample imageblock, eight-byte samples
         * at 4x in a 32x16 tile -- what Apple's M5 and G18 4x renders select
-        * for one RGBA8 target (MSAA notes s2.4). The caller admits it only
-        * under AGX_G18_MSAA4. */
+        * for one RGBA8 target (MSAA notes s2.4). */
        (desc->fragment &&
         !((desc->imageblock.sample_size_B == 8 ||
            (target_chip == AGX_CHIP_G18G &&
@@ -907,18 +905,14 @@ g18g_graphics_program_generate(
            /* Native1121 (run 1130): the mixed-format req2-clear layout's
             * fragment, background and end-of-tile SPECLM records carry a
             * 40-byte sample in the same 32x32 single-sample spelling
-            * (f19 = f20 = 5, f22 = 40, f25 = 1). */
+            * (f19 = f20 = 5, f22 = 40, f25 = 1). Native1130 (run 1139): the
+            * mixed-format workloads spell 56-byte samples the same way
+            * (f22 = 56; capture 1121 also 72). The layout admits a sample
+            * only where the kernel admits its tile. */
            !(target_chip == AGX_CHIP_G18G &&
-             desc->imageblock.sample_size_B == 40 &&
-             agx_g18_native1130_enabled()) &&
-           /* Native1130 (run 1139): the fragment, background and
-            * end-of-tile SPECLM of the mixed-format workloads spell 56-byte
-            * samples the same way (f22 = 56; capture 1121 also 72). The
-            * layout admits a sample only where the kernel admits its tile. */
-           !(target_chip == AGX_CHIP_G18G &&
-             (desc->imageblock.sample_size_B == 56 ||
-              desc->imageblock.sample_size_B == 72) &&
-             agx_g18_native_mixed_enabled()) &&
+             (desc->imageblock.sample_size_B == 40 ||
+              desc->imageblock.sample_size_B == 56 ||
+              desc->imageblock.sample_size_B == 72)) &&
            !(target_chip == AGX_CHIP_G18G &&
              desc->imageblock.sample_size_B >= 48 &&
              desc->imageblock.sample_size_B <= 128 &&
