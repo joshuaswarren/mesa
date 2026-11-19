@@ -1,5 +1,4 @@
 #include "agx3_rt_gen1_default.h"
-#include "agx3_rt_gen1_entry.h"
 #include "agx3_binder.h"
 #include "agx3_pack.h"
 #include <string.h>
@@ -72,24 +71,6 @@ agx3_rt_gen1_default_constants(uint8_t out[AGX3_RT_GEN1_DEFAULT_CONSTANTS_SIZE])
 {
    const uint32_t words[4] = {0x0fe00200, 0x00000fff, 0, 0x40000000};
    memcpy(out, words, sizeof(words));
-}
-bool
-agx3_rt_gen1_default_entry_generate(uint64_t slot_body_va, uint8_t out[512], size_t *length)
-{
-   static const struct agx3_rt_gen1_uniform uniforms[] = {
-      {0, 20}, {2, 22}, {12, 32}, {14, 34}, {4, 24}, {6, 26}, {8, 28}, {10, 30},
-   };
-   const struct agx3_rt_gen1_entry_desc desc = {
-      .constants_va = slot_body_va + 0x10000,
-      .shader_va = slot_body_va + 64,
-      .branch_va = slot_body_va,
-      .uniforms = uniforms,
-      .constant_dwords = 6,
-      .fetch_span = 3,
-      .uniform_count = sizeof(uniforms) / sizeof(uniforms[0]),
-      .context48 = false,
-   };
-   return agx3_rt_gen1_entry_generate(&desc, out, length);
 }
 bool
 agx3_rt_gen1_runtime_code_map(uint64_t rows[AGX3_RT_GEN1_RUNTIME_MAP_ROWS][3])
