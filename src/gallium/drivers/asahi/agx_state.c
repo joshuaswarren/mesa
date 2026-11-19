@@ -843,8 +843,6 @@ agx_m5_dispatch_barrier_flags(const struct agx_device *dev)
    return dev->chip == AGX_CHIP_G18G ? 0 : 5;
 }
 
-DEBUG_GET_ONCE_BOOL_OPTION(m5_gpu_tess, "ASAHI_M5_GPU_TESS", false)
-
 /* Can the CPU path (agx_swtnl.c) tessellate? The draw module tessellates only
  * through LLVM. */
 static bool
@@ -860,7 +858,7 @@ agx_swtnl_can_tessellate(void)
  * cannot: in a build without LLVM the draw module drops every patch. With
  * LLVM the CPU path is the qualified one. The GPU path still loses some
  * shapes, among them tessellation feeding a geometry shader, which M5 does
- * not rasterize natively yet. ASAHI_M5_GPU_TESS=1 forces the GPU path.
+ * not rasterize natively yet.
  */
 bool
 agx_m5_gpu_tess(struct agx_context *ctx)
@@ -868,7 +866,7 @@ agx_m5_gpu_tess(struct agx_context *ctx)
    if (!agx_chip_g17_m5(agx_device(ctx->base.screen)->chip))
       return false;
 
-   return debug_get_option_m5_gpu_tess() || !agx_swtnl_can_tessellate();
+   return !agx_swtnl_can_tessellate();
 }
 
 /* Room for a program's agx3d re-encoding: twice the G17G bound, which covers
