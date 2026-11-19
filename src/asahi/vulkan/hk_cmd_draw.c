@@ -124,21 +124,6 @@ static uint64_t hk_heap(struct hk_cmd_buffer *cmd);
 static bool hk_cmd_ensure_geometry_heap(struct hk_cmd_buffer *cmd);
 static enum mesa_prim hk_gs_in_prim(struct hk_cmd_buffer *cmd);
 
-static enum libagx_program
-hk_sw_tess_program(enum tess_primitive_mode prim, enum poly_tess_mode mode)
-{
-   switch (prim) {
-   case TESS_PRIMITIVE_QUADS:
-      return LIBAGX_TESS_QUAD(mode);
-   case TESS_PRIMITIVE_TRIANGLES:
-      return LIBAGX_TESS_TRI(mode);
-   case TESS_PRIMITIVE_ISOLINES:
-      return LIBAGX_TESS_ISOLINE(mode);
-   default:
-      return LIBAGX_NUM_PROGRAMS;
-   }
-}
-
 static uint64_t hk_upload_geometry_params(struct hk_cmd_buffer *cmd,
                                           struct agx_draw draw);
 static void hk_init_tess_params(struct hk_cmd_buffer *cmd,

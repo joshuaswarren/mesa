@@ -130,32 +130,6 @@ bool hk_agx3_g17g_basic_graphics_program_generate(
    enum agx_chip chip, const struct hk_agx3_g17p_graphics_program_desc *desc,
    struct hk_agx3_g17p_graphics_program *program);
 
-bool hk_agx3_g17p_graphics_root_prefix_generate(
-   enum agx_chip chip, uint64_t root_va,
-   struct agx3_g17p_graphics_root_prefix *prefix);
-
-bool hk_agx3_g17p_graphics_external_setup_suffix_generate(
-   enum agx_chip chip,
-   const struct hk_agx3_g17p_graphics_program_desc *desc, void *output,
-   size_t capacity, size_t *written);
-
-bool hk_agx3_g17p_graphics_external_launcher_generate(
-   enum agx_chip chip,
-   const struct hk_agx3_g17p_graphics_program_desc *desc,
-   uint64_t program_va, uint64_t root_va, uint64_t setup_va, void *output,
-   size_t capacity, size_t *written);
-
-bool hk_agx3_g17p_graphics_external_launcher_template_generate(
-   enum agx_chip chip,
-   const struct hk_agx3_g17p_graphics_program_desc *desc, uint64_t setup_va,
-   struct agx3_g17p_graphics_external_launcher_template *launcher);
-
-bool hk_agx3_g17p_graphics_external_launcher_template_relocate(
-   enum agx_chip chip,
-   const struct agx3_g17p_graphics_external_launcher_template *launcher,
-   uint64_t program_va, uint64_t root_va, uint64_t setup_va, void *output,
-   size_t capacity, size_t *written);
-
 bool hk_agx3_g17p_graphics_program_template_generate(
    enum agx_chip chip,
    const struct hk_agx3_g17p_graphics_program_desc *desc,
