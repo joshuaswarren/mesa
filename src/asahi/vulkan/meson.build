@@ -43,6 +43,8 @@ hk_files = files(
   'hk_device_memory.h',
   'hk_memory_budget.c',
   'hk_memory_budget.h',
+  'hk_host_alias.c',
+  'hk_host_alias.h',
   'hk_event.c',
   'hk_event.h',
   'hk_format.c',
@@ -152,6 +154,10 @@ if with_tests
 
   test('hk_memory_budget', executable('hk_memory_budget_test',
     files('tests/test-hk-memory-budget.c', 'hk_memory_budget.c'),
+    include_directories : include_directories('.')),
+    suite : ['asahi'])
+  test('hk_host_alias', executable('hk_host_alias_test',
+    files('tests/test-hk-host-alias.c', 'hk_host_alias.c'),
     include_directories : include_directories('.')),
     suite : ['asahi'])
   test(
