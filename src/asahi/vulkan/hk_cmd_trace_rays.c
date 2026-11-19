@@ -165,6 +165,7 @@ hk_trace_rays_single_kick(struct hk_cmd_buffer *cmd,
    }
    cs->current = (uint32_t *)(out + AGX3_CDM_BARRIER_SIZE +
                               AGX3_CDM_STREAM_LINK_SIZE);
+   cs->calls_stream = true;
    cs->stats.cmds++;
    return true;
 }

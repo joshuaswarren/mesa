@@ -2952,6 +2952,7 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
          return;
    }
    hk_dispatch_with_local_size(cmd, cs, s, grid, local_size);
+   cs->uses_global_atomics |= s->b.info.uses_global_atomics;
    if (agx_is_indirect(grid)) {
       cs->sib_indirect = true;
    } else {
@@ -2959,6 +2960,19 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
          (uint64_t)grid.count[0] * grid.count[1] * grid.count[2];
       cs->sib_threads = threads > UINT64_MAX - cs->sib_threads
                            ? UINT64_MAX : cs->sib_threads + threads;
+
+      /* What submit packing bounds a packet with (hk_pack_runs()). Static
+       * instruction counts do not bound loops or memory waits; they only
+       * keep packets of large programs short. */
+      uint64_t work;
+      if (__builtin_mul_overflow(threads, (uint64_t)s->b.info.stats.instrs,
+                                 &work))
+         work = UINT64_MAX;
+      cs->pack_threads = threads > UINT64_MAX - cs->pack_threads
+                            ? UINT64_MAX : cs->pack_threads + threads;
+      cs->pack_static_work = work > UINT64_MAX - cs->pack_static_work
+                                ? UINT64_MAX : cs->pack_static_work + work;
+      cs->pack_dispatches++;
    }
    if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
       hk_frame_anatomy_note_fs(cs, s);

@@ -3319,6 +3319,7 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
 
    case nir_intrinsic_global_atomic_agx:
    case nir_intrinsic_global_atomic_swap_agx:
+      b->shader->out->uses_global_atomics = true;
       agx_emit_atomic(b, dst, instr, false);
       return NULL;
 

@@ -179,6 +179,10 @@ struct agx_shader_info {
     * The main shader is at offset main_offset. The preamble is executed first.
     */
    bool has_preamble;
+   /* The program performs an atomic on global memory (buffer, image or
+    * device-address atomics). Submit packing keeps such programs apart where
+    * another kernel queue could run beside them (hk_queue.c). */
+   bool uses_global_atomics;
    /* Native constant-program live-ins. External G17P launch needs the
     * uniform-input prelude when a uniform half is read before definition. */
    bool agx3_preamble_uniform_inputs;
