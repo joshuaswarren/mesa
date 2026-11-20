@@ -1,31 +1,47 @@
 name: macOS-CI
-on: push
+# This ran `on: push` on the macos-11 label GitHub retired in 2024-06:
+# every push queued both matrix legs for a runner that can never exist
+# and GitHub auto-cancelled each run at 24h (~8,640 runner-min in 30
+# days, all wasted). Manual dispatch only now; the label is moved to
+# macos-15-intel (the brew paths below are Intel /usr/local) and the
+# job is bounded at 120 min.
+on: workflow_dispatch
 
 permissions:
   contents: read
+
+concurrency:
+  # ref_type in the group: a tag dispatch would otherwise cancel an
+  # in-progress branch build before the job-level ref gate skips it.
+  group: macos-ci-${{ github.ref_type }}
+  cancel-in-progress: true
 
 jobs:
   macOS-CI:
     strategy:
       matrix:
         glx_option: ['dri', 'xlib']
-    runs-on: macos-11
-    env:
-      GALLIUM_DUMP_CPU: true
-      MESON_EXEC: /Users/runner/Library/Python/3.11/bin/meson
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    # workflow_dispatch lets you pick a tag; a skipped job never takes a
+    # runner (a gate step would already be running on one).
+    if: github.ref_type == 'branch'
     steps:
     - name: Checkout
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     - name: Install Dependencies
       run: |
         cat > Brewfile <<EOL
         brew "bison"
         brew "expat"
+        brew "flex"
         brew "gettext"
         brew "libx11"
         brew "libxcb"
         brew "libxdamage"
         brew "libxext"
+        brew "libxrandr"
+        brew "libxshmfence"
         brew "molten-vk"
         brew "ninja"
         brew "pkg-config"
@@ -33,16 +49,33 @@ jobs:
         EOL
 
         brew update
-        brew bundle --verbose
+        # llvm is intentionally absent: Homebrew builds no x86_64 macOS bottles for any
+        # llvm formula, so on macos-15-intel it compiles for hours past the 120-minute
+        # job limit (run 44669319600 died inside its dependency chain). softpipe+zink
+        # need no LLVM; llvmpipe stays off via -Dllvm=disabled below.
+        brew bundle --verbose --no-upgrade
     - name: Install Mako and meson
-      run: pip3 install --user mako meson
+      # The Brewfile python@3.10 (and the image default python3) is
+      # externally-managed: pip --user trips PEP 668 on macos-15-intel. A venv
+      # under the pinned brew python carries mako + meson with no flag games.
+      run: |
+        "$(brew --prefix python@3.10)/bin/python3.10" -m venv "$RUNNER_TEMP/ci-venv"
+        # packaging + pyyaml satisfy meson.build's prog_python module checks; the
+        # venv goes on PATH so the probe hits 3.10 (which also still has distutils)
+        # instead of the image's newer python3 that lacks both.
+        "$RUNNER_TEMP/ci-venv/bin/pip" install mako meson packaging pyyaml
+        echo "$RUNNER_TEMP/ci-venv/bin" >> "$GITHUB_PATH"
+        # bison and flex are keg-only (macOS ships ancient bison 2.x at
+        # /usr/bin/bison, which cannot parse glcpp-parse.y) — their prefix
+        # bins must come first or ninja picks the system tools.
+        echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+        echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+        MESON_EXEC="$RUNNER_TEMP/ci-venv/bin/meson"
+        echo "MESON_EXEC=$MESON_EXEC" >> "$GITHUB_ENV"
+        "$MESON_EXEC" --version
     - name: Configure
       run: |
-        cat > native_config <<EOL
-        [binaries]
-        llvm-config = '/usr/local/opt/llvm/bin/llvm-config'
-        EOL
-        $MESON_EXEC . build --native-file=native_config -Dmoltenvk-dir=$(brew --prefix molten-vk) -Dbuild-tests=true -Dgallium-drivers=swrast,zink -Dglx=${{ matrix.glx_option }}
+        "$MESON_EXEC" . build -Dmoltenvk-dir=$(brew --prefix molten-vk) -Dbuild-tests=true -Dllvm=disabled -Dgallium-drivers=softpipe,zink -Dglx=${{ matrix.glx_option }}
     - name: Build
       run: $MESON_EXEC compile -C build
     - name: Test
@@ -51,7 +84,7 @@ jobs:
       run: $MESON_EXEC install -C build --destdir $PWD/install
     - name: 'Upload Artifact'
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: macos-${{ matrix.glx_option }}-result
         path: |
