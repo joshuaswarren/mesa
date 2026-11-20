@@ -24,6 +24,7 @@
 #include "agx_ppp_hal300_depth_bias_scissor_core.h"
 #include "agx_ppp_hal300_depth_stencil_core.h"
 #include "agx_ppp_viewport_payload_core.h"
+#include "agx_ppp_w_clamp_cull2_core.h"
 #include "agx_vdm_barrier_core.h"
 #include "agx_vdm_index_list_core.h"
 #include "agx_vdm_ppp_state_core.h"
@@ -189,6 +190,8 @@ static unsigned checks;
        "0000 00000 0000 00111 1 0")                                            \
    ROW(agx_ppp_viewport_payload_core_supported(c),                             \
        "0000 01111 0111 10111 1 0")                                            \
+   ROW(viewport_payload_generation(c), "0000 06666 0666 60777 7 0")            \
+   ROW(w_clamp_cull2_generation(c), "0000 06666 0666 60777 7 0")               \
    /* Per-record allowlists: CDM. */                                           \
    ROW(agx3_cdm_launch_target_grounded(c), "0000 01111 0111 10111 1 0")        \
    ROW(agx3_cdm_direct_launch_target_grounded(c), "0000 01111 0111 10111 1 0") \
@@ -216,6 +219,7 @@ static unsigned checks;
    ROW(agx3_native_indirect_compute_dispatch_size(c) / 4,                      \
        "iiii ijjji iiii iiiii i i")                                            \
    /* Per-record allowlists: Ioto. */                                          \
+   ROW(agx_chip_ioto_generation(c), "0000 01111 0111 10222 0 0")               \
    ROW(agx_ioto_target_supported(c), "0000 01111 0111 10111 0 0")              \
    ROW(agx_ioto_load_target_encoding(c), "0000 01111 0111 10222 0 0")          \
    ROW(agx_ioto_profile_control_supported(c), "0000 01111 0111 10111 0 0")     \
@@ -282,6 +286,40 @@ shader_binary_version_class(enum agx_chip chip)
    default:
       return 9;
    }
+}
+
+/* The PPP encoder generation a payload codec packs for a chip: 6 or 7, or 0
+ * when it refuses the chip. */
+static unsigned
+viewport_payload_generation(enum agx_chip chip)
+{
+   const struct agx_ppp_viewport_payload_fields fields = {.viewport_count = 1};
+   struct agx_ppp_viewport_payload_core out;
+   uint32_t header;
+
+   if (!agx_ppp_viewport_payload_core_pack(chip, &fields, &out))
+      return 0;
+
+   memcpy(&header, out.bytes, sizeof(header));
+   return header == AGX_PPP_VIEWPORT_PAYLOAD_GEN6_BASE_HEADER   ? 6
+          : header == AGX_PPP_VIEWPORT_PAYLOAD_GEN7_BASE_HEADER ? 7
+                                                                : 9;
+}
+
+static unsigned
+w_clamp_cull2_generation(enum agx_chip chip)
+{
+   const struct agx_ppp_w_clamp_cull2_fields fields = {0};
+   struct agx_ppp_w_clamp_cull2_core out;
+   uint32_t header;
+
+   if (!agx_ppp_w_clamp_cull2_core_pack(chip, &fields, &out))
+      return 0;
+
+   memcpy(&header, out.bytes, sizeof(header));
+   return header == AGX_PPP_W_CLAMP_CULL2_GEN6_HEADER   ? 6
+          : header == AGX_PPP_W_CLAMP_CULL2_GEN7_HEADER ? 7
+                                                        : 9;
 }
 
 static const char *const chip_names[AGX_CHIP_UNKNOWN + 1] = {

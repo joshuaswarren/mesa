@@ -116,6 +116,15 @@ enum agx_sampler_generation {
    AGX_SAMPLER_GENERATION_UNKNOWN,
 };
 
+/* The encoding of Ioto programs and their load, state, preshader and profile
+ * records. It follows the instruction set: GPU0 for the AGX3b parts whose
+ * programs are witnessed, GPU1 for the M5 parts. NONE refuses them. */
+enum agx_ioto_generation {
+   AGX_IOTO_GENERATION_NONE,
+   AGX_IOTO_GENERATION_GPU0,
+   AGX_IOTO_GENERATION_GPU1,
+};
+
 /* M4 Pro/Max and A18 Pro carry both queueing paths; M5 and M6 are
  * SKSM-only. */
 enum agx_submission_model {
@@ -165,6 +174,8 @@ enum agx_chip_record {
    AGX_RECORD_IOTO_PROFILE_CONTROL = 1 << 19,
    /* agx_chip_hal300_records */
    AGX_RECORD_HAL300_NATIVE_CAPTURE = 1 << 20,
+   AGX_RECORD_PPP_VIEWPORT = 1 << 21,
+   AGX_RECORD_PPP_W_CLAMP_CULL2 = 1 << 22,
 };
 
 /* The records of every byte-witnessed G15, G16 and G17 identity. */
@@ -172,6 +183,7 @@ enum agx_chip_record {
    (AGX_RECORD_VDM_STATE | AGX_RECORD_VDM_PPP_STATE | AGX_RECORD_VDM_BARRIER | \
     AGX_RECORD_VDM_STREAM_LINK | AGX_RECORD_VDM_STREAM_TERMINATE |             \
     AGX_RECORD_VDM_TESSELLATE | AGX_RECORD_VDM_INDEX_LIST |                    \
+    AGX_RECORD_PPP_VIEWPORT | AGX_RECORD_PPP_W_CLAMP_CULL2 |                   \
     AGX_RECORD_CDM_LAUNCH | AGX_RECORD_CDM_INDIRECT_LAUNCH |                   \
     AGX_RECORD_CDM_INDIRECT_LAUNCH_36 | AGX_RECORD_CDM_STREAM_LINK |           \
     AGX_RECORD_CDM_LINK_PADDING | AGX_RECORD_CDM_BARRIER |                     \
@@ -189,7 +201,8 @@ enum agx_chip_record {
  * before this table (see each codec). */
 #define AGX_RECORDS_G18G                                                       \
    (AGX_RECORD_VDM_STATE | AGX_RECORD_VDM_PPP_STATE | AGX_RECORD_VDM_BARRIER | \
-    AGX_RECORD_VDM_STREAM_TERMINATE | AGX_RECORD_PPP_HAL300_DEPTH_STENCIL |    \
+    AGX_RECORD_VDM_STREAM_TERMINATE | AGX_RECORD_PPP_VIEWPORT |                \
+    AGX_RECORD_PPP_W_CLAMP_CULL2 | AGX_RECORD_PPP_HAL300_DEPTH_STENCIL |       \
     AGX_RECORD_PPP_HAL300_DEPTH_BIAS_SCISSOR | AGX_RECORD_CDM_LAUNCH |         \
     AGX_RECORD_CDM_INDIRECT_LAUNCH | AGX_RECORD_CDM_INDIRECT_LAUNCH_36 |       \
     AGX_RECORD_CDM_BARRIER | AGX_RECORD_HAL300_NATIVE_CAPTURE)
@@ -234,8 +247,8 @@ enum agx_chip_quirk {
  * cannot disagree, and every predicate below reads a field of the row.
  *
  * Columns: chip, instruction set, binary encoding, command-stream generation,
- * descriptor generation, sampler generation, submission model, path,
- * witnessed records, quirks.
+ * descriptor generation, sampler generation, Ioto generation, submission
+ * model, path, witnessed records, quirks.
  *
  * AGX2: `G` is a single-cluster part, `X` is multi-cluster.
  *
@@ -277,47 +290,47 @@ enum agx_chip_quirk {
  * submission model is unknown.
  */
 #define AGX_CHIPS(X, ...)                                                      \
-   X(G13G, AGX2, AGX2, AGX2, 7, GEN4, CLASSIC, AGX2, 0, 0, __VA_ARGS__)        \
-   X(G13X, AGX2, AGX2, AGX2, 7, GEN4, CLASSIC, AGX2, 0, 0, __VA_ARGS__)        \
-   X(G14G, AGX2, AGX2, AGX2, 8, GEN4, CLASSIC, AGX2, 0, 0, __VA_ARGS__)        \
-   X(G14X, AGX2, AGX2, AGX2, 8, GEN4, CLASSIC, AGX2, 0, 0, __VA_ARGS__)        \
-   X(G15P, AGX2, AGX2, UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN, NONE, 0, 0,         \
+   X(G13G, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
+   X(G13X, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
+   X(G14G, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
+   X(G14X, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
+   X(G15P, AGX2, AGX2, UNKNOWN, UNKNOWN, UNKNOWN, NONE, UNKNOWN, NONE, 0, 0,   \
      __VA_ARGS__)                                                              \
-   X(G15G, AGX3, AGX3B, G15, 9, GEN4, CLASSIC, NATIVE_AGX3,                    \
+   X(G15G, AGX3, AGX3B, G15, 9, GEN4, GPU0, CLASSIC, NATIVE_AGX3,              \
      AGX_RECORDS_G15_G17 | AGX_RECORD_CDM_BARRIER_WIDE_VISIBILITY,             \
      AGX_QUIRKS_NATIVE_PRE_G17 | AGX_QUIRK_SCHEDULING_STALLS, __VA_ARGS__)     \
-   X(G15S, AGX3, AGX3B, G15, 9, GEN4, CLASSIC, NATIVE_AGX3,                    \
+   X(G15S, AGX3, AGX3B, G15, 9, GEN4, GPU0, CLASSIC, NATIVE_AGX3,              \
      AGX_RECORDS_G15_G17 | AGX_RECORD_CDM_BARRIER_WIDE_VISIBILITY,             \
      AGX_QUIRKS_NATIVE_PRE_G17, __VA_ARGS__)                                   \
-   X(G15C, AGX3, AGX3B, G15, 9, GEN4, CLASSIC, NATIVE_AGX3,                    \
+   X(G15C, AGX3, AGX3B, G15, 9, GEN4, GPU0, CLASSIC, NATIVE_AGX3,              \
      AGX_RECORDS_G15_G17 | AGX_RECORD_CDM_BARRIER_WIDE_VISIBILITY,             \
      AGX_QUIRKS_NATIVE_PRE_G17 | AGX_QUIRK_USC_BASE_PAGE_FILL_RETURNS,         \
      __VA_ARGS__)                                                              \
-   X(G15D, AGX3, AGX3B, G15, 9, GEN4, CLASSIC, NONE, AGX_RECORDS_G15_G17, 0,   \
+   X(G15D, AGX3, AGX3B, G15, 9, GEN4, GPU0, CLASSIC, NONE,                     \
+     AGX_RECORDS_G15_G17, 0, __VA_ARGS__)                                      \
+   X(G16P, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, NONE, UNKNOWN, NONE, 0, 0,     \
      __VA_ARGS__)                                                              \
-   X(G16P, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, UNKNOWN, NONE, 0, 0,           \
-     __VA_ARGS__)                                                              \
-   X(G16G, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, CLASSIC, NATIVE_AGX3,          \
+   X(G16G, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, CLASSIC, NATIVE_AGX3,    \
      AGX_RECORDS_G15_G17 | AGX_RECORD_CDM_BARRIER_WIDE_VISIBILITY,             \
      AGX_QUIRKS_NATIVE_PRE_G17, __VA_ARGS__)                                   \
-   X(G16S, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, DUAL, NONE,                    \
+   X(G16S, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, DUAL, NONE,              \
      AGX_RECORDS_G15_G17, 0, __VA_ARGS__)                                      \
-   X(G16C, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, DUAL, NONE,                    \
+   X(G16C, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, DUAL, NONE,              \
      AGX_RECORDS_G15_G17, 0, __VA_ARGS__)                                      \
-   X(G17P, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, DUAL, NATIVE_AGX3,             \
+   X(G17P, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, DUAL, NATIVE_AGX3,       \
      AGX_RECORDS_G15_G17 | AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY,                \
      AGX_QUIRKS_G17P, __VA_ARGS__)                                             \
-   X(G17A, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, UNKNOWN, NONE, 0, 0,           \
+   X(G17A, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, NONE, UNKNOWN, NONE, 0, 0,     \
      __VA_ARGS__)                                                              \
-   X(G17G, AGX3, AGX3C, HAL300, 10, GEN5, SKSM, HAL300,                        \
+   X(G17G, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300,                  \
      AGX_RECORDS_M5 | AGX_RECORD_HAL300_NATIVE_CAPTURE, AGX_QUIRK_M5_PATHS,    \
      __VA_ARGS__)                                                              \
-   X(G17S, AGX3, AGX3C, HAL300, 10, GEN5, SKSM, HAL300, AGX_RECORDS_M5, 0,     \
-     __VA_ARGS__)                                                              \
-   X(G17C, AGX3, AGX3C, HAL300, 10, GEN5, SKSM, HAL300, AGX_RECORDS_M5, 0,     \
-     __VA_ARGS__)                                                              \
-   X(G18G, AGX3, AGX3D, HAL300, 10, GEN5, SKSM, HAL300, AGX_RECORDS_G18G,      \
-     AGX_QUIRK_M5_PATHS, __VA_ARGS__)
+   X(G17S, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
+     0, __VA_ARGS__)                                                           \
+   X(G17C, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
+     0, __VA_ARGS__)                                                           \
+   X(G18G, AGX3, AGX3D, HAL300, 10, GEN5, NONE, SKSM, HAL300,                  \
+     AGX_RECORDS_G18G, AGX_QUIRK_M5_PATHS, __VA_ARGS__)
 
 enum agx_chip {
 #define AGX_CHIP_ENUM(chip, ...) AGX_CHIP_##chip,
@@ -334,6 +347,7 @@ struct agx_chip_info {
    enum agx_command_stream_generation cs_generation;
    enum agx_descriptor_generation descriptor_generation;
    enum agx_sampler_generation sampler_generation;
+   enum agx_ioto_generation ioto_generation;
    enum agx_submission_model submission_model;
    enum agx_chip_path path;
    /* Mask of enum agx_chip_record. */
@@ -347,7 +361,7 @@ struct agx_chip_info {
 /* Initialised by position: the C++ translation units that include this
  * header reject array and field designators. */
 static const struct agx_chip_info agx_chip_infos[AGX_CHIP_UNKNOWN + 1] = {
-#define AGX_CHIP_INFO(chip, isa, encoding, cs, descriptor, sampler,            \
+#define AGX_CHIP_INFO(chip, isa, encoding, cs, descriptor, sampler, ioto,      \
                       submission, path, records, quirks, ...)                  \
    {#chip,                                                                     \
     AGX_ISA_##isa,                                                             \
@@ -355,6 +369,7 @@ static const struct agx_chip_info agx_chip_infos[AGX_CHIP_UNKNOWN + 1] = {
     AGX_CS_GENERATION_##cs,                                                    \
     AGX_DESCRIPTOR_GENERATION_##descriptor,                                    \
     AGX_SAMPLER_GENERATION_##sampler,                                          \
+    AGX_IOTO_GENERATION_##ioto,                                                \
     AGX_SUBMISSION_MODEL_##submission,                                         \
     AGX_CHIP_PATH_##path,                                                      \
     records,                                                                   \
@@ -363,8 +378,8 @@ static const struct agx_chip_info agx_chip_infos[AGX_CHIP_UNKNOWN + 1] = {
 #undef AGX_CHIP_INFO
       {"unknown", AGX_ISA_UNKNOWN, AGX_ISA_ENCODING_UNKNOWN,
        AGX_CS_GENERATION_UNKNOWN, AGX_DESCRIPTOR_GENERATION_UNKNOWN,
-       AGX_SAMPLER_GENERATION_UNKNOWN, AGX_SUBMISSION_MODEL_UNKNOWN,
-       AGX_CHIP_PATH_NONE, 0, 0},
+       AGX_SAMPLER_GENERATION_UNKNOWN, AGX_IOTO_GENERATION_NONE,
+       AGX_SUBMISSION_MODEL_UNKNOWN, AGX_CHIP_PATH_NONE, 0, 0},
 };
 
 /* The row of a chip. AGX_CHIP_UNKNOWN and any value outside the enum get the
@@ -391,7 +406,7 @@ agx_chip_info(enum agx_chip chip)
  * AGX_CHIPS(AGX_CHIP_ROW_TEST, chip, TEST, arg) is that expansion for the
  * rows that pass TEST(path, records, arg).
  */
-#define AGX_CHIP_ROW_TEST(row, isa, encoding, cs, descriptor, sampler,         \
+#define AGX_CHIP_ROW_TEST(row, isa, encoding, cs, descriptor, sampler, ioto,   \
                           submission, path, records, quirks, chip, TEST, arg)  \
    | (((chip) == AGX_CHIP_##row) & TEST(AGX_CHIP_PATH_##path, records, arg))
 #define AGX_CHIP_ROW_HAS_RECORD(path, records, record)                         \
@@ -715,6 +730,12 @@ agx_chip_sampler_heap_element_size(enum agx_chip chip)
    default:
       return 0;
    }
+}
+
+static inline enum agx_ioto_generation
+agx_chip_ioto_generation(enum agx_chip chip)
+{
+   return agx_chip_info(chip)->ioto_generation;
 }
 
 static inline enum agx_submission_model
