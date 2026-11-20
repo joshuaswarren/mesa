@@ -792,12 +792,14 @@ agx_chip_g17_m5(enum agx_chip chip)
 
 /*
  * Whether the Gallium driver takes its M5 paths on this chip: draw admission,
- * native descriptors, the VDM/PPP streams and the M5 kernel contract. G18G
- * does: its records and texture/PBE descriptors are byte-identical to M5's
- * on every J873 native capture (agx_chip_hal300_records), its code is G17G
- * code re-encoded (agx_device_key::emit_agx3d), and the chip-specific deltas
- * (the tailed non-indexed Index List, the point-size rule) stay keyed on the
- * chip inside the record packers.
+ * native descriptors, the VDM/PPP streams and the M5 kernel contract. Both
+ * drivers ask it for the G17G-form compute dispatch, and the Vulkan driver
+ * for its G17G-form graphics program. G18G does: its records and texture/PBE
+ * descriptors are byte-identical to M5's on every J873 native capture
+ * (agx_chip_hal300_records), its code is G17G code re-encoded
+ * (agx_device_key::emit_agx3d), and the chip-specific deltas (the tailed
+ * non-indexed Index List, the point-size rule) stay keyed on the chip inside
+ * the record packers.
  *
  * These are the chips of agx_chip_hal300_records() today. That one says which
  * record layouts native captures witness, this one which paths the driver

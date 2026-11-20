@@ -555,7 +555,7 @@ hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
    const uint8_t render_kinds = HK_SYNC_GFX | HK_SYNC_XFER;
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
    if ((src_kinds & render_kinds) && (dst_kinds & HK_SYNC_GFX) &&
-       (agx_chip_g17_m5(chip) || chip == AGX_CHIP_G17P)) {
+       agx_chip_g17p_or_m5(chip)) {
       struct hk_sync_dep vtx = dep[HK_SYNC_VDM];
       vtx.cut = memory_cut(vtx.cut);
       if (vtx.prior & render_kinds)
@@ -987,8 +987,7 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
       cs->sync.kind |= HK_SYNC_GFX_MEM;
    note_last(cmd, cs);
 
-   if ((agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-        agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) &&
+   if (agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
        cmd->sync.pending_start_ts.handle && !cs->timestamp.start.handle &&
        !cs->timestamp.end.handle) {
       cs->timestamp.start = cmd->sync.pending_start_ts;
@@ -1052,8 +1051,7 @@ hk_sync_end_cs_if_timestamped(struct hk_cmd_buffer *cmd)
       return;
 
    const bool g17p_start =
-      (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-       agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) &&
+      agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
       cs->timestamp.start.handle;
    if (cs->timestamp.end.handle || g17p_start) {
       stamp_carrier_launch(cmd);
@@ -1381,8 +1379,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       /* A query reset or earlier dispatch may have left a reusable stream.
        * Consume the start stamp before recording work into it too, rather
        * than resolving it as an end stamp at the next timestamp write. */
-      if (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-          agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+      if (agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
          st->cs_check_pending = true;
       return;
    }

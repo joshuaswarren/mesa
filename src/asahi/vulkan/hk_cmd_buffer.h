@@ -2862,8 +2862,7 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * SPECTPR. There is no helper-program stack, and the kernel rejects a
     * command that names one. */
    if ((s->b.info.scratch_size == 0 && s->b.info.preamble_scratch_size == 0) ||
-       agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-       agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+       agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
       return;
 
    hk_reserve_scratch_slow(cmd, cs, s);
@@ -2875,7 +2874,7 @@ static inline bool
 hk_sync_image_class(const struct hk_cmd_buffer *cmd)
 {
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
-   return chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip);
+   return agx_chip_g17p_or_m5(chip);
 }
 
 /* AGX2 returns its shader-base-relative USC offset.  G17P returns the absolute

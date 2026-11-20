@@ -158,7 +158,7 @@ hk_agx3_g17g_vertex_program_info(
       (compiler_info->layer_viewport_off == 8 ||
        compiler_info->layer_viewport_off == 9) &&
       compiler_info->clip_off == compiler_info->layer_viewport_off;
-   if ((chip != AGX_CHIP_G17G && chip != AGX_CHIP_G18G) || !compiler_info ||
+   if (!agx_chip_hal300_records(chip) || !compiler_info ||
        (chip == AGX_CHIP_G17G &&
         (!color && ((!position && !position_psiz) ||
                     compiler_info->user_size != 0)))) {

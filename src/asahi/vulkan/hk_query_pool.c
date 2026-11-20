@@ -117,8 +117,7 @@ hk_query_command_cs(struct hk_cmd_buffer *cmd)
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    hk_sync_src_dep(cmd, HK_SYNC_ALL, cmd->current_cs.cs, dep);
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
-   if (cs && (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-              agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)))
+   if (cs && agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
       cs->g17p_timestamp_query = true;
    return cs;
 }

@@ -91,7 +91,7 @@ hk_hash_device_generation_contract(blake3_hasher *ctx,
 static bool
 hk_shader_fma_supported(enum agx_chip chip)
 {
-   return (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
+   return agx_chip_g17p_or_m5(chip) &&
           agx_chip_exact_fma32(chip);
 }
 
@@ -427,8 +427,7 @@ hk_get_device_features(
       .storagePushConstant16 = true,
       /* HAL200 interpolation is 32-bit, but the compiler performs matching
        * type-correct widening at ST_VARY and narrowing after interpolation. */
-      .storageInputOutput16 = agx_chip_native_agx3(dev->chip) ||
-                              agx_chip_g17_m5(dev->chip),
+      .storageInputOutput16 = agx_chip_native_or_m5(dev->chip),
       .multiview = true,
       /* ViewIndex is lowered into the layer output of the last
        * pre-rasterization stage and the draw is duplicated per view, so
@@ -1170,7 +1169,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .apiVersion = hk_get_vk_version(),
       .driverVersion = vk_get_driver_version(),
       .vendorID = instance->drirc.debug.force_vk_vendor ?: VK_VENDOR_ID_MESA,
-      .deviceID = (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip))
+      .deviceID = agx_chip_native_or_m5(dev->chip)
                      ? dev->params.chip_id : 0,
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
 
@@ -2267,7 +2266,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    /* Counted by the pre-graphics helpers, which every native chip runs;
     * hardware-qualified on M5 and G17P. */
    supported_extensions.EXT_primitives_generated_query =
-      agx_chip_g17_m5(pdev->dev.chip) || pdev->dev.chip == AGX_CHIP_G17P;
+      agx_chip_g17p_or_m5(pdev->dev.chip);
 
    supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
       (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2);

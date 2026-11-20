@@ -3975,7 +3975,7 @@ enum hk_rt_binary_executable {
 static bool
 hk_rt_binaries_native(const struct hk_device *dev)
 {
-   return dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip);
+   return agx_chip_g17p_or_m5(dev->dev.chip);
 }
 
 static void

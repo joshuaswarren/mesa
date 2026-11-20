@@ -39,21 +39,11 @@ extern "C" {
 static inline uint32_t
 hk_shader_binary_version(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G13G:
-   case AGX_CHIP_G13X:
-   case AGX_CHIP_G14G:
-   case AGX_CHIP_G14X:
-   case AGX_CHIP_G15P:
+   if (agx_chip_isa(chip) == AGX_ISA_AGX2)
       return HK_AGX2_SHADER_BINARY_VERSION;
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
+   if (agx_chip_g17p_or_m5(chip))
       return HK_AGX3_SHADER_BINARY_VERSION;
-   default:
-      return HK_CLASSIC_SHADER_BINARY_VERSION;
-   }
+   return HK_CLASSIC_SHADER_BINARY_VERSION;
 }
 
 /* API outputs include position. Unlinked shaders additionally reserve a

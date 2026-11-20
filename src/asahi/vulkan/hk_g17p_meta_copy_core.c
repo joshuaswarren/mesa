@@ -235,7 +235,7 @@ hk_g17p_compressed_copy_plan(
       memset(plan, 0, sizeof(*plan));
 
    if (!copy || !plan ||
-       (!agx_chip_native_agx3(copy->chip) && !agx_chip_g17_m5(copy->chip)) ||
+       !agx_chip_native_or_m5(copy->chip) ||
        hk_g17p_block_format_family(copy->format) ==
           HK_G17P_BLOCK_FORMAT_NONE ||
        !(image_is_source
@@ -509,8 +509,7 @@ hk_g17p_buffer_to_image_copy_supported(
    const bool one_dimensional =
       copy && copy->image_type == VK_IMAGE_TYPE_1D;
    const bool volume = copy && copy->image_type == VK_IMAGE_TYPE_3D;
-   if (!copy || (!agx_chip_native_agx3(copy->chip) &&
-                 !agx_chip_g17_m5(copy->chip)) ||
+   if (!copy || !agx_chip_native_or_m5(copy->chip) ||
        !hk_g17p_transfer_dst_layout_supported(copy->layout) ||
        (!one_dimensional && copy->image_type != VK_IMAGE_TYPE_2D && !volume) ||
        copy->samples != VK_SAMPLE_COUNT_1_BIT ||
@@ -676,7 +675,7 @@ hk_g17p_image_copy_slice(enum agx_chip chip, VkImageType src_type,
    const bool two_d_three_d = (src_1d_or_2d && dst_3d) ||
                               (dst_1d_or_2d && src_3d);
    const bool valid_pair = same_type || one_d_two_d || two_d_three_d;
-   if ((!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip)) ||
+   if (!agx_chip_native_or_m5(chip) ||
        !region || !out || !valid_types ||
        !valid_pair || src_layers == 0 ||
        src_layers != dst_layers || slice >= src_layers ||

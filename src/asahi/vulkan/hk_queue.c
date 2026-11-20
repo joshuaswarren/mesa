@@ -273,7 +273,7 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    memcpy(&c->zls_ctrl, &cs->cr.zls_control, sizeof(cs->cr.zls_control));
 
    const bool g18g = dev->dev.chip == AGX_CHIP_G18G;
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
+   if (agx_chip_native_or_m5(dev->dev.chip) ||
        g18g) {
       c->isp_zls_pixels = agx_chip_g17_m5(dev->dev.chip) || g18g
          ? hk_drm_m5_zls_pixels(
@@ -309,7 +309,7 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
     * render pass whose known primitive count is at most four, and never for
     * a continued pass or one with uncounted (indirect, mesh) work. This
     * stream's bound counts every draw of the whole pass, so it proves that. */
-   if ((agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
+   if (agx_chip_native_or_m5(dev->dev.chip) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_FEW_PRIMITIVES) &&
        cs->g17p_pass_begins && cs->g17p_pass_ends &&
        cs->g17p_primitive_bound <= 4) {
@@ -462,7 +462,7 @@ asahi_append_compute_attachments(struct hk_device *dev,
    /* Attachment spans are hints for the native AGX3 firmware interface.
     * AGX2 has never sent them, so G13 and G14 keep that submission. G18G
     * (M6) sends them as well. */
-   if (!agx_native_graphics(&dev->dev) && dev->dev.chip != AGX_CHIP_G18G)
+   if (!agx_chip_native_or_g18g(dev->dev.chip))
       return;
 
    const struct hk_drm_attachment_set *set = &cs->compute_attachments;
@@ -486,7 +486,7 @@ asahi_append_fragment_attachments(struct hk_device *dev,
                                   const struct hk_cs *cs)
 {
    /* See asahi_append_compute_attachments(). */
-   if (!agx_native_graphics(&dev->dev) && dev->dev.chip != AGX_CHIP_G18G)
+   if (!agx_chip_native_or_g18g(dev->dev.chip))
       return;
 
    const struct hk_drm_attachment_set *set = &cs->fragment_attachments;
@@ -1376,7 +1376,7 @@ hk_queue_restart_sync(struct hk_queue *queue)
 static bool
 hk_queue_admits_at_entry(const struct hk_device *dev)
 {
-   return agx_chip_g17_m5(dev->dev.chip) || dev->dev.chip == AGX_CHIP_G17P;
+   return agx_chip_g17p_or_m5(dev->dev.chip);
 }
 
 /* Admission must precede the common runtime's semaphore payload moves and
@@ -1611,8 +1611,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       if (result != VK_SUCCESS)
          return result;
 
-      flush_sstt = (dev->dev.chip == AGX_CHIP_G17P ||
-                    agx_chip_g17_m5(dev->dev.chip)) &&
+      flush_sstt = agx_chip_g17p_or_m5(dev->dev.chip) &&
                    hk_sparse_submission_updates_sstt(submit);
    }
 
@@ -2264,8 +2263,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                hk_frame_anatomy_render(anatomy, dev, cs, &cmd.legacy, i,
                                        nr_vdm + nr_cdm, payload.size);
             header.size = hk_drm_render_command_size(
-               agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
-                  dev->dev.chip == AGX_CHIP_G18G,
+               agx_chip_agx3_path(dev->dev.chip),
                queue->sync.exact_prior);
             if (queue->sync.exact_prior) {
                cmd.prior_vdm = command_prior[HK_SYNC_VDM];
@@ -2488,7 +2486,7 @@ hk_pack_runs_enabled(const struct hk_device *dev)
 static uint32_t
 hk_pack_attachment_limit(const struct hk_device *dev)
 {
-   if ((!agx_native_graphics(&dev->dev) && dev->dev.chip != AGX_CHIP_G18G) ||
+   if (!agx_chip_native_or_g18g(dev->dev.chip) ||
        !dev->dev.params.max_attachments)
       return UINT32_MAX;
    return dev->dev.params.max_attachments;
@@ -3073,8 +3071,7 @@ hk_queue_create(struct hk_device *dev,
    queue->drm.timeline_value = initial_value;
    queue->drm.signalled_value = initial_value;
 
-   if ((dev->dev.chip == AGX_CHIP_G17P ||
-        agx_chip_g17_m5(dev->dev.chip)) &&
+   if (agx_chip_g17p_or_m5(dev->dev.chip) &&
        dev->vk.enabled_features.sparseBinding && !kick) {
       queue->g17p_sstt_flush_bo =
          agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0, "SSTT flush stream");

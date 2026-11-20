@@ -554,7 +554,7 @@ hk_agx3_g17g_basic_graphics_program_generate(
    enum agx_chip chip, const struct hk_agx3_g17p_graphics_program_desc *desc,
    struct hk_agx3_g17p_graphics_program *program)
 {
-   if ((chip != AGX_CHIP_G17G && chip != AGX_CHIP_G18G) || !desc || !program)
+   if (!agx_chip_m5_paths(chip) || !desc || !program)
       return false;
    const struct agx3_g17p_graphics_program_desc shared_desc =
       hk_agx3_g17p_shared_graphics_desc(desc);

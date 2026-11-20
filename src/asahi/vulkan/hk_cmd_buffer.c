@@ -1253,7 +1253,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    }
 
    /* M5 records its barriers with the native dependency tracker. */
-   if (!agx_native_graphics(&dev->dev) && !agx_chip_g17_m5(dev->dev.chip)) {
+   if (!agx_chip_native_or_m5(dev->dev.chip)) {
       hk_cmd_buffer_end_compute(cmd);
       hk_cmd_buffer_end_graphics(cmd);
       /* Preserve the same conservative ordering in the shared submit graph,
@@ -1344,7 +1344,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * alone leaves the data in the GPU caches, and the end of the command
     * does not reliably write it back before completion is reported when
     * render work shares the queue. */
-   if ((dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
+   if (agx_chip_g17p_or_m5(dev->dev.chip) &&
        hk_dependency_has_host_access(pDependencyInfo)) {
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
       hk_sync_src_dep(cmd, src_kinds, cmd->current_cs.cs, dep);
@@ -1737,7 +1737,7 @@ hk_m5_note_push_writes(struct hk_cmd_buffer *cmd, uint32_t count,
                        const VkWriteDescriptorSet *writes)
 {
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
-   if (!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip))
+   if (!agx_chip_native_or_m5(chip))
       return;
 
    for (uint32_t i = 0; i < count; ++i) {
@@ -1758,7 +1758,7 @@ hk_m5_note_push_template(struct hk_cmd_buffer *cmd,
                          const void *data)
 {
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
-   if (!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip))
+   if (!agx_chip_native_or_m5(chip))
       return;
 
    for (uint32_t i = 0; i < template->entry_count; ++i) {
@@ -4400,12 +4400,10 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
    /* Only the native AGX3 path submits the spans (hk_queue.c). G18G
     * submits them too, as it did before the paths were split. */
-   const bool g18g = dev->dev.chip == AGX_CHIP_G18G;
-   if (agx_native_graphics(&dev->dev) || g18g)
+   if (agx_chip_native_or_g18g(dev->dev.chip))
       hk_cs_capture_fragment_attachments(dev, render, cs);
 
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
-       g18g) {
+   if (agx_chip_agx3_path(dev->dev.chip)) {
       /* The final VDM word stays zero when this selector is the
        * UINT32_MAX sentinel.  This reproduces m1n1's direct-triangle prefix. */
       cs->agx3_active_context_selector_valid = true;
@@ -4677,8 +4675,7 @@ hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->stream_linked |= linked;
    /* Conservative: G17P and the M5 re-emit their restart state after a
     * link. */
-   if (vdm && (hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P ||
-               agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)))
+   if (vdm && agx_chip_g17p_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
       cs->restart_index_set = false;
 }
 
@@ -4741,8 +4738,7 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
    /* An empty final stream of a pass with earlier draws is not an empty
     * render. Replacing it with the load-op clears would erase those draws. */
    const bool continuation = cmd->sync.pass_vdm != cs;
-   if (continuation && !agx_native_graphics(&dev->dev) &&
-       !agx_chip_g17_m5(dev->dev.chip))
+   if (continuation && !agx_chip_native_or_m5(dev->dev.chip))
       return false;
 
    /* Two reasons to keep the graphics representation on AGX3 rather than
@@ -4769,8 +4765,7 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     * common finalizer will append the native VDM terminator without uploading
     * any ordinary vertex or fragment program.
     */
-   const bool native_eot = agx_native_graphics(&dev->dev) ||
-                           agx_chip_g17_m5(dev->dev.chip);
+   const bool native_eot = agx_chip_native_or_m5(dev->dev.chip);
    const bool output_only_through_eot =
       native_eot && render->g17p_direct_color_resolve;
 
@@ -4912,8 +4907,7 @@ hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
          ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
          : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 
-   if ((!agx_chip_native_agx3(dev->dev.chip) &&
-        !agx_chip_g17_m5(dev->dev.chip)) ||
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
        cmd->in_meta ||
        cmd->vk.pool->queue_family_index >= pdev->queue_family_count ||
        !(pdev->queue_families[cmd->vk.pool->queue_family_index].queue_flags &

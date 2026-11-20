@@ -48,7 +48,7 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
 
       /* G17P and M5 share compressed images without storage or host-copy
        * access (hk_g17p_shared_compression_shape()). */
-      if (dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip))
+      if (agx_chip_g17p_or_m5(dev->chip))
          return props->optimalTilingFeatures &
                 ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
                   VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |

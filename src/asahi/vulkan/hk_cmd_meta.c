@@ -521,8 +521,7 @@ hk_g17p_sparse_buffer_copy(struct hk_cmd_buffer *cmd,
                            uint64_t dst_addr, VkDeviceSize size)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   assert((agx_native_graphics(&dev->dev) ||
-           agx_chip_g17_m5(dev->dev.chip)) && src_buffer->sparse_map);
+   assert(agx_chip_native_or_m5(dev->dev.chip) && src_buffer->sparse_map);
 
    /* Resident writes use the primary VA while nonresident reads must use the
     * zero-page shadow. Read the live map in the copy shader so a sparse bind
@@ -1347,11 +1346,7 @@ get_image_copy_pipeline(struct vk_device *device, struct vk_meta_device *meta,
        * The existing NIR pack/unpack path retains a single aligned raw store.
        * Meta pipelines are cached per device, so no extra key is needed. */
       .nir = build_image_copy_shader(key,
-         !agx_native_graphics(&container_of(device, struct hk_device, vk)->dev) &&
-         !agx_chip_g17_m5(container_of(device, struct hk_device, vk)->dev.chip) &&
-         container_of(device, struct hk_device, vk)->dev.chip != AGX_CHIP_G16G &&
-         /* G18G (AGX3) stores raw packed bytes too. */
-         container_of(device, struct hk_device, vk)->dev.chip != AGX_CHIP_G18G,
+         !agx_chip_agx3_path(container_of(device, struct hk_device, vk)->dev.chip),
          container_of(device, struct hk_device, vk)->dev.chip ==
             AGX_CHIP_G18G),
    };
@@ -1418,9 +1413,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
          const enum agx_chip chip =
             container_of(device, struct hk_device, vk)->dev.chip;
          const bool g17p_color =
-            (agx_native_graphics(
-                &container_of(device, struct hk_device, vk)->dev) ||
-             agx_chip_g17_m5(chip)) &&
+            agx_chip_native_or_m5(chip) &&
             !vk_format_is_depth_or_stencil(image->format);
          const struct hk_image *hk_image =
             container_of(image, struct hk_image, vk);
@@ -3270,8 +3263,7 @@ hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   if (agx_native_graphics(&dev->dev) ||
-       agx_chip_g17_m5(dev->dev.chip)) {
+   if (agx_chip_native_or_m5(dev->dev.chip)) {
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       struct hk_copy_batch batch = {0};
@@ -3401,8 +3393,7 @@ hk_g17p_copy_buffer_to_image_supported(
 static bool
 hk_g17p_block_copy_format(struct hk_device *dev, VkFormat format)
 {
-   if (!dev || (!agx_native_graphics(&dev->dev) &&
-                !agx_chip_g17_m5(dev->dev.chip)))
+   if (!dev || !agx_chip_native_or_m5(dev->dev.chip))
       return false;
 
    switch (hk_g17p_block_format_family(format)) {
@@ -3682,7 +3673,7 @@ hk_g17p_copy_padded_rgb_buffer_image(
    VkImageLayout image_layout, bool to_image)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if ((!agx_native_graphics(&dev->dev) && !agx_chip_g17_m5(dev->dev.chip)) ||
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
        region_count == 0 ||
        image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
        (image_layout != (to_image ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
@@ -4078,8 +4069,7 @@ hk_g17p_copy_uncompressed_buffer_to_image_supported(
    struct hk_device *dev, const struct hk_buffer *buffer,
    const struct hk_image *image, const VkCopyBufferToImageInfo2 *info)
 {
-   if ((!agx_native_graphics(&dev->dev) &&
-        !agx_chip_g17_m5(dev->dev.chip)) || info->regionCount == 0)
+   if (!agx_chip_native_or_m5(dev->dev.chip) || info->regionCount == 0)
       return false;
 
    for (uint32_t r = 0; r < info->regionCount; ++r) {
@@ -4400,7 +4390,7 @@ hk_g17p_raw_image_copy_supported(struct hk_device *dev,
                                  const struct hk_image *dst,
                                  const VkCopyImageInfo2 *info)
 {
-   if ((!agx_native_graphics(&dev->dev) && !agx_chip_g17_m5(dev->dev.chip)) ||
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
        info->regionCount == 0 ||
        src->vk.samples != dst->vk.samples ||
        (src->vk.samples != VK_SAMPLE_COUNT_1_BIT &&
@@ -4647,7 +4637,7 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
     * cause was not isolated). Its draws work, so upload through the common
     * graphics copy. */
    bool gfx = hk_copy_requires_gfx(dst_image) || dev->dev.chip == AGX_CHIP_G18G;
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
+   if (agx_chip_native_or_m5(dev->dev.chip)) {
       uint8_t plane;
       VkFormat format;
       uint32_t api_block_B, physical_block_B;
@@ -4815,7 +4805,7 @@ hk_xfer_copyimagetobuffer2(VkCommandBuffer commandBuffer,
    VkFormat format;
    uint32_t api_block_B, physical_block_B;
    const bool padded_rgb =
-      (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
+      agx_chip_native_or_m5(dev->dev.chip) &&
       pCopyImageToBufferInfo->regionCount > 0 &&
       hk_g17p_buffer_upload_plane(
          src_image,
@@ -4868,9 +4858,7 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    /* G17P copies through its native tile renderer, as buffer uploads do.
     * The common meta path preserves partial rectangles, layers and format
     * reinterpretation without the AGX2 compute imageblock protocol. */
-   bool gfx = agx_native_graphics(&dev->dev) ||
-              agx_chip_g17_m5(dev->dev.chip) ||
-              dev->dev.chip == AGX_CHIP_G18G || /* see the upload above */
+   bool gfx = agx_chip_agx3_path(dev->dev.chip) || /* see the upload above */
               hk_copy_requires_gfx(dst_image);
    VkPipelineBindPoint bind_point = hk_bind_point(gfx);
 
@@ -4878,8 +4866,7 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    hk_meta_begin(cmd, &save, bind_point);
 
    if (gfx) {
-      const bool native = agx_native_graphics(&dev->dev) ||
-                          agx_chip_g17_m5(dev->dev.chip);
+      const bool native = agx_chip_native_or_m5(dev->dev.chip);
       /* Both sides of a depth/stencil copy use the same views: per-plane
        * aliases when either depth plane is compressed. */
       const bool zs_planes =

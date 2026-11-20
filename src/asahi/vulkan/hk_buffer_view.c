@@ -79,8 +79,7 @@ hk_get_buffer_format_features(struct hk_physical_device *pdev,
 
       if (p_format == PIPE_FORMAT_R32_UINT || p_format == PIPE_FORMAT_R32_SINT ||
           (p_format == PIPE_FORMAT_R32_FLOAT &&
-           (pdev->dev.chip == AGX_CHIP_G17P ||
-            agx_chip_g17_m5(pdev->dev.chip))))
+           agx_chip_g17p_or_m5(pdev->dev.chip)))
          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
    }
 
@@ -103,8 +102,7 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
 
    enum pipe_format format = hk_format_to_pipe_format(view->vk.format);
    const struct util_format_description *desc = util_format_description(format);
-   const bool g17p = agx_native_graphics(&device->dev) ||
-                      agx_chip_g17_m5(device->dev.chip);
+   const bool g17p = agx_chip_native_or_m5(device->dev.chip);
    const bool rgb32 =
       ail_pixel_format[format].channels == AGX_CHANNELS_R32G32B32_EMULATED;
 
@@ -266,8 +264,7 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
 
    if (hk_native_pbe_supported(generation)) {
       hk_pack_native_pbe(generation, &view->pbe, &pbe);
-   } else if (agx_native_graphics(&device->dev) ||
-              agx_chip_g17_m5(device->dev.chip)) {
+   } else if (agx_chip_native_or_m5(device->dev.chip)) {
       /* AGX3's linear PBE is architectural and has no software tail field,
        * exactly like the texture above: the store lowering adds the tail from
        * the buffer metadata. A format the native packer cannot represent (the

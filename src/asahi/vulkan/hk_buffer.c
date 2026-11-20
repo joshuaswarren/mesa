@@ -350,8 +350,7 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
          }
       }
 
-      if ((dev->dev.chip == AGX_CHIP_G17P ||
-           agx_chip_g17_m5(dev->dev.chip)) &&
+      if (agx_chip_g17p_or_m5(dev->dev.chip) &&
           (buffer->vk.create_flags &
            VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT)) {
          const uint64_t entries = DIV_ROUND_UP(vma_size_B, AIL_PAGESIZE);
