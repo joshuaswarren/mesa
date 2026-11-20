@@ -665,16 +665,20 @@ test_agx3_live_vdm_barrier(void)
       AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
    };
 
-   for (unsigned i = 0; i < sizeof(grounded) / sizeof(grounded[0]); ++i) {
-      uint32_t packed[2] = {UINT32_C(0xdeadbeef), UINT32_C(0xfeedface)};
-      uint32_t *end = agx_vdm_barrier(packed, grounded[i]);
-      CHECK_EQ((uintptr_t)end - (uintptr_t)packed, sizeof(uint32_t));
-      /* The G15 and G16 kernel backends admit only the plain word. */
-      const bool plain = grounded[i] == AGX_CHIP_G15S ||
-                         grounded[i] == AGX_CHIP_G15C ||
-                         grounded[i] == AGX_CHIP_G16G;
-      CHECK_EQ(packed[0], plain ? UINT32_C(0x21000960) : UINT32_C(0x21000968));
-      CHECK_EQ(packed[1], UINT32_C(0xfeedface));
+   for (unsigned admits = 0; admits < 2; ++admits) {
+      for (unsigned i = 0; i < sizeof(grounded) / sizeof(grounded[0]); ++i) {
+         uint32_t packed[2] = {UINT32_C(0xdeadbeef), UINT32_C(0xfeedface)};
+         uint32_t *end = agx_vdm_barrier(packed, grounded[i], admits);
+         CHECK_EQ((uintptr_t)end - (uintptr_t)packed, sizeof(uint32_t));
+         /* Without DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE, the G15 and G16
+          * kernel backends admit only the plain word. */
+         const bool plain = !admits && (grounded[i] == AGX_CHIP_G15S ||
+                                        grounded[i] == AGX_CHIP_G15C ||
+                                        grounded[i] == AGX_CHIP_G16G);
+         CHECK_EQ(packed[0],
+                  plain ? UINT32_C(0x21000960) : UINT32_C(0x21000968));
+         CHECK_EQ(packed[1], UINT32_C(0xfeedface));
+      }
    }
 
    const enum agx_chip rejected[] = {
@@ -684,7 +688,7 @@ test_agx3_live_vdm_barrier(void)
    };
    for (unsigned i = 0; i < sizeof(rejected) / sizeof(rejected[0]); ++i) {
       uint32_t packed = UINT32_C(0xdeadbeef);
-      CHECK_EQ(agx_vdm_barrier(&packed, rejected[i]) == &packed, true);
+      CHECK_EQ(agx_vdm_barrier(&packed, rejected[i], true) == &packed, true);
       CHECK_EQ(packed, UINT32_C(0xdeadbeef));
    }
 }

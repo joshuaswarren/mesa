@@ -55,7 +55,8 @@ agx_vdm_barrier_core_supported(enum agx_chip chip)
 }
 
 bool
-agx_vdm_barrier_core_pack(enum agx_chip chip, struct agx_vdm_barrier_core *out)
+agx_vdm_barrier_core_pack(enum agx_chip chip, bool kernel_admits_inval,
+                          struct agx_vdm_barrier_core *out)
 {
    if (out)
       memset(out, 0, sizeof(*out));
@@ -63,7 +64,7 @@ agx_vdm_barrier_core_pack(enum agx_chip chip, struct agx_vdm_barrier_core *out)
    if (!out || !agx_vdm_barrier_core_supported(chip))
       return false;
 
-   agx_store_le32(out->bytes, agx_vdm_barrier_core_word(chip));
+   agx_store_le32(out->bytes, agx_vdm_barrier_core_word(chip, kernel_admits_inval));
    out->length = AGX_VDM_BARRIER_CORE_LENGTH;
    return true;
 }

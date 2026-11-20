@@ -10851,7 +10851,10 @@ agx_batch_init_state(struct agx_batch *batch)
        * encoding has no witness. Emit none, as Apple's streams do. */
    } else if (agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip)) {
       struct agx_vdm_barrier_core barrier;
-      const bool packed = agx_vdm_barrier_core_pack(dev->chip, &barrier);
+      const bool packed = agx_vdm_barrier_core_pack(
+         dev->chip,
+         dev->params.features & DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE,
+         &barrier);
       assert(packed);
       if (!packed)
          return;
@@ -16190,7 +16193,9 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
     */
    if (ctx->gs && ctx->streamout.num_targets > 0) {
       struct agx_device *dev = agx_device(ctx->base.screen);
-      out = (void *)agx_vdm_barrier((uint32_t *)out, dev->chip);
+      out = (void *)agx_vdm_barrier(
+         (uint32_t *)out, dev->chip,
+         dev->params.features & DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE);
    }
 
    assert((dev->chip != AGX_CHIP_G18G && !agx_chip_g17_m5(dev->chip)) ||
