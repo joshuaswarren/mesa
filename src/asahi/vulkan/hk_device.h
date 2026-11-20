@@ -447,6 +447,15 @@ hk_cdm_alias_scope(const struct hk_device *dev)
           p_atomic_read(&dev->va_alias_resources) != 0;
 }
 
+/* Whether the CDM strong flush has a memory-scoped form, which memory
+ * reached through a second address needs (hk_cdm_alias_scope()): on G17P
+ * and M5. The other HAL200 parts (G16) have only the plain strong flush. */
+static inline bool
+hk_cdm_memory_scope_form(const struct hk_device *dev)
+{
+   return dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip);
+}
+
 static inline struct hk_physical_device *
 hk_device_physical(struct hk_device *dev)
 {

@@ -118,6 +118,7 @@ hk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
    hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_event, event, _event);
 
+   cmd->state.uses_events = true;
    perf_debug(cmd, "Set event");
 
    assert(pDependencyInfo->sType == VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
@@ -148,6 +149,7 @@ hk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
    hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_event, event, _event);
 
+   cmd->state.uses_events = true;
    perf_debug(cmd, "Reset event");
    hk_event_write(cmd, event, hk_sync_kinds_src(stageMask), VK_EVENT_RESET);
 }
@@ -169,6 +171,7 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    hk_flush_deferred_clears(cmd);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   cmd->state.uses_events = true;
    perf_debug(cmd, "Wait events");
 
    for (uint32_t i = 0; i < eventCount; ++i) {

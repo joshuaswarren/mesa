@@ -29,6 +29,7 @@
 #include "hk_drm_render_core.h"
 #include "hk_drm_prior_core.h"
 #include "hk_execution_allowance.h"
+#include "hk_pack.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
 #include "hk_query_pool.h"
@@ -1560,15 +1561,25 @@ hk_sibling_prior(uint64_t prior, uint64_t base, uint64_t kq_base, bool *earlier)
    return kq_base;
 }
 
+/* Submits the recordings of `submit`. With submit packing these are the
+ * submission's packets and the command buffers it left alone; `original`
+ * is the application's submission, and `packed_bo` holds the packets'
+ * streams (hk_pack_runs()). *untouched is set when a host allocation failed
+ * before any queue or synchronization state changed: the submission can
+ * fail with that error and the queue stays usable. */
 static VkResult
-queue_submit(struct hk_device *dev, struct hk_queue *queue,
-             struct vk_queue_submit *submit)
+queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
+                        struct vk_queue_submit *submit,
+                        const struct vk_queue_submit *original,
+                        struct agx_bo *packed_bo, bool *untouched)
 {
+   *untouched = false;
    bool flush_sstt = false;
+   const bool bound = submit->buffer_bind_count || submit->image_bind_count ||
+                      submit->image_opaque_bind_count;
 
    /* TODO: Support asynchronous sparse queue? */
-   if (submit->buffer_bind_count || submit->image_bind_count ||
-       submit->image_opaque_bind_count) {
+   if (bound) {
 
       VkResult result = hk_queue_submit_bind_sparse_memory(dev, submit);
       if (result != VK_SUCCESS)
@@ -1611,14 +1622,38 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    const unsigned resolved_count = command_count - flush_sstt;
    if (resolved_count &&
        !util_dynarray_resize(&queue->sync_resolved, struct hk_sync_resolved,
-                             resolved_count))
+                             resolved_count)) {
+      *untouched = !bound;
       return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   /* Native M5 keeps the memory of every submitted recording until the
+    * submission retires. Elsewhere the application keeps its recordings
+    * alive, and only the packets' buffer needs it: the BO cache would hand
+    * it out again without waiting for the GPU. Pin before anything below
+    * changes queue or synchronization state, so that a failed allocation
+    * leaves nothing to roll back. */
+   struct hk_cmd_pending *pending = NULL;
+   const bool pin_recordings = agx_chip_g17_m5(dev->dev.chip);
+   if ((pin_recordings || packed_bo) && !dev->dev.is_virtio) {
+      const struct vk_queue_submit no_recordings = {0};
+      unsigned chunks = 1 + (command_count - 1) / max_commands_per_submit(dev);
+      VkResult pin_result = hk_cmd_pending_begin(
+         dev, pin_recordings ? original : &no_recordings, chunks, packed_bo,
+         &pending);
+      if (pin_result != VK_SUCCESS) {
+         *untouched = !bound;
+         return vk_error(queue, pin_result);
+      }
+   }
 
    bool replaced;
    VkResult queue_result = hk_queue_ensure_drm(
       dev, queue, hk_submit_needs_render_rq(submit), &replaced);
-   if (queue_result != VK_SUCCESS)
+   if (queue_result != VK_SUCCESS) {
+      hk_cmd_pending_end(dev, pending, queue, queue_result);
       return queue_result;
+   }
 
    /* The new kernel queue starts after all work of the one it replaces. */
    const uint64_t replaced_point = queue->drm.timeline_value;
@@ -1651,8 +1686,10 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       command_count > max_commands_per_submit(dev);
    const uint64_t point_count = chunk_timelines
       ? 1 + (command_count - 1) / max_commands_per_submit(dev) : 1;
-   if (queue->drm.timeline_value > UINT64_MAX - point_count)
+   if (queue->drm.timeline_value > UINT64_MAX - point_count) {
+      hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
       return vk_device_set_lost(&dev->vk, "Asahi queue timeline overflow");
+   }
    const uint64_t first_chunk_point = queue->drm.timeline_value + 1;
    queue->drm.timeline_value += point_count;
    unsigned wait_count = 0;
@@ -1710,8 +1747,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       .timeline_value = queue->drm.timeline_value,
    };
 
-   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
-      hk_query_note_submit((struct hk_cmd_buffer *)submit->command_buffers[i],
+   for (unsigned i = 0; i < original->command_buffer_count; ++i) {
+      hk_query_note_submit((struct hk_cmd_buffer *)original->command_buffers[i],
                            queue, queue->drm.timeline_value);
    }
 
@@ -1828,6 +1865,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       util_dynarray_fini(&payload);
       if (unlikely(anatomy))
          hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
+      hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
       return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
    }
 
@@ -1840,6 +1878,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
    bool sib_earlier = false;
    if (queue->sib.count > 1 && !replaced && !flush_sstt && !unlikely(anatomy) &&
+       !packed_bo &&
        hk_sibling_eligible(dev, queue, submit, resolved, prior_base,
                            command_count, kernel_cumulative) &&
        hk_sibling_deep(dev, queue, first_chunk_point - 1)) {
@@ -1905,6 +1944,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
              !hk_drm_serialize_prefix(&header, command_prior, nr_vdm, nr_cdm,
                                        prior_base, queue->sync.exact_prior)) {
             util_dynarray_fini(&payload);
+            hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
             return vk_device_set_lost(&dev->vk,
                                       "Asahi serialization ordinal overflow");
          }
@@ -1944,6 +1984,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                   if (unlikely(anatomy))
                      hk_frame_anatomy_end_submit(anatomy, dev, queue,
                                                  VK_ERROR_DEVICE_LOST);
+                  hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
                   return vk_device_set_lost(
                      &dev->vk, "M5 compute resource list too large (%u bytes)",
                      cs->compute_resources.size);
@@ -2038,6 +2079,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                   if (unlikely(anatomy))
                      hk_frame_anatomy_end_submit(anatomy, dev, queue,
                                                  VK_ERROR_DEVICE_LOST);
+                  hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
                   return vk_device_set_lost(
                      &dev->vk, "M5 render resource list too large (%u bytes)",
                      cs->render_resources.size);
@@ -2265,17 +2307,6 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    if (unlikely(anatomy))
       hk_frame_anatomy_prepare(anatomy, dev, payload.data, payload.size);
 
-   struct hk_cmd_pending *pending = NULL;
-   if (agx_chip_g17_m5(dev->dev.chip) && !dev->dev.is_virtio) {
-      unsigned chunks = 1 + (command_count - 1) / max_commands_per_submit(dev);
-      VkResult pin_result = hk_cmd_pending_begin(dev, submit, chunks, &pending);
-      if (pin_result != VK_SUCCESS) {
-         util_dynarray_fini(&payload);
-         /* Sync ordinals were already resolved above; this is not retryable
-          * without rolling them back. No GPU submission has happened. */
-         return vk_device_set_lost(&dev->vk, "Command-memory pin allocation failed");
-      }
-   }
    VkResult result;
    if (command_count <= max_commands_per_submit(dev)) {
       if (unlikely(anatomy))
@@ -2314,6 +2345,368 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    return result;
 }
 
+/* Submit packing.
+ *
+ * Every firmware compute command costs a fixed setup and completion on top
+ * of its dispatches. On the M5 Pro (G17S) a chain of 242 one-dispatch
+ * command buffers took 3.0 ms as separate commands and 0.31 ms as one; the
+ * M4 (G16G) kernel runs one command of the whole device at a time, with
+ * about 0.3 ms of turnaround each. Applications that record a dispatch or a
+ * few per command buffer and submit many at once (ML graphs, image filters)
+ * pay that cost per command buffer. A run of consecutive command buffers
+ * that each record one plain compute stream is therefore submitted as one
+ * command: their streams are copied back to back into a submission-owned
+ * buffer.
+ *
+ * A member boundary publishes the member's writes as the end of its own
+ * command would have published them for the members after it
+ * (hk_pack_boundary()):
+ *
+ * - Where the kernel takes a stream's own completion flush
+ *   (DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION, M5), every such stream
+ *   ends with the strong, memory-scoped flush. A boundary keeps the strong
+ *   flush and drops its memory scope, which only memory reached through a
+ *   second address needs (hk_cdm_alias_scope()); while such memory may
+ *   exist, it keeps the scope too. The packet's end keeps the whole flush.
+ * - HAL200 streams whose strong flush has no memory-scoped form (G16) end
+ *   with their last launch's ordering barrier or a strong flush, and the end
+ *   of the command publishes their writes. At a boundary the record becomes
+ *   the strong flush, as for a compute or transfer dependency inside one
+ *   stream. The last member's tail stays as recorded; the packet's own end
+ *   of command follows it.
+ *
+ * Work in a packet waits for whatever any member waited for, and work after
+ * it waits for the whole packet. On the compute subqueue that adds no
+ * ordering (M5 runs one queue's compute commands in order, the G16 kernel
+ * one command of the device at a time); a member that would add a render
+ * wait or synchronization kinds starts a new packet instead
+ * (hk_pack_plan()). Streams whose bytes depend on where they were recorded
+ * (links, calls, immediate writes) or that carry queries, timestamps, events,
+ * indirect or internal launches stay separate, and so do streams with global
+ * atomics where another kernel queue could run beside the packet
+ * (hk_pack_atomics_allowed()). A packet stays within the launch, thread and
+ * static work bounds of hk_pack.h and holds at most one stream with a looping
+ * program, so at ALU rate it runs about as long as its longest member could
+ * alone (hk_pack.h says how far that holds for memory-bound programs); it
+ * carries no more compute attachments than the kernel takes for one
+ * command. A run past a bound starts a new packet.
+ *
+ * It is on wherever a boundary is defined (hk_pack_boundary()), which the
+ * stream format and the kernel decide. HK_PACK_CDM_SUBMIT=0/1 (or the older
+ * ASAHI_M5_PACK_CDM_SUBMIT) turns it off or on there, for A/B rows.
+ */
+DEBUG_GET_ONCE_OPTION(hk_pack_cdm_submit_opt, "HK_PACK_CDM_SUBMIT", NULL)
+DEBUG_GET_ONCE_OPTION(m5_pack_cdm_submit_opt, "ASAHI_M5_PACK_CDM_SUBMIT", NULL)
+
+static bool
+hk_pack_trace(void)
+{
+   static int trace = -1;
+   if (trace < 0)
+      trace = debug_get_bool_option("HK_PACK_CDM_TRACE", false) ||
+              debug_get_bool_option("ASAHI_M5_PACK_CDM_TRACE", false);
+   return trace;
+}
+
+static bool
+hk_pack_runs_enabled(const struct hk_device *dev)
+{
+   if (dev->dev.is_virtio || (dev->dev.debug & AGX_DBG_NOMERGE) ||
+       hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE)
+      return false;
+
+   const char *opt = debug_get_option_hk_pack_cdm_submit_opt();
+   if (!opt)
+      opt = debug_get_option_m5_pack_cdm_submit_opt();
+   return opt ? debug_parse_bool_option(opt, false) : true;
+}
+
+/* The compute attachments one packet may carry: those the kernel takes for
+ * one command, so packing never drops one that a separate command would
+ * have carried (asahi_append_compute_attachments()). */
+static uint32_t
+hk_pack_attachment_limit(const struct hk_device *dev)
+{
+   if ((!agx_native_graphics(&dev->dev) && dev->dev.chip != AGX_CHIP_G18G) ||
+       !dev->dev.params.max_attachments)
+      return UINT32_MAX;
+   return dev->dev.params.max_attachments;
+}
+
+/* Streams with global atomics are packed only where no other kernel queue
+ * of the device can run beside the packet. On M5, two kernel queues
+ * running packed atomic chains on the same memory lost contributions (root
+ * cause unknown), so such streams stay separate commands unless
+ * ASAHI_M5_PACK_ATOMICS=1 (or HK_PACK_ATOMICS=1) and the device has a
+ * single kernel queue, which runs its commands in order. A second kernel
+ * queue created while a packet runs is not covered; unpacked atomic work
+ * has the same exposure. The G16 kernel runs one command of the whole
+ * device at a time, so nothing ever runs beside a packet there: G16G packs
+ * them unless HK_PACK_ATOMICS=0. That is a property of the G16 kernel, the
+ * only one for G16G, which no uAPI feature reports yet; the chip stands for
+ * it until one does. */
+DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
+DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
+
+static bool
+hk_pack_atomics_allowed(struct hk_device *dev, const struct hk_queue *queue)
+{
+   const char *opt = debug_get_option_hk_pack_atomics_opt();
+   if (!opt)
+      opt = debug_get_option_m5_pack_atomics_opt();
+
+   if (dev->dev.chip == AGX_CHIP_G16G)
+      return opt ? debug_parse_bool_option(opt, false) : true;
+
+   if (!opt || !debug_parse_bool_option(opt, false) || queue->sib.count > 1)
+      return false;
+
+   vk_foreach_queue(iter, &dev->vk) {
+      if (vk_queue_is_emulated(iter))
+         continue;
+      const struct hk_queue *other = container_of(iter, struct hk_queue, vk);
+      if (other != queue && other->drm.id != UINT32_MAX)
+         return false;
+   }
+   const struct hk_queue *as = dev->host_as.queue;
+   return !as || as == queue || as->drm.id == UINT32_MAX;
+}
+
+/* A submission-owned replacement for a run of command buffers. The
+ * existing resolver assigns ordinals to it, so later submissions name its
+ * actual kernel command. */
+struct hk_packed_submit {
+   struct hk_cmd_buffer cmd;
+   struct hk_cs cs;
+};
+
+struct hk_packed_runs {
+   struct agx_bo *bo;
+   unsigned packet_count;
+   struct hk_packed_submit *packets;
+   struct vk_command_buffer **commands;
+   unsigned command_count;
+};
+
+static void
+hk_packed_runs_free(struct hk_device *dev, struct hk_packed_runs *p)
+{
+   for (unsigned i = 0; i < p->packet_count; ++i)
+      util_dynarray_fini(&p->packets[i].cs.compute_resources);
+   agx_bo_unreference(&dev->dev, p->bo);
+   free(p->packets);
+   free(p->commands);
+}
+
+/* Keep each distinct resource profile once: the kernel folds the list into
+ * one demand with a per-field maximum (M5 only; empty elsewhere). The first
+ * `unique` bytes are already distinct; entries after them are new. */
+static void
+hk_pack_dedup_resources(struct util_dynarray *list, size_t unique)
+{
+   const size_t entry = sizeof(struct drm_asahi_compute_program);
+   if (list->size % entry || unique % entry)
+      return;
+   uint8_t *data = list->data;
+   size_t kept = unique;
+   for (size_t at = unique; at < list->size; at += entry) {
+      bool seen = false;
+      for (size_t j = 0; j < kept && !seen; j += entry)
+         seen = !memcmp(data + j, data + at, entry);
+      if (!seen) {
+         if (kept != at)
+            memmove(data + kept, data + at, entry);
+         kept += entry;
+      }
+   }
+   list->size = kept;
+}
+
+static bool
+hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
+             const struct vk_queue_submit *submit, struct hk_packed_runs *out)
+{
+   memset(out, 0, sizeof(*out));
+   const unsigned n = submit->command_buffer_count;
+   if (n < 2 || submit->buffer_bind_count || submit->image_bind_count ||
+       submit->image_opaque_bind_count || !hk_pack_runs_enabled(dev))
+      return false;
+
+   uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
+   if (!agx3_cdm_stream_terminate_pack(dev->dev.chip, terminate))
+      return false;
+
+   const bool visible_completion =
+      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_VISIBLE_COMPLETION;
+   const bool atomics = hk_pack_atomics_allowed(dev, queue);
+   const struct hk_pack_limits limits = {
+      .max_attachments = hk_pack_attachment_limit(dev),
+      .overhead =
+         sizeof(terminate) + HK_CS_SPACE_PADDING + AGX_CDM_STREAM_LINK_LENGTH,
+   };
+   struct hk_pack_member *members = malloc(n * sizeof(*members));
+   struct hk_pack_run *runs = malloc(n * sizeof(*runs));
+   if (!members || !runs) {
+      free(members);
+      free(runs);
+      return false;
+   }
+
+   const unsigned eligible = hk_pack_describe_submit(
+      members, dev, &queue->sync,
+      (struct hk_cmd_buffer *const *)submit->command_buffers, n, terminate,
+      atomics);
+
+   unsigned packed_members;
+   size_t total;
+   const unsigned run_count =
+      hk_pack_plan(members, n, &limits, runs, &packed_members, &total);
+   free(members);
+
+   if (!run_count) {
+      if (hk_pack_trace())
+         fprintf(stderr, "HK_PACK runs=0 eligible=%u of %u\n", eligible, n);
+      free(runs);
+      return false;
+   }
+
+   out->bo = agx_bo_create(&dev->dev, total, 0, 0, "Packed compute submit");
+   uint8_t *map = out->bo ? agx_bo_map(out->bo) : NULL;
+   out->packets = calloc(run_count, sizeof(*out->packets));
+   out->commands = malloc((n - packed_members + run_count) * sizeof(*out->commands));
+   if (!map || !out->packets || !out->commands) {
+      free(runs);
+      hk_packed_runs_free(dev, out);
+      memset(out, 0, sizeof(*out));
+      return false;
+   }
+
+   unsigned r = 0;
+   for (unsigned i = 0; i < n;) {
+      if (r == run_count || i != runs[r].first) {
+         out->commands[out->command_count++] = submit->command_buffers[i++];
+         continue;
+      }
+
+      const struct hk_pack_run *pr = &runs[r];
+      struct hk_packed_submit *packet = &out->packets[out->packet_count++];
+      struct hk_cmd_buffer *cmd = &packet->cmd;
+      struct hk_cs *cs = &packet->cs;
+      cmd->vk.base.device = &dev->vk;
+      list_inithead(&cmd->control_streams);
+      list_addtail(&cs->node, &cmd->control_streams);
+      cs->cmd = cmd;
+      cs->type = HK_CS_CDM;
+      cs->start = cs->current = map + pr->offset;
+      cs->end = map + pr->offset + pr->bytes;
+      cs->addr = out->bo->va->addr + pr->offset;
+      cs->root_size = pr->bytes;
+      cs->sync.seq = 1;
+      cs->visible_completion = visible_completion;
+      hk_drm_attachment_set_init(&cs->compute_attachments);
+      util_dynarray_init(&cs->compute_resources, NULL);
+
+      for (unsigned m = 0; m < pr->count; ++m) {
+         const struct hk_cmd_buffer *source =
+            (const void *)submit->command_buffers[pr->first + m];
+         cs->sync.kind |= list_first_entry(&source->control_streams,
+                                           struct hk_cs, node)->sync.kind;
+      }
+
+      uint8_t preceding_kinds = 0;
+      for (unsigned m = 0; m < pr->count; ++m) {
+         const struct hk_cmd_buffer *source =
+            (const void *)submit->command_buffers[pr->first + m];
+         const struct hk_cs *item = list_first_entry(&source->control_streams,
+                                                     struct hk_cs, node);
+         void *item_end = (uint8_t *)item->current - sizeof(terminate);
+         const bool last = m + 1 == pr->count;
+
+         /* The reserved range keeps the merge inline: the link path, which
+          * allocates from the packet's (absent) pool and would point the
+          * packet into the source's stream, must stay unreachable. The
+          * sources are only read here; the application keeps them alive
+          * until the submission completes. */
+         if (!hk_cs_space_fits((uint8_t *)cs->end - (uint8_t *)cs->current,
+                               (uint8_t *)item_end - (uint8_t *)item->start,
+                               AGX_CDM_STREAM_LINK_LENGTH)) {
+            assert(!"packet sized too small");
+            free(runs);
+            hk_packed_runs_free(dev, out);
+            memset(out, 0, sizeof(*out));
+            return false;
+         }
+         const size_t unique = cs->compute_resources.size;
+         hk_cs_merge_cdm_until(cs, item, item_end);
+         hk_pack_dedup_resources(&cs->compute_resources, unique);
+
+         if (visible_completion) {
+            /* Each source ends with the strong memory-scoped flush. The
+             * packet's end keeps it for the host and other queues, which
+             * observe nothing of a packet before its completion. Between
+             * members, the next one reads through the same addresses, so
+             * the scope is needed only where memory can also be reached
+             * through a second address (hk_cdm_alias_scope()). */
+            if (!last && !hk_cdm_alias_scope(dev) &&
+                cs->current == cs->memory_flush_end &&
+                cs->current == cs->strong_flush_end) {
+               uint8_t *word = (uint8_t *)cs->current - AGX3_CDM_BARRIER_SIZE;
+               agx3_cmdstream_store_le32(
+                  word, agx3_cmdstream_load_le32(word) &
+                           ~AGX3_CDM_BARRIER_FLUSH_MEMORY);
+               cs->memory_flush_end = NULL;
+            }
+            hk_cdm_visibility_flush(dev, cs, last || hk_cdm_alias_scope(dev));
+         } else if (!last) {
+            /* HAL200: the member's ordering barrier becomes the strong
+             * flush, or its strong flush stays. */
+            hk_cdm_visibility_flush(dev, cs, false);
+         }
+
+         hk_pack_fold_member(cmd, cs, source, item, last, &preceding_kinds);
+      }
+
+      assert(!cs->stream_linked);
+      assert(visible_completion
+                ? cs->memory_flush_end == cs->current
+                : cs->strong_flush_end == cs->current ||
+                     cs->weak_barrier_end == cs->current);
+      memcpy(cs->current, terminate, sizeof(terminate));
+      cs->current = (uint8_t *)cs->current + sizeof(terminate);
+      memset(cs->current, 0, HK_CS_SPACE_PADDING);
+      hk_pack_finish_sync(cmd, cs);
+
+      out->commands[out->command_count++] = &cmd->vk;
+      i += pr->count;
+      r++;
+   }
+
+   if (hk_pack_trace())
+      fprintf(stderr, "HK_PACK runs=%u members=%u eligible=%u of %u commands=%u "
+              "bytes=%zu\n", run_count, packed_members, eligible, n,
+              out->command_count, total);
+   free(runs);
+   return true;
+}
+
+static VkResult
+queue_submit(struct hk_device *dev, struct hk_queue *queue,
+             struct vk_queue_submit *submit, bool *untouched)
+{
+   struct hk_packed_runs runs;
+   if (!hk_pack_runs(dev, queue, submit, &runs))
+      return queue_submit_recordings(dev, queue, submit, submit, NULL,
+                                     untouched);
+
+   struct vk_queue_submit effective = *submit;
+   effective.command_buffer_count = runs.command_count;
+   effective.command_buffers = runs.commands;
+   VkResult result = queue_submit_recordings(dev, queue, &effective, submit,
+                                             runs.bo, untouched);
+   hk_packed_runs_free(dev, &runs);
+   return result;
+}
+
 static bool
 hk_submit_has_compute(const struct vk_queue_submit *submit)
 {
@@ -2345,10 +2738,11 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    const bool has_compute =
       queue->kick.watched && hk_submit_has_compute(submit);
 
-   VkResult result = queue_submit(dev, queue, submit);
-   if (result != VK_SUCCESS)
+   bool untouched;
+   VkResult result = queue_submit(dev, queue, submit, &untouched);
+   if (result != VK_SUCCESS && !untouched)
       result = vk_queue_set_lost(&queue->vk, "Submit failed");
-   else if (has_compute)
+   else if (result == VK_SUCCESS && has_compute)
       hk_compute_kick_note(dev, queue);
 
    if (dev->dev.debug & AGX_DBG_SYNC) {

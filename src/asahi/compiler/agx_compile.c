@@ -3319,6 +3319,7 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
 
    case nir_intrinsic_global_atomic_agx:
    case nir_intrinsic_global_atomic_swap_agx:
+      b->shader->out->uses_global_atomics = true;
       agx_emit_atomic(b, dst, instr, false);
       return NULL;
 
@@ -9396,6 +9397,7 @@ emit_loop(agx_context *ctx, nir_loop *nloop)
    ctx->loop_nesting = 0;
    ctx->total_nesting++;
    ctx->divergent_nesting += divergent;
+   ctx->out->has_loops = true;
 
    agx_block *popped_break = ctx->break_block;
 
