@@ -38,9 +38,10 @@ struct nir_def;
 #define AGX_NIR_SCS_TOUCH_FLAGS                                                \
    (AGX_NIR_SCS_TOUCH | AGX_NIR_SCS_TOUCH_FENCE_BEFORE |                       \
     AGX_NIR_SCS_TOUCH_FENCE_AFTER)
-/* byte_offsets: fold constant index addends into that byte offset. */
+/* byte_offsets: fold constant index addends into that byte offset.
+ * checked_offsets: see agx_shader_key::checked_offsets. */
 bool agx_nir_lower_address(struct nir_shader *shader, bool byte_indices,
-                           bool byte_offsets);
+                           bool byte_offsets, bool checked_offsets);
 bool agx_nir_preserve_position_order(struct nir_shader *shader);
 bool agx_nir_scalarize_int64(struct nir_shader *shader);
 bool agx_nir_lower_divmod64(struct nir_shader *shader, bool native_add64);

@@ -557,6 +557,14 @@ struct agx_shader_key {
     */
    bool no_preamble;
 
+   /* Buffer accesses are bounds-checked in software on their 32-bit offset
+    * (robustBufferAccess, robustBufferAccess2, a GL robust context). That
+    * check tests the offset modulo 2^32, so an access may only be addressed
+    * at that same value: array index products (amul) and no-wrap flags are
+    * not proof that the offset arithmetic does not wrap.
+    */
+   bool checked_offsets;
+
    /* A complete, single-sample M5 uniform-colour blend variant. The packer
     * still proves its one read/write pixel transaction before admitting it. */
    bool m5_uniform_blend;

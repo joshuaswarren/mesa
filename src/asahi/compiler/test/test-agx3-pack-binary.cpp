@@ -11107,7 +11107,7 @@ TEST_F(AGX3PackBinary, ByteAddressLoweringKeepsFullU32Offset)
       nir_def *value=nir_load_global(&b,1,32,
          nir_iadd(&b,base,nir_u2u64(&b,offset)),.align_mul=4);
       nir_store_global(&b,value,nir_imm_int64(&b,0x100000),.align_mul=4);
-      ASSERT_TRUE(agx_nir_lower_address(b.shader,enabled,false));
+      ASSERT_TRUE(agx_nir_lower_address(b.shader,enabled,false,false));
       unsigned found=0;
       nir_foreach_function_impl(impl,b.shader) {
          nir_foreach_block(block,impl) {
