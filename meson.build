@@ -2514,7 +2514,11 @@ elif host_machine.system() == 'windows' and cc.get_argument_syntax() != 'msvc'
   endif
 else
   prog_nm = find_program('nm')
-  with_symbols_check = prog_nm.found() and with_tests
+  # the symbols files list the ELF ABI (version-scripted exports); a darwin
+  # AppleGL libGL exports a different surface by design (GLX_USE_APPLEGL drops
+  # e.g. glXImportContextEXT) and Mach-O has no version script to hide internals
+  with_symbols_check = (prog_nm.found() and with_tests and
+                        host_machine.system() != 'darwin')
   if with_symbols_check
     symbols_check_args = ['--nm', prog_nm.full_path()]
   endif
