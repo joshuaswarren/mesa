@@ -3013,10 +3013,10 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
    }
 }
 
-/* Several regions of one vkCmdCopyBuffer in one dispatch (G17P only, the
- * chip it was measured on). vk_meta_copy_buffer_addresses() issues one
- * dispatch per region; each costs ~1.2-1.6 us of GPU time beyond its bytes
- * (80 regions of 4 KiB take ~100 us, the same bytes as one region ~6 us).
+/* Several regions of one vkCmdCopyBuffer in one dispatch.
+ * vk_meta_copy_buffer_addresses() issues one dispatch per region; on G17P
+ * each costs ~1.2-1.6 us of GPU time beyond its bytes (80 regions of 4 KiB
+ * take ~100 us, the same bytes as one region ~6 us).
  * Workgroup row y copies region y; rows shorter than the widest region end
  * early. No source region of a copy command may overlap a destination region
  * (VUID-VkCopyBufferInfo2-pRegions-00117) and overlapping destinations go to
@@ -3201,10 +3201,10 @@ hk_copy_batch_add(struct hk_cmd_buffer *cmd, struct hk_copy_batch *batch,
    if (!size)
       return;
 
-   if (dev->dev.chip != AGX_CHIP_G17P || size > (1ull << 30)) {
-      /* Other chips are unmeasured. Large regions gain nothing from batching
-       * and keep the shader's 32-bit offsets far from wrapping: vk_meta
-       * copies them (in several dispatches if needed). */
+   if (size > (1ull << 30)) {
+      /* Large regions gain nothing from batching and keep the shader's
+       * 32-bit offsets far from wrapping: vk_meta copies them (in several
+       * dispatches if needed). */
       hk_copy_batch_flush(cmd, batch);
       vk_meta_copy_buffer_addresses(&cmd->vk, &dev->meta, src, dst, size);
       return;
