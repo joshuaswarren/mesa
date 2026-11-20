@@ -89,7 +89,7 @@ def main():
             print('PASS')
             passed += 1
         else:
-            print('FAIL')
+            print('FAIL: want {!r}, got {!r}'.format(expected, actual))
 
     print('{}/{} tests returned correct results'.format(passed, len(files)))
     exit(0 if passed == len(files) else 1)
