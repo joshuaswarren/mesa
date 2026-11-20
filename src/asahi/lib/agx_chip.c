@@ -68,13 +68,13 @@ agx_chip_from_params(const struct drm_asahi_params_global *params)
           * a performance gate on it needs rows on those parts (see enum
           * agx_chip).
           */
-         if (params->chip_id == 0x6040 &&
+         if (params->chip_id == AGX_CHIP_ID_M4_PRO &&
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200)
             return AGX_CHIP_G17P;
          return AGX_CHIP_G16S;
       case 'C':
-         if (params->chip_id == 0x6041 &&
+         if (params->chip_id == AGX_CHIP_ID_M4_MAX &&
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200)
             return AGX_CHIP_G17P;
@@ -99,269 +99,6 @@ agx_chip_from_params(const struct drm_asahi_params_global *params)
       }
    default:
       return AGX_CHIP_UNKNOWN;
-   }
-}
-
-enum agx_isa
-agx_chip_isa(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G13G:
-   case AGX_CHIP_G13X:
-   case AGX_CHIP_G14G:
-   case AGX_CHIP_G14X:
-   case AGX_CHIP_G15P:
-      return AGX_ISA_AGX2;
-
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17A:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   case AGX_CHIP_G18G:
-      return AGX_ISA_AGX3;
-
-   case AGX_CHIP_UNKNOWN:
-   default:
-      return AGX_ISA_UNKNOWN;
-   }
-}
-
-enum agx_isa_encoding
-agx_chip_isa_encoding(enum agx_chip chip)
-{
-   /*
-    * Which encoder table a part uses. Apple's own tables decode each family
-    * 100% under exactly one of these and essentially 0% under the other, so
-    * this is a measurement rather than a reading of the naming scheme.
-    *
-    * gpu_gen and gpu_var are a string split of the kernel core-name table, so
-    * they map directly. P/A are not Mac performance tiers: G15P is AGX2 and
-    * G17P/G17A remain on the AGX3b/HAL200 side while the G17 Mac parts use
-    * AGX3c/HAL300.
-    */
-   switch (chip) {
-   case AGX_CHIP_G13G:
-   case AGX_CHIP_G13X:
-   case AGX_CHIP_G14G:
-   case AGX_CHIP_G14X:
-   case AGX_CHIP_G15P:
-      return AGX_ISA_ENCODING_AGX2;
-
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17A:
-      return AGX_ISA_ENCODING_AGX3B;
-
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return AGX_ISA_ENCODING_AGX3C;
-
-   /* The agx3d encoding table, shared with G18M and G19P. */
-   case AGX_CHIP_G18G:
-      return AGX_ISA_ENCODING_AGX3D;
-
-   case AGX_CHIP_UNKNOWN:
-   default:
-      return AGX_ISA_ENCODING_UNKNOWN;
-   }
-}
-
-enum agx_command_stream_generation
-agx_chip_command_stream_generation_reference(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G13G:
-   case AGX_CHIP_G13X:
-   case AGX_CHIP_G14G:
-   case AGX_CHIP_G14X:
-      return AGX_CS_GENERATION_AGX2;
-
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-      return AGX_CS_GENERATION_G15;
-
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17A:
-      return AGX_CS_GENERATION_HAL200;
-
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return AGX_CS_GENERATION_HAL300;
-
-   /* The record format, not the kernel HAL: the J873 native captures decode
-    * and repack under the HAL300 codecs. See agx_chip_hal300_records. */
-   case AGX_CHIP_G18G:
-      return AGX_CS_GENERATION_HAL300;
-
-   /* The A16 compiler target is known to be AGX2, but its command-stream
-    * class was not present in the Mac driver corpus. Do not infer it. */
-   case AGX_CHIP_G15P:
-   case AGX_CHIP_UNKNOWN:
-   default:
-      return AGX_CS_GENERATION_UNKNOWN;
-   }
-}
-
-enum agx_descriptor_generation
-agx_chip_descriptor_generation_reference(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G13G:
-   case AGX_CHIP_G13X:
-      return AGX_DESCRIPTOR_GENERATION_7;
-   case AGX_CHIP_G14G:
-   case AGX_CHIP_G14X:
-      return AGX_DESCRIPTOR_GENERATION_8;
-
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17A:
-      return AGX_DESCRIPTOR_GENERATION_9;
-
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return AGX_DESCRIPTOR_GENERATION_10;
-
-   /* The J873 colour render's PBE descriptor (ffe40a02 00007f80 00005800
-    * 0003f010) and its texture descriptor (f6880a02 0007f80f 00005800
-    * 000fc010) unpack as Gen10 and repack byte-identically. */
-   case AGX_CHIP_G18G:
-      return AGX_DESCRIPTOR_GENERATION_10;
-
-   case AGX_CHIP_G15P:
-   case AGX_CHIP_UNKNOWN:
-   default:
-      return AGX_DESCRIPTOR_GENERATION_UNKNOWN;
-   }
-}
-
-enum agx_sampler_generation
-agx_chip_sampler_generation_reference(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G13G:
-   case AGX_CHIP_G13X:
-   case AGX_CHIP_G14G:
-   case AGX_CHIP_G14X:
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-      return AGX_SAMPLER_GENERATION_GEN4;
-
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17A:
-      return AGX_SAMPLER_GENERATION_GEN4_HAL200;
-
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return AGX_SAMPLER_GENERATION_GEN5;
-
-   /* The J873 texture-sample render's sampler (Metal's default descriptor
-    * with nearest filters and clamp-to-edge) is 000f0000 00000780 at
-    * element 2 of a 32-byte heap. It repacks byte-identically as Gen5 and
-    * not as either Gen4 layout, whose maximum-LOD clamp of 14.0 turns the
-    * 15.0 there into 000e0000. */
-   case AGX_CHIP_G18G:
-      return AGX_SAMPLER_GENERATION_GEN5;
-
-   case AGX_CHIP_G15P:
-   case AGX_CHIP_UNKNOWN:
-   default:
-      return AGX_SAMPLER_GENERATION_UNKNOWN;
-   }
-}
-
-unsigned
-agx_chip_sampler_heap_element_size_reference(enum agx_chip chip)
-{
-   switch (agx_chip_command_stream_generation_reference(chip)) {
-   case AGX_CS_GENERATION_AGX2:
-      return 8;
-   case AGX_CS_GENERATION_G15:
-   case AGX_CS_GENERATION_HAL200:
-   case AGX_CS_GENERATION_HAL300:
-      return 32;
-   case AGX_CS_GENERATION_UNKNOWN:
-   default:
-      return 0;
-   }
-}
-
-enum agx_submission_model
-agx_chip_submission_model(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G13G:
-   case AGX_CHIP_G13X:
-   case AGX_CHIP_G14G:
-   case AGX_CHIP_G14X:
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-      return AGX_SUBMISSION_MODEL_CLASSIC;
-
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-      return AGX_SUBMISSION_MODEL_DUAL;
-
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return AGX_SUBMISSION_MODEL_SKSM;
-
-   /* On macOS 26A428 the G18G GPU has only SKSM channels, for 3D, TA
-    * and compute work; there is no classic queue. */
-   case AGX_CHIP_G18G:
-      return AGX_SUBMISSION_MODEL_SKSM;
-
-   /* No corresponding accelerator class was present in the Mac corpus. */
-   case AGX_CHIP_G15P:
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G17A:
-   case AGX_CHIP_UNKNOWN:
-   default:
-      return AGX_SUBMISSION_MODEL_UNKNOWN;
    }
 }
 
@@ -495,13 +232,13 @@ agx_params_driver_supported(const struct drm_asahi_params_global *params)
    case AGX_CHIP_G17P: {
       /* Honeykrisp's first AGX3 path is the exact T8140/A18 Pro contract.
        * Do not let the shared G17P ISA name admit another SoC or topology. */
-      const bool a18_pro =
-         params->chip_id == 0x8140 && params->num_clusters_total == 1;
+      const bool a18_pro = params->chip_id == AGX_CHIP_ID_A18_PRO &&
+                           params->num_clusters_total == 1;
       /* M4 Pro: two clusters (a binned part keeps two). */
-      const bool m4_pro =
-         params->chip_id == 0x6040 && params->num_clusters_total == 2;
-      const bool m4_max =
-         params->chip_id == 0x6041 && params->num_clusters_total == 4;
+      const bool m4_pro = params->chip_id == AGX_CHIP_ID_M4_PRO &&
+                          params->num_clusters_total == 2;
+      const bool m4_max = params->chip_id == AGX_CHIP_ID_M4_MAX &&
+                          params->num_clusters_total == 4;
       return (a18_pro || m4_pro || m4_max) && params->num_dies == 1 &&
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
@@ -637,35 +374,7 @@ agx_chip_needs_scheduling_stalls(enum agx_chip chip)
    /* The M3 base part alone. Not a property of its encoding: G15G shares the
     * agx3b table with G15S/C/D, every G16 part, and G17P/A, none of which
     * pad. */
-   return chip == AGX_CHIP_G15G;
-}
-
-const char *
-agx_chip_name(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G13G: return "G13G";
-   case AGX_CHIP_G13X: return "G13X";
-   case AGX_CHIP_G14G: return "G14G";
-   case AGX_CHIP_G14X: return "G14X";
-   case AGX_CHIP_G15P: return "G15P";
-   case AGX_CHIP_G15G: return "G15G";
-   case AGX_CHIP_G15S: return "G15S";
-   case AGX_CHIP_G15C: return "G15C";
-   case AGX_CHIP_G15D: return "G15D";
-   case AGX_CHIP_G16P: return "G16P";
-   case AGX_CHIP_G16G: return "G16G";
-   case AGX_CHIP_G16S: return "G16S";
-   case AGX_CHIP_G16C: return "G16C";
-   case AGX_CHIP_G17P: return "G17P";
-   case AGX_CHIP_G17A: return "G17A";
-   case AGX_CHIP_G17G: return "G17G";
-   case AGX_CHIP_G17S: return "G17S";
-   case AGX_CHIP_G17C: return "G17C";
-   case AGX_CHIP_G18G: return "G18G";
-   case AGX_CHIP_UNKNOWN:
-   default: return "unknown";
-   }
+   return agx_chip_info(chip)->quirks & AGX_QUIRK_SCHEDULING_STALLS;
 }
 
 const char *
