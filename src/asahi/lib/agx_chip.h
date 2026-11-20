@@ -224,6 +224,7 @@ enum agx_chip_quirk {
    AGX_QUIRK_SCHEDULING_STALLS = 1 << 11,
    AGX_QUIRK_M5_PATHS = 1 << 12,
    AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS = 1 << 13,
+   AGX_QUIRK_HW_TXF_BOUNDS = 1 << 14,
 };
 
 /* What the five native AGX3 chips share. */
@@ -325,11 +326,15 @@ enum agx_chip_quirk {
      __VA_ARGS__)                                                              \
    X(G17G, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300,                  \
      AGX_RECORDS_M5 | AGX_RECORD_HAL300_NATIVE_CAPTURE,                        \
-     AGX_QUIRK_M5_PATHS | AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS, __VA_ARGS__)    \
+     AGX_QUIRK_M5_PATHS | AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS |                \
+        AGX_QUIRK_HW_TXF_BOUNDS,                                               \
+     __VA_ARGS__)                                                              \
    X(G17S, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS, __VA_ARGS__)                         \
+     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS,            \
+     __VA_ARGS__)                                                              \
    X(G17C, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS, __VA_ARGS__)                         \
+     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS,            \
+     __VA_ARGS__)                                                              \
    X(G18G, AGX3, AGX3D, HAL300, 10, GEN5, NONE, SKSM, HAL300,                  \
      AGX_RECORDS_G18G, AGX_QUIRK_M5_PATHS, __VA_ARGS__)
 
@@ -1014,6 +1019,41 @@ static inline bool
 agx_chip_explicit_robust_image_bounds(enum agx_chip chip)
 {
    return agx_chip_info(chip)->quirks & AGX_QUIRK_EXPLICIT_ROBUST_IMAGE_BOUNDS;
+}
+
+/*
+ * Whether the texture unit bounds an integer texel fetch to the Vulkan view
+ * and returns the robustImageAccess2 value (zero, alpha one for a missing
+ * channel) for out-of-range spatial coordinates and 16-bit array layers,
+ * given a valid LOD and sample index. Shaders then only saturate wider
+ * layer/LOD/sample operands before 16-bit narrowing and validate nonzero
+ * LODs and multisample sample indices against view metadata
+ * (AGX_NIR_TEXTURE_HW_TXF_BOUNDS), instead of predicating every fetch on
+ * the descriptor's spatial size.
+ *
+ * Enabled for the M5 Gen10 texture unit (G17G, G17S, G17C):
+ *   - G17C (J716c): established by robustness and texelFetch Vulkan CTS
+ *     suites plus a 33-case out-of-range probe (LOD and sample 65536/-65536,
+ *     layer 65536, negative and large x/y/z, restricted subresource views,
+ *     null descriptors, float and integer missing alpha).
+ *   - G17G and G17S share the same M5 Gen10 texture unit; the existing G17G
+ *     measurement (be91d344340: out-of-view 2D-array layer returns zero and
+ *     layer 65536 wraps to layer 0) agrees with G17C. Full probe and CTS
+ *     verification on M5 Pro (G17S) / M5 (G17G) is the merge gate.
+ *
+ * Off elsewhere:
+ *   - G18G uses the Gen10 descriptor layout too, but its texture lowering
+ *     (agx_nir_lower_texture_for_generation) always applies the software
+ *     predicate and its behaviour is not measured, so it stays off so that
+ *     no caller can skip the predicate there.
+ *   - Gen9 parts (G15, G16, G17P) keep the software bounds: native 2D
+ *     accesses outside the view alias other texels of the image on G17P
+ *     (agx_chip_explicit_robust_image_bounds and the G17P lowering).
+ */
+static inline bool
+agx_chip_hw_texel_fetch_bounds(enum agx_chip chip)
+{
+   return agx_chip_info(chip)->quirks & AGX_QUIRK_HW_TXF_BOUNDS;
 }
 
 /*
