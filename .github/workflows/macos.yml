@@ -54,12 +54,13 @@ jobs:
         # need no LLVM; llvmpipe stays off via -Dllvm=disabled below.
         brew bundle --verbose --no-upgrade
     - name: Install Mako and meson
-      # python3 -m pip pins the interpreter so the user-site bin dir below is
-      # the one meson actually lands in (the image's default is 3.9; a Brewfile
-      # python would put it somewhere else).
+      # The Brewfile python@3.10 (and the image default python3) is
+      # externally-managed: pip --user trips PEP 668 on macos-15-intel. A venv
+      # under the pinned brew python carries mako + meson with no flag games.
       run: |
-        python3 -m pip install --user mako meson
-        MESON_EXEC="$(python3 -m site --user-base)/bin/meson"
+        "$(brew --prefix python@3.10)/bin/python3.10" -m venv "$RUNNER_TEMP/ci-venv"
+        "$RUNNER_TEMP/ci-venv/bin/pip" install mako meson
+        MESON_EXEC="$RUNNER_TEMP/ci-venv/bin/meson"
         echo "MESON_EXEC=$MESON_EXEC" >> "$GITHUB_ENV"
         "$MESON_EXEC" --version
     - name: Configure
