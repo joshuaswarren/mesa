@@ -1331,4 +1331,87 @@ TEST_F(nir_opt_algebraic_test, commutation_masks_preserve_direction_order)
    }
 }
 
+static unsigned
+count_narrowing_i2i(nir_shader *shader)
+{
+   unsigned count = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if ((alu->op == nir_op_i2i8 || alu->op == nir_op_i2i16 ||
+                 alu->op == nir_op_i2i32) &&
+                nir_src_bit_size(alu->src[0].src) > alu->def.bit_size)
+               count++;
+         }
+      }
+   }
+   return count;
+}
+
+TEST_F(nir_opt_algebraic_test, downcast_of_sign_extended_value_is_u2u)
+{
+   nir_def *base = nir_imm_int64(b, 0x100000);
+   nir_def *value16 = nir_load_global(b, 1, 16, base, (gl_access_qualifier)0, 2, 0);
+   nir_def *value32 = nir_i2i32(b, value16);
+   nir_def *byte0 = nir_u2u8(b, value32);
+   nir_store_global(b, nir_i2f32(b, byte0), nir_imm_int64(b, 0x200000), 1,
+                    (gl_access_qualifier)0, 4, 0);
+
+   nir_validate_shader(b->shader, "before the pass");
+   run_pass();
+
+   /* An i2i narrowing would fail validation; the downcast has to stay u2u. */
+   EXPECT_EQ(count_narrowing_i2i(b->shader), 0u);
+   bool u2u8_of_16 = false;
+   nir_foreach_function_impl(impl, b->shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op == nir_op_u2u8 &&
+                nir_src_bit_size(alu->src[0].src) == 16)
+               u2u8_of_16 = true;
+         }
+      }
+   }
+   EXPECT_TRUE(u2u8_of_16);
+   nir_validate_shader(b->shader, "after the pass");
+}
+
+TEST_F(nir_opt_algebraic_test, downcast_sign_extended_inner_narrow)
+{
+   nir_def *base = nir_imm_int64(b, 0x100000);
+   nir_def *value8 = nir_load_global(b, 1, 8, base, (gl_access_qualifier)0, 1, 0);
+   nir_def *value32 = nir_i2i32(b, value8);
+   nir_def *word = nir_u2u16(b, value32);
+   nir_store_global(b, nir_i2f32(b, word), nir_imm_int64(b, 0x200000), 1,
+                    (gl_access_qualifier)0, 4, 0);
+
+   nir_validate_shader(b->shader, "before the pass");
+   run_pass();
+
+   EXPECT_EQ(count_narrowing_i2i(b->shader), 0u);
+   bool i2i16_of_8 = false;
+   nir_foreach_function_impl(impl, b->shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op == nir_op_i2i16 &&
+                nir_src_bit_size(alu->src[0].src) == 8)
+               i2i16_of_8 = true;
+         }
+      }
+   }
+   EXPECT_TRUE(i2i16_of_8);
+   nir_validate_shader(b->shader, "after the pass");
+}
+
+
 }
