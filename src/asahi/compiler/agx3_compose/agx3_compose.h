@@ -32,6 +32,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "agx3_mnemonics.h"
+
 #define AGX3_MAX_FIELDS 160
 #define AGX3_MAX_WORDS  16
 
@@ -69,10 +71,14 @@ typedef struct {
    uint16_t fixed_off, cmd_off, grp_off;
    uint8_t fixed_n, pred_n, cmd_n, grp_n;
 } agx3_node;
-typedef struct { const char *mnemonic; uint8_t ep, size; uint32_t node; } agx3_form;
+/* mnemonic is an enum agx3_mnemonic. */
+typedef struct { uint32_t node; uint16_t mnemonic; uint8_t ep, size; } agx3_form;
 
 typedef struct {
+   /* In (mnemonic, ep) order.  mnemonic_forms[m] is one more than the index
+    * of mnemonic m's first form, 0 if the table has none. */
    const agx3_form *forms; uint32_t num_forms;
+   const uint16_t *mnemonic_forms;
    const agx3_node *nodes;
    const agx3_group *groups;
    const agx3_fixed *fixeds;
@@ -120,12 +126,20 @@ bool agx3_compose_known(const agx3_table *t, uint32_t form,
                         const uint64_t fields[AGX3_MAX_FIELDS],
                         const uint64_t nonzero[3], uint8_t *out);
 
-int32_t agx3_form_index(const agx3_table *t, const char *mnemonic, uint8_t ep);
+/* The form of mnemonic with entry point ep, -1 if the table has none. */
+int32_t agx3_form_index(const agx3_table *t, enum agx3_mnemonic mnemonic,
+                        uint8_t ep);
 
 /* The form Apple's encoder picks: this mnemonic's forms by ascending size,
  * ep breaking ties, first that encodes. Writes the bytes to out; -1 if none. */
-int32_t agx3_compose_apple_order(const agx3_table *t, const char *mnemonic,
+int32_t agx3_compose_apple_order(const agx3_table *t,
+                                 enum agx3_mnemonic mnemonic,
                                  const uint64_t fields[AGX3_MAX_FIELDS],
                                  uint8_t *out);
+
+/* A mnemonic's spelling, "?" for AGX3_MN_NONE and for no mnemonic at all;
+ * and back: AGX3_MN_NONE for a name no table has. */
+const char *agx3_mnemonic_name(enum agx3_mnemonic mnemonic);
+enum agx3_mnemonic agx3_mnemonic_from_name(const char *name);
 
 #endif

@@ -685,9 +685,9 @@ test_load_completion_wait(enum agx_chip chip)
          {3, 16}, {16, 4}, {30, 1},
       };
       uint8_t expected[AGX_IOTO_MAX_RECORD_SIZE], length;
-      CHECK(agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "copy", 0,
+      CHECK(agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_copy, 0,
          fields, ARRAY_SIZE(fields), NULL, 0, expected, &length) ||
-            agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "copy", 1,
+            agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_copy, 1,
          fields, ARRAY_SIZE(fields), NULL, 0, expected, &length));
       CHECK(core.copy_suffix_offset + length <= core.sink.length);
       CHECK(!memcmp(body + core.copy_suffix_offset, expected, length));

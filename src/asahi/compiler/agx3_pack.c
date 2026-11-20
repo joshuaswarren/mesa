@@ -1459,7 +1459,7 @@ agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
       unsigned count=object ? sizeof(object_fields)/sizeof(object_fields[0])
                             : sizeof(mesh_fields)/sizeof(mesh_fields[0]);
       memset(out,0,sizeof(*out));
-      return agx3_bind_compose(encoding,"barrier",0,fields,
+      return agx3_bind_compose(encoding,AGX3_MN_barrier,0,fields,
          count,NULL,0,out->bytes,&out->length);
    }
 
@@ -1574,7 +1574,7 @@ agx3_pack_scoped_barrier_wait(enum agx_isa_encoding encoding,
    }
 
    uint8_t first[AGX3_SCOPED_BARRIER_MAX_LENGTH], len = 0;
-   if (!agx3_bind_compose(encoding, "barrier", 0, base,
+   if (!agx3_bind_compose(encoding, AGX3_MN_barrier, 0, base,
                           sizeof(base) / sizeof(base[0]), wait, n, first,
                           &len) ||
        len != 6) {

@@ -97,7 +97,7 @@ encode_store_form(enum agx_isa_encoding enc,
                                       d->structural_flag);
    n = append_waits(d, ov, n);
 
-   return agx3_bind_compose(enc, "copy", ep, base, nb, ov, n, out, length);
+   return agx3_bind_compose(enc, AGX3_MN_copy, ep, base, nb, ov, n, out, length);
 }
 
 bool
@@ -178,7 +178,7 @@ encode_load_form(enum agx_isa_encoding enc,
          ov[n++] = (struct agx3_field_kv)KV(30 + i, 1);
    }
 
-   return agx3_bind_compose(enc, "rld", ep, base, nb, ov, n, out, length);
+   return agx3_bind_compose(enc, AGX3_MN_rld, ep, base, nb, ov, n, out, length);
 }
 
 bool

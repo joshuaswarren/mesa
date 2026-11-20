@@ -21,8 +21,8 @@ agx3_bind_table(enum agx_isa_encoding encoding)
 }
 
 unsigned
-agx3_bind_form_size(enum agx_isa_encoding encoding, const char *mnemonic,
-                    int ep)
+agx3_bind_form_size(enum agx_isa_encoding encoding,
+                    enum agx3_mnemonic mnemonic, int ep)
 {
    const agx3_table *t = agx3_bind_table(encoding);
    const int32_t form = t ? agx3_form_index(t, mnemonic, (uint8_t)ep) : -1;
@@ -84,16 +84,11 @@ agx3_bind_fields(const struct agx3_field_kv *baseline, unsigned nbaseline,
  */
 #define AGX3_BIND_MEMO_SLOTS  1024
 #define AGX3_BIND_MEMO_FIELDS 24
-#define AGX3_BIND_MEMO_NAME   24
 
 struct agx3_bind_memo {
    uint64_t hash;
    const agx3_table *table;
-   /* The caller's string: the hash and a quick first comparison use its
-    * address, but it may be gone by the next call, so an entry keeps its own
-    * copy of the name and a hit is confirmed against that. */
-   const char *mnemonic;
-   char name[AGX3_BIND_MEMO_NAME];
+   enum agx3_mnemonic mnemonic;
    int ep;
    uint8_t nfields, len;
    uint16_t field[AGX3_BIND_MEMO_FIELDS];
@@ -123,7 +118,7 @@ agx3_bind_memo_unlock(void)
 /* The memo key for this composition, false if it has more nonzero fields
  * than an entry holds. */
 static bool
-agx3_bind_memo_key(const agx3_table *t, const char *mnemonic, int ep,
+agx3_bind_memo_key(const agx3_table *t, enum agx3_mnemonic mnemonic, int ep,
                    const uint64_t fields[AGX3_MAX_FIELDS],
                    const uint64_t nonzero[3], struct agx3_bind_memo *key)
 {
@@ -166,8 +161,7 @@ agx3_bind_memo_get(const struct agx3_bind_memo *key, uint8_t *out,
        e->mnemonic == key->mnemonic && e->ep == key->ep &&
        e->nfields == key->nfields &&
        !memcmp(e->field, key->field, key->nfields * sizeof(key->field[0])) &&
-       !memcmp(e->value, key->value, key->nfields * sizeof(key->value[0])) &&
-       !strcmp(e->name, key->mnemonic)) {
+       !memcmp(e->value, key->value, key->nfields * sizeof(key->value[0]))) {
       memcpy(out, e->out, e->len);
       *len = e->len;
       hit = true;
@@ -180,25 +174,23 @@ static void
 agx3_bind_memo_put(const struct agx3_bind_memo *key, const uint8_t *out,
                    uint8_t len)
 {
-   const size_t name_len = strlen(key->mnemonic);
-   if (len == 0 || len > sizeof(key->out) || name_len >= sizeof(key->name) ||
-       !agx3_bind_memo_lock())
+   if (len == 0 || len > sizeof(key->out) || !agx3_bind_memo_lock())
       return;
    struct agx3_bind_memo *e = agx3_bind_memo_slot(key);
    *e = *key;
-   memcpy(e->name, key->mnemonic, name_len + 1);
    memcpy(e->out, out, len);
    e->len = len;
    agx3_bind_memo_unlock();
 }
 
 bool
-agx3_bind_compose(enum agx_isa_encoding encoding, const char *mnemonic, int ep,
+agx3_bind_compose(enum agx_isa_encoding encoding, enum agx3_mnemonic mnemonic,
+                  int ep,
                   const struct agx3_field_kv *baseline, unsigned nbaseline,
                   const struct agx3_field_kv *overrides, unsigned noverrides,
                   uint8_t *out, uint8_t *len)
 {
-   if (out == NULL || len == NULL || mnemonic == NULL)
+   if (out == NULL || len == NULL)
       return false;
 
    /*

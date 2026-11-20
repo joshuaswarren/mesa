@@ -100,7 +100,7 @@ agx3_vary_interp_mode(enum agx_isa_encoding enc, uint16_t dest,
       ov[n++] = (struct agx3_field_kv)KV(54, 1);
    if (first)
       ov[n++] = (struct agx3_field_kv)KV(63, 1);
-   return agx3_bind_compose(enc, "f32interp", agx3_bind_ep(enc, 0),
+   return agx3_bind_compose(enc, AGX3_MN_f32interp, agx3_bind_ep(enc, 0),
                             is_b(enc) ? base_b : base_c, is_b(enc) ? 5 : 7,
                             ov, n, out, len);
 }
@@ -141,7 +141,7 @@ agx3_vary_coords(enum agx_isa_encoding enc, uint16_t dest, uint8_t mode,
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(30 + i, 1);
 
-   return agx3_bind_compose(enc, "itrcoords", agx3_bind_ep(enc, 0), base,
+   return agx3_bind_compose(enc, AGX3_MN_itrcoords, agx3_bind_ep(enc, 0), base,
                             is_b(enc) ? 6 : 8, ov, n, out, len);
 }
 
@@ -247,7 +247,7 @@ agx3_vary_ldcf_at_start(enum agx_isa_encoding enc, uint16_t dest,
                                           KV(49, 2)};
    const struct agx3_field_kv ov[] = {KV(2, dest), KV(15, coef_index),
                                       KV(12, slot), KV(48, first)};
-   return agx3_bind_compose(enc, "ldcfr", agx3_bind_ep(enc, 0),
+   return agx3_bind_compose(enc, AGX3_MN_ldcfr, agx3_bind_ep(enc, 0),
                             is_b(enc) ? base_b : is_d(enc) ? base_d : base_c,
                             is_b(enc) ? 5 : is_d(enc) ? 7 : 6, ov,
                             first ? 4 : 3, out, len);
@@ -291,7 +291,7 @@ agx3_vary_uvsw(enum agx_isa_encoding enc, uint16_t value, uint16_t uvs_index,
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(30 + i, 1);
 
-   return agx3_bind_compose(enc, "uvsw", agx3_bind_ep(enc, 0),
+   return agx3_bind_compose(enc, AGX3_MN_uvsw, agx3_bind_ep(enc, 0),
                             is_b(enc) ? base_b : base_c, is_b(enc) ? 3 : 6,
                             ov, n, out, len);
 }
@@ -327,7 +327,7 @@ agx3_vary_uvsw_register_index(enum agx_isa_encoding enc, uint16_t value,
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(30 + i, 1);
 
-   return agx3_bind_compose(enc, "uvsw", agx3_bind_ep(enc, 0),
+   return agx3_bind_compose(enc, AGX3_MN_uvsw, agx3_bind_ep(enc, 0),
                             is_b(enc) ? base_b : base_c, is_b(enc) ? 3 : 6,
                             ov, n, out, len);
 }
@@ -359,7 +359,7 @@ agx3_vary_uvsw_uniform_index(enum agx_isa_encoding enc, uint16_t value,
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(30 + i, 1);
 
-   return agx3_bind_compose(enc, "uvsw", 0, m5 ? base_c : base, m5 ? 6 : 3, ov, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_uvsw, 0, m5 ? base_c : base, m5 ? 6 : 3, ov, n, out, len);
 }
 
 bool

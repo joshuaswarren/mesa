@@ -9,6 +9,9 @@ encodings: `agx3b` (G15, G16, G17P), `agx3c` (G17G, G17S, G17D, G18P) and
 
 `agx3{b,c,d}_tables.txt` are the checked-in descriptions.
 `gen_agx3_tables.py` turns each into `agx3{b,c,d}_tables.c` at build time.
+`agx3_mnemonics.h` lists the mnemonics of the three as `enum agx3_mnemonic`.
+An encoder names a form by its mnemonic and entry point, and a mnemonic that
+a description gains has to be added to that list.
 
 A form is a tree. Its root node carries the predicates that gate the form,
 the constant bits and field deposits it always makes, and its choice groups.

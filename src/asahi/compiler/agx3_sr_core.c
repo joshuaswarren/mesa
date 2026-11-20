@@ -171,14 +171,14 @@ agx3_sr_encode(enum agx_isa_encoding enc, const struct agx3_sr_desc *d,
     * (applegpu_g18g builds of the oracle and glxgears probes). */
    if (enc == AGX_ISA_ENCODING_AGX3D)
       return !d->first &&
-             agx3_bind_compose(enc, "rld", AGX3_BIND_APPLE_ORDER, base, nbase,
+             agx3_bind_compose(enc, AGX3_MN_rld, AGX3_BIND_APPLE_ORDER, base, nbase,
                                ov, n, out, len);
 
    /* The compact form's selector requires every wait bit zero, a narrow
     * destination field and no entry marker; the composer refuses it otherwise
     * and the long form carries the same operands. */
    if (!d->first &&
-       agx3_bind_compose(enc, "rld", 0, base, nbase, ov, n, out, len))
+       agx3_bind_compose(enc, AGX3_MN_rld, 0, base, nbase, ov, n, out, len))
       return true;
-   return agx3_bind_compose(enc, "rld", 1, base, nbase, ov, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_rld, 1, base, nbase, ov, n, out, len);
 }

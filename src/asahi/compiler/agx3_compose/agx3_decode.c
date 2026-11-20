@@ -248,7 +248,7 @@ expand(struct dec *d)
 
 int32_t
 agx3_decode(const agx3_table *t, const uint8_t *data, unsigned size,
-            const char *mnemonic, uint64_t fields[AGX3_MAX_FIELDS])
+            enum agx3_mnemonic mnemonic, uint64_t fields[AGX3_MAX_FIELDS])
 {
    if (!t || !data || !fields || size < 2 || size > 2 * AGX3_MAX_WORDS)
       return -1;
@@ -264,7 +264,7 @@ agx3_decode(const agx3_table *t, const uint8_t *data, unsigned size,
    int32_t result = -1;
    for (uint32_t form = 0; form < t->num_forms && !d->aborted; ++form) {
       const agx3_form *fm = &t->forms[form];
-      if (fm->size != size || (mnemonic && strcmp(fm->mnemonic, mnemonic)))
+      if (fm->size != size || (mnemonic && fm->mnemonic != mnemonic))
          continue;
       if (!fixed_ok(d, fm->node))
          continue;

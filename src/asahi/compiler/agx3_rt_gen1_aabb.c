@@ -47,7 +47,7 @@ static void body(struct stream *s,bool corrected){
     assert(agx3_bind_compose(AGX_ISA_ENCODING_AGX3B,op->name,op->ep,fields,op->nfields,NULL,0,bytes,&n));
    }
   }
-  assert(n==op->size);append(s,bytes,n,op->name,op->offset);
+  assert(n==op->size);append(s,bytes,n,agx3_mnemonic_name(op->name),op->offset);
   if(corrected){
    switch(op->offset){
    case 380:state(s,9,0,6,10,12,0,"x");state(s,57,2,36,14,16,0,"y");state(s,59,4,38,18,20,0,"z");break;

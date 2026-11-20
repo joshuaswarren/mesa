@@ -54,10 +54,11 @@ struct agx3_field_kv {
  */
 /* Byte length of form `mnemonic.ep` for `encoding`, or 0 if there is none. */
 unsigned agx3_bind_form_size(enum agx_isa_encoding encoding,
-                             const char *mnemonic, int ep);
+                             enum agx3_mnemonic mnemonic, int ep);
 
-bool agx3_bind_compose(enum agx_isa_encoding encoding, const char *mnemonic,
-                       int ep, const struct agx3_field_kv *baseline,
+bool agx3_bind_compose(enum agx_isa_encoding encoding,
+                       enum agx3_mnemonic mnemonic, int ep,
+                       const struct agx3_field_kv *baseline,
                        unsigned nbaseline,
                        const struct agx3_field_kv *overrides,
                        unsigned noverrides, uint8_t *out, uint8_t *len);

@@ -33,7 +33,7 @@ args_ok(const uint8_t *out, const uint8_t *len)
  * caller's buffer on refusal so speculative callers stay transactional.
  */
 static bool
-rt_compose(enum agx_isa_encoding enc, const char *mnemonic,
+rt_compose(enum agx_isa_encoding enc, enum agx3_mnemonic mnemonic,
            const struct agx3_field_kv *baseline, unsigned nbaseline,
            const struct agx3_field_kv *overrides, unsigned noverrides,
            uint8_t out[AGX3_RT_CORE_MAX_LENGTH], uint8_t *len)
@@ -78,7 +78,7 @@ agx3_rt_traversal_barrier(enum agx_isa_encoding enc,
 
    const bool is_b = enc == AGX_ISA_ENCODING_AGX3B;
    const struct agx3_field_kv ov[] = {KV(30, scope)};
-   return rt_compose(enc, "barrier", is_b ? b_base : c_base,
+   return rt_compose(enc, AGX3_MN_barrier, is_b ? b_base : c_base,
                      is_b ? NELEM(b_base) : NELEM(c_base),
                      ov, NELEM(ov), out, len);
 }

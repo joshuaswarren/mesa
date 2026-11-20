@@ -37,6 +37,18 @@ bench(unsigned passes)
    unsigned sink = 0;
    double best = DBL_MAX, best_g18g = DBL_MAX;
 
+   /* The vectors spell their mnemonics; an encoder has them as constants. */
+   static enum agx3_mnemonic mnemonics[4096], mnemonics_g18g[4096];
+   if (agx3_compose_corpus_case_count > 4096 ||
+       agx3d_compose_corpus_case_count > 4096)
+      return 1;
+   for (size_t i = 0; i < agx3_compose_corpus_case_count; ++i)
+      mnemonics[i] =
+         agx3_mnemonic_from_name(agx3_compose_corpus_cases[i].mnemonic);
+   for (size_t i = 0; i < agx3d_compose_corpus_case_count; ++i)
+      mnemonics_g18g[i] =
+         agx3_mnemonic_from_name(agx3d_compose_corpus_cases[i].mnemonic);
+
    for (unsigned pass = 0; pass < passes; ++pass) {
       double start = now_ns();
       for (size_t i = 0; i < agx3_compose_corpus_case_count; ++i) {
@@ -45,7 +57,7 @@ bench(unsigned passes)
          uint64_t fields[AGX3_MAX_FIELDS] = {0};
          for (uint16_t k = 0; k < c->nfields; ++k)
             fields[c->field_ids[k]] = c->field_vals[k];
-         int32_t form = agx3_form_index(t, c->mnemonic, c->ep);
+         int32_t form = agx3_form_index(t, mnemonics[i], c->ep);
          sink += agx3_compose(t, (uint32_t)form, fields, out) + out[0];
       }
       double took = now_ns() - start;
@@ -58,7 +70,7 @@ bench(unsigned passes)
          uint64_t fields[AGX3_MAX_FIELDS] = {0};
          for (uint8_t k = 0; k < c->nfields; ++k)
             fields[c->field_ids[k]] = c->field_vals[k];
-         int32_t form = agx3_form_index(&agx3d_table, c->mnemonic, c->ep);
+         int32_t form = agx3_form_index(&agx3d_table, mnemonics_g18g[i], c->ep);
          sink += agx3_compose(&agx3d_table, (uint32_t)form, fields, out) + out[0];
       }
       took = now_ns() - start;
@@ -87,33 +99,39 @@ main(int argc, char **argv)
 
       for (uint32_t i = 0; i < t->num_forms; ++i) {
          const agx3_form *f = &t->forms[i];
-         if (agx3_form_index(t, f->mnemonic, f->ep) != (int32_t)i) {
-            fprintf(stderr, "FAIL form lookup %s.ep%u (agx3%c)\n",
-                    f->mnemonic, f->ep, letter);
+         const char *name = agx3_mnemonic_name(f->mnemonic);
+         if (agx3_mnemonic_from_name(name) != f->mnemonic ||
+             agx3_form_index(t, f->mnemonic, f->ep) != (int32_t)i) {
+            fprintf(stderr, "FAIL form lookup %s.ep%u (agx3%c)\n", name,
+                    f->ep, letter);
             fail++;
          }
 
          if (f->size % 2 || f->size / 2 > AGX3_MAX_WORDS) {
             fprintf(stderr, "FAIL form size %s.ep%u = %u (agx3%c)\n",
-                    f->mnemonic, f->ep, f->size, letter);
+                    name, f->ep, f->size, letter);
             fail++;
          }
 
          if (i > 0) {
             const agx3_form *prev = &t->forms[i - 1];
-            const int mnemonic_cmp = strcmp(prev->mnemonic, f->mnemonic);
-            if (mnemonic_cmp > 0 ||
-                (mnemonic_cmp == 0 && prev->ep >= f->ep)) {
+            if (prev->mnemonic > f->mnemonic ||
+                (prev->mnemonic == f->mnemonic && prev->ep >= f->ep)) {
                fprintf(stderr, "FAIL unsorted forms %s.ep%u, %s.ep%u "
                                "(agx3%c)\n",
-                       prev->mnemonic, prev->ep, f->mnemonic, f->ep, letter);
+                       agx3_mnemonic_name(prev->mnemonic), prev->ep, name,
+                       f->ep, letter);
                fail++;
             }
          }
       }
 
-      if (agx3_form_index(t, "", 0) != -1 ||
-          agx3_form_index(t, "~unknown", UINT8_MAX) != -1) {
+      if (agx3_mnemonic_from_name("") != AGX3_MN_NONE ||
+          agx3_mnemonic_from_name("~unknown") != AGX3_MN_NONE ||
+          strcmp(agx3_mnemonic_name(AGX3_MN_NONE), "?") ||
+          strcmp(agx3_mnemonic_name(AGX3_MN_COUNT), "?") ||
+          agx3_form_index(t, AGX3_MN_NONE, 0) != -1 ||
+          agx3_form_index(t, AGX3_MN_COUNT, UINT8_MAX) != -1) {
          fprintf(stderr, "FAIL unknown form lookup (agx3%c)\n", letter);
          fail++;
       }
@@ -127,7 +145,8 @@ main(int argc, char **argv)
       for (uint16_t k = 0; k < c->nfields; ++k)
          fields[c->field_ids[k]] = c->field_vals[k];
 
-      int32_t form = agx3_form_index(t, c->mnemonic, c->ep);
+      int32_t form =
+         agx3_form_index(t, agx3_mnemonic_from_name(c->mnemonic), c->ep);
       uint8_t out[AGX3_MAX_WORDS * 2];
 
       if (form < 0 || !agx3_compose(t, (uint32_t)form, fields, out) ||
@@ -150,7 +169,8 @@ main(int argc, char **argv)
       for (uint8_t k = 0; k < c->nfields; ++k)
          fields[c->field_ids[k]] = c->field_vals[k];
 
-      int32_t form = agx3_form_index(t, c->mnemonic, c->ep);
+      int32_t form =
+         agx3_form_index(t, agx3_mnemonic_from_name(c->mnemonic), c->ep);
       uint8_t out[AGX3_MAX_WORDS * 2];
 
       if (form < 0 || t->forms[form].size != c->nbytes ||

@@ -182,7 +182,7 @@ encode(enum agx_isa_encoding enc, const struct agx3_scs_desc *d,
 
    uint8_t bytes[AGX3_SCS_MAX_LENGTH] = {0};
    uint8_t len = 0;
-   if (!agx3_bind_compose(enc, is_load ? "ldscs" : "stscs", 0, base, nb,
+   if (!agx3_bind_compose(enc, is_load ? AGX3_MN_ldscs : AGX3_MN_stscs, 0, base, nb,
                           ov, n, bytes, &len) ||
        len > sizeof(bytes))
       return false;
@@ -289,7 +289,7 @@ agx3_scs_encode_epilogue(enum agx_isa_encoding enc,
       KV(68, d->component_mask), KV(70, d->address_selector),
       KV(71, (uint16_t)d->byte_offset), KV(76, d->c_load_marker ? 2 : 0),
    };
-   return agx3_bind_compose(enc, "ldscs", 0, base,
+   return agx3_bind_compose(enc, AGX3_MN_ldscs, 0, base,
                            sizeof(base) / sizeof(base[0]), fields,
                            sizeof(fields) / sizeof(fields[0]), out, length);
 }
@@ -376,7 +376,7 @@ agx3_scs_encode_touch(enum agx_isa_encoding enc,
    };
    uint8_t bytes[AGX3_SCS_MAX_LENGTH] = {0};
    uint8_t len = 0;
-   if (!agx3_bind_compose(enc, "ldscs", 0, base,
+   if (!agx3_bind_compose(enc, AGX3_MN_ldscs, 0, base,
                           sizeof(base) / sizeof(base[0]), fields,
                           sizeof(fields) / sizeof(fields[0]), bytes, &len) ||
        len > sizeof(bytes))

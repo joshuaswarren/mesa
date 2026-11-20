@@ -81,7 +81,7 @@ agx3_cf_icmp_reg16(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
       fields[n++] = (struct agx3_field_kv)KV(39, wait_mask == 32);
    }
    for (unsigned ep = 0; ep < 2; ++ep)
-      if (agx3_bind_compose(enc, "icmp", ep, base, c ? 6 : 4, fields, n, out,
+      if (agx3_bind_compose(enc, AGX3_MN_icmp, ep, base, c ? 6 : 4, fields, n, out,
                             len))
          return true;
    return false;
@@ -110,7 +110,7 @@ agx3_cf_icmp_width_m5(enum agx3_cf_icond cond, unsigned slot,
       KV(26,hints[1].cache), KV(28,hints[1].discard), KV(29,sign && half[1]),
    };
    for (unsigned ep = 0; ep < 3; ++ep)
-      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,"icmp",ep,base,6,fields,10,out,len))
+      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,AGX3_MN_icmp,ep,base,6,fields,10,out,len))
          return true;
    return false;
 }
@@ -155,7 +155,7 @@ agx3_cf_icmp_reg(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                                           KV(25, 2), KV(32, 3), KV(33, 82)};
    const struct agx3_field_kv ov[] = {KV(2, src0), KV(17, src1), KV(42, cond),
                                       KV(31, slot)};
-   return agx3_bind_compose(enc, "icmp", 1, agx3b(enc) ? base_b : base_c,
+   return agx3_bind_compose(enc, AGX3_MN_icmp, 1, agx3b(enc) ? base_b : base_c,
                             agx3b(enc) ? 4 : 6, ov, 4, out, len);
 }
 
@@ -183,7 +183,7 @@ agx3_cf_icmp_reg_uniform32(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                                       KV(31, slot), KV(42, cond),
                                       KV(11, hint.cache),
                                       KV(13, hint.discard)};
-   return agx3_bind_compose(enc, "icmp", 1, base, agx3b(enc) ? 4 : 6, ov, 6, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_icmp, 1, base, agx3b(enc) ? 4 : 6, ov, 6, out, len);
 }
 
 /* An aligned 32-bit uniform against an 8-bit immediate: Apple's G17P loop
@@ -206,7 +206,7 @@ agx3_cf_icmp_uniform_imm(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                                         KV(25, 1), KV(32, 3), KV(33, 82)};
    const struct agx3_field_kv ov[] = {KV(3, uniform), KV(16, imm),
                                       KV(42, cond), KV(31, slot)};
-   return agx3_bind_compose(enc, "icmp", 1, base, agx3b(enc) ? 4 : 6, ov, 4, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_icmp, 1, base, agx3b(enc) ? 4 : 6, ov, 4, out, len);
 }
 
 bool
@@ -222,7 +222,7 @@ agx3_cf_icmp_imm(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                                           KV(25, 1), KV(32, 3), KV(33, 82)};
    const struct agx3_field_kv ov[] = {KV(2, src0), KV(16, imm), KV(42, cond),
                                       KV(31, slot)};
-   return agx3_bind_compose(enc, "icmp", 1, agx3b(enc) ? base_b : base_c,
+   return agx3_bind_compose(enc, AGX3_MN_icmp, 1, agx3b(enc) ? base_b : base_c,
                             agx3b(enc) ? 4 : 6, ov, 4, out, len);
 }
 
@@ -250,7 +250,7 @@ agx3_cf_icmp_imm16_runtime(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
       for (unsigned i = 0; i < 8; ++i)
          fields[6+i] = (struct agx3_field_kv)KV(34+i, !!(wait_mask & (1u << i)));
       for (unsigned ep = 0; ep < 3; ++ep)
-         if (agx3_bind_compose(enc,"icmp",ep,base,7,fields,14,out,len))
+         if (agx3_bind_compose(enc,AGX3_MN_icmp,ep,base,7,fields,14,out,len))
             return true;
       return false;
    }
@@ -263,7 +263,7 @@ agx3_cf_icmp_imm16_runtime(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
          KV(2, src), KV(16, imm), KV(42, cond), KV(31, slot),
          KV(39, wait_mask == 32),
       };
-      return agx3_bind_compose(enc, "icmp", 0, base, 4, fields, 5, out,
+      return agx3_bind_compose(enc, AGX3_MN_icmp, 0, base, 4, fields, 5, out,
                                len);
    }
    const struct agx3_field_kv base[] = {
@@ -273,7 +273,7 @@ agx3_cf_icmp_imm16_runtime(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
       KV(2,src), KV(16,imm), KV(42,cond), KV(31,slot), KV(11,hint.cache),
       KV(13,hint.discard), KV(39,wait_mask == 32),
    };
-   return agx3_bind_compose(enc,"icmp",1,base,gpu1 ? 7 : 5,fields,7,out,len);
+   return agx3_bind_compose(enc,AGX3_MN_icmp,1,base,gpu1 ? 7 : 5,fields,7,out,len);
 }
 
 /* G18G only: agx3_cf_icmp_imm16_runtime() as the G18G layer emits it on
@@ -315,7 +315,7 @@ agx3_cf_icmp_imm16_runtime_g18g(enum agx_isa_encoding enc,
       KV(2,src), KV(16,imm), KV(42,cond), KV(31,slot), KV(11,hint.cache),
       KV(13,hint.discard), KV(39,wait_mask == 32),
    };
-   return agx3_bind_compose(enc,"icmp",1,base,7,fields,7,out,len);
+   return agx3_bind_compose(enc,AGX3_MN_icmp,1,base,7,fields,7,out,len);
 }
 
 /*
@@ -359,7 +359,7 @@ agx3_cf_fcmp_reg(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
       return false;
    const struct agx3_field_kv ov[] = {KV(2, src0), KV(19, src1), KV(46, fcond),
                                       KV(34, or_nan ? 1 : 0), KV(35, slot)};
-   return agx3_bind_compose(enc, "fcmp", 1, agx3b(enc) ? base_b : base_c,
+   return agx3_bind_compose(enc, AGX3_MN_fcmp, 1, agx3b(enc) ? base_b : base_c,
                             agx3b(enc) ? 4 : 6, ov, 5, out, len);
 }
 
@@ -411,11 +411,11 @@ agx3_cf_fcmp_reg_neg(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
          KV(9,2), KV(10,2), KV(26,2), KV(27,2), KV(36,3), KV(37,69),
       };
       for (unsigned ep=0; ep<4; ep++)
-         if (agx3_bind_compose(enc, "fcmp", ep, m5_base, 6, ov, 10, out, len))
+         if (agx3_bind_compose(enc, AGX3_MN_fcmp, ep, m5_base, 6, ov, 10, out, len))
             return true;
       return false;
    }
-   return agx3_bind_compose(enc, "fcmp", 0, base, 5, ov, 9, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_fcmp, 0, base, 5, ov, 9, out, len);
 }
 
 /*
@@ -468,7 +468,7 @@ agx3_cf_fcmp_reg16(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
                                        !!(wait_mask & (1u << wait_slot))};
 
    for (unsigned ep = 0; ep < 4; ++ep) {
-      if (agx3_bind_compose(enc, "fcmp", ep, base, 4, ov, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_fcmp, ep, base, 4, ov, n, out, len))
          return true;
    }
    return false;
@@ -535,7 +535,7 @@ agx3_cf_fcmp_width_m5(enum agx3_cf_fcond cond, bool or_nan, unsigned slot,
    for (unsigned i = 0; i < 8; ++i)
       fields[count++] = (struct agx3_field_kv)KV(38 + i, (wait_mask >> i) & 1);
    for (unsigned ep = 0; ep < 4; ++ep) {
-      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "fcmp", ep, base, 4,
+      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_fcmp, ep, base, 4,
                            fields, count, out, len))
          return true;
    }
@@ -577,7 +577,7 @@ agx3_cf_fcmp_reg_abs(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
       ov[n++] = (struct agx3_field_kv){38 + wait_slot,
                                        !!(wait_mask & (1u << wait_slot))};
 
-   return agx3_bind_compose(enc, "fcmp", 2, base, 4, ov, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_fcmp, 2, base, 4, ov, n, out, len);
 }
 
 bool
@@ -590,7 +590,7 @@ agx3_cf_cndst(enum agx_isa_encoding enc, unsigned slot, bool invert,
    const struct agx3_field_kv base_c[] = {KV(2, 3), KV(3, 33)};
    const struct agx3_field_kv ov[] = {KV(0, invert ? 1 : 0), KV(1, slot),
                                       KV(12, push_count)};
-   return agx3_bind_compose(enc, "cndst", 0, base_c, agx3b(enc) ? 0 : 2, ov, 3,
+   return agx3_bind_compose(enc, AGX3_MN_cndst, 0, base_c, agx3b(enc) ? 0 : 2, ov, 3,
                             out, len);
 }
 
@@ -603,7 +603,7 @@ agx3_cf_cndlt(enum agx_isa_encoding enc, unsigned slot, bool invert,
    const struct agx3_field_kv base_b[] = {KV(12, 2)};
    const struct agx3_field_kv base_c[] = {KV(2, 3), KV(3, 31), KV(12, 2)};
    const struct agx3_field_kv ov[] = {KV(0, invert ? 1 : 0), KV(1, slot)};
-   return agx3_bind_compose(enc, "cndlt", 0, agx3b(enc) ? base_b : base_c,
+   return agx3_bind_compose(enc, AGX3_MN_cndlt, 0, agx3b(enc) ? base_b : base_c,
                             agx3b(enc) ? 1 : 3, ov, 2, out, len);
 }
 
@@ -623,10 +623,10 @@ agx3_cf_cndcf(enum agx_isa_encoding enc, unsigned slot, bool invert,
     * and a wide ep1, and only ep1 carries the larger level counts. Try the
     * compact point first so a shallow break keeps the short encoding. */
    if (agx3b(enc))
-      return agx3_bind_compose(enc, "cndcf", 0, NULL, 0, ov, 3, out, len);
+      return agx3_bind_compose(enc, AGX3_MN_cndcf, 0, NULL, 0, ov, 3, out, len);
 
-   return agx3_bind_compose(enc, "cndcf", 0, base_c, 2, ov, 3, out, len) ||
-          agx3_bind_compose(enc, "cndcf", 1, base_c, 2, ov, 3, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_cndcf, 0, base_c, 2, ov, 3, out, len) ||
+          agx3_bind_compose(enc, AGX3_MN_cndcf, 1, base_c, 2, ov, 3, out, len);
 }
 
 bool
@@ -638,7 +638,7 @@ agx3_cf_cndef(enum agx_isa_encoding enc, uint8_t out[AGX3_CF_MAX_LENGTH],
    const struct agx3_field_kv base_c[] = {KV(1, 6),  KV(2, 3),  KV(3, 29),
                                           KV(12, 1), KV(16, 2), KV(17, 1),
                                           KV(18, 2)};
-   return agx3_bind_compose(enc, "cndef", 0, agx3b(enc) ? base_b : base_c,
+   return agx3_bind_compose(enc, AGX3_MN_cndef, 0, agx3b(enc) ? base_b : base_c,
                             agx3b(enc) ? 4 : 7, NULL, 0, out, len);
 }
 
@@ -652,7 +652,7 @@ agx3_cf_cndend(enum agx_isa_encoding enc, unsigned pop_count,
    const struct agx3_field_kv base_c[] = {KV(0, 3), KV(1, 30), KV(14, 2),
                                           KV(15, 2), KV(16, 2)};
    const struct agx3_field_kv ov[] = {KV(10, pop_count)};
-   return agx3_bind_compose(enc, "cndend", 0, agx3b(enc) ? base_b : base_c,
+   return agx3_bind_compose(enc, AGX3_MN_cndend, 0, agx3b(enc) ? base_b : base_c,
                             agx3b(enc) ? 2 : 5, ov, 1, out, len);
 }
 
@@ -660,7 +660,7 @@ bool
 agx3_cf_branch(enum agx_isa_encoding enc, bool is_bn,
                uint8_t out[AGX3_CF_MAX_LENGTH], uint8_t *len)
 {
-   const char *mnem = is_bn ? "bn" : "b";
+   enum agx3_mnemonic mnem = is_bn ? AGX3_MN_bn : AGX3_MN_b;
    const int ep = agx3b(enc) ? 0 : 1;
    const struct agx3_field_kv base_c[] = {KV(1, 3), KV(2, is_bn ? 21 : 8)};
    return agx3_bind_compose(enc, mnem, ep, base_c, agx3b(enc) ? 0 : 2, NULL, 0,
@@ -753,7 +753,7 @@ bool agx3_cf_fcmp_zero_imm(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
    };
    for(unsigned i=0;i<(m5?8:6);i++)fields[7+i]=(struct agx3_field_kv)KV(38+i,!!(wait_mask&(1u<<i)));
    for(unsigned ep=0;ep<=(m5?3:1);ep++)
-      if(agx3_bind_compose(enc,"fcmp",ep,base,m5?6:4,fields,m5?15:13,out,len))return true;
+      if(agx3_bind_compose(enc,AGX3_MN_fcmp,ep,base,m5?6:4,fields,m5?15:13,out,len))return true;
    return false;
 }
 

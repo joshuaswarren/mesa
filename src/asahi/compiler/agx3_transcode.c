@@ -133,8 +133,8 @@
 #include "agx3_compose/agx3_decode.h"
 #include "asahi/isa/disasm.h"
 
-static const char *const refused_control_flow[] = {
-   "bl", "brk", "cndcall", "cndret", "dbgrtn", "yield",
+static const enum agx3_mnemonic refused_control_flow[] = {
+   AGX3_MN_bl, AGX3_MN_brk, AGX3_MN_cndcall, AGX3_MN_cndret, AGX3_MN_dbgrtn, AGX3_MN_yield,
 };
 
 /* The G17G flag slot that always reads true, and G18G's always-false one. */
@@ -148,10 +148,10 @@ static const char *const refused_control_flow[] = {
 #define DISPLACEMENT_MASK ((UINT64_C(1) << 48) - 1)
 
 static bool
-is_control_flow(const char *mnemonic)
+is_control_flow(enum agx3_mnemonic mnemonic)
 {
    for (unsigned i = 0; i < ARRAY_SIZE(refused_control_flow); ++i) {
-      if (!strcmp(mnemonic, refused_control_flow[i]))
+      if (mnemonic == refused_control_flow[i])
          return true;
    }
    return false;
@@ -180,19 +180,19 @@ spectpr_allocation(unsigned gprs16)
 }
 
 static bool
-apply_ioto_rules(const char *mnemonic, uint64_t fields[AGX3_MAX_FIELDS],
+apply_ioto_rules(enum agx3_mnemonic mnemonic, uint64_t fields[AGX3_MAX_FIELDS],
                  const struct agx3_transcode_ioto *ioto, const char **why)
 {
-   if (!strcmp(mnemonic, "ldshdr")) {
+   if (mnemonic == AGX3_MN_ldshdr) {
       fields[23] = 0;
       fields[21] = ioto->api_program ? 2 : 0;
-   } else if (!strcmp(mnemonic, "specTPR")) {
+   } else if (mnemonic == AGX3_MN_specTPR) {
       if (!ioto->shader_gprs || ioto->shader_gprs > 256) {
          *why = "specTPR without a register count";
          return false;
       }
       fields[24] = spectpr_allocation(ioto->shader_gprs);
-   } else if (!strcmp(mnemonic, "cndcall")) {
+   } else if (mnemonic == AGX3_MN_cndcall) {
       /* Only the witnessed helper call: target 27. */
       if (fields[16] != 27 || fields[17] != 1 || fields[25] != 1) {
          *why = "cndcall other than the witnessed Ioto helper call";
@@ -291,14 +291,14 @@ apply_imgwci_rule(uint64_t fields[AGX3_MAX_FIELDS], const char **why)
 }
 
 static bool
-apply_g18g_rules(const char *mnemonic, uint64_t fields[AGX3_MAX_FIELDS],
+apply_g18g_rules(enum agx3_mnemonic mnemonic, uint64_t fields[AGX3_MAX_FIELDS],
                  const struct agx3_transcode_ioto *ioto,
                  const bool *fragment_stage, const char **why)
 {
-   const bool ioto_only = !strcmp(mnemonic, "ldshdr") ||
-                          !strcmp(mnemonic, "specTPR") ||
-                          !strcmp(mnemonic, "specLM") ||
-                          !strcmp(mnemonic, "cndcall");
+   const bool ioto_only = mnemonic == AGX3_MN_ldshdr ||
+                          mnemonic == AGX3_MN_specTPR ||
+                          mnemonic == AGX3_MN_specLM ||
+                          mnemonic == AGX3_MN_cndcall;
    if (ioto_only) {
       if (!ioto) {
          *why = "Ioto-only instruction in shader code";
@@ -314,11 +314,11 @@ apply_g18g_rules(const char *mnemonic, uint64_t fields[AGX3_MAX_FIELDS],
     * intermediate only represents this typed source at 16 bits. Bank 2
     * identifies the G18 publisher, whose caller zero-extends packed NIR
     * samples into a separate full word before reaching this translation. */
-   if (!strcmp(mnemonic, "pack_smpir") && fields[9] == 5 && fields[5] == 2 &&
+   if (mnemonic == AGX3_MN_pack_smpir && fields[9] == 5 && fields[5] == 2 &&
        fields[74] == 9 && fields[75] == 12 && fields[76] == 1 &&
        fields[23] == 2 && fields[24] == 1)
       fields[24] = 2;
-   if (!strcmp(mnemonic, "smp")) {
+   if (mnemonic == AGX3_MN_smp) {
       if (fields[77] != 0 && fields[77] != 2) {
          *why = "texture sample whose f77 no G18G witness shows";
          return false;
@@ -436,9 +436,9 @@ apply_g18g_rules(const char *mnemonic, uint64_t fields[AGX3_MAX_FIELDS],
       fields[62] |= fields[69];
       fields[69] = 0;
    }
-   if (!strcmp(mnemonic, "imgwci") && !apply_imgwci_rule(fields, why))
+   if (mnemonic == AGX3_MN_imgwci && !apply_imgwci_rule(fields, why))
       return false;
-   if (!strcmp(mnemonic, "lddev"))
+   if (mnemonic == AGX3_MN_lddev)
       fields[87] = fields[75] ? 2 : 0;
    /* Native454/567's register-sample RGBA32, RGBA16Float and BGRA8 reloads
     * use the G18 long LLDCol form with f79=2 at every payload width.
@@ -463,11 +463,11 @@ apply_g18g_rules(const char *mnemonic, uint64_t fields[AGX3_MAX_FIELDS],
        (fields[10] == 1 && (fields[26] == 1 || fields[26] == 3 ||
                             fields[26] == 7 || fields[26] == 15)) ||
        (fields[10] == 2 && (fields[26] == 1 || fields[26] == 3)));
-   if (!strcmp(mnemonic, "lldcol") &&
+   if (mnemonic == AGX3_MN_lldcol &&
        ((fields[51] == 2 && fields[10] <= 2 && fields[26] == 15) ||
         scalar_pixel_load || native844_pixel_load))
       fields[79] = 2;
-   if (!strcmp(mnemonic, "ldcfr")) {
+   if (mnemonic == AGX3_MN_ldcfr) {
       /* Native G18 no-perspective interpolate_at_offset keeps the raw
        * three-coefficient selector f38=7 and adds f49=2. The flat-input
        * witness also has f49=2, but uses f38=5: that flat-only selector
@@ -482,22 +482,22 @@ apply_g18g_rules(const char *mnemonic, uint64_t fields[AGX3_MAX_FIELDS],
 /* The field naming the flag slot a compare writes or an exec-mask op reads,
  * or -1. cndend names none. */
 static int
-flag_slot_field(const char *mnemonic)
+flag_slot_field(enum agx3_mnemonic mnemonic)
 {
-   if (!strcmp(mnemonic, "icmp"))
+   if (mnemonic == AGX3_MN_icmp)
       return 31;
-   if (!strcmp(mnemonic, "fcmp"))
+   if (mnemonic == AGX3_MN_fcmp)
       return 35;
-   if (!strcmp(mnemonic, "cndst") || !strcmp(mnemonic, "cndlt") ||
-       !strcmp(mnemonic, "cndcf") || !strcmp(mnemonic, "cndef"))
+   if (mnemonic == AGX3_MN_cndst || mnemonic == AGX3_MN_cndlt ||
+       mnemonic == AGX3_MN_cndcf || mnemonic == AGX3_MN_cndef)
       return 1;
    return -1;
 }
 
 static bool
-is_compare(const char *mnemonic)
+is_compare(enum agx3_mnemonic mnemonic)
 {
-   return !strcmp(mnemonic, "icmp") || !strcmp(mnemonic, "fcmp");
+   return mnemonic == AGX3_MN_icmp || mnemonic == AGX3_MN_fcmp;
 }
 
 /* Whole-program flag-slot state: which predicate the previous instruction
@@ -510,7 +510,7 @@ struct flag_state {
 };
 
 static bool
-apply_flag_slot_rule(const char *mnemonic, uint64_t fields[AGX3_MAX_FIELDS],
+apply_flag_slot_rule(enum agx3_mnemonic mnemonic, uint64_t fields[AGX3_MAX_FIELDS],
                      struct flag_state *state, const char **why)
 {
    const int field = flag_slot_field(mnemonic);
@@ -533,7 +533,7 @@ apply_flag_slot_rule(const char *mnemonic, uint64_t fields[AGX3_MAX_FIELDS],
    if (slot == G17G_TRUE_SLOT) {
       /* Only the unconditional loop-entry push and the else flip read the
        * always-true slot, in G17G and G18G code alike. */
-      if (strcmp(mnemonic, "cndst") && strcmp(mnemonic, "cndef")) {
+      if (mnemonic != AGX3_MN_cndst && mnemonic != AGX3_MN_cndef) {
          *why = "always-true flag slot outside cndst/cndef";
          return false;
       }
@@ -658,30 +658,33 @@ transcode(struct util_dynarray *binary, unsigned start,
       trim_display(display, mnemonic, sizeof(mnemonic));
 
       uint64_t fields[AGX3_MAX_FIELDS];
+      const enum agx3_mnemonic shown = agx3_mnemonic_from_name(mnemonic);
       int32_t form =
-         agx3_decode(&agx3c_table, in + i, (unsigned)n, mnemonic, fields);
+         agx3_decode(&agx3c_table, in + i, (unsigned)n, shown, fields);
       /* As the witness-vector generator does: the display name is only a
-       * preference, some forms print under another name. */
-      if (form < 0)
-         form = agx3_decode(&agx3c_table, in + i, (unsigned)n, NULL, fields);
+       * preference, some forms print under another name. A name no table
+       * has was already decoded as any mnemonic. */
+      if (form < 0 && shown != AGX3_MN_NONE)
+         form = agx3_decode(&agx3c_table, in + i, (unsigned)n, AGX3_MN_NONE,
+                            fields);
       if (form < 0) {
          *why = "agx3c bytes do not decode to a field vector";
          goto fail;
       }
       /* Encode by the table's own name for the decoded form. */
-      const char *name = agx3c_table.forms[form].mnemonic;
+      const enum agx3_mnemonic name = agx3c_table.forms[form].mnemonic;
       if (helper_base_next) {
          /* The SR14 setup sequence indexes the USC-base helper table.
           * G18's AGX3D tables start at 0x200/0x400, twice the G17 bases.
           * Match this sequence rather than rewriting arbitrary immediates. */
-         if (strcmp(name, "ldimm") || fields[2] != 0 ||
+         if (name != AGX3_MN_ldimm || fields[2] != 0 ||
              (fields[14] != 0x100 && fields[14] != 0x200)) {
             *why = "unrecognized Ioto SR14 helper base";
             goto fail;
          }
          fields[14] *= 2;
       }
-      helper_base_next = ioto && !strcmp(name, "rld") && fields[21] == 14;
+      helper_base_next = ioto && name == AGX3_MN_rld && fields[21] == 14;
       if (!apply_g18g_rules(name, fields, ioto, fragment_stage, why) ||
           !apply_flag_slot_rule(name, fields, &flags, why))
          goto fail;
@@ -689,7 +692,7 @@ transcode(struct util_dynarray *binary, unsigned start,
        * single-sample mixed-format fragments take the long LLDCol form with
        * f79 = 2, inside the fragment's 0x200 entry and final release; the
        * packer validated every read of such a program. */
-      if (long_tile_reads && !strcmp(name, "lldcol") && fields[51] == 1 &&
+      if (long_tile_reads && name == AGX3_MN_lldcol && fields[51] == 1 &&
           fields[43] == 1)
          fields[79] = 2;
 
@@ -697,7 +700,7 @@ transcode(struct util_dynarray *binary, unsigned start,
 
       uint8_t bytes[2 * AGX3_MAX_WORDS];
       int32_t dform;
-      const bool branch = !strcmp(name, "b") || !strcmp(name, "bn");
+      const bool branch = name == AGX3_MN_b || name == AGX3_MN_bn;
       if (branch) {
          /* Encode with a zero displacement now, the real one once every
           * target has its agx3d offset. */

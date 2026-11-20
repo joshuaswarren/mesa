@@ -148,8 +148,11 @@ def dense(name, groups, forms):
     D['nodes'] = [node(a) for alts in groups for a in alts]
     D['forms'] = []
     for mnemonic, ep, size, root in forms:
-        D['forms'].append((mnemonic, ep, size, len(D['nodes'])))
+        D['forms'].append((len(D['nodes']), mnemonic, ep, size))
         D['nodes'].append(node(root))
+    # agx3_form_index() relies on this order.
+    require(forms == sorted(forms, key=lambda f: (f[0].encode(), f[1])),
+            'the forms are not in (mnemonic, ep) order')
     return D
 
 
@@ -183,7 +186,7 @@ def expand(D):
 
     return ([[node(off + i) for i in range(n)] for off, _, n, *_ in starts],
             [(mnemonic, ep, size, node(root))
-             for mnemonic, ep, size, root in D['forms']])
+             for root, mnemonic, ep, size in D['forms']])
 
 
 def check_keys(D, groups):
@@ -233,7 +236,7 @@ LAYOUT = {
     'cmds': ('agx3_cmd', (16, 8, 8, 8, 8, 8, 8)),
     'groups': ('agx3_group', (32, 32, 16, 8, 1)),
     'nodes': ('agx3_node', (32, 16, 16, 16, 8, 8, 8, 8)),
-    'forms': ('agx3_form', (None, 8, 8, 32)),
+    'forms': ('agx3_form', (32, None, 8, 8)),
     'lutpool': ('uint8_t', 8),
     'setpool': ('uint8_t', 8),
     'keys': ('uint8_t', 8),
@@ -242,7 +245,7 @@ LAYOUT = {
 
 def cell(name, value, bits):
     if bits is None:
-        return '"%s"' % value
+        return 'AGX3_MN_' + value
     # A value that outgrows its member needs a wider type in agx3_compose.h.
     require(0 <= value < 1 << bits, '%s: %d does not fit in %d bits',
             name, value, bits)
@@ -264,9 +267,16 @@ def print_c(name, D, out):
             for i in range(0, len(vals), 16):
                 out.write(','.join(vals[i:i + 16]) + ',\n')
         out.write('};\n')
+    # One more than the index of each mnemonic's first form.
+    out.write('static const uint16_t mnemonic_forms[AGX3_MN_COUNT] = {\n')
+    for i, form in enumerate(D['forms']):
+        if i == 0 or D['forms'][i - 1][1] != form[1]:
+            out.write('[AGX3_MN_%s] = %s,\n' %
+                      (form[1], cell('mnemonic_forms', i + 1, 16)))
+    out.write('};\n')
     out.write('const agx3_table %s_table = {\n'
-              '   forms, %d, nodes, groups, fixeds, predrefs, preds, cmds,\n'
-              '   lutpool, setpool, keys,\n'
+              '   forms, %d, mnemonic_forms, nodes, groups, fixeds, predrefs,\n'
+              '   preds, cmds, lutpool, setpool, keys,\n'
               '};\n' % (name, len(D['forms'])))
 
 
