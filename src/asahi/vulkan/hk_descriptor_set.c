@@ -27,6 +27,7 @@
 #include "asahi/compiler/agx_nir.h"
 
 #include "util/cache_ops.h"
+#include "util/log.h"
 #include "util/u_debug.h"
 
 #include <inttypes.h>
@@ -45,11 +46,12 @@ desc_ubo_data(struct hk_descriptor_set *set, uint32_t binding, uint32_t elem,
    const struct hk_descriptor_set_binding_layout *binding_layout =
       &set->layout->binding[binding];
 
+   /* An element at or past the end of the set has no bytes: the callers
+    * that write refuse it, in every build. */
    uint32_t offset = binding_layout->offset + elem * binding_layout->stride;
-   assert(offset < set->size);
 
    if (size_out != NULL)
-      *size_out = set->size - offset;
+      *size_out = offset < set->size ? set->size - offset : 0;
 
    return (char *)set->mapped_ptr + offset;
 }
@@ -117,9 +119,11 @@ static void
 write_desc(struct hk_descriptor_set *set, uint32_t binding, uint32_t elem,
            const void *desc_data, size_t desc_size)
 {
-   ASSERTED uint32_t dst_size;
+   uint32_t dst_size;
    void *dst = desc_ubo_data(set, binding, elem, &dst_size);
-   assert(desc_size <= dst_size);
+   if (desc_size > dst_size)
+      return;
+
    memcpy(dst, desc_data, desc_size);
    hk_descriptor_set_publish(set, dst, desc_size);
 }
@@ -597,9 +601,11 @@ write_buffer_desc_array(struct hk_descriptor_set *set, const void *data,
       return;
    }
 
-   ASSERTED uint32_t available;
+   uint32_t available;
    uint8_t *dst = desc_ubo_data(set, binding, first_elem, &available);
-   assert(count <= available / sizeof(struct hk_buffer_address));
+   if (count > available / sizeof(struct hk_buffer_address))
+      return;
+
    for (uint32_t i = 0; i < count; ++i) {
       const VkDescriptorBufferInfo *info =
          (const void *)((const uint8_t *)data + i * data_stride);
@@ -726,29 +732,33 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
        */
       if (dst_binding_layout->stride > 0 &&
           dst_binding_layout->stride == src_binding_layout->stride) {
-         ASSERTED uint32_t dst_max_size, src_max_size;
+         uint32_t dst_max_size, src_max_size;
          void *dst_map = desc_ubo_data(dst, copy->dstBinding,
                                       copy->dstArrayElement, &dst_max_size);
          const void *src_map = desc_ubo_data(src, copy->srcBinding,
                                             copy->srcArrayElement, &src_max_size);
          const size_t size =
             (size_t)copy->descriptorCount * dst_binding_layout->stride;
-         assert(size <= dst_max_size && size <= src_max_size);
-         if (size == sizeof(struct hk_buffer_address))
-            memcpy(dst_map, src_map, sizeof(struct hk_buffer_address));
-         else
-            memcpy(dst_map, src_map, size);
-         hk_descriptor_set_publish(dst, dst_map, size);
+         /* A range past the end of either set is not copied. */
+         if (size <= dst_max_size && size <= src_max_size) {
+            if (size == sizeof(struct hk_buffer_address))
+               memcpy(dst_map, src_map, sizeof(struct hk_buffer_address));
+            else
+               memcpy(dst_map, src_map, size);
+            hk_descriptor_set_publish(dst, dst_map, size);
+         }
       } else if (dst_binding_layout->stride > 0 && src_binding_layout->stride > 0) {
          for (uint32_t j = 0; j < copy->descriptorCount; j++) {
-            ASSERTED uint32_t dst_max_size, src_max_size;
+            uint32_t dst_max_size, src_max_size;
             void *dst_map = desc_ubo_data(
                dst, copy->dstBinding, copy->dstArrayElement + j, &dst_max_size);
             const void *src_map = desc_ubo_data(
                src, copy->srcBinding, copy->srcArrayElement + j, &src_max_size);
             const uint32_t copy_size =
                MIN2(dst_binding_layout->stride, src_binding_layout->stride);
-            assert(copy_size <= dst_max_size && copy_size <= src_max_size);
+            if (copy_size > dst_max_size || copy_size > src_max_size)
+               break;
+
             memcpy(dst_map, src_map, copy_size);
             hk_descriptor_set_publish(dst, dst_map, copy_size);
          }
@@ -864,22 +874,46 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
       hk_copy_descriptor_sets(descriptorCopyCount, pDescriptorCopies);
 }
 
-void
+/* Points a push descriptor set at layout for an update, and returns false,
+ * leaving it empty, if the layout does not fit the storage. Every push layout
+ * within the limits does (HK_PUSH_DESCRIPTOR_SET_SIZE): this keeps one that
+ * does not from being written, saved or uploaded past it, and says so.
+ */
+static bool
+hk_push_descriptor_set_begin(struct hk_push_descriptor_set *push_set,
+                             struct hk_descriptor_set_layout *layout,
+                             struct hk_descriptor_set *set)
+{
+   memcpy(push_set->layout_hash, layout->vk.blake3,
+          sizeof(push_set->layout_hash));
+   push_set->layout_flags = layout->vk.flags;
+   if (layout->non_variable_descriptor_buffer_size > sizeof(push_set->data)) {
+      mesa_loge("push descriptor layout of %u bytes refused: the push set "
+                "holds %zu",
+                layout->non_variable_descriptor_buffer_size,
+                sizeof(push_set->data));
+      push_set->size = 0;
+      return false;
+   }
+
+   push_set->size = layout->non_variable_descriptor_buffer_size;
+   *set = (struct hk_descriptor_set){
+      .layout = layout,
+      .size = sizeof(push_set->data),
+      .mapped_ptr = push_set->data,
+   };
+   return true;
+}
+
+bool
 hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
                               struct hk_descriptor_set_layout *layout,
                               uint32_t write_count,
                               const VkWriteDescriptorSet *writes)
 {
-   memcpy(push_set->layout_hash, layout->vk.blake3,
-          sizeof(push_set->layout_hash));
-   push_set->layout_flags = layout->vk.flags;
-   push_set->size = layout->non_variable_descriptor_buffer_size;
-   assert(layout->non_variable_descriptor_buffer_size < sizeof(push_set->data));
-   struct hk_descriptor_set set = {
-      .layout = layout,
-      .size = sizeof(push_set->data),
-      .mapped_ptr = push_set->data,
-   };
+   struct hk_descriptor_set set;
+   if (!hk_push_descriptor_set_begin(push_set, layout, &set))
+      return false;
 
    for (uint32_t w = 0; w < write_count; w++) {
       const VkWriteDescriptorSet *write = &writes[w];
@@ -941,6 +975,8 @@ hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
          break;
       }
    }
+
+   return true;
 }
 
 static void hk_descriptor_pool_free(struct hk_descriptor_pool *pool,
@@ -1395,22 +1431,18 @@ hk_UpdateDescriptorSetWithTemplate(
    hk_descriptor_set_write_template(set, template, pData);
 }
 
-void
+bool
 hk_push_descriptor_set_update_template(
    struct hk_push_descriptor_set *push_set,
    struct hk_descriptor_set_layout *layout,
    const struct vk_descriptor_update_template *template, const void *data)
 {
-   memcpy(push_set->layout_hash, layout->vk.blake3,
-          sizeof(push_set->layout_hash));
-   push_set->layout_flags = layout->vk.flags;
-   push_set->size = layout->non_variable_descriptor_buffer_size;
-   struct hk_descriptor_set tmp_set = {
-      .layout = layout,
-      .size = sizeof(push_set->data),
-      .mapped_ptr = push_set->data,
-   };
+   struct hk_descriptor_set tmp_set;
+   if (!hk_push_descriptor_set_begin(push_set, layout, &tmp_set))
+      return false;
+
    hk_descriptor_set_write_template(&tmp_set, template, data);
+   return true;
 }
 
 /*
