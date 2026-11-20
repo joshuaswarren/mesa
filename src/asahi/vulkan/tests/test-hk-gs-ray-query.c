@@ -125,7 +125,8 @@ check_split(bool dynamic_count, bool instances)
 /* CTS elects one invocation with CAS, then increments only on a successful
  * query. The geometry prepass must not claim that election. */
 static bool
-check_atomic_guard(bool native, bool instances)
+check_atomic_guard(bool native, bool instances,
+                   enum poly_gs_side_effects side_effects)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_GEOMETRY, &agx_nir_options, "GS query atomic guard");
@@ -190,7 +191,7 @@ check_atomic_guard(bool native, bool instances)
       .graphics_stage = true,
    };
    CHECK(hk_nir_lower_gs(b.shader, &count, &rast, &pre, &info,
-                         native ? &layout : NULL, POLY_GS_SIDE_EFFECTS_REPLAY,
+                         native ? &layout : NULL, side_effects,
                          NULL));
    CHECK(!count);
    unsigned atomics = 0, queries = 0;
@@ -905,9 +906,11 @@ int
 main(void)
 {
    glsl_type_singleton_init_or_ref();
-   bool valid = check_atomic_guard(false, false);
-   valid &= check_atomic_guard(true, false);
-   valid &= check_atomic_guard(true, true);
+   bool valid = check_atomic_guard(false, false, POLY_GS_SIDE_EFFECTS_REPLAY);
+   valid &= check_atomic_guard(true, false, POLY_GS_SIDE_EFFECTS_REPLAY);
+   valid &= check_atomic_guard(true, true, POLY_GS_SIDE_EFFECTS_REPLAY);
+   valid &= check_atomic_guard(true, false, POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT);
+   valid &= check_atomic_guard(true, true, POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT);
    for (unsigned dynamic = 0; dynamic < 2; ++dynamic)
       for (unsigned instances = 0; instances < 2; ++instances)
          valid &= check_split(dynamic, instances);

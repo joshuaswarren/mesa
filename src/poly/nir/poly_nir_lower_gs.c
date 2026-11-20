@@ -1600,11 +1600,26 @@ replay_blocks_main_side_effects(const nir_shader *s)
    return false;
 }
 
+static bool
+shader_has_ray_query(const nir_shader *s)
+{
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_intrinsic_is_ray_query(nir_instr_as_intrinsic(instr)->intrinsic))
+            return true;
+      }
+   }
+   return false;
+}
+
 /*
  * Decide whether POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT can safely execute
  * all API stores and atomics in the main kernel and drop them from count/rast.
- * Require that (1) the shader actually has API side effects, (2) replay drops
- * every single API store, atomic, and fence (so nothing is duplicated, lost on
+ * Require that (1) the shader actually has API side effects and no unlowered
+ * native ray queries (so native ray queries stay on replay rather than moving
+ * into a potentially indirect main compute dispatch), (2) replay drops every
+ * single API store, atomic, and fence (so nothing is duplicated, lost on
  * 0-vertex emission, or reordered between main and rast), and (3) replay retains
  * no application memory/UBO/image/texture read, barrier, subgroup operation, or
  * shader clock. Runs on the post-lower_gs_inputs() shader so the probe follows
@@ -1616,7 +1631,7 @@ can_use_main_side_effects(const nir_shader *gs,
                           poly_nir_remove_dead_fn remove_dead,
                           bool eliminate_local_ray_queries)
 {
-   if (!has_api_side_effect(gs))
+   if (!has_api_side_effect(gs) || shader_has_ray_query(gs))
       return false;
 
    nir_shader *probe = nir_shader_clone(NULL, gs);

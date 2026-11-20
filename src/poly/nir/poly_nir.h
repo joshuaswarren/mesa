@@ -65,9 +65,11 @@ enum poly_gs_side_effects {
    /* Perform API stores and atomics once per invocation in the main kernel
     * and strip them from the count and raster variants (M5). */
    POLY_GS_SIDE_EFFECTS_MAIN,
-   /* Use POLY_GS_SIDE_EFFECTS_MAIN only when replay drops every API side
-    * effect and retains no mutable memory, image, or texture reads that could
-    * observe main's writes; otherwise fall back to POLY_GS_SIDE_EFFECTS_REPLAY. */
+   /* Use POLY_GS_SIDE_EFFECTS_MAIN only when the shader has no unlowered ray
+    * queries, replay drops every API side effect, and replay retains no
+    * non-Poly memory/UBO/image/texture loads, barriers, subgroup/quadgroup
+    * ops, or shader clocks; otherwise fall back to
+    * POLY_GS_SIDE_EFFECTS_REPLAY. */
    POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT,
 };
 
