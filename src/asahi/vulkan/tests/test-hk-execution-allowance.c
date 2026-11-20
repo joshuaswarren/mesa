@@ -20,6 +20,15 @@ hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
    return (uint8_t *)current + AGX_CDM_STREAM_LINK_LENGTH;
 }
 
+/* The streams here record no alias sites (hk_cs::alias_sites stays zero), so
+ * the merge never moves any. */
+void
+hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
+                               const void *from_end, uint8_t *to, size_t skip)
+{
+   assert(!"no alias sites are recorded");
+}
+
 /* Merged streams here record no attachments; with more than one merge call
  * the compiler keeps hk_cs_merge_cdm() out of line, with its attachment loop. */
 bool
