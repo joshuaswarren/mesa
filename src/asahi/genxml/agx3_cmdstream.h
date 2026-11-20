@@ -134,23 +134,7 @@ agx3_cmdstream_load_le32(const uint8_t *src)
 static inline bool
 agx3_cdm_launch_target_grounded(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   case AGX_CHIP_G18G:
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_has_record(chip, AGX_RECORD_CDM_LAUNCH);
 }
 
 /* Kept separate from the 40-byte direct-launch gate so later evidence for one
@@ -159,25 +143,9 @@ agx3_cdm_launch_target_grounded(enum agx_chip chip)
 static inline bool
 agx3_cdm_indirect_launch_target_grounded(enum agx_chip chip)
 {
-   switch (chip) {
    /* G18G: the same six-word launch; the template's upper half of word 4
     * is 0. */
-   case AGX_CHIP_G18G:
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_has_record(chip, AGX_RECORD_CDM_INDIRECT_LAUNCH);
 }
 
 /* Keep the nine-word family independently gated: its presence was checked
@@ -186,24 +154,8 @@ agx3_cdm_indirect_launch_target_grounded(enum agx_chip chip)
 static inline bool
 agx3_cdm_indirect_launch_36_target_grounded(enum agx_chip chip)
 {
-   switch (chip) {
    /* G18G: the same nine-word launch. */
-   case AGX_CHIP_G18G:
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_has_record(chip, AGX_RECORD_CDM_INDIRECT_LAUNCH_36);
 }
 
 /* The 48-bit link form holds in every scoped base and aggregate family.
@@ -212,22 +164,7 @@ agx3_cdm_indirect_launch_36_target_grounded(enum agx_chip chip)
 static inline bool
 agx3_cdm_stream_link_target_grounded(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_has_record(chip, AGX_RECORD_CDM_STREAM_LINK);
 }
 
 static inline bool
@@ -524,7 +461,7 @@ agx3_cdm_stream_link_unpack(
 static inline bool
 agx3_cdm_link_padding_target_grounded(enum agx_chip chip)
 {
-   return chip != AGX_CHIP_G18G && agx3_cdm_launch_target_grounded(chip);
+   return agx_chip_has_record(chip, AGX_RECORD_CDM_LINK_PADDING);
 }
 
 static inline bool
@@ -579,23 +516,7 @@ agx3_cdm_link_padding_unpack(
 static inline bool
 agx3_cdm_barrier_target_grounded(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   case AGX_CHIP_G18G:
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_has_record(chip, AGX_RECORD_CDM_BARRIER);
 }
 
 static inline bool
@@ -627,8 +548,7 @@ agx3_cdm_barrier_wide_visibility_grounded(enum agx_chip chip)
 {
    /* G15C (M3 Max) is G15S's generation with more clusters and takes the
     * same forms. */
-   return chip == AGX_CHIP_G15G || chip == AGX_CHIP_G15S ||
-          chip == AGX_CHIP_G15C || chip == AGX_CHIP_G16G;
+   return agx_chip_has_record(chip, AGX_RECORD_CDM_BARRIER_WIDE_VISIBILITY);
 }
 
 #define AGX3_CDM_BARRIER_WIDE_VISIBILITY UINT32_C(0x0002009e)
@@ -655,15 +575,7 @@ agx3_cdm_barrier_wide_visibility_grounded(enum agx_chip chip)
 static inline bool
 agx3_cdm_barrier_flush_memory_grounded(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_has_record(chip, AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY);
 }
 
 static inline uint32_t
@@ -786,7 +698,7 @@ agx3_cdm_sstt_flush_invalidate_validate(enum agx_chip chip,
 static inline bool
 agx3_cdm_substream_barrier_target_grounded(enum agx_chip chip)
 {
-   return chip != AGX_CHIP_G18G && agx3_cdm_barrier_target_grounded(chip);
+   return agx_chip_has_record(chip, AGX_RECORD_CDM_SUBSTREAM_BARRIER);
 }
 
 static inline bool
@@ -847,8 +759,7 @@ agx3_cdm_substream_barrier_unpack(
 static inline bool
 agx3_cdm_secondary_barrier_target_grounded(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
+   return agx_chip_has_record(chip, AGX_RECORD_CDM_SECONDARY_BARRIER);
 }
 
 static inline bool

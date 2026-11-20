@@ -36,22 +36,7 @@ is_hal300(enum agx_chip chip)
 bool
 agx_ioto_profile_control_supported(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_has_record(chip, AGX_RECORD_IOTO_PROFILE_CONTROL);
 }
 
 size_t

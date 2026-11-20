@@ -603,50 +603,6 @@ test_classification_invariants(void)
    CHECK(strcmp(agx_isa_name(AGX_ISA_UNKNOWN), "unknown") == 0);
 }
 
-/* A record bit of the chip table is what that record's allowlist answers.
- * Checked while the allowlists still carry their own chip lists. */
-static void
-test_record_bits_match_allowlists(void)
-{
-   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
-      const enum agx_chip c = (enum agx_chip)i;
-      const unsigned records = agx_chip_info(c)->records;
-
-#define RECORD(bit, allowlist)                                                 \
-   CHECK(!!(records & AGX_RECORD_##bit) == allowlist(c))
-      RECORD(VDM_STATE, agx_vdm_state_vertex_pipeline_pair_supported);
-      RECORD(VDM_PPP_STATE, agx_vdm_ppp_state_core_supported);
-      RECORD(VDM_BARRIER, agx_vdm_barrier_core_supported);
-      RECORD(VDM_STREAM_LINK, agx_vdm_stream_link_core_supported);
-      RECORD(VDM_STREAM_TERMINATE, agx_vdm_stream_terminate_core_supported);
-      RECORD(VDM_TESSELLATE, agx_vdm_tessellate_direct_target_supported);
-      RECORD(VDM_INDEX_LIST,
-             agx_vdm_index_list_direct_target_supported_inline);
-      RECORD(PPP_HAL300_DEPTH_STENCIL,
-             agx_ppp_hal300_depth_stencil_core_supported);
-      RECORD(PPP_HAL300_DEPTH_BIAS_SCISSOR,
-             agx_ppp_hal300_depth_bias_scissor_core_supported);
-      RECORD(CDM_LAUNCH, agx3_cdm_launch_target_grounded);
-      RECORD(CDM_INDIRECT_LAUNCH, agx3_cdm_indirect_launch_target_grounded);
-      RECORD(CDM_INDIRECT_LAUNCH_36,
-             agx3_cdm_indirect_launch_36_target_grounded);
-      RECORD(CDM_STREAM_LINK, agx3_cdm_stream_link_target_grounded);
-      RECORD(CDM_LINK_PADDING, agx3_cdm_link_padding_target_grounded);
-      RECORD(CDM_BARRIER, agx3_cdm_barrier_target_grounded);
-      RECORD(CDM_BARRIER_WIDE_VISIBILITY,
-             agx3_cdm_barrier_wide_visibility_grounded);
-      RECORD(CDM_BARRIER_FLUSH_MEMORY,
-             agx3_cdm_barrier_flush_memory_grounded);
-      RECORD(CDM_SUBSTREAM_BARRIER,
-             agx3_cdm_substream_barrier_target_grounded);
-      RECORD(CDM_SECONDARY_BARRIER,
-             agx3_cdm_secondary_barrier_target_grounded);
-      RECORD(IOTO_PROFILE_CONTROL, agx_ioto_profile_control_supported);
-      RECORD(HAL300_NATIVE_CAPTURE, agx_chip_hal300_records);
-#undef RECORD
-   }
-}
-
 int
 main(void)
 {
@@ -657,7 +613,6 @@ main(void)
    test_params_contracts();
    test_invalid_identity();
    test_classification_invariants();
-   test_record_bits_match_allowlists();
 
    if (failures) {
       fprintf(stderr, "agx_chip: %u of %u checks failed\n", failures, checks);
