@@ -26,7 +26,6 @@ jobs:
     # workflow_dispatch lets you pick a tag; a skipped job never takes a
     # runner (a gate step would already be running on one).
     if: github.ref_type == 'branch'
-    env:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
