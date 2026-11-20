@@ -182,125 +182,24 @@ typedef struct drm_asahi_params_global decoder_params;
 
 /* Keep command-stream selection on the kernel's explicit generation/variant
  * identity.  Cluster count cannot distinguish A18 Pro (G17P/AGX3b) from M5
- * (G17G/AGX3c), and must never be used as an architecture proxy.  This local
- * form avoids making the standalone decoder library depend on libasahi_lib;
- * agx_chip_from_params() is the equivalent device-open mapping. */
+ * (G17G/AGX3c), and must never be used as an architecture proxy.
+ *
+ * This is agx_chip_from_params() without device open's cluster-count check,
+ * and with one more identity: a trace that names the M4 Max by variant 'X'
+ * decodes as G17P.  Device open refuses that variant. */
 enum agx_chip
 agxdecode_chip_from_params(const decoder_params *params)
 {
    if (!params)
       return AGX_CHIP_UNKNOWN;
 
-   switch (params->gpu_generation) {
-   case 13:
-      switch (params->gpu_variant) {
-      case 'G': return AGX_CHIP_G13G;
-      case 'S':
-      case 'C':
-      case 'D': return AGX_CHIP_G13X;
-      default: return AGX_CHIP_UNKNOWN;
-      }
-   case 14:
-      switch (params->gpu_variant) {
-      case 'G': return AGX_CHIP_G14G;
-      case 'S':
-      case 'C':
-      case 'D': return AGX_CHIP_G14X;
-      default: return AGX_CHIP_UNKNOWN;
-      }
-   case 15:
-      switch (params->gpu_variant) {
-      case 'P': return AGX_CHIP_G15P;
-      case 'G': return AGX_CHIP_G15G;
-      case 'S': return AGX_CHIP_G15S;
-      case 'C': return AGX_CHIP_G15C;
-      case 'D': return AGX_CHIP_G15D;
-      default: return AGX_CHIP_UNKNOWN;
-      }
-   case 16:
-      switch (params->gpu_variant) {
-      case 'P': return AGX_CHIP_G16P;
-      case 'G': return AGX_CHIP_G16G;
-      case 'S':
-         /* As agx_chip_from_params(): the M4 Pro on the G17 runtime is G17P. */
-         if (params->chip_id == 0x6040 &&
-             params->usc_generation == AGX_ISA_AGX3 &&
-             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200)
-            return AGX_CHIP_G17P;
-         return AGX_CHIP_G16S;
-      case 'C':
-      case 'X':
-         /* As agx_chip_from_params(): the M4 Max on the G17 runtime is G17P. */
-         if (params->chip_id == 0x6041 &&
-             params->usc_generation == AGX_ISA_AGX3 &&
-             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200)
-            return AGX_CHIP_G17P;
-         return params->gpu_variant == 'C' ? AGX_CHIP_G16C : AGX_CHIP_UNKNOWN;
-      default: return AGX_CHIP_UNKNOWN;
-      }
-   case 17:
-      switch (params->gpu_variant) {
-      case 'P': return AGX_CHIP_G17P;
-      case 'A': return AGX_CHIP_G17A;
-      case 'G': return AGX_CHIP_G17G;
-      case 'S': return AGX_CHIP_G17S;
-      case 'C': return AGX_CHIP_G17C;
-      default: return AGX_CHIP_UNKNOWN;
-      }
-   case 18:
-      switch (params->gpu_variant) {
-      case 'G': return AGX_CHIP_G18G;
-      default: return AGX_CHIP_UNKNOWN;
-      }
-   default:
-      return AGX_CHIP_UNKNOWN;
+   if (params->gpu_generation == 16 && params->gpu_variant == 'X') {
+      return agx_params_g17_runtime(params, AGX_CHIP_ID_M4_MAX)
+                ? AGX_CHIP_G17P
+                : AGX_CHIP_UNKNOWN;
    }
-}
 
-static bool
-agxdecode_chip_uses_agx3(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17A:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   case AGX_CHIP_G18G:
-      return true;
-   default:
-      return false;
-   }
-}
-
-static const char *
-agxdecode_chip_name(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G15G: return "G15G";
-   case AGX_CHIP_G15S: return "G15S";
-   case AGX_CHIP_G15C: return "G15C";
-   case AGX_CHIP_G15D: return "G15D";
-   case AGX_CHIP_G16P: return "G16P";
-   case AGX_CHIP_G16G: return "G16G";
-   case AGX_CHIP_G16S: return "G16S";
-   case AGX_CHIP_G16C: return "G16C";
-   case AGX_CHIP_G17P: return "G17P";
-   case AGX_CHIP_G17A: return "G17A";
-   case AGX_CHIP_G17G: return "G17G";
-   case AGX_CHIP_G17S: return "G17S";
-   case AGX_CHIP_G17C: return "G17C";
-   case AGX_CHIP_G18G: return "G18G";
-   default: return "unknown";
-   }
+   return agx_chip_from_identity(params);
 }
 
 /* Abstraction for command stream parsing */
@@ -737,7 +636,7 @@ agxdecode_ioto(UNUSED struct agxdecode_ctx *ctx, const uint8_t *map,
                                        &consumed)) {
       fprintf(agxdecode_dump_stream,
               "Unknown or non-canonical AGX3 Ioto record for %s\n",
-              agxdecode_chip_name(chip));
+              agx_chip_name(chip));
       return STATE_ERROR;
    }
 
@@ -787,7 +686,7 @@ agxdecode_cdm_agx3(struct agxdecode_ctx *ctx, const uint8_t *map,
       if (!agx3_cdm_direct_launch_unpack(chip, map, available, &direct)) {
          fprintf(agxdecode_dump_stream,
                  "Note: AGX3 launch is not the canonical direct form for %s\n",
-                 agxdecode_chip_name(chip));
+                 agx_chip_name(chip));
          u_hexdump(agxdecode_dump_stream, map,
                    MIN2(available, (size_t)AGX3_CDM_DIRECT_LAUNCH_SIZE), false);
       }
@@ -796,7 +695,7 @@ agxdecode_cdm_agx3(struct agxdecode_ctx *ctx, const uint8_t *map,
    if (!agx3_cdm_decode_one(chip, map, available, &record)) {
       fprintf(agxdecode_dump_stream,
               "Unknown or non-canonical AGX3 CDM record for %s\n",
-              agxdecode_chip_name(chip));
+              agx_chip_name(chip));
       return STATE_ERROR;
    }
 
@@ -906,7 +805,7 @@ agxdecode_cdm(struct agxdecode_ctx *ctx, const uint8_t *map,
               decoder_params *params, UNUSED void *data)
 {
    const enum agx_chip chip = agxdecode_chip_from_params(params);
-   if (agxdecode_chip_uses_agx3(chip))
+   if (agx_chip_isa(chip) == AGX_ISA_AGX3)
       return agxdecode_cdm_agx3(ctx, map, available, link, verbose, params,
                                 chip);
 
@@ -1020,7 +919,7 @@ agxdecode_ppp_agx3(struct agxdecode_ctx *ctx, enum agx_chip chip, uint64_t va,
       fprintf(agxdecode_dump_stream,
               "Unsupported or non-canonical AGX3 PPP payload for %s "
               "(%zu bytes)\n",
-              agxdecode_chip_name(chip), size);
+              agx_chip_name(chip), size);
       if (verbose)
          u_hexdump(agxdecode_dump_stream, payload, size, false);
       return;
@@ -1097,7 +996,7 @@ agxdecode_vdm_agx3(struct agxdecode_ctx *ctx, const uint8_t *map,
    if (!agx_vdm_decode_one(chip, map, available, &record)) {
       fprintf(agxdecode_dump_stream,
               "Unknown or non-canonical AGX3 VDM record for %s\n",
-              agxdecode_chip_name(chip));
+              agx_chip_name(chip));
       return STATE_ERROR;
    }
 
@@ -1284,7 +1183,7 @@ agxdecode_vdm(struct agxdecode_ctx *ctx, const uint8_t *map,
               decoder_params *params, UNUSED void *data)
 {
    const enum agx_chip chip = agxdecode_chip_from_params(params);
-   if (agxdecode_chip_uses_agx3(chip))
+   if (agx_chip_isa(chip) == AGX_ISA_AGX3)
       return agxdecode_vdm_agx3(ctx, map, available, link, verbose, params,
                                 chip);
 
