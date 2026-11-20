@@ -1,21 +1,32 @@
 name: macOS-CI
-on: push
+# This ran `on: push` on the macos-11 label GitHub retired in 2024-06:
+# every push queued both matrix legs for a runner that can never exist
+# and GitHub auto-cancelled each run at 24h (~8,640 runner-min in 30
+# days, all wasted). Manual dispatch only now; the label is moved to
+# macos-15-intel (the brew paths below are Intel /usr/local) and the
+# job is bounded at 120 min.
+on: workflow_dispatch
 
 permissions:
   contents: read
+
+concurrency:
+  group: macos-ci
+  cancel-in-progress: true
 
 jobs:
   macOS-CI:
     strategy:
       matrix:
         glx_option: ['dri', 'xlib']
-    runs-on: macos-11
+    runs-on: macos-15-intel
+    timeout-minutes: 120
     env:
       GALLIUM_DUMP_CPU: true
       MESON_EXEC: /Users/runner/Library/Python/3.11/bin/meson
     steps:
     - name: Checkout
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     - name: Install Dependencies
       run: |
         cat > Brewfile <<EOL
@@ -51,7 +62,7 @@ jobs:
       run: $MESON_EXEC install -C build --destdir $PWD/install
     - name: 'Upload Artifact'
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: macos-${{ matrix.glx_option }}-result
         path: |
