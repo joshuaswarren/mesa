@@ -1375,7 +1375,7 @@ agxdecode_drm_cmd_render(struct agxdecode_ctx *ctx,
 {
    const enum agx_chip chip = agxdecode_chip_from_params(params);
    decode_cmd graphics_program_decoder =
-      agx_chip_native_agx3(chip) || chip == AGX_CHIP_G18G ? agxdecode_ioto
+      agx_chip_native_or_g18g(chip) ? agxdecode_ioto
                                                           : agxdecode_usc;
 
    DUMP_FIELD(c, "%x", flags);

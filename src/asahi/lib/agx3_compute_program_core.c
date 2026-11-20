@@ -143,8 +143,7 @@ agx3_g17p_native_compute_launch_pack(
 
    memset(packed, 0, AGX3_CDM_DIRECT_LAUNCH_SIZE);
    if (!program || !grid ||
-       (!agx_chip_native_agx3(program->chip) &&
-        !agx_chip_g17_m5(program->chip) && program->chip != AGX_CHIP_G18G) ||
+       !agx_chip_agx3_path(program->chip) ||
        program->program_va == 0 ||
        program->program_va > UINT64_C(0xffffffffffff) ||
        (program->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||

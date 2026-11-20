@@ -618,7 +618,8 @@ agx_stream_sampler_state(const struct agx_device *dev)
 static inline bool
 agx_is_m4_pro(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G17P && dev->params.chip_id == 0x6040 &&
+   return dev->chip == AGX_CHIP_G17P &&
+          dev->params.chip_id == AGX_CHIP_ID_M4_PRO &&
           dev->params.gpu_generation == 16 && dev->params.gpu_variant == 'S';
 }
 

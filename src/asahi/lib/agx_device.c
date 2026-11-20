@@ -1252,7 +1252,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * a practical limit. */
    if (agx_chip_native_agx3(dev->chip))
       dev->shader_base = AGX_G17P_USC_WINDOW_BASE;
-   else if (agx_chip_g17_m5(dev->chip) || dev->chip == AGX_CHIP_G18G)
+   else if (agx_chip_hal300_path(dev->chip))
       dev->shader_base = AGX_M5_SHADER_BASE;
 
    if (dev->shader_base < reservation) {
@@ -1290,9 +1290,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * robustness carveout untouched while making every ordinary VDM payload
     * directly representable, with no per-run alias option.
     */
-   const bool heap_below_usc = agx_chip_native_agx3(dev->chip) ||
-                               agx_chip_g17_m5(dev->chip) ||
-                               dev->chip == AGX_CHIP_G18G;
+   const bool heap_below_usc = agx_chip_agx3_path(dev->chip);
 
    /*
     * Start the low heap as high as it can go rather than at the reservation.
@@ -1346,7 +1344,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
    /* G17P is bounded by the narrower of the compact VDM aperture and the
     * absolute USC texture/sampler table pointer, both of which sit below the
     * USC window. Other chips retain the kernel-reported user limit. */
-   if (agx_chip_g17_m5(dev->chip) || dev->chip == AGX_CHIP_G18G) {
+   if (agx_chip_hal300_path(dev->chip)) {
       struct agx_m5_va_layout layout;
       if (!agx_m5_va_layout(dev->params.vm_start, dev->params.vm_end,
                             dev->params.vm_kernel_min_size, dev->shader_base,
@@ -1359,7 +1357,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
       user_start = layout.data_start;
    }
    const uint64_t user_limit =
-      agx_chip_g17_m5(dev->chip) || dev->chip == AGX_CHIP_G18G
+      agx_chip_hal300_path(dev->chip)
          ? AGX_M5_DATA_END
          : agx_va_user_limit(dev->chip, heap_below_usc,
                              vm_create.kernel_start);
@@ -1582,9 +1580,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
       initialized |= AGX_INIT_CONTEXT_SLOTS;
    }
 
-   const bool dynamic_printf = agx_chip_native_agx3(dev->chip) ||
-                               agx_chip_g17_m5(dev->chip) ||
-                               dev->chip == AGX_CHIP_G18G;
+   const bool dynamic_printf = agx_chip_agx3_path(dev->chip);
    struct agx_bo *bo =
       dynamic_printf
          ? agx_bo_create(dev, LIBAGX_PRINTF_BUFFER_SIZE, 0, AGX_BO_WRITEBACK,
@@ -1620,8 +1616,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
    initialized |= AGX_INIT_PRINTF;
 
    /* Map the stage helper tables at the USC execution-window base. */
-   if (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
-       dev->chip == AGX_CHIP_G18G) {
+   if (agx_chip_agx3_path(dev->chip)) {
       const size_t usc_base_size = AIL_PAGESIZE;
 
       simple_mtx_lock(&dev->vma_lock);

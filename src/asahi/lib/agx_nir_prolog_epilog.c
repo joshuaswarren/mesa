@@ -1617,7 +1617,7 @@ agx_nir_lower_fs_output_to_epilog_for_device(
    nir_shader *s, enum agx_chip chip, struct agx_fs_epilog_link_info *out)
 {
    return lower_fs_output_to_epilog(
-      s, out, agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip),
+      s, out, agx_chip_native_or_m5(chip),
       agx_chip_native_agx3(chip), agx_chip_native_agx3(chip));
 }
 

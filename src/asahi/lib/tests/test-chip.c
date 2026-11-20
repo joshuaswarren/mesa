@@ -113,6 +113,11 @@ static unsigned checks;
    ROW(agx_chip_driver_supported(c), "1111 01110 0100 10000 0 0")              \
    ROW(agx_chip_uses_legacy_precompiled_programs(c),                           \
        "1111 00000 0000 00000 0 0")                                            \
+   ROW(agx_chip_hal300_path(c), "0000 00000 0000 00111 1 0")                   \
+   ROW(agx_chip_agx3_path(c), "0000 01110 0100 10111 1 0")                     \
+   ROW(agx_chip_native_or_m5(c), "0000 01110 0100 10111 0 0")                  \
+   ROW(agx_chip_native_or_g18g(c), "0000 01110 0100 10000 1 0")                \
+   ROW(agx_chip_g17p_or_m5(c), "0000 00000 0000 10111 0 0")                    \
    /* Capabilities and quirks. */                                              \
    ROW(agx_chip_has_native_render_context(c), "0000 00000 0000 10000 0 0")     \
    ROW(agx_chip_native_indirect_compute(c), "0000 01110 0100 10000 0 0")       \
@@ -343,6 +348,26 @@ test_truth_table(void)
          CHECK(product && strcmp(product, "A18 Pro") == 0);
       else
          CHECK(product == NULL);
+   }
+}
+
+/* Each chip-set predicate is the comparison chain it replaced at the call
+ * sites. */
+static void
+test_chip_sets(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      const bool native = agx_chip_native_agx3(c);
+      const bool m5 = agx_chip_g17_m5(c);
+
+      CHECK(agx_chip_hal300_path(c) == (m5 || c == AGX_CHIP_G18G));
+      CHECK(agx_chip_agx3_path(c) == (native || m5 || c == AGX_CHIP_G18G));
+      CHECK(agx_chip_native_or_m5(c) == (native || m5));
+      CHECK(agx_chip_native_or_g18g(c) == (native || c == AGX_CHIP_G18G));
+      CHECK(agx_chip_g17p_or_m5(c) == (c == AGX_CHIP_G17P || m5));
+      CHECK(m5 == (c == AGX_CHIP_G17G || c == AGX_CHIP_G17S ||
+                   c == AGX_CHIP_G17C));
    }
 }
 
@@ -607,6 +632,7 @@ int
 main(void)
 {
    test_truth_table();
+   test_chip_sets();
    test_recovered_table();
    test_decoder_identity();
    test_variant_is_load_bearing();

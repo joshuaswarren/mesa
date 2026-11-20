@@ -809,6 +809,52 @@ agx_chip_m5_paths(enum agx_chip chip)
    return agx_chip_info(chip)->quirks & AGX_QUIRK_M5_PATHS;
 }
 
+/*
+ * Chip sets that call sites test without a capability of their own. They say
+ * which chips and not why, and they are not interchangeable: three of them
+ * are "runs an AGX3 path" with G18G or the M5 parts left out. Each replaced
+ * the same comparisons written out at the call sites, so a site keeps the set
+ * it had. A new site that knows why it asks should get a predicate named for
+ * that reason instead.
+ */
+
+/* The HAL300 path: the M5 parts and G18G. */
+static inline bool
+agx_chip_hal300_path(enum agx_chip chip)
+{
+   return agx_chip_info(chip)->path == AGX_CHIP_PATH_HAL300;
+}
+
+/* Either AGX3 path: native AGX3, the M5 parts or G18G. */
+static inline bool
+agx_chip_agx3_path(enum agx_chip chip)
+{
+   const enum agx_chip_path path = agx_chip_info(chip)->path;
+
+   return path == AGX_CHIP_PATH_NATIVE_AGX3 || path == AGX_CHIP_PATH_HAL300;
+}
+
+/* Native AGX3 or an M5 part. Not G18G. */
+static inline bool
+agx_chip_native_or_m5(enum agx_chip chip)
+{
+   return agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip);
+}
+
+/* Native AGX3 or G18G. Not the M5 parts. */
+static inline bool
+agx_chip_native_or_g18g(enum agx_chip chip)
+{
+   return agx_chip_native_agx3(chip) || chip == AGX_CHIP_G18G;
+}
+
+/* G17P or an M5 part. Not the other native chips and not G18G. */
+static inline bool
+agx_chip_g17p_or_m5(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip);
+}
+
 /* Whether consecutive application dispatches of one CDM stream may omit the
  * ordering barrier between them.  Vulkan orders dispatches only through
  * explicit barriers; every other record (internal or indirect launch, cache
@@ -819,7 +865,7 @@ agx_chip_m5_paths(enum agx_chip chip)
 static inline bool
 agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
 {
-   return agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip);
+   return agx_chip_native_or_m5(chip);
 }
 
 /* Number of helper-table slots in the USC code-container lead block.  G15

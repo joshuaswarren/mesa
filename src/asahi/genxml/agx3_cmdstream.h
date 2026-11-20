@@ -525,20 +525,12 @@ agx3_cdm_barrier_flags_grounded(enum agx_chip chip, uint8_t flags)
    if (!agx3_cdm_barrier_target_grounded(chip) || flags > 0xf)
       return false;
 
-   switch (chip) {
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return true;
-   case AGX_CHIP_G18G:
-      /* The flag-free word is captured on G18G (compute-add), and flags=5
-       * is grounded on hardware from rel24b+ chained launches: the weak
-       * flag-free tail does not give write visibility and flag-free chains
-       * hung the CDM (hk_cmd_dispatch.c). */
-      return flags == 0 || flags == 5;
-   default:
-      return flags == 0 || flags == 0x5;
-   }
+   /* The M5 parts take every flag combination, the other chips the flag-free
+    * word and flags=5. On G18G the flag-free word is captured (compute-add),
+    * and flags=5 is grounded on hardware from rel24b+ chained launches: the
+    * weak flag-free tail does not give write visibility and flag-free chains
+    * hung the CDM (hk_cmd_dispatch.c). */
+   return agx_chip_g17_m5(chip) || flags == 0 || flags == 5;
 }
 
 /* The wide-visibility barrier forms are only known on G15S and G16G with
@@ -674,7 +666,7 @@ agx3_cdm_sstt_flush_invalidate_pack(
       return false;
 
    memset(packed, 0, AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE);
-   if (chip != AGX_CHIP_G17P && !agx_chip_g17_m5(chip))
+   if (!agx_chip_g17p_or_m5(chip))
       return false;
 
    agx3_cmdstream_store_le32(packed, UINT32_C(0x60024102));
@@ -686,7 +678,7 @@ agx3_cdm_sstt_flush_invalidate_validate(enum agx_chip chip,
                                         const void *packed,
                                         size_t available)
 {
-   return (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) && packed &&
+   return agx_chip_g17p_or_m5(chip) && packed &&
           available >= AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE &&
           agx3_cmdstream_load_le32((const uint8_t *)packed) ==
              UINT32_C(0x60024102);
