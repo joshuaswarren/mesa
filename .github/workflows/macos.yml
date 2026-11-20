@@ -41,7 +41,6 @@ jobs:
         brew "libxcb"
         brew "libxdamage"
         brew "libxext"
-        brew "llvm"
         brew "molten-vk"
         brew "ninja"
         brew "pkg-config"
@@ -49,7 +48,11 @@ jobs:
         EOL
 
         brew update
-        brew bundle --verbose
+        # llvm is intentionally absent: Homebrew builds no x86_64 macOS bottles for any
+        # llvm formula, so on macos-15-intel it compiles for hours past the 120-minute
+        # job limit (run 44669319600 died inside its dependency chain). softpipe+zink
+        # need no LLVM; llvmpipe stays off via -Dllvm=disabled below.
+        brew bundle --verbose --no-upgrade
     - name: Install Mako and meson
       # python3 -m pip pins the interpreter so the user-site bin dir below is
       # the one meson actually lands in (the image's default is 3.9; a Brewfile
@@ -61,12 +64,7 @@ jobs:
         "$MESON_EXEC" --version
     - name: Configure
       run: |
-        cat > native_config <<EOL
-        [binaries]
-        llvm-config = '$(brew --prefix llvm)/bin/llvm-config'
-        EOL
-        cat native_config
-        "$MESON_EXEC" . build --native-file=native_config -Dmoltenvk-dir=$(brew --prefix molten-vk) -Dbuild-tests=true -Dgallium-drivers=swrast,zink -Dglx=${{ matrix.glx_option }}
+        "$MESON_EXEC" . build -Dmoltenvk-dir=$(brew --prefix molten-vk) -Dbuild-tests=true -Dllvm=disabled -Dgallium-drivers=softpipe,zink -Dglx=${{ matrix.glx_option }}
     - name: Build
       run: $MESON_EXEC compile -C build
     - name: Test
