@@ -2816,6 +2816,9 @@ void hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
 bool hk_gen1_upload_fragment_query_state(struct hk_cmd_buffer *cmd, bool vertex_stage,
    struct agx3_ioto_uniform_range *range);
+bool hk_gen1_upload_rq_uniforms(struct hk_cmd_buffer *cmd, uint32_t *context,
+                                unsigned context_words, bool profile,
+                                struct agx3_ioto_uniform_range *range);
 
 void hk_g17p_prewarm_linked_compute_shader(struct hk_device *dev,
                                             struct hk_shader *s,
