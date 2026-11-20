@@ -6,6 +6,7 @@
 #include "hk_pack.h"
 
 #include <string.h>
+#include <strings.h>
 
 #include "util/bitscan.h"
 #include "util/u_debug.h"
@@ -59,12 +60,24 @@ hk_pack_admits_strong_tail(enum hk_pack_boundary boundary)
    return boundary != HK_PACK_BOUNDARY_NONE;
 }
 
+/* debug_parse_bool_option(), plus "on" and "off", which it does not know:
+ * HK_PACK_ATOMICS=off must not leave G16G's default on. */
+static bool
+hk_pack_parse_bool(const char *opt, bool dfault)
+{
+   if (!strcasecmp(opt, "off"))
+      return false;
+   if (!strcasecmp(opt, "on"))
+      return true;
+   return debug_parse_bool_option(opt, dfault);
+}
+
 bool
 hk_pack_atomics_choice(bool serial_kernel, const char *opt, unsigned queues)
 {
    if (serial_kernel)
-      return opt ? debug_parse_bool_option(opt, true) : true;
-   return opt && debug_parse_bool_option(opt, false) && queues <= 1;
+      return opt ? hk_pack_parse_bool(opt, true) : true;
+   return opt && hk_pack_parse_bool(opt, false) && queues <= 1;
 }
 
 const struct hk_cs *
@@ -107,27 +120,24 @@ hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
    if (memcmp(end, terminate, AGX3_CDM_STREAM_TERMINATE_SIZE))
       return NULL;
 
-   /* The stream ends with a strong flush, taken exactly where the boundary
-    * admits one (hk_pack_admits_strong_tail(), which the packing trace
-    * reports, so the two cannot disagree); a boundary that does not needs
-    * memory scope and visible completion. At the visible-completion
-    * boundary the strong flush is a last launch's tail vkEndCommandBuffer
-    * upgraded to the memory-scoped one, an application barrier at the end,
-    * or the one hk_flush_deferred_clears() left after the clears, standing
-    * for the barriers recorded after them. The last two have memory scope
-    * only where memory may have a second address (hk_cdm_alias_scope());
-    * while host_alias.dynamic decides that, vkEndCommandBuffer gives every
-    * stream with launches the memory-scoped end. Each is at least the
-    * dependency the application recorded across the boundary; the packet's
-    * end gets the memory scope (hk_pack_runs()), and this boundary exists
-    * only where the kernel accepts such a visible-completion command
-    * (hk_pack_boundary()). At the HAL200 boundary the stream may also end
-    * with an ordering barrier, which the boundary upgrades in place
-    * (hk_cdm_visibility_flush()). */
+   /* The stream ends with a strong flush, at a boundary that admits one
+    * without memory scope (hk_pack_admits_strong_tail(), which the packing
+    * trace reports, so the two cannot disagree; every boundary does). At the
+    * visible-completion boundary the strong flush is a last launch's tail
+    * vkEndCommandBuffer upgraded to the memory-scoped one, an application
+    * barrier at the end, or the one hk_flush_deferred_clears() left after
+    * the clears, standing for the barriers recorded after them. The last two
+    * have memory scope only where memory may have a second address
+    * (hk_cdm_alias_scope()); while host_alias.dynamic decides that,
+    * vkEndCommandBuffer gives every stream with launches the memory-scoped
+    * end. Each is at least the dependency the application recorded across
+    * the boundary; the packet's end gets the memory scope (hk_pack_runs()),
+    * and this boundary exists only where the kernel accepts such a
+    * visible-completion command (hk_pack_boundary()). At the HAL200 boundary
+    * the stream may also end with an ordering barrier, which the boundary
+    * upgrades in place (hk_cdm_visibility_flush()). */
    const bool strong_tail =
-      cs->strong_flush_end == end &&
-      (hk_pack_admits_strong_tail(boundary) ||
-       (cs->visible_completion && cs->memory_flush_end == end));
+      cs->strong_flush_end == end && hk_pack_admits_strong_tail(boundary);
    const bool ordering_tail = boundary == HK_PACK_BOUNDARY_STRONG_FLUSH &&
                               cs->weak_barrier_end == end;
    if (!strong_tail && !ordering_tail)

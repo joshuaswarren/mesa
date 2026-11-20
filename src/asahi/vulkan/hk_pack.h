@@ -98,8 +98,9 @@ bool hk_pack_admits_strong_tail(enum hk_pack_boundary boundary);
  * device's other kernel queues: with `serial_kernel` (G16G, whose kernel
  * runs a VM's compute commands one after another on one firmware queue) by
  * default and unless HK_PACK_ATOMICS (`opt`) says no; otherwise only when
- * `opt` says yes and the queue has a single kernel queue (`queues`). An
- * unparsable value keeps the default. */
+ * `opt` says yes and the queue has a single kernel queue (`queues`). `opt`
+ * takes debug_parse_bool_option()'s values plus "on" and "off"; any other
+ * value keeps the default. */
 bool hk_pack_atomics_choice(bool serial_kernel, const char *opt,
                             unsigned queues);
 

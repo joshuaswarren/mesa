@@ -520,7 +520,7 @@ test_boundary(void)
    T("G15S: not qualified, no boundary",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
    dev->dev.chip = AGX_CHIP_G17A;
-   T("G17A: HAL200 but not G16, no boundary",
+   T("G17A: HAL200, caches pending, no boundary",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
    dev->dev.chip = AGX_CHIP_G14G;
    T("G14G: no boundary", hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
@@ -569,6 +569,9 @@ test_atomics_choice(void)
    T("G16G: HK_PACK_ATOMICS=1", hk_pack_atomics_choice(true, "1", 1));
    T("G16G: an unparsable value keeps the default",
      hk_pack_atomics_choice(true, "maybe", 1));
+   T("G16G: HK_PACK_ATOMICS=off keeps them apart",
+     !hk_pack_atomics_choice(true, "off", 1) &&
+        !hk_pack_atomics_choice(true, "OFF", 1));
    T("M5: atomics apart by default", !hk_pack_atomics_choice(false, NULL, 1));
    T("M5: HK_PACK_ATOMICS=1 with one kernel queue",
      hk_pack_atomics_choice(false, "1", 1));
@@ -576,6 +579,8 @@ test_atomics_choice(void)
      !hk_pack_atomics_choice(false, "1", 2));
    T("M5: an unparsable value keeps the default",
      !hk_pack_atomics_choice(false, "maybe", 1));
+   T("M5: HK_PACK_ATOMICS=on with one kernel queue",
+     hk_pack_atomics_choice(false, "on", 1));
 }
 
 /* hk_sync_forget_stream() leaves a command buffer's latest render of a kind
