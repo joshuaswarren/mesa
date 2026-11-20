@@ -45,6 +45,12 @@ struct hk_device_memory {
    /* An import the GPU may write that another import can map at a second
     * address too: counted in hk_device::va_alias_resources while it lives. */
    bool alias_import;
+
+   /* A host import in hk_device::host_alias.imports (M5, host_alias.dynamic). */
+   bool host_alias_tracked;
+   /* An fd or dma-buf import, counted in hk_device::alias_live for its
+    * lifetime (hk_device_alias_get()). */
+   bool alias_fd;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_device_memory, vk.base, VkDeviceMemory,

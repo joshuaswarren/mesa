@@ -95,10 +95,12 @@ hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
        * vkEndCommandBuffer runs, left one after the clears, standing for
        * the barriers recorded after them. The last two have memory scope
        * only where memory may have a second address
-       * (hk_cdm_alias_scope()). Each is at least the dependency the
-       * application recorded across the boundary; the packet's end gets
-       * the memory scope (hk_pack_runs()), and this boundary exists only
-       * where the kernel accepts such a visible-completion command
+       * (hk_cdm_alias_scope()); while host_alias.dynamic decides that,
+       * vkEndCommandBuffer gives every stream with launches the
+       * memory-scoped end. Each is at least the dependency the application
+       * recorded across the boundary; the packet's end gets the memory
+       * scope (hk_pack_runs()), and this boundary exists only where the
+       * kernel accepts such a visible-completion command
        * (hk_pack_boundary()). */
       if (cs->strong_flush_end != end)
          return NULL;

@@ -3617,8 +3617,9 @@ hk_xfer_order(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    }
 
    /* Each launch ends in a weak ordering record; strengthen the last one
-    * into a cache flush, as a barrier does (hk_CmdPipelineBarrier2()). */
-   const bool alias_scope = hk_cdm_alias_scope(dev);
+    * into a cache flush, as a barrier does (hk_CmdPipelineBarrier2()). No
+    * patch site is recorded here (hk_cdm_alias_scope_unpatched()). */
+   const bool alias_scope = hk_cdm_alias_scope_unpatched(dev);
    for (unsigned i = 0; i < n; ++i) {
       struct hk_cs *w = flush[i];
       if (hk_cdm_visibility_flush_needed(dev, w, alias_scope)) {
@@ -13209,9 +13210,10 @@ hk_dispatch_task_kernel(struct hk_cmd_buffer *cmd, struct hk_shader *task,
 
    /* The launch ends in a weak ordering record, which doesn't make the
     * entries visible to the mesh draws that read them; strengthen it into a
-    * cache flush, as a barrier does. */
+    * cache flush, as a barrier does, without a patch site
+    * (hk_cdm_alias_scope_unpatched()). */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   const bool alias_scope = hk_cdm_alias_scope(dev);
+   const bool alias_scope = hk_cdm_alias_scope_unpatched(dev);
    if (hk_cdm_visibility_flush_needed(dev, ccs, alias_scope)) {
       hk_ensure_cs_has_space(cmd, ccs, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_visibility_flush(dev, ccs, alias_scope);

@@ -913,9 +913,11 @@ hk_init_g17p_grid_helper(struct hk_device *dev,
  *   another import may map the same pages (two dma-bufs over one memfd, or
  *   a dma-buf and a host import of its pages);
  * - a host import gets an address of its own, and the same pages may be
- *   imported again. With hk_host_memory_import_read_only every host import
- *   is read-only for the GPU, so the GPU writes no imported page and a read
- *   through the import cannot miss a write through another address.
+ *   imported again, or be mapped by the application at a second virtual
+ *   address that another import, or memory of another kind, reaches. With
+ *   hk_host_memory_import_read_only every host import is read-only for the
+ *   GPU, so the GPU writes no imported page and a read through the import
+ *   cannot miss a write through another address.
  *
  * Nothing else maps memory the GPU writes at two addresses: the read-only
  * shadow of every allocation is read only through sparse and capture/replay
@@ -923,6 +925,21 @@ hk_init_g17p_grid_helper(struct hk_device *dev,
  * acceleration structure tables, shader code) hold memory written by the
  * CPU alone. The structures of these features may only be used when they
  * are enabled, so a device that enabled none of them never has such memory.
+ *
+ * On M5 every resource through which these features map memory at a second
+ * address is seen as it is created, so the scope follows the live ones
+ * instead (host_alias.dynamic, hk_cdm_alias_scope()): buffers and image
+ * planes with an address of their own and memory mapped again for
+ * descriptor buffer capture/replay (va_alias_resources), fd and dma-buf
+ * imports, and host imports that may alias (hk_host_import_aliases()). An
+ * acceleration structure's address is its buffer's, also on replay, so its
+ * capture/replay is covered by the buffer's. An import of private anonymous
+ * memory of this process (malloc, aligned_alloc, an anonymous private mmap)
+ * that overlaps no other import of the device has its pages at no other GPU
+ * address: they are mapped at one virtual address of the process, and the
+ * GPU reaches them only through the import's own, unless the application
+ * moved an imported range with mremap and imported it again
+ * (hk_host_alias.h).
  */
 static bool
 hk_device_may_alias_memory(const struct hk_device *dev,
@@ -950,6 +967,55 @@ hk_device_may_alias_memory(const struct hk_device *dev,
    return ext->EXT_external_memory_host &&
           !instance->drirc.misc.host_memory_import_read_only;
 }
+
+/* ASAHI_M5_HOST_ALIAS_TRACE=1: name at device creation every enabled feature
+ * or extension through which memory can get a second GPU address
+ * (hk_device_may_alias_memory()), and the rule the device took. */
+static void
+hk_device_trace_alias_reasons(const struct hk_device *dev,
+                              const struct hk_instance *instance)
+{
+   const struct vk_features *f = &dev->vk.enabled_features;
+   const struct vk_device_extension_table *ext = &dev->vk.enabled_extensions;
+   char reasons[512] = "";
+   size_t n = 0;
+#define HK_ALIAS_REASON(cond, name)                                            \
+   do {                                                                        \
+      if ((cond) && n < sizeof(reasons))                                       \
+         n += snprintf(reasons + n, sizeof(reasons) - n, " %s", name);         \
+   } while (0)
+   HK_ALIAS_REASON(f->sparseBinding, "sparseBinding");
+   HK_ALIAS_REASON(f->sparseResidencyBuffer, "sparseResidencyBuffer");
+   HK_ALIAS_REASON(f->sparseResidencyImage2D, "sparseResidencyImage2D");
+   HK_ALIAS_REASON(f->sparseResidencyImage3D, "sparseResidencyImage3D");
+   HK_ALIAS_REASON(f->sparseResidency2Samples || f->sparseResidency4Samples ||
+                      f->sparseResidency8Samples || f->sparseResidency16Samples,
+                   "sparseResidencyNSamples");
+   HK_ALIAS_REASON(f->sparseResidencyAliased, "sparseResidencyAliased");
+   HK_ALIAS_REASON(f->bufferDeviceAddressCaptureReplay ||
+                      f->bufferDeviceAddressCaptureReplayEXT,
+                   "bufferDeviceAddressCaptureReplay");
+   HK_ALIAS_REASON(f->descriptorBufferCaptureReplay,
+                   "descriptorBufferCaptureReplay");
+   HK_ALIAS_REASON(f->accelerationStructureCaptureReplay,
+                   "accelerationStructureCaptureReplay");
+   HK_ALIAS_REASON(ext->KHR_external_memory_fd, "KHR_external_memory_fd");
+   HK_ALIAS_REASON(ext->EXT_external_memory_dma_buf, "EXT_external_memory_dma_buf");
+   HK_ALIAS_REASON(ext->EXT_external_memory_host &&
+                      !instance->drirc.misc.host_memory_import_read_only,
+                   "EXT_external_memory_host(writable)");
+#undef HK_ALIAS_REASON
+   fprintf(stderr, "M5_HOST_ALIAS device rule=%s may_alias=%u reasons:%s\n",
+           dev->host_alias.dynamic ? "per-resource"
+           : dev->may_alias_memory ? "per-device"
+                                   : "none",
+           dev->may_alias_memory, n ? reasons : " none");
+}
+
+/* A/B and fallback: the per-device rule, as before the scope followed the
+ * live resources. */
+DEBUG_GET_ONCE_BOOL_OPTION(m5_host_alias_static, "ASAHI_M5_HOST_ALIAS_STATIC",
+                           false)
 
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_CreateDevice(VkPhysicalDevice physicalDevice,
@@ -999,6 +1065,30 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.shader_ops = &hk_device_shader_ops;
    dev->vk.command_dispatch_table = &dev->cmd_dispatch;
    dev->may_alias_memory = hk_device_may_alias_memory(dev, instance);
+   simple_mtx_init(&dev->host_alias.lock, mtx_plain);
+   simple_mtx_init(&dev->host_alias.cmd_lock, mtx_plain);
+   list_inithead(&dev->host_alias.cmd_buffers);
+   u_rwlock_init(&dev->host_alias.patch_lock);
+   dev->host_alias.trace = agx_chip_g17_m5(pdev->dev.chip) &&
+      debug_get_bool_option("ASAHI_M5_HOST_ALIAS_TRACE", false);
+   if (dev->may_alias_memory && agx_chip_g17_m5(pdev->dev.chip) &&
+       !debug_get_option_m5_host_alias_static()) {
+      /* The word hk_cdm_flush() records for a memory-scoped strong flush. */
+      const struct agx3_cdm_barrier_info info = {
+         .chip = pdev->dev.chip,
+         .flags = 0x5,
+         .wide_visibility = agx_chip_cdm_wide_visibility(pdev->dev.chip),
+         .flush_memory = true,
+      };
+      uint8_t packed[AGX3_CDM_BARRIER_SIZE];
+      if (agx3_cdm_barrier_pack(&info, packed)) {
+         dev->host_alias.flush_word = agx3_cmdstream_load_le32(packed);
+         dev->host_alias.dynamic = true;
+         dev->may_alias_memory = false;
+      }
+   }
+   if (dev->host_alias.trace)
+      hk_device_trace_alias_reasons(dev, instance);
 
    drmDevicePtr drm_device = NULL;
    int ret = drmGetDeviceFromDevId(pdev->render_dev, 0, &drm_device);
@@ -1384,6 +1474,10 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    agx_bo_unreference(&dev->dev, dev->sparse_fill);
    agx_bo_unreference(&dev->dev, dev->code_heap.chunk);
    simple_mtx_destroy(&dev->code_heap.lock);
+   hk_host_imports_fini(&dev->host_alias.imports);
+   simple_mtx_destroy(&dev->host_alias.lock);
+   simple_mtx_destroy(&dev->host_alias.cmd_lock);
+   u_rwlock_destroy(&dev->host_alias.patch_lock);
    agx_close_device(&dev->dev);
    vk_free(&dev->vk.alloc, dev);
 }
