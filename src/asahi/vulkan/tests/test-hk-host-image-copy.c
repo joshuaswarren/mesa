@@ -26,9 +26,13 @@
 
 static int backing = -1;
 static unsigned mmaps, munmaps;
+/* The agx_bo each mapping was made into, for the last two mappings. */
+static struct agx_bo *mapped_bo[2];
 
 /* While set, each mapping waits here until two threads are mapping. */
 static pthread_barrier_t *mmap_rendezvous;
+/* While set, each mapping takes 100 ms. */
+static bool slow_mmap;
 
 static void
 mock_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
@@ -37,13 +41,15 @@ mock_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
    assert(!bo->_map);
    if (mmap_rendezvous)
       pthread_barrier_wait(mmap_rendezvous);
+   if (slow_mmap)
+      usleep(100 * 1000);
 
    bo->_map_size = length ?: bo->size;
    void *map = mmap(fixed_addr, bo->_map_size, PROT_READ | PROT_WRITE,
                     MAP_SHARED | (fixed_addr ? MAP_FIXED : 0), backing, 0);
    assert(map != MAP_FAILED);
    bo->_map = map;
-   p_atomic_inc(&mmaps);
+   mapped_bo[p_atomic_inc_return(&mmaps) & 1] = bo;
 }
 
 static void
@@ -255,6 +261,21 @@ copy_thread(void *data)
    return NULL;
 }
 
+struct map_job {
+   pthread_barrier_t *start;
+   struct agx_bo *bo;
+   void *map;
+};
+
+static void *
+map_thread(void *data)
+{
+   struct map_job *job = data;
+   pthread_barrier_wait(job->start);
+   job->map = agx_bo_map(job->bo);
+   return NULL;
+}
+
 int
 main(void)
 {
@@ -267,6 +288,7 @@ main(void)
    dev->dev.ops.bo_mmap = mock_mmap;
    dev->dev.ops.bo_munmap = mock_munmap;
    dev->dev.ops.bo_mmap_independent = true;
+   simple_mtx_init(&dev->dev.bo_mmap_lock, mtx_plain);
    VkDevice device = hk_device_to_handle(dev);
 
    struct agx_va va = {.addr = 0x100000000, .size_B = SIZE};
@@ -393,10 +415,56 @@ main(void)
    assert(!memcmp(jobs[1].texels, out, sizeof(out)));
    assert(munmap(mem2.copy_map, SIZE) == 0);
 
+   /* Two threads map a BO's shared mapping for the first time at once, the
+    * first while the second starts: it is mapped once, and both get that
+    * mapping. */
+   struct agx_bo bo2 = {.dev = &dev->dev, .size = SIZE, .va = &va};
+   pthread_barrier_t start;
+   assert(!pthread_barrier_init(&start, NULL, 2));
+   static struct map_job map_jobs[2];
+   slow_mmap = true;
+   const unsigned shared_mmaps = mmaps;
+   for (unsigned i = 0; i < 2; ++i) {
+      map_jobs[i] = (struct map_job){.start = &start, .bo = &bo2};
+      assert(!pthread_create(&threads[i], NULL, map_thread, &map_jobs[i]));
+   }
+   for (unsigned i = 0; i < 2; ++i)
+      assert(!pthread_join(threads[i], NULL));
+   slow_mmap = false;
+   assert(mmaps == shared_mmaps + 1);
+   assert(map_jobs[0].map && map_jobs[0].map == map_jobs[1].map &&
+          map_jobs[0].map == bo2._map);
+   assert(munmap(bo2._map, SIZE) == 0);
+
+   /* The same on a backend that can only map a BO itself: it is mapped
+    * once, in place, and both threads get that mapping. */
+   dev->dev.ops.bo_mmap_independent = false;
+   struct agx_bo bo3 = {.dev = &dev->dev, .size = SIZE, .va = &va};
+   mapped_bo[0] = mapped_bo[1] = NULL;
+   slow_mmap = true;
+   const unsigned inplace_mmaps = mmaps;
+   for (unsigned i = 0; i < 2; ++i) {
+      map_jobs[i] = (struct map_job){.start = &start, .bo = &bo3};
+      assert(!pthread_create(&threads[i], NULL, map_thread, &map_jobs[i]));
+   }
+   for (unsigned i = 0; i < 2; ++i)
+      assert(!pthread_join(threads[i], NULL));
+   slow_mmap = false;
+   assert(mmaps == inplace_mmaps + 1);
+   assert(mapped_bo[mmaps & 1] == &bo3);
+   assert(map_jobs[0].map && map_jobs[0].map == map_jobs[1].map &&
+          map_jobs[0].map == bo3._map);
+   assert(munmap(bo3._map, SIZE) == 0);
+   dev->dev.ops.bo_mmap_independent = true;
+   pthread_barrier_destroy(&start);
+
    close(backing);
+   simple_mtx_destroy(&dev->dev.bo_mmap_lock);
    vk_object_base_finish(&dev->vk.base);
    free(dev);
    puts("PASS: host image copies keep their own mapping through unmapped, "
-        "placed and reserved mappings and two copying threads");
+        "placed and reserved mappings and two copying threads; a BO's "
+        "shared mapping is made once when two threads map it first, in "
+        "place on a backend that cannot map a copy");
    return 0;
 }

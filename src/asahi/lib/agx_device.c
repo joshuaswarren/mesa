@@ -977,6 +977,7 @@ agx_cleanup_partial_device(struct agx_device *dev, unsigned initialized)
       util_sparse_array_finish(&dev->bo_map);
       simple_mtx_destroy(&dev->bo_cache.lock);
       simple_mtx_destroy(&dev->bo_map_lock);
+      simple_mtx_destroy(&dev->bo_mmap_lock);
       agxdecode_destroy_context(dev->agxdecode);
    }
    if (initialized & AGX_INIT_VIRTIO) {
@@ -1346,6 +1347,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    util_sparse_array_init(&dev->bo_map, sizeof(struct agx_bo), 512);
    simple_mtx_init(&dev->bo_map_lock, mtx_plain);
+   simple_mtx_init(&dev->bo_mmap_lock, mtx_plain);
 
    simple_mtx_init(&dev->bo_cache.lock, mtx_plain);
    list_inithead(&dev->bo_cache.lru);
