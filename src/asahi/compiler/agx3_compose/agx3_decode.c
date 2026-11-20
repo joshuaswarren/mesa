@@ -29,7 +29,7 @@ struct dec_field {
    uint64_t known_mask, known_value;
    uint8_t nluts, npreds;
    struct dec_lut luts[DEC_MAX_LUTS];
-   const agx3_pred *preds[DEC_MAX_PREDS];
+   uint32_t preds[DEC_MAX_PREDS];   /* in predrefs */
 };
 
 struct dec {
@@ -107,14 +107,14 @@ solve(struct dec *d)
    for (unsigned i = 0; i < d->nnodes; ++i) {
       const agx3_node *n = &t->nodes[d->nodes[i]];
       for (unsigned k = 0; k < n->pred_n; ++k) {
-         const agx3_pred *p = &t->preds[n->pred_off + k];
-         if (p->field >= AGX3_MAX_FIELDS)
+         const agx3_pred p = agx3_pred_at(t, n->pred_off + k);
+         if (p.field >= AGX3_MAX_FIELDS)
             return false;
-         struct dec_field *f = &d->f[p->field];
+         struct dec_field *f = &d->f[p.field];
          if (f->npreds == DEC_MAX_PREDS)
             return false;
-         f->preds[f->npreds++] = p;
-         touched[p->field] = 1;
+         f->preds[f->npreds++] = n->pred_off + k;
+         touched[p.field] = 1;
       }
       for (unsigned k = 0; k < n->cmd_n; ++k) {
          const agx3_cmd *c = &t->cmds[n->cmd_off + k];
@@ -124,7 +124,7 @@ solve(struct dec *d)
          struct dec_field *f = &d->f[c->field];
          const uint64_t bits = (w >> c->dst_shift) & wmask(c->width);
          touched[c->field] = 1;
-         if (c->lut_off >= 0) {
+         if (c->lut_n) {
             if (f->nluts == DEC_MAX_LUTS)
                return false;
             f->luts[f->nluts++] = (struct dec_lut){
@@ -150,14 +150,14 @@ solve(struct dec *d)
 
       /* Bitfield predicates fix slices of the value. */
       for (unsigned k = 0; k < f->npreds; ++k) {
-         const agx3_pred *p = f->preds[k];
-         if (p->kind != 3)
+         const agx3_pred p = agx3_pred_at(t, f->preds[k]);
+         if (p.kind != 3)
             continue;
-         const uint64_t m = wmask(p->width) << p->shift;
-         if (km & m & (kv ^ (p->a << p->shift)))
+         const uint64_t m = wmask(p.width) << p.shift;
+         if (km & m & (kv ^ ((uint64_t)p.a << p.shift)))
             return false;
          km |= m;
-         kv = (kv & ~m) | (p->a << p->shift);
+         kv = (kv & ~m) | ((uint64_t)p.a << p.shift);
       }
 
       /* Candidate values: an equality predicate's, else every LUT index up
@@ -165,8 +165,9 @@ solve(struct dec *d)
       uint64_t first = kv, count = 1;
       bool have_eq = false;
       for (unsigned k = 0; k < f->npreds; ++k) {
-         if (f->preds[k]->kind == 0) {
-            first = f->preds[k]->a;
+         const agx3_pred p = agx3_pred_at(t, f->preds[k]);
+         if (p.kind == 0) {
+            first = p.a;
             have_eq = true;
             break;
          }
@@ -190,8 +191,10 @@ solve(struct dec *d)
                    ((t->lutpool[l->off + v] >> l->src) & wmask(l->width)) ==
                       l->bits;
          }
-         for (unsigned k = 0; k < f->npreds && good; ++k)
-            good = pred_holds(d, f->preds[k], v);
+         for (unsigned k = 0; k < f->npreds && good; ++k) {
+            const agx3_pred p = agx3_pred_at(t, f->preds[k]);
+            good = pred_holds(d, &p, v);
+         }
          if (good) {
             d->fields[fi] = v;
             found = true;
@@ -224,7 +227,7 @@ expand(struct dec *d)
    const uint32_t g = d->pending[--d->npending];
    const agx3_group *grp = &d->t->groups[g];
    for (unsigned i = 0; i < grp->alt_n; ++i) {
-      const uint32_t alt = d->t->altpool[grp->alt_off + i];
+      const uint32_t alt = grp->alt_off + i;
       if (!fixed_ok(d, alt))
          continue;
       const agx3_node *an = &d->t->nodes[alt];

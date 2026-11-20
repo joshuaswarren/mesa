@@ -49,9 +49,8 @@ struct agx3_field_kv {
  * AGX_ISA_ENCODING_AGX3D (G18G) takes the same Apple field ids but its own
  * encoding points and lengths, so it is encoded only with
  * ep == AGX3_BIND_APPLE_ORDER, from a field vector a core encoder has
- * grounded against Apple's G18G output, and only in builds that link
- * agx3_compose/agx3d_tables.c and define AGX3_HAVE_AGX3D_TABLE. Any other
- * AGX3D request returns false.
+ * grounded against Apple's G18G output, and only in builds that define
+ * AGX3_HAVE_AGX3D_TABLE. Any other AGX3D request returns false.
  */
 /* Byte length of form `mnemonic.ep` for `encoding`, or 0 if there is none. */
 unsigned agx3_bind_form_size(enum agx_isa_encoding encoding,

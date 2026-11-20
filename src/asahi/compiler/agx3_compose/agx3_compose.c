@@ -1,4 +1,4 @@
-/* agx3_compose.c -- generic AGX3 encoder over packgen.py tables.
+/* agx3_compose.c -- generic AGX3 encoder over the generated tables.
  * Mirrors composer.py encode semantics; see agx3_compose.h. */
 #include "agx3_compose.h"
 #include <stdatomic.h>
@@ -30,15 +30,17 @@ static inline uint64_t wmask(unsigned width) {
    return width >= 64 ? ~0ull : (1ull << width) - 1;
 }
 
-static bool pred_ok(const ctx *c, const agx3_pred *p)
+/* A predicate that is not "field == small value". */
+static bool wide_pred_ok(const agx3_table *t, const uint64_t *fields,
+                         const agx3_pred *p)
 {
-   uint64_t v = c->fields[p->field];
+   if (p->field >= AGX3_MAX_FIELDS) return false;
+   uint64_t v = fields[p->field];
    switch (p->kind) {
    case 0: return v == p->a;
    case 1: {
-      if (v >= 0x10000) return false;
       for (uint16_t i = 0; i < p->b; i++)
-         if (c->t->setpool[p->a + i] == v) return true;
+         if (t->setpool[p->a + i] == v) return true;
       return false;
    }
    case 2: return p->a <= v && v <= p->b;
@@ -47,29 +49,30 @@ static bool pred_ok(const ctx *c, const agx3_pred *p)
    }
 }
 
-static bool preds_test(const ctx *c, uint32_t off, uint16_t n)
+/* Inline, and on the table and the fields rather than the ctx, so that the
+ * walk over a group's alternatives keeps its state in registers. */
+static inline bool preds_test(const agx3_table *t, const uint64_t *fields,
+                              const agx3_node *n)
 {
-   for (uint16_t i = 0; i < n; i++) {
-      const agx3_pred *p = &c->t->preds[off + i];
-      if (p->field >= AGX3_MAX_FIELDS) return false;
-      if (!pred_ok(c, p)) return false;
+   const agx3_predref *r = &t->predrefs[n->pred_off];
+   for (unsigned i = 0; i < n->pred_n; i++) {
+      if (r[i].field < AGX3_MAX_FIELDS) {
+         if (fields[r[i].field] != r[i].value) return false;
+      } else if (!wide_pred_ok(t, fields, agx3_wide_pred(t, r[i]))) {
+         return false;
+      }
    }
    return true;
 }
 
-static void preds_mark(ctx *c, uint32_t off, uint16_t n)
+static void preds_mark(ctx *c, const agx3_node *n)
 {
-   for (uint16_t i = 0; i < n; i++) {   /* mark consumed only if all hold */
-      bset(c->consumed, c->t->preds[off + i].field);
-      bset(c->is_pred, c->t->preds[off + i].field);
+   /* Only once all of them hold. */
+   for (unsigned i = 0; i < n->pred_n; i++) {
+      const unsigned field = agx3_pred_at(c->t, n->pred_off + i).field;
+      bset(c->consumed, field);
+      bset(c->is_pred, field);
    }
-}
-
-static bool preds_ok(ctx *c, uint32_t off, uint16_t n)
-{
-   if (!preds_test(c, off, n)) return false;
-   preds_mark(c, off, n);
-   return true;
 }
 
 static bool deposit(ctx *c, uint8_t word, uint16_t mask, uint16_t value)
@@ -85,16 +88,17 @@ static bool apply_node(ctx *c, uint32_t node_id);
 
 static bool apply_group(ctx *c, const agx3_group *g)
 {
-   for (uint16_t i = 0; i < g->alt_n; i++) {
-      uint32_t alt_id = c->t->altpool[g->alt_off + i];
-      const agx3_node *alt = &c->t->nodes[alt_id];
+   const agx3_table *t = c->t;
+   const uint64_t *fields = c->fields;
+   const agx3_node *alt = &t->nodes[g->alt_off];
+   for (const agx3_node *end = alt + g->alt_n; alt < end; alt++) {
       /* Most alternatives fail their predicates without modifying state.
        * Only snapshot the encoder once an alternative can actually apply. */
-      if (!preds_test(c, alt->pred_off, alt->pred_n))
+      if (!preds_test(t, fields, alt))
          continue;
       ctx saved = *c;
-      preds_mark(c, alt->pred_off, alt->pred_n);
-      if (apply_node(c, alt_id))
+      preds_mark(c, alt);
+      if (apply_node(c, (uint32_t)(alt - t->nodes)))
          return true;
       *c = saved;
    }
@@ -113,7 +117,7 @@ static bool apply_node(ctx *c, uint32_t node_id)
       if (cmd->field >= AGX3_MAX_FIELDS) return false;
       uint64_t value = c->fields[cmd->field], transformed;
       bset(c->consumed, cmd->field);
-      if (cmd->lut_off >= 0) {
+      if (cmd->lut_n) {
          bset(c->is_lut, cmd->field);
          if (value >= cmd->lut_n) return false;
          transformed = c->t->lutpool[cmd->lut_off + value];
@@ -161,7 +165,8 @@ bool agx3_compose_known(const agx3_table *t, uint32_t form,
    cp->direct_capacity = AGX3_MAX_FIELDS;
 
    const agx3_node *root = &t->nodes[f->node];
-   if (!preds_ok(cp, root->pred_off, root->pred_n)) return false;
+   if (!preds_test(t, fields, root)) return false;
+   preds_mark(cp, root);
    if (!apply_node(cp, f->node)) return false;
 
    /* strict: every nonzero field must have been consumed */
@@ -241,7 +246,7 @@ int32_t agx3_form_index(const agx3_table *t, const char *mnemonic, uint8_t ep)
 
    uint32_t lo = 0, hi = t->num_forms;
 
-   /* packgen emits forms in (mnemonic, entry-point) order.  This lookup is on
+   /* The forms are in (mnemonic, entry-point) order.  This lookup is on
     * every composed instruction, so do not linearly rescan the complete AGX3
     * form table for each instruction. */
    while (lo < hi) {

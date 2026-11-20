@@ -61,7 +61,7 @@ enum agx_isa {
  * still AGX3 (the applegpu_g18g Mach-O cpusubtype 0x1c3 has low nibble 3), and
  * roughly a fifth of the instructions keep their agx3c bytes, but the common
  * ALU, memory, control and texture forms are re-encoded with different
- * lengths. Its table is in the tree (agx3_compose/agx3d_tables.c and
+ * lengths. Its table is in the tree (agx3_compose/agx3d_tables.txt and
  * src/asahi/isa/AGX3d.xml, variant 2), but only the
  * instruction forms a core encoder has grounded against Apple's G18G output
  * are emitted for it; see agx_chip_codegen_supported.

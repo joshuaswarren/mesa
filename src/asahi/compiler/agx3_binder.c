@@ -38,9 +38,8 @@ agx3_bind_form_size(enum agx_isa_encoding encoding, const char *mnemonic,
 #include "util/xxhash.h"
 
 /*
- * The agx3d (G18G) table is 10 MB of generated data. Only the builds that
- * link agx3_compose/agx3d_tables.c define AGX3_HAVE_AGX3D_TABLE; everywhere
- * else an AGX3D request fails closed here instead of failing to link.
+ * Only the builds that encode G18G define AGX3_HAVE_AGX3D_TABLE and so link
+ * the agx3d table; everywhere else an AGX3D request fails closed here.
  */
 static const agx3_table *
 agx3d_table_or_null(void)

@@ -168,6 +168,18 @@ idep_agx_builder_h = declare_dependency(
   include_directories : include_directories('.'),
 )
 
+# The AGX3 encoding tables, generated from their descriptions.
+agx3_tables_c = []
+foreach t : ['agx3b', 'agx3c', 'agx3d']
+  agx3_tables_c += custom_target(
+    input : ['agx3_compose/gen_agx3_tables.py',
+             'agx3_compose/@0@_tables.txt'.format(t)],
+    output : '@0@_tables.c'.format(t),
+    command : [prog_python, '@INPUT0@', '@INPUT1@', '-o', '@OUTPUT@'],
+    depend_files : files('agx3_compose/agx3_table.py'),
+  )
+endforeach
+
 # The AGX3 encoder, its inverse and the three encoding tables, built once for
 # the compiler, the drivers and every test. A static link takes only the
 # tables it references.
@@ -176,10 +188,9 @@ libagx3_compose = static_library(
   files(
     'agx3_compose/agx3_compose.c',
     'agx3_compose/agx3_decode.c',
-    'agx3_compose/agx3b_tables.c',
-    'agx3_compose/agx3c_tables.c',
-    'agx3_compose/agx3d_tables.c',
   ),
+  agx3_tables_c,
+  include_directories : include_directories('agx3_compose'),
   c_args : [no_override_init_args],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,
@@ -197,6 +208,18 @@ libasahi_compiler = static_library(
 )
 
 if with_tests
+  # The generated tables hold exactly the rows of the tables their
+  # descriptions were made from.
+  foreach t : ['agx3b', 'agx3c', 'agx3d']
+    test(
+      '@0@_tables'.format(t),
+      prog_python,
+      args : [files('agx3_compose/gen_agx3_tables.py'), '--verify',
+              files('agx3_compose/@0@_tables.txt'.format(t))],
+      suite : ['asahi'],
+    )
+  endforeach
+
   # agx3_bind_compose()'s memo against the table walk, on every instruction
   # of the native witness texts.
   test(
