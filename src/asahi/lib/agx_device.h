@@ -597,13 +597,6 @@ unsigned agx_get_num_cores(const struct agx_device *dev);
 
 struct agx_device_key agx_gather_device_key(struct agx_device *dev);
 
-/* Native AGX3 recording: Ioto programs and HAL200-format records. */
-static inline bool
-agx_native_graphics(const struct agx_device *dev)
-{
-   return agx_chip_native_agx3(dev->chip);
-}
-
 /* This interface carries native sampler state in GPU records, not in the
  * firmware command's optional sampler-heap fields. */
 static inline bool
