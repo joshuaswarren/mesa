@@ -2364,10 +2364,13 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
  *
  * - Where the kernel takes a stream's own completion flush
  *   (DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION, M5), every such stream
- *   ends with the strong, memory-scoped flush. A boundary keeps the strong
- *   flush and drops its memory scope, which only memory reached through a
- *   second address needs (hk_cdm_alias_scope()); while such memory may
- *   exist, it keeps the scope too. The packet's end keeps the whole flush.
+ *   ends with a strong flush: the memory-scoped one, or, where memory has
+ *   no second address, the application's barrier or the deferred clears'
+ *   flush without memory scope (hk_pack_run_member()). A boundary keeps the
+ *   strong flush and drops its memory scope, which only memory reached
+ *   through a second address needs (hk_cdm_alias_scope()); while such
+ *   memory may exist, it keeps or gets the scope. The packet's end gets the
+ *   whole flush, upgraded in place where the last member's lacked the scope.
  * - HAL200 streams whose strong flush has no memory-scoped form (G16) end
  *   with their last launch's ordering barrier or a strong flush, and the end
  *   of the command publishes their writes. At a boundary the record becomes
@@ -2641,12 +2644,15 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
          hk_pack_dedup_resources(&cs->compute_resources, unique);
 
          if (visible_completion) {
-            /* Each source ends with the strong memory-scoped flush. The
-             * packet's end keeps it for the host and other queues, which
-             * observe nothing of a packet before its completion. Between
-             * members, the next one reads through the same addresses, so
-             * the scope is needed only where memory can also be reached
-             * through a second address (hk_cdm_alias_scope()). */
+            /* Each source ends with a strong flush (hk_pack_run_member()).
+             * The packet's end gets the memory scope, upgrading the record
+             * in place if the source's lacked it, for the host and other
+             * queues, which observe nothing of a packet before its
+             * completion. Between members, the next one reads through the
+             * same addresses, so the scope is needed only where memory can
+             * also be reached through a second address
+             * (hk_cdm_alias_scope()); a source without it keeps its plain
+             * strong flush there. */
             if (!last && !hk_cdm_alias_scope(dev) &&
                 cs->current == cs->memory_flush_end &&
                 cs->current == cs->strong_flush_end) {

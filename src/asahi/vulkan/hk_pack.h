@@ -71,8 +71,9 @@ enum hk_pack_boundary {
    HK_PACK_BOUNDARY_NONE,
    /* The kernel takes each stream's own completion flush, the strong
     * memory-scoped flush (DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION, M5
-    * streams): a member ends with it, and a boundary keeps the scope the
-    * next member needs. */
+    * streams): a member ends with a strong flush, a boundary keeps the
+    * memory scope only where memory may have a second address
+    * (hk_cdm_alias_scope()), and the packet's end gets it. */
    HK_PACK_BOUNDARY_VISIBLE_COMPLETION,
    /* HAL200 streams whose strong flush has no memory-scoped form (G16): the
     * kernel publishes a command's writes when it completes, and a boundary
