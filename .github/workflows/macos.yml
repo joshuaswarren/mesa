@@ -23,8 +23,11 @@ jobs:
     timeout-minutes: 120
     env:
       GALLIUM_DUMP_CPU: true
-      MESON_EXEC: /Users/runner/Library/Python/3.11/bin/meson
     steps:
+    - name: Branch gate
+      # workflow_dispatch lets you pick a tag; the build is meant for branch
+      # heads only.
+      run: case "$GITHUB_REF" in refs/heads/*) ;; *) echo "::error::dispatch ref $GITHUB_REF is not a branch"; exit 1;; esac
     - name: Checkout
       uses: actions/checkout@v4
     - name: Install Dependencies
@@ -37,6 +40,7 @@ jobs:
         brew "libxcb"
         brew "libxdamage"
         brew "libxext"
+        brew "llvm"
         brew "molten-vk"
         brew "ninja"
         brew "pkg-config"
@@ -46,14 +50,21 @@ jobs:
         brew update
         brew bundle --verbose
     - name: Install Mako and meson
-      run: pip3 install --user mako meson
+      # python3 -m pip pins the interpreter so the user-site bin dir below is
+      # the one meson actually lands in (the image's default is 3.9; a Brewfile
+      # python would put it somewhere else).
+      run: |
+        python3 -m pip install --user mako meson
+        echo "MESON_EXEC=$(python3 -m site --user-base)/bin/meson" >> "$GITHUB_ENV"
+        "$MESON_EXEC" --version
     - name: Configure
       run: |
         cat > native_config <<EOL
         [binaries]
-        llvm-config = '/usr/local/opt/llvm/bin/llvm-config'
+        llvm-config = '$(brew --prefix llvm)/bin/llvm-config'
         EOL
-        $MESON_EXEC . build --native-file=native_config -Dmoltenvk-dir=$(brew --prefix molten-vk) -Dbuild-tests=true -Dgallium-drivers=swrast,zink -Dglx=${{ matrix.glx_option }}
+        cat native_config
+        "$MESON_EXEC" . build --native-file=native_config -Dmoltenvk-dir=$(brew --prefix molten-vk) -Dbuild-tests=true -Dgallium-drivers=swrast,zink -Dglx=${{ matrix.glx_option }}
     - name: Build
       run: $MESON_EXEC compile -C build
     - name: Test
