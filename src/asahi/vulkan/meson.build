@@ -1087,6 +1087,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  g17p_vulkan_cross_queue = executable(
+    'g17p-vulkan-cross-queue',
+    files('tests/g17p_vulkan_cross_queue.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hk_vulkan_bg_eot_threads = executable(
     'hk-vulkan-bg-eot-threads',
     files('tests/hk_vulkan_bg_eot_threads.c'),
