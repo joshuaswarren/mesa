@@ -469,6 +469,21 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
          goto fail_alloc;
       }
+
+      /* Every byte of allocationSize must be backed by the imported object.
+       * An image bound to the memory is checked against the BO
+       * (hk_image_plane_bind()), but a buffer may use the whole of
+       * allocationSize, which would then run past the BO. */
+      if (mem->bo->size < pAllocateInfo->allocationSize) {
+         result = vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "allocationSize %" PRIu64 " exceeds the imported "
+                            "object (%" PRIu64 " bytes)",
+                            (uint64_t)pAllocateInfo->allocationSize,
+                            (uint64_t)mem->bo->size);
+         agx_bo_unreference(&dev->dev, mem->bo);
+         mem->bo = NULL;
+         goto fail_alloc;
+      }
       assert(!(flags & ~mem->bo->flags));
       mem->alias_import = true;
    } else if (host_info && host_info->handleType) {
