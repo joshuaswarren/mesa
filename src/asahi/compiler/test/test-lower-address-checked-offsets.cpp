@@ -52,6 +52,16 @@ offset32(const struct form &f, uint32_t x)
    return i * f.d + (member ? (uint32_t)f.c : 0);
 }
 
+/* The same offset without wrapping, as a valid access has it. */
+static int64_t
+offset_unwrapped(const struct form &f, uint32_t x)
+{
+   const bool shifted = f.shape == SHIFTED || f.shape == SHIFTED_MEMBER;
+   const bool member = f.shape == MEMBER || f.shape == SHIFTED_MEMBER;
+   const int64_t i = shifted ? (int64_t)x + f.k : (int64_t)x;
+   return i * f.d + (member ? f.c : 0);
+}
+
 static nir_def *
 build_offset(nir_builder *b, const struct form &f, nir_def *x)
 {
@@ -252,6 +262,46 @@ TEST(LowerAddressCheckedOffsets, WrappingIndicesStayInTheBuffer)
          ASSERT_TRUE(r.ok);
          EXPECT_EQ(r.address, p + t.checked)
             << "shape " << t.f.shape << std::hex << " x 0x" << t.x;
+      }
+   }
+}
+
+/* Unchecked: a valid access (a nonnegative array index, an offset below
+ * 2^31) keeps its address, and that includes the last bytes of a 2 GiB
+ * buffer. */
+TEST(LowerAddressCheckedOffsets, ValidOffsetsKeepTheirAddressUnchecked)
+{
+   const uint64_t p = 0x0000123400000000ull;
+   for (struct access acc : accesses) {
+      for (const struct form &f : forms(acc)) {
+         /* x for the last valid element, and the elements around it */
+         std::vector<uint32_t> vals(std::begin(xs), std::end(xs));
+         const int64_t member = (f.shape == MEMBER || f.shape == SHIFTED_MEMBER)
+                                   ? f.c
+                                   : 0;
+         const int64_t k = (f.shape == SHIFTED || f.shape == SHIFTED_MEMBER)
+                              ? f.k
+                              : 0;
+         const int64_t last = (INT32_MAX - (acc.bit_size / 8) * acc.comps -
+                               member) / f.d - k;
+         for (int64_t dx = -2; dx <= 0; ++dx)
+            vals.push_back((uint32_t)(last + dx));
+         for (const bool *o : option_sets) {
+            for (uint32_t x : vals) {
+               /* A valid access has a nonnegative array index. */
+               const int64_t v = offset_unwrapped(f, x);
+               if ((int64_t)x + k < 0 || v < 0 ||
+                   v + (acc.bit_size / 8) * acc.comps > INT32_MAX)
+                  continue;
+               struct result r = lower_form(f, acc, o[0], o[1], false, p, x);
+               ASSERT_TRUE(r.ok);
+               EXPECT_EQ(r.address, p + (uint64_t)v)
+                  << std::hex << "shape " << f.shape << " d " << f.d << " k "
+                  << std::dec << f.k << " c " << f.c << " bits "
+                  << acc.bit_size << " kind " << acc.kind << " options "
+                  << o[0] << o[1] << std::hex << " x 0x" << x;
+            }
+         }
       }
    }
 }

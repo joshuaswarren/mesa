@@ -279,9 +279,12 @@ existing_index_multiple(nir_intrinsic_instr *access, nir_scalar index,
  *   N - i folds to c + -i), so leave it alone.
  * - An array index i + c scaled by amul is, for a valid access, nonnegative
  *   and below 2^31 / stride, so as signed integers (i + c) * stride equals
- *   sext(i) * stride + c * stride. With c < 0 and a byte stride, i + c could
- *   still wrap into the last bytes of a 2 GiB buffer, so require c >= 0 or a
- *   wider stride there.
+ *   sext(i) * stride + c * stride. The index becomes the 32-bit i * stride,
+ *   which for c < 0 exceeds the valid offset by up to 32 KiB (the byte offset's
+ *   range) and so can pass 2^31 in the last 32 KiB of a 2 GiB buffer, at any
+ *   stride. Only where the access then scales the index (a 16-bit or wider
+ *   element) is that product below 2^30 + 2^14, so require c >= 0 at a byte
+ *   scale.
  *
  * The same bounds let a power-of-two stride move into the index scale.
  */
@@ -343,7 +346,7 @@ fold_byte_offset(nir_builder *b, nir_intrinsic_instr *access,
             continue;
 
          const int64_t c = nir_scalar_as_int(k);
-         if (c < 0 && stride < 2)
+         if (c < 0 && scale == 0)
             break;
 
          byte_offset += c * (int64_t)stride * (INT64_C(1) << scale);
