@@ -3084,4 +3084,12 @@ void hk_g17p_meta_wait_addr(struct hk_cmd_buffer *cmd, uint64_t address,
 void agx_fill_velem_keys(const struct vk_vertex_input_state *vi,
                          uint64_t attribs_read, struct agx_velem_key *keys);
 
+bool hk_needs_index_robustness(struct hk_cmd_buffer *cmd,
+                               struct agx_draw *draw,
+                               const struct agx_draw *conditional_direct);
+
+bool hk_robust_index_rewrite_admitted(const struct hk_device *dev,
+                                      struct agx_draw draw,
+                                      enum agx_primitive topology);
+
 struct agx_robustness hk_prolog_robustness(struct hk_device *dev);

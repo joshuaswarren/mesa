@@ -125,19 +125,26 @@ agx_vdm_hal200_index_range(uint64_t address, uint64_t range_B,
    if (!relocated || !size_word || !address ||
        (index_size_B != 1 && index_size_B != 2 && index_size_B != 4) ||
        (address & (index_size_B - 1)) ||
-       address >= limit || !range_B || range_B > UINT32_MAX ||
+       address >= limit || !range_B ||
        range_B > limit - address || !count || offset_B >= range_B ||
        (!zero_indices && count_B > range_B - offset_B))
       return false;
 
    /* A native direct indexed draw rounds the supplied byte length up to
     * dwords, then subtracts one. Keep arithmetic 64-bit so firstIndex and a
-    * near-4GiB range cannot wrap before validation. The window starts at the
+    * large (> 4 GiB) range cannot wrap before validation, and clamp remaining
+    * windows above the 32-bit dword ceiling to UINT32_MAX dwords (which still
+    * covers every possible uint32_t index count). The window starts at the
     * dword holding the first index, so a range that ends inside a dword needs
     * that dword counted from there. */
    *relocated = address + offset_B;
-   *size_word = (uint32_t)(((range_B - offset_B + (*relocated & 3) + 3) >> 2) -
-                           1);
+   const uint64_t rem_B = range_B - offset_B;
+   const uint64_t max_dwords_B = (uint64_t)UINT32_MAX * 4;
+   const uint64_t dwords =
+      rem_B >= max_dwords_B
+         ? (uint64_t)UINT32_MAX
+         : (rem_B + (*relocated & 3) + 3) >> 2;
+   *size_word = (uint32_t)((dwords > UINT32_MAX ? UINT32_MAX : dwords) - 1);
    return true;
 }
 
@@ -238,14 +245,16 @@ agx_vdm_hal200_indirect_draw_pack(
 
    uint32_t size_word = 0;
    if (fields->indexed) {
-      const uint64_t dwords = ((uint64_t)fields->index_buffer_range_B +
-                               (fields->index_buffer & 3) + 3) >> 2;
       const uint64_t limit = UINT64_C(1) << 48;
       if (!fields->index_buffer ||
           (fields->index_buffer & (fields->index_size_B - 1)) ||
           fields->index_buffer >= limit ||
-          fields->index_buffer_range_B > limit - fields->index_buffer ||
-          dwords == 0 || dwords > UINT32_MAX)
+          !fields->index_buffer_range_B ||
+          fields->index_buffer_range_B > limit - fields->index_buffer)
+         return false;
+      const uint64_t dwords = (fields->index_buffer_range_B +
+                               (fields->index_buffer & 3) + 3) >> 2;
+      if (dwords == 0 || dwords > UINT32_MAX)
          return false;
       size_word = (uint32_t)(dwords - 1);
    }

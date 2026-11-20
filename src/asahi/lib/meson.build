@@ -537,6 +537,7 @@ if with_tests
     executable(
       'asahi-vdm-index-list-core',
       files(
+        'agx_vdm_hal200_direct_draw_core.c',
         'agx_vdm_index_list_core.c',
         'tests/test-vdm-index-list-core.c',
       ),

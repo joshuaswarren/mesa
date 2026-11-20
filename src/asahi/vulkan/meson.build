@@ -841,6 +841,12 @@ if with_tests and ld_args_gc_sections.length() > 0
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_index_robustness', executable('hk_index_robustness_test',
+    files('tests/test-hk-index-robustness.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test('hk_rt_on_demand', executable('hk_rt_on_demand_test',
     files('tests/test-hk-rt-on-demand.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,

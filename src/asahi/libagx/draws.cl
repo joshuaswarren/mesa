@@ -270,7 +270,7 @@ libagx_draw_robust_index_impl(
    global uint32_t *vdm, global struct poly_heap *heap,
    global uint32_t *printf_buffer,
    constant VkDrawIndexedIndirectCommand *cmd, uint64_t in_buf_ptr,
-   uint32_t in_buf_range_B, ushort restart, uint32_t restart_index,
+   uint64_t in_buf_range_B, ushort restart, uint32_t restart_index,
    enum agx_chip chip, enum agx_primitive topology,
    uint32_t draw_state_context_offset,
    uint32_t render_state_emitted, uint64_t empty_draw_jump,
@@ -295,10 +295,9 @@ libagx_draw_robust_index_impl(
       draw.index_buffer_range_B = 4;
       draw.start = 0;
    } else if (cmd->instanceCount != 0 && cmd->indexCount > in_size_el) {
-      uint start_B = agx_indices_to_B(draw.start, draw.index_size);
+      uint64_t start_B = (uint64_t)draw.start << draw.index_size;
       constant void *in_buf =
          (constant void *)(draw.index_buffer + start_B);
-      uint in_size_B = agx_indices_to_B(in_size_el, index_size);
 
       /* After a small number of zeroes at the end, extra zeroes cannot change
        * triangle/line rendering: they duplicate degenerate primitives. Clamp
@@ -350,6 +349,7 @@ libagx_draw_robust_index_impl(
          draw.index_buffer_range_B = 4;
          draw.start = 0;
       } else {
+         uint in_size_B = agx_indices_to_B(in_size_el, index_size);
          global uchar *padded = heap->base + padded_offs;
          draw.index_buffer = (uintptr_t)padded;
          draw.index_buffer_range_B = out_size_B;
@@ -371,7 +371,7 @@ KERNEL(32)
 libagx_draw_robust_index(global uint32_t *vdm, global struct poly_heap *heap,
                          global uint32_t *printf_buffer,
                          constant VkDrawIndexedIndirectCommand *cmd,
-                         uint64_t in_buf_ptr, uint32_t in_buf_range_B,
+                         uint64_t in_buf_ptr, uint64_t in_buf_range_B,
                          ushort restart, uint32_t restart_index,
                          enum agx_chip chip, enum agx_primitive topology,
                          uint32_t draw_state_context_offset,
@@ -389,7 +389,7 @@ KERNEL(32)
 libagx_draw_robust_index_batch(constant struct libagx_robust_index_draw *draws,
                                global struct poly_heap *heap,
                                global uint32_t *printf_buffer,
-                               uint64_t in_buf_ptr, uint32_t in_buf_range_B,
+                               uint64_t in_buf_ptr, uint64_t in_buf_range_B,
                                ushort restart, uint32_t restart_index,
                                enum agx_chip chip, enum agx_primitive topology,
                                enum agx_index_size index_size__3)

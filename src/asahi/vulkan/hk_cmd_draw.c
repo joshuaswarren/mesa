@@ -11809,7 +11809,54 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       g17p_native_bind_tail_emitted_out);
 }
 
+/* Whether a GPU-rewritten draw that turns out empty (a zero count, or a
+ * record predicated off by an indirect count) has somewhere to continue.
+ * The G17P and HAL300 record families replace such a draw with a stream link
+ * (agx_vdm_draw_robust_index), whose target hk_emit_robust_index() computes
+ * only for native AGX3 and M5. G18G writes HAL300 records but has no such
+ * target yet, so it must not be sent through the rewrite by default. */
 static bool
+hk_robust_index_has_empty_continuation(const struct hk_device *dev)
+{
+   const enum agx_chip records =
+      agx_vdm_index_list_record_chip(agx_chip_record_family(dev->dev.chip));
+   const bool links = records == AGX_CHIP_G17P ||
+                      agx_vdm_index_list_direct_is_hal300_inline(records);
+   return !links || agx_chip_native_or_m5(dev->dev.chip);
+}
+
+/* Whether a draw already converted to the rewrite's indexed-indirect form
+ * (hk_draw_as_indexed_indirect) may be rewritten on this device: the rewrite
+ * needs an empty-draw continuation and an Index List the record chip packs.
+ * Otherwise the draw is refused, robust or oversized alike. */
+bool
+hk_robust_index_rewrite_admitted(const struct hk_device *dev,
+                                 struct agx_draw draw,
+                                 enum agx_primitive topology)
+{
+   const struct agx_draw probe = agx_draw_indexed(
+      1, 1, 0, 0, 0, AGX_ZERO_PAGE_ADDRESS, 4, draw.index_size, draw.restart);
+   return draw.b.ptr && hk_robust_index_has_empty_continuation(dev) &&
+          agx_vdm_draw_supported(agx_vdm_index_list_record_chip(dev->dev.chip),
+                                 probe, topology);
+}
+
+/* Whether a conditionally lowered direct draw's accessed index span stays
+ * within 32-bit byte addressing from the unrelocated index buffer base.
+ * Beyond UINT32_MAX bytes, keep the draw on the 64-bit software rewrite
+ * instead of handing a >= 4 GiB scaled firstIndex to a native indirect packet. */
+static bool
+hk_conditional_direct_fits_32bit_bytes(const struct agx_draw *d)
+{
+   if (!d->b.count[0] || !d->b.count[1])
+      return true;
+
+   const uint64_t start_B = (uint64_t)d->start << d->index_size;
+   const uint64_t count_B = (uint64_t)d->b.count[0] << d->index_size;
+   return start_B <= UINT32_MAX && count_B <= UINT32_MAX - start_B;
+}
+
+bool
 hk_needs_index_robustness(struct hk_cmd_buffer *cmd, struct agx_draw *draw,
                           const struct agx_draw *conditional_direct)
 {
@@ -11837,6 +11884,23 @@ hk_needs_index_robustness(struct hk_cmd_buffer *cmd, struct agx_draw *draw,
       return false;
    }
 
+   /* Indirect packets encode the index-buffer range in 32-bit dwords, so an
+    * oversized binding (> UINT32_MAX * 4 bytes, e.g. 16 GiB or 16 GiB + 4)
+    * cannot be represented natively and must lower through the software
+    * rewrite even when no robustness features are enabled. The same applies
+    * to a conditionally lowered direct draw whose accessed byte span exceeds
+    * UINT32_MAX from the unrelocated base. Where that rewrite has no
+    * continuation for an empty draw, the draw is refused at admission instead
+    * (agx_vdm_draw_supported), as before. */
+   if (agx_is_indirect(draw->b) &&
+       hk_robust_index_has_empty_continuation(dev)) {
+      uint32_t unused_size_word = 0;
+      if (!agx_draw_indirect_index_buffer_size_word(*draw, &unused_size_word) ||
+          (conditional_direct &&
+           !hk_conditional_direct_fits_32bit_bytes(conditional_direct)))
+         return true;
+   }
+
    if (!(dev->vk.enabled_features.robustBufferAccess ||
          dev->vk.enabled_features.robustBufferAccess2 ||
          dev->vk.enabled_features.pipelineRobustness))
@@ -11844,11 +11908,39 @@ hk_needs_index_robustness(struct hk_cmd_buffer *cmd, struct agx_draw *draw,
 
    /* A conditionally lowered direct draw has an immutable indirect record:
     * apply the direct draw's exact range test instead of conservatively
-    * treating it as application-authored indirect data. */
-   if (agx_is_indirect(draw->b))
-      return conditional_direct
-                ? agx_direct_draw_overreads_indices(*conditional_direct)
-                : true;
+    * treating it as application-authored indirect data, provided its accessed
+    * span stays within 32-bit byte addressing. */
+   if (agx_is_indirect(draw->b)) {
+      if (conditional_direct) {
+         if (!hk_conditional_direct_fits_32bit_bytes(conditional_direct))
+            return true;
+         return agx_direct_draw_overreads_indices(*conditional_direct);
+      }
+
+      /* Where agx_chip_vdm_indirect_index_bounds() holds, the indirect VDM
+       * INDEX_LIST bounds index fetches in dword units and substitutes index
+       * 0 for out-of-range indices (both partial and fully out-of-bounds
+       * draws, including with primitive restart and vertex offsets). When the index buffer range fits within 32-bit byte
+       * bounds, the base and range are 4-byte aligned, the index type is 16-
+       * or 32-bit, and the address/range stay within the 48-bit VA limit,
+       * hardware bounds are exact and no pre-graphics robust index rewrite
+       * pass is needed.
+       *
+       * Oversized bindings (> UINT32_MAX, including 4 GiB and 4 GiB + 4),
+       * unaligned 16-bit ranges, and 8-bit index buffers retain their full
+       * 64-bit byte range and take the software rewrite path. */
+      const uint64_t va_limit = UINT64_C(1) << 48;
+      if (agx_chip_vdm_indirect_index_bounds(dev->dev.chip) &&
+          draw->index_size != AGX_INDEX_SIZE_U8 &&
+          draw->index_buffer_range_B <= UINT32_MAX &&
+          (draw->index_buffer & 3) == 0 &&
+          (draw->index_buffer_range_B & 3) == 0 &&
+          draw->index_buffer < va_limit &&
+          draw->index_buffer_range_B <= va_limit - draw->index_buffer)
+         return false;
+
+      return true;
+   }
 
    return agx_direct_draw_overreads_indices(*draw);
 }
@@ -12482,13 +12574,19 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
       const uint64_t limit = UINT64_C(1) << 48;
       if (draw.index_size > AGX_INDEX_SIZE_U32 || !draw.index_buffer ||
           (draw.index_buffer & (index_size_B - 1)) ||
-          draw.index_buffer >= limit || !range_B || range_B > UINT32_MAX ||
+          draw.index_buffer >= limit || !range_B ||
           range_B > limit - draw.index_buffer || !draw.b.count[0] ||
           offset_B >= range_B ||
           (!zero_indices && count_B > range_B - offset_B))
          goto refused;
 
       const uint64_t ib = draw.index_buffer + offset_B;
+      const uint64_t rem_B = range_B - offset_B;
+      const uint64_t max_dwords_B = (uint64_t)UINT32_MAX * 4;
+      const uint64_t dwords =
+         rem_B >= max_dwords_B
+            ? (uint64_t)UINT32_MAX
+            : (rem_B + (ib & 3) + 3) >> 2;
       restart_index = hk_draw_restart_index(cmd, draw);
       restart_record =
          dev->dev.chip != AGX_CHIP_G17P ||
@@ -12506,7 +12604,7 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
       w[n++] = draw.b.count[0];
       w[n++] = draw.b.count[1];
       w[n++] = (uint32_t)(int32_t)draw.index_bias;
-      w[n++] = (uint32_t)(((range_B - offset_B + (ib & 3) + 3) >> 2) - 1);
+      w[n++] = (uint32_t)((dwords > UINT32_MAX ? UINT32_MAX : dwords) - 1);
       w[n++] = (uint32_t)((ib >> 40) & 0xff);
    } else {
       if (!draw.b.count[0])
@@ -13081,11 +13179,14 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
          continue;
       }
 
-      /* hk_g17p_emit_draw() validates a direct draw as it encodes it. */
+      /* hk_g17p_emit_draw() validates a direct draw as it encodes it, and the
+       * robust-index rewrite path validates its GPU-generated direct draw
+       * independently of the native indirect packet's dword ceiling. */
       enum agx_primitive topology = cmd->state.gfx.topology;
       /* Admit with the chip whose Index List words agx_vdm_draw() writes
        * below (G18G writes G17G's), not the raw chip. */
-      if ((!agx_chip_native_agx3(dev->dev.chip) || agx_is_indirect(draw.b)) &&
+      if (!needs_idx_robust &&
+          (!agx_chip_native_agx3(dev->dev.chip) || agx_is_indirect(draw.b)) &&
           !agx_vdm_draw_supported(agx_vdm_index_list_record_chip(dev->dev.chip),
                                   draw, topology)) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -13103,7 +13204,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
          cs->current = out;
 
          draw = hk_draw_as_indexed_indirect(cmd, draw);
-         if (!agx_vdm_draw_supported(dev->dev.chip, draw, topology)) {
+         if (!hk_robust_index_rewrite_admitted(dev, draw, topology)) {
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
             return;
          }

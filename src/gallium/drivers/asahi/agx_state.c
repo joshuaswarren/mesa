@@ -2313,7 +2313,8 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
       fprintf(stderr,
               "PBE_REFUSED format=%s target=%u dim=%u layout=%u level=%u "
               "levels=%u mip=%u layers=%u samples=%u %ux%u srgb=%u "
-              "compressed=%u extended=%u stride=%u sw=%u,%u,%u,%u,%u\n",
+              "compressed=%u extended=%u stride=%u sw=%" PRIu64 ",%u,%u,%u,%"
+              PRIu64 "\n",
               util_format_short_name(view->format), tex->base.target,
               cfg.dimension, cfg.layout, cfg.level, cfg.levels,
               cfg.unk_mipmapped, cfg.layers, cfg.samples, cfg.width,
