@@ -531,7 +531,7 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
    }
 
    /* Optimize but allow copies because we haven't lowered them yet */
-   if (agx_native_graphics(&((struct hk_physical_device *)vk_pdev)->dev) &&
+   if (agx_chip_native_agx3(((struct hk_physical_device *)vk_pdev)->dev.chip) &&
        nir->info.stage != MESA_SHADER_MESH)
       agx_preprocess_nir_native(
          nir, ((struct hk_physical_device *)vk_pdev)->dev.chip);
@@ -983,7 +983,7 @@ hk_hash_graphics_state(struct vk_physical_device *device,
 
    /* G17P removes user varyings from fragmentless pipelines, so the same
     * pre-rasterization shader compiles differently for a library. */
-   if (agx_native_graphics(&((struct hk_physical_device *)device)->dev) &&
+   if (agx_chip_native_agx3(((struct hk_physical_device *)device)->dev.chip) &&
        !(stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
       const bool no_fragment_shader = hk_pipeline_has_no_fragment_shader(state);
       _mesa_blake3_update(&blake3_ctx, &no_fragment_shader,
@@ -3075,7 +3075,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
                NULL);
       NIR_PASS(_, nir, nir_lower_wpos_center);
 
-      if (agx_native_graphics(&dev->dev)) {
+      if (agx_chip_native_agx3(dev->dev.chip)) {
          NIR_PASS(_, nir, agx_nir_lower_g17p_helper_samples);
       }
    }
@@ -3108,7 +3108,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             &ycbcr_state);
    NIR_PASS(_, nir, nir_shader_tex_pass, lower_ycbcr_chroma_blend,
             nir_metadata_none, (void *)&ycbcr_state);
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       NIR_PASS(_, nir, nir_shader_tex_pass, lower_ycbcr_plane_range,
                nir_metadata_control_flow, (void *)&ycbcr_state);
    }
@@ -3198,7 +3198,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    else
       NIR_PASS(_, nir, agx_nir_lower_texture_early, support_lod_bias);
 
-   if (agx_native_graphics(&dev->dev) &&
+   if (agx_chip_native_agx3(dev->dev.chip) &&
        agx_chip_sampler_has_lod_bias(dev->dev.chip))
       NIR_PASS(_, nir, nir_shader_tex_pass, hk_lower_g17p_sampler_bias,
                nir_metadata_control_flow, NULL);
@@ -3211,7 +3211,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       NIR_PASS(_, nir, hk_nir_lower_image_view_min_lod);
    }
 
-   if (((features & HK_FEAT_CUSTOM_BORDER) || agx_native_graphics(&dev->dev)) &&
+   if (((features & HK_FEAT_CUSTOM_BORDER) ||
+        agx_chip_native_agx3(dev->dev.chip)) &&
        !HK_PERF(dev, NOBORDER)) {
       NIR_PASS(_, nir, agx_nir_lower_custom_border);
    }
@@ -3509,7 +3510,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    if (nir->info.stage != MESA_SHADER_MESH &&
        !(nir->info.stage == MESA_SHADER_TASK &&
          agx_chip_g17p_or_m5(dev->dev.chip))) {
-      if (agx_native_graphics(&dev->dev))
+      if (agx_chip_native_agx3(dev->dev.chip))
          agx_preprocess_nir_native(nir, dev->dev.chip);
       else if (dev->dev.chip == AGX_CHIP_G18G)
          agx_preprocess_nir_g18g(nir);
@@ -4815,7 +4816,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * in a register (agx_optimizer_inline_imm), so only G17P admits one to
     * the sampler lowerings below. */
    const bool g17p = dev->dev.chip == AGX_CHIP_G17P;
-   if (agx_native_graphics(&dev->dev) &&
+   if (agx_chip_native_agx3(dev->dev.chip) &&
        nir->info.stage == MESA_SHADER_VERTEX) {
       /* Software vertex variants feed geometry/tessellation through CDM.
        * They use the same indexed texture heap and shifted vertex uniforms
@@ -4839,7 +4840,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                   AGX_ABI_G17P_TEXTURE_POINTER_HALFS,
                   shader->info.agx3_gen1_fragment_rq);
       }
-   } else if (agx_native_graphics(&dev->dev) &&
+   } else if (agx_chip_native_agx3(dev->dev.chip) &&
               (nir->info.stage == MESA_SHADER_GEOMETRY ||
                nir->info.stage == MESA_SHADER_TESS_CTRL ||
                nir->info.stage == MESA_SHADER_TESS_EVAL ||
@@ -4921,7 +4922,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          }
       }
       shader->info.g18_unlowered_image = hk_g18g_has_unlowered_image(nir);
-   } else if (agx_native_graphics(&dev->dev) &&
+   } else if (agx_chip_native_agx3(dev->dev.chip) &&
               nir->info.stage == MESA_SHADER_COMPUTE) {
       /* Descriptor buffers keep only the heap-indexed paths, which never
        * decode set contents while recording. */
@@ -5057,7 +5058,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          NIR_PASS(_, nir, nir_lower_alpha_to_coverage, false, enable);
       }
 
-      if (agx_native_graphics(&dev->dev))
+      if (agx_chip_native_agx3(dev->dev.chip))
          shader->info.fs.g17p_colour_unit_range =
             agx_nir_fs_colour_outputs_unit_range(nir);
 
@@ -5110,7 +5111,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                      a2c_in_main ? &a2c_in_main : NULL);
          }
          shader->info.fs.a2c_in_main = a2c_in_main;
-      } else if (agx_native_graphics(&dev->dev))
+      } else if (agx_chip_native_agx3(dev->dev.chip))
          NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
       else
          NIR_PASS(_, nir, agx_nir_lower_sample_mask);
@@ -5242,7 +5243,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * layer on this generation. */
       NIR_PASS(_, nir, agx_nir_lower_interpolation,
                agx_chip_native_or_m5(dev->dev.chip));
-      if (agx_native_graphics(&dev->dev)) {
+      if (agx_chip_native_agx3(dev->dev.chip)) {
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   hk_g17p_lower_is_first_fan,
                   nir_metadata_control_flow, NULL);
@@ -5297,7 +5298,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    uint64_t outputs = nir->info.outputs_written;
    if (sw_stage == MESA_SHADER_VERTEX || sw_stage == MESA_SHADER_TESS_EVAL) {
       if (hw) {
-         if (agx_native_graphics(&dev->dev)) {
+         if (agx_chip_native_agx3(dev->dev.chip)) {
             NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                      hk_g17p_saturate_layer_viewport,
                      nir_metadata_control_flow, NULL);
@@ -5308,7 +5309,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          hk_lower_hw_vs(dev, nir, shader, kill_psiz,
                         agx_chip_native_or_m5(dev->dev.chip),
                         default_layer, hk_clip_m1_1(dev, features),
-                        agx_native_graphics(&dev->dev)
+                        agx_chip_native_agx3(dev->dev.chip)
                            ? hk_root_descriptor_offset(draw.no_attachments)
                            : -1);
          outputs = nir->info.outputs_written;
@@ -5450,7 +5451,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                 rs->uniform_buffers !=
                    VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT),
       .g17p_sparse_vertex_outputs =
-         agx_native_graphics(&dev->dev) && hw &&
+         agx_chip_native_agx3(dev->dev.chip) && hw &&
          hk_g17p_sparse_vertex_outputs(&nir->info, sw_stage,
                                        xfb_info && xfb_info->output_count),
       /* The placeholder indices of a relocatable UVS layout, which the
@@ -5472,7 +5473,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       .no_preamble = dev->dev.chip == AGX_CHIP_G18G ||
          (agx_chip_g17_m5(dev->dev.chip) && !m5_compute_cprog &&
           !m5_fs_cprog) ||
-         (agx_native_graphics(&dev->dev) &&
+         (agx_chip_native_agx3(dev->dev.chip) &&
           (!agx_chip_native_preamble(dev->dev.chip) || !fs_reads_descriptors)),
    };
 
@@ -5481,7 +5482,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * vertex constant programs); carried in the key, never in the global
     * debug word. */
    backend_key.g17p_native_uniforms =
-      (agx_native_graphics(&dev->dev) || m5_fs_cprog) &&
+      (agx_chip_native_agx3(dev->dev.chip) || m5_fs_cprog) &&
       !backend_key.no_preamble;
 
    /* Uniform DMA: the root table, every descriptor set pointer, the dynamic
@@ -5504,7 +5505,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    const bool fs_dma = backend_key.no_preamble &&
                        sw_stage == MESA_SHADER_FRAGMENT &&
                        nir->info.stage == MESA_SHADER_FRAGMENT;
-   if ((agx_native_graphics(&dev->dev) && (fs_dma || vs_dma || cs_dma)) ||
+   if ((agx_chip_native_agx3(dev->dev.chip) && (fs_dma || vs_dma || cs_dma)) ||
        (agx_chip_g17_m5(dev->dev.chip) &&
         (fs_dma || vs_dma || (cs_dma && m5_compute_cprog)))) {
       backend_key.g17p_uniform_dma = true;
@@ -5551,7 +5552,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
         sw_stage == MESA_SHADER_FRAGMENT && hk_m5_uniform_colour(nir)) ||
        (sw_stage == MESA_SHADER_FRAGMENT &&
         shader->info.fs.m5_inline_sample_shading) ||
-       (agx_native_graphics(&dev->dev) &&
+       (agx_chip_native_agx3(dev->dev.chip) &&
         (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
         sw_stage == MESA_SHADER_FRAGMENT &&
         nir->info.stage == MESA_SHADER_FRAGMENT && !nir->info.internal &&
@@ -7652,7 +7653,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * non-AGX2 command-stream generations, so those keep replay until they
        * have a graphics-stage CDM launcher. */
       const bool supports_gs_main_cdm =
-         agx_native_graphics(&dev->dev) ||
+         agx_chip_native_agx3(dev->dev.chip) ||
          agx_chip_command_stream_generation(dev->dev.chip) ==
             AGX_CS_GENERATION_AGX2;
       const enum poly_gs_side_effects side_effects =
@@ -7687,7 +7688,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          NIR_PASS(_, rast, nir_lower_default_point_size);
 
       struct hk_shader *shader = &obj->variants[HK_GS_VARIANT_RAST];
-      if (agx_native_graphics(&dev->dev)) {
+      if (agx_chip_native_agx3(dev->dev.chip)) {
          NIR_PASS(_, rast, nir_shader_intrinsics_pass,
                   hk_g17p_saturate_layer_viewport, nir_metadata_control_flow,
                   NULL);
@@ -7695,7 +7696,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       hk_lower_hw_vs(dev, rast, shader, false,
                      agx_chip_native_or_m5(dev->dev.chip),
                      true, hk_clip_m1_1(dev, features),
-                     agx_native_graphics(&dev->dev)
+                     agx_chip_native_agx3(dev->dev.chip)
                         ? hk_root_descriptor_offset(draw.no_attachments)
                         : -1);
       shader->info.gs = count_variant->info.gs;
@@ -8361,7 +8362,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
     *
     * Do not apply this to pipeline libraries: their pre-raster shader can be
     * linked with a fragment library later. */
-   if (agx_native_graphics(&dev->dev) && shader_count > 0 &&
+   if (agx_chip_native_agx3(dev->dev.chip) && shader_count > 0 &&
        hk_pipeline_has_no_fragment_shader(state)) {
       nir_shader *last = shaders[shader_count - 1];
       if (last->info.stage <= MESA_SHADER_GEOMETRY)
@@ -8421,7 +8422,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    /* Only a complete pipeline known to have no fragment shader can fix an
     * empty interpolation contract. A pre-raster library or shader object
     * must retain draw-time UVS indices for its eventual fragment consumer. */
-   if (agx_native_graphics(&dev->dev) && shader_count > 0 &&
+   if (agx_chip_native_agx3(dev->dev.chip) && shader_count > 0 &&
        hk_pipeline_has_no_fragment_shader(state)) {
       nir_shader *last = shaders[shader_count - 1];
       if (last->info.stage <= MESA_SHADER_GEOMETRY) {
@@ -8740,19 +8741,19 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES ||
        (clip_z ? !dev->vk.physical->supported_features.depthClipControl
                : dev->vk.enabled_features.depthClipControl) ||
-       (has_mesh_source && (stage != MESA_SHADER_FRAGMENT ||
-                            dev->dev.chip != AGX_CHIP_G17P)) ||
+       (has_mesh_source &&
+        (stage != MESA_SHADER_FRAGMENT || dev->dev.chip != AGX_CHIP_G17P)) ||
        (variant_flags2 & ~1u) ||
        (has_fbl_source && stage != MESA_SHADER_FRAGMENT) ||
        (has_source && !sample_variants) ||
        (m5_sample_variants &&
         (!sample_variants || !agx_chip_g17_m5(dev->dev.chip))) ||
-       (sample_variants &&
-        (stage != MESA_SHADER_FRAGMENT ||
-         (agx_chip_g17_m5(dev->dev.chip) ? !m5_sample_variants
-                                        : !agx_native_graphics(&dev->dev)))) ||
+       (sample_variants && (stage != MESA_SHADER_FRAGMENT ||
+                            (agx_chip_g17_m5(dev->dev.chip)
+                                ? !m5_sample_variants
+                                : !agx_chip_native_agx3(dev->dev.chip)))) ||
        (has_mono && (stage != MESA_SHADER_FRAGMENT ||
-                    !agx_chip_native_or_m5(dev->dev.chip))))
+                     !agx_chip_native_or_m5(dev->dev.chip))))
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    /* Compiled with a custom-border emulation that this GPU, with no sampler

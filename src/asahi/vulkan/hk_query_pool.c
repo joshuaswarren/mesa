@@ -303,7 +303,7 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
     * buffer, when it is no longer current: a post-graphics dispatch would
     * open a new stream after every later command, a query copy or reset
     * included. Write into the stream itself, as native AGX3 does. */
-   const bool pin = agx_native_graphics(&dev->dev) ||
+   const bool pin = agx_chip_native_agx3(dev->dev.chip) ||
                     (cs != cmd->current_cs.post_gfx && cs != cmd->current_cs.cs);
    if (pin) {
       /* End-of-stream writes belong to this exact post-graphics stream.
@@ -363,7 +363,7 @@ hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
    hk_cdm_cache_flush(dev, cs);
 
    perf_debug(cmd, "Queued write");
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       hk_g17p_meta_fill_addr(cmd, &cmd->current_cs.cs, address,
                              sizeof(value), value);
       return;
@@ -577,7 +577,7 @@ emit_zero_queries(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Query pool zero");
 
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       emit_zero_queries_g17p(cmd, pool, first_index, num_queries,
                              set_available);
       return;
@@ -754,7 +754,7 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
 
    /* See hk_oq_submission_done(): only the native AGX3 path needs the
     * submission point. */
-   if (occlusion_queries && agx_native_graphics(&dev->dev)) {
+   if (occlusion_queries && agx_chip_native_agx3(dev->dev.chip)) {
       pool->oq_submit =
          vk_zalloc2(&dev->vk.alloc, pAllocator,
                     sizeof(*pool->oq_submit) * occlusion_queries, 8,
@@ -1879,7 +1879,8 @@ hk_cmd_copy_query_pool_results(struct hk_cmd_buffer *cmd,
     * Finish the producing streams before creating a waiting consumer so it
     * cannot spin ahead of its own availability write. Do this before
     * hk_query_command_cs attaches dependencies to the consumer stream. */
-   if (agx_native_graphics(&dev->dev) && (flags & VK_QUERY_RESULT_WAIT_BIT)) {
+   if (agx_chip_native_agx3(dev->dev.chip) &&
+       (flags & VK_QUERY_RESULT_WAIT_BIT)) {
       hk_cmd_buffer_end_graphics(cmd);
       hk_cmd_buffer_end_compute(cmd);
    }
@@ -1892,7 +1893,7 @@ hk_cmd_copy_query_pool_results(struct hk_cmd_buffer *cmd,
 
    perf_debug(cmd, "Query pool copy");
 
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       if ((pool->vk.query_type != VK_QUERY_TYPE_TIMESTAMP &&
            pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION &&
            pool->vk.query_type != VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT &&

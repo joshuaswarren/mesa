@@ -120,7 +120,7 @@ hk_upload_rodata(struct hk_device *dev)
    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
    /* Background reloads use the same two native texel-fetch selectors as
     * ordinary shaders: staged multisample reads name entry one. */
-   const unsigned sampler_count = agx_native_graphics(&dev->dev) ? 2 : 1;
+   const unsigned sampler_count = agx_chip_native_agx3(dev->dev.chip) ? 2 : 1;
    const size_t rodata_size = align(sampler_count * sampler_size, sizeof(uint64_t));
    dev->rodata.bo =
       agx_bo_create(&dev->dev, rodata_size, 0, 0, "Read only data");
@@ -275,7 +275,7 @@ hk_init_sampler_heap(struct hk_device *dev, struct hk_sampler_heap *h)
 
    VkResult result =
       hk_descriptor_table_init(dev, &h->table, sampler_size, 1024,
-                               agx_native_graphics(&dev->dev) ? 4096
+                               agx_chip_native_agx3(dev->dev.chip) ? 4096
                                : agx_chip_hal300_path(dev->dev.chip) ? 2048
                                                                   : 1024);
 
@@ -1112,7 +1112,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
     * sampler exists, and most samples then pay one branch, so D3D content keeps
     * its correct borders there. */
    if (instance->drirc.misc.disable_border_emulation &&
-       !agx_native_graphics(&pdev->dev)) {
+       !agx_chip_native_agx3(pdev->dev.chip)) {
       dev->perftest |= HK_PERF_NOBORDER;
    }
 

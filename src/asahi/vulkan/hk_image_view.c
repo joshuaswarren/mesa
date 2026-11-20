@@ -236,7 +236,7 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
    unsigned layer = view->vk.base_array_layer;
 
    enum pipe_format p_format = format_for_plane(view, view_plane);
-   const unsigned packed_ycbcr = agx_native_graphics(&dev->dev)
+   const unsigned packed_ycbcr = agx_chip_native_agx3(dev->dev.chip)
       ? hk_packed_ycbcr_bits(view->vk.format) : 0;
    if (packed_ycbcr)
       p_format = packed_ycbcr == 8 ? PIPE_FORMAT_R8G8B8A8_UNORM :
@@ -246,7 +246,7 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
                           hk_padded_image_format(p_format) != p_format;
    if (padded_rgb)
       p_format = hk_padded_image_format(p_format);
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       enum pipe_format integer = hk_scaled_texture_format(p_format);
       enum pipe_format normalized = hk_uscaled_normalized_format(p_format);
       if (usage == HK_DESC_USAGE_SAMPLED_FILTERABLE &&
@@ -341,7 +341,7 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
           * false) and native meta copies view one layer
           * (copied_layers_src_view).
           */
-         if (unlikely(layers > 1) && agx_native_graphics(&dev->dev))
+         if (unlikely(layers > 1) && agx_chip_native_agx3(dev->dev.chip))
             mesa_loge_once("hk: uncompressed view of %u layers of a "
                            "block-compressed image addresses only the first",
                            layers);
@@ -350,7 +350,7 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
          cfg.width = DIV_ROUND_UP(u_minify(layout->width_px, level), denom.x);
          cfg.height = DIV_ROUND_UP(u_minify(layout->height_px, level), denom.y);
          cfg.first_level = 0;
-         cfg.last_level = agx_native_graphics(&dev->dev) ? 0 : 1;
+         cfg.last_level = agx_chip_native_agx3(dev->dev.chip) ? 0 : 1;
       } else {
          cfg.address = base_addr + ail_get_layer_offset_B(layout, layer);
          cfg.width = layout->width_px;

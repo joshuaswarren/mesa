@@ -71,7 +71,8 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
     * of code inspection alone.  COSITED_EVEN is kept because it is what this
     * driver actually implements and passes.
     */
-   if (agx_native_graphics(&pdev->dev) && hk_packed_ycbcr_bits(vk_format)) {
+   if (agx_chip_native_agx3(pdev->dev.chip) &&
+       hk_packed_ycbcr_bits(vk_format)) {
       if (tiling != VK_IMAGE_TILING_OPTIMAL && tiling != VK_IMAGE_TILING_LINEAR)
          return 0;
       return VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
@@ -153,7 +154,7 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
    /* Keep compressed-family reporting atomic with the corresponding Vulkan
     * feature. The complete BC, ETC2/EAC and ASTC LDR format matrices are
     * hardware-qualified through the native G17P sampled/upload path. */
-   if (agx_native_graphics(&pdev->dev) &&
+   if (agx_chip_native_agx3(pdev->dev.chip) &&
        util_format_is_compressed(p_format) &&
        !hk_g17p_bc_format_supported(vk_format)) {
       const enum util_format_layout layout =
@@ -319,7 +320,7 @@ hk_get_image_format_features(struct hk_physical_device *pdev,
    }
 
    /* G17P used to add CHROMA_RECONSTRUCTION_EXPLICIT_FORCEABLE here, and only
-    * G17P: agx_native_graphics() is G16G/G17P, so M1/M2 reach these formats
+    * G17P: agx_chip_native_agx3() is G16G/G17P, so M1/M2 reach these formats
     * without it and every explicit_* conformance case is NotSupported there.
     *
     * That bit is the sole route into VK-GL-CTS's explicit reconstruction

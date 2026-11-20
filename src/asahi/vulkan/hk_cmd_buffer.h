@@ -2700,7 +2700,7 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
 
    if (cs) {
       struct hk_device *dev = hk_cmd_buffer_device(cmd);
-      const bool full_usc_state = agx_native_graphics(&dev->dev);
+      const bool full_usc_state = agx_chip_native_agx3(dev->dev.chip);
       /* Scissor and depth bias arrays are staged to dynamic arrays on the
        * CPU. When we end the control stream, they're done growing and are
        * ready for upload. G17P's ISP consumes these as full bit-40-set GART
@@ -3020,7 +3020,7 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       hk_dispatch_m5_native(cmd, cs, s, grid, local_size);
       return;
    }
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       hk_reserve_scratch(cmd, cs, s);
       hk_dispatch_g17p_native(cmd, cs, s, grid, local_size);
       /* Software graphics stages communicate through memory: VS outputs,

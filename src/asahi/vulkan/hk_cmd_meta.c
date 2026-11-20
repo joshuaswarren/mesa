@@ -81,27 +81,28 @@ hk_device_init_meta(struct hk_device *dev)
 
    dev->meta.use_gs_for_layer = false;
    dev->meta.use_layer_output = true;
-   dev->meta.use_view_relative_3d_layer = agx_native_graphics(&dev->dev);
+   dev->meta.use_view_relative_3d_layer = agx_chip_native_agx3(dev->dev.chip);
    /* hk never uses layered rendering for meta, so a one-layer attachment
     * view always renders Layer 0: the specialization holds on every chip. */
    dev->meta.specialize_single_layer_buffer_upload = true;
    /* Other native chips lower a stencil blit to eight bit-selective discard
     * passes. G17P exports stencil in one draw, which also resolves depth and
     * stencil together: 1.50 to 0.48 ms for a 2x D32S8 at 3456x2234. */
-   dev->meta.use_stencil_export = !agx_native_graphics(&dev->dev) ||
+   dev->meta.use_stencil_export = !agx_chip_native_agx3(dev->dev.chip) ||
                                   dev->dev.chip == AGX_CHIP_G17P;
    /* A scaled image is read through an exact integer descriptor or a
     * filterable normalized one depending on whether the sampler filters, so
     * a blit source has to arrive together with its sampler for the driver to
     * choose.  See hk_descriptor_set.c. */
-   dev->meta.use_combined_blit_descriptors = agx_native_graphics(&dev->dev);
+   dev->meta.use_combined_blit_descriptors =
+      agx_chip_native_agx3(dev->dev.chip);
    dev->meta.use_masked_rgba8_buffer_unpack =
-      agx_native_graphics(&dev->dev);
+      agx_chip_native_agx3(dev->dev.chip);
    dev->meta.use_rect_list_pipeline = true;
    dev->meta.cmd_bind_map_buffer = hk_cmd_bind_map_buffer;
    dev->meta.max_bind_map_buffer_size_B = 64 * 1024;
    dev->meta.buffer_access.max_fill_chunk_size =
-      agx_native_graphics(&dev->dev) ? 16 : 0;
+      agx_chip_native_agx3(dev->dev.chip) ? 16 : 0;
 
    for (unsigned i = 0; i < VK_META_BUFFER_CHUNK_SIZE_COUNT; ++i) {
       dev->meta.buffer_access.optimal_wg_size[i] = 64;
@@ -315,7 +316,7 @@ hk_g17p_meta_fill_addr(struct hk_cmd_buffer *cmd, struct hk_cs **target,
                        uint64_t address, uint64_t size, uint32_t value)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_native_graphics(&dev->dev) || !target || !address ||
+   if (!agx_chip_native_agx3(dev->dev.chip) || !target || !address ||
        ((address | size) & 3)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -672,7 +673,7 @@ hk_g17p_meta_wait_addr(struct hk_cmd_buffer *cmd, uint64_t address,
                        uint32_t value)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_native_graphics(&dev->dev) || !address || (address & 3)) {
+   if (!agx_chip_native_agx3(dev->dev.chip) || !address || (address & 3)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -2191,7 +2192,7 @@ hk_g17p_compute_blit_supported(const struct hk_device *dev,
                                const struct hk_image *dst,
                                const VkBlitImageInfo2 *info)
 {
-   if (!agx_native_graphics(&dev->dev) || info->regionCount == 0)
+   if (!agx_chip_native_agx3(dev->dev.chip) || info->regionCount == 0)
       return false;
 
    for (uint32_t r = 0; r < info->regionCount; ++r) {
@@ -2809,7 +2810,7 @@ hk_xfer_blitimage2(VkCommandBuffer commandBuffer,
 
    struct hk_meta_save save;
    hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
-   if (agx_native_graphics(&dev->dev) &&
+   if (agx_chip_native_agx3(dev->dev.chip) &&
        src_image->vk.image_type == VK_IMAGE_TYPE_2D &&
        dst_image->vk.image_type == VK_IMAGE_TYPE_2D) {
       for (uint32_t r = 0; r < pBlitImageInfo->regionCount; ++r) {
@@ -2879,7 +2880,7 @@ hk_xfer_resolveimage2(VkCommandBuffer commandBuffer,
    const struct ail_layout *src_layout = &src_image->planes[0].layout;
    const struct ail_layout *dst_layout = &dst_image->planes[0].layout;
    bool raw_unorm8x4 =
-      agx_native_graphics(&dev->dev) &&
+      agx_chip_native_agx3(dev->dev.chip) &&
       src_image->vk.image_type == VK_IMAGE_TYPE_2D &&
       dst_image->vk.image_type == VK_IMAGE_TYPE_2D &&
       src_image->vk.format == VK_FORMAT_R8G8B8A8_UNORM &&
@@ -4724,10 +4725,10 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
       struct vk_meta_copy_image_properties dst_props =
          hk_meta_copy_get_image_properties(
             dst_image, dev,
-            agx_native_graphics(&dev->dev) || m5_split_zs || m5_color,
+            agx_chip_native_agx3(dev->dev.chip) || m5_split_zs || m5_color,
             m5_split_zs);
 
-      if (agx_native_graphics(&dev->dev)) {
+      if (agx_chip_native_agx3(dev->dev.chip)) {
          /* Native single-slice EOT views already select the mip and array
           * layer or 3D Z slice. Keep source row/image strides intact while
           * splitting multi-layer and volume regions; no staging copy. */
@@ -4879,7 +4880,7 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
       struct vk_meta_copy_image_properties dst_props =
          hk_meta_copy_get_image_properties(dst_image, dev, native, zs_planes);
 
-      if (agx_native_graphics(&dev->dev)) {
+      if (agx_chip_native_agx3(dev->dev.chip)) {
          /* The qualified HAL200 BG/EOT contract is single-layer.  Preserve
           * arbitrary mip and rectangle selection while expanding array and
           * 3D regions into per-slice native meta draws. */
@@ -5119,7 +5120,7 @@ hk_xfer_fillbuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
    VK_FROM_HANDLE(hk_buffer, buffer, dstBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       /* VK_WHOLE_SIZE fills only complete 32-bit words. */
       VkDeviceSize size =
          vk_buffer_range(&buffer->vk, dstOffset, dstRange) & ~(VkDeviceSize)3;
@@ -5161,7 +5162,7 @@ hk_xfer_updatebuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(hk_buffer, buffer, dstBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       vk_meta_update_buffer(&cmd->vk, &dev->meta, dstBuffer, dstOffset, dstRange,

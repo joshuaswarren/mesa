@@ -104,7 +104,7 @@ hk_get_device_extensions(const struct agx_device *dev,
     * implementations have been qualified there. Native AGX3 and M5 keep
     * their existing exposure.
     */
-   const bool native_agx3 = (agx_native_graphics(dev) &&
+   const bool native_agx3 = (agx_chip_native_agx3(dev->chip) &&
                              dev->params.gpu_generation > 15) ||
                             agx_chip_g17_m5(dev->chip);
 
@@ -255,7 +255,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
       .EXT_external_memory_host = agx_has_userptr(dev),
-      .EXT_fragment_shader_interlock = agx_native_graphics(dev),
+      .EXT_fragment_shader_interlock = agx_chip_native_agx3(dev->chip),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -2275,7 +2275,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    supported_extensions.EXT_sampler_filter_minmax =
       agx_chip_sampler_generation(pdev->dev.chip) == AGX_SAMPLER_GENERATION_GEN5;
 
-   if (agx_native_graphics(&pdev->dev)) {
+   if (agx_chip_native_agx3(pdev->dev.chip)) {
       supported_extensions.KHR_shader_quad_control =
          pdev->dev.chip == AGX_CHIP_G17P;
    }
@@ -2404,7 +2404,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    VkQueueFlags queue_flags =
       VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT |
       VK_QUEUE_SPARSE_BINDING_BIT;
-   if (agx_native_graphics(&pdev->dev)) {
+   if (agx_chip_native_agx3(pdev->dev.chip)) {
       /* Graphics, compute and transfers use the native HAL200 queue path.
        * Sparse binding rides the shared per-page VM_BIND path; advertise it
        * only when the same opt-in that turns on the sparse features above is

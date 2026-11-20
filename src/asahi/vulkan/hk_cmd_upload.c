@@ -11,7 +11,7 @@ hk_pool_root_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
                    uint32_t alignment)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_native_graphics(&dev->dev))
+   if (!agx_chip_native_agx3(dev->dev.chip))
       return hk_pool_alloc(cmd, size, alignment);
 
    return hk_pool_alloc_from(cmd, &cmd->uploader.root, size, alignment,
@@ -52,7 +52,7 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    const size_t tail_B = hk_root_descriptor_offset(set_dynamic_buffer_start);
    /* CPU-decoded descriptor programs use a new root identity to invalidate
     * their native program caches, even when only set memory changed. */
-   if (agx_native_graphics(&dev->dev) && desc->uploaded_root.gpu &&
+   if (agx_chip_native_agx3(dev->dev.chip) && desc->uploaded_root.gpu &&
        desc->uploaded_root_size == root_size &&
        desc->generation == desc->uploaded_root_generation &&
        desc->dynamic_buffer_end == desc->uploaded_dynamic_buffer_end) {
@@ -101,7 +101,7 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    /* Cached G17P roots need explicit CPU-to-GPU publication. Clean just this
     * table now; vkEndCommandBuffer completes all recorded root cleans with a
     * single fence before submission can consume them. */
-   if (agx_native_graphics(&dev->dev) && util_has_cache_ops()) {
+   if (agx_chip_native_agx3(dev->dev.chip) && util_has_cache_ops()) {
       util_flush_range_no_fence(root_ptr.cpu, head_B);
       if (tail_B < root_size)
          util_flush_range_no_fence((uint8_t *)root_ptr.cpu + tail_B,
@@ -125,7 +125,8 @@ hk_cmd_upload_constants(struct hk_cmd_buffer *cmd, const struct hk_shader *s,
       return 0;
 
    assert(stage < MESA_SHADER_STAGES);
-   const bool native = agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev);
+   const bool native =
+      agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip);
    if (native && s->constant_data_id &&
        cmd->state.constant_data[stage].id == s->constant_data_id) {
       hk_upload_stat(cmd, constant_reuses, 1);
@@ -151,7 +152,7 @@ hk_cmd_upload_draw_params(struct hk_cmd_buffer *cmd, uint32_t first,
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    uint32_t params[] = {first, first_instance};
-   if (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) &&
+   if (agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) &&
        gfx->g17p_draw_params_host_valid && gfx->draw_params &&
        memcmp(gfx->g17p_draw_params_value, params, sizeof(params)) == 0) {
       hk_upload_stat(cmd, draw_param_reuses, 1);
@@ -172,7 +173,7 @@ void
 hk_cmd_upload_draw_id(struct hk_cmd_buffer *cmd, uint32_t draw_id)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   if (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) &&
+   if (agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) &&
        gfx->g17p_draw_id_host_valid && gfx->draw_id_ptr &&
        gfx->g17p_draw_id_value == draw_id) {
       hk_upload_stat(cmd, draw_id_reuses, 1);
