@@ -59,7 +59,11 @@ jobs:
       # under the pinned brew python carries mako + meson with no flag games.
       run: |
         "$(brew --prefix python@3.10)/bin/python3.10" -m venv "$RUNNER_TEMP/ci-venv"
-        "$RUNNER_TEMP/ci-venv/bin/pip" install mako meson
+        # packaging + pyyaml satisfy meson.build's prog_python module checks; the
+        # venv goes on PATH so the probe hits 3.10 (which also still has distutils)
+        # instead of the image's newer python3 that lacks both.
+        "$RUNNER_TEMP/ci-venv/bin/pip" install mako meson packaging pyyaml
+        echo "$RUNNER_TEMP/ci-venv/bin" >> "$GITHUB_PATH"
         MESON_EXEC="$RUNNER_TEMP/ci-venv/bin/meson"
         echo "MESON_EXEC=$MESON_EXEC" >> "$GITHUB_ENV"
         "$MESON_EXEC" --version
