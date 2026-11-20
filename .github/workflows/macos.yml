@@ -27,7 +27,6 @@ jobs:
     # runner (a gate step would already be running on one).
     if: github.ref_type == 'branch'
     env:
-      GALLIUM_DUMP_CPU: true
     steps:
     - name: Checkout
       uses: actions/checkout@v4
