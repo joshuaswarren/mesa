@@ -124,8 +124,7 @@ read_shader(struct agx_screen *screen, struct blob_reader *blob,
        * work and the identical cached dispatch fail descriptor validation. */
       binary->bo = agx_bo_create(&screen->dev, size, 0,
                                  AGX_BO_EXEC | AGX_BO_LOW_VA, "Executable");
-      if (agx_native_graphics(&screen->dev) ||
-          agx_chip_g17_m5(screen->dev.chip)) {
+      if (agx_chip_native_or_m5(screen->dev.chip)) {
          /* Native compute Ioto programs need the cached CPU shader bytes. */
          binary->b.binary = malloc(size);
          blob_copy_bytes(blob, binary->b.binary, size);

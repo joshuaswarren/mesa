@@ -1858,8 +1858,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
     * submission. */
    const bool m5_compute_commands = agx_m5_render_resources(dev) && compute;
    const bool m5_split_prepass =
-      (dev->chip == AGX_CHIP_G17G || dev->chip == AGX_CHIP_G18G) && compute &&
-      !m5_compute_commands;
+      agx_chip_m5_paths(dev->chip) && compute && !m5_compute_commands;
    const unsigned m5_split_count =
       !m5_split_prepass  ? 0
       : render           ? cdm_dispatch_count
@@ -2321,7 +2320,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          continue;
 
       /* But any BOs written by active batches are ours */
-      if (unlikely(writer != batch) && (dev->chip == AGX_CHIP_G18G || dev->chip == AGX_CHIP_G17G)) {
+      if (unlikely(writer != batch) && agx_chip_m5_paths(dev->chip)) {
          mesa_loge("asahi: batch %u lists BO %u (%s, %zu bytes @ 0x%" PRIx64
                    ") whose active writer is batch %u",
                    agx_batch_idx(batch), bo->handle,

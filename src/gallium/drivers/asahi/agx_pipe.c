@@ -1172,7 +1172,7 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
    agx_prepare_for_map(ctx, rsrc, level, usage, box, staging_blit);
 
    struct agx_device *dev = agx_device(pctx->screen);
-   const bool trace_read = (dev->chip == AGX_CHIP_G18G || agx_chip_g17_m5(dev->chip)) &&
+   const bool trace_read = agx_chip_hal300_path(dev->chip) &&
                           (dev->debug & AGX_DBG_FAULTTRACE) &&
                           (usage & PIPE_MAP_READ);
    if (trace_read) {
@@ -1736,7 +1736,7 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
     * zero is only a real clear value when depth or stencil storage exists.
     * Honeykrisp submits M5 renders on the G17 runtime the same way
     * (hk_drm_g17p_depth_clear). */
-   if ((agx_native_graphics(dev) || dev->chip == AGX_CHIP_G18G ||
+   if ((agx_chip_native_or_g18g(dev->chip) ||
         agx_m5_render_resources(dev)) && !zres &&
        !sres)
       c->isp_bgobjdepth = fui(1.0f);

@@ -117,8 +117,7 @@ agx_set_sampler_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
    struct agx_stage_uniforms *unif = &batch->stage_uniforms[stage];
    struct agx_device *dev = agx_device(ctx->base.screen);
 
-   const bool custom_border = agx_native_graphics(dev) ||
-                              dev->chip == AGX_CHIP_G18G || agx_chip_g17_m5(dev->chip);
+   const bool custom_border = agx_chip_agx3_path(dev->chip);
    if (custom_border) {
       for (unsigned s = 0; s < PIPE_MAX_SAMPLERS; ++s) {
          unif->custom_border_sampler_handle[s] = -1;
@@ -169,7 +168,7 @@ agx_set_sampler_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
     * GLES3 texture.units.all_units). */
    if (st->shader && st->shader->uses_bindless_samplers) {
       u_foreach_bit(s, st->valid_samplers) {
-         if (agx_native_graphics(dev) || dev->chip == AGX_CHIP_G18G || agx_chip_g17_m5(dev->chip)) {
+         if (agx_chip_agx3_path(dev->chip)) {
             /* The G17P graphics Ioto program publishes the per-stage HAL200
              * table directly. Indirect operands therefore name the same
              * i+1 entries as immediate operands; the old 28+index handle
