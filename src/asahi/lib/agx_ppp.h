@@ -92,10 +92,12 @@ agx_ppp_validate(struct agx_ppp_update *ppp, size_t size)
       (ppp)->head += AGX_##T##_LENGTH;                                         \
    } while (0)
 
+/* The scratch words are uint32_t: agx_pack() stores through a uint32_t
+ * pointer and agx_ppp_push_merged_blobs() ORs whole words, so a byte array
+ * here is only 4-byte aligned when the compiler happens to place it so. */
 #define agx_ppp_push_merged(ppp, T, name, merge)                               \
-   for (uint8_t _tmp[AGX_##T##_LENGTH], it = 1; it;                            \
-        it = 0, agx_ppp_push_merged_blobs(ppp, AGX_##T##_LENGTH,               \
-                                          (uint32_t *)_tmp,                    \
+   for (uint32_t _tmp[DIV_ROUND_UP(AGX_##T##_LENGTH, 4)], it = 1; it;          \
+        it = 0, agx_ppp_push_merged_blobs(ppp, AGX_##T##_LENGTH, _tmp,         \
                                           (uint32_t *)&merge))                 \
       agx_pack(_tmp, T, name)
 
