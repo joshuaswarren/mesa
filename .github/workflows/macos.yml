@@ -21,13 +21,12 @@ jobs:
         glx_option: ['dri', 'xlib']
     runs-on: macos-15-intel
     timeout-minutes: 120
+    # workflow_dispatch lets you pick a tag; a skipped job never takes a
+    # runner (a gate step would already be running on one).
+    if: github.ref_type == 'branch'
     env:
       GALLIUM_DUMP_CPU: true
     steps:
-    - name: Branch gate
-      # workflow_dispatch lets you pick a tag; the build is meant for branch
-      # heads only.
-      run: case "$GITHUB_REF" in refs/heads/*) ;; *) echo "::error::dispatch ref $GITHUB_REF is not a branch"; exit 1;; esac
     - name: Checkout
       uses: actions/checkout@v4
     - name: Install Dependencies
@@ -55,7 +54,8 @@ jobs:
       # python would put it somewhere else).
       run: |
         python3 -m pip install --user mako meson
-        echo "MESON_EXEC=$(python3 -m site --user-base)/bin/meson" >> "$GITHUB_ENV"
+        MESON_EXEC="$(python3 -m site --user-base)/bin/meson"
+        echo "MESON_EXEC=$MESON_EXEC" >> "$GITHUB_ENV"
         "$MESON_EXEC" --version
     - name: Configure
       run: |
