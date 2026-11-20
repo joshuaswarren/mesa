@@ -7,6 +7,7 @@
 #include "hk_device.h"
 #include "hk_buffer_view.h"
 #include "hk_frame_anatomy.h"
+#include "hk_query_pool.h"
 
 #include "hk_acceleration_structure.h"
 
@@ -1314,6 +1315,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    list_inithead(&dev->cmd_pending_queues);
    list_inithead(&dev->cmd_pending_failed);
    dev->cmd_pending_ready = true;
+   hk_query_stamps_init(dev);
    simple_mtx_init(&dev->vdm.lock, mtx_plain);
    for (unsigned class = 0; class < HK_CMD_SLAB_COUNT; ++class) {
       list_inithead(&dev->vdm.slabs[class]);
@@ -1442,6 +1444,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
     * a new recording during teardown. Kernel job pins retain failed work. */
    hk_cmd_pending_finish(dev);
    simple_mtx_destroy(&dev->cmd_pending_lock);
+   hk_query_stamps_finish(dev);
    hk_device_finish_vdm_slabs(dev);
    simple_mtx_destroy(&dev->vdm.lock);
 
