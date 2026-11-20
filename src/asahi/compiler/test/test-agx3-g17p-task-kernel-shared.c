@@ -328,9 +328,10 @@ check_agx2_compute_shared_not_vectorized(void)
 static bool
 check_agx3_generic_preprocess_shared_byte_offsets(enum agx_chip chip)
 {
+   /* G18G compiles as G17G and re-encodes as agx3d (agx_gather_device_key) */
    const bool g18g = chip == AGX_CHIP_G18G;
    const enum agx_isa_encoding encoding =
-      chip == AGX_CHIP_G17P ? AGX_ISA_ENCODING_AGX3B : AGX_ISA_ENCODING_AGX3C;
+      agx_chip_isa_encoding(g18g ? AGX_CHIP_G17G : chip);
 
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, &agx_nir_options,
