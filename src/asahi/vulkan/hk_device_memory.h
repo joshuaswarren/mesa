@@ -39,6 +39,11 @@ struct hk_device_memory {
    size_t map_size;
    bool map_owned;
 
+   /* The mapping host image copies go through (hk_device_memory_copy_map()),
+    * NULL until the first copy. It covers the whole BO and lives until
+    * vkFreeMemory. */
+   void *copy_map;
+
    /* Residency preference the kernel accepted (memory priority 1.0). */
    bool keep_resident;
 
@@ -62,6 +67,8 @@ hk_device_memory_addr(const struct hk_device_memory *mem)
 {
    return mem->replay_va ? mem->replay_va->addr : mem->bo->va->addr;
 }
+
+void *hk_device_memory_copy_map(struct hk_device_memory *mem);
 
 extern const VkExternalMemoryProperties hk_opaque_fd_mem_props;
 extern const VkExternalMemoryProperties hk_dma_buf_mem_props;
