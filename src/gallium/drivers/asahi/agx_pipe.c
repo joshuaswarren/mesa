@@ -1416,7 +1416,7 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
 
    unsigned fastclear = buffers & ~(batch->draw | batch->load);
    struct agx_device *dev = agx_device(pctx->screen);
-   if (agx_native_graphics(dev)) {
+   if (agx_chip_native_agx3(dev->chip)) {
       agx_batch_init_state(batch);
       const struct agx_tilebuffer_layout *tib = &batch->tilebuffer_layout;
       /* A spilling multisample tilebuffer clears every target with the
@@ -1827,7 +1827,7 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    /* A direct resolve also writes a different image: loaded samples in
     * tiles without geometry must reach that destination. */
    if ((batch->clear & batch->resolve) ||
-       (agx_native_graphics(dev) && batch->key.resolve &&
+       (agx_chip_native_agx3(dev->chip) && batch->key.resolve &&
         (batch->load & PIPE_CLEAR_COLOR0)))
       c->flags |= DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
 
@@ -1952,7 +1952,7 @@ agx_flush_compute(struct agx_context *ctx, struct agx_batch *batch,
 {
    /* Finalize the encoder */
    struct agx_device *dev = agx_device(ctx->base.screen);
-   if (agx_native_graphics(dev)) {
+   if (agx_chip_native_agx3(dev->chip)) {
       uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
       if (!agx3_cdm_stream_terminate_pack(dev->chip, terminate))
          UNREACHABLE("G17P CDM terminate must be grounded");
@@ -2486,7 +2486,7 @@ agx_init_shader_caps(struct pipe_screen *pscreen)
        * texel-fetch entry, so native graphics and compute can expose
        * Gallium's complete API table without the legacy heap. Geometry
        * shaders use the same table through their lowered compute programs. */
-      if (agx_native_graphics(agx_device(pscreen)) &&
+      if (agx_chip_native_agx3(agx_device(pscreen)->chip) &&
           (i == MESA_SHADER_VERTEX || i == MESA_SHADER_FRAGMENT ||
            i == MESA_SHADER_GEOMETRY || i == MESA_SHADER_COMPUTE))
          caps->max_texture_samplers = PIPE_MAX_SAMPLERS;

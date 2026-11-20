@@ -79,7 +79,7 @@ agx_upload_uniforms(struct agx_batch *batch,
          ? ctx->rast->base.sprite_coord_enable
          : 0;
 
-   if (hw_vs && agx_native_graphics(agx_device(ctx->base.screen))) {
+   if (hw_vs && agx_chip_native_agx3(agx_device(ctx->base.screen)->chip)) {
       /* Keep the old immutable upload for unchanged vertex inputs, including
        * fragment-only root updates. The unconditional native VS update used
        * to cover root inputs not represented by VS dirty bits. Compare the

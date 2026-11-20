@@ -169,7 +169,7 @@ check_vs(struct pipe_context *pctx)
    pctx->set_stencil_ref(pctx, ref);
    draw(pctx);
    CHECK(ctx->perf.vs_emits == 1 && ctx->batch->vdm.current > before);
-   if (agx_native_graphics(agx_device(pctx->screen))) {
+   if (agx_chip_native_agx3(agx_device(pctx->screen)->chip)) {
       struct agx_vdm_state_update_info update;
       CHECK(!agx_vdm_state_update_unpack(AGX_CHIP_G17P, before,
                                          AGX_VDM_STATE_UPDATE_LENGTH, &update));
