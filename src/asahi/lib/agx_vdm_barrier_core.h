@@ -23,14 +23,33 @@ extern "C" {
 /* Bit 3 of the barrier word is the USC cache invalidate (the genxml
  * VDM_BARRIER `USC cache inval` field, which the AGX2 path sets). */
 #define AGX_VDM_BARRIER_CORE_USC_INVAL 0x8u
-/* Apple's captures use 0x21000960, without the invalidate. We set it on every
- * chip that uses this word: the render-start barrier must make the USC see
- * memory written since the previous render. Without it the raster vertex
- * shader of an emulated geometry draw can read stale contents of recycled
- * command-pool memory written by the geometry pre-pass; on G17G (J704, 26A428)
- * the tiler then bins nothing and the fragment kick of that render hangs until
- * the firmware restarts the GPU. */
-#define AGX_VDM_BARRIER_CORE_WORD   (0x21000960u | AGX_VDM_BARRIER_CORE_USC_INVAL)
+/* Apple's captures use 0x21000960, without the invalidate. */
+#define AGX_VDM_BARRIER_CORE_PLAIN  0x21000960u
+
+/* The render-start barrier word for a chip. It carries the USC cache
+ * invalidate: the render-start barrier must make the USC see memory written
+ * since the previous render. Without it the raster vertex shader of an
+ * emulated geometry draw can read stale contents of recycled command-pool
+ * memory written by the geometry pre-pass; on G17G (J704, 26A428) the tiler
+ * then bins nothing and the fragment kick of that render hangs until the
+ * firmware restarts the GPU.
+ *
+ * The G15 (M3 Pro/Max) and G16 (M4) kernel backends admit a render only when
+ * its VDM stream starts with exactly 0x21000960 and refuse the submission
+ * with EINVAL otherwise, so those chips keep the plain word.
+ */
+static inline uint32_t
+agx_vdm_barrier_core_word(enum agx_chip chip)
+{
+   switch (chip) {
+   case AGX_CHIP_G15S:
+   case AGX_CHIP_G15C:
+   case AGX_CHIP_G16G:
+      return AGX_VDM_BARRIER_CORE_PLAIN;
+   default:
+      return AGX_VDM_BARRIER_CORE_PLAIN | AGX_VDM_BARRIER_CORE_USC_INVAL;
+   }
+}
 
 struct agx_vdm_barrier_core {
    uint8_t bytes[AGX_VDM_BARRIER_CORE_LENGTH];
