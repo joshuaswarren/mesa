@@ -28,8 +28,8 @@
  *   strong flush also has a memory-scoped form, which memory reached through
  *   a second address needs (hk_cdm_alias_scope()); no boundary of this kind
  *   asks for it. G17A, the other HAL200 part, sits between G17P and M5,
- *   which both have that form; until its caches are known it has no
- *   boundary either.
+ *   which both have that form; until its caches are known
+ *   (hk_cdm_caches_pending()) it has no boundary either.
  * - G15: the boundary would be the wide barrier its in-stream dependencies
  *   get (agx_chip_cdm_wide_visibility()), but packing there (the kernel's
  *   command deadline, attachment limits) is not qualified. AGX2 streams have
@@ -46,10 +46,8 @@ hk_pack_boundary(const struct hk_device *dev)
                 : HK_PACK_BOUNDARY_NONE;
    }
 
-   /* The G16 parts, all HAL200. */
-   const bool g16 = chip == AGX_CHIP_G16P || chip == AGX_CHIP_G16G ||
-                    chip == AGX_CHIP_G16S || chip == AGX_CHIP_G16C;
-   if (g16 && !hk_cdm_memory_scope_form(dev))
+   if (agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_HAL200 &&
+       !hk_cdm_memory_scope_form(dev) && !hk_cdm_caches_pending(dev))
       return HK_PACK_BOUNDARY_STRONG_FLUSH;
 
    return HK_PACK_BOUNDARY_NONE;
