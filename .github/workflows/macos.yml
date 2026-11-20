@@ -41,6 +41,8 @@ jobs:
         brew "libxcb"
         brew "libxdamage"
         brew "libxext"
+        brew "libxrandr"
+        brew "libxshmfence"
         brew "molten-vk"
         brew "ninja"
         brew "pkg-config"
