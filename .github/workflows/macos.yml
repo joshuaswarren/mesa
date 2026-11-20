@@ -11,7 +11,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci
+  # ref_type in the group: a tag dispatch would otherwise cancel an
+  # in-progress branch build before the job-level ref gate skips it.
+  group: macos-ci-${{ github.ref_type }}
   cancel-in-progress: true
 
 jobs:
