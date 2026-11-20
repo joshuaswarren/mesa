@@ -686,6 +686,7 @@ if with_tests
          'test/test-scalarize-int64.cpp',
          'test/test-lower-divmod64.cpp',
          'test/test-spill-fallback.cpp',
+         'test/test-agx-register-cache.cpp',
          'test/test-rt-register-pressure.cpp',
          'test/test-uniform-remat.cpp',
          'test/test-lower-pseudo.cpp',

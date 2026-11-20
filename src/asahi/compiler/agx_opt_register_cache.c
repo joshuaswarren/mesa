@@ -99,6 +99,18 @@ agx3_remove_redundant_physical_copies(agx_context *ctx)
    }
 }
 
+/* agx_opt_break_if moves a conditional break into the block after its if,
+ * but the edge to the break target stays on the emptied then block. The
+ * target's live-in is live at the break itself. */
+static agx_block *
+fused_break_target(const agx_instr *I)
+{
+   return (I->op == AGX_OPCODE_BREAK_IF_ICMP ||
+           I->op == AGX_OPCODE_BREAK_IF_FCMP)
+             ? I->target
+             : NULL;
+}
+
 static void
 postra_liveness_ins(BITSET_WORD *live, agx_instr *I)
 {
@@ -125,38 +137,54 @@ postra_liveness(agx_context *ctx)
    u_worklist worklist;
    agx_worklist_init(ctx, &worklist);
 
+   bool fused_breaks = false;
    agx_foreach_block(ctx, block) {
       BITSET_ZERO(block->reg_live_in);
       BITSET_ZERO(block->reg_live_out);
 
-      agx_worklist_push_tail(&worklist, block);
+      agx_foreach_instr_in_block(block, I)
+         fused_breaks |= fused_break_target(I) != NULL;
    }
 
-   while (!u_worklist_is_empty(&worklist)) {
-      /* Pop off in reverse order since liveness is backwards */
-      agx_block *blk = agx_worklist_pop_tail(&worklist);
+   /* A fused break's block is not a predecessor of its target, so with
+    * fused breaks the whole analysis repeats until nothing changes. */
+   bool changed;
+   do {
+      changed = false;
+      agx_foreach_block(ctx, block)
+         agx_worklist_push_tail(&worklist, block);
 
-      /* Calculate liveness locally */
-      agx_foreach_successor(blk, succ) {
-         BITSET_OR(blk->reg_live_out, blk->reg_live_out, succ->reg_live_in);
+      while (!u_worklist_is_empty(&worklist)) {
+         /* Pop off in reverse order since liveness is backwards */
+         agx_block *blk = agx_worklist_pop_tail(&worklist);
+
+         /* Calculate liveness locally */
+         agx_foreach_successor(blk, succ) {
+            BITSET_OR(blk->reg_live_out, blk->reg_live_out, succ->reg_live_in);
+         }
+
+         BITSET_DECLARE(live, AGX_NUM_REGS);
+         memcpy(live, blk->reg_live_out, sizeof(live));
+
+         agx_foreach_instr_in_block_rev(blk, ins) {
+            agx_block *target = fused_break_target(ins);
+            if (target)
+               BITSET_OR(live, live, target->reg_live_in);
+
+            postra_liveness_ins(live, ins);
+         }
+
+         if (BITSET_EQUAL(blk->reg_live_in, live))
+            continue;
+
+         /* We made progress, so we need to reprocess the predecessors */
+         memcpy(blk->reg_live_in, live, sizeof(live));
+         changed = true;
+         agx_foreach_predecessor(blk, pred) {
+            agx_worklist_push_head(&worklist, *pred);
+         }
       }
-
-      BITSET_DECLARE(live, AGX_NUM_REGS);
-      memcpy(live, blk->reg_live_out, sizeof(live));
-
-      agx_foreach_instr_in_block_rev(blk, ins) {
-         postra_liveness_ins(live, ins);
-      }
-
-      if (BITSET_EQUAL(blk->reg_live_in, live))
-         continue;
-
-      /* We made progress, so we need to reprocess the predecessors */
-      memcpy(blk->reg_live_in, live, sizeof(live));
-      agx_foreach_predecessor(blk, pred) {
-         agx_worklist_push_head(&worklist, *pred);
-      }
-   }
+   } while (fused_breaks && changed);
 
    u_worklist_fini(&worklist);
 }
@@ -201,6 +229,10 @@ agx_opt_register_cache(agx_context *ctx)
       BITSET_DECLARE(alu_reads, AGX_NUM_REGS) = {0};
 
       agx_foreach_instr_in_block_rev(block, I) {
+         agx_block *target = fused_break_target(I);
+         if (target)
+            BITSET_OR(live, live, target->reg_live_in);
+
          agx_foreach_reg_dest(I, d) {
             uint64_t reg = I->dest[d].value;
             unsigned nr = agx_index_size_16(I->dest[d]);
