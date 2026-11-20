@@ -542,7 +542,8 @@ hk_cdm_alias_scope(const struct hk_device *dev)
 
 /* Whether the CDM strong flush has a memory-scoped form, which memory
  * reached through a second address needs (hk_cdm_alias_scope()): on G17P
- * and M5. The other HAL200 parts (G16) have only the plain strong flush. */
+ * and M5. G16 has only the plain strong flush; G17A's caches are not known
+ * (hk_pack_boundary() gives it no packing). */
 static inline bool
 hk_cdm_memory_scope_form(const struct hk_device *dev)
 {
