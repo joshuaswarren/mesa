@@ -110,7 +110,7 @@ lower(enum shape sh, struct access acc, bool byte_indices, bool byte_offsets,
       nir_store_global(&b, v, nir_load_preamble(&b, 1, 64, .base = 8),
                        .align_mul = align);
    }
-   agx_nir_lower_address(b.shader, byte_indices, byte_offsets);
+   agx_nir_lower_address(b.shader, byte_indices, byte_offsets, false);
 
    nir_intrinsic_instr *intr = NULL;
    unsigned base_src = 0;
@@ -321,7 +321,7 @@ TEST(LowerAddressExactScale, RangesStayWithinTheirImplementation)
    nir_store_global(&c, v1, nir_load_preamble(&c, 1, 64, .base = 8),
                     .align_mul = 4);
 
-   agx_nir_lower_address(b.shader, false, true);
+   agx_nir_lower_address(b.shader, false, true, false);
 
    /* The second implementation's access at x = 0x40000000, where x << 2
     * wraps to 0. */

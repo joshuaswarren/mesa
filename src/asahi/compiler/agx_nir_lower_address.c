@@ -20,6 +20,7 @@ struct match {
 struct lower_address_options {
    bool byte_indices;
    bool byte_offsets;
+   bool checked_offsets;
    nir_shader *shader;
    struct hash_table *ranges;
 };
@@ -28,6 +29,12 @@ struct lower_address_options {
  * scaled by 2^amount in 64 bits after the access's extension: the product
  * must not wrap, unsigned for a zero-extended index or signed for a
  * sign-extended one. Either the instruction says so, or x is small enough.
+ *
+ * Where offsets are bounds-checked in software, the check tests value as it
+ * is, wrapped or not, and the access must go where the check looked. A no-wrap
+ * flag comes from the shader (SPIR-V NoUnsignedWrap/NoSignedWrap), and a
+ * shader that breaks that promise must still not reach past its buffers, so
+ * there only the range of x counts.
  */
 static bool
 scale_is_exact(const struct lower_address_options *options, nir_scalar value,
@@ -37,7 +44,8 @@ scale_is_exact(const struct lower_address_options *options, nir_scalar value,
       return true;
 
    nir_alu_instr *alu = nir_def_as_alu(value.def);
-   if (sign_extend ? alu->no_signed_wrap : alu->no_unsigned_wrap)
+   if (!options->checked_offsets &&
+       (sign_extend ? alu->no_signed_wrap : alu->no_unsigned_wrap))
       return true;
 
    /* A nonnegative x below 2^(31 - amount) also has no signed wrap. */
@@ -147,6 +155,8 @@ peel_u2u64_index(nir_builder *b, const struct lower_address_options *options,
  * valid access has a nonnegative array index, so every such product is
  * nonnegative, and since UBOs and SSBOs are limited to INT32_MAX bytes their
  * sum stays below 2^31 (see the relaxed lea rules in agx_nir_algebraic.py).
+ * With checked offsets no amul is left (see agx_nir_lower_address), since an
+ * access a software bounds check let through need not be valid.
  */
 static bool
 is_amul_sum(nir_scalar s, unsigned depth)
@@ -269,9 +279,12 @@ existing_index_multiple(nir_intrinsic_instr *access, nir_scalar index,
  *   N - i folds to c + -i), so leave it alone.
  * - An array index i + c scaled by amul is, for a valid access, nonnegative
  *   and below 2^31 / stride, so as signed integers (i + c) * stride equals
- *   sext(i) * stride + c * stride. With c < 0 and a byte stride, i + c could
- *   still wrap into the last bytes of a 2 GiB buffer, so require c >= 0 or a
- *   wider stride there.
+ *   sext(i) * stride + c * stride. The index becomes the 32-bit i * stride,
+ *   which for c < 0 exceeds the valid offset by up to 32 KiB (the byte offset's
+ *   range) and so can pass 2^31 in the last 32 KiB of a 2 GiB buffer, at any
+ *   stride. Only where the access then scales the index (a 16-bit or wider
+ *   element) is that product below 2^30 + 2^14, so require c >= 0 at a byte
+ *   scale.
  *
  * The same bounds let a power-of-two stride move into the index scale.
  */
@@ -333,7 +346,7 @@ fold_byte_offset(nir_builder *b, nir_intrinsic_instr *access,
             continue;
 
          const int64_t c = nir_scalar_as_int(k);
-         if (c < 0 && stride < 2)
+         if (c < 0 && scale == 0)
             break;
 
          byte_offset += c * (int64_t)stride * (INT64_C(1) << scale);
@@ -560,15 +573,41 @@ matched:
    return true;
 }
 
+/* amul promises that its product does not wrap, which only a valid access
+ * keeps. A software bounds check tests the wrapped 32-bit offset instead, and
+ * an index such as 0x40000001 into a uint[] passes it at offset 4. Where
+ * offsets are checked, make every 32-bit amul the multiply the check saw, so
+ * that the relaxed lea rules and the folds that rest on them cannot take the
+ * unwrapped index: the access then stays at base + the checked offset. The
+ * exact rules for imul and ishl (scale_is_exact) still take the index itself
+ * wherever its range proves the product cannot wrap.
+ */
+static bool
+amul_to_imul(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->op != nir_op_amul || alu->def.bit_size != 32)
+      return false;
+
+   alu->op = nir_op_imul;
+   return true;
+}
+
 bool
-agx_nir_lower_address(nir_shader *nir, bool byte_indices, bool byte_offsets)
+agx_nir_lower_address(nir_shader *nir, bool byte_indices, bool byte_offsets,
+                      bool checked_offsets)
 {
    struct lower_address_options options = {
       .byte_indices = byte_indices,
       .byte_offsets = byte_offsets,
+      .checked_offsets = checked_offsets,
       .shader = nir,
    };
    bool progress = false;
+
+   if (checked_offsets) {
+      NIR_PASS(progress, nir, nir_shader_alu_pass, amul_to_imul,
+               nir_metadata_control_flow, NULL);
+   }
 
    /* First, clean up as much as possible. This will make fusing more effective.
     */

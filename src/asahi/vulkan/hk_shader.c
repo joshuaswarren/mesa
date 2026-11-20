@@ -5425,6 +5425,15 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       .has_scratch = !nir->info.internal,
       .promote_constants = true,
       .promote_textures = true,
+      /* hk_buffer_addr_format() and hk_ubo_addr_format() bound robust
+       * buffers, and nir_lower_explicit_io then checks each access's 32-bit
+       * offset. Null-descriptor bounds need no exact offset: their size is
+       * zero, so every access fails the check. */
+      .checked_offsets =
+         rs && (rs->storage_buffers !=
+                   VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT ||
+                rs->uniform_buffers !=
+                   VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT),
       .g17p_sparse_vertex_outputs =
          agx_native_graphics(&dev->dev) && hw &&
          hk_g17p_sparse_vertex_outputs(&nir->info, sw_stage,
