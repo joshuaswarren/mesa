@@ -56,7 +56,7 @@ test_chip_routing(void)
 
    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
       const enum agx_descriptor_generation generation =
-         agx_gallium_descriptor_generation(cases[i].chip);
+         agx_chip_descriptor_generation(cases[i].chip);
       CHECK(generation == cases[i].generation);
       CHECK(agx_gallium_texture_descriptor_size(generation) == cases[i].size);
       CHECK(agx_gallium_pbe_descriptor_size(generation) == cases[i].size);
@@ -68,12 +68,12 @@ test_chip_routing(void)
       CHECK(storage.stride == 2 * cases[i].size);
    }
 
-   CHECK(agx_gallium_descriptor_generation(AGX_CHIP_UNKNOWN) ==
+   CHECK(agx_chip_descriptor_generation(AGX_CHIP_UNKNOWN) ==
          AGX_DESCRIPTOR_GENERATION_UNKNOWN);
-   CHECK(agx_gallium_descriptor_generation(AGX_CHIP_G15P) ==
+   CHECK(agx_chip_descriptor_generation(AGX_CHIP_G15P) ==
          AGX_DESCRIPTOR_GENERATION_UNKNOWN);
    CHECK(agx_gallium_storage_descriptor_layout(
-            agx_gallium_descriptor_generation(AGX_CHIP_G15P))
+            agx_chip_descriptor_generation(AGX_CHIP_G15P))
             .stride == 0);
    CHECK(agx_gallium_texture_descriptor_size(
             AGX_DESCRIPTOR_GENERATION_UNKNOWN) == 0);

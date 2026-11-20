@@ -2026,7 +2026,7 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
 {
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
    const enum agx_descriptor_generation descriptor_generation =
-      agx_gallium_descriptor_generation(dev->chip);
+      agx_chip_descriptor_generation(dev->chip);
    const unsigned descriptor_size =
       agx_gallium_pbe_descriptor_size(descriptor_generation);
 
@@ -2737,7 +2737,7 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
          dev->chip == AGX_CHIP_G18G && stage == MESA_SHADER_COMPUTE &&
          agx_nir_lower_g17p_gallium_storage_write(nir, 1);
       const enum agx_descriptor_generation descriptor_generation =
-         agx_gallium_descriptor_generation(dev->chip);
+         agx_chip_descriptor_generation(dev->chip);
       const unsigned texture_descriptor_size =
          agx_gallium_texture_descriptor_size(descriptor_generation);
       if (!texture_descriptor_size)
@@ -3450,7 +3450,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
     * agx_g17p_fill_storage_tail() writes. */
    /* G18G adds AGX_NIR_TEXTURE_GENERATION_G18G to keep its own forms. */
    NIR_PASS(_, nir, agx_nir_lower_multisampled_image_store_for_generation,
-            agx_gallium_descriptor_generation(dev->chip) |
+            agx_chip_descriptor_generation(dev->chip) |
                (dev->chip == AGX_CHIP_G18G ? AGX_NIR_TEXTURE_GENERATION_G18G
                                            : 0));
 
@@ -4066,7 +4066,7 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
       });
 
    const enum agx_descriptor_generation descriptor_generation =
-      agx_gallium_descriptor_generation(dev->chip);
+      agx_chip_descriptor_generation(dev->chip);
    if (agx_native_graphics(dev))
    {
       /* Texel fetches get G17P's explicit out-of-view predicate only in
@@ -5901,7 +5901,7 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
    struct agx_device *dev = agx_device(ctx->base.screen);
    const enum agx_descriptor_generation descriptor_generation =
-      agx_gallium_descriptor_generation(dev->chip);
+      agx_chip_descriptor_generation(dev->chip);
    const unsigned descriptor_size =
       agx_gallium_texture_descriptor_size(descriptor_generation);
    if (!descriptor_size)
@@ -9664,7 +9664,7 @@ agx_g17p_build_mixed_bg_eot(struct agx_batch *batch,
    struct agx_context *ctx = batch->ctx;
    struct agx_device *dev = agx_device(ctx->base.screen);
    const enum agx_descriptor_generation descriptor_generation =
-      agx_gallium_descriptor_generation(dev->chip);
+      agx_chip_descriptor_generation(dev->chip);
    const unsigned descriptor_size =
       agx_gallium_texture_descriptor_size(descriptor_generation);
    const unsigned samples = MAX2(framebuffer_key->tib.nr_samples, 1);
@@ -10152,7 +10152,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
    struct agx_context *ctx = batch->ctx;
    struct agx_device *dev = agx_device(ctx->base.screen);
    const enum agx_descriptor_generation descriptor_generation =
-      agx_gallium_descriptor_generation(dev->chip);
+      agx_chip_descriptor_generation(dev->chip);
    const unsigned descriptor_size =
       agx_gallium_texture_descriptor_size(descriptor_generation);
    if (!descriptor_size)
@@ -15010,7 +15010,7 @@ agx_g17g_mrt_spills_encodable(struct agx_context *ctx)
 {
    struct agx_device *dev = agx_device(ctx->base.screen);
    const enum agx_descriptor_generation generation =
-      agx_gallium_descriptor_generation(dev->chip);
+      agx_chip_descriptor_generation(dev->chip);
    /* The packers only read the device through the batch. */
    struct agx_batch scratch = {.ctx = ctx};
 
@@ -16354,7 +16354,7 @@ agx_launch(struct agx_batch *batch, struct agx_grid grid,
             const bool g18g = dev->chip == AGX_CHIP_G18G;
             const unsigned descriptor_size =
                agx_gallium_texture_descriptor_size(
-                  agx_gallium_descriptor_generation(dev->chip));
+                  agx_chip_descriptor_generation(dev->chip));
             const uint64_t write_control = agx_pool_upload_aligned(
                &batch->pool,
                g18g ? agx_g18g_native_write_state1
@@ -16874,7 +16874,7 @@ agx_decompress_inplace(struct agx_batch *batch, struct pipe_surface *surf,
    struct ail_layout *layout = &rsrc->layout;
    unsigned level = surf->level;
    const enum agx_descriptor_generation descriptor_generation =
-      agx_gallium_descriptor_generation(dev->chip);
+      agx_chip_descriptor_generation(dev->chip);
 
    perf_debug(dev, "Decompressing in-place due to: %s", reason);
 

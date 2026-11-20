@@ -484,7 +484,7 @@ agx_compression_allowed(const struct agx_resource *pres)
 {
    const struct agx_device *dev = agx_device(pres->base.screen);
    const enum agx_descriptor_generation generation =
-      agx_gallium_descriptor_generation(dev->chip);
+      agx_chip_descriptor_generation(dev->chip);
 
    /* Allow disabling compression for debugging */
    if (dev->debug & AGX_DBG_NOCOMPRESS) {
@@ -2918,7 +2918,7 @@ agx_dmabuf_modifier_external_only(struct pipe_screen *screen, uint64_t modifier)
     */
    return modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
           !agx_gallium_shared_compression_supported(
-             agx_gallium_descriptor_generation(agx_device(screen)->chip));
+             agx_chip_descriptor_generation(agx_device(screen)->chip));
 }
 
 static void
