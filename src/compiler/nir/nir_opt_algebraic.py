@@ -3028,15 +3028,28 @@ for t in ['int', 'uint', 'float', 'bool']:
 # upcasts where the type differs from the other cast
 for N, M in itertools.product(type_sizes('uint'), type_sizes('uint')):
    if N < M:
-      # The outer cast is a down-cast.  It doesn't matter what the size of the
-      # argument of the inner cast is because we'll never been in the upcast
-      # of downcast case.  Regardless of types, we'll always end up with y2yN
-      # in the end.
-      for x, y in itertools.product(['i', 'u'], ['i', 'u']):
-         x2xN = '{0}2{0}{1}'.format(x, N)
-         y2yM = '{0}2{0}{1}'.format(y, M)
-         y2yN = '{0}2{0}{1}'.format(y, N)
-         optimizations.append(((x2xN, (y2yM, a)), (y2yN, a)))
+      # Down-casts are always in the u2uN form
+      u2uN = 'u2u{0}'.format(N)
+
+      if N == 1:
+         for y in ['i', 'u']:
+            y2yM = '{0}2{0}{1}'.format(y, M)
+            optimizations.append(((u2uN, (y2yM, a)), (u2uN, a)))
+         continue
+
+      u2uM = 'u2u{0}'.format(M)
+      optimizations.append(((u2uN, (u2uM, a)), (u2uN, a)))
+
+      for P in type_sizes('uint'):
+         if P > M:
+            continue
+
+         # Keep the sign extension for down-casts of signed up-casts.
+         res = u2uN if P >= N else 'i2i{0}'.format(N)
+
+         i2iM = 'i2i{0}'.format(M)
+         aP = 'a@{0}'.format(P)
+         optimizations.append(((u2uN, (i2iM, aP)), (res, a)))
    elif N > M:
       # If the outer cast is an up-cast, we have to be more careful about the
       # size of the argument of the inner cast and with types.  In this case,
