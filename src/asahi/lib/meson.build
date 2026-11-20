@@ -255,11 +255,12 @@ if with_tests
     'asahi-agx-chip',
     executable(
       'asahi-agx-chip',
-      files(
-        'agx_chip.c',
-        'tests/test-chip.c',
-      ),
+      files('tests/test-chip.c'),
       include_directories : [inc_include, inc_src, inc_asahi],
+      dependencies : [idep_agx_pack, idep_mesautil],
+      link_with : [libasahi_lib],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
     ),
     suite : ['asahi'],
   )

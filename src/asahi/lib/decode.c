@@ -185,7 +185,7 @@ typedef struct drm_asahi_params_global decoder_params;
  * (G17G/AGX3c), and must never be used as an architecture proxy.  This local
  * form avoids making the standalone decoder library depend on libasahi_lib;
  * agx_chip_from_params() is the equivalent device-open mapping. */
-static enum agx_chip
+enum agx_chip
 agxdecode_chip_from_params(const decoder_params *params)
 {
    if (!params)
