@@ -86,23 +86,81 @@ static bool deposit(ctx *c, uint8_t word, uint16_t mask, uint16_t value)
 
 static bool apply_node(ctx *c, uint32_t node_id);
 
+/* A group is walked this far before its key index is used.  The first
+ * alternatives are the ones most instructions take, and testing a few of
+ * them costs less than the search.  gen_agx3_tables.py stores no index for a
+ * group no longer than its KEY_WALK.  The two numbers only have to agree for
+ * speed and size: the alternative selected is the same with any. */
+#define AGX3_KEY_WALK 8
+
+/* The alternative of a keyed group whose row has these field values, or
+ * NULL. */
+static const agx3_node *keyed_alt(const agx3_table *t, const uint64_t *fields,
+                                  const agx3_group *g)
+{
+   const uint8_t *key_fields = &t->keys[g->key_off];
+   const uint8_t *rows = key_fields + g->key_n;
+   unsigned lo = 0, hi = g->alt_n;
+   while (lo < hi) {
+      const unsigned mid = (lo + hi) / 2;
+      const uint8_t *row = rows + mid * (g->key_n + 2u);
+      unsigned i = 0;
+      while (i < g->key_n && row[i] == fields[key_fields[i]])
+         i++;
+      if (i == g->key_n) {
+         const unsigned pos = row[i] << 8 | row[i + 1];
+         return &t->nodes[g->alt_off + pos];
+      }
+      if (row[i] < fields[key_fields[i]]) lo = mid + 1;
+      else hi = mid;
+   }
+   return NULL;
+}
+
+/* The first of the alternatives alt .. end whose predicates hold, or end. */
+static inline const agx3_node *find_alt(const agx3_table *t,
+                                        const uint64_t *fields,
+                                        const agx3_node *alt,
+                                        const agx3_node *end)
+{
+   while (alt < end && !preds_test(t, fields, alt))
+      alt++;
+   return alt;
+}
+
 static bool apply_group(ctx *c, const agx3_group *g)
 {
    const agx3_table *t = c->t;
    const uint64_t *fields = c->fields;
    const agx3_node *alt = &t->nodes[g->alt_off];
-   for (const agx3_node *end = alt + g->alt_n; alt < end; alt++) {
+   const agx3_node *end = alt + g->alt_n;
+
+   if (g->exclusive) {
+      /* Only one alternative can hold: there is nothing to go back to when
+       * it does not apply, so no snapshot, and it may be looked up. */
+      const agx3_node *walk_end =
+         g->key_n && g->alt_n > AGX3_KEY_WALK ? alt + AGX3_KEY_WALK : end;
+      alt = find_alt(t, fields, alt, walk_end);
+      if (alt == end) return false;
+      if (alt == walk_end) {
+         alt = keyed_alt(t, fields, g);
+         if (!alt || !preds_test(t, fields, alt)) return false;
+      }
+      preds_mark(c, alt);
+      return apply_node(c, (uint32_t)(alt - t->nodes));
+   }
+
+   for (;; alt++) {
       /* Most alternatives fail their predicates without modifying state.
        * Only snapshot the encoder once an alternative can actually apply. */
-      if (!preds_test(t, fields, alt))
-         continue;
+      alt = find_alt(t, fields, alt, end);
+      if (alt == end) return false;
       ctx saved = *c;
       preds_mark(c, alt);
       if (apply_node(c, (uint32_t)(alt - t->nodes)))
          return true;
       *c = saved;
    }
-   return false;
 }
 
 static bool apply_node(ctx *c, uint32_t node_id)

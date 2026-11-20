@@ -15,6 +15,14 @@ the constant bits and field deposits it always makes, and its choice groups.
 The encoder takes the first alternative of each group, in table order, whose
 predicates hold and whose own groups resolve. An alternative is a node too.
 
+Where no field vector can satisfy the predicates of two alternatives of a
+group, the generator marks the group exclusive, and it indexes a large one
+by the field values that tell its alternatives apart. The encoder then looks
+the alternative up instead of walking to it, and does not go back. Every run
+of the generator checks the flags and the indexes it prints against the
+predicates, and `test/test-agx3-group-select.c` runs the encoder's selection
+in every exclusive group against the first alternative that holds.
+
 The descriptions were made once from the C tables that used to be checked
 in. Those repeated every choice group in every form that uses it. A
 description names each distinct group once and is otherwise the same data:

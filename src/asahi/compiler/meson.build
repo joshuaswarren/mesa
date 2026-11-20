@@ -387,6 +387,23 @@ if with_tests
     suite : ['asahi'],
   )
 
+  # The encoder's selection in every exclusive choice group against the first
+  # alternative, in table order, whose predicates hold.
+  test(
+    'agx3_group_select',
+    executable(
+      'agx3_group_select_test',
+      files(
+        'test/test-agx3-group-select.c',
+      ),
+      link_with : [libagx3_compose],
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      include_directories : [inc_include, inc_src],
+    ),
+    suite : ['asahi'],
+  )
+
   test(
     'agx3_compose_corpus',
     executable(

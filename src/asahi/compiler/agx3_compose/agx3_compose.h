@@ -17,7 +17,8 @@
  *    (u64 fields[160]);
  *  - root predicates gate the form; each choice group selects the first
  *    alternative, in table order, whose predicates hold and whose nested
- *    groups resolve;
+ *    groups resolve (looked up in the group's key index when it has one and
+ *    the first few alternatives do not hold);
  *  - all fixed-bit and field deposits share a written-bit shadow mask and
  *    must agree, otherwise the encode is rejected;
  *  - a nonzero field that no selected command or predicate consumes is
@@ -50,8 +51,19 @@ typedef struct {
    uint8_t lut_n;                /* 0: direct deposit */
    uint8_t field, word, dst_shift, width, src_shift;
 } agx3_cmd;
-/* The alternatives are nodes[alt_off .. alt_off + alt_n), in table order. */
-typedef struct { uint32_t alt_off; uint16_t alt_n; } agx3_group;
+/* The alternatives are nodes[alt_off .. alt_off + alt_n), in table order.
+ * exclusive: no field vector satisfies the predicates of two of them.
+ * With key_n != 0 the group is exclusive and has a key index at
+ * keys[key_off]: key_n field ids, then alt_n rows sorted by their first key_n
+ * bytes.  A row is the values those fields must have for one alternative to
+ * hold, then that alternative's position in the group, high byte first.  No
+ * two rows have the same values. */
+typedef struct {
+   uint32_t alt_off, key_off;
+   uint16_t alt_n;
+   uint8_t key_n;
+   bool exclusive;
+} agx3_group;
 typedef struct {
    uint32_t pred_off;
    uint16_t fixed_off, cmd_off, grp_off;
@@ -69,6 +81,7 @@ typedef struct {
    const agx3_cmd *cmds;
    const uint8_t *lutpool;
    const uint8_t *setpool;
+   const uint8_t *keys;
 } agx3_table;
 
 /* The preds row that a predref with field >= AGX3_MAX_FIELDS names. */

@@ -7,7 +7,9 @@ A node of the C tables names its fixed bits, predicates, commands and choice
 groups as runs in the row arrays, and identical runs are stored once. A choice
 group's alternatives are consecutive nodes. A predicate that tests a field
 for a small value, as nearly all do, is two bytes in its run; any other is a
-row of the preds array that the run names.
+row of the preds array that the run names. A large group whose alternatives
+can be told apart by field values has them indexed by those values (see
+key_index()).
 
 --verify expands the arrays this prints back into one node tree per form and
 compares them with the tables these descriptions were made from, the
@@ -15,10 +17,15 @@ agx3{b,c,d}_tables.c of commit afcc08b71: same rows, same order, by the
 SHA-256 of that file from its #include line on. A description that is changed
 on purpose no longer has those rows: delete its line of LEGACY_SHA256 in the
 same change, and --verify has nothing to compare that table with.
+
+Every run, with or without --verify, checks the exclusive flags and the key
+indexes it prints against the predicates of the alternatives (check_keys()).
+The encoder trusts them.
 """
 
 import argparse
 import hashlib
+import itertools
 
 import agx3_table
 
@@ -48,15 +55,68 @@ class Pool:
         return self.offsets[run]
 
 
+# AGX3_KEY_WALK of agx3_compose.c: the encoder walks that many alternatives of
+# a group before it uses the key index, so a group no longer than that gets
+# none. The two numbers only have to agree for speed and size. With different
+# ones the encoder walks a group to its end where it could have searched, or
+# has no index where it would have used one, and selects the same alternative.
+KEY_WALK = 8
+
+
+def key_index(alts):
+    """(fields, rows) that tell the alternatives of a group apart, or None.
+
+    fields are the fields every alternative tests for equality, less those
+    all of them test for the same value. A row is an alternative's values for
+    them, then its position in the group; rows are sorted. An alternative
+    holds only if the field vector has exactly its values. So when no two
+    rows have the same values, at most one alternative can hold for any field
+    vector: the group is exclusive. The encoder then has nothing to go back
+    to when that alternative does not apply, and may find it in any order.
+    """
+    eqs = []
+    for preds, *_ in alts:
+        eq = {}
+        for field, kind, _, _, a, _ in preds:
+            if kind == 0:
+                require(eq.setdefault(field, a) == a,
+                        'an alternative tests field %d for %d and for %d',
+                        field, eq[field], a)
+        eqs.append(eq)
+    fields = sorted(f for f in set(eqs[0]).intersection(*eqs[1:])
+                    if len(set(eq[f] for eq in eqs)) > 1)
+    rows = sorted((tuple(eq[f] for f in fields), i) for i, eq in enumerate(eqs))
+    if not fields or len(set(k for k, _ in rows)) < len(rows):
+        return None
+    require(len(fields) < 256, 'a group with %d key fields', len(fields))
+    require(fields[-1] < agx3_table.NUM_FIELDS, 'no field %d', fields[-1])
+    return fields, rows
+
+
 def dense(name, groups, forms):
     """The arrays of the C table, as lists of tuples in struct field order."""
     pools = {k: Pool() for k in ('fixeds', 'predrefs', 'preds', 'cmds',
-                                 'groups', 'lutpool', 'setpool')}
+                                 'groups', 'lutpool', 'setpool', 'keys')}
     D = {k: p.rows for k, p in pools.items()}
     # A group's alternatives are the nodes from here on.
     alt_off = [0]
     for alts in groups:
         alt_off.append(alt_off[-1] + len(alts))
+
+    def group(g):
+        index = key_index(groups[g])
+        # The encoder walks a group of up to KEY_WALK alternatives to its
+        # end, so only a longer one gets its index stored.
+        stored = index and len(groups[g]) > KEY_WALK
+        fields, rows = index if stored else ((), ())
+        # The key fields, then each row: its values and its position, high
+        # byte first.
+        key = tuple(fields) + tuple(
+            b for values, i in rows for b in values + (i >> 8, i & 0xff))
+        return (alt_off[g], pools['keys'].add(key), len(groups[g]),
+                len(fields), int(index is not None))
+
+    group_rows = [group(g) for g in range(len(groups))]
 
     def predref(field, kind, shift, width, a, b):
         if kind == 0 and a < 256:
@@ -82,8 +142,7 @@ def dense(name, groups, forms):
                 pools['fixeds'].add(tuple((mask, value, word)
                                           for word, mask, value in fixeds)),
                 pools['cmds'].add(tuple(cmds)),
-                pools['groups'].add(tuple((alt_off[g], len(groups[g]))
-                                          for g in grefs)),
+                pools['groups'].add(tuple(group_rows[g] for g in grefs)),
                 len(fixeds), len(preds), len(cmds), len(grefs))
 
     D['nodes'] = [node(a) for alts in groups for a in alts]
@@ -122,9 +181,48 @@ def expand(D):
                   in D['cmds'][cmd_off:cmd_off + cmd_n]),
             tuple(ids[g] for g in D['groups'][grp_off:grp_off + grp_n]))
 
-    return ([[node(off + i) for i in range(n)] for off, n in starts],
+    return ([[node(off + i) for i in range(n)] for off, _, n, *_ in starts],
             [(mnemonic, ep, size, node(root))
              for mnemonic, ep, size, root in D['forms']])
+
+
+def check_keys(D, groups):
+    """The exclusive flags and key indexes of D against the alternatives of
+    groups."""
+    alt_off = 0
+    rows_of = {(g[0], g[2]): g for g in D['groups']}
+    for g, alts in enumerate(groups):
+        alt_n = len(alts)
+        # A group that no node names has no row.
+        row = rows_of.get((alt_off, alt_n))
+        alt_off += alt_n
+        if row is None:
+            continue
+        _, key_off, _, key_n, exclusive = row
+        if not exclusive:
+            require(not key_n, 'group %d: a key index, but not exclusive', g)
+        elif not key_n:
+            # Every two alternatives test some field for different values.
+            eqs = [{field: a for field, kind, _, _, a, _ in preds if kind == 0}
+                   for preds, *_ in alts]
+            require(all(any(f in y and y[f] != v for f, v in x.items())
+                        for x, y in itertools.combinations(eqs, 2)),
+                    'group %d: exclusive, but two alternatives can hold', g)
+        else:
+            first, width = key_off + key_n, key_n + 2
+            fields = D['keys'][key_off:first]
+            rows = [tuple(D['keys'][first + r * width:first + (r + 1) * width])
+                    for r in range(alt_n)]
+            # Strictly ascending keys: no two alternatives share one.
+            require(all(a[:key_n] < b[:key_n] for a, b in zip(rows, rows[1:])),
+                    'group %d: its key rows do not ascend', g)
+            require(sorted(r[-2] << 8 | r[-1] for r in rows) ==
+                    list(range(alt_n)),
+                    'group %d: its key rows do not name every alternative', g)
+            require(all((field, 0, 0, 0, value, 0)
+                        in alts[r[-2] << 8 | r[-1]][0]
+                        for r in rows for field, value in zip(fields, r)),
+                    'group %d: a key value its alternative does not test', g)
 
 
 # C type of each array, and the bits each struct member holds.
@@ -133,11 +231,12 @@ LAYOUT = {
     'predrefs': ('agx3_predref', (8, 8)),
     'preds': ('agx3_pred', (64, 16, 8, 8, 8, 8)),
     'cmds': ('agx3_cmd', (16, 8, 8, 8, 8, 8, 8)),
-    'groups': ('agx3_group', (32, 16)),
+    'groups': ('agx3_group', (32, 32, 16, 8, 1)),
     'nodes': ('agx3_node', (32, 16, 16, 16, 8, 8, 8, 8)),
     'forms': ('agx3_form', (None, 8, 8, 32)),
     'lutpool': ('uint8_t', 8),
     'setpool': ('uint8_t', 8),
+    'keys': ('uint8_t', 8),
 }
 
 
@@ -167,7 +266,7 @@ def print_c(name, D, out):
         out.write('};\n')
     out.write('const agx3_table %s_table = {\n'
               '   forms, %d, nodes, groups, fixeds, predrefs, preds, cmds,\n'
-              '   lutpool, setpool,\n'
+              '   lutpool, setpool, keys,\n'
               '};\n' % (name, len(D['forms'])))
 
 
@@ -180,6 +279,7 @@ def main():
 
     name, groups, forms = agx3_table.parse(args.description)
     D = dense(name, groups, forms)
+    check_keys(D, groups)
     if args.verify and name in LEGACY_SHA256:
         rows = agx3_table.legacy_c(agx3_table.unfold(name, *expand(D)))
         got = hashlib.sha256(rows.encode()).hexdigest()
