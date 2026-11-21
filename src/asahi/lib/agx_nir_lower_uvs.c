@@ -38,11 +38,6 @@ struct ctx {
    struct agx_unlinked_uvs_layout *layout;
    bool layer_as_varying;
 
-   /* Canonical layouts: each slot's offset in the smooth copy, and the size of
-    * one copy (the distance to the flat copy). */
-   uint8_t canonical_offs[VARYING_SLOT_MAX];
-   unsigned canonical_copy;
-
    /* Relocatable layouts: each slot's placeholder UVS index. */
    uint8_t placeholder[VARYING_SLOT_MAX];
 };
@@ -109,11 +104,6 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_def *base;
    if (group == UVS_VARYINGS && ctx->layout->relocatable)
       base = nir_imm_intN_t(b, ctx->placeholder[sem.location], 16);
-   else if (group == UVS_VARYINGS && ctx->layout->canonical)
-      base = nir_imm_intN_t(b,
-                            ctx->layout->group_offs[group] +
-                               ctx->canonical_offs[sem.location],
-                            16);
    else if ((group == UVS_VARYINGS) && !single_vary)
       base = nir_load_uvs_index_agx(b, .io_semantics = sem);
    else
@@ -128,15 +118,8 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
     * no_varying; emitting both stores there disagrees with Apple's native UVS
     * layout and overstates the VertexProgramVariant output size. */
    if ((sem.location != VARYING_SLOT_LAYER || ctx->layer_as_varying) &&
-       (sem.location != VARYING_SLOT_VIEWPORT || !sem.no_varying)) {
+       (sem.location != VARYING_SLOT_VIEWPORT || !sem.no_varying))
       nir_store_uvs_agx(b, value, index);
-
-      /* The flat copy: a flat input takes the C coefficient, which holds the
-       * provoking vertex's value only for words in the flat range. */
-      if (group == UVS_VARYINGS && ctx->layout->canonical)
-         nir_store_uvs_agx(b, value,
-                           nir_iadd_imm(b, index, ctx->canonical_copy));
-   }
 
    /* Insert clip distance sysval writes, and gather layer/viewport writes so we
     * can accumulate their system value. These are still lowered like normal to
@@ -198,18 +181,36 @@ write_layer_viewport_sysval(struct ctx *ctx)
 }
 
 /* A user varying stored at a computed offset (an array indexed at run time)
- * has no constant UVS index to relocate. */
+ * has no constant UVS index to relocate: store it at each constant offset of
+ * the array under a test of the computed one instead. */
 static bool
-has_indirect_varying(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+lower_indirect_varying(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
-   bool *indirect = data;
-   if (intr->intrinsic == nir_intrinsic_store_output &&
-       group_for_varying(nir_intrinsic_io_semantics(intr).location) ==
-          UVS_VARYINGS &&
-       !nir_src_is_const(intr->src[1]))
-      *indirect = true;
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       group_for_varying(nir_intrinsic_io_semantics(intr).location) !=
+          UVS_VARYINGS ||
+       nir_src_is_const(intr->src[1]))
+      return false;
 
-   return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   nir_def *offset = intr->src[1].ssa;
+   nir_def *zero = nir_imm_int(b, 0);
+   for (unsigned i = 0; i < sem.num_slots; ++i) {
+      nir_io_semantics slot = sem;
+      slot.location += i;
+      slot.num_slots = 1;
+      nir_push_if(b, nir_ieq_imm(b, offset, i));
+      nir_intrinsic_instr *store =
+         nir_instr_as_intrinsic(nir_instr_clone(b->shader, &intr->instr));
+      nir_intrinsic_set_io_semantics(store, slot);
+      nir_builder_instr_insert(b, &store->instr);
+      nir_src_rewrite(&store->src[1], zero);
+      nir_pop_if(b, NULL);
+   }
+
+   nir_instr_remove(&intr->instr);
+   return true;
 }
 
 static bool
@@ -259,7 +260,7 @@ agx_nir_lower_default_layer(nir_shader *s)
 
 bool
 agx_nir_lower_uvs(nir_shader *s, struct agx_unlinked_uvs_layout *layout,
-                  bool layer_as_varying, bool canonical,
+                  bool layer_as_varying, bool relocatable,
                   int layer_zero_root_offset)
 {
    bool progress = false;
@@ -267,6 +268,17 @@ agx_nir_lower_uvs(nir_shader *s, struct agx_unlinked_uvs_layout *layout,
    /* Scalarize up front so we can ignore vectors later */
    NIR_PASS(progress, s, nir_lower_io_to_scalar, nir_var_shader_out, NULL,
             NULL);
+
+   /* A shader compiled without its fragment shader would otherwise place its
+    * varyings by the fragment shader's interpolation qualifiers, with UVS
+    * indices loaded at run time. With relocatable, write each one at a
+    * constant placeholder index instead, which linking it with the fragment
+    * shader rewrites (agx_uvs_relocation_map()).
+    */
+   relocatable = relocatable && !s->info.known_interpolation_qualifiers;
+   if (relocatable)
+      NIR_PASS(progress, s, nir_shader_intrinsics_pass, lower_indirect_varying,
+               nir_metadata_none, NULL);
 
    /* Determine the unlinked UVS layout */
    NIR_PASS(progress, s, nir_shader_intrinsics_pass, gather_components,
@@ -290,39 +302,12 @@ agx_nir_lower_uvs(nir_shader *s, struct agx_unlinked_uvs_layout *layout,
       }
    }
 
-   /* A shader compiled without its fragment shader would otherwise place its
-    * varyings by the fragment shader's interpolation qualifiers, with UVS
-    * indices loaded at run time. With canonical, write them in location order
-    * twice instead, a smooth copy and a flat copy (agx_assign_uvs()), so the
-    * indices are constants. Both copies must fit the native user-word limit.
-    * A larger shader keeps the qualifier-ordered layout, but is relocatable:
-    * it writes each varying at a constant placeholder index that linking it
-    * with the fragment shader rewrites (agx_uvs_relocation_map()).
-    */
    struct ctx ctx = {
       .layout = layout,
       .layer_as_varying = layer_as_varying,
       .layer_zero_root_offset = layer_zero_root_offset,
    };
-   const bool unlinked = canonical && !s->info.known_interpolation_qualifiers;
-   layout->canonical =
-      unlinked && 2 * sizes[UVS_VARYINGS] <= AGX_UVS_CANONICAL_MAX_WORDS;
-   layout->relocatable = false;
-   if (unlinked && !layout->canonical) {
-      bool indirect = false;
-      nir_shader_intrinsics_pass(s, has_indirect_varying, nir_metadata_all,
-                                 &indirect);
-      layout->relocatable = !indirect;
-   }
-   if (layout->canonical) {
-      unsigned offs = 0;
-      u_foreach_bit64(loc, layout->written) {
-         ctx.canonical_offs[loc] = offs;
-         offs += layout->components[loc];
-      }
-      ctx.canonical_copy = sizes[UVS_VARYINGS];
-      sizes[UVS_VARYINGS] *= 2;
-   }
+   layout->relocatable = relocatable;
 
    unsigned offs = 0;
    for (enum uvs_group g = 0; g < UVS_NUM_GROUP; ++g) {
@@ -417,15 +402,6 @@ agx_assign_uvs(struct agx_varyings_vs *varyings,
    /* The internal cull distance slots are always linearly-interpolated */
    linear_mask |= BITFIELD64_RANGE(VARYING_SLOT_CULL_PRIMITIVE, 2);
 
-   /* A canonical layout is a smooth copy of every slot in location order
-    * followed by a flat copy in the same order. Smooth and linear CF bindings
-    * read the smooth copy, flat ones the flat copy (flat_copy below).
-    */
-   if (layout->canonical) {
-      flat_mask = 0;
-      linear_mask = 0;
-   }
-
    assert(!(flat_mask & linear_mask & layout->written));
 
    /* TODO: Link FP16 varyings */
@@ -449,13 +425,6 @@ agx_assign_uvs(struct agx_varyings_vs *varyings,
          base += layout->components[loc];
          (*parts[p].num) += layout->components[loc];
       }
-   }
-
-   if (layout->canonical) {
-      assert(num_32_flat == 0 && num_32_linear == 0);
-      assert(2 * num_32_smooth == layout->user_size);
-      varyings->flat_copy = num_32_smooth;
-      num_32_flat = num_32_smooth;
    }
 
    agx_pack(&varyings->counts_32, VARYING_COUNTS, cfg) {
@@ -575,10 +544,6 @@ agx_link_varyings_vs_fs(void *out, struct agx_varyings_vs *vs,
 
             /* Varyings not written by vertex shader are undefined but we can't
              * crash */
-            /* A canonical layout's flat inputs read the flat copy. */
-            if (vs_index && !b.smooth)
-               vs_index += vs->flat_copy;
-
             if (vs_index) {
                assert(vs_index >= 4 &&
                       "gl_Position should have been the first 4 slots");
