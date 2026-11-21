@@ -146,7 +146,8 @@ asahi_g15s_vdm_gate(const struct asahi_g15s_gate_memory *memory,
       return refuse("a VDM stream base outside the compact window");
    if (!gate_read(memory, root, w, 1))
       return refuse("an unmapped VDM root");
-   /* As the kernel: only the word without the USC cache invalidate. */
+   /* As a kernel without DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE, which this
+    * shim does not report: only the word without the USC cache invalidate. */
    if (w[0] != 0x21000960)
       return gate_reject("VDM root", root, w);
    return true;

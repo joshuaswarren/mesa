@@ -731,7 +731,7 @@ test_closed_forms(void)
    /* Apple's word lacks the USC cache invalidate (bit 3) that we add. */
    static const uint8_t apple_vdm_barrier[] = {0x60, 0x09, 0x00, 0x21};
    static const uint8_t packed_vdm_barrier[] = {0x68, 0x09, 0x00, 0x21};
-   CHECK(agx_vdm_barrier_core_pack(AGX_CHIP_G18G, &vdm_barrier));
+   CHECK(agx_vdm_barrier_core_pack(AGX_CHIP_G18G, false, &vdm_barrier));
    CHECK(vdm_barrier.length == sizeof(packed_vdm_barrier) &&
          memcmp(vdm_barrier.bytes, packed_vdm_barrier,
                 sizeof(packed_vdm_barrier)) == 0);
