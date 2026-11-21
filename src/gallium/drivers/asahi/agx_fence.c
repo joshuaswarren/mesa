@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <errno.h>
 #include <xf86drm.h>
 #include <string.h>
 
@@ -130,11 +131,40 @@ agx_fence_create(struct agx_context *ctx)
    if (ctx->any_faults)
       return NULL;
 
-   /* Snapshot the last rendering out fence. We'd rather have another
-    * syncobj instead of a sync file, but this is all we get.
-    * (HandleToFD/FDToHandle just gives you another syncobj ID for the
-    * same syncobj).
+   /* Common path with no deferred server-wait fence: snapshot ctx->syncobj
+    * directly into a fresh syncobj via DRM_IOCTL_SYNCOBJ_TRANSFER, avoiding
+    * sync_file allocation and fd install/close on every glFenceSync().
+    * agx_fence_get_fd() exports a sync_file lazily only when requested.
     */
+   if (ctx->in_sync_fd < 0) {
+      struct pipe_fence_handle *f = calloc(1, sizeof(*f));
+      if (!f)
+         return NULL;
+
+      ret = drmSyncobjCreate(dev->fd, 0, &f->syncobj);
+      if (ret) {
+         agx_msg("create syncobj failed\n");
+         free(f);
+         return NULL;
+      }
+
+      ret = drmSyncobjTransfer(dev->fd, f->syncobj, 0, ctx->syncobj, 0, 0);
+      if (!ret) {
+         pipe_reference_init(&f->reference, 1);
+         return f;
+      }
+
+      int err = ret == -1 ? errno : -ret;
+      drmSyncobjDestroy(dev->fd, f->syncobj);
+      free(f);
+
+      if (err != EOPNOTSUPP && err != ENOSYS) {
+         agx_msg("syncobj transfer failed: %s\n", strerror(err));
+         return NULL;
+      }
+   }
+
+   /* Fallback path (or pending deferred server-wait): export a sync_file. */
    ret = drmSyncobjExportSyncFile(dev->fd, ctx->syncobj, &fd);
    if (ret || fd == -1) {
       agx_msg("export failed\n");
