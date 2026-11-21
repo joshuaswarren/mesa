@@ -1382,6 +1382,11 @@ struct hk_cs {
       struct agx_timestamp_req end;
    } timestamp;
 
+   /* G17P and M5: timestamp.start came from a leading TOP_OF_PIPE write on a
+    * chip whose start stamps latch before barriers resolve. Submission either
+    * keeps it on this command or moves it to a preceding end-stamp carrier. */
+   bool unordered_start_ts;
+
    /* Render only: occlusion availability slots written by the kernel at
     * retirement, indexed vertex start, vertex end, fragment start, fragment
     * end. Slots 0 and 3 are only used when timestamp.start/end are not. */
@@ -1597,8 +1602,10 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
     * start stamp b carried was a top-of-pipe write, which any earlier value
     * also satisfies. The caller refuses the merge when both have one. */
    a->timestamp.end = b->timestamp.end;
-   if (!a->timestamp.start.handle)
+   if (!a->timestamp.start.handle) {
       a->timestamp.start = b->timestamp.start;
+      a->unordered_start_ts = b->unordered_start_ts;
+   }
 
    util_dynarray_append_array(&a->compute_resources, uint8_t,
                              b->compute_resources.data, b->compute_resources.size);
