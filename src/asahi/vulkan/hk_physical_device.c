@@ -294,9 +294,11 @@ hk_get_device_extensions(const struct agx_device *dev,
       /* Tested on G17P only. */
       .EXT_depth_clip_control = dev->chip == AGX_CHIP_G17P,
       .EXT_depth_clip_enable = true,
-      /* Qualified on G17P only (the whole binding_model.descriptor_buffer
-       * group); other chips share the code but need their own run. */
-      .EXT_descriptor_buffer = dev->chip == AGX_CHIP_G17P,
+      /* Descriptor buffers require native AGX3/M5 descriptor tables, texel
+       * windows, and native sampler indices (agx_chip_native_or_m5()). AGX2
+       * lacks those tables, and G18G still uses AGX2-biased sampler indices
+       * and record-time compute image lowering. */
+      .EXT_descriptor_buffer = agx_chip_native_or_m5(dev->chip),
       .EXT_descriptor_indexing = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = false,
@@ -785,8 +787,13 @@ hk_get_device_features(
        * layout, and push descriptors keep their own command-buffer storage.
        */
       .descriptorBuffer = supported_extensions->EXT_descriptor_buffer,
+      /* M5 storage buffer descriptors embed the residency map page of a
+       * sparse buffer (hk_buffer_address::sparse_map_page), and capture/
+       * replay keeps the buffer's VA but not its map's: a replayed
+       * descriptor would name a stale map. */
       .descriptorBufferCaptureReplay =
-         supported_extensions->EXT_descriptor_buffer,
+         supported_extensions->EXT_descriptor_buffer &&
+         !agx_chip_g17_m5(dev->chip),
       .descriptorBufferImageLayoutIgnored =
          supported_extensions->EXT_descriptor_buffer,
       .descriptorBufferPushDescriptors =

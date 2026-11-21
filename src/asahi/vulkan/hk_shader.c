@@ -1797,7 +1797,7 @@ lookup_ycbcr_sampler(const void *_state, uint32_t set, uint32_t binding,
 }
 
 static const struct hk_sampler *
-lookup_packed_ycbcr_sampler(nir_tex_instr *tex, const void *state)
+tex_ycbcr_sampler(nir_tex_instr *tex, const void *state)
 {
    int handle = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
    if (handle < 0)
@@ -1810,9 +1810,46 @@ lookup_packed_ycbcr_sampler(nir_tex_instr *tex, const void *state)
          return NULL;
       index = nir_src_as_uint(deref->arr.index);
    }
-   const struct hk_sampler *sampler = lookup_ycbcr_sampler(
-      state, var->data.descriptor_set, var->data.binding, index);
+   return lookup_ycbcr_sampler(state, var->data.descriptor_set,
+                               var->data.binding, index);
+}
+
+static const struct hk_sampler *
+lookup_packed_ycbcr_sampler(nir_tex_instr *tex, const void *state)
+{
+   const struct hk_sampler *sampler = tex_ycbcr_sampler(tex, state);
    return sampler && hk_packed_ycbcr_bits(sampler->ycbcr.format) ? sampler : NULL;
+}
+
+/* A null converted image occupies just the first descriptor-buffer record.
+ * Test the first plane before lowering the sample into its plane accesses
+ * and color conversion. The conversion itself can map zero to nonzero.
+ */
+static bool
+guard_null_ycbcr_sample(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   if (nir_tex_instr_is_query(tex) || !tex_ycbcr_sampler(tex, data))
+      return false;
+
+   const struct lower_ycbcr_state *state = data;
+   int src = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   nir_variable *var =
+      nir_deref_instr_get_variable(nir_src_as_deref(tex->src[src].src));
+   if (!(state->set_layouts[var->data.descriptor_set]->flags &
+         VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT))
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_def *levels = nir_build_texture_query(b, tex, nir_texop_query_levels,
+                                             1, nir_type_int32, false, true);
+   nir_def *zero = nir_imm_zero(b, tex->def.num_components, tex->def.bit_size);
+   nir_if *valid = nir_push_if(b, nir_ine_imm(b, levels, 0));
+   valid->control = nir_selection_control_dont_flatten;
+   nir_instr *sample = nir_instr_clone(b->shader, &tex->instr);
+   nir_builder_instr_insert(b, sample);
+   nir_pop_if(b, valid);
+   nir_def_replace(&tex->def, nir_if_phi(b, &nir_instr_as_tex(sample)->def, zero));
+   return true;
 }
 
 /* API size queries return luma pixels. Run before adding private word queries. */
@@ -3104,6 +3141,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       .set_layout_count = set_layout_count,
       .set_layouts = set_layouts,
    };
+   NIR_PASS(lowered_complex, nir, nir_shader_tex_pass, guard_null_ycbcr_sample,
+            nir_metadata_none, (void *)&ycbcr_state);
    NIR_PASS(lowered_complex, nir, nir_shader_tex_pass, lower_packed_ycbcr_size,
             nir_metadata_control_flow, (void *)&ycbcr_state);
    NIR_PASS(lowered_complex, nir, nir_shader_tex_pass, lower_ycbcr_explicit,

@@ -7,10 +7,13 @@
  * exact address (the texture's tail offset counts only texture coordinates),
  * and a view of a sparse-residency buffer names the buffer's residency map,
  * from which the shader reads non-resident texels as zero. The views lie in
- * a sparse-residency buffer, which needs no memory.
+ * a sparse-residency buffer, which needs no memory. On M5 (argument "m5")
+ * a storage buffer descriptor of an address in that buffer names the same
+ * map in its sparse map page word; elsewhere that word stays zero.
  * Nothing executes on the GPU, so the test also runs under the no-op DRM
  * shim.
  */
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,8 +82,10 @@ texel_descriptor(VkDescriptorType type, VkDeviceAddress address,
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+   const bool m5 = argc > 1 && !strcmp(argv[1], "m5");
+
    const VkApplicationInfo app = {
       .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
       .apiVersion = VK_API_VERSION_1_3,
@@ -186,6 +191,7 @@ main(void)
    const VkDeviceAddress address = vkGetBufferDeviceAddress(dev, &address_info);
 
    uint8_t desc[256];
+   uint32_t map_page = 0;
    const struct {
       const char *name;
       VkDescriptorType type;
@@ -220,6 +226,36 @@ main(void)
                 (sparse & AGX_G17P_BUFFER_TEXTURE_SPARSE_ELSIZE_MASK) == 2,
              "%s view: sparse word 0x%x, not a residency map with "
              "4-byte texels", name, sparse);
+      map_page = sparse >> AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT;
+   }
+
+   /* A storage buffer descriptor inside the buffer: base address, size,
+    * then the residency map page (hk_buffer_address). */
+   const VkDescriptorAddressInfoEXT ssbo_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+      .address = address + 4 * 1000,
+      .range = 4096,
+   };
+   const VkDescriptorGetInfoEXT ssbo_get = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+      .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      .data.pStorageBuffer = &ssbo_info,
+   };
+   if (props.robustStorageBufferDescriptorSize < 16 ||
+       props.robustStorageBufferDescriptorSize > sizeof(desc)) {
+      EXPECT(0, "storage buffer descriptor size %zu",
+             props.robustStorageBufferDescriptorSize);
+   } else {
+      memset(desc, 0xcd, sizeof(desc));
+      get_descriptor(dev, &ssbo_get, props.robustStorageBufferDescriptorSize,
+                     desc);
+      EXPECT(word64(desc, 0) == ssbo_info.address,
+             "storage buffer: address 0x%llx",
+             (unsigned long long)word64(desc, 0));
+      const uint32_t expected = m5 ? map_page : 0;
+      EXPECT(map_page != 0 && word32(desc, 12) == expected,
+             "storage buffer: map page 0x%x, expected 0x%x", word32(desc, 12),
+             expected);
    }
 
    vkDestroyBuffer(dev, buffer, NULL);

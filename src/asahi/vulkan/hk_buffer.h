@@ -146,6 +146,9 @@ uint32_t hk_buffer_sparse_texel_word(const struct hk_buffer *buffer,
                                      unsigned blocksize_B);
 uint32_t hk_sparse_texel_word_at(struct hk_device *dev, uint64_t address,
                                  unsigned blocksize_B);
+/* The residency map page of the sparse buffer holding address, as
+ * hk_buffer_address::sparse_map_page carries it, 0 for none. */
+uint32_t hk_sparse_map_page_at(struct hk_device *dev, uint64_t address);
 
 /* Publish a bound/unbound sparse buffer range to physical pointer reads. */
 VkResult hk_update_physical_sparse_map(struct hk_device *dev, uint64_t address,
