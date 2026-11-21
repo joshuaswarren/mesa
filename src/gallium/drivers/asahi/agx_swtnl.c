@@ -55,6 +55,7 @@ struct swtnl_texture {
    uint32_t img_stride[PIPE_MAX_TEXTURE_LEVELS];
    uint32_t mip_offsets[PIPE_MAX_TEXTURE_LEVELS];
    uint8_t swizzle[4];
+   bool bound;
 };
 
 struct swtnl_tgsi_buffer {
@@ -1763,6 +1764,11 @@ agx_swtnl_applies(struct agx_context *ctx)
 }
 
 
+/* The draw module takes 32-bit strides and offsets, and samples with signed
+ * 32-bit offsets: a copy or buffer texture larger than llvmpipe's limit for
+ * the same sampling code (2 GiB) does not fit, so the draw goes without it. */
+#define AGX_SWTNL_MAX_TEXTURE_BYTES (1ull << 31)
+
 static bool
 swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
                   struct pipe_sampler_view *view, struct swtnl_texture *out)
@@ -1773,7 +1779,7 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
    uint32_t img_stride[PIPE_MAX_TEXTURE_LEVELS] = {0};
    uint32_t mip_offsets[PIPE_MAX_TEXTURE_LEVELS] = {0};
 
-   /* Multisampled views are not copied. */
+   /* Multisampled views are not copied: the draw goes without them. */
    if (tex->nr_samples > 1)
       return false;
 
@@ -1783,16 +1789,23 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
    if (tex->target == PIPE_BUFFER || view->target == PIPE_BUFFER) {
       if (!bs)
          return false;
-      const unsigned off = MIN2(view->u.buf.offset, tex->width0);
-      const unsigned avail = tex->width0 - off;
-      const unsigned copy_size = MIN2(view->u.buf.size, avail);
-      uint8_t *data = calloc(1, copy_size + 64);
+      const unsigned avail =
+         agx_buffer_range_in_resource(tex, view->u.buf.offset, view->u.buf.size);
+      /* In elements, clamped to the GPU path's texture-buffer limit so
+       * textureSize() matches across CPU and GPU paths, and sized by what the
+       * shader can sample rather than the whole backing buffer. */
+      const unsigned elems = agx_texture_buffer_size_el(format, avail);
+      const uint64_t copy_size = (uint64_t)elems * bs;
+      if (copy_size > AGX_SWTNL_MAX_TEXTURE_BYTES)
+         return false;
+      uint8_t *data = calloc(1, (size_t)copy_size + 64);
       if (!data)
          return false;
       if (copy_size) {
          struct pipe_transfer *xfer = NULL;
          const void *map =
-            pipe_buffer_map_range(pctx, tex, off, copy_size, PIPE_MAP_READ, &xfer);
+            pipe_buffer_map_range(pctx, tex, view->u.buf.offset, copy_size,
+                                  PIPE_MAP_READ, &xfer);
          if (!map) {
             free(data);
             return false;
@@ -1800,7 +1813,6 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
          memcpy(data, map, copy_size);
          pipe_buffer_unmap(pctx, xfer);
       }
-      const unsigned elems = copy_size / bs;
       row_stride[0] = copy_size;
       img_stride[0] = copy_size;
       draw_set_mapped_texture(ctx->swtnl_draw, s, i, elems, 1, 1, 0, 0, 1, 0,
@@ -1813,6 +1825,7 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
       out->swizzle[1] = view->swizzle_g;
       out->swizzle[2] = view->swizzle_b;
       out->swizzle[3] = view->swizzle_a;
+      out->bound = true;
       return true;
    }
 
@@ -1826,9 +1839,6 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
    const unsigned layers =
       array ? view->u.tex.last_layer - view->u.tex.first_layer + 1 : 1;
 
-   /* The draw module takes 32-bit strides and offsets, and samples with
-    * signed 32-bit offsets: a copy larger than llvmpipe's limit for the same
-    * sampling code (2 GiB) does not fit, so the draw goes without it. */
    uint64_t size = 0;
    for (unsigned l = first_level; l <= last_level; ++l) {
       const unsigned w = u_minify(tex->width0, l), h = u_minify(tex->height0, l);
@@ -1838,7 +1848,7 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
       const uint64_t img_B = row_B * util_format_get_nblocksy(format, h);
 
       size += img_B * d;
-      if (size > (1ull << 31))
+      if (size > AGX_SWTNL_MAX_TEXTURE_BYTES)
          return false;
 
       mip_offsets[l] = size - img_B * d;
@@ -1899,6 +1909,7 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
    out->swizzle[1] = view->swizzle_g;
    out->swizzle[2] = view->swizzle_b;
    out->swizzle[3] = view->swizzle_a;
+   out->bound = true;
    return true;
 }
 
@@ -2238,8 +2249,16 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       draw_set_sampler_views(draw, st, NULL, 0);
       draw_set_samplers(draw, st, NULL, 0);
       for (unsigned i = 0; i < mapped_views[st]; ++i) {
-         free(r->textures[st][i].data);
-         r->textures[st][i].data = NULL;
+         struct swtnl_texture *t = &r->textures[st][i];
+         uint32_t strides[PIPE_MAX_TEXTURE_LEVELS] = {0};
+
+         if (t->bound) {
+            draw_set_mapped_texture(draw, st, i, 0, 0, 0, 0, 0, 0, 0, NULL,
+                                    strides, strides, strides);
+         }
+         free(t->data);
+         t->data = NULL;
+         t->bound = false;
       }
    }
    for (unsigned i = 0; i < nr_vbs; ++i)
