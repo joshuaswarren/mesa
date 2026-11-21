@@ -63,7 +63,7 @@ flushes(nir_intrinsic_op intrinsic, nir_op op, unsigned bit_size, unsigned mode,
    agx_test_store_preamble(&b, r, 16);
    switch (t) {
    case M5:
-      agx_nir_lower_subgroups_m5(b.shader, true);
+      agx_nir_lower_subgroups_m5(b.shader, true, true);
       break;
    case G17P:
       agx_nir_lower_subgroups_g17p(b.shader);

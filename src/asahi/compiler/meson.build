@@ -736,6 +736,7 @@ if with_tests
          'test/test-m5-half-widen-once.cpp',
          'test/test-m5-byte-to-float.cpp',
          'test/test-fold-narrowed-half.cpp',
+         'test/test-m5-float-minmax-reduce.cpp',
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',
          'test/test-flatten-loads.cpp',
