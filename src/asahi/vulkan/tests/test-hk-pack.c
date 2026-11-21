@@ -393,7 +393,11 @@ test_plan(void)
    static const struct {
       enum agx_chip chip;
       const char *name;
-   } chips[] = {{AGX_CHIP_G16G, "G16G"}, {AGX_CHIP_G17S, "G17S"}};
+   } chips[] = {
+      {AGX_CHIP_G16G, "G16G"},
+      {AGX_CHIP_G17P, "G17P"},
+      {AGX_CHIP_G17S, "G17S"},
+   };
    for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
       char name[128];
 #define C(text) (snprintf(name, sizeof(name), "%s: %s", chips[c].name, text), name)
@@ -514,8 +518,8 @@ test_boundary(void)
    T("G16S: the same HAL200 boundary",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_STRONG_FLUSH);
    dev->dev.chip = AGX_CHIP_G17P;
-   T("G17P: memory-scoped flush form, no boundary",
-     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
+   T("G17P: HAL200 strong flush boundary (alias-scoped at pack time)",
+     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_STRONG_FLUSH);
    dev->dev.chip = AGX_CHIP_G15S;
    T("G15S: not qualified, no boundary",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
@@ -554,6 +558,16 @@ test_boundary(void)
    s->weak_barrier_end = NULL;
    T("G16G: a strong-flush tail, and the trace says so",
      hk_pack_run_member(dev_with(AGX_CHIP_G16G, 0), g, terminate, false) &&
+        hk_pack_admits_strong_tail(HK_PACK_BOUNDARY_STRONG_FLUSH));
+   chip = AGX_CHIP_G17P;
+   struct hk_cmd_buffer *p = plain(1);
+   T("G17P: an ordering-barrier tail",
+     hk_pack_run_member(dev_with(AGX_CHIP_G17P, 0), p, terminate, false));
+   s = list_first_entry(&p->control_streams, struct hk_cs, node);
+   s->strong_flush_end = s->weak_barrier_end;
+   s->weak_barrier_end = NULL;
+   T("G17P: a strong-flush tail, and the trace says so",
+     hk_pack_run_member(dev_with(AGX_CHIP_G17P, 0), p, terminate, false) &&
         hk_pack_admits_strong_tail(HK_PACK_BOUNDARY_STRONG_FLUSH));
 }
 
