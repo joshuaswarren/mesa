@@ -829,3 +829,7 @@ hk_get_spirv_options(struct vk_physical_device *vk_pdev,
 
 /* True when a native TES ray query runs in Poly's compute variant. */
 bool hk_tes_ray_queries_in_compute(const struct hk_device *dev);
+
+/* Lower a G17P task shader, after hk_lower_nir(), to the compute kernel of
+ * the software task stage. */
+void hk_g17p_lower_task_kernel(nir_shader *nir);

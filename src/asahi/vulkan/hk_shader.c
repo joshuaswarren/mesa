@@ -6700,7 +6700,7 @@ hk_shared_base_to_offset(nir_builder *b, nir_intrinsic_instr *intr,
  * workgroup writes its child grid and payload to its entry of the task
  * record. Payload accesses go to the entry; payload atomics and sub-dword
  * payload accesses use shared memory, copied out before the launch. */
-static void
+void
 hk_g17p_lower_task_kernel(nir_shader *nir)
 {
    NIR_PASS(_, nir, nir_lower_task_shader,
@@ -6762,6 +6762,11 @@ hk_g17p_lower_task_kernel(nir_shader *nir)
 
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_task_kernel_rewrite,
             nir_metadata_none, &k);
+
+   /* The payload now lives in the entry and shared memory. Drop its
+    * variables: a compute shader cannot declare task payload. */
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_mem_task_payload,
+            NULL);
 
    nir->info.stage = MESA_SHADER_COMPUTE;
    memset(&nir->info.cs, 0, sizeof(nir->info.cs));
