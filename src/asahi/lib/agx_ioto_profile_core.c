@@ -26,32 +26,10 @@ static const uint8_t g17s_minimal_profile_loader
       0x27, 0x04, 0x04, 0x00, 0x30, 0x00, 0xa4, 0x12,
    };
 
-static bool
-is_hal300(enum agx_chip chip)
-{
-   return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
-}
-
 bool
 agx_ioto_profile_control_supported(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_has_record(chip, AGX_RECORD_IOTO_PROFILE_CONTROL);
 }
 
 size_t
@@ -60,7 +38,7 @@ agx_ioto_profile_control_size(enum agx_chip chip)
    if (!agx_ioto_profile_control_supported(chip))
       return 0;
 
-   return is_hal300(chip) ? 6 : 4;
+   return agx_chip_g17_m5(chip) ? 6 : 4;
 }
 
 bool
@@ -74,7 +52,7 @@ agx_ioto_profile_control_pack(const struct agx_ioto_profile_control *profile,
    if (!profile || !agx_ioto_profile_control_supported(profile->chip))
       return false;
 
-   if (is_hal300(profile->chip)) {
+   if (agx_chip_g17_m5(profile->chip)) {
       if ((profile->payload0 & ~AGX_IOTO_PROFILE_CONTROL_HAL300_PAYLOAD0) != 0 ||
           (profile->payload1 & ~AGX_IOTO_PROFILE_CONTROL_HAL300_PAYLOAD1) != 0)
          return false;
@@ -84,15 +62,15 @@ agx_ioto_profile_control_pack(const struct agx_ioto_profile_control *profile,
       return false;
    }
 
-   agx_store_le16(out, is_hal300(profile->chip)
+   agx_store_le16(out, agx_chip_g17_m5(profile->chip)
                       ? AGX_IOTO_PROFILE_CONTROL_HAL300_OPCODE
                       : AGX_IOTO_PROFILE_CONTROL_CLASSIC_OPCODE);
    agx_store_le16(out + 2,
               profile->payload0 |
-                 (is_hal300(profile->chip)
+                 (agx_chip_g17_m5(profile->chip)
                      ? AGX_IOTO_PROFILE_CONTROL_HAL300_WORD1_FIXED
                      : 0));
-   if (is_hal300(profile->chip))
+   if (agx_chip_g17_m5(profile->chip))
       agx_store_le16(out + 4, profile->payload1);
 
    return true;

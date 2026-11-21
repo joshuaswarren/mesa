@@ -1097,7 +1097,7 @@ hk_CreateDescriptorPool(VkDevice _device,
        * the recording core. */
       pool->cpu_cached = hk_g17p_cached_cmd_memory(&dev->dev);
       const enum agx_bo_flags pool_flags =
-         agx_native_graphics(&dev->dev)
+         agx_chip_native_agx3(dev->dev.chip)
             ? AGX_BO_ZERO_ON_REUSE |
                  (pool->cpu_cached ? AGX_BO_WRITEBACK : 0)
             : 0;
@@ -1202,7 +1202,7 @@ hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
        * null texture / heap index 0, which is bound and safe.
        */
       set->cpu_cached = pool->cpu_cached;
-      if (agx_native_graphics(&dev->dev)) {
+      if (agx_chip_native_agx3(dev->dev.chip)) {
          memset(set->mapped_ptr, 0, set->size);
          hk_descriptor_set_publish(set, set->mapped_ptr, set->size);
       }
@@ -1470,7 +1470,7 @@ hk_GetDescriptorEXT(VkDevice _device,
    layout->descriptor_generation =
       agx_chip_descriptor_generation(dev->dev.chip);
    layout->native_sampler_indices =
-      agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip);
+      agx_chip_native_or_m5(dev->dev.chip);
    layout->binding_count = 1;
    layout->binding[0] = (struct hk_descriptor_set_binding_layout){
       .type = type,

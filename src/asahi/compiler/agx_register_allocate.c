@@ -1156,7 +1156,7 @@ prefer_high_bank(const struct ra_ctx *rctx, const agx_instr *I, unsigned d,
                  enum ra_class cls, unsigned minimum, unsigned limit)
 {
    const enum agx_chip chip = rctx->shader->key->dev.chip;
-   if ((chip != AGX_CHIP_G17P && !agx_chip_g17_m5(chip)) ||
+   if (!agx_chip_g17p_or_m5(chip) ||
        !rctx->shader->has_spill_pcopy_reserved || cls != RA_GPR ||
        minimum != 0 || limit != rctx->bound[cls] ||
        limit <= G17P_LOW_BANK_HALVES ||
@@ -1621,8 +1621,7 @@ static bool
 pick_phi_source_agreement(struct ra_ctx *rctx, agx_instr *I, unsigned *out)
 {
    if (I->op != AGX_OPCODE_PHI ||
-       (rctx->shader->key->dev.chip != AGX_CHIP_G17P &&
-        !agx_chip_g17_m5(rctx->shader->key->dev.chip)))
+       !agx_chip_g17p_or_m5(rctx->shader->key->dev.chip))
       return false;
 
    enum ra_class cls = ra_class_for_index(I->dest[0]);
@@ -1659,8 +1658,7 @@ pick_phi_unclaimed(struct ra_ctx *rctx, agx_instr *I, unsigned d,
                    unsigned count, unsigned align, unsigned *out)
 {
    if (I->op != AGX_OPCODE_PHI ||
-       (rctx->shader->key->dev.chip != AGX_CHIP_G17P &&
-        !agx_chip_g17_m5(rctx->shader->key->dev.chip)))
+       !agx_chip_g17p_or_m5(rctx->shader->key->dev.chip))
       return false;
 
    enum ra_class cls = ra_class_for_index(I->dest[d]);

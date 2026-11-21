@@ -12,32 +12,18 @@ static bool
 agx_ppp_viewport_header_layout(enum agx_chip chip, uint32_t *base_header,
                                unsigned *count_shift)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-      *base_header = AGX_PPP_VIEWPORT_PAYLOAD_GEN6_BASE_HEADER;
-      *count_shift = 12;
-      return true;
-
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   case AGX_CHIP_G18G:
-      *base_header = AGX_PPP_VIEWPORT_PAYLOAD_GEN7_BASE_HEADER;
-      *count_shift = 14;
-      return true;
-
-   default:
+   if (!agx_chip_has_record(chip, AGX_RECORD_PPP_VIEWPORT)) {
       *base_header = 0;
       *count_shift = 0;
       return false;
    }
+
+   /* PPPEncoderGen7 on the HAL300 path, PPPEncoderGen6 before it. */
+   const bool gen7 = agx_chip_hal300_path(chip);
+   *base_header = gen7 ? AGX_PPP_VIEWPORT_PAYLOAD_GEN7_BASE_HEADER
+                       : AGX_PPP_VIEWPORT_PAYLOAD_GEN6_BASE_HEADER;
+   *count_shift = gen7 ? 14 : 12;
+   return true;
 }
 
 /*

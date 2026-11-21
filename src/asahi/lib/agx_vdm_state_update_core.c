@@ -97,20 +97,6 @@ agx_vdm_state_update_unpack(enum agx_chip chip, const void *bytes, size_t size,
    return true;
 }
 
-static bool
-agx_vdm_state_update_is_hal300(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   case AGX_CHIP_G18G:
-      return true;
-   default:
-      return false;
-   }
-}
-
 /*
  * Materialize/pack the exact six-template path observed in:
  *
@@ -137,7 +123,7 @@ agx_vdm_state_update_template_materialize(
        info->variant > AGX_VDM_STATE_UPDATE_TEMPLATE_21)
       return false;
 
-   const bool hal300 = agx_vdm_state_update_is_hal300(chip);
+   const bool hal300 = agx_chip_hal300_path(chip);
    if (hal300 && (info->pre_hal300_flag_group_nonzero ||
                   info->pre_hal300_flag_bit_4))
       return false;
@@ -246,7 +232,7 @@ agx_vdm_state_update_vertex_ti_resources(
 
    /* Same bounds as the HAL200 fragment record: an 18-bit spill field and
     * the 12-bit IPR field, whose even rounding caps it at 0xffe. */
-   if ((!agx_chip_native_agx3(chip) && !agx_vdm_state_update_is_hal300(chip)) ||
+   if (!agx_chip_agx3_path(chip) ||
        !info || spill_quads > UINT32_C(0x3ffff) ||
        ipr_quads > UINT32_C(0xffe))
       return false;
@@ -317,7 +303,7 @@ agx_g17p_vertex_program_info(
    const bool preamble_ok =
       compiler_info &&
       (compiler_info->has_preamble
-          ? (agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip)) &&
+          ? agx_chip_native_or_m5(chip) &&
                compiler_info->constant_program_allowed &&
                compiler_info->preamble_staging_known &&
                compiler_info->nr_preamble_gprs != 0 &&
@@ -325,8 +311,7 @@ agx_g17p_vertex_program_info(
           : compiler_info->nr_preamble_gprs == 0 &&
                compiler_info->preamble_scratch_size == 0);
 
-   if ((!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip) &&
-        chip != AGX_CHIP_G18G) ||
+   if (!agx_chip_agx3_path(chip) ||
        !compiler_info || !program ||
        !compiler_info->hardware_vertex || !preamble_ok ||
        compiler_info->position_off != 0 || compiler_info->varyings_off != 4 ||
@@ -371,7 +356,7 @@ agx_g17p_vertex_program_info(
             .raw_vs_output_selector = 0,
             .raw_vs_output_flag_6 = false,
             .pre_hal300_flag_group_nonzero =
-               !agx_vdm_state_update_is_hal300(chip),
+               !agx_chip_hal300_path(chip),
             .pre_hal300_flag_bit_4 = false,
             .variant = AGX_VDM_STATE_UPDATE_TEMPLATE_00,
             .raw_active_context_selector = UINT32_MAX,

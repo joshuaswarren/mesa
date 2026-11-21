@@ -71,7 +71,8 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
     * of code inspection alone.  COSITED_EVEN is kept because it is what this
     * driver actually implements and passes.
     */
-   if (agx_native_graphics(&pdev->dev) && hk_packed_ycbcr_bits(vk_format)) {
+   if (agx_chip_native_agx3(pdev->dev.chip) &&
+       hk_packed_ycbcr_bits(vk_format)) {
       if (tiling != VK_IMAGE_TILING_OPTIMAL && tiling != VK_IMAGE_TILING_LINEAR)
          return 0;
       return VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
@@ -92,7 +93,7 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
    /* D16S8 uses the existing independent D16 and S8 planes, as D32S8 does
     * on G17P and M5. */
    if (vk_format == VK_FORMAT_D16_UNORM_S8_UINT) {
-      if (pdev->dev.chip != AGX_CHIP_G17P && !agx_chip_g17_m5(pdev->dev.chip))
+      if (!agx_chip_g17p_or_m5(pdev->dev.chip))
          return 0;
       p_format = PIPE_FORMAT_Z16_UNORM;
    }
@@ -100,7 +101,7 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
       return 0;
 
    enum pipe_format padded = hk_padded_image_format(p_format);
-   if ((agx_native_graphics(&pdev->dev) || agx_chip_g17_m5(pdev->dev.chip)) &&
+   if (agx_chip_native_or_m5(pdev->dev.chip) &&
        padded != p_format) {
       /* Linear and external modifier layouts must retain the API's packed
        * texel stride. This path is restricted to driver-owned optimal images. */
@@ -153,7 +154,7 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
    /* Keep compressed-family reporting atomic with the corresponding Vulkan
     * feature. The complete BC, ETC2/EAC and ASTC LDR format matrices are
     * hardware-qualified through the native G17P sampled/upload path. */
-   if (agx_native_graphics(&pdev->dev) &&
+   if (agx_chip_native_agx3(pdev->dev.chip) &&
        util_format_is_compressed(p_format) &&
        !hk_g17p_bc_format_supported(vk_format)) {
       const enum util_format_layout layout =
@@ -232,8 +233,7 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
    /* Our image atomic lowering doesn't bother to handle linear */
    if ((p_format == PIPE_FORMAT_R32_UINT || p_format == PIPE_FORMAT_R32_SINT ||
         (p_format == PIPE_FORMAT_R32_FLOAT &&
-         (pdev->dev.chip == AGX_CHIP_G17P ||
-          agx_chip_g17_m5(pdev->dev.chip)))) &&
+         agx_chip_g17p_or_m5(pdev->dev.chip))) &&
        tiling == VK_IMAGE_TILING_OPTIMAL) {
 
       features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
@@ -320,7 +320,7 @@ hk_get_image_format_features(struct hk_physical_device *pdev,
    }
 
    /* G17P used to add CHROMA_RECONSTRUCTION_EXPLICIT_FORCEABLE here, and only
-    * G17P: agx_native_graphics() is G16G/G17P, so M1/M2 reach these formats
+    * G17P: agx_chip_native_agx3() is G16G/G17P, so M1/M2 reach these formats
     * without it and every explicit_* conformance case is NotSupported there.
     *
     * That bit is the sole route into VK-GL-CTS's explicit reconstruction
@@ -456,7 +456,7 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
     * S8_UINT here, and zink gives its depth/stencil images feedback-loop
     * usage. */
    const bool depth_feedback =
-      (dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip)) &&
+      agx_chip_g17p_or_m5(dev->chip) &&
       allow_agx3 && hk_g17p_compression_depth_format(api_format);
    if ((usage & (VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT |
                  VK_IMAGE_USAGE_STORAGE_BIT)) ||
@@ -957,7 +957,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    const bool g17p_compressed =
-      (pdev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(pdev->dev.chip)) &&
+      agx_chip_g17p_or_m5(pdev->dev.chip) &&
       pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
       drm_mod_info &&
       drm_mod_info->drmFormatModifier ==
@@ -1573,7 +1573,7 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
    /* G17P and M5 share compressed colour images only in the shape both sides
     * allocate identically (hk_g17p_shared_compression_eligible()). */
    if (image->vk.drm_format_mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
-       (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
+       agx_chip_g17p_or_m5(dev->dev.chip) &&
        !(hk_g17p_shared_compression_supported(
             &dev->dev, pCreateInfo->format, pCreateInfo->imageType,
             pCreateInfo->flags, pCreateInfo->usage, pCreateInfo->pNext) &&
@@ -1598,7 +1598,7 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
 
       const enum pipe_format p_format = hk_format_to_pipe_format(format);
       const enum pipe_format layout_format =
-         (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
+         agx_chip_native_or_m5(dev->dev.chip) &&
                pCreateInfo->tiling == VK_IMAGE_TILING_OPTIMAL
             ? hk_padded_image_format(p_format)
             : p_format;

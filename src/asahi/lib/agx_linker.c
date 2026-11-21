@@ -50,7 +50,7 @@ agx_fs_epilog_apply_device_policy(enum agx_chip chip,
    /* G18 coverage also dirties color during depth-only or fully masked draws.
     * Preserve the previous tile value while executing the other side effects.
     */
-   key->preserve_zero_mask = g17p || agx_chip_g17_m5(chip) || chip == AGX_CHIP_G18G;
+   key->preserve_zero_mask = g17p || agx_chip_hal300_path(chip);
    key->sample_loop_mrt = chip == AGX_CHIP_G18G && key->nr_samples > 1;
    /* G18G: both AGX3 tile interfaces move packed bytes. The RGB transfer
     * function belongs around blending; alpha remains linear. R11G11B10 is
@@ -296,8 +296,7 @@ agx3_build_container(const struct agx_device *dev, uint8_t *image,
 static bool
 agx3_uses_code_container(const struct agx_device *dev)
 {
-   return agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
-          dev->chip == AGX_CHIP_G18G;
+   return agx_chip_agx3_path(dev->chip);
 }
 
 /* Give a relocatable vertex program's varyings the indices of the bound
@@ -340,8 +339,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    /* These literal loop fragments are AGX2 machine code. G17P exposes only
     * one sample and its Vulkan path folds sample shading before split-FS
     * lowering; fail closed if a caller ever bypasses that canonicalization. */
-   if ((agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
-        dev->chip == AGX_CHIP_G18G) &&
+   if (agx_chip_agx3_path(dev->chip) &&
        nr_samples_shaded) {
       fprintf(stderr,
               "agx_fast_link: external sample loop is not AGX3 machine code\n");
@@ -367,8 +365,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    bool nop_entry[ARRAY_SIZE(parts)] = {false};
    bool entry_seen = false;
    int kept_entry = -1;
-   if ((agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
-        dev->chip == AGX_CHIP_G18G) &&
+   if (agx_chip_agx3_path(dev->chip) &&
        fragment && !nr_samples_shaded && !colour_fused) {
       for (unsigned i = 0; i < ARRAY_SIZE(parts); ++i) {
          struct agx_shader_part *part = parts[i];
@@ -479,8 +476,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    /* The staging accounting is per instruction, so a linked software vertex
     * shader (a compute-stage main behind the vertex prolog) is described the
     * same way as a hardware vertex or fragment program. */
-   if ((agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
-        dev->chip == AGX_CHIP_G18G) &&
+   if (agx_chip_agx3_path(dev->chip) &&
        (main->info.stage == MESA_SHADER_VERTEX ||
         main->info.stage == MESA_SHADER_FRAGMENT ||
         main->info.stage == MESA_SHADER_COMPUTE ||

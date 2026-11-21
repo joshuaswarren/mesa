@@ -407,7 +407,7 @@ hk_g17p_shared_compression_shape(enum agx_chip chip, VkFormat format,
       VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
 
-   return (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
+   return agx_chip_g17p_or_m5(chip) &&
           type == VK_IMAGE_TYPE_2D &&
           !(flags & ~allowed_flags) && !(usage & ~allowed_usage) &&
           hk_g17p_compression_color_format(format);

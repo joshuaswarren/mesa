@@ -668,7 +668,7 @@ hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
     * roots on their own bump cursor so allocating one cannot evict a partially
     * used main-upload BO and move that allocator's slow path into the next
     * application command. Ownership remains on the ordinary main BO list. */
-   struct hk_uploader *uploader = agx_native_graphics(&dev->dev)
+   struct hk_uploader *uploader = agx_chip_native_agx3(dev->dev.chip)
                                      ? &cmd->uploader.streams
                                      : &cmd->uploader.main;
    return hk_pool_alloc_from(cmd, uploader, size, alignment, HK_CMD_BO_MAIN);
@@ -954,7 +954,7 @@ static void
 hk_cmd_buffer_publish_root_uploads(struct hk_cmd_buffer *cmd)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_native_graphics(&dev->dev) ||
+   if (!agx_chip_native_agx3(dev->dev.chip) ||
        list_is_empty(&cmd->uploader.root.bos))
       return;
 
@@ -1253,7 +1253,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    }
 
    /* M5 records its barriers with the native dependency tracker. */
-   if (!agx_native_graphics(&dev->dev) && !agx_chip_g17_m5(dev->dev.chip)) {
+   if (!agx_chip_native_or_m5(dev->dev.chip)) {
       hk_cmd_buffer_end_compute(cmd);
       hk_cmd_buffer_end_graphics(cmd);
       /* Preserve the same conservative ordering in the shared submit graph,
@@ -1344,7 +1344,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * alone leaves the data in the GPU caches, and the end of the command
     * does not reliably write it back before completion is reported when
     * render work shares the queue. */
-   if ((dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
+   if (agx_chip_g17p_or_m5(dev->dev.chip) &&
        hk_dependency_has_host_access(pDependencyInfo)) {
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
       hk_sync_src_dep(cmd, src_kinds, cmd->current_cs.cs, dep);
@@ -1394,7 +1394,7 @@ hk_g17p_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
                                   const struct hk_descriptor_state *desc)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
+   if (!agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) ||
        desc != &gfx->descriptors ||
        gfx->shaders[MESA_SHADER_GEOMETRY] ||
        gfx->shaders[MESA_SHADER_TESS_CTRL] ||
@@ -1737,7 +1737,7 @@ hk_m5_note_push_writes(struct hk_cmd_buffer *cmd, uint32_t count,
                        const VkWriteDescriptorSet *writes)
 {
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
-   if (!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip))
+   if (!agx_chip_native_or_m5(chip))
       return;
 
    for (uint32_t i = 0; i < count; ++i) {
@@ -1758,7 +1758,7 @@ hk_m5_note_push_template(struct hk_cmd_buffer *cmd,
                          const void *data)
 {
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
-   if (!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip))
+   if (!agx_chip_native_or_m5(chip))
       return;
 
    for (uint32_t i = 0; i < template->entry_count; ++i) {
@@ -3808,7 +3808,7 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    if (agx_chip_g17_m5(dev->dev.chip))
       return hk_m5_upload_graphics_program(cmd, s, linked);
 
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       const unsigned stage = s->info.stage == MESA_SHADER_FRAGMENT ? 1 : 0;
       struct hk_g17p_graphics_ioto_cache_entry *cached =
          &cmd->state.gfx.g17p_ioto[stage];
@@ -3841,7 +3841,7 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
        * earlier compact publication in this recording with the same inputs
        * was already admitted. */
       const bool spills = agx_tilebuffer_spills(&agfx->render.tilebuffer);
-      const bool same_program = agx_native_graphics(&dev->dev) &&
+      const bool same_program = agx_chip_native_agx3(dev->dev.chip) &&
                                 cached->admit.s == s &&
                                 cached->admit.linked == linked;
       const bool vertex_admitted =
@@ -3854,7 +3854,7 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
          cached->admit.provoking == agfx->provoking && hw_vs &&
          cached->admit.hw_vs == hw_vs;
       if (!vertex_admitted && !fragment_admitted) {
-         if (!agx_native_graphics(&dev->dev) ||
+         if (!agx_chip_native_agx3(dev->dev.chip) ||
              !hk_g17p_basic_graphics_program_supported(cmd, s, linked)) {
             vk_command_buffer_set_error(&cmd->vk,
                                         VK_ERROR_FEATURE_NOT_PRESENT);
@@ -4006,7 +4006,7 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
                     void *data, size_t data_size)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       hk_dispatch_precomp_g17p(cmd, grid, barrier, idx, data, data_size);
       return;
    }
@@ -4324,7 +4324,7 @@ hk_cs_capture_fragment_attachments(const struct hk_device *dev,
     * is a later meta pass that retains its own attachments. Eight multisample
     * targets and their resolve targets would otherwise overflow the table and
     * fail the submit. */
-   const bool g17p = agx_native_graphics(&dev->dev);
+   const bool g17p = agx_chip_native_agx3(dev->dev.chip);
    const bool resolves_written = !g17p || render->g17p_direct_color_resolve;
 
    for (unsigned i = 0; i < render->color_att_count; ++i) {
@@ -4400,12 +4400,10 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
    /* Only the native AGX3 path submits the spans (hk_queue.c). G18G
     * submits them too, as it did before the paths were split. */
-   const bool g18g = dev->dev.chip == AGX_CHIP_G18G;
-   if (agx_native_graphics(&dev->dev) || g18g)
+   if (agx_chip_native_or_g18g(dev->dev.chip))
       hk_cs_capture_fragment_attachments(dev, render, cs);
 
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
-       g18g) {
+   if (agx_chip_agx3_path(dev->dev.chip)) {
       /* The final VDM word stays zero when this selector is the
        * UINT32_MAX sentinel.  This reproduces m1n1's direct-triangle prefix. */
       cs->agx3_active_context_selector_valid = true;
@@ -4541,7 +4539,7 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
       memcpy(map, records, sizeof(records));
       map += sizeof(records);
-   } else if (agx_native_graphics(&dev->dev)) {
+   } else if (agx_chip_native_agx3(dev->dev.chip)) {
       /* PPPEncoderGen6's inspected G17P fixed-layout opening is one exact
        * W-clamp/Cull-2 payload, not the legacy AGX2 selector graph below.
        * Keep the payload in the compact VDM window just like every other
@@ -4628,7 +4626,7 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    /* All graphics state must be reemited in each control stream */
    hk_cmd_buffer_dirty_all(cmd);
 
-   if (agx_native_graphics(&dev->dev))
+   if (agx_chip_native_agx3(dev->dev.chip))
       assert((cs->current - cs->start) == HK_G17P_VDM_INITIAL_SIZE);
 
    return true;
@@ -4677,8 +4675,7 @@ hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->stream_linked |= linked;
    /* Conservative: G17P and the M5 re-emit their restart state after a
     * link. */
-   if (vdm && (hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P ||
-               agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)))
+   if (vdm && agx_chip_g17p_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
       cs->restart_index_set = false;
 }
 
@@ -4741,8 +4738,7 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
    /* An empty final stream of a pass with earlier draws is not an empty
     * render. Replacing it with the load-op clears would erase those draws. */
    const bool continuation = cmd->sync.pass_vdm != cs;
-   if (continuation && !agx_native_graphics(&dev->dev) &&
-       !agx_chip_g17_m5(dev->dev.chip))
+   if (continuation && !agx_chip_native_or_m5(dev->dev.chip))
       return false;
 
    /* Two reasons to keep the graphics representation on AGX3 rather than
@@ -4769,8 +4765,7 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     * common finalizer will append the native VDM terminator without uploading
     * any ordinary vertex or fragment program.
     */
-   const bool native_eot = agx_native_graphics(&dev->dev) ||
-                           agx_chip_g17_m5(dev->dev.chip);
+   const bool native_eot = agx_chip_native_or_m5(dev->dev.chip);
    const bool output_only_through_eot =
       native_eot && render->g17p_direct_color_resolve;
 
@@ -4912,8 +4907,7 @@ hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
          ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
          : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 
-   if ((!agx_chip_native_agx3(dev->dev.chip) &&
-        !agx_chip_g17_m5(dev->dev.chip)) ||
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
        cmd->in_meta ||
        cmd->vk.pool->queue_family_index >= pdev->queue_family_count ||
        !(pdev->queue_families[cmd->vk.pool->queue_family_index].queue_flags &

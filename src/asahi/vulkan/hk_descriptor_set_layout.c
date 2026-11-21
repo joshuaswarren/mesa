@@ -59,8 +59,7 @@ hk_descriptor_stride_align_for_type(
        * sideband (+72) did not fit the bare 64-byte texture/PBE pair, the
        * shader read zero tile geometry there, and atomics addressed the
        * twiddled image row-major. */
-      if (agx_native_graphics(&pdev->dev) || agx_chip_g17_m5(pdev->dev.chip) ||
-          pdev->dev.chip == AGX_CHIP_G18G) {
+      if (agx_chip_agx3_path(pdev->dev.chip)) {
          *stride += HK_G17P_STORAGE_SW_SIZE;
          /* imgwci addresses PBE records in a heap, and stores treat the
           * descriptor set as that heap. The PBE descriptor starts 32 bytes
@@ -83,7 +82,7 @@ hk_descriptor_stride_align_for_type(
        * heap indices and 24 bytes of buffer size/offset/address metadata.
        * The shader must never decode AGX2 software fields from Gen9 bytes.
        */
-      if (agx_native_graphics(&pdev->dev) || agx_chip_g17_m5(pdev->dev.chip)) {
+      if (agx_chip_native_or_m5(pdev->dev.chip)) {
          *stride = AGX_G17P_BUFFER_TEXTURE_DESCRIPTOR_SIZE;
          /* Texel-buffer stores address the PBE through the set's PBE heap,
           * like storage images. */
@@ -123,8 +122,7 @@ hk_descriptor_stride_align_for_type(
                hk_sampled_image_descriptor_layout(generation).stride;
          } else {
             *stride = HK_MAX_DESCRIPTOR_SIZE;
-            *alignment = (agx_native_graphics(&pdev->dev) ||
-                          agx_chip_g17_m5(pdev->dev.chip))
+            *alignment = agx_chip_native_or_m5(pdev->dev.chip)
                             ? HK_G17P_STORAGE_ALIGNMENT
                             : 8;
          }
@@ -315,8 +313,7 @@ hk_CreateDescriptorSetLayout(VkDevice device,
    layout->binding_count = num_bindings;
    layout->descriptor_generation =
       agx_chip_descriptor_generation(pdev->dev.chip);
-   layout->native_sampler_indices = agx_native_graphics(&pdev->dev) ||
-                                    agx_chip_g17_m5(pdev->dev.chip);
+   layout->native_sampler_indices = agx_chip_native_or_m5(pdev->dev.chip);
 
    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
       const VkDescriptorSetLayoutBinding *binding = &pCreateInfo->pBindings[j];

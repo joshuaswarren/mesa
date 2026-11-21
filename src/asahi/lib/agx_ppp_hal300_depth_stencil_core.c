@@ -31,16 +31,7 @@
 bool
 agx_ppp_hal300_depth_stencil_core_supported(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   case AGX_CHIP_G18G:
-      return true;
-
-   default:
-      return false;
-   }
+   return agx_chip_has_record(chip, AGX_RECORD_PPP_HAL300_DEPTH_STENCIL);
 }
 
 bool

@@ -24,19 +24,10 @@ static const uint8_t agx_ioto_e4[4] = {2, 0, 1, 3};
 static enum agx_ioto_state_encoding
 agx_ioto_state_target_encoding(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
+   switch (agx_chip_ioto_generation(chip)) {
+   case AGX_IOTO_GENERATION_GPU0:
       return AGX_IOTO_STATE_ENCODING_GPU0;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
+   case AGX_IOTO_GENERATION_GPU1:
       return AGX_IOTO_STATE_ENCODING_GPU1;
    default:
       return AGX_IOTO_STATE_ENCODING_UNSUPPORTED;

@@ -63,44 +63,6 @@ struct agx_gallium_storage_descriptor_layout {
    uint8_t stride;
 };
 
-/* G15P/A16 executes AGX2, but its complete descriptor/command-stream ABI is
- * not grounded.  Keep it UNKNOWN here just like the shared chip policy.
- */
-static inline enum agx_descriptor_generation
-agx_gallium_descriptor_generation(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G13G:
-   case AGX_CHIP_G13X:
-      return AGX_DESCRIPTOR_GENERATION_7;
-   case AGX_CHIP_G14G:
-   case AGX_CHIP_G14X:
-      return AGX_DESCRIPTOR_GENERATION_8;
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17A:
-      return AGX_DESCRIPTOR_GENERATION_9;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   /* The J873 native captures carry Gen10 texture and PBE descriptors that
-    * Mesa's G17G packers reproduce byte for byte. */
-   case AGX_CHIP_G18G:
-      return AGX_DESCRIPTOR_GENERATION_10;
-   case AGX_CHIP_G15P:
-   case AGX_CHIP_UNKNOWN:
-   default:
-      return AGX_DESCRIPTOR_GENERATION_UNKNOWN;
-   }
-}
-
 static inline bool
 agx_gallium_descriptor_generation_is_agx2(
    enum agx_descriptor_generation generation)

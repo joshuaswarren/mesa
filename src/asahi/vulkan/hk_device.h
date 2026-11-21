@@ -563,7 +563,7 @@ hk_cdm_alias_scope(const struct hk_device *dev)
 static inline bool
 hk_cdm_memory_scope_form(const struct hk_device *dev)
 {
-   return dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip);
+   return agx_chip_g17p_or_m5(dev->dev.chip);
 }
 
 /* Whether it is still unknown if the GPU's caches are tagged by virtual

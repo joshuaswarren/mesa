@@ -136,7 +136,7 @@ agx_batch_get_g17p_vdm_alias(struct agx_batch *batch, struct agx_bo *bo,
                              uint64_t address)
 {
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
-   if (!agx_native_graphics(dev))
+   if (!agx_chip_native_agx3(dev->chip))
       return address;
 
    if (!bo || address < bo->va->addr || address - bo->va->addr >= bo->size)
@@ -166,7 +166,7 @@ agx_batch_get_g17p_vdm_alias(struct agx_batch *batch, struct agx_bo *bo,
 static void
 agx_encoder_bind_vdm_alias(struct agx_device *dev, struct agx_encoder *encoder)
 {
-   if (!agx_native_graphics(dev))
+   if (!agx_chip_native_agx3(dev->chip))
       return;
 
    encoder->g17p_vdm_alias = agx_bo_get_g17p_vdm_alias(dev, encoder->bo);
@@ -1858,8 +1858,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
     * submission. */
    const bool m5_compute_commands = agx_m5_render_resources(dev) && compute;
    const bool m5_split_prepass =
-      (dev->chip == AGX_CHIP_G17G || dev->chip == AGX_CHIP_G18G) && compute &&
-      !m5_compute_commands;
+      agx_chip_m5_paths(dev->chip) && compute && !m5_compute_commands;
    const unsigned m5_split_count =
       !m5_split_prepass  ? 0
       : render           ? cdm_dispatch_count
@@ -2321,7 +2320,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          continue;
 
       /* But any BOs written by active batches are ours */
-      if (unlikely(writer != batch) && (dev->chip == AGX_CHIP_G18G || dev->chip == AGX_CHIP_G17G)) {
+      if (unlikely(writer != batch) && agx_chip_m5_paths(dev->chip)) {
          mesa_loge("asahi: batch %u lists BO %u (%s, %zu bytes @ 0x%" PRIx64
                    ") whose active writer is batch %u",
                    agx_batch_idx(batch), bo->handle,

@@ -132,7 +132,7 @@ hk_cmd_bo_create(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
     * through a draw. These BOs are recycled by the command pool, so populate
     * and initialize their shared mappings once at creation; subsequent command
     * buffers reuse already-resident pages without adding per-draw work. */
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
+   if (agx_chip_native_or_m5(dev->dev.chip)) {
       memset(bo->map, 0, bo->bo->size);
       if (hk_g17p_cached_cmd_memory(&dev->dev))
          util_flush_range(bo->map, bo->bo->size);
@@ -451,7 +451,7 @@ hk_cmd_pool_free_bo_list(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
    /* Under virtio every BO is an external object, which the host kernel locks
     * on every submit: a pool hoarding hundreds of idle BOs slows all submits. */
    const unsigned max_free =
-      (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
+      agx_chip_native_or_m5(dev->dev.chip) &&
          type == HK_CMD_BO_MAIN && !dev->dev.is_virtio
          ? HK_G17P_CMD_POOL_MAIN_BO_MAX
          : HK_CMD_POOL_BO_MAX;

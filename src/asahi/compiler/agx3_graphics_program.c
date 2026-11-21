@@ -1203,7 +1203,7 @@ agx3_g17p_fragment_blend_constant_base(enum agx_chip chip,
                                         unsigned occupied_halfs,
                                         uint16_t *base)
 {
-   if ((!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip)) || !base)
+   if (!agx_chip_native_or_m5(chip) || !base)
       return false;
 
    const unsigned start = ALIGN_POT(MAX2(occupied_halfs, 8), 2);

@@ -597,13 +597,6 @@ unsigned agx_get_num_cores(const struct agx_device *dev);
 
 struct agx_device_key agx_gather_device_key(struct agx_device *dev);
 
-/* Native AGX3 recording: Ioto programs and HAL200-format records. */
-static inline bool
-agx_native_graphics(const struct agx_device *dev)
-{
-   return agx_chip_native_agx3(dev->chip);
-}
-
 /* This interface carries native sampler state in GPU records, not in the
  * firmware command's optional sampler-heap fields. */
 static inline bool
@@ -618,7 +611,8 @@ agx_stream_sampler_state(const struct agx_device *dev)
 static inline bool
 agx_is_m4_pro(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G17P && dev->params.chip_id == 0x6040 &&
+   return dev->chip == AGX_CHIP_G17P &&
+          dev->params.chip_id == AGX_CHIP_ID_M4_PRO &&
           dev->params.gpu_generation == 16 && dev->params.gpu_variant == 'S';
 }
 

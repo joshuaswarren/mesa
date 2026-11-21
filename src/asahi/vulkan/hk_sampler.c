@@ -307,7 +307,8 @@ hk_CreateSampler(VkDevice device,
        * we no longer guarantee it, which is what "reconstruction is
        * implementation-defined" means.
        */
-      if (agx_native_graphics(&dev->dev) && hk_packed_ycbcr_bits(sampler->ycbcr.format))
+      if (agx_chip_native_agx3(dev->dev.chip) &&
+          hk_packed_ycbcr_bits(sampler->ycbcr.format))
          sampler->ycbcr.force_explicit_reconstruction = true;
       /* Explicit nearest chroma maps luma (i,j) to (i/2,j/2), independent
        * of chroma location. Linear reconstruction retains the offset. */
@@ -317,8 +318,8 @@ hk_CreateSampler(VkDevice device,
    }
 
    bool workaround_rgba4 = dev->vk.enabled_features.customBorderColors ||
-                           agx_native_graphics(&dev->dev);
-   bool int_border_custom = agx_native_graphics(&dev->dev);
+                           agx_chip_native_agx3(dev->dev.chip);
+   bool int_border_custom = agx_chip_native_agx3(dev->dev.chip);
    bool custom_border =
       uses_border(info) &&
       is_border_color_custom(info->borderColor, workaround_rgba4,
@@ -389,7 +390,8 @@ hk_CreateSampler(VkDevice device,
    /* Packed conversion fetches raw words; chroma filtering runs in the
     * shader and does not consume a second sampler/descriptor plane. */
    if (sampler->vk.ycbcr_conversion &&
-       !(agx_native_graphics(&dev->dev) && hk_packed_ycbcr_bits(sampler->ycbcr.format))) {
+       !(agx_chip_native_agx3(dev->dev.chip) &&
+         hk_packed_ycbcr_bits(sampler->ycbcr.format))) {
       assert(!uses_border(info) &&
              "consequence of VUID-VkSamplerCreateInfo-addressModeU-01646");
 

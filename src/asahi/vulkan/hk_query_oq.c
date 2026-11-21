@@ -287,7 +287,7 @@ hk_oq_render_stamps_supported(enum agx_chip chip)
     * end-of-render maintenance, and the host then writes its four stage
     * timestamps into the requested slots before signalling the fence
     * (g17/queue/render/retirement.rs, g17/completion.rs). */
-   return chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip);
+   return agx_chip_g17p_or_m5(chip);
 }
 
 void

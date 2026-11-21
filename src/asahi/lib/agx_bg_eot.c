@@ -227,8 +227,7 @@ agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
                &bindless_base, NULL, NULL, false,
                cache->dev->chip == AGX_CHIP_G18G,
                cache->dev->chip == AGX_CHIP_G18G,
-               agx_chip_native_agx3(cache->dev->chip) ||
-                  agx_chip_g17_m5(cache->dev->chip),
+               agx_chip_native_or_m5(cache->dev->chip),
                cache->dev->chip == AGX_CHIP_G18G);
       NIR_PASS(_, shader, agx_nir_lower_monolithic_msaa, tib->nr_samples);
       NIR_PASS(_, shader, agx_nir_lower_multisampled_image_store);
@@ -295,8 +294,7 @@ agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
    }
 
    res->info = bin.info;
-   if (agx_chip_native_agx3(cache->dev->chip) || agx_chip_g17_m5(cache->dev->chip) ||
-       cache->dev->chip == AGX_CHIP_G18G) {
+   if (agx_chip_agx3_path(cache->dev->chip)) {
       if (!agx_g17p_upload_bg_eot(cache, &bin, res)) {
          free(bin.binary);
          ralloc_free(shader);
@@ -414,14 +412,11 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
       /* Native multisample backgrounds store through the coverage register,
        * and so do G18G four-sample ones (msaa163). */
       .fs.nr_samples =
-         agx_chip_native_agx3(cache->dev->chip) ||
-               agx_chip_g17_m5(cache->dev->chip) ||
+         agx_chip_native_or_m5(cache->dev->chip) ||
                agx_g18_msaa4_tib(cache->dev, &key->tib)
             ? key->tib.nr_samples : 0,
       .reserved_preamble = key->reserved_preamble,
-      .no_preamble = agx_chip_native_agx3(cache->dev->chip) ||
-                     agx_chip_g17_m5(cache->dev->chip) ||
-                     cache->dev->chip == AGX_CHIP_G18G,
+      .no_preamble = agx_chip_agx3_path(cache->dev->chip),
    };
 
    /* The multi-target background protocol is keyed, not inferred: without
@@ -487,9 +482,7 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
 
       nir_def *color = build_background_op(
          &b, key->op[rt], rt, nr, source_msaa, layered,
-         agx_chip_native_agx3(cache->dev->chip) ||
-            agx_chip_g17_m5(cache->dev->chip) ||
-            cache->dev->chip == AGX_CHIP_G18G, clear_base);
+         agx_chip_agx3_path(cache->dev->chip), clear_base);
       if (key->preserve_resolve_outside) {
          assert(rt == 0 && key->op[rt] == AGX_BG_LOAD);
          nir_def *xy = nir_u2u32(&b, nir_load_pixel_coord(&b));
@@ -718,8 +711,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
 
       bool explicit = false;
       nir_def *coords = layer;
-      if (agx_chip_native_agx3(cache->dev->chip) ||
-          agx_chip_g17_m5(cache->dev->chip) || g18g) {
+      if (agx_chip_native_or_m5(cache->dev->chip) || g18g) {
          /* AGX3's EOT imgwblk has no implicit pixel-coordinate form.  Apple's
           * G17P compiler reads the hardware grid X/Y SRs explicitly.  Array
           * stores append the hardware layer ID; dropping it here made every
@@ -742,8 +734,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
          /* M5 reads the packed word as the packed-float tile format and
           * converts it to the R11G11B10 PBE (agx_rt0_pbe_format). */
          physical = (enum pipe_format)AIL_ISA_FORMAT_RG11B10F;
-      } else if (((agx_chip_native_agx3(cache->dev->chip) ||
-                   agx_chip_g17_m5(cache->dev->chip)) &&
+      } else if ((agx_chip_native_or_m5(cache->dev->chip) &&
                   (key->tib.logical_format[rt] == PIPE_FORMAT_R11G11B10_FLOAT ||
                    key->tib.logical_format[rt] == PIPE_FORMAT_R9G9B9E5_FLOAT)) ||
                  (g18g &&
@@ -755,8 +746,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
           * R11G11B10 explicitly into one raw word as well; texture views
           * retain the original decoding format. */
          physical = PIPE_FORMAT_R32_UINT;
-      } else if ((agx_chip_native_agx3(cache->dev->chip) ||
-                  agx_chip_g17_m5(cache->dev->chip) || g18g) &&
+      } else if ((agx_chip_native_or_m5(cache->dev->chip) || g18g) &&
           util_format_is_srgb(key->tib.logical_format[rt])) {
          /* G17P applies the sRGB transfer in the fragment's own packs
           * (fltnorm/normflt sRGB modes), and G18G lowers it explicitly before
@@ -792,8 +782,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
    struct agx_shader_key compiler_key = {
       .dev = agx_gather_device_key(cache->dev),
       .reserved_preamble = key->reserved_preamble,
-      .no_preamble = agx_chip_native_agx3(cache->dev->chip) ||
-                     agx_chip_g17_m5(cache->dev->chip) || g18g,
+      .no_preamble = agx_chip_native_or_m5(cache->dev->chip) || g18g,
       .m5_rt0_eot = agx_chip_g17_m5(cache->dev->chip),
       .m5_rt0_eot_store_and_resolve = key->m5_store_and_resolve,
       .g17g_rt0_eot = g18g,
@@ -964,9 +953,7 @@ agx_get_precompiled_locked(struct agx_bg_eot_cache *cache, unsigned program)
    /* G18G's kernels (agx3d, compiled as G17G) sit in the same CODE container
     * as G17P's: the M5 compute profile takes the entry exactly as the API
     * compute path builds it (agx_g17p_append_compute). */
-   const bool agx3_image = agx_chip_native_agx3(cache->dev->chip) ||
-                           agx_chip_g17_m5(cache->dev->chip) ||
-                           cache->dev->chip == AGX_CHIP_G18G;
+   const bool agx3_image = agx_chip_agx3_path(cache->dev->chip);
 
    if (agx3_image) {
       const bool m5 = agx_chip_g17_m5(cache->dev->chip);
