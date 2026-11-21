@@ -1145,6 +1145,51 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    return vk_command_buffer_end(&cmd->vk);
 }
 
+/* Whether any barrier in the dependency requests write availability (source
+ * write accesses) or read/host visibility (destination read or host write
+ * accesses). A barrier with neither is execution-only or WAR and requires
+ * execution ordering rather than a cache flush/invalidation. */
+/* Queue-family ownership transfer releases/acquires carry their own source
+ * write / destination read access masks per the Vulkan spec, so checking the
+ * filtered access masks below covers them without a separate QFOT branch. */
+static bool
+hk_dependency_needs_cache_flush(const VkDependencyInfo *info)
+{
+   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      if (vk_filter_src_access_flags2(
+             vk_expand_src_stage_flags2(b->srcStageMask), b->srcAccessMask) ||
+          vk_filter_dst_access_flags2(
+             vk_expand_dst_stage_flags2(b->dstStageMask), b->dstAccessMask))
+         return true;
+   }
+
+   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
+      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
+      if (vk_filter_src_access_flags2(
+             vk_expand_src_stage_flags2(b->srcStageMask), b->srcAccessMask) ||
+          vk_filter_dst_access_flags2(
+             vk_expand_dst_stage_flags2(b->dstStageMask), b->dstAccessMask))
+         return true;
+   }
+
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
+      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      /* Equal layouts, including UNDEFINED, are not transitions (sync2).
+       * Keep any real layout transition conservative and flush, matching
+       * hk_barrier.c. */
+      if (b->oldLayout != b->newLayout)
+         return true;
+      if (vk_filter_src_access_flags2(
+             vk_expand_src_stage_flags2(b->srcStageMask), b->srcAccessMask) ||
+          vk_filter_dst_access_flags2(
+             vk_expand_dst_stage_flags2(b->dstStageMask), b->dstAccessMask))
+         return true;
+   }
+
+   return false;
+}
+
 /* Images are compared as whole resources. Subresource-disjoint barriers may
  * still split, and aliasable/sparse attachments disable the unwritten-image
  * proof. Never infer disjointness from different Vulkan handles alone.
@@ -1419,7 +1464,11 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * the record is a patch site. */
    struct hk_cs *cs = cmd->current_cs.cs;
    const bool alias_scope = hk_cmd_alias_scope(cmd);
-   if (cs && HK_PERF(dev, WEAKBARRIER) && !alias_scope &&
+   const bool weak_only =
+      HK_PERF(dev, WEAKBARRIER) ||
+      (agx_chip_cdm_war_weak_barrier(dev->dev.chip) &&
+       !hk_dependency_needs_cache_flush(pDependencyInfo));
+   if (cs && weak_only && !alias_scope &&
        src_kinds && !(src_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
        dst_kinds && !(dst_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
        !hk_sync_xfer_pending(&cmd->sync) &&
@@ -1428,8 +1477,9 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
         !hk_cdm_visibility_flush_needed(dev, cs, alias_scope))) {
       /* Keep the preceding launch's weak ordering record in place (do not let
        * the next application dispatch elide it) and skip the flags-5 cache
-       * flush when testing ordering-only compute barriers. Where a later host
-       * import could alias, the record is a patch site like any other. */
+       * flush when the barrier is execution-only/WAR or when testing
+       * ordering-only compute barriers. Where a later host import could alias,
+       * the record is a patch site like any other. */
       cs->app_dispatch_end = NULL;
       hk_cdm_note_alias_site(cmd, cs);
    } else if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
