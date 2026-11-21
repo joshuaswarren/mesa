@@ -777,9 +777,13 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       /* The pre-graphics work of a pipeline without software
        * pre-rasterization stages (draw parameter patching, index rewriting,
        * statistics) reads buffers in the draw-indirect and vertex-input
-       * stages alone: image barriers (HK_SYNC_GFX_IMG) do not order it. */
+       * stages alone: image barriers (HK_SYNC_GFX_IMG) do not order it.
+       * A spilling render pass's pre-graphics decompression accesses the
+       * spilled colour attachments themselves, so it must still honour
+       * image barriers. */
       uint8_t classes = full_kinds(cs->sync.kind);
-      if (!cmd->state.gfx.shaders[MESA_SHADER_TESS_CTRL] &&
+      if (!agx_tilebuffer_spills(&cmd->state.gfx.render.tilebuffer) &&
+          !cmd->state.gfx.shaders[MESA_SHADER_TESS_CTRL] &&
           !cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL] &&
           !cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] &&
           !cmd->state.gfx.shaders[MESA_SHADER_TASK] &&

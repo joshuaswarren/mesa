@@ -1193,6 +1193,30 @@ test_image_barrier_vertex_class(void)
    T("carried image class orders an image-reading vertex half",
      reader->sync.barrier_ta[HK_SYNC_VDM] != DRM_ASAHI_BARRIER_NONE ||
      reader->sync.prior_ta[HK_SYNC_VDM] != 0);
+
+   /* Pre-graphics work without software pre-rasterization stages skips
+    * HK_SYNC_GFX_IMG unless the render pass spills colour attachments and
+    * therefore decompresses them in pre_gfx. */
+   cmd = new_cmd();
+   producer = add(cmd, false);
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX_IMG);
+   hk_sync_begin_rendering(cmd, false);
+   add_slot(cmd, &cmd->current_cs.gfx, false);
+   struct hk_cs *pre_plain = add_slot(cmd, &cmd->current_cs.pre_gfx, true);
+   T("non-spilling pre-graphics without pre-raster stages skips image class",
+     !pre_plain->sync.dep[HK_SYNC_VDM].cut);
+   hk_sync_end_rendering(cmd, false);
+
+   cmd = new_cmd();
+   producer = add(cmd, false);
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX_IMG);
+   hk_sync_begin_rendering(cmd, false);
+   cmd->state.gfx.render.tilebuffer.spilled[0] = true;
+   add_slot(cmd, &cmd->current_cs.gfx, false);
+   struct hk_cs *pre_spill = add_slot(cmd, &cmd->current_cs.pre_gfx, true);
+   T("spilling pre-graphics honours image class",
+     pre_spill->sync.dep[HK_SYNC_VDM].cut == producer);
+   hk_sync_end_rendering(cmd, false);
 }
 
 static void
