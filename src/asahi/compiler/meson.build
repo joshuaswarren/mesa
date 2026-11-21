@@ -679,6 +679,7 @@ if with_tests
          'test/test-aligned-bounds.cpp',
          'test/test-agx2-image-acquire.cpp',
          'test/test-agx2-g14g-witness.cpp',
+         'test/test-agx2-witness-compare.cpp',
          'test/test-byte-swap.cpp',
          'test/test-minmax-canonical.cpp',
          'test/test-workgroup-split.cpp',
@@ -751,6 +752,7 @@ if with_tests
     ),
     suite : ['asahi'],
     protocol : 'gtest',
+    env : {'MESON_SOURCE_ROOT' : meson.project_source_root()},
   )
 
   test(
