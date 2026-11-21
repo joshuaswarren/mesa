@@ -125,3 +125,57 @@ TEST(SpillLoopHeader, LiveThroughValueStaysSpilledAcrossLoop)
    EXPECT_EQ(fills, 1u);
    ralloc_free(mem);
 }
+
+/* One lane of a split device load is evicted and every reload repeats the
+ * load, so the spill store is dead after spilling and with it the only read
+ * of that split destination. Partial DCE after spilling must null the lane,
+ * or RA counts it until the end of the block and exceeds the budget. */
+TEST(SpillFallback, RepeatedSplitLaneLeavesNoDeadDestination)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17C;
+   key.has_scratch = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+
+   agx_index vector = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+   agx_instr *load = agx_device_load_to(b, vector, agx_uniform(0, AGX_SIZE_64),
+                                       agx_immediate(0), AGX_FORMAT_I32, 3, 0,
+                                       false);
+   load->memory_can_reorder = true;
+   agx_instr *split = agx_alloc_instr(b, AGX_OPCODE_SPLIT, 2, 1);
+   split->src[0] = vector;
+   split->dest[0] = agx_temp(b->shader, AGX_SIZE_32);
+   split->dest[1] = agx_temp(b->shader, AGX_SIZE_32);
+   agx_builder_insert(&b->cursor, split);
+   agx_unit_test(b, split->dest[0]);
+
+   /* Fill the 16 halves left after the spiller's parallel-copy reserve. */
+   agx_index pressure[8];
+   for (unsigned i = 0; i < ARRAY_SIZE(pressure); ++i)
+      pressure[i] = agx_fadd(b, agx_uniform(4 + 2 * i, AGX_SIZE_32),
+                            agx_uniform(2, AGX_SIZE_32));
+
+   for (agx_index value : pressure)
+      agx_unit_test(b, value);
+
+   agx_unit_test(b, split->dest[1]);
+   agx_compute_liveness(b->shader);
+   agx_spill(b->shader, 24, false);
+   agx_compute_liveness(b->shader);
+
+   EXPECT_FALSE(agx_is_null(split->dest[0]));
+   EXPECT_TRUE(agx_is_null(split->dest[1]));
+   EXPECT_LE(agx_calc_register_demand(b->shader, false), 24u);
+   unsigned repeated = 0;
+   agx_foreach_instr_global(b->shader, I) {
+      if (I->op == AGX_OPCODE_DEVICE_LOAD && I->mask == 1 &&
+          I->memory_byte_offset == 4)
+         ++repeated;
+   }
+   EXPECT_EQ(repeated, 1u);
+   ralloc_free(mem);
+}

@@ -1867,8 +1867,14 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
    agx_fold_m5_spill_constant_phis(ctx);
    agx_validate(ctx, "Spilling");
 
-   /* Remat can introduce dead code */
-   agx_dce(ctx, false);
+   /* Remat can introduce dead code. When every reload of a spilled split
+    * component repeats its device load, the spill store is dead, and with it
+    * the only read of that split destination. The spiller stopped counting
+    * the component at the store, but RA counts an unread destination until
+    * the end of its block, so null unread destinations as the partial DCE
+    * ahead of RA does, or the program can exceed the spill budget.
+    */
+   agx_dce(ctx, true);
 
    /* Any memory value that survives spilling is a stack slot: RA must keep
     * its parallel-copy scratch registers to lower memory copies after
