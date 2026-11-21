@@ -537,9 +537,15 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          flags |= AGX_BO_WRITEBACK;
 
       /* A BO from the cache allocates nothing new. If the kernel purged it
-       * meanwhile, one allocation can still pass the check. */
-      if (!hk_system_memory_fits(aligned_size) &&
-          !agx_bo_cache_has(&dev->dev, aligned_size, 64 * 1024, flags)) {
+       * meanwhile, one allocation can still pass the check. agx_bo_cache_has()
+       * is only a hint, so concurrent allocators can each pass on the same
+       * cached BO and any overshoot is bounded by the number of threads
+       * allocating at once. Guard with HK_MEMORY_CHECK_MIN first so sub-1 MiB
+       * allocations never take bo_cache.lock, then ask the cache before
+       * hk_system_memory_fits() reads /proc/meminfo. */
+      if (aligned_size >= HK_MEMORY_CHECK_MIN &&
+          !agx_bo_cache_has(&dev->dev, aligned_size, 64 * 1024, flags) &&
+          !hk_system_memory_fits(aligned_size)) {
          result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                             "Not enough free system memory for %" PRIu64
                             " MiB", aligned_size >> 20);
