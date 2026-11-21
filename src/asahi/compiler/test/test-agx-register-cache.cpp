@@ -180,6 +180,93 @@ TEST(DivergentLastUse, LoopKeepsTheExitedThreadsRegister)
    EXPECT_FALSE(read_of(latch, 6)->discard);
 }
 
+/* Nested divergent loops:
+ * - Threads that broke out of the outer loop wait at outer_exit with r6 while
+ *   the inner loop runs again; outer_brk is after the inner loop, so r6 is
+ *   kept in inner_latch only via the loop-propagation step.
+ * - Threads that broke out of the inner loop wait at inner_exit with r10 while
+ *   inner_latch runs again, so inner_latch must keep r10; after inner_exit,
+ *   r10 is dead (and re-initialized at outer_hdr), so inner_exit and a later
+ *   reuse in outer_latch must still get their last-use hints. */
+TEST(DivergentLastUse, NestedLoopKeepsOuterExitAndReleasesInnerExit)
+{
+   Shader s;
+   agx_builder *b = s.b;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *outer_hdr = agx_test_block(b->shader);
+   agx_block *inner_hdr = agx_test_block(b->shader);
+   agx_block *inner_brk = agx_test_block(b->shader);
+   agx_block *inner_latch = agx_test_block(b->shader);
+   agx_block *inner_exit = agx_test_block(b->shader);
+   agx_block *outer_brk = agx_test_block(b->shader);
+   agx_block *outer_latch = agx_test_block(b->shader);
+   agx_block *outer_exit = agx_test_block(b->shader);
+
+   agx_block_add_successor(entry, outer_hdr);
+   agx_block_add_successor(outer_hdr, inner_hdr);
+   agx_block_add_successor(inner_hdr, inner_brk);
+   agx_block_add_successor(inner_hdr, inner_latch);
+   agx_block_add_successor(inner_brk, inner_exit);
+   agx_block_add_successor(inner_latch, inner_hdr);
+   agx_block_add_successor(inner_exit, outer_brk);
+   agx_block_add_successor(inner_exit, outer_latch);
+   agx_block_add_successor(outer_brk, outer_exit);
+   agx_block_add_successor(outer_latch, outer_hdr);
+
+   outer_hdr->loop_header = true;
+   inner_hdr->loop_header = true;
+   outer_hdr->cf_divergent = inner_hdr->cf_divergent =
+      inner_brk->cf_divergent = inner_latch->cf_divergent =
+         inner_exit->cf_divergent = outer_brk->cf_divergent =
+            outer_latch->cf_divergent = true;
+
+   b->cursor = agx_after_block(entry);
+   agx_mov_imm_to(b, reg(8), 1);
+
+   b->cursor = agx_after_block(outer_hdr);
+   agx_mov_imm_to(b, reg(10), 0);
+
+   b->cursor = agx_after_block(inner_hdr);
+   agx_mov_imm_to(b, reg(10), 7);                         /* temporary in r10 */
+   agx_iadd_to(b, reg(8), reg(10), reg(8), 0);            /* must keep r10 via inner loop step */
+
+   b->cursor = agx_after_block(inner_brk);
+   agx_iadd_to(b, reg(10), reg(8), agx_immediate(3), 0); /* needed at inner_exit */
+
+   b->cursor = agx_after_block(inner_latch);
+   agx_mov_imm_to(b, reg(6), 9);                          /* temporary in r6 */
+   agx_iadd_to(b, reg(8), reg(6), reg(8), 0);             /* must keep r6 */
+   agx_mov_imm_to(b, reg(10), 11);                        /* temporary in r10 */
+   agx_iadd_to(b, reg(8), reg(10), reg(8), 0);            /* must keep r10 */
+
+   b->cursor = agx_after_block(inner_exit);
+   agx_iadd_to(b, reg(8), reg(10), reg(8), 0);            /* last read of r10 */
+
+   b->cursor = agx_after_block(outer_brk);
+   agx_iadd_to(b, reg(6), reg(8), agx_immediate(2), 0);   /* needed at outer_exit */
+
+   b->cursor = agx_after_block(outer_latch);
+   agx_mov_imm_to(b, reg(10), 13);                        /* post-exit reuse of r10 */
+   agx_iadd_to(b, reg(8), reg(10), reg(8), 0);            /* last read of r10 */
+
+   b->cursor = agx_after_block(outer_exit);
+   agx_unit_test(b, reg(6));
+
+   agx_opt_register_cache(b->shader);
+
+   /* Outer-exited threads hold r6 while the inner loop runs again. */
+   EXPECT_FALSE(read_of(inner_latch, 6)->discard);
+   /* Inner-exited threads hold r10 while the inner loop runs again
+    * (inner_hdr gets inner_exit solely from the inner loop propagation step). */
+   EXPECT_FALSE(read_of(inner_hdr, 10)->discard);
+   EXPECT_FALSE(read_of(inner_latch, 10)->discard);
+   /* r10 is live only into inner_exit, so it is released at and after inner_exit. */
+   EXPECT_TRUE(read_of(inner_exit, 10)->discard);
+   EXPECT_TRUE(read_of(outer_latch, 10)->discard);
+   /* outer_exit is the final read of r6 for every thread. */
+   EXPECT_TRUE(read_of(outer_exit, 6)->discard);
+}
+
 /* A register reused on one side of a divergent if, which no masked-off
  * thread needs (the else side and the code after never read it): each value
  * it holds gets its last use, as in uniform control flow. */
@@ -214,22 +301,26 @@ TEST(DivergentLastUse, ReuseNoMaskedThreadNeedsIsMarked)
    EXPECT_TRUE(u_read->src[0].discard);
 }
 
-/* The rule follows the instruction set: both AGX3 encodings mark the last use
- * of ReuseNoMaskedThreadNeedsIsMarked, and AGX2, whose hint only discards the
- * register-cache copy, keeps no hints in divergent control flow. */
+/* The rule follows the instruction set: AGX3B and AGX3C (Dynamic Caching) mark
+ * the last use of ReuseNoMaskedThreadNeedsIsMarked, while AGX2 (register-cache
+ * discard only) and AGX3D (static register count, unverified) keep no hints in
+ * divergent control flow. */
 TEST(DivergentLastUse, FollowsTheInstructionSet)
 {
    const struct {
       enum agx_isa_encoding encoding;
+      bool emit_agx3d;
       bool marked;
    } cases[] = {
-      {AGX_ISA_ENCODING_AGX3B, true},
-      {AGX_ISA_ENCODING_AGX3C, true},
-      {AGX_ISA_ENCODING_AGX2, false},
+      {AGX_ISA_ENCODING_AGX3B, false, true},
+      {AGX_ISA_ENCODING_AGX3C, false, true},
+      {AGX_ISA_ENCODING_AGX3C, true, false},
+      {AGX_ISA_ENCODING_AGX2, false, false},
    };
 
    for (const auto &c : cases) {
       Shader s(c.encoding);
+      s.key.dev.emit_agx3d = c.emit_agx3d;
       agx_builder *b = s.b;
       agx_block *entry = agx_start_block(b->shader);
       agx_block *then_ = agx_test_block(b->shader);
@@ -255,7 +346,8 @@ TEST(DivergentLastUse, FollowsTheInstructionSet)
 
       agx_opt_register_cache(b->shader);
 
-      EXPECT_EQ(u_read->src[0].discard, c.marked) << "encoding " << c.encoding;
+      EXPECT_EQ(u_read->src[0].discard, c.marked)
+         << "encoding " << c.encoding << " emit_agx3d " << c.emit_agx3d;
    }
 }
 
