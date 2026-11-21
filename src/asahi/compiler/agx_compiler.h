@@ -721,10 +721,12 @@ typedef struct {
     * describes the separate file consumed by UVSW and texture inputs. */
    unsigned agx3_staging_halfs;
    /* G18G vertex shaders with texture reads: where their outputs are
-    * staged (0: AGX3_G18G_READ_STAGING_LIMIT), and how far the texture
-    * reads of a refused attempt reached. */
+    * staged (0: AGX3_G18G_READ_STAGING_LIMIT), and, from a refused attempt,
+    * how far its texture reads reached and how many halves the outputs and
+    * any image-write bank need above them. */
    unsigned agx3_g18g_output_staging_floor;
    unsigned agx3_g18g_read_staging_end;
+   unsigned agx3_g18g_output_staging_span;
    bool agx3_staging_known;
    bool agx3_fltnorm_start;
    bool agx3_mrt_tile_ops_ordered;
@@ -1356,9 +1358,43 @@ void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);
  * encoding. */
 bool agx3_g17p_interleaved_zs(const agx_context *ctx);
 bool agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission);
+/* agx3_pack_binary, packed once more for a G18G vertex shader whose texture
+ * reads reach past AGX3_G18G_READ_STAGING_LIMIT, with its outputs above
+ * them (agx3_pack_binary.c). */
+bool agx3_pack_program(agx_context *ctx, struct util_dynarray *emission);
 bool agx3_interp_coords_from_itrcoords(const agx_context *ctx);
 bool agx3_merge_unread_pixel_waits(agx_context *ctx);
 const char *agx3_last_pack_refusal(void);
+
+/* G18G staging-file bounds, in halves, shared by the AGX3 packer and its
+ * vertex-output retry, agx3_pack_program(). */
+
+/* Image-write banks stay below this staging half, which also keeps every
+ * staged half within the COPY destination field. It is that field's encoding
+ * ceiling, not a measured size of the staging file. */
+#define AGX3_STAGED_WRITE_LIMIT 128u
+
+/* The first G18G image-write bank of a program that also reads textures or
+ * images, and the default base of the outputs of a G18G vertex shader that
+ * reads textures. AGX3C reads stage in blocks keyed by their scoreboard slot,
+ * 8 * (slot - 1) up the staging file: a texel fetch or image read at that
+ * plus its 0 or 16 coordinate base and at most 8 halves, a staged sample at
+ * that plus at most 16. Those stay below half 80 over eight slots. A G18G
+ * sample in its block instead reaches the block base plus its coordinate
+ * register plus 4, and a direct coordinate may sit as high as half 60, so
+ * such a sample reaches up to 8 * 7 + 64 = 120 (Firefox's Google Maps vertex
+ * shaders reached 84 to 112). The bound is therefore this packer's layout
+ * choice, not a hardware limit or a guarantee: the packer checks every
+ * finished program against it, and agx3_pack_program() packs a vertex shader
+ * whose reads reach past it once more with the outputs above them. */
+#define AGX3_G18G_READ_STAGING_LIMIT 80u
+
+/* The first G18G image-write bank of a vertex shader that reads nothing: its
+ * outputs' UVSW staging takes two halves per scoreboard slot, 2 * (slot - 1)
+ * over eight slots, all below half 16. Apple's G18G vertex functions keep a
+ * write's staging disjoint from the outputs' too (m6-image-write-vs iwv_f4:
+ * the write's data at 0..6, Y 8, X 10, the UVSWs from half 12). */
+#define AGX3_G18G_OUTPUT_STAGING_LIMIT 16u
 
 #ifndef NDEBUG
 void agx_validate(agx_context *ctx, const char *after_str);

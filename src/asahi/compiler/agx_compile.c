@@ -13387,18 +13387,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
        * by agx_params_driver_supported(); G17P uses this path on hardware.
        * If the encoder refuses an instruction, discard the emitted prefix and
        * report compilation failure. */
-      bool packed = agx3_pack_binary(ctx, binary);
-      /* G18G vertex outputs share the staging file with texture reads and
-       * are placed above AGX3_G18G_READ_STAGING_LIMIT (80 halves). Reads
-       * whose footprint reaches past it get one more attempt with the
-       * outputs right above their footprint, within 128 halves. */
-      if (!packed && ctx->agx3_g18g_read_staging_end &&
-          !ctx->agx3_g18g_output_staging_floor &&
-          ALIGN_POT(ctx->agx3_g18g_read_staging_end, 8) + 16 <= 128) {
-         ctx->agx3_g18g_output_staging_floor =
-            ALIGN_POT(ctx->agx3_g18g_read_staging_end, 8);
-         packed = agx3_pack_binary(ctx, binary);
-      }
+      bool packed = agx3_pack_program(ctx, binary);
       if (!packed) {
          char what[768];
          snprintf(what, sizeof(what), "AGX3 binary packer refused %s",
