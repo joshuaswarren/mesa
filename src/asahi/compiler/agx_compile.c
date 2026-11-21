@@ -9936,6 +9936,13 @@ agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
    if (hole_size > 0)
       return false;
 
+   if (low->intrinsic == nir_intrinsic_store_shared ||
+       high->intrinsic == nir_intrinsic_store_shared) {
+      if (nir_intrinsic_write_mask(low) != BITFIELD_MASK(low->num_components) ||
+          nir_intrinsic_write_mask(high) != BITFIELD_MASK(high->num_components))
+         return false;
+   }
+
    /* Must be aligned to the size of the load */
    unsigned align = nir_combined_align(align_mul, align_offset);
    if ((bit_size / 8) > align)
@@ -10318,13 +10325,30 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       NIR_PASS(_, nir, nir_opt_dce);
    }
 
+   /* Only AGX3 compute shaders defer element-index lowering here; AGX2 never
+    * sets shared_element_index_agx and must keep its existing scalar shared
+    * lowering. Frontends that ran agx_preprocess_nir() with g17p == false
+    * (G18G, Gallium, libagx, Borealis internal helpers) already narrowed
+    * shared offsets to u2u16(off32), so narrow any remaining 32-bit offsets
+    * first with element_indices = false and then run
+    * agx_nir_lower_shared_element_index to chase through u2u16 in 32 bits and
+    * preserve constant byte-offset folding in
+    * agx_nir_opt_shared_byte_offsets(). */
+   const bool lower_agx3_compute_shared =
+      (byte_indices || m5) && nir->info.stage == MESA_SHADER_COMPUTE &&
+      !nir->info.shared_element_index_agx;
    NIR_PASS(_, nir, nir_opt_load_store_vectorize,
             &(const nir_load_store_vectorize_options){
                .modes = nir_var_mem_global | nir_var_mem_constant |
+                        (lower_agx3_compute_shared ? nir_var_mem_shared : 0) |
                         nir_var_shader_temp,
                .callback = agx_mem_vectorize_cb,
             });
    NIR_PASS(_, nir, nir_lower_pack);
+   if (lower_agx3_compute_shared) {
+      NIR_PASS(_, nir, agx_nir_lower_shared_bitsize, false);
+      NIR_PASS(_, nir, agx_nir_lower_shared_element_index);
+   }
    NIR_PASS(_, nir, nir_opt_algebraic);
 
    nir_divergence_analysis(nir);
@@ -13926,29 +13950,47 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
     * into 32-bit halves, leaving each half addressing half its element.
     * Accesses of 32 bits and narrower are not split, so they are unaffected.
     */
-   if (g17p || native_fragment_depth) {
-      nir_lower_mem_access_bit_sizes_options shared_split = {
-         .modes = nir_var_mem_shared,
-         .callback = mem_access_size_align_cb,
-      };
-      NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &shared_split);
-   }
-
-   NIR_PASS(_, nir, agx_nir_lower_shared_bitsize,
-            g17p || native_fragment_depth);
-
-   /* A frontend that reaches this helper with `g17p` set owns the element-index
-    * conversion for the whole shader, including shared accesses that do not
-    * exist yet: hk_shader.c lowers `shared` variables to load_shared and
-    * store_shared at :1810, which is *between* its two calls here (:252 and
-    * :1892), so the first call legitimately finds nothing and the second does
-    * the work.  Record the ownership rather than the work -- a flag set by the
-    * pass itself would let that empty first call pass for a finished job and
-    * suppress both the real conversion and the backstop below, which is
-    * exactly how the Vulkan front end lost its conversion once already.
+   /* Compute shaders defer shared element-index lowering until after
+    * nir_lower_mem_access_bit_sizes() and nir_opt_load_store_vectorize() in
+    * agx_compile_shader_nir() so adjacent byte-addressed shared loads and
+    * stores merge into wider vector accesses before byte offsets become
+    * width-scaled element indices. Non-compute stages keep preprocess lowering.
     */
-   if (g17p || native_fragment_depth)
-      nir->info.shared_element_index_agx = true;
+   const bool defer_compute_shared =
+      (g17p || native_fragment_depth) && nir->info.stage == MESA_SHADER_COMPUTE;
+   if (!defer_compute_shared) {
+      if (g17p || native_fragment_depth) {
+         nir_lower_mem_access_bit_sizes_options shared_split = {
+            .modes = nir_var_mem_shared,
+            .callback = mem_access_size_align_cb,
+         };
+         NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &shared_split);
+      }
+
+      NIR_PASS(_, nir, agx_nir_lower_shared_bitsize,
+               g17p || native_fragment_depth);
+
+      /* A frontend that reaches this helper with `g17p` set owns the
+       * element-index conversion for the whole shader, including shared
+       * accesses that do not exist yet: hk_shader.c lowers `shared` variables
+       * to load_shared and store_shared between its two calls here, so the
+       * first call legitimately finds nothing and the second does the work.
+       * Record the ownership rather than the work -- a flag set by the pass
+       * itself would let that empty first call pass for a finished job and
+       * suppress both the real conversion and the backstop below.
+       */
+      if (g17p || native_fragment_depth)
+         nir->info.shared_element_index_agx = true;
+   } else {
+      /* agx_optimize_nir() owns the conversion now. An earlier call made
+       * before the frontend turned this shader into a compute kernel
+       * (Borealis's G17P task kernel, whose payload becomes shared memory)
+       * found no shared access and only recorded ownership; keeping its flag
+       * would skip the deferred conversion as well and leave byte offsets for
+       * the encoder.
+       */
+      nir->info.shared_element_index_agx = false;
+   }
 }
 
 void
@@ -16065,8 +16107,10 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !key->dev.emit_agx3d;
 
    /* Shared addresses arrive as byte offsets; AGX3 local memory instructions
-    * scale scalar element indices by their access width. */
-   if (is_agx3 && !nir->info.shared_element_index_agx)
+    * scale scalar element indices by their access width. Compute shaders
+    * convert inside agx_optimize_nir() right after shared vectorization. */
+   if (is_agx3 && nir->info.stage != MESA_SHADER_COMPUTE &&
+       !nir->info.shared_element_index_agx)
       NIR_PASS(_, nir, agx_nir_lower_shared_element_index);
 
 
@@ -16275,7 +16319,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, agx_nir_opt_licm, regs - 8);
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
+   if (is_agx3) {
       NIR_PASS(_, nir, agx_nir_opt_shared_byte_offsets);
       NIR_PASS(_, nir, nir_opt_cse);
       NIR_PASS(_, nir, nir_opt_dce);
