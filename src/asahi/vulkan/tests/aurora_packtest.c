@@ -18,6 +18,9 @@
  * fails if something was.
  *
  * usage: aurora-packtest ITERATIONS [CASE...]
+ *
+ * submit_to_fence_us times the iterations after the first two, which warm up;
+ * a run of two or fewer iterations reports it untimed.
  */
 #include <errno.h>
 #include <inttypes.h>
@@ -33,6 +36,8 @@
 #include <vulkan/vulkan.h>
 
 #include "aurora_packtest_shaders.h"
+
+#define WARMUP_ITERATIONS 2u
 
 #define LANES 1024u
 #define GUARD 64u
@@ -764,7 +769,7 @@ run_case(const char *name, unsigned iterations)
       }
       CHECK(vkWaitForFences(g.dev, 1, &fence, VK_TRUE, 10000000000ull));
       const uint64_t dt = now_ns() - t0;
-      if (it >= 2) {
+      if (it >= WARMUP_ITERATIONS) {
          best = dt < best ? dt : best;
          sum += dt;
          timed++;
@@ -780,9 +785,11 @@ run_case(const char *name, unsigned iterations)
          }
       }
    }
-   printf("%s %s cbs=%u iterations=%u submit_to_fence_us best=%.1f mean=%.1f\n",
-          bad ? "FAIL" : "PASS", name, T.ncb, iterations, best / 1e3,
-          timed ? sum / 1e3 / timed : 0.0);
+   printf("%s %s cbs=%u iterations=%u ", bad ? "FAIL" : "PASS", name, T.ncb, iterations);
+   if (timed)
+      printf("submit_to_fence_us best=%.1f mean=%.1f\n", best / 1e3, sum / 1e3 / timed);
+   else
+      printf("submit_to_fence_us untimed (iterations <= %u)\n", WARMUP_ITERATIONS);
    vkDestroyFence(g.dev, fence, NULL);
    if (sem)
       vkDestroySemaphore(g.dev, sem, NULL);
