@@ -51,6 +51,11 @@ struct hk_queue {
        * occlusion query reads (hk_oq_submission_done()). Every value at or
        * below it is complete. */
       uint64_t signalled_value;
+
+      /* Latest timeline point that received the waits of a submission
+       * without control streams (queue_submit_empty()), 0 once it is known
+       * complete. Later kernel submissions of this queue wait for it. */
+      uint64_t empty_wait_point;
    } drm;
 
    /* M5 submissions whose command memory is still pinned, oldest first

@@ -217,6 +217,27 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # A render on one queue read by compute on another, ordered by timeline
+  # semaphores, including waits made by submissions without command buffers;
+  # recorded and submitted, not executed (the ordering check needs the GPU).
+  test(
+    'hk-g17p-cross-queue',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_cross_queue,
+      '--shim',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+    timeout : 120,
+  )
+
   # Background/end-of-tile shader cache shared by command buffers recording
   # on several threads.
   test(
