@@ -806,3 +806,14 @@ agx3_transcode_agx3d_ioto(struct util_dynarray *binary, unsigned start,
    return ioto && transcode(binary, start, ioto, NULL, 0, NULL, false, why,
                             fail_offset);
 }
+
+bool
+agx3_transcode_agx3d_ioto_with_offsets(struct util_dynarray *binary,
+                                       unsigned start,
+                                       const struct agx3_transcode_ioto *ioto,
+                                       unsigned *offsets, unsigned count,
+                                       const char **why, unsigned *fail_offset)
+{
+   return ioto && transcode(binary, start, ioto, offsets, count, NULL, false,
+                            why, fail_offset);
+}

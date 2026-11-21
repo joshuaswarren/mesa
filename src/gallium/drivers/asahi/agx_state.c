@@ -14,6 +14,7 @@
 #include "asahi/compiler/agx3_compute_program.h"
 #include "asahi/compiler/agx3_graphics_program.h"
 #include "asahi/vulkan/hk_g17p_patch.h"
+#include "asahi/compiler/agx3_reencode_cache.h"
 #include "asahi/compiler/agx3_transcode.h"
 #include "asahi/compiler/agx_nir.h"
 #include "asahi/genxml/agx_pack.h"
@@ -878,6 +879,28 @@ agx_ioto_capacity(const struct agx_device *dev, size_t g17g_capacity)
    return dev->chip == AGX_CHIP_G18G ? 2 * g17g_capacity : g17g_capacity;
 }
 
+/*
+ * G18G re-encodings go through a cache (agx3_reencode_cache.c).
+ * ASAHI_MESA_DEBUG=verify checks every hit against a full re-encoding.
+ */
+static struct agx3_reencode_cache agx_g18g_reencode_cache =
+   AGX3_REENCODE_CACHE_INITIALIZER;
+
+/* Log a program the transcoder refused, and dump it under FAULTTRACE */
+static void
+agx_g18g_reencode_refused(const struct agx_device *dev,
+                          const struct agx3_g17p_graphics_program *program,
+                          const char *why, unsigned at)
+{
+   mesa_loge("asahi: G18G Ioto program not re-encoded: %s at +0x%x", why, at);
+   if (dev->debug & AGX_DBG_FAULTTRACE) {
+      fprintf(stderr, "G18G_IOTO_REFUSED length=%u data=", program->length);
+      for (unsigned i = 0; i < program->length; ++i)
+         fprintf(stderr, "%02x", program->bytes[i]);
+      fputc('\n', stderr);
+   }
+}
+
 /* G18G: re-encode a generated M5 Ioto program as agx3d in place. The G17G
  * programs embed no address of their own (agx_ioto_g17g_* only validate
  * program_va), so the longer agx3d text stays position-independent. */
@@ -893,30 +916,38 @@ agx_g18g_reencode_program(const struct agx_device *dev,
       .api_program = api_program,
       .shader_gprs = shader_gprs,
    };
-
-   struct util_dynarray code;
-   util_dynarray_init(&code, NULL);
-   memcpy(util_dynarray_grow_bytes(&code, 1, program->length), program->bytes,
-          program->length);
    const char *why = NULL;
    unsigned at = 0;
-   const bool ok = agx3_transcode_agx3d_ioto(&code, 0, &ioto, &why, &at) &&
-                   code.size <= sizeof(program->bytes);
-   if (ok) {
-      memcpy(program->bytes, code.data, code.size);
-      program->length = code.size;
-   } else {
-      mesa_loge("asahi: G18G Ioto program not re-encoded: %s at +0x%x",
-                why ? why : "longer than the program buffer", at);
-      if (dev->debug & AGX_DBG_FAULTTRACE) {
-         fprintf(stderr, "G18G_IOTO_REFUSED length=%u data=", program->length);
-         for (unsigned i = 0; i < program->length; ++i)
-            fprintf(stderr, "%02x", program->bytes[i]);
-         fputc('\n', stderr);
-      }
+
+   const bool verify = dev->debug & AGX_DBG_VERIFY;
+   const unsigned length = program->length;
+   struct agx3_g17p_graphics_program agx3c;
+
+   if (verify)
+      agx3c = *program;
+
+   switch (agx3_reencode_cached(&agx_g18g_reencode_cache, program, &ioto, &why,
+                                &at)) {
+   case AGX3_REENCODE_HIT:
+      if (verify && (!agx3_reencode_program(&agx3c, &ioto, &why, &at) ||
+                     agx3c.length != program->length ||
+                     memcmp(agx3c.bytes, program->bytes, program->length)))
+         mesa_loge("asahi: G18G re-encoding cache hit differs from "
+                   "a full re-encoding (length %u)", length);
+      return true;
+   case AGX3_REENCODE_MISS:
+      return true;
+   case AGX3_REENCODE_REFUSED:
+      agx_g18g_reencode_refused(dev, program, why, at);
+      return false;
+   case AGX3_REENCODE_UNCACHEABLE:
+      break;
    }
-   util_dynarray_fini(&code);
-   return ok;
+
+   if (agx3_reencode_program(program, &ioto, &why, &at))
+      return true;
+   agx_g18g_reencode_refused(dev, program, why, at);
+   return false;
 }
 
 static struct asahi_bg_eot
