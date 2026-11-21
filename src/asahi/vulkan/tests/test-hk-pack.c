@@ -517,7 +517,10 @@ test_boundary(void)
    T("G17P: memory-scoped flush form, no boundary",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
    dev->dev.chip = AGX_CHIP_G15S;
-   T("G15S: wide visibility, no boundary",
+   T("G15S: not qualified, no boundary",
+     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
+   dev->dev.chip = AGX_CHIP_G17A;
+   T("G17A: HAL200, caches pending, no boundary",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
    dev->dev.chip = AGX_CHIP_G14G;
    T("G14G: no boundary", hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
@@ -530,7 +533,54 @@ test_boundary(void)
      hk_pack_run_member(
         dev_with(AGX_CHIP_G17S, DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION),
         c, terminate, false));
+
+   /* A stream an application barrier ends: a strong flush without memory
+    * scope, so no visible completion. The member check takes it exactly
+    * where hk_pack_admits_strong_tail() says, which the trace reports. */
+   struct hk_cs *s = list_first_entry(&c->control_streams, struct hk_cs, node);
+   s->memory_flush_end = NULL;
+   s->visible_completion = false;
+   T("M5: a strong-flush tail, and the trace says so",
+     hk_pack_run_member(
+        dev_with(AGX_CHIP_G17S, DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION),
+        c, terminate, false) &&
+        hk_pack_admits_strong_tail(HK_PACK_BOUNDARY_VISIBLE_COMPLETION));
+   T("no strong-flush tail without a boundary",
+     !hk_pack_admits_strong_tail(HK_PACK_BOUNDARY_NONE));
    chip = AGX_CHIP_G16G;
+   struct hk_cmd_buffer *g = plain(1);
+   s = list_first_entry(&g->control_streams, struct hk_cs, node);
+   s->strong_flush_end = s->weak_barrier_end;
+   s->weak_barrier_end = NULL;
+   T("G16G: a strong-flush tail, and the trace says so",
+     hk_pack_run_member(dev_with(AGX_CHIP_G16G, 0), g, terminate, false) &&
+        hk_pack_admits_strong_tail(HK_PACK_BOUNDARY_STRONG_FLUSH));
+}
+
+/* HK_PACK_ATOMICS: on by default where the kernel runs a VM's compute
+ * commands one after another (G16G), opt-in elsewhere with one kernel queue;
+ * an unparsable value keeps the default. */
+static void
+test_atomics_choice(void)
+{
+   T("G16G: atomics packed by default", hk_pack_atomics_choice(true, NULL, 1));
+   T("G16G: HK_PACK_ATOMICS=0 keeps them apart",
+     !hk_pack_atomics_choice(true, "0", 1));
+   T("G16G: HK_PACK_ATOMICS=1", hk_pack_atomics_choice(true, "1", 1));
+   T("G16G: an unparsable value keeps the default",
+     hk_pack_atomics_choice(true, "maybe", 1));
+   T("G16G: HK_PACK_ATOMICS=off keeps them apart",
+     !hk_pack_atomics_choice(true, "off", 1) &&
+        !hk_pack_atomics_choice(true, "OFF", 1));
+   T("M5: atomics apart by default", !hk_pack_atomics_choice(false, NULL, 1));
+   T("M5: HK_PACK_ATOMICS=1 with one kernel queue",
+     hk_pack_atomics_choice(false, "1", 1));
+   T("M5: HK_PACK_ATOMICS=1 with two kernel queues",
+     !hk_pack_atomics_choice(false, "1", 2));
+   T("M5: an unparsable value keeps the default",
+     !hk_pack_atomics_choice(false, "maybe", 1));
+   T("M5: HK_PACK_ATOMICS=on with one kernel queue",
+     hk_pack_atomics_choice(false, "on", 1));
 }
 
 /* hk_sync_forget_stream() leaves a command buffer's latest render of a kind
@@ -565,6 +615,32 @@ test_forget(bool exact)
      wait_of(first_cs(c[1]), HK_SYNC_VDM, 0, exact) == 0 &&
         wait_of(first_cs(c[2]), HK_SYNC_VDM, 0, exact) != 0);
 #undef N
+}
+
+/* A render forgotten in an earlier submission on an exact-prior queue: the
+ * queue's latest positions (last_absolute), not the kinds it ran (ever), say
+ * which priors wait (from the fourth review of #488). */
+static void
+test_forget_history(void)
+{
+   struct hk_cmd_buffer *r = new_cmd();
+   r->sync.kind_override = HK_SYNC_XFER;
+   add(r, false);
+   r->sync.kind_override = 0;
+   struct hk_cs *gone = add(r, false);
+   hk_sync_forget_stream(r, gone);
+   list_del(&gone->node);
+   struct hk_queue *q = new_queue(true);
+   T("exact: earlier forget: history resolves", resolve(q, &r, 1));
+   struct hk_cmd_buffer *c[2] = {plain(1), after_render()};
+   struct hk_pack_run runs[4];
+   unsigned count;
+   plan_queue(q, c, 2, false, runs, &count);
+   T("exact: a render forgotten in an earlier submission splits", count == 0);
+   T("exact: earlier forget: resolves", resolve(q, c, 2));
+   T("exact: earlier forget: the resolver agrees",
+     wait_of(first_cs(c[0]), HK_SYNC_VDM, 0, true) == 0 &&
+        wait_of(first_cs(c[1]), HK_SYNC_VDM, 0, true) != 0);
 }
 
 /* A tail of a graphics destination class the packet's stream belongs to
@@ -1177,6 +1253,7 @@ main(void)
    if (!test_context)
       return EXIT_FAILURE;
    test_boundary();
+   test_atomics_choice();
    test_rejections();
    test_m5_tails();
    test_plan();
@@ -1186,6 +1263,7 @@ main(void)
    test_folds();
    test_forget(false);
    test_forget(true);
+   test_forget_history();
    test_full_classes();
    test_random();
    test_history();

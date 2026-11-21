@@ -542,11 +542,23 @@ hk_cdm_alias_scope(const struct hk_device *dev)
 
 /* Whether the CDM strong flush has a memory-scoped form, which memory
  * reached through a second address needs (hk_cdm_alias_scope()): on G17P
- * and M5. The other HAL200 parts (G16) have only the plain strong flush. */
+ * and M5. G16 has only the plain strong flush; G17A's caches are not known
+ * (hk_cdm_caches_pending()). */
 static inline bool
 hk_cdm_memory_scope_form(const struct hk_device *dev)
 {
    return dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip);
+}
+
+/* Whether it is still unknown if the GPU's caches are tagged by virtual
+ * address, as on G17P and M5, so that a plain strong flush may not make
+ * memory visible through a second address. G17A sits between those two and
+ * its caches have not been checked: it is pending until they are. G16 is
+ * known to be untagged. */
+static inline bool
+hk_cdm_caches_pending(const struct hk_device *dev)
+{
+   return dev->dev.chip == AGX_CHIP_G17A;
 }
 
 /* As hk_cdm_alias_scope(), for an application dependency recorded without a
