@@ -720,6 +720,11 @@ typedef struct {
    /* Half of the AGX3 compiler staging footprint. Unlike max_reg, this
     * describes the separate file consumed by UVSW and texture inputs. */
    unsigned agx3_staging_halfs;
+   /* G18G vertex shaders with texture reads: where their outputs are
+    * staged (0: AGX3_G18G_READ_STAGING_LIMIT), and how far the texture
+    * reads of a refused attempt reached. */
+   unsigned agx3_g18g_output_staging_floor;
+   unsigned agx3_g18g_read_staging_end;
    bool agx3_staging_known;
    bool agx3_fltnorm_start;
    bool agx3_mrt_tile_ops_ordered;

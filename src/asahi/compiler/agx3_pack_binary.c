@@ -13098,7 +13098,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
     * unchanged: moving them instead exceeds the sampler coordinate limit. */
    const uint16_t g18g_output_staging_base =
       ctx->key->dev.emit_agx3d && ctx->stage == MESA_SHADER_VERTEX &&
-      texture_ops_left != 0 ? AGX3_G18G_READ_STAGING_LIMIT : 0;
+      texture_ops_left != 0
+         ? MAX2(AGX3_G18G_READ_STAGING_LIMIT,
+                ctx->agx3_g18g_output_staging_floor)
+         : 0;
    const uint16_t g18g_image_write_floor =
       !ctx->key->dev.emit_agx3d || image_writes_left == 0 ||
       g18g_compact_image_banks ? 0
@@ -23211,8 +23214,15 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    /* Texture reads must stay below the separately placed vertex outputs.
     * Validate emitted extents rather than assuming the reserved bound. */
    if (g18g_output_staging_base &&
-       g18g_read_staging_end > g18g_output_staging_base)
+       g18g_read_staging_end > g18g_output_staging_base) {
+      /* The caller may retry with the outputs above the reads */
+      ctx->agx3_g18g_read_staging_end = g18g_read_staging_end;
+      if (agx_compiler_debug & (AGX_DBG_SHADERS | AGX_DBG_REFUSE))
+         fprintf(stderr, "G18G vertex texture reads stage to half %u, past "
+                 "the output staging at %u\n",
+                 g18g_read_staging_end, g18g_output_staging_base);
       goto fail;
+   }
 
    /* Every G18G image write was staged from g18g_image_write_floor up.
     * Refuse the program if a read's staging block or an output's UVSW
