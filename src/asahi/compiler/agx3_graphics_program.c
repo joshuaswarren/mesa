@@ -842,7 +842,8 @@ static bool
 g18g_graphics_program_generate(
    enum agx_chip chip, const struct agx3_g17p_graphics_program_desc *desc,
    enum agx_ioto_g17g_program_stage stage,
-   bool g18_tps, struct agx3_g17p_graphics_program *program)
+   bool g18_tps, struct agx3_g17p_graphics_program *program,
+   struct agx3_g17p_graphics_program_template *template)
 {
    /* G18 consumes this canonical GPU1 form through the caller's agx3d
     * re-encoder. Retain the target for imageblock admission before selecting
@@ -1005,16 +1006,21 @@ g18g_graphics_program_generate(
    struct agx_ioto_inflight_load loads[AGX3_G17P_GRAPHICS_MAX_LOAD_CHUNKS];
    struct agx_ioto_inflight_load sort[AGX3_G17P_GRAPHICS_MAX_LOAD_CHUNKS];
    struct agx_ioto_load_cache_entry cache[AGX3_G17P_GRAPHICS_MAX_LOAD_CHUNKS];
+   size_t relocation_count = 0;
    const struct agx3_ioto_uniform_program_desc load_desc = {
       .program_va = desc->program_va,
       .ranges = desc->uniform_ranges,
       .range_count = desc->uniform_range_count,
+      .patchable = desc->patchable,
    };
    const struct agx3_ioto_uniform_program_workspace workspace = {
       .body = body, .body_capacity = sizeof(body),
       .loads = loads, .load_capacity = ARRAY_SIZE(loads),
       .sort = sort, .sort_capacity = ARRAY_SIZE(sort),
       .cache = cache, .cache_capacity = ARRAY_SIZE(cache),
+      .relocations = template ? template->relocations : NULL,
+      .relocation_capacity = template ? ARRAY_SIZE(template->relocations) : 0,
+      .relocation_count = &relocation_count,
    };
    size_t body_size, copy_offset, written;
    struct agx3_g17p_graphics_program staged = {0};
@@ -1026,6 +1032,25 @@ g18g_graphics_program_generate(
           staged.bytes, sizeof(staged.bytes), &written) ||
        written > bound || written > UINT16_MAX)
       return false;
+   if (template) {
+      /* The composer inserts the state prefix where the body's COPY suffix
+       * starts (agx_ioto_g17g_resource_program_compose_classes()): move the
+       * address materializations after it past the prefix. */
+      size_t suffix;
+      if (!agx_ioto_program_copy_suffix_offset(chip, body, body_size, &suffix))
+         return false;
+      const size_t prefix = AGX_IOTO_STATE_TAIL_TYPE0_SIZE +
+                            AGX_IOTO_G17S_MINIMAL_PROFILE_LOADER_SIZE;
+      for (size_t i = 0; i < relocation_count; ++i) {
+         struct agx_ioto_load_relocation *r = &template->relocations[i];
+         if (r->offset >= suffix)
+            r->offset += prefix;
+         else if (r->offset + r->low_length + r->high_length > suffix)
+            return false;
+      }
+      template->relocation_count = relocation_count;
+      template->constant_suffix_offset = written - AGX_IOTO_PROGRAM_TERMINATE_SIZE;
+   }
    staged.length = written;
    *program = staged;
    return true;
@@ -1158,7 +1183,23 @@ agx3_g18g_graphics_program_generate(
                                  : AGX_IOTO_G17G_PROGRAM_FRAGMENT;
    /* Canonical GPU1 record; the G18 caller must re-encode it as agx3d. */
    return desc && g18g_graphics_program_generate(AGX_CHIP_G18G, desc, stage,
-                                                 false, program);
+                                                 false, program, NULL);
+}
+
+bool
+agx3_g18g_graphics_program_template_generate(
+   const struct agx3_g17p_graphics_program_desc *desc,
+   struct agx3_g17p_graphics_program_template *program)
+{
+   const enum agx_ioto_g17g_program_stage stage =
+      !desc                      ? AGX_IOTO_G17G_PROGRAM_VERTEX
+      : !desc->fragment          ? AGX_IOTO_G17G_PROGRAM_VERTEX
+      : desc->writes_sample_mask ? AGX_IOTO_G17G_PROGRAM_COVERAGE_FRAGMENT
+                                 : AGX_IOTO_G17G_PROGRAM_FRAGMENT;
+   /* A static TPS frame takes the _tps program, as for one generated whole */
+   return desc && program && g18g_graphics_program_generate(
+      AGX_CHIP_G18G, desc, stage, desc->scratch_size != 0, &program->program,
+      program);
 }
 
 bool
@@ -1168,7 +1209,8 @@ agx3_g18g_compute_program_generate(
 {
    /* Canonical GPU1 record; the G18 caller must re-encode it as agx3d. */
    return desc && !desc->fragment && g18g_graphics_program_generate(
-      AGX_CHIP_G17G, desc, AGX_IOTO_G17G_PROGRAM_COMPUTE, true, program);
+      AGX_CHIP_G17G, desc, AGX_IOTO_G17G_PROGRAM_COMPUTE, true, program,
+      NULL);
 }
 
 bool
@@ -1183,7 +1225,7 @@ agx3_g18g_graphics_program_generate_tps(
                                  : AGX_IOTO_G17G_PROGRAM_FRAGMENT;
    /* Canonical GPU1 record; the G18 caller must re-encode it as agx3d. */
    return desc && desc->scratch_size && g18g_graphics_program_generate(
-      AGX_CHIP_G18G, desc, stage, true, program);
+      AGX_CHIP_G18G, desc, stage, true, program, NULL);
 }
 
 bool
@@ -1195,7 +1237,7 @@ agx3_g18g_tile_program_generate(
    return desc && desc->fragment && g18g_graphics_program_generate(
       AGX_CHIP_G18G, desc, store ? AGX_IOTO_G17G_PROGRAM_EOT
                                  : AGX_IOTO_G17G_PROGRAM_BACKGROUND, false,
-      program);
+      program, NULL);
 }
 
 bool

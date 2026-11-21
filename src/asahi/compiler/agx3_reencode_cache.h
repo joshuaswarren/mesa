@@ -55,3 +55,32 @@ agx3_reencode_cached(struct agx3_reencode_cache *cache,
 
 /* Free every entry of cache */
 void agx3_reencode_cache_clear(struct agx3_reencode_cache *cache);
+
+/*
+ * A re-encoding template: the agx3d form of one program, for programs that
+ * differ from it only in the immediates of given LDIMMs -- a patchable
+ * program's range bases (agx3_g17p_graphics_program_template). Its owner
+ * keys it by the program's shape, so unlike a cache entry it needs no key.
+ */
+struct agx3_reencode_template;
+
+/* The template for program, whose LDIMMs at ldimm_offsets[0, count) carry the
+ * immediates that may change, allocated with ralloc on mem_ctx. NULL if the
+ * transcoder refuses program (why, at) or one of those LDIMMs does not
+ * re-encode to an LDIMM with the same immediate (the transcoder rewrites the
+ * USC helper base after an SR14 rld). */
+struct agx3_reencode_template *
+agx3_reencode_template_create(void *mem_ctx,
+                              const struct agx3_g17p_graphics_program *program,
+                              const struct agx3_transcode_ioto *ioto,
+                              const unsigned *ldimm_offsets, unsigned count,
+                              const char **why, unsigned *at);
+
+/* The agx3d program for the immediates[0, count) of the template's LDIMMs,
+ * in the order they were given: exactly what agx3_reencode_program() writes
+ * for the agx3c program with those immediates. False if one of them takes
+ * another size than in the template. */
+bool
+agx3_reencode_template_emit(const struct agx3_reencode_template *t,
+                            const uint32_t *immediates,
+                            struct agx3_g17p_graphics_program *program);

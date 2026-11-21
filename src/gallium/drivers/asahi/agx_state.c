@@ -63,6 +63,8 @@
 #include "pipe/p_state.h"
 #include "poly/geometry.h"
 #include "asahi/genxml/agx3_cmdstream.h"
+#include "util/u_atomic.h"
+#include "asahi/lib/agx_g18g_template_policy.h"
 #include "util/bitscan.h"
 #include "util/bitset.h"
 #include "util/blend.h"
@@ -870,13 +872,23 @@ agx_m5_gpu_tess(struct agx_context *ctx)
    return !agx_swtnl_can_tessellate();
 }
 
+/* Whether the M5 generators' programs are re-encoded as agx3d for dev. The
+ * generators behind it are G18G's own (agx3_g18g_graphics_program_*() and the
+ * G18 TPS envelope, which still key on AGX_CHIP_G18G): a later agx3d chip
+ * needs its own before it takes these paths. */
+static inline bool
+agx_reencodes_agx3d(const struct agx_device *dev)
+{
+   return agx_chip_isa_encoding(dev->chip) == AGX_ISA_ENCODING_AGX3D;
+}
+
 /* Room for a program's agx3d re-encoding: twice the G17G bound, which covers
  * every witness (the largest growth is f32mul's 8-byte form becoming 16).
  * The callers still refuse a program longer than what they allocated. */
 static inline size_t
 agx_ioto_capacity(const struct agx_device *dev, size_t g17g_capacity)
 {
-   return dev->chip == AGX_CHIP_G18G ? 2 * g17g_capacity : g17g_capacity;
+   return agx_reencodes_agx3d(dev) ? 2 * g17g_capacity : g17g_capacity;
 }
 
 /*
@@ -6897,6 +6909,50 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
    return agx_usc_addr(dev, t.gpu);
 }
 
+static bool
+agx_m5_graphics_program_cached(struct agx_device *dev,
+                               struct agx_linked_shader *linked,
+                               const struct agx3_g17p_graphics_program_desc *desc,
+                               struct agx3_g17p_graphics_program *program);
+
+/* agx3d templates made, for ASAHI_MESA_DEBUG=verify */
+static uint32_t agx_g18g_templates_made;
+
+/* ASAHI_MESA_DEBUG=verify: check a G18G program from a template against a
+ * fresh composition and full re-encoding, as the M5 builder does. */
+static void
+agx_g18g_graphics_template_verify(const struct agx_linked_shader *linked,
+                                  const struct agx3_g17p_graphics_program_desc *desc,
+                                  const struct agx3_g17p_graphics_program *program)
+{
+   struct agx3_g17p_graphics_program_desc d = *desc;
+   struct agx3_g17p_graphics_program fresh;
+   const struct agx3_transcode_ioto ioto = {
+      .api_program = true,
+      .shader_gprs = linked->nr_gprs,
+   };
+   const char *why = NULL;
+   unsigned at = 0;
+   d.patchable = true;
+   const bool same =
+      (d.scratch_size ? agx3_g18g_graphics_program_generate_tps(&d, &fresh)
+                      : agx3_g18g_graphics_program_generate(&d, &fresh)) &&
+      agx3_reencode_program(&fresh, &ioto, &why, &at) &&
+      fresh.length == program->length &&
+      !memcmp(fresh.bytes, program->bytes, program->length);
+   static uint32_t checked, differed;
+   const uint32_t n = p_atomic_inc_return(&checked);
+   if (!same && p_atomic_inc_return(&differed) <= 8)
+      fprintf(stderr, "G18G_PROGRAM_CACHE differs from a fresh composition "
+                      "(fragment %u, %zu ranges)\n", d.fragment,
+              d.uniform_range_count);
+   if (!(n & (n - 1)))
+      fprintf(stderr, "G18G_PROGRAM_CACHE verified %u programs, %u differed, "
+                      "%u templates made\n",
+              n, p_atomic_read(&differed),
+              p_atomic_read(&agx_g18g_templates_made));
+}
+
 /* G18G (j873): the M5-profile graphics program with agx3d re-encoding and the
  * G18 TPS-frame envelope. Every other native chip takes
  * agx_build_g17p_graphics_program() above. */
@@ -7100,34 +7156,11 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
       };
    }
 
-   size_t capacity;
-   const bool bounded = dev->chip == AGX_CHIP_G18G
-      ? agx3_g17g_graphics_program_bound(agx_ioto_chip(dev), ranges, count,
-                                         &capacity)
-      : agx3_g17p_graphics_program_bound_with_preshader(
-           dev->chip, ranges, count, preshader, &capacity);
-   if (!bounded)
-      AGX3_PROGRAM_REFUSE("program size bound");
-   capacity = agx_ioto_capacity(dev, capacity);
-
-   struct agx_bo *program_bo = NULL;
-   struct agx_ptr t = agx_pool_alloc_aligned_with_bo(
-      &batch->pipeline_pool, capacity, AGX_IOTO_PROGRAM_ALIGNMENT,
-      &program_bo);
-   if (!t.cpu || !program_bo)
-      AGX3_PROGRAM_REFUSE("the program could not be allocated in the pipeline pool");
-   if (!agx_va_in_usc_window(dev, t.gpu))
-      AGX3_PROGRAM_REFUSE("the program lies outside the USC window");
-   if (!agx_va_in_usc_window(dev,
-                             linked->bo->va->addr + linked->entry_offset))
-      AGX3_PROGRAM_REFUSE("the shader binary lies outside the USC window");
-
    const uint32_t pass_type =
       cs->stage == MESA_SHADER_FRAGMENT
          ? linked->fragment_control.opaque[0] >> 29
          : AGX_PASS_TYPE_OPAQUE;
-   const struct agx3_g17p_graphics_program_desc desc = {
-      .program_va = t.gpu,
+   struct agx3_g17p_graphics_program_desc desc = {
       .shader_va = linked->bo->va->addr + linked->entry_offset,
       .uniform_ranges = ranges,
       .uniform_range_count = count,
@@ -7147,6 +7180,56 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
          .tile_size_px = batch->tilebuffer_layout.tile_size,
       },
    };
+
+   /* G18 vertex/fragment TPS frames are admitted only when the kernel sizes
+    * the shared TA/3D pool from this render's resource suffix, and only
+    * inside the envelope that sizing is evidenced for. Without the feature
+    * the draw keeps its original refusal. */
+   const bool g18_tps = dev->chip == AGX_CHIP_G18G && desc.scratch_size;
+   if (g18_tps) {
+      if (!(dev->params.features & DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH))
+         AGX3_PROGRAM_REFUSE("Ioto program generation");
+      if (desc.imageblock.nr_samples != 1 ||
+          desc.imageblock.tile_size_px != 32 * 32 ||
+          !desc.imageblock.sample_size_B ||
+          desc.imageblock.sample_size_B > 8 ||
+          util_framebuffer_get_num_layers(&batch->key) != 1)
+         AGX3_PROGRAM_REFUSE("G18 graphics scratch outside the single-sample, "
+                             "single-layer, one-page tile envelope");
+   }
+
+   /* G18G: from the linked shader's template for this shape */
+   struct agx3_g17p_graphics_program program;
+   const bool cached = agx_reencodes_agx3d(dev) &&
+                       agx_m5_graphics_program_cached(dev, linked, &desc,
+                                                      &program);
+   size_t capacity;
+   if (cached) {
+      capacity = program.length;
+   } else {
+      const bool bounded = agx_reencodes_agx3d(dev)
+         ? agx3_g17g_graphics_program_bound(agx_ioto_chip(dev), ranges, count,
+                                            &capacity)
+         : agx3_g17p_graphics_program_bound_with_preshader(
+              dev->chip, ranges, count, preshader, &capacity);
+      if (!bounded)
+         AGX3_PROGRAM_REFUSE("program size bound");
+      capacity = agx_ioto_capacity(dev, capacity);
+   }
+
+   struct agx_bo *program_bo = NULL;
+   struct agx_ptr t = agx_pool_alloc_aligned_with_bo(
+      &batch->pipeline_pool, capacity, AGX_IOTO_PROGRAM_ALIGNMENT,
+      &program_bo);
+   if (!t.cpu || !program_bo)
+      AGX3_PROGRAM_REFUSE("the program could not be allocated in the pipeline pool");
+   if (!agx_va_in_usc_window(dev, t.gpu))
+      AGX3_PROGRAM_REFUSE("the program lies outside the USC window");
+   if (!agx_va_in_usc_window(dev,
+                             linked->bo->va->addr + linked->entry_offset))
+      AGX3_PROGRAM_REFUSE("the shader binary lies outside the USC window");
+   desc.program_va = t.gpu;
+
    size_t program_length;
    if (dev->chip == AGX_CHIP_G17P) {
       if (!agx_g17p_graphics_program_cached(dev->chip, linked, &desc, t.cpu,
@@ -7154,29 +7237,15 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
                                             &program_length))
          AGX3_PROGRAM_REFUSE("Ioto program generation");
    } else {
-      struct agx3_g17p_graphics_program program;
-      /* G18 vertex/fragment TPS frames are admitted only when the kernel
-       * sizes the shared TA/3D pool from this render's resource suffix, and
-       * only inside the envelope that sizing is evidenced for. Without the
-       * feature the draw keeps its original refusal. */
-      const bool g18_tps = dev->chip == AGX_CHIP_G18G && desc.scratch_size;
-      if (g18_tps) {
-         if (!(dev->params.features & DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH))
-            AGX3_PROGRAM_REFUSE("Ioto program generation");
-         if (desc.imageblock.nr_samples != 1 ||
-             desc.imageblock.tile_size_px != 32 * 32 ||
-             !desc.imageblock.sample_size_B ||
-             desc.imageblock.sample_size_B > 8 ||
-             util_framebuffer_get_num_layers(&batch->key) != 1)
-            AGX3_PROGRAM_REFUSE("G18 graphics scratch outside the single-sample, "
-                                "single-layer, one-page tile envelope");
-      }
-      const bool generated = dev->chip == AGX_CHIP_G18G
-         ? (g18_tps ? agx3_g18g_graphics_program_generate_tps(&desc, &program)
-                    : agx3_g17g_graphics_program_generate(dev->chip, &desc,
-                                                          &program)) &&
-              agx_g18g_reencode_program(dev, &program, true, linked->nr_gprs)
-         : agx3_g17p_graphics_program_generate(dev->chip, &desc, &program);
+      if (cached && (dev->debug & AGX_DBG_VERIFY))
+         agx_g18g_graphics_template_verify(linked, &desc, &program);
+      const bool generated = cached ||
+         (agx_reencodes_agx3d(dev)
+             ? (g18_tps ? agx3_g18g_graphics_program_generate_tps(&desc, &program)
+                        : agx3_g17g_graphics_program_generate(dev->chip, &desc,
+                                                              &program)) &&
+                  agx_g18g_reencode_program(dev, &program, true, linked->nr_gprs)
+             : agx3_g17p_graphics_program_generate(dev->chip, &desc, &program));
       if (!generated || program.length > capacity) {
          if (dev->debug & AGX_DBG_FAULTTRACE) {
             fprintf(stderr,
@@ -7227,7 +7296,13 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
  * tables get, and only the shape (imageblock, range starts and sizes) keys it.
  * The bytes don't depend on the program's own address (no constant program),
  * which Honeykrisp relies on as well; ASAHI_MESA_DEBUG=verify checks every
- * patched program against a fresh composition. */
+ * patched program against a fresh composition.
+ *
+ * G18G re-encodes every program as agx3d, which on the M6 cost as much again
+ * as composing it: a Chromium Google Maps drag spent 86% of its GPU process's
+ * CPU time building programs. Its templates also keep the agx3d form
+ * (agx3_reencode_template), where only the LDIMMs of the range bases change:
+ * the plan's relocations, each a low and a high half. */
 struct agx_m5_graphics_template {
    struct agx_m5_graphics_template *next;
    struct agx_ioto_g17p_imageblock imageblock;
@@ -7236,6 +7311,11 @@ struct agx_m5_graphics_template {
    uint8_t range_count;
    uint16_t length;
    struct hk_g17p_patch_plan plan;
+   /* G18G: the agx3d form of bytes, NULL if none could be made: the shape
+    * is then composed in full without trying again. */
+   struct agx3_reencode_template *agx3d;
+   /* When agx3d is kept, replaced or given up (agx_g18g_template_policy.h) */
+   struct agx_g18g_template_state agx3d_state;
    uint8_t bytes[];
 };
 
@@ -7260,14 +7340,42 @@ agx_m5_graphics_template_matches(const struct agx_m5_graphics_template *t,
    return hk_g17p_patch_plan_fits(&t->plan, d->uniform_ranges);
 }
 
-static void
-agx_m5_graphics_template_emit(const struct agx_m5_graphics_template *t,
+/* False if a G18G LDIMM takes another size for desc's addresses */
+static bool
+agx_m5_graphics_template_emit(const struct agx_device *dev,
+                              const struct agx_m5_graphics_template *t,
                               const struct agx3_g17p_graphics_program_desc *desc,
                               struct agx3_g17p_graphics_program *program)
 {
+   if (agx_reencodes_agx3d(dev)) {
+      uint32_t immediates[2 * HK_G17P_PATCH_MAX_RELOCS];
+      hk_g17p_patch_plan_ldimms(&t->plan, desc->uniform_ranges, NULL,
+                                immediates);
+      return agx3_reencode_template_emit(t->agx3d, immediates, program);
+   }
    program->length = t->length;
    memcpy(program->bytes, t->bytes, t->length);
    hk_g17p_patch_plan_apply(&t->plan, desc->uniform_ranges, program->bytes);
+   return true;
+}
+
+/* G18G: make t's agx3d form from its agx3c template, if it can be */
+static void
+agx_g18g_graphics_template_reencode(struct agx_m5_graphics_template *t,
+                                    const struct agx_linked_shader *linked,
+                                    const struct agx3_g17p_graphics_program *agx3c)
+{
+   const struct agx3_transcode_ioto ioto = {
+      .api_program = true,
+      .shader_gprs = linked->nr_gprs,
+   };
+   unsigned offsets[2 * HK_G17P_PATCH_MAX_RELOCS];
+   const unsigned count =
+      hk_g17p_patch_plan_ldimms(&t->plan, NULL, offsets, NULL);
+   const char *why = NULL;
+   unsigned at = 0;
+   t->agx3d = agx3_reencode_template_create(t, agx3c, &ioto, offsets, count,
+                                            &why, &at);
 }
 
 /* Write the program for desc (whose program_va isn't needed) from the linked
@@ -7280,22 +7388,47 @@ agx_m5_graphics_program_cached(struct agx_device *dev,
                                const struct agx3_g17p_graphics_program_desc *desc,
                                struct agx3_g17p_graphics_program *program)
 {
-   if (!agx_chip_g17_m5(dev->chip) ||
+   const bool g18g = agx_reencodes_agx3d(dev);
+   if ((!agx_chip_g17_m5(dev->chip) && !g18g) ||
        desc->uniform_range_count > HK_G17P_PATCH_MAX_RANGES)
       return false;
 
    simple_mtx_lock(&agx_m5_template_lock);
    struct agx_m5_graphics_template **slot = &linked->m5_graphics_templates;
    unsigned count = 0;
+   struct agx_g18g_template_state replaced = {0};
    while (*slot) {
       struct agx_m5_graphics_template *t = *slot;
       if (agx_m5_graphics_template_matches(t, desc)) {
          *slot = t->next;
+         /* A G18G shape without an agx3d form is composed in full */
+         const bool unpatchable = g18g && !t->agx3d;
+         const bool emitted =
+            !unpatchable && agx_m5_graphics_template_emit(dev, t, desc, program);
+         /* A draw the agx3d form refused (an LDIMM takes another size for
+          * these addresses) is composed in full; the policy decides when the
+          * template is replaced or given up. */
+         if (g18g && t->agx3d) {
+            switch (agx_g18g_template_after_draw(&t->agx3d_state, emitted)) {
+            case AGX_G18G_TEMPLATE_KEEP:
+               break;
+            case AGX_G18G_TEMPLATE_REPLACE:
+               replaced = agx_g18g_template_replacement(&t->agx3d_state);
+               ralloc_free(t);
+               t = NULL;
+               break;
+            case AGX_G18G_TEMPLATE_DROP:
+               ralloc_free(t->agx3d);
+               t->agx3d = NULL;
+               break;
+            }
+            if (!t)
+               break;
+         }
          t->next = linked->m5_graphics_templates;
          linked->m5_graphics_templates = t;
-         agx_m5_graphics_template_emit(t, desc, program);
          simple_mtx_unlock(&agx_m5_template_lock);
-         return true;
+         return emitted;
       }
       slot = &t->next;
       ++count;
@@ -7308,7 +7441,9 @@ agx_m5_graphics_program_cached(struct agx_device *dev,
    d.program_va = dev->shader_base + 0x10000;
    d.patchable = true;
    if (composed &&
-       agx3_g17g_graphics_program_template_generate(dev->chip, &d, composed)) {
+       (g18g ? agx3_g18g_graphics_program_template_generate(&d, composed)
+             : agx3_g17g_graphics_program_template_generate(dev->chip, &d,
+                                                            composed))) {
       created = rzalloc_size(linked, sizeof(*created) +
                                         composed->program.length);
       if (created &&
@@ -7316,6 +7451,12 @@ agx_m5_graphics_program_cached(struct agx_device *dev,
                                   d.uniform_range_count, composed->relocations,
                                   composed->relocation_count,
                                   composed->program.length, true)) {
+         if (g18g) {
+            agx_g18g_graphics_template_reencode(created, linked,
+                                                &composed->program);
+            p_atomic_inc(&agx_g18g_templates_made);
+         }
+         created->agx3d_state = replaced;
          created->imageblock = d.imageblock;
          created->range_count = d.uniform_range_count;
          for (unsigned i = 0; i < created->range_count; ++i) {
@@ -7335,7 +7476,11 @@ agx_m5_graphics_program_cached(struct agx_device *dev,
          }
          created->next = linked->m5_graphics_templates;
          linked->m5_graphics_templates = created;
-         agx_m5_graphics_template_emit(created, desc, program);
+         /* The template has desc's addresses: it emits as made */
+         if (g18g && !created->agx3d)
+            created = NULL;
+         else
+            agx_m5_graphics_template_emit(dev, created, desc, program);
       } else {
          ralloc_free(created);
          created = NULL;
