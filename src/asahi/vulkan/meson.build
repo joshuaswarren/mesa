@@ -1206,6 +1206,13 @@ if with_tests
 endif
 
 if with_tests
+  test('hk_errored_submit', executable('hk_errored_submit_test',
+    files('tests/test-hk-errored-submit.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [hk_wrap_test_link_args]),
+    timeout : 30, suite : ['asahi'])
   test('hk_lost_object_submit', executable('hk_lost_object_submit_test',
     files('tests/test-hk-lost-object-submit.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
