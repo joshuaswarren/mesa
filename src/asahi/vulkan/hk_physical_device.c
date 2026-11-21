@@ -1326,16 +1326,17 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxMeshOutputLayers = 8,
       /* A multiview mesh draw replays once per view (hk_foreach_view walks
        * every bit of the 32-bit view mask) and writes the view index to the
-       * layer, so mesh shaders take as many views as every other stage.
+       * layer, so mesh shaders could take HK_MAX_MULTIVIEW_VIEW_COUNT views.
        *
-       * VK-GL-CTS dEQP-VK.mesh_shader.ext.properties.max_view_index builds
-       * its view mask as (1u << count) - 1u, which is undefined for 32
-       * views (on AArch64 it yields 0, and only layer 0 is drawn), so that
-       * case fails against this limit until the CTS computes the mask
-       * without the overflowing shift.
+       * Report 16 until VK-GL-CTS is fixed:
+       * dEQP-VK.mesh_shader.ext.properties.max_view_index draws with
+       * min(maxMeshMultiviewViewCount, 32) views and builds its subpass view
+       * mask as (1u << count) - 1u. At 32 views the shift is undefined; on
+       * AArch64 it shifts by count mod 32, the mask becomes 0, the pass is
+       * not multiview, only layer 0 is drawn and the case fails. Raise this
+       * once the CTS has KhronosGroup/VK-GL-CTS#661 (aurora-silicon/mesa#516).
        */
-      .maxMeshMultiviewViewCount =
-         features->multiviewMeshShader ? HK_MAX_MULTIVIEW_VIEW_COUNT : 1,
+      .maxMeshMultiviewViewCount = features->multiviewMeshShader ? 16 : 1,
       .meshOutputPerVertexGranularity = 32,
       .meshOutputPerPrimitiveGranularity = 32,
       .maxPreferredTaskWorkGroupInvocations = 32,
