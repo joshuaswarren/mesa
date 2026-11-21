@@ -34,8 +34,17 @@
 #define HK_MAX_DESCRIPTOR_SET_SIZE       (1u << 30)
 #define HK_MAX_INLINE_UNIFORM_BLOCK_SIZE (1u << 16)
 #define HK_MAX_DESCRIPTORS               (1 << 20)
+#define HK_MAX_PLANES                    3
+/* The largest push descriptor set. A push layout has at most
+ * HK_MAX_PUSH_DESCRIPTORS elements of at most HK_MAX_DESCRIPTOR_SIZE bytes,
+ * except that an element of a binding whose immutable samplers convert a
+ * multi-planar format takes that per plane (hk_CreateDescriptorSetLayout()
+ * multiplies the stride by the plane count), and each binding starts after
+ * less than one more of alignment padding. So every push layout within the
+ * limits fits.
+ */
 #define HK_PUSH_DESCRIPTOR_SET_SIZE                                            \
-   (HK_MAX_PUSH_DESCRIPTORS * HK_MAX_DESCRIPTOR_SIZE)
+   (HK_MAX_PUSH_DESCRIPTORS * (HK_MAX_PLANES + 1) * HK_MAX_DESCRIPTOR_SIZE)
 /* Storage buffer descriptors hold the exact byte range and every bounds check
  * (explicit I/O lowering, check_in_bounds) tests offset + size - 1 < range,
  * so ranges are not rounded up for robustBufferAccess2.

@@ -14,7 +14,6 @@
 
 struct hk_device;
 
-#define HK_MAX_PLANES      3
 #define HK_MAX_IMAGE_DESCS (10 * HK_MAX_PLANES)
 
 struct hk_image_view {

@@ -152,12 +152,12 @@ struct hk_push_descriptor_set {
    uint8_t data[HK_PUSH_DESCRIPTOR_SET_SIZE];
 };
 
-void hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
+bool hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
                                    struct hk_descriptor_set_layout *layout,
                                    uint32_t write_count,
                                    const VkWriteDescriptorSet *writes);
 
-void hk_push_descriptor_set_update_template(
+bool hk_push_descriptor_set_update_template(
    struct hk_push_descriptor_set *push_set,
    struct hk_descriptor_set_layout *layout,
    const struct vk_descriptor_update_template *template, const void *data);

@@ -1900,6 +1900,10 @@ struct hk_cmd_buffer {
    /* Does the command buffer use the geometry heap? */
    bool uses_heap;
 
+   /* The push descriptor sets hk_meta_begin() saves, each only as long as
+    * its layout, stacked in the order nested meta operations begin. */
+   struct util_dynarray meta_push_saves;
+
    /* Owned BOs and retained references needed by recorded commands. */
    struct util_dynarray large_bos;
    /* Direct-mapped temporal cache avoids rescanning large_bos for the linked
@@ -2968,7 +2972,8 @@ struct hk_meta_save {
    uint64_t buffer_set0;
    uint32_t buffer_set_size0;
    enum agx_visibility_mode occlusion;
-   struct hk_push_descriptor_set push_desc0;
+   /* Where in hk_cmd_buffer::meta_push_saves the saved push set 0 starts */
+   uint32_t push_desc0_offset;
    VkQueryPipelineStatisticFlags pipeline_stats_flags;
    uint8_t push[HK_MAX_PUSH_SIZE];
    /* The runtime's record of stages bound from a pipeline. */
