@@ -226,6 +226,10 @@ TEST(DivergentLastUse, NestedLoopKeepsOuterExitAndReleasesInnerExit)
    b->cursor = agx_after_block(outer_hdr);
    agx_mov_imm_to(b, reg(10), 0);
 
+   b->cursor = agx_after_block(inner_hdr);
+   agx_mov_imm_to(b, reg(10), 7);                         /* temporary in r10 */
+   agx_iadd_to(b, reg(8), reg(10), reg(8), 0);            /* must keep r10 via inner loop step */
+
    b->cursor = agx_after_block(inner_brk);
    agx_iadd_to(b, reg(10), reg(8), agx_immediate(3), 0); /* needed at inner_exit */
 
@@ -252,7 +256,9 @@ TEST(DivergentLastUse, NestedLoopKeepsOuterExitAndReleasesInnerExit)
 
    /* Outer-exited threads hold r6 while the inner loop runs again. */
    EXPECT_FALSE(read_of(inner_latch, 6)->discard);
-   /* Inner-exited threads hold r10 while the inner loop runs again. */
+   /* Inner-exited threads hold r10 while the inner loop runs again
+    * (inner_hdr gets inner_exit solely from the inner loop propagation step). */
+   EXPECT_FALSE(read_of(inner_hdr, 10)->discard);
    EXPECT_FALSE(read_of(inner_latch, 10)->discard);
    /* r10 is live only into inner_exit, so it is released at and after inner_exit. */
    EXPECT_TRUE(read_of(inner_exit, 10)->discard);
