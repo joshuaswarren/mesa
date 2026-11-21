@@ -1071,6 +1071,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  g17p_vulkan_garbage_metadata = executable(
+    'g17p-vulkan-garbage-metadata',
+    files('tests/g17p_vulkan_garbage_metadata.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hk_vulkan_global_priority = executable(
     'hk-vulkan-global-priority',
     files('tests/hk_vulkan_global_priority.c'),

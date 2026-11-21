@@ -60,6 +60,19 @@
  * images are shared compressed only through the GPU_TILED_COMPRESSED
  * modifier contract, see hk_g17p_shared_compression_eligible().
  *
+ * Aliasing (VK_IMAGE_CREATE_ALIAS_BIT, which vkd3d-proton sets on every
+ * placed resource) is admitted. The layout is a function of the creation
+ * parameters, so images created alike and bound to the same memory share
+ * body and metadata, as the flag requires. A newly bound image starts with
+ * whatever its memory held, metadata included. That is not specific to
+ * ALIAS: app memory taken from the BO cache is not zeroed either. Each write
+ * path above writes whole 16x16 tiles with their metadata words, so stale
+ * words only decide how tiles read that were not written since the contents
+ * became undefined, and those texels are undefined anyway. The body has its
+ * full uncompressed size, with the metadata after it, so no mode reaches
+ * outside the image. Storage images are not admitted: shader stores leave
+ * the metadata as it was (hk_image.c).
+ *
  * This is the only G17P policy: every eligible image is compressed, with no
  * runtime opt-out.
  */
@@ -209,7 +222,8 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
    }
 
    VkImageCreateFlags allowed_flags =
-      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
+      VK_IMAGE_CREATE_ALIAS_BIT;
    if (g16s && info->imageType == VK_IMAGE_TYPE_2D)
       allowed_flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
    if (g16s && info->imageType == VK_IMAGE_TYPE_3D)

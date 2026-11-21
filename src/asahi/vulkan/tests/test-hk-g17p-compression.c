@@ -138,15 +138,24 @@ check_shape(VkFormat format, bool is_depth)
                            VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT));
    }
 
-   /* Sample-location tracking is also admitted for single-sample depth. */
+   /* Sample-location tracking is also admitted for single-sample depth.
+    * Aliasing is admitted for every shape; storage stays refused with it. */
    for (unsigned bit = 0; bit < 32; ++bit) {
       VkImageCreateInfo i = base;
       i.flags = 1u << bit;
       CHECK(ELIGIBLE(i) ==
             ((1u << bit) == VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT ||
              (1u << bit) == VK_IMAGE_CREATE_EXTENDED_USAGE_BIT ||
+             (1u << bit) == VK_IMAGE_CREATE_ALIAS_BIT ||
              (is_depth && (1u << bit) ==
                           VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT)));
+   }
+   {
+      VkImageCreateInfo i = base;
+      i.flags = VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+      CHECK(ELIGIBLE(i));
+      i.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+      CHECK(!ELIGIBLE(i));
    }
 
    /* Geometry. */
