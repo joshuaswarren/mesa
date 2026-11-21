@@ -141,6 +141,7 @@ hk_gen1_render_ray_query_stages(struct hk_device *dev, const struct hk_cs *cs,
 
 static void
 asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
+                       bool no_query_access,
                        struct drm_asahi_cmd_compute *cmd)
 {
    /* A linked stream leaves its root through a link record, so the root
@@ -150,7 +151,7 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
 
    *cmd = (struct drm_asahi_cmd_compute){
       .flags = (cs->m5_matrix_ops ? DRM_ASAHI_COMPUTE_USES_MATRIX : 0) |
-               (!cs->query_access &&
+               (no_query_access &&
                       (dev->dev.params.features &
                        DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
                    ? DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS
@@ -175,6 +176,21 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
       cmd->helper.cfg = cs->scratch.cs.preamble ? (1 << 16) : 0;
       cmd->helper.binary = agx_helper_program(&dev->bg_eot);
    }
+}
+
+/* Fill a compute command of the submission at queue->drm.timeline_value and
+ * record the timestamps the kernel will publish for it. NO_QUERY_ACCESS is
+ * decided by the query words the stream touches, against the stamps still
+ * pending on the device (renders and compute commands earlier in this
+ * submission included), not by query_access. */
+static void
+hk_queue_fill_cdm_command(struct hk_device *dev, struct hk_queue *queue,
+                          struct hk_cs *cs, struct drm_asahi_cmd_compute *cmd)
+{
+   const uint64_t point = queue->drm.timeline_value;
+   asahi_fill_cdm_command(dev, cs,
+                          !hk_query_stamps_conflict(dev, queue, point, cs), cmd);
+   hk_query_stamps_note_cs(dev, queue, point, cs);
 }
 
 /* Neither attachment storage nor empty-tile operations may observe the
@@ -2001,7 +2017,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                                          cs->compute_resources.size);
             }
             struct drm_asahi_cmd_compute_with_prior cmd = {0};
-            asahi_fill_cdm_command(dev, cs, &cmd.legacy);
+            hk_queue_fill_cdm_command(dev, queue, cs, &cmd.legacy);
             cmd.legacy.flags |= hk_as_build_flags(dev->dev.chip,
                                                   dev->dev.params.features,
                                                   cs->as_build);
@@ -2102,6 +2118,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             }
             struct drm_asahi_cmd_render_with_prior cmd = {0};
             asahi_fill_vdm_command(dev, cs, &cmd.legacy);
+            hk_query_stamps_note_cs(dev, queue, queue->drm.timeline_value, cs);
 
             /* M5: the vertex half's own render and compute prefixes, when
              * they are narrower than the whole render's, so its tiling can
@@ -3079,6 +3096,7 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
 {
    /* Stop/join the submit worker before releasing anything it can use. */
    vk_queue_finish(&queue->vk);
+   hk_query_stamps_clear_queue(dev, queue);
    hk_cmd_pending_finish_queue(dev, queue);
    drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);
    if (queue->drm.id != UINT32_MAX)

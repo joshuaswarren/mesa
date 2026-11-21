@@ -572,6 +572,64 @@ test_stamp_chips(void)
      !hk_oq_render_stamps_supported(AGX_CHIP_G16G));
 }
 
+static void
+test_join_moves_query_access_ranges(void)
+{
+   /* Reverse join (hk_oq_joins path): earlier free render's store joins into
+    * later full render's movable stream, preserving moved imm_write_query_ranges. */
+   test_chip = AGX_CHIP_G17P;
+   struct hk_cmd_buffer *c = new_cmd();
+   struct hk_cs *r0 = add(c, false);
+   struct hk_cs *p0 = add_post(c, r0, 1, 1);
+   hk_cs_note_imm_write_query_range(p0, 42, 64, 8);
+   struct hk_cs *r1 = add(c, false);
+   fill_slots(r1, 200);
+   struct hk_cs *p1 = add_post(c, r1, 1, 2);
+   hk_cs_note_imm_write_query_range(p1, 42, 128, 8);
+   T("join-rev-free: fixtures defer", deferred(c, p0) && deferred(c, p1));
+   hk_resolve_deferred_oq_available(c);
+   bool found_moved = false, found_local = false;
+   if (ndispatched == 1 && dispatched[0].cs == p1) {
+      util_dynarray_foreach(&p1->imm_write_query_ranges,
+                            struct hk_query_access_range, r) {
+         if (r->handle == 42 && r->start_B == 64 && r->end_B == 72)
+            found_moved = true;
+         if (r->handle == 42 && r->start_B == 128 && r->end_B == 136)
+            found_local = true;
+      }
+   }
+   T("join-rev-free: moved store query range survives on destination stream",
+     ndispatched == 1 && dispatched[0].cs == p1 && found_moved && found_local);
+
+   /* Reverse join (both full renders): earlier stream joins later movable one
+    * and propagates imm_write_query_untracked. */
+   c = new_cmd();
+   r0 = add(c, false);
+   fill_slots(r0, 100);
+   p0 = add_post(c, r0, 1, 1);
+   hk_cs_note_imm_write_query_range(p0, 55, 256, 8);
+   p0->imm_write_query_untracked = true;
+   r1 = add(c, false);
+   fill_slots(r1, 200);
+   p1 = add_post(c, r1, 1, 2);
+   hk_cs_note_imm_write_query_range(p1, 55, 512, 8);
+   T("join-rev-full: fixtures defer", deferred(c, p0) && deferred(c, p1));
+   hk_resolve_deferred_oq_available(c);
+   found_moved = found_local = false;
+   if (ndispatched == 1 && dispatched[0].cs == p1) {
+      util_dynarray_foreach(&p1->imm_write_query_ranges,
+                            struct hk_query_access_range, r) {
+         if (r->handle == 55 && r->start_B == 256 && r->end_B == 264)
+            found_moved = true;
+         if (r->handle == 55 && r->start_B == 512 && r->end_B == 520)
+            found_local = true;
+      }
+   }
+   T("join-rev-full: moved store query range and untracked flag survive",
+     ndispatched == 1 && dispatched[0].cs == p1 && found_moved && found_local &&
+        p1->imm_write_query_untracked);
+}
+
 int
 main(void)
 {
@@ -583,6 +641,7 @@ main(void)
    test_order();
    test_order_forward();
    test_stamp_chips();
+   test_join_moves_query_access_ranges();
    ralloc_free(test_context);
    printf("%u tests, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

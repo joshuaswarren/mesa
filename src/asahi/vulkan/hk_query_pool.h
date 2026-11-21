@@ -45,6 +45,8 @@ struct hk_query_pool {
 };
 
 struct hk_cmd_buffer;
+struct hk_cs;
+struct hk_device;
 struct hk_queue;
 
 struct hk_oq_end {
@@ -55,6 +57,15 @@ struct hk_oq_end {
 /* Record the queue timeline point that the submission of cmd signals. */
 void hk_query_note_submit(struct hk_cmd_buffer *cmd, struct hk_queue *queue,
                           uint64_t point);
+
+void hk_query_stamps_init(struct hk_device *dev);
+void hk_query_stamps_finish(struct hk_device *dev);
+void hk_query_stamps_unbind(struct hk_device *dev, uint32_t handle);
+void hk_query_stamps_clear_queue(struct hk_device *dev, struct hk_queue *queue);
+bool hk_query_stamps_conflict(struct hk_device *dev, struct hk_queue *queue,
+                              uint64_t current_point, const struct hk_cs *cs);
+void hk_query_stamps_note_cs(struct hk_device *dev, struct hk_queue *queue,
+                             uint64_t point, const struct hk_cs *cs);
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_query_pool, vk.base, VkQueryPool,
                                VK_OBJECT_TYPE_QUERY_POOL)
