@@ -3017,6 +3017,21 @@ ra_file_alignment(agx_context *ctx)
    return alignment;
 }
 
+/* AGX2 declares a register count with every program, and the hardware splits
+ * its register file statically: how many threads fit follows from that count
+ * (agx_occupancy_for_register_count). The AGX3B and AGX3C encodings declare no
+ * register count, in the program or its launch; their on-chip storage is
+ * allocated as threads use it. Spending registers there costs no fixed
+ * occupancy step, so the budget is the register file alone. AGX3D programs
+ * declare their register count per dispatch again (registers_16 in the G18
+ * dispatch and render resources) and keep the split.
+ */
+static bool
+agx_has_static_register_split(const agx_context *ctx)
+{
+   return !agx_isa_is_agx3(ctx->key->dev.encoding) || ctx->key->dev.emit_agx3d;
+}
+
 static void
 agx_ra_impl(agx_context *ctx, bool disable_remat)
 {
@@ -3044,10 +3059,14 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    /* Determine maximum possible registers. We won't exceed this! */
    unsigned max_possible_regs = AGX_NUM_REGS;
 
-   /* Compute shaders need to have their entire workgroup together, so our
-    * register usage is bounded by the workgroup size.
+   /* Compute shaders need to have their entire workgroup together, so with a
+    * static register split our register usage is bounded by the workgroup
+    * size. Without one, a 1024-thread workgroup using the whole file runs
+    * correctly, with its barriers, and faster than one spilling to fit an
+    * occupancy step.
     */
-   if (mesa_shader_stage_is_compute(ctx->stage)) {
+   if (mesa_shader_stage_is_compute(ctx->stage) &&
+       agx_has_static_register_split(ctx)) {
       unsigned threads_per_workgroup;
 
       /* If we don't know the workgroup size, worst case it. TODO: Optimize
@@ -3202,8 +3221,10 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
    /* If we need multiple waves, see if we can rematerialize constants to save
     * waves. If we only have a single wave regardless, this is pointless.
+    * Without a static register split there is no wave to save.
     */
-   if (!disable_remat && effective_demand > agx_round_registers(1) && !spilling) {
+   if (!disable_remat && agx_has_static_register_split(ctx) &&
+       effective_demand > agx_round_registers(1) && !spilling) {
       unsigned effective_demand_remat = agx_calc_register_demand(ctx, true);
 
       /* Worst-case assume we need 6 16-bit registers for constants, for a
