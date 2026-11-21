@@ -203,8 +203,10 @@ struct agx_device {
     * creates, in ms; 0 keeps the kernel's default. Sent only to a kernel with
     * DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT. */
    uint32_t compute_timeout_ms;
-   /* AGX_DBG_1QUEUE: render SCS layouts the shared queue was created with. */
+   /* AGX_DBG_1QUEUE: render SCS layouts and creation flags the shared queue
+    * was created with. */
    uint64_t queue_layouts[2];
+   uint32_t queue_flags;
    enum drm_asahi_priority queue_priority;
 
    /* VMA heaps */
@@ -573,6 +575,14 @@ uint32_t agx_create_command_queue(struct agx_device *dev,
                                   enum drm_asahi_priority priority);
 uint32_t agx_create_command_queue_with_render_scs(struct agx_device *dev,
    enum drm_asahi_priority priority, const uint64_t layouts[2]);
+/* As agx_create_command_queue(), but submissions with output syncs may return
+ * before they retire where the kernel offers that
+ * (DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT); *async says whether the queue does.
+ * The caller waits for those outputs before it reads anything the
+ * submissions write. */
+uint32_t agx_create_async_command_queue(struct agx_device *dev,
+                                        enum drm_asahi_priority priority,
+                                        bool *async);
 int agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id);
 bool agx_probe_high_priority(struct agx_device *dev);
 bool agx_device_vm_failed(struct agx_device *dev);

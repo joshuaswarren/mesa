@@ -1977,11 +1977,15 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          const bool g18g = dev->chip == AGX_CHIP_G18G;
          /* Wait through the kernel's normal input-fence path before reading
           * indirect counts, even if the first or every dispatch is empty.
-          * This submission has no output fence and touches no GPU queue. */
+          * This submission has no output fence and touches no GPU queue.
+          * On an async queue, issue it even without input syncs: an earlier
+          * batch of this context may still be writing the counts, and the
+          * kernel returns from a submission without output syncs only once
+          * every earlier submission of the queue has retired. */
          bool has_indirect = false;
          for (unsigned i = 0; g18g && i < cdm_dispatch_count; ++i)
             has_indirect |= cdm_dispatch[i].trace_mode != AGX_CDM_MODE_DIRECT;
-         if (has_indirect && in_sync_count) {
+         if (has_indirect && (in_sync_count || ctx->async_submit)) {
             struct drm_asahi_submit wait = {
                .queue_id = ctx->queue_id,
                .in_sync_count = in_sync_count,

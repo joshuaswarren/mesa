@@ -952,6 +952,9 @@ struct agx_context {
 
    /* Queue handle */
    uint32_t queue_id, virt_ring_idx;
+   /* The queue returns from a submission with output syncs before it retires
+    * (DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT). */
+   bool async_submit;
 
    struct agx_batch *batch;
    struct agx_bo *timestamps;
