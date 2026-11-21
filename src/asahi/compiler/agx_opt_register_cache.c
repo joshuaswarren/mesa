@@ -369,15 +369,17 @@ writes_reg(const agx_instr *I, unsigned reg)
    return false;
 }
 
-/* Last-use hints in divergent control flow, from physical liveness. They
- * are an AGX3 instruction-set feature: AGX3 releases a register at a source
- * marked as its last use, for the whole SIMD-group. AGX2's hint is a
- * register-cache discard only and keeps the old rule.
+/* Last-use hints in divergent control flow, from physical liveness. On AGX3B
+ * and AGX3C (Dynamic Caching, no declared register count), a source marked
+ * as its last use releases the register for the whole SIMD-group. AGX2's
+ * hint is a register-cache discard only, and AGX3D declares its register
+ * count per dispatch again and has no hardware verification row yet; both
+ * keep the old rule in divergent blocks.
  */
 static bool
 agx_divergent_last_use(const agx_context *ctx)
 {
-   return agx_isa_is_agx3(ctx->key->dev.encoding);
+   return agx_isa_is_agx3(ctx->key->dev.encoding) && !ctx->key->dev.emit_agx3d;
 }
 
 /*

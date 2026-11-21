@@ -214,22 +214,26 @@ TEST(DivergentLastUse, ReuseNoMaskedThreadNeedsIsMarked)
    EXPECT_TRUE(u_read->src[0].discard);
 }
 
-/* The rule follows the instruction set: both AGX3 encodings mark the last use
- * of ReuseNoMaskedThreadNeedsIsMarked, and AGX2, whose hint only discards the
- * register-cache copy, keeps no hints in divergent control flow. */
+/* The rule follows the instruction set: AGX3B and AGX3C (Dynamic Caching) mark
+ * the last use of ReuseNoMaskedThreadNeedsIsMarked, while AGX2 (register-cache
+ * discard only) and AGX3D (static register count, unverified) keep no hints in
+ * divergent control flow. */
 TEST(DivergentLastUse, FollowsTheInstructionSet)
 {
    const struct {
       enum agx_isa_encoding encoding;
+      bool emit_agx3d;
       bool marked;
    } cases[] = {
-      {AGX_ISA_ENCODING_AGX3B, true},
-      {AGX_ISA_ENCODING_AGX3C, true},
-      {AGX_ISA_ENCODING_AGX2, false},
+      {AGX_ISA_ENCODING_AGX3B, false, true},
+      {AGX_ISA_ENCODING_AGX3C, false, true},
+      {AGX_ISA_ENCODING_AGX3C, true, false},
+      {AGX_ISA_ENCODING_AGX2, false, false},
    };
 
    for (const auto &c : cases) {
       Shader s(c.encoding);
+      s.key.dev.emit_agx3d = c.emit_agx3d;
       agx_builder *b = s.b;
       agx_block *entry = agx_start_block(b->shader);
       agx_block *then_ = agx_test_block(b->shader);
@@ -255,7 +259,8 @@ TEST(DivergentLastUse, FollowsTheInstructionSet)
 
       agx_opt_register_cache(b->shader);
 
-      EXPECT_EQ(u_read->src[0].discard, c.marked) << "encoding " << c.encoding;
+      EXPECT_EQ(u_read->src[0].discard, c.marked)
+         << "encoding " << c.encoding << " emit_agx3d " << c.emit_agx3d;
    }
 }
 
