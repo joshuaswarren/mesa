@@ -122,6 +122,10 @@ bool agx_nir_lower_texture(struct nir_shader *s);
  * read the word from the PBE's last eight bytes, where Gallium keeps it.
  * Texel-buffer atomics are not affected. */
 #define AGX_NIR_TEXTURE_IMAGE_SIDEBAND (1u << 9)
+/* Answer a constant level-zero size query of a non-array 2D view from the
+ * extent the driver keeps in the descriptor's last word
+ * (AGX_GEN10_IMAGE_EXTENT_OFFSET, agx_chip_texture_descriptor_spare_word). */
+#define AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT (1u << 11)
 bool agx_nir_lower_texture_for_generation(struct nir_shader *s, unsigned generation);
 /* robust_formatless_images: formatless image loads have not been lowered for
  * view-bounds robustness and require it. */
