@@ -636,25 +636,37 @@ lower_to_gs_rast(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 }
 
-/* Remove an atomic whose result is unused and, with data, an API store or
- * image store. */
 static bool
-strip_api_side_effect(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+is_api_atomic_intrinsic(nir_intrinsic_op op)
 {
-   switch (intr->intrinsic) {
+   switch (op) {
    case nir_intrinsic_global_atomic:
    case nir_intrinsic_global_atomic_swap:
    case nir_intrinsic_image_atomic:
    case nir_intrinsic_image_atomic_swap:
    case nir_intrinsic_bindless_image_atomic:
    case nir_intrinsic_bindless_image_atomic_swap:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Remove an atomic whose result is unused and, with data, an API store or
+ * image store. */
+static bool
+strip_api_side_effect(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (is_api_atomic_intrinsic(intr->intrinsic)) {
       if (list_is_empty(&intr->def.uses)) {
          nir_instr_remove(&intr->instr);
          return true;
       }
 
       return false;
+   }
 
+   switch (intr->intrinsic) {
    case nir_intrinsic_store_global:
    case nir_intrinsic_image_store:
    case nir_intrinsic_bindless_image_store:
@@ -669,6 +681,29 @@ strip_api_side_effect(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    default:
       return false;
    }
+}
+
+static bool
+shader_has_api_atomic(const nir_shader *s)
+{
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             is_api_atomic_intrinsic(nir_instr_as_intrinsic(instr)->intrinsic))
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+strip_fence_mem_to_tex(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_fence_mem_to_tex_agx)
+      return false;
+
+   nir_instr_remove(&intr->instr);
+   return true;
 }
 
 /*
@@ -691,6 +726,10 @@ strip_api_side_effects(nir_shader *s, poly_nir_remove_dead_fn remove_dead,
       progress = false;
       NIR_PASS(progress, s, nir_shader_intrinsics_pass, strip_api_side_effect,
                nir_metadata_control_flow, (void *)true);
+      if (!shader_has_api_atomic(s)) {
+         NIR_PASS(progress, s, nir_shader_intrinsics_pass,
+                  strip_fence_mem_to_tex, nir_metadata_control_flow, NULL);
+      }
       NIR_PASS(progress, s, nir_opt_dce);
       NIR_PASS(progress, s, nir_opt_dead_cf_with_options,
                eliminate_local_ray_queries);
@@ -1327,12 +1366,291 @@ gs_api_primitive_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+static void
+opt_lowered_gs(nir_shader *gs, bool eliminate_local_ray_queries)
+{
+   bool progress = false;
+   do {
+      progress = false;
+      NIR_PASS(progress, gs, nir_lower_var_copies);
+      NIR_PASS(progress, gs, nir_lower_variable_initializers,
+               nir_var_shader_temp);
+      NIR_PASS(progress, gs, nir_lower_vars_to_ssa);
+      NIR_PASS(progress, gs, nir_opt_copy_prop);
+      NIR_PASS(progress, gs, nir_opt_constant_folding);
+      NIR_PASS(progress, gs, nir_opt_algebraic);
+      NIR_PASS(progress, gs, nir_opt_cse);
+      NIR_PASS(progress, gs, nir_opt_dead_cf_with_options,
+               eliminate_local_ray_queries);
+      NIR_PASS(progress, gs, nir_opt_dce);
+
+      /* Unrolling lets us statically determine counts more often, which
+       * otherwise would not be possible with multiple invocations even in the
+       * simplest of cases.
+       */
+      NIR_PASS(progress, gs, nir_opt_loop_unroll);
+   } while (progress);
+}
+
+static bool
+has_api_side_effect(const nir_shader *s)
+{
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (is_api_atomic_intrinsic(intr->intrinsic))
+            return true;
+         switch (intr->intrinsic) {
+         case nir_intrinsic_store_global:
+         case nir_intrinsic_store_ssbo:
+         case nir_intrinsic_ssbo_atomic:
+         case nir_intrinsic_ssbo_atomic_swap:
+         case nir_intrinsic_image_store:
+         case nir_intrinsic_bindless_image_store:
+         case nir_intrinsic_image_deref_store:
+         case nir_intrinsic_image_deref_atomic:
+         case nir_intrinsic_image_deref_atomic_swap:
+         case nir_intrinsic_fence_pbe_to_tex_agx:
+         case nir_intrinsic_fence_mem_to_tex_agx:
+            return true;
+         case nir_intrinsic_store_deref:
+         case nir_intrinsic_deref_atomic:
+         case nir_intrinsic_deref_atomic_swap:
+            if (nir_deref_mode_may_be(
+                   nir_src_as_deref(intr->src[0]),
+                   nir_var_mem_ssbo | nir_var_mem_global | nir_var_image))
+               return true;
+            break;
+         default:
+            break;
+         }
+      }
+   }
+   return false;
+}
+
+/*
+ * Recognize a load_global_constant emitted by Poly's own gs_api_primitive_id()
+ * or lower_gs_inputs(): either a direct field load from the vertex/geometry
+ * parameter buffer, or a per-vertex input load from
+ * poly_vertex_params::output_buffer. Application shaders cannot reference
+ * those internal Poly parameter buffers, so any other load_global_constant is
+ * conservatively treated as an application read (such as a lowered UBO) that
+ * could alias main's writes.
+ */
+static bool
+is_poly_param_buffer_addr(const nir_def *def, unsigned depth,
+                          bool require_vertex_param, uint64_t *const_offset)
+{
+   if (depth > 8)
+      return false;
+
+   if (nir_def_is_intrinsic(def)) {
+      const nir_intrinsic_instr *intr = nir_def_as_intrinsic(def);
+      if (intr->intrinsic == nir_intrinsic_load_vertex_param_buffer_poly ||
+          (!require_vertex_param &&
+           intr->intrinsic == nir_intrinsic_load_geometry_param_buffer_poly)) {
+         *const_offset = 0;
+         return true;
+      }
+      return false;
+   }
+
+   if (nir_def_is_alu(def)) {
+      const nir_alu_instr *alu = nir_def_as_alu(def);
+      if (alu->op == nir_op_iadd) {
+         for (unsigned i = 0; i < 2; ++i) {
+            if (nir_src_is_const(alu->src[1 - i].src)) {
+               uint64_t sub_off = 0;
+               if (is_poly_param_buffer_addr(alu->src[i].src.ssa, depth + 1,
+                                             require_vertex_param, &sub_off)) {
+                  *const_offset =
+                     sub_off + nir_src_comp_as_uint(alu->src[1 - i].src,
+                                                    alu->src[1 - i].swizzle[0]);
+                  return true;
+               }
+            }
+         }
+      }
+   }
+
+   return false;
+}
+
+static bool
+is_poly_vertex_output_buffer_addr(const nir_def *def, unsigned depth)
+{
+   if (depth > 8)
+      return false;
+
+   if (nir_def_is_intrinsic(def)) {
+      const nir_intrinsic_instr *intr = nir_def_as_intrinsic(def);
+      if (intr->intrinsic != nir_intrinsic_load_global_constant)
+         return false;
+      uint64_t off = 0;
+      return is_poly_param_buffer_addr(intr->src[0].ssa, 0, true, &off) &&
+             off == offsetof(struct poly_vertex_params, output_buffer);
+   }
+
+   if (nir_def_is_alu(def)) {
+      const nir_alu_instr *alu = nir_def_as_alu(def);
+      if (alu->op == nir_op_iadd) {
+         return is_poly_vertex_output_buffer_addr(alu->src[0].src.ssa,
+                                                  depth + 1) ||
+                is_poly_vertex_output_buffer_addr(alu->src[1].src.ssa,
+                                                  depth + 1);
+      }
+   }
+
+   return false;
+}
+
+static bool
+is_poly_private_constant_load(const nir_intrinsic_instr *intr)
+{
+   if (intr->intrinsic != nir_intrinsic_load_global_constant)
+      return false;
+
+   uint64_t off = 0;
+   if (is_poly_param_buffer_addr(intr->src[0].ssa, 0, false, &off))
+      return true;
+
+   return is_poly_vertex_output_buffer_addr(intr->src[0].ssa, 0);
+}
+
+/*
+ * Conservatively detect any instruction left in replay that could observe
+ * memory written by main, disagree when re-executed in the raster vertex
+ * subgroup/clock context instead of main's compute dispatch, or keep a
+ * memory-barrier loop alive in replay. Only Poly's own parameter and vertex
+ * input loads (is_poly_private_constant_load) are exempt; any other global,
+ * UBO, SSBO, image, or texture load (including load_global_constant from
+ * lowered UBOs or RGB32 buffer fetches) is treated as potentially aliasing
+ * main's writes.
+ */
+static bool
+replay_blocks_main_side_effects(const nir_shader *s)
+{
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_tex)
+            return true;
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (nir_intrinsic_infos[intr->intrinsic].flags &
+             (NIR_INTRINSIC_SUBGROUP | NIR_INTRINSIC_QUADGROUP))
+            return true;
+         switch (intr->intrinsic) {
+         case nir_intrinsic_load_global_constant:
+            if (!is_poly_private_constant_load(intr))
+               return true;
+            break;
+         case nir_intrinsic_load_global:
+         case nir_intrinsic_load_global_bounded:
+         case nir_intrinsic_load_global_offset:
+         case nir_intrinsic_load_global_2x32:
+         case nir_intrinsic_load_global_constant_bounded:
+         case nir_intrinsic_load_global_constant_offset:
+         case nir_intrinsic_load_global_predicated_agx:
+         case nir_intrinsic_load_ubo:
+         case nir_intrinsic_load_ubo_vec4:
+         case nir_intrinsic_load_ssbo:
+         case nir_intrinsic_image_load:
+         case nir_intrinsic_bindless_image_load:
+         case nir_intrinsic_image_deref_load:
+         case nir_intrinsic_image_sparse_load:
+         case nir_intrinsic_bindless_image_sparse_load:
+         case nir_intrinsic_image_deref_sparse_load:
+         case nir_intrinsic_image_samples_identical:
+         case nir_intrinsic_bindless_image_samples_identical:
+         case nir_intrinsic_image_deref_samples_identical:
+         case nir_intrinsic_barrier:
+         case nir_intrinsic_shader_clock:
+         case nir_intrinsic_load_subgroup_size:
+         case nir_intrinsic_load_subgroup_invocation:
+         case nir_intrinsic_load_subgroup_id:
+         case nir_intrinsic_load_num_subgroups:
+         case nir_intrinsic_load_subgroup_eq_mask:
+         case nir_intrinsic_load_subgroup_ge_mask:
+         case nir_intrinsic_load_subgroup_gt_mask:
+         case nir_intrinsic_load_subgroup_le_mask:
+         case nir_intrinsic_load_subgroup_lt_mask:
+         case nir_intrinsic_load_active_subgroup_count_agx:
+         case nir_intrinsic_load_active_subgroup_invocation_agx:
+         case nir_intrinsic_quad_ballot_agx:
+         case nir_intrinsic_inverse_ballot:
+         case nir_intrinsic_ballot_bit_count_exclusive:
+         case nir_intrinsic_ballot_bit_count_inclusive:
+            return true;
+         case nir_intrinsic_load_deref:
+            if (nir_deref_mode_may_be(
+                   nir_src_as_deref(intr->src[0]),
+                   nir_var_mem_ubo | nir_var_mem_ssbo | nir_var_mem_global |
+                      nir_var_image))
+               return true;
+            break;
+         default:
+            break;
+         }
+      }
+   }
+   return false;
+}
+
+static bool
+shader_has_ray_query(const nir_shader *s)
+{
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_intrinsic_is_ray_query(nir_instr_as_intrinsic(instr)->intrinsic))
+            return true;
+      }
+   }
+   return false;
+}
+
+/*
+ * Decide whether POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT can safely execute
+ * all API stores and atomics in the main kernel and drop them from count/rast.
+ * Require that (1) the shader actually has API side effects and no unlowered
+ * native ray queries (so native ray queries stay on replay rather than moving
+ * into a potentially indirect main compute dispatch), (2) replay drops every
+ * single API store, atomic, and fence (so nothing is duplicated, lost on
+ * 0-vertex emission, or reordered between main and rast), and (3) replay retains
+ * no application memory/UBO/image/texture read, barrier, subgroup operation, or
+ * shader clock. Runs on the post-lower_gs_inputs() shader so the probe follows
+ * the exact same lower_gs_intrinsics()/opt_lowered_gs()/strip_api_side_effects()
+ * sequence as the real raster variant.
+ */
+static bool
+can_use_main_side_effects(const nir_shader *gs,
+                          poly_nir_remove_dead_fn remove_dead,
+                          bool eliminate_local_ray_queries)
+{
+   if (!has_api_side_effect(gs) || shader_has_ray_query(gs))
+      return false;
+
+   nir_shader *probe = nir_shader_clone(NULL, gs);
+   NIR_PASS(_, probe, lower_gs_intrinsics, true);
+   opt_lowered_gs(probe, eliminate_local_ray_queries);
+   strip_api_side_effects(probe, remove_dead, eliminate_local_ray_queries);
+
+   bool safe = !has_api_side_effect(probe) &&
+               !replay_blocks_main_side_effects(probe);
+   ralloc_free(probe);
+   return safe;
+}
+
 bool
 poly_nir_lower_gs_with_options(nir_shader *gs, nir_shader **gs_count,
                                nir_shader **gs_copy, nir_shader **pre_gs,
                                struct poly_gs_info *info,
                                bool eliminate_local_ray_queries,
-                               bool main_side_effects,
+                               enum poly_gs_side_effects side_effects,
                                poly_nir_remove_dead_fn remove_dead)
 {
    /* Lower I/O as assumed by the rest of GS lowering */
@@ -1369,33 +1687,30 @@ poly_nir_lower_gs_with_options(nir_shader *gs, nir_shader **gs_count,
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_gs_inputs,
             nir_metadata_control_flow, NULL);
 
+   bool main_side_effects = false;
+   switch (side_effects) {
+   case POLY_GS_SIDE_EFFECTS_REPLAY:
+      main_side_effects = false;
+      break;
+   case POLY_GS_SIDE_EFFECTS_MAIN:
+      main_side_effects = true;
+      break;
+   case POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT:
+      main_side_effects = can_use_main_side_effects(
+         gs, remove_dead, eliminate_local_ray_queries);
+      break;
+   default:
+      UNREACHABLE("invalid side effects mode");
+   }
+
    /* Lower geometry shader writes to contain all of the required counts, so we
     * know where in the various buffers we should write vertices.
     */
    NIR_PASS(_, gs, lower_gs_intrinsics, main_side_effects);
 
    /* Clean up after all that lowering we did */
+   opt_lowered_gs(gs, eliminate_local_ray_queries);
    bool progress = false;
-   do {
-      progress = false;
-      NIR_PASS(progress, gs, nir_lower_var_copies);
-      NIR_PASS(progress, gs, nir_lower_variable_initializers,
-               nir_var_shader_temp);
-      NIR_PASS(progress, gs, nir_lower_vars_to_ssa);
-      NIR_PASS(progress, gs, nir_opt_copy_prop);
-      NIR_PASS(progress, gs, nir_opt_constant_folding);
-      NIR_PASS(progress, gs, nir_opt_algebraic);
-      NIR_PASS(progress, gs, nir_opt_cse);
-      NIR_PASS(progress, gs, nir_opt_dead_cf_with_options,
-               eliminate_local_ray_queries);
-      NIR_PASS(progress, gs, nir_opt_dce);
-
-      /* Unrolling lets us statically determine counts more often, which
-       * otherwise would not be possible with multiple invocations even in the
-       * simplest of cases.
-       */
-      NIR_PASS(progress, gs, nir_opt_loop_unroll);
-   } while (progress);
 
    /* If we know counts at compile-time we can simplify, so try to figure out
     * the counts statically.
@@ -1483,22 +1798,7 @@ poly_nir_lower_gs_with_options(nir_shader *gs, nir_shader **gs_count,
 
    /* Clean up after all that lowering we did */
    nir_lower_global_vars_to_local(gs);
-   do {
-      progress = false;
-      NIR_PASS(progress, gs, nir_lower_var_copies);
-      NIR_PASS(progress, gs, nir_lower_variable_initializers,
-               nir_var_shader_temp);
-      NIR_PASS(progress, gs, nir_lower_vars_to_ssa);
-      NIR_PASS(progress, gs, nir_opt_copy_prop);
-      NIR_PASS(progress, gs, nir_opt_constant_folding);
-      NIR_PASS(progress, gs, nir_opt_algebraic);
-      NIR_PASS(progress, gs, nir_opt_cse);
-      NIR_PASS(progress, gs, nir_opt_dead_cf_with_options,
-               eliminate_local_ray_queries);
-      NIR_PASS(progress, gs, nir_opt_dce);
-      NIR_PASS(progress, gs, nir_opt_loop_unroll);
-
-   } while (progress);
+   opt_lowered_gs(gs, eliminate_local_ray_queries);
 
    /* Strip remaining atomics, but not stores - since those are from us */
    if (!main_side_effects) {
@@ -1632,5 +1932,6 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
                   nir_shader **pre_gs, struct poly_gs_info *info)
 {
    return poly_nir_lower_gs_with_options(gs, gs_count, gs_copy, pre_gs, info,
-                                        false, false, NULL);
+                                         false, POLY_GS_SIDE_EFFECTS_REPLAY,
+                                         NULL);
 }

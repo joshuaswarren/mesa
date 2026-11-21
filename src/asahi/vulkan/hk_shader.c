@@ -7652,12 +7652,28 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       /* The raster replay is always a hardware vertex shader. */
       rq_layout.graphics_stage = dev->gen1_native_graphics_rq;
       /* On M5 the main kernel performs the invocation's API stores and
-       * atomics; the count and raster variants drop them. */
-      const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+       * atomics. On generations whose pre-raster CDM path can launch a
+       * MESA_SHADER_GEOMETRY main kernel (AGX2 via hk_dispatch_with_usc() and
+       * native AGX3 via hk_dispatch_g17p_native()), move side effects to main
+       * whenever replay is independent of them, keeping side-effect-only loops
+       * off the tiler. G18G's hk_dispatch_g17g_native() rejects non-compute
+       * stages and indirect grids, and hk_dispatch_with_usc_launch() rejects
+       * non-AGX2 command-stream generations, so those keep replay until they
+       * have a graphics-stage CDM launcher. */
+      const bool supports_gs_main_cdm =
+         agx_native_graphics(&dev->dev) ||
+         agx_chip_command_stream_generation(dev->dev.chip) ==
+            AGX_CS_GENERATION_AGX2;
+      const enum poly_gs_side_effects side_effects =
+         agx_chip_g17_m5(dev->dev.chip)
+            ? POLY_GS_SIDE_EFFECTS_MAIN
+            : (supports_gs_main_cdm
+                  ? POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT
+                  : POLY_GS_SIDE_EFFECTS_REPLAY);
       if (!hk_nir_lower_gs(nir, &count, &rast, &pre_gs,
                            &count_variant->info.gs,
-                           hk_native_rq_profile(dev) ? &rq_layout : NULL, m5,
-                           NULL)) {
+                           hk_native_rq_profile(dev) ? &rq_layout : NULL,
+                           side_effects, NULL)) {
          ralloc_free(nir);
          ralloc_free(count);
          ralloc_free(rast);
