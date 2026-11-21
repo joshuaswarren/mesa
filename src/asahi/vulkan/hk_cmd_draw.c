@@ -5053,8 +5053,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
          /* Resident targets retain compression. Only memory-backed targets
           * need their compressed contents converted before shader stores.
           */
-         if (agx_chip_g17p_or_m5(dev->dev.chip) &&
-             !render->tilebuffer.spilled[i])
+         if (!render->tilebuffer.spilled[i])
             continue;
 
          struct hk_image_view *view = render->color_att[i].iview;
@@ -5141,14 +5140,42 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                      return;
                   }
 
-                  struct libagx_decompress_images imgs;
-                  memcpy(&imgs.compressed, &view->planes[plane].emrt_texture,
-                         sizeof(imgs.compressed));
-                  memcpy(&imgs.uncompressed, &view->planes[plane].emrt_pbe,
-                         sizeof(imgs.uncompressed));
-                  libagx_decompress(cmd, grid, AGX_BARRIER_ALL | AGX_PREGFX,
-                                    layout, layer, level, base,
-                                    hk_pool_upload(cmd, &imgs, sizeof(imgs), 64));
+                  const VkAttachmentLoadOp load_op =
+                     pRenderingInfo->pColorAttachments[i].loadOp;
+                  const bool discard =
+                     !incomplete_render_area &&
+                     u_minify(image->vk.extent.width, level) ==
+                        render->cr.width &&
+                     u_minify(image->vk.extent.height, level) ==
+                        render->cr.height &&
+                     (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
+                      load_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
+                  if (discard) {
+                     const uint16_t width_tl =
+                        ail_metadata_width_tl(layout, level);
+                     const uint16_t height_tl =
+                        ail_metadata_height_tl(layout, level);
+                     const uint64_t metadata =
+                        base + layout->metadata_offset_B +
+                        layout->level_offsets_compressed_B[level] +
+                        (layer * layout->compression_layer_stride_B);
+                     libagx_reset_compression_metadata(
+                        cmd, agx_3d(width_tl, height_tl, layer_count),
+                        AGX_BARRIER_ALL | AGX_PREGFX, metadata,
+                        ail_tile_mode_uncompressed(layout->format),
+                        layout->compression_layer_stride_B / 8, width_tl,
+                        height_tl);
+                  } else {
+                     struct libagx_decompress_images imgs;
+                     memcpy(&imgs.compressed, &view->planes[plane].emrt_texture,
+                            sizeof(imgs.compressed));
+                     memcpy(&imgs.uncompressed, &view->planes[plane].emrt_pbe,
+                            sizeof(imgs.uncompressed));
+                     libagx_decompress(
+                        cmd, grid, AGX_BARRIER_ALL | AGX_PREGFX, layout, layer,
+                        level, base,
+                        hk_pool_upload(cmd, &imgs, sizeof(imgs), 64));
+                  }
                }
             }
          }

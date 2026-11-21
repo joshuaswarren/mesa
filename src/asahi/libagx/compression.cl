@@ -180,6 +180,31 @@ libagx_decompress(constant struct libagx_decompress_images *images,
                           memory_order_acq_rel, memory_scope_device);
 }
 
+/*
+ * Mark a compressed image's metadata tiles as uncompressed without reading or
+ * rewriting the body buffer. Used before a spilled render pass when the
+ * attachment's previous contents are discarded, avoiding compressed texture
+ * reads of stale or uninitialized metadata and redundant in-place body writes.
+ */
+KERNEL(32)
+libagx_reset_compression_metadata(global uint64_t *metadata,
+                                  uint64_t tile_uncompressed,
+                                  uint32_t metadata_layer_stride_tl,
+                                  uint16_t metadata_width_tl,
+                                  uint16_t metadata_height_tl)
+{
+   if (cl_global_id.x < metadata_width_tl &&
+       cl_global_id.y < metadata_height_tl) {
+      uint index_tl = index_metadata(cl_global_id, metadata_width_tl,
+                                     metadata_height_tl,
+                                     metadata_layer_stride_tl);
+      metadata[index_tl] = tile_uncompressed;
+   }
+
+   atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE | CLK_IMAGE_MEM_FENCE,
+                          memory_order_acq_rel, memory_scope_device);
+}
+
 static ushort2
 stretched_sa_to_px(ushort2 px, uint samples)
 {
