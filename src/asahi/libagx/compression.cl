@@ -124,7 +124,11 @@ libagx_decompress(constant struct libagx_decompress_images *images,
       }
    }
 
-   sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+   /* Wait for all compressed fetches across the tile before overwriting it
+    * in place. A subgroup barrier lowers to nothing on AGX2, allowing the
+    * first store to issue before pending texture scoreboards complete.
+    */
+   barrier(CLK_LOCAL_MEM_FENCE);
 
    /* Now that the whole tile is read, we write without racing. */
    for (uint i = 0; i < 8; ++i) {
@@ -156,10 +160,24 @@ libagx_decompress(constant struct libagx_decompress_images *images,
       }
    }
 
+   /* Drain the uncompressed PBE body stores before marking the tile
+    * uncompressed. On G13S, the dispatch-level AGX_BARRIER_ALL | AGX_PREGFX
+    * barrier alone did not order the final decompress dispatch's PBE body
+    * stores before the following render pass without an in-kernel PBE drain.
+    */
+   nir_fence_pbe_to_tex_agx();
+
    /* We've replaced the body buffer. Mark the tile as uncompressed. */
    if (cl_local_id.x == 0) {
       metadata[index_tl] = tile_uncompressed;
    }
+
+   /* Flush the metadata update and invalidate texture caches before the
+    * dispatch completes (the dispatch barrier orders visibility to the
+    * subsequent render pass).
+    */
+   atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE | CLK_IMAGE_MEM_FENCE,
+                          memory_order_acq_rel, memory_scope_device);
 }
 
 static ushort2
@@ -228,7 +246,7 @@ libagx_m5_decompress_rgba16f(global void *texture_heap,
                             (libagx_m5_recover_half(v.w) << 16));
    }
 
-   sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+   barrier(CLK_LOCAL_MEM_FENCE);
    for (uint i = 0; i < 8; i++) {
       const int4 sample_coord = (int4)(origin.x + lane.x + i,
                                        origin.y + lane.y, 0, 0);

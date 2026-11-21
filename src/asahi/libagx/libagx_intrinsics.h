@@ -16,6 +16,7 @@ uint32_t nir_load_helper_op_id_agx(void);
 uint32_t nir_load_helper_arg_lo_agx(void);
 uint32_t nir_load_helper_arg_hi_agx(void);
 void nir_fence_helper_exit_agx(void);
+void nir_fence_pbe_to_tex_agx(void);
 
 uint4 nir_bindless_image_load(uint handle, int4 coord, uint sample, uint lod,
                               uint image_dim, uint image_array, uint format,
