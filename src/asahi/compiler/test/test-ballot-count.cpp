@@ -17,7 +17,7 @@ TEST(BallotCount, PreserveMembershipAcrossDemoteOnM5)
       nir_store_global(&b, nir_isub(&b, before, after), nir_imm_int64(&b, 0x1000));
 
       if (m5)
-         agx_nir_lower_subgroups_m5(b.shader, true);
+         agx_nir_lower_subgroups_m5(b.shader, true, true);
       else
          agx_nir_lower_subgroups(b.shader);
       nir_opt_dce(b.shader);

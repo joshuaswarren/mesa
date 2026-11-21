@@ -23,6 +23,7 @@ struct agx_subgroup_lower_options {
    bool optimize_ballot_count;
    bool g17p_clustered_float;
    bool native_shuffle_xor;
+   bool m5_float_minmax;
 };
 
 /* M5 shuffles a 32-bit value across the subgroup by a constant lane XOR in
@@ -241,6 +242,19 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
       if (agx_options->g17p_clustered_float && cluster == 4 &&
           intr->def.bit_size == 32)
          return false;
+      /* M5's subgroup reduce takes float minimum and maximum: keep a
+       * reduction over whole subgroups (no cluster, or one of 32 or more)
+       * for it, in place of a shuffle tree of five shuffles and compares.
+       * It reduces the active lanes only. The tree it replaces is built
+       * from fmin/fmax with the builder's default float controls, which do
+       * not preserve signed zeros or NaNs, and the instruction matches
+       * it: NaN lanes are ignored unless every active lane is NaN, either
+       * zero may come back for a group with zeros of both signs, and
+       * denormals compare as zeros of their sign (the result may be a
+       * denormal operand). */
+      if (agx_options->m5_float_minmax && (cluster == 0 || cluster >= 32) &&
+          intr->intrinsic == nir_intrinsic_reduce && intr->def.bit_size == 32)
+         return false;
       return true;
 
    case nir_op_iadd:
@@ -309,13 +323,14 @@ agx_nir_flush_subgroup_minmax(nir_shader *s)
 
 static bool
 agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float,
-                                bool optimize_ballot_count,
-                                bool native_shuffle_xor)
+                                 bool optimize_ballot_count,
+                                 bool native_shuffle_xor, bool m5_float_minmax)
 {
    const struct agx_subgroup_lower_options agx_options = {
       .optimize_ballot_count = optimize_ballot_count,
       .g17p_clustered_float = g17p_clustered_float,
       .native_shuffle_xor = native_shuffle_xor,
+      .m5_float_minmax = m5_float_minmax,
    };
 
    /* First, do as much common lowering as we can */
@@ -349,21 +364,32 @@ agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float,
 bool
 agx_nir_lower_subgroups(nir_shader *s)
 {
-   return agx_nir_lower_subgroups_internal(s, false, true, false);
+   return agx_nir_lower_subgroups_internal(s, false, true, false, false);
 }
 
 bool
 agx_nir_lower_subgroups_g17p(nir_shader *s)
 {
-   return agx_nir_lower_subgroups_internal(s, true, false, false);
+   return agx_nir_lower_subgroups_internal(s, true, false, false, false);
 }
 
 bool
-agx_nir_lower_subgroups_m5(nir_shader *s, bool native_shuffle_xor)
+agx_nir_lower_subgroups_m5(nir_shader *s, bool native_shuffle_xor,
+                           bool native_float_minmax)
 {
+   const bool compute = s->info.stage == MESA_SHADER_COMPUTE;
+
+   /* The native float reduce does not flush denormal results, so it is not
+    * used when the shader asks for 32-bit denormals to be flushed: those
+    * reductions keep the tree, of values agx_nir_flush_subgroup_minmax()
+    * has flushed.
+    */
+   const bool ftz32 =
+      nir_is_denorm_flush_to_zero(s->info.float_controls_execution_mode, 32);
+
    return agx_nir_lower_subgroups_internal(
       s, false, s->info.stage != MESA_SHADER_FRAGMENT,
-      native_shuffle_xor && s->info.stage == MESA_SHADER_COMPUTE);
+      native_shuffle_xor && compute, native_float_minmax && compute && !ftz32);
 }
 
 static bool

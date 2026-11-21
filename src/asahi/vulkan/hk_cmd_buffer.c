@@ -4474,7 +4474,9 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    case AGX_CS_GENERATION_HAL200:
    case AGX_CS_GENERATION_HAL300: {
       struct agx_vdm_barrier_core barrier;
-      if (!agx_vdm_barrier_core_pack(dev->dev.chip, &barrier)) {
+      const bool admits_inval =
+         dev->dev.params.features & DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE;
+      if (!agx_vdm_barrier_core_pack(dev->dev.chip, admits_inval, &barrier)) {
          mesa_loge("no grounded AGX3 initial VDM barrier for %s",
                    agx_chip_name(dev->dev.chip));
          vk_command_buffer_set_error(&cmd->vk,

@@ -1234,6 +1234,11 @@ struct hk_cs {
     * accelerates queries. Implies CDM.
     */
    struct util_dynarray imm_writes;
+   /* Bound query-pool byte ranges (struct hk_query_access_range) written by
+    * imm_writes above, kept separate from oq_stamps so fallback availability
+    * stores and deferred occlusion joins preserve GPU query access tracking. */
+   struct util_dynarray imm_write_query_ranges;
+   bool imm_write_query_untracked;
 
    /* Native private-memory profiles for every dispatch in this stream. */
    struct util_dynarray compute_resources;
@@ -1291,6 +1296,15 @@ struct hk_cs {
 
    /* A query copy or reset was recorded into this stream. */
    bool query_access;
+
+   /* Query words in kernel-bound timestamp buffers this stream reads or
+    * writes (struct hk_query_access_range): copies, resets, availability
+    * stores, acceleration-structure properties and timestamp copies. These
+    * decide DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS (hk_query_stamps_conflict());
+    * query_access above does not. untracked: a word could not be recorded,
+    * so the flag is omitted. */
+   bool query_access_untracked;
+   struct util_dynarray query_access_ranges;
 
    /* The stream ends with a strong, memory-scoped flush
     * (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
@@ -1605,6 +1619,17 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
    a->stats.query_reset_queries += b->stats.query_reset_queries;
    a->stats.query_reset_flushes += b->stats.query_reset_flushes;
    a->query_access |= b->query_access;
+   a->query_access_untracked |= b->query_access_untracked;
+   if (b->query_access_ranges.size) {
+      if (!a->query_access_ranges.data)
+         a->query_access_ranges = UTIL_DYNARRAY_INIT;
+      void *dst = util_dynarray_grow_bytes(&a->query_access_ranges, 1,
+                                           b->query_access_ranges.size);
+      if (dst)
+         memcpy(dst, b->query_access_ranges.data, b->query_access_ranges.size);
+      else
+         a->query_access_untracked = true;
+   }
    assert(!a->query_reset_pending && !b->query_reset_pending);
 
    /* Frame anatomy: the merged command runs b's programs too. Without them
@@ -2485,6 +2510,97 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    gfx->descriptors.root_dirty = true;
 }
 
+struct hk_query_access_range {
+   uint32_t handle;
+   uint64_t start_B;
+   uint64_t end_B;
+};
+
+/* Record a bound query-pool byte range in ranges. Handle 0 (no kernel
+ * timestamp binding) and empty ranges have nothing the kernel publishes and
+ * record nothing; a range that cannot be recorded sets *untracked, which
+ * fails closed (no DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS). */
+static inline void
+hk_query_ranges_note(struct util_dynarray *ranges, bool *untracked,
+                     uint32_t handle, uint64_t start_B, uint64_t size_B)
+{
+   if (!handle || !size_B)
+      return;
+
+   if (size_B > UINT64_MAX - start_B) {
+      *untracked = true;
+      return;
+   }
+
+   if (!ranges->data)
+      *ranges = UTIL_DYNARRAY_INIT;
+
+   struct hk_query_access_range *slot =
+      util_dynarray_grow_bytes(ranges, 1, sizeof(*slot));
+   if (!slot) {
+      *untracked = true;
+      return;
+   }
+
+   *slot = (struct hk_query_access_range){
+      .handle = handle,
+      .start_B = start_B,
+      .end_B = start_B + size_B,
+   };
+}
+
+/* A query word this stream reads or writes. Only decides
+ * DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS; it does not set query_access, which
+ * records copies and resets alone. Recording paths use the hk_cmd_ forms
+ * below. */
+static inline void
+hk_cs_note_query_range(struct hk_cs *cs, uint32_t handle, uint64_t start_B,
+                       uint64_t size_B)
+{
+   if (cs)
+      hk_query_ranges_note(&cs->query_access_ranges,
+                           &cs->query_access_untracked, handle, start_B,
+                           size_B);
+}
+
+/* A query word written by a queued immediate write (imm_writes). Moves to
+ * query_access_ranges when the writes are dispatched. */
+static inline void
+hk_cs_note_imm_write_query_range(struct hk_cs *cs, uint32_t handle,
+                                 uint64_t start_B, uint64_t size_B)
+{
+   if (cs)
+      hk_query_ranges_note(&cs->imm_write_query_ranges,
+                           &cs->imm_write_query_untracked, handle, start_B,
+                           size_B);
+}
+
+/* Words are recorded only where the kernel accepts
+ * DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: elsewhere nothing reads them. */
+static inline bool
+hk_cmd_tracks_query_ranges(const struct hk_cmd_buffer *cmd)
+{
+   return hk_cmd_buffer_device(cmd)->dev.params.features &
+          DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+}
+
+static inline void
+hk_cmd_note_query_range(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                        uint32_t handle, uint64_t start_B, uint64_t size_B)
+{
+   if (hk_cmd_tracks_query_ranges(cmd))
+      hk_cs_note_query_range(cs, handle, start_B, size_B);
+}
+
+static inline void
+hk_cmd_note_imm_write_query_range(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                                  uint32_t handle, uint64_t start_B,
+                                  uint64_t size_B)
+{
+   if (hk_cmd_tracks_query_ranges(cmd))
+      hk_cs_note_imm_write_query_range(cs, handle, start_B, size_B);
+}
+
 static inline void
 hk_cs_destroy(struct hk_cs *cs)
 {
@@ -2495,7 +2611,9 @@ hk_cs_destroy(struct hk_cs *cs)
       util_dynarray_fini(&cs->depth_bias);
    } else {
       util_dynarray_fini(&cs->imm_writes);
+      util_dynarray_fini(&cs->imm_write_query_ranges);
       util_dynarray_fini(&cs->oq_stamps);
+      util_dynarray_fini(&cs->query_access_ranges);
    }
 
    free(cs);

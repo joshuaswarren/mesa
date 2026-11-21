@@ -454,6 +454,15 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT ((1ULL) << 38)
 
+/*
+ * DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE: the render-start VDM barrier at the
+ * root of a render's VDM stream may set the USC cache invalidate (bit 3).
+ * Reported on every GPU: the kernel's stream checks admit the barrier word
+ * with or without it. A feature bit like those of enum drm_asahi_feature,
+ * defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE ((1ULL) << 40)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR 3
@@ -2122,10 +2131,12 @@ enum drm_asahi_compute_flags {
 	DRM_ASAHI_COMPUTE_USES_MATRIX = (1L << 16),
 
 	/**
-	 * @DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: The command neither copies nor
-	 * resets queries, so it cannot observe timestamps the kernel publishes
-	 * for earlier commands and need not wait for that publication. Requires
-	 * DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS.
+	 * @DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: The command reads and writes no
+	 * timestamp or availability word whose host publication by the kernel
+	 * is still pending for an earlier command, so it need not wait for that
+	 * publication. The command may copy or reset queries whose words are
+	 * all already published, or were never bound for host timestamps.
+	 * Requires DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS.
 	 */
 	DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS = (1L << 17),
 

@@ -550,7 +550,7 @@ test_honeykrisp_bridge(void)
             UINT64_C(0xee12345000) + t * 4);
 
       struct agx_vdm_barrier_core barrier;
-      CHECK(agx_vdm_barrier_core_pack(chip, &barrier));
+      CHECK(agx_vdm_barrier_core_pack(chip, false, &barrier));
       uint8_t barrier_stream[AGX_VDM_BARRIER_CORE_LENGTH + 4];
       memcpy(barrier_stream, barrier.bytes, barrier.length);
       memset(barrier_stream + barrier.length, 0xa5, 4);

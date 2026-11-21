@@ -6,8 +6,10 @@
 #include "hk_pack.h"
 
 #include <string.h>
+#include <strings.h>
 
 #include "util/bitscan.h"
+#include "util/u_debug.h"
 #include "util/macros.h"
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
@@ -22,13 +24,17 @@
  *   application barrier or deferred clears at the end), and a packet's end
  *   can carry the memory-scoped one (hk_pack_runs()). This holds for every
  *   M5 part.
- * - HAL200 streams pack where the strong flush is the whole visibility
- *   record. G17P differs: its strong flush also has a memory-scoped form,
- *   which memory reached through a second address needs
- *   (hk_cdm_alias_scope()), and no boundary of this kind asks for it.
- * - G15 streams publish an in-stream dependency with the wide barrier
- *   (agx_chip_cdm_wide_visibility()), and AGX2 streams have neither terminate
- *   nor tail records this checks: neither has a boundary.
+ * - G16 (HAL200) streams pack where the strong flush is the whole visibility
+ *   record. G17P differs: its caches are tagged by virtual address and its
+ *   strong flush also has a memory-scoped form, which memory reached through
+ *   a second address needs (hk_cdm_alias_scope()); no boundary of this kind
+ *   asks for it. G17A, the other HAL200 part, sits between G17P and M5,
+ *   which both have that form; until its caches are known
+ *   (hk_cdm_caches_pending()) it has no boundary either.
+ * - G15: the boundary would be the wide barrier its in-stream dependencies
+ *   get (agx_chip_cdm_wide_visibility()), but packing there (the kernel's
+ *   command deadline, attachment limits) is not qualified. AGX2 streams have
+ *   neither the terminate nor the tail records this checks.
  */
 enum hk_pack_boundary
 hk_pack_boundary(const struct hk_device *dev)
@@ -42,10 +48,36 @@ hk_pack_boundary(const struct hk_device *dev)
    }
 
    if (agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_HAL200 &&
-       !hk_cdm_memory_scope_form(dev))
+       !hk_cdm_memory_scope_form(dev) && !hk_cdm_caches_pending(dev))
       return HK_PACK_BOUNDARY_STRONG_FLUSH;
 
    return HK_PACK_BOUNDARY_NONE;
+}
+
+bool
+hk_pack_admits_strong_tail(enum hk_pack_boundary boundary)
+{
+   return boundary != HK_PACK_BOUNDARY_NONE;
+}
+
+/* debug_parse_bool_option(), plus "on" and "off", which it does not know:
+ * HK_PACK_ATOMICS=off must not leave G16G's default on. */
+static bool
+hk_pack_parse_bool(const char *opt, bool dfault)
+{
+   if (!strcasecmp(opt, "off"))
+      return false;
+   if (!strcasecmp(opt, "on"))
+      return true;
+   return debug_parse_bool_option(opt, dfault);
+}
+
+bool
+hk_pack_atomics_choice(bool serial_kernel, const char *opt, unsigned queues)
+{
+   if (serial_kernel)
+      return opt ? hk_pack_parse_bool(opt, true) : true;
+   return opt && hk_pack_parse_bool(opt, false) && queues <= 1;
 }
 
 const struct hk_cs *
@@ -88,28 +120,28 @@ hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
    if (memcmp(end, terminate, AGX3_CDM_STREAM_TERMINATE_SIZE))
       return NULL;
 
-   if (boundary == HK_PACK_BOUNDARY_VISIBLE_COMPLETION) {
-      /* The stream ends with a strong flush: vkEndCommandBuffer upgraded a
-       * last launch's weak tail to the memory-scoped one; an application
-       * barrier at the end left one; or hk_flush_deferred_clears(), which
-       * vkEndCommandBuffer runs, left one after the clears, standing for
-       * the barriers recorded after them. The last two have memory scope
-       * only where memory may have a second address
-       * (hk_cdm_alias_scope()); while host_alias.dynamic decides that,
-       * vkEndCommandBuffer gives every stream with launches the
-       * memory-scoped end. Each is at least the dependency the application
-       * recorded across the boundary; the packet's end gets the memory
-       * scope (hk_pack_runs()), and this boundary exists only where the
-       * kernel accepts such a visible-completion command
-       * (hk_pack_boundary()). */
-      if (cs->strong_flush_end != end)
-         return NULL;
-   } else {
-      /* The stream ends with an ordering barrier or a strong flush, which a
-       * boundary upgrades in place (hk_cdm_visibility_flush()). */
-      if (cs->strong_flush_end != end && cs->weak_barrier_end != end)
-         return NULL;
-   }
+   /* The stream ends with a strong flush, at a boundary that admits one
+    * without memory scope (hk_pack_admits_strong_tail(), which the packing
+    * trace reports, so the two cannot disagree; every boundary does). At the
+    * visible-completion boundary the strong flush is a last launch's tail
+    * vkEndCommandBuffer upgraded to the memory-scoped one, an application
+    * barrier at the end, or the one hk_flush_deferred_clears() left after
+    * the clears, standing for the barriers recorded after them. The last two
+    * have memory scope only where memory may have a second address
+    * (hk_cdm_alias_scope()); while host_alias.dynamic decides that,
+    * vkEndCommandBuffer gives every stream with launches the memory-scoped
+    * end. Each is at least the dependency the application recorded across
+    * the boundary; the packet's end gets the memory scope (hk_pack_runs()),
+    * and this boundary exists only where the kernel accepts such a
+    * visible-completion command (hk_pack_boundary()). At the HAL200 boundary
+    * the stream may also end with an ordering barrier, which the boundary
+    * upgrades in place (hk_cdm_visibility_flush()). */
+   const bool strong_tail =
+      cs->strong_flush_end == end && hk_pack_admits_strong_tail(boundary);
+   const bool ordering_tail = boundary == HK_PACK_BOUNDARY_STRONG_FLUSH &&
+                              cs->weak_barrier_end == end;
+   if (!strong_tail && !ordering_tail)
+      return NULL;
 
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
       if (cs->sync.dep[sq].cut || cs->sync.dep_ta[sq].cut)
@@ -197,19 +229,20 @@ hk_pack_within_bounds(const struct hk_pack_member *m,
 }
 
 /*
- * A packet waits for everything any member waits for, and its members run
- * in order. For the compute subqueue that adds nothing: one queue runs its
- * compute commands in order (M5), or the kernel one command of the device at
- * a time (G16), so earlier members already followed what a later member
- * waits for. A render wait is different: a later member's wait on a render
- * would hold the earlier members back too. So every member must wait for no
- * render kind beyond those the first member waits for, counting the tails of
- * the members before it for the packet's kinds, which the packet waits for as
- * the separate commands would (hk_pack_fold_member()). Once the
- * render subqueue ran work, a member must not add synchronization kinds
- * either: the packet would take on the requirements carried in for them
- * from earlier command buffers. Otherwise the member starts a new packet.
- * This changes only how much is packed, never which waits are kept.
+ * A packet waits for everything any member waits for, and its members run in
+ * order. For the compute subqueue that adds nothing: one queue runs its
+ * compute commands in order (M5), and the G16 kernel every compute command of
+ * a VM in order on one firmware queue, so earlier members already followed
+ * what a later member waits for. A render wait is different: a later member's
+ * wait on a render would hold the earlier members back too. So every member
+ * must wait for no render kind beyond those the first member waits for,
+ * counting the tails of the members before it for the packet's kinds, which
+ * the packet waits for as the separate commands would
+ * (hk_pack_fold_member()). Once the render subqueue ran work, a member must
+ * not add synchronization kinds either: the packet would take on the
+ * requirements carried in for them from earlier command buffers. Otherwise
+ * the member starts a new packet. This changes only how much is packed, never
+ * which waits are kept.
  */
 unsigned
 hk_pack_plan(const struct hk_pack_member *members, unsigned n,
