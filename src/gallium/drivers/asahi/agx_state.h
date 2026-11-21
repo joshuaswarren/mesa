@@ -1340,6 +1340,11 @@ agx_buffer_range_in_resource(const struct pipe_resource *prsc, unsigned offset,
    return MIN2(size, prsc->width0 - offset);
 }
 
+bool agx_cpu_bind_constant_buffer(struct agx_context *ctx,
+                                  struct draw_context *draw,
+                                  mesa_shader_stage s, unsigned i,
+                                  struct pipe_transfer **transfer);
+
 bool agx_swtnl_lower_for_draw(nir_shader *nir);
 bool agx_m5_gpu_tess(struct agx_context *ctx);
 bool agx_swtnl_applies(struct agx_context *ctx);

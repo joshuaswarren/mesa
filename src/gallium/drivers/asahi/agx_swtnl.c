@@ -1931,11 +1931,13 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    uint8_t *ssbo_shadow[MESA_SHADER_FRAGMENT][PIPE_MAX_SHADER_BUFFERS] = {0};
    uint8_t *ssbo_mapped[MESA_SHADER_FRAGMENT][PIPE_MAX_SHADER_BUFFERS] = {0};
    unsigned ssbo_size[MESA_SHADER_FRAGMENT][PIPE_MAX_SHADER_BUFFERS] = {0};
+   unsigned cb_masks[MESA_SHADER_FRAGMENT] = {0};
    struct pipe_transfer *vb_transfers[PIPE_MAX_ATTRIBS] = {0};
    struct pipe_transfer *so_transfers[PIPE_MAX_SO_BUFFERS] = {0};
    struct pipe_transfer *ib_transfer = NULL;
    struct draw_so_target targets[PIPE_MAX_SO_BUFFERS];
    struct draw_so_target *target_ptrs[PIPE_MAX_SO_BUFFERS] = {0};
+   bool mapped = true;
 
    struct agx_uncompiled_shader *vs = ctx->stage[MESA_SHADER_VERTEX].shader;
    struct agx_uncompiled_shader *tcs = ctx->stage[MESA_SHADER_TESS_CTRL].shader;
@@ -2029,7 +2031,8 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       } else if (vb->buffer.resource) {
          ptr = map_buffer(ctx, vb->buffer.resource, PIPE_MAP_READ,
                           &vb_transfers[i]);
-         size = vb->buffer.resource->width0;
+         size = ptr ? vb->buffer.resource->width0 : 0;
+         mapped &= ptr != NULL;
       }
       draw_set_mapped_vertex_buffer(draw, i, ptr, size);
    }
@@ -2042,7 +2045,8 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       } else {
          indices = map_buffer(ctx, info->index.resource, PIPE_MAP_READ,
                               &ib_transfer);
-         available = info->index.resource->width0;
+         available = indices ? info->index.resource->width0 : 0;
+         mapped &= indices != NULL;
       }
       draw_set_indexes(draw, indices, info->index_size, available);
    }
@@ -2067,28 +2071,26 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       const int tgsi_idx = s == MESA_SHADER_VERTEX ? 0
                          : s == MESA_SHADER_GEOMETRY ? 1 : -1;
 
-      u_foreach_bit(i, stage->cb_mask) {
-         const struct pipe_constant_buffer *cb = &stage->cb[i];
-         const uint8_t *ptr = cb->user_buffer;
-
-         if (!ptr && cb->buffer) {
-            ptr = map_buffer(ctx, cb->buffer, PIPE_MAP_READ, &transfers[s][i]);
-            if (ptr)
-               ptr += cb->buffer_offset;
-         }
-         draw_set_mapped_constant_buffer(draw, s, i, ptr, cb->buffer_size);
+      cb_masks[s] = stage->cb_mask;
+      u_foreach_bit(i, cb_masks[s]) {
+         mapped &= agx_cpu_bind_constant_buffer(ctx, draw, s, i,
+                                                &transfers[s][i]);
       }
 
       /* Storage buffers: the executor's tessellation and geometry stages
        * read their inputs and write their results through them. */
       u_foreach_bit(i, stage->ssbo_mask) {
+         /* The range bound, clamped to the buffer by
+          * agx_set_shader_buffers(). */
          const struct pipe_shader_buffer *sb = &stage->ssbo[i];
+         const unsigned size = sb->buffer ? sb->buffer_size : 0;
          uint8_t *ptr = NULL;
 
-         if (sb->buffer) {
+         if (size) {
             ptr = (uint8_t *)map_buffer(ctx, sb->buffer,
                                         PIPE_MAP_READ | PIPE_MAP_WRITE,
                                         &ssbo_transfers[s][i]);
+            mapped &= ptr != NULL;
             if (ptr)
                ptr += sb->buffer_offset;
          }
@@ -2096,19 +2098,21 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
           * cacheable memory: on the write-combined BO mapping they raised
           * SIGBUS (GLES31 opaque_type_indexing.atomic_counter.*_geometry).
           * Run the stages on a shadow copy and write it back after. */
-         if (ptr && sb->buffer_size) {
-            ssbo_shadow[s][i] = malloc(sb->buffer_size);
+         if (ptr) {
+            ssbo_shadow[s][i] = malloc(size);
             if (ssbo_shadow[s][i]) {
-               memcpy(ssbo_shadow[s][i], ptr, sb->buffer_size);
+               memcpy(ssbo_shadow[s][i], ptr, size);
                ssbo_mapped[s][i] = ptr;
-               ssbo_size[s][i] = sb->buffer_size;
-               ptr = ssbo_shadow[s][i];
+               ssbo_size[s][i] = size;
+            } else {
+               mapped = false;
             }
+            ptr = ssbo_shadow[s][i];
          }
-         draw_set_mapped_shader_buffer(draw, s, i, ptr, sb->buffer_size);
+         draw_set_mapped_shader_buffer(draw, s, i, ptr, ptr ? size : 0);
          if (!draw->llvm && tgsi_idx >= 0) {
             r->tgsi_buffers[tgsi_idx].ptrs[i] = ptr;
-            r->tgsi_buffers[tgsi_idx].sizes[i] = ptr ? sb->buffer_size : 0;
+            r->tgsi_buffers[tgsi_idx].sizes[i] = ptr ? size : 0;
          }
       }
    }
@@ -2168,6 +2172,7 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
                                        &so_transfers[i]),
          .internal_offset = offset_B,
       };
+      mapped &= targets[i].mapping != NULL;
       atgt->stride = last->xfb_strides[i] * 4;
       target_ptrs[i] = &targets[i];
    }
@@ -2182,9 +2187,15 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    util_dynarray_clear(&r->acc_indices);
    r->acc_count = r->cur_base = 0;
 
-   draw_vbo(draw, info, 0, NULL, draw_info, 1, ctx->patch_vertices);
-   draw_flush(draw);
-   agx_swtnl_flush(r);
+   /* A buffer that could not be mapped leaves the draw out. */
+   if (mapped) {
+      draw_vbo(draw, info, 0, NULL, draw_info, 1, ctx->patch_vertices);
+      draw_flush(draw);
+      agx_swtnl_flush(r);
+   } else {
+      mesa_loge_once("asahi: CPU vertex stages: a buffer could not be "
+                     "mapped, draw skipped");
+   }
 
    for (unsigned i = 0; i < num_targets; ++i) {
       if (!target_ptrs[i])
@@ -2221,6 +2232,8 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    if (indices)
       draw_set_indexes(draw, NULL, 0, 0);
    for (unsigned s = 0; s < MESA_SHADER_FRAGMENT; ++s) {
+      u_foreach_bit(i, cb_masks[s])
+         draw_set_mapped_constant_buffer(draw, s, i, NULL, 0);
       for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; ++i) {
          if (transfers[s][i])
             pipe_buffer_unmap(&ctx->base, transfers[s][i]);
