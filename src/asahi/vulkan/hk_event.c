@@ -11,6 +11,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
+#include "vk_common_entrypoints.h"
 
 #define HK_EVENT_MEM_SIZE sizeof(VkResult)
 
@@ -207,8 +208,52 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
          cs = cmd->current_cs.cs ? cmd->current_cs.cs : cs;
          hk_sync_after_stream(cmd, cs, dst_kinds);
          hk_cmd_buffer_end_compute(cmd);
+         brl_sync_event_poll(cmd, cs);
       }
 
+      /* A layout transition of this wait (brl_discard_init_prepare()) follows
+       * the polls recorded so far, so the legacy route below, whose image
+       * barriers come in a pipeline barrier after the last wait, stays
+       * ordered after every event it waits for. Without a poll it follows
+       * the wait's first scope as the stage history has it now. A host
+       * operation there needs no GPU wait: the host sets the event before it
+       * submits the wait (VUID-vkSetEvent-event-09543). */
+      uint8_t init_dst;
+      const bool init =
+         brl_discard_init_prepare(cmd, &pDependencyInfos[i], &init_dst);
       hk_sync_barrier(cmd, src_kinds, dst_kinds);
+      if (init)
+         brl_discard_init_record(cmd, &pDependencyInfos[i], init_dst);
    }
+
+   if (!cmd->state.brl_legacy_event_wait)
+      brl_sync_event_done(cmd);
+}
+
+/* The common lowering of vkCmdWaitEvents waits on the events with an
+ * execution-only dependency and passes the barriers in a following
+ * vkCmdPipelineBarrier, which knows nothing of the events. Keep the polls
+ * recorded (brl_sync_event_poll()) until that barrier has been recorded, so a
+ * layout transition it performs is still ordered after the events. The
+ * barrier's first scope is the wait's source stages, so a wait on host and
+ * device events keeps the device stages. */
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount,
+                 const VkEvent *pEvents, VkPipelineStageFlags srcStageMask,
+                 VkPipelineStageFlags dstStageMask, uint32_t memoryBarrierCount,
+                 const VkMemoryBarrier *pMemoryBarriers,
+                 uint32_t bufferMemoryBarrierCount,
+                 const VkBufferMemoryBarrier *pBufferMemoryBarriers,
+                 uint32_t imageMemoryBarrierCount,
+                 const VkImageMemoryBarrier *pImageMemoryBarriers)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   cmd->state.brl_legacy_event_wait = true;
+   vk_common_CmdWaitEvents(commandBuffer, eventCount, pEvents, srcStageMask,
+                           dstStageMask, memoryBarrierCount, pMemoryBarriers,
+                           bufferMemoryBarrierCount, pBufferMemoryBarriers,
+                           imageMemoryBarrierCount, pImageMemoryBarriers);
+   cmd->state.brl_legacy_event_wait = false;
+   brl_sync_event_done(cmd);
 }

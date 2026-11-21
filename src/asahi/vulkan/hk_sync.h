@@ -271,6 +271,16 @@ struct hk_sync_stream {
     * dependency epoch vtx_images_epoch. */
    bool vtx_images;
    uint32_t vtx_images_epoch;
+
+   /* A layout transition the driver records as work
+    * (brl_sync_transition_begin()), or a stream one was merged into: a
+    * submission adds to its requirement the requirements earlier command
+    * buffers carry into brl_carry, the classes of the transition's first
+    * scope (barrier chains), instead of those of the stream's own classes.
+    * Its transfer class orders it after earlier transfer work, not after
+    * what earlier dependencies ask of later transfer work. */
+   bool brl_transition;
+   uint8_t brl_carry;
 };
 
 /* The resolved fields of one occurrence of a stream in a submission. */
@@ -366,6 +376,21 @@ struct hk_sync_state {
    /* The last attachment producer of a suspended pass instance, which the
     * resuming instance continues from. */
    struct hk_cs *suspended_last;
+
+   /* Layout transitions the driver performs as work (brl_sync_transition_*):
+    * the requirement of the transition being recorded, whether its streams
+    * are being recorded, next_seq when they started, and the latest stream
+    * of any such transition on each subqueue. brl_transition_carry is
+    * hk_sync_stream::brl_carry for its streams. */
+   struct hk_sync_dep brl_transition_dep[HK_SYNC_NUM_SQ];
+   uint8_t brl_transition_carry;
+   bool brl_transition_active;
+   uint32_t brl_transition_seq;
+   struct hk_cs *brl_transition_last[HK_SYNC_NUM_SQ];
+
+   /* The event wait being recorded (brl_sync_event_poll()): its latest poll
+    * stream. */
+   struct hk_cs *brl_event_poll;
 };
 
 /* Per-queue state: kinds of streams ever submitted on each subqueue. A
@@ -412,6 +437,59 @@ uint8_t hk_sync_kinds_src(VkPipelineStageFlags2 stages);
 /* And for a second synchronization scope. */
 uint8_t hk_sync_kinds_dst(VkPipelineStageFlags2 stages);
 
+/* Adds the scopes of one image barrier to src and dst, as
+ * hk_sync_dependency_kinds() counts them. */
+void brl_sync_image_barrier_kinds(const VkImageMemoryBarrier2 *barrier,
+                                  bool image_class, uint8_t *src,
+                                  uint8_t *dst);
+
+/*
+ * Layout transitions the driver performs as work. Vulkan orders an image
+ * layout transition after the first synchronization scope of its barrier and
+ * before the second (Vulkan 1.4, 7.7.4 "Image Layout Transitions"), and in
+ * submission order with every other layout transition on the queue. A
+ * transition the driver records as streams (brl_discard_init_record()) follows
+ * exactly that:
+ *
+ *    brl_sync_transition_kinds()   for each image barrier it performs
+ *    brl_sync_transition_prepare() before the dependency's hk_sync_barrier(),
+ *                                  so other barriers of the dependency do not
+ *                                  widen the first scope
+ *    brl_sync_transition_begin()   streams created from here on wait on that
+ *                                  requirement alone, not on what the recorded
+ *                                  dependencies ask of transfer-class work,
+ *                                  in this command buffer or, at submission,
+ *                                  in earlier ones (hk_sync_stream::brl_carry)
+ *    brl_sync_transition_end()     later work of the second scope waits on the
+ *                                  transition's streams, nothing else does
+ *
+ * The streams are of the transfer class, so a later first scope naming the
+ * transfer stages also covers them.
+ */
+
+/* Adds the scopes one image barrier gives the transition it performs. A queue
+ * family acquire ignores its source stages unless the dependency has
+ * VK_DEPENDENCY_QUEUE_FAMILY_OWNERSHIP_TRANSFER_USE_ALL_STAGES_BIT_KHR: the
+ * release and the semaphore between them order it. An automatic layout
+ * transition of a render pass (render_pass: the common runtime's
+ * runtime_rp_barrier) is ordered by the subpass dependencies, which arrive as
+ * the dependency's memory barriers while the image barrier names no source
+ * stage; their scopes are added too. */
+void brl_sync_transition_kinds(const VkDependencyInfo *info,
+                               const VkImageMemoryBarrier2 *barrier,
+                               bool image_class, bool acquire,
+                               bool render_pass, uint8_t *src, uint8_t *dst);
+
+/* The event wait being recorded: transitions it performs also follow its poll
+ * stream cs (G17P, hk_event_wait_polls()). brl_sync_event_done() ends the
+ * wait. */
+void brl_sync_event_poll(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void brl_sync_event_done(struct hk_cmd_buffer *cmd);
+
+void brl_sync_transition_prepare(struct hk_cmd_buffer *cmd, uint8_t src_kinds);
+void brl_sync_transition_begin(struct hk_cmd_buffer *cmd);
+void brl_sync_transition_end(struct hk_cmd_buffer *cmd, uint8_t dst_kinds);
+
 /* Union of the scopes of every barrier in a dependency. With image_class,
  * an image barrier whose second scope names graphics work names
  * HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG instead of HK_SYNC_GFX. */
@@ -448,9 +526,10 @@ void hk_sync_check_cs(struct hk_cmd_buffer *cmd);
 /* Stage class of work entering the open general compute stream. Keep this
  * equivalent to stream_kind() for &cmd->current_cs.cs. */
 #define hk_sync_general_cs_kind(cmd)                                           \
-   ((cmd)->sync.kind_override ? (cmd)->sync.kind_override                       \
-    : (cmd)->sync.xfer_depth  ? HK_SYNC_XFER                                    \
-                              : HK_SYNC_COMPUTE)
+   ((cmd)->sync.kind_override ? (cmd)->sync.kind_override                      \
+    : ((cmd)->sync.xfer_depth || (cmd)->sync.brl_transition_active)            \
+       ? HK_SYNC_XFER                                                          \
+       : HK_SYNC_COMPUTE)
 void hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 void hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
                    struct hk_cs *from);
