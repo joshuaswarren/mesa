@@ -469,6 +469,21 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
          goto fail_alloc;
       }
+
+      /* Every byte of allocationSize must be backed by the imported object.
+       * An image bound to the memory is checked against the BO
+       * (hk_image_plane_bind()), but a buffer may use the whole of
+       * allocationSize, which would then run past the BO. */
+      if (mem->bo->size < pAllocateInfo->allocationSize) {
+         result = vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "allocationSize %" PRIu64 " exceeds the imported "
+                            "object (%" PRIu64 " bytes)",
+                            (uint64_t)pAllocateInfo->allocationSize,
+                            (uint64_t)mem->bo->size);
+         agx_bo_unreference(&dev->dev, mem->bo);
+         mem->bo = NULL;
+         goto fail_alloc;
+      }
       assert(!(flags & ~mem->bo->flags));
       mem->alias_import = true;
    } else if (host_info && host_info->handleType) {
@@ -663,6 +678,46 @@ fail_alloc:
    return result;
 }
 
+/* The CPU mapping that host image copies of this memory go through.
+ *
+ * It is this object's own mapping of the whole BO (agx_bo_map_owned()), made
+ * at the first copy and kept until vkFreeMemory. The application's
+ * vkMapMemory2 and vkUnmapMemory2 of the memory, which may run on other
+ * threads while copies do, map, move and unmap only the BO's shared mapping
+ * or their own, so they never touch the one a copy is using.
+ *
+ * Host image copies need no external synchronization on the memory, so two
+ * threads can make the mapping at once: the first one installed is kept and
+ * the other is unmapped. Host memory stays where the application put it, and
+ * a backend that cannot map a BO twice has only the shared mapping; copies
+ * use the BO's shared mapping there. NULL if the BO cannot be mapped.
+ */
+void *
+hk_device_memory_copy_map(struct hk_device_memory *mem)
+{
+   void *map = p_atomic_read(&mem->copy_map);
+   if (map)
+      return map;
+
+   if (!mem->bo->dev->ops.bo_mmap_independent ||
+       (mem->bo->flags & AGX_BO_HOST_PTR)) {
+      map = agx_bo_map(mem->bo);
+   } else {
+      size_t size;
+      map = agx_bo_map_owned(mem->bo, NULL, 0, &size);
+      if (map == NULL)
+         return NULL;
+
+      void *installed = p_atomic_cmpxchg(&mem->copy_map, NULL, map);
+      if (installed != NULL) {
+         agx_bo_unmap_owned(mem->bo, map, size);
+         return installed;
+      }
+   }
+
+   return map;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
               const VkAllocationCallbacks *pAllocator)
@@ -687,6 +742,8 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
     * the BO; an owned one belongs to this object alone. */
    if (mem->map_owned)
       agx_bo_unmap_owned(mem->bo, mem->map, mem->map_size);
+   if (mem->copy_map)
+      agx_bo_unmap_owned(mem->bo, mem->copy_map, mem->bo->size);
 
    /* The BO may outlive this object in the BO cache. */
    hk_set_memory_priority(dev, mem, 0.5f);

@@ -242,6 +242,8 @@ struct agx_device {
 
    simple_mtx_t bo_map_lock;
    struct util_sparse_array bo_map;
+   /* Held while agx_bo_map_placed() maps a BO or moves its mapping. */
+   simple_mtx_t bo_mmap_lock;
    /* Exclusive upper bound for every loop over bo_map. */
    uint32_t max_handle;
 
@@ -387,24 +389,54 @@ agx_bo_map_placed(struct agx_bo *bo, void *fixed_addr, size_t length)
    if (bo->flags & AGX_BO_HOST_PTR)
       return fixed_addr && fixed_addr != bo->_map ? NULL : bo->_map;
 
-   /* The BO cache deliberately preserves CPU mappings.  A Vulkan allocation
-    * may therefore inherit a mapping from an earlier allocation even though
-    * the new VkDeviceMemory object has never been mapped.  A placed map must
-    * move that stale process mapping to the application's reserved address;
-    * returning it would violate VK_EXT_map_memory_placed.
-    *
-    * Keep ordinary mapping reuse unchanged.  Only the explicit placed-map
-    * contract is allowed to relocate an existing BO mapping. */
-   if (fixed_addr && bo->_map && bo->_map != fixed_addr) {
-      bo->dev->ops.bo_munmap(bo->dev, bo);
-      bo->_map = NULL;
-      bo->_map_size = 0;
+   void *map = p_atomic_read(&bo->_map);
+   if (map && (!fixed_addr || map == fixed_addr))
+      return map;
+
+   /* Threads that share a BO can map it for the first time at once (two
+    * contexts mapping one resource), and each would install its own mapping
+    * over the other's and leak it. So the mapping is made, or moved, under
+    * the device's lock and checked again there. On a backend with
+    * bo_mmap_independent it is made into a copy of the BO and published
+    * after its size, so a thread that finds it without the lock above finds
+    * it whole, never a failed mapping. A backend without it is only allowed
+    * to map the BO itself, so it maps the BO in place under the lock. */
+   simple_mtx_lock(&bo->dev->bo_mmap_lock);
+   map = bo->_map;
+   if (!map || (fixed_addr && map != fixed_addr)) {
+      /* The BO cache deliberately preserves CPU mappings.  A Vulkan
+       * allocation may therefore inherit a mapping from an earlier allocation
+       * even though the new VkDeviceMemory object has never been mapped.  A
+       * placed map must move that stale process mapping to the application's
+       * reserved address; returning it would violate
+       * VK_EXT_map_memory_placed.
+       *
+       * Keep ordinary mapping reuse unchanged.  Only the explicit placed-map
+       * contract is allowed to relocate an existing BO mapping. */
+      if (map) {
+         bo->dev->ops.bo_munmap(bo->dev, bo);
+         p_atomic_set(&bo->_map, NULL);
+         bo->_map_size = 0;
+      }
+
+      if (bo->dev->ops.bo_mmap_independent) {
+         struct agx_bo copy = *bo;
+         copy._map = NULL;
+         copy._map_size = 0;
+         bo->dev->ops.bo_mmap(bo->dev, &copy, fixed_addr,
+                              fixed_addr ? length : 0);
+         map = copy._map;
+         bo->_map_size = copy._map_size;
+         p_atomic_set(&bo->_map, map);
+      } else {
+         bo->dev->ops.bo_mmap(bo->dev, bo, fixed_addr,
+                              fixed_addr ? length : 0);
+         map = bo->_map;
+      }
    }
+   simple_mtx_unlock(&bo->dev->bo_mmap_lock);
 
-   if (!bo->_map)
-      bo->dev->ops.bo_mmap(bo->dev, bo, fixed_addr, fixed_addr ? length : 0);
-
-   return bo->_map;
+   return map;
 }
 
 static inline void *

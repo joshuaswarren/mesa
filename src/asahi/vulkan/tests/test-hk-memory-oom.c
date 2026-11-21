@@ -37,6 +37,7 @@ __typeof__(agx_bo_bind) __wrap_agx_bo_bind;
 __typeof__(agx_bo_cache_evict_all) __wrap_agx_bo_cache_evict_all;
 __typeof__(agx_bo_cache_evict_all) __real_agx_bo_cache_evict_all;
 __typeof__(agx_bo_export) __wrap_agx_bo_export;
+__typeof__(agx_bo_import) __wrap_agx_bo_import;
 __typeof__(hk_get_cgroup_memory_available) __wrap_hk_get_cgroup_memory_available;
 __typeof__(__vk_errorf) __wrap___vk_errorf;
 __typeof__(os_get_available_system_memory) __wrap_os_get_available_system_memory;
@@ -126,6 +127,19 @@ int
 __wrap_agx_bo_export(struct agx_device *dev, struct agx_bo *bo)
 {
    return -1;
+}
+
+/* An imported object of import_size bytes. */
+static uint64_t import_size;
+
+struct agx_bo *
+__wrap_agx_bo_import(struct agx_device *dev, int fd)
+{
+   struct agx_bo *bo = mock_bo_alloc(dev, import_size, AIL_PAGESIZE,
+                                     AGX_BO_SHARED | AGX_BO_SHAREABLE);
+   if (bo)
+      p_atomic_set(&bo->refcnt, 1);
+   return bo;
 }
 
 bool
@@ -522,6 +536,44 @@ main(void)
    assert(bo_calls == before);
    agx_bo_cache_evict_all(&dev->dev);
 
+   /* An fd import whose object is smaller than allocationSize is refused,
+    * releases the object and leaves the fd with the caller. One at least as
+    * large is taken and consumes the fd. */
+   VkImportMemoryFdInfoKHR import_info = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+      .fd = open("/dev/null", O_RDONLY | O_CLOEXEC),
+   };
+   assert(import_info.fd >= 0);
+   const VkMemoryAllocateInfo import_alloc = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &import_info,
+      .allocationSize = MIB,
+   };
+   import_size = 16384;
+   before = bo_calls;
+   assert(hk_AllocateMemory(hk_device_to_handle(dev), &import_alloc, &allocator,
+                            &memory) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   assert(bo_calls == before + 1 && !pinned && !host_live);
+   assert(!*hk_device_physical(dev)->mem_heaps[0].used);
+   assert(fcntl(import_info.fd, F_GETFD) != -1);
+   import_size = MIB - 16384;
+   assert(hk_AllocateMemory(hk_device_to_handle(dev), &import_alloc, &allocator,
+                            &memory) == VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   assert(!pinned && fcntl(import_info.fd, F_GETFD) != -1);
+   for (unsigned i = 0; i < 2; ++i) {
+      import_size = i ? 4 * MIB : MIB;
+      const int fd = import_info.fd;
+      assert(hk_AllocateMemory(hk_device_to_handle(dev), &import_alloc,
+                               &allocator, &memory) == VK_SUCCESS);
+      assert(hk_device_memory_from_handle(memory)->bo->size == import_size);
+      assert(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+      hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+      import_info.fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      assert(import_info.fd >= 0);
+   }
+   close(import_info.fd);
+
    assert(!pinned && !host_live && !kernel_oom_attempts);
    wsi_headless_finish_wsi(&pdev->wsi_device, vk_default_allocator());
    vk_object_base_finish(&dev->vk.base);
@@ -532,6 +584,6 @@ main(void)
    simple_mtx_destroy(&dev->dev.bo_map_lock);
    free(dev);
    free(pdev);
-   puts("PASS: 2050 swapchain allocation attempts and sync-file probe, no kernel OOM entry or retained backing");
+   puts("PASS: 2050 swapchain allocation attempts, sync-file probe and fd imports, no kernel OOM entry or retained backing");
    return 0;
 }

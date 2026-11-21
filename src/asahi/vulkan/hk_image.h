@@ -61,8 +61,12 @@ struct hk_image_plane {
    /* Bytes of that VA counted in hk_device::sparse_scratch_B. */
    uint64_t sparse_scratch_B;
 
-   /* For host image copy */
-   void *map;
+   /* For host image copy: the memory bound to this plane and the plane's
+    * offset in its BO. The copies go through the memory's copy mapping
+    * (hk_image_plane_map()).
+    */
+   struct hk_device_memory *mem;
+   uint64_t bo_offset_B;
    uint32_t rem;
 
    /* If the image has sparse residency, its residency is tracked in this
