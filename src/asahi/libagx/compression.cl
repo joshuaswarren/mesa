@@ -5,6 +5,7 @@
 #include "compiler/libcl/libcl.h"
 #include "compiler/nir/nir_defines.h"
 #include "compiler/shader_enums.h"
+#include "asahi/compiler/agx_nir_texture.h"
 #include "agx_pack.h"
 #include "compression.h"
 #include "libagx_intrinsics.h"
@@ -72,11 +73,17 @@ sample_id(int4 c, uint samples)
       return c.y & 1;
 }
 
+/*
+ * AGX2-only in-place decompression kernel. For multisampled attachments it
+ * calls libagx_image_texel_address() directly, which unpacks the AGX2 PBE
+ * descriptor and its software sideband layout. Callers must guard dispatch
+ * with hk_descriptor_generation_is_agx2().
+ */
 KERNEL(32)
 libagx_decompress(constant struct libagx_decompress_images *images,
                   global uint64_t *metadata, uint64_t tile_uncompressed,
-                  uint32_t metadata_layer_stride_tl, uint16_t metadata_width_tl,
-                  uint16_t metadata_height_tl,
+                  uint32_t metadata_layer_stride_tl, uint32_t layer_stride_sa,
+                  uint16_t metadata_width_tl, uint16_t metadata_height_tl,
                   uint log2_samples__3 /* 1x, 2x, 4x */)
 {
    uint samples = 1 << log2_samples__3;
@@ -128,10 +135,23 @@ libagx_decompress(constant struct libagx_decompress_images *images,
                                   ACCESS_NON_READABLE, nir_type_uint32);
       } else {
          int4 dec_px = decompose_px(c_sa, samples);
+         /* Multisampled stores address the linear buffer PBE by sample index.
+          * Lowering a formatless layered MS store would divide the byte layer
+          * stride by PIPE_FORMAT_NONE's block size (1), striding layers by
+          * blocksize_B too far; compute the in-layer index and add the exact
+          * sample layer stride here.
+          */
+         uint index_sa =
+            (uint)libagx_image_texel_address(&images->uncompressed,
+                                             convert_uint4(dec_px),
+                                             sample_id(c_sa, samples), 1,
+                                             false, true, false, true) +
+            (layer * layer_stride_sa);
+         int4 coord2d = (int4)(index_sa % AGX_TEXTURE_BUFFER_WIDTH,
+                               index_sa / AGX_TEXTURE_BUFFER_WIDTH, 0, 0);
 
-         nir_bindless_image_store(HANDLE(uncompressed), dec_px,
-                                  sample_id(c_sa, samples), texels[i], 0,
-                                  GLSL_SAMPLER_DIM_MS, true, 0,
+         nir_bindless_image_store(HANDLE(uncompressed), coord2d, 0, texels[i],
+                                  0, GLSL_SAMPLER_DIM_2D, false, 0,
                                   ACCESS_NON_READABLE, nir_type_uint32);
       }
    }

@@ -27,6 +27,14 @@ void nir_bindless_image_store(uint handle, int4 coord, uint sample, uint4 datum,
 
 uint nir_bindless_image_agx(uint offset_B, uint uniform);
 
+struct agx_pbe_packed;
+
 uint32_t libagx_twiddle_coordinates(ushort2 coord, uint16_t tile_w_px,
                                     uint16_t tile_h_px,
                                     uint32_t aligned_width_px);
+
+uint64_t libagx_image_texel_address(constant const struct agx_pbe_packed *ptr,
+                                    uint4 coord, uint sample_idx,
+                                    uint bytes_per_sample_B, bool is_1d,
+                                    bool is_msaa, bool is_layered,
+                                    bool return_index);

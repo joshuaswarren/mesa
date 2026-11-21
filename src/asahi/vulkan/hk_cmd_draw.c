@@ -5126,6 +5126,21 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                      tile.width_el, tile.height_el,
                      util_logbase2(layout->sample_count_sa) - 1);
                } else {
+                  /* libagx_decompress unpacks AGX2 PBE descriptors and their
+                   * software sideband directly; fail closed on non-AGX2
+                   * descriptor generations rather than misaddressing. */
+                  if (!hk_descriptor_generation_is_agx2(
+                         descriptor_generation)) {
+                     mesa_loge_once(
+                        "spilled compressed attachment decompression requires "
+                        "AGX2 descriptors (gen %u, format %s)",
+                        descriptor_generation,
+                        util_format_short_name(layout->format));
+                     vk_command_buffer_set_error(
+                        &cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+                     return;
+                  }
+
                   struct libagx_decompress_images imgs;
                   memcpy(&imgs.compressed, &view->planes[plane].emrt_texture,
                          sizeof(imgs.compressed));
