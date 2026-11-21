@@ -1081,3 +1081,167 @@ TEST(M5UniformStride, RowsShareTheirBase)
             for (uint32_t c = 1; c < 9; ++c)
                ASSERT_EQ((uint32_t)((t + c) * s + y), (uint32_t)((t * s + y) + c * s));
 }
+
+/* Every loop-header phi's sources are defined values (an undef one means a
+ * copy starts from an unwritten register). */
+static void
+expect_no_undef_header_phis(nir_shader *s)
+{
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_cf_node *parent = block->cf_node.parent;
+         if (parent->type != nir_cf_node_loop ||
+             nir_loop_first_block(nir_cf_node_as_loop(parent)) != block)
+            continue;
+         nir_foreach_phi(phi, block) {
+            nir_foreach_phi_src(src, phi)
+               EXPECT_NE(nir_def_instr(src->src.ssa)->type, nir_instr_type_undef);
+         }
+      }
+   }
+}
+
+enum box_variant {
+   BOX_PLAIN,
+   BOX_BARRIER,
+   BOX_LANE_STATE,
+   BOX_INTRINSIC_LIVE_OUT,
+   BOX_BOTTOM_TESTED,  /* the outer loop of BOX_INTRINSIC_LIVE_OUT, no live-out */
+   BOX_INNER_IF,       /* inner body ends in an if, increment defined before it */
+   BOX_SHARED_ATOMIC,  /* relaxed atomic shared load in the outer loop */
+   BOX_MAX_RECONVERGE, /* shader compiled with maximal reconvergence */
+   BOX_UBO_RADIUS,     /* the inner window read per row from a uniform buffer */
+   BOX_SSBO_RADIUS,    /* ... from a buffer the shader may write */
+};
+
+/* A box filter: for (y = -r; y <= r; y++) for (x = c - r; x <= c + r; x++)
+ * sum += buf[x]. The inner trip count does not change across the outer loop,
+ * so the outer loop is unswitched on it: then the unrolled inner loop (main
+ * and remainder), else the original; 5 loops in all, valid SSA. */
+static nir_shader *
+box_filter(box_variant variant)
+{
+   const bool barrier = variant == BOX_BARRIER;
+   const bool bottom = variant == BOX_INTRINSIC_LIVE_OUT || variant == BOX_BOTTOM_TESTED;
+   nir_builder b = compute_shader("box");
+   b.shader->info.shared_size = 4;
+   b.shader->info.maximally_reconverges = variant == BOX_MAX_RECONVERGE;
+   nir_variable *yv = nir_local_variable_create(b.impl, glsl_int_type(), "y");
+   nir_variable *xv = nir_local_variable_create(b.impl, glsl_int_type(), "x");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_def *r = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+   nir_def *c = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+   nir_store_var(&b, yv, nir_ineg(&b, r), 1);
+   nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+   nir_def *live_out = NULL;
+   nir_loop *outer = nir_push_loop(&b);
+   {
+      nir_def *y = nir_load_var(&b, yv);
+      if (!bottom)
+         nir_break_if(&b, nir_ilt(&b, r, y));
+      /* The window as a depthwise convolution reads it, inside the loop: a
+       * uniform-buffer read may run before the loop; a buffer read may not. */
+      nir_def *w = r;
+      if (variant == BOX_UBO_RADIUS)
+         w = nir_load_global_constant(&b, 1, 32, buffer_address(&b, nir_imm_int(&b, 8)),
+                                      .access = ACCESS_CAN_SPECULATE, .align_mul = 4);
+      else if (variant == BOX_SSBO_RADIUS)
+         w = nir_load_global(&b, 1, 32, buffer_address(&b, nir_imm_int(&b, 8)),
+                             .align_mul = 4);
+      nir_store_var(&b, xv, nir_isub(&b, c, w), 1);
+      nir_loop *inner = nir_push_loop(&b);
+      {
+         nir_def *x = nir_load_var(&b, xv);
+         nir_break_if(&b, nir_ilt(&b, nir_iadd(&b, c, w), x));
+         if (variant == BOX_INNER_IF) {
+            /* buf[x + 1] shares x + 1 with the increment, which is then
+             * defined before the if the body ends in. */
+            nir_def *x1 = nir_iadd_imm(&b, x, 1);
+            nir_def *v = nir_load_global(&b, 1, 32,
+                                         buffer_address(&b, nir_amul_imm(&b, x1, 4)),
+                                         .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                         .align_mul = 4);
+            nir_push_if(&b, nir_ult(&b, nir_imm_int(&b, 7), v));
+            nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+            nir_pop_if(&b, NULL);
+            nir_store_var(&b, xv, x1, 1);
+         } else {
+            nir_def *v = nir_load_global(&b, 1, 32,
+                                         buffer_address(&b, nir_amul_imm(&b, x, 4)),
+                                         .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                         .align_mul = 4);
+            nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+            nir_store_var(&b, xv, nir_iadd_imm(&b, x, 1), 1);
+         }
+      }
+      nir_pop_loop(&b, inner);
+      if (barrier)
+         nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP);
+      if (variant == BOX_LANE_STATE) {
+         nir_def *lane = nir_load_active_subgroup_invocation_agx(&b, 32);
+         nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), lane), 1);
+      }
+      if (variant == BOX_SHARED_ATOMIC) {
+         /* OpAtomicLoad on Workgroup storage: only ACCESS_ATOMIC is set. */
+         nir_def *flag = nir_load_shared(&b, 1, 32, nir_imm_int(&b, 0), .access = ACCESS_ATOMIC,
+                                         .align_mul = 4);
+         nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), flag), 1);
+      }
+      nir_def *next = nir_iadd_imm(&b, y, 1);
+      nir_store_var(&b, yv, next, 1);
+      if (bottom) {
+         /* Bottom-tested, optionally with an intrinsic result of the body
+          * used after the loop. */
+         if (variant == BOX_INTRINSIC_LIVE_OUT)
+            live_out = nir_load_local_invocation_index(&b);
+         nir_break_if(&b, nir_ilt(&b, r, next));
+      }
+   }
+   nir_pop_loop(&b, outer);
+   nir_def *result = nir_load_var(&b, acc);
+   if (live_out)
+      result = nir_iadd(&b, result, live_out);
+   nir_store_global(&b, result, buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+   NIR_PASS(_, b.shader, nir_opt_copy_prop);
+   NIR_PASS(_, b.shader, nir_opt_dce);
+   nir_validate_shader(b.shader, "box before");
+   return b.shader;
+}
+
+TEST(M5RuntimeLoops, NestedWindowUnswitches)
+{
+   /* Split, and the first copy's inner loop unrolled (main loop and
+    * remainder): 2 + 3 loops. With the inner body ending in an if, the
+    * increment's register write must stay in the latch, or the rebuilt
+    * back-edge value is a phi and that inner loop is no longer unrolled. */
+   for (box_variant v : {BOX_PLAIN, BOX_BOTTOM_TESTED, BOX_INNER_IF, BOX_UBO_RADIUS}) {
+      nir_shader *s = box_filter(v);
+      ASSERT_EQ(count_loops(s), 2u);
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 8, 320, NULL)) << "variant " << v;
+      nir_validate_shader(s, "box after");
+      EXPECT_EQ(count_loops(s), 5u) << "variant " << v;
+      EXPECT_EQ(loops_inside_ifs(s), 2u) << "variant " << v; /* the two outer copies */
+      expect_no_undef_header_phis(s);
+      NIR_PASS(_, s, nir_opt_dce);
+      nir_validate_shader(s, "box after dce");
+      ralloc_free(s);
+   }
+
+   /* Not split: a barrier or a lane-state operation (the condition may
+    * differ between invocations), an atomic access (a lane may wait on
+    * another through memory), maximal reconvergence, an intrinsic result
+    * used after the outer loop (it would become a phi of the two copies'
+    * values; the backend reads some intrinsics, such as bindless handles,
+    * from their definition), or a window read from memory the shader may
+    * write (it cannot be read before the loop). */
+   for (box_variant v : {BOX_BARRIER, BOX_LANE_STATE, BOX_SHARED_ATOMIC, BOX_MAX_RECONVERGE,
+                         BOX_INTRINSIC_LIVE_OUT, BOX_SSBO_RADIUS}) {
+      nir_shader *s = box_filter(v);
+      agx_nir_unroll_runtime_loops(s, 8, 320, NULL);
+      nir_validate_shader(s, "box refused after");
+      EXPECT_EQ(loops_inside_ifs(s), 0u) << "variant " << v;
+      expect_no_undef_header_phis(s);
+      ralloc_free(s);
+   }
+}

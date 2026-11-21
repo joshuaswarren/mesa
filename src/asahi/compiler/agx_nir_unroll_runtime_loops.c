@@ -41,6 +41,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_control_flow.h"
 #include "util/hash_table.h"
+#include "util/set.h"
 
 enum cont_rel {
    REL_LT,
@@ -176,8 +177,8 @@ rematerialize(nir_builder *b, nir_def *def, nir_loop *loop,
  * already produced before this pass (elect, the active-lane count, quad
  * ballots), plus the AGX operations that act for the whole SIMD-group or
  * workgroup (ray traversal and its shared state, mesh payload barriers,
- * sample-mask demotes). A main loop and a remainder run by different
- * invocations at once would change them. */
+ * sample-mask demotes). A main loop and a remainder, or two copies of an
+ * outer loop, run by different invocations at once would change them. */
 static bool
 lane_dependent(const nir_intrinsic_instr *intr)
 {
@@ -830,6 +831,311 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
    }
 }
 
+static void collect_loops(struct exec_list *list, struct util_dynarray *loops);
+
+/* The iterations per test for a counted loop, or 0 when it is not unrolled. */
+static unsigned
+choose_factor(nir_function_impl *impl, nir_loop *loop, struct counted_loop *cl,
+              unsigned factor, unsigned max_instrs)
+{
+   int size = count_unrollable(loop, cl->nif);
+   if (size < 0)
+      return 0;
+   /* A body too large for the full factor still gains from two
+    * iterations per test when it fits the budget at half the factor. */
+   unsigned f = factor;
+   while (f > 2 && (unsigned)size * f > max_instrs)
+      f /= 2;
+   /* Beyond four iterations, keep the reads the unrolled body has in
+    * flight within 16 registers: more only raises register pressure
+    * (the scheduler issues them together) and can cost occupancy. */
+   if (f > 4) {
+      const unsigned dwords = loaded_dwords(impl, loop);
+      while (f > 4 && dwords * f > 16)
+         f /= 2;
+   }
+   return (unsigned)size * f > max_instrs ? 0 : f;
+}
+
+static nir_loop *
+enclosing_loop(nir_cf_node *node)
+{
+   for (nir_cf_node *p = node->parent; p; p = p->parent) {
+      if (p->type == nir_cf_node_loop)
+         return nir_cf_node_as_loop(p);
+   }
+   return NULL;
+}
+
+/* Computable before `outer` from values defined before it, without memory
+ * reads that could fault there (push constants, preamble values, system
+ * values, and reads that may run speculatively from memory the shader does
+ * not write, such as uniform buffers): a value every iteration of `outer`
+ * sees alike. */
+static bool
+outer_invariant(nir_def *def, nir_loop *outer, unsigned depth)
+{
+   if (def_outside_loop(def, outer))
+      return true;
+   if (depth == 0)
+      return false;
+   nir_instr *instr = nir_def_instr(def);
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+   case nir_instr_type_undef:
+      return true;
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i)
+         if (!outer_invariant(alu->src[i].src.ssa, outer, depth - 1))
+            return false;
+      return true;
+   }
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      const nir_intrinsic_info *info = &nir_intrinsic_infos[intr->intrinsic];
+      const bool speculatable_read =
+         nir_intrinsic_can_reorder(intr) && nir_intrinsic_has_access(intr) &&
+         (nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE);
+      const bool safe = intr->intrinsic == nir_intrinsic_load_push_constant ||
+                        intr->intrinsic == nir_intrinsic_load_preamble ||
+                        (info->num_srcs == 0 && nir_intrinsic_can_reorder(intr)) ||
+                        speculatable_read;
+      if (!safe || !info->has_dest)
+         return false;
+      for (unsigned i = 0; i < info->num_srcs; ++i)
+         if (!outer_invariant(intr->src[i].ssa, outer, depth - 1))
+            return false;
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+/* As rematerialize(), relative to `outer`. */
+static nir_def *
+remat_outer(nir_builder *b, nir_def *def, nir_loop *outer, struct hash_table *remap)
+{
+   if (def_outside_loop(def, outer))
+      return def;
+   struct hash_entry *he = _mesa_hash_table_search(remap, def);
+   if (he)
+      return he->data;
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i)
+         remat_outer(b, alu->src[i].src.ssa, outer, remap);
+   } else if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      for (unsigned i = 0; i < nir_intrinsic_infos[intr->intrinsic].num_srcs; ++i)
+         remat_outer(b, intr->src[i].ssa, outer, remap);
+   }
+   nir_instr *clone = nir_instr_clone_deep(b->shader, instr, remap);
+   nir_builder_instr_insert(b, clone);
+   nir_def *result = nir_instr_def(clone);
+   _mesa_hash_table_insert(remap, def, result);
+   return result;
+}
+
+static unsigned
+count_instrs(nir_loop *loop)
+{
+   unsigned n = 0;
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_foreach_instr(instr, block)
+         ++n;
+   }
+   return n;
+}
+
+/* Values the outer loop leaves to the code after it become phis of the two
+ * copies' values. Fine for ALU results and constants; the backend reads some
+ * intrinsic results from their defining instruction (bindless handles,
+ * barycentrics), so any intrinsic or texture result used after the loop
+ * keeps the outer loop as it is. */
+static bool
+live_outs_are_alu(nir_loop *loop)
+{
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_foreach_instr(instr, block) {
+         nir_def *def = nir_instr_def(instr);
+         if (!def || instr->type == nir_instr_type_alu ||
+             instr->type == nir_instr_type_load_const ||
+             instr->type == nir_instr_type_undef ||
+             instr->type == nir_instr_type_phi)
+            continue;
+         nir_foreach_use_including_if(src, def) {
+            if (!block_in_loop(use_block(src), loop))
+               return false;
+         }
+      }
+   }
+   return true;
+}
+
+/* The outer loop may run under an if whose condition differs between
+ * invocations: nothing in it may need uniform control flow or the other
+ * invocations (barriers, subgroup and quad operations, derivatives), and only
+ * its own breaks and continues may leave it. Derefs would need
+ * rematerializing before the conversion to registers: refused. */
+static bool
+splittable_outer(nir_loop *loop)
+{
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_foreach_instr(instr, block) {
+         switch (instr->type) {
+         case nir_instr_type_jump:
+            if (nir_instr_as_jump(instr)->type != nir_jump_break &&
+                nir_instr_as_jump(instr)->type != nir_jump_continue)
+               return false;
+            break;
+         case nir_instr_type_call:
+         case nir_instr_type_deref:
+            return false;
+         case nir_instr_type_tex:
+            if (nir_tex_instr_has_implicit_derivative(nir_instr_as_tex(instr)))
+               return false;
+            break;
+         case nir_instr_type_intrinsic: {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (lane_dependent(intr))
+               return false;
+            /* A lane may wait on another lane of its subgroup through
+             * memory: the two copies would run one after the other. Atomic
+             * loads and stores of shared memory carry only ACCESS_ATOMIC. */
+            if (strstr(nir_intrinsic_infos[intr->intrinsic].name, "atomic") ||
+                (nir_intrinsic_has_access(intr) &&
+                 (nir_intrinsic_access(intr) &
+                  (ACCESS_COHERENT | ACCESS_VOLATILE | ACCESS_ATOMIC))))
+               return false;
+            switch (intr->intrinsic) {
+            case nir_intrinsic_barrier:
+            case nir_intrinsic_ddx:
+            case nir_intrinsic_ddy:
+            case nir_intrinsic_ddx_fine:
+            case nir_intrinsic_ddy_fine:
+            case nir_intrinsic_ddx_coarse:
+            case nir_intrinsic_ddy_coarse:
+            case nir_intrinsic_terminate:
+            case nir_intrinsic_terminate_if:
+            case nir_intrinsic_demote:
+            case nir_intrinsic_demote_if:
+               return false;
+            default:
+               break;
+            }
+            break;
+         }
+         default:
+            break;
+         }
+      }
+   }
+   return true;
+}
+
+/*
+ * A counted loop nested in another loop whose trip count the outer loop does
+ * not change (a box filter's or a SAD window's x - r .. x + r): decide once,
+ * before the outer loop, whether the unrolled form can run (at least
+ * `factor` iterations), and otherwise run a copy of the outer loop with the
+ * inner loop as it was. A 3-tap window then pays nothing for the unroll's
+ * guard and structure on every outer iteration; an 11-tap one keeps it.
+ * Both copies compute the same values, so the test only picks the faster.
+ */
+static bool
+unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs)
+{
+   /* With maximal reconvergence the outer loop's invocations must stay
+    * together; the split could separate them. */
+   if (impl->function->shader->info.maximally_reconverges)
+      return false;
+
+   struct util_dynarray loops;
+   util_dynarray_init(&loops, NULL);
+   collect_loops(&impl->body, &loops);
+   struct set *done = _mesa_pointer_set_create(NULL);
+   bool progress = false;
+
+   util_dynarray_foreach(&loops, nir_loop *, lp) {
+      nir_loop *inner = *lp;
+      nir_loop *outer = enclosing_loop(&inner->cf_node);
+      struct counted_loop cl;
+      if (!outer || _mesa_set_search(done, outer) || enclosing_loop(&outer->cf_node) ||
+          outer->partially_unrolled || nir_loop_has_continue_construct(outer) ||
+          !analyze_loop(inner, &cl))
+         continue;
+      const unsigned f = choose_factor(impl, inner, &cl, factor, max_instrs);
+      nir_block *pre_inner = nir_cf_node_as_block(nir_cf_node_prev(&inner->cf_node));
+      nir_phi_src *init = nir_phi_get_src_from_block(cl.iv, pre_inner);
+      nir_block *after = nir_cf_node_as_block(nir_cf_node_next(&outer->cf_node));
+      if (f < 4 || !init ||
+          (!nir_scalar_is_const(cl.bound) && !outer_invariant(cl.bound.def, outer, 8)))
+         continue;
+      if (!outer_invariant(init->src.ssa, outer, 8) || count_instrs(outer) > 256 ||
+          !splittable_outer(outer) || !live_outs_are_alu(outer) ||
+          (nir_block_first_instr(after) &&
+           nir_block_first_instr(after)->type == nir_instr_type_phi))
+         continue;
+
+      /* The test, before the outer loop: would the main loop's first
+       * iteration run? (For a rotated loop, the exact-tail form.) */
+      nir_builder b = nir_builder_at(nir_before_cf_node(&outer->cf_node));
+      struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+      nir_def *bound = nir_scalar_is_const(cl.bound)
+                          ? nir_imm_int(&b, (uint32_t)nir_scalar_as_uint(cl.bound))
+                          : nir_channel(&b, remat_outer(&b, cl.bound.def, outer, remap),
+                                        cl.bound.comp);
+      nir_def *iv0 = remat_outer(&b, init->src.ssa, outer, remap);
+      _mesa_hash_table_destroy(remap, NULL);
+      if (cl.offset && !cl.bottom)
+         iv0 = nir_iadd_imm(&b, iv0, cl.offset);
+      nir_def *g = guard_bound(&b, &cl, bound, f);
+      nir_def *cond;
+      if (cl.rel == REL_LT || cl.rel == REL_LE)
+         cond = cl.is_unsigned ? nir_ult(&b, iv0, g) : nir_ilt(&b, iv0, g);
+      else
+         cond = cl.is_unsigned ? nir_ult(&b, g, iv0) : nir_ilt(&b, g, iv0);
+
+      /* Values of the outer loop through registers, so both copies write
+       * the same ones and the code after reads them whichever ran. Phi
+       * sources are written in their own predecessor: hoisted into the arms
+       * of an if, an inner latch value would come back as a phi of the two
+       * arms, which the inner loop's analysis does not take. */
+      nir_foreach_block_in_cf_node(block, &outer->cf_node)
+         nir_lower_phis_to_regs_block(block, true);
+      nir_foreach_block_in_cf_node(block, &outer->cf_node)
+         nir_lower_ssa_defs_to_regs_block(block);
+
+      /* The lowering writes the outer phis' initial values at the end of the
+       * preheader, after cond: the if goes after those, right before the
+       * outer loop, so both copies start from them. */
+      b.cursor = nir_before_cf_node(&outer->cf_node);
+      nir_if *nif = nir_push_if(&b, cond);
+      nir_pop_if(&b, nif);
+      nir_cf_list list, copy;
+      nir_cf_extract(&list, nir_before_cf_node(&outer->cf_node),
+                     nir_after_cf_node(&outer->cf_node));
+      /* The copy keeps this inner loop as it is (clones copy the flag); its
+       * other loops stay candidates. */
+      inner->partially_unrolled = true;
+      struct hash_table *cmap = _mesa_pointer_hash_table_create(NULL);
+      nir_cf_list_clone(&copy, &list, &nif->cf_node, cmap);
+      _mesa_hash_table_destroy(cmap, NULL);
+      inner->partially_unrolled = false;
+      nir_cf_reinsert(&list, nir_before_cf_list(&nif->then_list));
+      nir_cf_reinsert(&copy, nir_before_cf_list(&nif->else_list));
+      _mesa_set_add(done, outer);
+      progress = true;
+   }
+
+   _mesa_set_destroy(done, NULL);
+   util_dynarray_fini(&loops);
+   return progress;
+}
+
 static void
 collect_loops(struct exec_list *list, struct util_dynarray *loops)
 {
@@ -864,6 +1170,16 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
       nir_metadata_require(impl, nir_metadata_block_index);
       nir_index_ssa_defs(impl);
 
+      bool unswitched = false;
+      if (unswitch_nested(impl, factor, max_instrs)) {
+         nir_progress(true, impl, nir_metadata_none);
+         nir_lower_reg_intrinsics_to_ssa_impl(impl);
+         nir_metadata_require(impl, nir_metadata_block_index);
+         nir_index_ssa_defs(impl);
+         unswitched = true;
+         any = true;
+      }
+
       struct util_dynarray loops;
       util_dynarray_init(&loops, NULL);
       collect_loops(&impl->body, &loops);
@@ -876,21 +1192,8 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
          struct counted_loop cl;
          if (n == ARRAY_SIZE(candidates) || !analyze_loop(*lp, &cl))
             continue;
-         int size = count_unrollable(*lp, cl.nif);
-         /* A body too large for the full factor still gains from two
-          * iterations per test when it fits the budget at half the factor. */
-         unsigned f = factor;
-         while (size >= 0 && f > 2 && (unsigned)size * f > max_instrs)
-            f /= 2;
-         /* Beyond four iterations, keep the reads the unrolled body has in
-          * flight within 16 registers: more only raises register pressure
-          * (the scheduler issues them together) and can cost occupancy. */
-         if (size >= 0 && f > 4) {
-            const unsigned dwords = loaded_dwords(impl, *lp);
-            while (f > 4 && dwords * f > 16)
-               f /= 2;
-         }
-         if (size < 0 || (unsigned)size * f > max_instrs)
+         const unsigned f = choose_factor(impl, *lp, &cl, factor, max_instrs);
+         if (!f)
             continue;
 
          /* The bound as seen from the preheader. */
@@ -924,6 +1227,8 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
          nir_progress(true, impl, nir_metadata_none);
          nir_lower_reg_intrinsics_to_ssa_impl(impl);
          any = true;
+      } else if (unswitched) {
+         nir_progress(true, impl, nir_metadata_none);
       } else {
          nir_no_progress(impl);
       }
