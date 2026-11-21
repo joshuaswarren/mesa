@@ -136,6 +136,12 @@ void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_device_quiesce_lost_submissions(struct hk_device *dev);
 
+/* The first command buffer of the submission whose recording failed, or NULL.
+ * Such a command buffer is not executable (vkEndCommandBuffer returned its
+ * error) and its streams may be incomplete. */
+struct vk_command_buffer *
+hk_submit_first_errored_cmd_buffer(const struct vk_queue_submit *submit);
+
 VkResult hk_queue_submit_bind_sparse_memory(struct hk_device *device,
                                             struct vk_queue_submit *submission);
 

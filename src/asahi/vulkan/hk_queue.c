@@ -34,6 +34,7 @@
 #include "hk_physical_device.h"
 #include "hk_query_pool.h"
 #include "hk_sparse.h"
+#include "vk_enum_to_str.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -2800,6 +2801,16 @@ hk_submit_has_compute(const struct vk_queue_submit *submit)
    return false;
 }
 
+struct vk_command_buffer *
+hk_submit_first_errored_cmd_buffer(const struct vk_queue_submit *submit)
+{
+   for (uint32_t i = 0; i < submit->command_buffer_count; ++i) {
+      if (vk_command_buffer_has_error(submit->command_buffers[i]))
+         return submit->command_buffers[i];
+   }
+   return NULL;
+}
+
 static VkResult
 hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
@@ -2808,6 +2819,18 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
    if (vk_device_is_lost_no_report(&dev->vk))
       return VK_ERROR_DEVICE_LOST;
+
+   /* Submitting a command buffer whose recording failed is invalid usage,
+    * and its control streams may stop short of their end. The GPU must never
+    * run them: the device is lost for this client instead.
+    */
+   struct vk_command_buffer *errored =
+      hk_submit_first_errored_cmd_buffer(submit);
+   if (unlikely(errored)) {
+      return vk_queue_set_lost(&queue->vk,
+                               "submitted a command buffer recorded with %s",
+                               vk_Result_to_str(errored->record_result));
+   }
 
    /* While a resource may alias, the command buffers recorded before it get
     * memory scope at their patch sites (hk_cdm_alias_scope()), before
