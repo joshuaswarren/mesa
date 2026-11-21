@@ -83,8 +83,7 @@ def declare_options():
 
     drirc_gen.add_common_vk_options(debug_options, features_options, misc_options,
                                     valid_options=VALID_COMMON_VK_OPTIONS,
-                                    # Use 1/2 of total size to avoid swapping
-                                    defaults={"heap_memory_percent": 0.5})
+                                    defaults={"heap_memory_percent": 0.0})
     drirc_gen.add_common_vk_wsi_options(debug_options, performance_options)
 
     return [

@@ -178,6 +178,10 @@ struct agx_device {
    /* Native DRM 0.2 added the four render resource-specifier high dwords.
     * Stock 0.0 kernels do not consume an oversized render packet's tail. */
    bool render_rsrc_spec_hi;
+   /* True when a native kernel populated the optional memory_limit /
+    * client_memory_limit tail of drm_asahi_params_global (where 0 means no
+    * driver limit, as opposed to a legacy 600-byte reply or virtio). */
+   bool has_memory_limits;
    agx_device_ops_t ops;
 
    /* vdrm device */
