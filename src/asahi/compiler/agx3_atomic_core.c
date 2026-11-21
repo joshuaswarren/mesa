@@ -49,7 +49,7 @@ append_waits(uint16_t wait_mask, struct agx3_field_kv *fields, unsigned n)
 }
 
 static bool
-compose_first(enum agx_isa_encoding enc, const char *mnemonic,
+compose_first(enum agx_isa_encoding enc, enum agx3_mnemonic mnemonic,
               const struct agx3_field_kv *fields, unsigned nfields,
               uint8_t out[AGX3_ATOMIC_MAX_LENGTH], uint8_t *len)
 {
@@ -197,7 +197,7 @@ agx3_atomic_encode_device(enum agx_isa_encoding enc,
           ? 1
           : 0);
    n = append_waits(waits, f, n);
-   return compose_first(enc, "atomicdev", f, n, out, len);
+   return compose_first(enc, AGX3_MN_atomicdev, f, n, out, len);
 }
 
 /* g18g admits the G18G-witnessed returning form that kills its register
@@ -296,7 +296,7 @@ encode_local(enum agx_isa_encoding enc, const struct agx3_local_atomic_desc *d,
    }
 
    n = append_waits(d->wait_mask, f, n);
-   return compose_first(enc, "atomictg", f, n, out, len);
+   return compose_first(enc, AGX3_MN_atomictg, f, n, out, len);
 }
 
 bool

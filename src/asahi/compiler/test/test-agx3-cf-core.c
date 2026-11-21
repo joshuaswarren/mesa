@@ -378,7 +378,7 @@ test_half_register_compare(void)
          {46, AGX3_CF_FCOND_LT}};
       uint8_t out[AGX3_CF_MAX_LENGTH];
       uint8_t len = 0;
-      const bool ok = agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "fcmp", 0,
+      const bool ok = agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_fcmp, 0,
                                         base, 4, ov, 7, out, &len);
       checks++;
       if (!ok || !hex_is(out, len, f32_rows[i].bytes)) {

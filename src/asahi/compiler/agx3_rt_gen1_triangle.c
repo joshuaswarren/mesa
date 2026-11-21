@@ -25,7 +25,7 @@ static void isel(struct stream *s,unsigned dest,unsigned a,unsigned b,bool narro
 }
 static void imm16(struct stream *s,unsigned dest,unsigned value,const char *name){
  const struct agx3_field_kv fields[]={{2,dest},{9,2},{10,1},{14,value}};
- uint8_t bytes[16],n;assert(agx3_bind_compose(AGX_ISA_ENCODING_AGX3B,"ldimm",1,fields,4,NULL,0,bytes,&n));append(s,bytes,n,name,-1);
+ uint8_t bytes[16],n;assert(agx3_bind_compose(AGX_ISA_ENCODING_AGX3B,AGX3_MN_ldimm,1,fields,4,NULL,0,bytes,&n));append(s,bytes,n,name,-1);
 }
 static void imm32(struct stream *s,unsigned dest,uint32_t value,const char *name){struct agx3_encoded_ldimm i;assert(agx3_pack_ldimm_u32(AGX_ISA_ENCODING_AGX3B,dest,value,&i));append(s,i.bytes,i.length,name,-1);}
 static void bitreg(struct stream *s,enum agx3_alu_op op,unsigned dest,unsigned a,unsigned b,const char *name){const uint16_t src[]={a,b};const enum agx3_alu_hint hints[]={AGX3_ALU_HINT_NONE,AGX3_ALU_HINT_NONE};uint8_t bytes[16],n;assert(agx3_alu_bit_reg16(AGX_ISA_ENCODING_AGX3B,op,dest,src,hints,0,bytes,&n));append(s,bytes,n,name,-1);}
@@ -159,7 +159,7 @@ static void body(struct stream *s,bool corrected){
   uint8_t bytes[16],n;
   if(op->target!=UINT32_MAX)assert(agx3_cf_branch(AGX_ISA_ENCODING_AGX3B,true,bytes,&n));
   else assert(agx3_bind_compose(AGX_ISA_ENCODING_AGX3B,op->name,op->ep,op->fields,op->nfields,NULL,0,bytes,&n));
-  assert(n==op->size);append(s,bytes,n,op->name,op->offset);
+  assert(n==op->size);append(s,bytes,n,agx3_mnemonic_name(op->name),op->offset);
   if(corrected){switch(op->offset){case 648:residual_zero(s,72,10,76,78,1,512,1024);break;case 700:residual_zero(s,80,82,84,86,2,2048,4096);break;case 722:residual_zero(s,88,18,90,92,4,8192,16384);break;case 908:finish_policy(s,72);break;
    /* Triangle B: edge v2-v3 (products 38/16, residuals 24/4), edge v1-v3
     * (76/14, residuals 48/2), then its validity, which the native code

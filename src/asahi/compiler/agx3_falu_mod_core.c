@@ -91,7 +91,7 @@ agx3_falu_add_mod(enum agx_isa_encoding enc, uint16_t dest, uint16_t src0,
       return false;
    struct agx3_field_kv ov[32];
    unsigned n = common_mods(dest, src0, src1, m, ov);
-   return agx3_bind_compose(enc, "f32add", 3, b(enc) ? add_b : add_c,
+   return agx3_bind_compose(enc, AGX3_MN_f32add, 3, b(enc) ? add_b : add_c,
                             b(enc) ? 9 : 11, ov, n, out, len);
 }
 
@@ -144,7 +144,7 @@ add_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
                                           (runtime->wait_mask >> i) & 1);
       for (unsigned ep = 0; ep <= 3; ++ep) {
          uint8_t bytes[AGX3_FALU_MOD_MAX_LENGTH], size;
-         if (agx3_bind_compose(enc, "f32add", agx3_bind_ep(enc, ep), m5 ? add_c : add_b, m5 ? 11 : 9, ov, n, bytes, &size)) {
+         if (agx3_bind_compose(enc, AGX3_MN_f32add, agx3_bind_ep(enc, ep), m5 ? add_c : add_b, m5 ? 11 : 9, ov, n, bytes, &size)) {
             if (!best_size || size < best_size) {
                for (unsigned i = 0; i < size; ++i)
                   best[i] = bytes[i];
@@ -210,7 +210,7 @@ agx3_falu_add_imm_runtime(uint16_t dest, uint16_t src0, uint8_t minifloat,
    ov[n++] = (struct agx3_field_kv)KV(46, runtime->discard[0]);
    for (unsigned i = 0; i < 8; ++i)
       ov[n++] = (struct agx3_field_kv)KV(52 + i, (runtime->wait_mask >> i) & 1);
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "f32add", 3, add_imm_c,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_f32add, 3, add_imm_c,
                             sizeof(add_imm_c) / sizeof(add_imm_c[0]), ov, n,
                             out, len);
 }
@@ -243,7 +243,7 @@ agx3_falu_mul_imm_runtime(uint16_t dest, uint16_t src0, uint8_t minifloat,
    ov[n++] = (struct agx3_field_kv)KV(46, runtime->discard[0]);
    for (unsigned i = 0; i < 8; ++i)
       ov[n++] = (struct agx3_field_kv)KV(80 + i, (runtime->wait_mask >> i) & 1);
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "f32mul", 3, mul_imm_c,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_f32mul, 3, mul_imm_c,
                             sizeof(mul_imm_c) / sizeof(mul_imm_c[0]), ov, n,
                             out, len);
 }
@@ -287,7 +287,7 @@ add_immediate(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                                        (runtime->wait_mask >> i) & 1);
    for (unsigned ep = 0; ep <= 3; ++ep) {
       uint8_t bytes[AGX3_FALU_MOD_MAX_LENGTH], size;
-      if (agx3_bind_compose(enc, "f32add", ep, agx3c ? base_c : base,
+      if (agx3_bind_compose(enc, AGX3_MN_f32add, ep, agx3c ? base_c : base,
                            agx3c ? 8 : 6, ov, n, bytes, &size)) {
          for (unsigned i = 0; i < size; ++i)
             out[i] = bytes[i];
@@ -347,7 +347,7 @@ agx3_falu_narrow_imm_sub_f32(enum agx_isa_encoding enc, uint16_t dest,
       ov[n++] = (struct agx3_field_kv)KV(52 + i,
                                        (runtime->wait_mask >> i) & 1);
    for (unsigned ep = 0; ep <= 3; ++ep) {
-      if (agx3_bind_compose(enc, "f32add", ep, base, 7, ov, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_f32add, ep, base, 7, ov, n, out, len))
          return true;
    }
    return false;
@@ -364,7 +364,7 @@ agx3_falu_mul_mod(enum agx_isa_encoding enc, uint16_t dest, uint16_t src0,
       return false;
    struct agx3_field_kv ov[32];
    unsigned n = common_mods(dest, src0, src1, m, ov);
-   return agx3_bind_compose(enc, "f32mul", 3, b(enc) ? mul_b : mul_c,
+   return agx3_bind_compose(enc, AGX3_MN_f32mul, 3, b(enc) ? mul_b : mul_c,
                             b(enc) ? 11 : 13, ov, n, out, len);
 }
 
@@ -402,7 +402,7 @@ mul_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
                                        (runtime->wait_mask >> i) & 1);
    for (unsigned ep = 0; ep <= 3; ++ep) {
       uint8_t bytes[AGX3_FALU_MOD_MAX_LENGTH], size;
-      if (agx3_bind_compose(enc, "f32mul", agx3_bind_ep(enc, ep), m5 ? mul_c : mul_b, m5 ? 13 : 11, ov, n, bytes, &size)) {
+      if (agx3_bind_compose(enc, AGX3_MN_f32mul, agx3_bind_ep(enc, ep), m5 ? mul_c : mul_b, m5 ? 13 : 11, ov, n, bytes, &size)) {
          for (unsigned i = 0; i < size; ++i)
             out[i] = bytes[i];
          *len = size;
@@ -448,7 +448,7 @@ agx3_falu_fma_mod(enum agx_isa_encoding enc, uint16_t dest, uint16_t src0,
    ov[n++] = (struct agx3_field_kv)KV(64, m->addend_abs ? 1 : 0);
    ov[n++] = (struct agx3_field_kv)KV(65, m->addend_neg ? 1 : 0);
    ov[n++] = (struct agx3_field_kv)KV(60, m->addend_16 ? 1 : 2);
-   return agx3_bind_compose(enc, "f32fma", b(enc) ? 5 : 7, b(enc) ? fma_b : fma_c,
+   return agx3_bind_compose(enc, AGX3_MN_f32fma, b(enc) ? 5 : 7, b(enc) ? fma_b : fma_c,
                             b(enc) ? 14 : 16, ov, n, out, len);
 }
 
@@ -496,7 +496,7 @@ fma_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
                                        (runtime->wait_mask >> i) & 1);
    for (unsigned ep = m5 ? 0 : 2; ep <= (m5 ? 7 : 5); ++ep) {
       uint8_t bytes[AGX3_FALU_MOD_MAX_LENGTH], size;
-      if (agx3_bind_compose(enc, "f32fma", agx3_bind_ep(enc, ep),
+      if (agx3_bind_compose(enc, AGX3_MN_f32fma, agx3_bind_ep(enc, ep),
                            m5 ? fma_c : fma_b, m5 ? 16 : 14, ov, n,
                            bytes, &size)) {
          for (unsigned i = 0; i < size; ++i)
@@ -571,7 +571,7 @@ fma_addend_imm_width_mod(enum agx_isa_encoding enc, uint16_t dest,
       if (m5 || (runtime->wait_mask & (1u << i)))
          ov[n++] = (struct agx3_field_kv)KV(97+i, !!(runtime->wait_mask & (1u << i)));
    for (unsigned ep = 0; ep <= (m5 ? 7 : 5); ++ep) {
-      if (agx3_bind_compose(enc,"f32fma",ep,base,m5 ? 13 : 11,ov,n,out,len))
+      if (agx3_bind_compose(enc,AGX3_MN_f32fma,ep,base,m5 ? 13 : 11,ov,n,out,len))
          return true;
    }
    return false;
@@ -657,7 +657,7 @@ fma_two_imm(enum agx_isa_encoding enc, uint16_t dest,
       if (m5 || (runtime->wait_mask & (1u << i)))
          ov[n++] = (struct agx3_field_kv)KV(97+i,!!(runtime->wait_mask & (1u << i)));
    for (unsigned ep = 0; ep <= (m5 ? 7 : 5); ++ep)
-      if (agx3_bind_compose(enc,"f32fma",ep,base,m5 ? 13 : 10,ov,n,out,len))
+      if (agx3_bind_compose(enc,AGX3_MN_f32fma,ep,base,m5 ? 13 : 10,ov,n,out,len))
          return true;
    return false;
 }
@@ -756,7 +756,7 @@ fma_mul_imm(enum agx_isa_encoding enc, uint16_t dest, bool dest_half,
       ov[n++] = (struct agx3_field_kv)KV(97 + i, (runtime->wait_mask >> i) & 1);
 
    for (unsigned ep = 0; ep <= (m5 ? 7 : 5); ++ep) {
-      if (agx3_bind_compose(enc, "f32fma", ep, base, m5 ? 12 : 10, ov, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_f32fma, ep, base, m5 ? 12 : 10, ov, n, out, len))
          return true;
    }
    return false;

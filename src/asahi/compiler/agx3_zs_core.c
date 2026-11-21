@@ -68,7 +68,7 @@ append_common(enum agx_isa_encoding e, const struct agx3_zs_desc *d,
 }
 
 static bool
-finish(enum agx_isa_encoding e, const char *mnemonic,
+finish(enum agx_isa_encoding e, enum agx3_mnemonic mnemonic,
        const struct agx3_field_kv *base_c, unsigned nbase_c,
        const struct agx3_field_kv *ov, unsigned n, uint8_t *out, uint8_t *len)
 {
@@ -105,7 +105,7 @@ agx3_zs_encode_sample_mask(enum agx_isa_encoding enc,
    struct agx3_field_kv ov[12];
    const unsigned n = append_common(enc, d, ov, 0);
 
-   return finish(enc, "movmsk", base_c, NELEM(base_c), ov, n, out, len);
+   return finish(enc, AGX3_MN_movmsk, base_c, NELEM(base_c), ov, n, out, len);
 }
 
 bool
@@ -137,5 +137,5 @@ agx3_zs_encode_depth_stencil(enum agx_isa_encoding enc,
          35, (uint64_t)((depth ? 1u : 0u) | (stencil ? 2u : 0u)));
    }
 
-   return finish(enc, "depthf", base_c, NELEM(base_c), ov, n, out, len);
+   return finish(enc, AGX3_MN_depthf, base_c, NELEM(base_c), ov, n, out, len);
 }

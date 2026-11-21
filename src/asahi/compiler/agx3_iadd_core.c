@@ -154,8 +154,8 @@ agx3_iadd_encode(enum agx_isa_encoding encoding,
    }
 
    return agx3_bind_compose(encoding,
-                            agx3b ? (d->subtract ? "isub" : "iadd")
-                                  : (d->subtract ? "isub32" : "iadd32"),
+                            agx3b ? (d->subtract ? AGX3_MN_isub : AGX3_MN_iadd)
+                                  : (d->subtract ? AGX3_MN_isub32 : AGX3_MN_iadd32),
                             0, baseline, nbaseline, ov, n, out, len);
 }
 
@@ -194,7 +194,7 @@ agx3_add_sub_immediate_encode(enum agx_isa_encoding encoding, bool subtract,
    for (unsigned slot=0;slot<slots;slot++)
       if(d->wait_mask & (1u<<slot))
          fields[n++]=(struct agx3_field_kv)KV((gpu1 ? 46 : 45)+slot,1);
-   return agx3_bind_compose(encoding,gpu1 ? (subtract ? "isub32" : "iadd32") : "isub",0,
+   return agx3_bind_compose(encoding,gpu1 ? (subtract ? AGX3_MN_isub32 : AGX3_MN_iadd32) : AGX3_MN_isub,0,
                             base,gpu1 ? 8 : 6,fields,n,out,len);
 }
 
@@ -417,8 +417,8 @@ agx3_imad_encode(enum agx_isa_encoding encoding,
       return false;
 
    return agx3_bind_compose(encoding,
-                            m5 ? (d->dest_64 ? "imadd64" : "imadd32")
-                               : (d->negate_addend ? "imsub" : "imadd"), 0,
+                            m5 ? (d->dest_64 ? AGX3_MN_imadd64 : AGX3_MN_imadd32)
+                               : (d->negate_addend ? AGX3_MN_imsub : AGX3_MN_imadd), 0,
                             baseline, nbaseline, ov, n, out, len);
 }
 
@@ -607,7 +607,7 @@ agx3_iadd_encode_g18g(enum agx_isa_encoding encoding,
    }
 
    return agx3_bind_compose(encoding,
-                            agx3b ? (d->subtract ? "isub" : "iadd") : (d->subtract ? "isub32" : "iadd32"),
+                            agx3b ? (d->subtract ? AGX3_MN_isub : AGX3_MN_iadd) : (d->subtract ? AGX3_MN_isub32 : AGX3_MN_iadd32),
                             agx3_bind_ep(encoding, 0), baseline, nbaseline,
                             ov, n, out, len);
 }
@@ -865,7 +865,7 @@ agx3_imad_encode_g18g(enum agx_isa_encoding encoding,
 
    return agx3_bind_compose(
       encoding,
-      m5 ? (d->dest_64 ? "imadd64" : "imadd32")
-         : (d->negate_addend ? "imsub" : "imadd"),
+      m5 ? (d->dest_64 ? AGX3_MN_imadd64 : AGX3_MN_imadd32)
+         : (d->negate_addend ? AGX3_MN_imsub : AGX3_MN_imadd),
       agx3_bind_ep(encoding, 0), baseline, nbaseline, ov, n, out, len);
 }

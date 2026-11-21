@@ -11894,7 +11894,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             return false;
          uint64_t fields[AGX3_MAX_FIELDS];
          const int32_t form =
-            agx3_decode(&agx3c_table, program + offset, 12, "imgwblk", fields);
+            agx3_decode(&agx3c_table, program + offset, 12, AGX3_MN_imgwblk, fields);
          const uint8_t selector = ctx->key->g17p_mrt_eot_selectors[rt];
          /* Native1130 (run 1139): 8-bit integer lanes (selector 0x55) store
           * with f29 = 0 in the 39 workloads' end-of-tile programs, which are
@@ -12265,10 +12265,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          };
          uint8_t sample_bytes[16], resolve_bytes[16];
          uint8_t sample_len = 0, resolve_len = 0;
-         if (!agx3_bind_compose(enc, "imgwblk", 0, img, ARRAY_SIZE(img),
+         if (!agx3_bind_compose(enc, AGX3_MN_imgwblk, 0, img, ARRAY_SIZE(img),
                                 sample_store, ARRAY_SIZE(sample_store),
                                 sample_bytes, &sample_len) ||
-             !agx3_bind_compose(enc, "imgwblk", 0, img, ARRAY_SIZE(img),
+             !agx3_bind_compose(enc, AGX3_MN_imgwblk, 0, img, ARRAY_SIZE(img),
                                 resolve_store, ARRAY_SIZE(resolve_store),
                                 resolve_bytes, &resolve_len) ||
              sample_len != 12 || resolve_len != 12)
@@ -12298,7 +12298,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             {52, 2}, {56, 3}, {57, 118}, {59, 1}, {74, 4},
          };
          if (!agx3_sr_encode(enc, &layer, layer_sr, &layer_sr_len) ||
-             !agx3_bind_compose(enc, "pack_imgwir", 0, layer_fields,
+             !agx3_bind_compose(enc, AGX3_MN_pack_imgwir, 0, layer_fields,
                                 ARRAY_SIZE(layer_fields), NULL, 0,
                                 layer_pack, &layer_pack_len))
             return false;

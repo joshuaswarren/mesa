@@ -19,7 +19,7 @@ agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
     * The 8x8 matrix multiply-add (f16/bf16/f32 inputs, f32 accumulator)
     * exists both on the M5 AGX3C encoding (G17G/G17S/G17C) and on the AGX3B
     * encoding that covers G15/G16 and G17P (M4 Pro, M4 Max, A18 Pro). The
-    * shared "f32matmad8x8" form carries every input type in the type field, so
+    * shared AGX3_MN_f32matmad8x8 form carries every input type in the type field, so
     * one builder serves both; only the general register file ceiling (192
     * halves on AGX3B vs 256 on AGX3C), the witnessed selector constants and
     * the scoreboard-wait field range differ between the two encodings. The
@@ -80,7 +80,7 @@ agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
       fields[count++] = (struct agx3_field_kv){69 + i,
                                              (d->wait_mask >> i) & 1};
 
-   return agx3_bind_compose(encoding, "f32matmad8x8", 0, base,
+   return agx3_bind_compose(encoding, AGX3_MN_f32matmad8x8, 0, base,
                             nbase, fields, count,
                             out, length);
 }
@@ -125,7 +125,7 @@ agx3_matrix_encode_gemm16(enum agx_isa_encoding encoding,
    for (unsigned i = 0; i < 8; ++i)
       if (d->wait_mask & (1u << i))
          fields[count++] = (struct agx3_field_kv){33 + i, 1};
-   return agx3_bind_compose(encoding, "fGeMM16x16x16", 0, base,
+   return agx3_bind_compose(encoding, AGX3_MN_fGeMM16x16x16, 0, base,
                             sizeof(base) / sizeof(base[0]), fields, count,
                             out, length);
 }

@@ -199,7 +199,7 @@ agx3_fltnorm_encode(enum agx_isa_encoding enc,
       if (d->wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(50 + i, 1);
 
-   if (agx3_bind_compose(enc, "fltnorm", agx3_bind_ep(enc, 0), base, nbase,
+   if (agx3_bind_compose(enc, AGX3_MN_fltnorm, agx3_bind_ep(enc, 0), base, nbase,
                          ov, n, out, len))
       return true;
 
@@ -342,7 +342,7 @@ agx3_persp_rcp_encode(enum agx_isa_encoding enc,
    for (unsigned i = 0; i < nslots(enc); ++i)
       if (d->wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(49 + i, 1);
-   return agx3_bind_compose(enc, "f32rcp", agx3_bind_ep(enc, 0),
+   return agx3_bind_compose(enc, AGX3_MN_f32rcp, agx3_bind_ep(enc, 0),
                             base, 7, ov, n, out, len);
 }
 
@@ -417,7 +417,7 @@ agx3_persp_mul_encode(enum agx_isa_encoding enc,
     * the extended ep5 form.  Try the canonical compact form first so all
     * existing GPR and slot1 witnesses remain byte-identical. */
    for (unsigned ep = 4; ep <= 5; ++ep) {
-      if (agx3_bind_compose(enc, "f32mul", agx3_bind_ep(enc, ep),
+      if (agx3_bind_compose(enc, AGX3_MN_f32mul, agx3_bind_ep(enc, ep),
                             base, 10, ov, n, out, len))
          return true;
    }
@@ -482,7 +482,7 @@ agx3_normflt_encode(enum agx_isa_encoding enc,
       if (d->wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(32 + i, 1);
 
-   if (agx3_bind_compose(enc, "normflt", agx3_bind_ep(enc, 0), base, nbase,
+   if (agx3_bind_compose(enc, AGX3_MN_normflt, agx3_bind_ep(enc, 0), base, nbase,
                          ov, n, out, len))
       return true;
 
@@ -552,7 +552,7 @@ agx3_rgb10a2_encode_for_encoding(enum agx_isa_encoding enc,
    fields[n++] = (struct agx3_field_kv)KV(94, 0);
    fields[n++] = (struct agx3_field_kv)KV(95, 0);
    fields[n++] = (struct agx3_field_kv)KV(96, 0);
-   return agx3_bind_compose(enc, "pack", agx3_bind_ep(enc, 0),
+   return agx3_bind_compose(enc, AGX3_MN_pack, agx3_bind_ep(enc, 0),
                            base, 2, fields, n, out, length);
 }
 
@@ -611,7 +611,7 @@ agx3_rgb10a2_unpack_encode(
    for (unsigned i = 0; i < nslots(enc); ++i)
       if (d->wait_mask & (1u << i))
          fields[n++] = (struct agx3_field_kv)KV(32 + i, 1);
-   return agx3_bind_compose(enc, "unpack", 0,
+   return agx3_bind_compose(enc, AGX3_MN_unpack, 0,
                            base, nbase, fields, n, out, length);
 }
 
@@ -649,6 +649,6 @@ agx3_rgb10a2_unpack_encode_g18g(
    for (unsigned i = 0; i < 8; ++i)
       if (d->wait_mask & (1u << i))
          fields[n++] = (struct agx3_field_kv)KV(32 + i, 1);
-   return agx3_bind_compose(enc, "unpack", agx3_bind_ep(enc, 0),
+   return agx3_bind_compose(enc, AGX3_MN_unpack, agx3_bind_ep(enc, 0),
                            base, 6, fields, n, out, length);
 }

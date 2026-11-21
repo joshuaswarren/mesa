@@ -59,7 +59,7 @@ agx3_select_encode(enum agx_isa_encoding encoding,
       if (I->saturate)
          return false;
       if (I->op == AGX3_SEL_OP_END)
-         return agx3_bind_compose(encoding, "end", AGX3_BIND_APPLE_ORDER,
+         return agx3_bind_compose(encoding, AGX3_MN_end, AGX3_BIND_APPLE_ORDER,
                                   end_fields, 2, NULL, 0, out, len);
       /* A 32-bit immediate into a register: the agx3c LDIMM row of
        * agx3_alu_table.h (f9=2 f10=2 f15=3 f16=105, f2 destination, f14
@@ -71,7 +71,7 @@ agx3_select_encode(enum agx_isa_encoding encoding,
             {9, 2}, {10, 2}, {15, 3}, {16, 105},
          };
          const struct agx3_field_kv ov[] = {{2, I->dest}, {14, I->imm}};
-         return agx3_bind_compose(encoding, "ldimm", AGX3_BIND_APPLE_ORDER,
+         return agx3_bind_compose(encoding, AGX3_MN_ldimm, AGX3_BIND_APPLE_ORDER,
                                   base, 4, ov, 2, out, len);
       }
       return false;

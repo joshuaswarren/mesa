@@ -200,12 +200,12 @@ agx3_reencode_fill(struct agx3_reencode_entry *e, uint64_t hash,
          agx3d_instr_length(encoded->bytes + at, encoded->length - at, NULL);
       uint8_t bytes[2 * AGX3_MAX_WORDS];
       if (n <= 0 ||
-          agx3_decode(&agx3d_table, encoded->bytes + at, n, "ldimm",
+          agx3_decode(&agx3d_table, encoded->bytes + at, n, AGX3_MN_ldimm,
                       l->fields) < 0 ||
           l->fields[AGX3_LDIMM_IMMEDIATE_FIELD] != immediates[k])
          return false;
       const int32_t form =
-         agx3_compose_apple_order(&agx3d_table, "ldimm", l->fields, bytes);
+         agx3_compose_apple_order(&agx3d_table, AGX3_MN_ldimm, l->fields, bytes);
       if (form < 0 || agx3d_table.forms[form].size != (unsigned)n ||
           memcmp(bytes, encoded->bytes + at, n))
          return false;
@@ -228,7 +228,7 @@ agx3_reencode_emit(struct agx3_reencode_entry *e, const uint32_t *immediates,
       uint8_t bytes[2 * AGX3_MAX_WORDS];
       l->fields[AGX3_LDIMM_IMMEDIATE_FIELD] = immediates[k];
       const int32_t form =
-         agx3_compose_apple_order(&agx3d_table, "ldimm", l->fields, bytes);
+         agx3_compose_apple_order(&agx3d_table, AGX3_MN_ldimm, l->fields, bytes);
       if (form < 0 || agx3d_table.forms[form].size != l->size)
          return false;
       memcpy(program->bytes + l->offset, bytes, l->size);

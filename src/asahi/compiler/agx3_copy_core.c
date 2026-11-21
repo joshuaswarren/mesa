@@ -69,7 +69,7 @@ agx3_copy_encode_reg16(enum agx_isa_encoding encoding, uint16_t dest_half,
    }
    for (int ep = dest_half >= AGX3_COPY_REG16_DEST_HALVES ? 1 : 0;
         ep <= (agx3c ? 1 : 0); ++ep) {
-      if (agx3_bind_compose(encoding, "copy", ep,
+      if (agx3_bind_compose(encoding, AGX3_MN_copy, ep,
                             agx3c ? baseline_c : baseline_b,
                             agx3c ? AGX3_COPY_ARRAY_SIZE(baseline_c)
                                   : AGX3_COPY_ARRAY_SIZE(baseline_b),
@@ -106,7 +106,7 @@ agx3_copy_encode_reg32(enum agx_isa_encoding encoding, uint16_t dest_half,
       if (wait_mask & (1u << i))
          overrides[n++] = (struct agx3_field_kv)KV(30 + i, 1);
    }
-   return agx3_bind_compose(encoding, "copy", 0, baseline,
+   return agx3_bind_compose(encoding, AGX3_MN_copy, 0, baseline,
                             AGX3_COPY_ARRAY_SIZE(baseline), overrides, n,
                             out, len);
 }
@@ -132,7 +132,7 @@ agx3_copy_encode_reg_to_uniform(enum agx_isa_encoding encoding,
          KV(23, 2), KV(24, 2), KV(27, kill), KV(28, 1), KV(29, 35),
       };
       for (unsigned ep = 0; ep <= 1; ++ep) {
-         if (agx3_bind_compose(encoding, "copy", ep, NULL, 0, fields,
+         if (agx3_bind_compose(encoding, AGX3_MN_copy, ep, NULL, 0, fields,
                               AGX3_COPY_ARRAY_SIZE(fields), out, len))
             return true;
       }
@@ -225,7 +225,7 @@ agx3_copy_encode_reg_to_uniform_g18g(enum agx_isa_encoding encoding,
       if (wait_mask & (1u << i))
          overrides[n++] = (struct agx3_field_kv)KV(30 + i, 1);
    }
-   return agx3_bind_compose(encoding, "copy", 1, baseline,
+   return agx3_bind_compose(encoding, AGX3_MN_copy, 1, baseline,
                             AGX3_COPY_ARRAY_SIZE(baseline), overrides, n,
                             out, len);
 }
@@ -255,7 +255,7 @@ agx3_copy_encode_uniform_to_reg16(enum agx_isa_encoding encoding,
       KV(28, m5 ? 3 : 0), KV(29, m5 ? 35 : 0),
    };
 
-   return agx3_bind_compose(encoding, "copy",
+   return agx3_bind_compose(encoding, AGX3_MN_copy,
                             dest_half >= AGX3_COPY_REG16_DEST_HALVES ? 1 : 0,
                             baseline,
                             AGX3_COPY_ARRAY_SIZE(baseline), overrides,
@@ -305,7 +305,7 @@ agx3_copy_encode_uniform_to_reg32(enum agx_isa_encoding encoding,
    };
 
    if (dest_half < AGX3_COPY_REG16_DEST_HALVES)
-      return agx3_bind_compose(encoding, "copy", agx3_bind_ep(encoding, 0),
+      return agx3_bind_compose(encoding, AGX3_MN_copy, agx3_bind_ep(encoding, 0),
                                baseline, nbaseline, overrides,
                                AGX3_COPY_ARRAY_SIZE(overrides), out, len);
 
@@ -339,7 +339,7 @@ agx3_copy_encode_uniform_to_reg32(enum agx_isa_encoding encoding,
     * The source kind and index fields are independent of that destination
     * extension, as with the corresponding extended half-register copy.
     */
-   return agx3_bind_compose(encoding, "copy", 1, baseline, nbaseline,
+   return agx3_bind_compose(encoding, AGX3_MN_copy, 1, baseline, nbaseline,
                             overrides,
                             AGX3_COPY_ARRAY_SIZE(overrides), out, len);
 }

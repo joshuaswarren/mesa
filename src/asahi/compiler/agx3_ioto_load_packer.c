@@ -249,7 +249,7 @@ pack_copy_fields(enum agx_isa_encoding enc, uint16_t destination_half,
    const uint8_t max_ep = 1;
    for (uint8_t ep = 0; ep <= max_ep; ++ep) {
       uint8_t length = 0;
-      if (!agx3_bind_compose(enc, "copy", ep, baseline, nbaseline, overrides,
+      if (!agx3_bind_compose(enc, AGX3_MN_copy, ep, baseline, nbaseline, overrides,
                              noverrides, record->bytes, &length))
          continue;
 

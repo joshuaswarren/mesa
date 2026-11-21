@@ -27,24 +27,24 @@ valid_reg(enum agx_isa_encoding enc, uint16_t reg)
    return limit != 0 && (reg & 1) == 0 && reg < limit;
 }
 
-static const char *
+static enum agx3_mnemonic
 shuffle_mnemonic(bool quad, enum agx3_subgroup_shuffle_op op)
 {
-   static const char *const simd[] = {
-      "simdbcast",
-      "simdbfly",
-      "simdshftup",
-      "simdshftdn",
+   static const enum agx3_mnemonic simd[] = {
+      AGX3_MN_simdbcast,
+      AGX3_MN_simdbfly,
+      AGX3_MN_simdshftup,
+      AGX3_MN_simdshftdn,
    };
-   static const char *const q[] = {
-      "quadshfl",
-      "quadbfly",
-      "quadshftup",
-      "quadshftdn",
+   static const enum agx3_mnemonic q[] = {
+      AGX3_MN_quadshfl,
+      AGX3_MN_quadbfly,
+      AGX3_MN_quadshftup,
+      AGX3_MN_quadshftdn,
    };
    return (unsigned)op < AGX3_SUBGROUP_SHUFFLE_NUM
              ? (quad ? q[op] : simd[op])
-             : NULL;
+             : AGX3_MN_NONE;
 }
 
 bool
@@ -65,7 +65,7 @@ agx3_subgroup_encode_active_mask(uint16_t dest, bool dest_cache,
    for (unsigned bit = 0; bit < 8; ++bit)
       if (wait_mask & (1u << bit))
          fields[count++] = (struct agx3_field_kv){46 + bit, 1};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,"simdiballot",0,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,AGX3_MN_simdiballot,0,
                            base,8,fields,count,out,length);
 }
 
@@ -101,7 +101,7 @@ agx3_subgroup_encode_quad_ballot_imm(uint16_t dest, bool dest_cache,
    for (unsigned bit = 0; bit < 8; ++bit)
       if (wait_mask & (1u << bit))
          fields[count++] = (struct agx3_field_kv){(uint16_t)(46 + bit), 1};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "quadiballot", 0, base, 8,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_quadiballot, 0, base, 8,
                             fields, count, out, length);
 }
 
@@ -141,8 +141,8 @@ encode_shuffle(enum agx_isa_encoding enc,
                : !valid_reg(enc, d->dest) || !valid_reg(enc, d->src))
       return false;
 
-   const char *mnemonic = shuffle_mnemonic(d->quad, d->op);
-   if (mnemonic == NULL)
+   enum agx3_mnemonic mnemonic = shuffle_mnemonic(d->quad, d->op);
+   if (mnemonic == AGX3_MN_NONE)
       return false;
 
    /*
@@ -430,7 +430,7 @@ encode_ballot(enum agx_isa_encoding enc,
          {2, d->dest}, {16, d->src}, {is_float ? 33 : 31, d->compare_value},
          {is_float ? 58 : 54, d->condition}, {is_float ? 59 : 55, d->invert},
       };
-      return agx3_bind_compose(enc, is_float ? "simdfballot" : "simdiballot",
+      return agx3_bind_compose(enc, is_float ? AGX3_MN_simdfballot : AGX3_MN_simdiballot,
                                0, base, nb, ov, sizeof(ov) / sizeof(ov[0]),
                                out, length);
    }
@@ -483,7 +483,7 @@ encode_ballot(enum agx_isa_encoding enc,
          {54, d->condition},
          {55, d->invert},
       };
-      return agx3_bind_compose(enc, "quadiballot", 0, qbase, qnb, qov,
+      return agx3_bind_compose(enc, AGX3_MN_quadiballot, 0, qbase, qnb, qov,
                                sizeof(qov) / sizeof(qov[0]), out, length);
    }
 
@@ -542,10 +542,10 @@ encode_ballot(enum agx_isa_encoding enc,
    if (g18g && is_c(enc) && d->compare_immediate && d->src_live)
       ADD_FIELD(25, 1);
 
-   const char *mnemonic;
+   enum agx3_mnemonic mnemonic;
    uint16_t cond_field, invert_field;
    if (d->type == AGX3_SUBGROUP_BALLOT_INTEGER) {
-      mnemonic = d->quad ? "quadiballot" : "simdiballot";
+      mnemonic = d->quad ? AGX3_MN_quadiballot : AGX3_MN_simdiballot;
       if (d->compare_immediate) {
          ADD_FIELD(38, 1);
          ADD_FIELD(39, 1);
@@ -566,7 +566,7 @@ encode_ballot(enum agx_isa_encoding enc,
          ADD_FIELD(45, d->quad ? 139 : 157);
       }
    } else {
-      mnemonic = d->quad ? "quadfballot" : "simdfballot";
+      mnemonic = d->quad ? AGX3_MN_quadfballot : AGX3_MN_simdfballot;
       ADD_FIELD(40, 1);
       ADD_FIELD(41, 2);
       cond_field = 58;
@@ -653,7 +653,7 @@ agx3_subgroup_encode_ballot_true_gpu1(uint16_t dest, bool dest_cache,
       {2, dest},
       {11, dest_cache ? 1u : 0u},
    };
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "simdiballot", 0, base,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_simdiballot, 0, base,
                             sizeof(base) / sizeof(base[0]), ov,
                             sizeof(ov) / sizeof(ov[0]), out, length);
 }
@@ -691,14 +691,14 @@ agx3_subgroup_encode_ballot_ult_reg_gpu1(
       {16, src0},
       {31, src1},
    };
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "simdiballot", 0, base,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_simdiballot, 0, base,
                             sizeof(base) / sizeof(base[0]), ov,
                             sizeof(ov) / sizeof(ov[0]), out, length);
 }
 
 struct reduce_form {
-   const char *simd;
-   const char *quad;
+   enum agx3_mnemonic simd;
+   enum agx3_mnemonic quad;
    uint8_t c_simd;
    uint8_t c_quad;
    bool is_float;
@@ -706,20 +706,20 @@ struct reduce_form {
 };
 
 static const struct reduce_form reduce_forms[AGX3_SUBGROUP_REDUCE_NUM] = {
-   [AGX3_SUBGROUP_REDUCE_AND] = {"sRedAND", "qRedAND", 169, 123, false, 2},
-   [AGX3_SUBGROUP_REDUCE_FADD] = {"sRedf32add", "qRedf32add", 172, 126, true,
+   [AGX3_SUBGROUP_REDUCE_AND] = {AGX3_MN_sRedAND, AGX3_MN_qRedAND, 169, 123, false, 2},
+   [AGX3_SUBGROUP_REDUCE_FADD] = {AGX3_MN_sRedf32add, AGX3_MN_qRedf32add, 172, 126, true,
                                   0},
-   [AGX3_SUBGROUP_REDUCE_OR] = {"sRedOR", "qRedOR", 177, 131, false, 2},
-   [AGX3_SUBGROUP_REDUCE_FMUL] = {"sRedf32mul", "qRedf32mul", 173, 127, true,
+   [AGX3_SUBGROUP_REDUCE_OR] = {AGX3_MN_sRedOR, AGX3_MN_qRedOR, 177, 131, false, 2},
+   [AGX3_SUBGROUP_REDUCE_FMUL] = {AGX3_MN_sRedf32mul, AGX3_MN_qRedf32mul, 173, 127, true,
                                   0},
-   [AGX3_SUBGROUP_REDUCE_XOR] = {"sRedXOR", "qRedXOR", 182, 136, false, 2},
-   [AGX3_SUBGROUP_REDUCE_FMIN] = {"sRedfmin", "qRedfmin", 175, 129, true, 0},
-   [AGX3_SUBGROUP_REDUCE_FMAX] = {"sRedfmax", "qRedfmax", 174, 128, true, 0},
-   [AGX3_SUBGROUP_REDUCE_IADD] = {"sRediadd", "qRediadd", 176, 130, false, 0},
-   [AGX3_SUBGROUP_REDUCE_SMIN] = {"sRedsmin", "qRedsmin", 179, 133, false, 1},
-   [AGX3_SUBGROUP_REDUCE_SMAX] = {"sRedsmax", "qRedsmax", 178, 132, false, 1},
-   [AGX3_SUBGROUP_REDUCE_UMIN] = {"sRedumin", "qRedumin", 181, 135, false, 2},
-   [AGX3_SUBGROUP_REDUCE_UMAX] = {"sRedumax", "qRedumax", 180, 134, false, 2},
+   [AGX3_SUBGROUP_REDUCE_XOR] = {AGX3_MN_sRedXOR, AGX3_MN_qRedXOR, 182, 136, false, 2},
+   [AGX3_SUBGROUP_REDUCE_FMIN] = {AGX3_MN_sRedfmin, AGX3_MN_qRedfmin, 175, 129, true, 0},
+   [AGX3_SUBGROUP_REDUCE_FMAX] = {AGX3_MN_sRedfmax, AGX3_MN_qRedfmax, 174, 128, true, 0},
+   [AGX3_SUBGROUP_REDUCE_IADD] = {AGX3_MN_sRediadd, AGX3_MN_qRediadd, 176, 130, false, 0},
+   [AGX3_SUBGROUP_REDUCE_SMIN] = {AGX3_MN_sRedsmin, AGX3_MN_qRedsmin, 179, 133, false, 1},
+   [AGX3_SUBGROUP_REDUCE_SMAX] = {AGX3_MN_sRedsmax, AGX3_MN_qRedsmax, 178, 132, false, 1},
+   [AGX3_SUBGROUP_REDUCE_UMIN] = {AGX3_MN_sRedumin, AGX3_MN_qRedumin, 181, 135, false, 2},
+   [AGX3_SUBGROUP_REDUCE_UMAX] = {AGX3_MN_sRedumax, AGX3_MN_qRedumax, 180, 134, false, 2},
 };
 
 static bool
@@ -747,15 +747,15 @@ encode_reduce(enum agx_isa_encoding enc,
     */
    const bool f16_arith = d->half && (d->op == AGX3_SUBGROUP_REDUCE_FADD ||
                                       d->op == AGX3_SUBGROUP_REDUCE_FMUL);
-   const char *mnemonic;
+   enum agx3_mnemonic mnemonic;
    if (f16_arith) {
       const bool add = d->op == AGX3_SUBGROUP_REDUCE_FADD;
-      mnemonic = d->quad ? (add ? "qRedf16add" : "qRedf16mul")
-                         : (add ? "sRedf16add" : "sRedf16mul");
+      mnemonic = d->quad ? (add ? AGX3_MN_qRedf16add : AGX3_MN_qRedf16mul)
+                         : (add ? AGX3_MN_sRedf16add : AGX3_MN_sRedf16mul);
    } else {
       mnemonic = d->quad ? f->quad : f->simd;
    }
-   if (mnemonic == NULL || mnemonic[0] == '\0')
+   if (mnemonic == AGX3_MN_NONE)
       return false;
    /*
     * Metal has scans for sums and products only, so those are the witnessed

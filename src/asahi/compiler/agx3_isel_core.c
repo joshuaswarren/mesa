@@ -64,7 +64,7 @@ agx3_bittest_encode(enum agx_isa_encoding enc,
       if (d->wait_mask & (1u << slot))
          ov[n++] = (struct agx3_field_kv)KV(98 + slot, 1);
    }
-   return agx3_bind_compose(enc, "isel", negate ? 22 : 27, base,
+   return agx3_bind_compose(enc, AGX3_MN_isel, negate ? 22 : 27, base,
                            sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
 
@@ -298,7 +298,7 @@ encode_explicit(const struct agx3_isel_desc *d,
       ov[n++] = (struct agx3_field_kv)KV(98 + i, (d->wait_mask >> i) & 1);
 
    const unsigned ep = d->dest_16 ? 25 + (d->dest & 1) : 27;
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "isel", ep,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_isel, ep,
                            base, sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
 
@@ -433,7 +433,7 @@ encode_gpu1(const struct agx3_isel_desc *d,
    const unsigned last = d->dest_16 ? 8 : 4;
    for (unsigned ep = first; ep <= last; ++ep)
       if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,
-                            d->dest_16 ? "iseli16" : "iseli32", ep,
+                            d->dest_16 ? AGX3_MN_iseli16 : AGX3_MN_iseli32, ep,
                             base, sizeof(base) / sizeof(base[0]), ov, n, out, len))
          return true;
    return false;
@@ -502,7 +502,7 @@ encode_agx3c(const struct agx3_isel_desc *d,
    for (unsigned i = 0; i < 8; ++i)
       ov[n++] = (struct agx3_field_kv)KV(74 + i, (d->wait_mask >> i) & 1);
 
-   const char *mnemonic = d->dest_16 ? "iseli16" : "iseli32";
+   enum agx3_mnemonic mnemonic = d->dest_16 ? AGX3_MN_iseli16 : AGX3_MN_iseli32;
    for (unsigned ep = 0; ep < 16; ++ep) {
       if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, mnemonic, ep, base,
                             sizeof(base) / sizeof(base[0]), ov, n, out, len))
@@ -593,7 +593,7 @@ agx3_isel_encode(enum agx_isa_encoding encoding,
          ov[n++] = (struct agx3_field_kv)KV(98 + i, 1);
    }
 
-   return agx3_bind_compose(encoding, "isel", ep, form->base, form->nbase, ov,
+   return agx3_bind_compose(encoding, AGX3_MN_isel, ep, form->base, form->nbase, ov,
                             n, out, len);
 }
 

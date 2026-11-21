@@ -10,7 +10,7 @@
 
 /* Static G17G/G18G helpers, defined beside their encoders below. */
 static bool
-bit_reg_gpu1(const char *mnemonic, uint8_t ep, unsigned table, bool word,
+bit_reg_gpu1(enum agx3_mnemonic mnemonic, uint8_t ep, unsigned table, bool word,
              uint16_t dest, bool dest_cache, uint16_t src0,
              enum agx3_alu_hint hint0, uint16_t src1,
              enum agx3_alu_hint hint1, uint16_t wait_mask,
@@ -68,7 +68,7 @@ agx3_alu_bitrev_m5(uint16_t dest, uint16_t src, bool src_half,
    for (unsigned i = 0; i < 8; ++i)
       if (wait_mask & (1u << i))
          fields[n++] = (struct agx3_field_kv){31 + i, 1};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "rev", 0, base, 6, fields,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_rev, 0, base, 6, fields,
                             n, out, len);
 }
 
@@ -116,7 +116,7 @@ agx3_alu_popcount(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
       if (wait_mask & (1u << slot))
          fields[n++] = (struct agx3_field_kv){31 + slot, 1};
    }
-   return agx3_bind_compose(enc, "cbs", 0, base, m5 ? 6 : 4, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_cbs, 0, base, m5 ? 6 : 4, fields, n, out, len);
 }
 
 /* G18G (M6), which compiles as agx3c: the G18G-witnessed cbs form. A live
@@ -162,7 +162,7 @@ agx3_alu_popcount_g18g(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
          {27, hint == AGX3_ALU_HINT_DISCARD},
          {29, 3}, {30, 23}, {31, wait_mask & 1}, {38, !!(wait_mask & 128)},
       };
-      return agx3_bind_compose(enc, "cbs", 0, fields,
+      return agx3_bind_compose(enc, AGX3_MN_cbs, 0, fields,
                                  sizeof(fields) / sizeof(fields[0]),
                                  NULL, 0, out, len);
    }
@@ -207,7 +207,7 @@ agx3_alu_popcount_g18g(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
       if (wait_mask & (1u << slot))
          fields[n++] = (struct agx3_field_kv){31 + slot, 1};
    }
-   return agx3_bind_compose(enc, "cbs", 0, base, 4, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_cbs, 0, base, 4, fields, n, out, len);
 }
 
 bool
@@ -229,7 +229,7 @@ agx3_alu_ft1_u32(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
       };
       for (unsigned i=0;i<8;i++)
          f[5+i]=(struct agx3_field_kv){31+i,!!(wait_mask & (1u<<i))};
-      return agx3_bind_compose(enc,"ft1",0,base,6,f,13,out,len);
+      return agx3_bind_compose(enc,AGX3_MN_ft1,0,base,6,f,13,out,len);
    }
 
    if (enc != AGX_ISA_ENCODING_AGX3B || !out || !len || dest >= 256 ||
@@ -258,7 +258,7 @@ agx3_alu_ft1_u32(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
       fields[n++] = (struct agx3_field_kv){36 + slot,
                                           !!(wait_mask & (1u << slot))};
 
-   if (!agx3_bind_compose(enc, "ft1", 0, base, 4, fields, n, out, len))
+   if (!agx3_bind_compose(enc, AGX3_MN_ft1, 0, base, 4, fields, n, out, len))
       return false;
 
    /* The recovered composer form fixes the independent source byte to zero,
@@ -272,7 +272,7 @@ agx3_alu_ft1_u32(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
 /* f10, f24 and f38 are the result's and the two operands' widths: 1 for a
  * half, 2 for an aligned 32-bit pair. */
 static bool
-bit_reg_gpu1(const char *mnemonic, uint8_t ep, unsigned table, bool word,
+bit_reg_gpu1(enum agx3_mnemonic mnemonic, uint8_t ep, unsigned table, bool word,
              uint16_t dest, bool dest_cache, uint16_t src0,
              enum agx3_alu_hint hint0, uint16_t src1,
              enum agx3_alu_hint hint1, uint16_t wait_mask,
@@ -316,7 +316,7 @@ agx3_alu_bit_andc16_gpu1(uint16_t dest, bool dest_cache, uint16_t src0,
 {
    /* Apple applegpu_g17g ctz: 33 03 06 01 3a 20 a2 02 84 00
     *   bit_andc h3 (cached), h3 (dead), h2 (cached) */
-   return bit_reg_gpu1("bit_andc", 0, 11, false, dest, dest_cache, src0,
+   return bit_reg_gpu1(AGX3_MN_bit_andc, 0, 11, false, dest, dest_cache, src0,
                        hint0, src1, hint1, wait_mask, out, len);
 }
 
@@ -326,7 +326,7 @@ agx3_alu_bit_andc32_gpu1(uint16_t dest, bool dest_cache, uint16_t src0,
                          enum agx3_alu_hint hint1, uint16_t wait_mask,
                          uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   return bit_reg_gpu1("bit_andc", 0, 11, true, dest, dest_cache, src0,
+   return bit_reg_gpu1(AGX3_MN_bit_andc, 0, 11, true, dest, dest_cache, src0,
                        hint0, src1, hint1, wait_mask, out, len);
 }
 
@@ -337,14 +337,14 @@ agx3_alu_bit_named_gpu1(unsigned truth_table, bool word, uint16_t dest,
                         enum agx3_alu_hint hint1, uint16_t wait_mask,
                         uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   const char *mnemonic;
+   enum agx3_mnemonic mnemonic;
    unsigned table;
    switch (truth_table) {
-   case 0x1u: mnemonic = "bit_nor"; table = 14; break;
-   case 0x2u: mnemonic = "bit_andc"; table = 11; break;
-   case 0x7u: mnemonic = "bit_nand"; table = 12; break;
-   case 0x9u: mnemonic = "bit_xnor"; table = 18; break;
-   case 0xbu: mnemonic = "bit_orc"; table = 17; break;
+   case 0x1u: mnemonic = AGX3_MN_bit_nor; table = 14; break;
+   case 0x2u: mnemonic = AGX3_MN_bit_andc; table = 11; break;
+   case 0x7u: mnemonic = AGX3_MN_bit_nand; table = 12; break;
+   case 0x9u: mnemonic = AGX3_MN_bit_xnor; table = 18; break;
+   case 0xbu: mnemonic = AGX3_MN_bit_orc; table = 17; break;
    default: return false;
    }
    for (uint8_t ep = 0; ep < 2; ++ep)
@@ -363,13 +363,13 @@ agx3_alu_bit_reg16_gpu1(enum agx3_alu_op op, uint16_t dest, bool dest_cache,
 {
    switch (op) {
    case AGX3_ALU_BAND:
-      return bit_reg_gpu1("bit_and", 1, 10, false, dest, dest_cache, src0,
+      return bit_reg_gpu1(AGX3_MN_bit_and, 1, 10, false, dest, dest_cache, src0,
                           hint0, src1, hint1, wait_mask, out, len);
    case AGX3_ALU_BOR:
-      return bit_reg_gpu1("bit_or", 1, 16, false, dest, dest_cache, src0,
+      return bit_reg_gpu1(AGX3_MN_bit_or, 1, 16, false, dest, dest_cache, src0,
                           hint0, src1, hint1, wait_mask, out, len);
    case AGX3_ALU_BXOR:
-      return bit_reg_gpu1("bit_xor", 1, 19, false, dest, dest_cache, src0,
+      return bit_reg_gpu1(AGX3_MN_bit_xor, 1, 19, false, dest, dest_cache, src0,
                           hint0, src1, hint1, wait_mask, out, len);
    default:
       return false;
@@ -398,7 +398,7 @@ agx3_alu_ft1_gpu1(uint16_t dest, uint16_t src, bool half,
       {27, hint == AGX3_ALU_HINT_DISCARD},
       {29, 3}, {30, 79}, {38, !!wait_mask},
    };
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "ft1", 0, fields,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_ft1, 0, fields,
                             sizeof(fields) / sizeof(fields[0]), NULL, 0, out,
                             len);
 }
@@ -426,7 +426,7 @@ agx3_alu_rev_gpu1(uint16_t dest, uint16_t src, enum agx3_alu_hint hint,
       {27, hint == AGX3_ALU_HINT_DISCARD},
       {29, 3}, {30, 143}, {38, !!wait_mask},
    };
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "rev", 0, fields,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_rev, 0, fields,
                             sizeof(fields) / sizeof(fields[0]), NULL, 0, out,
                             len);
 }
@@ -498,7 +498,7 @@ agx3_alu_fcmp_bool16_gpu1(uint16_t dest, uint16_t src0,
    fields[n++] = (struct agx3_field_kv){86, condition};
    for (unsigned f = 90; f <= 94; ++f)
       fields[n++] = (struct agx3_field_kv){f, 0};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "fseli16", 8, fields, n,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_fseli16, 8, fields, n,
                             NULL, 0, out, len);
 }
 
@@ -530,7 +530,7 @@ agx3_alu_sqrt_step_source_modifiers(enum agx_isa_encoding enc, uint16_t dest, ui
    };
    for (unsigned i = 0; i < 6; ++i)
       fields[7+i] = (struct agx3_field_kv){35+i,!!(wait_mask & (1u<<i))};
-   return agx3_bind_compose(enc,"f32sqrtstep",0,m5 ? base_c : base,m5 ? 6 : 4,fields,13,out,len);
+   return agx3_bind_compose(enc,AGX3_MN_f32sqrtstep,0,m5 ? base_c : base,m5 ? 6 : 4,fields,13,out,len);
 }
 
 bool
@@ -564,7 +564,7 @@ agx3_alu_sqrt_step_half(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
       fields[12] = (struct agx3_field_kv){41, !!(wait_mask & 64)};
       fields[13] = (struct agx3_field_kv){42, !!(wait_mask & 128)};
    }
-   return agx3_bind_compose(enc, "f32sqrtstep", 0, base, 4, fields,
+   return agx3_bind_compose(enc, AGX3_MN_f32sqrtstep, 0, base, 4, fields,
                             m5 ? 14 : 10, out, len);
 }
 
@@ -651,7 +651,7 @@ agx3_alu_fmul_minifloat_narrow(
    /* Native G17G scale kernels use ep1 for ready inputs and ep3 when
     * waiting on slot8. Preserve the G17P ep1-only admission. */
    for (unsigned ep = 1; ep <= (gpu1 ? 3 : 1); ++ep) {
-      if (agx3_bind_compose(enc, "f32mul", ep, base, gpu1 ? 10 : 8,
+      if (agx3_bind_compose(enc, AGX3_MN_f32mul, ep, base, gpu1 ? 10 : 8,
                              fields, n, encoded, &encoded_len)) {
          composed = true;
          break;
@@ -687,7 +687,7 @@ agx3_alu_fmul_half_minifloat_to_f32(
    const struct agx3_field_kv fields[] = {
       {2, dest}, {17, immediate}, {35, src},
    };
-   return agx3_bind_compose(enc, "f32mul", 1, base, 10, fields, 3, out,
+   return agx3_bind_compose(enc, AGX3_MN_f32mul, 1, base, 10, fields, 3, out,
                             len);
 }
 
@@ -723,7 +723,7 @@ agx3_alu_fmul_half_minifloat_m5(
       fields[n++] = (struct agx3_field_kv){80 + slot, !!(wait_mask & (1u << slot))};
 
    for (unsigned ep = 1; ep <= 3; ++ep)
-      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "f32mul", ep, base, 10,
+      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_f32mul, ep, base, 10,
                             fields, n, out, len))
          return true;
    return false;
@@ -762,7 +762,7 @@ agx3_alu_fadd_minifloat(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
    /* This encoding point rejects unsupported wait combinations. Do not
     * silently clear waits or switch to an unwitnessed long-form variant.
     */
-   return agx3_bind_compose(enc, "f32add", 1, base, 6, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_f32add, 1, base, 6, fields, n, out, len);
 }
 
 /* G18G (M6), which compiles as agx3c: also the compact agx3c
@@ -807,7 +807,7 @@ agx3_alu_fadd_minifloat_g18g(enum agx_isa_encoding enc, uint16_t dest, uint16_t 
    /* This encoding point rejects unsupported wait combinations. Do not
     * silently clear waits or switch to an unwitnessed long-form variant.
     */
-   return agx3_bind_compose(enc, "f32add", 1, base, gpu1 ? 8 : 6,
+   return agx3_bind_compose(enc, AGX3_MN_f32add, 1, base, gpu1 ? 8 : 6,
                            fields, n, out, len);
 }
 
@@ -848,7 +848,7 @@ agx3_alu_fadd_minifloat_mod(enum agx_isa_encoding enc, uint16_t dest,
       if (wait_mask & (1u << slot))
          fields[n++] = (struct agx3_field_kv){52 + slot, 1};
 
-   return agx3_bind_compose(enc, "f32add", saturate ? 2 : 1,
+   return agx3_bind_compose(enc, AGX3_MN_f32add, saturate ? 2 : 1,
                             base, 6, fields, n, out, len);
 }
 
@@ -894,7 +894,7 @@ agx3_alu_fadd_minifloat_mod_g18g(enum agx_isa_encoding enc, uint16_t dest,
       if (wait_mask & (1u << slot))
          fields[n++] = (struct agx3_field_kv){52 + slot, 1};
 
-   return agx3_bind_compose(enc, "f32add", saturate ? 2 : 1,
+   return agx3_bind_compose(enc, AGX3_MN_f32add, saturate ? 2 : 1,
                             base, gpu1 ? 8 : 6, fields, n, out, len);
 }
 
@@ -930,7 +930,7 @@ agx3_alu_fadd_abs_minifloat(
                                           (wait_mask >> slot) & 1};
 
    uint8_t encoded[AGX3_ALU_MAX_LENGTH], encoded_len = 0;
-   if (!agx3_bind_compose(enc, "f32add", 3, base, 6, fields, n,
+   if (!agx3_bind_compose(enc, AGX3_MN_f32add, 3, base, 6, fields, n,
                           encoded, &encoded_len))
       return false;
    memcpy(out, encoded, encoded_len);
@@ -967,7 +967,7 @@ agx3_alu_fadd_one_absneg(enum agx_isa_encoding enc, uint16_t dest,
                                           (wait_mask >> slot) & 1};
 
    for (unsigned ep = 0; ep <= 3; ++ep) {
-      if (agx3_bind_compose(enc, "f32add", ep, base, 6, fields, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_f32add, ep, base, 6, fields, n, out, len))
          return true;
    }
 
@@ -1001,7 +1001,7 @@ agx3_alu_fadd_abs_negzero(enum agx_isa_encoding enc, uint16_t dest,
                                           (wait_mask >> slot) & 1};
 
    for (unsigned ep = 0; ep <= 3; ++ep) {
-      if (agx3_bind_compose(enc, "f32add", ep, base, 6, fields, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_f32add, ep, base, 6, fields, n, out, len))
          return true;
    }
 
@@ -1127,7 +1127,7 @@ agx3_alu_fadd_stage(enum agx_isa_encoding enc, uint16_t staging_dest,
    }
 
    for (unsigned ep = 0; ep <= 3; ++ep) {
-      if (agx3_bind_compose(enc, "f32add", ep, base, 6, fields, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_f32add, ep, base, 6, fields, n, out, len))
          return true;
    }
 
@@ -1170,7 +1170,7 @@ agx3_alu_fma_minifloat_mod(enum agx_isa_encoding enc, uint16_t dest,
          fields[n++] = (struct agx3_field_kv){97 + slot,
                                              !!(wait_mask & (1u << slot))};
    for (unsigned ep = 2; ep <= (gpu1 ? 7 : 4); ep++)
-      if(agx3_bind_compose(enc,"f32fma",ep,base,gpu1 ? 13 : ((negate_addend || saturate) ? 11 : 10),
+      if(agx3_bind_compose(enc,AGX3_MN_f32fma,ep,base,gpu1 ? 13 : ((negate_addend || saturate) ? 11 : 10),
                            fields,n,out,len))
          return true;
    return false;
@@ -1217,7 +1217,7 @@ agx3_alu_int16_to_f32(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
    for (unsigned slot = 0; slot < (gpu1 ? 8 : 6); ++slot)
       if (wait_mask & (1u << slot))
          fields[n++] = (struct agx3_field_kv){33 + slot, 1};
-   return agx3_bind_compose(enc, "int2flt", 0, base, gpu1 ? 6 : 4,
+   return agx3_bind_compose(enc, AGX3_MN_int2flt, 0, base, gpu1 ? 6 : 4,
                            fields, n, out, len);
 }
 
@@ -1280,7 +1280,7 @@ agx3_alu_float_to_int32(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
       fields[n++] =
          (struct agx3_field_kv){33 + slot, !!(wait_mask & (1u << slot))};
 
-   return agx3_bind_compose(enc, "flt2int", 0, base, m5 ? 8 : 6, fields, n, out,
+   return agx3_bind_compose(enc, AGX3_MN_flt2int, 0, base, m5 ? 8 : 6, fields, n, out,
                             len);
 }
 
@@ -1335,7 +1335,7 @@ agx3_alu_float_to_int16(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
       fields[n++] = (struct agx3_field_kv){33 + slot,
                                            !!(wait_mask & (1u << slot))};
 
-   return agx3_bind_compose(enc, "flt2int", 0, base, m5 ? 8 : 6, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_flt2int, 0, base, m5 ? 8 : 6, fields, n, out, len);
 }
 
 bool
@@ -1360,7 +1360,7 @@ agx3_alu_add_imm16(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
    unsigned n=6;
    for(unsigned i=0;i<6;++i)
       if(wait_mask & (1u<<i))fields[n++]=(struct agx3_field_kv){45+i,1};
-   return agx3_bind_compose(enc,"iadd",0,base,6,fields,n,out,len);
+   return agx3_bind_compose(enc,AGX3_MN_iadd,0,base,6,fields,n,out,len);
 }
 
 bool
@@ -1404,7 +1404,7 @@ agx3_alu_mov16(enum agx_isa_encoding enc, uint16_t dest, uint32_t bits,
        bits > 0xffff || wait_mask)
       return false;
    const struct agx3_field_kv fields[] = {{9, 2}, {10, 1}, {2, dest}, {14, bits}};
-   return agx3_bind_compose(enc, "ldimm", 1, fields, 4, NULL, 0, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_ldimm, 1, fields, 4, NULL, 0, out, len);
 }
 
 bool
@@ -1428,7 +1428,7 @@ agx3_alu_mov16_gpu1(uint16_t dest, bool dest_cache, uint32_t bits,
    for (unsigned i = 0; i < 8; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv){17 + i, 1};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "ldimm", 2, base, 4, ov, n,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_ldimm, 2, base, 4, ov, n,
                             out, len);
 }
 
@@ -1458,8 +1458,8 @@ agx3_alu_fmul_mixed(enum agx_isa_encoding enc, uint16_t dest,
    for (unsigned bit = 0; bit < 6; ++bit)
       if (wait_mask & (1u << bit))
          fields[n++] = (struct agx3_field_kv){80 + bit, 1};
-   return agx3_bind_compose(enc, "f32mul", 0, base, 8, fields, n, out, len) ||
-          agx3_bind_compose(enc, "f32mul", 1, base, 8, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_f32mul, 0, base, 8, fields, n, out, len) ||
+          agx3_bind_compose(enc, AGX3_MN_f32mul, 1, base, 8, fields, n, out, len);
 }
 
 bool
@@ -1497,7 +1497,7 @@ agx3_alu_fmul_abs_mixed(
       fields[8 + slot] = (struct agx3_field_kv){80 + slot,
                                                !!(wait_mask & (1u << slot))};
 
-   return agx3_bind_compose(enc, "f32mul", 3, base, 9, fields, 14, out,
+   return agx3_bind_compose(enc, AGX3_MN_f32mul, 3, base, 9, fields, 14, out,
                             len);
 }
 
@@ -1536,7 +1536,7 @@ agx3_alu_fadd_mixed_half(
 
       const unsigned ep = (wait_mask & 0xc0) ? 3 :
                           ((wait_mask & (wait_mask - 1)) ? 2 : 1);
-      return agx3_bind_compose(enc, "f32add", ep, base, 8, fields, n,
+      return agx3_bind_compose(enc, AGX3_MN_f32add, ep, base, 8, fields, n,
                                out, len);
    }
 
@@ -1569,7 +1569,7 @@ agx3_alu_fadd_mixed_half(
       fields[8 + i] = (struct agx3_field_kv){52 + i,
                                             !!(wait_mask & (1u << i))};
 
-   return agx3_bind_compose(enc, "f32add", 1, base, 6, fields, 14, out,
+   return agx3_bind_compose(enc, AGX3_MN_f32add, 1, base, 6, fields, 14, out,
                             len);
 }
 
@@ -1605,7 +1605,7 @@ agx3_alu_fadd_abs_mixed_half(
       fields[8 + i] = (struct agx3_field_kv){52 + i,
                                             !!(wait_mask & (1u << i))};
 
-   return agx3_bind_compose(enc, "f32add", 3, base, 7, fields, 14, out,
+   return agx3_bind_compose(enc, AGX3_MN_f32add, 3, base, 7, fields, 14, out,
                             len);
 }
 
@@ -1650,7 +1650,7 @@ agx3_alu_fmul_mixed_half(enum agx_isa_encoding enc, uint16_t dest, uint16_t f32,
       fields[17] = (struct agx3_field_kv){87, !!(wait_mask & 128)};
    }
    for (unsigned ep = 0; ep < (m5 ? 4 : 2); ++ep)
-      if (agx3_bind_compose(enc, "f32mul", ep, base, 8, fields, m5 ? 18 : 14,
+      if (agx3_bind_compose(enc, AGX3_MN_f32mul, ep, base, 8, fields, m5 ? 18 : 14,
                             out, len))
          return true;
    return false;
@@ -1988,7 +1988,7 @@ agx3_alu_bit_reg_native(enum agx_isa_encoding enc, enum agx3_alu_op op,
       {46,!!(wait_mask & 4)}, {47,!!(wait_mask & 8)},
       {48,!!(wait_mask & 16)}, {49,!!(wait_mask & 32)},
    };
-   const char *name = agx3_alu_forms[op][0].mnemonic;
+   const enum agx3_mnemonic name = agx3_alu_forms[op][0].mnemonic;
    return agx3_bind_compose(enc,name,0,base,6,fields,14,out,len) ||
           agx3_bind_compose(enc,name,1,base,6,fields,14,out,len);
 }
@@ -2038,7 +2038,7 @@ bool
 agx3_alu_band_identity_live_gpu1(uint16_t reg, uint16_t wait_mask,
                                  uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   return bit_reg_gpu1("bit_and", 1, 10, !(reg & 1), reg, false, reg,
+   return bit_reg_gpu1(AGX3_MN_bit_and, 1, 10, !(reg & 1), reg, false, reg,
                        AGX3_ALU_HINT_CACHE, reg, AGX3_ALU_HINT_CACHE,
                        wait_mask | (UINT16_C(1) << 7), out, len);
 }
@@ -2137,7 +2137,7 @@ agx3_alu_and_imm16_m5(uint16_t dest, uint16_t src, uint8_t immediate,
    for (unsigned slot = 0; slot < 8; ++slot)
       if (wait_mask & (1u << slot))
          fields[n++] = (struct agx3_field_kv){44 + slot, 1};
-   const char *name = complement ? "bit_andc" : "bit_and";
+   enum agx3_mnemonic name = complement ? AGX3_MN_bit_andc : AGX3_MN_bit_and;
    return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, name, 0, base, 8,
                              fields, n, out, len) ||
           agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, name, 1, base, 8,
@@ -2171,7 +2171,7 @@ agx3_alu_complement_reg16_m5(uint16_t dest, const uint16_t src[2],
    for (unsigned slot = 0; slot < 8; ++slot)
       if (wait_mask & (1u << slot))
          fields[n++] = (struct agx3_field_kv){44 + slot, 1};
-   const char *name = disjunction ? "bit_orc" : "bit_andc";
+   enum agx3_mnemonic name = disjunction ? AGX3_MN_bit_orc : AGX3_MN_bit_andc;
    return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, name, 0, base, 8,
                              fields, n, out, len) ||
           agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, name, 1, base, 8,
@@ -2209,7 +2209,7 @@ agx3_alu_bit_not_m5(uint16_t dest, uint16_t src, bool word,
    for (unsigned slot = 0; slot < 8; ++slot)
       if (wait_mask & (1u << slot))
          fields[n++] = (struct agx3_field_kv){30 + slot, 1};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "inv", 0, base,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_inv, 0, base,
                             sizeof(base) / sizeof(base[0]), fields, n, out,
                             len);
 }
@@ -2237,7 +2237,7 @@ agx3_alu_bit_not_reg16(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
    for (unsigned slot = 0; slot < 6; ++slot)
       fields[n++] = (struct agx3_field_kv){30 + slot,
                                           !!(wait_mask & (1u << slot))};
-   return agx3_bind_compose(enc, "inv", 0, base,
+   return agx3_bind_compose(enc, AGX3_MN_inv, 0, base,
                             sizeof(base) / sizeof(base[0]), fields, n, out,
                             len);
 }
@@ -2246,7 +2246,7 @@ agx3_alu_bit_not_reg16(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
  * ordinary bitops' operand, hint and wait topology; only the mnemonic
  * carries the truth table. */
 static bool
-agx3_alu_bit_named_width(enum agx_isa_encoding enc, const char *mnemonic,
+agx3_alu_bit_named_width(enum agx_isa_encoding enc, enum agx3_mnemonic mnemonic,
                    uint16_t dest, const uint16_t src[2],
                    const enum agx3_alu_hint hints[2], const bool half[2], bool dest_cache,
                    uint16_t wait_mask, uint8_t out[AGX3_ALU_MAX_LENGTH],
@@ -2261,9 +2261,9 @@ agx3_alu_bit_named_width(enum agx_isa_encoding enc, const char *mnemonic,
        (unsigned)hints[1] > AGX3_ALU_HINT_CACHE)
       return false;
 
-   const unsigned table = !strcmp(mnemonic, "bit_andc") ? 11 :
-      !strcmp(mnemonic, "bit_nor") ? 14 : !strcmp(mnemonic, "bit_nand") ? 12 :
-      !strcmp(mnemonic, "bit_xnor") ? 18 : !strcmp(mnemonic, "bit_orc") ? 17 : 0;
+   const unsigned table = mnemonic == AGX3_MN_bit_andc ? 11 :
+      mnemonic == AGX3_MN_bit_nor ? 14 : mnemonic == AGX3_MN_bit_nand ? 12 :
+      mnemonic == AGX3_MN_bit_xnor ? 18 : mnemonic == AGX3_MN_bit_orc ? 17 : 0;
    if (m5 && !table)
       return false;
    const struct agx3_field_kv base[] = {
@@ -2286,7 +2286,7 @@ agx3_alu_bit_named_width(enum agx_isa_encoding enc, const char *mnemonic,
 }
 
 static bool
-agx3_alu_bit_named(enum agx_isa_encoding enc, const char *mnemonic,
+agx3_alu_bit_named(enum agx_isa_encoding enc, enum agx3_mnemonic mnemonic,
                    uint16_t dest, const uint16_t src[2],
                    const enum agx3_alu_hint hints[2], bool dest_cache,
                    uint16_t wait_mask, uint8_t out[AGX3_ALU_MAX_LENGTH],
@@ -2303,7 +2303,7 @@ agx3_alu_bit_andc_width_m5(uint16_t dest, const uint16_t src[2],
                            bool dest_cache, uint16_t wait_mask,
                            uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   return agx3_alu_bit_named_width(AGX_ISA_ENCODING_AGX3C, "bit_andc", dest,
+   return agx3_alu_bit_named_width(AGX_ISA_ENCODING_AGX3C, AGX3_MN_bit_andc, dest,
                                   src, hints, half, dest_cache, wait_mask,
                                   out, len);
 }
@@ -2319,7 +2319,7 @@ agx3_alu_bit_andc(enum agx_isa_encoding enc, uint16_t dest,
     *   0b010e03020000800000  bit_andc r0, ^r0, ^r1
     * Keeping the first input independently gives:
     *   0b031605020000800000  bit_andc r0, r1, ^r2 */
-   return agx3_alu_bit_named(enc, "bit_andc", dest, src, hints, dest_cache,
+   return agx3_alu_bit_named(enc, AGX3_MN_bit_andc, dest, src, hints, dest_cache,
                              wait_mask, out, len);
 }
 
@@ -2333,7 +2333,7 @@ agx3_alu_bit_nor(enum agx_isa_encoding enc, uint16_t dest,
     *   2b830681010000800000  bit_nor r2, $r1, $r0
     *   2b030e01010000800000  bit_nor r2, ^r1, r0
     *   2b011603010000800000  bit_nor r2, r0, ^r1 */
-   return agx3_alu_bit_named(enc, "bit_nor", dest, src, hints, dest_cache,
+   return agx3_alu_bit_named(enc, AGX3_MN_bit_nor, dest, src, hints, dest_cache,
                              wait_mask, out, len);
 }
 
@@ -2350,7 +2350,7 @@ agx3_alu_bit_nand(enum agx_isa_encoding enc, uint16_t dest,
                   bool dest_cache, uint16_t wait_mask,
                   uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   return agx3_alu_bit_named(enc, "bit_nand", dest, src, hints, dest_cache,
+   return agx3_alu_bit_named(enc, AGX3_MN_bit_nand, dest, src, hints, dest_cache,
                              wait_mask, out, len);
 }
 
@@ -2360,7 +2360,7 @@ agx3_alu_bit_xnor(enum agx_isa_encoding enc, uint16_t dest,
                   bool dest_cache, uint16_t wait_mask,
                   uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   return agx3_alu_bit_named(enc, "bit_xnor", dest, src, hints, dest_cache,
+   return agx3_alu_bit_named(enc, AGX3_MN_bit_xnor, dest, src, hints, dest_cache,
                              wait_mask, out, len);
 }
 
@@ -2370,7 +2370,7 @@ agx3_alu_bit_orc(enum agx_isa_encoding enc, uint16_t dest,
                  bool dest_cache, uint16_t wait_mask,
                  uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   return agx3_alu_bit_named(enc, "bit_orc", dest, src, hints, dest_cache,
+   return agx3_alu_bit_named(enc, AGX3_MN_bit_orc, dest, src, hints, dest_cache,
                              wait_mask, out, len);
 }
 
@@ -2551,7 +2551,7 @@ agx3_alu_fcmp_select_imm_width_internal(enum agx_isa_encoding enc,
    /* An absolute source moves to the fourteen-byte ep28..35 endpoints; the
     * composer's predicates reject f47/f64 on the ten-byte ones. */
    for (unsigned ep = 20; ep < 36; ++ep)
-      if (agx3_bind_compose(enc, "fsel", ep, base, 10, fields, 15, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_fsel, ep, base, 10, fields, 15, out, len))
          return true;
    return false;
 }
@@ -2778,7 +2778,7 @@ agx3_alu_fcmp_select(enum agx_isa_encoding enc, const struct agx3_fsel_desc *in,
 
    /* f43 and f60 are the two comparators' width fields, exactly as in
     * agx3_alu_fcmp_select_imm_width_internal() above, which grounds them on
-    * the same "fsel" endpoint family.  An immediate slot always declares
+    * the same AGX3_MN_fsel endpoint family.  An immediate slot always declares
     * width 2. */
    const struct agx3_field_kv base[] = {
       {10, 2}, {11, d.dest_16 ? 1 : 2},
@@ -2895,7 +2895,7 @@ agx3_alu_fcmp_select(enum agx_isa_encoding enc, const struct agx3_fsel_desc *in,
        * native predicates select them instead of growing an 8-byte select.
        * Apple's 16-bit select on a uniform comparand is endpoint 11. */
       for (unsigned ep = d.cmp0_uniform ? 10 : 13; ep < 36; ++ep) {
-         if (agx3_bind_compose(enc, "fsel", ep, shifted ? alt_base : base,
+         if (agx3_bind_compose(enc, AGX3_MN_fsel, ep, shifted ? alt_base : base,
                                shifted ? nab : 7, f, n, out, len))
             return true;
       }
@@ -3013,7 +3013,7 @@ agx3_alu_fcmp_minifloat_select_half(
       {107, wait_mask == 32}, {110, condition},
    };
    for (unsigned ep = 20; ep < 28; ++ep)
-      if (agx3_bind_compose(enc, "fsel", ep,
+      if (agx3_bind_compose(enc, AGX3_MN_fsel, ep,
                             integer ? integer_base : float_base,
                             integer ? 10 : 11, fields, 12, out, len))
          return true;
@@ -3110,12 +3110,12 @@ agx3_alu_fcmp_minifloat_select_mixed(
    const unsigned preferred = condition == 5
                                  ? 10
                                  : (dest_16 ? ((dest & 1) ? 26 : 25) : 22);
-   if (agx3_bind_compose(enc, "fsel", preferred, base, nbase, fields, n,
+   if (agx3_bind_compose(enc, AGX3_MN_fsel, preferred, base, nbase, fields, n,
                          out, len))
       return true;
    for (unsigned ep = 0; ep < 28; ++ep) {
       if (ep != preferred &&
-          agx3_bind_compose(enc, "fsel", ep, base, nbase, fields, n, out,
+          agx3_bind_compose(enc, AGX3_MN_fsel, ep, base, nbase, fields, n, out,
                             len))
          return true;
    }
@@ -3200,7 +3200,7 @@ agx3_alu_fcmp_half_minifloat_select_f32(
       {107, wait_mask == 32},
       {110, condition},
    };
-   return agx3_bind_compose(enc, "fsel", mixed_selected ? 22 : 27, base,
+   return agx3_bind_compose(enc, AGX3_MN_fsel, mixed_selected ? 22 : 27, base,
                             nbase, fields, 14, out, len);
 }
 
@@ -3241,7 +3241,7 @@ agx3_alu_fcmp_select_zero(enum agx_isa_encoding enc, uint16_t dest,
    };
    /* Native forms are ordered by size: 6, 8, then 10 bytes. */
    for (unsigned ep = 0; ep < 28; ++ep)
-      if (agx3_bind_compose(enc, "fsel", ep, base, 10, fields, 14, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_fsel, ep, base, 10, fields, 14, out, len))
          return true;
    return false;
 }
@@ -3270,7 +3270,7 @@ agx3_alu_int_to_float(enum agx_isa_encoding enc, uint16_t dest,
    unsigned n = 6;
    for (unsigned i = 0; i < (m5 ? 8 : 6); ++i)
       fields[n++] = (struct agx3_field_kv){33 + i, !!(wait_mask & (1u << i))};
-   return agx3_bind_compose(enc, "int2flt", 0, base, m5 ? 6 : 4, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_int2flt, 0, base, m5 ? 6 : 4, fields, n, out, len);
 }
 
 bool
@@ -3313,7 +3313,7 @@ agx3_alu_narrow_int_to_float(enum agx_isa_encoding enc, uint16_t dest,
    for (unsigned i = 0; i < (m5 ? 8 : 6); ++i)
       if (wait_mask & (1u << i))
          fields[n++] = (struct agx3_field_kv){33 + i, 1};
-   return agx3_bind_compose(enc, "int2flt", 0, base, m5 ? 5 : 3, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_int2flt, 0, base, m5 ? 5 : 3, fields, n, out, len);
 }
 
 bool
@@ -3363,7 +3363,7 @@ agx3_alu_i32_to_f16(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
    unsigned n = 6;
    for (unsigned i = 0; i < (m5 ? 8 : 6); ++i)
       fields[n++] = (struct agx3_field_kv){33 + i, !!(wait_mask & (1u << i))};
-   return agx3_bind_compose(enc, "int2flt", 0, base, m5 ? 6 : 4, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_int2flt, 0, base, m5 ? 6 : 4, fields, n, out, len);
 }
 
 bool
@@ -3406,7 +3406,7 @@ agx3_alu_f16_to_int32(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
       fields[n++] = (struct agx3_field_kv){33 + slot,
                                            !!(wait_mask & (1u << slot))};
 
-   return agx3_bind_compose(enc, "flt2int", 0, base, m5 ? 8 : 6, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_flt2int, 0, base, m5 ? 8 : 6, fields, n, out, len);
 }
 
 static bool
@@ -3444,7 +3444,7 @@ agx3_alu_bfeil_width(enum agx_isa_encoding enc, uint16_t dest, uint16_t source,
    for (unsigned i=0;i<(gpu1 ? 8 : 6);++i)
       if (wait_mask & (1u<<i))
          fields[count++] = (struct agx3_field_kv){60+i,1};
-   return agx3_bind_compose(enc,"srl",0,base,gpu1 ? 9 : 7,fields,count,out,length);
+   return agx3_bind_compose(enc,AGX3_MN_srl,0,base,gpu1 ? 9 : 7,fields,count,out,length);
 }
 
 bool
@@ -3494,7 +3494,7 @@ agx3_alu_shift_add16(enum agx_isa_encoding enc, uint16_t dest,
    for (unsigned i = 0; i < 6; ++i)
       if (wait_mask & (1u << i))
          fields[n++] = (struct agx3_field_kv){45 + i, 1};
-   return agx3_bind_compose(enc, "iadd", 0, base, 6, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_iadd, 0, base, 6, fields, n, out, len);
 }
 
 bool
@@ -3532,7 +3532,7 @@ agx3_alu_add_sat16(enum agx_isa_encoding enc, uint16_t dest,
    for (unsigned i = 0; i < 6; ++i)
       if (wait_mask & (1u << i))
          fields[n++] = (struct agx3_field_kv){45 + i, 1};
-   return agx3_bind_compose(enc, "iadd", 0, base, 7, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_iadd, 0, base, 7, fields, n, out, len);
 }
 
 bool
@@ -3571,7 +3571,7 @@ agx3_alu_addsub_sat16_m5(uint16_t dest, const uint16_t src[2],
       if (wait_mask & (1u << i))
          fields[n++] = (struct agx3_field_kv){46 + i, 1};
    return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,
-                            subtract ? "isub32" : "iadd32", 0, base,
+                            subtract ? AGX3_MN_isub32 : AGX3_MN_iadd32, 0, base,
                             sizeof(base) / sizeof(base[0]), fields, n, out,
                             len);
 }
@@ -3612,7 +3612,7 @@ agx3_alu_isub16(enum agx_isa_encoding enc, uint16_t dest, bool zero_minuend,
    for (unsigned i = 0; i < (m5 ? 8 : 6); ++i)
       if (wait_mask & (1u << i))
          fields[n++] = (struct agx3_field_kv){(m5 ? 46 : 45) + i, 1};
-   return agx3_bind_compose(enc, m5 ? "isub32" : "isub", 0, base,
+   return agx3_bind_compose(enc, m5 ? AGX3_MN_isub32 : AGX3_MN_isub, 0, base,
                             m5 ? 8 : 6, fields, n, out, len);
 }
 
@@ -3651,7 +3651,7 @@ agx3_alu_neg16(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
 }
 
 static bool
-agx3_alu_shift_reg(const char *mnemonic, enum agx_isa_encoding enc,
+agx3_alu_shift_reg(enum agx3_mnemonic mnemonic, enum agx_isa_encoding enc,
                    uint16_t dest, bool dest_16, bool dest_cache,
                    const uint16_t src[2], const bool src_16[2],
                    const enum agx3_alu_hint hints[2], uint16_t wait_mask,
@@ -3659,7 +3659,7 @@ agx3_alu_shift_reg(const char *mnemonic, enum agx_isa_encoding enc,
 {
    const bool m5 = enc == AGX_ISA_ENCODING_AGX3C;
    if ((enc != AGX_ISA_ENCODING_AGX3B && !m5) ||
-       (m5 && strcmp(mnemonic, "sll") && strcmp(mnemonic, "srl")) || !src || !src_16 || !hints || !out ||
+       (m5 && mnemonic != AGX3_MN_sll && mnemonic != AGX3_MN_srl) || !src || !src_16 || !hints || !out ||
        !len || (dest_16 ? dest >= 256 : (dest >= 256 || (dest & 1))) ||
        (src_16[0] ? src[0] >= 256 : (src[0] >= 256 || (src[0] & 1))) ||
        (src_16[1] ? src[1] >= 256 : (src[1] >= 256 || (src[1] & 1))) ||
@@ -3678,7 +3678,7 @@ agx3_alu_shift_reg(const char *mnemonic, enum agx_isa_encoding enc,
    unsigned nb = 8;
    if (m5) {
       base[nb++] = (struct agx3_field_kv){58, 3};
-      base[nb++] = (struct agx3_field_kv){59, !strcmp(mnemonic, "srl") ? 183 : 162};
+      base[nb++] = (struct agx3_field_kv){59, mnemonic == AGX3_MN_srl ? 183 : 162};
    }
    struct agx3_field_kv fields[16] = {
       {2, dest}, {11, dest_cache}, {16, src[0]},
@@ -3697,7 +3697,7 @@ agx3_alu_shift_reg(const char *mnemonic, enum agx_isa_encoding enc,
  * half 128, with the shift count's cache hint (f40). Used by
  * agx3_alu_sll_reg_g18g and agx3_alu_srl_reg_g18g. */
 static bool
-agx3_alu_shift_reg_g18g(const char *mnemonic, enum agx_isa_encoding enc,
+agx3_alu_shift_reg_g18g(enum agx3_mnemonic mnemonic, enum agx_isa_encoding enc,
                         uint16_t dest, bool dest_16, bool dest_cache,
                         const uint16_t src[2], const bool src_16[2],
                         const enum agx3_alu_hint hints[2], uint16_t wait_mask,
@@ -3721,7 +3721,7 @@ agx3_alu_shift_reg_g18g(const char *mnemonic, enum agx_isa_encoding enc,
    const struct agx3_field_kv base[] = {
       {9, 2}, {10, dest_16 ? 1 : 2}, {23, 2}, {24, src_16[0] ? 1 : 2},
       {38, 2}, {39, src_16[1] ? 1 : 2}, {52, 1}, {53, 2},
-      {58, 3}, {59, !strcmp(mnemonic, "sll") ? 162 : 183},
+      {58, 3}, {59, mnemonic == AGX3_MN_sll ? 162 : 183},
    };
    struct agx3_field_kv fields[16] = {
       {2, dest}, {11, dest_cache}, {16, src[0]},
@@ -3745,7 +3745,7 @@ agx3_alu_sll_reg(enum agx_isa_encoding enc, uint16_t dest, bool dest_16,
                  uint16_t wait_mask, uint8_t out[AGX3_ALU_MAX_LENGTH],
                  uint8_t *len)
 {
-   return agx3_alu_shift_reg("sll", enc, dest, dest_16, dest_cache, src,
+   return agx3_alu_shift_reg(AGX3_MN_sll, enc, dest, dest_16, dest_cache, src,
                              src_16, hints, wait_mask, out, len);
 }
 
@@ -3756,7 +3756,7 @@ agx3_alu_sll_reg_g18g(enum agx_isa_encoding enc, uint16_t dest, bool dest_16,
                       uint16_t wait_mask, uint8_t out[AGX3_ALU_MAX_LENGTH],
                       uint8_t *len)
 {
-   return agx3_alu_shift_reg_g18g("sll", enc, dest, dest_16, dest_cache, src,
+   return agx3_alu_shift_reg_g18g(AGX3_MN_sll, enc, dest, dest_16, dest_cache, src,
                                   src_16, hints, wait_mask, out, len);
 }
 
@@ -3796,7 +3796,7 @@ agx3_alu_sll_one_reg32(enum agx_isa_encoding enc, uint16_t dest,
          fields[count++] = (struct agx3_field_kv){60 + slot, 1};
    }
 
-   return agx3_bind_compose(enc, "sll", 0, base, 9, fields, count, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_sll, 0, base, 9, fields, count, out, len);
 }
 
 bool
@@ -3833,7 +3833,7 @@ agx3_alu_sll_one_m5(uint16_t dest, bool dest_16, uint16_t shift,
          fields[count++] = (struct agx3_field_kv){60 + slot, 1};
    }
 
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "sll", 0, base,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_sll, 0, base,
                             sizeof(base) / sizeof(base[0]), fields, count, out,
                             len);
 }
@@ -3845,7 +3845,7 @@ agx3_alu_srl_reg(enum agx_isa_encoding enc, uint16_t dest, bool dest_16,
                  uint16_t wait_mask, uint8_t out[AGX3_ALU_MAX_LENGTH],
                  uint8_t *len)
 {
-   return agx3_alu_shift_reg("srl", enc, dest, dest_16, dest_cache, src,
+   return agx3_alu_shift_reg(AGX3_MN_srl, enc, dest, dest_16, dest_cache, src,
                              src_16, hints, wait_mask, out, len);
 }
 
@@ -3856,7 +3856,7 @@ agx3_alu_srl_reg_g18g(enum agx_isa_encoding enc, uint16_t dest, bool dest_16,
                       uint16_t wait_mask, uint8_t out[AGX3_ALU_MAX_LENGTH],
                       uint8_t *len)
 {
-   return agx3_alu_shift_reg_g18g("srl", enc, dest, dest_16, dest_cache, src,
+   return agx3_alu_shift_reg_g18g(AGX3_MN_srl, enc, dest, dest_16, dest_cache, src,
                                   src_16, hints, wait_mask, out, len);
 }
 
@@ -3901,7 +3901,7 @@ agx3_alu_asr_reg16(enum agx_isa_encoding enc, uint16_t dest, uint16_t source,
          fields[count++] = (struct agx3_field_kv){45 + slot, 1};
    }
 
-   return agx3_bind_compose(enc, "sra", 0, base, 7, fields, count, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_sra, 0, base, 7, fields, count, out, len);
 }
 
 bool
@@ -3952,7 +3952,7 @@ agx3_alu_shift_imm32(enum agx_isa_encoding enc, bool left,
    for (unsigned i = 0; i < (m5 ? 8 : 6); ++i)
       if (wait_mask & (1u << i))
          fields[n++] = (struct agx3_field_kv){60 + i, 1};
-   return agx3_bind_compose(enc, left ? "sll" : "srl", 0,
+   return agx3_bind_compose(enc, left ? AGX3_MN_sll : AGX3_MN_srl, 0,
                             base, nb, fields, n, out, len);
 }
 
@@ -3992,7 +3992,7 @@ agx3_alu_srl_imm16(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
          fields[n++] = (struct agx3_field_kv){60 + i, 1};
    }
 
-   return agx3_bind_compose(enc, "srl", 0, base, m5 ? 10 : 8, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_srl, 0, base, m5 ? 10 : 8, fields, n, out, len);
 }
 
 bool
@@ -4027,7 +4027,7 @@ agx3_alu_extract_imm32(enum agx_isa_encoding enc, uint16_t dest,
    };
    for(unsigned i=0;i<(gpu1 ? 8 : 6);i++)
       fields[10+i]=(struct agx3_field_kv){60+i,!!(wait_mask & (1u<<i))};
-   return agx3_bind_compose(enc,"extract",0,base,gpu1 ? 10 : 8,
+   return agx3_bind_compose(enc,AGX3_MN_extract,0,base,gpu1 ? 10 : 8,
                            fields,gpu1 ? 18 : 16,out,length);
 }
 
@@ -4066,7 +4066,7 @@ agx3_alu_asr_imm32_source(enum agx_isa_encoding enc, uint16_t dest,
    };
    for (unsigned i=0;i<6;i++)
       fields[7+i]=(struct agx3_field_kv){45+i,!!(wait_mask & (1u<<i))};
-   return agx3_bind_compose(enc,"sra",0,base,gpu1 ? 8 : 6,fields,13,out,length);
+   return agx3_bind_compose(enc,AGX3_MN_sra,0,base,gpu1 ? 8 : 6,fields,13,out,length);
 }
 
 /* Metal532: runtime int and short shifts. The full-word value uses a
@@ -4098,7 +4098,7 @@ agx3_alu_asr_reg_m5(uint16_t dest, uint16_t source, uint16_t shift,
    };
    for (unsigned i=0;i<8;i++)
       fields[8+i]=(struct agx3_field_kv){45+i,!!(wait_mask & (1u<<i))};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,"sra",0,base,9,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,AGX3_MN_sra,0,base,9,
                            fields,16,out,length);
 }
 
@@ -4124,7 +4124,7 @@ agx3_alu_asr_imm_m5(uint16_t dest, uint16_t source, bool dest_16,
    };
    for (unsigned i=0;i<8;i++)
       fields[7+i]=(struct agx3_field_kv){45+i,!!(wait_mask & (1u<<i))};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,"sra",0,base,8,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,AGX3_MN_sra,0,base,8,
                            fields,15,out,length);
 }
 
@@ -4173,7 +4173,7 @@ agx3_alu_asr_imm16(enum agx_isa_encoding enc, uint16_t dest, uint16_t source,
    };
    for (unsigned i=0;i<6;i++)
       fields[7+i]=(struct agx3_field_kv){45+i,!!(wait_mask & (1u<<i))};
-   return agx3_bind_compose(enc,"sra",0,base,gpu1 ? 8 : 6,fields,13,out,length);
+   return agx3_bind_compose(enc,AGX3_MN_sra,0,base,gpu1 ? 8 : 6,fields,13,out,length);
 }
 
 bool agx3_alu_fcmp_select_reg_imm(enum agx_isa_encoding enc, uint16_t dest,
@@ -4390,7 +4390,7 @@ bool agx3_alu_fcmp_select_reg_imm(enum agx_isa_encoding enc, uint16_t dest,
       fields[n++]=(struct agx3_field_kv){discard[i],hints[i]==AGX3_ALU_HINT_DISCARD};
    }
    for(unsigned ep=0;ep<36;ep++)
-      if(agx3_bind_compose(enc,"fsel",ep,base,nbase,fields,n,out,len))
+      if(agx3_bind_compose(enc,AGX3_MN_fsel,ep,base,nbase,fields,n,out,len))
          return true;
    return false;
 }
@@ -4442,7 +4442,7 @@ agx3_alu_fcmp_select_f32_f16(enum agx_isa_encoding enc, uint16_t dest,
    }
 
    for (unsigned ep = 0; ep < 28; ++ep) {
-      if (agx3_bind_compose(enc, "fsel", ep, base, 10, fields, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_fsel, ep, base, 10, fields, n, out, len))
          return true;
    }
 
@@ -4504,7 +4504,7 @@ agx3_alu_fcmp_select_f16_f16_f32(
    }
 
    for (unsigned ep = 0; ep < 36; ++ep) {
-      if (agx3_bind_compose(enc, "fsel", ep, base, 10, fields, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_fsel, ep, base, 10, fields, n, out, len))
          return true;
    }
    return false;
@@ -4621,7 +4621,7 @@ agx3_alu_fcmp_select_f32_imm(enum agx_isa_encoding enc, uint16_t dest,
       }
    }
 
-   return agx3_bind_compose(enc, "fsel", src0_abs ? 35 : 27, NULL, 0,
+   return agx3_bind_compose(enc, AGX3_MN_fsel, src0_abs ? 35 : 27, NULL, 0,
                             fields, n, out, len);
 }
 
@@ -4664,7 +4664,7 @@ agx3_alu_fcmp_select_half(enum agx_isa_encoding enc, uint16_t dest,
 
    for (unsigned ep = 0; ep < 28; ++ep) {
       uint8_t candidate[AGX3_ALU_MAX_LENGTH], candidate_len;
-      if (!agx3_bind_compose(enc, "fsel", ep, base, 10, fields, 16,
+      if (!agx3_bind_compose(enc, AGX3_MN_fsel, ep, base, 10, fields, 16,
                              candidate, &candidate_len))
          continue;
 
@@ -4722,7 +4722,7 @@ agx3_alu_m5_fsel_half(uint16_t dest, const uint16_t src[4],
    for (unsigned i = 0; i < 8; ++i)
       fields[n++] = (struct agx3_field_kv){78 + i, !!(wait_mask & (1u << i))};
    for (unsigned ep = 0; ep <= 8; ++ep) {
-      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "fseli16", ep,
+      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_fseli16, ep,
                             base, 10, fields, n, out, len))
          return true;
    }
@@ -4798,7 +4798,7 @@ agx3_alu_fminmax_half(enum agx_isa_encoding enc, uint16_t dest,
       fields[n++] =
          (struct agx3_field_kv){102 + i, !!(wait_mask & (1u << i))};
    for (unsigned ep = 0; ep < 28; ++ep) {
-      if (agx3_bind_compose(enc, "fsel", ep, base, 10, fields, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_fsel, ep, base, 10, fields, n, out, len))
          return true;
    }
    return false;
@@ -4878,7 +4878,7 @@ agx3_alu_fminmax32_gpu1(uint16_t dest, uint16_t src0, uint16_t src2,
    }
    for (unsigned i=0;i<8;++i)
       fields[n++] = (struct agx3_field_kv){78+i,!!(wait_mask & (1u<<i))};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,"fseli32",4,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,AGX3_MN_fseli32,4,
                             base,12,fields,n,out,len);
 }
 
@@ -4961,7 +4961,7 @@ agx3_alu_fminmax32(enum agx_isa_encoding enc, uint16_t dest, uint16_t src0,
    }
    all[m++] = (struct agx3_field_kv){110, maximum ? 7 : 3};
 
-   return agx3_bind_compose(enc, "fsel", src1_immediate ? 2 : 7, NULL, 0, all,
+   return agx3_bind_compose(enc, AGX3_MN_fsel, src1_immediate ? 2 : 7, NULL, 0, all,
                             m, out, len);
 }
 
@@ -5025,7 +5025,7 @@ agx3_alu_fmax_abs_f32(enum agx_isa_encoding enc, uint16_t dest,
       {95, hints[1] == AGX3_ALU_HINT_CACHE},
       {97, hints[1] == AGX3_ALU_HINT_DISCARD}, {98, 1}, {110, 7},
    };
-   return agx3_bind_compose(enc, "fsel", 30, NULL, 0, f,
+   return agx3_bind_compose(enc, AGX3_MN_fsel, 30, NULL, 0, f,
                            sizeof(f) / sizeof(f[0]), out, len);
 }
 
@@ -5104,7 +5104,7 @@ agx3_alu_rcp(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
       fields[n++] = (struct agx3_field_kv){49 + slot,
                                                !!(wait_mask & (1u << slot))};
 
-   return agx3_bind_compose(enc, "f32rcp", 0, base, 5, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_f32rcp, 0, base, 5, fields, n, out, len);
 }
 
 bool
@@ -5116,7 +5116,7 @@ agx3_alu_f32rcp(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                        dest_cache, wait_mask, out, len);
 }
 
-static bool agx3_alu_unop(enum agx_isa_encoding enc, const char *mnemonic,
+static bool agx3_alu_unop(enum agx_isa_encoding enc, enum agx3_mnemonic mnemonic,
                           uint16_t dest, uint16_t src, bool dest_half,
                           bool src_half, enum agx3_alu_hint hint,
                           bool dest_cache, uint16_t wait_mask, bool src_neg,
@@ -5134,7 +5134,7 @@ agx3_alu_f32rsqrt_mod(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
     * absolute value and negation in, exactly as on f32log2/f32exp2/f32rcp;
     * see agx3_alu_core.h for the four witnessed bytes. */
    if (enc == AGX_ISA_ENCODING_AGX3C)
-      return agx3_alu_unop(enc, "f32rsqrt", dest, src, false, false, hint,
+      return agx3_alu_unop(enc, AGX3_MN_f32rsqrt, dest, src, false, false, hint,
                            dest_cache, wait_mask, src_neg, src_abs, out, len);
    if (enc != AGX_ISA_ENCODING_AGX3B || !out || !len || dest >= 256 ||
        src >= 256 || (dest & 1) || (src & 1) ||
@@ -5153,7 +5153,7 @@ agx3_alu_f32rsqrt_mod(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
    for (unsigned i = 0; i < 6; ++i)
       fields[7 + i] =
          (struct agx3_field_kv){35 + i, !!(wait_mask & (1u << i))};
-   return agx3_bind_compose(enc, "f32rsqrt", 0, base, 4, fields, 13, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_f32rsqrt, 0, base, 4, fields, 13, out, len);
 }
 
 bool
@@ -5171,8 +5171,8 @@ agx3_alu_unary_m5(enum agx3_funop op, uint16_t dest, uint16_t src,
       return false;
 
    const bool rounding = op <= AGX3_FUNOP_RINT;
-   const char *mnemonic = rounding ? "f32rint" :
-                          op == AGX3_FUNOP_LOG2 ? "f32log2" : "f32exp2";
+   enum agx3_mnemonic mnemonic = rounding ? AGX3_MN_f32rint :
+                          op == AGX3_FUNOP_LOG2 ? AGX3_MN_f32log2 : AGX3_MN_f32exp2;
    const unsigned opcode = rounding ? 65 : op == AGX3_FUNOP_LOG2 ? 59 : 52;
    /* Fresh G17G profiles prove odd half registers, half-to-full inputs,
     * f14 saturation, f30/f31 modifiers, actual lifetimes and zero/slot8
@@ -5234,7 +5234,7 @@ agx3_alu_derivative_m5(bool dfdy, uint16_t dest, uint16_t src, bool half,
       if (wait_mask & (1u << slot))
          fields[n++] = (struct agx3_field_kv){35 + slot, 1};
    return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,
-                            dfdy ? "f32dfdy" : "f32dfdx", 0, base, nbase,
+                            dfdy ? AGX3_MN_f32dfdy : AGX3_MN_f32dfdx, 0, base, nbase,
                             fields, n, out, len);
 }
 
@@ -5242,14 +5242,14 @@ agx3_alu_derivative_m5(bool dfdy, uint16_t dest, uint16_t src, bool half,
  * widths. Full-width forms have all six recovered wait bits; any half-width
  * log2 is currently grounded for no wait and slot 6. */
 static bool
-agx3_alu_unop(enum agx_isa_encoding enc, const char *mnemonic,
+agx3_alu_unop(enum agx_isa_encoding enc, enum agx3_mnemonic mnemonic,
               uint16_t dest, uint16_t src, bool dest_half, bool src_half,
               enum agx3_alu_hint hint, bool dest_cache, uint16_t wait_mask,
               bool src_neg, bool src_abs,
               uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
    if (enc == AGX_ISA_ENCODING_AGX3C) {
-      if (!strcmp(mnemonic, "f32rsqrt")) {
+      if (mnemonic == AGX3_MN_f32rsqrt) {
          if (!out || !len || dest >= 256 || src >= 256 ||
              (!dest_half && (dest & 1)) || (!src_half && (src & 1)) ||
              (wait_mask & ~0xffu) || (unsigned)hint > AGX3_ALU_HINT_CACHE)
@@ -5273,9 +5273,9 @@ agx3_alu_unop(enum agx_isa_encoding enc, const char *mnemonic,
                (struct agx3_field_kv){35 + i, !!(wait_mask & (1u << i))};
          return agx3_bind_compose(enc, mnemonic, 0, base, 6, f, 15, out, len);
       }
-      if (strcmp(mnemonic, "f32log2") && strcmp(mnemonic, "f32exp2"))
+      if (mnemonic != AGX3_MN_f32log2 && mnemonic != AGX3_MN_f32exp2)
          return false;
-      return agx3_alu_unary_m5(!strcmp(mnemonic, "f32log2")
+      return agx3_alu_unary_m5(mnemonic == AGX3_MN_f32log2
                                  ? AGX3_FUNOP_LOG2 : AGX3_FUNOP_EXP2,
                                 dest, src, dest_half, src_half, src_abs,
                                 src_neg, false, hint, dest_cache, wait_mask,
@@ -5317,7 +5317,7 @@ agx3_alu_log2(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
    if (dest >= registers || src >= registers)
       return false;
 
-   return agx3_alu_unop(enc, "f32log2", dest, src, dest_half, src_half, hint,
+   return agx3_alu_unop(enc, AGX3_MN_f32log2, dest, src, dest_half, src_half, hint,
                         dest_cache, wait_mask, src_neg, src_abs, out, len);
 }
 
@@ -5327,7 +5327,7 @@ agx3_alu_f32exp2_mod(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                      uint16_t wait_mask, bool src_neg, bool src_abs,
                      uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   return agx3_alu_unop(enc, "f32exp2", dest, src, false, false, hint,
+   return agx3_alu_unop(enc, AGX3_MN_f32exp2, dest, src, false, false, hint,
                         dest_cache, wait_mask, src_neg, src_abs, out, len);
 }
 
@@ -5369,7 +5369,7 @@ agx3_alu_f32_rint(enum agx_isa_encoding enc, uint64_t mode, uint16_t dest,
    for (unsigned i = 0; i < 6; ++i)
       fields[7 + i] =
          (struct agx3_field_kv){35 + i, !!(wait_mask & (1u << i))};
-   return agx3_bind_compose(enc, "f32rint", 0, base, 5, fields, 13, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_f32rint, 0, base, 5, fields, 13, out, len);
 }
 
 bool
@@ -5408,7 +5408,7 @@ agx3_alu_hrsqrt(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                 uint16_t wait_mask, uint8_t out[AGX3_ALU_MAX_LENGTH],
                 uint8_t *len)
 {
-   return agx3_alu_unop(enc, "f32rsqrt", dest, src, true, true, hint,
+   return agx3_alu_unop(enc, AGX3_MN_f32rsqrt, dest, src, true, true, hint,
                         dest_cache, wait_mask, false, false, out, len);
 }
 
@@ -5418,7 +5418,7 @@ agx3_alu_hexp2_neg(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                    uint16_t wait_mask, bool src_neg,
                    uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   return agx3_alu_unop(enc, "f32exp2", dest, src, true, true, hint,
+   return agx3_alu_unop(enc, AGX3_MN_f32exp2, dest, src, true, true, hint,
                         dest_cache, wait_mask, src_neg, false, out, len);
 }
 
@@ -5445,7 +5445,7 @@ agx3_alu_hrint(enum agx_isa_encoding enc, uint64_t mode, uint16_t dest,
    for (unsigned i = 0; i < 6; ++i)
       fields[5 + i] =
          (struct agx3_field_kv){35 + i, !!(wait_mask & (1u << i))};
-   return agx3_bind_compose(enc, "f32rint", 0, base, 5, fields, 11,
+   return agx3_bind_compose(enc, AGX3_MN_f32rint, 0, base, 5, fields, 11,
                             out, len);
 }
 
@@ -5525,7 +5525,7 @@ agx3_alu_fmul_narrow(enum agx_isa_encoding enc, uint16_t dest,
       fields[17] = (struct agx3_field_kv){87, !!(wait_mask & 128)};
    }
    for (unsigned ep = 0; ep < (m5 ? 4 : 2); ep++)
-      if (agx3_bind_compose(enc, "f32mul", ep, base, 8, fields, m5 ? 18 : 14,
+      if (agx3_bind_compose(enc, AGX3_MN_f32mul, ep, base, 8, fields, m5 ? 18 : 14,
                             out, len))
          return true;
    return false;
@@ -5553,7 +5553,7 @@ agx3_alu_fmul_narrow(enum agx_isa_encoding enc, uint16_t dest,
  * Each saturating vector differs from its unsaturated partner in f14 alone.
  */
 static bool
-agx3_alu_h_binop(enum agx_isa_encoding enc, const char *mnemonic,
+agx3_alu_h_binop(enum agx_isa_encoding enc, enum agx3_mnemonic mnemonic,
                  unsigned max_ep, uint16_t dest, const uint16_t src[2],
                  const enum agx3_alu_hint hints[2], bool dest_cache,
                  bool saturate, const bool src_abs[2], const bool src_neg[2], uint16_t wait_mask,
@@ -5593,7 +5593,7 @@ agx3_alu_h_binop(enum agx_isa_encoding enc, const char *mnemonic,
       fields[n++] = (struct agx3_field_kv){47, 1};
    if (m5) {
       fields[n++] = (struct agx3_field_kv){49, 3};
-      fields[n++] = (struct agx3_field_kv){50, !strcmp(mnemonic, "f16mul") ? 47 : 41};
+      fields[n++] = (struct agx3_field_kv){50, mnemonic == AGX3_MN_f16mul ? 47 : 41};
    }
    for (unsigned i = 0; i < (m5 ? 8 : 6); ++i)
       fields[n++] =
@@ -5614,7 +5614,7 @@ agx3_alu_hmul(enum agx_isa_encoding enc, uint16_t dest,
               uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
    const bool src_abs[2] = {false, false};
-   return agx3_alu_h_binop(enc, "f16mul", 2, dest, src, hints, dest_cache,
+   return agx3_alu_h_binop(enc, AGX3_MN_f16mul, 2, dest, src, hints, dest_cache,
                            false, src_abs, NULL, wait_mask, out, len);
 }
 
@@ -5626,7 +5626,7 @@ agx3_alu_hmul_abs(enum agx_isa_encoding enc, uint16_t dest,
                   uint16_t wait_mask,
                   uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   return agx3_alu_h_binop(enc, "f16mul", 4, dest, src, hints, dest_cache,
+   return agx3_alu_h_binop(enc, AGX3_MN_f16mul, 4, dest, src, hints, dest_cache,
                            false, src_abs, NULL, wait_mask, out, len);
 }
 
@@ -5637,7 +5637,7 @@ agx3_alu_hmul_saturate(enum agx_isa_encoding enc, uint16_t dest,
                        uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
    const bool src_abs[2] = {false, false};
-   return agx3_alu_h_binop(enc, "f16mul", 3, dest, src, hints, dest_cache,
+   return agx3_alu_h_binop(enc, AGX3_MN_f16mul, 3, dest, src, hints, dest_cache,
                            true, src_abs, NULL, wait_mask, out, len);
 }
 
@@ -5680,7 +5680,7 @@ agx3_alu_hmul_minifloat(enum agx_isa_encoding enc, uint16_t dest,
                                             !!(wait_mask & (1u << i))};
 
    for (unsigned ep = 0; ep < (m5 ? 4 : 2); ++ep)
-      if (agx3_bind_compose(enc, "f16mul", ep, base, 6, fields, n, out,
+      if (agx3_bind_compose(enc, AGX3_MN_f16mul, ep, base, 6, fields, n, out,
                             len))
          return true;
 
@@ -5696,7 +5696,7 @@ agx3_alu_hadd(enum agx_isa_encoding enc, uint16_t dest,
               uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
    const bool src_abs[2] = {false, false};
-   return agx3_alu_h_binop(enc, "f16add", 4, dest, src, hints, dest_cache,
+   return agx3_alu_h_binop(enc, AGX3_MN_f16add, 4, dest, src, hints, dest_cache,
                            false, src_abs, NULL, wait_mask, out, len);
 }
 
@@ -5707,7 +5707,7 @@ agx3_alu_hadd_mod_m5(uint16_t dest, const uint16_t src[2],
                      uint16_t wait_mask, uint8_t out[AGX3_ALU_MAX_LENGTH],
                      uint8_t *len)
 {
-   return agx3_alu_h_binop(AGX_ISA_ENCODING_AGX3C, "f16add", 4, dest, src,
+   return agx3_alu_h_binop(AGX_ISA_ENCODING_AGX3C, AGX3_MN_f16add, 4, dest, src,
                            hints, dest_cache, saturate, src_abs, src_neg,
                            wait_mask, out, len);
 }
@@ -5738,7 +5738,7 @@ agx3_alu_half_add_imm_to_f32_m5(uint16_t dest, uint16_t src, uint8_t immediate,
    for (unsigned i = 0; i < 8; i++)
       f[8 + i] = (struct agx3_field_kv){52 + i, !!(wait_mask & (1u << i))};
    for (unsigned ep = 0; ep < 4; ep++)
-      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "f32add", ep, base, 8, f,
+      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_f32add, ep, base, 8, f,
                             16, out, len))
          return true;
    return false;
@@ -5752,7 +5752,7 @@ agx3_alu_hadd_signed(enum agx_isa_encoding enc, uint16_t dest,
                       uint8_t *len)
 {
    const bool src_abs[] = {false, false};
-   return agx3_alu_h_binop(enc, "f16add", 4, dest, src, hints, dest_cache,
+   return agx3_alu_h_binop(enc, AGX3_MN_f16add, 4, dest, src, hints, dest_cache,
                            false, src_abs, src_neg, wait_mask, out, len);
 }
 
@@ -5763,7 +5763,7 @@ agx3_alu_hadd_saturate(enum agx_isa_encoding enc, uint16_t dest,
                        uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
    const bool src_abs[2] = {false, false};
-   return agx3_alu_h_binop(enc, "f16add", 4, dest, src, hints, dest_cache,
+   return agx3_alu_h_binop(enc, AGX3_MN_f16add, 4, dest, src, hints, dest_cache,
                            true, src_abs, NULL, wait_mask, out, len);
 }
 
@@ -5785,7 +5785,7 @@ agx3_alu_hadd_neg(enum agx_isa_encoding enc, uint16_t dest,
    const unsigned negate = swap ? 2 : neg_mask;
    const bool src_abs[2] = {false, false};
    const bool src_neg[2] = {negate & 1, negate & 2};
-   return agx3_alu_h_binop(enc, "f16add", 4, dest, ordered_src, ordered_hints,
+   return agx3_alu_h_binop(enc, AGX3_MN_f16add, 4, dest, ordered_src, ordered_hints,
                           dest_cache, saturate, src_abs, src_neg, wait_mask,
                           out, len);
 }
@@ -5818,7 +5818,7 @@ agx3_alu_hadd_abs_negzero(
       fields[n++] = (struct agx3_field_kv){51 + slot,
                                            !!(wait_mask & (1u << slot))};
    for (unsigned ep = 2; ep <= 3; ++ep)
-      if (agx3_bind_compose(enc,"f16add",ep,base,8,fields,n,out,len))
+      if (agx3_bind_compose(enc,AGX3_MN_f16add,ep,base,8,fields,n,out,len))
          return true;
    return false;
 }
@@ -5854,7 +5854,7 @@ agx3_alu_half_add_negzero_m5(uint16_t dest, uint16_t src, bool src_abs,
       fields[8 + i] = (struct agx3_field_kv){51 + i, !!(wait_mask & (1u << i))};
    fields[16] = (struct agx3_field_kv){14, saturate};
    for (unsigned ep = 0; ep < 4; ++ep)
-      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "f16add", ep, base, 8,
+      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_f16add, ep, base, 8,
                             fields, 17, out, len))
          return true;
    return false;
@@ -5892,11 +5892,11 @@ agx3_alu_hadd_neg_negzero(
     * clearing only the abs modifier relative to Native910. */
    if (g17g) {
       for (unsigned ep = 2; ep <= 3; ++ep)
-         if (agx3_bind_compose(enc, "f16add", ep, base, 8, fields, n, out, len))
+         if (agx3_bind_compose(enc, AGX3_MN_f16add, ep, base, 8, fields, n, out, len))
             return true;
       return false;
    }
-   return agx3_bind_compose(enc, "f16add", 2, base, 6, fields, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_f16add, 2, base, 6, fields, n, out, len);
 }
 
 bool
@@ -5941,7 +5941,7 @@ agx3_alu_hadd_saturate_negzero(
                                            !!(wait_mask & (1u << slot))};
 
    for (unsigned ep = 2; ep <= (m5 ? 3 : 2); ++ep) {
-      if (agx3_bind_compose(enc, "f16add", ep, base, 6, fields, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_f16add, ep, base, 6, fields, n, out, len))
          return true;
    }
    return false;
@@ -6010,7 +6010,7 @@ hfma(enum agx_isa_encoding enc, uint16_t dest,
    const unsigned first_ep =
       m5 ? 2 : (wait_mask && (wait_mask & (wait_mask - 1)) ? 4 : 3);
    for (unsigned ep = first_ep; ep < 6; ++ep) {
-      if (agx3_bind_compose(enc, "f16fma", ep, base, 8, fields, n, out,
+      if (agx3_bind_compose(enc, AGX3_MN_f16fma, ep, base, 8, fields, n, out,
                             len))
          return true;
    }
@@ -6086,7 +6086,7 @@ agx3_alu_hfma_addend_minifloat(
    const unsigned first_ep =
       wait_mask && (wait_mask & (wait_mask - 1)) ? 4 : 3;
    for (unsigned ep = first_ep; ep < 6; ++ep) {
-      if (agx3_bind_compose(enc, "f16fma", ep, base, 8, fields, m5 ? 19 : 15,
+      if (agx3_bind_compose(enc, AGX3_MN_f16fma, ep, base, 8, fields, m5 ? 19 : 15,
                             out, len))
          return true;
    }
@@ -6126,7 +6126,7 @@ agx3_alu_widen_half(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
    for (unsigned i=0;i<slots;i++)
       fields[8+i] = (struct agx3_field_kv){52+i,!!(wait_mask & (1u<<i))};
    for (unsigned ep=0;ep<4;ep++)
-      if (agx3_bind_compose(enc,"f32add",ep,base,m5 ? 8 : 6,
+      if (agx3_bind_compose(enc,AGX3_MN_f32add,ep,base,m5 ? 8 : 6,
                            fields,8+slots,out,len)) {
          /* metal-nt canonicalizes modifier-specific tail bits. */
          if (!m5 && src_abs && *len == 10)
@@ -6231,7 +6231,7 @@ agx3_alu_f32exp2(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                  enum agx3_alu_hint hint, bool dest_cache, uint16_t wait_mask,
                  uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   return agx3_alu_unop(enc, "f32exp2", dest, src, false, false, hint,
+   return agx3_alu_unop(enc, AGX3_MN_f32exp2, dest, src, false, false, hint,
                         dest_cache, wait_mask, false, false, out, len);
 }
 
@@ -6391,7 +6391,7 @@ agx3_alu_fcmp_select32_gpu1(const struct agx3_fsel32_gpu1_desc *d,
    /* G17G's second NClamp operation is the compact six-byte tied fmin,
     * with the slot-one wait in ep0. Other general selects retain ep4. */
    if (agx3_gpu1_tied_minmax(d, false) &&
-       agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "fseli32", 0, base, 12,
+       agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_fseli32, 0, base, 12,
                         fields, n, out, len))
       return true;
    /* The uniform-comparand witnesses use the compact fself32 endpoints
@@ -6400,7 +6400,7 @@ agx3_alu_fcmp_select32_gpu1(const struct agx3_fsel32_gpu1_desc *d,
       uint8_t best[AGX3_ALU_MAX_LENGTH], best_len = 0;
       for (unsigned ep = 0; ep < 8; ++ep) {
          uint8_t bytes[AGX3_ALU_MAX_LENGTH], size;
-         if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "fself32", ep, base,
+         if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_fself32, ep, base,
                                12, fields, n, bytes, &size) &&
              (!best_len || size < best_len)) {
             memcpy(best, bytes, size);
@@ -6414,7 +6414,7 @@ agx3_alu_fcmp_select32_gpu1(const struct agx3_fsel32_gpu1_desc *d,
       return true;
    }
    return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,
-                            fself ? "fself32" : "fseli32", 4, base, 12,
+                            fself ? AGX3_MN_fself32 : AGX3_MN_fseli32, 4, base, 12,
                             fields, n, out, len);
 }
 
@@ -6535,7 +6535,7 @@ agx3_alu_fcmp_select16_const_reg_gpu1(
       {85, !!(wait_mask & 128u)},
       {86, condition},
    };
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "fseli16", 8, base,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_fseli16, 8, base,
                             sizeof(base) / sizeof(base[0]), fields,
                             sizeof(fields) / sizeof(fields[0]), out, len);
 }
@@ -6580,7 +6580,7 @@ agx3_alu_hadd_minifloat(enum agx_isa_encoding enc, uint16_t dest,
                                            !!(wait_mask & (1u << slot))};
 
    for (unsigned ep = 1; ep <= (m5 ? 3 : 1); ++ep) {
-      if (agx3_bind_compose(enc, "f16add", ep, base, 6, fields, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_f16add, ep, base, 6, fields, n, out, len))
          return true;
    }
    return false;
@@ -6603,7 +6603,7 @@ agx3_alu_m5_ldimm(uint16_t dest, bool half, bool dest_cache, uint32_t bits,
    for (unsigned slot = 0; slot < 8; ++slot)
       fields[3 + slot] = (struct agx3_field_kv){17 + slot,
                                                !!(wait_mask & (1u << slot))};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "ldimm", 2, base, 4,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_ldimm, 2, base, 4,
                             fields, 11, out, len);
 }
 
@@ -6678,7 +6678,7 @@ agx3_alu_fcmp_select16_gpu1(const struct agx3_fsel32_gpu1_desc *d,
    for (unsigned i = 0; i < 8; ++i)
       fields[n++] = (struct agx3_field_kv){78 + i, !!(d->wait_mask & (1u << i))};
    for (unsigned ep = 0; ep < 16; ++ep)
-      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "fseli16", ep, base,
+      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_fseli16, ep, base,
                              sizeof(base) / sizeof(base[0]), fields, n, out, len))
          return true;
    return false;
@@ -6720,7 +6720,7 @@ agx3_alu_iadd16_gpu1(uint16_t dest, bool dest_cache, bool src0_immediate,
    for (unsigned i = 0; i < 8; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv){46 + i, 1};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "iadd32", 0, base, 7, ov,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_iadd32, 0, base, 7, ov,
                             n, out, len);
 }
 
@@ -6751,7 +6751,7 @@ agx3_alu_bit_imm_gpu1(enum agx3_alu_op op, uint16_t dest, bool dest_cache,
    for (unsigned i = 0; i < 8; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv){44 + i, 1};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "bit_and", 1, base, 7, ov,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_bit_and, 1, base, 7, ov,
                             n, out, len);
 }
 
@@ -6800,7 +6800,7 @@ agx3_alu_iadd32_reg_imm_gpu1(uint16_t dest, bool dest_cache, uint16_t src,
    for (unsigned i = 0; i < 8; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv){46 + i, 1};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "iadd32",
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_iadd32,
                             AGX3_BIND_APPLE_ORDER, base,
                             sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
@@ -6826,7 +6826,7 @@ agx3_alu_isub_imm16_m5(uint16_t dest, uint16_t src, uint16_t immediate,
    for (unsigned i=0; i<8; ++i)
       if (wait_mask & (1u << i))
          fields[n++] = (struct agx3_field_kv){46+i,1};
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "isub32", 0,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_isub32, 0,
                             base, 8, fields, n, out, len);
 }
 
@@ -6854,7 +6854,7 @@ agx3_alu_bit_widen_m5(enum agx3_alu_op op, bool first_half, uint16_t dest, uint1
       if (wait_mask & (1u << i))
          fields[n++] = (struct agx3_field_kv){44+i,1};
    for (unsigned ep=0; ep<2; ++ep)
-      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, op == AGX3_ALU_BAND ? "bit_and" : op == AGX3_ALU_BOR ? "bit_or" : "bit_xor", ep,
+      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, op == AGX3_ALU_BAND ? AGX3_MN_bit_and : op == AGX3_ALU_BOR ? AGX3_MN_bit_or : AGX3_MN_bit_xor, ep,
                              base, 8, fields, n, out, len))
          return true;
    return false;
@@ -6914,7 +6914,7 @@ agx3_alu_hfma_immediates_m5(uint16_t dest, uint16_t src,
    for (unsigned i=0;i<8;++i)
       fields[7+i]=(struct agx3_field_kv){68+i,!!(wait_mask & (1u<<i))};
    for (unsigned ep=2;ep<6;++ep)
-      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,"f16fma",ep,
+      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,AGX3_MN_f16fma,ep,
                            base,10,fields,15,out,len))
          return true;
    return false;

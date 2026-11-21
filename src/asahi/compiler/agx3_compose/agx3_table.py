@@ -1,9 +1,23 @@
 # Copyright 2026 Aurora Silicon
 # SPDX-License-Identifier: MIT
-"""Read a generated agx3{b,c,d}_tables.c, and encode or decode with it.
+"""Read an agx3{b,c,d}_tables.txt description, and encode or decode with it.
 
-load() parses the arrays of a generated table back into Python tuples in the
-C struct field order of agx3_compose.h.
+load() parses a description into the row arrays the tables were first
+checked in as (the legacy layout), as Python tuples:
+
+  fixeds  (word, mask, value)
+  preds   (field, kind, shift, width, a, b)
+          kind 0 eq a, 1 in setpool[a:a+b], 2 range [a,b], 3 bitfield eq a
+  cmds    (field, word, dst_shift, width, src_shift, lut_off, lut_n)
+          lut_off -1 deposits the field directly
+  groups  (alt_off, alt_n) into altpool, a list of node ids
+  nodes   (fixed_off, fixed_n, pred_off, pred_n, cmd_off, cmd_n, grp_off, grp_n)
+  forms   (mnemonic, ep, size, node)
+
+A description names each distinct choice group once; load() unfolds it into
+one node tree per form again. legacy_c() prints the rows as the C file they
+were checked in as, which is how gen_agx3_tables.py --verify proves that a
+description still holds exactly those rows.
 
 Composer mirrors agx3_compose.c exactly, including every fail-closed rule.
 
@@ -15,7 +29,7 @@ therefore always one the composer reproduces; it is not independent evidence
 that the table's field-to-bit mapping is right.
 """
 
-import re
+import os
 
 NUM_FIELDS = 160
 
@@ -27,26 +41,146 @@ def wmask(width):
     return (1 << width) - 1
 
 
-def load(path):
-    src = open(path).read()
-    T = {}
-    for name in ARRAYS:
-        m = re.search(r'static const \w+ ' + name + r'\[\] = \{\n?(.*?)\n?\};',
-                      src, re.S)
-        body = m.group(1)
-        if name == 'forms':
-            T[name] = [(a, int(b), int(c), int(d)) for a, b, c, d in
-                       re.findall(r'\{"([^"]*)",(\d+),(\d+),(\d+)\}', body)]
-        elif name in ('altpool', 'lutpool', 'setpool'):
-            T[name] = [int(x.replace('ull', ''), 0)
-                       for x in body.replace('\n', '').split(',') if x.strip()]
+def _pred(tok):
+    lhs, rhs = tok.split('=')
+    if lhs.endswith(']'):
+        field, bits = lhs[:-1].split('[')
+        shift, width = bits.split('+')
+        return (int(field), 3, int(shift), int(width), int(rhs), 0)
+    if rhs.startswith('{'):
+        return (int(lhs), 1, 0, 0, tuple(int(v) for v in rhs[1:-1].split(',')), 0)
+    if '..' in rhs:
+        lo, hi = rhs.split('..')
+        return (int(lhs), 2, 0, 0, int(lo), int(hi))
+    return (int(lhs), 0, 0, 0, int(rhs), 0)
+
+
+def _fixed(tok):
+    word, bits = tok.split('&')
+    mask, value = bits.split('=')
+    return (int(word), int(mask, 16), int(value, 16))
+
+
+def _cmd(tok):
+    tok, _, lut = tok.partition(':')
+    src, dst = tok.split('>')
+    field, bits = src[:-1].split('[')
+    src_shift, width = bits.split('+')
+    word, dst_shift = dst.split('.')
+    return (int(field), int(word), int(dst_shift), int(width), int(src_shift),
+            tuple(int(v) for v in lut.split(',')) if lut else None)
+
+
+def _node(line):
+    """A node line: preds ; fixeds ; cmds ; groups."""
+    part = [p.split() for p in line.split(';')] + [[]] * 3
+    return (tuple(_pred(t) for t in part[0]), tuple(_fixed(t) for t in part[1]),
+            tuple(_cmd(t) for t in part[2]), tuple(int(t[1:]) for t in part[3]))
+
+
+def parse(path):
+    """(name, groups, forms): groups[id] is a list of alternative nodes and
+    forms a list of (mnemonic, ep, size, node). A node is (preds, fixeds,
+    cmds, group ids), with set and LUT contents in place of pool offsets."""
+    groups, forms = [], []
+    shape = None
+    for line in open(path):
+        if line.startswith('#') or not line.strip():
+            continue
+        if line.startswith('group'):
+            head, _, shape = line.partition(':')
+            if int(head.split()[1]) != len(groups):
+                raise ValueError('groups are numbered in file order: ' + line)
+            if shape:
+                preds, fixeds = shape.split(';')
+                shape = ([_pred(t + '=0')[:4] for t in preds.split()],
+                         [_fixed(t + '=0')[:2] for t in fixeds.split()])
+            groups.append([])
+        elif line.startswith('form'):
+            _, mnemonic, ep, size = line.split()
+            forms.append([mnemonic, int(ep), int(size)])
+        elif len(forms) and len(forms[-1]) == 3:
+            forms[-1].append(_node(line))
+        elif shape:
+            # A row of a table-form group: the values of the header's shape.
+            a, _, values = line.partition(';')
+            a, values = a.split(), values.split()
+            if (len(a), len(values)) != (len(shape[0]), len(shape[1])):
+                raise ValueError('not a row of its group header: ' + line)
+            groups[-1].append((
+                tuple(p + (int(v), 0) for p, v in zip(shape[0], a)),
+                tuple(f + (int(v, 16),) for f, v in zip(shape[1], values)),
+                (), ()))
         else:
-            T[name] = [tuple(int(v.replace('ull', ''), 0) for v in t.split(','))
-                       for t in re.findall(r'\{([^{}]*)\}', body)]
-    m = re.search(r'const agx3_table (\w+) = \{\s*forms, (\d+),', src)
-    T['name'] = m.group(1)
-    T['num_forms'] = int(m.group(2))
+            groups[-1].append(_node(line))
+    name = os.path.basename(path).split('_')[0]
+    return name, groups, [tuple(f) for f in forms]
+
+
+def load(path):
+    return unfold(*parse(path))
+
+
+def unfold(name, groups, forms):
+    """One node tree per form, in the legacy row order."""
+    T = {a: [] for a in ARRAYS}
+    T['name'] = name + '_table'
+    pooled = {}
+
+    def pool(kind, values):
+        """Offset of values in the LUT or set pool, appended on first use."""
+        if (kind, values) not in pooled:
+            pooled[kind, values] = len(T[kind])
+            T[kind] += values
+        return pooled[kind, values]
+
+    def emit(node):
+        preds, fixeds, cmds, grefs = node
+        own = []
+        for g in grefs:
+            alts = [emit(a) for a in groups[g]]
+            own.append((len(T['altpool']), len(alts)))
+            T['altpool'] += alts
+        T['nodes'].append((len(T['fixeds']), len(fixeds), len(T['preds']),
+                           len(preds), len(T['cmds']), len(cmds),
+                           len(T['groups']), len(own)))
+        T['fixeds'] += fixeds
+        T['preds'] += [p if p[1] != 1 else
+                       p[:4] + (pool('setpool', p[4]), len(p[4])) for p in preds]
+        T['cmds'] += [c[:5] + ((-1, 0) if c[5] is None else
+                               (pool('lutpool', c[5]), len(c[5]))) for c in cmds]
+        T['groups'] += own
+        return len(T['nodes']) - 1
+
+    for mnemonic, ep, size, node in forms:
+        T['forms'].append((mnemonic, ep, size, emit(node)))
+    T['num_forms'] = len(forms)
     return T
+
+
+def legacy_c(T):
+    """The rows as the checked-in C files had them, from the #include line on."""
+    def rows(ctype, name, fmt):
+        return ('static const %s %s[] = {\n' % (ctype, name) +
+                ',\n'.join(fmt % r for r in T[name]) + '\n};\n')
+
+    def pool(ctype, name, fmt):
+        return ('static const %s %s[] = {\n' % (ctype, name) +
+                ','.join(fmt % v for v in T[name]) + '\n};\n')
+
+    return ('#include "agx3_compose.h"\n' +
+            rows('agx3_fixed', 'fixeds', '{%d,0x%x,0x%x}') +
+            rows('agx3_pred', 'preds', '{%d,%d,%d,%d,0x%xull,0x%xull}') +
+            rows('agx3_cmd', 'cmds', '{%d,%d,%d,%d,%d,%d,%d}') +
+            rows('agx3_group', 'groups', '{%d,%d}') +
+            rows('agx3_node', 'nodes', '{%d,%d,%d,%d,%d,%d,%d,%d}') +
+            rows('agx3_form', 'forms', '{"%s",%d,%d,%d}') +
+            pool('uint32_t', 'altpool', '%d') +
+            pool('uint16_t', 'lutpool', '%d') +
+            pool('uint64_t', 'setpool', '0x%xull') +
+            'const agx3_table %s = {\n  forms, %d, nodes, groups, altpool, '
+            'fixeds, preds, cmds, lutpool, setpool\n};\n' %
+            (T['name'], T['num_forms']))
 
 
 class Composer:

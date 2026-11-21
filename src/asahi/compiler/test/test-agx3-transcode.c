@@ -27,8 +27,9 @@ same_fields_except(const char *mnemonic, const uint8_t *a, unsigned alen,
                    const uint8_t *b, unsigned blen, unsigned ignore)
 {
    uint64_t fa[AGX3_MAX_FIELDS], fb[AGX3_MAX_FIELDS];
-   if (agx3_decode(&agx3d_table, a, alen, mnemonic, fa) < 0 ||
-       agx3_decode(&agx3d_table, b, blen, mnemonic, fb) < 0)
+   const enum agx3_mnemonic m = agx3_mnemonic_from_name(mnemonic);
+   if (m == AGX3_MN_NONE || agx3_decode(&agx3d_table, a, alen, m, fa) < 0 ||
+       agx3_decode(&agx3d_table, b, blen, m, fb) < 0)
       return false;
    fa[ignore] = fb[ignore] = 0;
    return !memcmp(fa, fb, sizeof(fa));
@@ -139,8 +140,8 @@ main(void)
          uint64_t fields[AGX3_MAX_FIELDS];
          const bool ok =
             b < count && t <= count && offsets[b + 1] - offsets[b] == 10 &&
-            (agx3_decode(&agx3d_table, bytes + offsets[b], 10, "b", fields) >= 0 ||
-             agx3_decode(&agx3d_table, bytes + offsets[b], 10, "bn", fields) >= 0) &&
+            (agx3_decode(&agx3d_table, bytes + offsets[b], 10, AGX3_MN_b, fields) >= 0 ||
+             agx3_decode(&agx3d_table, bytes + offsets[b], 10, AGX3_MN_bn, fields) >= 0) &&
             (int64_t)offsets[b] + ((int64_t)(fields[0] << 16) >> 16) ==
                (int64_t)offsets[t];
          if (!ok) {

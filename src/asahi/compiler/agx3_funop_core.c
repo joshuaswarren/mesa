@@ -23,7 +23,7 @@
  * op-select join the baseline (f32sinc uses a distinct word0 without f42).
  */
 struct funop_form {
-   const char *mnemonic;
+   enum agx3_mnemonic mnemonic;
    int rint_mode;                     /* f43, or -1 when not f32rint */
    bool wait_ok;                      /* wait fields grade A in the map */
    const struct agx3_field_kv *base_b;
@@ -78,29 +78,29 @@ static const struct agx3_field_kv c_dfdy[] = {
 };
 
 static const struct funop_form forms[AGX3_FUNOP_COUNT] = {
-   [AGX3_FUNOP_FLOOR] = {"f32rint", 3, true, b_rint_like, NELEM(b_rint_like),
+   [AGX3_FUNOP_FLOOR] = {AGX3_MN_f32rint, 3, true, b_rint_like, NELEM(b_rint_like),
                          c_rint, NELEM(c_rint)},
-   [AGX3_FUNOP_CEIL] = {"f32rint", 2, true, b_rint_like, NELEM(b_rint_like),
+   [AGX3_FUNOP_CEIL] = {AGX3_MN_f32rint, 2, true, b_rint_like, NELEM(b_rint_like),
                         c_rint, NELEM(c_rint)},
-   [AGX3_FUNOP_TRUNC] = {"f32rint", 1, true, b_rint_like, NELEM(b_rint_like),
+   [AGX3_FUNOP_TRUNC] = {AGX3_MN_f32rint, 1, true, b_rint_like, NELEM(b_rint_like),
                          c_rint, NELEM(c_rint)},
-   [AGX3_FUNOP_RINT] = {"f32rint", 0, true, b_rint_like, NELEM(b_rint_like),
+   [AGX3_FUNOP_RINT] = {AGX3_MN_f32rint, 0, true, b_rint_like, NELEM(b_rint_like),
                         c_rint, NELEM(c_rint)},
-   [AGX3_FUNOP_LOG2] = {"f32log2", -1, true, b_rint_like, NELEM(b_rint_like),
+   [AGX3_FUNOP_LOG2] = {AGX3_MN_f32log2, -1, true, b_rint_like, NELEM(b_rint_like),
                         c_log2, NELEM(c_log2)},
-   [AGX3_FUNOP_EXP2] = {"f32exp2", -1, true, b_rint_like, NELEM(b_rint_like),
+   [AGX3_FUNOP_EXP2] = {AGX3_MN_f32exp2, -1, true, b_rint_like, NELEM(b_rint_like),
                         c_exp2, NELEM(c_exp2)},
    /* f32sinc is grade B and dfdx/dfdy are absent in the wait-field map, so
     * they fail closed on any wait instead of guessing the bit positions. */
-   [AGX3_FUNOP_SINC] = {"f32sinc", -1, false, b_sinc_like, NELEM(b_sinc_like),
+   [AGX3_FUNOP_SINC] = {AGX3_MN_f32sinc, -1, false, b_sinc_like, NELEM(b_sinc_like),
                         c_sinc, NELEM(c_sinc)},
-   [AGX3_FUNOP_DFDX] = {"f32dfdx", -1, false, b_sinc_like, NELEM(b_sinc_like),
+   [AGX3_FUNOP_DFDX] = {AGX3_MN_f32dfdx, -1, false, b_sinc_like, NELEM(b_sinc_like),
                         c_dfdx, NELEM(c_dfdx)},
-   [AGX3_FUNOP_DFDY] = {"f32dfdy", -1, false, b_dfdy, NELEM(b_dfdy),
+   [AGX3_FUNOP_DFDY] = {AGX3_MN_f32dfdy, -1, false, b_dfdy, NELEM(b_dfdy),
                         c_dfdy, NELEM(c_dfdy)},
-   [AGX3_FUNOP_RSQRT] = {"f32rsqrt", -1, true, NULL, 0,
+   [AGX3_FUNOP_RSQRT] = {AGX3_MN_f32rsqrt, -1, true, NULL, 0,
                          c_rsqrt, NELEM(c_rsqrt)},
-   [AGX3_FUNOP_SQRT_STEP] = {"f32sqrtstep", -1, true, NULL, 0,
+   [AGX3_FUNOP_SQRT_STEP] = {AGX3_MN_f32sqrtstep, -1, true, NULL, 0,
                              c_sqrt_step, NELEM(c_sqrt_step)},
 };
 
