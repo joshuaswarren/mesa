@@ -668,6 +668,11 @@ struct agx_batch {
 
    uint64_t uploaded_clear_color[PIPE_MAX_COLOR_BUFS];
    union pipe_color_union clear_color[PIPE_MAX_COLOR_BUFS];
+
+   /* Zeroes that constant and storage buffers with nothing in range point at,
+    * 0 until the first one (agx_uniforms.c).
+    */
+   uint64_t zero_sink;
    double clear_depth;
    unsigned clear_stencil;
 
@@ -1320,6 +1325,20 @@ void agx_xfb_cpu_draw(struct agx_context *ctx,
                       const struct pipe_draw_info *info,
                       const struct pipe_draw_start_count_bias *draw);
 void agx_xfb_cpu_destroy(struct agx_context *ctx);
+
+/* A buffer range is bound as the application gave it and can extend past the
+ * end of its resource, for example when the buffer's data store is later
+ * replaced by a smaller one. Returns the bytes of the range inside the
+ * resource: 0 when it starts at or past the end. */
+static inline unsigned
+agx_buffer_range_in_resource(const struct pipe_resource *prsc, unsigned offset,
+                             unsigned size)
+{
+   if (offset >= prsc->width0)
+      return 0;
+
+   return MIN2(size, prsc->width0 - offset);
+}
 
 bool agx_swtnl_lower_for_draw(nir_shader *nir);
 bool agx_m5_gpu_tess(struct agx_context *ctx);
