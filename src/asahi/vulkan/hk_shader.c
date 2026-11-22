@@ -5661,12 +5661,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       }
    }
 
-   /* An M4 Pro API compute shader that shares nothing across its workgroup
-    * may launch its big workgroups as smaller hardware workgroups
-    * (agx_nir_lower_workgroup_split, hk dispatch_grid). Measured on T6040
-    * only, so A18 Pro keeps the API shape. */
+   /* A G17P API compute shader that shares nothing across its workgroup may
+    * launch its big workgroups as smaller hardware workgroups
+    * (agx_nir_lower_workgroup_split, hk dispatch_grid). */
    uint16_t launch_size[3] = {0};
-   if (agx_is_m4_pro(&dev->dev) && sw_stage == MESA_SHADER_COMPUTE &&
+   if (dev->dev.chip == AGX_CHIP_G17P && sw_stage == MESA_SHADER_COMPUTE &&
        nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
        agx_workgroup_split_size(nir, launch_size))
       NIR_PASS(_, nir, agx_nir_lower_workgroup_split, launch_size);

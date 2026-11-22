@@ -1201,7 +1201,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
             .format = pImageFormatInfo->format,
             .extent = {64, 64, 1},
             .mipLevels = 1,
-            .arrayLayers = agx_is_m4_pro(&pdev->dev) &&
+            .arrayLayers = pdev->dev.chip == AGX_CHIP_G17P &&
                                  (pImageFormatInfo->flags &
                                   VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)
                               ? 6 : 1,
@@ -1345,7 +1345,7 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                                          dev->params.features) ||
       m5_storage ||
       (hk_hal200_compression_eligible(dev->chip, dev->params.chip_id, plane,
-                                      info, agx_is_m4_pro(dev)) &&
+                                      info) &&
        !hk_g17p_multiview_spill_risk(info, multiview)) ||
       hk_g17p_shared_compression_eligible(dev->chip, plane, info) ||
       hk_m5_color_compression_eligible(dev->chip, plane, info) ||
