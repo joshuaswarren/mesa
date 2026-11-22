@@ -742,6 +742,7 @@ typedef struct {
    bool agx3_staging_known;
    bool agx3_fltnorm_start;
    bool agx3_mrt_tile_ops_ordered;
+   bool agx3_local_read_tile_ops;
    /* The packer emitted this fragment's tile accesses through the native1130
     * mixed-format protocol, inside its 0x200 entry and final release (run
     * 1139); its reads then take the long LLDCol form. */

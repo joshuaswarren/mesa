@@ -574,6 +574,10 @@ struct agx_shader_key {
     * still proves its one read/write pixel transaction before admitting it. */
    bool m5_uniform_blend;
 
+   /* Monolithic AGX3 fragment program reading color input attachments from
+    * on-chip tile memory (local_read / subpassLoad) across arbitrary CFG. */
+   bool agx3_local_read;
+
    /* AGX3B: build the preamble as a native constant program (CProg inputs
     * imported through its TPS frame, arithmetic results selected straight
     * into uniform destinations, half exports legalized) for this shader.

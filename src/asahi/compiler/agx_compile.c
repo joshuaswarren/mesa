@@ -12285,7 +12285,7 @@ agx3_order_g18_msaa_tile_ops(agx_context *ctx)
 }
 
 static bool
-agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
+agx3_order_g17p_mrt_tile_ops_strict(agx_context *ctx)
 {
    /* G18G: this optional pass cannot affect a non-fragment program or a
     * preamble. Returning false means no transformation, not a refused shader.
@@ -12699,6 +12699,158 @@ agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
    }
    ctx->agx3_mrt_tile_ops_ordered = true;
    return true;
+}
+
+/* Monolithic fragment shaders with on-chip tile-memory input-attachment reads
+ * (local_read / subpassLoad) can read partitions they never write and contain
+ * arbitrary control flow (e.g. lighting loops, per-sample unrolled loops)
+ * between their tile loads and final tile stores. Admit those shapes on G17P
+ * (AGX3B) and M5 (AGX3C, !emit_agx3d) under a single uniform pixel-class
+ * transaction covering every touched partition. */
+static bool
+agx3_order_g17p_local_read_tile_ops(agx_context *ctx)
+{
+   if (!ctx->key->agx3_local_read || ctx->key->m5_uniform_blend)
+      return false;
+
+   if ((ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B &&
+        !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !ctx->key->dev.emit_agx3d && ctx->key->fs.nr_samples <= 8)) ||
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||
+       ctx->key->secondary || ctx->key->fs.ignore_tib_dependencies ||
+       ctx->key->no_stop || ctx->key->g17p_emrt ||
+       list_is_empty(&ctx->blocks))
+      return false;
+
+   const bool multisample = ctx->key->fs.nr_samples > 1;
+   const BITSET_WORD *partitions = ctx->key->g17p_tile_partitions;
+   const bool keyed = !__bitset_is_empty(
+      partitions, BITSET_WORDS(AGX_G17P_MAX_BYTES_PER_SAMPLE));
+   agx_block *first_block = list_first_entry(&ctx->blocks, agx_block, link);
+   agx_block *exit_block = list_last_entry(&ctx->blocks, agx_block, link);
+
+   unsigned load_count = 0;
+   bool saw_stop = false;
+   bool saw_block0_cf = false;
+   bool tile_started = false;
+   bool saw_store = false;
+   bool all_loads_before_cf_and_stores = true;
+
+   agx_foreach_block(ctx, block) {
+      if (block == exit_block) {
+         if (block->successors[0] || block->successors[1])
+            return false;
+      } else {
+         if (!block->successors[0] && !block->successors[1])
+            return false;
+      }
+
+      agx_foreach_instr_in_block(block, I) {
+         if (saw_stop)
+            return false;
+
+         switch (I->op) {
+         case AGX_OPCODE_ZS_EMIT_AGX3:
+         case AGX_OPCODE_SIGNAL_PIX:
+            return false;
+         case AGX_OPCODE_SAMPLE_MASK_AGX3:
+            if (tile_started || block != first_block || saw_block0_cf)
+               return false;
+            break;
+         case AGX_OPCODE_LD_TILE:
+            if (I->nr_dests != 1 || I->nr_srcs != 2 || I->explicit_coords ||
+                I->pixel_offset >= AGX_G17P_MAX_BYTES_PER_SAMPLE ||
+                I->pixel_offset > UINT8_MAX ||
+                (keyed && !BITSET_TEST(partitions, I->pixel_offset)) ||
+                !(multisample
+                     ? (I->src[0].type == AGX_INDEX_NORMAL &&
+                        I->src[0].size == AGX_SIZE_16)
+                     : (I->src[0].type == AGX_INDEX_IMMEDIATE &&
+                        I->src[0].value == 0xff)) ||
+                !agx_is_null(I->src[1]))
+               return false;
+            if (block != first_block || saw_block0_cf || saw_store)
+               all_loads_before_cf_and_stores = false;
+            tile_started = true;
+            load_count++;
+            break;
+         case AGX_OPCODE_ST_TILE:
+            if (I->nr_dests != 0 || I->nr_srcs != 3 || I->explicit_coords ||
+                I->pixel_offset >= AGX_G17P_MAX_BYTES_PER_SAMPLE ||
+                I->pixel_offset > UINT8_MAX ||
+                (keyed && !BITSET_TEST(partitions, I->pixel_offset)) ||
+                I->src[0].type != AGX_INDEX_NORMAL || I->src[0].memory ||
+                !(multisample
+                     ? (I->src[1].type == AGX_INDEX_NORMAL &&
+                        I->src[1].size == AGX_SIZE_16)
+                     : (I->src[1].type == AGX_INDEX_IMMEDIATE &&
+                        I->src[1].value == 0xff)) ||
+                !agx_is_null(I->src[2]))
+               return false;
+            tile_started = true;
+            saw_store = true;
+            break;
+         case AGX_OPCODE_STOP:
+            if (block != exit_block)
+               return false;
+            saw_stop = true;
+            break;
+         case AGX_OPCODE_IF_ICMP:
+         case AGX_OPCODE_WHILE_ICMP:
+         case AGX_OPCODE_ELSE_ICMP:
+         case AGX_OPCODE_IF_FCMP:
+         case AGX_OPCODE_WHILE_FCMP:
+         case AGX_OPCODE_ELSE_FCMP:
+         case AGX_OPCODE_JMP_EXEC_ANY:
+         case AGX_OPCODE_JMP_EXEC_NONE:
+         case AGX_OPCODE_JMP_EXEC_NONE_AFTER:
+         case AGX_OPCODE_POP_EXEC:
+         case AGX_OPCODE_BREAK_IF_ICMP:
+         case AGX_OPCODE_BREAK_IF_FCMP:
+         case AGX_OPCODE_BEGIN_CF:
+            if (block == first_block)
+               saw_block0_cf = true;
+            break;
+         default:
+            break;
+         }
+      }
+   }
+
+   if (!saw_stop || !load_count)
+      return false;
+
+   /* Single-sample tile loads take only the immediate 0xff sample mask and
+    * have no register inputs. When every load sits in the entry block ahead
+    * of control flow and stores, group them back-to-back after the first load
+    * so all tilebuffer fetches overlap on independent scoreboard slots and
+    * load-only colour classes can release before lighting ALU begins. */
+   if (!multisample && all_loads_before_cf_and_stores && load_count > 1) {
+      agx_instr *anchor = NULL;
+      agx_foreach_instr_in_block_safe(first_block, I) {
+         if (I->op != AGX_OPCODE_LD_TILE)
+            continue;
+         if (!anchor) {
+            anchor = I;
+            continue;
+         }
+         list_del(&I->link);
+         list_add(&I->link, &anchor->link);
+         anchor = I;
+      }
+   }
+
+   ctx->agx3_mrt_tile_ops_ordered = true;
+   ctx->agx3_local_read_tile_ops = true;
+   return true;
+}
+
+static bool
+agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
+{
+   if (ctx->key->agx3_local_read && !ctx->key->m5_uniform_blend)
+      return agx3_order_g17p_local_read_tile_ops(ctx);
+   return agx3_order_g17p_mrt_tile_ops_strict(ctx);
 }
 
 /* The tile load whose value a store writes back unchanged, or NULL. The value

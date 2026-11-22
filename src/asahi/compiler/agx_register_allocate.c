@@ -3006,8 +3006,9 @@ agx3_tile_store_bank(agx_context *ctx)
     * So size the bank by what the stores actually need, prefix included, and
     * widen to the same halves 0..63 the plain MRT bank below already uses past
     * four targets rather than inventing a third bank. */
-   if (ctx->key->g17p_emrt && ctx->agx3_mrt_tile_ops_ordered &&
-       list_length(&ctx->blocks) > 1) {
+   if ((ctx->key->g17p_emrt && ctx->agx3_mrt_tile_ops_ordered &&
+        list_length(&ctx->blocks) > 1) ||
+       ctx->agx3_local_read_tile_ops) {
       const unsigned prefix = ALIGN_POT(reserved_size(ctx), payload_align);
       return prefix + payload_halves > 32 ? 64 : 32;
    }
