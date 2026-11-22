@@ -263,7 +263,8 @@ struct agx_device {
 
       /* Power-of-two size classes, subdivided by allocation-flag hash.
        * Exact flags are still checked when fetching; collisions only affect
-       * lookup cost. Each bucket is a list of free agx_bo objects.
+       * lookup cost. Each bucket is a LIFO list of free agx_bo objects so
+       * recently freed, non-purgeable BOs are reused first.
        */
       struct list_head buckets[NR_BO_CACHE_BUCKETS];
 
@@ -282,7 +283,9 @@ struct agx_device {
       int madvise;
 
       /* DRM shmem pages remain pinned while a BO is cached. Wake only while
-       * the cache has entries, so an idle client can release stale BOs. */
+       * the cache has entries, so an idle client can release stale BOs.
+       * idle_pending is written atomically under idle_lock and read atomically
+       * under bo_cache.lock to skip idle_lock on active-cache puts. */
       mtx_t idle_lock;
       struct u_cnd_monotonic idle_cond;
       thrd_t idle_thread;
