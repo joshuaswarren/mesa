@@ -7431,3 +7431,61 @@ TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
       ralloc_free(mem);
    }
 }
+
+/* On AGX3C (M5), fence_mem_to_tex_agx must emit the non-rendezvous device and
+ * texture fences rather than the workgroup-rendezvous DEVICE/TEXTURE barriers:
+ * the intrinsic sits inside per-invocation bounds checks and must make device
+ * image atomics visible to subsequent texture-cache reads in the same thread. */
+TEST(NativeForms, M5FenceMemToTexUsesNonRendezvousFences)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "m5 fence_mem_to_tex");
+   b.shader->info.workgroup_size[0] = 8;
+   b.shader->info.workgroup_size[1] = 16;
+   b.shader->info.workgroup_size[2] = 1;
+   nir_def *base = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *id = nir_load_local_invocation_index(&b);
+   nir_def *addr = nir_iadd(&b, base, nir_u2u64(&b, nir_ishl_imm(&b, id, 2)));
+   nir_global_atomic(&b, 32, addr, nir_imm_int(&b, 1),
+                     .atomic_op = nir_atomic_op_iadd);
+   nir_fence_mem_to_tex_agx(&b);
+   agx_preprocess_nir_native(b.shader, AGX_CHIP_G17S);
+
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   key.no_preamble = true;
+   key.reserved_preamble = 8;
+   agx_shader_part part = {};
+   ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+   ASSERT_NE(part.binary, nullptr);
+
+   agx3_encoded_scoped_barrier dev_fence = {}, tex_fence = {};
+   agx3_encoded_scoped_barrier dev_bar = {}, tex_bar = {};
+   ASSERT_TRUE(agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3C,
+                                        AGX3_BARRIER_SCOPE_DEVICE_FENCE,
+                                        &dev_fence));
+   ASSERT_TRUE(agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3C,
+                                        AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT,
+                                        &tex_fence));
+   ASSERT_TRUE(agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3C,
+                                        AGX3_BARRIER_SCOPE_DEVICE, &dev_bar));
+   ASSERT_TRUE(agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3C,
+                                        AGX3_BARRIER_SCOPE_TEXTURE, &tex_bar));
+
+   auto count_pattern = [&](const agx3_encoded_scoped_barrier &pat) {
+      unsigned count = 0;
+      const uint8_t *code = (const uint8_t *)part.binary;
+      for (unsigned i = 0; i + pat.length <= part.info.binary_size; ++i)
+         count += !memcmp(code + i, pat.bytes, pat.length);
+      return count;
+   };
+
+   EXPECT_EQ(count_pattern(dev_fence), 1u);
+   EXPECT_EQ(count_pattern(tex_fence), 1u);
+   EXPECT_EQ(count_pattern(dev_bar), 0u);
+   EXPECT_EQ(count_pattern(tex_bar), 0u);
+
+   free(part.binary);
+   ralloc_free(b.shader);
+}
