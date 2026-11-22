@@ -497,6 +497,27 @@ fold_ubyte_to_float = [
      ('u2f32', ('u2u8', ('unpack_32_2x16_split_y', a)))),
 ]
 
+# |a - b| of two unsigned bytes: their 16-bit differences a - b and b - a are
+# |a - b| and 2^16 - |a - b| > 255 (or both 0), so the smaller one is the
+# magnitude. Two independent 16-bit subtracts and an unsigned minimum replace
+# the widened subtract, its negation and the signed maximum.
+def u8_absdiff():
+    left, right = ('u2u16', 'a@8'), ('u2u16', 'b@8')
+    absdiff = ('u2u32', ('umin@16', ('isub@16', left, right),
+                         ('isub@16', right, left)))
+    rules = []
+    for delta in (('isub@32(is_used_once)', ('u2u32', 'a@8'), ('u2u32', 'b@8')),
+                  ('iadd@32(is_used_once)', ('u2u32', 'a@8'),
+                   ('ineg', ('u2u32', 'b@8')))):
+        rules += [(('iabs', delta), absdiff)]
+    for delta in (('isub@32', ('u2u32', 'a@8'), ('u2u32', 'b@8')),
+                  ('iadd@32', ('u2u32', 'a@8'), ('ineg', ('u2u32', 'b@8')))):
+        rules += [(('imax@32(agx_u8_absdiff_uses_match)', delta, ('ineg', delta)),
+                   absdiff),
+                  (('imax@32(agx_u8_absdiff_uses_match)', ('ineg', delta), delta),
+                   absdiff)]
+    return rules
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--import-path', required=True)
@@ -530,6 +551,26 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
 }
 """)
 
+    print("""
+/* imax(d, -d) where d has no other use than this maximum and its negation. */
+static bool
+agx_u8_absdiff_uses_match(const nir_alu_instr *instr)
+{
+   const nir_alu_instr *x = nir_src_as_alu(instr->src[0].src);
+   const nir_alu_instr *y = nir_src_as_alu(instr->src[1].src);
+   if (!x || !y)
+      return false;
+   const nir_alu_instr *neg = x->op == nir_op_ineg ? x : y;
+   const nir_alu_instr *delta = x->op == nir_op_ineg ? y : x;
+   return neg->op == nir_op_ineg && neg != delta &&
+          neg->src[0].src.ssa == &delta->def &&
+          neg->instr.block == instr->instr.block &&
+          delta->instr.block == instr->instr.block &&
+          list_is_singular(&neg->def.uses) &&
+          list_length(&delta->def.uses) == 2;
+}
+""")
+
     print(nir_algebraic.AlgebraicPass("agx_nir_cleanup_amul", cleanup_amul).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_lea", fuse_lea).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_lower_lea", lower_lea).render())
@@ -555,6 +596,8 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
                                       fold_ubyte_to_float).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fold_d3d_float_to_int",
                                       fold_d3d_float_to_int).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_opt_u8_absdiff",
+                                      u8_absdiff()).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_algebraic_late",
                                       fuse_extr + fuse_ubfe +
                                       fuse_imad + ixor_bcsel +

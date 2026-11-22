@@ -609,3 +609,73 @@ TEST(M5FoldOffsets, ArrayElement)
    ralloc_free(b.shader);
 }
 
+/* |a - b| of unsigned bytes in 16-bit arithmetic: evaluate the rewritten
+ * expression for every operand pair. */
+static uint32_t
+eval_scalar(nir_scalar s, uint8_t a, uint8_t b, nir_def *la, nir_def *lb)
+{
+   if (s.def == la)
+      return a;
+   if (s.def == lb)
+      return b;
+   if (nir_scalar_is_const(s))
+      return nir_scalar_as_uint(s);
+   EXPECT_TRUE(nir_scalar_is_alu(s));
+   nir_alu_instr *alu = nir_def_as_alu(s.def);
+   const nir_op_info *info = &nir_op_infos[alu->op];
+   nir_const_value src[4][NIR_MAX_VEC_COMPONENTS] = {};
+   nir_const_value *srcs[4];
+   for (unsigned i = 0; i < info->num_inputs; ++i) {
+      nir_scalar in = nir_scalar_chase_alu_src(s, i);
+      uint64_t v = eval_scalar(in, a, b, la, lb);
+      src[i][0] = nir_const_value_for_uint(v, in.def->bit_size);
+      srcs[i] = src[i];
+   }
+   nir_const_value dest[NIR_MAX_VEC_COMPONENTS] = {};
+   uint16_t poison = 0;
+   nir_eval_const_opcode(alu->op, dest, &poison, 1, alu->def.bit_size, srcs, 0);
+   return nir_const_value_as_uint(dest[0], alu->def.bit_size);
+}
+
+TEST(M5U8AbsDiff, Exhaustive)
+{
+   for (unsigned form = 0; form < 2; ++form) {
+      nir_builder b = compute_shader("u8-absdiff");
+      nir_def *addr = buffer_address(&b, nir_imm_int(&b, 0));
+      nir_def *la = nir_load_global(&b, 1, 8, addr, .align_mul = 1);
+      nir_def *lb = nir_load_global(&b, 1, 8, nir_iadd_imm(&b, addr, 1), .align_mul = 1);
+      nir_def *d = nir_isub(&b, nir_u2u32(&b, la), nir_u2u32(&b, lb));
+      nir_def *r = form == 0 ? nir_imax(&b, d, nir_ineg(&b, d)) : nir_iabs(&b, d);
+      nir_intrinsic_instr *store =
+         nir_store_global(&b, r, nir_iadd_imm(&b, addr, 4), .align_mul = 4);
+      NIR_PASS(_, b.shader, nir_opt_cse);
+   EXPECT_TRUE(agx_nir_opt_u8_absdiff(b.shader));
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "u8 absdiff");
+      nir_scalar out = nir_scalar_resolved(store->src[0].ssa, 0);
+      EXPECT_NE(nir_scalar_alu_op(out), nir_op_imax);
+      for (unsigned x = 0; x < 256; ++x) {
+         for (unsigned y = 0; y < 256; ++y) {
+            uint32_t got = eval_scalar(out, x, y, la, lb);
+            ASSERT_EQ(got, (uint32_t)abs((int)x - (int)y)) << x << " " << y;
+         }
+      }
+      ralloc_free(b.shader);
+   }
+}
+
+/* A delta with another use keeps its 32-bit form. */
+TEST(M5U8AbsDiff, OtherUseRefused)
+{
+   nir_builder b = compute_shader("u8-absdiff-uses");
+   nir_def *addr = buffer_address(&b, nir_imm_int(&b, 0));
+   nir_def *la = nir_load_global(&b, 1, 8, addr, .align_mul = 1);
+   nir_def *lb = nir_load_global(&b, 1, 8, nir_iadd_imm(&b, addr, 1), .align_mul = 1);
+   nir_def *d = nir_isub(&b, nir_u2u32(&b, la), nir_u2u32(&b, lb));
+   nir_store_global(&b, nir_imax(&b, d, nir_ineg(&b, d)), addr, .align_mul = 4);
+   nir_store_global(&b, d, nir_iadd_imm(&b, addr, 8), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+   EXPECT_FALSE(agx_nir_opt_u8_absdiff(b.shader));
+   ralloc_free(b.shader);
+}
+

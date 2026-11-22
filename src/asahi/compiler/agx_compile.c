@@ -10292,6 +10292,17 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          agx_optimize_loop_nir(nir, m5, g17p);
    }
 
+   /* Absolute differences of unsigned bytes in 16-bit arithmetic. */
+   if (m5 && !g18_scans) {
+      bool narrowed = false;
+      NIR_PASS(narrowed, nir, agx_nir_opt_u8_absdiff);
+      if (narrowed) {
+         NIR_PASS(_, nir, nir_opt_copy_prop);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
+
    /* Consecutive words read together, such as the unrolled iterations' reads
     * of one array, become one vector load. */
    /* With soft faults, robust buffer reads are plain reads followed by a
