@@ -1872,6 +1872,32 @@ nir_is_coherent(nir_intrinsic_instr *instr)
           (ACCESS_COHERENT | ACCESS_VOLATILE | ACCESS_ATOMIC);
 }
 
+/* Shared predicate for agx_emit_load() and agx_emit_alu() so both sites agree
+ * on when pack_32_4x8(load_agx 8x4) consumes the raw packed W8 payload
+ * directly. Scoped to AGX3C (non-G18G) to match agx_nir_opt_u8x4_hsum();
+ * G18G (emit_agx3d) stays excluded until verified on G18G hardware. */
+static bool
+agx_pack_32_4x8_zero_copy_load(const struct agx_device_key *dev,
+                               const nir_intrinsic_instr *ld,
+                               const nir_alu_instr *pack)
+{
+   if (dev->encoding != AGX_ISA_ENCODING_AGX3C || dev->emit_agx3d ||
+       ld->intrinsic != nir_intrinsic_load_agx ||
+       agx_format_for_pipe(nir_intrinsic_format(ld)) != AGX_FORMAT_I8 ||
+       (nir_intrinsic_base(ld) & (AGX_NIR_MEMORY_PACKED_COUNT_MASK |
+                                  AGX_NIR_MEMORY_UNPACK_W8_WORD)) ||
+       ld->def.num_components != 4 || ld->def.bit_size != 8 ||
+       !list_is_singular(&ld->def.uses))
+      return false;
+
+   if (pack->op != nir_op_pack_32_4x8 || pack->def.num_components != 1 ||
+       pack->def.bit_size != 32 || pack->src[0].src.ssa != &ld->def)
+      return false;
+
+   return pack->src[0].swizzle[0] == 0 && pack->src[0].swizzle[1] == 1 &&
+          pack->src[0].swizzle[2] == 2 && pack->src[0].swizzle[3] == 3;
+}
+
 static void
 agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
 {
@@ -2016,6 +2042,24 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
         (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
          dest.size == AGX_SIZE_32)) && packed_count == 0) {
       const unsigned nr = instr->def.num_components;
+      if (list_is_singular(&instr->def.uses)) {
+         nir_src *use = list_first_entry(&instr->def.uses, nir_src, use_link);
+         if (!nir_src_is_if(use) &&
+             nir_src_use_instr(use)->type == nir_instr_type_alu) {
+            nir_alu_instr *pack = nir_instr_as_alu(nir_src_use_instr(use));
+            if (agx_pack_32_4x8_zero_copy_load(&b->shader->key->dev, instr,
+                                               pack)) {
+               agx_instr *load = agx_device_load_to(
+                  b, agx_def_index(&pack->def), addr, offset, fmt,
+                  BITFIELD_MASK(nr), shift, nir_is_coherent(instr));
+               load->memory_index_is_bytes = index_bytes;
+               load->memory_byte_offset = byte_offset;
+               load->memory_is_packed = true;
+               return;
+            }
+         }
+      }
+
       agx_index payload = agx_temp(b->shader, AGX_SIZE_32);
       agx_instr *load = agx_device_load_to(b, payload, addr, offset, fmt,
                                            BITFIELD_MASK(nr), shift,
@@ -8441,6 +8485,30 @@ agx_emit_g17p_ufind_msb(agx_builder *b, agx_index dst, agx_index value)
 static agx_instr *
 agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
 {
+   if (instr->op == nir_op_pack_32_4x8 &&
+       instr->def.num_components == 1 && instr->def.bit_size == 32) {
+      nir_def *src = instr->src[0].src.ssa;
+      if (nir_def_instr(src)->type == nir_instr_type_intrinsic &&
+          agx_pack_32_4x8_zero_copy_load(
+             &b->shader->key->dev,
+             nir_instr_as_intrinsic(nir_def_instr(src)), instr))
+         return NULL;
+
+      /* pack_32_4x8 is only emitted by agx_nir_opt_u8x4_hsum() on AGX3C
+       * (non-G18G); G18G (emit_agx3d) stays excluded until verified on G18G
+       * hardware. */
+      assert(b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+             !b->shader->key->dev.emit_agx3d);
+      agx_index ch[4] = {agx_null()};
+      for (unsigned i = 0; i < 4; ++i)
+         ch[i] = agx_extract_nir_src(b, instr->src[0].src, instr->src[0].swizzle[i]);
+      agx_index packed[2] = {agx_null()};
+      ASSERTED unsigned n_packed =
+         agx_pack_integer_8_agx3(b, ch, 4, AGX_FORMAT_I8, packed);
+      assert(n_packed == 2);
+      return agx_emit_collect_to(b, agx_def_index(&instr->def), 2, packed);
+   }
+
    unsigned srcs = nir_op_infos[instr->op].num_inputs;
    unsigned sz = instr->def.bit_size;
    unsigned src_sz = srcs ? nir_src_bit_size(instr->src[0].src) : 0;
@@ -17375,6 +17443,16 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    NIR_PASS(canonical_minmax_progress, nir, agx_nir_opt_canonical_minmax);
    if (canonical_minmax_progress)
       NIR_PASS(_, nir, nir_opt_dce);
+
+   /* G18G (emit_agx3d) is gated out until verified on G18G hardware. */
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !key->dev.emit_agx3d) {
+      bool u8_hsum = false;
+      NIR_PASS(u8_hsum, nir, agx_nir_opt_u8x4_hsum);
+      if (u8_hsum) {
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
 
 
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
