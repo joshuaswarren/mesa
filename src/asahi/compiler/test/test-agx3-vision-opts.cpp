@@ -1337,3 +1337,62 @@ TEST(AGX3VisionOpts, FoldW8WordUnpackThreeComponentsAGX3B)
    free(part.binary);
    ralloc_free(b.shader);
 }
+
+TEST(AGX3VisionOpts, SameBlockStoreLoadForward)
+{
+   for (unsigned mode = 0; mode < 8; ++mode) {
+      /* mode 0: same-block store_agx -> matching load_agx forwards value
+       * mode 1: intervening store_agx to another index blocks forwarding
+       * mode 2: ACCESS_COHERENT blocks forwarding
+       * mode 3: intervening barrier blocks forwarding
+       * mode 4: intervening global atomic blocks forwarding
+       * mode 5: mismatched SIGN_EXTEND blocks forwarding
+       * mode 6: mismatched BASE shift blocks forwarding
+       * mode 7: converting format (R16_UNORM with 16-bit value) blocks forwarding */
+      nir_builder b = make_compute_shader("same-block-store-load-fwd");
+      nir_def *base = make_desc_base(&b, 0);
+      nir_def *out = make_desc_base(&b, 8);
+      nir_def *idx = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 16);
+      nir_def *val32 = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 16);
+
+      const bool unorm = mode == 7;
+      enum pipe_format fmt = unorm ? PIPE_FORMAT_R16_UNORM : PIPE_FORMAT_R32_UINT;
+      unsigned bits = unorm ? 16u : 32u;
+      nir_def *val = unorm ? nir_u2u16(&b, val32) : val32;
+      gl_access_qualifier acc = mode == 2 ? ACCESS_COHERENT : (gl_access_qualifier)0;
+
+      nir_store_agx(&b, val, base, idx, .access = acc, .base = 0,
+                    .format = fmt, .sign_extend = false);
+      if (mode == 1) {
+         nir_store_agx(&b, nir_imm_int(&b, 7), base, nir_iadd_imm(&b, idx, 1),
+                       .access = (gl_access_qualifier)0, .format = PIPE_FORMAT_R32_UINT);
+      } else if (mode == 3) {
+         nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                     .memory_scope = SCOPE_DEVICE,
+                     .memory_semantics = NIR_MEMORY_ACQ_REL,
+                     .memory_modes = nir_var_mem_ssbo);
+      } else if (mode == 4) {
+         nir_global_atomic(&b, 32, base, nir_imm_int(&b, 1),
+                           .atomic_op = nir_atomic_op_iadd);
+      }
+      nir_def *ld = nir_load_agx(&b, 1, bits, base, idx, .access = acc,
+                                 .base = mode == 6 ? 2 : 0,
+                                 .format = fmt,
+                                 .sign_extend = mode == 5);
+      nir_def *res = unorm ? nir_u2u32(&b, ld) : nir_iadd_imm(&b, ld, 1);
+      nir_store_global(&b, res, out, .align_mul = 4);
+
+      bool progress = agx_nir_opt_forward_merge_loads(b.shader);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "same block store load fwd");
+
+      if (mode == 0) {
+         EXPECT_TRUE(progress);
+         EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_agx), 0u);
+      } else {
+         EXPECT_FALSE(progress);
+         EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_agx), 1u);
+      }
+      ralloc_free(b.shader);
+   }
+}
