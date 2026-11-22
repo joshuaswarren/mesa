@@ -757,6 +757,23 @@ agx_chip_native_g15(enum agx_chip chip)
           agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_G15;
 }
 
+/*
+ * Whether the native AGX3 path runs on Apple's HAL200 command-stream
+ * generation (G16G and G17P) rather than G15 (M3, RTKit 2419).
+ *
+ * HAL200 streams allow post-initial VDM State Updates to elide an unchanged
+ * bind tail and allow standalone 8-byte PPP State Updates carrying only the
+ * 28-byte fragment record.  Root-descriptor trimming is also keyed on this
+ * predicate so G16G and G17P run the same fast-flush and trimmed-root path,
+ * while G15 stays on the full-tail / full-root path until verified on M3.
+ */
+static inline bool
+agx_chip_native_hal200(enum agx_chip chip)
+{
+   return agx_chip_native_agx3(chip) &&
+          agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_HAL200;
+}
+
 /* Whether the kernel presents the T8140 native render context: a fixed Bind0
  * and seven low context views at 0x1000000000 that every render job needs.
  * This is a HAL200 firmware construct; the G15 firmware has none. */

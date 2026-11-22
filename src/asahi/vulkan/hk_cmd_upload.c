@@ -27,11 +27,14 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    struct hk_root_descriptor_table *root = &desc->root;
 
    size_t root_size = sizeof(*root);
-   if (dev->dev.chip == AGX_CHIP_G17P &&
-       bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
-      const struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
-      if (s && s->root_descriptor_size)
-         root_size = MIN2(root_size, s->root_descriptor_size);
+   if (agx_chip_native_hal200(dev->dev.chip)) {
+      if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
+         const struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
+         if (s && s->root_descriptor_size)
+            root_size = MIN2(root_size, s->root_descriptor_size);
+      } else if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+         root_size = MIN2(root_size, hk_gfx_root_descriptor_size(cmd));
+      }
    }
 
    root->printf_buffer_address = dev->dev.printf_buffer_address;

@@ -1059,6 +1059,15 @@ if with_tests
   )
 
   # Also no-op shim tests, registered with the shim in ../meson.build.
+  g17p_vulkan_bind_tail_state_change = executable(
+    'g17p-vulkan-bind-tail-state-change',
+    files('tests/g17p_vulkan_bind_tail_state_change.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   g17p_vulkan_compressed_mip_blit = executable(
     'g17p-vulkan-compressed-mip-blit',
     files('tests/g17p_vulkan_compressed_mip_blit.c'),

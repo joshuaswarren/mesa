@@ -42,6 +42,7 @@
 #include "hk_descriptor_set.h"
 #include "hk_drm_render_core.h"
 #include "hk_ioto_arena_core.h"
+#include "hk_nir_root_size.h"
 #include "hk_pipeline_statistics_core.h"
 
 #include "asahi/lib/agx_nir_lower_vbo.h"
@@ -85,9 +86,11 @@ struct hk_g17p_prepared_bind_tail {
    uint64_t descriptor_generation;
    uint64_t vertex_buffer_generation;
    uint64_t root;
-   /* The fragment shader variant the tail launches and the uniform-DMA set
-    * base its program was built with (hk_g17p_dma_set_base()). */
+   /* The fragment shader variant the tail launches, its published stage
+    * program address, and the uniform-DMA set base its program was built
+    * with (hk_g17p_dma_set_base()). */
    const struct hk_shader *fragment_shader;
+   uint64_t fragment_program;
    uint64_t fragment_dma_set_base;
    struct hk_image_view *render_color0;
    struct hk_image_view *render_depth;
@@ -1418,6 +1421,19 @@ struct hk_cs {
       uint8_t viewport_count;
    } g17p_draw_state;
 
+   /* G17P / HAL200: the last complete bind tail published into this VDM
+    * stream.  Every record in that tail latches independently in PPP state,
+    * so a subsequent draw whose only changed tail input is the fragment
+    * program can elide the tail (when the fragment program is unchanged) or
+    * emit a single 8-byte PPP_STATE_UPDATE for the 28-byte fragment record. */
+   struct {
+      uint64_t fs_program;
+      uint32_t state_compact;
+      uint32_t scissor_size, depth_bias_size;
+      uint8_t viewport_count;
+      bool valid;
+   } g17p_bind_tail;
+
    /* We can only set ppp_multisamplectl once per batch. has_sample_locations
     * tracks if we've committed to a set of sample locations yet. vk_meta
     * operations do not set has_sample_locations since they don't care and it
@@ -2512,6 +2528,43 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    gfx->shaders_dirty = ~0;
    gfx->linked_dirty = ~0;
    gfx->descriptors.root_dirty = true;
+   gfx->g17p_bind_tail_memo.valid = false;
+   if (cmd->current_cs.gfx)
+      cmd->current_cs.gfx->g17p_bind_tail.valid = false;
+}
+
+static inline size_t
+hk_gfx_root_descriptor_size(const struct hk_cmd_buffer *cmd)
+{
+   const size_t full = sizeof(struct hk_root_descriptor_table);
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if (gfx->shaders[MESA_SHADER_TESS_CTRL] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_GEOMETRY] ||
+       gfx->shaders[MESA_SHADER_TASK] ||
+       gfx->shaders[MESA_SHADER_MESH] ||
+       !gfx->shaders[MESA_SHADER_VERTEX])
+      return full;
+
+   const struct hk_shader *vs =
+      &gfx->shaders[MESA_SHADER_VERTEX]->variants[HK_VS_VARIANT_HW];
+   if (!vs->compiled)
+      return full;
+
+   struct hk_api_shader *fs_obj =
+      gfx->mesh_fs ? gfx->mesh_fs
+      : (gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT]);
+   uint32_t fs_size = 0;
+   if (fs_obj) {
+      const struct hk_shader *fs = hk_fs_variant(
+         fs_obj, cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
+      if (!fs || !fs->compiled)
+         return full;
+      fs_size = fs->root_descriptor_size;
+   }
+
+   return hk_gfx_root_size_from_stages(vs->root_descriptor_size, fs_obj != NULL,
+                                       fs_size, full);
 }
 
 struct hk_query_access_range {
