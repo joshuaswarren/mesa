@@ -12143,6 +12143,7 @@ hk_m5_fragment_variant_preflight(struct hk_device *dev,
            key->max_samples_per_tile);
    const uint32_t pass = linked->b.fragment_control.opaque[0] >> 29;
    struct hk_agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->dev.params.num_clusters_total,
       .program_va = dev->dev.shader_base + 0x20000,
       .shader_va = linked->b.bo->va->addr + linked->b.entry_offset,
       .uniform_ranges = ranges, .uniform_range_count = count,

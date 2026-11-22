@@ -10,6 +10,9 @@
 #include "asahi/lib/agx_ioto_preshader_core.h"
 #include "asahi/lib/agx_ppp_hal300_graphics_core.h"
 #include "asahi/lib/agx3_compute_program_core.h"
+#include "asahi/lib/agx3_code_container_core.h"
+#include "asahi/lib/agx_bytes.h"
+#include "asahi/lib/agx_ioto_load_core.h"
 #include "util/macros.h"
 
 #include <stdio.h>
@@ -23,6 +26,35 @@
          return 1;                                                             \
       }                                                                        \
    } while (0)
+
+/* The cluster count each M5 part's kernel reports (its contract in
+ * agx_params_m5_supported()), which the USC window's lead is built for. */
+static unsigned
+m5_clusters(enum agx_chip chip)
+{
+   switch (chip) {
+   case AGX_CHIP_G17S: return 2;
+   case AGX_CHIP_G17C: return 4;
+   case AGX_CHIP_G17D: return 8;
+   default: return 1;
+   }
+}
+
+/* Whether the profile loader at `loader` loads the offset of the lead's
+ * helper-table group for this cluster count, through the LDIMM's immediate.
+ * For one and two clusters that is the template's raw byte at +20 as well
+ * (4, 8 and 16 for 0x100, 0x200 and 0x400). */
+static bool
+loader_points_at_group(const uint8_t *loader, unsigned clusters, bool vertex)
+{
+   const uint32_t group = agx3_m5_container_group_offset(clusters, vertex);
+   const uint64_t field = agx_ioto_load_ldimm_long_immediate(UINT32_MAX);
+
+   return group &&
+          (agx_load_le64(loader + 16) & field) ==
+             agx_ioto_load_ldimm_long_immediate(group) &&
+          (clusters > 2 || loader[20] == group >> 6);
+}
 
 static int
 test_g17g_programs(enum agx_chip chip)
@@ -47,6 +79,7 @@ test_g17g_programs(enum agx_chip chip)
          .compiler_d = fragment ? 0 : 32,
          .fragment = fragment,
          .imageblock = { .sample_size_B = 8, .nr_samples = 1, .tile_size_px = 1024 },
+         .usc_clusters = m5_clusters(chip),
       };
       struct agx3_g17p_graphics_program output;
       size_t empty_bound;
@@ -57,8 +90,15 @@ test_g17g_programs(enum agx_chip chip)
                                                  &output));
       CHECK(output.length == (fragment ? 90 : 84));
       CHECK(memcmp(output.bytes, expected_tail[fragment], 28) == 0);
-      CHECK(output.bytes[48] == (fragment ? 4 : 8) *
-            ((chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C) ? 2 : 1));
+      CHECK(loader_points_at_group(output.bytes + 28, m5_clusters(chip),
+                                   !fragment));
+      {
+         /* Without the cluster count the program is refused. */
+         struct agx3_g17p_graphics_program_desc no_clusters = desc;
+         no_clusters.usc_clusters = 0;
+         CHECK(!agx3_g17g_graphics_program_generate(chip, &no_clusters,
+                                                    &output));
+      }
 
 
       {
@@ -227,8 +267,8 @@ test_g17g_programs(enum agx_chip chip)
          CHECK(output.length == 84);
          CHECK(!memcmp(output.bytes, expected_tail[0], 8));
          CHECK(!memcmp(output.bytes + 8, expected_tail[1] + 8, 20));
-         CHECK(output.bytes[28 + 20] ==
-               ((chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C) ? 8 : 4));
+         CHECK(loader_points_at_group(output.bytes + 28, m5_clusters(chip),
+                                      false));
          static const uint8_t end[] = {14, 0, 0, 0};
          CHECK(!memcmp(output.bytes + 80, end, sizeof(end)));
 
@@ -546,6 +586,7 @@ test_multiround_uniforms(enum agx_chip chip)
       { .start_halfs = 8, .size_halfs = 180, .address = 0x5000010000 },
    };
    struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = m5_clusters(chip),
       .program_va = 0x10000100000, .shader_va = 0x10000000480,
       .shader_binary_size = 128, .nr_gprs = 16,
       .compiler_d_valid = true, .uniform_ranges = ranges,
@@ -769,19 +810,25 @@ int main(void) {
    int r = test_unused_vertex_outputs() || test_flat_shading_vertex() || test_load_completion_wait(AGX_CHIP_G17G) ||
            test_load_completion_wait(AGX_CHIP_G17S) ||
            test_load_completion_wait(AGX_CHIP_G17C) ||
+           test_load_completion_wait(AGX_CHIP_G17D) ||
            test_multiround_uniforms(AGX_CHIP_G17G) ||
            test_multiround_uniforms(AGX_CHIP_G17S) ||
            test_multiround_uniforms(AGX_CHIP_G17C) ||
+           test_multiround_uniforms(AGX_CHIP_G17D) ||
            test_cprog_input_bound(AGX_CHIP_G17G) ||
            test_cprog_input_bound(AGX_CHIP_G17S) ||
            test_cprog_input_bound(AGX_CHIP_G17C) ||
+           test_cprog_input_bound(AGX_CHIP_G17D) ||
            test_color_disabled() || test_visibility() || test_line_width() || test_polygon_and_primitive_msaa() || test_g17g_programs(AGX_CHIP_G17G) || test_g17g_programs(AGX_CHIP_G17S) ||
            test_g17g_programs(AGX_CHIP_G17C) ||
+           test_g17g_programs(AGX_CHIP_G17D) ||
            test_m5_dispatch(AGX_CHIP_G17G) || test_m5_dispatch(AGX_CHIP_G17S) ||
            test_m5_dispatch(AGX_CHIP_G17C) ||
+           test_m5_dispatch(AGX_CHIP_G17D) ||
            test_m5_single_kick_launch(AGX_CHIP_G17G) ||
            test_m5_single_kick_launch(AGX_CHIP_G17S) ||
-           test_m5_single_kick_launch(AGX_CHIP_G17C);
+           test_m5_single_kick_launch(AGX_CHIP_G17C) ||
+           test_m5_single_kick_launch(AGX_CHIP_G17D);
    if (!r) puts("M5_PROGRAM_DISPATCH_PASS");
    return r;
 }

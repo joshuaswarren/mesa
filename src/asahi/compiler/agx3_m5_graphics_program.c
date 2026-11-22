@@ -177,7 +177,7 @@ g17g_graphics_program_generate(
    if (!agx3_ioto_uniform_program_body_generate(
           chip, &load_desc, workspace, &body_size, &copy_offset) ||
        !agx_ioto_m5_resource_program_compose_classes(
-          chip, desc->program_va, body, body_size, &tail,
+          chip, desc->usc_clusters, desc->program_va, body, body_size, &tail,
           stage, MAX2(desc->colour_classes, 1),
           staged.bytes, sizeof(staged.bytes), &written) ||
        written > bound || written > UINT16_MAX)

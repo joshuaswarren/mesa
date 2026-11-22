@@ -531,6 +531,7 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
    struct agx3_g17p_rt0_bg_program bg_program;
    if (count == 0) {
       const struct hk_agx3_g17p_graphics_program_desc desc = {
+         .usc_clusters = dev->dev.params.num_clusters_total,
          .program_va = reservation.va,
          .shader_va = shader->ptr + shader->info.main_offset,
          .shader_binary_size = shader->info.binary_size,
@@ -1477,6 +1478,7 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
          cmd->state.gfx.render.g17p_direct_color_resolve = true;
    } else if (op == AGX_BG_EOT_NONE) {
       const struct hk_agx3_g17p_graphics_program_desc desc = {
+         .usc_clusters = dev->dev.params.num_clusters_total,
          .program_va = program_va,
          .shader_va = shader->ptr + shader->info.main_offset,
          .shader_binary_size = shader->info.binary_size,
@@ -2228,6 +2230,7 @@ hk_build_g17g_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       return (struct hk_bg_eot){0};
    void *map = reservation.map;
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->dev.params.num_clusters_total,
       .program_va = reservation.va,
       .shader_va = shader->ptr + shader->info.main_offset,
       .shader_binary_size = shader->info.binary_size,
@@ -2459,6 +2462,7 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
    if (!hk_cmd_reserve_ioto_program(cmd, capacity, "M5 MRT tile program", &reservation))
       return (struct hk_bg_eot){0};
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->dev.params.num_clusters_total,
       .program_va = reservation.va,
       .shader_va = shader->ptr + shader->info.main_offset,
       .shader_binary_size = shader->info.binary_size,
@@ -2537,6 +2541,7 @@ hk_build_m5_empty_bg_eot(struct hk_cmd_buffer *cmd,
                                    "M5 empty tile program", &reservation))
       return (struct hk_bg_eot){0};
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->dev.params.num_clusters_total,
       .program_va = reservation.va,
       .shader_va = shader->ptr,
       .shader_binary_size = shader->info.binary_size,
@@ -2726,6 +2731,7 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
    if (!hk_cmd_reserve_ioto_program(cmd, capacity, "M5 tile program", &reservation))
       return (struct hk_bg_eot){0};
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->dev.params.num_clusters_total,
       .program_va = reservation.va,
       .shader_va = shader->ptr + shader->info.main_offset,
       .shader_binary_size = shader->info.binary_size,

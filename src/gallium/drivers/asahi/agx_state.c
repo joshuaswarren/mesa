@@ -7749,6 +7749,7 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
          ? linked->fragment_control.opaque[0] >> 29
          : AGX_PASS_TYPE_OPAQUE;
    struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = t.gpu,
       .shader_va = linked->bo->va->addr + linked->entry_offset,
       .uniform_ranges = ranges,
@@ -8053,6 +8054,7 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
          ? linked->fragment_control.opaque[0] >> 29
          : AGX_PASS_TYPE_OPAQUE;
    struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .shader_va = linked->bo->va->addr + linked->entry_offset,
       .uniform_ranges = ranges,
       .uniform_range_count = count,
@@ -8536,6 +8538,7 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
          ? linked->fragment_control.opaque[0] >> 29
          : AGX_PASS_TYPE_OPAQUE;
    struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .shader_va = linked->bo->va->addr + linked->entry_offset,
       .uniform_ranges = ranges,
       .uniform_range_count = count,
@@ -8982,6 +8985,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
       size_t program_length;
       if (g17g) {
          const struct agx3_g17p_graphics_program_desc g17g_desc = {
+            .usc_clusters = dev->params.num_clusters_total,
             .program_va = program.gpu,
             .shader_va = shader_va,
             .uniform_ranges = ranges,
@@ -9572,6 +9576,7 @@ agx_g18_append_compute(struct agx_batch *batch,
    size_t program_length;
    if (g17g) {
       const struct agx3_g17p_graphics_program_desc g17g_desc = {
+         .usc_clusters = dev->params.num_clusters_total,
          .program_va = program.gpu,
          .shader_va = shader_va,
          .uniform_ranges = ranges,
@@ -9927,6 +9932,7 @@ agx_launch_precomp_m5(struct agx_batch *batch, struct agx_grid grid,
    const uint32_t scratch_bytes = MAX3(cs->info.scratch_size,
       cs->info.agx3_spectpr_scratch_size, cs->info.agx3_tps_size);
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = program.gpu,
       .shader_va = shader_va,
       .uniform_ranges = ranges,
@@ -10113,6 +10119,7 @@ agx_launch_precomp_g17_m5(struct agx_batch *batch, struct agx_grid grid,
       AGX_IOTO_PROGRAM_ALIGNMENT, &program_bo);
    const uint64_t shader_va = cs->ptr + cs->entry_offset;
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = program.gpu,
       .shader_va = shader_va,
       .uniform_ranges = ranges,
@@ -10744,6 +10751,7 @@ agx_build_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key,
        !agx_va_in_usc_window(dev, shader->ptr + shader->info.main_offset))
       return agx_reject_g17g_tile(batch, "M5 tile program allocation");
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = ptr.gpu,
       .shader_va = shader->ptr + shader->info.main_offset,
       .shader_binary_size = shader->info.binary_size,
@@ -11055,6 +11063,7 @@ agx_m5_publish_tile_program(struct agx_batch *batch,
        !agx_va_in_usc_window(dev, shader->ptr + shader->info.main_offset))
       return agx_reject_g17g_tile(batch, "M5 tile program allocation");
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->params.num_clusters_total,
       .program_va = ptr.gpu,
       .shader_va = shader->ptr + shader->info.main_offset,
       .shader_binary_size = shader->info.binary_size,
@@ -11825,6 +11834,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
          resource_spec = AGX_IOTO_G17P_EOT_RESOURCE_SPEC;
       } else if (op == AGX_BG_EOT_NONE) {
          const struct agx3_g17p_graphics_program_desc desc = {
+            .usc_clusters = dev->params.num_clusters_total,
             .program_va = program_ptr.gpu,
             .shader_va = shader->ptr + shader->info.main_offset,
             .shader_binary_size = shader->info.binary_size,

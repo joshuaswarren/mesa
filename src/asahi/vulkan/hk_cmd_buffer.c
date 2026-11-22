@@ -3653,6 +3653,8 @@ hk_g17p_graphics_program_desc_init(
    const bool fragment = s->info.stage == MESA_SHADER_FRAGMENT;
    const uint32_t pass_type = linked->b.fragment_control.opaque[0] >> 29;
    *desc = (struct hk_agx3_g17p_graphics_program_desc){
+      .usc_clusters =
+         hk_cmd_buffer_device(cmd)->dev.params.num_clusters_total,
       /* The container's entry point, not the allocation base: the shader
        * loader reads the block-size dword at entry - 0x80. */
       .shader_va = linked->b.bo->va->addr + linked->b.entry_offset,
@@ -3761,6 +3763,7 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       goto refused;
    }
    struct agx3_g17p_graphics_program_desc d = {
+      .usc_clusters = dev->dev.params.num_clusters_total,
       .shader_va = linked->b.bo->va->addr + linked->b.entry_offset,
       .uniform_ranges = ranges, .uniform_range_count = count,
       .shader_binary_size = linked->b.size,
@@ -4636,6 +4639,7 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
          return;
       }
       const struct agx3_g17p_graphics_program_desc desc = {
+         .usc_clusters = dev->dev.params.num_clusters_total,
          .program_va = program_t.gpu,
          .shader_va = prog->ptr + prog->entry_offset,
          .uniform_ranges = ranges,

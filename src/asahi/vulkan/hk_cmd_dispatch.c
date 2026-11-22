@@ -1768,6 +1768,7 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       return;
    const uint64_t shader_va = prog->ptr + prog->entry_offset;
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->dev.params.num_clusters_total,
       .program_va = reservation.va, .shader_va = shader_va,
       .uniform_ranges = ranges, .uniform_range_count = range_count,
       .shader_binary_size = prog->info.main_size,
@@ -1953,6 +1954,7 @@ hk_dispatch_preamble_cs(struct hk_cmd_buffer *cmd,
       return false;
 
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->dev.params.num_clusters_total,
       .program_va = reservation.va,
       .shader_va = shader_va,
       .uniform_ranges = ranges,
@@ -2071,6 +2073,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
    const uint64_t shader_va = linked->b.bo->va->addr + linked->b.entry_offset;
    struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->dev.params.num_clusters_total,
       .program_va = reservation.va, .shader_va = shader_va,
       .uniform_ranges = ranges, .uniform_range_count = count,
       .shader_binary_size = linked->b.size,
@@ -2964,6 +2967,7 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          ? MAX2(256u, ALIGN_POT(s->b.info.local_size, 64u))
          : 0;
    const struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = dev->dev.params.num_clusters_total,
       .program_va = program_t.gpu, .shader_va = shader_va,
       .uniform_ranges = ranges, .uniform_range_count = range_count,
       .shader_binary_size = linked->b.size, .nr_gprs = linked->b.nr_gprs,

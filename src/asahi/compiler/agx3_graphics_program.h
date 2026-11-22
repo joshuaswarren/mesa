@@ -88,6 +88,13 @@ struct agx3_g17p_graphics_program_desc {
    const struct agx3_cprog_inputs *cprog_inputs;
 
    const struct agx_ioto_preshader_desc *preshader;
+
+   /* M5: the cluster count the USC window's code-container lead was built
+    * for, the kernel's num_clusters_total (agx3_build_m5_container_lead()).
+    * The program's profile loader points at that lead's helper-table group
+    * (agx3_m5_container_group_offset()); an M5 program is refused without
+    * it. Other paths ignore it. */
+   unsigned usc_clusters;
 };
 
 struct agx3_g17p_graphics_program {
