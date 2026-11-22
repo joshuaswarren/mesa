@@ -696,7 +696,8 @@ if with_tests
       '-Wl,--wrap=agx_bo_export', '-Wl,--wrap=agx_bo_import',
       '-Wl,--wrap=hk_get_cgroup_memory_available', '-Wl,--wrap=__vk_errorf',
       '-Wl,--wrap=os_get_available_system_memory',
-      '-Wl,--wrap=os_get_total_physical_memory']),
+      '-Wl,--wrap=os_get_total_physical_memory',
+      '-Wl,--wrap=agx_bo_cache_has']),
     suite : ['asahi'])
   test('hk_push_descriptor_size', executable('hk_push_descriptor_size_test',
     files('tests/test-hk-push-descriptor-size.c'),
