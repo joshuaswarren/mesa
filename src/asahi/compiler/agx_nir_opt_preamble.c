@@ -426,6 +426,49 @@ instr_cost_g17p(nir_instr *instr, const void *data)
    return instr_cost(instr, data) * weight;
 }
 
+/* On AGX3C, native uniform-operand float instructions never fold fabs(u), and
+ * only fold fneg(u) on fadd and the addend (src 2) of ffma. Give fabs(u) and
+ * non-foldable fneg(u) non-zero cost so loop-invariant modified uniforms are
+ * precomputed once in the constant program instead of copied and negated per
+ * thread or per loop iteration. */
+static bool
+agx3c_fneg_all_uses_fold_uniform(const nir_def *def)
+{
+   bool any = false;
+   nir_foreach_use_including_if(use, def) {
+      any = true;
+      if (nir_src_is_if(use))
+         return false;
+      nir_instr *parent = nir_src_use_instr(use);
+      if (parent->type != nir_instr_type_alu)
+         return false;
+      nir_alu_instr *alu = nir_instr_as_alu(parent);
+      if (alu->op == nir_op_fadd)
+         continue;
+      if (alu->op == nir_op_ffma && use == &alu->src[2].src)
+         continue;
+      return false;
+   }
+   return any;
+}
+
+static float
+instr_cost_agx3c(nir_instr *instr, const void *data)
+{
+   float weight = execution_weight(instr->block, data);
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (alu->def.bit_size <= 32) {
+         if (alu->op == nir_op_fabs)
+            return weight;
+         if (alu->op == nir_op_fneg &&
+             !agx3c_fneg_all_uses_fold_uniform(&alu->def))
+            return weight;
+      }
+   }
+   return instr_cost(instr, data) * weight;
+}
+
 /* G17P's vertex output store reads its 16-bit index from the uniform file
  * (agx_instr_accepts_uniform), so an index computed in the preamble -- an
  * unlinked vertex shader's per-draw slot plus the component -- costs the
@@ -999,7 +1042,7 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
       /* The G17P uniform fabs cost is not an M5 witness; keep the
        * generic instruction cost there. */
       options.def_size = agx3c ? def_size_agx3c : def_size_agx3b;
-      options.instr_cost_cb = agx3c ? instr_cost : instr_cost_g17p;
+      options.instr_cost_cb = agx3c ? instr_cost_agx3c : instr_cost_g17p;
       options.rewrite_cost_cb = agx3c ? rewrite_cost_agx3c : rewrite_cost_g17p;
    }
    /* Every AGX3B chip: the uniform file it fills is the encoding's. */

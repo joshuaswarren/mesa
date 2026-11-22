@@ -1991,3 +1991,216 @@ TEST(AGX3UniformALU, M5NativeUniformBranchWitnesses)
    EXPECT_FALSE(agx3_cf_icmp_reg_uniform32(AGX_ISA_ENCODING_AGX3C,
       AGX3_CF_ICOND_EQ, 0, 4, 256, {false,false}, out, &length));
 }
+
+TEST(AGX3UniformALU, M5IntegerSelectPromotesConstantAndCanonicalizesUniformCmp)
+{
+   /* 1. Promote non-8-bit constant (#0xffffffff) into AGX3C 32-bit ICMPSEL. */
+   for (unsigned g18 = 0; g18 < 2; ++g18) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.emit_agx3d = g18 != 0;
+      key.promote_constants = true;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->out = rzalloc(mem, struct agx_shader_info);
+      b->shader->out->push_count = 16;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      agx_index lhs = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index rhs = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index alt = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index neg1 = agx_mov_imm(b, 32, 0xffffffffu);
+      agx_instr *sel = agx_icmpsel_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                      lhs, rhs, neg1, alt, AGX_ICOND_SLT);
+      agx_opt_promote_constants(b->shader);
+      if (!g18) {
+         ASSERT_EQ(sel->src[2].type, AGX_INDEX_UNIFORM);
+         uint32_t value = 0;
+         memcpy(&value,
+                &b->shader->rodata[sel->src[2].value -
+                                   b->shader->out->rodata.base_uniform],
+                sizeof(value));
+         EXPECT_EQ(value, 0xffffffffu);
+      } else {
+         EXPECT_EQ(sel->src[2].type, AGX_INDEX_NORMAL);
+      }
+      ralloc_free(mem);
+   }
+
+   /* 2. Canonicalize `u op r` to `r op' u` across all six agx_icond values,
+    *    then pack through agx3_pack_binary and verify byte-for-byte against
+    *    agx3_isel_encode on AGX3C. */
+   const struct {
+      enum agx_icond in;
+      enum agx_icond canonical;
+      enum agx3_isel_icond hw;
+   } iconds[] = {
+      {AGX_ICOND_UEQ, AGX_ICOND_UEQ, AGX3_ISEL_ICOND_EQ},
+      {AGX_ICOND_SEQ, AGX_ICOND_SEQ, AGX3_ISEL_ICOND_EQ},
+      {AGX_ICOND_ULT, AGX_ICOND_UGT, AGX3_ISEL_ICOND_UGT},
+      {AGX_ICOND_UGT, AGX_ICOND_ULT, AGX3_ISEL_ICOND_ULT},
+      {AGX_ICOND_SLT, AGX_ICOND_SGT, AGX3_ISEL_ICOND_SGT},
+      {AGX_ICOND_SGT, AGX_ICOND_SLT, AGX3_ISEL_ICOND_SLT},
+   };
+   for (const auto &c : iconds) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G17S;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->max_reg = 32;
+      agx_index u = agx_uniform(16, AGX_SIZE_32);
+      agx_index r = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index t = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index f = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *sel = agx_icmpsel_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                      u, r, t, f, c.in);
+      agx_lower_uniform_sources(b->shader);
+      unsigned copies = 0;
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_MOV)
+            copies++;
+      }
+      EXPECT_EQ(copies, 0u);
+      EXPECT_EQ(sel->src[0].type, AGX_INDEX_NORMAL);
+      EXPECT_EQ(sel->src[1].type, AGX_INDEX_UNIFORM);
+      EXPECT_EQ(sel->src[1].value, 16u);
+      EXPECT_EQ(sel->icond, c.canonical);
+
+      sel->dest[0] = agx_register(0, AGX_SIZE_32);
+      sel->src[0] = agx_register(2, AGX_SIZE_32);
+      sel->src[2] = agx_register(4, AGX_SIZE_32);
+      sel->src[3] = agx_register(6, AGX_SIZE_32);
+      agx_stop(b);
+
+      util_dynarray binary;
+      util_dynarray_init(&binary, mem);
+      ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+
+      struct agx3_isel_desc d = {};
+      d.dest = 0;
+      d.cmp0 = 2;
+      d.cmp1 = 16;
+      d.cmp1_uniform = true;
+      d.cond = c.hw;
+      d.explicit_hints = true;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_REGISTER;
+      d.sel_true = 4;
+      d.sel_false = 6;
+      uint8_t expected[AGX3_ISEL_MAX_LENGTH], expected_len = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, expected,
+                                   &expected_len));
+      ASSERT_GE(binary.size, expected_len);
+      EXPECT_EQ(memcmp(binary.data, expected, expected_len), 0);
+
+      util_dynarray_fini(&binary);
+      ralloc_free(mem);
+   }
+}
+
+TEST(AGX3UniformALU, M5HalfFcmpselPreservesSmallIntegerImmediate)
+{
+   /* 1. Verify AGX3C keeps inline 8-bit select immediates (including high
+    *    bytes 0x80 and 0xff, both select slots, and reversed imm-first
+    *    comparand) and packs byte-for-byte against agx3_alu_fcmp_select16_gpu1,
+    *    while G18G materializes them. */
+   const struct {
+      bool reverse_cmp;
+      bool imm_true;
+      uint16_t sel_byte;
+   } cases[] = {
+      {false, false, 0x00u},
+      {false, true,  0x7fu},
+      {false, true,  0x80u},
+      {false, false, 0xffu},
+      {true,  true,  0x80u},
+      {true,  false, 0xffu},
+   };
+   for (const auto &tc : cases) {
+      for (unsigned g18 = 0; g18 < 2; ++g18) {
+         void *mem = ralloc_context(NULL);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.dev.chip = g18 ? AGX_CHIP_G18G : AGX_CHIP_G17S;
+         key.dev.emit_agx3d = g18 != 0;
+         agx_builder *b = agx_test_builder(mem);
+         b->shader->key = &key;
+         b->shader->stage = MESA_SHADER_COMPUTE;
+         b->shader->max_reg = 32;
+         agx_index c0 = tc.reverse_cmp ? agx_immediate(0)
+                                       : agx_temp(b->shader, AGX_SIZE_32);
+         agx_index c1 = agx_temp(b->shader, AGX_SIZE_32);
+         agx_index reg_sel = agx_temp(b->shader, AGX_SIZE_16);
+         agx_index imm_sel = agx_immediate(tc.sel_byte);
+         agx_instr *sel = agx_fcmpsel_to(
+            b, agx_temp(b->shader, AGX_SIZE_16), c0, c1,
+            tc.imm_true ? imm_sel : reg_sel,
+            tc.imm_true ? reg_sel : imm_sel, AGX_FCOND_LT);
+         agx_materialize_agx3_alu_constants(b->shader);
+         const unsigned imm_slot = tc.imm_true ? 2u : 3u;
+         if (!g18) {
+            ASSERT_EQ(sel->src[imm_slot].type, AGX_INDEX_IMMEDIATE);
+            EXPECT_EQ(sel->src[imm_slot].value, tc.sel_byte);
+
+            sel->dest[0] = agx_register(0, AGX_SIZE_16);
+            if (tc.reverse_cmp) {
+               sel->src[1] = agx_register(2, AGX_SIZE_32);
+            } else {
+               sel->src[0] = agx_register(2, AGX_SIZE_32);
+               sel->src[1] = agx_register(4, AGX_SIZE_32);
+            }
+            sel->src[tc.imm_true ? 3u : 2u] = agx_register(6, AGX_SIZE_16);
+            agx_stop(b);
+
+            util_dynarray binary;
+            util_dynarray_init(&binary, mem);
+            ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+
+            struct agx3_fsel32_gpu1_desc d = {};
+            d.dest = 0;
+            d.cmp0 = 2;
+            d.cmp1 = tc.reverse_cmp ? 0 : 4;
+            d.cmp1_immediate = tc.reverse_cmp;
+            d.sel_immediate[0] = tc.imm_true;
+            d.sel_immediate[1] = !tc.imm_true;
+            d.sel_integer = true;
+            d.sel[0] = tc.imm_true ? tc.sel_byte : 6;
+            d.sel[1] = tc.imm_true ? 6 : tc.sel_byte;
+            d.condition = tc.reverse_cmp ? AGX_FCOND_GT : AGX_FCOND_LT;
+            uint8_t expected[AGX3_ALU_MAX_LENGTH], expected_len = 0;
+            ASSERT_TRUE(agx3_alu_fcmp_select16_gpu1(&d, expected,
+                                                    &expected_len));
+            ASSERT_GE(binary.size, expected_len);
+            EXPECT_EQ(memcmp(binary.data, expected, expected_len), 0);
+            util_dynarray_fini(&binary);
+         } else {
+            EXPECT_EQ(sel->src[imm_slot].type, AGX_INDEX_NORMAL);
+         }
+         ralloc_free(mem);
+      }
+   }
+
+   /* 2. Register-guard parity with packer: a uniform comparand must not be
+    *    treated as encodable by agx3c_fsel16_imm_encodable(). */
+   {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G17S;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      agx_index u = agx_uniform(16, AGX_SIZE_32);
+      agx_index c1 = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index reg_sel = agx_temp(b->shader, AGX_SIZE_16);
+      agx_instr *sel = agx_fcmpsel_to(b, agx_temp(b->shader, AGX_SIZE_16),
+                                      u, c1, agx_immediate(0x80), reg_sel,
+                                      AGX_FCOND_LT);
+      agx_materialize_agx3_alu_constants(b->shader);
+      EXPECT_EQ(sel->src[2].type, AGX_INDEX_NORMAL);
+      ralloc_free(mem);
+   }
+}

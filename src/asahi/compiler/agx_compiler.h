@@ -1242,6 +1242,12 @@ bool agx3_m5_float_accepts_uniform(const agx_context *ctx, const agx_instr *I,
                                    unsigned s, unsigned uniform,
                                    enum agx_size size);
 
+/* Whether replacing source s of an M5 main-program 32-bit ICMPSEL with
+ * `uniform` gives a native uniform-operand form (agx3_isel_encode). */
+bool agx3_m5_isel_accepts_uniform(const agx_context *ctx, const agx_instr *I,
+                                  unsigned s, unsigned uniform,
+                                  enum agx_size size);
+
 bool agx_instr_accepts_uniform(enum agx_isa_encoding encoding,
                                enum agx_opcode op, unsigned src_index,
                                unsigned value, enum agx_size size);

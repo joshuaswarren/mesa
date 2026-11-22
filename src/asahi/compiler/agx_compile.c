@@ -28,6 +28,7 @@
 #include "agx_nir_texture.h"
 #include "agx_debug.h"
 #include "agx_nir.h"
+#include "agx3_alu_core.h"
 #include "agx3_matrix_core.h"
 #include "agx_opcodes.h"
 #include "agx3_pack.h"
@@ -6421,6 +6422,101 @@ agx_agx3_bitop_immediate_ok(const agx_context *ctx, const agx_instr *I)
           !reg.neg && agx_channels(reg) == 1 && reg.size == I->dest[0].size;
 }
 
+/* Whether AGX3C's native 16-bit float select (agx3_alu_fcmp_select16_gpu1)
+ * encodes this 16-bit FCMPSEL directly with its 8-bit integer select
+ * immediate(s) intact, avoiding mov_imm materialization.
+ *
+ * Matches the register/immediate operand guards in agx3_pack_binary.c so this
+ * predicate cannot drift from the packer. Hardware readback on M5 Pro confirms
+ * sel_integer=true zero-extends 8-bit select immediates 0x00..0xff to 16 bits. */
+static bool
+agx3c_fsel16_imm_encodable(const agx_context *ctx, const agx_instr *I)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       ctx->key->dev.emit_agx3d || I->op != AGX_OPCODE_FCMPSEL ||
+       I->nr_dests != 1 || I->nr_srcs != 4 || I->saturate ||
+       I->fcmpsel_minifloat_select ||
+       (I->dest[0].type != AGX_INDEX_NORMAL &&
+        I->dest[0].type != AGX_INDEX_REGISTER) ||
+       I->dest[0].size != AGX_SIZE_16 || agx_channels(I->dest[0]) != 1)
+      return false;
+
+   for (unsigned s = 0; s < 4; ++s) {
+      if (I->src[s].abs || I->src[s].neg || I->src[s].memory ||
+          agx_channels(I->src[s]) != 1)
+         return false;
+   }
+
+   const bool c0_imm = I->src[0].type == AGX_INDEX_IMMEDIATE;
+   const bool c1_imm = I->src[1].type == AGX_INDEX_IMMEDIATE;
+   const bool c0_reg = (I->src[0].type == AGX_INDEX_NORMAL ||
+                        I->src[0].type == AGX_INDEX_REGISTER) &&
+                       (I->src[0].size == AGX_SIZE_32 ||
+                        I->src[0].size == AGX_SIZE_16);
+   const bool c1_reg = (I->src[1].type == AGX_INDEX_NORMAL ||
+                        I->src[1].type == AGX_INDEX_REGISTER) &&
+                       (I->src[1].size == AGX_SIZE_32 ||
+                        I->src[1].size == AGX_SIZE_16);
+   if (!((c0_reg && (c1_reg || (c1_imm && I->src[1].value <= UINT8_MAX))) ||
+         (c0_imm && I->src[0].value <= UINT8_MAX && c1_reg)))
+      return false;
+
+   for (unsigned s = 2; s < 4; ++s) {
+      if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
+         if (I->src[s].value > UINT8_MAX)
+            return false;
+         const agx_index cmp = I->src[s - 2];
+         if (cmp.type == AGX_INDEX_IMMEDIATE && cmp.value == I->src[s].value)
+            return false;
+      } else if ((I->src[s].type != AGX_INDEX_NORMAL &&
+                  I->src[s].type != AGX_INDEX_REGISTER) ||
+                 I->src[s].size != AGX_SIZE_16) {
+         return false;
+      }
+   }
+
+   const bool reverse = c0_imm;
+   const agx_index cmp0 = I->src[reverse ? 1 : 0];
+   const agx_index cmp1 = I->src[reverse ? 0 : 1];
+   unsigned cond = I->fcond;
+   bool swap = I->invert_cond;
+   if (cond == AGX_FCOND_LTN) {
+      cond = AGX_FCOND_GE;
+      swap = !swap;
+   } else if (cond == AGX_FCOND_GTN) {
+      cond = AGX_FCOND_LE;
+      swap = !swap;
+   }
+   if (reverse) {
+      switch (cond) {
+      case AGX_FCOND_LT: cond = AGX_FCOND_GT; break;
+      case AGX_FCOND_GT: cond = AGX_FCOND_LT; break;
+      case AGX_FCOND_LE: cond = AGX_FCOND_GE; break;
+      case AGX_FCOND_GE: cond = AGX_FCOND_LE; break;
+      default: break;
+      }
+   }
+
+   const agx_index sel0 = I->src[swap ? 3 : 2];
+   const agx_index sel1 = I->src[swap ? 2 : 3];
+   const struct agx3_fsel32_gpu1_desc d = {
+      .dest = 0,
+      .cmp0 = 0,
+      .cmp0_16 = cmp0.size == AGX_SIZE_16,
+      .cmp1 = cmp1.type == AGX_INDEX_IMMEDIATE ? cmp1.value : 0,
+      .cmp1_16 = cmp1.type != AGX_INDEX_IMMEDIATE && cmp1.size == AGX_SIZE_16,
+      .cmp1_immediate = cmp1.type == AGX_INDEX_IMMEDIATE,
+      .sel_immediate = {sel0.type == AGX_INDEX_IMMEDIATE,
+                        sel1.type == AGX_INDEX_IMMEDIATE},
+      .sel_integer = true,
+      .sel = {sel0.type == AGX_INDEX_IMMEDIATE ? sel0.value : 0,
+              sel1.type == AGX_INDEX_IMMEDIATE ? sel1.value : 0},
+      .condition = cond,
+   };
+   uint8_t bytes[AGX3_ALU_MAX_LENGTH], len;
+   return agx3_alu_fcmp_select16_gpu1(&d, bytes, &len);
+}
+
 void
 agx_materialize_agx3_alu_constants(agx_context *ctx)
 {
@@ -6967,7 +7063,8 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
             }
          }
          if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
-             I->op == AGX_OPCODE_FCMPSEL && I->dest[0].size == AGX_SIZE_16) {
+             I->op == AGX_OPCODE_FCMPSEL && I->dest[0].size == AGX_SIZE_16 &&
+             !agx3c_fsel16_imm_encodable(ctx, I)) {
             /* Select alternatives are bit patterns, not minifloats -- except
              * in a tied minimum/maximum, where the optimizer deposited the
              * compared minifloat into the select slot too. */
