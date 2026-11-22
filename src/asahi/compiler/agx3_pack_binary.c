@@ -5882,11 +5882,10 @@ agx3_translate_mem(enum agx_isa_encoding enc, const agx_instr *I, bool is_store,
        * immediate index is 0, and the reason the constant-data (rodata)
        * pointer came back wrong.
        */
-      const int64_t bytes =
-         ((int64_t)index.value << total_shift) + I->memory_byte_offset;
-      if (bytes >= -32768 && bytes <= 32767) {
+      int32_t bytes;
+      if (agx3_mem_immediate_byte_offset(I, index.value, &bytes)) {
          d->idx_scaled = false;
-         d->byte_off = (int32_t)bytes;
+         d->byte_off = bytes;
          d->shift = 0;
       } else if (index.value <= 0xffff && total_shift <= 4 &&
                  !I->memory_byte_offset) {
