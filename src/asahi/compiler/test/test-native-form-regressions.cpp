@@ -7566,3 +7566,154 @@ TEST(NativeForms, M5FenceMemToTexUsesNonRendezvousFences)
    free(part.binary);
    ralloc_free(b.shader);
 }
+
+TEST(NativeForms, Agx3bPreservesNativeI32ToF16AndMixedFadd)
+{
+   /* 1. agx_lower_agx3_half_converts preserves plain scalar i32/u32 -> f16
+    * converts on AGX3B, while leaving AGX3C, modified, uniform-source, and
+    * 16-bit-int converts lowered. */
+   struct ConvCase {
+      const char *name;
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      bool emit_agx3d;
+      enum agx_convert mode;
+      enum agx_size src_size;
+      bool is_uniform;
+      bool neg_src;
+      bool expect_native;
+   };
+   const ConvCase conv_cases[] = {
+      {"agx3b_u32_to_f16", AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false,
+       AGX_CONVERT_U32_TO_F, AGX_SIZE_32, false, false, true},
+      {"agx3b_s32_to_f16", AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false,
+       AGX_CONVERT_S32_TO_F, AGX_SIZE_32, false, false, true},
+      {"agx3c_u32_to_f16_lowers", AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, false,
+       AGX_CONVERT_U32_TO_F, AGX_SIZE_32, false, false, false},
+      {"agx3b_u32_neg_lowers", AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P,
+       false, AGX_CONVERT_U32_TO_F, AGX_SIZE_32, false, true, false},
+      {"agx3b_u32_uniform_lowers", AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false,
+       AGX_CONVERT_U32_TO_F, AGX_SIZE_32, true, false, false},
+      {"agx3b_u16_to_f16_lowers", AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false,
+       AGX_CONVERT_U16_TO_F, AGX_SIZE_16, false, false, false},
+   };
+
+   for (const ConvCase &c : conv_cases) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.chip = c.chip;
+      key.dev.emit_agx3d = c.emit_agx3d;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+
+      agx_index src = c.is_uniform ? agx_uniform(0, c.src_size)
+                                   : agx_register(2, c.src_size);
+      src.neg = c.neg_src;
+      agx_index dst = agx_temp(b->shader, AGX_SIZE_16);
+      agx_instr *conv = agx_convert_to(b, dst, agx_immediate(c.mode), src,
+                                       AGX_ROUND_RTE);
+      agx_unit_test(b, dst);
+
+      agx_lower_agx3_half_converts(b->shader);
+      EXPECT_EQ(conv->dest[0].size,
+                c.expect_native ? AGX_SIZE_16 : AGX_SIZE_32)
+         << c.name;
+      ralloc_free(mem);
+   }
+
+   /* 2. agx_materialize_agx3_alu_constants preserves plain scalar GPR
+    * F32 FADD(f32, f16) on AGX3B while still widening AGX3C, G18G, and uniform
+    * operands. */
+   struct FaddCase {
+      const char *name;
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      bool emit_agx3d;
+      bool half_first;
+      bool uniform_f32;
+      bool expect_native;
+   };
+   const FaddCase fadd_cases[] = {
+      {"agx3b_f32_f16", AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, false,
+       false, true},
+      {"agx3b_f16_f32", AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, true,
+       false, true},
+      {"agx3c_f32_f16_widens", AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, false,
+       false, false, false},
+      {"g18g_widens", AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true, false, false,
+       false},
+      {"agx3b_uniform_f32_widens", AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false,
+       false, true, false},
+   };
+
+   for (const FaddCase &c : fadd_cases) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.chip = c.chip;
+      key.dev.emit_agx3d = c.emit_agx3d;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+
+      agx_index f32 = c.uniform_f32 ? agx_uniform(0, AGX_SIZE_32)
+                                    : agx_register(4, AGX_SIZE_32);
+      agx_index f16 = agx_register(7, AGX_SIZE_16);
+      agx_index dst = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *add = agx_fadd_to(b, dst, c.half_first ? f16 : f32,
+                                   c.half_first ? f32 : f16);
+      agx_unit_test(b, dst);
+
+      agx_materialize_agx3_alu_constants(b->shader);
+      const unsigned half_idx = c.half_first ? 0 : 1;
+      EXPECT_EQ(add->src[half_idx].size,
+                c.expect_native ? AGX_SIZE_16 : AGX_SIZE_32)
+         << c.name;
+      ralloc_free(mem);
+   }
+
+   /* 3. agx_materialize_agx3_alu_constants widens F32 FADD(f16, #imm) and
+    * saturated F32 FADD.sat(f16, #-0.0) on AGX3B, while leaving the native
+    * unsaturated half-to-float conversion F32 FADD(f16, #-0.0) untouched. */
+   struct HalfImmCase {
+      const char *name;
+      agx_index imm;
+      bool saturate;
+      bool expect_widened;
+   };
+   const HalfImmCase half_imm_cases[] = {
+      {"agx3b_fadd_half_imm_widens", agx_immediate(0x70), false, true},
+      {"agx3b_fadd_sat_half_negzero_widens", agx_negzero(), true, true},
+      {"agx3b_fadd_half_negzero_stays_native", agx_negzero(), false, false},
+   };
+
+   for (const HalfImmCase &c : half_imm_cases) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+
+      agx_index f16 = agx_register(7, AGX_SIZE_16);
+      agx_index dst = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *add = agx_fadd_to(b, dst, f16, c.imm);
+      add->saturate = c.saturate;
+      agx_unit_test(b, dst);
+
+      agx_materialize_agx3_alu_constants(b->shader);
+      unsigned fadd_count = 0;
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_FADD)
+            fadd_count++;
+      }
+      EXPECT_EQ(add->src[0].size,
+                c.expect_widened ? AGX_SIZE_32 : AGX_SIZE_16)
+         << c.name;
+      EXPECT_EQ(fadd_count, c.expect_widened ? 2u : 1u) << c.name;
+      ralloc_free(mem);
+   }
+}

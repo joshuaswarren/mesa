@@ -1569,8 +1569,13 @@ agx3_alu_fadd_mixed_half(
       fields[8 + i] = (struct agx3_field_kv){52 + i,
                                             !!(wait_mask & (1u << i))};
 
-   return agx3_bind_compose(enc, AGX3_MN_f32add, 1, base, 6, fields, 14, out,
-                            len);
+   for (unsigned ep = 1; ep <= 2; ++ep) {
+      if (agx3_bind_compose(enc, AGX3_MN_f32add, ep, base, 6, fields, 14, out,
+                            len))
+         return true;
+   }
+
+   return false;
 }
 
 bool
