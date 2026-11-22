@@ -24,13 +24,14 @@ main(void)
    dev.params.features = DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
    assert(!hk_g17p_rt_enabled(&dev));
 
-   dev.params.chip_id = 0x6040;
-   dev.params.gpu_generation = 16;
-   dev.params.gpu_variant = 'S';
    dev.params.features = DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |
                          DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD;
-   assert(hk_g16s_as_enabled(&dev));
-   assert(!hk_g17p_rt_enabled(&dev));
+   static const uint32_t g17p_ids[] = {0x6040, 0x6041, 0x8140};
+   for (unsigned i = 0; i < ARRAY_SIZE(g17p_ids); ++i) {
+      dev.params.chip_id = g17p_ids[i];
+      assert(hk_g16s_as_enabled(&dev));
+      assert(!hk_g17p_rt_enabled(&dev));
+   }
    dev.params.features = DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
    assert(!hk_g16s_as_enabled(&dev));
    dev.chip = AGX_CHIP_G13G;

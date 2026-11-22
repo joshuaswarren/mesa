@@ -606,16 +606,6 @@ agx_stream_sampler_state(const struct agx_device *dev)
           dev->params.gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
 }
 
-/* T6040 uses the G17P architecture profile, while capability rollout may
- * still be product-specific. Device admission has already checked USC/HAL. */
-static inline bool
-agx_is_m4_pro(const struct agx_device *dev)
-{
-   return dev->chip == AGX_CHIP_G17P &&
-          dev->params.chip_id == AGX_CHIP_ID_M4_PRO &&
-          dev->params.gpu_generation == 16 && dev->params.gpu_variant == 'S';
-}
-
 struct agx_va *agx_va_alloc(struct agx_device *dev, uint64_t size_B,
                             uint64_t align_B, enum agx_va_flags flags,
                             uint64_t fixed_va);
