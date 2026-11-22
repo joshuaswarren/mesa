@@ -232,6 +232,7 @@ enum agx_chip_quirk {
    AGX_QUIRK_M5_PATHS = 1 << 12,
    AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS = 1 << 13,
    AGX_QUIRK_HW_TXF_BOUNDS = 1 << 14,
+   AGX_QUIRK_M5_LAYER_OPERAND = 1 << 15,
 };
 
 /* What the five native AGX3 chips share. */
@@ -344,7 +345,8 @@ enum agx_chip_quirk {
      AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS,            \
      __VA_ARGS__)                                                              \
    X(G17C, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS,            \
+     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS |           \
+        AGX_QUIRK_M5_LAYER_OPERAND,                                            \
      __VA_ARGS__)                                                              \
    X(G18G, AGX3, AGX3D, HAL300, 10, GEN5, NONE, SKSM, HAL300,                  \
      AGX_RECORDS_G18G, AGX_QUIRK_M5_PATHS, __VA_ARGS__)
@@ -920,6 +922,22 @@ static inline bool
 agx_chip_m5_paths(enum agx_chip chip)
 {
    return agx_chip_info(chip)->quirks & AGX_QUIRK_M5_PATHS;
+}
+
+/*
+ * Whether an M5-form store to a layer of an array takes a layer operand. The
+ * M5 Max (G17C) does, and its array descriptors keep the array form. The
+ * other M5 parts store the layer as the z coordinate of a 3D store: the
+ * shader packer (agx3_pack_binary.c), Borealis's image views and Gallium's
+ * PBE read this one bit so they cannot disagree, and Borealis's store window
+ * past 2048 slices (hk_nir_lower_descriptors()) follows the image view's
+ * layers_as_3d choice. G18G (compiled as G17G) is outside agx_chip_g17_m5(),
+ * which Borealis also requires; its layered stores are its owner's to settle.
+ */
+static inline bool
+agx_chip_m5_layer_operand(enum agx_chip chip)
+{
+   return agx_chip_info(chip)->quirks & AGX_QUIRK_M5_LAYER_OPERAND;
 }
 
 /*

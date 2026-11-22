@@ -529,15 +529,16 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
          translate_image_view_type(view->vk.view_type, msaa, layers > 1,
                                    usage, usage != HK_DESC_USAGE_SAMPLED);
 
-      /* The M5 and M5 Pro (G17G, G17S) write a layered image as 3D, with the
-       * layer in the z coordinate (agx3_pack_binary.c); only the M5 Max
-       * (G17C) takes a layer operand. Describe those stores as 3D, as
-       * Gallium does: a slice of a 3D image is a layer of the 2D array.
+      /* The M5 parts but the M5 Max write a layered image as 3D, with the
+       * layer in the z coordinate (agx3_pack_binary.c); the M5 Max (G17C)
+       * takes a layer operand (agx_chip_m5_layer_operand()). Describe those
+       * stores as 3D, as Gallium does: a slice of a 3D image is a layer of
+       * the 2D array.
        * End-of-tile stores use block access and keep their own dimension.
        */
       const bool layers_as_3d =
          generation == 10 && agx_chip_g17_m5(dev->dev.chip) &&
-         dev->dev.chip != AGX_CHIP_G17C && !eot &&
+         !agx_chip_m5_layer_operand(dev->dev.chip) && !eot &&
          layout->tiling != AIL_TILING_LINEAR &&
          cfg.dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY;
 
