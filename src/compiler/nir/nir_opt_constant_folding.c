@@ -98,6 +98,41 @@ nir_try_constant_fold_alu(nir_builder *b, nir_alu_instr *alu)
    nir_const_value src[NIR_ALU_MAX_INPUTS][NIR_MAX_VEC_COMPONENTS];
    nir_def *bcsel = NULL;
 
+   const nir_op_info *info = &nir_op_infos[alu->op];
+
+   for (unsigned i = 0; i < info->num_inputs; i++) {
+      nir_instr *src_instr = nir_def_instr(alu->src[i].src.ssa);
+
+      if (src_instr->type == nir_instr_type_load_const) {
+         nir_load_const_instr *load_const = nir_instr_as_load_const(src_instr);
+         for (unsigned j = 0; j < nir_ssa_alu_instr_src_components(alu, i); j++)
+            src[i][j] = load_const->value[alu->src[i].swizzle[j]];
+         continue;
+      }
+
+      /* Check if the source is a bcsel with two constants. */
+      if (src_instr->type == nir_instr_type_alu) {
+         nir_alu_instr *bcsel_alu = nir_instr_as_alu(src_instr);
+         if (is_bcsel_with_two_constants(bcsel_alu) && should_fold_bcsel(alu)) {
+            /* If there is multiple bcsel sources, they must use the same condition. */
+            if (bcsel && bcsel_alu->src[0].src.ssa != bcsel)
+               return NULL;
+
+            bcsel = bcsel_alu->src[0].src.ssa;
+
+            /* Use first bcsel constant. */
+            nir_load_const_instr *load_const =
+               nir_src_as_load_const(bcsel_alu->src[1].src);
+            for (unsigned j = 0; j < nir_ssa_alu_instr_src_components(alu, i); j++)
+               src[i][j] =
+                  load_const->value[bcsel_alu->src[1].swizzle[alu->src[i].swizzle[j]]];
+            continue;
+         }
+      }
+
+      return NULL;
+   }
+
    /* In the case that any outputs/inputs have unsized types, then we need to
     * guess the bit-size. In this case, the validator ensures that all
     * bit-sizes match so we can just take the bit-size from first
@@ -108,37 +143,14 @@ nir_try_constant_fold_alu(nir_builder *b, nir_alu_instr *alu)
     * (although it still requires to receive a valid bit-size).
     */
    unsigned bit_size = 0;
-   if (!nir_alu_type_get_type_size(nir_op_infos[alu->op].output_type))
+   if (!nir_alu_type_get_type_size(info->output_type)) {
       bit_size = alu->def.bit_size;
-
-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
-      if (bit_size == 0 &&
-          !nir_alu_type_get_type_size(nir_op_infos[alu->op].input_types[i]))
-         bit_size = alu->src[i].src.ssa->bit_size;
-
-      nir_load_const_instr *load_const = nir_src_as_load_const(alu->src[i].src);
-
-      if (load_const) {
-         for (unsigned j = 0; j < nir_ssa_alu_instr_src_components(alu, i); j++)
-            src[i][j] = load_const->value[alu->src[i].swizzle[j]];
-         continue;
-      }
-
-      /* Check if the source is a bcsel with two constants. */
-      nir_alu_instr *bcsel_alu = nir_src_as_alu(alu->src[i].src);
-      if (should_fold_bcsel(alu) && is_bcsel_with_two_constants(bcsel_alu)) {
-         /* If there is multiple bcsel sources, they must use the same condition. */
-         if (bcsel && bcsel_alu->src[0].src.ssa != bcsel)
-            return NULL;
-
-         bcsel = bcsel_alu->src[0].src.ssa;
-
-         /* Use first bcsel constant. */
-         load_const = nir_src_as_load_const(bcsel_alu->src[1].src);
-         for (unsigned j = 0; j < nir_ssa_alu_instr_src_components(alu, i); j++)
-            src[i][j] = load_const->value[bcsel_alu->src[1].swizzle[alu->src[i].swizzle[j]]];
-      } else {
-         return NULL;
+   } else {
+      for (unsigned i = 0; i < info->num_inputs; i++) {
+         if (!nir_alu_type_get_type_size(info->input_types[i])) {
+            bit_size = alu->src[i].src.ssa->bit_size;
+            break;
+         }
       }
    }
 
