@@ -11148,6 +11148,12 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    NIR_PASS(addr_progress, nir, agx_nir_lower_address, byte_indices, m5,
             checked_offsets);
 
+   /* Flatten serial uniform-stride 32-bit addition chains into base + (j * s)
+    * when preamble formation is enabled so the hoistable stride multiples
+    * j * s move into the preamble and every address computes independently in
+    * one add, breaking serial address dependencies ahead of strided loads. */
+   if (preamble_size && agx_preamble_allowed(nir))
+      NIR_PASS(_, nir, agx_nir_opt_uniform_stride_chains, m5);
 
    /* Now that loads carry an index, a select between two of them can choose
     * the index instead of the loaded data. Run it to a fixed point with the

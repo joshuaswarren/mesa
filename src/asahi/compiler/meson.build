@@ -25,6 +25,7 @@ libasahi_agx_files = files(
   'agx_nir_opt_uniform_idiv.c',
   'agx_nir_opt_monotonic_bit_insert.c',
   'agx_nir_opt_sink_loop_sample_uses.c',
+  'agx_nir_opt_uniform_stride_chains.c',
   'agx_nir_lower_clip_m1_1.c',
   'agx_nir_lower_cull_distance.c',
   'agx_nir_lower_fminmax.c',
@@ -986,6 +987,18 @@ if with_tests
     executable(
       'agx_nir_uniform_unit_global_id_test',
       files('test/test-uniform-unit-global-id.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+  test(
+    'agx_nir_uniform_stride_chains',
+    executable(
+      'agx_nir_uniform_stride_chains_test',
+      files('test/test-uniform-stride-chains.c'),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies : [idep_nir, idep_mesautil],
