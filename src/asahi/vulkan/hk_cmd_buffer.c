@@ -1214,6 +1214,106 @@ hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info
    return hk_barrier_classify(info, &state);
 }
 
+/* Whether an image barrier discards the contents of a compressed storage
+ * image that this queue must initialize. A shader store can update only part
+ * of a compression tile, so it must not meet the metadata the memory held
+ * before. Of an ownership transfer, only the acquire initializes (*acquire). */
+static bool
+brl_barrier_needs_metadata_init(const struct hk_cmd_buffer *cmd,
+                                const VkImageMemoryBarrier2 *bar,
+                                bool *acquire)
+{
+   if (bar->oldLayout != VK_IMAGE_LAYOUT_UNDEFINED ||
+       bar->newLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+      return false;
+
+   VK_FROM_HANDLE(hk_image, image, bar->image);
+   if (!(image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
+       !image->planes[0].layout.compressed)
+      return false;
+
+   *acquire = false;
+   if (image->vk.sharing_mode != VK_SHARING_MODE_EXCLUSIVE ||
+       bar->srcQueueFamilyIndex == bar->dstQueueFamilyIndex)
+      return true;
+
+   *acquire = bar->dstQueueFamilyIndex == cmd->vk.pool->queue_family_index;
+   return *acquire;
+}
+
+bool
+brl_discard_init_prepare(struct hk_cmd_buffer *cmd,
+                         const VkDependencyInfo *info, uint8_t *dst_kinds)
+{
+   /* A valid dependency inside a render pass instance keeps every layout. */
+   if (cmd->sync.in_pass)
+      return false;
+
+   uint8_t src_kinds = 0;
+   bool any = false;
+   *dst_kinds = 0;
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
+      const VkImageMemoryBarrier2 *bar = &info->pImageMemoryBarriers[i];
+      bool acquire;
+      if (!brl_barrier_needs_metadata_init(cmd, bar, &acquire))
+         continue;
+
+      brl_sync_transition_kinds(info, bar, hk_sync_image_class(cmd), acquire,
+                                cmd->vk.runtime_rp_barrier, &src_kinds,
+                                dst_kinds);
+      any = true;
+   }
+
+   if (!any)
+      return false;
+
+   /* A deferred clear was recorded before the dependency: it belongs to
+    * the first scope like any other earlier work. */
+   hk_flush_deferred_clears(cmd);
+   brl_sync_transition_prepare(cmd, src_kinds);
+   return true;
+}
+
+void
+brl_discard_init_record(struct hk_cmd_buffer *cmd,
+                        const VkDependencyInfo *info, uint8_t dst_kinds)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   /* The clears get streams of their own, which wait on the transition's
+    * requirement alone. */
+   hk_cmd_buffer_end_compute(cmd);
+   brl_sync_transition_begin(cmd);
+
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
+      const VkImageMemoryBarrier2 *bar = &info->pImageMemoryBarriers[i];
+      bool acquire;
+      if (!brl_barrier_needs_metadata_init(cmd, bar, &acquire))
+         continue;
+
+      VK_FROM_HANDLE(hk_image, image, bar->image);
+      const uint32_t zero[4] = {0};
+      hk_clear_image(cmd, image, PIPE_FORMAT_NONE, zero, &bar->subresourceRange,
+                     true);
+   }
+
+   /* The clears are device writes that the second scope reads, as an
+    * application transfer-to-shader dependency would order them. */
+   const bool alias_scope = hk_cmd_alias_scope(cmd);
+   struct hk_cs *cs = cmd->current_cs.cs;
+   if (cs && dst_kinds &&
+       hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
+      hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+      hk_cdm_visibility_flush(dev, cs, alias_scope);
+   }
+   hk_cmd_buffer_end_compute(cmd);
+   brl_sync_transition_end(cmd, dst_kinds);
+
+   /* The transition is work now: an ended pass instance cannot continue
+    * across it (hk_m5_pass_merge_classify() assumes transitions do none). */
+   cmd->state.pass_merge.valid = false;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                        const VkDependencyInfo *pDependencyInfo)
@@ -1258,7 +1358,12 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       hk_cmd_buffer_end_graphics(cmd);
       /* Preserve the same conservative ordering in the shared submit graph,
        * including kernels that advertise exact prior barriers on AGX2. */
+      uint8_t init_dst;
+      const bool init =
+         brl_discard_init_prepare(cmd, pDependencyInfo, &init_dst);
       hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+      if (init)
+         brl_discard_init_record(cmd, pDependencyInfo, init_dst);
       return;
    }
 
@@ -1298,6 +1403,11 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       return;
    }
 
+   /* Metadata initialization of discarded compressed storage images: its
+    * first scope is taken before this dependency is recorded. */
+   uint8_t init_dst;
+   const bool init = brl_discard_init_prepare(cmd, pDependencyInfo, &init_dst);
+
    uint8_t src_kinds, dst_kinds;
    hk_sync_dependency_kinds(pDependencyInfo, hk_sync_image_class(cmd),
                             &src_kinds, &dst_kinds);
@@ -1335,6 +1445,9 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    }
 
    hk_sync_barrier(cmd, src_kinds, dst_kinds);
+
+   if (init)
+      brl_discard_init_record(cmd, pDependencyInfo, init_dst);
 
    /* A barrier-only command buffer otherwise records no GPU work, so it
     * cannot make a preceding fragment store visible to the host. Emit the

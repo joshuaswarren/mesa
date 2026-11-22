@@ -38,6 +38,15 @@ full_kinds(uint8_t kinds)
    return hk_sync_full_kinds(kinds);
 }
 
+/* The destination classes whose carried requirements a submission adds to a
+ * stream's requirement (hk_sync_stream::brl_carry). */
+static inline uint8_t
+stream_carry(const struct hk_cs *cs)
+{
+   return cs->sync.brl_transition ? cs->sync.brl_carry
+                                  : full_kinds(cs->sync.kind);
+}
+
 /* The requirement on the next stream of the given kinds: the union over the
  * kinds, since a stream that does several kinds of work waits for all of
  * them. */
@@ -343,6 +352,19 @@ hk_sync_kinds_dst(VkPipelineStageFlags2 stages)
 }
 
 void
+brl_sync_image_barrier_kinds(const VkImageMemoryBarrier2 *barrier,
+                             bool image_class, uint8_t *src, uint8_t *dst)
+{
+   *src |= hk_sync_kinds_src(barrier->srcStageMask);
+   /* Graphics work accesses an image in the fragment and attachment
+    * stages or through a shader that reads it (HK_SYNC_GFX_IMG). */
+   uint8_t d = hk_sync_kinds_dst(barrier->dstStageMask);
+   if (image_class && (d & HK_SYNC_GFX))
+      d = (d & ~HK_SYNC_GFX) | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG;
+   *dst |= d;
+}
+
+void
 hk_sync_dependency_kinds(const VkDependencyInfo *info, bool image_class,
                          uint8_t *src, uint8_t *dst)
 {
@@ -359,14 +381,34 @@ hk_sync_dependency_kinds(const VkDependencyInfo *info, bool image_class,
       *dst |= hk_sync_kinds_dst(info->pBufferMemoryBarriers[i].dstStageMask);
    }
 
-   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
-      *src |= hk_sync_kinds_src(info->pImageMemoryBarriers[i].srcStageMask);
-      /* Graphics work accesses an image in the fragment and attachment
-       * stages or through a shader that reads it (HK_SYNC_GFX_IMG). */
-      uint8_t d = hk_sync_kinds_dst(info->pImageMemoryBarriers[i].dstStageMask);
-      if (image_class && (d & HK_SYNC_GFX))
-         d = (d & ~HK_SYNC_GFX) | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG;
-      *dst |= d;
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i)
+      brl_sync_image_barrier_kinds(&info->pImageMemoryBarriers[i], image_class,
+                                   src, dst);
+}
+
+void
+brl_sync_transition_kinds(const VkDependencyInfo *info,
+                          const VkImageMemoryBarrier2 *barrier,
+                          bool image_class, bool acquire, bool render_pass,
+                          uint8_t *src, uint8_t *dst)
+{
+   VkImageMemoryBarrier2 b = *barrier;
+   if (acquire &&
+       !(info->dependencyFlags &
+         VK_DEPENDENCY_QUEUE_FAMILY_OWNERSHIP_TRANSFER_USE_ALL_STAGES_BIT_KHR))
+      b.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+   brl_sync_image_barrier_kinds(&b, image_class, src, dst);
+
+   /* Vulkan 1.4, 8.1 "Render Pass": an automatic layout transition happens
+    * after the availability operations of the dependencies into the subpass
+    * and before their visibility operations. The common runtime passes only
+    * those dependencies, so their union is at most slightly wider than the
+    * ones naming the attachment. */
+   if (render_pass) {
+      for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+         *src |= hk_sync_kinds_src(info->pMemoryBarriers[i].srcStageMask);
+         *dst |= hk_sync_kinds_dst(info->pMemoryBarriers[i].dstStageMask);
+      }
    }
 }
 
@@ -598,6 +640,79 @@ hk_sync_pass_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
    }
 }
 
+void
+brl_sync_event_poll(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   cmd->sync.brl_event_poll = hk_sync_later(cmd->sync.brl_event_poll, cs);
+}
+
+void
+brl_sync_event_done(struct hk_cmd_buffer *cmd)
+{
+   cmd->sync.brl_event_poll = NULL;
+}
+
+void
+brl_sync_transition_prepare(struct hk_cmd_buffer *cmd, uint8_t src_kinds)
+{
+   struct hk_sync_state *st = &cmd->sync;
+   assert(!st->brl_transition_active);
+   st->epoch++;
+
+   /* The first scope, with the requirements earlier dependencies carry into
+    * it (barrier chains): of this command buffer here, of earlier ones at
+    * submission (hk_sync_stream::brl_carry). A host operation in the first
+    * scope has no class: Vulkan has the host signal an event before it
+    * submits the wait (vkSetEvent VUID-vkSetEvent-event-09543) and finish
+    * other host writes before the submission, which orders them. */
+   struct hk_sync_dep *dep = st->brl_transition_dep;
+   barrier_source_dependencies(cmd, src_kinds, dep);
+   st->brl_transition_carry = full_kinds(src_kinds);
+
+   /* An event wait's transition follows the wait itself. */
+   dep[HK_SYNC_CDM].cut =
+      hk_sync_later(dep[HK_SYNC_CDM].cut, st->brl_event_poll);
+
+   /* Layout transitions execute in submission order on the queue: after the
+    * earlier transitions of this command buffer and, since the tracking
+    * knows only stage classes before it, after the transfer-class work of
+    * earlier command buffers, which includes their transitions. That is
+    * their work only: what earlier dependencies ask of later transfer work
+    * does not apply to the transition (hk_sync_stream::brl_carry). */
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      dep[sq].cut = hk_sync_later(dep[sq].cut, st->brl_transition_last[sq]);
+      dep[sq].prior |= HK_SYNC_XFER;
+   }
+}
+
+void
+brl_sync_transition_begin(struct hk_cmd_buffer *cmd)
+{
+   struct hk_sync_state *st = &cmd->sync;
+   assert(!st->brl_transition_active && !st->kind_override);
+   st->brl_transition_active = true;
+   st->brl_transition_seq = st->next_seq;
+   st->epoch++;
+}
+
+void
+brl_sync_transition_end(struct hk_cmd_buffer *cmd, uint8_t dst_kinds)
+{
+   struct hk_sync_state *st = &cmd->sync;
+   assert(st->brl_transition_active);
+   st->brl_transition_active = false;
+   st->epoch++;
+
+   /* The second scope waits on the transition's streams. An empty second
+    * scope orders nothing after it but later transitions (prepare above) and
+    * the end of the submission. */
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      struct hk_cs *last = st->brl_transition_last[sq];
+      if (dst_kinds && last && last->sync.seq > st->brl_transition_seq)
+         hk_sync_after_stream(cmd, last, dst_kinds);
+   }
+}
+
 static void
 stream_wait(struct hk_cs *cs, const struct hk_sync_dep dep[HK_SYNC_NUM_SQ],
             bool ta)
@@ -697,7 +812,7 @@ stream_kind(struct hk_cmd_buffer *cmd, struct hk_cs **slot, bool compute)
 {
    if (cmd->sync.kind_override)
       return cmd->sync.kind_override;
-   if (cmd->sync.xfer_depth)
+   if (cmd->sync.xfer_depth || cmd->sync.brl_transition_active)
       return HK_SYNC_XFER;
    if (!compute || slot == &cmd->current_cs.pre_gfx ||
        slot == &cmd->current_cs.post_gfx)
@@ -773,7 +888,11 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * Waiting on the current render here would create a cycle after a kept
     * local barrier. Preserve global requirements, though: internal producers
     * such as attachment decompression must still follow external writes. */
-   if (compute && slot == &cmd->current_cs.pre_gfx) {
+   if (st->brl_transition_active) {
+      /* A driver-performed layout transition waits on its own requirement
+       * only (brl_sync_transition_prepare()). */
+      memcpy(dep, st->brl_transition_dep, sizeof(dep));
+   } else if (compute && slot == &cmd->current_cs.pre_gfx) {
       /* The pre-graphics work of a pipeline without software
        * pre-rasterization stages (draw parameter patching, index rewriting,
        * statistics) reads buffers in the draw-indirect and vertex-input
@@ -799,7 +918,10 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
    if (!compute) {
       struct hk_sync_dep ta[HK_SYNC_NUM_SQ];
-      req_for_kinds_ta(cmd, cs->sync.kind, ta);
+      if (st->brl_transition_active)
+         memcpy(ta, dep, sizeof(ta));
+      else
+         req_for_kinds_ta(cmd, cs->sync.kind, ta);
       stream_wait_frag(cs, dep);
       hk_sync_stream_wait(cs, ta);
    } else {
@@ -885,6 +1007,13 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       hk_sync_stream_wait_all(cmd, cs);
 
    note_last(cmd, cs);
+   if (st->brl_transition_active) {
+      cs->sync.brl_transition = true;
+      cs->sync.brl_carry = st->brl_transition_carry;
+      const unsigned sq = hk_sync_sq(cs);
+      st->brl_transition_last[sq] =
+         hk_sync_later(st->brl_transition_last[sq], cs);
+   }
 
    if (slot == &cmd->current_cs.cs)
       st->cs_check_pending = false;
@@ -963,7 +1092,8 @@ void
 hk_sync_check_cs(struct hk_cmd_buffer *cmd)
 {
    struct hk_cs *cs = cmd->current_cs.cs;
-   if (!cs || cmd->sync.pin_cs)
+   /* A transition's stream carries its own requirement alone. */
+   if (!cs || cmd->sync.pin_cs || cmd->sync.brl_transition_active)
       return;
 
    const uint8_t kinds = stream_kind(cmd, &cmd->current_cs.cs, true);
@@ -1120,6 +1250,9 @@ hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    }
    replace_pointer(&st->last_any[sq], cs, prev);
    replace_pointer(&st->internal[sq].cut, cs, prev);
+   replace_pointer(&st->brl_transition_dep[sq].cut, cs, prev);
+   replace_pointer(&st->brl_transition_last[sq], cs, prev);
+   replace_pointer(&st->brl_event_poll, cs, prev);
    replace_pointer(&st->pass_vdm, cs, NULL);
    xfer_replace_stream(st, cs, prev);
    if (st->pass_tile_first == cs) {
@@ -1188,6 +1321,10 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
       ta[sq].cut = previous_on_sq(cmd, into);
    stream_wait_frag(into, dep);
    hk_sync_stream_wait(into, ta);
+   if (into->sync.brl_transition || from->sync.brl_transition) {
+      into->sync.brl_carry = stream_carry(into) | stream_carry(from);
+      into->sync.brl_transition = true;
+   }
    into->sync.kind |= from->sync.kind;
 
    for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
@@ -1197,6 +1334,9 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
    }
    replace_pointer(&st->last_any[sq], from, into);
    replace_pointer(&st->internal[sq].cut, from, into);
+   replace_pointer(&st->brl_transition_dep[sq].cut, from, into);
+   replace_pointer(&st->brl_transition_last[sq], from, into);
+   replace_pointer(&st->brl_event_poll, from, into);
    records_replace_stream(cmd, from, into);
    xfer_replace_stream(st, from, into);
 
@@ -1951,12 +2091,15 @@ hk_sync_resolve_submit(struct hk_queue *queue,
                t->cut = latest_before(cmd, sq, cs);
 
             /* The whole render waits on the carried requirements of all its
-             * destination classes, its vertex half on those of its kinds. */
-            resolve_one(&ss, sq, &cs->sync.dep[sq], full_kinds(cs->sync.kind),
+             * destination classes, its vertex half on those of its kinds. A
+             * layout transition waits on those of its first scope alone. */
+            resolve_one(&ss, sq, &cs->sync.dep[sq], stream_carry(cs),
                         &cs->sync.barrier[sq], &cs->sync.prior[sq]);
             resolve_one(&ss, sq, &cs->sync.dep_ta[sq],
-                        cs->sync.kind |
-                           (cs->sync.vtx_images ? HK_SYNC_GFX_IMG : 0),
+                        cs->sync.brl_transition
+                           ? cs->sync.brl_carry
+                           : cs->sync.kind |
+                                (cs->sync.vtx_images ? HK_SYNC_GFX_IMG : 0),
                         &cs->sync.barrier_ta[sq], &cs->sync.prior_ta[sq]);
          }
       }

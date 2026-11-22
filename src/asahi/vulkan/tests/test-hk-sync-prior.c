@@ -1152,6 +1152,26 @@ test_image_barrier_vertex_class(void)
    hk_sync_dependency_kinds(&memory_dep, true, &src, &dst);
    T("memory barrier still names graphics", dst == HK_SYNC_GFX);
 
+   /* One image barrier's scopes, as a driver-performed layout transition
+    * takes them (brl_sync_transition_kinds()). */
+   const VkImageMemoryBarrier2 compute = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+   };
+   src = dst = 0;
+   brl_sync_image_barrier_kinds(&image, true, &src, &dst);
+   T("one image barrier names its own classes",
+     src == HK_SYNC_GFX && dst == (HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG));
+   src = dst = 0;
+   brl_sync_image_barrier_kinds(&compute, true, &src, &dst);
+   T("a compute image barrier from the top names compute only",
+     src == 0 && dst == HK_SYNC_COMPUTE);
+   brl_sync_image_barrier_kinds(&image, true, &src, &dst);
+   T("image barrier scopes accumulate",
+     src == HK_SYNC_GFX &&
+        dst == (HK_SYNC_COMPUTE | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG));
+
    struct hk_cmd_buffer *cmd = new_cmd();
    struct hk_cs *producer = add(cmd, false);
    hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
@@ -1217,6 +1237,455 @@ test_image_barrier_vertex_class(void)
    T("spilling pre-graphics honours image class",
      pre_spill->sync.dep[HK_SYNC_VDM].cut == producer);
    hk_sync_end_rendering(cmd, false);
+}
+
+/* A layout transition the driver performs as work (the metadata clear of a
+ * discarded compressed storage image): brl_sync_transition_*(), recorded the
+ * way brl_discard_init_prepare()/_record() and hk_CmdWaitEvents2() record it.
+ */
+static struct hk_cs *
+transition(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
+           const VkImageMemoryBarrier2 *bar, bool acquire, bool render_pass)
+{
+   uint8_t src = 0, dst = 0;
+   brl_sync_transition_kinds(info, bar, true, acquire, render_pass, &src,
+                             &dst);
+   brl_sync_transition_prepare(cmd, src);
+
+   uint8_t all_src, all_dst;
+   hk_sync_dependency_kinds(info, true, &all_src, &all_dst);
+   hk_sync_barrier(cmd, all_src, all_dst);
+
+   brl_sync_transition_begin(cmd);
+   struct hk_cs *clear = add(cmd, true);
+   clear->stats.cmds = 1;
+   brl_sync_transition_end(cmd, dst);
+   return clear;
+}
+
+static void
+test_discard_transition(void)
+{
+   const VkImageMemoryBarrier2 to_input = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+      .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+   };
+   const VkMemoryBarrier2 external = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+   };
+   const VkDependencyInfo subpass = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &external,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &to_input,
+   };
+
+   /* An automatic render-pass transition (the common runtime's
+    * runtime_rp_barrier): the image barrier names no source stage, the
+    * VK_SUBPASS_EXTERNAL dependency comes as a memory barrier. */
+   uint8_t src = 0, dst = 0;
+   brl_sync_transition_kinds(&subpass, &to_input, true, false, false, &src,
+                             &dst);
+   T("automatic transition: the image barrier alone names no source",
+     src == 0 && dst == HK_SYNC_GFX_FRAG);
+   src = dst = 0;
+   brl_sync_transition_kinds(&subpass, &to_input, true, false, true, &src,
+                             &dst);
+   T("automatic transition takes the subpass dependency's first scope",
+     src == HK_SYNC_GFX && dst == HK_SYNC_GFX_FRAG);
+
+   struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G17S, true);
+   struct hk_cs *render = add(cmd, false);
+   struct hk_cs *clear = transition(cmd, &subpass, &to_input, false, true);
+   T("automatic transition: the clear waits on the earlier render",
+     clear->sync.dep[HK_SYNC_VDM].cut == render);
+   T("the clear is transfer-class work", clear->sync.kind & HK_SYNC_XFER);
+   struct hk_cs *next = add(cmd, false);
+   T("the subpass's render waits on the clear",
+     next->sync.dep[HK_SYNC_CDM].cut == clear);
+   T("automatic transition submits", submit(new_queue(true), cmd));
+
+   /* A discard barrier next to an unrelated one in the same dependency. */
+   const VkImageMemoryBarrier2 to_compute = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+   };
+   const VkMemoryBarrier2 frag_to_copy = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+   };
+   const VkDependencyInfo mixed = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &frag_to_copy,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &to_compute,
+   };
+   cmd = timestamp_cmd(AGX_CHIP_G17S, true);
+   render = add(cmd, false);
+   clear = transition(cmd, &mixed, &to_compute, false, false);
+   T("mixed dependency: the clear inherits no unrelated cut",
+     !clear->sync.dep[HK_SYNC_VDM].cut && !clear->sync.dep[HK_SYNC_CDM].cut &&
+        !(clear->sync.dep[HK_SYNC_VDM].prior & HK_SYNC_GFX) &&
+        !(clear->sync.dep[HK_SYNC_CDM].prior & HK_SYNC_GFX));
+   hk_sync_xfer_begin(cmd);
+   struct hk_cs *copy = add(cmd, true);
+   hk_sync_xfer_end(cmd);
+   T("mixed dependency: a later copy keeps the application's dependency",
+     copy->sync.dep[HK_SYNC_VDM].cut == render);
+   T("mixed dependency: a later copy does not wait on the clear",
+     copy->sync.dep[HK_SYNC_CDM].cut != clear);
+   struct hk_cs *dispatch = add(cmd, true);
+   T("mixed dependency: the second scope waits on the clear",
+     dispatch->sync.dep[HK_SYNC_CDM].cut == clear);
+   T("mixed dependency submits", submit(new_queue(true), cmd));
+
+   /* A fragment-to-compute discard leaves no fragment requirement on later
+    * transfer work. */
+   const VkImageMemoryBarrier2 frag_to_compute = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+   };
+   const VkDependencyInfo frag_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &frag_to_compute,
+   };
+   cmd = timestamp_cmd(AGX_CHIP_G17S, true);
+   render = add(cmd, false);
+   clear = transition(cmd, &frag_dep, &frag_to_compute, false, false);
+   T("fragment-to-compute discard: the clear waits on the render",
+     clear->sync.dep[HK_SYNC_VDM].cut == render);
+   hk_sync_xfer_begin(cmd);
+   copy = add(cmd, true);
+   hk_sync_xfer_end(cmd);
+   T("fragment-to-compute discard: no lasting fragment-to-transfer wait",
+     !copy->sync.dep[HK_SYNC_VDM].cut && !copy->sync.dep[HK_SYNC_CDM].cut);
+
+   /* An empty second scope. */
+   const VkImageMemoryBarrier2 to_nothing = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+   };
+   const VkDependencyInfo empty_dst = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &to_nothing,
+   };
+   const VkDependencyInfo compute_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &to_compute,
+   };
+   struct hk_cmd_buffer *a = timestamp_cmd(AGX_CHIP_G17S, true);
+   struct hk_cs *producer = add(a, true);
+   struct hk_cs *first = transition(a, &empty_dst, &to_nothing, false, false);
+   T("empty second scope: the clear waits on its first scope",
+     first->sync.dep[HK_SYNC_CDM].cut == producer);
+   render = add(a, false);
+   dispatch = add(a, true);
+   T("empty second scope: later work does not wait on the clear",
+     render->sync.dep[HK_SYNC_CDM].cut != first &&
+        dispatch->sync.dep[HK_SYNC_CDM].cut != first);
+   struct hk_cs *second =
+      transition(a, &compute_dep, &to_compute, false, false);
+   T("layout transitions stay in submission order",
+     second->sync.dep[HK_SYNC_CDM].cut == first);
+   T("a transition follows earlier command buffers' transitions",
+     (second->sync.dep[HK_SYNC_CDM].prior & HK_SYNC_XFER) &&
+        (second->sync.dep[HK_SYNC_VDM].prior & HK_SYNC_XFER));
+   struct hk_cmd_buffer *b = timestamp_cmd(AGX_CHIP_G17S, true);
+   struct hk_cs *later = transition(b, &compute_dep, &to_compute, false, false);
+   struct hk_cmd_buffer *pair[] = {a, b};
+   T("transitions across command buffers submit",
+     hk_sync_resolve_submit(new_queue(true), pair, 2, false, false, 0, NULL));
+   T("a later command buffer's transition waits on the earlier ones",
+     later->sync.barrier[HK_SYNC_CDM] != DRM_ASAHI_BARRIER_NONE ||
+        later->sync.prior[HK_SYNC_CDM] != 0);
+
+   /* Queue family acquire: the source stages are ignored by default. */
+   const VkImageMemoryBarrier2 acquire = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+      .srcQueueFamilyIndex = 1,
+      .dstQueueFamilyIndex = 0,
+   };
+   VkDependencyInfo acquire_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &acquire,
+   };
+   src = dst = 0;
+   brl_sync_transition_kinds(&acquire_dep, &acquire, true, true, false, &src,
+                             &dst);
+   T("an acquire ignores its source stages",
+     src == 0 && dst == HK_SYNC_COMPUTE);
+   acquire_dep.dependencyFlags =
+      VK_DEPENDENCY_QUEUE_FAMILY_OWNERSHIP_TRANSFER_USE_ALL_STAGES_BIT_KHR;
+   src = dst = 0;
+   brl_sync_transition_kinds(&acquire_dep, &acquire, true, true, false, &src,
+                             &dst);
+   T("an acquire with USE_ALL_STAGES keeps them",
+     src == HK_SYNC_COMPUTE && dst == HK_SYNC_COMPUTE);
+
+   /* Event waits. G17P polls the event: the transition follows the poll,
+    * also when its barriers come in a later dependency (the legacy
+    * vkCmdWaitEvents route) whose first scope names only the host, which
+    * set the event before submitting the wait. */
+   const VkImageMemoryBarrier2 from_host = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+   };
+   const VkDependencyInfo host_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &from_host,
+   };
+   cmd = timestamp_cmd(AGX_CHIP_G17P, true);
+   cmd->sync.kind_override = HK_SYNC_ALL;
+   struct hk_cs *poll = add(cmd, true);
+   cmd->sync.kind_override = 0;
+   poll->stats.cmds = 1;
+   hk_sync_after_stream(cmd, poll, 0);
+   brl_sync_event_poll(cmd, poll);
+   clear = transition(cmd, &host_dep, &from_host, false, false);
+   T("event wait: the clear follows the poll",
+     clear->sync.dep[HK_SYNC_CDM].cut == poll);
+   brl_sync_event_done(cmd);
+   T("the event wait ends", !cmd->sync.brl_event_poll);
+   dispatch = add(cmd, true);
+   T("event wait: the second scope follows the clear",
+     dispatch->sync.dep[HK_SYNC_CDM].cut == clear);
+
+   /* Without a poll, a wait on an event the host set before submitting the
+    * command buffer (VUID-vkSetEvent-event-09543) needs no GPU wait for the
+    * host: unrelated earlier fragment work does not hold up the clear or the
+    * compute work that consumes the image. */
+   cmd = timestamp_cmd(AGX_CHIP_G17S, true);
+   render = add(cmd, false);
+   render->stats.cmds = 1;
+   clear = transition(cmd, &host_dep, &from_host, false, false);
+   dispatch = add(cmd, true);
+   T("host event set before submission: the clear waits on no render",
+     !clear->sync.dep[HK_SYNC_VDM].cut && !clear->sync.dep[HK_SYNC_CDM].cut &&
+        !(clear->sync.dep[HK_SYNC_VDM].prior & ~HK_SYNC_XFER) &&
+        !(clear->sync.dep[HK_SYNC_CDM].prior & ~HK_SYNC_XFER));
+   T("host event set before submission: the consumer waits on the clear only",
+     dispatch->sync.dep[HK_SYNC_CDM].cut == clear &&
+        !dispatch->sync.dep[HK_SYNC_VDM].cut);
+   T("host event set before submission submits",
+     submit(new_queue(true), cmd) &&
+        clear->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+        dispatch->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
+
+   /* A device-set event, and a legacy wait on host and device events (the
+    * common lowering's pipeline barrier names both source stages), keep the
+    * device stages of the wait's first scope. */
+   const VkImageMemoryBarrier2 from_compute = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+   };
+   const VkDependencyInfo device_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &from_compute,
+   };
+   cmd = timestamp_cmd(AGX_CHIP_G17S, true);
+   render = add(cmd, false);
+   producer = add(cmd, true);
+   clear = transition(cmd, &device_dep, &from_compute, false, false);
+   T("device-set event: the clear follows the wait's first scope",
+     clear->sync.dep[HK_SYNC_CDM].cut == producer &&
+        !clear->sync.dep[HK_SYNC_VDM].cut);
+
+   const VkImageMemoryBarrier2 from_host_compute = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask =
+         VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+   };
+   const VkDependencyInfo legacy_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &from_host_compute,
+   };
+   cmd = timestamp_cmd(AGX_CHIP_G17S, true);
+   render = add(cmd, false);
+   producer = add(cmd, true);
+   clear = transition(cmd, &legacy_dep, &from_host_compute, false, false);
+   T("host and device events: the clear keeps the device stages",
+     clear->sync.dep[HK_SYNC_CDM].cut == producer &&
+        !clear->sync.dep[HK_SYNC_VDM].cut);
+}
+
+/* A transition in a later command buffer than an unrelated
+ * FRAGMENT_SHADER -> COPY dependency: it follows earlier transfer work, but
+ * what that dependency asks of later transfer work stays with that work. */
+static void
+test_discard_transition_carry(void)
+{
+   const VkImageMemoryBarrier2 to_compute = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+   };
+   const VkDependencyInfo discard = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &to_compute,
+   };
+   const VkImageMemoryBarrier2 compute_to_compute = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+   };
+   const VkDependencyInfo chained = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &compute_to_compute,
+   };
+   const VkMemoryBarrier2 frag_to_copy = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+   };
+   const VkMemoryBarrier2 frag_to_compute = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+   };
+   const VkMemoryBarrier2 *const tails[] = {&frag_to_copy, &frag_to_compute};
+
+   for (unsigned exact = 0; exact < 2; ++exact) {
+      for (unsigned split = 0; split < 2; ++split) {
+         /* Legacy priors carry requirements only within one submission. */
+         if (split && !exact)
+            continue;
+         for (unsigned t = 0; t < 2; ++t) {
+            /* A: earlier transfer work, an unrelated render, then a
+             * dependency from fragment work to copies (t = 0), or to compute
+             * work, which a discard from compute chains with (t = 1). */
+            struct hk_cmd_buffer *a = timestamp_cmd(AGX_CHIP_G17S, exact);
+            hk_sync_xfer_begin(a);
+            struct hk_cs *copy = add(a, true);
+            copy->stats.cmds = 1;
+            hk_sync_xfer_end(a);
+            struct hk_cs *render = add(a, false);
+            render->stats.cmds = 1;
+            const VkDependencyInfo tail = {
+               .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+               .memoryBarrierCount = 1,
+               .pMemoryBarriers = tails[t],
+            };
+            uint8_t src, dst;
+            hk_sync_dependency_kinds(&tail, true, &src, &dst);
+            hk_sync_barrier(a, src, dst);
+
+            /* B: the discard, its consumer, and a later copy. */
+            struct hk_cmd_buffer *b = timestamp_cmd(AGX_CHIP_G17S, exact);
+            struct hk_cs *clear =
+               t ? transition(b, &chained, &compute_to_compute, false, false)
+                 : transition(b, &discard, &to_compute, false, false);
+            struct hk_cs *dispatch = add(b, true);
+            dispatch->stats.cmds = 1;
+            hk_sync_xfer_begin(b);
+            struct hk_cs *later = add(b, true);
+            later->stats.cmds = 1;
+            hk_sync_xfer_end(b);
+
+            struct hk_queue *q = new_queue(exact);
+            bool ok;
+            if (split) {
+               ok = submit(q, a) && submit(q, b);
+            } else {
+               struct hk_cmd_buffer *pair[] = {a, b};
+               ok = hk_sync_resolve_submit(q, pair, 2, false, false, 0, NULL);
+            }
+            T("transition after a carried dependency submits", ok);
+
+            /* The render is VDM command 1 and the copy CDM command 1, of
+             * this ioctl or (split, exact) as an absolute position. */
+            const bool waits_render =
+               split ? clear->sync.prior[HK_SYNC_VDM] == 1
+                     : clear->sync.barrier[HK_SYNC_VDM] == 1;
+            const bool no_render =
+               clear->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+               clear->sync.prior[HK_SYNC_VDM] == 0;
+            if (t) {
+               T("chained discard waits on the earlier render", waits_render);
+            } else {
+               T("discard does not take the carried transfer requirement",
+                 no_render);
+               T("its consumer does not wait on the render",
+                 dispatch->sync.barrier[HK_SYNC_VDM] ==
+                       DRM_ASAHI_BARRIER_NONE &&
+                    dispatch->sync.prior[HK_SYNC_VDM] == 0);
+            }
+            T("discard follows earlier transfer work",
+              split ? clear->sync.prior[HK_SYNC_CDM] == 1
+                    : clear->sync.barrier[HK_SYNC_CDM] == copy->sync.index);
+            T("a later copy keeps the carried requirement",
+              t || (split ? later->sync.prior[HK_SYNC_VDM] == 1
+                          : later->sync.barrier[HK_SYNC_VDM] ==
+                               render->sync.index));
+         }
+      }
+   }
+
+   /* A transition merged into a compute stream: the merged stream takes the
+    * carried requirements of compute work and of the transition's first
+    * scope, still not those of transfer work. */
+   struct hk_cmd_buffer *a = timestamp_cmd(AGX_CHIP_G17S, true);
+   struct hk_cs *render = add(a, false);
+   render->stats.cmds = 1;
+   hk_sync_barrier(a, HK_SYNC_GFX, HK_SYNC_XFER);
+   struct hk_cmd_buffer *b = timestamp_cmd(AGX_CHIP_G17S, true);
+   struct hk_cs *dispatch = add(b, true);
+   dispatch->stats.cmds = 1;
+   struct hk_cs *clear = transition(b, &discard, &to_compute, false, false);
+   hk_sync_merge(b, dispatch, clear);
+   list_del(&clear->node);
+   T("merged transition keeps an explicit carry",
+     dispatch->sync.brl_transition &&
+        (dispatch->sync.brl_carry & HK_SYNC_COMPUTE) &&
+        !(dispatch->sync.brl_carry & HK_SYNC_XFER));
+   struct hk_cmd_buffer *pair[] = {a, b};
+   T("merged transition submits",
+     hk_sync_resolve_submit(new_queue(true), pair, 2, false, false, 0, NULL));
+   T("merged transition does not take the carried transfer requirement",
+     dispatch->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+        dispatch->sync.prior[HK_SYNC_VDM] == 0);
 }
 
 static void
@@ -1564,6 +2033,8 @@ main(void)
    test_loaded_color_preservation();
    test_pass_software_graphics_dependencies();
    test_image_barrier_vertex_class();
+   test_discard_transition();
+   test_discard_transition_carry();
    test_g17p_vertex_after_memory_writers();
    test_g17p_tiling_order();
    test_chain_first_skips_empty_buffers();

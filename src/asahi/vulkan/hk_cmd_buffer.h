@@ -1797,6 +1797,10 @@ struct hk_cmd_buffer {
        * observe this recording before its submission completes. */
       bool uses_events;
 
+      /* Recording hk_CmdWaitEvents(): the event waits stay recorded for the
+       * pipeline barrier that carries its barriers. */
+      bool brl_legacy_event_wait;
+
       /* Scoped around direct/indirect AS builds, including their meta blits. */
       bool as_build_recording;
 
@@ -2959,6 +2963,20 @@ void hk_usc_upload_spilled_rt_descs(struct agx_usc_builder *b,
                                     struct hk_cmd_buffer *cmd);
 
 void hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs);
+
+/* Initializes the metadata of the compressed storage images a dependency
+ * moves out of UNDEFINED, before a shader store can meet stale metadata: by
+ * clearing the discarded subresources as their layout transition
+ * (brl_sync_transition_begin()). This depends only on the image being
+ * compressed for storage, whatever the chip. brl_discard_init_prepare()
+ * returns whether the dependency has such an image and takes its first scope;
+ * call it before the dependency's hk_sync_barrier(), and
+ * brl_discard_init_record() with the returned second scope after it. */
+bool brl_discard_init_prepare(struct hk_cmd_buffer *cmd,
+                              const VkDependencyInfo *info,
+                              uint8_t *dst_kinds);
+void brl_discard_init_record(struct hk_cmd_buffer *cmd,
+                             const VkDependencyInfo *info, uint8_t dst_kinds);
 
 /* As hk_cdm_cache_flush(), for a flush an application dependency asks for.
  * With `memory`, the flush also has memory scope on G17P and M5: needed for
