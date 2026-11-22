@@ -23,6 +23,7 @@
 #include "util/u_debug.h"
 #include "util/u_dynarray.h"
 #include "agx_builder.h"
+#include "agx3_compute_program.h"
 #include "agx_compiler.h"
 #include "agx_nir_texture.h"
 #include "agx_debug.h"
@@ -13356,8 +13357,11 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    }
    if (ctx->ra_failed) {
       /* Spilling only targets total demand; pinned values can still leave the
-       * shuffle no room. Recompile with an ever smaller spill budget. */
-      if (key->has_scratch && !key->is_helper && ra_budget_cut < 64) {
+       * shuffle no room. Recompile with an ever smaller spill budget unless
+       * RA_MEM itself was exhausted, where cutting the GPR budget only forces
+       * even more spills into an already-full frame. */
+      if (!ctx->ra_mem_exhausted && key->has_scratch && !key->is_helper &&
+          ra_budget_cut < 64) {
          ralloc_free(ctx);
          binary->size = initial_binary_size;
          /* Constant promotion and others accumulate into out. */
@@ -13448,6 +13452,24 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
          out->preamble_scratch_size = stack_size;
       else
          out->scratch_size = stack_size;
+   }
+
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2) {
+      const unsigned frame_B =
+         ctx->is_preamble
+            ? out->preamble_scratch_size
+            : MAX2(out->scratch_size, out->agx3_spectpr_scratch_size);
+      const unsigned limit_B = ctx->key->max_scratch_B
+                                  ? ctx->key->max_scratch_B
+                                  : AGX3_G17P_MAX_SPILL_B;
+
+      if (frame_B > limit_B) {
+         agx_set_refusal(ctx, "AGX3 scratch frame exceeds target limit",
+                         __LINE__);
+         binary->size = initial_binary_size;
+         ralloc_free(ctx);
+         return false;
+      }
    }
 
    if ((ctx->stage == MESA_SHADER_VERTEX ||

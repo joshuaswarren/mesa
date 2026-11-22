@@ -15,6 +15,7 @@
 #include "hk_nir_root_size.h"
 #include "hk_nir_lower_tes_rq.h"
 #include "hk_native_write_class.h"
+#include "asahi/compiler/agx3_compute_program.h"
 #include "asahi/compiler/agx_nir_m5_mesh.h"
 #include "asahi/compiler/agx3_mesh_core.h"
 #include "hk_nir_sampler_bias.h"
@@ -5437,6 +5438,21 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    const bool relocatable_uvs = hw && nir->info.stage == MESA_SHADER_VERTEX &&
                                 shader->info.uvs.relocatable;
+   /* Match the driver's real CDM vs graphics TPS spill admission ceiling so
+    * RA only expands beyond 4 KiB on stages/chips whose dispatch path can
+    * admit the resulting frame (G15/G16/G17P CDM up to 256 KiB, M5 CDM up to
+    * 64 KiB; graphics VDM/PPP and internal helpers remain capped at 4 KiB). */
+   const bool cdm_stage =
+      nir->info.stage == MESA_SHADER_COMPUTE ||
+      nir->info.stage == MESA_SHADER_GEOMETRY ||
+      nir->info.stage == MESA_SHADER_TESS_CTRL;
+   const uint32_t max_scratch_B =
+      (!cdm_stage || nir->info.internal)
+         ? AGX3_G17P_MAX_SPILL_B
+         : (agx_chip_native_agx3(dev->dev.chip)
+               ? AGX3_G17P_MAX_COMPUTE_SPILL_B
+               : (agx_chip_g17_m5(dev->dev.chip) ? (1u << 16)
+                                                 : AGX3_G17P_MAX_SPILL_B));
    struct agx_shader_key backend_key = {
       .reserved_preamble = root + (4 * (1 + set_count)),
       .g17p_texture_uniform_base = texture_uniform_base,
@@ -5445,6 +5461,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       .dev = agx_gather_device_key(&dev->dev),
       .no_stop = nir->info.stage == MESA_SHADER_FRAGMENT,
       .has_scratch = !nir->info.internal,
+      .max_scratch_B = max_scratch_B,
       .promote_constants = true,
       .promote_textures = true,
       /* hk_buffer_addr_format() and hk_ubo_addr_format() bound robust

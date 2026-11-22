@@ -38,9 +38,14 @@ extern "C" {
  * uniform halves up to 252 (agx3_tex_plain_uniform64). */
 #define AGX3_FRAGMENT_UNIFORM_END (252)
 
-/* Semi-arbitrary limit for spill slot allocation */
-#define AGX_NUM_MODELED_REGS_LOG2 (11)
+/* Representable spill-slot bitfield capacity in agx_index::reg (8192 halves =
+ * 16 KiB). Actual RA spill allocation is bounded per-target and per-stage in
+ * agx_register_allocate.c; AGX2 stays at AGX2_MAX_SPILL_SLOTS (4 KiB) to
+ * preserve its per-core agx_scratch memory bound.
+ */
+#define AGX_NUM_MODELED_REGS_LOG2 (13)
 #define AGX_NUM_MODELED_REGS      (1 << AGX_NUM_MODELED_REGS_LOG2)
+#define AGX2_MAX_SPILL_SLOTS      (2048)
 
 /* Limit on number of sources for non-phi instructions */
 #define AGX_MAX_NORMAL_SOURCES (16)
@@ -107,7 +112,7 @@ typedef struct {
     */
    unsigned reg : AGX_NUM_MODELED_REGS_LOG2;
    bool has_reg     : 1;
-   unsigned padding : 6;
+   unsigned padding : 4;
 } agx_index;
 static_assert(sizeof(agx_index) == 8, "packed");
 
@@ -750,6 +755,10 @@ typedef struct {
    /* Register allocation found no legal placement for a constrained value
     * (agx_register_allocate.c); the compile is refused after agx_ra(). */
    bool ra_failed;
+   /* Set alongside ra_failed when RA_MEM (spill slots) itself ran out.
+    * Retrying with a smaller GPR budget cannot help and only increases spill
+    * pressure. */
+   bool ra_mem_exhausted;
    /* Halves taken off the spill budget after a failed allocation, so the
     * live-range shuffle gets free room (agx_compile_function_nir retries). */
    unsigned ra_budget_cut;
