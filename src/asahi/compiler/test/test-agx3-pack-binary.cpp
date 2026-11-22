@@ -17995,3 +17995,83 @@ TEST_F(AGX3PackBinary, VertexRegisterLodSampleAlignsWideStagingBankOnAGX3C)
              code.end())
       << "expected second vertex sample to stage coord X at 8-aligned bank 8";
 }
+
+TEST_F(AGX3PackBinary, PureAluLoopInterleavesPipesAndBoundsProducerWaves)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->nir = rzalloc(mem_ctx, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *body = agx_test_block(b->shader);
+   agx_block *exit = agx_test_block(b->shader);
+   entry->index = 0;
+   body->index = 1;
+   exit->index = 2;
+   agx_block_add_successor(entry, body);
+   agx_block_add_successor(body, body);
+   agx_block_add_successor(body, exit);
+   body->loop_header = true;
+
+   b->cursor = agx_after_block(entry);
+   agx_index ha = agx_preload(b, agx_register(0, AGX_SIZE_16));
+   agx_index hb = agx_preload(b, agx_register(1, AGX_SIZE_16));
+   agx_index fa = agx_preload(b, agx_register(2, AGX_SIZE_32));
+   agx_index fb = agx_preload(b, agx_register(4, AGX_SIZE_32));
+   agx_index hc[6], fc[6];
+   for (unsigned i = 0; i < 6; ++i)
+      hc[i] = agx_preload(b, agx_register(8 + i, AGX_SIZE_16));
+   for (unsigned i = 0; i < 6; ++i)
+      fc[i] = agx_preload(b, agx_register(16 + 2 * i, AGX_SIZE_32));
+
+   b->cursor = agx_after_block(body);
+   agx_index h1[6], h2[6], f1[6], f2[6];
+   for (unsigned i = 0; i < 6; ++i) {
+      h1[i] = agx_temp(b->shader, AGX_SIZE_16);
+      agx_hfma_to(b, h1[i], ha, hb, hc[i]);
+   }
+   for (unsigned i = 0; i < 6; ++i) {
+      f1[i] = agx_temp(b->shader, AGX_SIZE_32);
+      agx_ffma_to(b, f1[i], fa, fb, fc[i]);
+   }
+   for (unsigned i = 0; i < 6; ++i) {
+      h2[i] = agx_temp(b->shader, AGX_SIZE_16);
+      agx_hfma_to(b, h2[i], h1[i], ha, hb);
+   }
+   for (unsigned i = 0; i < 6; ++i) {
+      f2[i] = agx_temp(b->shader, AGX_SIZE_32);
+      agx_ffma_to(b, f2[i], f1[i], fa, fb);
+   }
+
+   b->cursor = agx_after_block(exit);
+   for (unsigned i = 0; i < 6; ++i) {
+      agx_unit_test(b, h2[i]);
+      agx_unit_test(b, f2[i]);
+   }
+   agx_stop(b);
+
+   agx_ilp_schedule(b->shader);
+
+   std::vector<enum agx_opcode> fmas;
+   unsigned first_stage2_pos = ~0u;
+   unsigned pos = 0;
+   agx_foreach_instr_in_block(body, I) {
+      if (I->op != AGX_OPCODE_HFMA && I->op != AGX_OPCODE_FFMA)
+         continue;
+      fmas.push_back(I->op);
+      for (unsigned i = 0; i < 6; ++i) {
+         if (I->dest[0].value == h2[i].value ||
+             I->dest[0].value == f2[i].value)
+            first_stage2_pos = std::min(first_stage2_pos, pos);
+      }
+      pos++;
+   }
+
+   ASSERT_EQ(fmas.size(), 24u);
+   /* Mixed FP16/FP32 pipes alternate rather than issuing a 6-wide HFMA burst. */
+   EXPECT_NE(fmas[0], fmas[1]);
+   EXPECT_NE(fmas[1], fmas[2]);
+   /* First stage-2 consumer begins before all 12 stage-1 producers issue. */
+   EXPECT_LT(first_stage2_pos, 10u);
+}
