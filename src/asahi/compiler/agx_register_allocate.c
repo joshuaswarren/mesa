@@ -16,6 +16,7 @@
 #include "util/u_qsort.h"
 #include "util/u_debug.h"
 
+#include "agx3_compute_program.h"
 #include "agx3_copy_core.h"
 #include "agx_builder.h"
 #include "agx_compile.h"
@@ -1194,6 +1195,15 @@ find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
    }
    if (simple) {
       return reg;
+   } else if (cls != RA_GPR) {
+      /* Spill slots cannot live-range split: fail closed instead of falling
+       * through into GPR eviction (which corrupts used_regs[RA_GPR] in
+       * NDEBUG builds). */
+      rctx->shader->ra_failed = true;
+      rctx->shader->ra_mem_exhausted = true;
+      if (rctx->shader->ra_abort)
+         longjmp(*(jmp_buf *)rctx->shader->ra_abort, 1);
+      return 0;
    } else {
       assert(!rctx->early_killed && "no live range splits with early kill");
       assert(cls == RA_GPR && "no memory live range splits");
@@ -1662,7 +1672,11 @@ pick_phi_unclaimed(struct ra_ctx *rctx, agx_instr *I, unsigned d,
       return false;
 
    enum ra_class cls = ra_class_for_index(I->dest[d]);
-   BITSET_DECLARE(claimed, AGX_NUM_MODELED_REGS) = {0};
+   if (rctx->bound[cls] == 0)
+      return false;
+
+   BITSET_DECLARE(claimed, AGX_NUM_MODELED_REGS);
+   memset(claimed, 0, BITSET_WORDS(rctx->bound[cls]) * sizeof(BITSET_WORD));
    bool any = false;
 
    agx_foreach_phi_in_block(rctx->block, other) {
@@ -2282,7 +2296,11 @@ static void
 agx_ra_assign_local(struct ra_ctx *rctx)
 {
    BITSET_DECLARE(used_regs_gpr, AGX_NUM_REGS) = {0};
-   BITSET_DECLARE(used_regs_mem, AGX_NUM_MODELED_REGS) = {0};
+   BITSET_DECLARE(used_regs_mem, AGX_NUM_MODELED_REGS);
+   if (rctx->bound[RA_MEM] > 0) {
+      memset(used_regs_mem, 0,
+             BITSET_WORDS(rctx->bound[RA_MEM]) * sizeof(BITSET_WORD));
+   }
    uint16_t *ssa_to_reg = calloc(rctx->shader->alloc, sizeof(uint16_t));
 
    agx_block *block = rctx->block;
@@ -2534,7 +2552,7 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          I->src[0].type == AGX_INDEX_NORMAL &&
          I->src[1].type == AGX_INDEX_NORMAL;
 
-      if (I->nr_dests == 1 && !agx_is_null(I->dest[0]) &&
+      if (I->nr_dests == 1 && !agx_is_null(I->dest[0]) && !I->dest[0].memory &&
           !g17p_ft1 && !g17p_srl_boundary &&
           !g17p_reg_isub && !g17p_reg_and) {
          unsigned first_src = 0;
@@ -3028,6 +3046,46 @@ static bool
 agx_has_static_register_split(const agx_context *ctx)
 {
    return !agx_isa_is_agx3(ctx->key->dev.encoding) || ctx->key->dev.emit_agx3d;
+}
+
+static unsigned
+agx_ra_mem_bound(agx_context *ctx)
+{
+   /* AGX2 keeps the original 2048-half (4 KiB) spill-slot bound so
+    * agx_scratch memory sizing stays unchanged. */
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding))
+      return AGX2_MAX_SPILL_SLOTS;
+
+   unsigned avail_B = ctx->key->max_scratch_B ? ctx->key->max_scratch_B
+                                              : AGX3_G17P_MAX_SPILL_B;
+
+   /* Reserve the 16-byte AGX3B atomic-return scratch word placed directly
+    * above align(scratch_size_B, 4) in agx_compile_function_nir_attempt(). */
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
+      bool has_atomic_return = false;
+      agx_foreach_instr_global(ctx, I) {
+         if (I->op == AGX_OPCODE_ATOMIC && I->nr_dests == 1 &&
+             !agx_is_null(I->dest[0])) {
+            has_atomic_return = true;
+            break;
+         }
+      }
+      if (has_atomic_return)
+         avail_B = avail_B > 16 ? ((avail_B - 16) & ~3u) : 0;
+   }
+
+   /* Account for post-RA TPS frame alignment so RA cannot allocate a spill
+    * frame whose aligned published size exceeds the target limit. */
+   if (agx_is_g18g(&ctx->key->dev))
+      avail_B &= ~15u;
+   else
+      avail_B &= ~3u;
+
+   if (ctx->spill_base_B >= avail_B)
+      return 0;
+
+   return MIN2((avail_B - ctx->spill_base_B) / 2,
+               (unsigned)AGX_NUM_MODELED_REGS);
 }
 
 static void
@@ -3756,6 +3814,8 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    }
    ctx->ra_abort = &ra_abort;
 
+   const unsigned mem_bound = agx_ra_mem_bound(ctx);
+
    agx_foreach_block(ctx, block) {
       agx_ra_assign_local(&(struct ra_ctx){
          .shader = ctx,
@@ -3778,7 +3838,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          .high_gpr = high_gpr,
          .tex_low128 = tex_low128,
          .bound[RA_GPR] = max_regs,
-         .bound[RA_MEM] = AGX_NUM_MODELED_REGS,
+         .bound[RA_MEM] = mem_bound,
          .count[RA_GPR] = &reg_count,
          .count[RA_MEM] = &mem_slot_count,
       });

@@ -844,8 +844,10 @@ hk_g17p_compute_shader_supported(enum agx_chip chip, struct hk_shader *s,
             s->b.info.preamble_scratch_size <= max_spill_B &&
             s->b.info.preamble_scratch_size >=
                s->b.info.agx3_preamble_inputs.storage_bytes)) &&
-          s->b.info.scratch_size <= max_spill_B &&
-          linked->b.scratch_size <= max_spill_B &&
+          MAX2(s->b.info.scratch_size, s->b.info.agx3_spectpr_scratch_size) <=
+             max_spill_B &&
+          MAX2(linked->b.scratch_size, linked->b.agx3_spectpr_scratch_size) <=
+             max_spill_B &&
           s->b.info.agx3_staging_known &&
           s->b.info.local_size <= 32768 &&
           s->b.info.texture_state_count == 0 &&
