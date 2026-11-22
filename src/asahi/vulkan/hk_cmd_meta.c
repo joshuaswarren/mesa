@@ -4722,13 +4722,20 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
          m5 && hk_split_depth_stencil(dst_image->vk.format);
       const bool m5_color =
          m5 && !vk_format_is_depth_or_stencil(dst_image->vk.format);
+      /* M5 compresses layered depth; copy into it a layer at a time through
+       * 2D views, as native AGX3 does. */
+      const bool layered_depth =
+         m5 && dst_image->vk.array_layers > 1 &&
+         vk_format_is_depth_or_stencil(dst_image->vk.format) &&
+         dst_image->planes[0].layout.compressed;
       struct vk_meta_copy_image_properties dst_props =
          hk_meta_copy_get_image_properties(
             dst_image, dev,
-            agx_chip_native_agx3(dev->dev.chip) || m5_split_zs || m5_color,
+            agx_chip_native_agx3(dev->dev.chip) || m5_split_zs || m5_color ||
+               layered_depth,
             m5_split_zs);
 
-      if (agx_chip_native_agx3(dev->dev.chip)) {
+      if (agx_chip_native_agx3(dev->dev.chip) || layered_depth) {
          /* Native single-slice EOT views already select the mip and array
           * layer or 3D Z slice. Keep source row/image strides intact while
           * splitting multi-layer and volume regions; no staging copy. */
@@ -4880,7 +4887,10 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
       struct vk_meta_copy_image_properties dst_props =
          hk_meta_copy_get_image_properties(dst_image, dev, native, zs_planes);
 
-      if (agx_chip_native_agx3(dev->dev.chip)) {
+      const bool compressed_depth_array = agx_chip_g17_m5(dev->dev.chip) &&
+         vk_format_is_depth_or_stencil(dst_image->vk.format) &&
+         dst_image->vk.array_layers > 1 && dst_image->planes[0].layout.compressed;
+      if (agx_chip_native_agx3(dev->dev.chip) || compressed_depth_array) {
          /* The qualified HAL200 BG/EOT contract is single-layer.  Preserve
           * arbitrary mip and rectangle selection while expanding array and
           * 3D regions into per-slice native meta draws. */
