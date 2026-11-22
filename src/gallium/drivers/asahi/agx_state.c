@@ -1026,7 +1026,7 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
    struct AGX_TEXTURE cfg = {AGX_TEXTURE_header};
    {
       cfg.dimension = agx_translate_tex_dim(state->target,
-                                            util_res_sample_count(&rsrc->base));
+                                            util_res_sample_count(&rsrc->base.b));
       cfg.layout = agx_translate_layout(rsrc->layout.tiling);
       cfg.channels = ail_pixel_format[format].channels;
       cfg.type = ail_pixel_format[format].type;
@@ -1046,8 +1046,8 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
          cfg.buffer_size_sw = size_el;
          cfg.buffer_offset_sw = 0;
       } else {
-         cfg.width = rsrc->base.width0;
-         cfg.height = rsrc->base.height0;
+         cfg.width = rsrc->base.b.width0;
+         cfg.height = rsrc->base.b.height0;
          cfg.first_level = state->u.tex.first_level;
          cfg.last_level = state->u.tex.last_level;
       }
@@ -1073,7 +1073,7 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
       /* Native Gen9 cube descriptors require one complete six-face range.
        * The shared extended-range address is filled for all applicable
        * dimensions below, after the selected layer count is known. */
-      if (agx_chip_native_agx3(agx_device(rsrc->base.screen)->chip) &&
+      if (agx_chip_native_agx3(agx_device(rsrc->base.b.screen)->chip) &&
           state->target == PIPE_TEXTURE_CUBE) {
          const unsigned faces =
             state->u.tex.last_layer - state->u.tex.first_layer + 1;
@@ -1086,7 +1086,7 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
       }
 
       if (state->target == PIPE_TEXTURE_3D) {
-         cfg.depth = rsrc->base.depth0;
+         cfg.depth = rsrc->base.b.depth0;
       } else if (state->target == PIPE_BUFFER) {
          cfg.depth = 1;
       } else {
@@ -1109,8 +1109,8 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
          }
       }
 
-      if (rsrc->base.nr_samples > 1)
-         cfg.samples = agx_translate_sample_count(rsrc->base.nr_samples);
+      if (rsrc->base.b.nr_samples > 1)
+         cfg.samples = agx_translate_sample_count(rsrc->base.b.nr_samples);
 
       if (state->target == PIPE_BUFFER) {
          cfg.stride = (cfg.width * util_format_get_blocksize(format)) - 16;
@@ -1127,7 +1127,7 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
        * the layers themselves are tightly or page aligned.  Compression keeps
        * using the same word for metadata instead. */
       const bool gen9_range =
-         agx_chip_native_agx3(agx_device(rsrc->base.screen)->chip) &&
+         agx_chip_native_agx3(agx_device(rsrc->base.b.screen)->chip) &&
          !rsrc->layout.compressed &&
          rsrc->layout.tiling != AIL_TILING_LINEAR &&
          (state->target == PIPE_TEXTURE_2D_ARRAY ||
@@ -1164,7 +1164,7 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
 
    /* The buffer texture's element count for the shader's size query and
     * bounds check (agx_nir_lower_texture.c), in a word Gen10 leaves free. */
-   if (packed && agx_chip_g17_m5(agx_device(rsrc->base.screen)->chip) && descriptor_generation == AGX_DESCRIPTOR_GENERATION_10 &&
+   if (packed && agx_chip_g17_m5(agx_device(rsrc->base.b.screen)->chip) && descriptor_generation == AGX_DESCRIPTOR_GENERATION_10 &&
        state->target == PIPE_BUFFER)
       out->opaque[AGX_GEN10_BUFFER_TEXTURE_SIZE_OFFSET / 4] =
          cfg.buffer_size_sw;
@@ -1173,7 +1173,7 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
     * Apple one byte for byte. A mipmapped array samples layer zero for every
     * layer, and every field examined so far matches the witness, so print
     * the whole record rather than the fields we already believe in. */
-   if (packed && (agx_device(rsrc->base.screen)->debug & AGX_DBG_FAULTTRACE) &&
+   if (packed && (agx_device(rsrc->base.b.screen)->debug & AGX_DBG_FAULTTRACE) &&
        cfg.depth > 1) {
       fprintf(stderr,
               "M5_TEXTURE %ux%ux%u levels=%u..%u mip=%u pal=%u ext=%u "
@@ -1188,7 +1188,7 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
       fprintf(stderr, "\n");
    }
    if (packed && descriptor_generation == AGX_DESCRIPTOR_GENERATION_9 &&
-       (agx_device(rsrc->base.screen)->debug &
+       (agx_device(rsrc->base.b.screen)->debug &
         (AGX_DBG_TRACE | AGX_DBG_ASYNCTRACE))) {
       fprintf(stderr,
               "asahi: Gen9 texture %s %ux%u levels=%u..%u mipmapped=%u "
@@ -1232,14 +1232,16 @@ agx_create_sampler_view(struct pipe_context *pctx,
       } else {
          /* Use the stencil-only-part */
          rsrc = rsrc->separate_stencil;
-         texture = &rsrc->base;
+         texture = &rsrc->base.b;
          format = texture->format;
       }
    }
 
-   agx_legalize_compression(agx_context(pctx), rsrc, format);
-
-   /* Save off the resource that we actually use, with the stencil fixed up */
+   /* Save off the resource that we actually use, with the stencil fixed up.
+    * Defer agx_legalize_compression() to agx_set_sampler_views() because
+    * u_threaded_context calls create_sampler_view directly on the frontend
+    * thread where decompressing/flushing batches would race with the driver.
+    */
    so->rsrc = rsrc;
    so->format = format;
 
@@ -1267,6 +1269,10 @@ agx_set_sampler_views(struct pipe_context *pctx, mesa_shader_stage shader,
       count = 0;
 
    for (i = 0; i < count; ++i) {
+      if (views[i]) {
+         struct agx_sampler_view *view = (struct agx_sampler_view *)views[i];
+         agx_legalize_compression(ctx, view->rsrc, view->format);
+      }
       pipe_sampler_view_reference(
          (struct pipe_sampler_view **)&ctx->stage[shader].textures[i],
          views[i]);
@@ -1577,7 +1583,7 @@ agx_check_zs_merge(struct agx_context *ctx)
          if (!tex)
             continue;
          for (unsigned cb = 0; cb < ctx->framebuffer.nr_cbufs; ++cb) {
-            if (ctx->framebuffer.cbufs[cb].texture == &tex->rsrc->base)
+            if (ctx->framebuffer.cbufs[cb].texture == &tex->rsrc->base.b)
                goto unmerge;
          }
       }
@@ -1647,7 +1653,7 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
                   continue;
 
                struct agx_resource *rsrc = agx_resource(state->cbufs[i].texture);
-               if (!(rsrc->base.bind & PIPE_BIND_SHARED) &&
+               if (!(rsrc->base.b.bind & PIPE_BIND_SHARED) &&
                    ail_is_level_logically_compressed(&rsrc->layout,
                                                      state->cbufs[i].level))
                   agx_decompress(ctx, rsrc, "Render target spilled");
@@ -1877,13 +1883,13 @@ agx_g18_msaa4_storage(const struct agx_device *dev,
     * and draw predicates below.
     */
    const bool target_ok =
-      (rsrc->base.target == PIPE_TEXTURE_2D && rsrc->base.array_size == 1) ||
-      (rsrc->base.target == PIPE_TEXTURE_2D_ARRAY && rsrc->base.array_size >= 1);
+      (rsrc->base.b.target == PIPE_TEXTURE_2D && rsrc->base.b.array_size == 1) ||
+      (rsrc->base.b.target == PIPE_TEXTURE_2D_ARRAY && rsrc->base.b.array_size >= 1);
 
    return dev->chip == AGX_CHIP_G18G &&
-          (rsrc->base.nr_samples == 2 || rsrc->base.nr_samples == 4) &&
-          target_ok && rsrc->base.last_level == 0 &&
-          rsrc->base.depth0 == 1 && !rsrc->layout.compressed &&
+          (rsrc->base.b.nr_samples == 2 || rsrc->base.b.nr_samples == 4) &&
+          target_ok && rsrc->base.b.last_level == 0 &&
+          rsrc->base.b.depth0 == 1 && !rsrc->layout.compressed &&
           rsrc->layout.tiling == AIL_TILING_GPU &&
           format_ok;
 }
@@ -1907,7 +1913,7 @@ agx_g18_msaa4_zs_surface(const struct agx_device *dev,
    const bool single_d32_layer =
       surf->first_layer == surf->last_layer &&
       rsrc->layout.format == PIPE_FORMAT_Z32_FLOAT && !stencil &&
-      rsrc->base.target == PIPE_TEXTURE_2D_ARRAY;
+      rsrc->base.b.target == PIPE_TEXTURE_2D_ARRAY;
    return surf->level == 0 &&
           ((surf->first_layer == 0 && surf->last_layer == 0) ||
            single_d32_layer) &&
@@ -1917,8 +1923,8 @@ agx_g18_msaa4_zs_surface(const struct agx_device *dev,
           agx_g18_msaa4_storage(dev, rsrc, rsrc->layout.format) &&
           (!stencil ||
            (stencil->layout.format == PIPE_FORMAT_S8_UINT &&
-            stencil->base.width0 == rsrc->base.width0 &&
-            stencil->base.height0 == rsrc->base.height0 &&
+            stencil->base.b.width0 == rsrc->base.b.width0 &&
+            stencil->base.b.height0 == rsrc->base.b.height0 &&
             agx_g18_msaa4_storage(dev, stencil, PIPE_FORMAT_S8_UINT)));
 }
 
@@ -2102,7 +2108,7 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
    struct agx_resource *tex = agx_resource(view->resource);
    const struct util_format_description *desc =
       util_format_description(view->format);
-   enum pipe_texture_target target = tex->base.target;
+   enum pipe_texture_target target = tex->base.b.target;
    bool is_buffer = (target == PIPE_BUFFER);
 
    if (!is_buffer && view->u.tex.single_layer_view)
@@ -2131,7 +2137,7 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
    struct AGX_PBE cfg = {AGX_PBE_header};
    {
       cfg.dimension =
-         agx_translate_tex_dim(target, util_res_sample_count(&tex->base));
+         agx_translate_tex_dim(target, util_res_sample_count(&tex->base.b));
       /* G17G shaders store to layered images as 3D (agx3_pack_binary.c);
        * G17C stores keep the array. */
       if (descriptor_generation == AGX_DESCRIPTOR_GENERATION_10 &&
@@ -2182,7 +2188,7 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
          cfg.stride = (cfg.width * util_format_get_blocksize(view->format)) - 4;
          cfg.layers = 1;
          cfg.levels = 1;
-      } else if (util_res_sample_count(&tex->base) > 1 && !block_access) {
+      } else if (util_res_sample_count(&tex->base.b) > 1 && !block_access) {
          /* Multisampled images are bound like buffer textures, with
           * addressing arithmetic to determine the texel to write.
           *
@@ -2228,7 +2234,7 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
             cfg.levels = 1;
          } else {
             cfg.page_aligned_layers = tex->layout.page_aligned_layers;
-            cfg.levels = tex->base.last_level + 1;
+            cfg.levels = tex->base.b.last_level + 1;
 
             /* The M5 allocator's flag describes padding, so it is clear when
              * a layer is exactly one page. G18 block stores still need the
@@ -2272,8 +2278,8 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
             cfg.unk_mipmapped = false;
          }
 
-         if (tex->base.nr_samples > 1)
-            cfg.samples = agx_translate_sample_count(tex->base.nr_samples);
+         if (tex->base.b.nr_samples > 1)
+            cfg.samples = agx_translate_sample_count(tex->base.b.nr_samples);
       }
 
       if (tex->layout.compressed && !emrt) {
@@ -2311,14 +2317,14 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
          agx_gallium_descriptor_generation_is_agx3(descriptor_generation);
 
       if (!cfg.extended && (tex->layout.writeable_image || emrt) &&
-          tex->base.target != PIPE_BUFFER && !sideband_has_no_reader) {
+          tex->base.b.target != PIPE_BUFFER && !sideband_has_no_reader) {
 
-         if (util_res_sample_count(&tex->base) > 1) {
+         if (util_res_sample_count(&tex->base.b) > 1) {
             cfg.aligned_width_msaa_sw =
                align(u_minify(view->resource->width0, level),
                      tex->layout.tilesize_el[level].width_el);
 
-            cfg.sample_count_log2_sw = util_logbase2(tex->base.nr_samples);
+            cfg.sample_count_log2_sw = util_logbase2(tex->base.b.nr_samples);
          } else {
             cfg.level_offset_sw =
                ail_get_level_offset_B(&tex->layout, cfg.level);
@@ -2376,7 +2382,7 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
               "levels=%u mip=%u layers=%u samples=%u %ux%u srgb=%u "
               "compressed=%u extended=%u stride=%u sw=%" PRIu64 ",%u,%u,%u,%"
               PRIu64 "\n",
-              util_format_short_name(view->format), tex->base.target,
+              util_format_short_name(view->format), tex->base.b.target,
               cfg.dimension, cfg.layout, cfg.level, cfg.levels,
               cfg.unk_mipmapped, cfg.layers, cfg.samples, cfg.width,
               cfg.height, cfg.srgb, cfg.compressed, cfg.extended, cfg.stride,
@@ -2389,7 +2395,7 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
     * linear window and has no atomic addressing yet. */
    if (packed && agx_chip_g17_m5(dev->chip) && descriptor_generation == AGX_DESCRIPTOR_GENERATION_10 &&
        !block_access && !emrt && tex->layout.writeable_image &&
-       util_res_sample_count(&tex->base) <= 1) {
+       util_res_sample_count(&tex->base.b) <= 1) {
       uint64_t sw = 0;
       if (!is_buffer && tex->layout.tiling != AIL_TILING_LINEAR) {
          const struct ail_tile tile = tex->layout.tilesize_el[level];
@@ -2406,11 +2412,11 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
    }
 
    if (packed && (dev->debug & AGX_DBG_ASYNCTRACE) &&
-       util_res_sample_count(&tex->base) > 1) {
+       util_res_sample_count(&tex->base.b) > 1) {
       agx_msg("MSAA PBE: format=%s dimension=%u samples=%u address=0x%llx "
               "words: %08x %08x %08x %08x %08x %08x %08x %08x\n",
               util_format_short_name(view->format), cfg.dimension,
-              util_res_sample_count(&tex->base), (unsigned long long)cfg.buffer,
+              util_res_sample_count(&tex->base.b), (unsigned long long)cfg.buffer,
               out->opaque[0], out->opaque[1], out->opaque[2], out->opaque[3],
               out->opaque[4], out->opaque[5], out->opaque[6], out->opaque[7]);
    }
@@ -6094,7 +6100,7 @@ agx_upload_spilled_rt_descriptors(void *out, struct agx_batch *batch,
             memcpy(&width, entry + AGX_G17P_EMRT_ALIGNED_WIDTH_OFFSET, sizeof(width));
             fprintf(stderr, "G18_EMRT rt=%u heap=%u pbe=%u samples=%u "
                     "sw=%016llx aligned_width=%u layer=%u\n", rt, index,
-                    index + 1, rsrc->base.nr_samples,
+                    index + 1, rsrc->base.b.nr_samples,
                     (unsigned long long)sw, width, surf->first_layer);
          }
       }
@@ -6108,10 +6114,10 @@ agx_image_address_metadata(uint32_t out[10], const struct pipe_image_view *view)
 {
    struct agx_resource *rsrc = agx_resource(view->resource);
    const struct ail_layout *layout = &rsrc->layout;
-   const bool buffer = rsrc->base.target == PIPE_BUFFER;
+   const bool buffer = rsrc->base.b.target == PIPE_BUFFER;
    const unsigned level = buffer ? 0 : view->u.tex.level;
    const unsigned layer = buffer ? 0 : view->u.tex.first_layer;
-   const unsigned samples = util_res_sample_count(&rsrc->base);
+   const unsigned samples = util_res_sample_count(&rsrc->base.b);
    const unsigned bytes = util_format_get_blocksize(view->format);
 
    /* Bound atomics are raw32. MS stores additionally use two/four raw32
@@ -6191,7 +6197,7 @@ agx_g17p_fill_storage_tail(uint8_t *tail, unsigned record_size_B,
           sizeof(heap_index));
 
    struct agx_resource *rsrc = agx_resource(view->resource);
-   if (rsrc->base.target == PIPE_BUFFER) {
+   if (rsrc->base.b.target == PIPE_BUFFER) {
       /* Same software texel-buffer metadata as Honeykrisp. The native
        * descriptors already include the view byte offset, so the extra
        * coordinate offset is zero; atomics use the exact bound byte address. */
@@ -6211,7 +6217,7 @@ agx_g17p_fill_storage_tail(uint8_t *tail, unsigned record_size_B,
       return;
 
    const struct ail_layout *layout = &rsrc->layout;
-   const unsigned samples = util_res_sample_count(&rsrc->base);
+   const unsigned samples = util_res_sample_count(&rsrc->base.b);
    const bool linear = layout->tiling == AIL_TILING_LINEAR;
    /* Multisampled storage is bound as a linear buffer starting at its level,
     * so its level offset is zero, as in hk's pack_pbe(). */
@@ -6219,7 +6225,7 @@ agx_g17p_fill_storage_tail(uint8_t *tail, unsigned record_size_B,
 
    if (samples > 1) {
       const uint32_t aligned_width =
-         align(u_minify(rsrc->base.width0, view->u.tex.level),
+         align(u_minify(rsrc->base.b.width0, view->u.tex.level),
                layout->tilesize_el[view->u.tex.level].width_el);
       memcpy(tail + AGX_G17P_EMRT_ALIGNED_WIDTH_OFFSET - base, &aligned_width,
              sizeof(aligned_width));
@@ -6346,7 +6352,7 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
       agx_batch_reads(batch, tex->rsrc);
 
       /* Admit only resources covered by the native-backed stored path. */
-      if (dev->chip == AGX_CHIP_G18G && rsrc->base.nr_samples > 1 &&
+      if (dev->chip == AGX_CHIP_G18G && rsrc->base.b.nr_samples > 1 &&
           !agx_g18_msaa4_storage(dev, rsrc, tex->format)) {
          agx_native_descriptor_reject_batch(batch, "G18G multisample texture");
          return;
@@ -11671,7 +11677,7 @@ agx_batch_init_state(struct agx_batch *batch)
 
          if (agx_gallium_shared_compression_supported(
                 agx_chip_descriptor_generation(dev->chip)) ||
-             (rsrc->base.bind & PIPE_BIND_SHARED)) {
+             (rsrc->base.b.bind & PIPE_BIND_SHARED)) {
             agx_decompress_inplace(batch, surf, "Render target spilled");
          } else {
             /* agx_set_framebuffer_state() pre-decompresses spilling private
@@ -14712,7 +14718,7 @@ agx_draw_without_restart(struct agx_batch *batch,
    };
 
    struct pipe_draw_indirect_info new_indirect = *indirect;
-   new_indirect.buffer = &out_draws_rsrc.base;
+   new_indirect.buffer = &out_draws_rsrc.base.b;
    new_indirect.offset = out_draws.gpu - out_draws_rsrc.bo->va->addr;
    new_indirect.stride = 5 * sizeof(uint32_t);
 
@@ -15263,7 +15269,7 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
    struct agx_resource indirect_rsrc = {.bo = draw_bo};
 
    struct pipe_draw_indirect_info copy_indirect = {
-      .buffer = &indirect_rsrc.base,
+      .buffer = &indirect_rsrc.base.b,
       .offset = params.out_draws - draw_bo->va->addr,
       .stride = draw_stride,
       .draw_count = 1,
@@ -15318,7 +15324,7 @@ agx_legalize_feedback_loop_surf(struct agx_context *ctx,
       return;
 
    /* Decompress if we can and shadow if we can't. */
-   if (rsrc->base.bind & PIPE_BIND_SHARED) {
+   if (rsrc->base.b.bind & PIPE_BIND_SHARED) {
       struct agx_batch *batch = agx_get_batch(ctx);
 
       /* If we already did in-place decompression for this one */
@@ -16622,14 +16628,14 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
          .index_size = poly_gs_index_size(gsi->shape),
          .primitive_restart = poly_gs_indexed(gsi->shape),
          .restart_index = poly_gs_index_size(gsi->shape) == 1 ? 0xFF : ~0,
-         .index.resource = &index_rsrc.base,
+         .index.resource = &index_rsrc.base.b,
          .instance_count = 1,
       };
 
       if (indirect) {
          indirect_gs = (struct pipe_draw_indirect_info){
             .draw_count = 1,
-            .buffer = &indirect_rsrc.base,
+            .buffer = &indirect_rsrc.base.b,
             .offset = batch->uniforms.geometry_params -
                       indirect_rsrc.bo->va->addr +
                       offsetof(struct poly_geometry_params, draw),

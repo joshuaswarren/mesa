@@ -741,11 +741,11 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 
          struct pipe_blit_info stencil = *info;
          stencil.src.resource = src->separate_stencil
-                                   ? &src->separate_stencil->base
+                                   ? &src->separate_stencil->base.b
                                    : info->src.resource;
          stencil.src.format = PIPE_FORMAT_R8_UINT;
          stencil.dst.resource = dst->separate_stencil
-                                   ? &dst->separate_stencil->base
+                                   ? &dst->separate_stencil->base.b
                                    : info->dst.resource;
          stencil.dst.format = PIPE_FORMAT_R8_UINT;
          stencil.mask = PIPE_MASK_R;
@@ -1181,7 +1181,7 @@ agx_generate_mipmap_agx3_supported(const struct agx_device *dev,
    if (!dev || !rsrc || !agx_chip_native_agx3(dev->chip))
       return false;
 
-   const struct pipe_resource *prsc = &rsrc->base;
+   const struct pipe_resource *prsc = &rsrc->base.b;
    switch (prsc->target) {
    case PIPE_TEXTURE_2D:
    case PIPE_TEXTURE_2D_ARRAY:
