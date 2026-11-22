@@ -1888,6 +1888,14 @@ kill_source(struct ra_ctx *rctx, const agx_instr *I, unsigned s)
    assert(count >= 1);
 
    BITSET_CLEAR_COUNT(rctx->used_regs[cls], reg, count);
+
+   if (cls == RA_GPR) {
+      unsigned reserved = reserved_size(rctx->shader);
+      if (reg < reserved) {
+         BITSET_SET_COUNT(rctx->used_regs[RA_GPR], reg,
+                          MIN2(count, reserved - reg));
+      }
+   }
 }
 
 static void
@@ -2399,13 +2407,17 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          assert(I->dest[0].size == I->src[0].size);
          assert(I->src[0].type == AGX_INDEX_REGISTER);
 
-         /* r1l specifically is a preloaded register. It is reserved during
-          * demand calculations to ensure we don't need live range shuffling of
-          * spilling temporaries. But we can still preload to it. So if it's
-          * reserved, just free it. It'll be fine.
+         /* Preloaded registers may fall inside the shader-wide reserved prefix
+          * (such as r1l during spilling or r4..r7 before CEM eviction moves
+          * them out of the low scratch bank). Clear the reserved bits so the
+          * preload can occupy its fixed ABI register until killed.
           */
-         if (I->src[0].value == 2) {
-            BITSET_CLEAR(rctx->used_regs[RA_GPR], 2);
+         unsigned preload_reg = I->src[0].value;
+         unsigned preload_nr = agx_index_size_16(I->src[0]);
+         unsigned reserved = reserved_size(rctx->shader);
+         if (preload_reg < reserved) {
+            BITSET_CLEAR_COUNT(rctx->used_regs[RA_GPR], preload_reg,
+                               MIN2(preload_nr, reserved - preload_reg));
          }
 
          assign_regs(rctx, I->dest[0], I->src[0].value);
@@ -3104,8 +3116,54 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
       agx_foreach_instr_global(ctx, I) {
          if (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
-             (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY))
+             (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY)) {
             ctx->agx3_cem_low_scratch = true;
+            break;
+         }
+      }
+   }
+
+   /* Linked shaders may preload ABI inputs into the AGX3C low CEM scratch
+    * bank. Evict those preloads out of the bank at shader entry so cube
+    * sampling cannot clobber live ABI values. */
+   if (ctx->agx3_cem_low_scratch) {
+      agx_block *entry = agx_start_block(ctx);
+      agx_instr *last_preload = NULL;
+      bool saw_non_preload = false;
+      agx_foreach_instr_in_block(entry, I) {
+         if (I->op == AGX_OPCODE_PRELOAD) {
+            assert(!saw_non_preload && "PRELOAD must precede non-PRELOAD ops");
+            last_preload = I;
+         } else {
+            saw_non_preload = true;
+         }
+      }
+      if (last_preload) {
+         agx_builder b = agx_init_builder(ctx, agx_after_instr(last_preload));
+         agx_foreach_instr_in_block(entry, I) {
+            if (I->op != AGX_OPCODE_PRELOAD)
+               break;
+            unsigned reg = I->src[0].value;
+            unsigned nr = agx_index_size_16(I->src[0]);
+            if (reg >= AGX3C_CEM_LOW_SCRATCH_END ||
+                reg + nr <= AGX3C_CEM_LOW_SCRATCH_BASE)
+               continue;
+            agx_index orig = I->dest[0];
+            agx_index tmp = agx_vec_temp(ctx, orig.size, agx_channels(orig));
+            I->dest[0] = tmp;
+            if (agx_channels(orig) == 1) {
+               agx_mov_to(&b, orig, tmp);
+            } else {
+               unsigned comps = agx_channels(orig);
+               agx_instr *split = agx_split(&b, comps, tmp);
+               agx_instr *collect = agx_collect_to(&b, orig, comps);
+               for (unsigned c = 0; c < comps; ++c) {
+                  agx_index elem = agx_temp(ctx, orig.size);
+                  split->dest[c] = elem;
+                  collect->src[c] = elem;
+               }
+            }
+         }
       }
    }
 
