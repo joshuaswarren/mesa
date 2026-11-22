@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "hk_nir_match_pointwise_clamp.h"
+#include "hk_nir_wgid.h"
 
 #include <math.h>
 #include <string.h>
@@ -111,51 +112,29 @@ plain_load(const nir_intrinsic_instr *instr)
    return instr && !(nir_intrinsic_access(instr) & ~allowed);
 }
 
-/* Match base_workgroup_id[axis] * local_size[axis] (scalar or vector imul/ishl,
- * or identity when local_size == 1).  nir_lower_compute_system_values emits
- * vec3 imul(load_base_workgroup_id, vec3(workgroup_size)) even when an axis
- * has local_size == 1, before any scalarization pass runs. */
+/* Accept load_workgroup_id[axis] as GlobalInvocationID[axis] when
+ * local_size[axis] == 1 (so LocalInvocationID[axis] == 0).
+ *
+ * NOTE: The bare load_workgroup_id[axis] form (without + load_base_workgroup_id)
+ * equals GlobalInvocationID[axis] ONLY when base_group[axis] == 0. This matcher
+ * is sound only together with the dispatch-time nonzero-base refusal gates
+ * (hk_nir_dispatch_zero_base() in hk_cmd_dispatch.c:hk_try_record_compute_pair()
+ * and hk_select_depthwise_vec4(), plus dispatch_covers() below), all of which
+ * fall back to the original shader whenever any vkCmdDispatchBase offset is
+ * nonzero. */
 static bool
-match_base_wg_scaled(nir_scalar s, unsigned axis, uint32_t local_size)
+is_global_id_intr(nir_scalar s, const uint16_t local_size[3])
 {
-   s = nir_scalar_chase_movs(s);
-   if (!s.def || !local_size)
-      return false;
-
-   if (local_size == 1 && s.comp == axis && s.def->bit_size == 32 &&
-       intrinsic(s.def, nir_intrinsic_load_base_workgroup_id) != NULL)
-      return true;
-
-   if (alu_op(s, nir_op_imul)) {
-      nir_scalar a = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
-      nir_scalar b = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 1));
-      if (a.comp == axis && a.def->bit_size == 32 &&
-          intrinsic(a.def, nir_intrinsic_load_base_workgroup_id) &&
-          constant(b, local_size))
-         return true;
-      if (b.comp == axis && b.def->bit_size == 32 &&
-          intrinsic(b.def, nir_intrinsic_load_base_workgroup_id) &&
-          constant(a, local_size))
-         return true;
-   }
-
-   if (util_is_power_of_two_nonzero(local_size) && alu_op(s, nir_op_ishl)) {
-      unsigned shift = ffs(local_size) - 1;
-      nir_scalar a = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
-      nir_scalar b = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 1));
-      if (a.comp == axis && a.def->bit_size == 32 &&
-          intrinsic(a.def, nir_intrinsic_load_base_workgroup_id) &&
-          constant(b, shift))
-         return true;
-   }
-
-   return false;
+   return s.def && s.def->bit_size == 32 && s.comp < 3 &&
+          (intrinsic(s.def, nir_intrinsic_load_global_invocation_id) ||
+           (local_size && local_size[s.comp] == 1 &&
+            intrinsic(s.def, nir_intrinsic_load_workgroup_id)));
 }
 
 /* Recognizes a component of GlobalInvocationID or LocalInvocationID on either
  * pre-preprocess NIR (load_deref of nir_var_system_value) or post-preprocess
- * NIR (load_global_invocation_id [+ load_base_workgroup_id * local_size],
- * load_local_invocation_id). */
+ * NIR (load_global_invocation_id or unit-axis load_workgroup_id
+ * [+ load_base_workgroup_id * local_size], load_local_invocation_id). */
 static bool
 sysval_id_axis(nir_scalar value, gl_system_value loc,
                const uint16_t local_size[3], unsigned *axis_out)
@@ -177,23 +156,20 @@ sysval_id_axis(nir_scalar value, gl_system_value loc,
    }
 
    if (loc == SYSTEM_VALUE_GLOBAL_INVOCATION_ID) {
-      if (value.comp < 3 &&
-          intrinsic(value.def, nir_intrinsic_load_global_invocation_id)) {
+      if (is_global_id_intr(value, local_size)) {
          *axis_out = value.comp;
          return true;
       }
       if (local_size && alu_op(value, nir_op_iadd)) {
          nir_scalar a = nir_scalar_chase_movs(nir_scalar_chase_alu_src(value, 0));
          nir_scalar b = nir_scalar_chase_movs(nir_scalar_chase_alu_src(value, 1));
-         if (a.comp < 3 &&
-             intrinsic(a.def, nir_intrinsic_load_global_invocation_id) &&
-             match_base_wg_scaled(b, a.comp, local_size[a.comp])) {
+         if (is_global_id_intr(a, local_size) &&
+             hk_nir_match_base_wg_scaled(b, a.comp, local_size[a.comp])) {
             *axis_out = a.comp;
             return true;
          }
-         if (b.comp < 3 &&
-             intrinsic(b.def, nir_intrinsic_load_global_invocation_id) &&
-             match_base_wg_scaled(a, b.comp, local_size[b.comp])) {
+         if (is_global_id_intr(b, local_size) &&
+             hk_nir_match_base_wg_scaled(a, b.comp, local_size[b.comp])) {
             *axis_out = b.comp;
             return true;
          }
@@ -452,6 +428,7 @@ hk_nir_match_pointwise_clamp(const nir_shader *shader,
          case nir_intrinsic_vulkan_resource_index:
          case nir_intrinsic_load_vulkan_descriptor:
          case nir_intrinsic_load_global_invocation_id:
+         case nir_intrinsic_load_workgroup_id:
          case nir_intrinsic_load_base_workgroup_id:
          case nir_intrinsic_load_push_constant:
             break;
@@ -1709,6 +1686,7 @@ match_depthwise(const nir_shader *shader, struct hk_nir_depthwise_output *match,
          case nir_intrinsic_vulkan_resource_index:
          case nir_intrinsic_load_vulkan_descriptor:
          case nir_intrinsic_load_global_invocation_id:
+         case nir_intrinsic_load_workgroup_id:
          case nir_intrinsic_load_base_workgroup_id:
          case nir_intrinsic_load_push_constant:
             break;
@@ -2198,6 +2176,7 @@ hk_nir_match_gemm_output(const nir_shader *shader,
          case nir_intrinsic_vulkan_resource_index:
          case nir_intrinsic_load_vulkan_descriptor:
          case nir_intrinsic_load_global_invocation_id:
+         case nir_intrinsic_load_workgroup_id:
          case nir_intrinsic_load_base_workgroup_id:
          case nir_intrinsic_load_local_invocation_id:
          case nir_intrinsic_load_push_constant:
@@ -2532,8 +2511,10 @@ static bool
 dispatch_covers(const struct hk_nir_direct_shape *launch,
                 const uint32_t local_size[3], const uint64_t active[3])
 {
+   if (!hk_nir_dispatch_zero_base(launch->base_group))
+      return false;
    for (unsigned i = 0; i < 3; ++i) {
-      if (launch->base_group[i] || !local_size[i])
+      if (!local_size[i])
          return false;
       uint64_t threads = (uint64_t)launch->groups[i] * local_size[i];
       if (threads < active[i] || threads > INT32_MAX)

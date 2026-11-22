@@ -16,6 +16,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_compute_pair.h"
 #include "hk_nir_match_pointwise_clamp.h"
+#include "hk_nir_wgid.h"
 #include "hk_g17p_storage_image.h"
 #include "hk_frame_anatomy.h"
 #include "hk_sampler_index.h"
@@ -2911,8 +2912,7 @@ hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
 
    const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
-   if (desc->root.cs.base_group[0] || desc->root.cs.base_group[1] ||
-       desc->root.cs.base_group[2])
+   if (!hk_nir_dispatch_zero_base(desc->root.cs.base_group))
       return;
 
    const bool is_producer = info->role == HK_COMPUTE_PAIR_DEPTHWISE ||
@@ -3440,8 +3440,8 @@ hk_select_identity_copy4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
    if (!agx_chip_native_or_m5(dev->dev.chip) ||
        cmd->in_meta || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
       return normal;
-   if (grid->mode != AGX_CDM_MODE_DIRECT || desc->root.cs.base_group[0] ||
-       desc->root.cs.base_group[1] || desc->root.cs.base_group[2])
+   if (grid->mode != AGX_CDM_MODE_DIRECT ||
+       !hk_nir_dispatch_zero_base(desc->root.cs.base_group))
       return normal;
    if (!hk_g17p_compute_shader_supported(dev->dev.chip, copy, copy->only_linked, 1u << 16))
       return normal;
@@ -3593,8 +3593,8 @@ hk_select_depthwise_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
    if (!agx_chip_native_or_m5(dev->dev.chip) ||
        cmd->in_meta || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
       return normal;
-   if (grid->mode != AGX_CDM_MODE_DIRECT || desc->root.cs.base_group[0] ||
-       desc->root.cs.base_group[1] || desc->root.cs.base_group[2])
+   if (grid->mode != AGX_CDM_MODE_DIRECT ||
+       !hk_nir_dispatch_zero_base(desc->root.cs.base_group))
       return normal;
    if (!hk_g17p_compute_shader_supported(dev->dev.chip, alt, alt->only_linked, 1u << 16) ||
        alt->b.info.workgroup_size[0] == 0 || alt->b.info.workgroup_size[1] == 0 ||

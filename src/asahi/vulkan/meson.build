@@ -63,6 +63,7 @@ hk_files = files(
   'hk_image_layout_core.c',
   'hk_image_layout_core.h',
   'hk_identity_copy4.h',
+  'hk_nir_wgid.h',
   'hk_image_view.c',
   'hk_nir_copy_identity4.c',
   'hk_nir_match_pointwise_clamp.c',
