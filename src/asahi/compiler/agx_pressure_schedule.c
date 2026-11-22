@@ -16,12 +16,26 @@
 #include "agx3_fixed_dependencies.h"
 #include "agx_opcodes.h"
 
+struct sched_use_entry {
+   struct sched_node *node;
+   int32_t next;
+   uint8_t size16;
+};
+
 struct sched_ctx {
    /* Dependency graph */
    struct dag *dag;
 
-   /* Live set */
-   struct u_sparse_bitset live;
+   /* Dense live set for the current block */
+   BITSET_WORD *live;
+
+   /* Incremental pressure delta tables indexed by SSA value */
+   struct sched_node **def_node;
+   uint8_t *def_size;
+   int32_t *use_head;
+   struct util_dynarray *use_pool;
+   unsigned touched_start;
+   unsigned touched_end;
 };
 
 struct sched_node {
@@ -32,6 +46,9 @@ struct sched_node {
 
    /* Original position within the block (ILP scheduler only) */
    unsigned index;
+
+   /* Cached pressure delta for the current live set */
+   int32_t delta;
 };
 
 static void
@@ -267,7 +284,7 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniform
  *      live_in = (live_out - KILL) + GEN
  */
 static signed
-calculate_pressure_delta(agx_instr *I, struct u_sparse_bitset *live)
+calculate_pressure_delta(const agx_instr *I, struct u_sparse_bitset *live)
 {
    signed delta = 0;
 
@@ -293,6 +310,77 @@ calculate_pressure_delta(agx_instr *I, struct u_sparse_bitset *live)
    }
 
    return delta;
+}
+
+static signed
+calculate_pressure_delta_dense(const agx_instr *I, const BITSET_WORD *live)
+{
+   signed delta = 0;
+
+   /* Destinations must be unique */
+   agx_foreach_ssa_dest(I, d) {
+      if (BITSET_TEST(live, I->dest[d].value))
+         delta -= agx_index_size_16(I->dest[d]);
+   }
+
+   agx_foreach_ssa_src(I, src) {
+      /* Filter duplicates */
+      bool dupe = false;
+
+      for (unsigned i = 0; i < src; ++i) {
+         if (agx_is_equiv(I->src[i], I->src[src])) {
+            dupe = true;
+            break;
+         }
+      }
+
+      if (!dupe && !BITSET_TEST(live, I->src[src].value))
+         delta += agx_index_size_16(I->src[src]);
+   }
+
+   return delta;
+}
+
+static inline void
+sched_liveness_update_dense(BITSET_WORD *live, const agx_instr *I)
+{
+   agx_foreach_ssa_dest(I, d)
+      BITSET_CLEAR(live, I->dest[d].value);
+
+   agx_foreach_ssa_src(I, s)
+      BITSET_SET(live, I->src[s].value);
+}
+
+static inline void
+sched_adjust_deltas(struct sched_ctx *s, unsigned v, int32_t sign)
+{
+   struct sched_node *def = s->def_node[v];
+   if (def)
+      def->delta += sign * (int32_t)s->def_size[v];
+
+   const struct sched_use_entry *entries = s->use_pool->data;
+   for (int32_t idx = s->use_head[v]; idx >= 0; idx = entries[idx].next)
+      entries[idx].node->delta += sign * (int32_t)entries[idx].size16;
+}
+
+static inline void
+sched_apply_instr(struct sched_ctx *s, const agx_instr *I)
+{
+   agx_foreach_ssa_dest(I, d) {
+      const unsigned v = I->dest[d].value;
+      if (BITSET_TEST(s->live, v)) {
+         BITSET_CLEAR(s->live, v);
+         sched_adjust_deltas(s, v, +1);
+      }
+   }
+
+   agx_foreach_ssa_src(I, src) {
+      const unsigned v = I->src[src].value;
+      if (!BITSET_TEST(s->live, v)) {
+         BITSET_SET(s->live, v);
+         sched_adjust_deltas(s, v, -1);
+      }
+   }
 }
 
 /*
@@ -333,7 +421,8 @@ choose_instr(struct sched_ctx *s)
       if (n->instr->op == AGX_OPCODE_WAIT_PIX)
          return n;
 
-      int32_t delta = calculate_pressure_delta(n->instr, &s->live);
+      assert(n->delta == calculate_pressure_delta_dense(n->instr, s->live));
+      int32_t delta = n->delta;
 
       if (delta < min_delta) {
          best = n;
@@ -345,39 +434,105 @@ choose_instr(struct sched_ctx *s)
 }
 
 static void
-pressure_schedule_block(agx_context *ctx, agx_block *block, struct sched_ctx *s)
+pressure_schedule_block(agx_context *ctx, agx_block *block, struct sched_ctx *s,
+                        struct util_dynarray *all_nodes)
 {
+   const unsigned nr_dag =
+      util_dynarray_num_elements(all_nodes, struct sched_node *);
+   if (nr_dag <= 1)
+      return;
+
    /* off by a constant, that's ok */
    signed pressure = 0;
    signed orig_max_pressure = 0;
-   unsigned nr_ins = 0;
 
-   u_sparse_bitset_dup(&s->live, &block->live_out);
+   memset(s->live, 0, BITSET_BYTES(ctx->alloc));
+   U_SPARSE_BITSET_FOREACH_SET(&block->live_out, v)
+      BITSET_SET(s->live, v);
 
    agx_foreach_instr_in_block_rev(block, I) {
-      pressure += calculate_pressure_delta(I, &s->live);
+      pressure += calculate_pressure_delta_dense(I, s->live);
       orig_max_pressure = MAX2(pressure, orig_max_pressure);
-      agx_liveness_ins_update(&s->live, I);
-      nr_ins++;
+      sched_liveness_update_dense(s->live, I);
    }
 
-   u_sparse_bitset_dup(&s->live, &block->live_out);
+   memset(s->live, 0, BITSET_BYTES(ctx->alloc));
+   U_SPARSE_BITSET_FOREACH_SET(&block->live_out, v)
+      BITSET_SET(s->live, v);
+
+   /* Initialize per-node deltas and incremental def/use tables */
+   if (s->touched_start < s->touched_end) {
+      const unsigned span = s->touched_end - s->touched_start;
+      memset(s->def_node + s->touched_start, 0, span * sizeof(*s->def_node));
+      memset(s->use_head + s->touched_start, -1, span * sizeof(*s->use_head));
+   }
+   s->touched_start = ctx->alloc;
+   s->touched_end = 0;
+   util_dynarray_clear(s->use_pool);
+
+   util_dynarray_foreach(all_nodes, struct sched_node *, np) {
+      struct sched_node *node = *np;
+      const agx_instr *I = node->instr;
+      int32_t delta = 0;
+
+      agx_foreach_ssa_dest(I, d) {
+         const unsigned v = I->dest[d].value;
+         const uint8_t sz = agx_index_size_16(I->dest[d]);
+         s->def_node[v] = node;
+         s->def_size[v] = sz;
+         s->touched_start = MIN2(s->touched_start, v);
+         s->touched_end = MAX2(s->touched_end, v + 1);
+         if (BITSET_TEST(s->live, v))
+            delta -= sz;
+      }
+
+      agx_foreach_ssa_src(I, src) {
+         bool dupe = false;
+         for (unsigned i = 0; i < src; ++i) {
+            if (agx_is_equiv(I->src[i], I->src[src])) {
+               dupe = true;
+               break;
+            }
+         }
+         if (dupe)
+            continue;
+
+         const unsigned v = I->src[src].value;
+         const uint8_t sz = agx_index_size_16(I->src[src]);
+         const int32_t entry_idx =
+            util_dynarray_num_elements(s->use_pool, struct sched_use_entry);
+         struct sched_use_entry entry = {
+            .node = node,
+            .next = s->use_head[v],
+            .size16 = sz,
+         };
+         util_dynarray_append(s->use_pool, entry);
+         s->use_head[v] = entry_idx;
+         s->touched_start = MIN2(s->touched_start, v);
+         s->touched_end = MAX2(s->touched_end, v + 1);
+         if (!BITSET_TEST(s->live, v))
+            delta += sz;
+      }
+
+      node->delta = delta;
+   }
 
    /* off by a constant, that's ok */
    signed max_pressure = 0;
    pressure = 0;
 
-   struct sched_node **schedule = calloc(nr_ins, sizeof(struct sched_node *));
-   nr_ins = 0;
+   struct sched_node **schedule = malloc(nr_dag * sizeof(struct sched_node *));
+   unsigned nr_ins = 0;
 
    while (!list_is_empty(&s->dag->heads)) {
       struct sched_node *node = choose_instr(s);
-      pressure += calculate_pressure_delta(node->instr, &s->live);
+      assert(node->delta == calculate_pressure_delta_dense(node->instr, s->live));
+      pressure += node->delta;
       max_pressure = MAX2(pressure, max_pressure);
       dag_prune_head(s->dag, &node->dag);
 
       schedule[nr_ins++] = node;
-      agx_liveness_ins_update(&s->live, node->instr);
+      sched_apply_instr(s, node->instr);
    }
 
    /* Bail if it looks like it's worse */
@@ -407,18 +562,40 @@ agx_pressure_schedule(agx_context *ctx)
       native_uniforms |= native_uniform_write(I);
    }
 
+   BITSET_DECLARE(stack_live, 4096);
+   BITSET_WORD *live =
+      ctx->alloc <= 4096 ? stack_live : BITSET_CALLOC(ctx->alloc);
+   struct sched_node **def_node = calloc(ctx->alloc, sizeof(*def_node));
+   uint8_t *def_size = malloc(ctx->alloc * sizeof(*def_size));
+   int32_t *use_head = malloc(ctx->alloc * sizeof(*use_head));
+   memset(use_head, -1, ctx->alloc * sizeof(*use_head));
+   struct util_dynarray use_pool = UTIL_DYNARRAY_INIT;
+   struct util_dynarray all_nodes = UTIL_DYNARRAY_INIT;
+
+   struct sched_ctx sctx = {
+      .live = live,
+      .def_node = def_node,
+      .def_size = def_size,
+      .use_head = use_head,
+      .use_pool = &use_pool,
+      .touched_start = ctx->alloc,
+      .touched_end = 0,
+   };
+
    agx_foreach_block(ctx, block) {
-      struct sched_ctx sctx = {
-         .dag = create_dag(ctx, block, memctx, native_uniforms, NULL,
-                           &dag_state, false),
-      };
+      if (list_is_empty(&block->instructions) ||
+          list_is_singular(&block->instructions))
+         continue;
+
+      util_dynarray_clear(&all_nodes);
+      sctx.dag = create_dag(ctx, block, memctx, native_uniforms, &all_nodes,
+                            &dag_state, false);
       /* Preserve the original order if a complete dependency graph cannot be
        * built (invalid range or workspace allocation failure). */
       if (!sctx.dag)
          continue;
-      u_sparse_bitset_init(&sctx.live, ctx->alloc, memctx);
 
-      pressure_schedule_block(ctx, block, &sctx);
+      pressure_schedule_block(ctx, block, &sctx, &all_nodes);
    }
 
    /* Clean up after liveness analysis */
@@ -427,6 +604,13 @@ agx_pressure_schedule(agx_context *ctx)
          I->src[s].kill = false;
    }
 
+   util_dynarray_fini(&all_nodes);
+   util_dynarray_fini(&use_pool);
+   free(use_head);
+   free(def_size);
+   free(def_node);
+   if (live != stack_live)
+      free(live);
    free(dag_state.last_write);
    ralloc_free(memctx);
 }

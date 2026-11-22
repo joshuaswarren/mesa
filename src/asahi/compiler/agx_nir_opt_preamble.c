@@ -372,14 +372,17 @@ surviving_branches(nir_shader *nir, const nir_opt_preamble_options *options,
                    const unsigned *sizes,
                    const nir_opt_peephole_select_options *flatten)
 {
-   struct set *branches = _mesa_pointer_set_create(NULL);
-   struct util_dynarray ifs, clone_ifs, left;
-   util_dynarray_init(&ifs, NULL);
-   util_dynarray_init(&clone_ifs, NULL);
-   util_dynarray_init(&left, NULL);
+   struct util_dynarray ifs = UTIL_DYNARRAY_INIT;
    collect_ifs(&nir_shader_get_entrypoint(nir)->body, &ifs);
+   if (!ifs.size) {
+      util_dynarray_fini(&ifs);
+      return NULL;
+   }
 
-   if (flatten && ifs.size) {
+   struct set *branches = NULL;
+   if (flatten) {
+      struct util_dynarray clone_ifs = UTIL_DYNARRAY_INIT;
+      struct util_dynarray left = UTIL_DYNARRAY_INIT;
       unsigned used[nir_preamble_num_classes];
       memcpy(used, sizes, sizeof(used));
 
@@ -389,28 +392,32 @@ surviving_branches(nir_shader *nir, const nir_opt_preamble_options *options,
       nir_opt_peephole_select(clone, flatten);
       collect_ifs(&nir_shader_get_entrypoint(clone)->body, &left);
 
-      /* Both walks see the same ifs in the same order, and the select pass
-       * creates no ifs. */
-      struct set *standing = _mesa_pointer_set_create(NULL);
-      util_dynarray_foreach(&left, nir_if *, nif)
-         _mesa_set_add(standing, *nif);
-      for (unsigned i = 0; i < util_dynarray_num_elements(&ifs, nir_if *);
-           ++i) {
-         if (_mesa_set_search(standing, *util_dynarray_element(
-                                           &clone_ifs, nir_if *, i)))
-            _mesa_set_add(branches,
-                          *util_dynarray_element(&ifs, nir_if *, i));
+      if (left.size) {
+         branches = _mesa_pointer_set_create(NULL);
+         /* Both walks see the same ifs in the same order, and the select pass
+          * creates no ifs. */
+         struct set *standing = _mesa_pointer_set_create(NULL);
+         util_dynarray_foreach(&left, nir_if *, nif)
+            _mesa_set_add(standing, *nif);
+         for (unsigned i = 0; i < util_dynarray_num_elements(&ifs, nir_if *);
+              ++i) {
+            if (_mesa_set_search(standing, *util_dynarray_element(
+                                              &clone_ifs, nir_if *, i)))
+               _mesa_set_add(branches,
+                             *util_dynarray_element(&ifs, nir_if *, i));
+         }
+         _mesa_set_destroy(standing, NULL);
       }
-      _mesa_set_destroy(standing, NULL);
       ralloc_free(clone);
+      util_dynarray_fini(&clone_ifs);
+      util_dynarray_fini(&left);
    } else {
+      branches = _mesa_pointer_set_create(NULL);
       util_dynarray_foreach(&ifs, nir_if *, nif)
          _mesa_set_add(branches, *nif);
    }
 
    util_dynarray_fini(&ifs);
-   util_dynarray_fini(&clone_ifs);
-   util_dynarray_fini(&left);
    return branches;
 }
 
@@ -940,6 +947,25 @@ allow_speculative_load(nir_builder *b, nir_intrinsic_instr *load, void *data)
    return true;
 }
 
+static bool
+has_speculative_load_candidate(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         if (block->cf_node.parent->type == nir_cf_node_function)
+            continue;
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            unsigned end;
+            if (speculative_descriptor(nir_instr_as_intrinsic(instr), &end))
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 static unsigned
 free_preamble_halves(const nir_shader *nir,
                      const nir_opt_preamble_options *options,
@@ -1052,7 +1078,8 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
       options.cb_data = branches;
    }
    bool speculative = false;
-   if (g17p && !agx3c && nir->info.stage == MESA_SHADER_FRAGMENT) {
+   if (g17p && !agx3c && nir->info.stage == MESA_SHADER_FRAGMENT &&
+       has_speculative_load_candidate(nir)) {
       unsigned free_halves = free_preamble_halves(nir, &options, sizes);
       NIR_PASS(speculative, nir, nir_shader_intrinsics_pass,
                allow_speculative_load, nir_metadata_all, &free_halves);
