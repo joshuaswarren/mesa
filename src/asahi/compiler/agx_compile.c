@@ -17037,7 +17037,6 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          agx3_options.lower_bfloat16_conversions = true;
       }
       if (is_g17p) {
-         agx3_options.lower_iabs = false;
          /* G17P's saturate form is a standalone f32add.ep2 operation. */
          agx3_options.lower_fsat = false;
          /* G17P lowers unsigned saturating subtract to compare/sub/select. */
