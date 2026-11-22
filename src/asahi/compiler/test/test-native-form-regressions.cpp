@@ -7147,11 +7147,11 @@ TEST(NativeForms, CooperativeMatrixDefaultsFollowTheImplementedEncoding)
    EXPECT_FALSE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G13G));
 }
 
-/* A G17P 2D-array comparison keeps a nonzero constant level or bias in a
+/* An AGX3B 2D-array comparison keeps a nonzero constant level or bias in a
  * register, since agx3_emit_texture_sample() refuses that immediate. Every
  * form the packer already encoded keeps its immediate, so no shader that
  * compiled before compiles differently. */
-TEST(NativeForms, G17PArrayShadowConstantLodKeepsEncodableImmediates)
+TEST(NativeForms, AGX3BArrayShadowConstantLodKeepsEncodableImmediates)
 {
    struct {
       mesa_shader_stage stage;
@@ -7181,8 +7181,10 @@ TEST(NativeForms, G17PArrayShadowConstantLodKeepsEncodableImmediates)
        AGX_CHIP_G17P, true},
       {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000, true,
        AGX_CHIP_G17P, true},
-      /* Other chips are unchanged. */
+      /* Other AGX3B chips (e.g. G16G) follow the same staging rule. */
       {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000, false,
+       AGX_CHIP_G16G, false},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x0000, false,
        AGX_CHIP_G16G, true},
    };
    for (const auto &c : cases) {

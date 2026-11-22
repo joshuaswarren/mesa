@@ -582,7 +582,7 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
        * treats as vertex_explicit_lod, encode as immediates and keep them. */
       if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 1 && I->shadow &&
           !I->offset && I->dim == AGX_DIM_2D_ARRAY &&
-          ctx->key->dev.chip == AGX_CHIP_G17P &&
+          ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           (def->dest[0].size == AGX_SIZE_16 ? _mesa_half_to_float(def->imm)
                                             : uif(def->imm)) != 0.0f &&
           !(I->lod_mode == AGX_LOD_MODE_LOD_MIN &&

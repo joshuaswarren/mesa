@@ -12089,8 +12089,7 @@ agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
    const struct agx_ppp_hal200_fragment_control_fields control_fields = {
       .linked_control = linked_fragment_control,
       .shader_tri_merge_disable =
-         (dev->chip == AGX_CHIP_G17P &&
-          ctx->fs->b.info.needs_quad_derivatives) ||
+         ctx->fs->b.info.needs_quad_derivatives ||
          (batch->tilebuffer_layout.nr_samples > 1 &&
           ctx->fs->epilog_key.write_z) ||
          /* The linker's own merge-disable bit. */
