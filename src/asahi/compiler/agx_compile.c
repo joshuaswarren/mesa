@@ -1889,7 +1889,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
    const int16_t byte_offset =
       (int16_t)(shift >> AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT);
    assert(!byte_offset ||
-          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C);
+          agx_isa_is_agx3(b->shader->key->dev.encoding));
    shift &= ~(AGX_NIR_MEMORY_INDEX_BYTES | AGX_NIR_MEMORY_PACKED_COUNT_MASK |
               AGX_NIR_MEMORY_UNPACK_W8_WORD | AGX_NIR_MEMORY_BYTE_OFFSET_MASK);
 
@@ -2085,7 +2085,7 @@ agx_emit_store(agx_builder *b, nir_intrinsic_instr *instr)
    const int16_t byte_offset =
       (int16_t)(shift >> AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT);
    assert(!byte_offset ||
-          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C);
+          agx_isa_is_agx3(b->shader->key->dev.encoding));
    shift &= ~(AGX_NIR_MEMORY_INDEX_BYTES | AGX_NIR_MEMORY_BYTE_OFFSET_MASK);
 
    assert(shift <= 3);
@@ -6361,9 +6361,12 @@ agx_lower_agx3_half_iadd_constants(agx_context *ctx)
    return progress;
 }
 
-/* A 32-bit add or multiply-add of halves -- 16-bit integer arithmetic the
- * optimizer widened, as hk's int16 shaders and dynamically indexed uniform
- * arrays produce -- has no mixed-width AGX3 form. Extend each half register
+/* Lower 32-bit integer adds or multiply-adds of half sources -- 16-bit
+ * integer arithmetic the optimizer widened, as hk's int16 shaders and
+ * dynamically indexed uniform arrays produce -- that have no native
+ * mixed-width AGX3 encoding (all IMADs, immediate/uniform or saturated
+ * IADDs, double-negated IADDs, shifted IADDs outside AGX3C's shift 1..4
+ * non-negated form, and all AGX3D forms). Extend each half register
  * explicitly: AGX IR plain half sources are signed and abs selects zero
  * extension; negation and the add's shift stay on the widened operation. */
 static bool
@@ -6378,6 +6381,20 @@ agx_lower_agx3_widening_int(agx_context *ctx)
             (I->op == AGX_OPCODE_IADD && I->nr_srcs == 2 && !I->saturate)) ||
           I->nr_dests != 1 || I->dest[0].size != AGX_SIZE_32 ||
           agx_channels(I->dest[0]) != 1)
+         continue;
+
+      /* AGX3B/AGX3C natively encode unshifted 32-bit register+register IADD
+       * with 16-bit source width (plain=sext, abs=zext) in agx3_iadd_encode().
+       * AGX3C additionally encodes shifted (1..4) non-negated mixed-width
+       * register+register IADD in the same form. Keep explicit widening for
+       * unsupported shifts, uniforms/immediates, or G18G. */
+      const bool agx3c_shifted =
+         ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+         I->shift <= 4 && !I->src[0].neg && !I->src[1].neg;
+      if (I->op == AGX_OPCODE_IADD && !ctx->key->dev.emit_agx3d &&
+          (I->shift == 0 || agx3c_shifted) &&
+          I->src[0].type == AGX_INDEX_NORMAL && I->src[1].type == AGX_INDEX_NORMAL &&
+          !(I->src[0].neg && I->src[1].neg))
          continue;
 
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
@@ -11064,8 +11081,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * want to vectorize first since nir_opt_load_store_vectorize doesn't know
     * how to handle our loads. Likewise for uniform atomic optimization.
     */
-   NIR_PASS(addr_progress, nir, agx_nir_lower_address, byte_indices, m5,
-            checked_offsets);
+   NIR_PASS(addr_progress, nir, agx_nir_lower_address, byte_indices || m5,
+            byte_indices || m5, checked_offsets);
 
    /* Now that loads carry an index, a select between two of them can choose
     * the index instead of the loaded data. Run it to a fixed point with the

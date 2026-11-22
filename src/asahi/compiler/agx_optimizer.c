@@ -1115,11 +1115,17 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
                            !(src.neg && other.neg) && (other_reg || other_imm);
       }
 
+      /* Unshifted, non-saturating register+register iadd/isub with a normal
+       * partner also takes sign-extended (plain) halves on AGX3B, which
+       * agx_lower_agx3_widening_int() then leaves to agx3_iadd_encode(). */
       if (ctx->key &&
           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
            agx_is_g18g(&ctx->key->dev)) &&
           def->src[0].size == AGX_SIZE_16 && src.size == AGX_SIZE_32 &&
-          ((I->op == AGX_OPCODE_IADD && !agx3b_zext_iadd) ||
+          ((I->op == AGX_OPCODE_IADD && !agx3b_zext_iadd &&
+            (I->saturate || I->shift != 0 || agx_is_g18g(&ctx->key->dev) ||
+             I->src[1 - s].type != AGX_INDEX_NORMAL ||
+             (I->src[0].neg && I->src[1].neg))) ||
            I->op == AGX_OPCODE_IMAD ||
            I->op == AGX_OPCODE_ICMP || I->op == AGX_OPCODE_ICMPSEL ||
            I->op == AGX_OPCODE_BFI || I->op == AGX_OPCODE_BFEIL ||
