@@ -725,3 +725,40 @@ TEST(M5PopcountIdiom, TreeAndMultiplyForms)
       ralloc_free(b.shader);
    }
 }
+
+/* Workgroups of one subgroup: shared-memory and execution-only barriers
+ * narrow to subgroup scope; device-memory barriers and larger workgroups
+ * keep workgroup scope. */
+static nir_intrinsic_instr *
+barrier_in(nir_builder *b, nir_variable_mode modes, mesa_scope memory)
+{
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = memory,
+               .memory_semantics = memory == SCOPE_NONE ? (nir_memory_semantics)0
+                                                         : NIR_MEMORY_ACQ_REL,
+               .memory_modes = modes);
+   return nir_instr_as_intrinsic(nir_block_last_instr(nir_cursor_current_block(b->cursor)));
+}
+
+TEST(M5NarrowBarriers, SingleSubgroupWorkgroup)
+{
+   for (unsigned width : {32u, 8u, 64u}) {
+      nir_builder b = compute_shader("narrow-barriers");
+      b.shader->info.workgroup_size[0] = width;
+      nir_intrinsic_instr *shared = barrier_in(&b, nir_var_mem_shared, SCOPE_WORKGROUP);
+      nir_intrinsic_instr *exec = barrier_in(&b, (nir_variable_mode)0, SCOPE_NONE);
+      nir_intrinsic_instr *device =
+         barrier_in(&b, (nir_variable_mode)(nir_var_mem_shared | nir_var_mem_global),
+                    SCOPE_WORKGROUP);
+      const bool narrows = width <= 32;
+      EXPECT_EQ(agx_nir_narrow_single_subgroup_barriers(b.shader), narrows);
+      nir_validate_shader(b.shader, "narrow barriers");
+      const mesa_scope expect = narrows ? SCOPE_SUBGROUP : SCOPE_WORKGROUP;
+      EXPECT_EQ(nir_intrinsic_execution_scope(shared), expect);
+      EXPECT_EQ(nir_intrinsic_memory_scope(shared), expect);
+      EXPECT_EQ(nir_intrinsic_execution_scope(exec), expect);
+      EXPECT_EQ(nir_intrinsic_memory_scope(exec), SCOPE_NONE);
+      EXPECT_EQ(nir_intrinsic_execution_scope(device), SCOPE_WORKGROUP);
+      EXPECT_EQ(nir_intrinsic_memory_scope(device), SCOPE_WORKGROUP);
+      ralloc_free(b.shader);
+   }
+}
