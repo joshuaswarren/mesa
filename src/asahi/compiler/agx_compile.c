@@ -17291,9 +17291,9 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
 
    /* Apple issues a loop body's samples in source order and consumes all of
     * them after the last one (native robust_loop witness); Mesa consumed each
-    * right after its sample. Geometry-side M5 stages, like the M5 copy-loop
+    * right after its sample. Geometry-side AGX3 stages, like the M5 copy-loop
     * schedule; see agx_nir_opt_sink_loop_sample_uses.c. */
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+   if (is_agx3 &&
        nir->info.stage != MESA_SHADER_FRAGMENT &&
        nir->info.stage != MESA_SHADER_COMPUTE) {
       NIR_PASS(_, nir, agx_nir_opt_sink_loop_sample_uses);
