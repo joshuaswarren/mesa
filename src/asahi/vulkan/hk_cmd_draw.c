@@ -11822,12 +11822,18 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             }
          }
          if (dev->dev.chip == AGX_CHIP_G17S) {
-            /* Native object->mesh kicks (native726 mesh-object, 0x1ca48
-             * bound) set tail[0]; task kicks with the native record do too,
-             * with or without the grid at +0 (the buffer stays bound).
-             * Payload-free task kicks without it keep the mesh-only value. */
-            if (task && hk_m5_task_record(dev->dev.params.features))
-               state.raw_tail[0] = 1;
+            /* Native object->mesh kicks with task mesh storage bound size
+             * tail[0] in 1 KiB payload slot units to cover the optional 16 B
+             * child-grid record plus the task payload. Payload-free task kicks
+             * without task mesh storage keep the mesh-only value. */
+            if (task && hk_m5_task_record(dev->dev.params.features)) {
+               if (!agx_vdm_m5_mesh_set_task_payload(
+                      &state, object->info.mesh.payload_size_B)) {
+                  vk_command_buffer_set_error(&cmd->vk,
+                                              VK_ERROR_FEATURE_NOT_PRESENT);
+                  return;
+               }
+            }
          }
          if (!agx_vdm_mesh_state_pack(dev->dev.chip, &state, out)) {
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
