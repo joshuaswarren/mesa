@@ -242,7 +242,8 @@ agx3_bind_compose(enum agx_isa_encoding encoding, enum agx3_mnemonic mnemonic,
       return true;
 
    if (ep == AGX3_BIND_APPLE_ORDER) {
-      form = agx3_compose_apple_order(t, mnemonic, fields, out);
+      form = agx3_compose_apple_order_known(t, mnemonic, fields, nonzero,
+                                            out);
       if (form < 0)
          return false;
    } else if (!agx3_compose_known(t, (uint32_t)form, fields, nonzero, out)) {

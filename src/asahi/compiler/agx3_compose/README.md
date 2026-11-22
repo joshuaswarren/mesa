@@ -26,6 +26,22 @@ of the generator checks the flags and the indexes it prints against the
 predicates, and `test/test-agx3-group-select.c` runs the encoder's selection
 in every exclusive group against the first alternative that holds.
 
+The generator also resolves what the encoder checks after its walk. For each
+node it prints the fields the node consumes and which of them a predicate or
+a LUT covers, and for each direct deposit the bits of the field that the
+node's direct deposits take. The encoder ORs the first over the nodes it
+applied, and tests a value against the second when it deposits it. That test
+looks at one node, so the generator refuses a description in which two nodes
+that one instruction can apply deposit the same field directly.
+
+The encoder does not test a row's shape when it applies it. The generator
+refuses a field id that no table has, a deposit that leaves its 16-bit word,
+and a form that reaches a deposit into a word beyond its size.
+
+Apple's encoder tries the forms of a mnemonic by ascending size, the entry
+point breaking ties. Each table lists its forms in that order as well
+(`apple_order`), for the callers that want Apple's choice.
+
 The descriptions were made once from the C tables that used to be checked
 in. Those repeated every choice group in every form that uses it. A
 description names each distinct group once and is otherwise the same data:

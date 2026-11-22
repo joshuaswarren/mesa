@@ -220,6 +220,15 @@ if with_tests
     )
   endforeach
 
+  # The generator refuses the rows the encoder applies without a test.
+  test(
+    'agx3_tables_refusals',
+    prog_python,
+    args : [files('test/test-gen-agx3-refusals.py'),
+            files('agx3_compose/gen_agx3_tables.py')],
+    suite : ['asahi'],
+  )
+
   # agx3_bind_compose()'s memo against the table walk, on every instruction
   # of the native witness texts.
   test(
