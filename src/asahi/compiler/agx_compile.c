@@ -10523,6 +10523,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    NIR_PASS(_, nir, agx_nir_lower_address, byte_indices, m5,
             checked_offsets);
 
+   /* Rows at (x + c) * uniform stride: one shared multiply-add, then an add
+    * of a preamble-uniform c * stride per row. */
+   if (m5 && !g18_scans)
+      NIR_PASS(_, nir, agx_nir_opt_uniform_stride);
+
    /* Now that loads carry an index, a select between two of them can choose
     * the index instead of the loaded data. Run it to a fixed point with the
     * cleanup below, so a chain of candidate selects collapses to one load.

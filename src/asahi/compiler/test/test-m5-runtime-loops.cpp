@@ -1026,3 +1026,58 @@ TEST(M5NarrowBarriers, Subgroup0Refusals)
       ralloc_free(b.shader);
    }
 }
+
+/* Rows at (t + c) * stride + y with a uniform stride: three rows in one
+ * block share t * stride + y and add a uniform c * stride each; a lone row
+ * and rows in different blocks are left alone. Values: exhaustive over a few
+ * wrapping inputs on the rewritten expression. */
+TEST(M5UniformStride, RowsShareTheirBase)
+{
+   for (unsigned shape = 0; shape < 3; ++shape) {
+      nir_builder b = compute_shader("uniform-stride");
+      nir_def *t = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *stride = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+      nir_def *y = nir_channel(&b, nir_load_local_invocation_id(&b), 1);
+      const unsigned rows = shape == 1 ? 1 : 3;
+      for (unsigned c = 1; c <= rows; ++c) {
+         if (shape == 2)
+            nir_push_if(&b, nir_ine_imm(&b, stride, c));
+         nir_def *index = nir_iadd(&b, nir_imul(&b, nir_iadd_imm(&b, t, c), stride), y);
+         nir_store_global(&b, index, buffer_address(&b, nir_ishl_imm(&b, index, 2)), .align_mul = 4);
+         if (shape == 2)
+            nir_pop_if(&b, NULL);
+      }
+      const bool expect = shape == 0;
+      EXPECT_EQ(agx_nir_opt_uniform_stride(b.shader), expect) << "shape " << shape;
+      nir_validate_shader(b.shader, "uniform stride");
+      ralloc_free(b.shader);
+   }
+
+   /* A later group whose x is a row of an earlier group (a 3D stencil's
+    * ((z + dz) * H + y) * W + x): both rewrite, the second from the first's
+    * new result (validation catches a use of the removed row). */
+   {
+      nir_builder b = compute_shader("uniform-stride-nested");
+      nir_def *id = nir_load_local_invocation_id(&b);
+      nir_def *z = nir_channel(&b, id, 0), *y = nir_channel(&b, id, 1), *x = nir_channel(&b, id, 2);
+      nir_def *H = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+      nir_def *W = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 32);
+      nir_def *r1 = nir_iadd(&b, nir_imul(&b, nir_iadd_imm(&b, z, 1), H), y);
+      nir_def *r2 = nir_iadd(&b, nir_imul(&b, nir_iadd_imm(&b, z, 2), H), y);
+      nir_def *q1 = nir_iadd(&b, nir_imul(&b, nir_iadd_imm(&b, r1, 1), W), x);
+      nir_def *q2 = nir_iadd(&b, nir_imul(&b, nir_iadd_imm(&b, r1, 2), W), x);
+      nir_def *sum = nir_iadd(&b, nir_iadd(&b, r2, q1), q2);
+      nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+      EXPECT_TRUE(agx_nir_opt_uniform_stride(b.shader));
+      nir_validate_shader(b.shader, "uniform stride nested");
+      ralloc_free(b.shader);
+   }
+
+   /* (t + c) * s + y == (t * s + y) + c * s in 32-bit wrapping arithmetic. */
+   static const uint32_t v[] = {0, 1, 7, 0x7fffffffu, 0x80000000u, 0xfffffff9u, 0xdeadbeefu};
+   for (uint32_t t : v)
+      for (uint32_t s : v)
+         for (uint32_t y : v)
+            for (uint32_t c = 1; c < 9; ++c)
+               ASSERT_EQ((uint32_t)((t + c) * s + y), (uint32_t)((t * s + y) + c * s));
+}
