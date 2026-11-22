@@ -5399,12 +5399,12 @@ zink_image_copy_buffer(struct pipe_context *pctx,
 {
    /* convert bytes to texels */
    struct pipe_resource *img = pdst->target != PIPE_BUFFER ? pdst : psrc;
-   unsigned stride = buffer_stride ?
+   unsigned stride = (box->height > 1 || box->depth > 1) && buffer_stride ?
                      buffer_stride / util_format_get_blocksize(img->format) * util_format_get_blockwidth(img->format) :
-                     util_format_get_nblocksx(img->format, box->width);
-   unsigned layer_stride = buffer_layer_stride ?
+                     0;
+   unsigned layer_stride = box->depth > 1 && buffer_layer_stride && buffer_stride ?
                            buffer_layer_stride / buffer_stride * util_format_get_blockheight(img->format) :
-                           util_format_get_nblocksy(img->format, box->height);
+                           0;
 
    zink_copy_image_buffer(zink_context(pctx), zink_resource(pdst), zink_resource(psrc),
                           buffer_offset, stride, layer_stride, level, box, 0);
