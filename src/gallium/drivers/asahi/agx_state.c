@@ -11717,18 +11717,7 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
       agx_link_varyings_vs_fs(t.cpu, &batch->linked_varyings, vs->uvs.user_size,
                               cf, rast->base.flatshade_first ? 0 : 2, 0,
                               &batch->generate_primitive_id);
-      /* G17G's varying table selects perspective-correct coefficients with
-       * shade model 5. AGX2's 7 sets them up linearly there, which only a
-       * per-vertex W exposes: a constant colour reads back as c * W, the
-       * shader's 1/W divide applied to an undivided coefficient (dEQP
-       * fill_rules.projected; gpu/persp1.c measures 5 exact, 7/3/1/4 not). */
-      struct agx_cf_binding_packed *bindings =
-         (void *)((uint8_t *)t.cpu + AGX_CF_BINDING_HEADER_LENGTH);
-      for (unsigned i = 0; i < cf->nr_bindings; ++i) {
-         if (cf->bindings[i].smooth && cf->bindings[i].perspective)
-            bindings[i].opaque[0] =
-               (bindings[i].opaque[0] & ~BITFIELD_RANGE(2, 3)) | (5u << 2);
-      }
+      agx_cf_bindings_select_perspective(t.cpu, cf);
       /* Varying Counts packs smooth at bit 0, flat at bit 8 and linear
        * (noperspective) at bit 16; the record below uses the same layout. */
       const unsigned interpolation_shift =
@@ -13053,6 +13042,7 @@ agx_encode_g17g_state(struct agx_batch *batch, uint8_t *out)
                                  ? rast->base.sprite_coord_enable
                                  : 0,
                               &batch->generate_primitive_id);
+      agx_cf_bindings_select_perspective(t.cpu, cf);
       if (!general_varyings) {
          /* Varying Counts packs smooth at bit 0, flat at bit 8 and linear
           * (noperspective) at bit 16; the record below uses the same
