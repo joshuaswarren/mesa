@@ -15,6 +15,7 @@ libasahi_agx_files = files(
   'agx_nir_lower_divmod64.c',
   'agx_nir_lower_atomics.c',
   'agx_nir_opt_flatten_loads.c',
+  'agx_nir_opt_shared_vec2.c',
   'agx_nir_unroll_runtime_loops.c',
   'agx_nir_narrow_barriers.c',
   'agx_nir_opt_uniform_stride.c',

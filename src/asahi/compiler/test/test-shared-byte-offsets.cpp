@@ -134,3 +134,97 @@ check_element_addend(bool bounded, unsigned addend, unsigned expected_base)
 TEST(SharedByteOffsets, NestedElementAddend) { check_element_addend(true, 18, 72); }
 TEST(SharedByteOffsets, NestedElementAddendTooLarge) { check_element_addend(true, 64, 0); }
 TEST(SharedByteOffsets, NestedElementAddendUnbounded) { check_element_addend(false, 18, 0); }
+
+enum class PairBoundary {
+   None,
+   WorkgroupScope,
+   ImmediateBase,
+   AliasingWrite,
+   Volatile,
+   Rendezvous,
+   ShortAllocation,
+   NarrowWrap,
+};
+
+static void
+shared_pair_case(PairBoundary boundary)
+{
+   nir_builder b = workgroup_shader("shared-vec2");
+   b.shader->info.shared_element_index_agx = true;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.shared_size = boundary == PairBoundary::ShortAllocation ? 32 : 128;
+   nir_def *id = nir_load_local_invocation_id(&b);
+   nir_def *x = nir_ishl_imm(&b, nir_channel(&b, id, 0), 1);
+   nir_def *low = nir_u2u16(&b, x);
+   const int high_base = boundary == PairBoundary::ImmediateBase ? 8 : 4;
+   nir_def *high = boundary == PairBoundary::ImmediateBase ? low :
+      nir_u2u16(&b, nir_iadd_imm(&b, x,
+         boundary == PairBoundary::NarrowWrap ? 65537 : 1));
+   auto fence = [&]() {
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                        .memory_scope = boundary == PairBoundary::WorkgroupScope ?
+                           SCOPE_WORKGROUP : SCOPE_DEVICE,
+                        .memory_semantics = NIR_MEMORY_ACQ_REL,
+                        .memory_modes = nir_var_mem_shared);
+   };
+
+   fence();
+   nir_def *a = nir_load_shared(&b, 1, 32, low, .base = 4, .align_mul = 4);
+   if (boundary == PairBoundary::AliasingWrite)
+      nir_store_shared(&b, nir_imm_int(&b, 41), high, .base = 4, .align_mul = 4);
+   if (boundary == PairBoundary::Rendezvous)
+      fence();
+   nir_def *c = nir_load_shared(&b, 1, 32, high, .base = high_base, .align_mul = 4);
+   if (boundary == PairBoundary::Volatile)
+      nir_intrinsic_set_access(nir_def_as_intrinsic(c), ACCESS_VOLATILE);
+   fence();
+   nir_def *sum = nir_iadd(&b, a, c);
+   nir_store_shared(&b, sum, low, .align_mul = 4);
+
+   const bool expect = boundary == PairBoundary::None ||
+                       boundary == PairBoundary::WorkgroupScope ||
+                       boundary == PairBoundary::ImmediateBase;
+   nir_divergence_analysis(b.shader);
+   ASSERT_EQ(agx_nir_opt_shared_vec2(b.shader), expect);
+   nir_validate_shader(b.shader, "shared-vec2 result");
+
+   unsigned scalar = 0, vector = 0;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_shared)
+               continue;
+            scalar += intr->def.num_components == 1;
+            vector += intr->def.num_components == 2;
+            if (intr->def.num_components == 2) {
+               EXPECT_EQ(intr->src[0].ssa, low);
+               EXPECT_EQ(nir_intrinsic_base(intr), 4u);
+            }
+         }
+      }
+   }
+
+   EXPECT_EQ(scalar, expect ? 0u : 2u);
+   EXPECT_EQ(vector, expect ? 1u : 0u);
+   if (expect) {
+      nir_scalar a = nir_scalar_chase_alu_src(nir_get_scalar(sum, 0), 0);
+      nir_scalar c = nir_scalar_chase_alu_src(nir_get_scalar(sum, 0), 1);
+      EXPECT_EQ(a.def, c.def);
+      EXPECT_EQ(a.comp, 0u);
+      EXPECT_EQ(c.comp, 1u);
+   }
+   ralloc_free(b.shader);
+}
+
+TEST(SharedVec2, OddWordAddress) { shared_pair_case(PairBoundary::None); }
+TEST(SharedVec2, WorkgroupBarrier) { shared_pair_case(PairBoundary::WorkgroupScope); }
+TEST(SharedVec2, AliasingWrite) { shared_pair_case(PairBoundary::AliasingWrite); }
+TEST(SharedVec2, Rendezvous) { shared_pair_case(PairBoundary::Rendezvous); }
+TEST(SharedVec2, AllocationBound) { shared_pair_case(PairBoundary::ShortAllocation); }
+TEST(SharedVec2, NarrowWrap) { shared_pair_case(PairBoundary::NarrowWrap); }
+TEST(SharedVec2, MixedAddressUnits) { shared_pair_case(PairBoundary::ImmediateBase); }
+TEST(SharedVec2, VolatileRead) { shared_pair_case(PairBoundary::Volatile); }
+
