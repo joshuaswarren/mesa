@@ -1335,6 +1335,44 @@ test_compute_pair_stream_safety(void)
 
    cs = base; cs.type = HK_CS_VDM;
    T("compute_pair rejects non-CDM stream", !hk_compute_pair_stream_eligible(&cs));
+
+   /* Self-copy & shifted-overlap safety checks for identity_copy4 kinds. */
+   struct hk_storage_backing b_same[3] = {
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+      {0},
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+   };
+   bool same = false;
+   /* LINEAR_OFFSET shifted overlap on same BO (so != doff) must be rejected. */
+   T("copy4 rejects LINEAR_OFFSET shifted overlap",
+     !hk_copy4_classify_intervals(false, 1, b_same, 0, 64, 256, &same));
+   /* Same BO offset with aliased/mismatched VA must be rejected. */
+   struct hk_storage_backing b_va_diff[3] = {
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+      {0},
+      {.handle = 7, .offset = 0x1000, .address = 0x200000},
+   };
+   T("copy4 rejects same-BO aliased VA self-copy",
+     !hk_copy4_classify_intervals(false, 1, b_va_diff, 0, 0, 256, &same));
+   /* IM2COL_1X1 in-place (stride=1, kw==channels identity) classifies as self-copy. */
+   same = false;
+   T("copy4 accepts IM2COL_1X1 exact in-place as self-copy",
+     hk_copy4_classify_intervals(false, 1, b_same, 0, 0, 256, &same) && same);
+   /* IM2COL_1X1 shifted overlap on same BO must be rejected. */
+   T("copy4 rejects IM2COL_1X1 shifted overlap",
+     !hk_copy4_classify_intervals(false, 1, b_same, 0, 64, 256, &same));
+   /* LINEAR_FADD (nsrc==2) in-place is allowed but NEVER classified as self-copy. */
+   struct hk_storage_backing b_fadd[3] = {
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+      {.handle = 8, .offset = 0x2000, .address = 0x200000},
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+   };
+   same = true;
+   T("copy4 accepts LINEAR_FADD in-place without self-copy",
+     hk_copy4_classify_intervals(true, 2, b_fadd, 0, 0, 256, &same) && !same);
+   /* LINEAR_FADD shifted overlap on same BO must be rejected. */
+   T("copy4 rejects LINEAR_FADD shifted overlap",
+     !hk_copy4_classify_intervals(true, 2, b_fadd, 0, 64, 256, &same));
 }
 
 int

@@ -2969,6 +2969,10 @@ hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    record.root_va = desc->uploaded_root.gpu;
    memcpy(record.root_sets, desc->root.sets, sizeof(record.root_sets));
    memcpy(record.push, desc->root.push, sizeof(record.push));
+   record.cs_group_count_addr = desc->root.cs.group_count_addr;
+   memcpy(record.cs_base_group, desc->root.cs.base_group,
+          sizeof(record.cs_base_group));
+   record.printf_buffer_address = desc->root.printf_buffer_address;
    if (selected == api->depthwise_vec4)
       record.alt_kind = HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4;
    else if (selected == api->gemm_cmat16)
@@ -3329,26 +3333,6 @@ hk_intervals_disjoint(const struct hk_storage_backing *a, uint64_t a_start, uint
 }
 
 static bool
-hk_copy4_intervals_safe(const struct hk_storage_backing *src, uint64_t src_start,
-                        const struct hk_storage_backing *dst, uint64_t dst_start,
-                        uint64_t bytes, bool allow_exact_inplace)
-{
-   const uint64_t s_bo0 = src->offset + src_start, s_bo1 = s_bo0 + bytes;
-   const uint64_t d_bo0 = dst->offset + dst_start, d_bo1 = d_bo0 + bytes;
-   const uint64_t s_va0 = src->address + src_start, s_va1 = s_va0 + bytes;
-   const uint64_t d_va0 = dst->address + dst_start, d_va1 = d_va0 + bytes;
-
-   if (allow_exact_inplace &&
-       src->handle == dst->handle && s_bo0 == d_bo0 && s_va0 == d_va0)
-      return true;
-
-   const bool bo_overlap =
-      src->handle == dst->handle && s_bo0 < d_bo1 && d_bo0 < s_bo1;
-   const bool va_overlap = s_va0 < d_va1 && d_va0 < s_va1;
-   return !bo_overlap && !va_overlap;
-}
-
-static bool
 hk_check_storage_backing(const struct hk_descriptor_state *desc,
                          unsigned set, unsigned binding,
                          uint64_t start, uint64_t bytes, unsigned align,
@@ -3474,9 +3458,53 @@ hk_select_im2col_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
    return alt;
 }
 
+struct hk_copy4_dispatch_cert {
+   enum hk_compute_pair_role role;
+   struct hk_storage_backing bindings[3];
+   union {
+      struct hk_compute_pair_copy4 copy4;
+      struct hk_compute_pair_pad4 pad4;
+   } extra;
+};
+
+static void
+hk_record_copy4_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                     const struct hk_copy4_dispatch_cert *cert,
+                     const uint32_t orig_groups[3], struct agx_grid exec_grid)
+{
+   if (!cert || cert->role == HK_COMPUTE_PAIR_NONE || cs->compute_pair ||
+       cs->stats.cmds != 1 || cs->stream_linked ||
+       vk_command_buffer_has_error(&cmd->vk) || cmd->in_meta ||
+       exec_grid.mode != AGX_CDM_MODE_DIRECT ||
+       cmd->state.compute_pair_simultaneous ||
+       cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+      return;
+
+   const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
+   if (desc->root.cs.base_group[0] || desc->root.cs.base_group[1] ||
+       desc->root.cs.base_group[2])
+      return;
+
+   struct hk_compute_pair_dispatch *record = calloc(1, sizeof(*record));
+   if (!record)
+      return;
+   record->info.role = cert->role;
+   if (cert->role == HK_COMPUTE_PAIR_PAD4) {
+      record->extra.pad4 = cert->extra.pad4;
+      memcpy(record->bindings, cert->bindings, 3 * sizeof(record->bindings[0]));
+   } else {
+      record->extra.copy4 = cert->extra.copy4;
+      memcpy(record->bindings, cert->bindings, 2 * sizeof(record->bindings[0]));
+   }
+   memcpy(record->groups, orig_groups, sizeof(record->groups));
+   memcpy(record->exec_threads, exec_grid.count, sizeof(record->exec_threads));
+   cs->compute_pair = record;
+}
+
 static struct hk_shader *
 hk_select_identity_copy4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
-                         struct hk_shader *normal, struct agx_grid *grid)
+                         struct hk_shader *normal, struct agx_grid *grid,
+                         struct hk_copy4_dispatch_cert *cert_out)
 {
    struct hk_shader *copy = api->identity_copy4;
    const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
@@ -3546,6 +3574,23 @@ hk_select_identity_copy4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
       const uint64_t out_y = (uint64_t)(uint32_t)out_s[0] * (uint32_t)out_s[1];
       if (out_x > UINT32_MAX || out_y > UINT32_MAX)
          return normal;
+      if (cert_out) {
+         *cert_out = (struct hk_copy4_dispatch_cert){
+            .role = HK_COMPUTE_PAIR_PAD4,
+            .bindings = {src_b, pad_b, dst_b},
+            .extra.pad4 = {
+               .in_shape = {(uint32_t)in_s[0], (uint32_t)in_s[1],
+                            (uint32_t)in_s[2], (uint32_t)in_s[3]},
+               .out_shape = {(uint32_t)out_s[0], (uint32_t)out_s[1],
+                             (uint32_t)out_s[2], (uint32_t)out_s[3]},
+               .pad_idx = {info->pad_idx[0], info->pad_idx[1],
+                           info->pad_idx[2], info->pad_idx[3]},
+               .in_bytes = in_bytes,
+               .out_bytes = out_bytes,
+               .pad_bytes = pad_bytes,
+            },
+         };
+      }
       grid->count[0] = DIV_ROUND_UP((uint32_t)out_x, copy->b.info.workgroup_size[0]);
       grid->count[1] = DIV_ROUND_UP((uint32_t)out_y, copy->b.info.workgroup_size[1]);
       grid->count[2] = 1;
@@ -3606,16 +3651,25 @@ hk_select_identity_copy4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
          return normal;
    }
 
-   const bool allow_inplace =
-      (info->kind == HK_IDENTITY_COPY4_LINEAR_COPY ||
-       info->kind == HK_IDENTITY_COPY4_LINEAR_FADD);
-   if (!hk_copy4_intervals_safe(&backings[0], src_start, &backings[2], dst_start,
-                                bytes, allow_inplace))
+   const bool kind_allows_inplace =
+      info->kind == HK_IDENTITY_COPY4_LINEAR_COPY ||
+      info->kind == HK_IDENTITY_COPY4_LINEAR_FADD;
+   bool same_src0_dst = false;
+   if (!hk_copy4_classify_intervals(kind_allows_inplace, nsrc, backings, src_start,
+                                    dst_start, bytes, &same_src0_dst))
       return normal;
-   if (nsrc == 2 &&
-       !hk_copy4_intervals_safe(&backings[1], src_start, &backings[2], dst_start,
-                                bytes, allow_inplace))
-      return normal;
+
+   if (cert_out && nsrc == 1) {
+      *cert_out = (struct hk_copy4_dispatch_cert){
+         .role = same_src0_dst ? HK_COMPUTE_PAIR_SELF_COPY : HK_COMPUTE_PAIR_COPY4,
+         .bindings = {backings[0], backings[2]},
+         .extra.copy4 = {
+            .src_start = src_start,
+            .dst_start = dst_start,
+            .bytes = bytes,
+         },
+      };
+   }
 
    /* Flattened 1D vec4 grid: each invocation transfers up to 4 coalesced vec4s. */
    const uint32_t total_vec4 = (uint32_t)(bytes / 16);
@@ -3961,8 +4015,17 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
    }
 
    struct hk_shader *selected = s;
+   struct hk_copy4_dispatch_cert copy4_cert = {.role = HK_COMPUTE_PAIR_NONE};
    if (api && api->identity_copy4 && !api->compute_pair_producer && !in_threads && !invocation_stat) {
-      selected = hk_select_identity_copy4(cmd, api, s, &grid);
+      selected = hk_select_identity_copy4(cmd, api, s, &grid, &copy4_cert);
+      /* Record-time no-op self-copy elision: runs after
+       * hk_cs_invalidate_compute_pair() and is skipped whenever pipeline stats
+       * (invocation_stat), conditional rendering (indirect grid), base_group,
+       * or secondary CBs are active. Any preceding/following barriers remain in
+       * the stream; cs->stats.calls++ and frame-anatomy accounting are skipped
+       * here by design since no CDM dispatch is emitted. */
+      if (copy4_cert.role == HK_COMPUTE_PAIR_SELF_COPY && cs->stats.cmds > 0)
+         return;
       local_size = agx_workgroup(selected->b.info.workgroup_size[0],
                                  selected->b.info.workgroup_size[1],
                                  selected->b.info.workgroup_size[2]);
@@ -4010,6 +4073,9 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
         selected == api->gemm_cmat16 || selected == api->gemm_cmat32 ||
         selected == api->gemm_cmat64))
       hk_record_compute_pair(cmd, cs, api, selected, orig_groups, grid);
+   else if (!in_threads && !invocation_stat &&
+            copy4_cert.role != HK_COMPUTE_PAIR_NONE)
+      hk_record_copy4_pair(cmd, cs, &copy4_cert, orig_groups, grid);
    cs->uses_global_atomics |= selected->b.info.uses_global_atomics;
    cs->pack_loops |= selected->b.info.has_loops;
    if (agx_is_indirect(grid)) {

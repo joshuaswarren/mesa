@@ -8372,9 +8372,14 @@ struct hk_shader *
 hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
                                      struct hk_compute_pair_producer *prod,
                                      const struct hk_nir_clamp_epilogue *epilogue,
-                                     enum hk_compute_pair_alt_kind alt_kind)
+                                     enum hk_compute_pair_alt_kind alt_kind,
+                                     enum hk_compute_pair_dual_write dual_write)
 {
-   if (!dev || !prod || !prod->nir || !hk_nir_clamp_epilogue_valid(epilogue))
+   if (!dev || !prod || !prod->nir)
+      return NULL;
+   if (!epilogue && dual_write == HK_COMPUTE_PAIR_DUAL_NONE)
+      return NULL;
+   if (epilogue && !hk_nir_clamp_epilogue_valid(epilogue))
       return NULL;
    if (prod->info.role != HK_COMPUTE_PAIR_DEPTHWISE &&
        prod->info.role != HK_COMPUTE_PAIR_GEMM)
@@ -8390,12 +8395,18 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
         !prod->info.gemm.cmat_valid ||
         !agx_chip_cooperative_matrix_supported(dev->dev.chip)))
       return NULL;
+   if (dual_write != HK_COMPUTE_PAIR_DUAL_NONE &&
+       alt_kind == HK_COMPUTE_PAIR_ALT_NONE)
+      return NULL;
 
+   const bool has_ep = epilogue != NULL;
    simple_mtx_lock(&prod->lock);
    for (uint32_t i = 0; i < prod->variant_count; ++i) {
       const struct hk_compute_pair_variant *v = &prod->variants[i];
       if (v->alt_kind == alt_kind &&
-          hk_nir_clamp_epilogue_equal(&v->epilogue, epilogue)) {
+          v->dual_write == dual_write &&
+          v->has_epilogue == has_ep &&
+          (!has_ep || hk_nir_clamp_epilogue_equal(&v->epilogue, epilogue))) {
          struct hk_shader *cached = v->shader;
          simple_mtx_unlock(&prod->lock);
          return cached;
@@ -8409,17 +8420,17 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
    nir_shader *fused_nir = NULL;
    if (alt_kind == HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4) {
       fused_nir = hk_nir_build_depthwise_vec4(prod->nir, &prod->info.depthwise,
-                                              epilogue);
+                                              epilogue, dual_write);
    } else if (alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16) {
       fused_nir = hk_nir_build_gemm_cmat(prod->nir, &prod->info.gemm, 16,
-                                         epilogue);
+                                         epilogue, dual_write);
    } else if (alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32) {
       fused_nir = hk_nir_build_gemm_cmat(prod->nir, &prod->info.gemm, 32,
-                                         epilogue);
+                                         epilogue, dual_write);
    } else if (alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64) {
       fused_nir = hk_nir_build_gemm_cmat(prod->nir, &prod->info.gemm, 64,
-                                         epilogue);
-   } else {
+                                         epilogue, dual_write);
+   } else if (has_ep) {
       const struct hk_nir_clamp_buffer out_buf =
          prod->info.role == HK_COMPUTE_PAIR_DEPTHWISE ? prod->info.depthwise.output
                                                       : prod->info.gemm.output;
@@ -8440,11 +8451,15 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
                                           prod->features, fused_nir);
    }
 
-   prod->variants[prod->variant_count++] = (struct hk_compute_pair_variant){
-      .epilogue = *epilogue,
+   struct hk_compute_pair_variant var = {
+      .has_epilogue = has_ep,
       .alt_kind = alt_kind,
+      .dual_write = dual_write,
       .shader = shader,
    };
+   if (has_ep)
+      var.epilogue = *epilogue;
+   prod->variants[prod->variant_count++] = var;
    simple_mtx_unlock(&prod->lock);
    return shader;
 }
@@ -8617,18 +8632,18 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                if (pair.role == HK_COMPUTE_PAIR_DEPTHWISE &&
                    pair.depthwise.vec4_valid) {
                   depthwise_vec4_nir =
-                     hk_nir_build_depthwise_vec4(nir, &pair.depthwise, NULL);
+                     hk_nir_build_depthwise_vec4(nir, &pair.depthwise, NULL, HK_COMPUTE_PAIR_DUAL_NONE);
                } else if (pair.role == HK_COMPUTE_PAIR_GEMM &&
                           pair.gemm.cmat_valid &&
                           agx_chip_cooperative_matrix_supported(dev->dev.chip)) {
                   if (pair.gemm.is_guarded) {
                      gemm_cmat16_nir =
-                        hk_nir_build_gemm_cmat(nir, &pair.gemm, 16, NULL);
+                        hk_nir_build_gemm_cmat(nir, &pair.gemm, 16, NULL, HK_COMPUTE_PAIR_DUAL_NONE);
                   }
                   gemm_cmat32_nir =
-                     hk_nir_build_gemm_cmat(nir, &pair.gemm, 32, NULL);
+                     hk_nir_build_gemm_cmat(nir, &pair.gemm, 32, NULL, HK_COMPUTE_PAIR_DUAL_NONE);
                   gemm_cmat64_nir =
-                     hk_nir_build_gemm_cmat(nir, &pair.gemm, 64, NULL);
+                     hk_nir_build_gemm_cmat(nir, &pair.gemm, 64, NULL, HK_COMPUTE_PAIR_DUAL_NONE);
                }
             }
          }
