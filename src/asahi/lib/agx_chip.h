@@ -220,6 +220,9 @@ enum agx_chip_quirk {
    AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS = 1 << 7,
    AGX_QUIRK_IMAGE_LOAD_MISSES_OWN_STORE = 1 << 8,
    AGX_QUIRK_INEXACT_FMA32 = 1 << 9,
+   /* Hardware-qualified HAL200/AGX3B/GPU0 Ioto CProg + preamble (G16G, G17P);
+    * G15* uses RTKit 2419 (G15 CS gen, no CDM TI spill field) and is not
+    * qualified here. */
    AGX_QUIRK_NATIVE_PREAMBLE = 1 << 10,
    AGX_QUIRK_SCHEDULING_STALLS = 1 << 11,
    AGX_QUIRK_M5_PATHS = 1 << 12,
@@ -312,7 +315,7 @@ enum agx_chip_quirk {
      __VA_ARGS__)                                                              \
    X(G16G, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, CLASSIC, NATIVE_AGX3,    \
      AGX_RECORDS_G15_G17 | AGX_RECORD_CDM_BARRIER_WIDE_VISIBILITY,             \
-     AGX_QUIRKS_NATIVE_PRE_G17, __VA_ARGS__)                                   \
+     AGX_QUIRKS_NATIVE_PRE_G17 | AGX_QUIRK_NATIVE_PREAMBLE, __VA_ARGS__)       \
    X(G16S, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, DUAL, NONE,              \
      AGX_RECORDS_G15_G17, 0, __VA_ARGS__)                                      \
    X(G16C, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, DUAL, NONE,              \
@@ -1041,8 +1044,13 @@ agx_chip_sampler_has_lod_bias(enum agx_chip chip)
 
 /*
  * Whether native shaders may carry an Ioto constant program (CProg) and a
- * shader preamble.  Only the G17P Ioto preamble sequence is qualified; other
- * native chips compile every stage with no_preamble.
+ * shader preamble.  G16G and G17P share HAL200 (cs_generation = HAL200,
+ * sampler_generation = GEN4_HAL200), AGX3B, and GPU0 Ioto and are both
+ * hardware-qualified for native CProg.  G15* uses the older G15 (RTKit 2419)
+ * command-stream generation (its direct CDM launch has no TI spill field for
+ * agx_chip_query_ti_spill(), and native preambles have not been hardware-
+ * qualified on M3/J615), so G15* remains excluded and compiles every stage
+ * with no_preamble.
  */
 static inline bool
 agx_chip_native_preamble(enum agx_chip chip)
