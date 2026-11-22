@@ -286,6 +286,73 @@ libagx_m5_decompress_rgba16f(global void *texture_heap,
       metadata[index_tl] = ~(uint64_t)0;
 }
 
+/* Native G17P single-sample 16-byte/texel (R32G32B32A32) in-place spill
+ * decompression. Each 32-thread workgroup covers one 16x16 metadata tile
+ * (8 texels per thread), reading through the view's compressed 2D-array
+ * eMRT texture descriptor before overwriting the twiddled body and marking
+ * the metadata tile uncompressed.
+ */
+KERNEL(32)
+libagx_g17p_decompress_16b(global void *texture_heap,
+                           global void *sampler_heap,
+                           global uint64_t *metadata,
+                           global uint4 *body,
+                           uint64_t tile_uncompressed,
+                           uint read_index,
+                           uint metadata_layer_stride_tl,
+                           uint body_layer_stride_el,
+                           uint metadata_width_tl,
+                           uint metadata_height_tl,
+                           uint level_width_px,
+                           uint level_height_px,
+                           uint aligned_width_px,
+                           ushort tile_width_px,
+                           ushort tile_height_px)
+{
+   const uint index_tl = index_metadata(cl_group_id, metadata_width_tl,
+                                        metadata_height_tl,
+                                        metadata_layer_stride_tl);
+   if (metadata[index_tl] == tile_uncompressed)
+      return;
+
+   const uint handle = nir_bindless_image_agx(read_index, 0);
+   const uint2 origin = cl_group_id.xy * 16u;
+   const uint layer = cl_group_id.z;
+   const uint2 lane = (uint2)((cl_local_id.x & 1u) * 8u,
+                              cl_local_id.x >> 1);
+   const uint y = origin.y + lane.y;
+   uint4 values[8];
+   for (uint i = 0; i < 8; i++) {
+      const uint x = origin.x + lane.x + i;
+      if (x < level_width_px && y < level_height_px) {
+         const int4 coord = (int4)(x, y, layer, 0);
+         values[i] = nir_bindless_image_load(
+            handle, coord, 0, 0, GLSL_SAMPLER_DIM_2D, true, 0,
+            ACCESS_IN_BOUNDS, nir_type_uint32);
+      }
+   }
+
+   barrier(CLK_LOCAL_MEM_FENCE);
+
+   for (uint i = 0; i < 8; i++) {
+      const uint x = origin.x + lane.x + i;
+      if (x < level_width_px && y < level_height_px) {
+         const uint offset = libagx_twiddle_coordinates(
+            (ushort2)(x, y), tile_width_px, tile_height_px,
+            aligned_width_px);
+         body[layer * body_layer_stride_el + offset] = values[i];
+      }
+   }
+
+   atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE | CLK_IMAGE_MEM_FENCE,
+                          memory_order_acq_rel, memory_scope_device);
+   barrier(CLK_LOCAL_MEM_FENCE);
+   if (cl_local_id.x == 0)
+      metadata[index_tl] = tile_uncompressed;
+   atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE | CLK_IMAGE_MEM_FENCE,
+                          memory_order_acq_rel, memory_scope_device);
+}
+
 /*
  * Compute kernel to clear a compressed image to a solid colour by filling the
  * compression metadata to all solid and writing the colour to each tile.

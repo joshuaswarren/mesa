@@ -22,16 +22,18 @@
  * whose every write path in hk goes through one of those three units or the
  * libagx_fast_clear metadata kernel:
  *
- *  - Color: single-plane, 1-8 byte texels, one layer, one sample. Layered
- *    and multisampled compressed PBE packets are refused by
- *    agx_pbe_agx3_core.c (no witness), so arrays/MSAA stay plain. 16-byte
- *    texels are excluded so that a single-sample tilebuffer never spills a
- *    compressed target (spilling needs libagx_decompress, which has no G17P
- *    binary): 8 targets x 8 B fit in the 120 B/sample G17P budget.
+ *  - Color: single-plane, 1-8 byte texels, one layer, one sample, plus on
+ *    A18 Pro (AGX_CHIP_ID_A18_PRO, measured) 16-byte texels
+ *    (R32G32B32A32_{UINT,SINT,SFLOAT}), one layer, one sample. Layered and
+ *    multisampled compressed PBE packets are refused by agx_pbe_agx3_core.c
+ *    (no witness), so arrays/MSAA stay plain. 1-8 byte targets never spill
+ *    (8 x 8 B <= 120 B/sample); a spilled single-sample 16-byte target is
+ *    decompressed in-place before the render pass via
+ *    libagx_g17p_decompress_16b / libagx_reset_compression_metadata.
  *  - Colour at 2x where a 2x reload keeps the whole sample
  *    (!agx_chip_uncovered_tile_ms_reload_defect(chip, chip_id, 2): M4 Pro
  *    and M4 Max): also colour attachments of one level and one layer. G17P
- *    cannot spill a compressed target; at 2x the tile holds 64 bytes a
+ *    has no MSAA/1-8 B decompression program; at 2x the tile holds 64 bytes a
  *    sample, so the eight bytes-at-most targets, allocated first
  *    (hk_resident_attachments()), always stay in it, and a reload does not
  *    make them spill.
@@ -143,6 +145,23 @@ hk_g17p_compression_color_format(VkFormat format)
    }
 }
 
+/* 16-byte colour formats admitted on G17P for single-sample, single-layer 2D
+ * private images. Kept separate from hk_g17p_compression_color_format() so
+ * 2x MSAA, layered/3D, shared-modifier and M5 policies keep their 1-8 byte
+ * format set unchanged. */
+static inline bool
+hk_g17p_compression_color_format_16b(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_R32G32B32A32_UINT:
+   case VK_FORMAT_R32G32B32A32_SINT:
+   case VK_FORMAT_R32G32B32A32_SFLOAT:
+      return true;
+   default:
+      return false;
+   }
+}
+
 static inline bool
 hk_g17p_compression_depth_format(VkFormat format)
 {
@@ -180,12 +199,20 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
     * attachments stay plain on every G17P SoC: a 4x reload loses the upper
     * bytes of a wide sample (agx_chip_uncovered_tile_ms_reload_defect(chip,
     * chip_id, 4)), so a pass that reloads them spills them, and G17P has no
-    * decompression for a spilled compressed target. */
+    * MSAA/1-8 B decompression program for a spilled compressed target. */
    const bool ms2x =
       !agx_chip_uncovered_tile_ms_reload_defect(chip, chip_id, 2);
+   /* 16-byte colour (single-sample, single-layer 2D): measured on A18 Pro
+    * (T8140). M4 Pro and M4 Max share the same HAL200 PBE, texture and
+    * compression metadata encoding; missing there is a hardware run of the
+    * 16-byte formats and their 8-MRT spill decompression path. */
+   const bool color_16b =
+      chip_id == AGX_CHIP_ID_A18_PRO &&
+      hk_g17p_compression_color_format_16b(info->format);
    /* Not B10G11R11_UFLOAT: a compressed tile of its class reads NaN back as
     * zero, and a render or copy into the attachment must keep NaN. */
-   const bool color = hk_g17p_compression_color_format(info->format);
+   const bool color_1_8b = hk_g17p_compression_color_format(info->format);
+   const bool color = color_1_8b || color_16b;
    const bool depth = hk_g17p_compression_depth_format(info->format);
 
    /* Shared images keep their plain layout contract. Read each header field
@@ -213,9 +240,9 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
    VkImageCreateFlags allowed_flags =
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
       VK_IMAGE_CREATE_ALIAS_BIT;
-   if (color && info->imageType == VK_IMAGE_TYPE_2D)
+   if (color_1_8b && info->imageType == VK_IMAGE_TYPE_2D)
       allowed_flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-   if (color && info->imageType == VK_IMAGE_TYPE_3D)
+   if (color_1_8b && info->imageType == VK_IMAGE_TYPE_3D)
       allowed_flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
                        VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
    /* Zink marks every depth attachment sample-location compatible, including
@@ -273,6 +300,10 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
       return depth && info->mipLevels == 1;
    }
 
+   /* 16-byte texels stay on the single-sample, single-layer 2D shape. */
+   if (color_16b && (three_d || multisampled || info->arrayLayers != 1))
+      return false;
+
    if ((info->imageType != VK_IMAGE_TYPE_2D && !three_d) ||
        !info->extent.depth || !info->arrayLayers ||
        (three_d ? (info->arrayLayers != 1 || multisampled)
@@ -293,9 +324,9 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
    if ((three_d || info->arrayLayers > 1) && info->mipLevels != 1)
       return false;
    /* #66: a legal MRT mix can spill any MSAA colour attachment, and G17P
-    * has no decompression for a spilled compressed one. Only a 2x
-    * single-layer attachment on a SoC without the 2x uncovered-tile reload
-    * defect always stays in the tilebuffer (see the policy above); 4x,
+    * has no MSAA/1-8 B decompression program for a spilled compressed one.
+    * Only a 2x single-layer attachment on a SoC without the 2x uncovered-tile
+    * reload defect always stays in the tilebuffer (see the policy above); 4x,
     * arrays, and chips with the 2x reload defect stay plain. */
    if (multisampled &&
        (info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |

@@ -3559,10 +3559,10 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
  * Compressed multisample targets are at most eight bytes, so all eight fit
  * the 4x sample budget (64 bytes) and do not spill when allocated first.
  *
- * G17P cannot spill a compressed target at all (no decompression program),
- * and compresses multisample colour only at 2x on M4 Pro. A 2x tile holds
- * 64 bytes a sample (32 KiB over 16x16 pixels), so allocated first they fit
- * too.
+ * G17P cannot spill a compressed MSAA/1-8 B target (no MSAA/1-8 B
+ * decompression program), and compresses multisample colour only at 2x on M4
+ * Pro. A 2x tile holds 64 bytes a sample (32 KiB over 16x16 pixels), so
+ * allocated first they fit too.
  *
  * A multiview pass has an eight-byte budget, so over that it would spill one:
  * 2x colour is not compressed on a device with the multiview feature
@@ -5078,29 +5078,81 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
 
                perf_debug(cmd, "Decompressing in-place");
 
-               /* libagx_decompress has no G17P binary. G17P compresses 1-8
-                * byte colour targets, single-sample or 2x on M4 Pro (not with
-                * multiview), which hk_resident_attachments() keeps in the
-                * tilebuffer, so this is unreachable; fail closed with a
-                * diagnostic rather than a NULL program. */
-               if (dev->dev.chip == AGX_CHIP_G17P) {
-                  mesa_loge_once("G17P: spilled render pass with a compressed "
-                                 "attachment (%s) is unsupported",
-                                 util_format_short_name(layout->format));
-                  vk_command_buffer_set_error(&cmd->vk,
-                                              VK_ERROR_FEATURE_NOT_PRESENT);
-                  return;
-               }
-
                unsigned level = view->vk.base_mip_level;
                unsigned layer = view->vk.base_array_layer;
                uint64_t base = hk_image_base_address(image, image_plane);
+               const uint16_t width_tl = ail_metadata_width_tl(layout, level);
+               const uint16_t height_tl = ail_metadata_height_tl(layout, level);
 
                struct agx_grid grid =
-                  agx_3d(ail_metadata_width_tl(layout, level) * 32,
-                         ail_metadata_height_tl(layout, level), layer_count);
+                  agx_3d(width_tl * 32, height_tl, layer_count);
 
-               if (agx_chip_g17_m5(dev->dev.chip)) {
+               const VkAttachmentLoadOp load_op =
+                  pRenderingInfo->pColorAttachments[i].loadOp;
+               const bool discard =
+                  !incomplete_render_area &&
+                  u_minify(image->vk.extent.width, level) ==
+                     render->cr.width &&
+                  u_minify(image->vk.extent.height, level) ==
+                     render->cr.height &&
+                  (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
+                   load_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
+
+               if (dev->dev.chip == AGX_CHIP_G17P) {
+                  /* A resumed dynamic render pass preserves pixels rendered by
+                   * the suspended pass even when the attachment's loadOp is
+                   * CLEAR or DONT_CARE, so never drop existing tiles there. */
+                  const bool g17p_discard =
+                     discard &&
+                     !(pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT);
+                  const uint32_t read_index =
+                     view->planes[plane].emrt_read_heap_index;
+                  if (layout->sample_count_sa != 1 ||
+                      ail_get_blocksize_B(layout) != 16 ||
+                      (layout->layer_stride_B % 16) != 0 ||
+                      (!g17p_discard &&
+                       (!dev->sampled_images.base_va ||
+                        !dev->samplers.table.bo ||
+                        !read_index ||
+                        read_index >= dev->sampled_images.alloc))) {
+                     mesa_loge_once("G17P: spilled render pass with a compressed "
+                                    "attachment (%s, %ux) is unsupported",
+                                    util_format_short_name(layout->format),
+                                    layout->sample_count_sa);
+                     vk_command_buffer_set_error(&cmd->vk,
+                                                 VK_ERROR_FEATURE_NOT_PRESENT);
+                     return;
+                  }
+
+                  const uint64_t metadata =
+                     base + layout->metadata_offset_B +
+                     layout->level_offsets_compressed_B[level] +
+                     (layer * layout->compression_layer_stride_B);
+                  if (g17p_discard) {
+                     libagx_reset_compression_metadata(
+                        cmd, agx_3d(width_tl, height_tl, layer_count),
+                        AGX_BARRIER_ALL | AGX_PREGFX, metadata,
+                        ail_tile_mode_uncompressed(layout->format),
+                        layout->compression_layer_stride_B / 8, width_tl,
+                        height_tl);
+                  } else {
+                     const struct ail_tile tile = layout->tilesize_el[level];
+                     const uint32_t level_w = u_minify(layout->width_px, level);
+                     const uint32_t level_h =
+                        u_minify(layout->height_px, level);
+                     libagx_g17p_decompress_16b(
+                        cmd, grid, AGX_BARRIER_ALL | AGX_PREGFX,
+                        dev->sampled_images.base_va,
+                        dev->samplers.table.bo->va->addr, metadata,
+                        base + ail_get_layer_level_B(layout, layer, level),
+                        ail_tile_mode_uncompressed(layout->format),
+                        read_index,
+                        layout->compression_layer_stride_B / 8,
+                        layout->layer_stride_B / 16, width_tl, height_tl,
+                        level_w, level_h, align(level_w, tile.width_el),
+                        tile.width_el, tile.height_el);
+                  }
+               } else if (agx_chip_g17_m5(dev->dev.chip)) {
                   if (layout->format != PIPE_FORMAT_R16G16B16A16_FLOAT ||
                       (layout->sample_count_sa != 2 &&
                        layout->sample_count_sa != 4) ||
@@ -5120,8 +5172,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                      base + layout->metadata_offset_B,
                      base + ail_get_layer_level_B(layout, layer, level),
                      view->planes[plane].emrt_read_heap_index,
-                     ail_metadata_width_tl(layout, level),
-                     ail_metadata_height_tl(layout, level),
+                     width_tl, height_tl,
                      align(layout->width_px, tile.width_el),
                      tile.width_el, tile.height_el,
                      util_logbase2(layout->sample_count_sa) - 1);
@@ -5141,21 +5192,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                      return;
                   }
 
-                  const VkAttachmentLoadOp load_op =
-                     pRenderingInfo->pColorAttachments[i].loadOp;
-                  const bool discard =
-                     !incomplete_render_area &&
-                     u_minify(image->vk.extent.width, level) ==
-                        render->cr.width &&
-                     u_minify(image->vk.extent.height, level) ==
-                        render->cr.height &&
-                     (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
-                      load_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
                   if (discard) {
-                     const uint16_t width_tl =
-                        ail_metadata_width_tl(layout, level);
-                     const uint16_t height_tl =
-                        ail_metadata_height_tl(layout, level);
                      const uint64_t metadata =
                         base + layout->metadata_offset_B +
                         layout->level_offsets_compressed_B[level] +
