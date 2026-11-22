@@ -1512,8 +1512,8 @@ agx_nir_lower_m5_task_payload(nir_shader *s, unsigned max_payload_B,
  * other mesh the object writes no record and both stages put the payload at
  * +0. With the record, a full 1 KiB payload measured as lost workgroups of
  * the last children (those reading its last words), consistent with the
- * next task's record landing on them. */
-#define M5_TASK_RECORD_PAYLOAD 16
+ * next task's record landing on them. Shared with hk_shader.c and
+ * agx_vdm_mesh_core.h via AGX_M5_TASK_RECORD_PAYLOAD_BYTES. */
 
 static bool
 lower_mesh_record_grid(nir_builder *b, nir_intrinsic_instr *i, void *data)
@@ -1612,8 +1612,9 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool grid_record)
     * the grid words; they then alias word 0 once the body is done. */
    const bool alias_grid = grid + 16 > 32768;
    if (!launches || s->info.shared_size > 32768 ||
-       !agx_nir_lower_m5_task_payload(s, max_payload_B,
-                                      grid_record ? M5_TASK_RECORD_PAYLOAD : 0))
+       !agx_nir_lower_m5_task_payload(
+          s, max_payload_B,
+          grid_record ? AGX_M5_TASK_RECORD_PAYLOAD_BYTES : 0))
       return false;
    /* SPIR-V EmitMeshTasksEXT terminates the invocation: vtn follows the
     * launch with a halt, which would skip the child-count epilogue appended
