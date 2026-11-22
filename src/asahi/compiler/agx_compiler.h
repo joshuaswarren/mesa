@@ -1377,7 +1377,7 @@ agx_reserved_registers(const agx_context *ctx)
 }
 
 void agx_spill(agx_context *ctx, unsigned k, bool remat_only);
-bool agx_fold_m5_spill_constant_phis(agx_context *ctx);
+bool agx_fold_agx3_spill_constant_phis(agx_context *ctx);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
