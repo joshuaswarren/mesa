@@ -13411,7 +13411,8 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
        * by agx_params_driver_supported(); G17P uses this path on hardware.
        * If the encoder refuses an instruction, discard the emitted prefix and
        * report compilation failure. */
-      if (!agx3_pack_binary(ctx, binary)) {
+      bool packed = agx3_pack_program(ctx, binary);
+      if (!packed) {
          char what[768];
          snprintf(what, sizeof(what), "AGX3 binary packer refused %s",
                   agx3_last_pack_refusal()[0] ? agx3_last_pack_refusal()

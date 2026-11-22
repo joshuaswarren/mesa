@@ -46,6 +46,9 @@ extern "C" {
 #include "agx3_vary_core.h"
 #include "agx3_zs_core.h"
 #include "agx_mesh_abi.h"
+extern "C" {
+#include "asahi/isa/disasm.h"
+}
 #include "probes/g17p-sparse-mrt.h"
 
 /* agx_nir_lower_tilebuffer's ALL_SAMPLES: the pixel-rate sample mask, and the
@@ -16533,6 +16536,225 @@ TEST_F(AGX3PackBinary, G18GWorkgroupBarriersKeepLoadsInFlight)
       ASSERT_GE(code.size(), tail.size());
       EXPECT_EQ(std::vector<uint8_t>(code.end() - tail.size(), code.end()),
                 tail);
+   }
+}
+
+/* A G18G vertex shader: `loads` device loads still in flight at a 2D
+ * textureLod whose coordinates are in register half `coord`, then the four
+ * result channels and the loaded words written as varyings. The sample takes
+ * scoreboard slot loads + 1, and its staging block sits at 8 * loads. With
+ * relay_sample a second 2D sample of the same coordinates follows, with its
+ * level in a 16-bit register (half 20), and its result is written as varyings
+ * 20 to 23 too. */
+static agx_builder *
+g18g_vs_sample_then_outputs(agx_builder *b, unsigned loads, unsigned coord,
+                            bool relay_sample = false)
+{
+   b->shader->stage = MESA_SHADER_VERTEX;
+   b->shader->nir = rzalloc(b->shader, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_VERTEX;
+   for (unsigned n = 0; n < loads; ++n)
+      agx_device_load_to(b, agx_register(64 + 2 * n, AGX_SIZE_32),
+                         agx_uniform(16, AGX_SIZE_64), agx_immediate(n),
+                         AGX_FORMAT_I32, 1, 0, false);
+   agx_mov_imm_to(b, agx_register(coord, AGX_SIZE_32), 0x3e800000);
+   agx_mov_imm_to(b, agx_register(coord + 2, AGX_SIZE_32), 0x3f400000);
+   if (relay_sample)
+      agx_mov_imm_to(b, agx_register(20, AGX_SIZE_16), 0);
+   agx_index dest = agx_register(0, AGX_SIZE_32);
+   agx_index uv = agx_register(coord, AGX_SIZE_32);
+   dest.channels_m1 = 3;
+   uv.channels_m1 = 1;
+   agx_instr *tex = agx_texture_sample_to(
+      b, dest, uv, agx_immediate(0), agx_immediate(0), agx_immediate(0),
+      agx_immediate(1), agx_null(), AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0, false,
+      false, false, AGX_GATHER_NONE, false);
+   tex->mask = 15;
+   if (relay_sample) {
+      agx_index dest2 = agx_register(8, AGX_SIZE_32);
+      dest2.channels_m1 = 3;
+      agx_instr *tex2 = agx_texture_sample_to(
+         b, dest2, uv, agx_register(20, AGX_SIZE_16), agx_immediate(0),
+         agx_immediate(0), agx_immediate(1), agx_null(), AGX_DIM_2D,
+         AGX_LOD_MODE_LOD_MIN, 0, false, false, false, AGX_GATHER_NONE, false);
+      tex2->mask = 15;
+      for (unsigned c = 0; c < 4; ++c)
+         agx_st_vary(b, agx_immediate(20 + c),
+                     agx_register(8 + 2 * c, AGX_SIZE_32));
+   }
+   for (unsigned c = 0; c < 4; ++c)
+      agx_st_vary(b, agx_immediate(c), agx_register(2 * c, AGX_SIZE_32));
+   for (unsigned n = 0; n < loads; ++n)
+      agx_st_vary(b, agx_immediate(4 + n),
+                  agx_register(64 + 2 * n, AGX_SIZE_32));
+   agx_stop(b);
+   return b;
+}
+
+/* The staging halves the UVSWs of `code` write: the bits that carry the
+ * staging half are those that change when one UVSW is encoded at each even
+ * half. */
+static std::vector<unsigned>
+agx3c_uvsw_staging_halves(const std::vector<uint8_t> &code)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3C;
+   uint8_t probe[64][AGX3_VARY_MAX_LENGTH], len = 0;
+   for (unsigned h = 0; h < 64; ++h) {
+      uint8_t l = 0;
+      EXPECT_TRUE(agx3_vary_uvsw(enc, 2 * h, 0, 1, true, 0, probe[h], &l));
+      EXPECT_TRUE(!h || l == len);
+      len = l;
+   }
+   uint8_t mask[AGX3_VARY_MAX_LENGTH] = {0};
+   for (unsigned h = 1; h < 64; ++h)
+      for (unsigned i = 0; i < len; ++i)
+         mask[i] |= probe[h][i] ^ probe[0][i];
+
+   std::vector<unsigned> halves;
+   for (size_t at = 0; at < code.size();) {
+      const char *name = NULL;
+      const signed l =
+         agx3c_instr_length(code.data() + at, code.size() - at, &name);
+      EXPECT_GT(l, 0) << "undecodable at " << at;
+      if (l <= 0)
+         break;
+      if (name && strstr(name, "uvsw")) {
+         EXPECT_EQ(l, (signed)len) << "UVSW of another form at " << at;
+         unsigned found = ~0u;
+         for (unsigned h = 0; h < 64 && l == (signed)len; ++h) {
+            bool same = true;
+            for (unsigned i = 0; i < len; ++i)
+               same &= ((code[at + i] ^ probe[h][i]) & mask[i]) == 0;
+            if (same)
+               found = 2 * h;
+         }
+         EXPECT_NE(found, ~0u) << "UVSW staging half at " << at;
+         halves.push_back(found);
+      }
+      at += l;
+   }
+   return halves;
+}
+
+/* G18G vertex outputs are staged from AGX3_G18G_READ_STAGING_LIMIT (80), in
+ * the staging file the texture reads use. A G18G sample's staging block sits
+ * at 8 * (slot - 1) and reaches its coordinate register plus 4, so a
+ * textureLod issued behind several loads in flight reaches past 80, and
+ * agx3_pack_binary() refuses the shader. agx3_pack_program() then packs it
+ * once more with every output's UVSW staging at or above ALIGN(footprint, 8),
+ * provided the outputs still end within AGX3_STAGED_WRITE_LIMIT; a footprint
+ * past 112 stays refused. */
+TEST_F(AGX3PackBinary, G18GVertexOutputsMoveAboveHighTextureReads)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G18G;
+   key.dev.emit_agx3d = true;
+
+   /* Reads below 80: one attempt, the outputs from 80. */
+   {
+      agx_builder *b = g18g_vs_sample_then_outputs(builder(enc), 2, 44);
+      struct util_dynarray bin;
+      util_dynarray_init(&bin, mem_ctx);
+      ASSERT_TRUE(agx3_pack_program(b->shader, &bin))
+         << agx3_last_pack_refusal();
+      EXPECT_EQ(b->shader->agx3_g18g_output_staging_floor, 0u);
+      const std::vector<uint8_t> code((uint8_t *)bin.data,
+                                      (uint8_t *)bin.data + bin.size);
+      const auto halves = agx3c_uvsw_staging_halves(code);
+      EXPECT_EQ(halves.size(), 6u);
+      for (unsigned h : halves)
+         EXPECT_GE(h, AGX3_G18G_READ_STAGING_LIMIT);
+   }
+
+   static const struct {
+      unsigned loads, coord;
+   } cases[] = {{6, 32}, {6, 44}, {6, 60}, {7, 52}, {7, 56}, {7, 60}};
+   for (const auto &c : cases) {
+      SCOPED_TRACE(testing::Message()
+                   << c.loads << " loads, coordinate " << c.coord);
+      const unsigned footprint = 8 * c.loads + c.coord + 4;
+      const unsigned floor = ALIGN_POT(footprint, 8);
+      const bool fits =
+         floor + AGX3_G18G_OUTPUT_STAGING_LIMIT <= AGX3_STAGED_WRITE_LIMIT;
+
+      /* One attempt alone refuses, and says how far the reads reach. */
+      agx_builder *once =
+         g18g_vs_sample_then_outputs(builder(enc), c.loads, c.coord);
+      struct util_dynarray bin;
+      util_dynarray_init(&bin, mem_ctx);
+      EXPECT_FALSE(agx3_pack_binary(once->shader, &bin));
+      EXPECT_EQ(once->shader->agx3_g18g_read_staging_end, footprint);
+      EXPECT_NE(strstr(agx3_last_pack_refusal(), "past the output staging"),
+                nullptr)
+         << agx3_last_pack_refusal();
+
+      agx_builder *b =
+         g18g_vs_sample_then_outputs(builder(enc), c.loads, c.coord);
+      util_dynarray_init(&bin, mem_ctx);
+      ASSERT_EQ(agx3_pack_program(b->shader, &bin), fits)
+         << agx3_last_pack_refusal();
+      if (!fits)
+         continue;
+      EXPECT_EQ(b->shader->agx3_g18g_output_staging_floor, floor);
+      const std::vector<uint8_t> code((uint8_t *)bin.data,
+                                      (uint8_t *)bin.data + bin.size);
+      const auto halves = agx3c_uvsw_staging_halves(code);
+      EXPECT_EQ(halves.size(), 4u + c.loads);
+      for (unsigned h : halves) {
+         EXPECT_GE(h, floor);
+         EXPECT_LE(h, 126u);
+         EXPECT_LE(h + 2, b->shader->agx3_staging_halfs);
+      }
+      EXPECT_LE(b->shader->agx3_staging_halfs, AGX3_STAGED_WRITE_LIMIT);
+   }
+}
+
+/* The refused first attempt of agx3_pack_program() leaves nothing behind. A
+ * sample with a register level on a slot past 1 goes through the G17G LOD
+ * relay, which raises max_reg for its scratch word in every attempt. The
+ * retry must pack what one attempt at its floor packs, register bound
+ * included, not put a second relay word above the first (max_reg 79 instead
+ * of 77 here before agx3_pack_program() restored it). */
+TEST_F(AGX3PackBinary, G18GVertexOutputRetryKeepsTheRegisterBound)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G18G;
+   key.dev.emit_agx3d = true;
+   for (unsigned coord : {32u, 44u}) {
+      SCOPED_TRACE(testing::Message() << "coordinate " << coord);
+      agx_builder *once =
+         g18g_vs_sample_then_outputs(builder(enc), 6, coord, true);
+      struct util_dynarray bin;
+      util_dynarray_init(&bin, mem_ctx);
+      ASSERT_FALSE(agx3_pack_binary(once->shader, &bin));
+      const unsigned floor =
+         ALIGN_POT(once->shader->agx3_g18g_read_staging_end, 8);
+      ASSERT_NE(floor, 0u) << agx3_last_pack_refusal();
+      /* The relay ran in the refused attempt */
+      ASSERT_GT(once->shader->max_reg, 0u);
+
+      agx_builder *b =
+         g18g_vs_sample_then_outputs(builder(enc), 6, coord, true);
+      util_dynarray_init(&bin, mem_ctx);
+      ASSERT_TRUE(agx3_pack_program(b->shader, &bin))
+         << agx3_last_pack_refusal();
+      EXPECT_EQ(b->shader->agx3_g18g_output_staging_floor, floor);
+
+      agx_builder *direct =
+         g18g_vs_sample_then_outputs(builder(enc), 6, coord, true);
+      direct->shader->agx3_g18g_output_staging_floor = floor;
+      struct util_dynarray direct_bin;
+      util_dynarray_init(&direct_bin, mem_ctx);
+      ASSERT_TRUE(agx3_pack_binary(direct->shader, &direct_bin))
+         << agx3_last_pack_refusal();
+      EXPECT_EQ(b->shader->max_reg, direct->shader->max_reg);
+      EXPECT_EQ(b->shader->agx3_staging_halfs,
+                direct->shader->agx3_staging_halfs);
+      EXPECT_EQ(
+         std::vector<uint8_t>((uint8_t *)bin.data,
+                              (uint8_t *)bin.data + bin.size),
+         std::vector<uint8_t>((uint8_t *)direct_bin.data,
+                              (uint8_t *)direct_bin.data + direct_bin.size));
    }
 }
 

@@ -1687,9 +1687,6 @@ agx3_tex_cube_groups_result_slot(const agx_instr *I)
  * and 3D fetches keep the independently witnessed staging slot 2/result slot
  * 1 pair. G17P 3D reads publish their third integer coordinate in the next
  * staging word; every other texture axis remains a deliberate refusal. */
-/* Image-write banks stay below this staging half, which also keeps every
- * staged half within the COPY destination field. */
-#define AGX3_STAGED_WRITE_LIMIT 128u
 
 /* Operand banks a plain M5 texel fetch may stage its coordinates in before
  * one is recycled: one per scoreboard slot, so eight fetches can be in
@@ -1817,25 +1814,6 @@ agx3_fetch_coords_ok(const agx_instr *I, bool m5, bool staged, unsigned count)
                        I->src[0].value + 2 * count <= 128
                   : !(I->src[0].value & 3) && I->src[0].value <= 60);
 }
-
-/* The first G18G image-write bank of a program that also reads textures or
- * images. AGX3C reads stage in blocks keyed by their scoreboard slot, 8 *
- * (slot - 1) up the staging file: a texel fetch or image read at that plus
- * its 0 or 16 coordinate base and at most 8 halves, a staged sample at that
- * plus at most 16, a direct-coordinate sample below its coordinate register
- * (60 at most) plus 4. Over eight slots every read stays below half 80, so
- * banks from here on are disjoint from any read, before or after the write,
- * and leave three sixteen-half banks under AGX3_STAGED_WRITE_LIMIT. The
- * packer checks the finished program against this bound rather than trusting
- * the sum. */
-#define AGX3_G18G_READ_STAGING_LIMIT 80u
-
-/* The first G18G image-write bank of a vertex shader that reads nothing: its
- * outputs' UVSW staging takes two halves per scoreboard slot, 2 * (slot - 1)
- * over eight slots, all below half 16. Apple's G18G vertex functions keep a
- * write's staging disjoint from the outputs' too (m6-image-write-vs iwv_f4:
- * the write's data at 0..6, Y 8, X 10, the UVSWs from half 12). */
-#define AGX3_G18G_OUTPUT_STAGING_LIMIT 16u
 
 /* Staging banks held by asynchronous consumers still in flight: staged reads
  * and image writes. A bank stays held until the slot its consumer signals is
@@ -13110,7 +13088,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
     * unchanged: moving them instead exceeds the sampler coordinate limit. */
    const uint16_t g18g_output_staging_base =
       ctx->key->dev.emit_agx3d && ctx->stage == MESA_SHADER_VERTEX &&
-      texture_ops_left != 0 ? AGX3_G18G_READ_STAGING_LIMIT : 0;
+      texture_ops_left != 0
+         ? MAX2(AGX3_G18G_READ_STAGING_LIMIT,
+                ctx->agx3_g18g_output_staging_floor)
+         : 0;
    const uint16_t g18g_image_write_floor =
       !ctx->key->dev.emit_agx3d || image_writes_left == 0 ||
       g18g_compact_image_banks ? 0
@@ -23223,8 +23204,26 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    /* Texture reads must stay below the separately placed vertex outputs.
     * Validate emitted extents rather than assuming the reserved bound. */
    if (g18g_output_staging_base &&
-       g18g_read_staging_end > g18g_output_staging_base)
+       g18g_read_staging_end > g18g_output_staging_base) {
+      /* The caller may retry with the outputs above the reads: tell it how
+       * far they reached, and how much it must fit above them, the outputs
+       * and, if the shader writes images, one image-write bank (the 16-half
+       * bank_span of agx3_emit_storage_image_write). */
+      ctx->agx3_g18g_read_staging_end = g18g_read_staging_end;
+      ctx->agx3_g18g_output_staging_span =
+         AGX3_G18G_OUTPUT_STAGING_LIMIT + (image_writes_left ? 16 : 0);
+      char *first = agx3_refusal_buffer(true);
+      if (first && !first[0])
+         snprintf(first, AGX3_REFUSAL_SIZE,
+                  "G18G vertex texture reads stage to half %u, past the "
+                  "output staging at %u",
+                  g18g_read_staging_end, g18g_output_staging_base);
+      if (agx_compiler_debug & (AGX_DBG_SHADERS | AGX_DBG_REFUSE))
+         fprintf(stderr, "G18G vertex texture reads stage to half %u, past "
+                 "the output staging at %u\n",
+                 g18g_read_staging_end, g18g_output_staging_base);
       goto fail;
+   }
 
    /* Every G18G image write was staged from g18g_image_write_floor up.
     * Refuse the program if a read's staging block or an output's UVSW
@@ -23324,3 +23323,43 @@ fail:
 }
 
 #undef AGX3_PACK_FAIL
+
+/* G18G vertex outputs share the staging file with texture reads and are
+ * staged from AGX3_G18G_READ_STAGING_LIMIT. When agx3_pack_binary() reports
+ * reads that reach past it, pack once more with the outputs (and an
+ * image-write bank, if the shader writes images) right above the reads,
+ * provided they still end within AGX3_STAGED_WRITE_LIMIT. The outputs start
+ * at a multiple of 8 halves, a read block, like the default base. That costs
+ * no range: the highest base that fits, 112, or 96 with an image-write bank,
+ * is itself a multiple of 8. Nothing the refused attempt reserved carries
+ * over to the second: neither its staging footprint nor the scratch
+ * registers it raised max_reg for (the cube and array-layer temporaries, the
+ * G17G LOD relay). */
+bool
+agx3_pack_program(agx_context *ctx, struct util_dynarray *emission)
+{
+   const unsigned staging_halfs = ctx->agx3_staging_halfs;
+   const unsigned max_reg = ctx->max_reg;
+   ctx->agx3_g18g_output_staging_floor = 0;
+   ctx->agx3_g18g_read_staging_end = 0;
+   if (agx3_pack_binary(ctx, emission))
+      return true;
+
+   const unsigned read_end = ctx->agx3_g18g_read_staging_end;
+   const unsigned output_floor = ALIGN_POT(read_end, 8);
+   if (!read_end || output_floor + ctx->agx3_g18g_output_staging_span >
+                       AGX3_STAGED_WRITE_LIMIT)
+      return false;
+
+   ctx->agx3_staging_halfs = staging_halfs;
+   ctx->max_reg = max_reg;
+   ctx->agx3_g18g_read_staging_end = 0;
+   ctx->agx3_g18g_output_staging_floor = output_floor;
+   const bool packed = agx3_pack_binary(ctx, emission);
+   if (agx_compiler_debug & (AGX_DBG_SHADERS | AGX_DBG_REFUSE))
+      fprintf(stderr,
+              "G18G vertex outputs staged from half %u above texture "
+              "reads to half %u: %s\n",
+              output_floor, read_end, packed ? "packed" : "refused");
+   return packed;
+}
