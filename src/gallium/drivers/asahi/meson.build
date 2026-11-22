@@ -329,7 +329,6 @@ if with_tests and with_tools.contains('drm-shim')
       libasahi_layout, libasahi_decode, libagx3b_disasm, libgallium,
       libgalliumvl_stub,
     ],
-    build_by_default : false,
   )
 
   asahi_priority_test = executable(
@@ -555,6 +554,23 @@ if with_tests and with_tools.contains('drm-shim')
         'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
         'ASAHI_SHIM_G17P_EXPECT_COMPUTE=1',
         'ASAHI_SHIM_G17P_EXPECT_STRONG_COMPUTE_BARRIER=1',
+      ],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  foreach chip : ['g13g', 'g17p']
+    test(
+      'asahi-' + chip + '-gallium-fast-clear',
+      prog_python,
+      args : [
+        files('tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        asahi_g17p_blit_test,
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'AGX_TEST_FAST_CLEAR_HW=1',
       ],
       suite : ['asahi'],
     )
