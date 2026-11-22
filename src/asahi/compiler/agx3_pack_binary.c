@@ -763,10 +763,12 @@ agx3_try_float_modifier(struct util_dynarray *emission,
                       agx_channels(I->dest[0]) == 1;
    for (unsigned s = 0; s < I->nr_srcs; ++s)
       has_mod |= I->src[s].abs || I->src[s].neg;
-   /* Native C FMA consumes full and half registers in independently typed
-    * operand slots, including unmodified inputs. Route mixed operands through
-    * the same lifetime-aware modifier encoder. Plain F32 stays compact. */
-   if (enc == AGX_ISA_ENCODING_AGX3C && (is_fma || is_mul))
+   /* Native AGX3B/AGX3C FMA (and AGX3C MUL) consumes full and half registers in
+    * independently typed operand slots, including unmodified inputs. Route
+    * mixed operands through the same lifetime-aware modifier encoder. Plain F32
+    * stays compact. */
+   if ((enc == AGX_ISA_ENCODING_AGX3C && (is_fma || is_mul)) ||
+       (enc == AGX_ISA_ENCODING_AGX3B && is_fma))
       for (unsigned s = 0; s < I->nr_srcs; ++s)
          has_mod |= agx3_src_is_register(I->src[s]) &&
                     I->src[s].size == AGX_SIZE_16;

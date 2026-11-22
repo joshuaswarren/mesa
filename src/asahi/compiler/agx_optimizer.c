@@ -240,20 +240,50 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
 
       /* G17P and G18G do not have generally grounded f32 arithmetic over an f16
        * register.  FMUL has a few native mixed endpoints, but their combined
-       * producer-wait/lifetime domain is intentionally narrow.  Preserve the
-       * explicit exact widening for ordinary full-width arithmetic; native
-       * patterns such as the scalar-half sqrt are emitted without an fmov and
-       * therefore remain available. */
+       * producer-wait/lifetime domain is intentionally narrow, and
+       * fma_addend_imm_width_mod still refuses half sources on AGX3B.
+       * On AGX3B, unmodified all-scalar-register F32 FFMA carries independent
+       * per-operand f16/f32 width bits via agx3_falu_fma_mod_runtime (verified
+       * bit-exact against explicit f16->f32 widening across 1,024 subnormal,
+       * NaN-payload, and signed-zero cases in every operand slot on G17P
+       * hardware), so allow folding unmodified scalar f16 GPR widenings into
+       * such FFMAs; keep explicit exact widening for FADD, FMUL, G18G, and
+       * modified/mixed-kind FFMAs.  Native patterns such as the scalar-half
+       * sqrt are emitted without an fmov and therefore remain available. */
       if (ctx->key &&
           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
            agx_is_g18g(&ctx->key->dev)) &&
           (ins->op == AGX_OPCODE_FADD || ins->op == AGX_OPCODE_FMUL ||
            ins->op == AGX_OPCODE_FFMA) &&
-          src.size == AGX_SIZE_32 && def->src[0].size == AGX_SIZE_16 &&
-          !(def->src[0].type == AGX_INDEX_UNIFORM && !def->src[0].memory &&
+          src.size == AGX_SIZE_32 && def->src[0].size == AGX_SIZE_16) {
+         bool allow_half_uniform =
+            def->src[0].type == AGX_INDEX_UNIFORM && !def->src[0].memory &&
             !def->src[0].abs && !def->src[0].neg && !src.abs && !src.neg &&
-            agx_can_fold_half_uniform(ins, defs)))
-         continue;
+            agx_can_fold_half_uniform(ins, defs);
+         bool allow_agx3b_ffma_gpr =
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+            ins->op == AGX_OPCODE_FFMA && !ins->saturate &&
+            ins->nr_dests == 1 && !ins->dest[0].memory &&
+            ins->dest[0].size == AGX_SIZE_32 &&
+            agx_channels(ins->dest[0]) == 1 &&
+            (def->src[0].type == AGX_INDEX_NORMAL ||
+             def->src[0].type == AGX_INDEX_REGISTER) &&
+            !def->src[0].memory && agx_channels(def->src[0]) == 1 &&
+            !def->src[0].abs && !def->src[0].neg && !src.abs && !src.neg;
+         if (allow_agx3b_ffma_gpr) {
+            agx_foreach_src(ins, k) {
+               if ((ins->src[k].type != AGX_INDEX_NORMAL &&
+                    ins->src[k].type != AGX_INDEX_REGISTER) ||
+                   ins->src[k].memory || agx_channels(ins->src[k]) != 1 ||
+                   ins->src[k].abs || ins->src[k].neg) {
+                  allow_agx3b_ffma_gpr = false;
+                  break;
+               }
+            }
+         }
+         if (!allow_half_uniform && !allow_agx3b_ffma_gpr)
+            continue;
+      }
 
       /* M5's f32 add takes at most one half register (f32 + f16, or a half
        * plus a minifloat immediate); two half registers into an f32 result

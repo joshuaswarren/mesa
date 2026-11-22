@@ -5245,15 +5245,27 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
       }
 
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-      bool has_full_gpr = false;
+      bool has_full_gpr = false, src_modifier = false;
       unsigned half_uniforms = 0;
+      bool all_scalar_regs =
+         ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         I->nr_dests == 1 && !I->dest[0].memory &&
+         I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1;
       agx_foreach_src(I, s) {
          has_full_gpr |= (I->src[s].type == AGX_INDEX_NORMAL ||
                           I->src[s].type == AGX_INDEX_REGISTER) &&
                          I->src[s].size == AGX_SIZE_32;
+         src_modifier |= I->src[s].type != AGX_INDEX_IMMEDIATE &&
+                         I->src[s].type != AGX_INDEX_NULL &&
+                         (I->src[s].abs || I->src[s].neg);
          half_uniforms += I->src[s].type == AGX_INDEX_UNIFORM &&
                           I->src[s].size == AGX_SIZE_16;
+         if ((I->src[s].type != AGX_INDEX_NORMAL &&
+              I->src[s].type != AGX_INDEX_REGISTER) ||
+             I->src[s].memory || agx_channels(I->src[s]) != 1)
+            all_scalar_regs = false;
       }
+      const bool native_half_gpr = all_scalar_regs && !src_modifier;
       agx_foreach_src(I, s) {
          if (I->src[s].size != AGX_SIZE_16 ||
              I->src[s].type == AGX_INDEX_IMMEDIATE ||
@@ -5263,6 +5275,12 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
          if (I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
              agx_channels(I->dest[0]) == 1 && has_full_gpr &&
              half_uniforms == 1 && I->src[s].type == AGX_INDEX_UNIFORM)
+            continue;
+         /* AGX3B encodes unmodified all-scalar-register F32 FFMA with
+          * per-operand width bits directly (agx3_falu_fma_mod_runtime),
+          * avoiding redundant f16->f32 widening moves. Leave AGX3C untouched. */
+         if (native_half_gpr && (I->src[s].type == AGX_INDEX_NORMAL ||
+                                 I->src[s].type == AGX_INDEX_REGISTER))
             continue;
 
          agx_index widened = agx_temp(ctx, AGX_SIZE_32);
