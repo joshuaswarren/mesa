@@ -16,8 +16,8 @@ merge. To change the policy, edit .github/aurora/AGENTS.md.
 
 ## Pre-PR checklist
 
-Synced from [aurora-silicon/agent-guidelines](https://github.com/aurora-silicon/agent-guidelines/blob/8c0f9c227cd7/pre-pr-checklist.md)
-at 8c0f9c227cd7. Change it there, then sync the copy here; do not edit this section
+Synced from [aurora-silicon/agent-guidelines](https://github.com/aurora-silicon/agent-guidelines/blob/0b26c3109f8c/pre-pr-checklist.md)
+at 0b26c3109f8c. Change it there, then sync the copy here; do not edit this section
 on its own. These are the checks Aurora's review agents apply.
 
 Each item is a hard rule unless it says "default". If your change fails one, fix the change, or say in the PR why it can't be done yet and keep the PR a draft.
@@ -47,7 +47,7 @@ Each item is a hard rule unless it says "default". If your change fails one, fix
 ### 4. Clean-room and attribution (hard)
 
 - No Apple code, strings, firmware, disassembly output or Apple tuning values in public code, PRs, issues or channels. Our own traces and measurements are fine.
-- Commits carry human identity only, with a human `Signed-off-by`. No agent co-author or sign-off and no `Assisted-by` in commits. When an agent helped, the PR body's last line is `Assisted-by: LLM (<Vendor>:<Model>)`.
+- Commits carry human identity only, with a human `Signed-off-by`. No agent co-author or sign-off and no `Assisted-by` in commits. When an agent helped, disclose it at the end of the PR body with a plain `Assisted-by:` line naming the model or tool (exact wording, vendor prefix, and punctuation are flexible; do not nitpick format).
 - Carry other people's commits unchanged. No force pushes to shared branches.
 
 ### 5. Evidence (default, high bar)
