@@ -3248,6 +3248,13 @@ hk_emit_fused_compute_dispatch(struct hk_device *dev, struct hk_cs *cs,
    cs->stats.cmds++;
    cs->stats.calls++;
    cs->pack_dispatches++;
+   if (unlikely(dev->frame_anatomy)) {
+      hk_frame_anatomy_note_fs(cs, s);
+      const uint64_t wg = agx_workgroup_threads(local);
+      const uint64_t threads = (uint64_t)p->exec_threads[0] *
+                               p->exec_threads[1] * p->exec_threads[2];
+      hk_frame_anatomy_note_grid(cs, s, threads, wg ? threads / wg : 0, false);
+   }
    *ioto_used_out = ioto_used;
    return true;
 }
