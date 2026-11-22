@@ -33,10 +33,73 @@ count_loops(nir_shader *shader)
    return n;
 }
 
+/* A storage buffer address as the descriptor lowering builds it: the
+ * descriptor's address (its .xy) from a buffer binding descriptor load
+ * (ACCESS_BUFFER_BINDING_AGX) plus a 32-bit offset. */
 static nir_def *
-buffer_address(nir_builder *b, nir_def *byte_offset)
+buffer_address(nir_builder *b, nir_def *byte_offset, bool vec_pack = false)
 {
-   nir_def *base = nir_load_push_constant(b, 1, 64, nir_imm_int(b, 16), .range = 32);
+   nir_def *set = nir_load_preamble(b, 1, 64, .base = 4);
+   nir_def *desc = nir_load_global_constant(
+      b, 4, 32, set,
+      .access = (gl_access_qualifier)(ACCESS_CAN_SPECULATE |
+                                      ACCESS_BUFFER_BINDING_AGX),
+      .align_mul = 16);
+   nir_def *base = vec_pack
+                      ? nir_pack_64_2x32(b, nir_trim_vector(b, desc, 2))
+                      : nir_pack_64_2x32_split(b, nir_channel(b, desc, 0),
+                                               nir_channel(b, desc, 1));
+   return nir_iadd(b, base, nir_u2u64(b, byte_offset));
+}
+
+/* A physical storage buffer pointer, a 64-bit value of its own, plus a 32-bit
+ * offset the shader computed: the offset may wrap into another allocation. */
+static nir_def *
+physical_address(nir_builder *b, nir_def *byte_offset)
+{
+   nir_def *base = nir_load_push_constant(b, 1, 64, nir_imm_int(b, 0), .range = 32);
+   return nir_iadd(b, base, nir_u2u64(b, byte_offset));
+}
+
+enum packed_uvec4_source {
+   UVEC4_PUSH_CONSTANT,
+   UVEC4_UBO_LOAD,
+   UVEC4_SSBO_LOAD,
+   UVEC4_SPECULATIVE_ROOT_LOAD,
+};
+
+/* A pointer packed from the .xy of a loaded uvec4 (not a buffer binding
+ * descriptor): must be refused just like a direct 64-bit physical pointer. */
+static nir_def *
+packed_uvec4_address(nir_builder *b, nir_def *byte_offset,
+                     packed_uvec4_source src, bool vec_pack)
+{
+   nir_def *v = NULL;
+   switch (src) {
+   case UVEC4_PUSH_CONSTANT:
+      v = nir_load_push_constant(b, 4, 32, nir_imm_int(b, 16), .range = 32);
+      break;
+   case UVEC4_UBO_LOAD:
+      v = nir_load_global_constant(
+         b, 4, 32, buffer_address(b, nir_imm_int(b, 0)),
+         .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE |
+                                         ACCESS_CAN_REORDER),
+         .align_mul = 16);
+      break;
+   case UVEC4_SSBO_LOAD:
+      v = nir_load_global(b, 4, 32, buffer_address(b, nir_imm_int(b, 0)),
+                          .align_mul = 16);
+      break;
+   case UVEC4_SPECULATIVE_ROOT_LOAD:
+      v = nir_load_global_constant(
+         b, 4, 32, nir_load_preamble(b, 1, 64, .base = 0),
+         .access = ACCESS_CAN_SPECULATE, .align_mul = 16);
+      break;
+   }
+   nir_def *base = vec_pack
+                      ? nir_pack_64_2x32(b, nir_trim_vector(b, v, 2))
+                      : nir_pack_64_2x32_split(b, nir_channel(b, v, 0),
+                                               nir_channel(b, v, 1));
    return nir_iadd(b, base, nir_u2u64(b, byte_offset));
 }
 
@@ -303,5 +366,124 @@ TEST(M5RuntimeLoops, GuardBounds)
    /* hi - 3 would wrap: never. */
    EXPECT_EQ(folded_guard(TOP_TESTED, INT32_MIN + 2), (uint32_t)INT32_MIN);
    EXPECT_EQ(folded_guard(TOP_TESTED, INT32_MIN + 3), (uint32_t)INT32_MIN + 1);
+}
+
+static nir_intrinsic_instr *
+first_intrinsic(nir_shader *s, nir_intrinsic_op op, unsigned skip)
+{
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == op && skip-- == 0)
+               return nir_instr_as_intrinsic(instr);
+         }
+      }
+   }
+   return NULL;
+}
+
+/* Four consecutive words read in one block become one vector load. */
+TEST(M5MergeWords, FourWords)
+{
+   for (bool vec_pack : {false, true}) {
+      nir_builder b = compute_shader("merge-words");
+      nir_def *i = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+      nir_def *base = nir_amul_imm(&b, i, 4);
+      nir_def *sum = nir_imm_int(&b, 0);
+      for (unsigned k = 0; k < 4; ++k) {
+         nir_def *v = nir_load_global(&b, 1, 32,
+                                      buffer_address(&b, nir_iadd_imm(&b, base, 4 * k), vec_pack),
+                                      .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                      .align_mul = 4);
+         sum = nir_iadd(&b, sum, v);
+      }
+      nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
+      NIR_PASS(_, b.shader, nir_opt_cse);
+      EXPECT_TRUE(agx_nir_merge_global_words(b.shader)) << "vec_pack " << vec_pack;
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "merge words");
+      nir_intrinsic_instr *load = first_intrinsic(b.shader, nir_intrinsic_load_global, 0);
+      ASSERT_NE(load, nullptr);
+      EXPECT_EQ(load->def.num_components, 4u);
+      EXPECT_EQ(first_intrinsic(b.shader, nir_intrinsic_load_global, 1), nullptr);
+      ralloc_free(b.shader);
+   }
+}
+
+#define RO_ACCESS ((gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER))
+
+/* Words at i, i + 4 and at x, x + 4, where x is the word read at i: merging
+ * the first pair replaces x, from which the second pair's address is built.
+ * The second merge must take its offset from the live address. */
+TEST(M5MergeWords, OffsetFromMergedWord)
+{
+   nir_builder b = compute_shader("merge-chained");
+   nir_def *i = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+   nir_def *x = nir_load_global(&b, 1, 32, buffer_address(&b, i), .access = RO_ACCESS,
+                                .align_mul = 4);
+   nir_def *y = nir_load_global(&b, 1, 32, buffer_address(&b, nir_iadd_imm(&b, i, 4)),
+                                .access = RO_ACCESS, .align_mul = 4);
+   nir_def *z = nir_load_global(&b, 1, 32, buffer_address(&b, x), .access = RO_ACCESS,
+                                .align_mul = 4);
+   nir_def *w = nir_load_global(&b, 1, 32, buffer_address(&b, nir_iadd_imm(&b, x, 4)),
+                                .access = RO_ACCESS, .align_mul = 4);
+   nir_def *sum = nir_iadd(&b, nir_iadd(&b, x, y), nir_iadd(&b, z, w));
+   nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+   EXPECT_TRUE(agx_nir_merge_global_words(b.shader));
+   nir_validate_shader(b.shader, "merge chained words");
+   NIR_PASS(_, b.shader, nir_opt_dce);
+   nir_validate_shader(b.shader, "merge chained words after dce");
+   nir_intrinsic_instr *first = first_intrinsic(b.shader, nir_intrinsic_load_global, 0);
+   nir_intrinsic_instr *second = first_intrinsic(b.shader, nir_intrinsic_load_global, 1);
+   ASSERT_NE(first, nullptr);
+   ASSERT_NE(second, nullptr);
+   EXPECT_EQ(first->def.num_components, 2u);
+   EXPECT_EQ(second->def.num_components, 2u);
+   ralloc_free(b.shader);
+}
+
+/* A physical pointer plus x and x + 4: with x = 0xfffffffc the reads are at
+ * pointer + 0xfffffffc and pointer + 0, which may both be valid; a vector
+ * load would read pointer + 2^32. Not merged. */
+TEST(M5MergeWords, PhysicalPointerRefused)
+{
+   nir_builder b = compute_shader("merge-physical");
+   nir_def *x = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8), .range = 32);
+   nir_def *sum = nir_imm_int(&b, 0);
+   for (unsigned k = 0; k < 2; ++k)
+      sum = nir_iadd(&b, sum,
+                     nir_load_global(&b, 1, 32, physical_address(&b, nir_iadd_imm(&b, x, 4 * k)),
+                                     .access = RO_ACCESS, .align_mul = 4));
+   nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+   EXPECT_FALSE(agx_nir_merge_global_words(b.shader));
+   ralloc_free(b.shader);
+}
+
+/* A pointer packed from the .xy of a loaded uvec4 (UBO, SSBO, push constant,
+ * or lowered root load) has the same shape as a descriptor pack but is not a
+ * buffer binding descriptor: must not be merged. */
+TEST(M5MergeWords, PackedUvec4Refused)
+{
+   for (packed_uvec4_source src : {UVEC4_PUSH_CONSTANT, UVEC4_UBO_LOAD,
+                                   UVEC4_SSBO_LOAD, UVEC4_SPECULATIVE_ROOT_LOAD}) {
+      for (bool vec_pack : {false, true}) {
+         nir_builder b = compute_shader("merge-packed-uvec4");
+         nir_def *x = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8), .range = 32);
+         nir_def *sum = nir_imm_int(&b, 0);
+         for (unsigned k = 0; k < 2; ++k) {
+            nir_def *addr = packed_uvec4_address(&b, nir_iadd_imm(&b, x, 4 * k), src, vec_pack);
+            sum = nir_iadd(&b, sum,
+                           nir_load_global(&b, 1, 32, addr, .access = RO_ACCESS, .align_mul = 4));
+         }
+         nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
+         NIR_PASS(_, b.shader, nir_opt_cse);
+         EXPECT_FALSE(agx_nir_merge_global_words(b.shader))
+            << "src " << src << " vec_pack " << vec_pack;
+         ralloc_free(b.shader);
+      }
+   }
 }
 

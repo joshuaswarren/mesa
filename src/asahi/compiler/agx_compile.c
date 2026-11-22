@@ -10292,6 +10292,20 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          agx_optimize_loop_nir(nir, m5, g17p);
    }
 
+   /* Consecutive words read together, such as the unrolled iterations' reads
+    * of one array, become one vector load. */
+   /* With soft faults, robust buffer reads are plain reads followed by a
+    * bounds select, so a read past the end is not undefined: leave them. */
+   if (m5 && !g18_scans && !soft_fault) {
+      bool merged = false;
+      NIR_PASS(merged, nir, agx_nir_merge_global_words);
+      if (merged) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
+
    /* If soft fault is enabled, we can freely speculate everything. That lets us
     * peephole select and form preambles more aggressively.
     */

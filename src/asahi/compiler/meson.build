@@ -16,6 +16,7 @@ libasahi_agx_files = files(
   'agx_nir_lower_atomics.c',
   'agx_nir_opt_flatten_loads.c',
   'agx_nir_unroll_runtime_loops.c',
+  'agx_nir_merge_global_words.c',
   'agx_nir_opt_select_load.c',
   'agx_nir_opt_licm.c',
   'agx_nir_opt_sink_loop_sample_uses.c',
