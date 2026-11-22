@@ -21,8 +21,9 @@ plain_shared_load(nir_instr *instr)
       return false;
 
    nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+   const unsigned allowed = ACCESS_CAN_SPECULATE | ACCESS_CAN_REORDER;
    return load->intrinsic == nir_intrinsic_load_shared &&
-          nir_intrinsic_access(load) == 0;
+          (nir_intrinsic_access(load) & ~allowed) == 0;
 }
 
 /* A lowered AGX3 shared address is BASE in bytes plus a 16-bit index in

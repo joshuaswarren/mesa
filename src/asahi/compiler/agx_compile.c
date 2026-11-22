@@ -9805,13 +9805,14 @@ agx_lower_front_face(struct nir_builder *b, nir_intrinsic_instr *intr,
  * the latter run should be almost a no-op.
  */
 static void
-agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
+agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p, bool unroll_64)
 {
    const nir_shader_compiler_options *saved_options = nir->options;
    nir_shader_compiler_options options;
-   /* Native M5 ALU throughput benefits from exposing its 64-iteration
-    * loops before scheduling. Keep earlier GPU generations unchanged. */
-   if (m5) {
+   /* Native AGX3B/AGX3C ALU throughput and the 32x32 shared-memory GEMM
+    * matrix matcher benefit from exposing 64-iteration loops before
+    * scheduling. Keep earlier GPU generations unchanged. */
+   if (unroll_64) {
       options = *saved_options;
       options.max_unroll_iterations = 64;
       nir->options = &options;
@@ -10378,7 +10379,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    /* This runs only once up front since other optimizations don't affect it */
    NIR_PASS(_, nir, nir_opt_shrink_stores, true);
 
-   agx_optimize_loop_nir(nir, m5, g17p);
+   const bool agx3_unroll = byte_indices || m5;
+   agx_optimize_loop_nir(nir, m5, g17p, agx3_unroll);
 
    /* Loops are unrolled now: a subgroup XOR shuffle whose mask is still not
     * a constant takes the general lowering (agx_nir_lower_subgroups.c).
@@ -10387,31 +10389,32 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       bool lowered = false;
       NIR_PASS(lowered, nir, agx_nir_lower_dynamic_shuffle_xor);
       if (lowered)
-         agx_optimize_loop_nir(nir, m5, g17p);
+         agx_optimize_loop_nir(nir, m5, g17p, agx3_unroll);
    }
 
    /* Counted loops whose trip count is only known at run time: run several
-    * iterations per loop test where the bound allows it. On M5 the loop
+    * iterations per loop test where the bound allows it. On AGX3 the loop
     * control of a short body costs about as much as the body, and the
     * unrolled body's loads issue together and vectorize below. Bodies of up
     * to 40 instructions run 8 iterations per test (Metal's compiler unrolls
     * such loops by 8 when the source asks for it, as Geekbench's Hamming
     * distance does; SPIR-V carries no such hint), up to 80 run 4, up to 160
     * run 2. agx_compile_shader_nir compiles again with 4 if 8 costs
-    * occupancy. */
-   if (m5 && !g18_scans) {
+    * occupancy (AGX3C) or Dynamic Caching register pressure (AGX3B). */
+   const bool agx3_compute_opts = agx3_unroll && !g18_scans;
+   if (agx3_compute_opts) {
       bool unrolled = false;
       NIR_PASS(unrolled, nir, agx_nir_unroll_runtime_loops, m5_unroll_factor,
                320, m5_unroll_widest);
       if (unrolled)
-         agx_optimize_loop_nir(nir, m5, g17p);
+         agx_optimize_loop_nir(nir, m5, g17p, agx3_unroll);
    }
 
-   if (m5 && !g18_scans)
+   if (agx3_compute_opts)
       NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
 
    /* Absolute differences of unsigned bytes in 16-bit arithmetic. */
-   if (m5 && !g18_scans) {
+   if (agx3_compute_opts) {
       bool narrowed = false;
       NIR_PASS(narrowed, nir, agx_nir_opt_u8_absdiff);
       if (narrowed) {
@@ -10422,14 +10425,14 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    }
 
    /* Zero-extended bytes and halves convert to f32 from their half register. */
-   if (m5 && !g18_scans)
+   if (agx3_compute_opts)
       NIR_PASS(_, nir, agx_nir_opt_m5_narrow_to_float);
 
    /* Consecutive words read together, such as the unrolled iterations' reads
-    * of one array, become one vector load. */
-   /* With soft faults, robust buffer reads are plain reads followed by a
-    * bounds select, so a read past the end is not undefined: leave them. */
-   if (m5 && !g18_scans && !soft_fault) {
+    * of one array, become one vector load. Robust buffer reads under soft
+    * faults rely on checked_offsets bounds selects, so only merge when
+    * !checked_offsets. */
+   if (agx3_compute_opts && (!soft_fault || !checked_offsets)) {
       bool merged = false;
       NIR_PASS(merged, nir, agx_nir_merge_global_words);
       if (merged) {
@@ -10526,7 +10529,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
 
    /* Rows at (x + c) * uniform stride: one shared multiply-add, then an add
     * of a preamble-uniform c * stride per row. */
-   if (m5 && !g18_scans)
+   if (agx3_compute_opts)
       NIR_PASS(_, nir, agx_nir_opt_uniform_stride);
 
    /* Now that loads carry an index, a select between two of them can choose
@@ -14055,7 +14058,8 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
     * will run through the loop later, once we have the shader key, but if we
     * run now, that run will ideally be almost a no-op.
     */
-   agx_optimize_loop_nir(nir, !g17p && native_fragment_depth, g17p);
+   agx_optimize_loop_nir(nir, !g17p && native_fragment_depth, g17p,
+                         g17p || native_fragment_depth);
 
    /* Lower idiv after an optimization loop so we can constant fold more before
     * nir_opt_idiv_const.
@@ -14137,6 +14141,11 @@ agx_preprocess_nir(nir_shader *nir)
 void
 agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip)
 {
+   /* Before the main optimization loop reassociates the last addition of a
+    * written-out population count into its user. */
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
    agx_preprocess_nir_internal(nir, true, true, false, false,
                                chip == AGX_CHIP_G17P);
 }
@@ -16600,14 +16609,18 @@ agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
                   nir_metadata_control_flow, NULL);
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-       !key->dev.emit_agx3d &&
+   const bool agx3_native_compute =
+      (key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+       key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+      !key->dev.emit_agx3d;
+
+   if (agx3_native_compute &&
        nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
        nir->info.shared_size && !key->secondary) {
       /* Match 32x32 FP32 shared-memory GEMM tiles whose K-chain ffmads carry
        * no float-math-control bits (no NoContraction, no FPFastMathMode
        * lacking AllowReassoc/AllowContract, and no float-controls execution
-       * mode) and lower them to AGX3C f32matmad8x8 matrix operations. */
+       * mode) and lower them to AGX3 f32matmad8x8 matrix operations. */
       struct agx_gemm_match gemm;
       if (agx_nir_match_gemm(nir, &gemm))
          NIR_PASS(_, nir, agx_nir_lower_gemm, &gemm);
@@ -16624,13 +16637,11 @@ agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
 
    /* A workgroup of one subgroup needs only SIMD-group fences. (Runs after
     * any pass that delimits shared-memory phases by workgroup barriers.) */
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-       !key->dev.emit_agx3d)
+   if (agx3_native_compute)
       NIR_PASS(_, nir, agx_nir_narrow_single_subgroup_barriers);
    /* Larger workgroups: the barriers whose shared traffic stays in
     * subgroup 0, such as a tree reduction's last five steps. */
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-       !key->dev.emit_agx3d)
+   if (agx3_native_compute)
       NIR_PASS(_, nir, agx_nir_narrow_subgroup0_barriers);
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
@@ -16825,9 +16836,11 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                        struct agx_shader_part *out)
 {
    const unsigned factor = 8;
-   const bool m5 = key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-                   !key->dev.emit_agx3d;
-   if (!m5)
+   const bool agx3_native =
+      (key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+       key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+      !key->dev.emit_agx3d;
+   if (!agx3_native)
       return agx_compile_shader_nir_once(nir, key, out, 4, NULL);
 
    nir_shader *clone = nir_shader_clone(NULL, nir);
