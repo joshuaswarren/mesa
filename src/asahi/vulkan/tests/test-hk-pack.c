@@ -8,6 +8,7 @@
 #include "util/ralloc.h"
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
+#include "hk_compute_pair.h"
 #include "hk_pack.h"
 #include "hk_queue.h"
 
@@ -1260,6 +1261,82 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    abort();
 }
 
+static void
+test_compute_pair_stream_safety(void)
+{
+   struct hk_compute_pair_dispatch pair = {0};
+   struct hk_cs base = {
+      .type = HK_CS_CDM,
+      .compute_pair = &pair,
+      .stats = { .cmds = 1, .calls = 1 },
+      .pack_dispatches = 1,
+   };
+   T("compute_pair clean single-dispatch",
+     hk_compute_pair_stream_eligible(&base));
+
+   struct hk_cs cs;
+   cs = base; cs.compute_pair = NULL;
+   T("compute_pair rejects NULL metadata", !hk_compute_pair_stream_eligible(&cs));
+
+   /* [producer, barrier, X] or [consumer, Y]: multiple commands in one stream */
+   cs = base; cs.stats.cmds = 2; cs.stats.calls = 2; cs.pack_dispatches = 2;
+   T("compute_pair rejects multi-dispatch stream", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.stats.cmds = 2;
+   T("compute_pair rejects extra non-call cmd", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.pack_dispatches = 2;
+   T("compute_pair rejects pack_dispatches != 1", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.stream_linked = true;
+   T("compute_pair rejects stream_linked", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.calls_stream = true;
+   T("compute_pair rejects calls_stream", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.sib_indirect = true;
+   T("compute_pair rejects sib_indirect", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.uses_global_atomics = true;
+   T("compute_pair rejects global atomics", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.query_access = true;
+   T("compute_pair rejects query_access", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.query_reset_pending = true;
+   T("compute_pair rejects query_reset_pending", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.timestamp.start.handle = 1;
+   T("compute_pair rejects start timestamp", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.timestamp.end.handle = 1;
+   T("compute_pair rejects end timestamp", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.g17p_timestamp_query = true;
+   T("compute_pair rejects g17p_timestamp_query", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.gen1_native_rq = true;
+   T("compute_pair rejects gen1_native_rq", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.as_build = true;
+   T("compute_pair rejects as_build", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.alias_sites = 1;
+   T("compute_pair accepts single tail alias_site", hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.alias_sites = 2;
+   T("compute_pair rejects multiple alias_sites", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.g18_dispatch_sealed = true;
+   T("compute_pair rejects g18_dispatch_sealed", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.imm_writes.size = 16;
+   T("compute_pair rejects imm_writes", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.type = HK_CS_VDM;
+   T("compute_pair rejects non-CDM stream", !hk_compute_pair_stream_eligible(&cs));
+}
+
 int
 main(void)
 {
@@ -1281,6 +1358,7 @@ main(void)
    test_full_classes();
    test_random();
    test_history();
+   test_compute_pair_stream_safety();
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
