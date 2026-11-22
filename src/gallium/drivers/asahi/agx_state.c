@@ -1272,6 +1272,15 @@ agx_set_sampler_views(struct pipe_context *pctx, mesa_shader_stage shader,
       if (views[i]) {
          struct agx_sampler_view *view = (struct agx_sampler_view *)views[i];
          agx_legalize_compression(ctx, view->rsrc, view->format);
+
+         /* Gallium AGX3 does not use compressed cube descriptors (a 6-layer
+          * compressed 2D array can be reinterpreted as a cube view via
+          * glTextureView). Decompress before binding a cube sampler view. */
+         if (view->rsrc->layout.compressed &&
+             agx_gallium_descriptor_generation_is_agx3(
+                agx_chip_descriptor_generation(agx_device(pctx->screen)->chip)) &&
+             target_is_cube(view->base.target))
+            agx_decompress(ctx, view->rsrc, "Compressed cube view");
       }
       pipe_sampler_view_reference(
          (struct pipe_sampler_view **)&ctx->stage[shader].textures[i],
