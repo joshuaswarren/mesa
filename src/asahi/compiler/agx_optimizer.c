@@ -1009,24 +1009,30 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
          const bool m5_uniform_base =
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
 
-         /* On AGX3B a scalar W8 load and four packed W8 components both
-          * return one physical word, and the LDDEV encoding reads an aligned
-          * base directly from the low uniform file. Both are properties of
-          * the encoding, so this holds on every AGX3B part. */
-         const bool agx3b_w8_uniform_base =
+         /* On AGX3B the LDDEV base operand (group 567) is orthogonal to
+          * element width and component mask and reads any four-half-aligned
+          * low-file uniform directly. Keep the compute, non-internal,
+          * non-secondary, non-coherent scope so vertex/fragment fixed-shape
+          * paths remain unchanged, and widen to 16-bit and 32-bit scalar or
+          * vector loads (in addition to W8). */
+         const bool agx3b_uniform_base =
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
             ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
             ctx->nir && !ctx->nir->info.internal && !ctx->key->secondary &&
-            I->format == AGX_FORMAT_I8 && !I->coherent &&
-            I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
-            agx_channels(I->dest[0]) == 1 &&
-            ((!I->memory_is_packed && I->mask == 0x1) ||
-             (I->memory_is_packed && I->mask == 0xf)) &&
+            !I->coherent &&
+            I->nr_dests == 1 &&
+            ((I->format == AGX_FORMAT_I8 && I->dest[0].size == AGX_SIZE_32 &&
+              agx_channels(I->dest[0]) == 1 &&
+              ((!I->memory_is_packed && I->mask == 0x1) ||
+               (I->memory_is_packed && I->mask == 0xf))) ||
+             ((I->format == AGX_FORMAT_I16 || I->format == AGX_FORMAT_I32) &&
+              (I->dest[0].size == AGX_SIZE_16 ||
+               I->dest[0].size == AGX_SIZE_32))) &&
             !src.kill && !src.cache && !src.discard &&
             !lo.kill && !lo.cache && !lo.discard &&
             !hi.kill && !hi.cache && !hi.discard;
 
-         if ((m5_uniform_base || agx3b_w8_uniform_base) &&
+         if ((m5_uniform_base || agx3b_uniform_base) &&
              lo.type == AGX_INDEX_UNIFORM && hi.type == AGX_INDEX_UNIFORM &&
              lo.size == AGX_SIZE_32 && hi.size == AGX_SIZE_32 &&
              agx_channels(lo) == 1 && agx_channels(hi) == 1 &&

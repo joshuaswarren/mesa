@@ -2008,3 +2008,94 @@ TEST_F(Optimizer, Agx3bFoldsZeroExtendedHalfIntoIadd)
       EXPECT_EQ(I->src[1].neg, c.neg1) << c.name;
    }
 }
+
+TEST_F(Optimizer, AGX3BFoldsAlignedUniformDeviceLoadBase)
+{
+   struct load_case {
+      const char *name;
+      mesa_shader_stage stage;
+      enum agx_format fmt;
+      enum agx_size dst_size;
+      unsigned channels;
+      unsigned mask;
+      bool packed;
+      bool coherent;
+      bool internal;
+      bool secondary;
+      bool preamble;
+      unsigned base_u;
+      bool expect_fold;
+   };
+
+   const load_case cases[] = {
+      /* Compute I8 scalar & packed, aligned low uniform -> fold */
+      {"compute-i8-scalar", MESA_SHADER_COMPUTE, AGX_FORMAT_I8, AGX_SIZE_32, 1,
+       0x1, false, false, false, false, false, 4u, true},
+      {"compute-i8-packed", MESA_SHADER_COMPUTE, AGX_FORMAT_I8, AGX_SIZE_32, 1,
+       0xf, true, false, false, false, false, 8u, true},
+      /* Compute I16/I32 scalar & vector masks -> fold */
+      {"compute-i16-scalar", MESA_SHADER_COMPUTE, AGX_FORMAT_I16, AGX_SIZE_16,
+       1, 0x1, false, false, false, false, false, 4u, true},
+      {"compute-i16-vec4", MESA_SHADER_COMPUTE, AGX_FORMAT_I16, AGX_SIZE_16, 4,
+       0xf, false, false, false, false, false, 8u, true},
+      {"compute-i32-scalar", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32,
+       1, 0x1, false, false, false, false, false, 4u, true},
+      {"compute-i32-vec4", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 4,
+       0xf, false, false, false, false, false, 8u, true},
+      /* Unaligned or high uniform file -> refuse */
+      {"unaligned-u2", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1,
+       0x1, false, false, false, false, false, 2u, false},
+      {"high-file-u256", MESA_SHADER_COMPUTE, AGX_FORMAT_I16, AGX_SIZE_16, 4,
+       0xf, false, false, false, false, false, 256u, false},
+      /* Non-compute, coherent, internal, secondary, preamble, 64-bit -> refuse */
+      {"vertex-i32", MESA_SHADER_VERTEX, AGX_FORMAT_I32, AGX_SIZE_32, 1, 0x1,
+       false, false, false, false, false, 4u, false},
+      {"fragment-i32", MESA_SHADER_FRAGMENT, AGX_FORMAT_I32, AGX_SIZE_32, 1,
+       0x1, false, false, false, false, false, 4u, false},
+      {"coherent-i32", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1,
+       0x1, false, true, false, false, false, 4u, false},
+      {"internal-i32", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1,
+       0x1, false, false, true, false, false, 4u, false},
+      {"secondary-i32", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1,
+       0x1, false, false, false, true, false, 4u, false},
+      {"preamble-i32", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1,
+       0x1, false, false, false, false, true, 4u, false},
+      {"dest-64bit", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_64, 1, 0x1,
+       false, false, false, false, false, 4u, false},
+   };
+
+   for (const load_case &c : cases) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.secondary = c.secondary;
+      b->shader->key = &key;
+      b->shader->stage = c.stage;
+      b->shader->is_preamble = c.preamble;
+      b->shader->nir = rzalloc(mem_ctx, nir_shader);
+      b->shader->nir->info.stage = c.stage;
+      b->shader->nir->info.internal = c.internal;
+
+      agx_index base = agx_temp(b->shader, AGX_SIZE_64);
+      agx_instr *col = agx_collect_to(b, base, 2);
+      col->src[0] = agx_uniform(c.base_u, AGX_SIZE_32);
+      col->src[1] = agx_uniform(c.base_u + 2, AGX_SIZE_32);
+
+      agx_index dst = agx_vec_temp(b->shader, c.dst_size, c.channels);
+      agx_instr *ld =
+         agx_device_load_to(b, dst, base, wx, c.fmt, c.mask, 0, false);
+      ld->memory_is_packed = c.packed;
+      ld->coherent = c.coherent;
+      agx_unit_test(b, dst);
+
+      agx_optimize_and_dce(b->shader);
+
+      if (c.expect_fold) {
+         EXPECT_EQ(ld->src[0].type, AGX_INDEX_UNIFORM) << c.name;
+         EXPECT_EQ(ld->src[0].value, c.base_u) << c.name;
+         EXPECT_EQ(ld->src[0].size, AGX_SIZE_64) << c.name;
+      } else {
+         EXPECT_EQ(ld->src[0].type, AGX_INDEX_NORMAL) << c.name;
+      }
+   }
+}
