@@ -42,16 +42,30 @@ __typeof__(hk_get_cgroup_memory_available) __wrap_hk_get_cgroup_memory_available
 __typeof__(__vk_errorf) __wrap___vk_errorf;
 __typeof__(os_get_available_system_memory) __wrap_os_get_available_system_memory;
 __typeof__(os_get_total_physical_memory) __wrap_os_get_total_physical_memory;
+__typeof__(agx_bo_cache_has) __wrap_agx_bo_cache_has;
+__typeof__(agx_bo_cache_has) __real_agx_bo_cache_has;
 
 /* The reserve check reads real RAM in production. Fixed values keep this test
  * independent of the machine it runs on. */
 static uint64_t fake_available = UINT64_C(64) * 1024 * MIB;
 static uint64_t fake_total = UINT64_C(32) * 1024 * MIB;
 static bool meminfo_readable = true;
+/* hk_AllocateMemory() asks the BO cache before it reads /proc/meminfo and
+ * does neither below 1 MiB. Count both to check that order. */
+static unsigned meminfo_reads, cache_queries;
+
+bool
+__wrap_agx_bo_cache_has(struct agx_device *dev, size_t size, size_t align,
+                        uint32_t flags)
+{
+   ++cache_queries;
+   return __real_agx_bo_cache_has(dev, size, align, flags);
+}
 
 bool
 __wrap_os_get_available_system_memory(uint64_t *size)
 {
+   ++meminfo_reads;
    *size = fake_available;
    return meminfo_readable;
 }
@@ -510,11 +524,15 @@ main(void)
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    fake_total = UINT64_C(32) * 1024 * MIB;
 
-   /* Allocations below 1 MiB are never refused, 1 MiB is. */
+   /* Allocations below 1 MiB are never refused, 1 MiB is. Below 1 MiB
+    * neither the BO cache nor /proc/meminfo is consulted. */
    fake_available = 0;
+   meminfo_reads = cache_queries = 0;
    assert(alloc(dev, MIB / 2, &memory) == VK_SUCCESS);
+   assert(!meminfo_reads && !cache_queries);
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    assert(alloc(dev, MIB, &memory) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   assert(meminfo_reads == 1 && cache_queries == 1);
 
    /* An unreadable /proc/meminfo leaves only the heap limit. */
    meminfo_readable = false;
@@ -529,11 +547,15 @@ main(void)
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    fake_available = 1024 * MIB;
    before = bo_calls;
+   /* A cache hit does not read /proc/meminfo; a miss reads it once. */
+   meminfo_reads = cache_queries = 0;
    assert(alloc(dev, 128 * MIB, &memory) == VK_SUCCESS);
    assert(bo_calls == before);
+   assert(cache_queries == 1 && !meminfo_reads);
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    assert(alloc(dev, 512 * MIB, &memory) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
    assert(bo_calls == before);
+   assert(cache_queries == 2 && meminfo_reads == 1);
    agx_bo_cache_evict_all(&dev->dev);
 
    /* An fd import whose object is smaller than allocationSize is refused,

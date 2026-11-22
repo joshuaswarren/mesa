@@ -696,7 +696,15 @@ if with_tests
       '-Wl,--wrap=agx_bo_export', '-Wl,--wrap=agx_bo_import',
       '-Wl,--wrap=hk_get_cgroup_memory_available', '-Wl,--wrap=__vk_errorf',
       '-Wl,--wrap=os_get_available_system_memory',
-      '-Wl,--wrap=os_get_total_physical_memory']),
+      '-Wl,--wrap=os_get_total_physical_memory',
+      '-Wl,--wrap=agx_bo_cache_has']),
+    suite : ['asahi'])
+  test('hk_cache_identity', executable('hk_cache_identity_test',
+    files('tests/test-hk-cache-identity.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections, hk_wrap_test_link_args]),
     suite : ['asahi'])
   test('hk_push_descriptor_size', executable('hk_push_descriptor_size_test',
     files('tests/test-hk-push-descriptor-size.c'),
