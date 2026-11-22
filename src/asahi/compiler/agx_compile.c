@@ -10962,18 +10962,28 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    NIR_PASS(pre_alg_progress, nir, nir_opt_peephole_select,
             &peephole_select_options);
 
-   /* Small uniform ifs whose arms load from memory, which peephole select
-    * keeps: on M5 an if costs five control-flow instructions and a wait for
-    * every load in flight. Flattening one can expose another around it.
+   /* Small ifs whose arms load from memory, which peephole select keeps: on
+    * AGX3 an if costs a compare, an exec-mask push, a skip branch and a pop,
+    * and waits for every load in flight. M5 flattens small uniform ifs; every
+    * AGX3 encoding flattens the divergent if of a short-circuit operand that
+    * reads a uniform address (agx_nir_opt_flatten_loads.c). Flattening one
+    * can expose another around it, and peephole select reruns only then.
     * Not on G18G, which compiles as AGX3C with emit_agx3d (g18_scans). */
    bool any_flattened = false;
-   if (m5 && !g18_scans) {
-      bool flattened;
+   if ((byte_indices || m5) && !g18_scans) {
+      bool flattened, selected = false;
       do {
          flattened = false;
-         NIR_PASS(flattened, nir, agx_nir_opt_flatten_loads, 64, 4);
-         NIR_PASS(flattened, nir, nir_opt_peephole_select,
-                  &peephole_select_options);
+         if (m5)
+            NIR_PASS(flattened, nir, agx_nir_opt_flatten_loads, 64, 4);
+         NIR_PASS(flattened, nir,
+                  agx_nir_opt_flatten_short_circuit_uniform_loads);
+         if (flattened || selected) {
+            selected = false;
+            NIR_PASS(selected, nir, nir_opt_peephole_select,
+                     &peephole_select_options);
+         }
+         flattened |= selected;
          any_flattened |= flattened;
       } while (flattened);
       if (any_flattened) {
