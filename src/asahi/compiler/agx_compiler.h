@@ -1390,6 +1390,7 @@ unsigned agx_calc_register_demand(agx_context *ctx, bool remat);
 unsigned agx3_tile_store_bank(agx_context *ctx);
 
 void agx_lower_64bit_postra(agx_context *ctx);
+bool agx_lower_agx3_widening_int(agx_context *ctx);
 void agx_insert_waits(agx_context *ctx);
 void agx_opt_empty_else(agx_context *ctx);
 void agx_opt_register_cache(agx_context *ctx);
