@@ -366,7 +366,8 @@ check_legacy_depth_policy(void)
                   const bool expected =
                      f < 3 && u < 3 && levels == 1 &&
                      (samples == 1 ||
-                      (samples == 2 && layers == 1 && u != 1));
+                      ((samples == 2 || samples == 4) && layers == 1 &&
+                       u != 1));
                   CHECK(ELIGIBLE(i) == expected);
                   CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &i) ==
                         (expected && f == 2 && samples == 1));
@@ -509,14 +510,15 @@ check_transport_fever_3(void)
          {VK_FORMAT_D32_SFLOAT_S8_UINT, 0x23, true},
       };
    for (unsigned g = 0; g < sizeof(gbuffer) / sizeof(gbuffer[0]); ++g) {
+      const bool is_depth = gbuffer[g].format == VK_FORMAT_D32_SFLOAT_S8_UINT;
       VkImageCreateInfo i =
          image(gbuffer[g].format, 3456, 2234, 1, gbuffer[g].usage);
       i.samples = VK_SAMPLE_COUNT_2_BIT;
       CHECK(ELIGIBLE(i) == gbuffer[g].m4_pro);
       CHECK(!g16s_eligible(AGX_CHIP_G17P, 1, &i));
-      CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i));
+      CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i) == is_depth);
       i.samples = VK_SAMPLE_COUNT_4_BIT;
-      CHECK(!ELIGIBLE(i));
+      CHECK(ELIGIBLE(i) == is_depth);
    }
 }
 
@@ -820,17 +822,25 @@ check_m4_max(void)
    VkImageCreateInfo d = image(VK_FORMAT_D32_SFLOAT, 1920, 1080, 1, ds);
    CHECK(M4_MAX(d) && NEO(d));
    d.samples = VK_SAMPLE_COUNT_2_BIT;
-   CHECK(M4_MAX(d) && !NEO(d));
+   CHECK(M4_MAX(d) && NEO(d));
    d.samples = VK_SAMPLE_COUNT_4_BIT;
-   CHECK(!M4_MAX(d) && !NEO(d));
+   CHECK(M4_MAX(d) && NEO(d));
 
    /* Single-level depth arrays are admitted across G17P. */
    d = image(VK_FORMAT_D32_SFLOAT, 1024, 1024, 1, ds);
    d.arrayLayers = 4;
    CHECK(M4_MAX(d) && NEO(d));
 
-   /* Other chips never. */
+   /* Other chips never (except native HAL200 G16G for 2x/4x MSAA depth). */
    CHECK(!runtime_m4_max(AGX_CHIP_G14G, 0, &c));
+   d = image(VK_FORMAT_D32_SFLOAT, 1920, 1080, 1, ds);
+   CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &d));
+   d.samples = VK_SAMPLE_COUNT_2_BIT;
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &d));
+   CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G15G, 0, 0, &d));
+   d.samples = VK_SAMPLE_COUNT_4_BIT;
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &d));
+   CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G15G, 0, 0, &d));
 }
 
 static void

@@ -11,7 +11,8 @@
 #include <stddef.h>
 #include <string.h>
 
-/* G17P lossless compression policy.
+/* HAL200 lossless compression policy (G17P full policy, plus 2x/4x MSAA depth
+ * across native HAL200).
  *
  * The compressed Gen9 PBE (write) packet matches Apple's HAL200 StateFields
  * encoder byte-for-byte for GPU-tiled one-layer 2D images, the read
@@ -45,11 +46,14 @@
  *    field back as zero, however it was written. Rendering NaN into an
  *    R11G11B10F attachment has to keep it, so they stay plain.
  *  - Depth: D16_UNORM, D32_SFLOAT and both planes of D32_SFLOAT_S8_UINT,
- *    one level, one sample (single-layer or arrays); under the same 2x
- *    property also the depth plane at 2x (one layer). The 2x depth
- *    plane alone excludes input-attachment, feedback-loop and
- *    sample-location use (its S8 plane stays plain). The ZLS unit compresses the S8
- *    stencil plane with the same metadata layout as depth (stencil
+ *    one level, one sample (single-layer or arrays) on G17P; across HAL200
+ *    (G16G and G17P) also the depth plane at 2x and 4x (one level, one layer,
+ *    plane 0 only). Multisampled depth goes through ZLS rather than the colour
+ *    tilebuffer's background reload program, so it is unaffected by
+ *    AGX_QUIRK_UNCOVERED_TILE_MS_DEFECT. The 2x/4x depth plane excludes
+ *    input-attachment, feedback-loop and sample-location use (its S8 plane
+ *    stays plain). The ZLS unit compresses the S8 stencil plane with the same
+ *    metadata layout as depth (stencil
  *    load/store compression bits 4/8), it is read through its R8_UINT
  *    alias, and its clears are metadata fast clears. Zink stores GL Z24S8
  *    as D32S8, so these planes carry every GL depth/stencil buffer's ZLS
@@ -74,7 +78,7 @@
  * outside the image. Storage images are not admitted: shader stores leave
  * the metadata as it was (hk_image.c).
  *
- * This is the only G17P policy: every eligible image is compressed, with no
+ * This is the only HAL200 policy: every eligible image is compressed, with no
  * runtime opt-out.
  */
 
@@ -173,15 +177,15 @@ hk_g17p_compression_depth_format(VkFormat format)
 #define HK_G17P_WSI_IMAGE_CREATE_INFO_MESA ((VkStructureType)1000001002)
 
 /* Whether plane `plane` of an image created with `info` is compressed on
- * `chip`. There is no opt-out: every eligible G17P image takes the compressed
- * path. The generic hk_can_compress() checks (sparse, mutable-format
- * compatibility, ail_can_compress, the AGX-wide nocompress debug flag) still
- * apply. */
+ * `chip`. There is no opt-out: every eligible HAL200 image takes the
+ * compressed path. The generic hk_can_compress() checks (sparse,
+ * mutable-format compatibility, ail_can_compress, the AGX-wide nocompress
+ * debug flag) still apply. */
 static inline bool
 hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
                                unsigned plane, const VkImageCreateInfo *info)
 {
-   if (chip != AGX_CHIP_G17P || !info ||
+   if (!agx_chip_native_hal200(chip) || !info ||
        (plane != 0 && !(plane == 1 &&
                         info->format == VK_FORMAT_D32_SFLOAT_S8_UINT)))
       return false;
@@ -194,8 +198,8 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
     *
     * All G17P SoCs share the Gen9 PBE, ZLS and texture encodings for layered,
     * cube and 3D colour, non-attachment 2x/4x MSAA colour, and single-level
-    * depth arrays. 2x colour attachments and 2x depth are additionally gated
-    * by the hardware 2x uncovered-tile reload defect below (ms2x). 4x colour
+    * depth arrays. 2x colour attachments are additionally gated by the
+    * hardware 2x uncovered-tile reload defect below (ms2x). 4x colour
     * attachments stay plain on every G17P SoC: a 4x reload loses the upper
     * bytes of a wide sample (agx_chip_uncovered_tile_ms_reload_defect(chip,
     * chip_id, 4)), so a pass that reloads them spills them, and G17P has no
@@ -272,15 +276,25 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
    const bool multisampled = info->samples != VK_SAMPLE_COUNT_1_BIT;
    const bool three_d = info->imageType == VK_IMAGE_TYPE_3D;
    if (!color) {
-      /* 2x depth, lossless through ZLS load/store, depth resolve and texture
-       * reads where the 2x uncovered-tile reload defect does not apply. */
-      const bool depth_2x =
-         ms2x && plane == 0 && info->samples == VK_SAMPLE_COUNT_2_BIT &&
+      /* 2x/4x depth goes through ZLS (agx_pack_zls_control), sampled texture
+       * reads/resolves, and graphics copies (hk_copy_requires_gfx), never the
+       * colour tilebuffer's background reload program, so it is unaffected by
+       * AGX_QUIRK_UNCOVERED_TILE_MS_DEFECT across native HAL200. Plane 0 is
+       * verified lossless on M4 (G16G) and A18 Pro (G17P); 2x depth was also
+       * measured on M4 Pro / M4 Max (G17P). The S8 plane stays plain. */
+      const bool depth_ms =
+         plane == 0 &&
+         (info->samples == VK_SAMPLE_COUNT_2_BIT ||
+          info->samples == VK_SAMPLE_COUNT_4_BIT) &&
          depth &&
          !(info->usage & (VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
                           VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)) &&
          !(info->flags &
            VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT);
+      /* Non-G17P HAL200 parts (G16G) only take 2x/4x MSAA depth here;
+       * single-sample depth stays plain until verified separately on G16G. */
+      if (chip != AGX_CHIP_G17P && !depth_ms)
+         return false;
       /* Single-sample, single-level depth arrays across G17P. Every access to
        * one layer addresses its metadata at compression_layer_stride_B: ZLS
        * (with the metadata layer stride for layered rendering), the metadata
@@ -291,7 +305,7 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
          depth;
       if (info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
           !info->arrayLayers || (info->arrayLayers != 1 && !depth_array) ||
-          (info->samples != VK_SAMPLE_COUNT_1_BIT && !depth_2x) ||
+          (info->samples != VK_SAMPLE_COUNT_1_BIT && !depth_ms) ||
           info->tiling != VK_IMAGE_TILING_OPTIMAL || info->mipLevels < 1 ||
           (info->flags & ~allowed_flags) || (info->usage & ~allowed_usage) ||
           info->extent.width < 16 || info->extent.height < 16)
@@ -299,6 +313,11 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
 
       return depth && info->mipLevels == 1;
    }
+
+   /* Non-G17P HAL200 parts (G16G) keep colour plain here; G16G single-sample
+    * colour compression is gated separately (#638). */
+   if (chip != AGX_CHIP_G17P)
+      return false;
 
    /* 16-byte texels stay on the single-sample, single-layer 2D shape. */
    if (color_16b && (three_d || multisampled || info->arrayLayers != 1))

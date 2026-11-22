@@ -1334,8 +1334,9 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                             bool float_image_atomics, bool srgb_pair_views,
                             bool multiview)
 {
-   /* AGX3: G17P compresses every image hk_g17p_compression.h admits. Other
-    * AGX3 chips stay plain until their packets are recovered. */
+   /* AGX3: HAL200 (G17P and, for 2x/4x MSAA depth, G16G) and M5 compress every
+    * image hk_g17p_compression.h admits. Other AGX3 chips stay plain until
+    * their packets are recovered. */
    const bool m5_storage =
       hk_m5_storage_compression_eligible(dev, plane, info, float_image_atomics);
    bool allow_agx3 =
