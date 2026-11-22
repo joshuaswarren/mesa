@@ -1915,7 +1915,7 @@ try_kill_early_sources(struct ra_ctx *rctx, const agx_instr *I,
        dest_end > dest_limit(rctx, I, 0) ||
        (rctx->ssa_to_reg[I->src[first_source].value] & (dest_size - 1)) ||
        ((region_end < dest_end) &&
-        BITSET_TEST_RANGE(rctx->used_regs[RA_GPR], region_end, dest_end)))
+        BITSET_TEST_RANGE(rctx->used_regs[RA_GPR], region_end, dest_end - 1)))
       return;
 
    for (unsigned s = first_source; s <= last_source; ++s) {
