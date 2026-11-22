@@ -30,9 +30,10 @@ extern "C" {
  * twins of unlinked mesh shaders, to 42 when unlinked G17P vertex
  * shaders over the canonical size carry relocatable varying writes, to 43
  * when agx_shader_info gains launch_size, to 44 when unlinked G17P vertex
- * shaders drop the canonical layout for the relocatable one, and to 46 when
- * compute shaders carry packed vec4 alternates. */
-#define HK_AGX3_SHADER_BINARY_VERSION 46u
+ * shaders drop the canonical layout for the relocatable one, to 46 when
+ * compute shaders carry packed vec4 alternates, and to 47 when they carry
+ * compute-pair state in a third variant byte. */
+#define HK_AGX3_SHADER_BINARY_VERSION 47u
 #define HK_CLASSIC_SHADER_BINARY_VERSION 35u
 /* AGX2 binaries include attachmentless layer-zero root lowering and fs.reads_layer. */
 #define HK_AGX2_SHADER_BINARY_VERSION 37u

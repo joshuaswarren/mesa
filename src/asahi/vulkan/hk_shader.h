@@ -34,6 +34,8 @@
 #include "vk_shader.h"
 
 struct hk_physical_device;
+struct hk_compute_pair_info;
+struct hk_compute_pair_producer;
 struct hk_pipeline_compilation_ctx;
 struct vk_descriptor_set_layout;
 struct vk_graphics_pipeline_state;
@@ -435,10 +437,13 @@ struct hk_api_shader {
     * code/data from the device's bounded binary cache. */
    struct hk_shader_binary_cache_entry *binary_cache_entry;
 
-   /* Optional compile-time packed vec4 alternates for eligible AGX3 compute
-    * shaders. */
+   /* Optional compile-time packed vec4 alternates and lazy compute-pair fusion
+    * state for eligible AGX3/M5 compute shaders. */
+   struct hk_compute_pair_info *compute_pair;
+   struct hk_compute_pair_producer *compute_pair_producer;
    struct hk_shader *identity_copy4;
    struct hk_shader *im2col_vec4;
+   struct hk_shader *depthwise_vec4;
    struct hk_identity_copy4 identity_copy4_info;
 
    /* Is this an internal passthrough geometry shader? */
