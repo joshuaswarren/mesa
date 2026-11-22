@@ -193,6 +193,18 @@ store_memory(nir_builder *b, unsigned bindless_base, unsigned nr_samples,
              enum pipe_format format, unsigned rt, nir_def *value,
              nir_def *samples)
 {
+   /* AGX3 image writes take 32-bit sources. Widen 16-bit fragment outputs
+    * according to the attachment format class before storing to a spilled
+    * render target. */
+   if (value->bit_size == 16) {
+      if (util_format_is_pure_sint(format))
+         value = nir_i2i32(b, value);
+      else if (util_format_is_pure_uint(format))
+         value = nir_u2u32(b, value);
+      else
+         value = nir_f2f32(b, value);
+   }
+
    nir_def *image = handle_for_rt(b, bindless_base, rt, true);
    nir_def *tex_image = handle_for_rt(b, bindless_base, rt, false);
    nir_def *zero = nir_imm_intN_t(b, 0, 16);
