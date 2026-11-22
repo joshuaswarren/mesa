@@ -6179,8 +6179,8 @@ agx3_translate_device_atomic(const agx_instr *I,
  * displacement, while dynamically indexed returned operations arrive with a
  * register address after scalar lowering. */
 static bool
-agx3_translate_local_atomic(const agx_instr *I, uint8_t slot,
-                            uint16_t wait_mask,
+agx3_translate_local_atomic(const agx_instr *I, enum agx_isa_encoding enc,
+                            uint8_t slot, uint16_t wait_mask,
                             struct agx3_local_atomic_desc *d)
 {
    memset(d, 0, sizeof(*d));
@@ -6217,7 +6217,8 @@ agx3_translate_local_atomic(const agx_instr *I, uint8_t slot,
        (base.value & 3) == 0 && !base.cache && !base.discard && !base.kill) {
       d->address_kind = AGX3_ATOMIC_INDEX_IMMEDIATE;
       d->address = base.value;
-   } else if (agx3_src_is_register(base) && base.value <= 191 &&
+   } else if (agx3_src_is_register(base) &&
+              base.value <= (agx_encoding_is_g17_class(enc) ? 255 : 191) &&
               !(base.cache && base.discard)) {
       d->address_kind = AGX3_ATOMIC_INDEX_REGISTER;
       d->address = base.value;
@@ -16422,7 +16423,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             struct agx3_local_atomic_desc d;
             uint8_t bytes[AGX3_ATOMIC_MAX_LENGTH];
             uint8_t len = 0;
-            if (!agx3_translate_local_atomic(I, slot, wait, &d) ||
+            if (!agx3_translate_local_atomic(I, enc, slot, wait, &d) ||
                 !(agx_is_g18g(&ctx->key->dev)
                      ? agx3_atomic_encode_local_g18g(enc, &d, bytes, &len)
                      : agx3_atomic_encode_local(enc, &d, bytes, &len)) ||
