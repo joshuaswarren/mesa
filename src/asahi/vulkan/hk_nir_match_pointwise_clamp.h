@@ -182,7 +182,7 @@ hk_nir_build_depthwise_vec4(const struct nir_shader *producer,
                             const struct hk_nir_clamp_epilogue *epilogue);
 
 /* Build a Direct-B 4 KiB XOR-swizzled Shared-A f32matmad8x8 GEMM NIR alternate
- * (tile_n == 32 or 64) from a certified row-major GEMM producer (with
+ * (tile_n == 16, 32, or 64) from a certified row-major GEMM producer (with
  * cmat_valid == true). When `epilogue` is non-NULL, folds that exact clamp
  * epilogue into output writeback; handles arbitrary push layouts, bias_mode
  * arms, unconditional row/column bias, and biasless kernels. */
@@ -191,6 +191,16 @@ hk_nir_build_gemm_cmat(const struct nir_shader *producer,
                        const struct hk_nir_gemm_output *info,
                        uint32_t tile_n,
                        const struct hk_nir_clamp_epilogue *epilogue);
+
+/* M-tile height for each cooperative-matrix GEMM variant:
+ *   tile_n == 16: 32x16, K_step=32 (4 KiB shared A, 128 threads)
+ *   tile_n == 32: 64x32, K_step=16 (4 KiB shared A, 128 threads)
+ *   tile_n == 64: 32x64, K_step=32 (4 KiB shared A, 128 threads) */
+static inline uint32_t
+hk_gemm_cmat_tile_m(uint32_t tile_n)
+{
+   return tile_n == 32u ? 64u : 32u;
+}
 
 /* Validate dispatch dimensions for cooperative-matrix GEMM replacement.
  * Unguarded GEMM executes ceil(K/32) unconditional 32-wide tiles, so K must

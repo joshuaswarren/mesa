@@ -1373,9 +1373,10 @@ eval_compare_gemm_case(const struct gemm_test_opts *opts, uint32_t M,
       }
    }
 
+   const uint32_t tile_m = hk_gemm_cmat_tile_m(tile_n);
    const uint32_t alt_grid[3] = {
       (N + tile_n - 1u) / tile_n,
-      (M + 63u) / 64u,
+      (M + tile_m - 1u) / tile_m,
       1u,
    };
    struct hk_eval_ssbo ssbos_alt[4] = {
@@ -1443,8 +1444,9 @@ test_gemm_cmat_certify_and_build(void)
       HK_EVAL_CHECK(m_g17p.reads[1].offset_B == pos_cases[i].offset_B);
       HK_EVAL_CHECK(m_g17p.desc_comps == 4);
 
-      for (unsigned t = 0; t < 2; ++t) {
-         const uint32_t tile_n = t ? 64 : 32;
+      const uint32_t tile_ns[3] = { 16, 32, 64 };
+      for (unsigned t = 0; t < ARRAY_SIZE(tile_ns); ++t) {
+         const uint32_t tile_n = tile_ns[t];
          nir_shader *cmat = hk_nir_build_gemm_cmat(g17p, &m_g17p, tile_n, NULL);
          HK_EVAL_CHECK(cmat);
          nir_validate_shader(cmat, "gemm_cmat");
@@ -1504,6 +1506,32 @@ test_gemm_cmat_certify_and_build(void)
       ralloc_free(bad);
    }
 
+   /* Float controls mismatch between producer (mode 0) and clamp epilogue
+    * MUST be refused for every cooperative-matrix tile width. */
+   {
+      const struct gemm_test_opts o_fc = {
+         .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .use_ffma = true,
+      };
+      nir_shader *fc_prod = build_tiled_gemm_nir_opts(&o_fc);
+      run_hk_preprocess_for_test(fc_prod, false);
+      struct hk_nir_gemm_output m_fc = {0};
+      HK_EVAL_CHECK(hk_nir_match_gemm_output(
+         fc_prod, nir_address_format_64bit_global_32bit_offset, &m_fc));
+      HK_EVAL_CHECK(m_fc.cmat_valid);
+      const uint32_t bad_modes[] = {
+         FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP32,
+         FLOAT_CONTROLS_DENORM_PRESERVE_FP32,
+      };
+      const uint32_t tiles[] = { 16, 32, 64 };
+      for (unsigned mi = 0; mi < ARRAY_SIZE(bad_modes); ++mi) {
+         struct hk_nir_clamp_epilogue bad_ep = ep;
+         bad_ep.float_controls_execution_mode = bad_modes[mi];
+         for (unsigned ti = 0; ti < ARRAY_SIZE(tiles); ++ti)
+            HK_EVAL_CHECK(hk_nir_build_gemm_cmat(fc_prod, &m_fc, tiles[ti], &bad_ep) == NULL);
+      }
+      ralloc_free(fc_prod);
+   }
+
    /* Dispatch dimension gate: unguarded K = 16 mod 32 MUST be refused. */
    const uint32_t g64x64[3] = { 2, 2, 1 };
    const uint32_t g32x64[3] = { 1, 2, 1 };
@@ -1558,6 +1586,20 @@ test_gemm_cmat_certify_and_build(void)
    eval_compare_gemm_case(&o_guarded_fixed_row, 23, 39, 33, 0, 4, 4, 64, &ep,  600u);
    eval_compare_gemm_case(&o_guarded_fixed_col, 23, 39, 33, 1, 4, 4, 32, NULL, 601u);
    eval_compare_gemm_case(&o_guarded_nobias,    19, 25, 17, 2, 4, 4, 32, &ep,  602u);
+
+   /* cmat16 (32x16 K_step=32) bit-exact coverage: narrow N<=16, non-mult4 K,
+    * split bias, unguarded, fixed bias, and fused clamp epilogue. */
+   for (int bm = 0; bm <= 2; ++bm) {
+      eval_compare_gemm_case(&o_guarded_dyn,        37, 16, 27, bm, 4, 4, 16, NULL, 700u + bm);
+      eval_compare_gemm_case(&o_guarded_dyn,        65, 13, 48, bm, 4, 4, 16, &ep,  710u + bm);
+      eval_compare_gemm_case(&o_guarded_split_off4, 33, 16, 16, bm, 4, 4, 16, &ep,  720u + bm);
+   }
+   eval_compare_gemm_case(&o_unguarded_dyn,   64, 32, 64, 1, 0, 4, 16, &ep,  730u);
+   eval_compare_gemm_case(&o_guarded_fixed_row, 23, 11, 33, 0, 4, 4, 16, &ep, 731u);
+   eval_compare_gemm_case(&o_guarded_nobias,    19,  8, 17, 2, 4, 4, 16, &ep, 732u);
+   /* cmat32 (64x32 K_step=16) on N=96 and cmat64 (32x64 K_step=32) on N=144. */
+   eval_compare_gemm_case(&o_guarded_dyn, 65,  96, 48, 1, 4, 4, 32, &ep,  740u);
+   eval_compare_gemm_case(&o_guarded_dyn, 35, 144, 27, 1, 4, 4, 64, NULL, 741u);
 }
 
 int

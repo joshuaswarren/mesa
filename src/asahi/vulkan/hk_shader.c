@@ -5947,6 +5947,10 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
       hk_shader_destroy(dev, obj->depthwise_vec4, true);
       free(obj->depthwise_vec4);
    }
+   if (obj->gemm_cmat16) {
+      hk_shader_destroy(dev, obj->gemm_cmat16, true);
+      free(obj->gemm_cmat16);
+   }
    if (obj->gemm_cmat32) {
       hk_shader_destroy(dev, obj->gemm_cmat32, true);
       free(obj->gemm_cmat32);
@@ -8379,7 +8383,8 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
        (prod->info.role != HK_COMPUTE_PAIR_DEPTHWISE ||
         !prod->info.depthwise.vec4_valid))
       return NULL;
-   if ((alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 ||
+   if ((alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16 ||
+        alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 ||
         alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64) &&
        (prod->info.role != HK_COMPUTE_PAIR_GEMM ||
         !prod->info.gemm.cmat_valid ||
@@ -8405,6 +8410,9 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
    if (alt_kind == HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4) {
       fused_nir = hk_nir_build_depthwise_vec4(prod->nir, &prod->info.depthwise,
                                               epilogue);
+   } else if (alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16) {
+      fused_nir = hk_nir_build_gemm_cmat(prod->nir, &prod->info.gemm, 16,
+                                         epilogue);
    } else if (alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32) {
       fused_nir = hk_nir_build_gemm_cmat(prod->nir, &prod->info.gemm, 32,
                                          epilogue);
@@ -8503,6 +8511,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    bool has_compute_pair = false;
    struct hk_compute_pair_producer *compute_pair_producer = NULL;
    nir_shader *depthwise_vec4_nir = NULL;
+   nir_shader *gemm_cmat16_nir = NULL;
    nir_shader *gemm_cmat32_nir = NULL;
    nir_shader *gemm_cmat64_nir = NULL;
    struct hk_shader *identity_copy4 = NULL;
@@ -8612,6 +8621,10 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                } else if (pair.role == HK_COMPUTE_PAIR_GEMM &&
                           pair.gemm.cmat_valid &&
                           agx_chip_cooperative_matrix_supported(dev->dev.chip)) {
+                  if (pair.gemm.is_guarded) {
+                     gemm_cmat16_nir =
+                        hk_nir_build_gemm_cmat(nir, &pair.gemm, 16, NULL);
+                  }
                   gemm_cmat32_nir =
                      hk_nir_build_gemm_cmat(nir, &pair.gemm, 32, NULL);
                   gemm_cmat64_nir =
@@ -8795,6 +8808,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       if (result != VK_SUCCESS) {
          hk_compute_pair_producer_unref(compute_pair_producer);
          ralloc_free(depthwise_vec4_nir);
+         ralloc_free(gemm_cmat16_nir);
          ralloc_free(gemm_cmat32_nir);
          ralloc_free(gemm_cmat64_nir);
          if (identity_copy4) {
@@ -8841,6 +8855,10 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
             obj->depthwise_vec4 = hk_compile_compute_alt_nir(
                dev, info, pAllocator, hk_features, depthwise_vec4_nir);
          }
+         if (gemm_cmat16_nir) {
+            obj->gemm_cmat16 = hk_compile_compute_alt_nir(
+               dev, info, pAllocator, hk_features, gemm_cmat16_nir);
+         }
          if (gemm_cmat32_nir) {
             obj->gemm_cmat32 = hk_compile_compute_alt_nir(
                dev, info, pAllocator, hk_features, gemm_cmat32_nir);
@@ -8852,6 +8870,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       } else {
          hk_compute_pair_producer_unref(compute_pair_producer);
          ralloc_free(depthwise_vec4_nir);
+         ralloc_free(gemm_cmat16_nir);
          ralloc_free(gemm_cmat32_nir);
          ralloc_free(gemm_cmat64_nir);
       }
@@ -9403,6 +9422,7 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    const unsigned variant_flags2 = blob_read_uint8(blob);
    const bool has_fbl_source = variant_flags2 & 1;
    const bool has_compute_pair = (variant_flags2 & 2) != 0;
+   const bool has_gemm_cmat16 = (variant_flags2 & 4) != 0;
    const bool has_identity_copy4 = (variant_flags2 & 8) != 0;
    const bool has_im2col_vec4 = (variant_flags2 & 16) != 0;
    const bool has_depthwise_vec4 = (variant_flags2 & 32) != 0;
@@ -9414,10 +9434,10 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
                : dev->vk.enabled_features.depthClipControl) ||
        (has_mesh_source &&
         (stage != MESA_SHADER_FRAGMENT || dev->dev.chip != AGX_CHIP_G17P)) ||
-       (variant_flags2 & ~(1u | 2u | 8u | 16u | 32u | 64u | 128u)) ||
+       (variant_flags2 & ~(1u | 2u | 4u | 8u | 16u | 32u | 64u | 128u)) ||
        (has_im2col_vec4 && !has_identity_copy4) ||
        (has_depthwise_vec4 && !has_compute_pair) ||
-       ((has_gemm_cmat32 || has_gemm_cmat64) &&
+       ((has_gemm_cmat16 || has_gemm_cmat32 || has_gemm_cmat64) &&
         (!has_compute_pair || !agx_chip_cooperative_matrix_supported(dev->dev.chip))) ||
        ((has_compute_pair || has_identity_copy4) &&
         (stage != MESA_SHADER_COMPUTE || !agx_chip_native_or_m5(dev->dev.chip))) ||
@@ -9462,7 +9482,7 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
       if (!hk_compute_pair_info_deserialize(blob, &pair) ||
           (has_depthwise_vec4 &&
            (pair.role != HK_COMPUTE_PAIR_DEPTHWISE || !pair.depthwise.vec4_valid)) ||
-          ((has_gemm_cmat32 || has_gemm_cmat64) &&
+          ((has_gemm_cmat16 || has_gemm_cmat32 || has_gemm_cmat64) &&
            (pair.role != HK_COMPUTE_PAIR_GEMM || !pair.gemm.cmat_valid))) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
@@ -9521,6 +9541,15 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    if (has_depthwise_vec4) {
       VkResult result = hk_deserialize_optional_compute_alt(
          dev, blob, &obj->depthwise_vec4);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return result;
+      }
+   }
+
+   if (has_gemm_cmat16) {
+      VkResult result = hk_deserialize_optional_compute_alt(
+         dev, blob, &obj->gemm_cmat16);
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return result;
@@ -9951,6 +9980,7 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
                              (obj->clip_m1_1 ? 128 : 0));
    blob_write_uint8(blob, (obj->fbl_source ? 1 : 0) |
                              (obj->compute_pair ? 2 : 0) |
+                             (obj->gemm_cmat16 ? 4 : 0) |
                              (obj->identity_copy4 ? 8 : 0) |
                              (obj->im2col_vec4 ? 16 : 0) |
                              (obj->depthwise_vec4 ? 32 : 0) |
@@ -10009,10 +10039,11 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
       }
    }
 
-   const struct hk_shader *compute_alts[5] = {
+   const struct hk_shader *compute_alts[6] = {
       obj->identity_copy4,
       obj->im2col_vec4,
       obj->depthwise_vec4,
+      obj->gemm_cmat16,
       obj->gemm_cmat32,
       obj->gemm_cmat64,
    };
