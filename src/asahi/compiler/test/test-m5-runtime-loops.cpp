@@ -161,6 +161,25 @@ TEST(M5RuntimeLoops, TopTestedUnrolls)
    ralloc_free(s);
 }
 
+static unsigned
+loops_inside_ifs(nir_shader *shader)
+{
+   unsigned n = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_cf_node *parent = block->cf_node.parent;
+         if (parent->type == nir_cf_node_loop &&
+             nir_loop_first_block(nir_cf_node_as_loop(parent)) == block &&
+             parent->parent->type == nir_cf_node_if)
+            n++;
+      }
+   }
+   return n;
+}
+
+/* The rotated loop's only live-out (the sum) is a back-edge value: the
+ * original loop moves under an if, so the main loop needs only 4 iterations
+ * left. */
 TEST(M5RuntimeLoops, BottomTestedUnrolls)
 {
    nir_def *hi;
@@ -168,6 +187,9 @@ TEST(M5RuntimeLoops, BottomTestedUnrolls)
    EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256, NULL));
    nir_validate_shader(s, "bottom-tested unroll");
    EXPECT_EQ(count_loops(s), 2u);
+   EXPECT_EQ(loops_inside_ifs(s), 1u);
+   NIR_PASS(_, s, nir_opt_dce);
+   nir_validate_shader(s, "bottom-tested unroll after dce");
    ralloc_free(s);
 }
 
@@ -760,5 +782,87 @@ TEST(M5NarrowBarriers, SingleSubgroupWorkgroup)
       EXPECT_EQ(nir_intrinsic_execution_scope(device), SCOPE_WORKGROUP);
       EXPECT_EQ(nir_intrinsic_memory_scope(device), SCOPE_WORKGROUP);
       ralloc_free(b.shader);
+   }
+}
+
+/* Rotated loops for the exact-tail path; shape selects the live-outs. */
+enum tail_shape {
+   TAIL_INVARIANT_FROM_OUTER_PHI, /* t = w * 3 in the loop, w an if/else phi */
+   TAIL_SWAP,                     /* a = b; b = b + x; a used after */
+   TAIL_SHARED_BACK_EDGE,         /* i and k both advance to i + 1 */
+};
+
+static nir_shader *
+rotated_loop(tail_shape shape)
+{
+   nir_builder b = compute_shader("rotated-tail");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *kv = nir_local_variable_create(b.impl, glsl_uint_type(), "k");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_variable *av = nir_local_variable_create(b.impl, glsl_uint_type(), "a");
+   nir_variable *wv = nir_local_variable_create(b.impl, glsl_uint_type(), "w");
+   nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 32);
+   nir_def *sel = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8), .range = 32);
+   nir_push_if(&b, nir_ine_imm(&b, sel, 0));
+   nir_store_var(&b, wv, nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 12), .range = 32), 1);
+   nir_push_else(&b, NULL);
+   nir_store_var(&b, wv, nir_imm_int(&b, 7), 1);
+   nir_pop_if(&b, NULL);
+   nir_def *w = nir_load_var(&b, wv);
+   nir_store_var(&b, iv, sel, 1);
+   nir_store_var(&b, kv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, av, w, 1);
+   nir_def *t = NULL;
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_def *index = shape == TAIL_SHARED_BACK_EDGE ? nir_load_var(&b, kv) : i;
+      nir_def *v = nir_load_global(&b, 1, 32,
+                                   buffer_address(&b, nir_amul_imm(&b, index, 4)),
+                                   .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                   .align_mul = 4);
+      t = nir_imul_imm(&b, w, 3);
+      nir_def *sum = nir_iadd(&b, nir_load_var(&b, acc), v);
+      if (shape == TAIL_SWAP) {
+         nir_store_var(&b, av, sum, 1);
+         nir_store_var(&b, acc, nir_iadd(&b, sum, v), 1);
+      } else {
+         nir_store_var(&b, acc, sum, 1);
+      }
+      nir_def *next = nir_iadd_imm(&b, i, 1);
+      nir_store_var(&b, iv, next, 1);
+      nir_store_var(&b, kv, next, 1);
+      nir_break_if(&b, nir_ilt(&b, n, next));
+   }
+   nir_pop_loop(&b, loop);
+   nir_def *result = nir_load_var(&b, acc);
+   if (shape == TAIL_INVARIANT_FROM_OUTER_PHI)
+      result = nir_iadd(&b, result, t);
+   if (shape == TAIL_SWAP)
+      result = nir_iadd(&b, result, nir_load_var(&b, av));
+   nir_store_global(&b, result, buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+   NIR_PASS(_, b.shader, nir_opt_copy_prop);
+   NIR_PASS(_, b.shader, nir_opt_dce);
+   return b.shader;
+}
+
+/* Each shape unrolls and stays valid SSA; the invariant live-out is
+ * recomputed from the if/else phi without cloning anything before the loop,
+ * and the swap shape (a header phi live after the loop) keeps the plain
+ * form. Two loops in a row: the second's bound is the first's live-out. */
+TEST(M5RuntimeLoops, ExactTailShapes)
+{
+   for (tail_shape shape : {TAIL_INVARIANT_FROM_OUTER_PHI, TAIL_SWAP, TAIL_SHARED_BACK_EDGE}) {
+      nir_shader *s = rotated_loop(shape);
+      nir_validate_shader(s, "rotated before");
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256, NULL));
+      nir_validate_shader(s, "rotated unrolled");
+      EXPECT_EQ(count_loops(s), 2u);
+      EXPECT_EQ(loops_inside_ifs(s), shape == TAIL_SWAP ? 0u : 1u);
+      NIR_PASS(_, s, nir_opt_dce);
+      nir_validate_shader(s, "rotated after dce");
+      ralloc_free(s);
    }
 }

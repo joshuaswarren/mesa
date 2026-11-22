@@ -93,12 +93,17 @@ branch_is_empty(struct exec_list *list)
           exec_list_is_empty(&nir_cf_node_as_block(node)->instr_list);
 }
 
+/* By the control-flow tree, not block indices: those go stale once a loop
+ * of the shader has been unrolled. */
 static bool
 def_outside_loop(nir_def *def, nir_loop *loop)
 {
-   nir_block *block = nir_def_block(def);
-   return block->index < nir_loop_first_block(loop)->index ||
-          block->index > nir_loop_last_block(loop)->index;
+   for (nir_cf_node *node = nir_def_block(def)->cf_node.parent; node;
+        node = node->parent) {
+      if (node == &loop->cf_node)
+         return false;
+   }
+   return true;
 }
 
 /* A value every iteration computes alike from values defined before the
@@ -516,9 +521,132 @@ guard_bound(nir_builder *b, const struct counted_loop *cl, nir_def *bound,
    return nir_bcsel(b, valid, adj, never);
 }
 
+static bool
+block_in_loop(nir_block *block, nir_loop *loop)
+{
+   for (nir_cf_node *node = block->cf_node.parent; node; node = node->parent) {
+      if (node == &loop->cf_node)
+         return true;
+   }
+   return false;
+}
+
+static nir_block *
+use_block(nir_src *src)
+{
+   if (nir_src_is_if(src))
+      return nir_cf_node_as_block(nir_cf_node_prev(&nir_src_use_if(src)->cf_node));
+   return nir_src_use_instr(src)->block;
+}
+
+struct live_out {
+   nir_def *def;
+   /* The register of the header phi it feeds, or NULL for a loop-invariant
+    * value. */
+   nir_def *reg;
+   bool invariant;
+};
+
+/* Computed from values defined before the loop only, by instructions that
+ * may be repeated (as header_invariant(), in any block of the loop). */
+static bool
+loop_invariant(nir_def *def, nir_loop *loop, unsigned depth)
+{
+   if (def_outside_loop(def, loop))
+      return true;
+   if (depth == 0)
+      return false;
+   nir_instr *instr = nir_def_instr(def);
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+   case nir_instr_type_undef:
+      return true;
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i)
+         if (!loop_invariant(alu->src[i].src.ssa, loop, depth - 1))
+            return false;
+      return true;
+   }
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (!nir_intrinsic_can_reorder(intr) ||
+          !nir_intrinsic_infos[intr->intrinsic].has_dest)
+         return false;
+      for (unsigned i = 0; i < nir_intrinsic_infos[intr->intrinsic].num_srcs; ++i)
+         if (!loop_invariant(intr->src[i].ssa, loop, depth - 1))
+            return false;
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+/* The loop's values used after it, when each is the back-edge value of a
+ * header phi (a rotated loop's accumulators and induction variables) or
+ * loop-invariant (recomputed after the loop). */
+static bool
+back_edge_live_outs(nir_loop *loop, struct live_out *outs, unsigned *count)
+{
+   nir_block *header = nir_loop_first_block(loop);
+   nir_block *latch = nir_loop_last_block(loop);
+   /* Phis after the loop would need sources from the new if: keep the
+    * plain form. */
+   nir_block *after = nir_cf_node_as_block(nir_cf_node_next(&loop->cf_node));
+   if (nir_block_first_instr(after) &&
+       nir_block_first_instr(after)->type == nir_instr_type_phi)
+      return false;
+   *count = 0;
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_foreach_instr(instr, block) {
+         nir_def *def = nir_instr_def(instr);
+         if (!def)
+            continue;
+         bool outside = false;
+         nir_foreach_use_including_if(src, def)
+            outside |= !block_in_loop(use_block(src), loop);
+         if (!outside)
+            continue;
+         /* A header phi used after the loop (its value at the start of the
+          * last iteration) has no register holding it after the main loop;
+          * nor does a header phi that is another phi's back-edge value. */
+         if (instr->type == nir_instr_type_phi && block == header)
+            return false;
+         bool carried = false;
+         nir_foreach_phi(phi, header) {
+            nir_phi_src *back = nir_phi_get_src_from_block(phi, latch);
+            carried |= back && back->src.ssa == def;
+         }
+         const bool invariant = !carried && loop_invariant(def, loop, 8);
+         if ((!carried && !invariant) || *count == 16)
+            return false;
+         outs[(*count)++] = (struct live_out){def, NULL, invariant};
+      }
+   }
+   return true;
+}
+
+/* The register a header phi became, from its write at the end of the
+ * latch. */
+static nir_def *
+latch_register(nir_loop *loop, nir_def *value)
+{
+   nir_foreach_instr_reverse(instr, nir_loop_last_block(loop)) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *store = nir_instr_as_intrinsic(instr);
+      if (store->intrinsic == nir_intrinsic_store_reg && store->src[0].ssa == value)
+         return store->src[1].ssa;
+   }
+   return NULL;
+}
+
+/* later_bounds: the bounds computed for the loops unrolled after this one,
+ * which may name a value this loop leaves (plain pointers, not uses). */
 static void
 unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
-            unsigned factor)
+            unsigned factor, nir_def **later_bounds, unsigned nlater)
 {
    nir_loop *loop = cl->loop;
    nir_builder b = nir_builder_create(impl);
@@ -528,6 +656,22 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
    b.cursor = nir_after_block_before_jump(pre);
    nir_def *g = guard_bound(&b, cl, bound, factor);
 
+   /* A rotated loop runs its body before its test, so the original loop,
+    * reached after the main loop, runs at least one more iteration. When
+    * every value the loop leaves is a header phi's back-edge value and the
+    * test reads the stepped induction variable, skip the original loop
+    * instead once the test fails: the main loop then needs only `factor`
+    * iterations left, not factor + 1 (a trip count of exactly `factor`,
+    * such as 8 descriptor words, runs entirely in the main loop). */
+   struct live_out outs[16];
+   unsigned nouts = 0;
+   nir_phi_src *init = nir_phi_get_src_from_block(cl->iv, pre);
+   nir_phi_src *iv_back = nir_phi_get_src_from_block(cl->iv, nir_loop_last_block(loop));
+   const bool exact_tail = cl->bottom && cl->offset == cl->step && init &&
+                           iv_back && back_edge_live_outs(loop, outs, &nouts);
+   nir_def *iv0 = exact_tail ? init->src.ssa : NULL;
+   nir_def *iv_next = exact_tail ? iv_back->src.ssa : NULL;
+
    /* The guard test, in the header after its phis. A top-tested loop runs
     * iteration k when its test passes on v + k * step, k = 0 .. factor - 1,
     * with v the tested value at the top. A rotated loop runs the iteration
@@ -536,7 +680,7 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
     * which runs its body before its test. The same guard covers both. */
    b.cursor = nir_after_phis(nir_loop_first_block(loop));
    nir_def *iv = &cl->iv->def;
-   if (cl->offset)
+   if (cl->offset && !exact_tail)
       iv = nir_iadd_imm(&b, iv, cl->offset);
    nir_def *cont;
    if (cl->rel == REL_LT || cl->rel == REL_LE)
@@ -544,6 +688,10 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
    else
       cont = cl->is_unsigned ? nir_ult(&b, g, iv) : nir_ilt(&b, g, iv);
    nir_def *guard = cl->break_in_then ? nir_inot(&b, cont) : cont;
+   /* Which source of the compare reads the induction variable: after the
+    * header phis become registers, it is the load of the iv's register. */
+   nir_alu_instr *cont_alu = nir_def_as_alu(cont);
+   const unsigned iv_src = (cl->rel == REL_LT || cl->rel == REL_LE) ? 0 : 1;
 
    /* Leave SSA for the header's phis: both loops then read and write the
     * same registers and need no phis of their own. Write the registers at
@@ -619,6 +767,66 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
    for (unsigned i = 1; i < factor; ++i) {
       nir_cf_reinsert(&copies[2 * i], nir_after_cf_list(&main_loop->body));
       nir_cf_reinsert(&copies[2 * i + 1], nir_after_cf_list(&main_loop->body));
+   }
+
+   if (!exact_tail)
+      return;
+
+   /* Run the original loop only for its first iteration (no main
+    * iteration ran: the induction variable is still its initial value) or
+    * when the test the dropped iteration would have made passes. */
+   nir_intrinsic_instr *iv_load =
+      nir_def_as_intrinsic(cont_alu->src[iv_src].src.ssa);
+   assert(iv_load->intrinsic == nir_intrinsic_load_reg);
+   nir_def *iv_reg = iv_load->src[0].ssa;
+   (void)iv_next;
+   for (unsigned i = 0; i < nouts; ++i) {
+      if (outs[i].invariant)
+         continue;
+      outs[i].reg = latch_register(loop, outs[i].def);
+      assert(outs[i].reg);
+   }
+   b.cursor = nir_before_cf_node(&loop->cf_node);
+   nir_def *v = nir_load_reg(&b, iv_reg);
+   const bool u = cl->is_unsigned;
+   nir_def *more;
+   switch (cl->rel) {
+   case REL_LT: more = u ? nir_ult(&b, v, bound) : nir_ilt(&b, v, bound); break;
+   case REL_LE: more = u ? nir_uge(&b, bound, v) : nir_ige(&b, bound, v); break;
+   case REL_GT: more = u ? nir_ult(&b, bound, v) : nir_ilt(&b, bound, v); break;
+   default:     more = u ? nir_uge(&b, v, bound) : nir_ige(&b, v, bound); break;
+   }
+   nir_def *run = nir_ior(&b, nir_ieq(&b, v, iv0), more);
+   nir_if *tail = nir_push_if(&b, run);
+   nir_pop_if(&b, tail);
+   nir_cf_list moved;
+   nir_cf_extract(&moved, nir_before_cf_node(&loop->cf_node),
+                  nir_after_cf_node(&loop->cf_node));
+   nir_cf_reinsert(&moved, nir_before_cf_list(&tail->then_list));
+
+   /* The values the loop leaves: after the if, from their registers. The
+    * original loop exits before its latch writes them, so write them once
+    * more after it. */
+   b.cursor = nir_after_cf_node(&tail->cf_node);
+   struct hash_table *again = _mesa_pointer_hash_table_create(NULL);
+   for (unsigned i = 0; i < nouts; ++i) {
+      nir_def *value = outs[i].invariant
+                          ? rematerialize(&b, outs[i].def, loop, again)
+                          : nir_load_reg(&b, outs[i].reg);
+      nir_foreach_use_including_if_safe(src, outs[i].def) {
+         if (!block_in_loop(use_block(src), loop))
+            nir_src_rewrite(src, value);
+      }
+      for (unsigned j = 0; j < nlater; ++j) {
+         if (later_bounds[j] == outs[i].def)
+            later_bounds[j] = value;
+      }
+   }
+   _mesa_hash_table_destroy(again, NULL);
+   b.cursor = nir_after_cf_node(&loop->cf_node);
+   for (unsigned i = 0; i < nouts; ++i) {
+      if (!outs[i].invariant)
+         nir_store_reg(&b, outs[i].def, outs[i].reg);
    }
 }
 
@@ -709,7 +917,8 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
       util_dynarray_fini(&loops);
 
       for (unsigned i = 0; i < n; ++i)
-         unroll_loop(impl, &candidates[i], bounds[i], factors[i]);
+         unroll_loop(impl, &candidates[i], bounds[i], factors[i], &bounds[i + 1],
+                     n - i - 1);
 
       if (n) {
          nir_progress(true, impl, nir_metadata_none);
