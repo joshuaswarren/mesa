@@ -20,6 +20,7 @@
 
 #include "hk_device.h"
 #include "hk_device_memory.h"
+#include "hk_identity_copy4.h"
 #include "hk_private.h"
 #include "hk_nir_lower_mesh.h"
 
@@ -433,6 +434,12 @@ struct hk_api_shader {
    /* Non-NULL only for a fresh API wrapper borrowing immutable deserialized
     * code/data from the device's bounded binary cache. */
    struct hk_shader_binary_cache_entry *binary_cache_entry;
+
+   /* Optional compile-time packed vec4 alternates for eligible AGX3 compute
+    * shaders. */
+   struct hk_shader *identity_copy4;
+   struct hk_shader *im2col_vec4;
+   struct hk_identity_copy4 identity_copy4_info;
 
    /* Is this an internal passthrough geometry shader? */
    bool is_passthrough;

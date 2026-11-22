@@ -221,7 +221,7 @@ int main(void)
    for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip)
       assert(hk_shader_binary_version(chip) ==
              (chip == AGX_CHIP_G17P || chip == AGX_CHIP_G17G ||
-              chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C ? 45 :
+              chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C ? 46 :
               chip <= AGX_CHIP_G15P ? 37 : 35));
    assert(hk_as_build_flags(AGX_CHIP_G17P, 0, true) == 0);
    assert(hk_as_build_flags(AGX_CHIP_G17P, DRM_ASAHI_FEATURE_RENDER_RAY_QUERY, true) == 0);
