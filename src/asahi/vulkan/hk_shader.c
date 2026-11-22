@@ -3144,8 +3144,15 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    const bool lower_g17p_robust_images =
       dev->dev.chip == AGX_CHIP_G17P &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
+   /* Where the texture unit bounds texel fetches to the view, only the wide
+    * operands are saturated (AGX_NIR_TEXTURE_HW_TXF_BOUNDS below); see
+    * agx_chip_hw_texel_fetch_bounds(). */
+   const bool hw_txf_bounds =
+      agx_chip_hw_texel_fetch_bounds(dev->dev.chip) &&
+      rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
    const bool lower_agx3_robust_fetches =
       agx_chip_g17p_or_m5(dev->dev.chip) &&
+      !hw_txf_bounds &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
    const bool native_robust_images =
       agx_chip_explicit_robust_image_bounds(dev->dev.chip) &&
@@ -3516,13 +3523,14 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    if (agx_chip_native_or_m5(dev->dev.chip)) {
       /* hk_nir_lower_robust_image_access() leaves formatless loads to this
        * pass. */
+      unsigned tex_gen = agx_chip_descriptor_generation(dev->dev.chip);
+      if (agx_chip_texture_descriptor_spare_word(dev->dev.chip) &&
+          !nir->info.internal)
+         tex_gen |= AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT;
+      if (hw_txf_bounds)
+         tex_gen |= AGX_NIR_TEXTURE_HW_TXF_BOUNDS;
       NIR_PASS(lowered_tex, nir, agx_nir_lower_texture_with_buffer_metadata,
-               agx_chip_descriptor_generation(dev->dev.chip) |
-                  (agx_chip_texture_descriptor_spare_word(dev->dev.chip) &&
-                         !nir->info.internal
-                      ? AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT
-                      : 0),
-               lower_agx3_robust_fetches, dev->dev.sparse_ro_offset,
+               tex_gen, lower_agx3_robust_fetches, dev->dev.sparse_ro_offset,
                dev->vk.enabled_features.sparseResidencyBuffer);
    } else {
       if (dev->physical_sparse_map &&
