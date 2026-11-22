@@ -3057,6 +3057,9 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
              struct vk_descriptor_set_layout *const *set_layouts,
              enum hk_feature_key features)
 {
+   const bool already_preprocessed = nir->info.io_lowered;
+   bool lowered_complex = false;
+
    if (HK_PERF(dev, NOROBUST)) {
       rs = &vk_robustness_disabled;
    }
@@ -3067,31 +3070,33 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_opt_access, &access_options);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
-      NIR_PASS(_, nir, nir_lower_input_attachments,
+      NIR_PASS(lowered_complex, nir, nir_lower_input_attachments,
                &(nir_input_attachment_options){
                   .use_view_id_for_layer = is_multiview,
                });
 
-      NIR_PASS(_, nir, nir_shader_tex_pass, lower_subpass_dim, nir_metadata_all,
-               NULL);
+      NIR_PASS(lowered_complex, nir, nir_shader_tex_pass, lower_subpass_dim,
+               nir_metadata_all, NULL);
       NIR_PASS(_, nir, nir_lower_wpos_center);
 
       if (agx_chip_native_agx3(dev->dev.chip)) {
-         NIR_PASS(_, nir, agx_nir_lower_g17p_helper_samples);
+         NIR_PASS(lowered_complex, nir, agx_nir_lower_g17p_helper_samples);
       }
    }
 
    if (is_multiview &&
-       hk_lower_multiview_stage(nir->info.stage, next_stage_mask))
+       hk_lower_multiview_stage(nir->info.stage, next_stage_mask)) {
       hk_lower_multiview(nir, dev->dev.chip == AGX_CHIP_G17P);
+      lowered_complex = true;
+   }
 
    if (is_multiview && nir->info.stage == MESA_SHADER_FRAGMENT &&
        dev->dev.chip == AGX_CHIP_G17P)
-      NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_lower_multiview_fs_layer,
-               nir_metadata_control_flow, NULL);
+      NIR_PASS(lowered_complex, nir, nir_shader_intrinsics_pass,
+               hk_lower_multiview_fs_layer, nir_metadata_control_flow, NULL);
 
    if (nir->info.stage == MESA_SHADER_TESS_EVAL) {
-      NIR_PASS(_, nir, nir_lower_patch_vertices,
+      NIR_PASS(lowered_complex, nir, nir_lower_patch_vertices,
                nir->info.tess.tcs_vertices_out, NULL);
    }
 
@@ -3099,31 +3104,34 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       .set_layout_count = set_layout_count,
       .set_layouts = set_layouts,
    };
-   NIR_PASS(_, nir, nir_shader_tex_pass, lower_packed_ycbcr_size,
+   NIR_PASS(lowered_complex, nir, nir_shader_tex_pass, lower_packed_ycbcr_size,
             nir_metadata_control_flow, (void *)&ycbcr_state);
-   NIR_PASS(_, nir, nir_shader_tex_pass, lower_ycbcr_explicit,
+   NIR_PASS(lowered_complex, nir, nir_shader_tex_pass, lower_ycbcr_explicit,
             nir_metadata_none, (void *)&ycbcr_state);
-   NIR_PASS(_, nir, nir_shader_tex_pass, lower_packed_ycbcr_center,
-            nir_metadata_none, (void *)&ycbcr_state);
-   NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, lookup_ycbcr_conversion,
-            &ycbcr_state);
-   NIR_PASS(_, nir, nir_shader_tex_pass, lower_ycbcr_chroma_blend,
-            nir_metadata_none, (void *)&ycbcr_state);
+   NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
+            lower_packed_ycbcr_center, nir_metadata_none,
+            (void *)&ycbcr_state);
+   NIR_PASS(lowered_complex, nir, nir_vk_lower_ycbcr_tex,
+            lookup_ycbcr_conversion, &ycbcr_state);
+   NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
+            lower_ycbcr_chroma_blend, nir_metadata_none, (void *)&ycbcr_state);
    if (agx_chip_native_agx3(dev->dev.chip)) {
-      NIR_PASS(_, nir, nir_shader_tex_pass, lower_ycbcr_plane_range,
-               nir_metadata_control_flow, (void *)&ycbcr_state);
+      NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
+               lower_ycbcr_plane_range, nir_metadata_control_flow,
+               (void *)&ycbcr_state);
    }
 
    /* Lower push constants before lower_descriptors */
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
-            nir_address_format_32bit_offset);
+   bool lowered_push_const = false;
+   NIR_PASS(lowered_push_const, nir, nir_lower_explicit_io,
+            nir_var_mem_push_const, nir_address_format_32bit_offset);
 
    /* The cooperative-matrix lowering serves the 8x8 matmad on AGX3B
     * (G15/G16/G17P) as well as M5's AGX3C; it no-ops on shaders that carry no
     * cooperative matrix, so gating on the encoding is sufficient. */
    if (agx_chip_g17_m5(dev->dev.chip) ||
        agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3B)
-      NIR_PASS(_, nir, agx_nir_lower_cmat);
+      NIR_PASS(lowered_complex, nir, agx_nir_lower_cmat);
 
    /* Turn cache flushes into image coherency bits while we still have derefs */
    NIR_PASS(_, nir, nir_lower_memory_model);
@@ -3149,20 +3157,21 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    if (agx_chip_image_load_misses_own_store(dev->dev.chip) ||
        (agx_chip_g17_m5(dev->dev.chip) &&
         debug_get_bool_option("ASAHI_M5_IMAGE_STORE_FORWARD", false)))
-      NIR_PASS(_, nir, hk_nir_forward_image_stores,
+      NIR_PASS(lowered_complex, nir, hk_nir_forward_image_stores,
                lower_g17p_robust_images || native_robust_images ||
                   (features & HK_FEAT_NULL_DESCRIPTOR));
-   NIR_PASS(_, nir, hk_nir_lower_robust_image_access,
+   NIR_PASS(lowered_complex, nir, hk_nir_lower_robust_image_access,
             lower_g17p_robust_images);
    if (native_robust_images) {
-      NIR_PASS(_, nir, nir_lower_robust_access_cb, should_lower_robust,
-               hk_native_robust_oob_alpha, &native_robust_images);
+      NIR_PASS(lowered_complex, nir, nir_lower_robust_access_cb,
+               should_lower_robust, hk_native_robust_oob_alpha,
+               &native_robust_images);
    }
    if (native_robust_images) {
       const nir_lower_tex_options offsets = {.lower_txf_offset = true};
-      NIR_PASS(_, nir, nir_lower_tex, &offsets);
-      NIR_PASS(_, nir, nir_shader_tex_pass, hk_lower_native_robust_txf,
-               nir_metadata_control_flow, NULL);
+      NIR_PASS(lowered_complex, nir, nir_lower_tex, &offsets);
+      NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
+               hk_lower_native_robust_txf, nir_metadata_control_flow, NULL);
    }
 
    /* We must do early lowering before hk_nir_lower_descriptors, since this will
@@ -3193,34 +3202,36 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    /* M5 keeps a depth comparison's bias in the sampler descriptor, as the
     * M5 path always has; only a Gen4 sampler moves it into the shader. */
    if (agx_chip_native_or_m5(dev->dev.chip))
-      NIR_PASS(_, nir, agx_nir_lower_g17p_texture_early, support_lod_bias,
+      NIR_PASS(lowered_complex, nir, agx_nir_lower_g17p_texture_early,
+               support_lod_bias,
                agx_chip_sampler_has_lod_bias(dev->dev.chip) ||
                   agx_chip_g17_m5(dev->dev.chip));
    else
-      NIR_PASS(_, nir, agx_nir_lower_texture_early, support_lod_bias);
+      NIR_PASS(lowered_complex, nir, agx_nir_lower_texture_early,
+               support_lod_bias);
 
    if (agx_chip_native_agx3(dev->dev.chip) &&
        agx_chip_sampler_has_lod_bias(dev->dev.chip))
-      NIR_PASS(_, nir, nir_shader_tex_pass, hk_lower_g17p_sampler_bias,
-               nir_metadata_control_flow, NULL);
+      NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
+               hk_lower_g17p_sampler_bias, nir_metadata_control_flow, NULL);
 
    struct hk_instance *instance = hk_physical_device_instance(
       (struct hk_physical_device *)dev->vk.physical);
 
    if (instance->drirc.misc.image_view_min_lod &&
        (features & HK_FEAT_IMAGE_VIEW_MIN_LOD)) {
-      NIR_PASS(_, nir, hk_nir_lower_image_view_min_lod);
+      NIR_PASS(lowered_complex, nir, hk_nir_lower_image_view_min_lod);
    }
 
    if (((features & HK_FEAT_CUSTOM_BORDER) ||
         agx_chip_native_agx3(dev->dev.chip)) &&
        !HK_PERF(dev, NOBORDER)) {
-      NIR_PASS(_, nir, agx_nir_lower_custom_border);
+      NIR_PASS(lowered_complex, nir, agx_nir_lower_custom_border);
    }
 
    if (dev->vk.enabled_features.sparseResidencyBuffer &&
        agx_chip_g17_m5(dev->dev.chip)) {
-      NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+      NIR_PASS(lowered_complex, nir, nir_shader_intrinsics_pass,
                lower_physical_sparse_load, nir_metadata_none, NULL);
    }
 
@@ -3231,7 +3242,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       dev->vk.enabled_features.sparseResidencyBuffer &&
       hk_sparse_buffer_unmapped(&dev->dev);
 
-   NIR_PASS(_, nir, hk_nir_lower_descriptors, rs, set_layout_count,
+   bool lowered_desc = false;
+   NIR_PASS(lowered_desc, nir, hk_nir_lower_descriptors, rs, set_layout_count,
             set_layouts, sparse_store_guards, sparse_store_guards,
             dev->dev.sparse_ro_offset,
             hk_device_physical(dev)->scaled_sampling,
@@ -3239,7 +3251,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             instance->drirc.misc.d3d_nearest_mip,
             hk_coherent_images_in_memory(&dev->dev),
             dev->dev.chip == AGX_CHIP_G17G || dev->dev.chip == AGX_CHIP_G17S);
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
+   bool lowered_global_io = false;
+   NIR_PASS(lowered_global_io, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
    /* While UBO (and G17P/M5 SSBO) offsets are still 32-bit deref offsets,
     * merge adjacent scalar and component loads: once lowered to 64-bit
@@ -3250,41 +3263,47 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * does not change during a draw or dispatch, so its loads may also be
     * marked reorderable before CSE and vectorization. */
    const bool agx3_ssbo_vec = agx_chip_g17p_or_m5(dev->dev.chip);
+   bool lowered_buf_io = false;
    if (!agx3_ssbo_vec) {
-      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
+      NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
                hk_buffer_addr_format(rs->storage_buffers,
                                      rs->null_storage_buffer_descriptor,
                                      agx_chip_g17_m5(dev->dev.chip)));
    }
    const nir_variable_mode pre_lower_vec_modes =
       nir_var_mem_ubo | (agx3_ssbo_vec ? nir_var_mem_ssbo : 0);
-   NIR_PASS(_, nir, nir_lower_array_deref_of_vec, pre_lower_vec_modes, NULL,
+   bool lowered_pre_vec = false;
+   NIR_PASS(lowered_pre_vec, nir, nir_lower_array_deref_of_vec,
+            pre_lower_vec_modes, NULL,
             nir_lower_direct_array_deref_of_vec_load);
-   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_ubo_loads_reorderable,
-            nir_metadata_control_flow, NULL);
-   NIR_PASS(_, nir, nir_opt_cse);
-   NIR_PASS(_, nir, nir_opt_load_store_vectorize,
-            &(const nir_load_store_vectorize_options){
-               .modes = pre_lower_vec_modes,
-               .robust_modes =
-                  (rs->uniform_buffers ==
-                         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
-                      ? 0
-                      : nir_var_mem_ubo) |
-                  (!agx3_ssbo_vec ||
-                         rs->storage_buffers ==
+   NIR_PASS(lowered_pre_vec, nir, nir_shader_intrinsics_pass,
+            hk_ubo_loads_reorderable, nir_metadata_control_flow, NULL);
+   if (!already_preprocessed || lowered_desc || lowered_pre_vec ||
+       lowered_global_io) {
+      NIR_PASS(_, nir, nir_opt_cse);
+      NIR_PASS(_, nir, nir_opt_load_store_vectorize,
+               &(const nir_load_store_vectorize_options){
+                  .modes = pre_lower_vec_modes,
+                  .robust_modes =
+                     (rs->uniform_buffers ==
                             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
-                      ? 0
-                      : nir_var_mem_ssbo),
-               .callback = agx_mem_vectorize_cb,
-            });
+                         ? 0
+                         : nir_var_mem_ubo) |
+                     (!agx3_ssbo_vec ||
+                            rs->storage_buffers ==
+                               VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
+                         ? 0
+                         : nir_var_mem_ssbo),
+                  .callback = agx_mem_vectorize_cb,
+               });
+   }
    if (agx3_ssbo_vec) {
-      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
+      NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
                hk_buffer_addr_format(rs->storage_buffers,
                                      rs->null_storage_buffer_descriptor,
                                      agx_chip_g17_m5(dev->dev.chip)));
    }
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
+   NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_ubo_addr_format(rs->uniform_buffers));
 
    /* Ray queries lower to a software traversal loop of ALU and global loads.
@@ -3304,6 +3323,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
        !(dev->gen1_native_rq &&
          (nir->info.stage == MESA_SHADER_GEOMETRY ||
           nir->info.stage == MESA_SHADER_TESS_EVAL))) {
+      lowered_complex = true;
       if(dev->gen1_native_rq) {
          NIR_PASS(_, nir, nir_opt_ray_queries);
          NIR_PASS(_, nir, nir_opt_ray_query_ranges);
@@ -3336,57 +3356,72 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * lower_load_global_constant_offset_instr has special optimizations for
     * constant offsets, so we want as many offsets to be constant as possible.
     */
-   bool progress;
-   do {
-      progress = false;
-      NIR_PASS(progress, nir, nir_opt_constant_folding);
-      NIR_PASS(progress, nir, nir_opt_algebraic);
-      NIR_PASS(progress, nir, nir_opt_copy_prop);
-      NIR_PASS(progress, nir, nir_opt_dce);
-   } while (progress);
-
-   nir_move_options opts = nir_move_load_ssbo | nir_move_load_ubo;
-
-   /* Unbounded storage reads are load_global here. Sinking the reorderable
-    * ones to their uses keeps M5's large compute kernels from holding every
-    * loaded struct across unrelated branches, which is where they spill.
-    * nir_opt_sink never moves these into or out of a loop.
-    */
-   nir_move_options sink_opts = opts;
-   if (agx_chip_g17_m5(dev->dev.chip))
-      sink_opts |= nir_move_load_global;
-
-   NIR_PASS(progress, nir, nir_opt_sink, sink_opts);
-   NIR_PASS(progress, nir, nir_opt_move, opts);
-
    struct global_load_lowering global_loads = {
       .soft_fault = agx_has_soft_fault(&dev->dev),
       .storage_result_select = agx3_ssbo_vec,
    };
-   if (global_loads.storage_result_select && global_loads.soft_fault) {
-      /* Reads of one descriptor share its base and size only after CSE. */
-      NIR_PASS(_, nir, nir_opt_cse);
-      NIR_PASS(_, nir, m5_merge_buffer_words);
+   const bool need_pre_bounds_opt =
+      !already_preprocessed || lowered_desc || lowered_global_io ||
+      lowered_buf_io || lowered_complex;
+   if (need_pre_bounds_opt) {
+      bool alg_progress;
+      do {
+         bool cheap;
+         do {
+            cheap = false;
+            NIR_PASS(cheap, nir, nir_opt_copy_prop);
+            NIR_PASS(cheap, nir, nir_opt_constant_folding);
+            NIR_PASS(cheap, nir, nir_opt_dce);
+         } while (cheap);
+         alg_progress = false;
+         NIR_PASS(alg_progress, nir, nir_opt_algebraic);
+      } while (alg_progress);
+
+      nir_move_options opts = nir_move_load_ssbo | nir_move_load_ubo;
+
+      /* Unbounded storage reads are load_global here. Sinking the reorderable
+       * ones to their uses keeps M5's large compute kernels from holding every
+       * loaded struct across unrelated branches, which is where they spill.
+       * nir_opt_sink never moves these into or out of a loop.
+       */
+      nir_move_options sink_opts = opts;
+      if (agx_chip_g17_m5(dev->dev.chip))
+         sink_opts |= nir_move_load_global;
+
+      NIR_PASS(_, nir, nir_opt_sink, sink_opts);
+      NIR_PASS(_, nir, nir_opt_move, opts);
+
+      if (global_loads.storage_result_select && global_loads.soft_fault) {
+         /* Reads of one descriptor share its base and size only after CSE. */
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, m5_merge_buffer_words);
+      }
+   } else if (lowered_push_const) {
+      NIR_PASS(_, nir, nir_opt_copy_prop);
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_dce);
    }
+
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
             lower_load_global_constant_offset_instr, nir_metadata_none,
             &global_loads);
 
-
+   bool lowered_shared_io = false;
    if (nir->info.stage == MESA_SHADER_TASK || nir->info.stage == MESA_SHADER_MESH) {
-      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_task_payload,
-               shared_var_info);
-      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_task_payload,
-               nir_address_format_32bit_offset);
+      NIR_PASS(lowered_shared_io, nir, nir_lower_vars_to_explicit_types,
+               nir_var_mem_task_payload, shared_var_info);
+      NIR_PASS(lowered_shared_io, nir, nir_lower_explicit_io,
+               nir_var_mem_task_payload, nir_address_format_32bit_offset);
    }
    assert(nir->info.shared_size == 0);
 
-   NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
-            shared_var_info);
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared,
+   NIR_PASS(lowered_shared_io, nir, nir_lower_vars_to_explicit_types,
+            nir_var_mem_shared, shared_var_info);
+   NIR_PASS(lowered_shared_io, nir, nir_lower_explicit_io, nir_var_mem_shared,
             nir_address_format_32bit_offset);
 
    if (nir->info.zero_initialize_shared_memory && nir->info.shared_size > 0) {
+      lowered_complex = true;
       /* Align everything up to 16B so we can write whole vec4s. */
       nir->info.shared_size = align(nir->info.shared_size, 16);
       NIR_PASS(_, nir, nir_zero_initialize_shared_memory, nir->info.shared_size,
@@ -3415,7 +3450,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       lower_indirect_modes |= nir_var_shader_in | nir_var_shader_out;
    }
 
-   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+   NIR_PASS(lowered_complex, nir, nir_lower_indirect_derefs_to_if_else_trees,
             lower_indirect_modes, UINT32_MAX);
 
    /* SPIR-V represents a fragment gl_Layer read as load_layer_id, and the
@@ -3429,7 +3464,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       const nir_lower_sysvals_to_varyings_options sysvals_to_varyings = {
          .layer_id = true,
       };
-      NIR_PASS(_, nir, nir_lower_sysvals_to_varyings,
+      NIR_PASS(lowered_complex, nir, nir_lower_sysvals_to_varyings,
                &sysvals_to_varyings);
    }
 
@@ -3442,14 +3477,16 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    if (agx_chip_g17_m5(dev->dev.chip) &&
        (nir->info.stage == MESA_SHADER_TESS_CTRL ||
         nir->info.stage == MESA_SHADER_TESS_EVAL))
-      NIR_PASS(_, nir, nir_lower_tess_level_array_vars_to_vec);
+      NIR_PASS(lowered_complex, nir, nir_lower_tess_level_array_vars_to_vec);
 
    /* Mesh outputs are per-vertex/per-primitive arrays, so a component
     * write such as gl_MeshVerticesEXT[i].gl_Position.y reaches here as an
     * array deref of a vector, which nir_lower_io would store to component
     * 0. Turn those into masked vector accesses first. */
+   bool lowered_mesh_out = false;
    if (nir->info.stage == MESA_SHADER_MESH)
-      NIR_PASS(_, nir, nir_lower_array_deref_of_vec, nir_var_shader_out, NULL,
+      NIR_PASS(lowered_mesh_out, nir, nir_lower_array_deref_of_vec,
+               nir_var_shader_out, NULL,
                nir_lower_direct_array_deref_of_vec_load |
                nir_lower_indirect_array_deref_of_vec_load |
                nir_lower_direct_array_deref_of_vec_store |
@@ -3459,24 +3496,27 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             nir_lower_io_lower_64bit_to_32 |
                nir_lower_io_use_interpolated_input_intrinsics);
 
+   bool lowered_viewport = false;
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
-      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_viewport_fs,
-               nir_metadata_control_flow, NULL);
+      NIR_PASS(lowered_viewport, nir, nir_shader_intrinsics_pass,
+               lower_viewport_fs, nir_metadata_control_flow, NULL);
    }
 
    if (agx_chip_descriptor_generation(dev->dev.chip) == 9) {
-      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_scaled_storage,
-               nir_metadata_none, hk_device_physical(dev));
-      NIR_PASS(_, nir, nir_shader_tex_pass, lower_scaled_sample,
+      NIR_PASS(lowered_complex, nir, nir_shader_intrinsics_pass,
+               lower_scaled_storage, nir_metadata_none,
+               hk_device_physical(dev));
+      NIR_PASS(lowered_complex, nir, nir_shader_tex_pass, lower_scaled_sample,
                hk_scaled_sample_guard(nir) ? nir_metadata_none
                                            : nir_metadata_control_flow,
                hk_device_physical(dev));
    }
 
+   bool lowered_tex = false;
    if (agx_chip_native_or_m5(dev->dev.chip)) {
       /* hk_nir_lower_robust_image_access() leaves formatless loads to this
        * pass. */
-      NIR_PASS(_, nir, agx_nir_lower_texture_with_buffer_metadata,
+      NIR_PASS(lowered_tex, nir, agx_nir_lower_texture_with_buffer_metadata,
                agx_chip_descriptor_generation(dev->dev.chip) |
                   (agx_chip_texture_descriptor_spare_word(dev->dev.chip) &&
                          !nir->info.internal
@@ -3487,20 +3527,20 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    } else {
       if (dev->physical_sparse_map &&
           hk_sparse_texel_residency_from_map(&dev->dev)) {
-         NIR_PASS(_, nir, nir_shader_instructions_pass,
+         NIR_PASS(lowered_complex, nir, nir_shader_instructions_pass,
                   lower_sparse_texel_buffer_residency, nir_metadata_none,
                   (void *)dev);
       }
 
       /* G18G storage images use the 96-byte record, whose image-atomic
        * word hk_descriptor_set.c writes after the texture/PBE pair. */
-      NIR_PASS(_, nir, agx_nir_lower_texture_for_generation,
+      NIR_PASS(lowered_tex, nir, agx_nir_lower_texture_for_generation,
                agx_chip_descriptor_generation(dev->dev.chip) |
                   (dev->dev.chip == AGX_CHIP_G18G
                       ? AGX_NIR_TEXTURE_IMAGE_SIDEBAND
                       : 0));
    }
-   NIR_PASS(_, nir, agx_nir_lower_multisampled_image_store);
+   NIR_PASS(lowered_complex, nir, agx_nir_lower_multisampled_image_store);
 
    /* Mesh adds its native UVB shared arena after this frontend lowering.
     * Keep application shared accesses byte addressed until that arena exists;
@@ -3508,10 +3548,16 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * Reprocessing here and there divides preexisting element indices again.
     * The M5 task (object) branch likewise preprocesses after adding its
     * child-grid words, and the G17P task kernel after its payload lowering. */
+   const bool can_post_lower =
+      already_preprocessed && !lowered_complex && !lowered_desc &&
+      !lowered_global_io && !lowered_buf_io && !lowered_shared_io &&
+      !lowered_viewport && !lowered_tex && !lowered_mesh_out;
    if (nir->info.stage != MESA_SHADER_MESH &&
        !(nir->info.stage == MESA_SHADER_TASK &&
          agx_chip_g17p_or_m5(dev->dev.chip))) {
-      if (agx_chip_native_agx3(dev->dev.chip))
+      if (can_post_lower)
+         agx_preprocess_nir_post_lower(nir, dev->dev.chip);
+      else if (agx_chip_native_agx3(dev->dev.chip))
          agx_preprocess_nir_native(nir, dev->dev.chip);
       else if (dev->dev.chip == AGX_CHIP_G18G)
          agx_preprocess_nir_g18g(nir);
@@ -3527,7 +3573,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    };
    NIR_PASS(_, nir, nir_opt_peephole_select, &peephole_select_options);
    NIR_PASS(_, nir, nir_opt_if,
-            nir_opt_if_optimize_phi_true_false | nir_opt_if_avoid_64bit_phis);
+            nir_opt_if_optimize_phi_true_false |
+               nir_opt_if_avoid_64bit_phis);
 }
 
 /* Report a failed executable-preamble upload, so the caller's error path
@@ -4301,14 +4348,14 @@ hk_g17p_compile_vs_cprog(struct hk_device *dev, nir_shader **nir,
  */
 static bool
 hk_g17p_compile_fs_cprog(nir_shader **nir, struct agx_shader_key *key,
-                         struct hk_shader *shader)
+                         struct hk_shader *shader, struct blob *mono_blob)
 {
    nir_shader *attempt = nir_shader_clone(NULL, *nir);
    if (!attempt)
       return false;
 
    const char *declined = "compile";
-   if (agx_compile_shader_nir(attempt, key, &shader->b)) {
+   if (agx_compile_shader_nir_capture(attempt, key, &shader->b, mono_blob)) {
       const struct agx_shader_info *info = &shader->b.info;
       if (!info->has_preamble || hk_g17p_native_cprog_qualified(info)) {
          ralloc_free(*nir);
@@ -4328,6 +4375,9 @@ hk_g17p_compile_fs_cprog(nir_shader **nir, struct agx_shader_key *key,
       mesa_logw("G17P fragment constant program failed to compile (%s); "
                 "compiling without it", agx_last_compile_refusal());
    }
+
+   if (mono_blob)
+      mono_blob->size = 0;
 
    memset(&shader->b, 0, sizeof(shader->b));
    ralloc_free(attempt);
@@ -5570,16 +5620,22 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    /* Preserve NIR for optional native inline blending, M5 uniform-colour
     * blending and mandatory M5 sample shading whose split exports exceed the
-    * register file. */
-   if ((agx_chip_g17_m5(dev->dev.chip) &&
-        sw_stage == MESA_SHADER_FRAGMENT && hk_m5_uniform_colour(nir)) ||
-       (sw_stage == MESA_SHADER_FRAGMENT &&
-        shader->info.fs.m5_inline_sample_shading) ||
-       (agx_chip_native_agx3(dev->dev.chip) &&
-        (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
-        sw_stage == MESA_SHADER_FRAGMENT &&
-        nir->info.stage == MESA_SHADER_FRAGMENT && !nir->info.internal &&
-        !nir->info.fs.uses_sample_shading)) {
+    * register file. Native AGX3 inline blending captures the shader's
+    * pre-preamble NIR during the standalone compile below so fast-link does
+    * not repeat the pre-preamble optimization pipeline. */
+   const bool preserve_raw_mono =
+      (agx_chip_g17_m5(dev->dev.chip) && sw_stage == MESA_SHADER_FRAGMENT &&
+       hk_m5_uniform_colour(nir)) ||
+      (sw_stage == MESA_SHADER_FRAGMENT &&
+       shader->info.fs.m5_inline_sample_shading);
+   const bool capture_g17p_preopt_mono =
+      !preserve_raw_mono && agx_chip_native_agx3(dev->dev.chip) &&
+      (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
+      sw_stage == MESA_SHADER_FRAGMENT &&
+      nir->info.stage == MESA_SHADER_FRAGMENT && !nir->info.internal &&
+      !nir->info.fs.uses_sample_shading;
+
+   if (preserve_raw_mono) {
       struct blob blob;
       blob_init(&blob);
       nir_serialize(&blob, nir, false);
@@ -5589,6 +5645,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
             memcpy(shader->g17p_mono_nir, blob.data, blob.size);
             shader->g17p_mono_nir_size = blob.size;
             shader->g17p_mono_key = backend_key;
+            shader->g17p_mono_preoptimized = false;
          }
       }
       blob_finish(&blob);
@@ -5614,6 +5671,10 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        agx_workgroup_split_size(nir, launch_size))
       NIR_PASS(_, nir, agx_nir_lower_workgroup_split, launch_size);
 
+   struct blob mono_blob;
+   if (capture_g17p_preopt_mono)
+      blob_init(&mono_blob);
+
    /* G17P hardware vertex programs (API VS, GS raster and native TES
     * variants) run per-draw uniform work once in a native vertex constant
     * program, as Apple's compiler does: e.g. ProjMat * ModelViewMat. */
@@ -5629,7 +5690,9 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    if (!compiled &&
        agx_chip_native_or_m5(dev->dev.chip) &&
        nir->info.stage == MESA_SHADER_FRAGMENT && !backend_key.no_preamble)
-      compiled = hk_g17p_compile_fs_cprog(&nir, &backend_key, shader);
+      compiled = hk_g17p_compile_fs_cprog(
+         &nir, &backend_key, shader,
+         capture_g17p_preopt_mono ? &mono_blob : NULL);
    /* An M5 compute constant program can need a form the AGX3 packer does not
     * encode, such as a 16-bit uniform write beside a used uniform half.
     * Compile such a kernel without its constant program, as M5 runs the
@@ -5653,7 +5716,22 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       }
    }
    if (!compiled)
-      compiled = agx_compile_shader_nir(nir, &backend_key, &shader->b);
+      compiled = agx_compile_shader_nir_capture(
+         nir, &backend_key, &shader->b,
+         capture_g17p_preopt_mono ? &mono_blob : NULL);
+
+   if (capture_g17p_preopt_mono) {
+      if (compiled && mono_blob.size && !mono_blob.out_of_memory) {
+         shader->g17p_mono_nir = malloc(mono_blob.size);
+         if (shader->g17p_mono_nir) {
+            memcpy(shader->g17p_mono_nir, mono_blob.data, mono_blob.size);
+            shader->g17p_mono_nir_size = mono_blob.size;
+            shader->g17p_mono_key = backend_key;
+            shader->g17p_mono_preoptimized = true;
+         }
+      }
+      blob_finish(&mono_blob);
+   }
 
    if (lock)
       simple_mtx_unlock(lock);
@@ -5792,6 +5870,7 @@ hk_g17p_layout_shader_create(struct hk_device *dev, const struct hk_shader *api,
    s->uvs_linked = NULL;
    s->g17p_mono_nir = NULL;
    s->g17p_mono_nir_size = 0;
+   s->g17p_mono_preoptimized = false;
 
    if (s->b.info.has_preamble || s->b.info.rodata.size_16) {
       const size_t size = s->b.info.binary_size;
@@ -5839,6 +5918,7 @@ hk_shader_destroy(struct hk_device *dev, struct hk_shader *s,
    simple_mtx_destroy(&s->linked.lock);
    free(s->g17p_mono_nir);
    s->g17p_mono_nir = NULL;
+   s->g17p_mono_preoptimized = false;
 
    if (s->only_linked)
       hk_destroy_linked_shader(dev, s->only_linked);
@@ -6067,7 +6147,7 @@ hk_fs_sample_variant_cache_key(struct hk_device *dev,
    struct mesa_blake3 ctx;
    blake3_hash hash;
    _mesa_blake3_init(&ctx);
-   static const char tag[] = "hk fs sample variant";
+   static const char tag[] = "hk fs sample variant v2";
    _mesa_blake3_update(&ctx, tag, sizeof(tag));
    _mesa_blake3_update(&ctx, &samples, sizeof(samples));
    _mesa_blake3_update(&ctx, &src->key, sizeof(src->key));
@@ -6104,13 +6184,16 @@ hk_fs_sample_variant_load(struct hk_device *dev, struct hk_shader *shader,
       const void *mono_nir = blob_read_bytes(&blob, mono_size);
       const void *mono_key =
          blob_read_bytes(&blob, sizeof(shader->g17p_mono_key));
-      shader->g17p_mono_nir = blob.overrun ? NULL : malloc(mono_size);
+      const uint8_t mono_preopt = blob_read_uint8(&blob);
+      shader->g17p_mono_nir =
+         (blob.overrun || mono_preopt > 1) ? NULL : malloc(mono_size);
       ok = shader->g17p_mono_nir != NULL;
       if (ok) {
          memcpy(shader->g17p_mono_nir, mono_nir, mono_size);
          shader->g17p_mono_nir_size = mono_size;
          memcpy(&shader->g17p_mono_key, mono_key,
                 sizeof(shader->g17p_mono_key));
+         shader->g17p_mono_preoptimized = mono_preopt != 0;
       }
    }
    ok &= !blob.overrun && blob.current == blob.end;
@@ -6138,6 +6221,7 @@ hk_fs_sample_variant_store(struct hk_device *dev,
       blob_write_bytes(&blob, shader->g17p_mono_nir, mono_size);
       blob_write_bytes(&blob, &shader->g17p_mono_key,
                        sizeof(shader->g17p_mono_key));
+      blob_write_uint8(&blob, shader->g17p_mono_preoptimized ? 1 : 0);
    }
    if (!blob.out_of_memory)
       disk_cache_put(hk_device_physical(dev)->vk.disk_cache, key, blob.data,
@@ -8841,9 +8925,11 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
          const void *mono_nir = blob_read_bytes(blob, mono_size);
          const void *mono_key =
             blob_read_bytes(blob, sizeof(shader->g17p_mono_key));
-         shader->g17p_mono_nir = blob->overrun ? NULL : malloc(mono_size);
+         const uint8_t mono_preopt = blob_read_uint8(blob);
+         const bool bad_blob = blob->overrun || mono_preopt > 1;
+         shader->g17p_mono_nir = bad_blob ? NULL : malloc(mono_size);
          if (!shader->g17p_mono_nir) {
-            const VkResult result = blob->overrun
+            const VkResult result = bad_blob
                ? VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT
                : VK_ERROR_OUT_OF_HOST_MEMORY;
             hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
@@ -8853,6 +8939,7 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
          shader->g17p_mono_nir_size = mono_size;
          memcpy(&shader->g17p_mono_key, mono_key,
                 sizeof(shader->g17p_mono_key));
+         shader->g17p_mono_preoptimized = mono_preopt != 0;
       }
    }
 
@@ -9033,12 +9120,14 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
       /* The clone owns its own copy of the inline-blend NIR. */
       dst->g17p_mono_nir = NULL;
       dst->g17p_mono_nir_size = 0;
+      dst->g17p_mono_preoptimized = false;
       if (src->g17p_mono_nir) {
          dst->g17p_mono_nir = malloc(src->g17p_mono_nir_size);
          if (dst->g17p_mono_nir) {
             memcpy(dst->g17p_mono_nir, src->g17p_mono_nir,
                    src->g17p_mono_nir_size);
             dst->g17p_mono_nir_size = src->g17p_mono_nir_size;
+            dst->g17p_mono_preoptimized = src->g17p_mono_preoptimized;
          }
       }
       simple_mtx_init(&dst->linked.lock, mtx_plain);
@@ -9212,8 +9301,14 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
 
    const struct hk_fs_sample_source *src = obj->sample_source;
    bool mono = false;
-   hk_foreach_variant(obj, shader)
-      mono |= shader->g17p_mono_nir != NULL;
+   hk_foreach_variant(obj, shader) {
+      const unsigned i = shader - obj->variants;
+      const bool ready =
+         src ? (p_atomic_read(&src->ready_mask) & BITFIELD_BIT(i))
+             : shader->compiled;
+      if (ready && shader->g17p_mono_nir)
+         mono = true;
+   }
    const struct hk_border_source *border = obj->border_source;
    blob_write_uint8(blob, vk_shader->stage);
    blob_write_uint8(blob, (obj->g17p_sample_variants ? 1 : 0) | (src ? 2 : 0) |
@@ -9268,6 +9363,7 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
             blob_write_bytes(blob, shader->g17p_mono_nir, size);
             blob_write_bytes(blob, &shader->g17p_mono_key,
                              sizeof(shader->g17p_mono_key));
+            blob_write_uint8(blob, shader->g17p_mono_preoptimized ? 1 : 0);
          }
       }
    }

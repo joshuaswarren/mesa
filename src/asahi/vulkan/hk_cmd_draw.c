@@ -7258,11 +7258,13 @@ hk_g17p_mono_disk_key(struct hk_device *dev, const struct hk_shader *shader,
    if (partitions)
       memcpy(parts, partitions, sizeof(parts));
 
-   const char magic[8] = "hkmono3";
+   const char magic[8] = "hkmono4";
+   const uint8_t preopt_flag = shader->g17p_mono_preoptimized ? 1 : 0;
    const size_t rodata_size =
       shader->b.binary ? shader->b.info.rodata.size_16 * 2 : 0;
-   const size_t size = sizeof(magic) + sizeof(shader->g17p_mono_key) +
-                       sizeof(*ekey) + sizeof(parts) + rodata_size +
+   const size_t size = sizeof(magic) + sizeof(preopt_flag) +
+                       sizeof(shader->g17p_mono_key) + sizeof(*ekey) +
+                       sizeof(parts) + rodata_size +
                        shader->g17p_mono_nir_size;
    uint8_t *buf = malloc(size);
    if (!buf)
@@ -7271,6 +7273,8 @@ hk_g17p_mono_disk_key(struct hk_device *dev, const struct hk_shader *shader,
    uint8_t *p = buf;
    memcpy(p, magic, sizeof(magic));
    p += sizeof(magic);
+   memcpy(p, &preopt_flag, sizeof(preopt_flag));
+   p += sizeof(preopt_flag);
    memcpy(p, &shader->g17p_mono_key, sizeof(shader->g17p_mono_key));
    p += sizeof(shader->g17p_mono_key);
    memcpy(p, ekey, sizeof(*ekey));
@@ -7439,6 +7443,34 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       }
    }
 
+   const bool preopt =
+      shader->g17p_mono_preoptimized && !inline_samples && !uniform_blend;
+   bool epilog_has_alu = false;
+   if (preopt) {
+      agx_prepare_preoptimized_epilog_nir(eb.shader, &shader->g17p_mono_key);
+      nir_foreach_block(block, eb.impl) {
+         if (block->cf_node.parent != &eb.impl->cf_node)
+            epilog_has_alu = true;
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_alu) {
+               const nir_op op = nir_instr_as_alu(instr)->op;
+               if (op != nir_op_mov && op != nir_op_vec2 &&
+                   op != nir_op_vec3 && op != nir_op_vec4)
+                  epilog_has_alu = true;
+            } else if (instr->type == nir_instr_type_intrinsic) {
+               const nir_intrinsic_op op =
+                  nir_instr_as_intrinsic(instr)->intrinsic;
+               if (op != nir_intrinsic_load_exported_agx &&
+                   op != nir_intrinsic_store_local_pixel_agx)
+                  epilog_has_alu = true;
+            } else if (instr->type != nir_instr_type_load_const &&
+                       instr->type != nir_instr_type_undef) {
+               epilog_has_alu = true;
+            }
+         }
+      }
+   }
+
    {
       struct hash_table *remap = _mesa_pointer_hash_table_create(mem);
       nir_builder b = nir_builder_at(nir_after_impl(impl));
@@ -7530,7 +7562,12 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       if (!part)
          HK_MONO_FAIL("oom");
       /* agx_compile_shader_nir frees nothing it did not allocate. */
-      const bool compiled = agx_compile_shader_nir(nir, &key, part);
+      const bool preamble_newly_enabled =
+         !key.no_preamble && shader->g17p_mono_key.no_preamble;
+      const bool compiled = preopt
+         ? agx_compile_shader_nir_preoptimized(nir, &key, part, epilog_has_alu,
+                                               preamble_newly_enabled)
+         : agx_compile_shader_nir(nir, &key, part);
       nir = NULL; /* consumed */
       why = !compiled ? "backend refused the monolithic program"
             : uniform_blend
