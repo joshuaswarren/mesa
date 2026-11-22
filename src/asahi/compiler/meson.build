@@ -31,6 +31,7 @@ libasahi_agx_files = files(
   'agx_nir_ray_query.c',
   'agx_nir_gen1_ray_query.c',
   'agx_nir_lower_shared_bitsize.c',
+  'agx_nir_opt_shared_phase_cse.c',
   'agx_nir_lower_subgroups.c',
   'agx_nir_lower_compute_derivatives.c',
   'agx_nir_lower_workgroup_split.c',
@@ -742,6 +743,7 @@ if with_tests
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',
          'test/test-flatten-loads.cpp',
+         'test/test-shared-phase-cse.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
          # in libasahi_lib, which this test does not link.
          '../lib/agx_chip.c',
