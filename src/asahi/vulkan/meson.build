@@ -1215,6 +1215,12 @@ if with_tests
 endif
 
 if with_tests
+  # The queue's own-timeline wait of a kernel submission: one entry at the
+  # latest point any reason asks for. Header only; no device.
+  test('hk_own_wait', executable('hk_own_wait_test',
+    files('tests/test-hk-own-wait.c'),
+    include_directories : [include_directories('.'), inc_include, inc_src]),
+    suite : ['asahi'])
   test('hk_errored_submit', executable('hk_errored_submit_test',
     files('tests/test-hk-errored-submit.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,

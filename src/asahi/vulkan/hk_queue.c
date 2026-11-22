@@ -28,6 +28,7 @@
 #include "hk_entrypoints.h"
 #include "hk_drm_render_core.h"
 #include "hk_drm_prior_core.h"
+#include "hk_drm_own_wait.h"
 #include "hk_execution_allowance.h"
 #include "hk_pack.h"
 #include "hk_image.h"
@@ -1727,12 +1728,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
     * points of one timeline in a submission. own_wait is its index. */
    int own_wait = -1;
    if (replaced) {
-      own_wait = wait_count;
-      syncs[wait_count++] = (struct drm_asahi_sync){
-         .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
-         .handle = queue->drm.syncobj,
-         .timeline_value = replaced_point,
-      };
+      hk_drm_wait_own_timeline(syncs, &wait_count, 0, &own_wait,
+                               queue->drm.syncobj, replaced_point);
    }
 
    /* Waits an earlier empty submission transferred into the queue timeline
@@ -1741,19 +1738,15 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
     * ordered after the kernel job that first carried them. */
    if (queue->drm.empty_wait_point) {
       uint64_t done = 0;
-      if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1) == 0 &&
-          done >= queue->drm.empty_wait_point) {
-         queue->drm.empty_wait_point = 0;
-      } else if (own_wait >= 0) {
-         syncs[own_wait].timeline_value =
-            MAX2(syncs[own_wait].timeline_value, queue->drm.empty_wait_point);
+      const bool queried =
+         drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1) == 0;
+      if (hk_drm_empty_wait_pending(queue->drm.empty_wait_point, queried,
+                                    done)) {
+         hk_drm_wait_own_timeline(syncs, &wait_count, 0, &own_wait,
+                                  queue->drm.syncobj,
+                                  queue->drm.empty_wait_point);
       } else {
-         own_wait = wait_count;
-         syncs[wait_count++] = (struct drm_asahi_sync){
-            .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
-            .handle = queue->drm.syncobj,
-            .timeline_value = queue->drm.empty_wait_point,
-         };
+         queue->drm.empty_wait_point = 0;
       }
    }
 
@@ -2337,18 +2330,10 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
     * first submission already waits for every earlier point. */
    if (sib_remap && sib_earlier && !replaced) {
       assert(sib_target == 0);
-      if (own_wait >= 0) {
-         syncs[own_wait].timeline_value =
-            MAX2(syncs[own_wait].timeline_value, queue->sib.last_point);
-      } else {
-         memmove(&syncs[wait_count + 1], &syncs[wait_count],
-                 (kernel_signal_count + 1) * sizeof(*syncs));
-         syncs[wait_count++] = (struct drm_asahi_sync){
-            .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
-            .handle = queue->drm.syncobj,
-            .timeline_value = queue->sib.last_point,
-         };
-      }
+      /* The signals and the queue's own signal follow the waits. */
+      hk_drm_wait_own_timeline(syncs, &wait_count, kernel_signal_count + 1,
+                               &own_wait, queue->drm.syncobj,
+                               queue->sib.last_point);
    }
 
    struct drm_asahi_submit submit_ioctl = {
