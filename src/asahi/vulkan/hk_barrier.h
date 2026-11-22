@@ -27,14 +27,22 @@ struct hk_barrier_state {
    bool pre_graphics, post_graphics;
    bool attachments_alias;
    bool tilebuffer_spilled;
-   /* Attachment images which may have pending writes, not read-only loads. */
+   /* Color input attachments can read on-chip tile memory in this pass. */
+   bool color_input_local_read;
+   /* At least one depth or stencil attachment may have pending writes. */
+   bool depth_stencil_writes;
+   /* Attachment images which may have pending writes, not read-only loads.
+    * The first color_attachment_count entries are color attachments; any
+    * remaining entries are depth or stencil attachments. */
+   uint32_t color_attachment_count;
    uint32_t attachment_count;
    const VkImage *attachments;
 };
 
 /* CPU-only classification. Zero means the existing tile/stream ordering
  * satisfies the dependency; nonzero requires ending the physical render.
- * Input attachments currently use texture loads, not tile-buffer loads.
+ * When color_input_local_read is set, BY_REGION color input attachment reads
+ * stay in tile memory; depth/stencil and non-tile reads still split.
  */
 uint32_t hk_barrier_classify(const VkDependencyInfo *info,
                              const struct hk_barrier_state *state);

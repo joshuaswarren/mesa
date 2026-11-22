@@ -462,6 +462,117 @@ test_resources_and_fallbacks(void)
             hk_barrier_split_reason_name(r) != NULL, 1);
 }
 
+static void
+test_local_read(void)
+{
+   VkImage color_img = (VkImage)(uintptr_t)10;
+   VkImage depth_img = (VkImage)(uintptr_t)11;
+   VkImage atts[2] = {color_img, depth_img};
+
+   struct hk_barrier_state color_only = {
+      .color_input_local_read = true,
+      .depth_stencil_writes = false,
+      .color_attachment_count = 1,
+      .attachment_count = 1,
+      .attachments = atts,
+   };
+   struct hk_barrier_state color_and_ds = {
+      .color_input_local_read = true,
+      .depth_stencil_writes = true,
+      .color_attachment_count = 1,
+      .attachment_count = 2,
+      .attachments = atts,
+   };
+
+   VkMemoryBarrier2 b =
+      memory(COLOR, CW, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   VkDependencyInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &b,
+   };
+
+   check("local_read color CW -> input read kept",
+         hk_barrier_classify(&info, &color_only), 0);
+   check("local_read color CW -> input read kept even with writable D/S",
+         hk_barrier_classify(&info, &color_and_ds), 0);
+
+   b = memory(COLOR, CW, FRAG,
+              VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT | CR);
+   check("local_read color CW -> input read + CR kept",
+         hk_barrier_classify(&info, &color_and_ds), 0);
+
+   /* Non-BY_REGION still splits globally + texture. */
+   info.dependencyFlags = 0;
+   b = memory(COLOR, CW, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   check("local_read without BY_REGION splits",
+         hk_barrier_classify(&info, &color_only), BIT(GLOBAL) | BIT(TEXTURE));
+   info.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+
+   /* Depth/stencil write -> input read must split. */
+   b = memory(LATE, ZW, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   check("local_read depth ZW -> input read splits",
+         hk_barrier_classify(&info, &color_and_ds), BIT(TEXTURE));
+   b = memory(LATE, 0, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   check("local_read depth stage -> input read splits when D/S writable",
+         hk_barrier_classify(&info, &color_and_ds), BIT(TEXTURE));
+   b = memory(COLOR, VK_ACCESS_2_MEMORY_WRITE_BIT, FRAG,
+              VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   check("local_read MEMORY_WRITE splits when D/S writable",
+         hk_barrier_classify(&info, &color_and_ds), BIT(TEXTURE));
+   check("local_read MEMORY_WRITE kept when color-only",
+         hk_barrier_classify(&info, &color_only), 0);
+
+   /* Availability chain: CW -> CR then CR -> input read stays in tile. */
+   b = memory(COLOR, CR, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   check("local_read availability chain CR -> input read kept",
+         hk_barrier_classify(&info, &color_and_ds), 0);
+
+   /* Sampled / generic shader reads still split. */
+   b = memory(COLOR, CW, FRAG, SR);
+   check("local_read sampled read still splits",
+         hk_barrier_classify(&info, &color_only), BIT(TEXTURE));
+   b = memory(COLOR, CW, FRAG, VK_ACCESS_2_SHADER_READ_BIT);
+   check("local_read generic shader read still splits",
+         hk_barrier_classify(&info, &color_only), BIT(TEXTURE));
+
+   /* Tilebuffer spill and aliasing disable local_read. */
+   struct hk_barrier_state spilled = color_only;
+   spilled.tilebuffer_spilled = true;
+   b = memory(COLOR, CW, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   check("local_read spilled splits",
+         hk_barrier_classify(&info, &spilled), BIT(TEXTURE));
+   struct hk_barrier_state aliased = color_only;
+   aliased.attachments_alias = true;
+   check("local_read aliased splits",
+         hk_barrier_classify(&info, &aliased), BIT(TEXTURE));
+
+   /* Image barriers: color attachment kept, D/S attachment splits. */
+   VkImageMemoryBarrier2 img = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = COLOR,
+      .srcAccessMask = CW,
+      .dstStageMask = FRAG,
+      .dstAccessMask = VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT,
+      .image = color_img,
+      .oldLayout = VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ,
+      .newLayout = VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ,
+      .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+   };
+   info.memoryBarrierCount = 0;
+   info.imageMemoryBarrierCount = 1;
+   info.pImageMemoryBarriers = &img;
+   check("local_read color image barrier kept",
+         hk_barrier_classify(&info, &color_and_ds), 0);
+   img.image = depth_img;
+   img.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+   check("local_read depth image barrier splits",
+         hk_barrier_classify(&info, &color_and_ds), BIT(TEXTURE));
+}
+
 int
 main(void)
 {
@@ -469,6 +580,7 @@ main(void)
    test_sides_and_writes();
    test_read_only_attachments();
    test_resources_and_fallbacks();
+   test_local_read();
    printf("hk_barrier: %u checks, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

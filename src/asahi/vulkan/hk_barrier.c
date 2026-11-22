@@ -132,7 +132,7 @@ static uint32_t
 classify_scope(const struct hk_barrier_state *state, VkDependencyFlags flags,
                VkPipelineStageFlags2 src, VkAccessFlags2 src_access,
                VkPipelineStageFlags2 dst, VkAccessFlags2 dst_access,
-               bool attachment, bool buffer)
+               bool attachment, bool ds_attachment, bool buffer)
 {
    src = expand_stages(src, true);
    dst = expand_stages(dst, false);
@@ -206,14 +206,27 @@ classify_scope(const struct hk_barrier_state *state, VkDependencyFlags flags,
 
    if (writes_attachment) {
       /* Fixed-function attachment operations observe the preceding pixel's
-       * attachment value within the tile pass. Descriptor reads do not:
-       * nir_lower_input_attachments currently produces texture fetches.
-       * BY_REGION does not make those fetches read the tile buffer. */
+       * attachment value within the tile pass. When color_input_local_read is
+       * set, BY_REGION color input attachment reads also read on-chip tile
+       * memory directly (with a draw-time fallback split if any draw falls back
+       * to texture fetches). Depth/stencil writes and generic shader/sampled
+       * reads still require a memory store. */
+      const bool ds_src_write =
+         (src_access & VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) != 0 ||
+         (state->depth_stencil_writes &&
+          ((src_access & VK_ACCESS_2_MEMORY_WRITE_BIT) != 0 ||
+           (src & (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                   VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT)) != 0));
+      const VkAccessFlags2 local_dst_access =
+         attachment_access |
+         (state->color_input_local_read && !ds_attachment && !ds_src_write
+             ? VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT
+             : 0);
       const bool local_attachment =
          !buffer && !state->tilebuffer_spilled && !state->attachments_alias &&
          (flags & VK_DEPENDENCY_BY_REGION_BIT) &&
          !(src & ~framebuffer_stages) && !(dst & ~framebuffer_stages) &&
-         dst_access && !(dst_access & ~attachment_access);
+         dst_access && !(dst_access & ~local_dst_access);
       if (!local_attachment)
          reasons |= REASON(TEXTURE);
    }
@@ -237,7 +250,7 @@ hk_barrier_classify(const VkDependencyInfo *info,
       reasons |= classify_scope(
          state, info->dependencyFlags, b->srcStageMask, b->srcAccessMask,
          b->dstStageMask, b->dstAccessMask,
-         state->attachment_count || state->attachments_alias, false);
+         state->attachment_count || state->attachments_alias, false, false);
       if (b->pNext)
          reasons |= REASON(UNKNOWN);
    }
@@ -246,7 +259,8 @@ hk_barrier_classify(const VkDependencyInfo *info,
       const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
       reasons |= classify_scope(
          state, info->dependencyFlags, b->srcStageMask, b->srcAccessMask,
-         b->dstStageMask, b->dstAccessMask, state->attachments_alias, true);
+         b->dstStageMask, b->dstAccessMask, state->attachments_alias, false,
+         true);
       if (b->srcQueueFamilyIndex != b->dstQueueFamilyIndex)
          reasons |= REASON(OWNERSHIP);
       if (b->pNext)
@@ -256,11 +270,20 @@ hk_barrier_classify(const VkDependencyInfo *info,
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
       const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
       bool attachment = state->attachments_alias;
-      for (uint32_t a = 0; a < state->attachment_count; ++a)
-         attachment |= b->image == state->attachments[a];
+      bool ds_attachment =
+         (b->subresourceRange.aspectMask &
+          (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+      for (uint32_t a = 0; a < state->attachment_count; ++a) {
+         if (b->image == state->attachments[a]) {
+            attachment = true;
+            if (a >= state->color_attachment_count)
+               ds_attachment = true;
+         }
+      }
       reasons |= classify_scope(state, info->dependencyFlags, b->srcStageMask,
                                 b->srcAccessMask, b->dstStageMask,
-                                b->dstAccessMask, attachment, false);
+                                b->dstAccessMask, attachment, ds_attachment,
+                                false);
       /* Equal layouts, including UNDEFINED, are not transitions (sync2).
        * Keep all real transitions conservative; layout-specific data movement
        * is handled by the existing render continuation path. */
