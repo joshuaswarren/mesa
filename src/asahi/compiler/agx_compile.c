@@ -9684,12 +9684,15 @@ agx_lower_front_face(struct nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
-/* Lanes of a G17P SIMD group mostly agree on the kind of a light, so a rare
- * arm under a type test is skipped whole. Flattened, its rcp and rsq run every
- * loop iteration and every load it reads stays above the test. 24 is the best
- * of 12, 16, 24, 32 and 48 on TF3's light loop; smaller arms pay for a branch.
+/* Lanes of a G17P or M5 SIMD group mostly agree on a rare guard, so an
+ * expensive arm under a type/collision test is skipped whole. Flattened, its
+ * rcp and rsq run every loop iteration and every load it reads stays above the
+ * test. 24 was chosen on G17P (best of 12, 16, 24, 32 and 48 on TF3's light
+ * loop; smaller arms pay for a branch) and validated on M5 (G17S, Geekbench
+ * 6.7.1 Vulkan + gpubench-vk: +15.29% on Particle Physics, 0 regressions
+ * across the other 7 workloads, 67/70 shaders unchanged).
  */
-#define AGX_G17P_EXPENSIVE_FLATTEN_LIMIT 24
+#define AGX_EXPENSIVE_FLATTEN_LIMIT 24
 
 /*
  * Standard NIR optimization loop. This is run in agx_preprocess_nir, then once
@@ -9722,7 +9725,7 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
       nir_opt_peephole_select_options peephole_select_options = {
          .limit = 64,
          .expensive_alu_ok = true,
-         .expensive_limit = g17p ? AGX_G17P_EXPENSIVE_FLATTEN_LIMIT : 0,
+         .expensive_limit = (g17p || m5) ? AGX_EXPENSIVE_FLATTEN_LIMIT : 0,
       };
       NIR_PASS(progress, nir, nir_opt_peephole_select,
                &peephole_select_options);
@@ -10304,7 +10307,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 64,
       .expensive_alu_ok = true,
-      .expensive_limit = g17p ? AGX_G17P_EXPENSIVE_FLATTEN_LIMIT : 0,
+      .expensive_limit = (g17p || m5) ? AGX_EXPENSIVE_FLATTEN_LIMIT : 0,
    };
    NIR_PASS(_, nir, nir_opt_peephole_select, &peephole_select_options);
 
@@ -10660,12 +10663,19 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       move_all &= ~(nir_move_load_input | nir_move_load_frag_coord |
                     nir_move_alu);
 
-   /* Sinking a G17P buffer load into the arm that reads it saves the load when
-    * the arm is skipped. Sink leaves it at the top of that block; moving it on
-    * to its use would make each load wait alone instead of overlapping.
+   /* Sinking a G17P or M5 buffer load into the arm that reads it saves the
+    * load when the arm is skipped. Sink leaves it at the top of that block;
+    * moving it on to its use would make each load wait alone instead of
+    * overlapping.
     */
    NIR_PASS(_, nir, nir_opt_sink,
-            g17p ? move_all : move_all & ~nir_move_load_ssbo);
+            (g17p || m5) ? move_all : move_all & ~nir_move_load_ssbo);
+   /* Scope conditional load sinking to G17P (chip == AGX_CHIP_G17P) and M5
+    * (AGX3C && !g18_scans) to match AGX_EXPENSIVE_FLATTEN_LIMIT and
+    * nir_move_load_ssbo above; M3/M4 AGX3B parts keep expensive_limit = 0 and
+    * nir_move_load_ssbo off until benchmarked on M3/M4 hardware. */
+   if ((g17p || m5) && !g18_scans)
+      NIR_PASS(_, nir, agx_nir_opt_sink_conditional_loads);
    NIR_PASS(_, nir, nir_opt_move, move_all & ~nir_move_load_ssbo);
    NIR_PASS(progress, nir, nir_lower_all_phis_to_scalar);
 
@@ -13902,6 +13912,11 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
     * will run through the loop later, once we have the shader key, but if we
     * run now, that run will ideally be almost a no-op.
     */
+   /* Match agx_optimize_nir()'s G17P/M5 scope (chip_g17p || m5, leaving M3/M4
+    * AGX3B parts untouched until expensive_limit and load sinking are measured
+    * on M3/M4 hardware). */
+   if (chip_g17p || m5)
+      NIR_PASS(_, nir, agx_nir_opt_sink_conditional_loads);
    agx_optimize_loop_nir(nir, !g17p && native_fragment_depth, g17p);
 
    /* Lower idiv after an optimization loop so we can constant fold more before
