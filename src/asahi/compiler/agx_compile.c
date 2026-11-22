@@ -10891,6 +10891,86 @@ agx_preamble_allowed(const nir_shader *nir)
    return !(agx_compiler_debug & AGX_DBG_NOPREAMBLE) || nir->info.internal;
 }
 
+/* When a compute workgroup has static size 1 along an axis, every invocation
+ * in the workgroup has local_invocation_id[c] == 0, so
+ * global_invocation_id[c] == workgroup_id[c]. Replacing those components with
+ * load_workgroup_id exposes their workgroup-uniformity to divergence analysis,
+ * preamble hoisting, and uniform addressing. */
+bool
+agx_nir_uniform_unit_global_id(nir_shader *nir)
+{
+   if (nir->info.internal ||
+       (nir->info.stage != MESA_SHADER_COMPUTE &&
+        nir->info.stage != MESA_SHADER_KERNEL) ||
+       nir->info.workgroup_size_variable ||
+       !nir->info.workgroup_size[0] || !nir->info.workgroup_size[1] ||
+       !nir->info.workgroup_size[2])
+      return false;
+
+   /* Only multi-thread workgroups benefit from exposing unit axes as
+    * workgroup-uniform; single-thread (1x1x1) dispatches have no
+    * intra-workgroup uniformity to expose. Driver-generated EOT and
+    * background programs are marked info.internal = true explicitly and
+    * filtered above regardless of workgroup shape. */
+   const uint64_t wg_threads = (uint64_t)nir->info.workgroup_size[0] *
+                               nir->info.workgroup_size[1] *
+                               nir->info.workgroup_size[2];
+   if (wg_threads <= 1)
+      return false;
+
+   bool any_unit = false;
+   for (unsigned c = 0; c < 3; ++c)
+      any_unit |= nir->info.workgroup_size[c] == 1;
+   if (!any_unit)
+      return false;
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      bool impl_progress = false;
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic != nir_intrinsic_load_global_invocation_id)
+               continue;
+
+            const unsigned ncomp = intrin->def.num_components;
+            bool hit = false, all = true;
+            for (unsigned c = 0; c < ncomp; ++c) {
+               const bool unit = c < 3 && nir->info.workgroup_size[c] == 1;
+               hit |= unit;
+               all &= unit;
+            }
+            if (!hit)
+               continue;
+
+            b.cursor = nir_after_instr(instr);
+            nir_def *wg =
+               nir_u2uN(&b, nir_load_workgroup_id(&b), intrin->def.bit_size);
+            nir_def *chans[4];
+            for (unsigned c = 0; c < ncomp; ++c) {
+               if (c < 3 && nir->info.workgroup_size[c] == 1)
+                  chans[c] = nir_channel(&b, wg, c);
+               else
+                  chans[c] = nir_channel(&b, &intrin->def, c);
+            }
+            nir_def *vec = nir_vec(&b, chans, ncomp);
+            if (all) {
+               nir_def_rewrite_uses(&intrin->def, vec);
+               nir_instr_remove(instr);
+            } else {
+               nir_def_rewrite_uses_after(&intrin->def, vec);
+            }
+            impl_progress = true;
+         }
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool byte_indices, bool discard_word, bool g17p, bool m5,
@@ -10943,6 +11023,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
 
    /* This runs only once up front since other optimizations don't affect it */
    NIR_PASS(_, nir, nir_opt_shrink_stores, true);
+   NIR_PASS(_, nir, agx_nir_uniform_unit_global_id);
 
    agx_optimize_loop_nir(nir, m5, g17p);
 
@@ -11066,6 +11147,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     */
    NIR_PASS(addr_progress, nir, agx_nir_lower_address, byte_indices, m5,
             checked_offsets);
+
 
    /* Now that loads carry an index, a select between two of them can choose
     * the index instead of the loaded data. Run it to a fixed point with the
