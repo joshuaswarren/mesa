@@ -1931,3 +1931,80 @@ TEST_F(Optimizer, Agx3bHalfFaddKeepsOneWordSourceThroughCompaction)
       EXPECT_EQ(halves, 1u) << constant_first;
    }
 }
+
+
+TEST_F(Optimizer, Agx3bFoldsZeroExtendedHalfIntoIadd)
+{
+   struct Case {
+      const char *name;
+      enum agx_isa_encoding enc;
+      bool emit_agx3d;
+      bool both_half;
+      bool neg0;
+      bool neg1;
+      bool saturate;
+      unsigned shift;
+      bool expect_fold0;
+      bool expect_fold1;
+   };
+   const Case cases[] = {
+      {"u16_plus_u16", AGX_ISA_ENCODING_AGX3B, false, true, false, false,
+       false, 0, true, true},
+      {"u16_minus_u16", AGX_ISA_ENCODING_AGX3B, false, true, false, true,
+       false, 0, true, true},
+      {"u16_plus_u32", AGX_ISA_ENCODING_AGX3B, false, false, false, false,
+       false, 0, true, false},
+      {"u16_minus_u32", AGX_ISA_ENCODING_AGX3B, false, false, false, true,
+       false, 0, true, false},
+      {"u32_minus_u16", AGX_ISA_ENCODING_AGX3B, false, false, true, false,
+       false, 0, true, false},
+      {"both_neg_blocked", AGX_ISA_ENCODING_AGX3B, false, true, true, true,
+       false, 0, false, false},
+      {"saturate_blocked", AGX_ISA_ENCODING_AGX3B, false, true, false, false,
+       true, 0, false, false},
+      {"shifted_blocked", AGX_ISA_ENCODING_AGX3B, false, true, false, false,
+       false, 2, false, false},
+      {"g18g_blocked", AGX_ISA_ENCODING_AGX3C, true, true, false, false,
+       false, 0, false, false},
+   };
+
+   for (const Case &c : cases) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.emit_agx3d = c.emit_agx3d;
+      b->shader->key = &key;
+
+      agx_index h0 = agx_preload(b, hx);
+      agx_index w0 = agx_temp(b->shader, AGX_SIZE_32);
+      agx_mov_to(b, w0, h0);
+      agx_index s0 = c.neg0 ? agx_neg(w0) : w0;
+
+      agx_index s1;
+      if (c.both_half) {
+         agx_index h1 = agx_preload(b, hy);
+         agx_index w1 = agx_temp(b->shader, AGX_SIZE_32);
+         agx_mov_to(b, w1, h1);
+         s1 = c.neg1 ? agx_neg(w1) : w1;
+      } else {
+         agx_index w1 = agx_preload(b, wy);
+         s1 = c.neg1 ? agx_neg(w1) : w1;
+      }
+
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *I = agx_iadd_to(b, out, s0, s1, c.shift);
+      I->saturate = c.saturate;
+      agx_unit_test(b, out);
+
+      agx_optimize_and_dce(b->shader);
+
+      EXPECT_EQ(I->src[0].size, c.expect_fold0 ? AGX_SIZE_16 : AGX_SIZE_32)
+         << c.name;
+      EXPECT_EQ(I->src[0].abs, c.expect_fold0) << c.name;
+      EXPECT_EQ(I->src[0].neg, c.neg0) << c.name;
+      EXPECT_EQ(I->src[1].size, c.expect_fold1 ? AGX_SIZE_16 : AGX_SIZE_32)
+         << c.name;
+      EXPECT_EQ(I->src[1].abs, c.expect_fold1) << c.name;
+      EXPECT_EQ(I->src[1].neg, c.neg1) << c.name;
+   }
+}

@@ -19832,9 +19832,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              */
             agx_index na = original_a, nb = original_b;
             /* Addition commutes: keep a negated operand in slot B, and a 32-bit
-             * operand in slot A of a mixed-width add. */
+             * operand in slot A of a mixed-width add (matching AGX3B's f24=2,
+             * f39=1 witness for both sign- and zero-extended half addends,
+             * while leaving AGX3C's existing operand order untouched). */
             if ((na.neg && !nb.neg) ||
-                (!na.neg && !nb.neg && !na.abs && !nb.abs &&
+                (!na.neg && !nb.neg && !nb.abs &&
+                 (!na.abs || enc == AGX_ISA_ENCODING_AGX3B) &&
                  na.size == AGX_SIZE_16 && nb.size == AGX_SIZE_32)) {
                const agx_index t = na;
                na = nb;
