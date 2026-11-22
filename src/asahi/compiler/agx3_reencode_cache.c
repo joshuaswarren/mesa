@@ -613,6 +613,15 @@ fail:
    return NULL;
 }
 
+unsigned
+agx3_reencode_template_fast_ldimms(const struct agx3_reencode_template *t)
+{
+   unsigned fast = 0;
+   for (unsigned k = 0; k < t->ldimm_count; ++k)
+      fast += t->ldimms[k].fast;
+   return fast;
+}
+
 bool
 agx3_reencode_template_emit(const struct agx3_reencode_template *t,
                             const uint32_t *immediates,

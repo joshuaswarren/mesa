@@ -76,6 +76,13 @@ agx3_reencode_template_create(void *mem_ctx,
                               const unsigned *ldimm_offsets, unsigned count,
                               const char **why, unsigned *at);
 
+/* How many of the template's LDIMMs learnt their agx3d forms from the encoding
+ * tables, so that emitting deposits their immediates instead of composing
+ * them. That is all of them unless a change to the tables breaks what the
+ * learning relies on; the others still emit correctly, only slower. */
+unsigned
+agx3_reencode_template_fast_ldimms(const struct agx3_reencode_template *t);
+
 /* The agx3d program for the immediates[0, count) of the template's LDIMMs,
  * in the order they were given: exactly what agx3_reencode_program() writes
  * for the agx3c program with those immediates. False if one of them takes

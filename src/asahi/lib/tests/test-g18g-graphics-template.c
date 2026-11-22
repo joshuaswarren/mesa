@@ -95,8 +95,8 @@ int
 main(void)
 {
    void *mem = ralloc_context(NULL);
-   unsigned made = 0, emitted[CLASSES] = {0}, refused[CLASSES] = {0},
-            unfit = 0;
+   unsigned made = 0, emitted[CLASSES] = {0}, refused[CLASSES] = {0}, unfit = 0,
+            ldimms = 0;
 
    /* Vertex, fragment, coverage fragment, then both again with a TPS frame */
    for (unsigned variant = 0; variant < 6; ++variant) {
@@ -149,6 +149,9 @@ main(void)
          struct agx3_reencode_template *t = agx3_reencode_template_create(
             mem, &composed.program, &ioto, offsets, count, &why, &at);
          CHECK(t);
+         /* Every LDIMM deposits its immediate rather than composing it */
+         CHECK(agx3_reencode_template_fast_ldimms(t) == count);
+         ldimms += count;
          ++made;
 
          for (unsigned k = 0; k < 100 * CLASSES; ++k) {
@@ -215,6 +218,8 @@ main(void)
       struct agx3_reencode_template *t = agx3_reencode_template_create(
          mem, &composed.program, &ioto, offsets, count, &why, &at);
       CHECK(t);
+      CHECK(agx3_reencode_template_fast_ldimms(t) == count);
+      ldimms += count;
       ranges[1].address = UINT64_C(0x20000000400);
       CHECK(hk_g17p_patch_plan_fits(&plan, ranges));
       hk_g17p_patch_plan_ldimms(&plan, ranges, NULL, immediates);
@@ -228,6 +233,7 @@ main(void)
    for (unsigned c = 0; c < CLASSES; ++c)
       printf("class %u: %u emitted, %u refused\n", c, emitted[c], refused[c]);
    printf("%u templates, %u address sets the plans do not fit\n", made, unfit);
+   printf("%u template LDIMMs, all on their fast forms\n", ldimms);
    /* Every running-buffer draw comes from its template */
    CHECK(made == 36 && emitted[0] == 100 * made);
    ralloc_free(mem);
