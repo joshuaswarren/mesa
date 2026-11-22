@@ -55,6 +55,7 @@ bool agx_nir_lower_g17p_1x_tile_samples(struct nir_shader *s);
 bool agx_nir_fold_d3d_float_to_int(struct nir_shader *shader);
 bool agx_nir_fold_pixel_coord(struct nir_shader *shader);
 bool agx_nir_fold_extract16_bfe(struct nir_shader *shader);
+bool agx_nir_opt_half_bitfield_extract(struct nir_shader *shader);
 bool agx_nir_cleanup_amul(struct nir_shader *shader);
 bool agx_nir_fuse_lea(struct nir_shader *shader);
 bool agx_nir_lower_lea(struct nir_shader *shader);
