@@ -1332,6 +1332,19 @@ bool agx3_analyze_preamble_uniform_inputs(agx_context *ctx, bool *has_inputs);
  * therefore starts its outputs here, and nowhere else. */
 #define AGX3_UVS_POSITION_ENTRIES 4u
 
+/* AGX3C (M5) low CEM scratch bank: four 32-bit words (eight 16-bit halves)
+ * placed immediately above the 8-half spill parallel-copy prefix (0..7):
+ *   +0..+3: axis 0 magnitude/face pair (two 32-bit words)
+ *   +4..+5: axis 1 coordinate (one 32-bit word)
+ *   +6..+7: axis 2 coordinate (one 32-bit word)
+ * RA reserves halves 0..AGX3C_CEM_LOW_SCRATCH_END-1 and evicts entry preloads
+ * overlapping [AGX3C_CEM_LOW_SCRATCH_BASE, AGX3C_CEM_LOW_SCRATCH_END). */
+#define AGX3C_CEM_LOW_SCRATCH_BASE      8u
+#define AGX3C_CEM_LOW_SCRATCH_SIZE      8u
+#define AGX3C_CEM_LOW_SCRATCH_END       (AGX3C_CEM_LOW_SCRATCH_BASE + AGX3C_CEM_LOW_SCRATCH_SIZE)
+#define AGX3C_CEM_LOW_SCRATCH_AXIS1_OFF 4u
+#define AGX3C_CEM_LOW_SCRATCH_AXIS2_OFF 6u
+
 /* Number of 16-bit registers RA keeps reserved at the bottom of the register
  * file for the whole shader.
  */
@@ -1339,7 +1352,7 @@ static inline unsigned
 agx_reserved_registers(const agx_context *ctx)
 {
    if (ctx->agx3_cem_low_scratch)
-      return 16;
+      return AGX3C_CEM_LOW_SCRATCH_END;
    else if (ctx->has_spill_pcopy_reserved)
       return 8;
    else if (ctx->any_quad_divergent_shuffle)

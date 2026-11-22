@@ -12793,12 +12793,13 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       /* M5's RA reserves a low bank so unrelated values may use the full
        * register file; older callers retain the bank above their allocation. */
       const unsigned base = ctx->agx3_cem_low_scratch
-                               ? 8 : (observed_max_reg + 2) & ~1u;
-      if (base + 6 > 190)
+                               ? AGX3C_CEM_LOW_SCRATCH_BASE
+                               : (observed_max_reg + 2) & ~1u;
+      if (base + AGX3C_CEM_LOW_SCRATCH_AXIS2_OFF > 190)
          AGX3_PACK_FAIL();
       cem_scratch[0] = base;
-      cem_scratch[1] = base + 4;
-      cem_scratch[2] = base + 6;
+      cem_scratch[1] = base + AGX3C_CEM_LOW_SCRATCH_AXIS1_OFF;
+      cem_scratch[2] = base + AGX3C_CEM_LOW_SCRATCH_AXIS2_OFF;
       uint16_t reusable[3];
       if (agx3_reusable_cube_scratch(ctx, observed_max_reg, reusable)) {
          memcpy(cem_scratch, reusable, sizeof(reusable));
@@ -12807,7 +12808,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                  MAX3(reusable[0] + 3, reusable[1] + 1, reusable[2] + 1));
       } else {
          /* M5's low CEM bank may sit below the current allocation. */
-         ctx->max_reg = MAX2(ctx->max_reg, base + 7);
+         ctx->max_reg = MAX2(ctx->max_reg, base + AGX3C_CEM_LOW_SCRATCH_SIZE - 1);
       }
    }
 
