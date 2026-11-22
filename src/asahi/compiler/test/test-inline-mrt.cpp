@@ -467,6 +467,8 @@ TEST(LocalRead, PhaseSplitDisjointAndLoadOnly)
 TEST(LocalRead, CapabilityPredicateAndChipGating)
 {
    EXPECT_TRUE(agx_chip_local_read_tilebuffer(AGX_CHIP_G16G));
+   EXPECT_TRUE(agx_chip_local_read_tilebuffer(AGX_CHIP_G16S));
+   EXPECT_TRUE(agx_chip_local_read_tilebuffer(AGX_CHIP_G16C));
    EXPECT_TRUE(agx_chip_local_read_tilebuffer(AGX_CHIP_G17P));
    EXPECT_TRUE(agx_chip_local_read_tilebuffer(AGX_CHIP_G17G));
    EXPECT_TRUE(agx_chip_local_read_tilebuffer(AGX_CHIP_G17S));
@@ -488,6 +490,8 @@ TEST(LocalRead, CapabilityPredicateAndChipGating)
    };
    const chip_gate_case cases[] = {
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false, true, "G16G"},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16S, false, true, "G16S"},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16C, false, true, "G16C"},
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, true, "G17P"},
       {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, true, "G17S"},
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G, false, false, "G15G"},

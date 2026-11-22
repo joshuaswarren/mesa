@@ -12705,8 +12705,9 @@ agx3_order_g17p_mrt_tile_ops_strict(agx_context *ctx)
  * (local_read / subpassLoad) can read partitions they never write and contain
  * arbitrary control flow (e.g. lighting loops, per-sample unrolled loops)
  * between their tile loads and final tile stores. Admit those shapes on
- * chips with agx_chip_local_read_tilebuffer() (G16G, G17P, and M5) under a
- * single uniform pixel-class transaction covering every touched partition. */
+ * chips with agx_chip_local_read_tilebuffer() (HAL200/AGX3B and HAL300/AGX3C)
+ * under a single uniform pixel-class transaction covering every touched
+ * partition. */
 static bool
 agx3_order_g17p_local_read_tile_ops(agx_context *ctx)
 {

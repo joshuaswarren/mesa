@@ -162,6 +162,7 @@ static unsigned checks;
    ROW(agx_chip_has_agx3_ray_opcodes(c), "0000 01111 1111 11111 0 0")          \
    ROW(agx_chip_needs_scheduling_stalls(c), "0000 01000 0000 00000 0 0")       \
    ROW(agx_chip_cooperative_matrix_supported(c), "0000 01111 1111 11111 0 0")  \
+   ROW(agx_chip_local_read_tilebuffer(c), "0000 00000 1111 11111 0 0")         \
    /* Per-record allowlists: VDM. */                                           \
    ROW(agx_vdm_state_vertex_pipeline_pair_supported(c),                        \
        "0000 01111 0111 10111 1 0")                                            \
