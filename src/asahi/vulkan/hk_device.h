@@ -557,13 +557,15 @@ hk_cdm_alias_scope(const struct hk_device *dev)
 }
 
 /* Whether the CDM strong flush has a memory-scoped form, which memory
- * reached through a second address needs (hk_cdm_alias_scope()): on G17P
- * and M5. G16 has only the plain strong flush; G17A's caches are not known
- * (hk_cdm_caches_pending()). */
+ * reached through a second address needs (hk_cdm_alias_scope()). Keyed on
+ * the chip table's AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY capability (G17P
+ * and M5); G16 has only the plain strong flush and G17A's caches are not
+ * known (hk_cdm_caches_pending()). */
 static inline bool
 hk_cdm_memory_scope_form(const struct hk_device *dev)
 {
-   return agx_chip_g17p_or_m5(dev->dev.chip);
+   return agx_chip_has_record(dev->dev.chip,
+                              AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY);
 }
 
 /* Whether it is still unknown if the GPU's caches are tagged by virtual

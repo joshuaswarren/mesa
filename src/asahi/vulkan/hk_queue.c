@@ -2427,12 +2427,13 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
  *   through a second address needs (hk_cdm_alias_scope()); while such
  *   memory may exist, it keeps or gets the scope. The packet's end gets the
  *   whole flush, upgraded in place where the last member's lacked the scope.
- * - HAL200 streams whose strong flush has no memory-scoped form (G16) end
- *   with their last launch's ordering barrier or a strong flush, and the end
- *   of the command publishes their writes. At a boundary the record becomes
- *   the strong flush, as for a compute or transfer dependency inside one
- *   stream. The last member's tail stays as recorded; the packet's own end
- *   of command follows it.
+ * - HAL200 streams whose caches are qualified (!hk_cdm_caches_pending(),
+ *   G16 and G17P) end with their last launch's ordering barrier or a strong
+ *   flush, and the end of the command publishes their writes. At a boundary
+ *   the record becomes the strong flush, adding memory scope on G17P while
+ *   aliased mappings exist (hk_cdm_alias_scope()). The last member's tail
+ *   stays as recorded unless alias scope became active after recording on a
+ *   part with a memory-scoped flush, in which case it is upgraded in place.
  *
  * Work in a packet waits for whatever any member waited for, and work after
  * it waits for the whole packet. On the compute subqueue that adds no
@@ -2724,8 +2725,14 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
             hk_cdm_visibility_flush(dev, cs, last || hk_cdm_alias_scope(dev));
          } else if (!last) {
             /* HAL200: the member's ordering barrier becomes the strong
-             * flush, or its strong flush stays. */
-            hk_cdm_visibility_flush(dev, cs, false);
+             * flush, or its strong flush stays; on parts with a memory-scoped
+             * flush (G17P), add memory scope while aliased mappings exist. */
+            hk_cdm_visibility_flush(dev, cs, hk_cdm_alias_scope(dev));
+         } else if (hk_cdm_memory_scope_form(dev) && hk_cdm_alias_scope(dev) &&
+                    hk_cdm_visibility_flush_needed(dev, cs, true)) {
+            /* A VA-aliasing resource may have been created after the final
+             * member was recorded: upgrade its tail to memory scope in place. */
+            hk_cdm_visibility_flush(dev, cs, true);
          }
 
          hk_pack_fold_member(cmd, cs, source, item, last, &preceding_kinds);
