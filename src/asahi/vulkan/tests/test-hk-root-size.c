@@ -71,6 +71,67 @@ int main(void)
    load(&b, nir_iadd_imm(&b, reflected, 4096), 1, 32);
    assert(hk_nir_root_size(b.shader, full) == full);
    ralloc_free(b.shader);
-   puts("root footprint: constant, dynamic, escape, overflow, depth and reflection controls passed");
+
+   /* Test hk_shader_root_descriptor_size(): compute trims to the highest
+    * read / set-base prefix, whereas graphics VS/FS are floored at push_offset
+    * so driver-synthesized prolog/epilog loads in the draw arm stay covered. */
+   const unsigned sets_off = 32;
+   const unsigned push_off = 512;
+   const mesa_shader_stage gfx_stages[] = {
+      MESA_SHADER_VERTEX,
+      MESA_SHADER_FRAGMENT,
+   };
+
+   /* Compute with 1 set and no root loads stays below push_off. */
+   b = builder();
+   assert(hk_shader_root_descriptor_size(b.shader, MESA_SHADER_COMPUTE, 1,
+                                         sets_off, push_off, full) == 48);
+   load(&b, nir_iadd_imm(&b, nir_load_root_agx(&b), 60), 1, 32);
+   assert(hk_shader_root_descriptor_size(b.shader, MESA_SHADER_COMPUTE, 1,
+                                         sets_off, push_off, full) == 64);
+   ralloc_free(b.shader);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(gfx_stages); ++i) {
+      /* Empty shader / low root load is floored at push_offset (aligned to 16). */
+      b = nir_builder_init_simple_shader(gfx_stages[i], NULL, "gfx-root-floor");
+      assert(hk_shader_root_descriptor_size(b.shader, gfx_stages[i], 2,
+                                            sets_off, push_off, full) ==
+             push_off);
+      load(&b, nir_iadd_imm(&b, nir_load_root_agx(&b), 128), 4, 32);
+      assert(hk_shader_root_descriptor_size(b.shader, gfx_stages[i], 2,
+                                            sets_off, push_off, full) ==
+             push_off);
+      /* Constant push-constant read past push_off extends and aligns to 16B. */
+      load(&b, nir_iadd_imm(&b, nir_load_root_agx(&b), push_off + 20), 1, 32);
+      assert(hk_shader_root_descriptor_size(b.shader, gfx_stages[i], 2,
+                                            sets_off, push_off, full) ==
+             push_off + 32);
+      ralloc_free(b.shader);
+
+      /* Dynamic indexing stays full-sized. */
+      b = nir_builder_init_simple_shader(gfx_stages[i], NULL, "gfx-root-dyn");
+      addr = nir_iadd(&b, nir_load_root_agx(&b),
+                      nir_u2u64(&b, nir_load_vertex_id(&b)));
+      load(&b, addr, 1, 32);
+      assert(hk_shader_root_descriptor_size(b.shader, gfx_stages[i], 2,
+                                            sets_off, push_off, full) == full);
+      ralloc_free(b.shader);
+   }
+
+   /* Test hk_gfx_root_size_from_stages() (VS/FS max, VS-only, and fallbacks). */
+   assert(hk_gfx_root_size_from_stages(512, true, 576, full) == 576);
+   assert(hk_gfx_root_size_from_stages(640, true, 512, full) == 640);
+   assert(hk_gfx_root_size_from_stages(512, false, 0, full) == 512);
+   assert(hk_gfx_root_size_from_stages(0, true, 512, full) == full);
+   assert(hk_gfx_root_size_from_stages(512, true, 0, full) == full);
+   assert(hk_gfx_root_size_from_stages(full + 64, false, 0, full) == full);
+
+   /* Test hk_root_upload_needs_growth() re-upload trigger. */
+   assert(hk_root_upload_needs_growth(0, 512));
+   assert(hk_root_upload_needs_growth(512, 576));
+   assert(!hk_root_upload_needs_growth(576, 576));
+   assert(!hk_root_upload_needs_growth(640, 512));
+
+   puts("root footprint: compute and graphics floor, stage sizing, growth trigger, dynamic, escape, overflow, depth and reflection controls passed");
    return 0;
 }
