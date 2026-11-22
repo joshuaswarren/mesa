@@ -3384,12 +3384,38 @@ tc_texture_subdata(struct pipe_context *_pipe,
                         tc->options.is_resource_busy &&
                         !tc->options.is_resource_busy(tc->pipe->screen, tres->latest, usage | unsync_usage);
 
+      const unsigned blocksize = util_format_get_blocksize(resource->format);
+      const unsigned row_bytes = util_format_get_stride(resource->format, box->width);
+      const unsigned nblocksy = util_format_get_nblocksy(resource->format, box->height);
+      const bool valid_row_stride =
+         (box->height == 1 && box->depth == 1) ||
+         (stride >= row_bytes && (stride % blocksize) == 0);
+      const bool valid_layer_stride =
+         box->depth == 1 ||
+         (stride > 0 && layer_stride >= (uint64_t)nblocksy * stride &&
+          (layer_stride % stride) == 0);
+      const uint64_t copy_size =
+         (uint64_t)(box->depth - 1) * layer_stride +
+         (uint64_t)(nblocksy - 1) * stride +
+         row_bytes;
+
+      struct pipe_resource *pres = NULL;
       if (!can_unsync && resource->usage != PIPE_USAGE_STAGING &&
-          tc->options.parse_renderpass_info && tc->in_renderpass) {
+          tc->options.parse_renderpass_info && tc->in_renderpass &&
+          valid_row_stride && valid_layer_stride &&
+          copy_size > 0 && copy_size <= UINT32_MAX) {
          /* upload to staging buffer and then buf2img copy */
-         struct pipe_resource *pres = pipe_buffer_create(pipe->screen, 0, PIPE_USAGE_STREAM, layer_stride * box->depth);
-         pipe->buffer_subdata(pipe, pres, unsync_usage, 0, layer_stride * box->depth, data);
-         tc->base.image_copy_buffer(&tc->base, resource, pres, 0, stride, layer_stride, level, box);
+         pres = pipe_buffer_create(pipe->screen, 0, PIPE_USAGE_STREAM, copy_size);
+      }
+
+      if (pres) {
+         const unsigned copy_stride =
+            (box->height > 1 || box->depth > 1) ? stride : 0;
+         const uintptr_t copy_layer_stride =
+            box->depth > 1 ? layer_stride : 0;
+         pipe->buffer_subdata(pipe, pres, unsync_usage, 0, copy_size, data);
+         tc->base.image_copy_buffer(&tc->base, resource, pres, 0, copy_stride,
+                                    copy_layer_stride, level, box);
          pipe_resource_reference(&pres, NULL);
       } else {
          if (can_unsync) {

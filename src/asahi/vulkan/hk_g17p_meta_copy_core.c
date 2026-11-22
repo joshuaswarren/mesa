@@ -644,9 +644,16 @@ hk_g17p_buffer_to_image_copy_supported(
         (z >= mip_depth || copy->copy_extent.depth > mip_depth - z)))
       return false;
 
-   return (copy->buffer_row_length == 0 ||
+   const uint32_t slices =
+      volume ? copy->copy_extent.depth
+             : (copy->layer_count == VK_REMAINING_ARRAY_LAYERS
+                   ? copy->array_layers - copy->base_array_layer
+                   : copy->layer_count);
+
+   return ((copy->copy_extent.height == 1 && slices == 1) ||
+           copy->buffer_row_length == 0 ||
            copy->buffer_row_length >= copy->copy_extent.width) &&
-          (copy->buffer_image_height == 0 ||
+          (slices == 1 || copy->buffer_image_height == 0 ||
            copy->buffer_image_height >= copy->copy_extent.height);
 }
 
