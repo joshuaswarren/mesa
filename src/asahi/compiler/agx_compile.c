@@ -11086,6 +11086,13 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       } while (alg_progress);
    }
 
+   progress = false;
+   NIR_PASS(progress, nir, agx_nir_opt_narrow_subword_loads);
+   if (progress) {
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+
    /* Only lower int64 after optimizing address arithmetic, so that u2u64/i2i64
     * conversions remain.
     */
