@@ -2339,6 +2339,8 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    pctx->blit = agx_blit;
    if (agx_chip_g17_m5(agx_device(screen)->chip))
       pctx->generate_mipmap = agx_generate_mipmap_g17g;
+   else if (agx_chip_native_agx3(agx_device(screen)->chip))
+      pctx->generate_mipmap = agx_generate_mipmap_agx3;
    pctx->flush_resource = agx_flush_resource;
 
    pctx->buffer_map = u_transfer_helper_transfer_map;
@@ -2591,8 +2593,11 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
 
    u_init_pipe_screen_caps(pscreen, 1);
 
-   /* G17G generates mipmaps on the CPU (agx_generate_mipmap_g17g). */
-   caps->generate_mipmap = agx_chip_g17_m5(agx_device(pscreen)->chip);
+   /* G17G generates mipmaps on the CPU (agx_generate_mipmap_g17g); native
+    * AGX3 generates uncompressed UNORM8x4 mipchains in one compute batch
+    * (agx_generate_mipmap_agx3) and falls back to util_gen_mipmap. */
+   caps->generate_mipmap = agx_chip_g17_m5(agx_device(pscreen)->chip) ||
+                           agx_chip_native_agx3(agx_device(pscreen)->chip);
 
    caps->clip_halfz = true;
    caps->prefer_real_buffer_in_constbuf0 = true;

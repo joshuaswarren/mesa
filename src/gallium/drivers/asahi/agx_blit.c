@@ -9,7 +9,10 @@
 
 #include <stdint.h>
 #include "asahi/compiler/agx_nir_texture.h"
+#include "asahi/genxml/agx3_cmdstream.h"
 #include "asahi/layout/layout.h"
+#include "asahi/lib/agx3_compute_program_core.h"
+#include "asahi/lib/agx_tile_mip.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_format_convert.h"
 #include "gallium/auxiliary/util/u_blitter.h"
@@ -1151,5 +1154,264 @@ agx_generate_mipmap_g17g(struct pipe_context *pctx, struct pipe_resource *prsc,
          pctx->texture_unmap(pctx, src_xfer);
       }
    }
+   return true;
+}
+
+static bool
+agx_agx3_mipmap_format_supported(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+bool
+agx_generate_mipmap_agx3_supported(const struct agx_device *dev,
+                                   const struct agx_resource *rsrc,
+                                   enum pipe_format format,
+                                   unsigned base_level, unsigned last_level,
+                                   unsigned first_layer, unsigned last_layer)
+{
+   if (!dev || !rsrc || !agx_chip_native_agx3(dev->chip))
+      return false;
+
+   const struct pipe_resource *prsc = &rsrc->base;
+   switch (prsc->target) {
+   case PIPE_TEXTURE_2D:
+   case PIPE_TEXTURE_2D_ARRAY:
+   case PIPE_TEXTURE_CUBE:
+   case PIPE_TEXTURE_CUBE_ARRAY:
+      break;
+   default:
+      return false;
+   }
+
+   if (prsc->nr_samples > 1 || rsrc->layout.sample_count_sa != 1 ||
+       rsrc->layout.tiling != AIL_TILING_GPU || rsrc->layout.compressed ||
+       rsrc->layout.format != format ||
+       !agx_agx3_mipmap_format_supported(format))
+      return false;
+
+   if (base_level >= last_level || last_level > prsc->last_level ||
+       last_level >= rsrc->layout.levels || first_layer > last_layer ||
+       last_layer >= prsc->array_size || prsc->width0 > UINT16_MAX + 1u ||
+       prsc->height0 > UINT16_MAX + 1u)
+      return false;
+
+   for (unsigned level = base_level; level <= last_level; ++level) {
+      const struct ail_tile tile = rsrc->layout.tilesize_el[level];
+      struct agx_tile_address_config cfg;
+      if (!agx_tile_address_config_init(rsrc->layout.stride_el[level],
+                                        tile.width_el, tile.height_el, &cfg))
+         return false;
+   }
+
+   return true;
+}
+
+/* Ensure the current compute batch has room for one native AGX3 direct
+ * compute dispatch record plus the stream terminate emitted by
+ * agx_flush_compute(). Returns true if the batch was flushed and replaced. */
+static bool
+agx_agx3_mipmap_ensure_cdm_space(struct agx_context *ctx,
+                                 struct agx_batch **batchp,
+                                 struct agx_resource *rsrc, unsigned level,
+                                 unsigned last_level)
+{
+   const size_t min_bytes =
+      AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE + AGX3_CDM_STREAM_TERMINATE_SIZE;
+   struct agx_batch *batch = *batchp;
+
+   if ((size_t)(batch->cdm.end - batch->cdm.current) >= min_bytes)
+      return false;
+
+   agx_flush_batch(ctx, batch);
+   batch = agx_get_compute_batch(ctx);
+   agx_batch_init_state(batch);
+   agx_batch_reads(batch, rsrc);
+   for (unsigned l = level; l <= last_level; ++l)
+      agx_batch_writes(batch, rsrc, l);
+   *batchp = batch;
+   return true;
+}
+
+/* Native AGX3 compute mipchain generation for uncompressed GPU-tiled UNORM8x4
+ * 2D / 2D_ARRAY / CUBE textures. Runs all levels in one CDM compute batch via
+ * libagx_mipmap_unorm8x4 / libagx_mipmap_unorm8x4_2level /
+ * libagx_mipmap_unorm8x4_odd (matching Borealis's hk_g17p_compute_blit()),
+ * avoiding one 3D render pass per mip level. Unsupported formats or layouts
+ * return false and fall back to util_gen_mipmap(). */
+bool
+agx_generate_mipmap_agx3(struct pipe_context *pctx, struct pipe_resource *prsc,
+                         enum pipe_format format, unsigned base_level,
+                         unsigned last_level, unsigned first_layer,
+                         unsigned last_layer)
+{
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_device *dev = agx_device(pctx->screen);
+   struct agx_resource *rsrc = agx_resource(prsc);
+
+   if (!agx_generate_mipmap_agx3_supported(dev, rsrc, format, base_level,
+                                           last_level, first_layer, last_layer))
+      return false;
+
+   if (!agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4) ||
+       !agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4_ODD))
+      return false;
+
+   const bool has_2level =
+      agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4_2LEVEL) != NULL;
+
+   struct agx_batch *batch = agx_get_compute_batch(ctx);
+   agx_batch_init_state(batch);
+   agx_batch_reads(batch, rsrc);
+   for (unsigned level = base_level + 1; level <= last_level; ++level)
+      agx_batch_writes(batch, rsrc, level);
+
+   const struct ail_layout *layout = &rsrc->layout;
+   const uint64_t base_addr = agx_map_gpu(rsrc);
+
+   for (unsigned level = base_level + 1; level <= last_level;) {
+      const uint32_t src_w = u_minify(prsc->width0, level - 1);
+      const uint32_t src_h = u_minify(prsc->height0, level - 1);
+      const uint32_t dst_w = u_minify(prsc->width0, level);
+      const uint32_t dst_h = u_minify(prsc->height0, level);
+
+      const struct ail_tile src_tile = layout->tilesize_el[level - 1];
+      const struct ail_tile dst_tile = layout->tilesize_el[level];
+      struct agx_tile_address_config src_cfg, dst_cfg;
+      const bool ok_src = agx_tile_address_config_init(
+         layout->stride_el[level - 1], src_tile.width_el, src_tile.height_el,
+         &src_cfg);
+      const bool ok_dst = agx_tile_address_config_init(
+         layout->stride_el[level], dst_tile.width_el, dst_tile.height_el,
+         &dst_cfg);
+      assert(ok_src && ok_dst);
+      (void)ok_src;
+      (void)ok_dst;
+
+      bool fused2 = false;
+      uint32_t dst2_w = 0, dst2_h = 0;
+      struct agx_tile_address_config dst2_cfg = {0};
+      if (has_2level && level + 1 <= last_level &&
+          src_w == dst_w * 2u && src_h == dst_h * 2u &&
+          src_cfg.tile_width_log2 >= 2u && src_cfg.tile_height_log2 >= 2u &&
+          dst_cfg.tile_width_log2 >= 1u && dst_cfg.tile_height_log2 >= 1u) {
+         dst2_w = u_minify(prsc->width0, level + 1);
+         dst2_h = u_minify(prsc->height0, level + 1);
+         if (dst_w == dst2_w * 2u && dst_h == dst2_h * 2u) {
+            const struct ail_tile dst2_tile = layout->tilesize_el[level + 1];
+            const bool ok_dst2 = agx_tile_address_config_init(
+               layout->stride_el[level + 1], dst2_tile.width_el,
+               dst2_tile.height_el, &dst2_cfg);
+            assert(ok_dst2);
+            (void)ok_dst2;
+            fused2 = true;
+            for (unsigned layer = first_layer; layer <= last_layer; ++layer) {
+               const uint64_t s_addr =
+                  base_addr + ail_get_layer_level_B(layout, layer, level - 1);
+               const uint64_t d1_addr =
+                  base_addr + ail_get_layer_level_B(layout, layer, level);
+               if ((s_addr & 0xfu) || (d1_addr & 0xfu)) {
+                  fused2 = false;
+                  break;
+               }
+            }
+         }
+      }
+
+      if (fused2) {
+         const uint32_t tile_log2_packed =
+            dst2_cfg.tile_width_log2 | (dst2_cfg.tile_height_log2 << 4) |
+            (dst_cfg.tile_width_log2 << 8) | (dst_cfg.tile_height_log2 << 12) |
+            (src_cfg.tile_width_log2 << 16) | (src_cfg.tile_height_log2 << 20);
+         const struct agx_grid grid =
+            agx_2d(ALIGN_POT(dst2_w, 16), ALIGN_POT(dst2_h, 8));
+
+         for (unsigned layer = first_layer; layer <= last_layer; ++layer) {
+            agx_agx3_mipmap_ensure_cdm_space(ctx, &batch, rsrc, level,
+                                             last_level);
+
+            const uint64_t dst2_addr =
+               base_addr + ail_get_layer_level_B(layout, layer, level + 1);
+            const uint64_t dst1_addr =
+               base_addr + ail_get_layer_level_B(layout, layer, level);
+            const uint64_t src_addr =
+               base_addr + ail_get_layer_level_B(layout, layer, level - 1);
+            const enum agx_barrier barrier =
+               (layer == last_layer) ? AGX_BARRIER_ALL : AGX_BARRIER_NONE;
+
+            libagx_mipmap_unorm8x4_2level(
+               batch, grid, barrier, dst2_addr, dst1_addr, src_addr, dst2_w,
+               dst2_h, dst2_cfg.tiles_per_row, dst_cfg.tiles_per_row,
+               src_cfg.tiles_per_row, tile_log2_packed);
+         }
+
+         level += 2;
+         continue;
+      }
+
+      const bool odd = (src_w == (uint64_t)dst_w * 2u + 1u) ||
+                       (src_h == (uint64_t)dst_h * 2u + 1u);
+      struct agx_ptr axis = {0};
+      if (odd) {
+         axis = agx_pool_alloc_aligned(
+            &batch->pool, (size_t)(dst_w + dst_h) * sizeof(uint32_t), 4);
+         uint32_t *entries = axis.cpu;
+         const bool x_ok = agx_build_mip_axis(src_w, dst_w, entries);
+         const bool y_ok = agx_build_mip_axis(src_h, dst_h, entries + dst_w);
+         assert(x_ok && y_ok);
+         (void)x_ok;
+         (void)y_ok;
+      }
+
+      for (unsigned layer = first_layer; layer <= last_layer; ++layer) {
+         if (agx_agx3_mipmap_ensure_cdm_space(ctx, &batch, rsrc, level,
+                                              last_level) &&
+             odd) {
+            axis = agx_pool_alloc_aligned(
+               &batch->pool, (size_t)(dst_w + dst_h) * sizeof(uint32_t), 4);
+            uint32_t *entries = axis.cpu;
+            const bool x_ok = agx_build_mip_axis(src_w, dst_w, entries);
+            const bool y_ok =
+               agx_build_mip_axis(src_h, dst_h, entries + dst_w);
+            assert(x_ok && y_ok);
+            (void)x_ok;
+            (void)y_ok;
+         }
+
+         const uint64_t dst_addr =
+            base_addr + ail_get_layer_level_B(layout, layer, level);
+         const uint64_t src_addr =
+            base_addr + ail_get_layer_level_B(layout, layer, level - 1);
+         const enum agx_barrier barrier =
+            (layer == last_layer) ? AGX_BARRIER_ALL : AGX_BARRIER_NONE;
+
+         if (odd) {
+            libagx_mipmap_unorm8x4_odd(
+               batch, agx_2d(dst_w, dst_h), barrier, dst_addr, src_addr,
+               axis.gpu, dst_w, dst_h, dst_cfg.tiles_per_row,
+               src_cfg.tiles_per_row, dst_cfg.tile_width_log2,
+               dst_cfg.tile_height_log2, src_cfg.tile_width_log2,
+               src_cfg.tile_height_log2);
+         } else {
+            libagx_mipmap_unorm8x4(
+               batch, agx_2d(dst_w, dst_h), barrier, dst_addr, src_addr, dst_w,
+               dst_h, src_w == dst_w ? 1u : 2u, src_h == dst_h ? 1u : 2u,
+               dst_cfg.tiles_per_row, src_cfg.tiles_per_row,
+               dst_cfg.tile_width_log2, dst_cfg.tile_height_log2,
+               src_cfg.tile_width_log2, src_cfg.tile_height_log2);
+         }
+      }
+
+      ++level;
+   }
+
    return true;
 }
