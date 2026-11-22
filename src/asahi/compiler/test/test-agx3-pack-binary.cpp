@@ -3639,6 +3639,173 @@ TEST_F(AGX3PackBinary, DeviceAtomicMapsPostRaDiscardHints)
    }
 }
 
+TEST_F(AGX3PackBinary, DeviceAtomicEncodesHighRegistersOnG17Class)
+{
+   /* Exact failing instruction from KHR-Single-GL46.arrays_of_arrays_gl.AtomicUsage
+    * on G17S: d32:reg236 s0=32:reg236.discard s1=64:reg4 s2=32:reg234.discard. */
+   {
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C);
+      agx_index value = agx_register(236, AGX_SIZE_32);
+      value.discard = true;
+      agx_index base = agx_register(4, AGX_SIZE_64);
+      agx_index index = agx_register(234, AGX_SIZE_32);
+      index.discard = true;
+      agx_atomic_to(b, agx_register(236, AGX_SIZE_32), value, base, index,
+                    AGX_ATOMIC_OPC_ADD);
+      agx_stop(b);
+
+      struct agx3_device_atomic_desc d = {
+         .op = AGX3_ATOMIC_ADD,
+         .value = 236,
+         .value_kill = true,
+         .returns_value = true,
+         .result = 236,
+         .slot = 1,
+         .base_kind = AGX3_ATOMIC_BASE_REGISTER,
+         .base = 4,
+         .index_kind = AGX3_ATOMIC_INDEX_REGISTER,
+         .index = 234,
+         .index_kill = true,
+         .index_shift = 2,
+      };
+      uint8_t atomic[AGX3_ATOMIC_MAX_LENGTH], atomic_len = 0;
+      ASSERT_TRUE(agx3_atomic_encode_device(AGX_ISA_ENCODING_AGX3C, &d, atomic,
+                                            &atomic_len));
+      struct agx3_encoded_end end;
+      ASSERT_TRUE(agx3_pack_end(AGX_ISA_ENCODING_AGX3C, &end));
+
+      std::vector<uint8_t> want;
+      append(want, atomic, atomic_len);
+      append(want, end.bytes, end.length);
+      EXPECT_EQ(pack(b), want);
+   }
+
+   /* High 64-bit register base and distinct high value/result/index on AGX3C. */
+   {
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C);
+      agx_index value = agx_register(236, AGX_SIZE_32);
+      value.discard = true;
+      agx_index base = agx_register(248, AGX_SIZE_64);
+      agx_index index = agx_register(234, AGX_SIZE_32);
+      index.discard = true;
+      agx_atomic_to(b, agx_register(238, AGX_SIZE_32), value, base, index,
+                    AGX_ATOMIC_OPC_ADD);
+      agx_stop(b);
+
+      struct agx3_device_atomic_desc d = {
+         .op = AGX3_ATOMIC_ADD,
+         .value = 236,
+         .value_kill = true,
+         .returns_value = true,
+         .result = 238,
+         .slot = 1,
+         .base_kind = AGX3_ATOMIC_BASE_REGISTER,
+         .base = 248,
+         .index_kind = AGX3_ATOMIC_INDEX_REGISTER,
+         .index = 234,
+         .index_kill = true,
+         .index_shift = 2,
+      };
+      uint8_t atomic[AGX3_ATOMIC_MAX_LENGTH], atomic_len = 0;
+      ASSERT_TRUE(agx3_atomic_encode_device(AGX_ISA_ENCODING_AGX3C, &d, atomic,
+                                            &atomic_len));
+      struct agx3_encoded_end end;
+      ASSERT_TRUE(agx3_pack_end(AGX_ISA_ENCODING_AGX3C, &end));
+
+      std::vector<uint8_t> want;
+      append(want, atomic, atomic_len);
+      append(want, end.bytes, end.length);
+      EXPECT_EQ(pack(b), want);
+   }
+
+   /* Local atomic with high value, result, and 16-bit register address on AGX3C. */
+   {
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C);
+      agx_index value = agx_register(238, AGX_SIZE_32);
+      value.discard = true;
+      agx_local_atomic_to(b, agx_register(236, AGX_SIZE_32), value,
+                          agx_register(235, AGX_SIZE_16), agx_immediate(0),
+                          AGX_ATOMIC_OPC_ADD);
+      agx_stop(b);
+
+      struct agx3_local_atomic_desc d = {
+         .op = AGX3_ATOMIC_ADD,
+         .value = 238,
+         .value_kill = true,
+         .returns_value = true,
+         .result = 236,
+         .slot = 1,
+         .address_kind = AGX3_ATOMIC_INDEX_REGISTER,
+         .address = 235,
+      };
+      uint8_t atomic[AGX3_ATOMIC_MAX_LENGTH], atomic_len = 0;
+      ASSERT_TRUE(agx3_atomic_encode_local(AGX_ISA_ENCODING_AGX3C, &d, atomic,
+                                           &atomic_len));
+      struct agx3_encoded_end end;
+      ASSERT_TRUE(agx3_pack_end(AGX_ISA_ENCODING_AGX3C, &end));
+
+      std::vector<uint8_t> want;
+      append(want, atomic, atomic_len);
+      append(want, end.bytes, end.length);
+      EXPECT_EQ(pack(b), want);
+   }
+
+   /* Local atomic with high value, result, and 16-bit register address on AGX3D
+    * (G18G) through agx3_atomic_encode_local_g18g(). */
+   {
+      struct agx3_local_atomic_desc d = {
+         .op = AGX3_ATOMIC_ADD,
+         .value = 238,
+         .value_kill = true,
+         .returns_value = true,
+         .result = 236,
+         .slot = 1,
+         .address_kind = AGX3_ATOMIC_INDEX_REGISTER,
+         .address = 235,
+         .address_kill = true,
+      };
+      uint8_t atomic[AGX3_ATOMIC_MAX_LENGTH], atomic_len = 0;
+      ASSERT_TRUE(agx3_atomic_encode_local_g18g(AGX_ISA_ENCODING_AGX3D, &d,
+                                                atomic, &atomic_len));
+      EXPECT_GT(atomic_len, 0u);
+   }
+
+   /* AGX3B keeps its 192-half register-file ceiling fail-closed. */
+   {
+      uint8_t out[AGX3_ATOMIC_MAX_LENGTH], len = 0;
+      struct agx3_device_atomic_desc d = {
+         .op = AGX3_ATOMIC_ADD,
+         .value = 192,
+         .returns_value = true,
+         .result = 192,
+         .slot = 1,
+         .base_kind = AGX3_ATOMIC_BASE_REGISTER,
+         .base = 4,
+         .index_kind = AGX3_ATOMIC_INDEX_REGISTER,
+         .index = 8,
+         .index_shift = 2,
+      };
+      EXPECT_FALSE(agx3_atomic_encode_device(AGX_ISA_ENCODING_AGX3B, &d, out, &len));
+      d.value = d.result = 4;
+      d.base = 190;
+      EXPECT_FALSE(agx3_atomic_encode_device(AGX_ISA_ENCODING_AGX3B, &d, out, &len));
+
+      struct agx3_local_atomic_desc ld = {
+         .op = AGX3_ATOMIC_ADD,
+         .value = 192,
+         .returns_value = true,
+         .result = 4,
+         .slot = 1,
+         .address_kind = AGX3_ATOMIC_INDEX_REGISTER,
+         .address = 8,
+      };
+      EXPECT_FALSE(agx3_atomic_encode_local(AGX_ISA_ENCODING_AGX3B, &ld, out, &len));
+      ld.value = 4;
+      ld.address = 192;
+      EXPECT_FALSE(agx3_atomic_encode_local(AGX_ISA_ENCODING_AGX3B, &ld, out, &len));
+   }
+}
+
 TEST_F(AGX3PackBinary, DeviceAtomicReturnIsTiedWithoutClobberingIndex)
 {
    agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
