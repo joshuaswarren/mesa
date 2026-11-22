@@ -325,21 +325,31 @@ test_g17g_programs(enum agx_chip chip)
 static int
 test_m5_dispatch(enum agx_chip chip)
 {
+   /* A device of two dies scopes every ordering record
+    * (agx_cdm_ordering_memory_scope()); the M5 Ultra is the M5 part that has
+    * two, and the scoped record is grounded on it alone. */
+   const bool scoped = chip == AGX_CHIP_G17D;
    struct agx3_g17p_native_compute_program_desc desc = {
       .program_va = UINT64_C(0x10000090000),
       .shader_va = UINT64_C(0x100000003c0),
+      .ordering_memory_scope = true,
    };
    CHECK(agx3_cdm_direct_template_sources_compute(false, false, false,
                                                   &desc.launch_sources));
    struct agx3_compute_program program;
+   /* Refused where the scoped ordering record is not grounded. */
+   CHECK(agx3_m5_native_compute_program_bind(chip, &desc, &program) ==
+         scoped);
+   desc.ordering_memory_scope = scoped;
    CHECK(agx3_m5_native_compute_program_bind(chip, &desc, &program));
+   const uint32_t tail = scoped ? 0x6000017c : 0x60000160;
    struct agx3_compute_direct_grid grid = {
       .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
       .size = {1024,1,1}, .local_size = {64,1,1}, .dimensions = 1,
    };
    const uint32_t expected[] = {
       0, 0x01000000, 0x2400, 0x40000001,
-      1024, 1, 1, 64, 1, 1, 0x60000160,
+      1024, 1, 1, 64, 1, 1, tail,
    };
    uint8_t out[sizeof(expected)];
    struct agx3_compute_dispatch_sink sink = {.data = out, .capacity = sizeof(out)};
@@ -363,7 +373,7 @@ test_m5_dispatch(enum agx_chip chip)
    CHECK(!memcmp(saved, out, sizeof(out)));
    const uint32_t indirect_local[] = {
       0x10080000, 0x01000000, 0x2400, 0x40000001,
-      0x23, 0x45678000, 0x60000160,
+      0x23, 0x45678000, tail,
    };
    sink.length = 0;
    CHECK(agx3_m5_native_indirect_dispatch_append(

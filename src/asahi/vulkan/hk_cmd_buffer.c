@@ -1494,6 +1494,20 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
        * the record is a patch site like any other. */
       cs->app_dispatch_end = NULL;
       hk_cdm_note_alias_site(cmd, cs);
+   } else if (cs && agx_cdm_ordering_memory_scope(&dev->dev) &&
+              src_kinds == HK_SYNC_COMPUTE && dst_kinds &&
+              !(dst_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
+              pDependencyInfo->imageMemoryBarrierCount == 0 &&
+              !hk_sync_xfer_pending(&cmd->sync) &&
+              !hk_sync_dependency_has_host_access(pDependencyInfo) &&
+              cs->current == cs->weak_barrier_end) {
+      /* Where every launch's ordering record has memory scope
+       * (agx_cdm_ordering_memory_scope()), a dependency from compute to
+       * compute or transfer work with no image barrier keeps the preceding
+       * launch's record in place of the strong flush; the next application
+       * dispatch may not drop it. Image barriers, transfer sources and host
+       * access take the memory-scoped strong flush below. */
+      cs->app_dispatch_end = NULL;
    } else if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
               dst_kinds) {
       if (hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {

@@ -177,6 +177,10 @@ enum agx_chip_record {
    AGX_RECORD_PPP_VIEWPORT = 1 << 21,
    AGX_RECORD_PPP_W_CLAMP_CULL2 = 1 << 22,
    AGX_RECORD_VDM_STREAM_LINK_AGX2 = 1 << 23,
+   /* The CDM ordering record (flags 0) with memory scope, 0x6000017c, which
+    * agx_cdm_ordering_memory_scope() gives every M5 launch on a multi-die
+    * device. Hardware results on G17D. */
+   AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY = 1 << 24,
 };
 
 /* AGX2 chips that use the genxml 8-byte non-returning VDM_STREAM_LINK. */
@@ -350,7 +354,8 @@ enum agx_chip_quirk {
      AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS |           \
         AGX_QUIRK_M5_LAYER_OPERAND,                                            \
      __VA_ARGS__)                                                              \
-   X(G17D, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
+   X(G17D, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300,                  \
+     AGX_RECORDS_M5 | AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY,                    \
      AGX_QUIRK_GL_THROUGH_ZINK, __VA_ARGS__)                                   \
    X(G18G, AGX3, AGX3D, HAL300, 10, GEN5, NONE, SKSM, HAL300,                  \
      AGX_RECORDS_G18G, AGX_QUIRK_M5_PATHS, __VA_ARGS__)

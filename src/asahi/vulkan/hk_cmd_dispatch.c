@@ -1782,6 +1782,7 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    struct agx3_g17p_graphics_program program;
    struct agx3_g17p_native_compute_program_desc launch_desc = {
       .program_va = reservation.va, .shader_va = shader_va,
+      .ordering_memory_scope = agx_cdm_ordering_memory_scope(&dev->dev),
    };
    struct agx3_compute_program launch;
    if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &program) ||
@@ -2106,6 +2107,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       hk_m5_loader_get(dev, linked, &desc);
    struct agx3_g17p_native_compute_program_desc launch_desc = {
       .program_va = reservation.va, .shader_va = shader_va,
+      .ordering_memory_scope = agx_cdm_ordering_memory_scope(&dev->dev),
    };
    struct agx3_compute_program launch;
    if (loader) {

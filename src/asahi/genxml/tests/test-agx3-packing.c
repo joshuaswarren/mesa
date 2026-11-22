@@ -951,9 +951,26 @@ test_agx3_cdm_barrier(void)
       CHECK_EQ(agx3_cdm_barrier_unpack(full.chip, packed, sizeof(packed), &decoded), true);
       CHECK_EQ(decoded.flush_memory, true);
       CHECK_EQ(decoded.flags, 5);
-      /* Only the strong record takes the memory scope. */
+      /* The ordering record takes the memory scope only where its scoped
+       * form is grounded (AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY). */
       full.flags = 0;
-      CHECK_EQ(agx3_cdm_barrier_pack(&full, packed), false);
+      const bool scoped =
+         agx_chip_has_record(full.chip, AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY);
+      CHECK_EQ(scoped, full.chip == AGX_CHIP_G17D);
+      CHECK_EQ(agx3_cdm_barrier_pack(&full, packed), scoped);
+      if (scoped) {
+         CHECK_EQ(agx3_cmdstream_load_le32(packed), 0x6000017c);
+         CHECK_EQ(agx3_cdm_barrier_unpack(full.chip, packed, sizeof(packed),
+                                          &decoded),
+                  true);
+         CHECK_EQ(decoded.flush_memory, true);
+         CHECK_EQ(decoded.flags, 0);
+      } else {
+         agx3_cmdstream_store_le32(packed, 0x6000017c);
+         CHECK_EQ(agx3_cdm_barrier_unpack(full.chip, packed, sizeof(packed),
+                                          &decoded),
+                  false);
+      }
       /* A partial scope is not a grounded record. */
       agx3_cmdstream_store_le32(packed, 0x60001570);
       CHECK_EQ(agx3_cdm_barrier_unpack(memory_scope[i], packed, sizeof(packed), &decoded), false);

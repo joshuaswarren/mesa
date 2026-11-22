@@ -129,10 +129,16 @@ agx3_m5_native_compute_program_bind(
    const struct agx3_g17p_native_compute_program_desc *desc,
    struct agx3_compute_program *program)
 {
-   if (!agx_chip_g17_m5(chip))
+   if (!agx_chip_g17_m5(chip) || !desc ||
+       (desc->ordering_memory_scope &&
+        !agx3_cdm_barrier_flush_memory_flags(chip, 0)))
       return false;
 
-   return agx3_hal300_native_compute_program_bind(chip, true, desc, program);
+   if (!agx3_hal300_native_compute_program_bind(chip, true, desc, program))
+      return false;
+
+   program->ordering_memory_scope = desc->ordering_memory_scope;
+   return true;
 }
 
 static bool
@@ -308,7 +314,8 @@ agx3_m5_native_compute_dispatch_append(
    const struct agx3_cdm_barrier_info barrier = {
       .chip = program->chip,
       .flags = barrier_flags,
-      .flush_memory = barrier_flags == 5,
+      .flush_memory = barrier_flags == 5 ||
+                      (barrier_flags == 0 && program->ordering_memory_scope),
    };
    return agx3_native_compute_dispatch_append_common(program, grid, &barrier,
                                                      sink);
@@ -425,7 +432,10 @@ agx3_m5_native_indirect_dispatch_append(
       program,
       local_size ? AGX3_G17G_NATIVE_INDIRECT_GROUPS_MODE
                  : AGX3_G17G_NATIVE_INDIRECT_LOCAL_MODE,
-      grid_va, local_size, barrier_flags, barrier_flags == 5, sink);
+      grid_va, local_size, barrier_flags,
+      barrier_flags == 5 ||
+         (barrier_flags == 0 && program->ordering_memory_scope),
+      sink);
 }
 
 /* The six-word indirect launch.  Words 0..3 are the same program header the

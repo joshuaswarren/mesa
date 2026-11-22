@@ -454,14 +454,17 @@ enum hk_perftest {
  * mapped at more than one GPU VA an application compute/transfer barrier needs
  * the memory-scoped strong flush (hk_cdm_visibility_flush()).
  *
- * On M5, devices that enable aliasing-capable features (sparse, BDA,
- * capture/replay, fd/dma-buf, writable host imports) track active aliasing
- * resources in alias_live under host_alias.dynamic (or force memory scope via
- * may_alias_memory / ASAHI_M5_HOST_ALIAS_STATIC=1). Barriers recorded while
- * alias_live == 0 record patch sites (struct hk_alias_site) that are upgraded
- * in place when alias_live leaves 0 or at submission; unpatched paths
- * (graphics dependencies, event-using command buffers) and stream-end flushes
- * keep memory scope unconditionally while dynamic mode is active.
+ * On M5, devices whose barriers always take memory scope
+ * (agx_cdm_ordering_memory_scope()) take it on every barrier and in every
+ * launch's ordering record. Other M5 devices that enable aliasing-capable
+ * features (sparse, BDA, capture/replay, fd/dma-buf, writable host imports)
+ * track active aliasing resources in alias_live under host_alias.dynamic (or
+ * force memory scope via may_alias_memory / ASAHI_M5_HOST_ALIAS_STATIC=1).
+ * Barriers recorded while alias_live == 0 record patch sites (struct
+ * hk_alias_site) that are upgraded in place when alias_live leaves 0 or at
+ * submission; unpatched paths (graphics dependencies, event-using command
+ * buffers) and stream-end flushes keep memory scope unconditionally while
+ * dynamic mode is active.
  *
  * On G17P, memory scope is selected at barrier recording time whenever
  * va_alias_resources != 0 (live sparse, capture/replay, fd, or writable host
@@ -477,7 +480,8 @@ static inline bool
 hk_cdm_alias_scope(const struct hk_device *dev)
 {
    if (agx_chip_g17_m5(dev->dev.chip))
-      return dev->may_alias_memory || p_atomic_read(&dev->alias_live);
+      return agx_cdm_ordering_memory_scope(&dev->dev) ||
+             dev->may_alias_memory || p_atomic_read(&dev->alias_live);
 
    return dev->dev.chip == AGX_CHIP_G17P &&
           p_atomic_read(&dev->va_alias_resources) != 0;
