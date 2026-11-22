@@ -2774,7 +2774,7 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
             const struct hk_compute_pair_dispatch *p = members[i].cs->compute_pair;
             const struct hk_compute_pair_dispatch *c = members[i + 1].cs->compute_pair;
             struct hk_shader *fused = hk_compute_pair_get_or_compile_fused(
-               dev, p->producer, &c->info.clamp.epilogue, p->is_depthwise_vec4);
+               dev, p->producer, &c->info.clamp.epilogue, p->alt_kind);
             if (fused && hk_fused_compute_shader_eligible(dev, fused, p)) {
                if (AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE > members[i].bytes)
                   members[i].bytes = AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE;

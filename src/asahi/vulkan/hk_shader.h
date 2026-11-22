@@ -435,6 +435,8 @@ struct hk_api_shader {
    struct hk_shader *identity_copy4;
    struct hk_shader *im2col_vec4;
    struct hk_shader *depthwise_vec4;
+   struct hk_shader *gemm_cmat32;
+   struct hk_shader *gemm_cmat64;
    struct hk_identity_copy4 identity_copy4_info;
 
    /* Is this an internal passthrough geometry shader? */

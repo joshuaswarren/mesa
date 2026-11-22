@@ -761,10 +761,9 @@ run_depthwise_case(bool with_bias_buf, bool with_bias_flag,
    ssbos[3].data = v4_out;
    const uint32_t out_pairs = DIV_ROUND_UP((uint32_t)cfg->out_w, 2u);
    const uint32_t v4_grid[3] = {
-      DIV_ROUND_UP(out_pairs * ((uint32_t)cfg->channels / 4u),
-                   vec4->info.workgroup_size[0]),
-      DIV_ROUND_UP((uint32_t)cfg->out_h, vec4->info.workgroup_size[1]),
-      1,
+      DIV_ROUND_UP((uint32_t)cfg->channels / 4u, vec4->info.workgroup_size[0]),
+      DIV_ROUND_UP(out_pairs, vec4->info.workgroup_size[1]),
+      DIV_ROUND_UP((uint32_t)cfg->out_h, vec4->info.workgroup_size[2]),
    };
    hk_eval_dispatch(vec4, v4_grid, ssbos, 4, cfg, sizeof(*cfg));
    HK_EVAL_CHECK(memcmp(ref_out, v4_out, out_n * sizeof(float)) == 0);
@@ -948,6 +947,619 @@ test_gemm_match_and_splice(void)
    run_gemm_case(8, true, true, false, 20, 13, 5, 0);
 }
 
+static nir_def *
+ssbo_elem_deref_off(nir_builder *b, unsigned set, unsigned binding,
+                    uint32_t base_off_B, nir_def *elem_idx)
+{
+   const struct glsl_type *arr = glsl_array_type(glsl_float_type(), 0, 4);
+   struct glsl_struct_field field = {
+      .type = arr,
+      .name = "data",
+      .offset = (int)base_off_B,
+   };
+   const struct glsl_type *iface =
+      glsl_interface_type(&field, 1, GLSL_INTERFACE_PACKING_STD430, false, "Buf");
+   nir_def *res = nir_vulkan_resource_index(
+      b, 4, 32, nir_imm_int(b, 0), .desc_set = set, .binding = binding,
+      .desc_type = nir_descriptor_type_storage_buffer);
+   nir_def *desc = nir_load_vulkan_descriptor(
+      b, 4, 32, res, .desc_type = nir_descriptor_type_storage_buffer);
+   nir_deref_instr *blk =
+      nir_build_deref_cast(b, desc, nir_var_mem_ssbo, iface, 0);
+   nir_deref_instr *arr_d = nir_build_deref_struct(b, blk, 0);
+   return &nir_build_deref_array(b, arr_d, elem_idx)->def;
+}
+
+struct gemm_test_opts {
+   bool guarded;
+   bool has_bias_buf;
+   bool has_bias_mode;
+   uint32_t offset_B;
+   unsigned fp_math_ctrl;
+   uint32_t inner_bound;
+   bool transpose_b;
+   bool extra_store;
+   bool preserve_nan;
+   bool use_ffma;
+   bool split_bias_stores;
+   bool early_k_break;
+   bool early_dot_break;
+   bool swap_bias_arms;
+   bool bias_in_mode2;
+   bool drop_mode0_bias;
+   bool fixed_row_bias;
+};
+
+static nir_shader *
+build_tiled_gemm_nir_opts(const struct gemm_test_opts *o)
+{
+   const bool guarded = o->guarded;
+   const bool has_bias_buf = o->has_bias_buf;
+   const bool has_bias_mode = o->has_bias_mode;
+   const uint32_t offset_B = o->offset_B;
+   const unsigned fp_math_ctrl = o->fp_math_ctrl;
+   const uint32_t inner_bound = o->inner_bound ? o->inner_bound : 32;
+   const bool transpose_b = o->transpose_b;
+   const bool extra_store = o->extra_store;
+   const bool preserve_nan = o->preserve_nan;
+
+   nir_shader *s = new_compute_shader("tiled_gemm", 32, 4, 1);
+   s->info.num_ssbos = has_bias_buf ? 4 : 3;
+   if (preserve_nan)
+      s->info.float_controls_execution_mode |=
+         FLOAT_CONTROLS_DENORM_PRESERVE_FP32;
+
+   nir_variable *s_a = nir_variable_create(
+      s, nir_var_mem_shared,
+      glsl_array_type(glsl_array_type(glsl_float_type(), 32, 4), 32, 128), "s_a");
+   nir_variable *s_b = nir_variable_create(
+      s, nir_var_mem_shared,
+      glsl_array_type(glsl_array_type(glsl_float_type(), 32, 4), 32, 128), "s_b");
+
+   nir_builder b = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(s)));
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_def *lid = nir_load_local_invocation_id(&b);
+   nir_def *col = nir_channel(&b, gid, 0);
+   nir_def *gid_y = nir_channel(&b, gid, 1);
+   nir_def *lx = nir_channel(&b, lid, 0);
+   nir_def *ly = nir_channel(&b, lid, 1);
+
+   nir_def *K = load_push_i32(&b, offsetof(struct gemm_push_layout, k));
+   nir_def *N = load_push_i32(&b, offsetof(struct gemm_push_layout, n));
+   nir_def *M = load_push_i32(&b, offsetof(struct gemm_push_layout, m));
+   nir_def *bmode = has_bias_mode
+      ? load_push_i32(&b, offsetof(struct gemm_push_layout, bias_mode))
+      : NULL;
+
+   nir_variable *acc[8];
+   for (unsigned r = 0; r < 8; ++r) {
+      acc[r] = nir_local_variable_create(b.impl, glsl_float_type(), "acc");
+      nir_store_var(&b, acc[r], nir_imm_float(&b, 0.0f), 1);
+   }
+   nir_variable *tile_v = nir_local_variable_create(b.impl, glsl_int_type(), "t");
+   nir_store_var(&b, tile_v, nir_imm_int(&b, 0), 1);
+   nir_def *num_tiles = nir_idiv(&b, nir_iadd_imm(&b, K, 31), nir_imm_int(&b, 32));
+
+   nir_push_loop(&b);
+   {
+      nir_def *t = nir_load_var(&b, tile_v);
+      nir_push_if(&b, nir_ige(&b, t, num_tiles));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, NULL);
+      if (o->early_k_break) {
+         nir_push_if(&b, nir_ige_imm(&b, t, 1));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+      }
+
+      nir_def *k_base = nir_ishl_imm(&b, t, 5);
+      for (unsigned j = 0; j < 8; ++j) {
+         nir_def *s_row = nir_iadd_imm(&b, nir_ishl_imm(&b, ly, 3), j);
+         nir_def *a_row = nir_iadd_imm(&b, nir_ishl_imm(&b, gid_y, 3), j);
+         nir_def *a_col = nir_iadd(&b, k_base, lx);
+         nir_def *a_val;
+         if (guarded) {
+            nir_variable *av = nir_local_variable_create(b.impl, glsl_float_type(), "av");
+            nir_push_if(&b, nir_iand(&b, nir_ilt(&b, a_row, M), nir_ilt(&b, a_col, K)));
+            nir_def *a_idx = nir_iadd(&b, nir_imul(&b, a_row, K), a_col);
+            nir_store_var(&b, av,
+                          nir_load_deref(&b, nir_def_as_deref(
+                             ssbo_elem_deref_off(&b, 0, 0, offset_B, a_idx))), 1);
+            nir_push_else(&b, NULL);
+            nir_store_var(&b, av, nir_imm_float(&b, 0.0f), 1);
+            nir_pop_if(&b, NULL);
+            a_val = nir_load_var(&b, av);
+         } else {
+            nir_def *a_idx = nir_iadd(&b, nir_imul(&b, a_row, K), a_col);
+            a_val = nir_load_deref(&b, nir_def_as_deref(
+               ssbo_elem_deref_off(&b, 0, 0, offset_B, a_idx)));
+         }
+         nir_deref_instr *da =
+            nir_build_deref_array(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, s_a), s_row), lx);
+         nir_store_deref(&b, da, a_val, 1);
+
+         nir_def *b_row = nir_iadd(&b, k_base, s_row);
+         nir_def *b_val;
+         nir_def *b_idx = transpose_b
+            ? nir_iadd(&b, nir_imul(&b, col, K), b_row)
+            : nir_iadd(&b, nir_imul(&b, b_row, N), col);
+         if (guarded) {
+            nir_variable *bv = nir_local_variable_create(b.impl, glsl_float_type(), "bv");
+            nir_push_if(&b, nir_iand(&b, nir_ilt(&b, b_row, K), nir_ilt(&b, col, N)));
+            nir_store_var(&b, bv,
+                          nir_load_deref(&b, nir_def_as_deref(
+                             ssbo_elem_deref_off(&b, 0, 1, offset_B, b_idx))), 1);
+            nir_push_else(&b, NULL);
+            nir_store_var(&b, bv, nir_imm_float(&b, 0.0f), 1);
+            nir_pop_if(&b, NULL);
+            b_val = nir_load_var(&b, bv);
+         } else {
+            b_val = nir_load_deref(&b, nir_def_as_deref(
+               ssbo_elem_deref_off(&b, 0, 1, offset_B, b_idx)));
+         }
+         nir_deref_instr *db =
+            nir_build_deref_array(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, s_b), s_row), lx);
+         nir_store_deref(&b, db, b_val, 1);
+      }
+
+      if (extra_store) {
+         nir_store_deref(&b, nir_def_as_deref(
+            ssbo_elem_deref_off(&b, 0, 3, offset_B, nir_imm_int(&b, 0))),
+            nir_imm_float(&b, 0.0f), 1);
+      }
+
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_shared);
+
+      nir_variable *lv = nir_local_variable_create(b.impl, glsl_int_type(), "l");
+      nir_store_var(&b, lv, nir_imm_int(&b, 0), 1);
+      nir_push_loop(&b);
+      {
+         nir_def *l = nir_load_var(&b, lv);
+         nir_push_if(&b, nir_ige_imm(&b, l, inner_bound));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+         if (o->early_dot_break) {
+            nir_push_if(&b, nir_ige_imm(&b, l, 16));
+            nir_jump(&b, nir_jump_break);
+            nir_pop_if(&b, NULL);
+         }
+
+         nir_deref_instr *db =
+            nir_build_deref_array(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, s_b), l), lx);
+         nir_def *bv = nir_load_deref(&b, db);
+         for (unsigned r = 0; r < 8; ++r) {
+            nir_def *s_row = nir_iadd_imm(&b, nir_ishl_imm(&b, ly, 3), r);
+            nir_deref_instr *da =
+               nir_build_deref_array(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, s_a), s_row), l);
+            nir_def *av = nir_load_deref(&b, da);
+            b.fp_math_ctrl = fp_math_ctrl;
+            nir_def *sum;
+            if (o->use_ffma) {
+               sum = nir_ffma(&b, av, bv, nir_load_var(&b, acc[r]));
+            } else {
+               nir_def *prod = nir_fmul(&b, av, bv);
+               sum = nir_fadd(&b, nir_load_var(&b, acc[r]), prod);
+            }
+            b.fp_math_ctrl = nir_fp_fast_math;
+            nir_store_var(&b, acc[r], sum, 1);
+         }
+         nir_store_var(&b, lv, nir_iadd_imm(&b, l, 1), 1);
+      }
+      nir_pop_loop(&b, NULL);
+
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_shared);
+
+      nir_store_var(&b, tile_v, nir_iadd_imm(&b, t, 1), 1);
+   }
+   nir_pop_loop(&b, NULL);
+
+   nir_def *row_base = nir_ishl_imm(&b, nir_channel(&b, gid, 1), 3);
+   nir_def *col_ok = guarded ? nir_ilt(&b, col, N) : nir_imm_true(&b);
+   if (has_bias_buf && has_bias_mode && o->split_bias_stores) {
+      for (unsigned arm = 0; arm < 3; ++arm) {
+         nir_push_if(&b, nir_ieq_imm(&b, bmode, arm));
+         for (unsigned r = 0; r < 8; ++r) {
+            nir_def *row = nir_iadd_imm(&b, row_base, r);
+            if (guarded)
+               nir_push_if(&b, nir_iand(&b, nir_ilt(&b, row, M), col_ok));
+            nir_def *val = nir_load_var(&b, acc[r]);
+            nir_def *b_idx = NULL;
+            if (arm == 0 && !o->drop_mode0_bias)
+               b_idx = o->swap_bias_arms ? col : row;
+            else if (arm == 1)
+               b_idx = o->swap_bias_arms ? row : col;
+            else if (arm == 2 && o->bias_in_mode2)
+               b_idx = row;
+            if (b_idx) {
+               nir_def *bv = nir_load_deref(&b, nir_def_as_deref(
+                  ssbo_elem_deref_off(&b, 0, 2, offset_B, b_idx)));
+               val = nir_fadd(&b, val, bv);
+            }
+            nir_def *o_idx = nir_iadd(&b, nir_imul(&b, row, N), col);
+            nir_store_deref(&b, nir_def_as_deref(
+               ssbo_elem_deref_off(&b, 0, 3, offset_B, o_idx)), val, 1);
+            if (guarded)
+               nir_pop_if(&b, NULL);
+         }
+         nir_pop_if(&b, NULL);
+      }
+   } else {
+      for (unsigned r = 0; r < 8; ++r) {
+         nir_def *row = nir_iadd_imm(&b, row_base, r);
+         if (guarded)
+            nir_push_if(&b, nir_iand(&b, nir_ilt(&b, row, M), col_ok));
+
+         nir_def *val = nir_load_var(&b, acc[r]);
+         if (has_bias_buf) {
+            if (has_bias_mode) {
+               nir_push_if(&b, nir_ieq_imm(&b, bmode, 0));
+               {
+                  if (!o->drop_mode0_bias) {
+                     nir_def *bv = nir_load_deref(&b, nir_def_as_deref(
+                        ssbo_elem_deref_off(&b, 0, 2, offset_B,
+                                            o->swap_bias_arms ? col : row)));
+                     nir_store_var(&b, acc[r], nir_fadd(&b, val, bv), 1);
+                  }
+               }
+               nir_push_else(&b, NULL);
+               {
+                  nir_push_if(&b, nir_ieq_imm(&b, bmode, 1));
+                  {
+                     nir_def *bv = nir_load_deref(&b, nir_def_as_deref(
+                        ssbo_elem_deref_off(&b, 0, 2, offset_B,
+                                            o->swap_bias_arms ? row : col)));
+                     nir_store_var(&b, acc[r], nir_fadd(&b, val, bv), 1);
+                  }
+                  nir_push_else(&b, NULL);
+                  {
+                     if (o->bias_in_mode2) {
+                        nir_def *bv = nir_load_deref(&b, nir_def_as_deref(
+                           ssbo_elem_deref_off(&b, 0, 2, offset_B, row)));
+                        nir_store_var(&b, acc[r], nir_fadd(&b, val, bv), 1);
+                     }
+                  }
+                  nir_pop_if(&b, NULL);
+               }
+               nir_pop_if(&b, NULL);
+               val = nir_load_var(&b, acc[r]);
+            } else {
+               nir_def *bv = nir_load_deref(&b, nir_def_as_deref(
+                  ssbo_elem_deref_off(&b, 0, 2, offset_B,
+                                      o->fixed_row_bias ? row : col)));
+               val = nir_fadd(&b, val, bv);
+            }
+         }
+
+         nir_def *o_idx = nir_iadd(&b, nir_imul(&b, row, N), col);
+         nir_store_deref(&b, nir_def_as_deref(
+            ssbo_elem_deref_off(&b, 0, 3, offset_B, o_idx)), val, 1);
+
+         if (guarded)
+            nir_pop_if(&b, NULL);
+      }
+   }
+
+   NIR_PASS(_, s, nir_lower_vars_to_ssa);
+   NIR_PASS(_, s, nir_opt_dce);
+   nir_validate_shader(s, "build_tiled_gemm_nir");
+   return s;
+}
+
+static bool
+shader_has_cmat_muladd(const nir_shader *s)
+{
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_cmat_muladd_agx)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static uint32_t
+gemm_test_lcg(uint32_t *state)
+{
+   *state = *state * 1664525u + 1013904223u;
+   return *state;
+}
+
+static float
+gemm_test_rand_f32(uint32_t *state)
+{
+   uint32_t r = gemm_test_lcg(state);
+   if ((r & 0x3fu) == 0)
+      return 0.0f;
+   if ((r & 0x7fu) == 1)
+      return -0.0f;
+   if ((r & 0xffu) == 2)
+      return 1e-40f; /* subnormal */
+   int32_t s = (int32_t)(r >> 12) - (1 << 19);
+   return (float)s * (1.0f / 131072.0f);
+}
+
+static void
+eval_compare_gemm_case(const struct gemm_test_opts *opts, uint32_t M,
+                       uint32_t N, uint32_t K, int32_t bias_mode,
+                       size_t runtime_a_off, size_t runtime_b_off,
+                       uint32_t tile_n,
+                       const struct hk_nir_clamp_epilogue *epilogue,
+                       uint32_t seed)
+{
+   nir_shader *orig = build_tiled_gemm_nir_opts(opts);
+   nir_shader *pre = nir_shader_clone(NULL, orig);
+   run_hk_preprocess_for_test(pre, false);
+
+   struct hk_nir_gemm_output m = {0};
+   HK_EVAL_CHECK(hk_nir_match_gemm_output(
+      pre, nir_address_format_64bit_global_32bit_offset, &m));
+   HK_EVAL_CHECK(m.cmat_valid);
+
+   nir_shader *alt = hk_nir_build_gemm_cmat(pre, &m, tile_n, epilogue);
+   HK_EVAL_CHECK(alt);
+   nir_validate_shader(alt, "gemm_cmat_eval_alt");
+   HK_EVAL_CHECK(shader_has_cmat_muladd(alt));
+
+   const uint32_t off_elems = opts->offset_B / 4u;
+   const size_t a_elems = (size_t)M * K + off_elems;
+   const size_t b_elems = (size_t)K * N + off_elems;
+   const size_t bias_elems = (size_t)(M > N ? M : N) + off_elems + 1;
+   const size_t c_elems = (size_t)M * N + off_elems;
+
+   float *a_buf = calloc(a_elems, sizeof(float));
+   float *b_buf = calloc(b_elems, sizeof(float));
+   float *bias_buf = calloc(bias_elems, sizeof(float));
+   float *c_orig = calloc(c_elems, sizeof(float));
+   float *c_alt = calloc(c_elems, sizeof(float));
+   HK_EVAL_CHECK(a_buf && b_buf && bias_buf && c_orig && c_alt);
+
+   uint32_t rng = seed;
+   for (size_t i = off_elems; i < a_elems; ++i)
+      a_buf[i] = gemm_test_rand_f32(&rng);
+   for (size_t i = off_elems; i < b_elems; ++i)
+      b_buf[i] = gemm_test_rand_f32(&rng);
+   for (size_t i = off_elems; i < bias_elems; ++i)
+      bias_buf[i] = gemm_test_rand_f32(&rng);
+   for (size_t i = 0; i < off_elems; ++i) {
+      c_orig[i] = -123.5f;
+      c_alt[i] = -123.5f;
+   }
+
+   struct gemm_push_layout push = {
+      .k = (int32_t)K,
+      .n = (int32_t)N,
+      .m = (int32_t)M,
+      .bias_mode = bias_mode,
+   };
+
+   const uint32_t orig_grid[3] = {
+      (N + 31u) / 32u,
+      (M + 31u) / 32u,
+      1u,
+   };
+   HK_EVAL_CHECK(hk_gemm_cmat_dispatch_dims_ok(opts->guarded, M, N, K, orig_grid));
+
+   struct hk_eval_ssbo ssbos_orig[4] = {
+      { 0, 0, a_buf, a_elems * sizeof(float), runtime_a_off },
+      { 0, 1, b_buf, b_elems * sizeof(float), runtime_b_off },
+      { 0, 2, bias_buf, bias_elems * sizeof(float), runtime_b_off },
+      { 0, 3, c_orig, c_elems * sizeof(float), runtime_b_off },
+   };
+   hk_eval_dispatch_wg(orig, orig_grid, ssbos_orig, 4, &push, sizeof(push));
+
+   if (epilogue) {
+      float lo = hk_eval_u2f(epilogue->lower_bits);
+      float hi = hk_eval_u2f(epilogue->upper_bits);
+      for (size_t i = off_elems; i < c_elems; ++i) {
+         float v = c_orig[i];
+         if (epilogue->upper_first) {
+            if (epilogue->has_upper) v = fminf(v, hi);
+            if (epilogue->has_lower) v = fmaxf(v, lo);
+         } else {
+            if (epilogue->has_lower) v = fmaxf(v, lo);
+            if (epilogue->has_upper) v = fminf(v, hi);
+         }
+         c_orig[i] = v;
+      }
+   }
+
+   const uint32_t alt_grid[3] = {
+      (N + tile_n - 1u) / tile_n,
+      (M + 63u) / 64u,
+      1u,
+   };
+   struct hk_eval_ssbo ssbos_alt[4] = {
+      { 0, 0, a_buf, a_elems * sizeof(float), runtime_a_off },
+      { 0, 1, b_buf, b_elems * sizeof(float), runtime_b_off },
+      { 0, 2, bias_buf, bias_elems * sizeof(float), runtime_b_off },
+      { 0, 3, c_alt, c_elems * sizeof(float), runtime_b_off },
+   };
+   hk_eval_dispatch_wg(alt, alt_grid, ssbos_alt, 4, &push, sizeof(push));
+
+   for (size_t i = 0; i < c_elems; ++i) {
+      uint32_t uo = hk_eval_f2u(c_orig[i]);
+      uint32_t ua = hk_eval_f2u(c_alt[i]);
+      if (uo != ua) {
+         fprintf(stderr,
+                 "GEMM eval mismatch (M=%u N=%u K=%u bmode=%d tile_n=%u off=%u): "
+                 "idx=%zu orig=0x%08x (%g) alt=0x%08x (%g)\n",
+                 M, N, K, bias_mode, tile_n, opts->offset_B, i, uo, c_orig[i],
+                 ua, c_alt[i]);
+         HK_EVAL_CHECK(uo == ua);
+      }
+   }
+
+   free(a_buf);
+   free(b_buf);
+   free(bias_buf);
+   free(c_orig);
+   free(c_alt);
+   ralloc_free(alt);
+   ralloc_free(pre);
+   ralloc_free(orig);
+}
+
+static void
+test_gemm_cmat_certify_and_build(void)
+{
+   const struct hk_nir_clamp_epilogue ep = {
+      .has_lower = true, .has_upper = true, .upper_first = false,
+      .lower_bits = 0x00000000u, .upper_bits = 0x40c00000u,
+      .max_fp_math_ctrl = nir_fp_preserve_inf,
+      .min_fp_math_ctrl = nir_fp_preserve_inf,
+   };
+
+   const struct gemm_test_opts pos_cases[] = {
+      { .guarded = false, .has_bias_buf = true,  .has_bias_mode = true,  .offset_B = 0 },
+      { .guarded = true,  .has_bias_buf = true,  .has_bias_mode = true,  .offset_B = 0 },
+      { .guarded = true,  .has_bias_buf = true,  .has_bias_mode = true,  .offset_B = 4, .split_bias_stores = true },
+      { .guarded = false, .has_bias_buf = true,  .has_bias_mode = true,  .offset_B = 16, .split_bias_stores = true },
+      { .guarded = false, .has_bias_buf = false, .has_bias_mode = false, .offset_B = 0 },
+      { .guarded = true,  .has_bias_buf = true,  .has_bias_mode = false, .offset_B = 16 },
+      { .guarded = true,  .has_bias_buf = true,  .has_bias_mode = false, .offset_B = 4, .fixed_row_bias = true },
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(pos_cases); ++i) {
+      nir_shader *orig = build_tiled_gemm_nir_opts(&pos_cases[i]);
+
+      nir_shader *g17p = nir_shader_clone(NULL, orig);
+      run_hk_preprocess_for_test(g17p, false);
+      struct hk_nir_gemm_output m_g17p = {0};
+      HK_EVAL_CHECK(hk_nir_match_gemm_output(
+         g17p, nir_address_format_64bit_global_32bit_offset, &m_g17p));
+      HK_EVAL_CHECK(m_g17p.cmat_valid);
+      HK_EVAL_CHECK(m_g17p.output.offset_B == pos_cases[i].offset_B);
+      HK_EVAL_CHECK(m_g17p.reads[0].offset_B == pos_cases[i].offset_B);
+      HK_EVAL_CHECK(m_g17p.reads[1].offset_B == pos_cases[i].offset_B);
+      HK_EVAL_CHECK(m_g17p.desc_comps == 4);
+
+      for (unsigned t = 0; t < 2; ++t) {
+         const uint32_t tile_n = t ? 64 : 32;
+         nir_shader *cmat = hk_nir_build_gemm_cmat(g17p, &m_g17p, tile_n, NULL);
+         HK_EVAL_CHECK(cmat);
+         nir_validate_shader(cmat, "gemm_cmat");
+         HK_EVAL_CHECK(shader_has_cmat_muladd(cmat));
+         ralloc_free(cmat);
+
+         nir_shader *cmat_ep = hk_nir_build_gemm_cmat(g17p, &m_g17p, tile_n, &ep);
+         HK_EVAL_CHECK(cmat_ep);
+         nir_validate_shader(cmat_ep, "gemm_cmat_ep");
+         HK_EVAL_CHECK(shader_has_cmat_muladd(cmat_ep));
+         ralloc_free(cmat_ep);
+      }
+      ralloc_free(g17p);
+
+      nir_shader *m5 = nir_shader_clone(NULL, orig);
+      rewrite_ssbo_desc_comps(m5, 5);
+      run_hk_preprocess_for_test(m5, true);
+      struct hk_nir_gemm_output m_m5 = {0};
+      HK_EVAL_CHECK(hk_nir_match_gemm_output(
+         m5, nir_address_format_64bit_global_32bit_offset_map, &m_m5));
+      HK_EVAL_CHECK(m_m5.cmat_valid);
+      HK_EVAL_CHECK(m_m5.desc_comps == 5);
+      nir_shader *cmat_m5 = hk_nir_build_gemm_cmat(m5, &m_m5, 64, &ep);
+      HK_EVAL_CHECK(cmat_m5);
+      nir_validate_shader(cmat_m5, "gemm_cmat_m5");
+      HK_EVAL_CHECK(shader_has_cmat_muladd(cmat_m5));
+      ralloc_free(cmat_m5);
+      ralloc_free(m5);
+
+      ralloc_free(orig);
+   }
+
+   /* Negative certifier cases: cmat_valid MUST be false (or unmatched). */
+   const struct gemm_test_opts neg_cases[] = {
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .fp_math_ctrl = nir_fp_preserve_nan },
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .preserve_nan = true },
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .inner_bound = 31 },
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .transpose_b = true },
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .extra_store = true },
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .early_k_break = true },
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .early_dot_break = true },
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .split_bias_stores = true, .swap_bias_arms = true },
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .split_bias_stores = true, .bias_in_mode2 = true },
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .split_bias_stores = true, .drop_mode0_bias = true },
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .swap_bias_arms = true },
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .bias_in_mode2 = true },
+      { .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .drop_mode0_bias = true },
+      { .guarded = false, .has_bias_buf = false, .has_bias_mode = false, .offset_B = 4 },
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(neg_cases); ++i) {
+      nir_shader *bad = build_tiled_gemm_nir_opts(&neg_cases[i]);
+      run_hk_preprocess_for_test(bad, false);
+      struct hk_nir_gemm_output m_bad = {0};
+      bool matched = hk_nir_match_gemm_output(
+         bad, nir_address_format_64bit_global_32bit_offset, &m_bad);
+      HK_EVAL_CHECK(!matched || !m_bad.cmat_valid);
+      ralloc_free(bad);
+   }
+
+   /* Dispatch dimension gate: unguarded K = 16 mod 32 MUST be refused. */
+   const uint32_t g64x64[3] = { 2, 2, 1 };
+   const uint32_t g32x64[3] = { 1, 2, 1 };
+   HK_EVAL_CHECK(!hk_gemm_cmat_dispatch_dims_ok(false, 64, 64, 48, g64x64));
+   HK_EVAL_CHECK(!hk_gemm_cmat_dispatch_dims_ok(false, 64, 64, 16, g64x64));
+   HK_EVAL_CHECK( hk_gemm_cmat_dispatch_dims_ok(false, 64, 64, 32, g64x64));
+   HK_EVAL_CHECK( hk_gemm_cmat_dispatch_dims_ok(false, 64, 32, 64, g32x64));
+   HK_EVAL_CHECK( hk_gemm_cmat_dispatch_dims_ok(true,  64, 64, 48, g64x64));
+   HK_EVAL_CHECK( hk_gemm_cmat_dispatch_dims_ok(true,  37, 35, 19, g64x64));
+
+   /* Original vs alternate bit-exact NIR evaluation on random FP32 inputs. */
+   const struct gemm_test_opts o_guarded_dyn = {
+      .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .use_ffma = true,
+   };
+   const struct gemm_test_opts o_guarded_split_off4 = {
+      .guarded = true, .has_bias_buf = true, .has_bias_mode = true,
+      .offset_B = 4, .use_ffma = true, .split_bias_stores = true,
+   };
+   const struct gemm_test_opts o_unguarded_dyn = {
+      .guarded = false, .has_bias_buf = true, .has_bias_mode = true,
+      .offset_B = 16, .use_ffma = true,
+   };
+   const struct gemm_test_opts o_unguarded_split = {
+      .guarded = false, .has_bias_buf = true, .has_bias_mode = true,
+      .use_ffma = true, .split_bias_stores = true,
+   };
+   const struct gemm_test_opts o_guarded_fixed_row = {
+      .guarded = true, .has_bias_buf = true, .has_bias_mode = false,
+      .use_ffma = true, .fixed_row_bias = true,
+   };
+   const struct gemm_test_opts o_guarded_fixed_col = {
+      .guarded = true, .has_bias_buf = true, .has_bias_mode = false,
+      .use_ffma = true,
+   };
+   const struct gemm_test_opts o_guarded_nobias = {
+      .guarded = true, .has_bias_buf = false, .has_bias_mode = false,
+      .use_ffma = true,
+   };
+
+   for (int bm = 0; bm <= 2; ++bm) {
+      eval_compare_gemm_case(&o_guarded_dyn, 37, 35, 19, bm, 4, 4, 32, NULL, 100u + bm);
+      eval_compare_gemm_case(&o_guarded_dyn, 67, 69, 48, bm, 4, 4, 64, &ep,  200u + bm);
+      eval_compare_gemm_case(&o_guarded_split_off4, 33, 41, 20, bm, 4, 4, 64, NULL, 300u + bm);
+   }
+   eval_compare_gemm_case(&o_guarded_split_off4, 71, 29, 48, 0, 4, 4, 32, &ep, 350u);
+
+   for (int bm = 0; bm <= 2; ++bm) {
+      eval_compare_gemm_case(&o_unguarded_dyn, 64, 64, 32, bm, 0, 4, 64, NULL, 400u + bm);
+      eval_compare_gemm_case(&o_unguarded_split, 64, 32, 64, bm, 0, 4, 32, &ep, 500u + bm);
+   }
+
+   eval_compare_gemm_case(&o_guarded_fixed_row, 23, 39, 33, 0, 4, 4, 64, &ep,  600u);
+   eval_compare_gemm_case(&o_guarded_fixed_col, 23, 39, 33, 1, 4, 4, 32, NULL, 601u);
+   eval_compare_gemm_case(&o_guarded_nobias,    19, 25, 17, 2, 4, 4, 32, &ep,  602u);
+}
+
 int
 main(void)
 {
@@ -957,6 +1569,7 @@ main(void)
    test_clamp_match_and_splice();
    test_depthwise_vec4_and_fusion();
    test_gemm_match_and_splice();
+   test_gemm_cmat_certify_and_build();
    glsl_type_singleton_decref();
    printf("test-hk-compute-pair: PASS\n");
    return 0;

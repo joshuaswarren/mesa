@@ -96,6 +96,9 @@ struct hk_nir_gemm_output {
    struct hk_nir_clamp_buffer output;
    struct hk_nir_clamp_buffer reads[3]; /* 0: A, 1: B, 2: bias (optional) */
    uint32_t m_offset_B, n_offset_B, k_offset_B, bias_mode_offset_B;
+   uint32_t push_bytes;
+   uint32_t out_res_type, read_res_type[3];
+   uint32_t desc_comps;
    uint32_t local_size[3];
    uint32_t rows_per_thread;
    uint32_t float_controls_execution_mode;
@@ -103,6 +106,7 @@ struct hk_nir_gemm_output {
    bool has_bias_mode;
    bool has_bias_buffer;
    bool is_guarded;
+   bool cmat_valid;
 };
 
 enum hk_compute_pair_role {
@@ -111,7 +115,7 @@ enum hk_compute_pair_role {
    HK_COMPUTE_PAIR_GEMM = 3,
 };
 
-#define HK_COMPUTE_PAIR_INFO_VERSION 4u
+#define HK_COMPUTE_PAIR_INFO_VERSION 5u
 
 struct hk_compute_pair_info {
    uint32_t version;
@@ -167,13 +171,47 @@ hk_nir_splice_epilogue(const struct nir_shader *producer,
                        struct hk_nir_clamp_buffer output,
                        const struct hk_nir_clamp_epilogue *epilogue);
 
-/* Build a packed vec4 2-pixel-per-thread depthwise convolution NIR alternate
- * from a certified depthwise producer (with vec4_valid == true). When
- * `epilogue` is non-NULL, folds that exact clamp epilogue into both pixel
- * outputs; handles both biased and biasless depthwise kernels. */
+/* Build a packed vec4 2-pixel-per-thread (horizontal pair (ox, ox+1) with Z
+ * carrying output row oy) depthwise convolution NIR alternate from a certified
+ * depthwise producer (with vec4_valid == true). When `epilogue` is non-NULL,
+ * folds that exact clamp epilogue into both pixel outputs; handles both biased
+ * and biasless depthwise kernels. */
 struct nir_shader *
 hk_nir_build_depthwise_vec4(const struct nir_shader *producer,
                             const struct hk_nir_depthwise_output *info,
                             const struct hk_nir_clamp_epilogue *epilogue);
+
+/* Build a Direct-B 4 KiB XOR-swizzled Shared-A f32matmad8x8 GEMM NIR alternate
+ * (tile_n == 32 or 64) from a certified row-major GEMM producer (with
+ * cmat_valid == true). When `epilogue` is non-NULL, folds that exact clamp
+ * epilogue into output writeback; handles arbitrary push layouts, bias_mode
+ * arms, unconditional row/column bias, and biasless kernels. */
+struct nir_shader *
+hk_nir_build_gemm_cmat(const struct nir_shader *producer,
+                       const struct hk_nir_gemm_output *info,
+                       uint32_t tile_n,
+                       const struct hk_nir_clamp_epilogue *epilogue);
+
+/* Validate dispatch dimensions for cooperative-matrix GEMM replacement.
+ * Unguarded GEMM executes ceil(K/32) unconditional 32-wide tiles, so K must
+ * be a multiple of 32 (not merely 16) to match the original shader exactly. */
+static inline bool
+hk_gemm_cmat_dispatch_dims_ok(bool is_guarded, uint64_t m_u, uint32_t n_u,
+                              uint32_t k_u, const uint32_t grid[3])
+{
+   if (n_u == 0 || k_u == 0 || m_u == 0 || grid[2] != 1)
+      return false;
+   if (is_guarded) {
+      const uint64_t need_x = ((uint64_t)n_u + 31ull) / 32ull;
+      const uint64_t need_y = (m_u + 31ull) / 32ull;
+      return (uint64_t)grid[0] >= need_x &&
+             (uint64_t)grid[1] >= need_y &&
+             (uint64_t)grid[0] * 32ull <= (uint64_t)INT32_MAX &&
+             (uint64_t)grid[1] * 32ull <= (uint64_t)INT32_MAX;
+   }
+   return (n_u % 32u) == 0 && (k_u % 32u) == 0 && (m_u % 64ull) == 0 &&
+          grid[1] != 0 && (uint64_t)grid[0] * 32ull == (uint64_t)n_u &&
+          (uint64_t)grid[1] * 32ull == m_u && m_u <= (uint64_t)INT32_MAX;
+}
 
 #endif

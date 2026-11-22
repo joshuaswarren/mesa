@@ -2969,7 +2969,14 @@ hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    record.root_va = desc->uploaded_root.gpu;
    memcpy(record.root_sets, desc->root.sets, sizeof(record.root_sets));
    memcpy(record.push, desc->root.push, sizeof(record.push));
-   record.is_depthwise_vec4 = (selected == api->depthwise_vec4);
+   if (selected == api->depthwise_vec4)
+      record.alt_kind = HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4;
+   else if (selected == api->gemm_cmat32)
+      record.alt_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT32;
+   else if (selected == api->gemm_cmat64)
+      record.alt_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT64;
+   else
+      record.alt_kind = HK_COMPUTE_PAIR_ALT_NONE;
 
    cs->compute_pair = malloc(sizeof(record));
    if (!cs->compute_pair)
@@ -3598,7 +3605,7 @@ hk_select_depthwise_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
       return normal;
    if (!hk_g17p_compute_shader_supported(dev->dev.chip, alt, alt->only_linked, 1u << 16) ||
        alt->b.info.workgroup_size[0] == 0 || alt->b.info.workgroup_size[1] == 0 ||
-       alt->b.info.workgroup_size[2] != 1)
+       alt->b.info.workgroup_size[2] == 0)
       return normal;
 
    const struct hk_nir_depthwise_output *dw = &api->compute_pair->depthwise;
@@ -3683,11 +3690,153 @@ hk_select_depthwise_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
       return normal;
 
    const uint64_t out_pairs = DIV_ROUND_UP((uint64_t)(uint32_t)ow, 2);
-   const uint64_t out_x4 = out_pairs * ((uint32_t)ch / 4);
-   if (out_x4 > UINT32_MAX)
+   if (out_pairs > UINT32_MAX)
       return normal;
-   grid->count[0] = DIV_ROUND_UP((uint32_t)out_x4, alt->b.info.workgroup_size[0]);
-   grid->count[1] = DIV_ROUND_UP((uint32_t)oh, alt->b.info.workgroup_size[1]);
+   const uint32_t gx = DIV_ROUND_UP((uint32_t)ch / 4, alt->b.info.workgroup_size[0]);
+   const uint32_t gy = DIV_ROUND_UP((uint32_t)out_pairs, alt->b.info.workgroup_size[1]);
+   const uint32_t gz = DIV_ROUND_UP((uint32_t)oh, alt->b.info.workgroup_size[2]);
+   if (gx > 65535 || gy > 65535 || gz > 65535)
+      return normal;
+   grid->count[0] = gx;
+   grid->count[1] = gy;
+   grid->count[2] = gz;
+   return alt;
+}
+
+static struct hk_shader *
+hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
+                    struct hk_shader *normal, struct agx_grid *grid)
+{
+   const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if ((!api->gemm_cmat32 && !api->gemm_cmat64) || !api->compute_pair ||
+       api->compute_pair->role != HK_COMPUTE_PAIR_GEMM)
+      return normal;
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
+       !agx_chip_cooperative_matrix_supported(dev->dev.chip) ||
+       cmd->in_meta || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+      return normal;
+   if (grid->mode != AGX_CDM_MODE_DIRECT || desc->root.cs.base_group[0] ||
+       desc->root.cs.base_group[1] || desc->root.cs.base_group[2] ||
+       grid->count[2] != 1)
+      return normal;
+
+   const struct hk_nir_gemm_output *gemm = &api->compute_pair->gemm;
+   if (!gemm->cmat_valid || gemm->push_bytes > HK_COMPUTE_OPT_PUSH_BYTES ||
+       gemm->local_size[0] != normal->b.info.workgroup_size[0] ||
+       gemm->local_size[1] != normal->b.info.workgroup_size[1] ||
+       gemm->local_size[2] != normal->b.info.workgroup_size[2])
+      return normal;
+
+   int32_t m_i = 0, n_i = 0, k_i = 0, bias_mode = 2;
+   if (!hk_read_push_i32(desc, gemm->n_offset_B, &n_i) ||
+       !hk_read_push_i32(desc, gemm->k_offset_B, &k_i))
+      return normal;
+   if (n_i <= 0 || k_i <= 0)
+      return normal;
+
+   if (gemm->has_bias_mode) {
+      if (!hk_read_push_i32(desc, gemm->bias_mode_offset_B, &bias_mode))
+         return normal;
+      if (bias_mode < 0 || bias_mode > 2 ||
+          !(gemm->bias_mode_mask & (1u << bias_mode)))
+         return normal;
+   } else if (gemm->has_bias_buffer) {
+      if (gemm->bias_mode_mask == (1u << 0))
+         bias_mode = 0;
+      else if (gemm->bias_mode_mask == (1u << 1))
+         bias_mode = 1;
+      else
+         return normal;
+   }
+
+   uint64_t m_u = 0;
+   if (gemm->is_guarded) {
+      if (!hk_read_push_i32(desc, gemm->m_offset_B, &m_i) || m_i <= 0)
+         return normal;
+      m_u = (uint32_t)m_i;
+   } else {
+      m_u = (uint64_t)grid->count[1] * 32;
+   }
+   if (!hk_gemm_cmat_dispatch_dims_ok(gemm->is_guarded, m_u, (uint32_t)n_i,
+                                      (uint32_t)k_i, grid->count))
+      return normal;
+
+   struct hk_shader *alt = NULL;
+   uint32_t tile_n = 0;
+   if (!gemm->is_guarded) {
+      if (((uint32_t)n_i % 64) == 0 && api->gemm_cmat64) {
+         alt = api->gemm_cmat64;
+         tile_n = 64;
+      } else if (api->gemm_cmat32) {
+         alt = api->gemm_cmat32;
+         tile_n = 32;
+      }
+   } else {
+      if ((uint32_t)n_i > 32 && api->gemm_cmat64) {
+         alt = api->gemm_cmat64;
+         tile_n = 64;
+      } else if (api->gemm_cmat32) {
+         alt = api->gemm_cmat32;
+         tile_n = 32;
+      }
+   }
+   if (!alt ||
+       !hk_g17p_compute_shader_supported(dev->dev.chip, alt, alt->only_linked, 1u << 16))
+      return normal;
+
+   const uint64_t n_u = (uint32_t)n_i;
+   const uint64_t k_u = (uint32_t)k_i;
+   uint64_t a_elems = 0, b_elems = 0, c_elems = 0;
+   if (__builtin_mul_overflow(m_u, k_u, &a_elems) ||
+       __builtin_mul_overflow(k_u, n_u, &b_elems) ||
+       __builtin_mul_overflow(m_u, n_u, &c_elems))
+      return normal;
+   const uint64_t a_bytes = a_elems * sizeof(uint32_t);
+   const uint64_t b_bytes = b_elems * sizeof(uint32_t);
+   const uint64_t c_bytes = c_elems * sizeof(uint32_t);
+   const uint64_t bias_bytes =
+      (bias_mode == 0) ? m_u * sizeof(uint32_t) :
+      (bias_mode == 1) ? n_u * sizeof(uint32_t) : 0;
+   if (a_bytes > (uint64_t)INT32_MAX + 1 ||
+       b_bytes > (uint64_t)INT32_MAX + 1 ||
+       c_bytes > (uint64_t)INT32_MAX + 1 ||
+       bias_bytes > (uint64_t)INT32_MAX + 1)
+      return normal;
+
+   const uint32_t a_align = gemm->is_guarded ? 4 : 16;
+   if ((gemm->reads[0].offset_B % a_align) || (gemm->reads[1].offset_B % 4) ||
+       (bias_bytes && (gemm->reads[2].offset_B % 4)) || (gemm->output.offset_B % 4))
+      return normal;
+
+   struct hk_storage_backing a_b, b_b, bs_b, c_b;
+   if (!hk_check_storage_backing(desc, gemm->reads[0].set, gemm->reads[0].binding,
+                                 gemm->reads[0].offset_B, a_bytes, a_align, &a_b) ||
+       !hk_check_storage_backing(desc, gemm->reads[1].set, gemm->reads[1].binding,
+                                 gemm->reads[1].offset_B, b_bytes, 4, &b_b) ||
+       !hk_check_storage_backing(desc, gemm->output.set, gemm->output.binding,
+                                 gemm->output.offset_B, c_bytes, 4, &c_b))
+      return normal;
+   if (bias_bytes &&
+       !hk_check_storage_backing(desc, gemm->reads[2].set, gemm->reads[2].binding,
+                                 gemm->reads[2].offset_B, bias_bytes, 4, &bs_b))
+      return normal;
+
+   if (!hk_intervals_disjoint(&a_b, gemm->reads[0].offset_B, a_bytes,
+                              &c_b, gemm->output.offset_B, c_bytes) ||
+       !hk_intervals_disjoint(&b_b, gemm->reads[1].offset_B, b_bytes,
+                              &c_b, gemm->output.offset_B, c_bytes) ||
+       (bias_bytes &&
+        !hk_intervals_disjoint(&bs_b, gemm->reads[2].offset_B, bias_bytes,
+                               &c_b, gemm->output.offset_B, c_bytes)))
+      return normal;
+
+   const uint64_t gx = DIV_ROUND_UP(n_u, tile_n);
+   const uint64_t gy = DIV_ROUND_UP(m_u, 64);
+   if (gx > 65535 || gy > 65535)
+      return normal;
+   grid->count[0] = (uint32_t)gx;
+   grid->count[1] = (uint32_t)gy;
    grid->count[2] = 1;
    return alt;
 }
@@ -3762,6 +3911,13 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
       local_size = agx_workgroup(selected->b.info.workgroup_size[0],
                                  selected->b.info.workgroup_size[1],
                                  selected->b.info.workgroup_size[2]);
+   } else if (api && (api->gemm_cmat32 || api->gemm_cmat64) && api->compute_pair &&
+              api->compute_pair->role == HK_COMPUTE_PAIR_GEMM &&
+              !in_threads && !invocation_stat) {
+      selected = hk_select_gemm_cmat(cmd, api, s, &grid);
+      local_size = agx_workgroup(selected->b.info.workgroup_size[0],
+                                 selected->b.info.workgroup_size[1],
+                                 selected->b.info.workgroup_size[2]);
    }
 
    if (!agx_is_indirect(grid) && !in_threads) {
@@ -3787,7 +3943,8 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
    }
    hk_dispatch_with_local_size(cmd, cs, selected, grid, local_size);
    if (!in_threads && !invocation_stat && api && api->compute_pair &&
-       (selected == s || selected == api->depthwise_vec4))
+       (selected == s || selected == api->depthwise_vec4 ||
+        selected == api->gemm_cmat32 || selected == api->gemm_cmat64))
       hk_record_compute_pair(cmd, cs, api, selected, orig_groups, grid);
    cs->uses_global_atomics |= selected->b.info.uses_global_atomics;
    cs->pack_loops |= selected->b.info.has_loops;

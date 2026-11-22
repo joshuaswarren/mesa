@@ -17,11 +17,18 @@ struct hk_shader;
 struct nir_shader;
 struct vk_descriptor_set_layout;
 
-#define HK_COMPUTE_PAIR_MAX_VARIANTS 8u
+#define HK_COMPUTE_PAIR_MAX_VARIANTS 16u
+
+enum hk_compute_pair_alt_kind {
+   HK_COMPUTE_PAIR_ALT_NONE = 0,
+   HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4 = 1,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 = 2,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT64 = 3,
+};
 
 struct hk_compute_pair_variant {
    struct hk_nir_clamp_epilogue epilogue;
-   bool use_depthwise_vec4;
+   enum hk_compute_pair_alt_kind alt_kind;
    struct hk_shader *shader;
 };
 
@@ -67,7 +74,7 @@ struct hk_shader *
 hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
                                      struct hk_compute_pair_producer *prod,
                                      const struct hk_nir_clamp_epilogue *epilogue,
-                                     bool use_depthwise_vec4);
+                                     enum hk_compute_pair_alt_kind alt_kind);
 
 void hk_compute_pair_info_serialize(struct blob *blob,
                                     const struct hk_compute_pair_info *info);
@@ -88,7 +95,7 @@ struct hk_compute_pair_dispatch {
    uint64_t root_va;
    uint64_t root_sets[HK_MAX_SETS];
    uint8_t push[HK_MAX_PUSH_SIZE];
-   bool is_depthwise_vec4;
+   enum hk_compute_pair_alt_kind alt_kind;
    struct hk_compute_pair_producer *producer;
 };
 
