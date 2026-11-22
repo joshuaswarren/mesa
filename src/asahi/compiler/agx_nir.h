@@ -43,6 +43,7 @@ struct nir_def;
 bool agx_nir_lower_address(struct nir_shader *shader, bool byte_indices,
                            bool byte_offsets, bool checked_offsets);
 bool agx_nir_preserve_position_order(struct nir_shader *shader);
+bool agx_nir_opt_shared_phase_cse(struct nir_shader *shader);
 bool agx_nir_scalarize_int64(struct nir_shader *shader);
 bool agx_nir_lower_divmod64(struct nir_shader *shader, bool native_add64);
 bool agx_nir_lower_algebraic_late(struct nir_shader *shader);
