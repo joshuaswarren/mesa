@@ -47,25 +47,31 @@ check_formats(void)
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
    /* Every core format below VK_FORMAT_ASTC_12x12_SRGB_BLOCK. */
-   unsigned color = 0, depth = 0;
+   unsigned color = 0, color16 = 0, depth = 0;
    for (unsigned f = 1; f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++f) {
       const bool c = hk_g17p_compression_color_format((VkFormat)f);
+      const bool c16 = hk_g17p_compression_color_format_16b((VkFormat)f);
       const bool d = hk_g17p_compression_depth_format((VkFormat)f);
       CHECK(!(c && d));
+      CHECK(!(c && c16));
+      CHECK(!(c16 && d));
       color += c;
+      color16 += c16;
       depth += d;
 
       VkImageCreateInfo i = image((VkFormat)f, 64, 64, 1, color_usage);
       CHECK(ELIGIBLE(i) == (c || d));
+      CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, AGX_CHIP_ID_A18_PRO,
+                                           0, &i) == (c || c16 || d));
    }
    CHECK(color == 46);
+   CHECK(color16 == 3);
    CHECK(depth == 3);
 
-   /* No 16-byte texels (tilebuffer spill), no packed/padded RGB, no stencil
-    * or combined depth/stencil, no block-compressed or YCbCr formats. */
+   /* No packed/padded RGB, no stencil or combined depth/stencil, no
+    * block-compressed or YCbCr formats. */
    static const VkFormat rejected[] = {
-      VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT,
-      VK_FORMAT_R32G32B32A32_SINT,   VK_FORMAT_R32G32B32_SFLOAT,
+      VK_FORMAT_R32G32B32_SFLOAT,
       VK_FORMAT_R8G8B8_UNORM,        VK_FORMAT_R16G16B16_SFLOAT,
       VK_FORMAT_B10G11R11_UFLOAT_PACK32,
       VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, VK_FORMAT_R4G4B4A4_UNORM_PACK16,
@@ -83,26 +89,30 @@ check_formats(void)
 }
 
 static void
-check_shape(VkFormat format, bool is_depth)
+check_shape_for_chip(VkFormat format, bool is_depth, uint32_t chip_id)
 {
+   const bool is_color_16b = hk_g17p_compression_color_format_16b(format);
    const VkImageUsageFlags usage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       VK_IMAGE_USAGE_SAMPLED_BIT |
       (is_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
                 : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
    const VkImageCreateInfo base = image(format, 2408, 1508, 1, usage);
-   CHECK(ELIGIBLE(base));
+#define CHIP_ELIGIBLE(i)                                                       \
+   hk_hal200_compression_eligible(AGX_CHIP_G17P, chip_id, 0, &(i))
+   CHECK(CHIP_ELIGIBLE(base));
 
    /* Chip and plane. */
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
-      CHECK(hk_g17p_compression_eligible((enum agx_chip)chip, 0, &base) ==
+      CHECK(hk_hal200_compression_eligible((enum agx_chip)chip, chip_id, 0,
+                                           &base) ==
             (chip == AGX_CHIP_G17P));
    /* Plane 1 is the stencil plane of D32_SFLOAT_S8_UINT alone. */
-   CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, &base) ==
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, chip_id, 1, &base) ==
          (format == VK_FORMAT_D32_SFLOAT_S8_UINT));
-   CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 2, &base));
-   CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, NULL));
-   CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, NULL));
+   CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G17P, chip_id, 2, &base));
+   CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G17P, chip_id, 0, NULL));
+   CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G17P, chip_id, 1, NULL));
 
    /* Usage: only texture/PBE/ZLS usages are admitted. */
    VkImageUsageFlags allowed =
@@ -116,12 +126,12 @@ check_shape(VkFormat format, bool is_depth)
    for (unsigned bit = 0; bit < 32; ++bit) {
       VkImageCreateInfo i = base;
       i.usage |= 1u << bit;
-      CHECK(ELIGIBLE(i) == !!((1u << bit) & allowed));
+      CHECK(CHIP_ELIGIBLE(i) == !!((1u << bit) & allowed));
    }
    for (unsigned usage_bits = 0; usage_bits < 256; ++usage_bits) {
       VkImageCreateInfo i = base;
       i.usage = usage_bits & allowed;
-      CHECK(ELIGIBLE(i));
+      CHECK(CHIP_ELIGIBLE(i));
    }
    static const VkImageUsageFlags refused[] = {
       VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT,
@@ -134,8 +144,9 @@ check_shape(VkFormat format, bool is_depth)
    for (unsigned r = 0; r < sizeof(refused) / sizeof(refused[0]); ++r) {
       VkImageCreateInfo i = base;
       i.usage |= refused[r];
-      CHECK(ELIGIBLE(i) == (is_depth && refused[r] ==
-                           VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT));
+      CHECK(CHIP_ELIGIBLE(i) ==
+            (is_depth &&
+             refused[r] == VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT));
    }
 
    /* Sample-location tracking is also admitted for single-sample depth.
@@ -143,7 +154,7 @@ check_shape(VkFormat format, bool is_depth)
    for (unsigned bit = 0; bit < 32; ++bit) {
       VkImageCreateInfo i = base;
       i.flags = 1u << bit;
-      CHECK(ELIGIBLE(i) ==
+      CHECK(CHIP_ELIGIBLE(i) ==
             ((1u << bit) == VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT ||
              (1u << bit) == VK_IMAGE_CREATE_EXTENDED_USAGE_BIT ||
              (1u << bit) == VK_IMAGE_CREATE_ALIAS_BIT ||
@@ -153,47 +164,47 @@ check_shape(VkFormat format, bool is_depth)
    {
       VkImageCreateInfo i = base;
       i.flags = VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-      CHECK(ELIGIBLE(i));
+      CHECK(CHIP_ELIGIBLE(i));
       i.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-      CHECK(!ELIGIBLE(i));
+      CHECK(!CHIP_ELIGIBLE(i));
    }
 
    /* Geometry. */
    VkImageCreateInfo i = base;
    i.imageType = VK_IMAGE_TYPE_1D;
-   CHECK(!ELIGIBLE(i));
+   CHECK(!CHIP_ELIGIBLE(i));
    i = base; i.imageType = VK_IMAGE_TYPE_3D;
-   CHECK(ELIGIBLE(i) == !is_depth);
+   CHECK(CHIP_ELIGIBLE(i) == (!is_depth && !is_color_16b));
    i = base; i.extent.depth = 2;
-   CHECK(!ELIGIBLE(i));
+   CHECK(!CHIP_ELIGIBLE(i));
    i = base; i.arrayLayers = 2;
-   CHECK(ELIGIBLE(i));
+   CHECK(CHIP_ELIGIBLE(i) == !is_color_16b);
    i = base; i.arrayLayers = 6;
-   CHECK(ELIGIBLE(i));
+   CHECK(CHIP_ELIGIBLE(i) == !is_color_16b);
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
-      CHECK(!ELIGIBLE(i));
+      CHECK(!CHIP_ELIGIBLE(i));
    }
    i = base; i.tiling = VK_IMAGE_TILING_LINEAR;
-   CHECK(!ELIGIBLE(i));
+   CHECK(!CHIP_ELIGIBLE(i));
    i = base; i.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-   CHECK(!ELIGIBLE(i));
+   CHECK(!CHIP_ELIGIBLE(i));
    i = base; i.mipLevels = 0;
-   CHECK(!ELIGIBLE(i));
+   CHECK(!CHIP_ELIGIBLE(i));
    i = base; i.mipLevels = 12;
-   CHECK(ELIGIBLE(i) == !is_depth);
+   CHECK(CHIP_ELIGIBLE(i) == !is_depth);
    i = base; i.extent.width = 15;
-   CHECK(!ELIGIBLE(i));
+   CHECK(!CHIP_ELIGIBLE(i));
    i = base; i.extent.height = 15;
-   CHECK(!ELIGIBLE(i));
+   CHECK(!CHIP_ELIGIBLE(i));
    i = base; i.extent.width = 16; i.extent.height = 16;
-   CHECK(ELIGIBLE(i));
+   CHECK(CHIP_ELIGIBLE(i));
    i = base; i.extent.width = 17; i.extent.height = 31;
-   CHECK(ELIGIBLE(i));
+   CHECK(CHIP_ELIGIBLE(i));
    i = base; i.extent.width = 16384; i.extent.height = 16384;
-   CHECK(ELIGIBLE(i));
+   CHECK(CHIP_ELIGIBLE(i));
    i = base; i.sharingMode = VK_SHARING_MODE_CONCURRENT;
-   CHECK(ELIGIBLE(i));
+   CHECK(CHIP_ELIGIBLE(i));
 
    /* Shared images stay plain; an empty external handle set does not. */
    VkExternalMemoryImageCreateInfo external = {
@@ -205,16 +216,23 @@ check_shape(VkFormat format, bool is_depth)
       .pNext = &external,
    };
    i = base; i.pNext = &external;
-   CHECK(!ELIGIBLE(i));
+   CHECK(!CHIP_ELIGIBLE(i));
    i = base; i.pNext = &list;
-   CHECK(!ELIGIBLE(i));
+   CHECK(!CHIP_ELIGIBLE(i));
    external.handleTypes = 0;
-   CHECK(ELIGIBLE(i));
+   CHECK(CHIP_ELIGIBLE(i));
    list.pNext = NULL;
-   CHECK(ELIGIBLE(i));
+   CHECK(CHIP_ELIGIBLE(i));
    VkBaseInStructure wsi = {.sType = HK_G17P_WSI_IMAGE_CREATE_INFO_MESA};
    i = base; i.pNext = &wsi;
-   CHECK(!ELIGIBLE(i));
+   CHECK(!CHIP_ELIGIBLE(i));
+#undef CHIP_ELIGIBLE
+}
+
+static void
+check_shape(VkFormat format, bool is_depth)
+{
+   check_shape_for_chip(format, is_depth, 0);
 }
 
 static void
@@ -786,6 +804,12 @@ main(void)
    check_shape(VK_FORMAT_R8G8B8A8_UNORM, false);
    check_shape(VK_FORMAT_B8G8R8A8_SRGB, false);
    check_shape(VK_FORMAT_R16G16B16A16_SFLOAT, false);
+   check_shape_for_chip(VK_FORMAT_R32G32B32A32_SFLOAT, false,
+                        AGX_CHIP_ID_A18_PRO);
+   check_shape_for_chip(VK_FORMAT_R32G32B32A32_UINT, false,
+                        AGX_CHIP_ID_A18_PRO);
+   check_shape_for_chip(VK_FORMAT_R32G32B32A32_SINT, false,
+                        AGX_CHIP_ID_A18_PRO);
    check_shape(VK_FORMAT_R8_UNORM, false);
    check_shape(VK_FORMAT_D32_SFLOAT, true);
    check_shape(VK_FORMAT_D16_UNORM, true);

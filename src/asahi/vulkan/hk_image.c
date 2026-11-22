@@ -1316,10 +1316,11 @@ hk_GetPhysicalDeviceSparseImageFormatProperties2(
 }
 
 /* A multiview pass keeps multisample colour to an eight-byte budget in the
- * tilebuffer (the uncovered-tile defect), and G17P cannot spill a compressed
- * target: with more compressed 2x colour than that, the pass could only fail.
- * A 2x colour image cannot know whether it will meet such a pass, so it stays
- * plain on a device that enabled multiview. Depth is not in that budget. */
+ * tilebuffer (the uncovered-tile defect), and G17P has no MSAA/1-8 B
+ * decompression program for a spilled compressed target: with more compressed
+ * 2x colour than that, the pass could only fail. A 2x colour image cannot know
+ * whether it will meet such a pass, so it stays plain on a device that enabled
+ * multiview. Depth is not in that budget. */
 static bool
 hk_g17p_multiview_spill_risk(const VkImageCreateInfo *info, bool multiview)
 {

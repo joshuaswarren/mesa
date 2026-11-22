@@ -60,27 +60,30 @@ check_formats(void)
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
    /* Every core format below VK_FORMAT_ASTC_12x12_SRGB_BLOCK. */
-   unsigned color = 0, depth = 0;
+   unsigned color = 0, color16 = 0, depth = 0;
    for (unsigned f = 1; f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++f) {
       const bool c = hk_g17p_compression_color_format((VkFormat)f);
+      const bool c16 = hk_g17p_compression_color_format_16b((VkFormat)f);
       const bool d = hk_g17p_compression_depth_format((VkFormat)f) ||
                      f == VK_FORMAT_S8_UINT;
       CHECK(!(c && d));
+      CHECK(!(c && c16));
+      CHECK(!(c16 && d));
       color += c;
+      color16 += c16;
       depth += d;
 
       VkImageCreateInfo i = image((VkFormat)f, 64, 64, 1, color_usage);
-      CHECK(ELIGIBLE(i) == (c || hk_g17p_compression_depth_format((VkFormat)f)));
+      CHECK(ELIGIBLE(i) ==
+            (c || hk_g17p_compression_depth_format((VkFormat)f)));
    }
    CHECK(color == 46);
+   CHECK(color16 == 3);
    CHECK(depth == 4);
 
-   /* No 16-byte texels (tilebuffer spill), no packed/padded RGB, no packed
-    * depth/stencil, no block-compressed or YCbCr formats. */
+   /* No packed/padded RGB, no packed depth/stencil, no block-compressed or
+    * YCbCr formats. */
    static const VkFormat rejected[] = {
-      VK_FORMAT_R32G32B32A32_SFLOAT,
-      VK_FORMAT_R32G32B32A32_UINT,
-      VK_FORMAT_R32G32B32A32_SINT,
       VK_FORMAT_R32G32B32_SFLOAT,
       VK_FORMAT_R8G8B8_UNORM,
       VK_FORMAT_R16G16B16_SFLOAT,
@@ -830,6 +833,51 @@ check_m4_max(void)
    CHECK(!runtime_m4_max(AGX_CHIP_G14G, 0, &c));
 }
 
+static void
+check_color_16b(void)
+{
+   const VkImageUsageFlags rt =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   static const VkFormat formats[] = {
+      VK_FORMAT_R32G32B32A32_SFLOAT,
+      VK_FORMAT_R32G32B32A32_UINT,
+      VK_FORMAT_R32G32B32A32_SINT,
+   };
+   for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); ++f) {
+      /* 16-byte colour is admitted on A18 Pro (measured); M4 Pro and M4 Max
+       * stay plain until measured there. */
+      VkImageCreateInfo base = image(formats[f], 1920, 1080, 1, rt);
+      CHECK(!ELIGIBLE(base) && !M4_MAX(base) && NEO(base));
+
+      /* Mip chains are admitted for single-sample, single-layer 2D on A18 Pro. */
+      VkImageCreateInfo mips = base;
+      mips.mipLevels = 10;
+      CHECK(!ELIGIBLE(mips) && !M4_MAX(mips) && NEO(mips));
+
+      /* MSAA, arrays, cubes and 3D stay plain on every G17P SoC. */
+      VkImageCreateInfo x = base;
+      x.samples = VK_SAMPLE_COUNT_2_BIT;
+      CHECK(!ELIGIBLE(x) && !M4_MAX(x) && !NEO(x));
+      x.samples = VK_SAMPLE_COUNT_4_BIT;
+      CHECK(!ELIGIBLE(x) && !M4_MAX(x) && !NEO(x));
+
+      x = base;
+      x.arrayLayers = 2;
+      CHECK(!ELIGIBLE(x) && !M4_MAX(x) && !NEO(x));
+
+      x = image(formats[f], 256, 256, 1, rt);
+      x.arrayLayers = 6;
+      x.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+      CHECK(!ELIGIBLE(x) && !M4_MAX(x) && !NEO(x));
+
+      x = image(formats[f], 64, 64, 1, rt);
+      x.imageType = VK_IMAGE_TYPE_3D;
+      x.extent.depth = 4;
+      CHECK(!ELIGIBLE(x) && !M4_MAX(x) && !NEO(x));
+   }
+}
+
 int
 main(void)
 {
@@ -848,6 +896,7 @@ main(void)
    check_zink();
    check_shared();
    check_m4_max();
+   check_color_16b();
    printf("G17P compression policy: %u checks passed\n", checks);
    return 0;
 }
