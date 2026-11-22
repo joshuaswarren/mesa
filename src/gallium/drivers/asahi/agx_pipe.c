@@ -3684,6 +3684,17 @@ agx_screen_create(int fd, struct renderonly *ro,
       return NULL;
    }
 
+   /* GL on a chip whose row says so runs through zink over Borealis, which
+    * the loader picks for it from the same row; this driver's paths have
+    * not run there (agx_chip_gl_through_zink()). */
+   if (agx_chip_gl_through_zink(agx_screen->dev.chip)) {
+      fprintf(stderr, "Apple %s: GL runs through zink\n",
+              agx_chip_name(agx_screen->dev.chip));
+      agx_close_device(&agx_screen->dev);
+      ralloc_free(agx_screen);
+      return NULL;
+   }
+
    /* Forward no16 flag from driconf. This must happen after opening the device,
     * since agx_open_device sets debug.
     */

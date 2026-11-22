@@ -233,6 +233,7 @@ enum agx_chip_quirk {
    AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS = 1 << 13,
    AGX_QUIRK_HW_TXF_BOUNDS = 1 << 14,
    AGX_QUIRK_M5_LAYER_OPERAND = 1 << 15,
+   AGX_QUIRK_GL_THROUGH_ZINK = 1 << 16,
 };
 
 /* What the five native AGX3 chips share. */
@@ -350,7 +351,7 @@ enum agx_chip_quirk {
         AGX_QUIRK_M5_LAYER_OPERAND,                                            \
      __VA_ARGS__)                                                              \
    X(G17D, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     0, __VA_ARGS__)                                                           \
+     AGX_QUIRK_GL_THROUGH_ZINK, __VA_ARGS__)                                   \
    X(G18G, AGX3, AGX3D, HAL300, 10, GEN5, NONE, SKSM, HAL300,                  \
      AGX_RECORDS_G18G, AGX_QUIRK_M5_PATHS, __VA_ARGS__)
 
@@ -946,6 +947,18 @@ agx_chip_m5_layer_operand(enum agx_chip chip)
 }
 
 /*
+ * Whether GL on this chip runs through zink over Borealis rather than the
+ * asahi Gallium driver, whose paths have not run there: the Gallium screen
+ * refuses the chip (agx_screen_create()), and the loader picks zink for it.
+ * The M5 Ultra (G17D) today.
+ */
+static inline bool
+agx_chip_gl_through_zink(enum agx_chip chip)
+{
+   return agx_chip_info(chip)->quirks & AGX_QUIRK_GL_THROUGH_ZINK;
+}
+
+/*
  * Chip sets that call sites test without a capability of their own. They say
  * which chips and not why, and they are not interchangeable: three of them
  * are "runs an AGX3 path" with G18G or the M5 parts left out. Each replaced
@@ -1312,9 +1325,9 @@ bool agx_params_driver_supported(
 bool agx_params_g18g_bringup_supported(
    const struct drm_asahi_params_global *params);
 
-/* Exact M5 (T8142, G17G), M5 Pro (T6050, G17S) and M5 Max (T6050, G17C)
- * kernel contracts the driver admits. This is not a declaration of a complete
- * or conformant device path. */
+/* Exact M5 (T8142, G17G), M5 Pro (T6050, G17S), M5 Max (T6050, G17C) and M5
+ * Ultra (T6050, G17D) kernel contracts the driver admits. This is not a
+ * declaration of a complete or conformant device path. */
 bool agx_params_m5_supported(
    const struct drm_asahi_params_global *params);
 

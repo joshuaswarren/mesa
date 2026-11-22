@@ -182,11 +182,12 @@ static const struct agx_soc agx_socs[] = {
    {AGX_CHIP_ID_M4_MAX, AGX_CHIP_G17P, 1, 4, DRM_ASAHI_GPU_HAL_200,
     AGX_SOC_NATIVE, NULL},
 
-   /* T8142 (M5), and T6050 as the M5 Pro (J714s, J716s) and the M5 Max
-    * (J716c). */
+   /* T8142 (M5), and T6050 as the M5 Pro (J714s, J716s), the M5 Max (J716c),
+    * and the M5 Ultra (J775D). */
    {0x8142, AGX_CHIP_G17G, 1, 1, DRM_ASAHI_GPU_HAL_300, AGX_SOC_M5, NULL},
    {0x6050, AGX_CHIP_G17S, 1, 2, DRM_ASAHI_GPU_HAL_300, AGX_SOC_M5, NULL},
    {0x6050, AGX_CHIP_G17C, 1, 4, DRM_ASAHI_GPU_HAL_300, AGX_SOC_M5, NULL},
+   {0x6050, AGX_CHIP_G17D, 2, 8, DRM_ASAHI_GPU_HAL_300, AGX_SOC_M5, NULL},
 
    /* T8152 (M6, J873). The shim's G18G profile and the J873 G18G kernel
     * driver both publish HAL 300 until the uAPI has a PI_400 value. */

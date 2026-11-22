@@ -111,6 +111,7 @@ static unsigned checks;
    ROW(agx_chip_hal300_records(c), "0000 00000 0000 001000 1 0")                \
    ROW(agx_chip_m5_paths(c), "0000 00000 0000 001000 1 0")                      \
    ROW(agx_chip_m5_layer_operand(c), "0000 00000 0000 000010 0 0")              \
+   ROW(agx_chip_gl_through_zink(c), "0000 00000 0000 000001 0 0")               \
    ROW(agx_chip_codegen_supported(c), "1111 11111 1111 111111 0 0")             \
    ROW(agx_chip_driver_supported(c), "1111 01110 0100 100000 0 0")              \
    ROW(agx_chip_uses_legacy_precompiled_programs(c),                           \
