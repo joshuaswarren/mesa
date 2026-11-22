@@ -7271,3 +7271,163 @@ TEST(NativeForms, Agx3bMatmad8x8EnforcesRegisterBounds)
    EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &agx3c_max, out,
                                        &length));
 }
+
+/*
+ * Unmodified all-scalar-register F32 FFMA on AGX3B (non-G18G) preserves
+ * f16 GPR sources (both SSA normal and precoloured register indices) across
+ * all operand slots and packs them via agx3_falu_fma_mod_runtime(). Modified,
+ * uniform-mixed, and G18G forms keep explicit f16->f32 widening.
+ */
+TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
+{
+   struct LowerCase {
+      const char *name;
+      enum agx_isa_encoding enc;
+      bool emit_agx3d;
+      bool precoloured;
+      unsigned half_mask;
+      bool src_neg;
+      bool src_abs;
+      bool addend_uniform;
+      bool expect_native;
+   };
+   const LowerCase cases[] = {
+      {"agx3b_src0_normal", AGX_ISA_ENCODING_AGX3B, false, false, 1u, false,
+       false, false, true},
+      {"agx3b_src1_normal", AGX_ISA_ENCODING_AGX3B, false, false, 2u, false,
+       false, false, true},
+      {"agx3b_addend_normal", AGX_ISA_ENCODING_AGX3B, false, false, 4u, false,
+       false, false, true},
+      {"agx3b_dual_normal", AGX_ISA_ENCODING_AGX3B, false, false, 5u, false,
+       false, false, true},
+      {"agx3b_src0_precoloured", AGX_ISA_ENCODING_AGX3B, false, true, 1u, false,
+       false, false, true},
+      {"agx3b_neg_widened", AGX_ISA_ENCODING_AGX3B, false, false, 1u, true,
+       false, false, false},
+      {"agx3b_abs_widened", AGX_ISA_ENCODING_AGX3B, false, false, 1u, false,
+       true, false, false},
+      {"agx3b_uniform_mixed_widened", AGX_ISA_ENCODING_AGX3B, false, false, 1u,
+       false, false, true, false},
+      {"agx3c_src0_widened", AGX_ISA_ENCODING_AGX3C, false, false, 1u, false,
+       false, false, false},
+      {"g18g_src0_widened", AGX_ISA_ENCODING_AGX3C, true, false, 1u, false,
+       false, false, false},
+   };
+
+   for (const LowerCase &c : cases) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.emit_agx3d = c.emit_agx3d;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+
+      agx_index srcs[3];
+      for (unsigned s = 0; s < 3; ++s) {
+         if (s == 2 && c.addend_uniform) {
+            srcs[s] = agx_uniform(0, AGX_SIZE_32);
+            continue;
+         }
+         const bool half = (c.half_mask & (1u << s)) != 0;
+         agx_index reg = agx_register(2 * s + (half ? 1 : 0),
+                                      half ? AGX_SIZE_16 : AGX_SIZE_32);
+         srcs[s] = c.precoloured ? reg : agx_preload(b, reg);
+      }
+      if (c.src_neg)
+         srcs[1] = agx_neg(srcs[1]);
+      if (c.src_abs)
+         srcs[1] = agx_abs(srcs[1]);
+
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *fma = agx_ffma_to(b, out, srcs[0], srcs[1], srcs[2]);
+      agx_unit_test(b, out);
+
+      agx_lower_agx3_fma_sources(b->shader);
+
+      for (unsigned s = 0; s < 3; ++s) {
+         if (!(c.half_mask & (1u << s)))
+            continue;
+         EXPECT_EQ(fma->src[s].size, c.expect_native ? AGX_SIZE_16 : AGX_SIZE_32)
+            << c.name << " src" << s;
+      }
+      ralloc_free(mem);
+   }
+
+   /* End-to-end AGX3B packing: independently verify the physical instruction
+    * words deposited by agx3_pack_binary() against agx3b_tables.txt without
+    * calling agx3_falu_fma_mod_runtime().
+    *
+    * In agx3b_tables.txt:
+    *   form f32fma 2 (6B, addend=f32, regs < 128):
+    *     w0&0x0007==1, w1&0x0007==6, w2&0x0003==0
+    *   form f32fma 3 (8B, addend=f16 or high reg):
+    *     w0&0x0007==1, w1&0x0007==6, w2&0x0003==1
+    *     group 270 (addend width field 60): w2&0x0004==0, w3&0x0002==0 (f16)
+    *     or w3&0x0002==2 (f32)
+    *   Both forms deposit width fields via LUT (f16->0, f32->1):
+    *     dest width (field 10) -> w0 bit 3
+    *     src1 width (field 26) -> w0 bit 8
+    *     src0 width (field 43) -> w1 bit 8 */
+   struct PackCase {
+      unsigned mask;
+      uint16_t regs[3];
+      unsigned expect_len;
+   };
+   const PackCase pack_cases[] = {
+      {1u, {5, 4, 6}, 6},      /* form 2: src0=f16, src1=f32, addend=f32 */
+      {2u, {2, 7, 6}, 6},      /* form 2: src0=f32, src1=f16, addend=f32 */
+      {3u, {5, 7, 6}, 6},      /* form 2: src0=f16, src1=f16, addend=f32 */
+      {1u, {5, 4, 130}, 8},    /* form 3: src0=f16, addend=f32 (high reg) */
+      {4u, {2, 4, 9}, 8},      /* form 3: addend=f16 */
+      {5u, {5, 4, 9}, 8},      /* form 3: src0=f16, addend=f16 */
+      {7u, {5, 7, 9}, 8},      /* form 3: all three sources f16 */
+   };
+   for (const PackCase &pc : pack_cases) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->max_reg = 140;
+
+      const bool src0_16 = (pc.mask & 1u) != 0;
+      const bool src1_16 = (pc.mask & 2u) != 0;
+      const bool add_16 = (pc.mask & 4u) != 0;
+      agx_index s0 = agx_register(pc.regs[0], src0_16 ? AGX_SIZE_16 : AGX_SIZE_32);
+      agx_index s1 = agx_register(pc.regs[1], src1_16 ? AGX_SIZE_16 : AGX_SIZE_32);
+      agx_index s2 = agx_register(pc.regs[2], add_16 ? AGX_SIZE_16 : AGX_SIZE_32);
+      agx_ffma_to(b, agx_register(0, AGX_SIZE_32), s0, s1, s2);
+      agx_stop(b);
+
+      util_dynarray binary;
+      util_dynarray_init(&binary, mem);
+      ASSERT_TRUE(agx3_pack_binary(b->shader, &binary)) << "mask=" << pc.mask;
+      /* Stop is 4 bytes on AGX3B; first instruction must be exact form size. */
+      ASSERT_EQ(binary.size, pc.expect_len + 4u) << "mask=" << pc.mask;
+
+      const uint8_t *raw = (const uint8_t *)binary.data;
+      const uint16_t w0 = (uint16_t)raw[0] | ((uint16_t)raw[1] << 8);
+      const uint16_t w1 = (uint16_t)raw[2] | ((uint16_t)raw[3] << 8);
+      const uint16_t w2 = (uint16_t)raw[4] | ((uint16_t)raw[5] << 8);
+      EXPECT_EQ(w0 & 0x0007u, 0x0001u) << "mask=" << pc.mask;
+      EXPECT_EQ(w1 & 0x0007u, 0x0006u) << "mask=" << pc.mask;
+      EXPECT_EQ((w0 >> 3) & 1u, 1u) << "dest f32 width bit, mask=" << pc.mask;
+      EXPECT_EQ((w0 >> 8) & 1u, src1_16 ? 0u : 1u) << "src1 width bit, mask=" << pc.mask;
+      EXPECT_EQ((w1 >> 8) & 1u, src0_16 ? 0u : 1u) << "src0 width bit, mask=" << pc.mask;
+      if (pc.expect_len == 6) {
+         EXPECT_EQ(w2 & 0x0003u, 0x0000u) << "form 2 selector, mask=" << pc.mask;
+      } else {
+         const uint16_t w3 = (uint16_t)raw[6] | ((uint16_t)raw[7] << 8);
+         EXPECT_EQ(w2 & 0x0003u, 0x0001u) << "form 3 selector, mask=" << pc.mask;
+         EXPECT_EQ(w2 & 0x0004u, 0x0000u) << "g270 high bit, mask=" << pc.mask;
+         EXPECT_EQ(w3 & 0x0002u, add_16 ? 0x0000u : 0x0002u)
+            << "g270 addend width bit, mask=" << pc.mask;
+      }
+
+      util_dynarray_fini(&binary);
+      ralloc_free(mem);
+   }
+}

@@ -1716,3 +1716,72 @@ TEST_F(Optimizer, G17PCompoundInnerGuardSemantics)
       }
    }
 }
+
+TEST_F(Optimizer, Agx3bFoldsUnmodifiedHalfGprIntoFfma)
+{
+   struct Case {
+      const char *name;
+      enum agx_isa_encoding enc;
+      bool emit_agx3d;
+      enum agx_opcode op;
+      bool saturate;
+      bool src_neg;
+      bool has_imm;
+      bool has_uniform;
+      bool expect_folded;
+   };
+   const Case cases[] = {
+      {"agx3b_ffma_plain", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FFMA,
+       false, false, false, false, true},
+      {"agx3b_fadd_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD,
+       false, false, false, false, false},
+      {"agx3b_fmul_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FMUL,
+       false, false, false, false, false},
+      {"agx3b_ffma_saturate_blocked", AGX_ISA_ENCODING_AGX3B, false,
+       AGX_OPCODE_FFMA, true, false, false, false, false},
+      {"agx3b_ffma_neg_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FFMA,
+       false, true, false, false, false},
+      {"agx3b_ffma_imm_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FFMA,
+       false, false, true, false, false},
+      {"agx3b_ffma_uniform_blocked", AGX_ISA_ENCODING_AGX3B, false,
+       AGX_OPCODE_FFMA, false, false, false, true, false},
+      {"g18g_ffma_blocked", AGX_ISA_ENCODING_AGX3C, true, AGX_OPCODE_FFMA,
+       false, false, false, false, false},
+   };
+
+   for (const Case &c : cases) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.emit_agx3d = c.emit_agx3d;
+      b->shader->key = &key;
+
+      agx_index half = agx_preload(b, hx);
+      agx_index widened = agx_temp(b->shader, AGX_SIZE_32);
+      agx_fmov_to(b, widened, half);
+
+      agx_index s0 = widened;
+      if (c.src_neg)
+         s0 = agx_neg(s0);
+      agx_index s1 = c.has_imm       ? agx_immediate_f(1.0f)
+                     : c.has_uniform ? agx_uniform(0, AGX_SIZE_32)
+                                     : agx_preload(b, wy);
+      agx_index s2 = agx_preload(b, wz);
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+
+      agx_instr *I;
+      if (c.op == AGX_OPCODE_FADD)
+         I = agx_fadd_to(b, out, s0, s1);
+      else if (c.op == AGX_OPCODE_FMUL)
+         I = agx_fmul_to(b, out, s0, s1);
+      else
+         I = agx_ffma_to(b, out, s0, s1, s2);
+      I->saturate = c.saturate;
+      agx_unit_test(b, out);
+
+      agx_optimize_and_dce(b->shader);
+
+      EXPECT_EQ(I->src[0].size, c.expect_folded ? AGX_SIZE_16 : AGX_SIZE_32)
+         << c.name;
+   }
+}
