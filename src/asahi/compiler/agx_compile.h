@@ -728,6 +728,10 @@ void agx_preprocess_nir_g17p(nir_shader *nir);
  * alone check chip. */
 void agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip);
 void agx_preprocess_nir_g18g(nir_shader *nir);
+/* Fast second-stage preprocessing for shaders already preprocessed once before
+ * simple I/O or push-constant lowering. Falls back to full preprocessing if any
+ * temporary variables were introduced. */
+void agx_preprocess_nir_post_lower(nir_shader *nir, enum agx_chip chip);
 
 /* Access private (scratch) memory in whole 32-bit words, the only width the
  * AGX3 stack protocol encodes. agx_preprocess_nir_g17p() runs it. */
@@ -780,8 +784,20 @@ bool agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
 #define AGX3_CPROG_FS_STATIC_SPILL_VERSION 2u
 bool agx3_cprog_static_spill_info_valid(const struct agx_shader_info *info);
 
+struct blob;
+
 bool agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                             struct agx_shader_part *out);
+bool agx_compile_shader_nir_capture(nir_shader *nir, struct agx_shader_key *key,
+                                    struct agx_shader_part *out,
+                                    struct blob *pre_preamble_blob);
+void agx_prepare_preoptimized_epilog_nir(nir_shader *nir,
+                                         const struct agx_shader_key *key);
+bool agx_compile_shader_nir_preoptimized(nir_shader *nir,
+                                         struct agx_shader_key *key,
+                                         struct agx_shader_part *out,
+                                         bool epilog_has_alu,
+                                         bool preamble_newly_enabled);
 
 struct agx_occupancy {
    unsigned max_registers;

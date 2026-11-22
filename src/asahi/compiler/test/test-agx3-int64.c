@@ -375,16 +375,81 @@ check_m5_wide_product(void)
    return ok;
 }
 
+static bool
+check_mul_extended_64bit(void)
+{
+   static const struct {
+      enum agx_isa_encoding encoding;
+      const char *name;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX2, "AGX2"},
+      {AGX_ISA_ENCODING_AGX3B, "AGX3B"},
+      {AGX_ISA_ENCODING_AGX3C, "AGX3C"},
+   };
+   static const unsigned bit_sizes[] = {32, 64};
+
+   for (unsigned t = 0; t < ARRAY_SIZE(targets); ++t) {
+      for (unsigned bs_i = 0; bs_i < ARRAY_SIZE(bit_sizes); ++bs_i) {
+         const unsigned bs = bit_sizes[bs_i];
+         const unsigned bytes = bs / 8;
+
+         for (unsigned is_signed = 0; is_signed < 2; ++is_signed) {
+            nir_builder b = nir_builder_init_simple_shader(
+               MESA_SHADER_COMPUTE, &agx_nir_options,
+               "mul_extended (imul + mul_high)");
+            b.shader->info.workgroup_size[0] = 1;
+            b.shader->info.workgroup_size[1] = 1;
+            b.shader->info.workgroup_size[2] = 1;
+
+            nir_def *input = nir_load_preamble(&b, 1, 64, .base = 0);
+            nir_def *output = nir_load_preamble(&b, 1, 64, .base = 4);
+            nir_def *x = nir_load_global(&b, 1, bs, input, .align_mul = bytes);
+            nir_def *y = nir_load_global(&b, 1, bs,
+                                         nir_iadd_imm(&b, input, bytes),
+                                         .align_mul = bytes);
+            nir_def *lo = nir_imul(&b, x, y);
+            nir_def *hi =
+               is_signed ? nir_imul_high(&b, x, y) : nir_umul_high(&b, x, y);
+            nir_store_global(&b, lo, output, .align_mul = bytes);
+            nir_store_global(&b, hi, nir_iadd_imm(&b, output, bytes),
+                             .align_mul = bytes);
+            agx_preprocess_nir(b.shader);
+
+            struct agx_shader_key key = {
+               .dev.encoding = targets[t].encoding,
+               .reserved_preamble = 8,
+               .no_preamble = true,
+            };
+            struct agx_shader_part part = {0};
+            const bool valid = agx_compile_shader_nir(b.shader, &key, &part) &&
+                               part.binary && part.info.binary_size > 4;
+            free(part.binary);
+            ralloc_free(b.shader);
+
+            if (!valid) {
+               fprintf(stderr, "%s failed %u-bit %s mul_extended compile\n",
+                       targets[t].name, bs,
+                       is_signed ? "signed" : "unsigned");
+               return false;
+            }
+         }
+      }
+   }
+
+   return true;
+}
+
 int
 main(void)
 {
    if (!check_host_oracle() || !check_g17p_compile() ||
        !check_g17p_strength_reduced_mul() || !check_g17g_add64() ||
-       !check_g17p_widened_mul() || !check_m5_wide_product())
+       !check_g17p_widened_mul() || !check_m5_wide_product() ||
+       !check_mul_extended_64bit())
       return 1;
 
    puts("agx3_int64: arithmetic, dynamic shifts and strength-reduced "
         "multiplies compile for G17P; full-width addition and 32x32->64 "
-        "products compile for M5");
+        "products compile for M5; 64-bit mul_extended compiles across AGX2/AGX3");
    return 0;
 }

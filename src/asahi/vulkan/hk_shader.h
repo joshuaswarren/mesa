@@ -285,12 +285,14 @@ struct hk_shader {
    /* Address of the start of the shader data section */
    uint64_t data_addr;
 
-   /* The fragment main's NIR (serialized just before its backend compile)
+   /* The fragment main's NIR (serialized just before its backend compile or
+    * right before preamble formation when g17p_mono_preoptimized is set)
     * and that compile's key, so fast-link can build one program with the
     * draw's colour epilog inlined. NULL when the shape is not eligible. */
    void *g17p_mono_nir;
    size_t g17p_mono_nir_size;
    struct agx_shader_key g17p_mono_key;
+   bool g17p_mono_preoptimized;
 };
 
 static inline uint64_t
