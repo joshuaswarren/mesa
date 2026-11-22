@@ -20,6 +20,7 @@ libasahi_agx_files = files(
   'agx_nir_opt_flatten_loads.c',
   'agx_nir_opt_merge_nested_early_exits.c',
   'agx_nir_opt_narrow_subword_loads.c',
+  'agx_nir_opt_guard_chains.c',
   'agx_nir_opt_select_load.c',
   'agx_nir_opt_licm.c',
   'agx_nir_opt_uniform_idiv.c',
@@ -820,6 +821,7 @@ if with_tests
          'test/test-flatten-loads.cpp',
          'test/test-narrow-subword-loads.cpp',
          'test/test-shared-phase-cse.cpp',
+         'test/test-guard-chains.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
          # in libasahi_lib, which this test does not link.
          '../lib/agx_chip.c',

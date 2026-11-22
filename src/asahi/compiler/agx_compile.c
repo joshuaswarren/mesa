@@ -11005,6 +11005,20 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          agx_optimize_loop_nir(nir, m5, g17p);
    }
 
+   /* Fuse nested guards, hoist independent load/test prefixes across pure
+    * ifs to overlap memory latency, and coalesce adjacent expensive
+    * divergent ifs under a combined fast-path guard. Runs across AGX3B and
+    * AGX3C (excluding G18G). */
+   if ((byte_indices || m5) && !g18_scans) {
+      bool guarded = false;
+      NIR_PASS(guarded, nir, agx_nir_opt_guard_chains);
+      if (guarded) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
+
    /* Compute shaders defer shared-offset lowering until after
     * nir_lower_mem_access_bit_sizes() and nir_opt_load_store_vectorize() so
     * adjacent byte-addressed shared loads and stores merge into wider vector
