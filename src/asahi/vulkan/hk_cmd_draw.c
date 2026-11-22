@@ -32,6 +32,8 @@
 #include "agx_vdm_hal200_bind_tail_core.h"
 #include "agx_vdm_hal200_direct_draw_core.h"
 #include "agx_vdm_ppp_state_core.h"
+
+#include "agx_vdm_stream_link_core.h"
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
 #include "hk_native_vertex_template.h"
@@ -11378,6 +11380,7 @@ hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    out += encoded.length;
    gfx->g17p_vdm_update_memo.key = key;
    gfx->g17p_vdm_update_memo.encoded = encoded;
+   gfx->g17p_vdm_update_memo.pipeline_program = pipeline_program;
    gfx->g17p_vdm_update_memo.valid = true;
 
 tail:
@@ -15111,6 +15114,494 @@ hk_agx3_emit_indirect_multi(struct hk_cmd_buffer *cmd,
    return start + emitted;
 }
 
+static bool
+hk_agx3_vdm_stream_target(struct hk_cmd_buffer *cmd, uint64_t addr,
+                          uint64_t *compact_out)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   uint64_t compact = addr;
+
+   if (hk_g17p_vdm_low_window_enabled(&dev->dev)) {
+      compact = hk_g17p_vdm_compact(cmd, addr);
+      if (!compact)
+         return false;
+   } else if (agx_chip_g17_m5(dev->dev.chip)) {
+      if (!agx_m5_vdm_compact(addr, &compact))
+         return false;
+   }
+
+   if (compact >= (UINT64_C(1) << 40))
+      return false;
+
+   *compact_out = compact;
+   return true;
+}
+
+/* Complete a bind tail emitted by hk_flush_gfx_state() with a zero-draw link
+ * to the next word so a fallback path can record draws cleanly. */
+static void
+hk_agx3_close_dangling_bind_tail(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                                 bool tail_emitted)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!tail_emitted || !agx_chip_native_agx3(dev->dev.chip))
+      return;
+
+   hk_ensure_cs_has_space(cmd, cs, 16);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+   uint32_t draw_state_offset = 0;
+   uint64_t next_compact = 0;
+   struct agx_vdm_stream_link_core link;
+   if (!hk_g17p_draw_state_offset(cmd, cs, &draw_state_offset)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   memcpy(cs->current, &draw_state_offset, sizeof(draw_state_offset));
+   cs->current += sizeof(draw_state_offset);
+
+   const uint64_t next_va =
+      hk_cs_current_addr(cs) + AGX_VDM_STREAM_LINK_CORE_LENGTH;
+   if (!hk_agx3_vdm_stream_target(cmd, next_va, &next_compact) ||
+       !agx_vdm_stream_link_core_pack(dev->dev.chip, next_compact, &link)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   memcpy(cs->current, link.bytes, link.length);
+   cs->current += link.length;
+   cs->stream_linked = true;
+   cmd->state.gfx.dirty |= HK_DIRTY_VARYINGS;
+}
+
+/*
+ * Build the VDM sub-stream (and per-draw Ioto vertex programs when vertex
+ * state republishes per record) for multi-draw indirect and indirect-count
+ * commands on the GPU in O(1) CPU time.
+ *
+ * The main VDM stream links into `sub_vdm`, where lane `i < count` writes one
+ * byte-identical draw record and lane `count` writes the returning VDM Stream
+ * Link. For indirect-count draws this eliminates both the CPU record loop and
+ * `libagx_predicate_indirect`, and stops the VDM at `count` instead of parsing
+ * culled slots up to `max_draw_count`.
+ */
+/* Bound per-call and per-command-buffer GPU indirect VDM/Ioto scratch so a
+ * large maxDrawCount or many indirect calls cannot exhaust the 4 GiB LOW_VA
+ * USC exec window; larger calls fall back to the CPU loop cleanly. */
+#define HK_INDIRECT_VDM_MAX_DRAWS      65536u
+#define HK_INDIRECT_VDM_MAX_IOTO_BYTES (16u * 1024u * 1024u)
+
+static bool
+hk_agx3_draw_indirect_gpu(struct hk_cmd_buffer *cmd, uint64_t in,
+                          uint64_t count_addr, uint32_t max_draw_count,
+                          uint32_t stride, bool indexed)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+
+   const enum agx_command_stream_generation cs_gen =
+      agx_chip_command_stream_generation(dev->dev.chip);
+   if ((cs_gen != AGX_CS_GENERATION_HAL200 &&
+        cs_gen != AGX_CS_GENERATION_HAL300) ||
+       !agx_vdm_stream_link_core_supported(dev->dev.chip) ||
+       max_draw_count == 0 || max_draw_count > HK_INDIRECT_VDM_MAX_DRAWS ||
+       in == 0 || (in & 3u) != 0)
+      return false;
+
+   const uint32_t cmd_size = sizeof(uint32_t) * (indexed ? 5u : 4u);
+   if (max_draw_count > 1 && (stride < cmd_size || (stride % 4u) != 0))
+      return false;
+
+   const uint64_t va_limit = UINT64_C(1) << 48;
+   if (in >= va_limit - cmd_size ||
+       (max_draw_count > 1 &&
+        (uint64_t)(max_draw_count - 1) * stride > va_limit - cmd_size - in))
+      return false;
+
+   if (!gfx->shaders[MESA_SHADER_VERTEX] ||
+       !gfx->shaders[MESA_SHADER_FRAGMENT] || gfx->render.view_mask ||
+       dyn->rs.depth_bias.enable || gfx->shaders[MESA_SHADER_GEOMETRY] ||
+       gfx->shaders[MESA_SHADER_TESS_CTRL] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       mesa_prim_has_adjacency(
+          vk_topology_to_mesa(dyn->ia.primitive_topology)) ||
+       hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
+                                       cmd->conditional_meta) ||
+       (gfx->descriptors.root.draw.pipeline_stats_flags &
+        (VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT |
+         VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT |
+         VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT |
+         VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
+         VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT)) ||
+       hk_prims_generated_active(cmd) ||
+       (dyn->ms.rasterization_samples && !gfx->render.tilebuffer.nr_samples))
+      return false;
+
+   struct agx_draw first_draw =
+      indexed ? agx_draw_indexed_indirect(in, gfx->index.buffer.addr,
+                                          gfx->index.buffer.range, 0, 0)
+              : agx_draw_indirect(in);
+   hk_g17p_normalize_indirect_draw(cmd, &first_draw);
+
+   if (indexed) {
+      struct agx_draw robust_draw = first_draw;
+      if ((first_draw.index_size != AGX_INDEX_SIZE_U8 &&
+           first_draw.index_size != AGX_INDEX_SIZE_U16 &&
+           first_draw.index_size != AGX_INDEX_SIZE_U32) ||
+          !first_draw.index_buffer ||
+          hk_needs_index_robustness(cmd, &robust_draw, NULL))
+         return false;
+   }
+
+   if (!count_addr) {
+      hk_m5_pass_merge_end_ordered(cmd, "multi-draw indirect");
+      hk_xfer_check_draw(
+         cmd, in, in + (uint64_t)stride * (max_draw_count - 1) + cmd_size);
+   }
+
+   hk_g17p_note_depth_use(cmd);
+
+   bool needs_idx_robust = false;
+   bool tail_emitted = false;
+   struct hk_cs *cs = hk_flush_gfx_state(
+      cmd, 0, &first_draw, &needs_idx_robust, &tail_emitted, NULL);
+   if (!cs || vk_command_buffer_has_error(&cmd->vk))
+      return true;
+
+   if (needs_idx_robust ||
+       !hk_g17p_indirect_records_eligible(cmd, &first_draw, false)) {
+      hk_agx3_close_dangling_bind_tail(cmd, cs, tail_emitted);
+      return vk_command_buffer_has_error(&cmd->vk);
+   }
+
+   const bool g17p = agx_chip_native_agx3(dev->dev.chip);
+   const bool republishes = hk_gfx_republishes_render_state(cmd);
+   struct hk_linked_shader *linked_vs = gfx->linked[MESA_SHADER_VERTEX];
+   struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
+   struct hk_shader *sw_vs = hk_bound_sw_vs(gfx);
+   const bool uses_draw_id = republishes && sw_vs->b.info.uses_draw_id;
+   const uint32_t param_offset_B =
+      indexed ? offsetof(VkDrawIndexedIndirectCommand, vertexOffset)
+              : offsetof(VkDrawIndirectCommand, firstVertex);
+
+   uint8_t vdm_tmpl[160];
+   uint32_t vdm_pos = 0;
+   uint32_t vdm_pipeline_word_off = UINT32_MAX;
+   uint32_t vdm_pipeline_raw_template = 0;
+   uint32_t draw_state_offset = 0;
+
+   struct hk_vdm_allocation *draw_ids_span = NULL;
+   struct hk_vdm_allocation *sub_ioto_span = NULL;
+   struct hk_vdm_allocation *sub_vdm_span = NULL;
+   struct agx_bo *sub_ioto_bo = NULL;
+   struct hk_linked_shader *linked_hw_vs = NULL;
+
+   uint64_t sub_vdm_gpu = 0;
+   uint64_t ioto_out_gpu = 0;
+   uint64_t draw_ids_gpu = 0;
+   uint64_t ioto_template_gpu = 0;
+   uint32_t ioto_copy_dwords = 0;
+   uint32_t ioto_stride_B = 0;
+   size_t total_ioto_B = 0;
+   struct libagx_indirect_ioto_reloc relocs[LIBAGX_INDIRECT_VDM_MAX_RELOCS];
+   uint32_t reloc_count = 0;
+
+   if (republishes) {
+      /* GPU-written Ioto programs live in EXEC memory that may be recycled
+       * across renders, so the render-start VDM barrier must invalidate the
+       * USC instruction cache. */
+      const bool admits_inval =
+         (dev->dev.params.features & DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE) != 0;
+      if (!(agx_vdm_barrier_core_word(dev->dev.chip, admits_inval) &
+            AGX_VDM_BARRIER_CORE_USC_INVAL))
+         goto fallback;
+
+      linked_hw_vs = hk_linked_hw_vs(cmd, hw_vs, sw_vs, linked_vs);
+      const enum agx_vdm_state_update_draw_path draw_path =
+         first_draw.indexed ? AGX_VDM_STATE_UPDATE_DRAW_INDIRECT_INDEXED
+                            : AGX_VDM_STATE_UPDATE_DRAW_INDIRECT_NONINDEXED;
+      const bool rasterization_enabled = hk_native_vertex_template_enabled(
+         hk_rast_discard(cmd), hw_vs->info.writes_external_memory,
+         hk_g17p_xfb_vertex_side_effects(cmd, hw_vs));
+      const struct hk_g17p_vdm_update_key *memo =
+         &gfx->g17p_vdm_update_memo.key;
+      if (!linked_hw_vs || !gfx->g17p_vdm_update_memo.valid ||
+          memo->hw_vs != hw_vs || memo->draw_path != draw_path ||
+          memo->rasterization_enabled != rasterization_enabled ||
+          memo->provoking != gfx->provoking ||
+          memo->primitive_id != gfx->generate_primitive_id ||
+          !memo->ordinary ||
+          memo->selector_valid != cs->agx3_active_context_selector_valid ||
+          memo->selector != cs->agx3_raw_active_context_selector)
+         goto fallback;
+
+      const struct agx_vdm_state_update *upd =
+         &gfx->g17p_vdm_update_memo.encoded;
+      vdm_pipeline_raw_template =
+         hw_vs->agx3_vdm_state_update.template_info.raw_state_load_count_18
+         << 3;
+      struct agx_vdm_state_vertex_pipeline_pair expected_pair;
+      if (upd->length != AGX_VDM_STATE_UPDATE_LENGTH ||
+          vdm_pos + upd->length > sizeof(vdm_tmpl) ||
+          !agx_vdm_state_vertex_pipeline_pair_pack(
+             dev->dev.chip, gfx->g17p_vdm_update_memo.pipeline_program,
+             vdm_pipeline_raw_template, &expected_pair) ||
+          memcmp(upd->bytes + 8, expected_pair.bytes,
+                 sizeof(expected_pair.bytes)) != 0)
+         goto fallback;
+      memcpy(vdm_tmpl + vdm_pos, upd->bytes, upd->length);
+      vdm_pipeline_word_off = 2u;
+      vdm_pos += upd->length;
+   }
+
+   const uint32_t body_off = vdm_pos;
+   if (g17p) {
+      const struct agx_vdm_hal200_indirect_draw_fields fields = {
+         .draw_state_context_offset = 4,
+         .primitive = (uint8_t)gfx->topology,
+         .indexed = first_draw.indexed,
+         .index_size_B =
+            first_draw.indexed ? agx_index_size_to_B(first_draw.index_size) : 0,
+         .restart_enable = first_draw.restart,
+         .restart_index = hk_draw_restart_index(cmd, first_draw),
+         .index_buffer = first_draw.index_buffer,
+         .index_buffer_range_B = first_draw.index_buffer_range_B,
+         .indirect_buffer = first_draw.b.ptr,
+      };
+      struct agx_vdm_hal200_indirect_draw encoded;
+      size_t emitted = 0;
+      if (!agx_vdm_hal200_indirect_draw_pack(dev->dev.chip, &fields,
+                                             &encoded) ||
+          !agx_vdm_hal200_draw_emit(dev->dev.chip, encoded.bytes,
+                                    encoded.length, false, vdm_tmpl + vdm_pos,
+                                    sizeof(vdm_tmpl) - vdm_pos, &emitted))
+         goto fallback;
+      vdm_pos += emitted;
+   } else {
+      uint32_t *end = agx_vdm_draw(
+         (uint32_t *)(vdm_tmpl + vdm_pos),
+         agx_vdm_index_list_record_chip(dev->dev.chip), first_draw,
+         gfx->topology, hk_draw_restart_index(cmd, first_draw));
+      vdm_pos = (uint32_t)((uint8_t *)end - vdm_tmpl);
+   }
+
+   if ((vdm_pos % 4u) != 0 || vdm_pos > sizeof(vdm_tmpl))
+      goto fallback;
+
+   const uint32_t vdm_record_dwords = vdm_pos / 4u;
+   const uint32_t vdm_indirect_word_off =
+      body_off / 4u + (indexed ? 4u : 1u);
+   if (vdm_indirect_word_off + 2u > vdm_record_dwords)
+      goto fallback;
+   uint32_t check_hi = 0, check_lo = 0;
+   memcpy(&check_hi, vdm_tmpl + vdm_indirect_word_off * 4u, 4);
+   memcpy(&check_lo, vdm_tmpl + (vdm_indirect_word_off + 1u) * 4u, 4);
+   if (check_hi != (uint32_t)((in >> 32) & 0xffffu) ||
+       check_lo != ((uint32_t)in & 0xfffffffcu))
+      goto fallback;
+
+   if (g17p && tail_emitted && !draw_state_offset &&
+       !hk_g17p_draw_state_offset(cmd, cs, &draw_state_offset))
+      goto fallback;
+
+   if (!tail_emitted) {
+      hk_ensure_cs_has_space(cmd, cs, 16);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         goto fallback_err;
+   } else {
+      assert(cs->current + 16 <= cs->end);
+   }
+
+   const uint64_t return_va = hk_cs_current_addr(cs) +
+                              (g17p && tail_emitted ? 4u : 0u) +
+                              AGX_VDM_STREAM_LINK_CORE_LENGTH;
+   uint64_t return_compact = 0;
+   if (!hk_agx3_vdm_stream_target(cmd, return_va, &return_compact))
+      goto fallback;
+
+   struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
+
+   if (republishes) {
+      if (uses_draw_id) {
+         struct agx_ptr draw_ids;
+         if (hk_cmd_pool_alloc_span(pool, HK_CMD_SLAB_DATA_GPU,
+                                    (size_t)max_draw_count * sizeof(uint32_t),
+                                    64, &draw_ids, &draw_ids_span) !=
+             VK_SUCCESS)
+            goto fallback;
+         draw_ids_gpu = draw_ids.gpu;
+      }
+
+      if (!hk_agx3_indirect_ioto_prepare(
+             cmd, hw_vs, linked_hw_vs, in, stride, param_offset_B,
+             draw_ids_gpu, max_draw_count, &ioto_template_gpu,
+             &ioto_copy_dwords, &ioto_stride_B, relocs, &reloc_count))
+         goto fallback;
+
+      total_ioto_B = (size_t)max_draw_count * ioto_stride_B;
+      if (total_ioto_B == 0 ||
+          total_ioto_B > HK_INDIRECT_VDM_MAX_IOTO_BYTES ||
+          cmd->state.indirect_vdm_ioto_bytes >
+             HK_INDIRECT_VDM_MAX_IOTO_BYTES - total_ioto_B)
+         goto fallback;
+
+      /* Sub-allocate GPU-written Ioto programs from unmapped non-writeback
+       * device slabs to avoid per-draw BO churn without CPU cacheline
+       * aliasing; keep >4 MiB calls in standalone unmapped EXEC BOs. */
+      if (total_ioto_B <= HK_CMD_SLAB_MAX_SIZE) {
+         struct agx_ptr sub_ioto;
+         if (hk_cmd_pool_alloc_span(pool, HK_CMD_SLAB_IOTO_GPU, total_ioto_B,
+                                    AGX_IOTO_PROGRAM_ALIGNMENT, &sub_ioto,
+                                    &sub_ioto_span) != VK_SUCCESS)
+            goto fallback;
+         ioto_out_gpu = sub_ioto.gpu;
+      } else {
+         sub_ioto_bo =
+            agx_bo_create(&dev->dev, total_ioto_B, AGX_IOTO_PROGRAM_ALIGNMENT,
+                          AGX_BO_EXEC | AGX_BO_LOW_VA,
+                          "Indirect Ioto programs");
+         if (!sub_ioto_bo || !sub_ioto_bo->va)
+            goto fallback;
+         ioto_out_gpu = sub_ioto_bo->va->addr;
+      }
+
+      if (!ioto_out_gpu || (ioto_out_gpu & 0x3fu) != 0 ||
+          ioto_out_gpu >= va_limit || total_ioto_B > va_limit - ioto_out_gpu)
+         goto fallback;
+   }
+
+   const size_t sub_vdm_bytes = (size_t)max_draw_count * vdm_pos +
+                                AGX_VDM_STREAM_LINK_CORE_LENGTH +
+                                HK_CS_SPACE_PADDING;
+   if (sub_vdm_bytes > HK_CMD_SLAB_MAX_SIZE)
+      goto fallback;
+
+   struct agx_ptr sub_vdm;
+   if (hk_cmd_pool_alloc_span(pool, HK_CMD_SLAB_VDM_GPU, sub_vdm_bytes, 256,
+                              &sub_vdm, &sub_vdm_span) != VK_SUCCESS)
+      goto fallback;
+   sub_vdm_gpu = sub_vdm.gpu;
+
+   uint64_t sub_vdm_compact = 0;
+   if (hk_g17p_vdm_low_window_enabled(&dev->dev)) {
+      if (sub_vdm_span->alias) {
+         uint32_t alias_compact = 0;
+         if (!agx_g17p_vdm_alias_compact(sub_vdm_span->alias, &alias_compact))
+            goto fallback;
+         /* Write and fetch the sub-stream through the same GPU VA so CDM
+          * writes and VDM reads stay coherent without dual-VA aliasing. */
+         sub_vdm_gpu = sub_vdm_span->alias;
+         sub_vdm_compact = alias_compact;
+      } else if (!agx_g17p_vdm_payload_compact(sub_vdm_gpu, &sub_vdm_compact) ||
+                 sub_vdm_compact >= (UINT64_C(1) << 40)) {
+         goto fallback;
+      }
+   } else if (!hk_agx3_vdm_stream_target(cmd, sub_vdm_gpu, &sub_vdm_compact)) {
+      goto fallback;
+   }
+
+   struct agx_vdm_stream_link_core jump_link;
+   if (!agx_vdm_stream_link_core_pack(dev->dev.chip, sub_vdm_compact,
+                                      &jump_link))
+      goto fallback;
+
+   const uint64_t vdm_template_gpu = hk_pool_upload(cmd, vdm_tmpl, vdm_pos, 16);
+   if (!vdm_template_gpu)
+      goto fallback;
+
+   struct libagx_indirect_vdm_desc desc = {
+      .sub_vdm = sub_vdm_gpu,
+      .vdm_template = vdm_template_gpu,
+      .in_buffer = in,
+      .count_buffer = count_addr,
+      .return_link_compact = return_compact,
+      .ioto_out = ioto_out_gpu,
+      .ioto_template = ioto_template_gpu,
+      .draw_ids_out = draw_ids_gpu,
+      .max_draw_count = max_draw_count,
+      .in_stride_B = stride,
+      .vdm_record_dwords = vdm_record_dwords,
+      .vdm_indirect_word_off = vdm_indirect_word_off,
+      .vdm_pipeline_word_off = vdm_pipeline_word_off,
+      .vdm_pipeline_raw_template = vdm_pipeline_raw_template,
+      .param_offset_B = param_offset_B,
+      .ioto_copy_dwords = ioto_copy_dwords,
+      .ioto_stride_B = ioto_stride_B,
+      .reloc_count = reloc_count,
+   };
+   if (reloc_count)
+      memcpy(desc.relocs, relocs, reloc_count * sizeof(relocs[0]));
+
+   const uint64_t desc_gpu = hk_pool_upload(cmd, &desc, sizeof(desc), 8);
+   if (!desc_gpu)
+      goto fallback;
+
+   /* Commit allocations and main-stream jump. */
+   if (draw_ids_span)
+      list_addtail(&draw_ids_span->link, &cmd->vdm_allocations);
+   if (sub_ioto_span)
+      list_addtail(&sub_ioto_span->link, &cmd->vdm_allocations);
+   if (sub_vdm_span)
+      list_addtail(&sub_vdm_span->link, &cmd->vdm_allocations);
+   if (sub_ioto_bo)
+      util_dynarray_append(&cmd->large_bos, sub_ioto_bo);
+   cmd->state.indirect_vdm_ioto_bytes += total_ioto_B;
+
+   if (g17p && tail_emitted) {
+      memcpy(cs->current, &draw_state_offset, sizeof(draw_state_offset));
+      cs->current += sizeof(draw_state_offset);
+   }
+   memcpy(cs->current, jump_link.bytes, jump_link.length);
+   cs->current += jump_link.length;
+   cs->stream_linked = true;
+   cs->restart_index_set = false;
+   cs->g17p_primitive_bound = UINT64_MAX;
+
+   if (unlikely(!cmd->state.gfx.render.first_draw_seen))
+      hk_g17p_note_first_draw(cmd, cs, first_draw);
+
+   cs->stats.calls++;
+   cs->stats.cmds++;
+   hk_upload_stat(cmd, draws, max_draw_count);
+   hk_note_attachmentless_draw(cmd, cs);
+   hk_note_pre_raster_images(cmd, cs);
+   hk_m5_note_render_resources(cmd, cs);
+   if (unlikely(dev->frame_anatomy)) {
+      hk_frame_anatomy_note_fs(cs, hk_bound_fs(cmd));
+      hk_frame_anatomy_note_vs(cs, hw_vs);
+      hk_frame_anatomy_note_m5_fragment(cs);
+   }
+
+   libagx_build_indirect_vdm(
+      cmd, agx_1d((max_draw_count + 1u) * LIBAGX_INDIRECT_VDM_LANES_PER_DRAW),
+      AGX_BARRIER_ALL | AGX_PREGFX, desc_gpu);
+   return true;
+
+fallback:
+   if (draw_ids_span)
+      hk_device_free_span(dev, draw_ids_span);
+   if (sub_ioto_span)
+      hk_device_free_span(dev, sub_ioto_span);
+   if (sub_vdm_span)
+      hk_device_free_span(dev, sub_vdm_span);
+   if (sub_ioto_bo)
+      agx_bo_unreference(&dev->dev, sub_ioto_bo);
+   hk_agx3_close_dangling_bind_tail(cmd, cs, tail_emitted);
+   return vk_command_buffer_has_error(&cmd->vk);
+
+fallback_err:
+   if (draw_ids_span)
+      hk_device_free_span(dev, draw_ids_span);
+   if (sub_ioto_span)
+      hk_device_free_span(dev, sub_ioto_span);
+   if (sub_vdm_span)
+      hk_device_free_span(dev, sub_vdm_span);
+   if (sub_ioto_bo)
+      agx_bo_unreference(&dev->dev, sub_ioto_bo);
+   return true;
+}
+
 static void
 hk_draw_indirect_inner(VkCommandBuffer commandBuffer, uint64_t base,
                        uint32_t drawCount, uint32_t stride)
@@ -15338,14 +15829,20 @@ hk_draw_indirect_count(VkCommandBuffer commandBuffer, VkBuffer _buffer,
       return;
 
    size_t out_stride = sizeof(uint32_t) * (indexed ? 5 : 4);
-   uint64_t patched = hk_pool_alloc(cmd, out_stride * maxDrawCount, 4).gpu;
    uint64_t in = hk_buffer_address_ro(buffer, offset);
    uint64_t count_addr = hk_buffer_address_ro(count_buffer, countBufferOffset);
 
-   /* The predicate below reads both buffers before the draw is recorded. */
+   /* The pre-graphics compute builder / predicate reads both buffers before
+    * the draw is recorded. */
    hk_xfer_check_draw(cmd, in, in + (uint64_t)stride * (maxDrawCount - 1) +
                                   out_stride);
    hk_xfer_check_draw(cmd, count_addr, count_addr + sizeof(uint32_t));
+
+   if (hk_agx3_draw_indirect_gpu(cmd, in, count_addr, maxDrawCount, stride,
+                                 indexed))
+      return;
+
+   uint64_t patched = hk_pool_alloc(cmd, out_stride * maxDrawCount, 4).gpu;
 
    libagx_predicate_indirect(cmd, agx_1d(maxDrawCount),
                              AGX_BARRIER_ALL | AGX_PREGFX, patched, in,

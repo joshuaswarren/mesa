@@ -86,7 +86,8 @@ hk_g17p_vdm_lookup(struct hk_cmd_buffer *cmd, uint64_t primary, bool bind)
       return primary;
 
    struct hk_vdm_allocation *last = cmd->g17p_vdm_last_allocation;
-   if (last && primary >= last->addr && primary - last->addr < last->size) {
+   if (last && last->alias && primary >= last->addr &&
+       primary - last->addr < last->size) {
       uint32_t compact = 0;
       if (agx_g17p_vdm_alias_compact(
              last->alias + (primary - last->addr), &compact))
@@ -99,7 +100,7 @@ hk_g17p_vdm_lookup(struct hk_cmd_buffer *cmd, uint64_t primary, bool bind)
     * instead of growing with every render pass recorded. */
    list_for_each_entry_rev(struct hk_vdm_allocation, allocation,
                            &cmd->vdm_allocations, link) {
-      if (primary < allocation->addr ||
+      if (!allocation->alias || primary < allocation->addr ||
           primary - allocation->addr >= allocation->size)
          continue;
 
@@ -3914,6 +3915,172 @@ hk_agx3_multi_draw_ioto_finish(struct hk_cmd_buffer *cmd,
    u_foreach_bit(r, tpl->draw_id_mask)
       cached->loader_ranges[r].address = draw_id_ptr;
    cached->loader_program = pipeline_program;
+}
+
+static bool
+hk_agx3_indirect_loader_fits(const struct hk_g17p_gfx_loader *l,
+                             const struct hk_g17p_launch *launch,
+                             const struct agx3_ioto_uniform_range *first,
+                             const struct agx3_ioto_uniform_range *last)
+{
+   if (!l || l->length == 0 || l->length > AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE)
+      return false;
+
+   if (!hk_g17p_patch_plan_fits(&l->plan, first) ||
+       !hk_g17p_patch_plan_fits(&l->plan, last))
+      return false;
+
+   unsigned varying = 0;
+   for (unsigned r = 0; r < l->plan.reloc_count; ++r) {
+      const struct hk_g17p_patch_reloc *rel = &l->plan.relocs[r];
+      const uint8_t src = launch->source[rel->range];
+      if (src != HK_G17P_RANGE_SOURCE_DRAW_PARAMS &&
+          src != HK_G17P_RANGE_SOURCE_DRAW_ID)
+         continue;
+
+      if ((rel->offset & 1u) != 0)
+         return false;
+
+      const uint64_t base_first = first[rel->range].address + rel->delta;
+      const uint64_t base_last = last[rel->range].address + rel->delta;
+      if (base_last < base_first)
+         return false;
+
+      /* A 2-byte low LDIMM requires every intermediate draw's low 32 bits to
+       * remain < 128; forbid crossing a 4 GiB wrap boundary. */
+      if ((rel->short_mask & 1u) && (base_first >> 32) != (base_last >> 32))
+         return false;
+
+      if (++varying > LIBAGX_INDIRECT_VDM_MAX_RELOCS)
+         return false;
+   }
+
+   return true;
+}
+
+bool
+hk_agx3_indirect_ioto_prepare(
+   struct hk_cmd_buffer *cmd, struct hk_shader *s,
+   struct hk_linked_shader *linked, uint64_t in_va, uint32_t stride_B,
+   uint32_t param_offset_B, uint64_t draw_ids_va, uint32_t max_draw_count,
+   uint64_t *ioto_template_gpu, uint32_t *ioto_copy_dwords,
+   uint32_t *ioto_stride_B, struct libagx_indirect_ioto_reloc *relocs,
+   uint32_t *reloc_count)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_g17p_graphics_ioto_cache_entry *cached = &gfx->g17p_ioto[0];
+   const struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, 0, linked);
+
+   if (!max_draw_count || s->info.stage != MESA_SHADER_VERTEX ||
+       s->info.agx3_gen1_fragment_rq || !launch->valid || launch->s != s ||
+       launch->linked != linked || !launch->loader ||
+       cached->loader != launch->loader || cached->loader_linked != linked ||
+       !cached->loader_program ||
+       launch->flags != hk_g17p_launch_flags(cmd, s))
+      return false;
+
+   const unsigned count = launch->count;
+   struct agx3_ioto_uniform_range first[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   struct agx3_ioto_uniform_range last[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   memcpy(first, cached->loader_ranges, count * sizeof(first[0]));
+   memcpy(last, cached->loader_ranges, count * sizeof(last[0]));
+
+   const uint64_t last_idx = max_draw_count - 1;
+   for (unsigned i = 0; i < count; ++i) {
+      if (launch->source[i] == HK_G17P_RANGE_SOURCE_DRAW_PARAMS) {
+         first[i].address = in_va + param_offset_B;
+         last[i].address = in_va + last_idx * stride_B + param_offset_B;
+      } else if (launch->source[i] == HK_G17P_RANGE_SOURCE_DRAW_ID) {
+         if (!draw_ids_va)
+            return false;
+         first[i].address = draw_ids_va;
+         last[i].address = draw_ids_va + last_idx * sizeof(uint32_t);
+      }
+   }
+
+   const struct hk_g17p_gfx_loader *l = launch->loader;
+   if (!hk_agx3_indirect_loader_fits(l, launch, first, last)) {
+      const struct agx_tilebuffer_layout *tib = &gfx->render.tilebuffer;
+      const struct agx_ioto_g17p_imageblock imageblock = {
+         .sample_size_B = tib->sample_size_B,
+         .nr_samples = tib->nr_samples,
+         .tile_size_px = tib->tile_size,
+      };
+
+      l = NULL;
+      for (struct hk_g17p_gfx_loader *it =
+              p_atomic_read(&linked->g17p_gfx_loaders);
+           it; it = it->next) {
+         if (hk_g17p_gfx_loader_matches(it, s, &imageblock, first, count) &&
+             hk_agx3_indirect_loader_fits(it, launch, first, last)) {
+            l = it;
+            break;
+         }
+      }
+
+      if (!l) {
+         struct hk_agx3_g17p_graphics_program_desc desc;
+         if (!hk_g17p_graphics_program_desc_init(cmd, s, linked, first, count,
+                                                 &desc))
+            return false;
+
+         struct hk_g17p_gfx_loader *created =
+            hk_g17p_gfx_loader_create(dev, s, &desc, true);
+         if (!created)
+            return false;
+
+         while (true) {
+            struct hk_g17p_gfx_loader *head =
+               p_atomic_read(&linked->g17p_gfx_loaders);
+            created->next = head;
+            if (p_atomic_cmpxchg_ptr(&linked->g17p_gfx_loaders, head,
+                                     created) == head)
+               break;
+         }
+
+         if (!hk_agx3_indirect_loader_fits(created, launch, first, last))
+            return false;
+         l = created;
+      }
+   }
+
+   static_assert((AGX_IOTO_PROGRAM_ALIGNMENT % 16) == 0,
+                 "Ioto program stride must remain 16-byte aligned");
+   const uint32_t copy_B = ALIGN_POT(l->length, 16);
+   struct agx_ptr tmpl = hk_pool_alloc(cmd, copy_B, 16);
+   if (!tmpl.cpu)
+      return false;
+
+   if (copy_B > l->length)
+      memset((uint8_t *)tmpl.cpu + l->length, 0, copy_B - l->length);
+   memcpy(tmpl.cpu, l->bytes, l->length);
+   hk_g17p_patch_plan_apply(&l->plan, first, tmpl.cpu);
+
+   uint32_t nrelocs = 0;
+   for (unsigned r = 0; r < l->plan.reloc_count; ++r) {
+      const struct hk_g17p_patch_reloc *rel = &l->plan.relocs[r];
+      const uint8_t src = launch->source[rel->range];
+      if (src != HK_G17P_RANGE_SOURCE_DRAW_PARAMS &&
+          src != HK_G17P_RANGE_SOURCE_DRAW_ID)
+         continue;
+
+      assert(nrelocs < LIBAGX_INDIRECT_VDM_MAX_RELOCS);
+      relocs[nrelocs++] = (struct libagx_indirect_ioto_reloc){
+         .dest_lo = rel->dest[0],
+         .dest_hi = rel->dest[1],
+         .delta = rel->delta,
+         .offset = rel->offset,
+         .kind = src == HK_G17P_RANGE_SOURCE_DRAW_PARAMS ? 0u : 1u,
+         .short_mask = rel->short_mask,
+      };
+   }
+
+   *ioto_template_gpu = tmpl.gpu;
+   *ioto_copy_dwords = copy_B / 4u;
+   *ioto_stride_B = ALIGN_POT(l->length, AGX_IOTO_PROGRAM_ALIGNMENT);
+   *reloc_count = nrelocs;
+   return true;
 }
 
 static uint64_t

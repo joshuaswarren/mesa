@@ -29,6 +29,20 @@ libagx_predicate_indirect(global uint32_t *out, constant uint32_t *in,
    }
 }
 
+/*
+ * Build a GPU-authored AGX3 VDM sub-stream (and per-draw Ioto vertex programs
+ * when the vertex shader reads base parameters or draw ID) for multi-draw
+ * indirect and indirect-count draws. Four consecutive lanes cooperate on each
+ * draw record using 128-bit coalesced transfers with in-register patching; draw
+ * `count` writes the returning VDM Stream Link so culled slots above `count`
+ * are never parsed by the VDM.
+ */
+KERNEL(128)
+libagx_build_indirect_vdm(constant struct libagx_indirect_vdm_desc *desc)
+{
+   libagx_build_indirect_vdm_sublane(desc, cl_global_id.x);
+}
+
 /* VK_EXT_transform_feedback exposes the byte count written by streamout as a
  * draw source.  Generate the complete VkDrawIndirectCommand on the GPU so a
  * producer earlier in this command buffer never needs CPU readback. */

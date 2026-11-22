@@ -818,6 +818,7 @@ struct hk_graphics_state {
    struct {
       struct hk_g17p_vdm_update_key key;
       struct agx_vdm_state_update encoded;
+      uint64_t pipeline_program;
       bool valid;
    } g17p_vdm_update_memo;
 
@@ -1878,6 +1879,10 @@ struct hk_cmd_buffer {
        * attachments through memory; the next draw ends the stream first. */
       bool m5_ordered_split;
 
+      /* Cumulative GPU-built indirect Ioto bytes reserved in this recording,
+       * bounding LOW_VA pressure across repeated indirect-count commands. */
+      size_t indirect_vdm_ioto_bytes;
+
       /* Per recording; reported at submission so reused command buffers are
        * counted each time. Reasons overlap, total counts physical splits. */
       struct {
@@ -2912,6 +2917,20 @@ void hk_agx3_multi_draw_ioto_finish(struct hk_cmd_buffer *cmd,
                                     const struct hk_agx3_multi_draw_ioto_tpl *tpl,
                                     uint64_t pipeline_program,
                                     uint64_t draw_params, uint64_t draw_id_ptr);
+
+struct libagx_indirect_ioto_reloc;
+
+/* Prepare a GPU-patchable Ioto vertex-program template and its varying
+ * relocations (draw parameters / draw ID) for a multi-draw indirect VDM
+ * builder. Returns false when the active vertex launch cannot be patched
+ * cleanly across [0, max_draw_count). */
+bool hk_agx3_indirect_ioto_prepare(
+   struct hk_cmd_buffer *cmd, struct hk_shader *s,
+   struct hk_linked_shader *linked, uint64_t in_va, uint32_t stride_B,
+   uint32_t param_offset_B, uint64_t draw_ids_va, uint32_t max_draw_count,
+   uint64_t *ioto_template_gpu, uint32_t *ioto_copy_dwords,
+   uint32_t *ioto_stride_B, struct libagx_indirect_ioto_reloc *relocs,
+   uint32_t *reloc_count);
 
 void hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
                                   const VkCommandBufferBeginInfo *pBeginInfo);

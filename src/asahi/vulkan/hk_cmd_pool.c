@@ -165,20 +165,37 @@ hk_cmd_bo_destroy(struct hk_device *dev, UNUSED const VkAllocationCallbacks *all
    vk_free(&dev->vk.alloc, bo);
 }
 
+static bool
+hk_cmd_slab_is_gpu_only(enum hk_cmd_slab_class class)
+{
+   return class == HK_CMD_SLAB_VDM_GPU || class == HK_CMD_SLAB_IOTO_GPU ||
+          class == HK_CMD_SLAB_DATA_GPU;
+}
+
 static struct hk_vdm_slab *
-hk_device_create_vdm_slab(struct hk_device *dev, enum hk_cmd_slab_class class)
+hk_device_create_vdm_slab(struct hk_device *dev, enum hk_cmd_slab_class class,
+                          uint64_t min_size)
 {
    static const char *const labels[HK_CMD_SLAB_COUNT] = {
       [HK_CMD_SLAB_VDM] = "VDM command slab",
       [HK_CMD_SLAB_MAIN] = "Main command slab",
       [HK_CMD_SLAB_USC] = "USC command slab",
       [HK_CMD_SLAB_IOTO] = "G17P Ioto program slab",
+      [HK_CMD_SLAB_VDM_GPU] = "GPU indirect VDM slab",
+      [HK_CMD_SLAB_IOTO_GPU] = "GPU indirect Ioto slab",
+      [HK_CMD_SLAB_DATA_GPU] = "GPU indirect data slab",
    };
+   const bool gpu_only = hk_cmd_slab_is_gpu_only(class);
    const enum agx_bo_flags flags =
-      (class == HK_CMD_SLAB_USC    ? AGX_BO_LOW_VA
-       : class == HK_CMD_SLAB_IOTO ? AGX_BO_EXEC | AGX_BO_LOW_VA
-                                   : 0) |
-      (hk_g17p_cached_cmd_memory(&dev->dev) ? AGX_BO_WRITEBACK : 0);
+      (class == HK_CMD_SLAB_USC ? AGX_BO_LOW_VA
+       : (class == HK_CMD_SLAB_IOTO || class == HK_CMD_SLAB_IOTO_GPU)
+          ? AGX_BO_EXEC | AGX_BO_LOW_VA
+          : 0) |
+      (!gpu_only && hk_g17p_cached_cmd_memory(&dev->dev) ? AGX_BO_WRITEBACK
+                                                         : 0);
+
+   if (min_size > HK_CMD_SLAB_MAX_SIZE)
+      return NULL;
 
    struct hk_vdm_slab *slab =
       vk_zalloc(&dev->vk.alloc, sizeof(*slab), 8,
@@ -186,7 +203,9 @@ hk_device_create_vdm_slab(struct hk_device *dev, enum hk_cmd_slab_class class)
    if (!slab)
       return NULL;
 
-   const uint32_t size = dev->vdm.next_size[class] ?: HK_CMD_BO_SIZE;
+   uint32_t size = dev->vdm.next_size[class] ?: HK_CMD_BO_SIZE;
+   while (size < min_size && size < HK_CMD_SLAB_MAX_SIZE)
+      size = MIN2(size * 2, HK_CMD_SLAB_MAX_SIZE);
    dev->vdm.next_size[class] = MIN2(size * 2, HK_CMD_SLAB_MAX_SIZE);
    slab->bo = agx_bo_create(&dev->dev, size, 0, flags, labels[class]);
    if (!slab->bo) {
@@ -195,17 +214,33 @@ hk_device_create_vdm_slab(struct hk_device *dev, enum hk_cmd_slab_class class)
    }
 
    /* Map before creating the GPU alias so a failed CPU mapping cannot
-    * publish a slab with an invalid recording pointer. */
-   slab->map = agx_bo_map(slab->bo);
-   if (!slab->map) {
-      agx_bo_unreference(&dev->dev, slab->bo);
-      vk_free(&dev->vk.alloc, slab);
-      return NULL;
+    * publish a slab with an invalid recording pointer. GPU-only slabs are
+    * written by pre-graphics compute and stay unmapped on the CPU. */
+   if (!gpu_only) {
+      slab->map = agx_bo_map(slab->bo);
+      if (!slab->map) {
+         agx_bo_unreference(&dev->dev, slab->bo);
+         vk_free(&dev->vk.alloc, slab);
+         return NULL;
+      }
    }
 
    /* Uploader spans name their primary mapping, so they spend none of the
-    * finite alias aperture. */
-   if (class == HK_CMD_SLAB_VDM) {
+    * finite alias aperture. GPU indirect VDM slabs also use their primary
+    * mapping whenever the whole BO already lies inside the lower-root compact
+    * VDM window, reserving the finite alias aperture for addresses outside it. */
+   bool need_vdm_alias = class == HK_CMD_SLAB_VDM;
+   if (class == HK_CMD_SLAB_VDM_GPU &&
+       hk_g17p_vdm_low_window_enabled(&dev->dev)) {
+      uint64_t start_compact = 0, end_compact = 0;
+      need_vdm_alias =
+         !agx_g17p_vdm_payload_compact(slab->bo->va->addr, &start_compact) ||
+         !agx_g17p_vdm_payload_compact(slab->bo->va->addr + slab->bo->size - 4,
+                                       &end_compact) ||
+         start_compact >= (UINT64_C(1) << 40) ||
+         end_compact >= (UINT64_C(1) << 40);
+   }
+   if (need_vdm_alias) {
       slab->alias = hk_g17p_vdm_alias_alloc(&dev->dev, slab->bo->size);
       const uint32_t bind = DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE;
       if (!slab->alias || agx_bo_bind(&dev->dev, slab->bo, slab->alias,
@@ -244,7 +279,9 @@ hk_cmd_pool_alloc_span(struct hk_cmd_pool *pool, enum hk_cmd_slab_class class,
                        struct hk_vdm_allocation **allocation)
 {
    struct hk_device *dev = hk_cmd_pool_device(pool);
-   if (!size || size > HK_CMD_BO_SIZE || !alignment || !ptr || !allocation)
+   const bool gpu_only = hk_cmd_slab_is_gpu_only(class);
+   const uint64_t max_size = gpu_only ? HK_CMD_SLAB_MAX_SIZE : HK_CMD_BO_SIZE;
+   if (!size || size > max_size || !alignment || !ptr || !allocation)
       return vk_error(pool, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    simple_mtx_lock(&dev->vdm.lock);
@@ -257,11 +294,12 @@ hk_cmd_pool_alloc_span(struct hk_cmd_pool *pool, enum hk_cmd_slab_class class,
          owner = slab;
          break;
       }
-      list_move_to(&slab->link, &dev->vdm.full[class]);
+      if (!gpu_only || size <= HK_CMD_BO_SIZE)
+         list_move_to(&slab->link, &dev->vdm.full[class]);
    }
 
    if (!owner) {
-      owner = hk_device_create_vdm_slab(dev, class);
+      owner = hk_device_create_vdm_slab(dev, class, size);
       if (!owner) {
          simple_mtx_unlock(&dev->vdm.lock);
          return vk_error(pool, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -291,7 +329,8 @@ hk_cmd_pool_alloc_span(struct hk_cmd_pool *pool, enum hk_cmd_slab_class class,
    };
    *ptr = (struct agx_ptr){
       .gpu = addr,
-      .cpu = (uint8_t *)owner->map + (addr - owner->bo->va->addr),
+      .cpu = owner->map ? (uint8_t *)owner->map + (addr - owner->bo->va->addr)
+                        : NULL,
    };
    *allocation = lease;
    simple_mtx_unlock(&dev->vdm.lock);
@@ -569,6 +608,8 @@ void
 hk_cmd_pool_clean_vdm(const struct hk_vdm_allocation *allocation)
 {
    const struct hk_vdm_slab *slab = allocation->slab;
+   if (!slab->map)
+      return;
    util_flush_range_no_fence(
       (uint8_t *)slab->map + (allocation->addr - slab->bo->va->addr),
       allocation->size);
