@@ -458,3 +458,45 @@ TEST(RegisterAllocate, FindRegsSimpleWordBoundaryMasks)
       }
    }
 }
+
+TEST(PressureCSE, NormfltDistinguishesFormatAndChannels)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_index src = agx_preload(b, agx_register(0, AGX_SIZE_16));
+
+   agx_index u8_pair_a = agx_temp(b->shader, AGX_SIZE_16);
+   u8_pair_a.channels_m1 = 1;
+   agx_normflt_agx3_to(b, u8_pair_a, src, AGX_FORMAT_U8NORM);
+
+   agx_index u8_pair_b = agx_temp(b->shader, AGX_SIZE_16);
+   u8_pair_b.channels_m1 = 1;
+   agx_normflt_agx3_to(b, u8_pair_b, src, AGX_FORMAT_U8NORM);
+
+   agx_index s8_pair = agx_temp(b->shader, AGX_SIZE_16);
+   s8_pair.channels_m1 = 1;
+   agx_normflt_agx3_to(b, s8_pair, src, AGX_FORMAT_S8NORM);
+
+   agx_index u8_scalar = agx_temp(b->shader, AGX_SIZE_16);
+   u8_scalar.channels_m1 = 0;
+   agx_normflt_agx3_to(b, u8_scalar, src, AGX_FORMAT_U8NORM);
+
+   agx_instr *use_a = agx_unit_test(b, u8_pair_a);
+   agx_instr *use_b = agx_unit_test(b, u8_pair_b);
+   agx_instr *use_s8 = agx_unit_test(b, s8_pair);
+   agx_instr *use_scalar = agx_unit_test(b, u8_scalar);
+
+   agx_opt_cse(b->shader);
+   agx_dce(b->shader, true);
+
+   /* Identical normflt ops merge; differing format or channels_m1 stay distinct. */
+   EXPECT_TRUE(agx_is_equiv(use_a->src[0], use_b->src[0]));
+   EXPECT_FALSE(agx_is_equiv(use_a->src[0], use_s8->src[0]));
+   EXPECT_FALSE(agx_is_equiv(use_a->src[0], use_scalar->src[0]));
+
+   unsigned normflt_count = 0;
+   agx_foreach_instr_global(b->shader, I)
+      normflt_count += I->op == AGX_OPCODE_NORMFLT_AGX3;
+   EXPECT_EQ(normflt_count, 3u);
+   ralloc_free(mem);
+}
