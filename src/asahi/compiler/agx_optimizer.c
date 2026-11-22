@@ -351,6 +351,41 @@ image_write_source_can_be_immediate(agx_instr *I, unsigned s)
  * the integer 48, a denormal that reads as 0.0. That zeroed the coverage
  * multiplier of Skia's FillRRectOp (Chromium canvas fillRect and arcs
  * vanished). The constant stays in a register. */
+/* U8_TO_F reads only the low 8 bits of its 16-bit source register. When an
+ * unpacked byte lane masks with 0xff before converting to float, drop the
+ * mask and convert directly from the raw packed half register. */
+static void
+agx_optimizer_convert_u8(agx_context *ctx, agx_instr **defs, agx_instr *I)
+{
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
+       ctx->key->dev.emit_agx3d || I->op != AGX_OPCODE_CONVERT ||
+       I->dest[0].size != AGX_SIZE_32 ||
+       I->src[0].type != AGX_INDEX_IMMEDIATE ||
+       (I->src[0].value != AGX_CONVERT_U8_TO_F &&
+        I->src[0].value != AGX_CONVERT_U16_TO_F) ||
+       I->src[1].type != AGX_INDEX_NORMAL ||
+       I->src[1].size != AGX_SIZE_16 || I->src[1].abs || I->src[1].neg)
+      return;
+
+   agx_instr *def = defs[I->src[1].value];
+   if (!def || def->op != AGX_OPCODE_BITOP ||
+       def->truth_table != UTIL_LUT2(a & b) ||
+       def->dest[0].size != AGX_SIZE_16)
+      return;
+
+   for (unsigned s = 0; s < 2; ++s) {
+      agx_index mask = def->src[s];
+      agx_index val = def->src[1 - s];
+      if (mask.type == AGX_INDEX_IMMEDIATE && mask.value == 0xff &&
+          val.type == AGX_INDEX_NORMAL && val.size == AGX_SIZE_16 &&
+          !val.abs && !val.neg && !val.memory) {
+         I->src[0] = agx_immediate(AGX_CONVERT_U8_TO_F);
+         I->src[1] = val;
+         return;
+      }
+   }
+}
+
 static void
 agx_optimizer_minifloat_select(agx_context *ctx, agx_instr **defs,
                                agx_instr *I)
@@ -1841,6 +1876,7 @@ agx_optimizer_forward(agx_context *ctx)
           I->op != AGX_OPCODE_UNIFORM_STORE && I->op != AGX_OPCODE_EXPORT)
          agx_optimizer_inline_imm(ctx, defs, I);
 
+      agx_optimizer_convert_u8(ctx, defs, I);
       agx_optimizer_minifloat_select(ctx, defs, I);
 
       /* Inlining a constant into fmov can leave two minifloat operands.

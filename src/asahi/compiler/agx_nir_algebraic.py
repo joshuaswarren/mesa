@@ -521,6 +521,23 @@ def u8_absdiff():
 # M5 converts an unsigned byte or half in a half register to f32 directly. A
 # zero-extended value converts exactly as signed or unsigned, so the widening
 # copy is not needed.
+# Canonicalize constant offsets across integer subtractions so unrolled
+# diagonal address expressions like (a + c1) - (b + c2) CSE onto (a - b) + (c1 - c2).
+reassoc_const_offsets = [
+    (('ineg@32', ('iadd@32(is_used_once)', 'a(is_not_const)', '#c')),
+     ('iadd', ('ineg', a), ('ineg', c))),
+    (('iadd@32', ('iadd@32(is_used_once)', 'a(is_not_const)', '#c'), ('iadd@32(is_used_once)', 'b(is_not_const)', '#d')),
+     ('iadd', ('iadd', a, b), ('iadd', c, d))),
+    (('iadd@32', ('iadd@32(is_used_once)', 'a(is_not_const)', '#c'), 'b(is_not_const)'),
+     ('iadd', ('iadd', a, b), c)),
+    (('isub@32', ('iadd@32', 'a(is_not_const)', '#c'), ('iadd@32', 'b(is_not_const)', '#d')),
+     ('iadd', ('isub', a, b), ('isub', c, d))),
+    (('isub@32', 'a(is_not_const)', ('iadd@32', 'b(is_not_const)', '#c')),
+     ('iadd', ('isub', a, b), ('ineg', c))),
+    (('isub@32', ('iadd@32', 'a(is_not_const)', '#c'), 'b(is_not_const)'),
+     ('iadd', ('isub', a, b), c)),
+]
+
 m5_narrow_to_float = [
     (('i2f32', ('u2u32', 'a@8')), ('u2f32', a)),
     (('u2f32', ('u2u32', 'a@8')), ('u2f32', a)),
@@ -610,6 +627,8 @@ agx_u8_absdiff_uses_match(const nir_alu_instr *instr)
                                       u8_absdiff()).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_opt_m5_narrow_to_float",
                                       m5_narrow_to_float).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_reassoc_const_offsets",
+                                      reassoc_const_offsets).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_algebraic_late",
                                       fuse_extr + fuse_ubfe +
                                       fuse_imad + ixor_bcsel +

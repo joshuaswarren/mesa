@@ -8724,7 +8724,8 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
       /* As for i2f below: the unsigned-byte float32 conversion reads only
        * the low eight bits of its half (agx_nir_fold_ubyte_to_float). */
       if (src_sz == 8 && sz == 32 &&
-          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
           !agx_is_g18g(&b->shader->key->dev)) {
          nir_alu_instr *narrow = nir_src_as_alu(instr->src[0].src);
          if (narrow &&
@@ -10403,18 +10404,41 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * occupancy (AGX3C) or Dynamic Caching register pressure (AGX3B). */
    const bool agx3_compute_opts = agx3_unroll && !g18_scans;
    if (agx3_compute_opts) {
+      bool jammed = false;
+      NIR_PASS(jammed, nir, agx_nir_unroll_and_jam, m5_unroll_factor,
+               m5_unroll_widest);
+      if (jammed)
+         agx_optimize_loop_nir(nir, m5, g17p, agx3_unroll);
+
       bool unrolled = false;
       NIR_PASS(unrolled, nir, agx_nir_unroll_runtime_loops, m5_unroll_factor,
                320, m5_unroll_widest);
       if (unrolled)
          agx_optimize_loop_nir(nir, m5, g17p, agx3_unroll);
+      if (jammed || unrolled) {
+         bool reassoc = false;
+         NIR_PASS(reassoc, nir, agx_nir_reassoc_const_offsets);
+         if (reassoc) {
+            NIR_PASS(_, nir, nir_opt_constant_folding);
+            NIR_PASS(_, nir, nir_opt_algebraic);
+            NIR_PASS(_, nir, nir_opt_cse);
+            NIR_PASS(_, nir, nir_opt_dce);
+         }
+      }
    }
 
    if (agx3_compute_opts)
       NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
 
-   /* Absolute differences of unsigned bytes in 16-bit arithmetic. */
+   /* Bit-exact FP32-blocked u8 absolute-difference sums when u8 operands are
+    * reused across terms, followed by 16-bit integer narrowing for the rest. */
    if (agx3_compute_opts) {
+      bool fp_absdiff = false;
+      NIR_PASS(fp_absdiff, nir, agx_nir_opt_u8_absdiff_fp);
+      if (fp_absdiff) {
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
       bool narrowed = false;
       NIR_PASS(narrowed, nir, agx_nir_opt_u8_absdiff);
       if (narrowed) {
