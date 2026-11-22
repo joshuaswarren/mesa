@@ -455,6 +455,14 @@ enum drm_asahi_feature {
 #define DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT ((1ULL) << 38)
 
 /*
+ * DRM_ASAHI_FEATURE_ASYNC_SUBMIT: QUEUE_CREATE accepts
+ * DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT. Reported by GPUs whose submissions
+ * otherwise return only once they have retired (G18). A feature bit like
+ * those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_ASYNC_SUBMIT ((1ULL) << 39)
+
+/*
  * DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE: the render-start VDM barrier at the
  * root of a render's VDM stream may set the USC cache invalidate (bit 3).
  * Reported on every GPU: the kernel's stream checks admit the barrier word
@@ -1053,12 +1061,32 @@ enum drm_asahi_priority {
 	DRM_ASAHI_PRIORITY_REALTIME = 3,
 };
 
+/** Queue creation flags. */
+enum drm_asahi_queue_create_flags {
+	/**
+	 * @DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT: A submission to this queue
+	 * with at least one output sync returns once it is accepted, before
+	 * it runs; its output syncs signal when it retires, and userspace
+	 * waits for them before it reads anything the submission writes. A
+	 * submission without output syncs still returns only once it and
+	 * every earlier submission of the queue have retired. An accepted
+	 * submission that fails later signals its outputs with the error,
+	 * and the queue's next submission fails with it; a client that does
+	 * not submit again learns of it only from its outputs, so it checks
+	 * their error before it reads what the submission wrote. Requires
+	 * DRM_ASAHI_FEATURE_ASYNC_SUBMIT. On a GPU that reports it, a
+	 * submission to a queue without the flag returns only once it has
+	 * retired.
+	 */
+	DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT = (1U << 0),
+};
+
 /**
  * struct drm_asahi_queue_create - Arguments passed to
  * DRM_IOCTL_ASAHI_QUEUE_CREATE
  */
 struct drm_asahi_queue_create {
-	/** @flags: MBZ */
+	/** @flags: Zero or more of drm_asahi_queue_create_flags */
 	__u32 flags;
 
 	/** @vm_id: The ID of the VM this queue is bound to */

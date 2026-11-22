@@ -1729,9 +1729,10 @@ agx_create_command_queue(struct agx_device *dev,
    return agx_create_command_queue_with_render_scs(dev, priority, layouts);
 }
 
-uint32_t
-agx_create_command_queue_with_render_scs(struct agx_device *dev,
-   enum drm_asahi_priority priority, const uint64_t layouts[2])
+static uint32_t
+agx_create_queue(struct agx_device *dev, enum drm_asahi_priority priority,
+                 const uint64_t layouts[2], uint32_t flags,
+                 uint32_t *created_flags)
 {
    if (dev->debug & AGX_DBG_1QUEUE) {
       // Abuse this lock for this, it's debug only anyway
@@ -1739,15 +1740,21 @@ agx_create_command_queue_with_render_scs(struct agx_device *dev,
       if (dev->queue_id) {
          /* The shared queue serves a later caller only if it was created with
           * every render SCS layout that caller needs (Vulkan's first queue
-          * brings the ray-query layout; GL needs none). */
+          * brings the ray-query layout; GL needs none) and with no flag the
+          * caller did not ask for (an async queue for a caller that reads
+          * results right after a submission). */
          const bool covered =
             (!layouts[0] || layouts[0] == dev->queue_layouts[0]) &&
-            (!layouts[1] || layouts[1] == dev->queue_layouts[1]);
+            (!layouts[1] || layouts[1] == dev->queue_layouts[1]) &&
+            !(dev->queue_flags & ~flags);
+         const uint32_t shared_flags = dev->queue_flags;
          simple_mtx_unlock(&dev->vma_lock);
          if (!covered) {
             errno = EINVAL;
             return UINT32_MAX;
          }
+         if (created_flags)
+            *created_flags = shared_flags;
          return dev->queue_id;
       }
    }
@@ -1755,6 +1762,7 @@ agx_create_command_queue_with_render_scs(struct agx_device *dev,
    const bool timeout = dev->compute_timeout_ms &&
                         (dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT);
    struct drm_asahi_queue_create queue_create = {
+      .flags = flags,
       .vm_id = dev->vm_id,
       .priority = priority,
       .usc_exec_base = dev->shader_base,
@@ -1784,10 +1792,34 @@ agx_create_command_queue_with_render_scs(struct agx_device *dev,
       dev->queue_priority = priority;
       dev->queue_layouts[0] = layouts[0];
       dev->queue_layouts[1] = layouts[1];
+      dev->queue_flags = flags;
       simple_mtx_unlock(&dev->vma_lock);
    }
 
+   if (created_flags)
+      *created_flags = flags;
    return queue_create.queue_id;
+}
+
+uint32_t
+agx_create_command_queue_with_render_scs(struct agx_device *dev,
+   enum drm_asahi_priority priority, const uint64_t layouts[2])
+{
+   return agx_create_queue(dev, priority, layouts, 0, NULL);
+}
+
+uint32_t
+agx_create_async_command_queue(struct agx_device *dev,
+                               enum drm_asahi_priority priority, bool *async)
+{
+   const uint64_t layouts[2] = {0};
+   const bool offered = dev->params.features & DRM_ASAHI_FEATURE_ASYNC_SUBMIT;
+   uint32_t flags = 0;
+   const uint32_t id =
+      agx_create_queue(dev, priority, layouts,
+                       offered ? DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT : 0, &flags);
+   *async = id != UINT32_MAX && (flags & DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT);
+   return id;
 }
 
 int

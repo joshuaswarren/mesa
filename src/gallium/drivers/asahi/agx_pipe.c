@@ -2292,14 +2292,16 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    else if (flags & (PIPE_CONTEXT_HIGH_PRIORITY | PIPE_CONTEXT_REALTIME_PRIORITY))
       priority = DRM_ASAHI_PRIORITY_HIGH;
 
-   ctx->queue_id = agx_create_command_queue(agx_device(screen), priority);
+   ctx->queue_id = agx_create_async_command_queue(agx_device(screen), priority,
+                                                  &ctx->async_submit);
 
    /* HIGH requires backend support and CAP_SYS_NICE or DRM master;
     * otherwise fall back to MEDIUM.
     */
    if (ctx->queue_id == UINT32_MAX && priority == DRM_ASAHI_PRIORITY_HIGH) {
       priority = DRM_ASAHI_PRIORITY_MEDIUM;
-      ctx->queue_id = agx_create_command_queue(agx_device(screen), priority);
+      ctx->queue_id = agx_create_async_command_queue(
+         agx_device(screen), priority, &ctx->async_submit);
    }
    if (ctx->queue_id == UINT32_MAX) {
       u_upload_destroy(pctx->stream_uploader);
