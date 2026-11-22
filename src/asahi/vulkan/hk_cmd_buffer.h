@@ -632,6 +632,11 @@ struct hk_rendering_state {
     * hk_g17p_note_first_draw(). */
    bool first_draw_seen;
    uint8_t color_covered;
+
+   /* An in-pass BY_REGION barrier with INPUT_ATTACHMENT_READ_BIT was kept in
+    * this physical stream assuming tile-memory reads. Any subsequent draw that
+    * falls back to texture-backed input attachment reads must split first. */
+   bool kept_local_read_barrier;
 };
 
 struct hk_index_buffer_state {
@@ -926,6 +931,7 @@ struct hk_graphics_state {
    struct {
       struct hk_shader *shader;
       struct hk_fast_link_key_fs key;
+      uint64_t desc_gen;
       bool valid;
       /* Colour attachments the linked fragment program writes, and whether
        * it reads the tilebuffer. */
@@ -2824,6 +2830,7 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
    }
 
    cmd->current_cs.gfx = NULL;
+   cmd->state.gfx.render.kept_local_read_barrier = false;
 
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.pre_gfx);
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
