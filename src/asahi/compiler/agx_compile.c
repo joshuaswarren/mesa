@@ -16528,6 +16528,11 @@ agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
        !key->dev.emit_agx3d)
       NIR_PASS(_, nir, agx_nir_narrow_single_subgroup_barriers);
+   /* Larger workgroups: the barriers whose shared traffic stays in
+    * subgroup 0, such as a tree reduction's last five steps. */
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !key->dev.emit_agx3d)
+      NIR_PASS(_, nir, agx_nir_narrow_subgroup0_barriers);
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       nir_print_shader(nir, stdout);

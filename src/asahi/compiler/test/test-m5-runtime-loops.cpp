@@ -866,3 +866,163 @@ TEST(M5RuntimeLoops, ExactTailShapes)
       ralloc_free(s);
    }
 }
+
+/* A 64-wide tree reduction: s[t] = v; barrier; for off = 32, 16:
+ * if (t < off) s[t] += s[t + off]; barrier; then t == 0 reads s[0]. The
+ * first barrier orders every invocation's store: kept. The one after the
+ * off = 32 step sits between two subgroup-0 steps: narrowed. The last one
+ * has only t == 0 after it: narrowed. With a guard t < 48 nothing after the
+ * first barrier is limited to subgroup 0 and the steps keep their barriers. */
+static nir_shader *
+reduction(unsigned first_off)
+{
+   nir_builder b = compute_shader("reduction");
+   b.shader->info.workgroup_size[0] = 64;
+   b.shader->info.shared_size = 256;
+   nir_def *t = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+   nir_def *addr = nir_u2u16(&b, nir_ishl_imm(&b, t, 2));
+   nir_store_shared(&b, t, addr, .align_mul = 4);
+   nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+   for (unsigned off : {first_off, 16u}) {
+      nir_push_if(&b, nir_ult_imm(&b, t, off));
+      nir_def *other = nir_load_shared(&b, 1, 32, nir_u2u16(&b, nir_ishl_imm(&b, nir_iadd_imm(&b, t, off), 2)),
+                                       .align_mul = 4);
+      nir_def *mine = nir_load_shared(&b, 1, 32, addr, .align_mul = 4);
+      nir_store_shared(&b, nir_iadd(&b, mine, other), addr, .align_mul = 4);
+      nir_pop_if(&b, NULL);
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+   }
+   nir_push_if(&b, nir_ieq_imm(&b, t, 0));
+   nir_def *sum = nir_load_shared(&b, 1, 32, nir_imm_intN_t(&b, 0, 16), .align_mul = 4);
+   nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+   nir_pop_if(&b, NULL);
+   return b.shader;
+}
+
+static void
+barrier_scopes(nir_shader *s, mesa_scope *out, unsigned n)
+{
+   unsigned i = 0;
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_barrier && i < n)
+               out[i++] = nir_intrinsic_execution_scope(nir_instr_as_intrinsic(instr));
+         }
+      }
+   }
+   ASSERT_EQ(i, n);
+}
+
+TEST(M5NarrowBarriers, Subgroup0ReductionTail)
+{
+   nir_shader *s = reduction(32);
+   EXPECT_TRUE(agx_nir_narrow_subgroup0_barriers(s));
+   nir_validate_shader(s, "reduction");
+   mesa_scope scopes[3];
+   barrier_scopes(s, scopes, 3);
+   EXPECT_EQ(scopes[0], SCOPE_WORKGROUP);
+   EXPECT_EQ(scopes[1], SCOPE_SUBGROUP);
+   EXPECT_EQ(scopes[2], SCOPE_SUBGROUP);
+   ralloc_free(s);
+
+   s = reduction(48);
+   agx_nir_narrow_subgroup0_barriers(s);
+   barrier_scopes(s, scopes, 3);
+   EXPECT_EQ(scopes[0], SCOPE_WORKGROUP);
+   EXPECT_EQ(scopes[1], SCOPE_WORKGROUP);
+   /* Between the t < 16 step and the t == 0 read: both subgroup 0. */
+   EXPECT_EQ(scopes[2], SCOPE_SUBGROUP);
+   ralloc_free(s);
+}
+
+/* A buffer flag read before a shared-memory barrier and written after it, by
+ * a 64-wide workgroup with no shared traffic around the barrier: the
+ * rendezvous orders the read before the write across subgroups, so it keeps
+ * workgroup scope. A read-only (reorderable) read cannot observe the write:
+ * then the barrier is narrowed. */
+TEST(M5NarrowBarriers, Subgroup0OtherMemoryOrdered)
+{
+   for (bool readonly : {false, true}) {
+      nir_builder b = compute_shader("flag");
+      b.shader->info.workgroup_size[0] = 64;
+      b.shader->info.shared_size = 4;
+      nir_def *t = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *flag =
+         nir_load_global(&b, 1, 32, buffer_address(&b, nir_imm_int(&b, 0)), .access = readonly ? RO_ACCESS : (gl_access_qualifier)0,
+                         .align_mul = 4);
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+      nir_push_if(&b, nir_ieq_imm(&b, t, 63));
+      nir_store_global(&b, nir_imm_int(&b, 1), buffer_address(&b, nir_imm_int(&b, 0)),
+                       .align_mul = 4);
+      nir_pop_if(&b, NULL);
+      nir_store_global(&b, flag, buffer_address(&b, nir_ishl_imm(&b, nir_iadd_imm(&b, t, 1), 2)),
+                       .align_mul = 4);
+      agx_nir_narrow_subgroup0_barriers(b.shader);
+      nir_validate_shader(b.shader, "flag barrier");
+      mesa_scope scope;
+      barrier_scopes(b.shader, &scope, 1);
+      EXPECT_EQ(scope, readonly ? SCOPE_SUBGROUP : SCOPE_WORKGROUP) << "readonly " << readonly;
+      ralloc_free(b.shader);
+   }
+}
+
+/* Shapes the pass must leave alone or survive: a buffer fence relying on the
+ * control barrier's rendezvous, a subgroup barrier next to the workgroup one,
+ * and a guard condition that is a unary op (b2b1 of a shared bool). */
+TEST(M5NarrowBarriers, Subgroup0Refusals)
+{
+   for (unsigned shape = 0; shape < 3; ++shape) {
+      nir_builder b = compute_shader("refusals");
+      b.shader->info.workgroup_size[0] = 64;
+      b.shader->info.shared_size = 256;
+      nir_def *t = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *addr = nir_u2u16(&b, nir_ishl_imm(&b, t, 2));
+      if (shape == 2) {
+         nir_def *flag = nir_b2b1(&b, nir_load_shared(&b, 1, 32, nir_imm_intN_t(&b, 252, 16),
+                                                      .align_mul = 4));
+         nir_push_if(&b, flag);
+         nir_store_shared(&b, t, addr, .align_mul = 4);
+         nir_pop_if(&b, NULL);
+      } else {
+         nir_store_shared(&b, t, addr, .align_mul = 4);
+      }
+      if (shape == 0)
+         nir_barrier(&b, .execution_scope = SCOPE_NONE, .memory_scope = SCOPE_DEVICE,
+                     .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_ssbo);
+      if (shape == 1)
+         nir_barrier(&b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+                     .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+      nir_def *other = nir_load_shared(&b, 1, 32,
+                                       nir_u2u16(&b, nir_ishl_imm(&b, nir_isub(&b, nir_imm_int(&b, 63), t), 2)),
+                                       .align_mul = 4);
+      nir_store_global(&b, other, buffer_address(&b, nir_ishl_imm(&b, t, 2)), .align_mul = 4);
+      nir_validate_shader(b.shader, "refusals before");
+      if (shape < 2) {
+         EXPECT_FALSE(agx_nir_narrow_subgroup0_barriers(b.shader));
+      } else {
+         agx_nir_narrow_subgroup0_barriers(b.shader);
+      }
+      nir_validate_shader(b.shader, "refusals after");
+      /* The workgroup barrier orders a store every invocation made: kept. */
+      unsigned workgroup = 0;
+      nir_foreach_function_impl(impl, b.shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_barrier &&
+                   nir_intrinsic_execution_scope(nir_instr_as_intrinsic(instr)) == SCOPE_WORKGROUP)
+                  ++workgroup;
+            }
+         }
+      }
+      EXPECT_EQ(workgroup, 1u) << "shape " << shape;
+      ralloc_free(b.shader);
+   }
+}

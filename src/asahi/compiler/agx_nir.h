@@ -368,6 +368,7 @@ bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,
 
 bool agx_nir_merge_global_words(struct nir_shader *shader);
 bool agx_nir_narrow_single_subgroup_barriers(struct nir_shader *shader);
+bool agx_nir_narrow_subgroup0_barriers(struct nir_shader *shader);
 bool agx_nir_fold_m5_offsets(struct nir_shader *shader);
 bool agx_nir_unroll_runtime_loops(struct nir_shader *shader, unsigned factor,
                                   unsigned max_instrs, unsigned *widest);
