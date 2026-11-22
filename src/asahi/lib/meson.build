@@ -214,6 +214,23 @@ if with_tests
     suite : ['asahi'],
   )
   test(
+    'asahi-ppp-push-merged',
+    executable(
+      'asahi-ppp-push-merged',
+      files('tests/test-ppp-push-merged.c'),
+      include_directories : [
+        inc_include, inc_src, inc_asahi, libasahi_lib_includes,
+      ],
+      dependencies : [
+        idep_nir, idep_mesautil, idep_libagx, idep_agx_pack, dep_libdrm,
+      ],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
     'asahi-i386-layout',
     executable(
       'asahi-i386-layout',
