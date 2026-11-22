@@ -10374,6 +10374,15 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (uniform_atomics)
       NIR_PASS(progress, nir, nir_opt_uniform_atomics, true);
 
+   /* Constant index addends that agx_nir_lower_address cannot see through
+    * its LEA fusion go to M5's byte offsets first. */
+   if (m5 && !g18_scans && !soft_fault) {
+      bool folded = false;
+      NIR_PASS(folded, nir, agx_nir_fold_m5_offsets);
+      if (folded)
+         NIR_PASS(_, nir, nir_opt_dce);
+   }
+
    /* Lower addressing modes. The sooner we do this, the sooner we get rid of
     * amul/aadd instructions and can let nir_opt_algebraic do its job. But we
     * want to vectorize first since nir_opt_load_store_vectorize doesn't know
