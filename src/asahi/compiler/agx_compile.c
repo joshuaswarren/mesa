@@ -3026,36 +3026,7 @@ agx_emit_image_store(agx_builder *b, nir_intrinsic_instr *instr)
        * copy kernels all declare. Select on the stored type instead: it
        * gives the same f70 for those three formats and is the rule Apple's
        * compiler is following. */
-      nir_alu_type stored =
-         nir_alu_type_get_base_type(nir_intrinsic_src_type(instr));
-      if (stored == nir_type_invalid) {
-         /* Not every producer of an image store fills in src_type. Fall back
-          * to the declared format, which says the same thing whenever it is
-          * there at all. */
-         switch (nir_intrinsic_format(instr)) {
-         case PIPE_FORMAT_R8G8B8A8_UINT:
-         case PIPE_FORMAT_R32_UINT:
-            stored = nir_type_uint;
-            break;
-         case PIPE_FORMAT_R8G8B8A8_SINT:
-         case PIPE_FORMAT_R32_SINT:
-            stored = nir_type_int;
-            break;
-         case PIPE_FORMAT_R32_FLOAT:
-         case PIPE_FORMAT_R8G8B8A8_UNORM:
-         case PIPE_FORMAT_R10G10B10A2_UNORM:
-            stored = nir_type_float;
-            break;
-         default:
-            /* Any other declared format names its data class the same way
-             * (the G18G branch below already does this): the PBE converts
-             * the four 32-bit lanes, f70 only says float or integer. */
-            if (nir_intrinsic_format(instr) != PIPE_FORMAT_NONE)
-               stored = util_format_is_pure_integer(nir_intrinsic_format(instr))
-                           ? nir_type_int : nir_type_float;
-            break;
-         }
-      }
+      nir_alu_type stored = agx_image_store_base_type(instr);
 
       switch (stored) {
       case nir_type_float:
@@ -3092,11 +3063,7 @@ agx_emit_image_store(agx_builder *b, nir_intrinsic_instr *instr)
        * A store that names no type falls back to its declared format's
        * class; with neither, it stays unnamed and the packer refuses it. */
       const enum pipe_format format = nir_intrinsic_format(instr);
-      nir_alu_type stored =
-         nir_alu_type_get_base_type(nir_intrinsic_src_type(instr));
-      if (stored == nir_type_invalid && format != PIPE_FORMAT_NONE)
-         stored = util_format_is_pure_integer(format) ? nir_type_int
-                                                      : nir_type_float;
+      nir_alu_type stored = agx_image_store_base_type(instr);
       if ((format == PIPE_FORMAT_R32_UINT || format == PIPE_FORMAT_R32_SINT) &&
           (stored == nir_type_uint || stored == nir_type_int))
          write->format = AGX_FORMAT_I32;

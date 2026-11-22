@@ -385,10 +385,221 @@ test_wide_rgba8_epilog(unsigned count, unsigned target_mask,
    return ok;
 }
 
+static bool
+test_agx3_spilled_mrt_16bit_epilog(void)
+{
+   static const struct {
+      enum pipe_format fmt;
+      nir_alu_type expected_type;
+      const char *name;
+   } cases[] = {
+      {PIPE_FORMAT_R8_UNORM, nir_type_float32, "R8_UNORM"},
+      {PIPE_FORMAT_R16G16B16A16_FLOAT, nir_type_float32, "RGBA16F"},
+      {PIPE_FORMAT_R8_SINT, nir_type_int32, "R8_SINT"},
+      {PIPE_FORMAT_R16G16B16A16_UINT, nir_type_uint32, "RGBA16UI"},
+   };
+   static const struct {
+      enum agx_chip chip;
+      enum agx_isa_encoding encoding;
+      bool emit_agx3d;
+      bool native_spills;
+      unsigned native_spill_generation;
+      unsigned emrt_heap_base;
+      const char *label;
+   } configs[] = {
+      /* Gen9 native_spills=true (pins the path whose widening was moved out
+       * of lower_native_emrt_uniforms() into agx_nir_lower_texture). */
+      {AGX_CHIP_G17P, AGX_ISA_ENCODING_AGX3B, false, true, 0, 8, "G17P-native"},
+      /* M5 Gallium one-pass MRT (rt0_resident=true, native_spills=false). */
+      {AGX_CHIP_G17G, AGX_ISA_ENCODING_AGX3C, false, false, 0, 0, "G17G-rt0"},
+      {AGX_CHIP_G17S, AGX_ISA_ENCODING_AGX3C, false, false, 0, 0, "G17S-rt0"},
+      {AGX_CHIP_G17C, AGX_ISA_ENCODING_AGX3C, false, false, 0, 0, "G17C-rt0"},
+      /* G18G native_spills=true (Gen10 descriptors, AGX3D encoding). */
+      {AGX_CHIP_G18G, AGX_ISA_ENCODING_AGX3C, true, true, 10, 0, "G18G-native"},
+   };
+
+   for (unsigned c = 0; c < ARRAY_SIZE(configs); ++c) {
+      for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+         struct agx_fs_epilog_key key = {
+            .link = {
+               .size_32 = configs[c].native_spills ? 0x1 : 0x0,
+               .loc_written = 0x7,
+            },
+            .nr_samples = 1,
+            .max_sample_size_B = configs[c].native_spills ? 16 : 0,
+            .max_bytes_per_tile = 32768,
+            .max_samples_per_tile = 2048,
+            .rt0_resident = !configs[c].native_spills,
+            .native_spills = configs[c].native_spills,
+            .native_spill_generation = configs[c].native_spill_generation,
+            .emrt_heap_base = configs[c].emrt_heap_base,
+         };
+         agx_fs_epilog_apply_device_policy(configs[c].chip, &key);
+         memset(key.remap, -1, sizeof(key.remap));
+         for (unsigned rt = 0; rt < 3; ++rt) {
+            key.remap[rt] = rt;
+            key.rt_formats[rt] =
+               (configs[c].native_spills && rt == 0)
+                  ? PIPE_FORMAT_R32G32B32A32_FLOAT
+                  : cases[i].fmt;
+            key.blend.rt[rt].colormask = 0xf;
+            key.blend.rt[rt].mode = blend_mode(false);
+         }
+
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_FRAGMENT, &agx_nir_options,
+            "AGX3 16-bit spilled MRT epilog");
+         agx_nir_fs_epilog(&b, &key);
+
+         const nir_intrinsic_op expected_op =
+            configs[c].native_spills ? nir_intrinsic_bindless_image_store
+                                     : nir_intrinsic_image_store;
+         unsigned stores = 0;
+         bool widened_ok = true;
+         nir_foreach_block(block, b.impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != expected_op)
+                  continue;
+               stores++;
+               widened_ok &= intr->src[3].ssa->bit_size == 32 &&
+                             nir_intrinsic_src_type(intr) ==
+                                cases[i].expected_type;
+            }
+         }
+
+         if (configs[c].chip == AGX_CHIP_G17P)
+            agx_nir_lower_g17p_1x_tile_samples(b.shader);
+         else if (configs[c].chip == AGX_CHIP_G18G)
+            agx_nir_lower_g18_tile_samples(b.shader, 1);
+
+         agx_preprocess_nir(b.shader);
+         struct agx_shader_key backend = {
+            .dev.encoding = configs[c].encoding,
+            .dev.emit_agx3d = configs[c].emit_agx3d,
+            .dev.chip = configs[c].chip,
+            .secondary = true,
+         };
+         struct agx_shader_part part = {0};
+         bool compiled =
+            agx_compile_shader_nir(b.shader, &backend, &part) && part.binary;
+         free(part.binary);
+         ralloc_free(b.shader);
+
+         if (stores != 2 || !widened_ok || !compiled) {
+            fprintf(stderr,
+                    "AGX3 16-bit spilled MRT epilog failed (%s %s, stores=%u "
+                    "widened=%u compiled=%u)\n",
+                    configs[c].label, cases[i].name, stores, widened_ok,
+                    compiled);
+            return false;
+         }
+      }
+   }
+
+   return true;
+}
+
+static bool
+test_agx3_image_store_widening(void)
+{
+   static const struct {
+      nir_alu_type in_type;
+      enum pipe_format fmt;
+      nir_alu_type expected_type;
+      nir_op expected_op;
+   } cases[] = {
+      {nir_type_float16, PIPE_FORMAT_R16G16B16A16_FLOAT, nir_type_float32,
+       nir_op_f2f32},
+      {nir_type_int16, PIPE_FORMAT_R16G16B16A16_SINT, nir_type_int32,
+       nir_op_i2i32},
+      {nir_type_uint16, PIPE_FORMAT_R16G16B16A16_UINT, nir_type_uint32,
+       nir_op_u2u32},
+      {nir_type_invalid, PIPE_FORMAT_R8_SINT, nir_type_int32, nir_op_i2i32},
+      {nir_type_invalid, PIPE_FORMAT_R8_UINT, nir_type_uint32, nir_op_u2u32},
+      {nir_type_invalid, PIPE_FORMAT_R8_UNORM, nir_type_float32, nir_op_f2f32},
+   };
+   static const unsigned gens[] = {0, 9, 10};
+
+   for (unsigned g = 0; g < ARRAY_SIZE(gens); ++g) {
+      const unsigned gen = gens[g];
+      for (unsigned bindless = 0; bindless < 2; ++bindless) {
+         for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+            nir_builder b = nir_builder_init_simple_shader(
+               MESA_SHADER_COMPUTE, &agx_nir_options, "image store widen");
+            nir_def *coord = nir_imm_ivec4(&b, 1, 2, 0, 0);
+            nir_def *sample = nir_imm_intN_t(&b, 0, 16);
+            nir_def *lod = nir_imm_intN_t(&b, 0, 16);
+            nir_def *val = nir_load_preamble(&b, 4, 16, .base = 0);
+            if (bindless) {
+               nir_def *handle =
+                  nir_bindless_image_agx(&b, nir_imm_int(&b, 0), .desc_set = 0);
+               nir_bindless_image_store(&b, handle, coord, sample, val, lod,
+                                        .image_dim = GLSL_SAMPLER_DIM_2D,
+                                        .format = cases[i].fmt,
+                                        .src_type = cases[i].in_type);
+            } else {
+               nir_image_store(&b, nir_imm_intN_t(&b, 1, 16), coord, sample,
+                               val, lod, .image_dim = GLSL_SAMPLER_DIM_2D,
+                               .format = cases[i].fmt,
+                               .src_type = cases[i].in_type);
+            }
+
+            agx_nir_lower_texture_for_generation(b.shader, gen);
+
+            bool found = false;
+            bool ok = false;
+            nir_foreach_block(block, b.impl) {
+               nir_foreach_instr(instr, block) {
+                  if (instr->type != nir_instr_type_intrinsic)
+                     continue;
+                  nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+                  if (intr->intrinsic != nir_intrinsic_image_store &&
+                      intr->intrinsic != nir_intrinsic_bindless_image_store)
+                     continue;
+                  found = true;
+                  if (gen == 0) {
+                     ok = intr->src[3].ssa->bit_size == 16 &&
+                          nir_intrinsic_src_type(intr) == cases[i].in_type;
+                  } else {
+                     nir_instr *def_instr = nir_def_instr(intr->src[3].ssa);
+                     ok = intr->src[3].ssa->bit_size == 32 &&
+                          nir_intrinsic_src_type(intr) ==
+                             cases[i].expected_type &&
+                          def_instr->type == nir_instr_type_alu &&
+                          nir_instr_as_alu(def_instr)->op ==
+                             cases[i].expected_op;
+                  }
+               }
+            }
+            ralloc_free(b.shader);
+
+            if (!found || !ok) {
+               fprintf(stderr,
+                       "image_store widening failed gen=%u bindless=%u case=%u "
+                       "(found=%u ok=%u)\n",
+                       gen, bindless, i, found, ok);
+               return false;
+            }
+         }
+      }
+   }
+
+   return true;
+}
+
 int
 main(void)
 {
    if (!test_r11g11b10_mrt_layout())
+      return 1;
+
+   if (!test_agx3_spilled_mrt_16bit_epilog())
+      return 1;
+
+   if (!test_agx3_image_store_widening())
       return 1;
 
    if (!test_wboit_background_clear())

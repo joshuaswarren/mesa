@@ -167,14 +167,6 @@ lower_native_emrt_uniforms(nir_builder *b, nir_intrinsic_instr *intr, void *data
    b->cursor = nir_before_instr(&intr->instr);
 
    if (intr->intrinsic == nir_intrinsic_bindless_image_store) {
-      nir_def *value = intr->src[3].ssa;
-      nir_alu_type type = nir_alu_type_get_base_type(nir_intrinsic_src_type(intr));
-      if (value->bit_size < 32) {
-         value = type == nir_type_float ? nir_f2f32(b, value) :
-                 type == nir_type_int ? nir_i2i32(b, value) : nir_u2u32(b, value);
-         nir_src_rewrite(&intr->src[3], value);
-         nir_intrinsic_set_src_type(intr, type | 32);
-      }
       /* G17P's existing bindless store consumes native 32-byte PBE records,
        * not byte offsets. Descriptor crawls retain their byte handles. */
       nir_intrinsic_instr *handle = nir_src_as_intrinsic(intr->src[0]);
