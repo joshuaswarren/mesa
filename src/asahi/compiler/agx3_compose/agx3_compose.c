@@ -28,11 +28,9 @@ static inline uint64_t wmask(unsigned width) {
    return width >= 64 ? ~0ull : (1ull << width) - 1;
 }
 
-/* A predicate that is not "field == small value". */
-static bool wide_pred_ok(const agx3_table *t, const uint64_t *fields,
-                         const agx3_pred *p)
+static inline bool pred_holds(const agx3_table *t, const agx3_pred *p,
+                              uint64_t v)
 {
-   uint64_t v = fields[p->field];
    switch (p->kind) {
    case 0: return v == p->a;
    case 1: {
@@ -44,6 +42,18 @@ static bool wide_pred_ok(const agx3_table *t, const uint64_t *fields,
    case 3: return ((v >> p->shift) & wmask(p->width)) == p->a;
    default: return false;
    }
+}
+
+bool agx3_pred_holds(const agx3_table *t, const agx3_pred *p, uint64_t v)
+{
+   return pred_holds(t, p, v);
+}
+
+/* A predicate that is not "field == small value". */
+static bool wide_pred_ok(const agx3_table *t, const uint64_t *fields,
+                         const agx3_pred *p)
+{
+   return pred_holds(t, p, fields[p->field]);
 }
 
 /* Inline, and on the table and the fields rather than the ctx, so that the
