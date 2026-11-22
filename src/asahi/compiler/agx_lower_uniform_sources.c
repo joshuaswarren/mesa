@@ -673,6 +673,66 @@ m5_native_isel_uniform(const agx_context *ctx, const agx_instr *I)
    return agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length);
 }
 
+bool
+agx3_m5_isel_accepts_uniform(const agx_context *ctx, const agx_instr *I,
+                             unsigned s, unsigned uniform, enum agx_size size)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       ctx->key->dev.emit_agx3d || ctx->is_preamble ||
+       I->op != AGX_OPCODE_ICMPSEL || s == 0 || s >= 4 || I->nr_srcs != 4 ||
+       size != AGX_SIZE_32 || (uniform & 1) || uniform >= 512)
+      return false;
+
+   agx_instr candidate = *I;
+   agx_index sources[4];
+   memcpy(sources, I->src, sizeof(sources));
+   candidate.src = sources;
+   sources[s] = agx_replace_index(sources[s], agx_uniform(uniform, size));
+   return m5_native_isel_uniform(ctx, &candidate);
+}
+
+/* On AGX3C, native uniform ISEL takes a uniform right comparand (cmp1_uniform)
+ * beside a 32-bit register left comparand. Canonicalize `u op r` to `r op' u`
+ * when that yields a native form. */
+static void
+m5_canonicalize_isel_uniform_cmp(const agx_context *ctx, agx_instr *I)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       ctx->key->dev.emit_agx3d || ctx->is_preamble ||
+       I->op != AGX_OPCODE_ICMPSEL || I->nr_srcs != 4 || I->saturate ||
+       I->invert_cond || I->src[0].type != AGX_INDEX_UNIFORM ||
+       I->src[1].type != AGX_INDEX_NORMAL)
+      return;
+
+   enum agx_icond rev;
+   switch (I->icond) {
+   case AGX_ICOND_UEQ:
+   case AGX_ICOND_SEQ:
+      rev = I->icond;
+      break;
+   case AGX_ICOND_ULT: rev = AGX_ICOND_UGT; break;
+   case AGX_ICOND_UGT: rev = AGX_ICOND_ULT; break;
+   case AGX_ICOND_SLT: rev = AGX_ICOND_SGT; break;
+   case AGX_ICOND_SGT: rev = AGX_ICOND_SLT; break;
+   default:
+      return;
+   }
+
+   agx_instr candidate = *I;
+   agx_index sources[4];
+   memcpy(sources, I->src, sizeof(sources));
+   sources[0] = I->src[1];
+   sources[1] = I->src[0];
+   candidate.src = sources;
+   candidate.icond = rev;
+   if (!m5_native_isel_uniform(ctx, &candidate))
+      return;
+
+   I->src[0] = sources[0];
+   I->src[1] = sources[1];
+   I->icond = rev;
+}
+
 void
 agx_lower_uniform_sources(agx_context *ctx)
 {
@@ -757,6 +817,7 @@ agx_lower_uniform_sources(agx_context *ctx)
          ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
          !ctx->is_preamble &&
          agx3_m5_fcmpsel_uniform_cmp0(I, &m5_fsel_cond, &m5_fsel_swap);
+      m5_canonicalize_isel_uniform_cmp(ctx, I);
       if (m5_native_isel_uniform(ctx, I)) {
          for (unsigned i = 0; i < 4; ++i)
             keep_isel_uniform[i] = I->src[i].type == AGX_INDEX_UNIFORM;
