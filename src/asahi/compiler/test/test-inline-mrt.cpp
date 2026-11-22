@@ -108,6 +108,7 @@ TEST(LocalRead, DeferredMultiBlockTileProtocol)
       const char *name;
    };
    const chip_case chips[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, "G16G"},
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, "G17P"},
       {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, "G17S"},
    };
@@ -206,6 +207,7 @@ TEST(LocalRead, DeferredMixedFormatGBuffer)
       const char *name;
    };
    const chip_case chips[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, "G16G"},
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, "G17P"},
       {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, "G17S"},
    };
@@ -293,6 +295,7 @@ TEST(LocalRead, PhaseSplitDisjointAndLoadOnly)
       const char *name;
    };
    const chip_case chips[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, "G16G"},
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, "G17P"},
       {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, "G17S"},
    };
@@ -448,14 +451,198 @@ TEST(LocalRead, PhaseSplitDisjointAndLoadOnly)
                                rel_nowait + rel_nowait_len),
                    end);
 
-         if (c.enc == AGX_ISA_ENCODING_AGX3B) {
-            uint8_t rel_slot6[AGX3_PIXEL_MAX_LENGTH], rel_slot6_len = 0;
-            ASSERT_TRUE(agx3_pixel_release(c.enc, 0xf0, false, 1u << 5,
-                                           rel_slot6, &rel_slot6_len));
-            EXPECT_NE(std::search(begin, end, rel_slot6,
-                                  rel_slot6 + rel_slot6_len),
-                      end);
+          if (c.enc == AGX_ISA_ENCODING_AGX3B) {
+             uint8_t rel_slot6[AGX3_PIXEL_MAX_LENGTH], rel_slot6_len = 0;
+             ASSERT_TRUE(agx3_pixel_release(c.enc, 0xf0, false, 1u << 5,
+                                            rel_slot6, &rel_slot6_len));
+             EXPECT_NE(std::search(begin, end, rel_slot6,
+                                   rel_slot6 + rel_slot6_len),
+                       end);
+          }
+          free(part.binary);
+       }
+    }
+ }
+
+TEST(LocalRead, CapabilityPredicateAndChipGating)
+{
+   EXPECT_TRUE(agx_chip_local_read_tilebuffer(AGX_CHIP_G16G));
+   EXPECT_TRUE(agx_chip_local_read_tilebuffer(AGX_CHIP_G17P));
+   EXPECT_TRUE(agx_chip_local_read_tilebuffer(AGX_CHIP_G17G));
+   EXPECT_TRUE(agx_chip_local_read_tilebuffer(AGX_CHIP_G17S));
+   EXPECT_TRUE(agx_chip_local_read_tilebuffer(AGX_CHIP_G17C));
+
+   EXPECT_FALSE(agx_chip_local_read_tilebuffer(AGX_CHIP_G13G));
+   EXPECT_FALSE(agx_chip_local_read_tilebuffer(AGX_CHIP_G14G));
+   EXPECT_FALSE(agx_chip_local_read_tilebuffer(AGX_CHIP_G15G));
+   EXPECT_FALSE(agx_chip_local_read_tilebuffer(AGX_CHIP_G15S));
+   EXPECT_FALSE(agx_chip_local_read_tilebuffer(AGX_CHIP_G15C));
+   EXPECT_FALSE(agx_chip_local_read_tilebuffer(AGX_CHIP_G18G));
+
+   struct chip_gate_case {
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      bool emit_agx3d;
+      bool expected_ok;
+      const char *name;
+   };
+   const chip_gate_case cases[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false, true, "G16G"},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, true, "G17P"},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, true, "G17S"},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G, false, false, "G15G"},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15S, false, false, "G15S"},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true, false, "G18G"},
+   };
+
+   /* Load-only tilebuffer read (no ST_TILE) is admitted solely by the on-chip
+    * local-read protocol, so it directly verifies chip gating in the compiler. */
+   for (const auto &c : cases) {
+      SCOPED_TRACE(c.name);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "local_read gated chip");
+      agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.chip = c.chip;
+      key.dev.emit_agx3d = c.emit_agx3d;
+      key.no_preamble = true;
+      key.reserved_preamble = 8;
+      key.agx3_local_read = true;
+      key.fs.nr_samples = 1;
+
+      BITSET_SET(key.g17p_tile_partitions, 0);
+      nir_def *smask = nir_imm_intN_t(&b, 0xff, 16);
+      nir_def *g0 = nir_load_local_pixel_agx(
+         &b, 4, 32, smask, .base = 0, .format = PIPE_FORMAT_R8_UNORM,
+         .target = 0);
+      nir_store_global(&b, g0, nir_imm_int64(&b, 0x10000), .write_mask = 0xf);
+      b.shader->info.outputs_read = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+      b.shader->info.fs.uses_fbfetch_output = true;
+
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      EXPECT_EQ(agx_compile_shader_nir(b.shader, &key, &part), c.expected_ok);
+      free(part.binary);
+   }
+}
+
+TEST(LocalRead, CrossRtSwapPreservesLoadBeforeStore)
+{
+   /* Regression test for tilebuffer WAR hazard when input attachment mapping
+    * swaps render targets (e.g. pColorAttachmentInputIndices = {1, 0, 2, 3}:
+    * RT0 <- load(RT1), RT1 <- load(RT0)). NIR sink/move must never sink
+    * load_local_pixel_agx(RT0) past store_local_pixel_agx(RT0). */
+   struct chip_case {
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      const char *name;
+   };
+   const chip_case chips[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, "G16G"},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, "G17P"},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, "G17S"},
+   };
+
+   for (const auto &c : chips) {
+      for (unsigned samples : {1u, 4u}) {
+         SCOPED_TRACE(::testing::Message()
+                      << c.name << " samples=" << samples);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_FRAGMENT, &agx_nir_options, "local_read cross rt swap");
+         agx_shader_key key = {};
+         key.dev.encoding = c.enc;
+         key.dev.chip = c.chip;
+         key.no_preamble = true;
+         key.reserved_preamble = 8;
+         key.agx3_local_read = true;
+         key.fs.nr_samples = samples;
+
+         const unsigned offsets[4] = {0, 4, 8, 12};
+         for (unsigned i = 0; i < 4; ++i)
+            BITSET_SET(key.g17p_tile_partitions, offsets[i]);
+
+         nir_def *cov =
+            samples == 1 ? nir_imm_intN_t(&b, 0xff, 16)
+                         : nir_u2u16(&b, nir_load_sample_mask(&b));
+
+         for (unsigned s = 0; s < samples; ++s) {
+            nir_def *smask =
+               samples == 1
+                  ? cov
+                  : nir_iand(&b, cov, nir_imm_intN_t(&b, 1u << s, 16));
+            nir_def *in0 = nir_load_local_pixel_agx(
+               &b, 4, 32, smask, .base = static_cast<int>(offsets[1]),
+               .format = PIPE_FORMAT_R8_UNORM, .target = 1);
+            nir_def *in1 = nir_load_local_pixel_agx(
+               &b, 4, 32, smask, .base = static_cast<int>(offsets[0]),
+               .format = PIPE_FORMAT_R8_UNORM, .target = 0);
+            nir_def *in2 = nir_load_local_pixel_agx(
+               &b, 4, 32, smask, .base = static_cast<int>(offsets[2]),
+               .format = PIPE_FORMAT_R8_UNORM, .target = 2);
+            nir_def *in3 = nir_load_local_pixel_agx(
+               &b, 4, 32, smask, .base = static_cast<int>(offsets[3]),
+               .format = PIPE_FORMAT_R8_UNORM, .target = 3);
+
+            nir_store_local_pixel_agx(&b, in0, smask, nir_undef(&b, 2, 16),
+                                      .base = static_cast<int>(offsets[0]),
+                                      .write_mask = 0xf,
+                                      .format = PIPE_FORMAT_R8_UNORM,
+                                      .target = 0);
+            nir_store_local_pixel_agx(&b, in1, smask, nir_undef(&b, 2, 16),
+                                      .base = static_cast<int>(offsets[1]),
+                                      .write_mask = 0xf,
+                                      .format = PIPE_FORMAT_R8_UNORM,
+                                      .target = 1);
+            nir_store_local_pixel_agx(&b, in2, smask, nir_undef(&b, 2, 16),
+                                      .base = static_cast<int>(offsets[2]),
+                                      .write_mask = 0xf,
+                                      .format = PIPE_FORMAT_R8_UNORM,
+                                      .target = 2);
+            nir_store_local_pixel_agx(&b, in3, smask, nir_undef(&b, 2, 16),
+                                      .base = static_cast<int>(offsets[3]),
+                                      .write_mask = 0xf,
+                                      .format = PIPE_FORMAT_R8_UNORM,
+                                      .target = 3);
          }
+
+         b.shader->info.outputs_read = BITFIELD64_RANGE(FRAG_RESULT_DATA0, 4);
+         b.shader->info.outputs_written = BITFIELD64_RANGE(FRAG_RESULT_DATA0, 4);
+         b.shader->info.fs.uses_fbfetch_output = true;
+
+         /* Explicitly run NIR sink & move passes and verify no load_local_pixel
+          * was sunk past a store_local_pixel of the same sample/target. */
+         nir_opt_sink(b.shader, nir_move_all);
+         nir_opt_move(b.shader, nir_move_all);
+         unsigned seen_stores_in_sample = 0;
+         unsigned loads_in_sample = 0;
+         nir_foreach_block(block, b.impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_local_pixel_agx) {
+                  EXPECT_EQ(seen_stores_in_sample, 0u)
+                     << "WAR hazard: load_local_pixel_agx sunk past store_local_pixel_agx";
+                  loads_in_sample++;
+               } else if (intr->intrinsic == nir_intrinsic_store_local_pixel_agx) {
+                  seen_stores_in_sample++;
+                  if (seen_stores_in_sample == 4) {
+                     EXPECT_EQ(loads_in_sample, 4u);
+                     seen_stores_in_sample = 0;
+                     loads_in_sample = 0;
+                  }
+               }
+            }
+         }
+         EXPECT_EQ(seen_stores_in_sample, 0u);
+         EXPECT_EQ(loads_in_sample, 0u);
+
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+            << agx3_last_pack_refusal();
+         EXPECT_TRUE(part.info.agx3_colour_link.entry_emitted);
+         EXPECT_EQ(part.info.agx3_colour_link.colour_classes, 0x7u);
          free(part.binary);
       }
    }

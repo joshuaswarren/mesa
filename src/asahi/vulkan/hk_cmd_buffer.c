@@ -1193,7 +1193,8 @@ hk_dependency_has_host_access(const VkDependencyInfo *info)
  * proof. Never infer disjointness from different Vulkan handles alone.
  */
 static uint32_t
-hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info)
+hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
+                         bool *used_local_read)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
@@ -1239,14 +1240,14 @@ hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info
    state.depth_stencil_writes =
       state.attachment_count > state.color_attachment_count;
    state.color_input_local_read =
-      agx_chip_native_or_m5(dev->dev.chip) && render->view_mask == 0 &&
+      agx_chip_local_read_tilebuffer(dev->dev.chip) && render->view_mask == 0 &&
       cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
       !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
                          VK_RENDERING_RESUMING_BIT |
                          VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) &&
       !state.tilebuffer_spilled && !state.attachments_alias;
 
-   return hk_barrier_classify(info, &state);
+   return hk_barrier_classify_ex(info, &state, used_local_read);
 }
 
 /* Whether an image barrier discards the contents of a compressed storage
@@ -1349,22 +1350,6 @@ brl_discard_init_record(struct hk_cmd_buffer *cmd,
    cmd->pass_merge.valid = false;
 }
 
-static bool
-hk_dependency_has_input_attachment_read(const VkDependencyInfo *dep)
-{
-   for (uint32_t i = 0; i < dep->memoryBarrierCount; ++i) {
-      if (dep->pMemoryBarriers[i].dstAccessMask &
-          VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT)
-         return true;
-   }
-   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; ++i) {
-      if (dep->pImageMemoryBarriers[i].dstAccessMask &
-          VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT)
-         return true;
-   }
-   return false;
-}
-
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                        const VkDependencyInfo *pDependencyInfo)
@@ -1438,7 +1423,9 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       uint8_t src_kinds, dst_kinds;
       hk_sync_dependency_kinds(pDependencyInfo, hk_sync_image_class(cmd),
                             &src_kinds, &dst_kinds);
-      const uint32_t reasons = hk_classify_pass_barrier(cmd, pDependencyInfo);
+      bool used_local_read = false;
+      const uint32_t reasons =
+         hk_classify_pass_barrier(cmd, pDependencyInfo, &used_local_read);
       if (reasons) {
          if (hk_cmd_buffer_end_graphics(cmd)) {
             cmd->state.barrier_stats.splits++;
@@ -1448,7 +1435,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       } else {
          if (cmd->current_cs.gfx)
             cmd->state.barrier_stats.kept++;
-         if (hk_dependency_has_input_attachment_read(pDependencyInfo))
+         if (used_local_read)
             cmd->state.gfx.render.kept_local_read_barrier = true;
       }
       /* Ending an empty render can replace its clear with a CDM job. Capture

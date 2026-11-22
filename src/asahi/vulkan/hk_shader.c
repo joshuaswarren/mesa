@@ -6592,7 +6592,7 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
    if (!nir)
       return;
 
-   if (!agx_chip_native_or_m5(dev->dev.chip) || nir->info.internal ||
+   if (!agx_chip_local_read_tilebuffer(dev->dev.chip) || nir->info.internal ||
        (key && key->fs.zs_self_dep) || hk_nir_has_ray_query(nir) ||
        (nir->info.outputs_written &
         (BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
@@ -6640,17 +6640,16 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
    meta.reads_images = hk_shader_reads_images(nir);
    meta.may_kill = hk_fs_may_kill(nir);
 
-   const bool g17p = dev->dev.chip == AGX_CHIP_G17P;
    if (agx_chip_native_agx3(dev->dev.chip)) {
       nir_shader *candidate =
          !dev->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind &&
                !(features & HK_FEAT_DESCRIPTOR_BUFFER) &&
-               agx_nir_g17p_combined_sampler_candidate(nir, g17p)
+               agx_nir_g17p_combined_sampler_candidate(nir, false)
             ? nir_shader_clone(NULL, nir)
             : NULL;
       struct agx_g17p_combined_sampler_binding binding;
       if (candidate &&
-          agx_nir_lower_g17p_combined_sampler(candidate, &binding, g17p)) {
+          agx_nir_lower_g17p_combined_sampler(candidate, &binding, false)) {
          ralloc_free(nir);
          nir = candidate;
          meta.agx3_combined_sampler_valid = true;
@@ -6658,7 +6657,7 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
          set_count = 0;
       } else {
          ralloc_free(candidate);
-         if (agx_nir_lower_g17p_indexed_samplers(nir, g17p))
+         if (agx_nir_lower_g17p_indexed_samplers(nir, false))
             meta.agx3_indexed_sampler_valid = true;
       }
    } else if (agx_chip_g17_m5(dev->dev.chip) &&
@@ -6677,8 +6676,6 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
             &meta.epilog_key);
    if (agx_chip_g17_m5(dev->dev.chip)) {
       NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
-   } else if (dev->dev.chip == AGX_CHIP_G17P) {
-      NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_g17p, NULL);
    } else {
       NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
    }
@@ -7971,8 +7968,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          const bool lr_ok =
             hk_nir_scan_input_attachments(nir, &lr_info, &scanned_ia);
          has_ia |= scanned_ia;
-         if (lr_ok && agx_chip_native_or_m5(dev->dev.chip) && !mesh_fs &&
-             !nir->info.internal) {
+         if (lr_ok && agx_chip_local_read_tilebuffer(dev->dev.chip) &&
+             !mesh_fs && !nir->info.internal) {
             lr_nir = nir_shader_clone(NULL, nir);
             if (lr_nir) {
                hk_nir_lower_input_attachments_to_outputs(lr_nir);
@@ -8034,7 +8031,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       struct hk_physical_device *pdev = hk_device_physical(dev);
       struct util_dynarray ifs;
       util_dynarray_init(&ifs, NULL);
-      if (hk_find_border_emulation(nir, &ifs, dev->dev.chip == AGX_CHIP_G17P) &&
+      const bool border_g17p = dev->dev.chip == AGX_CHIP_G17P;
+      if (hk_find_border_emulation(nir, &ifs, border_g17p) &&
           ifs.size) {
          if (twin_of || p_atomic_read(&pdev->border_emulation)) {
             border_emulating = true;
@@ -8058,8 +8056,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       if (lr_nir && !border_emulating) {
          struct util_dynarray lr_ifs;
          util_dynarray_init(&lr_ifs, NULL);
-         if (hk_find_border_emulation(lr_nir, &lr_ifs,
-                                      dev->dev.chip == AGX_CHIP_G17P) &&
+         if (hk_find_border_emulation(lr_nir, &lr_ifs, border_g17p) &&
              lr_ifs.size)
             hk_drop_border_emulation(&lr_ifs);
          util_dynarray_fini(&lr_ifs);
@@ -9371,8 +9368,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       if (nir->info.stage == MESA_SHADER_FRAGMENT) {
          const bool lr_ok =
             hk_nir_scan_input_attachments(nir, &lr_infos[i], &has_ias[i]);
-         if (lr_ok && agx_chip_native_or_m5(dev->dev.chip) && !is_multiview &&
-             !has_mesh && !nir->info.internal) {
+         if (lr_ok && agx_chip_local_read_tilebuffer(dev->dev.chip) &&
+             !is_multiview && !has_mesh && !nir->info.internal) {
             lr_nirs[i] = nir_shader_clone(NULL, nir);
             if (lr_nirs[i]) {
                hk_nir_lower_input_attachments_to_outputs(lr_nirs[i]);
@@ -9858,9 +9855,9 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
        (has_fbl_source && stage != MESA_SHADER_FRAGMENT) ||
        (has_byte_stencil && stage != MESA_SHADER_COMPUTE) ||
        (has_local_read && (stage != MESA_SHADER_FRAGMENT ||
-                           !agx_chip_native_or_m5(dev->dev.chip))) ||
+                           !agx_chip_local_read_tilebuffer(dev->dev.chip))) ||
        (has_sample_lr && (!has_source || stage != MESA_SHADER_FRAGMENT ||
-                          !agx_chip_native_or_m5(dev->dev.chip))) ||
+                          !agx_chip_local_read_tilebuffer(dev->dev.chip))) ||
        (has_source && !sample_variants) ||
        (m5_sample_variants &&
         (!sample_variants || !agx_chip_g17_m5(dev->dev.chip))) ||

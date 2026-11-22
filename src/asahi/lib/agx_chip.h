@@ -1264,6 +1264,22 @@ agx_chip_has_agx3_ray_opcodes(enum agx_chip chip)
    return agx_isa_is_agx3(agx_chip_isa_encoding(chip));
 }
 
+/*
+ * Whether Borealis may keep in-pass color input-attachment reads
+ * (VK_KHR_dynamic_rendering_local_read and in-subpass self-dependencies) in
+ * on-chip tile memory via the monolithic local-read pixel-class protocol.
+ *
+ * Restricted to chips verified on physical hardware: M4 (G16G), A18 Pro /
+ * M4 Pro / M4 Max (G17P), and the M5 family (G17G, G17S, G17C). Unverified
+ * M3 (G15*) and M6 (G18G) parts remain on the DRAM fallback path.
+ */
+static inline bool
+agx_chip_local_read_tilebuffer(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G16G || chip == AGX_CHIP_G17P ||
+          agx_chip_g17_m5(chip);
+}
+
 /* Stable name for diagnostics, e.g. "G15G". Never NULL. */
 static inline const char *
 agx_chip_name(enum agx_chip chip)

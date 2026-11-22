@@ -43,9 +43,33 @@ struct hk_barrier_state {
  * satisfies the dependency; nonzero requires ending the physical render.
  * When color_input_local_read is set, BY_REGION color input attachment reads
  * stay in tile memory; depth/stencil and non-tile reads still split.
+ * When used_local_read is non-NULL, it is set to true iff the barrier stayed
+ * in the render pass (return value 0) and relied on color_input_local_read to
+ * admit an INPUT_ATTACHMENT_READ on a written color attachment.
  */
-uint32_t hk_barrier_classify(const VkDependencyInfo *info,
-                             const struct hk_barrier_state *state);
+uint32_t hk_barrier_classify_ex(const VkDependencyInfo *info,
+                                const struct hk_barrier_state *state,
+                                bool *used_local_read);
+
+static inline uint32_t
+hk_barrier_classify(const VkDependencyInfo *info,
+                    const struct hk_barrier_state *state)
+{
+   return hk_barrier_classify_ex(info, state, NULL);
+}
+
+/* Whether a kept local-read barrier must split the physical render pass before
+ * emitting a draw whose fragment shader reads input attachments via the DRAM
+ * texture path rather than on-chip tile memory. */
+static inline bool
+hk_barrier_local_read_draw_needs_split(bool kept_local_read_barrier,
+                                       bool in_meta,
+                                       bool fs_has_input_attachments,
+                                       bool uses_local_read_tile)
+{
+   return kept_local_read_barrier && !in_meta && fs_has_input_attachments &&
+          !uses_local_read_tile;
+}
 
 const char *hk_barrier_split_reason_name(enum hk_barrier_split_reason reason);
 

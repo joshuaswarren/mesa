@@ -34,7 +34,7 @@ extern "C" {
  * attachmentless layer-zero root lowering and fs.reads_layer, and to 46 when
  * AGX3 fragment binaries carry on-chip local_read NIR payloads. */
 #define HK_AGX3_SHADER_BINARY_VERSION 46u
-#define HK_CLASSIC_SHADER_BINARY_VERSION 35u
+#define HK_CLASSIC_SHADER_BINARY_VERSION 36u
 /* AGX2 binaries include attachmentless layer-zero root lowering and fs.reads_layer. */
 #define HK_AGX2_SHADER_BINARY_VERSION 37u
 

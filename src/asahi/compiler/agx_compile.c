@@ -12704,16 +12704,17 @@ agx3_order_g17p_mrt_tile_ops_strict(agx_context *ctx)
 /* Monolithic fragment shaders with on-chip tile-memory input-attachment reads
  * (local_read / subpassLoad) can read partitions they never write and contain
  * arbitrary control flow (e.g. lighting loops, per-sample unrolled loops)
- * between their tile loads and final tile stores. Admit those shapes on G17P
- * (AGX3B) and M5 (AGX3C, !emit_agx3d) under a single uniform pixel-class
- * transaction covering every touched partition. */
+ * between their tile loads and final tile stores. Admit those shapes on
+ * chips with agx_chip_local_read_tilebuffer() (G16G, G17P, and M5) under a
+ * single uniform pixel-class transaction covering every touched partition. */
 static bool
 agx3_order_g17p_local_read_tile_ops(agx_context *ctx)
 {
    if (!ctx->key->agx3_local_read || ctx->key->m5_uniform_blend)
       return false;
 
-   if ((ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B &&
+   if (!agx_chip_local_read_tilebuffer(ctx->key->dev.chip) ||
+       (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B &&
         !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
           !ctx->key->dev.emit_agx3d && ctx->key->fs.nr_samples <= 8)) ||
        ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||

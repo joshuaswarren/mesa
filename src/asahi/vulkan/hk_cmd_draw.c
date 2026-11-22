@@ -11406,7 +11406,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
       }
    }
 
-   if (fs && fs->local_read_nir && agx_chip_native_or_m5(dev->dev.chip) &&
+   if (fs && fs->local_read_nir && agx_chip_local_read_tilebuffer(dev->dev.chip) &&
        !key->epilog.native_spills && !key->epilog.blend.logicop_enable &&
        !key->epilog.blend.alpha_to_coverage &&
        !key->epilog.blend.alpha_to_one && !key->epilog.defer_api_sample_mask &&
@@ -13282,7 +13282,9 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                }
             }
          }
-         if (!on_chip) {
+         if (hk_barrier_local_read_draw_needs_split(
+                gfx->render.kept_local_read_barrier, cmd->in_meta,
+                fs->info.fs.has_input_attachments, on_chip)) {
             perf_debug(cmd, "Splitting pass for DRAM input-attachment read (lr_nir=%u lr_en=%u)",
                        fs->local_read_nir != NULL, lr_enabled);
             hk_cmd_buffer_end_graphics(cmd);
@@ -14931,9 +14933,10 @@ hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
    if (fs &&
        ((fs->local_read_nir &&
          gfx->fast_link_fs.desc_gen != desc->generation) ||
-        (gfx->render.kept_local_read_barrier &&
-         fs->info.fs.has_input_attachments &&
-         !gfx->linked[MESA_SHADER_FRAGMENT]->uses_local_read_tile)))
+        hk_barrier_local_read_draw_needs_split(
+           gfx->render.kept_local_read_barrier, cmd->in_meta,
+           fs->info.fs.has_input_attachments,
+           gfx->linked[MESA_SHADER_FRAGMENT]->uses_local_read_tile)))
       return false;
 
    if (hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,

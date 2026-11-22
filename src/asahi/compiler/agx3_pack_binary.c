@@ -10284,13 +10284,14 @@ agx3_g17p_interleaved_zs(const agx_context *ctx)
  * PIXWAIT covering all touched (loaded and/or stored) tile partitions, and one
  * final PIXREL(combined_classes, last=true) after the final unconditional store
  * or at STOP. Works for both single-sample and unrolled MSAA fragments with
- * arbitrary control flow on G17P (AGX3B) and M5 (AGX3C, !emit_agx3d). */
+ * arbitrary control flow on chips with agx_chip_local_read_tilebuffer(). */
 static struct agx3_g17p_mrt_protocol
 agx3_g17p_local_read_protocol(agx_context *ctx)
 {
    struct agx3_g17p_mrt_protocol p = {0};
 
-   if ((ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B &&
+   if (!agx_chip_local_read_tilebuffer(ctx->key->dev.chip) ||
+       (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B &&
         !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
           !ctx->key->dev.emit_agx3d && ctx->key->fs.nr_samples <= 8)) ||
        ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||
@@ -13090,6 +13091,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          enc == AGX_ISA_ENCODING_AGX3B &&
          ctx->stage == MESA_SHADER_FRAGMENT && texture_samples_left != 0;
    }
+
+   if (ctx->key->agx3_local_read &&
+       !agx_chip_local_read_tilebuffer(ctx->key->dev.chip))
+      AGX3_PACK_FAIL();
 
    /* The valid G17P colour-only corpus has one class-12 wait/store bracket.
     * Multi-RT shaders instead select read/write classes by sorted tile

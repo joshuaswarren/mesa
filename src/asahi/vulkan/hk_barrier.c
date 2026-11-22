@@ -132,7 +132,8 @@ static uint32_t
 classify_scope(const struct hk_barrier_state *state, VkDependencyFlags flags,
                VkPipelineStageFlags2 src, VkAccessFlags2 src_access,
                VkPipelineStageFlags2 dst, VkAccessFlags2 dst_access,
-               bool attachment, bool ds_attachment, bool buffer)
+               bool attachment, bool ds_attachment, bool buffer,
+               bool *used_local_read)
 {
    src = expand_stages(src, true);
    dst = expand_stages(dst, false);
@@ -217,11 +218,12 @@ classify_scope(const struct hk_barrier_state *state, VkDependencyFlags flags,
           ((src_access & VK_ACCESS_2_MEMORY_WRITE_BIT) != 0 ||
            (src & (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT)) != 0));
+      const bool allow_color_input_local_read =
+         state->color_input_local_read && !ds_attachment && !ds_src_write;
       const VkAccessFlags2 local_dst_access =
          attachment_access |
-         (state->color_input_local_read && !ds_attachment && !ds_src_write
-             ? VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT
-             : 0);
+         (allow_color_input_local_read ? VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT
+                                       : 0);
       const bool local_attachment =
          !buffer && !state->tilebuffer_spilled && !state->attachments_alias &&
          (flags & VK_DEPENDENCY_BY_REGION_BIT) &&
@@ -229,14 +231,18 @@ classify_scope(const struct hk_barrier_state *state, VkDependencyFlags flags,
          dst_access && !(dst_access & ~local_dst_access);
       if (!local_attachment)
          reasons |= REASON(TEXTURE);
+      else if (used_local_read && allow_color_input_local_read &&
+               (dst_access & VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT))
+         *used_local_read = true;
    }
 
    return reasons;
 }
 
 uint32_t
-hk_barrier_classify(const VkDependencyInfo *info,
-                    const struct hk_barrier_state *state)
+hk_barrier_classify_ex(const VkDependencyInfo *info,
+                       const struct hk_barrier_state *state,
+                       bool *used_local_read)
 {
    const VkDependencyFlags known_flags = VK_DEPENDENCY_BY_REGION_BIT |
                                          VK_DEPENDENCY_VIEW_LOCAL_BIT |
@@ -244,13 +250,15 @@ hk_barrier_classify(const VkDependencyInfo *info,
    uint32_t reasons = (info->pNext || (info->dependencyFlags & ~known_flags))
                          ? REASON(UNKNOWN)
                          : 0;
+   bool any_local_read = false;
 
    for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
       const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
       reasons |= classify_scope(
          state, info->dependencyFlags, b->srcStageMask, b->srcAccessMask,
          b->dstStageMask, b->dstAccessMask,
-         state->attachment_count || state->attachments_alias, false, false);
+         state->attachment_count || state->attachments_alias, false, false,
+         &any_local_read);
       if (b->pNext)
          reasons |= REASON(UNKNOWN);
    }
@@ -260,7 +268,7 @@ hk_barrier_classify(const VkDependencyInfo *info,
       reasons |= classify_scope(
          state, info->dependencyFlags, b->srcStageMask, b->srcAccessMask,
          b->dstStageMask, b->dstAccessMask, state->attachments_alias, false,
-         true);
+         true, &any_local_read);
       if (b->srcQueueFamilyIndex != b->dstQueueFamilyIndex)
          reasons |= REASON(OWNERSHIP);
       if (b->pNext)
@@ -283,7 +291,7 @@ hk_barrier_classify(const VkDependencyInfo *info,
       reasons |= classify_scope(state, info->dependencyFlags, b->srcStageMask,
                                 b->srcAccessMask, b->dstStageMask,
                                 b->dstAccessMask, attachment, ds_attachment,
-                                false);
+                                false, &any_local_read);
       /* Equal layouts, including UNDEFINED, are not transitions (sync2).
        * Keep all real transitions conservative; layout-specific data movement
        * is handled by the existing render continuation path. */
@@ -295,6 +303,8 @@ hk_barrier_classify(const VkDependencyInfo *info,
          reasons |= REASON(UNKNOWN);
    }
 
+   if (used_local_read)
+      *used_local_read = (reasons == 0) && any_local_read;
    return reasons;
 }
 
