@@ -18,6 +18,7 @@ libasahi_agx_files = files(
   'agx_nir_unroll_runtime_loops.c',
   'agx_nir_merge_global_words.c',
   'agx_nir_fold_m5_offsets.c',
+  'agx_nir_opt_popcount_idiom.c',
   'agx_nir_opt_select_load.c',
   'agx_nir_opt_licm.c',
   'agx_nir_opt_sink_loop_sample_uses.c',
