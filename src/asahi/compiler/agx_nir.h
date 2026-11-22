@@ -65,6 +65,7 @@ bool agx_nir_opt_flatten_loads(struct nir_shader *shader, unsigned limit,
                                unsigned max_loads);
 bool agx_nir_opt_sink_loop_sample_uses(struct nir_shader *shader);
 bool agx_nir_opt_hoist_loop_samples(struct nir_shader *shader);
+bool agx_nir_opt_factor_const_mul(struct nir_shader *shader);
 bool agx_nir_fuse_algebraic_late(struct nir_shader *shader);
 bool agx_nir_fuse_doubled_add(struct nir_shader *shader);
 bool agx_nir_fold_byte_to_float(struct nir_shader *shader);

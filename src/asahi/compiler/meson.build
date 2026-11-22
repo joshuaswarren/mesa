@@ -14,6 +14,7 @@ libasahi_agx_files = files(
   'agx_nir_scalarize_int64.c',
   'agx_nir_lower_divmod64.c',
   'agx_nir_lower_atomics.c',
+  'agx_nir_opt_factor_const_mul.c',
   'agx_nir_opt_flatten_loads.c',
   'agx_nir_opt_select_load.c',
   'agx_nir_opt_licm.c',
@@ -768,6 +769,7 @@ if with_tests
          'test/test-lower-address-wide-shift.cpp',
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',
+         'test/test-factor-const-mul.cpp',
          'test/test-flatten-loads.cpp',
          'test/test-shared-phase-cse.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives

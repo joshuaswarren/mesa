@@ -10884,6 +10884,16 @@ pre_preamble:
       NIR_PASS(late_progress, nir, agx_nir_fold_ubyte_to_float);
    }
 
+   /* Factor shared constant multipliers and shifts in integer add trees before
+    * multiply-add fusion turns them into opaque imadshl_agx instructions.
+    */
+   bool factored = false;
+   NIR_PASS(factored, nir, agx_nir_opt_factor_const_mul);
+   if (factored) {
+      late_progress = true;
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+
    /* Fuse add/sub/multiplies/shifts after running opt_algebraic_late to fuse
     * isub but before shifts are lowered.
     */
