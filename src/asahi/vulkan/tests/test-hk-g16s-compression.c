@@ -13,7 +13,7 @@
 static bool
 g16s_eligible(enum agx_chip chip, unsigned plane, const VkImageCreateInfo *info)
 {
-   return hk_hal200_compression_eligible(chip, 0x6040, plane, info, true);
+   return hk_hal200_compression_eligible(chip, 0x6040, plane, info);
 }
 
 static unsigned checks;
@@ -389,8 +389,8 @@ check_depth_arrays(void)
       i.arrayLayers = 4;
       CHECK(ELIGIBLE(i));
       CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &i) == (f == 2));
-      /* The Neo policy keeps one layer. */
-      CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i));
+      /* Depth arrays are admitted across G17P. */
+      CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i));
       i.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
       CHECK(ELIGIBLE(i));
       i.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
@@ -740,21 +740,23 @@ check_shared(void)
    CHECK(SHARED(kopper));
 }
 
-/* The M4 Max (T6041) keeps a reloaded 2x sample whole
- * (agx_chip_uncovered_tile_ms_reload_defect()), so it takes the 2x colour
- * attachments and 2x depth, nothing more of the M4 Pro's shapes. The A18 Pro
- * (T8140, "Neo") does not, and keeps its 2x images plain. */
+/* All G17P SoCs share the HAL200/Gen9 compression encodings for layered, cube
+ * and 3D colour, non-attachment MSAA colour, and single-level depth arrays.
+ * M4 Pro (T6040) and M4 Max (T6041) also keep a reloaded 2x sample whole
+ * (agx_chip_uncovered_tile_ms_reload_defect()), so they additionally admit 2x
+ * colour attachments and 2x depth, while A18 Pro (T8140) keeps 2x colour
+ * attachments and 2x depth plain. */
 static bool
 m4_max_eligible(enum agx_chip chip, unsigned plane,
                 const VkImageCreateInfo *info)
 {
-   return hk_hal200_compression_eligible(chip, 0x6041, plane, info, false);
+   return hk_hal200_compression_eligible(chip, 0x6041, plane, info);
 }
 
 static bool
 neo_eligible(enum agx_chip chip, unsigned plane, const VkImageCreateInfo *info)
 {
-   return hk_hal200_compression_eligible(chip, 0x8140, plane, info, false);
+   return hk_hal200_compression_eligible(chip, 0x8140, plane, info);
 }
 
 static bool (*volatile runtime_m4_max)(enum agx_chip, unsigned,
@@ -777,40 +779,52 @@ check_m4_max(void)
    VkImageCreateInfo c = image(VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1, rt);
    CHECK(M4_MAX(c) && NEO(c));
 
+   /* 2x colour attachments depend on !agx_chip_uncovered_tile_ms_reload_defect():
+    * admitted on M4 Pro and M4 Max, refused on A18 Pro. */
    c.samples = VK_SAMPLE_COUNT_2_BIT;
    CHECK(M4_MAX(c) && !NEO(c));
    VkImageCreateInfo x = c;
    x.samples = VK_SAMPLE_COUNT_4_BIT;
-   CHECK(!M4_MAX(x));
+   CHECK(!M4_MAX(x) && !NEO(x));
    x = c;
    x.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
-   CHECK(!M4_MAX(x));
+   CHECK(!M4_MAX(x) && !NEO(x));
    x = c;
    x.arrayLayers = 2;
-   CHECK(!M4_MAX(x));
+   CHECK(!M4_MAX(x) && !NEO(x));
+   /* Non-attachment 2x/4x MSAA colour is admitted across G17P. */
    x = c;
    x.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-   CHECK(!M4_MAX(x));
+   CHECK(M4_MAX(x) && NEO(x));
+   x.samples = VK_SAMPLE_COUNT_4_BIT;
+   CHECK(M4_MAX(x) && NEO(x));
    x = c;
    x.format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-   CHECK(!M4_MAX(x));
+   CHECK(!M4_MAX(x) && !NEO(x));
 
-   /* Layered colour stays on the M4 Pro. */
+   /* Layered, cube, and 3D colour (single-mip) are admitted across G17P. */
    x = image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, rt);
    x.arrayLayers = 6;
-   CHECK(!M4_MAX(x) && g16s_eligible(AGX_CHIP_G17P, 0, &x));
+   CHECK(M4_MAX(x) && NEO(x));
+   x.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   CHECK(M4_MAX(x) && NEO(x));
+   x = image(VK_FORMAT_R8G8B8A8_UNORM, 512, 512, 1,
+             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+   x.imageType = VK_IMAGE_TYPE_3D;
+   x.extent.depth = 8;
+   CHECK(M4_MAX(x) && NEO(x));
 
    VkImageCreateInfo d = image(VK_FORMAT_D32_SFLOAT, 1920, 1080, 1, ds);
-   CHECK(M4_MAX(d));
+   CHECK(M4_MAX(d) && NEO(d));
    d.samples = VK_SAMPLE_COUNT_2_BIT;
    CHECK(M4_MAX(d) && !NEO(d));
    d.samples = VK_SAMPLE_COUNT_4_BIT;
-   CHECK(!M4_MAX(d));
+   CHECK(!M4_MAX(d) && !NEO(d));
 
-   /* Depth arrays: M4 Pro only. */
+   /* Single-level depth arrays are admitted across G17P. */
    d = image(VK_FORMAT_D32_SFLOAT, 1024, 1024, 1, ds);
    d.arrayLayers = 4;
-   CHECK(!M4_MAX(d) && g16s_eligible(AGX_CHIP_G17P, 0, &d));
+   CHECK(M4_MAX(d) && NEO(d));
 
    /* Other chips never. */
    CHECK(!runtime_m4_max(AGX_CHIP_G14G, 0, &c));

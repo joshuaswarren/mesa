@@ -163,13 +163,13 @@ check_shape(VkFormat format, bool is_depth)
    i.imageType = VK_IMAGE_TYPE_1D;
    CHECK(!ELIGIBLE(i));
    i = base; i.imageType = VK_IMAGE_TYPE_3D;
-   CHECK(!ELIGIBLE(i));
+   CHECK(ELIGIBLE(i) == !is_depth);
    i = base; i.extent.depth = 2;
    CHECK(!ELIGIBLE(i));
    i = base; i.arrayLayers = 2;
-   CHECK(!ELIGIBLE(i));
+   CHECK(ELIGIBLE(i));
    i = base; i.arrayLayers = 6;
-   CHECK(!ELIGIBLE(i));
+   CHECK(ELIGIBLE(i));
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
       CHECK(!ELIGIBLE(i));
