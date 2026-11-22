@@ -611,12 +611,17 @@ check_main_side_effects_fence_strip(void)
    b.shader->info.outputs_written = VARYING_BIT_POS;
 
    const uint64_t atomic_addr = 0x10009000000ull;
+   const uint64_t count_addr = 0x1000a000000ull;
+   /* A run-time trip count, so no unroll limit can remove the loop before
+    * the GS lowering sees it. */
+   nir_def *trips = nir_load_global(&b, 1, 32, nir_imm_int64(&b, count_addr),
+                                    .align_mul = 4);
    nir_variable *iter = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
    nir_store_var(&b, iter, nir_imm_int(&b, 0), 1);
    nir_push_loop(&b);
    {
       nir_def *i = nir_load_var(&b, iter);
-      nir_break_if(&b, nir_uge_imm(&b, i, 64));
+      nir_break_if(&b, nir_uge(&b, i, trips));
       nir_global_atomic(&b, 32, nir_imm_int64(&b, atomic_addr),
                         nir_imm_int(&b, 1), .atomic_op = nir_atomic_op_iadd);
       nir_fence_mem_to_tex_agx(&b);
