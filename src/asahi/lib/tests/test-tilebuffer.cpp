@@ -866,11 +866,13 @@ g17p_single_sample_layout(const enum pipe_format *formats, unsigned count,
       formats, count, 1, layered, AGX_G17P_MAX_BYTES_PER_SAMPLE, 32768, 2048);
 }
 
-/* A spilled compressed render target needs in-place decompression, which
- * has no G17P build, so no compressed G17P colour format may ever spill.
- * Every renderable format takes at most 16 bytes of a sample and every
- * compressed one at most 8, so eight targets need at most 7 * 16 + 8 = 120
- * bytes, the G17P per-sample limit. Check the bound and every placement.
+/* At single-sample (1x), every renderable format takes at most 16 bytes of a
+ * sample and every compressed G17P colour format at most 8, so eight targets
+ * need at most 7 * 16 + 8 = 120 bytes, the G17P per-sample limit, and never
+ * spill. Check the 1x bound and every placement. (At 2x/4x MSAA, wide MRT
+ * framebuffers can exceed the tilebuffer byte budget and spill; Gallium
+ * pre-decompresses those targets via agx_decompress() in
+ * agx_set_framebuffer_state() instead of using in-place decompression.)
  */
 TEST(Tilebuffer, G17PCompressedColourNeverSpills)
 {
