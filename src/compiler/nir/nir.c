@@ -3272,22 +3272,6 @@ nir_op_vec(unsigned num_components)
    /* clang-format on */
 }
 
-bool
-nir_op_is_vec(nir_op op)
-{
-   switch (op) {
-   case nir_op_vec2:
-   case nir_op_vec3:
-   case nir_op_vec4:
-   case nir_op_vec5:
-   case nir_op_vec8:
-   case nir_op_vec16:
-      return true;
-   default:
-      return false;
-   }
-}
-
 nir_component_mask_t
 nir_alu_instr_src_read_mask(const nir_alu_instr *instr, unsigned src)
 {
@@ -3299,15 +3283,6 @@ nir_alu_instr_src_read_mask(const nir_alu_instr *instr, unsigned src)
       read_mask |= (1 << instr->src[src].swizzle[c]);
    }
    return read_mask;
-}
-
-unsigned
-nir_ssa_alu_instr_src_components(const nir_alu_instr *instr, unsigned src)
-{
-   if (nir_op_infos[instr->op].input_sizes[src] > 0)
-      return nir_op_infos[instr->op].input_sizes[src];
-
-   return instr->def.num_components;
 }
 
 #define CASE_ALL_SIZES(op) \
