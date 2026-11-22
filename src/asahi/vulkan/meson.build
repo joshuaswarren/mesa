@@ -62,7 +62,9 @@ hk_files = files(
   'hk_image.h',
   'hk_image_layout_core.c',
   'hk_image_layout_core.h',
+  'hk_identity_copy4.h',
   'hk_image_view.c',
+  'hk_nir_copy_identity4.c',
   'hk_image_view.h',
   'hk_instance.c',
   'hk_instance.h',
@@ -1273,5 +1275,16 @@ if with_tests
       '-Wl,--wrap=drmIoctl',
       '-Wl,--wrap=os_get_available_system_memory',
       '-Wl,--wrap=os_get_total_physical_memory']),
+    timeout : 30, suite : ['asahi'])
+endif
+
+if with_tests
+  test('hk_identity_copy4', executable('hk_identity_copy4_test',
+    files('tests/test-hk-identity-copy4.c', 'hk_nir_copy_identity4.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi],
+    dependencies : [idep_nir, idep_mesautil, idep_libagx, dep_m],
+    link_with : [libasahi_compiler],
+    link_args : [ld_args_gc_sections]),
     timeout : 30, suite : ['asahi'])
 endif

@@ -13816,7 +13816,7 @@ agx_preserve_quad_control(nir_shader *nir)
 
 static void
 agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_depth,
-                            bool g18g, bool m5, bool chip_g17p)
+                            bool g18g, bool m5, bool chip_g17p, bool defer_idiv)
 {
    if (!nir)
       return;
@@ -13905,19 +13905,24 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    agx_optimize_loop_nir(nir, !g17p && native_fragment_depth, g17p);
 
    /* Lower idiv after an optimization loop so we can constant fold more before
-    * nir_opt_idiv_const.
+    * nir_opt_idiv_const. Vulkan compute shaders on native AGX3 may defer this
+    * step during initial preprocessing so compute-kernel matchers can inspect
+    * raw idiv/udiv/irem/imod/umod ops; hk_lower_nir() always finishes lowering
+    * via agx_preprocess_nir_native() before backend compilation.
     */
-   NIR_PASS(_, nir, nir_opt_idiv_const, 16);
+   if (!defer_idiv) {
+      NIR_PASS(_, nir, nir_opt_idiv_const, 16);
 
-   nir_lower_idiv_options idiv_options = {
-      .allow_fp16 = true,
-   };
+      nir_lower_idiv_options idiv_options = {
+         .allow_fp16 = true,
+      };
 
-   NIR_PASS(_, nir, nir_lower_idiv, &idiv_options);
+      NIR_PASS(_, nir, nir_lower_idiv, &idiv_options);
 
-   /* Has to run after nir_lower_idiv */
-   NIR_PASS(_, nir, nir_shader_alu_pass, agx_nir_lower_fdiv,
-            nir_metadata_control_flow, NULL);
+      /* Has to run after nir_lower_idiv */
+      NIR_PASS(_, nir, nir_shader_alu_pass, agx_nir_lower_fdiv,
+               nir_metadata_control_flow, NULL);
+   }
 
    NIR_PASS(_, nir, nir_opt_deref);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
@@ -13996,14 +14001,21 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 void
 agx_preprocess_nir(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, false, false, false, false);
+   agx_preprocess_nir_internal(nir, false, false, false, false, false, false);
 }
 
 void
 agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip)
 {
    agx_preprocess_nir_internal(nir, true, true, false, false,
-                               chip == AGX_CHIP_G17P);
+                               chip == AGX_CHIP_G17P, false);
+}
+
+void
+agx_preprocess_nir_native_defer_idiv(nir_shader *nir, enum agx_chip chip)
+{
+   agx_preprocess_nir_internal(nir, true, true, false, false,
+                               chip == AGX_CHIP_G17P, true);
 }
 
 void
@@ -14016,7 +14028,7 @@ void
 agx_preprocess_nir_g18g(nir_shader *nir)
 {
    /* Select G18 trig without inheriting G17P subgroup/shared-memory rules. */
-   agx_preprocess_nir_internal(nir, false, false, true, false, false);
+   agx_preprocess_nir_internal(nir, false, false, true, false, false, false);
 }
 
 static bool
@@ -16580,5 +16592,11 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true, false);
+   agx_preprocess_nir_internal(nir, false, true, false, true, false, false);
+}
+
+void
+agx_preprocess_nir_m5_defer_idiv(nir_shader *nir)
+{
+   agx_preprocess_nir_internal(nir, false, true, false, true, false, true);
 }

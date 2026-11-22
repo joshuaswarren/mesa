@@ -722,12 +722,14 @@ void agx_preprocess_nir_g17p(nir_shader *nir);
 /* For any native AGX3 chip (agx_chip_native_agx3); passes validated on G17P
  * alone check chip. */
 void agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip);
+void agx_preprocess_nir_native_defer_idiv(nir_shader *nir, enum agx_chip chip);
 void agx_preprocess_nir_g18g(nir_shader *nir);
 
 /* Access private (scratch) memory in whole 32-bit words, the only width the
  * AGX3 stack protocol encodes. agx_preprocess_nir_g17p() runs it. */
 bool agx3_nir_lower_scratch_words(nir_shader *nir);
 void agx_preprocess_nir_m5(nir_shader *nir);
+void agx_preprocess_nir_m5_defer_idiv(nir_shader *nir);
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
 /* TARGET/LIVE retain their normal semantics. This flag records the proof that
