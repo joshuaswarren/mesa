@@ -486,8 +486,8 @@ typedef struct {
    /* NIR permits either sign for a zero result of this floating add. */
    bool no_signed_zero : 1;
 
-   /* M5 FCMPSEL: a selected immediate is a minifloat (native fself32), not
-    * raw integer bits. */
+   /* FCMPSEL: a selected immediate was folded as a minifloat by the optimizer
+    * (AGX3C 32-bit fself or AGX3B tied min/max), rather than raw integer bits. */
    bool fcmpsel_minifloat_select : 1;
 
    /* Output modifiers */
@@ -1452,6 +1452,29 @@ agx_is_float_src(const agx_instr *I, unsigned s)
 
    /* fcmp takes first 2 as floats but returns an integer */
    return info.is_float || (s < 2 && fcmp);
+}
+
+/* Whether an FCMPSEL is a fully tied minNum/maxNum pattern:
+ * (a LTN b) ? a : b or (a GTN b) ? a : b, with identical sizes, modifiers,
+ * and memory flags on each compare/select pair. */
+static inline bool
+agx_fcmpsel_is_tied_minmax(const agx_instr *I)
+{
+   if (I->op != AGX_OPCODE_FCMPSEL || I->nr_srcs != 4 || I->invert_cond ||
+       I->saturate ||
+       (I->fcond != AGX_FCOND_GTN && I->fcond != AGX_FCOND_LTN))
+      return false;
+
+   /* agx_is_equiv() ignores modifiers, and a modifier on one half of a tie
+    * would make the two operands different values. Require them identical. */
+   for (unsigned i = 0; i < 2; ++i) {
+      const agx_index a = I->src[i], b = I->src[i + 2];
+      if (!agx_is_equiv(a, b) || a.size != b.size || a.abs != b.abs ||
+          a.neg != b.neg || a.memory != b.memory)
+         return false;
+   }
+
+   return true;
 }
 
 /* The M5 select with a uniform first comparand that native G17G
