@@ -417,6 +417,9 @@ struct hk_device {
    } scratch;
 
    uint32_t perftest;
+   /* drirc hk_submit_batch_size: at most this many commands per kernel
+    * submission (0: the kernel and batching limits alone). */
+   unsigned submit_batch_size;
 
    struct {
       struct u_rwlock lock;

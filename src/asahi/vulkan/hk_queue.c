@@ -521,9 +521,10 @@ asahi_append_fragment_attachments(struct hk_device *dev,
 static inline unsigned
 max_commands_per_submit(struct hk_device *dev)
 {
-   return hk_drm_submit_command_limit(
+   unsigned limit = hk_drm_submit_command_limit(
       dev->dev.chip != AGX_CHIP_G13X && !HK_PERF(dev, NOBATCH),
       dev->dev.params.max_commands_per_submission);
+   return dev->submit_batch_size ? MIN2(limit, dev->submit_batch_size) : limit;
 }
 
 static VkResult
