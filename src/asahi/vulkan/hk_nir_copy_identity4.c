@@ -595,6 +595,44 @@ columns(struct im2col_params *p, nir_scalar s)
 }
 
 static bool
+columns_borderless(struct im2col_params *p, nir_scalar s)
+{
+   nir_scalar body;
+   if (const_arg(s, nir_op_iadd, 1, 1))
+      body = arg(s, 0);
+   else if (const_arg(s, nir_op_iadd, 0, 1))
+      body = arg(s, 1);
+   else
+      return false;
+
+   nir_scalar diff, stride, iw, ic, kw, kc;
+   if (!match_div(body, &diff, &stride) ||
+       !bind_im2col_param(p, IM2COL_STRIDE_WIDTH, stride))
+      return false;
+
+   nir_scalar term0, term1;
+   if (alu(diff, nir_op_isub)) {
+      term0 = arg(diff, 0);
+      term1 = arg(diff, 1);
+   } else if (alu(diff, nir_op_iadd) && alu(arg(diff, 1), nir_op_ineg)) {
+      term0 = arg(diff, 0);
+      term1 = arg(arg(diff, 1), 0);
+   } else if (alu(diff, nir_op_iadd) && alu(arg(diff, 0), nir_op_ineg)) {
+      term0 = arg(diff, 1);
+      term1 = arg(arg(diff, 0), 0);
+   } else {
+      return false;
+   }
+
+   return match_div(term0, &iw, &ic) &&
+          bind_im2col_param(p, IM2COL_INPUT_WIDTH, iw) &&
+          bind_im2col_param(p, IM2COL_CHANNELS, ic) &&
+          match_div(term1, &kw, &kc) &&
+          bind_im2col_param(p, IM2COL_KERNEL_WIDTH, kw) &&
+          bind_im2col_param(p, IM2COL_CHANNELS, kc);
+}
+
+static bool
 original_coords(struct im2col_params *p, nir_scalar tap, nir_scalar row,
                 nir_scalar x, nir_scalar y, nir_scalar *cols_out)
 {
@@ -871,6 +909,7 @@ acyclic(const struct exec_list *list, unsigned depth)
 struct access_set {
    nir_intrinsic_instr *store;
    nir_intrinsic_instr *load[2];
+   unsigned load_count;
 };
 
 static bool
@@ -918,7 +957,8 @@ collect_accesses(nir_function_impl *impl, struct access_set *accesses)
          }
       }
    }
-   return accesses->store && count == ARRAY_SIZE(accesses->load);
+   accesses->load_count = count;
+   return accesses->store && count >= 1 && count <= ARRAY_SIZE(accesses->load);
 }
 
 static bool
@@ -1016,6 +1056,46 @@ match_im2col(nir_shader *nir, struct copy_buffer *src, struct copy_buffer *dst,
       return false;
 
    nir_scalar payload = scalar(ops.store->src[1].ssa);
+   if (ops.load_count == 1) {
+      nir_intrinsic_instr *ld = ops.load[0];
+      nir_scalar src_index = {0};
+      if (payload.def != &ld->def ||
+          !inside_arm(&ld->instr.block->cf_node, bounds, false) ||
+          !match_buffer(ld, src, &src_index) ||
+          same_binding(*src, *dst) ||
+          !alu(src_index, nir_op_iadd))
+         return false;
+
+      nir_scalar ia = arg(src_index, 0), ib = arg(src_index, 1);
+      nir_scalar x = {0}, y = {0};
+      if (bind_im2col_mul(params, IM2COL_INPUT_WIDTH, ia, &y)) {
+         x = ib;
+      } else if (bind_im2col_mul(params, IM2COL_INPUT_WIDTH, ib, &y)) {
+         x = ia;
+      } else {
+         return false;
+      }
+
+      nir_scalar cols_s = {0};
+      if (!original_coords(params, tap, row, x, y, &cols_s) ||
+          !columns_borderless(params, cols_s))
+         return false;
+
+      for (unsigned i = 0; i < IM2COL_PARAM_COUNT; ++i) {
+         if (i == IM2COL_BORDER_WIDTH || i == IM2COL_BORDER_HEIGHT ||
+             i == IM2COL_INPUT_HEIGHT) {
+            if (params->bound[i])
+               return false;
+            params->off[i] = UINT16_MAX;
+         } else if (!params->bound[i]) {
+            return false;
+         }
+      }
+      if (im2col_vec4_ok)
+         *im2col_vec4_ok = true;
+      return true;
+   }
+
    nir_if *stride_branch = value_branch(payload);
    nir_scalar is_unit, unit_value, other_value;
    uint16_t s0 = 0, s1 = 0;
@@ -1877,18 +1957,27 @@ hk_nir_im2col_vec4(const nir_shader *orig)
    nir_cf_delete(&old);
    nir_builder b = nir_builder_at(nir_after_block(nir_start_block(impl)));
 
-   nir->info.workgroup_size[0] = 32;
-   nir->info.workgroup_size[1] = 4;
-   nir->info.workgroup_size[2] = 1;
+   /* 3D grid: X = kx4 (or kx for scalar), Y = out_x, Z = out_y, looping over
+    * ky = 0..kh-1. Eliminates per-thread udiv/umod on thread coordinates (gid)
+    * and keeps 8 adjacent output columns x 4 rows in the workgroup for L1 reuse.
+    * With workgroup_size.x = 4, RGB 3x3 scalar (kw=9) uses 3 X groups (12 lanes
+    * for 9 taps). A 1x1 kernel with ch=4 (kw4=1) would leave 3 of 4 X lanes
+    * idle here, though unit-stride zero-border 1x1 dispatches are routed to the
+    * flattened 1D identity_copy4 path first. */
+   nir->info.workgroup_size[0] = 4;
+   nir->info.workgroup_size[1] = 8;
+   nir->info.workgroup_size[2] = 4;
 
    nir_def *gid = nir_load_global_invocation_id(&b, 32);
-   nir_def *tap4 = nir_channel(&b, gid, 0);
-   nir_def *row = nir_channel(&b, gid, 1);
+   nir_def *gx = nir_channel(&b, gid, 0);
+   nir_def *out_x = nir_channel(&b, gid, 1);
+   nir_def *out_y = nir_channel(&b, gid, 2);
 
-   nir_def *bw = push_at(&b, p.off[IM2COL_BORDER_WIDTH], p.push_bytes);
-   nir_def *bh = push_at(&b, p.off[IM2COL_BORDER_HEIGHT], p.push_bytes);
+   const bool has_border = p.bound[IM2COL_BORDER_WIDTH];
+   nir_def *bw = has_border ? push_at(&b, p.off[IM2COL_BORDER_WIDTH], p.push_bytes) : NULL;
+   nir_def *bh = has_border ? push_at(&b, p.off[IM2COL_BORDER_HEIGHT], p.push_bytes) : NULL;
    nir_def *iw = push_at(&b, p.off[IM2COL_INPUT_WIDTH], p.push_bytes);
-   nir_def *ih = push_at(&b, p.off[IM2COL_INPUT_HEIGHT], p.push_bytes);
+   nir_def *ih = has_border ? push_at(&b, p.off[IM2COL_INPUT_HEIGHT], p.push_bytes) : NULL;
    nir_def *kw = push_at(&b, p.off[IM2COL_KERNEL_WIDTH], p.push_bytes);
    nir_def *pw = push_at(&b, p.off[IM2COL_PATCHES_WIDTH], p.push_bytes);
    nir_def *ph = push_at(&b, p.off[IM2COL_PATCHES_HEIGHT], p.push_bytes);
@@ -1896,74 +1985,177 @@ hk_nir_im2col_vec4(const nir_shader *orig)
    nir_def *sh = push_at(&b, p.off[IM2COL_STRIDE_HEIGHT], p.push_bytes);
    nir_def *ch = push_at(&b, p.off[IM2COL_CHANNELS], p.push_bytes);
 
-   nir_def *pw4 = nir_ushr_imm(&b, pw, 2);
-   nir_if *active = nir_push_if(&b, nir_iand(&b, nir_ult(&b, tap4, pw4),
-                                                 nir_ult(&b, row, ph)));
-   {
-      const enum gl_access_qualifier read = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
-      nir_def *c4 = nir_ushr_imm(&b, ch, 2);
-      nir_def *iw4 = nir_ushr_imm(&b, iw, 2);
-      nir_def *kw4 = nir_ushr_imm(&b, kw, 2);
-      nir_def *unit = nir_iand(&b, nir_ieq_imm(&b, sw, 1), nir_ieq_imm(&b, sh, 1));
-
-      nir_def *pad_x = nir_imul(&b, bw, ch);
+   /* Uniform shape math from push constants (hoisted into the preamble when
+    * preamble shaders are supported; on chips that refuse a preamble such as
+    * G17P/G16G/G15x these uniform udivs run per thread, while gid-dependent
+    * divisions are still eliminated by the 3D grid): */
+   nir_def *unit = has_border ? nir_iand(&b, nir_ieq_imm(&b, sw, 1), nir_ieq_imm(&b, sh, 1)) : NULL;
+   nir_def *pad_x = has_border ? nir_imul(&b, bw, ch) : NULL;
+   nir_def *bordered_iw = iw;
+   if (has_border) {
       nir_def *pad_x_tot = nir_bcsel(&b, unit, nir_ishl_imm(&b, pad_x, 1), pad_x);
-      nir_def *bordered_iw = nir_iadd(&b, iw, pad_x_tot);
-      nir_def *diff = nir_isub(&b, nir_udiv(&b, bordered_iw, ch), nir_udiv(&b, kw, ch));
-      nir_def *cols = nir_iadd_imm(&b, nir_udiv(&b, diff, sw), 1);
-
-      nir_def *out_x = nir_umod(&b, row, cols);
-      nir_def *out_y = nir_udiv(&b, row, cols);
-      nir_def *kx4 = nir_umod(&b, tap4, kw4);
-      nir_def *ky = nir_udiv(&b, tap4, kw4);
-
-      nir_def *x4 = nir_iadd(&b, nir_imul(&b, out_x, nir_imul(&b, sw, c4)), kx4);
-      nir_def *y = nir_iadd(&b, nir_imul(&b, out_y, sh), ky);
-
-      nir_def *zero_f = nir_imm_float(&b, 0.0f);
-      nir_def *zero_v4 = nir_vec4(&b, zero_f, zero_f, zero_f, zero_f);
-
-      nir_def *v_unit = NULL, *v_other = NULL;
-      nir_if *u_if = nir_push_if(&b, unit);
-      {
-         nir_def *pad_x4 = nir_imul(&b, bw, c4);
-         nir_def *x_in4 = nir_isub(&b, x4, pad_x4);
-         nir_def *y_in = nir_isub(&b, y, bh);
-         nir_def *in_b = nir_iand(&b, nir_ult(&b, x_in4, iw4), nir_ult(&b, y_in, ih));
-         nir_def *v_ld = NULL;
-         nir_if *ok_if = nir_push_if(&b, in_b);
-         {
-            nir_def *s_idx4 = nir_iadd(&b, nir_imul(&b, y_in, iw4), x_in4);
-            nir_def *sa = address(&b, src, s_idx4, read);
-            v_ld = nir_load_global(&b, 4, 32, sa, .align_mul = 16, .access = read);
-         }
-         nir_push_else(&b, ok_if);
-         nir_pop_if(&b, ok_if);
-         v_unit = nir_if_phi(&b, v_ld, zero_v4);
-      }
-      nir_push_else(&b, u_if);
-      {
-         nir_def *in_b = nir_iand(&b, nir_ult(&b, x4, iw4), nir_ult(&b, y, ih));
-         nir_def *v_ld = NULL;
-         nir_if *ok_if = nir_push_if(&b, in_b);
-         {
-            nir_def *s_idx4 = nir_iadd(&b, nir_imul(&b, y, iw4), x4);
-            nir_def *sa = address(&b, src, s_idx4, read);
-            v_ld = nir_load_global(&b, 4, 32, sa, .align_mul = 16, .access = read);
-         }
-         nir_push_else(&b, ok_if);
-         nir_pop_if(&b, ok_if);
-         v_other = nir_if_phi(&b, v_ld, zero_v4);
-      }
-      nir_pop_if(&b, u_if);
-      nir_def *val = nir_if_phi(&b, v_unit, v_other);
-
-      nir_def *dst_idx4 = nir_iadd(&b, nir_imul(&b, row, pw4), tap4);
-      nir_def *da = address(&b, dst, dst_idx4, ACCESS_NON_READABLE);
-      nir_store_global(&b, val, da, .align_mul = 16, .write_mask = 0xf,
-                       .access = ACCESS_NON_READABLE);
+      bordered_iw = nir_iadd(&b, iw, pad_x_tot);
    }
-   nir_pop_if(&b, active);
+   nir_def *diff = nir_isub(&b, nir_udiv(&b, bordered_iw, ch), nir_udiv(&b, kw, ch));
+   nir_def *cols = nir_iadd_imm(&b, nir_udiv(&b, diff, sw), 1);
+   nir_def *rows_y = nir_udiv(&b, ph, cols);
+   nir_def *kh = nir_udiv(&b, pw, kw);
+
+   nir_def *or_align = nir_ior(&b, nir_ior(&b, ch, iw), nir_ior(&b, kw, pw));
+   nir_def *is_vec4 = nir_ieq_imm(&b, nir_iand_imm(&b, or_align, 3), 0);
+
+   const enum gl_access_qualifier read = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
+   nir_def *zero_i = nir_imm_int(&b, 0);
+   nir_def *zero_f = nir_imm_float(&b, 0.0f);
+   nir_def *zero_v4 = nir_vec4(&b, zero_f, zero_f, zero_f, zero_f);
+
+   nir_if *v4_if = nir_push_if(&b, is_vec4);
+   {
+      nir_def *kw4 = nir_ushr_imm(&b, kw, 2);
+      nir_def *in_b = nir_iand(&b, nir_iand(&b, nir_ult(&b, gx, kw4),
+                                                nir_ult(&b, out_x, cols)),
+                                   nir_ult(&b, out_y, rows_y));
+      nir_if *active = nir_push_if(&b, in_b);
+      {
+         nir_def *pw4 = nir_ushr_imm(&b, pw, 2);
+         nir_def *c4 = nir_ushr_imm(&b, ch, 2);
+         nir_def *iw4 = nir_ushr_imm(&b, iw, 2);
+         nir_def *row = nir_iadd(&b, nir_imul(&b, out_y, cols), out_x);
+         nir_def *x4 = nir_iadd(&b, nir_imul(&b, out_x, nir_imul(&b, sw, c4)), gx);
+         nir_def *y_base = nir_imul(&b, out_y, sh);
+         nir_def *dst_base4 = nir_iadd(&b, nir_imul(&b, row, pw4), gx);
+
+         nir_def *x_eff4 = x4;
+         nir_def *y_eff0 = y_base;
+         nir_def *x_ok = NULL;
+         if (has_border) {
+            nir_def *pad_x4 = nir_imul(&b, bw, c4);
+            x_eff4 = nir_bcsel(&b, unit, nir_isub(&b, x4, pad_x4), x4);
+            y_eff0 = nir_bcsel(&b, unit, nir_isub(&b, y_base, bh), y_base);
+            x_ok = nir_ult(&b, x_eff4, iw4);
+         }
+
+         nir_loop *lp = nir_push_loop(&b);
+         lp->control = nir_loop_control_dont_unroll;
+         nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&lp->cf_node));
+         nir_block *hdr = nir_loop_first_block(lp);
+         nir_phi_instr *ky_phi = nir_phi_instr_create(b.shader);
+         nir_def_init(&ky_phi->instr, &ky_phi->def, 1, 32);
+         nir_phi_instr_add_src(ky_phi, pre, zero_i);
+         nir_phi_instr *di_phi = nir_phi_instr_create(b.shader);
+         nir_def_init(&di_phi->instr, &di_phi->def, 1, 32);
+         nir_phi_instr_add_src(di_phi, pre, dst_base4);
+
+         nir_def *ky = &ky_phi->def;
+         nir_def *dst_idx4 = &di_phi->def;
+         nir_if *done = nir_push_if(&b, nir_ige(&b, ky, kh));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, done);
+
+         nir_def *y_cur = nir_iadd(&b, y_eff0, ky);
+         nir_def *val = NULL;
+         if (has_border) {
+            nir_def *v_ld = NULL;
+            nir_if *ok_if = nir_push_if(&b, nir_iand(&b, x_ok, nir_ult(&b, y_cur, ih)));
+            {
+               nir_def *s_idx4 = nir_iadd(&b, nir_imul(&b, y_cur, iw4), x_eff4);
+               nir_def *sa = address(&b, src, s_idx4, read);
+               v_ld = nir_load_global(&b, 4, 32, sa, .align_mul = 16, .access = read);
+            }
+            nir_push_else(&b, ok_if);
+            nir_pop_if(&b, ok_if);
+            val = nir_if_phi(&b, v_ld, zero_v4);
+         } else {
+            nir_def *s_idx4 = nir_iadd(&b, nir_imul(&b, y_cur, iw4), x_eff4);
+            nir_def *sa = address(&b, src, s_idx4, read);
+            val = nir_load_global(&b, 4, 32, sa, .align_mul = 16, .access = read);
+         }
+
+         nir_def *da = address(&b, dst, dst_idx4, ACCESS_NON_READABLE);
+         nir_store_global(&b, val, da, .align_mul = 16, .write_mask = 0xf,
+                          .access = ACCESS_NON_READABLE);
+
+         nir_block *back = nir_loop_last_block(lp);
+         nir_phi_instr_add_src(ky_phi, back, nir_iadd_imm(&b, ky, 1));
+         nir_phi_instr_add_src(di_phi, back, nir_iadd(&b, dst_idx4, kw4));
+         nir_instr_insert(nir_before_block(hdr), &ky_phi->instr);
+         nir_instr_insert(nir_before_block(hdr), &di_phi->instr);
+         nir_pop_loop(&b, lp);
+      }
+      nir_pop_if(&b, active);
+   }
+   nir_push_else(&b, v4_if);
+   {
+      /* Scalar 3D fallback for non-multiple-of-4 channels/strides (e.g. RGB ch=3). */
+      nir_def *in_b = nir_iand(&b, nir_iand(&b, nir_ult(&b, gx, kw),
+                                                nir_ult(&b, out_x, cols)),
+                                   nir_ult(&b, out_y, rows_y));
+      nir_if *active = nir_push_if(&b, in_b);
+      {
+         nir_def *row = nir_iadd(&b, nir_imul(&b, out_y, cols), out_x);
+         nir_def *x = nir_iadd(&b, nir_imul(&b, out_x, nir_imul(&b, sw, ch)), gx);
+         nir_def *y_base = nir_imul(&b, out_y, sh);
+         nir_def *dst_base = nir_iadd(&b, nir_imul(&b, row, pw), gx);
+
+         nir_def *x_eff = x;
+         nir_def *y_eff0 = y_base;
+         nir_def *x_ok = NULL;
+         if (has_border) {
+            x_eff = nir_bcsel(&b, unit, nir_isub(&b, x, pad_x), x);
+            y_eff0 = nir_bcsel(&b, unit, nir_isub(&b, y_base, bh), y_base);
+            x_ok = nir_ult(&b, x_eff, iw);
+         }
+
+         nir_loop *lp = nir_push_loop(&b);
+         lp->control = nir_loop_control_dont_unroll;
+         nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&lp->cf_node));
+         nir_block *hdr = nir_loop_first_block(lp);
+         nir_phi_instr *ky_phi = nir_phi_instr_create(b.shader);
+         nir_def_init(&ky_phi->instr, &ky_phi->def, 1, 32);
+         nir_phi_instr_add_src(ky_phi, pre, zero_i);
+         nir_phi_instr *di_phi = nir_phi_instr_create(b.shader);
+         nir_def_init(&di_phi->instr, &di_phi->def, 1, 32);
+         nir_phi_instr_add_src(di_phi, pre, dst_base);
+
+         nir_def *ky = &ky_phi->def;
+         nir_def *dst_idx = &di_phi->def;
+         nir_if *done = nir_push_if(&b, nir_ige(&b, ky, kh));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, done);
+
+         nir_def *y_cur = nir_iadd(&b, y_eff0, ky);
+         nir_def *val = NULL;
+         if (has_border) {
+            nir_def *v_ld = NULL;
+            nir_if *ok_if = nir_push_if(&b, nir_iand(&b, x_ok, nir_ult(&b, y_cur, ih)));
+            {
+               nir_def *s_idx = nir_iadd(&b, nir_imul(&b, y_cur, iw), x_eff);
+               nir_def *sa = address_scalar(&b, src, s_idx, read, false);
+               v_ld = nir_load_global(&b, 1, 32, sa, .align_mul = 4, .access = read);
+            }
+            nir_push_else(&b, ok_if);
+            nir_pop_if(&b, ok_if);
+            val = nir_if_phi(&b, v_ld, zero_f);
+         } else {
+            nir_def *s_idx = nir_iadd(&b, nir_imul(&b, y_cur, iw), x_eff);
+            nir_def *sa = address_scalar(&b, src, s_idx, read, false);
+            val = nir_load_global(&b, 1, 32, sa, .align_mul = 4, .access = read);
+         }
+
+         nir_def *da = address_scalar(&b, dst, dst_idx, ACCESS_NON_READABLE, false);
+         nir_store_global(&b, val, da, .align_mul = 4, .write_mask = 1,
+                          .access = ACCESS_NON_READABLE);
+
+         nir_block *back = nir_loop_last_block(lp);
+         nir_phi_instr_add_src(ky_phi, back, nir_iadd_imm(&b, ky, 1));
+         nir_phi_instr_add_src(di_phi, back, nir_iadd(&b, dst_idx, kw));
+         nir_instr_insert(nir_before_block(hdr), &ky_phi->instr);
+         nir_instr_insert(nir_before_block(hdr), &di_phi->instr);
+         nir_pop_loop(&b, lp);
+      }
+      nir_pop_if(&b, active);
+   }
+   nir_pop_if(&b, v4_if);
 
    nir_opt_dce(nir);
    nir_shader_gather_info(nir, impl);

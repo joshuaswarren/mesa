@@ -675,9 +675,9 @@ test_im2col_bit_exact(void)
          uint32_t go[3] = { DIV_ROUND_UP((uint32_t)pw, 16), DIV_ROUND_UP((uint32_t)ph, 16), 1 };
          uint32_t gi[3] = { DIV_ROUND_UP(elems / 4, 128 * 4), 1, 1 };
          uint32_t gv[3] = {
-            DIV_ROUND_UP((uint32_t)pw / 4, vec4_alt->info.workgroup_size[0]),
-            DIV_ROUND_UP((uint32_t)ph, vec4_alt->info.workgroup_size[1]),
-            1,
+            DIV_ROUND_UP((uint32_t)kw / 4, vec4_alt->info.workgroup_size[0]),
+            DIV_ROUND_UP((uint32_t)(iw / ch), vec4_alt->info.workgroup_size[1]),
+            DIV_ROUND_UP((uint32_t)ih, vec4_alt->info.workgroup_size[2]),
          };
          hk_eval_dispatch(orig, go, so, 2, push, l->push_range);
          hk_eval_dispatch(id_alt, gi, si, 2, push, l->push_range);
@@ -698,6 +698,11 @@ test_im2col_bit_exact(void)
          { 1, 1, 7, 5, 3, 1, 1, 8 },
          { 1, 1, 9, 7, 3, 2, 2, 8 },
          { 2, 1, 6, 5, 5, 1, 1, 4 },
+         /* Scalar 3-channel RGB stride-2 and bordered non-unit-stride scalar shapes. */
+         { 1, 1, 10, 8, 3, 2, 2, 3 },
+         { 1, 1, 7, 5, 3, 1, 1, 3 },
+         { 1, 1, 11, 9, 3, 2, 3, 3 },
+         { 1, 2, 9, 8, 3, 2, 2, 5 },
       };
       for (unsigned ci = 0; ci < ARRAY_SIZE(icases); ++ci) {
          const int32_t bw = icases[ci].bw, bh = icases[ci].bh;
@@ -735,10 +740,11 @@ test_im2col_bit_exact(void)
          struct hk_eval_ssbo so[2] = { {0, 0, src, src_elems * 4}, {0, 1, dst_orig, dst_elems * 4} };
          struct hk_eval_ssbo sv[2] = { {0, 0, src, src_elems * 4}, {0, 1, dst_v4, dst_elems * 4} };
          uint32_t go[3] = { DIV_ROUND_UP((uint32_t)pw, 16), DIV_ROUND_UP((uint32_t)ph, 16), 1 };
+         const bool use_v4 = ((ch % 4) == 0 && (iw % 4) == 0 && (kw % 4) == 0 && (pw % 4) == 0);
          uint32_t gv[3] = {
-            DIV_ROUND_UP((uint32_t)pw / 4, vec4_alt->info.workgroup_size[0]),
-            DIV_ROUND_UP((uint32_t)ph, vec4_alt->info.workgroup_size[1]),
-            1,
+            DIV_ROUND_UP(use_v4 ? ((uint32_t)kw / 4) : (uint32_t)kw, vec4_alt->info.workgroup_size[0]),
+            DIV_ROUND_UP((uint32_t)cols, vec4_alt->info.workgroup_size[1]),
+            DIV_ROUND_UP((uint32_t)rows, vec4_alt->info.workgroup_size[2]),
          };
          hk_eval_dispatch(orig, go, so, 2, push, l->push_range);
          hk_eval_dispatch(vec4_alt, gv, sv, 2, push, l->push_range);
@@ -754,6 +760,278 @@ test_im2col_bit_exact(void)
    }
 }
 
+static nir_shader *
+build_borderless_im2col_shader(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &agx_nir_options, "borderless_im2col");
+   b.shader->info.workgroup_size[0] = 16;
+   b.shader->info.workgroup_size[1] = 16;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.num_ssbos = 2;
+   b.shader->num_uniforms = 36;
+
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_def *x = nir_channel(&b, gid, 0);
+   nir_def *y = nir_channel(&b, gid, 1);
+
+   nir_def *iw = load_push_u32(&b, 0, 36);
+   nir_def *kw = load_push_u32(&b, 8, 36);
+   nir_def *pw = load_push_u32(&b, 16, 36);
+   nir_def *ph = load_push_u32(&b, 20, 36);
+   nir_def *sw = load_push_u32(&b, 24, 36);
+   nir_def *sh = load_push_u32(&b, 28, 36);
+   nir_def *ch = load_push_u32(&b, 32, 36);
+
+   nir_def *oob = build_short_or(&b, nir_ige(&b, x, pw), nir_ige(&b, y, ph));
+   nir_if *guard = nir_push_if(&b, oob);
+   nir_push_else(&b, guard);
+   {
+      nir_def *cols = nir_iadd_imm(&b, nir_idiv(&b, nir_isub(&b, nir_idiv(&b, iw, ch), nir_idiv(&b, kw, ch)), sw), 1);
+      nir_def *bx = nir_imul(&b, nir_imod(&b, y, cols), sw);
+      nir_def *by = nir_imul(&b, nir_idiv(&b, y, cols), sh);
+      nir_def *ix = nir_iadd(&b, nir_imul(&b, bx, ch), nir_imod(&b, x, kw));
+      nir_def *iy = nir_iadd(&b, by, nir_idiv(&b, x, kw));
+      nir_def *s_idx = nir_iadd(&b, nir_imul(&b, iy, iw), ix);
+      nir_def *d_idx = nir_iadd(&b, nir_imul(&b, y, pw), x);
+      nir_deref_instr *sd = make_ssbo_elem_deref(&b, 0, 0, glsl_float_type(), true, s_idx);
+      nir_deref_instr *dd = make_ssbo_elem_deref(&b, 0, 1, glsl_float_type(), false, d_idx);
+      nir_def *val = nir_load_deref_with_access(&b, sd, ACCESS_NON_WRITEABLE);
+      nir_store_deref_with_access(&b, dd, val, 1, ACCESS_NON_READABLE);
+   }
+   nir_pop_if(&b, guard);
+
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   return b.shader;
+}
+
+static void
+test_borderless_im2col_bit_exact(void)
+{
+   nir_shader *orig = build_borderless_im2col_shader();
+   struct hk_identity_copy4 info = {0};
+   nir_shader *id_alt = hk_nir_copy_identity4(orig, &info);
+   HK_EVAL_CHECK(id_alt != NULL);
+   nir_validate_shader(id_alt, "borderless im2col identity alt");
+   HK_EVAL_CHECK(info.kind == HK_IDENTITY_COPY4_IM2COL_1X1);
+   HK_EVAL_CHECK(info.im2col_vec4_ok);
+   HK_EVAL_CHECK(info.border_width_offset == UINT16_MAX);
+   HK_EVAL_CHECK(info.border_height_offset == UINT16_MAX);
+   HK_EVAL_CHECK(info.input_height_offset == UINT16_MAX);
+   HK_EVAL_CHECK(info.input_width_offset == 0);
+   HK_EVAL_CHECK(info.kernel_width_offset == 8);
+   HK_EVAL_CHECK(info.patches_width_offset == 16);
+   HK_EVAL_CHECK(info.patches_height_offset == 20);
+   HK_EVAL_CHECK(info.stride_width_offset == 24);
+   HK_EVAL_CHECK(info.stride_height_offset == 28);
+   HK_EVAL_CHECK(info.channels_offset == 32);
+
+   nir_shader *vec4_alt = hk_nir_im2col_vec4(orig);
+   HK_EVAL_CHECK(vec4_alt != NULL);
+   nir_validate_shader(vec4_alt, "borderless im2col vec4 alt");
+
+   /* 1x1 identity_copy4 */
+   {
+      const int32_t w = 7, h = 5, ch = 8;
+      const int32_t iw = w * ch, kw = ch, pw = ch, ph = w * h;
+      uint32_t push[9] = { (uint32_t)iw, (uint32_t)h, (uint32_t)kw, 1, (uint32_t)pw, (uint32_t)ph, 1, 1, (uint32_t)ch };
+      const uint32_t elems = (uint32_t)(iw * h);
+      uint32_t *src = calloc(elems, 4), *d0 = calloc(elems, 4), *d1 = calloc(elems, 4);
+      fill_pattern_u32(src, elems, 101);
+      struct hk_eval_ssbo s0[2] = { {0, 0, src, elems * 4}, {0, 1, d0, elems * 4} };
+      struct hk_eval_ssbo s1[2] = { {0, 0, src, elems * 4}, {0, 1, d1, elems * 4} };
+      uint32_t g0[3] = { DIV_ROUND_UP((uint32_t)pw, 16), DIV_ROUND_UP((uint32_t)ph, 16), 1 };
+      uint32_t g1[3] = { DIV_ROUND_UP(elems / 4, id_alt->info.workgroup_size[0] * 4), 1, 1 };
+      hk_eval_dispatch(orig, g0, s0, 2, push, 36);
+      hk_eval_dispatch(id_alt, g1, s1, 2, push, 36);
+      HK_EVAL_CHECK(memcmp(d0, d1, elems * 4) == 0);
+      free(src); free(d0); free(d1);
+   }
+
+   /* 3x3 vec4 and scalar (ch=8 s=1, ch=8 s=2, ch=3 s=2) */
+   struct { int32_t w, h, kdim, sw, sh, ch; } cases[] = {
+      { 9, 7, 3, 1, 1, 8 },
+      { 9, 7, 3, 2, 2, 8 },
+      { 9, 7, 3, 2, 2, 3 },
+   };
+   for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ++ci) {
+      const int32_t ch = cases[ci].ch, iw = cases[ci].w * ch, ih = cases[ci].h;
+      const int32_t kw = cases[ci].kdim * ch, pw = kw * cases[ci].kdim;
+      const int32_t sw = cases[ci].sw, sh = cases[ci].sh;
+      const int32_t cols = (iw / ch - kw / ch) / sw + 1;
+      const int32_t rows = (ih - cases[ci].kdim) / sh + 1;
+      const int32_t ph = cols * rows;
+      uint32_t push[9] = { (uint32_t)iw, (uint32_t)ih, (uint32_t)kw, (uint32_t)cases[ci].kdim,
+                           (uint32_t)pw, (uint32_t)ph, (uint32_t)sw, (uint32_t)sh, (uint32_t)ch };
+      const uint32_t se = (uint32_t)(iw * ih), de = (uint32_t)(pw * ph);
+      uint32_t *src = calloc(se, 4), *d0 = calloc(de, 4), *d1 = calloc(de, 4);
+      fill_pattern_u32(src, se, 200 + ci);
+      memset(d0, 0x55, de * 4); memset(d1, 0x55, de * 4);
+      struct hk_eval_ssbo s0[2] = { {0, 0, src, se * 4}, {0, 1, d0, de * 4} };
+      struct hk_eval_ssbo s1[2] = { {0, 0, src, se * 4}, {0, 1, d1, de * 4} };
+      uint32_t g0[3] = { DIV_ROUND_UP((uint32_t)pw, 16), DIV_ROUND_UP((uint32_t)ph, 16), 1 };
+      const bool use_v4 = ((ch % 4) == 0 && (iw % 4) == 0 && (kw % 4) == 0 && (pw % 4) == 0);
+      uint32_t g1[3] = {
+         DIV_ROUND_UP(use_v4 ? ((uint32_t)kw / 4) : (uint32_t)kw, vec4_alt->info.workgroup_size[0]),
+         DIV_ROUND_UP((uint32_t)cols, vec4_alt->info.workgroup_size[1]),
+         DIV_ROUND_UP((uint32_t)rows, vec4_alt->info.workgroup_size[2]),
+      };
+      hk_eval_dispatch(orig, g0, s0, 2, push, 36);
+      hk_eval_dispatch(vec4_alt, g1, s1, 2, push, 36);
+      HK_EVAL_CHECK(memcmp(d0, d1, de * 4) == 0);
+      free(src); free(d0); free(d1);
+   }
+
+   ralloc_free(vec4_alt);
+   ralloc_free(id_alt);
+   ralloc_free(orig);
+
+   /* Negative: borderless im2col with writable source load must be rejected. */
+   {
+      nir_shader *bad = build_borderless_im2col_shader();
+      nir_foreach_function_impl(impl, bad) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_intrinsic) {
+                  nir_intrinsic_instr *op = nir_instr_as_intrinsic(instr);
+                  if (op->intrinsic == nir_intrinsic_load_deref)
+                     nir_intrinsic_set_access(op, (enum gl_access_qualifier)0);
+               }
+            }
+         }
+      }
+      struct hk_identity_copy4 bad_info = {0};
+      HK_EVAL_CHECK(hk_nir_copy_identity4(bad, &bad_info) == NULL);
+      HK_EVAL_CHECK(hk_nir_im2col_vec4(bad) == NULL);
+      ralloc_free(bad);
+   }
+}
+
+/* Structurally distinct permuted-layout borderless HWC im2col formulation:
+ * non-zero descriptor set/bindings (s1b2 -> s1b3), 8x8 workgroup, permuted
+ * 48-byte push-constant layout with padding gaps, and commuted index math. */
+static nir_shader *
+build_permuted_layout_im2col_shader(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &agx_nir_options, "permuted_layout_im2col");
+   b.shader->info.workgroup_size[0] = 8;
+   b.shader->info.workgroup_size[1] = 8;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.num_ssbos = 2;
+   b.shader->num_uniforms = 48;
+
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_def *tap = nir_channel(&b, gid, 0);
+   nir_def *row = nir_channel(&b, gid, 1);
+
+   /* Permuted push layout: ch=0, sw=4, sh=8, (gap 12), kw=16, (gap 20),
+    * iw=24, (gap 28), pw=32, ph=36, (tail 40..47). */
+   nir_def *ch = load_push_u32(&b, 0, 48);
+   nir_def *sw = load_push_u32(&b, 4, 48);
+   nir_def *sh = load_push_u32(&b, 8, 48);
+   nir_def *kw = load_push_u32(&b, 16, 48);
+   nir_def *iw = load_push_u32(&b, 24, 48);
+   nir_def *pw = load_push_u32(&b, 32, 48);
+   nir_def *ph = load_push_u32(&b, 36, 48);
+
+   nir_def *oob = build_short_or(&b, nir_ige(&b, row, ph), nir_ige(&b, tap, pw));
+   nir_if *guard = nir_push_if(&b, oob);
+   nir_push_else(&b, guard);
+   {
+      nir_def *in_cols = nir_idiv(&b, iw, ch);
+      nir_def *k_cols = nir_idiv(&b, kw, ch);
+      nir_def *cols = nir_iadd_imm(&b, nir_idiv(&b, nir_isub(&b, in_cols, k_cols), sw), 1);
+      nir_def *ox = nir_imod(&b, row, cols);
+      nir_def *oy = nir_idiv(&b, row, cols);
+      nir_def *kx = nir_imod(&b, tap, kw);
+      nir_def *ky = nir_idiv(&b, tap, kw);
+      /* Commuted operand order relative to build_borderless_im2col_shader(). */
+      nir_def *ix = nir_iadd(&b, kx, nir_imul(&b, ch, nir_imul(&b, sw, ox)));
+      nir_def *iy = nir_iadd(&b, ky, nir_imul(&b, sh, oy));
+      nir_def *s_idx = nir_iadd(&b, ix, nir_imul(&b, iw, iy));
+      nir_def *d_idx = nir_iadd(&b, tap, nir_imul(&b, pw, row));
+      nir_deref_instr *sd = make_ssbo_elem_deref(&b, 1, 2, glsl_float_type(), true, s_idx);
+      nir_deref_instr *dd = make_ssbo_elem_deref(&b, 1, 3, glsl_float_type(), false, d_idx);
+      nir_def *val = nir_load_deref_with_access(&b, sd, ACCESS_NON_WRITEABLE);
+      nir_store_deref_with_access(&b, dd, val, 1, ACCESS_NON_READABLE);
+   }
+   nir_pop_if(&b, guard);
+
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   return b.shader;
+}
+
+static void
+test_permuted_layout_im2col_bit_exact(void)
+{
+   nir_shader *orig = build_permuted_layout_im2col_shader();
+   struct hk_identity_copy4 info = {0};
+   nir_shader *id_alt = hk_nir_copy_identity4(orig, &info);
+   HK_EVAL_CHECK(id_alt != NULL);
+   nir_validate_shader(id_alt, "permuted layout im2col identity alt");
+   HK_EVAL_CHECK(info.kind == HK_IDENTITY_COPY4_IM2COL_1X1);
+   HK_EVAL_CHECK(info.im2col_vec4_ok);
+   HK_EVAL_CHECK(info.src_set == 1 && info.src_binding == 2);
+   HK_EVAL_CHECK(info.dst_set == 1 && info.dst_binding == 3);
+   HK_EVAL_CHECK(info.border_width_offset == UINT16_MAX);
+   HK_EVAL_CHECK(info.border_height_offset == UINT16_MAX);
+   HK_EVAL_CHECK(info.input_height_offset == UINT16_MAX);
+   HK_EVAL_CHECK(info.channels_offset == 0);
+   HK_EVAL_CHECK(info.stride_width_offset == 4);
+   HK_EVAL_CHECK(info.stride_height_offset == 8);
+   HK_EVAL_CHECK(info.kernel_width_offset == 16);
+   HK_EVAL_CHECK(info.input_width_offset == 24);
+   HK_EVAL_CHECK(info.patches_width_offset == 32);
+   HK_EVAL_CHECK(info.patches_height_offset == 36);
+
+   nir_shader *vec4_alt = hk_nir_im2col_vec4(orig);
+   HK_EVAL_CHECK(vec4_alt != NULL);
+   nir_validate_shader(vec4_alt, "permuted layout im2col vec4 alt");
+
+   struct { int32_t w, h, kdim, sw, sh, ch; } cases[] = {
+      { 11, 7, 3, 1, 1, 8 },
+      { 11, 9, 3, 2, 2, 8 },
+      { 10, 9, 3, 2, 2, 3 },
+      { 9, 7, 3, 2, 3, 5 },
+   };
+   for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ++ci) {
+      const int32_t ch = cases[ci].ch, iw = cases[ci].w * ch, ih = cases[ci].h;
+      const int32_t kw = cases[ci].kdim * ch, pw = kw * cases[ci].kdim;
+      const int32_t sw = cases[ci].sw, sh = cases[ci].sh;
+      const int32_t cols = (iw / ch - kw / ch) / sw + 1;
+      const int32_t rows = (ih - cases[ci].kdim) / sh + 1;
+      const int32_t ph = cols * rows;
+      uint32_t push[12] = {0};
+      push[0] = (uint32_t)ch;
+      push[1] = (uint32_t)sw;
+      push[2] = (uint32_t)sh;
+      push[4] = (uint32_t)kw;
+      push[6] = (uint32_t)iw;
+      push[8] = (uint32_t)pw;
+      push[9] = (uint32_t)ph;
+      const uint32_t se = (uint32_t)(iw * ih), de = (uint32_t)(pw * ph);
+      uint32_t *src = calloc(se, 4), *d0 = calloc(de, 4), *d1 = calloc(de, 4);
+      fill_pattern_u32(src, se, 300 + ci);
+      memset(d0, 0x33, de * 4); memset(d1, 0x33, de * 4);
+      struct hk_eval_ssbo s0[2] = { {1, 2, src, se * 4}, {1, 3, d0, de * 4} };
+      struct hk_eval_ssbo s1[2] = { {1, 2, src, se * 4}, {1, 3, d1, de * 4} };
+      uint32_t g0[3] = { DIV_ROUND_UP((uint32_t)pw, 8), DIV_ROUND_UP((uint32_t)ph, 8), 1 };
+      const bool use_v4 = ((ch % 4) == 0 && (iw % 4) == 0 && (kw % 4) == 0 && (pw % 4) == 0);
+      uint32_t g1[3] = {
+         DIV_ROUND_UP(use_v4 ? ((uint32_t)kw / 4) : (uint32_t)kw, vec4_alt->info.workgroup_size[0]),
+         DIV_ROUND_UP((uint32_t)cols, vec4_alt->info.workgroup_size[1]),
+         DIV_ROUND_UP((uint32_t)rows, vec4_alt->info.workgroup_size[2]),
+      };
+      hk_eval_dispatch(orig, g0, s0, 2, push, 48);
+      hk_eval_dispatch(vec4_alt, g1, s1, 2, push, 48);
+      HK_EVAL_CHECK(memcmp(d0, d1, de * 4) == 0);
+      free(src); free(d0); free(d1);
+   }
+
+   ralloc_free(vec4_alt);
+   ralloc_free(id_alt);
+   ralloc_free(orig);
+}
+
 int
 main(void)
 {
@@ -762,6 +1040,8 @@ main(void)
    test_linear_bit_exact();
    test_pad4d_bit_exact();
    test_im2col_bit_exact();
+   test_borderless_im2col_bit_exact();
+   test_permuted_layout_im2col_bit_exact();
 
    /* Negative: writable source load, extra store, or unsigned guard must reject. */
    {
