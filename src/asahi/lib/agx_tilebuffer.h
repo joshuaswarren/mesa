@@ -188,12 +188,15 @@ bool agx_nir_lower_tilebuffer(struct nir_shader *shader,
 
 /* As agx_nir_lower_tilebuffer, plus explicit software sRGB and R11G11B10
  * conversions of tile values and, with x_alpha_one, 1.0 stored into the X
- * channel of RGBX/BGRX targets (all used on G18G). */
+ * channel of RGBX/BGRX targets (all used on G18G). ms_whole_sample: the
+ * multisampled tile accesses move whole samples, taking F16 but not I16
+ * (G18G). */
 bool agx_nir_lower_tilebuffer_with_conversions(
    struct nir_shader *shader, struct agx_tilebuffer_layout *tib,
    uint8_t *colormasks, unsigned *bindless_base, struct nir_def *write_samples,
    bool *translucent, bool preserve_zero_mask, bool lower_srgb,
-   bool lower_r11g11b10, bool lower_g17p_formats, bool x_alpha_one);
+   bool lower_r11g11b10, bool ms_whole_sample, bool lower_g17p_formats,
+   bool x_alpha_one);
 /* Put spilled render target accesses back on immediate texture state slots
  * after descriptor crawling has run (G17G's bindful image accesses). */
 bool agx_nir_rebind_spilled_rts(struct nir_shader *shader);

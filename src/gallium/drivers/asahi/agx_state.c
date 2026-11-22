@@ -3307,6 +3307,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
                   &rt_spill, NULL, &translucent, false,
                   dev->chip == AGX_CHIP_G18G,
                   dev->chip == AGX_CHIP_G18G,
+                  dev->chip == AGX_CHIP_G18G,
                   agx_chip_native_or_m5(dev->chip),
                   dev->chip == AGX_CHIP_G18G);
          if (rt0_resident)
@@ -12618,6 +12619,25 @@ agx_g18_msaa4_draw_admitted(struct agx_context *ctx, struct agx_batch *batch,
       batch->key.cbufs[0].format == PIPE_FORMAT_R8G8B8A8_UNORM &&
       !batch->key.zsbuf.texture && !fs->b.info.early_fragment_tests &&
       !fs->b.info.writes_sample_mask;
+   /* A translucent pixel-rate draw, blended or colour-masked: the epilog's
+    * unrolled sample loop reads, merges and writes each covered sample whole
+    * (build_g18_msaa4_fs_epilog; a partial mask is merged like a blend, and
+    * F16 targets are read as F16, as the G18 sample transactions require).
+    * Measured on the M6 against llvmpipe at 2x and 4x, with and without
+    * depth/stencil, for one RGBA8, R11G11B10F or RGBA16F target: Google
+    * Maps' area fills, which were dropped. A partial API sample mask makes
+    * the pass translucent punch-through; the prolog kills the samples it
+    * leaves out (per_pixel_api_mask), and the loop writes only covered ones. */
+   const bool per_pixel_translucent =
+      per_pixel_api_mask && !fs->so->info.uses_fbfetch &&
+      (fragment_pass == AGX_PASS_TYPE_TRANSLUCENT ||
+       fragment_pass == AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH) &&
+      batch->reduced_prim == MESA_PRIM_TRIANGLES &&
+      batch->key.nr_cbufs == 1 &&
+      (batch->key.cbufs[0].format == PIPE_FORMAT_R8G8B8A8_UNORM ||
+       batch->key.cbufs[0].format == PIPE_FORMAT_R11G11B10_FLOAT ||
+       batch->key.cbufs[0].format == PIPE_FORMAT_R16G16B16A16_FLOAT) &&
+      ctx->blend->key.rt[0].colormask != 0;
    const bool admitted = agx_g18_msaa4_tile_layout(dev, &batch->tilebuffer_layout) &&
           (no_color || agx_g18_msaa_color_surfaces(batch)) &&
           agx_g18_msaa4_zs_surface(dev, &batch->key.zsbuf) &&
@@ -12628,7 +12648,8 @@ agx_g18_msaa4_draw_admitted(struct agx_context *ctx, struct agx_batch *batch,
            (unrolled_memory &&
             (fragment_pass == AGX_PASS_TYPE_TRANSLUCENT ||
              fragment_pass == AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH)) ||
-           resident_mrt_preserve || g18_fbfetch_unrolled) &&
+           resident_mrt_preserve || g18_fbfetch_unrolled ||
+           per_pixel_translucent) &&
           ctx->rast->base.multisample &&
            (per_pixel_api_mask || per_pixel_api_shader_mask ||
             unrolled_colour || unrolled_memory ||
