@@ -223,6 +223,7 @@ enum agx_chip_quirk {
    AGX_QUIRK_NATIVE_PREAMBLE = 1 << 10,
    AGX_QUIRK_SCHEDULING_STALLS = 1 << 11,
    AGX_QUIRK_M5_PATHS = 1 << 12,
+   AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS = 1 << 13,
 };
 
 /* What the five native AGX3 chips share. */
@@ -323,12 +324,12 @@ enum agx_chip_quirk {
    X(G17A, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, NONE, UNKNOWN, NONE, 0, 0,     \
      __VA_ARGS__)                                                              \
    X(G17G, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300,                  \
-     AGX_RECORDS_M5 | AGX_RECORD_HAL300_NATIVE_CAPTURE, AGX_QUIRK_M5_PATHS,    \
-     __VA_ARGS__)                                                              \
+     AGX_RECORDS_M5 | AGX_RECORD_HAL300_NATIVE_CAPTURE,                        \
+     AGX_QUIRK_M5_PATHS | AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS, __VA_ARGS__)    \
    X(G17S, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     0, __VA_ARGS__)                                                           \
+     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS, __VA_ARGS__)                         \
    X(G17C, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     0, __VA_ARGS__)                                                           \
+     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS, __VA_ARGS__)                         \
    X(G18G, AGX3, AGX3D, HAL300, 10, GEN5, NONE, SKSM, HAL300,                  \
      AGX_RECORDS_G18G, AGX_QUIRK_M5_PATHS, __VA_ARGS__)
 
@@ -712,6 +713,45 @@ static inline enum agx_sampler_generation
 agx_chip_sampler_generation(enum agx_chip chip)
 {
    return agx_chip_info(chip)->sampler_generation;
+}
+
+/*
+ * Whether an indirect indexed VDM Index List bounds its index fetch in
+ * hardware the way robustBufferAccess2 requires: indices past the record's
+ * index-buffer size (index_buffer_size_word, dwords minus one) read as 0.
+ *
+ * What is established, and by what:
+ *   - The record carries that word on every AGX3 command-stream generation:
+ *     the G15 and HAL200 records (agx_vdm_hal200_indirect_draw_pack) and the
+ *     HAL300 one, which adds only the Unk 2 word before it
+ *     (agx_vdm_index_list_indirect_pack_words). That is packet layout.
+ *   - Enabled for the M5 HAL300 record family (G17G, G17S, G17C): zero
+ *     substitution for out-of-range indices is measured on G17C (J716c) by
+ *     dEQP-VK.robustness.{index_access,vertex_access.*index*,robustness2}.*,
+ *     dEQP-VK.draw.{*indexed*,renderpass.multi_draw.*}, and a 28-case
+ *     bit-exact equivalence probe against the software rewrite (partial and
+ *     full out-of-range draws, 32-bit firstIndex wrap, signed vertexOffset,
+ *     multi-draw firstInstance, primitive restart, indirect count). G17S
+ *     (M5 Pro) and G17G (M5) share the same HAL300 indirect record layout;
+ *     M5 Pro hardware verification is the merge gate.
+ *
+ * Off elsewhere:
+ *   - G18G uses HAL300 records too, but has no stream-link continuation for
+ *     an empty rewritten draw yet (hk_robust_index_rewrite_admitted) and its
+ *     out-of-range index behaviour is unmeasured, so it stays off.
+ *   - G15, G16G and G17P (G15/HAL200 records) keep the software rewrite until
+ *     hardware rows (M3, M4, A18 Pro, M4 Pro) prove zero substitution past
+ *     the size word.
+ *   - AGX2 does not have it: its Index List does not read out-of-range
+ *     indices as zero (libagx_draw_robust_index).
+ *
+ * The bound is dword granular, so callers still rewrite draws whose range
+ * does not end on a dword: 8-bit indices and unaligned 16-bit ranges.
+ */
+static inline bool
+agx_chip_vdm_indirect_index_bounds(enum agx_chip chip)
+{
+   return agx_chip_info(chip)->quirks & AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS;
 }
 
 /* Native sampler heap element size. The packed state word remains eight
