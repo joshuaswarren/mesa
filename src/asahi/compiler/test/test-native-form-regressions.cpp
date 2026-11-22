@@ -7717,3 +7717,159 @@ TEST(NativeForms, Agx3bPreservesNativeI32ToF16AndMixedFadd)
       ralloc_free(mem);
    }
 }
+
+/* KHR-GL46.texture_view.view_sampling fetches sampler2DMS / sampler2DMSArray
+ * in every stage of a 5-stage pipeline (VS, TCS, TES, GS, FS) and
+ * texelFetch(sampler2DRect, ...) with no LOD operand. Before Poly lowers
+ * TCS/TES/GS to CDM kernels (or HW VS), agx_nir_lower_g17g_indexed_reads()
+ * sees their API stages; declining them left unlowered bindless handles and
+ * agx3_indexed_sampler_valid = false, causing hk_dispatch_m5_native() to
+ * refuse the launch with VK_ERROR_FEATURE_NOT_PRESENT. */
+TEST(NativeForms, M5PreRasterMultisampleAndImplicitLod0FetchLowerAndCompile)
+{
+   const mesa_shader_stage stages[] = {
+      MESA_SHADER_VERTEX,
+      MESA_SHADER_TESS_CTRL,
+      MESA_SHADER_TESS_EVAL,
+      MESA_SHADER_GEOMETRY,
+      MESA_SHADER_MESH,
+      MESA_SHADER_TASK,
+   };
+
+   for (mesa_shader_stage stage : stages) {
+      for (bool is_array : {false, true}) {
+         SCOPED_TRACE(::testing::Message()
+                      << "stage=" << stage << " array=" << is_array);
+         nir_builder b = nir_builder_init_simple_shader(
+            stage, &agx_nir_options, "m5 preraster ms fetch");
+         nir_def *handle = agx_test_bindless_image_agx(&b, nir_imm_int(&b, 64), 0);
+         nir_def *coord = nir_imm_ivec3(&b, 3, 5, is_array ? ((1u << 16) | 2u) : 2u);
+         nir_tex_instr *tex = nir_tex_instr_create(b.shader, 2);
+         tex->op = nir_texop_txf_ms;
+         tex->sampler_dim = GLSL_SAMPLER_DIM_MS;
+         tex->is_array = is_array;
+         tex->dest_type = nir_type_float32;
+         tex->coord_components = is_array ? 3 : 2;
+         tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_backend1, coord);
+         tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, handle);
+         nir_def_init(&tex->instr, &tex->def, 4, 32);
+         nir_builder_instr_insert(&b, &tex->instr);
+         nir_store_global(&b, &tex->def, nir_imm_int64(&b, 0x2000000),
+                          .write_mask = 15, .align_mul = 4);
+
+         ASSERT_TRUE(agx_nir_lower_g17g_indexed_reads(b.shader));
+         const int tex_off =
+            nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
+         ASSERT_GE(tex_off, 0);
+         EXPECT_EQ(nir_src_bit_size(tex->src[tex_off].src), 64u);
+         EXPECT_LT(nir_tex_instr_src_index(tex, nir_tex_src_texture_handle), 0);
+         nir_validate_shader(b.shader, "m5 preraster ms fetch");
+
+         /* Compile the CDM-dispatched stages (TCS, GS, and TES lowered to
+          * compute) on G17S to confirm the lowered fetch packs with known
+          * staging and satisfies hk_g17p_compute_shader_supported(). */
+         if (stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_GEOMETRY ||
+             stage == MESA_SHADER_TESS_EVAL) {
+            if (stage == MESA_SHADER_TESS_EVAL)
+               b.shader->info.stage = MESA_SHADER_COMPUTE;
+            /* Lower load_descriptor_set_agx(0) to load_preamble(12) as hk does
+             * with root = AGX_G17P_TXF_ROOT_HALFS (8). */
+            nir_foreach_block(block, b.impl) {
+               nir_foreach_instr_safe(instr, block) {
+                  if (instr->type != nir_instr_type_intrinsic)
+                     continue;
+                  nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+                  if (intr->intrinsic != nir_intrinsic_load_descriptor_set_agx)
+                     continue;
+                  nir_builder lb = nir_builder_at(nir_before_instr(instr));
+                  nir_def *set = nir_load_preamble(&lb, 1, 64, .base = 12);
+                  nir_def_replace(&intr->def, set);
+               }
+            }
+            agx_preprocess_nir_m5(b.shader);
+            struct agx_shader_key key = {};
+            key.dev.chip = AGX_CHIP_G17S;
+            key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+            key.reserved_preamble = 16;
+            key.no_preamble = true;
+            struct agx_shader_part part = {};
+            ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+            EXPECT_TRUE(part.info.uses_txf);
+            EXPECT_EQ(part.info.texture_state_count, 0u);
+            EXPECT_EQ(part.info.sampler_state_count, 1u);
+            EXPECT_FALSE(part.info.uses_sampler_heap);
+            EXPECT_TRUE(part.info.agx3_staging_known);
+            EXPECT_GE(part.info.agx3_staging_halfs, 8u);
+            free(part.binary);
+         }
+         ralloc_free(b.shader);
+      }
+
+      /* Also verify txf without an explicit LOD source (sampler2DRect /
+       * samplerBuffer / OpImageFetch without Lod) lowers and adds lod=0. */
+      SCOPED_TRACE(::testing::Message() << "stage=" << stage << " txf_nolod");
+      nir_builder b = nir_builder_init_simple_shader(
+         stage, &agx_nir_options, "m5 preraster txf without lod");
+      nir_def *handle = agx_test_bindless_image_agx(&b, nir_imm_int(&b, 64), 0);
+      nir_def *coord = nir_imm_ivec2(&b, 3, 5);
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, 2);
+      tex->op = nir_texop_txf;
+      tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      tex->is_array = false;
+      tex->dest_type = nir_type_float32;
+      tex->coord_components = 2;
+      tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_backend1, coord);
+      tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, handle);
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      nir_store_global(&b, &tex->def, nir_imm_int64(&b, 0x2000000),
+                       .write_mask = 15, .align_mul = 4);
+
+      ASSERT_TRUE(agx_nir_lower_g17g_indexed_reads(b.shader));
+      const int tex_off =
+         nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
+      const int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+      ASSERT_GE(tex_off, 0);
+      ASSERT_GE(lod_idx, 0);
+      EXPECT_EQ(nir_src_bit_size(tex->src[tex_off].src), 64u);
+      EXPECT_EQ(nir_src_bit_size(tex->src[lod_idx].src), 32u);
+      EXPECT_TRUE(nir_src_is_const(tex->src[lod_idx].src));
+      EXPECT_EQ(nir_src_as_uint(tex->src[lod_idx].src), 0u);
+      EXPECT_LT(nir_tex_instr_src_index(tex, nir_tex_src_texture_handle), 0);
+      nir_validate_shader(b.shader, "m5 preraster txf without lod");
+
+      if (stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_GEOMETRY ||
+          stage == MESA_SHADER_TESS_EVAL) {
+         if (stage == MESA_SHADER_TESS_EVAL)
+            b.shader->info.stage = MESA_SHADER_COMPUTE;
+         nir_foreach_block(block, b.impl) {
+            nir_foreach_instr_safe(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_load_descriptor_set_agx)
+                  continue;
+               nir_builder lb = nir_builder_at(nir_before_instr(instr));
+               nir_def *set = nir_load_preamble(&lb, 1, 64, .base = 12);
+               nir_def_replace(&intr->def, set);
+            }
+         }
+         agx_preprocess_nir_m5(b.shader);
+         struct agx_shader_key key = {};
+         key.dev.chip = AGX_CHIP_G17S;
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.reserved_preamble = 16;
+         key.no_preamble = true;
+         struct agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+         EXPECT_TRUE(part.info.uses_txf);
+         EXPECT_EQ(part.info.texture_state_count, 0u);
+         EXPECT_EQ(part.info.sampler_state_count, 1u);
+         EXPECT_FALSE(part.info.uses_sampler_heap);
+         EXPECT_TRUE(part.info.agx3_staging_known);
+         EXPECT_GE(part.info.agx3_staging_halfs, 4u);
+         free(part.binary);
+      }
+      ralloc_free(b.shader);
+   }
+}
