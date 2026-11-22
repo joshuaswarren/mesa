@@ -85,6 +85,58 @@ hk_hash_device_generation_contract(blake3_hasher *ctx,
    _mesa_blake3_update(ctx, values, sizeof(values));
 }
 
+void
+hk_layout_identity(const struct agx_device *dev, uint8_t uuid[VK_UUID_SIZE])
+{
+   blake3_hasher blake3_ctx;
+   uint8_t blake3[BLAKE3_KEY_LEN];
+
+   _mesa_blake3_init(&blake3_ctx);
+   /* Make sure we don't match with other vendors */
+   const char *driver = "honeykrisp-v1";
+   _mesa_blake3_update(&blake3_ctx, driver, strlen(driver));
+   hk_hash_device_generation_contract(&blake3_ctx, dev);
+   _mesa_blake3_final(&blake3_ctx, blake3);
+
+   memcpy(uuid, blake3, VK_UUID_SIZE);
+}
+
+void
+hk_cache_identity(const uint8_t build_sha[32], const struct agx_device *dev,
+                  uint64_t compiler_flags, uint64_t env_hash,
+                  uint8_t uuid[VK_UUID_SIZE], uint64_t *disk_cache_id)
+{
+   blake3_hasher blake3_ctx;
+   _mesa_blake3_init(&blake3_ctx);
+
+   static_assert(BLAKE3_KEY_LEN == 32);
+   _mesa_blake3_update(&blake3_ctx, build_sha, BLAKE3_KEY_LEN);
+   hk_hash_device_generation_contract(&blake3_ctx, dev);
+   _mesa_blake3_update(&blake3_ctx, &compiler_flags, sizeof(compiler_flags));
+   _mesa_blake3_update(&blake3_ctx, &env_hash, sizeof(env_hash));
+
+   /* The kernel's feature bits select code paths at compile time: M5 native
+    * traversal or software ray queries, compute resources, RT-only render
+    * records. Key the caches on them so that a shader built against one
+    * kernel's features is never served on a kernel with others. They do not
+    * change the image layout, so they stay out of optimalTilingLayoutUUID.
+    */
+   const uint64_t features = dev->params.features;
+   _mesa_blake3_update(&blake3_ctx, &features, sizeof(features));
+
+   unsigned char blake3[BLAKE3_KEY_LEN];
+   _mesa_blake3_final(&blake3_ctx, blake3);
+
+   static_assert(BLAKE3_KEY_LEN >= VK_UUID_SIZE);
+   memcpy(uuid, blake3, VK_UUID_SIZE);
+
+   /* The disk cache follows the same identity as pipelineCacheUUID: the
+    * build, the device's generation contract and kernel features, the
+    * compiler flags and the codegen environment.
+    */
+   memcpy(disk_cache_id, blake3, sizeof(*disk_cache_id));
+}
+
 /* VK_KHR_shader_fma: G17P with its explicit-RTE tininess repair
  * (agx_nir_lower_fma_rte()) and M5. G13-G15 do not pass the newly exposed
  * cases. */
@@ -1849,19 +1901,7 @@ hk_get_device_properties(const struct agx_device *dev,
    /* We're a UMR so we can always map every kind of memory */
    properties->identicalMemoryTypeRequirements = true;
 
-   {
-      blake3_hasher blake3_ctx;
-      uint8_t blake3[BLAKE3_KEY_LEN];
-
-      _mesa_blake3_init(&blake3_ctx);
-      /* Make sure we don't match with other vendors */
-      const char *driver = "honeykrisp-v1";
-      _mesa_blake3_update(&blake3_ctx, driver, strlen(driver));
-      hk_hash_device_generation_contract(&blake3_ctx, dev);
-      _mesa_blake3_final(&blake3_ctx, blake3);
-
-      memcpy(properties->optimalTilingLayoutUUID, blake3, VK_UUID_SIZE);
-   }
+   hk_layout_identity(dev, properties->optimalTilingLayoutUUID);
 }
 
 /* Every AGX_*, HK_* and ASAHI_* environment variable that can change generated
@@ -1979,33 +2019,13 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
 {
    struct hk_instance *instance = hk_physical_device_instance(pdev);
 
-   blake3_hasher blake3_ctx;
-   _mesa_blake3_init(&blake3_ctx);
-
-   _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
-                     sizeof(instance->driver_build_sha));
-   hk_hash_device_generation_contract(&blake3_ctx, &pdev->dev);
-
-   const uint64_t compiler_flags = hk_physical_device_compiler_flags(pdev);
-   _mesa_blake3_update(&blake3_ctx, &compiler_flags, sizeof(compiler_flags));
-   const uint64_t env_hash = hk_codegen_env_hash();
-   _mesa_blake3_update(&blake3_ctx, &env_hash, sizeof(env_hash));
-
-   /* The kernel's feature bits select code paths at compile time: M5 native
-    * traversal or software ray queries, compute resources, RT-only render
-    * records. Key the caches on them so that a shader built against one
-    * kernel's features is never served on a kernel with others. They do not
-    * change the image layout, so they stay out of optimalTilingLayoutUUID.
-    */
-   const uint64_t features = pdev->dev.params.features;
-   _mesa_blake3_update(&blake3_ctx, &features, sizeof(features));
-
-   unsigned char blake3[BLAKE3_KEY_LEN];
-   _mesa_blake3_final(&blake3_ctx, blake3);
-
-   static_assert(BLAKE3_KEY_LEN >= VK_UUID_SIZE);
-   memcpy(pdev->vk.properties.pipelineCacheUUID, blake3, VK_UUID_SIZE);
-   memcpy(pdev->vk.properties.shaderBinaryUUID, blake3, VK_UUID_SIZE);
+   uint64_t disk_cache_id;
+   hk_cache_identity(instance->driver_build_sha, &pdev->dev,
+                     hk_physical_device_compiler_flags(pdev),
+                     hk_codegen_env_hash(),
+                     pdev->vk.properties.pipelineCacheUUID, &disk_cache_id);
+   memcpy(pdev->vk.properties.shaderBinaryUUID,
+          pdev->vk.properties.pipelineCacheUUID, VK_UUID_SIZE);
 
 #ifdef ENABLE_SHADER_CACHE
    char renderer[10];
@@ -2025,13 +2045,7 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
    static_assert(sizeof(instance->driver_build_sha) >= 20);
    char timestamp[2 * 20 + 1];
    mesa_bytes_to_hex(timestamp, instance->driver_build_sha, id_bytes);
-   /* The disk cache follows the same identity as pipelineCacheUUID: the
-    * build, the device's generation contract and kernel features, the
-    * compiler flags and the codegen environment.
-    */
-   uint64_t identity;
-   memcpy(&identity, blake3, sizeof(identity));
-   pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, identity);
+   pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, disk_cache_id);
    if (pdev->vk.disk_cache != NULL) {
       hk_border_emulation_recall(pdev);
       pdev->vk.properties.pipelineBinaryInternalCache = true;

@@ -114,6 +114,18 @@ void hk_physical_device_destroy(struct vk_physical_device *vk_device);
 
 uint64_t hk_codegen_env_hash(void);
 
+/* optimalTilingLayoutUUID: the device's generation contract only. */
+void hk_layout_identity(const struct agx_device *dev,
+                        uint8_t uuid[VK_UUID_SIZE]);
+
+/* pipelineCacheUUID (and shaderBinaryUUID) and the disk cache's driver flags:
+ * the build, the generation contract, the compiler flags, the codegen
+ * environment and the kernel's feature bits. */
+void hk_cache_identity(const uint8_t build_sha[32],
+                       const struct agx_device *dev, uint64_t compiler_flags,
+                       uint64_t env_hash, uint8_t uuid[VK_UUID_SIZE],
+                       uint64_t *disk_cache_id);
+
 void hk_border_emulation_recall(struct hk_physical_device *pdev);
 void hk_border_emulation_remember(struct hk_physical_device *pdev);
 
