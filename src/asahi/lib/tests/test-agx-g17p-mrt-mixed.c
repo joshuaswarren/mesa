@@ -1813,6 +1813,66 @@ test_wide_samples(void)
    return 0;
 }
 
+/* Direct EOT MSAA resolve from mixed/subset MRT tilebuffers: both a single
+ * resolved target at a non-zero sample offset (the 5-RT deferred local-read
+ * shape) and a multi-target resolve-only EOT emit 2D resolving IMGWBLK
+ * selectors (low nibble 5, wire-width bit 1 clear) rather than MS store. */
+static int
+test_multisample_direct_resolve_eot(void)
+{
+   /* Single resolved RGBA8 target at byte offset 20 in a 24 B/sample tile. */
+   {
+      const enum pipe_format fmt = PIPE_FORMAT_R8G8B8A8_UNORM;
+      const uint8_t offset = 20;
+      struct agx_shader_key key = {
+         .dev.encoding = AGX_ISA_ENCODING_AGX3B,
+         .no_preamble = true,
+         .g17p_rt0_eot_multisample = false,
+      };
+      agx_g17p_configure_rt0_eot_key(fmt, &key);
+      struct agx_shader_part part = {0};
+      CHECK(compile_eot(1, &fmt, &offset, &key, &part));
+      CHECK(part.info.binary_size == 68);
+      CHECK(part.info.nr_gprs == 8);
+      CHECK(part.info.agx3_staging_known && part.info.agx3_staging_halfs == 8);
+      CHECK(((const uint8_t *)part.binary)[61] == 0x75);
+      free(part.binary);
+   }
+
+   /* Two resolved targets (RGBA8 + RGBA16F) in a mixed MSAA tilebuffer. */
+   {
+      const enum pipe_format fmts[2] = {
+         PIPE_FORMAT_R8G8B8A8_UNORM,
+         PIPE_FORMAT_R16G16B16A16_FLOAT,
+      };
+      const uint8_t offsets[2] = {20, 8};
+      struct agx_shader_key key = {
+         .dev.encoding = AGX_ISA_ENCODING_AGX3B,
+         .no_preamble = true,
+         .g17p_rt0_eot_multisample = false,
+         .g17p_mrt_eot_count = 2,
+         .g17p_mrt_eot_selectors = {
+            agx_g17p_mrt_eot_selector(fmts[0]),
+            agx_g17p_mrt_eot_selector(fmts[1]),
+         },
+      };
+      agx_g17p_configure_rt0_eot_key(fmts[0], &key);
+      struct agx_shader_part part = {0};
+      CHECK(compile_eot(2, fmts, offsets, &key, &part));
+      CHECK(part.info.binary_size == 32 + 44 * 2);
+      CHECK(part.info.nr_gprs == 8);
+      CHECK(part.info.agx3_staging_known && part.info.agx3_staging_halfs == 16);
+      const uint8_t *bin = part.binary;
+      CHECK(bin[92 + 9] == 0x75);
+      CHECK(bin[104 + 9] == 0x15);
+      CHECK((bin[92 + 8] & 0x80) != 0);
+      CHECK((bin[104 + 8] & 0x80) != 0);
+      free(part.binary);
+   }
+
+   return 0;
+}
+
 int
 main(void)
 {
@@ -1821,7 +1881,8 @@ main(void)
        test_background_programs() || test_epilogs() ||
        test_reused_mrt_payloads() ||
        test_subset_epilogs() || test_octa_subset_epilogs() ||
-       test_multisample_eot_witnesses() || test_multisample_epilogs() ||
+       test_multisample_eot_witnesses() ||
+       test_multisample_direct_resolve_eot() || test_multisample_epilogs() ||
        test_blended_epilogs() || test_preserved_blended_epilogs() ||
        test_wide_samples())
       return 1;
