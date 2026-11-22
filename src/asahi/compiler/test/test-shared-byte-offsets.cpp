@@ -4,6 +4,7 @@
 #include "compiler/nir/nir_builder.h"
 extern "C" {
 #include "agx_nir.h"
+#include "agx_nir_match_gemm.h"
 }
 
 static void
@@ -228,3 +229,210 @@ TEST(SharedVec2, NarrowWrap) { shared_pair_case(PairBoundary::NarrowWrap); }
 TEST(SharedVec2, MixedAddressUnits) { shared_pair_case(PairBoundary::ImmediateBase); }
 TEST(SharedVec2, VolatileRead) { shared_pair_case(PairBoundary::Volatile); }
 
+enum class GemmMutation {
+   None,
+   NoContraction,
+   OverlappingTiles,
+   UninitializedTileSlot,
+   UninitializedAccumulator,
+   DivergentBreak,
+   SharedAccessAfterLoop,
+};
+
+static nir_phi_instr *
+create_scalar_phi(nir_shader *shader)
+{
+   nir_phi_instr *phi = nir_phi_instr_create(shader);
+   nir_def_init(&phi->instr, &phi->def, 1, 32);
+   return phi;
+}
+
+static nir_builder
+build_gemm_shader(GemmMutation mutation)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "gemm-match");
+   b.shader->info.io_lowered = true;
+   b.shader->info.shared_element_index_agx = true;
+   b.shader->info.workgroup_size[0] = AGX_GEMM_WIDTH;
+   b.shader->info.workgroup_size[1] = AGX_GEMM_SUBGROUPS;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.min_subgroup_size = AGX_GEMM_WIDTH;
+   b.shader->info.max_subgroup_size = AGX_GEMM_WIDTH;
+   b.shader->info.shared_size = 8 * AGX_GEMM_TILE_WORDS;
+
+   const int a_bytes = 0;
+   const int b_bytes = mutation == GemmMutation::OverlappingTiles ?
+      2 * AGX_GEMM_TILE_WORDS : 4 * AGX_GEMM_TILE_WORDS;
+
+   nir_def *n_tiles = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 4);
+   nir_def *cond = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 4);
+   nir_def *local = nir_load_local_invocation_id(&b);
+   nir_def *x = nir_channel(&b, local, 0);
+   nir_def *y8 = nir_ishl_imm(&b, nir_channel(&b, local, 1), 3);
+   nir_def *zero = nir_imm_float(&b, 0.0f);
+   nir_def *one = nir_imm_float(&b, 1.0f);
+   nir_def *k_zero = nir_imm_int(&b, 0);
+
+   auto fence = [&]() {
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                        .memory_scope = SCOPE_WORKGROUP,
+                        .memory_semantics = NIR_MEMORY_ACQ_REL,
+                        .memory_modes = nir_var_mem_shared);
+   };
+
+   nir_if *guard = nir_push_if(&b, nir_ine_imm(&b, n_tiles, 0));
+   nir_loop *loop = nir_push_loop(&b);
+   nir_block *preheader = nir_loop_predecessor_block(loop);
+   nir_block *header = nir_loop_first_block(loop);
+
+   nir_phi_instr *k_phi = create_scalar_phi(b.shader);
+   nir_phi_instr_add_src(k_phi, preheader, k_zero);
+
+   nir_phi_instr *initial[AGX_GEMM_ROWS_PER_LANE];
+   nir_def *acc[AGX_GEMM_ROWS_PER_LANE];
+   for (unsigned row = 0; row < AGX_GEMM_ROWS_PER_LANE; ++row) {
+      initial[row] = create_scalar_phi(b.shader);
+      nir_phi_instr_add_src(initial[row], preheader, zero);
+      acc[row] = &initial[row]->def;
+   }
+
+   for (unsigned row = 0; row < AGX_GEMM_ROWS_PER_LANE; ++row) {
+      nir_def *row_idx = nir_iadd_imm(&b, y8, row);
+      nir_def *word = nir_u2u16(&b, nir_iadd(&b, nir_ishl_imm(&b, row_idx, 5), x));
+      nir_store_shared(&b, one, word, .base = a_bytes, .align_mul = 4);
+      if (mutation == GemmMutation::UninitializedTileSlot &&
+          row == AGX_GEMM_ROWS_PER_LANE - 1) {
+         nir_push_if(&b, nir_ine_imm(&b, cond, 0));
+         nir_store_shared(&b, one, word, .base = b_bytes, .align_mul = 4);
+         nir_pop_if(&b, NULL);
+      } else {
+         nir_store_shared(&b, one, word, .base = b_bytes, .align_mul = 4);
+      }
+   }
+
+   fence();
+
+   for (unsigned k = 0; k < AGX_GEMM_WIDTH; ++k) {
+      nir_def *b_idx = nir_u2u16(&b, nir_iadd_imm(&b, x, k * AGX_GEMM_WIDTH));
+      nir_def *b_val = nir_load_shared(&b, 1, 32, b_idx, .base = b_bytes, .align_mul = 4);
+      for (unsigned row = 0; row < AGX_GEMM_ROWS_PER_LANE; ++row) {
+         nir_def *row_idx = nir_iadd_imm(&b, y8, row);
+         nir_def *a_idx =
+            nir_u2u16(&b, nir_iadd_imm(&b, nir_ishl_imm(&b, row_idx, 5), k));
+         nir_def *a_val =
+            nir_load_shared(&b, 1, 32, a_idx, .base = a_bytes, .align_mul = 4);
+         acc[row] = nir_ffma(&b, a_val, b_val, acc[row]);
+         if (mutation == GemmMutation::NoContraction && k == 15 && row == 3) {
+            nir_def_as_alu(acc[row])->fp_math_ctrl =
+               (nir_fp_math_control)(nir_fp_no_contract | nir_fp_no_transform);
+         }
+      }
+   }
+
+   fence();
+
+   nir_def *k_next = nir_iadd_imm(&b, &k_phi->def, 1);
+   nir_def *done = mutation == GemmMutation::DivergentBreak ?
+      nir_ine_imm(&b, x, 0) : nir_uge(&b, k_next, n_tiles);
+   nir_push_if(&b, done);
+   nir_jump(&b, nir_jump_break);
+   nir_pop_if(&b, NULL);
+
+   nir_block *latch = nir_loop_last_block(loop);
+   nir_phi_instr_add_src(k_phi, latch, k_next);
+   nir_instr_insert(nir_before_block(header), &k_phi->instr);
+   for (unsigned row = 0; row < AGX_GEMM_ROWS_PER_LANE; ++row) {
+      nir_phi_instr_add_src(initial[row], latch, acc[row]);
+      nir_instr_insert(nir_before_block(header), &initial[row]->instr);
+   }
+
+   nir_pop_loop(&b, loop);
+
+   nir_push_else(&b, guard);
+   nir_def *skip_val = mutation == GemmMutation::UninitializedAccumulator ?
+      nir_undef(&b, 1, 32) : zero;
+   nir_pop_if(&b, guard);
+
+   nir_block *after_loop = nir_if_last_then_block(guard);
+   nir_block *else_block = nir_if_last_else_block(guard);
+
+   nir_phi_instr *exit_phi[AGX_GEMM_ROWS_PER_LANE];
+   for (unsigned row = 0; row < AGX_GEMM_ROWS_PER_LANE; ++row) {
+      exit_phi[row] = create_scalar_phi(b.shader);
+      nir_phi_instr_add_src(exit_phi[row], after_loop, acc[row]);
+      nir_phi_instr_add_src(exit_phi[row], else_block, row == 0 ? skip_val : zero);
+      nir_builder_instr_insert(&b, &exit_phi[row]->instr);
+   }
+
+   nir_def *total = &exit_phi[0]->def;
+   for (unsigned row = 1; row < AGX_GEMM_ROWS_PER_LANE; ++row)
+      total = nir_fadd(&b, total, &exit_phi[row]->def);
+
+   if (mutation == GemmMutation::SharedAccessAfterLoop) {
+      nir_def *tail =
+         nir_load_shared(&b, 1, 32, nir_imm_intN_t(&b, 0, 16), .base = 0, .align_mul = 4);
+      total = nir_fadd(&b, total, tail);
+   }
+
+   nir_store_global(&b, total, nir_imm_int64(&b, 0x1000), .align_mul = 4);
+   nir_validate_shader(b.shader, "gemm-match setup");
+   return b;
+}
+
+static void
+check_gemm_refusal(GemmMutation mutation)
+{
+   nir_builder b = build_gemm_shader(mutation);
+   nir_function_impl *impl = nir_shader_get_entrypoint(b.shader);
+   nir_metadata_require(impl, nir_metadata_block_index | nir_metadata_divergence |
+                              nir_metadata_dominance);
+   char *before = nir_shader_as_str(b.shader, b.shader);
+
+   struct agx_gemm_match match = {};
+   EXPECT_FALSE(agx_nir_match_gemm(b.shader, &match));
+   nir_validate_shader(b.shader, "gemm-match refusal");
+
+   char *after = nir_shader_as_str(b.shader, b.shader);
+   EXPECT_STREQ(before, after);
+   ralloc_free(b.shader);
+}
+
+TEST(GemmMatch, AcceptAndLower)
+{
+   nir_builder b = build_gemm_shader(GemmMutation::None);
+   struct agx_gemm_match match = {};
+   ASSERT_TRUE(agx_nir_match_gemm(b.shader, &match));
+   EXPECT_EQ(match.a_bytes, 0u);
+   EXPECT_EQ(match.b_bytes, 4u * AGX_GEMM_TILE_WORDS);
+
+   ASSERT_TRUE(agx_nir_lower_gemm(b.shader, &match));
+   nir_validate_shader(b.shader, "gemm-match lowered");
+
+   unsigned cmat_ops = 0;
+   unsigned shared_barriers = 0;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (agx_nir_is_shared_phase_barrier(instr))
+               ++shared_barriers;
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_cmat_muladd_agx)
+               ++cmat_ops;
+         }
+      }
+   }
+
+   EXPECT_EQ(cmat_ops, 16u);
+   EXPECT_EQ(count_alu(b.shader, nir_op_ffma), 0u);
+   EXPECT_EQ(shared_barriers, 3u);
+   ralloc_free(b.shader);
+}
+
+TEST(GemmMatch, NoContraction) { check_gemm_refusal(GemmMutation::NoContraction); }
+TEST(GemmMatch, OverlappingTiles) { check_gemm_refusal(GemmMutation::OverlappingTiles); }
+TEST(GemmMatch, UninitializedTileSlot) { check_gemm_refusal(GemmMutation::UninitializedTileSlot); }
+TEST(GemmMatch, UninitializedAccumulator) { check_gemm_refusal(GemmMutation::UninitializedAccumulator); }
+TEST(GemmMatch, DivergentBreak) { check_gemm_refusal(GemmMutation::DivergentBreak); }
+TEST(GemmMatch, SharedAccessAfterLoop) { check_gemm_refusal(GemmMutation::SharedAccessAfterLoop); }

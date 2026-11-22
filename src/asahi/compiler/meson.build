@@ -5,6 +5,7 @@
 libasahi_agx_files = files(
   'agx_compile.c',
   'agx_nir_lower_cmat.c',
+  'agx_nir_match_gemm.c',
   'agx_dce.c',
   'agx_liveness.c',
   'agx_insert_waits.c',
