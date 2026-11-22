@@ -11016,6 +11016,14 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       !nir->info.shared_element_index_agx;
    const bool lower_agx3_compute_shared =
       (byte_indices || m5) && vectorize_compute_shared;
+
+   {
+      bool unswitched = false;
+      NIR_PASS(unswitched, nir, agx_nir_opt_unswitch_affine_bounds);
+      if (unswitched)
+         agx_optimize_loop_nir(nir, m5, g17p);
+   }
+
    NIR_PASS(pre_alg_progress, nir, nir_opt_load_store_vectorize,
             &(const nir_load_store_vectorize_options){
                .modes = nir_var_mem_global | nir_var_mem_constant |

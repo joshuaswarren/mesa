@@ -399,3 +399,4 @@ bool agx_nir_lower_integer_division(struct nir_shader *nir,
                                     bool forms_preamble);
 bool agx_nir_has_loop(const struct nir_shader *nir);
 bool agx_nir_limit_heavy_branch_unroll(struct nir_shader *nir);
+bool agx_nir_opt_unswitch_affine_bounds(struct nir_shader *shader);
