@@ -4,6 +4,7 @@
  */
 
 #include "compiler/nir/nir_builder.h"
+#include "util/u_dynarray.h"
 #include "agx_compiler.h"
 #include "agx_nir.h"
 #include <stdlib.h>
@@ -289,13 +290,113 @@ compare_scalars(const void *a, const void *b)
    return (int)x->comp - (int)y->comp;
 }
 
+struct elem_candidate {
+   nir_intrinsic_instr *intr;
+   nir_scalar sum;
+   nir_scalar terms[4];
+   unsigned count;
+   uint64_t elements;
+   uint64_t e_hi;
+   unsigned e_lo;
+   unsigned shift;
+   unsigned base;
+};
+
+static bool
+same_terms(const struct elem_candidate *a, const struct elem_candidate *b)
+{
+   if (a->count != b->count)
+      return false;
+   for (unsigned t = 0; t < a->count; ++t) {
+      if (a->terms[t].def != b->terms[t].def ||
+          a->terms[t].comp != b->terms[t].comp)
+         return false;
+   }
+   return true;
+}
+
+static bool
+sum_matches_canonical(nir_scalar sum, const nir_scalar *terms, unsigned count)
+{
+   if (count != 2 || !nir_scalar_is_alu(sum) ||
+       nir_scalar_alu_op(sum) != nir_op_iadd)
+      return false;
+   nir_scalar s0 = nir_scalar_chase_alu_src(sum, 0);
+   nir_scalar s1 = nir_scalar_chase_alu_src(sum, 1);
+   return s0.def == terms[0].def && s0.comp == terms[0].comp &&
+          s1.def == terms[1].def && s1.comp == terms[1].comp;
+}
+
+static bool
+analyze_elem_candidate(nir_shader *shader, struct hash_table *ranges,
+                       nir_intrinsic_instr *intr, struct elem_candidate *out)
+{
+   if (intr->intrinsic != nir_intrinsic_load_shared &&
+       intr->intrinsic != nir_intrinsic_store_shared)
+      return false;
+
+   const unsigned bits = intr->intrinsic == nir_intrinsic_load_shared
+                            ? intr->def.bit_size
+                            : nir_src_bit_size(intr->src[0]);
+   if (bits != 16 && bits != 32)
+      return false;
+
+   const unsigned shift = util_logbase2(bits / 8);
+   nir_src *offset = nir_get_io_offset_src(intr);
+   nir_scalar s = nir_scalar_resolved(offset->ssa, 0);
+   if (s.def->bit_size != 16 || !nir_scalar_is_alu(s) ||
+       nir_scalar_alu_op(s) != nir_op_u2u16)
+      return false;
+
+   s = nir_scalar_chase_alu_src(s, 0);
+   const unsigned base = nir_intrinsic_base(intr);
+   if (base > 255 || s.def->bit_size != 32 || !nir_scalar_is_alu(s) ||
+       nir_scalar_alu_op(s) != nir_op_iadd)
+      return false;
+
+   unsigned count = 0;
+   uint64_t elements = 0;
+   if (!gather_sum(s, 3, out->terms, &count, &elements) || !count)
+      return false;
+
+   const unsigned max_lo = (255u - base) >> shift;
+   uint64_t e_hi = 0;
+   unsigned e_lo = 0;
+   if (elements <= max_lo) {
+      e_lo = elements;
+   } else {
+      const unsigned chunk = 256u >> shift;
+      e_hi = (elements / chunk) * chunk;
+      e_lo = elements - e_hi;
+      if (e_lo > max_lo)
+         return false;
+   }
+
+   uint64_t bound = 0;
+   for (unsigned t = 0; t < count; ++t)
+      bound += term_upper_bound(shader, ranges, out->terms[t], 2);
+   if (bound > UINT16_MAX - elements)
+      return false;
+
+   qsort(out->terms, count, sizeof(out->terms[0]), compare_scalars);
+   out->intr = intr;
+   out->sum = s;
+   out->count = count;
+   out->elements = elements;
+   out->e_hi = e_hi;
+   out->e_lo = e_lo;
+   out->shift = shift;
+   out->base = base;
+   return true;
+}
+
 /* Element-index lowering leaves byte additions beneath the shift/narrowing:
  * u2u16((byte_address + constant) >> log2(element_size)).  Extract a small,
  * aligned constant into LDTG/STTG's byte offset.  Both the source addition and
  * the narrowed element index must be proven not to wrap: moving an add across
  * either wrap would change the accessed address. */
 static bool
-fold_byte_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+fold_shifted_byte_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    if (intr->intrinsic != nir_intrinsic_load_shared &&
        intr->intrinsic != nir_intrinsic_store_shared)
@@ -316,36 +417,6 @@ fold_byte_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    const unsigned base = nir_intrinsic_base(intr);
    if (base > 255)
       return false;
-
-   /* An element index the lowering divided exactly keeps its constant
-    * addends inside a sum: u2u16(a + (b + constant)). Gather the sum's terms,
-    * and move the constant to the byte offset when neither the remaining sum
-    * nor the narrowing can wrap. Summing the variable terms in a fixed order
-    * lets accesses that differ only in the constant share one index. */
-   if (s.def->bit_size == 32 && nir_scalar_is_alu(s) &&
-       nir_scalar_alu_op(s) == nir_op_iadd) {
-      nir_scalar terms[4];
-      unsigned count = 0;
-      uint64_t elements = 0;
-      if (!gather_sum(s, 3, terms, &count, &elements) || !elements || !count ||
-          elements > (255 - base) >> shift)
-         return false;
-
-      uint64_t bound = 0;
-      for (unsigned t = 0; t < count; ++t)
-         bound += term_upper_bound(b->shader, data, terms[t], 2);
-      if (bound > UINT16_MAX - elements)
-         return false;
-
-      qsort(terms, count, sizeof(terms[0]), compare_scalars);
-      b->cursor = nir_before_instr(&intr->instr);
-      nir_def *variable = nir_mov_scalar(b, terms[0]);
-      for (unsigned t = 1; t < count; ++t)
-         variable = nir_iadd(b, variable, nir_mov_scalar(b, terms[t]));
-      nir_src_rewrite(offset, nir_u2u16(b, variable));
-      nir_intrinsic_set_base(intr, base + (elements << shift));
-      return true;
-   }
 
    if (!nir_scalar_is_alu(s) || nir_scalar_alu_op(s) != nir_op_ushr)
       return false;
@@ -378,13 +449,90 @@ fold_byte_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return false;
 }
 
+/* Fold exact-divided element index sums into LDTG/STTG's 8-bit byte offset.
+ * For clusters of accesses sharing the same variable terms across multiple
+ * 256-byte windows (such as strided vertical stencil taps), split
+ * elements = e_hi + e_lo into a shared chunk base (V + e_hi) plus immediate
+ * byte offset (e_lo << shift) so up to 256 / elem_size taps share one add. */
+static bool
+fold_elem_offsets_impl(nir_function_impl *impl, struct hash_table *ranges)
+{
+   struct util_dynarray cands;
+   util_dynarray_init(&cands, NULL);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         struct elem_candidate cand;
+         if (analyze_elem_candidate(impl->function->shader, ranges,
+                                    nir_instr_as_intrinsic(instr), &cand))
+            util_dynarray_append(&cands, cand);
+      }
+   }
+
+   const unsigned num_cands =
+      util_dynarray_num_elements(&cands, struct elem_candidate);
+   if (!num_cands) {
+      util_dynarray_fini(&cands);
+      return false;
+   }
+
+   struct elem_candidate *arr = cands.data;
+   nir_builder b = nir_builder_create(impl);
+   bool progress = false;
+
+   for (unsigned i = 0; i < num_cands; ++i) {
+      const struct elem_candidate *c = &arr[i];
+      unsigned var_uses = 0;
+      unsigned bucket_uses = 0;
+      for (unsigned j = 0; j < num_cands; ++j) {
+         if (!same_terms(c, &arr[j]))
+            continue;
+         var_uses++;
+         if (c->e_hi == arr[j].e_hi)
+            bucket_uses++;
+      }
+
+      bool rewrite = false;
+      if (c->e_hi == 0) {
+         if (c->e_lo > 0)
+            rewrite = true;
+         else if (c->count > 1 && var_uses >= 2 &&
+                  !sum_matches_canonical(c->sum, c->terms, c->count))
+            rewrite = true;
+      } else if (bucket_uses >= 2) {
+         rewrite = true;
+      }
+
+      if (!rewrite)
+         continue;
+
+      b.cursor = nir_before_instr(&c->intr->instr);
+      nir_def *variable = nir_mov_scalar(&b, c->terms[0]);
+      for (unsigned t = 1; t < c->count; ++t)
+         variable = nir_iadd(&b, variable, nir_mov_scalar(&b, c->terms[t]));
+      if (c->e_hi > 0)
+         variable = nir_iadd_imm(&b, variable, c->e_hi);
+      nir_src_rewrite(nir_get_io_offset_src(c->intr), nir_u2u16(&b, variable));
+      if (c->e_lo > 0)
+         nir_intrinsic_set_base(c->intr, c->base + (c->e_lo << c->shift));
+      progress = true;
+   }
+
+   util_dynarray_fini(&cands);
+   return nir_progress(progress, impl, nir_metadata_control_flow);
+}
+
 bool
 agx_nir_opt_shared_byte_offsets(nir_shader *shader)
 {
    struct hash_table *ranges = _mesa_pointer_hash_table_create(NULL);
-   bool progress = nir_shader_intrinsics_pass(shader, fold_byte_offset,
-                                              nir_metadata_control_flow,
-                                              ranges);
+   bool progress = false;
+   nir_foreach_function_impl(impl, shader)
+      progress |= fold_elem_offsets_impl(impl, ranges);
+   progress |= nir_shader_intrinsics_pass(shader, fold_shifted_byte_offset,
+                                          nir_metadata_control_flow, ranges);
    _mesa_hash_table_destroy(ranges, NULL);
    return progress;
 }
