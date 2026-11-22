@@ -397,3 +397,36 @@ TEST(DivergentLastUse, ShuffleScratchKeepsMaskedLanesZero)
    EXPECT_FALSE(s0->src[1].discard);
    EXPECT_FALSE(s1->src[1].discard);
 }
+
+/* Overwriting only the low half of a multi-half source must not mark the
+ * source as a last use while its upper half remains live. On AGX3B and AGX3C
+ * (Dynamic Caching), a discard on r0 releases both r0l and r0h; on AGX2 it is
+ * a register-cache hint that likewise applies to the whole source register. */
+TEST(RegisterCache, PartialOverwriteKeepsLiveUpperHalf)
+{
+   for (enum agx_isa_encoding enc : {AGX_ISA_ENCODING_AGX3C,
+                                     AGX_ISA_ENCODING_AGX3B,
+                                     AGX_ISA_ENCODING_AGX2}) {
+      SCOPED_TRACE(enc);
+      Shader s(enc);
+      agx_builder *b = s.b;
+      agx_block *entry = agx_start_block(b->shader);
+      b->cursor = agx_after_block(entry);
+
+      const agx_index r0 = agx_register(0, AGX_SIZE_32);
+      const agx_index r0l = agx_register(0, AGX_SIZE_16);
+      const agx_index r0h = agx_register(1, AGX_SIZE_16);
+      const agx_index r2 = agx_register(4, AGX_SIZE_32);
+
+      agx_mov_imm_to(b, r0, 0x01000000);
+      agx_mov_imm_to(b, r2, 1);
+      agx_instr *partial = agx_icmpsel_to(b, r0l, r2, r0, agx_immediate(1),
+                                          agx_immediate(0), AGX_ICOND_UEQ);
+      agx_unit_test(b, r0l);
+      agx_unit_test(b, r0h);
+
+      agx_opt_register_cache(b->shader);
+
+      EXPECT_FALSE(partial->src[1].discard);
+   }
+}
