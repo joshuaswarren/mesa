@@ -267,8 +267,9 @@ enum agx_chip_quirk {
  * not inferred. The Mac G15 parts execute AGX3b; G15G additionally needs
  * explicit scheduling nops. Every G16 part executes AGX3b.
  *
- * G17P/G17A remain on the HAL200/AGX3b side of the boundary. The M5 G/S/C
- * parts use AGX3c.
+ * G17P/G17A remain on the HAL200/AGX3b side of the boundary. The M5 G/S/C/D
+ * parts use AGX3c. G17D is the M5 Ultra: T6050 with two dies and eight
+ * clusters.
  *
  * G17P is an instruction-set and firmware-HAL profile (AGX3b shaders, HAL200
  * firmware interface), not one SoC. agx_chip_from_params() maps three SoCs to
@@ -348,6 +349,8 @@ enum agx_chip_quirk {
      AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS |           \
         AGX_QUIRK_M5_LAYER_OPERAND,                                            \
      __VA_ARGS__)                                                              \
+   X(G17D, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
+     0, __VA_ARGS__)                                                           \
    X(G18G, AGX3, AGX3D, HAL300, 10, GEN5, NONE, SKSM, HAL300,                  \
      AGX_RECORDS_G18G, AGX_QUIRK_M5_PATHS, __VA_ARGS__)
 
@@ -706,6 +709,7 @@ agx_chip_from_identity(const struct drm_asahi_params_global *params)
       case 'G': return AGX_CHIP_G17G;
       case 'S': return AGX_CHIP_G17S;
       case 'C': return AGX_CHIP_G17C;
+      case 'D': return AGX_CHIP_G17D;
       default: return AGX_CHIP_UNKNOWN;
       }
    case 18:
@@ -789,6 +793,7 @@ agx_chip_sampler_generation(enum agx_chip chip)
  *     equivalence probe and all five Vulkan CTS groups above.
  *
  * Off elsewhere:
+ *   - G17D (M5 Ultra) keeps the software rewrite until measured on the J775D.
  *   - G18G uses HAL300 records too, but has no stream-link continuation for
  *     an empty rewritten draw yet (hk_robust_index_rewrite_admitted) and its
  *     out-of-range index behaviour is unmeasured, so it stays off.
@@ -1049,9 +1054,10 @@ agx_chip_usc_base_page_fill_returns_for(enum agx_chip chip,
  * level-zero extent there (AGX_GEN10_IMAGE_EXTENT_OFFSET), so a constant
  * level-zero textureSize() is one load.
  *
- * True for the M5 Gen10 descriptor (G17G, G17S, G17C): the genxml layout has
- * no field there, Gallium's G17G buffer textures keep their element count in
- * it (AGX_GEN10_BUFFER_TEXTURE_SIZE_OFFSET), and G17C views carry the extent.
+ * True for the M5 Gen10 descriptor (G17G, G17S, G17C, G17D): the genxml
+ * layout has no field there, Gallium's G17G buffer textures keep their
+ * element count in it (AGX_GEN10_BUFFER_TEXTURE_SIZE_OFFSET), and G17C views
+ * carry the extent.
  * AGX2 descriptors are 24 bytes and have no such word. Nothing shows that
  * the Gen9 texture unit (G15, G16, G17P) or G18G's ignores it: no producer
  * writes a nonzero value there on either (G17P keeps its buffer metadata in
@@ -1098,6 +1104,8 @@ agx_chip_explicit_robust_image_bounds(enum agx_chip chip)
  *     verification on M5 Pro (G17S) / M5 (G17G) is the merge gate.
  *
  * Off elsewhere:
+ *   - G17D (M5 Ultra) keeps the software predicate until measured on the
+ *     J775D.
  *   - G18G uses the Gen10 descriptor layout too, but its texture lowering
  *     (agx_nir_lower_texture_for_generation) always applies the software
  *     predicate and its behaviour is not measured, so it stays off so that

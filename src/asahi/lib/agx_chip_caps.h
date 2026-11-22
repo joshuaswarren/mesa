@@ -67,7 +67,7 @@ enum agx_chip_cap {
     * larger power-of-two hardware workgroups (up to 256 threads, or 512 for
     * short low-register loop-free shaders) to avoid the AGX3 CDM per-workgroup
     * launch-rate floor on large grids. Measured and qualified on G17P
-    * (HAL200); off on M5 (G17G/G17S/G17C), G15, G16, G18G, and AGX2 until
+    * (HAL200); off on M5 (G17G/G17S/G17C/G17D), G15, G16, G18G, and AGX2 until
     * per-generation hardware A/B and CTS rows are collected. */
    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS = 1u << 10,
 
@@ -97,7 +97,8 @@ enum agx_chip_cap {
     AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_RESIDENCY_3D |      \
     AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER)
 
-/* What the M5 parts (G17G, G17S, G17C) share. */
+/* What the single-die M5 parts (G17G, G17S, G17C) share. G17D keeps
+ * VDM_INDIRECT_INDEX_BOUNDS and HW_TXF_BOUNDS off until measured on J775D. */
 #define AGX_CAPS_M5                                                            \
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
@@ -129,6 +130,8 @@ enum agx_chip_cap {
    X(G17G, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17S, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17C, AGX_CAPS_M5, __VA_ARGS__)                                           \
+   X(G17D, AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX,    \
+     __VA_ARGS__)                                                              \
    X(G18G, 0, __VA_ARGS__)
 
 /* Like agx_chip_has_record(), a test of the table expands to comparisons, so

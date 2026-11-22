@@ -71,7 +71,7 @@ main(void)
    for (enum agx_chip chip = 0; chip < AGX_CHIP_UNKNOWN; ++chip) {
       const enum hk_agx3_as_format format = hk_agx3_as_format_for_chip(chip);
       const bool is_m5 = chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-                         chip == AGX_CHIP_G17C;
+                         chip == AGX_CHIP_G17C || chip == AGX_CHIP_G17D;
       assert(format == (is_m5 ? HK_AGX3_AS_FORMAT_M5 : HK_AGX3_AS_FORMAT_GEN1));
       m5 += is_m5;
       gen1 += !is_m5;
@@ -104,7 +104,7 @@ main(void)
       own = is_m5 ? hk_m5_agx3_refit_spirv(&own_B) : hk_gen1_agx3_refit_spirv(&own_B);
       assert(refit && own == refit && own_B == size_B);
    }
-   assert(m5 == 3 && gen1 == AGX_CHIP_UNKNOWN - 3);
+   assert(m5 == 4 && gen1 == AGX_CHIP_UNKNOWN - 4);
 
    /* The two formats share no program, and the GEN1 triangle pair variant
     * keeps its workgroup shape. */

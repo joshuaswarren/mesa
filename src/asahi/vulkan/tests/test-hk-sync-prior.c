@@ -121,7 +121,7 @@ end_timestamp(struct hk_cmd_buffer *cmd, uint32_t query)
 /* Chips whose start stamps latch before a command's waits (hk_sync.c,
  * start_stamps_ordered()): G17P and M5. */
 static const enum agx_chip end_stamp_chips[] = {
-   AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C};
+   AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D};
 
 /* G17P and M5: ResetQueryPool leaves a reusable compute stream. A TOP_OF_PIPE
  * stamp after it ends that stream's command: start stamps latch before the

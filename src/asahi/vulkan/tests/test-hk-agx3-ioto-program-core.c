@@ -180,14 +180,14 @@ test_g17p_precompiled_data_layout(void)
 static const enum agx_chip targets[] = {
    AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
    AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
 };
 
 static bool
 is_gpu1(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
+          chip == AGX_CHIP_G17C || chip == AGX_CHIP_G17D;
 }
 
 static struct hk_agx3_ioto_program_desc
@@ -558,7 +558,7 @@ test_g17s_minimal_compute_admission(void)
    static const enum agx_chip rejected[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17C, AGX_CHIP_UNKNOWN,
+      AGX_CHIP_G17G, AGX_CHIP_G17C, AGX_CHIP_G17D, AGX_CHIP_UNKNOWN,
    };
    for (size_t i = 0; i < ARRAY_SIZE(rejected); ++i) {
       CHECK(expect_g17s_minimal_hk_failure(rejected[i], &desc,

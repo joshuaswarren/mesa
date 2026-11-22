@@ -62,12 +62,14 @@ main(void)
 
 
    /* Kernel-feature-gated cumulative signals and sibling compute queues apply
-    * uniformly across G16G, G17P, and M5 (G17G/G17S/G17C) without chip forks. */
+    * uniformly across G16G, G17P, and M5 (G17G/G17S/G17C/G17D) without chip
+    * forks. */
    const uint64_t sib_features = DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES |
                                  DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS |
                                  DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
    const enum agx_chip sib_chips[] = {
-      AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S,
+      AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(sib_chips); ++i) {
       struct agx_device qdev = {
