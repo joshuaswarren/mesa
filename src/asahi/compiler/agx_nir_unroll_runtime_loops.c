@@ -251,6 +251,59 @@ count_unrollable(nir_loop *loop, nir_if *terminator)
    return count;
 }
 
+struct varying_state {
+   BITSET_WORD *varying;
+   bool any;
+};
+
+static bool
+src_varies(nir_src *src, void *data)
+{
+   struct varying_state *st = data;
+   st->any |= BITSET_TEST(st->varying, src->ssa->index);
+   return true;
+}
+
+/* 32-bit registers one iteration's memory and texture reads fill, counting
+ * the reads whose address depends on a value the loop carries (reads of
+ * addresses that are the same every iteration, such as descriptors and the
+ * bound's parameters, are shared by the unrolled copies). */
+static unsigned
+loaded_dwords(nir_function_impl *impl, nir_loop *loop)
+{
+   BITSET_WORD *varying =
+      calloc(BITSET_WORDS(impl->ssa_alloc), sizeof(BITSET_WORD));
+   nir_block *header = nir_loop_first_block(loop);
+   unsigned dwords = 0;
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_foreach_instr(instr, block) {
+         nir_def *def = nir_instr_def(instr);
+         if (!def)
+            continue;
+         struct varying_state st = {varying, false};
+         if (instr->type == nir_instr_type_phi && block == header)
+            st.any = true;
+         else
+            nir_foreach_src(instr, src_varies, &st);
+         if (!st.any)
+            continue;
+         BITSET_SET(varying, def->index);
+
+         bool load = instr->type == nir_instr_type_tex;
+         if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            const nir_intrinsic_info *info = &nir_intrinsic_infos[intr->intrinsic];
+            load = info->has_dest && nir_intrinsic_has_align_mul(intr) &&
+                   !strncmp(info->name, "load_", 5);
+         }
+         if (load)
+            dwords += def->num_components * DIV_ROUND_UP(def->bit_size, 32);
+      }
+   }
+   free(varying);
+   return dwords;
+}
+
 static bool
 analyze_loop(nir_loop *loop, struct counted_loop *out)
 {
@@ -594,13 +647,14 @@ collect_loops(struct exec_list *list, struct util_dynarray *loops)
 
 bool
 agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
-                             unsigned max_instrs)
+                             unsigned max_instrs, unsigned *widest)
 {
    bool any = false;
    assert(factor >= 2 && factor <= 16);
 
    nir_foreach_function_impl(impl, shader) {
       nir_metadata_require(impl, nir_metadata_block_index);
+      nir_index_ssa_defs(impl);
 
       struct util_dynarray loops;
       util_dynarray_init(&loops, NULL);
@@ -620,6 +674,14 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
          unsigned f = factor;
          while (size >= 0 && f > 2 && (unsigned)size * f > max_instrs)
             f /= 2;
+         /* Beyond four iterations, keep the reads the unrolled body has in
+          * flight within 16 registers: more only raises register pressure
+          * (the scheduler issues them together) and can cost occupancy. */
+         if (size >= 0 && f > 4) {
+            const unsigned dwords = loaded_dwords(impl, *lp);
+            while (f > 4 && dwords * f > 16)
+               f /= 2;
+         }
          if (size < 0 || (unsigned)size * f > max_instrs)
             continue;
 
@@ -640,6 +702,8 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
             bounds[n] = nir_channel(&b, def, bound.comp);
          }
          factors[n] = f;
+         if (widest)
+            *widest = MAX2(*widest, f);
          candidates[n++] = cl;
       }
       util_dynarray_fini(&loops);

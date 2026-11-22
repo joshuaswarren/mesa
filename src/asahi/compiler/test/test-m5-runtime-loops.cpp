@@ -153,11 +153,11 @@ TEST(M5RuntimeLoops, TopTestedUnrolls)
    nir_def *hi;
    nir_shader *s = counted_loop(TOP_TESTED, &hi, false, INT64_MAX);
    ASSERT_EQ(count_loops(s), 1u);
-   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256));
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256, NULL));
    nir_validate_shader(s, "top-tested unroll");
    EXPECT_EQ(count_loops(s), 2u);
    /* Both loops are marked; a second run leaves them alone. */
-   EXPECT_FALSE(agx_nir_unroll_runtime_loops(s, 4, 256));
+   EXPECT_FALSE(agx_nir_unroll_runtime_loops(s, 4, 256, NULL));
    ralloc_free(s);
 }
 
@@ -165,7 +165,7 @@ TEST(M5RuntimeLoops, BottomTestedUnrolls)
 {
    nir_def *hi;
    nir_shader *s = counted_loop(BOTTOM_TESTED, &hi, false, INT64_MAX);
-   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256));
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256, NULL));
    nir_validate_shader(s, "bottom-tested unroll");
    EXPECT_EQ(count_loops(s), 2u);
    ralloc_free(s);
@@ -175,7 +175,7 @@ TEST(M5RuntimeLoops, BarrierRefused)
 {
    nir_def *hi;
    nir_shader *s = counted_loop(TOP_TESTED, &hi, true, INT64_MAX);
-   EXPECT_FALSE(agx_nir_unroll_runtime_loops(s, 4, 256));
+   EXPECT_FALSE(agx_nir_unroll_runtime_loops(s, 4, 256, NULL));
    EXPECT_EQ(count_loops(s), 1u);
    ralloc_free(s);
 }
@@ -235,14 +235,14 @@ lane_state_loop(lane_op op)
 TEST(M5RuntimeLoops, LaneStateRefused)
 {
    nir_shader *s = lane_state_loop(LANE_NONE);
-   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256));
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256, NULL));
    nir_validate_shader(s, "lane-state control after");
    EXPECT_EQ(count_loops(s), 2u);
    ralloc_free(s);
 
    for (lane_op op : {LANE_ELECT, LANE_BALLOT_COUNT, LANE_QUAD_VOTE}) {
       s = lane_state_loop(op);
-      EXPECT_FALSE(agx_nir_unroll_runtime_loops(s, 4, 256)) << "op " << op;
+      EXPECT_FALSE(agx_nir_unroll_runtime_loops(s, 4, 256, NULL)) << "op " << op;
       EXPECT_EQ(count_loops(s), 1u) << "op " << op;
       ralloc_free(s);
    }
@@ -252,7 +252,7 @@ TEST(M5RuntimeLoops, BudgetRefused)
 {
    nir_def *hi;
    nir_shader *s = counted_loop(TOP_TESTED, &hi, false, INT64_MAX);
-   EXPECT_FALSE(agx_nir_unroll_runtime_loops(s, 4, 8));
+   EXPECT_FALSE(agx_nir_unroll_runtime_loops(s, 4, 8, NULL));
    ralloc_free(s);
 }
 
@@ -284,7 +284,7 @@ TEST(M5RuntimeLoops, HeaderDefinedBackEdge)
    NIR_PASS(_, s, nir_opt_copy_prop);
    NIR_PASS(_, s, nir_opt_cse);
    NIR_PASS(_, s, nir_opt_dce);
-   ASSERT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256));
+   ASSERT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256, NULL));
    NIR_PASS(_, s, nir_opt_algebraic);
    NIR_PASS(_, s, nir_opt_constant_folding);
    NIR_PASS(_, s, nir_opt_copy_prop);
@@ -330,7 +330,7 @@ folded_guard(loop_shape shape, int64_t hi_const)
 {
    nir_def *hi;
    nir_shader *s = counted_loop(shape, &hi, false, hi_const);
-   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256));
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256, NULL));
    NIR_PASS(_, s, nir_opt_constant_folding);
    NIR_PASS(_, s, nir_opt_copy_prop);
    NIR_PASS(_, s, nir_opt_dce);
