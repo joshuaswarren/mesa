@@ -2347,52 +2347,65 @@ TEST(NativeForms, EndOfTilePreservesSamplesAndResolvesSameTile)
    /* Both outputs read offset zero. Their descriptors are distinct, and
     * only the second descriptor names a single-sample image. Keep all four
     * dimension combinations as controls; no host check establishes pixels. */
-   for (unsigned resolves = 0; resolves < 4; ++resolves) {
-      SCOPED_TRACE(resolves);
-      nir_builder b = nir_builder_init_simple_shader(
-         MESA_SHADER_COMPUTE, &agx_nir_options, "EOT store and resolve");
-      nir_def *xy = nir_trim_vector(&b, nir_load_global_invocation_id(&b, 32), 2);
-      for (unsigned pbe = 0; pbe < 2; ++pbe) {
-         nir_intrinsic_instr *intr = nir_image_store_block_agx(
-            &b, nir_imm_intN_t(&b, pbe, 16), nir_imm_int(&b, 0), xy);
-         nir_intrinsic_set_format(intr, (enum pipe_format)AIL_ISA_FORMAT_U8NORM);
-         nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_2D);
-         nir_intrinsic_set_image_array(intr, false);
-         nir_intrinsic_set_explicit_coord(intr, true);
-      }
-      agx_shader_key key = {};
-      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-      key.dev.chip = AGX_CHIP_G17P;
-      key.no_preamble = true;
-      key.g17p_rt0_eot_multisample = true;
-      key.g17p_mrt_eot_count = 2;
-      key.g17p_mrt_eot_resolve_mask = resolves;
-      key.g17p_mrt_eot_selectors[0] = 0x75;
-      key.g17p_mrt_eot_selectors[1] = 0x75;
-      agx_preprocess_nir(b.shader);
-      agx_shader_part part = {};
-      bool ok = agx_compile_shader_nir(b.shader, &key, &part);
-      EXPECT_TRUE(ok);
-      if (ok) {
-         EXPECT_EQ(part.info.binary_size, 120u);
-         EXPECT_EQ(part.info.main_size, 120u);
-         EXPECT_TRUE(part.info.agx3_staging_known);
-         EXPECT_EQ(part.info.agx3_staging_halfs, 16u);
-         if (part.info.binary_size == 120) {
-            const uint8_t *code = static_cast<const uint8_t *>(part.binary);
-            /* Native single-target MS and SS dimension fields, independently
-             * selected for each store of the existing dual-target program. */
-            for (unsigned pbe = 0; pbe < 2; ++pbe) {
-               bool ms = !(resolves & (1u << pbe));
-               EXPECT_EQ(code[pbe ? 63 : 43],
-                         (pbe ? 0x0c : 0x04) | (ms ? 0x02 : 0x00));
-               EXPECT_EQ(code[92 + 12 * pbe + 8], ms ? 0x28 : 0xa8);
-               EXPECT_EQ(code[92 + 12 * pbe + 9], ms ? 0x72 : 0x75);
+   static const struct {
+      uint8_t selector;
+      enum ail_isa_format format;
+   } cases[] = {
+      {0x75, AIL_ISA_FORMAT_U8NORM},
+      {0x15, AIL_ISA_FORMAT_F16},
+      {0x95, AIL_ISA_FORMAT_U16NORM},
+   };
+   for (const auto &c : cases) {
+      const uint8_t base_sel = c.selector;
+      SCOPED_TRACE(static_cast<unsigned>(base_sel));
+      for (unsigned resolves = 0; resolves < 4; ++resolves) {
+         SCOPED_TRACE(resolves);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "EOT store and resolve");
+         nir_def *xy = nir_trim_vector(&b, nir_load_global_invocation_id(&b, 32), 2);
+         for (unsigned pbe = 0; pbe < 2; ++pbe) {
+            nir_intrinsic_instr *intr = nir_image_store_block_agx(
+               &b, nir_imm_intN_t(&b, pbe, 16), nir_imm_int(&b, 0), xy);
+            nir_intrinsic_set_format(intr, (enum pipe_format)c.format);
+            nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_2D);
+            nir_intrinsic_set_image_array(intr, false);
+            nir_intrinsic_set_explicit_coord(intr, true);
+         }
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = AGX_CHIP_G17P;
+         key.no_preamble = true;
+         key.g17p_rt0_eot_multisample = true;
+         key.g17p_mrt_eot_count = 2;
+         key.g17p_mrt_eot_resolve_mask = resolves;
+         key.g17p_mrt_eot_selectors[0] = base_sel;
+         key.g17p_mrt_eot_selectors[1] = base_sel;
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         bool ok = agx_compile_shader_nir(b.shader, &key, &part);
+         EXPECT_TRUE(ok);
+         if (ok) {
+            EXPECT_EQ(part.info.binary_size, 120u);
+            EXPECT_EQ(part.info.main_size, 120u);
+            EXPECT_TRUE(part.info.agx3_staging_known);
+            EXPECT_EQ(part.info.agx3_staging_halfs, 16u);
+            if (part.info.binary_size == 120) {
+               const uint8_t *code = static_cast<const uint8_t *>(part.binary);
+               /* Native single-target MS and SS dimension fields, independently
+                * selected for each store of the existing dual-target program. */
+               for (unsigned pbe = 0; pbe < 2; ++pbe) {
+                  bool ms = !(resolves & (1u << pbe));
+                  EXPECT_EQ(code[pbe ? 63 : 43],
+                            (pbe ? 0x0c : 0x04) | (ms ? 0x02 : 0x00));
+                  EXPECT_EQ(code[92 + 12 * pbe + 8], ms ? 0x28 : 0xa8);
+                  EXPECT_EQ(code[92 + 12 * pbe + 9],
+                            ms ? ((base_sel & 0xf0) | 0x02) : base_sel);
+               }
             }
          }
+         free(part.binary);
+         ralloc_free(b.shader);
       }
-      free(part.binary);
-      ralloc_free(b.shader);
    }
 }
 

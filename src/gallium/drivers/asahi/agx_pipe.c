@@ -2035,11 +2035,12 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
     *
     * This case matters a LOT for performance in workloads that split batches.
     */
-   /* A direct resolve also writes a different image: loaded samples in
-    * tiles without geometry must reach that destination. */
+   /* A direct resolve also writes a different image: loaded or cleared
+    * samples in tiles without geometry must reach that destination even if
+    * the multisample source attachment was subsequently invalidated. */
    if ((batch->clear & batch->resolve) ||
        (agx_chip_native_agx3(dev->chip) && batch->key.resolve &&
-        (batch->load & PIPE_CLEAR_COLOR0)))
+        ((batch->load | batch->clear) & PIPE_CLEAR_COLOR0)))
       c->flags |= DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
 
    if (batch->vs_scratch) {
@@ -2416,20 +2417,35 @@ agx_invalidate_resource(struct pipe_context *pctx,
 {
    struct agx_context *ctx = agx_context(pctx);
    struct agx_resource *rsrc = agx_resource(resource);
-   struct agx_batch *batch = agx_get_batch(ctx);
 
-   /* Handle the glInvalidateFramebuffer case */
-   if (batch->key.zsbuf.texture == resource) {
+   /* Handle the glInvalidateFramebuffer case, including batches whose
+    * ctx->batch pointer was cleared after attaching a direct MSAA resolve.
+    * Targeting the resource's active writer batch (not only ctx->batch) is
+    * safe because contents are undefined after invalidate, so any pending
+    * writer may drop its store. */
+   struct agx_batch *batch =
+      rsrc->bo ? agx_writer_get(ctx, rsrc->bo->handle) : NULL;
+   if (!batch || !agx_batch_is_active(batch) || !batch->initialized)
+      batch = ctx->batch;
+
+   if (batch && batch->key.zsbuf.texture == resource) {
       batch->resolve &= ~PIPE_CLEAR_DEPTHSTENCIL;
       ctx->dirty |= AGX_DIRTY_ZS;
    }
 
-   for (unsigned i = 0; i < batch->key.nr_cbufs; ++i) {
+   for (unsigned i = 0; batch && i < batch->key.nr_cbufs; ++i) {
       const struct pipe_surface *surf = &batch->key.cbufs[i];
 
       if (surf->texture == resource) {
          batch->resolve &= ~(PIPE_CLEAR_COLOR0 << i);
          ctx->dirty |= AGX_DIRTY_BLEND;
+
+         /* Only blit-attached resolves detach ctx->batch so no later draw can
+          * enter the batch. A DRI MSAA visual carries key.resolve on an active
+          * ctx->batch and can keep taking draws after glInvalidateFramebuffer,
+          * so it must keep g17p_resolve_preserve set. */
+         if (i == 0 && batch->key.resolve && batch->g17p_resolve_blit_attached)
+            batch->g17p_resolve_preserve = false;
       }
    }
 

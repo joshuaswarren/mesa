@@ -606,6 +606,45 @@ check_direct_resolve_shapes(void)
       fprintf(stderr, "exact XRGB8 resolve shape was rejected\n");
       return false;
    }
+   static const enum pipe_format accepted_formats[] = {
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R16G16_FLOAT,
+      PIPE_FORMAT_R16_FLOAT,
+      PIPE_FORMAT_R16G16B16A16_UNORM,
+      PIPE_FORMAT_R16G16B16A16_SNORM,
+      PIPE_FORMAT_R10G10B10A2_UNORM,
+      PIPE_FORMAT_R8G8B8A8_SNORM,
+      PIPE_FORMAT_R8_UNORM,
+      PIPE_FORMAT_R5G6B5_UNORM,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(accepted_formats); ++i) {
+      src.format = dst.format = info.src.format = info.dst.format =
+         accepted_formats[i];
+      if (!agx_g17p_direct_resolve_blit_shape(&info, true)) {
+         fprintf(stderr, "direct resolve format %s was rejected\n",
+                 util_format_short_name(accepted_formats[i]));
+         return false;
+      }
+   }
+   static const enum pipe_format rejected_formats[] = {
+      PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R32_FLOAT,
+      PIPE_FORMAT_R11G11B10_FLOAT,
+      PIPE_FORMAT_R9G9B9E5_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_SRGB,
+      PIPE_FORMAT_R8G8B8A8_UINT,
+      PIPE_FORMAT_R16G16B16A16_SINT,
+      PIPE_FORMAT_Z32_FLOAT,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(rejected_formats); ++i) {
+      src.format = dst.format = info.src.format = info.dst.format =
+         rejected_formats[i];
+      if (agx_g17p_direct_resolve_blit_shape(&info, true)) {
+         fprintf(stderr, "unsupported direct resolve format %s was accepted\n",
+                 util_format_short_name(rejected_formats[i]));
+         return false;
+      }
+   }
    src.format = dst.format = info.src.format = info.dst.format =
       PIPE_FORMAT_R8G8B8A8_UNORM;
 
@@ -898,6 +937,18 @@ check_staged_resolve_shapes(void)
       PIPE_FORMAT_B8G8R8X8_UNORM;
    if (!agx_g17p_staged_resolve_blit_shape(&info)) {
       fprintf(stderr, "partial XRGB8 resolve staging shape was rejected\n");
+      return false;
+   }
+   src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R16G16B16A16_FLOAT;
+   if (!agx_g17p_staged_resolve_blit_shape(&info)) {
+      fprintf(stderr, "partial RGBA16F resolve staging shape was rejected\n");
+      return false;
+   }
+   src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R32G32B32A32_FLOAT;
+   if (agx_g17p_staged_resolve_blit_shape(&info)) {
+      fprintf(stderr, "partial RGBA32F resolve staging shape was accepted\n");
       return false;
    }
    src.format = dst.format = info.src.format = info.dst.format =
@@ -2230,6 +2281,112 @@ main(void)
    pipe_resource_reference(&xrgb8_msaa, NULL);
    pipe_resource_reference(&xrgb8_resolve, NULL);
    printf("G17P XRGB8 2x clear/direct-resolve completed\n");
+
+   /* Exercise 4x RGBA16F direct resolve both preserving the MSAA source and
+    * discarding it via invalidate_resource after attaching the resolve. */
+   struct pipe_resource rgba16f_msaa_template = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_R16G16B16A16_FLOAT,
+      .width0 = 64,
+      .height0 = 64,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 0,
+      .nr_samples = 4,
+      .nr_storage_samples = 4,
+      .usage = PIPE_USAGE_DEFAULT,
+      .bind = PIPE_BIND_RENDER_TARGET,
+   };
+   struct pipe_resource *rgba16f_msaa =
+      screen->resource_create(screen, &rgba16f_msaa_template);
+   struct pipe_resource *rgba16f_resolve =
+      make_2d(screen, PIPE_FORMAT_R16G16B16A16_FLOAT, 64, 64,
+              PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+   if (!rgba16f_msaa || !rgba16f_resolve) {
+      fprintf(stderr, "RGBA16F 4x render target was not advertised\n");
+      return 1;
+   }
+   struct pipe_framebuffer_state rgba16f_msaa_fb = {
+      .width = 64,
+      .height = 64,
+      .layers = 1,
+      .samples = 4,
+      .nr_cbufs = 1,
+   };
+   rgba16f_msaa_fb.cbufs[0] = (struct pipe_surface){
+      .texture = rgba16f_msaa,
+      .format = PIPE_FORMAT_R16G16B16A16_FLOAT,
+      .first_layer = 0,
+      .last_layer = 0,
+      .level = 0,
+   };
+   const struct pipe_blit_info rgba16f_resolve_blit = {
+      .src = {
+         .resource = rgba16f_msaa,
+         .format = PIPE_FORMAT_R16G16B16A16_FLOAT,
+         .box = {.width = 64, .height = 64, .depth = 1},
+      },
+      .dst = {
+         .resource = rgba16f_resolve,
+         .format = PIPE_FORMAT_R16G16B16A16_FLOAT,
+         .box = {.width = 64, .height = 64, .depth = 1},
+      },
+      .mask = PIPE_MASK_RGBA,
+      .filter = PIPE_TEX_FILTER_NEAREST,
+   };
+   pctx->set_framebuffer_state(pctx, &rgba16f_msaa_fb);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &xrgb8_clear, 0.0, 0);
+   pctx->blit(pctx, &rgba16f_resolve_blit);
+   pctx->flush(pctx, NULL, 0);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &xrgb8_clear, 0.0, 0);
+   pctx->blit(pctx, &rgba16f_resolve_blit);
+   {
+      struct agx_context *actx = agx_context(pctx);
+      struct agx_batch *rb =
+         agx_writer_get(actx, agx_resource(rgba16f_msaa)->bo->handle);
+      if (agx_chip_native_agx3(agx_device(screen)->chip)) {
+         if (!rb || !rb->key.resolve || !rb->g17p_resolve_blit_attached ||
+             !rb->g17p_resolve_preserve) {
+            fprintf(stderr,
+                    "RGBA16F blit-attached resolve batch did not preserve source\n");
+            return 1;
+         }
+         pctx->invalidate_resource(pctx, rgba16f_msaa);
+         if (rb->g17p_resolve_preserve ||
+             (rb->resolve & PIPE_CLEAR_COLOR0) ||
+             !(rb->clear & PIPE_CLEAR_COLOR0)) {
+            fprintf(stderr,
+                    "invalidate_resource left unexpected resolve/clear state on blit-attached batch\n");
+            return 1;
+         }
+      } else {
+         pctx->invalidate_resource(pctx, rgba16f_msaa);
+      }
+   }
+   pctx->flush(pctx, NULL, 0);
+
+   /* A DRI MSAA visual carries key.resolve on an active ctx->batch that keeps
+    * taking draws after glInvalidateFramebuffer(). Invalidating it must NOT
+    * clear g17p_resolve_preserve, or later draws before flush lose their MSAA
+    * store. */
+   rgba16f_msaa_fb.resolve = rgba16f_resolve;
+   pctx->set_framebuffer_state(pctx, &rgba16f_msaa_fb);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &xrgb8_clear, 0.0, 0);
+   pctx->invalidate_resource(pctx, rgba16f_msaa);
+   {
+      struct agx_context *actx = agx_context(pctx);
+      struct agx_batch *dri_b = actx->batch;
+      if (!dri_b || dri_b->key.resolve != rgba16f_resolve ||
+          dri_b->g17p_resolve_blit_attached || !dri_b->g17p_resolve_preserve) {
+         fprintf(stderr,
+                 "invalidate_resource cleared g17p_resolve_preserve on active DRI MSAA batch\n");
+         return 1;
+      }
+   }
+   pctx->flush(pctx, NULL, 0);
+   pipe_resource_reference(&rgba16f_msaa, NULL);
+   pipe_resource_reference(&rgba16f_resolve, NULL);
+   printf("G17P RGBA16F 4x clear/direct-resolve/invalidate completed\n");
 
    struct pipe_resource *mrt_xrgb =
       make_2d(screen, PIPE_FORMAT_R8G8B8X8_UNORM, 8, 8,

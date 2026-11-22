@@ -621,6 +621,7 @@ struct agx_batch {
    /* Only a loader-provided resolve may seed the multisample tile reload. */
    bool g17p_resolve_reload;
    bool g17p_resolve_preserve;
+   bool g17p_resolve_blit_attached;
 
    /* M5: every colour attachment of this multi-attachment batch stays in the
     * tilebuffer, moved by the multi-target tile programs
