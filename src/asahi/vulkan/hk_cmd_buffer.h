@@ -116,6 +116,7 @@ struct hk_g17p_prepared_bind_tail {
    uint8_t provoking;
    uint8_t occlusion_mode;
    uint8_t viewport_count;
+   uint8_t effective_fragment_pass_type;
    bool generate_primitive_id;
    bool force_never_in_shader;
    bool in_meta;
@@ -637,6 +638,14 @@ struct hk_rendering_state {
     * this physical stream assuming tile-memory reads. Any subsequent draw that
     * falls back to texture-backed input attachment reads must split first. */
    bool kept_local_read_barrier;
+
+   /* Partial-MRT HSR background liveness for the first stream of the pass:
+    * bg_live_mask marks bound colour attachments whose initial BG contents
+    * must be preserved (LOAD_OP_LOAD or LOAD_OP_CLEAR), and bg_clear_fill_rt
+    * encodes 2-bit agx_epilog_clear_fill codes for LOAD_OP_CLEAR attachments
+    * whose clear value can be materialized directly in the fragment epilog. */
+   uint8_t bg_live_mask;
+   uint16_t bg_clear_fill_rt;
 };
 
 struct hk_index_buffer_state {
@@ -933,11 +942,18 @@ struct hk_graphics_state {
       struct hk_fast_link_key_fs key;
       uint64_t desc_gen;
       bool valid;
-      /* Colour attachments the linked fragment program writes, and whether
-       * it reads the tilebuffer. */
+      /* Colour attachments the linked fragment program writes (including any
+       * epilog clear-fill targets), those written by the application shader
+       * itself, the stream clear-fill code snapshot used to build `key`, and
+       * whether the linked program reads the tilebuffer. */
       uint8_t color_written;
+      uint8_t app_color_written;
+      uint16_t bg_clear_fill_rt;
       bool reads_tib;
    } fast_link_fs;
+
+   /* Effective AGX_PASS_TYPE_* selected for the active draw (hk_partial_mrt_hsr). */
+   uint8_t effective_fragment_pass_type;
 
    /* Keep these four native graphics caches contiguous: AGX2 resets leave
     * their zero-initialized storage untouched.
@@ -1312,6 +1328,21 @@ struct hk_cs {
     * (vkCmdEndRendering without SUSPENDING) its render pass: it is the whole
     * pass, not a part split off or continued. */
    bool g17p_pass_begins, g17p_pass_ends;
+
+   /* Partial-MRT HSR per-stream tracking:
+    * - bg_live_mask: bound colour attachments whose stream BG shader (bg.main
+    *   or bg.partial) holds live contents that ISP HSR must not skip.
+    * - bg_clear_fill_rt: 2-bit agx_epilog_clear_fill codes for LOAD_OP_CLEAR
+    *   attachments on the first stream of a non-resuming pass (0 on later
+    *   streams where bg.main reloads partial results).
+    * - user_color_written_mask: colour attachments written by application
+    *   draws or mid-pass vkCmdClearAttachments in this stream.
+    * - opaque_color_written: colour attachments written by pending
+    *   opaque/punch-through draws in the current HSR batch. */
+   uint8_t bg_live_mask;
+   uint16_t bg_clear_fill_rt;
+   uint8_t user_color_written_mask;
+   uint8_t opaque_color_written;
 
    /* A G17P mesh launch is recorded into this render stream. The A18 Pro
     * loses the vertex output of the mesh workgroup in flight whenever the
@@ -1951,6 +1982,12 @@ struct hk_cmd_buffer {
    /* CmdClearAttachments is the sole vk_meta operation affected by
     * conditional rendering. */
    bool conditional_meta;
+
+   /* True while recording the meta draw inside vkCmdClearAttachments. */
+   bool in_clear_attachments;
+
+   /* True while hk_begin_rendering() records its pass-start clear draw. */
+   bool in_begin_rendering_clear;
 
    /* Single-kick vkCmdTraceRays* on M5: while set, hk_dispatch_m5_native
     * writes the kernel's launch record (40-byte direct launch + barrier) here

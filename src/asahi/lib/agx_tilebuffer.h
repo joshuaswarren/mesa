@@ -186,6 +186,19 @@ bool agx_nir_lower_tilebuffer(struct nir_shader *shader,
                               bool preserve_zero_mask,
                               bool lower_g17p_formats);
 
+struct agx_tilebuffer_lower_info {
+   /* True if translucency was required for any reason other than an unwritten
+    * bound attachment (masked/zero colormask, sample mask, tile/memory load,
+    * or spilled tilebuffer). */
+   bool translucent_other;
+
+   /* True if at least one bound attachment was not statically written. */
+   bool has_unwritten_rt;
+
+   /* Bitmask of bound render targets statically written by the shader. */
+   uint8_t outputs_written;
+};
+
 /* As agx_nir_lower_tilebuffer, plus explicit software sRGB and R11G11B10
  * conversions of tile values and, with x_alpha_one, 1.0 stored into the X
  * channel of RGBX/BGRX targets (all used on G18G). ms_whole_sample: the
@@ -197,6 +210,13 @@ bool agx_nir_lower_tilebuffer_with_conversions(
    bool *translucent, bool preserve_zero_mask, bool lower_srgb,
    bool lower_r11g11b10, bool ms_whole_sample, bool lower_g17p_formats,
    bool x_alpha_one);
+
+bool agx_nir_lower_tilebuffer_with_conversions_info(
+   struct nir_shader *shader, struct agx_tilebuffer_layout *tib,
+   uint8_t *colormasks, unsigned *bindless_base, struct nir_def *write_samples,
+   bool *translucent, bool preserve_zero_mask, bool lower_srgb,
+   bool lower_r11g11b10, bool ms_whole_sample, bool lower_g17p_formats,
+   bool x_alpha_one, struct agx_tilebuffer_lower_info *info_out);
 /* Put spilled render target accesses back on immediate texture state slots
  * after descriptor crawling has run (G17G's bindful image accesses). */
 bool agx_nir_rebind_spilled_rts(struct nir_shader *shader);

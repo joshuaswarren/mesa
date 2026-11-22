@@ -5279,9 +5279,12 @@ hk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
       if (pAttachments[i].aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT |
                                         VK_IMAGE_ASPECT_STENCIL_BIT))
          hk_g17p_note_depth_clear(cmd, pAttachments[i].aspectMask);
-      if (pAttachments[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
-         cmd->state.gfx.render.color_written |=
-            BITFIELD_BIT(pAttachments[i].colorAttachment);
+      if (pAttachments[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+         const uint8_t bit = BITFIELD_BIT(pAttachments[i].colorAttachment);
+         cmd->state.gfx.render.color_written |= bit;
+         if (!cmd->in_begin_rendering_clear && cmd->current_cs.gfx)
+            cmd->current_cs.gfx->user_color_written_mask |= bit;
+      }
    }
 
    struct hk_meta_save save;
@@ -5291,8 +5294,10 @@ hk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
     * rendering command and remains inside an active conditional scope. */
    assert(!cmd->conditional_meta);
    cmd->conditional_meta = true;
+   cmd->in_clear_attachments = true;
    vk_meta_clear_attachments(&cmd->vk, &dev->meta, &render_info,
                              attachmentCount, pAttachments, rectCount, pRects);
+   cmd->in_clear_attachments = false;
    cmd->conditional_meta = false;
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
 }

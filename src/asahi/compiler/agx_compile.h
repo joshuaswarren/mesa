@@ -203,6 +203,15 @@ struct agx_shader_info {
    /* Does the shader read the tilebuffer? */
    bool reads_tib;
 
+   /* Set on fragment epilogs / monolithic fragment shaders whose reads_tib was
+    * forced solely because one or more bound colour attachments are unwritten.
+    */
+   bool translucent_only_for_unwritten_rts;
+
+   /* Bitmask of bound colour attachments written by this fragment epilog /
+    * monolithic fragment shader. */
+   uint8_t color_rts_written;
+
    /* Does the shader require early fragment tests? */
    bool early_fragment_tests;
 
