@@ -3559,7 +3559,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
        * shader rule); the replacement below then clamps it and substitutes
        * the API point size whenever the size is not per-vertex.
        */
-      if (dev->chip == AGX_CHIP_G18G && so->gs_mode == MESA_PRIM_POINTS)
+      if (agx_chip_hal300_path(dev->chip) && so->gs_mode == MESA_PRIM_POINTS)
          NIR_PASS(_, gs_copy, nir_lower_default_point_size);
 
       /* Replace the point size write if present, but do not insert a write:
@@ -3571,10 +3571,10 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
 
       NIR_PASS(_, gs_copy, nir_lower_io_to_scalar, nir_var_shader_out, NULL,
                NULL);
-      /* G18G keys its geometry variants on asahi_gs_shader_key; every other
-       * chip's geometry key is the compute key and carries none of this. */
-      const bool g18_gs_key = dev->chip == AGX_CHIP_G18G;
-      if (g18_gs_key && key_->gs.trim_rast_varyings) {
+      /* HAL300 chips trim unused geometry copy outputs via asahi_gs_shader_key
+       * so the rasterization copy program only exports fragment-read varyings. */
+      const bool hal300_gs_key = agx_chip_hal300_path(dev->chip);
+      if (hal300_gs_key && key_->gs.trim_rast_varyings) {
          uint64_t keep = key_->gs.rast_varyings;
          NIR_PASS(_, gs_copy, nir_shader_intrinsics_pass,
                   agx_nir_trim_rast_output, nir_metadata_control_flow, &keep);
@@ -4897,7 +4897,7 @@ agx_update_gs_copy_link(struct agx_context *ctx, struct agx_batch *batch)
 
    ctx->linked.gs_copy = NULL;
    if (!ctx->gs || !ctx->gs->gs_copy ||
-       !agx_chip_native_or_g18g(dev->chip))
+       !agx_chip_agx3_path(dev->chip))
       return;
 
    struct agx_compiled_shader *copy = ctx->gs->gs_copy;
@@ -4959,7 +4959,7 @@ agx_update_gs(struct agx_context *ctx, const struct pipe_draw_info *info,
        * fragment input). Rasterizing an output nothing reads is
        * unobservable, so the copy program exports only what the fragment
        * shader reads. */
-      if (dev->chip == AGX_CHIP_G18G) {
+      if (agx_chip_hal300_path(dev->chip)) {
          key.trim_rast_varyings = true;
          key.rast_varyings = fs ? fs->info.inputs_read : 0;
       }
@@ -11390,7 +11390,10 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
 {
    struct agx_context *ctx = batch->ctx;
    struct agx_device *dev = agx_device(ctx->base.screen);
-   const struct agx_compiled_shader *vs = ctx->vs;
+   struct agx_compiled_shader *hw_vs = ctx->gs ? ctx->gs->gs_copy : ctx->vs;
+   struct agx_linked_shader *hw_vs_linked =
+      ctx->gs ? ctx->linked.gs_copy : ctx->linked.vs;
+   const struct agx_compiled_shader *vs = hw_vs;
    struct agx_linked_shader *fs = ctx->linked.fs;
    const struct agx_rasterizer *rast = ctx->rast;
    struct agx_varyings_fs *cf = fs ? &fs->cf : NULL;
@@ -11597,7 +11600,6 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
 
    M5_DRAW_OUTSIDE(!vs, "no vertex shader");
    M5_DRAW_OUTSIDE(!fs, "no fragment shader");
-   M5_DRAW_OUTSIDE(ctx->gs, "geometry shader");
    if (vs && fs && cf) {
       M5_DRAW_OUTSIDE(!no_varyings && !color_varying && !position_only,
                       "varyings outside the colour shape");
@@ -11654,7 +11656,6 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
                       batch->tilebuffer_layout.nr_samples != 2 &&
                       batch->tilebuffer_layout.nr_samples != 4,
                    "multisampled");
-   M5_DRAW_OUTSIDE(rast->base.rasterizer_discard, "rasterizer discard");
    M5_DRAW_OUTSIDE(rast->base.fill_front != PIPE_POLYGON_MODE_FILL ||
                       rast->base.fill_back != PIPE_POLYGON_MODE_FILL,
                    "polygon fill mode");
@@ -11757,7 +11758,7 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
    }
 
    uint64_t vertex_program = 0, fragment_program = 0;
-   agx_build_pipeline(batch, ctx->vs, ctx->linked.vs,
+   agx_build_pipeline(batch, hw_vs, hw_vs_linked,
                       MESA_SHADER_VERTEX, 0, 0, &vertex_program, NULL);
    agx_build_pipeline(batch, ctx->fs, ctx->linked.fs,
                       MESA_SHADER_FRAGMENT, 0, 0, &fragment_program, NULL);
@@ -11769,10 +11770,21 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
       return NULL;
    }
 
+   /* Match Borealis (hk_native_vertex_template_enabled): keep the vertex
+    * template enabled when the hardware vertex/GS-copy program writes memory
+    * or transform feedback, and rely on the PPP rasterizer_discard bit below
+    * to suppress fragment rasterization. */
+   const struct agx_uncompiled_shader *hw_vs_uncompiled =
+      hw_vs->so ? hw_vs->so
+                : (ctx->gs ? ctx->stage[MESA_SHADER_GEOMETRY].shader
+                           : ctx->stage[MESA_SHADER_VERTEX].shader);
+   const bool writes_memory =
+      (hw_vs_uncompiled && hw_vs_uncompiled->info.writes_memory) ||
+      ctx->streamout.num_targets > 0;
    const struct agx_vdm_state_update_draw_info draw_info = {
       .source_layout = AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_AGX3_VERTEX_PROGRAM_VARIANT,
       .draw_path = AGX_VDM_STATE_UPDATE_DRAW_DIRECT_NONINDEXED,
-      .rasterization_enabled = true,
+      .rasterization_enabled = !rast->base.rasterizer_discard || writes_memory,
       .raw_provoking_selector = rast->base.flatshade_first ? 0 : 2,
       .template_info = {
          .pipeline = vertex_program,
@@ -11835,7 +11847,7 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
          ((cf && cf->reads_z) ? 0x200000 : 0) |
          ((UINT32_C(1) << clip_dist_words) - 1),
       .cull_mode = rast->base.cull_face,
-      .front_face_ccw = rast->base.front_ccw, .point_size_output = psiz,
+      .front_face_ccw = agx_front_face_ccw(ctx), .point_size_output = psiz,
       /* The same provoking vertex as the VDM selector above. Honeykrisp
        * programs both on M5 (46478b5cfdc: with the PPP selector left at 0,
        * clipped last-vertex triangles took their flat inputs from vertex 0),
@@ -11878,6 +11890,7 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
       .front_stencil_reference = ctx->stencil_ref.ref_value[0],
       .back_stencil_reference =
          ctx->stencil_ref.ref_value[ctx->zs->base.stencil[1].enabled ? 1 : 0],
+      .rasterizer_discard = rast->base.rasterizer_discard,
    };
    struct agx_ppp_hal300_graphics_core graphics;
    if (!agx_ppp_hal300_graphics_core_pack(dev->chip, &graphics_fields, &graphics))
@@ -14324,8 +14337,9 @@ agx_needs_passthrough_gs(struct agx_context *ctx,
 
    /* TODO: this is really sloppy, we should add a VDM kernel for this.
     *
-    * M5 rasterizes no geometry-shader draw; its tessellation prepass counts
-    * the primitives instead (agx_draw_patches), as hk does.
+    * On M5, the tessellation prepass counts primitives directly
+    * (agx_draw_patches), as Borealis does, so patch draws do not need a
+    * passthrough GS for indirect primitive queries.
     */
    if ((indirect || info->mode == MESA_PRIM_PATCHES) && ctx->active_queries &&
        ctx->prims_generated[0] &&
@@ -16236,7 +16250,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
          ib = batch->geom_index;
          ib_extent = index_rsrc.bo->size - (batch->geom_index - ib);
       } else if (gsi->shape == POLY_GS_SHAPE_STATIC_INDEXED &&
-                 agx_device(ctx->base.screen)->chip == AGX_CHIP_G18G &&
+                 agx_chip_hal300_path(agx_device(ctx->base.screen)->chip) &&
                  agx_vdm_index_list_direct_is_hal300_inline(
                     agx_device(ctx->base.screen)->chip)) {
          /* HAL300 index lists take U16 or U32 indices only, as for the U8
@@ -16258,16 +16272,6 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
        * between the GS prepass and the GS rast program.
        */
       agx_update_descriptors(batch, ctx->gs->gs_copy);
-
-      /* Transform feedback and the primitive queries are produced by the
-       * prepass dispatches above; the rasterization draw only shades
-       * fragments. With rasterizer discard there are none, and the G17G
-       * draw profile has no witness for the indexed, restart-enabled draw
-       * the copy program needs, so the work is complete here. Refusing it
-       * would drop the whole batch, prepass included. */
-      if (agx_chip_g17_m5(agx_device(ctx->base.screen)->chip) &&
-          ctx->rast->base.rasterizer_discard)
-         return;
    }
 
    /* The geometry-shader and tessellation rasterization draws are indirect
