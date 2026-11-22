@@ -788,12 +788,11 @@ TEST(AGX3VisionOpts, SmallWindowUnswitchExactThreeAndFour)
       }
 
       if (mode == 0) {
-         /* Exact 3-tap inner loop is completely eliminated (max depth 1), so
-          * the outer loop becomes innermost and is eligible for runtime unroll
-          * with 3 straight-line loads per outer iteration. */
-         EXPECT_EQ(max_depth, 1u);
-         EXPECT_GE(count_intrinsics(b.shader, nir_intrinsic_load_agx), 3u);
-         EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_agx) % 3u, 0u);
+         /* Exact 3x3 window: both inner and outer loops are completely peeled
+          * into 9 straight-line loads with zero remaining loops. */
+         EXPECT_EQ(max_depth, 0u);
+         EXPECT_EQ(loops, 0u);
+         EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_agx), 9u);
       } else if (mode == 1) {
          /* 5-tap: 4 straight-line loads + 1 in compact remainder loop. */
          EXPECT_EQ(max_depth, 2u);
@@ -1001,10 +1000,17 @@ TEST(AGX3VisionOpts, SmallWindowUnswitchDecreasing)
 
       unsigned loops = 0, max_depth = 0;
       count_loop_shape(b.impl, &loops, &max_depth);
-      if (mode == 0 || mode == 3) {
+      if (mode == 0) {
+         /* Inner trip == 3 (exclusive span=3), outer trip == 4 (inclusive span=3):
+          * inner peeled straight-line, outer remains a depth-1 loop. */
          EXPECT_EQ(max_depth, 1u);
          EXPECT_GE(count_intrinsics(b.shader, nir_intrinsic_load_agx), 3u);
          EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_agx) % 3u, 0u);
+      } else if (mode == 3) {
+         /* Exact 3x3 (inclusive span=2 on both axes): both loops peeled. */
+         EXPECT_EQ(max_depth, 0u);
+         EXPECT_EQ(loops, 0u);
+         EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_agx), 9u);
       } else if (mode == 1) {
          EXPECT_EQ(max_depth, 2u);
          EXPECT_EQ(loops, 2u);
@@ -1113,9 +1119,9 @@ TEST(AGX3VisionOpts, SmallWindowUnswitchUnsigned)
       unsigned loops = 0, max_depth = 0;
       count_loop_shape(b.impl, &loops, &max_depth);
       if (mode == 0 || mode == 3) {
-         EXPECT_EQ(max_depth, 1u);
-         EXPECT_GE(count_intrinsics(b.shader, nir_intrinsic_load_agx), 3u);
-         EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_agx) % 3u, 0u);
+         EXPECT_EQ(max_depth, 0u);
+         EXPECT_EQ(loops, 0u);
+         EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_agx), 9u);
          EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_store_global), 1u);
       } else if (mode == 1) {
          EXPECT_EQ(max_depth, 2u);
@@ -1210,7 +1216,8 @@ TEST(AGX3VisionOpts, SmallWindowUnswitchExactThreeLiveOutIV)
 
    unsigned loops = 0, max_depth = 0;
    count_loop_shape(b.impl, &loops, &max_depth);
-   EXPECT_EQ(max_depth, 1u);
+   EXPECT_EQ(max_depth, 0u);
+   EXPECT_EQ(loops, 0u);
 
    unsigned iv_stores = 0;
    nir_foreach_block(block, b.impl) {
@@ -1295,10 +1302,10 @@ TEST(AGX3VisionOpts, SmallWindowUnswitchInnerStore)
       const unsigned n_loads = count_intrinsics(b.shader, nir_intrinsic_load_agx);
       const unsigned n_stores = count_intrinsics(b.shader, nir_intrinsic_store_agx);
       if (mode == 0) {
-         EXPECT_EQ(max_depth, 1u);
-         EXPECT_GE(n_stores, 3u);
-         EXPECT_EQ(n_stores % 3u, 0u);
-         EXPECT_EQ(n_stores, n_loads);
+         EXPECT_EQ(max_depth, 0u);
+         EXPECT_EQ(loops, 0u);
+         EXPECT_EQ(n_stores, 9u);
+         EXPECT_EQ(n_loads, 9u);
       } else {
          EXPECT_EQ(max_depth, 2u);
          EXPECT_EQ(loops, 2u);
@@ -1392,6 +1399,118 @@ TEST(AGX3VisionOpts, SameBlockStoreLoadForward)
       } else {
          EXPECT_FALSE(progress);
          EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_agx), 1u);
+      }
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(AGX3VisionOpts, Exact3x3OuterPeelAndGuards)
+{
+   for (unsigned mode = 0; mode < 7; ++mode) {
+      /* mode 0: 3x6 window (inner == 3, outer == 6) -> inner peeled, outer stays loop
+       * mode 1: 3x3 with two inner loops -> outer stays loop (count_nested_loops guard)
+       * mode 2: 3x3 with barrier in outer body -> outer stays loop (outer_peelable guard)
+       * mode 3: 3x2 window (inner == 3, outer == 2) -> inner peeled, outer stays loop
+       * mode 4: 3x4 window (inner == 3, outer == 4) -> inner peeled, outer stays loop
+       * mode 5: 3x3 with outer REL_LE bound at INT32_MAX -> no-wrap guard keeps outer loop
+       * mode 6: exact 3x3 window -> both outer and inner peel completely (9 loads, 0 loops) */
+      nir_builder b = make_compute_shader("exact-3x3-outer-guards");
+      nir_def *base = make_desc_base(&b, 0);
+      nir_def *out = make_desc_base(&b, 8);
+      nir_def *x0 = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 20);
+      nir_def *y0 = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 20);
+      nir_def *xrad = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8), .range = 20);
+      nir_def *yrad = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 12), .range = 20);
+      nir_def *stride = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 16), .range = 20);
+      nir_def *xhi = nir_iadd(&b, x0, xrad);
+      nir_def *yhi = nir_iadd(&b, y0, yrad);
+
+      nir_variable *acc_var = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_variable *y_var = nir_local_variable_create(b.impl, glsl_int_type(), "y");
+      nir_variable *x_var = nir_local_variable_create(b.impl, glsl_int_type(), "x");
+      nir_store_var(&b, acc_var, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, y_var, y0, 1);
+
+      nir_loop *outer = nir_push_loop(&b);
+      {
+         nir_def *y = nir_load_var(&b, y_var);
+         nir_if *yex = nir_push_if(&b, nir_ilt(&b, yhi, y));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, yex);
+
+         nir_def *row_off = nir_imul(&b, y, stride);
+         nir_store_var(&b, x_var, x0, 1);
+         nir_loop *inner = nir_push_loop(&b);
+         {
+            nir_def *x = nir_load_var(&b, x_var);
+            nir_if *xex = nir_push_if(&b, nir_ilt(&b, xhi, x));
+            nir_jump(&b, nir_jump_break);
+            nir_pop_if(&b, xex);
+
+            nir_def *v = nir_load_agx(&b, 1, 8, base, nir_iadd(&b, row_off, x),
+                                      .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                      .format = PIPE_FORMAT_R8_UINT);
+            nir_store_var(&b, acc_var, nir_iadd(&b, nir_load_var(&b, acc_var), nir_u2u32(&b, v)), 1);
+            nir_store_var(&b, x_var, nir_iadd_imm(&b, x, 1), 1);
+         }
+         nir_pop_loop(&b, inner);
+
+         if (mode == 1) {
+            nir_store_var(&b, x_var, x0, 1);
+            nir_loop *inner2 = nir_push_loop(&b);
+            {
+               nir_def *x = nir_load_var(&b, x_var);
+               nir_if *xex = nir_push_if(&b, nir_ilt(&b, xhi, x));
+               nir_jump(&b, nir_jump_break);
+               nir_pop_if(&b, xex);
+
+               nir_def *v = nir_load_agx(&b, 1, 8, base, nir_iadd(&b, row_off, x),
+                                         .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                         .format = PIPE_FORMAT_R8_UINT);
+               nir_store_var(&b, acc_var, nir_iadd(&b, nir_load_var(&b, acc_var), nir_u2u32(&b, v)), 1);
+               nir_store_var(&b, x_var, nir_iadd_imm(&b, x, 1), 1);
+            }
+            nir_pop_loop(&b, inner2);
+         } else if (mode == 2) {
+            nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                        .memory_scope = SCOPE_WORKGROUP,
+                        .memory_semantics = NIR_MEMORY_ACQ_REL,
+                        .memory_modes = nir_var_mem_shared);
+         }
+         nir_store_var(&b, y_var, nir_iadd_imm(&b, y, 1), 1);
+      }
+      nir_pop_loop(&b, outer);
+      nir_store_global(&b, nir_load_var(&b, acc_var), out, .align_mul = 4);
+
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops(b.shader, 8, 96, NULL));
+      fold_after_specialize(b.shader, "exact 3x3 outer guards");
+
+      b.cursor = nir_before_impl(b.impl);
+      nir_def_replace(x0, nir_imm_int(&b, 10));
+      nir_def_replace(xrad, nir_imm_int(&b, 2));
+      const int y0_val = mode == 5 ? (INT32_MAX - 2) : 0;
+      int yrad_val = 2;
+      if (mode == 0)
+         yrad_val = 5;
+      else if (mode == 3)
+         yrad_val = 1;
+      else if (mode == 4)
+         yrad_val = 3;
+      nir_def_replace(y0, nir_imm_int(&b, y0_val));
+      nir_def_replace(yrad, nir_imm_int(&b, yrad_val));
+      fold_after_specialize(b.shader, "exact 3x3 outer guards specialized");
+
+      unsigned loops = 0, max_depth = 0;
+      count_loop_shape(b.impl, &loops, &max_depth);
+      if (mode == 6) {
+         EXPECT_EQ(max_depth, 0u);
+         EXPECT_EQ(loops, 0u);
+         EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_agx), 9u);
+      } else {
+         EXPECT_GE(max_depth, 1u);
+         EXPECT_GE(count_intrinsics(b.shader, nir_intrinsic_load_agx), 3u);
       }
       ralloc_free(b.shader);
    }

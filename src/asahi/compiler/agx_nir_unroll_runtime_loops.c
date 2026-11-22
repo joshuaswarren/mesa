@@ -311,7 +311,7 @@ loaded_dwords(nir_function_impl *impl, nir_loop *loop)
 }
 
 static bool
-analyze_loop(nir_loop *loop, struct counted_loop *out)
+analyze_loop_opts(nir_loop *loop, struct counted_loop *out, bool allow_nested)
 {
    if (nir_loop_has_continue_construct(loop) || loop->partially_unrolled ||
        loop->control == nir_loop_control_dont_unroll)
@@ -349,12 +349,14 @@ analyze_loop(nir_loop *loop, struct counted_loop *out)
       return false;
 
    /* Innermost: nothing but blocks and ifs after the terminator. */
-   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
-      nir_cf_node *parent = block->cf_node.parent;
-      while (parent != &loop->cf_node) {
-         if (parent->type == nir_cf_node_loop)
-            return false;
-         parent = parent->parent;
+   if (!allow_nested) {
+      nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+         nir_cf_node *parent = block->cf_node.parent;
+         while (parent != &loop->cf_node) {
+            if (parent->type == nir_cf_node_loop)
+               return false;
+            parent = parent->parent;
+         }
       }
    }
 
@@ -484,6 +486,12 @@ analyze_loop(nir_loop *loop, struct counted_loop *out)
       .is_unsigned = op == nir_op_ult || op == nir_op_uge,
    };
    return true;
+}
+
+static bool
+analyze_loop(nir_loop *loop, struct counted_loop *out)
+{
+   return analyze_loop_opts(loop, out, false);
 }
 
 /* The loop-invariant value G such that "iv < G" (REL_LT, REL_LE) or
@@ -1061,6 +1069,79 @@ loop_has_nested_loop(struct exec_list *list)
    return false;
 }
 
+static bool
+outer_peelable(nir_loop *outer, nir_if *terminator, nir_loop *inner)
+{
+   nir_foreach_block_in_cf_node(block, &outer->cf_node) {
+      bool in_inner = false;
+      for (nir_cf_node *p = block->cf_node.parent; p != &outer->cf_node;
+           p = p->parent) {
+         if (p == &inner->cf_node) {
+            in_inner = true;
+            break;
+         }
+      }
+      if (in_inner)
+         continue;
+
+      nir_foreach_instr(instr, block) {
+         switch (instr->type) {
+         case nir_instr_type_jump:
+            if (block->cf_node.parent != &terminator->cf_node)
+               return false;
+            break;
+         case nir_instr_type_intrinsic: {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (lane_dependent(intr))
+               return false;
+            switch (intr->intrinsic) {
+            case nir_intrinsic_barrier:
+            case nir_intrinsic_terminate:
+            case nir_intrinsic_terminate_if:
+            case nir_intrinsic_demote:
+            case nir_intrinsic_demote_if:
+            case nir_intrinsic_ddx:
+            case nir_intrinsic_ddy:
+            case nir_intrinsic_ddx_fine:
+            case nir_intrinsic_ddy_fine:
+            case nir_intrinsic_ddx_coarse:
+            case nir_intrinsic_ddy_coarse:
+               return false;
+            default:
+               break;
+            }
+            break;
+         }
+         case nir_instr_type_tex:
+            if (nir_tex_instr_has_implicit_derivative(nir_instr_as_tex(instr)))
+               return false;
+            break;
+         case nir_instr_type_call:
+            return false;
+         default:
+            break;
+         }
+      }
+   }
+   return true;
+}
+
+static unsigned
+count_nested_loops(struct exec_list *list)
+{
+   unsigned n = 0;
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_loop) {
+         n += 1 + count_nested_loops(&nir_cf_node_as_loop(node)->body);
+      } else if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         n += count_nested_loops(&nif->then_list) +
+              count_nested_loops(&nif->else_list);
+      }
+   }
+   return n;
+}
+
 static nir_loop *
 nth_loop_in_list(struct exec_list *list, unsigned *index)
 {
@@ -1227,7 +1308,8 @@ loop_has_8bit_load(nir_loop *loop)
 
 static bool
 unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
-                struct util_dynarray *small_peels)
+                struct util_dynarray *small_peels,
+                struct util_dynarray *outer3_peels)
 {
    /* With maximal reconvergence the outer loop's invocations must stay
     * together; the split could separate them. */
@@ -1289,7 +1371,7 @@ unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
          (cl.step == 1 || cl.step == -1) &&
          count_instrs(outer) <= 96 && !loop_has_nested_loop(&inner->body) &&
          loop_has_8bit_load(inner);
-      nir_def *cond4 = NULL, *cond3 = NULL;
+      nir_def *cond4 = NULL, *cond3 = NULL, *cond3_outer = NULL;
       unsigned inner_ord = 0;
       if (split_small) {
          nir_def *g4 = guard_bound(&b, &cl, bound, 4);
@@ -1300,6 +1382,27 @@ unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
          cond3 = exact_trip_cond(&b, &cl, iv0, bound, 3);
          bool found_ord = loop_ordinal_in_list(&outer->body, inner, &inner_ord);
          assert(found_ord);
+
+         struct counted_loop ocl;
+         nir_block *pre_outer = nir_cf_node_as_block(nir_cf_node_prev(&outer->cf_node));
+         if (analyze_loop_opts(outer, &ocl, true) && !ocl.bottom &&
+             ocl.offset == 0 && (ocl.step == 1 || ocl.step == -1) &&
+             count_nested_loops(&outer->body) == 1 &&
+             count_instrs(outer) <= 64 &&
+             outer_peelable(outer, ocl.nif, inner)) {
+            nir_phi_src *oinit = nir_phi_get_src_from_block(ocl.iv, pre_outer);
+            if (oinit && (nir_scalar_is_const(ocl.bound) ||
+                          outer_invariant(ocl.bound.def, outer, 8))) {
+               struct hash_table *oremap = _mesa_pointer_hash_table_create(NULL);
+               nir_def *obound =
+                  nir_scalar_is_const(ocl.bound)
+                     ? nir_imm_int(&b, (uint32_t)nir_scalar_as_uint(ocl.bound))
+                     : nir_channel(&b, remat_outer(&b, ocl.bound.def, outer, oremap),
+                                   ocl.bound.comp);
+               _mesa_hash_table_destroy(oremap, NULL);
+               cond3_outer = exact_trip_cond(&b, &ocl, oinit->src.ssa, obound, 3);
+            }
+         }
       }
 
       /* Values of the outer loop through registers, so both copies write
@@ -1346,7 +1449,6 @@ unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
 
          nir_cf_reinsert(&list, nir_before_cf_list(&nif->then_list));
          nir_cf_reinsert(&copy4, nir_before_cf_list(&nif4->then_list));
-         nir_cf_reinsert(&copy3, nir_before_cf_list(&nif3->then_list));
          nir_cf_reinsert(&copy, nir_before_cf_list(&nif3->else_list));
 
          unsigned idx4 = inner_ord;
@@ -1355,11 +1457,44 @@ unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
          struct small_peel_rec r4 = {inner4, 4, true};
          util_dynarray_append(small_peels, r4);
 
-         unsigned idx3 = inner_ord;
-         nir_loop *inner3 = nth_loop_in_list(&nif3->then_list, &idx3);
-         assert(inner3);
-         struct small_peel_rec r3 = {inner3, 3, false};
-         util_dynarray_append(small_peels, r3);
+         if (cond3_outer) {
+            b.cursor = nir_before_cf_list(&nif3->then_list);
+            nir_if *nif33 = nir_push_if(&b, cond3_outer);
+            nir_pop_if(&b, nif33);
+
+            nir_cf_list copy33;
+            struct hash_table *cmap33 = _mesa_pointer_hash_table_create(NULL);
+            nir_cf_list_clone(&copy33, &copy3, &nif33->cf_node, cmap33);
+            _mesa_hash_table_destroy(cmap33, NULL);
+
+            nir_cf_reinsert(&copy33, nir_before_cf_list(&nif33->then_list));
+            nir_cf_reinsert(&copy3, nir_before_cf_list(&nif33->else_list));
+
+            unsigned idx33 = inner_ord;
+            nir_loop *inner33 = nth_loop_in_list(&nif33->then_list, &idx33);
+            assert(inner33);
+            struct small_peel_rec r33 = {inner33, 3, false};
+            util_dynarray_append(small_peels, r33);
+
+            nir_loop *outer33 = enclosing_loop(&inner33->cf_node);
+            assert(outer33);
+            struct small_peel_rec ro33 = {outer33, 3, false};
+            util_dynarray_append(outer3_peels, ro33);
+
+            unsigned idx3 = inner_ord;
+            nir_loop *inner3 = nth_loop_in_list(&nif33->else_list, &idx3);
+            assert(inner3);
+            struct small_peel_rec r3 = {inner3, 3, false};
+            util_dynarray_append(small_peels, r3);
+         } else {
+            nir_cf_reinsert(&copy3, nir_before_cf_list(&nif3->then_list));
+
+            unsigned idx3 = inner_ord;
+            nir_loop *inner3 = nth_loop_in_list(&nif3->then_list, &idx3);
+            assert(inner3);
+            struct small_peel_rec r3 = {inner3, 3, false};
+            util_dynarray_append(small_peels, r3);
+         }
       } else {
          /* The copy keeps this inner loop as it is (clones copy the flag); its
           * other loops stay candidates. */
@@ -1415,9 +1550,10 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
       nir_index_ssa_defs(impl);
 
       bool unswitched = false;
-      struct util_dynarray small_peels;
+      struct util_dynarray small_peels, outer3_peels;
       util_dynarray_init(&small_peels, NULL);
-      if (unswitch_nested(impl, factor, max_instrs, &small_peels)) {
+      util_dynarray_init(&outer3_peels, NULL);
+      if (unswitch_nested(impl, factor, max_instrs, &small_peels, &outer3_peels)) {
          nir_progress(true, impl, nir_metadata_none);
          nir_lower_reg_intrinsics_to_ssa_impl(impl);
          nir_metadata_require(impl, nir_metadata_block_index);
@@ -1435,11 +1571,24 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
             nir_lower_reg_intrinsics_to_ssa_impl(impl);
             nir_metadata_require(impl, nir_metadata_block_index);
             nir_index_ssa_defs(impl);
+            bool outer_peeled = false;
+            util_dynarray_foreach(&outer3_peels, struct small_peel_rec, rec) {
+               if (peel_straight_prefix(impl, rec->loop, rec->count,
+                                        rec->keep_tail))
+                  outer_peeled = true;
+            }
+            if (outer_peeled) {
+               nir_progress(true, impl, nir_metadata_none);
+               nir_lower_reg_intrinsics_to_ssa_impl(impl);
+               nir_metadata_require(impl, nir_metadata_block_index);
+               nir_index_ssa_defs(impl);
+            }
          }
          unswitched = true;
          any = true;
       }
       util_dynarray_fini(&small_peels);
+      util_dynarray_fini(&outer3_peels);
 
       struct util_dynarray loops;
       util_dynarray_init(&loops, NULL);
