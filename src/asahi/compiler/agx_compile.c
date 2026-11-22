@@ -4168,7 +4168,22 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
    }
 
    case nir_intrinsic_fence_mem_to_tex_agx: {
+      if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !b->shader->key->dev.emit_agx3d) {
+         /* AGX3C's DEVICE and TEXTURE barriers are workgroup rendezvous forms
+          * whose device scope stays workgroup-local. Image-atomic fences may
+          * sit inside divergent bounds checks and must order device-memory
+          * atomics with subsequent texture-cache reads in the same invocation,
+          * so emit the non-rendezvous device and texture fences instead. */
+         agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_DEVICE_FENCE);
+         agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT);
+         return NULL;
+      }
       if (b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2) {
+         /* Keep AGX3B (G15/G16/G17P) and AGX3D on the existing pair until
+          * validated with image.atomic_operations CTS on G17P hardware; AGX3B
+          * also encodes DEVICE_FENCE and TEXTURE_FENCE_WAIT and can adopt the
+          * non-rendezvous form once verified there. */
          agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_DEVICE);
          agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_TEXTURE);
          return NULL;
