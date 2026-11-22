@@ -651,8 +651,31 @@ test_g17p_compressed_render_target(void)
       CHECK(memcmp(native.opaque, targets[i].words,
                    sizeof(targets[i].words)) == 0);
 
-      /* Outside the compressed single-layer 2D packet nothing is encoded. */
+      /* Gen9 compressed 2x/4x 2D multisample keeps the single-sample compressed
+       * payload and updates only the dimension nibble (4) and sample selector
+       * at word0[57:56]. */
       const struct AGX_PBE original = rt;
+      static const enum agx_sample_count ms_counts[] = {
+         AGX_SAMPLE_COUNT_2,
+         AGX_SAMPLE_COUNT_4,
+      };
+      for (unsigned s = 0; s < ARRAY_SIZE(ms_counts); ++s) {
+         rt = original;
+         rt.dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED;
+         rt.samples = ms_counts[s];
+         uint64_t expected_ms[4];
+         memcpy(expected_ms, targets[i].words, sizeof(expected_ms));
+         expected_ms[0] = (expected_ms[0] & ~UINT64_C(0xf)) | 4u |
+                          ((uint64_t)s << 56);
+         memset(&native, 0xa5, sizeof(native));
+         CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
+                                           &rt));
+         CHECK(memcmp(native.opaque, expected_ms, sizeof(expected_ms)) == 0);
+      }
+
+      /* Outside the compressed single-layer 2D and 2x/4x 2D multisample
+       * packets nothing is encoded. */
+      rt = original;
       rt.acceleration_buffer = 0;
       CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
                                          &rt));
@@ -666,8 +689,15 @@ test_g17p_compressed_render_target(void)
       CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
                                          &rt));
       rt = original;
+      rt.dimension = AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED;
+      rt.layers = 2;
+      rt.samples = AGX_SAMPLE_COUNT_4;
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
+                                         &rt));
+      rt = original;
       rt.dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED;
       rt.samples = AGX_SAMPLE_COUNT_4;
+      rt.layout = AGX_LAYOUT_TWIDDLED;
       CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
                                          &rt));
       rt = original;

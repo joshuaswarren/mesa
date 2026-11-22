@@ -1586,6 +1586,12 @@ unmerge:
    agx_dirty_all(ctx);
 }
 
+static struct agx_tilebuffer_layout
+agx_gallium_tilebuffer_layout(const struct agx_device *dev,
+                              const enum pipe_format *formats,
+                              unsigned nr_cbufs, unsigned nr_samples,
+                              bool layered);
+
 static void
 agx_set_framebuffer_state(struct pipe_context *pctx,
                           const struct pipe_framebuffer_state *state)
@@ -1594,6 +1600,49 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
 
    if (!state)
       return;
+
+   /* On chips without in-place decompression (AGX3), reallocate any
+    * compressed render target that this framebuffer's tilebuffer layout will
+    * spill before binding `state` into `ctx->framebuffer`. Running
+    * agx_decompress() here avoids re-entering with the spilling framebuffer
+    * when the blitter restores `ctx->framebuffer`, and guarantees no batch
+    * reaches AGX2-only agx_decompress_inplace().
+    */
+   const struct agx_device *dev = agx_device(pctx->screen);
+   if (!agx_gallium_shared_compression_supported(
+          agx_chip_descriptor_generation(dev->chip)) &&
+       state->nr_cbufs > 1 && !agx_chip_g17_m5(dev->chip)) {
+      bool any_compressed = false;
+      enum pipe_format formats[PIPE_MAX_COLOR_BUFS] = {0};
+
+      for (unsigned i = 0; i < state->nr_cbufs; ++i) {
+         formats[i] = state->cbufs[i].format;
+         if (state->cbufs[i].texture &&
+             ail_is_level_logically_compressed(
+                &agx_resource(state->cbufs[i].texture)->layout,
+                state->cbufs[i].level))
+            any_compressed = true;
+      }
+
+      if (any_compressed) {
+         struct agx_tilebuffer_layout tib = agx_gallium_tilebuffer_layout(
+            dev, formats, state->nr_cbufs,
+            util_framebuffer_get_num_samples(state),
+            util_framebuffer_get_num_layers(state) > 1);
+         if (agx_tilebuffer_spills(&tib)) {
+            for (unsigned i = 0; i < state->nr_cbufs; ++i) {
+               if (!tib.spilled[i] || !state->cbufs[i].texture)
+                  continue;
+
+               struct agx_resource *rsrc = agx_resource(state->cbufs[i].texture);
+               if (!(rsrc->base.bind & PIPE_BIND_SHARED) &&
+                   ail_is_level_logically_compressed(&rsrc->layout,
+                                                     state->cbufs[i].level))
+                  agx_decompress(ctx, rsrc, "Render target spilled");
+            }
+         }
+      }
+   }
 
    util_copy_framebuffer_state(&ctx->framebuffer, state);
    ctx->g17g_mrt_spills_known = false;
@@ -11045,9 +11094,16 @@ agx_batch_init_state(struct agx_batch *batch)
          if (!ail_is_level_logically_compressed(layout, level))
             continue;
 
-         if (true || (rsrc->base.bind & PIPE_BIND_SHARED)) {
+         if (agx_gallium_shared_compression_supported(
+                agx_chip_descriptor_generation(dev->chip)) ||
+             (rsrc->base.bind & PIPE_BIND_SHARED)) {
             agx_decompress_inplace(batch, surf, "Render target spilled");
          } else {
+            /* agx_set_framebuffer_state() pre-decompresses spilling private
+             * compressed targets on AGX3 before copying ctx->framebuffer so
+             * blitter restore cannot re-enter batch setup. */
+            assert(!"Spilled compressed render target was not pre-decompressed "
+                    "in agx_set_framebuffer_state()");
             agx_decompress(batch->ctx, rsrc, "Render target spilled");
          }
       }

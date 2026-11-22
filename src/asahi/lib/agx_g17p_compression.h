@@ -22,11 +22,13 @@
  *
  * Every format here has a tilebuffer footprint of at most 8 bytes per
  * sample, and none has a different store class (R11G11B10 and RGB9E5 are
- * stored as R32_UINT words). With at most seven other render targets of at
- * most 16 bytes, a single-sample G17P tilebuffer (120 bytes per sample)
- * therefore never spills one of these, so a compressed render target never
- * needs the in-place decompression kernel, which has no G17P build.
- * test-tilebuffer.cpp checks both properties for every format here.
+ * stored as R32_UINT words). At 1x, with at most seven other render targets
+ * of at most 16 bytes, a G17P tilebuffer (120 bytes per sample) never spills
+ * one of these; test-tilebuffer.cpp checks both properties at 1x. At 2x/4x
+ * MSAA, wide MRT framebuffers (such as 5x RGBA16F at 4x) can exceed the
+ * tilebuffer byte budget and spill, so Gallium pre-decompresses spilling
+ * private targets via agx_decompress() in agx_set_framebuffer_state() rather
+ * than relying on AGX2-only in-place decompression.
  */
 static inline bool
 agx_g17p_compression_color_format(enum pipe_format format)

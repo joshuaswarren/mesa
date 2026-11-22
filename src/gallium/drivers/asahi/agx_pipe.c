@@ -441,12 +441,17 @@ agx_twiddled_allowed(const struct agx_resource *pres)
    return true;
 }
 
-/* G17P depth: a private, single-level, single-layer, single-sample Z32F
- * depth buffer, as Honeykrisp compresses (hk_g17p_compression_depth_format()).
- * ZLS writes it compressed through the metadata agx_batch already passes, and
- * the compressed Gen9 2D texture packet reads it. On the M4 Max this is
- * byte-identical to plain depth through depth testing across passes,
- * readback, sampling, shadow comparison, blits and scissored clears. */
+/* G17P depth: a private, single-level, single-layer 1x/2x/4x Z32_FLOAT or
+ * Z16_UNORM depth buffer (including the separated Z32_FLOAT plane of
+ * Z32F_S8 and Z24S8). ZLS writes it compressed through the metadata
+ * agx_batch already passes, and the compressed Gen9 2D / 2D-multisample
+ * texture packet reads it.
+ *
+ * The width0/height0 >= 16 check is intentionally in pixels (stricter than
+ * ail_can_compress(), which measures in samples at 2x/4x) so sub-16px
+ * multisample targets stay uncompressed where metadata overhead outweighs
+ * bandwidth savings.
+ */
 static bool
 agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
                                            const struct pipe_resource *templ)
@@ -454,18 +459,24 @@ agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
    return dev->chip == AGX_CHIP_G17P &&
           templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
           templ->array_size <= 1 && templ->last_level == 0 &&
-          templ->nr_samples <= 1 && templ->format == PIPE_FORMAT_Z32_FLOAT &&
+          (templ->nr_samples <= 1 || templ->nr_samples == 2 ||
+           templ->nr_samples == 4) &&
+          (templ->format == PIPE_FORMAT_Z32_FLOAT ||
+           templ->format == PIPE_FORMAT_Z16_UNORM) &&
+          templ->width0 >= 16 && templ->height0 >= 16 &&
           !(templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DEPTH_STENCIL));
 }
 
-/* G17P compresses a private, single-level, single-layer, single-sample 2D
- * colour image of agx_g17p_compression_color_format(): written by the
- * compressed Gen9 2D PBE (end-of-tile stores, blits, staging uploads) and
- * read by the compressed texture descriptor, the packets Honeykrisp
- * compresses its own G17P colour images with. Nothing decompresses such an
- * image in place: its format never spills from the tilebuffer, and it is
- * neither shared nor scanned out, so a feedback loop or a shader-image
- * binding reallocates it uncompressed (agx_decompress()), as on AGX2.
+/* G17P compresses a private, single-level, single-layer 1x/2x/4x 2D colour
+ * image of agx_g17p_compression_color_format(): written by the compressed
+ * Gen9 2D or 2x/4x multisample PBE (end-of-tile stores, blits, staging
+ * uploads) and read by the compressed texture descriptor. Nothing
+ * decompresses such an image in place: it is neither shared nor scanned out,
+ * so a spilling MRT framebuffer, feedback loop, or shader-image binding
+ * reallocates it uncompressed via agx_decompress().
+ *
+ * As with depth above, width0/height0 >= 16 is intentionally kept in pixels
+ * rather than samples to leave tiny sub-16px 2x/4x targets uncompressed.
  */
 static bool
 agx_g17p_private_compression_allowed(const struct agx_device *dev,
@@ -473,7 +484,10 @@ agx_g17p_private_compression_allowed(const struct agx_device *dev,
 {
    return dev->chip == AGX_CHIP_G17P && templ->target == PIPE_TEXTURE_2D &&
           templ->depth0 == 1 && templ->array_size <= 1 &&
-          templ->last_level == 0 && templ->nr_samples <= 1 &&
+          templ->last_level == 0 &&
+          (templ->nr_samples <= 1 || templ->nr_samples == 2 ||
+           templ->nr_samples == 4) &&
+          templ->width0 >= 16 && templ->height0 >= 16 &&
           !(templ->bind &
             ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)) &&
           agx_g17p_compression_color_format(templ->format);
