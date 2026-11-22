@@ -1092,6 +1092,24 @@ agx_unpack_integer_8_agx3(agx_builder *b, agx_index dest,
                           const agx_index *halfs, unsigned nr_channels)
 {
    agx_index channels[4] = {agx_null()};
+
+   /* AGX3C: unpack each byte in one 16-bit operation: even bytes mask
+    * the low byte and odd bytes shift right by 8, clearing the upper byte. */
+   if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !b->shader->key->dev.emit_agx3d) {
+      for (unsigned i = 0; i < nr_channels; ++i) {
+         channels[i] = (i & 1) ? agx_ushr(b, halfs[i / 2], agx_immediate(8))
+                               : agx_and(b, halfs[i / 2], agx_immediate(0xff));
+         if (dest.size == AGX_SIZE_32) {
+            agx_index zext = agx_temp(b->shader, AGX_SIZE_32);
+            agx_mov_to(b, zext, channels[i]);
+            channels[i] = zext;
+         }
+      }
+      agx_emit_collect_to(b, dest, nr_channels, channels);
+      return;
+   }
+
    agx_index shift = agx_mov_imm(b, 32, 8);
    for (unsigned i = 0; i < nr_channels; ++i) {
       agx_index wide = agx_pad_to_32(b, halfs[i / 2]);
