@@ -518,6 +518,16 @@ def u8_absdiff():
                    absdiff)]
     return rules
 
+# M5 converts an unsigned byte or half in a half register to f32 directly. A
+# zero-extended value converts exactly as signed or unsigned, so the widening
+# copy is not needed.
+m5_narrow_to_float = [
+    (('i2f32', ('u2u32', 'a@8')), ('u2f32', a)),
+    (('u2f32', ('u2u32', 'a@8')), ('u2f32', a)),
+    (('i2f32', ('u2u32', 'a@16')), ('u2f32', a)),
+    (('u2f32', ('u2u32', 'a@16')), ('u2f32', a)),
+]
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--import-path', required=True)
@@ -598,6 +608,8 @@ agx_u8_absdiff_uses_match(const nir_alu_instr *instr)
                                       fold_d3d_float_to_int).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_opt_u8_absdiff",
                                       u8_absdiff()).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_opt_m5_narrow_to_float",
+                                      m5_narrow_to_float).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_algebraic_late",
                                       fuse_extr + fuse_ubfe +
                                       fuse_imad + ixor_bcsel +

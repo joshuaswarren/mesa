@@ -8716,6 +8716,95 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
                                   AGX_ROUND_RTE);
       }
 
+      /* M5 converts the low byte of a half register to f32 directly. Byte 0
+       * or 2 of a word, as a packed RGBA8 pixel is unpacked, is the low byte
+       * of its low or high half: no mask or shift. Bytes 1 and 3 take a
+       * 16-bit shift of their half. All four read only the halves, so the
+       * word dies at its split and needs no copy. */
+      if (instr->op == nir_op_u2f32 && src_sz == 32 &&
+          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !b->shader->key->dev.emit_agx3d) {
+         nir_scalar x = nir_scalar_chase_movs(
+            nir_get_scalar(instr->src[0].src.ssa, instr->src[0].swizzle[0]));
+         nir_scalar word = {0};
+         int half = -1;
+         bool high_byte = false;
+         if (nir_scalar_is_alu(x) && nir_scalar_alu_op(x) == nir_op_ushr) {
+            nir_scalar k = nir_scalar_chase_alu_src(x, 1);
+            if (nir_scalar_is_const(k) && (nir_scalar_as_uint(k) & 31) == 24) {
+               word = nir_scalar_chase_alu_src(x, 0);
+               half = 1;
+               high_byte = true;
+            }
+         } else if (nir_scalar_is_alu(x) && nir_scalar_alu_op(x) == nir_op_iand) {
+            for (unsigned i = 0; i < 2; ++i) {
+               nir_scalar k = nir_scalar_chase_alu_src(x, i);
+               if (nir_scalar_is_const(k) && nir_scalar_as_uint(k) == 0xff) {
+                  word = nir_scalar_chase_alu_src(x, 1 - i);
+                  half = 0;
+               }
+            }
+            /* (w >> 8k) & 0xff: byte k of w. */
+            if (half == 0 && nir_scalar_is_alu(word) &&
+                nir_scalar_alu_op(word) == nir_op_ushr) {
+               nir_scalar k = nir_scalar_chase_alu_src(word, 1);
+               const unsigned sh =
+                  nir_scalar_is_const(k) ? nir_scalar_as_uint(k) & 31 : 0;
+               if (sh == 8 || sh == 16 || sh == 24) {
+                  word = nir_scalar_chase_alu_src(word, 0);
+                  half = sh / 16;
+                  high_byte = sh & 8;
+               }
+            }
+         } else if (nir_scalar_is_alu(x) &&
+                    (nir_scalar_alu_op(x) == nir_op_ubitfield_extract ||
+                     nir_scalar_alu_op(x) == nir_op_ubfe)) {
+            nir_scalar off = nir_scalar_chase_alu_src(x, 1);
+            nir_scalar bits = nir_scalar_chase_alu_src(x, 2);
+            if (nir_scalar_is_const(off) && nir_scalar_is_const(bits) &&
+                nir_scalar_as_uint(bits) == 8 && nir_scalar_as_uint(off) < 32 &&
+                !(nir_scalar_as_uint(off) & 7)) {
+               word = nir_scalar_chase_alu_src(x, 0);
+               half = nir_scalar_as_uint(off) / 16;
+               high_byte = nir_scalar_as_uint(off) & 8;
+            }
+         } else if (nir_scalar_is_alu(x) &&
+                    nir_scalar_alu_op(x) == nir_op_extract_u8) {
+            nir_scalar idx = nir_scalar_chase_alu_src(x, 1);
+            if (nir_scalar_is_const(idx) && nir_scalar_as_uint(idx) < 4) {
+               word = nir_scalar_chase_alu_src(x, 0);
+               half = nir_scalar_as_uint(idx) / 2;
+               high_byte = nir_scalar_as_uint(idx) & 1;
+            }
+         }
+         if (half >= 0 && word.def->bit_size == 32) {
+            agx_index h;
+            nir_scalar narrow = {0};
+            if (nir_scalar_is_alu(word) &&
+                nir_scalar_alu_op(word) == nir_op_u2u32)
+               narrow = nir_scalar_chase_alu_src(word, 0);
+            if (half == 0 && narrow.def && narrow.def->bit_size == 16) {
+               /* The low half of a zero-extended half is the half. */
+               h = agx_extract_nir_src(b, nir_src_for_ssa(narrow.def),
+                                       narrow.comp);
+            } else {
+               agx_index w = agx_extract_nir_src(b, nir_src_for_ssa(word.def),
+                                                 word.comp);
+               h = agx_temp(b->shader, AGX_SIZE_16);
+               agx_subdivide_to(b, h, w, half);
+            }
+            /* The odd bytes: shift the half, whose upper byte is then zero. */
+            if (high_byte) {
+               return agx_convert_to(b, dst,
+                                     agx_immediate(AGX_CONVERT_U16_TO_F),
+                                     agx_ushr(b, h, agx_immediate(8)),
+                                     AGX_ROUND_RTE);
+            }
+            return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_U8_TO_F),
+                                  h, AGX_ROUND_RTE);
+         }
+      }
+
       enum agx_convert mode = (src_sz == 32)   ? AGX_CONVERT_U32_TO_F
                               : (src_sz == 16) ? AGX_CONVERT_U16_TO_F
                                                : AGX_CONVERT_U8_TO_F;
@@ -10303,6 +10392,10 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       }
    }
 
+   /* Zero-extended bytes and halves convert to f32 from their half register. */
+   if (m5 && !g18_scans)
+      NIR_PASS(_, nir, agx_nir_opt_m5_narrow_to_float);
+
    /* Consecutive words read together, such as the unrolled iterations' reads
     * of one array, become one vector load. */
    /* With soft faults, robust buffer reads are plain reads followed by a
@@ -10627,7 +10720,12 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * (agx_lower_agx3_half_converts). */
    if (m5 && !g18_scans) {
       NIR_PASS(_, nir, agx_nir_fold_byte_to_float);
-      NIR_PASS(_, nir, agx_nir_fold_ubyte_to_float);
+      /* Unsigned byte-to-float stays on the direct AGX3C half-register path:
+       * agx_emit_alu (u2f32) converts every byte of a word and the low byte of
+       * a zero-extended half directly from their mask, shift, and extract
+       * forms. Narrowing them to u2u8 here makes later passes lengthen them
+       * (byte 2 as split_y, u2u32, split_x, u2u8; byte 1 as a 32-bit shift),
+       * so agx_nir_fold_ubyte_to_float is skipped here. */
    }
 
    /* Fuse add/sub/multiplies/shifts after running opt_algebraic_late to fuse
