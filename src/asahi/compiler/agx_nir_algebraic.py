@@ -12,6 +12,7 @@ b = 'b'
 c = 'c'
 d = 'd'
 e = 'e'
+f = 'f'
 
 lower_sm5_shift = []
 
@@ -144,6 +145,48 @@ for T, sizes, one in [('f', [16, 32], 1.0),
 # This needs to be a separate pass that runs after lower_selects, in order to
 # pick up patterns like b2f32(iand(...))
 opt_selects = [
+        # Direct condition dominance in nested selects (only when the
+        # inner select becomes dead, avoiding live-range extension).
+        (('bcsel', a, ('bcsel(is_used_once)', a, b, c), d), ('bcsel', a, b, d)),
+        (('bcsel', a, b, ('bcsel(is_used_once)', a, c, d)), ('bcsel', a, b, d)),
+
+        # Collapse selects whose boolean condition (ior/iand or boolean bcsel)
+        # shares a predicate with an arm select, provided every use of the
+        # boolean condition collapses so it becomes dead.
+        (('bcsel', ('ior(agx_bcsel_cond_collapses)', a, b), ('bcsel(is_used_once)', a, c, d), e),
+         ('bcsel', a, c, ('bcsel', b, d, e))),
+        (('bcsel', ('ior(agx_bcsel_cond_collapses)', a, b), c, ('bcsel(is_used_once)', a, d, e)),
+         ('bcsel', a, c, ('bcsel', b, c, e))),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, True, b), ('bcsel(is_used_once)', a, c, d), e),
+         ('bcsel', a, c, ('bcsel', b, d, e))),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, True, b), c, ('bcsel(is_used_once)', a, d, e)),
+         ('bcsel', a, c, ('bcsel', b, c, e))),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, b, True), ('bcsel(is_used_once)', a, c, d), e),
+         ('bcsel', a, ('bcsel', b, c, e), d)),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, b, True), c, ('bcsel(is_used_once)', a, d, e)),
+         ('bcsel', a, ('bcsel', b, c, d), c)),
+        (('bcsel', ('iand(agx_bcsel_cond_collapses)', a, b), ('bcsel(is_used_once)', a, c, d), e),
+         ('bcsel', a, ('bcsel', b, c, e), e)),
+        (('bcsel', ('iand(agx_bcsel_cond_collapses)', a, b), c, ('bcsel(is_used_once)', a, d, e)),
+         ('bcsel', a, ('bcsel', b, c, d), e)),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, b, False), ('bcsel(is_used_once)', a, c, d), e),
+         ('bcsel', a, ('bcsel', b, c, e), e)),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, b, False), c, ('bcsel(is_used_once)', a, d, e)),
+         ('bcsel', a, ('bcsel', b, c, d), e)),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, False, b), ('bcsel(is_used_once)', a, c, d), e),
+         ('bcsel', a, e, ('bcsel', b, d, e))),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, False, b), c, ('bcsel(is_used_once)', a, d, e)),
+         ('bcsel', a, d, ('bcsel', b, c, e))),
+
+        # Hoist single-use negation out of select trees to cut live values and
+        # let the final negation fold into a downstream add/sub.
+        (('bcsel', a, ('ineg(is_used_once)', b), ('ineg(is_used_once)', c)),
+         ('ineg', ('bcsel', a, b, c))),
+        (('bcsel', a, ('u2u32', 'b@8'), ('u2u32', 'c@8')),
+         ('u2u32', ('bcsel', a, b, c))),
+        (('bcsel', a, ('u2u32', 'b@16'), ('u2u32', 'c@16')),
+         ('u2u32', ('bcsel', a, b, c))),
+
         (('bcsel', ('ior(is_used_once)', ('inot', a), b), c, d),
          ('bcsel', a, ('bcsel', b, c, d), c)),
 
@@ -155,6 +198,7 @@ opt_selects = [
 
         (('bcsel', ('iand(is_used_once)', a, b), c, d),
          ('bcsel', a, ('bcsel', b, c, d), d)),
+
 ]
 
 # When the ior/iand is used multiple times, we can instead fuse the other way.
@@ -580,6 +624,56 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
 
     print("""
 /* imax(d, -d) where d has no other use than this maximum and its negation. */
+/* True when every use of a 1-bit boolean op is the condition of a bcsel whose
+ * true or false arm is a single-use bcsel sharing one of this op's predicates,
+ * so collapsing all uses kills the boolean op with zero live-value increase. */
+static bool
+agx_bcsel_cond_collapses(const nir_alu_instr *instr)
+{
+   if (instr->def.bit_size != 1 || instr->def.num_components != 1)
+      return false;
+   if (list_is_singular(&instr->def.uses))
+      return true;
+   nir_def *op0 = instr->src[0].src.ssa;
+   nir_def *op1 = NULL;
+   if (instr->op == nir_op_ior || instr->op == nir_op_iand) {
+      op1 = instr->src[1].src.ssa;
+   } else if (instr->op == nir_op_bcsel) {
+      if (nir_src_is_const(instr->src[1].src))
+         op1 = instr->src[2].src.ssa;
+      else if (nir_src_is_const(instr->src[2].src))
+         op1 = instr->src[1].src.ssa;
+      else
+         return false;
+   } else {
+      return false;
+   }
+   nir_foreach_use_including_if(src, &instr->def) {
+      if (nir_src_is_if(src))
+         return false;
+      nir_instr *use = nir_src_use_instr(src);
+      if (use->type != nir_instr_type_alu)
+         return false;
+      nir_alu_instr *ualu = nir_instr_as_alu(use);
+      if (ualu->op != nir_op_bcsel || src != &ualu->src[0].src)
+         return false;
+      bool matched = false;
+      for (unsigned arm = 1; arm <= 2; arm++) {
+         nir_alu_instr *arm_alu = nir_src_as_alu(ualu->src[arm].src);
+         if (arm_alu && arm_alu->op == nir_op_bcsel &&
+             list_is_singular(&arm_alu->def.uses) &&
+             (arm_alu->src[0].src.ssa == op0 ||
+              arm_alu->src[0].src.ssa == op1)) {
+            matched = true;
+            break;
+         }
+      }
+      if (!matched)
+         return false;
+   }
+   return true;
+}
+
 static bool
 agx_u8_absdiff_uses_match(const nir_alu_instr *instr)
 {

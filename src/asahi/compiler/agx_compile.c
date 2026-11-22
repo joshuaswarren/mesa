@@ -10795,6 +10795,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    do {
       progress = false;
 
+      if (agx3_compute_opts)
+         NIR_PASS(progress, nir, agx_nir_opt_narrow_u8_fadd_tree);
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_cse);
       NIR_PASS(progress, nir, agx_nir_fuse_algebraic_late);
@@ -10822,7 +10824,22 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (g18_scans)
       NIR_PASS(_, nir, agx_nir_avoid_square_overflow);
    NIR_PASS(_, nir, agx_nir_fold_pixel_coord);
-   NIR_PASS(_, nir, agx_nir_fuse_selects);
+   if (agx3_compute_opts) {
+      bool fused_selects = false;
+      for (unsigned iter = 0; iter < 4; ++iter) {
+         bool p = false;
+         NIR_PASS(p, nir, agx_nir_fuse_selects);
+         fused_selects |= p;
+         if (!p)
+            break;
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+      NIR_PASS(_, nir, agx_nir_fold_const_select_alu);
+      if (fused_selects)
+         NIR_PASS(_, nir, nir_opt_remove_phis);
+   } else {
+      NIR_PASS(_, nir, agx_nir_fuse_selects);
+   }
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_combine_barriers, NULL, NULL);
    NIR_PASS(_, nir, nir_opt_copy_prop);
@@ -16567,6 +16584,22 @@ agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
       NIR_PASS(_, nir, agx_nir_opt_canonical_minmax);
       NIR_PASS(_, nir, nir_opt_dce);
+   }
+
+   if ((key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+        key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+       !key->dev.emit_agx3d) {
+      NIR_PASS(_, nir, agx_nir_opt_forward_merge_loads);
+      NIR_PASS(_, nir, nir_opt_dce);
+
+      if (mesa_shader_stage_is_compute(nir->info.stage)) {
+         bool guarded_sel = false;
+         NIR_PASS(guarded_sel, nir, agx_nir_opt_guard_selected_loads);
+         if (guarded_sel) {
+            NIR_PASS(_, nir, nir_opt_dce);
+            nir_divergence_analysis(nir);
+         }
+      }
    }
 
 
