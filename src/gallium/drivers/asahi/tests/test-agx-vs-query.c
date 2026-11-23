@@ -62,14 +62,26 @@ struct draw_state {
 };
 
 static void *
-create_vs(struct pipe_context *pctx, bool vertex_id)
+create_vs(struct pipe_context *pctx, bool vertex_id, bool draw_id,
+          bool vertex_attr)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_VERTEX, &agx_nir_options, "VS dirty tracking");
    nir_def *pos = nir_imm_vec4(&b, 0, 0, 0, 1);
-   if (vertex_id) {
-      nir_def *id = nir_u2f32(
-         &b, nir_iadd(&b, nir_load_vertex_id(&b), nir_load_base_instance(&b)));
+   if (vertex_id || draw_id || vertex_attr) {
+      nir_def *acc = nir_imm_int(&b, 0);
+      if (vertex_id)
+         acc = nir_iadd(&b, nir_load_vertex_id(&b), nir_load_base_instance(&b));
+      if (draw_id)
+         acc = nir_iadd(&b, acc, nir_load_draw_id(&b));
+      nir_def *id = nir_u2f32(&b, acc);
+      if (vertex_attr) {
+         nir_def *attr = nir_load_input(
+            &b, 2, 32, nir_imm_int(&b, 0), .base = 0,
+            .io_semantics.location = VERT_ATTRIB_GENERIC0,
+            .io_semantics.num_slots = 1);
+         id = nir_fadd(&b, id, nir_channel(&b, attr, 0));
+      }
       pos = nir_vec4(&b, id, id, nir_imm_float(&b, 0), nir_imm_float(&b, 1));
    }
    nir_store_output(&b, pos, nir_imm_int(&b, 0), .base = 0, .write_mask = 0xf,
@@ -85,7 +97,7 @@ create_vs(struct pipe_context *pctx, bool vertex_id)
 static bool
 setup_draw(struct pipe_context *pctx, struct draw_state *s)
 {
-   s->vs = create_vs(pctx, false);
+   s->vs = create_vs(pctx, false, false, false);
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, &agx_nir_options, "VS dirty tracking fragment");
    nir_store_output(&b, nir_imm_vec4(&b, 1, 0, 0, 1), nir_imm_int(&b, 0),
@@ -205,7 +217,7 @@ check_vs(struct pipe_context *pctx)
     * chunk. */
    const bool native_agx3 =
       agx_chip_native_agx3(agx_device(pctx->screen)->chip);
-   void *id_vs = create_vs(pctx, true);
+   void *id_vs = create_vs(pctx, true, false, false);
    CHECK(id_vs);
    pctx->bind_vs_state(pctx, id_vs);
    emits = ctx->perf.vs_emits;
@@ -289,6 +301,123 @@ check_vs(struct pipe_context *pctx)
       }
    }
    pipe_resource_reference(&indirect_buffer, NULL);
+
+   /* Indirect multi-draw: both state-clean (body-only) and per-draw
+    * gl_DrawID + base-param across a 64 KiB VDM STREAM_LINK boundary. */
+   {
+      const uint16_t indices[3] = {0, 1, 2};
+      struct pipe_resource *ib =
+         pipe_buffer_create(pctx->screen, PIPE_BIND_INDEX_BUFFER,
+                            PIPE_USAGE_DEFAULT, sizeof(indices));
+      CHECK(ib);
+      pipe_buffer_write(pctx, ib, 0, sizeof(indices), indices);
+
+      const unsigned mdi_count = 1600;
+      uint32_t (*mdi_args)[5] = calloc(mdi_count, sizeof(*mdi_args));
+      CHECK(mdi_args);
+      for (unsigned i = 0; i < mdi_count; ++i) {
+         mdi_args[i][0] = 3;
+         mdi_args[i][1] = 1;
+         mdi_args[i][2] = 0;
+         mdi_args[i][3] = 0;
+         mdi_args[i][4] = i;
+      }
+      struct pipe_resource *mdi_buf =
+         pipe_buffer_create(pctx->screen, PIPE_BIND_COMMAND_ARGS_BUFFER,
+                            PIPE_USAGE_DEFAULT, mdi_count * sizeof(*mdi_args));
+      CHECK(mdi_buf);
+      pipe_buffer_write(pctx, mdi_buf, 0, mdi_count * sizeof(*mdi_args),
+                        mdi_args);
+      free(mdi_args);
+
+      struct pipe_draw_info mdi_info = {
+         .mode = MESA_PRIM_TRIANGLES,
+         .index_size = 2,
+         .index.resource = ib,
+         .instance_count = 1,
+      };
+      struct pipe_draw_indirect_info mdi_clean = {
+         .buffer = mdi_buf,
+         .draw_count = 8,
+         .stride = 20,
+      };
+      emits = ctx->perf.vs_emits;
+      uint64_t draws_before = ctx->perf.draws;
+      scissor_before = ctx->batch->scissor.size;
+      pctx->draw_vbo(pctx, &mdi_info, 0, &mdi_clean, &indirect_draw, 1);
+      CHECK(ctx->perf.draws == draws_before + 8);
+      if (native_agx3) {
+         CHECK(ctx->perf.vs_emits <= emits + 1);
+         CHECK(ctx->batch->scissor.size <= scissor_before + AGX_SCISSOR_LENGTH);
+         emits = ctx->perf.vs_emits;
+         scissor_before = ctx->batch->scissor.size;
+         pctx->draw_vbo(pctx, &mdi_info, 0, &mdi_clean, &indirect_draw, 1);
+         CHECK(ctx->perf.vs_emits == emits);
+         CHECK(ctx->batch->scissor.size == scissor_before);
+      }
+
+      /* Include a vertex attribute so draw 0 uploads AGX_SYSVAL_TABLE_VS into
+       * batch->pool, verifying that per-draw draw_id slices stay isolated from
+       * static pool tables and reuse the Ioto template cache across 1,600
+       * sub-draws instead of thrashing it. */
+      const float verts[6] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f};
+      struct pipe_resource *vb =
+         pipe_buffer_create(pctx->screen, PIPE_BIND_VERTEX_BUFFER,
+                            PIPE_USAGE_DEFAULT, sizeof(verts));
+      CHECK(vb);
+      pipe_buffer_write(pctx, vb, 0, sizeof(verts), verts);
+      struct pipe_vertex_buffer vbuf = {
+         .buffer.resource = vb,
+         .buffer_offset = 0,
+      };
+      struct pipe_vertex_element velem = {
+         .src_offset = 0,
+         .src_format = PIPE_FORMAT_R32G32_FLOAT,
+         .src_stride = 2 * sizeof(float),
+         .vertex_buffer_index = 0,
+      };
+      void *mdi_ve = pctx->create_vertex_elements_state(pctx, 1, &velem);
+      CHECK(mdi_ve);
+      pctx->set_vertex_buffers(pctx, 1, &vbuf);
+      pctx->bind_vertex_elements_state(pctx, mdi_ve);
+
+      void *mdi_vs = create_vs(pctx, true, true, true);
+      CHECK(mdi_vs);
+      pctx->bind_vs_state(pctx, mdi_vs);
+      struct pipe_draw_indirect_info mdi_drawid = {
+         .buffer = mdi_buf,
+         .draw_count = mdi_count,
+         .stride = 20,
+      };
+      emits = ctx->perf.vs_emits;
+      draws_before = ctx->perf.draws;
+      scissor_before = ctx->batch->scissor.size;
+      struct agx_bo *start_vdm_bo = ctx->batch->vdm.bo;
+      uint8_t *start_vdm_end = ctx->batch->vdm.end;
+      pctx->draw_vbo(pctx, &mdi_info, 0, &mdi_drawid, &indirect_draw, 1);
+      CHECK(ctx->perf.draws == draws_before + mdi_count);
+      CHECK(ctx->perf.vs_emits == emits + mdi_count);
+      CHECK(ctx->vs->b.info.uses_draw_id && ctx->linked.vs->uses_base_param);
+      if (native_agx3) {
+         CHECK(ctx->batch->vdm.bo != start_vdm_bo ||
+               ctx->batch->vdm.end != start_vdm_end);
+         /* Only draw 0 + the VDM STREAM_LINK re-latches emit bind tails. */
+         CHECK((ctx->batch->scissor.size - scissor_before) <=
+               4 * AGX_SCISSOR_LENGTH);
+         /* Draw 0 + isolated draw_id shape must reuse templates across all
+          * 1,600 sub-draws without thrashing. */
+         CHECK(ctx->linked.vs->g17p_graphics_templates_generated >= 1 &&
+               ctx->linked.vs->g17p_graphics_templates_generated <= 4);
+      }
+      pctx->bind_vs_state(pctx, s.vs);
+      pctx->delete_vs_state(pctx, mdi_vs);
+      pctx->bind_vertex_elements_state(pctx, s.ve);
+      pctx->delete_vertex_elements_state(pctx, mdi_ve);
+      pctx->set_vertex_buffers(pctx, 0, NULL);
+      pipe_resource_reference(&vb, NULL);
+      pipe_resource_reference(&mdi_buf, NULL);
+      pipe_resource_reference(&ib, NULL);
+   }
 
    /* Returning to an existing batch dirties state, including its VS. */
    struct agx_batch *first = ctx->batch;
