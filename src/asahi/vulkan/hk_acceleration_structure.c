@@ -92,6 +92,14 @@ static const uint32_t agx3_plan_spv[] = {
 #include "bvh/hk_agx3_gen1_plan.spv.h"
 };
 
+static const uint32_t agx3_plan_fused_spv[] = {
+#include "bvh/hk_agx3_gen1_plan_fused.spv.h"
+};
+
+static const uint32_t agx3_plan_fused_pairs_spv[] = {
+#include "bvh/hk_agx3_gen1_plan_fused_pairs.spv.h"
+};
+
 static const uint32_t agx3_refit_spv[] = {
 #include "bvh/hk_agx3_refit.spv.h"
 };
@@ -793,25 +801,39 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
    };
    /* A TLAS encodes only inner and instance nodes. */
    const bool instances = args->geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR;
-   const struct stage node_encode = instances
-      ? (struct stage){"hk-agx3-node-encode-instances", agx3_node_instances_spv,
-                       sizeof(agx3_node_instances_spv),
+   const bool fused = args->node_bound <= HK_AGX3_PLAN_FUSED_MAX_NODES;
+   const struct stage plan_stage = fused
+      ? (args->pairs
+            ? (struct stage){"hk-agx3-plan-fused-pairs",
+                             agx3_plan_fused_pairs_spv,
+                             sizeof(agx3_plan_fused_pairs_spv), sizeof(*args)}
+            : (struct stage){"hk-agx3-plan-fused", agx3_plan_fused_spv,
+                             sizeof(agx3_plan_fused_spv), sizeof(*args)})
+      : (args->pairs
+            ? (struct stage){"hk-agx3-plan-pairs", agx3_plan_pairs_spv,
+                             sizeof(agx3_plan_pairs_spv), sizeof(*args)}
+            : (struct stage){"hk-agx3-plan", agx3_plan_spv,
+                             sizeof(agx3_plan_spv), sizeof(*args)});
+   const struct stage node_encode = args->pairs
+      ? (struct stage){"hk-agx3-node-encode-pairs", agx3_node_pairs_spv,
+                       sizeof(agx3_node_pairs_spv),
                        sizeof(struct hk_agx3_leaf_args)}
-      : (struct stage){"hk-agx3-node-encode", agx3_node_spv,
-                       sizeof(agx3_node_spv), sizeof(struct hk_agx3_leaf_args)};
+      : instances
+         ? (struct stage){"hk-agx3-node-encode-instances",
+                          agx3_node_instances_spv,
+                          sizeof(agx3_node_instances_spv),
+                          sizeof(struct hk_agx3_leaf_args)}
+         : (struct stage){"hk-agx3-node-encode", agx3_node_spv,
+                          sizeof(agx3_node_spv),
+                          sizeof(struct hk_agx3_leaf_args)};
    const struct stage stages[] = {
-      {"hk-agx3-plan", agx3_plan_spv, sizeof(agx3_plan_spv), sizeof(*args)},
+      plan_stage,
       node_encode,
       {"hk-agx3-as-envelope", agx3_envelope_spv, sizeof(agx3_envelope_spv),
        sizeof(struct hk_agx3_envelope_args)},
-      /* Planning and node encoding that pair triangles. */
-      {"hk-agx3-node-encode-pairs", agx3_node_pairs_spv,
-       sizeof(agx3_node_pairs_spv), sizeof(struct hk_agx3_leaf_args)},
-      {"hk-agx3-plan-pairs", agx3_plan_pairs_spv, sizeof(agx3_plan_pairs_spv),
-       sizeof(*args)},
    };
-   VkPipeline pipeline[5];
-   VkPipelineLayout layout[5];
+   VkPipeline pipeline[3];
+   VkPipelineLayout layout[3];
    for (unsigned i = 0; i < ARRAY_SIZE(stages); ++i) {
       VkResult result = get_pipeline_spv(
          dev, stages[i].name, stages[i].code, stages[i].size,
@@ -820,28 +842,41 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
          return result;
    }
 
-   const unsigned plan = args->pairs ? 4 : 0;
    vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline[plan]);
+                             pipeline[0]);
    const VkMemoryBarrier barrier = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
       .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
       .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
                        VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
    };
-   for (unsigned phase = 0; phase < 5; ++phase) {
+   if (fused) {
       struct hk_agx3_plan_args push = *args;
-      push.phase = phase;
-      vk_common_CmdPushConstants(command_buffer, layout[plan],
-                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
-                                &push);
-      hk_cmd_dispatch_unaligned(command_buffer,
-                                phase == 4 ? 1 : args->node_bound,
+      push.phase = 0;
+      vk_common_CmdPushConstants(command_buffer, layout[0],
+                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                                 &push);
+      hk_cmd_dispatch_unaligned(command_buffer, HK_AGX3_PLAN_FUSED_GROUP_SIZE,
                                 1, 1);
       vk_common_CmdPipelineBarrier(
          command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
          0, 1, &barrier, 0, NULL, 0, NULL);
+   } else {
+      for (unsigned phase = 0; phase < 5; ++phase) {
+         struct hk_agx3_plan_args push = *args;
+         push.phase = phase;
+         vk_common_CmdPushConstants(command_buffer, layout[0],
+                                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                                    &push);
+         hk_cmd_dispatch_unaligned(command_buffer,
+                                   phase == 4 ? 1 : args->node_bound,
+                                   1, 1);
+         vk_common_CmdPipelineBarrier(
+            command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+            0, 1, &barrier, 0, NULL, 0, NULL);
+      }
    }
 
    const struct hk_agx3_leaf_args encode = {
@@ -855,24 +890,25 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
       .retained_offset = args->retained_offset,
       .build_flags = args->build_flags, .node_bound = args->node_bound,
       .keep_retained = args->keep_retained,
+      .refit = fused && instances ? 1u : 0u,
    };
    for (unsigned step = 0; step < 2; ++step) {
       bool envelope = instances ? step == 0 : step == 1;
-      unsigned stage = envelope ? 2
-                     : args->pairs ? 3 : 1;
+      unsigned stage = envelope ? 2 : 1;
       vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                               pipeline[stage]);
+                                pipeline[stage]);
       vk_common_CmdPushConstants(command_buffer, layout[stage],
-                                VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                envelope ? sizeof(finish) : sizeof(encode),
-                                envelope ? (const void *)&finish : (const void *)&encode);
+                                 VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                 envelope ? sizeof(finish) : sizeof(encode),
+                                 envelope ? (const void *)&finish : (const void *)&encode);
       /* A TLAS envelope also clears a pointer per instance: spread that
        * over a thread per instance rather than one workgroup. */
       if (envelope)
          hk_cmd_dispatch_unaligned(command_buffer,
-                                   instances ? CLAMP(ALIGN_POT(args->leaf_bound, 64),
-                                                     64, 65536)
-                                             : 64,
+                                   instances && !fused
+                                      ? CLAMP(ALIGN_POT(args->leaf_bound, 64),
+                                              64, 65536)
+                                      : 64,
                                    1, 1);
       else
          hk_cmd_dispatch_indirect_addr(command_buffer,
