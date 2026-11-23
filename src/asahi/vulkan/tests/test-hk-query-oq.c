@@ -553,23 +553,22 @@ test_order_forward(void)
    test_chip = AGX_CHIP_G17P;
 }
 
-/* Only the G17 runtime (G17P and M5) publishes render timestamps at
- * retirement. G15 firmware writes the vertex-end slot when tiling finishes,
- * before the fragment work writes the counts: such a stamp is not
- * availability. */
+/* Native HAL200 (G16G/G17P) and M5 (G17G/G17S/G17C) runtimes publish render
+ * timestamps at full retirement. G15 firmware writes the vertex-end slot when
+ * tiling finishes, before the fragment work writes the counts: such a stamp is
+ * not availability. */
 static void
 test_stamp_chips(void)
 {
-   T("chips: G17P and M5 renders carry availability",
-     hk_oq_render_stamps_supported(AGX_CHIP_G17P) &&
+   T("chips: native HAL200 and M5 renders carry availability",
+     hk_oq_render_stamps_supported(AGX_CHIP_G16G) &&
+        hk_oq_render_stamps_supported(AGX_CHIP_G17P) &&
         hk_oq_render_stamps_supported(AGX_CHIP_G17G) &&
         hk_oq_render_stamps_supported(AGX_CHIP_G17S));
    T("chips: G15 renders keep the queued store",
      !hk_oq_render_stamps_supported(AGX_CHIP_G15G) &&
         !hk_oq_render_stamps_supported(AGX_CHIP_G15S) &&
         !hk_oq_render_stamps_supported(AGX_CHIP_G15C));
-   T("chips: other native chips keep the queued store",
-     !hk_oq_render_stamps_supported(AGX_CHIP_G16G));
 }
 
 static void
