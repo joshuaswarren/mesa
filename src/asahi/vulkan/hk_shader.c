@@ -5669,11 +5669,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       }
    }
 
-   /* A G17P API compute shader that shares nothing across its workgroup may
-    * launch its big workgroups as smaller hardware workgroups
+   /* A G17P or M5 API compute shader that shares nothing across its workgroup
+    * may launch its big workgroups as smaller hardware workgroups
     * (agx_nir_lower_workgroup_split, hk dispatch_grid). */
    uint16_t launch_size[3] = {0};
-   if (dev->dev.chip == AGX_CHIP_G17P && sw_stage == MESA_SHADER_COMPUTE &&
+   if (agx_chip_g17p_or_m5(dev->dev.chip) && sw_stage == MESA_SHADER_COMPUTE &&
        nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
        agx_workgroup_split_size(nir, launch_size))
       NIR_PASS(_, nir, agx_nir_lower_workgroup_split, launch_size);
