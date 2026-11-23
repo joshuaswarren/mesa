@@ -858,6 +858,46 @@ int main(void)
       CHECK(agx3_slot_assign(p, 5, 6, r));
       CHECK(r[2].wait_mask == 0 && r[4].wait_mask == 0);
    }
+   /* A loop body is such a level (agx3_slot_cf_kind()): entry push, body,
+    * draining continue test and backedge, pop. A load from before the loop
+    * stays in flight into the body, where its consumer waits for it, and is
+    * outstanding again after the pop, where a consumer waits for it too:
+    * every iteration but the first starts after the backedge drain, so only
+    * the entry state can still hold it. */
+   {
+      struct agx3_slot_instr push = st(0), test = st(0), back = st(0),
+                             pop = st(0);
+      push.cf_push = 1;
+      push.cf_arm = true;
+      test.cf = back.cf = pop.cf = AGX3_SLOT_CF_DRAIN;
+      pop.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         ld(10), push, alu(12, 10, 10), ld(16), test, back, pop,
+         alu(14, 10, 16),
+      };
+      CHECK(agx3_slot_assign(p, 8, 6, r));
+      CHECK(r[2].wait_mask == (1u << (r[0].slot - 1)));
+      /* The body's own load is retired by its drains, not after the loop. */
+      CHECK(r[7].wait_mask == (1u << (r[0].slot - 1)));
+      /* While the entry load is live, the body does not reuse its slot. */
+      CHECK(r[3].slot != 0);
+   }
+   {
+      struct agx3_slot_instr push = st(0), test = st(0), back = st(0),
+                             pop = st(0);
+      push.cf_push = 1;
+      push.cf_arm = true;
+      test.cf = back.cf = pop.cf = AGX3_SLOT_CF_DRAIN;
+      pop.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         ld(10), push, ld(16), alu(18, 16, 16), test, back, pop,
+         alu(14, 10, 10),
+      };
+      CHECK(agx3_slot_assign(p, 8, 6, r));
+      CHECK(r[2].slot != r[0].slot);
+      CHECK(r[7].wait_mask == (1u << (r[0].slot - 1)));
+   }
+
    /* An arm closed together with another level, or an unbalanced pop, is
     * refused: the packer then drains everywhere. */
    {

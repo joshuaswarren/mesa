@@ -8174,6 +8174,123 @@ TEST_F(AGX3PackBinary, StructuredIfAndForwardBranch)
    }
 }
 
+/* Build: load r4; loop { [store r4]; while (r0 < r2) } [store r4], the
+ * loop skeleton of NestedLoopEntryBackedgeAndPop. */
+static void
+build_load_then_loop(agx_builder *b, bool body_uses, bool after_uses)
+{
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_index loaded = agx_register(4, AGX_SIZE_32);
+   agx_device_load_to(b, loaded, agx_uniform(0, AGX_SIZE_64), agx_immediate(0),
+                      AGX_FORMAT_I32, 1, 0, false);
+   agx_push_exec(b, 1);
+   agx_block *body = agx_test_block(b->shader);
+   agx_builder lb = agx_init_builder(b->shader, agx_after_block(body));
+   agx_device_store(&lb, body_uses ? loaded : agx_register(6, AGX_SIZE_32),
+                    agx_uniform(0, AGX_SIZE_64), agx_immediate(8),
+                    AGX_FORMAT_I32, 1, 0, false);
+   agx_while_icmp(&lb, agx_register(0, AGX_SIZE_32),
+                  agx_register(2, AGX_SIZE_32), 1, AGX_ICOND_ULT, false, NULL);
+   agx_jmp_exec_any(&lb, body);
+   agx_pop_exec(&lb, 1);
+   agx_device_store(&lb, after_uses ? loaded : agx_register(6, AGX_SIZE_32),
+                    agx_uniform(0, AGX_SIZE_64), agx_immediate(4),
+                    AGX_FORMAT_I32, 1, 0, false);
+   agx_stop(&lb);
+}
+
+/* A loop's entry push keeps a load from before the loop in flight: the
+ * loop's consumer waits for it in the body, and nothing drains at the entry.
+ * A load the body does not consume would be retired by the body's continue
+ * test on every iteration, so that loop drains once at its entry instead. */
+TEST_F(AGX3PackBinary, LoopEntryKeepsLoadsInFlight)
+{
+   for (int e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      for (bool body_uses : {true, false}) {
+         SCOPED_TRACE(::testing::Message()
+                      << "enc=" << enc << " body_uses=" << body_uses);
+         agx_builder *b = builder(enc);
+         build_load_then_loop(b, body_uses, !body_uses);
+         EXPECT_FALSE(pack(b).empty());
+         EXPECT_EQ(agx3_native_stats.cf_drains, body_uses ? 0u : 1u);
+      }
+   }
+}
+
+/* The body retires the load before its first drain, on the first iteration
+ * with every invocation that entered: after the loop it is complete, so the
+ * consumer there needs no wait and nothing drains anywhere. */
+TEST_F(AGX3PackBinary, LoopBodyRetiresEntryStateOnTheFirstIteration)
+{
+   for (int e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      agx_builder *b = builder(enc);
+      build_load_then_loop(b, true, true);
+      EXPECT_FALSE(pack(b).empty());
+      EXPECT_EQ(agx3_native_stats.cf_drains, 0u);
+      EXPECT_EQ(agx3_native_stats.wait_carriers, 0u);
+   }
+}
+
+/* Build: load r4; loop { r8 = r4 + r4 (an ALU consumer); store r8;
+ * while (r0 < r2) }. */
+static void
+build_load_then_alu_loop(agx_builder *b)
+{
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_index loaded = agx_register(4, AGX_SIZE_32);
+   agx_device_load_to(b, loaded, agx_uniform(0, AGX_SIZE_64), agx_immediate(0),
+                      AGX_FORMAT_I32, 1, 0, false);
+   agx_push_exec(b, 1);
+   agx_block *body = agx_test_block(b->shader);
+   agx_builder lb = agx_init_builder(b->shader, agx_after_block(body));
+   agx_fadd_to(&lb, agx_register(8, AGX_SIZE_32), loaded, loaded);
+   agx_device_store(&lb, agx_register(8, AGX_SIZE_32),
+                    agx_uniform(0, AGX_SIZE_64), agx_immediate(8),
+                    AGX_FORMAT_I32, 1, 0, false);
+   agx_while_icmp(&lb, agx_register(0, AGX_SIZE_32),
+                  agx_register(2, AGX_SIZE_32), 1, AGX_ICOND_ULT, false, NULL);
+   agx_jmp_exec_any(&lb, body);
+   agx_pop_exec(&lb, 1);
+   agx_stop(&lb);
+}
+
+/* Keeping results in flight into a loop never makes the loop's code larger
+ * than draining at its entry: when the body's consumer of a load from
+ * before the loop can only wait through a carrier, which would run on every
+ * iteration, agx3_pack_program() packs again with that entry draining. */
+TEST_F(AGX3PackBinary, LoopEntryNeverAddsCarriersToTheBody)
+{
+   for (int e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      for (bool alu : {false, true}) {
+         SCOPED_TRACE(::testing::Message() << "enc=" << enc << " alu=" << alu);
+         size_t sizes[2];
+         for (unsigned drain_all = 0; drain_all < 2; ++drain_all) {
+            agx_builder *b = builder(enc);
+            if (alu)
+               build_load_then_alu_loop(b);
+            else
+               build_load_then_loop(b, true, false);
+            struct util_dynarray bin;
+            util_dynarray_init(&bin, mem_ctx);
+            if (drain_all) {
+               b->shader->agx3_cf_drain_all = true;
+               ASSERT_TRUE(agx3_pack_binary(b->shader, &bin));
+            } else {
+               ASSERT_TRUE(agx3_pack_program(b->shader, &bin));
+            }
+            sizes[drain_all] = bin.size;
+         }
+         EXPECT_LE(sizes[0], sizes[1]);
+      }
+   }
+}
+
 TEST_F(AGX3PackBinary, NestedLoopEntryBackedgeAndPop)
 {
    /* Mesa's push_exec(1) + jmp_exec_any + pop_exec(1) loop skeleton maps to

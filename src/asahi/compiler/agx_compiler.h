@@ -747,6 +747,12 @@ typedef struct {
     * retry when keeping results in flight into if arms leaves a wait no
     * instruction form can carry (agx3_pack_program()). */
    bool agx3_cf_drain_all;
+   /* Pack with a drain at every loop entry, and what the last pack did:
+    * how many loop entries kept results in flight, and how many wait
+    * carriers it emitted inside loops (agx3_pack_program()). */
+   bool agx3_loop_entry_drain_all;
+   unsigned agx3_kept_loop_entries;
+   unsigned agx3_loop_carriers;
    unsigned agx3_g18g_read_staging_end;
    unsigned agx3_g18g_output_staging_span;
    bool agx3_staging_known;

@@ -76,7 +76,8 @@ enum agx3_slot_cf {
  * mask, may still be outstanding if the arm had no lanes. After an arm ends,
  * assignment therefore resumes from the state at the if, and consumers of
  * generations issued before it wait for them themselves; each consumer only
- * runs with lanes, where its wait holds.
+ * runs with lanes, where its wait holds. A loop's body is such a level too:
+ * the loop's pop resumes from the state at its entry push.
  */
 
 struct agx3_slot_instr {
