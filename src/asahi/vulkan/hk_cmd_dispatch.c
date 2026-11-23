@@ -2900,6 +2900,7 @@ static void
 hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                        const struct hk_api_shader *api,
                        const struct hk_shader *selected,
+                       enum hk_compute_pair_alt_kind alt_kind,
                        const uint32_t orig_groups[3], struct agx_grid exec_grid)
 {
    const struct hk_compute_pair_info *info = api ? api->compute_pair : NULL;
@@ -2973,16 +2974,7 @@ hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    memcpy(record.cs_base_group, desc->root.cs.base_group,
           sizeof(record.cs_base_group));
    record.printf_buffer_address = desc->root.printf_buffer_address;
-   if (selected == api->depthwise_vec4)
-      record.alt_kind = HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4;
-   else if (selected == api->gemm_cmat16)
-      record.alt_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT16;
-   else if (selected == api->gemm_cmat32)
-      record.alt_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT32;
-   else if (selected == api->gemm_cmat64)
-      record.alt_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT64;
-   else
-      record.alt_kind = HK_COMPUTE_PAIR_ALT_NONE;
+   record.alt_kind = alt_kind;
 
    cs->compute_pair = malloc(sizeof(record));
    if (!cs->compute_pair)
@@ -3798,7 +3790,8 @@ hk_select_depthwise_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
 
 static struct hk_shader *
 hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
-                    struct hk_shader *normal, struct agx_grid *grid)
+                    struct hk_shader *normal, struct agx_grid *grid,
+                    enum hk_compute_pair_alt_kind *alt_kind_out)
 {
    const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -3869,32 +3862,19 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
    } else {
       /* Guarded tile-width selection:
        * - N <= 16: cmat16 (32x16, K_step=32) avoids 50-75% N-lane waste.
-       * - N > 32 with N % 64 == 0 or N % 32 != 0: cmat64 (32x64, K_step=32)
-       *   doubles M-parallelism and halves K-loop barriers. When N % 32 != 0
-       *   (e.g. N=48 or N=144), both cmat64 and cmat32 incur N-tail waste (for
-       *   N=48 both pad to 64 with 25% waste), so cmat64 wins via fewer N WGs
-       *   and K_step=32. When N % 32 == 0 && N % 64 != 0 (e.g. N=96), cmat32
-       *   (64x32, K_step=16) has 0% N-tail waste vs cmat64's 50% last-tile
-       *   waste and is selected instead.
-       * - 16 < N <= 32: cmat32 (64x32, K_step=16) fits in one N tile. */
-      if ((uint32_t)n_i <= 16 && api->gemm_cmat16) {
-         alt = api->gemm_cmat16;
-         tile_n = 16;
-      } else if ((uint32_t)n_i > 32 &&
-                 (((uint32_t)n_i % 64) == 0 || ((uint32_t)n_i % 32) != 0) &&
-                 api->gemm_cmat64) {
-         alt = api->gemm_cmat64;
-         tile_n = 64;
-      } else if (api->gemm_cmat32) {
-         alt = api->gemm_cmat32;
-         tile_n = 32;
-      } else if (api->gemm_cmat64) {
-         alt = api->gemm_cmat64;
-         tile_n = 64;
-      } else if (api->gemm_cmat16) {
-         alt = api->gemm_cmat16;
-         tile_n = 16;
-      }
+       * - N > 32 with even ceil(N/32) and K >= 32: cmat64 (32x64, K_step=32)
+       *   matches cmat32's padded N-tile footprint while halving K-loop
+       *   barriers and doubling M-parallelism. When ceil(N/32) is odd or
+       *   K < 32, cmat32 (64x32, K_step=16) avoids extra N-padding waste and
+       *   keeps full K-steps on the fast path.
+       * - Otherwise: cmat32 (64x32, K_step=16). */
+      tile_n = hk_gemm_cmat_select_tile_n((uint32_t)n_i, (uint32_t)k_i,
+                                          api->gemm_cmat16 != NULL,
+                                          api->gemm_cmat32 != NULL,
+                                          api->gemm_cmat64 != NULL);
+      alt = tile_n == 16 ? api->gemm_cmat16 :
+            tile_n == 32 ? api->gemm_cmat32 :
+            tile_n == 64 ? api->gemm_cmat64 : NULL;
    }
    if (!alt ||
        !hk_g17p_compute_shader_supported(dev->dev.chip, alt, alt->only_linked, 1u << 16))
@@ -3951,9 +3931,37 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
    const uint64_t gy = DIV_ROUND_UP(m_u, tile_m);
    if (gx > 65535 || gy > 65535)
       return normal;
+
+   enum hk_compute_pair_alt_kind chosen_kind =
+      tile_n == 16 ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT16 :
+      tile_n == 32 ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 :
+                     HK_COMPUTE_PAIR_ALT_GEMM_CMAT64;
+
+   /* When a guarded GEMM dispatch has exact tile-aligned M/N/K and a 16-byte
+    * aligned A buffer, specialize to the unguarded cmat kernel (no boundary
+    * predicates or scalar tail loops). */
+   if (api->compute_pair_producer &&
+       hk_gemm_cmat_can_specialize_unguarded(gemm->is_guarded, m_u, n_u, k_u,
+                                             tile_n, gemm->reads[0].offset_B,
+                                             a_b.address, a_b.offset)) {
+      enum hk_compute_pair_alt_kind ug_kind =
+         tile_n == 16 ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED :
+         tile_n == 32 ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED :
+                        HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED;
+      struct hk_shader *ug = hk_compute_pair_get_or_compile_fused(
+         dev, api->compute_pair_producer, NULL, ug_kind,
+         HK_COMPUTE_PAIR_DUAL_NONE);
+      if (ug) {
+         alt = ug;
+         chosen_kind = ug_kind;
+      }
+   }
+
    grid->count[0] = (uint32_t)gx;
    grid->count[1] = (uint32_t)gy;
    grid->count[2] = 1;
+   if (alt_kind_out)
+      *alt_kind_out = chosen_kind;
    return alt;
 }
 
@@ -4016,6 +4024,7 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
 
    struct hk_shader *selected = s;
    struct hk_copy4_dispatch_cert copy4_cert = {.role = HK_COMPUTE_PAIR_NONE};
+   enum hk_compute_pair_alt_kind selected_alt_kind = HK_COMPUTE_PAIR_ALT_NONE;
    if (api && api->identity_copy4 && !api->compute_pair_producer && !in_threads && !invocation_stat) {
       selected = hk_select_identity_copy4(cmd, api, s, &grid, &copy4_cert);
       /* Record-time no-op self-copy elision: runs after
@@ -4033,6 +4042,8 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
               api->compute_pair->role == HK_COMPUTE_PAIR_DEPTHWISE &&
               !in_threads && !invocation_stat) {
       selected = hk_select_depthwise_vec4(cmd, api, s, &grid);
+      if (selected == api->depthwise_vec4)
+         selected_alt_kind = HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4;
       local_size = agx_workgroup(selected->b.info.workgroup_size[0],
                                  selected->b.info.workgroup_size[1],
                                  selected->b.info.workgroup_size[2]);
@@ -4040,7 +4051,7 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
               api->compute_pair &&
               api->compute_pair->role == HK_COMPUTE_PAIR_GEMM &&
               !in_threads && !invocation_stat) {
-      selected = hk_select_gemm_cmat(cmd, api, s, &grid);
+      selected = hk_select_gemm_cmat(cmd, api, s, &grid, &selected_alt_kind);
       local_size = agx_workgroup(selected->b.info.workgroup_size[0],
                                  selected->b.info.workgroup_size[1],
                                  selected->b.info.workgroup_size[2]);
@@ -4069,10 +4080,9 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
    }
    hk_dispatch_with_local_size(cmd, cs, selected, grid, local_size);
    if (!in_threads && !invocation_stat && api && api->compute_pair &&
-       (selected == s || selected == api->depthwise_vec4 ||
-        selected == api->gemm_cmat16 || selected == api->gemm_cmat32 ||
-        selected == api->gemm_cmat64))
-      hk_record_compute_pair(cmd, cs, api, selected, orig_groups, grid);
+       (selected == s || selected_alt_kind != HK_COMPUTE_PAIR_ALT_NONE))
+      hk_record_compute_pair(cmd, cs, api, selected, selected_alt_kind,
+                             orig_groups, grid);
    else if (!in_threads && !invocation_stat &&
             copy4_cert.role != HK_COMPUTE_PAIR_NONE)
       hk_record_copy4_pair(cmd, cs, &copy4_cert, orig_groups, grid);

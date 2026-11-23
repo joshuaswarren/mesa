@@ -17,7 +17,7 @@ struct hk_shader;
 struct nir_shader;
 struct vk_descriptor_set_layout;
 
-#define HK_COMPUTE_PAIR_MAX_VARIANTS 32u
+#define HK_COMPUTE_PAIR_MAX_VARIANTS 48u
 
 enum hk_compute_pair_alt_kind {
    HK_COMPUTE_PAIR_ALT_NONE = 0,
@@ -25,7 +25,47 @@ enum hk_compute_pair_alt_kind {
    HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 = 2,
    HK_COMPUTE_PAIR_ALT_GEMM_CMAT64 = 3,
    HK_COMPUTE_PAIR_ALT_GEMM_CMAT16 = 4,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED = 5,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED = 6,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED = 7,
 };
+
+static inline bool
+hk_compute_pair_alt_is_gemm_cmat(enum hk_compute_pair_alt_kind kind)
+{
+   return kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16 ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64 ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED;
+}
+
+static inline uint32_t
+hk_compute_pair_alt_gemm_tile_n(enum hk_compute_pair_alt_kind kind)
+{
+   switch (kind) {
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT16:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED:
+      return 16;
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT32:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED:
+      return 32;
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED:
+      return 64;
+   default:
+      return 0;
+   }
+}
+
+static inline bool
+hk_compute_pair_alt_is_gemm_unguarded(enum hk_compute_pair_alt_kind kind)
+{
+   return kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED;
+}
 
 struct hk_compute_pair_variant {
    bool has_epilogue;

@@ -1925,6 +1925,207 @@ eval_compare_gemm_dual_pad4(const struct gemm_test_opts *opts,
 }
 
 static void
+eval_compare_gemm_cpu_and_guarded_specialize(uint32_t M, uint32_t N, uint32_t K,
+                                             int32_t bias_mode, uint32_t tile_n,
+                                             bool specialize_unguarded,
+                                             const struct hk_nir_clamp_epilogue *epilogue,
+                                             uint32_t seed)
+{
+   const struct gemm_test_opts opts = {
+      .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .use_ffma = true,
+   };
+   nir_shader *orig = build_tiled_gemm_nir_opts(&opts);
+   nir_shader *pre = nir_shader_clone(NULL, orig);
+   run_hk_preprocess_for_test(pre, false);
+
+   struct hk_nir_gemm_output m = {0};
+   HK_EVAL_CHECK(hk_nir_match_gemm_output(
+      pre, nir_address_format_64bit_global_32bit_offset, &m));
+   HK_EVAL_CHECK(m.cmat_valid && m.is_guarded);
+
+   struct hk_nir_gemm_output build_info = m;
+   if (specialize_unguarded) {
+      HK_EVAL_CHECK(hk_gemm_cmat_can_specialize_unguarded(
+         m.is_guarded, M, N, K, tile_n, m.reads[0].offset_B, 0, 0));
+      build_info.is_guarded = false;
+   }
+
+   nir_shader *alt = hk_nir_build_gemm_cmat(
+      pre, &build_info, tile_n, epilogue, HK_COMPUTE_PAIR_DUAL_NONE);
+   HK_EVAL_CHECK(alt != NULL);
+   nir_validate_shader(alt, "gemm_cmat_specialize_or_sweep");
+
+   const size_t a_elems = (size_t)M * K;
+   const size_t b_elems = (size_t)K * N;
+   const size_t bias_elems = (size_t)(M > N ? M : N);
+   const size_t c_elems = (size_t)M * N;
+   float *a_buf = calloc(a_elems, sizeof(float));
+   float *b_buf = calloc(b_elems, sizeof(float));
+   float *bias_buf = calloc(bias_elems, sizeof(float));
+   float *c_orig = calloc(c_elems, sizeof(float));
+   float *c_alt = calloc(c_elems, sizeof(float));
+   float *c_cpu = calloc(c_elems, sizeof(float));
+   HK_EVAL_CHECK(a_buf && b_buf && bias_buf && c_orig && c_alt && c_cpu);
+
+   uint32_t rng = seed;
+   for (size_t i = 0; i < a_elems; ++i)
+      a_buf[i] = gemm_test_rand_f32(&rng);
+   for (size_t i = 0; i < b_elems; ++i)
+      b_buf[i] = gemm_test_rand_f32(&rng);
+   for (size_t i = 0; i < bias_elems; ++i)
+      bias_buf[i] = gemm_test_rand_f32(&rng);
+
+   /* Independent CPU FP32 reference matching exact K-order FMA + bias + clamp. */
+   for (uint32_t r = 0; r < M; ++r) {
+      for (uint32_t c = 0; c < N; ++c) {
+         float acc = 0.0f;
+         for (uint32_t k = 0; k < K; ++k)
+            acc = fmaf(a_buf[(size_t)r * K + k], b_buf[(size_t)k * N + c], acc);
+         if (bias_mode == 0)
+            acc += bias_buf[r];
+         else if (bias_mode == 1)
+            acc += bias_buf[c];
+         if (epilogue) {
+            float lo = hk_eval_u2f(epilogue->lower_bits);
+            float hi = hk_eval_u2f(epilogue->upper_bits);
+            if (epilogue->has_lower) acc = fmaxf(acc, lo);
+            if (epilogue->has_upper) acc = fminf(acc, hi);
+         }
+         c_cpu[(size_t)r * N + c] = acc;
+      }
+   }
+
+   struct gemm_push_layout push = {
+      .k = (int32_t)K, .n = (int32_t)N, .m = (int32_t)M, .bias_mode = bias_mode,
+   };
+   const uint32_t orig_grid[3] = { (N + 31u) / 32u, (M + 31u) / 32u, 1u };
+   struct hk_eval_ssbo ssbos_orig[4] = {
+      { 0, 0, a_buf, a_elems * sizeof(float), 0 },
+      { 0, 1, b_buf, b_elems * sizeof(float), 0 },
+      { 0, 2, bias_buf, bias_elems * sizeof(float), 0 },
+      { 0, 3, c_orig, c_elems * sizeof(float), 0 },
+   };
+   hk_eval_dispatch_wg(orig, orig_grid, ssbos_orig, 4, &push, sizeof(push));
+   if (epilogue) {
+      float lo = hk_eval_u2f(epilogue->lower_bits);
+      float hi = hk_eval_u2f(epilogue->upper_bits);
+      for (size_t i = 0; i < c_elems; ++i) {
+         float v = c_orig[i];
+         if (epilogue->has_lower) v = fmaxf(v, lo);
+         if (epilogue->has_upper) v = fminf(v, hi);
+         c_orig[i] = v;
+      }
+   }
+
+   const uint32_t tile_m = hk_gemm_cmat_tile_m(tile_n);
+   const uint32_t alt_grid[3] = {
+      (N + tile_n - 1u) / tile_n, (M + tile_m - 1u) / tile_m, 1u,
+   };
+   struct hk_eval_ssbo ssbos_alt[4] = {
+      { 0, 0, a_buf, a_elems * sizeof(float), 0 },
+      { 0, 1, b_buf, b_elems * sizeof(float), 0 },
+      { 0, 2, bias_buf, bias_elems * sizeof(float), 0 },
+      { 0, 3, c_alt, c_elems * sizeof(float), 0 },
+   };
+   hk_eval_dispatch_wg(alt, alt_grid, ssbos_alt, 4, &push, sizeof(push));
+
+   for (size_t i = 0; i < c_elems; ++i) {
+      HK_EVAL_CHECK(hk_eval_f2u(c_alt[i]) == hk_eval_f2u(c_orig[i]));
+      HK_EVAL_CHECK(hk_eval_f2u(c_alt[i]) == hk_eval_f2u(c_cpu[i]));
+   }
+
+   free(a_buf); free(b_buf); free(bias_buf);
+   free(c_orig); free(c_alt); free(c_cpu);
+   ralloc_free(alt); ralloc_free(pre); ralloc_free(orig);
+}
+
+static void
+test_gemm_cmat_guarded_specialize_and_shape_sweep(void)
+{
+   const struct hk_nir_clamp_epilogue ep = {
+      .has_lower = true, .has_upper = true, .upper_first = false,
+      .lower_bits = 0x00000000u, .upper_bits = 0x40c00000u,
+      .max_fp_math_ctrl = nir_fp_preserve_inf,
+      .min_fp_math_ctrl = nir_fp_preserve_inf,
+   };
+
+   /* Tile selection unit coverage. */
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(1,   1,  true, true, true) == 16);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(16,  64, true, true, true) == 16);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(17,  64, true, true, true) == 32);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(32,  64, true, true, true) == 32);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(33,  64, true, true, true) == 64);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(64,  31, true, true, true) == 32);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(64,  32, true, true, true) == 64);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(96,  64, true, true, true) == 32);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(128, 32, true, true, true) == 64);
+
+   /* Guarded producer -> *_UNGUARDED specialization predicate and NIR-eval at
+    * exact multiples and multiple-minus-1 for M, N, and K across all tiles. */
+   const uint32_t tiles[3] = { 16, 32, 64 };
+   for (unsigned ti = 0; ti < ARRAY_SIZE(tiles); ++ti) {
+      const uint32_t tn = tiles[ti];
+      const uint32_t tm = hk_gemm_cmat_tile_m(tn);
+      const uint32_t ks = hk_gemm_cmat_k_step(tn);
+
+      /* Exact multiples specialize; misaligned A and non-guarded inputs refuse. */
+      HK_EVAL_CHECK( hk_gemm_cmat_can_specialize_unguarded(true,  tm,     tn,     ks,     tn, 0, 0, 0));
+      HK_EVAL_CHECK( hk_gemm_cmat_can_specialize_unguarded(true,  2 * tm, 2 * tn, 2 * ks, tn, 16, 64, 32));
+      HK_EVAL_CHECK(!hk_gemm_cmat_can_specialize_unguarded(false, tm,     tn,     ks,     tn, 0, 0, 0));
+      HK_EVAL_CHECK(!hk_gemm_cmat_can_specialize_unguarded(true,  tm,     tn,     ks,     tn, 4, 0, 0));
+      HK_EVAL_CHECK(!hk_gemm_cmat_can_specialize_unguarded(true,  tm,     tn,     ks,     tn, 0, 4, 0));
+      HK_EVAL_CHECK(!hk_gemm_cmat_can_specialize_unguarded(true,  tm,     tn,     ks,     tn, 0, 0, 4));
+
+      /* Multiple-minus-1 on M, N, or K MUST refuse unguarded specialization. */
+      HK_EVAL_CHECK(!hk_gemm_cmat_can_specialize_unguarded(true, tm - 1, tn,     ks,     tn, 0, 0, 0));
+      HK_EVAL_CHECK(!hk_gemm_cmat_can_specialize_unguarded(true, tm,     tn - 1, ks,     tn, 0, 0, 0));
+      HK_EVAL_CHECK(!hk_gemm_cmat_can_specialize_unguarded(true, tm,     tn,     ks - 1, tn, 0, 0, 0));
+      HK_EVAL_CHECK(!hk_gemm_cmat_can_specialize_unguarded(true, 2 * tm - 1, 2 * tn,     2 * ks,     tn, 0, 0, 0));
+      HK_EVAL_CHECK(!hk_gemm_cmat_can_specialize_unguarded(true, 2 * tm,     2 * tn - 1, 2 * ks,     tn, 0, 0, 0));
+      HK_EVAL_CHECK(!hk_gemm_cmat_can_specialize_unguarded(true, 2 * tm,     2 * tn,     2 * ks - 1, tn, 0, 0, 0));
+
+      /* Guarded producer specialized to *_UNGUARDED at exact multiples. */
+      eval_compare_gemm_cpu_and_guarded_specialize(tm, tn, ks, 1, tn, true, NULL, 1100u + ti * 10u);
+      eval_compare_gemm_cpu_and_guarded_specialize(tm, tn, ks, 0, tn, true, &ep,  1101u + ti * 10u);
+      eval_compare_gemm_cpu_and_guarded_specialize(2 * tm, 2 * tn, 2 * ks, 2, tn, true, &ep, 1102u + ti * 10u);
+
+      /* Guarded fallback at multiple-minus-1 for M, N, and K. */
+      eval_compare_gemm_cpu_and_guarded_specialize(tm - 1, tn,     ks,     1, tn, false, &ep,  1103u + ti * 10u);
+      eval_compare_gemm_cpu_and_guarded_specialize(tm,     tn - 1, ks,     0, tn, false, NULL, 1104u + ti * 10u);
+      eval_compare_gemm_cpu_and_guarded_specialize(tm,     tn,     ks - 1, 1, tn, false, &ep,  1105u + ti * 10u);
+   }
+
+   /* Broad shape sweep against CPU FP32 reference: odd N, K%4!=0, K<32, edge M. */
+   const struct {
+      uint32_t m, n, k;
+      int32_t bias_mode;
+      bool clamp;
+   } sweep[] = {
+      {  1,  1,  1, 1, false },
+      {  1, 15,  3, 0, true  },
+      {  7,  7,  5, 2, false },
+      { 15, 17, 13, 1, true  },
+      { 31, 31, 15, 0, false },
+      { 32, 33, 16, 1, true  },
+      { 33, 49, 27, 1, false },
+      { 63, 63, 31, 0, true  },
+      { 64, 65, 19, 2, false },
+      { 65, 95, 35, 1, true  },
+      { 32, 64, 24, 1, false },
+      { 64, 96, 32, 0, true  },
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(sweep); ++i) {
+      const uint32_t tn = hk_gemm_cmat_select_tile_n(sweep[i].n, sweep[i].k,
+                                                     true, true, true);
+      const bool ug = hk_gemm_cmat_can_specialize_unguarded(
+         true, sweep[i].m, sweep[i].n, sweep[i].k, tn, 0, 0, 0);
+      eval_compare_gemm_cpu_and_guarded_specialize(
+         sweep[i].m, sweep[i].n, sweep[i].k, sweep[i].bias_mode, tn, ug,
+         sweep[i].clamp ? &ep : NULL, 1200u + i);
+   }
+}
+
+static void
 test_dual_write_fusion(void)
 {
    struct hk_nir_clamp_epilogue ep = {
@@ -2009,6 +2210,7 @@ main(void)
    test_depthwise_vec4_and_fusion();
    test_gemm_match_and_splice();
    test_gemm_cmat_certify_and_build();
+   test_gemm_cmat_guarded_specialize_and_shape_sweep();
    test_dual_write_fusion();
    glsl_type_singleton_decref();
    printf("test-hk-compute-pair: PASS\n");

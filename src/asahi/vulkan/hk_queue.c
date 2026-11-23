@@ -2761,9 +2761,7 @@ compute_pair_copy4_match(const struct hk_compute_pair_dispatch *producer,
       dst_align = 16;
    } else if (producer->info.role == HK_COMPUTE_PAIR_GEMM) {
       const struct hk_nir_gemm_output *p = &producer->info.gemm;
-      if ((producer->alt_kind != HK_COMPUTE_PAIR_ALT_GEMM_CMAT16 &&
-           producer->alt_kind != HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 &&
-           producer->alt_kind != HK_COMPUTE_PAIR_ALT_GEMM_CMAT64) ||
+      if (!hk_compute_pair_alt_is_gemm_cmat(producer->alt_kind) ||
           !hk_nir_gemm_producer_footprint(p, &ps, p_end, NULL, NULL))
          return false;
       out_off = p->output.offset_B;
@@ -2815,9 +2813,7 @@ compute_pair_pad4_match(const struct hk_compute_pair_dispatch *producer,
 {
    if (!producer || !pad4 || !producer->producer || !producer->root_va ||
        producer->info.role != HK_COMPUTE_PAIR_GEMM ||
-       (producer->alt_kind != HK_COMPUTE_PAIR_ALT_GEMM_CMAT16 &&
-        producer->alt_kind != HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 &&
-        producer->alt_kind != HK_COMPUTE_PAIR_ALT_GEMM_CMAT64) ||
+       !hk_compute_pair_alt_is_gemm_cmat(producer->alt_kind) ||
        pad4->info.role != HK_COMPUTE_PAIR_PAD4)
       return false;
 
