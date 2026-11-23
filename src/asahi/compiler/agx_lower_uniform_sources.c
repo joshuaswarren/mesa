@@ -770,9 +770,9 @@ agx3_isel_uniforms_kept(const agx_context *ctx, const agx_instr *I,
    if (uniform_ok[2] || uniform_ok[3]) {
       keep[2] = uniform_ok[2];
       keep[3] = uniform_ok[3];
-   } else if (uniform_ok[0] && reg32[1]) {
+   } else if (uniform_ok[0] && reg32[1] && reg32[2] && reg32[3]) {
       keep[0] = true;
-   } else if (uniform_ok[1] && reg32[0]) {
+   } else if (uniform_ok[1] && reg32[0] && reg32[2] && reg32[3]) {
       keep[1] = true;
    }
 }
@@ -913,12 +913,13 @@ agx_lower_uniform_sources(agx_context *ctx)
       }
       const bool both_minmax_uniform = native_minmax &&
          I->src[0].type == AGX_INDEX_UNIFORM && I->src[1].type == AGX_INDEX_UNIFORM;
-      /* agx_lower_pseudo() turns an unfused comparison into the 0/1 select
-       * fcmpsel(a, b, #1, #0), so a comparison reads its uniform comparands
-       * where that select does. */
+      /* Native AGX3B uniform-comparand fsel witnesses only select registers
+       * or immediate zero (never non-zero integer immediates such as the
+       * #1/#0 produced when agx_lower_pseudo() lowers AGX_OPCODE_FCMP). */
       const bool fsel_shape =
-         (I->op == AGX_OPCODE_FCMPSEL && I->nr_srcs == 4) ||
-         (I->op == AGX_OPCODE_FCMP && I->nr_srcs == 2);
+         I->op == AGX_OPCODE_FCMPSEL && I->nr_srcs == 4 &&
+         !(I->src[2].type == AGX_INDEX_IMMEDIATE && I->src[2].value != 0) &&
+         !(I->src[3].type == AGX_INDEX_IMMEDIATE && I->src[3].value != 0);
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           (half_float || full_float)) {
          const enum agx_size size = half_float ? AGX_SIZE_16 : AGX_SIZE_32;
