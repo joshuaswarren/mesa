@@ -3184,30 +3184,88 @@ translate_priority(VkQueueGlobalPriorityKHR prio)
    }
 }
 
+/* Vulkan queues of one device that keep a kernel queue of their own
+ * (hk_queue_share()).
+ *
+ * drm_asahi_queue_limits::max_queues is the kernel's machine-wide pool of
+ * kernel queues, shared with every other client. One Vulkan queue may hold up
+ * to HK_QUEUE_SIBLINGS_MAX of them, its primary and sibling kernel queues.
+ * Dividing the pool by one more than that keeps a single device from claiming
+ * all of it, leaving room for the device's helper queues and for other
+ * clients, and no device needs more than one family advertises. Without
+ * independent kernel queues, including under virtio where the limits cannot
+ * be queried, the Vulkan queues of a priority class and creation flags share
+ * one kernel queue.
+ */
+uint32_t
+hk_queue_independent_budget(struct hk_device *dev)
+{
+   if (!(dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) ||
+       dev->dev.is_virtio)
+      return 1;
+
+   const uint32_t max_queues = hk_device_physical(dev)->queue_limits.max_queues;
+   return CLAMP(max_queues / (1u + HK_QUEUE_SIBLINGS_MAX), 1u,
+                HK_ADVERTISED_QUEUES);
+}
+
+/* Vulkan queues of the device that run on the kernel queue of `real`, other
+ * than `real` itself. */
+static unsigned
+hk_queue_sharers(struct hk_device *dev, const struct vk_queue *real)
+{
+   unsigned sharers = 0;
+   vk_foreach_queue(iter, &dev->vk) {
+      if (iter != real && iter->real_queue == real)
+         sharers++;
+   }
+   return sharers;
+}
+
 void
 hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
 {
-   /* Keep independent Vulkan submit workers while bounding scarce kernel
-    * contexts per device. Queue families differ in exposed capabilities, but
-    * each kernel queue supports both engines. Priority and creation flags
-    * must match; the common runtime serializes callbacks on the backing queue.
+   /* Every Vulkan queue keeps an independent submit worker. The first ones,
+    * up to the device's budget (hk_queue_independent_budget()), also get a
+    * kernel queue of their own. A later queue shares the kernel queue of an
+    * earlier queue of the same priority class and creation flags, the one
+    * the fewest queues share, so shared work spreads over all of them; it
+    * gets its own only when its class has none yet. Queue families differ in
+    * exposed capabilities, but each kernel queue supports both engines. The
+    * common runtime serializes callbacks on the backing queue.
     */
-   if (!agx_chip_g17_m5(dev->dev.chip))
+   unsigned independent = 0;
+   vk_foreach_queue(iter, &dev->vk) {
+      if (iter == &queue->vk)
+         break;
+      if (!vk_queue_is_emulated(iter))
+         independent++;
+   }
+   if (independent < hk_queue_independent_budget(dev))
       return;
 
+   struct vk_queue *backing = NULL;
+   unsigned backing_sharers = 0;
    vk_foreach_queue(iter, &dev->vk) {
       if (iter == &queue->vk)
          break;
       if (vk_queue_is_emulated(iter))
          continue;
-      struct hk_queue *real = container_of(iter, struct hk_queue, vk);
+      const struct hk_queue *real = container_of(iter, struct hk_queue, vk);
       if (real->drm.virt_ring_idx != queue->drm.virt_ring_idx ||
           real->vk.flags != queue->vk.flags)
          continue;
-      queue->vk.driver_submit = NULL;
-      vk_queue_set_emulated(&queue->vk, iter);
-      break;
+      const unsigned sharers = hk_queue_sharers(dev, iter);
+      if (!backing || sharers < backing_sharers) {
+         backing = iter;
+         backing_sharers = sharers;
+      }
    }
+   if (!backing)
+      return;
+
+   queue->vk.driver_submit = NULL;
+   vk_queue_set_emulated(&queue->vk, backing);
 }
 
 static VkResult
@@ -3246,13 +3304,13 @@ hk_queue_create(struct hk_device *dev,
       return VK_ERROR_NOT_PERMITTED_KHR;
    }
 
-   /* On M5, quantize relative priorities to the two unprivileged classes.
-    * M5 only: there the Vulkan queues of one priority class share a kernel
-    * queue (hk_queue_share), so the class is the only scheduling distinction
-    * left between them; this mapping was qualified with the M5 snapshot.
-    * Elsewhere each VkQueue owns its kernel queue and relative priorities
-    * stay a hint, as the spec allows. An explicit global class takes
-    * precedence. No scheduling work is needed during submission.
+   /* On M5, quantize relative priorities to the two unprivileged classes;
+    * this mapping was qualified with the M5 snapshot. Vulkan queues of one
+    * class past the device's budget share kernel queues (hk_queue_share()),
+    * and the class is then the only scheduling distinction left between
+    * them. Elsewhere relative priorities stay a hint, as the spec allows. An
+    * explicit global class takes precedence. No scheduling work is needed
+    * during submission.
     */
    if (agx_chip_g17_m5(dev->dev.chip) && !priority_info &&
        pCreateInfo->pQueuePriorities[index_in_family] < 0.5f)
