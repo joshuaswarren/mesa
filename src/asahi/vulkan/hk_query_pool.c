@@ -841,8 +841,10 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    cmd->sync.kind_override = HK_SYNC_ALL;
    cmd->state.query_reset_recording = true;
    struct hk_cs *cs = hk_query_command_cs(cmd);
-   if (cs)
+   if (cs) {
+      cmd->sync.has_gpu_query_reset = true;
       emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
+   }
    cmd->state.query_reset_recording = false;
    cmd->sync.kind_override = 0;
    if (!cs)
@@ -1626,6 +1628,19 @@ hk_query_stamps_note_one_locked(struct hk_device *dev, struct hk_queue *queue,
    while (index[pos] != 0)
       pos = (pos + 1) & mask;
    index[pos] = (uint32_t)(count + 1);
+}
+
+void
+hk_query_stamps_note_req(struct hk_device *dev, struct hk_queue *queue,
+                         uint64_t point, uint32_t handle, uint32_t offset_B)
+{
+   if (!handle || !dev->query_stamps.ready ||
+       !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS))
+      return;
+
+   simple_mtx_lock(&dev->query_stamps.lock);
+   hk_query_stamps_note_one_locked(dev, queue, point, handle, offset_B);
+   simple_mtx_unlock(&dev->query_stamps.lock);
 }
 
 void

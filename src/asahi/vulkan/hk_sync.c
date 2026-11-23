@@ -1021,7 +1021,11 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    /* A top-of-pipe timestamp waiting for a command to ride on. */
    if (st->pending_start_ts.handle) {
       cs->timestamp.start = st->pending_start_ts;
+      cs->unordered_start_ts = st->pending_start_ts_unordered;
+      if (cs->unordered_start_ts)
+         st->has_unordered_start_ts = true;
       st->pending_start_ts = (struct agx_timestamp_req){0};
+      st->pending_start_ts_unordered = false;
    }
 }
 
@@ -1125,7 +1129,11 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
        cmd->sync.pending_start_ts.handle && !cs->timestamp.start.handle &&
        !cs->timestamp.end.handle) {
       cs->timestamp.start = cmd->sync.pending_start_ts;
+      cs->unordered_start_ts = cmd->sync.pending_start_ts_unordered;
+      if (cs->unordered_start_ts)
+         cmd->sync.has_unordered_start_ts = true;
       cmd->sync.pending_start_ts = (struct agx_timestamp_req){0};
+      cmd->sync.pending_start_ts_unordered = false;
    }
 }
 
@@ -1281,8 +1289,10 @@ hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    }
 
    /* A stamp the stream carried is not lost: it becomes pending again. */
-   if (cs->timestamp.start.handle && !st->pending_start_ts.handle)
+   if (cs->timestamp.start.handle && !st->pending_start_ts.handle) {
       st->pending_start_ts = cs->timestamp.start;
+      st->pending_start_ts_unordered = cs->unordered_start_ts;
+   }
 }
 
 void
@@ -1438,6 +1448,18 @@ timestamp_only_stream(struct hk_cmd_buffer *cmd,
    return cs;
 }
 
+static bool
+sync_state_has_req(const struct hk_sync_state *st)
+{
+   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+      for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+         if (st->req[k][sq].cut || st->req[k][sq].prior)
+            return true;
+      }
+   }
+   return false;
+}
+
 void
 hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
 {
@@ -1446,7 +1468,9 @@ hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
       return;
 
    const struct agx_timestamp_req req = st->pending_start_ts;
+   const bool unordered = st->pending_start_ts_unordered;
    st->pending_start_ts = (struct agx_timestamp_req){0};
+   st->pending_start_ts_unordered = false;
    st->epoch++;
 
    struct hk_cs *tail = last_stream(cmd);
@@ -1465,8 +1489,20 @@ hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
    if (!cs)
       return;
    cs->timestamp.start = req;
+   cs->unordered_start_ts = unordered;
+   if (unordered)
+      st->has_unordered_start_ts = true;
    stamp_carrier_launch(cmd);
    hk_cmd_buffer_end_compute(cmd);
+}
+
+bool
+hk_sync_can_defer_unordered_start_ts(struct hk_cmd_buffer *cmd)
+{
+   const struct hk_sync_state *st = &cmd->sync;
+
+   return !last_stream(cmd) && !st->pending_start_ts.handle &&
+          !sync_state_has_req(st);
 }
 
 void
@@ -1518,15 +1554,29 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       return;
    }
 
-   if (!src_kinds && start_stamps_ordered(cmd)) {
-      hk_sync_flush_pending_timestamp(cmd);
-      st->pending_start_ts = req;
-      /* A query reset or earlier dispatch may have left a reusable stream.
-       * Consume the start stamp before recording work into it too, rather
-       * than resolving it as an end stamp at the next timestamp write. */
-      if (agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
-         st->cs_check_pending = true;
-      return;
+   if (!src_kinds) {
+      if (start_stamps_ordered(cmd)) {
+         hk_sync_flush_pending_timestamp(cmd);
+         st->pending_start_ts = req;
+         st->pending_start_ts_unordered = false;
+         /* A query reset or earlier dispatch may have left a reusable stream.
+          * Consume the start stamp before recording work into it too, rather
+          * than resolving it as an end stamp at the next timestamp write. */
+         if (agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+            st->cs_check_pending = true;
+         return;
+      }
+
+      /* A leading TOP_OF_PIPE timestamp with no earlier work or barrier in
+       * this command buffer can ride on the first stream's start stamp when
+       * submission confirms no prior queue barrier, input wait, or live
+       * cross-subqueue work precedes it (hk_queue.c); otherwise submission
+       * moves it to a preceding end-stamp carrier. */
+      if (hk_sync_can_defer_unordered_start_ts(cmd)) {
+         st->pending_start_ts = req;
+         st->pending_start_ts_unordered = true;
+         return;
+      }
    }
 
    hk_sync_flush_pending_timestamp(cmd);
@@ -1560,6 +1610,8 @@ void
 hk_sync_begin_rendering(struct hk_cmd_buffer *cmd, bool resuming)
 {
    struct hk_sync_state *st = &cmd->sync;
+   if (resuming && st->pending_start_ts_unordered)
+      hk_sync_flush_pending_timestamp(cmd);
    st->epoch++;
    st->in_pass = true;
    st->pass_start_seq = st->next_seq;

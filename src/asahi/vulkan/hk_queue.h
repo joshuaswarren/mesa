@@ -56,6 +56,26 @@ struct hk_queue {
        * without control streams (queue_submit_empty()), 0 once it is known
        * complete. Later kernel submissions of this queue wait for it. */
       uint64_t empty_wait_point;
+
+      /* Latest timeline point of a submission carrying commands on each
+       * subqueue (VDM / CDM), cleared to 0 once observed complete. Used so a
+       * leading TOP_OF_PIPE timestamp on one subqueue takes the ordered
+       * carrier whenever the other subqueue still has incomplete work. */
+      uint64_t last_sq_point[HK_SYNC_NUM_SQ];
+
+      /* Latest timeline point of a submission carrying a GPU query reset
+       * (vkCmdResetQueryPool), cleared to 0 once observed complete. A submit
+       * that ends with compute after a reset clears the queue tail, yet its
+       * reset may still be running when the next submit's leading TOP_OF_PIPE
+       * start stamp would latch. */
+      uint64_t last_query_reset_point;
+
+      /* Latest timeline point covered by a queue barrier tail
+       * (queue->sync.tail), cleared to 0 once observed complete. Because
+       * queue->sync.tail holds monotonic ordinals that never reset to 0,
+       * tracking its timeline point lets leading TOP_OF_PIPE timestamps
+       * re-engage the fast path once the barrier's source work has finished. */
+      uint64_t last_tail_point;
    } drm;
 
    /* M5 submissions whose command memory is still pinned, oldest first
@@ -69,6 +89,10 @@ struct hk_queue {
    /* Device-lifetime command storage for the G17P SSTT maintenance encoder.
     * Sparse image remaps submit this record before their signal operations. */
    struct agx_bo *g17p_sstt_flush_bo;
+
+   /* Lazy command storage for an ordered end-stamp carrier when a leading
+    * TOP_OF_PIPE timestamp cannot safely ride on the first command's start. */
+   struct agx_bo *ts_carrier_bo;
 
    /* Kinds of streams this queue has ever run, see hk_sync.h. */
    struct hk_sync_queue sync;
