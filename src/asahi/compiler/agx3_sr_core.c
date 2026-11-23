@@ -70,13 +70,13 @@ agx3_sr_witnessed(enum agx_isa_encoding enc, uint8_t sr, enum agx3_sr_width widt
       case 63:
          return enc == AGX_ISA_ENCODING_AGX3C;
       case 65:
-         return enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C;
+         return agx_isa_is_agx3(enc);
       default:
          return false;
       }
    }
    if (width == AGX3_SR_W32 && sr == 64)
-      return enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C;
+      return agx_isa_is_agx3(enc);
    if (width == AGX3_SR_W32 && sr == 62)
       return enc == AGX_ISA_ENCODING_AGX3C;
    if (width == AGX3_SR_W32)
@@ -127,7 +127,7 @@ agx3_sr_encode(enum agx_isa_encoding enc, const struct agx3_sr_desc *d,
     * marked W16 SR39 read (m6-sample-mask-in: 248201002000b002 on
     * applegpu_g17g, 2100420000080100 on applegpu_g18g). */
    const bool coverage_entry = d->sr == 39 && d->width == AGX3_SR_W16 &&
-      (enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C);
+      agx_isa_is_agx3(enc);
    const bool pixel_entry = enc == AGX_ISA_ENCODING_AGX3B &&
       (d->sr == 23 || d->sr == 24) && d->width == AGX3_SR_W32;
    if (d->first && !coverage_entry && !pixel_entry)

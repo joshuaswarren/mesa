@@ -177,8 +177,7 @@ agx_instr_accepts_uniform(enum agx_isa_encoding encoding, enum agx_opcode op,
        * (the uniform's half index in f18, operand class f24 = 3), so
        * keep the uniform as the second operand instead of copying it into
        * a GPR on every iteration. */
-      return (encoding == AGX_ISA_ENCODING_AGX3B ||
-              encoding == AGX_ISA_ENCODING_AGX3C) &&
+      return agx_isa_is_agx3(encoding) &&
              src_index == 1 && size == AGX_SIZE_32 && !(value & 1) &&
              value < 256;
    case AGX_OPCODE_PHI:

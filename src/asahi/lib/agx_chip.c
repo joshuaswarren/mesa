@@ -43,8 +43,7 @@ agx_chip_codegen_supported(enum agx_chip chip)
    const enum agx_isa_encoding encoding = agx_chip_isa_encoding(chip);
 
    return encoding == AGX_ISA_ENCODING_AGX2 ||
-          encoding == AGX_ISA_ENCODING_AGX3B ||
-          encoding == AGX_ISA_ENCODING_AGX3C;
+          agx_isa_is_agx3(encoding);
 }
 
 bool

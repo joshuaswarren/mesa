@@ -186,7 +186,7 @@ agx3_stage_copy_liveness(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
 {
    const unsigned slots = agx_encoding_is_g17_class(enc) ? 8 : 6;
    if (!out || !len ||
-       (enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+       !agx_isa_is_agx3(enc) ||
        (stage_kill && enc != AGX_ISA_ENCODING_AGX3B) ||
        (dest & 1) || (src & 1) || dest >= 256 || src >= 256 ||
        slot < 1 || slot > slots || (wait_mask & ~((1u << slots) - 1)))

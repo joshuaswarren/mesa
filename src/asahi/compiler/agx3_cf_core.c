@@ -172,7 +172,7 @@ agx3_cf_icmp_reg_uniform32(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                            struct agx3_cf_source_hints hint,
                            uint8_t out[AGX3_CF_MAX_LENGTH], uint8_t *len)
 {
-   if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+   if (!agx_isa_is_agx3(enc) ||
        !icond_ok(cond) || !slot_ok(slot) || src0 >= 256 ||
        (src0 & 1) || uniform >= 256 || (uniform & 1) ||
        (hint.cache && hint.discard) || !out || !len)
@@ -198,7 +198,7 @@ agx3_cf_icmp_uniform_imm(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                          unsigned slot, uint16_t uniform, uint8_t imm,
                          uint8_t out[AGX3_CF_MAX_LENGTH], uint8_t *len)
 {
-   if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+   if (!agx_isa_is_agx3(enc) ||
        !icond_ok(cond) || !slot_ok(slot) || uniform >= 256 ||
        (uniform & 1) || !out || !len)
       return false;
@@ -370,7 +370,7 @@ agx3_cf_fcmp_reg_neg(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
                      const struct agx3_cf_source_hints hints_in[2],
                      uint8_t out[AGX3_CF_MAX_LENGTH], uint8_t *len)
 {
-   if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) || !src_in || !neg_in || !hints_in ||
+   if (!agx_isa_is_agx3(enc) || !src_in || !neg_in || !hints_in ||
        !out || !len || !slot_ok(slot) ||
        (or_nan && enc != AGX_ISA_ENCODING_AGX3C) ||
        (cond != AGX3_CF_FCOND_LT && cond != AGX3_CF_FCOND_GT &&
