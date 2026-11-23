@@ -517,13 +517,15 @@ test_agx3_pbe(void)
    bad[6].dimension = AGX_TEXTURE_DIMENSION_1D;
    bad[7].mode = AGX_IMAGE_MODE_SPARSE;
 
-   /* sRGB on store is Gen9-only, as in hk_pack_native_pbe(). */
+   /* sRGB on store is supported on both Gen9 and Gen10 (M5), staying off on
+    * G18G's native PBE path. */
    struct AGX_PBE srgb = rt;
    srgb.srgb = true;
    CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
                                      &srgb));
-   CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
-                                      &srgb));
+   CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
+                                     &srgb));
+   CHECK(!agx_gallium_pack_g18_native_pbe(&native, &srgb));
 
    for (unsigned i = 0; i < ARRAY_SIZE(bad); ++i) {
       memset(&native, 0xff, sizeof(native));
@@ -673,6 +675,24 @@ test_g17p_compressed_render_target(void)
          CHECK(memcmp(native.opaque, expected_ms, sizeof(expected_ms)) == 0);
       }
 
+      /* Gen10 (M5) also packs single-sample and 2x/4x multisample compressed
+       * RGBA8 render targets (metadata bit moves to word0[61], sample selector
+       * to word0[59:58], while G18G remains off). */
+      rt = original;
+      memset(&native, 0xa5, sizeof(native));
+      CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
+                                        &rt));
+      for (unsigned s = 0; s < ARRAY_SIZE(ms_counts); ++s) {
+         rt = original;
+         rt.dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED;
+         rt.samples = ms_counts[s];
+         memset(&native, 0xa5, sizeof(native));
+         CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
+                                           &rt));
+      }
+      rt = original;
+      CHECK(!agx_gallium_pack_g18_native_pbe(&native, &rt));
+
       /* Outside the compressed single-layer 2D and 2x/4x 2D multisample
        * packets nothing is encoded. */
       rt = original;
@@ -704,9 +724,8 @@ test_g17p_compressed_render_target(void)
       rt.layout = AGX_LAYOUT_TWIDDLED;
       CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
                                          &rt));
-      rt = original;
-      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10,
-                                         &native, &rt));
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
+                                         &rt));
    }
 }
 

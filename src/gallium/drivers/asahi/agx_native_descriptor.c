@@ -473,12 +473,14 @@ agx_gallium_pack_native_pbe_impl(
    const bool multisample =
       legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED ||
       array_multisample;
+   const bool gen10_m5 =
+      !g18_mips && agx3_generation == AGX_PBE_AGX3_GENERATION_10;
    const bool compressed_2d =
-      legacy->compressed && gen9 &&
+      legacy->compressed && (gen9 || gen10_m5) &&
       legacy->dimension == AGX_TEXTURE_DIMENSION_2D &&
       legacy->layout == AGX_LAYOUT_GPU && !multisample;
    const bool compressed_2d_ms =
-      legacy->compressed && gen9 &&
+      legacy->compressed && (gen9 || gen10_m5) &&
       legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED &&
       legacy->layout == AGX_LAYOUT_GPU;
    if ((!layered && !multisample && !g18_layered &&
@@ -515,10 +517,10 @@ agx_gallium_pack_native_pbe_impl(
        (multisample && (legacy->layout == AGX_LAYOUT_LINEAR ||
                         legacy->level != 0 || legacy->levels != 1 ||
                         legacy->unk_mipmapped ||
-                        (gen9 && legacy->compressed && !compressed_2d_ms))) ||
+                        ((gen9 || gen10_m5) && legacy->compressed && !compressed_2d_ms))) ||
        (!gen9 && !g18_mips && (legacy->level != 0 || legacy->levels != 1 ||
                   legacy->unk_mipmapped)) ||
-       (!gen9 && legacy->srgb) ||
+       (!(gen9 || gen10_m5) && legacy->srgb) ||
        (legacy->extended != legacy->compressed) ||
        (legacy->layout == AGX_LAYOUT_LINEAR
            ? legacy->stride < 12 || legacy->stride > UINT32_MAX - 4
@@ -546,7 +548,8 @@ agx_gallium_pack_native_pbe_impl(
       .acceleration_buffer = legacy->acceleration_buffer,
       .stride_B =
          legacy->layout == AGX_LAYOUT_LINEAR ? legacy->stride + 4 : 0,
-      .page_aligned_layers = legacy->page_aligned_layers,
+      .page_aligned_layers =
+         (legacy->compressed && !layered) ? false : legacy->page_aligned_layers,
       .srgb = legacy->srgb,
    };
 

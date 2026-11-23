@@ -1623,7 +1623,7 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
    const struct agx_device *dev = agx_device(pctx->screen);
    if (!agx_gallium_shared_compression_supported(
           agx_chip_descriptor_generation(dev->chip)) &&
-       state->nr_cbufs > 1 && !agx_chip_g17_m5(dev->chip)) {
+       state->nr_cbufs > 1) {
       bool any_compressed = false;
       enum pipe_format formats[PIPE_MAX_COLOR_BUFS] = {0};
 

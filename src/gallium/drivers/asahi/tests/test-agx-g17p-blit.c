@@ -2093,7 +2093,7 @@ main(void)
     * background texture; an unencodable descriptor would have aborted in
     * agx_native_descriptor_rejected(). Other AGX3 parts keep it plain. */
    if (!agx2 &&
-       agx_resource(dst)->layout.compressed != (dev->chip == AGX_CHIP_G17P)) {
+       agx_resource(dst)->layout.compressed != agx_chip_g17p_or_m5(dev->chip)) {
       fprintf(stderr,
               "AGX3 render target compression does not follow the G17P "
               "policy\n");
