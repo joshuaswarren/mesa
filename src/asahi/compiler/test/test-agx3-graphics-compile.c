@@ -8427,13 +8427,15 @@ g17p_stencil_protocol(const struct agx_shader_part *part, bool depth)
    bool upper_half = false, writeout = false;
    for (unsigned word = 0; word < 126; word += 2) {
       for (unsigned src = 0; src < 128; ++src) {
-         for (unsigned cache = 0; cache < 2; ++cache) {
-            for (unsigned discard = 0; discard < 2 - cache; ++discard) {
-               uint8_t copy[AGX3_COPY_MAX_LENGTH], length;
-               if (agx3_copy_encode_reg16(AGX_ISA_ENCODING_AGX3B, word + 1,
-                                          src, false, cache, discard, 0,
-                                          copy, &length))
-                  upper_half |= binary_contains(part, copy, length);
+         for (unsigned dest_cache = 0; dest_cache < 2; ++dest_cache) {
+            for (unsigned cache = 0; cache < 2; ++cache) {
+               for (unsigned discard = 0; discard < 2 - cache; ++discard) {
+                  uint8_t copy[AGX3_COPY_MAX_LENGTH], length;
+                  if (agx3_copy_encode_reg16(AGX_ISA_ENCODING_AGX3B, word + 1,
+                                             src, dest_cache, cache, discard, 0,
+                                             copy, &length))
+                     upper_half |= binary_contains(part, copy, length);
+               }
             }
          }
       }
