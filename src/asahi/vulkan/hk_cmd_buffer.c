@@ -3732,44 +3732,47 @@ refused:
  * (ASAHI_MESA_DEBUG=verify). Keep its temporary snapshot and checks out of
  * the normal recording path. */
 __attribute__((cold, noinline)) static void
-hk_m5_verify_fragment_root_shadow(const struct hk_graphics_state *gfx)
+hk_agx3_verify_fragment_root_shadow(const struct hk_graphics_state *gfx)
 {
    struct hk_root_fragment_snapshot reference;
    if (gfx->root_cpu) {
-      hk_root_fragment_snapshot_store(&reference, gfx->root_cpu);
+      hk_root_fragment_snapshot_store(&reference, gfx->root_cpu,
+                                      gfx->root_size);
       if (gfx->root_fragment_snapshot_cpu != gfx->root_cpu ||
           memcmp(&reference, &gfx->root_fragment_snapshot, sizeof(reference))) {
-         mesa_loge("M5 current root snapshot mismatch");
+         mesa_loge("AGX3 current root snapshot mismatch");
          abort();
       }
    }
    if (gfx->fs_root_cpu) {
-      hk_root_fragment_snapshot_store(&reference, gfx->fs_root_cpu);
+      hk_root_fragment_snapshot_store(&reference, gfx->fs_root_cpu,
+                                      gfx->fs_root_size);
       if (gfx->fs_root_fragment_snapshot_cpu != gfx->fs_root_cpu ||
           memcmp(&reference, &gfx->fs_root_fragment_snapshot,
                  sizeof(reference))) {
-         mesa_loge("M5 prior root snapshot mismatch");
+         mesa_loge("AGX3 prior root snapshot mismatch");
          abort();
       }
    }
 }
 
-/* The root the M5 fragment program of s follows. A root republished only
+/* The root the AGX3 fragment program of s follows. A root republished only
  * for bytes the fragment shader cannot read -- a per-draw dynamic offset of a
- * vertex-stage uniform buffer, a vertex buffer bind -- keeps the program the
- * stage last published, and with it the whole PPP state: that root stays
- * valid for the command buffer and holds the same bytes wherever the shader
- * reads. */
+ * vertex-stage uniform buffer, a vertex-only push constant update, a vertex
+ * buffer bind -- keeps the program the stage last published, and with it the
+ * whole PPP state: that root stays valid for the command buffer and holds the
+ * same bytes wherever the shader reads. */
 static uint64_t
-hk_m5_fragment_root(struct hk_cmd_buffer *cmd, const struct hk_shader *s)
+hk_agx3_fragment_root(struct hk_cmd_buffer *cmd, const struct hk_shader *s)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
 
    if (unlikely(dev->dev.debug & AGX_DBG_VERIFY))
-      hk_m5_verify_fragment_root_shadow(gfx);
+      hk_agx3_verify_fragment_root_shadow(gfx);
 
-   return hk_m5_fragment_root_select(gfx, s->info.agx3_root_reads, true, true);
+   return hk_agx3_fragment_root_select(gfx, s->info.agx3_root_reads,
+                                       s->root_descriptor_size, true, true);
 }
 
 static uint64_t
@@ -3782,7 +3785,7 @@ hk_m5_upload_graphics_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    struct hk_g17p_graphics_ioto_cache_entry *cached =
       &cmd->state.gfx.g17p_ioto[stage];
    const uint64_t root = stage && !s->info.agx3_gen1_fragment_rq
-                            ? hk_m5_fragment_root(cmd, s)
+                            ? hk_agx3_fragment_root(cmd, s)
                             : cmd->state.gfx.root;
 
    /* As on HAL200: a launch recorded for the same program and draw state
@@ -4078,6 +4081,11 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
        * earlier compact publication in this recording with the same inputs
        * was already admitted. */
       struct hk_graphics_state *agfx = &cmd->state.gfx;
+      const uint64_t root =
+         stage && agx_chip_native_hal200(dev->dev.chip) &&
+         !s->info.agx3_gen1_fragment_rq
+            ? hk_agx3_fragment_root(cmd, hk_linked_shader_source(s, linked))
+            : agfx->root;
       const struct hk_shader *hw_vs =
          agfx->shaders[MESA_SHADER_VERTEX] ? hk_bound_hw_vs(agfx) : NULL;
       const uint8_t flags = hk_g17p_launch_flags(cmd, s);
@@ -4085,7 +4093,7 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       if (!s->info.agx3_gen1_fragment_rq &&
           hk_g17p_launch_matches(cmd, launch, s, linked, flags, hw_vs)) {
          const uint64_t published =
-            hk_g17p_launch_replay(cmd, launch, linked, cached, agfx->root);
+            hk_g17p_launch_replay(cmd, launch, linked, cached, root);
          if (published)
             return published;
          if (vk_command_buffer_has_error(&cmd->vk))
@@ -4130,14 +4138,14 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
          loader_ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
       uint8_t sources[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
       size_t loader_range_count = 0;
-      if (hk_g17p_graphics_uniform_ranges(cmd, s, linked, agfx->root,
+      if (hk_g17p_graphics_uniform_ranges(cmd, s, linked, root,
                                           loader_ranges, &loader_range_count,
                                           sources)) {
          const uint64_t published = hk_g17p_publish_gfx_loader(
             cmd, s, linked, cached, loader_ranges, loader_range_count);
          if (published) {
             hk_g17p_launch_record(cmd, launch, s, linked, cached->loader,
-                                  flags, hw_vs, agfx->root, loader_ranges,
+                                  flags, hw_vs, root, loader_ranges,
                                   loader_range_count, sources);
             return published;
          }

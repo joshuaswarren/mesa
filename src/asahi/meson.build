@@ -78,6 +78,51 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # Vertex-only push-constant changes with a root-using FS that does not read
+  # push constants must reuse the prior fragment root and elide both the full
+  # bind tail and the incremental 28B FS PPP update.
+  test(
+    'hk-g17p-bind-tail-vs-only-push',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_bind_tail_state_change,
+      '--vs-only-push',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_MESA_DEBUG=verify',
+      'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,2,0',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  test(
+    'hk-g16g-bind-tail-vs-only-push',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_bind_tail_state_change,
+      '--vs-only-push',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g16g',
+      'ASAHI_MESA_DEBUG=verify',
+      'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,2,0',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # AGX3 multi-draw indirect recording fast path across HAL200, G15 and
   # HAL300/M5 (fixed loader reuse, dynamic DRAW_PARAMS/DRAW_ID relocs,
   # robust-index batching, empty draws, VDM chunk rollover and Ioto growth).
