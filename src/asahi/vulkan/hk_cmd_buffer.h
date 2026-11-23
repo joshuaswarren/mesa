@@ -41,6 +41,7 @@
 #include "hk_cs_root_size.h"
 #include "hk_descriptor_set.h"
 #include "hk_drm_render_core.h"
+#include "hk_g17p_patch.h"
 #include "hk_ioto_arena_core.h"
 #include "hk_nir_root_size.h"
 #include "hk_pipeline_statistics_core.h"
@@ -2854,6 +2855,38 @@ void hk_m5_pass_merge_note_set_bind(struct hk_cmd_buffer *cmd);
 uint64_t hk_m5_multi_draw_vertex_program(struct hk_cmd_buffer *cmd,
                                          struct hk_shader *s,
                                          struct hk_linked_shader *linked);
+
+struct hk_agx3_multi_draw_ioto_reloc {
+   uint64_t dest[2];
+   uint32_t delta;
+   uint16_t offset;
+   uint8_t short_mask;
+   bool is_draw_id;
+};
+
+/* Pre-patched vertex-stage Ioto template for a multi-draw indirect loop.
+ * Static uniform ranges are patched into `bytes` once; each record only
+ * reserves arena space, copies `bytes`, and patches `dyn_relocs`. */
+struct hk_agx3_multi_draw_ioto_tpl {
+   uint8_t bytes[HK_AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE];
+   uint16_t length;
+   bool cached_cmd_mem;
+   uint8_t dyn_reloc_count;
+   uint32_t draw_params_mask;
+   uint32_t draw_id_mask;
+   struct hk_agx3_multi_draw_ioto_reloc dyn_relocs[HK_G17P_PATCH_MAX_RELOCS];
+};
+
+bool hk_agx3_multi_draw_ioto_prepare(struct hk_cmd_buffer *cmd,
+                                     struct hk_shader *s,
+                                     struct hk_linked_shader *linked,
+                                     bool uses_base_param, bool uses_draw_id,
+                                     struct hk_agx3_multi_draw_ioto_tpl *tpl);
+
+void hk_agx3_multi_draw_ioto_finish(struct hk_cmd_buffer *cmd,
+                                    const struct hk_agx3_multi_draw_ioto_tpl *tpl,
+                                    uint64_t pipeline_program,
+                                    uint64_t draw_params, uint64_t draw_id_ptr);
 
 void hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
                                   const VkCommandBufferBeginInfo *pBeginInfo);

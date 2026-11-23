@@ -3830,6 +3830,105 @@ hk_m5_multi_draw_vertex_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    return hk_upload_usc_words_internal(cmd, s, linked);
 }
 
+bool
+hk_agx3_multi_draw_ioto_prepare(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+                                struct hk_linked_shader *linked,
+                                bool uses_base_param, bool uses_draw_id,
+                                struct hk_agx3_multi_draw_ioto_tpl *tpl)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_g17p_graphics_ioto_cache_entry *cached = &gfx->g17p_ioto[0];
+   const struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, 0, linked);
+
+   const uint8_t expected_flags =
+      (gfx->root ? 1 : 0) | (uses_base_param ? 2 : 0) | (uses_draw_id ? 4 : 0);
+
+   if (s->info.stage != MESA_SHADER_VERTEX || s->info.agx3_gen1_fragment_rq ||
+       !launch->valid || launch->s != s || launch->linked != linked ||
+       !launch->loader || cached->loader != launch->loader ||
+       cached->loader_linked != linked || !cached->loader_program ||
+       launch->flags != expected_flags)
+      return false;
+
+   const struct hk_g17p_gfx_loader *l = launch->loader;
+   if (!l->length || l->length > sizeof(tpl->bytes) ||
+       launch->count != l->plan.range_count ||
+       launch->count > HK_G17P_PATCH_MAX_RANGES)
+      return false;
+
+   uint32_t draw_params_mask = 0;
+   uint32_t draw_id_mask = 0;
+   for (unsigned i = 0; i < launch->count; ++i) {
+      if (launch->source[i] == HK_G17P_RANGE_SOURCE_DRAW_PARAMS)
+         draw_params_mask |= BITFIELD_BIT(i);
+      else if (launch->source[i] == HK_G17P_RANGE_SOURCE_DRAW_ID)
+         draw_id_mask |= BITFIELD_BIT(i);
+   }
+   const uint32_t dyn_mask = draw_params_mask | draw_id_mask;
+
+   /* Static ranges stay at cached->loader_ranges; require that no dynamic
+    * range shares a cluster with any other range so moving DRAW_PARAMS or
+    * DRAW_ID cannot invalidate cluster sharing. */
+   if (l->plan.shared) {
+      for (unsigned i = 0; i < l->plan.range_count; ++i) {
+         const unsigned leader = l->plan.leader[i];
+         if (dyn_mask & BITFIELD_BIT(i)) {
+            if (leader != i)
+               return false;
+         } else if (dyn_mask & BITFIELD_BIT(leader)) {
+            return false;
+         }
+      }
+   }
+
+   if (!hk_g17p_patch_plan_fits(&l->plan, cached->loader_ranges))
+      return false;
+
+   /* Bake all static relocations into the template once. */
+   memcpy(tpl->bytes, l->bytes, l->length);
+   hk_g17p_patch_plan_apply(&l->plan, cached->loader_ranges, tpl->bytes);
+
+   unsigned dyn_reloc_count = 0;
+   for (unsigned r = 0; r < l->plan.reloc_count; ++r) {
+      const struct hk_g17p_patch_reloc *rel = &l->plan.relocs[r];
+      if (!(dyn_mask & BITFIELD_BIT(rel->range)))
+         continue;
+      tpl->dyn_relocs[dyn_reloc_count++] = (struct hk_agx3_multi_draw_ioto_reloc){
+         .dest = {rel->dest[0], rel->dest[1]},
+         .delta = rel->delta,
+         .offset = rel->offset,
+         .short_mask = rel->short_mask,
+         .is_draw_id = (draw_id_mask & BITFIELD_BIT(rel->range)) != 0,
+      };
+   }
+
+   if ((dyn_mask != 0) != (dyn_reloc_count != 0))
+      return false;
+
+   tpl->length = l->length;
+   tpl->cached_cmd_mem = hk_g17p_cached_cmd_memory(&dev->dev);
+   tpl->dyn_reloc_count = dyn_reloc_count;
+   tpl->draw_params_mask = draw_params_mask;
+   tpl->draw_id_mask = draw_id_mask;
+   return true;
+}
+
+void
+hk_agx3_multi_draw_ioto_finish(struct hk_cmd_buffer *cmd,
+                               const struct hk_agx3_multi_draw_ioto_tpl *tpl,
+                               uint64_t pipeline_program, uint64_t draw_params,
+                               uint64_t draw_id_ptr)
+{
+   struct hk_g17p_graphics_ioto_cache_entry *cached =
+      &cmd->state.gfx.g17p_ioto[0];
+   u_foreach_bit(r, tpl->draw_params_mask)
+      cached->loader_ranges[r].address = draw_params;
+   u_foreach_bit(r, tpl->draw_id_mask)
+      cached->loader_ranges[r].address = draw_id_ptr;
+   cached->loader_program = pipeline_program;
+}
+
 static uint64_t
 hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked)

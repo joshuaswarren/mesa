@@ -78,6 +78,55 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # AGX3 multi-draw indirect recording fast path across HAL200, G15 and
+  # HAL300/M5 (fixed loader reuse, dynamic DRAW_PARAMS/DRAW_ID relocs,
+  # robust-index batching, empty draws, VDM chunk rollover and Ioto growth).
+  foreach chip : ['g17p', 'g16g', 'g15s', 'g17s-kernel']
+    test(
+      'hk-' + chip + '-indirect-multi',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        g17p_vulkan_indirect_multi,
+        '--shim',
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'ASAHI_MESA_DEBUG=verify',
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  # Static G17P VDM stream validation on the CPU-encoded non-indexed multi-draw
+  # indirect cases (bind-tail elision, dynamic relocs, and VDM chunk rollover).
+  # Indexed robust-batch slots are written by libagx_draw_robust_index_batch on
+  # the GPU and remain zeroed under drm-shim, so they are verified on hardware
+  # and via ASAHI_MESA_DEBUG=verify above.
+  test(
+    'hk-g17p-indirect-multi-stream',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_indirect_multi,
+      '--shim',
+      '--non-indexed-only',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_MESA_DEBUG=verify',
+      'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # Graphics-path copies from one layer of a block-compressed image into a
   # compressed G17P image; encoded and stream-validated, not executed.
   test(
