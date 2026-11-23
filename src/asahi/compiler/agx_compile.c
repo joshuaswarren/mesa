@@ -13478,7 +13478,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    }
 
 
-   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+   if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
        agx_opt_collect_split(ctx)) {
       agx_validate(ctx, "collect/split folding");
       AGX_PASS(ctx, agx_dce, true);
