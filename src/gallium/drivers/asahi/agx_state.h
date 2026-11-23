@@ -384,6 +384,9 @@ struct agx_uncompiled_shader {
       uint64_t inputs_linear_shaded;
       /* Every varying slot a fragment shader reads. */
       uint64_t inputs_read;
+      /* Samplers whose LOD bias the shader adds itself (nir_lower_tex's
+       * sampler bias lowering), through a direct lod_bias query. */
+      uint32_t lod_bias_samplers;
       uint8_t cull_distance_size;
       bool has_edgeflags;
       bool uses_fbfetch;
@@ -836,7 +839,10 @@ struct asahi_fs_shader_key {
    /* G17G: keep colour output g17g_mrt_output - 1 alone, at location 0
     * (agx_g17g_split_mrt). Zero keeps every output. */
    uint8_t g17g_mrt_output;
-   bool padding[5];
+   bool padding;
+   /* Samplers among agx_uncompiled_shader::info.lod_bias_samplers whose
+    * LOD bias is zero, compiled with that bias as a constant. */
+   uint32_t zero_lod_bias;
 };
 static_assert(sizeof(struct asahi_fs_shader_key) == 40, "no holes");
 
@@ -1656,6 +1662,8 @@ struct agx_lower_bindings_options {
 
 bool agx_nir_lower_bindings(nir_shader *shader,
                        struct agx_lower_bindings_options *options);
+uint32_t agx_lod_bias_samplers(nir_shader *nir);
+bool agx_nir_fold_zero_lod_bias(nir_shader *nir, uint32_t zero_lod_bias);
 bool agx_nir_lower_custom_border_g17p(nir_shader *shader, bool shadow_gather);
 /* As agx_nir_lower_custom_border_g17p; g18 selects G18G's shadow border
  * emulation and reports shadow operations it cannot emulate. */
