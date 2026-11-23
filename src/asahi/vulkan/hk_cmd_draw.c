@@ -43,6 +43,7 @@
 #include "hk_entrypoints.h"
 #include "hk_image.h"
 #include "hk_image_view.h"
+#include "hk_inline_blend_layout.h"
 #include "hk_agx3_ioto_program_core.h"
 #include "hk_g17p_ppp_indices.h"
 #include "hk_g17p_full_frame_scissor.h"
@@ -7163,36 +7164,12 @@ hk_g17p_mono_layout_mismatch(const struct agx_shader_part *a,
                  m->info.rodata.size_16 * 2))
          return "rodata";
    }
-   HK_MONO_FIELD(has_preamble)
-   HK_MONO_FIELD(preamble_size)
-   HK_MONO_FIELD(nr_preamble_gprs)
-   HK_MONO_FIELD(agx3_preamble_uniform_inputs)
-   HK_MONO_FIELD(agx3_preamble_tps_inputs)
-   HK_MONO_FIELD(preamble_scratch_size)
-   HK_MONO_FIELD(agx3_preamble_staging_known)
-   HK_MONO_FIELD(agx3_preamble_staging_halfs)
-   HK_MONO_FIELD(agx3_preamble_inputs.count)
-   HK_MONO_FIELD(agx3_preamble_inputs.storage_bytes)
-   if (a->info.has_preamble) {
-      /* G17 graphics Ioto still launches the API shader's constant program
-       * (hk_upload_usc_words_internal), while the linked main comes from m.
-       * Equal sizes/register counts do not prove that their uniform values
-       * agree. Keep the split link unless code and its frozen live-ins agree. */
-      if (memcmp(a->info.agx3_preamble_inputs.halves,
-                 m->info.agx3_preamble_inputs.halves,
-                 sizeof(a->info.agx3_preamble_inputs.halves)))
-         return "preamble inputs";
-      if (!a->binary || !m->binary || !a->info.preamble_size ||
-          a->info.preamble_offset > a->info.binary_size ||
-          m->info.preamble_offset > m->info.binary_size ||
-          a->info.preamble_size > a->info.binary_size - a->info.preamble_offset ||
-          m->info.preamble_size > m->info.binary_size - m->info.preamble_offset)
-         return "preamble extent";
-      if (memcmp((const uint8_t *)a->binary + a->info.preamble_offset,
-                 (const uint8_t *)m->binary + m->info.preamble_offset,
-                 a->info.preamble_size))
-         return "preamble code";
-   }
+   /* Without a layout of its own the draw launches the API shader's
+    * constant program (hk_upload_usc_words_internal) before the linked main
+    * from m, so the two must be the same program. */
+   const char *cprog = hk_g17p_cprog_mismatch(a, m);
+   if (cprog)
+      return cprog;
 resources:
    HK_MONO_FIELD(texture_state_count)
    HK_MONO_FIELD(sampler_state_count)
@@ -7263,13 +7240,13 @@ hk_g17p_mono_resolve_exports(nir_shader *nir)
    return true;
 }
 
-/* Whether an inline-blend program carries its own constant program, which
- * only a program built for an API shader without one does. */
+/* Whether an inline-blend program carries its own constant program
+ * (hk_g17p_inline_blend_own_layout()). */
 static bool
 hk_g17p_mono_own_layout(const struct hk_shader *shader,
                         const struct agx_shader_part *part)
 {
-   return part->info.has_preamble && !shader->b.info.has_preamble;
+   return hk_g17p_inline_blend_own_layout(&shader->b, part);
 }
 
 /* Every G17P fragment program that touches the tile opens the pixel
@@ -7359,7 +7336,8 @@ hk_g17p_mono_disk_key(struct hk_device *dev, const struct hk_shader *shader,
    if (partitions)
       memcpy(parts, partitions, sizeof(parts));
 
-   const char magic[8] = "hkmono4";
+   /* Bumped when the admission changes: refusals are cached as well. */
+   const char magic[8] = "hkmono6";
    const uint8_t preopt_flag = shader->g17p_mono_preoptimized ? 1 : 0;
    const size_t rodata_size =
       shader->b.binary ? shader->b.info.rodata.size_16 * 2 : 0;
@@ -7480,7 +7458,10 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
     * letting this program form its own
     * constant program when the API shader has none (a push-constant-only
     * fragment main forms none, see hk_compile_nir()). Only chips whose
-    * native constant program is qualified form one. */
+    * native constant program is qualified form one. A main that reads its
+    * colour from a uniform buffer has a constant program already and keeps
+    * its own key; the same terms reach that program here, and the result
+    * launches with its own layout (hk_g17p_mono_own_layout()). */
    bool uniform_exports = agx_chip_native_preamble(dev->dev.chip) &&
                           shader->g17p_mono_key.no_preamble;
    if (uniform_exports) {
