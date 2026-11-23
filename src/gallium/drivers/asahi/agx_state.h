@@ -1464,6 +1464,18 @@ struct agx_resource {
 
    BITSET_DECLARE(data_valid, PIPE_MAX_TEXTURE_LEVELS);
 
+   /* Levels whose data_valid bit was cleared by agx_invalidate_resource().
+    * Kept per-level so agx_prepare_for_map() still synchronizes against any
+    * in-flight GPU batch referencing bo, while a subsequent GPU or CPU write
+    * (agx_resource_set_valid()) clears the level bit and shadowing or syncing
+    * all referencing batches zeroes the set.
+    *
+    * Invariant: data_valid and invalidated_levels are disjoint; a level bit
+    * is set here only when agx_invalidate_resource() cleared a previously
+    * valid level without shadowing or syncing bo.
+    */
+   BITSET_DECLARE(invalidated_levels, PIPE_MAX_TEXTURE_LEVELS);
+
    struct ail_layout layout;
 
    /* Metal does not support packed depth/stencil formats; presumably AGX does
@@ -1571,6 +1583,13 @@ agx_resource_valid(struct agx_resource *rsrc, int level)
    }
 
    return BITSET_TEST(rsrc->data_valid, level);
+}
+
+static inline void
+agx_resource_set_valid(struct agx_resource *rsrc, unsigned level)
+{
+   BITSET_SET(rsrc->data_valid, level);
+   BITSET_CLEAR(rsrc->invalidated_levels, level);
 }
 
 static inline void *

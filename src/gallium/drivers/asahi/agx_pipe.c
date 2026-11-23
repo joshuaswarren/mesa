@@ -843,6 +843,7 @@ agx_shadow(struct agx_context *ctx, struct agx_resource *rsrc, bool needs_copy)
    /* Swap the pointers, dropping a reference */
    agx_bo_unreference(dev, rsrc->bo);
    rsrc->bo = new_;
+   BITSET_ZERO(rsrc->invalidated_levels);
 
    /* Reemit descriptors using this resource */
    agx_dirty_all(ctx);
@@ -958,9 +959,14 @@ agx_prepare_for_map(struct agx_context *ctx, struct agx_resource *rsrc,
    /* If the level has not been written, we may freely do CPU access (writes),
     * even if other levels are being written by the GPU. This lets us write some
     * mip levels on the CPU and some on the GPU, without stalling.
+    *
+    * Skip this shortcut for levels whose data_valid bit was cleared by
+    * agx_invalidate_resource(), because an in-flight GPU batch may still be
+    * reading or writing the BO.
     */
    if (!(ignore_valid && rsrc->base.b.target == PIPE_BUFFER) &&
-       !agx_resource_valid(rsrc, level))
+       !agx_resource_valid(rsrc, level) &&
+       !BITSET_TEST(rsrc->invalidated_levels, level))
       return;
 
    /* Upgrade DISCARD_RANGE to WHOLE_RESOURCE if the whole resource is
@@ -1009,6 +1015,7 @@ agx_prepare_for_map(struct agx_context *ctx, struct agx_resource *rsrc,
     */
    if (!agx_any_batch_uses_resource(ctx, rsrc)) {
       rsrc->shadowed_bytes = 0;
+      BITSET_ZERO(rsrc->invalidated_levels);
       return;
    }
 
@@ -1030,6 +1037,7 @@ agx_prepare_for_map(struct agx_context *ctx, struct agx_resource *rsrc,
    agx_sync_readers(ctx, rsrc, "Unsynchronized write");
 
    rsrc->shadowed_bytes = 0;
+   BITSET_ZERO(rsrc->invalidated_levels);
 }
 
 /*
@@ -1406,7 +1414,7 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
       if (!off_driver_thread && (usage & PIPE_MAP_WRITE) &&
           (usage &
            (PIPE_MAP_DIRECTLY | PIPE_MAP_PERSISTENT | PIPE_MAP_COHERENT))) {
-         BITSET_SET(rsrc->data_valid, level);
+         agx_resource_set_valid(rsrc, level);
       }
 
       uint32_t offset =
@@ -1447,7 +1455,7 @@ agx_texture_subdata(struct pipe_context *pctx, struct pipe_resource *prsrc,
                stride, box->x, box->y, box->width, box->height);
    }
 
-   BITSET_SET(rsrc->data_valid, level);
+   agx_resource_set_valid(rsrc, level);
 }
 
 static void
@@ -1502,8 +1510,19 @@ agx_transfer_unmap(struct pipe_context *pctx, struct pipe_transfer *transfer)
                break;
             old = cur;
          }
+         /* Keep data_valid and invalidated_levels disjoint, as
+          * agx_resource_set_valid() does. */
+         BITSET_WORD *inv =
+            &rsrc->invalidated_levels[BITSET_BITWORD(transfer->level)];
+         BITSET_WORD inv_old = p_atomic_read(inv);
+         while (inv_old & bit) {
+            BITSET_WORD cur = p_atomic_cmpxchg(inv, inv_old, inv_old & ~bit);
+            if (cur == inv_old)
+               break;
+            inv_old = cur;
+         }
       } else {
-         BITSET_SET(rsrc->data_valid, transfer->level);
+         agx_resource_set_valid(rsrc, transfer->level);
       }
    }
 
@@ -2343,6 +2362,7 @@ agx_invalidate_resource(struct pipe_context *pctx,
                         struct pipe_resource *resource)
 {
    struct agx_context *ctx = agx_context(pctx);
+   struct agx_resource *rsrc = agx_resource(resource);
    struct agx_batch *batch = agx_get_batch(ctx);
 
    /* Handle the glInvalidateFramebuffer case */
@@ -2357,6 +2377,38 @@ agx_invalidate_resource(struct pipe_context *pctx,
       if (surf->texture == resource) {
          batch->resolve &= ~(PIPE_CLEAR_COLOR0 << i);
          ctx->dirty |= AGX_DIRTY_BLEND;
+      }
+   }
+
+   if (resource->target == PIPE_BUFFER)
+      return;
+
+   /* Drop valid-level tracking when no active batch is already writing the
+    * resource, so the next render pass (for example a full-surface PBO upload)
+    * can skip loading overwritten contents into the tilebuffer.
+    *
+    * When an active initialized batch is already writing the resource, a
+    * subsequent draw in that same batch will not re-run agx_batch_init_state()
+    * to re-mark data_valid; marking AGX_DIRTY_BLEND/ZS above ensures a later
+    * draw in the same batch still re-enables end-of-tile store.
+    */
+   if (rsrc->bo) {
+      struct agx_batch *writer = agx_writer_get(ctx, rsrc->bo->handle);
+      if (!writer || !agx_batch_is_active(writer)) {
+         BITSET_OR(rsrc->invalidated_levels, rsrc->invalidated_levels,
+                   rsrc->data_valid);
+         BITSET_ZERO(rsrc->data_valid);
+      }
+   }
+
+   if (rsrc->separate_stencil && rsrc->separate_stencil->bo) {
+      struct agx_batch *swriter =
+         agx_writer_get(ctx, rsrc->separate_stencil->bo->handle);
+      if (!swriter || !agx_batch_is_active(swriter)) {
+         BITSET_OR(rsrc->separate_stencil->invalidated_levels,
+                   rsrc->separate_stencil->invalidated_levels,
+                   rsrc->separate_stencil->data_valid);
+         BITSET_ZERO(rsrc->separate_stencil->data_valid);
       }
    }
 }
