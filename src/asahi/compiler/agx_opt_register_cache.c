@@ -125,6 +125,31 @@ postra_liveness_ins(BITSET_WORD *live, agx_instr *I)
    }
 }
 
+static bool
+postra_block_gen_kill(agx_block *block, BITSET_WORD *gen, BITSET_WORD *kill)
+{
+   bool has_fused_break = false;
+   agx_foreach_instr_in_block_rev(block, I) {
+      if (fused_break_target(I))
+         has_fused_break = true;
+
+      agx_foreach_reg_dest(I, d) {
+         unsigned reg = I->dest[d].value;
+         unsigned count = agx_index_size_16(I->dest[d]);
+         BITSET_CLEAR_COUNT(gen, reg, count);
+         BITSET_SET_COUNT(kill, reg, count);
+      }
+
+      agx_foreach_reg_src(I, s) {
+         unsigned reg = I->src[s].value;
+         unsigned count = agx_index_size_16(I->src[s]);
+         BITSET_SET_COUNT(gen, reg, count);
+         BITSET_CLEAR_COUNT(kill, reg, count);
+      }
+   }
+   return has_fused_break;
+}
+
 /*
  * Globally, liveness analysis uses a fixed-point algorithm based on a
  * worklist. We initialize a work list with the exit block. We iterate the work
@@ -152,14 +177,32 @@ postra_liveness(agx_context *ctx)
    u_worklist worklist;
    agx_worklist_init(ctx, &worklist);
 
+   const unsigned n = ctx->num_blocks;
+   const unsigned rw = BITSET_WORDS(AGX_NUM_REGS);
+   BITSET_WORD *gen = n ? calloc((size_t)n * rw, sizeof(BITSET_WORD)) : NULL;
+   BITSET_WORD *kill = n ? calloc((size_t)n * rw, sizeof(BITSET_WORD)) : NULL;
+   bool *blk_fused = n ? calloc(n, sizeof(bool)) : NULL;
+   bool *blk_seen = n ? calloc(n, sizeof(bool)) : NULL;
+   bool use_summary = gen && kill && blk_fused && blk_seen;
+
    bool fused_breaks = false;
    agx_foreach_block(ctx, block) {
       BITSET_ZERO(block->reg_live_in);
       BITSET_ZERO(block->reg_live_out);
 
-      agx_foreach_instr_in_block(block, I)
-         fused_breaks |= fused_break_target(I) != NULL;
+      if (use_summary && block->index < n && !blk_seen[block->index]) {
+         blk_seen[block->index] = true;
+         bool fb = postra_block_gen_kill(block, gen + (size_t)block->index * rw,
+                                         kill + (size_t)block->index * rw);
+         blk_fused[block->index] = fb;
+         fused_breaks |= fb;
+      } else {
+         use_summary = false;
+         agx_foreach_instr_in_block(block, I)
+            fused_breaks |= fused_break_target(I) != NULL;
+      }
    }
+   free(blk_seen);
 
    /* A fused break's block is not a predecessor of its target, so with
     * fused breaks the whole analysis repeats until nothing changes. */
@@ -179,14 +222,21 @@ postra_liveness(agx_context *ctx)
          }
 
          BITSET_DECLARE(live, AGX_NUM_REGS);
-         memcpy(live, blk->reg_live_out, sizeof(live));
+         if (use_summary && !blk_fused[blk->index]) {
+            const BITSET_WORD *gb = gen + (size_t)blk->index * rw;
+            const BITSET_WORD *kb = kill + (size_t)blk->index * rw;
+            for (unsigned w = 0; w < rw; ++w)
+               live[w] = (blk->reg_live_out[w] & ~kb[w]) | gb[w];
+         } else {
+            memcpy(live, blk->reg_live_out, sizeof(live));
 
-         agx_foreach_instr_in_block_rev(blk, ins) {
-            agx_block *target = fused_break_target(ins);
-            if (target)
-               BITSET_OR(live, live, target->reg_live_in);
+            agx_foreach_instr_in_block_rev(blk, ins) {
+               agx_block *target = fused_break_target(ins);
+               if (target)
+                  BITSET_OR(live, live, target->reg_live_in);
 
-            postra_liveness_ins(live, ins);
+               postra_liveness_ins(live, ins);
+            }
          }
 
          if (BITSET_EQUAL(blk->reg_live_in, live))
@@ -201,6 +251,9 @@ postra_liveness(agx_context *ctx)
       }
    } while (fused_breaks && changed);
 
+   free(gen);
+   free(kill);
+   free(blk_fused);
    u_worklist_fini(&worklist);
 }
 
@@ -253,13 +306,16 @@ physical_liveness(agx_context *ctx, struct physical_live *p)
    unsigned *loop_end = calloc(n, sizeof(unsigned));
    BITSET_WORD *pending = calloc((size_t)n * bw, sizeof(BITSET_WORD));
    BITSET_WORD *live_in = calloc((size_t)n * rw, sizeof(BITSET_WORD));
+   BITSET_WORD *gen = calloc((size_t)n * rw, sizeof(BITSET_WORD));
+   BITSET_WORD *kill = calloc((size_t)n * rw, sizeof(BITSET_WORD));
+   bool *blk_fused = calloc(n, sizeof(bool));
    p->live_in = live_in;
    p->words = rw;
    p->pos = calloc(n, sizeof(unsigned));
    p->inactive = calloc((size_t)n * rw, sizeof(BITSET_WORD));
    p->live_out = calloc((size_t)n * rw, sizeof(BITSET_WORD));
-   bool ok = order && loop_end && pending && live_in && p->pos && p->inactive &&
-             p->live_out;
+   bool ok = order && loop_end && pending && live_in && gen && kill &&
+             blk_fused && p->pos && p->inactive && p->live_out;
 
    unsigned count = 0;
    if (ok) {
@@ -269,6 +325,9 @@ physical_liveness(agx_context *ctx, struct physical_live *p)
             break;
          }
          order[count] = block;
+         blk_fused[count] =
+            postra_block_gen_kill(block, gen + (size_t)count * rw,
+                                  kill + (size_t)count * rw);
          p->pos[block->index] = count++;
       }
    }
@@ -344,14 +403,21 @@ physical_liveness(agx_context *ctx, struct physical_live *p)
             }
             memcpy(out, live, sizeof(live));
 
-            agx_foreach_instr_in_block_rev(block, I) {
-               agx_block *target = fused_break_target(I);
-               if (target) {
-                  __bitset_or(live, live,
-                              live_in + (size_t)p->pos[target->index] * rw, rw);
+            if (!blk_fused[a]) {
+               const BITSET_WORD *gb = gen + (size_t)a * rw;
+               const BITSET_WORD *kb = kill + (size_t)a * rw;
+               for (unsigned w = 0; w < rw; ++w)
+                  live[w] = (out[w] & ~kb[w]) | gb[w] | inactive[w];
+            } else {
+               agx_foreach_instr_in_block_rev(block, I) {
+                  agx_block *target = fused_break_target(I);
+                  if (target) {
+                     __bitset_or(live, live,
+                                 live_in + (size_t)p->pos[target->index] * rw, rw);
+                  }
+                  postra_liveness_ins(live, I);
+                  __bitset_or(live, live, inactive, rw);
                }
-               postra_liveness_ins(live, I);
-               __bitset_or(live, live, inactive, rw);
             }
 
             BITSET_WORD *in = live_in + (size_t)a * rw;
@@ -366,6 +432,9 @@ physical_liveness(agx_context *ctx, struct physical_live *p)
    free(order);
    free(loop_end);
    free(pending);
+   free(gen);
+   free(kill);
+   free(blk_fused);
    if (!ok)
       physical_live_free(p);
    return ok;
