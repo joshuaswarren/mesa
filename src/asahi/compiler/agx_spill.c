@@ -622,15 +622,20 @@ cmp_dist(const void *left_, const void *right_, void *ctx_)
    /* We assume that rematerializing - even before every instruction - is
     * cheaper than spilling. As long as one of the nodes is rematerializable
     * (with distance > 0), we choose it over spilling. Within a class of nodes
-    * (rematerializable or not), compare by next-use-distance.
+    * (rematerializable or not), compare by next-use-distance, breaking ties
+    * deterministically by descending SSA index so spilling decisions do not
+    * depend on hash-table iteration order or qsort instability and prefer
+    * keeping more recently defined inner values over older outer values.
     */
    bool remat_left = ctx->remat[left->node] != NULL && left->dist > 0;
    bool remat_right = ctx->remat[right->node] != NULL && right->dist > 0;
 
    if (remat_left != remat_right)
       return remat_left ? 1 : -1;
-   else
+   else if (left->dist != right->dist)
       return (left->dist > right->dist) - (left->dist < right->dist);
+   else
+      return (right->node > left->node) - (right->node < left->node);
 }
 
 /*
