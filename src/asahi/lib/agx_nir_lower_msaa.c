@@ -729,18 +729,12 @@ agx_nir_hoist_g17p_zs_writes(nir_shader *shader)
 }
 
 /*
- * M5 pixel-rate depth-only or stencil-only writes at several samples.
- *
- * Native G17G fragments (native G17G compiler zs_depth_{2,4,8}x,
- * zs_cdepth_4x, zs_depth_only_4x, zs_stencil_{2,4}x) take the depth/coverage
- * class once, then loop over the covered samples with a single DEPTHF, each
- * iteration naming one sample. The code is identical at every sample count.
- * Rewrite a whole-pixel store_zs_agx of that shape, executed once at the top
- * level, into the same loop; the backend stages one word per iteration
- * (AGX_ZS_COVERED_SAMPLE). The loop runs at least once, so a lane whose
- * coverage is already empty still balances the transaction with an empty
- * word, as the native loop's bottom test does. Whole-pixel depth and stencil
- * together stay one word, and masked writes stay one word per sample.
+ * Lower a top-level whole-pixel depth-only or stencil-only store_zs_agx at
+ * >= 2 samples on M5 into a single depth/coverage transaction looping over
+ * covered samples with one DEPTHF per sample (AGX_ZS_COVERED_SAMPLE).
+ * The loop runs at least once so lanes with empty coverage still balance the
+ * transaction with an empty word. Combined depth+stencil and masked writes
+ * are left unchanged.
  */
 bool
 agx_nir_lower_m5_zs_sample_loop(nir_shader *shader, unsigned nr_samples)
@@ -904,24 +898,15 @@ m5_hoist_zs_write(nir_function_impl *impl)
 }
 
 /*
- * The end of the leading pixel-rate part of a pixel-shaded M5 epilog that
- * holds all of its coverage updates and depth/stencil writes. False when
- * there are none, or when other work precedes the last of them.
+ * Find the end of the leading pixel-rate prefix of an M5 epilog containing
+ * all coverage updates and depth/stencil writes (false if none or if other
+ * work precedes the last one).
  *
- * Native G17G blended alpha-to-coverage fragments (native G17G compiler
- * a2cb_pure_{2,4,8}x, with and without a depth attachment) issue one testing
- * MOVMSK at pixel rate, then blend each covered sample. Wrapping the update
- * in the sample loop instead issues one per sample, each naming its own
- * sample. A testing word tests every covered sample, not only the ones it
- * names: that is how a2c at alpha 0 wrote depth before 911fc231107. So the
- * first live sample's update would also test, and write depth for, samples
- * that a later sample's update kills (expected from that result).
- *
- * Blended fragments that write depth likewise finish depth before blending:
- * one DEPTHF per sample with the alpha coverage folded in (a2cb_depth_{2,4,8}x)
- * or, without alpha-to-coverage, the covered-sample DEPTHF loop
- * (blend_depth_{2,4,8}x). Leaving the write in the sample loop interleaves a
- * DEPTHF with each sample's colour instead.
+ * Coverage updates and depth writes must complete at pixel rate before the
+ * per-sample blend loop: a testing MOVMSK tests every currently covered
+ * sample, so issuing it inside the sample loop would test and write depth for
+ * samples killed by a later iteration, and leaving DEPTHF inside the loop
+ * would interleave depth writes with per-sample colour blending.
  */
 static bool
 m5_pixel_rate_prefix(nir_shader *shader, nir_cursor *end)
