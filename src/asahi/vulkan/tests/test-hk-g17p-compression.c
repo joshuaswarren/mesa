@@ -183,7 +183,7 @@ check_shape_for_chip(VkFormat format, bool is_depth, uint32_t chip_id)
    CHECK(CHIP_ELIGIBLE(i) == !is_color_16b);
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
-      CHECK(CHIP_ELIGIBLE(i) == (is_depth && (s == 2 || s == 4)));
+      CHECK(CHIP_ELIGIBLE(i) == (!is_color_16b && (s == 2 || s == 4)));
    }
    i = base; i.tiling = VK_IMAGE_TILING_LINEAR;
    CHECK(!CHIP_ELIGIBLE(i));

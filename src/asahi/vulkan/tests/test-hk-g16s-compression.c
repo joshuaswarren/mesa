@@ -194,12 +194,13 @@ check_shape(VkFormat format, bool is_zs)
    CHECK(ELIGIBLE(i));
    i = base; i.arrayLayers = 6;
    CHECK(ELIGIBLE(i));
-   /* Of the multisample colour attachments, only 2x (one layer) on M4 Pro. */
+   /* 2x and 4x multisample colour attachments (single-layer and layered) are
+    * admitted across G17P now that libagx_agx3_decompress handles all shapes. */
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
-      CHECK(ELIGIBLE(i) == (s == 2));
+      CHECK(ELIGIBLE(i) == (s == 2 || s == 4));
       i.arrayLayers = 2;
-      CHECK(!ELIGIBLE(i));
+      CHECK(ELIGIBLE(i) == (s == 2 || s == 4));
    }
    i = base; i.tiling = VK_IMAGE_TILING_LINEAR;
    CHECK(!ELIGIBLE(i));
@@ -248,8 +249,9 @@ check_shape(VkFormat format, bool is_zs)
  * pass, attachment slot and neighbouring formats are unknown at allocation.
  * Cover every admitted colour format, including the smallest ones that can
  * spill next to wide targets, and input/transient attachment combinations.
- * A 2x single-layer attachment is admitted: allocated first, every target
- * of at most eight bytes fits the 64-byte 2x sample (hk_resident_attachments).
+ * 2x and 4x MSAA colour attachments (single-layer and layered, including
+ * input/transient) are all admitted now that hk_hal200_decompress_attachment
+ * decompresses any spilled attachment on demand.
  */
 static void
 check_colour_msaa_spill_policy(void)
@@ -275,12 +277,10 @@ check_colour_msaa_spill_policy(void)
                   attachment.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
                if (mask & 2)
                   attachment.usage |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
-               const bool expected =
-                  samples == 1 || (samples == 2 && layers == 1 && !(mask & 1));
-               CHECK(ELIGIBLE(attachment) == expected);
+               CHECK(ELIGIBLE(attachment));
                attachment.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
                                   VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-               CHECK(ELIGIBLE(attachment) == expected);
+               CHECK(ELIGIBLE(attachment));
             }
          }
       }
@@ -309,7 +309,7 @@ check_layered_and_msaa(void)
       i.samples = (VkSampleCountFlagBits)samples;
       CHECK(ELIGIBLE(i) == (samples <= 4));
       i.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-      CHECK(ELIGIBLE(i) == (samples == 1));
+      CHECK(ELIGIBLE(i) == (samples <= 4));
       i.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
       i.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
       CHECK(!ELIGIBLE(i));
@@ -497,12 +497,12 @@ check_minecraft(void)
 static void
 check_transport_fever_3(void)
 {
-   /* Transport Fever 3 at 2x anti-aliasing: its 3456x2234 G-buffer is
+   /* Transport Fever 3 at 2x/4x anti-aliasing: its 3456x2234 G-buffer is
     * R11G11B10F, A2R10G10B10 and RGBA8 (usage 0x13) and D32S8 (0x23),
     * reloaded and stored about six times a frame. All but R11G11B10F (which
-    * would lose NaN) and the stencil plane compress on M4 Pro; nothing
-    * multisampled does on the other G17P chips. */
-   static const struct { VkFormat format; VkImageUsageFlags usage; bool m4_pro; }
+    * would lose NaN) and the stencil plane compress across all G17P chips
+    * at both 2x and 4x now that libagx_agx3_decompress handles spills. */
+   static const struct { VkFormat format; VkImageUsageFlags usage; bool admitted; }
       gbuffer[] = {
          {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 0x13, false},
          {VK_FORMAT_A2R10G10B10_UNORM_PACK32, 0x13, true},
@@ -510,15 +510,17 @@ check_transport_fever_3(void)
          {VK_FORMAT_D32_SFLOAT_S8_UINT, 0x23, true},
       };
    for (unsigned g = 0; g < sizeof(gbuffer) / sizeof(gbuffer[0]); ++g) {
-      const bool is_depth = gbuffer[g].format == VK_FORMAT_D32_SFLOAT_S8_UINT;
       VkImageCreateInfo i =
          image(gbuffer[g].format, 3456, 2234, 1, gbuffer[g].usage);
       i.samples = VK_SAMPLE_COUNT_2_BIT;
-      CHECK(ELIGIBLE(i) == gbuffer[g].m4_pro);
+      CHECK(ELIGIBLE(i) == gbuffer[g].admitted);
       CHECK(!g16s_eligible(AGX_CHIP_G17P, 1, &i));
-      CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i) == is_depth);
+      CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i) ==
+            gbuffer[g].admitted);
       i.samples = VK_SAMPLE_COUNT_4_BIT;
-      CHECK(ELIGIBLE(i) == is_depth);
+      CHECK(ELIGIBLE(i) == gbuffer[g].admitted);
+      CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i) ==
+            gbuffer[g].admitted);
    }
 }
 
@@ -746,11 +748,9 @@ check_shared(void)
 }
 
 /* All G17P SoCs share the HAL200/Gen9 compression encodings for layered, cube
- * and 3D colour, non-attachment MSAA colour, and single-level depth arrays.
- * M4 Pro (T6040) and M4 Max (T6041) also keep a reloaded 2x sample whole
- * (agx_chip_uncovered_tile_ms_reload_defect()), so they additionally admit 2x
- * colour attachments and 2x depth, while A18 Pro (T8140) keeps 2x colour
- * attachments and 2x depth plain. */
+ * and 3D colour, 2x/4x MSAA colour (both non-attachment and attachment, with
+ * libagx_agx3_decompress handling any spilled attachment), and single-level
+ * depth arrays. */
 static bool
 m4_max_eligible(enum agx_chip chip, unsigned plane,
                 const VkImageCreateInfo *info)
@@ -784,19 +784,20 @@ check_m4_max(void)
    VkImageCreateInfo c = image(VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1, rt);
    CHECK(M4_MAX(c) && NEO(c));
 
-   /* 2x colour attachments depend on !agx_chip_uncovered_tile_ms_reload_defect():
-    * admitted on M4 Pro and M4 Max, refused on A18 Pro. */
+   /* 2x/4x colour attachments (single-layer, layered, and input) are admitted
+    * across all G17P SoCs now that libagx_agx3_decompress handles spilled
+    * attachments on demand. */
    c.samples = VK_SAMPLE_COUNT_2_BIT;
-   CHECK(M4_MAX(c) && !NEO(c));
+   CHECK(M4_MAX(c) && NEO(c));
    VkImageCreateInfo x = c;
    x.samples = VK_SAMPLE_COUNT_4_BIT;
-   CHECK(!M4_MAX(x) && !NEO(x));
+   CHECK(M4_MAX(x) && NEO(x));
    x = c;
    x.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
-   CHECK(!M4_MAX(x) && !NEO(x));
+   CHECK(M4_MAX(x) && NEO(x));
    x = c;
    x.arrayLayers = 2;
-   CHECK(!M4_MAX(x) && !NEO(x));
+   CHECK(M4_MAX(x) && NEO(x));
    /* Non-attachment 2x/4x MSAA colour is admitted across G17P. */
    x = c;
    x.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
