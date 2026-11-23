@@ -11,6 +11,7 @@
 #include "util/driconf.h"
 #include "util/xmlconfig.h"
 #include "agx_state.h"
+#include "agx_fence.h"
 #include "agx_public.h"
 
 #define CHECK(x) do { if (!(x)) { \
@@ -133,6 +134,247 @@ run_batch(struct pipe_context *pctx, bool compute, bool render, bool split,
    CHECK(ctx->submit_perf.submits == 0 && ctx->submit_perf.batches == 0);
 }
 
+struct coalesced_record {
+   unsigned in_sync_count;
+   unsigned out_sync_count;
+   unsigned renders;
+   unsigned computes;
+   unsigned att_sets;
+   unsigned att_clears;
+   uint16_t render_vdm_barriers[16];
+   uint16_t render_cdm_barriers[16];
+   uint16_t compute_vdm_barriers[16];
+   uint16_t compute_cdm_barriers[16];
+};
+
+static struct coalesced_record coalesced_log[8];
+static unsigned coalesced_calls;
+static bool coalesced_fail;
+
+/* The no-op drm-shim stubs DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD; provide a dummy
+ * file descriptor so agx_fence_create() and fence_server_sync() can run. */
+int
+drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
+{
+   CHECK(handle);
+   int dup_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+   CHECK(dup_fd >= 0);
+   *sync_file_fd = dup_fd;
+   return 0;
+}
+
+static int
+inspect_coalesced_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
+                         struct agx_submit_virt *virt)
+{
+   CHECK(coalesced_calls < ARRAY_SIZE(coalesced_log));
+   struct coalesced_record *rec = &coalesced_log[coalesced_calls++];
+   memset(rec, 0, sizeof(*rec));
+   rec->in_sync_count = submit->in_sync_count;
+   rec->out_sync_count = submit->out_sync_count;
+
+   const uint8_t *data = (void *)(uintptr_t)submit->cmdbuf;
+   size_t cursor = 0;
+   while (cursor < submit->cmdbuf_size) {
+      CHECK(submit->cmdbuf_size - cursor >= sizeof(struct drm_asahi_cmd_header));
+      const struct drm_asahi_cmd_header *h = (void *)(data + cursor);
+      CHECK(h->size <= submit->cmdbuf_size - cursor - sizeof(*h));
+      if (h->cmd_type == DRM_ASAHI_CMD_RENDER) {
+         if (rec->renders < ARRAY_SIZE(rec->render_vdm_barriers)) {
+            rec->render_vdm_barriers[rec->renders] = h->vdm_barrier;
+            rec->render_cdm_barriers[rec->renders] = h->cdm_barrier;
+         }
+         rec->renders++;
+      } else if (h->cmd_type == DRM_ASAHI_CMD_COMPUTE) {
+         if (rec->computes < ARRAY_SIZE(rec->compute_vdm_barriers)) {
+            rec->compute_vdm_barriers[rec->computes] = h->vdm_barrier;
+            rec->compute_cdm_barriers[rec->computes] = h->cdm_barrier;
+         }
+         rec->computes++;
+      } else if (h->cmd_type == DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS) {
+         CHECK(h->vdm_barrier == DRM_ASAHI_BARRIER_NONE &&
+               h->cdm_barrier == DRM_ASAHI_BARRIER_NONE);
+         if (h->size > 0)
+            rec->att_sets++;
+         else
+            rec->att_clears++;
+      }
+      cursor += sizeof(*h) + h->size;
+   }
+   return coalesced_fail ? -EINVAL : 0;
+}
+
+static void
+run_coalesced_tests(struct pipe_screen *screen)
+{
+   struct agx_device *dev = agx_device(screen);
+   dev->ops.submit = inspect_coalesced_submit;
+   dev->params.max_commands_per_submission = 64;
+
+   /* 1. Multi-batch render + compute coalescing + SET_FRAGMENT_ATTACHMENTS clear */
+   {
+      struct pipe_context *pctx = screen->context_create(screen, NULL, 0);
+      CHECK(pctx);
+      struct agx_context *ctx = agx_context(pctx);
+      struct pipe_resource templ = {
+         .target = PIPE_TEXTURE_2D,
+         .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+         .width0 = 16,
+         .height0 = 16,
+         .depth0 = 1,
+         .array_size = 1,
+         .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+      };
+      struct pipe_resource *tex = screen->resource_create(screen, &templ);
+      CHECK(tex);
+
+      struct pipe_framebuffer_state fb_att = {
+         .width = 16,
+         .height = 16,
+         .nr_cbufs = 1,
+         .cbufs[0] = {.texture = tex, .format = templ.format},
+      };
+      struct pipe_framebuffer_state fb_none = {.width = 16, .height = 16};
+
+      coalesced_calls = 0;
+      coalesced_fail = false;
+      struct drm_asahi_cmd_render r = {0};
+      struct drm_asahi_cmd_compute c = {0};
+
+      /* Batch 0: render with attachment */
+      pctx->set_framebuffer_state(pctx, &fb_att);
+      struct agx_batch *b0 = agx_get_batch(ctx);
+      agx_batch_queue_or_submit(ctx, b0, NULL, &r);
+      CHECK(coalesced_calls == 0 && agx_batch_is_queued(b0));
+
+      /* Batch 1: attachmentless render (must clear fragment attachments) */
+      pctx->set_framebuffer_state(pctx, &fb_none);
+      struct agx_batch *b1 = agx_get_batch(ctx);
+      agx_batch_queue_or_submit(ctx, b1, NULL, &r);
+      CHECK(coalesced_calls == 0 && agx_batch_is_queued(b1));
+
+      /* Batch 2: compute-only batch */
+      struct agx_batch *b2 = agx_get_compute_batch(ctx);
+      agx_batch_queue_or_submit(ctx, b2, &c, NULL);
+      CHECK(coalesced_calls == 0 && agx_batch_is_queued(b2));
+
+      /* Batch 3: mixed compute + render batch */
+      pctx->set_framebuffer_state(pctx, &fb_att);
+      struct agx_batch *b3 = agx_get_batch(ctx);
+      agx_batch_queue_or_submit(ctx, b3, &c, &r);
+      CHECK(coalesced_calls == 0 && agx_batch_is_queued(b3));
+
+      /* Flush drains all 4 batches in 1 ioctl. */
+      pctx->flush(pctx, NULL, 0);
+      CHECK(coalesced_calls == 1);
+      CHECK(coalesced_log[0].renders == 3 && coalesced_log[0].computes == 2);
+      CHECK(coalesced_log[0].out_sync_count == 4 + 2);
+      CHECK(coalesced_log[0].att_sets == 2 && coalesced_log[0].att_clears == 1);
+      CHECK(coalesced_log[0].render_vdm_barriers[0] == 0 &&
+            coalesced_log[0].render_cdm_barriers[0] == 0);
+      CHECK(coalesced_log[0].render_vdm_barriers[1] == 1 &&
+            coalesced_log[0].render_cdm_barriers[1] == 0);
+      CHECK(coalesced_log[0].compute_vdm_barriers[0] == 2 &&
+            coalesced_log[0].compute_cdm_barriers[0] == 0);
+      CHECK(coalesced_log[0].compute_vdm_barriers[1] == 2 &&
+            coalesced_log[0].compute_cdm_barriers[1] == 1);
+      CHECK(coalesced_log[0].render_vdm_barriers[2] == DRM_ASAHI_BARRIER_NONE &&
+            coalesced_log[0].render_cdm_barriers[2] == 2);
+
+      agx_sync_all(ctx, "coalesced test 1");
+      pipe_resource_reference(&tex, NULL);
+      pctx->destroy(pctx);
+   }
+
+   /* 2. Command-limit overflow splits cleanly across submissions. */
+   {
+      struct pipe_context *pctx = screen->context_create(screen, NULL, 0);
+      CHECK(pctx);
+      struct agx_context *ctx = agx_context(pctx);
+      dev->params.max_commands_per_submission = 3;
+      struct pipe_framebuffer_state fb = {.width = 16, .height = 16};
+      pctx->set_framebuffer_state(pctx, &fb);
+      struct drm_asahi_cmd_render r = {0};
+
+      coalesced_calls = 0;
+      coalesced_fail = false;
+      for (unsigned i = 0; i < 5; ++i) {
+         struct agx_batch *b = agx_get_batch(ctx);
+         agx_batch_queue_or_submit(ctx, b, NULL, &r);
+      }
+      /* 4th batch overflowed limit=3 and flushed first 3. */
+      CHECK(coalesced_calls == 1 && coalesced_log[0].renders == 3);
+      pctx->flush(pctx, NULL, 0);
+      CHECK(coalesced_calls == 2 && coalesced_log[1].renders == 2);
+      dev->params.max_commands_per_submission = 64;
+      agx_sync_all(ctx, "coalesced overflow");
+      pctx->destroy(pctx);
+   }
+
+   /* 3. fence_server_sync drains prior queued batches before attaching in_sync. */
+   {
+      struct pipe_context *pctx = screen->context_create(screen, NULL, 0);
+      CHECK(pctx);
+      struct agx_context *ctx = agx_context(pctx);
+      struct pipe_framebuffer_state fb = {.width = 16, .height = 16};
+      pctx->set_framebuffer_state(pctx, &fb);
+      struct drm_asahi_cmd_render r = {0};
+
+      coalesced_calls = 0;
+      coalesced_fail = false;
+      struct agx_batch *b0 = agx_get_batch(ctx);
+      agx_batch_queue_or_submit(ctx, b0, NULL, &r);
+      CHECK(coalesced_calls == 0);
+
+      struct pipe_fence_handle *f = agx_fence_create(ctx);
+      /* agx_fence_create drained b0 already. */
+      CHECK(f && coalesced_calls == 1 && coalesced_log[0].renders == 1);
+
+      struct agx_batch *b1 = agx_get_batch(ctx);
+      agx_batch_queue_or_submit(ctx, b1, NULL, &r);
+      CHECK(coalesced_calls == 1);
+      pctx->fence_server_sync(pctx, f, 0);
+      /* fence_server_sync must have drained b1 before recording in_sync_fd,
+       * while a subsequent batch b2 receives the explicit acquire fence. */
+      CHECK(coalesced_calls == 2 && coalesced_log[1].renders == 1);
+      CHECK(coalesced_log[1].in_sync_count == coalesced_log[0].in_sync_count);
+
+      struct agx_batch *b2 = agx_get_batch(ctx);
+      agx_batch_queue_or_submit(ctx, b2, NULL, &r);
+      pctx->flush(pctx, NULL, 0);
+      CHECK(coalesced_calls == 3 && coalesced_log[2].renders == 1);
+      CHECK(coalesced_log[2].in_sync_count ==
+            coalesced_log[1].in_sync_count + 1);
+      screen->fence_reference(screen, &f, NULL);
+      agx_sync_all(ctx, "coalesced fence");
+      pctx->destroy(pctx);
+   }
+
+   /* 4. Failed coalesced submission retires all queued batches cleanly. */
+   {
+      struct pipe_context *pctx = screen->context_create(screen, NULL, 0);
+      CHECK(pctx);
+      struct agx_context *ctx = agx_context(pctx);
+      struct pipe_framebuffer_state fb = {.width = 16, .height = 16};
+      pctx->set_framebuffer_state(pctx, &fb);
+      struct drm_asahi_cmd_render r = {0};
+
+      coalesced_calls = 0;
+      coalesced_fail = true;
+      struct agx_batch *b0 = agx_get_batch(ctx);
+      agx_batch_queue_or_submit(ctx, b0, NULL, &r);
+      struct agx_batch *b1 = agx_get_batch(ctx);
+      agx_batch_queue_or_submit(ctx, b1, NULL, &r);
+      pctx->flush(pctx, NULL, 0);
+      CHECK(coalesced_calls == 1);
+      CHECK(ctx->any_faults);
+      CHECK(!agx_batch_is_queued(b0) && !agx_batch_is_queued(b1));
+      CHECK(!agx_batch_is_submitted(b0) && !agx_batch_is_submitted(b1));
+      coalesced_fail = false;
+      pctx->destroy(pctx);
+   }
+}
+
 int
 main(void)
 {
@@ -160,6 +402,7 @@ main(void)
          run_batch(pctx, true, true, false, false, 2);
       pctx->destroy(pctx);
    }
+   run_coalesced_tests(screen);
    screen->destroy(screen);
    driDestroyOptionInfo(&info);
    close(fd);
