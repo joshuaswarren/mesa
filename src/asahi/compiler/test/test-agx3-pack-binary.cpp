@@ -8360,6 +8360,222 @@ TEST_F(AGX3PackBinary, LoopEntryNeverAddsCarriersToTheBody)
    }
 }
 
+/* Build: loop { load r4; [if (r8 < r10) { break }] break if (r0 < r2);
+ * [store r4] } store r4. When the body consumes its load after the break,
+ * the lanes that stay retire it before the backedge, and the lanes that
+ * broke take it to the store after the loop. */
+static void
+build_break_loop(agx_builder *b, bool if_break, bool body_uses = true)
+{
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_index loaded = agx_register(4, AGX_SIZE_32);
+   agx_push_exec(b, 1);
+   agx_block *body = agx_test_block(b->shader);
+   agx_block *arm = if_break ? agx_test_block(b->shader) : NULL;
+   agx_block *arm_pop = if_break ? agx_test_block(b->shader) : NULL;
+   agx_block *test = agx_test_block(b->shader);
+   agx_block *footer = agx_test_block(b->shader);
+   agx_block *after = agx_test_block(b->shader);
+
+   agx_builder lb = agx_init_builder(b->shader, agx_after_block(body));
+   agx_device_load_to(&lb, loaded, agx_uniform(0, AGX_SIZE_64),
+                      agx_immediate(0), AGX_FORMAT_I32, 1, 0, false);
+   if (if_break) {
+      agx_if_icmp(&lb, agx_register(8, AGX_SIZE_32),
+                  agx_register(10, AGX_SIZE_32), 1, AGX_ICOND_ULT, false,
+                  arm_pop);
+      agx_builder ab = agx_init_builder(b->shader, agx_after_block(arm));
+      agx_index r0l = agx_register(0, AGX_SIZE_16);
+      agx_break_if_icmp(&ab, r0l, r0l, 2, false, AGX_ICOND_UEQ, after);
+      agx_builder pb = agx_init_builder(b->shader, agx_after_block(arm_pop));
+      agx_pop_exec(&pb, 1);
+   }
+   agx_builder tb = agx_init_builder(b->shader, agx_after_block(test));
+   agx_break_if_icmp(&tb, agx_register(0, AGX_SIZE_32),
+                     agx_register(2, AGX_SIZE_32), 1, false, AGX_ICOND_ULT,
+                     after);
+   agx_jmp_exec_none_after(&tb, footer);
+   agx_device_store(&tb, body_uses ? loaded : agx_register(6, AGX_SIZE_32),
+                    agx_uniform(0, AGX_SIZE_64), agx_immediate(8),
+                    AGX_FORMAT_I32, 1, 0, false);
+
+   agx_builder fb = agx_init_builder(b->shader, agx_after_block(footer));
+   agx_jmp_exec_any(&fb, body);
+   agx_pop_exec(&fb, 1);
+
+   agx_builder ab = agx_init_builder(b->shader, agx_after_block(after));
+   agx_device_store(&ab, loaded, agx_uniform(0, AGX_SIZE_64), agx_immediate(4),
+                    AGX_FORMAT_I32, 1, 0, false);
+   agx_stop(&ab);
+}
+
+/* Build: loop { load r10; loop { load r12; break if (r0 < r2); store r12;
+ * store r10 } store r10; store r12; break if (r4 < r6) }. The inner loop
+ * consumes the outer body's load, but only after its break. */
+static void
+build_nested_break_loops(agx_builder *b)
+{
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_index outer = agx_register(10, AGX_SIZE_32);
+   agx_index inner = agx_register(12, AGX_SIZE_32);
+   agx_index base = agx_uniform(0, AGX_SIZE_64);
+   agx_push_exec(b, 1);
+   agx_block *ob = agx_test_block(b->shader);
+   agx_block *ib = agx_test_block(b->shader);
+   agx_block *itest = agx_test_block(b->shader);
+   agx_block *ifoot = agx_test_block(b->shader);
+   agx_block *iafter = agx_test_block(b->shader);
+   agx_block *ofoot = agx_test_block(b->shader);
+   agx_block *oafter = agx_test_block(b->shader);
+
+   agx_builder bb = agx_init_builder(b->shader, agx_after_block(ob));
+   agx_device_load_to(&bb, outer, base, agx_immediate(0), AGX_FORMAT_I32, 1, 0,
+                      false);
+   agx_push_exec(&bb, 1);
+   bb = agx_init_builder(b->shader, agx_after_block(ib));
+   agx_device_load_to(&bb, inner, base, agx_immediate(4), AGX_FORMAT_I32, 1, 0,
+                      false);
+   bb = agx_init_builder(b->shader, agx_after_block(itest));
+   agx_break_if_icmp(&bb, agx_register(0, AGX_SIZE_32),
+                     agx_register(2, AGX_SIZE_32), 1, false, AGX_ICOND_ULT,
+                     iafter);
+   agx_jmp_exec_none_after(&bb, ifoot);
+   agx_device_store(&bb, inner, base, agx_immediate(8), AGX_FORMAT_I32, 1, 0,
+                    false);
+   agx_device_store(&bb, outer, base, agx_immediate(12), AGX_FORMAT_I32, 1, 0,
+                    false);
+   bb = agx_init_builder(b->shader, agx_after_block(ifoot));
+   agx_jmp_exec_any(&bb, ib);
+   agx_pop_exec(&bb, 1);
+   bb = agx_init_builder(b->shader, agx_after_block(iafter));
+   agx_device_store(&bb, outer, base, agx_immediate(16), AGX_FORMAT_I32, 1, 0,
+                    false);
+   agx_device_store(&bb, inner, base, agx_immediate(20), AGX_FORMAT_I32, 1, 0,
+                    false);
+   agx_break_if_icmp(&bb, agx_register(4, AGX_SIZE_32),
+                     agx_register(6, AGX_SIZE_32), 1, false, AGX_ICOND_ULT,
+                     oafter);
+   agx_jmp_exec_none_after(&bb, ofoot);
+   bb = agx_init_builder(b->shader, agx_after_block(ofoot));
+   agx_jmp_exec_any(&bb, ob);
+   agx_pop_exec(&bb, 1);
+   bb = agx_init_builder(b->shader, agx_after_block(oafter));
+   agx_stop(&bb);
+}
+
+/* A break joins its loop's pop instead of draining (agx3_slot_core.h): with
+ * joins off, each break drains what the lanes that stay would have retired
+ * later anyway. */
+TEST_F(AGX3PackBinary, BreakKeepsLoadsInFlightToTheLoopExit)
+{
+   for (int e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      for (bool if_break : {false, true}) {
+         SCOPED_TRACE(::testing::Message()
+                      << "enc=" << enc << " if_break=" << if_break);
+         for (bool off : {false, true}) {
+            agx_builder *b = builder(enc);
+            build_break_loop(b, if_break);
+            b->shader->agx3_arm_join_off = off;
+            EXPECT_FALSE(pack(b).empty());
+            if (off)
+               EXPECT_GE(agx3_native_stats.cf_drains, 1u);
+            else
+               EXPECT_EQ(agx3_native_stats.cf_drains, 0u);
+         }
+      }
+   }
+}
+
+/* When the lanes that stay do not consume the load before the backedge,
+ * which would retire it on every iteration anyway, the break drains as it
+ * did before breaks joined. */
+TEST_F(AGX3PackBinary, BreakDrainsWhatOnlyTheBackedgeWouldRetire)
+{
+   for (int e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      SCOPED_TRACE(::testing::Message() << "enc=" << enc);
+      std::vector<uint8_t> code[2];
+      for (unsigned off = 0; off < 2; ++off) {
+         agx_builder *b = builder(enc);
+         build_break_loop(b, false, false);
+         b->shader->agx3_arm_join_off = off;
+         code[off] = pack(b);
+         EXPECT_EQ(agx3_native_stats.loop_cf_drains, 1u);
+      }
+      EXPECT_FALSE(code[0].empty());
+      EXPECT_EQ(code[0], code[1]);
+   }
+}
+
+/* Once the inner loop's break no longer drains, the inner loop keeps the
+ * outer body's load in flight at its entry too: nothing drains anywhere. */
+TEST_F(AGX3PackBinary, InnerLoopBreakKeepsOuterLoadsInFlight)
+{
+   for (int e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      SCOPED_TRACE(::testing::Message() << "enc=" << enc);
+      unsigned drains[2], kept[2];
+      for (unsigned off = 0; off < 2; ++off) {
+         agx_builder *b = builder(enc);
+         build_nested_break_loops(b);
+         b->shader->agx3_arm_join_off = off;
+         EXPECT_FALSE(pack(b).empty());
+         drains[off] = agx3_native_stats.loop_cf_drains;
+         kept[off] = b->shader->agx3_kept_loop_entries;
+      }
+      EXPECT_EQ(drains[0], 0u);
+      EXPECT_GT(drains[1], 0u);
+      EXPECT_EQ(kept[0], 2u);
+      EXPECT_LT(kept[1], 2u);
+   }
+}
+
+/* agx3_pack_program() keeps break joins only where they leave no more
+ * carriers inside loops, then no more carriers, then no more code than
+ * the breaks draining, with or without the arms joining. */
+TEST_F(AGX3PackBinary, BreakJoinNeverAddsLoopCarriers)
+{
+   for (int e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      for (unsigned shape = 0; shape < 3; ++shape) {
+         SCOPED_TRACE(::testing::Message() << "enc=" << enc
+                                           << " shape=" << shape);
+         struct { unsigned loop_carriers, carriers; size_t size; } cost[3];
+         for (unsigned v = 0; v < 3; ++v) {
+            agx_builder *b = builder(enc);
+            if (shape == 2)
+               build_nested_break_loops(b);
+            else
+               build_break_loop(b, shape);
+            struct util_dynarray bin;
+            util_dynarray_init(&bin, mem_ctx);
+            if (v) {
+               b->shader->agx3_arm_join_off = v == 2;
+               b->shader->agx3_break_joins = AGX3_BREAKS_DRAIN;
+               ASSERT_TRUE(agx3_pack_binary(b->shader, &bin));
+            } else {
+               ASSERT_TRUE(agx3_pack_program(b->shader, &bin));
+            }
+            cost[v] = {b->shader->agx3_loop_carriers,
+                       agx3_native_stats.wait_carriers, bin.size};
+         }
+         for (unsigned v = 1; v < 3; ++v) {
+            EXPECT_LE(cost[0].loop_carriers, cost[v].loop_carriers) << v;
+            if (cost[0].loop_carriers == cost[v].loop_carriers) {
+               EXPECT_LE(cost[0].carriers, cost[v].carriers) << v;
+               if (cost[0].carriers == cost[v].carriers)
+                  EXPECT_LE(cost[0].size, cost[v].size) << v;
+            }
+         }
+      }
+   }
+}
+
 TEST_F(AGX3PackBinary, NestedLoopEntryBackedgeAndPop)
 {
    /* Mesa's push_exec(1) + jmp_exec_any + pop_exec(1) loop skeleton maps to

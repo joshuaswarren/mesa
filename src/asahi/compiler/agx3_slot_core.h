@@ -81,6 +81,15 @@ enum agx3_slot_cf {
  * where every joined path retired it, so a consumer waits on the union. An
  * arm's else and pop need no drain. A loop's body is a level too: its pop
  * joins the state at its entry push.
+ *
+ * A break leaves its loop the same way an arm ends: its lanes skip the rest
+ * of the body and resume at the loop's pop, and when every lane has broken
+ * the rest of the body runs with none, so its waits do not run either. A
+ * break that joins does not drain; the loop's pop joins the state each such
+ * break left, so a consumer after the loop waits for what any break left in
+ * flight. Lanes that stay in the loop wait as before, and the backedge still
+ * drains, so a later iteration never reissues a slot whose generation an
+ * earlier one left in flight.
  */
 
 struct agx3_slot_instr {
@@ -93,6 +102,12 @@ struct agx3_slot_instr {
     * level and starts the next. */
    uint8_t cf_push, cf_pop;
    bool cf_arm, cf_else;
+   /* cf_loop marks an opened level as a loop whose pop joins the states its
+    * breaks left. cf_break, on a break that joins, is the number of levels
+    * it exits: its state joins the loop level that many levels up, which
+    * must be marked cf_loop. */
+   bool cf_loop;
+   uint8_t cf_break;
    /* This asynchronous instruction reads its sources when it retires rather
     * than when it issues, so redefining one of them first changes what it
     * transfers. Set it for device stores, whose payload nothing else tracks:
