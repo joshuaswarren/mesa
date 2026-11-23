@@ -418,6 +418,12 @@ agx_chip_info(enum agx_chip chip)
 #define AGX_CHIP_ROW_HAS_RECORD(path, records, record)                         \
    (((records) & (record)) != 0)
 #define AGX_CHIP_ROW_ON_PATH(path, records, wanted) ((path) == (wanted))
+#define AGX_CHIP_ROW_TEST_CS(row, isa, encoding, cs, descriptor, sampler,      \
+                             ioto, submission, path, records, quirks, chip,    \
+                             wanted_path, wanted_cs)                           \
+   | (((chip) == AGX_CHIP_##row) &                                             \
+      ((AGX_CHIP_PATH_##path) == (wanted_path)) &                              \
+      ((AGX_CS_GENERATION_##cs) == (wanted_cs)))
 
 /* Whether a chip is witnessed to take a record (enum agx_chip_record). */
 static inline bool
@@ -474,6 +480,24 @@ agx_chip_native_agx3(enum agx_chip chip)
 {
    return false AGX_CHIPS(AGX_CHIP_ROW_TEST, chip, AGX_CHIP_ROW_ON_PATH,
                           AGX_CHIP_PATH_NATIVE_AGX3);
+}
+
+/*
+ * Whether the native AGX3 path runs on Apple's HAL200 command-stream
+ * generation (G16G and G17P) rather than G15 (M3, RTKit 2419).
+ *
+ * HAL200 streams allow post-initial VDM State Updates to elide an unchanged
+ * bind tail and allow standalone 8-byte PPP State Updates carrying only the
+ * 28-byte fragment record.  Root-descriptor trimming and HAL200 libagx DGC
+ * framing are also keyed on this predicate so G16G and G17P share the same
+ * path while G15 stays on its G15 layout.
+ */
+static inline bool
+agx_chip_native_hal200(enum agx_chip chip)
+{
+   return false AGX_CHIPS(AGX_CHIP_ROW_TEST_CS, chip,
+                          AGX_CHIP_PATH_NATIVE_AGX3,
+                          AGX_CS_GENERATION_HAL200);
 }
 
 /* The chip whose record encodings GPU-generated (libagx) command-stream
@@ -800,23 +824,6 @@ agx_chip_native_g15(enum agx_chip chip)
 {
    return agx_chip_native_agx3(chip) &&
           agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_G15;
-}
-
-/*
- * Whether the native AGX3 path runs on Apple's HAL200 command-stream
- * generation (G16G and G17P) rather than G15 (M3, RTKit 2419).
- *
- * HAL200 streams allow post-initial VDM State Updates to elide an unchanged
- * bind tail and allow standalone 8-byte PPP State Updates carrying only the
- * 28-byte fragment record.  Root-descriptor trimming is also keyed on this
- * predicate so G16G and G17P run the same fast-flush and trimmed-root path,
- * while G15 stays on the full-tail / full-root path until verified on M3.
- */
-static inline bool
-agx_chip_native_hal200(enum agx_chip chip)
-{
-   return agx_chip_native_agx3(chip) &&
-          agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_HAL200;
 }
 
 /* Whether the kernel presents the T8140 native render context: a fixed Bind0

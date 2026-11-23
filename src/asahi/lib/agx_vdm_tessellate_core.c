@@ -121,7 +121,7 @@ agx_vdm_tessellate_indirect_pack(
    if (out)
       memset(out, 0, sizeof(*out));
 
-   if (!out || !info || chip != AGX_CHIP_G17P ||
+   if (!out || !info || !agx_chip_native_hal200(chip) ||
        info->factor_buffer >= (UINT64_C(1) << 48) ||
        info->indirect_buffer >= (UINT64_C(1) << 48) ||
        (info->indirect_buffer & 3) ||
