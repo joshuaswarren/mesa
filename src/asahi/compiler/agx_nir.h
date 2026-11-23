@@ -95,6 +95,7 @@ struct nir_def *agx_nir_quad_ddy(struct nir_builder *b, struct nir_def *v);
 bool agx_nir_lower_shared_element_index(struct nir_shader *s);
 bool agx_nir_opt_shared_byte_offsets(struct nir_shader *s);
 bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget);
+bool agx_nir_opt_dw_conv_3x3(struct nir_shader *shader);
 bool agx_nir_lower_fminmax(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_fminmax_signed_zero(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_word_bounds(struct nir_shader *s);
