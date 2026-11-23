@@ -10533,6 +10533,10 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  struct blob *pre_preamble_blob, bool pre_preamble_optimized,
                  bool epilog_has_alu, bool preamble_newly_enabled)
 {
+   /* byte_indices is set exactly for the AGX3B encoding (M3, M4 and the A18
+    * Pro). Lowerings that depend on the instruction set, rather than on one
+    * part's measured tuning, key on it instead of on the G17P part. */
+   const bool agx3b = byte_indices;
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 64,
       .expensive_alu_ok = true,
@@ -10565,7 +10569,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                     (m5 ? nir_reassociate_loop_invariant : 0));
       }
       if (epilog_has_alu)
-         NIR_PASS(_, nir, agx_nir_lower_fminmax, g17p || m5);
+         NIR_PASS(_, nir, agx_nir_lower_fminmax, agx3b || m5);
       goto pre_preamble;
    }
 
@@ -10730,10 +10734,10 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    progress = false;
    if (byte_indices)
       NIR_PASS(progress, nir, agx_nir_scalarize_int64);
-   /* G17P and M5: normalized 64-bit division instead of nir_lower_int64's
-    * fully unrolled 64-step division (agx_nir_lower_divmod64.c). M5 keeps
-    * the loop's 64-bit add and subtract native. */
-   if (g17p || m5)
+   /* AGX3: normalized 64-bit division instead of nir_lower_int64's fully
+    * unrolled 64-step division (agx_nir_lower_divmod64.c). M5 keeps the
+    * loop's 64-bit add and subtract native. */
+   if (agx3b || m5)
       NIR_PASS(progress, nir, agx_nir_lower_divmod64, m5);
    NIR_PASS(progress, nir, nir_lower_int64);
 
@@ -10777,7 +10781,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * expressions. Do it after nir_opt_reassociate because nir_opt_reassociate
     * should work on unlowered fmin/fmax.
     */
-   NIR_PASS(pre_fuse_dirty, nir, agx_nir_lower_fminmax, g17p || m5);
+   NIR_PASS(pre_fuse_dirty, nir, agx_nir_lower_fminmax, agx3b || m5);
 
    if (pre_preamble_blob)
       nir_serialize(pre_preamble_blob, nir, false);
@@ -10924,7 +10928,7 @@ pre_preamble:
     */
    bool late_progress = false;
    NIR_PASS(late_progress, nir, nir_opt_algebraic_late);
-   NIR_PASS(late_progress, nir, agx_nir_lower_fminmax, g17p || m5);
+   NIR_PASS(late_progress, nir, agx_nir_lower_fminmax, agx3b || m5);
 
    /* The AGX3 byte-address backend cannot encode 64-bit shifted adds.
     * Lower remaining multiplies before fusion turns x * 3 into one; the
