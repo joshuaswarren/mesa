@@ -10415,7 +10415,7 @@ hk_g17p_read_only_early_reject_in(const struct hk_device *dev,
    /* Moving a test ahead of a discard is unobservable only when neither the
     * test nor the skipped fragment has a side effect. The all-live prolog
     * also must not inherit an API-mask or cull-distance kill. */
-   return agx_chip_native_agx3(dev->dev.chip) &&
+   return agx_chip_native_or_m5(dev->dev.chip) &&
           fs->b.info.writes_sample_mask && !fs->info.fs.static_tests &&
           !fs->b.info.early_fragment_tests && !fs->info.fs.writes_memory &&
           !fs->info.fs.epilog_key.write_z && !fs->info.fs.epilog_key.write_s &&
