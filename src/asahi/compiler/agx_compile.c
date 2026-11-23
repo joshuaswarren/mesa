@@ -17466,6 +17466,124 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
     * automatically setting this committed-path property. */
    info->ray_traversal_depth_nonzero = nir->info.ray_queries != 0;
 
+   struct {
+      bool candidate;
+      uint16_t in_base_half;
+      uint16_t in_size_halfs;
+      uint16_t out_start_half;
+      uint16_t out_size_halfs;
+   } hoistable_preamble = {0};
+
+   if (nir->info.stage == MESA_SHADER_VERTEX &&
+       agx_isa_is_agx3(key->dev.encoding) && !key->no_preamble &&
+       !key->secondary) {
+      nir_function_impl *preamble = nir_shader_get_preamble(nir);
+      if (preamble) {
+         bool ok = true;
+         bool have_in = false;
+         unsigned in_min = UINT_MAX, in_max = 0;
+         bool have_store = false;
+         unsigned out_min = UINT_MAX, out_max = 0;
+
+         nir_foreach_block(block, preamble) {
+            nir_foreach_instr(instr, block) {
+               switch (instr->type) {
+               case nir_instr_type_alu:
+               case nir_instr_type_load_const:
+               case nir_instr_type_undef:
+               case nir_instr_type_phi:
+               case nir_instr_type_jump:
+                  break;
+               case nir_instr_type_intrinsic: {
+                  nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+                  switch (intr->intrinsic) {
+                  case nir_intrinsic_load_preamble: {
+                     unsigned base = nir_intrinsic_base(intr);
+                     unsigned bit_size = intr->def.bit_size;
+                     unsigned comps = intr->def.num_components;
+                     unsigned halves = comps * DIV_ROUND_UP(bit_size, 16);
+                     if (!halves || (base & 1u) ||
+                         !((bit_size == 64 && comps == 1) ||
+                           (bit_size == 32 && (comps == 1 || comps == 2)))) {
+                        ok = false;
+                     } else {
+                        have_in = true;
+                        in_min = MIN2(in_min, base);
+                        in_max = MAX2(in_max, base + halves);
+                     }
+                     break;
+                  }
+                  case nir_intrinsic_store_preamble: {
+                     if (nir_intrinsic_preamble_class(intr) != 0) {
+                        ok = false;
+                        break;
+                     }
+                     unsigned base = nir_intrinsic_base(intr);
+                     unsigned bit_size = intr->src[0].ssa->bit_size;
+                     unsigned comps = intr->src[0].ssa->num_components;
+                     unsigned halves = comps * DIV_ROUND_UP(bit_size, 16);
+                     if (!halves || (base & 1u) ||
+                         (bit_size != 16 && bit_size != 32 &&
+                          bit_size != 64)) {
+                        ok = false;
+                     } else {
+                        have_store = true;
+                        out_min = MIN2(out_min, base);
+                        out_max = MAX2(out_max, base + halves);
+                     }
+                     break;
+                  }
+                  case nir_intrinsic_load_constant_agx:
+                  case nir_intrinsic_load_agx:
+                  case nir_intrinsic_load_global:
+                  case nir_intrinsic_load_global_constant:
+                  case nir_intrinsic_load_global_constant_offset:
+                  case nir_intrinsic_load_global_constant_bounded:
+                  case nir_intrinsic_as_uniform:
+                  case nir_intrinsic_convert_alu_types:
+                     break;
+                  default:
+                     ok = false;
+                     break;
+                  }
+                  break;
+               }
+               default:
+                  ok = false;
+                  break;
+               }
+               if (!ok)
+                  break;
+            }
+            if (!ok)
+               break;
+         }
+
+         if (ok && have_store && out_min < out_max) {
+            unsigned out_size = ALIGN_POT(out_max - out_min, 2);
+            if (out_size > 0 && out_size <= 128 &&
+                out_min <= UINT16_MAX - out_size) {
+               if (have_in) {
+                  unsigned in_size = in_max - in_min;
+                  if (in_size > 0 && in_size <= 4 &&
+                      in_min <= UINT16_MAX - in_size &&
+                      (out_min >= in_max || out_min + out_size <= in_min)) {
+                     hoistable_preamble.in_base_half = in_min;
+                     hoistable_preamble.in_size_halfs = in_size;
+                     hoistable_preamble.out_start_half = out_min;
+                     hoistable_preamble.out_size_halfs = out_size;
+                     hoistable_preamble.candidate = true;
+                  }
+               } else {
+                  hoistable_preamble.out_start_half = out_min;
+                  hoistable_preamble.out_size_halfs = out_size;
+                  hoistable_preamble.candidate = true;
+               }
+            }
+         }
+      }
+   }
+
    nir_foreach_function_with_impl(func, impl, nir) {
       unsigned offset;
       const struct agx_shader_info saved_info = out->info;
@@ -17512,6 +17630,39 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    /* The preamble may be compiled after main and legalize a final half-word
     * export into a native dword. Report the complete physical footprint. */
    info->stats.uniforms = info->push_count;
+
+   if (hoistable_preamble.candidate && info->has_preamble &&
+       info->texture_state_count == 0 && info->sampler_state_count == 0 &&
+       !info->uses_sampler_heap && !info->uses_ray_traversal &&
+       !info->uses_resource_info_query) {
+      unsigned out_start = hoistable_preamble.out_start_half;
+      unsigned out_end = out_start + hoistable_preamble.out_size_halfs;
+      bool overlap = false;
+
+      if (info->rodata.size_16) {
+         unsigned ro_start = info->rodata.base_uniform;
+         unsigned ro_end = ro_start + info->rodata.size_16;
+         if (!(out_end <= ro_start || out_start >= ro_end))
+            overlap = true;
+      }
+
+      for (unsigned i = 0; i < info->agx3_uniform_dma_count; ++i) {
+         unsigned dma_start = info->agx3_uniform_dma[i].dest;
+         unsigned dma_end = dma_start + info->agx3_uniform_dma[i].halfs;
+         if (!(out_end <= dma_start || out_start >= dma_end))
+            overlap = true;
+      }
+
+      if (!overlap) {
+         info->agx3_preamble_hoistable = true;
+         info->agx3_preamble_in_base_half = hoistable_preamble.in_base_half;
+         info->agx3_preamble_in_size_halfs = hoistable_preamble.in_size_halfs;
+         info->agx3_preamble_out_start_half =
+            hoistable_preamble.out_start_half;
+         info->agx3_preamble_out_size_halfs =
+            hoistable_preamble.out_size_halfs;
+      }
+   }
 
    if (agx_should_dump(nir, AGX_DBG_SHADERDB)) {
       agx2_stats_fprintf(stderr, _mesa_shader_stage_to_abbrev(nir->info.stage),

@@ -198,6 +198,19 @@ struct agx_shader_info {
     * This occupies existing alignment padding, but all ABI layouts are checked. */
    uint8_t agx3_preamble_static_spill_version;
    struct agx3_cprog_inputs agx3_preamble_inputs;
+   /* AGX3 hoistable vertex preamble contract: when set, the vertex shader's
+    * @preamble reads at most one 64-bit uniform slot
+    * [agx3_preamble_in_base_half, +agx3_preamble_in_size_halfs), performs only
+    * pure read-only memory loads and ALU, and writes general preamble uniforms
+    * strictly inside [agx3_preamble_out_start_half,
+    * +agx3_preamble_out_size_halfs). The driver may execute @preamble once as a
+    * 1-thread compute shader and bind the output buffer as a vertex uniform
+    * range instead of re-running the per-draw vertex constant program. */
+   bool agx3_preamble_hoistable;
+   uint16_t agx3_preamble_in_base_half;
+   uint16_t agx3_preamble_in_size_halfs;
+   uint16_t agx3_preamble_out_start_half;
+   uint16_t agx3_preamble_out_size_halfs;
    unsigned preamble_offset, main_offset;
 
    /* Does the shader read the tilebuffer? */
