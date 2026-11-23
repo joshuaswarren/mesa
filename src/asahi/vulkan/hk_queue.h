@@ -148,6 +148,42 @@ hk_queue_device(struct hk_queue *queue)
    return (struct hk_device *)queue->vk.base.device;
 }
 
+
+/* Whether a queue publishes API signals from its cumulative queue timeline
+ * because independent engines or sibling kernel queues may finish out of
+ * order. */
+static inline bool
+hk_queue_uses_cumulative_signals(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G17P ||
+          (dev->params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) != 0;
+}
+
+/* Whether a non-chunked submission with output signals can publish them
+ * atomically inside DRM_IOCTL_ASAHI_SUBMIT via cumulative signals. */
+static inline bool
+hk_queue_kernel_cumulative_supported(const struct agx_device *dev,
+                                     bool cumulative_signals,
+                                     bool chunk_timelines,
+                                     unsigned signal_count)
+{
+   return cumulative_signals && !chunk_timelines && signal_count > 0 &&
+          (dev->params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) != 0;
+}
+
+/* Whether a VkQueue should open sibling compute kernel queues to overlap
+ * independent compute kicks within the same context. */
+static inline bool
+hk_queue_sibling_compute_supported(const struct agx_device *dev,
+                                   bool exact_prior)
+{
+   const uint64_t required = DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS |
+                             DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
+   return !dev->is_virtio && exact_prior &&
+          hk_queue_uses_cumulative_signals(dev) &&
+          (dev->params.features & required) == required;
+}
+
 VkResult hk_queue_init(struct hk_device *dev,
                        const VkDeviceQueueCreateInfo *pCreateInfo,
                        uint32_t index_in_family);
