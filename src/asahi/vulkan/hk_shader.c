@@ -5223,9 +5223,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          NIR_PASS(_, nir, nir_lower_alpha_to_coverage, false, enable);
       }
 
-      if (agx_chip_native_agx3(dev->dev.chip))
-         shader->info.fs.g17p_colour_unit_range =
-            agx_nir_fs_colour_outputs_unit_range(nir);
+      shader->info.fs.colour_unit_range =
+         agx_nir_fs_colour_outputs_unit_range(nir);
 
       /* Only a shader that already discards has an early coverage update to
        * carry the kill. A shader with no way to apply it keeps it in the
