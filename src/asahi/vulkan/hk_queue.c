@@ -1308,7 +1308,7 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
                           "Waiting for the replaced kernel queue failed: %s",
                           strerror(errno));
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
-      queue->drm.id = UINT32_MAX;
+      p_atomic_set(&queue->drm.id, UINT32_MAX);
    }
 
    /* M5 and G17P admit GPU work at the API entrypoint, before semaphore
@@ -1322,8 +1322,8 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
       &dev->dev, (enum drm_asahi_priority)(queue->drm.virt_ring_idx - 1), layouts);
    if (id != UINT32_MAX) {
       *replaced = had_queue;
-      queue->drm.id = id;
       queue->drm.render_rq = render_rq;
+      p_atomic_set(&queue->drm.id, id);
       return VK_SUCCESS;
    }
 
@@ -1380,6 +1380,14 @@ hk_queue_admits_at_entry(const struct hk_device *dev)
    return agx_chip_g17p_or_m5(dev->dev.chip);
 }
 
+static inline struct hk_queue *
+hk_queue_backing(struct hk_queue *queue)
+{
+   return queue->vk.real_queue
+             ? container_of(queue->vk.real_queue, struct hk_queue, vk)
+             : queue;
+}
+
 /* Admission must precede the common runtime's semaphore payload moves and
  * the first submission of a batch. Failing inside driver_submit is too late
  * to return a retryable allocation error. Keep admission lazy so unused Vulkan
@@ -1389,8 +1397,7 @@ static VkResult
 hk_queue_admit(struct hk_queue *queue, unsigned render_rq)
 {
    /* Admission and callbacks must use the same backing queue and lock. */
-   if (queue->vk.real_queue)
-      queue = container_of(queue->vk.real_queue, struct hk_queue, vk);
+   queue = hk_queue_backing(queue);
    simple_mtx_lock(&queue->vk.lock);
    /* Admission only creates a missing kernel queue, with the render ray-query
     * scratch the call needs (G17P), so a first submission that needs it does
@@ -1425,6 +1432,13 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
    if (hk_queue_admits_at_entry(dev)) {
       if (vk_device_is_lost(&dev->vk))
          return VK_ERROR_DEVICE_LOST;
+
+      /* Once the backing kernel queue exists, admission is a no-op: skip the
+       * command-buffer scan and queue lock on steady-state submissions. If a
+       * G17P ray-query replacement briefly clears drm.id, this falls through
+       * to the locked path below. */
+      if (p_atomic_read(&hk_queue_backing(queue)->drm.id) != UINT32_MAX)
+         return vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
 
       const bool rq_capable =
          dev->gen1_native_graphics_rq || dev->gen1_native_fragment_rq;
@@ -1462,6 +1476,10 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
    if (hk_queue_admits_at_entry(dev)) {
       if (vk_device_is_lost(&dev->vk))
          return VK_ERROR_DEVICE_LOST;
+
+      if (p_atomic_read(&hk_queue_backing(queue)->drm.id) != UINT32_MAX)
+         return vk_common_QueueBindSparse(_queue, bindInfoCount, pBindInfo,
+                                          fence);
 
       /* Sparse image changes may require a GPU maintenance command. Reserve
        * its queue before any bind or semaphore operation in this API call.
@@ -2724,11 +2742,11 @@ hk_pack_atomics_allowed(struct hk_device *dev, const struct hk_queue *queue)
       if (vk_queue_is_emulated(iter))
          continue;
       const struct hk_queue *other = container_of(iter, struct hk_queue, vk);
-      if (other != queue && other->drm.id != UINT32_MAX)
+      if (other != queue && p_atomic_read(&other->drm.id) != UINT32_MAX)
          return false;
    }
    const struct hk_queue *as = dev->host_as.queue;
-   return !as || as == queue || as->drm.id == UINT32_MAX;
+   return !as || as == queue || p_atomic_read(&as->drm.id) == UINT32_MAX;
 }
 
 /* A submission-owned replacement for a run of command buffers. The
@@ -3288,7 +3306,7 @@ hk_queue_create(struct hk_device *dev,
       !queue->sync.serialize &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
 
-   queue->drm.id = UINT32_MAX;
+   p_atomic_set(&queue->drm.id, UINT32_MAX);
    for (unsigned i = 0; i < HK_QUEUE_SIBLINGS_MAX; ++i)
       queue->sib.id[i] = UINT32_MAX;
    queue->sib.count = 1;
