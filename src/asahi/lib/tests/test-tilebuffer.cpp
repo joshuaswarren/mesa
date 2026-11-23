@@ -779,6 +779,51 @@ TEST(Tilebuffer, G17PCompressedTwoSampleTargetsStayResident)
    EXPECT_TRUE(multiview.spilled[5]);
 }
 
+TEST(Tilebuffer, M5CompressedFourSampleInputAttachmentStaysResident)
+{
+   /* M5 at 4x: a 64 KiB tile holds 64 bytes per sample. Seven RGBA32F
+    * uncompressed attachments (112 B/sample) plus a compressed RGBA16F MSAA4
+    * input attachment on RT7 exceed the tilebuffer; plain descending-alignment
+    * order spills RT7. Pinning RT7 via resident_mask keeps it resident and
+    * spills wider uncompressed RGBA32F targets instead. */
+   enum pipe_format formats[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R16G16B16A16_FLOAT,
+   };
+   const auto plain = agx_build_tilebuffer_layout_resident(
+      formats, 8, 4, false, AGX_MAX_RENDER_TARGETS * 16, 65536, 2048, 0);
+   EXPECT_TRUE(plain.spilled[7]);
+   EXPECT_FALSE(plain.spilled[0]);
+   EXPECT_FALSE(plain.spilled[3]);
+   EXPECT_TRUE(plain.spilled[4]);
+
+   const auto resident = agx_build_tilebuffer_layout_resident(
+      formats, 8, 4, false, AGX_MAX_RENDER_TARGETS * 16, 65536, 2048,
+      BITFIELD_BIT(7));
+   EXPECT_FALSE(resident.spilled[7]);
+   EXPECT_EQ(resident._offset_B[7], 0u);
+   EXPECT_FALSE(resident.spilled[0]);
+   EXPECT_FALSE(resident.spilled[1]);
+   EXPECT_FALSE(resident.spilled[2]);
+   EXPECT_TRUE(resident.spilled[3]);
+   EXPECT_TRUE(resident.spilled[4]);
+   EXPECT_TRUE(resident.spilled[5]);
+   EXPECT_TRUE(resident.spilled[6]);
+   EXPECT_EQ(resident.resident_mask, BITFIELD_BIT(7));
+   EXPECT_EQ(resident.sample_size_B, 56u);
+
+   /* All eight 8-byte compressed MSAA4 targets fit without spilling. */
+   enum pipe_format rgba16f[AGX_MAX_RENDER_TARGETS];
+   for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt)
+      rgba16f[rt] = PIPE_FORMAT_R16G16B16A16_FLOAT;
+   const auto eight = agx_build_tilebuffer_layout_resident(
+      rgba16f, 8, 4, false, AGX_MAX_RENDER_TARGETS * 16, 65536, 2048, 0xff);
+   EXPECT_FALSE(agx_tilebuffer_spills(&eight));
+   EXPECT_EQ(eight.sample_size_B, 64u);
+}
+
 class SampleDepthOrder : public ::testing::Test {
  protected:
    SampleDepthOrder()

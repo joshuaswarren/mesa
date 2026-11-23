@@ -570,16 +570,28 @@ hk_m5_msaa_color_compression_format(VkFormat format)
 /* Qualified multisample metadata shapes. Sharing and aliasing flags are not
  * admitted; a mutable format is, and hk_can_compress() then requires a format
  * list of compression-compatible views.
+ *
+ * INPUT_ATTACHMENT_BIT is safe on M5 (unlike G17P): M5's 64 KiB tilebuffer
+ * holds 64 B/sample at 4x MSAA (all 8 max targets x <= 8 B fit without
+ * spilling), and hk_resident_attachments() pins every compressed MSAA colour
+ * attachment first in the tilebuffer so an MRT mix with wider uncompressed
+ * attachments spills the uncompressed targets instead. Same-pass input reads
+ * therefore read the resident tilebuffer, and separate-pass reads decode
+ * through the Gen10 compressed MSAA texture descriptor.
  */
 static inline bool
 hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
                                      const VkImageCreateInfo *info)
 {
+   const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
    const VkImageUsageFlags allowed_usage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 
-   if (chip != AGX_CHIP_G17S || plane != 0 || !info)
+   if (!agx_chip_g17_m5(chip) || plane != 0 || !info)
       return false;
 
    for (const void *next = info->pNext; next;) {
@@ -591,7 +603,7 @@ hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
              sizeof(next));
    }
 
-   return !(info->flags & ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+   return !(info->flags & ~allowed_flags) &&
           info->imageType == VK_IMAGE_TYPE_2D &&
           info->extent.depth == 1 && info->extent.width >= 16 &&
           info->extent.height >= 16 && info->arrayLayers == 1 &&
