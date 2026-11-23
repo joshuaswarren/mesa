@@ -1841,6 +1841,8 @@ hk_gen1_rq_init_generated(struct hk_device *dev)
       AGX_BO_WRITEBACK, "Gen1 intersection table");
    if (!dev->gen1_rq_code || !dev->gen1_rq_ift) goto fail;
    uint8_t *code = agx_bo_map(dev->gen1_rq_code);
+   uint8_t *ift = agx_bo_map(dev->gen1_rq_ift);
+   if (!code || !ift) goto fail;
    memset(code, 0, 11108352);
    for (unsigned slot = 0; slot < AGX3_RT_GEN1_RUNTIME_SLOTS; ++slot) {
       if (!agx3_rt_gen1_stub_body_generate(slot, body, sizeof(body), &body_length)) goto fail;
@@ -1869,7 +1871,7 @@ hk_gen1_rq_init_generated(struct hk_device *dev)
    agx3_rt_gen1_aabb_constants(&table, &table_length);
    memcpy(code + rows[AGX3_RT_GEN1_AABB_SLOT * 3][0], body, body_length);
    memcpy(code + rows[AGX3_RT_GEN1_AABB_SLOT * 3 + 1][0], table, table_length);
-   agx3_rt_gen1_runtime_ift(agx_bo_map(dev->gen1_rq_ift));
+   agx3_rt_gen1_runtime_ift(ift);
    for (unsigned slot = 0; slot < AGX3_RT_GEN1_RUNTIME_SLOTS; ++slot) {
       uint8_t *slot_entry = code + rows[slot * 3 + 2][0];
       if (!agx3_rt_gen1_runtime_entry_generate(slot, entry, &entry_length) || entry_length > 0x4000)
@@ -1897,6 +1899,10 @@ hk_gen1_rq_init_generated(struct hk_device *dev)
           !agx3_rt_gen1_runtime_constants(slot, &table, &table_length) ||
           !hk_gen1_rq_generated_slot_matches(code, rows, slot, body, body_length, table, table_length))
          goto fail;
+   }
+   if (util_has_cache_ops()) {
+      util_flush_range(code, 11108352);
+      util_flush_range(ift, 0x4000);
    }
    for (unsigned i = 0; i < 630; i++) {
       uint64_t *r = dev->gen1_rq_maps + 3 * i;
@@ -2800,7 +2806,10 @@ hk_CopyMemoryToAccelerationStructureKHR(
    if (!blob) {
       result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    } else {
-      memcpy(agx_bo_map(blob), pInfo->src.hostAddress, bytes);
+      void *blob_map = agx_bo_map(blob);
+      memcpy(blob_map, pInfo->src.hostAddress, bytes);
+      if (util_has_cache_ops())
+         util_flush_range(blob_map, bytes);
       const VkCopyMemoryToAccelerationStructureInfoKHR info = {
          .sType = pInfo->sType,
          .src.deviceAddress = blob->va->addr,
@@ -2834,7 +2843,10 @@ hk_CopyAccelerationStructureToMemoryKHR(
    if (!blob) {
       result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    } else {
-      memset(agx_bo_map(blob), 0, bound);
+      uint8_t *blob_map = agx_bo_map(blob);
+      memset(blob_map, 0, bound);
+      if (util_has_cache_ops())
+         util_flush_inval_range(blob_map, bound);
       const VkCopyAccelerationStructureToMemoryInfoKHR info = {
          .sType = pInfo->sType,
          .src = pInfo->src,
@@ -2844,12 +2856,14 @@ hk_CopyAccelerationStructureToMemoryKHR(
       hk_CmdCopyAccelerationStructureToMemoryKHR(run.cmd, &info);
       result = hk_host_as_execute(&run);
       if (result == VK_SUCCESS) {
+         if (util_has_cache_ops())
+            util_flush_inval_range(blob_map, bound);
          uint64_t bytes;
-         memcpy(&bytes, (const uint8_t *)agx_bo_map(blob) + 32, sizeof(bytes));
+         memcpy(&bytes, blob_map + 32, sizeof(bytes));
          if (bytes < LIBAGX_GEN1_AS_SERIAL_HEADER_BYTES || bytes > bound)
             result = vk_error(dev, VK_ERROR_UNKNOWN);
          else
-            memcpy(pInfo->dst.hostAddress, agx_bo_map(blob), bytes);
+            memcpy(pInfo->dst.hostAddress, blob_map, bytes);
       }
    }
    hk_host_as_finish(&run);
