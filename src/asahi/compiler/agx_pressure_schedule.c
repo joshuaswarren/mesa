@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "util/bitset.h"
 #include "util/dag.h"
 #include "agx_debug.h"
 #include "util/sparse_bitset.h"
@@ -1110,6 +1111,69 @@ ilp_block_device_loads(const agx_block *block)
    return loads;
 }
 
+/* True when a block emits multiple ST_TILE stores to the same pixel_offset and
+ * at least one of those stores carries a sample-dependent payload. On AGX3B,
+ * agx3_tile_store_bank() counts each pixel_offset once under the assumption
+ * that per-sample stores to one colour target are serialized and reuse one
+ * register vector in r0..r7; hoisting independent sample loads across those
+ * stores keeps multiple sample payloads live simultaneously and can push
+ * later ST_TILE sources past the 16-half bank. */
+static bool
+ilp_block_has_multi_sample_tile_stores(const agx_context *ctx,
+                                       const agx_block *block, void *memctx)
+{
+   BITSET_WORD *sample_dep =
+      rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(MAX2(ctx->alloc, 1)));
+   if (!sample_dep)
+      return true;
+
+   BITSET_DECLARE(seen_offsets, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
+   BITSET_DECLARE(sample_offsets, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
+   bool result = false;
+
+   agx_foreach_instr_in_block(block, I) {
+      bool dep = ilp_is_sample(ctx, I);
+      if (!dep) {
+         agx_foreach_ssa_src(I, s) {
+            if (BITSET_TEST(sample_dep, I->src[s].value)) {
+               dep = true;
+               break;
+            }
+         }
+      }
+      if (dep) {
+         agx_foreach_ssa_dest(I, d)
+            BITSET_SET(sample_dep, I->dest[d].value);
+      }
+
+      if (I->op != AGX_OPCODE_ST_TILE)
+         continue;
+
+      const bool uses_sample = I->src[0].type == AGX_INDEX_NORMAL &&
+                               BITSET_TEST(sample_dep, I->src[0].value);
+      if (I->pixel_offset >= AGX_G17P_MAX_BYTES_PER_SAMPLE) {
+         if (uses_sample) {
+            result = true;
+            break;
+         }
+         continue;
+      }
+
+      if (BITSET_TEST(seen_offsets, I->pixel_offset) &&
+          (uses_sample || BITSET_TEST(sample_offsets, I->pixel_offset))) {
+         result = true;
+         break;
+      }
+
+      BITSET_SET(seen_offsets, I->pixel_offset);
+      if (uses_sample)
+         BITSET_SET(sample_offsets, I->pixel_offset);
+   }
+
+   ralloc_free(sample_dep);
+   return result;
+}
+
 /* Register halves the block's sample results occupy together. */
 static unsigned
 ilp_block_sample_halves(const agx_context *ctx, const agx_block *block)
@@ -1532,6 +1596,12 @@ agx_ilp_schedule(agx_context *ctx)
                             false, false, &dag_state);
       } else if (!in_loop[block->index] && !ctx->is_preamble &&
                  ctx->stage == MESA_SHADER_FRAGMENT &&
+                 /* On AGX3B, agx3_tile_store_bank() assumes per-sample ST_TILE
+                  * stores to the same pixel_offset are serialized in r0..r7;
+                  * skip sample hoisting when a block stores multiple samples
+                  * to one target (background reloads and unrolled MSAA FS). */
+                 !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                   ilp_block_has_multi_sample_tile_stores(ctx, block, memctx)) &&
                  ilp_block_samples(ctx, block) >= AGX_ILP_FS_MIN_SAMPLES) {
          /* The pressure schedule places each sample's consumers right after
           * it, so the program waits for one sample before issuing the next.

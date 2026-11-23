@@ -751,6 +751,7 @@ if with_tests
          'test/test-agx3-unary-lowering.cpp',
          'test/test-agx3-fsel-uniform.cpp',
          'test/test-agx3-cube-scratch.cpp',
+         'test/test-bg-shader-schedule.cpp',
          'test/test-fminmax-constant-denorm.cpp',
          'test/test-denorm-preserve-fma.cpp',
          'test/test-fminmax-signed-zero.cpp',
