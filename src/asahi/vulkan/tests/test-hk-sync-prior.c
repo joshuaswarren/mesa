@@ -293,13 +293,28 @@ test_timestamp_leading_top(void)
 static void
 test_timestamp_execution_scopes(void)
 {
-   for (unsigned exact = 0; exact < 2; ++exact) {
+   T("start_stamps_ordered distinguishes G16G/AGX2 from G17P/M5",
+     agx_chip_start_stamps_ordered(AGX_CHIP_G13G) &&
+     agx_chip_start_stamps_ordered(AGX_CHIP_G14G) &&
+     agx_chip_start_stamps_ordered(AGX_CHIP_G15G) &&
+     agx_chip_start_stamps_ordered(AGX_CHIP_G16G) &&
+     !agx_chip_start_stamps_ordered(AGX_CHIP_G17P) &&
+     !agx_chip_start_stamps_ordered(AGX_CHIP_G17G) &&
+     !agx_chip_start_stamps_ordered(AGX_CHIP_G17S) &&
+     !agx_chip_start_stamps_ordered(AGX_CHIP_G17C));
+
+   const enum agx_chip ts_chips[] = {
+      AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   };
+   for (unsigned c = 0; c < ARRAY_SIZE(ts_chips); ++c) {
+      const enum agx_chip chip = ts_chips[c];
+      for (unsigned exact = 0; exact < 2; ++exact) {
       struct hk_queue *queue = new_queue(exact);
-      struct hk_cmd_buffer *first = timestamp_cmd(AGX_CHIP_G17P, exact);
+      struct hk_cmd_buffer *first = timestamp_cmd(chip, exact);
       add(first, true);
       end_timestamp(first, 0);
       T("first timed compute resolves", submit(queue, first));
-      struct hk_cmd_buffer *second = timestamp_cmd(AGX_CHIP_G17P, exact);
+      struct hk_cmd_buffer *second = timestamp_cmd(chip, exact);
       struct hk_cs *timed = add(second, true);
       end_timestamp(second, 1);
       T("next timed compute resolves", submit(queue, second));
@@ -312,7 +327,7 @@ test_timestamp_execution_scopes(void)
        * that genuine scope through the production barrier entry point before
        * the consumer, then add a timestamp to it and resolve both submissions.
        */
-      struct hk_cmd_buffer *query = timestamp_cmd(AGX_CHIP_G17P, exact);
+      struct hk_cmd_buffer *query = timestamp_cmd(chip, exact);
       hk_sync_barrier(query, HK_SYNC_ALL, HK_SYNC_ALL);
       struct hk_cs *copy = add(query, true);
       copy->g17p_timestamp_query = true;
@@ -322,10 +337,10 @@ test_timestamp_execution_scopes(void)
         exact ? copy->sync.prior[HK_SYNC_CDM] == 2
               : copy->sync.barrier[HK_SYNC_CDM] == 0);
 
-      struct hk_cmd_buffer *barrier = timestamp_cmd(AGX_CHIP_G17P, exact);
+      struct hk_cmd_buffer *barrier = timestamp_cmd(chip, exact);
       hk_sync_barrier(barrier, HK_SYNC_ALL, HK_SYNC_ALL);
       T("standalone query ordering resolves", submit(queue, barrier));
-      struct hk_cmd_buffer *after = timestamp_cmd(AGX_CHIP_G17P, exact);
+      struct hk_cmd_buffer *after = timestamp_cmd(chip, exact);
       struct hk_cs *inherited = add(after, true);
       end_timestamp(after, 3);
       T("later timestamp with carried requirements resolves", submit(queue, after));
@@ -334,10 +349,10 @@ test_timestamp_execution_scopes(void)
               : inherited->sync.barrier[HK_SYNC_CDM] == 0);
 
       queue = new_queue(exact);
-      first = timestamp_cmd(AGX_CHIP_G17P, exact);
+      first = timestamp_cmd(chip, exact);
       add(first, false);
       T("earlier render resolves", submit(queue, first));
-      second = timestamp_cmd(AGX_CHIP_G17P, exact);
+      second = timestamp_cmd(chip, exact);
       timed = add(second, true);
       end_timestamp(second, 4);
       T("timestamp after render resolves", submit(queue, second));
@@ -346,11 +361,11 @@ test_timestamp_execution_scopes(void)
               : timed->sync.barrier[HK_SYNC_VDM] == 0);
 
       queue = new_queue(exact);
-      first = timestamp_cmd(AGX_CHIP_G17P, exact);
+      first = timestamp_cmd(chip, exact);
       add(first, true);
       end_timestamp(first, 5);
       T("reset producer timestamp resolves", submit(queue, first));
-      struct hk_cmd_buffer *reset_cmd = timestamp_cmd(AGX_CHIP_G17P, exact);
+      struct hk_cmd_buffer *reset_cmd = timestamp_cmd(chip, exact);
       hk_sync_barrier(reset_cmd, HK_SYNC_ALL, HK_SYNC_ALL);
       struct hk_cs *reset = add(reset_cmd, true);
       reset->g17p_timestamp_query = true;
@@ -365,10 +380,10 @@ test_timestamp_execution_scopes(void)
         later->sync.barrier[HK_SYNC_CDM] == 1);
 
       queue = new_queue(exact);
-      first = timestamp_cmd(AGX_CHIP_G17P, exact);
+      first = timestamp_cmd(chip, exact);
       add(first, true);
       T("render timestamp compute source resolves", submit(queue, first));
-      second = timestamp_cmd(AGX_CHIP_G17P, exact);
+      second = timestamp_cmd(chip, exact);
       struct hk_cs *render = add(second, false);
       end_timestamp(second, 7);
       T("render end timestamp resolves", submit(queue, second));
@@ -377,8 +392,12 @@ test_timestamp_execution_scopes(void)
               : render->sync.barrier[HK_SYNC_CDM] == 0);
    }
 
+   }
+
+   /* Unqualified targets (AGX2 and future G18G) retain the original same-CDM
+    * timestamp prefix even if exact-prior barriers are advertised. */
    for (unsigned chip = 0; chip < 2; ++chip) {
-      const enum agx_chip target = chip ? AGX_CHIP_G16G : AGX_CHIP_G13G;
+      const enum agx_chip target = chip ? AGX_CHIP_G18G : AGX_CHIP_G13G;
       struct hk_queue *queue = new_queue(true);
       struct hk_cmd_buffer *first = timestamp_cmd(target, true);
       add(first, true);

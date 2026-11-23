@@ -940,6 +940,16 @@ agx_chip_g17p_or_m5(enum agx_chip chip)
    return chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip);
 }
 
+/* Whether hardware/firmware orders command start stamps after a command's
+ * waits. G17P and M5 (G17G/G17S/G17C) latch start stamps when firmware takes
+ * the command, before barriers resolve, so Borealis places timestamps on
+ * command completion (end stamps) instead. */
+static inline bool
+agx_chip_start_stamps_ordered(enum agx_chip chip)
+{
+   return !agx_chip_g17p_or_m5(chip);
+}
+
 /* Whether consecutive application dispatches of one CDM stream may omit the
  * ordering barrier between them.  Vulkan orders dispatches only through
  * explicit barriers; every other record (internal or indirect launch, cache

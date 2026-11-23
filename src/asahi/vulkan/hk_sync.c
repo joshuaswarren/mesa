@@ -1383,11 +1383,11 @@ stamp_wait(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 {
    if (cs->type == HK_CS_CDM) {
       const struct hk_device *dev = hk_cmd_buffer_device(cmd);
-      if (agx_chip_native_agx3(dev->dev.chip) &&
-          dev->dev.chip == AGX_CHIP_G17P &&
+      if (agx_chip_native_or_m5(dev->dev.chip) &&
           (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)) {
-         /* The logical compute queue already orders these GPU commands by
-          * their mandatory kick parents. Adding the timestamp's same-CDM
+         /* With exact-prior barriers on non-serialized AGX3 queues (native
+          * AGX3 and M5), the logical compute queue already orders GPU commands
+          * by their mandatory kick parents. Adding the timestamp's same-CDM
           * prefix also waits for earlier CPU timestamp publication, which
           * serializes otherwise independent timed dispatches. Keep genuine
           * query-memory requirements already present on the stream, and the
@@ -1424,10 +1424,7 @@ stamp_wait(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 static bool
 start_stamps_ordered(const struct hk_cmd_buffer *cmd)
 {
-   const struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   return !((agx_chip_native_agx3(dev->dev.chip) &&
-             dev->dev.chip == AGX_CHIP_G17P) ||
-            agx_chip_g17_m5(dev->dev.chip));
+   return agx_chip_start_stamps_ordered(hk_cmd_buffer_device(cmd)->dev.chip);
 }
 
 static struct hk_cs *
