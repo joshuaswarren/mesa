@@ -909,38 +909,76 @@ morton_generate(VkCommandBuffer commandBuffer, struct vk_device *device,
    disp->CmdBindPipeline(
       commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
 
-   for (uint32_t i = 0; i < build_count; ++i) {
-      if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
-         continue;
-      if (states[i].fused_leaf_morton)
-         continue;
-      if ((states[i].config.build_flags & VK_MORTON_BUILD_FLAGS) != build_flags)
-         continue;
+   if (args->morton_phase_dispatch) {
+      unsigned max_passes = 0;
+      for (uint32_t i = 0; i < build_count; ++i) {
+         if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+            continue;
+         if (states[i].fused_leaf_morton)
+            continue;
+         if ((states[i].config.build_flags & VK_MORTON_BUILD_FLAGS) != build_flags)
+            continue;
+         max_passes = MAX2(max_passes, states[i].morton_sort_passes);
+      }
 
-      uint64_t scratch_addr = states[i].build_info->scratchData.deviceAddress;
-      struct morton_sort_args consts = {
-         .bvh = scratch_addr + states[i].scratch.ir_offset,
-         .header = scratch_addr + states[i].scratch.header_offset,
-         .ids_even = scratch_addr + states[i].scratch.sort_buffer_offset[0],
-         .ids_odd = scratch_addr + states[i].scratch.sort_buffer_offset[1],
-         .counts = scratch_addr + states[i].scratch.sort_internal_offset,
-         .leaf_count = states[i].leaf_node_count,
-         .pass = UINT32_MAX,
-      };
+      for (unsigned pass = 0; pass < max_passes; ++pass) {
+         for (uint32_t i = 0; i < build_count; ++i) {
+            if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+               continue;
+            if (states[i].fused_leaf_morton)
+               continue;
+            if ((states[i].config.build_flags & VK_MORTON_BUILD_FLAGS) != build_flags)
+               continue;
+            if (pass >= states[i].morton_sort_passes)
+               continue;
 
-      const unsigned pass_count = args->morton_phase_dispatch
-         ? states[i].morton_sort_passes : 1;
-      for (unsigned pass = 0; pass < pass_count; ++pass) {
-         if (args->morton_phase_dispatch)
-            consts.pass = pass;
+            uint64_t scratch_addr = states[i].build_info->scratchData.deviceAddress;
+            struct morton_sort_args consts = {
+               .bvh = scratch_addr + states[i].scratch.ir_offset,
+               .header = scratch_addr + states[i].scratch.header_offset,
+               .ids_even = scratch_addr + states[i].scratch.sort_buffer_offset[0],
+               .ids_odd = scratch_addr + states[i].scratch.sort_buffer_offset[1],
+               .counts = scratch_addr + states[i].scratch.sort_internal_offset,
+               .leaf_count = states[i].leaf_node_count,
+               .pass = pass,
+            };
+
+            disp->CmdPushConstants(commandBuffer, layout,
+                                   VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(consts), &consts);
+            disp->CmdDispatch(commandBuffer, states[i].morton_sort_dispatch_size, 1, 1);
+
+            if (pass == 0)
+               states[i].scratch_offset = states[i].scratch.sort_buffer_offset[states[i].morton_sort_passes & 0x1];
+         }
+         if (pass + 1 < max_passes)
+            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+      }
+   } else {
+      for (uint32_t i = 0; i < build_count; ++i) {
+         if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+            continue;
+         if (states[i].fused_leaf_morton)
+            continue;
+         if ((states[i].config.build_flags & VK_MORTON_BUILD_FLAGS) != build_flags)
+            continue;
+
+         uint64_t scratch_addr = states[i].build_info->scratchData.deviceAddress;
+         struct morton_sort_args consts = {
+            .bvh = scratch_addr + states[i].scratch.ir_offset,
+            .header = scratch_addr + states[i].scratch.header_offset,
+            .ids_even = scratch_addr + states[i].scratch.sort_buffer_offset[0],
+            .ids_odd = scratch_addr + states[i].scratch.sort_buffer_offset[1],
+            .counts = scratch_addr + states[i].scratch.sort_internal_offset,
+            .leaf_count = states[i].leaf_node_count,
+            .pass = UINT32_MAX,
+         };
+
          disp->CmdPushConstants(commandBuffer, layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(consts), &consts);
          disp->CmdDispatch(commandBuffer, states[i].morton_sort_dispatch_size, 1, 1);
-         if (pass + 1 < pass_count)
-            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
-      }
 
-      states[i].scratch_offset = states[i].scratch.sort_buffer_offset[states[i].morton_sort_passes & 0x1];
+         states[i].scratch_offset = states[i].scratch.sort_buffer_offset[states[i].morton_sort_passes & 0x1];
+      }
    }
 
    if (args->emit_markers) {
@@ -1556,20 +1594,27 @@ vk_cmd_build_acceleration_structures_indirect(VkCommandBuffer commandBuffer,
             return;
          }
 
+         bool any_fill = false;
          for (uint32_t i = 0; i < infoCount; ++i) {
             if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE ||
                 states[i].fused_leaf_morton)
                continue;
-            device->cmd_fill_buffer_addr(commandBuffer, pInfos[i].scratchData.deviceAddress + states[i].scratch.sort_internal_offset,
-                                         sizeof(struct morton_ready_count) * states[i].morton_sort_passes, 0x0);
+            if (!args->morton_phase_dispatch && states[i].morton_sort_dispatch_size > 1) {
+               device->cmd_fill_buffer_addr(commandBuffer, pInfos[i].scratchData.deviceAddress + states[i].scratch.sort_internal_offset,
+                                            sizeof(struct morton_ready_count) * states[i].morton_sort_passes, 0x0);
+               any_fill = true;
+            }
 
-            if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_HPLOC) {
+            if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_HPLOC &&
+                states[i].leaf_node_count > 1) {
                device->cmd_fill_buffer_addr(commandBuffer, pInfos[i].scratchData.deviceAddress + states[i].scratch.hploc_ranges_offset,
                                             sizeof(uint32_t) * states[i].internal_node_count, 0xffffffff);
+               any_fill = true;
             }
          }
 
-         vk_bvh_build_barrier_transfer_to_compute(commandBuffer);
+         if (any_fill)
+            vk_bvh_build_barrier_transfer_to_compute(commandBuffer);
          vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
 
          result = vk_build_stage(morton_generate, commandBuffer, device, meta, args, states, infoCount, VK_MORTON_BUILD_FLAGS, false);
