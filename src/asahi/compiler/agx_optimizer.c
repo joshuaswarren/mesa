@@ -1263,7 +1263,7 @@ bool
 agx_eval_immediate_icond(agx_context *ctx, enum agx_icond icond, agx_index x,
                          agx_index y, bool *result)
 {
-   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
        x.type != AGX_INDEX_IMMEDIATE || y.type != AGX_INDEX_IMMEDIATE ||
        x.neg || y.neg)
       return false;
@@ -1459,7 +1459,7 @@ agx_select_compare_cut(const void *a, const void *b)
 static void
 agx_optimizer_select_guard(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
-   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
        I->op != AGX_OPCODE_ICMPSEL || I->saturate || I->invert_cond ||
        agx_channels(I->dest[0]) != 1)
       return;

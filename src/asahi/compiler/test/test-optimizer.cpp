@@ -4,6 +4,7 @@
  */
 
 #include "agx_builder.h"
+#include "agx3_pack.h"
 #include "agx3_select_core.h"
 #include "agx_compiler.h"
 #include "agx_test.h"
@@ -1301,14 +1302,15 @@ TEST_F(Optimizer, TileSampleImmediateControls)
 
 TEST_F(Optimizer, G17PAbsorbsExclusiveSelectGuards)
 {
-   for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
-      for (unsigned target = 0; target < 8; ++target) {
-         for (unsigned guard = 0; guard < 8; ++guard) {
-            for (bool reverse : {false, true}) {
-               agx_builder *actual = agx_test_builder(mem_ctx);
-               agx_builder *expected = agx_test_builder(mem_ctx);
-               struct agx_shader_key key = {};
-               key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   for (auto encoding : {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
+         for (unsigned target = 0; target < 8; ++target) {
+            for (unsigned guard = 0; guard < 8; ++guard) {
+               for (bool reverse : {false, true}) {
+                  agx_builder *actual = agx_test_builder(mem_ctx);
+                  agx_builder *expected = agx_test_builder(mem_ctx);
+                  struct agx_shader_key key = {};
+                  key.dev.encoding = encoding;
                for (agx_builder *b : {actual, expected}) {
                   b->shader->key = &key;
                   agx_index variable = agx_preload(b, agx_register(0, size));
@@ -1334,9 +1336,10 @@ TEST_F(Optimizer, G17PAbsorbsExclusiveSelectGuards)
                                     reverse ? AGX_ICOND_UGT : AGX_ICOND_UEQ);
                   agx_unit_test(b, out);
                }
-               agx_optimize_and_dce(actual->shader);
-               agx_dce(expected->shader, true);
-               ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+                  agx_optimize_and_dce(actual->shader);
+                  agx_dce(expected->shader, true);
+                  ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+               }
             }
          }
       }
@@ -1640,11 +1643,12 @@ TEST_F(Optimizer, G17POuterInputProvesCompoundSelectGuard)
 
 TEST_F(Optimizer, G17PSelectGuardImmediateBoundary)
 {
-   for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
-      for (unsigned threshold : {254u, 255u}) {
-         agx_builder *b = agx_test_builder(mem_ctx);
-         struct agx_shader_key key = {};
-         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   for (auto encoding : {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
+         for (unsigned threshold : {254u, 255u}) {
+            agx_builder *b = agx_test_builder(mem_ctx);
+            struct agx_shader_key key = {};
+            key.dev.encoding = encoding;
          b->shader->key = &key;
          agx_index variable = agx_preload(b, agx_register(0, size));
          agx_index predicate = agx_icmp(
@@ -1661,8 +1665,69 @@ TEST_F(Optimizer, G17PSelectGuardImmediateBoundary)
                }
             }
          }
-         for (uint32_t input = threshold - 1; input <= threshold + 2; ++input)
-            EXPECT_EQ(select_test_run(b->shader, input), input > threshold);
+            for (uint32_t input = threshold - 1; input <= threshold + 2; ++input)
+               EXPECT_EQ(select_test_run(b->shader, input), input > threshold);
+         }
+      }
+   }
+}
+
+TEST_F(Optimizer, AGX3CSelectGuardFoldsAndPacksToBinary)
+{
+   const struct {
+      enum agx_chip chip;
+      bool emit_agx3d;
+   } targets[] = {
+      {AGX_CHIP_G17S, false},
+      {AGX_CHIP_G18G, true},
+   };
+
+   for (const auto &t : targets) {
+      for (unsigned guard : {3u, 5u}) {
+         agx_builder *b = agx_test_builder(mem_ctx);
+         struct agx_shader_key key = {};
+         struct agx_shader_info info = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.dev.chip = t.chip;
+         key.dev.emit_agx3d = t.emit_agx3d;
+         b->shader->key = &key;
+         b->shader->out = &info;
+         b->shader->stage = MESA_SHADER_COMPUTE;
+         b->shader->nir = rzalloc(mem_ctx, nir_shader);
+         b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+
+         agx_index variable = agx_preload(b, agx_register(0, AGX_SIZE_32));
+         agx_index tval = agx_preload(b, agx_register(2, AGX_SIZE_32));
+         agx_index fval = agx_preload(b, agx_register(4, AGX_SIZE_32));
+         agx_index predicate =
+            agx_icmp(b, variable, agx_immediate(guard), AGX_ICOND_UEQ, false);
+         agx_index inner = agx_temp(b->shader, AGX_SIZE_32);
+         agx_icmpsel_to(b, inner, variable, agx_immediate(3), tval, fval,
+                        AGX_ICOND_UEQ);
+         agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+         agx_icmpsel_to(b, out, predicate, agx_zero(), inner, fval,
+                        AGX_ICOND_UEQ);
+         agx_device_store(b, out, agx_uniform(0, AGX_SIZE_64), agx_immediate(0),
+                          AGX_FORMAT_I32, 1, 0, false);
+         agx_stop(b);
+
+         agx_optimize_and_dce(b->shader);
+
+         unsigned icmpsel_count = 0;
+         agx_foreach_instr_global(b->shader, I) {
+            if (I->op == AGX_OPCODE_ICMPSEL)
+               icmpsel_count++;
+         }
+         EXPECT_EQ(icmpsel_count, guard == 3u ? 0u : 1u);
+
+         agx_ra(b->shader);
+         ASSERT_FALSE(b->shader->ra_failed);
+         agx_lower_pseudo(b->shader);
+
+         struct util_dynarray binary;
+         util_dynarray_init(&binary, mem_ctx);
+         EXPECT_TRUE(agx3_pack_binary(b->shader, &binary));
+         EXPECT_GT(binary.size, 0u);
       }
    }
 }
