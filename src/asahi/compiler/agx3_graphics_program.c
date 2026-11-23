@@ -872,15 +872,9 @@ g18g_graphics_program_generate(
          (desc->threadgroup_memory_size_B & 63))) ||
        desc->colour_classes > 7 ||
        (!desc->fragment && desc->colour_classes) ||
-       /* A render with no colour attachment has an empty imageblock. Apple's
-        * own colour-free render emits the same fragment SPECLM spelling as a
-        * colour one -- both carry 1700002c00001808 -- so the sample size may
-        * be zero as well as the witnessed eight bytes. Other tile sizes and
-        * sample counts still need their own native evidence.
-        *
-        * msaa163: plus exactly one multisample imageblock, eight-byte samples
-        * at 4x in a 32x16 tile -- what Apple's M5 and G18 4x renders select
-        * for one RGBA8 target (MSAA notes s2.4). */
+       /* Admitted imageblock shapes: 32x32 1x with 0 (depth-only) or 8-byte
+        * samples, plus 32x16 4x MSAA with 8-byte samples. Other tile sizes
+        * and sample counts stay closed. */
        (desc->fragment &&
         !((desc->imageblock.sample_size_B == 8 ||
            (target_chip == AGX_CHIP_G18G &&
@@ -918,16 +912,9 @@ g18g_graphics_program_generate(
                                           desc->uniform_range_count, &bound))
       return false;
 
-   /* The captured M5 physical imageblock spelling. Byte 7 is the imageblock
-    * sample size in bytes: three native fragment renders taken in one session
-    * publish 1700002c00001808 for one RGBA8 attachment and 1700002c00001820
-    * for eight, and nothing else in the record moves. Bytes 0..6 -- which are
-    * the per-tile-shape seed in HAL200's spelling -- are identical across
-    * both, so Apple keeps the 32x32 tile for 32-byte samples rather than
-    * halving it, landing on exactly the 32 KiB structural bound. The byte is
-    * therefore a plain byte count, and sixteen-byte samples (RGBA32 and RGB32
-    * attachments) use it as such. Other tile sizes and sample counts still
-    * need their own native evidence. */
+   /* M5 physical imageblock record: bytes 0..6 encode the tile shape (32x32
+    * up to the 32 KiB bound) and byte 7 is the per-sample byte count (0, 8,
+    * 16, or 32 bytes). Other tile sizes and sample counts stay closed. */
    static const uint8_t speclm[2][AGX_IOTO_SPECLM_SIZE] = {
       {0x07,0x00,0x00,0x0c,0x00,0x00,0x00,0x00},
       {0x17,0x00,0x00,0x2c,0x00,0x00,0x18,0x08},
