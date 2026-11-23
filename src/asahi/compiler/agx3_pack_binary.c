@@ -8577,6 +8577,47 @@ agx3_slot_cf_kind(const agx_instr *I)
    }
 }
 
+/* What emission knows about the generations in flight: the outstanding
+ * slots, which of them are image writes and which write r0, and the staging
+ * halves their consumers still read. An arm's end restores what was in
+ * flight at its if, as slot assignment does (agx3_slot_core.h). */
+struct agx3_emit_slots {
+   uint16_t outstanding, image_writes, r0_inflight;
+   struct agx3_staging_banks staging;
+};
+
+struct agx3_emit_level {
+   bool arm;
+   struct agx3_emit_slots at_if;
+};
+
+static void
+agx3_emit_slots_capture(struct agx3_emit_slots *to, uint16_t outstanding,
+                        uint16_t image_writes,
+                        const struct agx3_staging_banks *staging)
+{
+   to->outstanding = outstanding;
+   to->image_writes = image_writes;
+   to->r0_inflight = agx3_r0_inflight;
+   to->staging = *staging;
+}
+
+/* After the drain at an arm's end, which retired everything for the lanes
+ * that ran the arm: everything in flight at the if is in flight again, its
+ * staging halves included, as the arm may have had no lanes. */
+static void
+agx3_emit_slots_join(const struct agx3_emit_slots *from, uint16_t *outstanding,
+                     uint16_t *image_writes,
+                     struct agx3_staging_banks *staging)
+{
+   *outstanding |= from->outstanding;
+   *image_writes |= from->image_writes;
+   agx3_r0_inflight |= from->r0_inflight;
+   for (unsigned i = 0; i < from->staging.end; ++i)
+      staging->readers[i] |= from->staging.readers[i];
+   staging->end = MAX2(staging->end, from->staging.end);
+}
+
 static int
 agx3_try_control_flow(struct util_dynarray *emission,
                       struct util_dynarray *fixups, enum agx_isa_encoding enc,
@@ -14073,11 +14114,15 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       AGX3_PACK_FAIL();
 
    /* The emission ledger follows the same arms as assignment: after an arm
-    * ends, what was outstanding at its if is outstanding again. */
-   uint16_t *cf_out_stack = rzalloc_array(ctx, uint16_t, count ? count : 1);
-   bool *cf_arm_stack = rzalloc_array(ctx, bool, count ? count : 1);
-   unsigned cf_depth = 0;
-   if (!cf_out_stack || !cf_arm_stack)
+    * ends, what was in flight at its if is in flight again. */
+   unsigned cf_levels = 0, cf_depth = 0;
+   for (unsigned i = 0, d = 0; i < count; ++i) {
+      d = d - MIN2(d, sl[i].cf_pop) + sl[i].cf_push;
+      cf_levels = MAX2(cf_levels, d);
+   }
+   struct agx3_emit_level *cf_level =
+      rzalloc_array(ctx, struct agx3_emit_level, cf_levels ? cf_levels : 1);
+   if (!cf_level)
       AGX3_PACK_FAIL();
 
    k = 0;
@@ -14545,16 +14590,23 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             AGX3_REFUSE(I);
          if (cf > 0) {
             const struct agx3_slot_instr *cf_e = &sl[instr_index];
-            if (cf_e->cf_else && cf_depth && cf_arm_stack[cf_depth - 1])
-               outstanding = cf_out_stack[cf_depth - 1];
+            if (cf_e->cf_else && cf_depth && cf_level[cf_depth - 1].arm)
+               agx3_emit_slots_join(&cf_level[cf_depth - 1].at_if,
+                                    &outstanding, &image_write_slots,
+                                    &staging_banks);
             for (unsigned p = 0; p < cf_e->cf_pop && cf_depth; ++p) {
-               --cf_depth;
-               if (cf_arm_stack[cf_depth])
-                  outstanding = cf_out_stack[cf_depth];
+               const struct agx3_emit_level *L = &cf_level[--cf_depth];
+               if (L->arm)
+                  agx3_emit_slots_join(&L->at_if, &outstanding,
+                                       &image_write_slots, &staging_banks);
             }
-            for (unsigned p = 0; p < cf_e->cf_push && cf_depth < count; ++p) {
-               cf_arm_stack[cf_depth] = cf_e->cf_arm;
-               cf_out_stack[cf_depth++] = outstanding;
+            for (unsigned p = 0; p < cf_e->cf_push && cf_depth < cf_levels;
+                 ++p) {
+               struct agx3_emit_level *L = &cf_level[cf_depth++];
+               L->arm = cf_e->cf_arm;
+               if (L->arm)
+                  agx3_emit_slots_capture(&L->at_if, outstanding,
+                                          image_write_slots, &staging_banks);
             }
             if (loop_entry_push)
                loop_depth++;

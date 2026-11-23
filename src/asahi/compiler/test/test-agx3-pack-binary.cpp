@@ -5984,6 +5984,76 @@ TEST_F(AGX3PackBinary, TextureFetch2DLod2Immediate)
    EXPECT_EQ(pack(b), want);
 }
 
+static agx_instr *
+staged_fetch_2d(agx_builder *b, unsigned dest_reg, unsigned coord_reg)
+{
+   agx_index dest = agx_register(dest_reg, AGX_SIZE_32);
+   agx_index coord = agx_register(coord_reg, AGX_SIZE_32);
+   dest.channels_m1 = 3;
+   coord.channels_m1 = 1;
+   agx_instr *I = agx_texture_sample_to(
+      b, dest, coord, agx_immediate(0), agx_immediate(0), agx_immediate(0),
+      agx_immediate(0), agx_null(), AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0, false,
+      false, false, AGX_GATHER_NONE, false);
+   I->op = AGX_OPCODE_TEXTURE_LOAD;
+   I->mask = 15;
+   return I;
+}
+
+/* Register indices are halves. fetch h0 <- h24; if (h48 < h50) { h40 =
+ * h0 + h2; fetch h8 <- h28 } pop; fetch h16 <- h32. The arm waits for the
+ * first fetch, so its own fetch may stage in the first fetch's bank. Lanes
+ * that skipped the arm did not wait, so after the pop the first fetch may
+ * still be reading its staged coordinates: the last fetch must stage them
+ * elsewhere or wait for it. */
+static void
+build_fetch_if_fetch(agx_builder *b)
+{
+   b->shader->stage = MESA_SHADER_VERTEX;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *arm = agx_test_block(b->shader);
+   agx_block *pop = agx_test_block(b->shader);
+   staged_fetch_2d(b, 0, 24);
+   agx_begin_cf(b);
+   agx_if_icmp(b, agx_register(48, AGX_SIZE_32), agx_register(50, AGX_SIZE_32),
+               1, AGX_ICOND_ULT, false, pop);
+   agx_jmp_exec_none(b, pop);
+   agx_block_add_successor(entry, arm);
+   agx_block_add_successor(entry, pop);
+
+   agx_builder ab = agx_init_builder(b->shader, agx_after_block(arm));
+   agx_fadd_to(&ab, agx_register(40, AGX_SIZE_32), agx_register(0, AGX_SIZE_32),
+               agx_register(2, AGX_SIZE_32));
+   staged_fetch_2d(&ab, 8, 28);
+   agx_index arm_out = agx_register(8, AGX_SIZE_32);
+   arm_out.channels_m1 = 3;
+   agx_device_store(&ab, arm_out, agx_uniform(0, AGX_SIZE_64), agx_immediate(32),
+                    AGX_FORMAT_I32, 15, 0, false);
+   agx_block_add_successor(arm, pop);
+
+   agx_builder pb = agx_init_builder(b->shader, agx_after_block(pop));
+   agx_pop_exec(&pb, 1);
+   staged_fetch_2d(&pb, 16, 32);
+   for (unsigned h = 0; h <= 16; h += 16) {
+      agx_index v = agx_register(h, AGX_SIZE_32);
+      v.channels_m1 = 3;
+      agx_device_store(&pb, v, agx_uniform(0, AGX_SIZE_64),
+                       agx_immediate(h), AGX_FORMAT_I32, 15, 0, false);
+   }
+   agx_stop(&pb);
+}
+
+TEST_F(AGX3PackBinary, ArmEndKeepsStagedCoordinatesOfAnEarlierFetch)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   build_fetch_if_fetch(b);
+   ASSERT_FALSE(pack(b).empty());
+   /* The arm's fetch reuses bank 0 (halves 0..3); the last one takes bank 1
+    * (halves 8..11) rather than overwrite the first fetch's coordinates. */
+   EXPECT_TRUE(b->shader->agx3_staging_known);
+   EXPECT_EQ(b->shader->agx3_staging_halfs, 12u);
+}
+
 TEST_F(AGX3PackBinary, TextureFetchRepeatedWaitKeepsCoordinateUntilFinalCopy)
 {
    const auto enc = AGX_ISA_ENCODING_AGX3B;
