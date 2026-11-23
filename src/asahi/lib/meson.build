@@ -469,6 +469,21 @@ if with_tests
   )
 
   test(
+    'asahi-agx-ioto-state-core',
+    executable(
+      'asahi-agx-ioto-state-core',
+      files(
+        'agx_ioto_core.c',
+        'agx_ioto_state_core.c',
+        'tests/test-agx-ioto-state-core.c',
+      ),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      c_args : ['-UNDEBUG'],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'asahi-agx-ioto-program-core',
     executable(
       'asahi-agx-ioto-program-core',
