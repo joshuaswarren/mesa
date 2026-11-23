@@ -375,6 +375,7 @@ target_supports_program(const char *target, const nir_function *func)
            !strcmp(func->name, "libagx_reset_compression_metadata")) ||
           !strcmp(func->name, "libagx_copy_image") ||
           !strcmp(func->name, "libagx_mipmap_unorm8x4") ||
+          !strcmp(func->name, "libagx_mipmap_unorm8x4_2level") ||
           !strcmp(func->name, "libagx_mipmap_unorm8x4_odd") ||
           !strcmp(func->name, "libagx_resolve_unorm8x4") ||
           !strcmp(func->name, "libagx_predicate_indirect") ||

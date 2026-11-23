@@ -48,6 +48,8 @@
 
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/genxml/agx_pack.h"
+#include "asahi/lib/agx3_cdm_decode_core.h"
+#include "asahi/lib/agx_tile_mip.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_xfb_info.h"
 #include "compiler/glsl_types.h"
@@ -1141,6 +1143,341 @@ vertex_state_encoded(void *cso)
    return ok;
 }
 
+static uint8_t
+agx_mip_ref_avg4_u8(uint8_t a, uint8_t b, uint8_t c, uint8_t d)
+{
+   const unsigned sum = (unsigned)a + b + c + d;
+   const unsigned q = sum >> 2;
+   const unsigned r = sum & 3u;
+   return (uint8_t)(q + (r > 2u || (r == 2u && q < 128u)));
+}
+
+static bool
+agx_mip_ref_downsample(const uint8_t *src, uint32_t sw, uint32_t sh,
+                       uint8_t *dst, uint32_t dw, uint32_t dh)
+{
+   const bool odd = (sw == dw * 2u + 1u) || (sh == dh * 2u + 1u);
+   if (odd) {
+      uint32_t *x_axis = malloc((size_t)(dw + dh) * sizeof(uint32_t));
+      if (!x_axis)
+         return false;
+      uint32_t *y_axis = x_axis + dw;
+      if (!agx_build_mip_axis(sw, dw, x_axis) ||
+          !agx_build_mip_axis(sh, dh, y_axis)) {
+         free(x_axis);
+         return false;
+      }
+      for (uint32_t y = 0; y < dh; ++y) {
+         const uint32_t ye = y_axis[y];
+         const uint32_t sy0 = ye & 0xffffu;
+         const uint32_t wy = (ye >> 16) & 0xffu;
+         const uint32_t sy1 = sy0 + (wy != 0u);
+         const uint32_t iy = 256u - wy;
+         for (uint32_t x = 0; x < dw; ++x) {
+            const uint32_t xe = x_axis[x];
+            const uint32_t sx0 = xe & 0xffffu;
+            const uint32_t wx = (xe >> 16) & 0xffu;
+            const uint32_t sx1 = sx0 + (wx != 0u);
+            const uint32_t ix = 256u - wx;
+            const uint32_t w00 = ix * iy;
+            const uint32_t w10 = wx * iy;
+            const uint32_t w01 = ix * wy;
+            const uint32_t w11 = wx * wy;
+            for (unsigned c = 0; c < 4; ++c) {
+               const uint32_t val =
+                  src[(sy0 * sw + sx0) * 4 + c] * w00 +
+                  src[(sy0 * sw + sx1) * 4 + c] * w10 +
+                  src[(sy1 * sw + sx0) * 4 + c] * w01 +
+                  src[(sy1 * sw + sx1) * 4 + c] * w11;
+               const uint32_t fixed4 = (val + 2048u) >> 12;
+               uint32_t out = fixed4 >> 4;
+               const uint32_t rem = fixed4 & 15u;
+               out += (rem > 8u || (rem == 8u && out < 128u));
+               dst[(y * dw + x) * 4 + c] = (uint8_t)out;
+            }
+         }
+      }
+      free(x_axis);
+      return true;
+   }
+
+   const uint32_t scx = (sw == dw) ? 1u : 2u;
+   const uint32_t scy = (sh == dh) ? 1u : 2u;
+   for (uint32_t y = 0; y < dh; ++y) {
+      const uint32_t sy0 = y * scy;
+      const uint32_t sy1 = sy0 + scy - 1u;
+      for (uint32_t x = 0; x < dw; ++x) {
+         const uint32_t sx0 = x * scx;
+         const uint32_t sx1 = sx0 + scx - 1u;
+         for (unsigned c = 0; c < 4; ++c) {
+            dst[(y * dw + x) * 4 + c] = agx_mip_ref_avg4_u8(
+               src[(sy0 * sw + sx0) * 4 + c], src[(sy0 * sw + sx1) * 4 + c],
+               src[(sy1 * sw + sx0) * 4 + c], src[(sy1 * sw + sx1) * 4 + c]);
+         }
+      }
+   }
+   return true;
+}
+
+static bool
+check_agx3_compute_mipmap_case(struct pipe_screen *screen,
+                               struct pipe_context *pctx,
+                               const char *name,
+                               enum pipe_texture_target target,
+                               uint32_t width, uint32_t height,
+                               uint32_t layers, unsigned last_level,
+                               bool expect_fused_2level, bool check_pixels)
+{
+   struct agx_device *mdev = agx_device(screen);
+   struct agx_context *mctx = agx_context(pctx);
+   const struct pipe_resource tmpl = {
+      .target = target,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .width0 = width,
+      .height0 = height,
+      .depth0 = 1,
+      .array_size = layers,
+      .last_level = last_level,
+      .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
+   };
+   struct pipe_resource *tex = screen->resource_create(screen, &tmpl);
+   if (!tex) {
+      fprintf(stderr, "mipmap %s: resource_create failed\n", name);
+      return false;
+   }
+
+   /* Upload deterministic non-constant RGBA8 data for every layer's level 0. */
+   const size_t base_layer_bytes = (size_t)width * height * 4;
+   uint8_t *ref_prev = malloc(base_layer_bytes * layers);
+   if (!ref_prev) {
+      pipe_resource_reference(&tex, NULL);
+      return false;
+   }
+   for (uint32_t z = 0; z < layers; ++z) {
+      uint8_t *layer_buf = ref_prev + z * base_layer_bytes;
+      for (uint32_t y = 0; y < height; ++y) {
+         for (uint32_t x = 0; x < width; ++x) {
+            uint8_t *px = layer_buf + (y * width + x) * 4;
+            px[0] = (uint8_t)((x * 13u + y * 7u + z * 37u) & 0xffu);
+            px[1] = (uint8_t)((x * 5u + y * 19u + z * 53u + 17u) & 0xffu);
+            px[2] = (uint8_t)(((x ^ y) * 11u + z * 29u + 125u) & 0xffu);
+            px[3] = (uint8_t)((x * 3u + y * 23u + z * 41u + 190u) & 0xffu);
+         }
+      }
+      struct pipe_box box = {
+         .x = 0, .y = 0, .z = (int)z,
+         .width = (int)width, .height = (int)height, .depth = 1,
+      };
+      struct pipe_transfer *xfer = NULL;
+      uint8_t *map =
+         pctx->texture_map(pctx, tex, 0, PIPE_MAP_WRITE, &box, &xfer);
+      if (!map) {
+         fprintf(stderr, "mipmap %s: level 0 map failed\n", name);
+         free(ref_prev);
+         pipe_resource_reference(&tex, NULL);
+         return false;
+      }
+      for (uint32_t y = 0; y < height; ++y)
+         memcpy(map + y * xfer->stride, layer_buf + y * width * 4, width * 4);
+      pctx->texture_unmap(pctx, xfer);
+   }
+   pctx->flush(pctx, NULL, 0);
+
+   if (!pctx->generate_mipmap ||
+       !pctx->generate_mipmap(pctx, tex, PIPE_FORMAT_R8G8B8A8_UNORM, 0,
+                              last_level, 0, layers - 1)) {
+      fprintf(stderr, "mipmap %s: generate_mipmap failed\n", name);
+      free(ref_prev);
+      pipe_resource_reference(&tex, NULL);
+      return false;
+   }
+   if (!mctx->batch || !mctx->batch->cdm.bo || mctx->batch->vdm.bo) {
+      fprintf(stderr, "mipmap %s: did not stay in one CDM batch\n", name);
+      free(ref_prev);
+      pipe_resource_reference(&tex, NULL);
+      return false;
+   }
+
+   /* Decode the emitted CDM records directly to confirm kernel selection. */
+   const uint8_t *cdm_base = agx_bo_map(mctx->batch->cdm.bo);
+   const size_t cdm_len = (size_t)(mctx->batch->cdm.current - cdm_base);
+   size_t off = 0;
+   unsigned launches = 0, fused_launches = 0;
+   while (off < cdm_len) {
+      struct agx3_cdm_decoded_record rec;
+      if (!agx3_cdm_decode_one(mdev->chip, cdm_base + off, cdm_len - off,
+                               &rec) ||
+          !rec.length) {
+         fprintf(stderr, "mipmap %s: CDM decode failed at +%zu/%zu\n", name,
+                 off, cdm_len);
+         free(ref_prev);
+         pipe_resource_reference(&tex, NULL);
+         return false;
+      }
+      if (rec.kind == AGX3_CDM_RECORD_LAUNCH) {
+         ++launches;
+         if (rec.data.launch.local_size[0] == 16 &&
+             rec.data.launch.local_size[1] == 8 &&
+             rec.data.launch.local_size[2] == 1)
+            ++fused_launches;
+      }
+      off += rec.length;
+   }
+   if (expect_fused_2level &&
+       (fused_launches < 2 * layers || launches >= last_level * layers)) {
+      fprintf(stderr,
+              "mipmap %s: expected fused 2-level (16x8) dispatches, got "
+              "fused=%u total=%u (single-level=%u)\n",
+              name, fused_launches, launches, last_level * layers);
+      free(ref_prev);
+      pipe_resource_reference(&tex, NULL);
+      return false;
+   }
+
+   pctx->flush(pctx, NULL, 0);
+
+   /* Map every generated level/layer; on real hardware verify bit-exact output
+    * against the CPU reference matching libagx_mipmap_unorm8x4{,_odd}. */
+   uint32_t prev_w = width, prev_h = height;
+   for (unsigned lvl = 1; lvl <= last_level; ++lvl) {
+      const uint32_t dw = u_minify(width, lvl);
+      const uint32_t dh = u_minify(height, lvl);
+      const size_t dst_layer_bytes = (size_t)dw * dh * 4;
+      uint8_t *ref_cur = malloc(dst_layer_bytes * layers);
+      if (!ref_cur) {
+         free(ref_prev);
+         pipe_resource_reference(&tex, NULL);
+         return false;
+      }
+      for (uint32_t z = 0; z < layers; ++z) {
+         const uint8_t *src_layer = ref_prev + (size_t)z * prev_w * prev_h * 4;
+         uint8_t *dst_layer = ref_cur + (size_t)z * dst_layer_bytes;
+         if (!agx_mip_ref_downsample(src_layer, prev_w, prev_h, dst_layer, dw,
+                                     dh)) {
+            free(ref_cur);
+            free(ref_prev);
+            pipe_resource_reference(&tex, NULL);
+            return false;
+         }
+
+         struct pipe_box box = {
+            .x = 0, .y = 0, .z = (int)z,
+            .width = (int)dw, .height = (int)dh, .depth = 1,
+         };
+         struct pipe_transfer *xfer = NULL;
+         const uint8_t *map =
+            pctx->texture_map(pctx, tex, lvl, PIPE_MAP_READ, &box, &xfer);
+         if (!map) {
+            fprintf(stderr, "mipmap %s: readback map failed lvl=%u z=%u\n",
+                    name, lvl, z);
+            free(ref_cur);
+            free(ref_prev);
+            pipe_resource_reference(&tex, NULL);
+            return false;
+         }
+         if (check_pixels) {
+            for (uint32_t y = 0; y < dh; ++y) {
+               const uint8_t *got_row = map + y * xfer->stride;
+               const uint8_t *exp_row = dst_layer + y * dw * 4;
+               if (memcmp(got_row, exp_row, dw * 4) != 0) {
+                  for (uint32_t x = 0; x < dw; ++x) {
+                     if (memcmp(got_row + x * 4, exp_row + x * 4, 4) != 0) {
+                        fprintf(stderr,
+                                "mipmap %s: mismatch lvl=%u z=%u (%u,%u) "
+                                "got=(%u,%u,%u,%u) exp=(%u,%u,%u,%u)\n",
+                                name, lvl, z, x, y, got_row[x * 4],
+                                got_row[x * 4 + 1], got_row[x * 4 + 2],
+                                got_row[x * 4 + 3], exp_row[x * 4],
+                                exp_row[x * 4 + 1], exp_row[x * 4 + 2],
+                                exp_row[x * 4 + 3]);
+                        break;
+                     }
+                  }
+                  pctx->texture_unmap(pctx, xfer);
+                  free(ref_cur);
+                  free(ref_prev);
+                  pipe_resource_reference(&tex, NULL);
+                  return false;
+               }
+            }
+         }
+         pctx->texture_unmap(pctx, xfer);
+      }
+      free(ref_prev);
+      ref_prev = ref_cur;
+      prev_w = dw;
+      prev_h = dh;
+   }
+
+   free(ref_prev);
+   pipe_resource_reference(&tex, NULL);
+   return true;
+}
+
+static bool
+check_agx3_compute_mipmap(struct pipe_screen *screen, struct pipe_context *pctx,
+                          bool check_pixels)
+{
+   struct agx_device *mdev = agx_device(screen);
+   if (!agx_chip_native_agx3(mdev->chip))
+      return true;
+
+   /* Verify predicate accept/reject matrix. */
+   const struct pipe_resource mip_tmpl = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .width0 = 64,
+      .height0 = 33,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 6,
+      .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
+   };
+   struct pipe_resource *mip_tex = screen->resource_create(screen, &mip_tmpl);
+   if (!mip_tex) {
+      fprintf(stderr, "mip_tex resource_create failed\n");
+      return false;
+   }
+   struct agx_resource *mrsrc = agx_resource(mip_tex);
+   if (!agx_generate_mipmap_agx3_supported(
+          mdev, mrsrc, PIPE_FORMAT_R8G8B8A8_UNORM, 0, 6, 0, 0) ||
+       agx_generate_mipmap_agx3_supported(
+          mdev, mrsrc, PIPE_FORMAT_R8G8B8A8_SRGB, 0, 6, 0, 0) ||
+       agx_generate_mipmap_agx3_supported(
+          mdev, mrsrc, PIPE_FORMAT_R16G16B16A16_FLOAT, 0, 6, 0, 0) ||
+       agx_generate_mipmap_agx3_supported(
+          mdev, mrsrc, PIPE_FORMAT_R8G8B8A8_UNORM, 3, 3, 0, 0)) {
+      fprintf(stderr, "AGX3 mipchain predicate matrix failed\n");
+      pipe_resource_reference(&mip_tex, NULL);
+      return false;
+   }
+   pipe_resource_reference(&mip_tex, NULL);
+
+   if (!check_agx3_compute_mipmap_case(screen, pctx, "even_64x64_fused",
+                                       PIPE_TEXTURE_2D, 64, 64, 1, 6, true,
+                                       check_pixels) ||
+       !check_agx3_compute_mipmap_case(screen, pctx, "odd_65x33",
+                                       PIPE_TEXTURE_2D, 65, 33, 1, 6, false,
+                                       check_pixels) ||
+       !check_agx3_compute_mipmap_case(screen, pctx, "strip_1x9",
+                                       PIPE_TEXTURE_2D, 1, 9, 1, 3, false,
+                                       check_pixels) ||
+       !check_agx3_compute_mipmap_case(screen, pctx, "strip_9x1",
+                                       PIPE_TEXTURE_2D, 9, 1, 1, 3, false,
+                                       check_pixels) ||
+       !check_agx3_compute_mipmap_case(screen, pctx, "array_33x17x4",
+                                       PIPE_TEXTURE_2D_ARRAY, 33, 17, 4, 5,
+                                       false, check_pixels) ||
+       !check_agx3_compute_mipmap_case(screen, pctx, "cube_32x32x6_fused",
+                                       PIPE_TEXTURE_CUBE, 32, 32, 6, 5, true,
+                                       check_pixels))
+      return false;
+
+   printf("AGX3 compute generate_mipmap completed (check_pixels=%u)\n",
+          (unsigned)check_pixels);
+   return true;
+}
+
 /* The hardware vertex program shapes behind KHR-GL30.clip_distance.* and any
  * program with more than one user varying slot: position plus N clip
  * distances (the functional test, N = 1..8, written from gl_VertexID), the
@@ -1434,6 +1771,15 @@ main(void)
       return ok ? 0 : 1;
    }
 
+   if (getenv("AGX_TEST_MIPMAP_HW")) {
+      const bool ok =
+         check_agx3_compute_mipmap(screen, pctx, getenv("ASAHI_SHIM_CHIP") == NULL);
+      pctx->destroy(pctx);
+      screen->destroy(screen);
+      close(fd);
+      return ok ? 0 : 1;
+   }
+
    if (getenv("AGX_TEST_XFB_COPY_PROGRAM")) {
       glsl_type_singleton_init_or_ref();
       /* A triangle capture shades one of three candidate vertices, so its
@@ -1709,6 +2055,13 @@ main(void)
    }
    pctx->clear_buffer(pctx, filled, 0, 256, fill, sizeof(fill));
    pctx->flush(pctx, NULL, 0);
+
+   /* Native AGX3 compute mipchain generation: predicate matrix, CDM decode
+    * verifying fused 2-level (16x8) selection, and even/odd/1xN/array/cube
+    * readback (CPU-reference pixel verification when running on hardware). */
+   if (!check_agx3_compute_mipmap(screen, pctx,
+                                  getenv("ASAHI_SHIM_CHIP") == NULL))
+      return 1;
 
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(screen);

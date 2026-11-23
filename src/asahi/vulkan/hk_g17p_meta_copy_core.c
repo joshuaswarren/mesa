@@ -4,6 +4,7 @@
  */
 
 #include "hk_g17p_meta_copy_core.h"
+#include "asahi/lib/agx_tile_mip.h"
 #include "util/compiler.h"
 #include "util/u_math.h"
 #include "vk_format.h"
@@ -15,40 +16,7 @@ bool
 hk_g17p_build_mip_axis(uint32_t src_extent, uint32_t dst_extent,
                        uint32_t *entries)
 {
-   if (!entries || !src_extent || !dst_extent || src_extent > UINT16_MAX + 1u ||
-       !(src_extent == dst_extent ||
-         src_extent == (uint64_t)dst_extent * 2u ||
-         src_extent == (uint64_t)dst_extent * 2u + 1u))
-      return false;
-
-   if (src_extent == dst_extent) {
-      for (uint32_t i = 0; i < dst_extent; ++i)
-         entries[i] = i;
-      return true;
-   }
-
-   /* vk_meta computes the normalized scale in double on the CPU, casts it to
-    * f32 push data, then applies it to FragCoord with an FFMA. */
-   const float scale = (float)(1.0 / (double)dst_extent);
-   for (uint32_t i = 0; i < dst_extent; ++i) {
-      /* This work happens once while recording the dispatch, not per pixel. */
-      const float uv = ((float)i + 0.5f) * scale;
-      const float source = uv * (float)src_extent - 0.5f;
-      uint32_t lower = (uint32_t)source;
-      uint32_t weight = (uint32_t)((source - (float)lower) * 256.0f + 0.5f);
-
-      if (weight == 256) {
-         ++lower;
-         weight = 0;
-      }
-
-      if (lower >= src_extent)
-         lower = src_extent - 1;
-
-      entries[i] = lower | (weight << 16);
-   }
-
-   return true;
+   return agx_build_mip_axis(src_extent, dst_extent, entries);
 }
 
 bool
@@ -59,21 +27,15 @@ hk_g17p_tile_address_config_init(
    if (config)
       memset(config, 0, sizeof(*config));
 
-   if (!config || !stride_el || !tile_width_el || !tile_height_el ||
-       (tile_width_el & (tile_width_el - 1)) ||
-       (tile_height_el & (tile_height_el - 1)))
-      return false;
-
-   const uint32_t width_log2 = util_logbase2(tile_width_el);
-   const uint32_t height_log2 = util_logbase2(tile_height_el);
-   if (width_log2 > 7 || height_log2 > 7)
+   struct agx_tile_address_config shared;
+   if (!config || !agx_tile_address_config_init(stride_el, tile_width_el,
+                                                tile_height_el, &shared))
       return false;
 
    *config = (struct hk_g17p_tile_address_config){
-      .tiles_per_row =
-         ((uint64_t)stride_el + tile_width_el - 1) >> width_log2,
-      .tile_width_log2 = width_log2,
-      .tile_height_log2 = height_log2,
+      .tiles_per_row = shared.tiles_per_row,
+      .tile_width_log2 = shared.tile_width_log2,
+      .tile_height_log2 = shared.tile_height_log2,
    };
    return true;
 }
