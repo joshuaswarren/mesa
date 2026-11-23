@@ -2352,23 +2352,26 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
    /* A staged read consumes, and kills, its coordinate bank asynchronously,
     * so consecutive reads stage in disjoint banks, as Apple's do (smp f19=0
     * then f19=4). Callers that pass no `banks` keep one bank. Halves 4..7
-    * carry PACK_SMPIR operands, so the second plain bank starts at half 8; a
-    * read with PACK_SMPIR operands keeps the base bank and occupies halves
-    * 0..7. An outstanding read sharing the halves is retired first. */
+    * carry PACK_SMPIR operands, so banks step by eight halves; plain 2D
+    * reads, immediate-LOD 2D-array reads, and M5 multisample reads allocate
+    * disjoint banks from `staging_base`, while other reads with PACK_SMPIR
+    * operands keep the base bank and occupy halves 0..7. An outstanding read
+    * sharing the halves is retired first. */
    const bool plain_bank = !ms_2d && !ms_array && !array && !register_lod;
+   const bool array_bank = array && !register_lod;
    const bool m5_ms_banks = m5 && (ms_2d || ms_array);
-   const bool banked_read = plain_bank || m5_ms_banks;
-   /* Plain M5 fetch coordinates can name any aligned bank through half 60.
-    * Use independent banks for all eight scoreboard slots before recycling
-    * one. */
-   const unsigned plain_banks = m5 ?
-      MIN2(AGX3_M5_FETCH_BANKS, 1 + (60 - staging_base) / 8) : 2;
+   const bool banked_read = plain_bank || array_bank || m5_ms_banks;
+   /* Fetch coordinates can name any aligned bank through half 60 (f19).
+    * Use independent eight-half banks for all scoreboard slots (6 on AGX3B,
+    * 8 on AGX3C) before recycling one. */
+   const unsigned plain_banks =
+      MIN2(m5 ? AGX3_M5_FETCH_BANKS : 6u, 1 + (60 - staging_base) / 8);
    /* Keep independent non-array MS publications in separate operand banks. */
    const unsigned ms_banks =
       m5_ms_banks && !ms_array ? AGX3_M5_MS_FETCH_BANKS : 4;
    const uint16_t bank_span =
-      m5_ms_banks ? 8 : plain_bank ? 2 * coord_count
-                                 : staging_base + 8;
+      (m5_ms_banks || array_bank) ? 8 : plain_bank ? 2 * coord_count
+                                                   : staging_base + 8;
    uint16_t staging_coord = staging_base;
    uint16_t bank_retire = 0;
    const bool reuse = group && group->reuse;
@@ -2387,11 +2390,13 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
    } else if (stage_coordinates && banks) {
       agx3_staging_release(banks, outstanding);
 
-      /* A read with PACK_SMPIR operands occupies halves 0..bank_span. */
+      /* Non-banked reads with PACK_SMPIR operands occupy halves 0..bank_span. */
       const uint16_t first = banked_read ? staging_base : 0;
+      const unsigned max_banks =
+         m5_ms_banks ? ms_banks :
+         (plain_bank || array_bank) ? plain_banks : 1u;
       bool placed = false;
-      for (unsigned c = 0; c < (m5_ms_banks ? ms_banks : plain_bank ? plain_banks : 1u) &&
-                           !placed; ++c) {
+      for (unsigned c = 0; c < max_banks && !placed; ++c) {
          const uint16_t start = first + 8 * c;
          const uint16_t conflict = agx3_staging_conflicts(
             banks, banked_read ? start : 0, bank_span);
@@ -2408,20 +2413,21 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
          agx3_staging_forget(banks, bank_retire);
    }
    /* The r0 carrier reads and rewrites r0, so it is sound only while r0 is
-    * ready or its producer is in the mask. When M5 multisample reads fill
-    * all four operand banks, the next one retires the first bank's read,
-    * and r0 may be the destination of a later read still in flight: in the
-    * stencil resolve of dEQP-VK.renderpasses.renderpass2.
-    * depth_stencil_resolve.*.stencil_min, five texel fetches were in
-    * flight, the second writing r0..r3, and the carrier waited for the
-    * first alone. Carry the retirement on this fetch's coordinates with
-    * the fetch's own wait, which covers every pending write of them; the
-    * staging COPYs right after it wait for the same producers. */
-   if (bank_retire &&
-       !(m5 ? agx3_retire_wait_on(emission, enc, I->src[0],
-                                  bank_retire | wait_mask)
-            : agx3_retire_slots_noop(emission, enc, bank_retire)))
-      return false;
+    * ready or its producer is in the mask. When banked reads fill all banks,
+    * the next one retires the first bank's read, and r0 may be the
+    * destination of a later read still in flight: in the stencil resolve of
+    * dEQP-VK.renderpasses.renderpass2.depth_stencil_resolve.*.stencil_min,
+    * five texel fetches were in flight, the second writing r0..r3, and the
+    * carrier waited for the first alone. Carry the retirement on this
+    * fetch's coordinates with the fetch's own wait, which covers every
+    * pending write of them; the staging COPYs right after it wait for the
+    * same producers. */
+   if (bank_retire) {
+      if (!agx3_retire_wait_on(emission, enc, I->src[0],
+                               bank_retire | wait_mask))
+         return false;
+      wait_mask = 0;
+   }
    if (staged_end)
       *staged_end = banked_read ? staging_coord + bank_span : bank_span;
 
@@ -2545,7 +2551,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
          uint8_t packed[AGX3_TEX_MAX_LENGTH], packed_len = 0;
          const agx_index layer = agx3_tex_coord(I, 2);
          if (!agx3_tex_stage_array_layer_at(
-                enc, staging_base, layer.value, staging_slot, 0,
+                enc, staging_coord, layer.value, staging_slot, 0,
                 layer.cache, layer.discard,
                 packed, &packed_len) ||
              !agx3_append(emission, packed, packed_len))
@@ -4613,11 +4619,18 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
       !shadow && !offset && !query_lod && !min_lod &&
       (((vertex_stage || compute_stage) && (immediate_lod || gradient_lod)) ||
        m5_fragment_3d);
+   const bool combined_array_lod = array && !cube && !staged_offset &&
+      ((explicit_lod && !immediate_lod) || register_bias || min_lod);
+   const bool relocatable_array = array && !cube && !register_operands &&
+      !query_lod && !staged_offset && !register_offset &&
+      !combined_array_lod && !gradient_lod && !bias_min && !gradient_min &&
+      !(bank_base & 7);
    if (bank_base != 0 &&
        ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
         native_staged_coords ||
-        (array && !(enc == AGX_ISA_ENCODING_AGX3B && vertex_stage &&
-                    explicit_lod && immediate_lod && !shadow && !offset)) ||
+        (array && !relocatable_array &&
+         !(enc == AGX_ISA_ENCODING_AGX3B && vertex_stage &&
+           explicit_lod && immediate_lod && !shadow && !offset)) ||
         (three_d && !m5_banked_3d &&
          !(enc == AGX_ISA_ENCODING_AGX3B && vertex_stage)) ||
         cube || (gradient_lod && !m5_banked_3d) || bias_min || gradient_min || query_lod ||
@@ -4641,8 +4654,6 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
    uint8_t bytes[AGX3_TEX_MAX_LENGTH];
    uint8_t len = 0;
 
-   const bool combined_array_lod = array && !cube && !staged_offset &&
-      ((explicit_lod && !immediate_lod) || register_bias || min_lod);
    const uint16_t offset_base = I->src[5].value + (shadow ? 2 : 0);
    /* The comparison 2D-array bias and the staged 3D bias read their minimum
     * from a packed register. */
@@ -8312,10 +8323,11 @@ agx3_allocate_staging(struct util_dynarray *emission,
                       unsigned span, unsigned avoid_end, uint16_t *base)
 {
    uint16_t waits;
-   /* C's packed per-lane LOD occupies bank+6 in an eight-half group.
-    * Ordinary coordinates keep their native four-half alignment. */
-   const unsigned alignment =
-      enc == AGX_ISA_ENCODING_AGX3C && span == 8 ? 8 : 4;
+   /* Eight-half sample banks (2D-array layer + comparison, packed per-lane
+    * LOD, 3D) align to eight halves so consecutive banks stay disjoint and
+    * satisfy PACK_SMPIR's bank alignment on both AGX3B and AGX3C. Ordinary
+    * four-half coordinates keep their native four-half alignment. */
+   const unsigned alignment = span == 8 ? 8 : 4;
    if (!agx3_staging_plan_above(banks, span, alignment, AGX3_STAGING_HALFS,
                                 avoid_end, base, &waits))
       return false;
@@ -15099,11 +15111,22 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                    I->src[1].type == AGX_INDEX_IMMEDIATE) ||
                   I->lod_mode == AGX_LOD_MODE_LOD_GRAD)) ||
                 m5_fragment_3d);
+            const bool relocatable_2d_array =
+               (enc == AGX_ISA_ENCODING_AGX3B ||
+                (enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d)) &&
+               I->dim == AGX_DIM_2D_ARRAY && !I->query_lod &&
+               !(I->offset && !I->offset_xyz) &&
+               I->src[3].type != AGX_INDEX_REGISTER &&
+               I->src[4].type != AGX_INDEX_REGISTER &&
+               (I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
+                ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
+                  I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
+                 I->src[1].type == AGX_INDEX_IMMEDIATE));
             const bool relocatable_coordinates =
                (enc == AGX_ISA_ENCODING_AGX3B ||
                 enc == AGX_ISA_ENCODING_AGX3C) && slot != 0 &&
                !native_staged_coords &&
-               (m5_banked_3d || I->dim == AGX_DIM_2D ||
+               (m5_banked_3d || relocatable_2d_array || I->dim == AGX_DIM_2D ||
                 (enc == AGX_ISA_ENCODING_AGX3B &&
                  (I->dim == AGX_DIM_3D ||
                   (I->dim == AGX_DIM_2D_ARRAY && !I->shadow && !I->offset)) &&
@@ -15112,7 +15135,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                  I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
                  I->src[1].type == AGX_INDEX_IMMEDIATE)) &&
                !I->query_lod && !(I->offset && !I->offset_xyz) &&
-               (m5_banked_3d || I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
+               (m5_banked_3d || relocatable_2d_array ||
+                I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
                 ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
                   I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
                  (I->src[1].type == AGX_INDEX_IMMEDIATE ||
