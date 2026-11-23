@@ -379,6 +379,8 @@ bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,
                                                     bool support_lod_bias,
                                                     bool lower_2d_robustness);
 
+bool agx_nir_opt_nonneg_idiv(struct nir_shader *shader);
+
 bool agx_nir_opt_uniform_idiv(struct nir_shader *shader);
 bool agx_nir_uniform_idiv_applies(struct nir_alu_instr *alu,
                                   struct hash_table *cache);

@@ -895,4 +895,9 @@ static const nir_shader_compiler_options agx_nir_options = {
    .discard_is_demote = true,
    .scalarize_ddx = true,
    .io_options = nir_io_always_interpolate_convergent_fs_inputs,
+   /* Match hk_physical_device's maxComputeWorkGroupCount / Invocations (Gallium
+    * caps all axes at 65535), letting range analysis prove Y/Z (and 1-wide X)
+    * global_invocation_id bounds <= INT32_MAX. */
+   .max_workgroup_invocations = 1024,
+   .max_workgroup_count = {0x7fffffff, 65535, 65535},
 };
