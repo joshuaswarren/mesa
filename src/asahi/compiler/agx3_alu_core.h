@@ -123,24 +123,8 @@ bool agx3_alu_complement_reg16_m5(uint16_t dest, const uint16_t src[2],
                                 uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
 
 /*
- * The same AND/OR/XOR with the second operand an IMMEDIATE. The operand kind
- * is a field, f37, on the very encoding point the register form already uses,
- * with the constant in f29 -- so `x & 0xff` is not a different instruction, it
- * is the register form with one field changed. Witnessed with
- * metal-nt -arch applegpu_g17p and recovered through tools/decomp.c:
- *
- *   a & c      0b051f01000000800000   f16=4 f37=2 f38=2
- *   a & 0xff   0b011fff100200800000   f29=255 f37=1 f38=2
- *   a | 0xff   0b011fff120a00800000   bit_or, same fields
- *   a ^ 0xff   0b011eff120a00800000   bit_xor, same fields
- *   a & 0x7f   0b010fff100200800000   f29=127
- *   a ^ 1      0b010e81120a00800000   f29=1
- *   (ushort) a & 0xff   13021fff100200800000   f10=1 f24=1, f38 still 2
- *   (ushort) a | 0x80   13021f81020a00800000   f29=128
- *
- * The narrow rows are what settle f38: a 16-bit result narrows f10 and f24 but
- * NOT f38, because an immediate operand declares width 2 whatever the
- * destination is -- the same rule the compare-select's immediate slot follows.
+ * Bitwise AND/OR/XOR with an immediate second operand (f37=1, f29=imm).
+ * A 16-bit result narrows f10 and f24, while f38 stays 2 for the immediate.
  */
 bool agx3_alu_bit_imm(enum agx_isa_encoding enc, enum agx3_alu_op op,
                       bool narrow, uint16_t dest, uint16_t src,
@@ -148,20 +132,8 @@ bool agx3_alu_bit_imm(enum agx_isa_encoding enc, enum agx3_alu_op op,
                       uint16_t wait_mask,
                       uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
 
-/* G17P 16-bit ~a, Apple's unary `inv` at width 1. The destination cache is
- * f11, the source is f16 with its cache/discard hints in f25/f27, and
- * f30..f35 wait on producer slots 1..6. Witnessed with metal-nt -arch
- * applegpu_g17p on `ushort m = ~s` fragments and kernels:
- *
- *   03002e00010800000000   inv $h0, ^h0
- *   03002e00012800000000   inv $h0, ^h0  waiting on slot 1
- *   03802600052800000000   inv $h1, $h0  waiting on slot 1
- *   03822600050800000000   inv $h1, $h2
- *   13802600050800000000   inv $h3, $h0
- *   13022e00010800800000   inv $h2, ^h2  read twice, waiting on slot 6
- *   13020e00010800800000   inv h2, ^h2   stored once, waiting on slot 6
- *   13020600050800800000   inv h3, h2    waiting on slot 6
- */
+/* G17P 16-bit unary bitwise NOT (`inv`, width 1): dest cache f11, src f16
+ * (cache/discard f25/f27), and producer slot waits f30..f35. */
 bool agx3_alu_bit_not_reg16(enum agx_isa_encoding enc, uint16_t dest,
                             uint16_t src, enum agx3_alu_hint hint,
                             bool dest_cache, uint16_t wait_mask,
@@ -367,33 +339,10 @@ bool agx3_alu_fcmp_select_imm_width(enum agx_isa_encoding enc, uint16_t dest,
                              uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
 
 /*
- * The general compare-select.
- *
- * `fcmpsel` is four operands -- two compared, two selected -- and each carries
- * an independent (kind, width, value) triple. Selected values use kind 1 for
- * an immediate, kind 2 for a GPR, and kind 3 for a uniform. Fresh G17P
- * select-kind.metal probes change only GPR versus constant-buffer alternatives
- * in fabs(f32) < f16 ? a : b.
- *
- * Field map, recovered from 84 Apple `fsel` instructions:
- *
- *   dest          f3    width f11   cache f12
- *   compare 0     f35   kind  f42   width f43   cache f44  last-use f46  ABS f47
- *                 (a uniform comparand: kind 3, its half index in f36)
- *   compare 1     f52 (register) or f51 (immediate)
- *                       kind  f59   width f60   cache f61  last-use f63  ABS f64
- *                 (a uniform comparand: kind 3, its half index in f53, its
- *                 width in f60; no hints or modifiers)
- *   select true   f69 (GPR), f70 (uniform), f68 (immediate)  kind f76 width f77
- *   select false  f86 (GPR), f87 (uniform), f85 (immediate)  kind f93 width f94
- *   condition f110, scoreboard f107
- *
- * Absolute sources move the instruction to a longer endpoint exactly as they
- * do elsewhere in the family, so the endpoint range is scanned rather than
- * computed; the endpoints are mutually exclusive on their fixed bits.
- *
- * GPR alternatives carry cache/discard fields f78/f80 and f95/f97. Uniform
- * alternatives have no GPR lifetime hints.
+ * General four-operand `fcmpsel` (each operand carries an independent kind,
+ * width, and value; kind 1=imm, 2=GPR, 3=uniform). Absolute compare sources
+ * select a longer endpoint; GPR alternatives carry cache/discard hints
+ * (f78/f80, f95/f97) while uniform alternatives carry none.
  */
 enum agx3_fsel_kind {
    /* compare slots */
@@ -745,23 +694,10 @@ bool agx3_alu_asr_imm16_to32(enum agx_isa_encoding enc, uint16_t dest,
                             uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *length);
 
 /*
- * G17P register/immediate FSEL. Absolute compare modifiers are grounded for
- * f32 eq/lt/gt, plus GE/LE with exactly one absolute comparator, with f32
- * selected values.
- *
- * `compare_neg` carries a negate on EITHER comparator. f65 is the only negate
- * field the encoding has and it names the second comparator; every other
- * placement is rewritten inside this function rather than refused -- a negated
- * first comparator exchanges the operands and reverses the relation (Apple's
- * own canonicalisation, observed), negating both is the relation flip alone,
- * a negate against the exact immediate zero is a no-op because -0.0 and +0.0
- * compare equal, and a modifier on a minifloat comparator folds into the
- * constant's sign bit. abs and neg compose on the same instruction. The byte
- * ladder for all of it is in agx3_alu_core.c.
- *
- * This function absorbed agx3_alu_fcmp_select_reg_imm_neg(), which was a
- * second entry point for the f65 half of the same encoding; there is one
- * encoder now, not two.
+ * G17P register/immediate FSEL (abs compare modifiers supported for f32
+ * eq/lt/gt and single-abs ge/le with f32 selected values). Hardware only
+ * encodes negate on the second comparator (f65); other placements rewrite via
+ * operand swap, relation flip, or minifloat sign-bit folding.
  */
 bool agx3_alu_fcmp_select_reg_imm(enum agx_isa_encoding enc, uint16_t dest,
                                   const uint16_t src[4], bool compare_zero,
@@ -813,18 +749,8 @@ bool agx3_alu_fmax_half(enum agx_isa_encoding enc, uint16_t dest,
                         uint8_t *len);
 
 /*
- * 32-bit tied fmin/fmax -- the shape NIR produces for max(x, 0.0), and so for
- * normalize(), clamp(), saturate() and discard.  Apple encodes it as a compact
- * six-byte `fsel`, not as the general mixed-width select:
- *
- *   fmax(a, b)     f32   12 03 1e 05 00 c0   (fsel.ep7, register second operand)
- *   fmax(a, 0.0f)  f32   12 03 0a 81 00 c2   (fsel.ep2, minifloat second operand)
- *   fmin           f32   the same, condition 3 instead of 7
- *
- * both witnessed byte-exactly from `metal-nt -arch applegpu_g17p`.  The
- * immediate is an ordinary AGX minifloat, deposited twice because the compared
- * and selected operands are tied.  wait_mask carries at most one scoreboard
- * slot; a wider wait must be retired before the instruction.
+ * 32-bit tied fmin/fmax encoded as compact 6-byte `fsel` (ep7 register, ep2
+ * minifloat immediate deposited twice). `wait_mask` carries at most one slot.
  */
 bool agx3_alu_fmin_f32(enum agx_isa_encoding enc, uint16_t dest,
                        const uint16_t src[4],
@@ -859,18 +785,8 @@ bool agx3_alu_rcp(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                   uint8_t *len);
 
 /*
- * Full-precision reciprocal and reciprocal square root.
- *
- * These are the same two Apple forms the half encoders above use; f26 selects
- * the source width (1 = one 16-bit half, 2 = a 32-bit pair) and f10 selects
- * the destination's. Only the half widths were wired up, so every
- * fragment shader containing a float divide or a normalize() -- which NIR
- * lowers to frcp / frsq on 32-bit values -- was refused outright.
- *
- * Witnessed byte-exactly against applegpu_g17p:
- *   o[i] = 1.0f / a[i]    af 00 56 00 02 00 10 48 20 00
- *   o[i] = rsqrt(a[i])    af 01 56 00 02 00 b0 40 00 00
- * both with the loaded source dead (f29 = 1) and waiting the load's slot 6.
+ * 32-bit reciprocal and reciprocal square root (same forms as the 16-bit
+ * encoders with f10=2, f26=2).
  */
 bool agx3_alu_f32rcp(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                      enum agx3_alu_hint hint, bool dest_cache,
@@ -878,21 +794,8 @@ bool agx3_alu_f32rcp(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                      uint8_t *len);
 
 /*
- * Reciprocal square root carrying the source's ABS (f30) and NEG (f31)
- * modifiers, the same two bits f32log2/f32exp2/f32rcp already model on their
- * own forms. `inversesqrt(abs(x))` is the standard safe form of the idiom and
- * reached the packer as `rsqrt [s0=32:reg.abs]`, which had no encoding at all.
- *
- * Witnessed with `metal-nt -arch applegpu_g17p`, one kernel per modifier,
- * each a single-field difference from the plain control and every vector
- * recovered by re-composing through this encoder (tools/decomp.c):
- *
- *   o[i] = rsqrt(a[i])         af 01 56 00 02 00 b0 40 00 00
- *   o[i] = rsqrt(-a[i])        af 01 56 00 02 00 b0 40 01 00   f31
- *   o[i] = rsqrt(fabs(a[i]))   af 01 56 00 02 00 b0 c0 00 00   f30
- *   o[i] = rsqrt(-fabs(a[i]))  af 01 56 00 02 00 b0 c0 01 00   both
- *
- * The two are separable exactly as they are on exp2: `-fabs` sets both.
+ * 32-bit reciprocal square root with separable source ABS (f30) and NEG (f31)
+ * modifiers.
  */
 bool agx3_alu_f32rsqrt_mod(enum agx_isa_encoding enc, uint16_t dest,
                            uint16_t src, enum agx3_alu_hint hint,
@@ -915,23 +818,8 @@ bool agx3_alu_f32exp2_mod(enum agx_isa_encoding enc, uint16_t dest,
                           uint8_t *len);
 
 /*
- * Full-precision floor and ceiling. Apple names the instruction f32rint and
- * selects the rounding in f43; the width selectors f10 and f26 are 1 for a
- * scalar half and 2 for a 32-bit pair, the same relationship the 32-bit
- * logarithm has to the half one. Only the half widths were wired up, so
- * floor() on a float -- vkQuake's quantized lightmap coordinate -- refused
- * the shader.
- *
- * Witnessed byte-exactly against applegpu_g17p, one kernel per mode:
- *   o[i] = rint(a[i])    2f 00 56 00 02 00 b0 40 00 00   f43 absent
- *   o[i] = trunc(a[i])   2f 00 56 00 02 00 b0 40 06 00   f43 = 1
- *   o[i] = ceil(a[i])    2f 00 56 00 02 00 b0 40 04 00   f43 = 2
- *   o[i] = floor(a[i])   2f 00 56 00 02 00 b0 40 02 00   f43 = 3
- * and, for the lifetime and wait fields this form shares with the family,
- *   float x = a[i]; o[i] = floor(x) + x
- *                        2f 00 56 04 03 00 92 40 02 00   f27 retained, f11
- *   o[i] = floor(a[i]) * 4 + floor(b[i])
- *                        2f 10 54 04 03 08 b0 40 02 00   f35, wait slot 1
+ * 32-bit rounding (`f32rint`, f10=2, f26=2): f43 selects mode (absent=rint,
+ * 1=trunc, 2=ceil, 3=floor) with shared family lifetime and wait fields.
  */
 bool agx3_alu_f32floor(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                        enum agx3_alu_hint hint, bool dest_cache,
@@ -944,16 +832,9 @@ bool agx3_alu_f32ceil(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                       uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
 
 /*
- * Round-to-nearest-even is the same form with f43 absent, the first line of
- * the witness table above.
- *
- * The select core also encodes a 32-bit roundeven, through
- * agx3_pack_f32_rint_reg(), but that encoding point deposits its source in a
- * six-bit field and so refuses any source above r63. Register allocation puts
- * one there in any shader with real pressure, and the refusal is fatal: the
- * whole shader is rejected and pipeline creation fails. This form carries the
- * family's full eight-bit register fields, its source modifiers and its wait
- * slots, so it covers the register file.
+ * 32-bit round-to-nearest-even (`f32rint`, f43 absent) with full 8-bit
+ * register fields, source modifiers, and scoreboard waits (unlike the 6-bit
+ * source limit in `agx3_pack_f32_rint_reg`).
  */
 bool agx3_alu_f32roundeven(enum agx_isa_encoding enc, uint16_t dest,
                            uint16_t src, enum agx3_alu_hint hint,
@@ -1215,36 +1096,10 @@ bool agx3_alu_sqrt_step_mod(enum agx_isa_encoding enc, uint16_t dest,
                             uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
 
 /*
- * G17G 32-bit float compare-select, dest(32) = (cmp0 cond cmp1) ? sel0 : sel1.
- *
- * GPU1 splits the select by what it selects. Two registers are `fseli32`
- * (ep4, 14 bytes, opcode f77=76); a float constant on either side is
- * `fself32` (ep4, 16 bytes, opcode f85=74), whose selected immediates are
- * minifloats. The comparand is a 32-bit register or a minifloat immediate on
- * both. Every field below is pinned by an Apple applegpu_g17g kernel
- * (gpu/m5-xfb-alu7-, -alu8-, -alu10-, -alu11-reference.metal), reproduced
- * byte for byte in test-agx3-alu-core.c:
- *
- *   fseli32   select(w, v, a < -1.0f)     2200074a2300a00214ac8a602040
- *             a < 2.0f / a < 0.5f / a < 0.0f    f32 = 64 / 32 / 0
- *             a >= 1.0f  eq  gt  le          f86 = 5, 0, 2, 6 (agx_fcond)
- *             a != 1.0f  = eq with the two registers exchanged
- *             select(w, v, a < b)          2200074a2300a0029401a1602040
- *             a >= b / a == b              f33 register, f40 = 2
- *   fself32   select(v, 0.0f, a < -1.0f)   2200032a2300a00214ac4a200000c000
- *             select(v, 1.0f / 2.0f, ...)  f51 = 48 / 64
- *             select(1.0f, v, ...)         f68 = 48, register in f52
- *             a >= 1.0f  eq  gt  le  ne    f94 = 5, 0, 2, 6, and eq exchanged
- *             select(0.0f, v, a < b)       2200032a2300a0021402a1080000c000
- *             select(v, 0.0f, a < 0.0f)    f34 = 0
- *
- * Both selected operands as constants is not this instruction: Apple emits a
- * half result (`fself16`) and widens it, so that shape stays refused. The
- * comparand fields carry no abs/neg on GPU1 and only the slot-8 wait is
- * witnessed; the encoder writes the full eight-bit mask like every other
- * GPU1 form. f11 is the destination-cache hint (fragment-depth witnesses
- * 2200072a2b00a0021400a1602040 / 2200074a2b00a0021400a1600440 set it on a
- * result the next instruction reads).
+ * G17G 32-bit float compare-select: two registers encode as 14-byte `fseli32`
+ * (ep4, f77=76), and one register plus one minifloat encodes as 16-byte
+ * `fself32` (ep4, f85=74); two selected immediates are refused. Comparands
+ * carry no abs/neg; f11 is the destination-cache hint.
  */
 struct agx3_fsel32_gpu1_desc {
    uint16_t dest;
