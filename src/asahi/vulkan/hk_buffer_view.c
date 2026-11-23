@@ -41,7 +41,7 @@ hk_as_vtx_format_supported(const struct hk_physical_device *pdev,
    case VK_FORMAT_R64G64_SFLOAT:
    case VK_FORMAT_R64G64B64_SFLOAT:
    case VK_FORMAT_R64G64B64A64_SFLOAT:
-      return pdev->dev.chip == AGX_CHIP_G17P;
+      return agx_chip_native_hal200(pdev->dev.chip);
    default:
       return vk_acceleration_struct_vtx_format_supported(vk_format);
    }
@@ -79,7 +79,8 @@ hk_get_buffer_format_features(struct hk_physical_device *pdev,
 
       if (p_format == PIPE_FORMAT_R32_UINT || p_format == PIPE_FORMAT_R32_SINT ||
           (p_format == PIPE_FORMAT_R32_FLOAT &&
-           agx_chip_g17p_or_m5(pdev->dev.chip)))
+           (agx_chip_native_hal200(pdev->dev.chip) ||
+            agx_chip_g17_m5(pdev->dev.chip))))
          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
    }
 
