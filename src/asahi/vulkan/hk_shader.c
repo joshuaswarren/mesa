@@ -982,20 +982,10 @@ hk_hash_graphics_state(struct vk_physical_device *device,
       _mesa_blake3_update(&blake3_ctx, &is_multiview, sizeof(is_multiview));
    }
 
-   /* G17P removes user varyings from fragmentless pipelines, so the same
-    * pre-rasterization shader compiles differently for a library. */
-   if (agx_chip_native_agx3(((struct hk_physical_device *)device)->dev.chip) &&
-       !(stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
-      const bool no_fragment_shader = hk_pipeline_has_no_fragment_shader(state);
-      _mesa_blake3_update(&blake3_ctx, &no_fragment_shader,
-                          sizeof(no_fragment_shader));
-   }
-
-   /* M5 removes user varyings from the mesh shader of a fragmentless
-    * pipeline (hk_m5_prune_fragmentless_mesh_outputs), so that mesh shader
-    * compiles differently for a pre-rasterization library. */
-   if (agx_chip_g17_m5(((struct hk_physical_device *)device)->dev.chip) &&
-       (stages & VK_SHADER_STAGE_MESH_BIT_EXT) &&
+   /* AGX3 (native and M5) removes user varyings from fragmentless pipelines,
+    * so the same pre-rasterization shader compiles differently for a
+    * library. */
+   if (agx_chip_native_or_m5(((struct hk_physical_device *)device)->dev.chip) &&
        !(stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
       const bool no_fragment_shader = hk_pipeline_has_no_fragment_shader(state);
       _mesa_blake3_update(&blake3_ctx, &no_fragment_shader,
@@ -8474,14 +8464,14 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    /* A complete raster pipeline without a fragment shader cannot consume
     * user varyings.  Remove them before AGX assigns the unlinked UVS layout,
     * while preserving fixed-function outputs such as position and any XFB
-    * writes.  Besides avoiding pointless vertex work, this keeps the G17P
-    * backend on its native immediate-index UVSW form; the dynamic UVS index
-    * is only needed when a later fragment shader may still choose the
+    * writes.  Besides avoiding pointless vertex work, this keeps AGX3
+    * backends on their native immediate-index UVSW form; the dynamic UVS
+    * index is only needed when a later fragment shader may still choose the
     * interpolation-class ordering.
     *
     * Do not apply this to pipeline libraries: their pre-raster shader can be
     * linked with a fragment library later. */
-   if (agx_chip_native_agx3(dev->dev.chip) && shader_count > 0 &&
+   if (agx_chip_native_or_m5(dev->dev.chip) && shader_count > 0 &&
        hk_pipeline_has_no_fragment_shader(state)) {
       nir_shader *last = shaders[shader_count - 1];
       if (last->info.stage <= MESA_SHADER_GEOMETRY)
@@ -8541,7 +8531,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    /* Only a complete pipeline known to have no fragment shader can fix an
     * empty interpolation contract. A pre-raster library or shader object
     * must retain draw-time UVS indices for its eventual fragment consumer. */
-   if (agx_chip_native_agx3(dev->dev.chip) && shader_count > 0 &&
+   if (agx_chip_native_or_m5(dev->dev.chip) && shader_count > 0 &&
        hk_pipeline_has_no_fragment_shader(state)) {
       nir_shader *last = shaders[shader_count - 1];
       if (last->info.stage <= MESA_SHADER_GEOMETRY) {
