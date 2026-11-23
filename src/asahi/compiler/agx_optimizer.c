@@ -1729,13 +1729,12 @@ agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
    bool quad = I->op == AGX_OPCODE_QUAD_BALLOT;
    assert(quad || I->op == AGX_OPCODE_BALLOT);
 
-   /* G17P's half-width quad ballot compares a register against zero. AGX2
+   /* AGX3's half-width quad ballot compares a register against zero. AGX2
     * can fuse general integer/float comparisons, but those forms do not
     * encode an AGX3 half-width quad result. Keep the predicate calculation
     * for quad any/all and let lower_pseudo ballot its nonzero boolean.
     */
    if (quad && I->dest[0].size == AGX_SIZE_16 && ctx->key &&
-       ctx->key->dev.chip == AGX_CHIP_G17P &&
        ctx->key->dev.shader_quad_control &&
        (def->op != AGX_OPCODE_ICMP ||
         def->src[1].type != AGX_INDEX_IMMEDIATE || def->src[1].value != 0 ||
