@@ -677,7 +677,7 @@ hk_gen1_upload_as_table(struct hk_cmd_buffer *cmd)
 }
 
 static_assert(sizeof(struct hk_agx3_leaf_job) == 64, "native node job ABI");
-static_assert(sizeof(struct hk_agx3_leaf_args) == 32, "native node push ABI");
+static_assert(sizeof(struct hk_agx3_leaf_args) == 40, "native node push ABI");
 static_assert(sizeof(struct hk_agx3_envelope_job) == 48, "native envelope job ABI");
 static_assert(sizeof(struct hk_agx3_envelope_args) == 64, "native envelope push ABI");
 /* The GEN1 layout: the plan state, then the node encoding dispatch arguments
@@ -882,6 +882,7 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
    const struct hk_agx3_leaf_args encode = {
       .jobs = args->jobs, .status = node_status, .job_count = args->node_bound,
       .slot_bias = slot_bias, .counts = args->state,
+      .leaf_bound = args->leaf_bound,
    };
    const struct hk_agx3_envelope_args finish = {
       .jobs = args->envelope, .status = envelope_status, .job_count = 1,
@@ -892,9 +893,16 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
       .keep_retained = args->keep_retained,
       .refit = fused && instances ? 1u : 0u,
    };
+   /* Large TLAS builds still rely on the envelope pass to clear the instance
+    * pointer table before node encoding writes active entries. BLAS/AABB
+    * builds and fused small TLAS builds (whose planner already cleared the
+    * table) write disjoint regions and overlap envelope with node encoding. */
+   const bool need_step_barrier = instances && !fused;
    for (unsigned step = 0; step < 2; ++step) {
       bool envelope = instances ? step == 0 : step == 1;
       unsigned stage = envelope ? 2 : 1;
+      if (!envelope && fused && args->node_bound == 0)
+         continue;
       vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 pipeline[stage]);
       vk_common_CmdPushConstants(command_buffer, layout[stage],
@@ -910,10 +918,16 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                                               64, 65536)
                                       : 64,
                                    1, 1);
+      else if (fused)
+         hk_cmd_dispatch_unaligned(
+            command_buffer,
+            DIV_ROUND_UP(args->node_bound, HK_AGX3_NODE_JOBS_PER_GROUP) *
+               HK_AGX3_GEN1_NODE_GROUP_LANES,
+            1, 1);
       else
          hk_cmd_dispatch_indirect_addr(command_buffer,
                                        args->state + HK_AGX3_PLAN_ENCODE_DISPATCH);
-      if (step == 0)
+      if (step == 0 && need_step_barrier)
          vk_common_CmdPipelineBarrier(command_buffer,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,

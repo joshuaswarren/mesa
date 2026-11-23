@@ -305,9 +305,15 @@ struct hk_agx3_leaf_args {
     * reference (see libagx/gen1_as.h). Zero when output_bvh is the base.
     * M5 uses this ABI word for its diagnostic bounding-box record stride. */
    uint32_t slot_bias;
-   /* When nonzero, the number of jobs written by planning (its first word),
-    * which the indirect dispatch rounds up to whole workgroups. */
+   /* When nonzero, the plan state written by planning (job_count at 0,
+    * next_slot at 12), which indirect or over-provisioned direct dispatches
+    * clamp against and TLAS instance encoding uses for tail offsets. */
    VOID_REF counts;
+   /* When nonzero alongside counts, TLAS instance encoding derives transform
+    * and pointer table offsets from counts->next_slot and leaf_bound directly
+    * instead of reading them back from the envelope header. */
+   uint32_t leaf_bound;
+   uint32_t padding;
 };
 
 /* Node jobs per encoding workgroup, eight lanes each. */

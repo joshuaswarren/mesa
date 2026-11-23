@@ -214,6 +214,8 @@ main()
 #ifdef HK_AGX3_REFIT
    hk_agx3_refit_state refit = DEREF(REF(hk_agx3_refit_state)(args.refit));
    uint jobs = refit.job_count;
+   if (gl_WorkGroupID.x * JOBS >= jobs)
+      return;
    uint64_t records = refit.retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
    bool live = id < jobs;
    hk_agx3_leaf_job job;
@@ -241,6 +243,8 @@ main()
    uint jobs = args.job_count;
    if (args.counts != 0ul)
       jobs = min(jobs, DEREF(REF(uint32_t)(args.counts)));
+   if (gl_WorkGroupID.x * JOBS >= jobs)
+      return;
    bool live = id < jobs;
    hk_agx3_leaf_job job;
    uint count = 0;
@@ -467,9 +471,18 @@ main()
                       transforms + 64ul * uint64_t(args.leaf_bound));
    }
 #else
-   if (instances && lane < count)
-      encode_instance(job, lane, DEREF(REF(uint64_t)(job.output_bvh + 104ul)),
-                      DEREF(REF(uint64_t)(job.output_bvh + 128ul)));
+   if (instances && lane < count) {
+      uint64_t transforms, pointers;
+      if (args.counts != 0ul && args.leaf_bound != 0u) {
+         transforms =
+            uint64_t(DEREF(REF(hk_agx3_plan_state)(args.counts)).next_slot) * 64ul;
+         pointers = transforms + 64ul * uint64_t(args.leaf_bound);
+      } else {
+         transforms = DEREF(REF(uint64_t)(job.output_bvh + 104ul));
+         pointers = DEREF(REF(uint64_t)(job.output_bvh + 128ul));
+      }
+      encode_instance(job, lane, transforms, pointers);
+   }
 #endif
    if (leaf && lane < count) {
       /* The record: its header, the four x, y and z coordinates, then the

@@ -136,10 +136,9 @@ clear_instance_pointers(uint job_index, uint first, uint stride)
    uint64_t size = pointers + uint64_t(job.leaf_bound) * 16ul + 184ul;
    if (job.output_bvh >= (1ul << 48) || size > (1ul << 48) - job.output_bvh)
       return;
-   for (uint i = first; i < job.leaf_bound; i += stride) {
-      store64(job.output_bvh + pointers + uint64_t(i)*16ul, 0ul);
-      store64(job.output_bvh + pointers + uint64_t(i)*16ul + 8ul, 0ul);
-   }
+   for (uint i = first; i < job.leaf_bound; i += stride)
+      DEREF(REF(uvec4)(job.output_bvh + pointers + uint64_t(i) * 16ul)) =
+         uvec4(0u);
 }
 
 void
