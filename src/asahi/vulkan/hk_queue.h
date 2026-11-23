@@ -172,7 +172,9 @@ hk_queue_kernel_cumulative_supported(const struct agx_device *dev,
 }
 
 /* Whether a VkQueue should open sibling compute kernel queues to overlap
- * independent compute kicks within the same context. */
+ * independent compute kicks within the same context. Not where the kernel
+ * already spreads each queue's independent compute over several firmware
+ * queues (DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL): both would fan out. */
 static inline bool
 hk_queue_sibling_compute_supported(const struct agx_device *dev,
                                    bool exact_prior)
@@ -181,7 +183,8 @@ hk_queue_sibling_compute_supported(const struct agx_device *dev,
                              DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
    return !dev->is_virtio && exact_prior &&
           hk_queue_uses_cumulative_signals(dev) &&
-          (dev->params.features & required) == required;
+          (dev->params.features & required) == required &&
+          !(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL);
 }
 
 VkResult hk_queue_init(struct hk_device *dev,

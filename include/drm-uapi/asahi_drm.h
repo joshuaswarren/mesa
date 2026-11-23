@@ -471,6 +471,15 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE ((1ULL) << 40)
 
+/*
+ * DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL: the kernel itself runs the
+ * independent compute commands of one queue on several firmware compute
+ * queues of its context, so that they overlap. Userspace needs no further
+ * queues of its own for that. A feature bit like those of enum
+ * drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL ((1ULL) << 42)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR 3

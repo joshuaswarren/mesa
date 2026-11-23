@@ -85,6 +85,13 @@ main(void)
       assert(!hk_queue_sibling_compute_supported(&qdev, true));
       qdev.is_virtio = false;
 
+      /* A kernel that fans compute out itself gets no sibling queues. */
+      qdev.params.features =
+         sib_features | DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL;
+      assert(hk_queue_uses_cumulative_signals(&qdev));
+      assert(!hk_queue_sibling_compute_supported(&qdev, true));
+      qdev.params.features = sib_features;
+
       qdev.params.features = DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES |
                              DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
       assert(!hk_queue_kernel_cumulative_supported(&qdev, true, false, 1));
