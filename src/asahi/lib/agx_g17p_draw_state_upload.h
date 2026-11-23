@@ -29,8 +29,6 @@
 #define AGX_G17P_VARYING_RECORD_BYTES 20u
 #define AGX_G17P_VARYING_RECORD_OFFSET                                  \
    (AGX_G17P_BIND_GROUP_BYTES + AGX_G17P_VIEWPORT_RECORD_BYTES)
-#define AGX_G17P_BIND_STATE_BYTES                                        \
-   (AGX_G17P_VARYING_RECORD_OFFSET + AGX_G17P_VARYING_RECORD_BYTES)
 
 struct agx_g17p_bind_state_upload {
    struct agx_vdm_hal200_bind_pair pairs[AGX_VDM_HAL200_BIND_COUNT];

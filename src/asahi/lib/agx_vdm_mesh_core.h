@@ -11,9 +11,6 @@ extern "C" {
 #define AGX_VDM_MESH_STATE_LENGTH    56u
 #define AGX_VDM_MESH_DISPATCH_LENGTH 28u
 #define AGX_VDM_MESH_STATE_HEADER    UINT32_C(0x40000d2c)
-/* Index List block with the mesh bit; bits 8..15 are the Index List
- * "Primitive" field (cmdbuf.xml): native triangle mesh records carry 6. */
-#define AGX_VDM_MESH_DISPATCH_HEADER UINT32_C(0x70000600)
 #define AGX_VDM_MESH_DISPATCH_BASE   UINT32_C(0x70000000)
 /* Native G17S object->mesh child-grid record at +0 of the SR62/SR63 payload
  * address when the mesh shader reads gl_NumWorkGroups (payload follows at +16).

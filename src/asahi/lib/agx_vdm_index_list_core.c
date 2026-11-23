@@ -8,18 +8,6 @@
 
 #include <string.h>
 
-static bool
-agx_vdm_index_list_direct_is_hal300(enum agx_chip chip)
-{
-   return agx_vdm_index_list_direct_is_hal300_inline(chip);
-}
-
-static bool
-agx_vdm_index_list_primitive_supported(uint8_t primitive)
-{
-   return agx_vdm_index_list_direct_primitive_supported_inline(primitive);
-}
-
 /*
  * These helpers cover only the exact direct Index List records recovered from
  * Apple's G15, HAL200, and HAL300 VDM encoders.  HAL300 has header bit 27 set
@@ -35,11 +23,6 @@ agx_vdm_index_list_primitive_supported(uint8_t primitive)
  * This is a host representation/validation surface.  It does not emit into a
  * live VDM stream or enable scheduling, submission, or device admission.
  */
-static bool
-agx_vdm_index_list_direct_target_supported(enum agx_chip chip)
-{
-   return agx_vdm_index_list_direct_target_supported_inline(chip);
-}
 
 bool
 agx_vdm_index_list_direct_nonindexed_pack(
@@ -74,10 +57,10 @@ agx_vdm_index_list_direct_nonindexed_unpack(
    if (info)
       memset(info, 0, sizeof(*info));
 
-   if (!bytes || !info || !agx_vdm_index_list_direct_target_supported(chip))
+   if (!bytes || !info || !agx_vdm_index_list_direct_target_supported_inline(chip))
       return false;
 
-   const bool hal300 = agx_vdm_index_list_direct_is_hal300(chip);
+   const bool hal300 = agx_vdm_index_list_direct_is_hal300_inline(chip);
    const size_t expected_size = hal300 ? 20 : 16;
    if (size != expected_size)
       return false;
@@ -89,7 +72,7 @@ agx_vdm_index_list_direct_nonindexed_unpack(
    const uint8_t primitive = (uint8_t)(header >> 8);
 
    if ((header & UINT32_C(0xffff00ff)) != expected_header ||
-       !agx_vdm_index_list_primitive_supported(primitive) ||
+       !agx_vdm_index_list_direct_primitive_supported_inline(primitive) ||
        agx_load_le32(&raw[8]) == 0 ||
        (hal300 && agx_load_le32(&raw[16]) != UINT32_C(7)))
       return false;
@@ -134,10 +117,10 @@ agx_vdm_index_list_direct_indexed_unpack(
    if (info)
       memset(info, 0, sizeof(*info));
 
-   if (!bytes || !info || !agx_vdm_index_list_direct_target_supported(chip))
+   if (!bytes || !info || !agx_vdm_index_list_direct_target_supported_inline(chip))
       return false;
 
-   const bool hal300 = agx_vdm_index_list_direct_is_hal300(chip);
+   const bool hal300 = agx_vdm_index_list_direct_is_hal300_inline(chip);
    const size_t expected_size = hal300 ? 32 : 28;
    if (size != expected_size)
       return false;
@@ -155,7 +138,7 @@ agx_vdm_index_list_direct_indexed_unpack(
    const uint32_t high_word = agx_load_le32(&raw[high_offset]);
 
    if ((header & UINT32_C(0xfff00000)) != expected_fixed ||
-       !agx_vdm_index_list_primitive_supported(primitive) ||
+       !agx_vdm_index_list_direct_primitive_supported_inline(primitive) ||
        !agx_vdm_index_list_index_size_supported_inline(chip, index_size) ||
        agx_load_le32(&raw[12]) == 0 || high_word > 0xff ||
        (hal300 &&
@@ -208,10 +191,10 @@ agx_vdm_index_list_indirect_nonindexed_unpack(
    if (info)
       memset(info, 0, sizeof(*info));
 
-   if (!bytes || !info || !agx_vdm_index_list_direct_target_supported(chip))
+   if (!bytes || !info || !agx_vdm_index_list_direct_target_supported_inline(chip))
       return false;
 
-   const bool hal300 = agx_vdm_index_list_direct_is_hal300(chip);
+   const bool hal300 = agx_vdm_index_list_direct_is_hal300_inline(chip);
    const size_t expected_size = hal300 ? 16 : 12;
    if (size != expected_size)
       return false;
@@ -225,7 +208,7 @@ agx_vdm_index_list_indirect_nonindexed_unpack(
    const uint32_t addr_lo = agx_load_le32(&raw[8]);
 
    if ((header & UINT32_C(0xffff00ff)) != expected_header ||
-       !agx_vdm_index_list_primitive_supported(primitive) ||
+       !agx_vdm_index_list_direct_primitive_supported_inline(primitive) ||
        addr_hi > 0xffff || (addr_lo & 3u) != 0 ||
        (hal300 &&
         agx_load_le32(&raw[12]) != UINT32_C(7)))
@@ -270,10 +253,10 @@ agx_vdm_index_list_indirect_indexed_unpack(
    if (info)
       memset(info, 0, sizeof(*info));
 
-   if (!bytes || !info || !agx_vdm_index_list_direct_target_supported(chip))
+   if (!bytes || !info || !agx_vdm_index_list_direct_target_supported_inline(chip))
       return false;
 
-   const bool hal300 = agx_vdm_index_list_direct_is_hal300(chip);
+   const bool hal300 = agx_vdm_index_list_direct_is_hal300_inline(chip);
    const size_t expected_size = hal300 ? 36 : 32;
    if (size != expected_size)
       return false;
@@ -289,7 +272,7 @@ agx_vdm_index_list_indirect_indexed_unpack(
       (enum agx_vdm_index_list_index_size)((header >> 17) & 0x7);
    const bool restart_enable = (header & (UINT32_C(1) << 16)) != 0;
 
-   if (!agx_vdm_index_list_primitive_supported(primitive) ||
+   if (!agx_vdm_index_list_direct_primitive_supported_inline(primitive) ||
        !agx_vdm_index_list_index_size_supported_inline(chip, index_size))
       return false;
 
