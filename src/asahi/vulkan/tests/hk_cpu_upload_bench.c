@@ -13,6 +13,8 @@
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
+#include "vk_instance.h"
+#include "vk_physical_device.h"
 #include "vk_pipeline_layout.h"
 
 #define CHECK(c) do { if (!(c)) { \
@@ -291,30 +293,75 @@ reuse_correctness(struct fixture *f)
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) != root);
    f->fs_api->variants[0].info.agx3_combined_sampler_valid = false;
 
-   hk_cmd_upload_draw_params(cmd, 7, 3);
-   const uint64_t params = cmd->state.gfx.draw_params;
-   hk_cmd_upload_draw_params(cmd, 7, 3);
-   CHECK(cmd->state.gfx.draw_params == params);
-   hk_cmd_upload_draw_params(cmd, 7, 4);
-   CHECK(cmd->state.gfx.draw_params != params);
-   hk_cmd_upload_draw_id(cmd, 1234);
-   const uint64_t id = cmd->state.gfx.draw_id_ptr;
-   hk_cmd_upload_draw_id(cmd, 1234);
-   CHECK(cmd->state.gfx.draw_id_ptr == id);
+   const enum agx_chip upload_reuse_chips[] = {
+      AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S,
+      AGX_CHIP_G17C,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(upload_reuse_chips); ++i) {
+      f->dev.dev.chip = upload_reuse_chips[i];
+      reset(f);
+      hk_cmd_upload_draw_params(cmd, 7, 3);
+      const uint64_t params = cmd->state.gfx.draw_params;
+      CHECK(params != 0);
+      hk_cmd_upload_draw_params(cmd, 7, 3);
+      CHECK(cmd->state.gfx.draw_params == params);
+      CHECK(cmd->state.upload_stats.draw_param_uploads == 1);
+      CHECK(cmd->state.upload_stats.draw_param_reuses == 1);
+      /* Indirect draw invalidation forces a fresh direct upload. */
+      cmd->state.gfx.g17p_draw_params_host_valid = false;
+      hk_cmd_upload_draw_params(cmd, 7, 3);
+      CHECK(cmd->state.gfx.draw_params != params);
+      const uint64_t params2 = cmd->state.gfx.draw_params;
+      hk_cmd_upload_draw_params(cmd, 7, 4);
+      CHECK(cmd->state.gfx.draw_params != params2);
 
-   const uint64_t data = hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX);
-   CHECK(hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX) == data);
-   CHECK(hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_COMPUTE) != data);
-   /* A new shader may occupy the same malloc address. Its unique payload ID
-    * must force a new immutable upload without changing the earlier bytes. */
-   const uint8_t *old = (uint8_t *)f->main_map + data - 0x100000;
-   CHECK(old[0] == 0);
-   f->constants[0] = 99;
-   f->vs.constant_data_id = 3;
-   CHECK(hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX) != data);
-   CHECK(old[0] == 0);
-   f->constants[0] = 0;
-   f->vs.constant_data_id = 1;
+      hk_cmd_upload_draw_id(cmd, 1234);
+      const uint64_t id = cmd->state.gfx.draw_id_ptr;
+      CHECK(id != 0);
+      hk_cmd_upload_draw_id(cmd, 1234);
+      CHECK(cmd->state.gfx.draw_id_ptr == id);
+      CHECK(cmd->state.upload_stats.draw_id_uploads == 1);
+      CHECK(cmd->state.upload_stats.draw_id_reuses == 1);
+      hk_cmd_upload_draw_id(cmd, 1235);
+      CHECK(cmd->state.gfx.draw_id_ptr != id);
+
+      const uint64_t data = hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX);
+      CHECK(data != 0);
+      CHECK(hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX) == data);
+      CHECK(hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_COMPUTE) != data);
+      CHECK(cmd->state.upload_stats.constant_uploads == 2);
+      CHECK(cmd->state.upload_stats.constant_reuses == 1);
+      /* A new shader may occupy the same malloc address. Its unique payload ID
+       * must force a new immutable upload without changing the earlier bytes. */
+      const uint8_t *old = (uint8_t *)f->main_map + data - 0x100000;
+      CHECK(old[0] == 0);
+      f->constants[0] = 99;
+      f->vs.constant_data_id = 3;
+      CHECK(hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX) != data);
+      CHECK(old[0] == 0);
+      f->constants[0] = 0;
+      f->vs.constant_data_id = 1;
+   }
+
+   /* Non-AGX3 chips (G13G, G14G) do not use the native upload reuse caches. */
+   const enum agx_chip non_reuse_chips[] = {AGX_CHIP_G13G, AGX_CHIP_G14G};
+   for (unsigned i = 0; i < ARRAY_SIZE(non_reuse_chips); ++i) {
+      f->dev.dev.chip = non_reuse_chips[i];
+      reset(f);
+      hk_cmd_upload_draw_params(cmd, 7, 3);
+      const uint64_t prev_params = cmd->state.gfx.draw_params;
+      hk_cmd_upload_draw_params(cmd, 7, 3);
+      CHECK(cmd->state.gfx.draw_params != prev_params);
+      hk_cmd_upload_draw_id(cmd, 1234);
+      const uint64_t prev_id = cmd->state.gfx.draw_id_ptr;
+      hk_cmd_upload_draw_id(cmd, 1234);
+      CHECK(cmd->state.gfx.draw_id_ptr != prev_id);
+      const uint64_t prev_data =
+         hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX);
+      CHECK(hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX) !=
+            prev_data);
+   }
+   f->dev.dev.chip = AGX_CHIP_G17P;
 
    reset(f);
    CHECK(cmd->state.gfx.descriptors.uploaded_root.gpu == 0);
@@ -401,6 +448,229 @@ run(struct fixture *f, const char *name, unsigned change_every, unsigned batches
           sizeof(struct hk_root_descriptor_table));
 }
 
+static void
+graphics_launch_replay_correctness(struct fixture *f)
+{
+   struct hk_cmd_buffer *cmd = &f->cmd;
+   const uint64_t shader_base = UINT64_C(0x1000000000);
+   const size_t ioto_capacity = 64 * 1024;
+   uint8_t *ioto_map = calloc(1, ioto_capacity);
+   struct hk_api_shader *mesh_api =
+      calloc(1, hk_api_shader_size(MESA_SHADER_MESH, false));
+   CHECK(ioto_map && mesh_api);
+   mesh_api->vk.stage = MESA_SHADER_MESH;
+   mesh_api->variants[HK_MESH_VARIANT_MAIN].compiled = true;
+   mesh_api->variants[HK_MESH_VARIANT_MAIN].info.stage = MESA_SHADER_MESH;
+
+   struct agx_va arena_va = {.addr = shader_base + 0x20000, .size_B = ioto_capacity};
+   struct agx_bo arena_bo = {
+      .dev = &f->dev.dev,
+      .va = &arena_va,
+      .size = ioto_capacity,
+      .refcnt = 1,
+   };
+   struct agx_va shader_va = {.addr = shader_base + 0x40000, .size_B = 4096};
+   struct agx_bo shader_bo = {
+      .dev = &f->dev.dev,
+      .va = &shader_va,
+      .size = 4096,
+      .refcnt = 1,
+   };
+
+   struct hk_shader *hw_vs = &f->vs_api->variants[HK_VS_VARIANT_HW];
+   struct hk_shader *hw_fs = &f->fs_api->variants[0];
+   const struct hk_shader saved_vs = *hw_vs;
+   const struct hk_shader saved_fs = *hw_fs;
+
+   hw_vs->info.stage = MESA_SHADER_VERTEX;
+   hw_vs->b.info.stage = MESA_SHADER_VERTEX;
+   hw_vs->info.agx3_uses_root = true;
+   hw_vs->info.agx3_root_uniform = 8;
+   hw_vs->info.set_count = 1;
+   hw_vs->agx3_vdm_state_update.source_layout =
+      AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_AGX3_VERTEX_PROGRAM_VARIANT;
+
+   hw_fs->info.stage = MESA_SHADER_FRAGMENT;
+   hw_fs->b.info.stage = MESA_SHADER_FRAGMENT;
+   hw_fs->info.agx3_uses_root = true;
+   hw_fs->info.agx3_root_uniform = 8;
+   hw_fs->info.set_count = 1;
+
+   struct hk_linked_shader linked_vs = {0};
+   linked_vs.b.bo = &shader_bo;
+   linked_vs.b.entry_offset = 0x80;
+   linked_vs.b.size = 256;
+   linked_vs.b.nr_gprs = 16;
+   linked_vs.b.g17p_compiler_d_valid = true;
+   linked_vs.b.g17p_compiler_d = 16;
+
+   struct hk_linked_shader linked_fs = {0};
+   linked_fs.b.bo = &shader_bo;
+   linked_fs.b.entry_offset = 0x280;
+   linked_fs.b.size = 256;
+   linked_fs.b.nr_gprs = 16;
+   linked_fs.b.g17p_compiler_d_valid = true;
+   linked_fs.b.g17p_compiler_d = 16;
+   linked_fs.b.g17p_colour_classes = 1;
+
+   struct vk_instance inst = {0};
+   list_inithead(&inst.debug_utils.callbacks);
+   list_inithead(&inst.debug_utils.instance_callbacks);
+   mtx_init(&inst.debug_utils.callbacks_mutex, mtx_plain);
+   struct vk_physical_device phys = {.instance = &inst};
+   f->dev.vk.physical = &phys;
+   f->dev.dev.shader_base = shader_base;
+   util_dynarray_init(&cmd->large_bos, NULL);
+
+   const enum agx_chip chips[] = {
+      AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S,
+      AGX_CHIP_G17C,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(chips); ++i) {
+      f->dev.dev.chip = chips[i];
+      reset(f);
+      cmd->vk.record_result = VK_SUCCESS;
+      cmd->ioto = (struct hk_ioto_arena){
+         .bo = &arena_bo,
+         .map = ioto_map,
+         .base = arena_va.addr,
+         .capacity = ioto_capacity,
+      };
+      cmd->state.gfx.root = 0x800000;
+      cmd->state.gfx.render.g17p_rt0_layout_supported = true;
+      cmd->state.gfx.render.tilebuffer = (struct agx_tilebuffer_layout){
+         .tile_size = 32 * 32,
+         .sample_size_B = 8,
+         .nr_samples = 1,
+         .max_sample_size_B = 64,
+         .max_samples_per_tile = 2048,
+         .max_bytes_per_tile = 32768,
+      };
+
+      /* VS: identical draw params keep loader_program stable across draws
+       * with zero new Ioto emissions; changing draw params replays via the
+       * recorded launch and cached loader without creating a second loader
+       * (root at 0x800000 and draw_params at 0x100000 have separate bases). */
+      hk_cmd_upload_draw_params(cmd, 7, 3);
+      const uint64_t vs_prog1 = hk_upload_usc_words(cmd, hw_vs, &linked_vs);
+      CHECK(vs_prog1 != 0 && cmd->vk.record_result == VK_SUCCESS);
+      CHECK(cmd->ioto.programs == 1);
+      CHECK(cmd->state.gfx.g17p_ioto[0].admit.s == hw_vs);
+      CHECK(cmd->state.gfx.g17p_ioto[0].admit.linked == &linked_vs);
+      const struct hk_g17p_gfx_loader *vs_loader =
+         cmd->state.gfx.g17p_ioto[0].loader;
+      CHECK(vs_loader != NULL);
+
+      hk_cmd_upload_draw_params(cmd, 7, 3);
+      const uint64_t vs_prog2 = hk_upload_usc_words(cmd, hw_vs, &linked_vs);
+      CHECK(vs_prog2 == vs_prog1);
+      CHECK(cmd->ioto.programs == 1);
+
+      hk_cmd_upload_draw_params(cmd, 9, 4);
+      const uint64_t vs_prog3 = hk_upload_usc_words(cmd, hw_vs, &linked_vs);
+      CHECK(vs_prog3 != 0 && vs_prog3 != vs_prog1);
+      CHECK(cmd->ioto.programs == 2);
+      CHECK(cmd->state.gfx.g17p_ioto[0].loader == vs_loader);
+
+      /* Adding identical draw ID reuses draw_id_ptr and keeps loader_program
+       * stable across consecutive draws. */
+      hk_cmd_upload_draw_id(cmd, 5);
+      const uint64_t vs_id1 = hk_upload_usc_words(cmd, hw_vs, &linked_vs);
+      CHECK(vs_id1 != 0 && cmd->ioto.programs == 3);
+      hk_cmd_upload_draw_id(cmd, 5);
+      const uint64_t vs_id2 = hk_upload_usc_words(cmd, hw_vs, &linked_vs);
+      CHECK(vs_id2 == vs_id1 && cmd->ioto.programs == 3);
+
+      /* Evicting the launch slot still hits cached->admit on every chip. */
+      const struct hk_g17p_gfx_loader *vs_id_loader =
+         cmd->state.gfx.g17p_ioto[0].loader;
+      for (unsigned s = 0; s < HK_G17P_LAUNCH_SLOTS; ++s)
+         cmd->state.gfx.g17p_launch[0][s].valid = false;
+      const uint64_t vs_prog4 = hk_upload_usc_words(cmd, hw_vs, &linked_vs);
+      CHECK(vs_prog4 == vs_id1);
+      CHECK(cmd->ioto.programs == 3);
+      CHECK(cmd->state.gfx.g17p_ioto[0].loader == vs_id_loader);
+
+      /* FS with mesh shader bound (no vertex shader): populates launch->hw_vs
+       * and cached->admit.hw_vs and replays cleanly. */
+      cmd->state.gfx.shaders[MESA_SHADER_VERTEX] = NULL;
+      cmd->state.gfx.shaders[MESA_SHADER_MESH] = mesh_api;
+      const uint64_t fs_mesh1 = hk_upload_usc_words(cmd, hw_fs, &linked_fs);
+      CHECK(fs_mesh1 != 0 && cmd->vk.record_result == VK_SUCCESS);
+      CHECK(cmd->state.gfx.g17p_ioto[1].admit.hw_vs ==
+            &mesh_api->variants[HK_MESH_VARIANT_MAIN]);
+      const uint32_t progs_after_mesh1 = cmd->ioto.programs;
+      const uint64_t fs_mesh2 = hk_upload_usc_words(cmd, hw_fs, &linked_fs);
+      CHECK(fs_mesh2 == fs_mesh1);
+      CHECK(cmd->ioto.programs == progs_after_mesh1);
+
+      /* M5 MSAA/MRT layout where g17p_rt0_layout_supported is false: M5 admits,
+       * caches admission, and hits launch replay; HAL200 stays refused. */
+      reset(f);
+      cmd->vk.record_result = VK_SUCCESS;
+      cmd->ioto = (struct hk_ioto_arena){
+         .bo = &arena_bo,
+         .map = ioto_map,
+         .base = arena_va.addr,
+         .capacity = ioto_capacity,
+      };
+      cmd->state.gfx.root = 0x800000;
+      cmd->state.gfx.render.g17p_rt0_layout_supported = false;
+      cmd->state.gfx.render.tilebuffer = (struct agx_tilebuffer_layout){
+         .tile_size = 32 * 16,
+         .sample_size_B = 16,
+         .nr_samples = 4,
+         .max_sample_size_B = 64,
+         .max_samples_per_tile = 2048,
+         .max_bytes_per_tile = 32768,
+      };
+      const uint64_t msaa1 = hk_upload_usc_words(cmd, hw_fs, &linked_fs);
+      if (agx_chip_g17_m5(chips[i])) {
+         CHECK(msaa1 != 0 && cmd->vk.record_result == VK_SUCCESS);
+         CHECK(cmd->ioto.programs == 1);
+         CHECK(cmd->state.gfx.g17p_ioto[1].admit.s == hw_fs);
+         const struct hk_g17p_gfx_loader *msaa_loader =
+            cmd->state.gfx.g17p_ioto[1].loader;
+         CHECK(msaa_loader != NULL);
+         const uint64_t msaa2 = hk_upload_usc_words(cmd, hw_fs, &linked_fs);
+         CHECK(msaa2 == msaa1);
+         CHECK(cmd->ioto.programs == 1);
+         /* Moving the fragment root replays via the recorded launch + loader. */
+         cmd->state.gfx.root = 0x801000;
+         cmd->state.gfx.fs_root = 0;
+         const uint64_t msaa3 = hk_upload_usc_words(cmd, hw_fs, &linked_fs);
+         CHECK(msaa3 != 0 && msaa3 != msaa1);
+         CHECK(cmd->ioto.programs == 2);
+         CHECK(cmd->state.gfx.g17p_ioto[1].loader == msaa_loader);
+      } else {
+         CHECK(msaa1 == 0);
+         CHECK(cmd->vk.record_result == VK_ERROR_FEATURE_NOT_PRESENT);
+      }
+
+      hk_g17p_linked_graphics_cache_finish(&f->dev, &linked_vs);
+      hk_g17p_linked_graphics_cache_finish(&f->dev, &linked_fs);
+   }
+
+   /* Restore fixture state cleanly without invoking DRM BO free on stack BOs. */
+   util_dynarray_fini(&cmd->large_bos);
+   free(cmd->retained_set);
+   cmd->retained_set = NULL;
+   cmd->retained_set_capacity = 0;
+   cmd->retained_set_count = 0;
+   memset(cmd->recent_retained_bos, 0, sizeof(cmd->recent_retained_bos));
+   memset(&cmd->ioto, 0, sizeof(cmd->ioto));
+   *hw_vs = saved_vs;
+   *hw_fs = saved_fs;
+   f->dev.dev.chip = AGX_CHIP_G17P;
+   f->dev.dev.shader_base = 0;
+   f->dev.vk.physical = NULL;
+   mtx_destroy(&inst.debug_utils.callbacks_mutex);
+   cmd->vk.record_result = VK_SUCCESS;
+   free(mesh_api);
+   free(ioto_map);
+   reset(f);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -409,6 +679,7 @@ main(int argc, char **argv)
    struct fixture *f = fixture();
    correctness(f);
    reuse_correctness(f);
+   graphics_launch_replay_correctness(f);
    run(f, "identical", 16, batches);
    run(f, "change_every_4", 4, batches);
    run(f, "change_every_draw", 1, batches);
