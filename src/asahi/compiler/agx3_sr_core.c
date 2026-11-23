@@ -10,52 +10,18 @@
 #define KV(f, v) {(uint16_t)(f), (uint64_t)(v)}
 
 /*
- * Witnessed (SR number, width) pairs: one Apple-compiled kernel per MSL
- * builtin, identical numbers on agx3b and
- * agx3c. 16-bit: 6 simdgroup_index_in_threadgroup, 7 thread_index_in_simdgroup,
- * 9/10/11 thread_position_in_threadgroup.xyz, 13 thread_index_in_threadgroup,
- * 17/18/19 threads_per_threadgroup.xyz, 20/21/22
- * dispatch_threads_per_threadgroup.xyz, 34 active thread index in the
- * subgroup, 36 (witnessed in Apple device-atomic kernels, attribution
- * UNKNOWN). 32-bit: 23/24/25 thread_position_in_grid.xyz,
- * 26/27/28 threadgroup_position_in_grid.xyz.
- *
- * Two 32-bit numbers are hardware-vertex invocation inputs. The composer's
- * anonymous f21 values 51 and 46 encode hardware SR bytes 0xdd vertex ID and
- * 0xd8 instance ID respectively. They are isolated by otherwise identical
- * G17P vertex shaders and compile to `0cdd1006` / `0cd81006` for destination
- * r0.
- *
- * Three more feed the post-tessellation vertex program of a Metal
- * tessellation pipeline, between those two: 47 (byte 0xd9) is [[patch_id]],
- * and 48 and 49 (0xda, 0xdb) are the two [[position_in_patch]] coordinates as
- * 32-bit floats, for triangle and quad patches alike (a triangle's third
- * barycentric is computed as 1 - u - v). metal-nt -arch applegpu_g17p reads
- * them as `0cd91006`, `2cda1046` and `1cdb1066`.
- *
- * Three more 16-bit numbers are fragment-only (`metal-nt -arch
- * applegpu_g17p`):
- *
- *  - 39 is the *incoming* coverage word. PROVEN: a fragment shader that reads
- *    `uint m [[sample_mask]]` compiles to exactly `rld h0 <- SR 39 (W16)`,
- *    `h0 >>= 4`, `int2flt`, so the incoming mask sits in bits 4..7.
- *  - 2 is read by every 1x fragment shader that writes a sample mask or a
- *    depth and by no colour-only shader; its value is combined into the staged
- *    coverage word as N | (T << 4) | (T << 8). Reproducing Apple's own
- *    kill-all constant from that formula requires T = 0xF0, i.e. a four-bit
- *    mask in bits 4..7 exactly like SR 39. Presence and use are PROVEN;
- *    "the per-invocation target-sample mask" is INFERRED from that arithmetic.
- *  - 41 is the back-facing predicate. A `[[front_facing]] ? 17 : 3` fragment
- *    reads SR41 and selects 17 when that value equals zero, directly pinning
- *    both the register identity and its polarity.
- *
- * SR 34 is the active thread index in the subgroup. Apple's G17P compiler reads
- * it for simd_is_first() in compute, vertex and fragment shaders as
- * `rld SR34 == 0`, and compiles simd_broadcast_first(x) to
- * `simdiballot(SR34 == 0)`, find-first-set, `simdbcast`. A fragment read
- * whose result only reaches the colour output also sets f48; the same read
- * feeding a derivative or a quad reduction, or inside a helper-invocation
- * guard, leaves it clear (agx3_sr_desc::fragment_active_index).
+ * Supported AGX3B/AGX3C (SR, width) pairs:
+ *  - 16-bit compute/subgroup: 6 simdgroup_in_tg, 7 lane_in_simd,
+ *    9..11 thread_in_tg.xyz, 13 linear_thread_in_tg, 17..19 threads_per_tg.xyz,
+ *    20..22 dispatch_threads_per_tg.xyz, 34 active_thread_index (fragment
+ *    colour-only reads also set f48 via fragment_active_index), 36 (seen in
+ *    device-atomic kernels; attribution unknown).
+ *  - 16-bit fragment: 2 target-sample mask (inferred from 1x coverage-word
+ *    arithmetic), 39 incoming coverage (bits 4..7), 41 back-facing predicate
+ *    (0 = front-facing).
+ *  - 32-bit compute/vertex/tess: 23..25 thread_in_grid.xyz, 26..28 tg_in_grid.xyz,
+ *    46 instance_id (0xd8), 47 patch_id (0xd9), 48..49 tess_coord.uv (0xda/0xdb),
+ *    51 vertex_id (0xdd).
  */
 static bool
 agx3_sr_witnessed(enum agx_isa_encoding enc, uint8_t sr, enum agx3_sr_width width)

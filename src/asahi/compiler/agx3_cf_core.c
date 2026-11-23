@@ -116,31 +116,8 @@ agx3_cf_icmp_width_m5(enum agx3_cf_icond cond, unsigned slot,
 }
 
 /*
- * The source fields of every comparison form are HALF-register indices with
- * eight bits, so halves 0..255 -- all 128 architectural 32-bit registers --
- * are addressable.  These entry points used to stop at half 128, which cut
- * the usable 32-bit register file in half for any shader that branches, and
- * nothing about the encoding asked for that.
- *
- * Apple's own applegpu_g17p output, from kernels with ninety simultaneously
- * live loaded values, compares high halves in every shape:
- *
- *   if (x88 >  x89)          0a9722950485                    icmp ep0  f2=150 f17=148
- *   if (x88 <  17u)          0a9922901583                    icmp ep0  f2=152 f16=17
- *   if (x88 != 0u)           0a992380060007830000            icmp ep1  f2=152
- *   if (fx88 <  fx89)        0a9722950385                    fcmp ep0  f2=150 f19=148
- *   if (fx88 < -fx89)        0a972295038d                    fcmp ep0  f32=1 (negate)
- *   if (|fx88| < |fx89|)     0a97239503000305000000200300    fcmp ep2  f14=1 f31=1
- *   if (fx88 == fx89)        0a972395060000850000            fcmp ep1
- *   if (fx88 <  0.0f)        0a9922810383                    fcmp ep0  f2=152
- *   if (fx88 <  1.0f)        0a9922b10383                    fcmp ep0  f18=48
- *
- * and the surrounding loads and multiply-adds in the same kernel write the
- * same field just as high (`lddev` f2=178, `imadd` f2=182), so the index is
- * plainly a half number and not a narrower operand class.  The generated
- * composer -- which comes from the encoder tables -- accepts f2/f17/f19
- * up to 255 and refuses 256, and every value round-trips back through the
- * structural decomposer unchanged.
+ * Comparison source fields are 8-bit half-register indices covering halves
+ * 0..255 (all 128 32-bit architectural registers).
  */
 bool
 agx3_cf_icmp_reg(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
@@ -475,28 +452,8 @@ agx3_cf_fcmp_reg16(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
 }
 
 /*
- * The same register comparison with an ABSOLUTE VALUE on either source.
- *
- * As on `fsel`, ABS is not a bit on the six-byte form: Apple moves to a
- * longer encoding point. Six bytes become fourteen, ep0 becomes ep2, and f14
- * and f31 are the two sources' bits. Grounded with metal-nt -arch
- * applegpu_g17p, one kernel per field. The branch body is a device atomic so
- * that Metal cannot if-convert the compare into an `fsel` and answer a
- * different question:
- *
- *   if (a < b)                  0a013a0303c0                    ep0,  6 B
- *   if (fabs(a) < b)            0a013b0303000300000000800100    ep2, 14 B  f14
- *   if (a < fabs(b))            0a013b0303000300000000800200    ep2, 14 B  f31
- *   if (fabs(a) < fabs(b))      0a013b0303000300000000800300    ep2, 14 B  both
- *   if (fabs(a) > fabs(b))      0a013b0303000200000000800300    f46 = 2
- *   if (fabs(a) == fabs(b))     0a013b0307000000000000800300    f46 absent
- *
- * Every other field keeps its number, so the long form differs from the short
- * one by the endpoint and the two bits alone. Qt Quick's conicalgradient.frag
- * branches on `abs(coord.y) == abs(coord.x)` and failed closed on this.
- *
- * f38..f43 are the six producer wait slots on this form; Apple's kernels
- * above wait on slot 6 because their operands come from a load.
+ * Register float comparison with source ABS modifiers uses the 14-byte ep2
+ * form (f14/f31 for src0/src1 abs, f38..f43 for the six wait slots).
  */
 bool
 agx3_cf_fcmp_width_m5(enum agx3_cf_fcond cond, bool or_nan, unsigned slot,
@@ -722,18 +679,8 @@ agx3_cf_patch_branch(enum agx_isa_encoding enc, bool is_bn, uint8_t *branch,
 }
 
 /*
- * G17G (AGX3c) spells the same compare with its selector constants f36/f37
- * and eight wait slots (f38..f45). Apple's applegpu_g17g branches in
- * test/native/g17g/m5-compare-select-reference.metal, each a register that is
- * not read again (f13), slot 0, chosen smallest first as Apple does:
- *
- *   if (x <  0.5f)    0a012aa10302             f18 = 32, f46 = 1
- *   if (x >  1.0f)    0a012ab10202             f18 = 48, f46 = 2
- *   if (x < -1.0f)    0a013ab10302             f18 = 176
- *   half x < 1.0h     0a002ab10302             f10 = 1
- *   if (x >= 0.0f)    1a012b81060002020000     lt, unordered: f34, f46 = 5
- *   if (x <= 2.0f)    1a012bc1060003020000     gt, unordered: f46 = 6
- *   if (x == 0.0f)    0a012b81060000020000     f46 = 0
+ * AGX3C float-vs-minifloat compare: uses selector constants f36/f37, eight
+ * wait slots (f38..f45), and 10-byte ep1 for ==/ge/le/unordered conditions.
  */
 bool agx3_cf_fcmp_zero_imm(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
                         bool or_nan, unsigned slot, uint16_t source, bool source_16,
@@ -758,26 +705,8 @@ bool agx3_cf_fcmp_zero_imm(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
 }
 
 /*
- * The same encoding point comparing against a NON-ZERO constant.
- *
- * f18 is the second operand and it was pinned to zero, so `if (x < 1.0)` --
- * ordinary GLSL, and what dEQP's workgroup-memory tests branch on -- had no
- * encoding. This is the same defect the integer side already carried and
- * fixed: agx3_cf_icmp_zero16_runtime() never set f16, which is what made it a
- * zero compare.
- *
- * Apple's bytes, one kernel per variable, the branch body made a loop so it
- * cannot be if-converted into a select (a trivial `if`/`else` compiles to
- * fsel and emits no fcmp at all, which is why this needs a real branch):
- *
- *   if (v < 0.0f)   0a 03 2a 81 03 c2      f18 absent
- *   if (v < 0.5f)   0a 03 2a a1 03 c2      f18 = 32
- *   if (v < 1.0f)   0a 03 2a b1 03 c2      f18 = 48
- *   if (v < 2.0f)   0a 03 2a c1 03 c2      f18 = 64
- *   if (v > 1.0f)   0a 03 2a b1 02 c2      f18 = 48, relation in f46
- *   half v < 1.0h   0a 02 2a b1 03 c2      f18 = 48, f10 = 1
- *
- * so the constant is the ordinary minifloat this ISA uses everywhere else.
+ * Float comparison against an 8-bit AGX minifloat immediate in f18 (omitted
+ * when 0.0).
  */
 bool agx3_cf_fcmp_zero(enum agx_isa_encoding enc, enum agx3_cf_fcond cond,
                        bool or_nan, unsigned slot, uint16_t source,
