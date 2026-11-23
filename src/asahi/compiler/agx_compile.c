@@ -14929,6 +14929,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
     * redundant sign fixups. Other integer division waits for the shader key
     * (agx_nir_lower_integer_division), which decides whether a preamble forms.
     */
+   NIR_PASS(_, nir, agx_nir_opt_iv_divmod);
    NIR_PASS(_, nir, agx_nir_opt_nonneg_idiv);
    NIR_PASS(_, nir, nir_opt_idiv_const, 16);
 
