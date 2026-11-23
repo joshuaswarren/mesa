@@ -13,6 +13,7 @@
 #include <xf86drm.h>
 
 #include "asahi/compiler/agx_compile.h"
+#include "asahi/lib/agx_vdm_hal200_direct_draw_core.h"
 #include "asahi/lib/agx_vdm_state_update_core.h"
 #include "compiler/glsl_types.h"
 #include "compiler/nir/nir_builder.h"
@@ -198,7 +199,12 @@ check_vs(struct pipe_context *pctx)
    draw(pctx);
    CHECK(ctx->perf.vs_emits == emits);
 
-   /* A different shader and per-draw base parameters must refresh VS. */
+   /* A different shader and per-draw base parameters must refresh VS.
+    * On HAL200, repeating the same VS with only VS uniform/param changes
+    * elides the bind tail and selector until a VDM STREAM_LINK starts a new
+    * chunk. */
+   const bool native_agx3 =
+      agx_chip_native_agx3(agx_device(pctx->screen)->chip);
    void *id_vs = create_vs(pctx, true);
    CHECK(id_vs);
    pctx->bind_vs_state(pctx, id_vs);
@@ -206,8 +212,47 @@ check_vs(struct pipe_context *pctx)
    draw(pctx);
    CHECK(ctx->perf.vs_emits == emits + 1 && ctx->skipped_no_program == 0);
    CHECK(ctx->linked.vs->uses_base_param);
+   size_t scissor_before = ctx->batch->scissor.size;
+   size_t zbias_before = ctx->batch->depth_bias.size;
+   before = ctx->batch->vdm.current;
    draw(pctx);
    CHECK(ctx->perf.vs_emits == emits + 2);
+   if (native_agx3) {
+      CHECK(ctx->batch->scissor.size == scissor_before);
+      CHECK(ctx->batch->depth_bias.size == zbias_before);
+      CHECK((size_t)(ctx->batch->vdm.current - before) ==
+            AGX_VDM_STATE_UPDATE_LENGTH +
+               AGX_VDM_HAL200_DIRECT_DRAW_BODY_LENGTH);
+   }
+
+   /* Cross a 512 KiB VDM chunk boundary with VS-only updates to exercise
+    * STREAM_LINK reset and bind-tail re-latching under the stream validator. */
+   if (native_agx3) {
+      struct agx_bo *start_vdm_bo = ctx->batch->vdm.bo;
+      uint8_t *start_vdm_end = ctx->batch->vdm.end;
+      bool linked = false;
+      for (unsigned i = 0; i < 20000; ++i) {
+         draw(pctx);
+         if (ctx->batch->vdm.bo != start_vdm_bo ||
+             ctx->batch->vdm.end != start_vdm_end) {
+            linked = true;
+            break;
+         }
+      }
+      CHECK(linked);
+      CHECK(ctx->batch->g17p_bind_tail_latched);
+      CHECK(ctx->batch->g17p_have_latched_vs);
+      /* The draw right after re-latching in the new chunk elides again. */
+      scissor_before = ctx->batch->scissor.size;
+      zbias_before = ctx->batch->depth_bias.size;
+      before = ctx->batch->vdm.current;
+      draw(pctx);
+      CHECK(ctx->batch->scissor.size == scissor_before);
+      CHECK(ctx->batch->depth_bias.size == zbias_before);
+      CHECK((size_t)(ctx->batch->vdm.current - before) ==
+            AGX_VDM_STATE_UPDATE_LENGTH +
+               AGX_VDM_HAL200_DIRECT_DRAW_BODY_LENGTH);
+   }
    pctx->bind_vs_state(pctx, s.vs);
    pctx->delete_vs_state(pctx, id_vs);
 
@@ -230,8 +275,18 @@ check_vs(struct pipe_context *pctx)
    };
    struct pipe_draw_start_count_bias indirect_draw = {0};
    for (unsigned i = 0; i < 2; ++i) {
+      scissor_before = ctx->batch->scissor.size;
+      zbias_before = ctx->batch->depth_bias.size;
+      before = ctx->batch->vdm.current;
       pctx->draw_vbo(pctx, &indirect_info, 0, &indirect, &indirect_draw, 1);
       CHECK(ctx->perf.vs_emits == emits);
+      if (native_agx3) {
+         CHECK(ctx->batch->scissor.size == scissor_before);
+         CHECK(ctx->batch->depth_bias.size == zbias_before);
+         CHECK((size_t)(ctx->batch->vdm.current - before) ==
+               AGX_VDM_HAL200_INDIRECT_NONINDEXED_DRAW_LENGTH -
+                  AGX_VDM_HAL200_DRAW_STATE_POINTER_LENGTH);
+      }
    }
    pipe_resource_reference(&indirect_buffer, NULL);
 

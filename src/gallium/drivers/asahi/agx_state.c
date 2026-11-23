@@ -14254,6 +14254,42 @@ agx_encode_g17g_state(struct agx_batch *batch, uint8_t *out)
 }
 
 static uint8_t *
+agx_g17p_emit_vs_state_update(struct agx_batch *batch, uint8_t *out,
+                              const struct agx_compiled_shader *vs,
+                              uint32_t raw_word0, uint64_t pipeline,
+                              uint32_t outputs_out[2])
+{
+   struct agx_context *ctx = batch->ctx;
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   const uint32_t provoking = ctx->rast->base.flatshade_first ? 0 : 2;
+   const uint32_t outputs[2] = {
+      vs->uvs.vdm.opaque[0] +
+         (batch->generate_primitive_id ? UINT32_C(0x100) : 0),
+      (ctx->rast->base.rasterizer_discard ? 0x30 + provoking : provoking) |
+         (batch->generate_primitive_id ? UINT32_C(0x40) : 0),
+   };
+   const struct agx_vdm_state_update_info info = {
+      .raw_vertex_shader_word0 = raw_word0,
+      .pipeline = pipeline,
+      .raw_pipeline_template = 0,
+      .raw_vertex_outputs = {outputs[0], outputs[1]},
+      .raw_vertex_unknown = 0,
+   };
+   struct agx_vdm_state_update encoded;
+   const bool packed = agx_vdm_state_update_pack(dev->chip, &info, &encoded);
+   assert(packed);
+   if (!packed)
+      return NULL;
+
+   memcpy(out, encoded.bytes, encoded.length);
+   if (outputs_out) {
+      outputs_out[0] = outputs[0];
+      outputs_out[1] = outputs[1];
+   }
+   return out + encoded.length;
+}
+
+static uint8_t *
 agx_encode_state(struct agx_batch *batch, uint8_t *out,
                  uint32_t *draw_state_offset)
 {
@@ -14316,6 +14352,10 @@ agx_encode_state(struct agx_batch *batch, uint8_t *out,
       ppp_updates++;
    }
 
+   bool vs_emitted = false;
+   uint32_t vs_word0 = 0;
+   uint32_t vs_outputs[2] = {0, 0};
+
    /* HAL200 retains the vertex state update independently of its bind tail
     * and per-draw selector, just as the older VDM retains VS state. The old
     * immutable uniform upload remains valid until vertex inputs change. */
@@ -14340,29 +14380,12 @@ agx_encode_state(struct agx_batch *batch, uint8_t *out,
                                             NULL))
             return NULL;
 
-         const uint32_t provoking = ctx->rast->base.flatshade_first ? 0 : 2;
-         const struct agx_vdm_state_update_info info = {
-            .raw_vertex_shader_word0 = counts.opaque[0],
-            .pipeline = pipeline,
-            .raw_pipeline_template = 0,
-            .raw_vertex_outputs = {
-               vs->uvs.vdm.opaque[0] +
-                  (batch->generate_primitive_id ? UINT32_C(0x100) : 0),
-               (ctx->rast->base.rasterizer_discard ? 0x30 + provoking
-                                                  : provoking) |
-                  (batch->generate_primitive_id ? UINT32_C(0x40) : 0),
-            },
-            .raw_vertex_unknown = 0,
-         };
-         struct agx_vdm_state_update encoded;
-         const bool packed =
-            agx_vdm_state_update_pack(dev->chip, &info, &encoded);
-         assert(packed);
-         if (!packed)
+         vs_word0 = counts.opaque[0];
+         out = agx_g17p_emit_vs_state_update(batch, out, vs, vs_word0,
+                                             pipeline, vs_outputs);
+         if (!out)
             return NULL;
-
-         memcpy(out, encoded.bytes, encoded.length);
-         out += encoded.length;
+         vs_emitted = true;
       } else {
          agx_push(out, VDM_STATE, cfg) {
             cfg.vertex_shader_word_0_present = true;
@@ -14393,8 +14416,38 @@ agx_encode_state(struct agx_batch *batch, uint8_t *out,
          ctx->perf.vs_emits++;
    }
 
-   if (agx_chip_native_agx3(dev->chip))
-      return agx_g17p_emit_bind_state(batch, out, vs, draw_state_offset);
+   if (agx_chip_native_agx3(dev->chip)) {
+      /* Elide the HAL200 bind tail when only vertex uniforms or VBO bindings
+       * changed and the current VDM chunk already latched the matching PPP
+       * bind tail and vertex metadata. */
+      const bool need_bind_tail =
+         !batch->g17p_bind_tail_latched || varyings_dirty ||
+         (ctx->dirty & ~(AGX_DIRTY_VS | AGX_DIRTY_VERTEX)) != 0 ||
+         batch->g17p_latched_vs_shader != vs ||
+         batch->g17p_fragment_shader != ctx->fs ||
+         batch->g17p_fragment_linked != ctx->linked.fs ||
+         (vs_emitted &&
+          (!batch->g17p_have_latched_vs ||
+           vs_word0 != batch->g17p_latched_vs_word0 ||
+           vs_outputs[0] != batch->g17p_latched_vs_outputs[0] ||
+           vs_outputs[1] != batch->g17p_latched_vs_outputs[1]));
+      if (!need_bind_tail)
+         return out;
+
+      out = agx_g17p_emit_bind_state(batch, out, vs, draw_state_offset);
+      if (!out)
+         return NULL;
+
+      batch->g17p_bind_tail_latched = true;
+      batch->g17p_latched_vs_shader = vs;
+      if (vs_emitted) {
+         batch->g17p_have_latched_vs = true;
+         batch->g17p_latched_vs_word0 = vs_word0;
+         batch->g17p_latched_vs_outputs[0] = vs_outputs[0];
+         batch->g17p_latched_vs_outputs[1] = vs_outputs[1];
+      }
+      return out;
+   }
 
    struct agx_pool *pool = &batch->pool;
 
@@ -14709,8 +14762,10 @@ agx_g17p_emit_indirect_draw(enum agx_chip chip, uint8_t *out,
                             uint32_t restart_index,
                             uint32_t draw_state_offset)
 {
+   const bool tail_emitted = draw_state_offset != 0;
    const struct agx_vdm_hal200_indirect_draw_fields fields = {
-      .draw_state_context_offset = draw_state_offset,
+      /* Not emitted without a fresh tail, but packed regardless. */
+      .draw_state_context_offset = tail_emitted ? draw_state_offset : 4,
       .primitive = primitive,
       .indexed = draw->indexed,
       .index_size_B = draw->indexed ? agx_index_size_to_B(draw->index_size) : 0,
@@ -14721,14 +14776,16 @@ agx_g17p_emit_indirect_draw(enum agx_chip chip, uint8_t *out,
       .indirect_buffer = draw->b.ptr,
    };
    struct agx_vdm_hal200_indirect_draw packed;
-   const bool valid = agx_vdm_hal200_indirect_draw_pack(
-      chip, &fields, &packed);
+   size_t emitted = 0;
+   const bool valid =
+      agx_vdm_hal200_indirect_draw_pack(chip, &fields, &packed) &&
+      agx_vdm_hal200_draw_emit(chip, packed.bytes, packed.length, tail_emitted,
+                               out, packed.length, &emitted);
    assert(valid);
    if (!valid)
       return out;
 
-   memcpy(out, packed.bytes, packed.length);
-   return out + packed.length;
+   return out + emitted;
 }
 
 static uint64_t
@@ -14842,6 +14899,8 @@ agx_ensure_cmdbuf_has_space(struct agx_batch *batch, struct agx_encoder *enc,
          return;
 
       memcpy(enc->current, link.bytes, link.length);
+      batch->g17p_bind_tail_latched = false;
+      batch->g17p_have_latched_vs = false;
    } else if (vdm && agx_chip_g17_m5(dev->chip)) {
       /* The M5 command processor adds the render-context base to a Stream
        * Link target, as it does to a PPP payload pointer: an absolute target
@@ -17421,16 +17480,9 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    agx_ensure_cmdbuf_has_space(batch, &batch->vdm, command_space);
 
    uint32_t draw_state_offset = 0;
-   /* Native HAL200 indirect records always carry a draw-state selector.
-    * A state-clean indirect draw needs only its bind tail and selector;
-    * dirtying PRIM would also relink varyings and rebuild the VS program. */
    const uint64_t skipped_before = ctx->skipped_no_program;
-   uint8_t *out =
-      agx_chip_native_agx3(dev->chip) && indirect && !ctx->dirty
-         ? agx_g17p_emit_bind_state(batch, batch->vdm.current,
-                                    ctx->gs ? ctx->gs->gs_copy : ctx->vs,
-                                    &draw_state_offset)
-         : agx_encode_state(batch, batch->vdm.current, &draw_state_offset);
+   uint8_t *out = agx_encode_state(batch, batch->vdm.current,
+                                   &draw_state_offset);
    if (!out) {
       if (dev->chip == AGX_CHIP_G18G) {
          if (ctx->skipped_no_program == skipped_before)
