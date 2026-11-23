@@ -432,8 +432,11 @@ struct hk_agx3_plan_args {
 #define HK_AGX3_M5_AABB_RECORD_B 48u
 
 #define HK_AGX3_PLAN_ENCODE_DISPATCH 32u /* bytes after hk_agx3_plan_state */
-/* Single-workgroup fused planner limits (bvh/agx3_plan.comp). */
-#define HK_AGX3_PLAN_FUSED_MAX_NODES 2048u
+/* Single-workgroup fused planner limits (bvh/agx3_plan.comp).
+ * 768 nodes (9 KiB shared scratch) keeps small TLAS/BLAS builds (<= 384 leaves)
+ * on one workgroup without serializing larger multi-core builds like 1024-tri
+ * BLAS (node_bound=2047) onto a single core. */
+#define HK_AGX3_PLAN_FUSED_MAX_NODES 768u
 #define HK_AGX3_PLAN_FUSED_GROUP_SIZE 256u
 /* hk_agx3_plan_node.depth flags of an internal node whose two children are
  * triangles encoded as one record, and whether that record is opaque. */
