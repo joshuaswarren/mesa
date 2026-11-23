@@ -97,7 +97,7 @@ hk_device_init_meta(struct hk_device *dev)
    dev->meta.use_combined_blit_descriptors =
       agx_chip_native_agx3(dev->dev.chip);
    dev->meta.use_masked_rgba8_buffer_unpack =
-      agx_chip_native_agx3(dev->dev.chip);
+      agx_chip_native_or_m5(dev->dev.chip);
    dev->meta.use_rect_list_pipeline = true;
    dev->meta.cmd_bind_map_buffer = hk_cmd_bind_map_buffer;
    dev->meta.max_bind_map_buffer_size_B = 64 * 1024;
@@ -3969,7 +3969,7 @@ hk_g17p_tiled_upload_shape(const struct hk_device *dev, bool dest_tiled,
                            struct hk_g17p_tiled_upload_key *key,
                            uint32_t groups[3])
 {
-   if (dev->dev.chip != AGX_CHIP_G17P || !dest_tiled || !plan->width_el ||
+   if (!agx_chip_g17p_or_m5(dev->dev.chip) || !dest_tiled || !plan->width_el ||
        !plan->height_el)
       return false;
 
