@@ -10523,6 +10523,57 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
    return progress;
 }
 
+static bool
+agx_nir_shrink_memory_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_constant:
+   case nir_intrinsic_load_constant:
+   case nir_intrinsic_load_push_constant:
+      break;
+   default:
+      return false;
+   }
+
+   if (intr->def.num_components <= 1)
+      return false;
+
+   /* Keep 4-component buffer descriptors intact for preamble speculation and
+    * never drop volatile memory reads. */
+   if (nir_intrinsic_has_access(intr) &&
+       (nir_intrinsic_access(intr) &
+        (ACCESS_BUFFER_DESCRIPTOR_AGX | ACCESS_VOLATILE)))
+      return false;
+
+   nir_foreach_use(use_src, &intr->def) {
+      if (nir_src_use_instr(use_src)->type == nir_instr_type_intrinsic)
+         return false;
+   }
+
+   unsigned mask = nir_def_components_read(&intr->def);
+   if (!mask)
+      return false;
+
+   unsigned comps = util_last_bit(mask);
+   unsigned rounded = comps > 4 ? util_next_power_of_two(comps) : comps;
+   if (rounded >= intr->def.num_components)
+      return false;
+
+   intr->def.num_components = rounded;
+   intr->num_components = rounded;
+   return true;
+}
+
+static bool
+agx_nir_shrink_memory_loads(nir_shader *nir)
+{
+   return nir_shader_intrinsics_pass(nir, agx_nir_shrink_memory_load,
+                                     nir_metadata_control_flow, NULL);
+}
+
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool byte_indices, bool discard_word, bool g17p, bool m5,
@@ -10676,6 +10727,12 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       sub_progress |= uatom;
       addr_progress |= uatom;
    }
+
+   /* Trim unused trailing vector load channels (e.g. vec4 UBO/SSBO/global loads
+    * reading only .xyz) before lowering addressing so dead channels do not hold
+    * GPRs or uniform slots, without introducing address-offset arithmetic or
+    * narrowing scratch loads / marked buffer descriptors. */
+   NIR_PASS(_, nir, agx_nir_shrink_memory_loads);
 
    /* Lower addressing modes. The sooner we do this, the sooner we get rid of
     * amul/aadd instructions and can let nir_opt_algebraic do its job. But we
