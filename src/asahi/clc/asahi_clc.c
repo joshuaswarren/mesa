@@ -86,6 +86,13 @@ target_is_native_agx3(const char *target)
    return agx_chip_native_agx3(target_chip(target));
 }
 
+/* Whether a target runs the native AGX3 path with the HAL200 command stream. */
+static bool
+target_is_native_hal200(const char *target)
+{
+   return agx_chip_native_hal200(target_chip(target));
+}
+
 /* Whether a target executes AGX3 code: the native AGX3B path or the M5 AGX3C
  * one. */
 static bool
@@ -360,9 +367,9 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_fill_uint4") ||
           !strcmp(func->name, "libagx_gen1_as_property") ||
           !strcmp(func->name, "libagx_gen1_as_copy") ||
-          /* Native G17P AS copies relocate child slots and then restore the
-           * instance-record slots which can resemble node markers. */
-          (!strcmp(target, "g17p") &&
+          /* Native HAL200 Gen1 AS copies relocate child slots and then
+           * restore the instance-record slots which can resemble node markers. */
+          (target_is_native_hal200(target) &&
            (!strcmp(func->name, "libagx_gen1_as_rebase") ||
             !strcmp(func->name, "libagx_gen1_as_restore_records"))) ||
           !strcmp(func->name, "libagx_gen1_as_serialize") ||

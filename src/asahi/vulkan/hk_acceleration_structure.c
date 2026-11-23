@@ -2619,10 +2619,12 @@ hk_host_as_begin(struct hk_device *dev, struct hk_host_as_run *run)
 }
 
 static struct agx_bo *
-hk_host_as_bo(struct hk_host_as_run *run, uint64_t size, const char *name)
+hk_host_as_bo(struct hk_host_as_run *run, uint64_t size, bool cpu_mapped,
+              const char *name)
 {
-   struct agx_bo *bo = agx_bo_create(&run->dev->dev, MAX2(size, 16), 0,
-                                     util_has_cache_ops() ? AGX_BO_WRITEBACK : 0,
+   const enum agx_bo_flags flags =
+      (cpu_mapped && util_has_cache_ops()) ? AGX_BO_WRITEBACK : 0;
+   struct agx_bo *bo = agx_bo_create(&run->dev->dev, MAX2(size, 16), 0, flags,
                                      name);
    if (bo)
       util_dynarray_append(&run->bos, bo);
@@ -2725,8 +2727,8 @@ hk_BuildAccelerationStructuresKHR(
       const uint64_t scratch_bytes =
          info->mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR ?
             sizes.updateScratchSize : sizes.buildScratchSize;
-      struct agx_bo *staging = hk_host_as_bo(&run, bytes, "Host AS build input");
-      struct agx_bo *scratch = hk_host_as_bo(&run, scratch_bytes, "Host AS build scratch");
+      struct agx_bo *staging = hk_host_as_bo(&run, bytes, true, "Host AS build input");
+      struct agx_bo *scratch = hk_host_as_bo(&run, scratch_bytes, false, "Host AS build scratch");
       if (!staging || !scratch) {
          result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          goto out;
@@ -2796,7 +2798,7 @@ hk_CopyMemoryToAccelerationStructureKHR(
    VkResult result = hk_host_as_begin(dev, &run);
    if (result != VK_SUCCESS)
       return result;
-   struct agx_bo *blob = hk_host_as_bo(&run, bytes, "Host AS deserialize input");
+   struct agx_bo *blob = hk_host_as_bo(&run, bytes, true, "Host AS deserialize input");
    if (!blob) {
       result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    } else {
@@ -2830,7 +2832,7 @@ hk_CopyAccelerationStructureToMemoryKHR(
    if (result != VK_SUCCESS)
       return result;
    const uint64_t bound = src->size * 2 + 4096;
-   struct agx_bo *blob = hk_host_as_bo(&run, bound, "Host AS serialize output");
+   struct agx_bo *blob = hk_host_as_bo(&run, bound, true, "Host AS serialize output");
    if (!blob) {
       result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    } else {
