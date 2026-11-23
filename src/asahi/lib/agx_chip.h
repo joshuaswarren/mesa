@@ -953,6 +953,16 @@ agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
    return agx_chip_native_or_m5(chip);
 }
 
+/* Whether the Borealis graphics path supplies the depth/stencil feedback-loop
+ * shader twin (hk_fbl_twin()) and draw-time dynamic transition
+ * (hk_select_fbl_fs()) required for VK_EXT_attachment_feedback_loop_dynamic_state.
+ * Shared across native AGX3 (G15/G16/G17P) and M5 (G17G/G17S/G17C). */
+static inline bool
+agx_chip_has_feedback_loop_dynamic_state(enum agx_chip chip)
+{
+   return agx_chip_native_or_m5(chip);
+}
+
 /* Number of helper-table slots in the USC code-container lead block.  G15
  * and G16 parts have ten; with six their fragment programs of 256x256 and
  * larger walk past the lead into the guard page.  On G17P the state loader's

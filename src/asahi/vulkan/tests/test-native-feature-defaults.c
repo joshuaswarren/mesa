@@ -59,6 +59,14 @@ main(void)
    assert(!agx_chip_elide_app_dispatch_barrier(AGX_CHIP_G15P));
    assert(!agx_chip_elide_app_dispatch_barrier(AGX_CHIP_G18G));
 
+   /* Dynamic attachment feedback loop state tracks the shared depth/stencil
+    * twin and draw-time selection across native AGX3 and M5. */
+   for (unsigned i = 0; i < ARRAY_SIZE(elide_chips); ++i)
+      assert(agx_chip_has_feedback_loop_dynamic_state(elide_chips[i]));
+   assert(!agx_chip_has_feedback_loop_dynamic_state(AGX_CHIP_G13G));
+   assert(!agx_chip_has_feedback_loop_dynamic_state(AGX_CHIP_G14X));
+   assert(!agx_chip_has_feedback_loop_dynamic_state(AGX_CHIP_G18G));
+
    puts("native feature defaults: ok");
    return 0;
 }
