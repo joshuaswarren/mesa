@@ -354,6 +354,8 @@ struct hk_device {
    } vdm;
 
    bool cmd_pending_ready;
+   /* Number of queues currently linked into cmd_pending_queues. */
+   int cmd_pending_active;
    simple_mtx_t cmd_pending_lock;
    /* Queues with pending submissions (hk_queue::cmd_link). */
    struct list_head cmd_pending_queues;

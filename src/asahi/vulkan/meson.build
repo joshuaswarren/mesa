@@ -1277,6 +1277,16 @@ if with_tests
 endif
 
 if with_tests
+  test('hk_cmd_pending', executable('hk_cmd_pending_test',
+    files('tests/test-hk-cmd-pending.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk, libasahi_lib],
+    link_args : [ld_args_gc_sections]),
+    timeout : 30, suite : ['asahi'])
+endif
+
+if with_tests
   test('hk_query_stamps', executable('hk_query_stamps_test',
     files('tests/test-hk-query-stamps.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,

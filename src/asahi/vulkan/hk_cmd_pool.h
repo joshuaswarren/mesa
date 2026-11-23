@@ -140,22 +140,26 @@ void hk_device_free_span(struct hk_device *dev,
                          struct hk_vdm_allocation *allocation);
 void hk_device_finish_vdm_slabs(struct hk_device *dev);
 
-/* Command-memory retirement, independent of API semaphores: on native M5
- * for the memory of every submitted recording, elsewhere only for a
- * driver-owned buffer a submission reads (extra_bo, a packed compute
- * stream), which goes back to the BO cache only once the submission
- * retired. */
+/* Command-memory retirement, independent of API semaphores:
+ * - Driver-owned packed compute stream buffers (extra_bo) have no application
+ *   handle to keep them alive, so submissions pin them until their completion
+ *   syncobj retires.
+ * - Application command recordings follow Vulkan lifetime rules while the
+ *   device is healthy; when a device is lost (or its VM reports a kernel
+ *   error), hk_cmd_pending_retain_lost() keeps their BOs and spans out of
+ *   reuse lists and BO caches until device destruction. */
 struct agx_bo;
+struct hk_cmd_buffer;
 struct hk_cmd_pending;
 struct hk_queue;
-struct vk_queue_submit;
-VkResult hk_cmd_pending_begin(struct hk_device *dev,
-                               const struct vk_queue_submit *submit,
-                               unsigned chunks, struct agx_bo *extra_bo,
+VkResult hk_cmd_pending_begin(struct hk_device *dev, unsigned chunks,
+                               struct agx_bo *extra_bo,
                                struct hk_cmd_pending **out);
 uint32_t hk_cmd_pending_signal(struct hk_cmd_pending *pending);
 void hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *pending,
                         struct hk_queue *queue, VkResult result);
+void hk_cmd_pending_retain_lost(struct hk_device *dev,
+                                struct hk_cmd_buffer *cmd);
 void hk_cmd_pending_reap(struct hk_device *dev);
 void hk_cmd_pending_finish_queue(struct hk_device *dev, struct hk_queue *queue);
 void hk_cmd_pending_finish(struct hk_device *dev);
