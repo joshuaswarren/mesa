@@ -241,7 +241,8 @@ enum agx_chip_quirk {
    (AGX_QUIRKS_NATIVE | AGX_QUIRK_NATIVE_RENDER_CONTEXT |                      \
     AGX_QUIRK_USC_HELPER_SLOT_PER_CORE |                                       \
     AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS |                                  \
-    AGX_QUIRK_IMAGE_LOAD_MISSES_OWN_STORE | AGX_QUIRK_NATIVE_PREAMBLE)
+    AGX_QUIRK_IMAGE_LOAD_MISSES_OWN_STORE | AGX_QUIRK_NATIVE_PREAMBLE |        \
+    AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS)
 
 /*
  * The chip table: one row per chip, and the only place that says what a chip
@@ -730,23 +731,24 @@ agx_chip_sampler_generation(enum agx_chip chip)
  *     the G15 and HAL200 records (agx_vdm_hal200_indirect_draw_pack) and the
  *     HAL300 one, which adds only the Unk 2 word before it
  *     (agx_vdm_index_list_indirect_pack_words). That is packet layout.
- *   - Enabled for the M5 HAL300 record family (G17G, G17S, G17C): zero
- *     substitution for out-of-range indices is measured on G17C (J716c) by
+ *   - Enabled for the M5 AGX3C family (G17G, G17S, G17C; agx_chip_g17_m5()):
+ *     zero substitution for out-of-range indices is measured on G17C (J716c)
+ *     and G17S (J714s) by
  *     dEQP-VK.robustness.{index_access,vertex_access.*index*,robustness2}.*,
  *     dEQP-VK.draw.{*indexed*,renderpass.multi_draw.*}, and a 28-case
  *     bit-exact equivalence probe against the software rewrite (partial and
  *     full out-of-range draws, 32-bit firstIndex wrap, signed vertexOffset,
- *     multi-draw firstInstance, primitive restart, indirect count). G17S
- *     (M5 Pro) and G17G (M5) share the same HAL300 indirect record layout;
- *     M5 Pro hardware verification is the merge gate.
+ *     multi-draw firstInstance, primitive restart, indirect count).
+ *   - Enabled for G17P (HAL200): zero substitution past index_buffer_size_word
+ *     is measured on A18 Pro (G17P B1) by the same 28-case bit-exact
+ *     equivalence probe and all five Vulkan CTS groups above.
  *
  * Off elsewhere:
  *   - G18G uses HAL300 records too, but has no stream-link continuation for
  *     an empty rewritten draw yet (hk_robust_index_rewrite_admitted) and its
  *     out-of-range index behaviour is unmeasured, so it stays off.
- *   - G15, G16G and G17P (G15/HAL200 records) keep the software rewrite until
- *     hardware rows (M3, M4, A18 Pro, M4 Pro) prove zero substitution past
- *     the size word.
+ *   - G15 and G16G (G15/HAL200 records) keep the software rewrite until
+ *     hardware rows (M3, M4) prove zero substitution past the size word.
  *   - AGX2 does not have it: its Index List does not read out-of-range
  *     indices as zero (libagx_draw_robust_index).
  *
