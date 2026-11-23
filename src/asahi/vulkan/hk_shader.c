@@ -1272,6 +1272,37 @@ m5_split_address(nir_def *addr, nir_def **base, nir_def **offset)
    return false;
 }
 
+static bool
+m5_has_mergeable_buffer_words(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         unsigned count = 0;
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            if (in->num_components != 1 || in->def.bit_size != 32 ||
+                !nir_intrinsic_can_reorder(in))
+               continue;
+            switch (in->intrinsic) {
+            case nir_intrinsic_load_global_bounded:
+            case nir_intrinsic_load_global_constant_bounded:
+            case nir_intrinsic_load_global_constant_offset:
+            case nir_intrinsic_load_global:
+            case nir_intrinsic_load_global_constant:
+               if (nir_intrinsic_align(in) >= 4 && ++count >= 2)
+                  return true;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
 /* M5: a structure read field by field (a light record in a loop) issues one
  * load per 32-bit word, each with its own address. Merge the reads of up to
  * four consecutive words at one base and offset term into one vector load.
@@ -3398,7 +3429,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       NIR_PASS(_, nir, nir_opt_sink, sink_opts);
       NIR_PASS(_, nir, nir_opt_move, opts);
 
-      if (global_loads.storage_result_select && global_loads.soft_fault) {
+      if (global_loads.storage_result_select && global_loads.soft_fault &&
+          m5_has_mergeable_buffer_words(nir)) {
          /* Reads of one descriptor share its base and size only after CSE. */
          NIR_PASS(_, nir, nir_opt_cse);
          NIR_PASS(_, nir, m5_merge_buffer_words);
