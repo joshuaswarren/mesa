@@ -5098,7 +5098,10 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                   (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
                    load_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
 
-               if (dev->dev.chip == AGX_CHIP_G17P) {
+               if (dev->dev.chip == AGX_CHIP_G17P ||
+                   (agx_chip_g17_m5(dev->dev.chip) &&
+                    layout->sample_count_sa == 1 &&
+                    ail_get_blocksize_B(layout) == 16)) {
                   /* A resumed dynamic render pass preserves pixels rendered by
                    * the suspended pass even when the attachment's loadOp is
                    * CLEAR or DONT_CARE, so never drop existing tiles there. */
@@ -5115,7 +5118,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                         !dev->samplers.table.bo ||
                         !read_index ||
                         read_index >= dev->sampled_images.alloc))) {
-                     mesa_loge_once("G17P: spilled render pass with a compressed "
+                     mesa_loge_once("AGX3: spilled render pass with a compressed "
                                     "attachment (%s, %ux) is unsupported",
                                     util_format_short_name(layout->format),
                                     layout->sample_count_sa);
@@ -5150,7 +5153,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                         layout->compression_layer_stride_B / 8,
                         layout->layer_stride_B / 16, width_tl, height_tl,
                         level_w, level_h, align(level_w, tile.width_el),
-                        tile.width_el, tile.height_el);
+                        tile.width_el, tile.height_el,
+                        ail_metadata_tile(layout).height_el);
                   }
                } else if (agx_chip_g17_m5(dev->dev.chip)) {
                   if (layout->format != PIPE_FORMAT_R16G16B16A16_FLOAT ||

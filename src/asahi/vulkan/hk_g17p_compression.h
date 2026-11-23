@@ -488,18 +488,18 @@ hk_g17p_shared_compression_eligible(enum agx_chip chip, unsigned plane,
  * level, so AIL_LAYOUT_POLICY_M5's per-level metadata placement must be the
  * hardware's.
  */
-/* One-byte texels. The M5 hardware places a compressed level after a 32x32
- * one-byte level 2 KiB on, where AIL_LAYOUT_POLICY_M5 puts it 1 KiB on: the
- * end-of-tile store and texture reads use the hardware's offset, AIL-addressed
- * writes (fast clears, copies) the other. Two- to eight-byte texels agree with
- * the hardware at every level tested (64x64 to 2976x1872, odd sizes). */
-static inline bool
-hk_m5_compression_one_byte(VkFormat format)
-{
-   return format == VK_FORMAT_R8_UNORM || format == VK_FORMAT_R8_SNORM ||
-          format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_SINT;
-}
-
+/* M5 lossless compression of colour render targets and sampled textures.
+ *
+ * The Gen10 compressed PBE (write) packet and texture (read) descriptor
+ * support GPU-tiled 2D (single-level and mipmapped, including 1-byte mip
+ * chains aligned on 2 KiB compressed-level boundaries in
+ * AIL_LAYOUT_POLICY_M5), 2D arrays (single-level and mipmapped), cube maps,
+ * single-level 3D volumes (1-8 byte + B10G11R11 formats), and single-sample
+ * single-layer 16-byte formats (R32G32B32A32_{UINT,SINT,SFLOAT}, with spilled
+ * MRT attachments decompressed in place via libagx_g17p_decompress_16b using
+ * M5's 16x8 metadata tile geometry). Shared images (external memory, WSI) stay
+ * plain under this private policy.
+ */
 static inline bool
 hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
                                  const VkImageCreateInfo *info)
@@ -525,28 +525,48 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
       next = following;
    }
 
-   const VkImageCreateFlags allowed_flags =
+   const bool color_1_8b =
+      hk_g17p_compression_color_format(info->format) ||
+      /* M5 stores it in its own class (agx_rt0_pbe_format). */
+      info->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+   const bool color_16b = hk_g17p_compression_color_format_16b(info->format);
+   if (!color_1_8b && !color_16b)
+      return false;
+
+   const bool three_d = info->imageType == VK_IMAGE_TYPE_3D;
+   if (color_16b && (three_d || info->arrayLayers != 1))
+      return false;
+
+   VkImageCreateFlags allowed_flags =
       VK_IMAGE_CREATE_ALIAS_BIT |
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+   if (color_1_8b && info->imageType == VK_IMAGE_TYPE_2D)
+      allowed_flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   if (color_1_8b && three_d)
+      allowed_flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
+                       VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
    const VkImageUsageFlags allowed_usage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 
-   return info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
-          info->arrayLayers == 1 &&
-          (info->mipLevels == 1 || !hk_m5_compression_one_byte(info->format)) &&
-          info->samples == VK_SAMPLE_COUNT_1_BIT &&
+   if ((info->imageType != VK_IMAGE_TYPE_2D && !three_d) ||
+       !info->extent.depth || !info->arrayLayers || !info->mipLevels ||
+       (three_d ? (info->arrayLayers != 1 || info->mipLevels != 1)
+                : info->extent.depth != 1) ||
+       ((info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+        (info->extent.width != info->extent.height ||
+         info->arrayLayers % 6)))
+      return false;
+
+   return info->samples == VK_SAMPLE_COUNT_1_BIT &&
           info->tiling == VK_IMAGE_TILING_OPTIMAL &&
           !(info->flags & ~allowed_flags) &&
           (info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                           VK_IMAGE_USAGE_TRANSFER_DST_BIT)) &&
           !(info->usage & ~allowed_usage) && info->extent.width >= 16 &&
-          info->extent.height >= 16 &&
-          (hk_g17p_compression_color_format(info->format) ||
-           /* M5 stores it in its own class (agx_rt0_pbe_format). */
-           info->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+          info->extent.height >= 16;
 }
 
 /* Multisample colour formats with a qualified compressed metadata shape:

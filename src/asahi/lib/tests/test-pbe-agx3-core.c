@@ -793,6 +793,60 @@ check_gen9_interchange_compressed(void)
    return 0;
 }
 
+static int
+check_gen10_compressed_layered(void)
+{
+   const struct agx_pbe_agx3_2d_fields fields = {
+      .layout = 2,
+      .channels = 0x28,
+      .swizzle_r = 0,
+      .swizzle_g = 1,
+      .swizzle_b = 2,
+      .swizzle_a = 3,
+      .width = 129,
+      .height = 127,
+      .buffer = UINT64_C(0x4000100000),
+      .acceleration_buffer = UINT64_C(0x4000160000),
+      .compressed = true,
+      .page_aligned_layers = true,
+   };
+   struct agx_pbe_agx3_descriptor packed;
+   uint64_t w[4];
+
+   /* Gen10 compressed 2D array (single-level and mipmapped). */
+   CHECK(agx_pbe_agx3_2d_array_pack(AGX_PBE_AGX3_GENERATION_10, &fields, 4,
+                                    &packed));
+   memcpy(w, packed.bytes, sizeof(w));
+   CHECK((w[0] & 0xf) == 3);
+   CHECK((w[0] >> 61) & 1);
+   CHECK(((w[1] >> 44) & 0xffff) == 3);
+   CHECK((w[1] >> 60) & 1);
+   CHECK((w[1] >> 63) & 1);
+   CHECK(w[2] == (fields.acceleration_buffer >> 4));
+
+   CHECK(agx_pbe_agx3_2d_array_mip_pack(AGX_PBE_AGX3_GENERATION_10, &fields, 4,
+                                        2, 4, &packed));
+   memcpy(w, packed.bytes, sizeof(w));
+   CHECK((w[0] & 0xf) == 3);
+   CHECK((w[0] >> 60) & 1);
+   CHECK((w[0] >> 61) & 1);
+   CHECK(((w[2] >> 44) & 0xf) == 2);
+   CHECK(((w[2] >> 48) & 0xf) == 3);
+   CHECK((w[2] & ((UINT64_C(1) << 44) - 1)) ==
+         (fields.acceleration_buffer >> 4));
+
+   /* Gen10 compressed 3D (single-level only). */
+   CHECK(agx_pbe_agx3_3d_pack(AGX_PBE_AGX3_GENERATION_10, &fields, 4, &packed));
+   memcpy(w, packed.bytes, sizeof(w));
+   CHECK((w[0] & 0xf) == 5);
+   CHECK((w[0] >> 61) & 1);
+   CHECK(((w[1] >> 44) & 0xffff) == 3);
+   CHECK((w[1] >> 60) & 1);
+   CHECK(!agx_pbe_agx3_3d_mip_pack(AGX_PBE_AGX3_GENERATION_10, &fields, 4, 1,
+                                   3, &packed));
+   return 0;
+}
+
 int
 main(void)
 {
@@ -806,7 +860,8 @@ main(void)
        check_gen9_compressed_atlas_vector() ||
        check_gen9_multisample_vector() ||
        check_gen9_array_multisample_vector() ||
-       check_gen9_interchange_compressed())
+       check_gen9_interchange_compressed() ||
+       check_gen10_compressed_layered())
       return 1;
 
    printf("agx_pbe_agx3_core: %u checks passed\n", checks);

@@ -620,8 +620,31 @@ check_m5_color(void)
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &i));
    i.mipLevels = 12;
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &i));
+   /* 2D arrays (single-level and mipmapped), cubes, and single-level 3D are
+    * admitted for 1-8 byte and B10G11R11 colour formats. */
    VkImageCreateInfo c = i;
    c.arrayLayers = 2;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.mipLevels = 1;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i;
+   c.mipLevels = 1;
+   c.extent.width = 128;
+   c.extent.height = 128;
+   c.arrayLayers = 6;
+   c.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.extent.width = 129;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i;
+   c.imageType = VK_IMAGE_TYPE_3D;
+   c.extent.width = 65;
+   c.extent.height = 63;
+   c.extent.depth = 4;
+   c.arrayLayers = 1;
+   c.mipLevels = 1;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.mipLevels = 2;
    CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
    /* A transfer destination is made renderable like an attachment; an
     * image that is neither is not compressed. */
@@ -630,21 +653,27 @@ check_m5_color(void)
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
    c.usage &= ~VK_IMAGE_USAGE_TRANSFER_DST_BIT;
    CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   /* 16-byte formats compress as single-sample, single-layer 2D only. */
    c = i;
    c.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.format = VK_FORMAT_R32G32B32A32_UINT;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.arrayLayers = 2;
    CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
    c = i;
    c.samples = VK_SAMPLE_COUNT_4_BIT;
    c.mipLevels = 1;
    CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
-   /* One-byte texels compress only as a single level. */
+   /* One-byte texels compress both single-level and mipmapped under M5's
+    * 2 KiB compressed-level layout alignment. */
    static const VkFormat one_byte[] = {
       VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT,
    };
    for (unsigned f = 0; f < sizeof(one_byte) / sizeof(one_byte[0]); ++f) {
       c = i;
       c.format = one_byte[f];
-      CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
       c.mipLevels = 1;
       CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
    }

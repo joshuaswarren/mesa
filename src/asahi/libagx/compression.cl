@@ -286,11 +286,11 @@ libagx_m5_decompress_rgba16f(global void *texture_heap,
       metadata[index_tl] = ~(uint64_t)0;
 }
 
-/* Native G17P single-sample 16-byte/texel (R32G32B32A32) in-place spill
- * decompression. Each 32-thread workgroup covers one 16x16 metadata tile
- * (8 texels per thread), reading through the view's compressed 2D-array
- * eMRT texture descriptor before overwriting the twiddled body and marking
- * the metadata tile uncompressed.
+/* Native AGX3 (G17P 16x16 and M5 16x8) single-sample 16-byte/texel
+ * (R32G32B32A32) in-place spill decompression. Each 32-thread workgroup covers
+ * one 16 x meta_tile_height_px metadata tile (16x16 on G17P, 16x8 on M5),
+ * reading through the view's compressed 2D-array eMRT texture descriptor before
+ * overwriting the twiddled body and marking the metadata tile uncompressed.
  */
 KERNEL(32)
 libagx_g17p_decompress_16b(global void *texture_heap,
@@ -307,7 +307,8 @@ libagx_g17p_decompress_16b(global void *texture_heap,
                            uint level_height_px,
                            uint aligned_width_px,
                            ushort tile_width_px,
-                           ushort tile_height_px)
+                           ushort tile_height_px,
+                           ushort meta_tile_height_px)
 {
    const uint index_tl = index_metadata(cl_group_id, metadata_width_tl,
                                         metadata_height_tl,
@@ -316,31 +317,37 @@ libagx_g17p_decompress_16b(global void *texture_heap,
       return;
 
    const uint handle = nir_bindless_image_agx(read_index, 0);
-   const uint2 origin = cl_group_id.xy * 16u;
+   const uint2 origin = (uint2)(cl_group_id.x * 16u,
+                                cl_group_id.y * meta_tile_height_px);
    const uint layer = cl_group_id.z;
    const uint2 lane = (uint2)((cl_local_id.x & 1u) * 8u,
                               cl_local_id.x >> 1);
    const uint y = origin.y + lane.y;
+   const bool in_tile = lane.y < meta_tile_height_px;
    uint4 values[8];
-   for (uint i = 0; i < 8; i++) {
-      const uint x = origin.x + lane.x + i;
-      if (x < level_width_px && y < level_height_px) {
-         const int4 coord = (int4)(x, y, layer, 0);
-         values[i] = nir_bindless_image_load(
-            handle, coord, 0, 0, GLSL_SAMPLER_DIM_2D, true, 0,
-            ACCESS_IN_BOUNDS, nir_type_uint32);
+   if (in_tile) {
+      for (uint i = 0; i < 8; i++) {
+         const uint x = origin.x + lane.x + i;
+         if (x < level_width_px && y < level_height_px) {
+            const int4 coord = (int4)(x, y, layer, 0);
+            values[i] = nir_bindless_image_load(
+               handle, coord, 0, 0, GLSL_SAMPLER_DIM_2D, true, 0,
+               ACCESS_IN_BOUNDS, nir_type_uint32);
+         }
       }
    }
 
    barrier(CLK_LOCAL_MEM_FENCE);
 
-   for (uint i = 0; i < 8; i++) {
-      const uint x = origin.x + lane.x + i;
-      if (x < level_width_px && y < level_height_px) {
-         const uint offset = libagx_twiddle_coordinates(
-            (ushort2)(x, y), tile_width_px, tile_height_px,
-            aligned_width_px);
-         body[layer * body_layer_stride_el + offset] = values[i];
+   if (in_tile) {
+      for (uint i = 0; i < 8; i++) {
+         const uint x = origin.x + lane.x + i;
+         if (x < level_width_px && y < level_height_px) {
+            const uint offset = libagx_twiddle_coordinates(
+               (ushort2)(x, y), tile_width_px, tile_height_px,
+               aligned_width_px);
+            body[layer * body_layer_stride_el + offset] = values[i];
+         }
       }
    }
 

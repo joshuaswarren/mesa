@@ -328,7 +328,7 @@ target_supports_program(const char *target, const nir_function *func)
    if (!strcmp(func->name, "libagx_m5_decompress_rgba16f"))
       return !strcmp(target, "g17g");
    if (!strcmp(func->name, "libagx_g17p_decompress_16b"))
-      return !strcmp(target, "g17p");
+      return !strcmp(target, "g17p") || !strcmp(target, "g17g");
 
    if (!strcmp(target, "g17g") &&
        !strncmp(func->name, "libagx_d3d12_", strlen("libagx_d3d12_")))

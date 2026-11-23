@@ -357,3 +357,48 @@ TEST(Interchange, Modifier)
              AIL_TILING_INTERCHANGE);
    EXPECT_TRUE(ail_is_drm_modifier_compressed(DRM_FORMAT_MOD_APPLE_INTERCHANGE));
 }
+
+TEST(M5Layout, CompressedOneByteMipAlignment)
+{
+   struct ail_layout m5_r8 = {
+      .width_px = 128,
+      .height_px = 128,
+      .depth_px = 1,
+      .sample_count_sa = 1,
+      .levels = 8,
+      .policy = AIL_LAYOUT_POLICY_M5,
+      .tiling = AIL_TILING_GPU,
+      .compressed = true,
+      .format = PIPE_FORMAT_R8_UNORM,
+      .renderable = true,
+   };
+   ail_make_miptree(&m5_r8);
+
+   /* Level 2 is 32x32 (1 KiB of texels), followed by compressed level 3
+    * (16x16); M5 hardware places level 3 2 KiB after level 2. */
+   EXPECT_EQ(m5_r8.level_offsets_B[3] - m5_r8.level_offsets_B[2], 2048u);
+
+   /* Legacy policy keeps the 1 KiB spacing, and 4-byte formats on M5 are
+    * unchanged. */
+   struct ail_layout legacy_r8 = m5_r8;
+   memset(legacy_r8.level_offsets_B, 0, sizeof(legacy_r8.level_offsets_B));
+   legacy_r8.policy = AIL_LAYOUT_POLICY_LEGACY;
+   ail_make_miptree(&legacy_r8);
+   EXPECT_EQ(legacy_r8.level_offsets_B[3] - legacy_r8.level_offsets_B[2], 1024u);
+
+   struct ail_layout m5_rgba8 = {
+      .width_px = 257,
+      .height_px = 255,
+      .depth_px = 1,
+      .sample_count_sa = 1,
+      .levels = 9,
+      .policy = AIL_LAYOUT_POLICY_M5,
+      .tiling = AIL_TILING_GPU,
+      .compressed = true,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .renderable = true,
+   };
+   ail_make_miptree(&m5_rgba8);
+   /* Level 4 is 16x15 (1 KiB of texels), followed by uncompressed level 5. */
+   EXPECT_EQ(m5_rgba8.level_offsets_B[5] - m5_rgba8.level_offsets_B[4], 1024u);
+}

@@ -138,6 +138,15 @@ ail_initialize_gpu_tiled(struct ail_layout *layout)
       layout->level_offsets_B[l] = offset_B;
       offset_B = ALIGN_POT(offset_B + (blocksize_B * size_el), AIL_CACHELINE);
 
+      /* On M5 (AIL_LAYOUT_POLICY_M5), hardware places compressed mip levels
+       * on a 2 KiB boundary (observed after a 32x32 1-byte level, which is
+       * 1 KiB of texels; 2-16 byte compressed levels are already >= 2 KiB
+       * through 32x32 and levels below 16x16 are uncompressed). */
+      if (layout->policy == AIL_LAYOUT_POLICY_M5 && !layout->mipmapped_z &&
+          layout->compressed && l + 1 < layout->levels &&
+          ail_is_level_logically_compressed(layout, l + 1))
+         offset_B = ALIGN_POT(offset_B, 0x800);
+
       /* The tilesize is based on the true mipmap level size, not the POT
        * rounded size, except for compressed textures */
       unsigned tilesize_el;

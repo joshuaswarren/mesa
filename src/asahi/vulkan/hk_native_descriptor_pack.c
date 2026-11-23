@@ -272,8 +272,9 @@ hk_pack_native_pbe(unsigned generation,
    const bool compressed_2d = legacy->compressed &&
       (generation == 9 || generation == 10) &&
       (legacy->dimension == AGX_TEXTURE_DIMENSION_2D ||
-       (generation == 10 && array && legacy->layers == 1 &&
-        legacy->level == 0 && legacy->levels == 1)) &&
+       (generation == 10 && array) ||
+       (generation == 10 && three_d && legacy->level == 0 &&
+        legacy->levels == 1)) &&
       (legacy->layout == AGX_LAYOUT_GPU || (generation == 9 && interchange)) &&
       !multisample;
    /* Private destination capability for raw D32 copy views. The independently
