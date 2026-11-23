@@ -1092,6 +1092,28 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
          &key->tib, active_count,
          partial_render || store_source || resolved_after_pass,
          iview ? iview->vk.image->samples : 0);
+
+      /* A stored multisample attachment with an AVERAGE resolve (GL through
+       * zink stores every multisample framebuffer) resolves in this same
+       * end-of-tile program, as Gallium's store_and_resolve does, instead of
+       * reading the stored samples back in a meta resolve after the pass. */
+      const struct hk_image_view *resolve = color_att[0].resolve_iview;
+      const struct hk_agx3_g17p_store_and_resolve_target fused = {
+         .color_attachment_count = active_count,
+         .final_store = !partial_render,
+         .whole_attachments = cmd->state.gfx.render.cr.whole_attachments,
+         .store_source = store_source,
+         .has_resolve_target = has_resolve && resolve,
+         .average_resolve = att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT,
+         .source_samples = iview ? iview->vk.image->samples : 0,
+         .resolve_samples = resolve ? resolve->vk.image->samples : 0,
+         .resolve_format_matches =
+            iview && resolve && resolve->vk.format == iview->vk.format,
+         .source_pbe_valid = iview && iview->planes[0].eot_pbe_valid,
+         .resolve_pbe_valid = resolve && resolve->planes[0].eot_pbe_valid,
+      };
+      key->store_and_resolve = key->multisample_store &&
+         hk_agx3_g17p_store_and_resolve_supported(&key->tib, &fused);
    }
 
    const bool wboit_mrt = mrt == AGX_G17P_MRT_WBOIT;
@@ -1196,8 +1218,17 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
             ? AGX3_G17P_WBOIT_MRT_CLEAR_PUSH_HALFS
             : AGX3_G17P_RT0_CLEAR_PUSH_HALFS;
 
+   key->store_and_resolve &= store && op == AGX_EOT_STORE &&
+                             attachment_count == 1 && !dual_mrt_active &&
+                             !multi_mrt_active;
    struct agx_bg_eot_shader *shader =
       agx_get_bg_eot_shader(&dev->bg_eot, key);
+   if (key->store_and_resolve && !hk_g17p_bg_eot_shader_supported(shader)) {
+      /* Without the two-output program the pass stores its samples and
+       * resolves them after the pass, as it did before the fused path. */
+      key->store_and_resolve = false;
+      shader = agx_get_bg_eot_shader(&dev->bg_eot, key);
+   }
    const bool shader_resources_match =
       shader &&
       (store || (op == AGX_BG_EOT_NONE
@@ -1217,8 +1248,12 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
       program_capacity = AGX_IOTO_G17P_NO_RESOURCE_PROGRAM_SIZE;
       program_label = "G17P empty tile Ioto program";
    } else if (store) {
-      program_capacity = multi_mrt_active ? AGX_IOTO_G17P_QUAD_EOT_PROGRAM_MAX_SIZE
-                                        : AGX_IOTO_G17P_RT0_EOT_PROGRAM_SIZE;
+      /* The store-and-resolve program has two PBE outputs; Gallium bounds
+       * its program the same way (agx_build_bg_eot()). */
+      program_capacity =
+         key->store_and_resolve ? AGX_IOTO_G17P_OCTA_EOT_PROGRAM_MAX_SIZE
+         : multi_mrt_active     ? AGX_IOTO_G17P_QUAD_EOT_PROGRAM_MAX_SIZE
+                                : AGX_IOTO_G17P_RT0_EOT_PROGRAM_SIZE;
       program_label = "G17P RT0 EOT Ioto program";
    } else if (op == AGX_BG_CLEAR) {
       program_capacity =
@@ -1289,7 +1324,17 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
        */
       const bool multisample_store =
          agx_chip_native_agx3(dev->dev.chip) && key->multisample_store;
+      /* The store-and-resolve program also writes the resolve attachment
+       * through a second, single-sample PBE (key->store_and_resolve was only
+       * admitted with both descriptors valid). */
+      struct hk_image_view *resolve_view =
+         key->store_and_resolve ? color_att[0].resolve_iview : NULL;
       if (!iview || !target ||
+          (key->store_and_resolve &&
+           (!multisample_store || direct_resolve || !resolve_view ||
+            !resolve_view->planes[0].eot_pbe_valid ||
+            resolve_view->vk.image->samples != 1 ||
+            resolve_view->vk.format != iview->vk.format)) ||
           (agx_chip_native_agx3(dev->dev.chip) && !direct_resolve &&
            !multisample_store && target->vk.image->samples != 1) ||
           (multisample_store &&
@@ -1335,6 +1380,16 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
             VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR))
          ((uint8_t *)&pbe_arguments[0])[15] |= 0x20;
 
+      if (resolve_view) {
+         /* Output 1 resolves the same imageblock. As for the direct resolve,
+          * its PBE averages in linear space for an sRGB format. */
+         pbe_arguments[1] = resolve_view->planes[0].eot;
+         if (util_format_is_srgb(key->tib.logical_format[0]) &&
+             !(color_att[0].flags &
+               VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR))
+            ((uint8_t *)&pbe_arguments[1])[15] |= 0x20;
+      }
+
       if (dual_mrt_active)
          pbe_arguments[1] = target1_pbe;
       if (multi_mrt_active) {
@@ -1349,8 +1404,11 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
             pbe_arguments[rt] = view->planes[0].eot;
          }
       }
+      /* End-of-tile outputs: one per stored target, plus the resolve. */
+      const unsigned outputs = resolve_view ? 2 : attachment_count;
       const size_t pbe_argument_size =
          multi_mrt_active ? attachment_count * AGX_IOTO_G17P_RT0_PBE_ARGUMENT_SIZE
+         : resolve_view   ? outputs * AGX_IOTO_G17P_RT0_PBE_ARGUMENT_SIZE
          : dual_mrt_active ? AGX_IOTO_G17P_RGBA8_MRT_PBE_ARGUMENT_SIZE
                          : AGX_IOTO_G17P_RT0_PBE_ARGUMENT_SIZE;
       const uint64_t pbe_argument_va =
@@ -1363,11 +1421,15 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
          .shader_va = shader->ptr + shader->info.main_offset,
          .pbe_argument_va = pbe_argument_va,
          .imageblock_offset_B = agx_tilebuffer_offset_B(&key->tib, 0),
-         .attachment_count = attachment_count,
-         /* Layered MRT uses the shared array builtin, like Gallium. */
-         .mixed_mrt = attachment_count >= 2,
+         .attachment_count = outputs,
+         /* Layered MRT uses the shared array builtin, like Gallium. So does
+          * the store-and-resolve pair, whose two outputs read one
+          * imageblock offset. */
+         .mixed_mrt = outputs >= 2,
          .imageblock_offset1_B =
-            attachment_count > 1 ? agx_tilebuffer_offset_B(&key->tib, 1) : 0,
+            resolve_view         ? agx_tilebuffer_offset_B(&key->tib, 0)
+            : attachment_count > 1 ? agx_tilebuffer_offset_B(&key->tib, 1)
+                                   : 0,
          .imageblock_offset2_B = attachment_count > 2 ? agx_tilebuffer_offset_B(&key->tib, 2) : 0,
          .imageblock_offset3_B = attachment_count > 3 ? agx_tilebuffer_offset_B(&key->tib, 3) : 0,
          .shader_binary_size = shader->info.binary_size,
@@ -1392,7 +1454,9 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
       program_length = program.length;
       resource_spec = AGX_IOTO_G17P_EOT_RESOURCE_SPEC;
 
-      if (direct_resolve)
+      /* Either way this program writes the resolve attachment, so the pass
+       * has no resolve left to run after it. */
+      if (direct_resolve || resolve_view)
          cmd->state.gfx.render.g17p_direct_color_resolve = true;
    } else if (op == AGX_BG_EOT_NONE) {
       const struct hk_agx3_g17p_graphics_program_desc desc = {
