@@ -134,20 +134,10 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
    uint64_t rw_base = hk_buffer_address_rw(buffer, 0) + head_offset_B;
    uint64_t ro_base = hk_buffer_address_ro(buffer, 0) + head_offset_B;
 
-   /* Which mapping the sampled texel-buffer descriptor addresses on G17P.
-    *
-    * The read-only shadow at +sparse_ro_offset is the mechanism every other
-    * read-only descriptor uses to get sparseResidencyNonResidentStrict for
-    * free: an unbound page reads as zero there.  For a texel buffer G17P
-    * cannot rely on it, so the descriptor names the primary mapping and the
-    * shader masks a non-resident texel to zero from the residency bitmap
-    * instead -- one address and one residency source for both the sparse
-    * fetch and the ordinary read.  See buffer_texel_resident() in
-    * agx_nir_lower_texture.c.
-    *
-    * For a non-sparse buffer hk_buffer_address() returns the same address
-    * either way (the shadow only exists for buffer->va != NULL), so this
-    * cannot move an ordinary texel buffer.
+   /* On AGX3/M5, address the primary mapping rather than the read-only sparse
+    * shadow; non-resident texels are masked to zero in the shader from the
+    * residency bitmap (see buffer_texel_resident() in agx_nir_lower_texture.c).
+    * Non-sparse buffers return the same VA from both helpers.
     */
    const uint64_t sampled_base = g17p ? rw_base : ro_base;
 
@@ -201,13 +191,10 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       texture.stride = texture.width * sizeof(uint32_t) - 16;
    }
    if (g17p) {
-      /* A sparse-resident buffer carries a per-page residency bitmap, and the
-       * buffer texture descriptor has no hardware sparse mode to report
-       * residency with, so a sparse texel fetch reads that bitmap instead.
-       * Pack the map and the element size the shader needs to find the page;
-       * see AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET.  A non-power-of-two
-       * element size (the emulated RGB32 layout) takes the raw load path,
-       * which claims residency anyway, so leave the word zero for it. */
+      /* Pack the per-page residency bitmap and element size for sparse texel
+       * fetches (AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET); leave zero for
+       * non-power-of-two emulated RGB32, which uses raw loads.
+       */
       const uint32_t sparse = hk_buffer_sparse_texel_word(
          buffer, util_format_get_blocksize(format));
 
@@ -279,11 +266,7 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       memset(&view->pbe, 0, sizeof(view->pbe));
    }
 
-   /* G17P reaches a sampled texture through the device heap, so the view's
-    * texture descriptor has to live there and the descriptor carries only its
-    * index.  Without this the index stays 0 and every texel-buffer fetch
-    * resolves to the null texture.  Mirrors hk_image_view.c's per-plane
-    * hk_descriptor_table_add(). */
+   /* Register the sampled texture in the device heap (mirrors hk_image_view.c). */
    if (g17p) {
       VkResult result = hk_descriptor_table_add(
          device, &device->sampled_images, &view->tex,
@@ -317,24 +300,16 @@ hk_DestroyBufferView(VkDevice _device, VkBufferView bufferView,
 }
 
 /*
- * VK_EXT_descriptor_buffer texel buffers on G17P.
+ * VK_EXT_descriptor_buffer texel buffers on AGX3/M5.
  *
- * vkGetDescriptorEXT() names a texel buffer by address, range and format, so
- * there is no view object to own the device heap texture that G17P samples
- * through (hk_CreateBufferView()). Instead each format gets a fixed set of
- * maximum-sized buffer textures, "windows", over the application VA: 2^28
- * texels each, one starting every 2^27 texels, so any view of at most 2^27
- * texels lies inside one of them. The descriptor's software metadata selects
- * the view's texels in the window: the element offset and count that the
- * texel fetch, image load/store and atomic lowerings already apply
- * (agx_nir_lower_texture.c). The heap indices are reserved when the device is
- * created, in a fixed order, and a window is written when first used, so a
- * descriptor does not depend on the order views were asked for
- * (capture/replay). A larger view, or one outside the VA, gets a texture of
- * its own, kept until the device is destroyed.
- *
- * The emulated RGB32 formats read memory directly at the metadata address;
- * their texture is only read out of bounds, so one window serves each.
+ * Since vkGetDescriptorEXT() has no VkBufferView object to own a heap slot,
+ * each format reserves overlapping 2^28-texel "windows" stepped every 2^27
+ * texels across the application VA so any view <= 2^27 texels fits in one,
+ * with software metadata selecting offset and count (agx_nir_lower_texture.c).
+ * Indices are reserved in fixed order at device creation and populated on first
+ * use for capture/replay determinism; larger/out-of-range views allocate a
+ * dedicated device-lifetime slot. Emulated RGB32 reads memory directly and
+ * needs only one window per format.
  */
 #define HK_TEXEL_WINDOW_EL      (AGX_TEXTURE_BUFFER_WIDTH * AGX_TEXTURE_BUFFER_MAX_HEIGHT)
 #define HK_TEXEL_WINDOW_STEP_EL (HK_TEXEL_WINDOW_EL / 2)
