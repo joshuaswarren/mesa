@@ -53,16 +53,16 @@ liveness_ins_update_dense(BITSET_WORD *live, agx_instr *I)
 void
 agx_compute_liveness(agx_context *ctx)
 {
-   BITSET_DECLARE(stack_live, 4096);
-   BITSET_WORD *dense_live =
-      ctx->alloc <= 4096 ? stack_live : BITSET_CALLOC(ctx->alloc);
-
    /* Fast path for single-block shaders without self-loops: one dense
     * backwards pass with no worklist or sparse bitset churn.
     */
    if (list_is_singular(&ctx->blocks)) {
       agx_block *blk = list_first_entry(&ctx->blocks, agx_block, link);
       if (util_dynarray_num_elements(&blk->predecessors, agx_block *) == 0) {
+         BITSET_DECLARE(stack_live, 4096);
+         BITSET_WORD *dense_live =
+            ctx->alloc <= 4096 ? stack_live : BITSET_CALLOC(ctx->alloc);
+
          u_sparse_bitset_free(&blk->live_in);
          u_sparse_bitset_free(&blk->live_out);
          u_sparse_bitset_init(&blk->live_in, ctx->alloc, blk);
@@ -85,6 +85,160 @@ agx_compute_liveness(agx_context *ctx)
          return;
       }
    }
+
+   /* Fast path when the dense block x SSA bitset slab stays bounded (~4 MiB
+    * at the 262144-word cap): precompute per-block gen/kill once, solve the
+    * fixed-point with word-wide bitset ops (no per-iteration sparse bitset
+    * dup/merge/free or repeated instruction walks), then run a single final
+    * backwards pass per block to mark src.kill and populate sparse live sets.
+    */
+   const unsigned words = BITSET_WORDS(ctx->alloc);
+   if (ctx->num_blocks > 0 && ctx->alloc > 0 &&
+       (uint64_t)ctx->num_blocks * words <= 262144) {
+      bool valid_indices = true;
+      bool *seen = calloc(ctx->num_blocks, sizeof(bool));
+      if (seen) {
+         agx_foreach_block(ctx, block) {
+            if (block->index >= ctx->num_blocks || seen[block->index]) {
+               valid_indices = false;
+               break;
+            }
+            seen[block->index] = true;
+         }
+         free(seen);
+      } else {
+         valid_indices = false;
+      }
+
+      if (valid_indices) {
+         const size_t total = (size_t)ctx->num_blocks * words;
+         BITSET_WORD *slab = calloc(4 * total + words, sizeof(BITSET_WORD));
+         bool *has_phi = calloc(ctx->num_blocks, sizeof(bool));
+         if (slab && has_phi) {
+            BITSET_WORD *gen = slab;
+            BITSET_WORD *kill = gen + total;
+            BITSET_WORD *live_in = kill + total;
+            BITSET_WORD *live_out = live_in + total;
+            BITSET_WORD *tmp = live_out + total;
+
+            u_worklist worklist;
+            u_worklist_init(&worklist, ctx->num_blocks, NULL);
+
+            agx_foreach_block(ctx, block) {
+               const unsigned b = block->index;
+               BITSET_WORD *gb = gen + (size_t)b * words;
+               BITSET_WORD *kb = kill + (size_t)b * words;
+
+               agx_foreach_instr_in_block_rev(block, I) {
+                  if (I->op == AGX_OPCODE_PHI) {
+                     has_phi[b] = true;
+                     continue;
+                  }
+                  agx_foreach_ssa_dest(I, d) {
+                     const unsigned v = I->dest[d].value;
+                     BITSET_CLEAR(gb, v);
+                     BITSET_SET(kb, v);
+                  }
+                  agx_foreach_ssa_src(I, s) {
+                     const unsigned v = I->src[s].value;
+                     BITSET_SET(gb, v);
+                     BITSET_CLEAR(kb, v);
+                  }
+               }
+
+               agx_worklist_push_head(&worklist, block);
+            }
+
+            while (!u_worklist_is_empty(&worklist)) {
+               agx_block *blk = agx_worklist_pop_head(&worklist);
+               const unsigned b = blk->index;
+               const BITSET_WORD *gb = gen + (size_t)b * words;
+               const BITSET_WORD *kb = kill + (size_t)b * words;
+               BITSET_WORD *in_b = live_in + (size_t)b * words;
+               const BITSET_WORD *out_b = live_out + (size_t)b * words;
+
+               for (unsigned w = 0; w < words; ++w)
+                  in_b[w] = (out_b[w] & ~kb[w]) | gb[w];
+
+               if (has_phi[b]) {
+                  memcpy(tmp, in_b, words * sizeof(BITSET_WORD));
+                  agx_foreach_phi_in_block(blk, phi) {
+                     assert(phi->dest[0].type == AGX_INDEX_NORMAL);
+                     BITSET_CLEAR(tmp, phi->dest[0].value);
+                  }
+               }
+
+               const BITSET_WORD *prop = has_phi[b] ? tmp : in_b;
+               agx_foreach_predecessor(blk, pred) {
+                  const unsigned p = (*pred)->index;
+                  BITSET_WORD *out_p = live_out + (size_t)p * words;
+                  bool changed = false;
+
+                  for (unsigned w = 0; w < words; ++w) {
+                     BITSET_WORD old = out_p[w];
+                     BITSET_WORD nw = old | prop[w];
+                     if (nw != old) {
+                        out_p[w] = nw;
+                        changed = true;
+                     }
+                  }
+
+                  if (has_phi[b]) {
+                     unsigned pred_idx = agx_predecessor_index(blk, *pred);
+                     agx_foreach_phi_in_block(blk, phi) {
+                        agx_index operand = phi->src[pred_idx];
+                        if (operand.type == AGX_INDEX_NORMAL) {
+                           if (!BITSET_TEST(out_p, operand.value)) {
+                              BITSET_SET(out_p, operand.value);
+                              changed = true;
+                           }
+                           phi->src[pred_idx].kill = false;
+                        }
+                     }
+                  }
+
+                  if (changed)
+                     agx_worklist_push_tail(&worklist, *pred);
+               }
+            }
+
+            agx_foreach_block(ctx, block) {
+               const unsigned b = block->index;
+               const BITSET_WORD *in_b = live_in + (size_t)b * words;
+               const BITSET_WORD *out_b = live_out + (size_t)b * words;
+
+               u_sparse_bitset_free(&block->live_in);
+               u_sparse_bitset_free(&block->live_out);
+               u_sparse_bitset_init(&block->live_in, ctx->alloc, block);
+               u_sparse_bitset_init(&block->live_out, ctx->alloc, block);
+
+               memcpy(tmp, out_b, words * sizeof(BITSET_WORD));
+               agx_foreach_instr_in_block_rev(block, I) {
+                  if (I->op != AGX_OPCODE_PHI)
+                     liveness_ins_update_dense(tmp, I);
+               }
+               assert(memcmp(tmp, in_b, words * sizeof(BITSET_WORD)) == 0);
+
+               unsigned v;
+               BITSET_FOREACH_SET(v, in_b, ctx->alloc)
+                  u_sparse_bitset_set(&block->live_in, v);
+               BITSET_FOREACH_SET(v, out_b, ctx->alloc)
+                  u_sparse_bitset_set(&block->live_out, v);
+            }
+
+            u_worklist_fini(&worklist);
+            free(slab);
+            free(has_phi);
+            return;
+         }
+         free(slab);
+         free(has_phi);
+      }
+   }
+
+   BITSET_DECLARE(stack_live, 4096);
+   BITSET_WORD *dense_live =
+      ctx->alloc <= 4096 ? stack_live : BITSET_CALLOC(ctx->alloc);
 
    u_worklist worklist;
    u_worklist_init(&worklist, ctx->num_blocks, NULL);
