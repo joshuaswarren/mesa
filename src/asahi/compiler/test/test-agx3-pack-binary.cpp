@@ -17713,3 +17713,71 @@ TEST_F(AGX3PackBinary, TextureFetchBankRetireClearsWaitMask)
                          redundant_r0 + rlen),
              code.end());
 }
+
+/* On AGX3B, consecutive plain 2D texel fetches allocate up to six disjoint
+ * banks (0, 8, 16, 24, 32, 40) matching the six scoreboard slots without
+ * early waits before wrapping cleanly onto bank 0 and bank 8. */
+TEST_F(AGX3PackBinary, TextureFetchPlain2DUsesSixBanksOnAGX3B)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3B;
+   const unsigned banks = 6u;
+   const unsigned ops = 8u;
+   agx_builder *b = builder(enc);
+   key.dev.chip = AGX_CHIP_G17P;
+   key.dev.emit_agx3d = false;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->max_reg = 127;
+
+   for (unsigned i = 0; i < ops; ++i) {
+      const uint16_t dst_reg = i == 1 ? 0 : (88 + 4 * i);
+      agx_index dest = agx_register(dst_reg, AGX_SIZE_16);
+      dest.channels_m1 = 3;
+      agx_index coord = agx_register(8 + 8 * i, AGX_SIZE_32);
+      coord.channels_m1 = 1;
+      auto *I = agx_texture_sample_to(
+         b, dest, coord, agx_immediate(0), agx_immediate(0),
+         agx_immediate(0), agx_immediate(0), agx_null(),
+         AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0,
+         false, false, false, AGX_GATHER_NONE, false);
+      I->op = AGX_OPCODE_TEXTURE_LOAD;
+      I->mask = 15;
+   }
+   agx_stop(b);
+
+   const auto code = pack(b);
+   ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+   EXPECT_TRUE(b->shader->agx3_staging_known);
+   EXPECT_EQ(b->shader->agx3_staging_halfs, 8u * (banks - 1) + 4u);
+
+   for (unsigned i = 0; i < ops; ++i) {
+      const uint16_t bank = 8 * (i % banks);
+      const uint8_t slot = 1 + (i % banks);
+      const uint16_t dst_reg = i == 1 ? 0 : (88 + 4 * i);
+      const uint16_t copy_wait = i >= banks ? (uint16_t)(1u << (slot - 1)) : 0;
+      uint8_t bytes[AGX3_TEX_MAX_LENGTH], len = 0;
+      ASSERT_TRUE(agx3_tex_stage_copy_hints(
+         enc, bank, 8 + 8 * i, slot, copy_wait, false, false, bytes, &len));
+      EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
+                code.end())
+         << "missing plain 2D fetch coord x staging for op " << i
+         << " at bank " << bank << " wait " << copy_wait;
+
+      const struct agx3_tex_fetch_desc want = {
+         .dest = dst_reg,
+         .coord = bank,
+         .width = AGX3_TEX_W16,
+         .mask = 15,
+         .slot = slot,
+         .wait_mask = (uint16_t)(1u << (slot - 1)),
+         .coord_kill = true,
+         .final = i == ops - 1,
+         .array = false,
+         .sampler_value = 0,
+      };
+      ASSERT_TRUE(agx3_tex_encode_fetch(enc, &want, bytes, &len));
+      EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
+                code.end())
+         << "missing plain 2D fetch instruction for op " << i << " at bank "
+         << bank;
+   }
+}

@@ -2361,15 +2361,10 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
    const bool array_bank = array && !register_lod;
    const bool m5_ms_banks = m5 && (ms_2d || ms_array);
    const bool banked_read = plain_bank || array_bank || m5_ms_banks;
-   /* Plain M5 fetch coordinates can name any aligned bank through half 60.
-    * Use independent banks for all eight scoreboard slots before recycling
-    * one. */
-   const unsigned plain_banks = m5 ?
-      MIN2(AGX3_M5_FETCH_BANKS, 1 + (60 - staging_base) / 8) : 2;
-   /* 2D-array fetch coordinates can name any aligned bank through half 60
-    * (f19); allocate one eight-half bank per scoreboard slot (6 on AGX3B,
+   /* Fetch coordinates can name any aligned bank through half 60 (f19).
+    * Use independent eight-half banks for all scoreboard slots (6 on AGX3B,
     * 8 on AGX3C) before recycling one. */
-   const unsigned array_banks =
+   const unsigned plain_banks =
       MIN2(m5 ? AGX3_M5_FETCH_BANKS : 6u, 1 + (60 - staging_base) / 8);
    /* Keep independent non-array MS publications in separate operand banks. */
    const unsigned ms_banks =
@@ -2399,8 +2394,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       const uint16_t first = banked_read ? staging_base : 0;
       const unsigned max_banks =
          m5_ms_banks ? ms_banks :
-         array_bank  ? array_banks :
-         plain_bank  ? plain_banks : 1u;
+         (plain_bank || array_bank) ? plain_banks : 1u;
       bool placed = false;
       for (unsigned c = 0; c < max_banks && !placed; ++c) {
          const uint16_t start = first + 8 * c;
