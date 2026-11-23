@@ -181,6 +181,16 @@ check_shape_for_chip(VkFormat format, bool is_depth, uint32_t chip_id)
    CHECK(CHIP_ELIGIBLE(i) == !is_color_16b);
    i = base; i.arrayLayers = 6;
    CHECK(CHIP_ELIGIBLE(i) == !is_color_16b);
+   /* Mipmapped 2D arrays and mipmapped cubemaps compress for 1-8B colour;
+    * 16B colour, depth, and mipmapped 3D stay plain. */
+   i = base; i.arrayLayers = 4; i.mipLevels = 4;
+   CHECK(CHIP_ELIGIBLE(i) == (!is_depth && !is_color_16b));
+   i = base; i.extent.width = 256; i.extent.height = 256;
+   i.arrayLayers = 6; i.mipLevels = 4;
+   i.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   CHECK(CHIP_ELIGIBLE(i) == (!is_depth && !is_color_16b));
+   i = base; i.imageType = VK_IMAGE_TYPE_3D; i.extent.depth = 4; i.mipLevels = 2;
+   CHECK(!CHIP_ELIGIBLE(i));
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
       CHECK(CHIP_ELIGIBLE(i) == (is_depth && (s == 2 || s == 4)));

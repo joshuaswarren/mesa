@@ -302,7 +302,7 @@ check_layered_and_msaa(void)
    small.extent.width = small.extent.height = 256;
    CHECK(!ELIGIBLE(small));
    i.mipLevels = 5;
-   CHECK(!ELIGIBLE(i));
+   CHECK(ELIGIBLE(i));
    i.mipLevels = 1;
    i.flags = 0;
    for (unsigned samples = 1; samples <= 64; samples <<= 1) {

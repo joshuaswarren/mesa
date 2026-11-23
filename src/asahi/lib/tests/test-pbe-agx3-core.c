@@ -662,7 +662,26 @@ check_gen9_compressed_atlas_vector(void)
    bad = fields;
    bad.layout = 1;
    CHECK(!agx_pbe_agx3_2d_pack(9, &bad, &packed));
-   CHECK(!agx_pbe_agx3_2d_array_mip_pack(9, &fields, 2, 0, 5, &packed));
+   /* Gen9 compressed 2D array mip chains preserve the base metadata pointer
+    * in word2[43:0] alongside level/levels in word2[51:44], array dimension in
+    * word0[3:0], layers-1 in word1[59:44], and page_aligned_layers in bit60. */
+   struct agx_pbe_agx3_2d_fields array_fields = fields;
+   array_fields.page_aligned_layers = true;
+   for (unsigned level = 0; level < 5; ++level) {
+      uint8_t array_expected[32];
+      memcpy(array_expected, expected, sizeof(array_expected));
+      array_expected[0] = (array_expected[0] & 0xf0) | 3;
+      /* layers = 4 -> (4 - 1) << 44 in word1 (bits 44..59 -> byte 13 bits 4..7),
+       * plus page_aligned_layers at bit 60 (byte 15 bit 4). */
+      array_expected[13] |= 3u << 4;
+      array_expected[15] |= 1u << 4;
+      array_expected[21] = level << 4;
+      CHECK(agx_pbe_agx3_2d_array_mip_pack(9, &array_fields, 4, level, 5,
+                                           &packed));
+      CHECK(memcmp(packed.bytes, array_expected, sizeof(array_expected)) == 0);
+   }
+   /* Compressed 3D mip chains remain rejected. */
+   CHECK(!agx_pbe_agx3_3d_mip_pack(9, &array_fields, 4, 0, 5, &packed));
    return 0;
 }
 

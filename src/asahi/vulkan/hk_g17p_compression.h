@@ -340,7 +340,7 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
       return false;
    }
 
-   if ((three_d || info->arrayLayers > 1) && info->mipLevels != 1)
+   if (three_d && info->mipLevels != 1)
       return false;
    /* #66: a legal MRT mix can spill any MSAA colour attachment, and G17P
     * has no MSAA/1-8 B decompression program for a spilled compressed one.
