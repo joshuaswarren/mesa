@@ -5,8 +5,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdlib.h>
+#include <string.h>
 #include "util/bitset.h"
-#include "util/hash_table.h"
 #include "util/ralloc.h"
 #include "util/sparse_bitset.h"
 #include "util/u_dynarray.h"
@@ -21,7 +22,7 @@
  */
 
 /*
- * Next-use distances are logically in ℤ ∪ {∞}. Modeled as saturating uint32 and
+ * Next-use distances are logically in ℤ ∪ {∞}. Modeled as saturating uint32 and
  * referred to as dist_t.
  *
  * next_uses represents a next-use map. This is a sparse data structure mapping
@@ -30,101 +31,127 @@
  * requirements O(live variables). This is important for performance and memory
  * usage on big shaders with many blocks.
  *
- * For now, next_uses is backed by a Mesa hash table, but it could be optimized
- * to something more specialized in the future.
+ * Backed by a compact open-addressed table with power-of-two capacity.
+ * Distances decrease monotonically during fixed-point propagation, so entries
+ * are never removed and no tombstones are needed.
  */
 #define DIST_INFINITY (UINT32_MAX)
 typedef uint32_t dist_t;
 
-static dist_t
+static inline dist_t
 dist_sum(dist_t A, dist_t B)
 {
    return (A + B < A) ? DIST_INFINITY : (A + B);
 }
 
-struct next_uses {
-   struct hash_table_u64 *ht;
+struct next_use_entry {
+   uint32_t key; /* UINT32_MAX for empty */
+   dist_t dist;
 };
+
+struct next_uses {
+   void *memctx;
+   struct next_use_entry *entries;
+   uint32_t mask;
+   uint32_t count;
+};
+
+static inline uint32_t
+next_use_hash(uint32_t key)
+{
+   uint32_t h = key * 2654435761u;
+   return h ^ (h >> 16);
+}
 
 static void
 init_next_uses(struct next_uses *nu, void *memctx)
 {
-   nu->ht = _mesa_hash_table_u64_create(memctx);
+   nu->memctx = memctx;
+   nu->entries = NULL;
+   nu->mask = 0;
+   nu->count = 0;
 }
 
 static void
-destroy_next_uses(struct next_uses *nu)
+next_uses_grow(struct next_uses *nu)
 {
-   _mesa_hash_table_u64_destroy(nu->ht);
-}
+   uint32_t old_cap = nu->entries ? nu->mask + 1 : 0;
+   uint32_t new_cap = old_cap ? old_cap * 2 : 16;
+   uint32_t new_mask = new_cap - 1;
+   struct next_use_entry *new_entries =
+      ralloc_array(nu->memctx, struct next_use_entry, new_cap);
+   memset(new_entries, 0xff, new_cap * sizeof(*new_entries));
 
-static void
-clear_next_uses(struct next_uses *nu)
-{
-   _mesa_hash_table_u64_clear(nu->ht);
-}
-
-static void
-copy_next_uses(struct next_uses *nu, const struct next_uses *from)
-{
-   clear_next_uses(nu);
-
-   hash_table_u64_foreach(from->ht, use) {
-      _mesa_hash_table_u64_insert(nu->ht, use.key, use.data);
-   }
-}
-
-static void
-set_next_use(struct next_uses *nu, unsigned node, dist_t dist)
-{
-   if (dist == DIST_INFINITY) {
-      _mesa_hash_table_u64_remove(nu->ht, node);
-   } else {
-      uintptr_t as_ptr = (uintptr_t)(dist + 1);
-      assert(as_ptr != 0 && "non-NULL");
-
-      _mesa_hash_table_u64_insert(nu->ht, node, (void *)as_ptr);
-   }
-}
-
-static dist_t
-search_next_uses(const struct next_uses *nu, unsigned node)
-{
-   void *ent = _mesa_hash_table_u64_search(nu->ht, node);
-   if (!ent)
-      return DIST_INFINITY;
-
-   uintptr_t raw = (uintptr_t)ent;
-   return raw - 1;
-}
-
-#define foreach_next_use(nu, node, dist)                                       \
-   hash_table_u64_foreach((nu)->ht, use_)                                      \
-      for (uint32_t _terminator = 1, node = use_.key,                          \
-                    UNUSED dist = ((uintptr_t)use_.data) - 1;                  \
-           _terminator != 0; _terminator = 0)
-
-/*
- * Calculate the minimum of two next-use sets. Values absent from one of the
- * underlying sets are infinity so do not contribute to the minimum, instead
- * acting like a set union.
- */
-static bool
-minimum_next_uses(struct next_uses *nu, const struct next_uses *from)
-{
-   bool progress = false;
-
-   foreach_next_use(from, node, from_dist) {
-      dist_t nu_dist = search_next_uses(nu, node);
-
-      if (from_dist < nu_dist) {
-         set_next_use(nu, node, from_dist);
-         progress = true;
+   for (uint32_t i = 0; i < old_cap; ++i) {
+      uint32_t k = nu->entries[i].key;
+      if (k != UINT32_MAX) {
+         uint32_t idx = next_use_hash(k) & new_mask;
+         while (new_entries[idx].key != UINT32_MAX)
+            idx = (idx + 1) & new_mask;
+         new_entries[idx] = nu->entries[i];
       }
    }
 
-   return progress;
+   ralloc_free(nu->entries);
+   nu->entries = new_entries;
+   nu->mask = new_mask;
 }
+
+static inline bool
+set_next_use_min(struct next_uses *nu, unsigned node, dist_t dist)
+{
+   assert(node != UINT32_MAX);
+   assert(dist != DIST_INFINITY);
+
+   if (!nu->entries || nu->count + 1 > ((nu->mask + 1) >> 2) * 3)
+      next_uses_grow(nu);
+
+   uint32_t mask = nu->mask;
+   uint32_t idx = next_use_hash(node) & mask;
+   for (;;) {
+      struct next_use_entry *e = &nu->entries[idx];
+      if (e->key == node) {
+         if (dist < e->dist) {
+            e->dist = dist;
+            return true;
+         }
+         return false;
+      }
+      if (e->key == UINT32_MAX) {
+         e->key = node;
+         e->dist = dist;
+         nu->count++;
+         return true;
+      }
+      idx = (idx + 1) & mask;
+   }
+}
+
+static inline dist_t
+search_next_uses(const struct next_uses *nu, unsigned node)
+{
+   if (!nu->entries)
+      return DIST_INFINITY;
+
+   uint32_t mask = nu->mask;
+   uint32_t idx = next_use_hash(node) & mask;
+   for (;;) {
+      const struct next_use_entry *e = &nu->entries[idx];
+      if (e->key == node)
+         return e->dist;
+      if (e->key == UINT32_MAX)
+         return DIST_INFINITY;
+      idx = (idx + 1) & mask;
+   }
+}
+
+#define foreach_next_use(nu, node, dist_)                                      \
+   for (uint32_t _nu_i = 0, _nu_cap = (nu)->entries ? (nu)->mask + 1 : 0;      \
+        _nu_i < _nu_cap; ++_nu_i)                                              \
+      if ((nu)->entries[_nu_i].key != UINT32_MAX)                              \
+         for (uint32_t _terminator = 1, node = (nu)->entries[_nu_i].key,       \
+                       UNUSED dist_ = (nu)->entries[_nu_i].dist;               \
+              _terminator != 0; _terminator = 0)
 
 static uint32_t
 instr_cycles(const agx_instr *I)
@@ -1442,6 +1469,11 @@ compute_s_entry(struct spill_ctx *ctx)
    assert(sb->nS_entry == nS);
 }
 
+struct block_local_defs {
+   uint32_t *defined;
+   unsigned n_defined;
+};
+
 static ATTRIBUTE_NOINLINE void
 global_next_use_distances(agx_context *ctx, void *memctx,
                           struct spill_block *blocks)
@@ -1449,116 +1481,142 @@ global_next_use_distances(agx_context *ctx, void *memctx,
    u_worklist worklist;
    u_worklist_init(&worklist, ctx->num_blocks, NULL);
 
+   BITSET_WORD *defined = BITSET_CALLOC(ctx->alloc);
+   BITSET_WORD *phi_dests = BITSET_CALLOC(ctx->alloc);
+   struct block_local_defs *local_defs =
+      calloc(ctx->num_blocks, sizeof(*local_defs));
+   struct util_dynarray def_scratch = UTIL_DYNARRAY_INIT;
+
+   /* Precompute each block's local first uses (seeded directly into
+    * next_use_in) and defined variable list once before the worklist loop. */
    agx_foreach_block(ctx, block) {
       struct spill_block *sb = &blocks[block->index];
 
       init_next_uses(&sb->next_use_in, memctx);
       init_next_uses(&sb->next_use_out, memctx);
 
-      agx_foreach_instr_in_block(block, I) {
-         sb->cycles += instr_cycles(I);
-      }
-
-      agx_worklist_push_head(&worklist, block);
-   }
-
-   /* Definitions that have been seen */
-   BITSET_WORD *defined =
-      malloc(BITSET_WORDS(ctx->alloc) * sizeof(BITSET_WORD));
-
-   struct next_uses dists;
-   init_next_uses(&dists, NULL);
-
-   /* Iterate the work list in reverse order since liveness is backwards */
-   while (!u_worklist_is_empty(&worklist)) {
-      agx_block *blk = agx_worklist_pop_head(&worklist);
-      struct spill_block *sb = &blocks[blk->index];
-
-      /* Definitions that have been seen */
-      memset(defined, 0, BITSET_WORDS(ctx->alloc) * sizeof(BITSET_WORD));
-
-      /* Initialize all distances to infinity */
-      clear_next_uses(&dists);
-
+      util_dynarray_clear(&def_scratch);
       uint32_t cycle = 0;
 
-      /* Calculate dists. Phis are handled separately. */
-      agx_foreach_instr_in_block(blk, I) {
+      agx_foreach_instr_in_block(block, I) {
          if (I->op == AGX_OPCODE_PHI) {
-            cycle++;
+            cycle += instr_cycles(I);
             continue;
          }
 
-         /* Record first use before def. Phi sources are handled
-          * above, because they logically happen in the
-          * predecessor.
-          */
          agx_foreach_ssa_src(I, s) {
-            if (BITSET_TEST(defined, I->src[s].value))
-               continue;
-            if (search_next_uses(&dists, I->src[s].value) < DIST_INFINITY)
-               continue;
-
-            assert(I->src[s].value < ctx->alloc);
-            set_next_use(&dists, I->src[s].value, cycle);
+            unsigned v = I->src[s].value;
+            assert(v < ctx->alloc);
+            if (!BITSET_TEST(defined, v))
+               set_next_use_min(&sb->next_use_in, v, cycle);
          }
 
-         /* Record defs */
          agx_foreach_ssa_dest(I, d) {
-            assert(I->dest[d].value < ctx->alloc);
-            BITSET_SET(defined, I->dest[d].value);
+            uint32_t v = I->dest[d].value;
+            assert(v < ctx->alloc);
+            if (!BITSET_TEST(defined, v)) {
+               BITSET_SET(defined, v);
+               util_dynarray_append(&def_scratch, v);
+            }
          }
 
          cycle += instr_cycles(I);
       }
 
-      /* Apply transfer function to get our entry state. */
+      sb->cycles = cycle;
+      unsigned n_def = util_dynarray_num_elements(&def_scratch, uint32_t);
+      if (n_def) {
+         local_defs[block->index].n_defined = n_def;
+         local_defs[block->index].defined = malloc(n_def * sizeof(uint32_t));
+         memcpy(local_defs[block->index].defined,
+                util_dynarray_begin(&def_scratch), n_def * sizeof(uint32_t));
+         for (unsigned i = 0; i < n_def; ++i)
+            BITSET_CLEAR(defined, local_defs[block->index].defined[i]);
+      }
+
+      agx_worklist_push_head(&worklist, block);
+   }
+
+   util_dynarray_fini(&def_scratch);
+
+   /* Iterate the work list in reverse order since liveness is backwards */
+   while (!u_worklist_is_empty(&worklist)) {
+      agx_block *blk = agx_worklist_pop_head(&worklist);
+      struct spill_block *sb = &blocks[blk->index];
+      const struct block_local_defs *ld = &local_defs[blk->index];
+
+      for (unsigned i = 0; i < ld->n_defined; ++i)
+         BITSET_SET(defined, ld->defined[i]);
+
+      /* Apply transfer function: local first uses are already in next_use_in
+       * with cycle < sb->cycles, so taking the minimum preserves them while
+       * incorporating monotonically decreasing next_use_out distances. */
       foreach_next_use(&sb->next_use_out, node, dist) {
-         set_next_use(&sb->next_use_in, node, dist_sum(dist, sb->cycles));
+         if (!BITSET_TEST(defined, node)) {
+            dist_t d = dist_sum(dist, sb->cycles);
+            if (d != DIST_INFINITY)
+               set_next_use_min(&sb->next_use_in, node, d);
+         }
       }
 
-      foreach_next_use(&dists, node, dist) {
-         set_next_use(&sb->next_use_in, node, dist);
-      }
-
-      int i;
-      BITSET_FOREACH_SET(i, defined, ctx->alloc) {
-         set_next_use(&sb->next_use_in, i, DIST_INFINITY);
-      }
+      for (unsigned i = 0; i < ld->n_defined; ++i)
+         BITSET_CLEAR(defined, ld->defined[i]);
 
       /* Propagate the live in of the successor (blk) to the live out of
        * predecessors.
        *
        * Phi nodes are logically on the control flow edge and act in parallel.
-       * To handle when propagating, we kill writes from phis and make live the
-       * corresponding sources.
+       * Skip phi destinations from next_use_in and make each predecessor's
+       * corresponding phi source live with distance 0.
        */
+      bool has_phis = false;
+      agx_foreach_phi_in_block(blk, I) {
+         assert(I->dest[0].type == AGX_INDEX_NORMAL);
+         BITSET_SET(phi_dests, I->dest[0].value);
+         has_phis = true;
+      }
+
       agx_foreach_predecessor(blk, pred) {
          struct spill_block *sp = &blocks[(*pred)->index];
-         copy_next_uses(&dists, &sb->next_use_in);
+         bool progress = false;
 
-         /* Kill write */
-         agx_foreach_phi_in_block(blk, I) {
-            assert(I->dest[0].type == AGX_INDEX_NORMAL);
-            set_next_use(&dists, I->dest[0].value, DIST_INFINITY);
+         if (has_phis) {
+            foreach_next_use(&sb->next_use_in, node, dist) {
+               if (!BITSET_TEST(phi_dests, node) &&
+                   set_next_use_min(&sp->next_use_out, node, dist))
+                  progress = true;
+            }
+
+            unsigned pred_idx = agx_predecessor_index(blk, *pred);
+            agx_foreach_phi_in_block(blk, I) {
+               agx_index operand = I->src[pred_idx];
+               if (operand.type == AGX_INDEX_NORMAL &&
+                   set_next_use_min(&sp->next_use_out, operand.value, 0))
+                  progress = true;
+            }
+         } else {
+            foreach_next_use(&sb->next_use_in, node, dist) {
+               if (set_next_use_min(&sp->next_use_out, node, dist))
+                  progress = true;
+            }
          }
 
-         /* Make live the corresponding source */
-         agx_foreach_phi_in_block(blk, I) {
-            agx_index operand = I->src[agx_predecessor_index(blk, *pred)];
-            if (operand.type == AGX_INDEX_NORMAL)
-               set_next_use(&dists, operand.value, 0);
-         }
-
-         /* Join by taking minimum */
-         if (minimum_next_uses(&sp->next_use_out, &dists))
+         if (progress)
             agx_worklist_push_tail(&worklist, *pred);
+      }
+
+      if (has_phis) {
+         agx_foreach_phi_in_block(blk, I)
+            BITSET_CLEAR(phi_dests, I->dest[0].value);
       }
    }
 
+   for (unsigned i = 0; i < ctx->num_blocks; ++i)
+      free(local_defs[i].defined);
+   free(local_defs);
+   free(phi_dests);
    free(defined);
    u_worklist_fini(&worklist);
-   destroy_next_uses(&dists);
 }
 
 static ATTRIBUTE_NOINLINE void

@@ -179,3 +179,58 @@ TEST(SpillFallback, RepeatedSplitLaneLeavesNoDeadDestination)
    EXPECT_EQ(repeated, 1u);
    ralloc_free(mem);
 }
+
+/* Exercise next_uses growth (>16 live-in values) and multi-block propagation
+ * with spilling across a diamond and loop. */
+TEST(SpillLoopHeader, ManyLiveValuesGrowNextUsesAndValidate)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.has_scratch = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->any_cf = true;
+
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *header = agx_test_block(b->shader);
+   agx_block *body = agx_test_block(b->shader);
+   agx_block *exit = agx_test_block(b->shader);
+   header->loop_header = true;
+   agx_block_add_successor(entry, header);
+   agx_block_add_successor(header, body);
+   agx_block_add_successor(header, exit);
+   agx_block_add_successor(body, header);
+
+   constexpr unsigned N = 24;
+   agx_index live[N];
+   b->cursor = agx_after_block(entry);
+   for (unsigned i = 0; i < N; ++i) {
+      live[i] = agx_fadd(b, agx_uniform(2 * i, AGX_SIZE_32),
+                         agx_uniform(2 * i + 2, AGX_SIZE_32));
+   }
+
+   b->cursor = agx_after_block(body);
+   agx_index acc = agx_fadd(b, live[0], live[1]);
+   agx_unit_test(b, acc);
+
+   b->cursor = agx_after_block(exit);
+   for (unsigned i = 0; i < N; ++i)
+      agx_unit_test(b, live[i]);
+
+   agx_compute_liveness(b->shader);
+   agx_spill(b->shader, 24, false);
+
+   unsigned stores = 0, fills = 0;
+   agx_foreach_instr_global(b->shader, I) {
+      if (I->op == AGX_OPCODE_MOV && I->dest[0].memory)
+         stores++;
+      if (I->op == AGX_OPCODE_MOV && I->src[0].memory)
+         fills++;
+   }
+   EXPECT_GT(stores, 0u);
+   EXPECT_GT(fills, 0u);
+   ralloc_free(mem);
+}
