@@ -942,11 +942,11 @@ agx_chip_g17p_or_m5(enum agx_chip chip)
 
 /* Whether consecutive application dispatches of one CDM stream may omit the
  * ordering barrier between them.  Vulkan orders dispatches only through
- * explicit barriers; every other record (internal or indirect launch, cache
- * flush, link, stream end) still follows a barrier.  On the native AGX3 CDM
- * (G15, HAL200 and M5 HAL300) the barrier holds the next launch until every
- * kernel launched before it has finished; without it the threadgroups of
- * consecutive launches run side by side. */
+ * explicit barriers; every other record (internal launch, non-M5 indirect
+ * launch, cache flush, link, stream end) still follows a barrier.  On the
+ * native AGX3 CDM (G15, HAL200 and M5 HAL300) the barrier holds the next
+ * launch until every kernel launched before it has finished; without it the
+ * threadgroups of consecutive launches run side by side. */
 static inline bool
 agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
 {

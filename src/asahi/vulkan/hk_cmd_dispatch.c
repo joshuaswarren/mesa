@@ -1983,12 +1983,14 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * the previous one's weak tail, which nothing else has followed or
     * strengthened, and let this launch's own tail end the stream instead.
     * The two then run side by side; a barrier recorded after them waits for
-    * both. Indirect launches and ray-tracing pipeline kernels keep their
-    * barrier, and so does a kernel with a large per-thread scratch frame:
-    * it runs slower the more of its threads are in flight, so it stays
+    * both. M5 indirect dispatches are single hardware records with the same
+    * weak tail and obey the same Vulkan barrier rules, so they can overlap
+    * with adjacent application dispatches too. Ray-tracing pipeline kernels
+    * keep their barrier, and so does a kernel with a large per-thread scratch
+    * frame: it runs slower the more of its threads are in flight, so it stays
     * alone. */
    const bool app_dispatch =
-      !cmd->in_meta && !internal && !agx_is_indirect(grid) &&
+      !cmd->in_meta && !internal &&
       !cmd->state.cs.descriptors.root.cs.trace_rays_addr &&
       desc.scratch_size <= HK_M5_OVERLAP_MAX_SCRATCH_B &&
       agx_chip_elide_app_dispatch_barrier(dev->dev.chip);
