@@ -2483,7 +2483,9 @@ agx_nir_lower_custom_border(nir_shader *nir)
  * clamp-to-0 index c is not negative, i.e. `if (c >= 0)`, with tex_0 sampling
  * c without its integer-border bit (hk_nir_lower_descriptors()). */
 static bool
-hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
+hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0,
+                          bool has_unbiased_sampler,
+                          unsigned descriptor_generation)
 {
    const int s = nir_tex_instr_src_index(tex_0, nir_tex_src_sampler_handle);
    if (s < 0)
@@ -2511,10 +2513,10 @@ hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
       return false;
    if (nir_scalar_equal(tested, c))
       return true;
-   if (!g17p)
+   if (!has_unbiased_sampler)
       return false;
    const struct hk_sampled_image_descriptor_layout native =
-      hk_sampled_image_descriptor_layout(9);
+      hk_sampled_image_descriptor_layout(descriptor_generation);
    return hk_nir_border_indices_same_descriptor(
       tested, c,
       native.clamp_0_sampler_index - native.sampler -
@@ -2527,7 +2529,9 @@ hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
  * emulation, unless every clamp-to-0 sample sits directly in the then-list
  * of its branch (hk_is_border_emulation_if()). */
 static bool
-hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p)
+hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs,
+                         bool has_unbiased_sampler,
+                         unsigned descriptor_generation)
 {
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -2546,7 +2550,9 @@ hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p)
             foreach_list_typed(nir_cf_node, node, node, &nif->then_list)
                in_then |= node == &block->cf_node;
             if (!in_then ||
-                !hk_is_border_emulation_if(nif, nir_instr_as_tex(instr), g17p)) {
+                !hk_is_border_emulation_if(nif, nir_instr_as_tex(instr),
+                                           has_unbiased_sampler,
+                                           descriptor_generation)) {
                return false;
             }
 
@@ -3211,13 +3217,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    if (agx_chip_native_or_m5(dev->dev.chip))
       NIR_PASS(lowered_complex, nir, agx_nir_lower_g17p_texture_early,
                support_lod_bias,
-               agx_chip_sampler_has_lod_bias(dev->dev.chip) ||
-                  agx_chip_g17_m5(dev->dev.chip));
+               agx_chip_sampler_has_lod_bias(dev->dev.chip));
    else
       NIR_PASS(lowered_complex, nir, agx_nir_lower_texture_early,
                support_lod_bias);
 
-   if (agx_chip_native_agx3(dev->dev.chip) &&
+   if (agx_chip_native_or_m5(dev->dev.chip) &&
        agx_chip_sampler_has_lod_bias(dev->dev.chip))
       NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
                hk_lower_g17p_sampler_bias, nir_metadata_control_flow, NULL);
@@ -7180,7 +7185,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       struct hk_physical_device *pdev = hk_device_physical(dev);
       struct util_dynarray ifs;
       util_dynarray_init(&ifs, NULL);
-      if (hk_find_border_emulation(nir, &ifs, dev->dev.chip == AGX_CHIP_G17P) &&
+      if (hk_find_border_emulation(
+             nir, &ifs, agx_chip_sampler_has_lod_bias(dev->dev.chip),
+             agx_chip_descriptor_generation(dev->dev.chip)) &&
           ifs.size) {
          if (twin_of || p_atomic_read(&pdev->border_emulation)) {
             border_emulating = true;
