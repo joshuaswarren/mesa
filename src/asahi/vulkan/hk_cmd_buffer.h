@@ -737,6 +737,8 @@ enum hk_g17p_range_source {
     * (dynamic buffers) or a static descriptor set holds at a fixed byte, plus
     * a fixed offset, while that buffer covers the span. */
    HK_G17P_RANGE_SOURCE_BUFFER = 5,
+   /* Hoisted AGX3 vertex preamble output buffer (computed once in PREGFX). */
+   HK_G17P_RANGE_SOURCE_PREAMBLE_OUT = 6,
    /* Uploaded while collecting the ranges (combined-sampler pointers,
     * spilled render-target descriptors), or a buffer span the buffer does
     * not wholly cover: not re-derivable. */
@@ -810,6 +812,7 @@ struct hk_g17p_vdm_update_key {
    bool primitive_id;
    bool ordinary;
    bool selector_valid;
+   bool hoisted_preamble;
 };
 
 struct hk_graphics_state {
@@ -858,6 +861,10 @@ struct hk_graphics_state {
 
    uint64_t draw_params;
    uint64_t draw_id_ptr;
+   /* Hoisted AGX3 vertex preamble output VA active for the current multi-draw
+    * batch, and whether the current multi-draw requested hoisting. */
+   uint64_t g17p_hoisted_preamble_va;
+   bool g17p_hoist_preamble_requested;
    uint32_t g17p_draw_params_value[2];
    uint32_t g17p_draw_id_value;
    bool g17p_draw_params_host_valid;
@@ -1329,6 +1336,15 @@ struct hk_cs {
 
    /* A graphics program recorded in this stream writes external memory. */
    bool m5_shader_writes_memory;
+
+   /* Per-render-stream memo of hoisted AGX3 vertex preamble outputs already
+    * computed by a PREGFX dispatch for a given (vertex shader, root VA). */
+   struct {
+      const struct hk_shader *vs;
+      uint64_t root;
+      uint64_t out_va;
+   } preamble_hoist[4];
+   uint8_t preamble_hoist_next;
 
    /* M5: the continued instance was ordered after this stream's earlier work
     * by a dependency that is not framebuffer-local (hk_m5_pass_merge_begin()).
@@ -3046,6 +3062,12 @@ bool hk_agx3_indirect_ioto_prepare(
    uint64_t *ioto_template_gpu, uint32_t *ioto_copy_dwords,
    uint32_t *ioto_stride_B, struct libagx_indirect_ioto_reloc *relocs,
    uint32_t *reloc_count);
+
+/* Dispatch a 1-thread PREGFX compute kernel to materialize a hoisted AGX3
+ * vertex preamble from root_ptr into out_ptr before the render pass runs. */
+bool hk_dispatch_preamble_cs(struct hk_cmd_buffer *cmd,
+                             struct hk_shader *preamble_cs, uint64_t root_ptr,
+                             uint64_t out_ptr);
 
 void hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
                                   const VkCommandBufferBeginInfo *pBeginInfo);
