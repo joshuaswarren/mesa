@@ -10788,6 +10788,22 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       spec_progress || any_flattened || addr_progress || sub_progress ||
       pre_alg_progress || progress;
 
+   /* Merge nested early-exit branches sharing an identical fallback arm and
+    * fold redundant range-bound disjunctions before reassociation and preamble
+    * formation so combined bounds hoist cleanly. */
+   if (byte_indices || m5) {
+      bool merged_exits = false;
+      NIR_PASS(merged_exits, nir, agx_nir_opt_merge_nested_early_exits);
+      if (merged_exits) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+         nir_divergence_analysis(nir);
+         pre_fuse_dirty = true;
+      }
+   }
+
    /* Reassociate before forming preambles because it makes preambles more
     * effective. Clean up after. On M5, also order the loop-invariant terms of
     * a chain in a loop first, so accumulations of per-iteration constants
@@ -16835,6 +16851,9 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
 
       NIR_PASS(post_opt_progress, nir, agx_nir_opt_licm, regs - 8);
    }
+
+   if (is_agx3 && !key->dev.emit_agx3d)
+      NIR_PASS(post_opt_progress, nir, agx_nir_hoist_loop_invariant_guard_bits);
 
    if (is_agx3) {
       NIR_PASS(post_opt_progress, nir, agx_nir_opt_shared_byte_offsets);

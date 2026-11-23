@@ -158,7 +158,20 @@ opt_selects = [
 ]
 
 # When the ior/iand is used multiple times, we can instead fuse the other way.
+# Prefer placing a fusable comparison on the bcsel condition when the other
+# operand is not a fusable comparison (e.g. an accumulated bcsel/ior chain),
+# so `acc || (x < bound)` lowers to one icmpsel/fcmpsel instead of two.
 opt_selects.extend([
+        (('iand', ('inot', 'a@1(agx_is_fusable_cmp)'), 'b@1(agx_is_not_fusable_cmp)'),
+         ('bcsel', a, False, b)),
+        (('iand', 'a@1(agx_is_fusable_cmp)', 'b@1(agx_is_not_fusable_cmp)'),
+         ('bcsel', a, b, False)),
+
+        (('ior', ('inot', 'a@1(agx_is_fusable_cmp)'), 'b@1(agx_is_not_fusable_cmp)'),
+         ('bcsel', a, b, True)),
+        (('ior', 'a@1(agx_is_fusable_cmp)', 'b@1(agx_is_not_fusable_cmp)'),
+         ('bcsel', a, True, b)),
+
         (('iand', ('inot', 'a@1'), b), ('bcsel', a, False, b)),
         (('iand', 'a@1', b), ('bcsel', a, b, False)),
 
@@ -510,7 +523,42 @@ def run():
     print('#include "agx_nir.h"')
     print('#include "agx_nir_aligned_bounds.h"')
     print('#include "nir.h"')
+    print('#include "nir_search.h"')
     print("""
+static bool
+agx_is_fusable_cmp(UNUSED const nir_search_state *state,
+                   const nir_alu_instr *instr, unsigned src,
+                   UNUSED unsigned num_components,
+                   UNUSED const uint8_t *swizzle)
+{
+   nir_alu_instr *src_alu = nir_src_as_alu(instr->src[src].src);
+   if (!src_alu || src_alu->def.num_components != 1)
+      return false;
+   switch (src_alu->op) {
+   case nir_op_ilt:
+   case nir_op_ige:
+   case nir_op_ult:
+   case nir_op_uge:
+   case nir_op_ieq:
+   case nir_op_ine:
+   case nir_op_flt:
+   case nir_op_fge:
+   case nir_op_feq:
+   case nir_op_fneu:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+agx_is_not_fusable_cmp(UNUSED const nir_search_state *state,
+                       const nir_alu_instr *instr, unsigned src,
+                       unsigned num_components, const uint8_t *swizzle)
+{
+   return !agx_is_fusable_cmp(state, instr, src, num_components, swizzle);
+}
+
 static bool
 agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
 {
