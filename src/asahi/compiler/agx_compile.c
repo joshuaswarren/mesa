@@ -6020,7 +6020,8 @@ agx_lower_g17g_retry_float_operands(agx_context *ctx)
        * single rounding for arithmetic, as the native mixed op would do). */
       bool any32 = false, any16 = false;
       for (unsigned s = 0; s < I->nr_srcs; ++s) {
-         if (I->src[s].type != AGX_INDEX_NORMAL)
+         if (I->src[s].type != AGX_INDEX_NORMAL &&
+             I->src[s].type != AGX_INDEX_UNIFORM)
             continue;
          any32 |= I->src[s].size == AGX_SIZE_32;
          any16 |= I->src[s].size == AGX_SIZE_16;
@@ -6042,7 +6043,8 @@ agx_lower_g17g_retry_float_operands(agx_context *ctx)
          continue;
 
       for (unsigned s = 0; s < I->nr_srcs; ++s) {
-         if (I->src[s].type != AGX_INDEX_NORMAL ||
+         if ((I->src[s].type != AGX_INDEX_NORMAL &&
+              I->src[s].type != AGX_INDEX_UNIFORM) ||
              I->src[s].size != AGX_SIZE_16)
             continue;
          /* The 32-bit select compares f32: widen half comparands. */
