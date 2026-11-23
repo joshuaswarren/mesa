@@ -1570,8 +1570,9 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
     * inter-context input fences. The submission then appends two output
     * fences and a private publication fence, all needing full records.
     */
-   const bool split_compute = dev->chip == AGX_CHIP_G17P && compute && render &&
-                             dev->params.max_commands_per_submission < 2;
+   const bool split_compute =
+      agx_chip_native_hal200(dev->chip) && compute && render &&
+      dev->params.max_commands_per_submission < 2;
    unsigned bo_count = util_dynarray_num_elements(&batch->bo_list.list,
                                                   struct agx_bo *);
    unsigned sync_capacity = bo_count + 5 + split_compute;

@@ -1768,7 +1768,7 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
                         c->stencil.comp_base);
    }
 
-   if ((dev->debug & AGX_DBG_NOCLUSTER) && dev->chip != AGX_CHIP_G17P)
+   if ((dev->debug & AGX_DBG_NOCLUSTER) && !agx_chip_native_hal200(dev->chip))
       c->flags |= DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING;
 
    c->bg.rsrc_spec = (uint32_t)pipeline_clear.rsrc_spec;

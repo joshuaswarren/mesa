@@ -4946,7 +4946,8 @@ agx_update_gs(struct agx_context *ctx, const struct pipe_draw_info *info,
    struct agx_device *dev = agx_device(ctx->base.screen);
    struct agx_uncompiled_shader *fs = ctx->stage[MESA_SHADER_FRAGMENT].shader;
    struct asahi_gs_shader_key key = {0};
-   if (dev->chip == AGX_CHIP_G18G || dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip)) {
+   if (dev->chip == AGX_CHIP_G18G || agx_chip_native_hal200(dev->chip) ||
+       agx_chip_g17_m5(dev->chip)) {
       key.link_uvs = true;
       if (fs) {
          key.flat_varyings = fs->info.inputs_flat_shaded;
@@ -7032,7 +7033,7 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
       AGX3_PROGRAM_REFUSE("unlinked shader");
    struct agx_ioto_preshader_desc preamble;
    const struct agx_ioto_preshader_desc *preshader = NULL;
-   if (dev->chip == AGX_CHIP_G17P) {
+   if (agx_chip_native_preamble(dev->chip)) {
       if (!agx_bind_g17p_preamble(&cs->b.info, cs->b.binary, cs->bo, &preamble))
          AGX3_PROGRAM_REFUSE("the preamble cannot be bound");
       if (cs->b.info.has_preamble)
@@ -7048,7 +7049,7 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
     * The cache is cleared whenever the batch's executable pool is replaced. */
    const unsigned vertex_dirty =
       AGX_DIRTY_VS | AGX_DIRTY_VS_PROG | AGX_DIRTY_VERTEX;
-   if (dev->chip == AGX_CHIP_G17P && cs->stage == MESA_SHADER_FRAGMENT &&
+   if (agx_chip_native_hal200(dev->chip) && cs->stage == MESA_SHADER_FRAGMENT &&
        !(ctx->dirty & ~vertex_dirty) && batch->g17p_fragment_program &&
        batch->g17p_fragment_shader == cs &&
        batch->g17p_fragment_linked == linked) {
@@ -7282,7 +7283,7 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
    desc.program_va = t.gpu;
 
    size_t program_length;
-   if (dev->chip == AGX_CHIP_G17P) {
+   if (agx_chip_native_hal200(dev->chip)) {
       if (!agx_g17p_graphics_program_cached(dev->chip, linked, &desc, t.cpu,
                                             capacity,
                                             &program_length))
@@ -7326,7 +7327,7 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
       AGX3_PROGRAM_REFUSE("program upload");
    if (full_va)
       *full_va = t.gpu;
-   if (dev->chip == AGX_CHIP_G17P && cs->stage == MESA_SHADER_FRAGMENT) {
+   if (agx_chip_native_hal200(dev->chip) && cs->stage == MESA_SHADER_FRAGMENT) {
       batch->g17p_fragment_program = t.gpu;
       batch->g17p_fragment_shader = cs;
       batch->g17p_fragment_linked = linked;
@@ -8012,7 +8013,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
    if (g17g) {
       /* An indirect-local grid comes only from the geometry prepass of a
        * tessellated draw (agx_launch_gs_prerast), as in hk. */
-      if ((dev->chip != AGX_CHIP_G17P && !g17g) ||
+      if ((!agx_chip_native_hal200(dev->chip) && !g17g) ||
           (g17g && grid.mode != AGX_CDM_MODE_DIRECT &&
            !(indirect_local && agx_m5_gpu_tess(batch->ctx) &&
              batch->ctx->in_tess)) ||
@@ -8475,7 +8476,7 @@ agx_g18_append_compute(struct agx_batch *batch,
     * either and stays direct. */
    const bool g18_indirect =
       dev->chip == AGX_CHIP_G18G && agx_is_indirect(grid);
-   if ((dev->chip != AGX_CHIP_G17P && !g17g) ||
+   if ((!agx_chip_native_hal200(dev->chip) && !g17g) ||
        (g17g && grid.mode != AGX_CDM_MODE_DIRECT && !g18_indirect) ||
        !info || !binary ||
        (grid.mode == AGX_CDM_MODE_INDIRECT_GLOBAL && !g18_indirect) ||
@@ -8484,7 +8485,7 @@ agx_g18_append_compute(struct agx_batch *batch,
        !info->main_size || !info->nr_gprs ||
        info->preamble_scratch_size ||
        (g17g && !g18 && info->scratch_size) ||
-       (dev->chip == AGX_CHIP_G17P &&
+       (agx_chip_native_hal200(dev->chip) &&
         (info->has_preamble || tps_size > AGX3_G17P_MAX_SPILL_B ||
          (tps_size & 3))) ||
        !info->agx3_staging_known ||
