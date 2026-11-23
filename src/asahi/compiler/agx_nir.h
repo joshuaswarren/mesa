@@ -375,3 +375,5 @@ bool agx_nir_lower_cmat_flexible(struct nir_shader *s, bool *pairing);
 bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,
                                                     bool support_lod_bias,
                                                     bool lower_2d_robustness);
+bool agx_nir_narrow_single_subgroup_barriers(struct nir_shader *shader);
+bool agx_nir_narrow_subgroup0_barriers(struct nir_shader *shader);

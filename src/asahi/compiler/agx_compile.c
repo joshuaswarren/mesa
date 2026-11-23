@@ -16911,6 +16911,12 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
          NIR_PASS(_, nir, nir_shader_intrinsics_pass, fold_w8_word_unpack,
                   nir_metadata_control_flow, NULL);
+
+      /* Narrow workgroup shared-memory barriers whose traffic stays inside a
+       * single 32-wide subgroup (runs after agx_nir_opt_shared_phase_cse,
+       * which delimits read-only phases by workgroup barriers). */
+      NIR_PASS(_, nir, agx_nir_narrow_single_subgroup_barriers);
+      NIR_PASS(_, nir, agx_nir_narrow_subgroup0_barriers);
    }
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
