@@ -179,7 +179,7 @@ nir_opt_cse_impl(nir_function_impl *impl)
          _mesa_set_clear(&per_block_set, NULL);
 
       nir_foreach_instr_safe(instr, block) {
-         if (do_subgroup_cse(instr)) {
+         if (instr->type == nir_instr_type_intrinsic && do_subgroup_cse(instr)) {
             if (!per_block_set.table)
                nir_instr_set_init(&per_block_set, NULL);
 
