@@ -10603,6 +10603,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    NIR_PASS(_, nir, nir_opt_shrink_stores, true);
 
    agx_optimize_loop_nir(nir, m5, g17p);
+   NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
 
    /* Loops are unrolled now: a subgroup XOR shuffle whose mask is still not
     * a constant takes the general lowering (agx_nir_lower_subgroups.c).
@@ -14345,6 +14346,10 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    if (!post_lower) {
+      /* Recognize written-out 32-bit population counts before the main
+       * optimization loop can reassociate their final addition into users. */
+      NIR_PASS(_, nir, nir_opt_copy_prop);
+      NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
       if (g17p || native_fragment_depth) {
          NIR_PASS(_, nir, nir_shader_alu_pass,
                   agx_nir_lower_g17p_f16_classify,
