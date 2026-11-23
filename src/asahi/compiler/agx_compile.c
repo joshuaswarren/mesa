@@ -9896,68 +9896,134 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
       .expensive_limit = g17p ? AGX_G17P_EXPENSIVE_FLATTEN_LIMIT : 0,
    };
 
-   /* Exact circular fixed-point over the 12-pass cycle. Single-pass idempotent
-    * passes (copy_prop, dce, cse, constant_folding) only require the other 11
-    * passes to observe no progress before stopping; all other passes require a
-    * full 12-pass cycle including themselves. */
-   enum { NUM_PASSES = 12 };
-   int remaining = NUM_PASSES;
-   for (int p = 0; remaining > 0; p = (p + 1) % NUM_PASSES) {
+   /* Track which passes may still find work via a bitmask. Skip passes that
+    * cannot make progress on loop-free or single-block shaders, and only wake
+    * passes that can react to a given pass's changes:
+    * - idempotent passes (copy_prop, cse, constant_folding) wake all other
+    *   active passes;
+    * - dce only deletes unused instructions, so it cannot create new copy-prop,
+    *   CSE, constant-folding, undef, or remove-phi opportunities; it wakes only
+    *   dead_cf, peephole_select, phi_precision, fold_d3d, algebraic, and
+    *   loop_unroll;
+    * - all other passes wake the entire active set.
+    */
+   bool has_loops = false;
+   bool single_block = true;
+   nir_foreach_function_impl(impl, nir) {
+      if (!exec_list_is_singular(&impl->body))
+         single_block = false;
+      foreach_list_typed(nir_cf_node, node, node, &impl->body) {
+         if (node->type == nir_cf_node_loop) {
+            has_loops = true;
+            single_block = false;
+            break;
+         } else if (node->type == nir_cf_node_if) {
+            single_block = false;
+            nir_foreach_block(blk, impl) {
+               for (nir_cf_node *p = blk->cf_node.parent; p; p = p->parent) {
+                  if (p->type == nir_cf_node_loop) {
+                     has_loops = true;
+                     break;
+                  }
+               }
+               if (has_loops)
+                  break;
+            }
+            break;
+         }
+      }
+   }
+
+   enum {
+      OPT_COPY_PROP = 0,
+      OPT_REMOVE_PHIS = 1,
+      OPT_DCE = 2,
+      OPT_DEAD_CF = 3,
+      OPT_CSE = 4,
+      OPT_PEEPHOLE_SELECT = 5,
+      OPT_PHI_PRECISION = 6,
+      OPT_FOLD_D3D = 7,
+      OPT_ALGEBRAIC = 8,
+      OPT_CONSTANT_FOLDING = 9,
+      OPT_UNDEF = 10,
+      OPT_LOOP_UNROLL = 11,
+      NUM_PASSES = 12,
+   };
+
+   uint32_t active = (1u << NUM_PASSES) - 1u;
+   if (!m5)
+      active &= ~(1u << OPT_FOLD_D3D);
+   if (!has_loops)
+      active &= ~(1u << OPT_LOOP_UNROLL);
+   if (single_block)
+      active &= ~((1u << OPT_REMOVE_PHIS) | (1u << OPT_DEAD_CF) |
+                  (1u << OPT_PEEPHOLE_SELECT) | (1u << OPT_PHI_PRECISION) |
+                  (1u << OPT_LOOP_UNROLL));
+
+   const uint32_t dce_wake =
+      ((1u << OPT_DEAD_CF) | (1u << OPT_PEEPHOLE_SELECT) |
+       (1u << OPT_PHI_PRECISION) | (1u << OPT_FOLD_D3D) |
+       (1u << OPT_ALGEBRAIC) | (1u << OPT_LOOP_UNROLL)) &
+      active;
+
+   uint32_t pending = active;
+   for (int p = 0; pending != 0; p = (p + 1) % NUM_PASSES) {
+      if (!(pending & (1u << p)))
+         continue;
+      pending &= ~(1u << p);
+
       bool progress = false;
-      bool idempotent = false;
+      uint32_t wake = active;
 
       switch (p) {
-      case 0:
+      case OPT_COPY_PROP:
          NIR_PASS(progress, nir, nir_opt_copy_prop);
-         idempotent = true;
+         wake = active & ~(1u << OPT_COPY_PROP);
          break;
-      case 1:
+      case OPT_REMOVE_PHIS:
          NIR_PASS(progress, nir, nir_opt_remove_phis);
          break;
-      case 2:
+      case OPT_DCE:
          NIR_PASS(progress, nir, nir_opt_dce);
-         idempotent = true;
+         wake = dce_wake;
          break;
-      case 3:
+      case OPT_DEAD_CF:
          NIR_PASS(progress, nir, nir_opt_dead_cf);
          break;
-      case 4:
+      case OPT_CSE:
          NIR_PASS(progress, nir, nir_opt_cse);
-         idempotent = true;
+         wake = active & ~(1u << OPT_CSE);
          break;
-      case 5:
+      case OPT_PEEPHOLE_SELECT:
          NIR_PASS(progress, nir, nir_opt_peephole_select,
                   &peephole_select_options);
          break;
-      case 6:
+      case OPT_PHI_PRECISION:
          NIR_PASS(progress, nir, nir_opt_phi_precision);
          break;
-      case 7:
+      case OPT_FOLD_D3D:
          /* The M5 conversion has D3D's saturating, NaN-to-zero semantics.
           * Fold before nir_opt_algebraic distributes a following add into the
           * clamping selects. */
-         if (m5)
-            NIR_PASS(progress, nir, agx_nir_fold_d3d_float_to_int);
+         NIR_PASS(progress, nir, agx_nir_fold_d3d_float_to_int);
          break;
-      case 8:
+      case OPT_ALGEBRAIC:
          NIR_PASS(progress, nir, nir_opt_algebraic);
          break;
-      case 9:
+      case OPT_CONSTANT_FOLDING:
          NIR_PASS(progress, nir, nir_opt_constant_folding);
-         idempotent = true;
+         wake = active & ~(1u << OPT_CONSTANT_FOLDING);
          break;
-      case 10:
+      case OPT_UNDEF:
          NIR_PASS(progress, nir, nir_opt_undef);
          break;
-      case 11:
+      case OPT_LOOP_UNROLL:
          NIR_PASS(progress, nir, nir_opt_loop_unroll);
          break;
       }
 
       if (progress)
-         remaining = idempotent ? (NUM_PASSES - 1) : NUM_PASSES;
-      else
-         remaining--;
+         pending |= wake;
    }
    nir->options = saved_options;
 }
@@ -10503,6 +10569,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       .expensive_limit = g17p ? AGX_G17P_EXPENSIVE_FLATTEN_LIMIT : 0,
    };
    bool progress = false;
+   bool pre_fuse_dirty = false;
 
    if (pre_preamble_optimized) {
       if (epilog_has_alu) {
@@ -10550,8 +10617,9 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    /* If soft fault is enabled, we can freely speculate everything. That lets us
     * peephole select and form preambles more aggressively.
     */
+   bool spec_progress = false;
    if (soft_fault) {
-      NIR_PASS(_, nir, nir_shader_instructions_pass, set_speculate,
+      NIR_PASS(spec_progress, nir, nir_shader_instructions_pass, set_speculate,
                nir_metadata_control_flow, NULL);
    }
 
@@ -10568,9 +10636,9 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * keeps: on M5 an if costs five control-flow instructions and a wait for
     * every load in flight. Flattening one can expose another around it.
     * Not on G18G, which compiles as AGX3C with emit_agx3d (g18_scans). */
+   bool any_flattened = false;
    if (m5 && !g18_scans) {
       bool flattened;
-      bool any_flattened = false;
       do {
          flattened = false;
          NIR_PASS(flattened, nir, agx_nir_opt_flatten_loads, 64, 4);
@@ -10716,26 +10784,37 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       } while (alg_progress);
    }
 
+   pre_fuse_dirty =
+      spec_progress || any_flattened || addr_progress || sub_progress ||
+      pre_alg_progress || progress;
+
    /* Reassociate before forming preambles because it makes preambles more
     * effective. Clean up after. On M5, also order the loop-invariant terms of
     * a chain in a loop first, so accumulations of per-iteration constants
     * (robustness loops add the same size queries every iteration) are summed
     * once in the preamble instead of once per term and iteration.
+    *
+    * When nir_opt_reassociate_loop() returns true, its final cleanup loop ran
+    * algebraic/constant-folding/copy-prop/CSE/DCE to a fixpoint, leaving the
+    * shader CSE/DCE-clean on return.
     */
-   nir_opt_reassociate_loop(
-      nir, nir_reassociate_scalar_math | nir_reassociate_cse_heuristic |
-              (m5 ? nir_reassociate_loop_invariant : 0));
+   if (nir_opt_reassociate_loop(
+          nir, nir_reassociate_scalar_math | nir_reassociate_cse_heuristic |
+                  (m5 ? nir_reassociate_loop_invariant : 0)))
+      pre_fuse_dirty = false;
 
    /* Lower fmin/fmax before optimizing preambles so we can see across uniform
     * expressions. Do it after nir_opt_reassociate because nir_opt_reassociate
     * should work on unlowered fmin/fmax.
     */
-   NIR_PASS(_, nir, agx_nir_lower_fminmax, g17p || m5);
+   NIR_PASS(pre_fuse_dirty, nir, agx_nir_lower_fminmax, g17p || m5);
 
    if (pre_preamble_blob)
       nir_serialize(pre_preamble_blob, nir, false);
 
 pre_preamble:
+   if (pre_preamble_optimized)
+      pre_fuse_dirty = true;
    /* AGX_G17P_DISCARD_WORD: reduce one-sample coverage-update sources to bit
     * 0 after the algebraic loops and right before preamble formation, so the
     * uniform `tests_zs & 1` is hoisted. nir_opt_algebraic would otherwise
@@ -10750,6 +10829,7 @@ pre_preamble:
       else
          NIR_PASS(word, nir, agx_g17p_discard_word);
       if (word) {
+         pre_fuse_dirty = true;
          NIR_PASS(_, nir, nir_opt_constant_folding);
          NIR_PASS(_, nir, nir_opt_dce);
       }
@@ -10779,8 +10859,8 @@ pre_preamble:
       if (sizes[2] == 0)
          sizes[2]++;
 
-      NIR_PASS(_, nir, agx_nir_opt_preamble, sizes, byte_indices || m5, m5,
-               &peephole_select_options);
+      NIR_PASS(pre_fuse_dirty, nir, agx_nir_opt_preamble, sizes,
+               byte_indices || m5, m5, &peephole_select_options);
 
       *preamble_size = sizes[0];
 
@@ -10793,6 +10873,7 @@ pre_preamble:
          bool words = false;
          NIR_PASS(words, nir, agx_nir_lower_word_bounds);
          if (words) {
+            pre_fuse_dirty = true;
             NIR_PASS(_, nir, nir_opt_cse);
             NIR_PASS(_, nir, nir_opt_dce);
          }
@@ -10804,6 +10885,7 @@ pre_preamble:
          bool shared = false;
          NIR_PASS(shared, nir, agx_nir_share_bounds);
          if (shared) {
+            pre_fuse_dirty = true;
             NIR_PASS(_, nir, nir_opt_copy_prop);
             NIR_PASS(_, nir, nir_opt_dce);
          }
@@ -10815,12 +10897,14 @@ pre_preamble:
        * results need. */
       if (dma_key && dma_key->g17p_uniform_dma &&
           agx3_nir_lower_uniform_dma(nir, dma_key, dma_info)) {
+         pre_fuse_dirty = true;
          NIR_PASS(_, nir, nir_opt_dce);
          agx_remove_empty_preamble(nir);
       }
 
       if (dma_key && dma_key->g17p_uniform_dma &&
           nir->info.stage == MESA_SHADER_VERTEX) {
+         pre_fuse_dirty = true;
          agx3_inline_cheap_vertex_preamble(nir);
          NIR_PASS(_, nir, nir_opt_dce);
       }
@@ -10843,20 +10927,22 @@ pre_preamble:
     * native 64-bit iadd/umul_2x32_64) recreated by nir_opt_algebraic after the
     * first nir_lower_int64 pass.
     */
-   NIR_PASS(_, nir, nir_opt_peephole_select, &peephole_select_options);
+   NIR_PASS(pre_fuse_dirty, nir, nir_opt_peephole_select,
+            &peephole_select_options);
    if (byte_indices)
-      NIR_PASS(_, nir, agx_nir_scalarize_int64);
-   NIR_PASS(_, nir, nir_lower_int64);
+      NIR_PASS(pre_fuse_dirty, nir, agx_nir_scalarize_int64);
+   NIR_PASS(pre_fuse_dirty, nir, nir_lower_int64);
 
    /* Constant-program flags, now that their trivial branches are selects. */
    if (byte_indices && !m5)
-      NIR_PASS(_, nir, agx_nir_export_select_flags_as_halves, true);
+      NIR_PASS(pre_fuse_dirty, nir, agx_nir_export_select_flags_as_halves, true);
 
    /* After the selects of trivial if-else statements exist. */
    if (m5) {
       bool folded = false;
       NIR_PASS(folded, nir, agx_nir_m5_split_or_selects);
       if (folded) {
+         pre_fuse_dirty = true;
          NIR_PASS(_, nir, nir_opt_copy_prop);
          NIR_PASS(_, nir, nir_opt_dce);
       }
@@ -10897,8 +10983,10 @@ pre_preamble:
    /* Fuse add/sub/multiplies/shifts after running opt_algebraic_late to fuse
     * isub but before shifts are lowered.
     */
-   NIR_PASS(_, nir, nir_opt_dce);
-   NIR_PASS(_, nir, nir_opt_cse);
+   if (pre_fuse_dirty || late_progress) {
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_opt_cse);
+   }
    do {
       progress = false;
 
@@ -16675,10 +16763,11 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    /* Safe uniform-load speculation and if/phi folding have now exposed
     * matching sample copies. Preserve early subset proofs through those
     * optimizations and promote them only after complete-sample coalescing. */
+   bool post_opt_progress = false;
    if (key->dev.emit_agx3d && nir->info.stage == MESA_SHADER_FRAGMENT &&
        (key->fs.nr_samples == 2 || key->fs.nr_samples == 4) &&
        !key->fs.inside_sample_loop)
-      NIR_PASS(_, nir, agx_nir_coalesce_sample_mask_updates,
+      NIR_PASS(post_opt_progress, nir, agx_nir_coalesce_sample_mask_updates,
                key->fs.nr_samples);
 
    /* Inline blend/framebuffer-fetch shaders load the tilebuffer in the
@@ -16688,33 +16777,36 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C && key->dev.emit_agx3d &&
        nir->info.stage == MESA_SHADER_FRAGMENT &&
        (key->fs.nr_samples == 2 || key->fs.nr_samples == 4))
-      NIR_PASS(_, nir, agx_nir_lower_g18_tile_samples,
+      NIR_PASS(post_opt_progress, nir, agx_nir_lower_g18_tile_samples,
                key->fs.nr_samples);
 
    if (is_agx3 && source_imul64)
-      NIR_PASS(_, nir, agx_nir_lower_imul64, m5_wide_product);
+      NIR_PASS(post_opt_progress, nir, agx_nir_lower_imul64, m5_wide_product);
 
    if (is_agx3)
       nir->options = original_options;
 
    /* AGX_G17P_UNIFORM_DMA: only when no preamble is formed. */
    if (is_agx3 && key->g17p_uniform_dma && !form_preamble &&
-       agx3_nir_lower_uniform_dma(nir, key, info))
+       agx3_nir_lower_uniform_dma(nir, key, info)) {
+      post_opt_progress = true;
       NIR_PASS(_, nir, nir_opt_dce);
+   }
 
    /* Late NIR cleanup can remove main-program uses of values exported by
     * preamble extraction. Preserve their SSA uses inside the CProg, while
     * dropping writes to general uniform slots nobody reads anymore.
     */
    if (is_agx3 && form_preamble) {
-      NIR_PASS(_, nir, agx_nir_remove_unused_preamble_exports,
+      NIR_PASS(post_opt_progress, nir, agx_nir_remove_unused_preamble_exports,
                key->reserved_preamble);
-      NIR_PASS(_, nir, agx_nir_coalesce_preamble_half_exports,
+      NIR_PASS(post_opt_progress, nir, agx_nir_coalesce_preamble_half_exports,
                key->reserved_preamble, info->push_count);
-      NIR_PASS(_, nir, nir_opt_dce);
+      if (post_opt_progress)
+         NIR_PASS(_, nir, nir_opt_dce);
       /* The launch's copies, if any, sit above every export. */
       unsigned push_count = info->push_count;
-      NIR_PASS(_, nir, agx_nir_place_preamble_handles_low,
+      NIR_PASS(post_opt_progress, nir, agx_nir_place_preamble_handles_low,
                key->reserved_preamble,
                info->agx3_uniform_dma_count ? info->agx3_uniform_dma[0].dest
                                             : push_count,
@@ -16725,6 +16817,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       info->varyings.fs.nr_cf = key->fs.cf_base;
       assign_coefficient_regs(nir, &info->varyings.fs);
+      post_opt_progress = true;
    }
 
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
@@ -16740,13 +16833,15 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          regs = MIN2(regs, agx_max_registers_for_occupancy(threads));
       }
 
-      NIR_PASS(_, nir, agx_nir_opt_licm, regs - 8);
+      NIR_PASS(post_opt_progress, nir, agx_nir_opt_licm, regs - 8);
    }
 
    if (is_agx3) {
-      NIR_PASS(_, nir, agx_nir_opt_shared_byte_offsets);
-      NIR_PASS(_, nir, nir_opt_cse);
-      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(post_opt_progress, nir, agx_nir_opt_shared_byte_offsets);
+      bool cse_progress = false;
+      NIR_PASS(cse_progress, nir, nir_opt_cse);
+      if (cse_progress || post_opt_progress)
+         NIR_PASS(_, nir, nir_opt_dce);
    }
 
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
