@@ -3160,9 +3160,24 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    /* The cooperative-matrix lowering serves the 8x8 matmad on AGX3B
     * (G15/G16/G17P) as well as M5's AGX3C; it no-ops on shaders that carry no
     * cooperative matrix, so gating on the encoding is sufficient. */
+   bool cmat_lowered = false;
    if (agx_chip_g17_m5(dev->dev.chip) ||
        agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3B)
-      NIR_PASS(lowered_complex, nir, agx_nir_lower_cmat);
+      NIR_PASS(cmat_lowered, nir, agx_nir_lower_cmat,
+               agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3B);
+
+   /* A matrix load becomes per-element loads, and a shader that loads one
+    * matrix again for each matrix it multiplies with (one B tile per A row)
+    * would read each element that often. While the memory is still derefs,
+    * read it once: CSE makes the addresses equal and copy propagation reuses
+    * the value until something may have written it.
+    */
+   if (cmat_lowered) {
+      lowered_complex = true;
+      NIR_PASS(_, nir, nir_opt_cse);
+      NIR_PASS(_, nir, nir_opt_copy_prop_vars);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
 
    /* Turn cache flushes into image coherency bits while we still have derefs */
    NIR_PASS(_, nir, nir_lower_memory_model);

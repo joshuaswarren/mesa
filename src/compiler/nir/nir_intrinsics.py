@@ -1576,7 +1576,9 @@ intrinsic("cmat_insert", src_comp=[-1, 1, -1, 1])
 intrinsic("cmat_copy", src_comp=[-1, -1])
 intrinsic("cmat_transpose", src_comp=[-1, -1], indices=[SATURATE, CMAT_SIGNED_MASK, FP_MATH_CTRL])
 intrinsic("cmat_get_coordinate", src_comp=[1], dest_comp=2, indices=[CMAT_DESC], bit_sizes=[32])
-intrinsic("cmat_muladd_agx", src_comp=[0, 0, 0], dest_comp=0, bit_sizes=[32], indices=[SRC_TYPE, SRC_TYPE2],
+# AGX matmad: src[] = { A, B, C }; the result has C's width (f32, or f16 for an
+# f16 accumulator the hardware sums natively).
+intrinsic("cmat_muladd_agx", src_comp=[0, 0, 0], dest_comp=0, bit_sizes=('src', 2), indices=[SRC_TYPE, SRC_TYPE2],
           flags=[CAN_ELIMINATE, SUBGROUP])
 
 # src[] = { deref }.

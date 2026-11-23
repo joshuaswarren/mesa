@@ -13998,6 +13998,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          }
 
          if (I->op == AGX_OPCODE_MATMAD8_AGX3) {
+            const bool f16_acc = I->matrix_type & AGX3_MATRIX_ACCUM_F16;
+            const enum agx_size acc_size = f16_acc ? AGX_SIZE_16 : AGX_SIZE_32;
             if ((I->matrix_type & 15) != ((I->matrix_type >> 4) & 15))
                AGX3_REFUSE(I);
             /* 8x8 matmad is available on AGX3B (G15/G16/G17P) as well as M5
@@ -14010,7 +14012,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 ctx->stage != MESA_SHADER_COMPUTE || I->nr_dests != 1 ||
                 I->nr_srcs != 3 || I->saturate || wait > wait_max ||
                 !agx3_src_is_register(I->dest[0]) || I->dest[0].memory ||
-                I->dest[0].size != AGX_SIZE_32 ||
+                I->dest[0].size != acc_size ||
                 agx_channels(I->dest[0]) != 2)
                AGX3_REFUSE(I);
 
@@ -14022,12 +14024,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                .dest_cache = I->dest[0].cache,
                .wait_mask = wait,
                .input_type = I->matrix_type & 15,
+               .f16_accumulate = f16_acc,
             };
             for (unsigned s = 0; s < 3; ++s) {
                const agx_index src = I->src[s];
                if (!agx3_src_is_register(src) || src.memory || src.abs ||
                    src.neg || agx_channels(src) != 2 ||
-                   src.size != (s == 2 || (I->matrix_type & 15) == AGX3_MATRIX_INPUT_F32
+                   src.size != (s == 2 ? acc_size :
+                                (I->matrix_type & 15) == AGX3_MATRIX_INPUT_F32
                                   ? AGX_SIZE_32 : AGX_SIZE_16))
                   AGX3_REFUSE(I);
                d.cache[s] = src.cache;

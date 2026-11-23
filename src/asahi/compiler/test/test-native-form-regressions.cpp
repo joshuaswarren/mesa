@@ -12,6 +12,9 @@
 #include "agx3_matrix_core.h"
 #include "agx3_vary_core.h"
 extern "C" {
+#include "agx3_compose/agx3_decode.h"
+}
+extern "C" {
 #include "agx_nir.h"
 #include "asahi/layout/layout.h"
 }
@@ -6971,6 +6974,78 @@ TEST(NativeForms, Agx3bMatmad8x8MatchesAppleG16G)
       EXPECT_EQ(length, c.bytes.size()) << c.tag;
       EXPECT_EQ(std::vector<uint8_t>(out, out + length), c.bytes) << c.tag;
    }
+}
+
+/*
+ * AGX3B f16matmad8x8 (f16 A, B, C and result), in the form the compiler emits
+ * (C in a register): the form the f16 x f16 + f16 8x8x8 products took on G17P
+ * hardware, where every result matched an f16 FMA chain (C first, round to
+ * nearest even per step). Decode the encoder's bytes with the AGX3B table and
+ * check each field by name. The f16 form has no operand type fields; each
+ * operand is a register (kind 2) of one half per element. The f16 form refuses
+ * other input types and the AGX3C encoding (its M5 layout is not mapped).
+ */
+TEST(NativeForms, Agx3bF16Matmad8x8Fields)
+{
+   enum {
+      DEST = 2, DEST_KIND = 9, DEST_SIZE = 10, DEST_CACHE = 11,
+      A = 17, A_KIND = 24, A_SIZE = 25, A_CACHE = 26, A_DISCARD = 28,
+      B = 34, B_KIND = 41, B_SIZE = 42, B_CACHE = 43, B_DISCARD = 45,
+      C = 51, C_KIND = 58, C_SIZE = 59, C_CACHE = 60, C_DISCARD = 62,
+      WAIT = 68, /* slots 0..5 in 68..73 */
+      KIND_REGISTER = 2, SIZE_HALF = 1,
+   };
+   struct agx3_matrix_mma8_desc d = {
+      .dest = 16, .a = 8, .b = 4, .c = 12,
+      .cache = {false, false, true}, .discard = {true, false, false},
+      .wait_mask = 0x21,
+      .input_type = AGX3_MATRIX_INPUT_F16, .f16_accumulate = true,
+   };
+   uint8_t out[14], length = 0;
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &d, out, &length));
+
+   uint64_t f[AGX3_MAX_FIELDS];
+   const int32_t form =
+      agx3_decode(&agx3b_table, out, length, AGX3_MN_NONE, f);
+   ASSERT_GE(form, 0);
+   EXPECT_EQ(agx3b_table.forms[form].mnemonic, AGX3_MN_f16matmad8x8);
+   EXPECT_EQ(agx3b_table.forms[form].size, length);
+
+   EXPECT_EQ(f[DEST], 16u);
+   EXPECT_EQ(f[DEST_KIND], (uint64_t)KIND_REGISTER);
+   EXPECT_EQ(f[DEST_SIZE], (uint64_t)SIZE_HALF);
+   EXPECT_EQ(f[DEST_CACHE], 0u);
+   EXPECT_EQ(f[A], 8u);
+   EXPECT_EQ(f[A_KIND], (uint64_t)KIND_REGISTER);
+   EXPECT_EQ(f[A_SIZE], (uint64_t)SIZE_HALF);
+   EXPECT_EQ(f[A_CACHE], 0u);
+   EXPECT_EQ(f[A_DISCARD], 1u);
+   EXPECT_EQ(f[B], 4u);
+   EXPECT_EQ(f[B_KIND], (uint64_t)KIND_REGISTER);
+   EXPECT_EQ(f[B_SIZE], (uint64_t)SIZE_HALF);
+   EXPECT_EQ(f[B_CACHE], 0u);
+   EXPECT_EQ(f[B_DISCARD], 0u);
+   EXPECT_EQ(f[C], 12u);
+   EXPECT_EQ(f[C_KIND], (uint64_t)KIND_REGISTER);
+   EXPECT_EQ(f[C_SIZE], (uint64_t)SIZE_HALF);
+   EXPECT_EQ(f[C_CACHE], 1u);
+   EXPECT_EQ(f[C_DISCARD], 0u);
+   for (unsigned i = 0; i < 6; ++i)
+      EXPECT_EQ(f[WAIT + i], (uint64_t)((0x21 >> i) & 1)) << "wait slot " << i;
+
+   /* Without f16_accumulate the same product is the f32-accumulator form */
+   d.f16_accumulate = false;
+   d.dest = d.c = 16;
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &d, out, &length));
+   const int32_t f32_form =
+      agx3_decode(&agx3b_table, out, length, AGX3_MN_NONE, f);
+   ASSERT_GE(f32_form, 0);
+   EXPECT_EQ(agx3b_table.forms[f32_form].mnemonic, AGX3_MN_f32matmad8x8);
+   d.f16_accumulate = true;
+
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &d, out, &length));
+   d.input_type = AGX3_MATRIX_INPUT_BF16;
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &d, out, &length));
 }
 
 /*

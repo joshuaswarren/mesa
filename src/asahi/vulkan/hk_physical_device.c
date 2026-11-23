@@ -2733,15 +2733,21 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
             if (types[i] == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
                 !pdev->vk.supported_features.shaderBFloat16CooperativeMatrix)
                continue;
-            unsigned modes = types[i] == VK_COMPONENT_TYPE_BFLOAT16_KHR ? 2 : 1;
+            /* An 8x8 accumulator of the 16-bit input type takes half the
+             * registers of an f32 one. f16 is listed on the AGX3B encoding
+             * (G15/G16/G17P) only, where it runs on the f16matmad8x8: AGX3C
+             * (M5) would widen it into an f32 matmad not yet run with it. */
+            const bool f16_accum = agx_chip_isa_encoding(pdev->dev.chip) ==
+                                   AGX_ISA_ENCODING_AGX3B;
+            unsigned modes = (types[i] == VK_COMPONENT_TYPE_BFLOAT16_KHR || f16_accum) ? 2 : 1;
             for (unsigned accum = 0; accum < modes; ++accum) {
                vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p) {
                   *p = (VkCooperativeMatrixPropertiesKHR) {
                      .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
                      .MSize = size, .NSize = size, .KSize = size,
                      .AType = types[i], .BType = types[i],
-                     .CType = accum ? VK_COMPONENT_TYPE_BFLOAT16_KHR : VK_COMPONENT_TYPE_FLOAT32_KHR,
-                     .ResultType = accum ? VK_COMPONENT_TYPE_BFLOAT16_KHR : VK_COMPONENT_TYPE_FLOAT32_KHR,
+                     .CType = accum ? types[i] : VK_COMPONENT_TYPE_FLOAT32_KHR,
+                     .ResultType = accum ? types[i] : VK_COMPONENT_TYPE_FLOAT32_KHR,
                      .saturatingAccumulation = VK_FALSE,
                      .scope = VK_SCOPE_SUBGROUP_KHR,
                   };

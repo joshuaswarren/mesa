@@ -1,13 +1,69 @@
 #include "agx3_matrix_core.h"
 #include "agx3_binder.h"
+#include "util/macros.h"
+
+/*
+ * The AGX3B f16matmad8x8: f16 A, B, C and result, one half per element. It is
+ * f32matmad8x8 without the three operand type fields, so each operand's
+ * fields sit one id lower: a register kind (2 = register) and a one-half
+ * operand size, the register as a half index, then the cache and discard
+ * hints (f26/f28 for A, f43/f45 for B, f60/f62 for C; the destination's is
+ * f11). C is absent with kind 1 (field 51 zero) or a register with kind 2
+ * (field 51). The scoreboard wait is fields 68..73. The compiler always
+ * passes C in a register; on G17P that form computes an f16 FMA chain (C
+ * first, round to nearest even per step). NativeForms.Agx3bF16Matmad8x8Fields
+ * checks the fields.
+ */
+static bool
+agx3_matrix_encode_mma8_f16(const struct agx3_matrix_mma8_desc *d,
+                            uint8_t out[14], uint8_t *length)
+{
+   if (d->input_type != AGX3_MATRIX_INPUT_F16 || (d->wait_mask & ~0x3fu) ||
+       (d->dest & 1) || d->dest > 190 || (d->a & 1) || d->a > 190 ||
+       (d->b & 1) || d->b > 190 ||
+       (!d->c_zero && ((d->c & 1) || d->c > 190)) ||
+       (d->c_zero && (d->c || d->cache[2] || d->discard[2])))
+      return false;
+   for (unsigned i = 0; i < 3; ++i) {
+      if (d->cache[i] && d->discard[i])
+         return false;
+   }
+
+   static const struct agx3_field_kv base[] = {
+      {9, 2}, {10, 1}, {24, 2}, {25, 1}, {41, 2}, {42, 1}, {59, 1},
+   };
+   struct agx3_field_kv fields[20];
+   unsigned count = 0;
+   fields[count++] = (struct agx3_field_kv){2, d->dest};
+   fields[count++] = (struct agx3_field_kv){11, d->dest_cache};
+   fields[count++] = (struct agx3_field_kv){17, d->a};
+   fields[count++] = (struct agx3_field_kv){34, d->b};
+   fields[count++] = (struct agx3_field_kv){58, d->c_zero ? 1 : 2};
+   fields[count++] = (struct agx3_field_kv){51, d->c_zero ? 0 : d->c};
+   fields[count++] = (struct agx3_field_kv){26, d->cache[0]};
+   fields[count++] = (struct agx3_field_kv){28, d->discard[0]};
+   fields[count++] = (struct agx3_field_kv){43, d->cache[1]};
+   fields[count++] = (struct agx3_field_kv){45, d->discard[1]};
+   fields[count++] = (struct agx3_field_kv){60, d->cache[2]};
+   fields[count++] = (struct agx3_field_kv){62, d->discard[2]};
+   for (unsigned i = 0; i < 6; ++i)
+      fields[count++] = (struct agx3_field_kv){68 + i, (d->wait_mask >> i) & 1};
+
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_f16matmad8x8, 0,
+                            base, ARRAY_SIZE(base), fields, count, out,
+                            length);
+}
 
 bool
 agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
                         const struct agx3_matrix_mma8_desc *d,
                         uint8_t out[14], uint8_t *length)
 {
-   if (!d)
+   if (!d || !out || !length)
       return false;
+   if (d->f16_accumulate)
+      return encoding == AGX_ISA_ENCODING_AGX3B &&
+             agx3_matrix_encode_mma8_f16(d, out, length);
    const bool agx3b = encoding == AGX_ISA_ENCODING_AGX3B;
    unsigned type = d->input_type ? d->input_type : AGX3_MATRIX_INPUT_F16;
    unsigned align_mask = type == AGX3_MATRIX_INPUT_F16 ? 3 : 1;
@@ -26,7 +82,7 @@ agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
     * 16x16 GEMM form (agx3_matrix_encode_gemm16) is M5 only, so this is the
     * sole matrix instruction AGX3B offers.
     */
-   if ((encoding != AGX_ISA_ENCODING_AGX3C && !agx3b) || !out || !length ||
+   if ((encoding != AGX_ISA_ENCODING_AGX3C && !agx3b) ||
        (type != AGX3_MATRIX_INPUT_F16 && type != AGX3_MATRIX_INPUT_F32 &&
         type != AGX3_MATRIX_INPUT_BF16) ||
        (d->dest & align_mask) || d->dest > dest_max ||
