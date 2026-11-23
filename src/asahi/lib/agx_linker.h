@@ -354,6 +354,8 @@ struct agx_fs_epilog_key {
    uint8_t max_sample_size_B;
    /* agx_tilebuffer_layout::resident_mask of the render pass. */
    uint8_t resident_mask;
+   /* agx_tilebuffer_layout::first_mask of the render pass. */
+   uint8_t first_mask;
    bool native_imageblock;
    uint32_t max_bytes_per_tile;
    uint16_t max_samples_per_tile;

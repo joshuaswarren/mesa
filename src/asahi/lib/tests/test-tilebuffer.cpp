@@ -980,3 +980,76 @@ TEST(Tilebuffer, G17PCompressedColourNeverSpills)
       EXPECT_FALSE(agx_g17p_compression_color_format(format))
          << util_format_name(format);
 }
+
+TEST(Tilebuffer, PackFirstIfFitsMovesClearedRTIntoFirst8Bytes)
+{
+   /* Default descending-alignment order puts 16B RGBA32F at [0, 16) and
+    * 4B RGBA8 at [16, 20). Packing RT1 first moves it into [0, 4) without
+    * changing sample_size_B, tile_size, or spilling. */
+   enum pipe_format formats[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   auto tib = agx_build_tilebuffer_layout_with_limits(
+      formats, 2, 4, false, AGX_G17P_MAX_BYTES_PER_SAMPLE, 32768, 2048);
+   EXPECT_EQ(agx_tilebuffer_offset_B(&tib, 0), 0u);
+   EXPECT_EQ(agx_tilebuffer_offset_B(&tib, 1), 16u);
+   EXPECT_EQ(agx_tilebuffer_format_size_B(PIPE_FORMAT_R32G32B32A32_FLOAT), 16u);
+   EXPECT_EQ(agx_tilebuffer_format_size_B(PIPE_FORMAT_R8G8B8A8_UNORM), 4u);
+
+   const uint16_t orig_tile = tib.tile_size;
+   EXPECT_TRUE(agx_tilebuffer_pack_first_if_fits(&tib, BITFIELD_BIT(1), 8));
+   EXPECT_EQ(tib.first_mask, BITFIELD_BIT(1));
+   EXPECT_EQ(agx_tilebuffer_offset_B(&tib, 1), 0u);
+   EXPECT_EQ(agx_tilebuffer_offset_B(&tib, 0), 4u);
+   EXPECT_EQ(tib.tile_size, orig_tile);
+   EXPECT_FALSE(agx_tilebuffer_spills(&tib));
+
+   /* Rebuilding + applying first_mask reproduces the layout byte-for-byte. */
+   auto rebuilt = agx_build_tilebuffer_layout_with_limits(
+      formats, 2, 4, false, AGX_G17P_MAX_BYTES_PER_SAMPLE, 32768, 2048);
+   agx_tilebuffer_apply_first_mask(&rebuilt, tib.first_mask);
+   EXPECT_EQ(memcmp(&rebuilt, &tib, sizeof(tib)), 0);
+
+   /* Already within [0, 8): no-op and first_mask stays 0. */
+   enum pipe_format fits_formats[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   auto already = agx_build_tilebuffer_layout_with_limits(
+      fits_formats, 2, 4, false, AGX_G17P_MAX_BYTES_PER_SAMPLE, 32768, 2048);
+   EXPECT_FALSE(agx_tilebuffer_pack_first_if_fits(&already, BITFIELD_BIT(0), 8));
+   EXPECT_EQ(already.first_mask, 0u);
+
+   /* Moving RT1 (4B) ahead of RT0 (8B) fits RT1 into [0, 4). */
+   EXPECT_TRUE(agx_tilebuffer_pack_first_if_fits(&already, BITFIELD_BIT(1), 8));
+   EXPECT_EQ(already.first_mask, BITFIELD_BIT(1));
+   EXPECT_EQ(agx_tilebuffer_offset_B(&already, 1), 0u);
+   EXPECT_EQ(agx_tilebuffer_offset_B(&already, 0), 4u);
+
+   /* Combined cleared size > 8B: refused and layout stays untouched. */
+   auto wide = agx_build_tilebuffer_layout_with_limits(
+      fits_formats, 2, 4, false, AGX_G17P_MAX_BYTES_PER_SAMPLE, 32768, 2048);
+   const auto wide_orig = wide;
+   EXPECT_FALSE(agx_tilebuffer_pack_first_if_fits(
+      &wide, BITFIELD_BIT(0) | BITFIELD_BIT(1), 8));
+   EXPECT_EQ(memcmp(&wide, &wide_orig, sizeof(wide)), 0);
+
+   /* Deferred MSAA4 tile pass: 3 transient G-buffer targets (DONT_CARE) plus
+    * 1 stored RGBA8 lighting output at RT3. Packing only the stored RT3 puts
+    * it at offset 0 within the 8B uncovered-tile limit without spilling. */
+   enum pipe_format deferred_formats[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   auto def = agx_build_tilebuffer_layout_with_limits(
+      deferred_formats, 4, 4, false, AGX_G17P_MAX_BYTES_PER_SAMPLE, 32768,
+      2048);
+   EXPECT_GT(def.sample_size_B, 8u);
+   EXPECT_GT(agx_tilebuffer_offset_B(&def, 3), 8u);
+   EXPECT_TRUE(agx_tilebuffer_pack_first_if_fits(&def, BITFIELD_BIT(3), 8));
+   EXPECT_EQ(agx_tilebuffer_offset_B(&def, 3), 0u);
+   EXPECT_FALSE(agx_tilebuffer_spills(&def));
+}

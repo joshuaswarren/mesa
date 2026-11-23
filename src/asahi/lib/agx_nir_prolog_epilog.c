@@ -732,6 +732,8 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
                    key->nr_samples, true, key->max_sample_size_B,
                    key->max_bytes_per_tile, key->max_samples_per_tile,
                    key->resident_mask);
+   if (key->first_mask && !tib.resident_mask)
+      agx_tilebuffer_apply_first_mask(&tib, key->first_mask);
 
    unsigned rt_order[AGX_MAX_RENDER_TARGETS];
    for (unsigned rt = 0; rt < ARRAY_SIZE(rt_order); ++rt)
