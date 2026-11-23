@@ -7963,6 +7963,105 @@ TEST_F(AGX3PackBinary, NativeStatsCountControlFlowDrains)
    }
 }
 
+/* Build: load r4; if (r0 < r2) { <arm> } <after>, with the arm's exec-none
+ * skip jumping to the pop block. `arm_uses` puts the load's consumer in the
+ * arm; otherwise it follows the pop. */
+static void
+build_load_then_if(agx_builder *b, bool arm_uses, bool compare_reads_load)
+{
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *arm = agx_test_block(b->shader);
+   agx_block *pop = agx_test_block(b->shader);
+   agx_index loaded = agx_register(4, AGX_SIZE_32);
+   agx_device_load_to(b, loaded, agx_uniform(0, AGX_SIZE_64), agx_immediate(0),
+                      AGX_FORMAT_I32, 1, 0, false);
+   agx_begin_cf(b);
+   agx_if_icmp(b, compare_reads_load ? loaded : agx_register(0, AGX_SIZE_32),
+               agx_register(2, AGX_SIZE_32), 1, AGX_ICOND_ULT, false, pop);
+   agx_jmp_exec_none(b, pop);
+   agx_block_add_successor(entry, arm);
+   agx_block_add_successor(entry, pop);
+
+   agx_builder ab = agx_init_builder(b->shader, agx_after_block(arm));
+   agx_device_store(&ab, arm_uses ? loaded : agx_register(6, AGX_SIZE_32),
+                    agx_uniform(0, AGX_SIZE_64), agx_immediate(8),
+                    AGX_FORMAT_I32, 1, 0, false);
+   agx_block_add_successor(arm, pop);
+
+   agx_builder pb = agx_init_builder(b->shader, agx_after_block(pop));
+   agx_pop_exec(&pb, 1);
+   agx_device_store(&pb, loaded, agx_uniform(0, AGX_SIZE_64), agx_immediate(4),
+                    AGX_FORMAT_I32, 1, 0, false);
+   agx_stop(&pb);
+}
+
+/* A forward if keeps the load in flight into its arm: no drain at the if,
+ * the consumer in the arm waits for it, and the pop at the end of the arm
+ * retires nothing more. A consumer only after the pop leaves the load
+ * outstanding until the pop, which drains it; so does the skipped-arm path,
+ * whose jump lands on that pop's carrier. */
+TEST_F(AGX3PackBinary, ForwardIfKeepsLoadsInFlightIntoTheArm)
+{
+   for (int e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      for (bool arm_uses : {true, false}) {
+         agx_builder *b = builder(enc);
+         build_load_then_if(b, arm_uses, false);
+         EXPECT_FALSE(pack(b).empty());
+         /* The consumer in the arm waited; the pop still drains on the
+          * skip path's behalf only when something is outstanding there. */
+         EXPECT_EQ(agx3_native_stats.cf_drains, arm_uses ? 0u : 1u);
+      }
+   }
+}
+
+/* The skip jump must land ahead of the pop's retire carrier: the carrier
+ * is the first thing in the pop block, and the branch displacement reaches
+ * exactly the block start. */
+TEST_F(AGX3PackBinary, SkippedArmLandsOnTheRetireCarrier)
+{
+   for (int e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      agx_builder *b = builder(enc);
+      build_load_then_if(b, false, false);
+      std::vector<uint8_t> bin = pack(b);
+      ASSERT_FALSE(bin.empty());
+      agx_block *pop = NULL;
+      agx_foreach_block(b->shader, block)
+         pop = block;
+      ASSERT_NE(pop, nullptr);
+      /* The pop block starts with the carrier, not the cndend: a jump to
+       * the block start runs the carrier. The cndend follows it. */
+      uint8_t cndend[AGX3_CF_MAX_LENGTH], len = 0;
+      ASSERT_TRUE(agx3_cf_cndend(enc, 1, cndend, &len));
+      ASSERT_LE((size_t)pop->offset + len, bin.size());
+      EXPECT_NE(memcmp(bin.data() + pop->offset, cndend, len), 0);
+      bool cndend_follows = false;
+      for (size_t at = pop->offset + 1; at + len <= bin.size(); ++at)
+         cndend_follows |= !memcmp(bin.data() + at, cndend, len);
+      EXPECT_TRUE(cndend_follows);
+      EXPECT_EQ(agx3_native_stats.cf_drains, 1u);
+      EXPECT_GE(agx3_native_stats.wait_carriers, 1u);
+   }
+}
+
+/* A compare reading the load waits for it, which no branch form carries:
+ * the if drains as before and nothing is left for the pop. */
+TEST_F(AGX3PackBinary, IfReadingALoadStillDrains)
+{
+   for (int e = 0; e < 2; ++e) {
+      agx_builder *b =
+         builder(e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B);
+      build_load_then_if(b, false, true);
+      EXPECT_FALSE(pack(b).empty());
+      EXPECT_EQ(agx3_native_stats.cf_drains, 0u);
+      EXPECT_GE(agx3_native_stats.wait_carriers, 1u);
+   }
+}
+
 TEST_F(AGX3PackBinary, StructuredIfAndForwardBranch)
 {
    /* One fused AGX IR if becomes icmp + cndst. The optional exec-none jump is

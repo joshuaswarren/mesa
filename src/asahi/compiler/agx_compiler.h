@@ -742,6 +742,11 @@ typedef struct {
     * how far its texture reads reached and how many halves the outputs and
     * any image-write bank need above them. */
    unsigned agx3_g18g_output_staging_floor;
+
+   /* Pack with a scoreboard drain at every control-flow boundary, as the
+    * retry when keeping results in flight into if arms leaves a wait no
+    * instruction form can carry (agx3_pack_program()). */
+   bool agx3_cf_drain_all;
    unsigned agx3_g18g_read_staging_end;
    unsigned agx3_g18g_output_staging_span;
    bool agx3_staging_known;

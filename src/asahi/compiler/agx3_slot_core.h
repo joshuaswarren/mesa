@@ -59,21 +59,36 @@ extern "C" {
 
 /* How emission treats the scoreboard at an instruction. Slot assignment is
  * linear, so emission retires every outstanding generation before a
- * control-flow boundary (agx3_pack_binary.c); agx3_slot_retire_at_cf() then
- * drops the waits those drains made redundant. */
+ * draining control-flow boundary (agx3_slot_cf_kind() in
+ * agx3_pack_binary.c). Assignment starts the code after such a boundary from
+ * an empty scoreboard, and agx3_slot_retire_at_cf() reports the drains. */
 enum agx3_slot_cf {
    AGX3_SLOT_CF_NONE = 0,
    /* Emission retires everything outstanding before this instruction. */
    AGX3_SLOT_CF_DRAIN,
-   /* The same, at a boundary that emits no bytes, so the boundary right
-    * after it, if any, is the first instruction to consume a result. */
-   AGX3_SLOT_CF_DRAIN_EMPTY,
 };
+
+/*
+ * A drain's retire carrier runs under the exec mask current where it is
+ * emitted, and an instruction no lane executes does not reliably wait. So the
+ * carrier at the end of an if arm (its else or pop_exec) retires only what
+ * that arm issued: a generation issued before the if, under the enclosing
+ * mask, may still be outstanding if the arm had no lanes. After an arm ends,
+ * assignment therefore resumes from the state at the if, and consumers of
+ * generations issued before it wait for them themselves; each consumer only
+ * runs with lanes, where its wait holds.
+ */
 
 struct agx3_slot_instr {
    bool is_async;   /* produces a scoreboard-tracked result */
    bool drain;      /* retire preceding async operations before a fence */
    uint8_t cf;      /* enum agx3_slot_cf */
+   /* Structured control flow: exec levels this instruction opens (an if or
+    * a loop push) and closes (pop_exec). cf_arm marks an opened level whose
+    * arm keeps results in flight (cf == AGX3_SLOT_CF_NONE); cf_else ends one
+    * arm of the innermost level and starts the next. */
+   uint8_t cf_push, cf_pop;
+   bool cf_arm, cf_else;
    /* This asynchronous instruction reads its sources when it retires rather
     * than when it issues, so redefining one of them first changes what it
     * transfers. Set it for device stores, whose payload nothing else tracks:
@@ -164,13 +179,12 @@ bool agx3_slot_assign(const struct agx3_slot_instr *instrs, unsigned n,
                       unsigned nslots, struct agx3_slot_result *out);
 
 /*
- * After assignment: remove the waits on generations that a control-flow
+ * After assignment: remove any wait on a generation that a control-flow
  * drain (instrs[i].cf) already retired, until a later producer reuses the
  * slot. entry_wait holds the slots pending on entry to the region. When
  * `drained` is not NULL, drained[i] is set when the drain before instrs[i]
- * retires a generation that neither instrs[i] nor, after an empty boundary,
- * the boundary right after it reads; such a drain costs latency that state
- * carried across the branch would not.
+ * retires a generation instrs[i] does not read; such a drain costs latency
+ * that state carried across the branch would not.
  */
 void agx3_slot_retire_at_cf(const struct agx3_slot_instr *instrs, unsigned n,
                             uint16_t entry_wait, struct agx3_slot_result *res,
