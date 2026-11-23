@@ -66,6 +66,7 @@ gen1_rq_supported_load(const nir_intrinsic_instr *intr, bool instances, bool pos
    case nir_ray_query_value_intersection_instance_id:
    case nir_ray_query_value_intersection_instance_custom_index:
    case nir_ray_query_value_intersection_instance_address:
+   case nir_ray_query_value_intersection_instance_sbt_index:
       return instances && nir_intrinsic_committed(intr);
    case nir_ray_query_value_intersection_type:
    case nir_ray_query_value_intersection_t:
@@ -93,6 +94,7 @@ gen1_candidate_supported_load(const nir_intrinsic_instr *intr, bool position_fet
    case nir_ray_query_value_intersection_barycentrics:
    case nir_ray_query_value_intersection_instance_id:
    case nir_ray_query_value_intersection_instance_custom_index:
+   case nir_ray_query_value_intersection_instance_address:
    case nir_ray_query_value_intersection_instance_sbt_index:
    case nir_ray_query_value_intersection_candidate_aabb_opaque:
    case nir_ray_query_value_intersection_object_ray_origin:
@@ -864,6 +866,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             nir_def *packet=nir_load_deref(&b,result[2]);
             nir_def *hit=nir_ine_imm(&b,nir_ushr_imm(&b,nir_channel(&b,packet,0),30),0);
             nir_def *zero=nir_imm_ivec2(&b,0,0);
+            nir_def *zero_ptr=nir_imm_int64(&b,0);
             nir_push_if(&b,hit);
             /* Native G17P packs each 48-bit instance pointer into three
              * consecutive halfwords, at a six-byte per-lane stride. */
@@ -877,9 +880,15 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             nir_def *ids=nir_load_global(&b,2,32,nir_iadd_imm(&b,pointer,96),.align_mul=4);
             nir_pop_if(&b,NULL);
             ids=nir_if_phi(&b,ids,zero);
+            pointer=nir_if_phi(&b,pointer,zero_ptr);
+            nir_store_deref(&b,result[0],nir_vec4(&b,
+               nir_unpack_64_2x32_split_x(&b,pointer),
+               nir_unpack_64_2x32_split_y(&b,pointer),
+               nir_imm_int(&b,1),nir_imm_int(&b,0)),15);
             nir_store_deref(&b,result[2],nir_vec4(&b,
                nir_channel(&b,packet,0),nir_channel(&b,packet,1),
-               nir_channel(&b,ids,1),nir_channel(&b,ids,0)),15);
+               nir_channel(&b,ids,1),
+               nir_iand_imm(&b,nir_channel(&b,ids,0),0xffffff)),15);
          }
          nir_pop_if(&b,NULL);
          nir_store_deref(&b, active, nir_imm_false(&b), 1);

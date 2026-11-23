@@ -13,9 +13,11 @@
 #include "asahi/compiler/agx3_compute_program.h"
 #include "util/blob.h"
 #include "util/set.h"
+#include "hk_cmd_buffer.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_physical_device.h"
+#include "hk_ray_tracing_core.h"
 #include "hk_ray_tracing_pipeline.h"
 #include "hk_shader.h"
 #include "hk_rt_recursion_spv.h"
@@ -29,6 +31,7 @@
 #include "vk_shader.h"
 #include "vk_shader_module.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 
 #define CHECK(x)                                                               \
@@ -44,6 +47,7 @@
 
 static unsigned translations, backends, shader_destroys, live_nir;
 static unsigned last_instrs, last_calls, last_max_block;
+static void (*inspect_nir)(nir_shader *nir);
 static nir_shader *tracked_nir[64];
 static VkResult backend_result = VK_SUCCESS;
 static unsigned fail_translation;
@@ -161,6 +165,8 @@ __wrap_hk_compile_shader(struct hk_device *dev,
          last_max_block = MAX2(last_max_block, n);
       }
    }
+   if (inspect_nir)
+      inspect_nir(info->nir);
    ralloc_free(info->nir);
    if (backend_result != VK_SUCCESS)
       return backend_result;
@@ -343,6 +349,316 @@ static struct hk_ray_tracing_pipeline *
 rt(VkPipeline p)
 {
    return hk_ray_tracing_pipeline_from_handle(p);
+}
+
+/* Minimal concrete evaluator for pure NIR SSA DAGs emitted by
+ * hk_compile_rt_kernel() (launch-ID reconstruction, OOB guard, SBT entry
+ * address arithmetic, and group-handle dispatch conditions). */
+struct nir_eval_env {
+   uint32_t wg[3];
+   uint32_t lid;
+   uint32_t sbt_index;
+   VkTraceRaysIndirectCommand2KHR cmd;
+   uint64_t root_addr;
+   uint64_t cmd_addr;
+   const uint8_t *hit_sbt;
+   size_t hit_sbt_size;
+};
+
+static uint64_t
+nir_eval_mask(unsigned bit_size)
+{
+   return bit_size >= 64 ? ~UINT64_C(0) : ((UINT64_C(1) << bit_size) - 1);
+}
+
+static int64_t
+nir_eval_sext(uint64_t v, unsigned bit_size)
+{
+   v &= nir_eval_mask(bit_size);
+   if (bit_size < 64 && (v & (UINT64_C(1) << (bit_size - 1))))
+      v |= ~nir_eval_mask(bit_size);
+   return (int64_t)v;
+}
+
+static uint64_t
+nir_eval_def(const nir_def *def, unsigned comp, const struct nir_eval_env *env);
+
+static uint64_t
+nir_eval_alu_src(const nir_alu_src *src, unsigned comp,
+                 const struct nir_eval_env *env)
+{
+   return nir_eval_def(src->src.ssa, src->swizzle[comp], env);
+}
+
+static uint64_t
+nir_eval_mem_read(const struct nir_eval_env *env, uint64_t addr,
+                  unsigned bytes)
+{
+   if (addr == env->root_addr + hk_root_descriptor_offset(cs.trace_rays_addr)) {
+      CHECK(bytes == 8);
+      return env->cmd_addr;
+   }
+   if (addr >= env->cmd_addr &&
+       addr + bytes <= env->cmd_addr + sizeof(env->cmd)) {
+      uint64_t out = 0;
+      memcpy(&out, (const uint8_t *)&env->cmd + (addr - env->cmd_addr), bytes);
+      return out;
+   }
+   if (env->hit_sbt && addr >= env->cmd.hitShaderBindingTableAddress &&
+       addr + bytes <= env->cmd.hitShaderBindingTableAddress + env->hit_sbt_size) {
+      uint64_t out = 0;
+      memcpy(&out,
+             env->hit_sbt + (addr - env->cmd.hitShaderBindingTableAddress),
+             bytes);
+      return out;
+   }
+   fprintf(stderr, "unexpected nir_eval_mem_read at 0x%" PRIx64 " (%u B)\n",
+           addr, bytes);
+   abort();
+}
+
+static uint64_t
+nir_eval_def(const nir_def *def, unsigned comp, const struct nir_eval_env *env)
+{
+   const nir_instr *instr = nir_def_instr(def);
+   const unsigned bs = def->bit_size;
+   const uint64_t mask = nir_eval_mask(bs);
+
+   switch (instr->type) {
+   case nir_instr_type_load_const: {
+      const nir_load_const_instr *lc = nir_instr_as_load_const(instr);
+      return nir_const_value_as_uint(lc->value[comp], bs) & mask;
+   }
+   case nir_instr_type_phi:
+      /* Software traversal carries sbt_index across loop iterations in a phi. */
+      return env->sbt_index & mask;
+   case nir_instr_type_intrinsic: {
+      const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      switch (intr->intrinsic) {
+      case nir_intrinsic_load_workgroup_id:
+         CHECK(comp < 3);
+         return env->wg[comp];
+      case nir_intrinsic_load_local_invocation_index:
+         return env->lid;
+      case nir_intrinsic_load_root_agx:
+         return env->root_addr;
+      case nir_intrinsic_load_global_constant:
+      case nir_intrinsic_load_global: {
+         const uint64_t base = nir_eval_def(intr->src[0].ssa, 0, env);
+         const unsigned bytes = bs / 8;
+         return nir_eval_mem_read(env, base + comp * bytes, bytes) & mask;
+      }
+      case nir_intrinsic_rq_load: {
+         const nir_ray_query_value val = nir_intrinsic_ray_query_value(intr);
+         if (val == nir_ray_query_value_intersection_instance_sbt_index)
+            return env->sbt_index & mask;
+         return 0;
+      }
+      default:
+         fprintf(stderr, "unsupported intrinsic in nir_eval_def: %s\n",
+                 nir_intrinsic_infos[intr->intrinsic].name);
+         abort();
+      }
+   }
+   case nir_instr_type_alu: {
+      const nir_alu_instr *alu = nir_instr_as_alu(instr);
+      switch (alu->op) {
+      case nir_op_mov:
+         return nir_eval_alu_src(&alu->src[0], comp, env) & mask;
+      case nir_op_vec2:
+      case nir_op_vec3:
+      case nir_op_vec4:
+         return nir_eval_alu_src(&alu->src[comp], 0, env) & mask;
+      case nir_op_iadd:
+         return (nir_eval_alu_src(&alu->src[0], comp, env) +
+                 nir_eval_alu_src(&alu->src[1], comp, env)) & mask;
+      case nir_op_isub:
+         return (nir_eval_alu_src(&alu->src[0], comp, env) -
+                 nir_eval_alu_src(&alu->src[1], comp, env)) & mask;
+      case nir_op_imul:
+         return (nir_eval_alu_src(&alu->src[0], comp, env) *
+                 nir_eval_alu_src(&alu->src[1], comp, env)) & mask;
+      case nir_op_umul_2x32_64:
+         return (uint64_t)(uint32_t)nir_eval_alu_src(&alu->src[0], comp, env) *
+                (uint64_t)(uint32_t)nir_eval_alu_src(&alu->src[1], comp, env);
+      case nir_op_ishl: {
+         const uint64_t a = nir_eval_alu_src(&alu->src[0], comp, env);
+         const unsigned s = nir_eval_alu_src(&alu->src[1], comp, env) & (bs - 1);
+         return (a << s) & mask;
+      }
+      case nir_op_ushr: {
+         const uint64_t a = nir_eval_alu_src(&alu->src[0], comp, env) & mask;
+         const unsigned s = nir_eval_alu_src(&alu->src[1], comp, env) & (bs - 1);
+         return (a >> s) & mask;
+      }
+      case nir_op_iand:
+         return (nir_eval_alu_src(&alu->src[0], comp, env) &
+                 nir_eval_alu_src(&alu->src[1], comp, env)) & mask;
+      case nir_op_ior:
+         return (nir_eval_alu_src(&alu->src[0], comp, env) |
+                 nir_eval_alu_src(&alu->src[1], comp, env)) & mask;
+      case nir_op_ixor:
+         return (nir_eval_alu_src(&alu->src[0], comp, env) ^
+                 nir_eval_alu_src(&alu->src[1], comp, env)) & mask;
+      case nir_op_inot:
+         return (~nir_eval_alu_src(&alu->src[0], comp, env)) & mask;
+      case nir_op_ieq: {
+         const unsigned sbs = alu->src[0].src.ssa->bit_size;
+         const uint64_t sm = nir_eval_mask(sbs);
+         return ((nir_eval_alu_src(&alu->src[0], comp, env) & sm) ==
+                 (nir_eval_alu_src(&alu->src[1], comp, env) & sm)) ? 1 : 0;
+      }
+      case nir_op_ine: {
+         const unsigned sbs = alu->src[0].src.ssa->bit_size;
+         const uint64_t sm = nir_eval_mask(sbs);
+         return ((nir_eval_alu_src(&alu->src[0], comp, env) & sm) !=
+                 (nir_eval_alu_src(&alu->src[1], comp, env) & sm)) ? 1 : 0;
+      }
+      case nir_op_ult: {
+         const unsigned sbs = alu->src[0].src.ssa->bit_size;
+         const uint64_t sm = nir_eval_mask(sbs);
+         return ((nir_eval_alu_src(&alu->src[0], comp, env) & sm) <
+                 (nir_eval_alu_src(&alu->src[1], comp, env) & sm)) ? 1 : 0;
+      }
+      case nir_op_uge: {
+         const unsigned sbs = alu->src[0].src.ssa->bit_size;
+         const uint64_t sm = nir_eval_mask(sbs);
+         return ((nir_eval_alu_src(&alu->src[0], comp, env) & sm) >=
+                 (nir_eval_alu_src(&alu->src[1], comp, env) & sm)) ? 1 : 0;
+      }
+      case nir_op_ilt: {
+         const unsigned sbs = alu->src[0].src.ssa->bit_size;
+         return (nir_eval_sext(nir_eval_alu_src(&alu->src[0], comp, env), sbs) <
+                 nir_eval_sext(nir_eval_alu_src(&alu->src[1], comp, env), sbs))
+                   ? 1 : 0;
+      }
+      case nir_op_ige: {
+         const unsigned sbs = alu->src[0].src.ssa->bit_size;
+         return (nir_eval_sext(nir_eval_alu_src(&alu->src[0], comp, env), sbs) >=
+                 nir_eval_sext(nir_eval_alu_src(&alu->src[1], comp, env), sbs))
+                   ? 1 : 0;
+      }
+      case nir_op_bcsel:
+         return (nir_eval_alu_src(&alu->src[0], comp, env) & 1)
+                   ? (nir_eval_alu_src(&alu->src[1], comp, env) & mask)
+                   : (nir_eval_alu_src(&alu->src[2], comp, env) & mask);
+      case nir_op_u2u64:
+      case nir_op_u2u32:
+      case nir_op_u2u16:
+      case nir_op_u2u8: {
+         const unsigned sbs = alu->src[0].src.ssa->bit_size;
+         return (nir_eval_alu_src(&alu->src[0], comp, env) &
+                 nir_eval_mask(sbs)) & mask;
+      }
+      case nir_op_pack_64_2x32:
+         return (nir_eval_alu_src(&alu->src[0], 0, env) & UINT32_MAX) |
+                ((nir_eval_alu_src(&alu->src[0], 1, env) & UINT32_MAX) << 32);
+      case nir_op_pack_64_2x32_split:
+         return (nir_eval_alu_src(&alu->src[0], comp, env) & UINT32_MAX) |
+                ((nir_eval_alu_src(&alu->src[1], comp, env) & UINT32_MAX) << 32);
+      case nir_op_unpack_64_2x32: {
+         const uint64_t v = nir_eval_alu_src(&alu->src[0], 0, env);
+         return (comp == 0 ? v : (v >> 32)) & UINT32_MAX;
+      }
+      case nir_op_unpack_64_2x32_split_x:
+         return nir_eval_alu_src(&alu->src[0], comp, env) & UINT32_MAX;
+      case nir_op_unpack_64_2x32_split_y:
+         return (nir_eval_alu_src(&alu->src[0], comp, env) >> 32) & UINT32_MAX;
+      case nir_op_b2i32:
+      case nir_op_b2i64:
+         return (nir_eval_alu_src(&alu->src[0], comp, env) & 1) ? 1 : 0;
+      case nir_op_ubfe: {
+         const uint64_t v = nir_eval_alu_src(&alu->src[0], comp, env);
+         const unsigned off = nir_eval_alu_src(&alu->src[1], comp, env) & 63;
+         const unsigned bits = nir_eval_alu_src(&alu->src[2], comp, env) & 63;
+         return bits == 0 ? 0 : ((v >> off) & nir_eval_mask(bits)) & mask;
+      }
+      default:
+         fprintf(stderr, "unsupported ALU op in nir_eval_def: %s\n",
+                 nir_op_infos[alu->op].name);
+         abort();
+      }
+   }
+   default:
+      fprintf(stderr, "unsupported instr type %d in nir_eval_def\n",
+              instr->type);
+      abort();
+   }
+}
+
+/* Verify that the real megakernel NIR emitted by hk_compile_rt_kernel()
+ * retires the exact partial-tile OOB lanes and passes the exact in-bounds
+ * lanes across heights 1, 2, 4, and 5 when dispatched with
+ * hk_rt_launch_group_count(). */
+static void
+inspect_tiled_launch_oob(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_if *oob_if = NULL;
+   foreach_list_typed(nir_cf_node, node, node, &impl->body) {
+      if (node->type == nir_cf_node_if) {
+         oob_if = nir_cf_node_as_if(node);
+         break;
+      }
+   }
+   CHECK(oob_if != NULL);
+
+   /* Determine whether the active body lives in `then` or `else` (after
+    * nir_lower_returns + nir_opt_if, the condition polarity may flip). */
+   unsigned then_instrs = 0, else_instrs = 0;
+   foreach_list_typed(nir_cf_node, cf, node, &oob_if->then_list) {
+      nir_foreach_block_in_cf_node(block, cf)
+         nir_foreach_instr(instr, block)
+            then_instrs++;
+   }
+   foreach_list_typed(nir_cf_node, cf, node, &oob_if->else_list) {
+      nir_foreach_block_in_cf_node(block, cf)
+         nir_foreach_instr(instr, block)
+            else_instrs++;
+   }
+   CHECK(then_instrs != else_instrs);
+   const bool active_on_true = then_instrs > else_instrs;
+
+   const uint32_t cases[][3] = {
+      {1, 1, 1}, {7, 1, 1}, {33, 1, 1},
+      {1, 2, 1}, {7, 2, 1}, {8, 2, 1}, {9, 2, 1}, {9, 2, 2},
+      {1, 4, 1}, {7, 4, 1}, {8, 4, 1}, {9, 4, 1}, {9, 4, 2},
+      {1, 5, 1}, {7, 5, 1}, {8, 5, 1}, {9, 5, 1}, {9, 5, 2},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+      const uint32_t w = cases[i][0], h = cases[i][1], d = cases[i][2];
+      uint32_t groups[3];
+      hk_rt_launch_group_count(w, h, d, groups);
+      struct nir_eval_env env = {
+         .root_addr = UINT64_C(0x100000),
+         .cmd_addr = UINT64_C(0x200000),
+         .cmd = { .width = w, .height = h, .depth = d },
+      };
+      const size_t total = (size_t)w * (size_t)h * (size_t)d;
+      const size_t launched = (size_t)groups[0] * groups[1] * groups[2] *
+                              HK_RT_WORKGROUP_SIZE_X;
+      size_t active = 0, retired = 0;
+      for (uint32_t gz = 0; gz < groups[2]; ++gz) {
+         for (uint32_t gy = 0; gy < groups[1]; ++gy) {
+            for (uint32_t gx = 0; gx < groups[0]; ++gx) {
+               for (uint32_t lid = 0; lid < HK_RT_WORKGROUP_SIZE_X; ++lid) {
+                  env.wg[0] = gx;
+                  env.wg[1] = gy;
+                  env.wg[2] = gz;
+                  env.lid = lid;
+                  const bool cond =
+                     (nir_eval_def(oob_if->condition.ssa, 0, &env) & 1) != 0;
+                  if (cond == active_on_true)
+                     active++;
+                  else
+                     retired++;
+               }
+            }
+         }
+      }
+      CHECK(active == total);
+      CHECK(retired == launched - total);
+   }
 }
 
 int
@@ -866,6 +1182,21 @@ main(void)
             32 + (48 + 32) + 5 * (80 + 32) + 31 * (112 + 32) + 112);
       CHECK(hk_rt_continuation_stack_size(&sizes, 5, false, 72, &leaf) ==
             32 + (48 + 32) + 5 * (80 + 32) + 160 && leaf == 80 + 80);
+      /* Verify real compiled NIR launch-ID reconstruction and OOB guard across
+       * partial edge tiles at heights 1, 2, 4, and 5. */
+      ci = info(0);
+      ci.stageCount = ARRAY_SIZE(stages);
+      ci.pStages = stages;
+      ci.groupCount = ARRAY_SIZE(groups);
+      ci.pGroups = groups;
+      ci.maxPipelineRayRecursionDepth = 1;
+      inspect_nir = inspect_tiled_launch_oob;
+      CHECK(create(VK_NULL_HANDLE, &ci, &p) == VK_SUCCESS);
+      inspect_nir = NULL;
+      destroy(p);
+      puts("PASS: compiled NIR launch-ID OOB guard covers partial edge tiles at "
+           "heights 1, 2, 4 and 5");
+
       for (unsigned i = 0; i < ARRAY_SIZE(mods); ++i)
          vk_common_DestroyShaderModule(device, mods[i], NULL);
       puts("PASS: continuation mode above depth 3: no calls, code size "

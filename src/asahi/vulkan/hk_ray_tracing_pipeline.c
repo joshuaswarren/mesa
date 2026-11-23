@@ -301,6 +301,8 @@ struct hk_rt_shader_state {
    nir_variable *tmax;
 
    nir_variable *instance_addr;
+   nir_variable *instance_id;
+   nir_variable *instance_custom_index;
    nir_variable *primitive_addr;
    nir_variable *primitive_id;
    nir_variable *geometry_id_and_flags;
@@ -423,6 +425,10 @@ hk_ray_tracing_state_init(nir_shader *nir, struct hk_rt_compiler *compiler)
 
    if (compiler->position_fetch)
       VAR(primitive_addr, glsl_uint64_t_type(), "primitive_addr");
+   if (compiler->native_agx) {
+      VAR(instance_id, glsl_uint_type(), "instance_id");
+      VAR(instance_custom_index, glsl_uint_type(), "instance_custom_index");
+   }
 
 #undef VAR
 }
@@ -701,8 +707,8 @@ hk_rt_stage_call_cond(nir_builder *b, const struct hk_rt_stage_call *call)
 /* Preserve invocation state across nested calls. SSA/DCE eliminates fields
  * that the caller never reads after the return; no fixed spill frame is added. */
 struct hk_rt_saved_state {
-   nir_variable *vars[22];
-   nir_def *values[22];
+   nir_variable *vars[24];
+   nir_def *values[24];
    unsigned count;
 };
 
@@ -722,6 +728,8 @@ hk_rt_save_state(nir_builder *b, struct hk_rt_shader_state *state)
       state->dir,
       state->tmax,
       state->instance_addr,
+      state->instance_id,
+      state->instance_custom_index,
       state->primitive_id,
       state->geometry_id_and_flags,
       state->hit_kind,
@@ -734,6 +742,8 @@ hk_rt_save_state(nir_builder *b, struct hk_rt_shader_state *state)
       state->opaque,
       state->primitive_addr,
    };
+   static_assert(ARRAY_SIZE(vars) <= ARRAY_SIZE(saved.vars),
+                 "hk_rt_saved_state capacity");
    for (unsigned i = 0; i < ARRAY_SIZE(vars); ++i) {
       if (!vars[i])
          continue;
@@ -1250,22 +1260,23 @@ hk_handle_triangle_intersection(nir_builder *b,
    nir_pop_if(b, NULL);
 }
 
-/* Candidate and committed state use the same native instance pointer table.
- * Any-hit must see the candidate state before application acceptance. */
+/* Load native hit state straight from the ray query so we reuse the instance
+ * node pointer and IDs traversal already fetched instead of chasing the TLAS
+ * instance pointer table again.  Any-hit must see candidate state before
+ * application acceptance. */
 static void
 hk_rt_native_load_hit_state(nir_builder *b, struct hk_rt_shader_state *state,
-                        nir_def *q, nir_def *as, bool committed)
+                            nir_def *q, bool committed, bool triangle_only)
 {
-   nir_def *instance_id = nir_rq_load(b, 1, 32, q, .committed = committed,
-      .ray_query_value = nir_ray_query_value_intersection_instance_id);
-   /* Native pointer table entries contain record-relative-offset +4. */
-   nir_def *table = nir_load_global(b, 1, 64, nir_iadd_imm(b, as, 128),
-                                    .align_mul = 8);
-   nir_def *entry = nir_load_global(b, 1, 64,
-      nir_iadd(b, nir_iadd(b, as, table), nir_u2u64(b, nir_ishl_imm(b, instance_id, 4))),
-      .align_mul = 8);
-   nir_def *instance = nir_iadd_imm(b, nir_iadd(b, as, entry), -4);
+   nir_def *instance = nir_rq_load(b, 1, 64, q, .committed = committed,
+      .ray_query_value = nir_ray_query_value_intersection_instance_address);
    nir_store_var(b, state->instance_addr, instance, 1);
+   nir_store_var(b, state->instance_id,
+      nir_rq_load(b, 1, 32, q, .committed = committed,
+         .ray_query_value = nir_ray_query_value_intersection_instance_id), 1);
+   nir_store_var(b, state->instance_custom_index,
+      nir_rq_load(b, 1, 32, q, .committed = committed,
+         .ray_query_value = nir_ray_query_value_intersection_instance_custom_index), 1);
    nir_def *primitive = nir_rq_load(b, 1, 32, q, .committed = committed,
       .ray_query_value = nir_ray_query_value_intersection_primitive_index);
    nir_store_var(b, state->primitive_id, primitive, 1);
@@ -1278,9 +1289,11 @@ hk_rt_native_load_hit_state(nir_builder *b, struct hk_rt_shader_state *state,
    nir_def *distance = nir_rq_load(b, 1, 32, q, .committed = committed,
       .ray_query_value = nir_ray_query_value_intersection_t);
    nir_store_var(b, state->tmax, distance, 1);
-   nir_def *type = nir_rq_load(b, 1, 32, q, .committed = committed,
-      .ray_query_value = nir_ray_query_value_intersection_type);
-   nir_push_if(b, nir_ieq_imm(b, type, committed ? 1 : 0));
+   if (!triangle_only) {
+      nir_def *type = nir_rq_load(b, 1, 32, q, .committed = committed,
+         .ray_query_value = nir_ray_query_value_intersection_type);
+      nir_push_if(b, nir_ieq_imm(b, type, committed ? 1 : 0));
+   }
    nir_def *front = nir_rq_load(b, 1, 1, q, .committed = committed,
       .ray_query_value = nir_ray_query_value_intersection_front_face);
    nir_store_var(b, state->hit_kind,
@@ -1289,10 +1302,10 @@ hk_rt_native_load_hit_state(nir_builder *b, struct hk_rt_shader_state *state,
       .ray_query_value = nir_ray_query_value_intersection_barycentrics);
    nir_store_scratch(b, bary, nir_load_var(b, state->stack_ptr),
                      .align_mul = 8, .write_mask = 3);
-   nir_pop_if(b, NULL);
-   nir_def *otw = nir_iadd(b, instance,
-      nir_load_global(b, 1, 64, nir_iadd_imm(b, instance, 104), .align_mul = 8));
-   nir_def *sbt = nir_load_global(b, 1, 32, nir_iadd_imm(b, otw, 48), .align_mul = 4);
+   if (!triangle_only)
+      nir_pop_if(b, NULL);
+   nir_def *sbt = nir_rq_load(b, 1, 32, q, .committed = committed,
+      .ray_query_value = nir_ray_query_value_intersection_instance_sbt_index);
    nir_store_var(b, state->traversal.sbt_offset_and_flags, sbt, 1);
    nir_store_var(b, state->sbt_index,
                  hk_hit_sbt_index(b, state, geometry), 1);
@@ -1302,10 +1315,31 @@ hk_rt_native_load_hit_state(nir_builder *b, struct hk_rt_shader_state *state,
  * lowering for traversal; software hk_bvh traversal cannot interpret them. */
 static void
 hk_trace_ray_native(nir_builder *b, struct hk_rt_compiler *compiler,
-                nir_def *as, nir_def *flags, nir_def *mask,
-                nir_def *origin, nir_def *tmin, nir_def *dir, nir_def *tmax)
+                    nir_def *as, nir_def *flags, nir_def *mask,
+                    nir_def *origin, nir_def *tmin, nir_def *dir,
+                    nir_def *tmax, bool skip_committed_on_skip_chit)
 {
    struct hk_rt_shader_state *state = &compiler->state;
+   bool has_isec = false, has_ahit = false;
+   if (!(compiler->flags &
+         VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR)) {
+      for (uint32_t i = 0; i < compiler->pipeline->group_count; ++i) {
+         if (compiler->pipeline->groups[i].isec_index != VK_SHADER_UNUSED_KHR) {
+            has_isec = true;
+            break;
+         }
+      }
+   }
+   if (!(compiler->flags &
+         VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR)) {
+      for (uint32_t i = 0; i < compiler->pipeline->group_count; ++i) {
+         if (compiler->pipeline->groups[i].ahit_index != VK_SHADER_UNUSED_KHR) {
+            has_ahit = true;
+            break;
+         }
+      }
+   }
+
    /* Each generated traversal drains/terminates its native queue and copies
     * the committed hit into state before invoking closest-hit or miss code.
     * Those stages therefore reuse this context for their subsequent traces.
@@ -1315,6 +1349,8 @@ hk_trace_ray_native(nir_builder *b, struct hk_rt_compiler *compiler,
       compiler->native_query = nir_variable_create(b->shader, nir_var_shader_temp,
          glsl_uint64_t_type(), "rt.query");
       compiler->native_query->data.ray_query = true;
+   }
+   if (has_isec && !compiler->native_hit_kind) {
       compiler->native_hit_kind = nir_variable_create(b->shader,
          nir_var_shader_temp, glsl_uint_type(), "rt.procedural_hit_kind");
       compiler->native_hit_attribs = nir_variable_create(b->shader,
@@ -1333,45 +1369,47 @@ hk_trace_ray_native(nir_builder *b, struct hk_rt_compiler *compiler,
    if (compiler->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR)
       query_flags = nir_ior_imm(b, query_flags, SpvRayFlagsSkipTrianglesKHRMask);
    nir_rq_initialize(b, q, as, query_flags, mask, origin, tmin, dir, tmax);
-   nir_push_loop(b);
-   nir_break_if(b, nir_inot(b, nir_rq_proceed(b, 1, q)));
-   {
-      nir_def *candidate_type = nir_rq_load(b, 1, 32, q, .committed = false,
-         .ray_query_value = nir_ray_query_value_intersection_type);
-      nir_def *best = nir_rq_load(b, 1, 32, q, .committed = true,
-         .ray_query_value = nir_ray_query_value_intersection_t);
-      hk_rt_native_load_hit_state(b, state, q, as, false);
-      nir_store_var(b, state->terminate,
-         nir_test_mask(b, flags, SpvRayFlagsTerminateOnFirstHitKHRMask), 1);
-      struct hk_sbt_entry hit_entry = hk_load_sbt_entry(
-         b, nir_load_var(b, state->sbt_index), HK_RT_CMD_HIT_ADDRESS);
-      nir_store_var(b, state->shader_record_ptr, hit_entry.shader_record_ptr, 1);
-      nir_push_if(b, nir_ieq_imm(b, candidate_type, 1));
+   if (!has_isec && !has_ahit) {
+      nir_push_loop(b);
+      nir_break_if(b, nir_inot(b, nir_rq_proceed(b, 1, q)));
       {
-         nir_store_var(b, state->accept, nir_imm_false(b), 1);
-         nir_store_var(b, state->tmax, best, 1);
-         nir_store_var(b, state->opaque, nir_rq_load(b, 1, 1, q,
-            .committed = false,
-            .ray_query_value = nir_ray_query_value_intersection_candidate_aabb_opaque), 1);
-         for (uint32_t i = 0; i < compiler->pipeline->group_count; ++i) {
-            struct hk_ray_tracing_group *group = compiler->pipeline->groups + i;
-            if (group->isec_index == VK_SHADER_UNUSED_KHR)
-               continue;
-            nir_shader *stage = compiler->pipeline->stages[group->isec_index]->nir;
-            nir_push_if(b, nir_ieq_imm(b, hit_entry.value, group->handle.index));
-            hk_call_ray_tracing_stage(b, compiler, stage, true);
-            nir_pop_if(b, NULL);
-            struct hk_lower_isec_state isec_state = {
-               .compiler = compiler,
-               .ahit = group->ahit_index == VK_SHADER_UNUSED_KHR ? NULL :
-                  compiler->pipeline->stages[group->ahit_index]->nir,
-            };
-            nir_shader_intrinsics_pass(b->shader, hk_lower_isec_intrinsic,
-                                       nir_metadata_none, &isec_state);
+         nir_def *confirm = nir_imm_true(b);
+         if (!(compiler->flags &
+               VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR)) {
+            nir_def *candidate_type = nir_rq_load(b, 1, 32, q, .committed = false,
+               .ray_query_value = nir_ray_query_value_intersection_type);
+            confirm = nir_ieq_imm(b, candidate_type, 0);
          }
+         nir_push_if(b, confirm);
+         {
+            nir_rq_confirm_intersection(b, q);
+            nir_push_if(b, nir_test_mask(b, flags,
+                                         SpvRayFlagsTerminateOnFirstHitKHRMask));
+            nir_rq_terminate(b, q);
+            nir_pop_if(b, NULL);
+         }
+         nir_pop_if(b, NULL);
       }
-      nir_push_else(b, NULL);
+      nir_pop_loop(b, NULL);
+   } else if (!has_isec) {
+      nir_push_loop(b);
+      nir_break_if(b, nir_inot(b, nir_rq_proceed(b, 1, q)));
       {
+         const bool guard_aabb =
+            !(compiler->flags &
+              VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR);
+         if (guard_aabb) {
+            nir_def *candidate_type = nir_rq_load(b, 1, 32, q, .committed = false,
+               .ray_query_value = nir_ray_query_value_intersection_type);
+            nir_push_if(b, nir_ieq_imm(b, candidate_type, 0));
+         }
+         hk_rt_native_load_hit_state(b, state, q, false, true);
+         nir_store_var(b, state->terminate,
+            nir_test_mask(b, flags, SpvRayFlagsTerminateOnFirstHitKHRMask), 1);
+         struct hk_sbt_entry hit_entry = hk_load_sbt_entry(
+            b, nir_load_var(b, state->sbt_index), HK_RT_CMD_HIT_ADDRESS);
+         nir_store_var(b, state->shader_record_ptr,
+                       hit_entry.shader_record_ptr, 1);
          nir_store_var(b, state->accept, nir_imm_true(b), 1);
          for (uint32_t i = 0; i < compiler->pipeline->group_count; ++i) {
             struct hk_ray_tracing_group *group = compiler->pipeline->groups + i;
@@ -1383,32 +1421,110 @@ hk_trace_ray_native(nir_builder *b, struct hk_rt_compiler *compiler,
             nir_pop_if(b, NULL);
          }
          nir_push_if(b, nir_load_var(b, state->accept));
-         nir_rq_confirm_intersection(b, q);
+         {
+            nir_rq_confirm_intersection(b, q);
+            nir_push_if(b, nir_load_var(b, state->terminate));
+            nir_rq_terminate(b, q);
+            nir_pop_if(b, NULL);
+         }
+         nir_pop_if(b, NULL);
+         if (guard_aabb)
+            nir_pop_if(b, NULL);
+      }
+      nir_pop_loop(b, NULL);
+   } else {
+      nir_push_loop(b);
+      nir_break_if(b, nir_inot(b, nir_rq_proceed(b, 1, q)));
+      {
+         nir_def *candidate_type = nir_rq_load(b, 1, 32, q, .committed = false,
+            .ray_query_value = nir_ray_query_value_intersection_type);
+         nir_def *best = nir_rq_load(b, 1, 32, q, .committed = true,
+            .ray_query_value = nir_ray_query_value_intersection_t);
+         hk_rt_native_load_hit_state(b, state, q, false, false);
+         nir_store_var(b, state->terminate,
+            nir_test_mask(b, flags, SpvRayFlagsTerminateOnFirstHitKHRMask), 1);
+         struct hk_sbt_entry hit_entry = hk_load_sbt_entry(
+            b, nir_load_var(b, state->sbt_index), HK_RT_CMD_HIT_ADDRESS);
+         nir_store_var(b, state->shader_record_ptr, hit_entry.shader_record_ptr, 1);
+         nir_push_if(b, nir_ieq_imm(b, candidate_type, 1));
+         {
+            nir_store_var(b, state->accept, nir_imm_false(b), 1);
+            nir_store_var(b, state->tmax, best, 1);
+            nir_store_var(b, state->opaque, nir_rq_load(b, 1, 1, q,
+               .committed = false,
+               .ray_query_value = nir_ray_query_value_intersection_candidate_aabb_opaque), 1);
+            for (uint32_t i = 0; i < compiler->pipeline->group_count; ++i) {
+               struct hk_ray_tracing_group *group = compiler->pipeline->groups + i;
+               if (group->isec_index == VK_SHADER_UNUSED_KHR)
+                  continue;
+               nir_shader *stage = compiler->pipeline->stages[group->isec_index]->nir;
+               nir_push_if(b, nir_ieq_imm(b, hit_entry.value, group->handle.index));
+               hk_call_ray_tracing_stage(b, compiler, stage, true);
+               nir_pop_if(b, NULL);
+               struct hk_lower_isec_state isec_state = {
+                  .compiler = compiler,
+                  .ahit = group->ahit_index == VK_SHADER_UNUSED_KHR ? NULL :
+                     compiler->pipeline->stages[group->ahit_index]->nir,
+               };
+               nir_shader_intrinsics_pass(b->shader, hk_lower_isec_intrinsic,
+                                          nir_metadata_none, &isec_state);
+            }
+         }
+         nir_push_else(b, NULL);
+         {
+            nir_store_var(b, state->accept, nir_imm_true(b), 1);
+            if (has_ahit) {
+               for (uint32_t i = 0; i < compiler->pipeline->group_count; ++i) {
+                  struct hk_ray_tracing_group *group = compiler->pipeline->groups + i;
+                  if (group->ahit_index == VK_SHADER_UNUSED_KHR)
+                     continue;
+                  nir_shader *stage = compiler->pipeline->stages[group->ahit_index]->nir;
+                  nir_push_if(b, nir_ieq_imm(b, hit_entry.value, group->handle.index));
+                  hk_call_ray_tracing_stage(b, compiler, stage, true);
+                  nir_pop_if(b, NULL);
+               }
+            }
+            nir_push_if(b, nir_load_var(b, state->accept));
+            nir_rq_confirm_intersection(b, q);
+            nir_pop_if(b, NULL);
+         }
+         nir_pop_if(b, NULL);
+         nir_push_if(b, nir_iand(b, nir_load_var(b, state->accept),
+                                 nir_load_var(b, state->terminate)));
+         nir_rq_terminate(b, q);
          nir_pop_if(b, NULL);
       }
-      nir_pop_if(b, NULL);
-      nir_push_if(b, nir_iand(b, nir_load_var(b, state->accept),
-                              nir_load_var(b, state->terminate)));
-      nir_rq_terminate(b, q);
-      nir_pop_if(b, NULL);
+      nir_pop_loop(b, NULL);
    }
-   nir_pop_loop(b, NULL);
    /* A miss after rejected candidates keeps the original ray maximum. */
    nir_store_var(b, state->tmax, tmax, 1);
    nir_def *type = nir_rq_load(b, 1, 32, q, .committed = true,
                                .ray_query_value = nir_ray_query_value_intersection_type);
-   nir_store_var(b, state->traversal.hit, nir_ine_imm(b, type, 0), 1);
-   nir_push_if(b, nir_ine_imm(b, type, 0));
-   hk_rt_native_load_hit_state(b, state, q, as, true);
-   nir_push_if(b, nir_ieq_imm(b, type, 2));
-   nir_store_var(b, state->hit_kind, nir_load_var(b, compiler->native_hit_kind), 1);
-   nir_def *frame = nir_load_var(b, state->stack_ptr);
-   for (unsigned i = 0; i < HK_RAY_HIT_ATTRIBS_SIZE / 4; ++i) {
-      nir_store_scratch(b, nir_load_deref(b, hk_native_hit_attrib(b, compiler, i)),
-                        nir_iadd_imm(b, frame, 4 * i), .align_mul = 4,
-                        .write_mask = 0x1);
+   nir_def *hit = nir_ine_imm(b, type, 0);
+   nir_store_var(b, state->traversal.hit, hit, 1);
+   nir_def *load_hit = hit;
+   if (skip_committed_on_skip_chit) {
+      load_hit = nir_iand(b, hit,
+         nir_inot(b, nir_test_mask(b, flags,
+                                   SpvRayFlagsSkipClosestHitShaderKHRMask)));
    }
-   nir_pop_if(b, NULL);
+   nir_push_if(b, load_hit);
+   {
+      hk_rt_native_load_hit_state(b, state, q, true, !has_isec);
+      if (has_isec) {
+         nir_push_if(b, nir_ieq_imm(b, type, 2));
+         nir_store_var(b, state->hit_kind,
+                       nir_load_var(b, compiler->native_hit_kind), 1);
+         nir_def *frame = nir_load_var(b, state->stack_ptr);
+         for (unsigned i = 0; i < HK_RAY_HIT_ATTRIBS_SIZE / 4; ++i) {
+            nir_store_scratch(b,
+               nir_load_deref(b, hk_native_hit_attrib(b, compiler, i)),
+               nir_iadd_imm(b, frame, 4 * i), .align_mul = 4,
+               .write_mask = 0x1);
+         }
+         nir_pop_if(b, NULL);
+      }
+   }
    nir_pop_if(b, NULL);
 }
 
@@ -1492,7 +1608,7 @@ hk_rt_emit_traversal(nir_builder *b, struct hk_rt_compiler *compiler,
    nir_push_if(b, nir_ine_imm(b, accel_struct, 0));
    if (compiler->native_agx)
       hk_trace_ray_native(b, compiler, accel_struct, flags, cull_mask,
-                      origin, tmin, dir, tmax);
+                          origin, tmin, dir, tmax, true);
    else
       hk_build_ray_traversal(b, &args);
    nir_pop_if(b, NULL);
@@ -1546,7 +1662,8 @@ hk_rt_load_wto(nir_builder *b, const struct hk_rt_compiler *compiler,
    nir_def *cols[4];
    for (unsigned c = 0; c < 4; ++c)
       cols[c] = nir_load_global(b, 3, 32,
-         nir_iadd_imm(b, instance, 16 + c*12), .align_mul = 4);
+         nir_iadd_imm(b, instance, 16 + c*12), .align_mul = 4,
+         .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
    for (unsigned r = 0; r < 3; ++r)
       rows[r] = nir_vec4(b, nir_channel(b, cols[0], r),
          nir_channel(b, cols[1], r), nir_channel(b, cols[2], r),
@@ -1826,7 +1943,7 @@ hk_hit_object_trace(nir_builder *b, struct hk_rt_compiler *compiler,
    nir_push_if(b, nir_ine_imm(b, accel_struct, 0));
    if (compiler->native_agx)
       hk_trace_ray_native(b, compiler, accel_struct, flags, cull_mask,
-                          origin, tmin, dir, tmax);
+                          origin, tmin, dir, tmax, false);
    else
       hk_build_ray_traversal(b, &args);
    nir_pop_if(b, NULL);
@@ -1900,8 +2017,18 @@ hk_hit_object_execute(nir_builder *b, struct hk_rt_compiler *compiler,
       nir_store_var(b, state->tmin, hk_hobj_load(b, hobj, HK_HOBJ_TMIN), 0x1);
       nir_store_var(b, state->dir, hk_hobj_load(b, hobj, HK_HOBJ_DIR), 0x7);
       nir_store_var(b, state->tmax, hk_hobj_load(b, hobj, HK_HOBJ_TMAX), 0x1);
-      nir_store_var(b, state->instance_addr,
-                    hk_hobj_load(b, hobj, HK_HOBJ_INSTANCE_ADDR), 0x1);
+      nir_def *instance_addr = hk_hobj_load(b, hobj, HK_HOBJ_INSTANCE_ADDR);
+      nir_store_var(b, state->instance_addr, instance_addr, 0x1);
+      if (state->instance_id) {
+         nir_push_if(b, nir_ieq_imm(b, kind, HK_HOBJ_HIT));
+         nir_def *ids = nir_load_global(b, 2, 32,
+            nir_iadd_imm(b, instance_addr, 96), .align_mul = 4,
+            .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+         nir_store_var(b, state->instance_id, nir_channel(b, ids, 1), 0x1);
+         nir_store_var(b, state->instance_custom_index,
+                       nir_iand_imm(b, nir_channel(b, ids, 0), 0xFFFFFF), 0x1);
+         nir_pop_if(b, NULL);
+      }
       nir_store_var(b, state->primitive_id,
                     hk_hobj_load(b, hobj, HK_HOBJ_PRIMITIVE_ID), 0x1);
       nir_store_var(b, state->geometry_id_and_flags,
@@ -2046,13 +2173,15 @@ hk_hit_object_load(nir_builder *b, struct hk_rt_compiler *compiler,
    case nir_hit_object_value_instance_id: {
       nir_def *instance = hk_hobj_load(b, hobj, HK_HOBJ_INSTANCE_ADDR);
       return nir_load_global(b, 1, 32, nir_iadd_imm(b, instance,
-         compiler->native_agx ? 100 : offsetof(struct hk_bvh_instance_node, instance_id)));
+         compiler->native_agx ? 100 : offsetof(struct hk_bvh_instance_node, instance_id)),
+         .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
    }
    case nir_hit_object_value_instance_custom_index: {
       nir_def *instance = hk_hobj_load(b, hobj, HK_HOBJ_INSTANCE_ADDR);
       nir_def *custom = nir_load_global(b, 1, 32, nir_iadd_imm(b, instance,
          compiler->native_agx ? 96 :
-            offsetof(struct hk_bvh_instance_node, custom_instance_and_mask)));
+            offsetof(struct hk_bvh_instance_node, custom_instance_and_mask)),
+         .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
       return nir_iand_imm(b, custom, 0xFFFFFF);
    }
    case nir_hit_object_value_hit_kind:
@@ -2080,10 +2209,11 @@ hk_hit_object_load(nir_builder *b, struct hk_rt_compiler *compiler,
       nir_def *instance = hk_hobj_load(b, hobj, HK_HOBJ_INSTANCE_ADDR);
       if (compiler->native_agx) {
          nir_def *relative = nir_load_global(b, 1, 64,
-            nir_iadd_imm(b, instance, 104), .align_mul = 8);
+            nir_iadd_imm(b, instance, 104), .align_mul = 8,
+            .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
          return nir_load_global(b, 3, 32,
             nir_iadd_imm(b, nir_iadd(b, instance, relative), column * 12),
-            .align_mul = 4);
+            .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
       }
       nir_def *rows[3];
       for (unsigned r = 0; r < 3; ++r)
@@ -2811,9 +2941,27 @@ hk_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
       break;
 
    /* Ray tracing system values */
-   case nir_intrinsic_load_ray_launch_id:
-      def = nir_load_global_invocation_id(b, 32);
+   case nir_intrinsic_load_ray_launch_id: {
+      nir_def *launch_size_y = nir_channel(
+         b, hk_load_trace_ray_command_field(b, HK_RT_CMD_WIDTH, 3, 32), 1);
+      nir_def *wg = nir_load_workgroup_id(b);
+      nir_def *lid = nir_load_local_invocation_index(b);
+      nir_def *tile_2d = nir_ugt_imm(b, launch_size_y, 1);
+      nir_def *x_2d = nir_iadd(b, nir_ishl_imm(b, nir_channel(b, wg, 0),
+                                               HK_RT_TILE_2D_X_LOG2),
+                               nir_iand_imm(b, lid, HK_RT_TILE_2D_X - 1));
+      nir_def *y_2d = nir_iadd(b, nir_ishl_imm(b, nir_channel(b, wg, 1),
+                                               HK_RT_TILE_2D_Y_LOG2),
+                               nir_ushr_imm(b, lid, HK_RT_TILE_2D_X_LOG2));
+      nir_def *x_1d = nir_iadd(b, nir_ishl_imm(b, nir_channel(b, wg, 0),
+                                               HK_RT_WORKGROUP_SIZE_X_LOG2),
+                               lid);
+      nir_def *y_1d = nir_channel(b, wg, 1);
+      def = nir_vec3(b, nir_bcsel(b, tile_2d, x_2d, x_1d),
+                     nir_bcsel(b, tile_2d, y_2d, y_1d),
+                     nir_channel(b, wg, 2));
       break;
+   }
    case nir_intrinsic_load_ray_launch_size:
       def = hk_load_trace_ray_command_field(b, HK_RT_CMD_WIDTH, 3, 32);
       break;
@@ -2833,13 +2981,18 @@ hk_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
       def = nir_load_var(b, state->dir);
       break;
    case nir_intrinsic_load_ray_instance_custom_index: {
+      if (state->instance_custom_index) {
+         def = nir_load_var(b, state->instance_custom_index);
+         break;
+      }
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
       nir_def *custom_instance_and_mask = nir_load_global(
          b, 1, 32,
          nir_iadd_imm(b, instance_node_addr,
                       compiler->native_agx ? 96 :
                          offsetof(struct hk_bvh_instance_node,
-                                  custom_instance_and_mask)));
+                                  custom_instance_and_mask)),
+         .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
       def = nir_iand_imm(b, custom_instance_and_mask, 0xFFFFFF);
       break;
    }
@@ -2851,12 +3004,17 @@ hk_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
                          0xFFFFFFF);
       break;
    case nir_intrinsic_load_instance_id: {
+      if (state->instance_id) {
+         def = nir_load_var(b, state->instance_id);
+         break;
+      }
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
       def = nir_load_global(
          b, 1, 32,
          nir_iadd_imm(b, instance_node_addr,
                       compiler->native_agx ? 100 :
-                         offsetof(struct hk_bvh_instance_node, instance_id)));
+                         offsetof(struct hk_bvh_instance_node, instance_id)),
+         .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
       break;
    }
    case nir_intrinsic_load_ray_flags:
@@ -2883,10 +3041,11 @@ hk_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
       if (compiler->native_agx) {
          nir_def *relative = nir_load_global(b, 1, 64,
-            nir_iadd_imm(b, instance_node_addr, 104), .align_mul = 8);
+            nir_iadd_imm(b, instance_node_addr, 104), .align_mul = 8,
+            .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
          def = nir_load_global(b, 3, 32,
             nir_iadd_imm(b, nir_iadd(b, instance_node_addr, relative), c*12),
-            .align_mul = 4);
+            .align_mul = 4, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
          break;
       }
       nir_def *rows[3];
