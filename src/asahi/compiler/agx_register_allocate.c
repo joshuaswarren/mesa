@@ -392,20 +392,97 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
    return max_demand;
 }
 
+bool
+agx_ra_find_regs_simple(const BITSET_WORD *used, unsigned count,
+                        unsigned align, unsigned minimum, unsigned limit,
+                        unsigned *out)
+{
+   const unsigned start = ALIGN_POT(minimum, align);
+   if (start + count > limit)
+      return false;
+
+   bool found = false;
+   unsigned result = 0;
+
+   if (BITSET_WORDBITS == 32 && count == align &&
+       (align == 1 || align == 2 || align == 4 || align == 8 || align == 16)) {
+      const unsigned last_reg = limit - count;
+      const unsigned first_word = start >> 5;
+      const unsigned last_word = last_reg >> 5;
+
+      for (unsigned wi = first_word; wi <= last_word; ++wi) {
+         const uint32_t w = used[wi];
+         if (w == ~0u)
+            continue;
+
+         uint32_t free_slots;
+         if (align == 1) {
+            free_slots = ~w;
+         } else if (align == 2) {
+            free_slots = (~(w | (w >> 1))) & 0x55555555u;
+         } else if (align == 4) {
+            uint32_t b = w | (w >> 1);
+            free_slots = (~(b | (b >> 2))) & 0x11111111u;
+         } else if (align == 8) {
+            uint32_t b = w | (w >> 1);
+            b |= b >> 2;
+            free_slots = (~(b | (b >> 4))) & 0x01010101u;
+         } else {
+            free_slots = ((w & 0xffffu) ? 0u : 1u) |
+                         ((w >> 16) ? 0u : (1u << 16));
+         }
+
+         if (wi == first_word && (start & 31))
+            free_slots &= ~0u << (start & 31);
+         if (wi == last_word && (last_reg & 31) != 31)
+            free_slots &= (2u << (last_reg & 31)) - 1u;
+
+         if (free_slots) {
+            result = (wi << 5) + (unsigned)(ffs(free_slots) - 1);
+            found = true;
+            break;
+         }
+      }
+   } else {
+      for (unsigned reg = start; reg + count <= limit;) {
+         if (BITSET_WORDBITS == 32 && used[reg >> 5] == ~0u) {
+            reg = ALIGN_POT((reg | 31u) + 1u, align);
+            continue;
+         }
+         if (!BITSET_TEST_COUNT(used, reg, count)) {
+            result = reg;
+            found = true;
+            break;
+         }
+         reg += align;
+      }
+   }
+
+#ifndef NDEBUG
+   bool ref_found = false;
+   unsigned ref_reg = 0;
+   for (unsigned reg = start; reg + count <= limit; reg += align) {
+      if (!BITSET_TEST_COUNT(used, reg, count)) {
+         ref_reg = reg;
+         ref_found = true;
+         break;
+      }
+   }
+   assert(found == ref_found && (!found || result == ref_reg));
+#endif
+
+   if (found)
+      *out = result;
+   return found;
+}
+
 static bool
 find_regs_simple(struct ra_ctx *rctx, enum ra_class cls, unsigned count,
                  unsigned align, unsigned minimum, unsigned limit,
                  unsigned *out)
 {
-   for (unsigned reg = ALIGN_POT(minimum, align); reg + count <= limit;
-        reg += align) {
-      if (!BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count)) {
-         *out = reg;
-         return true;
-      }
-   }
-
-   return false;
+   return agx_ra_find_regs_simple(rctx->used_regs[cls], count, align, minimum,
+                                  limit, out);
 }
 
 static unsigned

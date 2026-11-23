@@ -4779,6 +4779,47 @@ hk_vs_covers_clip_square(const nir_shader *vs)
    return true;
 }
 
+struct hk_agx3_tex_image_ops {
+   bool has_tex;
+   bool has_bindless_image_read;
+   bool has_bindless_image_store;
+   bool has_bindless_image_atomic;
+};
+
+static struct hk_agx3_tex_image_ops
+hk_agx3_scan_tex_image_ops(const nir_shader *nir)
+{
+   struct hk_agx3_tex_image_ops ops = {0};
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               ops.has_tex = true;
+            } else if (instr->type == nir_instr_type_intrinsic) {
+               switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+               case nir_intrinsic_bindless_image_load:
+               case nir_intrinsic_bindless_image_sparse_load:
+                  ops.has_bindless_image_read = true;
+                  break;
+               case nir_intrinsic_bindless_image_store:
+                  ops.has_bindless_image_store = true;
+                  break;
+               case nir_intrinsic_bindless_image_atomic:
+               case nir_intrinsic_bindless_image_atomic_swap:
+                  ops.has_bindless_image_atomic = true;
+                  break;
+               default:
+                  break;
+               }
+            }
+         }
+      }
+   }
+
+   return ops;
+}
+
 /* G18G compute: keep a lowered clone of the shader if its pass succeeded,
  * otherwise drop the clone and keep the shader as it was. */
 static bool
@@ -4951,22 +4992,30 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * image_load of a read-write image, which that lowering cannot encode
        * on G18G. Then several images in one set, then textures and images
        * through per-dispatch tables, then the indexed samplers. */
+      const struct hk_agx3_tex_image_ops ops = hk_agx3_scan_tex_image_ops(nir);
+      const bool has_bindless_image = ops.has_bindless_image_read ||
+                                      ops.has_bindless_image_store ||
+                                      ops.has_bindless_image_atomic;
       struct agx_g17p_storage_image_binding storage;
       struct agx_g18g_table_binding tables;
-      nir_shader *c = nir_shader_clone(NULL, nir);
-      bool storage_ok = hk_g18g_keep_lowered(
-         &nir, c, c && agx_nir_lower_g18g_storage_image(c, &storage));
-      if (!storage_ok) {
-         c = nir_shader_clone(NULL, nir);
+      bool storage_ok = false;
+
+      if (!ops.has_tex && has_bindless_image) {
+         nir_shader *c = nir_shader_clone(NULL, nir);
          storage_ok = hk_g18g_keep_lowered(
-            &nir, c, c && agx_nir_lower_g18g_storage_images(c, &storage));
+            &nir, c, c && agx_nir_lower_g18g_storage_image(c, &storage));
+         if (!storage_ok) {
+            c = nir_shader_clone(NULL, nir);
+            storage_ok = hk_g18g_keep_lowered(
+               &nir, c, c && agx_nir_lower_g18g_storage_images(c, &storage));
+         }
       }
 
       if (storage_ok) {
          shader->info.agx3_storage_image_valid = true;
          shader->info.agx3_storage_image = storage;
-      } else {
-         c = nir_shader_clone(NULL, nir);
+      } else if (ops.has_tex || has_bindless_image) {
+         nir_shader *c = nir_shader_clone(NULL, nir);
          if (hk_g18g_keep_lowered(
                 &nir, c, c && agx_nir_lower_g18g_combined_tables(c, &tables))) {
             shader->info.agx3_storage_image_valid = true;
@@ -4974,7 +5023,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                (struct agx_g17p_storage_image_binding){0};
             shader->info.agx3_g18_tables_valid = true;
             shader->info.agx3_g18_tables = tables;
-         } else {
+         } else if (ops.has_tex || ops.has_bindless_image_read) {
             c = nir_shader_clone(NULL, nir);
             shader->info.agx3_indexed_sampler_valid = hk_g18g_keep_lowered(
                &nir, c, c && agx_nir_lower_g17p_indexed_samplers(c, g17p));
@@ -4986,94 +5035,119 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       /* Descriptor buffers keep only the heap-indexed paths, which never
        * decode set contents while recording. */
       const bool record_time_sets = !(features & HK_FEAT_DESCRIPTOR_BUFFER);
-      nir_shader *candidate = nir_shader_clone(NULL, nir);
-      struct agx_g17p_sampled_storage_binding sampled_storage;
-      if (candidate && record_time_sets &&
-          !dev->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind &&
-          agx_nir_lower_g17p_sampled_storage(candidate, &sampled_storage)) {
-         ralloc_free(nir);
-         nir = candidate;
-         shader->info.agx3_sampled_storage_valid = true;
-         shader->info.agx3_sampled_storage = sampled_storage;
-      } else {
-         ralloc_free(candidate);
-         candidate = nir_shader_clone(NULL, nir);
+      const bool sampled_uab =
+         dev->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind;
+      const struct hk_agx3_tex_image_ops ops = hk_agx3_scan_tex_image_ops(nir);
+      const bool has_bindless_image = ops.has_bindless_image_read ||
+                                      ops.has_bindless_image_store ||
+                                      ops.has_bindless_image_atomic;
+      bool lowered = false;
+
+      if (record_time_sets && !sampled_uab && ops.has_tex &&
+          ops.has_bindless_image_store) {
+         nir_shader *candidate = nir_shader_clone(NULL, nir);
+         struct agx_g17p_sampled_storage_binding sampled_storage;
+         if (candidate &&
+             agx_nir_lower_g17p_sampled_storage(candidate, &sampled_storage)) {
+            ralloc_free(nir);
+            nir = candidate;
+            shader->info.agx3_sampled_storage_valid = true;
+            shader->info.agx3_sampled_storage = sampled_storage;
+            lowered = true;
+         } else {
+            ralloc_free(candidate);
+         }
+      }
+
+      if (!lowered && record_time_sets && !ops.has_tex && has_bindless_image) {
+         nir_shader *candidate = nir_shader_clone(NULL, nir);
          struct agx_g17p_storage_image_binding storage;
-         if (candidate && record_time_sets &&
+         if (candidate &&
              agx_nir_lower_g17p_storage_image(candidate, &storage)) {
             ralloc_free(nir);
             nir = candidate;
             shader->info.agx3_storage_image_valid = true;
             shader->info.agx3_storage_image = storage;
+            lowered = true;
          } else {
             ralloc_free(candidate);
-            candidate = nir_shader_clone(NULL, nir);
-            struct agx_g17p_combined_sampler_binding sampled_binding;
-            if (candidate && record_time_sets &&
-                !dev->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind &&
-                agx_nir_lower_g17p_combined_sampler(candidate,
-                                                    &sampled_binding, g17p)) {
-               ralloc_free(nir);
-               nir = candidate;
-               shader->info.agx3_combined_sampler_valid = true;
-               shader->info.agx3_combined_sampler = sampled_binding;
-               shader->info.agx3_txf_texture_valid = true;
-               shader->info.agx3_txf_texture.texture_offset_B =
-                  sampled_binding.texture_offset_B;
-            } else {
-               ralloc_free(candidate);
-               candidate = nir_shader_clone(NULL, nir);
-               if (candidate &&
-                   agx_nir_lower_g17p_indexed_samplers(candidate, g17p)) {
-                  /* Keep the storage image BINDLESS alongside indexed
-                   * samplers.
-                   *
-                   * agx_nir_lower_g17p_indexed_storage() rewrites the image
-                   * store to the immediate-slot form: image_write with a zero
-                   * base and a constant resource index, with the PBE
-                   * descriptor delivered through the launch's argument slots
-                   * by hk_agx3_g17p_indexed_storage_pointers()
-                   * (hk_cmd_dispatch.c).  Measured on G17P with the
-                   * image_2d_view_3d_image compute sampler cases: in that
-                   * combination the store lands nowhere at all -- the
-                   * destination reads back byte-identical to its pre-dispatch
-                   * clear -- at resource index 1 and at index 2 alike.  The
-                   * ordinary bindless image write, which the fragment stage
-                   * and every non-sampling compute shader already use on this
-                   * chip, stores correctly: 8 fail -> 0 fail, with 2823
-                   * neighbouring cases per-case identical.
-                   *
-                   * WHY the immediate-slot store fails here is NOT understood.
-                   * Only that it does, and that the bindless form does not.
-                   * The slot layout is a plausible suspect -- slots 0/1 carry
-                   * the texture and sampler heap bases that the shader
-                   * dereferences itself -- but that is a hypothesis, not a
-                   * measurement, and the driver does build a combined pointer
-                   * set for exactly this case rather than ignoring it.
-                   */
-                  ralloc_free(nir);
-                  nir = candidate;
-                  shader->info.agx3_indexed_sampler_valid = true;
-                  shader->info.agx3_indexed_storage_valid = false;
-               } else {
-                  ralloc_free(candidate);
-                  candidate = nir_shader_clone(NULL, nir);
-                  struct agx_g17p_txf_binding binding;
-                  if (candidate && record_time_sets &&
-                      agx_nir_lower_g17p_txf(candidate, &binding) &&
-                      (!(binding.texture_offset_B &
-                         (HK_G17P_TEXTURE_STATE_ALIGN - 1)) ||
-                       !dev->vk.enabled_features
-                           .descriptorBindingSampledImageUpdateAfterBind)) {
-                     ralloc_free(nir);
-                     nir = candidate;
-                     shader->info.agx3_txf_texture_valid = true;
-                     shader->info.agx3_txf_texture = binding;
-                  } else {
-                     ralloc_free(candidate);
-                  }
-               }
-            }
+         }
+      }
+
+      if (!lowered && record_time_sets && !sampled_uab && ops.has_tex &&
+          agx_nir_g17p_combined_sampler_candidate(nir, g17p)) {
+         nir_shader *candidate = nir_shader_clone(NULL, nir);
+         struct agx_g17p_combined_sampler_binding sampled_binding;
+         if (candidate &&
+             agx_nir_lower_g17p_combined_sampler(candidate,
+                                                 &sampled_binding, g17p)) {
+            ralloc_free(nir);
+            nir = candidate;
+            shader->info.agx3_combined_sampler_valid = true;
+            shader->info.agx3_combined_sampler = sampled_binding;
+            shader->info.agx3_txf_texture_valid = true;
+            shader->info.agx3_txf_texture.texture_offset_B =
+               sampled_binding.texture_offset_B;
+            lowered = true;
+         } else {
+            ralloc_free(candidate);
+         }
+      }
+
+      if (!lowered && (ops.has_tex || ops.has_bindless_image_read)) {
+         nir_shader *candidate = nir_shader_clone(NULL, nir);
+         if (candidate &&
+             agx_nir_lower_g17p_indexed_samplers(candidate, g17p)) {
+            /* Keep the storage image BINDLESS alongside indexed
+             * samplers.
+             *
+             * agx_nir_lower_g17p_indexed_storage() rewrites the image
+             * store to the immediate-slot form: image_write with a zero
+             * base and a constant resource index, with the PBE
+             * descriptor delivered through the launch's argument slots
+             * by hk_agx3_g17p_indexed_storage_pointers()
+             * (hk_cmd_dispatch.c).  Measured on G17P with the
+             * image_2d_view_3d_image compute sampler cases: in that
+             * combination the store lands nowhere at all -- the
+             * destination reads back byte-identical to its pre-dispatch
+             * clear -- at resource index 1 and at index 2 alike.  The
+             * ordinary bindless image write, which the fragment stage
+             * and every non-sampling compute shader already use on this
+             * chip, stores correctly: 8 fail -> 0 fail, with 2823
+             * neighbouring cases per-case identical.
+             *
+             * WHY the immediate-slot store fails here is NOT understood.
+             * Only that it does, and that the bindless form does not.
+             * The slot layout is a plausible suspect -- slots 0/1 carry
+             * the texture and sampler heap bases that the shader
+             * dereferences itself -- but that is a hypothesis, not a
+             * measurement, and the driver does build a combined pointer
+             * set for exactly this case rather than ignoring it.
+             */
+            ralloc_free(nir);
+            nir = candidate;
+            shader->info.agx3_indexed_sampler_valid = true;
+            shader->info.agx3_indexed_storage_valid = false;
+            lowered = true;
+         } else {
+            ralloc_free(candidate);
+         }
+      }
+
+      if (!lowered && record_time_sets && ops.has_tex) {
+         nir_shader *candidate = nir_shader_clone(NULL, nir);
+         struct agx_g17p_txf_binding binding;
+         if (candidate &&
+             agx_nir_lower_g17p_txf(candidate, &binding) &&
+             (!(binding.texture_offset_B &
+                (HK_G17P_TEXTURE_STATE_ALIGN - 1)) ||
+              !sampled_uab)) {
+            ralloc_free(nir);
+            nir = candidate;
+            shader->info.agx3_txf_texture_valid = true;
+            shader->info.agx3_txf_texture = binding;
+         } else {
+            ralloc_free(candidate);
          }
       }
    }

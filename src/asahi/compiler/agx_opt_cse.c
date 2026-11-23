@@ -8,41 +8,64 @@
 #include "util/compiler.h"
 #include "agx_builder.h"
 
-#define XXH_INLINE_ALL
-#include "util/xxhash.h"
-
 /*
  * This pass handles CSE'ing repeated expressions created in the process of
  * translating from NIR. Also, currently this is intra-block only, to make it
  * work over multiple block we'd need to bring forward dominance calculation.
  */
 
-static inline uint32_t
-HASH(uint32_t hash, unsigned data)
+static inline uint64_t
+hash_mix64(uint64_t h, uint64_t x)
 {
-   return XXH32(&data, sizeof(data), hash);
+   h ^= x * 0x9e3779b97f4a7c15ull;
+   return (h ^ (h >> 27)) * 0xbf58476d1ce4e5b9ull;
 }
 
-/* Hash an instruction. XXH32 isn't too speedy, so this is hotspot. */
+static inline uint32_t
+hash_finalize(uint64_t h)
+{
+   h ^= h >> 31;
+   h *= 0x94d049bb133111ebull;
+   return (uint32_t)(h ^ (h >> 32));
+}
+
+/* Hash an instruction using inline 64-bit multiply-mix. */
 static uint32_t
 hash_instr(const void *data)
 {
    const agx_instr *I = data;
-   uint32_t hash = 0;
+   uint64_t h = ((uint64_t)I->nr_dests << 8) | I->nr_srcs;
 
    /* Explicitly skip destinations, except for size and type */
    agx_foreach_dest(I, d) {
-      hash = HASH(hash, ((uint32_t)I->dest[d].type) |
-                           (((uint32_t)I->dest[d].size) << 16));
+      h = hash_mix64(h, ((uint64_t)I->dest[d].type) |
+                        (((uint64_t)I->dest[d].size) << 16));
    }
 
    /* Hash the source array as-is */
-   hash = XXH32(I->src, sizeof(agx_index) * I->nr_srcs, hash);
+   STATIC_ASSERT(sizeof(agx_index) == 8);
+   for (unsigned s = 0; s < I->nr_srcs; ++s) {
+      uint64_t w;
+      memcpy(&w, &I->src[s], sizeof(w));
+      h = hash_mix64(h, w);
+   }
 
    /* Hash everything else in the instruction starting from the opcode */
-   hash = XXH32(&I->op, sizeof(agx_instr) - offsetof(agx_instr, op), hash);
+   const uint8_t *p = (const uint8_t *)&I->op;
+   const size_t tail_bytes = sizeof(agx_instr) - offsetof(agx_instr, op);
+   size_t off = 0;
+   for (; off + 8 <= tail_bytes; off += 8) {
+      uint64_t w;
+      memcpy(&w, p + off, 8);
+      h = hash_mix64(h, w);
+   }
+   if (off < tail_bytes) {
+      uint64_t w = 0;
+      memcpy(&w, p + off, tail_bytes - off);
+      h = hash_mix64(h, w);
+   }
 
-   return hash;
+   return hash_finalize(h);
 }
 
 static bool
@@ -146,12 +169,10 @@ enum cse_mode {
  * CSE walk. Returns the block's peak.
  */
 static unsigned
-cse_block_pressure(agx_context *ctx, agx_block *block, const uint8_t *sizes,
-                   BITSET_WORD *live, unsigned *pressure)
+cse_block_pressure(agx_context *ctx, agx_block *block, unsigned position,
+                   const uint8_t *sizes, BITSET_WORD *live, unsigned *pressure)
 {
-   unsigned position = 0, peak = 0, count = 0;
-   agx_foreach_instr_in_block(block, I)
-      position++;
+   unsigned peak = 0, count = 0;
 
    memset(live, 0, BITSET_BYTES(ctx->alloc));
    U_SPARSE_BITSET_FOREACH_SET(&block->live_out, v) {
@@ -199,6 +220,8 @@ agx_opt_cse_impl(agx_context *ctx, enum cse_mode mode)
    unsigned replacement_start = ctx->alloc;
    unsigned replacement_end = 0;
    unsigned *last = NULL;
+   unsigned last_start = ctx->alloc;
+   unsigned last_end = 0;
    if (require_overlap) {
       last = calloc(ctx->alloc, sizeof(*last));
       agx_compute_liveness(ctx);
@@ -209,13 +232,17 @@ agx_opt_cse_impl(agx_context *ctx, enum cse_mode mode)
    }
 
    uint8_t *sizes = NULL;
-   unsigned *pressure = NULL;
+   unsigned *all_pressure = NULL;
+   unsigned *block_offsets = NULL;
+   BITSET_DECLARE(stack_live, 4096);
    BITSET_WORD *live = NULL;
    unsigned peak = 0;
    if (mode == CSE_BOUNDED) {
-      unsigned longest = 0;
       sizes = calloc(ctx->alloc, sizeof(*sizes));
-      live = BITSET_CALLOC(ctx->alloc);
+      live = ctx->alloc <= 4096 ? stack_live : BITSET_CALLOC(ctx->alloc);
+      block_offsets = malloc((ctx->num_blocks + 1) * sizeof(*block_offsets));
+      unsigned total = 0;
+      unsigned b = 0;
       agx_foreach_block(ctx, block) {
          unsigned n = 0;
          agx_foreach_instr_in_block(block, I) {
@@ -225,14 +252,24 @@ agx_opt_cse_impl(agx_context *ctx, enum cse_mode mode)
                   util_next_power_of_two(agx_index_size_16(I->dest[d]));
             }
          }
-         longest = MAX2(longest, n);
+         block_offsets[b++] = total;
+         total += n + 1;
       }
+      block_offsets[b] = total;
 
-      pressure = calloc(longest + 1, sizeof(*pressure));
-      agx_foreach_block(ctx, block)
-         peak = MAX2(peak, cse_block_pressure(ctx, block, sizes, live, pressure));
+      all_pressure = malloc(MAX2(total, 1u) * sizeof(*all_pressure));
+      b = 0;
+      agx_foreach_block(ctx, block) {
+         const unsigned off = block_offsets[b];
+         const unsigned len = block_offsets[b + 1] - off - 1;
+         all_pressure[off] = 0;
+         peak = MAX2(peak, cse_block_pressure(ctx, block, len, sizes, live,
+                                              all_pressure + off));
+         b++;
+      }
    }
 
+   unsigned block_idx = 0;
    agx_foreach_block(ctx, block) {
       if (replacement_start < replacement_end) {
          memset(replacement + replacement_start, 0,
@@ -241,21 +278,36 @@ agx_opt_cse_impl(agx_context *ctx, enum cse_mode mode)
       replacement_start = ctx->alloc;
       replacement_end = 0;
       _mesa_set_clear(instr_set, NULL);
-      if (mode == CSE_BOUNDED)
-         cse_block_pressure(ctx, block, sizes, live, pressure);
+      unsigned *pressure =
+         mode == CSE_BOUNDED ? all_pressure + block_offsets[block_idx] : NULL;
+      block_idx++;
 
+      bool has_live_out = false;
       if (require_overlap) {
-         memset(last, 0, ctx->alloc * sizeof(*last));
+         if (last_start < last_end) {
+            memset(last + last_start, 0,
+                   sizeof(*last) * (last_end - last_start));
+         }
+         last_start = ctx->alloc;
+         last_end = 0;
          unsigned position = 0;
          agx_foreach_instr_in_block(block, I) {
             ++position;
             if (I->op != AGX_OPCODE_PHI) {
-               agx_foreach_ssa_src(I, s)
-                  last[I->src[s].value] = position;
+               agx_foreach_ssa_src(I, s) {
+                  const unsigned v = I->src[s].value;
+                  last[v] = position;
+                  last_start = MIN2(last_start, v);
+                  last_end = MAX2(last_end, v + 1);
+               }
             }
          }
-         U_SPARSE_BITSET_FOREACH_SET(&block->live_out, v)
+         U_SPARSE_BITSET_FOREACH_SET(&block->live_out, v) {
+            has_live_out = true;
             last[v] = position;
+            last_start = MIN2(last_start, v);
+            last_end = MAX2(last_end, v + 1);
+         }
       }
 
       unsigned position = 0;
@@ -279,7 +331,8 @@ agx_opt_cse_impl(agx_context *ctx, enum cse_mode mode)
                agx_foreach_ssa_dest(instr, d) {
                   const unsigned a = match->dest[d].value;
                   const unsigned b = instr->dest[d].value;
-                  safe &= !u_sparse_bitset_test(&block->live_out, b);
+                  if (has_live_out)
+                     safe &= !u_sparse_bitset_test(&block->live_out, b);
 
                   /* Without overlap, the earlier result becomes live from its
                    * last use up to here as well. */
@@ -302,7 +355,11 @@ agx_opt_cse_impl(agx_context *ctx, enum cse_mode mode)
                      for (unsigned p = last[a] + 1; p < position; ++p)
                         pressure[p] += sizes[a];
                   }
-                  last[a] = MAX2(last[a], last[b]);
+                  if (last[b] > last[a]) {
+                     last[a] = last[b];
+                     last_start = MIN2(last_start, a);
+                     last_end = MAX2(last_end, a + 1);
+                  }
                }
             }
             agx_foreach_dest(instr, d) {
@@ -317,8 +374,10 @@ agx_opt_cse_impl(agx_context *ctx, enum cse_mode mode)
 
    free(last);
    free(sizes);
-   free(pressure);
-   free(live);
+   free(all_pressure);
+   free(block_offsets);
+   if (live && live != stack_live)
+      free(live);
    free(replacement);
    _mesa_set_destroy(instr_set, NULL);
 }

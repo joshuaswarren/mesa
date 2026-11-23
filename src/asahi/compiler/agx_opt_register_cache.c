@@ -134,6 +134,21 @@ postra_liveness_ins(BITSET_WORD *live, agx_instr *I)
 static void
 postra_liveness(agx_context *ctx)
 {
+   if (ctx->num_blocks == 1) {
+      agx_block *blk = agx_start_block(ctx);
+      if (!blk->successors[0] && !blk->successors[1]) {
+         BITSET_ZERO(blk->reg_live_out);
+         BITSET_DECLARE(live, AGX_NUM_REGS);
+         BITSET_ZERO(live);
+         agx_foreach_instr_in_block_rev(blk, ins) {
+            assert(!fused_break_target(ins));
+            postra_liveness_ins(live, ins);
+         }
+         memcpy(blk->reg_live_in, live, sizeof(live));
+         return;
+      }
+   }
+
    u_worklist worklist;
    agx_worklist_init(ctx, &worklist);
 
