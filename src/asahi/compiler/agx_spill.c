@@ -155,6 +155,8 @@ struct spill_block {
    struct next_uses next_use_out;
 };
 
+struct candidate;
+
 struct spill_ctx {
    void *memctx;
    agx_context *shader;
@@ -168,6 +170,18 @@ struct spill_ctx {
 
    /* Local IPs of next-use */
    dist_t *next_uses;
+
+   /* Scratch array (size n, all DIST_INFINITY between calls) for
+    * calculate_local_next_use(). */
+   dist_t *local_nu;
+
+   /* Reusable scratch buffers for compute_w_entry() and insert_coupling_code(). */
+   unsigned *freq;
+   struct candidate *candidates;
+   BITSET_WORD *pred_W;
+   BITSET_WORD *pred_S;
+   BITSET_WORD *phi_any_dests;
+   BITSET_WORD *phi_raw_dests;
 
    /* Current local IP relative to the start of the block */
    uint32_t ip;
@@ -693,19 +707,36 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
    struct spill_block *sp = spill_block(ctx, pred);
    struct spill_block *ss = spill_block(ctx, succ);
 
+   BITSET_WORD *pred_W = ctx->pred_W;
+   BITSET_WORD *pred_S = ctx->pred_S;
+   BITSET_WORD *phi_any_dests = ctx->phi_any_dests;
+   BITSET_WORD *phi_raw_dests = ctx->phi_raw_dests;
+   BITSET_WORD *edge_regs = ctx->W;
+
+   for (unsigned i = 0; i < sp->nW_exit; ++i)
+      BITSET_SET(pred_W, sp->W_exit[i]);
+
+   for (unsigned i = 0; i < sp->nS_exit; ++i)
+      BITSET_SET(pred_S, sp->S_exit[i]);
+
    /* Values in registers on both sides of the edge, where a reload may read
     * them without extending their live ranges.
     */
-   BITSET_WORD *edge_regs = ctx->W;
-   memset(edge_regs, 0, BITSET_BYTES(ctx->n));
-   for (unsigned i = 0; i < sp->nW_exit; ++i) {
-      for (unsigned j = 0; j < ss->nW_entry; ++j) {
-         if (sp->W_exit[i] == ss->W_entry[j]) {
-            BITSET_SET(edge_regs, sp->W_exit[i]);
-            break;
-         }
-      }
+   for (unsigned j = 0; j < ss->nW_entry; ++j) {
+      unsigned v = ss->W_entry[j];
+      if (BITSET_TEST(pred_W, v))
+         BITSET_SET(edge_regs, v);
    }
+
+   agx_foreach_phi_in_block(succ, phi) {
+      unsigned chased = chase_mem_index(phi->dest[0], ctx->spill_base);
+      if (chased < ctx->n)
+         BITSET_SET(phi_any_dests, chased);
+      if (phi->dest[0].value < ctx->n)
+         BITSET_SET(phi_raw_dests, phi->dest[0].value);
+   }
+
+   unsigned s = agx_predecessor_index(succ, pred);
 
    agx_foreach_phi_in_block(succ, I) {
       if (!I->dest[0].memory)
@@ -713,8 +744,6 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
 
       agx_builder b =
          agx_init_builder(ctx->shader, agx_before_function(ctx->shader));
-
-      unsigned s = agx_predecessor_index(succ, pred);
 
       /* Copy immediate/uniform phi sources to memory variables at the start of
        * the program, where pressure is zero and hence the copy is legal.
@@ -740,13 +769,7 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
          continue;
       }
 
-      bool spilled = false;
-      for (unsigned i = 0; i < sp->nS_exit; ++i) {
-         if (sp->S_exit[i] == I->src[s].value) {
-            spilled = true;
-            break;
-         }
-      }
+      bool spilled = BITSET_TEST(pred_S, I->src[s].value);
 
       if (!spilled) {
          /* Spill the phi source. TODO: avoid redundant spills here */
@@ -776,23 +799,8 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
    for (unsigned i = 0; i < ss->nS_entry; ++i) {
       unsigned v = ss->S_entry[i];
 
-      bool spilled = false;
-      for (unsigned j = 0; j < sp->nS_exit; ++j) {
-         if (sp->S_exit[j] == v) {
-            spilled = true;
-            break;
-         }
-      }
-
       /* We handle spilling phi destinations separately */
-      agx_foreach_phi_in_block(succ, phi) {
-         if (chase_mem_index(phi->dest[0], ctx->spill_base) == v) {
-            spilled = true;
-            break;
-         }
-      }
-
-      if (spilled)
+      if (BITSET_TEST(pred_S, v) || BITSET_TEST(phi_any_dests, v))
          continue;
 
       agx_builder b = agx_init_builder(ctx->shader, agx_along_edge(pred, succ));
@@ -802,25 +810,10 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
    /* Variables in W at the start of succ must be defined along the edge. */
    for (unsigned i = 0; i < ss->nW_entry; ++i) {
       unsigned node = ss->W_entry[i];
-      bool defined = false;
 
-      /* Variables live at the end of the predecessor are live along the edge */
-      for (unsigned j = 0; j < sp->nW_exit; ++j) {
-         if (sp->W_exit[j] == node) {
-            defined = true;
-            break;
-         }
-      }
-
-      /* Phis are defined along the edge */
-      agx_foreach_phi_in_block(succ, phi) {
-         if (phi->dest[0].value == node) {
-            defined = true;
-            break;
-         }
-      }
-
-      if (defined)
+      /* Variables live at the end of the predecessor and phis are defined along
+       * the edge. */
+      if (BITSET_TEST(pred_W, node) || BITSET_TEST(phi_raw_dests, node))
          continue;
 
       /* Otherwise, inserting a reload defines the variable along the edge */
@@ -832,8 +825,6 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
    agx_foreach_phi_in_block(succ, I) {
       if (I->dest[0].memory)
          continue;
-
-      unsigned s = agx_predecessor_index(succ, pred);
 
       /* Treat immediate/uniform phi sources as registers for pressure
        * accounting and phi lowering purposes. Parallel copy lowering can handle
@@ -847,16 +838,8 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
          continue;
       }
 
-      bool live = false;
-      for (unsigned i = 0; i < sp->nW_exit; ++i) {
-         if (sp->W_exit[i] == I->src[s].value) {
-            live = true;
-            break;
-         }
-      }
-
       /* Fill the phi source in the predecessor */
-      if (!live) {
+      if (!BITSET_TEST(pred_W, I->src[s].value)) {
          agx_block *reload_block = agx_edge_to_block(pred, succ);
          insert_reload(ctx, reload_block, agx_along_edge(pred, succ),
                        I->src[s].value,
@@ -865,6 +848,24 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
 
       /* Leave as-is for the GPR version */
       assert(!I->src[s].memory);
+   }
+
+   /* Restore scratch bitsets sparsely for the next edge. */
+   for (unsigned i = 0; i < sp->nW_exit; ++i)
+      BITSET_CLEAR(pred_W, sp->W_exit[i]);
+
+   for (unsigned i = 0; i < sp->nS_exit; ++i)
+      BITSET_CLEAR(pred_S, sp->S_exit[i]);
+
+   for (unsigned j = 0; j < ss->nW_entry; ++j)
+      BITSET_CLEAR(edge_regs, ss->W_entry[j]);
+
+   agx_foreach_phi_in_block(succ, phi) {
+      unsigned chased = chase_mem_index(phi->dest[0], ctx->spill_base);
+      if (chased < ctx->n)
+         BITSET_CLEAR(phi_any_dests, chased);
+      if (phi->dest[0].value < ctx->n)
+         BITSET_CLEAR(phi_raw_dests, phi->dest[0].value);
    }
 }
 
@@ -879,14 +880,13 @@ calculate_local_next_use(struct spill_ctx *ctx, struct util_dynarray *out)
 {
    struct spill_block *sb = spill_block(ctx, ctx->block);
    unsigned ip = sb->cycles;
+   dist_t *nu = ctx->local_nu;
 
    *out = UTIL_DYNARRAY_INIT;
 
-   struct next_uses nu;
-   init_next_uses(&nu, NULL);
-
    foreach_next_use(&sb->next_use_out, i, dist) {
-      set_next_use(&nu, i, dist_sum(ip, dist));
+      assert(i < ctx->n);
+      nu[i] = dist_sum(ip, dist);
    }
 
    agx_foreach_instr_in_block_rev(ctx->block, I) {
@@ -895,21 +895,34 @@ calculate_local_next_use(struct spill_ctx *ctx, struct util_dynarray *out)
       if (I->op != AGX_OPCODE_PHI) {
          agx_foreach_ssa_src(I, s) {
             unsigned v = I->src[s].value;
+            assert(v < ctx->n);
 
-            util_dynarray_append(out, search_next_uses(&nu, v));
-            set_next_use(&nu, v, ip);
+            util_dynarray_append(out, nu[v]);
+            nu[v] = ip;
          }
 
          agx_foreach_ssa_dest_rev(I, d) {
             unsigned v = I->dest[d].value;
+            assert(v < ctx->n);
 
-            util_dynarray_append(out, search_next_uses(&nu, v));
+            util_dynarray_append(out, nu[v]);
          }
       }
    }
 
    assert(ip == 0 && "cycle counting is consistent");
-   destroy_next_uses(&nu);
+
+   /* Restore touched entries to DIST_INFINITY for the next block. */
+   foreach_next_use(&sb->next_use_out, i, _) {
+      nu[i] = DIST_INFINITY;
+   }
+   agx_foreach_instr_in_block(ctx->block, I) {
+      if (I->op != AGX_OPCODE_PHI) {
+         agx_foreach_ssa_src(I, s) {
+            nu[I->src[s].value] = DIST_INFINITY;
+         }
+      }
+   }
 }
 
 static agx_cursor
@@ -1230,7 +1243,7 @@ compute_w_entry_loop_header(struct spill_ctx *ctx)
    struct spill_block *sb = spill_block(ctx, block);
 
    unsigned nP = u_sparse_bitset_count(&block->live_in);
-   struct candidate *candidates = calloc(nP, sizeof(struct candidate));
+   struct candidate *candidates = ctx->candidates;
    unsigned j = 0;
 
    foreach_next_use(&sb->next_use_in, i, dist) {
@@ -1277,7 +1290,6 @@ compute_w_entry_loop_header(struct spill_ctx *ctx)
 
    assert(ctx->nW <= ctx->k);
    free(used);
-   free(candidates);
 }
 
 /*
@@ -1300,7 +1312,7 @@ compute_w_entry(struct spill_ctx *ctx)
    }
 
    /* Usual blocks follow */
-   unsigned *freq = calloc(ctx->n, sizeof(unsigned));
+   unsigned *freq = ctx->freq;
 
    /* Record what's written at the end of each predecessor */
    agx_foreach_predecessor(ctx->block, P) {
@@ -1312,7 +1324,7 @@ compute_w_entry(struct spill_ctx *ctx)
       }
    }
 
-   struct candidate *candidates = calloc(ctx->n, sizeof(struct candidate));
+   struct candidate *candidates = ctx->candidates;
    unsigned j = 0;
 
    /* Variables that are in all predecessors are assumed in W_entry. Phis and
@@ -1377,8 +1389,13 @@ compute_w_entry(struct spill_ctx *ctx)
 
    assert(ctx->nW <= ctx->k && "invariant");
 
-   free(freq);
-   free(candidates);
+   /* Restore touched freq[] entries sparsely for the next block. */
+   agx_foreach_predecessor(ctx->block, P) {
+      struct spill_block *sp = spill_block(ctx, *P);
+
+      for (unsigned i = 0; i < sp->nW_exit; ++i)
+         freq[sp->W_exit[i]] = 0;
+   }
 }
 
 /*
@@ -1805,6 +1822,10 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
 
    BITSET_WORD *W = ralloc_array(memctx, BITSET_WORD, BITSET_WORDS(n));
    BITSET_WORD *S = ralloc_array(memctx, BITSET_WORD, BITSET_WORDS(n));
+   dist_t *local_nu = ralloc_array(memctx, dist_t, n);
+   memset(local_nu, 0xff, n * sizeof(dist_t));
+   unsigned *freq = rzalloc_array(memctx, unsigned, n);
+   struct candidate *candidates = ralloc_array(memctx, struct candidate, n);
 
    agx_foreach_block(ctx, block) {
       memset(W, 0, BITSET_BYTES(n));
@@ -1820,6 +1841,9 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
          .repeat = repeat,
          .repeat_comp = repeat_comp,
          .next_uses = next_uses,
+         .local_nu = local_nu,
+         .freq = freq,
+         .candidates = candidates,
          .block = block,
          .blocks = blocks,
          .k = k,
@@ -1835,6 +1859,14 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
    }
 
    /* Now that all blocks are processed separately, stitch it together */
+   memset(W, 0, BITSET_BYTES(n));
+   BITSET_WORD *pred_W = rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(n));
+   BITSET_WORD *pred_S = rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(n));
+   BITSET_WORD *phi_any_dests =
+      rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(n));
+   BITSET_WORD *phi_raw_dests =
+      rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(n));
+
    agx_foreach_block(ctx, block) {
       struct spill_ctx sctx = {
          .memctx = memctx,
@@ -1845,6 +1877,10 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
          .remat = remat,
          .repeat = repeat,
          .repeat_comp = repeat_comp,
+         .pred_W = pred_W,
+         .pred_S = pred_S,
+         .phi_any_dests = phi_any_dests,
+         .phi_raw_dests = phi_raw_dests,
          .block = block,
          .blocks = blocks,
          .k = k,
