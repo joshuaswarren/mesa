@@ -2346,14 +2346,18 @@ agx_invalidate_resource(struct pipe_context *pctx,
    struct agx_batch *batch = agx_get_batch(ctx);
 
    /* Handle the glInvalidateFramebuffer case */
-   if (batch->key.zsbuf.texture == resource)
+   if (batch->key.zsbuf.texture == resource) {
       batch->resolve &= ~PIPE_CLEAR_DEPTHSTENCIL;
+      ctx->dirty |= AGX_DIRTY_ZS;
+   }
 
    for (unsigned i = 0; i < batch->key.nr_cbufs; ++i) {
       const struct pipe_surface *surf = &batch->key.cbufs[i];
 
-      if (surf->texture == resource)
+      if (surf->texture == resource) {
          batch->resolve &= ~(PIPE_CLEAR_COLOR0 << i);
+         ctx->dirty |= AGX_DIRTY_BLEND;
+      }
    }
 }
 
