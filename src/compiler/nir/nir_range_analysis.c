@@ -1683,8 +1683,8 @@ get_intrinsic_uub(struct analysis_state *state, struct scalar_query q, uint32_t 
                              get_max_workgroup_count(shader, q.scalar.comp)) -
                    1u;
       } else {
-         *result = (shader->info.workgroup_size[q.scalar.comp] *
-                    get_max_workgroup_count(shader, q.scalar.comp)) -
+         *result = mul_clamp(shader->info.workgroup_size[q.scalar.comp],
+                             get_max_workgroup_count(shader, q.scalar.comp)) -
                    1u;
       }
       break;
