@@ -1622,6 +1622,7 @@ bool agx3_sink_vertex_outputs(agx_context *ctx);
 bool agx3_coalesce_uniform_half_stores(agx_context *ctx);
 
 bool agx_lower_agx3_device_atomic_sources(agx_context *ctx);
+nir_alu_type agx_image_store_base_type(const nir_intrinsic_instr *intr);
 
 #ifdef __cplusplus
 } /* extern C */
