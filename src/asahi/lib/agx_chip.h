@@ -561,9 +561,9 @@ agx_encoding_is_g17_class(enum agx_isa_encoding encoding)
 
 #include "drm-uapi/asahi_drm.h"
 
-/* The AGX3 ISA family: G17P (AGX3B) and G17S (AGX3C) share instruction forms
- * and the AGX3 backend. Encoder/packer capability stays per encoding; the
- * shared compiler policy gates on the family. */
+/* AGX3B (G15x/G16x/G17P/G17A) and AGX3C (G17G/S/C) share instruction forms
+ * and the AGX3 backend. Intentionally excludes AGX3D (G18G). Encoder/packer
+ * capability stays per encoding; shared compiler policy gates on this pair. */
 static inline bool
 agx_isa_is_agx3(enum agx_isa_encoding enc)
 {

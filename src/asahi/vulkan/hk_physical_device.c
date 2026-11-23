@@ -1168,12 +1168,11 @@ hk_get_device_properties(const struct agx_device *dev,
 {
    const unsigned descriptor_generation =
       agx_chip_descriptor_generation(dev->chip);
-   /* Native AGX3 and every M5 part (G17G, G17S, G17C) view texel buffers
+   /* Native AGX3 (G15G/S/C, G16G, G17P) and every M5 part (G17G, G17S, G17C) view texel buffers
     * through the 2D texture/PBE descriptor with the software alignment tail.
     * G18G takes the legacy buffer-view path, which has no tail.
     */
-   const bool agx3_texel_buffer_tail =
-      agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip);
+   const bool agx3_texel_buffer_tail = agx_chip_native_or_m5(dev->chip);
    const bool texel_buffer_single_texel_alignment =
       hk_descriptor_generation_is_agx2(descriptor_generation) || agx3_texel_buffer_tail;
    /* G17P: what agx_nir_lower_gen1_mesh accepts and the CTS runs there
