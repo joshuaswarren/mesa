@@ -398,3 +398,34 @@ agx3_slot_assign(const struct agx3_slot_instr *instrs, unsigned n,
 {
    return agx3_slot_assign_with_entry(instrs, n, nslots, NULL, 0, out);
 }
+
+void
+agx3_slot_retire_at_cf(const struct agx3_slot_instr *instrs, unsigned n,
+                       uint16_t entry_wait, struct agx3_slot_result *res,
+                       bool *drained)
+{
+   uint16_t retired = 0, live = entry_wait;
+   for (unsigned i = 0; i < n; ++i) {
+      res[i].wait_mask &= (uint16_t)~retired;
+      live &= (uint16_t)~res[i].wait_mask;
+
+      if (res[i].slot) {
+         const uint16_t bit = (uint16_t)(1u << (res[i].slot - 1));
+         retired &= (uint16_t)~bit;
+         live |= bit;
+      }
+
+      if (instrs[i].cf == AGX3_SLOT_CF_NONE)
+         continue;
+
+      if (drained) {
+         uint16_t mask = live;
+         if (instrs[i].cf == AGX3_SLOT_CF_DRAIN_EMPTY && i + 1 < n &&
+             instrs[i + 1].cf != AGX3_SLOT_CF_NONE)
+            mask &= (uint16_t)~res[i + 1].wait_mask;
+         drained[i] = mask != 0;
+      }
+      retired |= live;
+      live = 0;
+   }
+}

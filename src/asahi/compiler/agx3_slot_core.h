@@ -57,9 +57,23 @@ extern "C" {
  * list; truncating it can drop a late descriptor load's RAW wait. */
 #define AGX3_SLOT_MAX_REGS 32u
 
+/* How emission treats the scoreboard at an instruction. Slot assignment is
+ * linear, so emission retires every outstanding generation before a
+ * control-flow boundary (agx3_pack_binary.c); agx3_slot_retire_at_cf() then
+ * drops the waits those drains made redundant. */
+enum agx3_slot_cf {
+   AGX3_SLOT_CF_NONE = 0,
+   /* Emission retires everything outstanding before this instruction. */
+   AGX3_SLOT_CF_DRAIN,
+   /* The same, at a boundary that emits no bytes, so the boundary right
+    * after it, if any, is the first instruction to consume a result. */
+   AGX3_SLOT_CF_DRAIN_EMPTY,
+};
+
 struct agx3_slot_instr {
    bool is_async;   /* produces a scoreboard-tracked result */
    bool drain;      /* retire preceding async operations before a fence */
+   uint8_t cf;      /* enum agx3_slot_cf */
    /* This asynchronous instruction reads its sources when it retires rather
     * than when it issues, so redefining one of them first changes what it
     * transfers. Set it for device stores, whose payload nothing else tracks:
@@ -148,6 +162,19 @@ struct agx3_slot_live_range {
  */
 bool agx3_slot_assign(const struct agx3_slot_instr *instrs, unsigned n,
                       unsigned nslots, struct agx3_slot_result *out);
+
+/*
+ * After assignment: remove the waits on generations that a control-flow
+ * drain (instrs[i].cf) already retired, until a later producer reuses the
+ * slot. entry_wait holds the slots pending on entry to the region. When
+ * `drained` is not NULL, drained[i] is set when the drain before instrs[i]
+ * retires a generation that neither instrs[i] nor, after an empty boundary,
+ * the boundary right after it reads; such a drain costs latency that state
+ * carried across the branch would not.
+ */
+void agx3_slot_retire_at_cf(const struct agx3_slot_instr *instrs, unsigned n,
+                            uint16_t entry_wait, struct agx3_slot_result *res,
+                            bool *drained);
 
 /* Import pending results into the same scoreboard ledger as instructions.
  * For example, the G17P loader publishes packed constant-program inputs in

@@ -13443,6 +13443,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          ordered[k] = I;
          struct agx3_slot_instr *e = &sl[k++];
+         /* Emission drains the scoreboard before every control-flow
+          * boundary except AGX3C's architectural BEGIN_CF. */
+         if (agx3_is_cf_op(I) &&
+             !(enc == AGX_ISA_ENCODING_AGX3C && I->op == AGX_OPCODE_BEGIN_CF))
+            e->cf = I->op == AGX_OPCODE_BEGIN_CF ? AGX3_SLOT_CF_DRAIN_EMPTY
+                                                 : AGX3_SLOT_CF_DRAIN;
          /* EXPORT is a zero-byte register-ABI declaration after RA, not a
           * physical read. Letting it consume an async dependency marks the
           * slot waited without emitting any wait, so a linked epilog reads
@@ -13880,35 +13886,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
     * later producer reuses the slot. Otherwise a post-branch ISEL may carry a
     * stale slot together with two real producers, escaping the native
     * slots-1-and-2 pair even though only that pair is live. */
-   /* cf_drains[i]: the drain before ordered[i] retires a generation that
-    * neither it nor, for the zero-byte BEGIN_CF, the branch right after it
-    * reads. Only counted, for shader statistics. */
+   /* cf_drains[i], for shader statistics: the drain before ordered[i]
+    * retires something that neither branch reads. */
    bool *cf_drains = rzalloc_array(ctx, bool, count ? count : 1);
    if (!cf_drains)
       AGX3_PACK_FAIL();
-   uint16_t cf_retired = 0, cf_live = entry_wait;
-   for (unsigned i = 0; i < count; ++i) {
-      res[i].wait_mask &= (uint16_t)~cf_retired;
-      cf_live &= (uint16_t)~res[i].wait_mask;
-
-      if (res[i].slot) {
-         const uint16_t bit = (uint16_t)(1u << (res[i].slot - 1));
-         cf_retired &= (uint16_t)~bit;
-         cf_live |= bit;
-      }
-
-      const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
-         ordered[i]->op == AGX_OPCODE_BEGIN_CF;
-      if (agx3_is_cf_op(ordered[i]) && !live_begin) {
-         uint16_t drained = cf_live;
-         if (ordered[i]->op == AGX_OPCODE_BEGIN_CF && i + 1 < count &&
-             agx3_is_cf_op(ordered[i + 1]))
-            drained &= (uint16_t)~res[i + 1].wait_mask;
-         cf_drains[i] = drained != 0;
-         cf_retired |= cf_live;
-         cf_live = 0;
-      }
-   }
+   agx3_slot_retire_at_cf(sl, count, entry_wait, res, cf_drains);
 
    uint8_t active_coord_slot = 0;
    unsigned staged_components = 0;

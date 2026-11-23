@@ -738,6 +738,42 @@ int main(void)
       CHECK(!agx3_slot_assign(p, 4, 6, r));
    }
 
+   /* Control-flow drains: emission retires the load before the branch, so
+    * its consumer after the branch needs no wait, and the drain counts. */
+   {
+      struct agx3_slot_instr branch = st(0);
+      branch.cf = AGX3_SLOT_CF_DRAIN;
+      struct agx3_slot_instr p[] = { ld(10), branch, alu(12, 10, 10) };
+      bool drained[3] = {0};
+      CHECK(agx3_slot_assign(p, 3, 6, r));
+      CHECK(r[2].wait_mask == (1u << (r[0].slot - 1)));
+      agx3_slot_retire_at_cf(p, 3, 0, r, drained);
+      CHECK(r[2].wait_mask == 0);
+      CHECK(!drained[0] && drained[1] && !drained[2]);
+   }
+   /* An empty boundary drains what the branch right after it reads: not a
+    * drain, since that branch has to wait for it anyway. */
+   {
+      struct agx3_slot_instr begin = {0}, branch = st(10);
+      begin.cf = AGX3_SLOT_CF_DRAIN_EMPTY;
+      branch.cf = AGX3_SLOT_CF_DRAIN;
+      struct agx3_slot_instr p[] = { ld(10), begin, branch };
+      bool drained[3] = {0};
+      CHECK(agx3_slot_assign(p, 3, 6, r));
+      agx3_slot_retire_at_cf(p, 3, 0, r, drained);
+      CHECK(!drained[1] && !drained[2]);
+      CHECK(r[2].wait_mask == 0);
+   }
+   /* A generation issued after the drain keeps its own wait. */
+   {
+      struct agx3_slot_instr branch = st(0);
+      branch.cf = AGX3_SLOT_CF_DRAIN;
+      struct agx3_slot_instr p[] = { ld(10), branch, ld(12), alu(14, 12, 10) };
+      CHECK(agx3_slot_assign(p, 4, 6, r));
+      agx3_slot_retire_at_cf(p, 4, 0, r, NULL);
+      CHECK(r[3].wait_mask == (1u << (r[2].slot - 1)));
+   }
+
    /* Malformed inputs. */
    CHECK(!agx3_slot_assign(NULL, 1, 6, r));
    { struct agx3_slot_instr p=ld(0); CHECK(!agx3_slot_assign(&p,1,0,r)); CHECK(!agx3_slot_assign(&p,1,9,r)); }
