@@ -36,6 +36,7 @@
 #include "agx3_local_tps_core.h"
 #include "agx3_mem_core.h"
 #include "agx3_matrix_core.h"
+#include "agx3_native_stats.h"
 #include "agx3_pack.h"
 #include "agx3_staging.h"
 #include "agx3_resource_ir.h"
@@ -1624,13 +1625,17 @@ agx3_emit_uvsw(agx_context *ctx, struct util_dynarray *emission,
 static __thread bool agx3_carrier1140;
 static __thread uint16_t agx3_r0_inflight;
 
+__thread struct agx3_native_stats agx3_native_stats;
+
 static bool
 agx3_band_carrier(enum agx_isa_encoding enc, uint16_t reg, uint16_t mask,
                   uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   return agx3_carrier1140 && enc == AGX_ISA_ENCODING_AGX3C
+   const bool ok = agx3_carrier1140 && enc == AGX_ISA_ENCODING_AGX3C
              ? agx3_alu_band_identity_live_gpu1(reg, mask, out, len)
              : agx3_alu_band_identity_wait(enc, reg, mask, out, len);
+   agx3_native_stats.wait_carriers += ok;
+   return ok;
 }
 
 static bool
@@ -6741,6 +6746,8 @@ agx3_emit_alu(struct util_dynarray *emission, enum agx_isa_encoding enc,
                                0, 0, prewait, prelude, &prelude_len);
       if (!ok || !agx3_append(emission, prelude, prelude_len))
          return false;
+      /* agx3_band_carrier() counts itself. */
+      agx3_native_stats.wait_carriers += !exact_in_place;
       wait_mask &= ~prewait;
    }
 
@@ -8252,6 +8259,7 @@ agx3_retire_wait_on(struct util_dynarray *emission, enum agx_isa_encoding enc,
                           mask | (1u << (enc == AGX_ISA_ENCODING_AGX3C ? 7 : 5)),
                           bytes, &len)
       : agx3_alu_band_identity_wait(enc, reg.value, mask, bytes, &len);
+   agx3_native_stats.wait_carriers += ok;
    return ok && agx3_append(emission, bytes, len);
 }
 
@@ -11608,6 +11616,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    agx3_carrier1140 = enc == AGX_ISA_ENCODING_AGX3C &&
                       ctx->key->dev.emit_agx3d;
    agx3_r0_inflight = 0;
+   agx3_native_stats = (struct agx3_native_stats){0};
 
    /* MS MRT reloads reuse texture destinations for scalar sample indices.
     * Their synchronous ALU consumers and ldimm wait preludes can retire
@@ -13625,6 +13634,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
     * later producer reuses the slot. Otherwise a post-branch ISEL may carry a
     * stale slot together with two real producers, escaping the native
     * slots-1-and-2 pair even though only that pair is live. */
+   /* cf_drains[i]: the drain before ordered[i] retires a generation that
+    * neither it nor, for the zero-byte BEGIN_CF, the branch right after it
+    * reads. Only counted, for shader statistics. */
+   bool *cf_drains = rzalloc_array(ctx, bool, count ? count : 1);
+   if (!cf_drains)
+      AGX3_PACK_FAIL();
    uint16_t cf_retired = 0, cf_live = entry_wait;
    for (unsigned i = 0; i < count; ++i) {
       res[i].wait_mask &= (uint16_t)~cf_retired;
@@ -13639,6 +13654,11 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
          ordered[i]->op == AGX_OPCODE_BEGIN_CF;
       if (agx3_is_cf_op(ordered[i]) && !live_begin) {
+         uint16_t drained = cf_live;
+         if (ordered[i]->op == AGX_OPCODE_BEGIN_CF && i + 1 < count &&
+             agx3_is_cf_op(ordered[i + 1]))
+            drained &= (uint16_t)~res[i + 1].wait_mask;
+         cf_drains[i] = drained != 0;
          cf_retired |= cf_live;
          cf_live = 0;
       }
@@ -14051,6 +14071,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             if (retire != 0) {
                if (!agx3_retire_slots_noop(emission, enc, retire))
                   AGX3_REFUSE(I);
+               if (cf_drains[instr_index]) {
+                  agx3_native_stats.cf_drains++;
+                  agx3_native_stats.loop_cf_drains += loop_depth > 0;
+               }
                cf_wait = 0;
                cf_outstanding = 0;
                outstanding = 0;
@@ -15891,6 +15915,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                      : agx3_alu_band_identity_wait(enc, value.value, wait,
                                                    carrier, &carrier_len);
                   ok = retired && agx3_append(emission, carrier, carrier_len);
+                  agx3_native_stats.wait_carriers += ok;
                }
 
                for (unsigned i = 0; ok && i < copies; ++i) {
