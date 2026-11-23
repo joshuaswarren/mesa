@@ -3469,6 +3469,8 @@ struct hk_copy4_dispatch_cert {
 
 static void
 hk_record_copy4_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                     const struct hk_api_shader *api,
+                     const struct hk_shader *selected,
                      const struct hk_copy4_dispatch_cert *cert,
                      const uint32_t orig_groups[3], struct agx_grid exec_grid)
 {
@@ -3485,6 +3487,12 @@ hk_record_copy4_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        desc->root.cs.base_group[2])
       return;
 
+   if (cert->role == HK_COMPUTE_PAIR_FADD &&
+       (!api || !api->compute_pair_producer ||
+        api->compute_pair_producer->info.role != HK_COMPUTE_PAIR_FADD ||
+        !desc->uploaded_root.gpu || !selected || selected->data_size != 0))
+      return;
+
    struct hk_compute_pair_dispatch *record = calloc(1, sizeof(*record));
    if (!record)
       return;
@@ -3492,6 +3500,21 @@ hk_record_copy4_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (cert->role == HK_COMPUTE_PAIR_PAD4) {
       record->extra.pad4 = cert->extra.pad4;
       memcpy(record->bindings, cert->bindings, 3 * sizeof(record->bindings[0]));
+   } else if (cert->role == HK_COMPUTE_PAIR_FADD) {
+      record->info.fadd_push_bytes = api->identity_copy4_info.push_bytes;
+      record->extra.copy4 = cert->extra.copy4;
+      memcpy(record->bindings, cert->bindings, 3 * sizeof(record->bindings[0]));
+      memcpy(record->exec_local, selected->b.info.workgroup_size,
+             sizeof(record->exec_local));
+      record->root_va = desc->uploaded_root.gpu;
+      memcpy(record->root_sets, desc->root.sets, sizeof(record->root_sets));
+      memcpy(record->push, desc->root.push, sizeof(record->push));
+      record->cs_group_count_addr = desc->root.cs.group_count_addr;
+      memcpy(record->cs_base_group, desc->root.cs.base_group,
+             sizeof(record->cs_base_group));
+      record->printf_buffer_address = desc->root.printf_buffer_address;
+      record->alt_kind = HK_COMPUTE_PAIR_ALT_LINEAR_FADD;
+      record->producer = hk_compute_pair_producer_ref(api->compute_pair_producer);
    } else {
       record->extra.copy4 = cert->extra.copy4;
       memcpy(record->bindings, cert->bindings, 2 * sizeof(record->bindings[0]));
@@ -3663,6 +3686,18 @@ hk_select_identity_copy4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
       *cert_out = (struct hk_copy4_dispatch_cert){
          .role = same_src0_dst ? HK_COMPUTE_PAIR_SELF_COPY : HK_COMPUTE_PAIR_COPY4,
          .bindings = {backings[0], backings[2]},
+         .extra.copy4 = {
+            .src_start = src_start,
+            .dst_start = dst_start,
+            .bytes = bytes,
+         },
+      };
+   } else if (cert_out && info->kind == HK_IDENTITY_COPY4_LINEAR_FADD &&
+              nsrc == 2 && api->compute_pair_producer &&
+              api->compute_pair_producer->info.role == HK_COMPUTE_PAIR_FADD) {
+      *cert_out = (struct hk_copy4_dispatch_cert){
+         .role = HK_COMPUTE_PAIR_FADD,
+         .bindings = {backings[0], backings[1], backings[2]},
          .extra.copy4 = {
             .src_start = src_start,
             .dst_start = dst_start,
@@ -4016,7 +4051,7 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
 
    struct hk_shader *selected = s;
    struct hk_copy4_dispatch_cert copy4_cert = {.role = HK_COMPUTE_PAIR_NONE};
-   if (api && api->identity_copy4 && !api->compute_pair_producer && !in_threads && !invocation_stat) {
+   if (api && api->identity_copy4 && !api->compute_pair && !in_threads && !invocation_stat) {
       selected = hk_select_identity_copy4(cmd, api, s, &grid, &copy4_cert);
       /* Record-time no-op self-copy elision: runs after
        * hk_cs_invalidate_compute_pair() and is skipped whenever pipeline stats
@@ -4075,7 +4110,8 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
       hk_record_compute_pair(cmd, cs, api, selected, orig_groups, grid);
    else if (!in_threads && !invocation_stat &&
             copy4_cert.role != HK_COMPUTE_PAIR_NONE)
-      hk_record_copy4_pair(cmd, cs, &copy4_cert, orig_groups, grid);
+      hk_record_copy4_pair(cmd, cs, api, selected, &copy4_cert, orig_groups,
+                           grid);
    cs->uses_global_atomics |= selected->b.info.uses_global_atomics;
    cs->pack_loops |= selected->b.info.has_loops;
    if (agx_is_indirect(grid)) {
