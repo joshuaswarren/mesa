@@ -159,6 +159,7 @@ static unsigned checks;
    ROW(agx_chip_native_preamble(c), "0000 00000 0000 10000 0 0")               \
    ROW(agx_chip_query_ti_spill(c), "0000 00000 0000 10000 0 0")                \
    ROW(agx_chip_has_hardware_ray_tracing(c), "0000 01111 1111 11111 1 0")      \
+   ROW(agx_chip_has_agx3_ray_opcodes(c), "0000 01111 1111 11111 0 0")          \
    ROW(agx_chip_needs_scheduling_stalls(c), "0000 01000 0000 00000 0 0")       \
    ROW(agx_chip_cooperative_matrix_supported(c), "0000 01111 1111 11111 0 0")  \
    /* Per-record allowlists: VDM. */                                           \

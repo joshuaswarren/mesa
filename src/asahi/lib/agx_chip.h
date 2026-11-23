@@ -1226,6 +1226,15 @@ agx_chip_cooperative_matrix_supported(enum agx_chip chip)
           agx_chip_g17_m5(chip);
 }
 
+/* Hardware ray-query opcodes (intersect_ray, continue_ray, inc_stk) share one
+ * instruction encoding per AGX3B / AGX3C ISA family; AGX3D (G18G) and AGX2
+ * parts do not use these packers. */
+static inline bool
+agx_chip_has_agx3_ray_opcodes(enum agx_chip chip)
+{
+   return agx_isa_is_agx3(agx_chip_isa_encoding(chip));
+}
+
 /* Stable name for diagnostics, e.g. "G15G". Never NULL. */
 static inline const char *
 agx_chip_name(enum agx_chip chip)

@@ -1750,23 +1750,17 @@ agx3_pack_intersect_ray(enum agx_isa_encoding encoding,
    return true;
 }
 
+static enum agx_isa_encoding
+agx3_ray_opcode_chip_encoding(enum agx_chip chip)
+{
+   return agx_chip_has_agx3_ray_opcodes(chip) ? agx_chip_isa_encoding(chip)
+                                              : AGX_ISA_ENCODING_UNKNOWN;
+}
+
 enum agx_isa_encoding
 agx3_intersect_ray_witnessed_chip_encoding(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G17P:
-      return AGX_ISA_ENCODING_AGX3B;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-      return AGX_ISA_ENCODING_AGX3C;
-   default:
-      return AGX_ISA_ENCODING_UNKNOWN;
-   }
+   return agx3_ray_opcode_chip_encoding(chip);
 }
 
 static const uint8_t continue_ray_canonical_agx3b[] = {
@@ -1861,21 +1855,7 @@ agx3_pack_continue_ray(enum agx_isa_encoding encoding,
 enum agx_isa_encoding
 agx3_continue_ray_witnessed_chip_encoding(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G17P:
-      return AGX_ISA_ENCODING_AGX3B;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-      return AGX_ISA_ENCODING_AGX3C;
-   default:
-      return AGX_ISA_ENCODING_UNKNOWN;
-   }
+   return agx3_ray_opcode_chip_encoding(chip);
 }
 
 bool
@@ -1937,18 +1917,5 @@ agx3_pack_inc_stk_fixed_witness(
 enum agx_isa_encoding
 agx3_inc_stk_witnessed_chip_encoding(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G17P:
-      return AGX_ISA_ENCODING_AGX3B;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-      return AGX_ISA_ENCODING_AGX3C;
-   default:
-      return AGX_ISA_ENCODING_UNKNOWN;
-   }
+   return agx3_ray_opcode_chip_encoding(chip);
 }
