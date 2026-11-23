@@ -753,6 +753,11 @@ typedef struct {
    bool agx3_loop_entry_drain_all;
    unsigned agx3_kept_loop_entries;
    unsigned agx3_loop_carriers;
+   /* Pack with an if's arms draining at their ends instead of joining, and
+    * how many arm ends of the last pack the join kept from draining
+    * (agx3_pack_program()). */
+   bool agx3_arm_join_off;
+   unsigned agx3_joined_arm_drains;
    unsigned agx3_g18g_read_staging_end;
    unsigned agx3_g18g_output_staging_span;
    bool agx3_staging_known;

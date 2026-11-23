@@ -4,6 +4,7 @@
  */
 
 #include "agx3_slot_core.h"
+#include "util/bitscan.h"
 #include "util/macros.h"
 
 #include <stdlib.h>
@@ -11,12 +12,13 @@
 
 /* Whether a register still belongs to this generation, as result or payload. */
 static bool
-agx3_slot_generation_live(const uint8_t *reg_slot,
+agx3_slot_generation_live(const uint16_t *reg_slots,
                           const uint16_t *reader_slots, unsigned slot,
                           unsigned token_count)
 {
+   const uint16_t bit = (uint16_t)(1u << (slot - 1));
    for (unsigned r = 0; r < token_count; ++r) {
-      if (reg_slot[r] == slot || (reader_slots[r] & (1u << (slot - 1))))
+      if ((reg_slots[r] | reader_slots[r]) & bit)
          return true;
    }
    return false;
@@ -54,15 +56,25 @@ agx3_slot_token_count(const struct agx3_slot_instr *instrs, unsigned n)
    return count;
 }
 
-/* The assignment state at the if that opened an arm. */
-struct agx3_slot_level {
-   bool arm;
+/* One assignment state, as a structured level saves it. */
+struct agx3_slot_state {
    uint16_t pending, entry_pending, active_reader_slots;
    bool waited[9], reissuable[9];
    uint8_t join_class[9], join_count[9];
-   uint8_t *reg_slot;
+   uint16_t *reg_slots;
    uint16_t *reader_slots;
 };
+
+/* A structured if (or loop) level: the state at the if, and at the end of
+ * its first arm once an else has started the second. */
+struct agx3_slot_level {
+   bool arm, has_else;
+   struct agx3_slot_state at_if, then_end;
+};
+
+/* Two paths' join class for one slot, when both leave it pending with
+ * different queues: no producer may join it, and any reuse waits first. */
+#define AGX3_SLOT_JOIN_MIXED UINT8_MAX
 
 struct agx3_slot_levels {
    struct agx3_slot_level *levels;
@@ -101,25 +113,26 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
          token_count = range->first + range->count;
    }
 
-   /* reg_slot[r] = slot (1..nslots) of the async op whose result currently
-    * lives in half-register r, or 0 if r was last written by a synchronous op
-    * (or never). */
-   uint8_t reg_slot[AGX3_SLOT_NUM_TOKENS];
-   memset(reg_slot, 0, token_count * sizeof(reg_slot[0]));
+   /* reg_slots[r] = the slots (bit s - 1 for slot s) of the async ops whose
+    * result may currently live in half-register r, or 0 if r was last written
+    * by a synchronous op (or never). One path names one slot; after the arms
+    * of an if join, r may hold the result of either arm's op. */
+   uint16_t reg_slots[AGX3_SLOT_NUM_TOKENS];
+   memset(reg_slots, 0, token_count * sizeof(reg_slots[0]));
    uint16_t pending = 0;
    for (unsigned i = 0; i < entry_count; ++i) {
       /* One token cannot name two independently pending generations. */
-      if (reg_slot[entry[i].token])
+      if (reg_slots[entry[i].token])
          return false;
-      reg_slot[entry[i].token] = entry[i].slot;
+      reg_slots[entry[i].token] = (uint16_t)(1u << (entry[i].slot - 1));
       pending |= (uint16_t)(1u << (entry[i].slot - 1));
    }
    for (unsigned i = 0; i < live_count; ++i) {
       const struct agx3_slot_live_range *range = &live[i];
       for (unsigned r = range->first; r < range->first + range->count; ++r) {
-         if (reg_slot[r])
+         if (reg_slots[r])
             return false;
-         reg_slot[r] = range->slot;
+         reg_slots[r] = (uint16_t)(1u << (range->slot - 1));
       }
       pending |= (uint16_t)(1u << (range->slot - 1));
    }
@@ -178,10 +191,11 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
          const uint16_t r = I->src[s];
          if (r >= AGX3_SLOT_NUM_TOKENS)
             return false;
-         const uint8_t slot = reg_slot[r];
-         if (slot != 0 && !slot_waited[slot]) {
-            wait_mask |= (uint16_t)(1u << (slot - 1));
-            slot_waited[slot] = true;
+         u_foreach_bit(b, reg_slots[r]) {
+            if (!slot_waited[b + 1]) {
+               wait_mask |= (uint16_t)(1u << b);
+               slot_waited[b + 1] = true;
+            }
          }
       }
 
@@ -194,17 +208,18 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
        * (agx_insert_waits.c, "Check for write-after-write"); omitting it here
        * produced no diagnostic, just wrong values on hardware.
        *
-       * This runs before the bookkeeping below, so reg_slot[] still names the
-       * previous writer rather than this instruction.
+       * This runs before the bookkeeping below, so reg_slots[] still names the
+       * previous writers rather than this instruction.
        */
       for (unsigned d = 0; d < I->nr_dsts; ++d) {
          const uint16_t r = I->dst[d];
          if (r >= AGX3_SLOT_NUM_TOKENS)
             return false;
-         const uint8_t slot = reg_slot[r];
-         if (slot != 0 && !slot_waited[slot]) {
-            wait_mask |= (uint16_t)(1u << (slot - 1));
-            slot_waited[slot] = true;
+         u_foreach_bit(b, reg_slots[r]) {
+            if (!slot_waited[b + 1]) {
+               wait_mask |= (uint16_t)(1u << b);
+               slot_waited[b + 1] = true;
+            }
          }
 
          /* Write-after-read: retire every async op still reading this
@@ -235,9 +250,9 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
          bool live = false;
          for (unsigned r = 0; r < token_count; ++r) {
             live |= (reader_slots[r] & bit) != 0;
-            if (reg_slot[r] == slot) {
+            if (reg_slots[r] & bit) {
                live = true;
-               reg_slot[r] = 0;
+               reg_slots[r] &= (uint16_t)~bit;
             }
          }
          if (live && !slot_waited[slot])
@@ -276,7 +291,11 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
          if (!slot) {
             if (I->coalesce_src) {
                const unsigned source = I->src[I->coalesce_src - 1];
-               const uint8_t producer_slot = reg_slot[source];
+               /* Only a source with one possible producer. */
+               const uint16_t producers = reg_slots[source];
+               const uint8_t producer_slot =
+                  util_bitcount(producers) == 1
+                     ? (uint8_t)(__builtin_ctz(producers) + 1) : 0;
                if (producer_slot && producer_slot <= cap &&
                    slot_waited[producer_slot] &&
                    !(I->transient_slots & (1u << (producer_slot - 1))))
@@ -296,7 +315,7 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
                if (candidate > cap)
                   continue;
                if (slot_waited[candidate] ||
-                   !agx3_slot_generation_live(reg_slot, reader_slots, candidate,
+                   !agx3_slot_generation_live(reg_slots, reader_slots, candidate,
                                              token_count) ||
                    (I->reissues_live_slot && slot_reissuable[candidate]) ||
                    (I->join_class && slot_join_class[candidate] == I->join_class &&
@@ -354,10 +373,8 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
          const bool new_join = slot_waited[slot] ||
                                slot_join_class[slot] != I->join_class;
          if (slot_waited[slot]) {
-            for (unsigned r = 0; r < token_count; ++r) {
-               if (reg_slot[r] == slot)
-                  reg_slot[r] = 0;
-            }
+            for (unsigned r = 0; r < token_count; ++r)
+               reg_slots[r] &= (uint16_t)~(1u << (slot - 1));
          }
          slot_waited[slot] = false; /* freshly outstanding */
          slot_reissuable[slot] = I->reissues_live_slot;
@@ -367,7 +384,7 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
          for (unsigned d = 0; d < I->nr_dsts; ++d) {
             if (I->dst[d] >= AGX3_SLOT_NUM_TOKENS)
                return false;
-            reg_slot[I->dst[d]] = slot;
+            reg_slots[I->dst[d]] = (uint16_t)(1u << (slot - 1));
          }
          if ((I->latches_srcs || I->late_src_mask) && I->nr_srcs) {
             active_reader_slots |= (uint16_t)(1u << (slot - 1));
@@ -384,7 +401,7 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
          for (unsigned d = 0; d < I->nr_dsts; ++d) {
             if (I->dst[d] >= AGX3_SLOT_NUM_TOKENS)
                return false;
-            reg_slot[I->dst[d]] = 0; /* synchronous result, no wait needed */
+            reg_slots[I->dst[d]] = 0; /* synchronous result, no wait needed */
          }
       }
 
@@ -393,7 +410,7 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
        * scoreboard, so allocation neither skips nor waits for generations
        * the drain already retired. */
       if (I->cf != AGX3_SLOT_CF_NONE) {
-         memset(reg_slot, 0, token_count * sizeof(reg_slot[0]));
+         memset(reg_slots, 0, token_count * sizeof(reg_slots[0]));
          memset(reader_slots, 0, token_count * sizeof(reader_slots[0]));
          active_reader_slots = 0;
          pending = 0;
@@ -406,26 +423,63 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
          }
       }
 
-      /* An arm's end retires only what the arm issued: resume from the
-       * state at its if (enum agx3_slot_cf). */
-#define AGX3_SLOT_LOAD(L)                                                     \
+      /* The arms of an if join (enum agx3_slot_cf): each starts from the
+       * state at the if, an else's arm also from what the first arm left in
+       * flight, and the code after the pop from both arms' ends. A path no
+       * lane takes still contributes its state, since its waits did not
+       * run. */
+#define AGX3_SLOT_SAVE(S)                                                     \
    do {                                                                       \
-      memcpy(reg_slot, (L)->reg_slot, token_count * sizeof(reg_slot[0]));    \
-      memcpy(reader_slots, (L)->reader_slots,                                \
+      memcpy((S)->reg_slots, reg_slots, token_count * sizeof(reg_slots[0])); \
+      memcpy((S)->reader_slots, reader_slots,                                \
              token_count * sizeof(reader_slots[0]));                         \
-      pending = (L)->pending;                                                \
-      entry_pending = (L)->entry_pending;                                    \
-      active_reader_slots = (L)->active_reader_slots;                        \
-      memcpy(slot_waited, (L)->waited, sizeof(slot_waited));                 \
-      memcpy(slot_reissuable, (L)->reissuable, sizeof(slot_reissuable));     \
-      memcpy(slot_join_class, (L)->join_class, sizeof(slot_join_class));     \
-      memcpy(slot_join_count, (L)->join_count, sizeof(slot_join_count));     \
+      (S)->pending = pending;                                                \
+      (S)->entry_pending = entry_pending;                                    \
+      (S)->active_reader_slots = active_reader_slots;                        \
+      memcpy((S)->waited, slot_waited, sizeof(slot_waited));                 \
+      memcpy((S)->reissuable, slot_reissuable, sizeof(slot_reissuable));     \
+      memcpy((S)->join_class, slot_join_class, sizeof(slot_join_class));     \
+      memcpy((S)->join_count, slot_join_count, sizeof(slot_join_count));     \
+   } while (0)
+#define AGX3_SLOT_JOIN(S)                                                     \
+   do {                                                                       \
+      for (unsigned r = 0; r < token_count; ++r) {                           \
+         reg_slots[r] |= (S)->reg_slots[r];                                  \
+         reader_slots[r] |= (S)->reader_slots[r];                            \
+      }                                                                      \
+      for (unsigned slot = 1; slot <= nslots; ++slot) {                      \
+         const uint16_t bit = (uint16_t)(1u << (slot - 1));                  \
+         const bool here = pending & bit, there = (S)->pending & bit;        \
+         if (here && there) {                                                \
+            slot_reissuable[slot] &= (S)->reissuable[slot];                  \
+            if (slot_join_class[slot] != (S)->join_class[slot]) {            \
+               slot_join_class[slot] = AGX3_SLOT_JOIN_MIXED;                 \
+               slot_join_count[slot] = 1;                                    \
+            } else {                                                         \
+               slot_join_count[slot] =                                       \
+                  MAX2(slot_join_count[slot], (S)->join_count[slot]);        \
+            }                                                                \
+         } else if (there) {                                                 \
+            slot_reissuable[slot] = (S)->reissuable[slot];                   \
+            slot_join_class[slot] = (S)->join_class[slot];                   \
+            slot_join_count[slot] = (S)->join_count[slot];                   \
+         }                                                                   \
+         /* Synchronised exactly when no joined path left it pending. */    \
+         slot_waited[slot] = !here && !there;                                \
+      }                                                                      \
+      pending |= (S)->pending;                                               \
+      entry_pending |= (S)->entry_pending;                                   \
+      active_reader_slots |= (S)->active_reader_slots;                       \
    } while (0)
       if (I->cf_else) {
          if (!depth)
             return false;
-         if (lv->levels[depth - 1].arm)
-            AGX3_SLOT_LOAD(&lv->levels[depth - 1]);
+         struct agx3_slot_level *L = &lv->levels[depth - 1];
+         if (L->arm) {
+            AGX3_SLOT_SAVE(&L->then_end);
+            L->has_else = true;
+            AGX3_SLOT_JOIN(&L->at_if);
+         }
       }
       for (unsigned p = 0; p < I->cf_pop; ++p) {
          if (!depth)
@@ -435,28 +489,20 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
             /* An arm keeps state only when its pop closes it alone. */
             if (I->cf_pop != 1)
                return false;
-            AGX3_SLOT_LOAD(L);
+            AGX3_SLOT_JOIN(L->has_else ? &L->then_end : &L->at_if);
          }
       }
-#undef AGX3_SLOT_LOAD
       for (unsigned p = 0; p < I->cf_push; ++p) {
          if (depth >= lv->max_depth)
             return false;
          struct agx3_slot_level *L = &lv->levels[depth++];
          L->arm = I->cf_arm;
-         if (!L->arm)
-            continue;
-         memcpy(L->reg_slot, reg_slot, token_count * sizeof(reg_slot[0]));
-         memcpy(L->reader_slots, reader_slots,
-                token_count * sizeof(reader_slots[0]));
-         L->pending = pending;
-         L->entry_pending = entry_pending;
-         L->active_reader_slots = active_reader_slots;
-         memcpy(L->waited, slot_waited, sizeof(slot_waited));
-         memcpy(L->reissuable, slot_reissuable, sizeof(slot_reissuable));
-         memcpy(L->join_class, slot_join_class, sizeof(slot_join_class));
-         memcpy(L->join_count, slot_join_count, sizeof(slot_join_count));
+         L->has_else = false;
+         if (L->arm)
+            AGX3_SLOT_SAVE(&L->at_if);
       }
+#undef AGX3_SLOT_JOIN
+#undef AGX3_SLOT_SAVE
    }
 
    return true;
@@ -493,16 +539,19 @@ agx3_slot_assign_initial(const struct agx3_slot_instr *instrs, unsigned n,
    uint8_t *arena = NULL;
    if (max_depth) {
       lv.levels = calloc(max_depth, sizeof(*lv.levels));
-      arena = calloc(max_depth, stride * (sizeof(uint8_t) + sizeof(uint16_t)));
+      /* Two states per level, each a writer and a reader word per token. */
+      arena = calloc(max_depth, 4 * stride * sizeof(uint16_t));
       if (!lv.levels || !arena) {
          free(lv.levels);
          free(arena);
          return false;
       }
       for (unsigned d = 0; d < max_depth; ++d) {
-         uint8_t *base = arena + d * stride * (sizeof(uint8_t) + sizeof(uint16_t));
-         lv.levels[d].reader_slots = (uint16_t *)base;
-         lv.levels[d].reg_slot = base + stride * sizeof(uint16_t);
+         uint16_t *base = (uint16_t *)arena + d * 4 * stride;
+         lv.levels[d].at_if.reg_slots = base;
+         lv.levels[d].at_if.reader_slots = base + stride;
+         lv.levels[d].then_end.reg_slots = base + 2 * stride;
+         lv.levels[d].then_end.reader_slots = base + 3 * stride;
       }
    }
 
@@ -546,10 +595,10 @@ agx3_slot_retire_at_cf(const struct agx3_slot_instr *instrs, unsigned n,
 {
    /* Assignment already starts from the state each drain leaves, so no
     * wait names a generation a drain retired; only report the drains,
-    * following the same arm structure. */
+    * following the same arm joins. */
+   struct level { bool arm, has_else; uint16_t at_if, then_end; };
+   struct level *levels = calloc(n ? n : 1, sizeof(*levels));
    uint16_t live = entry_wait;
-   uint16_t *at_if = calloc(n ? n : 1, sizeof(uint16_t));
-   bool *arm = calloc(n ? n : 1, sizeof(bool));
    unsigned depth = 0;
    for (unsigned i = 0; i < n; ++i) {
       live &= (uint16_t)~res[i].wait_mask;
@@ -561,20 +610,23 @@ agx3_slot_retire_at_cf(const struct agx3_slot_instr *instrs, unsigned n,
             drained[i] = live != 0;
          live = 0;
       }
-      if (!at_if || !arm)
+      if (!levels)
          continue;
-      if (instrs[i].cf_else && depth && arm[depth - 1])
-         live = at_if[depth - 1];
+      if (instrs[i].cf_else && depth && levels[depth - 1].arm) {
+         levels[depth - 1].then_end = live;
+         levels[depth - 1].has_else = true;
+         live |= levels[depth - 1].at_if;
+      }
       for (unsigned p = 0; p < instrs[i].cf_pop && depth; ++p) {
-         --depth;
-         if (arm[depth])
-            live = at_if[depth];
+         const struct level *L = &levels[--depth];
+         if (L->arm)
+            live |= L->has_else ? L->then_end : L->at_if;
       }
       for (unsigned p = 0; p < instrs[i].cf_push && depth < n; ++p) {
-         arm[depth] = instrs[i].cf_arm;
-         at_if[depth++] = live;
+         levels[depth++] = (struct level){
+            .arm = instrs[i].cf_arm, .at_if = live,
+         };
       }
    }
-   free(at_if);
-   free(arm);
+   free(levels);
 }

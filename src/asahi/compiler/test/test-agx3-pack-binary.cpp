@@ -8025,10 +8025,15 @@ TEST_F(AGX3PackBinary, NativeStatsCountControlFlowDrains)
                           agx_immediate(4), AGX_FORMAT_I32, 1, 0, false);
          agx_stop(&pb);
 
+         /* The arm's pop joins instead of draining (agx3_slot_core.h): the
+          * store after it waits for the load itself. A compare reading the
+          * load waits for it through a carrier, as no branch carries a
+          * wait. */
          EXPECT_FALSE(pack(b).empty());
-         EXPECT_EQ(agx3_native_stats.cf_drains, compare_reads_load ? 0u : 1u);
+         EXPECT_EQ(agx3_native_stats.cf_drains, 0u);
          EXPECT_EQ(agx3_native_stats.loop_cf_drains, 0u);
-         EXPECT_GE(agx3_native_stats.wait_carriers, 1u);
+         EXPECT_GE(agx3_native_stats.wait_carriers,
+                   compare_reads_load ? 1u : 0u);
       }
    }
 }
@@ -8066,11 +8071,9 @@ build_load_then_if(agx_builder *b, bool arm_uses, bool compare_reads_load)
    agx_stop(&pb);
 }
 
-/* A forward if keeps the load in flight into its arm: no drain at the if,
- * the consumer in the arm waits for it, and the pop at the end of the arm
- * retires nothing more. A consumer only after the pop leaves the load
- * outstanding until the pop, which drains it; so does the skipped-arm path,
- * whose jump lands on that pop's carrier. */
+/* A forward if keeps the load in flight into its arm, and the arm's pop joins
+ * instead of draining: the consumer, in the arm or after the pop, waits for
+ * the load itself, and nothing drains. */
 TEST_F(AGX3PackBinary, ForwardIfKeepsLoadsInFlightIntoTheArm)
 {
    for (int e = 0; e < 2; ++e) {
@@ -8080,17 +8083,14 @@ TEST_F(AGX3PackBinary, ForwardIfKeepsLoadsInFlightIntoTheArm)
          agx_builder *b = builder(enc);
          build_load_then_if(b, arm_uses, false);
          EXPECT_FALSE(pack(b).empty());
-         /* The consumer in the arm waited; the pop still drains on the
-          * skip path's behalf only when something is outstanding there. */
-         EXPECT_EQ(agx3_native_stats.cf_drains, arm_uses ? 0u : 1u);
+         EXPECT_EQ(agx3_native_stats.cf_drains, 0u);
       }
    }
 }
 
-/* The skip jump must land ahead of the pop's retire carrier: the carrier
- * is the first thing in the pop block, and the branch displacement reaches
- * exactly the block start. */
-TEST_F(AGX3PackBinary, SkippedArmLandsOnTheRetireCarrier)
+/* The skip jump lands at the pop block's start, which is now its cndend: the
+ * joined pop emits no carrier, and nothing drains. */
+TEST_F(AGX3PackBinary, SkippedArmLandsOnTheJoinedPop)
 {
    for (int e = 0; e < 2; ++e) {
       const enum agx_isa_encoding enc =
@@ -8103,18 +8103,87 @@ TEST_F(AGX3PackBinary, SkippedArmLandsOnTheRetireCarrier)
       agx_foreach_block(b->shader, block)
          pop = block;
       ASSERT_NE(pop, nullptr);
-      /* The pop block starts with the carrier, not the cndend: a jump to
-       * the block start runs the carrier. The cndend follows it. */
       uint8_t cndend[AGX3_CF_MAX_LENGTH], len = 0;
       ASSERT_TRUE(agx3_cf_cndend(enc, 1, cndend, &len));
       ASSERT_LE((size_t)pop->offset + len, bin.size());
-      EXPECT_NE(memcmp(bin.data() + pop->offset, cndend, len), 0);
-      bool cndend_follows = false;
-      for (size_t at = pop->offset + 1; at + len <= bin.size(); ++at)
-         cndend_follows |= !memcmp(bin.data() + at, cndend, len);
-      EXPECT_TRUE(cndend_follows);
-      EXPECT_EQ(agx3_native_stats.cf_drains, 1u);
-      EXPECT_GE(agx3_native_stats.wait_carriers, 1u);
+      EXPECT_EQ(memcmp(bin.data() + pop->offset, cndend, len), 0);
+      EXPECT_EQ(agx3_native_stats.cf_drains, 0u);
+   }
+}
+
+/* Build: if (r0 < r2) { r6 = load } else { r6 = load } store r6; with each
+ * arm's exec-none skip. */
+static void
+build_if_else_loads(agx_builder *b)
+{
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *then_arm = agx_test_block(b->shader);
+   agx_block *else_arm = agx_test_block(b->shader);
+   agx_block *pop = agx_test_block(b->shader);
+   agx_index value = agx_register(6, AGX_SIZE_32);
+   agx_begin_cf(b);
+   agx_if_icmp(b, agx_register(0, AGX_SIZE_32), agx_register(2, AGX_SIZE_32),
+               1, AGX_ICOND_ULT, false, else_arm);
+   agx_jmp_exec_none(b, else_arm);
+   agx_block_add_successor(entry, then_arm);
+   agx_block_add_successor(entry, else_arm);
+
+   agx_builder tb = agx_init_builder(b->shader, agx_after_block(then_arm));
+   agx_device_load_to(&tb, value, agx_uniform(0, AGX_SIZE_64),
+                      agx_immediate(0), AGX_FORMAT_I32, 1, 0, false);
+   agx_block_add_successor(then_arm, else_arm);
+
+   agx_builder eb = agx_init_builder(b->shader, agx_after_block(else_arm));
+   agx_else_fcmp(&eb, agx_zero(), agx_zero(), 1, AGX_FCOND_EQ, false, pop);
+   agx_jmp_exec_none(&eb, pop);
+   agx_device_load_to(&eb, value, agx_uniform(0, AGX_SIZE_64),
+                      agx_immediate(4), AGX_FORMAT_I32, 1, 0, false);
+   agx_block_add_successor(else_arm, pop);
+
+   agx_builder pb = agx_init_builder(b->shader, agx_after_block(pop));
+   agx_pop_exec(&pb, 1);
+   agx_device_store(&pb, value, agx_uniform(0, AGX_SIZE_64), agx_immediate(8),
+                    AGX_FORMAT_I32, 1, 0, false);
+   agx_stop(&pb);
+}
+
+/* Joined arms: neither the else nor the pop drains. The second arm's load
+ * waits out the first's before redefining r6, and the store after the pop
+ * waits for whichever arm's load ran. */
+TEST_F(AGX3PackBinary, IfElseArmsJoinWithoutDrains)
+{
+   for (int e = 0; e < 2; ++e) {
+      agx_builder *b =
+         builder(e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B);
+      build_if_else_loads(b);
+      EXPECT_FALSE(pack(b).empty());
+      EXPECT_EQ(agx3_native_stats.cf_drains, 0u);
+   }
+}
+
+/* agx3_pack_program() keeps the join only where it is no worse than the
+ * arms draining at their ends. */
+TEST_F(AGX3PackBinary, ArmJoinNeverGrowsTheProgram)
+{
+   for (int e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      size_t sizes[2];
+      for (unsigned off = 0; off < 2; ++off) {
+         agx_builder *b = builder(enc);
+         build_if_else_loads(b);
+         struct util_dynarray bin;
+         util_dynarray_init(&bin, mem_ctx);
+         if (off) {
+            b->shader->agx3_arm_join_off = true;
+            ASSERT_TRUE(agx3_pack_binary(b->shader, &bin));
+         } else {
+            ASSERT_TRUE(agx3_pack_program(b->shader, &bin));
+         }
+         sizes[off] = bin.size;
+      }
+      EXPECT_LE(sizes[0], sizes[1]) << enc;
    }
 }
 
