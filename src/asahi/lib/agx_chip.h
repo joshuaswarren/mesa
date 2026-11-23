@@ -176,7 +176,11 @@ enum agx_chip_record {
    AGX_RECORD_HAL300_NATIVE_CAPTURE = 1 << 20,
    AGX_RECORD_PPP_VIEWPORT = 1 << 21,
    AGX_RECORD_PPP_W_CLAMP_CULL2 = 1 << 22,
+   AGX_RECORD_VDM_STREAM_LINK_AGX2 = 1 << 23,
 };
+
+/* AGX2 chips that use the genxml 8-byte non-returning VDM_STREAM_LINK. */
+#define AGX_RECORDS_AGX2 (AGX_RECORD_VDM_STREAM_LINK_AGX2)
 
 /* The records of every byte-witnessed G15, G16 and G17 identity. */
 #define AGX_RECORDS_G15_G17                                                    \
@@ -295,10 +299,14 @@ enum agx_chip_quirk {
  * submission model is unknown.
  */
 #define AGX_CHIPS(X, ...)                                                      \
-   X(G13G, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
-   X(G13X, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
-   X(G14G, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
-   X(G14X, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
+   X(G13G, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, AGX_RECORDS_AGX2,   \
+     0, __VA_ARGS__)                                                           \
+   X(G13X, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, AGX_RECORDS_AGX2,   \
+     0, __VA_ARGS__)                                                           \
+   X(G14G, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, AGX_RECORDS_AGX2,   \
+     0, __VA_ARGS__)                                                           \
+   X(G14X, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, AGX_RECORDS_AGX2,   \
+     0, __VA_ARGS__)                                                           \
    X(G15P, AGX2, AGX2, UNKNOWN, UNKNOWN, UNKNOWN, NONE, UNKNOWN, NONE, 0, 0,   \
      __VA_ARGS__)                                                              \
    X(G15G, AGX3, AGX3B, G15, 9, GEN4, GPU0, CLASSIC, NATIVE_AGX3,              \
@@ -434,6 +442,15 @@ agx_chip_has_record(enum agx_chip chip, unsigned record)
 {
    return false AGX_CHIPS(AGX_CHIP_ROW_TEST, chip, AGX_CHIP_ROW_HAS_RECORD,
                           record);
+}
+
+/* Whether a chip is witnessed to take an 8-byte non-returning VDM stream link
+ * (genxml AGX_VDM_STREAM_LINK on AGX2 or agx_vdm_stream_link_core on AGX3). */
+static inline bool
+agx_chip_vdm_stream_link_supported(enum agx_chip chip)
+{
+   return agx_chip_has_record(chip, AGX_RECORD_VDM_STREAM_LINK |
+                                       AGX_RECORD_VDM_STREAM_LINK_AGX2);
 }
 
 /* G17P keeps every colour target in the imageblock past 64 bytes a sample:
