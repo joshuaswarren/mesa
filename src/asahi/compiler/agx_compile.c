@@ -10884,6 +10884,16 @@ pre_preamble:
       NIR_PASS(late_progress, nir, agx_nir_fold_ubyte_to_float);
    }
 
+   /* Factor shared constant multipliers and shifts in integer add trees before
+    * multiply-add fusion turns them into opaque imadshl_agx instructions.
+    */
+   bool factored = false;
+   NIR_PASS(factored, nir, agx_nir_opt_factor_const_mul);
+   if (factored) {
+      late_progress = true;
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+
    /* Fuse add/sub/multiplies/shifts after running opt_algebraic_late to fuse
     * isub but before shifts are lowered.
     */
@@ -10919,6 +10929,11 @@ pre_preamble:
    /* Do remaining lowering late, since this inserts &s for shifts so we want to
     * do it after fusing constant shifts. Constant folding will clean up.
     */
+   /* Share shifted high-half bitfield extracts on AGX3 (both AGX3B and AGX3C)
+    * before extract16_bfe folds them into separate IC-pipe bfeil ops. */
+   if (byte_indices || m5)
+      NIR_PASS(late_progress, nir, agx_nir_opt_half_bitfield_extract);
+
    /* Must precede agx_nir_lower_algebraic_late, which rewrites extract_u16
     * into u2u32(unpack_32_2x16_split_y) (the pass also matches that form). */
    NIR_PASS(late_progress, nir, agx_nir_fold_extract16_bfe);

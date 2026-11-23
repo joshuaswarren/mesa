@@ -55,6 +55,7 @@ bool agx_nir_lower_g17p_1x_tile_samples(struct nir_shader *s);
 bool agx_nir_fold_d3d_float_to_int(struct nir_shader *shader);
 bool agx_nir_fold_pixel_coord(struct nir_shader *shader);
 bool agx_nir_fold_extract16_bfe(struct nir_shader *shader);
+bool agx_nir_opt_half_bitfield_extract(struct nir_shader *shader);
 bool agx_nir_cleanup_amul(struct nir_shader *shader);
 bool agx_nir_fuse_lea(struct nir_shader *shader);
 bool agx_nir_lower_lea(struct nir_shader *shader);
@@ -65,6 +66,7 @@ bool agx_nir_opt_flatten_loads(struct nir_shader *shader, unsigned limit,
                                unsigned max_loads);
 bool agx_nir_opt_sink_loop_sample_uses(struct nir_shader *shader);
 bool agx_nir_opt_hoist_loop_samples(struct nir_shader *shader);
+bool agx_nir_opt_factor_const_mul(struct nir_shader *shader);
 bool agx_nir_fuse_algebraic_late(struct nir_shader *shader);
 bool agx_nir_fuse_doubled_add(struct nir_shader *shader);
 bool agx_nir_fold_byte_to_float(struct nir_shader *shader);
