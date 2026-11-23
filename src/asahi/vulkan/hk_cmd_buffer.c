@@ -664,13 +664,15 @@ hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   /* A G17P compute root consumes a whole command BO. Keep control-stream
-    * roots on their own bump cursor so allocating one cannot evict a partially
-    * used main-upload BO and move that allocator's slow path into the next
+   /* Keep control-stream roots on their own bump cursor whenever the
+    * control-stream allocation layout splits compact roots from general upload
+    * memory, so allocating a VDM or CDM root cannot evict a partially used
+    * main-upload BO and move that allocator's slow path into the next
     * application command. Ownership remains on the ordinary main BO list. */
-   struct hk_uploader *uploader = agx_chip_native_agx3(dev->dev.chip)
-                                     ? &cmd->uploader.streams
-                                     : &cmd->uploader.main;
+   struct hk_uploader *uploader =
+      hk_cs_uses_dedicated_stream_uploader(dev->dev.chip)
+         ? &cmd->uploader.streams
+         : &cmd->uploader.main;
    return hk_pool_alloc_from(cmd, uploader, size, alignment, HK_CMD_BO_MAIN);
 }
 
@@ -1498,20 +1500,23 @@ hk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
 
 }
 
-/* Only ordinary G17P graphics programs whose descriptor values are fetched
- * through the root/table in GPU memory qualify.  CPU-decoded combined sampler
- * programs and variant selection retain the existing publication path.
+/* Only ordinary graphics programs whose descriptors are fetched from GPU
+ * memory through an Ioto-published immutable root table qualify for no-op
+ * bind retention.  CPU-decoded combined sampler programs, sample-variant
+ * shaders, and non-ordinary pre-raster stages retain conservative invalidation.
  */
 static bool
 hk_g17p_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
                                   const struct hk_descriptor_state *desc)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   if (!agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) ||
+   if (!hk_chip_uses_ioto_descriptor_root(hk_cmd_buffer_device(cmd)->dev.chip) ||
        desc != &gfx->descriptors ||
        gfx->shaders[MESA_SHADER_GEOMETRY] ||
        gfx->shaders[MESA_SHADER_TESS_CTRL] ||
-       gfx->shaders[MESA_SHADER_TESS_EVAL])
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_MESH] ||
+       gfx->shaders[MESA_SHADER_TASK])
       return false;
 
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
