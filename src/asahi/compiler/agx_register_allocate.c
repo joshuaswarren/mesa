@@ -267,9 +267,18 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
       agx_print_shader(ctx, stdout);
    }
 
-   uint8_t *widths = calloc(ctx->alloc, sizeof(uint8_t));
-   enum ra_class *classes = calloc(ctx->alloc, sizeof(enum ra_class));
-   BITSET_WORD *dest_read = agx_values_read(ctx);
+   static_assert(RA_CLASSES <= UINT8_MAX, "ra_class fits in uint8_t");
+   uint8_t stack_widths[1024];
+   uint8_t stack_classes[1024];
+   uint8_t *widths =
+      ctx->alloc <= 1024 ? stack_widths : calloc(ctx->alloc, sizeof(uint8_t));
+   uint8_t *classes =
+      ctx->alloc <= 1024 ? stack_classes : calloc(ctx->alloc, sizeof(uint8_t));
+   if (ctx->alloc <= 1024) {
+      memset(widths, 0, ctx->alloc * sizeof(uint8_t));
+      memset(classes, 0, ctx->alloc * sizeof(uint8_t));
+   }
+   BITSET_WORD *dest_read = NULL;
 
    agx_foreach_instr_global(ctx, I) {
       if (remat && (I->op == AGX_OPCODE_MOV_IMM ||
@@ -376,8 +385,12 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
             late_kill_count += (pot_width - real_width);
 
             /* An unread M5 query-entry result dies right after its write. */
-            if (I->op == AGX_OPCODE_ENTER_QUERY_M5 && !BITSET_TEST(dest_read, I->dest[d].value))
-               late_kill_count += real_width;
+            if (I->op == AGX_OPCODE_ENTER_QUERY_M5) {
+               if (!dest_read)
+                  dest_read = agx_values_read(ctx);
+               if (!BITSET_TEST(dest_read, I->dest[d].value))
+                  late_kill_count += real_width;
+            }
          }
 
          max_demand = MAX2(demand, max_demand);
@@ -387,8 +400,10 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
    }
 
    free(dest_read);
-   free(widths);
-   free(classes);
+   if (widths != stack_widths)
+      free(widths);
+   if (classes != stack_classes)
+      free(classes);
    return max_demand;
 }
 
