@@ -1636,9 +1636,7 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
       for (unsigned i = 0; i < state->nr_cbufs; ++i) {
          formats[i] = state->cbufs[i].format;
          if (state->cbufs[i].texture &&
-             ail_is_level_logically_compressed(
-                &agx_resource(state->cbufs[i].texture)->layout,
-                state->cbufs[i].level))
+             agx_resource(state->cbufs[i].texture)->layout.compressed)
             any_compressed = true;
       }
 
@@ -1654,8 +1652,7 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
 
                struct agx_resource *rsrc = agx_resource(state->cbufs[i].texture);
                if (!(rsrc->base.b.bind & PIPE_BIND_SHARED) &&
-                   ail_is_level_logically_compressed(&rsrc->layout,
-                                                     state->cbufs[i].level))
+                   rsrc->layout.compressed)
                   agx_decompress(ctx, rsrc, "Render target spilled");
             }
          }

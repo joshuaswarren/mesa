@@ -673,8 +673,55 @@ test_g17p_compressed_render_target(void)
          CHECK(memcmp(native.opaque, expected_ms, sizeof(expected_ms)) == 0);
       }
 
-      /* Outside the compressed single-layer 2D and 2x/4x 2D multisample
-       * packets nothing is encoded. */
+      /* Gen9 compressed 2D mip chains preserve the compressed payload and
+       * apply the Gen9 mip extension (word0 bit58, word2[51:44]). */
+      for (unsigned level = 0; level < 5; ++level) {
+         rt = original;
+         rt.level = level;
+         rt.levels = 5;
+         rt.unk_mipmapped = true;
+         uint64_t expected_mip[4];
+         memcpy(expected_mip, targets[i].words, sizeof(expected_mip));
+         expected_mip[0] |= UINT64_C(1) << 58;
+         expected_mip[2] |= ((uint64_t)level << 44) | (UINT64_C(4) << 48);
+         memset(&native, 0xa5, sizeof(native));
+         CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
+                                           &rt));
+         CHECK(memcmp(native.opaque, expected_mip, sizeof(expected_mip)) == 0);
+      }
+
+      /* Gen9 compressed single-level 2D array and 3D packets keep the 2D
+       * compressed payload and set dimension (3 or 5), layers-1 at
+       * word1[59:44], and page_aligned_layers at word1[60]. */
+      static const struct {
+         enum agx_texture_dimension dim;
+         uint64_t dim_bits;
+         unsigned layers;
+      } layered_cases[] = {
+         {AGX_TEXTURE_DIMENSION_2D_ARRAY, 3u, 2u},
+         {AGX_TEXTURE_DIMENSION_3D, 5u, 4u},
+      };
+      for (unsigned c = 0; c < ARRAY_SIZE(layered_cases); ++c) {
+         rt = original;
+         rt.dimension = layered_cases[c].dim;
+         rt.layers = layered_cases[c].layers;
+         rt.page_aligned_layers = true;
+         uint64_t expected_layered[4];
+         memcpy(expected_layered, targets[i].words, sizeof(expected_layered));
+         expected_layered[0] =
+            (expected_layered[0] & ~UINT64_C(0xf)) | layered_cases[c].dim_bits;
+         expected_layered[1] |=
+            ((uint64_t)(layered_cases[c].layers - 1u) << 44) |
+            (UINT64_C(1) << 60);
+         memset(&native, 0xa5, sizeof(native));
+         CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
+                                           &rt));
+         CHECK(memcmp(native.opaque, expected_layered,
+                      sizeof(expected_layered)) == 0);
+      }
+
+      /* Outside the proven compressed 2D (with mips), single-level 2D array /
+       * 3D, and 2x/4x 2D multisample packets nothing is encoded. */
       rt = original;
       rt.acceleration_buffer = 0;
       CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
@@ -686,6 +733,15 @@ test_g17p_compressed_render_target(void)
       rt = original;
       rt.dimension = AGX_TEXTURE_DIMENSION_2D_ARRAY;
       rt.layers = 2;
+      rt.levels = 5;
+      rt.unk_mipmapped = true;
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
+                                         &rt));
+      rt = original;
+      rt.dimension = AGX_TEXTURE_DIMENSION_3D;
+      rt.layers = 4;
+      rt.levels = 5;
+      rt.unk_mipmapped = true;
       CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
                                          &rt));
       rt = original;

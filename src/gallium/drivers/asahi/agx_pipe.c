@@ -475,13 +475,17 @@ agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
           !(templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DEPTH_STENCIL));
 }
 
-/* G17P compresses a private, single-level, single-layer 1x/2x/4x 2D colour
- * image of agx_g17p_compression_color_format(): written by the compressed
- * Gen9 2D or 2x/4x multisample PBE (end-of-tile stores, blits, staging
- * uploads) and read by the compressed texture descriptor. Nothing
- * decompresses such an image in place: it is neither shared nor scanned out,
- * so a spilling MRT framebuffer, feedback loop, or shader-image binding
- * reallocates it uncompressed via agx_decompress().
+/* G17P compresses private colour images matching the hardware-verified Gen9
+ * compressed PBE and texture shapes:
+ *   - 1x single-layer 2D (single-level or mipmapped, up to 16 levels):
+ *     <= 8-byte formats (agx_g17p_compression_color_format()) and 16-byte
+ *     RGBA32 formats (agx_g17p_compression_color_format_16b());
+ *   - 2x/4x multisample single-level, single-layer 2D: <= 8-byte formats;
+ *   - 1x single-level 2D array and 3D: <= 8-byte formats.
+ *
+ * Nothing decompresses such an image in place: it is neither shared nor
+ * scanned out, so a spilling MRT framebuffer, feedback loop, or shader-image
+ * binding reallocates it uncompressed via agx_decompress().
  *
  * As with depth above, width0/height0 >= 16 is intentionally kept in pixels
  * rather than samples to leave tiny sub-16px 2x/4x targets uncompressed.
@@ -490,15 +494,38 @@ static bool
 agx_g17p_private_compression_allowed(const struct agx_device *dev,
                                      const struct pipe_resource *templ)
 {
-   return dev->chip == AGX_CHIP_G17P && templ->target == PIPE_TEXTURE_2D &&
-          templ->depth0 == 1 && templ->array_size <= 1 &&
-          templ->last_level == 0 &&
-          (templ->nr_samples <= 1 || templ->nr_samples == 2 ||
-           templ->nr_samples == 4) &&
-          templ->width0 >= 16 && templ->height0 >= 16 &&
-          !(templ->bind &
-            ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)) &&
-          agx_g17p_compression_color_format(templ->format);
+   if (dev->chip != AGX_CHIP_G17P ||
+       templ->width0 < 16 || templ->height0 < 16 ||
+       (templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)))
+      return false;
+
+   const bool color_le8b = agx_g17p_compression_color_format(templ->format);
+   const bool color_16b = agx_g17p_compression_color_format_16b(templ->format);
+   if (!color_le8b && !color_16b)
+      return false;
+
+   const bool single_sample = templ->nr_samples <= 1;
+   if (templ->target == PIPE_TEXTURE_2D) {
+      if (templ->depth0 != 1 || templ->array_size > 1)
+         return false;
+
+      if (single_sample)
+         return templ->last_level < 16;
+
+      return color_le8b && templ->last_level == 0 &&
+             (templ->nr_samples == 2 || templ->nr_samples == 4);
+   }
+
+   if (!color_le8b || !single_sample || templ->last_level != 0)
+      return false;
+
+   if (templ->target == PIPE_TEXTURE_2D_ARRAY)
+      return templ->depth0 == 1 && templ->array_size >= 1;
+
+   if (templ->target == PIPE_TEXTURE_3D)
+      return templ->array_size <= 1 && templ->depth0 >= 1;
+
+   return false;
 }
 
 static bool
