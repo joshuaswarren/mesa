@@ -5693,7 +5693,9 @@ TEST(NativeForms, M5EmptyMeshTopology)
                        .write_mask=1, .align_mul=4);
       nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 0),
          nir_imm_int(&b, 0), nir_undef(&b, 1, 32));
-      ASSERT_TRUE(agx_nir_m5_canonicalize_empty_mesh(b.shader));
+      bool canonicalized = false;
+      NIR_PASS(canonicalized, b.shader, agx_nir_m5_canonicalize_empty_mesh);
+      ASSERT_TRUE(canonicalized);
       EXPECT_EQ(b.shader->info.mesh.primitive_type, MESA_PRIM_TRIANGLES);
       ASSERT_TRUE(agx_nir_lower_m5_mesh_triangle_probe(b.shader));
       agx_preprocess_nir(b.shader);
