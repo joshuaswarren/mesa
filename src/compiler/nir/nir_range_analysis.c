@@ -1414,6 +1414,14 @@ process_fp_query(struct analysis_state *state, struct analysis_query *aq, uint32
 fp_class_mask
 nir_analyze_fp_class(nir_fp_analysis_state *fp_state, const nir_def *def)
 {
+   if (unlikely(!fp_state->bitset)) {
+      /* Over-allocate, so that we can keep using the allocated table memory
+       * even when new SSA values are added. */
+      fp_state->size = fp_state->impl->ssa_alloc + fp_state->impl->ssa_alloc / 4u;
+      fp_state->bitset = calloc(BITSET_BYTES(fp_state->size), 1);
+      fp_state->arr = malloc(fp_state->size * sizeof(uint16_t));
+   }
+
    struct fp_query query_alloc[64];
    uint32_t result_alloc[64];
 
@@ -1437,18 +1445,19 @@ nir_create_fp_analysis_state(nir_function_impl *impl)
 {
    nir_fp_analysis_state state;
    state.impl = impl;
-   /* Over-allocate, so that we can keep using the allocated table memory
-    * even when new SSA values are added. */
-   state.size = (impl->ssa_alloc + impl->ssa_alloc / 4u);
+   state.size = 0;
    state.max = -1;
-   state.bitset = calloc(BITSET_BYTES(state.size), 1);
-   state.arr = malloc(state.size * sizeof(uint16_t));
+   state.bitset = NULL;
+   state.arr = NULL;
    return state;
 }
 
 void
 nir_invalidate_fp_analysis_state(nir_fp_analysis_state *state)
 {
+   if (!state->bitset)
+      return;
+
    if (state->impl->ssa_alloc > state->size) {
       state->size = state->impl->ssa_alloc + state->impl->ssa_alloc / 4u;
 
