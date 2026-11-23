@@ -17,6 +17,7 @@ libasahi_agx_files = files(
   'agx_nir_opt_factor_const_mul.c',
   'agx_nir_opt_half_bitfield_extract.c',
   'agx_nir_opt_flatten_loads.c',
+  'agx_nir_opt_factor_loop_mac.c',
   'agx_nir_opt_select_load.c',
   'agx_nir_opt_licm.c',
   'agx_nir_opt_sink_loop_sample_uses.c',
@@ -911,6 +912,19 @@ if with_tests
     ),
     suite : ['asahi'],
   )
+  test(
+    'agx_nir_factor_loop_mac',
+    executable(
+      'agx_nir_factor_loop_mac_test',
+      files('test/test-factor-loop-mac.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
   test(
     'agx_nir_sink_loop_sample_uses',
     executable(
