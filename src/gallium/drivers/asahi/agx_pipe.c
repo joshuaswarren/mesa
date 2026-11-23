@@ -2985,23 +2985,22 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
 
    caps->max_vertex_element_src_offset = 0xffff;
 
-   /* On AGX3, advertising blit-based transfers routes a format-mismatched
-    * glReadPixels through u_blitter.  In particular, the WSI-native
-    * B8G8R8A8_UNORM -> API R8G8B8A8_UNORM conversion silently returns zero on
-    * G17P even though the same drawable is byte-exact through a dma-buf CPU
-    * map after both CPU upload and GPU clear.  Keep using the ordinary mapped
-    * transfer path, which performs the format conversion on the CPU, until
-    * the AGX3 render-blitter pixel path is hardware-grounded.
-    *
-    * This is correctness-critical for every default EGL surface: the DRI
-    * pbuffer/window colour buffer is BGRA while GLES glReadPixels(GL_RGBA)
-    * requests RGBA.  AGX2 retains its established accelerated path.
+   /* Enable blit-based texture transfers on AGX2 and Gen9 AGX3, whose PBE
+    * encoders support mipmapped, layered, sRGB, and linear transfer targets.
+    * Gen10 PBE currently rejects sRGB targets on all Gen10 parts, mipmapped
+    * targets on non-G18 Gen10, and linear layered targets on G18, so a blit
+    * transfer into those shapes would drop its render batch while reporting
+    * success.
     */
+   const enum agx_descriptor_generation desc_gen =
+      agx_chip_descriptor_generation(dev->chip);
    caps->texture_transfer_modes =
-      agx_chip_command_stream_generation(agx_device(pscreen)->chip) ==
-            AGX_CS_GENERATION_AGX2
+      agx_gallium_descriptor_generation_is_agx2(desc_gen) ||
+            desc_gen == AGX_DESCRIPTOR_GENERATION_9
          ? PIPE_TEXTURE_TRANSFER_BLIT
          : PIPE_TEXTURE_TRANSFER_DEFAULT;
+
+   caps->invalidate_pbo_upload_destination = true;
 
    caps->device_type = PIPE_DEVICE_TYPE_INTEGRATED_GPU;
    caps->endianness = PIPE_ENDIAN_LITTLE;
