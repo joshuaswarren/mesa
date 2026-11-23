@@ -3908,6 +3908,7 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
    if (!agx_chip_native_or_m5(dev->dev.chip) ||
        cmd->in_meta || cs->stats.cmds == 0 || cmd->sync.pass_vdm != cs ||
        cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx ||
+       cmd->state.oq_pending_render ||
        cmd->uses_heap || cs->timestamp.start.handle ||
        cs->timestamp.end.handle) {
       if (msaa_enabled)
@@ -4401,7 +4402,8 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
     * bookkeeping changed except through hk_m5_pass_merge_barrier(). */
    if (cmd->in_meta || cmd->state.deferred_clear_count ||
        cmd->current_cs.gfx || cmd->current_cs.pre_gfx ||
-       cmd->current_cs.post_gfx || cmd->sync.in_pass ||
+       cmd->current_cs.post_gfx || cmd->state.oq_pending_render ||
+       cmd->sync.in_pass ||
        cmd->sync.pending_start_ts.handle)
       why = "state";
    else if (list_is_empty(&cmd->control_streams) ||

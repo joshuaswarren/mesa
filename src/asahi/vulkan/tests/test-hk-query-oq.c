@@ -112,6 +112,13 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    abort();
 }
 
+void
+hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
 /* The resolver reads only the chip from the device. */
 static enum agx_chip test_chip = AGX_CHIP_G17P;
 

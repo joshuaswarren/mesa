@@ -573,6 +573,8 @@ void
 hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                 uint8_t dst_kinds)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    cmd->sync.epoch++;
    if (!src_kinds || !dst_kinds)
       return;
@@ -621,6 +623,8 @@ void
 hk_sync_pass_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                      uint8_t dst_kinds)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    struct hk_sync_state *st = &cmd->sync;
    assert(st->in_pass);
    st->epoch++;
@@ -797,6 +801,8 @@ void
 hk_sync_after_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                      uint8_t dst_kinds)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    const unsigned sq = hk_sync_sq(cs);
    const struct hk_sync_dep dep = {.cut = cs};
 
@@ -1466,6 +1472,8 @@ hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
    struct hk_sync_state *st = &cmd->sync;
    if (!st->pending_start_ts.handle)
       return;
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
 
    const struct agx_timestamp_req req = st->pending_start_ts;
    const bool unordered = st->pending_start_ts_unordered;
@@ -1509,6 +1517,8 @@ void
 hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
                         struct agx_timestamp_req req)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    struct hk_sync_state *st = &cmd->sync;
    const uint8_t src_kinds = hk_sync_kinds_src(stage);
    struct hk_cs *gfx = cmd->current_cs.gfx;
@@ -1703,6 +1713,8 @@ hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 void
 hk_sync_heap_used(struct hk_cmd_buffer *cmd)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    struct hk_sync_state *st = &cmd->sync;
    st->heap_pass = true;
    st->epoch++;
@@ -1720,6 +1732,8 @@ hk_sync_heap_used(struct hk_cmd_buffer *cmd)
 void
 hk_sync_resolve_begin(struct hk_cmd_buffer *cmd)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    struct hk_sync_state *st = &cmd->sync;
    st->epoch++;
    st->internal[HK_SYNC_VDM] = (struct hk_sync_dep){

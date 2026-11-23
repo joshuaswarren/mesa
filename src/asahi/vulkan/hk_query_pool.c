@@ -414,14 +414,36 @@ static void
 hk_cmd_end_query_stamped(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                          uint32_t query)
 {
-   const uint32_t render_seq = cmd->current_cs.gfx->sync.seq;
+   struct hk_cs *render = cmd->current_cs.gfx;
+   const uint64_t offset_B = hk_query_available_offset(pool, query);
+
+   /* Fast path: stage up to 3 availability writes inline on the active render
+    * stream so single-render command buffers never allocate and discard a
+    * post_gfx CDM stream and its 64 KiB control-stream root. */
+   if (!cmd->current_cs.post_gfx &&
+       (!cmd->state.oq_pending_render ||
+        cmd->state.oq_pending_render == render) &&
+       render->oq_pending_count < ARRAY_SIZE(render->oq_pending) &&
+       offset_B <= UINT32_MAX) {
+      render->oq_pending[render->oq_pending_count++] = (struct hk_oq_pending){
+         .avail_addr = hk_query_available_addr(pool, query),
+         .handle = pool->handle,
+         .offset_B = (uint32_t)offset_B,
+         .avail_size = (uint8_t)hk_query_available_size(pool),
+      };
+      cmd->state.oq_pending_render = render;
+      return;
+   }
+
+   hk_flush_oq_pending(cmd);
+
+   const uint32_t render_seq = render->sync.seq;
    hk_queue_query_available_write(cmd, pool, query, 1, true);
 
    struct hk_cs *cs = cmd->current_cs.post_gfx;
    if (!cs || vk_command_buffer_has_error(&cmd->vk))
       return;
 
-   const uint64_t offset_B = hk_query_available_offset(pool, query);
    if (offset_B > UINT32_MAX)
       return;
 
@@ -434,6 +456,50 @@ hk_cmd_end_query_stamped(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
       .render_seq = render_seq,
    };
    util_dynarray_append(&cs->oq_stamps, stamp);
+}
+
+void
+hk_resolve_pending_oq_available(struct hk_cmd_buffer *cmd)
+{
+   struct hk_cs *render = cmd->state.oq_pending_render;
+   if (!render)
+      return;
+
+   /* Any later stream or sync record flushed oq_pending_render into post_gfx,
+    * so nothing depends on this render. Verify no tail requirement names it,
+    * then stamp its free retirement slots directly (same slot order as
+    * hk_stamp_oq_available()). */
+   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+      const struct hk_cs *cut = cmd->sync.req[k][HK_SYNC_VDM].cut;
+      if (cut && cut->sync.seq >= render->sync.seq) {
+         hk_flush_oq_pending(cmd);
+         return;
+      }
+   }
+
+   const unsigned order[] = {1, 2, 0};
+   unsigned free_slots[ARRAY_SIZE(order)], nfree = 0;
+   for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
+      const unsigned slot = order[i];
+      if ((slot == 0 && render->timestamp.start.handle) ||
+          render->oq_stamp[slot].handle)
+         continue;
+      free_slots[nfree++] = slot;
+   }
+
+   if (nfree < render->oq_pending_count) {
+      hk_flush_oq_pending(cmd);
+      return;
+   }
+
+   for (unsigned i = 0; i < render->oq_pending_count; ++i) {
+      render->oq_stamp[free_slots[i]] = (struct agx_timestamp_req){
+         .handle = render->oq_pending[i].handle,
+         .offset_B = render->oq_pending[i].offset_B,
+      };
+   }
+   render->oq_pending_count = 0;
+   cmd->state.oq_pending_render = NULL;
 }
 
 /* Mark the stream that received a query copy or reset (query_access), and

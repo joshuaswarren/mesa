@@ -479,6 +479,13 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    abort();
 }
 
+void
+hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
 /* Record a real full-frame pass with a sparse-mask preservation footprint.
  * Layer ranges describe BG/EOT's physical access, not just enabled views. */
 static struct hk_cs *
