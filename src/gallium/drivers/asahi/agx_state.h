@@ -627,6 +627,12 @@ struct agx_batch {
     * class, DRM_ASAHI_RENDER_SHADER_WRITES). */
    bool m5_shader_writes;
 
+   /* Conservative vertex-stage dependency and primitive-count tracking for
+    * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS and DRM_ASAHI_RENDER_FEW_PRIMITIVES. */
+   bool vs_needs_render_barrier;
+   bool prims_unknown;
+   uint32_t known_prims;
+
    uint64_t uploaded_clear_color[PIPE_MAX_COLOR_BUFS];
    union pipe_color_union clear_color[PIPE_MAX_COLOR_BUFS];
    double clear_depth;
@@ -1431,7 +1437,40 @@ struct agx_resource {
     * times multiplied by the resource size.
     */
    size_t shadowed_bytes;
+
+   /* Set once any render batch in this context writes this resource (as a
+    * render target or via fragment shader image/SSBO stores). Used to avoid
+    * overlapping a later batch's vertex stage ahead of a render it reads. */
+   bool render_written;
 };
+
+static inline void
+agx_batch_note_vs_read(struct agx_batch *batch, struct agx_resource *rsrc)
+{
+   if (!rsrc || batch->vs_needs_render_barrier)
+      return;
+
+   if (rsrc->render_written) {
+      batch->vs_needs_render_barrier = true;
+      return;
+   }
+
+   if (rsrc->bo) {
+      if (rsrc->bo->flags & AGX_BO_SHARED) {
+         batch->vs_needs_render_barrier = true;
+         return;
+      }
+
+      uint64_t writer = p_atomic_read_relaxed(&rsrc->bo->writer);
+      if (writer && agx_bo_writer_queue(writer) != batch->ctx->queue_id) {
+         batch->vs_needs_render_barrier = true;
+         return;
+      }
+   }
+
+   if (rsrc->separate_stencil)
+      agx_batch_note_vs_read(batch, rsrc->separate_stencil);
+}
 
 static inline struct agx_resource *
 agx_resource(struct pipe_resource *pctx)

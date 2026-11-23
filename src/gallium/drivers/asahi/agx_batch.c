@@ -440,6 +440,9 @@ agx_batch_init(struct agx_context *ctx,
    util_dynarray_init(&batch->m5_compute_programs, ctx);
    memset(&batch->m5_tile_program, 0, sizeof(batch->m5_tile_program));
    batch->m5_shader_writes = false;
+   batch->vs_needs_render_barrier = false;
+   batch->prims_unknown = false;
+   batch->known_prims = 0;
    batch->faulttrace_seqid = 0;
 
    batch->clear = 0;
@@ -1118,6 +1121,8 @@ agx_batch_writes_internal(struct agx_batch *batch, struct agx_resource *rsrc,
                                   false, start, end);
 
    BITSET_SET(rsrc->data_valid, level);
+   if (!agx_batch_is_compute(batch))
+      rsrc->render_written = true;
 
    /* Nothing to do if we're already writing */
    if (writer == batch) {
@@ -2345,6 +2350,10 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       struct drm_asahi_cmd_header header = agx_cmd_header(
          false, compute_here ? DRM_ASAHI_BARRIER_NONE : 0,
          compute_here ? compute_commands : 0);
+      if ((dev->params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+          header.vdm_barrier != DRM_ASAHI_BARRIER_NONE &&
+          !batch->vs_needs_render_barrier)
+         render->flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
       /* G18G takes the full drm_asahi_cmd_render. */
       header.size = dev->chip == AGX_CHIP_G18G
                        ? sizeof(struct drm_asahi_cmd_render)
@@ -2916,6 +2925,10 @@ agx_submit_pending(struct agx_context *ctx)
          struct drm_asahi_cmd_header header = agx_cmd_header(
             false, batch_compute_cmds ? DRM_ASAHI_BARRIER_NONE : nr_vdm,
             nr_cdm);
+         if ((dev->params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+             header.vdm_barrier != DRM_ASAHI_BARRIER_NONE &&
+             !batch->vs_needs_render_barrier)
+            entry->render.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
          header.size = dev->chip == AGX_CHIP_G18G
                           ? sizeof(struct drm_asahi_cmd_render)
                           : agx_render_command_size(dev);

@@ -1889,6 +1889,11 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    if ((dev->debug & AGX_DBG_NOCLUSTER) && !agx_chip_native_hal200(dev->chip))
       c->flags |= DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING;
 
+   if (agx_chip_native_or_m5(dev->chip) &&
+       (dev->params.features & DRM_ASAHI_FEATURE_FEW_PRIMITIVES) &&
+       !batch->prims_unknown && batch->known_prims <= 4)
+      c->flags |= DRM_ASAHI_RENDER_FEW_PRIMITIVES;
+
    c->bg.rsrc_spec = (uint32_t)pipeline_clear.rsrc_spec;
    c->eot.rsrc_spec = (uint32_t)pipeline_store.rsrc_spec;
    c->partial_bg.rsrc_spec = (uint32_t)pipeline_load.rsrc_spec;

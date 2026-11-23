@@ -143,6 +143,7 @@ struct coalesced_record {
    unsigned att_clears;
    uint16_t render_vdm_barriers[16];
    uint16_t render_cdm_barriers[16];
+   uint64_t render_flags[16];
    uint16_t compute_vdm_barriers[16];
    uint16_t compute_cdm_barriers[16];
 };
@@ -181,8 +182,10 @@ inspect_coalesced_submit(struct agx_device *dev, struct drm_asahi_submit *submit
       CHECK(h->size <= submit->cmdbuf_size - cursor - sizeof(*h));
       if (h->cmd_type == DRM_ASAHI_CMD_RENDER) {
          if (rec->renders < ARRAY_SIZE(rec->render_vdm_barriers)) {
+            const struct drm_asahi_cmd_render *rc = (const void *)(h + 1);
             rec->render_vdm_barriers[rec->renders] = h->vdm_barrier;
             rec->render_cdm_barriers[rec->renders] = h->cdm_barrier;
+            rec->render_flags[rec->renders] = rc->flags;
          }
          rec->renders++;
       } else if (h->cmd_type == DRM_ASAHI_CMD_COMPUTE) {
@@ -371,6 +374,129 @@ run_coalesced_tests(struct pipe_screen *screen)
       CHECK(!agx_batch_is_queued(b0) && !agx_batch_is_queued(b1));
       CHECK(!agx_batch_is_submitted(b0) && !agx_batch_is_submitted(b1));
       coalesced_fail = false;
+      pctx->destroy(pctx);
+   }
+
+   /* 5. DRM_ASAHI_RENDER_FRAGMENT_BARRIERS and DRM_ASAHI_RENDER_FEW_PRIMITIVES */
+   {
+      const uint64_t saved_features = dev->params.features;
+      struct pipe_context *pctx = screen->context_create(screen, NULL, 0);
+      CHECK(pctx);
+      struct agx_context *ctx = agx_context(pctx);
+      struct pipe_resource templ = {
+         .target = PIPE_TEXTURE_2D,
+         .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+         .width0 = 16,
+         .height0 = 16,
+         .depth0 = 1,
+         .array_size = 1,
+         .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+      };
+      struct pipe_resource *tex = screen->resource_create(screen, &templ);
+      CHECK(tex);
+      struct agx_resource *rsrc = agx_resource(tex);
+      CHECK(!rsrc->render_written);
+
+      struct pipe_framebuffer_state fb = {
+         .width = 16,
+         .height = 16,
+         .nr_cbufs = 1,
+         .cbufs[0] = {.texture = tex, .format = templ.format},
+      };
+      pctx->set_framebuffer_state(pctx, &fb);
+      struct drm_asahi_cmd_render r = {0};
+      struct drm_asahi_cmd_compute c = {0};
+
+      dev->params.features =
+         saved_features | DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS;
+      coalesced_calls = 0;
+      coalesced_fail = false;
+
+      /* Render 0 writes tex; no VS render-written dependency -> flag set. */
+      struct agx_batch *b0 = agx_get_batch(ctx);
+      b0->initialized = true;
+      agx_batch_writes(b0, rsrc, 0);
+      CHECK(rsrc->render_written);
+      agx_batch_queue_or_submit(ctx, b0, NULL, &r);
+
+      /* Render 1 reads render-written tex in VS -> flag suppressed. */
+      struct agx_batch *b1 = agx_get_batch(ctx);
+      agx_batch_note_vs_read(b1, rsrc);
+      CHECK(b1->vs_needs_render_barrier);
+      agx_batch_queue_or_submit(ctx, b1, NULL, &r);
+
+      /* Render 2 is mixed compute+render (vdm_barrier == NONE) -> flag clear. */
+      struct agx_batch *b2 = agx_get_batch(ctx);
+      agx_batch_queue_or_submit(ctx, b2, &c, &r);
+
+      pctx->flush(pctx, NULL, 0);
+      CHECK(coalesced_calls == 1 && coalesced_log[0].renders == 3);
+      CHECK(coalesced_log[0].render_flags[0] &
+            DRM_ASAHI_RENDER_FRAGMENT_BARRIERS);
+      CHECK(!(coalesced_log[0].render_flags[1] &
+              DRM_ASAHI_RENDER_FRAGMENT_BARRIERS));
+      CHECK(!(coalesced_log[0].render_flags[2] &
+              DRM_ASAHI_RENDER_FRAGMENT_BARRIERS));
+
+      /* Without kernel feature bit, flag stays clear. */
+      dev->params.features =
+         saved_features & ~DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS;
+      coalesced_calls = 0;
+      struct agx_batch *b3 = agx_get_batch(ctx);
+      agx_batch_queue_or_submit(ctx, b3, NULL, &r);
+      pctx->flush(pctx, NULL, 0);
+      CHECK(coalesced_calls == 1 && coalesced_log[0].renders == 1);
+      CHECK(!(coalesced_log[0].render_flags[0] &
+              DRM_ASAHI_RENDER_FRAGMENT_BARRIERS));
+
+      /* FEW_PRIMITIVES via real agx_cmdbuf() path on native/M5 chips. */
+      if (agx_chip_native_or_m5(dev->chip)) {
+         union pipe_color_union color = {.f = {0.25f, 0.5f, 0.75f, 1.0f}};
+         dev->params.features =
+            saved_features | DRM_ASAHI_FEATURE_FEW_PRIMITIVES;
+
+         coalesced_calls = 0;
+         pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &color, 0.0, 0);
+         ctx->batch->known_prims = 2;
+         ctx->batch->prims_unknown = false;
+         pctx->flush(pctx, NULL, 0);
+         CHECK(coalesced_calls == 1 && coalesced_log[0].renders == 1);
+         CHECK(coalesced_log[0].render_flags[0] &
+               DRM_ASAHI_RENDER_FEW_PRIMITIVES);
+
+         coalesced_calls = 0;
+         pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &color, 0.0, 0);
+         ctx->batch->known_prims = 5;
+         ctx->batch->prims_unknown = false;
+         pctx->flush(pctx, NULL, 0);
+         CHECK(coalesced_calls == 1 && coalesced_log[0].renders == 1);
+         CHECK(!(coalesced_log[0].render_flags[0] &
+                 DRM_ASAHI_RENDER_FEW_PRIMITIVES));
+
+         coalesced_calls = 0;
+         pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &color, 0.0, 0);
+         ctx->batch->known_prims = 1;
+         ctx->batch->prims_unknown = true;
+         pctx->flush(pctx, NULL, 0);
+         CHECK(coalesced_calls == 1 && coalesced_log[0].renders == 1);
+         CHECK(!(coalesced_log[0].render_flags[0] &
+                 DRM_ASAHI_RENDER_FEW_PRIMITIVES));
+
+         dev->params.features =
+            saved_features & ~DRM_ASAHI_FEATURE_FEW_PRIMITIVES;
+         coalesced_calls = 0;
+         pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &color, 0.0, 0);
+         ctx->batch->known_prims = 1;
+         ctx->batch->prims_unknown = false;
+         pctx->flush(pctx, NULL, 0);
+         CHECK(coalesced_calls == 1 && coalesced_log[0].renders == 1);
+         CHECK(!(coalesced_log[0].render_flags[0] &
+                 DRM_ASAHI_RENDER_FEW_PRIMITIVES));
+      }
+
+      dev->params.features = saved_features;
+      agx_sync_all(ctx, "coalesced flags");
+      pipe_resource_reference(&tex, NULL);
       pctx->destroy(pctx);
    }
 }
