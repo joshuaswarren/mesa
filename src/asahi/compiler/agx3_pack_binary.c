@@ -7640,7 +7640,7 @@ agx3_emit_scoped_barrier(struct util_dynarray *emission,
 {
    if (I->op != AGX_OPCODE_SCOPED_BARRIER_AGX3 ||
        I->nr_dests != 0 || I->nr_srcs != 0 ||
-       I->imm > AGX3_BARRIER_SCOPE_OBJECT_PAYLOAD_EXIT)
+       I->imm > AGX3_BARRIER_SCOPE_THREADGROUP_FENCE)
       return false;
 
    struct agx3_encoded_scoped_barrier encoded;
@@ -13230,6 +13230,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          e->drain = (I->op == AGX_OPCODE_SCOPED_BARRIER_AGX3 &&
                      (I->imm == AGX3_BARRIER_SCOPE_DEVICE ||
                       I->imm == AGX3_BARRIER_SCOPE_DEVICE_FENCE ||
+                      I->imm == AGX3_BARRIER_SCOPE_THREADGROUP_FENCE ||
                       agx3_m5_rendezvous_barrier(ctx, enc, I->imm))) ||
                     I->op == AGX_OPCODE_RT_BARRIER_GEN1 ||
                     I->op == AGX_OPCODE_FENCE_UVB_GEN1;
@@ -16902,6 +16903,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * issued writes, which the scheduler's drain cannot see. */
             const bool device = I->imm == AGX3_BARRIER_SCOPE_DEVICE ||
                                 I->imm == AGX3_BARRIER_SCOPE_DEVICE_FENCE;
+            /* A memory-only fence also orders the invocation's reads still
+             * in flight, as the device fence does. */
+            const bool fence = I->imm == AGX3_BARRIER_SCOPE_THREADGROUP_FENCE;
             /* An M5 workgroup barrier retires everything in flight, as the
              * planner's drain does for the operations it tracks. */
             const bool rendezvous =
@@ -16927,7 +16931,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                texture_wait ? image_write_slots & outstanding_here & ~1u : 0;
             const uint16_t retire =
                wait | image_wait |
-               ((device || rendezvous || g18g_texture_barrier)
+               ((device || fence || rendezvous || g18g_texture_barrier)
                    ? outstanding_here : 0);
             if (!agx3_emit_scoped_barrier(emission, enc, I, retire))
                AGX3_REFUSE(I);
