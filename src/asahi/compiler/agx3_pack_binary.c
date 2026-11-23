@@ -8596,20 +8596,18 @@ agx3_try_control_flow(struct util_dynarray *emission,
       const bool is_float = I->op == AGX_OPCODE_IF_FCMP ||
                             I->op == AGX_OPCODE_WHILE_FCMP ||
                             I->op == AGX_OPCODE_BREAK_IF_FCMP;
-      /* G16G reuses each loop's slot for its breaks and wraps deep loop nests;
-       * G17P assigns a deep break the next slot so it cannot overwrite the
-       * live predicate of an enclosing conditional. NEST counts exec-mask
-       * levels exited, not loop depth. A flag slot is an ordinary resource
-       * (Apple reuses slot 1 for several loops' exit predicates), and every
-       * compare here is immediately followed by the CND consuming it, so the
-       * six slots wrap modulo six for nests deeper than six. */
+      /* Assign a deep break (I->nest > 1) the next flag slot so it cannot
+       * overwrite the live predicate of an enclosing conditional. NEST counts
+       * exec-mask levels exited, not loop depth. A flag slot is an ordinary
+       * resource (Apple reuses slot 1 for several loops' exit predicates), and
+       * every compare here is immediately followed by the CND consuming it, so
+       * the six slots wrap modulo six for nests deeper than six. */
       if ((is_break_if || is_while) && loop_depth == 0)
          return -1;
       const unsigned loop_slot = loop_depth - 1;
-      const unsigned flag_slot = chip == AGX_CHIP_G16G
-         ? (is_break_if || is_while ? loop_slot % 6 : 0)
-         : (is_break_if ? (loop_slot + (I->nest > 1)) % 6
-                        : (is_while ? loop_slot % 6 : 0));
+      const unsigned flag_slot =
+         is_break_if ? (loop_slot + (I->nest > 1)) % 6
+                     : (is_while ? loop_slot % 6 : 0);
       if (flag_slot >= 6)
          return -1;
       if (!agx3_emit_cf_compare(emission, enc, I, is_float, flag_slot,
@@ -16997,7 +16995,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * are advisory, so retain even a last-use half after legalization
              * has widened its other reads for the following multiply. */
             const enum agx3_alu_hint half_hint =
-               ctx->key->dev.chip == AGX_CHIP_G17P
+               enc == AGX_ISA_ENCODING_AGX3B
                   ? AGX3_ALU_HINT_CACHE : agx3_post_ra_hint(src);
             const bool ok =
                half ? agx3_alu_sqrt_step_half(enc, dest.value, src.value,
@@ -18098,8 +18096,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                /* LTN/GTN are minNum/maxNum conditions. Rewriting them to
                 * GE/LE with swapped integer selections returns the NaN when
                 * src0 is NaN. Untied condition-3/7 selects are not grounded. */
-               if (ctx->key->dev.chip != AGX_CHIP_G17P &&
-                   (condition == AGX_FCOND_LTN || condition == AGX_FCOND_GTN))
+               if (condition == AGX_FCOND_LTN || condition == AGX_FCOND_GTN)
                   AGX3_REFUSE(I);
                if (zero_first) {
                   switch (condition) {
@@ -18755,13 +18752,11 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              /* A uniform alternative takes the general descriptor below. */
              I->src[2].type != AGX_INDEX_UNIFORM &&
              I->src[3].type != AGX_INDEX_UNIFORM) {
-            /* G16G's condition-3/7 full-register form is grounded only when
-             * the alternatives are tied min/max operands, handled above.
-             * Rewriting an untied all-register form to ordered GE/LE returns
-             * the NaN operand. G17P retains its separately qualified legacy
-             * form, and immediate-alternative M4 witnesses remain below. */
-            if (ctx->key->dev.chip != AGX_CHIP_G17P &&
-                I->dest[0].size == AGX_SIZE_32 &&
+            /* Condition-3/7 full-register forms are grounded only when the
+             * alternatives are tied min/max operands, handled above. Rewriting
+             * an untied all-register form to ordered GE/LE returns the NaN
+             * operand; immediate-alternative witnesses remain below. */
+            if (I->dest[0].size == AGX_SIZE_32 &&
                 (I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN) &&
                 agx3_src_is_register(I->src[0]) &&
                 agx3_src_is_register(I->src[1]) &&
@@ -18872,8 +18867,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                bool swap = I->invert_cond;
                /* The tied min/max handler above owns condition 3/7. There is
                 * no grounded untied encoding with those NaN semantics. */
-               if (ctx->key->dev.chip != AGX_CHIP_G17P &&
-                   (condition == AGX_FCOND_LTN || condition == AGX_FCOND_GTN))
+               if (condition == AGX_FCOND_LTN || condition == AGX_FCOND_GTN)
                   AGX3_REFUSE(I);
                uint16_t fsel_wait = wait;
                if (fsel_wait != 0 && fsel_wait != 32) {

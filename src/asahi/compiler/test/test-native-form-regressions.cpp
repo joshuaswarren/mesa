@@ -1034,63 +1034,70 @@ TEST(NativeForms, NegatedSqrtStepReachesPacker)
 
 TEST(NativeForms, G17PHalfSqrtStepAcceptsLastUse)
 {
-   for (unsigned hint : {0u, 1u, 2u}) {
-      void *mem = ralloc_context(NULL);
-      agx_builder *b = agx_test_builder(mem);
-      agx_shader_key key = {};
-      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-      key.dev.chip = AGX_CHIP_G17P;
-      b->shader->key = &key;
-      b->shader->stage = MESA_SHADER_COMPUTE;
-      b->shader->max_reg = 7;
-      agx_index src = agx_register(3, AGX_SIZE_16);
-      src.cache = hint == 1;
-      src.discard = hint == 2;
-      agx_srsqrt_to(b, agx_register(4, AGX_SIZE_32), src);
-      agx_stop(b);
-      util_dynarray binary;
-      util_dynarray_init(&binary, mem);
-      ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
-      uint8_t expected[AGX3_ALU_MAX_LENGTH], length;
-      ASSERT_TRUE(agx3_alu_sqrt_step_half(
-         AGX_ISA_ENCODING_AGX3B, 4, 3, AGX3_ALU_HINT_CACHE, true, 0,
-         expected, &length));
-      ASSERT_GE(binary.size, length);
-      EXPECT_EQ(memcmp(binary.data, expected, length), 0);
-      util_dynarray_fini(&binary);
-      ralloc_free(mem);
+   for (agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G16G}) {
+      for (unsigned hint : {0u, 1u, 2u}) {
+         SCOPED_TRACE(chip);
+         SCOPED_TRACE(hint);
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = chip;
+         b->shader->key = &key;
+         b->shader->stage = MESA_SHADER_COMPUTE;
+         b->shader->max_reg = 7;
+         agx_index src = agx_register(3, AGX_SIZE_16);
+         src.cache = hint == 1;
+         src.discard = hint == 2;
+         agx_srsqrt_to(b, agx_register(4, AGX_SIZE_32), src);
+         agx_stop(b);
+         util_dynarray binary;
+         util_dynarray_init(&binary, mem);
+         ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+         uint8_t expected[AGX3_ALU_MAX_LENGTH], length;
+         ASSERT_TRUE(agx3_alu_sqrt_step_half(
+            AGX_ISA_ENCODING_AGX3B, 4, 3, AGX3_ALU_HINT_CACHE, true, 0,
+            expected, &length));
+         ASSERT_GE(binary.size, length);
+         EXPECT_EQ(memcmp(binary.data, expected, length), 0);
+         util_dynarray_fini(&binary);
+         ralloc_free(mem);
+      }
    }
 }
 
 TEST(NativeForms, G17PHalfComparisonSelectsIntegerBits)
 {
-   for (unsigned selected : {1u, 2u, 0xffu, 0x3c00u, 0x8000u, 0xffffu}) {
-      for (unsigned arm : {2u, 3u}) {
-         SCOPED_TRACE(selected);
-         SCOPED_TRACE(arm);
-         void *mem = ralloc_context(NULL);
-         agx_builder *b = agx_test_builder(mem);
-         agx_shader_key key = {};
-         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-         key.dev.chip = AGX_CHIP_G17P;
-         b->shader->key = &key;
-         agx_index x = agx_preload(b, agx_register(4, AGX_SIZE_16));
-         agx_index y = agx_preload(b, agx_register(5, AGX_SIZE_16));
-         agx_index alternatives[] = {agx_immediate(selected), x};
-         agx_instr *sel = agx_fcmpsel_to(
-            b, agx_temp(b->shader, AGX_SIZE_16), x, y,
-            alternatives[arm == 3], alternatives[arm == 2], AGX_FCOND_LT);
-         agx_materialize_agx3_alu_constants(b->shader);
-         const agx_instr *constant = NULL;
-         agx_foreach_instr_global(b->shader, I) {
-            if (I->nr_dests && agx_is_equiv(I->dest[0], sel->src[arm]))
-               constant = I;
+   for (agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G16G}) {
+      for (unsigned selected : {1u, 2u, 0xffu, 0x3c00u, 0x8000u, 0xffffu}) {
+         for (unsigned arm : {2u, 3u}) {
+            SCOPED_TRACE(chip);
+            SCOPED_TRACE(selected);
+            SCOPED_TRACE(arm);
+            void *mem = ralloc_context(NULL);
+            agx_builder *b = agx_test_builder(mem);
+            agx_shader_key key = {};
+            key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+            key.dev.chip = chip;
+            b->shader->key = &key;
+            agx_index x = agx_preload(b, agx_register(4, AGX_SIZE_16));
+            agx_index y = agx_preload(b, agx_register(5, AGX_SIZE_16));
+            agx_index alternatives[] = {agx_immediate(selected), x};
+            agx_instr *sel = agx_fcmpsel_to(
+               b, agx_temp(b->shader, AGX_SIZE_16), x, y,
+               alternatives[arm == 3], alternatives[arm == 2], AGX_FCOND_LT);
+            agx_materialize_agx3_alu_constants(b->shader);
+            const agx_instr *constant = NULL;
+            agx_foreach_instr_global(b->shader, I) {
+               if (I->nr_dests && agx_is_equiv(I->dest[0], sel->src[arm]))
+                  constant = I;
+            }
+            ASSERT_NE(constant, nullptr);
+            EXPECT_EQ(constant->op, AGX_OPCODE_MOV_IMM);
+            EXPECT_EQ(constant->imm, selected);
+            EXPECT_EQ(constant->dest[0].size, AGX_SIZE_16);
+            ralloc_free(mem);
          }
-         ASSERT_NE(constant, nullptr);
-         EXPECT_EQ(constant->op, AGX_OPCODE_MOV_IMM);
-         EXPECT_EQ(constant->imm, selected);
-         EXPECT_EQ(constant->dest[0].size, AGX_SIZE_16);
-         ralloc_free(mem);
       }
    }
 }

@@ -7884,17 +7884,7 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
             if (I->src[s].type != AGX_INDEX_IMMEDIATE)
                continue;
 
-            if (ctx->key->dev.chip == AGX_CHIP_G17P) {
-               I->src[s] = agx_mov_imm(&b, 16, I->src[s].value);
-               continue;
-            }
-
-            float value = agx_minifloat_decode(I->src[s].value);
-            if (I->src[s].abs)
-               value = fabsf(value);
-            if (I->src[s].neg)
-               value = -value;
-            I->src[s] = agx_mov_imm(&b, 16, _mesa_float_to_half(value));
+            I->src[s] = agx_mov_imm(&b, 16, I->src[s].value);
          }
       }
 
