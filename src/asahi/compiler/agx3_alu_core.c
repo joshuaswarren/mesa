@@ -2873,6 +2873,12 @@ agx3_alu_fcmp_select(enum agx_isa_encoding enc, const struct agx3_fsel_desc *in,
    const bool integer_select =
       (d.sel0_kind == AGX3_FSEL_SEL_IMMEDIATE && d.sel0 != 0) ||
       (d.sel1_kind == AGX3_FSEL_SEL_IMMEDIATE && d.sel1 != 0);
+   /* Native AGX3B uniform-comparand witnesses only select registers or an
+    * immediate zero (never a non-zero integer immediate like #1/#0 from
+    * lowered FCMP). Refuse unwitnessed combinations here so the packer
+    * never emits them. */
+   if ((d.cmp0_uniform || d.cmp1_uniform) && integer_select)
+      return false;
    struct agx3_field_kv alt_base[9];
    unsigned nab = 0;
    alt_base[nab++] = (struct agx3_field_kv){0, 1};

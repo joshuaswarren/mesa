@@ -106,4 +106,14 @@ TEST(AGX3FselUniform, RefusedShapes)
    EXPECT_EQ(encode(d), "refused");
    d.cmp1_abs = false; d.cmp0_neg = true;
    EXPECT_EQ(encode(d), "refused");
+
+   /* Non-zero integer immediate alternatives beside a uniform comparand have
+    * no native AGX3B witness (e.g. lowered fcmp(r, u) -> fcmpsel(r, u, #1, #0)). */
+   d.cmp0_neg = false;
+   d.sel0_kind = AGX3_FSEL_SEL_IMMEDIATE; d.sel0 = 1; d.sel0_hint = AGX3_ALU_HINT_NONE;
+   d.sel1_kind = AGX3_FSEL_SEL_IMMEDIATE; d.sel1 = 0; d.sel1_hint = AGX3_ALU_HINT_NONE;
+   EXPECT_EQ(encode(d), "refused");
+   d.cmp1_uniform = false; d.cmp1_is_immediate = true; d.cmp1 = 0;
+   d.cmp0_uniform = true; d.cmp0 = 20;
+   EXPECT_EQ(encode(d), "refused");
 }
