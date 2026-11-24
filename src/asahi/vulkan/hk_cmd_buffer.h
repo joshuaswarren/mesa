@@ -510,7 +510,16 @@ static_assert(hk_root_descriptor_offset(set_dynamic_buffer_start) ==
               "the dynamic buffer table is followed by its set starts");
 
 struct hk_descriptor_state {
-   bool root_dirty;
+   /* How root differs from the last uploaded root: read and written only
+    * through hk_root_dirty() and the other hk_root_*() helpers below.
+    * push_only is set while every change since that upload was to push
+    * constants, push_launched while the vertex launch last published reads
+    * the current push constants from an upload of their own. */
+   struct {
+      bool dirty;
+      bool push_only;
+      bool push_launched;
+   } root_change;
    uint64_t generation;
    uint64_t identity_copy4_push_mask;
    struct hk_root_descriptor_table root;
@@ -541,6 +550,73 @@ struct hk_descriptor_state {
    /* Bitmask of 32-bit push-constant DWORDs written in this command buffer. */
    uint64_t push_written_dwords;
 };
+
+/* Whether root differs from the last uploaded root. */
+static inline bool
+hk_root_dirty(const struct hk_descriptor_state *desc)
+{
+   return desc->root_change.dirty;
+}
+
+/* Whether root differs from the last uploaded root in push constants alone. */
+static inline bool
+hk_root_push_only_dirty(const struct hk_descriptor_state *desc)
+{
+   return desc->root_change.dirty && desc->root_change.push_only;
+}
+
+/* Whether the vertex launch last published reads every root byte a draw
+ * needs: the root is as uploaded, or only push constants changed since and
+ * that launch reads them from their own upload (hk_root_mark_push_launched()).
+ * push_launch_fits says whether the draw could take such a launch
+ * (hk_agx3_try_push_only_vs_program()). The root itself stays dirty either
+ * way, so every path that reads it from the uploaded copy uploads it first. */
+static inline bool
+hk_root_launch_current(const struct hk_descriptor_state *desc,
+                       bool push_launch_fits)
+{
+   return !desc->root_change.dirty ||
+          (push_launch_fits && desc->root_change.push_launched);
+}
+
+/* Root changed in anything but push constants, or in unknown bytes. */
+static inline void
+hk_root_mark_dirty(struct hk_descriptor_state *desc)
+{
+   desc->root_change.dirty = true;
+   desc->root_change.push_only = false;
+   desc->root_change.push_launched = false;
+}
+
+/* Root changed in its push constants. An earlier change of any other kind
+ * since the last upload keeps the root fully dirty. */
+static inline void
+hk_root_mark_push_dirty(struct hk_descriptor_state *desc)
+{
+   if (!desc->root_change.dirty) {
+      desc->root_change.dirty = true;
+      desc->root_change.push_only = true;
+   }
+   desc->root_change.push_launched = false;
+}
+
+/* The vertex program was launched over the current push constants alone,
+ * and the uploaded root, which still holds older ones, was kept. */
+static inline void
+hk_root_mark_push_launched(struct hk_descriptor_state *desc)
+{
+   assert(hk_root_push_only_dirty(desc));
+   desc->root_change.push_launched = true;
+}
+
+/* Root was uploaded as it is. */
+static inline void
+hk_root_mark_clean(struct hk_descriptor_state *desc)
+{
+   desc->root_change.dirty = false;
+   desc->root_change.push_only = false;
+   desc->root_change.push_launched = false;
+}
 
 struct hk_attachment {
    VkRenderingAttachmentFlagBitsKHR flags;
@@ -758,6 +834,10 @@ enum hk_g17p_range_source {
    HK_G17P_RANGE_SOURCE_BUFFER = 5,
    /* Hoisted AGX3 vertex preamble output buffer (computed once in PREGFX). */
    HK_G17P_RANGE_SOURCE_PREAMBLE_OUT = 6,
+   /* Push-constant slice inside the graphics root (uniform DMA span inside
+    * root.push[]). Replays from root + offset in full-root mode, or from a
+    * narrow uploaded push slice when push_only_root is set. */
+   HK_G17P_RANGE_SOURCE_PUSH = 7,
    /* Uploaded while collecting the ranges (combined-sampler pointers,
     * spilled render-target descriptors), or a buffer span the buffer does
     * not wholly cover: not re-derivable. */
@@ -788,6 +868,11 @@ struct hk_g17p_launch {
    uint8_t flags;
    uint8_t count;
    bool valid;
+   /* Vertex launch whose only root-backed uniform ranges lie inside
+    * root.push[push_min_B .. push_min_B + push_size_B). */
+   bool push_only_root;
+   uint16_t push_min_B;
+   uint16_t push_size_B;
    uint8_t source[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    /* Descriptor set of a SET or BUFFER range; HK_G17P_LAUNCH_ROOT_SET for a
     * BUFFER range whose descriptor is in the root. */
@@ -2807,7 +2892,7 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    gfx->dirty = ~0;
    gfx->shaders_dirty = ~0;
    gfx->linked_dirty = ~0;
-   gfx->descriptors.root_dirty = true;
+   hk_root_mark_dirty(&gfx->descriptors);
    gfx->g17p_bind_tail_memo.valid = false;
    if (cmd->current_cs.gfx)
       cmd->current_cs.gfx->g17p_bind_tail.valid = false;
@@ -3294,6 +3379,9 @@ uint64_t hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd,
                                       bool task);
 uint64_t hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked);
+uint64_t hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd,
+                                          struct hk_shader *s,
+                                          struct hk_linked_shader *linked);
 
 void hk_usc_upload_spilled_rt_descs(struct agx_usc_builder *b,
                                     struct hk_cmd_buffer *cmd);

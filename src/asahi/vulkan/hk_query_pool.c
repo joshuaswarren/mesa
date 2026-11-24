@@ -1074,7 +1074,7 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    }
 
    case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT: {
-      cmd->state.gfx.descriptors.root_dirty = true;
+      hk_root_mark_dirty(&cmd->state.gfx.descriptors);
       cmd->state.gfx.descriptors.root.mesh_prims_query =
          end ? 0 : hk_query_report_addr(dev, pool, query);
       graphics = true;
@@ -1083,7 +1083,7 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
 
    case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
       struct hk_root_descriptor_table *root = &cmd->state.gfx.descriptors.root;
-      cmd->state.gfx.descriptors.root_dirty = true;
+      hk_root_mark_dirty(&cmd->state.gfx.descriptors);
 
       root->draw.pipeline_stats =
          end ? 0 : hk_query_report_addr(dev, pool, query);

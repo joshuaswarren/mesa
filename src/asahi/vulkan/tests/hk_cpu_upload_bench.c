@@ -158,12 +158,12 @@ reuse_correctness(struct fixture *f)
    struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
    bind(f, 16, VK_SHADER_STAGE_ALL_GRAPHICS);
    const uint64_t generation = desc->generation;
-   desc->root_dirty = false;
+   hk_root_mark_clean(desc);
    desc->sets_dirty = 0;
    bind(f, 16, VK_SHADER_STAGE_ALL_GRAPHICS);
-   CHECK(desc->generation == generation && !desc->root_dirty && !desc->sets_dirty);
+   CHECK(desc->generation == generation && !hk_root_dirty(desc) && !desc->sets_dirty);
    bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
-   CHECK(desc->generation == generation + 1 && desc->root_dirty);
+   CHECK(desc->generation == generation + 1 && hk_root_dirty(desc));
 
    uint64_t root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) == root);
@@ -285,9 +285,9 @@ reuse_correctness(struct fixture *f)
    f->fs_api->variants[0].info.agx3_combined_sampler_valid = true;
    root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
    const uint64_t before = desc->generation;
-   desc->root_dirty = false;
+   hk_root_mark_clean(desc);
    bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
-   CHECK(desc->generation == before + 1 && desc->root_dirty);
+   CHECK(desc->generation == before + 1 && hk_root_dirty(desc));
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) != root);
    f->fs_api->variants[0].info.agx3_combined_sampler_valid = false;
 
