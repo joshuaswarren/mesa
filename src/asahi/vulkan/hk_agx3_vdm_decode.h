@@ -31,9 +31,11 @@ extern "C" {
  * shaders over the canonical size carry relocatable varying writes, to 43
  * when agx_shader_info gains launch_size, to 44 when unlinked G17P vertex
  * shaders drop the canonical layout for the relocatable one, to 45 for
- * attachmentless layer-zero root lowering and fs.reads_layer, and to 46 when
- * AGX3 fragment binaries carry on-chip local_read NIR payloads. */
-#define HK_AGX3_SHADER_BINARY_VERSION 46u
+ * attachmentless layer-zero root lowering and fs.reads_layer, to 46 when
+ * AGX3 fragment binaries carry on-chip local_read NIR payloads, and to 47
+ * when agx_shader_info gains AGX3 vertex preamble hoist metadata and
+ * vertex binaries may carry extracted preamble NIR. */
+#define HK_AGX3_SHADER_BINARY_VERSION 47u
 #define HK_CLASSIC_SHADER_BINARY_VERSION 36u
 /* AGX2 binaries include attachmentless layer-zero root lowering and fs.reads_layer. */
 #define HK_AGX2_SHADER_BINARY_VERSION 37u

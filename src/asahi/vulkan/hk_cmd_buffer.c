@@ -3091,6 +3091,19 @@ hk_g17p_graphics_uniform_ranges(
                            HK_AGX3_G17P_GRAPHICS_MAX_RANGES, &count, sources))
       return hk_g17p_graphics_ranges_refused(range_count, count);
 
+   if (s->info.stage == MESA_SHADER_VERTEX &&
+       cmd->state.gfx.g17p_hoisted_preamble_va) {
+      if (count >= HK_AGX3_G17P_GRAPHICS_MAX_RANGES ||
+          !s->b.info.agx3_preamble_out_size_halfs)
+         return hk_g17p_graphics_ranges_refused(range_count, count);
+      sources[count] = HK_G17P_RANGE_SOURCE_PREAMBLE_OUT;
+      ranges[count++] = (struct agx3_ioto_uniform_range){
+         .start_halfs = s->b.info.agx3_preamble_out_start_half,
+         .size_halfs = s->b.info.agx3_preamble_out_size_halfs,
+         .address = cmd->state.gfx.g17p_hoisted_preamble_va,
+      };
+   }
+
    *range_count = count;
    return count <= HK_AGX3_G17P_GRAPHICS_MAX_RANGES;
 }
@@ -3107,6 +3120,7 @@ struct hk_g17p_gfx_loader {
    uint16_t range_start[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    uint16_t range_size[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    uint8_t range_count;
+   bool has_constant_program;
    uint16_t length;
    struct hk_g17p_patch_plan plan;
    uint8_t bytes[];
@@ -3117,9 +3131,10 @@ hk_g17p_gfx_loader_matches(const struct hk_g17p_gfx_loader *l,
                            const struct hk_shader *s,
                            const struct agx_ioto_g17p_imageblock *imageblock,
                            const struct agx3_ioto_uniform_range *ranges,
-                           size_t range_count)
+                           size_t range_count, bool has_constant_program)
 {
    if (l->s != s || l->range_count != range_count ||
+       l->has_constant_program != has_constant_program ||
        l->imageblock.tile_size_px != imageblock->tile_size_px ||
        l->imageblock.sample_size_B != imageblock->sample_size_B ||
        l->imageblock.nr_samples != imageblock->nr_samples)
@@ -3162,6 +3177,7 @@ hk_g17p_gfx_loader_create(struct hk_device *dev, const struct hk_shader *s,
    l->s = s;
    l->imageblock = desc->imageblock;
    l->range_count = desc->uniform_range_count;
+   l->has_constant_program = desc->constant_program.code_size != 0;
    l->length = t->program.length;
    memcpy(l->bytes, t->program.bytes, t->program.length);
    for (unsigned i = 0; i < l->range_count; ++i) {
@@ -3239,7 +3255,8 @@ hk_g17p_launch_flags(const struct hk_cmd_buffer *cmd, const struct hk_shader *s)
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
    uint8_t flags = gfx->root ? 1 : 0;
    if (s->info.stage == MESA_SHADER_VERTEX) {
-      flags |= (gfx->draw_params ? 2 : 0) | (gfx->draw_id_ptr ? 4 : 0);
+      flags |= (gfx->draw_params ? 2 : 0) | (gfx->draw_id_ptr ? 4 : 0) |
+               (gfx->g17p_hoisted_preamble_va ? 32 : 0);
    } else if (s->info.stage == MESA_SHADER_FRAGMENT) {
       flags |= (hk_cmd_uses_blend_constant(cmd) ? 8 : 0) |
                (agx_tilebuffer_spills(&gfx->render.tilebuffer) ? 16 : 0);
@@ -3287,6 +3304,7 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
          break;
       case HK_G17P_RANGE_SOURCE_DRAW_PARAMS:
       case HK_G17P_RANGE_SOURCE_DRAW_ID:
+      case HK_G17P_RANGE_SOURCE_PREAMBLE_OUT:
          break;
       case HK_G17P_RANGE_SOURCE_SET: {
          /* The set-pointer span the range was collected from: the one
@@ -3397,6 +3415,9 @@ hk_g17p_launch_replay(struct hk_cmd_buffer *cmd,
       case HK_G17P_RANGE_SOURCE_DRAW_ID:
          address = gfx->draw_id_ptr;
          break;
+      case HK_G17P_RANGE_SOURCE_PREAMBLE_OUT:
+         address = gfx->g17p_hoisted_preamble_va;
+         break;
       case HK_G17P_RANGE_SOURCE_SET: {
          /* As hk_g17p_graphics_uniform_ranges(): an unbound set reads the
           * zero page. */
@@ -3462,17 +3483,22 @@ hk_g17p_publish_gfx_loader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       .tile_size_px = tib->tile_size,
    };
 
+   const bool has_constant_program =
+      s->b.info.has_preamble &&
+      !(s->info.stage == MESA_SHADER_VERTEX &&
+        cmd->state.gfx.g17p_hoisted_preamble_va != 0);
    const struct hk_g17p_gfx_loader *l = cached->loader;
    unsigned shapes = 0;
    if (!l || cached->loader_linked != linked ||
-       !hk_g17p_gfx_loader_matches(l, s, &imageblock, ranges, range_count) ||
+       !hk_g17p_gfx_loader_matches(l, s, &imageblock, ranges, range_count,
+                                   has_constant_program) ||
        !hk_g17p_patch_plan_fits(&l->plan, ranges)) {
       l = NULL;
       for (struct hk_g17p_gfx_loader *it =
               p_atomic_read(&linked->g17p_gfx_loaders);
            it; it = it->next) {
          if (!hk_g17p_gfx_loader_matches(it, s, &imageblock, ranges,
-                                         range_count))
+                                         range_count, has_constant_program))
             continue;
          if (hk_g17p_patch_plan_fits(&it->plan, ranges)) {
             l = it;
@@ -3582,7 +3608,12 @@ hk_g17p_graphics_program_desc_init(
        desc->imageblock.nr_samples == 0 && desc->imageblock.sample_size_B == 0)
       desc->imageblock.nr_samples = 1;
 
-   if (s->b.info.has_preamble &&
+   const bool use_cprog =
+      s->b.info.has_preamble &&
+      !(s->info.stage == MESA_SHADER_VERTEX &&
+        cmd->state.gfx.g17p_hoisted_preamble_va != 0);
+
+   if (use_cprog &&
        (!s->bo || !s->bo->va || s->code_size != s->b.info.binary_size ||
         !hk_agx3_g17p_constant_program_from_binary(
            s->code_ptr, s->code_size, s->b.info.preamble_offset,
@@ -3593,16 +3624,18 @@ hk_g17p_graphics_program_desc_init(
       return false;
    }
 
-   desc->constant_program.request_prelude =
-      s->b.info.agx3_preamble_uniform_inputs;
-   if (s->b.info.agx3_preamble_tps_inputs) {
-      if (!s->b.info.has_preamble ||
-          s->b.info.preamble_scratch_size <
-             s->b.info.agx3_preamble_inputs.storage_bytes) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return false;
+   if (use_cprog) {
+      desc->constant_program.request_prelude =
+         s->b.info.agx3_preamble_uniform_inputs;
+      if (s->b.info.agx3_preamble_tps_inputs) {
+         if (!s->b.info.has_preamble ||
+             s->b.info.preamble_scratch_size <
+                s->b.info.agx3_preamble_inputs.storage_bytes) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            return false;
+         }
+         desc->cprog_inputs = &s->b.info.agx3_preamble_inputs;
       }
-      desc->cprog_inputs = &s->b.info.agx3_preamble_inputs;
    }
    return true;
 }
@@ -4029,11 +4062,15 @@ hk_agx3_indirect_ioto_prepare(
          .tile_size_px = tib->tile_size,
       };
 
+      const bool has_constant_program =
+         s->b.info.has_preamble && gfx->g17p_hoisted_preamble_va == 0;
+
       l = NULL;
       for (struct hk_g17p_gfx_loader *it =
               p_atomic_read(&linked->g17p_gfx_loaders);
            it; it = it->next) {
-         if (hk_g17p_gfx_loader_matches(it, s, &imageblock, first, count) &&
+         if (hk_g17p_gfx_loader_matches(it, s, &imageblock, first, count,
+                                        has_constant_program) &&
              hk_agx3_indirect_loader_fits(it, launch, first, last)) {
             l = it;
             break;

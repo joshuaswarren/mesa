@@ -11779,6 +11779,73 @@ hk_gfx_republishes_render_state(struct hk_cmd_buffer *cmd)
  * tail_known_match: see hk_g17p_emit_native_bind_tail().  Returns false, with
  * the command buffer error set and cs->current at the failed record, when
  * publication is refused. */
+/* Minimum indirect multi-draw count required to hoist a pure root-only AGX3
+ * vertex preamble out of per-draw constant programs into a single 1-thread
+ * PREGFX compute dispatch. */
+#define HK_PREAMBLE_HOIST_MIN_DRAWS 8u
+
+static inline const struct agx_vdm_state_update_program_info *
+hk_hw_vs_vdm_state_update(const struct hk_shader *hw_vs, bool hoisted_preamble)
+{
+   if (hoisted_preamble &&
+       hw_vs->agx3_vdm_state_update_no_cprog.source_layout ==
+          AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_AGX3_VERTEX_PROGRAM_VARIANT)
+      return &hw_vs->agx3_vdm_state_update_no_cprog;
+   return &hw_vs->agx3_vdm_state_update;
+}
+
+static void
+hk_maybe_hoist_vertex_preamble(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                               struct hk_shader *hw_vs,
+                               struct hk_shader *sw_vs,
+                               struct hk_linked_shader *linked_vs)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if (!gfx->g17p_hoist_preamble_requested || gfx->g17p_hoisted_preamble_va)
+      return;
+
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!agx_chip_native_or_m5(dev->dev.chip) || dev->dev.chip == AGX_CHIP_G18G ||
+       cmd->in_meta || !cs || !gfx->root || !hw_vs || hw_vs != sw_vs ||
+       !linked_vs || !hw_vs->b.info.agx3_preamble_hoistable ||
+       !hw_vs->preamble_nir ||
+       hw_vs->agx3_vdm_state_update_no_cprog.source_layout !=
+          AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_AGX3_VERTEX_PROGRAM_VARIANT ||
+       !(linked_vs->b.uses_base_param || sw_vs->b.info.uses_draw_id) ||
+       cs->m5_shader_writes_memory || gfx->shaders_write_memory ||
+       gfx->xfb_enabled)
+      return;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(cs->preamble_hoist); ++i) {
+      if (cs->preamble_hoist[i].vs == hw_vs &&
+          cs->preamble_hoist[i].root == gfx->root &&
+          cs->preamble_hoist[i].out_va != 0) {
+         gfx->g17p_hoisted_preamble_va = cs->preamble_hoist[i].out_va;
+         return;
+      }
+   }
+
+   struct hk_shader *preamble_cs = hk_shader_get_preamble_cs(dev, hw_vs);
+   if (!preamble_cs)
+      return;
+
+   const size_t out_bytes =
+      (size_t)hw_vs->b.info.agx3_preamble_out_size_halfs * 2u;
+   struct agx_ptr out = hk_pool_alloc(cmd, out_bytes, 16);
+   if (!out.cpu)
+      return;
+   memset(out.cpu, 0, out_bytes);
+
+   if (!hk_dispatch_preamble_cs(cmd, preamble_cs, gfx->root, out.gpu))
+      return;
+
+   unsigned slot = cs->preamble_hoist_next++ & (ARRAY_SIZE(cs->preamble_hoist) - 1);
+   cs->preamble_hoist[slot].vs = hw_vs;
+   cs->preamble_hoist[slot].root = gfx->root;
+   cs->preamble_hoist[slot].out_va = out.gpu;
+   gfx->g17p_hoisted_preamble_va = out.gpu;
+}
+
 static bool
 hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                              uint8_t **out_p, struct hk_shader *hw_vs,
@@ -11792,8 +11859,9 @@ hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    uint8_t *out = *out_p;
 
    *tail_emitted = false;
+   const bool hoisted_preamble = gfx->g17p_hoisted_preamble_va != 0;
    const struct agx_vdm_state_update_program_info *program =
-      &hw_vs->agx3_vdm_state_update;
+      hk_hw_vs_vdm_state_update(hw_vs, hoisted_preamble);
    const bool pipeline_va_valid =
       pipeline_program != 0 && pipeline_program < (UINT64_C(1) << 48) &&
       (pipeline_program & UINT64_C(0x3f)) == 0;
@@ -11825,6 +11893,7 @@ hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .ordinary = ordinary_draw_path,
       .selector_valid = cs->agx3_active_context_selector_valid,
       .selector = cs->agx3_raw_active_context_selector,
+      .hoisted_preamble = hoisted_preamble,
    };
    struct agx_vdm_state_update encoded;
    struct agx_vdm_state_vertex_pipeline_pair pair;
@@ -11837,6 +11906,7 @@ hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        memo->primitive_id == key.primitive_id &&
        memo->ordinary == key.ordinary &&
        memo->selector_valid == key.selector_valid &&
+       memo->hoisted_preamble == key.hoisted_preamble &&
        agx_vdm_state_vertex_pipeline_pair_pack(
           dev->dev.chip, pipeline_program,
           program->template_info.raw_state_load_count_18 << 3, &pair)) {
@@ -12504,6 +12574,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          cs->current = out;
          return;
       }
+      if (!native_mesh)
+         hk_maybe_hoist_vertex_preamble(cmd, cs, hw_vs, sw_vs, linked_vs);
       const uint64_t pipeline_program = native_mesh
          ? hk_upload_native_mesh_program(cmd, hw_vs, linked_hw_vs, false, false)
          : hk_upload_usc_words(cmd, hw_vs, linked_hw_vs);
@@ -12774,7 +12846,8 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
 
-   if (!agx_chip_native_hal200(dev->dev.chip) || !ordinary_draw_path)
+   if (!agx_chip_native_hal200(dev->dev.chip) || !ordinary_draw_path ||
+       (gfx->g17p_hoist_preamble_requested && !gfx->g17p_hoisted_preamble_va))
       return false;
 
    if (vk_dynamic_graphics_state_any_dirty(dyn) || gfx->shaders_dirty ||
@@ -13198,7 +13271,8 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       &cmd->vk.dynamic_graphics_state;
 
    if (cs)
-      cs->m5_shader_writes_memory |= gfx->shaders_write_memory;
+      cs->m5_shader_writes_memory |=
+         gfx->shaders_write_memory || gfx->xfb_enabled;
 
    if (!cs)
       return NULL;
@@ -15130,6 +15204,9 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
          hk_linked_hw_vs(cmd, hw_vs, sw_vs, linked_vs);
       if (!linked_hw_vs)
          return;
+      cs->m5_shader_writes_memory |=
+         gfx->shaders_write_memory || gfx->xfb_enabled;
+      hk_maybe_hoist_vertex_preamble(cmd, cs, hw_vs, sw_vs, linked_vs);
       /* A record after the first of a multi-draw republishes the previous
        * record's program with its own draw parameters. */
       const uint64_t pipeline_program =
@@ -16234,6 +16311,11 @@ hk_draw_indirect_inner(VkCommandBuffer commandBuffer, uint64_t base,
       assert(stride >= sizeof(VkDrawIndirectCommand));
    }
 
+   const bool prev_hoist_req = cmd->state.gfx.g17p_hoist_preamble_requested;
+   const uint64_t prev_hoist_va = cmd->state.gfx.g17p_hoisted_preamble_va;
+   if (drawCount >= HK_PREAMBLE_HOIST_MIN_DRAWS)
+      cmd->state.gfx.g17p_hoist_preamble_requested = true;
+
    const struct hk_device *dev = hk_cmd_buffer_device(cmd);
    int eligible =
       agx_chip_native_or_m5(dev->dev.chip) ? -1 : 0;
@@ -16255,6 +16337,9 @@ hk_draw_indirect_inner(VkCommandBuffer commandBuffer, uint64_t base,
          draw_id = next - 1;
       }
    }
+
+   cmd->state.gfx.g17p_hoist_preamble_requested = prev_hoist_req;
+   cmd->state.gfx.g17p_hoisted_preamble_va = prev_hoist_va;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -16370,8 +16455,16 @@ hk_draw_indexed_indirect_inner(VkCommandBuffer commandBuffer, uint64_t buffer,
       assert(stride >= sizeof(VkDrawIndexedIndirectCommand));
    }
 
-   if (hk_g17p_draw_robust_multi(cmd, buffer, drawCount, stride))
+   const bool prev_hoist_req = cmd->state.gfx.g17p_hoist_preamble_requested;
+   const uint64_t prev_hoist_va = cmd->state.gfx.g17p_hoisted_preamble_va;
+   if (drawCount >= HK_PREAMBLE_HOIST_MIN_DRAWS)
+      cmd->state.gfx.g17p_hoist_preamble_requested = true;
+
+   if (hk_g17p_draw_robust_multi(cmd, buffer, drawCount, stride)) {
+      cmd->state.gfx.g17p_hoist_preamble_requested = prev_hoist_req;
+      cmd->state.gfx.g17p_hoisted_preamble_va = prev_hoist_va;
       return;
+   }
 
    const struct hk_device *dev = hk_cmd_buffer_device(cmd);
    int eligible =
@@ -16400,6 +16493,9 @@ hk_draw_indexed_indirect_inner(VkCommandBuffer commandBuffer, uint64_t buffer,
          draw_id = next - 1;
       }
    }
+
+   cmd->state.gfx.g17p_hoist_preamble_requested = prev_hoist_req;
+   cmd->state.gfx.g17p_hoisted_preamble_va = prev_hoist_va;
 }
 
 VKAPI_ATTR void VKAPI_CALL
