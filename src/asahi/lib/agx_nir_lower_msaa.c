@@ -539,9 +539,12 @@ struct g17p_equiv_probe {
  * Compare the undecoded lanes instead. Four or two 8-bit lanes are read as
  * one 32-bit or 16-bit word at the same byte offset (pixel offsets are byte
  * offsets aligned to the lane width, and the lanes arrive in byte order
- * either way, as R11G11B10F's raw 32-bit word does). 16-bit lanes are read
- * as 16-bit integers, a packed 32-bit format as its word. Other shapes, one
- * or three 8-bit lanes, keep the body's own read.
+ * either way, as R11G11B10F's raw 32-bit word does). Four or two 16-bit
+ * lanes at a 4-byte-aligned offset are read as two or one 32-bit words so
+ * the probe compares half as many channels and folds directly into the
+ * 32-bit difference accumulator; unaligned or odd-component 16-bit lanes
+ * keep 16-bit integer reads, and a packed 32-bit format keeps its word.
+ * Other shapes, one or three 8-bit lanes, keep the body's own read.
  *
  * Bytes that differ but decode alike (signed normalized -128 and -127, NaN
  * payloads) take the per-sample path, which is always correct.
@@ -573,8 +576,18 @@ g17p_equiv_set_raw_form(struct g17p_equiv_probe *p)
    case AIL_ISA_FORMAT_F16:
    case AIL_ISA_FORMAT_U16NORM:
    case AIL_ISA_FORMAT_S16NORM:
-      p->raw_format = PIPE_FORMAT_R16_UINT;
-      p->raw_bit_size = 16;
+      if (p->num_components == 4 && (p->base % 4) == 0) {
+         p->raw_format = PIPE_FORMAT_R32_UINT;
+         p->raw_components = 2;
+         p->raw_bit_size = 32;
+      } else if (p->num_components == 2 && (p->base % 4) == 0) {
+         p->raw_format = PIPE_FORMAT_R32_UINT;
+         p->raw_components = 1;
+         p->raw_bit_size = 32;
+      } else {
+         p->raw_format = PIPE_FORMAT_R16_UINT;
+         p->raw_bit_size = 16;
+      }
       break;
 
    case AIL_ISA_FORMAT_RGB10A2:
@@ -596,6 +609,20 @@ g17p_equiv_probe_is_body_read(const struct g17p_equiv_probe *p)
    return p->raw_format == p->format &&
           p->raw_components == p->num_components &&
           p->raw_bit_size == p->bit_size;
+}
+
+/* A 32-bit raw probe of two or four 16-bit integer or float lanes holds the
+ * exact bit pattern of sample 0's body read in packed 32-bit words, which
+ * unpack into 16-bit half-registers with zero instructions (agx_subdivide_to)
+ * instead of reloading the tilebuffer on the fast path. */
+static bool
+g17p_equiv_probe_can_unpack_v0(const struct g17p_equiv_probe *p)
+{
+   return p->raw_format == PIPE_FORMAT_R32_UINT && p->raw_bit_size == 32 &&
+          p->raw_components * 2 == p->num_components &&
+          (p->format == PIPE_FORMAT_R16_UINT ||
+           p->format == PIPE_FORMAT_R16_FLOAT) &&
+          (p->bit_size == 16 || p->bit_size == 32);
 }
 
 static bool
@@ -691,8 +718,8 @@ g17p_equiv_find_probe(const struct g17p_equiv_probe *probes,
 }
 
 static void
-specialize_g17p_equiv_copy(nir_cf_list *copy, nir_def *load_samples,
-                           nir_def *store_samples,
+specialize_g17p_equiv_copy(nir_function_impl *impl, nir_cf_list *copy,
+                           nir_def *load_samples, nir_def *store_samples,
                            const struct g17p_equiv_probe *probes,
                            nir_def *const *reuse_v0, unsigned num_probes)
 {
@@ -712,7 +739,26 @@ specialize_g17p_equiv_copy(nir_cf_list *copy, nir_def *load_samples,
                            : -1;
                assert(!reuse_v0 || k >= 0);
                if (k >= 0 && reuse_v0[k]) {
-                  nir_def_rewrite_uses(&intr->def, reuse_v0[k]);
+                  nir_def *val = reuse_v0[k];
+                  const struct g17p_equiv_probe *p = &probes[k];
+                  if (!g17p_equiv_probe_is_body_read(p)) {
+                     assert(g17p_equiv_probe_can_unpack_v0(p));
+                     nir_builder b = nir_builder_create(impl);
+                     b.cursor = nir_before_instr(instr);
+                     nir_def *lanes[4];
+                     for (unsigned i = 0; i < p->raw_components; ++i) {
+                        nir_def *word = nir_channel(&b, val, i);
+                        lanes[2 * i] = nir_unpack_32_2x16_split_x(&b, word);
+                        lanes[2 * i + 1] = nir_unpack_32_2x16_split_y(&b, word);
+                     }
+                     val = nir_vec(&b, lanes, p->num_components);
+                     if (p->bit_size == 32) {
+                        val = p->format == PIPE_FORMAT_R16_FLOAT
+                                 ? nir_f2f32(&b, val)
+                                 : nir_u2u32(&b, val);
+                     }
+                  }
+                  nir_def_rewrite_uses(&intr->def, val);
                   nir_instr_remove(instr);
                } else {
                   nir_src_rewrite(&intr->src[0], load_samples);
@@ -864,21 +910,28 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
       nir_sample_mask_agx(&b, nir_imm_intN_t(&b, G17P_EQUIV_ALL_SAMPLES, 16),
                           nir_imm_intN_t(&b, G17P_EQUIV_ALL_SAMPLES, 16));
 
+   /* Sample coverage cannot change after force_early because discard, demote,
+    * zs_emit and all other sample-mask mutations were rejected above. Read
+    * native W16 SR39 once and derive the covered-sample masks for the probes,
+    * fast path and slow path so agx_nir_lower_g17p_tile_samples() does not
+    * emit a separate coverage read in every basic block. */
    const unsigned full_mask = BITFIELD_MASK(nr_samples);
-   nir_def *cov = nir_u2u16(&b, nir_load_sample_mask(&b));
-   nir_def *lane_eq =
-      nir_ieq_imm(&b, nir_iand_imm(&b, cov, full_mask), full_mask);
+   nir_def *cov_raw = nir_load_active_samples_agx(&b);
+   nir_def *cov_low = nir_iand_imm(&b, cov_raw, full_mask);
+   nir_def *sample_masks[4];
+   for (unsigned s = 0; s < nr_samples; ++s)
+      sample_masks[s] = nir_iand_imm(&b, cov_raw, BITFIELD_BIT(s));
 
    /* Reuse sample 0's probed values across the branch when the live footprint
-    * is small and the probe read is the body's own. For wider MRT local-read
-    * shaders, keeping all probed payloads live across the branch inflates
-    * register pressure; drop the probe values after the ballot and reload
-    * sample 0 in the shading body instead. A probe that reads the raw lanes
-    * of a decoded format is never reused: the body still decodes its own
-    * reload. Narrow the remaining 8-bit unorm/snorm probes (one or three
-    * lanes) to f16 when they are not reused (injective for all 256 values),
-    * so the probe preamble uses half the registers while the shading body
-    * still loads exact f32 values. */
+    * is small and the probe read matches or directly unpacks to the body's
+    * own. For wider MRT local-read shaders, keeping all probed payloads live
+    * across the branch inflates register pressure; drop the probe values after
+    * the ballot and reload sample 0 in the shading body instead. A probe that
+    * reads the raw lanes of a decoded normalized format is never reused: the
+    * body still decodes its own reload. Narrow the remaining 8-bit
+    * unorm/snorm probes (one or three lanes) to f16 when they are not reused
+    * (injective for all 256 values), so the probe preamble uses half the
+    * registers while the shading body still loads exact f32 values. */
    const bool reuse_small = total_dwords <= G17P_EQUIV_REUSE_DWORDS;
 
    nir_def *v0[G17P_EQUIV_MAX_PROBES];
@@ -900,17 +953,20 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
       }
 
       v0[k] = nir_load_local_pixel_agx(
-         &b, probes[k].raw_components, probe_bits,
-         nir_imm_intN_t(&b, BITFIELD_BIT(0), 16), .base = probes[k].base,
-         .format = probes[k].raw_format, .target = probes[k].target);
-      reuse[k] = body_read && reuse_small ? v0[k] : NULL;
+         &b, probes[k].raw_components, probe_bits, sample_masks[0],
+         .base = probes[k].base, .format = probes[k].raw_format,
+         .target = probes[k].target);
+      reuse[k] = reuse_small && (body_read ||
+                                 g17p_equiv_probe_can_unpack_v0(&probes[k]))
+                    ? v0[k]
+                    : NULL;
       any_reuse |= reuse[k] != NULL;
 
       for (unsigned s = 1; s < nr_samples; ++s) {
          nir_def *vs = nir_load_local_pixel_agx(
-            &b, probes[k].raw_components, probe_bits,
-            nir_imm_intN_t(&b, BITFIELD_BIT(s), 16), .base = probes[k].base,
-            .format = probes[k].raw_format, .target = probes[k].target);
+            &b, probes[k].raw_components, probe_bits, sample_masks[s],
+            .base = probes[k].base, .format = probes[k].raw_format,
+            .target = probes[k].target);
          nir_def *diff = nir_ixor(&b, v0[k], vs);
          for (unsigned c = 0; c < probes[k].raw_components; ++c) {
             nir_def *d = nir_channel(&b, diff, c);
@@ -924,32 +980,36 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
       }
    }
 
+   /* A lane disqualifies the whole-pixel fast path if any sample is uncovered
+    * (cov_low ^ full_mask != 0) or any probed bit differs across samples.
+    * Fold all mismatch bits into one 32-bit word so the subgroup ballot lowers
+    * directly to a single witnessed AGX3B 32-bit icmp_ballot(mismatch != 0). */
+   nir_def *mismatch16 =
+      nir_ixor(&b, cov_low, nir_imm_intN_t(&b, full_mask, 16));
    if (diff16)
-      lane_eq = nir_iand(&b, lane_eq, nir_ieq_imm(&b, diff16, 0));
+      mismatch16 = nir_ior(&b, mismatch16, diff16);
+   nir_def *mismatch = nir_u2u32(&b, mismatch16);
    if (diff32)
-      lane_eq = nir_iand(&b, lane_eq, nir_ieq_imm(&b, diff32, 0));
+      mismatch = nir_ior(&b, mismatch, diff32);
 
-   nir_def *any_not_eq = nir_ballot(&b, 1, 32, nir_inot(&b, lane_eq));
+   nir_def *any_not_eq = nir_ballot(&b, 1, 32, nir_ine_imm(&b, mismatch, 0));
    nir_def *all_equiv = nir_ieq_imm(&b, any_not_eq, 0);
 
    nir_if *nif = nir_push_if(&b, all_equiv);
    {
-      nir_def *sample0_mask = nir_imm_intN_t(&b, BITFIELD_BIT(0), 16);
-      nir_def *all_mask = nir_imm_intN_t(&b, G17P_EQUIV_ALL_SAMPLES, 16);
       nir_cf_list fast_copy;
       nir_cf_list_clone(&fast_copy, &body, &impl->cf_node, NULL);
-      specialize_g17p_equiv_copy(&fast_copy, sample0_mask, all_mask, probes,
-                                 any_reuse ? reuse : NULL, num_probes);
+      specialize_g17p_equiv_copy(impl, &fast_copy, sample_masks[0], cov_low,
+                                 probes, any_reuse ? reuse : NULL, num_probes);
       b.cursor = nir_cf_reinsert(&fast_copy, b.cursor);
    }
    nir_push_else(&b, nif);
    {
       for (unsigned i = 0; i < nr_samples; ++i) {
-         nir_def *sample_mask = nir_imm_intN_t(&b, BITFIELD_BIT(i), 16);
          nir_cf_list slow_copy;
          nir_cf_list_clone(&slow_copy, &body, &impl->cf_node, NULL);
-         specialize_g17p_equiv_copy(&slow_copy, sample_mask, sample_mask,
-                                    probes,
+         specialize_g17p_equiv_copy(impl, &slow_copy, sample_masks[i],
+                                    sample_masks[i], probes,
                                     (i == 0 && any_reuse) ? reuse : NULL,
                                     num_probes);
          b.cursor = nir_cf_reinsert(&slow_copy, b.cursor);
