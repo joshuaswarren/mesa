@@ -457,6 +457,9 @@ struct hk_descriptor_state {
     * root.sets[] holds their address, and their contents may change until
     * the commands execute, so recording never reads them. */
    uint32_t buffer_active;
+
+   /* Bitmask of 32-bit push-constant DWORDs written in this command buffer. */
+   uint64_t push_written_dwords;
 };
 
 struct hk_attachment {

@@ -12,6 +12,7 @@
 #include "agx_scratch.h"
 #include "agx_tilebuffer.h"
 #include "hk_buffer.h"
+#include "hk_byte_stencil.h"
 #include "hk_acceleration_structure.h"
 #include "hk_cmd_buffer.h"
 #include "hk_g17p_storage_image.h"
@@ -2897,10 +2898,9 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 }
 
 static void
-dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
+dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+                     struct agx_grid grid, bool in_threads)
 {
-   hk_cmd_resolve_compute_border(cmd);
-   struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
    if (agx_is_shader_empty(&s->b))
       return;
 
@@ -3002,6 +3002,14 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
 }
 
 static void
+dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
+{
+   hk_cmd_resolve_compute_border(cmd);
+   struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
+   dispatch_grid_shader(cmd, s, grid, in_threads);
+}
+
+static void
 dispatch(struct hk_cmd_buffer *cmd, struct agx_grid grid)
 {
    dispatch_grid(cmd, grid, false);
@@ -3058,6 +3066,37 @@ hk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
    struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
    if (desc->push_dirty)
       hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+
+   if (!cmd->in_meta && cmd->state.cs.shader &&
+       cmd->state.cs.shader->byte_stencil &&
+       !hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
+                                        cmd->conditional_meta) &&
+       !hk_stat_enabled(hk_pipeline_stat_addr(
+          cmd, VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT))) {
+      const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+      struct hk_byte_stencil_variant *bs = cmd->state.cs.shader->byte_stencil;
+      uint32_t tile_gx = 0, tile_gy = 0;
+      if (hk_byte_stencil_validate_dispatch(
+             dev, desc, &bs->plan, baseGroupX, baseGroupY, baseGroupZ,
+             groupCountX, groupCountY, groupCountZ, &tile_gx, &tile_gy)) {
+         desc->root.cs.base_group[0] = 0;
+         desc->root.cs.base_group[1] = 0;
+         desc->root.cs.base_group[2] = 0;
+
+         VkDispatchIndirectCommand tile_gc = {
+            .x = tile_gx,
+            .y = tile_gy,
+            .z = 1,
+         };
+         desc->root.cs.group_count_addr =
+            hk_pool_upload(cmd, &tile_gc, sizeof(tile_gc), 8);
+         desc->root.cs.grid_helper_sparse_map_addr = 0;
+
+         dispatch_grid_shader(cmd, &bs->shader, agx_3d(tile_gx, tile_gy, 1),
+                              false);
+         return;
+      }
+   }
 
    desc->root.cs.base_group[0] = baseGroupX;
    desc->root.cs.base_group[1] = baseGroupY;

@@ -6132,6 +6132,11 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
    hk_border_source_destroy(dev, obj->mesh_source);
    hk_border_source_destroy(dev, obj->fbl_source);
 
+   if (obj->byte_stencil) {
+      hk_shader_destroy(dev, &obj->byte_stencil->shader, owns_payload);
+      free(obj->byte_stencil);
+   }
+
    if (obj->binary_cache_entry)
       hk_shader_binary_cache_entry_unref(dev, obj->binary_cache_entry);
 
@@ -7189,6 +7194,33 @@ hk_compile_source_create(void *nir, size_t nir_size, const union hk_key *key,
    return src;
 }
 
+struct hk_byte_stencil_candidate {
+   struct hk_byte_stencil_plan plan;
+   nir_shader *tiled_nir;
+};
+
+static bool
+hk_maybe_build_byte_stencil(struct hk_device *dev, const nir_shader *nir,
+                            const struct vk_shader_compile_info *info,
+                            struct hk_byte_stencil_candidate *out)
+{
+   if (!nir || nir->info.stage != MESA_SHADER_COMPUTE || nir->info.internal ||
+       !info || !info->robustness)
+      return false;
+
+   if (!hk_nir_match_byte_stencil(nir, info->set_layout_count, info->set_layouts,
+                                  &out->plan))
+      return false;
+
+   const nir_address_format ssbo_addr_format = hk_buffer_addr_format(
+      info->robustness->storage_buffers,
+      info->robustness->null_storage_buffer_descriptor,
+      agx_chip_g17_m5(dev->dev.chip));
+   out->tiled_nir = hk_nir_build_tiled_byte_stencil(NULL, nir, &out->plan,
+                                                    ssbo_addr_format);
+   return out->tiled_nir != NULL;
+}
+
 /* twin_of: compile a twin of the shader that saved these inputs, with
  * custom-border emulation; mesh_fs: the twin is the fragment shader for a
  * G17P mesh shader with these per-primitive records (hk_mesh_fs_twin());
@@ -7205,6 +7237,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   const struct agx_m5_mesh_varyings *mesh_fs,
                   bool no_default_layer, bool mesh_default_layer,
                   int vs_covers, bool m5_no_grid_record,
+                  struct hk_byte_stencil_candidate *bs_cand,
                   struct hk_api_shader **shader_out)
 {
    VkResult result;
@@ -8188,6 +8221,30 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return result;
       }
+
+      if (bs_cand && bs_cand->tiled_nir && sw_stage == MESA_SHADER_COMPUTE) {
+         nir_shader *tiled_nir = bs_cand->tiled_nir;
+         bs_cand->tiled_nir = NULL;
+         struct hk_byte_stencil_variant *bs = calloc(1, sizeof(*bs));
+         if (bs) {
+            bs->plan = bs_cand->plan;
+            hk_lower_nir(dev, tiled_nir, info->robustness, false,
+                         info->next_stage_mask, info->set_layout_count,
+                         info->set_layouts, features);
+            VkResult bs_res = hk_compile_nir(
+               dev, pAllocator, tiled_nir, info->flags, info->robustness, key,
+               features, &bs->shader, sw_stage, true, NULL,
+               info->set_layout_count, static_set_mask);
+            if (bs_res == VK_SUCCESS) {
+               obj->byte_stencil = bs;
+            } else {
+               hk_shader_destroy(dev, &bs->shader, true);
+               free(bs);
+            }
+         } else {
+            ralloc_free(tiled_nir);
+         }
+      }
    }
 
    /* hk_compile_nir() runs after the collapse above, so by the time it fills
@@ -8215,8 +8272,18 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
                   const VkAllocationCallbacks *allocator,
                   struct hk_api_shader **shader_out)
 {
-   return hk_compile_shader_impl(dev, info, state, features, allocator, NULL,
-                                 NULL, false, false, -1, false, shader_out);
+   struct hk_byte_stencil_candidate bs_cand = {0};
+   struct hk_byte_stencil_candidate *bs_ptr = NULL;
+   if (info && info->nir &&
+       hk_maybe_build_byte_stencil(dev, info->nir, info, &bs_cand))
+      bs_ptr = &bs_cand;
+
+   VkResult result = hk_compile_shader_impl(dev, info, state, features,
+                                            allocator, NULL, NULL, false, false,
+                                            -1, false, bs_ptr, shader_out);
+   if (bs_cand.tiled_nir)
+      ralloc_free(bs_cand.tiled_nir);
+   return result;
 }
 
 static VkResult
@@ -8246,7 +8313,7 @@ hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
    const bool m5_no_grid_record = obj->variants[0].info.mesh.m5_no_grid_record;
    VkResult result = hk_compile_shader_impl(dev, &info, NULL, NULL, NULL, src,
                                             mesh_fs, false, false, -1,
-                                            m5_no_grid_record, &shader);
+                                            m5_no_grid_record, NULL, &shader);
    *built = result == VK_SUCCESS ? shader : NULL;
    return result;
 }
@@ -8479,6 +8546,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
    nir_shader *shaders[shader_count];
    int vs_covers[shader_count];
+   struct hk_byte_stencil_candidate bs_cands[shader_count];
+   memset(bs_cands, 0, sizeof(bs_cands));
    for (uint32_t i = 0; i < shader_count; i++)
       vs_covers[i] = -1;
    bool has_mesh = false;
@@ -8525,8 +8594,10 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                      nir->info.stage == MESA_SHADER_VERTEX &&
                      hk_vs_covers_clip_square(nir);
       if (!hk_mesh_task_grid(dev, nir, info->flags)) {
-         for (uint32_t j = 0; j < shader_count; j++)
+         for (uint32_t j = 0; j < shader_count; j++) {
             ralloc_free(infos[j].nir);
+            ralloc_free(bs_cands[j].tiled_nir);
+         }
          memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
          return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                           "mesh gl_NumWorkGroups under a task stage needs the task record");
@@ -8536,12 +8607,16 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       if (agx_chip_g17_m5(dev->dev.chip) &&
           nir->info.stage == MESA_SHADER_COMPUTE &&
           !agx_nir_cmat_supported(nir)) {
-         for (uint32_t j = 0; j < shader_count; j++)
+         for (uint32_t j = 0; j < shader_count; j++) {
             ralloc_free(infos[j].nir);
+            ralloc_free(bs_cands[j].tiled_nir);
+         }
          memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
          return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                           "cooperative matrix size or operation not supported");
       }
+      if (nir->info.stage == MESA_SHADER_COMPUTE)
+         hk_maybe_build_byte_stencil(dev, nir, info, &bs_cands[i]);
       hk_lower_nir(dev, nir, info->robustness, is_multiview,
                    info->next_stage_mask, info->set_layout_count,
                     info->set_layouts, hk_features);
@@ -8712,15 +8787,22 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                                 mesh_default_layer &&
                                    infos[i].stage == MESA_SHADER_MESH,
                                 vs_covers[i], no_grid_record,
+                                bs_cands[i].tiled_nir ? &bs_cands[i] : NULL,
                                 (struct hk_api_shader **)&shaders_out[i]);
+      if (bs_cands[i].tiled_nir) {
+         ralloc_free(bs_cands[i].tiled_nir);
+         bs_cands[i].tiled_nir = NULL;
+      }
       if (result != VK_SUCCESS) {
          /* Clean up all the shaders before this point */
          for (uint32_t j = 0; j < i; j++)
             hk_api_shader_destroy(&dev->vk, shaders_out[j], pAllocator);
 
          /* Clean up all the NIR after this point */
-         for (uint32_t j = i + 1; j < shader_count; j++)
+         for (uint32_t j = i + 1; j < shader_count; j++) {
             ralloc_free(infos[j].nir);
+            ralloc_free(bs_cands[j].tiled_nir);
+         }
 
          /* Memset the output array */
          memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
@@ -8977,14 +9059,16 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    const bool clip_z = variant_flags & 128;
    const unsigned variant_flags2 = blob_read_uint8(blob);
    const bool has_fbl_source = variant_flags2 & 1;
+   const bool has_byte_stencil = variant_flags2 & 2;
    /* Graphics, compute, task and mesh stages. */
    if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES ||
        (clip_z ? !dev->vk.physical->supported_features.depthClipControl
                : dev->vk.enabled_features.depthClipControl) ||
        (has_mesh_source &&
         (stage != MESA_SHADER_FRAGMENT || dev->dev.chip != AGX_CHIP_G17P)) ||
-       (variant_flags2 & ~1u) ||
+       (variant_flags2 & ~3u) ||
        (has_fbl_source && stage != MESA_SHADER_FRAGMENT) ||
+       (has_byte_stencil && stage != MESA_SHADER_COMPUTE) ||
        (has_source && !sample_variants) ||
        (m5_sample_variants &&
         (!sample_variants || !agx_chip_g17_m5(dev->dev.chip))) ||
@@ -9100,6 +9184,29 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
       }
    }
 
+   if (has_byte_stencil) {
+      struct hk_byte_stencil_variant *bs = calloc(1, sizeof(*bs));
+      if (!bs) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      blob_copy_bytes(blob, &bs->plan, sizeof(bs->plan));
+      if (blob->overrun) {
+         free(bs);
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      }
+      VkResult bs_res =
+         hk_deserialize_shader(dev, blob, &bs->shader, false, cache_candidate);
+      if (bs_res != VK_SUCCESS) {
+         hk_shader_destroy(dev, &bs->shader, true);
+         free(bs);
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return bs_res;
+      }
+      obj->byte_stencil = bs;
+   }
+
    VkResult result = hk_shader_prepare_device_for_stage(dev, stage);
    if (result != VK_SUCCESS) {
       hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
@@ -9156,6 +9263,12 @@ hk_shader_binary_payload_cacheable(struct hk_api_shader *obj)
       if (!shader->compiled)
          continue;
       if (shader->bo || shader->only_linked || !shader->linked.ht)
+         return false;
+   }
+
+   if (obj->byte_stencil && obj->byte_stencil->shader.compiled) {
+      const struct hk_shader *bs = &obj->byte_stencil->shader;
+      if (bs->bo || bs->only_linked || !bs->linked.ht)
          return false;
    }
 
@@ -9267,6 +9380,27 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
       /* Every compiled variant links on demand, including one whose main
        * compiled to zero bytes. */
       dst->linked.lazy_ht = src->compiled;
+   }
+
+   if (src_obj->byte_stencil) {
+      struct hk_byte_stencil_variant *bs = calloc(1, sizeof(*bs));
+      if (!bs) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      bs->plan = src_obj->byte_stencil->plan;
+      struct hk_shader *dst = &bs->shader;
+      const struct hk_shader *src = &src_obj->byte_stencil->shader;
+      *dst = *src;
+      memset(&dst->linked, 0, sizeof(dst->linked));
+      dst->only_linked = NULL;
+      dst->uvs_linked = NULL;
+      dst->bo = NULL;
+      dst->g17p_mono_nir = NULL;
+      dst->g17p_mono_nir_size = 0;
+      simple_mtx_init(&dst->linked.lock, mtx_plain);
+      dst->linked.lazy_ht = src->compiled;
+      obj->byte_stencil = bs;
    }
 
    *shader_out = &obj->vk;
@@ -9450,7 +9584,8 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
                              (obj->g17p_sample_variants == 4 ? 32 : 0) |
                              (obj->mesh_source ? 64 : 0) |
                              (obj->clip_m1_1 ? 128 : 0));
-   blob_write_uint8(blob, obj->fbl_source ? 1 : 0);
+   blob_write_uint8(blob, (obj->fbl_source ? 1 : 0) |
+                             (obj->byte_stencil ? 2 : 0));
 
    hk_foreach_variant(obj, shader) {
       const unsigned i = shader - obj->variants;
@@ -9521,6 +9656,12 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
       blob_write_uint8(blob, sources[i]->static_set_mask);
       blob_write_uint32(blob, sources[i]->nir_size);
       blob_write_bytes(blob, sources[i]->nir, sources[i]->nir_size);
+   }
+
+   if (obj->byte_stencil) {
+      blob_write_bytes(blob, &obj->byte_stencil->plan,
+                       sizeof(obj->byte_stencil->plan));
+      hk_shader_serialize(vk_dev, &obj->byte_stencil->shader, blob);
    }
 
    return !blob->out_of_memory;
