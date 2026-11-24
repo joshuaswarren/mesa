@@ -606,6 +606,14 @@ struct agx_batch {
    struct agx_compiled_shader *g17p_fragment_shader;
    struct agx_linked_shader *g17p_fragment_linked;
 
+   /* HAL200 VDM bind-tail and vertex-state tracking for the current VDM chunk.
+    * Reset on a new batch and whenever a VDM STREAM_LINK starts a new chunk. */
+   bool g17p_bind_tail_latched;
+   bool g17p_have_latched_vs;
+   const struct agx_compiled_shader *g17p_latched_vs_shader;
+   uint32_t g17p_latched_vs_word0;
+   uint32_t g17p_latched_vs_outputs[2];
+
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;
    /* G17G: this render holds the output of a tessellation stage and keeps
@@ -941,6 +949,9 @@ DERIVE_HASH_TABLE(asahi_blit_key);
 struct asahi_blitter {
    bool active;
    struct hash_table *blit_cs;
+
+   /* Compressed mip-level compute shaders, by enum agx_g17p_mip_key */
+   void *g17p_mip_cs[32];
 
    /* [filter] */
    void *sampler[2];
@@ -1631,6 +1642,37 @@ agx_map_texture_gpu(struct agx_resource *rsrc, unsigned z)
           (uint64_t)ail_get_layer_offset_B(&rsrc->layout, z);
 }
 
+static inline bool
+agx_mdi_subdraw_offset(const struct pipe_draw_indirect_info *indirect,
+                       unsigned draw_index, uint32_t arg_size_B,
+                       uint32_t *offset_out)
+{
+   assert(indirect && indirect->buffer && offset_out);
+
+   const uint64_t buf_size = indirect->buffer->width0;
+   const uint64_t base_offset = indirect->offset;
+   const uint64_t stride = indirect->stride;
+
+   if ((base_offset & 3u) || (stride & 3u) ||
+       base_offset > buf_size || arg_size_B > buf_size - base_offset)
+      return false;
+
+   /* Widen and bound the delta against both the 32-bit
+    * pipe_draw_indirect_info::offset field and the indirect buffer size
+    * before multiplying draw_index * stride. */
+   const uint64_t max_delta =
+      MIN2((uint64_t)UINT32_MAX - base_offset,
+           buf_size - arg_size_B - base_offset);
+   if (stride && (uint64_t)draw_index > max_delta / stride)
+      return false;
+
+   const uint64_t sub_offset = base_offset + (uint64_t)draw_index * stride;
+   assert(sub_offset <= UINT32_MAX &&
+          sub_offset <= buf_size - arg_size_B);
+   *offset_out = (uint32_t)sub_offset;
+   return true;
+}
+
 void agx_decompress(struct agx_context *ctx, struct agx_resource *rsrc,
                     const char *reason);
 
@@ -1895,6 +1937,9 @@ bool agx_generate_mipmap_agx3_supported(const struct agx_device *dev,
                                         unsigned last_level,
                                         unsigned first_layer,
                                         unsigned last_layer);
+
+bool agx_g17p_compressed_mip_chain_allowed(const struct agx_device *dev,
+                                           const struct pipe_resource *templ);
 
 bool agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
                          enum pipe_format format, unsigned base_level,

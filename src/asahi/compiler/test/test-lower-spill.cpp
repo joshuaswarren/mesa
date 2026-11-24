@@ -730,15 +730,21 @@ TEST_F(M5SpillConstantPhi, PreservesParallelPhiPrefix)
    }
 }
 
-TEST_F(M5SpillConstantPhi, G17PAndConstantProgramsRemainUnchanged)
+TEST_F(M5SpillConstantPhi, AGX2AndConstantProgramsRemainUnchanged)
 {
    agx_index root = literal(1); join();
    agx_index out = agx_temp(b->shader, AGX_SIZE_32);
    phi(root, root, out);
-   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.encoding = AGX_ISA_ENCODING_AGX2;
    EXPECT_FALSE(agx_fold_m5_spill_constant_phis(b->shader));
-   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
    b->shader->is_preamble = true;
    EXPECT_FALSE(agx_fold_m5_spill_constant_phis(b->shader));
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   EXPECT_FALSE(agx_fold_m5_spill_constant_phis(b->shader));
    EXPECT_EQ(definition(out)->op, AGX_OPCODE_PHI);
+   b->shader->is_preamble = false;
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   EXPECT_TRUE(agx_fold_m5_spill_constant_phis(b->shader));
+   EXPECT_EQ(definition(out)->op, AGX_OPCODE_MOV_IMM);
 }

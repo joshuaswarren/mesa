@@ -765,8 +765,21 @@ agx_bo_create_checked(struct agx_device *dev, size_t size, unsigned align,
     * policy before entering the kernel allocator. Running this after
     * agx_bo_cache_fetch() avoids a second cache-lock walk and ensures a purged
     * or concurrently claimed cache entry cannot bypass the check. */
-   if (!bo && can_alloc && !can_alloc(size, can_alloc_data))
-      return NULL;
+   if (!bo && can_alloc && !can_alloc(size, can_alloc_data)) {
+      /* Idle cached BOs still count as used memory. Before refusing the
+       * allocation, free them and ask once more: the cache must never be
+       * the reason an allocation fails. */
+      simple_mtx_lock(&dev->bo_cache.lock);
+      const bool cache_empty = dev->bo_cache.size == 0;
+      simple_mtx_unlock(&dev->bo_cache.lock);
+
+      if (cache_empty)
+         return NULL;
+
+      agx_bo_cache_evict_all(dev);
+      if (!can_alloc(size, can_alloc_data))
+         return NULL;
+   }
 
    /* Otherwise, allocate a fresh BO. If allocation fails, we can try waiting
     * for something in the cache. But if there's no nothing suitable, we should

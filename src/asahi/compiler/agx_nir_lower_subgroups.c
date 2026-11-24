@@ -361,29 +361,29 @@ static struct agx_subgroup_lower_options
 agx_subgroup_options_for_target(const nir_shader *s, bool g17p, bool m5,
                                 bool g18g)
 {
+   const bool compute = s->info.stage == MESA_SHADER_COMPUTE;
+
+   /* The native float reduce treats denormals as zeros of their sign and does
+    * not flush or reliably preserve them, so keep the shuffle tree whenever
+    * the shader requests 32-bit denormal flush-to-zero or denormal preserve.
+    */
+   const bool denorm32_exact =
+      nir_is_denorm_flush_to_zero(s->info.float_controls_execution_mode, 32) ||
+      nir_is_denorm_preserve(s->info.float_controls_execution_mode, 32);
+
    if (g17p) {
       return (struct agx_subgroup_lower_options){
          .optimize_ballot_count = false,
          .g17p_clustered_float = true,
-         .native_shuffle_xor = s->info.stage == MESA_SHADER_COMPUTE,
-         .m5_float_minmax = false,
+         .native_shuffle_xor = compute,
+         .m5_float_minmax = compute && !denorm32_exact,
       };
    } else if (m5) {
-      const bool compute = s->info.stage == MESA_SHADER_COMPUTE;
-
-      /* The native float reduce does not flush denormal results, so it is not
-       * used when the shader asks for 32-bit denormals to be flushed: those
-       * reductions keep the tree, of values agx_nir_flush_subgroup_minmax()
-       * has flushed.
-       */
-      const bool ftz32 =
-         nir_is_denorm_flush_to_zero(s->info.float_controls_execution_mode, 32);
-
       return (struct agx_subgroup_lower_options){
          .optimize_ballot_count = s->info.stage != MESA_SHADER_FRAGMENT,
          .g17p_clustered_float = false,
          .native_shuffle_xor = !g18g && compute,
-         .m5_float_minmax = !g18g && compute && !ftz32,
+         .m5_float_minmax = !g18g && compute && !denorm32_exact,
       };
    } else {
       return (struct agx_subgroup_lower_options){

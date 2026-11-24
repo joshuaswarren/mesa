@@ -1115,11 +1115,17 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
                            !(src.neg && other.neg) && (other_reg || other_imm);
       }
 
+      /* Unshifted, non-saturating register+register iadd/isub with a normal
+       * partner also takes sign-extended (plain) halves on AGX3B, which
+       * agx_lower_agx3_widening_int() then leaves to agx3_iadd_encode(). */
       if (ctx->key &&
           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
            agx_is_g18g(&ctx->key->dev)) &&
           def->src[0].size == AGX_SIZE_16 && src.size == AGX_SIZE_32 &&
-          ((I->op == AGX_OPCODE_IADD && !agx3b_zext_iadd) ||
+          ((I->op == AGX_OPCODE_IADD && !agx3b_zext_iadd &&
+            (I->saturate || I->shift != 0 || agx_is_g18g(&ctx->key->dev) ||
+             I->src[1 - s].type != AGX_INDEX_NORMAL ||
+             (I->src[0].neg && I->src[1].neg))) ||
            I->op == AGX_OPCODE_IMAD ||
            I->op == AGX_OPCODE_ICMP || I->op == AGX_OPCODE_ICMPSEL ||
            I->op == AGX_OPCODE_BFI || I->op == AGX_OPCODE_BFEIL ||
@@ -2019,6 +2025,34 @@ agx_optimizer_forward(agx_context *ctx)
          agx_optimizer_bitop(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD) {
          agx_optimizer_signext(ctx, defs, I);
+      }
+   }
+
+   /* Back-edge sources of loop-header phis had defs[v] == NULL during the
+    * single forward pass above, leaving scalarized vector loop phis with
+    * `split -> mov -> phi` chains. Propagate plain register moves into those
+    * phi edges now that defs[] is complete. */
+   agx_foreach_block(ctx, block) {
+      if (!block->loop_header)
+         continue;
+
+      agx_foreach_phi_in_block(block, phi) {
+         agx_foreach_ssa_src(phi, s) {
+            const agx_index src = phi->src[s];
+            const agx_instr *def = defs[src.value];
+            if (!def || def->op != AGX_OPCODE_MOV || def->saturate ||
+                def->dest[0].memory)
+               continue;
+
+            const agx_index rep = def->src[0];
+            if (rep.type != AGX_INDEX_NORMAL || rep.memory || rep.abs ||
+                rep.neg || rep.size != src.size ||
+                agx_channels(rep) != agx_channels(src) ||
+                rep.value == phi->dest[0].value)
+               continue;
+
+            agx_replace_src(phi, s, rep);
+         }
       }
    }
 
