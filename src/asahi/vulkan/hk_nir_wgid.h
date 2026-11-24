@@ -12,12 +12,9 @@
 /* Direct compute alternates and producer/clamp fusion assume zero base
  * workgroup offsets (no vkCmdDispatchBase shift), which is also required for
  * the bare unit-axis load_workgroup_id[axis] == GlobalInvocationID[axis]
- * equivalence. */
-static inline bool
-hk_nir_dispatch_zero_base(const uint32_t base_group[3])
-{
-   return !base_group[0] && !base_group[1] && !base_group[2];
-}
+ * equivalence. They share hk_nir_dispatch_zero_base() with workgroup
+ * coalescing. */
+#include "hk_nir_root_size.h"
 
 /* Match 32-bit base_workgroup_id[axis] * local_size[axis] (scalar or vector
  * imul/ishl, or bare base_workgroup_id[axis] when local_size == 1).
