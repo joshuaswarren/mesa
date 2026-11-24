@@ -487,6 +487,10 @@ agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
  *   - 2x/4x multisample single-level, single-layer 2D: <= 8-byte formats;
  *   - 1x single-level 2D array and 3D: <= 8-byte formats.
  *
+ * G16G compresses only 1x single-level, single-layer 2D colour images of
+ * <= 8-byte formats (agx_chip_gen9_color_compression() without
+ * agx_chip_gen9_extended_compression()).
+ *
  * Nothing decompresses such an image in place: it is neither shared nor
  * scanned out, so a spilling MRT framebuffer, feedback loop, or shader-image
  * binding reallocates it uncompressed via agx_decompress().
@@ -498,13 +502,16 @@ static bool
 agx_g17p_private_compression_allowed(const struct agx_device *dev,
                                      const struct pipe_resource *templ)
 {
-   if (dev->chip != AGX_CHIP_G17P ||
+   if (!agx_chip_gen9_color_compression(dev->chip) ||
        templ->width0 < 16 || templ->height0 < 16 ||
        (templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)))
       return false;
 
+   /* Every shape beyond 1x single-level 2D of <= 8-byte formats is G17P's. */
+   const bool extended = agx_chip_gen9_extended_compression(dev->chip);
    const bool color_le8b = agx_g17p_compression_color_format(templ->format);
-   const bool color_16b = agx_g17p_compression_color_format_16b(templ->format);
+   const bool color_16b =
+      extended && agx_g17p_compression_color_format_16b(templ->format);
    if (!color_le8b && !color_16b)
       return false;
 
@@ -514,13 +521,14 @@ agx_g17p_private_compression_allowed(const struct agx_device *dev,
          return false;
 
       if (single_sample)
-         return templ->last_level < 16;
+         return templ->last_level == 0 ||
+                (extended && templ->last_level < 16);
 
-      return color_le8b && templ->last_level == 0 &&
+      return extended && color_le8b && templ->last_level == 0 &&
              (templ->nr_samples == 2 || templ->nr_samples == 4);
    }
 
-   if (!color_le8b || !single_sample || templ->last_level != 0)
+   if (!extended || !color_le8b || !single_sample || templ->last_level != 0)
       return false;
 
    if (templ->target == PIPE_TEXTURE_2D_ARRAY)

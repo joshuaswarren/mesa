@@ -2121,14 +2121,16 @@ main(void)
           agx_chip_name(dev->chip), vs_ok ? "ok" : "refused",
           fs_ok ? "ok" : "refused", linked_ok ? "ok" : "refused");
 
-   /* G17P compresses this 2408x1506 RGBA8 render target, so the clear, the
-    * flush and the blit above took the compressed end-of-tile PBE and
-    * background texture; an unencodable descriptor would have aborted in
-    * agx_native_descriptor_rejected(). Other AGX3 parts keep it plain. */
+   /* Gen9 colour-compression parts (G17P, G16G) compress this 2408x1506 RGBA8
+    * render target, so the clear, the flush and the blit above took the
+    * compressed end-of-tile PBE and background texture; an unencodable
+    * descriptor would have aborted in agx_native_descriptor_rejected(). Other
+    * AGX3 parts keep it plain. */
    if (!agx2 &&
-       agx_resource(dst)->layout.compressed != (dev->chip == AGX_CHIP_G17P)) {
+       agx_resource(dst)->layout.compressed !=
+          agx_chip_gen9_color_compression(dev->chip)) {
       fprintf(stderr,
-              "AGX3 render target compression does not follow the G17P "
+              "AGX3 render target compression does not follow the Gen9 colour "
               "policy\n");
       status = 1;
    }
