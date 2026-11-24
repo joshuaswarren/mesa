@@ -1451,12 +1451,19 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * that record writes the device's writes back for the host (a strong
     * flush alone leaves them in the GPU caches, and the end of a command
     * does not reliably write them back before completion is reported when
-    * render work shares the queue). The host can only observe it at the end
-    * of the submission or through an event, so it is deferred there
-    * (hk_sync_defer_host_flush()) instead of taking a compute command of its
-    * own between the work around it. */
-   if (hk_cdm_memory_scope_form(dev))
-      hk_sync_defer_host_flush(cmd, pDependencyInfo);
+    * render work shares the queue). An open compute stream holding work
+    * after the dependency's first scope takes the record, so the command
+    * that ends with the scope's work ends with the flush. Otherwise the
+    * host, which can only observe it at the end of the submission or
+    * through an event, gets it there (hk_sync_defer_host_flush()) instead of
+    * from a compute command of its own between the work around it. */
+   if (hk_cdm_memory_scope_form(dev)) {
+      struct hk_cs *flush = hk_sync_host_flush(cmd, pDependencyInfo);
+      if (flush) {
+         hk_ensure_cs_has_space(cmd, flush, AGX3_CDM_BARRIER_SIZE);
+         hk_cdm_visibility_flush(dev, flush, true);
+      }
+   }
 
    /* The dependency this barrier recorded is the one a continued instance
     * applies to its stream (hk_sync_merge_rendering()); a stream it created

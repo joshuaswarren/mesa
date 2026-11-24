@@ -2131,15 +2131,14 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       memcmp(prev_tail, queue->sync.tail, sizeof(prev_tail)) != 0;
 
    /* The deferred host flush follows the first scopes of the dependencies
-    * that asked for it, as resolved for the whole submission. Like every
-    * command, it follows the first one where that carries the input syncs
-    * or a leading flush. */
+    * that asked for it, as resolved for the whole submission, and the
+    * submission's last command on each subqueue, which covers the first one
+    * where that carries the input syncs or a leading flush. */
    uint16_t flush_barrier[HK_SYNC_NUM_SQ] = {DRM_ASAHI_BARRIER_NONE,
                                              DRM_ASAHI_BARRIER_NONE};
    uint64_t flush_prior[HK_SYNC_NUM_SQ] = {0, 0};
    if (host_flush &&
-       !hk_sync_host_flush_prefix(&queue->sync, host_flush_kinds,
-                                  chain_first || prepend_cdm, prior_base,
+       !hk_sync_host_flush_prefix(&queue->sync, host_flush_kinds, prior_base,
                                   sq_count, flush_barrier, flush_prior)) {
       util_dynarray_fini(&payload);
       if (unlikely(anatomy))
