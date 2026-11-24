@@ -163,7 +163,7 @@ compile_mma8(enum glsl_base_type type_a, enum glsl_base_type type_b,
                                    &dd->def, nir_imm_int(&b, 0));
    nir_store_shared(&b, elt, nir_imm_int(&b, 0), .align_mul = 4);
 
-   if (!agx_nir_lower_cmat(b.shader, native)) {
+   if (!agx_nir_lower_cmat(b.shader, native, false)) {
       fprintf(stderr, "%s: cooperative-matrix lowering did not run\n", name);
       ralloc_free(b.shader);
       return false;
