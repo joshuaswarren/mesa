@@ -2369,14 +2369,15 @@ main(void)
       agx_chip_command_stream_generation(dev->chip) == AGX_CS_GENERATION_AGX2;
    int status = 0;
 
-   /* AGX2 and Gen9 AGX3 advertise blit-based texture transfers; Gen10 keeps
-    * mapped CPU transfers while its PBE encoder refuses sRGB, mipmapped
-    * (non-G18), and linear layered (G18) transfer targets. */
+   /* AGX2, Gen9 AGX3 and the M5 profile advertise blit-based texture
+    * transfers; other Gen10 chips keep mapped CPU transfers while their PBE
+    * encoder refuses sRGB, mipmapped (non-G18), and linear layered (G18)
+    * transfer targets. */
    const enum agx_descriptor_generation desc_gen =
       agx_chip_descriptor_generation(dev->chip);
    const unsigned want_transfer_modes =
       (agx_gallium_descriptor_generation_is_agx2(desc_gen) ||
-       desc_gen == AGX_DESCRIPTOR_GENERATION_9)
+       desc_gen == AGX_DESCRIPTOR_GENERATION_9 || agx_chip_g17_m5(dev->chip))
          ? PIPE_TEXTURE_TRANSFER_BLIT
          : PIPE_TEXTURE_TRANSFER_DEFAULT;
    if (screen->caps.texture_transfer_modes != want_transfer_modes ||

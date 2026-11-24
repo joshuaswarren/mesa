@@ -3044,12 +3044,24 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
     * targets on non-G18 Gen10, and linear layered targets on G18, so a blit
     * transfer into those shapes would drop its render batch while reporting
     * success.
+    *
+    * The M5 profile (Gen10) renders every blit-transfer target through the
+    * paths its mapped transfers already take, since those blit each staged
+    * level of a tiled or compressed texture with u_blitter
+    * (agx_blit_from_staging, agx_blit_to_staging): u_blitter blits a layer at
+    * a time, a layered st/mesa PBO draw is split into layers
+    * (agx_swtnl_applies), the end-of-tile PBE stores sRGB as the linear
+    * format the shaders encoded, and a level of a mipmapped 2D texture is
+    * stored as a one-level image (agx_batch_upload_pbe_internal).  Let
+    * st/mesa upload from PBOs and convert formats on the GPU there instead
+    * of copying every texel through a CPU staging map.
     */
    const enum agx_descriptor_generation desc_gen =
       agx_chip_descriptor_generation(dev->chip);
    caps->texture_transfer_modes =
       agx_gallium_descriptor_generation_is_agx2(desc_gen) ||
-            desc_gen == AGX_DESCRIPTOR_GENERATION_9
+            desc_gen == AGX_DESCRIPTOR_GENERATION_9 ||
+            agx_chip_g17_m5(dev->chip)
          ? PIPE_TEXTURE_TRANSFER_BLIT
          : PIPE_TEXTURE_TRANSFER_DEFAULT;
 

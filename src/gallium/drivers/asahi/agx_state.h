@@ -397,6 +397,8 @@ struct agx_uncompiled_shader {
       bool uses_buffer_textures;
       bool uses_query_lod;
       bool writes_memory;
+      /* A vertex or tessellation evaluation shader that writes gl_Layer. */
+      bool writes_layer;
       /* API output, excluding synthetic early depth/stencil mask updates. */
       bool writes_api_sample_mask;
 
