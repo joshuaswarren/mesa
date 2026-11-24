@@ -299,7 +299,8 @@ TEST(Linear, Packed422Rows)
  * macroblock row.
  */
 static void
-check_interchange(unsigned w, unsigned h)
+check_interchange(unsigned w, unsigned h,
+                  enum pipe_format format = PIPE_FORMAT_B8G8R8A8_UNORM)
 {
    struct ail_layout layout = {
       .width_px = w,
@@ -309,12 +310,13 @@ check_interchange(unsigned w, unsigned h)
       .levels = 1,
       .tiling = AIL_TILING_INTERCHANGE,
       .compressed = true,
-      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+      .format = format,
       .renderable = true,
    };
 
    ail_make_miptree(&layout);
 
+   EXPECT_EQ(util_format_get_blocksize(format), 4u);
    const unsigned tx = DIV_ROUND_UP(w, 16), ty = DIV_ROUND_UP(h, 16);
    const uint64_t pitch = tx * 1024;
    const uint64_t data = ty * pitch;
@@ -352,6 +354,32 @@ TEST(Interchange, OddSizes)
    check_interchange(33, 17);
    check_interchange(1920, 1080);
    check_interchange(16384, 16);
+}
+
+TEST(Interchange, TenBitFormats)
+{
+   static const enum pipe_format formats[] = {
+      PIPE_FORMAT_B8G8R8A8_UNORM,
+      PIPE_FORMAT_B8G8R8X8_UNORM,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R8G8B8X8_UNORM,
+      PIPE_FORMAT_B10G10R10A2_UNORM,
+      PIPE_FORMAT_B10G10R10X2_UNORM,
+      PIPE_FORMAT_R10G10B10A2_UNORM,
+      PIPE_FORMAT_R10G10B10X2_UNORM,
+   };
+   static const unsigned dims[][2] = {
+      {2408, 1506},
+      {3456, 2234},
+      {256, 128},
+      {33, 17},
+      {1920, 1080},
+      {16384, 16},
+   };
+   for (enum pipe_format fmt : formats) {
+      for (const auto &d : dims)
+         check_interchange(d[0], d[1], fmt);
+   }
 }
 
 TEST(Interchange, Modifier)

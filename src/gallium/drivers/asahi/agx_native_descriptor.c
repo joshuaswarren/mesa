@@ -322,6 +322,8 @@ agx_gallium_pack_native_texture(
    }
 
    if (generation == AGX_DESCRIPTOR_GENERATION_10) {
+      if (semantic->layout == AGX_LAYOUT_INTERCHANGE)
+         return false;
       if (!semantic->width || semantic->width > 32768 || !semantic->height ||
           semantic->height > 32768)
          return false;

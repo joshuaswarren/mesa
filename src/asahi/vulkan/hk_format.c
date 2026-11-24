@@ -59,7 +59,7 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
              ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
    }
 
-   /* Interchange: the 32-bit RGBA formats on chips with
+   /* Interchange: the 32-bit 8-bit and 10-bit RGB/RGBA formats on chips with
     * AGX_CAP_GEN9_2D_COMPRESSION; never storage or host copies
     * (compressed). */
    if (mod == DRM_FORMAT_MOD_APPLE_INTERCHANGE) {

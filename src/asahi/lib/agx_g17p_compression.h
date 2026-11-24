@@ -138,7 +138,8 @@ agx_chip_supports_interchange(enum agx_chip chip)
    return agx_chip_has_cap(chip, AGX_CAP_GEN9_2D_COMPRESSION);
 }
 
-/* The plain 32-bit formats an Interchange image may have. */
+/* The plain 32-bit 8-bit and 10-bit RGB/RGBA formats an Interchange image
+ * may have (4-byte texels matching ail_initialize_interchange()). */
 static inline bool
 agx_interchange_format(enum pipe_format format)
 {
@@ -147,6 +148,10 @@ agx_interchange_format(enum pipe_format format)
    case PIPE_FORMAT_B8G8R8X8_UNORM:
    case PIPE_FORMAT_R8G8B8A8_UNORM:
    case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+   case PIPE_FORMAT_B10G10R10X2_UNORM:
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+   case PIPE_FORMAT_R10G10B10X2_UNORM:
       return true;
    default:
       return false;

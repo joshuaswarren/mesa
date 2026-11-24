@@ -871,6 +871,273 @@ check_interchange_and_shared_bo(struct pipe_context *pctx)
           "comp_cs_rejected=%d non_ix_cs_ok=%d\n",
           agx_chip_name(dev->chip), want_ix, rt_rejected, comp_cs_rejected,
           non_ix_cs_ok);
+
+   /* 10-bit RGB Interchange modifier advertising, scanout allocation, X2
+    * clear+blended-draw compilation, and FP16/UINT non-advertisement. */
+   static const enum pipe_format tenbit_fmts[] = {
+      PIPE_FORMAT_B10G10R10A2_UNORM,
+      PIPE_FORMAT_B10G10R10X2_UNORM,
+      PIPE_FORMAT_R10G10B10A2_UNORM,
+      PIPE_FORMAT_R10G10B10X2_UNORM,
+   };
+   static const enum pipe_format unsupported_ix_fmts[] = {
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R10G10B10A2_UINT,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(unsupported_ix_fmts); ++i) {
+      bool u_ext = true;
+      const bool u_ix = screen->is_dmabuf_modifier_supported(
+         screen, DRM_FORMAT_MOD_APPLE_INTERCHANGE, unsupported_ix_fmts[i],
+         &u_ext);
+      if (u_ix) {
+         fprintf(stderr, "unsupported interchange format %s advertised on %s\n",
+                 util_format_name(unsupported_ix_fmts[i]),
+                 agx_chip_name(dev->chip));
+         ok = false;
+      }
+      struct pipe_resource u_templ = ix_templ;
+      u_templ.format = unsupported_ix_fmts[i];
+      struct pipe_resource *u_res = screen->resource_create_with_modifiers(
+         screen, &u_templ, display_mods, ARRAY_SIZE(display_mods));
+      if (!u_res || agx_resource(u_res)->modifier != DRM_FORMAT_MOD_LINEAR) {
+         fprintf(stderr,
+                 "unsupported interchange format %s did not fall back to linear on %s\n",
+                 util_format_name(unsupported_ix_fmts[i]),
+                 agx_chip_name(dev->chip));
+         ok = false;
+      }
+      pipe_resource_reference(&u_res, NULL);
+   }
+
+   /* Prepare minimal VS/FS + blended state to verify 10-bit A2 and X2
+    * Interchange clear + blended draw compile and emit without batch reject. */
+   nir_builder vs_b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "interchange10 vs");
+   nir_store_output(&vs_b, nir_imm_vec4(&vs_b, 0.0f, 0.0f, 0.0f, 1.0f),
+                    nir_imm_int(&vs_b, 0), .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_POS);
+   nir_shader_gather_info(vs_b.shader, nir_shader_get_entrypoint(vs_b.shader));
+   struct pipe_shader_state vs_st = {.type = PIPE_SHADER_IR_NIR,
+                                     .ir.nir = vs_b.shader};
+   void *vs_cso = pctx->create_vs_state(pctx, &vs_st);
+
+   nir_builder fs_b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "interchange10 fs");
+   nir_store_output(&fs_b, nir_imm_vec4(&fs_b, 0.25f, 0.5f, 0.75f, 0.5f),
+                    nir_imm_int(&fs_b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_DATA0);
+   nir_shader_gather_info(fs_b.shader, nir_shader_get_entrypoint(fs_b.shader));
+   struct pipe_shader_state fs_st = {.type = PIPE_SHADER_IR_NIR,
+                                     .ir.nir = fs_b.shader};
+   void *fs_cso = pctx->create_fs_state(pctx, &fs_st);
+
+   struct pipe_blend_state blend = {0};
+   blend.rt[0].blend_enable = 1;
+   blend.rt[0].rgb_func = PIPE_BLEND_ADD;
+   blend.rt[0].rgb_src_factor = PIPE_BLENDFACTOR_SRC_ALPHA;
+   blend.rt[0].rgb_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
+   blend.rt[0].alpha_func = PIPE_BLEND_ADD;
+   blend.rt[0].alpha_src_factor = PIPE_BLENDFACTOR_ONE;
+   blend.rt[0].alpha_dst_factor = PIPE_BLENDFACTOR_ZERO;
+   blend.rt[0].colormask = 0xf;
+   void *blend_cso = pctx->create_blend_state(pctx, &blend);
+
+   struct pipe_rasterizer_state rast = {
+      .depth_clip_near = true,
+      .depth_clip_far = true,
+      .point_size = 1,
+      .line_width = 1,
+   };
+   void *rast_cso = pctx->create_rasterizer_state(pctx, &rast);
+   struct pipe_depth_stencil_alpha_state dsa = {0};
+   void *dsa_cso = pctx->create_depth_stencil_alpha_state(pctx, &dsa);
+   void *ve_cso = pctx->create_vertex_elements_state(pctx, 0, NULL);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(tenbit_fmts); ++i) {
+      const enum pipe_format fmt = tenbit_fmts[i];
+      bool tb_ext = true;
+      const bool tb_ix = screen->is_dmabuf_modifier_supported(
+         screen, DRM_FORMAT_MOD_APPLE_INTERCHANGE, fmt, &tb_ext);
+      if (tb_ix != want_ix || (tb_ix && tb_ext)) {
+         fprintf(stderr,
+                 "interchange %s support=%d ext_only=%d on %s (want %d, 0)\n",
+                 util_format_name(fmt), tb_ix, tb_ext, agx_chip_name(dev->chip),
+                 want_ix);
+         ok = false;
+      }
+
+      uint64_t qmods[8] = {0};
+      unsigned qext[8] = {0};
+      int qcount = 0;
+      screen->query_dmabuf_modifiers(screen, fmt, ARRAY_SIZE(qmods), qmods,
+                                     qext, &qcount);
+      bool found_ix = false;
+      for (int m = 0; m < qcount; ++m) {
+         if (qmods[m] == DRM_FORMAT_MOD_APPLE_INTERCHANGE) {
+            found_ix = true;
+            if (qext[m]) {
+               fprintf(stderr, "query_dmabuf_modifiers %s marked IX ext_only\n",
+                       util_format_name(fmt));
+               ok = false;
+            }
+         }
+      }
+      if (found_ix != want_ix) {
+         fprintf(stderr, "query_dmabuf_modifiers %s found_ix=%d (want %d)\n",
+                 util_format_name(fmt), found_ix, want_ix);
+         ok = false;
+      }
+
+      struct pipe_resource tb_templ = ix_templ;
+      tb_templ.format = fmt;
+      struct pipe_resource *tb = screen->resource_create_with_modifiers(
+         screen, &tb_templ, display_mods, ARRAY_SIZE(display_mods));
+      if (!tb) {
+         fprintf(stderr, "failed to allocate 10-bit scanout %s on %s\n",
+                 util_format_name(fmt), agx_chip_name(dev->chip));
+         ok = false;
+         continue;
+      }
+
+      struct agx_resource *tb_rsrc = agx_resource(tb);
+      const uint64_t want_mod = want_ix ? DRM_FORMAT_MOD_APPLE_INTERCHANGE
+                                        : DRM_FORMAT_MOD_LINEAR;
+      if (tb_rsrc->modifier != want_mod) {
+         fprintf(stderr, "10-bit %s modifier %#llx on %s (want %#llx)\n",
+                 util_format_name(fmt), (unsigned long long)tb_rsrc->modifier,
+                 agx_chip_name(dev->chip), (unsigned long long)want_mod);
+         ok = false;
+      }
+
+      if (want_ix) {
+         struct agx_bo *orig_bo = tb_rsrc->bo;
+         if (!agx_resource_is_shared(tb_rsrc) || !tb_rsrc->layout.compressed ||
+             tb_rsrc->layout.tiling != AIL_TILING_INTERCHANGE) {
+            fprintf(stderr, "10-bit %s not shared+compressed+interchange\n",
+                    util_format_name(fmt));
+            ok = false;
+         }
+
+         /* Full-extent clear-only batches on 10-bit Interchange scanout (both
+          * A2 and void-alpha X2) must NOT convert to libagx_fast_clear() CDM:
+          * fast clear packs void alpha as 00 (0x3fffffff) instead of opaque
+          * 11 (0xffffffff) and bypasses PBE swizzle_a=3 + 1.0 padding. Test
+          * both an initial clear and a second clear with data_valid set. */
+         pctx->flush(pctx, NULL, 0);
+         struct pipe_framebuffer_state fb = {
+            .width = 256,
+            .height = 256,
+            .layers = 1,
+            .samples = 1,
+            .nr_cbufs = 1,
+            .cbufs[0] = {.texture = tb, .format = fmt},
+         };
+         pctx->set_framebuffer_state(pctx, &fb);
+         const union pipe_color_union clear_col = {.f = {0.1f, 0.2f, 0.3f, 1.0f}};
+         for (unsigned pass = 0; pass < 2; ++pass) {
+            pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &clear_col, 0.0,
+                        0);
+            struct agx_batch *fc_batch = ctx->batch;
+            if (!fc_batch || agx_try_fast_clear_batch(ctx, fc_batch) ||
+                fc_batch->vdm.bo == NULL || fc_batch->cdm.bo != NULL ||
+                has_rejected_active_batch(ctx)) {
+               fprintf(stderr,
+                       "10-bit %s clear-only pass %u unexpectedly took "
+                       "fast-clear or rejected on %s (batch=%p vdm=%p cdm=%p "
+                       "rejected=%d)\n",
+                       util_format_name(fmt), pass, agx_chip_name(dev->chip),
+                       (void *)fc_batch,
+                       fc_batch ? (void *)fc_batch->vdm.bo : NULL,
+                       fc_batch ? (void *)fc_batch->cdm.bo : NULL,
+                       has_rejected_active_batch(ctx));
+               ok = false;
+            }
+            pctx->flush(pctx, NULL, 0);
+            if (tb_rsrc->bo != orig_bo || !tb_rsrc->layout.compressed) {
+               fprintf(stderr,
+                       "10-bit %s clear-only pass %u mutated BO/compression\n",
+                       util_format_name(fmt), pass);
+               ok = false;
+            }
+         }
+
+         /* Clear + blended draw must compile and submit cleanly (exercises
+          * RGB10A2 unpack + x_alpha=1.0 padding + PACK_RGB10A2_AGX3 + Gen9
+          * compressed Interchange PBE with swizzle_a=3 for X2). */
+         pctx->bind_vs_state(pctx, vs_cso);
+         pctx->bind_fs_state(pctx, fs_cso);
+         pctx->bind_blend_state(pctx, blend_cso);
+         pctx->bind_rasterizer_state(pctx, rast_cso);
+         pctx->bind_depth_stencil_alpha_state(pctx, dsa_cso);
+         pctx->bind_vertex_elements_state(pctx, ve_cso);
+         struct pipe_viewport_state vp = {.scale = {128, 128, 0.5},
+                                          .translate = {128, 128, 0.5}};
+         pctx->set_viewport_states(pctx, 0, 1, &vp);
+         pctx->set_sample_mask(pctx, ~0u);
+
+         const unsigned skipped_before = ctx->skipped_no_program;
+         pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &clear_col, 0.0, 0);
+         const struct pipe_draw_info dinfo = {.mode = MESA_PRIM_TRIANGLES,
+                                              .instance_count = 1};
+         const struct pipe_draw_start_count_bias draw = {.count = 3};
+         pctx->draw_vbo(pctx, &dinfo, 0, NULL, &draw, 1);
+         const bool rejected = has_rejected_active_batch(ctx);
+         const bool drew = ctx->batch && ctx->batch->draws;
+         pctx->flush(pctx, NULL, 0);
+         if (rejected || !drew || ctx->skipped_no_program != skipped_before ||
+             tb_rsrc->bo != orig_bo || !tb_rsrc->layout.compressed) {
+            fprintf(stderr,
+                    "10-bit %s clear+blend draw failed on %s: rejected=%d "
+                    "drew=%d skipped=%u bo_same=%d compressed=%d\n",
+                    util_format_name(fmt), agx_chip_name(dev->chip), rejected,
+                    drew, ctx->skipped_no_program - skipped_before,
+                    tb_rsrc->bo == orig_bo, tb_rsrc->layout.compressed);
+            ok = false;
+         }
+
+         /* Incompatible R32_UINT view on shared 10-bit Interchange must fail
+          * closed without reallocating BO. */
+         struct pipe_framebuffer_state bad_fb = {
+            .width = 256,
+            .height = 256,
+            .layers = 1,
+            .samples = 1,
+            .nr_cbufs = 1,
+            .cbufs[0] = {.texture = tb, .format = PIPE_FORMAT_R32_UINT},
+         };
+         pctx->set_framebuffer_state(pctx, &bad_fb);
+         const union pipe_color_union clear_u32 = {.ui = {1, 0, 0, 0}};
+         pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &clear_u32, 0.0, 0);
+         const bool bad_rejected = has_rejected_active_batch(ctx);
+         pctx->flush(pctx, NULL, 0);
+         struct pipe_framebuffer_state empty_fb = {0};
+         pctx->set_framebuffer_state(pctx, &empty_fb);
+         if (!bad_rejected || tb_rsrc->bo != orig_bo ||
+             !tb_rsrc->layout.compressed) {
+            fprintf(stderr,
+                    "10-bit %s incompatible RT view: rejected=%d bo_same=%d "
+                    "compressed=%d\n",
+                    util_format_name(fmt), bad_rejected, tb_rsrc->bo == orig_bo,
+                    tb_rsrc->layout.compressed);
+            ok = false;
+         }
+      }
+      pipe_resource_reference(&tb, NULL);
+   }
+
+   pctx->bind_vs_state(pctx, NULL);
+   pctx->bind_fs_state(pctx, NULL);
+   pctx->bind_blend_state(pctx, NULL);
+   pctx->bind_rasterizer_state(pctx, NULL);
+   pctx->bind_depth_stencil_alpha_state(pctx, NULL);
+   pctx->bind_vertex_elements_state(pctx, NULL);
+   pctx->delete_vs_state(pctx, vs_cso);
+   pctx->delete_fs_state(pctx, fs_cso);
+   pctx->delete_blend_state(pctx, blend_cso);
+   pctx->delete_rasterizer_state(pctx, rast_cso);
+   pctx->delete_depth_stencil_alpha_state(pctx, dsa_cso);
+   pctx->delete_vertex_elements_state(pctx, ve_cso);
+
    return ok;
 }
 

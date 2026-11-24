@@ -2255,11 +2255,16 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
       }
 
       /* RGBX/BGRX: the fourth memory channel is void, so the loop leaves
-       * swizzle_a at 0 and the byte takes tile channel 0 (red).  Point it at
+       * swizzle_a at 0 and the channel takes tile channel 0 (red).  Point it at
        * the tile's alpha instead, which agx_nir_lower_tilebuffer fills with
-       * 1.0 for these formats, so X scans out as 0xff.
+       * 1.0 for these formats, so X scans out as opaque all-ones. On G17P/M5
+       * this covers 10-bit RGB10X2/BGR10X2 whose packed RGB10A2 tile word
+       * always carries 1.0 in channel 3.
        */
-      if (dev->chip == AGX_CHIP_G18G && desc->nr_channels == 4 &&
+      if ((dev->chip == AGX_CHIP_G18G ||
+           (agx_chip_native_or_m5(dev->chip) &&
+            cfg.channels == AGX_CHANNELS_R10G10B10A2)) &&
+          desc->nr_channels == 4 &&
           desc->channel[3].type == UTIL_FORMAT_TYPE_VOID)
          cfg.swizzle_a = 3;
 

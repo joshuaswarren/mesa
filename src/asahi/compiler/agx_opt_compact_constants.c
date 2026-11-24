@@ -42,9 +42,11 @@ agx_opt_compact_constants(agx_context *ctx)
    /* Analyze the types that we read constants as */
    agx_foreach_instr_global(ctx, I) {
       const bool wide_float_op =
-         g18g && I->nr_dests >= 1 && I->dest[0].size == AGX_SIZE_32 &&
-         (I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL ||
-          I->op == AGX_OPCODE_FFMA);
+         (g18g && I->nr_dests >= 1 && I->dest[0].size == AGX_SIZE_32 &&
+          (I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL ||
+           I->op == AGX_OPCODE_FFMA)) ||
+         (agx3 && (I->op == AGX_OPCODE_FLTNORM_AGX3 ||
+                   I->op == AGX_OPCODE_PACK_RGB10A2_AGX3));
 
       agx_foreach_ssa_src(I, s) {
          const bool half_pair =

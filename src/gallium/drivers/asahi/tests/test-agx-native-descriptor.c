@@ -1365,6 +1365,134 @@ test_dmabuf_modifier_external_only(void)
    }
 }
 
+static void
+test_gen9_interchange_descriptors(void)
+{
+   static const struct {
+      enum agx_channels channels;
+      enum agx_channel swizzle_r, swizzle_g, swizzle_b, swizzle_a;
+      uint8_t expected_pbe_byte2;
+   } cases[] = {
+      /* 8-bit BGRA / RGBA */
+      {AGX_CHANNELS_R8G8B8A8, AGX_CHANNEL_B, AGX_CHANNEL_G, AGX_CHANNEL_R,
+       AGX_CHANNEL_A, 0xc6},
+      {AGX_CHANNELS_R8G8B8A8, AGX_CHANNEL_R, AGX_CHANNEL_G, AGX_CHANNEL_B,
+       AGX_CHANNEL_A, 0xe4},
+      /* 10-bit BGR10A2/BGR10X2 (MTL94 swizzle) and RGB10A2/RGB10X2 */
+      {AGX_CHANNELS_R10G10B10A2, AGX_CHANNEL_B, AGX_CHANNEL_G, AGX_CHANNEL_R,
+       AGX_CHANNEL_A, 0xc6},
+      {AGX_CHANNELS_R10G10B10A2, AGX_CHANNEL_R, AGX_CHANNEL_G, AGX_CHANNEL_B,
+       AGX_CHANNEL_A, 0xe4},
+   };
+
+   const unsigned width = 3456, height = 2234;
+   const unsigned tiles_x = DIV_ROUND_UP(width, 16);
+   const uint64_t base_va = UINT64_C(0x1000080000);
+   const uint64_t meta_va = UINT64_C(0x1001ec0000);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+      struct AGX_PBE pbe = {AGX_PBE_header};
+      pbe.dimension = AGX_TEXTURE_DIMENSION_2D;
+      pbe.layout = AGX_LAYOUT_INTERCHANGE;
+      pbe.channels = cases[i].channels;
+      pbe.type = AGX_TEXTURE_TYPE_UNORM;
+      pbe.swizzle_r = cases[i].swizzle_r;
+      pbe.swizzle_g = cases[i].swizzle_g;
+      pbe.swizzle_b = cases[i].swizzle_b;
+      pbe.swizzle_a = cases[i].swizzle_a;
+      pbe.width = width;
+      pbe.height = height;
+      pbe.layers = 1;
+      pbe.levels = 1;
+      pbe.buffer = base_va;
+      pbe.compressed = true;
+      pbe.extended = true;
+      pbe.acceleration_buffer = meta_va;
+      pbe.stride = tiles_x * 16 - 4;
+
+      struct agx_gallium_pbe_descriptor packed_pbe;
+      CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9,
+                                        &packed_pbe, &pbe));
+      const uint8_t *pbe_bytes = (const uint8_t *)packed_pbe.opaque;
+      CHECK((pbe_bytes[0] & 0x3f) == 0x32); /* dim=2 (2D), layout=3 (IX) */
+      CHECK(pbe_bytes[2] == cases[i].expected_pbe_byte2);
+
+      struct agx_pbe_agx3_2d_fields decoded_pbe;
+      CHECK(agx_pbe_agx3_2d_unpack(AGX_PBE_AGX3_GENERATION_9, packed_pbe.opaque,
+                                   sizeof(packed_pbe.opaque), &decoded_pbe));
+      CHECK(decoded_pbe.layout == AGX_LAYOUT_INTERCHANGE);
+      CHECK(decoded_pbe.channels == cases[i].channels);
+      CHECK(decoded_pbe.type == AGX_TEXTURE_TYPE_UNORM);
+      CHECK(decoded_pbe.swizzle_r == cases[i].swizzle_r &&
+            decoded_pbe.swizzle_g == cases[i].swizzle_g &&
+            decoded_pbe.swizzle_b == cases[i].swizzle_b &&
+            decoded_pbe.swizzle_a == cases[i].swizzle_a);
+      CHECK(decoded_pbe.compressed);
+      CHECK(decoded_pbe.buffer == base_va);
+      CHECK(decoded_pbe.acceleration_buffer == meta_va);
+      CHECK(decoded_pbe.stride_B == tiles_x * 16);
+
+      /* Gen10, uncompressed, layered, or mipmapped Interchange PBEs must fail. */
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10,
+                                         &packed_pbe, &pbe));
+      struct AGX_PBE bad_pbe = pbe;
+      bad_pbe.compressed = false;
+      bad_pbe.extended = false;
+      bad_pbe.acceleration_buffer = 0;
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9,
+                                         &packed_pbe, &bad_pbe));
+      bad_pbe = pbe;
+      bad_pbe.levels = 2;
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9,
+                                         &packed_pbe, &bad_pbe));
+      bad_pbe = pbe;
+      bad_pbe.dimension = AGX_TEXTURE_DIMENSION_2D_ARRAY;
+      bad_pbe.layers = 2;
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9,
+                                         &packed_pbe, &bad_pbe));
+
+      struct AGX_TEXTURE tex = {AGX_TEXTURE_header};
+      tex.dimension = AGX_TEXTURE_DIMENSION_2D;
+      tex.layout = AGX_LAYOUT_INTERCHANGE;
+      tex.channels = cases[i].channels;
+      tex.type = AGX_TEXTURE_TYPE_UNORM;
+      tex.swizzle_r = cases[i].swizzle_r;
+      tex.swizzle_g = cases[i].swizzle_g;
+      tex.swizzle_b = cases[i].swizzle_b;
+      tex.swizzle_a = cases[i].swizzle_a;
+      tex.width = width;
+      tex.height = height;
+      tex.depth = 1;
+      tex.address = base_va;
+      tex.compressed = true;
+      tex.extended = true;
+      tex.acceleration_buffer = meta_va;
+      tex.stride = (tiles_x - 1) << 4;
+
+      struct agx_gallium_texture_descriptor packed_tex;
+      CHECK(agx_gallium_pack_native_texture(AGX_DESCRIPTOR_GENERATION_9,
+                                            &packed_tex, &tex));
+      struct AGX_TEXTURE_GEN9 decoded_tex = {0};
+      CHECK(AGX_TEXTURE_GEN9_unpack(NULL, (const uint8_t *)packed_tex.opaque,
+                                    &decoded_tex));
+      CHECK(decoded_tex.layout == AGX_LAYOUT_INTERCHANGE);
+      CHECK(decoded_tex.channels == cases[i].channels);
+      CHECK(decoded_tex.type == AGX_TEXTURE_TYPE_UNORM);
+      CHECK(decoded_tex.swizzle_r == cases[i].swizzle_r &&
+            decoded_tex.swizzle_g == cases[i].swizzle_g &&
+            decoded_tex.swizzle_b == cases[i].swizzle_b &&
+            decoded_tex.swizzle_a == cases[i].swizzle_a);
+      CHECK(decoded_tex.compressed && decoded_tex.extended);
+      CHECK(decoded_tex.address == base_va);
+      CHECK(decoded_tex.acceleration_buffer == meta_va);
+      CHECK(decoded_tex.stride == ((tiles_x - 1) << 4));
+
+      /* Gen10 rejects Interchange textures as well. */
+      CHECK(!agx_gallium_pack_native_texture(AGX_DESCRIPTOR_GENERATION_10,
+                                             &packed_tex, &tex));
+   }
+}
+
 int
 main(void)
 {
@@ -1380,6 +1508,7 @@ main(void)
    test_gen9_compressed_depth_array();
    test_native_packers();
    test_agx3_pbe();
+   test_gen9_interchange_descriptors();
    test_g17p_compressed_render_target();
    test_g17p_image_atomic_sw();
    printf("Gallium AGX native descriptors: %u checks passed\n", checks);
