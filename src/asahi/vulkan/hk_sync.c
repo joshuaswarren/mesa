@@ -385,6 +385,82 @@ hk_sync_dependency_kinds(const VkDependencyInfo *info, bool image_class,
                                    src, dst);
 }
 
+/* A host access, or MEMORY_READ or MEMORY_WRITE with the host stage in the
+ * destination scope: those stand for every read or write valid in the scope,
+ * the host's too. ALL_COMMANDS does not include the host stage. A host write
+ * needs the earlier device writes written back first as much as a host read
+ * does: a line written back after it would overwrite it. */
+static bool
+barrier_has_host_access(VkPipelineStageFlags2 dst_stages,
+                        VkAccessFlags2 dst_access)
+{
+   if (dst_access & (VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_HOST_WRITE_BIT))
+      return true;
+
+   return (dst_stages & VK_PIPELINE_STAGE_2_HOST_BIT) &&
+          (dst_access &
+           (VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT));
+}
+
+bool
+hk_sync_dependency_has_host_access(const VkDependencyInfo *info)
+{
+   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      if (barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
+         return true;
+   }
+
+   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
+      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
+      if (barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
+         return true;
+   }
+
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
+      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      if (barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
+         return true;
+   }
+
+   return false;
+}
+
+/* Vulkan 1.4, 7.1 "Execution and Memory Dependencies": a destination access
+ * scope with a host access adds a memory domain operation that makes the
+ * memory available in the device domain available to the host domain. That
+ * is any write an earlier availability operation in an execution dependency
+ * chain reaching this one made available, not only the writes of this
+ * barrier's source access scope, so a barrier with read-only or empty source
+ * access still flushes. A domain operation happens after the first
+ * synchronization scope, and only one with device work in it can follow
+ * device writes: an empty or host-only first scope needs no flush. */
+uint8_t
+hk_sync_host_flush_kinds(const VkDependencyInfo *info)
+{
+   uint8_t kinds = 0;
+
+   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      if (barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
+         kinds |= hk_sync_kinds_src(b->srcStageMask);
+   }
+
+   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
+      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
+      if (barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
+         kinds |= hk_sync_kinds_src(b->srcStageMask);
+   }
+
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
+      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      if (barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
+         kinds |= hk_sync_kinds_src(b->srcStageMask);
+   }
+
+   return kinds;
+}
+
 void
 brl_sync_transition_kinds(const VkDependencyInfo *info,
                           const VkImageMemoryBarrier2 *barrier,

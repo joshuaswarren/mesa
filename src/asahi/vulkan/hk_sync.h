@@ -557,6 +557,16 @@ void brl_sync_transition_end(struct hk_cmd_buffer *cmd, uint8_t dst_kinds);
 void hk_sync_dependency_kinds(const VkDependencyInfo *info, bool image_class,
                               uint8_t *src, uint8_t *dst);
 
+/* Whether a dependency performs a device-to-host memory domain operation: a
+ * barrier names a host access, or MEMORY_READ or MEMORY_WRITE with the host
+ * stage in its destination scope. */
+bool hk_sync_dependency_has_host_access(const VkDependencyInfo *info);
+
+/* The first synchronization scopes, as kinds, of the barriers of a dependency
+ * that perform a device-to-host domain operation. Zero when none does, or
+ * when their first scopes hold no device work. */
+uint8_t hk_sync_host_flush_kinds(const VkDependencyInfo *info);
+
 /* Record an execution dependency: all earlier streams of the source kinds
  * complete before any later stream of the destination kinds starts. */
 void hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
