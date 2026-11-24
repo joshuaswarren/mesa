@@ -3379,13 +3379,22 @@ hk_g17p_zls_elide_store(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
  * without clear or flags, so other passes keep their programs. On M5 that also
  * excludes resolves; a G17P pass without a direct resolve resolves after the
  * pass, from the memory this store would have left unchanged. A continuation
- * of the pass restores the full programs (hk_m5_pass_merge_begin()). */
+ * of the pass restores the full programs (hk_m5_pass_merge_begin()).
+ *
+ * A G17P pass with a direct resolve carries that resolve in its end-of-tile
+ * programs, which this rebuild would lose, so such a pass keeps them and its
+ * stores. Only the main background program of a covered attachment changes
+ * (hk_g17p_note_first_draw()): the first draw overwrites every sample before
+ * the resolve reads it, so the tile load is dropped. A zink multisample pass
+ * that resolves into its blit target and keeps the samples (LOAD/STORE, as GL
+ * requires) otherwise reloads the whole multisample tile every frame. */
 static void
 hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_rendering_state *render = &cmd->state.gfx.render;
    const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+   const bool direct_resolve = !m5 && render->g17p_direct_color_resolve;
    /* The rebuilt programs may drop every colour store; M5 has an empty
     * end-of-tile program only for single-layer, non-spilling colour tiles
     * (hk_build_m5_empty_bg_eot()), multisampled ones included. */
@@ -3393,11 +3402,20 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
        cs != render->zls_first_cs || cmd->in_meta || render->color_read ||
        render->view_mask || render->layer_count > 1 ||
        (m5 ? !hk_m5_color_imageblock_supported(&render->tilebuffer)
-           : (agx_tilebuffer_spills(&render->tilebuffer) ||
-              render->g17p_direct_color_resolve)) ||
+           : agx_tilebuffer_spills(&render->tilebuffer)) ||
        (render->flags & (VK_RENDERING_SUSPENDING_BIT |
                          VK_RENDERING_RESUMING_BIT |
                          VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)))
+      return;
+
+   const bool incomplete_render_area =
+      render->area.offset.x > 0 || render->area.offset.y > 0 ||
+      render->area.extent.width < render->cr.width ||
+      render->area.extent.height < render->cr.height;
+   /* A direct resolve writes whole tiles; outside a partial render area its
+    * background program merges the destination (preserve_resolve_outside),
+    * which is built from the attachment's own load. */
+   if (direct_resolve && incomplete_render_area)
       return;
 
    VkRenderingAttachmentInfo atts[HK_MAX_RTS], bg_atts[HK_MAX_RTS];
@@ -3419,7 +3437,10 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
          .storeOp = att->store_op,
       };
       bg_atts[i] = atts[i];
-      if (att->iview && att->load_op == VK_ATTACHMENT_LOAD_OP_LOAD &&
+      /* Dropping a store would also drop a direct resolve in the same
+       * end-of-tile program. */
+      if (!direct_resolve && att->iview &&
+          att->load_op == VK_ATTACHMENT_LOAD_OP_LOAD &&
           att->store_op == VK_ATTACHMENT_STORE_OP_STORE &&
           !(render->color_written & BITFIELD_BIT(i))) {
          atts[i].imageView = VK_NULL_HANDLE;
@@ -3438,10 +3459,6 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (!elide && !covered)
       return;
 
-   const bool incomplete_render_area =
-      render->area.offset.x > 0 || render->area.offset.y > 0 ||
-      render->area.extent.width < render->cr.width ||
-      render->area.extent.height < render->cr.height;
    const VkRenderingInfo info = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
       .renderArea = render->area,
@@ -3454,6 +3471,17 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    bg_info.pColorAttachments = bg_atts;
    const struct hk_bg_eot bg_main = hk_build_bg_eot(
       cmd, &bg_info, false, false, incomplete_render_area, NULL);
+   if (direct_resolve) {
+      /* Covered attachments only: the end-of-tile programs, which carry the
+       * resolve, and the partial-render reload stay as they are. */
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return;
+      cs->cr.bg.main = bg_main;
+      cs->anatomy_covered = covered;
+      perf_debug(cmd, "Dropped loads of covered attachments 0x%x of a pass "
+                 "with a direct resolve", covered);
+      return;
+   }
    const struct hk_bg_eot eot_main =
       hk_build_bg_eot(cmd, &info, true, false, incomplete_render_area, NULL);
    const struct hk_bg_eot eot_partial =
