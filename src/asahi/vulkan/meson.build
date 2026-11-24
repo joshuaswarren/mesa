@@ -312,7 +312,8 @@ if with_tests
       suite : ['asahi'],
     )
 
-    # Which dependencies ask for host availability; no device or GPU.
+    # Host availability deferred to the end of the submission, resolved
+    # through the real hk_sync resolver; no device or GPU.
     test(
       'hk_host_flush',
       executable(

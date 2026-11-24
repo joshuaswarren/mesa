@@ -1448,7 +1448,10 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
          for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
             VK_FROM_HANDLE(hk_cmd_buffer, cmd,
                            pSubmits[i].pCommandBufferInfos[j].commandBuffer);
-            if (list_is_empty(&cmd->control_streams))
+            /* A command buffer without streams still sends the host flush
+             * it deferred (hk_sync_defer_host_flush()). */
+            if (list_is_empty(&cmd->control_streams) &&
+                !cmd->sync.host_flush_kinds)
                continue;
             needs_queue = true;
             if (rq_capable)
@@ -1640,6 +1643,65 @@ hk_queue_ensure_ts_carrier(struct hk_device *dev, struct hk_queue *queue)
    return VK_SUCCESS;
 }
 
+/* A flush-only stream dispatches no shader: on M5 kernels that take compute
+ * resource lists, it declares an empty one. */
+static void
+hk_queue_append_no_compute_resources(const struct hk_device *dev,
+                                     struct util_dynarray *payload)
+{
+   if (agx_chip_g17_m5(dev->dev.chip) &&
+       (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) {
+      const struct drm_asahi_cmd_header resources = {
+         .cmd_type = DRM_ASAHI_SET_COMPUTE_RESOURCES,
+         .size = 0,
+         .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
+         .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
+      };
+      util_dynarray_append(payload, resources);
+   }
+}
+
+/* The stream of the compute command that ends a submission with its
+ * deferred host availability: the memory-scoped strong flush, encoded as
+ * hk_cdm_visibility_flush() records it in a command buffer, and the
+ * terminator. */
+static VkResult
+hk_queue_ensure_host_flush(struct hk_device *dev, struct hk_queue *queue)
+{
+   if (queue->host_flush_bo)
+      return VK_SUCCESS;
+
+   struct agx_bo *bo =
+      agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0, "Host flush");
+   if (!bo)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   uint8_t *stream = agx_bo_map(bo);
+   if (!stream || !hk_cdm_pack_visibility_flush(dev, true, stream) ||
+       !agx3_cdm_stream_terminate_pack(dev->dev.chip,
+                                       stream + AGX3_CDM_BARRIER_SIZE)) {
+      agx_bo_unreference(&dev->dev, bo);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   queue->host_flush_bo = bo;
+   return VK_SUCCESS;
+}
+
+/* Whether the deferred host flush depends on an earlier submission, by the
+ * rule hk_sibling_eligible() applies to streams. */
+static bool
+hk_host_flush_names_earlier(const uint16_t barrier[HK_SYNC_NUM_SQ],
+                            const uint64_t prior[HK_SYNC_NUM_SQ],
+                            const uint64_t base[HK_SYNC_NUM_SQ])
+{
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      if ((prior[sq] && prior[sq] <= base[sq]) || barrier[sq] == 0)
+         return true;
+   }
+   return false;
+}
+
 /* Submits the recordings of `submit`. With submit packing these are the
  * submission's packets and the command buffers it left alone; `original`
  * is the application's submission, and `packed_bo` holds the packets'
@@ -1735,15 +1797,29 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       }
    }
 
-   unsigned command_count = prepend_cdm ? 1 : 0;
+   /* Host availability the command buffers deferred (secondaries replay
+    * into their primary): one memory-scoped flush ends the submission, after
+    * the first scopes of those dependencies. */
+   uint8_t host_flush_kinds = 0;
+   for (unsigned i = 0; i < original->command_buffer_count; ++i) {
+      const struct hk_cmd_buffer *cmdbuf =
+         (const struct hk_cmd_buffer *)original->command_buffers[i];
+      host_flush_kinds |= cmdbuf->sync.host_flush_kinds;
+   }
+   const bool host_flush = host_flush_kinds != 0;
+
+   uint32_t sq_count[HK_SYNC_NUM_SQ] = {0, prepend_cdm ? 1 : 0};
 
    /* Gather the number of individual commands to submit up front */
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
 
-      command_count += list_length(&cmdbuf->control_streams);
+      list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node)
+         sq_count[hk_sync_sq(cs)]++;
    }
+   const unsigned command_count =
+      sq_count[HK_SYNC_VDM] + sq_count[HK_SYNC_CDM] + (host_flush ? 1 : 0);
 
    perf_debug_dev(&dev->dev,
                   "Submitting %u control streams (%u command buffers)",
@@ -1778,11 +1854,19 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       }
    }
 
+   if (host_flush) {
+      VkResult flush_result = hk_queue_ensure_host_flush(dev, queue);
+      if (flush_result != VK_SUCCESS) {
+         *untouched = !bound;
+         return vk_error(queue, flush_result);
+      }
+   }
+
    /* Resolved sync fields, one entry per stream occurrence: a
     * simultaneous-use command buffer may occur more than once. A sparse bind
     * that only flushes the sparse table has none, and resizing a never
     * allocated array to zero returns NULL. */
-   const unsigned resolved_count = command_count - prepend_cdm;
+   const unsigned resolved_count = command_count - prepend_cdm - host_flush;
    if (resolved_count &&
        !util_dynarray_resize(&queue->sync_resolved, struct hk_sync_resolved,
                              resolved_count)) {
@@ -1981,19 +2065,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
    if (flush_sstt) {
       assert(queue->g17p_sstt_flush_bo);
-      if (agx_chip_g17_m5(dev->dev.chip) &&
-          (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) {
-         /* This stream flushes metadata without dispatching a shader. Declare
-          * its empty resource list, as for other flush-only M5 streams.
-          */
-         const struct drm_asahi_cmd_header resources = {
-            .cmd_type = DRM_ASAHI_SET_COMPUTE_RESOURCES,
-            .size = 0,
-            .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
-            .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
-         };
-         util_dynarray_append(&payload, resources);
-      }
+      hk_queue_append_no_compute_resources(dev, &payload);
       struct drm_asahi_cmd_header header = agx_cmd_header(true, 0, 0);
       const struct drm_asahi_cmd_compute_with_prior cmd = {
          .legacy = {
@@ -2036,13 +2108,13 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    uint64_t prev_tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    if (resolve && queue->sync.exact_prior)
       memcpy(prev_tail, queue->sync.tail, sizeof(prev_tail));
+   const bool chain_first =
+      wait_count > 0 &&
+      !(dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS);
    if (resolve && !hk_sync_resolve_submit(queue,
                           (struct hk_cmd_buffer *const *)submit->command_buffers,
                           submit->command_buffer_count, prepend_cdm,
-                          wait_count > 0 &&
-                          !(dev->dev.params.features &
-                            DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS),
-                          completed, queue->sync_resolved.data)) {
+                          chain_first, completed, queue->sync_resolved.data)) {
       util_dynarray_fini(&payload);
       if (unlikely(anatomy))
          hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
@@ -2052,6 +2124,24 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    const bool tail_raised =
       resolve && queue->sync.exact_prior &&
       memcmp(prev_tail, queue->sync.tail, sizeof(prev_tail)) != 0;
+
+   /* The deferred host flush follows the first scopes of the dependencies
+    * that asked for it, as resolved for the whole submission. Like every
+    * command, it follows the first one where that carries the input syncs
+    * or a leading flush. */
+   uint16_t flush_barrier[HK_SYNC_NUM_SQ] = {DRM_ASAHI_BARRIER_NONE,
+                                             DRM_ASAHI_BARRIER_NONE};
+   uint64_t flush_prior[HK_SYNC_NUM_SQ] = {0, 0};
+   if (host_flush &&
+       !hk_sync_host_flush_prefix(&queue->sync, host_flush_kinds,
+                                  chain_first || prepend_cdm, prior_base,
+                                  sq_count, flush_barrier, flush_prior)) {
+      util_dynarray_fini(&payload);
+      if (unlikely(anatomy))
+         hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
+      hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
+      return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
+   }
 
    /* Sibling kernel queues (hk_queue::sib): an eligible submission takes the
     * next kernel queue in turn. Once a sibling has run work, the primary's
@@ -2063,6 +2153,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    bool sib_earlier = false;
    if (queue->sib.count > 1 && !replaced && !prepend_cdm && !unlikely(anatomy) &&
        !packed_bo &&
+       !(host_flush &&
+         hk_host_flush_names_earlier(flush_barrier, flush_prior, prior_base)) &&
        hk_sibling_eligible(dev, queue, submit, resolved, prior_base,
                            command_count, kernel_cumulative) &&
        hk_sibling_deep(dev, queue, first_chunk_point - 1)) {
@@ -2089,16 +2181,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    if (ts_carrier) {
       assert(queue->ts_carrier_bo);
       assert(!flush_sstt);
-      if (agx_chip_g17_m5(dev->dev.chip) &&
-          (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) {
-         const struct drm_asahi_cmd_header resources = {
-            .cmd_type = DRM_ASAHI_SET_COMPUTE_RESOURCES,
-            .size = 0,
-            .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
-            .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
-         };
-         util_dynarray_append(&payload, resources);
-      }
+      hk_queue_append_no_compute_resources(dev, &payload);
       struct drm_asahi_cmd_header header = agx_cmd_header(
          true,
          queue->sync.exact_prior ? DRM_ASAHI_BARRIER_NONE : 0,
@@ -2528,6 +2611,70 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             nr_vdm++;
          }
       }
+   }
+
+   if (host_flush) {
+      assert(queue->host_flush_bo);
+      hk_queue_append_no_compute_resources(dev, &payload);
+      struct drm_asahi_cmd_header header =
+         agx_cmd_header(true, flush_barrier[HK_SYNC_VDM],
+                        flush_barrier[HK_SYNC_CDM]);
+      /* The stream ends with the memory-scoped strong flush, so where the
+       * kernel takes a stream's own completion flush it takes this one, as
+       * for the flush streams command buffers end (hk_EndCommandBuffer()). */
+      const bool visible_completion = hk_cdm_visible_completion(dev);
+      struct drm_asahi_cmd_compute_with_prior cmd = {
+         .legacy = {
+            .flags = ((dev->dev.params.features &
+                       DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
+                         ? DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS
+                         : 0) |
+                     (visible_completion ? DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION
+                                         : 0),
+            .cdm_ctrl_stream_base = queue->host_flush_bo->va->addr,
+            .cdm_ctrl_stream_end =
+               queue->host_flush_bo->va->addr +
+               AGX3_CDM_BARRIER_SIZE + AGX3_CDM_STREAM_TERMINATE_SIZE,
+         },
+      };
+      uint64_t prior[HK_SYNC_NUM_SQ] = {
+         flush_prior[HK_SYNC_VDM], flush_prior[HK_SYNC_CDM],
+      };
+      if (sib_rewrite) {
+         for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+            prior[sq] = hk_drm_sibling_prior(prior[sq], prior_base[sq],
+                                             kq_base[sq], &sib_earlier);
+            if (flush_barrier[sq] == 0)
+               sib_earlier = true;
+         }
+      }
+      if (queue->sync.serialize &&
+          !hk_drm_serialize_prefix(&header, prior, nr_vdm, nr_cdm, prior_base,
+                                   queue->sync.exact_prior)) {
+         util_dynarray_fini(&payload);
+         if (unlikely(anatomy))
+            hk_frame_anatomy_end_submit(anatomy, dev, queue,
+                                        VK_ERROR_DEVICE_LOST);
+         hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
+         return vk_device_set_lost(&dev->vk,
+                                   "Asahi serialization ordinal overflow");
+      }
+      assert(header.vdm_barrier == DRM_ASAHI_BARRIER_NONE ||
+             header.vdm_barrier <= nr_vdm);
+      assert(header.cdm_barrier == DRM_ASAHI_BARRIER_NONE ||
+             header.cdm_barrier <= nr_cdm);
+      if (queue->sync.exact_prior) {
+         header.size = sizeof(cmd);
+         cmd.prior_vdm = prior[HK_SYNC_VDM];
+         cmd.prior_cdm = prior[HK_SYNC_CDM];
+      }
+      if (unlikely(anatomy))
+         hk_frame_anatomy_note(dev, "host flush kinds=0x%x barrier=%u,%u",
+                               host_flush_kinds, header.vdm_barrier,
+                               header.cdm_barrier);
+      util_dynarray_append(&payload, header);
+      util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
+      nr_cdm++;
    }
 
    if (dev->dev.debug & AGX_DBG_TRACE) {
@@ -3530,6 +3677,7 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
    }
    agx_bo_unreference(&dev->dev, queue->g17p_sstt_flush_bo);
    agx_bo_unreference(&dev->dev, queue->ts_carrier_bo);
+   agx_bo_unreference(&dev->dev, queue->host_flush_bo);
    util_dynarray_fini(&queue->sync_resolved);
    hk_queue_pack_free_packets(queue);
    util_dynarray_fini(&queue->pack.members);

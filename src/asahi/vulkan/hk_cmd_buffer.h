@@ -3020,6 +3020,12 @@ void brl_discard_init_record(struct hk_cmd_buffer *cmd,
 void hk_cdm_visibility_flush(struct hk_device *dev, struct hk_cs *cs,
                              bool memory);
 
+/* The AGX3 strong flush record hk_cdm_visibility_flush(dev, cs, memory)
+ * appends, for a stream the driver builds outside a command buffer. False
+ * where the chip has no grounded encoding. */
+bool hk_cdm_pack_visibility_flush(const struct hk_device *dev, bool memory,
+                                  uint8_t packed[AGX3_CDM_BARRIER_SIZE]);
+
 /* Whether hk_cdm_visibility_flush(dev, cs, memory) would record anything. */
 bool hk_cdm_visibility_flush_needed(const struct hk_device *dev,
                                     const struct hk_cs *cs, bool memory);

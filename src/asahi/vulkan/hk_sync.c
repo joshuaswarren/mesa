@@ -461,6 +461,26 @@ hk_sync_host_flush_kinds(const VkDependencyInfo *info)
    return kinds;
 }
 
+/* The host observes memory only through a fence, semaphore or queue wait at
+ * the end of a submission, or through an event status written before then
+ * (hk_sync_take_host_flush()), so the flush can wait until the submission's
+ * end. One flush there serves every such dependency of the submission, and
+ * no stream is created between the work around them. */
+void
+hk_sync_defer_host_flush(struct hk_cmd_buffer *cmd,
+                         const VkDependencyInfo *info)
+{
+   cmd->sync.host_flush_kinds |= hk_sync_host_flush_kinds(info);
+}
+
+uint8_t
+hk_sync_take_host_flush(struct hk_cmd_buffer *cmd)
+{
+   const uint8_t kinds = cmd->sync.host_flush_kinds;
+   cmd->sync.host_flush_kinds = 0;
+   return kinds;
+}
+
 void
 brl_sync_transition_kinds(const VkDependencyInfo *info,
                           const VkImageMemoryBarrier2 *barrier,
@@ -2098,6 +2118,53 @@ hk_sync_queue_kinds(const struct hk_sync_queue *q, unsigned sq)
          kinds |= BITFIELD_BIT(k);
    }
    return kinds;
+}
+
+bool
+hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds, bool chain,
+                          const uint64_t base[HK_SYNC_NUM_SQ],
+                          const uint32_t count[HK_SYNC_NUM_SQ],
+                          uint16_t barrier[HK_SYNC_NUM_SQ],
+                          uint64_t prior[HK_SYNC_NUM_SQ])
+{
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      barrier[sq] = DRM_ASAHI_BARRIER_NONE;
+      prior[sq] = 0;
+
+      if (q->exact_prior) {
+         /* What resolve_one() gives a stream of every kind whose first
+          * scope is `kinds`, at the end of the submission: the latest
+          * command of those kinds, and every requirement still carried, as
+          * a stream recorded at the dependency itself would have picked up.
+          * A command of this submission within the 16-bit field is named by
+          * its position, any other by its ordinal. Waits are prefixes. */
+         uint64_t v = 0;
+         u_foreach_bit(k, kinds)
+            v = MAX2(v, q->last_absolute[k][sq]);
+         for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k)
+            v = MAX2(v, q->tail[k][sq]);
+         if (chain && count[sq])
+            v = MAX2(v, base[sq] + count[sq]);
+         if (v > base[sq] && v - base[sq] < DRM_ASAHI_BARRIER_NONE)
+            barrier[sq] = (uint16_t)(v - base[sq]);
+         else
+            prior[sq] = v;
+      } else if (count[sq]) {
+         /* Legacy prefixes carry no history to resolve against here: follow
+          * the submission's last command on the subqueue, */
+         barrier[sq] = MIN2(count[sq], DRM_ASAHI_BARRIER_NONE - 1);
+      } else if (q->ever[sq]) {
+         /* or with none, every command of earlier ioctls. */
+         barrier[sq] = 0;
+      }
+   }
+
+   if (q->exact_prior) {
+      if (q->submitted[HK_SYNC_CDM] == UINT64_MAX)
+         return false;
+      q->submitted[HK_SYNC_CDM]++;
+   }
+   return true;
 }
 
 uint8_t
