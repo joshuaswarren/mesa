@@ -17881,15 +17881,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 (src.cache && src.discard))
                AGX3_REFUSE(I);
             uint8_t bytes[AGX3_ALU_MAX_LENGTH],len;
-            /* The half-input leaf requires a retained source. Cache hints
-             * are advisory, so retain even a last-use half after legalization
+            /* The half-input leaf requires a retained source on both
+             * encodings. A last-use hint only releases the register early,
+             * so retaining a half that is not read again is always correct:
+             * retain even a last-use or unhinted half, as after legalization
              * has widened its other reads for the following multiply. */
-            const enum agx3_alu_hint half_hint =
-               enc == AGX_ISA_ENCODING_AGX3B
-                  ? AGX3_ALU_HINT_CACHE : agx3_post_ra_hint(src);
             const bool ok =
                half ? agx3_alu_sqrt_step_half(enc, dest.value, src.value,
-                                              half_hint,
+                                              AGX3_ALU_HINT_CACHE,
                                               enc == AGX_ISA_ENCODING_AGX3C ? dest.cache : true,
                                               wait, bytes, &len)
                     : (src.size == AGX_SIZE_32 && !(src.value & 1) &&
