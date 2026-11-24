@@ -5818,14 +5818,13 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    /* G17P hardware vertex programs (API VS, GS raster and native TES
     * variants) run per-draw uniform work once in a native vertex constant
-    * program, as Apple's compiler does: e.g. ProjMat * ModelViewMat. */
-   /* HAL300 sets the same vertex constant program and packs its TI IPR/spill
-    * quads into every VDM template exactly as HAL200 does. */
-   const bool vs_cprog =
-      (agx_chip_native_preamble(dev->dev.chip) ||
-       agx_chip_g17_m5(dev->dev.chip)) &&
-      hw && nir->info.stage == MESA_SHADER_VERTEX &&
-      !shader->info.agx3_gen1_fragment_rq;
+    * program (e.g. ProjMat * ModelViewMat). On M5 kernels that advertise
+    * render stage prefixes, omit the vertex constant program so non-spilling
+    * vertex shaders stay free of TPS and can overlap earlier fragment work
+    * through stage prefixes (hk_allow_vs_cprog()). */
+   const bool vs_cprog = hk_allow_vs_cprog(
+      dev->dev.chip, dev->dev.params.features, hw, nir->info.stage,
+      shader->info.agx3_gen1_fragment_rq);
    bool compiled = vs_cprog &&
       hk_g17p_compile_vs_cprog(dev, &nir, &backend_key, shader);
    if (!compiled &&
