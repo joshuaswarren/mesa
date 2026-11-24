@@ -590,6 +590,19 @@ if with_tests
   )
 
   test(
+    'agx3b_encoding_opts',
+    executable(
+      'agx3b_encoding_opts_test',
+      files('test/test-agx3b-encoding-opts.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'agx3_int64',
     executable(
       'agx3_int64_test',
