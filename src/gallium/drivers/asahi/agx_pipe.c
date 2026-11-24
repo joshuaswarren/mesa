@@ -453,26 +453,34 @@ agx_twiddled_allowed(const struct agx_resource *pres)
    return true;
 }
 
-/* G17P depth: a private, single-level, single-layer 1x/2x/4x Z32_FLOAT or
- * Z16_UNORM depth buffer (including the separated Z32_FLOAT plane of
- * Z32F_S8 and Z24S8). ZLS writes it compressed through the metadata
- * agx_batch already passes, and the compressed Gen9 2D / 2D-multisample
- * texture packet reads it.
+/* G17P depth: a private, single-level Z32_FLOAT or Z16_UNORM depth buffer,
+ * including the separated Z32_FLOAT plane of Z32F_S8 and Z24S8. Single-layer
+ * 1x/2x/4x 2D targets are admitted across AGX_CHIP_G17P (matching Borealis for
+ * Z16/Z32F 2D). Single-sample 2D arrays are currently gated to A18 Pro
+ * (AGX_CHIP_ID_A18_PRO), where the layered ZLS, Gen9 compressed 2D-array
+ * texture, and per-layer compressed 2D PBE paths have been verified on
+ * hardware (Borealis currently gates depth arrays to M4 Pro; M4 Pro/Max can be
+ * enabled here once their Gallium layered runs are collected).
  *
  * The width0/height0 >= 16 check is intentionally in pixels (stricter than
  * ail_can_compress(), which measures in samples at 2x/4x) so sub-16px
- * multisample targets stay uncompressed where metadata overhead outweighs
- * bandwidth savings.
+ * targets stay uncompressed where metadata overhead outweighs bandwidth
+ * savings.
  */
 static bool
 agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
                                            const struct pipe_resource *templ)
 {
-   return dev->chip == AGX_CHIP_G17P &&
-          templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
-          templ->array_size <= 1 && templ->last_level == 0 &&
-          (templ->nr_samples <= 1 || templ->nr_samples == 2 ||
-           templ->nr_samples == 4) &&
+   const bool target_ok =
+      (templ->target == PIPE_TEXTURE_2D && templ->array_size <= 1 &&
+       (templ->nr_samples <= 1 || templ->nr_samples == 2 ||
+        templ->nr_samples == 4)) ||
+      (dev->params.chip_id == AGX_CHIP_ID_A18_PRO &&
+       templ->target == PIPE_TEXTURE_2D_ARRAY && templ->array_size >= 1 &&
+       templ->nr_samples <= 1);
+
+   return dev->chip == AGX_CHIP_G17P && target_ok &&
+          templ->depth0 == 1 && templ->last_level == 0 &&
           (templ->format == PIPE_FORMAT_Z32_FLOAT ||
            templ->format == PIPE_FORMAT_Z16_UNORM) &&
           templ->width0 >= 16 && templ->height0 >= 16 &&
@@ -1704,6 +1712,12 @@ transition_resource(struct pipe_context *pctx, struct agx_resource *rsrc,
    rsrc->bo = new_res->bo;
    new_res->bo = old;
 
+   /* Any sampler view or image already bound to a stage keeps pointing at rsrc,
+    * so force descriptor re-upload after the BO/layout swap. */
+   struct agx_context *ctx = agx_context(pctx);
+   for (unsigned s = 0; s < MESA_SHADER_STAGES; ++s)
+      ctx->stage[s].dirty |= AGX_STAGE_DIRTY_IMAGE;
+
    /* Free the new resource, which now owns the old BO */
    pipe_resource_reference((struct pipe_resource **)&new_res, NULL);
 }
@@ -1780,6 +1794,16 @@ agx_zls_layer_stride(struct agx_device *dev, const struct ail_layout *layout,
            util_is_aligned(layout->layer_stride_B, AIL_PAGESIZE)) &&
           "Page aligned Z/S layers");
    unsigned pages = layout->layer_stride_B / AIL_PAGESIZE;
+   /* A sub-page single-layer depth/stencil buffer (such as a small Z16 or
+    * Z32F texture) has pages == 0, so ((pages - 1) << 14) | 1 underflows to
+    * 0xffffc001. The layer stride is unused for single-layer rendering, and
+    * the AGX3/G18G kernel ZLS validation rejects 0xffffc001, so return 0
+    * (matching Borealis). AGX2 keeps the existing underflowed word so G13/G14
+    * command streams stay unchanged. */
+   if (agx_chip_native_or_g18g(dev->chip) && single_layer && pages == 0) {
+      assert(layout->depth_px == 1);
+      return 0;
+   }
    return ((pages - 1) << 14) | 1;
 }
 
