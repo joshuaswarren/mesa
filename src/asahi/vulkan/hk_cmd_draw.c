@@ -15034,7 +15034,7 @@ hk_agx3_emit_indirect_multi(struct hk_cmd_buffer *cmd,
       cs->stats.calls += emitted;
       cs->stats.cmds += emitted;
       hk_upload_stat(cmd, draws, emitted);
-      hk_g17p_note_layer_zero_draw(cmd, cs);
+      hk_note_attachmentless_draw(cmd, cs);
       hk_note_pre_raster_images(cmd, cs);
       hk_m5_note_render_resources(cmd, cs);
    }
