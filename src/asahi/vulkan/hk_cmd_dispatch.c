@@ -15,6 +15,7 @@
 #include "hk_byte_stencil.h"
 #include "hk_acceleration_structure.h"
 #include "hk_cmd_buffer.h"
+#include "hk_nir_root_size.h"
 #include "hk_g17p_storage_image.h"
 #include "hk_frame_anatomy.h"
 #include "hk_sampler_index.h"
@@ -34,6 +35,7 @@
 #include "libagx_shaders.h"
 #include "asahi/genxml/agx3_cmdstream.h"
 #include "asahi/lib/agx3_g17p_grid_helper_core.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/lib/agx_scs_layout.h"
 #include "asahi/lib/agx_rt_compute_gen1.h"
 #include "util/log.h"
@@ -3159,6 +3161,48 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       local_size = agx_workgroup(s->b.info.launch_size[0],
                                  s->b.info.launch_size[1],
                                  s->b.info.launch_size[2]);
+   } else if (!agx_is_indirect(grid) && !in_threads &&
+              agx_chip_has_cap(hk_cmd_buffer_device(cmd)->dev.chip,
+                               AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) &&
+              (s->info.agx3_root_reads & HK_ROOT_PROVEN_WG_COALESCE_SAFE) &&
+              !s->b.info.uses_ray_traversal && !s->b.info.local_size &&
+              !s->b.info.scratch_size &&
+              !s->b.info.agx3_spectpr_scratch_size &&
+              !s->b.info.uses_matrix16 &&
+              !desc->root.cs.trace_rays_addr &&
+              hk_nir_dispatch_zero_base(desc->root.cs.base_group)) {
+      struct hk_device *dev = hk_cmd_buffer_device(cmd);
+      const uint32_t eff_gprs = MAX2((uint32_t)s->b.info.nr_gprs,
+                                     (uint32_t)s->b.info.nr_preamble_gprs);
+      uint32_t max_wg =
+         dev->vk.physical->properties.maxComputeWorkGroupInvocations;
+      if (s->b.info.stats.threads)
+         max_wg = MIN2(max_wg, s->b.info.stats.threads);
+      if (eff_gprs > 256u)
+         max_wg = 0;
+      else if (eff_gprs)
+         max_wg = MIN2(max_wg,
+                       agx_occupancy_for_register_count(eff_gprs).max_threads);
+      /* Short, low-register, loop-free pure-global shaders still hit AGX3's
+       * per-WG CDM launch floor at wg=256 on massive grids; coalesce them up
+       * to 512 threads (>= 1024 WGs). Account for native constant-program
+       * register usage when preambles are active. General pure-global shaders
+       * cap at 256 (>= 256 WGs, and always >= 4 * num_cores so wide GPUs
+       * never lose core saturation); never 1024, which regresses on AGX3. */
+      const uint32_t target_wg =
+         (!s->b.info.has_loops && s->b.info.stats.instrs <= 64u &&
+          eff_gprs <= 24u)
+            ? 512u
+            : 256u;
+      const uint64_t min_wgs =
+         MAX2(256ull, 4ull * agx_get_num_cores(&dev->dev));
+      uint16_t coalesced[3];
+      if (hk_coalesce_workgroup_size_ex(
+             s->b.info.workgroup_size, grid.count,
+             dev->vk.physical->properties.maxComputeWorkGroupSize, max_wg,
+             target_wg, min_wgs, coalesced)) {
+         local_size = agx_workgroup(coalesced[0], coalesced[1], coalesced[2]);
+      }
    }
 
    if (cs->g18_dispatch_sealed) {

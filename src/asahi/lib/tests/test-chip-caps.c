@@ -43,7 +43,8 @@ static unsigned checks;
 
 #define CAP_BIT(cap, predicate) | (cap)
 static const unsigned all_caps =
-   (0 CAPS(CAP_BIT)) | AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_DESCRIPTOR_BUFFER;
+   (0 CAPS(CAP_BIT)) | AGX_CAP_SPARSE_RESIDENCY_3D |
+   AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its
@@ -102,12 +103,26 @@ test_unknown_has_none(void)
       CHECK(!agx_chip_has_cap((enum agx_chip)i, 0));
 }
 
+/* AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS is enabled only on G17P until
+ * per-generation hardware A/B benchmarks and CTS rows qualify other parts. */
+static void
+test_coalesce_pure_global_workgroups(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) ==
+                    (c == AGX_CHIP_G17P),
+                 c);
+   }
+}
+
 int
 main(void)
 {
    test_table_covers_every_chip();
    test_caps_match_predicates();
    test_unknown_has_none();
+   test_coalesce_pure_global_workgroups();
 
    if (failures) {
       fprintf(stderr, "agx_chip_caps: %u of %u checks failed\n", failures,

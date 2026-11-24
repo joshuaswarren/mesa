@@ -329,6 +329,14 @@ enum hk_root_reads {
    /* Push constants: vertex-only push updates leave fragment-visible root
     * bytes unchanged unless the fragment shader reads push constants. */
    HK_ROOT_READS_PUSH = BITFIELD_BIT(3),
+   /* Compute-only positive proof (inverted polarity so older cached binaries
+    * default to 0 = conservative): API workgroup has <= 256 invocations (a
+    * multiple of 32), depends only on global invocation ID / zero base_group
+    * (no shared/tile/scratch/ray/matrix/barrier/subgroup/local/workgroup
+    * builtins, and never observes group_count_addr), so direct zero-base
+    * dispatches may launch in coalesced hardware workgroups up to 256/512
+    * threads that evenly divide the thread grid. */
+   HK_ROOT_PROVEN_WG_COALESCE_SAFE = BITFIELD_BIT(4),
 };
 
 /* Every root byte a draw may republish without the fragment stage observing
