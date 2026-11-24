@@ -2065,10 +2065,11 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
       load->memory_byte_offset = byte_offset;
    load->memory_is_packed = packed_count != 0;
    /* nir_opt_access proved nothing writes this memory and it is not
-    * volatile, so the read is a function of its address alone. The M5 spiller
-    * may then repeat it in place of filling the value from a spill slot. */
+    * volatile, so the read is a function of its address alone. The AGX3
+    * spiller may then repeat it in place of filling the value from a spill
+    * slot. */
    load->memory_can_reorder =
-      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      agx_isa_is_agx3(b->shader->key->dev.encoding) &&
       nir_intrinsic_can_reorder(instr) && !nir_is_coherent(instr);
    agx_emit_cached_split(b, dest, instr->def.num_components);
 }
@@ -2887,7 +2888,7 @@ agx_emit_image_load(agx_builder *b, agx_index dst, nir_intrinsic_instr *intr)
     * image writes (native725 vs_copy). */
    const enum gl_access_qualifier access = nir_intrinsic_access(intr);
    I->memory_can_reorder =
-      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      agx_isa_is_agx3(b->shader->key->dev.encoding) &&
       (access & ACCESS_CAN_REORDER) && (access & ACCESS_RESTRICT) &&
       !nir_is_coherent(intr);
    I->mask = agx_expand_tex_to(b, &intr->def, tmp,
@@ -10217,13 +10218,13 @@ agx_nir_limit_heavy_branch_unroll(nir_shader *nir)
  * the latter run should be almost a no-op.
  */
 static void
-agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
+agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p, bool unroll_64)
 {
    const nir_shader_compiler_options *saved_options = nir->options;
    nir_shader_compiler_options options;
-   /* Native M5 ALU throughput benefits from exposing its 64-iteration
+   /* Native AGX3 ALU throughput benefits from exposing its 64-iteration
     * loops before scheduling. Keep earlier GPU generations unchanged. */
-   if (m5) {
+   if (unroll_64) {
       options = *saved_options;
       options.max_unroll_iterations = 64;
       nir->options = &options;
@@ -10948,7 +10949,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       if (preamble_size && (epilog_has_alu || preamble_newly_enabled)) {
          nir_opt_reassociate_loop(
             nir, nir_reassociate_scalar_math | nir_reassociate_cse_heuristic |
-                    (m5 ? nir_reassociate_loop_invariant : 0));
+                    ((agx3b || m5) ? nir_reassociate_loop_invariant : 0));
       }
       if (epilog_has_alu)
          NIR_PASS(_, nir, agx_nir_lower_fminmax, agx3b || m5);
@@ -10958,7 +10959,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    /* This runs only once up front since other optimizations don't affect it */
    NIR_PASS(_, nir, nir_opt_shrink_stores, true);
 
-   agx_optimize_loop_nir(nir, m5, g17p);
+   agx_optimize_loop_nir(nir, m5, g17p, agx3b || m5);
 
    /* Loops are unrolled now: a subgroup relative shuffle whose mask/delta is
     * still not a constant in 1..31 takes the general lowering
@@ -10968,7 +10969,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       bool lowered = false;
       NIR_PASS(lowered, nir, agx_nir_lower_dynamic_shuffle_xor);
       if (lowered)
-         agx_optimize_loop_nir(nir, m5, g17p);
+         agx_optimize_loop_nir(nir, m5, g17p, agx3b || m5);
    }
 
    /* If soft fault is enabled, we can freely speculate everything. That lets us
@@ -10990,11 +10991,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
             &peephole_select_options);
 
    /* Small uniform ifs whose arms load from memory, which peephole select
-    * keeps: on M5 an if costs five control-flow instructions and a wait for
+    * keeps: on AGX3 an if costs five control-flow instructions and a wait for
     * every load in flight. Flattening one can expose another around it.
     * Not on G18G, which compiles as AGX3C with emit_agx3d (g18_scans). */
    bool any_flattened = false;
-   if (m5 && !g18_scans) {
+   if ((agx3b || m5) && !g18_scans) {
       bool flattened;
       do {
          flattened = false;
@@ -11016,7 +11017,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       bool folded_bits = false;
       NIR_PASS(folded_bits, nir, agx_nir_opt_monotonic_bit_insert);
       if (folded_bits)
-         agx_optimize_loop_nir(nir, m5, g17p);
+         agx_optimize_loop_nir(nir, m5, g17p, agx3b || m5);
    }
 
    /* Compute shaders defer shared-offset lowering until after
@@ -11187,7 +11188,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     */
    if (nir_opt_reassociate_loop(
           nir, nir_reassociate_scalar_math | nir_reassociate_cse_heuristic |
-                  (m5 ? nir_reassociate_loop_invariant : 0)))
+                  ((agx3b || m5) ? nir_reassociate_loop_invariant : 0)))
       pre_fuse_dirty = false;
 
    /* Lower fmin/fmax before optimizing preambles so we can see across uniform
@@ -14927,7 +14928,8 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
        * will run through the loop later, once we have the shader key, but if we
        * run now, that run will ideally be almost a no-op.
        */
-      agx_optimize_loop_nir(nir, !g17p && native_fragment_depth, g17p);
+      agx_optimize_loop_nir(nir, !g17p && native_fragment_depth, g17p,
+                            g17p || m5);
    } else {
       NIR_PASS(_, nir, nir_opt_copy_prop);
       NIR_PASS(_, nir, nir_opt_constant_folding);
@@ -17053,7 +17055,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    const bool form_preamble = !key->secondary && !key->no_preamble;
    const bool is_agx3 = key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
                        key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
-   const bool is_g17p = key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+   const bool is_agx3b = key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
    const bool m5_wide_product =
       key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !key->dev.emit_agx3d;
 
@@ -17191,7 +17193,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
             NIR_PASS(_, nir, agx_nir_lower_f2bf_rtne);
          agx3_options.lower_bfloat16_conversions = true;
       }
-      if (is_g17p) {
+      if (is_agx3b) {
          /* G17P's saturate form is a standalone f32add.ep2 operation. */
          agx3_options.lower_fsat = false;
          /* G17P lowers unsigned saturating subtract to compare/sub/select. */
@@ -17222,7 +17224,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    const mesa_shader_stage stage = nir->info.stage;
    const bool uniform_atomics =
       !is_agx3 ||
-      (is_g17p && (stage == MESA_SHADER_COMPUTE ||
+      (is_agx3b && (stage == MESA_SHADER_COMPUTE ||
                    stage == MESA_SHADER_VERTEX ||
                    stage == MESA_SHADER_TESS_CTRL ||
                    stage == MESA_SHADER_FRAGMENT));
@@ -17258,8 +17260,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    /* Only the one-sample AGX3B coverage path reads
     * bit 0 alone; sample loops and multisampled variants keep whole masks. */
    const bool discard_word =
-      ((is_g17p && key->dev.encoding == AGX_ISA_ENCODING_AGX3B) ||
-       key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+      (is_agx3b || key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
       nir->info.stage == MESA_SHADER_FRAGMENT &&
       MAX2(key->fs.nr_samples, 1) == 1 && !key->fs.inside_sample_loop;
 
@@ -17327,7 +17328,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
                key->reserved_preamble,
                info->agx3_uniform_dma_count ? info->agx3_uniform_dma[0].dest
                                             : push_count,
-               &push_count, is_g17p);
+               &push_count, is_agx3b);
       info->push_count = push_count;
    }
 
@@ -17337,21 +17338,59 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       post_opt_progress = true;
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
+   if (is_agx3) {
       /* Hoist only what the register file can hold through the loop, matching
        * agx_ra_impl's shader-specific limits. Only static-split targets
-       * (emit_agx3d) cap compute shaders by workgroup occupancy.
+       * (emit_agx3d) cap compute shaders by workgroup occupancy. AGX3B uses
+       * Dynamic Caching (no static per-workgroup register split), so bound it
+       * by its 192-half file less headroom for backend register expansion,
+       * and mirror RA's agx3_cube_register_budget() cap when sampling
+       * cube/cube-array maps.
        */
-      unsigned regs = key->dev.emit_agx3d ? AGX3D_NUM_REGS : AGX3C_NUM_REGS;
-      if (mesa_shader_stage_is_compute(nir->info.stage) &&
-          key->dev.emit_agx3d) {
-         const unsigned threads = nir->info.workgroup_size_variable
-            ? 1024
-            : nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
-                 nir->info.workgroup_size[2];
-         regs = MIN2(regs, agx_max_registers_for_occupancy(threads));
+      unsigned regs;
+      if (is_agx3b) {
+         regs = AGX3B_NUM_REGS;
+         nir_foreach_function_impl(impl, nir) {
+            nir_foreach_block(block, impl) {
+               nir_foreach_instr(instr, block) {
+                  if (instr->type != nir_instr_type_tex)
+                     continue;
+                  nir_tex_instr *tex = nir_instr_as_tex(instr);
+                  if (tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE)
+                     continue;
+                  const bool has_bias_min =
+                     tex->op == nir_texop_txb &&
+                     nir_tex_instr_src_index(tex, nir_tex_src_min_lod) >= 0;
+                  regs = MIN2(regs,
+                              (tex->is_array || has_bias_min)
+                                 ? AGX3B_CUBE_ARRAY_MAX_REGS
+                                 : AGX3B_CUBE_MAX_REGS);
+               }
+            }
+         }
+         regs -= 16;
+
+         /* On AGX3B graphics stages, cap NIR LICM at the 1024-thread tier so
+          * backend varying/sample register expansion cannot push
+          * medium-pressure fragment/vertex shaders into spills or lower thread
+          * counts. Compute shaders keep the full Dynamic Caching budget (176
+          * halves, or 96 when sampling cube arrays). */
+         if (!mesa_shader_stage_is_compute(nir->info.stage))
+            regs = MIN2(regs, agx_max_registers_for_occupancy(1024));
+      } else {
+         regs = key->dev.emit_agx3d ? AGX3D_NUM_REGS : AGX3C_NUM_REGS;
+         if (mesa_shader_stage_is_compute(nir->info.stage) &&
+             key->dev.emit_agx3d) {
+            const unsigned threads = nir->info.workgroup_size_variable
+               ? 1024
+               : nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
+                    nir->info.workgroup_size[2];
+            regs = MIN2(regs, agx_max_registers_for_occupancy(threads));
+         }
       }
+      /* RA's ray-traversal compute budget applies to AGX3C only. */
       const bool cap_rt_compute =
+         key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
          nir->info.stage == MESA_SHADER_COMPUTE && !key->is_helper &&
          (nir->info.ray_queries != 0 || uses_scs);
       if (key->is_helper)
@@ -17399,9 +17438,9 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
 
    /* Apple issues a loop body's samples in source order and consumes all of
     * them after the last one (native robust_loop witness); Mesa consumed each
-    * right after its sample. Geometry-side M5 stages, like the M5 copy-loop
+    * right after its sample. Geometry-side AGX3 stages, like the AGX3 copy-loop
     * schedule; see agx_nir_opt_sink_loop_sample_uses.c. */
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+   if (is_agx3 &&
        nir->info.stage != MESA_SHADER_FRAGMENT &&
        nir->info.stage != MESA_SHADER_COMPUTE) {
       NIR_PASS(_, nir, agx_nir_opt_sink_loop_sample_uses);
@@ -17443,7 +17482,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       nir_print_shader(nir, stdout);
 
-   if (is_g17p) {
+   if (is_agx3b) {
       info->agx3_uniform_halfs_valid = true;
       nir_foreach_function_with_impl(func, impl, nir) {
          nir_foreach_block(block, impl) {

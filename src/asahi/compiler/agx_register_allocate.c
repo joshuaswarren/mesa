@@ -3064,8 +3064,9 @@ agx3_cube_register_budget(agx_context *ctx)
       const bool own_scratch = !I->agx3_cube_scalar_coords && I->nr_srcs == 7;
       budget = MIN2(budget,
                     ((I->dim == AGX_DIM_CUBE_ARRAY && !own_scratch) || bias_min)
-                       ? 112 : own_scratch ? AGX3B_NUM_REGS - 16
-                                           : AGX3B_NUM_REGS - 8);
+                       ? AGX3B_CUBE_ARRAY_MAX_REGS
+                       : own_scratch ? AGX3B_NUM_REGS - 16
+                                     : AGX3B_CUBE_MAX_REGS);
       shared_cem |= !own_scratch;
       packed_layer |= own_scratch && I->src[1].type != AGX_INDEX_IMMEDIATE &&
                       (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||

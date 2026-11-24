@@ -22,6 +22,14 @@
 /* G17P's register file: halves 0..191. */
 #define AGX3B_NUM_REGS (192)
 
+/* AGX3B cube/cube-array register budgets shared between NIR LICM and RA
+ * (agx3_cube_register_budget): cube-array face staging without own scratch
+ * and bias+min_lod place 16 halves of CEM scratch above the allocation inside
+ * the 7-bit register-field limit (112 = 128 - 16 halves); plain cube reserves
+ * 8 halves above the allocation for CEM scratch. */
+#define AGX3B_CUBE_ARRAY_MAX_REGS (112)
+#define AGX3B_CUBE_MAX_REGS       (AGX3B_NUM_REGS - 8)
+
 struct agx_cf_binding {
    /* Base coefficient register */
    uint8_t cf_base;
