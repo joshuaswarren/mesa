@@ -14,32 +14,17 @@ struct hk_shader;
 struct hk_tess_info;
 
 /*
- * Software tessellation runs five compute stages before the render, each
- * reading what the previous one wrote (hk_launch_tess()). Recorded draw by
- * draw, every stage needs a cache flush: a pass of a few hundred terrain
- * patches becomes thousands of serialized tiny dispatches. The draws of one
- * render do not read each other's tessellation state, so their stages can
- * run side by side: each stage is recorded into its own side stream, and
- * hk_tess_batch_flush() splices the streams into the pre-graphics stream
- * with one flush after each stage.
+ * Batch the five pre-graphics software tessellation compute stages
+ * (hk_launch_tess()) across independent draws in a render pass: each stage
+ * records into its own side stream, and hk_tess_batch_flush() splices the
+ * stages into the pre-graphics stream with a single cache flush per stage.
  *
- * Within a side stream, consecutive launches carry no barrier at all, as
- * consecutive application dispatches on G15 (hk_dispatch_g17p_native()).
- * Even the weak ordering barrier that ends every native launch waits for the
- * launch before it: with it, a pass of 1024 draws (vulkan-tess-batch) takes
- * 27 ms on the M4 Pro whether or not the stages also flush; without it, 1 ms.
- * This needs two things. The launches of one stage are independent: each
- * reads only what the previous stage of its own draw wrote, and tessellator
- * heap allocations are atomic. And the cache flush after a stage waits for
- * all of its launches, not just the last one, before the next stage starts,
- * as G15's barrier-less application dispatches assume
- * (agx_chip_elide_app_dispatch_barrier()); vulkan-tess-batch-order is the
- * hardware test for it. The G17P stream validator accepts direct launches
- * back to back and still wants a barrier before anything else.
- *
- * Any other work for the pre-graphics stream flushes the batch first
- * (hk_cmd_buffer_get_cs_general()), as does the end of the render, so that
- * work keeps its place after the tessellation of the draws before it.
+ * Consecutive launches within a side stream omit the trailing weak ordering
+ * barrier so independent draws overlap (tessellator heap allocations are
+ * atomic, and the stage-end cache flush waits for all launches before the next
+ * stage starts; G17P's stream validator permits back-to-back direct launches
+ * but still requires a barrier before any other work). Any other pre-graphics
+ * work (hk_cmd_buffer_get_cs_general()) or render end flushes the batch first.
  */
 enum hk_tess_stage {
    HK_TESS_STAGE_VS,
@@ -66,15 +51,12 @@ struct hk_tess_batch {
 };
 
 /*
- * Whether a draw's tessellation may join the batch. An indirect draw sizes
- * its stages on the GPU with a setup kernel of its own, and a geometry shader
- * consumes the tessellation right away. Pipeline statistics, clipper and
- * primitives-generated counters are incremented without atomics by every
- * draw's stages, so concurrent stages would lose counts.
- *
- * shortcut: G17P only, measured on the M4 Pro (T6040); the A18 Pro (T8140)
- * shares the chip id. G15/G16 native graphics take the same dispatch path
- * and could join once tested.
+ * Direct tessellation draws without geometry shaders (which consume
+ * tessellation immediately) or non-atomic pipeline/clipper/primitives-generated
+ * counters may join the batch; indirect draws use a GPU setup kernel.
+ * Admitted: G17P (measured on M4 Pro / T6040: 27 ms -> 1 ms on 1024 draws,
+ * barrier elision verified by vulkan-tess-batch-order; A18 Pro / T8140 shares
+ * the chip id and is untested); closed: G15/G16 native (same path, untested).
  */
 static inline bool
 hk_tess_batchable(enum agx_chip chip, struct agx_draw draw, bool geometry,
