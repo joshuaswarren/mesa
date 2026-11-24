@@ -28,6 +28,7 @@
  * Common helper functions for PBO up- and downloads.
  */
 
+#include "state_tracker/st_atom.h"
 #include "state_tracker/st_context.h"
 #include "state_tracker/st_nir.h"
 #include "state_tracker/st_pbo.h"
@@ -275,12 +276,30 @@ st_pbo_draw(struct st_context *st, const struct st_pbo_addresses *addr,
    /* Disable stream output */
    cso_set_stream_outputs(cso, 0, NULL, 0, 0);
 
+   /* EXT_window_rectangles only applies to drawing commands and clears, never
+    * to texture uploads/downloads or ReadPixels. Temporarily disable active
+    * window rectangles for the PBO meta-draw and mark them dirty so the next
+    * GL draw restores them.
+    */
+   bool restore_window_rects = false;
+   if (st->pipe->set_window_rectangles &&
+       (st->state.window_rects.num > 0 || st->state.window_rects.include)) {
+      st->pipe->set_window_rectangles(st->pipe, false, 0, NULL);
+      st->state.window_rects.num = 0;
+      st->state.window_rects.include = false;
+      restore_window_rects = true;
+   }
+
    if (addr->depth == 1) {
       cso_draw_arrays(cso, MESA_PRIM_TRIANGLE_STRIP, 0, 4);
    } else {
       cso_draw_arrays_instanced(cso, MESA_PRIM_TRIANGLE_STRIP,
                                 0, 4, 0, addr->depth);
    }
+
+   if (restore_window_rects)
+      ST_SET_STATE(st->ctx->NewDriverState, ST_NEW_WINDOW_RECTANGLES);
+
    pipe_resource_release(st->pipe, cb_releasebuf);
    pipe_resource_release(st->pipe, vb_releasebuf);
 

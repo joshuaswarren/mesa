@@ -69,7 +69,7 @@ hk_trace_rays_record(const VkStridedDeviceAddressRegionKHR *raygen,
 static struct hk_ray_tracing_pipeline *
 hk_bound_rt_pipeline(struct hk_cmd_buffer *cmd)
 {
-   struct hk_ray_tracing_pipeline *pipeline = cmd->state.rt.pipeline;
+   struct hk_ray_tracing_pipeline *pipeline = cmd->rt.pipeline;
 
    if (pipeline == NULL ||
        (pipeline->shader == NULL && pipeline->kernel_count == 0)) {

@@ -9,6 +9,7 @@
 #include "agx3_alu_core.h"
 #include "agx3_falu_mod_core.h"
 #include "agx3_pack.h"
+#include "agx3_compose/agx3_decode.h"
 #include "agx3_alu_core_vectors.c"
 #include <stdio.h>
 #include <stdlib.h>
@@ -3205,9 +3206,100 @@ static void test_native_half_multiply(void)
    const bool both_abs[]={true,true};
    uint8_t bytes[AGX3_ALU_MAX_LENGTH],len;
    assert(agx3_alu_hmul_abs(AGX_ISA_ENCODING_AGX3B,2,src,hints,both_abs,
-                            false,32,bytes,&len));
+                            false,false,32,bytes,&len));
    exact(bytes,len,"10031d02020000800300");
+
+   /* saturate(|a| * |b|) is the same ep3 form with only f14 added. */
+   for (unsigned e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      uint8_t plain[AGX3_ALU_MAX_LENGTH], plain_len;
+      uint8_t sat[AGX3_ALU_MAX_LENGTH], sat_len;
+      assert(agx3_alu_hmul_abs(enc,2,src,hints,both_abs,false,false,32,
+                               plain,&plain_len));
+      assert(agx3_alu_hmul_abs(enc,2,src,hints,both_abs,true,false,32,
+                               sat,&sat_len));
+      assert(plain_len == 10 && sat_len == plain_len);
+      unsigned differing_bits = 0;
+      for (unsigned i = 0; i < sat_len; ++i) {
+         for (unsigned x = plain[i] ^ sat[i]; x; x &= x - 1)
+            ++differing_bits;
+      }
+      assert(differing_bits == 1);
+   }
    puts("Native half multiply: live/dead and absolute Apple vectors PASS");
+}
+
+static void test_agx3b_multislot_wait_fmul_hmul(void)
+{
+   /* AGX3B compact f32mul.ep1 (group 375) and f16mul.ep1 (group 113) encode
+    * only 8 of the 64 6-bit scoreboard wait masks (0, single-slot, and 0x03).
+    * Every remaining multi-slot wait mask must select the 8-byte ep2 form
+    * carrying all six independent wait bits (f80..f85 / f51..f56), matching
+    * agx3_alu_hadd() and mul_mod_runtime(). */
+   const enum agx_isa_encoding enc = AGX_ISA_ENCODING_AGX3B;
+   const enum agx3_alu_hint disc[2] = {
+      AGX3_ALU_HINT_DISCARD, AGX3_ALU_HINT_DISCARD
+   };
+   const uint16_t narrow_srcs[2][2] = { {56, 40}, {32, 20} };
+   const uint16_t narrow_dsts[2] = { 2, 1 };
+
+   for (uint16_t wait = 0; wait < 64; ++wait) {
+      const bool compact_wait =
+         wait == 0 || wait == 0x03 || (wait & (wait - 1)) == 0;
+      uint8_t bytes[AGX3_ALU_MAX_LENGTH];
+      uint8_t len = 0;
+      uint64_t fields[AGX3_MAX_FIELDS];
+
+      /* 1. agx3_alu_fmul_narrow (even + odd half dest, Godot 4.7 Mobile shape) */
+      for (unsigned k = 0; k < 2; ++k) {
+         assert(agx3_alu_fmul_narrow(enc, narrow_dsts[k], narrow_srcs[k], disc,
+                                     false, wait, bytes, &len));
+         assert(compact_wait ? (len == 4 || len == 6) : len == 8);
+         int32_t form = agx3_decode(&agx3b_table, bytes, len, AGX3_MN_f32mul,
+                                    fields);
+         assert(form >= 0);
+         assert(fields[2] == narrow_dsts[k]);
+         assert(fields[10] == 1);
+         assert(fields[18] == narrow_srcs[k][0]);
+         assert(fields[35] == narrow_srcs[k][1]);
+         for (unsigned b = 0; b < 6; ++b)
+            assert(fields[80 + b] == ((wait >> b) & 1u));
+      }
+
+      /* 2. agx3_alu_fmul_mixed_half */
+      assert(agx3_alu_fmul_mixed_half(enc, 3, 24, 9, AGX3_ALU_HINT_DISCARD,
+                                      AGX3_ALU_HINT_NONE, false, wait, bytes,
+                                      &len));
+      assert(compact_wait ? (len == 4 || len == 6) : len == 8);
+      assert(agx3_decode(&agx3b_table, bytes, len, AGX3_MN_f32mul, fields) >= 0);
+      assert(fields[2] == 3 && fields[10] == 1 && fields[18] == 24 &&
+             fields[35] == 9);
+      for (unsigned b = 0; b < 6; ++b)
+         assert(fields[80 + b] == ((wait >> b) & 1u));
+
+      /* 3. agx3_alu_fmul_mixed */
+      assert(agx3_alu_fmul_mixed(enc, 6, 24, 9, AGX3_ALU_HINT_DISCARD,
+                                 AGX3_ALU_HINT_CACHE, false, wait, bytes,
+                                 &len));
+      assert(compact_wait ? (len == 4 || len == 6) : len == 8);
+      assert(agx3_decode(&agx3b_table, bytes, len, AGX3_MN_f32mul, fields) >= 0);
+      assert(fields[2] == 6 && fields[10] == 2 && fields[18] == 24 &&
+             fields[35] == 9);
+      for (unsigned b = 0; b < 6; ++b)
+         assert(fields[80 + b] == ((wait >> b) & 1u));
+
+      /* 4. agx3_alu_hmul_minifloat */
+      assert(agx3_alu_hmul_minifloat(enc, 5, 14, 0x3c, AGX3_ALU_HINT_DISCARD,
+                                     false, wait, bytes, &len));
+      assert(compact_wait ? (len == 4 || len == 6) : len == 8);
+      assert(agx3_decode(&agx3b_table, bytes, len, AGX3_MN_f16mul, fields) >= 0);
+      assert(fields[2] == 5 && fields[16] == 0x3c && fields[34] == 14);
+      for (unsigned b = 0; b < 6; ++b)
+         assert(fields[51 + b] == ((wait >> b) & 1u));
+   }
+
+   puts("AGX3B multi-slot wait fmul/hmul_minifloat: 64x5 round-trip decode checks PASS");
 }
 
 static void test_wait_code_forms_fail_closed(void)
@@ -3920,6 +4012,76 @@ static void test_native_fadd_mixed_half(void)
          vectors[i].f16, vectors[i].hint32, vectors[i].hint16,
          vectors[i].dest_cache, vectors[i].wait, bytes, &len));
       exact(bytes, len, vectors[i].bytes);
+   }
+
+   /* Multi-slot waits that do not fit the compact ep1 wait code (e.g. slots
+    * 0+2 or all 6 slots) fall back cleanly to the 8-byte ep2 mask form.
+    * Independently verify every physical field from agx3b_tables.txt form
+    * f32add 2: opcode bits (w0&7==1, w1&7==4, w2&3==1), width groups
+    * g239/g240/g241 (dest=f32, f32=f32, f16=f16), GPR register/hint encodings
+    * g244/g243/g235/g237 (including odd half bit w2.4 and high-reg bits
+    * w2.12/w2.8/w2.10), and all 6 wait bits (w2[13..15], w3[13..15]). */
+   static const struct {
+      uint16_t dest, f32, f16;
+      enum agx3_alu_hint hint32, hint16;
+      bool dest_cache;
+      uint8_t wait;
+   } ep2_cases[] = {
+      {16, 8, 4, AGX3_ALU_HINT_CACHE, AGX3_ALU_HINT_NONE, false, 0x05},
+      {144, 136, 5, AGX3_ALU_HINT_DISCARD, AGX3_ALU_HINT_CACHE, true, 0x2a},
+      {254, 252, 255, AGX3_ALU_HINT_NONE, AGX3_ALU_HINT_DISCARD, true, 0x3f},
+   };
+   for (unsigned i = 0; i < sizeof(ep2_cases) / sizeof(ep2_cases[0]); ++i) {
+      const uint16_t dest = ep2_cases[i].dest;
+      const uint16_t f32 = ep2_cases[i].f32;
+      const uint16_t f16 = ep2_cases[i].f16;
+      const uint8_t wm = ep2_cases[i].wait;
+      assert(agx3_alu_fadd_mixed_half(
+         AGX_ISA_ENCODING_AGX3B, dest, f32, f16, ep2_cases[i].hint32,
+         ep2_cases[i].hint16, ep2_cases[i].dest_cache, wm, bytes, &len));
+      assert(len == 8);
+      const uint16_t w0 = (uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8);
+      const uint16_t w1 = (uint16_t)bytes[2] | ((uint16_t)bytes[3] << 8);
+      const uint16_t w2 = (uint16_t)bytes[4] | ((uint16_t)bytes[5] << 8);
+      const uint16_t w3 = (uint16_t)bytes[6] | ((uint16_t)bytes[7] << 8);
+      /* Opcode / form bits */
+      assert((w0 & 0x0007u) == 0x0001u);
+      assert((w1 & 0x0007u) == 0x0004u);
+      assert((w2 & 0x0003u) == 0x0001u);
+      /* Width bits: g239 (dest=f32), g240 (f32=f32), g241 (f16=f16) */
+      assert(((w0 >> 3) & 1u) == 1u && ((w3 >> 6) & 1u) == 0u);
+      assert(((w0 >> 8) & 1u) == 1u && ((w3 >> 7) & 1u) == 0u);
+      assert(((w1 >> 8) & 1u) == 0u && ((w3 >> 8) & 1u) == 0u);
+      /* GPR class selectors: g244/g243, g235, g237 */
+      assert(((w2 >> 5) & 1u) == 0u && ((w2 >> 6) & 1u) == 0u);
+      assert(((w2 >> 7) & 1u) == 0u);
+      assert(((w2 >> 9) & 1u) == 0u);
+      /* Reconstructed register fields + cache/discard hints */
+      const uint16_t dec_dest =
+         ((w2 >> 2) & 1u) | (((w0 >> 4) & 0xfu) << 1) |
+         (((w1 >> 6) & 0x3u) << 5) | (((w2 >> 12) & 1u) << 7);
+      const uint16_t dec_f32 =
+         ((w2 >> 3) & 1u) | (((w0 >> 9) & 0x3fu) << 1) |
+         (((w2 >> 8) & 1u) << 7);
+      const uint16_t dec_f16 =
+         ((w2 >> 4) & 1u) | (((w1 >> 9) & 0x3fu) << 1) |
+         (((w2 >> 10) & 1u) << 7);
+      assert(dec_dest == dest);
+      assert(dec_f32 == f32);
+      assert(dec_f16 == f16);
+      assert(((w2 >> 4) & 1u) == (f16 & 1u));
+      assert(((w1 >> 5) & 1u) == (ep2_cases[i].dest_cache ? 1u : 0u));
+      assert(((w0 >> 15) & 1u) ==
+             (ep2_cases[i].hint32 == AGX3_ALU_HINT_CACHE ? 1u : 0u));
+      assert(((w1 >> 3) & 1u) ==
+             (ep2_cases[i].hint32 == AGX3_ALU_HINT_DISCARD ? 1u : 0u));
+      assert(((w1 >> 15) & 1u) ==
+             (ep2_cases[i].hint16 == AGX3_ALU_HINT_CACHE ? 1u : 0u));
+      assert(((w1 >> 4) & 1u) ==
+             (ep2_cases[i].hint16 == AGX3_ALU_HINT_DISCARD ? 1u : 0u));
+      /* All 6 wait mask bits */
+      assert(((w2 >> 13) & 0x7u) == (wm & 0x7u));
+      assert(((w3 >> 13) & 0x7u) == ((wm >> 3) & 0x7u));
    }
 
    assert(!agx3_alu_fadd_mixed_half(
@@ -6535,6 +6697,32 @@ static void test_threejs_width_kind_modifier_axes(void)
       assert(agx3_falu_fma_mod_runtime(enc, 0, 0, 8, 4, &g, &frt, bytes,
                                        &len));
       exact(bytes, len, "09081e01810402c0");
+
+      /* Unmodified src0_16 alone on all-register f32mul and f32fma across
+       * AGX3B and AGX3C (symmetric to src1_16 above: f43 = 1, f26 = 2). */
+      const enum agx_isa_encoding mixed_encs[2] = {
+         AGX_ISA_ENCODING_AGX3B,
+         AGX_ISA_ENCODING_AGX3C,
+      };
+      for (unsigned ei = 0; ei < 2; ++ei) {
+         struct agx3_falu_mods m0 = {0};
+         m0.src0_16 = true;
+         assert(agx3_falu_mul_mod_runtime(mixed_encs[ei], 0, 4, 0, &m0, &rt,
+                                          bytes, &len));
+         exact(bytes, len, "09011d0400c0");
+
+         assert(agx3_falu_fma_mod_runtime(mixed_encs[ei], 0, 8, 0, 4, &m0,
+                                          &frt, bytes, &len));
+         exact(bytes, len, "09011e08810402c0");
+
+         /* Odd half-register src0 also encodes on both AGX3B and AGX3C. */
+         assert(agx3_falu_mul_mod_runtime(mixed_encs[ei], 0, 5, 0, &m0, &rt,
+                                          bytes, &len));
+         assert(len > 0);
+         assert(agx3_falu_fma_mod_runtime(mixed_encs[ei], 0, 9, 0, 4, &m0,
+                                          &frt, bytes, &len));
+         assert(len > 0);
+      }
    }
 
    /* fsel: an absolute comparator against a minifloat IMMEDIATE. Against the
@@ -6778,6 +6966,7 @@ int main(void){
    test_fmul_half_minifloat_to_f32();
    test_fadd_minifloat();
    test_u16_to_f32();
+   test_agx3b_multislot_wait_fmul_hmul();
    unsigned pass=0,fail=0,unsupported=0;
    for(size_t i=0;i<avn;i++){
       const struct av*v=&avs[i];

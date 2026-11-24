@@ -159,6 +159,14 @@ bool agx3_g17g_graphics_program_template_generate(
    enum agx_chip chip, const struct agx3_g17p_graphics_program_desc *desc,
    struct agx3_g17p_graphics_program_template *program);
 
+/* G18G: agx3_g18g_graphics_program_generate(), or _tps() for a program with
+ * a static TPS frame, recording where it materializes each range's base as
+ * agx3_g17g_graphics_program_template_generate() does. Canonical GPU1 output
+ * for agx3d re-encoding (agx3_reencode_template_create()). */
+bool agx3_g18g_graphics_program_template_generate(
+   const struct agx3_g17p_graphics_program_desc *desc,
+   struct agx3_g17p_graphics_program_template *program);
+
 /* Capture the exact address materializations of the normal M5 compute
  * program. Relocations refer to bytes of the final composed program. */
 bool agx3_g17g_compute_program_template_generate(

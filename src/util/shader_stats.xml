@@ -37,6 +37,14 @@
       <stat name="Spills">Number of spill (stack store) instructions</stat>
       <stat name="Fills">Number of fill (stack load) instructions</stat>
       <stat name="Preamble instructions" display="Preamble inst">Preamble instruction count</stat>
+      <stat name="Native instructions" display="Native">Instructions in the encoded main program, counted from its bytes</stat>
+      <stat name="Native immediate loads" display="Native ldimm">Immediate-load instructions in the encoded main program</stat>
+      <stat name="Wait carriers" display="Carriers">AGX3: identity instructions emitted only to carry a scoreboard wait</stat>
+      <stat name="Control-flow drains" display="CF drains">AGX3: control-flow instructions before which outstanding asynchronous results the branch does not read were waited for</stat>
+      <stat name="Loop control-flow drains" display="Loop CF drains">AGX3: control-flow drains inside a loop</stat>
+      <stat name="Staging copies">AGX3: copies into the staging register file</stat>
+      <stat name="Loop immediates">Immediate moves inside loops after register allocation</stat>
+      <stat name="Loop uniform copies">Copies from the uniform file inside loops after register allocation</stat>
     </isa>
 
    <family name="Pan">

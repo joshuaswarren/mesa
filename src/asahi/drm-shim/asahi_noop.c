@@ -887,7 +887,42 @@ merge_stream_stats(const struct asahi_g17p_stream_stats *stats)
 {
    stream_totals.draws += stats->draws;
    stream_totals.state_updates += stats->state_updates;
+   stream_totals.elided_bind_tails += stats->elided_bind_tails;
+   stream_totals.incremental_fs_ppp_updates += stats->incremental_fs_ppp_updates;
    stream_totals.no_varying_fs |= stats->no_varying_fs;
+}
+
+static void __attribute__((destructor))
+check_bind_tail_counts(void)
+{
+   const char *spec = getenv("ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS");
+   if (!spec || !spec[0])
+      return;
+
+   unsigned exp_full = 0, exp_elided = 0, exp_fs_ppp = 0;
+   if (sscanf(spec, "%u,%u,%u", &exp_full, &exp_elided, &exp_fs_ppp) != 3) {
+      fprintf(stderr, "shim: invalid ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=%s\n",
+              spec);
+      _Exit(EXIT_FAILURE);
+   }
+
+   const unsigned full =
+      stream_totals.state_updates - stream_totals.elided_bind_tails;
+   if (full != exp_full || stream_totals.elided_bind_tails != exp_elided ||
+       stream_totals.incremental_fs_ppp_updates != exp_fs_ppp) {
+      fprintf(stderr,
+              "shim: G17P bind-tail counts mismatch: got full=%u elided=%u "
+              "fs_ppp=%u, expected %u,%u,%u\n",
+              full, stream_totals.elided_bind_tails,
+              stream_totals.incremental_fs_ppp_updates, exp_full, exp_elided,
+              exp_fs_ppp);
+      _Exit(EXIT_FAILURE);
+   }
+
+   fprintf(stderr,
+           "shim: G17P bind-tail counts matched: full=%u elided=%u fs_ppp=%u\n",
+           full, stream_totals.elided_bind_tails,
+           stream_totals.incremental_fs_ppp_updates);
 }
 
 static void __attribute__((destructor))
@@ -927,12 +962,17 @@ check_compute_coverage(void)
        (getenv("ASAHI_SHIM_G17P_EXPECT_STRONG_COMPUTE_BARRIER") &&
         !compute_stats.strong_barriers) ||
        (getenv("ASAHI_SHIM_G17P_EXPECT_BACK_TO_BACK") &&
-        !compute_stats.unbarriered_launches)) {
+        !compute_stats.unbarriered_launches) ||
+       (getenv("ASAHI_SHIM_G17P_EXPECT_STRONG_INDIRECT_COMPUTE_BARRIER") &&
+        !compute_stats.indirect_strong_barriers)) {
       fprintf(stderr,
               "shim: incomplete G17P compute coverage: launches=%u "
-              "back-to-back=%u barriers=%u strong=%u terminated=%u\n",
+              "back-to-back=%u barriers=%u strong=%u indirect=%u "
+              "indirect-strong=%u terminated=%u\n",
               compute_stats.launches, compute_stats.unbarriered_launches,
               compute_stats.barriers, compute_stats.strong_barriers,
+              compute_stats.indirect_launches,
+              compute_stats.indirect_strong_barriers,
               compute_stats.terminated);
       _Exit(EXIT_FAILURE);
    }
@@ -2106,7 +2146,8 @@ asahi_ioctl_submit_unlocked(int fd, unsigned long request, void *arg)
    }
 
    const char *validate = getenv("ASAHI_SHIM_VALIDATE_G17P_STREAM");
-   if (!validate || !strcmp(validate, "0") || !shim_g17_runtime())
+   if (!validate || !strcmp(validate, "0") ||
+       (!shim_g17_runtime() && shim_params() != &params_g16g))
       return 0;
 
    const uint8_t *cmdbuf = (const void *)(uintptr_t)submit->cmdbuf;
@@ -2135,13 +2176,15 @@ asahi_ioctl_submit_unlocked(int fd, unsigned long request, void *arg)
           * private VM.  Mirror that kernel requirement so a private context
           * allocation fails on the host with the same ENOENT class instead
           * of reaching hardware first. */
-         const struct asahi_vm_mapping *context =
-            find_mapping(fd, UINT64_C(0x1000000000), UINT64_C(0x10000));
-         if (!context ||
-             (asahi_bo(context->bo)->gem_flags & DRM_ASAHI_GEM_VM_PRIVATE)) {
-            fprintf(stderr,
-                    "shim: G17P render context is absent from shared job view\n");
-            return -ENOENT;
+         if (shim_g17_runtime()) {
+            const struct asahi_vm_mapping *context =
+               find_mapping(fd, UINT64_C(0x1000000000), UINT64_C(0x10000));
+            if (!context ||
+                (asahi_bo(context->bo)->gem_flags & DRM_ASAHI_GEM_VM_PRIVATE)) {
+               fprintf(stderr,
+                       "shim: G17P render context is absent from shared job view\n");
+               return -ENOENT;
+            }
          }
 
          /* A private publication fence may follow the batch outputs. */
@@ -2174,9 +2217,10 @@ asahi_ioctl_submit_unlocked(int fd, unsigned long request, void *arg)
          g17p_streams_validated++;
          fprintf(stderr,
                  "shim: G17P VDM validated: %u draws, %u indexed, %u state "
-                 "updates, %u links, %u barriers (%u inter-draw, %u "
-                 "unbarriered republications)\n",
+                 "updates (%u elided, %u fs_ppp), %u links, %u barriers (%u "
+                 "inter-draw, %u unbarriered republications)\n",
                  stats.draws, stats.indexed_draws, stats.state_updates,
+                 stats.elided_bind_tails, stats.incremental_fs_ppp_updates,
                  stats.links, stats.barriers, stats.inter_draw_barriers,
                  stats.unbarriered_state_republications);
       } else if (header->cmd_type == DRM_ASAHI_CMD_COMPUTE) {
@@ -2211,6 +2255,9 @@ asahi_ioctl_submit_unlocked(int fd, unsigned long request, void *arg)
          compute_stats.barriers += stats.barriers;
          compute_stats.prologue_barriers += stats.prologue_barriers;
          compute_stats.strong_barriers += stats.strong_barriers;
+         compute_stats.indirect_launches += stats.indirect_launches;
+         compute_stats.indirect_strong_barriers +=
+            stats.indirect_strong_barriers;
          compute_stats.sstt_flushes += stats.sstt_flushes;
          compute_stats.terminated |= stats.terminated;
          g17p_streams_validated++;

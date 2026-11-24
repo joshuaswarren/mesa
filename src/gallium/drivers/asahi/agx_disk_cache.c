@@ -80,6 +80,16 @@ write_shader(struct blob *blob, const struct agx_compiled_shader *binary,
    blob_write_bytes(blob, binary->push,
                     sizeof(binary->push[0]) * binary->push_range_count);
 
+   /* A fragment main kept for inline blending (agx_keep_inline_blend_nir())
+    * blends inline from the cache as well. */
+   blob_write_uint32(blob, binary->inline_blend_nir_size);
+   if (binary->inline_blend_nir_size) {
+      blob_write_bytes(blob, binary->inline_blend_nir,
+                       binary->inline_blend_nir_size);
+      blob_write_bytes(blob, &binary->inline_blend_key,
+                       sizeof(binary->inline_blend_key));
+   }
+
    if (is_root_gs) {
       blob_write_bytes(blob, &binary->gs, sizeof(binary->gs));
       write_shader(blob, binary->pre_gs, false);
@@ -144,6 +154,22 @@ read_shader(struct agx_screen *screen, struct blob_reader *blob,
    binary->push_range_count = blob_read_uint32(blob);
    blob_copy_bytes(blob, binary->push,
                    sizeof(binary->push[0]) * binary->push_range_count);
+
+   const uint32_t inline_blend_nir_size = blob_read_uint32(blob);
+   if (inline_blend_nir_size) {
+      const void *nir = blob_read_bytes(blob, inline_blend_nir_size);
+      blob_copy_bytes(blob, &binary->inline_blend_key,
+                      sizeof(binary->inline_blend_key));
+      /* The key is written without its only pointer, which Gallium never
+       * sets; never trust one read back either. */
+      binary->inline_blend_key.g17p_rodata_hint = NULL;
+      binary->inline_blend_nir =
+         blob->overrun ? NULL : malloc(inline_blend_nir_size);
+      if (binary->inline_blend_nir) {
+         memcpy(binary->inline_blend_nir, nir, inline_blend_nir_size);
+         binary->inline_blend_nir_size = inline_blend_nir_size;
+      }
+   }
 
    if (is_root && uncompiled->type == MESA_SHADER_GEOMETRY) {
       blob_copy_bytes(blob, &binary->gs, sizeof(binary->gs));

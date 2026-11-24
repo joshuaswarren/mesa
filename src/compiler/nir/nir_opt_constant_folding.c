@@ -92,11 +92,55 @@ should_fold_bcsel(nir_alu_instr *alu)
    return alu->op != nir_op_fneg;
 }
 
-nir_def *
-nir_try_constant_fold_alu(nir_builder *b, nir_alu_instr *alu)
+static inline bool
+alu_src0_may_fold(const nir_alu_instr *alu)
+{
+   const nir_instr *s0 = nir_def_instr(alu->src[0].src.ssa);
+   return s0->type == nir_instr_type_load_const ||
+          (s0->type == nir_instr_type_alu &&
+           nir_instr_as_alu(s0)->op == nir_op_bcsel);
+}
+
+static ATTRIBUTE_NOINLINE nir_def *
+try_constant_fold_alu_slow(nir_builder *b, nir_alu_instr *alu)
 {
    nir_const_value src[NIR_ALU_MAX_INPUTS][NIR_MAX_VEC_COMPONENTS];
    nir_def *bcsel = NULL;
+
+   const nir_op_info *info = &nir_op_infos[alu->op];
+
+   for (unsigned i = 0; i < info->num_inputs; i++) {
+      nir_instr *src_instr = nir_def_instr(alu->src[i].src.ssa);
+
+      if (src_instr->type == nir_instr_type_load_const) {
+         nir_load_const_instr *load_const = nir_instr_as_load_const(src_instr);
+         for (unsigned j = 0; j < nir_ssa_alu_instr_src_components(alu, i); j++)
+            src[i][j] = load_const->value[alu->src[i].swizzle[j]];
+         continue;
+      }
+
+      /* Check if the source is a bcsel with two constants. */
+      if (src_instr->type == nir_instr_type_alu) {
+         nir_alu_instr *bcsel_alu = nir_instr_as_alu(src_instr);
+         if (is_bcsel_with_two_constants(bcsel_alu) && should_fold_bcsel(alu)) {
+            /* If there is multiple bcsel sources, they must use the same condition. */
+            if (bcsel && bcsel_alu->src[0].src.ssa != bcsel)
+               return NULL;
+
+            bcsel = bcsel_alu->src[0].src.ssa;
+
+            /* Use first bcsel constant. */
+            nir_load_const_instr *load_const =
+               nir_src_as_load_const(bcsel_alu->src[1].src);
+            for (unsigned j = 0; j < nir_ssa_alu_instr_src_components(alu, i); j++)
+               src[i][j] =
+                  load_const->value[bcsel_alu->src[1].swizzle[alu->src[i].swizzle[j]]];
+            continue;
+         }
+      }
+
+      return NULL;
+   }
 
    /* In the case that any outputs/inputs have unsized types, then we need to
     * guess the bit-size. In this case, the validator ensures that all
@@ -108,37 +152,14 @@ nir_try_constant_fold_alu(nir_builder *b, nir_alu_instr *alu)
     * (although it still requires to receive a valid bit-size).
     */
    unsigned bit_size = 0;
-   if (!nir_alu_type_get_type_size(nir_op_infos[alu->op].output_type))
+   if (!nir_alu_type_get_type_size(info->output_type)) {
       bit_size = alu->def.bit_size;
-
-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
-      if (bit_size == 0 &&
-          !nir_alu_type_get_type_size(nir_op_infos[alu->op].input_types[i]))
-         bit_size = alu->src[i].src.ssa->bit_size;
-
-      nir_load_const_instr *load_const = nir_src_as_load_const(alu->src[i].src);
-
-      if (load_const) {
-         for (unsigned j = 0; j < nir_ssa_alu_instr_src_components(alu, i); j++)
-            src[i][j] = load_const->value[alu->src[i].swizzle[j]];
-         continue;
-      }
-
-      /* Check if the source is a bcsel with two constants. */
-      nir_alu_instr *bcsel_alu = nir_src_as_alu(alu->src[i].src);
-      if (should_fold_bcsel(alu) && is_bcsel_with_two_constants(bcsel_alu)) {
-         /* If there is multiple bcsel sources, they must use the same condition. */
-         if (bcsel && bcsel_alu->src[0].src.ssa != bcsel)
-            return NULL;
-
-         bcsel = bcsel_alu->src[0].src.ssa;
-
-         /* Use first bcsel constant. */
-         load_const = nir_src_as_load_const(bcsel_alu->src[1].src);
-         for (unsigned j = 0; j < nir_ssa_alu_instr_src_components(alu, i); j++)
-            src[i][j] = load_const->value[bcsel_alu->src[1].swizzle[alu->src[i].swizzle[j]]];
-      } else {
-         return NULL;
+   } else {
+      for (unsigned i = 0; i < info->num_inputs; i++) {
+         if (!nir_alu_type_get_type_size(info->input_types[i])) {
+            bit_size = alu->src[i].src.ssa->bit_size;
+            break;
+         }
       }
    }
 
@@ -168,6 +189,15 @@ nir_try_constant_fold_alu(nir_builder *b, nir_alu_instr *alu)
    nir_def *else_const = const_value_for_alu(b, alu, bit_size, src);
 
    return nir_bcsel(b, bcsel, then_const, else_const);
+}
+
+nir_def *
+nir_try_constant_fold_alu(nir_builder *b, nir_alu_instr *alu)
+{
+   if (!alu_src0_may_fold(alu))
+      return NULL;
+
+   return try_constant_fold_alu_slow(b, alu);
 }
 
 static nir_const_value *
@@ -260,7 +290,7 @@ is_dual_slot_io(nir_intrinsic_instr *intrin)
           intrin->def.num_components >= 3;
 }
 
-static nir_def *
+static ATTRIBUTE_NOINLINE nir_def *
 try_fold_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
                    struct constant_fold_state *state)
 {
@@ -570,7 +600,7 @@ try_fold_texel_offset_src(nir_tex_instr *tex)
    return true;
 }
 
-static nir_def *
+static ATTRIBUTE_NOINLINE nir_def *
 try_fold_tex(nir_builder *b, nir_tex_instr *tex)
 {
    bool progress = false;
@@ -593,20 +623,97 @@ try_fold_tex(nir_builder *b, nir_tex_instr *tex)
    return progress ? NIR_LOWER_INSTR_PROGRESS : NULL;
 }
 
-static nir_def *
-try_fold_instr(nir_builder *b, nir_instr *instr, void *_state)
+static nir_instr *
+next_instr_after_cursor(nir_cursor cursor)
 {
-   switch (instr->type) {
-   case nir_instr_type_alu:
-      return nir_try_constant_fold_alu(b, nir_instr_as_alu(instr));
-   case nir_instr_type_intrinsic:
-      return try_fold_intrinsic(b, nir_instr_as_intrinsic(instr), _state);
-   case nir_instr_type_tex:
-      return try_fold_tex(b, nir_instr_as_tex(instr));
-   default:
-      /* Don't know how to constant fold */
+   switch (cursor.option) {
+   case nir_cursor_before_block:
+      for (nir_block *b = cursor.block; b; b = nir_block_cf_tree_next(b)) {
+         nir_instr *first = nir_block_first_instr(b);
+         if (first)
+            return first;
+      }
       return NULL;
+   case nir_cursor_after_block:
+      for (nir_block *b = nir_block_cf_tree_next(cursor.block); b;
+           b = nir_block_cf_tree_next(b)) {
+         nir_instr *first = nir_block_first_instr(b);
+         if (first)
+            return first;
+      }
+      return NULL;
+   case nir_cursor_before_instr:
+      return cursor.instr;
+   case nir_cursor_after_instr: {
+      nir_instr *next = nir_instr_next(cursor.instr);
+      if (next)
+         return next;
+      return next_instr_after_cursor(nir_after_block(cursor.instr->block));
    }
+   default:
+      UNREACHABLE("invalid cursor");
+   }
+}
+
+static bool
+nir_opt_constant_folding_impl(nir_function_impl *impl,
+                              struct constant_fold_state *state)
+{
+   nir_builder b = nir_builder_create(impl);
+   nir_metadata preserved = nir_metadata_control_flow;
+   bool progress = false;
+
+   nir_instr *instr = next_instr_after_cursor(nir_before_impl(impl));
+   while (instr) {
+      nir_def *new_def = NULL;
+      switch (instr->type) {
+      case nir_instr_type_alu: {
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         if (alu_src0_may_fold(alu)) {
+            b.cursor = nir_before_instr(instr);
+            new_def = try_constant_fold_alu_slow(&b, alu);
+         }
+         break;
+      }
+      case nir_instr_type_intrinsic:
+         b.cursor = nir_before_instr(instr);
+         new_def = try_fold_intrinsic(&b, nir_instr_as_intrinsic(instr), state);
+         break;
+      case nir_instr_type_tex:
+         b.cursor = nir_before_instr(instr);
+         new_def = try_fold_tex(&b, nir_instr_as_tex(instr));
+         break;
+      default:
+         break;
+      }
+
+      if (unlikely(new_def != NULL)) {
+         progress = true;
+         if (new_def == NIR_LOWER_INSTR_PROGRESS) {
+            nir_instr *next = nir_instr_next(instr);
+            instr = likely(next != NULL)
+                       ? next
+                       : next_instr_after_cursor(nir_after_block(instr->block));
+         } else if (new_def == NIR_LOWER_INSTR_PROGRESS_REPLACE) {
+            assert(!nir_instr_def(instr));
+            instr = next_instr_after_cursor(nir_instr_free_and_dce(instr));
+         } else {
+            nir_def *old_def = nir_instr_def(instr);
+            assert(old_def != NULL);
+            if (nir_def_block(new_def) != instr->block)
+               preserved = nir_metadata_none;
+            nir_def_rewrite_uses(old_def, new_def);
+            instr = next_instr_after_cursor(nir_instr_free_and_dce(instr));
+         }
+      } else {
+         nir_instr *next = nir_instr_next(instr);
+         instr = likely(next != NULL)
+                    ? next
+                    : next_instr_after_cursor(nir_after_block(instr->block));
+      }
+   }
+
+   return nir_progress(progress, impl, preserved);
 }
 
 bool
@@ -616,8 +723,10 @@ nir_opt_constant_folding(nir_shader *shader)
    state.has_load_constant = false;
    state.has_indirect_load_const = false;
 
-   bool progress = nir_shader_lower_instructions(shader, NULL, try_fold_instr,
-                                                 &state);
+   bool progress = false;
+   nir_foreach_function_impl(impl, shader) {
+      progress |= nir_opt_constant_folding_impl(impl, &state);
+   }
 
    /* This doesn't free the constant data if there are no constant loads because
     * the data might still be used but the loads have been lowered to load_ubo
