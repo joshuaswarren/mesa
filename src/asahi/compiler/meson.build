@@ -27,6 +27,7 @@ libasahi_agx_files = files(
   'agx_nir_opt_uniform_idiv.c',
   'agx_nir_opt_monotonic_bit_insert.c',
   'agx_nir_opt_iv_divmod.c',
+  'agx_nir_opt_unswitch_affine_bounds.c',
   'agx_nir_opt_sink_loop_sample_uses.c',
   'agx_nir_opt_uniform_stride_chains.c',
   'agx_nir_lower_clip_m1_1.c',
@@ -1093,6 +1094,19 @@ if with_tests
     executable(
       'agx_uniform_idiv_test',
       files('test/test-agx-uniform-idiv.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx_unswitch_affine_bounds',
+    executable(
+      'agx_unswitch_affine_bounds_test',
+      files('test/test-agx-unswitch-affine-bounds.c'),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies : [idep_nir, idep_mesautil],
