@@ -531,6 +531,11 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
       }
    }
 
+   /* Before agx_preprocess_nir turns GLSL's ffma_weak into ffma: only the
+    * shader's own strict FMAs take the explicit-RTE repair. */
+   NIR_PASS(_, nir, agx_nir_lower_fma_rte,
+            ((struct hk_physical_device *)vk_pdev)->dev.chip);
+
    /* Optimize but allow copies because we haven't lowered them yet */
    if (agx_chip_native_agx3(((struct hk_physical_device *)vk_pdev)->dev.chip) &&
        nir->info.stage != MESA_SHADER_MESH)

@@ -16413,9 +16413,6 @@ agx_prepare_preoptimized_epilog_nir(nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, agx_nir_lower_denorm_preserve);
-   if (key->dev.chip == AGX_CHIP_G17P ||
-       key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
-      NIR_PASS(_, nir, agx_nir_lower_fma_rte);
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
        key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
       NIR_PASS(_, nir, agx_nir_lower_f2bf_rtne);
@@ -16588,9 +16585,6 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
 
       NIR_PASS(_, nir, agx_nir_lower_denorm_preserve);
-      if (key->dev.chip == AGX_CHIP_G17P ||
-          key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
-         NIR_PASS(_, nir, agx_nir_lower_fma_rte);
 
       /* Sin/cos that agx_preprocess_nir_g17p left for an explicit-RTE shader.
        * Their reduction FMAs serve an absolute-error bound, which a tininess
