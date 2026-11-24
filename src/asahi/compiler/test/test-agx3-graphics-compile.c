@@ -9244,6 +9244,29 @@ test_agx3_heavy_branch_loop_unroll_limit(void)
    return kept_unrollable;
 }
 
+/* A vertex shader with nothing to hoist has no constant program. Looking
+ * for a hoistable vertex preamble must not create an empty one. */
+static bool
+test_agx3_vertex_without_preamble_has_none(void)
+{
+   nir_shader *nir = build_vs_flat();
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.reserved_preamble = 4;
+   key.agx3_native_cprog = true;
+   key.g17p_native_uniforms = true;
+
+   struct agx_shader_part part = {0};
+   bool ok = agx_compile_shader_nir(nir, &key, &part);
+   ok = ok && !part.info.has_preamble && part.info.nr_preamble_gprs == 0 &&
+        part.info.preamble_size == 0;
+   free(part.binary);
+   ralloc_free(nir);
+   return ok;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -9689,6 +9712,7 @@ main(int argc, char **argv)
    RUN(test_g17g_array_fetch);
    RUN(test_g17g_cube_shadow_lod);
    RUN(test_g17g_xfb_add);
+   RUN(test_agx3_vertex_without_preamble_has_none);
    RUN(test_g17p_eot_block_store);
    RUN(test_indexed_sampler_sets);
    RUN(test_g17p_layered_eot_block_store);
