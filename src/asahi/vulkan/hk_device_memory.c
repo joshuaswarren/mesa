@@ -64,11 +64,11 @@ static bool
 hk_allow_bo_alloc(size_t size, void *data)
 {
    bool *mem_rejected = data;
-   if (hk_system_memory_fits(size))
-      return true;
 
-   *mem_rejected = true;
-   return false;
+   /* agx_bo_create_checked() asks again after evicting the BO cache, so
+    * record only the latest answer. */
+   *mem_rejected = !hk_system_memory_fits(size);
+   return !*mem_rejected;
 }
 
 /* Supports opaque fd only */
