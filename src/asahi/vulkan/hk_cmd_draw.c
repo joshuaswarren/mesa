@@ -4567,12 +4567,13 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
 
    /* vkd3d-proton renders without attachments at the Vulkan maximum, layers
     * included, which cannot fit in a tiler allocation. Nothing is stored per
-    * layer, so one hardware layer serves all of them. */
-   bool no_attachments = agx_chip_native_agx3(dev->dev.chip) &&
-                         !render->view_mask && !render->depth_att.iview &&
+    * layer, so one hardware layer serves all of them (unless a fragment shader
+    * on !layer_as_varying hardware reads gl_Layer, handled at draw flush). */
+   bool no_attachments = !render->view_mask && !render->depth_att.iview &&
                          !render->stencil_att.iview;
    for (uint32_t i = 0; i < render->color_att_count; i++)
       no_attachments &= !render->color_att[i].iview;
+   render->no_attachments = no_attachments;
    if (cmd->state.gfx.descriptors.root.draw.no_attachments != no_attachments) {
       cmd->state.gfx.descriptors.root.draw.no_attachments = no_attachments;
       cmd->state.gfx.descriptors.root_dirty = true;
@@ -8137,6 +8138,59 @@ hk_effective_viewport_count(struct hk_cmd_buffer *cmd)
 }
 
 static void
+hk_compute_vp_scissor_rects(const struct vk_dynamic_graphics_state *dyn,
+                            uint32_t fb_width, uint32_t fb_height,
+                            unsigned count, unsigned minx[], unsigned miny[],
+                            unsigned maxx[], unsigned maxy[])
+{
+   const unsigned api_viewports = MIN2(dyn->vp.viewport_count, count);
+   const unsigned api_scissors = MIN2(dyn->vp.scissor_count, count);
+
+   /* We implicitly scissor to the viewport. Clamp float coordinates before
+    * converting to unsigned so negative minimums clip to zero instead of
+    * wrapping to huge unsigned coordinates.
+    */
+   for (uint32_t i = 0; i < api_viewports; i++) {
+      const VkViewport *vp = &dyn->vp.viewports[i];
+
+      minx[i] = CLAMP(MIN2(vp->x, vp->x + vp->width), 0.0f, (float)fb_width);
+      miny[i] = CLAMP(MIN2(vp->y, vp->y + vp->height), 0.0f, (float)fb_height);
+      maxx[i] = CLAMP(MAX2(vp->x, vp->x + vp->width), 0.0f, (float)fb_width);
+      maxy[i] = CLAMP(MAX2(vp->y, vp->y + vp->height), 0.0f, (float)fb_height);
+   }
+
+   /* Additionally clamp to the framebuffer so we don't rasterize
+    * off-screen pixels.
+    */
+   for (unsigned i = 0; i < count; ++i) {
+      minx[i] = MIN2(minx[i], fb_width);
+      maxx[i] = MIN2(maxx[i], fb_width);
+      miny[i] = MIN2(miny[i], fb_height);
+      maxy[i] = MIN2(maxy[i], fb_height);
+   }
+
+   /* We additionally apply any API scissors */
+   for (unsigned i = 0; i < api_scissors; ++i) {
+      const VkRect2D *s = &dyn->vp.scissors[i];
+      const uint32_t sx0 = MAX2(s->offset.x, 0);
+      const uint32_t sy0 = MAX2(s->offset.y, 0);
+      const uint64_t sx1 = (uint64_t)sx0 + s->extent.width;
+      const uint64_t sy1 = (uint64_t)sy0 + s->extent.height;
+
+      minx[i] = MAX2(minx[i], sx0);
+      miny[i] = MAX2(miny[i], sy0);
+      maxx[i] = MIN2(maxx[i], (unsigned)MIN2(sx1, (uint64_t)fb_width));
+      maxy[i] = MIN2(maxy[i], (unsigned)MIN2(sy1, (uint64_t)fb_height));
+   }
+
+   /* A disjoint intersection is empty, not an inverted 16-bit rectangle. */
+   for (unsigned i = 0; i < count; ++i) {
+      minx[i] = MIN2(minx[i], maxx[i]);
+      miny[i] = MIN2(miny[i], maxy[i]);
+   }
+}
+
+static void
 hk_flush_vp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -8157,67 +8211,13 @@ hk_flush_vp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
     * discard the app may not supply any, but we can just program garbage.
     */
    const unsigned count = hk_effective_viewport_count(cmd);
-   const unsigned api_viewports = MIN2(dyn->vp.viewport_count, count);
-   const unsigned api_scissors = MIN2(dyn->vp.scissor_count, count);
 
    unsigned minx[HK_MAX_VIEWPORTS] = {0}, miny[HK_MAX_VIEWPORTS] = {0};
    unsigned maxx[HK_MAX_VIEWPORTS] = {0}, maxy[HK_MAX_VIEWPORTS] = {0};
 
-   /* We implicitly scissor to the viewport. We need to do a min/max dance to
-    * handle inverted viewports.
-    */
-   for (uint32_t i = 0; i < api_viewports; i++) {
-      const VkViewport *vp = &dyn->vp.viewports[i];
-
-      if (dev->dev.chip == AGX_CHIP_G18G) {
-         /* Clamp before converting to unsigned. During a Zink window shrink,
-          * the old inverted viewport can extend above the new attachment. A
-          * negative minimum must clip to zero, not wrap to a huge coordinate. */
-         minx[i] = CLAMP(MIN2(vp->x, vp->x + vp->width), 0.0f,
-                         (float)cmd->state.gfx.render.cr.width);
-         miny[i] = CLAMP(MIN2(vp->y, vp->y + vp->height), 0.0f,
-                         (float)cmd->state.gfx.render.cr.height);
-         maxx[i] = CLAMP(MAX2(vp->x, vp->x + vp->width), 0.0f,
-                         (float)cmd->state.gfx.render.cr.width);
-         maxy[i] = CLAMP(MAX2(vp->y, vp->y + vp->height), 0.0f,
-                         (float)cmd->state.gfx.render.cr.height);
-         continue;
-      }
-
-      minx[i] = MIN2(vp->x, vp->x + vp->width);
-      miny[i] = MIN2(vp->y, vp->y + vp->height);
-      maxx[i] = MAX2(vp->x, vp->x + vp->width);
-      maxy[i] = MAX2(vp->y, vp->y + vp->height);
-   }
-
-   /* Additionally clamp to the framebuffer so we don't rasterize
-    * off-screen pixels. TODO: Is this necessary? the GL driver does this but
-    * it might be cargoculted at this point.
-    */
-   for (unsigned i = 0; i < count; ++i) {
-      minx[i] = MIN2(minx[i], cmd->state.gfx.render.cr.width);
-      maxx[i] = MIN2(maxx[i], cmd->state.gfx.render.cr.width);
-      miny[i] = MIN2(miny[i], cmd->state.gfx.render.cr.height);
-      maxy[i] = MIN2(maxy[i], cmd->state.gfx.render.cr.height);
-   }
-
-   /* We additionally apply any API scissors */
-   for (unsigned i = 0; i < api_scissors; ++i) {
-      const VkRect2D *s = &dyn->vp.scissors[i];
-
-      minx[i] = MAX2(minx[i], s->offset.x);
-      miny[i] = MAX2(miny[i], s->offset.y);
-      maxx[i] = MIN2(maxx[i], s->offset.x + s->extent.width);
-      maxy[i] = MIN2(maxy[i], s->offset.y + s->extent.height);
-   }
-
-   if (hal300) {
-      /* A disjoint intersection is empty, not an inverted 16-bit rectangle. */
-      for (unsigned i = 0; i < count; ++i) {
-         minx[i] = MIN2(minx[i], maxx[i]);
-         miny[i] = MIN2(miny[i], maxy[i]);
-      }
-   }
+   hk_compute_vp_scissor_rects(dyn, cmd->state.gfx.render.cr.width,
+                               cmd->state.gfx.render.cr.height, count, minx,
+                               miny, maxx, maxy);
 
    /* Upload a hardware scissor for each viewport, whether there's a
     * corresponding API scissor or not.
@@ -11700,6 +11700,21 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
+   /* On !layer_as_varying hardware (AGX2), fragment shaders read gl_Layer from
+    * the hardware rasterizer layer (nir_load_layer_id), so do not force
+    * hardware layer 0 if the bound fragment shader reads gl_Layer. */
+   {
+      const struct hk_shader *fs = hk_bound_fs(cmd);
+      const bool fs_reads_hw_layer =
+         !agx_chip_native_or_m5(dev->dev.chip) && fs && fs->info.fs.reads_layer;
+      const uint16_t no_attachments =
+         gfx->render.no_attachments && !fs_reads_hw_layer;
+      if (gfx->descriptors.root.draw.no_attachments != no_attachments) {
+         gfx->descriptors.root.draw.no_attachments = no_attachments;
+         gfx->descriptors.root_dirty = true;
+      }
+   }
+
    /* Root must be uploaded after the above, which touch the root. */
    if (agx_chip_native_hal200(dev->dev.chip) &&
        hk_root_upload_needs_growth(gfx->descriptors.uploaded_root_size,
@@ -12968,28 +12983,45 @@ refused:
    return false;
 }
 
-/* Capture the selected last producer at each successful emission, never
- * infer a stream's layer range from the command buffer's final bindings.
+/* Capture the selected last producer and active hardware scissor bounds at
+ * each successful emission, never infer them from the command buffer's final
+ * bindings. Only attachmentless passes inspect these counters at submit time.
  */
 static void
-hk_g17p_note_layer_zero_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+hk_note_attachmentless_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
-   if (!agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) ||
-       cmd->state.gfx.render.view_mask) {
-      cs->g17p_layer_zero_unknown = true;
+   if (!hk_attachmentless_render(cs))
       return;
+
+   if (cmd->state.gfx.render.view_mask) {
+      cs->layer_zero_unknown = true;
+   } else if (cmd->state.gfx.descriptors.root.draw.no_attachments) {
+      cs->layer_zero_draws++;
+   } else {
+      const struct hk_shader *vs = hk_bound_hw_vs(&cmd->state.gfx);
+      if (vs && vs->info.default_layer_zero)
+         cs->layer_zero_draws++;
+      else
+         cs->layer_zero_unknown = true;
    }
 
-   if (cmd->state.gfx.descriptors.root.draw.no_attachments) {
-      cs->g17p_layer_zero_draws++;
-      return;
-   }
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   if (!dyn->rs.rasterizer_discard_enable) {
+      const unsigned count = hk_effective_viewport_count(cmd);
+      unsigned minx[HK_MAX_VIEWPORTS] = {0}, miny[HK_MAX_VIEWPORTS] = {0};
+      unsigned maxx[HK_MAX_VIEWPORTS] = {0}, maxy[HK_MAX_VIEWPORTS] = {0};
 
-   const struct hk_shader *vs = hk_bound_hw_vs(&cmd->state.gfx);
-   if (vs && vs->info.g17p_default_layer_zero)
-      cs->g17p_layer_zero_draws++;
-   else
-      cs->g17p_layer_zero_unknown = true;
+      hk_compute_vp_scissor_rects(dyn, cs->cr.width, cs->cr.height, count, minx,
+                                  miny, maxx, maxy);
+      for (unsigned i = 0; i < count; ++i) {
+         if (minx[i] < maxx[i] && miny[i] < maxy[i]) {
+            cs->attachmentless_max_x = MAX2(cs->attachmentless_max_x, maxx[i]);
+            cs->attachmentless_max_y = MAX2(cs->attachmentless_max_y, maxy[i]);
+         }
+      }
+   }
+   cs->attachmentless_bounded_draws++;
 }
 
 /* An upper bound of the primitives one view of an API draw submits, or
@@ -13576,7 +13608,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
          }
       }
 
-      hk_g17p_note_layer_zero_draw(cmd, cs);
+      hk_note_attachmentless_draw(cmd, cs);
       hk_note_pre_raster_images(cmd, cs);
       hk_m5_note_render_resources(cmd, cs);
       if (unlikely(dev->frame_anatomy)) {
@@ -14345,7 +14377,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       if (agx_chip_g17_m5(dev->dev.chip) && draw.indexed)
          cs->restart_index_set = false;
    }
-   hk_g17p_note_layer_zero_draw(cmd, cs);
+   hk_note_attachmentless_draw(cmd, cs);
    hk_note_pre_raster_images(cmd, cs);
    hk_m5_note_render_resources(cmd, cs);
    if (unlikely(dev->frame_anatomy)) {
