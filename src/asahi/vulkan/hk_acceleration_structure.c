@@ -111,6 +111,9 @@ static const uint32_t agx3_refit_propagate_spv[] = {
 static const uint32_t agx3_refit_inner_spv[] = {
 #include "bvh/hk_agx3_refit_inner.spv.h"
 };
+static const uint32_t agx3_refit_top_spv[] = {
+#include "bvh/hk_agx3_refit_top.spv.h"
+};
 
 static const uint32_t agx3_refit_encode_spv[] = {
 #include "bvh/hk_agx3_refit_encode.spv.h"
@@ -119,6 +122,11 @@ static const uint32_t agx3_refit_encode_spv[] = {
 /* The refit encoder for triangle structures only. */
 static const uint32_t agx3_refit_encode_triangles_spv[] = {
 #include "bvh/hk_agx3_refit_encode_triangles.spv.h"
+};
+
+/* Direct single-geometry in-place triangle refit encoder. */
+static const uint32_t agx3_refit_encode_triangles_direct_spv[] = {
+#include "bvh/hk_agx3_refit_encode_triangles_direct.spv.h"
 };
 
 /* The node encoder for instance structures only. */
@@ -694,6 +702,20 @@ static_assert(HK_AGX3_GEN1_AABB_RECORD_B == HK_AGX3_AS_SLOT_B,
 static_assert(HK_AGX3_GEN1_IMAGE_ALIGN == 16384, "GEN1 image alignment");
 static_assert(HK_AGX3_GEN1_NODE_GROUP_LANES == 8 * HK_AGX3_NODE_JOBS_PER_GROUP,
               "GEN1 encoder workgroup");
+static_assert(sizeof(struct hk_agx3_refit_top_args) == 104 &&
+              sizeof(struct hk_agx3_refit_top_args) <= HK_MAX_PUSH_SIZE,
+              "GEN1 refit top push ABI");
+static_assert(sizeof(struct hk_agx3_refit_leaf_args) == 72 &&
+              sizeof(struct hk_agx3_refit_leaf_args) <= HK_MAX_PUSH_SIZE,
+              "GEN1 refit leaf push ABI");
+static_assert(sizeof(struct hk_agx3_refit_direct_args) == 88 &&
+              sizeof(struct hk_agx3_refit_direct_args) <= HK_MAX_PUSH_SIZE,
+              "GEN1 refit direct triangle push ABI");
+static_assert(HK_AGX3_REFIT_TOP_GROUP_SIZE == HK_AGX3_REFIT_TOP_LANES &&
+              HK_AGX3_REFIT_TOP_GROUP_SIZE % 8 == 0 &&
+              HK_AGX3_REFIT_PREPARE_GROUP_SIZE == HK_AGX3_REFIT_GROUP_SIZE &&
+              HK_AGX3_REFIT_TOP_LEVELS < HK_AGX3_REFIT_LEVELS,
+              "GEN1 refit top scheduling constants");
 
 const uint32_t *
 hk_gen1_agx3_node_encoder_spirv(bool pairs, size_t *size_B)
@@ -707,6 +729,20 @@ hk_gen1_agx3_refit_spirv(size_t *size_B)
 {
    *size_B = sizeof(agx3_refit_spv);
    return agx3_refit_spv;
+}
+
+const uint32_t *
+hk_gen1_agx3_refit_top_spirv(size_t *size_B)
+{
+   *size_B = sizeof(agx3_refit_top_spv);
+   return agx3_refit_top_spv;
+}
+
+const uint32_t *
+hk_gen1_agx3_refit_encode_direct_spirv(size_t *size_B)
+{
+   *size_B = sizeof(agx3_refit_encode_triangles_direct_spv);
+   return agx3_refit_encode_triangles_direct_spv;
 }
 
 const uint32_t *
@@ -1485,6 +1521,7 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(vk_acceleration_structure, src,
                   state->build_info->srcAccelerationStructure);
    const bool prepare = phase == HK_AGX3_REFIT_PREPARE;
+   const bool fused_all = hk_agx3_refit_fused_all(state->leaf_node_count);
    const uint64_t scratch = state->build_info->scratchData.deviceAddress;
    const uint64_t encode = ALIGN_POT(scratch + state->scratch.header_offset +
                                      sizeof(struct vk_ir_header), UINT64_C(8));
@@ -1496,8 +1533,9 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
       .header = scratch + state->scratch.header_offset,
       .plan_nodes = encode + layout.nodes, .plan_jobs = encode + layout.jobs,
       .plan_state = encode + layout.state,
-      .refit = encode + layout.state, .counters = encode + layout.nodes,
-      .bounds = encode + layout.jobs, .envelope = encode + layout.envelope,
+      .refit = encode + layout.state,
+      .counters = (prepare && fused_all) ? 0 : encode + layout.nodes,
+      .bounds = encode + layout.jobs, .envelope = 0,
       .output_bvh = hk_as_native_va(dst),
       .root_offset = state->scratch.internal_node_offset - state->scratch.ir_offset,
       .leaf_bound = state->leaf_node_count,
@@ -1508,16 +1546,24 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
                          state->build_info->dstAccelerationStructure,
       .slot_bias = hk_gen1_as_slot_bias(dev, dst),
       .status = encode + layout.node_status,
-      .levels = prepare && layout.node_bound ? encode + layout.refit_levels : 0,
+      .levels = (prepare && layout.node_bound && !fused_all)
+                   ? encode + layout.refit_levels : 0,
       .level = level,
       .no_leaves = prepare && hk_agx3_refit_skips_leaves(dev, state),
    };
    /* One thread per job, per instance pointer, and per retained word that
-    * an update into another structure copies. */
+    * an update into another structure copies; prepare uses grid-stride loops
+    * so its grid stays small and workgroup-aligned. */
    uint64_t count = MAX2(layout.node_bound, state->leaf_node_count);
-   if (args.copy)
-      count = MAX2(count, HK_AGX3_RETAINED_BYTES((uint64_t)layout.node_bound,
-                                                 (uint64_t)state->leaf_node_count) / 4);
+   if (prepare) {
+      const uint64_t retained_bytes =
+         HK_AGX3_RETAINED_BYTES((uint64_t)layout.node_bound,
+                                (uint64_t)state->leaf_node_count);
+      count = hk_agx3_refit_prepare_threads(
+         state->leaf_node_count, layout.node_bound, retained_bytes,
+         args.copy != 0,
+         args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR);
+   }
    vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
    vk_common_CmdPushConstants(commandBuffer, pipeline_layout,
       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), &args);
@@ -1566,14 +1612,31 @@ hk_agx3_refit_save_batch(VkCommandBuffer commandBuffer,
    }
 }
 
+static bool
+hk_agx3_refit_is_direct_triangles(
+   const struct hk_device *dev,
+   const struct vk_acceleration_structure_build_state *state)
+{
+   const VkAccelerationStructureBuildGeometryInfoKHR *info = state->build_info;
+   const uint32_t prim_count =
+      info->geometryCount == 1 && state->build_range_infos
+         ? state->build_range_infos[0].primitiveCount : 0;
+   return hk_agx3_refit_uses_direct_triangles(
+      hk_agx3_refit_skips_leaves(dev, state),
+      info->srcAccelerationStructure == info->dstAccelerationStructure,
+      info->geometryCount, prim_count, state->leaf_node_count);
+}
+
 /* The updates of one build call, step by step together: each step is a
  * launch per update with one barrier after the step, so a step's launches
  * have no barrier between them and may run side by side (see
  * hk_dispatch_g17p_native()). Per update the steps are: leaves (or, for
- * triangles that place their own, nothing), prepare from the retained jobs,
- * place the triangles, encode the leaf jobs, propagate to the inner jobs past
- * the levels, encode the inner jobs of each level, deepest first, and finish
- * the envelope. */
+ * triangles that place their own, nothing), prepare overlapped with triangle
+ * placement (skipped for small/medium single-geometry in-place triangle
+ * updates), encode the leaf jobs (direct for small/medium updates, loading
+ * single-geometry triangles inline when eligible), propagate and wide lower
+ * inner levels for large trees, then fuse the top inner levels (or all inner
+ * levels for small/medium trees) with envelope finalization in one workgroup. */
 static VkResult
 hk_cmd_refit_agx3(VkCommandBuffer commandBuffer, struct vk_device *device,
                   struct vk_meta_device *meta,
@@ -1589,11 +1652,18 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer, struct vk_device *device,
    if (!any_update)
       return VK_SUCCESS;
 
-   VkPipeline pipeline[4];
-   VkPipelineLayout pipeline_layout[4];
-   enum { ENCODE_TRIANGLES, ENCODE, ENVELOPE, PLACE };
+   VkPipeline pipeline[5];
+   VkPipelineLayout pipeline_layout[5];
+   enum { ENCODE_TRIANGLES_DIRECT, ENCODE_TRIANGLES, ENCODE, REFIT_TOP, PLACE };
    VkResult result =
-      get_pipeline_spv(dev, "hk-agx3-refit-encode-triangles",
+      get_pipeline_spv(dev, "hk-agx3-refit-encode-triangles-direct",
+                       agx3_refit_encode_triangles_direct_spv,
+                       sizeof(agx3_refit_encode_triangles_direct_spv),
+                       sizeof(struct hk_agx3_refit_direct_args),
+                       &pipeline[ENCODE_TRIANGLES_DIRECT],
+                       &pipeline_layout[ENCODE_TRIANGLES_DIRECT]);
+   if (result == VK_SUCCESS)
+      result = get_pipeline_spv(dev, "hk-agx3-refit-encode-triangles",
                        agx3_refit_encode_triangles_spv,
                        sizeof(agx3_refit_encode_triangles_spv),
                        sizeof(struct hk_agx3_refit_encode_args),
@@ -1603,9 +1673,9 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer, struct vk_device *device,
          sizeof(agx3_refit_encode_spv), sizeof(struct hk_agx3_refit_encode_args),
          &pipeline[ENCODE], &pipeline_layout[ENCODE]);
    if (result == VK_SUCCESS)
-      result = get_pipeline_spv(dev, "hk-agx3-as-envelope", agx3_envelope_spv,
-         sizeof(agx3_envelope_spv), sizeof(struct hk_agx3_envelope_args),
-         &pipeline[ENVELOPE], &pipeline_layout[ENVELOPE]);
+      result = get_pipeline_spv(dev, "hk-agx3-refit-top", agx3_refit_top_spv,
+         sizeof(agx3_refit_top_spv), sizeof(struct hk_agx3_refit_top_args),
+         &pipeline[REFIT_TOP], &pipeline_layout[REFIT_TOP]);
    if (result == VK_SUCCESS)
       result = get_pipeline_spv(dev, "hk-agx3-refit-leaf", agx3_refit_leaf_spv,
          sizeof(agx3_refit_leaf_spv), sizeof(struct hk_agx3_refit_leaf_args),
@@ -1613,14 +1683,22 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer, struct vk_device *device,
    if (result != VK_SUCCESS)
       return result;
 
-   const VkMemoryBarrier barrier = {
+   const VkMemoryBarrier compute_barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+   };
+   const VkMemoryBarrier indirect_barrier = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
       .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
       .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
                        VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
    };
    bool any;
-   unsigned max_levels = 0;
+   bool any_prepare = false;
+   bool any_place = false;
+   bool any_unfused = false;
+   unsigned max_unfused_levels = 0;
 
    /* Leaves */
    any = false;
@@ -1629,11 +1707,19 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer, struct vk_device *device,
       if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
          continue;
       VK_FROM_HANDLE(vk_acceleration_structure, dst, state->build_info->dstAccelerationStructure);
+      VK_FROM_HANDLE(vk_acceleration_structure, src, state->build_info->srcAccelerationStructure);
       struct hk_agx3_as_layout layout;
       if (!hk_gen1_as_layout_init(state->leaf_node_count, &layout) ||
-          !hk_gen1_as_metadata_addr_for_id(cmd, hk_gen1_as_id(dev, dst)))
+          !hk_gen1_as_metadata_addr_for_id(cmd, hk_gen1_as_id(dev, dst)) ||
+          !hk_gen1_as_metadata_addr(cmd, src))
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-      max_levels = MAX2(max_levels, hk_agx3_refit_levels(state));
+      const bool direct_tri = hk_agx3_refit_is_direct_triangles(dev, state);
+      any_prepare |= !direct_tri;
+      any_place |= hk_agx3_refit_skips_leaves(dev, state) && !direct_tri;
+      if (!hk_agx3_refit_fused_all(state->leaf_node_count)) {
+         any_unfused = true;
+         max_unfused_levels = MAX2(max_unfused_levels, hk_agx3_refit_levels(state));
+      }
       if (hk_agx3_refit_skips_leaves(dev, state))
          continue;
       result = vk_cmd_build_as_leaves(commandBuffer, device, meta, build_args, state);
@@ -1644,58 +1730,67 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer, struct vk_device *device,
    if (any)
       vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
 
-   /* Prepare */
-   for (uint32_t i = 0; i < build_count; ++i) {
-      if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
-         hk_agx3_refit_phase(commandBuffer, &states[i], HK_AGX3_REFIT_PREPARE,
-                             hk_agx3_refit_levels(&states[i]));
-   }
-   vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-      0, 1, &barrier, 0, NULL, 0, NULL);
-
-   /* Place the triangles: a thread per primitive of each geometry, numbered
-    * as leaf generation numbers them; they take the IR leaves' place. */
-   static_assert(sizeof(struct hk_agx3_refit_triangle) <= sizeof(struct vk_ir_triangle_node),
-                 "placed triangles fit where the IR leaves would be");
-   any = false;
-   for (uint32_t i = 0; i < build_count; ++i) {
-      const struct vk_acceleration_structure_build_state *state = &states[i];
-      if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE ||
-          !hk_agx3_refit_skips_leaves(dev, state))
-         continue;
-      struct hk_agx3_as_layout layout;
-      hk_gen1_as_layout_init(state->leaf_node_count, &layout);
-      const uint64_t scratch = state->build_info->scratchData.deviceAddress;
-      const uint64_t encode = ALIGN_POT(scratch + state->scratch.header_offset +
-                                        sizeof(struct vk_ir_header), UINT64_C(8));
-      const VkAccelerationStructureBuildGeometryInfoKHR *info = state->build_info;
-      struct hk_agx3_refit_leaf_args leaf = {
-         .refit = encode + layout.state,
-         .triangles = scratch + state->scratch.ir_offset,
-         .leaf_bound = state->leaf_node_count,
-      };
-      vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline[PLACE]);
-      uint32_t first = 0;
-      for (uint32_t j = 0; j < info->geometryCount; ++j) {
-         const VkAccelerationStructureBuildRangeInfoKHR *range = &state->build_range_infos[j];
-         if (!range->primitiveCount)
+   /* Prepare and place triangles in one wave (skipped entirely when every
+    * update in the batch uses direct single-geometry triangle refit). */
+   if (any_prepare || any_place) {
+      for (uint32_t i = 0; i < build_count; ++i) {
+         const struct vk_acceleration_structure_build_state *state = &states[i];
+         if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE ||
+             hk_agx3_refit_is_direct_triangles(dev, state))
             continue;
-         leaf.geometry = vk_fill_geometry_data(info->type, first, j,
-            info->pGeometries ? &info->pGeometries[j] : info->ppGeometries[j], range);
-         leaf.primitive_count = range->primitiveCount;
-         vk_common_CmdPushConstants(commandBuffer, pipeline_layout[PLACE],
-            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leaf), &leaf);
-         hk_cmd_dispatch_unaligned(commandBuffer, range->primitiveCount, 1, 1);
-         first += range->primitiveCount;
+         const unsigned prep_levels =
+            hk_agx3_refit_fused_all(state->leaf_node_count)
+               ? HK_AGX3_REFIT_LEVELS : hk_agx3_refit_levels(state);
+         hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_PREPARE, prep_levels);
       }
-      any = true;
+      static_assert(sizeof(struct hk_agx3_refit_triangle) <= sizeof(struct vk_ir_triangle_node),
+                    "placed triangles fit where the IR leaves would be");
+      bool bound_place = false;
+      for (uint32_t i = 0; i < build_count; ++i) {
+         const struct vk_acceleration_structure_build_state *state = &states[i];
+         if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE ||
+             !hk_agx3_refit_skips_leaves(dev, state) ||
+             hk_agx3_refit_is_direct_triangles(dev, state))
+            continue;
+         VK_FROM_HANDLE(vk_acceleration_structure, src,
+                        state->build_info->srcAccelerationStructure);
+         const uint64_t scratch = state->build_info->scratchData.deviceAddress;
+         const VkAccelerationStructureBuildGeometryInfoKHR *info = state->build_info;
+         struct hk_agx3_refit_leaf_args leaf = {
+            .metadata = hk_gen1_as_metadata_addr(cmd, src),
+            .triangles = scratch + state->scratch.ir_offset,
+            .leaf_bound = state->leaf_node_count,
+         };
+         if (!bound_place) {
+            vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline[PLACE]);
+            bound_place = true;
+         }
+         uint32_t first = 0;
+         for (uint32_t j = 0; j < info->geometryCount; ++j) {
+            const VkAccelerationStructureBuildRangeInfoKHR *range = &state->build_range_infos[j];
+            if (!range->primitiveCount)
+               continue;
+            leaf.geometry = vk_fill_geometry_data(info->type, first, j,
+               info->pGeometries ? &info->pGeometries[j] : info->ppGeometries[j], range);
+            leaf.primitive_count = range->primitiveCount;
+            vk_common_CmdPushConstants(commandBuffer, pipeline_layout[PLACE],
+               VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leaf), &leaf);
+            hk_cmd_dispatch_unaligned(commandBuffer, range->primitiveCount, 1, 1);
+            first += range->primitiveCount;
+         }
+      }
+      /* Only large unfused updates consume indirect dispatch commands; keeping
+       * DRAW_INDIRECT off direct-only batches avoids ordering unrelated draws. */
+      vk_common_CmdPipelineBarrier(
+         commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         any_unfused
+            ? (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT)
+            : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         0, 1, any_unfused ? &indirect_barrier : &compute_barrier, 0, NULL, 0, NULL);
    }
-   if (any)
-      vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
 
    /* Encode the leaf jobs */
+   unsigned bound_encode = 5;
    for (uint32_t i = 0; i < build_count; ++i) {
       const struct vk_acceleration_structure_build_state *state = &states[i];
       if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
@@ -1706,6 +1801,32 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer, struct vk_device *device,
       const uint64_t scratch = state->build_info->scratchData.deviceAddress;
       const uint64_t encode = ALIGN_POT(scratch + state->scratch.header_offset +
                                         sizeof(struct vk_ir_header), UINT64_C(8));
+      if (hk_agx3_refit_is_direct_triangles(dev, state)) {
+         const VkAccelerationStructureBuildGeometryInfoKHR *info = state->build_info;
+         const struct hk_agx3_refit_direct_args direct = {
+            .metadata = hk_gen1_as_metadata_addr_for_id(cmd, hk_gen1_as_id(dev, dst)),
+            .bounds = encode + layout.jobs,
+            .output_bvh = hk_as_native_va(dst),
+            .status = encode + layout.node_status,
+            .geometry = vk_fill_geometry_data(
+               info->type, 0, 0,
+               info->pGeometries ? &info->pGeometries[0] : info->ppGeometries[0],
+               &state->build_range_infos[0]),
+            .slot_bias = hk_gen1_as_slot_bias(dev, dst),
+            .leaf_bound = state->leaf_node_count,
+         };
+         if (bound_encode != ENCODE_TRIANGLES_DIRECT) {
+            vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      pipeline[ENCODE_TRIANGLES_DIRECT]);
+            bound_encode = ENCODE_TRIANGLES_DIRECT;
+         }
+         vk_common_CmdPushConstants(commandBuffer, pipeline_layout[ENCODE_TRIANGLES_DIRECT],
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(direct), &direct);
+         hk_cmd_dispatch_unaligned(
+            commandBuffer,
+            hk_agx3_refit_direct_leaf_invocations(state->leaf_node_count), 1, 1);
+         continue;
+      }
       const bool triangles =
          vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_TRIANGLES_KHR;
       const struct hk_agx3_refit_encode_args refit = {
@@ -1718,44 +1839,61 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer, struct vk_device *device,
                          ? scratch + state->scratch.ir_offset : 0,
       };
       const unsigned p = triangles ? ENCODE_TRIANGLES : ENCODE;
-      vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline[p]);
+      if (bound_encode != p) {
+         vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline[p]);
+         bound_encode = p;
+      }
       vk_common_CmdPushConstants(commandBuffer, pipeline_layout[p],
          VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(refit), &refit);
-      hk_cmd_dispatch_indirect_addr(commandBuffer, encode + layout.state);
+      if (hk_agx3_refit_fused_all(state->leaf_node_count))
+         hk_cmd_dispatch_unaligned(
+            commandBuffer,
+            hk_agx3_refit_direct_leaf_invocations(state->leaf_node_count), 1, 1);
+      else
+         hk_cmd_dispatch_indirect_addr(commandBuffer, encode + layout.state);
    }
    vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &compute_barrier, 0, NULL, 0, NULL);
 
-   /* Propagate */
-   for (uint32_t i = 0; i < build_count; ++i) {
-      if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
-         hk_agx3_refit_phase(commandBuffer, &states[i], HK_AGX3_REFIT_PROPAGATE,
-                             hk_agx3_refit_levels(&states[i]));
-   }
-   vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
-
-   /* The levels, deepest first; an update takes part in its own levels. */
-   for (unsigned level = max_levels; level-- > 0;) {
-      any = false;
+   /* Propagate and wide lower levels for large updates only; small/medium
+    * updates encode every inner level inside hk_agx3_refit_top below. */
+   if (any_unfused) {
       for (uint32_t i = 0; i < build_count; ++i) {
          const struct vk_acceleration_structure_build_state *state = &states[i];
          if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE ||
-             level >= hk_agx3_refit_levels(state))
+             hk_agx3_refit_fused_all(state->leaf_node_count))
             continue;
-         struct hk_agx3_as_layout layout;
-         hk_gen1_as_layout_init(state->leaf_node_count, &layout);
-         if (!layout.node_bound)
-            continue;
-         hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_INNER, level);
-         any = true;
+         hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_PROPAGATE,
+                             hk_agx3_refit_levels(state));
       }
-      if (any)
-         vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+      vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &compute_barrier, 0, NULL, 0, NULL);
+
+      for (unsigned level = max_unfused_levels; level-- > HK_AGX3_REFIT_TOP_LEVELS;) {
+         any = false;
+         for (uint32_t i = 0; i < build_count; ++i) {
+            const struct vk_acceleration_structure_build_state *state = &states[i];
+            if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE ||
+                hk_agx3_refit_fused_all(state->leaf_node_count) ||
+                level >= hk_agx3_refit_levels(state))
+               continue;
+            struct hk_agx3_as_layout layout;
+            hk_gen1_as_layout_init(state->leaf_node_count, &layout);
+            if (!layout.node_bound)
+               continue;
+            hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_INNER, level);
+            any = true;
+         }
+         if (any)
+            vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &compute_barrier, 0, NULL, 0, NULL);
+      }
    }
 
-   /* Envelopes */
+   /* Fused top inner levels (all inner levels for small/medium trees) and
+    * envelope finalization, one direct workgroup per update. */
+   vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             pipeline[REFIT_TOP]);
    for (uint32_t i = 0; i < build_count; ++i) {
       const struct vk_acceleration_structure_build_state *state = &states[i];
       if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
@@ -1766,21 +1904,34 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer, struct vk_device *device,
       const uint64_t scratch = state->build_info->scratchData.deviceAddress;
       const uint64_t encode = ALIGN_POT(scratch + state->scratch.header_offset +
                                         sizeof(struct vk_ir_header), UINT64_C(8));
-      const struct hk_agx3_envelope_args finish = {
-         .jobs = encode + layout.envelope, .status = encode + layout.envelope_status,
-         .job_count = 1, .reserved = 2,
+      const bool keep_retained =
+         state->build_info->srcAccelerationStructure ==
+         state->build_info->dstAccelerationStructure;
+      const bool no_leaves = hk_agx3_refit_skips_leaves(dev, state);
+      const bool direct_tri = hk_agx3_refit_is_direct_triangles(dev, state);
+      const struct hk_agx3_refit_top_args top = {
+         .refit = direct_tri ? 0 : encode + layout.state,
+         .counters = encode + layout.nodes,
+         .bounds = encode + layout.jobs,
+         .output_bvh = hk_as_native_va(dst),
+         .status = encode + layout.node_status,
+         .envelope_status = encode + layout.envelope_status,
          .metadata = hk_gen1_as_metadata_addr_for_id(cmd, hk_gen1_as_id(dev, dst)),
-         .ir_header = scratch + state->scratch.header_offset,
+         .header = scratch + state->scratch.header_offset,
          .retained_offset = hk_agx3_retained_offset(state),
-         .build_flags = state->build_info->flags, .node_bound = layout.node_bound,
-         .keep_retained = state->build_info->srcAccelerationStructure ==
-                          state->build_info->dstAccelerationStructure,
-         .refit = 1,
+         .leaf_bound = state->leaf_node_count,
+         .node_bound = layout.node_bound,
+         .slot_bias = hk_gen1_as_slot_bias(dev, dst),
+         .resource_id = hk_gen1_as_id(dev, dst),
+         .geometry_type = vk_get_as_geometry_type(state->build_info),
+         .build_flags = state->build_info->flags,
+         .top_levels = hk_agx3_refit_top_levels(state->leaf_node_count),
+         .flags = (keep_retained ? HK_AGX3_REFIT_TOP_KEEP_RETAINED : 0u) |
+                  (no_leaves ? HK_AGX3_REFIT_TOP_NO_LEAVES : 0u),
       };
-      vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline[ENVELOPE]);
-      vk_common_CmdPushConstants(commandBuffer, pipeline_layout[ENVELOPE],
-         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
-      hk_cmd_dispatch_unaligned(commandBuffer, 64, 1, 1);
+      vk_common_CmdPushConstants(commandBuffer, pipeline_layout[REFIT_TOP],
+         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(top), &top);
+      hk_cmd_dispatch_unaligned(commandBuffer, HK_AGX3_REFIT_TOP_GROUP_SIZE, 1, 1);
    }
 
    for (uint32_t i = 0; i < build_count; ++i) {

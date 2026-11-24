@@ -36,6 +36,16 @@
 /* Variants for one geometry kind: their jobs are inner nodes or that
  * kind's leaves only, so the other kinds' encoders, and their registers,
  * drop out. A job of another kind fails as an invalid job. */
+#ifdef HK_AGX3_REFIT_DIRECT
+#define HK_AGX3_REFIT 1
+#define HK_AGX3_LEAF_ONLY HK_AGX3_NODE_LEAF
+/* Inactive triangles have NaN vertices, as for leaf generation. */
+#define SpvCapabilitySignedZeroInfNanPreserve 4466
+#define SpvExecutionModeSignedZeroInfNanPreserve 4461
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"],
+                     capabilities = [SpvCapabilitySignedZeroInfNanPreserve],
+                     SpvExecutionModeSignedZeroInfNanPreserve, 32);
+#endif
 #ifdef HK_AGX3_REFIT_TRIANGLES
 #define HK_AGX3_REFIT 1
 #define HK_AGX3_LEAF_ONLY HK_AGX3_NODE_LEAF
@@ -57,7 +67,9 @@
 layout(local_size_x = 8 * JOBS) in;
 layout(push_constant) uniform CONSTS
 {
-#ifdef HK_AGX3_REFIT
+#ifdef HK_AGX3_REFIT_DIRECT
+   hk_agx3_refit_direct_args args;
+#elif defined(HK_AGX3_REFIT)
    hk_agx3_refit_encode_args args;
 #else
    hk_agx3_leaf_args args;
@@ -211,8 +223,40 @@ main()
    uint id = gl_WorkGroupID.x * JOBS + slot;
    /* Every lane reaches every subgroup operation; a job that has no node to
     * encode, or fails a check, only stops doing work. */
-#ifdef HK_AGX3_REFIT
+#ifdef HK_AGX3_REFIT_DIRECT
+   libagx_gen1_as_metadata live_meta =
+      DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
+   if (live_meta.retained_bytes == 0ul)
+      return;
+   uint64_t retained = live_meta.native_base + live_meta.retained_offset;
+   hk_agx3_retained_state saved = DEREF(REF(hk_agx3_retained_state)(retained));
+   uint jobs = saved.job_count;
+   uint leaf_jobs = saved.leaf_jobs;
+   if (leaf_jobs > jobs || leaf_jobs + saved.inner_jobs != jobs)
+      leaf_jobs = jobs;
+   if (gl_WorkGroupID.x * JOBS >= leaf_jobs)
+      return;
+   uint64_t records = retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
+   uint64_t offsets = records + uint64_t(jobs) * uint64_t(HK_AGX3_RETAINED_JOB_BYTES);
+   bool live = id < jobs;
+   hk_agx3_leaf_job job;
+   hk_agx3_retained_job record;
+   uint count = 0;
+   if (live) {
+      record = DEREF(INDEX(hk_agx3_retained_job, records, id));
+      job.node_kind = (record.kind_count >> 4) & 15u;
+      live = job.node_kind != HK_AGX3_NODE_INNER;
+   }
+   if (live) {
+      job.output_bvh = args.output_bvh;
+      job.root_slot = record.root_slot;
+      job.child_slot = record.child_slot;
+      job.child_count = record.kind_count & 15u;
+      count = job.child_count;
+#elif defined(HK_AGX3_REFIT)
    hk_agx3_refit_state refit = DEREF(REF(hk_agx3_refit_state)(args.refit));
+   if (gl_WorkGroupID.x >= refit.dispatch[0])
+      return;
    uint jobs = refit.job_count;
    if (gl_WorkGroupID.x * JOBS >= jobs)
       return;
@@ -307,7 +351,39 @@ main()
 #ifndef HK_AGX3_LEAF_PAIRS
          vec3 tri[3];
          uint geometry_flags;
-#ifdef HK_AGX3_REFIT
+#ifdef HK_AGX3_REFIT_DIRECT
+         uint prim_id = DEREF(INDEX(uint32_t, offsets, record.first + lane)) /
+                        SIZEOF(vk_ir_triangle_node);
+         vk_bvh_geometry_data geom = args.geometry;
+         geometry_flags = geom.geometry_id;
+         my_primitive = prim_id;
+         if (prim_id >= args.leaf_bound) {
+            my_bad |= HK_AGX3_LEAF_RANGE;
+            tri[0] = vec3(0.0);
+            tri[1] = vec3(0.0);
+            tri[2] = vec3(0.0);
+         } else {
+            triangle_vertices vertices =
+               load_vertices(geom.data,
+                             load_indices(geom.indices, geom.index_format, prim_id),
+                             geom.vertex_format, geom.stride);
+            if (geom.transform != 0ul) {
+               mat4 transform = mat4(1.0);
+               for (uint col = 0; col < 4; col++)
+                  for (uint row = 0; row < 3; row++)
+                     transform[col][row] = DEREF(INDEX(float, geom.transform, col + row * 4));
+               for (uint i = 0; i < 3; i++)
+                  vertices.vertex[i] = transform * vertices.vertex[i];
+            }
+            /* An updatable structure keeps an inactive triangle as zero
+             * vertices (VK_BUILD_FLAG_ALWAYS_ACTIVE). */
+            bool inactive = false;
+            for (uint i = 0; i < 3; i++)
+               inactive = inactive || any(isnan(vertices.vertex[i]));
+            for (uint v = 0; v < 3; ++v)
+               tri[v] = inactive ? vec3(0.0) : vertices.vertex[v].xyz;
+         }
+#elif defined(HK_AGX3_REFIT)
          if (args.triangles != 0ul) {
             REF(hk_agx3_refit_triangle) src =
                INDEX(hk_agx3_refit_triangle, args.triangles, record.first + lane);
@@ -316,8 +392,17 @@ main()
             for (uint v = 0; v < 3; ++v)
                for (uint a = 0; a < 3; ++a)
                   tri[v][a] = DEREF(src).coords[v][a];
-         } else
-#endif
+         } else {
+            REF(vk_ir_triangle_node)
+            src = REF(vk_ir_triangle_node)(
+               OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
+            geometry_flags = DEREF(src).geometry_id_and_flags;
+            my_primitive = DEREF(src).triangle_id;
+            for (uint v = 0; v < 3; ++v)
+               for (uint a = 0; a < 3; ++a)
+                  tri[v][a] = DEREF(src).coords[v][a];
+         }
+#else
          {
             REF(vk_ir_triangle_node)
             src = REF(vk_ir_triangle_node)(
@@ -328,6 +413,7 @@ main()
                for (uint a = 0; a < 3; ++a)
                   tri[v][a] = DEREF(src).coords[v][a];
          }
+#endif
          my_geometry_id = geometry_flags & ~VK_GEOMETRY_OPAQUE;
          /* The Gen1 triangle record is the same for types 8 and 16;
           * type 8 marks the geometry opaque. */
@@ -466,14 +552,14 @@ main()
       store128(geometry + 32ul, uvec4(my_primitive, 0u, 0u, 0u));
       store128(geometry + 48ul, uvec4(0u));
    }
-#ifdef HK_AGX3_REFIT
+#if defined(HK_AGX3_REFIT) && !defined(HK_AGX3_REFIT_DIRECT)
    if (instances && lane < count) {
       /* As the envelope lays them out after the nodes. */
       uint64_t transforms = uint64_t(refit.end_slot) * 64ul;
       encode_instance(job, lane, transforms,
                       transforms + 64ul * uint64_t(args.leaf_bound));
    }
-#else
+#elif !defined(HK_AGX3_REFIT)
    if (instances && lane < count) {
       uint64_t transforms, pointers;
       if (args.counts != 0ul && args.leaf_bound != 0u) {

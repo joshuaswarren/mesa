@@ -23,6 +23,7 @@
  */
 #version 460
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
@@ -33,9 +34,22 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
 #include "hk_build_interface.h"
 #include "agx3_node.h"
+#ifdef HK_AGX3_REFIT_TOP
+layout(local_size_x = HK_AGX3_REFIT_TOP_GROUP_SIZE) in;
+layout(push_constant) uniform CONSTS { hk_agx3_refit_top_args args; };
+#else
 layout(local_size_x = HK_AGX3_REFIT_GROUP_SIZE) in;
 layout(push_constant) uniform CONSTS { hk_agx3_refit_args args; };
+#endif
 
+/* The retained level table: counts, then fill cursors. */
+uint64_t
+level_table(uint64_t retained, uint jobs)
+{
+   return retained + uint64_t(HK_AGX3_RETAINED_LEVELS(jobs, args.leaf_bound));
+}
+
+#ifndef HK_AGX3_REFIT_TOP
 uint
 leaf_size()
 {
@@ -43,13 +57,6 @@ leaf_size()
              ? SIZEOF(vk_ir_instance_node)
              : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
                 ? SIZEOF(vk_ir_aabb_node) : SIZEOF(vk_ir_triangle_node);
-}
-
-/* The retained level table: counts, then fill cursors. */
-uint64_t
-level_table(uint64_t retained, uint jobs)
-{
-   return retained + uint64_t(HK_AGX3_RETAINED_LEVELS(jobs, args.leaf_bound));
 }
 
 /* Index into the retained inner jobs by level of the first of `level`. */
@@ -234,24 +241,29 @@ prepare(uint id)
    }
    hk_agx3_retained_state saved = DEREF(REF(hk_agx3_retained_state)(source));
    uint jobs = saved.job_count;
+   uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
    if (args.copy != 0u) {
       /* An update into another structure keeps it updatable: copy the state,
        * the records and every child offset the leaf jobs may use. */
       uint words = HK_AGX3_RETAINED_BYTES(jobs, args.leaf_bound) / 4u;
-      if (id < words)
-         DEREF(INDEX(uint32_t, args.retained, id)) = DEREF(INDEX(uint32_t, source, id));
+      for (uint i = id; i < words; i += stride)
+         DEREF(INDEX(uint32_t, args.retained, i)) = DEREF(INDEX(uint32_t, source, i));
    }
-   if (id < jobs)
-      DEREF(INDEX(uint32_t, args.counters, id)) = 0u;
+   if (saved.deepest_level >= args.level && args.counters != 0ul) {
+      for (uint i = id; i < jobs; i += stride)
+         DEREF(INDEX(uint32_t, args.counters, i)) = 0u;
+   }
 
    bool instances = args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR;
    uint64_t transforms = uint64_t(saved.end_slot) * 64ul;
    uint64_t pointers = transforms + 64ul * uint64_t(args.leaf_bound);
    /* Instance encoding fills the pointer of every active instance. */
-   if (instances && jobs != 0u && id < args.leaf_bound) {
-      uint64_t entry = args.output_bvh + pointers + uint64_t(id) * 16ul;
-      DEREF(REF(uint64_t)(entry)) = 0ul;
-      DEREF(REF(uint64_t)(entry + 8ul)) = 0ul;
+   if (instances && jobs != 0u) {
+      for (uint i = id; i < args.leaf_bound; i += stride) {
+         uint64_t entry = args.output_bvh + pointers + uint64_t(i) * 16ul;
+         DEREF(REF(uint64_t)(entry)) = 0ul;
+         DEREF(REF(uint64_t)(entry + 8ul)) = 0ul;
+      }
    }
    if (id != 0)
       return;
@@ -290,22 +302,24 @@ prepare(uint id)
       }
    }
 
-   uint active_leaves = args.no_leaves != 0u ? saved.active_leaves
-                                             : DEREF(args.header).active_leaf_count;
-   bool empty = jobs == 0u || active_leaves == 0u;
-   hk_agx3_envelope_job job;
-   job.bounds = REF(vk_ir_node)(args.bounds + uint64_t(jobs != 0u ? jobs - 1u : 0u) *
-                                uint64_t(SIZEOF(vk_aabb)));
-   job.output_bvh = args.output_bvh;
-   job.end_slot = saved.end_slot;
-   job.primitive_count = empty ? 0u : active_leaves;
-   job.node_count = jobs;
-   job.depth = saved.depth;
-   job.opaque_build_word = empty ? HK_AGX3_PLAN_EMPTY : 0u;
-   job.resource_id = args.resource_id;
-   job.geometry_type = args.geometry_type;
-   job.leaf_bound = args.leaf_bound;
-   DEREF(REF(hk_agx3_envelope_job)(args.envelope)) = job;
+   if (args.envelope != 0ul) {
+      uint active_leaves = args.no_leaves != 0u ? saved.active_leaves
+                                                : DEREF(args.header).active_leaf_count;
+      bool empty = jobs == 0u || active_leaves == 0u;
+      hk_agx3_envelope_job job;
+      job.bounds = REF(vk_ir_node)(args.bounds + uint64_t(jobs != 0u ? jobs - 1u : 0u) *
+                                   uint64_t(SIZEOF(vk_aabb)));
+      job.output_bvh = args.output_bvh;
+      job.end_slot = saved.end_slot;
+      job.primitive_count = empty ? 0u : active_leaves;
+      job.node_count = jobs;
+      job.depth = saved.depth;
+      job.opaque_build_word = empty ? HK_AGX3_PLAN_EMPTY : 0u;
+      job.resource_id = args.resource_id;
+      job.geometry_type = args.geometry_type;
+      job.leaf_bound = args.leaf_bound;
+      DEREF(REF(hk_agx3_envelope_job)(args.envelope)) = job;
+   }
 }
 
 /* From leaf job `id`, whose bounds refit encoding left at its position:
@@ -442,3 +456,406 @@ main()
    else
       inner(id);
 }
+#else /* HK_AGX3_REFIT_TOP */
+
+shared uint s_level_count[HK_AGX3_REFIT_LEVELS];
+shared uint s_level_start[HK_AGX3_REFIT_LEVELS];
+
+/* Exact round-to-nearest-even reciprocal matching agx3_envelope.comp. */
+uint
+reciprocal_rte(float value)
+{
+   uint bits = floatBitsToUint(value);
+   if ((bits & 0x80000000u) != 0u || (bits & 0x7fffffffu) == 0u ||
+       (bits & 0x7f800000u) == 0x7f800000u)
+      return 0x7f800000u;
+   int exponent = int((bits >> 23) & 255u);
+   uint mantissa = bits & 0x7fffffu;
+   if (exponent != 0) {
+      mantissa |= 0x800000u;
+   } else {
+      int shift = 23 - findMSB(mantissa);
+      mantissa <<= shift;
+      exponent = 1 - shift;
+   }
+   int result_exponent = max(253 - exponent, 0);
+   if (result_exponent >= 255)
+      return 0x7f800000u;
+   int numerator_bit = result_exponent == 0 ? 299 - exponent : 47;
+   uint64_t numerator = 1ul << numerator_bit;
+   uint estimate_bits = floatBitsToUint(1.0 / float(mantissa));
+   int estimate_exponent = int((estimate_bits >> 23) & 255u);
+   uint estimate_mantissa = 0x800000u | (estimate_bits & 0x7fffffu);
+   int estimate_shift = 150 - numerator_bit - estimate_exponent;
+   uint quotient = estimate_shift < 0
+                      ? estimate_mantissa << uint(-estimate_shift)
+                      : estimate_mantissa >> uint(estimate_shift);
+   uint64_t product = uint64_t(mantissa) * uint64_t(quotient);
+   while (product > numerator) {
+      --quotient;
+      product -= uint64_t(mantissa);
+   }
+   while (product + uint64_t(mantissa) <= numerator) {
+      ++quotient;
+      product += uint64_t(mantissa);
+   }
+   uint64_t twice_remainder = (numerator - product) * 2ul;
+   if (twice_remainder > uint64_t(mantissa) ||
+       (twice_remainder == uint64_t(mantissa) && (quotient & 1u) != 0u))
+      ++quotient;
+   if (quotient == 0x1000000u) {
+      quotient >>= 1;
+      ++result_exponent;
+   }
+   return result_exponent == 0
+             ? quotient
+             : (uint(result_exponent) << 23) | (quotient & 0x7fffffu);
+}
+
+void
+publish_refit_metadata(uint jobs, uint64_t image_bytes)
+{
+   if (args.metadata == 0ul)
+      return;
+   libagx_gen1_as_metadata live;
+   live.native_base = args.output_bvh;
+   live.image_bytes = image_bytes;
+   live.retained_offset = 0ul;
+   live.retained_bytes = 0ul;
+   if ((args.flags & HK_AGX3_REFIT_TOP_KEEP_RETAINED) != 0u) {
+      libagx_gen1_as_metadata previous =
+         DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
+      live.retained_offset = previous.retained_offset;
+      live.retained_bytes = previous.retained_bytes;
+   } else if ((args.build_flags & 1u) != 0u) { /* Vulkan ALLOW_UPDATE */
+      live.retained_offset = args.retained_offset;
+      live.retained_bytes =
+         uint64_t(HK_AGX3_RETAINED_BYTES(jobs, args.leaf_bound));
+   }
+   live.storage_bytes = max(image_bytes, live.retained_offset + live.retained_bytes);
+   live.build_flags = args.build_flags;
+   live.leaf_bound = args.leaf_bound;
+   live.node_bound = args.node_bound;
+   live.geometry_type = args.geometry_type;
+   live.resource_id = args.resource_id;
+   live.version = LIBAGX_GEN1_AS_METADATA_VERSION;
+   DEREF(REF(libagx_gen1_as_metadata)(args.metadata)) = live;
+}
+
+/* Compute half the bounding-box surface area with NoContraction, padding any
+ * flat axis to match agx3_envelope.comp. Kept in a pure helper (no buffer
+ * references) so glslang's precise propagation stays local. */
+float
+envelope_half_area(vec3 lo, inout vec3 hi, inout uint status)
+{
+   precise vec3 extent = hi - lo;
+   for (uint a = 0u; a < 3u; ++a) {
+      if (isnan(lo[a]) || isinf(lo[a]) || isnan(hi[a]) || isinf(hi[a]))
+         status |= HK_AGX3_LEAF_NONFINITE;
+      if (lo[a] > hi[a])
+         status |= HK_AGX3_LEAF_RANGE;
+      if (extent[a] == 0.0) {
+         hi[a] = lo[a] + max(abs(lo[a]), 1.0) * 1.52587890625e-05;
+         extent[a] = hi[a] - lo[a];
+      }
+   }
+   precise float xy = extent.x * extent.y;
+   precise float xz = extent.x * extent.z;
+   precise float yz = extent.y * extent.z;
+   precise float area = (xy + xz) + yz;
+   return area;
+}
+
+void
+finish_refit_envelope(hk_agx3_retained_state saved, uint jobs)
+{
+   uint active_leaves = (args.flags & HK_AGX3_REFIT_TOP_NO_LEAVES) != 0u
+                           ? saved.active_leaves
+                           : DEREF(args.header).active_leaf_count;
+   bool empty = jobs == 0u || active_leaves == 0u;
+   if (empty) {
+      if (args.output_bvh == 0ul || (args.output_bvh & 63ul) != 0ul ||
+          args.output_bvh >= (1ul << 48) - 192ul) {
+         DEREF(args.envelope_status) = HK_AGX3_LEAF_RANGE;
+         return;
+      }
+      for (uint i = 0u; i < 48u; ++i)
+         store32(args.output_bvh + uint64_t(i) * 4ul,
+                 i >= 20u && i < 26u ? 0x7fc00000u : 0u);
+      store_word64(args.output_bvh + 144ul, args.output_bvh);
+      store32(args.output_bvh + 176ul,
+              args.resource_id != 0u ? args.resource_id : 1u);
+      publish_refit_metadata(jobs, 192ul);
+      DEREF(args.envelope_status) = HK_AGX3_LEAF_SUCCESS;
+      return;
+   }
+
+   uint64_t tail = uint64_t(saved.end_slot) * 64ul;
+   bool instances = args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR;
+   uint64_t transform_offset = tail;
+   uint64_t pointer_offset = tail + 64ul * uint64_t(args.leaf_bound);
+   uint64_t descriptor_offset = instances
+      ? pointer_offset + 16ul * uint64_t(args.leaf_bound) : tail;
+   uint64_t size = descriptor_offset + 184ul;
+   uint status = 0u;
+   if (saved.end_slot < 3u || active_leaves == 0u || jobs == 0u ||
+       saved.depth == 0u)
+      status |= HK_AGX3_LEAF_INVALID_COUNT;
+   if (args.output_bvh == 0ul || (args.output_bvh & 63ul) != 0ul ||
+       args.output_bvh >= (1ul << 48) || size > (1ul << 48) - args.output_bvh)
+      status |= HK_AGX3_LEAF_RANGE;
+
+   vk_aabb root_bounds = DEREF(INDEX(vk_aabb, args.bounds, jobs - 1u));
+   vec3 lo = root_bounds.min, hi = root_bounds.max;
+   float area = envelope_half_area(lo, hi, status);
+   uint inverse_bits = reciprocal_rte(area);
+   float inverse = uintBitsToFloat(inverse_bits);
+   if (!(area > 0.0) || isinf(area) || isinf(inverse))
+      status |= HK_AGX3_LEAF_RANGE;
+   if (status != 0u) {
+      DEREF(args.envelope_status) = status;
+      return;
+   }
+
+   uint64_t h = args.output_bvh + 64ul;
+   uint64_t h0 = (instances ? 0x080000008000f032ul : 0x080000002000f032ul) |
+                 (uint64_t(2u) << 24);
+   uint64_t off40 = instances ? transform_offset : tail;
+   uint64_t off48 = instances ? descriptor_offset : tail;
+   uint64_t off64 = instances ? pointer_offset : tail;
+   store128(h, uvec4(unpackUint2x32(h0), unpackUint2x32(size)));
+   store128(h + 16ul, uvec4(floatBitsToUint(lo.x), floatBitsToUint(lo.y),
+                            floatBitsToUint(lo.z), floatBitsToUint(hi.x)));
+   store128(h + 32ul, uvec4(floatBitsToUint(hi.y), floatBitsToUint(hi.z),
+                            unpackUint2x32(off40)));
+   store128(h + 48ul, uvec4(unpackUint2x32(off48), unpackUint2x32(off48)));
+   store128(h + 64ul, uvec4(unpackUint2x32(off64), unpackUint2x32(off40)));
+   store128(h + 80ul, uvec4(unpackUint2x32(args.output_bvh), unpackUint2x32(off40)));
+   store128(h + 96ul, uvec4(1u, 0u, 0u, 0u));
+   store128(h + 112ul, uvec4(args.resource_id != 0u ? args.resource_id : 1u,
+                             0u, instances ? 0x41d00000u : 0u, 0x01000000u));
+
+   uint64_t d = args.output_bvh + descriptor_offset;
+   if (instances) {
+      store128(d, uvec4(active_leaves, 0u, 0u, active_leaves));
+      store128(d + 16ul, uvec4(jobs, saved.depth, 0u, active_leaves));
+      store128(d + 32ul, uvec4(1u, 0u, 0u, 0u));
+      store128(d + 48ul, uvec4(0u, 0x3f800000u, 0u, 0u));
+      store128(d + 64ul, uvec4(8u, 0u, 0u, 0u));
+      store128(d + 80ul, uvec4(8u, 18u, 0u, 6u));
+      store128(d + 96ul, uvec4(1u, 1u, 1u, inverse_bits));
+      store128(d + 112ul, uvec4(0x01000000u, 0u, 0x00000100u, 0x00010000u));
+      store128(d + 128ul, uvec4(0x00010000u, 0x00ff0001u, 0x02000000u, 5u));
+      store128(d + 144ul, uvec4(0x03000002u, 1u, 0u, 0x3f800000u));
+   } else {
+      store128(d, uvec4(active_leaves, active_leaves, 0u, 0u));
+      store128(d + 16ul, uvec4(jobs, saved.depth, 1u, 0u));
+      store128(d + 32ul, uvec4(1u, 0u, 0u, 0u));
+      store128(d + 48ul, uvec4(0u, 0x3f800000u, 0u, 0u));
+      store128(d + 64ul, uvec4(2u, 1u, 0u, 0u));
+      store128(d + 80ul, uvec4(2u, 10u, 0u, 0u));
+      store128(d + 96ul, uvec4(0u, 0u, 0u, inverse_bits));
+      store128(d + 112ul, uvec4(0x01000000u, 0x01000000u, 0x00000101u, 0x00010000u));
+      store128(d + 128ul, uvec4(0x00010000u, 0x00ff0001u, 0x02000000u, 0x01000005u));
+      store128(d + 144ul, uvec4(0x03000000u, 1u, 0u, 0x3f800000u));
+   }
+   store128(d + 160ul, uvec4(0u));
+   store32(d + 176ul, 0u);
+   store32(d + 180ul, 0u);
+
+   publish_refit_metadata(jobs, size);
+   DEREF(args.envelope_status) = HK_AGX3_LEAF_SUCCESS;
+}
+
+/* Fallback for degenerate trees deeper than HK_AGX3_REFIT_LEVELS when
+ * running all inner levels in one workgroup. */
+void
+propagate_top(uint tid, uint64_t records, uint jobs, uint leaves)
+{
+   for (uint i = tid; i < jobs; i += HK_AGX3_REFIT_TOP_GROUP_SIZE)
+      DEREF(INDEX(uint32_t, args.counters, i)) = 0u;
+   controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup,
+                  gl_StorageSemanticsBuffer,
+                  gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable |
+                     gl_SemanticsMakeVisible);
+   for (uint i = tid; i < leaves; i += HK_AGX3_REFIT_TOP_GROUP_SIZE) {
+      hk_agx3_retained_job leaf = DEREF(INDEX(hk_agx3_retained_job, records, i));
+      if (((leaf.kind_count >> 4) & 15u) == HK_AGX3_NODE_INNER)
+         continue;
+      uint parent = leaf.parent;
+      for (uint steps = 0u; parent != 0xffffffffu && steps < 64u; ++steps) {
+         hk_agx3_retained_job job = DEREF(INDEX(hk_agx3_retained_job, records, parent));
+         if ((job.kind_count >> 8) < HK_AGX3_REFIT_LEVELS)
+            break;
+         uint count = job.kind_count & 15u;
+         uint arrived = atomicAdd(DEREF(INDEX(uint32_t, args.counters, parent)), 1u,
+            gl_ScopeWorkgroup, gl_StorageSemanticsBuffer,
+            gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
+         if (arrived + 1u != count)
+            break;
+         vec3 lo = vec3(INFINITY), hi = vec3(-INFINITY);
+         for (uint c = 0u; c < count && c < 8u; ++c) {
+            lo = min(lo, DEREF(INDEX(vk_aabb, args.bounds, job.first + c)).min);
+            hi = max(hi, DEREF(INDEX(vk_aabb, args.bounds, job.first + c)).max);
+         }
+         vec3 base;
+         uvec3 exponent;
+         bool ok = count >= 1u && count <= 8u && fit_root(lo, hi, base, exponent);
+         for (uint t = 0u; t < 8u && ok; ++t) {
+            vec3 c_lo = vec3(INFINITY), c_hi = vec3(-INFINITY);
+            if (t < count) {
+               c_lo = DEREF(INDEX(vk_aabb, args.bounds, job.first + t)).min;
+               c_hi = DEREF(INDEX(vk_aabb, args.bounds, job.first + t)).max;
+            }
+            root_word(t, count, HK_AGX3_NODE_INNER, 0u, job.child_slot,
+                      args.slot_bias, base, exponent, c_lo, c_hi, ok);
+         }
+         if (ok) {
+            uint64_t node = args.output_bvh + uint64_t(job.root_slot) * 64ul;
+            for (uint t = 0u; t < 8u; ++t) {
+               vec3 c_lo = vec3(INFINITY), c_hi = vec3(-INFINITY);
+               if (t < count) {
+                  c_lo = DEREF(INDEX(vk_aabb, args.bounds, job.first + t)).min;
+                  c_hi = DEREF(INDEX(vk_aabb, args.bounds, job.first + t)).max;
+               }
+               bool word_ok = true;
+               uint64_t word = root_word(t, count, HK_AGX3_NODE_INNER, 0u,
+                                         job.child_slot, args.slot_bias,
+                                         base, exponent, c_lo, c_hi, word_ok);
+               store_word64(node + uint64_t(t) * 8ul, word);
+            }
+         } else {
+            lo = hi = HK_AGX3_FAILED_BOUNDS;
+         }
+         store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, job.position)), lo, hi);
+         DEREF(INDEX(uint32_t, args.status, parent)) =
+            ok ? HK_AGX3_LEAF_SUCCESS : HK_AGX3_LEAF_RANGE;
+         parent = job.parent;
+      }
+   }
+   controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup,
+                  gl_StorageSemanticsBuffer,
+                  gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable |
+                     gl_SemanticsMakeVisible);
+}
+
+/* Single-workgroup fused inner-level refit and envelope writer. Processes
+ * levels min(deepest_level, top_levels - 1) down to 0 in 8-lane batches
+ * (32 jobs per iteration), synchronizing inter-level bounds writes within the
+ * workgroup, then writes the AS header, descriptor and live metadata on
+ * lane 0. */
+void
+main()
+{
+   uint tid = gl_LocalInvocationID.x;
+   uint local_slot = tid / 8u;
+   uint lane = tid % 8u;
+   const uint jobs_per_iter = HK_AGX3_REFIT_TOP_GROUP_SIZE / 8u;
+
+   uint64_t retained = 0ul;
+   hk_agx3_retained_state saved;
+   saved.job_count = 0u;
+   saved.root_job = 0xffffffffu;
+   saved.end_slot = 0u;
+   saved.depth = 0u;
+   saved.deepest_level = 0u;
+   saved.active_leaves = 0u;
+   saved.leaf_jobs = 0u;
+   saved.inner_jobs = 0u;
+   if (args.refit != 0ul) {
+      retained = DEREF(REF(hk_agx3_refit_state)(args.refit)).retained;
+      saved = DEREF(REF(hk_agx3_retained_state)(retained));
+   } else if (args.metadata != 0ul) {
+      libagx_gen1_as_metadata live =
+         DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
+      if (live.retained_bytes != 0ul) {
+         retained = live.native_base + live.retained_offset;
+         saved = DEREF(REF(hk_agx3_retained_state)(retained));
+      }
+   }
+   uint jobs = saved.job_count;
+
+   if (jobs != 0u && args.top_levels != 0u) {
+      uint64_t records = retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
+      uint64_t table = level_table(retained, jobs);
+      uint64_t list = table + uint64_t(HK_AGX3_RETAINED_LEVEL_BYTES);
+
+      if (tid == 0u) {
+         uint sum = 0u;
+         for (uint l = 0u; l < HK_AGX3_REFIT_LEVELS; ++l) {
+            uint c = min(DEREF(INDEX(uint32_t, table, l)), jobs);
+            s_level_count[l] = c;
+            s_level_start[l] = sum;
+            sum += c;
+         }
+      }
+      controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup,
+                     gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+
+      if (args.top_levels >= HK_AGX3_REFIT_LEVELS &&
+          saved.deepest_level >= HK_AGX3_REFIT_LEVELS) {
+         uint leaves = saved.leaf_jobs;
+         if (leaves > jobs || leaves + saved.inner_jobs != jobs)
+            leaves = jobs;
+         propagate_top(tid, records, jobs, leaves);
+      }
+
+      uint start_level = min(saved.deepest_level, args.top_levels - 1u);
+      for (int lvl = int(start_level); lvl >= 0; --lvl) {
+         uint level_count = s_level_count[lvl];
+         if (level_count == 0u)
+            continue;
+         uint base_idx = s_level_start[lvl];
+         for (uint batch = 0u; batch < level_count; batch += jobs_per_iter) {
+            uint slot = batch + local_slot;
+            bool live = slot < level_count;
+            uint index = 0u, count = 0u;
+            hk_agx3_retained_job job;
+            vec3 my_lo = vec3(INFINITY), my_hi = vec3(-INFINITY);
+            if (live) {
+               index = DEREF(INDEX(uint32_t, list, base_idx + slot));
+               job = DEREF(INDEX(hk_agx3_retained_job, records, index));
+               count = job.kind_count & 15u;
+               if (lane < count) {
+                  my_lo = DEREF(INDEX(vk_aabb, args.bounds, job.first + lane)).min;
+                  my_hi = DEREF(INDEX(vk_aabb, args.bounds, job.first + lane)).max;
+               }
+            }
+            vec3 lo = subgroupClusteredMin(my_lo, 8u);
+            vec3 hi = subgroupClusteredMax(my_hi, 8u);
+            vec3 base;
+            uvec3 exponent;
+            bool ok = live && count >= 1u && count <= 8u && fit_root(lo, hi, base, exponent);
+            uint64_t word = 0ul;
+            if (ok)
+               word = root_word(lane, count, HK_AGX3_NODE_INNER, 0u, job.child_slot,
+                                args.slot_bias, base, exponent, my_lo, my_hi, ok);
+            bool bad = subgroupClusteredOr(ok ? 0u : 1u, 8u) != 0u;
+            if (live) {
+               if (bad) {
+                  if (lane == 0u) {
+                     DEREF(INDEX(uint32_t, args.status, index)) = HK_AGX3_LEAF_RANGE;
+                     store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, job.position)),
+                                HK_AGX3_FAILED_BOUNDS, HK_AGX3_FAILED_BOUNDS);
+                  }
+               } else {
+                  store_word64(args.output_bvh + uint64_t(job.root_slot) * 64ul +
+                               uint64_t(lane) * 8ul, word);
+                  if (lane == 0u) {
+                     store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, job.position)), lo, hi);
+                     DEREF(INDEX(uint32_t, args.status, index)) = HK_AGX3_LEAF_SUCCESS;
+                  }
+               }
+            }
+         }
+         controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup,
+                        gl_StorageSemanticsBuffer,
+                        gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable |
+                           gl_SemanticsMakeVisible);
+      }
+   }
+
+   if (tid == 0u)
+      finish_refit_envelope(saved, jobs);
+}
+#endif /* HK_AGX3_REFIT_TOP */
