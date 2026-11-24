@@ -20,6 +20,7 @@
 
 #include "hk_device.h"
 #include "hk_device_memory.h"
+#include "hk_identity_copy4.h"
 #include "hk_private.h"
 #include "hk_nir_lower_mesh.h"
 
@@ -78,7 +79,13 @@ struct hk_shader_info {
           * triangle covering the whole clip-space square in front of the
           * viewer (hk_vs_covers_clip_square()). */
          bool covers_clip_square;
-         uint8_t _pad[6];
+         /* Per-pipeline vertex input robustness (enum agx_robustness_level).
+          * Valid only when has_vertex_robustness is true; shader objects leave
+          * it false so draw-time prolog/index robustness derives from enabled
+          * device features. */
+         uint8_t vertex_robustness;
+         bool has_vertex_robustness;
+         uint8_t _pad[4];
       } vs;
 
       struct {
@@ -94,9 +101,10 @@ struct hk_shader_info {
          /* Rasterization samples the G17P coverage updates are compiled for */
          uint8_t g17p_samples;
 
-         /* AGX_G17P_UNIT_RANGE_BLEND: every colour output is provably in
-          * [0, 1] (computed only with the flag set). */
-         bool g17p_colour_unit_range;
+         /* Every colour output is provably in [0, 1]
+          * (agx_nir_fs_colour_outputs_unit_range), allowing blend epilogs to
+          * elide redundant UNORM/sRGB source clamps. */
+         bool colour_unit_range;
 
          /* AGX3: the main part's depth/stencil test selector was folded to
           * "this part tests" (hk_fs_key::static_tests); its epilog must not
@@ -109,7 +117,10 @@ struct hk_shader_info {
          /* G17P: the main part applies alpha-to-coverage in the coverage
           * update that tests (agx_fs_epilog_key::a2c_in_main). */
          bool a2c_in_main;
-         uint8_t _pad[1];
+         /* Fragment shader reads gl_Layer (VARYING_SLOT_LAYER or LAYER_ID). */
+         bool reads_layer;
+         /* Fragment shader declares or reads any subpass input attachment. */
+         bool has_input_attachments;
       } fs;
 
       struct {
@@ -141,10 +152,9 @@ struct hk_shader_info {
    uint8_t set_count;
 
    /* Positive proof recorded before inserting the default Layer output.
-    * Only original vertex hardware variants qualify.  False is unknown.
-    * Serialized with shader binary version 26 or newer.
+    * Only original vertex/tess/geom hardware variants qualify. False is unknown.
     */
-   bool g17p_default_layer_zero;
+   bool default_layer_zero;
 
    /* External API memory writes (stores, atomics, transform feedback). */
    bool writes_external_memory;
@@ -212,10 +222,63 @@ struct hk_fast_link_key_vs {
    struct agx_vs_prolog_key prolog;
 };
 
+#define HK_MAX_LOCAL_READ_BINDINGS 8
+
+struct hk_local_read_binding {
+   uint8_t ia_idx;
+   uint8_t set;
+   uint16_t binding;
+   uint16_t elem;
+   uint8_t is_ms;
+   uint8_t _pad;
+};
+
+struct hk_local_read_info {
+   uint8_t ia_mask;
+   uint8_t ms_mask;
+   uint8_t binding_count;
+   bool uses_sample_shading;
+   struct hk_local_read_binding bindings[HK_MAX_LOCAL_READ_BINDINGS];
+};
+
+struct hk_local_read_shader_meta {
+   struct agx_fs_epilog_link_info epilog_key;
+   uint8_t set_count;
+   uint8_t agx3_root_reads;
+   bool g17p_colour_unit_range;
+   bool static_tests;
+   bool may_kill;
+   bool a2c_in_main;
+   bool early_fragment_tests;
+   bool writes_memory;
+   bool writes_external_memory;
+   bool reads_images;
+   bool agx3_uses_root;
+   bool agx3_combined_sampler_valid;
+   bool agx3_txf_texture_valid;
+   bool agx3_storage_image_valid;
+   bool agx3_sampled_storage_valid;
+   bool agx3_indexed_sampler_valid;
+   bool agx3_indexed_storage_valid;
+   unsigned agx3_root_uniform;
+   struct agx_g17p_combined_sampler_binding agx3_combined_sampler;
+   struct agx_g17p_txf_binding agx3_txf_texture;
+   struct agx_g17p_storage_image_binding agx3_storage_image;
+   struct agx_g17p_sampled_storage_binding agx3_sampled_storage;
+   struct agx_g17p_indexed_storage_binding agx3_indexed_storage;
+};
+
+struct hk_local_read_link_key {
+   int8_t ia_to_rt[HK_MAX_RTS];
+   uint8_t enabled;
+   uint8_t _pad[3];
+};
+
 struct hk_fast_link_key_fs {
    unsigned nr_samples_shaded;
    struct agx_fs_prolog_key prolog;
    struct agx_fs_epilog_key epilog;
+   struct hk_local_read_link_key local_read;
 };
 
 struct hk_shader {
@@ -237,6 +300,10 @@ struct hk_shader {
     * with position and up to two ordinary varying slots populate the exact
     * no-preamble fields; other AGX3 layouts remain zero. */
    struct agx_vdm_state_update_program_info agx3_vdm_state_update;
+   /* Matching VertexProgramVariant state with its per-draw constant program
+    * stripped, used when the vertex preamble is hoisted into a PREGFX compute
+    * dispatch for multi-draw batches. */
+   struct agx_vdm_state_update_program_info agx3_vdm_state_update_no_cprog;
 
    const void *code_ptr;
    uint32_t code_size;
@@ -293,6 +360,22 @@ struct hk_shader {
    size_t g17p_mono_nir_size;
    struct agx_shader_key g17p_mono_key;
    bool g17p_mono_preoptimized;
+
+   /* Fragment NIR with eligible color subpass input attachments lowered to
+    * fb_fetch_output load_output intrinsics, so fast-link can inline the
+    * colour epilog and read on-chip tile memory directly. NULL if ineligible. */
+   void *local_read_nir;
+   size_t local_read_nir_size;
+   struct agx_shader_key local_read_key;
+   struct hk_local_read_info local_read;
+   struct hk_local_read_shader_meta local_read_meta;
+
+   /* Extracted 1-thread compute NIR for a hoistable AGX3 vertex preamble, and
+    * the lazily compiled compute shader built from it under linked.lock. */
+   void *preamble_nir;
+   size_t preamble_nir_size;
+   struct hk_shader *preamble_cs;
+   bool preamble_cs_attempted;
 };
 
 static inline uint64_t
@@ -420,12 +503,25 @@ hk_g17p_sparse_vertex_outputs(const struct shader_info *info,
  * multiple hardware hk_shader's, built at shader compile time. This complexity
  * implements the legacy geometry pipeline and native sample-count variants.
  */
+#include "hk_byte_stencil.h"
+
+struct hk_byte_stencil_variant {
+   struct hk_byte_stencil_plan plan;
+   struct hk_shader shader;
+};
+
 struct hk_api_shader {
    struct vk_shader vk;
 
    /* Non-NULL only for a fresh API wrapper borrowing immutable deserialized
     * code/data from the device's bounded binary cache. */
    struct hk_shader_binary_cache_entry *binary_cache_entry;
+
+   /* Optional compile-time packed vec4 alternates for eligible AGX3 compute
+    * shaders. */
+   struct hk_shader *identity_copy4;
+   struct hk_shader *im2col_vec4;
+   struct hk_identity_copy4 identity_copy4_info;
 
    /* Is this an internal passthrough geometry shader? */
    bool is_passthrough;
@@ -464,6 +560,10 @@ struct hk_api_shader {
    /* Non-NULL for a fragment shader whose depth/stencil feedback loop is only
     * known at draw time: what its zs_self_dep twin compiles from. */
    struct hk_border_source *fbl_source;
+
+   /* Non-NULL for a compute shader matched as a separable 1D byte-image
+    * stencil: holds the dispatch validation plan and compiled tiled variant. */
+   struct hk_byte_stencil_variant *byte_stencil;
 
    struct hk_shader variants[];
 };
@@ -653,6 +753,17 @@ struct hk_linked_shader {
     * the descriptor root even when the application fragment shader does not. */
    bool g17p_prolog_uses_root;
 
+   /* Linked fragment executable reads color input attachments directly from
+    * on-chip tile memory instead of texture descriptors. */
+   bool uses_local_read_tile;
+
+   /* Linked fragment executable is translucent solely because it writes a
+    * proper non-empty subset of the bound colour attachments without reading
+    * the tilebuffer, blending, logic ops, partial channel/sample masks, or
+    * spilling. Eligible for per-stream opaque/punch-through HSR promotion. */
+   bool partial_mrt_opaque_eligible;
+   uint8_t partial_mrt_written_mask;
+
    /* An inline-blend fragment program that forms its own constant program
     * (hk_g17p_inline_epilog_part()) has its own uniform layout: this shader
     * describes it, and the draw takes the program's launch (uniform ranges,
@@ -678,7 +789,11 @@ static inline struct hk_shader *
 hk_linked_shader_source(struct hk_shader *source,
                         const struct hk_linked_shader *linked)
 {
-   return linked && linked->variant_source ? linked->variant_source : source;
+   if (linked && linked->variant_source)
+      return linked->variant_source;
+   if (linked && linked->g17p_layout)
+      return linked->g17p_layout;
+   return source;
 }
 
 /* `main_part`, when non-NULL, replaces main->b as the linked main part
@@ -697,6 +812,12 @@ struct hk_linked_shader *hk_fast_link_part(struct hk_device *dev, bool fragment,
 struct hk_shader *hk_g17p_layout_shader_create(struct hk_device *dev,
                                                const struct hk_shader *api,
                                                struct agx_shader_part *part);
+/* Like hk_g17p_layout_shader_create(), and replaces fragment resource metadata
+ * with api->local_read_meta for a monolithic tile-memory local_read program. */
+struct hk_shader *
+hk_g17p_layout_shader_create_local_read(struct hk_device *dev,
+                                        const struct hk_shader *api,
+                                        struct agx_shader_part *part);
 
 struct hk_linked_shader *hk_fast_link(struct hk_device *dev, bool fragment,
                                       struct hk_shader *main,
@@ -745,6 +866,114 @@ hk_g17p_native_cprog_qualified(const struct agx_shader_info *info)
            agx3_cprog_static_spill_info_valid(info)) &&
           (!!info->agx3_preamble_inputs.count ==
            info->agx3_preamble_tps_inputs);
+}
+
+/* Whether a compiled compute shader's constant program (preamble) satisfies
+ * the CDM launch contract on G17P or M5. Shared between compile-time fallback
+ * (hk_compile_nir()) and record-time validation
+ * (hk_g17p_compute_shader_supported()) so any kernel whose preamble dispatch
+ * would refuse (including texture/sampler state promotion, scratch/local-size
+ * caps, or staging metadata) falls back cleanly to compiling without a
+ * preamble. */
+static inline bool
+hk_agx3_compute_cprog_supported(enum agx_chip chip, mesa_shader_stage stage,
+                                const struct hk_shader_info *hk_info,
+                                const struct agx_shader_info *info,
+                                unsigned max_spill_B)
+{
+   if (!info->has_preamble && info->preamble_scratch_size == 0)
+      return true;
+
+   const bool tex_sampler_ok =
+      info->texture_state_count == 0 && !info->uses_sampler_heap &&
+      (info->sampler_state_count == 0 ||
+       ((hk_info->agx3_txf_texture_valid ||
+         hk_info->agx3_storage_image_valid ||
+         hk_info->agx3_sampled_storage_valid ||
+         hk_info->agx3_indexed_storage_valid ||
+         hk_info->agx3_indexed_sampler_valid) &&
+        info->sampler_state_count == 1));
+
+   return (agx_chip_g17_m5(chip) || agx_chip_native_preamble(chip)) &&
+          stage == MESA_SHADER_COMPUTE &&
+          info->agx3_staging_known &&
+          info->agx3_preamble_staging_known &&
+          info->scratch_size <= max_spill_B &&
+          info->local_size <= 32768 &&
+          info->preamble_scratch_size <= max_spill_B &&
+          info->preamble_scratch_size >=
+             info->agx3_preamble_inputs.storage_bytes &&
+          tex_sampler_ok &&
+          (agx_chip_g17_m5(chip) ||
+           (hk_g17p_native_cprog_qualified(info) &&
+            !info->uses_ray_traversal && !info->uses_resource_info_query));
+}
+
+/* Whether a hardware vertex shader should attempt a native vertex constant
+ * program (preamble).
+ *
+ * A native vertex constant program imports its inputs through thread-private
+ * storage (preamble_scratch_size > 0). On M5, any vertex-stage TPS allocation
+ * sets cs->m5_vertex_tps and forces the vertex half to keep the full
+ * render-subqueue prefix instead of overlapping earlier fragment work through
+ * stage prefixes. When the kernel advertises stage-prefix overlap on M5 (both
+ * DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS and either
+ * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES or
+ * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2, matching queue submission
+ * admission in hk_queue.c), omit the vertex constant program so non-spilling
+ * hardware vertex shaders stay free of TPS and stage-prefix overlap can engage
+ * (vertex shaders whose main body spills still set cs->m5_vertex_tps). API
+ * vertex shaders receive driver-resolvable descriptors and push data through
+ * uniform DMA (vs_dma), while GS raster and native TES variants keep their
+ * root and descriptor pointers for direct loads. When the kernel lacks the
+ * full stage-prefix submission capability on M5, preserve the existing vertex
+ * constant program. */
+static inline bool
+hk_allow_vs_cprog(enum agx_chip chip, uint64_t features, bool hw,
+                  mesa_shader_stage stage, bool agx3_gen1_fragment_rq)
+{
+   const bool m5_stage_prefixes =
+      agx_chip_g17_m5(chip) &&
+      (features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) &&
+      (features & (DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES |
+                   DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2));
+   const bool m5_cprog = agx_chip_g17_m5(chip) && !m5_stage_prefixes;
+   return (agx_chip_native_preamble(chip) || m5_cprog) && hw &&
+          stage == MESA_SHADER_VERTEX && !agx3_gen1_fragment_rq;
+}
+
+static inline enum agx_robustness_level
+hk_vertex_robustness_from_vk(VkPipelineRobustnessBufferBehaviorEXT behavior)
+{
+   switch (behavior) {
+   case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT:
+      return AGX_ROBUSTNESS_DISABLED;
+   case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT:
+      return AGX_ROBUSTNESS_GL;
+   case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT:
+      return AGX_ROBUSTNESS_D3D;
+   default:
+      UNREACHABLE("Invalid VkPipelineRobustnessBufferBehaviorEXT");
+   }
+}
+
+static inline enum agx_robustness_level
+hk_vertex_robustness_level(const struct hk_device *dev,
+                           const struct hk_shader *vs,
+                           VkPipelineRobustnessBufferBehaviorEXT vi_robustness)
+{
+   if (vs && vs->info.vs.has_vertex_robustness) {
+      if (vi_robustness !=
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT)
+         return hk_vertex_robustness_from_vk(vi_robustness);
+      return (enum agx_robustness_level)vs->info.vs.vertex_robustness;
+   }
+
+   if (dev->vk.enabled_features.robustBufferAccess2)
+      return AGX_ROBUSTNESS_D3D;
+   if (dev->vk.enabled_features.robustBufferAccess)
+      return AGX_ROBUSTNESS_GL;
+   return AGX_ROBUSTNESS_DISABLED;
 }
 
 /* A null uniform buffer is based at the zero page, which spans
@@ -835,3 +1064,9 @@ bool hk_tes_ray_queries_in_compute(const struct hk_device *dev);
 /* Lower a G17P task shader, after hk_lower_nir(), to the compute kernel of
  * the software task stage. */
 void hk_g17p_lower_task_kernel(nir_shader *nir);
+
+/* Lazily compile and cache the 1-thread compute shader for a hoistable AGX3
+ * vertex preamble. Returns NULL if the vertex shader has no hoistable preamble
+ * or compilation fails. */
+struct hk_shader *hk_shader_get_preamble_cs(struct hk_device *dev,
+                                            struct hk_shader *vs);

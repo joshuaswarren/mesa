@@ -39,6 +39,7 @@ agx_upload_vbos(struct agx_batch *batch)
       if (vb.buffer.resource) {
          struct agx_resource *rsrc = agx_resource(vb.buffer.resource);
          agx_batch_reads(batch, rsrc);
+         agx_batch_note_vs_read(batch, rsrc);
 
          buffers[vbo] = agx_map_gpu(rsrc) + vb.buffer_offset;
          buf_sizes[vbo] = rsrc->layout.size_B - vb.buffer_offset -
@@ -195,9 +196,14 @@ agx_set_cbuf_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
    struct agx_stage *st = &batch->ctx->stage[stage];
    struct agx_stage_uniforms *unif = &batch->stage_uniforms[stage];
 
+   const bool pre_frag =
+      stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE;
+
    u_foreach_bit(cb, st->cb_mask) {
       unif->ubo_base[cb] = agx_const_buffer_ptr(batch, &st->cb[cb]);
       unif->ubo_size[cb] = st->cb[cb].buffer_size;
+      if (pre_frag && st->cb[cb].buffer)
+         agx_batch_note_vs_read(batch, agx_resource(st->cb[cb].buffer));
    }
 }
 
@@ -210,6 +216,9 @@ agx_set_ssbo_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
    /* Single element sink. TODO: Optimize with soft fault. */
    uint32_t zeroes[4] = {0};
    uint64_t sink = agx_pool_upload_aligned(&batch->pool, &zeroes, 16, 16);
+
+   const bool pre_frag =
+      stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE;
 
    /* Consider all shader buffers, needed to avoid faults with
     * e.g. arb_shader_storage_buffer_object-array-ssbo-binding.
@@ -224,9 +233,13 @@ agx_set_ssbo_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
             agx_batch_writes_range(batch, rsrc, sb->buffer_offset,
                                    sb->buffer_size);
             batch->incoherent_writes = true;
+            if (pre_frag)
+               batch->vs_needs_render_barrier = true;
          } else {
             agx_batch_reads_range(batch, rsrc, sb->buffer_offset,
                                   sb->buffer_size);
+            if (pre_frag)
+               agx_batch_note_vs_read(batch, rsrc);
          }
 
          unif->ssbo_base[cb] = agx_map_gpu(rsrc) + sb->buffer_offset;

@@ -417,6 +417,9 @@ struct hk_device {
    } scratch;
 
    uint32_t perftest;
+   /* drirc hk_submit_batch_size: at most this many commands per kernel
+    * submission (0: the kernel and batching limits alone). */
+   unsigned submit_batch_size;
 
    struct {
       struct u_rwlock lock;
@@ -490,6 +493,17 @@ hk_cdm_memory_scope_form(const struct hk_device *dev)
 {
    return agx_chip_has_record(dev->dev.chip,
                               AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY);
+}
+
+/* Whether a compute command whose stream ends with the strong memory-scoped
+ * flush says so (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION), so the kernel can
+ * let another queue's kick wait for its completion in firmware. */
+static inline bool
+hk_cdm_visible_completion(const struct hk_device *dev)
+{
+   return agx_chip_g17_m5(dev->dev.chip) &&
+          (dev->dev.params.features &
+           DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION);
 }
 
 /* Whether it is still unknown if the GPU's caches are tagged by virtual

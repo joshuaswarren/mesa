@@ -164,43 +164,42 @@ allow_any_intrin(const nir_intrinsic_instr *intrin, const void *data)
 static bool
 nir_opt_cse_impl(nir_function_impl *impl)
 {
-   struct set instr_set;
-   nir_instr_set_init(&instr_set, NULL);
+   struct nir_cse_instr_set instr_set;
+   nir_cse_instr_set_init(&instr_set, impl->ssa_alloc);
 
-   _mesa_set_resize(&instr_set, impl->ssa_alloc);
-
-   struct set per_block_set = { 0 };
+   struct nir_cse_instr_set per_block_set;
+   per_block_set.capacity = 0;
 
    nir_metadata_require(impl, nir_metadata_dominance);
 
    bool progress = false;
    nir_foreach_block(block, impl) {
-      if (per_block_set.table)
-         _mesa_set_clear(&per_block_set, NULL);
+      if (per_block_set.capacity)
+         nir_cse_instr_set_clear(&per_block_set);
 
       nir_foreach_instr_safe(instr, block) {
          if (instr->type == nir_instr_type_intrinsic && do_subgroup_cse(instr)) {
-            if (!per_block_set.table)
-               nir_instr_set_init(&per_block_set, NULL);
+            if (!per_block_set.capacity)
+               nir_cse_instr_set_init(&per_block_set, 0);
 
-            if (nir_instr_set_add_or_rewrite(&per_block_set, instr, allow_any_intrin, NULL, NULL)) {
+            if (nir_cse_instr_set_add_or_rewrite(&per_block_set, instr, allow_any_intrin, NULL, NULL)) {
                progress = true;
                nir_instr_remove(instr);
             }
-         } else if (nir_instr_set_add_or_rewrite(&instr_set, instr, allow_discard, NULL, dominates)) {
+         } else if (nir_cse_instr_set_add_or_rewrite(&instr_set, instr, allow_discard, NULL, dominates)) {
             progress = true;
             nir_instr_remove(instr);
-         } else if (per_block_set.table && may_change_active_invocations(instr)) {
-            _mesa_set_clear(&per_block_set, NULL);
+         } else if (per_block_set.capacity && may_change_active_invocations(instr)) {
+            nir_cse_instr_set_clear(&per_block_set);
          }
       }
    }
 
    nir_progress(progress, impl, nir_metadata_control_flow);
 
-   if (per_block_set.table)
-      nir_instr_set_fini(&per_block_set);
-   nir_instr_set_fini(&instr_set);
+   if (per_block_set.capacity)
+      nir_cse_instr_set_fini(&per_block_set);
+   nir_cse_instr_set_fini(&instr_set);
    return progress;
 }
 

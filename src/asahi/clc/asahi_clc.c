@@ -86,6 +86,13 @@ target_is_native_agx3(const char *target)
    return agx_chip_native_agx3(target_chip(target));
 }
 
+/* Whether a target runs the native AGX3 path with the HAL200 command stream. */
+static bool
+target_is_native_hal200(const char *target)
+{
+   return agx_chip_native_hal200(target_chip(target));
+}
+
 /* Whether a target executes AGX3 code: the native AGX3B path or the M5 AGX3C
  * one. */
 static bool
@@ -327,8 +334,8 @@ target_supports_program(const char *target, const nir_function *func)
 {
    if (!strcmp(func->name, "libagx_m5_decompress_rgba16f"))
       return !strcmp(target, "g17g");
-   if (!strcmp(func->name, "libagx_g17p_decompress_16b"))
-      return !strcmp(target, "g17p");
+   if (!strcmp(func->name, "libagx_agx3_decompress"))
+      return agx_chip_native_hal200(target_chip(target));
 
    if (!strcmp(target, "g17g") &&
        !strncmp(func->name, "libagx_d3d12_", strlen("libagx_d3d12_")))
@@ -360,9 +367,9 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_fill_uint4") ||
           !strcmp(func->name, "libagx_gen1_as_property") ||
           !strcmp(func->name, "libagx_gen1_as_copy") ||
-          /* Native G17P AS copies relocate child slots and then restore the
-           * instance-record slots which can resemble node markers. */
-          (!strcmp(target, "g17p") &&
+          /* Native HAL200 Gen1 AS copies relocate child slots and then
+           * restore the instance-record slots which can resemble node markers. */
+          (target_is_native_hal200(target) &&
            (!strcmp(func->name, "libagx_gen1_as_rebase") ||
             !strcmp(func->name, "libagx_gen1_as_restore_records"))) ||
           !strcmp(func->name, "libagx_gen1_as_serialize") ||
@@ -371,7 +378,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_gen1_as_empty") ||
           (strcmp(target, "g18g") &&
            !strcmp(func->name, "libagx_fast_clear")) ||
-          (!strcmp(target, "g17p") &&
+          (agx_chip_native_hal200(target_chip(target)) &&
            !strcmp(func->name, "libagx_reset_compression_metadata")) ||
           !strcmp(func->name, "libagx_copy_image") ||
           !strcmp(func->name, "libagx_mipmap_unorm8x4") ||
@@ -379,6 +386,11 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_mipmap_unorm8x4_odd") ||
           !strcmp(func->name, "libagx_resolve_unorm8x4") ||
           !strcmp(func->name, "libagx_predicate_indirect") ||
+          !strcmp(func->name, "libagx_build_indirect_vdm") ||
+          /* Runtime VDM stream truncation for drawIndirectCount: one
+           * invocation, binary search over constant spans, save/restore of one
+           * 8-byte VDM record header with a pre-packed VDM_STREAM_LINK. */
+          !strcmp(func->name, "libagx_patch_vdm_indirect_count") ||
           /* VK_KHR_ray_tracing_pipeline's indirect trace-rays setup.  One
            * invocation, three constant loads, three global stores and a shift
            * -- no atomics, no barriers, no printf, no scratch.  Its ARITHMETIC
@@ -432,7 +444,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_copy_query_gl") ||
           !strcmp(func->name, "libagx_increment_cs_invocations") ||
           !strcmp(func->name, "libagx_setup_indirect_dispatch") ||
-          !strcmp(func->name, "libagx_copy_timestamp") ||
+          !strcmp(func->name, "libagx_copy_timestamps") ||
           !strcmp(func->name, "libagx_increment_statistic") ||
           /* Software tessellation */
           !strcmp(func->name, "libagx_tess_setup_indirect") ||
@@ -725,7 +737,7 @@ main(int argc, char **argv)
             }
 
             if (!strcmp(libfunc->name, "libagx_m5_decompress_rgba16f") ||
-                !strcmp(libfunc->name, "libagx_g17p_decompress_16b")) {
+                !strcmp(libfunc->name, "libagx_agx3_decompress")) {
                key.g17p_texture_uniform_base = AGX_ABI_AGX3_PRECOMP_ARG_HALFS;
                NIR_PASS(_, clone, nir_shader_intrinsics_pass,
                         lower_m5_decompress_load, nir_metadata_none, NULL);

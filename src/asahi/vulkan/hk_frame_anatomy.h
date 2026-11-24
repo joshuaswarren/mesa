@@ -2,34 +2,23 @@
  * Copyright 2026 Aurora Silicon contributors
  * SPDX-License-Identifier: MIT
  *
- * Opt-in "frame anatomy" profiler: one compact log line per submitted
- * control stream (render or compute) with the hardware's framebuffer and
- * attachment load/store configuration, the barriers exactly as submitted and
- * firmware GPU timestamps.
+ * Opt-in frame-anatomy profiler: logs one line per submitted control stream
+ * (render or compute) with framebuffer/load-store state, submitted barriers,
+ * and firmware GPU timestamps.
  *
- * Enabled only by HK_FRAME_ANATOMY=<path> (or "-" for stderr). Every
- * HK_FRAME_ANATOMY_EVERY-th queue submit is sampled (default 200).
- * HK_FRAME_ANATOMY_TS selects which commands of a sampled submit get profiler
- * timestamps: "all" (default), "edges" (first and last hardware command only)
- * or "none".
+ * Controlled by HK_FRAME_ANATOMY=<path|"-" for stderr>,
+ * HK_FRAME_ANATOMY_EVERY=<N> (default 200), and
+ * HK_FRAME_ANATOMY_TS=<"all"|"edges"|"none"> (default "all").
  *
- * The profiler changes the timing it reports:
- * - With "all", each cross-engine step of a sampled submit waits on the
- *   host first (on the M5 the kernel turns every timestamped command into
- *   a host-prefix producer). Gaps between render and compute work in "all"
- *   output are largely made by the profiler. Seen on G17P (M4 Max: a
- *   multi-pass test went from 0.53 to 3.41 ms per frame, with ~600 us
- *   gaps between engines in a game that are not there without it) and on
- *   the M5. Use "all" for per-command shape and relative cost inside one
- *   engine; use "edges" (low perturbation, whole submit) or "none" for
- *   timing.
- * - A command's start stamp is taken before its barriers resolve, so a
- *   per-command duration includes the wait on its dependencies.
- * - Sampling costs time by itself: HK_FRAME_ANATOMY_EVERY=1 cost ~23 % fps
- *   on G17P in a game even apart from "all". Keep sampling sparse.
- * When HK_FRAME_ANATOMY is unset, hk_device::frame_anatomy stays NULL and
- * every hook below reduces to one predictable NULL test; no control stream,
- * shader or kernel command is changed.
+ * Timing caveats:
+ * - "all" makes each cross-engine step wait on the host first (on M5 the
+ *   kernel turns every timestamped command into a host-prefix producer;
+ *   measured 0.53 -> 3.41 ms/frame on M4 Max); use "all" for intra-engine
+ *   shape and "edges"/"none" for end-to-end timing.
+ * - Start timestamps precede barrier resolution, so durations include waits.
+ * - Dense sampling adds overhead (HK_FRAME_ANATOMY_EVERY=1 cost ~23% fps on
+ *   G17P); keep HK_FRAME_ANATOMY_EVERY sparse.
+ * When unset, hk_device::frame_anatomy is NULL and hooks are single NULL checks.
  */
 #pragma once
 

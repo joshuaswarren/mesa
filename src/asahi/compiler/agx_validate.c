@@ -121,6 +121,12 @@ agx_validate_sources(agx_instr *I)
       } else if (I->op == AGX_OPCODE_PHI) {
          agx_validate_assert(src.size == I->dest[0].size);
          agx_validate_assert(!agx_is_null(src));
+      } else if ((I->op == AGX_OPCODE_FCMPSEL ||
+                  I->op == AGX_OPCODE_ICMPSEL) &&
+                 s >= 2 && I->nr_dests == 1) {
+         /* A selected register or uniform is a bit pattern of the
+          * destination's width: no encoding extends or narrows it. */
+         agx_validate_assert(src.size == I->dest[0].size);
       }
 
       agx_validate_assert(!src.memory || is_stack_valid(I));
@@ -173,6 +179,10 @@ agx_write_registers(const agx_context *ctx, const agx_instr *I, unsigned d)
       return 16;
    case AGX_OPCODE_MATMAD8_AGX3:
       return (I->matrix_type & AGX3_MATRIX_ACCUM_F16) ? 2 : 4;
+   case AGX_OPCODE_SIMD_MATRIX_FMADD32:
+   case AGX_OPCODE_SIMD_MATRIX_FMADD16:
+      /* paired-register fragment (2 elements/lane) */
+      return agx_index_size_16(I->dest[d]);
    case AGX_OPCODE_MOV:
    case AGX_OPCODE_PHI:
       /* Tautological */
@@ -345,6 +355,10 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
       if (I->matrix_type & AGX3_MATRIX_ACCUM_F16)
          return 2;
       return s == 2 || (I->matrix_type & 15) == 2 ? 4 : 2;
+   case AGX_OPCODE_SIMD_MATRIX_FMADD32:
+   case AGX_OPCODE_SIMD_MATRIX_FMADD16:
+      /* paired-register fragment operands (2 elements/lane) */
+      return agx_index_size_16(I->src[s]);
    case AGX_OPCODE_MOV:
    case AGX_OPCODE_EXPORT:
       /* Tautological */
@@ -661,6 +675,27 @@ agx_validate_sr(const agx_instr *I)
    }
 }
 
+/* No AGX3 ballot compare takes a source modifier: agx3_emit_subgroup_ballot
+ * encodes plain operands only. */
+static bool
+agx_validate_agx3_ballot(const agx_context *ctx, const agx_instr *I)
+{
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding))
+      return true;
+
+   switch (I->op) {
+   case AGX_OPCODE_ICMP_BALLOT:
+   case AGX_OPCODE_FCMP_BALLOT:
+   case AGX_OPCODE_ICMP_QUAD_BALLOT:
+   case AGX_OPCODE_FCMP_QUAD_BALLOT:
+      agx_foreach_src(I, s)
+         agx_validate_assert(!I->src[s].abs && !I->src[s].neg);
+      return true;
+   default:
+      return true;
+   }
+}
+
 void
 agx_validate(agx_context *ctx, const char *after)
 {
@@ -725,6 +760,12 @@ agx_validate(agx_context *ctx, const char *after)
    agx_foreach_instr_global(ctx, I) {
       if (!agx_validate_sources(I)) {
          fprintf(stderr, "Invalid sources form after %s\n", after);
+         agx_print_instr(I, stderr);
+         fail = true;
+      }
+
+      if (!agx_validate_agx3_ballot(ctx, I)) {
+         fprintf(stderr, "Invalid AGX3 ballot source after %s\n", after);
          agx_print_instr(I, stderr);
          fail = true;
       }

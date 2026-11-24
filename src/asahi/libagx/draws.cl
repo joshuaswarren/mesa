@@ -29,6 +29,37 @@ libagx_predicate_indirect(global uint32_t *out, constant uint32_t *in,
    }
 }
 
+/*
+ * Build a GPU-authored AGX3 VDM sub-stream (and per-draw Ioto vertex programs
+ * when the vertex shader reads base parameters or draw ID) for multi-draw
+ * indirect and indirect-count draws. Four consecutive lanes cooperate on each
+ * draw record using 128-bit coalesced transfers with in-register patching; draw
+ * `count` writes the returning VDM Stream Link so culled slots above `count`
+ * are never parsed by the VDM.
+ */
+KERNEL(128)
+libagx_build_indirect_vdm(constant struct libagx_indirect_vdm_desc *desc)
+{
+   libagx_build_indirect_vdm_sublane(desc, cl_global_id.x);
+}
+
+/*
+ * Fast path for drawIndirectCount: instead of copying and predicating every
+ * indirect command and letting VDM execute all maxDrawCount records, patch a
+ * non-returning VDM_STREAM_LINK over draw `*draw_count`'s first 8 bytes so VDM
+ * jumps straight past the remaining records.
+ */
+KERNEL(1)
+libagx_patch_vdm_indirect_count(
+   global struct libagx_vdm_truncate_state *state,
+   constant struct libagx_vdm_draw_span *spans, constant uint32_t *draw_count,
+   uint32_t num_spans, uint32_t max_draw_count, uint32_t link_w0,
+   uint32_t link_w1)
+{
+   libagx_vdm_patch_indirect_count_impl(state, spans, draw_count, num_spans,
+                                        max_draw_count, link_w0, link_w1);
+}
+
 /* VK_EXT_transform_feedback exposes the byte count written by streamout as a
  * draw source.  Generate the complete VkDrawIndirectCommand on the GPU so a
  * producer earlier in this command buffer never needs CPU readback. */
@@ -436,6 +467,25 @@ libagx_draw_robust_index_batch(constant struct libagx_robust_index_draw *draws,
  * be copied to for the kernels to read, or zero when the record already holds
  * them.  `handles` lists each kernel's raygen handle index.
  */
+/* Same non-wrapping round-up as hk_rt_launch_group_count: 8x4 tiles for 2D/3D
+ * launches (height > 1) with 32-lane workgroups, 32x1 strips for 1D launches. */
+static inline uint2
+libagx_trace_rays_group_count(uint32_t width, uint32_t height,
+                              uint32_t local_size_x_log2)
+{
+   if (local_size_x_log2 == 5u && height > 1u) {
+      return (uint2)(
+         (width >> 3u) + ((width & 7u) ? 1u : 0u),
+         (height >> 2u) + ((height & 3u) ? 1u : 0u)
+      );
+   }
+   const uint32_t mask = (1u << local_size_x_log2) - 1u;
+   return (uint2)(
+      (width >> local_size_x_log2) + ((width & mask) ? 1u : 0u),
+      height
+   );
+}
+
 KERNEL(1)
 libagx_trace_rays_select_setup(constant uint64_t *record,
                                global uint32_t *out_record_dims,
@@ -455,11 +505,8 @@ libagx_trace_rays_select_setup(constant uint64_t *record,
       out_record_dims[2] = depth;
    }
 
-   /* Same non-wrapping round-up as libagx_trace_rays_indirect_setup and
-    * hk_rt_launch_group_count. */
-   const uint32_t mask = (1u << local_size_x_log2) - 1u;
-   const uint32_t groups_x =
-      (width >> local_size_x_log2) + ((width & mask) ? 1u : 0u);
+   const uint2 groups_xy =
+      libagx_trace_rays_group_count(width, height, local_size_x_log2);
 
    constant uint32_t *raygen_handle = (constant uint32_t *)(uintptr_t)record[0];
    const uint32_t selected = *raygen_handle;
@@ -467,8 +514,8 @@ libagx_trace_rays_select_setup(constant uint64_t *record,
    for (uint32_t k = 0; k < kernel_count; ++k) {
       const bool run = handles[k] == selected;
       out_groups[k] = (VkDispatchIndirectCommand){
-         .x = run ? groups_x : 0u,
-         .y = run ? height : 0u,
+         .x = run ? groups_xy.x : 0u,
+         .y = run ? groups_xy.y : 0u,
          .z = run ? depth : 0u,
       };
    }
@@ -509,9 +556,10 @@ libagx_trace_rays_select_launch(constant uint64_t *record,
       out_record_dims[2] = depth;
    }
 
-   const uint32_t mask = (1u << local_size_x_log2) - 1u;
-   const uint32_t groups_x =
-      (width >> local_size_x_log2) + ((width & mask) ? 1u : 0u);
+   const uint2 groups_xy =
+      libagx_trace_rays_group_count(width, height, local_size_x_log2);
+   const uint32_t groups_x = groups_xy.x;
+   const uint32_t groups_y = groups_xy.y;
 
    constant uint32_t *raygen_handle = (constant uint32_t *)(uintptr_t)record[0];
    const uint32_t selected = *raygen_handle;
@@ -522,23 +570,23 @@ libagx_trace_rays_select_launch(constant uint64_t *record,
          chosen = k;
    }
 
-   const bool run = chosen < kernel_count && groups_x && height && depth;
+   const bool run = chosen < kernel_count && groups_x && groups_y && depth;
    *out_groups = (VkDispatchIndirectCommand){
       .x = run ? groups_x : 0u,
-      .y = run ? height : 0u,
+      .y = run ? groups_y : 0u,
       .z = run ? depth : 0u,
    };
 
    constant uint32_t *t = templates + 11u * (run ? chosen : 0u);
    uint32_t word0 = t[0];
-   if (!run || (height < 2u && depth < 2u))
+   if (!run || (groups_y < 2u && depth < 2u))
       word0 &= 0xfff1ffffu;
    slot[1] = word0;
    slot[2] = t[1];
    slot[3] = t[2];
    slot[4] = t[3];
    slot[5] = run ? (groups_x << local_size_x_log2) : 0u;
-   slot[6] = run ? height : 0u;
+   slot[6] = run ? groups_y : 0u;
    slot[7] = run ? depth : 0u;
    slot[8] = run ? t[7] : 0u;
    slot[9] = run ? t[8] : 0u;
@@ -578,10 +626,11 @@ libagx_trace_rays_indirect_setup(global uint32_t *out_record_dims,
     * test-hk-ray-tracing-core pins the two together at the top of the range;
     * the first version of this kernel used the wrapping form and that test is
     * what caught it. */
-   const uint32_t mask = (1u << local_size_x_log2) - 1u;
+   const uint2 groups_xy =
+      libagx_trace_rays_group_count(width, height, local_size_x_log2);
    *out_groups = (VkDispatchIndirectCommand){
-      .x = (width >> local_size_x_log2) + ((width & mask) ? 1u : 0u),
-      .y = height,
+      .x = groups_xy.x,
+      .y = groups_xy.y,
       .z = depth,
    };
 }

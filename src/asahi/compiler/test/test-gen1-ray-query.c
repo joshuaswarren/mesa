@@ -65,7 +65,10 @@ standard_ray_query(unsigned count, unsigned array, bool instances, bool candidat
       if(candidates) {
          nir_def *candidate_id=nir_rq_load(&b,1,32,rqs[i],
             .ray_query_value=nir_ray_query_value_intersection_instance_id,.committed=false);
+         nir_def *candidate_addr=nir_rq_load(&b,1,64,rqs[i],
+            .ray_query_value=nir_ray_query_value_intersection_instance_address,.committed=false);
          nir_store_global(&b,candidate_id,nir_imm_int64(&b,0x10003020000ull),.align_mul=4,.write_mask=1);
+         nir_store_global(&b,candidate_addr,nir_imm_int64(&b,0x10003020008ull),.align_mul=8,.write_mask=1);
          nir_rq_confirm_intersection(&b,rqs[i]);
       }
       nir_pop_loop(&b, NULL);
@@ -89,7 +92,13 @@ standard_ray_query(unsigned count, unsigned array, bool instances, bool candidat
          .ray_query_value=nir_ray_query_value_intersection_instance_id,.committed=true);
       nir_def *custom=nir_rq_load(&b,1,32,rq,
          .ray_query_value=nir_ray_query_value_intersection_instance_custom_index,.committed=true);
+      nir_def *addr=nir_rq_load(&b,1,64,rq,
+         .ray_query_value=nir_ray_query_value_intersection_instance_address,.committed=true);
+      nir_def *sbt=nir_rq_load(&b,1,32,rq,
+         .ray_query_value=nir_ray_query_value_intersection_instance_sbt_index,.committed=true);
       nir_store_global(&b,nir_vec2(&b,id,custom),nir_imm_int64(&b,0x10003010008ull),.align_mul=8,.write_mask=3);
+      nir_store_global(&b,addr,nir_imm_int64(&b,0x10003010010ull),.align_mul=8,.write_mask=1);
+      nir_store_global(&b,sbt,nir_imm_int64(&b,0x10003010018ull),.align_mul=4,.write_mask=1);
    }
    if(candidates) {
       nir_def *object_origin=nir_rq_load(&b,3,32,rq,

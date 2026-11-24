@@ -96,18 +96,37 @@ hk_ResetEvent(VkDevice device, VkEvent _event)
  * synchronization scope of vkCmdSetEvent2 and vkCmdResetEvent2 includes all
  * commands earlier in submission order, restricted to the stage mask). The
  * stream is the driver's own, so every later source scope covers it.
+ *
+ * The host can read the status (vkGetEventStatus) before the submission
+ * completes, so the host availability deferred to the end of the submission
+ * (hk_sync_defer_host_flush()) is made here instead: the stream also follows
+ * those dependencies' first scopes and flushes with memory scope before the
+ * write.
  */
 static void
 hk_event_write(struct hk_cmd_buffer *cmd, struct hk_event *event,
                uint8_t src_kinds, uint32_t value)
 {
+   /* An earlier timestamp write is in a non-empty first scope: the host may
+    * read its query once it sees the event. */
+   if (src_kinds)
+      hk_sync_flush_stamp_copies(cmd);
+   const uint8_t host_kinds = hk_sync_take_host_flush(cmd);
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, src_kinds, cmd->current_cs.cs, dep);
+   hk_sync_src_dep(cmd, hk_sync_stamp_scope(src_kinds) | host_kinds,
+                   cmd->current_cs.cs, dep);
 
    cmd->sync.kind_override = HK_SYNC_ALL;
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
-   if (cs)
+   if (cs) {
+      if (host_kinds) {
+         hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+         hk_cdm_visibility_flush(hk_cmd_buffer_device(cmd), cs, true);
+      }
       hk_queue_write(cmd, event->bo->va->addr, value, false);
+   } else {
+      cmd->sync.host_flush_kinds |= host_kinds;
+   }
    cmd->sync.kind_override = 0;
 }
 
@@ -140,6 +159,11 @@ hk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
       hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_visibility_flush(dev, cs, true);
    }
+
+   /* A host access in this dependency is made available before the status
+    * the host polls is written (hk_event_write()). */
+   if (hk_cdm_memory_scope_form(dev))
+      hk_sync_defer_host_flush(cmd, pDependencyInfo);
 
    hk_event_write(cmd, event, src_kinds, VK_EVENT_SET);
 }

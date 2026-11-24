@@ -36,11 +36,13 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "drm-uapi/drm_fourcc.h"
 #include "pipe/p_context.h"
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "util/u_inlines.h"
+#include "util/format/u_format.h"
 #include "util/format/u_formats.h"
 #include "util/u_memory.h"
 #include "util/driconf.h"
@@ -278,6 +280,7 @@ check_sampler_boundary_compile(struct pipe_context *pctx)
       };
       struct agx_uncompiled_shader *shader =
          pctx->create_fs_state(pctx, &cso);
+      agx_shader_wait_ready(shader);
       const bool indirect =
          samplers[i] >= AGX_GALLIUM_G17P_IMMEDIATE_API_SAMPLERS;
 
@@ -305,6 +308,7 @@ check_sampler_boundary_compile(struct pipe_context *pctx)
    };
    struct agx_uncompiled_shader *dynamic =
       pctx->create_fs_state(pctx, &dynamic_cso);
+   agx_shader_wait_ready(dynamic);
    if (!dynamic || dynamic_cso.error_message ||
        !dynamic->uses_bindless_samplers) {
       fprintf(stderr, "G17P dynamic sampler table did not compile: %s\n",
@@ -434,6 +438,7 @@ check_query_lod_compile(struct pipe_context *pctx)
             .ir.nir = b.shader,
          };
          struct agx_uncompiled_shader *shader = pctx->create_fs_state(pctx, &cso);
+         agx_shader_wait_ready(shader);
          const bool ok = shader && !cso.error_message &&
                          shader->info.uses_query_lod &&
                          shader->uses_bindless_samplers;
@@ -601,6 +606,45 @@ check_direct_resolve_shapes(void)
    if (!agx_g17p_direct_resolve_blit_shape(&info, true)) {
       fprintf(stderr, "exact XRGB8 resolve shape was rejected\n");
       return false;
+   }
+   static const enum pipe_format accepted_formats[] = {
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R16G16_FLOAT,
+      PIPE_FORMAT_R16_FLOAT,
+      PIPE_FORMAT_R16G16B16A16_UNORM,
+      PIPE_FORMAT_R16G16B16A16_SNORM,
+      PIPE_FORMAT_R10G10B10A2_UNORM,
+      PIPE_FORMAT_R8G8B8A8_SNORM,
+      PIPE_FORMAT_R8_UNORM,
+      PIPE_FORMAT_R5G6B5_UNORM,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(accepted_formats); ++i) {
+      src.format = dst.format = info.src.format = info.dst.format =
+         accepted_formats[i];
+      if (!agx_g17p_direct_resolve_blit_shape(&info, true)) {
+         fprintf(stderr, "direct resolve format %s was rejected\n",
+                 util_format_short_name(accepted_formats[i]));
+         return false;
+      }
+   }
+   static const enum pipe_format rejected_formats[] = {
+      PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R32_FLOAT,
+      PIPE_FORMAT_R11G11B10_FLOAT,
+      PIPE_FORMAT_R9G9B9E5_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_SRGB,
+      PIPE_FORMAT_R8G8B8A8_UINT,
+      PIPE_FORMAT_R16G16B16A16_SINT,
+      PIPE_FORMAT_Z32_FLOAT,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(rejected_formats); ++i) {
+      src.format = dst.format = info.src.format = info.dst.format =
+         rejected_formats[i];
+      if (agx_g17p_direct_resolve_blit_shape(&info, true)) {
+         fprintf(stderr, "unsupported direct resolve format %s was accepted\n",
+                 util_format_short_name(rejected_formats[i]));
+         return false;
+      }
    }
    src.format = dst.format = info.src.format = info.dst.format =
       PIPE_FORMAT_R8G8B8A8_UNORM;
@@ -897,6 +941,18 @@ check_staged_resolve_shapes(void)
       return false;
    }
    src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R16G16B16A16_FLOAT;
+   if (!agx_g17p_staged_resolve_blit_shape(&info)) {
+      fprintf(stderr, "partial RGBA16F resolve staging shape was rejected\n");
+      return false;
+   }
+   src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R32G32B32A32_FLOAT;
+   if (agx_g17p_staged_resolve_blit_shape(&info)) {
+      fprintf(stderr, "partial RGBA32F resolve staging shape was accepted\n");
+      return false;
+   }
+   src.format = dst.format = info.src.format = info.dst.format =
       PIPE_FORMAT_R8G8B8A8_UNORM;
 
    info.sample0_only = true;
@@ -1135,6 +1191,7 @@ static bool
 vertex_state_encoded(void *cso)
 {
    struct agx_uncompiled_shader *so = cso;
+   agx_shader_wait_ready(so);
    bool ok = true;
    hash_table_foreach(so->variants, ent) {
       struct agx_compiled_shader *cs = ent->data;
@@ -1240,9 +1297,12 @@ check_agx3_compute_mipmap_case(struct pipe_screen *screen,
       .last_level = last_level,
       .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
    };
-   struct pipe_resource *tex = screen->resource_create(screen, &tmpl);
+   const uint64_t uncomp_mod = DRM_FORMAT_MOD_APPLE_GPU_TILED;
+   struct pipe_resource *tex =
+      screen->resource_create_with_modifiers(screen, &tmpl, &uncomp_mod, 1);
    if (!tex) {
-      fprintf(stderr, "mipmap %s: resource_create failed\n", name);
+      fprintf(stderr, "mipmap %s: resource_create_with_modifiers failed\n",
+              name);
       return false;
    }
 
@@ -1414,6 +1474,71 @@ check_agx3_compute_mipmap_case(struct pipe_screen *screen,
    return true;
 }
 
+/* A HAL200 UNORM8x4 chain at or above the compute/render-pass crossover
+ * compresses, and its levels are generated by the compressed compute path in
+ * one CDM batch: never by util_gen_mipmap(), never through the uncompressed
+ * kernels. sRGB filtering and layered chains stay plain. */
+static bool
+check_compressed_mip_chain(struct pipe_screen *screen,
+                           struct pipe_context *pctx)
+{
+   struct agx_device *mdev = agx_device(screen);
+   const struct pipe_resource big_tmpl = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .width0 = 2560,
+      .height0 = 1440,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 11,
+      .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
+   };
+   const bool chain_compresses =
+      agx_g17p_compressed_mip_chain_allowed(mdev, &big_tmpl);
+   if (chain_compresses != agx_chip_gen9_color_compression(mdev->chip)) {
+      fprintf(stderr, "compressed mip chain policy mismatch\n");
+      return false;
+   }
+
+   struct pipe_resource *big_tex = screen->resource_create(screen, &big_tmpl);
+   if (!big_tex) {
+      fprintf(stderr, "big mip chain resource_create failed\n");
+      return false;
+   }
+   struct agx_resource *brsrc = agx_resource(big_tex);
+   if (brsrc->layout.compressed != chain_compresses ||
+       (chain_compresses &&
+        agx_generate_mipmap_agx3_supported(
+           mdev, brsrc, PIPE_FORMAT_R8G8B8A8_UNORM, 0, 11, 0, 0))) {
+      fprintf(stderr, "compressed mip chain allocation mismatch\n");
+      pipe_resource_reference(&big_tex, NULL);
+      return false;
+   }
+
+   struct agx_context *mctx = agx_context(pctx);
+   if (!pctx->generate_mipmap(pctx, big_tex, PIPE_FORMAT_R8G8B8A8_UNORM, 0, 11,
+                              0, 0) ||
+       !mctx->batch || !mctx->batch->cdm.bo || mctx->batch->vdm.bo) {
+      fprintf(stderr, "compressed compute generate_mipmap left the CDM batch\n");
+      pipe_resource_reference(&big_tex, NULL);
+      return false;
+   }
+   pctx->flush(pctx, NULL, 0);
+   pipe_resource_reference(&big_tex, NULL);
+
+   struct pipe_resource srgb_tmpl = big_tmpl;
+   srgb_tmpl.format = PIPE_FORMAT_R8G8B8A8_SRGB;
+   struct pipe_resource array_tmpl = big_tmpl;
+   array_tmpl.target = PIPE_TEXTURE_2D_ARRAY;
+   array_tmpl.array_size = 2;
+   if (agx_g17p_compressed_mip_chain_allowed(mdev, &srgb_tmpl) ||
+       agx_g17p_compressed_mip_chain_allowed(mdev, &array_tmpl)) {
+      fprintf(stderr, "sRGB or layered mip chain admitted\n");
+      return false;
+   }
+   return true;
+}
+
 static bool
 check_agx3_compute_mipmap(struct pipe_screen *screen, struct pipe_context *pctx,
                           bool check_pixels)
@@ -1422,7 +1547,8 @@ check_agx3_compute_mipmap(struct pipe_screen *screen, struct pipe_context *pctx,
    if (!agx_chip_native_agx3(mdev->chip))
       return true;
 
-   /* Verify predicate accept/reject matrix. */
+   /* Verify predicate accept/reject matrix on an explicitly uncompressed
+    * GPU-tiled mipmap chain. */
    const struct pipe_resource mip_tmpl = {
       .target = PIPE_TEXTURE_2D,
       .format = PIPE_FORMAT_R8G8B8A8_UNORM,
@@ -1433,9 +1559,11 @@ check_agx3_compute_mipmap(struct pipe_screen *screen, struct pipe_context *pctx,
       .last_level = 6,
       .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
    };
-   struct pipe_resource *mip_tex = screen->resource_create(screen, &mip_tmpl);
+   const uint64_t uncomp_mod = DRM_FORMAT_MOD_APPLE_GPU_TILED;
+   struct pipe_resource *mip_tex =
+      screen->resource_create_with_modifiers(screen, &mip_tmpl, &uncomp_mod, 1);
    if (!mip_tex) {
-      fprintf(stderr, "mip_tex resource_create failed\n");
+      fprintf(stderr, "mip_tex resource_create_with_modifiers failed\n");
       return false;
    }
    struct agx_resource *mrsrc = agx_resource(mip_tex);
@@ -1452,6 +1580,27 @@ check_agx3_compute_mipmap(struct pipe_screen *screen, struct pipe_context *pctx,
       return false;
    }
    pipe_resource_reference(&mip_tex, NULL);
+
+   /* Default private mipmapped 2D RGBA8 textures compress on G17P and are
+    * rejected by the uncompressed CDM mipchain so util_gen_mipmap() preserves
+    * compression. */
+   struct pipe_resource *priv_mip_tex =
+      screen->resource_create(screen, &mip_tmpl);
+   if (!priv_mip_tex) {
+      fprintf(stderr, "priv_mip_tex resource_create failed\n");
+      return false;
+   }
+   struct agx_resource *priv_mrsrc = agx_resource(priv_mip_tex);
+   const bool expect_comp = mdev->chip == AGX_CHIP_G17P;
+   if (priv_mrsrc->layout.compressed != expect_comp ||
+       (expect_comp && agx_generate_mipmap_agx3_supported(
+                          mdev, priv_mrsrc, PIPE_FORMAT_R8G8B8A8_UNORM, 0, 6, 0,
+                          0))) {
+      fprintf(stderr, "AGX3 private mipchain compression guard failed\n");
+      pipe_resource_reference(&priv_mip_tex, NULL);
+      return false;
+   }
+   pipe_resource_reference(&priv_mip_tex, NULL);
 
    if (!check_agx3_compute_mipmap_case(screen, pctx, "even_64x64_fused",
                                        PIPE_TEXTURE_2D, 64, 64, 1, 6, true,
@@ -1470,7 +1619,8 @@ check_agx3_compute_mipmap(struct pipe_screen *screen, struct pipe_context *pctx,
                                        false, check_pixels) ||
        !check_agx3_compute_mipmap_case(screen, pctx, "cube_32x32x6_fused",
                                        PIPE_TEXTURE_CUBE, 32, 32, 6, 5, true,
-                                       check_pixels))
+                                       check_pixels) ||
+       !check_compressed_mip_chain(screen, pctx))
       return false;
 
    printf("AGX3 compute generate_mipmap completed (check_pixels=%u)\n",
@@ -1649,6 +1799,7 @@ check_discard_main_sample_key(struct pipe_context *pctx)
    void *ve_cso = pctx->create_vertex_elements_state(pctx, 0, NULL);
    if (!vs_cso || !fs_cso || !rast_cso || !depth_cso || !ve_cso)
       return false;
+   agx_shader_wait_ready(fs_cso);
    if (fs_cso->info.needs_sample_count || fs_cso->info.uses_fbfetch ||
        fs_cso->info.uses_sample_shading)
       return false;
@@ -1718,6 +1869,653 @@ check_discard_main_sample_key(struct pipe_context *pctx)
    return ok;
 }
 
+static bool
+check_invalidate_and_bgra_readback(struct pipe_screen *screen,
+                                   struct pipe_context *pctx,
+                                   bool check_pixels)
+{
+   struct agx_context *ctx = agx_context(pctx);
+
+   /* 1. Flushed texture: invalidate_resource() must move previously valid
+    * levels from data_valid into invalidated_levels without tainting never-
+    * written levels, skip COLOR0 reload on the next batch, and clear
+    * invalidated_levels[0] as soon as the next batch writes level 0. */
+   struct pipe_resource tmpl = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .width0 = 64,
+      .height0 = 64,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 1,
+      .usage = PIPE_USAGE_DEFAULT,
+      .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+   };
+   struct pipe_resource *tex = screen->resource_create(screen, &tmpl);
+   if (!tex) {
+      fprintf(stderr, "invalidate test resource_create failed\n");
+      return false;
+   }
+   struct agx_resource *rsrc = agx_resource(tex);
+
+   struct pipe_framebuffer_state fb = {
+      .width = 64,
+      .height = 64,
+      .layers = 1,
+      .samples = 1,
+      .nr_cbufs = 1,
+   };
+   fb.cbufs[0] = (struct pipe_surface){
+      .texture = tex,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   pctx->set_framebuffer_state(pctx, &fb);
+
+   const union pipe_color_union c0 = {.f = {0.25f, 0.5f, 0.75f, 1.0f}};
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &c0, 0.0, 0);
+   pctx->flush(pctx, NULL, 0);
+
+   if (!agx_resource_valid(rsrc, 0) || agx_resource_valid(rsrc, 1) ||
+       BITSET_TEST(rsrc->invalidated_levels, 0) ||
+       BITSET_TEST(rsrc->invalidated_levels, 1)) {
+      fprintf(stderr, "unexpected valid/invalidated state after clear+flush\n");
+      pipe_resource_reference(&tex, NULL);
+      return false;
+   }
+
+   /* Unbind before invalidating (the try_pbo_upload_common() order). */
+   struct pipe_framebuffer_state empty_fb = {0};
+   pctx->set_framebuffer_state(pctx, &empty_fb);
+   pctx->invalidate_resource(pctx, tex);
+
+   if (agx_resource_valid(rsrc, 0) ||
+       !BITSET_TEST(rsrc->invalidated_levels, 0) ||
+       BITSET_TEST(rsrc->invalidated_levels, 1)) {
+      fprintf(stderr,
+              "expected invalidate_resource() to move level 0 to "
+              "invalidated_levels without tainting level 1 (valid0=%d inv0=%d "
+              "inv1=%d)\n",
+              agx_resource_valid(rsrc, 0),
+              BITSET_TEST(rsrc->invalidated_levels, 0),
+              BITSET_TEST(rsrc->invalidated_levels, 1));
+      pipe_resource_reference(&tex, NULL);
+      return false;
+   }
+
+   /* Re-binding and initializing a new batch must skip COLOR0 reload, mark
+    * level 0 valid again, and clear invalidated_levels[0]. */
+   pctx->set_framebuffer_state(pctx, &fb);
+   struct agx_batch *batch = agx_get_batch(ctx);
+   agx_batch_init_state(batch);
+   if ((batch->load & PIPE_CLEAR_COLOR0) || !agx_resource_valid(rsrc, 0) ||
+       BITSET_TEST(rsrc->invalidated_levels, 0)) {
+      fprintf(stderr,
+              "post-invalidate batch init wrong (load=%#x valid0=%d inv0=%d)\n",
+              batch->load, agx_resource_valid(rsrc, 0),
+              BITSET_TEST(rsrc->invalidated_levels, 0));
+      pipe_resource_reference(&tex, NULL);
+      return false;
+   }
+
+   /* 2. Active initialized batch: invalidate_resource() must drop resolve and
+    * dirty AGX_DIRTY_BLEND so a later draw in the same batch re-enables store,
+    * while preserving data_valid and keeping invalidated_levels clear. */
+   batch->resolve |= PIPE_CLEAR_COLOR0;
+   ctx->dirty &= ~AGX_DIRTY_BLEND;
+   pctx->invalidate_resource(pctx, tex);
+   if ((batch->resolve & PIPE_CLEAR_COLOR0) ||
+       !(ctx->dirty & AGX_DIRTY_BLEND) || !agx_resource_valid(rsrc, 0) ||
+       BITSET_TEST(rsrc->invalidated_levels, 0)) {
+      fprintf(stderr,
+              "active-batch invalidate state wrong (resolve=%#x dirty=%#x "
+              "valid=%d inv=%d)\n",
+              batch->resolve, ctx->dirty, agx_resource_valid(rsrc, 0),
+              BITSET_TEST(rsrc->invalidated_levels, 0));
+      pipe_resource_reference(&tex, NULL);
+      return false;
+   }
+   pctx->flush(pctx, NULL, 0);
+   pctx->set_framebuffer_state(pctx, &empty_fb);
+   pipe_resource_reference(&tex, NULL);
+
+   /* 3. Separate stencil: active-batch invalidate dirties AGX_DIRTY_ZS, and
+    * post-flush invalidate clears both depth and separate_stencil data_valid
+    * into invalidated_levels. */
+   struct pipe_resource *zs =
+      make_2d(screen, PIPE_FORMAT_Z32_FLOAT_S8X24_UINT, 64, 64,
+              PIPE_BIND_DEPTH_STENCIL);
+   if (!zs) {
+      fprintf(stderr, "invalidate test zs resource_create failed\n");
+      return false;
+   }
+   struct agx_resource *zrsrc = agx_resource(zs);
+   struct pipe_framebuffer_state zs_fb = {
+      .width = 64,
+      .height = 64,
+      .layers = 1,
+      .samples = 1,
+   };
+   zs_fb.zsbuf = (struct pipe_surface){
+      .texture = zs,
+      .format = PIPE_FORMAT_Z32_FLOAT_S8X24_UINT,
+   };
+   pctx->set_framebuffer_state(pctx, &zs_fb);
+   pctx->clear(pctx, PIPE_CLEAR_DEPTHSTENCIL, 0, 0, NULL, &c0, 0.5, 0x5a);
+
+   struct agx_batch *zs_batch = agx_get_batch(ctx);
+   zs_batch->resolve |= PIPE_CLEAR_DEPTHSTENCIL;
+   ctx->dirty &= ~AGX_DIRTY_ZS;
+   pctx->invalidate_resource(pctx, zs);
+   if ((zs_batch->resolve & PIPE_CLEAR_DEPTHSTENCIL) ||
+       !(ctx->dirty & AGX_DIRTY_ZS)) {
+      fprintf(stderr,
+              "active-batch ZS invalidate state wrong (resolve=%#x dirty=%#x)\n",
+              zs_batch->resolve, ctx->dirty);
+      pipe_resource_reference(&zs, NULL);
+      return false;
+   }
+
+   pctx->flush(pctx, NULL, 0);
+   pctx->set_framebuffer_state(pctx, &empty_fb);
+   pctx->invalidate_resource(pctx, zs);
+   if (agx_resource_valid(zrsrc, 0) ||
+       !BITSET_TEST(zrsrc->invalidated_levels, 0) ||
+       (zrsrc->separate_stencil &&
+        (agx_resource_valid(zrsrc->separate_stencil, 0) ||
+         !BITSET_TEST(zrsrc->separate_stencil->invalidated_levels, 0)))) {
+      fprintf(stderr,
+              "expected invalidate_resource() to move Z+S valid state into "
+              "invalidated_levels\n");
+      pipe_resource_reference(&zs, NULL);
+      return false;
+   }
+   pipe_resource_reference(&zs, NULL);
+
+   /* 4. BGRA8_UNORM -> RGBA8_UNORM blit readback (both uncompressed 32x32 and
+    * compression-eligible 256x256). Under the no-op shim this exercises the
+    * descriptor/shader path; on real hardware (check_pixels=true) it checks
+    * exact R/G/B/A channel values. */
+   const unsigned sizes[2] = {32, 256};
+   const uint8_t want[4] = {64, 128, 191, 255};
+   for (unsigned s = 0; s < ARRAY_SIZE(sizes); ++s) {
+      const unsigned dim = sizes[s];
+      struct pipe_resource *bgra =
+         make_2d(screen, PIPE_FORMAT_B8G8R8A8_UNORM, dim, dim,
+                 PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+      struct pipe_resource *rgba =
+         make_2d(screen, PIPE_FORMAT_R8G8B8A8_UNORM, dim, dim,
+                 PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+      if (!bgra || !rgba) {
+         fprintf(stderr, "BGRA->RGBA %ux%u resource_create failed\n", dim, dim);
+         pipe_resource_reference(&bgra, NULL);
+         pipe_resource_reference(&rgba, NULL);
+         return false;
+      }
+
+      struct pipe_framebuffer_state bfb = {
+         .width = dim,
+         .height = dim,
+         .layers = 1,
+         .samples = 1,
+         .nr_cbufs = 1,
+      };
+      bfb.cbufs[0] = (struct pipe_surface){
+         .texture = bgra,
+         .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+      };
+      pctx->set_framebuffer_state(pctx, &bfb);
+      pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &c0, 0.0, 0);
+
+      struct pipe_blit_info binfo = {
+         .src = {
+            .resource = bgra,
+            .level = 0,
+            .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+            .box = {.width = dim, .height = dim, .depth = 1},
+         },
+         .dst = {
+            .resource = rgba,
+            .level = 0,
+            .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+            .box = {.width = dim, .height = dim, .depth = 1},
+         },
+         .mask = PIPE_MASK_RGBA,
+         .filter = PIPE_TEX_FILTER_NEAREST,
+      };
+      pctx->blit(pctx, &binfo);
+      pctx->flush(pctx, NULL, 0);
+
+      if (check_pixels) {
+         struct pipe_transfer *xfer = NULL;
+         uint8_t *map = pipe_texture_map(pctx, rgba, 0, 0, PIPE_MAP_READ, 0, 0,
+                                         dim, dim, &xfer);
+         if (!map || !xfer) {
+            fprintf(stderr, "BGRA->RGBA %ux%u transfer_map failed\n", dim, dim);
+            pipe_resource_reference(&bgra, NULL);
+            pipe_resource_reference(&rgba, NULL);
+            return false;
+         }
+         for (unsigned y = 0; y < dim; ++y) {
+            const uint8_t *row = map + y * xfer->stride;
+            for (unsigned x = 0; x < dim; ++x) {
+               const uint8_t *px = row + x * 4;
+               if (memcmp(px, want, 4) != 0) {
+                  fprintf(stderr,
+                          "BGRA->RGBA %ux%u mismatch at (%u,%u): got "
+                          "(%u,%u,%u,%u) want (%u,%u,%u,%u)\n",
+                          dim, dim, x, y, px[0], px[1], px[2], px[3], want[0],
+                          want[1], want[2], want[3]);
+                  pipe_texture_unmap(pctx, xfer);
+                  pipe_resource_reference(&bgra, NULL);
+                  pipe_resource_reference(&rgba, NULL);
+                  return false;
+               }
+            }
+         }
+         pipe_texture_unmap(pctx, xfer);
+      }
+
+      pctx->set_framebuffer_state(pctx, &empty_fb);
+      pipe_resource_reference(&bgra, NULL);
+      pipe_resource_reference(&rgba, NULL);
+   }
+
+   printf("invalidate + BGRA8->RGBA8 readback check passed (check_pixels=%d)\n",
+          check_pixels);
+   return true;
+}
+
+static bool
+check_rgba8_readback(struct pipe_context *pctx, struct pipe_resource *rsrc,
+                     unsigned w, unsigned h, const uint8_t expected[4],
+                     bool check_pixels, const char *label)
+{
+   struct pipe_transfer *xfer = NULL;
+   struct pipe_box box = {.x = 0, .y = 0, .z = 0, .width = w, .height = h, .depth = 1};
+   const uint8_t *map =
+      pctx->texture_map(pctx, rsrc, 0, PIPE_MAP_READ, &box, &xfer);
+   if (!map || !xfer) {
+      fprintf(stderr, "%s readback map failed\n", label);
+      return false;
+   }
+
+   bool ok = true;
+   if (check_pixels) {
+      for (unsigned y = 0; y < h && ok; ++y) {
+         const uint8_t *row = map + y * xfer->stride;
+         for (unsigned x = 0; x < w; ++x) {
+            const uint8_t *px = row + x * 4;
+            if (memcmp(px, expected, 4) != 0) {
+               fprintf(stderr,
+                       "%s pixel mismatch at (%u,%u): got (%u,%u,%u,%u), "
+                       "expected (%u,%u,%u,%u)\n",
+                       label, x, y, px[0], px[1], px[2], px[3], expected[0],
+                       expected[1], expected[2], expected[3]);
+               ok = false;
+               break;
+            }
+         }
+      }
+   }
+   pctx->texture_unmap(pctx, xfer);
+   return ok;
+}
+
+static bool
+check_fast_clear_batch(struct pipe_screen *screen, struct pipe_context *pctx,
+                       bool check_pixels)
+{
+   struct agx_device *dev = agx_device(screen);
+   struct agx_context *fc_ctx = agx_context(pctx);
+   const union pipe_color_union colour = {.f = {0.25f, 0.5f, 0.75f, 1.0f}};
+   uint8_t expected_rgba[4] = {0};
+   util_format_pack_rgba(PIPE_FORMAT_R8G8B8A8_UNORM, expected_rgba, colour.f, 1);
+
+   /* 1. 1x compressed RGBA8 colour target: initial partial clear sets
+    * data_valid so batch->load gets PIPE_CLEAR_COLOR0, then full-extent clear
+    * with an active TIME_ELAPSED query must convert to CDM, flush, and read
+    * back the exact clear colour. */
+   struct pipe_resource *c1x =
+      make_2d(screen, PIPE_FORMAT_R8G8B8A8_UNORM, 256, 256,
+              PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+   struct pipe_resource *c1x_rb =
+      make_2d(screen, PIPE_FORMAT_R8G8B8A8_UNORM, 16, 16,
+              PIPE_BIND_RENDER_TARGET);
+   if (!c1x || !c1x_rb) {
+      fprintf(stderr, "fast-clear 1x resource_create failed\n");
+      return false;
+   }
+
+   bool ok = true;
+   unsigned cdm_cases = 0;
+   const bool fc_4b_1x =
+      agx_precomp_launchable(fc_ctx, LIBAGX_FAST_CLEAR(2, 0));
+   const bool fc_4b_4x =
+      agx_precomp_launchable(fc_ctx, LIBAGX_FAST_CLEAR(2, 2));
+   const bool fc_2b_1x =
+      agx_precomp_launchable(fc_ctx, LIBAGX_FAST_CLEAR(1, 0));
+   const bool fc_1b_1x =
+      agx_precomp_launchable(fc_ctx, LIBAGX_FAST_CLEAR(0, 0));
+   if (fc_4b_1x && agx_resource(c1x)->layout.compressed) {
+      struct pipe_framebuffer_state partial_fb = {
+         .width = 16,
+         .height = 16,
+         .layers = 1,
+         .samples = 1,
+         .nr_cbufs = 1,
+         .cbufs[0] = {.texture = c1x, .format = PIPE_FORMAT_R8G8B8A8_UNORM},
+      };
+      const union pipe_color_union seed = {.f = {0.9f, 0.1f, 0.1f, 1.0f}};
+      pctx->set_framebuffer_state(pctx, &partial_fb);
+      pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &seed, 0.0, 0);
+      pctx->flush(pctx, NULL, 0);
+
+      struct pipe_framebuffer_state full_fb = partial_fb;
+      full_fb.width = 256;
+      full_fb.height = 256;
+      pctx->set_framebuffer_state(pctx, &full_fb);
+
+      struct pipe_query *tq =
+         pctx->create_query(pctx, PIPE_QUERY_TIME_ELAPSED, 0);
+      if (tq)
+         pctx->begin_query(pctx, tq);
+      pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &colour, 0.0, 0);
+      struct agx_batch *fc_batch = fc_ctx->batch;
+      if (!fc_batch || !(fc_batch->load & PIPE_CLEAR_COLOR0) ||
+          (tq && fc_batch->timestamps.size == 0) ||
+          !agx_try_fast_clear_batch(fc_ctx, fc_batch) ||
+          fc_batch->vdm.bo != NULL || fc_batch->cdm.bo == NULL) {
+         fprintf(stderr,
+                 "1x compressed clear did not convert to CDM "
+                 "(batch=%p load=%#x ts=%u vdm=%p cdm=%p)\n",
+                 (void *)fc_batch, fc_batch ? fc_batch->load : 0,
+                 fc_batch ? fc_batch->timestamps.size : 0,
+                 fc_batch ? (void *)fc_batch->vdm.bo : NULL,
+                 fc_batch ? (void *)fc_batch->cdm.bo : NULL);
+         ok = false;
+      } else {
+         cdm_cases++;
+      }
+      pctx->flush(pctx, NULL, 0);
+      if (tq) {
+         pctx->end_query(pctx, tq);
+         union pipe_query_result qres = {0};
+         if (check_pixels && !pctx->get_query_result(pctx, tq, true, &qres)) {
+            fprintf(stderr, "TIME_ELAPSED get_query_result failed\n");
+            ok = false;
+         }
+         pctx->destroy_query(pctx, tq);
+      }
+
+      struct pipe_blit_info sample_blit = {
+         .src = {
+            .resource = c1x,
+            .level = 0,
+            .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+            .box = {.x = 0, .y = 0, .z = 0, .width = 16, .height = 16, .depth = 1},
+         },
+         .dst = {
+            .resource = c1x_rb,
+            .level = 0,
+            .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+            .box = {.x = 0, .y = 0, .z = 0, .width = 16, .height = 16, .depth = 1},
+         },
+         .mask = PIPE_MASK_RGBA,
+         .filter = PIPE_TEX_FILTER_NEAREST,
+      };
+      pctx->blit(pctx, &sample_blit);
+      pctx->flush(pctx, NULL, 0);
+      ok &= check_rgba8_readback(pctx, c1x_rb, 16, 16, expected_rgba,
+                                 check_pixels, "1x RGBA8 fast-clear");
+   }
+   pipe_resource_reference(&c1x, NULL);
+   pipe_resource_reference(&c1x_rb, NULL);
+
+   /* 2. 4x MSAA compressed colour target: full-extent clear -> CDM ->
+    * resolve blit -> readback pixel compare. */
+   struct pipe_resource msaa_tmpl = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .width0 = 64,
+      .height0 = 64,
+      .depth0 = 1,
+      .array_size = 1,
+      .nr_samples = 4,
+      .nr_storage_samples = 4,
+      .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+   };
+   struct pipe_resource *msaa_fc = screen->resource_create(screen, &msaa_tmpl);
+   struct pipe_resource *msaa_rb =
+      make_2d(screen, PIPE_FORMAT_R8G8B8A8_UNORM, 64, 64,
+              PIPE_BIND_RENDER_TARGET);
+   if (!msaa_fc || !msaa_rb) {
+      fprintf(stderr, "fast-clear 4x MSAA resource_create failed\n");
+      pipe_resource_reference(&msaa_fc, NULL);
+      pipe_resource_reference(&msaa_rb, NULL);
+      return false;
+   }
+   if (fc_4b_4x && agx_resource(msaa_fc)->layout.compressed) {
+      struct pipe_framebuffer_state msaa_fb = {
+         .width = 64,
+         .height = 64,
+         .layers = 1,
+         .samples = 4,
+         .nr_cbufs = 1,
+         .cbufs[0] = {.texture = msaa_fc, .format = PIPE_FORMAT_R8G8B8A8_UNORM},
+      };
+      pctx->set_framebuffer_state(pctx, &msaa_fb);
+      pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &colour, 0.0, 0);
+      struct agx_batch *ms_batch = fc_ctx->batch;
+      if (!ms_batch || !agx_try_fast_clear_batch(fc_ctx, ms_batch) ||
+          ms_batch->vdm.bo != NULL || ms_batch->cdm.bo == NULL) {
+         fprintf(stderr, "4x MSAA compressed clear did not convert to CDM\n");
+         ok = false;
+      } else {
+         cdm_cases++;
+      }
+      pctx->flush(pctx, NULL, 0);
+
+      struct pipe_blit_info msaa_resolve = {
+         .src = {
+            .resource = msaa_fc,
+            .level = 0,
+            .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+            .box = {.x = 0, .y = 0, .z = 0, .width = 64, .height = 64, .depth = 1},
+         },
+         .dst = {
+            .resource = msaa_rb,
+            .level = 0,
+            .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+            .box = {.x = 0, .y = 0, .z = 0, .width = 64, .height = 64, .depth = 1},
+         },
+         .mask = PIPE_MASK_RGBA,
+         .filter = PIPE_TEX_FILTER_NEAREST,
+      };
+      pctx->blit(pctx, &msaa_resolve);
+      pctx->flush(pctx, NULL, 0);
+      ok &= check_rgba8_readback(pctx, msaa_rb, 64, 64, expected_rgba,
+                                 check_pixels, "4x MSAA RGBA8 fast-clear");
+   }
+   pipe_resource_reference(&msaa_fc, NULL);
+   pipe_resource_reference(&msaa_rb, NULL);
+
+   /* 3. Compressed depth (Z32_FLOAT and Z16_UNORM): full-extent clear -> CDM
+    * -> readback compare. */
+   const enum pipe_format z_fmts[2] = {
+      PIPE_FORMAT_Z32_FLOAT,
+      PIPE_FORMAT_Z16_UNORM,
+   };
+   const double z_vals[2] = {0.375, 0.25};
+   for (unsigned i = 0; i < ARRAY_SIZE(z_fmts); ++i) {
+      struct pipe_resource *zres =
+         make_2d(screen, z_fmts[i], 256, 256,
+                 PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SAMPLER_VIEW);
+      if (!zres) {
+         fprintf(stderr, "fast-clear depth resource_create failed\n");
+         ok = false;
+         continue;
+      }
+      const bool fc_z =
+         z_fmts[i] == PIPE_FORMAT_Z32_FLOAT ? fc_4b_1x : fc_2b_1x;
+      if (fc_z && agx_resource(zres)->layout.compressed) {
+         struct pipe_framebuffer_state zfb = {
+            .width = 256,
+            .height = 256,
+            .layers = 1,
+            .samples = 1,
+            .zsbuf = {.texture = zres, .format = z_fmts[i]},
+         };
+         pctx->set_framebuffer_state(pctx, &zfb);
+         pctx->clear(pctx, PIPE_CLEAR_DEPTH, 0, 0, NULL, NULL, z_vals[i], 0);
+         struct agx_batch *zbatch = fc_ctx->batch;
+         if (!zbatch || !agx_try_fast_clear_batch(fc_ctx, zbatch) ||
+             zbatch->vdm.bo != NULL || zbatch->cdm.bo == NULL) {
+            fprintf(stderr, "compressed %s clear did not convert to CDM\n",
+                    util_format_short_name(z_fmts[i]));
+            ok = false;
+         } else {
+            cdm_cases++;
+         }
+         pctx->flush(pctx, NULL, 0);
+
+         struct pipe_transfer *zxfer = NULL;
+         struct pipe_box zbox = {
+            .x = 0, .y = 0, .z = 0, .width = 16, .height = 16, .depth = 1,
+         };
+         const uint8_t *zmap =
+            pctx->texture_map(pctx, zres, 0, PIPE_MAP_READ, &zbox, &zxfer);
+         if (!zmap || !zxfer) {
+            fprintf(stderr, "%s readback map failed\n",
+                    util_format_short_name(z_fmts[i]));
+            ok = false;
+         } else {
+            if (check_pixels) {
+               for (unsigned y = 0; y < 16 && ok; ++y) {
+                  const uint8_t *row = zmap + y * zxfer->stride;
+                  for (unsigned x = 0; x < 16; ++x) {
+                     if (z_fmts[i] == PIPE_FORMAT_Z32_FLOAT) {
+                        float got = 0.0f;
+                        memcpy(&got, row + x * 4, 4);
+                        if (got != (float)z_vals[i]) {
+                           fprintf(stderr,
+                                   "Z32_FLOAT mismatch at (%u,%u): got %f, expected %f\n",
+                                   x, y, got, z_vals[i]);
+                           ok = false;
+                           break;
+                        }
+                     } else {
+                        uint16_t got = 0;
+                        memcpy(&got, row + x * 2, 2);
+                        const uint16_t want = (uint16_t)(z_vals[i] * 65535.0 + 0.5);
+                        if (abs((int)got - (int)want) > 1) {
+                           fprintf(stderr,
+                                   "Z16_UNORM mismatch at (%u,%u): got %u, expected %u\n",
+                                   x, y, got, want);
+                           ok = false;
+                           break;
+                        }
+                     }
+                  }
+               }
+            }
+            pctx->texture_unmap(pctx, zxfer);
+         }
+      }
+      pipe_resource_reference(&zres, NULL);
+   }
+
+   /* 4. Combined COLOR|DEPTH|STENCIL on RGBA8 + Z32F_S8: takes CDM when all
+    * three attachments (including separate S8_UINT on AGX2) are compressed,
+    * and falls back cleanly to VDM when stencil is uncompressed (G17P). */
+   struct pipe_resource *cds_c =
+      make_2d(screen, PIPE_FORMAT_R8G8B8A8_UNORM, 256, 256,
+              PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+   struct pipe_resource *cds_zs =
+      make_2d(screen, PIPE_FORMAT_Z32_FLOAT_S8X24_UINT, 256, 256,
+              PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SAMPLER_VIEW);
+   if (!cds_c || !cds_zs) {
+      fprintf(stderr, "fast-clear CDS resource_create failed\n");
+      pipe_resource_reference(&cds_c, NULL);
+      pipe_resource_reference(&cds_zs, NULL);
+      return false;
+   }
+   struct agx_resource *zs_rsrc = agx_resource(cds_zs);
+   struct agx_resource *s_rsrc =
+      zs_rsrc->separate_stencil ? zs_rsrc->separate_stencil : zs_rsrc;
+   const bool expect_cds_cdm =
+      fc_4b_1x && fc_1b_1x && agx_resource(cds_c)->layout.compressed &&
+      zs_rsrc->layout.compressed && s_rsrc->layout.compressed;
+   struct pipe_framebuffer_state cds_fb = {
+      .width = 256,
+      .height = 256,
+      .layers = 1,
+      .samples = 1,
+      .nr_cbufs = 1,
+      .cbufs[0] = {.texture = cds_c, .format = PIPE_FORMAT_R8G8B8A8_UNORM},
+      .zsbuf = {.texture = cds_zs, .format = PIPE_FORMAT_Z32_FLOAT_S8X24_UINT},
+   };
+   const double cds_depth = 0.625;
+   const unsigned cds_stencil = 0x5a;
+   pctx->set_framebuffer_state(pctx, &cds_fb);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL,
+               0xf, 0, NULL, &colour, cds_depth, cds_stencil);
+   struct agx_batch *cds_batch = fc_ctx->batch;
+   const bool cds_converted =
+      cds_batch && agx_try_fast_clear_batch(fc_ctx, cds_batch);
+   if (cds_converted != expect_cds_cdm) {
+      fprintf(stderr,
+              "CDS clear CDM conversion=%d, expected=%d (c=%d z=%d s=%d)\n",
+              cds_converted, expect_cds_cdm,
+              agx_resource(cds_c)->layout.compressed,
+              zs_rsrc->layout.compressed, s_rsrc->layout.compressed);
+      ok = false;
+   } else if (cds_converted) {
+      cdm_cases++;
+   }
+   pctx->flush(pctx, NULL, 0);
+
+   ok &= check_rgba8_readback(pctx, cds_c, 16, 16, expected_rgba, check_pixels,
+                              "CDS RGBA8 clear");
+   struct pipe_transfer *zs_xfer = NULL;
+   struct pipe_box zs_box = {
+      .x = 0, .y = 0, .z = 0, .width = 16, .height = 16, .depth = 1,
+   };
+   const uint8_t *zs_map =
+      pctx->texture_map(pctx, cds_zs, 0, PIPE_MAP_READ, &zs_box, &zs_xfer);
+   if (!zs_map || !zs_xfer) {
+      fprintf(stderr, "CDS Z32F_S8 readback map failed\n");
+      ok = false;
+   } else {
+      if (check_pixels) {
+         for (unsigned y = 0; y < 16 && ok; ++y) {
+            const uint8_t *row = zs_map + y * zs_xfer->stride;
+            for (unsigned x = 0; x < 16; ++x) {
+               float got_z = 0.0f;
+               memcpy(&got_z, row + x * 8, 4);
+               const uint8_t got_s = row[x * 8 + 4];
+               if (got_z != (float)cds_depth || got_s != cds_stencil) {
+                  fprintf(stderr,
+                          "CDS Z32F_S8 mismatch at (%u,%u): got (z=%f, s=%#x), "
+                          "expected (z=%f, s=%#x)\n",
+                          x, y, got_z, got_s, cds_depth, cds_stencil);
+                  ok = false;
+                  break;
+               }
+            }
+         }
+      }
+      pctx->texture_unmap(pctx, zs_xfer);
+   }
+   pipe_resource_reference(&cds_c, NULL);
+   pipe_resource_reference(&cds_zs, NULL);
+
+   printf("fast-clear-batch chip=%s check_pixels=%d cdm_cases=%u cds_cdm=%d "
+          "result=%s\n",
+          agx_chip_name(dev->chip), check_pixels, cdm_cases, expect_cds_cdm,
+          ok ? "PASS" : "FAIL");
+   return ok;
+}
+
 int
 main(void)
 {
@@ -1753,6 +2551,15 @@ main(void)
       return 1;
    }
 
+   if (getenv("AGX_TEST_FAST_CLEAR_HW")) {
+      const bool ok =
+         check_fast_clear_batch(screen, pctx, getenv("ASAHI_SHIM_CHIP") == NULL);
+      pctx->destroy(pctx);
+      screen->destroy(screen);
+      close(fd);
+      return ok ? 0 : 1;
+   }
+
    if (getenv("AGX_TEST_MAIN_SAMPLE_KEY")) {
       glsl_type_singleton_init_or_ref();
       const bool ok = check_discard_main_sample_key(pctx);
@@ -1774,6 +2581,14 @@ main(void)
    if (getenv("AGX_TEST_MIPMAP_HW")) {
       const bool ok =
          check_agx3_compute_mipmap(screen, pctx, getenv("ASAHI_SHIM_CHIP") == NULL);
+      pctx->destroy(pctx);
+      screen->destroy(screen);
+      close(fd);
+      return ok ? 0 : 1;
+   }
+
+   if (getenv("AGX_TEST_BGRA_READBACK_HW")) {
+      const bool ok = check_invalidate_and_bgra_readback(screen, pctx, true);
       pctx->destroy(pctx);
       screen->destroy(screen);
       close(fd);
@@ -1812,6 +2627,9 @@ main(void)
       return 1;
 
    if (!check_staged_resolve_shapes())
+      return 1;
+
+   if (!check_invalidate_and_bgra_readback(screen, pctx, false))
       return 1;
 
    if (!check_es3_compile_contract(pctx))
@@ -1931,6 +2749,112 @@ main(void)
    pipe_resource_reference(&xrgb8_resolve, NULL);
    printf("G17P XRGB8 2x clear/direct-resolve completed\n");
 
+   /* Exercise 4x RGBA16F direct resolve both preserving the MSAA source and
+    * discarding it via invalidate_resource after attaching the resolve. */
+   struct pipe_resource rgba16f_msaa_template = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_R16G16B16A16_FLOAT,
+      .width0 = 64,
+      .height0 = 64,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 0,
+      .nr_samples = 4,
+      .nr_storage_samples = 4,
+      .usage = PIPE_USAGE_DEFAULT,
+      .bind = PIPE_BIND_RENDER_TARGET,
+   };
+   struct pipe_resource *rgba16f_msaa =
+      screen->resource_create(screen, &rgba16f_msaa_template);
+   struct pipe_resource *rgba16f_resolve =
+      make_2d(screen, PIPE_FORMAT_R16G16B16A16_FLOAT, 64, 64,
+              PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+   if (!rgba16f_msaa || !rgba16f_resolve) {
+      fprintf(stderr, "RGBA16F 4x render target was not advertised\n");
+      return 1;
+   }
+   struct pipe_framebuffer_state rgba16f_msaa_fb = {
+      .width = 64,
+      .height = 64,
+      .layers = 1,
+      .samples = 4,
+      .nr_cbufs = 1,
+   };
+   rgba16f_msaa_fb.cbufs[0] = (struct pipe_surface){
+      .texture = rgba16f_msaa,
+      .format = PIPE_FORMAT_R16G16B16A16_FLOAT,
+      .first_layer = 0,
+      .last_layer = 0,
+      .level = 0,
+   };
+   const struct pipe_blit_info rgba16f_resolve_blit = {
+      .src = {
+         .resource = rgba16f_msaa,
+         .format = PIPE_FORMAT_R16G16B16A16_FLOAT,
+         .box = {.width = 64, .height = 64, .depth = 1},
+      },
+      .dst = {
+         .resource = rgba16f_resolve,
+         .format = PIPE_FORMAT_R16G16B16A16_FLOAT,
+         .box = {.width = 64, .height = 64, .depth = 1},
+      },
+      .mask = PIPE_MASK_RGBA,
+      .filter = PIPE_TEX_FILTER_NEAREST,
+   };
+   pctx->set_framebuffer_state(pctx, &rgba16f_msaa_fb);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &xrgb8_clear, 0.0, 0);
+   pctx->blit(pctx, &rgba16f_resolve_blit);
+   pctx->flush(pctx, NULL, 0);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &xrgb8_clear, 0.0, 0);
+   pctx->blit(pctx, &rgba16f_resolve_blit);
+   {
+      struct agx_context *actx = agx_context(pctx);
+      struct agx_batch *rb =
+         agx_writer_get(actx, agx_resource(rgba16f_msaa)->bo->handle);
+      if (agx_chip_native_agx3(agx_device(screen)->chip)) {
+         if (!rb || !rb->key.resolve || !rb->g17p_resolve_blit_attached ||
+             !rb->g17p_resolve_preserve) {
+            fprintf(stderr,
+                    "RGBA16F blit-attached resolve batch did not preserve source\n");
+            return 1;
+         }
+         pctx->invalidate_resource(pctx, rgba16f_msaa);
+         if (rb->g17p_resolve_preserve ||
+             (rb->resolve & PIPE_CLEAR_COLOR0) ||
+             !(rb->clear & PIPE_CLEAR_COLOR0)) {
+            fprintf(stderr,
+                    "invalidate_resource left unexpected resolve/clear state on blit-attached batch\n");
+            return 1;
+         }
+      } else {
+         pctx->invalidate_resource(pctx, rgba16f_msaa);
+      }
+   }
+   pctx->flush(pctx, NULL, 0);
+
+   /* A DRI MSAA visual carries key.resolve on an active ctx->batch that keeps
+    * taking draws after glInvalidateFramebuffer(). Invalidating it must NOT
+    * clear g17p_resolve_preserve, or later draws before flush lose their MSAA
+    * store. */
+   rgba16f_msaa_fb.resolve = rgba16f_resolve;
+   pctx->set_framebuffer_state(pctx, &rgba16f_msaa_fb);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &xrgb8_clear, 0.0, 0);
+   pctx->invalidate_resource(pctx, rgba16f_msaa);
+   {
+      struct agx_context *actx = agx_context(pctx);
+      struct agx_batch *dri_b = actx->batch;
+      if (!dri_b || dri_b->key.resolve != rgba16f_resolve ||
+          dri_b->g17p_resolve_blit_attached || !dri_b->g17p_resolve_preserve) {
+         fprintf(stderr,
+                 "invalidate_resource cleared g17p_resolve_preserve on active DRI MSAA batch\n");
+         return 1;
+      }
+   }
+   pctx->flush(pctx, NULL, 0);
+   pipe_resource_reference(&rgba16f_msaa, NULL);
+   pipe_resource_reference(&rgba16f_resolve, NULL);
+   printf("G17P RGBA16F 4x clear/direct-resolve/invalidate completed\n");
+
    struct pipe_resource *mrt_xrgb =
       make_2d(screen, PIPE_FORMAT_R8G8B8X8_UNORM, 8, 8,
               PIPE_BIND_RENDER_TARGET);
@@ -2038,6 +2962,15 @@ main(void)
    pctx->flush(pctx, NULL, 0);
    printf("clear and flush completed\n");
 
+   /* Full-extent compressed clear-only batch (1x/4x colour, depth, and
+    * combined colour+depth+stencil) must convert to libagx_fast_clear() CDM
+    * dispatches, attach active TIME_ELAPSED queries, and read back exact
+    * clear values when run on real hardware. */
+   if (!check_fast_clear_batch(screen, pctx, getenv("ASAHI_SHIM_CHIP") == NULL))
+      return 1;
+   pctx->set_framebuffer_state(pctx, &fb);
+   printf("full-extent compressed fast-clear CDM path verified\n");
+
    pctx->blit(pctx, &info);
 
    /* G17P's one admitted precompiled kernel is the vector buffer fill used
@@ -2069,14 +3002,24 @@ main(void)
       agx_chip_command_stream_generation(dev->chip) == AGX_CS_GENERATION_AGX2;
    int status = 0;
 
-   /* AGX2 keeps blit-based texture transfers. Later generations use mapped
-    * transfers, which convert formats on the CPU. */
+   /* AGX2, Gen9 AGX3 and the M5 profile advertise blit-based texture
+    * transfers; other Gen10 chips keep mapped CPU transfers while their PBE
+    * encoder refuses sRGB, mipmapped (non-G18), and linear layered (G18)
+    * transfer targets. */
+   const enum agx_descriptor_generation desc_gen =
+      agx_chip_descriptor_generation(dev->chip);
    const unsigned want_transfer_modes =
-      agx2 ? PIPE_TEXTURE_TRANSFER_BLIT : PIPE_TEXTURE_TRANSFER_DEFAULT;
-   if (screen->caps.texture_transfer_modes != want_transfer_modes) {
-      fprintf(stderr, "texture transfer modes %#x on %s, expected %#x\n",
-              screen->caps.texture_transfer_modes, agx_chip_name(dev->chip),
-              want_transfer_modes);
+      (agx_gallium_descriptor_generation_is_agx2(desc_gen) ||
+       desc_gen == AGX_DESCRIPTOR_GENERATION_9 || agx_chip_g17_m5(dev->chip))
+         ? PIPE_TEXTURE_TRANSFER_BLIT
+         : PIPE_TEXTURE_TRANSFER_DEFAULT;
+   if (screen->caps.texture_transfer_modes != want_transfer_modes ||
+       !screen->caps.invalidate_pbo_upload_destination) {
+      fprintf(stderr,
+              "texture transfer caps (%#x, inv_pbo=%d) on %s, expected (%#x, 1)\n",
+              screen->caps.texture_transfer_modes,
+              screen->caps.invalidate_pbo_upload_destination,
+              agx_chip_name(dev->chip), want_transfer_modes);
       status = 1;
    }
 
@@ -2088,14 +3031,16 @@ main(void)
           agx_chip_name(dev->chip), vs_ok ? "ok" : "refused",
           fs_ok ? "ok" : "refused", linked_ok ? "ok" : "refused");
 
-   /* G17P compresses this 2408x1506 RGBA8 render target, so the clear, the
-    * flush and the blit above took the compressed end-of-tile PBE and
-    * background texture; an unencodable descriptor would have aborted in
-    * agx_native_descriptor_rejected(). Other AGX3 parts keep it plain. */
+   /* Gen9 colour-compression parts (G17P, G16G) compress this 2408x1506 RGBA8
+    * render target, so the clear, the flush and the blit above took the
+    * compressed end-of-tile PBE and background texture; an unencodable
+    * descriptor would have aborted in agx_native_descriptor_rejected(). Other
+    * AGX3 parts keep it plain. */
    if (!agx2 &&
-       agx_resource(dst)->layout.compressed != (dev->chip == AGX_CHIP_G17P)) {
+       agx_resource(dst)->layout.compressed !=
+          agx_chip_gen9_color_compression(dev->chip)) {
       fprintf(stderr,
-              "AGX3 render target compression does not follow the G17P "
+              "AGX3 render target compression does not follow the Gen9 colour "
               "policy\n");
       status = 1;
    }

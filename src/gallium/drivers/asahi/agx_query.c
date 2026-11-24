@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <errno.h>
 #include <stdint.h>
+#include <xf86drm.h>
 #include "pipe/p_defines.h"
 #include "util/bitset.h"
 #include "util/macros.h"
@@ -53,23 +55,21 @@ struct agx_oq_heap {
    BITSET_DECLARE(available, AGX_MAX_OCCLUSION_QUERIES);
 };
 
-static void
-agx_destroy_oq_heap(void *heap_)
-{
-   struct agx_oq_heap *heap = heap_;
-   agx_bo_unreference(heap->dev, heap->bo);
-}
-
 static struct agx_oq_heap *
 agx_alloc_oq_heap(struct agx_context *ctx)
 {
-   struct agx_oq_heap *heap = rzalloc(ctx, struct agx_oq_heap);
-   ralloc_set_destructor(heap, agx_destroy_oq_heap);
+   struct agx_oq_heap *heap = CALLOC_STRUCT(agx_oq_heap);
+   if (!heap)
+      return NULL;
 
    heap->dev = agx_device(ctx->base.screen);
    heap->bo =
       agx_bo_create(heap->dev, AGX_MAX_OCCLUSION_QUERIES * sizeof(uint64_t), 0,
                     AGX_BO_WRITEBACK, "Occlusion query heap");
+   if (!heap->bo) {
+      FREE(heap);
+      return NULL;
+   }
 
    /* At the start, everything is available */
    BITSET_ONES(heap->available);
@@ -77,8 +77,19 @@ agx_alloc_oq_heap(struct agx_context *ctx)
    return heap;
 }
 
+void
+agx_destroy_oq_heap_ctx(struct agx_context *ctx)
+{
+   if (!ctx->oq)
+      return;
+
+   agx_bo_unreference(ctx->oq->dev, ctx->oq->bo);
+   FREE(ctx->oq);
+   ctx->oq = NULL;
+}
+
 static struct agx_oq_heap *
-agx_get_oq_heap(struct agx_context *ctx)
+agx_get_oq_heap_locked(struct agx_context *ctx)
 {
    if (!ctx->oq)
       ctx->oq = agx_alloc_oq_heap(ctx);
@@ -89,23 +100,31 @@ agx_get_oq_heap(struct agx_context *ctx)
 static struct agx_ptr
 agx_alloc_oq(struct agx_context *ctx)
 {
-   struct agx_oq_heap *heap = agx_get_oq_heap(ctx);
+   simple_mtx_lock(&ctx->oq_lock);
+   struct agx_oq_heap *heap = agx_get_oq_heap_locked(ctx);
+   if (!heap) {
+      simple_mtx_unlock(&ctx->oq_lock);
+      return (struct agx_ptr){NULL, 0};
+   }
 
    /* Find first available */
    int ffs = BITSET_FFS(heap->available);
-   if (!ffs)
+   if (!ffs) {
+      simple_mtx_unlock(&ctx->oq_lock);
       return (struct agx_ptr){NULL, 0};
+   }
 
    /* Allocate it */
    unsigned index = ffs - 1;
    BITSET_CLEAR(heap->available, index);
 
    unsigned offset = index * sizeof(uint64_t);
-
-   return (struct agx_ptr){
+   struct agx_ptr ptr = {
       (uint8_t *)agx_bo_map(heap->bo) + offset,
       heap->bo->va->addr + offset,
    };
+   simple_mtx_unlock(&ctx->oq_lock);
+   return ptr;
 }
 
 static unsigned
@@ -119,22 +138,27 @@ agx_oq_index(struct agx_context *ctx, struct agx_query *q)
 static void
 agx_free_oq(struct agx_context *ctx, struct agx_query *q)
 {
-   struct agx_oq_heap *heap = agx_get_oq_heap(ctx);
+   simple_mtx_lock(&ctx->oq_lock);
+   struct agx_oq_heap *heap = agx_get_oq_heap_locked(ctx);
    unsigned index = agx_oq_index(ctx, q);
 
    assert(index < AGX_MAX_OCCLUSION_QUERIES);
    assert(!BITSET_TEST(heap->available, index));
 
    BITSET_SET(heap->available, index);
+   simple_mtx_unlock(&ctx->oq_lock);
 }
 
 uint64_t
 agx_get_occlusion_heap(struct agx_batch *batch)
 {
-   if (!batch->ctx->oq)
-      return 0;
+   simple_mtx_lock(&batch->ctx->oq_lock);
+   struct agx_oq_heap *oq = batch->ctx->oq;
+   struct agx_bo *bo = oq ? oq->bo : NULL;
+   simple_mtx_unlock(&batch->ctx->oq_lock);
 
-   struct agx_bo *bo = batch->ctx->oq->bo;
+   if (!bo)
+      return 0;
 
    if (agx_batch_uses_bo(batch, bo))
       return bo->va->addr;
@@ -215,6 +239,7 @@ static bool
 is_query_busy(struct agx_context *ctx, struct agx_query *query, bool submit)
 {
    bool busy = false;
+   bool need_submit = false;
    for (unsigned i = 0; i < AGX_MAX_BATCHES; ++i) {
       if (query->writer_generation[i] == ctx->batches.generation[i] &&
           !agx_poll_batch(ctx, &ctx->batches.slots[i])) {
@@ -222,15 +247,20 @@ is_query_busy(struct agx_context *ctx, struct agx_query *query, bool submit)
             return true;
 
          /* GL availability polling must eventually finish without an app
-          * flush. Submit only still-active writers, once; never wait for
-          * them here. Already submitted writers need only the zero-timeout
+          * flush. Submit only still-active or queued writers, once; never wait
+          * for them here. Already submitted writers need only the zero-timeout
           * poll above. Return not-ready even if submission retires inline. */
          busy = true;
          if (agx_batch_is_active(&ctx->batches.slots[i]))
             agx_flush_batch_for_reason(ctx, &ctx->batches.slots[i],
                                        "Query result availability");
+         if (agx_batch_is_queued(&ctx->batches.slots[i]))
+            need_submit = true;
       }
    }
+
+   if (need_submit)
+      agx_submit_pending(ctx);
 
    return busy;
 }
@@ -402,6 +432,38 @@ classify_query_type(enum pipe_query_type type)
    }
 }
 
+static void
+agx_query_format_result(struct agx_device *dev, enum pipe_query_type type,
+                        uint64_t value, uint64_t begin_val,
+                        union pipe_query_result *vresult)
+{
+   switch (classify_query_type(type)) {
+   case QUERY_COPY_BOOL32:
+      vresult->u64 = ((uint32_t)value) != 0;
+      return;
+
+   case QUERY_COPY_BOOL64:
+      vresult->u64 = value != 0;
+      return;
+
+   case QUERY_COPY_NORMAL:
+      vresult->u64 = value;
+      return;
+
+   case QUERY_COPY_TIMESTAMP:
+      vresult->u64 = agx_gpu_timestamp_to_ns(dev, value);
+      return;
+
+   case QUERY_COPY_TIME_ELAPSED:
+      /* end - begin */
+      vresult->u64 = agx_gpu_timestamp_to_ns(dev, value - begin_val);
+      return;
+
+   default:
+      UNREACHABLE("Other queries not yet supported");
+   }
+}
+
 static bool
 agx_get_query_result_inner(struct pipe_context *pctx, struct pipe_query *pquery,
                            bool wait, bool submit,
@@ -417,32 +479,120 @@ agx_get_query_result_inner(struct pipe_context *pctx, struct pipe_query *pquery,
       return false;
 
    uint64_t *ptr = query->ptr.cpu;
-   uint64_t value = *ptr;
+   agx_query_format_result(dev, query->type, ptr[0],
+                           is_timer(query) ? ptr[1] : 0, vresult);
+   return true;
+}
 
-   switch (classify_query_type(query->type)) {
-   case QUERY_COPY_BOOL32:
-      vresult->u64 = ((uint32_t)value) != 0;
-      return true;
+static bool
+agx_get_query_result_flushed(struct agx_context *ctx, struct agx_query *query,
+                             bool wait, union pipe_query_result *vresult)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
 
-   case QUERY_COPY_BOOL64:
-      vresult->u64 = value != 0;
-      return true;
+   for (;;) {
+      uint32_t wait_syncobj = 0;
+      bool need_wait = false;
+      uint64_t extra_end_ts = 0;
+      uint64_t extra_begin_ts = UINT64_MAX;
 
-   case QUERY_COPY_NORMAL:
-      vresult->u64 = value;
-      return true;
+      simple_mtx_lock(&ctx->query_lock);
 
-   case QUERY_COPY_TIMESTAMP:
-      vresult->u64 = agx_gpu_timestamp_to_ns(dev, value);
-      return true;
+      for (unsigned i = 0; i < AGX_MAX_BATCHES; ++i) {
+         if (query->writer_generation[i] !=
+             ctx->batches.query_state[i].generation)
+            continue;
 
-   case QUERY_COPY_TIME_ELAPSED:
-      /* end - begin */
-      vresult->u64 = agx_gpu_timestamp_to_ns(dev, ptr[0] - ptr[1]);
-      return true;
+         if (!ctx->batches.query_state[i].submitted) {
+            /* A flushed query's writers must already be submitted. Fall back
+             * safely if an unexpected unsubmitted writer is observed.
+             */
+            assert(!"flushed query still has unsubmitted writer");
+            simple_mtx_unlock(&ctx->query_lock);
+            threaded_context_unwrap_sync(&ctx->tc->base);
+            return agx_get_query_result_inner(&ctx->base,
+                                              (struct pipe_query *)query, wait,
+                                              true, vresult);
+         }
 
-   default:
-      UNREACHABLE("Other queries not yet supported");
+         if (ctx->batches.query_state[i].quarantined) {
+            if (!wait) {
+               simple_mtx_unlock(&ctx->query_lock);
+               return false;
+            }
+            continue;
+         }
+
+         uint32_t syncobj = ctx->batches.query_state[i].syncobj;
+         int ret = drmSyncobjWait(dev->fd, &syncobj, 1, 0, 0, NULL);
+         assert(!ret || ret == -ETIME);
+         if (ret) {
+            if (!wait) {
+               simple_mtx_unlock(&ctx->query_lock);
+               return false;
+            }
+            if (unlikely(dev->debug & AGX_DBG_PERF))
+               p_atomic_inc(&ctx->perf.query_waits);
+            wait_syncobj = syncobj;
+            need_wait = true;
+            break;
+         }
+
+         /* Batch i finished on the GPU before the driver thread retired it.
+          * Fold its timestamps locally while holding query_lock so the slot
+          * cannot be retired and reused underneath us.
+          */
+         if (is_timer(query) && ctx->timestamps) {
+            struct agx_timestamps *ts =
+               ((struct agx_timestamps *)agx_bo_map(ctx->timestamps)) + i;
+            if (ctx->batches.query_state[i].has_cdm) {
+               extra_begin_ts = MIN2(extra_begin_ts, ts->comp_start);
+               extra_end_ts = MAX2(extra_end_ts, ts->comp_end);
+            }
+            if (ctx->batches.query_state[i].has_vdm) {
+               extra_begin_ts = MIN2(extra_begin_ts, ts->vtx_start);
+               extra_end_ts = MAX2(extra_end_ts, ts->frag_end);
+            }
+         }
+      }
+
+      if (!need_wait) {
+         uint64_t *ptr = query->ptr.cpu;
+         uint64_t value = ptr[0];
+         uint64_t begin_val = is_timer(query) ? ptr[1] : 0;
+
+         if (is_timer(query)) {
+            value = MAX2(value, extra_end_ts);
+            begin_val = MIN2(begin_val, extra_begin_ts);
+         }
+
+         simple_mtx_unlock(&ctx->query_lock);
+         agx_query_format_result(dev, query->type, value, begin_val, vresult);
+         return true;
+      }
+
+      /* Snapshot the pending syncobj before dropping query_lock so a concurrent
+       * driver-thread retirement and reuse of slot i cannot replace the fence.
+       */
+      uint32_t tmp_syncobj = 0;
+      if (drmSyncobjCreate(dev->fd, 0, &tmp_syncobj) == 0) {
+         if (drmSyncobjTransfer(dev->fd, tmp_syncobj, 0, wait_syncobj, 0, 0) !=
+             0) {
+            drmSyncobjDestroy(dev->fd, tmp_syncobj);
+            tmp_syncobj = 0;
+         }
+      }
+      simple_mtx_unlock(&ctx->query_lock);
+
+      uint32_t target = tmp_syncobj ? tmp_syncobj : wait_syncobj;
+      int ret;
+      do {
+         ret = drmSyncobjWait(dev->fd, &target, 1, INT64_MAX, 0, NULL);
+      } while (ret == -EINTR);
+      assert(!ret);
+
+      if (tmp_syncobj)
+         drmSyncobjDestroy(dev->fd, tmp_syncobj);
    }
 }
 
@@ -450,6 +600,17 @@ static bool
 agx_get_query_result(struct pipe_context *pctx, struct pipe_query *pquery,
                      bool wait, union pipe_query_result *vresult)
 {
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_query *query = (struct agx_query *)pquery;
+
+   /* When threaded_query::flushed is true, u_threaded_context calls
+    * get_query_result directly from the frontend thread without syncing.
+    * Poll/wait against the locked batch query_state snapshot instead of
+    * draining the TC queue.
+    */
+   if (ctx->tc && query->base.flushed)
+      return agx_get_query_result_flushed(ctx, query, wait, vresult);
+
    return agx_get_query_result_inner(pctx, pquery, wait, true, vresult);
 }
 
@@ -472,8 +633,8 @@ agx_get_query_result_resource_cpu(struct agx_context *ctx,
       /* availability */
       result.u64 = !is_query_busy(ctx, query, true);
    } else {
-      if (!agx_get_query_result(&ctx->base, (void *)query,
-                                flags & PIPE_QUERY_WAIT, &result))
+      if (!agx_get_query_result_inner(&ctx->base, (void *)query,
+                                      flags & PIPE_QUERY_WAIT, true, &result))
          return;
    }
 
@@ -486,8 +647,8 @@ agx_get_query_result_resource_cpu(struct agx_context *ctx,
       result.u32 = x;
    }
 
-   pipe_buffer_write(&ctx->base, resource, offset,
-                     result_type_size(result_type), &result.u64);
+   tc_buffer_write(&ctx->base, resource, offset,
+                   result_type_size(result_type), &result.u64);
 }
 
 static bool
@@ -513,6 +674,7 @@ agx_get_query_result_resource_gpu(struct agx_context *ctx,
    enum query_copy_type copy_type = classify_query_type(query->type);
 
    struct agx_batch *batch = agx_get_compute_batch(ctx);
+   batch->query_access = true;
    agx_batch_init_state(batch);
    agx_dirty_all(ctx);
 
@@ -563,6 +725,7 @@ agx_add_query_to_batch(struct agx_batch *batch, struct agx_query *query)
    struct agx_bo *bo = is_occlusion(query) ? batch->ctx->oq->bo : query->bo;
 
    agx_batch_add_bo(batch, bo);
+   batch->barrier_untracked = true;
    query->writer_generation[idx] = batch->ctx->batches.generation[idx];
 }
 
@@ -597,18 +760,32 @@ void
 agx_finish_batch_queries(struct agx_batch *batch, uint64_t begin_ts,
                          uint64_t end_ts)
 {
-   /* Remove the batch as write from all queries by incrementing the generation
-    * of the batch.
-    */
-   batch->ctx->batches.generation[agx_batch_idx(batch)]++;
+   struct agx_context *ctx = batch->ctx;
+   unsigned idx = agx_batch_idx(batch);
 
-   /* Write out timestamps */
+   simple_mtx_lock(&ctx->query_lock);
+
+   /* Write out timestamps before advancing the batch generation so app-thread
+    * readers observing the incremented generation see the final values.
+    */
    util_dynarray_foreach(&batch->timestamps, struct agx_ptr, it) {
       uint64_t *ptr = it->cpu;
 
       ptr[0] = MAX2(ptr[0], end_ts);
       ptr[1] = MIN2(ptr[1], begin_ts);
    }
+
+   /* Remove the batch as writer from all queries by incrementing the generation
+    * of the batch.
+    */
+   ctx->batches.generation[idx]++;
+   ctx->batches.query_state[idx].generation = ctx->batches.generation[idx];
+   ctx->batches.query_state[idx].submitted = false;
+   ctx->batches.query_state[idx].quarantined = false;
+   ctx->batches.query_state[idx].has_cdm = false;
+   ctx->batches.query_state[idx].has_vdm = false;
+
+   simple_mtx_unlock(&ctx->query_lock);
 }
 
 void
