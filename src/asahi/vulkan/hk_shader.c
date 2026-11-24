@@ -1335,6 +1335,66 @@ m5_has_mergeable_buffer_words(nir_shader *nir)
    return false;
 }
 
+/* Load the words of a robust uniform buffer read at constant offsets
+ * r[g..g_end) through the aligned 16-byte windows that hold them.
+ *
+ * Merging each block's run of words on its own gives the blocks of an
+ * unrolled loop different loads of the same words: a different first word or
+ * width in each block. nir_opt_preamble shares only equal loads, so every copy
+ * takes its own uniform slots, and the words that no longer fit are held in
+ * registers by the main program. Every read of a window is the same load, so
+ * the preamble keeps one copy of it.
+ *
+ * Each word keeps its own exact check against the descriptor's byte size, and
+ * soft fault covers the window's unread words. */
+static bool
+m5_load_uniform_windows(struct m5_word_read *r, unsigned g, unsigned g_end)
+{
+   bool progress = false;
+   for (unsigned i = g; i < g_end;) {
+      const uint32_t window = r[i].offset.constant & ~15u;
+      unsigned j = i, first = i, last = i;
+      bool words = true;
+      while (j < g_end && (r[j].offset.constant & ~15u) == window) {
+         words &= (r[j].offset.constant & 3) == 0;
+         if (r[j].load->instr.index < r[first].load->instr.index)
+            first = j;
+         if (r[j].load->instr.index > r[last].load->instr.index)
+            last = j;
+         j++;
+      }
+
+      /* The window's last word must end within 32 bits like the reads. */
+      if (!words || window > UINT32_MAX - 16 ||
+          (first != last &&
+           !m5_bounded_can_move(&r[first].load->instr, &r[last].load->instr))) {
+         i = j;
+         continue;
+      }
+
+      nir_intrinsic_instr *low = r[i].load;
+      nir_builder b = nir_builder_at(nir_before_instr(&r[first].load->instr));
+      nir_def *addr =
+         nir_iadd(&b, r[i].base, nir_u2u64(&b, nir_imm_int(&b, window)));
+      nir_def *v = nir_load_global_constant(
+         &b, 4, 32, addr,
+         .align_mul = nir_intrinsic_align_mul(low) >= 16 ? 16 : 4,
+         .access = nir_intrinsic_access(low) | ACCESS_NON_WRITEABLE |
+                   ACCESS_CAN_REORDER);
+
+      for (unsigned k = i; k < j; k++) {
+         const uint32_t offset = r[k].offset.constant;
+         nir_def *word = nir_channel(&b, v, (offset - window) / 4);
+         word = nir_bounds_agx(&b, word, nir_imm_int(&b, offset + 4),
+                               r[k].bound);
+         nir_def_replace(&r[k].load->def, word);
+      }
+      progress = true;
+      i = j;
+   }
+   return progress;
+}
+
 /* M5: a structure read field by field (a light record in a loop) issues one
  * load per 32-bit word, each with its own address. Merge the reads of up to
  * four consecutive words at one base and offset term into one vector load.
@@ -1350,7 +1410,12 @@ m5_has_mergeable_buffer_words(nir_shader *nir)
  *
  * which is exact, except that a word whose offset wraps is now zeroed instead
  * of read at its wrapped offset. Only such a word's address differs from its
- * separate read, and soft fault covers it. */
+ * separate read, and soft fault covers it.
+ *
+ * Robust uniform buffer reads at constant offsets reach this pass as single
+ * words too: the vectorizer cannot prove that their offsets do not wrap. Their
+ * windows are fixed instead of following each block's reads
+ * (m5_load_uniform_windows). */
 static bool
 m5_merge_buffer_words(nir_shader *nir)
 {
@@ -1408,6 +1473,13 @@ m5_merge_buffer_words(nir_shader *nir)
                if (r[g_end].load->instr.index < r[earliest].load->instr.index)
                   earliest = g_end;
                g_end++;
+            }
+
+            if (r[g].bound && !r[g].offset.term.def &&
+                r[g].load->intrinsic == nir_intrinsic_load_global_constant_bounded) {
+               progress |= m5_load_uniform_windows(r, g, g_end);
+               g = g_end;
+               continue;
             }
 
             /* Split the record into loads of up to four consecutive words. */
