@@ -14,6 +14,9 @@
 #include "agx3_isel_core.h"
 #include "agx3_tex_core.h"
 #include "agx_test.h"
+extern "C" {
+#include "agx_nir.h"
+}
 
 TEST(AGX3UniformALU, PackedUniformLoadPointerBoundaries)
 {
@@ -2247,5 +2250,127 @@ TEST(AGX3UniformALU, M5HalfFcmpselPreservesSmallIntegerImmediate)
       agx_materialize_agx3_alu_constants(b->shader);
       EXPECT_EQ(sel->src[2].type, AGX_INDEX_NORMAL);
       ralloc_free(mem);
+   }
+}
+
+TEST(AGX3UniformALU, OpenCodedPack4x8LowersToPack2x16)
+{
+   auto build_tree = [](nir_builder *b, unsigned assoc, nir_def *b0,
+                        nir_def *b1, nir_def *b2, nir_def *b3,
+                        nir_def **inner_out) -> nir_def * {
+      nir_def *s0 = nir_u2u32(b, b0);
+      nir_def *s1 = nir_ishl_imm(b, nir_u2u32(b, b1), 8);
+      nir_def *s2 = nir_ishl_imm(b, nir_u2u32(b, b2), 16);
+      nir_def *s3 = nir_ishl_imm(b, nir_u2u32(b, b3), 24);
+      nir_def *inner = NULL;
+      nir_def *packed = NULL;
+      switch (assoc) {
+      case 0: /* Left-associative: (((b0 | b1<<8) | b2<<16) | b3<<24) */
+         inner = nir_ior(b, s0, s1);
+         packed = nir_ior(b, nir_ior(b, inner, s2), s3);
+         break;
+      case 1: /* Balanced: (b0 | b1<<8) | (b2<<16 | b3<<24) */
+         inner = nir_ior(b, s0, s1);
+         packed = nir_ior(b, inner, nir_ior(b, s2, s3));
+         break;
+      case 2: /* Right-associative (low-inner): b3<<24 | (b2<<16 | (b1<<8 | b0)) */
+         inner = nir_ior(b, s1, s0);
+         packed = nir_ior(b, s3, nir_ior(b, s2, inner));
+         break;
+      case 3: /* Right-associative (high-inner): b0 | (b1<<8 | (b2<<16 | b3<<24)) */
+         inner = nir_ior(b, s2, s3);
+         packed = nir_ior(b, s0, nir_ior(b, s1, inner));
+         break;
+      default:
+         ADD_FAILURE() << "invalid association " << assoc;
+         break;
+      }
+      if (inner_out)
+         *inner_out = inner;
+      return packed;
+   };
+
+   for (unsigned assoc = 0; assoc < 4; ++assoc) {
+      /* 1 & 2. Dynamic 8-bit loads lower cleanly to pack_32_2x16_split, and
+       * substituting concrete bytes 0x11..0x44 into the lowered IR and
+       * constant-folding produces exact 0x44332211 (catching swapped lanes
+       * or missing shifts). */
+      {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "pack4x8_dyn_and_fold");
+         nir_def *addr = nir_imm_int64(&b, 0x1000);
+         nir_def *b0 = nir_load_global(&b, 1, 8, addr, .align_mul = 1);
+         nir_def *b1 = nir_load_global(&b, 1, 8, nir_iadd_imm(&b, addr, 1), .align_mul = 1);
+         nir_def *b2 = nir_load_global(&b, 1, 8, nir_iadd_imm(&b, addr, 2), .align_mul = 1);
+         nir_def *b3 = nir_load_global(&b, 1, 8, nir_iadd_imm(&b, addr, 3), .align_mul = 1);
+         nir_def *packed = build_tree(&b, assoc, b0, b1, b2, b3, NULL);
+         nir_intrinsic_instr *store =
+            nir_store_global(&b, packed, nir_iadd_imm(&b, addr, 16), .align_mul = 4);
+
+         EXPECT_TRUE(agx_nir_lower_algebraic_late(b.shader));
+         nir_opt_dce(b.shader);
+         nir_validate_shader(b.shader, "pack4x8 lowered");
+
+         unsigned pack2x16 = 0, u2u32_cnt = 0;
+         nir_foreach_function_impl(impl, b.shader) {
+            nir_foreach_block(block, impl) {
+               nir_foreach_instr(instr, block) {
+                  if (instr->type != nir_instr_type_alu)
+                     continue;
+                  nir_alu_instr *alu = nir_instr_as_alu(instr);
+                  if (alu->op == nir_op_pack_32_2x16_split)
+                     pack2x16++;
+                  if (alu->op == nir_op_u2u32)
+                     u2u32_cnt++;
+               }
+            }
+         }
+         EXPECT_EQ(pack2x16, 1u);
+         EXPECT_EQ(u2u32_cnt, 0u);
+
+         b.cursor = nir_before_impl(b.impl);
+         nir_def_rewrite_uses(b0, nir_imm_intN_t(&b, 0x11, 8));
+         nir_def_rewrite_uses(b1, nir_imm_intN_t(&b, 0x22, 8));
+         nir_def_rewrite_uses(b2, nir_imm_intN_t(&b, 0x33, 8));
+         nir_def_rewrite_uses(b3, nir_imm_intN_t(&b, 0x44, 8));
+         EXPECT_TRUE(nir_opt_constant_folding(b.shader));
+         nir_opt_dce(b.shader);
+         nir_validate_shader(b.shader, "pack4x8 folded");
+         ASSERT_TRUE(nir_src_is_const(store->src[0]));
+         EXPECT_EQ(nir_src_as_uint(store->src[0]), 0x44332211u);
+         ralloc_free(b.shader);
+      }
+
+      /* 3. Negative control: multi-use inner ior stays untouched so the
+       *    partial 32-bit word is not duplicated alongside a 16-bit chain. */
+      {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "pack4x8_multiuse");
+         nir_def *addr = nir_imm_int64(&b, 0x3000);
+         nir_def *b0 = nir_load_global(&b, 1, 8, addr, .align_mul = 1);
+         nir_def *b1 = nir_load_global(&b, 1, 8, nir_iadd_imm(&b, addr, 1), .align_mul = 1);
+         nir_def *b2 = nir_load_global(&b, 1, 8, nir_iadd_imm(&b, addr, 2), .align_mul = 1);
+         nir_def *b3 = nir_load_global(&b, 1, 8, nir_iadd_imm(&b, addr, 3), .align_mul = 1);
+         nir_def *inner = NULL;
+         nir_def *packed = build_tree(&b, assoc, b0, b1, b2, b3, &inner);
+         nir_store_global(&b, packed, nir_iadd_imm(&b, addr, 16), .align_mul = 4);
+         nir_store_global(&b, inner, nir_iadd_imm(&b, addr, 20), .align_mul = 4);
+
+         agx_nir_lower_algebraic_late(b.shader);
+         nir_opt_dce(b.shader);
+         nir_validate_shader(b.shader, "pack4x8 multiuse");
+         unsigned pack2x16 = 0;
+         nir_foreach_function_impl(impl, b.shader) {
+            nir_foreach_block(block, impl) {
+               nir_foreach_instr(instr, block) {
+                  if (instr->type == nir_instr_type_alu &&
+                      nir_instr_as_alu(instr)->op == nir_op_pack_32_2x16_split)
+                     pack2x16++;
+               }
+            }
+         }
+         EXPECT_EQ(pack2x16, 0u);
+         ralloc_free(b.shader);
+      }
    }
 }

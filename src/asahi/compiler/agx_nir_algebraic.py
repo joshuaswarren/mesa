@@ -78,6 +78,34 @@ lower_pack = [
      ('pack_32_2x16_split', ('ior', ('u2u16', a), ('ishl', ('u2u16', b), 8)),
                             ('ior', ('u2u16', c), ('ishl', ('u2u16', d), 8)))),
 
+    # Recognize open-coded 4x8 -> 32-bit byte packing of zero-extended bytes
+    # and lower identically to pack_32_4x8_split, avoiding << 16 / << 24 shift
+    # immediates and halving live register width. Inner iors require
+    # is_used_once so multi-use partial words do not stay live alongside the
+    # rewritten 16-bit chain. Covers left-associative (including commuted
+    # d<<24 | (c<<16 | (b<<8 | a))), balanced, and right-associative
+    # a | (b<<8 | (c<<16 | d<<24)) trees.
+    (('ior', ('ior(is_used_once)',
+              ('ior(is_used_once)', ('u2u32', 'a@8'),
+                                    ('ishl', ('u2u32', 'b@8'), 8)),
+              ('ishl', ('u2u32', 'c@8'), 16)),
+             ('ishl', ('u2u32', 'd@8'), 24)),
+     ('pack_32_2x16_split', ('ior', ('u2u16', a), ('ishl', ('u2u16', b), 8)),
+                            ('ior', ('u2u16', c), ('ishl', ('u2u16', d), 8)))),
+    (('ior', ('ior(is_used_once)', ('u2u32', 'a@8'),
+                                   ('ishl', ('u2u32', 'b@8'), 8)),
+             ('ior(is_used_once)', ('ishl', ('u2u32', 'c@8'), 16),
+                                   ('ishl', ('u2u32', 'd@8'), 24))),
+     ('pack_32_2x16_split', ('ior', ('u2u16', a), ('ishl', ('u2u16', b), 8)),
+                            ('ior', ('u2u16', c), ('ishl', ('u2u16', d), 8)))),
+    (('ior', ('u2u32', 'a@8'),
+             ('ior(is_used_once)',
+              ('ishl', ('u2u32', 'b@8'), 8),
+              ('ior(is_used_once)', ('ishl', ('u2u32', 'c@8'), 16),
+                                    ('ishl', ('u2u32', 'd@8'), 24)))),
+     ('pack_32_2x16_split', ('ior', ('u2u16', a), ('ishl', ('u2u16', b), 8)),
+                            ('ior', ('u2u16', c), ('ishl', ('u2u16', d), 8)))),
+
     # A half taken from a word and narrowed again (u2u16(extract_u16(x, 1)),
     # as the cooperative matrix lowering builds an operand from a 32-bit
     # load) is the half itself. Without this the u2u32 of the rewrite below
