@@ -18154,7 +18154,10 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    if (nir->info.stage == MESA_SHADER_VERTEX &&
        agx_isa_is_agx3(key->dev.encoding) && !key->no_preamble &&
        !key->secondary) {
-      nir_function_impl *preamble = nir_shader_get_preamble(nir);
+      /* nir_shader_get_preamble() would create an empty one, which would
+       * then be compiled as a constant program of a shader that has none. */
+      nir_function *preamble_fn = nir_shader_get_entrypoint(nir)->preamble;
+      nir_function_impl *preamble = preamble_fn ? preamble_fn->impl : NULL;
       if (preamble) {
          bool ok = true;
          bool have_in = false;
