@@ -214,6 +214,16 @@ struct agx_shader_info {
     * +agx3_preamble_out_size_halfs). The driver may execute @preamble once as a
     * 1-thread compute shader and bind the output buffer as a vertex uniform
     * range instead of re-running the per-draw vertex constant program. */
+   /* Post-DMA root-uniform liveness for AGX3 shaders compiled with
+    * g17p_uniform_dma: distinguishes whether the main shader and/or its
+    * @preamble still load the 64-bit root pointer uniform at g17p_dma_root.
+    * When false, uniform DMA and/or preamble hoisting retired every root load
+    * so the driver can omit the dead root-pointer range (when set_count == 0
+    * and no prolog reads the root). */
+   bool agx3_root_uniform_usage_valid;
+   bool agx3_main_uses_root_uniform;
+   bool agx3_preamble_uses_root_uniform;
+
    bool agx3_preamble_hoistable;
    uint16_t agx3_preamble_in_base_half;
    uint16_t agx3_preamble_in_size_halfs;
