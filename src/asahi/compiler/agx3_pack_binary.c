@@ -764,12 +764,12 @@ agx3_try_float_modifier(struct util_dynarray *emission,
                       agx_channels(I->dest[0]) == 1;
    for (unsigned s = 0; s < I->nr_srcs; ++s)
       has_mod |= I->src[s].abs || I->src[s].neg;
-   /* Native AGX3B/AGX3C FMA (and AGX3C MUL) consumes full and half registers in
+   /* Native AGX3B/AGX3C FMA and MUL consume full and half registers in
     * independently typed operand slots, including unmodified inputs. Route
     * mixed operands through the same lifetime-aware modifier encoder. Plain F32
     * stays compact. */
-   if ((enc == AGX_ISA_ENCODING_AGX3C && (is_fma || is_mul)) ||
-       (enc == AGX_ISA_ENCODING_AGX3B && is_fma))
+   if ((enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C) &&
+       (is_fma || is_mul))
       for (unsigned s = 0; s < I->nr_srcs; ++s)
          has_mod |= agx3_src_is_register(I->src[s]) &&
                     I->src[s].size == AGX_SIZE_16;
@@ -5558,7 +5558,7 @@ agx3_emit_rgb10a2(struct util_dynarray *emission, enum agx_isa_encoding enc,
  */
 static bool
 agx3_emit_normflt(struct util_dynarray *emission, enum agx_isa_encoding enc,
-                  const agx_instr *I, uint16_t wait_mask)
+                  bool emit_agx3d, const agx_instr *I, uint16_t wait_mask)
 {
    if (I->nr_dests != 1 || I->nr_srcs != 1)
       return false;
@@ -5566,7 +5566,12 @@ agx3_emit_normflt(struct util_dynarray *emission, enum agx_isa_encoding enc,
    const agx_index dest = I->dest[0];
    const agx_index src = I->src[0];
 
-   if (!agx3_src_is_register(dest) || dest.memory || dest.size != AGX_SIZE_32 ||
+   const bool dest_16 =
+      (enc == AGX_ISA_ENCODING_AGX3B ||
+       (enc == AGX_ISA_ENCODING_AGX3C && !emit_agx3d)) &&
+      dest.size == AGX_SIZE_16;
+   if (!agx3_src_is_register(dest) || dest.memory ||
+       (!dest_16 && dest.size != AGX_SIZE_32) ||
        agx_channels(dest) > 2 || agx_channels(dest) < 1)
       return false;
    const bool norm16 = I->format == AGX_FORMAT_U16NORM ||
@@ -5582,6 +5587,7 @@ agx3_emit_normflt(struct util_dynarray *emission, enum agx_isa_encoding enc,
 
    struct agx3_normflt_desc d = {
       .dest = dest.value,
+      .dest_16 = dest_16,
       .dest_hint = true,
       .src = src.value,
       .two_lanes = two_lanes,
@@ -16376,7 +16382,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          }
 
          if (I->op == AGX_OPCODE_NORMFLT_AGX3) {
-            if (!agx3_emit_normflt(emission, enc, I, wait))
+            if (!agx3_emit_normflt(emission, enc, ctx->key->dev.emit_agx3d, I,
+                                   wait))
                AGX3_REFUSE(I);
             continue;
          }

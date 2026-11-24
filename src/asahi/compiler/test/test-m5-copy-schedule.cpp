@@ -860,3 +860,51 @@ TEST(M5CopySchedule, StackAdjustSerializesStackAccesses)
    EXPECT_GT(adj_free, ld_pos);
    ralloc_free(s.mem);
 }
+
+/* Multi-channel loads unpacked by SPLIT remain tracked as in-flight loads
+ * until a real consumer reads a split lane, and independent ALU chains
+ * interleave rather than serializing one chain after another. */
+TEST(M5CopySchedule, SplitLoadChainsInterleaveIndependentAlu)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+   agx_index address = agx_preload(b, agx_register(2, AGX_SIZE_64));
+   agx_index w = agx_preload(b, agx_register(6, AGX_SIZE_32));
+   agx_index acc[4];
+   for (unsigned c = 0; c < 4; ++c)
+      acc[c] = agx_mov_imm(b, 32, 0);
+
+   for (unsigned i = 0; i < 6; ++i) {
+      agx_index vec = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_device_load_to(b, vec, address, agx_immediate(i * 16),
+                         AGX_FORMAT_I32, 0xf, 0, false);
+      agx_instr *split = agx_split(b, 4, vec);
+      for (unsigned c = 0; c < 4; ++c)
+         split->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+      for (unsigned c = 0; c < 4; ++c) {
+         agx_index scaled = agx_fmul(b, split->dest[c], w);
+         acc[c] = agx_ffma(b, scaled, w, acc[c]);
+      }
+   }
+   agx_index total = agx_fadd(b, agx_fadd(b, acc[0], acc[1]),
+                              agx_fadd(b, acc[2], acc[3]));
+   agx_unit_test(b, total);
+
+   agx_ilp_schedule(b->shader);
+   const unsigned in_flight = max_device_loads_in_flight(s.body);
+   EXPECT_GE(in_flight, 2u);
+   EXPECT_LE(in_flight, 4u);
+
+   /* Verify that the first two FMULs issue before the first FFMA (interleaving
+    * independent chains instead of completing lane 0's FMUL->FFMA before lane 1). */
+   unsigned fmuls_before_first_ffma = 0;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_FFMA)
+         break;
+      fmuls_before_first_ffma += I->op == AGX_OPCODE_FMUL;
+   }
+   EXPECT_GE(fmuls_before_first_ffma, 2u);
+   ralloc_free(s.mem);
+}
