@@ -420,6 +420,13 @@ hk_g17p_sparse_vertex_outputs(const struct shader_info *info,
  * multiple hardware hk_shader's, built at shader compile time. This complexity
  * implements the legacy geometry pipeline and native sample-count variants.
  */
+#include "hk_byte_stencil.h"
+
+struct hk_byte_stencil_variant {
+   struct hk_byte_stencil_plan plan;
+   struct hk_shader shader;
+};
+
 struct hk_api_shader {
    struct vk_shader vk;
 
@@ -464,6 +471,10 @@ struct hk_api_shader {
    /* Non-NULL for a fragment shader whose depth/stencil feedback loop is only
     * known at draw time: what its zs_self_dep twin compiles from. */
    struct hk_border_source *fbl_source;
+
+   /* Non-NULL for a compute shader matched as a separable 1D byte-image
+    * stencil: holds the dispatch validation plan and compiled tiled variant. */
+   struct hk_byte_stencil_variant *byte_stencil;
 
    struct hk_shader variants[];
 };

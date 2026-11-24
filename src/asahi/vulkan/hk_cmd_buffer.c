@@ -1679,6 +1679,15 @@ hk_push_constants(UNUSED struct hk_cmd_buffer *cmd,
                   struct hk_descriptor_state *desc,
                   const VkPushConstantsInfoKHR *info)
 {
+   const uint32_t first_dw = info->offset >> 2;
+   const uint32_t dw_count = info->size >> 2;
+   if (first_dw < 64 && dw_count > 0) {
+      const uint32_t clamped = MIN2(dw_count, 64 - first_dw);
+      const uint64_t mask =
+         clamped == 64 ? UINT64_MAX : ((UINT64_C(1) << clamped) - 1);
+      desc->push_written_dwords |= mask << first_dw;
+   }
+
    /* D3D translation layers re-push unchanged constants before most draws.
     * While the root is clean the uploaded root holds exactly these bytes, so
     * an identical push changes nothing; keep the root and every preparation

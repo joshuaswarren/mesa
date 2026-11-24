@@ -12,6 +12,7 @@ hk_files = files(
   'hk_buffer_view.c',
   'hk_bvh_depth_core.c',
   'hk_bvh_depth_core.h',
+  'hk_byte_stencil.h',
   'hk_buffer_view.h',
   'hk_bvh.h',
   'hk_cmd_buffer.c',
@@ -75,6 +76,7 @@ hk_files = files(
   'hk_nir_vertex_preamble.c',
   'hk_nir_vertex_preamble.h',
   'hk_nir_root_size.c',
+  'hk_nir_tile_byte_stencil.c',
   'hk_nir_lower_ray_queries.c',
   'hk_nir_lower_robust_image.c',
   'hk_nir_lower_robust_image.h',
@@ -1358,6 +1360,12 @@ if with_tests
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]),
+    timeout : 30, suite : ['asahi'])
+  test('hk_byte_stencil', executable('hk_byte_stencil_test',
+    files('tests/test-hk-byte-stencil.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk, libasahi_compiler]),
     timeout : 30, suite : ['asahi'])
 endif
 
