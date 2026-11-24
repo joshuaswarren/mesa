@@ -1135,6 +1135,7 @@ create_program(struct zink_context *ctx, bool is_compute)
    u_rwlock_init(&pg->pipeline_cache_lock);
    util_queue_fence_init(&pg->cache_fence);
    pg->is_compute = is_compute;
+   pg->is_robust = (ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS) > 0;
    pg->precompile_done = true;
    pg->ctx = ctx;
    return (void*)pg;
@@ -1381,7 +1382,10 @@ gfx_program_init(struct zink_context *ctx, struct zink_gfx_program *prog)
    }
 
    if (screen->optimal_keys) {
-      if (is_mesh)
+      if (screen->have_pipeline_robustness && prog->base.is_robust) {
+         bool generated_tcs = prog->shaders[MESA_SHADER_TESS_CTRL] && prog->shaders[MESA_SHADER_TESS_CTRL]->non_fs.is_generated;
+         prog->libs = is_mesh ? create_lib_cache_mesh(prog) : create_lib_cache(prog, generated_tcs);
+      } else if (is_mesh)
          prog->libs = find_or_create_lib_cache_mesh(screen, prog);
       else
          prog->libs = find_or_create_lib_cache(screen, prog);
@@ -1457,7 +1461,8 @@ create_gfx_program_separable(struct zink_context *ctx, struct zink_shader **stag
    if (!is_separate ||
        /* TODO: maybe try variants? grimace */
        !is_default ||
-       !can_gpl)
+       !can_gpl ||
+       (screen->have_pipeline_robustness && (ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS)))
       return zink_create_gfx_program(ctx, stages, vertices_per_patch, hash, is_mesh);
    for (unsigned i = 0; i < MESA_SHADER_MESH_STAGES; i++) {
       /* ensure async shader creation is done */
@@ -1742,7 +1747,7 @@ create_compute_program(struct zink_context *ctx, nir_shader *nir)
    comp->has_variable_shared_mem = nir->info.cs.has_variable_shared_mem;
    comp->base.can_precompile = !comp->use_local_size &&
                                (screen->info.have_EXT_non_seamless_cube_map || !zink_shader_has_cubes(nir)) &&
-                               (screen->info.rb2_feats.robustImageAccess2 || !(ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS));
+                               (screen->pdev_robustness.image_access2 || !(ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS));
    _mesa_hash_table_init(&comp->pipelines, comp->base.ralloc_ctx, NULL, comp->use_local_size ?
                                                        equals_compute_pipeline_state_local_size :
                                                        equals_compute_pipeline_state);
@@ -1909,9 +1914,12 @@ zink_destroy_compute_program(struct zink_screen *screen,
 }
 
 ALWAYS_INLINE static bool
-compute_can_shortcut(const struct zink_compute_program *comp)
+compute_can_shortcut(const struct zink_screen *screen,
+                     const struct zink_compute_program *comp,
+                     const struct zink_compute_pipeline_state *state)
 {
-   return !comp->use_local_size && !comp->curr->num_uniforms && !comp->curr->has_nonseamless;
+   return !comp->use_local_size && !comp->curr->num_uniforms && !comp->curr->has_nonseamless &&
+          (!screen->have_pipeline_robustness || comp->base.is_robust == !!state->robust);
 }
 
 VkPipeline
@@ -1936,7 +1944,7 @@ zink_get_compute_pipeline(struct zink_screen *screen,
    }
 
    util_queue_fence_wait(&comp->base.cache_fence);
-   if (comp->base_pipeline && compute_can_shortcut(comp)) {
+   if (comp->base_pipeline && compute_can_shortcut(screen, comp, state)) {
       state->pipeline = comp->base_pipeline;
       return state->pipeline;
    }
@@ -1960,7 +1968,7 @@ zink_get_compute_pipeline(struct zink_screen *screen,
       }
 
       zink_screen_update_pipeline_cache(screen, &comp->base, false);
-      if (compute_can_shortcut(comp)) {
+      if (compute_can_shortcut(screen, comp, state)) {
          simple_mtx_unlock(&comp->cache_lock);
          /* don't add base pipeline to cache */
          state->pipeline = comp->base_pipeline = pipeline;
@@ -2382,6 +2390,7 @@ zink_get_subgroup_size_for_block(struct zink_screen *screen, struct zink_compute
    uint32_t subgroup_sizes = 0;
    if (screen->info.have_KHR_pipeline_executable_properties) {
       struct zink_compute_pipeline_state pipeline_state = {
+         .robust = comp->base.is_robust,
          .dirty = true,
          .local_size = { block[0], block[1], block[2] },
          .variable_shared_mem = 0, // TODO?,

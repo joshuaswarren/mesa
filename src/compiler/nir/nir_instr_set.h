@@ -67,6 +67,37 @@ nir_instr_set_add_or_rewrite(struct set *instr_set, nir_instr *instr,
  */
 void nir_instr_set_remove(struct set *instr_set, nir_instr *instr);
 
+#define NIR_CSE_INSTR_SET_INLINE_CAP 128
+
+/**
+ * Compact power-of-2 open-addressed linear-probing instruction set for
+ * insertion-only CSE passes. Stores 32-bit non-zero hashes separately from
+ * instruction pointers so probing inspects up to 16 hashes per cache line
+ * without prime modulo, tombstones, or indirect hash/equality callbacks.
+ */
+struct nir_cse_instr_set {
+   uint32_t *hashes;
+   nir_instr **instrs;
+   uint32_t capacity;
+   uint32_t count;
+   uint32_t max_entries;
+   uint32_t inline_hashes[NIR_CSE_INSTR_SET_INLINE_CAP];
+   nir_instr *inline_instrs[NIR_CSE_INSTR_SET_INLINE_CAP];
+};
+
+void nir_cse_instr_set_init(struct nir_cse_instr_set *set,
+                            uint32_t expected_entries);
+void nir_cse_instr_set_fini(struct nir_cse_instr_set *set);
+void nir_cse_instr_set_clear(struct nir_cse_instr_set *set);
+
+nir_instr *
+nir_cse_instr_set_add_or_rewrite(struct nir_cse_instr_set *set,
+                                 nir_instr *instr,
+                                 nir_intrin_filter_cb allow_additional_intrin,
+                                 const void *intrin_data,
+                                 bool (*cond_function)(const nir_instr *a,
+                                                       const nir_instr *b));
+
 /*@}*/
 
 #endif /* NIR_INSTR_SET_H */

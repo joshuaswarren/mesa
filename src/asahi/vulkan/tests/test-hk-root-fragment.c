@@ -17,17 +17,41 @@ static uint64_t checks;
 
 /* Independent reference: select by comparing the actual published roots. */
 static uint64_t
-fresh_select(struct hk_graphics_state *gfx, uint8_t reads)
+fresh_select(struct hk_graphics_state *gfx, uint8_t reads,
+             uint32_t required_size)
 {
    const uint8_t hidden = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
                           HK_ROOT_READS_DYNAMIC_BUFFERS;
+   const uint32_t full = sizeof(struct hk_root_descriptor_table);
+   const uint32_t req = required_size ? MIN2(required_size, full) : full;
+   const uint32_t cur_size = gfx->root_size ? MIN2(gfx->root_size, full) : full;
+   const uint32_t prev_size =
+      gfx->fs_root_size ? MIN2(gfx->fs_root_size, full) : full;
    if (gfx->fs_root && gfx->fs_root != gfx->root && gfx->root_cpu &&
-       !(reads & hidden) &&
-       hk_root_matches_for_fragment(gfx->fs_root_cpu, gfx->root_cpu))
+       prev_size >= req && !(reads & hidden) &&
+       hk_root_matches_for_fragment(gfx->fs_root_cpu, prev_size, gfx->root_cpu,
+                                    cur_size) &&
+       (!(reads & HK_ROOT_READS_PUSH) ||
+        hk_root_matches_push(gfx->fs_root_cpu, prev_size, gfx->root_cpu,
+                             cur_size)))
       return gfx->fs_root;
    gfx->fs_root = gfx->root;
    gfx->fs_root_cpu = gfx->root_cpu;
+   gfx->fs_root_size = gfx->root_size;
    return gfx->root;
+}
+
+static void
+select_and_check_size(struct hk_graphics_state *fresh,
+                      struct hk_graphics_state *cached, uint8_t reads,
+                      uint32_t required_size, bool memo, bool shadow)
+{
+   CHECK(fresh_select(fresh, reads, required_size) ==
+         hk_agx3_fragment_root_select(cached, reads, required_size, memo,
+                                      shadow));
+   CHECK(fresh->fs_root == cached->fs_root);
+   CHECK(fresh->fs_root_cpu == cached->fs_root_cpu);
+   CHECK(fresh->fs_root_size == cached->fs_root_size);
 }
 
 static void
@@ -35,42 +59,63 @@ select_and_check(struct hk_graphics_state *fresh,
                  struct hk_graphics_state *cached, uint8_t reads, bool memo,
                  bool shadow)
 {
-   CHECK(fresh_select(fresh, reads) ==
-         hk_m5_fragment_root_select(cached, reads, memo, shadow));
-   CHECK(fresh->fs_root == cached->fs_root);
-   CHECK(fresh->fs_root_cpu == cached->fs_root_cpu);
+   select_and_check_size(fresh, cached, reads, 0, memo, shadow);
 }
 
 /* Publication uses a mutable cached CPU source and an immutable GPU copy.
- * Poison skipped dynamic bytes so accidental observation cannot pass. */
+ * Poison skipped dynamic bytes and bytes beyond root_size so accidental
+ * observation cannot pass. */
+static void
+publish_size(struct hk_graphics_state *fresh, struct hk_graphics_state *cached,
+             struct hk_root_descriptor_table *gpu,
+             const struct hk_root_descriptor_table *source,
+             unsigned dynamic_end, uint32_t root_size, uint64_t va,
+             bool shadow)
+{
+   const size_t head =
+      MIN2((size_t)root_size,
+           hk_root_descriptor_offset(dynamic_buffers) +
+              dynamic_end * sizeof(source->dynamic_buffers[0]));
+   const size_t tail = hk_root_descriptor_offset(set_dynamic_buffer_start);
+   memset(gpu, 0xa7, sizeof(*gpu));
+   if (shadow)
+      hk_root_fragment_snapshot_publish(cached, gpu, source, root_size);
+   memcpy(gpu, source, head);
+   if (tail < root_size)
+      memcpy((uint8_t *)gpu + tail, (const uint8_t *)source + tail,
+             root_size - tail);
+   fresh->root = cached->root = va;
+   fresh->root_cpu = cached->root_cpu = gpu;
+   fresh->root_size = cached->root_size = root_size;
+   if (shadow) {
+      size_t out = 0;
+      for (size_t b = 0; b < sizeof(*gpu); ++b) {
+         if (!hk_root_reads_of(b, b + 1)) {
+            const uint8_t expected =
+               b < root_size ? ((const uint8_t *)gpu)[b] : 0;
+            CHECK(cached->root_fragment_snapshot.bytes[out] == expected);
+            ++out;
+         }
+      }
+      CHECK(out == HK_ROOT_FRAGMENT_VISIBLE_SIZE);
+      const size_t push_off = hk_root_descriptor_offset(push);
+      for (size_t i = 0; i < HK_MAX_PUSH_SIZE; ++i) {
+         const size_t b = push_off + i;
+         const uint8_t expected =
+            b < root_size ? ((const uint8_t *)gpu)[b] : 0;
+         CHECK(cached->root_fragment_snapshot.push[i] == expected);
+      }
+   }
+}
+
 static void
 publish(struct hk_graphics_state *fresh, struct hk_graphics_state *cached,
         struct hk_root_descriptor_table *gpu,
         const struct hk_root_descriptor_table *source, unsigned dynamic_end,
         uint64_t va, bool shadow)
 {
-   const size_t head = hk_root_descriptor_offset(dynamic_buffers) +
-                       dynamic_end * sizeof(source->dynamic_buffers[0]);
-   const size_t tail = hk_root_descriptor_offset(set_dynamic_buffer_start);
-   memset(gpu, 0xa7, sizeof(*gpu));
-   if (shadow)
-      hk_root_fragment_snapshot_publish(cached, gpu, source);
-   memcpy(gpu, source, head);
-   memcpy((uint8_t *)gpu + tail, (const uint8_t *)source + tail,
-          sizeof(*gpu) - tail);
-   fresh->root = cached->root = va;
-   fresh->root_cpu = cached->root_cpu = gpu;
-   if (shadow) {
-      size_t out = 0;
-      for (size_t b = 0; b < sizeof(*gpu); ++b) {
-         if (!hk_root_reads_of(b, b + 1)) {
-            CHECK(cached->root_fragment_snapshot.bytes[out] ==
-                  ((const uint8_t *)gpu)[b]);
-            ++out;
-         }
-      }
-      CHECK(out == HK_ROOT_FRAGMENT_VISIBLE_SIZE);
-   }
+   publish_size(fresh, cached, gpu, source, dynamic_end, sizeof(*gpu), va,
+                shadow);
 }
 
 int
@@ -96,12 +141,14 @@ main(void)
                cached->fs_root_fragment_snapshot_cpu;
             ((uint8_t *)&source)[byte] ^= 0x5a;
             publish(fresh, cached, &gpu[1], &source, end, 0x2000, shadow);
-            for (unsigned reads = 0; reads < 8; ++reads) {
+            for (unsigned reads = 0; reads < 16; ++reads) {
                /* Each mask must decide between the old and current roots.
                 * A previous hidden-read selection must not pre-adopt it. */
                fresh->fs_root = cached->fs_root = 0x1000;
                fresh->fs_root_cpu = cached->fs_root_cpu = &gpu[0];
+               fresh->fs_root_size = cached->fs_root_size = sizeof(source);
                cached->fs_root_checked_root = 0;
+               cached->fs_root_checked_push_match = false;
                cached->fs_root_fragment_snapshot = prior;
                cached->fs_root_fragment_snapshot_cpu = prior_cpu;
                select_and_check(fresh, cached, reads, memo, shadow);
@@ -109,6 +156,61 @@ main(void)
             }
          }
       }
+
+      /* Cross-shader memo safety: a non-push FS reusing fs_root across a
+       * push-constant change must not satisfy a subsequent push-reading FS on
+       * the same root; conversely a push-reading FS reusing fs_root across a
+       * vertex-input change must not stale-cache push equality for a later
+       * root whose push constants differ. */
+      memset(fresh, 0, sizeof(*fresh));
+      memset(cached, 0, sizeof(*cached));
+      memset(&source, 0, sizeof(source));
+      publish(fresh, cached, &gpu[0], &source, 0, 0x1000, shadow);
+      select_and_check(fresh, cached, 0, memo, shadow);
+      source.push[0] = 0x33;
+      publish(fresh, cached, &gpu[1], &source, 0, 0x2000, shadow);
+      select_and_check(fresh, cached, 0, memo, shadow);
+      CHECK(cached->fs_root == 0x1000);
+      select_and_check(fresh, cached, HK_ROOT_READS_PUSH, memo, shadow);
+      CHECK(cached->fs_root == 0x2000);
+
+      /* Push-reading FS reuses across a vertex-input change, then a new root
+       * changes push[]: non-push FS reuses, push-reading FS must adopt. */
+      source.draw.attrib_base[0] = 0xdeadbeef0000ull;
+      publish(fresh, cached, &gpu[2], &source, 0, 0x3000, shadow);
+      select_and_check(fresh, cached, HK_ROOT_READS_PUSH, memo, shadow);
+      CHECK(cached->fs_root == 0x2000);
+      select_and_check(fresh, cached, 0, memo, shadow);
+      CHECK(cached->fs_root == 0x2000);
+      source.push[12] = 0x77;
+      publish(fresh, cached, &gpu[3], &source, 0, 0x4000, shadow);
+      select_and_check(fresh, cached, 0, memo, shadow);
+      CHECK(cached->fs_root == 0x2000);
+      select_and_check(fresh, cached, HK_ROOT_READS_PUSH, memo, shadow);
+      CHECK(cached->fs_root == 0x4000);
+
+      /* Trimmed HAL200 roots: reuse holds when fs_root_size covers the
+       * shader's required_size, and is rejected when a later shader requires
+       * bytes beyond the trimmed upload (even if those bytes are zero). */
+      const uint32_t push_off = hk_root_descriptor_offset(push);
+      const uint32_t push16 = push_off + 16;
+      memset(fresh, 0, sizeof(*fresh));
+      memset(cached, 0, sizeof(*cached));
+      memset(&source, 0, sizeof(source));
+      source.sets[0] = 0x12340000;
+      source.push[0] = 1;
+      publish_size(fresh, cached, &gpu[0], &source, 0, push16, 0x1000, shadow);
+      select_and_check_size(fresh, cached, 0, push_off, memo, shadow);
+      CHECK(cached->fs_root == 0x1000);
+      source.push[0] = 2;
+      publish_size(fresh, cached, &gpu[1], &source, 0, push16, 0x2000, shadow);
+      select_and_check_size(fresh, cached, 0, push_off, memo, shadow);
+      CHECK(cached->fs_root == 0x1000);
+      /* Growing to a shader that needs the full root must not reuse push16. */
+      publish_size(fresh, cached, &gpu[2], &source, 0, sizeof(source), 0x3000,
+                   shadow);
+      select_and_check_size(fresh, cached, 0, sizeof(source), memo, shadow);
+      CHECK(cached->fs_root == 0x3000);
 
       /* Every publication-time global and the complete tail are visible. */
       memset(fresh, 0, sizeof(*fresh));
@@ -135,14 +237,14 @@ main(void)
       publish(fresh, cached, &gpu[1], &source, 0, 0x2000, shadow);
       memset(&source, 0x6d, sizeof(source));
       select_and_check(fresh, cached, 0, memo, shadow);
-      select_and_check(fresh, cached, 7, memo, shadow);
+      select_and_check(fresh, cached, 15, memo, shadow);
 
       /* Failed publication retains the old CPU copy while its GPU VA is 0. */
       source.push[0] ^= 1;
       publish(fresh, cached, &gpu[2], &source, 64, 0x3000, shadow);
       fresh->root = cached->root = 0;
       select_and_check(fresh, cached, 0, memo, shadow);
-      select_and_check(fresh, cached, 7, memo, shadow);
+      select_and_check(fresh, cached, 15, memo, shadow);
       cached->root_fragment_snapshot_cpu = NULL;
       select_and_check(fresh, cached, 0, memo, shadow);
 
@@ -152,7 +254,7 @@ main(void)
       memset(&source, 0, sizeof(source));
       publish(fresh, cached, &gpu[0], &source, 0, 0x1000, shadow);
       select_and_check(fresh, cached, 0, memo, shadow);
-      source.push[0] = 1;
+      source.sets[0] = 1;
       publish(fresh, cached, &gpu[1], &source, 0, 0x2000, shadow);
       cached->root_fragment_snapshot_cpu = NULL;
       select_and_check(fresh, cached, 0, memo, shadow);

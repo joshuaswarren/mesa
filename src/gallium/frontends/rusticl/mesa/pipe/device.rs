@@ -60,23 +60,10 @@ fn load_devs() -> impl Iterator<Item = PipeLoaderDevice> {
     devices.into_iter().filter_map(PipeLoaderDevice::new)
 }
 
-fn get_enabled_devs() -> HashMap<String, u32> {
+fn parse_enabled_devs(enabled_devs: &str) -> HashMap<String, u32> {
     let mut res = HashMap::new();
 
-    // we require the type here as this list can be empty depending on the build options
-    let default_devs: &[&str] = &[
-        #[cfg(any(rusticl_enable_asahi, rusticl_enable_auto))]
-        "asahi",
-        #[cfg(any(rusticl_enable_freedreno, rusticl_enable_auto))]
-        "freedreno",
-        #[cfg(any(rusticl_enable_panfrost, rusticl_enable_auto))]
-        "panfrost",
-        #[cfg(rusticl_enable_radeonsi)]
-        "radeonsi",
-    ];
-
     // I wished we could use different iterators, but that's not really working out.
-    let enabled_devs = env::var("RUSTICL_ENABLE").unwrap_or(default_devs.join(","));
     let mut last_driver = None;
     for driver_str in enabled_devs.split(',') {
         if driver_str.is_empty() {
@@ -114,7 +101,30 @@ fn get_enabled_devs() -> HashMap<String, u32> {
         res.insert("panthor".to_owned(), res["panfrost"]);
     }
 
+    if let Some(&mask) = res.get("asahi") {
+        res.entry("aurora".to_owned()).or_insert(mask);
+    } else if let Some(&mask) = res.get("aurora") {
+        res.entry("asahi".to_owned()).or_insert(mask);
+    }
+
     res
+}
+
+fn get_enabled_devs() -> HashMap<String, u32> {
+    // we require the type here as this list can be empty depending on the build options
+    let default_devs: &[&str] = &[
+        #[cfg(any(rusticl_enable_asahi, rusticl_enable_auto))]
+        "asahi",
+        #[cfg(any(rusticl_enable_freedreno, rusticl_enable_auto))]
+        "freedreno",
+        #[cfg(any(rusticl_enable_panfrost, rusticl_enable_auto))]
+        "panfrost",
+        #[cfg(rusticl_enable_radeonsi)]
+        "radeonsi",
+    ];
+
+    let enabled_devs = env::var("RUSTICL_ENABLE").unwrap_or(default_devs.join(","));
+    parse_enabled_devs(&enabled_devs)
 }
 
 pub fn load_screens() -> impl Iterator<Item = PipeScreenWithLdev> {
@@ -134,4 +144,40 @@ pub fn load_screens() -> impl Iterator<Item = PipeScreenWithLdev> {
         }
     })
     .filter_map(PipeLoaderDevice::load_screen)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_enabled_devs;
+
+    #[test]
+    fn asahi_and_aurora_alias_both_ways() {
+        let from_asahi = parse_enabled_devs("asahi");
+        assert_eq!(from_asahi.get("asahi"), Some(&!0));
+        assert_eq!(from_asahi.get("aurora"), Some(&!0));
+
+        let from_aurora = parse_enabled_devs("aurora");
+        assert_eq!(from_aurora.get("aurora"), Some(&!0));
+        assert_eq!(from_aurora.get("asahi"), Some(&!0));
+    }
+
+    #[test]
+    fn asahi_and_aurora_preserve_device_masks() {
+        let from_aurora_0 = parse_enabled_devs("aurora:0");
+        assert_eq!(from_aurora_0.get("aurora"), Some(&1));
+        assert_eq!(from_aurora_0.get("asahi"), Some(&1));
+
+        let explicit_both = parse_enabled_devs("asahi:0,aurora:2");
+        assert_eq!(explicit_both.get("asahi"), Some(&1));
+        assert_eq!(explicit_both.get("aurora"), Some(&4));
+    }
+
+    #[test]
+    fn unrelated_or_empty_enable_leaves_aurora_disabled() {
+        assert!(!parse_enabled_devs("").contains_key("aurora"));
+        let lp = parse_enabled_devs("llvmpipe");
+        assert_eq!(lp.get("swrast"), Some(&!0));
+        assert!(!lp.contains_key("asahi"));
+        assert!(!lp.contains_key("aurora"));
+    }
 }

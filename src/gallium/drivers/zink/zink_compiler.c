@@ -26,6 +26,7 @@
 #include "zink_context.h"
 #include "zink_compiler.h"
 #include "zink_descriptors.h"
+#include "zink_pipeline.h"
 #include "zink_program.h"
 #include "zink_screen.h"
 #include "nir_to_spirv/nir_to_spirv.h"
@@ -3548,6 +3549,12 @@ zink_shader_spirv_compile(struct zink_screen *screen, struct zink_shader *zs, st
    }
 
    sci.sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT;
+   VkPipelineRobustnessCreateInfoEXT prci;
+   if (screen->have_pipeline_robustness) {
+      zink_fill_pipeline_robustness(screen, pg ? pg->is_robust : false, &prci);
+      prci.pNext = sci.pNext;
+      sci.pNext = &prci;
+   }
    sci.flags = VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR;
    if (zs->info.stage == MESA_SHADER_MESH && zs->info.prev_stage != MESA_SHADER_TASK)
       sci.flags |= VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT;

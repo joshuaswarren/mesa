@@ -363,6 +363,12 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
       pci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
    pci.layout = prog->base.layout;
    pci.pNext = &state->rendering_info;
+   VkPipelineRobustnessCreateInfoEXT prci;
+   if (screen->have_pipeline_robustness) {
+      zink_fill_pipeline_robustness(screen, prog->base.is_robust, &prci);
+      prci.pNext = pci.pNext;
+      pci.pNext = &prci;
+   }
    if (!is_mesh) {
       if (needs_vi)
          pci.pVertexInputState = &vertex_input_state;
@@ -429,6 +435,38 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
    return pipeline;
 }
 
+void
+zink_fill_pipeline_robustness(struct zink_screen *screen, bool is_robust,
+                              VkPipelineRobustnessCreateInfoEXT *prci)
+{
+   *prci = (VkPipelineRobustnessCreateInfoEXT){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT,
+   };
+   if (!is_robust) {
+      prci->storageBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+      prci->uniformBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+      prci->vertexInputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+      prci->images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
+   } else {
+      VkPipelineRobustnessBufferBehaviorEXT buf_beh =
+         screen->pdev_robustness.buffer_access2 ?
+            VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT :
+         screen->pdev_robustness.buffer_access ?
+            VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT :
+            VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+      VkPipelineRobustnessImageBehaviorEXT img_beh =
+         screen->pdev_robustness.image_access2 ?
+            VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_2_EXT :
+         screen->pdev_robustness.image_access ?
+            VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT :
+            VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
+      prci->storageBuffers = buf_beh;
+      prci->uniformBuffers = buf_beh;
+      prci->vertexInputs = buf_beh;
+      prci->images = img_beh;
+   }
+}
+
 VkPipeline
 zink_create_compute_pipeline(struct zink_screen *screen, struct zink_compute_program *comp, struct zink_compute_pipeline_state *state)
 {
@@ -437,6 +475,13 @@ zink_create_compute_pipeline(struct zink_screen *screen, struct zink_compute_pro
    pci.layout = comp->base.layout;
    if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB)
       pci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+
+   VkPipelineRobustnessCreateInfoEXT prci;
+   if (screen->have_pipeline_robustness) {
+      zink_fill_pipeline_robustness(screen, state ? !!state->robust : comp->base.is_robust, &prci);
+      prci.pNext = pci.pNext;
+      pci.pNext = &prci;
+   }
 
    VkPipelineShaderStageCreateInfo stage = {0};
    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -638,7 +683,8 @@ VkPipeline
 zink_create_gfx_pipeline_input(struct zink_screen *screen,
                                struct zink_gfx_pipeline_state *state,
                                const uint8_t *binding_map,
-                               VkPrimitiveTopology primitive_topology)
+                               VkPrimitiveTopology primitive_topology,
+                               bool is_robust)
 {
    VkGraphicsPipelineLibraryCreateInfoEXT gplci = {
       VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
@@ -695,6 +741,12 @@ zink_create_gfx_pipeline_input(struct zink_screen *screen,
    VkGraphicsPipelineCreateInfo pci = {0};
    pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
    pci.pNext = &gplci;
+   VkPipelineRobustnessCreateInfoEXT prci;
+   if (screen->have_pipeline_robustness) {
+      zink_fill_pipeline_robustness(screen, is_robust, &prci);
+      prci.pNext = pci.pNext;
+      pci.pNext = &prci;
+   }
    pci.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
    if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB)
       pci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
@@ -745,7 +797,7 @@ zink_create_mesh_pipeline_input(struct zink_screen *screen)
 }
 
 static VkPipeline
-create_gfx_pipeline_library(struct zink_screen *screen, struct zink_shader_object *objs, unsigned stage_mask, VkPipelineLayout layout, VkPipelineCache pipeline_cache)
+create_gfx_pipeline_library(struct zink_screen *screen, struct zink_shader_object *objs, unsigned stage_mask, VkPipelineLayout layout, VkPipelineCache pipeline_cache, bool is_robust)
 {
    assert(screen->info.have_EXT_extended_dynamic_state && screen->info.have_EXT_extended_dynamic_state2);
    VkPipelineRenderingCreateInfo rendering_info;
@@ -821,6 +873,12 @@ create_gfx_pipeline_library(struct zink_screen *screen, struct zink_shader_objec
    VkGraphicsPipelineCreateInfo pci = {0};
    pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
    pci.pNext = &gplci;
+   VkPipelineRobustnessCreateInfoEXT prci;
+   if (screen->have_pipeline_robustness) {
+      zink_fill_pipeline_robustness(screen, is_robust, &prci);
+      prci.pNext = pci.pNext;
+      pci.pNext = &prci;
+   }
    pci.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
    if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB)
       pci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
@@ -888,7 +946,7 @@ VkPipeline
 zink_create_gfx_pipeline_library(struct zink_screen *screen, struct zink_gfx_program *prog)
 {
    u_rwlock_wrlock(&prog->base.pipeline_cache_lock);
-   VkPipeline pipeline = create_gfx_pipeline_library(screen, prog->objs, prog->stages_present, prog->base.layout, prog->base.pipeline_cache);
+   VkPipeline pipeline = create_gfx_pipeline_library(screen, prog->objs, prog->stages_present, prog->base.layout, prog->base.pipeline_cache, prog->base.is_robust);
    u_rwlock_wrunlock(&prog->base.pipeline_cache_lock);
    return pipeline;
 }
@@ -896,7 +954,7 @@ zink_create_gfx_pipeline_library(struct zink_screen *screen, struct zink_gfx_pro
 VkPipeline
 zink_create_gfx_pipeline_separate(struct zink_screen *screen, struct zink_shader_object *objs, VkPipelineLayout layout, mesa_shader_stage stage)
 {
-   return create_gfx_pipeline_library(screen, objs, BITFIELD_BIT(stage), layout, VK_NULL_HANDLE);
+   return create_gfx_pipeline_library(screen, objs, BITFIELD_BIT(stage), layout, VK_NULL_HANDLE, false);
 }
 
 VkPipeline
@@ -954,7 +1012,7 @@ zink_find_or_create_input_dynamic(struct zink_context *ctx, VkPrimitiveTopology 
    if (!he) {
       struct zink_gfx_input_key *ikey = rzalloc(ctx, struct zink_gfx_input_key);
       ikey->idx = ctx->gfx_pipeline_state.idx;
-      ikey->pipeline = zink_create_gfx_pipeline_input(zink_screen(ctx->base.screen), &ctx->gfx_pipeline_state, NULL, vkmode);
+      ikey->pipeline = zink_create_gfx_pipeline_input(zink_screen(ctx->base.screen), &ctx->gfx_pipeline_state, NULL, vkmode, (ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS) > 0);
       he = _mesa_set_add_pre_hashed(&ctx->gfx_inputs, hash, ikey);
    }
    return (struct zink_gfx_input_key *)he->key;
@@ -974,7 +1032,7 @@ zink_find_or_create_input(struct zink_context *ctx, VkPrimitiveTopology vkmode)
       } else {
          memcpy(ikey, &ctx->gfx_pipeline_state.input, offsetof(struct zink_gfx_input_key, pipeline));
       }
-      ikey->pipeline = zink_create_gfx_pipeline_input(zink_screen(ctx->base.screen), &ctx->gfx_pipeline_state, ikey->element_state->binding_map, vkmode);
+      ikey->pipeline = zink_create_gfx_pipeline_input(zink_screen(ctx->base.screen), &ctx->gfx_pipeline_state, ikey->element_state->binding_map, vkmode, (ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS) > 0);
       he = _mesa_set_add_pre_hashed(&ctx->gfx_inputs, hash, ikey);
    }
    return (struct zink_gfx_input_key*)he->key;

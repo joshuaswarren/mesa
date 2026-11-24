@@ -19,6 +19,7 @@ extern "C" {
 
 struct agx_g17p_graphics_template;
 struct agx_m5_graphics_template;
+struct agx_compiled_shader;
 
 struct agx_linked_shader {
    /* Mapped executable memory */
@@ -27,9 +28,17 @@ struct agx_linked_shader {
    /* Gallium-owned, bounded Ioto template cache. Entries are ralloc children
     * of this linked shader and contain no live batch allocations. */
    struct agx_g17p_graphics_template *g17p_graphics_templates;
+   uint32_t g17p_graphics_templates_generated;
 
    /* The same for the M5 family's native programs (agx_state.c). */
    struct agx_m5_graphics_template *m5_graphics_templates;
+
+   /* Gallium-owned: the fragment program compiled from the API shader and
+    * its colour epilog as one (inline blending), which this linked program
+    * runs. It launches with that program's own uniform layout and constant
+    * program. NULL for a split main + epilog link, which launches with the
+    * API shader's. */
+   struct agx_compiled_shader *inline_blend_fs;
 
    /* Exact executable byte count. BO allocations are page-rounded, so the
     * BO size is not a safe disassembler bound. */
@@ -102,6 +111,11 @@ bool agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
                    struct agx_shader_part *prolog,
                    struct agx_shader_part *epilog, unsigned nr_samples_shaded,
                    const uint8_t *uvs_map);
+
+/* Whether an AGX3b fragment program that blends inline (a main compiled with
+ * its colour epilog) opens its pixel transaction with the colour entry gate and
+ * ends it with the final release just before END. */
+bool agx3_fragment_pixel_protocol_proven(const struct agx_shader_part *part);
 
 /* These parts of the vertex element affect the generated code */
 struct agx_velem_key {
@@ -354,6 +368,8 @@ struct agx_fs_epilog_key {
    uint8_t max_sample_size_B;
    /* agx_tilebuffer_layout::resident_mask of the render pass. */
    uint8_t resident_mask;
+   /* agx_tilebuffer_layout::first_mask of the render pass. */
+   uint8_t first_mask;
    bool native_imageblock;
    uint32_t max_bytes_per_tile;
    uint16_t max_samples_per_tile;
@@ -446,6 +462,12 @@ bool agx_nir_lower_g17p_sample_shading_file(
    nir_shader *nir, struct agx_fs_epilog_link_info *link, unsigned samples,
    unsigned registers, bool eight_samples);
 void agx_nir_fs_prolog(struct nir_builder *b, const void *key_);
+
+/* Append a fragment epilog to the end of the fragment main `nir` it was built
+ * for, so that both compile as one program, and turn the main's exports and
+ * the epilog's loads of them into SSA values. Returns false, leaving `nir`
+ * unusable, for any shape the split link does not hand over this way. */
+bool agx_nir_inline_fs_epilog(nir_shader *nir, nir_shader *epilog);
 
 bool agx_nir_gather_vs_inputs(nir_shader *s,
                               BITSET_WORD *attrib_components_read);

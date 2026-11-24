@@ -167,14 +167,6 @@ lower_native_emrt_uniforms(nir_builder *b, nir_intrinsic_instr *intr, void *data
    b->cursor = nir_before_instr(&intr->instr);
 
    if (intr->intrinsic == nir_intrinsic_bindless_image_store) {
-      nir_def *value = intr->src[3].ssa;
-      nir_alu_type type = nir_alu_type_get_base_type(nir_intrinsic_src_type(intr));
-      if (value->bit_size < 32) {
-         value = type == nir_type_float ? nir_f2f32(b, value) :
-                 type == nir_type_int ? nir_i2i32(b, value) : nir_u2u32(b, value);
-         nir_src_rewrite(&intr->src[3], value);
-         nir_intrinsic_set_src_type(intr, type | 32);
-      }
       /* G17P's existing bindless store consumes native 32-byte PBE records,
        * not byte offsets. Descriptor crawls retain their byte handles. */
       nir_intrinsic_instr *handle = nir_src_as_intrinsic(intr->src[0]);
@@ -732,6 +724,8 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
                    key->nr_samples, true, key->max_sample_size_B,
                    key->max_bytes_per_tile, key->max_samples_per_tile,
                    key->resident_mask);
+   if (key->first_mask && !tib.resident_mask)
+      agx_tilebuffer_apply_first_mask(&tib, key->first_mask);
 
    unsigned rt_order[AGX_MAX_RENDER_TARGETS];
    for (unsigned rt = 0; rt < ARRAY_SIZE(rt_order); ++rt)
@@ -1969,4 +1963,138 @@ agx_nir_lower_g17p_sample_shading(nir_shader *nir,
 {
    return agx_nir_lower_g17p_sample_shading_file(nir, link, samples,
                                                  AGX3B_NUM_REGS, false);
+}
+
+/*
+ * Inline blending: append a colour epilog to the fragment main it was built
+ * for, so the backend compiles a single program.
+ *
+ * In a split link, export_agx copies a value into GPRs at the end of the main
+ * and load_exported_agx reads those GPRs at the start of the epilog. Nothing
+ * runs in between, so in one program each such load is the exported value
+ * itself. That holds only for a load of exactly what the main exported, so
+ * this refuses:
+ *
+ *  - a main that reads exported registers itself (a prolog's exports or a
+ *    hardware preload): load_exported_agx must stay in the first block of its
+ *    shader part;
+ *  - an export outside the main's last block, or one overlapping another;
+ *  - a load of an exported register at another width or offset;
+ *  - a load of a register below the colour exports that the main never wrote.
+ *    The split epilog reads whatever the hardware or the prolog left there.
+ *
+ * A colour component the main never wrote is undefined in the API. The split
+ * epilog reads a register nothing wrote, and the single program reads an
+ * undefined value.
+ */
+#define AGX_EXPORT_HALFS 256
+
+bool
+agx_nir_inline_fs_epilog(nir_shader *nir, nir_shader *epilog)
+{
+   assert(nir->info.stage == MESA_SHADER_FRAGMENT);
+   assert(epilog->info.stage == MESA_SHADER_FRAGMENT);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_block *last = nir_impl_last_block(impl);
+   nir_scalar value[AGX_EXPORT_HALFS];
+   uint8_t width[AGX_EXPORT_HALFS] = {0};
+   bool written[AGX_EXPORT_HALFS] = {false};
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_exported_agx)
+            return false;
+         if (intr->intrinsic != nir_intrinsic_export_agx)
+            continue;
+
+         nir_def *v = intr->src[0].ssa;
+         if (block != last || (v->bit_size != 16 && v->bit_size != 32))
+            return false;
+
+         const unsigned step = v->bit_size / 16;
+         for (unsigned c = 0; c < v->num_components; ++c) {
+            const unsigned h = nir_intrinsic_base(intr) + c * step;
+            if (h + step > AGX_EXPORT_HALFS)
+               return false;
+
+            for (unsigned i = 0; i < step; ++i) {
+               if (written[h + i])
+                  return false;
+
+               written[h + i] = true;
+            }
+
+            value[h] = nir_get_scalar(v, c);
+            width[h] = v->bit_size;
+         }
+
+         nir_instr_remove(instr);
+      }
+   }
+
+   /* The epilog runs where the main ends. */
+   struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+   if (!remap)
+      return false;
+
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   nir_inline_function_impl(&b, nir_shader_get_entrypoint(epilog), NULL,
+                            remap);
+   _mesa_hash_table_destroy(remap, NULL);
+
+   /* The main's exports are gone, so every load left is the epilog's. */
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_exported_agx)
+            continue;
+
+         nir_def *def = &intr->def;
+         if (def->bit_size != 16 && def->bit_size != 32)
+            return false;
+
+         const unsigned step = def->bit_size / 16;
+         nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+         b.cursor = nir_before_instr(instr);
+
+         for (unsigned c = 0; c < def->num_components; ++c) {
+            const unsigned h = nir_intrinsic_base(intr) + c * step;
+            if (h + step > AGX_EXPORT_HALFS)
+               return false;
+
+            if (width[h] == def->bit_size) {
+               comps[c] = nir_mov_scalar(&b, value[h]);
+            } else if (written[h] || written[h + step - 1] ||
+                       h < AGX_ABI_FOUT_COLOUR(0)) {
+               return false;
+            } else {
+               comps[c] = nir_undef(&b, 1, def->bit_size);
+            }
+         }
+
+         nir_def_replace(def, nir_vec(&b, comps, def->num_components));
+      }
+   }
+
+   /* What the backend derives from the shader info must cover both parts. */
+   nir->info.outputs_read |= epilog->info.outputs_read;
+   nir->info.outputs_written |= epilog->info.outputs_written;
+   BITSET_OR(nir->info.system_values_read, nir->info.system_values_read,
+             epilog->info.system_values_read);
+   nir->info.writes_memory |= epilog->info.writes_memory;
+   nir->info.fs.uses_discard |= epilog->info.fs.uses_discard;
+   nir->info.fs.uses_fbfetch_output |= epilog->info.fs.uses_fbfetch_output;
+   nir->info.fs.uses_sample_shading |= epilog->info.fs.uses_sample_shading;
+
+   nir_index_ssa_defs(impl);
+   nir_progress(true, impl, nir_metadata_none);
+   return true;
 }

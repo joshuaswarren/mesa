@@ -15,11 +15,16 @@ libasahi_agx_files = files(
   'agx_nir_lower_divmod64.c',
   'agx_nir_lower_atomics.c',
   'agx_nir_opt_factor_const_mul.c',
+  'agx_nir_opt_nonneg_idiv.c',
   'agx_nir_opt_half_bitfield_extract.c',
   'agx_nir_opt_flatten_loads.c',
   'agx_nir_opt_factor_loop_mac.c',
+  'agx_nir_opt_merge_nested_early_exits.c',
+  'agx_nir_opt_narrow_subword_loads.c',
   'agx_nir_opt_select_load.c',
   'agx_nir_opt_licm.c',
+  'agx_nir_opt_uniform_idiv.c',
+  'agx_nir_opt_monotonic_bit_insert.c',
   'agx_nir_opt_sink_loop_sample_uses.c',
   'agx_nir_lower_clip_m1_1.c',
   'agx_nir_lower_cull_distance.c',
@@ -113,6 +118,7 @@ libasahi_agx_files = files(
   'agx_pressure_schedule.c',
   'agx_ir.c',
   'agx_opt_cse.c',
+  'agx_opt_licm.c',
   'agx_opt_break_if.c',
   'agx_opt_empty_else.c',
   'agx_opt_jmp_none.c',
@@ -204,7 +210,8 @@ libasahi_compiler = static_library(
   'asahi_compiler',
   [libasahi_agx_files, agx_opcodes_c, agx_nir_algebraic_c],
   dependencies: [idep_nir, idep_agx_opcodes_h, idep_agx_builder_h, idep_mesautil, idep_libagx],
-  link_with : [libagx3_compose, libagx2_disasm, libagx3c_disasm, libagx3d_disasm],
+  link_with : [libagx3_compose, libagx2_disasm, libagx3b_disasm, libagx3c_disasm,
+               libagx3d_disasm],
   c_args : [no_override_init_args, '-Wno-c2x-extensions',
             '-DAGX3_HAVE_AGX3D_TABLE'],
   gnu_symbol_visibility : 'hidden',
@@ -589,10 +596,36 @@ if with_tests
   )
 
   test(
+    'agx3b_encoding_opts',
+    executable(
+      'agx3b_encoding_opts_test',
+      files('test/test-agx3b-encoding-opts.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'agx3_int64',
     executable(
       'agx3_int64_test',
       files('test/test-agx3-int64.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx_byte_to_float',
+    executable(
+      'agx_byte_to_float_test',
+      files('test/test-agx-byte-to-float.c'),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies : [idep_nir, idep_mesautil],
@@ -702,22 +735,29 @@ if with_tests
          'test/test-minifloat.cpp',
          'test/test-optimizer.cpp',
          'test/test-pressure-cse.cpp',
+         'test/test-ilp-cprog-cap.cpp',
          'test/test-rte-fma.cpp',
          'test/test-image-atomic-metadata.cpp',
          'test/test-ballot-count.cpp',
+         'test/test-agx3-ballot-modifiers.cpp',
          'test/test-border-index.cpp',
          'test/test-aligned-bounds.cpp',
          'test/test-agx2-image-acquire.cpp',
+         'test/test-agx3-shared-fence.cpp',
          'test/test-byte-swap.cpp',
          'test/test-minmax-canonical.cpp',
          'test/test-workgroup-split.cpp',
          'test/test-selected-f2i.cpp',
+         'test/test-flrp-contract.cpp',
+         'test/test-monotonic-bit-insert.cpp',
          'test/test-buffer-format-groups.cpp',
          'test/test-scalarize-int64.cpp',
          'test/test-lower-divmod64.cpp',
          'test/test-spill-fallback.cpp',
          'test/test-agx-register-cache.cpp',
+         'test/test-opt-licm.cpp',
          'test/test-ra-early-kill.cpp',
+         'test/test-ra-uniform-phi.cpp',
          'test/test-rt-register-pressure.cpp',
          'test/test-uniform-remat.cpp',
          'test/test-lower-pseudo.cpp',
@@ -734,6 +774,7 @@ if with_tests
          'test/test-preamble-half-exports.cpp',
          'test/test-demote-early-kill.cpp',
          'test/test-preamble-half-word-exports.cpp',
+         'test/test-preamble-hoist.cpp',
          'test/test-quad-control.cpp',
          'test/test-preamble-priority.cpp',
          'test/test-signed-zero-fma.cpp',
@@ -754,6 +795,8 @@ if with_tests
          'test/test-agx3-integer-lowering.cpp',
          'test/test-agx3-unary-lowering.cpp',
          'test/test-agx3-fsel-uniform.cpp',
+         'test/test-agx3-uniform-comparands.cpp',
+         'test/test-agx3-g17g-retry-select.cpp',
          'test/test-agx3-cube-scratch.cpp',
          'test/test-fminmax-constant-denorm.cpp',
          'test/test-denorm-preserve-fma.cpp',
@@ -773,8 +816,10 @@ if with_tests
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',
          'test/test-factor-const-mul.cpp',
+         'test/test-nonneg-idiv.cpp',
          'test/test-half-bitfield-extract.cpp',
          'test/test-flatten-loads.cpp',
+         'test/test-narrow-subword-loads.cpp',
          'test/test-shared-phase-cse.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
          # in libasahi_lib, which this test does not link.
@@ -783,7 +828,7 @@ if with_tests
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies: [idep_gtest, idep_nir, idep_agx_opcodes_h, idep_agx_builder_h, idep_mesautil],
-      link_with : [libasahi_compiler],
+      link_with : [libasahi_compiler, libagx3b_disasm],
     ),
     suite : ['asahi'],
     protocol : 'gtest',
@@ -926,6 +971,19 @@ if with_tests
   )
 
   test(
+    'agx_nir_merge_nested_early_exits',
+    executable(
+      'agx_nir_merge_nested_early_exits_test',
+      files('test/test-merge-nested-early-exits.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'agx_nir_sink_loop_sample_uses',
     executable(
       'agx_nir_sink_loop_sample_uses_test',
@@ -992,6 +1050,19 @@ if with_tests
     executable(
       'agx3_pso_compile_fastpath_test',
       files('test/test-agx3-pso-compile-fastpath.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx_uniform_idiv',
+    executable(
+      'agx_uniform_idiv_test',
+      files('test/test-agx-uniform-idiv.c'),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies : [idep_nir, idep_mesautil],

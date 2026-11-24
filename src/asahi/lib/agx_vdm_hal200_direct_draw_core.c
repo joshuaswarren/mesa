@@ -10,26 +10,6 @@
 
 #include <string.h>
 
-static bool
-primitive_supported(uint8_t primitive)
-{
-   switch (primitive) {
-   case 0:
-   case 1:
-   case 3:
-   case 5:
-   case 6:
-   case 9:
-   case 11:
-   case 13:
-   case 14:
-   case 15:
-      return true;
-   default:
-      return false;
-   }
-}
-
 bool
 agx_vdm_hal200_direct_draw_body_pack(
    enum agx_chip chip, const struct agx_vdm_hal200_direct_draw_fields *fields,
@@ -39,7 +19,9 @@ agx_vdm_hal200_direct_draw_body_pack(
       memset(out, 0, sizeof(*out));
 
    if (!out || !fields || !agx_chip_native_agx3(chip) ||
-       !primitive_supported(fields->primitive) || fields->vertex_count == 0 ||
+       !agx_vdm_index_list_direct_primitive_supported_inline(
+          fields->primitive) ||
+       fields->vertex_count == 0 ||
        fields->instance_count == 0)
       return false;
 
@@ -160,7 +142,8 @@ agx_vdm_hal200_indexed_draw_body_pack(
    uint32_t size_word;
    if (!out || !fields || !agx_chip_native_agx3(chip) ||
        fields->instance_count == 0 ||
-       !primitive_supported(fields->primitive) ||
+       !agx_vdm_index_list_direct_primitive_supported_inline(
+          fields->primitive) ||
        !agx_vdm_hal200_index_range(
           fields->index_buffer, fields->index_buffer_range_B,
           fields->first_index, fields->index_count, fields->index_size_B,

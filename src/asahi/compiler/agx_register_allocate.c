@@ -500,6 +500,18 @@ find_regs_simple(struct ra_ctx *rctx, enum ra_class cls, unsigned count,
                                   limit, out);
 }
 
+/* A phi reading the uniform file becomes a move from it on that incoming edge
+ * (agx_insert_parallel_copies()), which writes the phi's register. */
+static bool
+phi_reads_uniform(const agx_instr *I)
+{
+   agx_foreach_src(I, s) {
+      if (I->src[s].type == AGX_INDEX_UNIFORM)
+         return true;
+   }
+   return false;
+}
+
 static unsigned
 dest_limit(const struct ra_ctx *rctx, const agx_instr *I, unsigned d)
 {
@@ -522,6 +534,14 @@ dest_limit(const struct ra_ctx *rctx, const agx_instr *I, unsigned d)
    if ((rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
         agx_is_g18g(&rctx->shader->key->dev)) &&
        I->op == AGX_OPCODE_MOV && I->src[0].type == AGX_INDEX_UNIFORM)
+      limit = MIN2(limit, AGX3_COPY_REG16_DEST_HALVES);
+   /* So does the move a phi reading the uniform file becomes on that edge.
+    * G17P's 32-bit uniform copy also names the upper registers; its 16-bit
+    * one, like G18G's at both widths, does not. */
+   if (I->op == AGX_OPCODE_PHI && phi_reads_uniform(I) &&
+       (agx_is_g18g(&rctx->shader->key->dev) ||
+        (rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         I->dest[d].size == AGX_SIZE_16)))
       limit = MIN2(limit, AGX3_COPY_REG16_DEST_HALVES);
    if (rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
        BITSET_TEST(rctx->low_gpr, I->dest[d].value))
@@ -1236,13 +1256,6 @@ pick_transient_texture_region(struct ra_ctx *rctx, agx_instr *I, unsigned d,
  * already used, unless they feed a low-bank collect.
  */
 #define G17P_LOW_BANK_HALVES 128
-
-/* Register budget, in halves, of M5 compute kernels that use native ray
- * traversal. Value from 7c91dddf53f (the M5 userspace snapshot), measured on
- * M5 hardware with the full-resolution RT workload: 160 halves was faster
- * than 128 and 192. Not derived; the snapshot records no numbers.
- */
-#define AGX_M5_RT_REGISTER_BUDGET 160u
 
 static bool
 prefer_high_bank(const struct ra_ctx *rctx, const agx_instr *I, unsigned d,
@@ -2993,8 +3006,9 @@ agx3_tile_store_bank(agx_context *ctx)
     * So size the bank by what the stores actually need, prefix included, and
     * widen to the same halves 0..63 the plain MRT bank below already uses past
     * four targets rather than inventing a third bank. */
-   if (ctx->key->g17p_emrt && ctx->agx3_mrt_tile_ops_ordered &&
-       list_length(&ctx->blocks) > 1) {
+   if ((ctx->key->g17p_emrt && ctx->agx3_mrt_tile_ops_ordered &&
+        list_length(&ctx->blocks) > 1) ||
+       ctx->agx3_local_read_tile_ops) {
       const unsigned prefix = ALIGN_POT(reserved_size(ctx), payload_align);
       return prefix + payload_halves > 32 ? 64 : 32;
    }
@@ -3135,6 +3149,23 @@ ra_file_alignment(agx_context *ctx)
                           util_next_power_of_two(agx_index_size_16(I->dest[d])));
    }
    return alignment;
+}
+
+/* The registers assignment uses for a program with the given demand: as many
+ * as it can without affecting occupancy, which reduces live range splitting.
+ */
+static unsigned
+assignment_file(const agx_context *ctx, unsigned demand, unsigned alignment,
+                unsigned max_possible_regs, bool force_spilling)
+{
+   unsigned regs =
+      agx_occupancy_for_register_count(ALIGN_POT(demand, alignment))
+         .max_registers;
+   if (ctx->key->is_helper || force_spilling)
+      regs = max_possible_regs;
+
+   /* Occupancy rounding must not reach past a smaller register file. */
+   return ROUND_DOWN_TO(MIN2(regs, max_possible_regs), alignment);
 }
 
 /* AGX2 declares a register count with every program, and the hardware splits
@@ -3422,6 +3453,17 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    agx_compute_liveness(ctx);
    unsigned effective_demand = agx_calc_register_demand(ctx, false);
    bool spilling = (effective_demand > max_possible_regs);
+
+   /* A program that fits can keep loop-invariant operands out of its loops,
+    * as long as its demand, and so every decision below, stays the same and
+    * the registers assignment will use keep room for each loop's values. */
+   if (!spilling && !(agx_compiler_debug & AGX_DBG_NOOPT) &&
+       agx_opt_licm(ctx, effective_demand,
+                    assignment_file(ctx, effective_demand,
+                                    ra_file_alignment(ctx), max_possible_regs,
+                                    force_spilling)))
+      effective_demand = agx_calc_register_demand(ctx, false);
+
    bool remat = false;
    const unsigned full_budget = max_possible_regs;
 
@@ -3926,17 +3968,9 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    unsigned demand = ALIGN_POT(effective_demand, reg_file_alignment);
    assert(demand <= max_possible_regs && "Invariant");
 
-   /* Round up the demand to the maximum number of registers we can use without
-    * affecting occupancy. This reduces live range splitting.
-    */
-   unsigned max_regs = agx_occupancy_for_register_count(demand).max_registers;
-   if (ctx->key->is_helper || force_spilling)
-      max_regs = max_possible_regs;
-
-   /* Occupancy rounding must not reach past a smaller register file. */
-   max_regs = MIN2(max_regs, max_possible_regs);
-
-   max_regs = ROUND_DOWN_TO(max_regs, reg_file_alignment);
+   unsigned max_regs =
+      assignment_file(ctx, effective_demand, reg_file_alignment,
+                      max_possible_regs, force_spilling);
 
    /* Or, we can bound tightly for debugging */
    if (agx_compiler_debug & AGX_DBG_DEMAND)
