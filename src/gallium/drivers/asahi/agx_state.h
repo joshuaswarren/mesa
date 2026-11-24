@@ -34,6 +34,7 @@
 #include "util/set.h"
 #include "util/slab.h"
 #include "util/u_atomic.h"
+#include "util/u_queue.h"
 #include "util/u_range.h"
 #include "agx_bg_eot.h"
 #include "agx_helpers.h"
@@ -459,6 +460,20 @@ struct agx_uncompiled_shader {
    /* Set on VS, passed to FS for linkage */
    unsigned base_varying;
 
+   /* Fence signaled once asynchronous shader lowering and precompilation end. */
+   struct util_queue_fence ready;
+
+   /* Owned by the async shader worker until @ready is signaled. */
+   struct {
+      struct agx_screen *screen;
+      nir_shader *nir;
+      struct util_debug_callback debug;
+      mesa_shader_stage next_stage;
+      bool support_lod_bias;
+      bool robust;
+      bool cancelled;
+   } precompile;
+
    /* Tessellation info */
    struct {
       uint64_t per_vertex_outputs;
@@ -471,6 +486,13 @@ struct agx_uncompiled_shader {
       bool point_mode;
    } tess;
 };
+
+static inline void
+agx_shader_wait_ready(struct agx_uncompiled_shader *so)
+{
+   if (so)
+      util_queue_fence_wait(&so->ready);
+}
 
 enum agx_stage_dirty {
    AGX_STAGE_DIRTY_CONST = BITFIELD_BIT(0),
@@ -1338,6 +1360,7 @@ struct agx_screen {
    struct pipe_screen pscreen;
    struct agx_device dev;
    struct disk_cache *disk_cache;
+   struct util_queue shader_compiler_queue;
 
    /* Atomic: a context with unknown completion keeps the device alive. */
    bool submit_quarantined;

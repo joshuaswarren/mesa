@@ -37,6 +37,7 @@
 #include "util/os_misc.h"
 #include "util/simple_mtx.h"
 #include "util/timespec.h"
+#include "util/u_cpu_detect.h"
 #include "util/u_drm.h"
 #include "util/u_gen_mipmap.h"
 #include "util/u_helpers.h"
@@ -2415,6 +2416,18 @@ asahi_clear_buffer(struct pipe_context *pipe, struct pipe_resource *resource,
                           clear_value_size);
 }
 
+static void
+agx_set_debug_callback(struct pipe_context *pctx,
+                       const struct util_debug_callback *cb)
+{
+   struct agx_screen *screen = agx_screen(pctx->screen);
+
+   if (util_queue_is_initialized(&screen->shader_compiler_queue))
+      util_queue_finish(&screen->shader_compiler_queue);
+
+   u_default_set_debug_callback(pctx, cb);
+}
+
 static struct pipe_context *
 agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 {
@@ -2497,7 +2510,7 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    pctx->buffer_subdata = u_default_buffer_subdata;
    pctx->clear_buffer = asahi_clear_buffer;
    pctx->texture_subdata = agx_texture_subdata;
-   pctx->set_debug_callback = u_default_set_debug_callback;
+   pctx->set_debug_callback = agx_set_debug_callback;
    pctx->get_sample_position = u_default_get_sample_position;
    pctx->invalidate_resource = agx_invalidate_resource;
    pctx->memory_barrier = agx_memory_barrier;
@@ -3162,6 +3175,9 @@ agx_destroy_screen(struct pipe_screen *pscreen)
    if (p_atomic_read(&screen->submit_quarantined))
       return;
 
+   if (util_queue_is_initialized(&screen->shader_compiler_queue))
+      util_queue_destroy(&screen->shader_compiler_queue);
+
    drmSyncobjDestroy(screen->dev.fd, screen->flush_syncobj);
 
    if (screen->dev.ro)
@@ -3198,6 +3214,26 @@ static struct disk_cache *
 agx_get_disk_shader_cache(struct pipe_screen *pscreen)
 {
    return agx_screen(pscreen)->disk_cache;
+}
+
+static void
+agx_set_max_shader_compiler_threads(struct pipe_screen *pscreen,
+                                    unsigned max_threads)
+{
+   struct agx_screen *screen = agx_screen(pscreen);
+
+   if (util_queue_is_initialized(&screen->shader_compiler_queue))
+      util_queue_adjust_num_threads(&screen->shader_compiler_queue,
+                                    max_threads, false);
+}
+
+static bool
+agx_is_parallel_shader_compilation_finished(struct pipe_screen *pscreen,
+                                            void *shader,
+                                            mesa_shader_stage shader_type)
+{
+   struct agx_uncompiled_shader *so = shader;
+   return !so || util_queue_fence_is_signalled(&so->ready);
 }
 
 static const struct u_transfer_vtbl transfer_vtbl = {
@@ -3327,6 +3363,10 @@ agx_screen_create(int fd, struct renderonly *ro,
    screen->fence_finish = agx_fence_finish;
    screen->fence_get_fd = agx_fence_get_fd;
    screen->get_disk_shader_cache = agx_get_disk_shader_cache;
+   screen->set_max_shader_compiler_threads =
+      agx_set_max_shader_compiler_threads;
+   screen->is_parallel_shader_compilation_finished =
+      agx_is_parallel_shader_compilation_finished;
    screen->get_cl_cts_version = agx_get_cl_cts_version;
 
    /* G17G iterates no varying with a register coefficient index: have
@@ -3352,6 +3392,14 @@ agx_screen_create(int fd, struct renderonly *ro,
    agx_init_screen_caps(screen);
 
    agx_disk_cache_init(agx_screen);
+
+   const unsigned num_threads =
+      CLAMP(util_get_cpu_caps()->nr_cpus, 1u, 32u);
+   util_queue_init(&agx_screen->shader_compiler_queue, "agx_sh", 64,
+                   num_threads,
+                   UTIL_QUEUE_INIT_RESIZE_IF_FULL |
+                      UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY,
+                   NULL);
 
    /* TODO: Refactor readonly data? */
    {
