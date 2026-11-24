@@ -31,7 +31,7 @@ agx3_m5_mrt_eot_staging_halfs(unsigned targets)
 }
 
 static bool
-m5_mrt_append(uint8_t *bytes, size_t *size, const char *op,
+m5_mrt_append(uint8_t *bytes, size_t *size, enum agx3_mnemonic op,
               const struct agx3_field_kv *fields, unsigned count,
               uint8_t ep, uint8_t expected_length)
 {
@@ -61,7 +61,7 @@ m5_mrt_wire(uint8_t *bytes, size_t *size, unsigned rt, unsigned targets,
       pack[count++] = (struct agx3_field_kv)KV(44, 4);
       pack[count++] = (struct agx3_field_kv)KV(55, rt + 1 == targets);
    }
-   if (!m5_mrt_append(bytes, size, "pack_imgwir", pack, count, 0, 14))
+   if (!m5_mrt_append(bytes, size, AGX3_MN_pack_imgwir, pack, count, 0, 14))
       return false;
    if (targets == 1)
       return true;
@@ -72,7 +72,7 @@ m5_mrt_wire(uint8_t *bytes, size_t *size, unsigned rt, unsigned targets,
          KV(16, xy ? 0 : 2), KV(23, 2), KV(24, 2),
          KV(25, !last), KV(27, last), KV(28, 1), KV(29, 35),
       };
-      if (!m5_mrt_append(bytes, size, "copy", copy, AGX_MRT_ARRAY_SIZE(copy),
+      if (!m5_mrt_append(bytes, size, AGX3_MN_copy, copy, AGX_MRT_ARRAY_SIZE(copy),
                            rt == 0 ? 0 : 1, rt == 0 ? 4 : 8))
          return false;
    }
@@ -94,7 +94,7 @@ m5_mrt_store(uint8_t *bytes, size_t *size, unsigned rt, uint8_t selector,
    unsigned count = 18;
    if (layered)
       img[count++] = (struct agx3_field_kv)KV(31, 2);
-   return m5_mrt_append(bytes, size, "imgwblk", img, count, 0, 12);
+   return m5_mrt_append(bytes, size, AGX3_MN_imgwblk, img, count, 0, 12);
 }
 
 /* Reuse the qualified RT0 array encoding: SR12 is the tile layer, packed
@@ -117,7 +117,7 @@ m5_mrt_layer(uint8_t *bytes, size_t *size)
       KV(23, 2), KV(24, 1), KV(27, 1), KV(38, 1), KV(51, 1),
       KV(52, 2), KV(56, 3), KV(57, 118), KV(59, 1), KV(74, 4),
    };
-   return m5_mrt_append(bytes, size, "pack_imgwir", fields,
+   return m5_mrt_append(bytes, size, AGX3_MN_pack_imgwir, fields,
                         AGX_MRT_ARRAY_SIZE(fields), 0, 14);
 }
 
@@ -306,7 +306,7 @@ agx3_tile_store_f13(enum agx_isa_encoding enc, uint16_t data,
    ov[n++] = (struct agx3_field_kv)KV(57, tile_off);
    n = sample_overrides(sample, ov, n);
    n = wait_overrides(enc, wait_mask, ov, n);
-   if (!agx3_bind_compose(enc, "lstcol", agx3_bind_ep(enc, 0),
+   if (!agx3_bind_compose(enc, AGX3_MN_lstcol, agx3_bind_ep(enc, 0),
                           is_b(enc) ? base_b : base_c, is_b(enc) ? 7 : 8, ov,
                           n, out, len)) {
       memset(out, 0, AGX3_TILE_MAX_LENGTH);
@@ -400,7 +400,7 @@ agx3_tile_load(enum agx_isa_encoding enc, uint16_t dest,
    ov[n++] = (struct agx3_field_kv)KV(78, first ? 1 : 0);
    if (!is_b(enc))
       ov[n++] = (struct agx3_field_kv)KV(74, last ? 2 : 0);
-   if (!agx3_bind_compose(enc, "lldcol", 0, is_b(enc) ? base_b : base_c,
+   if (!agx3_bind_compose(enc, AGX3_MN_lldcol, 0, is_b(enc) ? base_b : base_c,
                           is_b(enc) ? 7 : 8, ov, n, out, len)) {
       memset(out, 0, AGX3_TILE_MAX_LENGTH);
       *len = 0;
@@ -443,7 +443,7 @@ agx3_tile_store_lifetime(enum agx_isa_encoding enc, uint16_t data,
    ov[n++] = (struct agx3_field_kv)KV(57, tile_off);
    n = sample_overrides(sample, ov, n);
    n = wait_overrides(enc, wait_mask, ov, n);
-   if (!agx3_bind_compose(enc, "lstcol", agx3_bind_ep(enc, 0), base_c, 8, ov,
+   if (!agx3_bind_compose(enc, AGX3_MN_lstcol, agx3_bind_ep(enc, 0), base_c, 8, ov,
                           n, out, len)) {
       memset(out, 0, AGX3_TILE_MAX_LENGTH);
       *len = 0;
@@ -490,7 +490,7 @@ agx3_tile_load_g18_mixed(enum agx_isa_encoding enc, uint16_t dest,
    n = sample_overrides(sample, ov, n);
    ov[n++] = (struct agx3_field_kv)KV(78, first ? 1 : 0);
    ov[n++] = (struct agx3_field_kv)KV(74, last ? 2 : 0);
-   if (!agx3_bind_compose(enc, "lldcol", 0, base_c, 8, ov, n, out, len)) {
+   if (!agx3_bind_compose(enc, AGX3_MN_lldcol, 0, base_c, 8, ov, n, out, len)) {
       memset(out, 0, AGX3_TILE_MAX_LENGTH);
       *len = 0;
       return false;

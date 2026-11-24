@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: MIT */
 #pragma once
 #include "compiler/nir/nir.h"
+#include "asahi/lib/agx_vdm_mesh_core.h"
 #include "agx_mesh_abi.h"
 #ifdef __cplusplus
 extern "C" {

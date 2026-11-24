@@ -14,6 +14,7 @@
 #include <assert.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 struct legacy_sampled_image_descriptor {
@@ -601,6 +602,51 @@ check_captured_rgba8_lossless_pbe(void)
 #undef REJECT_COMPRESSED
 }
 
+/* A sampled or storage view's level-zero extent lives in the Gen10 software
+ * word; a validating decode must accept it and give it back. */
+static void
+check_level_zero_extent_round_trip(void)
+{
+   const struct AGX_TEXTURE texture = {
+      AGX_TEXTURE_header,
+      .dimension = AGX_TEXTURE_DIMENSION_2D,
+      .layout = AGX_LAYOUT_GPU,
+      .channels = AGX_CHANNELS_R8G8B8A8,
+      .type = AGX_TEXTURE_TYPE_UNORM,
+      .width = 1920,
+      .height = 1080,
+      .address = 0x80000,
+      .first_level = 1,
+      .last_level = 3,
+      .unk_mipmapped = true,
+   };
+   struct hk_native_texture_descriptor packed;
+   assert(hk_pack_native_texture(10, &packed, &texture));
+   hk_native_texture_set_level_zero_extent(&packed, 960, 540);
+   assert(packed.opaque[AGX_GEN10_IMAGE_EXTENT_OFFSET / 4] ==
+          (960u | (540u << 16)));
+
+   char *log = NULL;
+   size_t log_size = 0;
+   FILE *fp = open_memstream(&log, &log_size);
+   assert(fp);
+   struct AGX_TEXTURE_GEN10 gen10;
+   const bool valid =
+      AGX_TEXTURE_GEN10_unpack(fp, (const uint8_t *)packed.opaque, &gen10);
+   fclose(fp);
+   assert(valid && log_size == 0);
+   free(log);
+   assert(gen10.software_word == (960u | (540u << 16)));
+   assert(gen10.width == 1920 && gen10.height == 1080);
+   assert(gen10.first_level == 1 && gen10.last_level == 3);
+
+   /* Repacking the decoded fields reproduces the descriptor, word 7
+    * included. */
+   uint32_t repacked[8];
+   AGX_TEXTURE_GEN10_pack(repacked, &gen10);
+   assert(!memcmp(repacked, packed.opaque, sizeof(repacked)));
+}
+
 static void
 check_sparse_translation(void)
 {
@@ -734,7 +780,24 @@ check_lossless_layered_packets(void)
       if (layered) {
          REFUSE(p.layers = 0);
          REFUSE(p.layers = 65537);
-         REFUSE(p.levels = 2);
+         if (cases[i].dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY) {
+            p = original;
+            p.level = 1;
+            p.levels = 4;
+            p.unk_mipmapped = true;
+            assert(hk_pack_native_pbe(9, &packed, &p));
+            uint64_t mw[4];
+            memcpy(mw, packed.opaque, sizeof(mw));
+            assert(((mw[0] >> 58) & 1) == 1);
+            assert(((mw[0] >> 59) & 1) == 1);
+            assert((mw[2] & ((UINT64_C(1) << 44) - 1)) ==
+                   (p.acceleration_buffer >> 4));
+            assert(((mw[2] >> 44) & 0xf) == 1);
+            assert(((mw[2] >> 48) & 0xf) == 3);
+            REFUSE(p.levels = 17);
+         } else {
+            REFUSE(p.levels = 2);
+         }
       }
 #undef REFUSE
    }
@@ -805,6 +868,7 @@ int
 main(void)
 {
    check_sparse_translation();
+   check_level_zero_extent_round_trip();
    check_lossless_layered_packets();
    check_buffer_metadata();
    check_layered_multisample_pbe();

@@ -125,9 +125,6 @@ struct agx3_scs_epilogue_desc {
 bool agx3_scs_encode_epilogue(enum agx_isa_encoding enc,
                               const struct agx3_scs_epilogue_desc *desc,
                               uint8_t out[AGX3_SCS_MAX_LENGTH], uint8_t *length);
-bool agx3_scs_decode_epilogue(enum agx_isa_encoding enc, const uint8_t *bytes,
-                              size_t length,
-                              struct agx3_scs_epilogue_desc *out);
 
 /* AGX3b destination-less load, the form every Gen1 leaf program ends with
  * (agx3_rt_gen1_*_ops.h, and the bodies in agx3_rt_gen1_default.c). As on

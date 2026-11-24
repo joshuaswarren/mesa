@@ -282,20 +282,19 @@ hk_resolve_oq_reverse(struct hk_cmd_buffer *cmd)
 bool
 hk_oq_render_stamps_supported(enum agx_chip chip)
 {
-   /* G17P and M5 (G17G/G17S) both run the shared G17 kernel runtime: a render
-    * completes only once its completion stamps cover it, after the
-    * end-of-render maintenance, and the host then writes its four stage
-    * timestamps into the requested slots before signalling the fence
-    * (g17/queue/render/retirement.rs, g17/completion.rs). */
-   return chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip);
+   /* Native HAL200 (G16G/G17P) and M5 (G17G/G17S/G17C) kernel runtimes publish
+    * a render's four stage timestamps only after full retirement (including
+    * end-of-render maintenance) before signalling the fence
+    * (g16/poll.rs, g17/queue/render/retirement.rs, g17/completion.rs). */
+   return agx_chip_native_hal200(chip) || agx_chip_g17_m5(chip);
 }
 
 void
 hk_resolve_deferred_oq_available(struct hk_cmd_buffer *cmd)
 {
-   /* The reverse order is qualified on G17P; the other native AGX3 chips keep
-    * recording order until it is measured there. */
-   if (hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P)
+   /* Reverse order applies across native HAL200 chips; G15 keeps recording
+    * order until measured there. */
+   if (agx_chip_native_hal200(hk_cmd_buffer_device(cmd)->dev.chip))
       hk_resolve_oq_reverse(cmd);
    else
       hk_resolve_oq_forward(cmd);

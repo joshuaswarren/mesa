@@ -78,6 +78,34 @@ lower_pack = [
      ('pack_32_2x16_split', ('ior', ('u2u16', a), ('ishl', ('u2u16', b), 8)),
                             ('ior', ('u2u16', c), ('ishl', ('u2u16', d), 8)))),
 
+    # Recognize open-coded 4x8 -> 32-bit byte packing of zero-extended bytes
+    # and lower identically to pack_32_4x8_split, avoiding << 16 / << 24 shift
+    # immediates and halving live register width. Inner iors require
+    # is_used_once so multi-use partial words do not stay live alongside the
+    # rewritten 16-bit chain. Covers left-associative (including commuted
+    # d<<24 | (c<<16 | (b<<8 | a))), balanced, and right-associative
+    # a | (b<<8 | (c<<16 | d<<24)) trees.
+    (('ior', ('ior(is_used_once)',
+              ('ior(is_used_once)', ('u2u32', 'a@8'),
+                                    ('ishl', ('u2u32', 'b@8'), 8)),
+              ('ishl', ('u2u32', 'c@8'), 16)),
+             ('ishl', ('u2u32', 'd@8'), 24)),
+     ('pack_32_2x16_split', ('ior', ('u2u16', a), ('ishl', ('u2u16', b), 8)),
+                            ('ior', ('u2u16', c), ('ishl', ('u2u16', d), 8)))),
+    (('ior', ('ior(is_used_once)', ('u2u32', 'a@8'),
+                                   ('ishl', ('u2u32', 'b@8'), 8)),
+             ('ior(is_used_once)', ('ishl', ('u2u32', 'c@8'), 16),
+                                   ('ishl', ('u2u32', 'd@8'), 24))),
+     ('pack_32_2x16_split', ('ior', ('u2u16', a), ('ishl', ('u2u16', b), 8)),
+                            ('ior', ('u2u16', c), ('ishl', ('u2u16', d), 8)))),
+    (('ior', ('u2u32', 'a@8'),
+             ('ior(is_used_once)',
+              ('ishl', ('u2u32', 'b@8'), 8),
+              ('ior(is_used_once)', ('ishl', ('u2u32', 'c@8'), 16),
+                                    ('ishl', ('u2u32', 'd@8'), 24)))),
+     ('pack_32_2x16_split', ('ior', ('u2u16', a), ('ishl', ('u2u16', b), 8)),
+                            ('ior', ('u2u16', c), ('ishl', ('u2u16', d), 8)))),
+
     # A half taken from a word and narrowed again (u2u16(extract_u16(x, 1)),
     # as the cooperative matrix lowering builds an operand from a 32-bit
     # load) is the half itself. Without this the u2u32 of the rewrite below
@@ -94,6 +122,17 @@ lower_pack = [
     # For optimizing extract->convert sequences for unpack/pack norm
     (('u2f32', ('u2u32', a)), ('u2f32', a)),
     (('i2f32', ('i2i32', a)), ('i2f32', a)),
+
+    # A value zero-extended from 8 or 16 bits is non-negative as a signed
+    # integer, so its signed conversion is the unsigned conversion of the
+    # narrow value, which reads the half register directly instead of
+    # widening it first (SPIR-V's OpUConvert of a byte, then OpConvertSToF).
+    # Only for a byte loaded on its own: one taken from a word, a four-byte
+    # load included, converts better through the word (fold_ubyte_to_float,
+    # fold_w8_word_unpack()).
+    (('i2f32', ('u2u32', 'a@8(is_scalar_intrinsic_result)')), ('u2f32', a)),
+    (('i2f32', ('u2u32', 'a@16')), ('u2f32', a)),
+    (('i2f16', ('u2u16', 'a@8(is_scalar_intrinsic_result)')), ('u2f16', a)),
 
     # Chew through some 8-bit before the backend has to deal with it
     (('f2u8', a), ('u2u8', ('f2u16', a))),
@@ -158,7 +197,20 @@ opt_selects = [
 ]
 
 # When the ior/iand is used multiple times, we can instead fuse the other way.
+# Prefer placing a fusable comparison on the bcsel condition when the other
+# operand is not a fusable comparison (e.g. an accumulated bcsel/ior chain),
+# so `acc || (x < bound)` lowers to one icmpsel/fcmpsel instead of two.
 opt_selects.extend([
+        (('iand', ('inot', 'a@1(agx_is_fusable_cmp)'), 'b@1(agx_is_not_fusable_cmp)'),
+         ('bcsel', a, False, b)),
+        (('iand', 'a@1(agx_is_fusable_cmp)', 'b@1(agx_is_not_fusable_cmp)'),
+         ('bcsel', a, b, False)),
+
+        (('ior', ('inot', 'a@1(agx_is_fusable_cmp)'), 'b@1(agx_is_not_fusable_cmp)'),
+         ('bcsel', a, b, True)),
+        (('ior', 'a@1(agx_is_fusable_cmp)', 'b@1(agx_is_not_fusable_cmp)'),
+         ('bcsel', a, True, b)),
+
         (('iand', ('inot', 'a@1'), b), ('bcsel', a, False, b)),
         (('iand', 'a@1', b), ('bcsel', a, b, False)),
 
@@ -455,6 +507,23 @@ fold_selected_f2i32 = [
      ('f2i32', ('bcsel', a, b, c))),
 ]
 
+# Contract inexact linear interpolation a*(1 - t) + b*t (and its FMA form
+# ffma(1 - t, a, b*t)) into ffma(t, b - a, a), cutting 4 ops to 2 (fneg is a
+# free source modifier on AGX3 f32add). Only non-exact (~) ops without
+# SignedZeroInfNanPreserve (nnan,ninf,nsz) match, preserving precise /
+# NoContraction and VK_KHR_shader_float_controls semantics.
+opt_flrp_contract = [
+    (('~ffma(nnan,ninf,nsz)',
+      ('~fadd(nnan,ninf,nsz)', 1.0, ('fneg', 't')), 'a',
+      ('~fmul(is_used_once,nnan,ninf,nsz)', 't', 'b')),
+     ('ffma', 't', ('fadd', 'b', ('fneg', 'a')), 'a')),
+    (('~fadd(nnan,ninf,nsz)',
+      ('~fmul(is_used_once,nnan,ninf,nsz)',
+       ('~fadd(nnan,ninf,nsz)', 1.0, ('fneg', 't')), 'a'),
+      ('~fmul(is_used_once,nnan,ninf,nsz)', 't', 'b')),
+     ('ffma', 't', ('fadd', 'b', ('fneg', 'a')), 'a')),
+]
+
 # A sign-extended byte converted to float: (x << (24 - 8k)) >> 24 is three
 # instructions on M5 (insert, arithmetic shift, word conversion). int2flt has a
 # signed-byte form that reads the low eight bits of a half register, so convert
@@ -540,8 +609,44 @@ def run():
 
     print('#include "agx_nir.h"')
     print('#include "agx_nir_aligned_bounds.h"')
+    print('#include "agx_nir_algebraic_helpers.h"')
     print('#include "nir.h"')
+    print('#include "nir_search.h"')
     print("""
+static bool
+agx_is_fusable_cmp(UNUSED const nir_search_state *state,
+                   const nir_alu_instr *instr, unsigned src,
+                   UNUSED unsigned num_components,
+                   UNUSED const uint8_t *swizzle)
+{
+   nir_alu_instr *src_alu = nir_src_as_alu(instr->src[src].src);
+   if (!src_alu || src_alu->def.num_components != 1)
+      return false;
+   switch (src_alu->op) {
+   case nir_op_ilt:
+   case nir_op_ige:
+   case nir_op_ult:
+   case nir_op_uge:
+   case nir_op_ieq:
+   case nir_op_ine:
+   case nir_op_flt:
+   case nir_op_fge:
+   case nir_op_feq:
+   case nir_op_fneu:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+agx_is_not_fusable_cmp(UNUSED const nir_search_state *state,
+                       const nir_alu_instr *instr, unsigned src,
+                       unsigned num_components, const uint8_t *swizzle)
+{
+   return !agx_is_fusable_cmp(state, instr, src, num_components, swizzle);
+}
+
 static bool
 agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
 {
@@ -614,7 +719,8 @@ agx_u8_absdiff_uses_match(const nir_alu_instr *instr)
                                       fuse_extr + fuse_ubfe +
                                       fuse_imad + ixor_bcsel +
                                       fold_aligned_bounds + fold_byte_swap +
-                                      fold_selected_f2i32).render())
+                                      fold_selected_f2i32 +
+                                      opt_flrp_contract).render())
 
 
 if __name__ == '__main__':

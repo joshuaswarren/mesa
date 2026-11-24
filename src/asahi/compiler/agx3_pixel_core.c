@@ -85,7 +85,7 @@ agx3_pixel_colour_entry(enum agx_isa_encoding enc,
 
    const struct agx3_field_kv fields[] = {KV(14, 512), KV(15, 1)};
    const struct agx3_field_kv base_c[] = {KV(16, 3), KV(17, 122)};
-   if (!agx3_bind_compose(enc, "pixwait", agx3_bind_ep(enc, 0), fields,
+   if (!agx3_bind_compose(enc, AGX3_MN_pixwait, agx3_bind_ep(enc, 0), fields,
                           NELEM(fields), is_b(enc) ? NULL : base_c,
                           is_b(enc) ? 0 : NELEM(base_c),
                           out, len)) {
@@ -111,7 +111,7 @@ agx3_pixel_colour_entry_zs_unreleased(enum agx_isa_encoding enc,
 
    const struct agx3_field_kv fields[] = {KV(14, 512), KV(15, 1), KV(34, 1)};
    const struct agx3_field_kv base_c[] = {KV(16, 3), KV(17, 122)};
-   if (!agx3_bind_compose(enc, "pixwait", 0, fields, NELEM(fields), base_c,
+   if (!agx3_bind_compose(enc, AGX3_MN_pixwait, 0, fields, NELEM(fields), base_c,
                           NELEM(base_c), out, len)) {
       memset(out, 0, AGX3_PIXEL_MAX_LENGTH);
       *len = 0;
@@ -142,7 +142,7 @@ agx3_pixel_atomic_acquire(enum agx_isa_encoding enc,
 
    const struct agx3_field_kv fields[] = {KV(14, 4), KV(34, 0)};
    const struct agx3_field_kv base_c[] = {KV(16, 3), KV(17, 122)};
-   if (!agx3_bind_compose(enc, "pixwait", 0,
+   if (!agx3_bind_compose(enc, AGX3_MN_pixwait, 0,
                           is_b(enc) ? fields : base_c,
                           is_b(enc) ? 1 : NELEM(base_c),
                           is_b(enc) ? NULL : fields,
@@ -166,7 +166,7 @@ agx3_pixel_atomic_barrier(enum agx_isa_encoding enc,
       return false;
 
    const struct agx3_field_kv fields[] = {KV(24, 1), KV(30, 3), KV(39, 1)};
-   if (!agx3_bind_compose(enc, "barrier", 0, fields, NELEM(fields), NULL, 0,
+   if (!agx3_bind_compose(enc, AGX3_MN_barrier, 0, fields, NELEM(fields), NULL, 0,
                           out, len) ||
        *len != AGX3_PIXEL_MAX_LENGTH) {
       memset(out, 0, AGX3_PIXEL_MAX_LENGTH);
@@ -225,7 +225,7 @@ agx3_pixel_wait(enum agx_isa_encoding enc, uint32_t writeout,
    ov[n++] = (struct agx3_field_kv)KV(34, writeout == 1 ? 0 : 1);
    n = wait_overrides(enc, wait_mask, 18, ov, n);
 
-   if (!agx3_bind_compose(enc, "pixwait", agx3_bind_ep(enc, 0),
+   if (!agx3_bind_compose(enc, AGX3_MN_pixwait, agx3_bind_ep(enc, 0),
                           is_b(enc) ? NULL : base_c,
                           is_b(enc) ? 0 : NELEM(base_c), ov, n, out,
                           len)) {
@@ -263,7 +263,7 @@ agx3_pixel_release(enum agx_isa_encoding enc, uint32_t writeout, bool last,
    ov[n++] = (struct agx3_field_kv)KV(14, writeout | (last ? 0x200u : 0u));
    n = wait_overrides(enc, wait_mask, 17, ov, n);
 
-   if (!agx3_bind_compose(enc, "pixrel", agx3_bind_ep(enc, 0),
+   if (!agx3_bind_compose(enc, AGX3_MN_pixrel, agx3_bind_ep(enc, 0),
                           is_b(enc) ? NULL : base_c,
                           is_b(enc) ? 0 : NELEM(base_c), ov, n, out,
                           len)) {

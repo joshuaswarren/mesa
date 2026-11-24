@@ -132,7 +132,7 @@ hk_cmd_bo_create(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
     * through a draw. These BOs are recycled by the command pool, so populate
     * and initialize their shared mappings once at creation; subsequent command
     * buffers reuse already-resident pages without adding per-draw work. */
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
+   if (agx_chip_native_or_m5(dev->dev.chip)) {
       memset(bo->map, 0, bo->bo->size);
       if (hk_g17p_cached_cmd_memory(&dev->dev))
          util_flush_range(bo->map, bo->bo->size);
@@ -165,20 +165,37 @@ hk_cmd_bo_destroy(struct hk_device *dev, UNUSED const VkAllocationCallbacks *all
    vk_free(&dev->vk.alloc, bo);
 }
 
+static bool
+hk_cmd_slab_is_gpu_only(enum hk_cmd_slab_class class)
+{
+   return class == HK_CMD_SLAB_VDM_GPU || class == HK_CMD_SLAB_IOTO_GPU ||
+          class == HK_CMD_SLAB_DATA_GPU;
+}
+
 static struct hk_vdm_slab *
-hk_device_create_vdm_slab(struct hk_device *dev, enum hk_cmd_slab_class class)
+hk_device_create_vdm_slab(struct hk_device *dev, enum hk_cmd_slab_class class,
+                          uint64_t min_size)
 {
    static const char *const labels[HK_CMD_SLAB_COUNT] = {
       [HK_CMD_SLAB_VDM] = "VDM command slab",
       [HK_CMD_SLAB_MAIN] = "Main command slab",
       [HK_CMD_SLAB_USC] = "USC command slab",
       [HK_CMD_SLAB_IOTO] = "G17P Ioto program slab",
+      [HK_CMD_SLAB_VDM_GPU] = "GPU indirect VDM slab",
+      [HK_CMD_SLAB_IOTO_GPU] = "GPU indirect Ioto slab",
+      [HK_CMD_SLAB_DATA_GPU] = "GPU indirect data slab",
    };
+   const bool gpu_only = hk_cmd_slab_is_gpu_only(class);
    const enum agx_bo_flags flags =
-      (class == HK_CMD_SLAB_USC    ? AGX_BO_LOW_VA
-       : class == HK_CMD_SLAB_IOTO ? AGX_BO_EXEC | AGX_BO_LOW_VA
-                                   : 0) |
-      (hk_g17p_cached_cmd_memory(&dev->dev) ? AGX_BO_WRITEBACK : 0);
+      (class == HK_CMD_SLAB_USC ? AGX_BO_LOW_VA
+       : (class == HK_CMD_SLAB_IOTO || class == HK_CMD_SLAB_IOTO_GPU)
+          ? AGX_BO_EXEC | AGX_BO_LOW_VA
+          : 0) |
+      (!gpu_only && hk_g17p_cached_cmd_memory(&dev->dev) ? AGX_BO_WRITEBACK
+                                                         : 0);
+
+   if (min_size > HK_CMD_SLAB_MAX_SIZE)
+      return NULL;
 
    struct hk_vdm_slab *slab =
       vk_zalloc(&dev->vk.alloc, sizeof(*slab), 8,
@@ -186,7 +203,9 @@ hk_device_create_vdm_slab(struct hk_device *dev, enum hk_cmd_slab_class class)
    if (!slab)
       return NULL;
 
-   const uint32_t size = dev->vdm.next_size[class] ?: HK_CMD_BO_SIZE;
+   uint32_t size = dev->vdm.next_size[class] ?: HK_CMD_BO_SIZE;
+   while (size < min_size && size < HK_CMD_SLAB_MAX_SIZE)
+      size = MIN2(size * 2, HK_CMD_SLAB_MAX_SIZE);
    dev->vdm.next_size[class] = MIN2(size * 2, HK_CMD_SLAB_MAX_SIZE);
    slab->bo = agx_bo_create(&dev->dev, size, 0, flags, labels[class]);
    if (!slab->bo) {
@@ -195,17 +214,33 @@ hk_device_create_vdm_slab(struct hk_device *dev, enum hk_cmd_slab_class class)
    }
 
    /* Map before creating the GPU alias so a failed CPU mapping cannot
-    * publish a slab with an invalid recording pointer. */
-   slab->map = agx_bo_map(slab->bo);
-   if (!slab->map) {
-      agx_bo_unreference(&dev->dev, slab->bo);
-      vk_free(&dev->vk.alloc, slab);
-      return NULL;
+    * publish a slab with an invalid recording pointer. GPU-only slabs are
+    * written by pre-graphics compute and stay unmapped on the CPU. */
+   if (!gpu_only) {
+      slab->map = agx_bo_map(slab->bo);
+      if (!slab->map) {
+         agx_bo_unreference(&dev->dev, slab->bo);
+         vk_free(&dev->vk.alloc, slab);
+         return NULL;
+      }
    }
 
    /* Uploader spans name their primary mapping, so they spend none of the
-    * finite alias aperture. */
-   if (class == HK_CMD_SLAB_VDM) {
+    * finite alias aperture. GPU indirect VDM slabs also use their primary
+    * mapping whenever the whole BO already lies inside the lower-root compact
+    * VDM window, reserving the finite alias aperture for addresses outside it. */
+   bool need_vdm_alias = class == HK_CMD_SLAB_VDM;
+   if (class == HK_CMD_SLAB_VDM_GPU &&
+       hk_g17p_vdm_low_window_enabled(&dev->dev)) {
+      uint64_t start_compact = 0, end_compact = 0;
+      need_vdm_alias =
+         !agx_g17p_vdm_payload_compact(slab->bo->va->addr, &start_compact) ||
+         !agx_g17p_vdm_payload_compact(slab->bo->va->addr + slab->bo->size - 4,
+                                       &end_compact) ||
+         start_compact >= (UINT64_C(1) << 40) ||
+         end_compact >= (UINT64_C(1) << 40);
+   }
+   if (need_vdm_alias) {
       slab->alias = hk_g17p_vdm_alias_alloc(&dev->dev, slab->bo->size);
       const uint32_t bind = DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE;
       if (!slab->alias || agx_bo_bind(&dev->dev, slab->bo, slab->alias,
@@ -244,7 +279,9 @@ hk_cmd_pool_alloc_span(struct hk_cmd_pool *pool, enum hk_cmd_slab_class class,
                        struct hk_vdm_allocation **allocation)
 {
    struct hk_device *dev = hk_cmd_pool_device(pool);
-   if (!size || size > HK_CMD_BO_SIZE || !alignment || !ptr || !allocation)
+   const bool gpu_only = hk_cmd_slab_is_gpu_only(class);
+   const uint64_t max_size = gpu_only ? HK_CMD_SLAB_MAX_SIZE : HK_CMD_BO_SIZE;
+   if (!size || size > max_size || !alignment || !ptr || !allocation)
       return vk_error(pool, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    simple_mtx_lock(&dev->vdm.lock);
@@ -257,11 +294,12 @@ hk_cmd_pool_alloc_span(struct hk_cmd_pool *pool, enum hk_cmd_slab_class class,
          owner = slab;
          break;
       }
-      list_move_to(&slab->link, &dev->vdm.full[class]);
+      if (!gpu_only || size <= HK_CMD_BO_SIZE)
+         list_move_to(&slab->link, &dev->vdm.full[class]);
    }
 
    if (!owner) {
-      owner = hk_device_create_vdm_slab(dev, class);
+      owner = hk_device_create_vdm_slab(dev, class, size);
       if (!owner) {
          simple_mtx_unlock(&dev->vdm.lock);
          return vk_error(pool, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -291,7 +329,8 @@ hk_cmd_pool_alloc_span(struct hk_cmd_pool *pool, enum hk_cmd_slab_class class,
    };
    *ptr = (struct agx_ptr){
       .gpu = addr,
-      .cpu = (uint8_t *)owner->map + (addr - owner->bo->va->addr),
+      .cpu = owner->map ? (uint8_t *)owner->map + (addr - owner->bo->va->addr)
+                        : NULL,
    };
    *allocation = lease;
    simple_mtx_unlock(&dev->vdm.lock);
@@ -302,10 +341,12 @@ VkResult
 hk_cmd_pool_alloc_bo_span(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
                           uint32_t size, struct hk_cmd_bo **bo_out)
 {
-   list_for_each_entry(struct hk_cmd_bo, bo, &pool->free_spans[type], link) {
+   const enum hk_cmd_span_bucket bucket = hk_cmd_span_bucket_for_size(size);
+   list_for_each_entry(struct hk_cmd_bo, bo, &pool->free_spans[type][bucket],
+                       link) {
       if (bo->size == size) {
          list_del(&bo->link);
-         pool->num_free_spans[type]--;
+         pool->num_free_spans[type][bucket]--;
          *bo_out = bo;
          return VK_SUCCESS;
       }
@@ -334,6 +375,47 @@ hk_cmd_pool_alloc_bo_span(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
    bo->size = size;
    *bo_out = bo;
    return VK_SUCCESS;
+}
+
+VkResult
+hk_cmd_pool_alloc_ioto_span(struct hk_cmd_pool *pool, struct agx_ptr *ptr,
+                            struct hk_vdm_allocation **allocation)
+{
+   if (!list_is_empty(&pool->free_ioto_spans)) {
+      struct hk_vdm_allocation *span = list_first_entry(
+         &pool->free_ioto_spans, struct hk_vdm_allocation, link);
+      list_del(&span->link);
+      pool->num_free_ioto_spans--;
+      *ptr = (struct agx_ptr){
+         .gpu = span->addr,
+         .cpu = (uint8_t *)span->slab->map +
+                (span->addr - span->slab->bo->va->addr),
+      };
+      *allocation = span;
+      return VK_SUCCESS;
+   }
+
+   return hk_cmd_pool_alloc_span(pool, HK_CMD_SLAB_IOTO, HK_CMD_SPAN_SIZE,
+                                 HK_CMD_SPAN_SIZE, ptr, allocation);
+}
+
+void
+hk_cmd_pool_free_ioto_span(struct hk_cmd_pool *pool,
+                           struct hk_vdm_allocation *allocation)
+{
+   if (!allocation)
+      return;
+
+   struct hk_device *dev = hk_cmd_pool_device(pool);
+   const unsigned max_free = hk_cmd_pool_ioto_span_cache_max(&dev->dev);
+   if (p_atomic_read(&allocation->refcount) == 1 &&
+       pool->num_free_ioto_spans < max_free) {
+      list_add(&allocation->link, &pool->free_ioto_spans);
+      pool->num_free_ioto_spans++;
+      return;
+   }
+
+   hk_device_free_span(dev, allocation);
 }
 
 void
@@ -396,9 +478,13 @@ hk_CreateCommandPool(VkDevice _device,
    for (enum hk_cmd_bo_type type = 0; type < HK_CMD_BO_TYPE_COUNT; ++type) {
       list_inithead(&pool->free_bos[type]);
       pool->num_free_bos[type] = 0;
-      list_inithead(&pool->free_spans[type]);
-      pool->num_free_spans[type] = 0;
+      for (unsigned bucket = 0; bucket < HK_CMD_SPAN_BUCKET_COUNT; ++bucket) {
+         list_inithead(&pool->free_spans[type][bucket]);
+         pool->num_free_spans[type][bucket] = 0;
+      }
    }
+   list_inithead(&pool->free_ioto_spans);
+   pool->num_free_ioto_spans = 0;
 
    *pCmdPool = hk_cmd_pool_to_handle(pool);
 
@@ -413,15 +499,25 @@ hk_cmd_pool_destroy_bos(struct hk_cmd_pool *pool)
       list_for_each_entry_safe(struct hk_cmd_bo, bo, &pool->free_bos[type],
                                link)
          hk_cmd_bo_destroy(dev, &pool->vk.alloc, bo);
-      list_for_each_entry_safe(struct hk_cmd_bo, bo, &pool->free_spans[type],
-                               link)
-         hk_cmd_bo_destroy(dev, &pool->vk.alloc, bo);
-
       list_inithead(&pool->free_bos[type]);
       pool->num_free_bos[type] = 0;
-      list_inithead(&pool->free_spans[type]);
-      pool->num_free_spans[type] = 0;
+
+      for (unsigned bucket = 0; bucket < HK_CMD_SPAN_BUCKET_COUNT; ++bucket) {
+         list_for_each_entry_safe(struct hk_cmd_bo, bo,
+                                  &pool->free_spans[type][bucket], link)
+            hk_cmd_bo_destroy(dev, &pool->vk.alloc, bo);
+         list_inithead(&pool->free_spans[type][bucket]);
+         pool->num_free_spans[type][bucket] = 0;
+      }
    }
+
+   list_for_each_entry_safe(struct hk_vdm_allocation, span,
+                            &pool->free_ioto_spans, link) {
+      list_del(&span->link);
+      hk_device_free_span(dev, span);
+   }
+   list_inithead(&pool->free_ioto_spans);
+   pool->num_free_ioto_spans = 0;
 }
 
 VkResult
@@ -451,10 +547,12 @@ hk_cmd_pool_free_bo_list(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
    /* Under virtio every BO is an external object, which the host kernel locks
     * on every submit: a pool hoarding hundreds of idle BOs slows all submits. */
    const unsigned max_free =
-      (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
+      agx_chip_native_or_m5(dev->dev.chip) &&
          type == HK_CMD_BO_MAIN && !dev->dev.is_virtio
          ? HK_G17P_CMD_POOL_MAIN_BO_MAX
          : HK_CMD_POOL_BO_MAX;
+   const unsigned max_free_spans =
+      hk_cmd_pool_span_cache_max(&dev->dev, type);
 
    list_for_each_entry_safe(struct hk_cmd_bo, bo, bos, link) {
       list_del(&bo->link);
@@ -462,10 +560,16 @@ hk_cmd_pool_free_bo_list(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
          /* Drop recording ownership, but never put pending bytes in either
           * pool reuse list. Submission pins also retain aliases and spans. */
          hk_cmd_bo_destroy(hk_cmd_pool_device(pool), &pool->vk.alloc, bo);
-      } else if (bo->span && pool->num_free_spans[type] < HK_CMD_POOL_BO_MAX) {
-         list_add(&bo->link, &pool->free_spans[type]);
-         pool->num_free_spans[type]++;
-      } else if (bo->span || pool->num_free_bos[type] >= max_free) {
+      } else if (bo->span) {
+         const enum hk_cmd_span_bucket bucket =
+            hk_cmd_span_bucket_for_size(bo->size);
+         if (pool->num_free_spans[type][bucket] < max_free_spans) {
+            list_add(&bo->link, &pool->free_spans[type][bucket]);
+            pool->num_free_spans[type][bucket]++;
+         } else {
+            hk_cmd_bo_destroy(hk_cmd_pool_device(pool), &pool->vk.alloc, bo);
+         }
+      } else if (pool->num_free_bos[type] >= max_free) {
          hk_cmd_bo_destroy(hk_cmd_pool_device(pool),
                            &pool->vk.alloc, bo);
       } else {
@@ -504,6 +608,8 @@ void
 hk_cmd_pool_clean_vdm(const struct hk_vdm_allocation *allocation)
 {
    const struct hk_vdm_slab *slab = allocation->slab;
+   if (!slab->map)
+      return;
    util_flush_range_no_fence(
       (uint8_t *)slab->map + (allocation->addr - slab->bo->va->addr),
       allocation->size);
@@ -883,8 +989,13 @@ hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *p,
    if (!p)
       return;
 
+   /* Once p is on a queue's list and the lock drops, a reap on another
+    * thread may release it: decide before then whether this thread does.
+    */
+   const bool release = !p->attempted;
+
    simple_mtx_lock(&dev->cmd_pending_lock);
-   if (!p->attempted) {
+   if (release) {
       /* No ioctl used its syncobjs or memory. */
       hk_cmd_pending_recycle(dev, p);
    } else if (result != VK_SUCCESS) {
@@ -909,7 +1020,7 @@ hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *p,
    }
    simple_mtx_unlock(&dev->cmd_pending_lock);
 
-   if (!p->attempted)
+   if (release)
       hk_cmd_pending_release(dev, p, false);
 }
 

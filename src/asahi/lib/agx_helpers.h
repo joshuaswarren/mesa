@@ -308,6 +308,8 @@ agx_fill_decompress_args(struct ail_layout *layout, unsigned layer,
                   layout->level_offsets_compressed_B[level] +
                   (layer * layout->compression_layer_stride_B),
       .metadata_layer_stride_tl = layout->compression_layer_stride_B / 8,
+      .layer_stride_sa =
+         layout->layer_stride_B / ail_get_blocksize_B(layout),
       .metadata_width_tl = ail_metadata_width_tl(layout, level),
       .metadata_height_tl = ail_metadata_height_tl(layout, level),
    };

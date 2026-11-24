@@ -383,7 +383,7 @@ struct hk_device {
     * record carries no dimensions and no resource table, so the only way a
     * runtime grid can reach the main record is for this program to publish
     * the six-u32 geometry block.  Compiled once, from NIR, through the same
-    * path as any other Honeykrisp compute shader, so it uses the driver's own
+    * path as any other Borealis compute shader, so it uses the driver's own
     * proven root/uniform ABI rather than a replayed one.  NULL on chips
     * without native indirect compute; on those that have it, device creation
     * fails if it does not compile. */
@@ -447,105 +447,29 @@ enum hk_perftest {
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)
 
-/* G17P and M5 GPU caches are tagged by virtual address: a strong CDM flush
- * makes a write visible only to reads through the same mapping. While memory
- * may be read through a second address, an application dependency between
- * compute or transfer work needs the memory-scope flush
- * (hk_cdm_visibility_flush()). Devices without such memory keep the ordinary
- * strong flush.
+/* G17P and M5 GPU caches are tagged by virtual address, so when memory may be
+ * mapped at more than one GPU VA an application compute/transfer barrier needs
+ * the memory-scoped strong flush (hk_cdm_visibility_flush()).
  *
- * On M5 the features through which memory can get a second GPU address are
- * looked at once, when the device is created (hk_device_may_alias_memory()):
- * sparse binding and residency, buffer device address, descriptor buffer
- * and acceleration structure capture/replay, fd and dma-buf memory, and
- * writable host imports. A device that enabled none of them never has such
- * memory and keeps the plain flushes. On any other M5 device
- * (host_alias.dynamic) the scope follows the resources that exist: memory
- * scope while alias_live is not 0, the count of
+ * On M5, devices that enable aliasing-capable features (sparse, BDA,
+ * capture/replay, fd/dma-buf, writable host imports) track active aliasing
+ * resources in alias_live under host_alias.dynamic (or force memory scope via
+ * may_alias_memory / ASAHI_M5_HOST_ALIAS_STATIC=1). Barriers recorded while
+ * alias_live == 0 record patch sites (struct hk_alias_site) that are upgraded
+ * in place when alias_live leaves 0 or at submission; unpatched paths
+ * (graphics dependencies, event-using command buffers) and stream-end flushes
+ * keep memory scope unconditionally while dynamic mode is active.
  *
- * - live buffers and image planes with a GPU address of their own over
- *   other memory: sparse buffers and images, buffers with a capture/replay
- *   address, and memory mapped again in the capture/replay region for
- *   descriptor buffers (va_alias_resources, which G17P reads alone). Each
- *   counts from its creation, before memory can be bound to it. On M5 an
- *   acceleration structure's address is its buffer's (also on replay,
- *   vk_common_CreateAccelerationStructureKHR()), and image views and
- *   samplers replay only descriptor indices, so their capture/replay adds
- *   no address;
- * - live fd and dma-buf imports, each for its lifetime: another import, of
- *   this device or another, may map the same pages;
- * - live host imports that may alias (hk_host_import_aliases()): not all
- *   private anonymous memory of this process, or overlapping another live
- *   import of which one of the two is GPU-writable. Not seen: pages moved by
- *   mremap after an import and imported again (hk_host_alias.h).
+ * On G17P, memory scope is selected at barrier recording time whenever
+ * va_alias_resources != 0 (live sparse, capture/replay, fd, or writable host
+ * imports). The flush is emitted into an open compute stream holding work;
+ * earlier closed streams already flushed at stream end.
  *
- * Every count goes through hk_device_alias_add(); the add that takes the
- * count from 0 runs the patch below for all live command buffers
- * (hk_device_alias_began()) before the call that creates the resource
- * returns. The count never wraps (hk_device_alias_add()). Memory gets its second GPU address
- * only when such a resource is created, so the work recorded or submitted
- * before then is given memory scope at that point:
- *
- * - Each application dependency between compute and transfer work that this
- *   rule recorded without memory scope is a patch site
- *   (hk_cdm_note_alias_site()): the stream word of its barrier record, over
- *   which the memory-scoped strong flush is written (struct hk_alias_site).
- * - A command buffer's sites are written at submission while the scope is
- *   on, before its streams are packed or handed to the kernel
- *   (hk_queue_submit()). Work behind a semaphore the host signals reaches
- *   the driver only once that signal is submitted (the runtime submits it
- *   from a thread that waits for VK_SYNC_WAIT_PENDING), so after every
- *   resource the work may reach; work already with the kernel can reach no
- *   later resource, which no host signal orders before it.
- * - When alias_live leaves 0, the sites of every executable command buffer
- *   are written as well (hk_device_patch_alias_sites()).
- * - Writes only add memory scope, and a written command buffer keeps it
- *   until it is reset or freed.
- * - Every compute stream holding launches ends with the memory-scoped strong
- *   flush (vkEndCommandBuffer), so what it wrote is in memory by its end.
- *   Graphics commands, including transfers done through a render pass, get
- *   no such flush, as under the per-device rule, which never gave M5
- *   graphics memory scope either. Sites cover reads by work recorded before
- *   a resource that aliases; this covers writes made before it, by work that
- *   already ran, read later through the new address, through a resource that
- *   replaced a freed one, or through another device's, process's or API's
- *   mapping of the same pages: an fd export or a host import elsewhere, which
- *   Vulkan orders after this work only at a submission boundary. Submit
- *   packing keeps that flush only at a packet's end while alias_live is 0.
- * - What records no site keeps memory scope while the mode is on: the
- *   dependencies of graphics paths (transfers ordered before a draw, task
- *   launches), and all of a command buffer that uses events, since an event
- *   the host sets could let an execution that already started reach memory
- *   aliased after it started (hk_cmd_alias_scope()).
- *
- * ASAHI_M5_HOST_ALIAS_STATIC=1 restores the per-device rule for every one
- * of these features (A/B and fallback).
- *
- * On G17P the state is read when a barrier is recorded: live sparse and
- * capture/replay resources, and live fd imports and host imports the GPU may
- * write (another import can map the same pages at a second address). A
- * resource the command buffer references exists by then, and it counts from
- * creation, so later sparse binds are covered. Not covered on G17P: a
- * resource or import created after the command buffer was recorded and
- * reached through a path recording did not see, that is a device address the
- * command buffer reads indirectly, or a descriptor set bound at recording and
- * updated after it (descriptorBinding*UpdateAfterBind).
- *
- * The flush goes into the open compute stream, and only when that stream
- * already holds work (hk_cdm_visibility_flush_needed()). It writes back every
- * dirty line, so the writes it covers include those of earlier streams and
- * earlier command buffers. A barrier recorded with no open compute stream
- * holding work records no flush. This includes the first barrier of a
- * command buffer and barriers after the stream was closed, for example by a
- * timestamp or query copy; the compute and transfer writes before it were
- * flushed with memory scope at the end of their stream
- * (hk_cdm_end_stream_flush()). When the open stream holds work unrelated to
- * the source, the flush goes at its end, but a graphics destination is still
- * ordered only after the source's stream, so it can start before the flush.
- * Graphics-only sources also do not request memory scope: attachment or
- * shader writes through a sparse image followed by transfer or compute reads
- * through a plain alias receive the ordinary post-graphics strong flush. That
- * case has not been hardware-tested. */
+ * Not covered on G17P: resources or imports created after command buffer
+ * recording and reached via device address or UpdateAfterBind descriptors;
+ * graphics-only sources writing through a sparse image read via a plain alias
+ * receive only the ordinary post-graphics strong flush (untested).
+ */
 static inline bool
 hk_cdm_alias_scope(const struct hk_device *dev)
 {
@@ -557,13 +481,26 @@ hk_cdm_alias_scope(const struct hk_device *dev)
 }
 
 /* Whether the CDM strong flush has a memory-scoped form, which memory
- * reached through a second address needs (hk_cdm_alias_scope()): on G17P
- * and M5. G16 has only the plain strong flush; G17A's caches are not known
- * (hk_cdm_caches_pending()). */
+ * reached through a second address needs (hk_cdm_alias_scope()). Keyed on
+ * the chip table's AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY capability (G17P
+ * and M5); G16 has only the plain strong flush and G17A's caches are not
+ * known (hk_cdm_caches_pending()). */
 static inline bool
 hk_cdm_memory_scope_form(const struct hk_device *dev)
 {
-   return dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip);
+   return agx_chip_has_record(dev->dev.chip,
+                              AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY);
+}
+
+/* Whether a compute command whose stream ends with the strong memory-scoped
+ * flush says so (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION), so the kernel can
+ * let another queue's kick wait for its completion in firmware. */
+static inline bool
+hk_cdm_visible_completion(const struct hk_device *dev)
+{
+   return agx_chip_g17_m5(dev->dev.chip) &&
+          (dev->dev.params.features &
+           DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION);
 }
 
 /* Whether it is still unknown if the GPU's caches are tagged by virtual

@@ -161,6 +161,60 @@ TEST(M5RuntimeLoops, TopTestedUnrolls)
    ralloc_free(s);
 }
 
+/* A second counted loop bounded by the count the first one leaves (its
+ * induction variable after it, as a geometry shader's vertex loop leaves the
+ * number of vertices): unrolling the first turns that header phi into a
+ * register, and the second loop's guard must read the value that replaces
+ * it. */
+TEST(M5RuntimeLoops, LaterBoundFromEarlierLoop)
+{
+   nir_builder b = compute_shader("chained-bounds");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *kv = nir_local_variable_create(b.impl, glsl_uint_type(), "k");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 32);
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+   nir_loop *first = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_ige(&b, i, n));
+      nir_def *v = nir_load_global(&b, 1, 32,
+                                   buffer_address(&b, nir_amul_imm(&b, i, 4)),
+                                   .align_mul = 4);
+      nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, first);
+   nir_def *count = nir_load_var(&b, iv);
+   nir_store_var(&b, kv, nir_imm_int(&b, 0), 1);
+   nir_loop *second = nir_push_loop(&b);
+   {
+      nir_def *k = nir_load_var(&b, kv);
+      nir_break_if(&b, nir_ige(&b, k, count));
+      nir_def *v = nir_load_global(
+         &b, 1, 32,
+         buffer_address(&b, nir_iadd_imm(&b, nir_amul_imm(&b, k, 4), 256)),
+         .align_mul = 4);
+      nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, kv, nir_iadd_imm(&b, k, 1), 1);
+   }
+   nir_pop_loop(&b, second);
+   nir_store_global(&b, nir_load_var(&b, acc),
+                    buffer_address(&b, nir_imm_int(&b, 0)), .align_mul = 4);
+   nir_shader *s = b.shader;
+   NIR_PASS(_, s, nir_lower_vars_to_ssa);
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   NIR_PASS(_, s, nir_opt_cse);
+   NIR_PASS(_, s, nir_opt_dce);
+   ASSERT_EQ(count_loops(s), 2u);
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 256, NULL));
+   nir_validate_shader(s, "bound from an earlier loop");
+   /* Both loops unrolled: a main loop in front of each. */
+   EXPECT_EQ(count_loops(s), 4u);
+   ralloc_free(s);
+}
+
 static unsigned
 loops_inside_ifs(nir_shader *shader)
 {

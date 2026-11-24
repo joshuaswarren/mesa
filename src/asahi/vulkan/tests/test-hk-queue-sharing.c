@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT
- * Queue selection and callback serialization without a DRM device.
+ * Kernel queue budget, queue selection and callback serialization without a
+ * DRM device.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,8 +25,243 @@
 #error "observing contention on the backing queue lock needs futex simple_mtx"
 #endif
 
-static struct hk_queue queues[6];
-static int entered, released, finished, independent, active;
+#define IQ DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES
+
+/* drm.virt_ring_idx of the MEDIUM, LOW and HIGH priority classes. */
+#define MEDIUM (DRM_ASAHI_PRIORITY_MEDIUM + 1)
+#define LOW    (DRM_ASAHI_PRIORITY_LOW + 1)
+#define HIGH   (DRM_ASAHI_PRIORITY_HIGH + 1)
+
+#define PROTECTED VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT
+
+static struct hk_device *dev;
+static struct hk_physical_device *pdev;
+
+/* The budget and the queue choice read nothing of the chip. */
+static const enum agx_chip chips[] = {
+   AGX_CHIP_G13G, AGX_CHIP_G14X, AGX_CHIP_G15S, AGX_CHIP_G16G,
+   AGX_CHIP_G17P, AGX_CHIP_G17S, AGX_CHIP_G17C,
+};
+
+static void
+set_kernel(uint64_t features, bool virtio, uint32_t max_queues,
+           uint32_t max_in_flight_per_queue)
+{
+   dev->dev.params.features = features;
+   dev->dev.is_virtio = virtio;
+   pdev->queue_limits = (struct drm_asahi_queue_limits){
+      .max_queues = max_queues,
+      .max_in_flight_per_queue = max_in_flight_per_queue,
+   };
+}
+
+static void
+test_budget(void)
+{
+   /* One kernel queue per class without independent kernel queues, or under
+    * virtio where the limits cannot be queried, whatever the limits hold. */
+   set_kernel(0, false, 58, 2);
+   CHECK(hk_queue_independent_budget(dev) == 1);
+   set_kernel(0, false, 0, 0);
+   CHECK(hk_queue_independent_budget(dev) == 1);
+   set_kernel(IQ, true, 58, 2);
+   CHECK(hk_queue_independent_budget(dev) == 1);
+
+   /* A pool of 58 or 42 kernel queues allows 11 or 8 Vulkan queues, one per
+    * 1 + HK_QUEUE_SIBLINGS_MAX kernel queues, capped at the advertised count.
+    * Render credits per kernel queue do not matter. */
+   for (uint32_t credits = 1; credits <= 2; credits++) {
+      set_kernel(IQ, false, 58, credits);
+      CHECK(hk_queue_independent_budget(dev) == HK_ADVERTISED_QUEUES);
+      set_kernel(IQ, false, 42, credits);
+      CHECK(hk_queue_independent_budget(dev) == HK_ADVERTISED_QUEUES);
+   }
+
+   /* A scarce pool bounds the budget, but never below one. */
+   set_kernel(IQ, false, 15, 2);
+   CHECK(hk_queue_independent_budget(dev) == 3);
+   set_kernel(IQ, false, 2 * (1 + HK_QUEUE_SIBLINGS_MAX) - 1, 2);
+   CHECK(hk_queue_independent_budget(dev) == 1);
+   set_kernel(IQ, false, 8, 2);
+   CHECK(hk_queue_independent_budget(dev) == 1);
+   set_kernel(IQ, false, 1, 1);
+   CHECK(hk_queue_independent_budget(dev) == 1);
+
+   /* A large pool: never more than the advertised count. */
+   set_kernel(IQ, false, 4096, 2);
+   CHECK(hk_queue_independent_budget(dev) == HK_ADVERTISED_QUEUES);
+}
+
+static struct hk_queue pool[3 * HK_ADVERTISED_QUEUES];
+static unsigned pool_count;
+
+typedef VkResult (*submit_fn)(struct vk_queue *queue,
+                              struct vk_queue_submit *submit);
+
+static VkResult
+idle_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
+{
+   return VK_SUCCESS;
+}
+
+/* Like hk_queue_create(): initialize, pick the class, then share. */
+static void
+create(struct hk_queue *queue, uint32_t family, uint8_t ring,
+       VkDeviceQueueCreateFlags flags, submit_fn driver_submit)
+{
+   const VkDeviceQueueCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .flags = flags,
+      .queueFamilyIndex = family,
+      .queueCount = 1,
+   };
+   CHECK(vk_queue_init(&queue->vk, &dev->vk, &info, 0) == VK_SUCCESS);
+   queue->drm.virt_ring_idx = ring;
+   queue->vk.driver_submit = driver_submit;
+   hk_queue_share(dev, queue);
+}
+
+static unsigned
+add(uint8_t ring, VkDeviceQueueCreateFlags flags)
+{
+   CHECK(pool_count < ARRAY_SIZE(pool));
+   create(&pool[pool_count], pool_count % 3, ring, flags, idle_submit);
+   return pool_count++;
+}
+
+/* Index of the queue whose kernel queue pool[i] runs on. */
+static unsigned
+backing(unsigned i)
+{
+   const struct hk_queue *queue = &pool[i];
+   if (!vk_queue_is_emulated(&queue->vk)) {
+      CHECK(queue->vk.driver_submit == idle_submit);
+      return i;
+   }
+
+   CHECK(!queue->vk.driver_submit);
+   const struct hk_queue *real =
+      container_of(queue->vk.real_queue, struct hk_queue, vk);
+   CHECK(real >= pool && real < pool + pool_count);
+   CHECK(!vk_queue_is_emulated(&real->vk));
+   /* Sharing never crosses a priority class or creation flags. */
+   CHECK(real->drm.virt_ring_idx == queue->drm.virt_ring_idx);
+   CHECK(real->vk.flags == queue->vk.flags);
+   return real - pool;
+}
+
+static unsigned
+independent(void)
+{
+   unsigned count = 0;
+   for (unsigned i = 0; i < pool_count; i++)
+      count += backing(i) == i;
+   return count;
+}
+
+/* Match device teardown: aliases stop before their backing queues. */
+static void
+finish_all(void)
+{
+   while (!list_is_empty(&dev->vk.queues)) {
+      struct vk_queue *queue =
+         list_last_entry(&dev->vk.queues, struct vk_queue, link);
+      vk_queue_finish(queue);
+   }
+   pool_count = 0;
+}
+
+/* Queues up to the budget keep their own kernel queue; later ones of a class
+ * spread over its kernel queues, the least shared first. */
+static void
+test_spread(void)
+{
+   set_kernel(IQ, false, 15, 2);
+   for (unsigned i = 0; i < 9; i++)
+      add(MEDIUM, 0);
+   const unsigned expect[] = {0, 1, 2, 0, 1, 2, 0, 1, 2};
+   for (unsigned i = 0; i < ARRAY_SIZE(expect); i++)
+      CHECK(backing(i) == expect[i]);
+   CHECK(independent() == 3);
+   finish_all();
+}
+
+/* Past the budget, a queue only shares a kernel queue of its own priority
+ * class and creation flags, and gets one of its own if its class has none. */
+static void
+test_isolation(void)
+{
+   set_kernel(IQ, false, 10, 1);
+   CHECK(hk_queue_independent_budget(dev) == 2);
+   const unsigned m0 = add(MEDIUM, 0);
+   const unsigned m1 = add(MEDIUM, 0);
+   const unsigned l0 = add(LOW, 0);
+   const unsigned p0 = add(MEDIUM, PROTECTED);
+   const unsigned l1 = add(LOW, 0);
+   const unsigned p1 = add(MEDIUM, PROTECTED);
+   const unsigned m2 = add(MEDIUM, 0);
+   const unsigned h0 = add(HIGH, 0);
+   const unsigned m3 = add(MEDIUM, 0);
+   const unsigned h1 = add(HIGH, 0);
+
+   CHECK(backing(m0) == m0 && backing(m1) == m1);
+   CHECK(backing(l0) == l0);
+   CHECK(backing(p0) == p0);
+   CHECK(backing(l1) == l0);
+   CHECK(backing(p1) == p0);
+   CHECK(backing(m2) == m0 && backing(m3) == m1);
+   CHECK(backing(h0) == h0);
+   CHECK(backing(h1) == h0);
+   CHECK(independent() == 5);
+   finish_all();
+}
+
+/* Kernels with independent queues report pools of 42 or 58 kernel queues.
+ * Every queue of one universal family then keeps a kernel queue of its own,
+ * whatever the render credits, as do the first HK_ADVERTISED_QUEUES queues of
+ * three families; the rest spread evenly over those. */
+static void
+test_advertised(void)
+{
+   set_kernel(IQ, false, 58, 1);
+   for (unsigned i = 0; i < HK_ADVERTISED_QUEUES; i++)
+      add(MEDIUM, 0);
+   CHECK(independent() == HK_ADVERTISED_QUEUES);
+   for (unsigned i = 0; i < pool_count; i++)
+      CHECK(!pool[i].vk.real_queue);
+   finish_all();
+
+   set_kernel(IQ, false, 58, 2);
+   for (unsigned i = 0; i < 3 * HK_ADVERTISED_QUEUES; i++)
+      add(MEDIUM, 0);
+   CHECK(independent() == HK_ADVERTISED_QUEUES);
+   unsigned sharers[HK_ADVERTISED_QUEUES] = {0};
+   for (unsigned i = HK_ADVERTISED_QUEUES; i < pool_count; i++) {
+      CHECK(backing(i) < HK_ADVERTISED_QUEUES);
+      sharers[backing(i)]++;
+   }
+   for (unsigned i = 0; i < HK_ADVERTISED_QUEUES; i++)
+      CHECK(sharers[i] == 2);
+   finish_all();
+}
+
+/* Without independent kernel queues, every queue of a class shares one. */
+static void
+test_single(void)
+{
+   set_kernel(0, false, 0, 0);
+   const unsigned m0 = add(MEDIUM, 0);
+   const unsigned m1 = add(MEDIUM, 0);
+   const unsigned l0 = add(LOW, 0);
+   const unsigned m2 = add(MEDIUM, 0);
+   CHECK(backing(m0) == m0);
+   CHECK(backing(m1) == m0 && backing(m2) == m0);
+   CHECK(backing(l0) == l0);
+   finish_all();
+}
+
+static struct hk_queue queues[5];
+static int entered, released, finished, other, active;
 
 /* Flags change under `lock` and are broadcast on `cond`. */
 static mtx_t lock;
@@ -53,7 +289,7 @@ static VkResult
 driver_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
    if (queue == &queues[2].vk) {
-      bump(&independent);
+      bump(&other);
       return VK_SUCCESS;
    }
    CHECK(queue == &queues[0].vk);
@@ -73,50 +309,32 @@ submit(unsigned index)
                          VK_NULL_HANDLE) == VK_SUCCESS);
 }
 
-int
-main(void)
+/* Submissions of queues that share a kernel queue run one at a time on the
+ * backing queue's callback; another class's queue is not held up. */
+static void
+test_serialization(void)
 {
-   struct hk_device *dev = calloc(1, sizeof(*dev));
-   struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
-   CHECK(dev && pdev);
    CHECK(mtx_init(&lock, mtx_plain) == thrd_success);
    CHECK(cnd_init(&cond) == thrd_success);
-   vk_object_base_init(&dev->vk, &dev->vk.base, VK_OBJECT_TYPE_DEVICE);
-   dev->vk.alloc = *vk_default_allocator();
-   dev->vk.physical = &pdev->vk;
    dev->vk.submit_mode = VK_QUEUE_SUBMIT_MODE_THREADED;
-   dev->vk.timeline_mode = VK_DEVICE_TIMELINE_MODE_NATIVE;
-   list_inithead(&dev->vk.queues);
-   dev->dev.chip = AGX_CHIP_G17C;
+   set_kernel(IQ, false, 1 + HK_QUEUE_SIBLINGS_MAX, 1);
 
    for (unsigned i = 0; i < ARRAY_SIZE(queues); i++) {
-      VkDeviceQueueCreateInfo info = {
-         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-         .flags = i == 3 ? VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT : 0,
-         .queueFamilyIndex = i % 3,
-         .queueCount = 1};
-      CHECK(vk_queue_init(&queues[i].vk, &dev->vk, &info, 0) == VK_SUCCESS);
-      queues[i].drm.virt_ring_idx = i == 2 ? 1 : 2;
-      queues[i].drm.id = 42 + i;
-      queues[i].vk.driver_submit = driver_submit;
-      if (i == 5)
-         dev->dev.chip = AGX_CHIP_G17P;
-      hk_queue_share(dev, &queues[i]);
+      create(&queues[i], i % 3, i == 2 ? LOW : MEDIUM, i == 3 ? PROTECTED : 0,
+             driver_submit);
    }
-   dev->dev.chip = AGX_CHIP_G17C;
    CHECK(queues[0].vk.real_queue == &queues[0].vk);
    CHECK(queues[1].vk.real_queue == &queues[0].vk);
    CHECK(!queues[2].vk.real_queue);
    CHECK(!queues[3].vk.real_queue);
    CHECK(queues[4].vk.real_queue == &queues[0].vk);
-   CHECK(!queues[5].vk.real_queue);
    CHECK(!queues[1].vk.driver_submit && !queues[4].vk.driver_submit);
 
    submit(0);
    await(&entered);
    submit(1);
    submit(2);
-   await(&independent);
+   await(&other);
    /* The alias submission is serialized behind the paused one on the
     * backing queue's lock. A futex simple_mtx holds 2 exactly while another
     * thread waits for it, and only the alias' submit thread can contend
@@ -128,20 +346,39 @@ main(void)
    CHECK(p_atomic_read(&entered) == 1);
    bump(&released);
 
-   /* Match device teardown: aliases must stop before the backing queue. */
-   while (!list_is_empty(&dev->vk.queues)) {
-      struct vk_queue *queue =
-         list_last_entry(&dev->vk.queues, struct vk_queue, link);
-      vk_queue_finish(queue);
-   }
+   finish_all();
    CHECK(p_atomic_read(&entered) == 2);
    CHECK(p_atomic_read(&finished) == 2);
-   vk_object_base_finish(&dev->vk.base);
    cnd_destroy(&cond);
    mtx_destroy(&lock);
+}
+
+int
+main(void)
+{
+   dev = calloc(1, sizeof(*dev));
+   pdev = calloc(1, sizeof(*pdev));
+   CHECK(dev && pdev);
+   vk_object_base_init(&dev->vk, &dev->vk.base, VK_OBJECT_TYPE_DEVICE);
+   dev->vk.alloc = *vk_default_allocator();
+   dev->vk.physical = &pdev->vk;
+   dev->vk.submit_mode = VK_QUEUE_SUBMIT_MODE_IMMEDIATE;
+   dev->vk.timeline_mode = VK_DEVICE_TIMELINE_MODE_NATIVE;
+   list_inithead(&dev->vk.queues);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(chips); i++) {
+      dev->dev.chip = chips[i];
+      test_budget();
+      test_spread();
+      test_isolation();
+      test_advertised();
+      test_single();
+   }
+   test_serialization();
+
+   vk_object_base_finish(&dev->vk.base);
    free(pdev);
    free(dev);
-   puts(
-      "queue matching, serialization, independent priority, reverse finish: PASS");
+   puts("queue budget, spreading, class isolation, serialization: PASS");
    return 0;
 }

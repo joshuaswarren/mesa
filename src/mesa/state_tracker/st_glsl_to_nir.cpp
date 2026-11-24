@@ -434,6 +434,36 @@ st_nir_lower_wpos_ytransform(struct nir_shader *nir,
    return progress;
 }
 
+#ifdef ENABLE_SHADER_CACHE
+/**
+ * Link a program found in the disk cache that could not be restored from it
+ * from source instead, as on a cache miss: lock the attached shaders again,
+ * start over with fresh program data and compile the skipped shaders.
+ */
+static bool
+st_relink_uncached(struct gl_context *ctx, struct gl_shader_program *prog,
+                   struct gl_shader_link_locks *locks)
+{
+   if (!_mesa_lock_attached_shaders(ctx, prog, locks)) {
+      linker_error(prog, "out of memory");
+      return false;
+   }
+
+   _mesa_clear_shader_program_data(ctx, prog);
+   prog->data = _mesa_create_shader_program_data();
+   link_shaders_init(ctx, prog);
+   prog->SamplersValidated = GL_TRUE;
+
+   shader_cache_compile_shaders(ctx, prog);
+   for (unsigned i = 0; i < prog->NumShaders; i++) {
+      if (!prog->Shaders[i]->CompileStatus)
+         linker_error(prog, "linking with uncompiled/unspecialized shader");
+   }
+
+   return prog->data->LinkStatus;
+}
+#endif
+
 static bool
 st_link_glsl_to_nir(struct gl_context *ctx,
                     struct gl_shader_program *shader_program,
@@ -443,14 +473,23 @@ st_link_glsl_to_nir(struct gl_context *ctx,
    struct gl_linked_shader *linked_shader[MESA_SHADER_MESH_STAGES];
    unsigned num_shaders = 0;
 
-   /* A program restored from the disk cache reads no attached shader. */
-   if (shader_program->data->LinkStatus == LINKING_SKIPPED)
+#ifdef ENABLE_SHADER_CACHE
+   /* Return early if we are loading the shader from on-disk cache */
+   if (shader_program->data->LinkStatus == LINKING_SKIPPED) {
+      /* A program restored from the disk cache reads no attached shader. */
       _mesa_unlock_attached_shaders(ctx, locks);
 
-   /* Return early if we are loading the shader from on-disk cache */
-   if (st_load_nir_from_disk_cache(ctx, shader_program)) {
-      return GL_TRUE;
+      if (st_load_nir_from_disk_cache(ctx, shader_program))
+         return GL_TRUE;
+
+      /* Not expected: every cache hit restores its NIR. Should that change,
+       * link from source rather than without the locks.
+       */
+      assert(!"disk cache hit could not be restored");
+      if (!st_relink_uncached(ctx, shader_program, locks))
+         return GL_FALSE;
    }
+#endif
 
    MESA_TRACE_FUNC();
 
@@ -842,9 +881,12 @@ st_link_shader(struct gl_context *ctx, struct gl_shader_program *prog,
     * before the backend compile, after which another context may free them.
     */
    cache_key *cache_keys = NULL;
+   unsigned num_cache_keys = 0;
    if (ctx->Cache && prog->data->LinkStatus == LINKING_SUCCESS && !spirv) {
       cache_keys = (cache_key *) malloc(prog->NumShaders * sizeof(cache_key));
-      for (i = 0; cache_keys && i < prog->NumShaders; i++)
+      if (cache_keys)
+         num_cache_keys = prog->NumShaders;
+      for (i = 0; i < num_cache_keys; i++)
          memcpy(cache_keys[i], prog->Shaders[i]->disk_cache_blake3,
                 sizeof(cache_key));
    }
@@ -878,7 +920,8 @@ st_link_shader(struct gl_context *ctx, struct gl_shader_program *prog,
 
 #ifdef ENABLE_SHADER_CACHE
    if (prog->data->LinkStatus && cache_keys)
-      shader_cache_write_program_metadata(ctx, prog, cache_keys);
+      shader_cache_write_program_metadata(ctx, prog, cache_keys,
+                                          num_cache_keys);
    free(cache_keys);
 #endif
 }

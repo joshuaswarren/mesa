@@ -12,6 +12,13 @@
 #include "vk_queue.h"
 
 struct hk_device;
+struct hk_packed_submit;
+
+/* Queues advertised per family when the kernel reports independent queues
+ * (DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES), and the most Vulkan queues of one
+ * device that keep a kernel queue of their own (hk_queue_independent_budget()).
+ */
+#define HK_ADVERTISED_QUEUES 8u
 
 /* Kernel queues one hk_queue may spread its independent work over. */
 #define HK_QUEUE_SIBLINGS_MAX 4
@@ -56,6 +63,26 @@ struct hk_queue {
        * without control streams (queue_submit_empty()), 0 once it is known
        * complete. Later kernel submissions of this queue wait for it. */
       uint64_t empty_wait_point;
+
+      /* Latest timeline point of a submission carrying commands on each
+       * subqueue (VDM / CDM), cleared to 0 once observed complete. Used so a
+       * leading TOP_OF_PIPE timestamp on one subqueue takes the ordered
+       * carrier whenever the other subqueue still has incomplete work. */
+      uint64_t last_sq_point[HK_SYNC_NUM_SQ];
+
+      /* Latest timeline point of a submission carrying a GPU query reset
+       * (vkCmdResetQueryPool), cleared to 0 once observed complete. A submit
+       * that ends with compute after a reset clears the queue tail, yet its
+       * reset may still be running when the next submit's leading TOP_OF_PIPE
+       * start stamp would latch. */
+      uint64_t last_query_reset_point;
+
+      /* Latest timeline point covered by a queue barrier tail
+       * (queue->sync.tail), cleared to 0 once observed complete. Because
+       * queue->sync.tail holds monotonic ordinals that never reset to 0,
+       * tracking its timeline point lets leading TOP_OF_PIPE timestamps
+       * re-engage the fast path once the barrier's source work has finished. */
+      uint64_t last_tail_point;
    } drm;
 
    /* M5 submissions whose command memory is still pinned, oldest first
@@ -70,12 +97,30 @@ struct hk_queue {
     * Sparse image remaps submit this record before their signal operations. */
    struct agx_bo *g17p_sstt_flush_bo;
 
+   /* Lazy command storage for an ordered end-stamp carrier when a leading
+    * TOP_OF_PIPE timestamp cannot safely ride on the first command's start. */
+   struct agx_bo *ts_carrier_bo;
+
+   /* Lazy command storage for the memory-scoped cache flush that ends a
+    * submission whose command buffers deferred host availability
+    * (hk_sync_defer_host_flush()). */
+   struct agx_bo *host_flush_bo;
+
    /* Kinds of streams this queue has ever run, see hk_sync.h. */
    struct hk_sync_queue sync;
 
    /* Scratch for queue_submit: the resolved sync fields of each stream
     * occurrence of the submission being built (hk_sync_resolve_submit()). */
    struct util_dynarray sync_resolved;
+
+   /* Reusable scratch for submit packing (hk_pack_runs()). */
+   struct {
+      struct util_dynarray members;
+      struct util_dynarray runs;
+      struct util_dynarray commands;
+      struct hk_packed_submit *packets;
+      unsigned packets_cap;
+   } pack;
 
    /* Compute kick (hk_compute_kick.c). watched is set at device creation
     * for a queue whose priority class has a kick queue. The rest is
@@ -115,6 +160,9 @@ struct hk_queue {
       bool used;
       /* Timeline point of the latest submission to a sibling. */
       uint64_t last_point;
+      /* Timeline point of the latest packed submission containing global
+       * atomics; sibling routing stays off until it completes. */
+      uint64_t packed_atomic_point;
    } sib;
 };
 
@@ -122,6 +170,45 @@ static inline struct hk_device *
 hk_queue_device(struct hk_queue *queue)
 {
    return (struct hk_device *)queue->vk.base.device;
+}
+
+
+/* Whether a queue publishes API signals from its cumulative queue timeline
+ * because independent engines or sibling kernel queues may finish out of
+ * order. */
+static inline bool
+hk_queue_uses_cumulative_signals(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G17P ||
+          (dev->params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) != 0;
+}
+
+/* Whether a non-chunked submission with output signals can publish them
+ * atomically inside DRM_IOCTL_ASAHI_SUBMIT via cumulative signals. */
+static inline bool
+hk_queue_kernel_cumulative_supported(const struct agx_device *dev,
+                                     bool cumulative_signals,
+                                     bool chunk_timelines,
+                                     unsigned signal_count)
+{
+   return cumulative_signals && !chunk_timelines && signal_count > 0 &&
+          (dev->params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) != 0;
+}
+
+/* Whether a VkQueue should open sibling compute kernel queues to overlap
+ * independent compute kicks within the same context. Not where the kernel
+ * already spreads each queue's independent compute over several firmware
+ * queues (DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL): both would fan out. */
+static inline bool
+hk_queue_sibling_compute_supported(const struct agx_device *dev,
+                                   bool exact_prior)
+{
+   const uint64_t required = DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS |
+                             DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
+   return !dev->is_virtio && exact_prior &&
+          hk_queue_uses_cumulative_signals(dev) &&
+          (dev->params.features & required) == required &&
+          !(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL);
 }
 
 VkResult hk_queue_init(struct hk_device *dev,
@@ -136,7 +223,15 @@ void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_device_quiesce_lost_submissions(struct hk_device *dev);
 
+/* The first command buffer of the submission whose recording failed, or NULL.
+ * Such a command buffer is not executable (vkEndCommandBuffer returned its
+ * error) and its streams may be incomplete. */
+struct vk_command_buffer *
+hk_submit_first_errored_cmd_buffer(const struct vk_queue_submit *submit);
+
 VkResult hk_queue_submit_bind_sparse_memory(struct hk_device *device,
                                             struct vk_queue_submit *submission);
+
+uint32_t hk_queue_independent_budget(struct hk_device *dev);
 
 void hk_queue_share(struct hk_device *dev, struct hk_queue *queue);

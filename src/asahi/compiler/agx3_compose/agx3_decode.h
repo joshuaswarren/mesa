@@ -17,11 +17,12 @@
 #include "agx3_compose.h"
 
 /*
- * Decode `size` bytes as one instruction of table `t`. When `mnemonic` is
- * non-NULL only forms of that mnemonic are tried. On success returns the form
+ * Decode `size` bytes as one instruction of table `t`. Unless `mnemonic` is
+ * AGX3_MN_NONE only forms of that mnemonic are tried. On success returns the form
  * index and fills fields[]; returns -1 if no form reproduces the bytes.
  */
 int32_t agx3_decode(const agx3_table *t, const uint8_t *data, unsigned size,
-                    const char *mnemonic, uint64_t fields[AGX3_MAX_FIELDS]);
+                    enum agx3_mnemonic mnemonic,
+                    uint64_t fields[AGX3_MAX_FIELDS]);
 
 #endif

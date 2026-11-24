@@ -10,10 +10,8 @@
  * b/bn are the actual branches, carrying a signed byte displacement patched in
  * after block offsets are known. Conditions are AGX2's own icond/fcond enums.
  *
- * Every encoder here is grade A: it reproduces Apple's witnessed instruction
- * bytes exactly via the generated composer. What is NOT here is the lowering --
- * turning IR structured control flow into these sequences with flag-slot
- * allocation and branch fixups -- which lives in the backend.
+ * Structured control-flow lowering (flag-slot allocation and branch fixups)
+ * lives in the backend.
  */
 
 #pragma once
@@ -46,19 +44,9 @@ enum agx3_cf_fcond {
    AGX3_CF_FCOND_GT = 2,
 };
 
-/*
- * The longest control-flow form is fourteen bytes: `fcmp.ep2`, which is what
- * an absolute-valued comparison source moves to.  This was 10 -- the length
- * of `fcmp.ep1` -- so agx3_cf_fcmp_reg_abs() wrote four bytes past the end of
- * every caller's buffer, all of which are sized by this macro.  Nothing
- * caught it because the overrun lands in stack padding on the paths that
- * reach it; building a caller with a stack protector aborts on the spot.
- */
-#define AGX3_CF_MAX_LENGTH 14u
-/* `b`/`bn`, whose displacement agx3_cf_patch_branch() fills in later. This is
- * the size a caller must RESERVE for a forward branch, which is not the same
- * number as the buffer bound above. */
-#define AGX3_CF_MAX_FLAG_SLOT 5u /* slots 0..5 are witnessed */
+/* Longest control-flow form is 14 bytes (`fcmp.ep2` with abs modifier). */
+#define AGX3_CF_MAX_LENGTH    14u
+#define AGX3_CF_MAX_FLAG_SLOT 5u
 
 struct agx3_cf_source_hints {
    bool cache;
@@ -79,15 +67,15 @@ bool agx3_cf_icmp_reg16(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
 bool agx3_cf_icmp_reg(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                       unsigned slot, uint16_t src0, uint16_t src1,
                       uint8_t out[AGX3_CF_MAX_LENGTH], uint8_t *len);
-/* flag[slot] = (32-bit register src0 cond 32-bit uniform), the form Apple's
- * G17P and G17G loop tests use. `uniform` is an even half index below 256. */
+/* flag[slot] = (32-bit register src0 cond 32-bit uniform); `uniform` is an
+ * even half index below 256. */
 bool agx3_cf_icmp_reg_uniform32(enum agx_isa_encoding enc,
                                 enum agx3_cf_icond cond, unsigned slot,
                                 uint16_t src0, uint16_t uniform,
                                 struct agx3_cf_source_hints hint,
                                 uint8_t out[AGX3_CF_MAX_LENGTH], uint8_t *len);
 /* flag[slot] = (32-bit uniform cond imm); `uniform` is an even half index
- * below 256. Apple's G17P/G17G loop-guard form. */
+ * below 256. */
 bool agx3_cf_icmp_uniform_imm(enum agx_isa_encoding enc,
                               enum agx3_cf_icond cond, unsigned slot,
                               uint16_t uniform, uint8_t imm,
@@ -96,29 +84,8 @@ bool agx3_cf_icmp_imm(enum agx_isa_encoding enc, enum agx3_cf_icond cond,
                       unsigned slot, uint16_t src0, uint8_t imm,
                       uint8_t out[AGX3_CF_MAX_LENGTH], uint8_t *len);
 
-/*
- * The same encoding point with a non-zero immediate.  `int n; if (n < 2)` is
- * ordinary GLSL -- Hyprland's border, shadow and inner-glow shaders all reach
- * the packer that way -- and Mesa keeps a small int in a 16-bit half, so it
- * arrives here rather than at agx3_cf_icmp_imm().
- *
- * Witnessed with `metal-nt -arch applegpu_g17p` against the zero form as the
- * control, one kernel per immediate and nothing else changed.  Every witness
- * is the same ten-byte instruction with only f16 different, which is the
- * field agx3_cf_icmp_imm() already uses for the 32-bit source form:
- *
- *   short x;  if (x < 0)    0a 04 23 80 02 00 07 c2 02 00   (== the zero form)
- *   short x;  if (x < 2)    0a 04 23 82 02 00 07 c2 02 00
- *   short x;  if (x < 17)   0a 04 23 90 02 00 17 c2 02 00
- *   short x;  if (x < 255)  0a 04 33 fe 02 00 17 c2 02 00
- *   short x;  if (x > 5)    0a 04 23 84 02 00 16 c2 02 00
- *   short x;  if (x == 7)   0a 04 23 86 06 00 17 c2 02 00
- *   ushort x; if (x == 2)   0a 04 23 82 06 00 07 c2 02 00
- *
- * The two unsigned ordered relations use the compact six-byte encoding point.
- * Fresh dead/live witnesses for `ushort x < 4` are both
- * 0a 04 22 84 05 c2, so that form has no source-lifetime fields. At 256 and
- * above Apple changes the instruction, so the immediate is capped at 255.
+/* 16-bit integer compare against an 8-bit immediate (0..255). Unsigned ordered
+ * relations use the compact 6-byte form (no source-lifetime fields).
  */
 bool agx3_cf_icmp_imm16_runtime(enum agx_isa_encoding enc,
                                 enum agx3_cf_icond cond, unsigned slot,
@@ -200,37 +167,9 @@ bool agx3_cf_cndlt(enum agx_isa_encoding enc, unsigned slot, bool invert,
 bool agx3_cf_cndef(enum agx_isa_encoding enc, uint8_t out[AGX3_CF_MAX_LENGTH],
                    uint8_t *len);
 
-/*
- * cndcf selects lanes to leave the current construct when flag[slot] XOR
- * invert is true. They stay inactive until `level_count` architectural
- * exec-mask levels have been popped. CNDLT instead retains lanes whose
- * predicate is true. These forms therefore require opposite predicate senses
- * when lowering the same BREAK_IF. A loop owns two levels; deeper breaks use
- * CNDCF's sixteen-bit level count.
- *
- * Witnessed with `metal-nt -arch applegpu_g17p` from MSL that breaks out of
- * a loop from inside 2..7 nested ifs, each condition reading a distinct
- * `device const uint *` element so the Metal compiler cannot flatten them.
- * Apple's bytes, and ours, byte for byte:
- *
- *   ifs=2  cndcf slot1 count3   8f 05 54 03 00 01
- *   ifs=3  cndcf slot1 count4   8f 05 54 04 00 01
- *   ifs=4  cndcf slot1 count5   8f 05 54 05 00 01
- *   ifs=5  cndcf slot1 count6   8f 05 54 06 00 01
- *   ifs=6  cndcf slot1 count7   8f 05 54 07 00 01
- *   ifs=7  cndcf slot1 count8   8f 05 54 08 00 01
- *   break in an else arm        8f 05 54 03 00 09   (invert = f0, bit 43)
- *   break in an INNER loop      8f 05 54 03 00 02   (slot 2, count still 3)
- *
- * The count is the number of levels open *inside the innermost loop*, loop
- * included: an outer loop's levels do not raise it, which is exactly how
- * Mesa's per-loop `loop_nesting` counter is defined. Negating the innermost
- * condition changes the compare and leaves these bytes identical, so the
- * break's sense lives in the compare, not in the count.
- *
- * The AGX3c constants mirror the sibling cnd encoders here (selector f3 = 28
- * from AGX3c.xml's `f3eq28` predicate, as cndlt uses 31 and cndst 33); AGX3c
- * parts have no captured witness for this operation.
+/* cndcf deactivates lanes when (flag[slot] ^ invert) is true until
+ * `level_count` exec-mask levels (inside the innermost loop, matching
+ * `loop_nesting`) have been popped. Opposite predicate sense to cndlt.
  */
 bool agx3_cf_cndcf(enum agx_isa_encoding enc, unsigned slot, bool invert,
                    unsigned level_count, uint8_t out[AGX3_CF_MAX_LENGTH],

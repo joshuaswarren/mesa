@@ -8,13 +8,6 @@
 
 #include <string.h>
 
-static bool
-is_agx3_encoding(enum agx_isa_encoding encoding)
-{
-   return encoding == AGX_ISA_ENCODING_AGX3B ||
-          encoding == AGX_ISA_ENCODING_AGX3C;
-}
-
 static void
 write_le16(uint8_t *bytes, uint16_t value)
 {
@@ -26,7 +19,7 @@ bool
 agx3_pack_ldimm_u32(enum agx_isa_encoding encoding, uint16_t dest,
                     uint32_t imm, struct agx3_encoded_ldimm *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 256 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 256 ||
        (dest & 1) != 0)
       return false;
 
@@ -82,7 +75,7 @@ agx3_pack_iadd_u32_imm8(enum agx_isa_encoding encoding, uint16_t dest,
                         uint16_t src, uint8_t imm,
                         struct agx3_encoded_iadd_u32_imm8 *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || (dest & 1) != 0 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || (dest & 1) != 0 ||
        (src & 1) != 0)
       return false;
 
@@ -147,7 +140,7 @@ agx3_pack_iadd_u32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
                            uint16_t src0, uint16_t src1,
                            struct agx3_encoded_iadd_u32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || (dest & 1) != 0 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || (dest & 1) != 0 ||
        (src0 & 1) != 0 || (src1 & 1) != 0)
       return false;
 
@@ -213,7 +206,7 @@ agx3_pack_fadd_f32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
                            uint16_t src0, uint16_t src1,
                            struct agx3_encoded_fadd_f32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 256 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 256 ||
        src0 >= 256 || src1 >= 256 || (dest & 1) != 0 || (src0 & 1) != 0 ||
        (src1 & 1) != 0)
       return false;
@@ -250,7 +243,7 @@ agx3_pack_fmul_f32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
                            uint16_t src0, uint16_t src1,
                            struct agx3_encoded_fmul_f32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 128 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 128 ||
        src0 >= 128 || src1 >= 128 || (dest & 1) != 0 || (src0 & 1) != 0 ||
        (src1 & 1) != 0)
       return false;
@@ -291,7 +284,7 @@ agx3_pack_fma_f32_reg_reg_reg(
    uint16_t mul1, uint16_t addend,
    struct agx3_encoded_fma_f32_reg_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 128 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 128 ||
        mul0 >= 128 || mul1 >= 128 || addend >= 128 || (dest & 1) != 0 ||
        (mul0 & 1) != 0 || (mul1 & 1) != 0 || (addend & 1) != 0)
       return false;
@@ -358,7 +351,7 @@ agx3_pack_fmin_f32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
                            uint16_t src0, uint16_t src1,
                            struct agx3_encoded_fmin_f32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 128 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 128 ||
        src0 >= 128 || src1 >= 128 || (dest & 1) != 0 || (src0 & 1) != 0 ||
        (src1 & 1) != 0)
       return false;
@@ -426,7 +419,7 @@ agx3_pack_fmax_f32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
                            uint16_t src0, uint16_t src1,
                            struct agx3_encoded_fmax_f32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 128 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 128 ||
        src0 >= 128 || src1 >= 128 || (dest & 1) != 0 || (src0 & 1) != 0 ||
        (src1 & 1) != 0)
       return false;
@@ -494,7 +487,7 @@ agx3_pack_i32_to_f32_reg(enum agx_isa_encoding encoding, uint16_t dest,
                          uint16_t src,
                          struct agx3_encoded_i32_to_f32_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 128 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 128 ||
        src >= 128 || (dest & 1) != 0 || (src & 1) != 0)
       return false;
 
@@ -545,7 +538,7 @@ agx3_pack_u32_to_f32_reg(enum agx_isa_encoding encoding, uint16_t dest,
                          uint16_t src,
                          struct agx3_encoded_u32_to_f32_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 128 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 128 ||
        src >= 128 || (dest & 1) != 0 || (src & 1) != 0)
       return false;
 
@@ -595,7 +588,7 @@ bool
 agx3_pack_f32_rint_reg(enum agx_isa_encoding encoding, uint16_t dest,
                        uint16_t src, struct agx3_encoded_f32_rint_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 128 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 128 ||
        src >= 128 || (dest & 1) != 0 || (src & 1) != 0)
       return false;
 
@@ -642,7 +635,7 @@ bool
 agx3_pack_f32_rcp_reg(enum agx_isa_encoding encoding, uint16_t dest,
                       uint16_t src, struct agx3_encoded_f32_rcp_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 128 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 128 ||
        src >= 128 || (dest & 1) != 0 || (src & 1) != 0)
       return false;
 
@@ -685,7 +678,7 @@ agx3_pack_f32_rsqrt_reg(enum agx_isa_encoding encoding, uint16_t dest,
                         uint16_t src,
                         struct agx3_encoded_f32_rsqrt_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 128 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 128 ||
        src >= 128 || (dest & 1) != 0 || (src & 1) != 0)
       return false;
 
@@ -729,7 +722,7 @@ agx3_pack_f32_to_int_rtz_reg(
    uint16_t dest, uint16_t src,
    struct agx3_encoded_f32_to_int_rtz_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) ||
        (mode != AGX3_F32_TO_I32_RTZ && mode != AGX3_F32_TO_U32_RTZ) ||
        dest >= 128 || src >= 128 || (dest & 1) != 0 || (src & 1) != 0)
       return false;
@@ -788,7 +781,7 @@ agx3_pack_bit_and_u32_reg_reg(
    enum agx_isa_encoding encoding, uint16_t dest, uint16_t src0,
    uint16_t src1, struct agx3_encoded_bit_and_u32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 256 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 256 ||
        src0 >= 256 || src1 >= 256 || (dest & 1) != 0 || (src0 & 1) != 0 ||
        (src1 & 1) != 0)
       return false;
@@ -850,7 +843,7 @@ agx3_pack_bit_or_u32_reg_reg(
    enum agx_isa_encoding encoding, uint16_t dest, uint16_t src0,
    uint16_t src1, struct agx3_encoded_bit_or_u32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 256 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 256 ||
        src0 >= 256 || src1 >= 256 || (dest & 1) != 0 || (src0 & 1) != 0 ||
        (src1 & 1) != 0)
       return false;
@@ -912,7 +905,7 @@ agx3_pack_bit_xor_u32_reg_reg(
    enum agx_isa_encoding encoding, uint16_t dest, uint16_t src0,
    uint16_t src1, struct agx3_encoded_bit_xor_u32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 256 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 256 ||
        src0 >= 256 || src1 >= 256 || (dest & 1) != 0 || (src0 & 1) != 0 ||
        (src1 & 1) != 0)
       return false;
@@ -974,7 +967,7 @@ agx3_pack_bit_not_u32_reg(enum agx_isa_encoding encoding, uint16_t dest,
                           uint16_t src,
                           struct agx3_encoded_bit_not_u32_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || dest >= 256 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || dest >= 256 ||
        src >= 256 || (dest & 1) != 0 || (src & 1) != 0)
       return false;
 
@@ -1027,7 +1020,7 @@ agx3_pack_isub_u32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
                            uint16_t src0, uint16_t src1,
                            struct agx3_encoded_isub_u32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || (dest & 1) != 0 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || (dest & 1) != 0 ||
        (src0 & 1) != 0 || (src1 & 1) != 0)
       return false;
 
@@ -1093,7 +1086,7 @@ agx3_pack_sll_u32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
                           uint16_t src0, uint16_t src1,
                           struct agx3_encoded_sll_u32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || (dest & 1) != 0 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || (dest & 1) != 0 ||
        (src0 & 1) != 0 || (src1 & 1) != 0)
       return false;
 
@@ -1160,7 +1153,7 @@ agx3_pack_asr_i32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
                           uint16_t src0, uint16_t src1,
                           struct agx3_encoded_asr_i32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || (dest & 1) != 0 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || (dest & 1) != 0 ||
        (src0 & 1) != 0 || (src1 & 1) != 0)
       return false;
 
@@ -1226,7 +1219,7 @@ agx3_pack_lsr_u32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
                           uint16_t src0, uint16_t src1,
                           struct agx3_encoded_lsr_u32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || (dest & 1) != 0 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || (dest & 1) != 0 ||
        (src0 & 1) != 0 || (src1 & 1) != 0)
       return false;
 
@@ -1293,7 +1286,7 @@ agx3_pack_imul_u32_reg_reg(enum agx_isa_encoding encoding, uint16_t dest,
                            uint16_t src0, uint16_t src1,
                            struct agx3_encoded_imul_u32_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || (dest & 1) != 0 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || (dest & 1) != 0 ||
        (src0 & 1) != 0 || (src1 & 1) != 0)
       return false;
 
@@ -1361,7 +1354,7 @@ agx3_pack_imadd_u32_reg_reg_reg(
    uint16_t mul1, uint16_t addend,
    struct agx3_encoded_imadd_u32_reg_reg_reg *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || (dest & 1) != 0 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || (dest & 1) != 0 ||
        (mul0 & 1) != 0 || (mul1 & 1) != 0 || (addend & 1) != 0)
       return false;
 
@@ -1438,10 +1431,37 @@ agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
                          struct agx3_encoded_scoped_barrier *out)
 {
    if (scope == AGX3_BARRIER_SCOPE_SUBGROUP_SHARED) {
-      if (!is_agx3_encoding(encoding) || out == NULL)
+      if (!agx_isa_is_agx3(encoding) || out == NULL)
          return false;
       memset(out, 0, sizeof(*out));
       return true;
+   }
+   /*
+    * The barrier's fields mean the same on both encodings: the memory class
+    * (f24 device, f26 threadgroup, f28 texture), f29 the threadgroup
+    * rendezvous, f39 the threadgroup memory scope. Each witnessed
+    * memory-only fence is its barrier with f29 cleared and f40 set: the
+    * device fence (device barrier f24 f29 f39 -> f24 f39 f40) and, on AGX3C,
+    * atomic_thread_fence(mem_texture, thread_scope_threadgroup) (texture
+    * barrier f28 f29 f39 f40 f41 -> f28 f39 f40 f41). The threadgroup-memory
+    * fence is the threadgroup barrier (f26 f29 f39) with the same rule
+    * applied. A rendezvous in its place would count arrivals that a fence
+    * in divergent control flow never gets from the rest of the workgroup.
+    */
+   if (scope == AGX3_BARRIER_SCOPE_THREADGROUP_FENCE) {
+      if (out == NULL || (encoding != AGX_ISA_ENCODING_AGX3B &&
+                          encoding != AGX_ISA_ENCODING_AGX3C))
+         return false;
+      const struct agx3_field_kv fields[] = {
+         {14, 3}, {15, 9}, {26, 1}, {30, 2}, {39, 1}, {40, 1},
+      };
+      const bool agx3c = encoding == AGX_ISA_ENCODING_AGX3C;
+      memset(out, 0, sizeof(*out));
+      /* f14/f15 are fixed fields of the AGX3C form only. */
+      return agx3_bind_compose(encoding, AGX3_MN_barrier, 0,
+                               fields + (agx3c ? 0 : 2),
+                               agx3c ? 6 : 4, NULL, 0, out->bytes,
+                               &out->length);
    }
    if (scope == AGX3_BARRIER_SCOPE_MESH_PAYLOAD_ENTRY ||
        scope == AGX3_BARRIER_SCOPE_OBJECT_PAYLOAD_EXIT) {
@@ -1459,7 +1479,7 @@ agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
       unsigned count=object ? sizeof(object_fields)/sizeof(object_fields[0])
                             : sizeof(mesh_fields)/sizeof(mesh_fields[0]);
       memset(out,0,sizeof(*out));
-      return agx3_bind_compose(encoding,"barrier",0,fields,
+      return agx3_bind_compose(encoding,AGX3_MN_barrier,0,fields,
          count,NULL,0,out->bytes,&out->length);
    }
 
@@ -1574,7 +1594,7 @@ agx3_pack_scoped_barrier_wait(enum agx_isa_encoding encoding,
    }
 
    uint8_t first[AGX3_SCOPED_BARRIER_MAX_LENGTH], len = 0;
-   if (!agx3_bind_compose(encoding, "barrier", 0, base,
+   if (!agx3_bind_compose(encoding, AGX3_MN_barrier, 0, base,
                           sizeof(base) / sizeof(base[0]), wait, n, first,
                           &len) ||
        len != 6) {
@@ -1608,7 +1628,7 @@ agx3_pack_simd_broadcast_f32_imm(
    enum agx_isa_encoding encoding, uint16_t dest, uint16_t src, uint8_t lane,
    struct agx3_encoded_simd_broadcast_f32_imm *out)
 {
-   if (out == NULL || !is_agx3_encoding(encoding) || (dest & 1) != 0 ||
+   if (out == NULL || !agx_isa_is_agx3(encoding) || (dest & 1) != 0 ||
        (src & 1) != 0 || (lane != 0 && lane != 3))
       return false;
 
@@ -1663,7 +1683,7 @@ agx3_pack_simd_broadcast_f32_imm(
 bool
 agx3_pack_end(enum agx_isa_encoding encoding, struct agx3_encoded_end *out)
 {
-   if (!is_agx3_encoding(encoding) || out == NULL)
+   if (!agx_isa_is_agx3(encoding) || out == NULL)
       return false;
 
    memset(out, 0, sizeof(*out));
@@ -1757,23 +1777,17 @@ agx3_pack_intersect_ray(enum agx_isa_encoding encoding,
    return true;
 }
 
+static enum agx_isa_encoding
+agx3_ray_opcode_chip_encoding(enum agx_chip chip)
+{
+   return agx_chip_has_agx3_ray_opcodes(chip) ? agx_chip_isa_encoding(chip)
+                                              : AGX_ISA_ENCODING_UNKNOWN;
+}
+
 enum agx_isa_encoding
 agx3_intersect_ray_witnessed_chip_encoding(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G17P:
-      return AGX_ISA_ENCODING_AGX3B;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-      return AGX_ISA_ENCODING_AGX3C;
-   default:
-      return AGX_ISA_ENCODING_UNKNOWN;
-   }
+   return agx3_ray_opcode_chip_encoding(chip);
 }
 
 static const uint8_t continue_ray_canonical_agx3b[] = {
@@ -1868,21 +1882,7 @@ agx3_pack_continue_ray(enum agx_isa_encoding encoding,
 enum agx_isa_encoding
 agx3_continue_ray_witnessed_chip_encoding(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G17P:
-      return AGX_ISA_ENCODING_AGX3B;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-      return AGX_ISA_ENCODING_AGX3C;
-   default:
-      return AGX_ISA_ENCODING_UNKNOWN;
-   }
+   return agx3_ray_opcode_chip_encoding(chip);
 }
 
 bool
@@ -1944,18 +1944,5 @@ agx3_pack_inc_stk_fixed_witness(
 enum agx_isa_encoding
 agx3_inc_stk_witnessed_chip_encoding(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G17P:
-      return AGX_ISA_ENCODING_AGX3B;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-      return AGX_ISA_ENCODING_AGX3C;
-   default:
-      return AGX_ISA_ENCODING_UNKNOWN;
-   }
+   return agx3_ray_opcode_chip_encoding(chip);
 }

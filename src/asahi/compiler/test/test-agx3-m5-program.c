@@ -337,18 +337,18 @@ test_m5_dispatch(enum agx_chip chip)
  * it writes into the single-kick slot from a kernel's template. */
 static void
 select_launch_model(const uint32_t tmpl[11], bool run, uint32_t groups_x,
-                    uint32_t height, uint32_t depth, unsigned log2,
+                    uint32_t groups_y, uint32_t depth, unsigned log2,
                     uint32_t out[11])
 {
    uint32_t word0 = tmpl[0];
-   if (!run || (height < 2 && depth < 2))
+   if (!run || (groups_y < 2 && depth < 2))
       word0 &= 0xfff1ffffu;
    out[0] = word0;
    out[1] = tmpl[1];
    out[2] = tmpl[2];
    out[3] = tmpl[3];
    out[4] = run ? groups_x << log2 : 0;
-   out[5] = run ? height : 0;
+   out[5] = run ? groups_y : 0;
    out[6] = run ? depth : 0;
    out[7] = run ? tmpl[7] : 0;
    out[8] = run ? tmpl[8] : 0;
@@ -384,20 +384,36 @@ test_m5_single_kick_launch(enum agx_chip chip)
       CHECK(sink.length == sizeof(tmpl));
 
       const uint32_t dims[][3] = {
-         {1, 1, 1}, {31, 1, 1}, {32, 1, 1}, {33, 1, 1}, {1920, 1080, 1},
-         {64, 1, 7}, {5, 3, 2}, {2976, 1872, 1},
+         {1, 1, 1}, {31, 1, 1}, {32, 1, 1}, {33, 1, 1}, {64, 1, 7},
+         /* Partial edge tiles at heights 2, 4, and 5: heights 2 and 4 collapse
+          * into a single 8x4 tile row (groups_y == 1, clearing the 2D/3D bits
+          * for depth == 1), while height 5 crosses into a second tile row
+          * (groups_y == 2, keeping the 2D encoding). */
+         {1, 2, 1}, {7, 2, 1}, {8, 2, 1}, {9, 2, 1}, {9, 2, 2},
+         {1, 4, 1}, {7, 4, 1}, {8, 4, 1}, {9, 4, 1}, {9, 4, 2},
+         {1, 5, 1}, {7, 5, 1}, {8, 5, 1}, {9, 5, 1}, {9, 5, 2},
+         {5, 3, 1}, {5, 3, 2}, {1920, 1080, 1}, {2976, 1872, 1},
       };
       for (unsigned i = 0; i < ARRAY_SIZE(dims); ++i) {
          const uint32_t w = dims[i][0], h = dims[i][1], d = dims[i][2];
-         const uint32_t groups_x = (w >> 5) + ((w & 31) ? 1 : 0);
+         const uint32_t groups_x = h > 1 ? ((w >> 3) + ((w & 7) ? 1 : 0))
+                                         : ((w >> 5) + ((w & 31) ? 1 : 0));
+         const uint32_t groups_y = h > 1 ? ((h >> 2) + ((h & 3) ? 1 : 0)) : h;
          uint32_t model[11];
-         select_launch_model(tmpl, true, groups_x, h, d, 5, model);
+         select_launch_model(tmpl, true, groups_x, groups_y, d, 5, model);
+         if (groups_y == 1 && d == 1)
+            CHECK((model[0] & 0x000e0000u) == 0);
+         else
+            CHECK((model[0] & 0x000e0000u) != 0);
+         CHECK(model[4] == (groups_x << 5));
+         CHECK(model[5] == groups_y);
+         CHECK(model[6] == d);
 
          /* hk_dispatch_m5_native's direct record for the same launch. */
          const struct agx3_compute_direct_grid grid = {
             .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
-            .size = {groups_x * 32, h, d}, .local_size = {32, 1, 1},
-            .dimensions = d != 1 ? 3 : h != 1 ? 2 : 1,
+            .size = {groups_x * 32, groups_y, d}, .local_size = {32, 1, 1},
+            .dimensions = d != 1 ? 3 : groups_y != 1 ? 2 : 1,
          };
          uint32_t host[11];
          sink = (struct agx3_compute_dispatch_sink){
@@ -685,9 +701,9 @@ test_load_completion_wait(enum agx_chip chip)
          {3, 16}, {16, 4}, {30, 1},
       };
       uint8_t expected[AGX_IOTO_MAX_RECORD_SIZE], length;
-      CHECK(agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "copy", 0,
+      CHECK(agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_copy, 0,
          fields, ARRAY_SIZE(fields), NULL, 0, expected, &length) ||
-            agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "copy", 1,
+            agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_copy, 1,
          fields, ARRAY_SIZE(fields), NULL, 0, expected, &length));
       CHECK(core.copy_suffix_offset + length <= core.sink.length);
       CHECK(!memcmp(body + core.copy_suffix_offset, expected, length));

@@ -121,7 +121,7 @@ agx_gallium_pack_g17p_txf_sampler(
 
    memset(out, 0, sizeof(*out));
 
-   if (agx_chip_g17_m5(chip) || chip == AGX_CHIP_G18G) {
+   if (agx_chip_hal300_path(chip)) {
       /* The same texel-fetch state in G17G's Gen5 record, as
        * hk_pack_native_txf_sampler() and the G17G tile reload use it: the
        * compare-mode selector is set even without a comparison. */
@@ -160,7 +160,7 @@ bool
 agx_gallium_g17p_sampler_handle(enum agx_chip chip, unsigned api_sampler,
                                 uint16_t *native_handle)
 {
-   if ((!agx_chip_native_agx3(chip) && chip != AGX_CHIP_G18G && !agx_chip_g17_m5(chip)) ||
+   if (!agx_chip_agx3_path(chip) ||
        api_sampler >= AGX_GALLIUM_G17P_API_SAMPLERS || !native_handle)
       return false;
 
@@ -173,7 +173,7 @@ agx_gallium_g17p_custom_border_handle(enum agx_chip chip,
                                       unsigned api_sampler,
                                       uint16_t *native_handle)
 {
-   if ((!agx_chip_native_agx3(chip) && chip != AGX_CHIP_G18G && !agx_chip_g17_m5(chip)) ||
+   if (!agx_chip_agx3_path(chip) ||
        api_sampler >= AGX_GALLIUM_G17P_API_SAMPLERS || !native_handle)
       return false;
 
@@ -477,6 +477,14 @@ agx_gallium_pack_native_pbe_impl(
       legacy->compressed && gen9 &&
       legacy->dimension == AGX_TEXTURE_DIMENSION_2D &&
       legacy->layout == AGX_LAYOUT_GPU && !multisample;
+   const bool compressed_2d_ms =
+      legacy->compressed && gen9 &&
+      legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED &&
+      legacy->layout == AGX_LAYOUT_GPU;
+   const bool compressed_layered =
+      legacy->compressed && gen9 && (array || three_d) &&
+      legacy->layout == AGX_LAYOUT_GPU &&
+      legacy->level == 0 && legacy->levels == 1 && !legacy->unk_mipmapped;
    if ((!layered && !multisample && !g18_layered &&
         legacy->dimension != AGX_TEXTURE_DIMENSION_2D) ||
        /* Gen10 linear 2D is agx_pbe_agx3_2d_pack()'s layout exactly. The
@@ -503,13 +511,15 @@ agx_gallium_pack_native_pbe_impl(
        (multisample ? (legacy->samples != AGX_SAMPLE_COUNT_2 &&
                        legacy->samples != AGX_SAMPLE_COUNT_4)
                     : legacy->samples != AGX_SAMPLE_COUNT_2) ||
-       (legacy->compressed && !compressed_2d && !gen10_multisample) ||
+       (legacy->compressed && !compressed_2d && !compressed_2d_ms &&
+        !compressed_layered && !gen10_multisample) ||
        legacy->mode != AGX_IMAGE_MODE_NORMAL ||
        (!layered && !g18_layered && legacy->layers != 1) ||
        (g18_layered && legacy->layout == AGX_LAYOUT_LINEAR) ||
        (multisample && (legacy->layout == AGX_LAYOUT_LINEAR ||
                         legacy->level != 0 || legacy->levels != 1 ||
-                        legacy->unk_mipmapped || (gen9 && legacy->compressed))) ||
+                        legacy->unk_mipmapped ||
+                        (gen9 && legacy->compressed && !compressed_2d_ms))) ||
        (!gen9 && !g18_mips && (legacy->level != 0 || legacy->levels != 1 ||
                   legacy->unk_mipmapped)) ||
        (!gen9 && legacy->srgb) ||
