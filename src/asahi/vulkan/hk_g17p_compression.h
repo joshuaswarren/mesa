@@ -40,8 +40,9 @@
  *    plane 0 only). Multisampled depth goes through ZLS rather than the colour
  *    tilebuffer's background reload program, so it is unaffected by
  *    AGX_QUIRK_UNCOVERED_TILE_MS_DEFECT. The 2x/4x depth plane excludes
- *    input-attachment, feedback-loop and sample-location use (its S8 plane
- *    stays plain). The ZLS unit compresses the S8 stencil plane with the same
+ *    input-attachment use (its S8 plane stays plain); it admits the
+ *    feedback-loop usage and sample-location flag zink sets on every depth
+ *    attachment, as single-sample depth does. The ZLS unit compresses the S8 stencil plane with the same
  *    metadata layout as depth (stencil
  *    load/store compression bits 4/8), it is read through its R8_UINT
  *    alias, and its clears are metadata fast clears. Zink stores GL Z24S8
@@ -267,16 +268,20 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
        * colour tilebuffer's background reload program, so it is unaffected by
        * AGX_QUIRK_UNCOVERED_TILE_MS_DEFECT across native HAL200. Plane 0 is
        * verified lossless on M4 (G16G) and A18 Pro (G17P); 2x depth was also
-       * measured on M4 Pro / M4 Max (G17P). The S8 plane stays plain. */
+       * measured on M4 Pro / M4 Max (G17P). The S8 plane stays plain.
+       *
+       * Zink gives every depth attachment feedback-loop usage and the
+       * sample-location flag, so excluding them leaves every GL multisampled
+       * depth buffer plain. Neither changes how the plane is stored: the
+       * compression is lossless over the stored sample values, which custom
+       * sample locations only choose where to evaluate, and a feedback-loop
+       * read samples the plane through the texture unit, which already reads
+       * compressed 2x/4x depth. Input attachments stay excluded. */
       const bool depth_ms =
          plane == 0 &&
          (info->samples == VK_SAMPLE_COUNT_2_BIT ||
           info->samples == VK_SAMPLE_COUNT_4_BIT) &&
-         depth &&
-         !(info->usage & (VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
-                          VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)) &&
-         !(info->flags &
-           VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT);
+         depth && !(info->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
       /* Non-G17P HAL200 parts (G16G) only take 2x/4x MSAA depth here;
        * single-sample depth stays plain until verified separately on G16G. */
       if (chip != AGX_CHIP_G17P && !depth_ms)

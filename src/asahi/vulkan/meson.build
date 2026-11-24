@@ -1299,6 +1299,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  hal200_vulkan_msaa_depth_compression = executable(
+    'hal200-vulkan-msaa-depth-compression',
+    files('tests/hal200_vulkan_msaa_depth_compression.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   g17p_vulkan_layered_depth = executable(
     'g17p-vulkan-layered-depth',
     files('tests/g17p_vulkan_layered_depth.c'),
