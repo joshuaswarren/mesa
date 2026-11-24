@@ -146,6 +146,32 @@ test_g17p_graphics_root_requirement(void)
    CHECK(hk_agx3_g17p_graphics_needs_root(true, false, 0));
    CHECK(hk_agx3_g17p_graphics_needs_root(false, true, 0));
    CHECK(hk_agx3_g17p_graphics_needs_root(false, false, 1));
+
+   /* Set pointers after a root pointer at half 12: set k at 16 + 4k. */
+   uint64_t halfs[8] = {0};
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 2) == 0);
+   CHECK(!hk_agx3_g17p_graphics_needs_root(false, false, 0));
+   /* Unknown reads, or no sets: the layout's count. */
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, false, 12, 2) == 2);
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 0) == 0);
+   /* The root pointer itself (halves 12..15) is not a set pointer. */
+   halfs[0] = BITFIELD64_RANGE(12, 4);
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 2) == 0);
+   /* Any half of any set pointer keeps all of them. */
+   for (unsigned h = 16; h < 24; ++h) {
+      halfs[0] = BITFIELD64_BIT(h);
+      CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 2) == 2);
+   }
+   halfs[0] = BITFIELD64_BIT(24);
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 2) == 0);
+   /* Across a word boundary: root at 56, sets at 60..67. */
+   halfs[0] = 0;
+   halfs[1] = BITFIELD64_BIT(65 - 64);
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 56, 2) == 2);
+   halfs[1] = 0;
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 56, 2) == 0);
+   /* A window past the recorded halves is not known to be dead. */
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 1, true, 56, 2) == 2);
    return 0;
 }
 

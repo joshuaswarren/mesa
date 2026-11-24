@@ -3129,6 +3129,7 @@ hk_g17p_graphics_uniform_ranges(
    }
 
    bool effective_uses_root = s->info.agx3_uses_root;
+   uint8_t live_set_count = s->info.set_count;
    if (s->info.stage == MESA_SHADER_VERTEX &&
        s->b.info.agx3_root_uniform_usage_valid) {
       const bool hoisted = cmd->state.gfx.g17p_hoisted_preamble_va != 0;
@@ -3136,11 +3137,19 @@ hk_g17p_graphics_uniform_ranges(
          s->b.info.agx3_main_uses_root_uniform ||
          (!hoisted && s->b.info.has_preamble &&
           s->b.info.agx3_preamble_uses_root_uniform);
+      /* A vertex shader reading only push constants through uniform DMA
+       * (draw-ID indexed tiles, per-draw transforms) then has no root range
+       * at all, and its launches become push-only
+       * (hk_agx3_try_push_only_vs_program()). */
+      live_set_count = hk_agx3_g17p_graphics_live_set_count(
+         s->b.info.agx3_uniform_halfs,
+         ARRAY_SIZE(s->b.info.agx3_uniform_halfs),
+         s->b.info.agx3_uniform_halfs_valid, root_uniform, s->info.set_count);
    }
 
    if (hk_agx3_g17p_graphics_needs_root(
           effective_uses_root, linked->g17p_prolog_uses_root,
-          s->info.set_count)) {
+          live_set_count)) {
       if (!root_ptr)
          return hk_g17p_graphics_ranges_refused(range_count, count);
 

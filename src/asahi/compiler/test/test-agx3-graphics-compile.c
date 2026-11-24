@@ -9354,6 +9354,39 @@ test_agx3_vertex_without_preamble_has_none(void)
    return ok;
 }
 
+/* The driver keeps a vertex shader's descriptor-set pointers only when its
+ * uniform-half record names one (hk_agx3_g17p_graphics_live_set_count()).
+ * Firefox's vertex texel fetch through set 3 reads that set's pointer, halves
+ * 12..15 under lower_test_descriptor_set(), and not set 1's, halves 4..7.
+ */
+static bool
+test_agx3_vertex_set_pointer_uniform_halfs(void)
+{
+   nir_shader *nir = build_vs_indexed_texture_fetch();
+   if (!nir)
+      return false;
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.no_preamble = true;
+   key.reserved_preamble = 64;
+
+   struct agx_shader_part part = {0};
+   const bool ok = agx_compile_shader_nir(nir, &key, &part);
+   const uint64_t halfs = part.info.agx3_uniform_halfs[0];
+   const uint64_t set1 = BITFIELD64_RANGE(4, 4), set3 = BITFIELD64_RANGE(12, 4);
+   const bool named = ok && part.info.agx3_uniform_halfs_valid &&
+                      (halfs & set3) == set3 && !(halfs & set1);
+   if (!named) {
+      fprintf(stderr, "vertex set-pointer halves: ok=%d valid=%d "
+              "halfs0=0x%llx\n", ok, part.info.agx3_uniform_halfs_valid,
+              (unsigned long long)halfs);
+   }
+   free(part.binary);
+   ralloc_free(nir);
+   return named;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -9833,6 +9866,7 @@ main(int argc, char **argv)
    RUN(test_agx3_heavy_branch_loop_unroll_limit);
    RUN(test_g17c_txf_layer_saturation);
    RUN(test_agx3_tiny_push_vertex_preamble_inlined);
+   RUN(test_agx3_vertex_set_pointer_uniform_halfs);
 #undef RUN
 
    for (unsigned e = 0; e < ARRAY_SIZE(encodings); ++e) {

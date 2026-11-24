@@ -151,8 +151,8 @@ struct agx_shader_info {
    /* Number of uniforms */
    uint16_t push_count;
 
-   /* G17P load_preamble declarations after NIR optimization, in native
-    * half-register units. This is a publication contract, not a CProg TPS
+   /* G17P load_preamble declarations and bindless texture/sampler heap bases
+    * after NIR optimization, in native half-register units. This is a publication contract, not a CProg TPS
     * import layout. Consumers must also publish compiler rodata separately. */
    uint64_t agx3_uniform_halfs[AGX3_CPROG_INPUT_WORDS];
    bool agx3_uniform_halfs_valid;
