@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_cmd_buffer.h"
+#include "hk_identity_copy4.h"
 #include "util/format/u_format.h"
 #include "hk_frame_anatomy.h"
 #include "hk_ppp_state.h"
@@ -901,6 +902,7 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    if (!cmd->g17p_pristine)
       hk_reset_cmd_buffer(&cmd->vk, 0);
    cmd->g17p_pristine = false;
+   cmd->usage_flags = pBeginInfo->flags;
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
 
    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY &&
@@ -1451,12 +1453,19 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * that record writes the device's writes back for the host (a strong
     * flush alone leaves them in the GPU caches, and the end of a command
     * does not reliably write them back before completion is reported when
-    * render work shares the queue). The host can only observe it at the end
-    * of the submission or through an event, so it is deferred there
-    * (hk_sync_defer_host_flush()) instead of taking a compute command of its
-    * own between the work around it. */
-   if (hk_cdm_memory_scope_form(dev))
-      hk_sync_defer_host_flush(cmd, pDependencyInfo);
+    * render work shares the queue). An open compute stream holding work
+    * after the dependency's first scope takes the record, so the command
+    * that ends with the scope's work ends with the flush. Otherwise the
+    * host, which can only observe it at the end of the submission or
+    * through an event, gets it there (hk_sync_defer_host_flush()) instead of
+    * from a compute command of its own between the work around it. */
+   if (hk_cdm_memory_scope_form(dev)) {
+      struct hk_cs *flush = hk_sync_host_flush(cmd, pDependencyInfo);
+      if (flush) {
+         hk_ensure_cs_has_space(cmd, flush, AGX3_CDM_BARRIER_SIZE);
+         hk_cdm_visibility_flush(dev, flush, true);
+      }
+   }
 
    /* The dependency this barrier recorded is the one a continued instance
     * applies to its stream (hk_sync_merge_rendering()); a stream it created
@@ -1638,7 +1647,7 @@ hk_CmdBindDescriptorSets2KHR(
 }
 
 static void
-hk_push_constants(UNUSED struct hk_cmd_buffer *cmd,
+hk_push_constants(struct hk_cmd_buffer *cmd,
                   struct hk_descriptor_state *desc,
                   const VkPushConstantsInfoKHR *info)
 {
@@ -1649,6 +1658,12 @@ hk_push_constants(UNUSED struct hk_cmd_buffer *cmd,
       const uint64_t mask =
          clamped == 64 ? UINT64_MAX : ((UINT64_C(1) << clamped) - 1);
       desc->push_written_dwords |= mask << first_dw;
+   }
+
+   if (!cmd->in_meta && desc == &cmd->state.cs.descriptors &&
+       info->offset < HK_COMPUTE_OPT_PUSH_BYTES) {
+      unsigned size = MIN2(info->size, HK_COMPUTE_OPT_PUSH_BYTES - info->offset);
+      desc->identity_copy4_push_mask |= BITFIELD64_MASK(size) << info->offset;
    }
 
    /* D3D translation layers re-push unchanged constants before most draws.
@@ -3091,6 +3106,19 @@ hk_g17p_graphics_uniform_ranges(
                            HK_AGX3_G17P_GRAPHICS_MAX_RANGES, &count, sources))
       return hk_g17p_graphics_ranges_refused(range_count, count);
 
+   if (s->info.stage == MESA_SHADER_VERTEX &&
+       cmd->state.gfx.g17p_hoisted_preamble_va) {
+      if (count >= HK_AGX3_G17P_GRAPHICS_MAX_RANGES ||
+          !s->b.info.agx3_preamble_out_size_halfs)
+         return hk_g17p_graphics_ranges_refused(range_count, count);
+      sources[count] = HK_G17P_RANGE_SOURCE_PREAMBLE_OUT;
+      ranges[count++] = (struct agx3_ioto_uniform_range){
+         .start_halfs = s->b.info.agx3_preamble_out_start_half,
+         .size_halfs = s->b.info.agx3_preamble_out_size_halfs,
+         .address = cmd->state.gfx.g17p_hoisted_preamble_va,
+      };
+   }
+
    *range_count = count;
    return count <= HK_AGX3_G17P_GRAPHICS_MAX_RANGES;
 }
@@ -3107,6 +3135,7 @@ struct hk_g17p_gfx_loader {
    uint16_t range_start[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    uint16_t range_size[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    uint8_t range_count;
+   bool has_constant_program;
    uint16_t length;
    struct hk_g17p_patch_plan plan;
    uint8_t bytes[];
@@ -3117,9 +3146,10 @@ hk_g17p_gfx_loader_matches(const struct hk_g17p_gfx_loader *l,
                            const struct hk_shader *s,
                            const struct agx_ioto_g17p_imageblock *imageblock,
                            const struct agx3_ioto_uniform_range *ranges,
-                           size_t range_count)
+                           size_t range_count, bool has_constant_program)
 {
    if (l->s != s || l->range_count != range_count ||
+       l->has_constant_program != has_constant_program ||
        l->imageblock.tile_size_px != imageblock->tile_size_px ||
        l->imageblock.sample_size_B != imageblock->sample_size_B ||
        l->imageblock.nr_samples != imageblock->nr_samples)
@@ -3162,6 +3192,7 @@ hk_g17p_gfx_loader_create(struct hk_device *dev, const struct hk_shader *s,
    l->s = s;
    l->imageblock = desc->imageblock;
    l->range_count = desc->uniform_range_count;
+   l->has_constant_program = desc->constant_program.code_size != 0;
    l->length = t->program.length;
    memcpy(l->bytes, t->program.bytes, t->program.length);
    for (unsigned i = 0; i < l->range_count; ++i) {
@@ -3239,7 +3270,8 @@ hk_g17p_launch_flags(const struct hk_cmd_buffer *cmd, const struct hk_shader *s)
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
    uint8_t flags = gfx->root ? 1 : 0;
    if (s->info.stage == MESA_SHADER_VERTEX) {
-      flags |= (gfx->draw_params ? 2 : 0) | (gfx->draw_id_ptr ? 4 : 0);
+      flags |= (gfx->draw_params ? 2 : 0) | (gfx->draw_id_ptr ? 4 : 0) |
+               (gfx->g17p_hoisted_preamble_va ? 32 : 0);
    } else if (s->info.stage == MESA_SHADER_FRAGMENT) {
       flags |= (hk_cmd_uses_blend_constant(cmd) ? 8 : 0) |
                (agx_tilebuffer_spills(&gfx->render.tilebuffer) ? 16 : 0);
@@ -3287,6 +3319,7 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
          break;
       case HK_G17P_RANGE_SOURCE_DRAW_PARAMS:
       case HK_G17P_RANGE_SOURCE_DRAW_ID:
+      case HK_G17P_RANGE_SOURCE_PREAMBLE_OUT:
          break;
       case HK_G17P_RANGE_SOURCE_SET: {
          /* The set-pointer span the range was collected from: the one
@@ -3397,6 +3430,9 @@ hk_g17p_launch_replay(struct hk_cmd_buffer *cmd,
       case HK_G17P_RANGE_SOURCE_DRAW_ID:
          address = gfx->draw_id_ptr;
          break;
+      case HK_G17P_RANGE_SOURCE_PREAMBLE_OUT:
+         address = gfx->g17p_hoisted_preamble_va;
+         break;
       case HK_G17P_RANGE_SOURCE_SET: {
          /* As hk_g17p_graphics_uniform_ranges(): an unbound set reads the
           * zero page. */
@@ -3462,17 +3498,22 @@ hk_g17p_publish_gfx_loader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       .tile_size_px = tib->tile_size,
    };
 
+   const bool has_constant_program =
+      s->b.info.has_preamble &&
+      !(s->info.stage == MESA_SHADER_VERTEX &&
+        cmd->state.gfx.g17p_hoisted_preamble_va != 0);
    const struct hk_g17p_gfx_loader *l = cached->loader;
    unsigned shapes = 0;
    if (!l || cached->loader_linked != linked ||
-       !hk_g17p_gfx_loader_matches(l, s, &imageblock, ranges, range_count) ||
+       !hk_g17p_gfx_loader_matches(l, s, &imageblock, ranges, range_count,
+                                   has_constant_program) ||
        !hk_g17p_patch_plan_fits(&l->plan, ranges)) {
       l = NULL;
       for (struct hk_g17p_gfx_loader *it =
               p_atomic_read(&linked->g17p_gfx_loaders);
            it; it = it->next) {
          if (!hk_g17p_gfx_loader_matches(it, s, &imageblock, ranges,
-                                         range_count))
+                                         range_count, has_constant_program))
             continue;
          if (hk_g17p_patch_plan_fits(&it->plan, ranges)) {
             l = it;
@@ -3582,7 +3623,12 @@ hk_g17p_graphics_program_desc_init(
        desc->imageblock.nr_samples == 0 && desc->imageblock.sample_size_B == 0)
       desc->imageblock.nr_samples = 1;
 
-   if (s->b.info.has_preamble &&
+   const bool use_cprog =
+      s->b.info.has_preamble &&
+      !(s->info.stage == MESA_SHADER_VERTEX &&
+        cmd->state.gfx.g17p_hoisted_preamble_va != 0);
+
+   if (use_cprog &&
        (!s->bo || !s->bo->va || s->code_size != s->b.info.binary_size ||
         !hk_agx3_g17p_constant_program_from_binary(
            s->code_ptr, s->code_size, s->b.info.preamble_offset,
@@ -3593,16 +3639,18 @@ hk_g17p_graphics_program_desc_init(
       return false;
    }
 
-   desc->constant_program.request_prelude =
-      s->b.info.agx3_preamble_uniform_inputs;
-   if (s->b.info.agx3_preamble_tps_inputs) {
-      if (!s->b.info.has_preamble ||
-          s->b.info.preamble_scratch_size <
-             s->b.info.agx3_preamble_inputs.storage_bytes) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return false;
+   if (use_cprog) {
+      desc->constant_program.request_prelude =
+         s->b.info.agx3_preamble_uniform_inputs;
+      if (s->b.info.agx3_preamble_tps_inputs) {
+         if (!s->b.info.has_preamble ||
+             s->b.info.preamble_scratch_size <
+                s->b.info.agx3_preamble_inputs.storage_bytes) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            return false;
+         }
+         desc->cprog_inputs = &s->b.info.agx3_preamble_inputs;
       }
-      desc->cprog_inputs = &s->b.info.agx3_preamble_inputs;
    }
    return true;
 }
@@ -4029,11 +4077,15 @@ hk_agx3_indirect_ioto_prepare(
          .tile_size_px = tib->tile_size,
       };
 
+      const bool has_constant_program =
+         s->b.info.has_preamble && gfx->g17p_hoisted_preamble_va == 0;
+
       l = NULL;
       for (struct hk_g17p_gfx_loader *it =
               p_atomic_read(&linked->g17p_gfx_loaders);
            it; it = it->next) {
-         if (hk_g17p_gfx_loader_matches(it, s, &imageblock, first, count) &&
+         if (hk_g17p_gfx_loader_matches(it, s, &imageblock, first, count,
+                                        has_constant_program) &&
              hk_agx3_indirect_loader_fits(it, launch, first, last)) {
             l = it;
             break;
@@ -4848,6 +4900,20 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    cs->cr.bg.main = render->cr.bg.partial;
    cs->cr.eot.main = render->cr.eot.partial;
    cs->cr.zls_control = render->cr.zls_control_partial;
+
+   /* Conservative default for continuation/split streams where bg.main is
+    * bg.partial: every bound colour attachment has live BG contents and cannot
+    * be synthesized by constant epilog clear-fill. hk_begin_rendering()
+    * overrides these on the first stream of a non-resuming pass. */
+   uint8_t bound_color_mask = 0;
+   for (uint32_t i = 0; i < render->color_att_count; ++i) {
+      if (render->color_att[i].iview)
+         bound_color_mask |= BITFIELD_BIT(i);
+   }
+   cs->bg_live_mask = bound_color_mask;
+   cs->bg_clear_fill_rt = 0;
+   cs->user_color_written_mask = 0;
+   cs->opaque_color_written = 0;
 
    /* Barrier to enforce GPU-CPU coherency, in case this batch is back to back
     * with another that caused stale data to be cached and the CPU wrote to it

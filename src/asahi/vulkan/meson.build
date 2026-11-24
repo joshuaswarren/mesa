@@ -63,7 +63,9 @@ hk_files = files(
   'hk_image.h',
   'hk_image_layout_core.c',
   'hk_image_layout_core.h',
+  'hk_identity_copy4.h',
   'hk_image_view.c',
+  'hk_nir_copy_identity4.c',
   'hk_image_view.h',
   'hk_instance.c',
   'hk_instance.h',
@@ -110,8 +112,10 @@ hk_files = files(
   'hk_pack.c',
   'hk_pack.h',
   'hk_inline_blend_layout.h',
+  'hk_partial_mrt_hsr.h',
   'hk_queue.c',
   'hk_queue.h',
+  'hk_queue_flush.h',
   'hk_frame_anatomy.c',
   'hk_frame_anatomy.h',
   'hk_sampler.c',
@@ -163,6 +167,21 @@ if with_tests
         inc_src, inc_asahi,
       ],
       dependencies : [idep_nir, idep_mesautil]),
+    suite : ['asahi'])
+
+  test('hk_partial_mrt_hsr',
+    executable('hk_partial_mrt_hsr_test',
+      files('tests/test-hk-partial-mrt-hsr.c'),
+      include_directories : [
+        include_directories('.'), inc_gallium, inc_gallium_aux, inc_include,
+        inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm,
+      ],
+      dependencies : [
+        idep_nir, idep_mesautil, idep_libagx,
+        idep_libagx_shaders_h, idep_agx_pack,
+        idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+      ],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout]),
     suite : ['asahi'])
 
   test('hk_memory_budget', executable('hk_memory_budget_test',
@@ -221,6 +240,18 @@ if with_tests
     files('tests/test-hk-root-size.c', 'hk_nir_root_size.c'),
     include_directories : [include_directories('.'), inc_include, inc_src],
     dependencies : [idep_nir, idep_mesautil]), suite : ['asahi'])
+
+  test('hk_vdm_indirect_count',
+    executable('hk_vdm_indirect_count_test',
+      files('tests/test-hk-vdm-indirect-count.c'),
+      include_directories : [
+        include_directories('.'), inc_include, inc_src, inc_asahi,
+      ],
+      dependencies : [idep_mesautil, idep_agx_pack],
+      link_with : [libasahi_lib],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden'),
+    suite : ['asahi'])
   # Unused recording functions require section garbage collection so the
   # test can link the production resolver without the rest of the driver.
   if ld_args_gc_sections.length() > 0
@@ -1446,6 +1477,14 @@ if with_tests
     files('tests/test-hk-ray-tracing-core.c', 'hk_ray_tracing_core.c'),
     include_directories : [include_directories('.'), inc_include, inc_src]),
     suite : ['asahi'])
+  test('hk_root_only_flush', executable('hk_root_only_flush_test',
+    files('tests/test-hk-root-only-flush.c'),
+    c_args : ['-DNDEBUG'],
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]),
+    timeout : 30, suite : ['asahi'])
 endif
 
 if with_tests
@@ -1458,5 +1497,16 @@ if with_tests
       '-Wl,--wrap=drmIoctl',
       '-Wl,--wrap=os_get_available_system_memory',
       '-Wl,--wrap=os_get_total_physical_memory']),
+    timeout : 30, suite : ['asahi'])
+endif
+
+if with_tests
+  test('hk_identity_copy4', executable('hk_identity_copy4_test',
+    files('tests/test-hk-identity-copy4.c', 'hk_nir_copy_identity4.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi],
+    dependencies : [idep_nir, idep_mesautil, idep_libagx, dep_m],
+    link_with : [libasahi_compiler],
+    link_args : [ld_args_gc_sections]),
     timeout : 30, suite : ['asahi'])
 endif

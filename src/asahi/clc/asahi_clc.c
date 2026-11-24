@@ -387,6 +387,10 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_resolve_unorm8x4") ||
           !strcmp(func->name, "libagx_predicate_indirect") ||
           !strcmp(func->name, "libagx_build_indirect_vdm") ||
+          /* Runtime VDM stream truncation for drawIndirectCount: one
+           * invocation, binary search over constant spans, save/restore of one
+           * 8-byte VDM record header with a pre-packed VDM_STREAM_LINK. */
+          !strcmp(func->name, "libagx_patch_vdm_indirect_count") ||
           /* VK_KHR_ray_tracing_pipeline's indirect trace-rays setup.  One
            * invocation, three constant loads, three global stores and a shift
            * -- no atomics, no barriers, no printf, no scratch.  Its ARITHMETIC

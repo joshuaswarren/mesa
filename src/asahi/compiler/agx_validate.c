@@ -675,6 +675,27 @@ agx_validate_sr(const agx_instr *I)
    }
 }
 
+/* No AGX3 ballot compare takes a source modifier: agx3_emit_subgroup_ballot
+ * encodes plain operands only. */
+static bool
+agx_validate_agx3_ballot(const agx_context *ctx, const agx_instr *I)
+{
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding))
+      return true;
+
+   switch (I->op) {
+   case AGX_OPCODE_ICMP_BALLOT:
+   case AGX_OPCODE_FCMP_BALLOT:
+   case AGX_OPCODE_ICMP_QUAD_BALLOT:
+   case AGX_OPCODE_FCMP_QUAD_BALLOT:
+      agx_foreach_src(I, s)
+         agx_validate_assert(!I->src[s].abs && !I->src[s].neg);
+      return true;
+   default:
+      return true;
+   }
+}
+
 void
 agx_validate(agx_context *ctx, const char *after)
 {
@@ -739,6 +760,12 @@ agx_validate(agx_context *ctx, const char *after)
    agx_foreach_instr_global(ctx, I) {
       if (!agx_validate_sources(I)) {
          fprintf(stderr, "Invalid sources form after %s\n", after);
+         agx_print_instr(I, stderr);
+         fail = true;
+      }
+
+      if (!agx_validate_agx3_ballot(ctx, I)) {
+         fprintf(stderr, "Invalid AGX3 ballot source after %s\n", after);
          agx_print_instr(I, stderr);
          fail = true;
       }

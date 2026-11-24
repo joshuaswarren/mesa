@@ -70,6 +70,7 @@ bool agx_nir_opt_flatten_loads(struct nir_shader *shader, unsigned limit,
                                unsigned max_loads);
 bool agx_nir_opt_merge_nested_early_exits(struct nir_shader *shader);
 bool agx_nir_hoist_loop_invariant_guard_bits(struct nir_shader *shader);
+bool agx_nir_opt_factor_loop_mac(struct nir_shader *shader);
 bool agx_nir_opt_sink_loop_sample_uses(struct nir_shader *shader);
 bool agx_nir_opt_hoist_loop_samples(struct nir_shader *shader);
 bool agx_nir_opt_factor_const_mul(struct nir_shader *shader);
@@ -109,6 +110,8 @@ bool agx_nir_lower_shared_element_index(struct nir_shader *s);
 bool agx_nir_opt_shared_byte_offsets(struct nir_shader *s);
 bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget,
                       bool cap_rt_compute);
+bool agx_nir_opt_monotonic_bit_insert(struct nir_shader *shader);
+bool agx_nir_opt_iv_divmod(struct nir_shader *shader);
 bool agx_nir_lower_fminmax(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_fminmax_signed_zero(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_word_bounds(struct nir_shader *s);
@@ -400,3 +403,7 @@ bool agx_nir_lower_integer_division(struct nir_shader *nir,
                                     bool forms_preamble);
 bool agx_nir_has_loop(const struct nir_shader *nir);
 bool agx_nir_limit_heavy_branch_unroll(struct nir_shader *nir);
+bool agx_nir_opt_u8x4_hsum(struct nir_shader *shader);
+bool agx_nir_uniform_unit_global_id(struct nir_shader *nir);
+bool agx_nir_opt_uniform_stride_chains(struct nir_shader *shader,
+                                       bool no_textures);

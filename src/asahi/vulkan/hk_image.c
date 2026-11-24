@@ -228,7 +228,8 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
                   VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
    }
 
-   /* Our image atomic lowering doesn't bother to handle linear */
+   /* Our image atomic lowering doesn't bother to handle linear. R32_SFLOAT
+    * atomics are required wherever shaderImageFloat32Atomics is advertised. */
    if ((p_format == PIPE_FORMAT_R32_UINT || p_format == PIPE_FORMAT_R32_SINT ||
         (p_format == PIPE_FORMAT_R32_FLOAT &&
          pdev->vk.supported_features.shaderImageFloat32Atomics)) &&

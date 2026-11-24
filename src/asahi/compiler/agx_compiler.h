@@ -609,6 +609,15 @@ typedef struct agx_block {
    uint8_t pass_flags;
 } agx_block;
 
+/* How the AGX3 packer lets a loop's breaks leave it (agx3_slot_core.h). */
+enum agx3_break_joins {
+   /* Join a break's state into its loop's pop where that gains something
+    * (agx3_break_keeps_state()), drain it otherwise. */
+   AGX3_BREAKS_JOIN_GAINFUL = 0,
+   AGX3_BREAKS_JOIN_ALL,
+   AGX3_BREAKS_DRAIN,
+};
+
 typedef struct {
    nir_shader *nir;
    mesa_shader_stage stage;
@@ -742,6 +751,29 @@ typedef struct {
     * how far its texture reads reached and how many halves the outputs and
     * any image-write bank need above them. */
    unsigned agx3_g18g_output_staging_floor;
+
+   /* Pack with a scoreboard drain at every control-flow boundary, as the
+    * retry when keeping results in flight into if arms leaves a wait no
+    * instruction form can carry (agx3_pack_program()). */
+   bool agx3_cf_drain_all;
+   /* Pack with a drain at every loop entry, and what the last pack did:
+    * how many loop entries kept results in flight, and how many wait
+    * carriers it emitted inside loops (agx3_pack_program()). */
+   bool agx3_loop_entry_drain_all;
+   unsigned agx3_kept_loop_entries;
+   unsigned agx3_loop_carriers;
+   /* Pack with an if's arms draining at their ends instead of joining, and
+    * how many arm ends of the last pack the join kept from draining
+    * (agx3_pack_program()). */
+   bool agx3_arm_join_off;
+   unsigned agx3_joined_arm_drains;
+   /* How a pack's breaks leave their loops (enum agx3_break_joins), and of
+    * the last pack how many breaks a join kept from draining something and
+    * how many joining breaks drain because joining gained nothing
+    * (agx3_pack_program()). */
+   uint8_t agx3_break_joins;
+   unsigned agx3_joined_breaks;
+   unsigned agx3_refused_breaks;
    unsigned agx3_g18g_read_staging_end;
    unsigned agx3_g18g_output_staging_span;
    bool agx3_staging_known;
@@ -1607,6 +1639,7 @@ bool agx_nir_lower_shared_bitsize(nir_shader *shader, bool element_indices);
 bool agx_nir_lower_frag_sidefx(nir_shader *s, bool g17p);
 void agx_lower_agx3_fma_sources(agx_context *ctx);
 void agx_lower_agx3_half_converts(agx_context *ctx);
+void agx_opt_agx3_normflt_byte_pairs(agx_context *ctx);
 void agx_materialize_agx3_alu_constants(agx_context *ctx);
 void agx_lower_agx3_mixed_width_unary(agx_context *ctx);
 bool agx_lower_g17g_retry_float_operands(agx_context *ctx);

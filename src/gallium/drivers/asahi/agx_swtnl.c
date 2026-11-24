@@ -1724,14 +1724,27 @@ agx_swtnl_delete_shader(struct agx_context *ctx, struct agx_uncompiled_shader *s
  * Does this draw take the CPU path? G17G, a geometry stage (or tessellation
  * the draw module can do, see agx_m5_gpu_tess()), and nothing the CPU copy
  * does not see: no textures, images or storage buffers before rasterization.
+ *
+ * A layered framebuffer is drawn a layer at a time (agx_g17g_layered_draw),
+ * so the layer a vertex shader writes reaches the GPU only as the per-layer
+ * subsets drawn here. Without this, every primitive of such a draw (layered
+ * clears and blits through u_blitter, layered PBO transfers in st/mesa,
+ * gl_Layer from a vertex shader) lands in layer 0.
  */
 bool
 agx_swtnl_applies(struct agx_context *ctx)
 {
    if (!agx_chip_g17_m5(agx_device(ctx->base.screen)->chip) ||
-       ctx->swtnl_inner ||
-       (!ctx->stage[MESA_SHADER_GEOMETRY].shader &&
-        !ctx->stage[MESA_SHADER_TESS_EVAL].shader))
+       ctx->swtnl_inner)
+      return false;
+
+   const struct agx_uncompiled_shader *vs =
+      ctx->stage[MESA_SHADER_VERTEX].shader;
+   const bool vs_layer =
+      vs && vs->info.writes_layer &&
+      util_framebuffer_get_num_layers(&ctx->framebuffer) > 1;
+   if (!ctx->stage[MESA_SHADER_GEOMETRY].shader &&
+       !ctx->stage[MESA_SHADER_TESS_EVAL].shader && !vs_layer)
       return false;
 
    /* The draw module tessellates only with LLVM: without it, tessellation

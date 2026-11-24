@@ -456,7 +456,7 @@ can_repeat_alu(const agx_context *ctx, const agx_instr *I)
    }
 
    /* A texture coordinate producer is paired with its sample */
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C || ctx->is_preamble ||
+   if (!agx_isa_is_agx3(ctx->key->dev.encoding) || ctx->is_preamble ||
        I->nr_dests != 1 || I->dest[0].type != AGX_INDEX_NORMAL ||
        I->dest[0].memory || I->agx3_tex_coord_stage ||
        I->agx3_tex_coord_component || I->agx3_tex_coord_start)
@@ -1751,7 +1751,7 @@ constant_phi_prove(agx_instr **defs, const int *parents,
 bool
 agx_fold_m5_spill_constant_phis(agx_context *ctx)
 {
-   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
        ctx->is_preamble || !ctx->alloc)
       return false;
 

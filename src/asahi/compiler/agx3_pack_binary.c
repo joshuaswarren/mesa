@@ -764,12 +764,12 @@ agx3_try_float_modifier(struct util_dynarray *emission,
                       agx_channels(I->dest[0]) == 1;
    for (unsigned s = 0; s < I->nr_srcs; ++s)
       has_mod |= I->src[s].abs || I->src[s].neg;
-   /* Native AGX3B/AGX3C FMA (and AGX3C MUL) consumes full and half registers in
+   /* Native AGX3B/AGX3C FMA and MUL consume full and half registers in
     * independently typed operand slots, including unmodified inputs. Route
     * mixed operands through the same lifetime-aware modifier encoder. Plain F32
     * stays compact. */
-   if ((enc == AGX_ISA_ENCODING_AGX3C && (is_fma || is_mul)) ||
-       (enc == AGX_ISA_ENCODING_AGX3B && is_fma))
+   if ((enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C) &&
+       (is_fma || is_mul))
       for (unsigned s = 0; s < I->nr_srcs; ++s)
          has_mod |= agx3_src_is_register(I->src[s]) &&
                     I->src[s].size == AGX_SIZE_16;
@@ -5558,7 +5558,7 @@ agx3_emit_rgb10a2(struct util_dynarray *emission, enum agx_isa_encoding enc,
  */
 static bool
 agx3_emit_normflt(struct util_dynarray *emission, enum agx_isa_encoding enc,
-                  const agx_instr *I, uint16_t wait_mask)
+                  bool emit_agx3d, const agx_instr *I, uint16_t wait_mask)
 {
    if (I->nr_dests != 1 || I->nr_srcs != 1)
       return false;
@@ -5566,7 +5566,12 @@ agx3_emit_normflt(struct util_dynarray *emission, enum agx_isa_encoding enc,
    const agx_index dest = I->dest[0];
    const agx_index src = I->src[0];
 
-   if (!agx3_src_is_register(dest) || dest.memory || dest.size != AGX_SIZE_32 ||
+   const bool dest_16 =
+      (enc == AGX_ISA_ENCODING_AGX3B ||
+       (enc == AGX_ISA_ENCODING_AGX3C && !emit_agx3d)) &&
+      dest.size == AGX_SIZE_16;
+   if (!agx3_src_is_register(dest) || dest.memory ||
+       (!dest_16 && dest.size != AGX_SIZE_32) ||
        agx_channels(dest) > 2 || agx_channels(dest) < 1)
       return false;
    const bool norm16 = I->format == AGX_FORMAT_U16NORM ||
@@ -5582,6 +5587,7 @@ agx3_emit_normflt(struct util_dynarray *emission, enum agx_isa_encoding enc,
 
    struct agx3_normflt_desc d = {
       .dest = dest.value,
+      .dest_16 = dest_16,
       .dest_hint = true,
       .src = src.value,
       .two_lanes = two_lanes,
@@ -8529,6 +8535,279 @@ agx3_is_loop_guard_push(const agx_instr *I)
    return agx3_is_loop_push(I, 0);
 }
 
+/* Whether the first instruction of `block` ends an arm: an else or a
+ * pop_exec, where the arms of an if join. */
+static bool
+agx3_block_starts_arm_end(const agx_block *block)
+{
+   if (list_is_empty(&block->instructions))
+      return false;
+
+   const agx_instr *first =
+      list_first_entry(&block->instructions, agx_instr, link);
+   return first->op == AGX_OPCODE_ELSE_ICMP ||
+          first->op == AGX_OPCODE_ELSE_FCMP ||
+          first->op == AGX_OPCODE_POP_EXEC;
+}
+
+/*
+ * How the scoreboard crosses a control-flow instruction. Slot assignment is
+ * linear, which is exact within one arm of an if: an arm is entered only
+ * from the instruction before it. So outstanding results stay in flight into
+ * an arm, through the zero-byte BEGIN_CF, a forward if and a plain
+ * exec-none jump whose target starts with an else or pop_exec (the jump
+ * skips an arm no lane takes). Where the arms meet, at the else and the pop,
+ * assignment joins their states (agx3_slot_core.h) instead of draining; the
+ * structured-level pass in agx3_pack_binary() marks those.
+ *
+ * A loop's entry push keeps results in flight into the loop the same way.
+ * Its body is also entered from the backedge, but the backedge drains, so on
+ * later iterations nothing issued before the loop is outstanding any more:
+ * assignment, which starts the body from the state at the entry, then only
+ * names extra generations, and a wait on a retired slot is a no-op. A break
+ * leaves the loop like the end of an arm: it keeps its results in flight,
+ * and the loop's pop joins the states its breaks left (agx3_slot_core.h).
+ * Continue tests and the backedge keep draining. A loop keeps the entry
+ * state only while its body retires all of it on the way to its first
+ * drain (see the assignment loop in agx3_pack_binary()). Jumps that land
+ * past a carrier keep draining.
+ */
+static enum agx3_slot_cf
+agx3_slot_cf_kind(const agx_instr *I)
+{
+   if (!agx3_is_cf_op(I))
+      return AGX3_SLOT_CF_NONE;
+
+   switch (I->op) {
+   case AGX_OPCODE_BEGIN_CF:
+      return AGX3_SLOT_CF_NONE;
+   case AGX_OPCODE_IF_ICMP:
+   case AGX_OPCODE_IF_FCMP:
+      return I->target || agx3_is_loop_entry_push(I) ? AGX3_SLOT_CF_NONE
+                                                     : AGX3_SLOT_CF_DRAIN;
+   case AGX_OPCODE_JMP_EXEC_NONE:
+      return I->target && agx3_block_starts_arm_end(I->target)
+                ? AGX3_SLOT_CF_NONE
+                : AGX3_SLOT_CF_DRAIN;
+   default:
+      return AGX3_SLOT_CF_DRAIN;
+   }
+}
+
+/*
+ * Whether the generations live before sl[from] all retire on the way to the
+ * pop of the loop `depth` levels out, other than at a drain. Follow the
+ * assignment's state from there, with those generations marked, and refuse
+ * at the first drain that retires a marked generation, or, with
+ * `shared_drains`, at the first drain that retires nothing else. A level
+ * between the loop and sl[from] counts as an arm whose if had the marked
+ * state.
+ */
+static bool
+agx3_retired_before_drains(const struct agx3_slot_instr *sl,
+                           const struct agx3_slot_result *res, unsigned count,
+                           unsigned from, unsigned depth, uint16_t marked,
+                           bool shared_drains)
+{
+   /* The live generations, and which of them are marked, at a level's if,
+    * at the end of its first arm and, for an inner loop, joined over its
+    * breaks. */
+   struct level {
+      bool arm, has_else, loop;
+      uint16_t if_live, if_before, then_live, then_before;
+      uint16_t break_live, break_before;
+   } levels[32];
+   uint16_t live = marked, before = marked;
+   if (!depth || depth > ARRAY_SIZE(levels))
+      return false;
+   levels[0] = (struct level){.arm = true};
+   for (unsigned d = 1; d < depth; ++d)
+      levels[d] = (struct level){.arm = true, .if_live = live,
+                                 .if_before = before};
+
+   for (unsigned i = from; i < count; ++i) {
+      live &= (uint16_t)~res[i].wait_mask;
+      before &= live;
+      if (res[i].slot) {
+         const uint16_t bit = (uint16_t)(1u << (res[i].slot - 1));
+         live |= bit;
+         before &= (uint16_t)~bit;
+      }
+      if (sl[i].cf != AGX3_SLOT_CF_NONE) {
+         if (before && !(shared_drains && (live & ~before)))
+            return false;
+         live = before = 0;
+      }
+      /* A break out of this loop takes its state past the loop's pop. */
+      if (sl[i].cf_break && sl[i].cf_break < depth) {
+         struct level *L = &levels[depth - sl[i].cf_break];
+         L->break_live |= live;
+         L->break_before |= before;
+      }
+      if (sl[i].cf_else && depth && levels[depth - 1].arm) {
+         struct level *L = &levels[depth - 1];
+         L->then_live = live;
+         L->then_before = before;
+         L->has_else = true;
+         live |= L->if_live;
+         before |= L->if_before;
+      }
+      for (unsigned p = 0; p < sl[i].cf_pop && depth; ++p) {
+         const struct level *L = &levels[--depth];
+         if (depth == 0)
+            return true; /* the loop's own pop */
+         if (L->arm) {
+            live |= L->has_else ? L->then_live : L->if_live;
+            before |= L->has_else ? L->then_before : L->if_before;
+         }
+         if (L->loop) {
+            live |= L->break_live;
+            before |= L->break_before;
+         }
+      }
+      for (unsigned p = 0; p < sl[i].cf_push; ++p) {
+         if (depth >= ARRAY_SIZE(levels))
+            return false;
+         levels[depth++] = (struct level){
+            .arm = sl[i].cf_arm, .loop = sl[i].cf_loop, .if_live = live,
+            .if_before = before,
+         };
+      }
+   }
+   return false;
+}
+
+/*
+ * Whether keeping results in flight into the loop that sl[push] opens gains
+ * anything. A generation issued before the loop that the body does not
+ * retire before one of the body's drains is retired by that drain on every
+ * iteration, where the entry push would have retired it once.
+ */
+static bool
+agx3_loop_entry_keeps_state(const struct agx3_slot_instr *sl,
+                            const struct agx3_slot_result *res, unsigned count,
+                            unsigned push, uint16_t live_at_push)
+{
+   return agx3_retired_before_drains(sl, res, count, push + 1, 1,
+                                     live_at_push, false);
+}
+
+/*
+ * Whether a break at sl[brk] gains anything by keeping its results in
+ * flight. When the lanes that stay do not retire one of them before the
+ * loop's next drain, that drain retires it on every iteration as the break
+ * would have. That costs nothing where the drain retires other generations
+ * too, but a drain only the break's state needs just moves the break's,
+ * and the loop's exit waits for that state as well.
+ */
+static bool
+agx3_break_keeps_state(const struct agx3_slot_instr *sl,
+                       const struct agx3_slot_result *res, unsigned count,
+                       unsigned brk, uint16_t live_at_break)
+{
+   return agx3_retired_before_drains(sl, res, count, brk + 1,
+                                     sl[brk].cf_break, live_at_break, true);
+}
+
+/* The scoreboard generations outstanding before each instruction, as
+ * assignment left them (agx3_slot_retire_at_cf() follows the same rules). */
+static void
+agx3_slot_live_before(const struct agx3_slot_instr *sl,
+                      const struct agx3_slot_result *res, unsigned count,
+                      uint16_t entry_wait, uint16_t *live_before)
+{
+   struct level {
+      bool arm, has_else, loop;
+      uint16_t at_if, then_end, breaks;
+   } levels[64];
+   uint16_t live = entry_wait;
+   unsigned depth = 0;
+   for (unsigned i = 0; i < count; ++i) {
+      live_before[i] = live;
+      live &= (uint16_t)~res[i].wait_mask;
+      if (res[i].slot)
+         live |= (uint16_t)(1u << (res[i].slot - 1));
+      if (sl[i].cf != AGX3_SLOT_CF_NONE)
+         live = 0;
+      if (sl[i].cf_break && sl[i].cf_break <= depth)
+         levels[depth - sl[i].cf_break].breaks |= live;
+      if (sl[i].cf_else && depth && levels[depth - 1].arm) {
+         levels[depth - 1].then_end = live;
+         levels[depth - 1].has_else = true;
+         live |= levels[depth - 1].at_if;
+      }
+      for (unsigned p = 0; p < sl[i].cf_pop && depth; ++p) {
+         const struct level *L = &levels[--depth];
+         if (L->arm)
+            live |= L->has_else ? L->then_end : L->at_if;
+         if (L->loop)
+            live |= L->breaks;
+      }
+      for (unsigned p = 0; p < sl[i].cf_push && depth < ARRAY_SIZE(levels);
+           ++p)
+         levels[depth++] = (struct level){
+            .arm = sl[i].cf_arm, .loop = sl[i].cf_loop, .at_if = live,
+         };
+   }
+}
+
+/* What emission knows about the generations in flight: the outstanding
+ * slots, which of them are image writes and which write r0, and the staging
+ * halves their consumers still read. At the arms of an if it joins as slot
+ * assignment does (agx3_slot_core.h). */
+struct agx3_emit_slots {
+   uint16_t outstanding, image_writes, r0_inflight;
+   struct agx3_staging_banks staging;
+};
+
+struct agx3_emit_level {
+   bool arm, has_else, loop, has_break;
+   struct agx3_emit_slots at_if, then_end, breaks;
+};
+
+static void
+agx3_emit_slots_capture(struct agx3_emit_slots *to, uint16_t outstanding,
+                        uint16_t image_writes,
+                        const struct agx3_staging_banks *staging)
+{
+   to->outstanding = outstanding;
+   to->image_writes = image_writes;
+   to->r0_inflight = agx3_r0_inflight;
+   to->staging = *staging;
+}
+
+static void
+agx3_emit_slots_join(const struct agx3_emit_slots *from, uint16_t *outstanding,
+                     uint16_t *image_writes,
+                     struct agx3_staging_banks *staging)
+{
+   *outstanding |= from->outstanding;
+   *image_writes |= from->image_writes;
+   agx3_r0_inflight |= from->r0_inflight;
+   for (unsigned i = 0; i < from->staging.end; ++i)
+      staging->readers[i] |= from->staging.readers[i];
+   staging->end = MAX2(staging->end, from->staging.end);
+}
+
+/* A break joins what is in flight into the state its loop's pop resumes. */
+static void
+agx3_emit_slots_add(struct agx3_emit_slots *to, bool *has, uint16_t outstanding,
+                    uint16_t image_writes,
+                    const struct agx3_staging_banks *staging)
+{
+   if (!*has) {
+      agx3_emit_slots_capture(to, outstanding, image_writes, staging);
+      *has = true;
+      return;
+   }
+   to->outstanding |= outstanding;
+   to->image_writes |= image_writes;
+   to->r0_inflight |= agx3_r0_inflight;
+   for (unsigned i = 0; i < staging->end; ++i)
+      to->staging.readers[i] |= staging->readers[i];
+   to->staging.end = MAX2(to->staging.end, staging->end);
+}
+
 static int
 agx3_try_control_flow(struct util_dynarray *emission,
                       struct util_dynarray *fixups, enum agx_isa_encoding enc,
@@ -8551,11 +8830,12 @@ agx3_try_control_flow(struct util_dynarray *emission,
                         I->op == AGX_OPCODE_JMP_EXEC_NONE_AFTER;
 
    /*
-    * Slot assignment is linear, so a control-flow boundary is safe only when
-    * nothing is in flight: then every block is entered with an empty
-    * scoreboard whichever predecessor ran. A result still outstanding here
-    * would carry its slot across the branch (or a backedge), which needs a
-    * predecessor-aware analysis this backend does not have, so it is refused.
+    * Slot assignment is linear, so a result may stay in flight across a
+    * control-flow instruction only where agx3_slot_cf_kind() says the
+    * linear order is exact; the caller passes outstanding = 0 there. Any
+    * other result still outstanding here would carry its slot across a
+    * merge or a backedge, which needs a predecessor-aware analysis this
+    * backend does not have, so it is refused.
     */
    const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
       I->op == AGX_OPCODE_BEGIN_CF;
@@ -13443,6 +13723,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          ordered[k] = I;
          struct agx3_slot_instr *e = &sl[k++];
+         e->cf = agx3_slot_cf_kind(I);
          /* EXPORT is a zero-byte register-ABI declaration after RA, not a
           * physical read. Letting it consume an async dependency marks the
           * slot waited without emitting any wait, so a linked epilog reads
@@ -13870,45 +14151,192 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                               resource_use_count, sl, count,
                               AGX3_SLOT_RESOURCE_HALVES, resource_bases, sl)))
       AGX3_PACK_FAIL();
-   if (!agx3_slot_assign_with_entry(sl, count, nslots, &input_entry,
-                                    cprog_imports ? 1 : 0, res))
-      AGX3_PACK_FAIL();
+   /* Structured levels: an if or loop push opens one, pop_exec n closes n
+    * and an else switches arms. The arms of a forward if join (agx3_slot_core.h)
+    * when the pop closing it closes nothing else: the if keeps results in
+    * flight into its arm, and its else and pop need no drain. A loop entry
+    * keeps results in flight into its body the same way, and a skip jump
+    * right after such an if or its else. A break out of a loop joins its
+    * state into the loop's pop instead of draining, and so does the exit
+    * jump right after it, which lands on that pop. Anything else drains as
+    * it always did. */
+   {
+      unsigned *open = rzalloc_array(ctx, unsigned, count ? count : 1);
+      unsigned *level_of = rzalloc_array(ctx, unsigned, count ? count : 1);
+      unsigned *else_of = rzalloc_array(ctx, unsigned, count ? count : 1);
+      unsigned *pop_of = rzalloc_array(ctx, unsigned, count ? count : 1);
+      /* break_of[i]: the loop entry push a break at i exits, or UINT_MAX. */
+      unsigned *break_of = rzalloc_array(ctx, unsigned, count ? count : 1);
+      if (!open || !level_of || !else_of || !pop_of || !break_of)
+         AGX3_PACK_FAIL();
+      unsigned depth = 0;
+      bool balanced = !ctx->agx3_cf_drain_all;
+      for (unsigned i = 0; i < count && balanced; ++i) {
+         const agx_instr *I = ordered[i];
+         level_of[i] = depth ? open[depth - 1] + 1 : 0;
+         break_of[i] = UINT_MAX;
+         if ((I->op == AGX_OPCODE_BREAK_IF_ICMP ||
+              I->op == AGX_OPCODE_BREAK_IF_FCMP) &&
+             I->nest && I->nest <= depth &&
+             agx3_is_loop_entry_push(ordered[open[depth - I->nest]]))
+            break_of[i] = open[depth - I->nest];
+         if (I->op == AGX_OPCODE_IF_ICMP || I->op == AGX_OPCODE_IF_FCMP) {
+            sl[i].cf_push = 1;
+            else_of[i] = pop_of[i] = UINT_MAX;
+            open[depth++] = i;
+         } else if (I->op == AGX_OPCODE_ELSE_ICMP ||
+                    I->op == AGX_OPCODE_ELSE_FCMP) {
+            sl[i].cf_else = true;
+            balanced = depth > 0 && else_of[open[depth - 1]] == UINT_MAX;
+            if (balanced)
+               else_of[open[depth - 1]] = i;
+         } else if (I->op == AGX_OPCODE_POP_EXEC) {
+            balanced = I->nest <= depth;
+            sl[i].cf_pop = balanced ? I->nest : 0;
+            for (unsigned p = 0; balanced && p < I->nest; ++p) {
+               const unsigned at = open[--depth];
+               sl[at].cf_arm = sl[at].cf == AGX3_SLOT_CF_NONE && I->nest == 1;
+               pop_of[at] = i;
+            }
+         }
+      }
+      balanced &= depth == 0;
+      for (unsigned i = 0; i < count; ++i) {
+         const agx_instr *I = ordered[i];
+         if (!balanced) {
+            sl[i].cf_push = sl[i].cf_pop = sl[i].cf_break = 0;
+            sl[i].cf_else = sl[i].cf_arm = sl[i].cf_loop = false;
+         }
+         /* A break joins its loop's pop, as does the exit jump after it. */
+         if (balanced && !ctx->agx3_arm_join_off &&
+             ctx->agx3_break_joins != AGX3_BREAKS_DRAIN &&
+             break_of[i] != UINT_MAX && pop_of[break_of[i]] != UINT_MAX &&
+             ordered[pop_of[break_of[i]]]->nest == 1) {
+            sl[i].cf_break = I->nest;
+            sl[i].cf = AGX3_SLOT_CF_NONE;
+            sl[break_of[i]].cf_loop = true;
+            sl[pop_of[break_of[i]]].cf = AGX3_SLOT_CF_NONE;
+            if (I->nest == 1 && i + 1 < count &&
+                ordered[i + 1]->op == AGX_OPCODE_JMP_EXEC_NONE_AFTER)
+               sl[i + 1].cf = AGX3_SLOT_CF_NONE;
+         }
+         /* A joined if's arms end without a drain. */
+         if (balanced && !ctx->agx3_arm_join_off && sl[i].cf_arm &&
+             ordered[i]->target) {
+            if (else_of[i] != UINT_MAX)
+               sl[else_of[i]].cf = AGX3_SLOT_CF_NONE;
+            sl[pop_of[i]].cf = AGX3_SLOT_CF_NONE;
+         }
+         if ((I->op == AGX_OPCODE_IF_ICMP || I->op == AGX_OPCODE_IF_FCMP) &&
+             !sl[i].cf_arm)
+            sl[i].cf = AGX3_SLOT_CF_DRAIN;
+         if (I->op == AGX_OPCODE_JMP_EXEC_NONE &&
+             sl[i].cf == AGX3_SLOT_CF_NONE) {
+            const agx_instr *P = i ? ordered[i - 1] : NULL;
+            const bool after_arm_if = P && sl[i - 1].cf_arm && P->target;
+            const bool after_arm_else = P && sl[i - 1].cf_else &&
+               level_of[i - 1] && sl[level_of[i - 1] - 1].cf_arm;
+            if (!balanced || !(after_arm_if || after_arm_else))
+               sl[i].cf = AGX3_SLOT_CF_DRAIN;
+         }
+         /* The skip jump of a joined if's else arm lands on the arm's pop
+          * (agx_opt_jmp_none() targets the end of the else's last block),
+          * which joins the arm no lane took. */
+         if (I->op == AGX_OPCODE_JMP_EXEC_NONE_AFTER && balanced &&
+             !ctx->agx3_arm_join_off && i && sl[i - 1].cf_else &&
+             level_of[i - 1]) {
+            const unsigned at = level_of[i - 1] - 1;
+            if (sl[at].cf_arm && ordered[at]->target &&
+                pop_of[at] != UINT_MAX && I->target &&
+                agx_last_instr(I->target) == ordered[pop_of[at]])
+               sl[i].cf = AGX3_SLOT_CF_NONE;
+         }
+      }
+   }
 
-   /* Emission drains every live scoreboard generation before control flow,
-    * but the linear slot assignment above cannot see that architectural
-    * boundary. Remove waits belonging to those retired generations until a
-    * later producer reuses the slot. Otherwise a post-branch ISEL may carry a
-    * stale slot together with two real producers, escaping the native
-    * slots-1-and-2 pair even though only that pair is live. */
-   /* cf_drains[i]: the drain before ordered[i] retires a generation that
-    * neither it nor, for the zero-byte BEGIN_CF, the branch right after it
-    * reads. Only counted, for shader statistics. */
+   if (!agx3_slot_assign_with_entry(sl, count, nslots, &input_entry,
+                                    cprog_imports ? 1 : 0, res)) {
+      /* Fall back to draining at every control-flow boundary. */
+      for (unsigned i = 0; i < count; ++i) {
+         sl[i].cf_push = sl[i].cf_pop = sl[i].cf_break = 0;
+         sl[i].cf_else = sl[i].cf_arm = sl[i].cf_loop = false;
+         if (agx3_is_cf_op(ordered[i]) &&
+             ordered[i]->op != AGX_OPCODE_BEGIN_CF)
+            sl[i].cf = AGX3_SLOT_CF_DRAIN;
+      }
+      if (!agx3_slot_assign_with_entry(sl, count, nslots, &input_entry,
+                                       cprog_imports ? 1 : 0, res))
+         AGX3_PACK_FAIL();
+   }
+
+   /* A branch that itself waits for a result (a compare reading a load)
+    * has no grounded form carrying that wait, so it retires everything
+    * outstanding first, as every branch once did; a break that does still
+    * joins its loop's pop, with nothing left in flight. A loop entry whose
+    * body would retire what was issued before it on every iteration drains
+    * once at the entry instead (agx3_loop_entry_keeps_state()). Otherwise
+    * the body retires all of it before its first drain, outside any arm, so
+    * on the first iteration with every invocation still in the loop; what a
+    * break takes out before that reaches the loop's pop through the break's
+    * join. The pop then has no entry state to resume. Drain those and assign
+    * again; each pass only adds drains or drops a resume, so this ends. */
+   uint16_t *live_before = rzalloc_array(ctx, uint16_t, count ? count : 1);
+   if (!live_before)
+      AGX3_PACK_FAIL();
+   ctx->agx3_refused_breaks = 0;
+   for (bool upgraded = true; upgraded;) {
+      upgraded = false;
+      agx3_slot_live_before(sl, res, count, entry_wait, live_before);
+      /* Breaks first: whether a loop entry keeps its state depends on
+       * whether the breaks in its body drain. */
+      for (unsigned i = 0;
+           i < count && ctx->agx3_break_joins == AGX3_BREAKS_JOIN_GAINFUL;
+           ++i) {
+         if (sl[i].cf == AGX3_SLOT_CF_NONE && sl[i].cf_break &&
+             !res[i].wait_mask &&
+             !agx3_break_keeps_state(sl, res, count, i, live_before[i])) {
+            sl[i].cf = AGX3_SLOT_CF_DRAIN;
+            ctx->agx3_refused_breaks++;
+            upgraded = true;
+         }
+      }
+      const bool breaks_upgraded = upgraded;
+      for (unsigned i = 0; i < count && !breaks_upgraded; ++i) {
+         if (sl[i].cf != AGX3_SLOT_CF_NONE || !agx3_is_cf_op(ordered[i]))
+            continue;
+         const bool loop_entry =
+            agx3_is_loop_entry_push(ordered[i]) && sl[i].cf_arm;
+         if (res[i].wait_mask ||
+             (loop_entry && (ctx->agx3_loop_entry_drain_all ||
+                             !agx3_loop_entry_keeps_state(
+                                sl, res, count, i, live_before[i])))) {
+            /* A forward if that drains still joins its arms: it saves the
+             * state its drain leaves. */
+            sl[i].cf = AGX3_SLOT_CF_DRAIN;
+            sl[i].cf_arm = sl[i].cf_arm && ordered[i]->target;
+            upgraded = true;
+         } else if (loop_entry) {
+            sl[i].cf_arm = false;
+            upgraded = true;
+         }
+      }
+      if (upgraded &&
+          !agx3_slot_assign_with_entry(sl, count, nslots, &input_entry,
+                                       cprog_imports ? 1 : 0, res))
+         AGX3_PACK_FAIL();
+   }
+
+   /* Emission drains every live scoreboard generation before a draining
+    * control-flow boundary, and assignment starts after it from an empty
+    * scoreboard. Drop any wait still naming a retired generation: a
+    * post-branch ISEL must not carry a stale slot together with two real
+    * producers, escaping the native slots-1-and-2 pair. */
+   /* cf_drains[i], for shader statistics: the drain before ordered[i]
+    * retires something it does not read. */
    bool *cf_drains = rzalloc_array(ctx, bool, count ? count : 1);
    if (!cf_drains)
       AGX3_PACK_FAIL();
-   uint16_t cf_retired = 0, cf_live = entry_wait;
-   for (unsigned i = 0; i < count; ++i) {
-      res[i].wait_mask &= (uint16_t)~cf_retired;
-      cf_live &= (uint16_t)~res[i].wait_mask;
-
-      if (res[i].slot) {
-         const uint16_t bit = (uint16_t)(1u << (res[i].slot - 1));
-         cf_retired &= (uint16_t)~bit;
-         cf_live |= bit;
-      }
-
-      const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
-         ordered[i]->op == AGX_OPCODE_BEGIN_CF;
-      if (agx3_is_cf_op(ordered[i]) && !live_begin) {
-         uint16_t drained = cf_live;
-         if (ordered[i]->op == AGX_OPCODE_BEGIN_CF && i + 1 < count &&
-             agx3_is_cf_op(ordered[i + 1]))
-            drained &= (uint16_t)~res[i + 1].wait_mask;
-         cf_drains[i] = drained != 0;
-         cf_retired |= cf_live;
-         cf_live = 0;
-      }
-   }
+   agx3_slot_retire_at_cf(sl, count, entry_wait, res, cf_drains);
 
    uint8_t active_coord_slot = 0;
    unsigned staged_components = 0;
@@ -13960,6 +14388,17 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
    const bool *tps_rereads = agx3_static_reload_rereads(ctx, ordered, count);
    if (!tps_rereads)
+      AGX3_PACK_FAIL();
+
+   /* The emission ledger joins the arms of an if as assignment does. */
+   unsigned cf_levels = 0, cf_depth = 0;
+   for (unsigned i = 0, d = 0; i < count; ++i) {
+      d = d - MIN2(d, sl[i].cf_pop) + sl[i].cf_push;
+      cf_levels = MAX2(cf_levels, d);
+   }
+   struct agx3_emit_level *cf_level =
+      rzalloc_array(ctx, struct agx3_emit_level, cf_levels ? cf_levels : 1);
+   if (!cf_level)
       AGX3_PACK_FAIL();
 
    k = 0;
@@ -14118,6 +14557,16 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    bool mesh_exports_pending = false;
    unsigned mesh_vertex_fences = 0;
 
+   /* Wait carriers emitted inside loops run on every iteration; count them
+    * for agx3_pack_program() (the native statistics count every carrier
+    * this pack emits; those since an instruction began are its own). */
+   ctx->agx3_kept_loop_entries = 0;
+   ctx->agx3_joined_arm_drains = 0;
+   ctx->agx3_joined_breaks = 0;
+   ctx->agx3_loop_carriers = 0;
+   unsigned carriers_seen = agx3_native_stats.wait_carriers;
+   bool last_in_loop = false;
+
    agx_foreach_block(ctx, block) {
       block->offset = emission->size;
       block->loop_exit_offset = -1;
@@ -14166,6 +14615,30 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          uint16_t wait = res[k].wait_mask;
          const uint8_t native_coord_slot = native_coord_slots[instr_index];
          k++;
+
+         /* Carriers since the previous instruction were its own. */
+         if (last_in_loop)
+            ctx->agx3_loop_carriers +=
+               agx3_native_stats.wait_carriers - carriers_seen;
+         carriers_seen = agx3_native_stats.wait_carriers;
+         last_in_loop = loop_depth > 0;
+         ctx->agx3_kept_loop_entries +=
+            agx3_is_loop_entry_push(I) &&
+            sl[instr_index].cf == AGX3_SLOT_CF_NONE;
+         /* An arm's end, or a break and the exit jump after it, that a
+          * join kept from draining something. */
+         const bool joined = sl[instr_index].cf == AGX3_SLOT_CF_NONE &&
+                             outstanding;
+         const bool break_exit =
+            sl[instr_index].cf_break ||
+            (I->op == AGX_OPCODE_JMP_EXEC_NONE_AFTER && instr_index &&
+             sl[instr_index - 1].cf_break);
+         ctx->agx3_joined_breaks += joined && break_exit;
+         ctx->agx3_joined_arm_drains +=
+            joined && !break_exit &&
+            (I->op == AGX_OPCODE_ELSE_ICMP || I->op == AGX_OPCODE_ELSE_FCMP ||
+             I->op == AGX_OPCODE_POP_EXEC ||
+             I->op == AGX_OPCODE_JMP_EXEC_NONE_AFTER);
          const off_t span_start = emission->size;
          if (early_compare) {
             const struct agx3_instr_span span = {
@@ -14329,13 +14802,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          }
 
-         /* Give every control-flow boundary an empty scoreboard, rather
-          * than refusing the shader when something is still in flight. */
+         /* Retire everything outstanding at a draining control-flow
+          * boundary (agx3_slot_cf_kind()). Elsewhere results stay in flight
+          * into the arm the boundary opens. */
          uint16_t cf_wait = wait;
          uint16_t cf_outstanding = outstanding_here;
-         const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
-            I->op == AGX_OPCODE_BEGIN_CF;
-         if (agx3_is_cf_op(I) && !live_begin) {
+         if (agx3_is_cf_op(I) && sl[instr_index].cf == AGX3_SLOT_CF_NONE)
+            cf_outstanding = 0;
+         if (agx3_is_cf_op(I) && sl[instr_index].cf != AGX3_SLOT_CF_NONE) {
             const uint16_t retire = (uint16_t)(cf_wait | cf_outstanding);
             if (retire != 0) {
                if (!agx3_retire_slots_noop(emission, enc, retire))
@@ -14425,6 +14899,41 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          if (cf < 0)
             AGX3_REFUSE(I);
          if (cf > 0) {
+            const struct agx3_slot_instr *cf_e = &sl[instr_index];
+            if (cf_e->cf_else && cf_depth && cf_level[cf_depth - 1].arm) {
+               struct agx3_emit_level *L = &cf_level[cf_depth - 1];
+               agx3_emit_slots_capture(&L->then_end, outstanding,
+                                       image_write_slots, &staging_banks);
+               L->has_else = true;
+               agx3_emit_slots_join(&L->at_if, &outstanding,
+                                    &image_write_slots, &staging_banks);
+            }
+            if (cf_e->cf_break && cf_e->cf_break <= cf_depth) {
+               struct agx3_emit_level *L = &cf_level[cf_depth - cf_e->cf_break];
+               agx3_emit_slots_add(&L->breaks, &L->has_break, outstanding,
+                                   image_write_slots, &staging_banks);
+            }
+            for (unsigned p = 0; p < cf_e->cf_pop && cf_depth; ++p) {
+               const struct agx3_emit_level *L = &cf_level[--cf_depth];
+               if (L->arm)
+                  agx3_emit_slots_join(L->has_else ? &L->then_end : &L->at_if,
+                                       &outstanding, &image_write_slots,
+                                       &staging_banks);
+               if (L->loop && L->has_break)
+                  agx3_emit_slots_join(&L->breaks, &outstanding,
+                                       &image_write_slots, &staging_banks);
+            }
+            for (unsigned p = 0; p < cf_e->cf_push && cf_depth < cf_levels;
+                 ++p) {
+               struct agx3_emit_level *L = &cf_level[cf_depth++];
+               L->arm = cf_e->cf_arm;
+               L->has_else = false;
+               L->loop = cf_e->cf_loop;
+               L->has_break = false;
+               if (L->arm)
+                  agx3_emit_slots_capture(&L->at_if, outstanding,
+                                          image_write_slots, &staging_banks);
+            }
             if (loop_entry_push)
                loop_depth++;
             else if (loop_pop && loop_depth > 0) {
@@ -15873,7 +16382,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          }
 
          if (I->op == AGX_OPCODE_NORMFLT_AGX3) {
-            if (!agx3_emit_normflt(emission, enc, I, wait))
+            if (!agx3_emit_normflt(emission, enc, ctx->key->dev.emit_agx3d, I,
+                                   wait))
                AGX3_REFUSE(I);
             continue;
          }
@@ -17378,15 +17888,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 (src.cache && src.discard))
                AGX3_REFUSE(I);
             uint8_t bytes[AGX3_ALU_MAX_LENGTH],len;
-            /* The half-input leaf requires a retained source. Cache hints
-             * are advisory, so retain even a last-use half after legalization
+            /* The half-input leaf requires a retained source on both
+             * encodings. A last-use hint only releases the register early,
+             * so retaining a half that is not read again is always correct:
+             * retain even a last-use or unhinted half, as after legalization
              * has widened its other reads for the following multiply. */
-            const enum agx3_alu_hint half_hint =
-               enc == AGX_ISA_ENCODING_AGX3B
-                  ? AGX3_ALU_HINT_CACHE : agx3_post_ra_hint(src);
             const bool ok =
                half ? agx3_alu_sqrt_step_half(enc, dest.value, src.value,
-                                              half_hint,
+                                              AGX3_ALU_HINT_CACHE,
                                               enc == AGX_ISA_ENCODING_AGX3C ? dest.cache : true,
                                               wait, bytes, &len)
                     : (src.size == AGX_SIZE_32 && !(src.value & 1) &&
@@ -23779,13 +24288,161 @@ fail:
  * over to the second: neither its staging footprint nor the scratch
  * registers it raised max_reg for (the cube and array-layer temporaries, the
  * G17G LOD relay). */
+/* Everything a pack attempt records in the context, so that a later attempt
+ * starts from the same state as the first. */
+struct agx3_pack_restore {
+   unsigned staging_halfs, max_reg, uvs_reloc_count, uvs_relocs_size;
+   struct agx3_colour_link_info colour_link;
+   bool staging_known, fltnorm_start, g18_mixed_protocol;
+};
+
+static void
+agx3_pack_restore(agx_context *ctx, const struct agx3_pack_restore *r)
+{
+   ctx->agx3_staging_halfs = r->staging_halfs;
+   ctx->max_reg = r->max_reg;
+   ctx->agx3_colour_link = r->colour_link;
+   ctx->agx3_staging_known = r->staging_known;
+   ctx->agx3_fltnorm_start = r->fltnorm_start;
+   ctx->agx3_g18_mixed_protocol = r->g18_mixed_protocol;
+   ctx->agx3_uvs_reloc_count = r->uvs_reloc_count;
+   ctx->agx3_uvs_relocs.size = r->uvs_relocs_size;
+   ctx->agx3_g18g_output_staging_floor = 0;
+   ctx->agx3_g18g_read_staging_end = 0;
+}
+
+/* How a pack carries scoreboard state across control flow, what it cost
+ * (its size, its wait carriers and those inside loops) and what it kept in
+ * flight. */
+struct agx3_cf_attempt {
+   bool join, keep_loop_entries;
+   enum agx3_break_joins breaks;
+   unsigned size, carriers, loop_carriers;
+   unsigned joined_arms, joined_breaks, refused_breaks, kept_loop_entries;
+};
+
+static bool
+agx3_pack_cf_attempt(agx_context *ctx, struct util_dynarray *emission,
+                     unsigned start, const struct agx3_pack_restore *r,
+                     struct agx3_cf_attempt *a)
+{
+   emission->size = start;
+   agx3_pack_restore(ctx, r);
+   ctx->agx3_cf_drain_all = false;
+   ctx->agx3_arm_join_off = !a->join;
+   ctx->agx3_break_joins = a->breaks;
+   ctx->agx3_loop_entry_drain_all = !a->keep_loop_entries;
+   if (!agx3_pack_binary(ctx, emission))
+      return false;
+   a->size = emission->size - start;
+   a->carriers = agx3_native_stats.wait_carriers;
+   a->loop_carriers = ctx->agx3_loop_carriers;
+   a->joined_arms = ctx->agx3_joined_arm_drains;
+   a->joined_breaks = ctx->agx3_joined_breaks;
+   a->refused_breaks = ctx->agx3_refused_breaks;
+   a->kept_loop_entries = ctx->agx3_kept_loop_entries;
+   return true;
+}
+
+/* Fewer carriers inside loops, which run every iteration, then fewer
+ * carriers (control-flow drains among them), and then less code. */
+static bool
+agx3_cf_attempt_better(const struct agx3_cf_attempt *a,
+                       const struct agx3_cf_attempt *b)
+{
+   if (a->loop_carriers != b->loop_carriers)
+      return a->loop_carriers < b->loop_carriers;
+   if (a->carriers != b->carriers)
+      return a->carriers < b->carriers;
+   return a->size < b->size;
+}
+
+/* Pack `a` and keep it instead of *best when it is better, or, with
+ * `wins_ties`, no worse. Returns whether the emission holds *best. */
+static bool
+agx3_try_cf_attempt(agx_context *ctx, struct util_dynarray *emission,
+                    unsigned start, const struct agx3_pack_restore *r,
+                    struct agx3_cf_attempt a, struct agx3_cf_attempt *best,
+                    bool wins_ties)
+{
+   if (!agx3_pack_cf_attempt(ctx, emission, start, r, &a) ||
+       !(agx3_cf_attempt_better(&a, best) ||
+         (wins_ties && !agx3_cf_attempt_better(best, &a))))
+      return false;
+   *best = a;
+   return true;
+}
+
 bool
 agx3_pack_program(agx_context *ctx, struct util_dynarray *emission)
 {
-   const unsigned staging_halfs = ctx->agx3_staging_halfs;
-   const unsigned max_reg = ctx->max_reg;
-   ctx->agx3_g18g_output_staging_floor = 0;
-   ctx->agx3_g18g_read_staging_end = 0;
+   const struct agx3_pack_restore r = {
+      .staging_halfs = ctx->agx3_staging_halfs,
+      .max_reg = ctx->max_reg,
+      .uvs_reloc_count = ctx->agx3_uvs_reloc_count,
+      .uvs_relocs_size = ctx->agx3_uvs_relocs.size,
+      .colour_link = ctx->agx3_colour_link,
+      .staging_known = ctx->agx3_staging_known,
+      .fltnorm_start = ctx->agx3_fltnorm_start,
+      .g18_mixed_protocol = ctx->agx3_g18_mixed_protocol,
+   };
+   const unsigned start = emission->size;
+
+   /*
+    * Joining an if's arms (agx3_slot_core.h) saves the drains at their ends
+    * but can leave consumers after the pop waiting on generations from both
+    * arms, through carriers where a form names fewer slots; joining a break
+    * does the same after its loop; keeping results in flight into a loop
+    * (agx3_slot_cf_kind()) can leave its body fewer free slots. When one of
+    * them kept something in flight, pack once more without it and keep the
+    * better program: a join wins ties, a loop entry has to save code. Each
+    * choice starts from the best program so far.
+    *
+    * agx3_break_keeps_state() judges each break alone, but breaks join in
+    * cascades (an inner loop's entry keeps its state once its breaks join),
+    * so where it made a break drain, try them all joined too.
+    */
+   struct agx3_cf_attempt best = {.join = true, .keep_loop_entries = true};
+   if (agx3_pack_cf_attempt(ctx, emission, start, &r, &best)) {
+      bool packed_best = true;
+      struct agx3_cf_attempt a;
+      if (best.refused_breaks) {
+         a = best;
+         a.breaks = AGX3_BREAKS_JOIN_ALL;
+         packed_best = agx3_try_cf_attempt(ctx, emission, start, &r, a, &best,
+                                           false);
+      }
+      if (best.joined_breaks) {
+         a = best;
+         a.breaks = AGX3_BREAKS_DRAIN;
+         packed_best = agx3_try_cf_attempt(ctx, emission, start, &r, a, &best,
+                                           false);
+      }
+      if (best.joined_arms) {
+         a = (struct agx3_cf_attempt){
+            .join = false, .keep_loop_entries = true,
+            .breaks = AGX3_BREAKS_DRAIN,
+         };
+         packed_best = agx3_try_cf_attempt(ctx, emission, start, &r, a, &best,
+                                           false);
+      }
+      if (best.kept_loop_entries) {
+         a = best;
+         a.keep_loop_entries = false;
+         packed_best = agx3_try_cf_attempt(ctx, emission, start, &r, a, &best,
+                                           true);
+      }
+      if (packed_best ||
+          agx3_pack_cf_attempt(ctx, emission, start, &r, &best))
+         return true;
+   }
+   emission->size = start;
+
+   /* Results kept in flight into if arms can leave a consumer after the arm
+    * waiting on generations no form of it can name together (a select's
+    * two-slot rule). Draining at every boundary is the established form. */
+   agx3_pack_restore(ctx, &r);
+   ctx->agx3_cf_drain_all = true;
    if (agx3_pack_binary(ctx, emission))
       return true;
 
@@ -23795,9 +24452,7 @@ agx3_pack_program(agx_context *ctx, struct util_dynarray *emission)
                        AGX3_STAGED_WRITE_LIMIT)
       return false;
 
-   ctx->agx3_staging_halfs = staging_halfs;
-   ctx->max_reg = max_reg;
-   ctx->agx3_g18g_read_staging_end = 0;
+   agx3_pack_restore(ctx, &r);
    ctx->agx3_g18g_output_staging_floor = output_floor;
    const bool packed = agx3_pack_binary(ctx, emission);
    if (agx_compiler_debug & (AGX_DBG_SHADERS | AGX_DBG_REFUSE))

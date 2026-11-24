@@ -207,6 +207,188 @@ compile_mma8(enum glsl_base_type type_a, enum glsl_base_type type_b,
    return ok;
 }
 
+static bool
+compile_mma8_loop_ra(enum agx_isa_encoding encoding, const char *name)
+{
+   /* Verify that a multi-accumulator 8x8 matmad8 loop with unrolled K-slices
+    * coalesces accumulator phi webs into aligned pairs in place without
+    * spilling or emitting per-accumulator copy churn across the loop body. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "8x8 mma8 loop ra %s", name);
+   b.shader->info.workgroup_size[0] = 32;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.shared_size = 4096;
+   b.shader->info.cs.has_cooperative_matrix = true;
+
+   nir_def *lane = nir_load_subgroup_invocation(&b);
+   nir_def *zero_i = nir_imm_int(&b, 0);
+   nir_def *zero_f = nir_imm_float(&b, 0.0f);
+   nir_def *zero_v2 = nir_vec2(&b, zero_f, zero_f);
+
+   /* Prefetched vec4 tiles carried across the loop header ahead of acc_phi
+    * (matching a software-pipelined GEMM K-loop): storing them into shared
+    * memory at the top of the loop kills 16 halves below acc_phi, exposing a
+    * low-register hole before matmad8 runs. */
+   nir_def *va0_init =
+      nir_load_shared(&b, 4, 32, nir_ishl_imm(&b, lane, 4), .align_mul = 16);
+   nir_def *va1_init = nir_load_shared(
+      &b, 4, 32, nir_ishl_imm(&b, nir_iadd_imm(&b, lane, 32), 4),
+      .align_mul = 16);
+
+   nir_loop *lp = nir_push_loop(&b);
+   lp->control = nir_loop_control_dont_unroll;
+   nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&lp->cf_node));
+   nir_block *hdr = nir_loop_first_block(lp);
+
+   nir_phi_instr *k_phi = nir_phi_instr_create(b.shader);
+   nir_def_init(&k_phi->instr, &k_phi->def, 1, 32);
+   nir_phi_instr_add_src(k_phi, pre, zero_i);
+
+   nir_phi_instr *b_idx_phi = nir_phi_instr_create(b.shader);
+   nir_def_init(&b_idx_phi->instr, &b_idx_phi->def, 1, 32);
+   nir_phi_instr_add_src(b_idx_phi, pre, lane);
+
+   nir_phi_instr *va0_phi = nir_phi_instr_create(b.shader);
+   nir_def_init(&va0_phi->instr, &va0_phi->def, 4, 32);
+   nir_phi_instr_add_src(va0_phi, pre, va0_init);
+
+   nir_phi_instr *va1_phi = nir_phi_instr_create(b.shader);
+   nir_def_init(&va1_phi->instr, &va1_phi->def, 4, 32);
+   nir_phi_instr_add_src(va1_phi, pre, va1_init);
+
+   nir_phi_instr *acc_phi[4][2];
+   for (unsigned m = 0; m < 4; ++m) {
+      for (unsigned n = 0; n < 2; ++n) {
+         acc_phi[m][n] = nir_phi_instr_create(b.shader);
+         nir_def_init(&acc_phi[m][n]->instr, &acc_phi[m][n]->def, 2, 32);
+         nir_phi_instr_add_src(acc_phi[m][n], pre, zero_v2);
+      }
+   }
+
+   nir_def *k = &k_phi->def;
+   nir_def *b_idx = &b_idx_phi->def;
+   nir_if *done = nir_push_if(&b, nir_ige_imm(&b, k, 16));
+   nir_jump(&b, nir_jump_break);
+   nir_pop_if(&b, done);
+
+   /* Consume prefetched vec4 tiles before matmad8 so their registers die. */
+   nir_store_shared(&b, &va0_phi->def, nir_ishl_imm(&b, lane, 4),
+                    .align_mul = 16, .write_mask = 0xf);
+   nir_store_shared(&b, &va1_phi->def,
+                    nir_ishl_imm(&b, nir_iadd_imm(&b, lane, 32), 4),
+                    .align_mul = 16, .write_mask = 0xf);
+
+   nir_def *cur_acc[4][2];
+   for (unsigned m = 0; m < 4; ++m)
+      for (unsigned n = 0; n < 2; ++n)
+         cur_acc[m][n] = &acc_phi[m][n]->def;
+
+   for (unsigned ks = 0; ks < 2; ++ks) {
+      nir_def *b_tile[2];
+      for (unsigned n = 0; n < 2; ++n) {
+         nir_def *off = nir_ishl_imm(
+            &b, nir_iadd_imm(&b, b_idx, (ks * 6 + n) * 32), 3);
+         b_tile[n] = nir_load_shared(&b, 2, 32, off, .align_mul = 8);
+      }
+
+      for (unsigned m = 0; m < 4; ++m) {
+         nir_def *off = nir_ishl_imm(
+            &b, nir_iadd_imm(&b, nir_iadd(&b, lane, k), (ks * 6 + 2 + m) * 32),
+            3);
+         nir_def *a_tile = nir_load_shared(&b, 2, 32, off, .align_mul = 8);
+         for (unsigned n = 0; n < 2; ++n) {
+            cur_acc[m][n] = nir_cmat_muladd_agx(
+               &b, a_tile, b_tile[n], cur_acc[m][n],
+               .src_type = nir_type_float32, .src_type2 = nir_type_float32);
+         }
+      }
+   }
+
+   nir_def *k_next = nir_iadd_imm(&b, k, 1);
+   nir_def *va0_next = nir_load_shared(
+      &b, 4, 32, nir_ishl_imm(&b, nir_iadd(&b, lane, k_next), 4),
+      .align_mul = 16);
+   nir_def *va1_next = nir_load_shared(
+      &b, 4, 32,
+      nir_ishl_imm(&b, nir_iadd_imm(&b, nir_iadd(&b, lane, k_next), 32), 4),
+      .align_mul = 16);
+
+   nir_block *back = nir_loop_last_block(lp);
+   for (unsigned m = 0; m < 4; ++m) {
+      for (unsigned n = 0; n < 2; ++n) {
+         nir_phi_instr_add_src(acc_phi[m][n], back, cur_acc[m][n]);
+         nir_instr_insert(nir_before_block(hdr), &acc_phi[m][n]->instr);
+      }
+   }
+   nir_phi_instr_add_src(va1_phi, back, va1_next);
+   nir_instr_insert(nir_before_block(hdr), &va1_phi->instr);
+   nir_phi_instr_add_src(va0_phi, back, va0_next);
+   nir_instr_insert(nir_before_block(hdr), &va0_phi->instr);
+   nir_phi_instr_add_src(b_idx_phi, back, nir_iadd_imm(&b, b_idx, 16));
+   nir_instr_insert(nir_before_block(hdr), &b_idx_phi->instr);
+   nir_phi_instr_add_src(k_phi, back, k_next);
+   nir_instr_insert(nir_before_block(hdr), &k_phi->instr);
+   nir_pop_loop(&b, lp);
+
+   /* Post-loop conditional tail merging acc_phi (like a GEMM K-tail if),
+    * ensuring acc_phi also feeds a later phi rather than only the loop's
+    * matmad8 collect. */
+   nir_def *tail_acc[4][2];
+   nir_if *tail_if = nir_push_if(&b, nir_ieq_imm(&b, nir_iand_imm(&b, lane, 1), 0));
+   {
+      nir_def *a_t = nir_load_shared(&b, 2, 32, nir_ishl_imm(&b, lane, 3), .align_mul = 8);
+      nir_def *b_t = nir_load_shared(&b, 2, 32, nir_ishl_imm(&b, nir_iadd_imm(&b, lane, 32), 3), .align_mul = 8);
+      for (unsigned m = 0; m < 4; ++m) {
+         for (unsigned n = 0; n < 2; ++n) {
+            tail_acc[m][n] = nir_cmat_muladd_agx(
+               &b, a_t, b_t, &acc_phi[m][n]->def,
+               .src_type = nir_type_float32, .src_type2 = nir_type_float32);
+         }
+      }
+   }
+   nir_push_else(&b, tail_if);
+   nir_pop_if(&b, tail_if);
+
+   nir_def *out_acc[4][2];
+   for (unsigned m = 0; m < 4; ++m)
+      for (unsigned n = 0; n < 2; ++n)
+         out_acc[m][n] = nir_if_phi(&b, tail_acc[m][n], &acc_phi[m][n]->def);
+
+   for (unsigned m = 0; m < 4; ++m) {
+      for (unsigned n = 0; n < 2; ++n) {
+         nir_def *off = nir_ishl_imm(&b, nir_iadd_imm(&b, lane, (m * 2 + n) * 32), 3);
+         nir_store_shared(&b, out_acc[m][n], off, .align_mul = 8, .write_mask = 3);
+      }
+   }
+
+   agx_preprocess_nir(b.shader);
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = encoding;
+   struct agx_shader_part part = {0};
+   if (!agx_compile_shader_nir(b.shader, &key, &part)) {
+      fprintf(stderr, "%s: AGX3 compile failed\n", name);
+      ralloc_free(b.shader);
+      return false;
+   }
+   /* Without cross-block accumulator collect sinking, loop-phi copyprop, and
+    * in-place matmad8_agx3 coalescing, RA emits 48+ accumulator mov1 copies
+    * (>=193 instrs, >=92 GPRs); with all fixes, all 16 loop + 8 tail matmad8
+    * instructions coalesce in place (~151-153 instrs, 88 GPRs). */
+   const bool ok = part.binary != NULL && part.info.binary_size > 0 &&
+                   part.info.scratch_size == 0 && part.info.nr_gprs <= 90 &&
+                   part.info.stats.instrs <= 165;
+   fprintf(ok ? stdout : stderr,
+           "%s: instrs=%u binary_size=%u scratch=%u gprs=%u\n", name,
+           part.info.stats.instrs, part.info.binary_size,
+           part.info.scratch_size, part.info.nr_gprs);
+
+   free(part.binary);
+   ralloc_free(b.shader);
+   return ok;
+}
+
 int
 main(void)
 {
@@ -241,6 +423,10 @@ main(void)
          pass = false;
       }
    }
+
+   if (!compile_mma8_loop_ra(AGX_ISA_ENCODING_AGX3B, "8-acc mma8 loop on AGX3B") ||
+       !compile_mma8_loop_ra(AGX_ISA_ENCODING_AGX3C, "8-acc mma8 loop on AGX3C"))
+      pass = false;
 
    glsl_type_singleton_decref();
    return pass ? 0 : 1;
