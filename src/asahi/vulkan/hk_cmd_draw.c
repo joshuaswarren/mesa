@@ -14357,7 +14357,11 @@ hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
          return false;
    }
 
-   return agx_vdm_draw_supported(dev->dev.chip, *draw, gfx->topology);
+   return allow_robust
+             ? hk_robust_index_rewrite_admitted(dev, *draw, gfx->topology)
+             : agx_vdm_draw_supported(
+                  agx_vdm_index_list_record_chip(dev->dev.chip), *draw,
+                  gfx->topology);
 }
 
 /* Emit one eligible record (see hk_g17p_indirect_records_eligible()). */
@@ -14453,7 +14457,16 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    cs->stats.calls++;
    hk_upload_stat(cmd, draws, 1);
    if (batch) {
+      /* The kernel writes the M5 Index List into a slot reserved after
+       * this point; its restart state goes before it. */
+      if (agx_chip_g17_m5(dev->dev.chip) && draw.restart)
+         cs->current = hk_m5_emit_restart_index(cmd, cs, cs->current, draw);
       hk_emit_robust_index(cmd, cs, draw, gfx->topology, tail_emitted, batch);
+      /* G17P: its GPU-written indexed indirect packets set the restart
+       * index. M5: for an empty draw the kernel writes a Stream Link over
+       * the slot, which counts as a link (hk_cmd_buffer.c). */
+      if (agx_chip_native_or_m5(dev->dev.chip))
+         cs->restart_index_set = false;
    } else if (agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip)) {
       if (!hk_g17p_emit_draw(cmd, cs, cs->current, draw, gfx->topology,
                              tail_emitted))
@@ -14559,7 +14572,7 @@ hk_g17p_draw_robust_multi(struct hk_cmd_buffer *cmd, uint64_t buffer,
                           uint32_t draw_count, uint32_t stride)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_chip_native_agx3(dev->dev.chip) || draw_count <= 1)
+   if (!agx_chip_native_or_m5(dev->dev.chip) || draw_count <= 1)
       return false;
 
    struct hk_graphics_state *gfx = &cmd->state.gfx;
