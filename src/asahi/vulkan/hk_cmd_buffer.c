@@ -1676,7 +1676,8 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
 
    /* CPU-decoded descriptor programs retain their conservative invalidation:
     * their inputs can change in set memory without changing its address. */
-   desc->root_dirty |= root_changed || !retain_root;
+   if (root_changed || !retain_root)
+      hk_root_mark_dirty(desc);
    desc->generation++;
 }
 
@@ -1734,7 +1735,7 @@ hk_push_constants(struct hk_cmd_buffer *cmd,
       return;
 
    memcpy(desc->root.push + info->offset, info->pValues, info->size);
-   desc->root_dirty = true;
+   hk_root_mark_push_dirty(desc);
    desc->generation++;
 }
 
@@ -1813,7 +1814,7 @@ hk_set_descriptor_buffer_offsets(struct hk_cmd_buffer *cmd,
                          set_layout ? set_layout->max_buffer_size : 0);
    }
 
-   desc->root_dirty = true;
+   hk_root_mark_dirty(desc);
    desc->generation++;
 }
 
@@ -1858,7 +1859,7 @@ hk_bind_embedded_samplers(struct hk_cmd_buffer *cmd,
                                         size, HK_MIN_UBO_ALIGNMENT);
 
    hk_bind_buffer_set(desc, pipeline_layout, info->set, addr, size);
-   desc->root_dirty = true;
+   hk_root_mark_dirty(desc);
    desc->generation++;
 }
 
@@ -2033,7 +2034,7 @@ hk_cmd_buffer_flush_push_descriptors(struct hk_cmd_buffer *cmd,
       desc->set_sizes[set_idx] = size;
    }
 
-   desc->root_dirty = true;
+   hk_root_mark_dirty(desc);
    desc->push_dirty = 0;
 }
 

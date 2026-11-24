@@ -3913,7 +3913,7 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
        * indirect launch at the predicated copy, so skipped commands also
        * contribute zero pipeline-stat invocations. */
       desc->root.cs.group_count_addr = patched;
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
       grid = agx_grid_indirect(patched);
    }
 
@@ -4213,7 +4213,7 @@ hk_cmd_dispatch_rays(struct hk_cmd_buffer *cmd, struct hk_api_shader *shader,
    desc->root.cs.group_count_addr = group_count_addr;
    desc->root.cs.grid_helper_sparse_map_addr = 0;
    desc->root.cs.trace_rays_addr = record_addr;
-   desc->root_dirty = true;
+   hk_root_mark_dirty(desc);
 
    /* Conditional rendering predicates draws, dispatches and attachment
     * clears only; vkCmdTraceRays* must execute regardless of it. */
@@ -4230,7 +4230,7 @@ hk_cmd_dispatch_rays(struct hk_cmd_buffer *cmd, struct hk_api_shader *shader,
    rt->root.cs.trace_rays_addr = 0;
 
    cmd->state.cs = saved;
-   cmd->state.cs.descriptors.root_dirty = true;
+   hk_root_mark_dirty(&cmd->state.cs.descriptors);
 }
 
 void

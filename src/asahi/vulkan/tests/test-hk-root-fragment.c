@@ -271,6 +271,38 @@ main(void)
       fresh->root = cached->root = 0;
       select_and_check(fresh, cached, 0, memo, shadow);
    }
+   /* Root change tracking: push-only until any other change. */
+   {
+      struct hk_descriptor_state *d = calloc(1, sizeof(*d));
+      CHECK(d != NULL);
+      CHECK(!hk_root_dirty(d) && !hk_root_push_only_dirty(d));
+
+      hk_root_mark_push_dirty(d);
+      CHECK(hk_root_dirty(d) && hk_root_push_only_dirty(d));
+      hk_root_mark_push_dirty(d);
+      CHECK(hk_root_push_only_dirty(d));
+
+      /* Any other change makes the root fully dirty, and a later push does
+       * not make it push-only again. */
+      hk_root_mark_dirty(d);
+      CHECK(hk_root_dirty(d) && !hk_root_push_only_dirty(d));
+      hk_root_mark_push_dirty(d);
+      CHECK(hk_root_dirty(d) && !hk_root_push_only_dirty(d));
+
+      hk_root_mark_clean(d);
+      CHECK(!hk_root_dirty(d) && !hk_root_push_only_dirty(d));
+
+      /* A change before the push keeps it fully dirty too. */
+      hk_root_mark_dirty(d);
+      hk_root_mark_push_dirty(d);
+      CHECK(!hk_root_push_only_dirty(d));
+      hk_root_mark_clean(d);
+      hk_root_mark_push_dirty(d);
+      hk_root_mark_clean(d);
+      CHECK(!hk_root_dirty(d));
+      free(d);
+   }
+
    printf("root fragment: %" PRIu64 " checks passed\n", checks);
    free(fresh);
    free(cached);

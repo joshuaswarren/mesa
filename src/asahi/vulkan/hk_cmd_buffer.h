@@ -510,7 +510,13 @@ static_assert(hk_root_descriptor_offset(set_dynamic_buffer_start) ==
               "the dynamic buffer table is followed by its set starts");
 
 struct hk_descriptor_state {
-   bool root_dirty;
+   /* How root differs from the last uploaded root: read and written only
+    * through hk_root_dirty() and hk_root_mark_*() below. push_only is set
+    * while every change since that upload was to push constants. */
+   struct {
+      bool dirty;
+      bool push_only;
+   } root_change;
    uint64_t generation;
    uint64_t identity_copy4_push_mask;
    struct hk_root_descriptor_table root;
@@ -541,6 +547,47 @@ struct hk_descriptor_state {
    /* Bitmask of 32-bit push-constant DWORDs written in this command buffer. */
    uint64_t push_written_dwords;
 };
+
+/* Whether root differs from the last uploaded root. */
+static inline bool
+hk_root_dirty(const struct hk_descriptor_state *desc)
+{
+   return desc->root_change.dirty;
+}
+
+/* Whether root differs from the last uploaded root in push constants alone. */
+static inline bool
+hk_root_push_only_dirty(const struct hk_descriptor_state *desc)
+{
+   return desc->root_change.dirty && desc->root_change.push_only;
+}
+
+/* Root changed in anything but push constants, or in unknown bytes. */
+static inline void
+hk_root_mark_dirty(struct hk_descriptor_state *desc)
+{
+   desc->root_change.dirty = true;
+   desc->root_change.push_only = false;
+}
+
+/* Root changed in its push constants. An earlier change of any other kind
+ * since the last upload keeps the root fully dirty. */
+static inline void
+hk_root_mark_push_dirty(struct hk_descriptor_state *desc)
+{
+   if (!desc->root_change.dirty) {
+      desc->root_change.dirty = true;
+      desc->root_change.push_only = true;
+   }
+}
+
+/* Root was uploaded as it is. */
+static inline void
+hk_root_mark_clean(struct hk_descriptor_state *desc)
+{
+   desc->root_change.dirty = false;
+   desc->root_change.push_only = false;
+}
 
 struct hk_attachment {
    VkRenderingAttachmentFlagBitsKHR flags;
@@ -2807,7 +2854,7 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    gfx->dirty = ~0;
    gfx->shaders_dirty = ~0;
    gfx->linked_dirty = ~0;
-   gfx->descriptors.root_dirty = true;
+   hk_root_mark_dirty(&gfx->descriptors);
    gfx->g17p_bind_tail_memo.valid = false;
    if (cmd->current_cs.gfx)
       cmd->current_cs.gfx->g17p_bind_tail.valid = false;
