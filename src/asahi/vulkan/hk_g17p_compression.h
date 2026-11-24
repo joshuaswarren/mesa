@@ -474,6 +474,17 @@ hk_m5_compression_one_byte(VkFormat format)
           format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_SINT;
 }
 
+/* Whether shader storage-image stores through a Gen10 compressed PBE
+ * descriptor are qualified to merge into compressed tiles and maintain
+ * compression metadata. Keep image creation (hk_m5_storage_compression_eligible)
+ * and compute meta blits (hk_agx3_gen10_mip_blit_supported) on this single
+ * gate so they cannot drift apart. */
+static inline bool
+hk_chip_supports_compressed_storage_pbe(enum agx_chip chip)
+{
+   return agx_chip_g17_m5(chip);
+}
+
 static inline bool
 hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
                                  const VkImageCreateInfo *info)
