@@ -19,17 +19,10 @@ extern "C" {
 #define AGX_PBE_AGX3_GENERATION_9      9u
 #define AGX_PBE_AGX3_GENERATION_10     10u
 
-/* This is intentionally the subset whose complete byte geometry is recovered:
- * ordinary non-sparse 2D images in Gen9/10 linear or twiddled/GPU
- * memory, Gen9/10 GPU-tiled compressed 2D images, and Gen9's exact uncompressed
- * tiled 2D-array extension. The dedicated G18G multisample entry points also
- * encode Gen10 tiled 2D/array targets, including GPU-tiled compression.
- * Gen9's ordinary single-layer packet has no layer-mode bit regardless of
- * allocation padding; the inherited page-aligned-layer input is ignored on
- * scalar pack and canonicalized to false on unpack. Gen10 keeps its existing
- * flag semantics. Fields with unresolved Gen9/10 semantics are not
- * represented and are required to be zero by the decoder.
- */
+/* Non-sparse 2D/layered PBE descriptor fields for Gen9/Gen10 (linear,
+ * twiddled/GPU tiled, and GPU-tiled compressed). Gen9 scalar 2D has no
+ * page-aligned-layers bit (ignored on pack, false on unpack); Gen10 retains
+ * it. Unrepresented bits must be zero on unpack. */
 struct agx_pbe_agx3_2d_fields {
    uint8_t layout;
    uint8_t channels;
@@ -87,17 +80,9 @@ bool agx_pbe_agx3_3d_mip_pack(
    uint32_t depth, uint32_t level, uint32_t levels,
    struct agx_pbe_agx3_descriptor *out);
 
-/* Multisample colour target. In the HAL200 Gen9 PBE an ordinary non-array
- * multisample write target selects dimension 4 (2 when single-sampled), and
- * the two-bit sample selector `(samples >> 2) & 3` sits at word0[57:56] -- the
- * same Sample Count enum the texture descriptor uses (2x=0, 4x=1, 8x=2). Every
- * other field keeps its single-sample placement: the descriptor holds the
- * logical width and height, not sample-expanded ones.
- *
- * Bounded to the tiled 2x/4x colour shapes G17P's tilebuffer admits. 8x has
- * the same field layout but no tilebuffer or layout qualification, so it is
- * refused here rather than guessed.
- */
+/* Tiled multisample colour target (dimension 4, logical width/height).
+ * Sample selector `(samples >> 2) & 3` sits at word0[57:56] (Gen9: 2x/4x)
+ * or word0[59:58] (Gen10: 2x/4x/8x). */
 bool agx_pbe_agx3_2d_multisample_pack(
    uint32_t generation, const struct agx_pbe_agx3_2d_fields *fields,
    uint32_t samples, struct agx_pbe_agx3_descriptor *out);

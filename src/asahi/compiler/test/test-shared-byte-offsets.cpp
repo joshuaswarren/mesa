@@ -1,5 +1,6 @@
 /* Copyright 2026 Aurora Silicon; SPDX-License-Identifier: MIT */
 #include <gtest/gtest.h>
+#include <vector>
 #include "agx_test.h"
 #include "compiler/nir/nir_builder.h"
 extern "C" {
@@ -174,4 +175,272 @@ TEST(SharedByteOffsets, NarrowedByteOffsetElementIndexFolds)
 
    nir_validate_shader(b.shader, "shared-narrowed-element-index result");
    ralloc_free(b.shader);
+}
+
+/* A strided cluster spanning multiple 256-byte windows splits each element
+ * offset into a shared chunk base (V + 64*k) plus immediate byte offset
+ * (0/64/128/192), letting CSE collapse 8 taps into 2 adds instead of 15. */
+TEST(SharedByteOffsets, MultiChunkClusterSharesChunkBases)
+{
+   nir_builder b = workgroup_shader("shared-multichunk-cluster");
+   b.shader->info.workgroup_size[0] = 16;
+   b.shader->info.workgroup_size[1] = 16;
+   nir_def *id = nir_load_local_invocation_id(&b);
+   nir_def *lx = nir_channel(&b, id, 0);
+   nir_def *ly = nir_channel(&b, id, 1);
+   nir_def *row = nir_ishl_imm(&b, ly, 4);
+
+   nir_intrinsic_instr *loads[8];
+   nir_def *sum = NULL;
+   for (unsigned t = 0; t < 8; ++t) {
+      nir_def *row_t = t ? nir_iadd_imm(&b, row, t * 16) : row;
+      nir_def *idx = nir_u2u16(&b, nir_iadd(&b, row_t, lx));
+      nir_def *val = nir_load_shared(&b, 1, 32, idx, .align_mul = 4);
+      loads[t] = nir_def_as_intrinsic(val);
+      sum = sum ? nir_iadd(&b, sum, val) : val;
+   }
+   nir_store_global(&b, sum, nir_imm_int64(&b, 0), .align_mul = 4);
+
+   EXPECT_TRUE(agx_nir_opt_shared_byte_offsets(b.shader));
+   nir_opt_cse(b.shader);
+   nir_opt_dce(b.shader);
+
+   for (unsigned t = 0; t < 8; ++t)
+      EXPECT_EQ(nir_intrinsic_base(loads[t]), (t % 4) * 64);
+
+   /* First 4 taps share u2u16(V); next 4 share u2u16(V + 64). */
+   for (unsigned t = 1; t < 4; ++t)
+      EXPECT_EQ(loads[t]->src[0].ssa, loads[0]->src[0].ssa);
+   for (unsigned t = 5; t < 8; ++t)
+      EXPECT_EQ(loads[t]->src[0].ssa, loads[4]->src[0].ssa);
+   EXPECT_NE(loads[0]->src[0].ssa, loads[4]->src[0].ssa);
+
+   /* Only 2 address adds remain (V = lx + row, V + 64), plus 7 value adds. */
+   EXPECT_EQ(count_alu(b.shader, nir_op_iadd), 9u);
+
+   nir_validate_shader(b.shader, "shared-multichunk-cluster result");
+   ralloc_free(b.shader);
+}
+
+/* Unbounded multi-chunk clusters must not split across a possible u16 wrap. */
+TEST(SharedByteOffsets, MultiChunkClusterUnboundedDoesNotSplit)
+{
+   nir_builder b = workgroup_shader("shared-multichunk-unbounded");
+   nir_def *x = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 4);
+   nir_def *y = nir_channel(&b, nir_load_local_invocation_id(&b), 1);
+
+   nir_intrinsic_instr *loads[2];
+   for (unsigned t = 0; t < 2; ++t) {
+      nir_def *idx = nir_u2u16(&b, nir_iadd(&b, nir_iadd_imm(&b, x, 64 + t * 16), y));
+      loads[t] = nir_def_as_intrinsic(
+         nir_load_shared(&b, 1, 32, idx, .align_mul = 4));
+   }
+
+   EXPECT_FALSE(agx_nir_opt_shared_byte_offsets(b.shader));
+   EXPECT_EQ(nir_intrinsic_base(loads[0]), 0);
+   EXPECT_EQ(nir_intrinsic_base(loads[1]), 0);
+   nir_validate_shader(b.shader, "shared-multichunk-unbounded result");
+   ralloc_free(b.shader);
+}
+
+static std::vector<uint32_t>
+eval_shared_byte_addrs(const nir_shader *orig, uint32_t lx, uint32_t ly,
+                       uint32_t pc)
+{
+   nir_shader *s = nir_shader_clone(NULL, orig);
+   nir_foreach_function_impl(impl, s) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            b.cursor = nir_before_instr(instr);
+            if (intr->intrinsic == nir_intrinsic_load_local_invocation_id) {
+               nir_def_replace(&intr->def, nir_imm_ivec3(&b, lx, ly, 0));
+            } else if (intr->intrinsic == nir_intrinsic_load_push_constant) {
+               nir_def_replace(&intr->def, nir_imm_int(&b, pc));
+            }
+         }
+      }
+   }
+
+   bool progress;
+   do {
+      progress = false;
+      progress |= nir_opt_constant_folding(s);
+      progress |= nir_opt_copy_prop(s);
+      progress |= nir_opt_dce(s);
+   } while (progress);
+
+   std::vector<uint32_t> addrs;
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_shared &&
+                intr->intrinsic != nir_intrinsic_store_shared)
+               continue;
+            unsigned bits = intr->intrinsic == nir_intrinsic_load_shared
+                               ? intr->def.bit_size
+                               : nir_src_bit_size(intr->src[0]);
+            unsigned shift = util_logbase2(bits / 8);
+            nir_src *off = nir_get_io_offset_src(intr);
+            EXPECT_TRUE(nir_src_is_const(*off));
+            EXPECT_LE(nir_intrinsic_base(intr), 255u);
+            uint32_t elem = nir_src_as_uint(*off) & 0xffffu;
+            addrs.push_back((elem << shift) + nir_intrinsic_base(intr));
+         }
+      }
+   }
+
+   ralloc_free(s);
+   return addrs;
+}
+
+/* Nonzero .base whose sum crosses a 256-byte chunk boundary: taps whose
+ * base + (e_lo << shift) would exceed 255 stay untouched while in-range taps
+ * fold cleanly into chunks, preserving every effective byte address. */
+TEST(SharedByteOffsets, ValueEquivalenceNonzeroBaseCrossesChunk)
+{
+   nir_builder b = workgroup_shader("shared-nonzero-base-chunk");
+   b.shader->info.workgroup_size[0] = 16;
+   b.shader->info.workgroup_size[1] = 16;
+   nir_def *id = nir_load_local_invocation_id(&b);
+   nir_def *lx = nir_channel(&b, id, 0);
+   nir_def *ly = nir_channel(&b, id, 1);
+   nir_def *row = nir_ishl_imm(&b, ly, 4);
+
+   const unsigned elems[] = {0, 16, 48, 60, 64, 80, 120, 124};
+   nir_intrinsic_instr *loads[8];
+   nir_def *sum = NULL;
+   for (unsigned t = 0; t < 8; ++t) {
+      nir_def *row_t = elems[t] ? nir_iadd_imm(&b, row, elems[t]) : row;
+      nir_def *idx = nir_u2u16(&b, nir_iadd(&b, row_t, lx));
+      nir_def *val = nir_load_shared(&b, 1, 32, idx, .base = 16, .align_mul = 4);
+      loads[t] = nir_def_as_intrinsic(val);
+      sum = sum ? nir_iadd(&b, sum, val) : val;
+   }
+   nir_store_global(&b, sum, nir_imm_int64(&b, 0), .align_mul = 4);
+
+   nir_shader *orig = nir_shader_clone(NULL, b.shader);
+   EXPECT_TRUE(agx_nir_opt_shared_byte_offsets(b.shader));
+   nir_opt_cse(b.shader);
+   nir_opt_dce(b.shader);
+
+   const unsigned expected_base[] = {16, 80, 208, 16, 16, 80, 240, 16};
+   for (unsigned t = 0; t < 8; ++t)
+      EXPECT_EQ(nir_intrinsic_base(loads[t]), expected_base[t]);
+   EXPECT_EQ(loads[4]->src[0].ssa, loads[5]->src[0].ssa);
+   EXPECT_EQ(loads[4]->src[0].ssa, loads[6]->src[0].ssa);
+
+   const uint32_t coords[][2] = {{0, 0}, {15, 0}, {0, 15}, {15, 15}, {7, 9}};
+   for (const auto &c : coords) {
+      EXPECT_EQ(eval_shared_byte_addrs(b.shader, c[0], c[1], 0),
+                eval_shared_byte_addrs(orig, c[0], c[1], 0));
+   }
+
+   nir_validate_shader(b.shader, "shared-nonzero-base-chunk result");
+   ralloc_free(orig);
+   ralloc_free(b.shader);
+}
+
+/* Multi-chunk split is accepted when variable upper bound + elements == 0xffff
+ * and rejected when it reaches 0x10000. */
+TEST(SharedByteOffsets, ValueEquivalenceExact0xffffBound)
+{
+   for (unsigned over = 0; over < 2; ++over) {
+      nir_builder b = workgroup_shader("shared-exact-0xffff");
+      nir_def *pc = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                           .range = 4);
+      uint32_t mask = (0xffffu - 80u) + over;
+      nir_def *v = nir_iand_imm(&b, pc, mask);
+      nir_def *z = nir_imm_int(&b, 0);
+
+      const unsigned elems[] = {64, 80};
+      nir_def *sum = NULL;
+      for (unsigned t = 0; t < 2; ++t) {
+         nir_def *idx = nir_u2u16(&b, nir_iadd(&b, nir_iadd_imm(&b, v, elems[t]), z));
+         nir_def *val = nir_load_shared(&b, 1, 32, idx, .align_mul = 4);
+         sum = sum ? nir_iadd(&b, sum, val) : val;
+      }
+      nir_store_global(&b, sum, nir_imm_int64(&b, 0), .align_mul = 4);
+
+      nir_shader *orig = nir_shader_clone(NULL, b.shader);
+      EXPECT_EQ(agx_nir_opt_shared_byte_offsets(b.shader), over == 0);
+      nir_opt_cse(b.shader);
+      nir_opt_dce(b.shader);
+
+      const uint32_t pcs[] = {0u, 1234u, mask, 0xffffffffu};
+      for (uint32_t p : pcs) {
+         EXPECT_EQ(eval_shared_byte_addrs(b.shader, 0, 0, p),
+                   eval_shared_byte_addrs(orig, 0, 0, p));
+      }
+
+      nir_validate_shader(b.shader, "shared-exact-0xffff result");
+      ralloc_free(orig);
+      ralloc_free(b.shader);
+   }
+}
+
+/* 16-bit elements (shift = 1, 128 elements per 256-byte chunk) and
+ * store_shared multi-chunk clustering preserve exact effective byte addresses. */
+TEST(SharedByteOffsets, ValueEquivalence16BitElementsAndStoreShared)
+{
+   for (unsigned is_store = 0; is_store < 2; ++is_store) {
+      nir_builder b = workgroup_shader("shared-16bit-multichunk");
+      b.shader->info.workgroup_size[0] = 16;
+      b.shader->info.workgroup_size[1] = 16;
+      nir_def *id = nir_load_local_invocation_id(&b);
+      nir_def *lx = nir_channel(&b, id, 0);
+      nir_def *ly = nir_channel(&b, id, 1);
+      nir_def *row = nir_ishl_imm(&b, ly, 4);
+
+      nir_intrinsic_instr *intrs[8];
+      nir_def *sum = NULL;
+      for (unsigned t = 0; t < 8; ++t) {
+         nir_def *row_t = t ? nir_iadd_imm(&b, row, t * 32) : row;
+         nir_def *idx = nir_u2u16(&b, nir_iadd(&b, row_t, lx));
+         if (is_store) {
+            intrs[t] = nir_store_shared(&b, nir_imm_intN_t(&b, t, 16), idx,
+                                        .base = 8, .align_mul = 2);
+         } else {
+            nir_def *val = nir_load_shared(&b, 1, 16, idx, .base = 8,
+                                           .align_mul = 2);
+            intrs[t] = nir_def_as_intrinsic(val);
+            sum = sum ? nir_iadd(&b, sum, val) : val;
+         }
+      }
+      if (!is_store)
+         nir_store_global(&b, nir_u2u32(&b, sum), nir_imm_int64(&b, 0),
+                          .align_mul = 4);
+
+      nir_shader *orig = nir_shader_clone(NULL, b.shader);
+      EXPECT_TRUE(agx_nir_opt_shared_byte_offsets(b.shader));
+      nir_opt_cse(b.shader);
+      nir_opt_dce(b.shader);
+
+      for (unsigned t = 0; t < 8; ++t)
+         EXPECT_EQ(nir_intrinsic_base(intrs[t]), 8u + (t % 4) * 64u);
+      for (unsigned t = 1; t < 4; ++t)
+         EXPECT_EQ(nir_get_io_offset_src(intrs[t])->ssa,
+                   nir_get_io_offset_src(intrs[0])->ssa);
+      for (unsigned t = 5; t < 8; ++t)
+         EXPECT_EQ(nir_get_io_offset_src(intrs[t])->ssa,
+                   nir_get_io_offset_src(intrs[4])->ssa);
+      EXPECT_NE(nir_get_io_offset_src(intrs[0])->ssa,
+                nir_get_io_offset_src(intrs[4])->ssa);
+
+      const uint32_t coords[][2] = {{0, 0}, {15, 0}, {0, 15}, {15, 15}};
+      for (const auto &c : coords) {
+         EXPECT_EQ(eval_shared_byte_addrs(b.shader, c[0], c[1], 0),
+                   eval_shared_byte_addrs(orig, c[0], c[1], 0));
+      }
+
+      nir_validate_shader(b.shader, "shared-16bit-multichunk result");
+      ralloc_free(orig);
+      ralloc_free(b.shader);
+   }
 }

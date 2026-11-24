@@ -50,6 +50,9 @@ agx_append_split_compute(struct util_dynarray *cmdbuf,
    }
 }
 
+#define foreach_queued(ctx, idx)                                               \
+   BITSET_FOREACH_SET(idx, ctx->batches.queued, AGX_MAX_BATCHES)
+
 #define foreach_submitted(ctx, idx)                                            \
    BITSET_FOREACH_SET(idx, ctx->batches.submitted, AGX_MAX_BATCHES)
 
@@ -76,6 +79,12 @@ agx_batch_is_active(struct agx_batch *batch)
 }
 
 bool
+agx_batch_is_queued(struct agx_batch *batch)
+{
+   return BITSET_TEST(batch->ctx->batches.queued, agx_batch_idx(batch));
+}
+
+bool
 agx_batch_is_submitted(struct agx_batch *batch)
 {
    return BITSET_TEST(batch->ctx->batches.submitted, agx_batch_idx(batch));
@@ -89,8 +98,23 @@ agx_batch_mark_active(struct agx_batch *batch)
    batch_debug(batch, "ACTIVE");
 
    assert(!BITSET_TEST(batch->ctx->batches.submitted, batch_idx));
+   assert(!BITSET_TEST(batch->ctx->batches.queued, batch_idx));
    assert(!BITSET_TEST(batch->ctx->batches.active, batch_idx));
    BITSET_SET(batch->ctx->batches.active, batch_idx);
+}
+
+static void
+agx_batch_mark_queued(struct agx_batch *batch)
+{
+   unsigned batch_idx = agx_batch_idx(batch);
+
+   batch_debug(batch, "QUEUED");
+
+   assert(BITSET_TEST(batch->ctx->batches.active, batch_idx));
+   assert(!BITSET_TEST(batch->ctx->batches.queued, batch_idx));
+   assert(!BITSET_TEST(batch->ctx->batches.submitted, batch_idx));
+   BITSET_CLEAR(batch->ctx->batches.active, batch_idx);
+   BITSET_SET(batch->ctx->batches.queued, batch_idx);
 }
 
 static void
@@ -100,9 +124,11 @@ agx_batch_mark_submitted(struct agx_batch *batch)
 
    batch_debug(batch, "SUBMIT");
 
-   assert(BITSET_TEST(batch->ctx->batches.active, batch_idx));
+   assert(BITSET_TEST(batch->ctx->batches.active, batch_idx) ||
+          BITSET_TEST(batch->ctx->batches.queued, batch_idx));
    assert(!BITSET_TEST(batch->ctx->batches.submitted, batch_idx));
    BITSET_CLEAR(batch->ctx->batches.active, batch_idx);
+   BITSET_CLEAR(batch->ctx->batches.queued, batch_idx);
    BITSET_SET(batch->ctx->batches.submitted, batch_idx);
 }
 
@@ -114,6 +140,7 @@ agx_batch_mark_complete(struct agx_batch *batch)
    batch_debug(batch, "COMPLETE");
 
    assert(!BITSET_TEST(batch->ctx->batches.active, batch_idx));
+   assert(!BITSET_TEST(batch->ctx->batches.queued, batch_idx));
    assert(BITSET_TEST(batch->ctx->batches.submitted, batch_idx));
    BITSET_CLEAR(batch->ctx->batches.submitted, batch_idx);
 }
@@ -173,7 +200,7 @@ agx_encoder_bind_vdm_alias(struct agx_device *dev, struct agx_encoder *encoder)
    assert(encoder->g17p_vdm_alias);
 }
 
-static void
+void
 agx_encoder_cleanup(struct agx_device *dev, struct agx_encoder *encoder)
 {
    agx_bo_unreference(dev, encoder->bo);
@@ -246,16 +273,18 @@ agx_batch_set_m5_tile_program(struct agx_batch *batch,
 }
 
 /* DRM_ASAHI_SET_COMPUTE_RESOURCES for the compute commands that follow, when
- * the kernel takes one. An empty list sends nothing: a dispatch without
- * thread-private storage needs no plan. Returns false if the list cannot be
- * encoded (the header size is 16 bits). */
+ * the kernel takes one. An empty list sends nothing unless force_clear is set
+ * to reset persistent state from an earlier compute batch in the same
+ * submission. Returns false if the list cannot be encoded (the header size is
+ * 16 bits). */
 static bool
 agx_append_m5_compute_resources(struct agx_device *dev,
                                 struct agx_batch *batch,
-                                struct util_dynarray *cmdbuf)
+                                struct util_dynarray *cmdbuf, bool force_clear)
 {
-   if (!(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES) ||
-       !batch->m5_compute_programs.size)
+   if (!(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES))
+      return true;
+   if (!batch->m5_compute_programs.size && !force_clear)
       return true;
    if (batch->m5_compute_programs.size > UINT16_MAX)
       return false;
@@ -267,27 +296,32 @@ agx_append_m5_compute_resources(struct agx_device *dev,
       .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
    };
    util_dynarray_append(cmdbuf, header);
-   util_dynarray_append_array(cmdbuf, uint8_t, batch->m5_compute_programs.data,
-                              batch->m5_compute_programs.size);
+   if (batch->m5_compute_programs.size) {
+      util_dynarray_append_array(cmdbuf, uint8_t,
+                                 batch->m5_compute_programs.data,
+                                 batch->m5_compute_programs.size);
+   }
    return true;
 }
 
 /* Compute commands for the recorded dispatches first..end-1 of the batch's
  * count, one command each (see agx_batch_submit()). Each waits on the one
  * before it in its submission, the first on the queue's earlier submissions
- * (barrier 0). The batch's compute timestamps bracket all of its commands,
- * across submissions. */
+ * (or prior commands of a coalesced submission). The batch's compute
+ * timestamps bracket all of its commands, across submissions. */
 static void
 agx_append_m5_compute_commands(struct agx_batch *batch,
                                const struct drm_asahi_cmd_compute *compute,
                                unsigned first, unsigned end, unsigned count,
+                               uint16_t vdm_barrier, uint16_t base_cdm_barrier,
                                struct util_dynarray *cmdbuf)
 {
    const struct agx_cdm_dispatch *cdm_dispatch = batch->cdm_dispatch.data;
    const uint64_t cdm_base = batch->cdm.bo->va->addr;
 
    for (unsigned i = first; i < end; ++i) {
-      struct drm_asahi_cmd_header header = agx_cmd_header(true, 0, i - first);
+      struct drm_asahi_cmd_header header =
+         agx_cmd_header(true, vdm_barrier, base_cdm_barrier + (i - first));
       struct drm_asahi_cmd_compute one = *compute;
       one.cdm_ctrl_stream_base = cdm_base + cdm_dispatch[i].start;
       one.cdm_ctrl_stream_end = cdm_base + cdm_dispatch[i].end;
@@ -359,12 +393,18 @@ agx_batch_init(struct agx_context *ctx,
     * copy (agx_blit) reloads from the single-sample image. */
    batch->g17p_resolve_reload = false;
    batch->g17p_resolve_preserve = key->resolve != NULL;
+   batch->g17g_mrt_resident = false;
+   batch->g17p_resolve_blit_attached = false;
    batch->seqnum = ++ctx->batches.seqnum;
+   batch->submit_seq = 0;
    batch->g17p_fragment_program = 0;
    batch->vs_root_valid = false;
    batch->g17p_emrt_heap = 0;
    batch->g17p_fragment_shader = NULL;
    batch->g17p_fragment_linked = NULL;
+   batch->g17p_bind_tail_latched = false;
+   batch->g17p_have_latched_vs = false;
+   batch->g17p_latched_vs_shader = NULL;
 
    agx_bo_reference(screen->rodata);
    agx_pool_init(&batch->pool, dev, "Batch pool", 0, true);
@@ -375,14 +415,19 @@ agx_batch_init(struct agx_context *ctx,
    if (!batch->bo_list.set) {
       batch->bo_list.set = _mesa_pointer_set_create(ctx);
       util_dynarray_init(&batch->bo_list.list, ctx);
+      util_dynarray_init(&batch->bo_list.written, ctx);
       batch->bo_list.ranges = _mesa_pointer_hash_table_create(ctx);
       util_dynarray_init(&batch->bo_list.range_list, ctx);
    } else {
       _mesa_set_clear(batch->bo_list.set, NULL);
       util_dynarray_clear(&batch->bo_list.list);
+      util_dynarray_clear(&batch->bo_list.written);
       _mesa_hash_table_clear(batch->bo_list.ranges, NULL);
       util_dynarray_clear(&batch->bo_list.range_list);
    }
+   batch->submitted_has_vdm = false;
+   batch->submitted_has_cdm = false;
+   batch->barrier_untracked = false;
 
    if (agx_batch_is_compute(batch)) {
       batch->cdm = agx_encoder_allocate(batch, dev);
@@ -403,6 +448,9 @@ agx_batch_init(struct agx_context *ctx,
    util_dynarray_init(&batch->m5_compute_programs, ctx);
    memset(&batch->m5_tile_program, 0, sizeof(batch->m5_tile_program));
    batch->m5_shader_writes = false;
+   batch->vs_needs_render_barrier = false;
+   batch->prims_unknown = false;
+   batch->known_prims = 0;
    batch->faulttrace_seqid = 0;
 
    batch->clear = 0;
@@ -424,6 +472,7 @@ agx_batch_init(struct agx_context *ctx,
    batch->g17g_prims = 0;
    batch->g17g_small_budget = false;
    batch->incoherent_writes = false;
+   batch->query_access = false;
    agx_bo_unreference(dev, batch->sampler_heap.bo);
    batch->sampler_heap.bo = NULL;
    batch->sampler_heap.count = 0;
@@ -557,7 +606,7 @@ agx_batch_cleanup(struct agx_context *ctx, struct agx_batch *batch, bool reset)
                  "nonzero=%zu full=%zu samples=%u first=0x%zx last=0x%zx "
                  "quarters=%zu,%zu,%zu,%zu residues4=%zu,%zu,%zu,%zu\n",
                  (unsigned long long)agx_map_gpu(rt), size, nonzero, full,
-                 util_res_sample_count(&rt->base), first, last,
+                 util_res_sample_count(&rt->base.b), first, last,
                  quarters[0], quarters[1], quarters[2], quarters[3],
                  residues[0], residues[1], residues[2], residues[3]);
       }
@@ -599,6 +648,8 @@ agx_batch_cleanup(struct agx_context *ctx, struct agx_batch *batch, bool reset)
    agx_pool_cleanup(&batch->pipeline_pool);
 
    util_dynarray_clear(&batch->bo_list.list);
+   util_dynarray_clear(&batch->bo_list.written);
+   batch->submit_seq = 0;
    util_dynarray_fini(&batch->cdm_dispatch);
    util_dynarray_fini(&batch->scissor);
    util_dynarray_fini(&batch->depth_bias);
@@ -659,11 +710,26 @@ agx_cleanup_batches(struct agx_context *ctx)
    uint32_t first = 0;
 
    foreach_submitted(ctx, i) {
-      if (ctx->batches.slots[i].submit_quarantined)
+      struct agx_batch *slot = &ctx->batches.slots[i];
+      if (slot->submit_quarantined)
          continue;
 
-      batches[count] = &ctx->batches.slots[i];
-      syncobjs[count++] = ctx->batches.slots[i].syncobj;
+      /* Coalesced batches share a single kernel submission and fence; poll
+       * each submission once and retire the whole group together below. */
+      if (slot->submit_seq) {
+         bool seen = false;
+         for (unsigned j = 0; j < count; ++j) {
+            if (batches[j]->submit_seq == slot->submit_seq) {
+               seen = true;
+               break;
+            }
+         }
+         if (seen)
+            continue;
+      }
+
+      batches[count] = slot;
+      syncobjs[count++] = slot->syncobj;
    }
 
    if (!count)
@@ -674,10 +740,21 @@ agx_cleanup_batches(struct agx_context *ctx)
    if (ret)
       return -1;
 
-   assert(first < AGX_MAX_BATCHES);
+   assert(first < count);
+   uint64_t seq = batches[first]->submit_seq;
+   int freed = agx_batch_idx(batches[first]);
    agx_check_batch_fence(ctx, batches[first]);
    agx_batch_cleanup(ctx, batches[first], false);
-   return agx_batch_idx(batches[first]);
+
+   if (seq) {
+      foreach_submitted(ctx, i) {
+         struct agx_batch *slot = &ctx->batches.slots[i];
+         if (!slot->submit_quarantined && slot->submit_seq == seq)
+            agx_batch_cleanup(ctx, slot, false);
+      }
+   }
+
+   return freed;
 }
 
 static struct agx_batch *
@@ -701,6 +778,7 @@ agx_get_batch_for_framebuffer(struct agx_context *ctx,
    /* Look for a free batch */
    for (i = 0; i < AGX_MAX_BATCHES; ++i) {
       if (!BITSET_TEST(ctx->batches.active, i) &&
+          !BITSET_TEST(ctx->batches.queued, i) &&
           !BITSET_TEST(ctx->batches.submitted, i)) {
          struct agx_batch *batch = &ctx->batches.slots[i];
          agx_batch_init(ctx, state, batch);
@@ -714,6 +792,18 @@ agx_get_batch_for_framebuffer(struct agx_context *ctx,
       struct agx_batch *batch = &ctx->batches.slots[freed];
       agx_batch_init(ctx, state, batch);
       return batch;
+   }
+
+   /* Drain queued batches before evicting so they become submitted and
+    * eligible for retirement or LRU wait. */
+   if (ctx->pending.batches.size) {
+      agx_submit_pending(ctx);
+      freed = agx_cleanup_batches(ctx);
+      if (freed >= 0) {
+         struct agx_batch *batch = &ctx->batches.slots[freed];
+         agx_batch_init(ctx, state, batch);
+         return batch;
+      }
    }
 
    /* Else, evict something */
@@ -775,6 +865,8 @@ agx_flush_all(struct agx_context *ctx, const char *reason)
 
       agx_flush_batch(ctx, &ctx->batches.slots[idx]);
    }
+
+   agx_submit_pending(ctx);
 }
 
 void
@@ -796,7 +888,7 @@ static void
 agx_batch_note_range(struct agx_batch *batch, struct agx_resource *rsrc,
                      uint64_t start, uint64_t end)
 {
-   if (rsrc->base.target != PIPE_BUFFER)
+   if (rsrc->base.b.target != PIPE_BUFFER)
       return;
 
    struct hash_entry *e =
@@ -825,7 +917,7 @@ agx_batch_touches_range(struct agx_batch *batch, struct agx_resource *rsrc,
 {
    if (!agx_batch_uses_bo(batch, rsrc->bo))
       return false;
-   if (rsrc->base.target != PIPE_BUFFER || (start == 0 && end == AGX_RANGE_ALL))
+   if (rsrc->base.b.target != PIPE_BUFFER || (start == 0 && end == AGX_RANGE_ALL))
       return true;
 
    struct hash_entry *e =
@@ -861,6 +953,15 @@ agx_flush_readers_except_range(struct agx_context *ctx,
 
    /* Then wait on everything if necessary */
    if (sync) {
+      foreach_queued(ctx, idx) {
+         struct agx_batch *batch = &ctx->batches.slots[idx];
+
+         if (batch != except && agx_batch_uses_bo(batch, rsrc->bo)) {
+            agx_submit_pending(ctx);
+            break;
+         }
+      }
+
       foreach_submitted(ctx, idx) {
          struct agx_batch *batch = &ctx->batches.slots[idx];
 
@@ -891,13 +992,16 @@ agx_flush_writer_except(struct agx_context *ctx, struct agx_resource *rsrc,
    struct agx_batch *writer = agx_writer_get(ctx, rsrc->bo->handle);
 
    if (writer && writer != except &&
-       (agx_batch_is_active(writer) || agx_batch_is_submitted(writer))) {
+       (agx_batch_is_active(writer) || agx_batch_is_queued(writer) ||
+        agx_batch_is_submitted(writer))) {
       if (agx_batch_is_active(writer) || sync) {
          perf_debug_ctx(ctx, "%s writer due to: %s\n", sync ? "Sync" : "Flush",
                         reason);
       }
       if (agx_batch_is_active(writer))
          agx_flush_batch(ctx, writer);
+      if (sync && agx_batch_is_queued(writer))
+         agx_submit_pending(ctx);
       /* Check for submitted state, because if the batch was a no-op it'll
        * already be cleaned up */
       if (sync && agx_batch_is_submitted(writer))
@@ -910,6 +1014,13 @@ agx_any_batch_uses_resource(struct agx_context *ctx, struct agx_resource *rsrc)
 {
    unsigned idx;
    foreach_active(ctx, idx) {
+      struct agx_batch *batch = &ctx->batches.slots[idx];
+
+      if (agx_batch_uses_bo(batch, rsrc->bo))
+         return true;
+   }
+
+   foreach_queued(ctx, idx) {
       struct agx_batch *batch = &ctx->batches.slots[idx];
 
       if (agx_batch_uses_bo(batch, rsrc->bo))
@@ -985,7 +1096,7 @@ agx_batch_reads_internal(struct agx_batch *batch, struct agx_resource *rsrc,
       agx_batch_add_bo(batch, rsrc->separate_stencil->bo);
 
    /* Don't hazard track fake resources internally created for meta */
-   if (!rsrc->base.screen)
+   if (!rsrc->base.b.screen)
       return;
 
    batch_debug(batch, "Reads BO @ 0x%" PRIx64 " (%s)", rsrc->bo->va->addr,
@@ -1018,7 +1129,9 @@ agx_batch_writes_internal(struct agx_batch *batch, struct agx_resource *rsrc,
    agx_flush_readers_except_range(ctx, rsrc, batch, "Write from other batch",
                                   false, start, end);
 
-   BITSET_SET(rsrc->data_valid, level);
+   agx_resource_set_valid(rsrc, level);
+   if (!agx_batch_is_compute(batch))
+      rsrc->render_written = true;
 
    /* Nothing to do if we're already writing */
    if (writer == batch) {
@@ -1034,13 +1147,17 @@ agx_batch_writes_internal(struct agx_batch *batch, struct agx_resource *rsrc,
    agx_batch_reads_internal(batch, rsrc, start, end);
 
    writer = agx_writer_get(ctx, rsrc->bo->handle);
-   assert(!writer || agx_batch_is_submitted(writer));
+   assert(!writer || agx_batch_is_submitted(writer) ||
+          agx_batch_is_queued(writer));
 
    /* We are now the new writer. Disregard the previous writer -- anything that
     * needs to wait for the writer going forward needs to wait for us.
     */
    agx_writer_remove(ctx, rsrc->bo->handle);
    agx_writer_add(ctx, agx_batch_idx(batch), rsrc->bo->handle);
+   util_dynarray_append(&batch->bo_list.written, rsrc->bo);
+   if (rsrc->separate_stencil && rsrc->separate_stencil->bo)
+      util_dynarray_append(&batch->bo_list.written, rsrc->separate_stencil->bo);
    assert(agx_batch_is_active(batch));
    batch_debug(batch, "Becomes writer of BO @ 0x%" PRIx64 " (%s)",
                rsrc->bo->va->addr,
@@ -1053,10 +1170,9 @@ agx_batch_writes(struct agx_batch *batch, struct agx_resource *rsrc,
 {
    agx_batch_writes_internal(batch, rsrc, level, 0, AGX_RANGE_ALL);
 
-   if (rsrc->base.target == PIPE_BUFFER) {
+   if (rsrc->base.b.target == PIPE_BUFFER) {
       /* Assume BOs written by the GPU are fully valid */
-      rsrc->valid_buffer_range.start = 0;
-      rsrc->valid_buffer_range.end = ~0;
+      agx_valid_buffer_range_set_full(rsrc);
    }
 }
 
@@ -1064,10 +1180,74 @@ void
 agx_batch_writes_range(struct agx_batch *batch, struct agx_resource *rsrc,
                        unsigned offset, unsigned size)
 {
-   assert(rsrc->base.target == PIPE_BUFFER);
+   assert(rsrc->base.b.target == PIPE_BUFFER);
    agx_batch_writes_internal(batch, rsrc, 0, offset, (uint64_t)offset + size);
-   util_range_add(&rsrc->base, &rsrc->valid_buffer_range, offset,
-                  offset + size);
+   agx_valid_buffer_range_add(rsrc, offset, offset + size);
+}
+
+/* Compute inter-submission VDM/CDM barriers for @batch on native AGX3 queues.
+ * Disjoint in-flight batches need not serialize across subqueues (for example,
+ * an independent CDM dispatch overlapping an in-flight VDM render). Any
+ * untracked side effect, external/shared fence, explicit API barrier, or
+ * RAW/WAR/WAW BO overlap fails closed to barrier 0. */
+static void
+agx_batch_compute_barriers(struct agx_context *ctx, struct agx_batch *batch,
+                           bool untracked_current, uint16_t *out_vdm_barrier,
+                           uint16_t *out_cdm_barrier)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+
+   if (!agx_chip_native_agx3(dev->chip) ||
+       (dev->debug & (AGX_DBG_TRACE | AGX_DBG_SYNC | AGX_DBG_SCRATCH)) ||
+       ctx->any_faults || untracked_current) {
+      *out_vdm_barrier = 0;
+      *out_cdm_barrier = 0;
+      return;
+   }
+
+   bool need_vdm = false;
+   bool need_cdm = false;
+   unsigned i;
+   foreach_submitted(ctx, i) {
+      struct agx_batch *prev = &ctx->batches.slots[i];
+
+      /* A quarantined batch's subqueue state is unknown: wait on both. */
+      if (prev->submit_quarantined) {
+         need_vdm = need_cdm = true;
+         break;
+      }
+
+      bool hazard = prev->barrier_untracked ||
+                    prev->seqnum <= ctx->batches.barrier_seqnum;
+
+      if (!hazard && prev->bo_list.written.size) {
+         util_dynarray_foreach(&prev->bo_list.written, struct agx_bo *, entry) {
+            if (_mesa_set_search(batch->bo_list.set, *entry)) {
+               hazard = true;
+               break;
+            }
+         }
+      }
+
+      if (!hazard && batch->bo_list.written.size) {
+         util_dynarray_foreach(&batch->bo_list.written, struct agx_bo *, entry) {
+            if (_mesa_set_search(prev->bo_list.set, *entry)) {
+               hazard = true;
+               break;
+            }
+         }
+      }
+
+      if (hazard) {
+         need_vdm |= prev->submitted_has_vdm;
+         need_cdm |= prev->submitted_has_cdm;
+         if (need_vdm && need_cdm)
+            break;
+      }
+   }
+
+   *out_vdm_barrier = need_vdm ? 0 : DRM_ASAHI_BARRIER_NONE;
+   *out_cdm_barrier = need_cdm ? 0 : DRM_ASAHI_BARRIER_NONE;
 }
 
 static bool
@@ -1110,6 +1290,22 @@ agx_add_sync(struct drm_asahi_sync *syncs, unsigned *count, uint32_t handle)
       .sync_type = DRM_ASAHI_SYNC_SYNCOBJ,
       .handle = handle,
    };
+}
+
+static void
+agx_add_sync_unique(struct drm_asahi_sync *syncs, unsigned *count,
+                    uint32_t handle)
+{
+   if (!handle)
+      return;
+
+   for (unsigned i = 0; i < *count; ++i) {
+      if (syncs[i].sync_type == DRM_ASAHI_SYNC_SYNCOBJ &&
+          syncs[i].handle == handle)
+         return;
+   }
+
+   agx_add_sync(syncs, count, handle);
 }
 
 #define MAX_ATTACHMENTS 16
@@ -1169,6 +1365,28 @@ agx_wait_failed_submit(struct agx_device *dev, uint32_t syncobj, bool accepted)
    } while (ret == -EINTR);
 
    return ret == 0;
+}
+
+/* Publish a submitted batch's state for agx_get_query_result_flushed(), which
+ * u_threaded_context calls from the frontend thread. A quarantined batch's
+ * completion is unknown, so it publishes no fence and no timestamps. */
+static void
+agx_publish_batch_query_state(struct agx_context *ctx, struct agx_batch *batch,
+                              bool quarantined)
+{
+   unsigned idx = agx_batch_idx(batch);
+
+   simple_mtx_lock(&ctx->query_lock);
+   ctx->batches.query_state[idx].generation = ctx->batches.generation[idx];
+   if (!quarantined)
+      ctx->batches.query_state[idx].syncobj = batch->syncobj;
+   ctx->batches.query_state[idx].submitted = true;
+   ctx->batches.query_state[idx].quarantined = quarantined;
+   ctx->batches.query_state[idx].has_cdm =
+      !quarantined && batch->cdm.bo && !batch->compute_dropped;
+   ctx->batches.query_state[idx].has_vdm =
+      !quarantined && batch->vdm.bo != NULL;
+   simple_mtx_unlock(&ctx->query_lock);
 }
 
 static void
@@ -1238,13 +1456,15 @@ agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
       batch->failed_syncobjs[1] = error_syncobj;
       ctx->submit_quarantined = true;
       p_atomic_set(&agx_screen(ctx->base.screen)->submit_quarantined, true);
+      agx_publish_batch_query_state(ctx, batch, true);
+
       agx_msg("submit completion unknown; quarantining context resources\n");
    }
 
    /* A refused batch is lost on its own; the context stays usable. */
    if (!refused && !(g17_refused && complete)) {
       const bool first_fault = !ctx->any_faults;
-      ctx->any_faults = true;
+      p_atomic_set(&ctx->any_faults, true);
       if (first_fault && ctx->reset.reset)
          ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
    }
@@ -1276,6 +1496,50 @@ asahi_add_attachment(struct attachments *att, struct agx_resource *rsrc)
       .size = rsrc->layout.size_B - rsrc->layout.level_offsets_B[0],
       .pointer = agx_map_gpu(rsrc),
    };
+}
+
+static void
+agx_append_render_attachments(struct agx_batch *batch,
+                              struct util_dynarray *cmdbuf,
+                              bool *prev_had_attachments)
+{
+   struct attachments att = {.count = 0};
+   struct pipe_framebuffer_state *fb = &batch->key;
+
+   for (unsigned i = 0; i < fb->nr_cbufs; ++i) {
+      if (fb->cbufs[i].texture)
+         asahi_add_attachment(&att, agx_resource(fb->cbufs[i].texture));
+   }
+
+   if (fb->resolve)
+      asahi_add_attachment(&att, agx_resource(fb->resolve));
+
+   if (fb->zsbuf.texture) {
+      struct agx_resource *rsrc = agx_resource(fb->zsbuf.texture);
+      asahi_add_attachment(&att, rsrc);
+
+      if (rsrc->separate_stencil)
+         asahi_add_attachment(&att, rsrc->separate_stencil);
+   }
+
+   /* SET_FRAGMENT_ATTACHMENTS persists across render commands within a
+    * multi-command submission; an attachmentless render following one with
+    * attachments must emit an empty command to clear it. */
+   if (att.count || *prev_had_attachments) {
+      struct drm_asahi_cmd_header header = {
+         .cmd_type = DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS,
+         .size = sizeof(att.list[0]) * att.count,
+         .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
+         .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
+      };
+
+      util_dynarray_append(cmdbuf, header);
+      if (att.count) {
+         util_dynarray_append_array(cmdbuf, struct drm_asahi_attachment,
+                                    att.list, att.count);
+      }
+      *prev_had_attachments = att.count > 0;
+   }
 }
 
 static void
@@ -1416,14 +1680,14 @@ agx_g18_indirect_empty(struct agx_batch *batch,
    return 0;
 }
 
-void
-agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
-                 struct drm_asahi_cmd_compute *compute,
-                 struct drm_asahi_cmd_render *render)
+static bool
+agx_validate_batch_for_submit(struct agx_context *ctx, struct agx_batch *batch,
+                              struct drm_asahi_cmd_compute **compute_p,
+                              struct drm_asahi_cmd_render **render_p)
 {
    struct agx_device *dev = agx_device(ctx->base.screen);
-   struct agx_screen *screen = agx_screen(ctx->base.screen);
-   const struct agx_cdm_dispatch *cdm_dispatch = batch->cdm_dispatch.data;
+   struct drm_asahi_cmd_compute *compute = *compute_p;
+   struct drm_asahi_cmd_render *render = *render_p;
    const unsigned cdm_dispatch_count =
       util_dynarray_num_elements(&batch->cdm_dispatch, struct agx_cdm_dispatch);
 
@@ -1468,7 +1732,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          ctx->batch = NULL;
       agx_batch_mark_submitted(batch);
       agx_batch_cleanup(ctx, batch, false);
-      return;
+      return false;
    }
 
    /* Every draw in this batch was refused by the G17G profile, so its VDM
@@ -1528,7 +1792,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          util_dynarray_clear(&batch->timestamps);
          agx_batch_mark_submitted(batch);
          agx_batch_cleanup(ctx, batch, false);
-         return;
+         return false;
       }
    }
 
@@ -1563,15 +1827,40 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          ctx->batch = NULL;
       agx_batch_mark_submitted(batch);
       agx_batch_cleanup(ctx, batch, false);
-      return;
+      return false;
    }
+
+   *compute_p = compute;
+   *render_p = render;
+   return true;
+}
+
+void
+agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
+                 struct drm_asahi_cmd_compute *compute,
+                 struct drm_asahi_cmd_render *render)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   struct agx_screen *screen = agx_screen(ctx->base.screen);
+
+   /* Preserve strict FIFO ordering with any earlier coalesced batches. */
+   if (ctx->pending.batches.size)
+      agx_submit_pending(ctx);
+
+   if (!agx_validate_batch_for_submit(ctx, batch, &compute, &render))
+      return;
+
+   const struct agx_cdm_dispatch *cdm_dispatch = batch->cdm_dispatch.data;
+   const unsigned cdm_dispatch_count =
+      util_dynarray_num_elements(&batch->cdm_dispatch, struct agx_cdm_dispatch);
 
    /* At most every BO contributes an input wait, followed by the explicit and
     * inter-context input fences. The submission then appends two output
     * fences and a private publication fence, all needing full records.
     */
-   const bool split_compute = dev->chip == AGX_CHIP_G17P && compute && render &&
-                             dev->params.max_commands_per_submission < 2;
+   const bool split_compute =
+      agx_chip_native_hal200(dev->chip) && compute && render &&
+      dev->params.max_commands_per_submission < 2;
    unsigned bo_count = util_dynarray_num_elements(&batch->bo_list.list,
                                                   struct agx_bo *);
    unsigned sync_capacity = bo_count + 5 + split_compute;
@@ -1900,6 +2189,16 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    /* Compute commands in this submission, which the render waits on. */
    unsigned compute_commands = 0;
 
+   const bool untracked_current =
+      batch->barrier_untracked || batch->heap || batch->vs_scratch ||
+      batch->fs_scratch || batch->cs_scratch || batch->timestamps.size > 0 ||
+      batch->query_access || ctx->global_buffers.size > 0 ||
+      in_sync_count > 0 || shared_bo_count > 0 || split_compute ||
+      m5_split_prepass || m5_compute_commands;
+   uint16_t vdm_barrier = 0, cdm_barrier = 0;
+   agx_batch_compute_barriers(ctx, batch, untracked_current, &vdm_barrier,
+                              &cdm_barrier);
+
    /* Submit! */
    if (compute && !split_compute && m5_compute_commands) {
       /* The G17 runtime (M5 Pro, M5 Max, and M5 on it) takes a mixed
@@ -1937,10 +2236,10 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
             };
 
             ASSERTED bool encoded =
-               agx_append_m5_compute_resources(dev, batch, &chunk);
+               agx_append_m5_compute_resources(dev, batch, &chunk, false);
             assert(encoded);
             agx_append_m5_compute_commands(batch, compute, first, first + n,
-                                           cdm_dispatch_count, &chunk);
+                                           cdm_dispatch_count, 0, 0, &chunk);
 
             struct drm_asahi_submit chunk_submit = {
                .flags = 0,
@@ -1981,14 +2280,15 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       }
 
       ASSERTED bool encoded =
-         agx_append_m5_compute_resources(dev, batch, &cmdbuf);
+         agx_append_m5_compute_resources(dev, batch, &cmdbuf, false);
       assert(encoded);
       agx_append_m5_compute_commands(batch, compute, first, cdm_dispatch_count,
-                                     cdm_dispatch_count, &cmdbuf);
+                                     cdm_dispatch_count, 0, 0, &cmdbuf);
       compute_commands = cdm_dispatch_count - first;
    } else if (compute && !split_compute) {
-      /* Barrier on previous submission */
-      struct drm_asahi_cmd_header header = agx_cmd_header(true, 0, 0);
+      /* Barrier on prior dependent submissions (NONE when disjoint on AGX3). */
+      struct drm_asahi_cmd_header header =
+         agx_cmd_header(true, vdm_barrier, cdm_barrier);
 
       util_dynarray_append(&cmdbuf, header);
       util_dynarray_append(&cmdbuf, *compute);
@@ -2123,37 +2423,8 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    }
 
    if (render) {
-      struct attachments att = {.count = 0};
-      struct pipe_framebuffer_state *fb = &batch->key;
-
-      for (unsigned i = 0; i < fb->nr_cbufs; ++i) {
-         if (fb->cbufs[i].texture)
-            asahi_add_attachment(&att, agx_resource(fb->cbufs[i].texture));
-      }
-
-      if (fb->resolve)
-         asahi_add_attachment(&att, agx_resource(fb->resolve));
-
-      if (fb->zsbuf.texture) {
-         struct agx_resource *rsrc = agx_resource(fb->zsbuf.texture);
-         asahi_add_attachment(&att, rsrc);
-
-         if (rsrc->separate_stencil)
-            asahi_add_attachment(&att, rsrc->separate_stencil);
-      }
-
-      if (att.count) {
-         struct drm_asahi_cmd_header header = {
-            .cmd_type = DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS,
-            .size = sizeof(att.list[0]) * att.count,
-            .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
-            .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
-         };
-
-         util_dynarray_append(&cmdbuf, header);
-         util_dynarray_append_array(&cmdbuf, struct drm_asahi_attachment,
-                                    att.list, att.count);
-      }
+      bool prev_att = false;
+      agx_append_render_attachments(batch, &cmdbuf, &prev_att);
 
       if (agx_m5_render_resources(dev)) {
          ASSERTED bool encoded =
@@ -2178,8 +2449,13 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       const bool compute_here =
          compute && !split_compute && !m5_split_prepass && compute_commands;
       struct drm_asahi_cmd_header header = agx_cmd_header(
-         false, compute_here ? DRM_ASAHI_BARRIER_NONE : 0,
-         compute_here ? compute_commands : 0);
+         false, compute_here ? DRM_ASAHI_BARRIER_NONE : vdm_barrier,
+         compute_here ? compute_commands : cdm_barrier);
+      if ((dev->params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+          (header.vdm_barrier != DRM_ASAHI_BARRIER_NONE ||
+           header.cdm_barrier != DRM_ASAHI_BARRIER_NONE) &&
+          !compute_here && !batch->vs_needs_render_barrier)
+         render->flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
       /* G18G takes the full drm_asahi_cmd_render. */
       header.size = dev->chip == AGX_CHIP_G18G
                        ? sizeof(struct drm_asahi_cmd_render)
@@ -2334,7 +2610,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
             agx_msg("shared BO release-fence fallback wait failed: %s\n",
                     strerror(ret < -1 ? -ret : (errno ? errno : EIO)));
             const bool first_fault = !ctx->any_faults;
-            ctx->any_faults = true;
+            p_atomic_set(&ctx->any_faults, true);
             if (first_fault && ctx->reset.reset)
                ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
          }
@@ -2398,7 +2674,13 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    }
 
    util_dynarray_fini(&cmdbuf);
+   batch->submitted_has_cdm = compute != NULL;
+   batch->submitted_has_vdm = render != NULL;
+   batch->barrier_untracked = untracked_current;
+   batch->submit_seq = seqid;
    agx_batch_mark_submitted(batch);
+
+   agx_publish_batch_query_state(ctx, batch, false);
 
    free(virt.extres);
 
@@ -2419,12 +2701,562 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       agx_cleanup_batches(ctx);
 }
 
+static void
+agx_retire_failed_pending(struct agx_context *ctx,
+                          struct agx_pending_batch *entries, unsigned count,
+                          struct drm_asahi_sync *syncs,
+                          struct agx_shared_bo_sync *shared_bos,
+                          unsigned shared_bo_count, void *extres,
+                          struct util_dynarray *cmdbuf, int error,
+                          uint32_t error_syncobj)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+
+   for (unsigned i = 0; i < shared_bo_count; ++i) {
+      if (shared_bos[i].in_syncobj)
+         drmSyncobjDestroy(dev->fd, shared_bos[i].in_syncobj);
+   }
+
+   free(syncs);
+   free(shared_bos);
+   free(extres);
+   util_dynarray_fini(cmdbuf);
+
+   const bool refused = (error == 524);
+   const bool g17 = agx_m5_render_resources(dev);
+   const bool g17_refused = g17 && error == EINVAL;
+   const bool complete =
+      refused || agx_wait_failed_submit(dev, error_syncobj, false);
+
+   for (unsigned k = 0; k < count; ++k) {
+      struct agx_batch *batch = entries[k].batch;
+      if (ctx->batch == batch)
+         ctx->batch = NULL;
+      agx_batch_mark_submitted(batch);
+
+      if (complete) {
+         if (g17 && (refused || g17_refused))
+            drmSyncobjSignal(dev->fd, &batch->syncobj, 1);
+         agx_batch_cleanup(ctx, batch, false);
+      } else {
+         batch->submit_quarantined = true;
+         if (k == 0)
+            batch->failed_syncobjs[1] = error_syncobj;
+         agx_publish_batch_query_state(ctx, batch, true);
+      }
+   }
+
+   if (complete) {
+      if (error_syncobj)
+         drmSyncobjDestroy(dev->fd, error_syncobj);
+   } else {
+      ctx->submit_quarantined = true;
+      p_atomic_set(&agx_screen(ctx->base.screen)->submit_quarantined, true);
+      agx_msg("submit completion unknown; quarantining context resources\n");
+   }
+
+   if (!refused && !(g17_refused && complete)) {
+      const bool first_fault = !ctx->any_faults;
+      p_atomic_set(&ctx->any_faults, true);
+      if (first_fault && ctx->reset.reset)
+         ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
+   }
+
+   errno = error;
+}
+
+void
+agx_submit_pending(struct agx_context *ctx)
+{
+   if (!ctx->pending.batches.size)
+      return;
+
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   struct agx_screen *screen = agx_screen(ctx->base.screen);
+
+   /* Detach the pending queue up front so cleanup or error paths see it empty. */
+   struct util_dynarray pending = ctx->pending.batches;
+   util_dynarray_init(&ctx->pending.batches, ctx);
+   ctx->pending.hw_cmds = 0;
+
+   struct agx_pending_batch *entries = pending.data;
+   const unsigned count =
+      util_dynarray_num_elements(&pending, struct agx_pending_batch);
+   assert(count > 0);
+
+   unsigned total_bo_count = 0;
+   for (unsigned k = 0; k < count; ++k) {
+      total_bo_count += util_dynarray_num_elements(
+         &entries[k].batch->bo_list.list, struct agx_bo *);
+   }
+
+   const unsigned sync_capacity = total_bo_count + 2 + count + 2;
+   unsigned in_sync_count = 0;
+   unsigned shared_bo_count = 0;
+   struct drm_asahi_sync *syncs = malloc(sync_capacity * sizeof(*syncs));
+   struct agx_shared_bo_sync *shared_bos =
+      malloc(MAX2(total_bo_count, 1) * sizeof(*shared_bos));
+   struct util_dynarray cmdbuf = UTIL_DYNARRAY_INIT;
+
+   if (!syncs || !shared_bos || ctx->any_faults) {
+      agx_retire_failed_pending(ctx, entries, count, syncs, shared_bos, 0, NULL,
+                                &cmdbuf, ctx->any_faults ? EIO : ENOMEM, 0);
+      util_dynarray_fini(&pending);
+      return;
+   }
+
+   uint64_t wait_seqid = p_atomic_read(&screen->flush_wait_seqid);
+   struct agx_submit_virt virt = {.ring_idx = ctx->virt_ring_idx};
+
+   if (wait_seqid && wait_seqid == ctx->flush_my_seqid)
+      wait_seqid = ctx->flush_other_seqid;
+
+   uint64_t seqid = p_atomic_inc_return(&screen->flush_cur_seqid);
+   assert(seqid > wait_seqid);
+
+   u_rwlock_rdlock(&screen->destroy_lock);
+
+   for (unsigned k = 0; k < count; ++k) {
+      struct agx_batch *batch = entries[k].batch;
+
+      AGX_BATCH_FOREACH_BO(batch, entry) {
+         struct agx_bo *bo = *entry;
+
+         if (bo->flags & AGX_BO_SHARED) {
+            bool seen = false;
+            for (unsigned s = 0; s < shared_bo_count; ++s) {
+               if (shared_bos[s].bo == bo) {
+                  seen = true;
+                  break;
+               }
+            }
+            if (seen)
+               continue;
+
+            batch_debug(batch, "Waits on shared BO @ 0x%" PRIx64, bo->va->addr);
+
+            int in_sync_fd = agx_export_sync_file(dev, bo);
+            uint32_t sync_handle = 0;
+            int ret = in_sync_fd >= 0
+                         ? drmSyncobjCreate(dev->fd, 0, &sync_handle)
+                         : -1;
+
+            if (!ret) {
+               ret = drmSyncobjImportSyncFile(dev->fd, sync_handle, in_sync_fd);
+               if (ret) {
+                  drmSyncobjDestroy(dev->fd, sync_handle);
+                  sync_handle = 0;
+               }
+            }
+
+            if (in_sync_fd < 0
+                   ? !agx_wait_shared_bo(bo)
+                   : (ret && agx_fallback_wait(in_sync_fd,
+                                               "shared BO import failed"))) {
+               const int sync_errno = errno ? errno : EIO;
+               if (in_sync_fd >= 0)
+                  close(in_sync_fd);
+               u_rwlock_rdunlock(&screen->destroy_lock);
+               agx_retire_failed_pending(ctx, entries, count, syncs, shared_bos,
+                                         shared_bo_count, virt.extres, &cmdbuf,
+                                         sync_errno, 0);
+               util_dynarray_fini(&pending);
+               return;
+            }
+
+            if (in_sync_fd >= 0)
+               close(in_sync_fd);
+
+            if (sync_handle)
+               agx_add_sync(syncs, &in_sync_count, sync_handle);
+
+            shared_bos[shared_bo_count++] = (struct agx_shared_bo_sync){
+               .bo = bo,
+               .in_syncobj = sync_handle,
+            };
+            if (dev->is_virtio)
+               virt.extres_count++;
+         } else {
+            uint64_t writer = p_atomic_read_relaxed(&bo->writer);
+            uint32_t queue_id = agx_bo_writer_queue(writer);
+            if (writer && queue_id != ctx->queue_id) {
+               batch_debug(batch,
+                           "Waits on inter-context BO @ 0x%" PRIx64
+                           " from queue %u",
+                           bo->va->addr, queue_id);
+
+               agx_add_sync_unique(syncs, &in_sync_count,
+                                   agx_bo_writer_syncobj(writer));
+            }
+         }
+      }
+   }
+
+   if (dev->is_virtio && virt.extres_count) {
+      virt.extres =
+         malloc(virt.extres_count * sizeof(struct asahi_ccmd_submit_res));
+      if (!virt.extres) {
+         u_rwlock_rdunlock(&screen->destroy_lock);
+         agx_retire_failed_pending(ctx, entries, count, syncs, shared_bos,
+                                   shared_bo_count, NULL, &cmdbuf, ENOMEM, 0);
+         util_dynarray_fini(&pending);
+         return;
+      }
+
+      for (unsigned i = 0; i < virt.extres_count; i++) {
+         virt.extres[i].res_id = shared_bos[i].bo->uapi_handle;
+         virt.extres[i].flags = ASAHI_EXTRES_READ | ASAHI_EXTRES_WRITE;
+      }
+   }
+
+   uint32_t explicit_syncobj = 0;
+   if (!agx_get_in_sync(ctx, &explicit_syncobj)) {
+      const int sync_errno = errno ? errno : EIO;
+      u_rwlock_rdunlock(&screen->destroy_lock);
+      agx_retire_failed_pending(ctx, entries, count, syncs, shared_bos,
+                                shared_bo_count, virt.extres, &cmdbuf,
+                                sync_errno, 0);
+      util_dynarray_fini(&pending);
+      return;
+   }
+   agx_add_sync(syncs, &in_sync_count, explicit_syncobj);
+
+   if (wait_seqid) {
+      syncs[in_sync_count++] = (struct drm_asahi_sync){
+         .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
+         .handle = screen->flush_syncobj,
+         .timeline_value = wait_seqid,
+      };
+   }
+
+   uint32_t submit_syncobj = 0;
+   int create_ret = drmSyncobjCreate(dev->fd, 0, &submit_syncobj);
+   if (create_ret) {
+      const int error = create_ret < -1 ? -create_ret : (errno ? errno : EIO);
+      u_rwlock_rdunlock(&screen->destroy_lock);
+      agx_retire_failed_pending(ctx, entries, count, syncs, shared_bos,
+                                shared_bo_count, virt.extres, &cmdbuf, error,
+                                0);
+      util_dynarray_fini(&pending);
+      return;
+   }
+
+   const bool late_point = agx_m5_render_resources(dev);
+   struct drm_asahi_sync *out_syncs = syncs + in_sync_count;
+   const unsigned out_sync_count = count + (late_point ? 1 : 2);
+   assert(in_sync_count + out_sync_count <= sync_capacity);
+
+   for (unsigned k = 0; k < count; ++k) {
+      out_syncs[k] = (struct drm_asahi_sync){
+         .sync_type = DRM_ASAHI_SYNC_SYNCOBJ,
+         .handle = entries[k].batch->syncobj,
+      };
+   }
+
+   if (!late_point) {
+      out_syncs[count] = (struct drm_asahi_sync){
+         .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
+         .handle = screen->flush_syncobj,
+         .timeline_value = seqid,
+      };
+      out_syncs[count + 1] = (struct drm_asahi_sync){
+         .sync_type = DRM_ASAHI_SYNC_SYNCOBJ,
+         .handle = submit_syncobj,
+      };
+   } else {
+      out_syncs[count] = (struct drm_asahi_sync){
+         .sync_type = DRM_ASAHI_SYNC_SYNCOBJ,
+         .handle = submit_syncobj,
+      };
+   }
+
+   const bool untracked_submit = in_sync_count > 0 || shared_bo_count > 0 ||
+                                 ctx->global_buffers.size > 0 ||
+                                 agx_m5_render_resources(dev);
+   uint16_t prior_vdm = DRM_ASAHI_BARRIER_NONE;
+   uint16_t prior_cdm = DRM_ASAHI_BARRIER_NONE;
+   for (unsigned k = 0; k < count; ++k) {
+      struct agx_batch *batch = entries[k].batch;
+      const bool untracked_k =
+         untracked_submit || batch->barrier_untracked || batch->heap ||
+         batch->vs_scratch || batch->fs_scratch || batch->cs_scratch ||
+         batch->timestamps.size > 0 || batch->query_access;
+      entries[k].untracked = untracked_k;
+
+      uint16_t batch_vdm = 0, batch_cdm = 0;
+      agx_batch_compute_barriers(ctx, batch, untracked_k, &batch_vdm,
+                                 &batch_cdm);
+      if (batch_vdm == 0)
+         prior_vdm = 0;
+      if (batch_cdm == 0)
+         prior_cdm = 0;
+   }
+
+   unsigned nr_vdm = 0, nr_cdm = 0;
+   bool prev_frag_att = false;
+   bool prev_m5_comp_res = false;
+   unsigned mixed_batches = 0;
+
+   for (unsigned k = 0; k < count; ++k) {
+      struct agx_pending_batch *entry = &entries[k];
+      struct agx_batch *batch = entry->batch;
+      unsigned batch_compute_cmds = 0;
+
+      mixed_batches += entry->has_compute && entry->has_render;
+
+      if (entry->has_compute) {
+         if (agx_m5_render_resources(dev)) {
+            const unsigned cdm_dispatch_count = util_dynarray_num_elements(
+               &batch->cdm_dispatch, struct agx_cdm_dispatch);
+            ASSERTED bool encoded = agx_append_m5_compute_resources(
+               dev, batch, &cmdbuf, prev_m5_comp_res);
+            assert(encoded);
+            prev_m5_comp_res = batch->m5_compute_programs.size > 0;
+            agx_append_m5_compute_commands(batch, &entry->compute, 0,
+                                           cdm_dispatch_count,
+                                           cdm_dispatch_count, nr_vdm, nr_cdm,
+                                           &cmdbuf);
+            batch_compute_cmds = cdm_dispatch_count;
+            nr_cdm += cdm_dispatch_count;
+         } else {
+            struct drm_asahi_cmd_header header = agx_cmd_header(
+               true, nr_vdm ? nr_vdm : prior_vdm, nr_cdm ? nr_cdm : prior_cdm);
+            util_dynarray_append(&cmdbuf, header);
+            util_dynarray_append(&cmdbuf, entry->compute);
+            batch_compute_cmds = 1;
+            nr_cdm += 1;
+         }
+      }
+
+      if (entry->has_render) {
+         agx_append_render_attachments(batch, &cmdbuf, &prev_frag_att);
+
+         if (agx_m5_render_resources(dev)) {
+            ASSERTED bool encoded =
+               agx_append_m5_render_resources(dev, batch, &cmdbuf);
+            assert(encoded);
+
+            if (batch->m5_shader_writes &&
+                (dev->params.features & DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES))
+               entry->render.flags |= DRM_ASAHI_RENDER_SHADER_WRITES;
+         }
+
+         const uint16_t render_vdm =
+            batch_compute_cmds ? DRM_ASAHI_BARRIER_NONE
+                               : (nr_vdm ? nr_vdm : prior_vdm);
+         const uint16_t render_cdm = nr_cdm ? nr_cdm : prior_cdm;
+         struct drm_asahi_cmd_header header =
+            agx_cmd_header(false, render_vdm, render_cdm);
+         if ((dev->params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+             !batch_compute_cmds && !batch->vs_needs_render_barrier &&
+             (render_vdm != DRM_ASAHI_BARRIER_NONE ||
+              render_cdm != DRM_ASAHI_BARRIER_NONE))
+            entry->render.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+         header.size = dev->chip == AGX_CHIP_G18G
+                          ? sizeof(struct drm_asahi_cmd_render)
+                          : agx_render_command_size(dev);
+         util_dynarray_append(&cmdbuf, header);
+         util_dynarray_append_array(&cmdbuf, uint8_t, &entry->render,
+                                    header.size);
+         nr_vdm += 1;
+      }
+   }
+
+   if (unlikely(dev->debug & AGX_DBG_PERF)) {
+      ctx->submit_perf.batches += count;
+      ctx->submit_perf.mixed_batches += mixed_batches;
+      ctx->submit_perf.submits++;
+   }
+
+   struct drm_asahi_submit submit = {
+      .flags = 0,
+      .queue_id = ctx->queue_id,
+      .in_sync_count = in_sync_count,
+      .out_sync_count = out_sync_count,
+      .syncs = (uint64_t)(uintptr_t)syncs,
+      .cmdbuf = (uint64_t)(uintptr_t)cmdbuf.data,
+      .cmdbuf_size = cmdbuf.size,
+   };
+
+   int ret = dev->ops.submit(dev, &submit, &virt);
+   if (unlikely((dev->debug & AGX_DBG_PERF) && ret))
+      ctx->submit_perf.failures++;
+   const int submit_errno =
+      ret < -1 ? -ret : (ret ? (errno ? errno : EIO) : 0);
+
+   u_rwlock_rdunlock(&screen->destroy_lock);
+
+   if (ret) {
+      fprintf(stderr,
+              "DRM_IOCTL_ASAHI_SUBMIT coalesced (%u batches, %u renders, "
+              "%u computes) failed: %s\n",
+              count, nr_vdm, nr_cdm, strerror(submit_errno));
+      agx_retire_failed_pending(ctx, entries, count, syncs, shared_bos,
+                                shared_bo_count, virt.extres, &cmdbuf,
+                                submit_errno, submit_syncobj);
+      util_dynarray_fini(&pending);
+      return;
+   }
+
+   drmSyncobjDestroy(dev->fd, submit_syncobj);
+
+   struct agx_batch *last_batch = entries[count - 1].batch;
+   bool point_published = true;
+   if (late_point && drmSyncobjTransfer(dev->fd, screen->flush_syncobj, seqid,
+                                        last_batch->syncobj, 0, 0)) {
+      agx_msg("timeline point transfer failed; waiting for the batch\n");
+      drmSyncobjWait(dev->fd, &last_batch->syncobj, 1, INT64_MAX,
+                     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+      point_published = false;
+   }
+
+   if (shared_bo_count) {
+      int out_sync_fd = -1;
+      int exp_ret =
+         drmSyncobjExportSyncFile(dev->fd, last_batch->syncobj, &out_sync_fd);
+      bool transfer_failed = exp_ret || out_sync_fd < 0;
+
+      for (unsigned i = 0; i < shared_bo_count; i++) {
+         if (shared_bos[i].in_syncobj) {
+            if (drmSyncobjDestroy(dev->fd, shared_bos[i].in_syncobj))
+               transfer_failed = true;
+            shared_bos[i].in_syncobj = 0;
+         }
+
+         if (out_sync_fd >= 0 &&
+             agx_import_sync_file(dev, shared_bos[i].bo, out_sync_fd))
+            transfer_failed = true;
+      }
+
+      if (out_sync_fd >= 0)
+         close(out_sync_fd);
+
+      if (transfer_failed) {
+         int wait_ret = drmSyncobjWait(dev->fd, &last_batch->syncobj, 1,
+                                       INT64_MAX,
+                                       DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+         if (wait_ret) {
+            agx_msg("shared BO release-fence fallback wait failed: %s\n",
+                    strerror(wait_ret < -1 ? -wait_ret
+                                           : (errno ? errno : EIO)));
+            const bool first_fault = !ctx->any_faults;
+            p_atomic_set(&ctx->any_faults, true);
+            if (first_fault && ctx->reset.reset)
+               ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
+         }
+      }
+   }
+
+   for (unsigned k = 0; k < count; ++k) {
+      struct agx_batch *batch = entries[k].batch;
+      util_dynarray_foreach(&batch->bo_list.written, struct agx_bo *, entry) {
+         struct agx_bo *bo = *entry;
+         p_atomic_set(&bo->writer, agx_bo_writer(ctx->queue_id, batch->syncobj));
+         batch_debug(batch, "Writes to BO @ 0x%" PRIx64, bo->va->addr);
+      }
+
+      batch->submitted_has_cdm = entries[k].has_compute;
+      batch->submitted_has_vdm = entries[k].has_render;
+      batch->barrier_untracked = entries[k].untracked;
+      batch->submit_seq = seqid;
+      agx_batch_mark_submitted(batch);
+      agx_publish_batch_query_state(ctx, batch, false);
+      if (ctx->batch == batch)
+         ctx->batch = NULL;
+   }
+
+   free(syncs);
+   free(shared_bos);
+   free(virt.extres);
+   util_dynarray_fini(&cmdbuf);
+   util_dynarray_fini(&pending);
+
+   ctx->syncobj = last_batch->syncobj;
+   if (point_published)
+      ctx->flush_last_seqid = seqid;
+
+   if (agx_cleanup_batches(ctx) >= 0)
+      agx_cleanup_batches(ctx);
+}
+
+static bool
+agx_can_queue_batch(const struct agx_device *dev, const struct agx_batch *batch)
+{
+   if (dev->params.max_commands_per_submission < 2)
+      return false;
+
+   if (dev->debug & (AGX_DBG_TRACE | AGX_DBG_SYNC | AGX_DBG_SCRATCH |
+                     AGX_DBG_FAULTTRACE | AGX_DBG_ASYNCTRACE))
+      return false;
+
+   if (agx_chip_m5_paths(dev->chip) && !agx_m5_render_resources(dev))
+      return false;
+
+   if (batch->g18.scratch)
+      return false;
+
+   return true;
+}
+
+void
+agx_batch_queue_or_submit(struct agx_context *ctx, struct agx_batch *batch,
+                          struct drm_asahi_cmd_compute *compute,
+                          struct drm_asahi_cmd_render *render)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+
+   if (!agx_can_queue_batch(dev, batch)) {
+      agx_batch_submit(ctx, batch, compute, render);
+      return;
+   }
+
+   if (!agx_validate_batch_for_submit(ctx, batch, &compute, &render))
+      return;
+
+   const unsigned cdm_dispatch_count =
+      util_dynarray_num_elements(&batch->cdm_dispatch, struct agx_cdm_dispatch);
+   const unsigned compute_cmds =
+      !compute ? 0 : (agx_m5_render_resources(dev) ? cdm_dispatch_count : 1);
+   const unsigned batch_cmds = compute_cmds + (render ? 1 : 0);
+   const unsigned limit = dev->params.max_commands_per_submission;
+
+   /* Batches whose own commands exceed the per-submission limit (e.g. M5
+    * compute chunking) go through agx_batch_submit() directly. */
+   if (batch_cmds > limit) {
+      agx_batch_submit(ctx, batch, compute, render);
+      return;
+   }
+
+   if (ctx->pending.batches.size && ctx->pending.hw_cmds + batch_cmds > limit)
+      agx_submit_pending(ctx);
+
+   struct agx_pending_batch entry = {
+      .batch = batch,
+      .has_compute = compute != NULL,
+      .has_render = render != NULL,
+   };
+   if (compute)
+      entry.compute = *compute;
+   if (render)
+      entry.render = *render;
+
+   util_dynarray_append(&ctx->pending.batches, entry);
+   ctx->pending.hw_cmds += batch_cmds;
+
+   if (ctx->batch == batch)
+      ctx->batch = NULL;
+
+   agx_batch_mark_queued(batch);
+}
+
 bool
 agx_poll_batch(struct agx_context *ctx, struct agx_batch *batch)
 {
-   /* Polling must never submit an active batch. A query may have writers in
-    * several slots, so retire only the completed submitted writer here. */
-   if (agx_batch_is_active(batch) || batch->submit_quarantined)
+   /* Polling must never submit an active or queued batch. A query may have
+    * writers in several slots, so retire only the completed submitted writer
+    * here. */
+   if (agx_batch_is_active(batch) || agx_batch_is_queued(batch) ||
+       batch->submit_quarantined)
       return false;
 
    if (!agx_batch_is_submitted(batch))
@@ -2448,6 +3280,9 @@ agx_sync_batch(struct agx_context *ctx, struct agx_batch *batch)
 
    if (agx_batch_is_active(batch))
       agx_flush_batch(ctx, batch);
+
+   if (agx_batch_is_queued(batch))
+      agx_submit_pending(ctx);
 
    /* Empty batch case, already cleaned up */
    if (!agx_batch_is_submitted(batch))
@@ -2484,6 +3319,8 @@ agx_sync_all(struct agx_context *ctx, const char *reason)
       agx_flush_batch(ctx, &ctx->batches.slots[idx]);
    }
 
+   agx_submit_pending(ctx);
+
    foreach_submitted(ctx, idx) {
       agx_sync_batch(ctx, &ctx->batches.slots[idx]);
    }
@@ -2509,7 +3346,7 @@ agx_batch_reset(struct agx_context *ctx, struct agx_batch *batch)
  * Timestamp queries record the time after all current work is finished,
  * which we handle as the time after all current batches finish (since we're a
  * tiler and would rather not split the batch). So add a query to all active
- * batches.
+ * batches and to the tail of any queued submission.
  */
 void
 agx_add_timestamp_end_query(struct agx_context *ctx, struct agx_query *q)
@@ -2517,6 +3354,31 @@ agx_add_timestamp_end_query(struct agx_context *ctx, struct agx_query *q)
    unsigned idx;
    foreach_active(ctx, idx) {
       agx_batch_add_timestamp_query(&ctx->batches.slots[idx], q);
+   }
+
+   if (ctx->pending.batches.size) {
+      struct agx_pending_batch *last =
+         util_dynarray_top_ptr(&ctx->pending.batches, struct agx_pending_batch);
+      agx_batch_add_timestamp_query(last->batch, q);
+
+      if (ctx->timestamps) {
+         if (last->has_compute) {
+            last->compute.ts.start.handle = ctx->timestamp_handle;
+            last->compute.ts.end.handle = ctx->timestamp_handle;
+            last->compute.ts.start.offset =
+               agx_timestamp_offset(last->batch, comp_start);
+            last->compute.ts.end.offset =
+               agx_timestamp_offset(last->batch, comp_end);
+         }
+         if (last->has_render) {
+            last->render.ts_vtx.start.handle = ctx->timestamp_handle;
+            last->render.ts_frag.end.handle = ctx->timestamp_handle;
+            last->render.ts_vtx.start.offset =
+               agx_timestamp_offset(last->batch, vtx_start);
+            last->render.ts_frag.end.offset =
+               agx_timestamp_offset(last->batch, frag_end);
+         }
+      }
    }
 }
 
@@ -2537,4 +3399,6 @@ agx_memory_barrier(struct pipe_context *pctx, unsigned flags)
       if (batch->incoherent_writes)
          agx_flush_batch_for_reason(ctx, batch, "Memory barrier");
    }
+
+   ctx->batches.barrier_seqnum = ctx->batches.seqnum;
 }

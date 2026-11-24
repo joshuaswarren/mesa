@@ -1050,9 +1050,6 @@ build_buffer_to_image_fs(const struct vk_meta_device *meta,
       MESA_SHADER_FRAGMENT, NULL, "vk-meta-copy-buffer-to-image-frag");
    nir_builder *b = &builder;
 
-   /* Don't read out of bounds for helpers */
-   nir_terminate_if(b, nir_is_helper_invocation(b, 1));
-
    VkFormat buf_fmt =
       copy_img_buf_format_for_aspect(&key->img.view, key->img.aspect);
 
@@ -1089,7 +1086,9 @@ build_buffer_to_image_fs(const struct vk_meta_device *meta,
     * copy-relative coordinates. The unsigned byte offset would then wrap and
     * fault on hardware without soft faults. This shader has no derivatives;
     * helpers may safely read the first source texel instead. Keep the address
-    * itself valid, even if the backend speculates the load.
+    * itself valid, even if the backend speculates the load. That is all
+    * helpers need: they write nothing, so they are not terminated, which
+    * would cost every invocation a sample-mask update and a branch.
     */
    nir_def *extent = nir_vec3(b,
       load_info(b, struct vk_meta_copy_buffer_image_info, copy_id_range.end.x),

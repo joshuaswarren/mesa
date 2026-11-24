@@ -12,8 +12,12 @@
 #include "agx_scratch.h"
 #include "agx_tilebuffer.h"
 #include "hk_buffer.h"
+#include "hk_byte_stencil.h"
 #include "hk_acceleration_structure.h"
 #include "hk_cmd_buffer.h"
+#include "hk_compute_pair.h"
+#include "hk_nir_match_pointwise_clamp.h"
+#include "hk_nir_root_size.h"
 #include "hk_g17p_storage_image.h"
 #include "hk_frame_anatomy.h"
 #include "hk_sampler_index.h"
@@ -33,6 +37,7 @@
 #include "libagx_shaders.h"
 #include "asahi/genxml/agx3_cmdstream.h"
 #include "asahi/lib/agx3_g17p_grid_helper_core.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/lib/agx_scs_layout.h"
 #include "asahi/lib/agx_rt_compute_gen1.h"
 #include "util/log.h"
@@ -572,6 +577,23 @@ hk_cdm_visibility_flush_needed(const struct hk_device *dev,
           cs->current != cs->memory_flush_end;
 }
 
+bool
+hk_cdm_pack_visibility_flush(const struct hk_device *dev, bool memory,
+                             uint8_t packed[AGX3_CDM_BARRIER_SIZE])
+{
+   /* The AGX3 compute encoding uses flags=5 for its strong
+    * post-dispatch cache flush on every grounded G15--G17 identity.  Keep
+    * Honeykrisp's deliberately conservative flush-after-every-launch
+    * policy, but encode it in the target command-stream ISA. */
+   const struct agx3_cdm_barrier_info info = {
+      .chip = dev->dev.chip,
+      .flags = 0x5,
+      .wide_visibility = agx_chip_cdm_wide_visibility(dev->dev.chip),
+      .flush_memory = hk_cdm_flush_has_memory_scope(dev, memory),
+   };
+   return agx3_cdm_barrier_pack(&info, packed);
+}
+
 static void
 hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
 {
@@ -581,7 +603,10 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
 
    switch (agx_chip_command_stream_generation(dev->dev.chip)) {
    case AGX_CS_GENERATION_AGX2:
+      if (cs->current == cs->strong_flush_end)
+         return;
       cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
+      cs->strong_flush_end = cs->current;
       break;
 
    case AGX_CS_GENERATION_G15:
@@ -610,18 +635,8 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
       if (dev->dev.chip == AGX_CHIP_G18G)
          return;
 
-      /* The AGX3 compute encoding uses flags=5 for its strong
-       * post-dispatch cache flush on every grounded G15--G17 identity.  Keep
-       * Honeykrisp's deliberately conservative flush-after-every-launch
-       * policy, but encode it in the target command-stream ISA. */
-      const struct agx3_cdm_barrier_info info = {
-         .chip = dev->dev.chip,
-         .flags = 0x5,
-         .wide_visibility = agx_chip_cdm_wide_visibility(dev->dev.chip),
-         .flush_memory = memory_scope,
-      };
       uint8_t packed[AGX3_CDM_BARRIER_SIZE];
-      if (!agx3_cdm_barrier_pack(&info, packed)) {
+      if (!hk_cdm_pack_visibility_flush(dev, memory, packed)) {
          mesa_loge("no grounded AGX3 CDM cache flush for %s",
                    agx_chip_name(dev->dev.chip));
          vk_command_buffer_set_error(&cs->cmd->vk,
@@ -829,21 +844,15 @@ hk_g17p_compute_shader_supported(enum agx_chip chip, struct hk_shader *s,
                                  struct hk_linked_shader *linked, unsigned max_spill_B)
 {
    /* poly_nir_lower_gs preserves the API geometry stage on the main kernel,
-    * even though Honeykrisp has always launched that binary through CDM. */
+    * even though Borealis has always launched that binary through CDM. */
    return s && linked &&
           (s->b.info.stage == MESA_SHADER_COMPUTE ||
            s->info.stage == MESA_SHADER_GEOMETRY ||
            s->info.stage == MESA_SHADER_TESS_CTRL) &&
           linked->b.bo && linked->b.bo->va && linked->b.size != 0 &&
           linked->b.size <= UINT32_MAX && linked->b.nr_gprs != 0 &&
-          ((!s->b.info.has_preamble && s->b.info.preamble_scratch_size == 0) ||
-           /* Only an M5 compute compile forms a constant program
-            * (hk_shader.c), and it carries its TPS frame in the launch. */
-           (agx_chip_g17_m5(chip) && s->info.stage == MESA_SHADER_COMPUTE &&
-            s->b.info.agx3_preamble_staging_known &&
-            s->b.info.preamble_scratch_size <= max_spill_B &&
-            s->b.info.preamble_scratch_size >=
-               s->b.info.agx3_preamble_inputs.storage_bytes)) &&
+          hk_agx3_compute_cprog_supported(chip, s->info.stage, &s->info,
+                                          &s->b.info, max_spill_B) &&
           MAX2(s->b.info.scratch_size, s->b.info.agx3_spectpr_scratch_size) <=
              max_spill_B &&
           MAX2(linked->b.scratch_size, linked->b.agx3_spectpr_scratch_size) <=
@@ -1091,6 +1100,30 @@ hk_g17p_linked_program_desc(struct hk_shader *s,
           s->b.info.ray_traversal_depth_nonzero, &launch_sources))
       return false;
 
+   struct agx_ioto_constant_program constant_program = {0};
+   const struct agx3_cprog_inputs *cprog_inputs = NULL;
+   if (s->b.info.has_preamble) {
+      if (!s->bo || !s->bo->va ||
+          !hk_agx3_g17p_constant_program_from_binary(
+             s->code_ptr, s->code_size, s->b.info.preamble_offset,
+             s->b.info.preamble_size, hk_shader_code_va(s),
+             s->b.info.binary_size, &constant_program))
+         return false;
+      constant_program.force_external = true;
+      constant_program.absolute_branch = true;
+      constant_program.request_prelude = s->b.info.agx3_preamble_uniform_inputs;
+      if (s->b.info.agx3_preamble_tps_inputs)
+         cprog_inputs = &s->b.info.agx3_preamble_inputs;
+      const unsigned cprog_frame =
+         ALIGN_POT(MAX2((unsigned)s->b.info.agx3_preamble_inputs.storage_bytes,
+                        s->b.info.preamble_scratch_size), 16);
+      launch_sources.ti_spill_bytes =
+         MAX2(launch_sources.ti_spill_bytes, cprog_frame);
+      launch_sources.ti_largest_ipr_bytes =
+         MAX2(launch_sources.ti_largest_ipr_bytes,
+              (uint32_t)s->b.info.agx3_preamble_staging_halfs * 2u);
+   }
+
    *desc = (struct agx3_g17p_compute_program_desc){
       .shader_va = linked->b.bo->va->addr + linked->b.entry_offset,
       .uniform_ranges = ranges,
@@ -1098,14 +1131,17 @@ hk_g17p_linked_program_desc(struct hk_shader *s,
       .shader_binary_size = linked->b.size,
       .scratch_size =
          MAX2(linked->b.scratch_size, linked->b.agx3_spectpr_scratch_size),
-      .nr_gprs = linked->b.nr_gprs,
+      .nr_gprs = MAX2(linked->b.nr_gprs, s->b.info.nr_preamble_gprs),
       .compiler_d_valid = s->b.info.agx3_staging_known,
-      .compiler_d = (uint32_t)s->b.info.agx3_staging_halfs * 2,
+      .compiler_d = MAX2((uint32_t)s->b.info.agx3_staging_halfs * 2,
+                         (uint32_t)s->b.info.agx3_preamble_staging_halfs * 2),
       .threadgroup_memory_size_B =
          s->b.info.local_size ? MAX2(256u, ALIGN_POT(s->b.info.local_size, 64u))
                               : 0,
       .launch_sources = launch_sources,
       .ldshdr_f1 = kind,
+      .constant_program = constant_program,
+      .cprog_inputs = cprog_inputs,
    };
    return true;
 }
@@ -1197,7 +1233,7 @@ hk_g17p_build_compute_program(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * after vkQueueSubmit returns. Their originating pipeline need not remain
     * alive after command recording, so the command buffer owns references. */
    hk_cmd_buffer_retain_bo(cmd, linked->b.bo);
-   if (s->b.info.rodata.size_16 != 0)
+   if (s->b.info.rodata.size_16 != 0 || s->b.info.has_preamble)
       hk_cmd_buffer_retain_bo(cmd, s->bo);
 
    const bool ok = hk_g17p_build_compute_program_raw(
@@ -1323,12 +1359,13 @@ hk_g17p_indirect_launch_supported(struct hk_device *dev, struct agx_grid grid,
 }
 
 /*
- * Append an indirect launch of a built main program: the helper publishes
- * the grid's launch geometry, and the main record consumes it.
+ * Append an indirect launch of a built main program to `cs`: the helper
+ * publishes the grid's launch geometry, and the main record consumes it. The
+ * helper program is built for the same stream as the launch.
  */
 static __attribute__((hot)) bool
 hk_g17p_append_indirect_launch(
-   struct hk_cmd_buffer *cmd, struct agx_grid grid,
+   struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct agx_grid grid,
    struct agx_workgroup local_size, uint64_t sparse_map_addr,
    const struct hk_g17p_compute_program_ref *program,
    struct agx3_compute_dispatch_sink *sink)
@@ -1383,7 +1420,7 @@ hk_g17p_append_indirect_launch(
    uint64_t helper_program_va;
    struct hk_g17p_compute_program_ref helper_program;
    if (!hk_g17p_build_compute_program(
-          cmd, cmd->current_cs.cs, helper_s, helper_s->only_linked,
+          cmd, cs, helper_s, helper_s->only_linked,
           helper_root_ptr.gpu, 0,
           local_size, false,
           AGX3_G17P_GRID_HELPER_LDSHDR_F1, "grid-helper", helper_ranges,
@@ -1558,8 +1595,8 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
          .data = (uint8_t *)cs->current,
          .capacity = (uint8_t *)cs->end - (uint8_t *)cs->current,
       };
-      if (!hk_g17p_append_indirect_launch(cmd, grid, local_size, 0, &program,
-                                          &sink))
+      if (!hk_g17p_append_indirect_launch(cmd, cs, grid, local_size, 0,
+                                          &program, &sink))
          return;
 
       cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
@@ -1572,6 +1609,11 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
        * the G17P stream oracle rejects. */
       cs->weak_barrier_end = cs->current;
       cs->app_dispatch_end = NULL;
+      /* The direct path below ends an AGX_BARRIER_ALL launch in the strong
+       * flush its consumer relies on. Give the indirect launch the same:
+       * strengthen its weak tail in place. */
+      if (barrier & AGX_BARRIER_ALL)
+         hk_cdm_cache_flush(dev, cs);
       if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy))
          hk_frame_anatomy_note_precomp(cs, idx, grid);
       cs->stats.cmds++;
@@ -1793,6 +1835,173 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    cs->stats.cmds++;
 }
 
+bool
+hk_dispatch_preamble_cs(struct hk_cmd_buffer *cmd,
+                        struct hk_shader *preamble_cs, uint64_t root_ptr,
+                        uint64_t out_ptr)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_linked_shader *linked = preamble_cs ? preamble_cs->only_linked : NULL;
+   if (!agx_chip_native_or_m5(dev->dev.chip) || dev->dev.chip == AGX_CHIP_G18G ||
+       !preamble_cs || !linked || !linked->b.bo || !linked->b.bo->va ||
+       !linked->b.size || !linked->b.nr_gprs || !preamble_cs->b.info.agx3_staging_known ||
+       preamble_cs->b.info.has_preamble ||
+       (preamble_cs->b.info.rodata.size_16 &&
+        (!preamble_cs->bo || !preamble_cs->bo->va)))
+      return false;
+
+   const uint32_t scratch_size =
+      MAX2(linked->b.scratch_size, linked->b.agx3_spectpr_scratch_size);
+   if (agx_chip_g17_m5(dev->dev.chip) && scratch_size &&
+       !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES))
+      return false;
+
+   const uint32_t local_B = preamble_cs->b.info.local_size
+      ? MAX2(256u, ALIGN_POT(preamble_cs->b.info.local_size, 64u))
+      : 0;
+   if (local_B > dev->vk.physical->properties.maxComputeSharedMemorySize)
+      return false;
+
+   struct agx_ptr uploaded = hk_pool_alloc(cmd, 2 * sizeof(uint64_t), 8);
+   if (!uploaded.cpu)
+      return false;
+   const uint64_t args[2] = {root_ptr, out_ptr};
+   memcpy(uploaded.cpu, args, sizeof(args));
+
+   struct agx3_ioto_uniform_range ranges[2] = {{
+      .start_halfs = AGX_ABI_AGX3_PRECOMP_ARG_HALFS,
+      .size_halfs = 8,
+      .address = uploaded.gpu,
+   }};
+   unsigned range_count = 1;
+   if (preamble_cs->b.info.rodata.size_16) {
+      const struct agx_rodata *rodata = &preamble_cs->b.info.rodata;
+      if (!hk_agx3_g17p_rodata_range(rodata->base_uniform, rodata->size_16,
+                                     hk_shader_code_va(preamble_cs),
+                                     rodata->offset,
+                                     preamble_cs->b.info.binary_size,
+                                     &ranges[range_count++]))
+         return false;
+   }
+
+   struct agx3_cdm_direct_template_sources launch_sources;
+   if (!agx3_cdm_direct_template_sources_compute(false, false, false,
+                                                  &launch_sources))
+      return false;
+
+   const uint64_t shader_va = linked->b.bo->va->addr + linked->b.entry_offset;
+   const struct agx3_compute_direct_grid direct = {
+      .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
+      .size = {1, 1, 1},
+      .local_size = {1, 1, 1},
+      .dimensions = 1,
+   };
+
+   struct hk_cs *cs =
+      hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+   if (!cs)
+      return false;
+
+   if (agx_chip_native_agx3(dev->dev.chip)) {
+      const struct agx3_g17p_compute_program_desc desc = {
+         .shader_va = shader_va,
+         .uniform_ranges = ranges,
+         .uniform_range_count = range_count,
+         .shader_binary_size = linked->b.size,
+         .scratch_size = scratch_size,
+         .nr_gprs = linked->b.nr_gprs,
+         .compiler_d_valid = true,
+         .compiler_d = (uint32_t)preamble_cs->b.info.agx3_staging_halfs * 2,
+         .threadgroup_memory_size_B = local_B,
+         .launch_sources = launch_sources,
+         .ldshdr_f1 = AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3,
+      };
+      uint64_t program_va;
+      struct hk_g17p_compute_program_ref program;
+      if (!hk_g17p_build_compute_program_raw(
+             cmd, &linked->g17p_compute_templates, &desc, &program_va,
+             &program))
+         return false;
+
+      hk_cmd_buffer_retain_bo(cmd, linked->b.bo);
+      if (preamble_cs->b.info.rodata.size_16)
+         hk_cmd_buffer_retain_bo(cmd, preamble_cs->bo);
+
+      hk_ensure_cs_has_space(cmd, cs, 0x2000);
+      struct agx3_compute_dispatch_sink sink = {
+         .data = (uint8_t *)cs->current,
+         .capacity = (uint8_t *)cs->end - (uint8_t *)cs->current,
+      };
+      if (!hk_agx3_g17p_native_compute_dispatch_append_with_barrier(
+             &program.launch, &direct, 0x5, &sink))
+         return false;
+
+      cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
+      cs->strong_flush_end = cs->current;
+      cs->weak_barrier_end = NULL;
+      cs->stats.cmds++;
+      return true;
+   }
+
+   size_t capacity;
+   if (!agx3_g17g_graphics_program_bound(dev->dev.chip, ranges, range_count,
+                                         &capacity))
+      return false;
+   struct hk_ioto_reservation reservation;
+   if (!hk_cmd_reserve_ioto_program(cmd, capacity, "M5 hoisted preamble",
+                                    &reservation))
+      return false;
+
+   const struct agx3_g17p_graphics_program_desc desc = {
+      .program_va = reservation.va,
+      .shader_va = shader_va,
+      .uniform_ranges = ranges,
+      .uniform_range_count = range_count,
+      .shader_binary_size = linked->b.size,
+      .scratch_size = scratch_size,
+      .nr_gprs = linked->b.nr_gprs,
+      .compiler_d_valid = true,
+      .compiler_d = (uint32_t)preamble_cs->b.info.agx3_staging_halfs * 2,
+      .threadgroup_memory_size_B = local_B,
+   };
+   struct agx3_g17p_graphics_program program;
+   struct agx3_g17p_native_compute_program_desc launch_desc = {
+      .program_va = reservation.va,
+      .shader_va = shader_va,
+      .launch_sources = launch_sources,
+   };
+   struct agx3_compute_program launch;
+   if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &program) ||
+       !agx3_m5_native_compute_program_bind(dev->dev.chip, &launch_desc,
+                                            &launch))
+      return false;
+
+   memcpy(reservation.map, program.bytes, program.length);
+   if (!hk_cmd_publish_ioto_program(cmd, &reservation, program.length))
+      return false;
+
+   hk_cmd_buffer_retain_bo(cmd, linked->b.bo);
+   if (preamble_cs->b.info.rodata.size_16)
+      hk_cmd_buffer_retain_bo(cmd, preamble_cs->bo);
+
+   hk_ensure_cs_has_space(cmd, cs, 0x2000);
+   struct agx3_compute_dispatch_sink sink = {
+      .data = (uint8_t *)cs->current,
+      .capacity = (uint8_t *)cs->end - (uint8_t *)cs->current,
+   };
+   if (!agx3_m5_native_compute_dispatch_append(&launch, &direct, 5, &sink))
+      return false;
+
+   cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
+   cs->strong_flush_end = cs->current;
+   cs->memory_flush_end = cs->current;
+   cs->weak_barrier_end = NULL;
+   hk_m5_compute_resources(cs, desc.scratch_size, 0,
+                           desc.threadgroup_memory_size_B, 1);
+   cs->stats.cmds++;
+   return true;
+}
+
 
 __attribute__((hot)) void
 hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
@@ -1983,12 +2192,14 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * the previous one's weak tail, which nothing else has followed or
     * strengthened, and let this launch's own tail end the stream instead.
     * The two then run side by side; a barrier recorded after them waits for
-    * both. Indirect launches and ray-tracing pipeline kernels keep their
-    * barrier, and so does a kernel with a large per-thread scratch frame:
-    * it runs slower the more of its threads are in flight, so it stays
+    * both. M5 indirect dispatches are single hardware records with the same
+    * weak tail and obey the same Vulkan barrier rules, so they can overlap
+    * with adjacent application dispatches too. Ray-tracing pipeline kernels
+    * keep their barrier, and so does a kernel with a large per-thread scratch
+    * frame: it runs slower the more of its threads are in flight, so it stays
     * alone. */
    const bool app_dispatch =
-      !cmd->in_meta && !internal && !agx_is_indirect(grid) &&
+      !cmd->in_meta && !internal &&
       !cmd->state.cs.descriptors.root.cs.trace_rays_addr &&
       desc.scratch_size <= HK_M5_OVERLAP_MAX_SCRATCH_B &&
       agx_chip_elide_app_dispatch_barrier(dev->dev.chip);
@@ -2459,7 +2670,7 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    };
 
    if (indirect) {
-      if (!hk_g17p_append_indirect_launch(cmd, grid, local_size,
+      if (!hk_g17p_append_indirect_launch(cmd, cs, grid, local_size,
                                           sparse_map_addr, &program, &sink))
          return;
 
@@ -2897,10 +3108,795 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 }
 
 static void
-dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
+hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                       const struct hk_api_shader *api,
+                       const struct hk_shader *selected,
+                       const uint32_t orig_groups[3], struct agx_grid exec_grid)
 {
-   hk_cmd_resolve_compute_border(cmd);
-   struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
+   const struct hk_compute_pair_info *info = api ? api->compute_pair : NULL;
+   if (!info || cs->compute_pair || cs->stats.cmds != 1 || cs->stream_linked ||
+       vk_command_buffer_has_error(&cmd->vk) || cmd->in_meta ||
+       exec_grid.mode != AGX_CDM_MODE_DIRECT ||
+       cmd->state.compute_pair_simultaneous ||
+       cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+      return;
+
+   const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
+   if (desc->root.cs.base_group[0] || desc->root.cs.base_group[1] ||
+       desc->root.cs.base_group[2])
+      return;
+
+   const bool is_producer = info->role == HK_COMPUTE_PAIR_DEPTHWISE ||
+                            info->role == HK_COMPUTE_PAIR_GEMM;
+   if (is_producer && (!api->compute_pair_producer || !desc->uploaded_root.gpu ||
+                       selected->data_size != 0))
+      return;
+
+   const struct hk_nir_clamp_buffer *bindings[4];
+   unsigned count;
+   bool has_bias_binding = true;
+   if (info->role == HK_COMPUTE_PAIR_DEPTHWISE) {
+      count = 4;
+      for (unsigned i = 0; i < 3; ++i)
+         bindings[i] = &info->depthwise.reads[i];
+      bindings[3] = &info->depthwise.output;
+      has_bias_binding = info->depthwise.has_bias_buffer;
+   } else if (info->role == HK_COMPUTE_PAIR_GEMM) {
+      count = 4;
+      for (unsigned i = 0; i < 3; ++i)
+         bindings[i] = &info->gemm.reads[i];
+      bindings[3] = &info->gemm.output;
+      has_bias_binding = info->gemm.has_bias_buffer;
+   } else {
+      count = 2;
+      bindings[0] = &info->clamp.input;
+      bindings[1] = &info->clamp.output;
+   }
+
+   struct hk_compute_pair_dispatch record = {.info = *info};
+   for (unsigned i = 0; i < count; ++i) {
+      if (is_producer && i == 2 && !has_bias_binding) {
+         record.bindings[i] = (struct hk_storage_backing){0};
+         continue;
+      }
+      const unsigned set = bindings[i]->set;
+      if (set >= HK_MAX_SETS ||
+          ((desc->buffer_active | desc->push_active) & BITFIELD_BIT(set)))
+         return;
+      if (!hk_descriptor_set_storage_backing(desc->sets[set], bindings[i]->binding,
+                                             &record.bindings[i])) {
+         if (info->role == HK_COMPUTE_PAIR_GEMM && i == 2) {
+            record.bindings[i] = (struct hk_storage_backing){0};
+            continue;
+         }
+         return;
+      }
+   }
+
+   memcpy(record.groups, orig_groups, sizeof(record.groups));
+   memcpy(record.exec_threads, exec_grid.count, sizeof(record.exec_threads));
+   memcpy(record.exec_local, selected->b.info.workgroup_size,
+          sizeof(record.exec_local));
+   record.root_va = desc->uploaded_root.gpu;
+   memcpy(record.root_sets, desc->root.sets, sizeof(record.root_sets));
+   memcpy(record.push, desc->root.push, sizeof(record.push));
+   record.is_depthwise_vec4 = (selected == api->depthwise_vec4);
+
+   cs->compute_pair = malloc(sizeof(record));
+   if (!cs->compute_pair)
+      return;
+   if (is_producer)
+      record.producer = hk_compute_pair_producer_ref(api->compute_pair_producer);
+   *cs->compute_pair = record;
+}
+
+static bool
+hk_fused_compute_uniform_ranges(
+   enum agx_chip chip, const struct hk_shader *s,
+   const struct hk_compute_pair_dispatch *p,
+   struct agx3_ioto_uniform_range ranges[HK_G17P_COMPUTE_MAX_RANGES],
+   size_t *range_count)
+{
+   if (!s || !p || !p->root_va || !ranges || !range_count || s->data_size != 0 ||
+       s->b.info.uses_ray_traversal || s->b.info.uses_global_atomics ||
+       s->info.stage != MESA_SHADER_COMPUTE ||
+       s->info.agx3_txf_texture_valid || s->info.agx3_storage_image_valid ||
+       s->info.agx3_sampled_storage_valid || s->info.agx3_indexed_storage_valid ||
+       s->info.agx3_indexed_sampler_valid)
+      return false;
+
+   const unsigned dma_count = s->b.info.agx3_uniform_dma_count;
+   const struct agx_rodata *rodata = &s->b.info.rodata;
+   if (!s->info.agx3_uses_root && s->info.set_count == 0 &&
+       rodata->size_16 == 0 && dma_count == 0) {
+      *range_count = 0;
+      return true;
+   }
+
+   const unsigned root_uniform = s->info.agx3_root_uniform;
+   if (!hk_agx3_g17p_root_range(root_uniform, s->info.set_count, p->root_va,
+                                &ranges[0]))
+      return false;
+
+   size_t count = 1;
+   if (rodata->size_16 != 0) {
+      if (!s->bo || !s->bo->va ||
+          !hk_agx3_g17p_rodata_range(rodata->base_uniform, rodata->size_16,
+                                     hk_shader_code_va(s), rodata->offset,
+                                     s->b.info.binary_size, &ranges[count]))
+         return false;
+      count++;
+   }
+
+   for (unsigned i = 0; i < dma_count; ++i) {
+      const struct agx3_uniform_dma_span *span = &s->b.info.agx3_uniform_dma[i];
+      if (span->source == AGX3_UNIFORM_DMA_BUFFER)
+         return false;
+      const unsigned pointer = span->pointer;
+      const int set = pointer == root_uniform ? -1
+                      : pointer >= root_uniform + 4 &&
+                            (pointer - root_uniform - 4) % 4 == 0 &&
+                            (pointer - root_uniform - 4) / 4 < HK_MAX_SETS
+                         ? (int)(pointer - root_uniform - 4) / 4
+                         : -2;
+      if (count >= HK_G17P_COMPUTE_MAX_RANGES || set == -2 ||
+          (span->dest & 1) || (span->halfs & 1) || (span->offset_B & 3))
+         return false;
+      const uint64_t base = set < 0 ? p->root_va : p->root_sets[set];
+      const uint64_t address = base ? base + span->offset_B : AGX_ZERO_PAGE_ADDRESS;
+      if (address & 3)
+         return false;
+      ranges[count++] = (struct agx3_ioto_uniform_range){
+         .start_halfs = span->dest,
+         .size_halfs = span->halfs,
+         .address = address,
+      };
+   }
+
+   *range_count = count;
+   return true;
+}
+
+static struct agx_workgroup
+hk_fused_launch_local(const struct hk_shader *s)
+{
+   if (s->b.info.launch_size[0])
+      return agx_workgroup(s->b.info.launch_size[0], s->b.info.launch_size[1],
+                           s->b.info.launch_size[2]);
+   return agx_workgroup(s->b.info.workgroup_size[0], s->b.info.workgroup_size[1],
+                        s->b.info.workgroup_size[2]);
+}
+
+bool
+hk_fused_compute_shader_eligible(const struct hk_device *dev,
+                                 struct hk_shader *s,
+                                 const struct hk_compute_pair_dispatch *p)
+{
+   if (!dev || !s || !p || !agx_chip_native_or_m5(dev->dev.chip))
+      return false;
+   struct hk_linked_shader *linked = s->only_linked;
+   const bool is_m5 = agx_chip_g17_m5(dev->dev.chip);
+   const unsigned max_spill_B =
+      is_m5 ? (1u << 16) : AGX3_G17P_MAX_COMPUTE_SPILL_B;
+   if (!hk_g17p_compute_shader_supported(dev->dev.chip, s, linked, max_spill_B))
+      return false;
+   if (memcmp(s->b.info.workgroup_size, p->exec_local, sizeof(p->exec_local)))
+      return false;
+   if (!p->exec_threads[0] || !p->exec_threads[1] || !p->exec_threads[2])
+      return false;
+
+   const struct agx_workgroup local = hk_fused_launch_local(s);
+   if (!local.x || !local.y || !local.z ||
+       (uint64_t)local.x * local.y * local.z >
+          dev->vk.physical->properties.maxComputeWorkGroupInvocations ||
+       (p->exec_threads[0] % local.x) || (p->exec_threads[1] % local.y) ||
+       (p->exec_threads[2] % local.z))
+      return false;
+
+   if (is_m5) {
+      if ((s->b.info.scratch_size || linked->b.scratch_size) &&
+          !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES))
+         return false;
+      if (s->b.info.uses_matrix16 &&
+          !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX))
+         return false;
+      if (s->b.info.has_preamble && (!s->bo || !s->bo->va))
+         return false;
+   }
+
+   struct agx3_ioto_uniform_range ranges[HK_G17P_COMPUTE_MAX_RANGES];
+   size_t range_count = 0;
+   return hk_fused_compute_uniform_ranges(dev->dev.chip, s, p, ranges,
+                                          &range_count);
+}
+
+bool
+hk_emit_fused_compute_dispatch(struct hk_device *dev, struct hk_cs *cs,
+                               struct hk_shader *s,
+                               const struct hk_compute_pair_dispatch *p,
+                               uint8_t *ioto_map, uint64_t ioto_va,
+                               size_t ioto_cap, size_t *ioto_used_out)
+{
+   if (!hk_fused_compute_shader_eligible(dev, s, p) || !cs || !ioto_map ||
+       !ioto_va || !ioto_used_out ||
+       !hk_cs_space_fits((uint8_t *)cs->end - (uint8_t *)cs->current,
+                         AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE,
+                         AGX_CDM_STREAM_LINK_LENGTH))
+      return false;
+
+   struct hk_linked_shader *linked = s->only_linked;
+   const uint64_t shader_va = linked->b.bo->va->addr + linked->b.entry_offset;
+   if (!agx_va_in_usc_window(&dev->dev, ioto_va) ||
+       !agx_va_in_usc_window(&dev->dev, shader_va))
+      return false;
+
+   struct agx3_ioto_uniform_range ranges[HK_G17P_COMPUTE_MAX_RANGES];
+   size_t range_count = 0;
+   if (!hk_fused_compute_uniform_ranges(dev->dev.chip, s, p, ranges,
+                                        &range_count))
+      return false;
+
+   const struct agx_workgroup local = hk_fused_launch_local(s);
+   const struct agx3_compute_direct_grid direct = {
+      .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
+      .size = {p->exec_threads[0], p->exec_threads[1], p->exec_threads[2]},
+      .local_size = {local.x, local.y, local.z},
+      .dimensions = p->exec_threads[2] != 1 || local.z != 1 ? 3
+                  : p->exec_threads[1] != 1 || local.y != 1 ? 2 : 1,
+   };
+
+   struct agx3_compute_dispatch_sink sink = {
+      .data = (uint8_t *)cs->current,
+      .capacity = (uint8_t *)cs->end - (uint8_t *)cs->current,
+   };
+   size_t ioto_used = 0;
+
+   if (agx_chip_g17_m5(dev->dev.chip)) {
+      struct agx3_g17p_graphics_program_desc desc = {
+         .program_va = ioto_va,
+         .shader_va = shader_va,
+         .uniform_ranges = ranges,
+         .uniform_range_count = range_count,
+         .shader_binary_size = linked->b.size,
+         .nr_gprs = MAX2(linked->b.nr_gprs, s->b.info.nr_preamble_gprs),
+         .scratch_size = MAX3(s->b.info.scratch_size, linked->b.scratch_size,
+                              linked->b.agx3_spectpr_scratch_size),
+         .compiler_d_valid = s->b.info.agx3_staging_known,
+         .compiler_d = MAX2((uint32_t)s->b.info.agx3_staging_halfs * 2,
+                            (uint32_t)s->b.info.agx3_preamble_staging_halfs * 2),
+         .threadgroup_memory_size_B = s->b.info.local_size
+            ? MAX2(256u, ALIGN_POT(s->b.info.local_size, 64u)) : 0,
+      };
+      if (s->b.info.has_preamble) {
+         if (!s->bo || !s->bo->va ||
+             !hk_agx3_g17p_constant_program_from_binary(
+                s->code_ptr, s->code_size, s->b.info.preamble_offset,
+                s->b.info.preamble_size, hk_shader_code_va(s),
+                s->b.info.binary_size, &desc.constant_program))
+            return false;
+         desc.constant_program.force_external = true;
+         desc.constant_program.absolute_branch = true;
+         desc.constant_program.request_prelude =
+            s->b.info.agx3_preamble_uniform_inputs;
+         if (s->b.info.agx3_preamble_tps_inputs)
+            desc.cprog_inputs = &s->b.info.agx3_preamble_inputs;
+      }
+
+      struct agx3_g17p_graphics_program program;
+      if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &program) ||
+          program.length > ioto_cap)
+         return false;
+
+      struct agx3_g17p_native_compute_program_desc launch_desc = {
+         .program_va = ioto_va,
+         .shader_va = shader_va,
+      };
+      if (!agx3_cdm_direct_template_sources_compute(
+             s->b.info.uses_resource_info_query, false, false,
+             &launch_desc.launch_sources))
+         return false;
+      if (s->b.info.has_preamble) {
+         const unsigned cprog_frame =
+            ALIGN_POT(MAX2((unsigned)s->b.info.agx3_preamble_inputs.storage_bytes,
+                           s->b.info.preamble_scratch_size), 16);
+         launch_desc.launch_sources.ti_spill_bytes =
+            MAX2(launch_desc.launch_sources.ti_spill_bytes, cprog_frame);
+      }
+      struct agx3_compute_program launch;
+      if (!agx3_m5_native_compute_program_bind(dev->dev.chip, &launch_desc,
+                                               &launch) ||
+          !agx3_m5_native_compute_dispatch_append(&launch, &direct, 0, &sink))
+         return false;
+
+      memcpy(ioto_map, program.bytes, program.length);
+      ioto_used = program.length;
+      cs->m5_matrix_ops |= s->b.info.uses_matrix16;
+      hk_m5_compute_resources(cs, desc.scratch_size, 0,
+                              desc.threadgroup_memory_size_B,
+                              (uint32_t)local.x * local.y * local.z);
+   } else {
+      /* The loader a dispatch of the fused shader would get, constant
+       * program included, composed at this submission's address. */
+      struct agx3_g17p_compute_program_desc desc;
+      if (!hk_g17p_linked_program_desc(
+             s, linked, AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3, ranges,
+             range_count, &desc))
+         return false;
+      desc.program_va = ioto_va;
+
+      struct agx3_g17p_compute_program *program = malloc(sizeof(*program));
+      if (!program)
+         return false;
+      const bool ok =
+         agx3_g17p_compute_program_generate(dev->dev.chip, &desc, program) &&
+         program->length <= ioto_cap &&
+         hk_agx3_g17p_native_compute_dispatch_append_with_barrier(
+            &program->launch, &direct, 0, &sink);
+      if (ok) {
+         memcpy(ioto_map, program->bytes, program->length);
+         ioto_used = program->length;
+      }
+      free(program);
+      if (!ok)
+         return false;
+   }
+
+   cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
+   cs->weak_barrier_end = cs->current;
+   cs->strong_flush_end = NULL;
+   cs->memory_flush_end = NULL;
+   cs->app_dispatch_end = NULL;
+   cs->stats.cmds++;
+   cs->stats.calls++;
+   cs->pack_dispatches++;
+   *ioto_used_out = ioto_used;
+   return true;
+}
+
+static bool
+hk_read_push_i32(const struct hk_descriptor_state *desc, uint32_t off, int32_t *out)
+{
+   if (off + 4 > HK_COMPUTE_OPT_PUSH_BYTES)
+      return false;
+   const uint64_t mask = BITFIELD64_MASK(4) << off;
+   if ((desc->identity_copy4_push_mask & mask) != mask)
+      return false;
+   memcpy(out, desc->root.push + off, sizeof(*out));
+   return true;
+}
+
+static bool
+hk_identity_copy4_required_bytes(const struct hk_descriptor_state *desc,
+                                 const struct hk_identity_copy4 *info,
+                                 struct agx_grid grid, const uint16_t local[3],
+                                 uint64_t *bytes, uint32_t *k_out)
+{
+   int32_t bw = 0, bh = 0, iw = 0, ih = 0, kw = 0, k = 0, m = 0, sw = 0, sh = 0, channels = 0;
+   if (!hk_read_push_i32(desc, info->border_width_offset, &bw) ||
+       !hk_read_push_i32(desc, info->border_height_offset, &bh) ||
+       !hk_read_push_i32(desc, info->input_width_offset, &iw) ||
+       !hk_read_push_i32(desc, info->input_height_offset, &ih) ||
+       !hk_read_push_i32(desc, info->kernel_width_offset, &kw) ||
+       !hk_read_push_i32(desc, info->patches_width_offset, &k) ||
+       !hk_read_push_i32(desc, info->patches_height_offset, &m) ||
+       !hk_read_push_i32(desc, info->stride_width_offset, &sw) ||
+       !hk_read_push_i32(desc, info->stride_height_offset, &sh) ||
+       !hk_read_push_i32(desc, info->channels_offset, &channels))
+      return false;
+
+   if (bw || bh || sw != 1 || sh != 1 ||
+       iw <= 0 || ih <= 0 || channels <= 0 || kw != channels || k != channels ||
+       k % 4 || iw % channels || m <= 0 || (uint64_t)(iw / channels) * ih != (uint64_t)m)
+      return false;
+
+   if (grid.count[0] != DIV_ROUND_UP((uint32_t)k, local[0]) ||
+       grid.count[1] != DIV_ROUND_UP((uint32_t)m, local[1]) || grid.count[2] != 1)
+      return false;
+
+   const uint64_t extent = (uint64_t)m * k * sizeof(uint32_t);
+   if (extent > (uint64_t)INT32_MAX + 1)
+      return false;
+   *bytes = extent;
+   *k_out = (uint32_t)k;
+   return true;
+}
+
+static bool
+hk_intervals_disjoint(const struct hk_storage_backing *a, uint64_t a_start, uint64_t a_bytes,
+                      const struct hk_storage_backing *b, uint64_t b_start, uint64_t b_bytes)
+{
+   if (!a_bytes || !b_bytes)
+      return true;
+   const uint64_t a_bo0 = a->offset + a_start, a_bo1 = a_bo0 + a_bytes;
+   const uint64_t b_bo0 = b->offset + b_start, b_bo1 = b_bo0 + b_bytes;
+   const uint64_t a_va0 = a->address + a_start, a_va1 = a_va0 + a_bytes;
+   const uint64_t b_va0 = b->address + b_start, b_va1 = b_va0 + b_bytes;
+   const bool bo_overlap =
+      a->handle == b->handle && a_bo0 < b_bo1 && b_bo0 < a_bo1;
+   const bool va_overlap = a_va0 < b_va1 && b_va0 < a_va1;
+   return !bo_overlap && !va_overlap;
+}
+
+static bool
+hk_copy4_intervals_safe(const struct hk_storage_backing *src, uint64_t src_start,
+                        const struct hk_storage_backing *dst, uint64_t dst_start,
+                        uint64_t bytes, bool allow_exact_inplace)
+{
+   const uint64_t s_bo0 = src->offset + src_start, s_bo1 = s_bo0 + bytes;
+   const uint64_t d_bo0 = dst->offset + dst_start, d_bo1 = d_bo0 + bytes;
+   const uint64_t s_va0 = src->address + src_start, s_va1 = s_va0 + bytes;
+   const uint64_t d_va0 = dst->address + dst_start, d_va1 = d_va0 + bytes;
+
+   if (allow_exact_inplace &&
+       src->handle == dst->handle && s_bo0 == d_bo0 && s_va0 == d_va0)
+      return true;
+
+   const bool bo_overlap =
+      src->handle == dst->handle && s_bo0 < d_bo1 && d_bo0 < s_bo1;
+   const bool va_overlap = s_va0 < d_va1 && d_va0 < s_va1;
+   return !bo_overlap && !va_overlap;
+}
+
+static bool
+hk_check_storage_backing(const struct hk_descriptor_state *desc,
+                         unsigned set, unsigned binding,
+                         uint64_t start, uint64_t bytes, unsigned align,
+                         struct hk_storage_backing *backing)
+{
+   if (set >= HK_MAX_SETS || ((desc->buffer_active | desc->push_active) & BITFIELD_BIT(set)))
+      return false;
+   if (!hk_descriptor_set_storage_backing(desc->sets[set], binding, backing))
+      return false;
+   if (desc->root.sets[set] != hk_descriptor_set_addr(desc->sets[set]))
+      return false;
+   if (!backing->address || (backing->address | backing->offset) % align)
+      return false;
+   const uint64_t end = start + bytes;
+   if (end < bytes || backing->size < end ||
+       backing->address > UINT64_MAX - end ||
+       backing->offset > UINT64_MAX - end)
+      return false;
+   return true;
+}
+
+static struct hk_shader *
+hk_select_im2col_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
+                      struct hk_shader *normal, struct agx_grid *grid)
+{
+   struct hk_shader *alt = api->im2col_vec4;
+   const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const struct hk_identity_copy4 *info = &api->identity_copy4_info;
+   if (!alt || !info->im2col_vec4_ok ||
+       !hk_g17p_compute_shader_supported(dev->dev.chip, alt, alt->only_linked, 1u << 16) ||
+       alt->b.info.workgroup_size[0] == 0 || alt->b.info.workgroup_size[1] == 0 ||
+       alt->b.info.workgroup_size[2] != 1)
+      return normal;
+
+   int32_t bw = 0, bh = 0, iw = 0, ih = 0, kw = 0, pw = 0, ph = 0, sw = 0, sh = 0, ch = 0;
+   if (!hk_read_push_i32(desc, info->border_width_offset, &bw) ||
+       !hk_read_push_i32(desc, info->border_height_offset, &bh) ||
+       !hk_read_push_i32(desc, info->input_width_offset, &iw) ||
+       !hk_read_push_i32(desc, info->input_height_offset, &ih) ||
+       !hk_read_push_i32(desc, info->kernel_width_offset, &kw) ||
+       !hk_read_push_i32(desc, info->patches_width_offset, &pw) ||
+       !hk_read_push_i32(desc, info->patches_height_offset, &ph) ||
+       !hk_read_push_i32(desc, info->stride_width_offset, &sw) ||
+       !hk_read_push_i32(desc, info->stride_height_offset, &sh) ||
+       !hk_read_push_i32(desc, info->channels_offset, &ch))
+      return normal;
+   if (bw < 0 || bh < 0 || iw <= 0 || ih <= 0 || kw <= 0 ||
+       pw <= 0 || ph <= 0 || sw <= 0 || sh <= 0 || ch <= 0)
+      return normal;
+   if ((ch % 4) != 0 || (iw % 4) != 0 || (kw % 4) != 0 || (pw % 4) != 0)
+      return normal;
+   if ((iw % ch) != 0 || (kw % ch) != 0)
+      return normal;
+   const bool unit = (sw == 1 && sh == 1);
+   const uint64_t pad_x = (uint64_t)(uint32_t)bw * (uint32_t)ch;
+   const uint64_t pad_x_tot = unit ? pad_x * 2 : pad_x;
+   if (pad_x_tot > (uint64_t)INT32_MAX - (uint32_t)iw ||
+       (uint32_t)bh > 0x3fffffffu || (pad_x / 4) > 0x3fffffffu)
+      return normal;
+   const uint64_t bordered_iw = (uint32_t)iw + pad_x_tot;
+   if (bordered_iw < (uint32_t)kw)
+      return normal;
+
+   if (grid->count[2] != 1 ||
+       grid->count[0] < DIV_ROUND_UP((uint32_t)pw, info->local[0]) ||
+       grid->count[1] < DIV_ROUND_UP((uint32_t)ph, info->local[1]) ||
+       (uint64_t)grid->count[0] * info->local[0] > (uint64_t)INT32_MAX ||
+       (uint64_t)grid->count[1] * info->local[1] > (uint64_t)INT32_MAX)
+      return normal;
+
+   const uint64_t src_bytes = (uint64_t)(uint32_t)iw * (uint32_t)ih * sizeof(uint32_t);
+   const uint64_t dst_bytes = (uint64_t)(uint32_t)pw * (uint32_t)ph * sizeof(uint32_t);
+   if (src_bytes > (uint64_t)INT32_MAX + 1 || dst_bytes > (uint64_t)INT32_MAX + 1)
+      return normal;
+
+   struct hk_storage_backing src_b, dst_b;
+   if (!hk_check_storage_backing(desc, info->src_set, info->src_binding, 0, src_bytes, 16, &src_b) ||
+       !hk_check_storage_backing(desc, info->dst_set, info->dst_binding, 0, dst_bytes, 16, &dst_b))
+      return normal;
+
+   /* Reject overlap between source and destination buffers. */
+   if (!hk_intervals_disjoint(&src_b, 0, src_bytes, &dst_b, 0, dst_bytes))
+      return normal;
+
+   grid->count[0] = DIV_ROUND_UP((uint32_t)pw / 4, alt->b.info.workgroup_size[0]);
+   grid->count[1] = DIV_ROUND_UP((uint32_t)ph, alt->b.info.workgroup_size[1]);
+   grid->count[2] = 1;
+   return alt;
+}
+
+static struct hk_shader *
+hk_select_identity_copy4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
+                         struct hk_shader *normal, struct agx_grid *grid)
+{
+   struct hk_shader *copy = api->identity_copy4;
+   const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!copy)
+      return normal;
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
+       cmd->in_meta || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+      return normal;
+   if (grid->mode != AGX_CDM_MODE_DIRECT || desc->root.cs.base_group[0] ||
+       desc->root.cs.base_group[1] || desc->root.cs.base_group[2])
+      return normal;
+   if (!hk_g17p_compute_shader_supported(dev->dev.chip, copy, copy->only_linked, 1u << 16))
+      return normal;
+
+   const struct hk_identity_copy4 *info = &api->identity_copy4_info;
+   if (!hk_identity_copy4_supported_local(info->local) ||
+       memcmp(info->local, normal->b.info.workgroup_size, sizeof(info->local)) ||
+       copy->b.info.workgroup_size[0] == 0 ||
+       copy->b.info.workgroup_size[1] == 0 ||
+       copy->b.info.workgroup_size[2] != 1)
+      return normal;
+
+   if (info->kind == HK_IDENTITY_COPY4_PAD4) {
+      int32_t in_s[4], out_s[4];
+      for (unsigned d = 0; d < 4; ++d) {
+         if (!hk_read_push_i32(desc, info->in_shape_off[d], &in_s[d]) ||
+             !hk_read_push_i32(desc, info->out_shape_off[d], &out_s[d]) ||
+             in_s[d] <= 0 || out_s[d] <= 0)
+            return normal;
+      }
+      if ((in_s[3] % 4) != 0 || (out_s[3] % 4) != 0)
+         return normal;
+      uint64_t in_elems = 1, out_elems = 1;
+      for (unsigned d = 0; d < 4; ++d) {
+         if (__builtin_mul_overflow(in_elems, (uint64_t)(uint32_t)in_s[d], &in_elems) ||
+             __builtin_mul_overflow(out_elems, (uint64_t)(uint32_t)out_s[d], &out_elems))
+            return normal;
+      }
+      const uint64_t in_bytes = in_elems * sizeof(uint32_t);
+      const uint64_t out_bytes = out_elems * sizeof(uint32_t);
+      if (in_elems > (uint64_t)INT32_MAX / 4 || out_elems > (uint64_t)INT32_MAX / 4)
+         return normal;
+      const uint64_t orig_x = (uint64_t)(uint32_t)out_s[2] * (uint32_t)out_s[3];
+      const uint64_t orig_y = (uint64_t)(uint32_t)out_s[0] * (uint32_t)out_s[1];
+      if (grid->count[2] != 1 ||
+          orig_x > (uint64_t)INT32_MAX || orig_y > (uint64_t)INT32_MAX ||
+          grid->count[0] < DIV_ROUND_UP((uint32_t)orig_x, info->local[0]) ||
+          grid->count[1] < DIV_ROUND_UP((uint32_t)orig_y, info->local[1]) ||
+          (uint64_t)grid->count[0] * info->local[0] > (uint64_t)INT32_MAX ||
+          (uint64_t)grid->count[1] * info->local[1] > (uint64_t)INT32_MAX)
+         return normal;
+      uint32_t max_pad_idx = 0;
+      for (unsigned d = 0; d < 4; ++d)
+         max_pad_idx = MAX2(max_pad_idx, info->pad_idx[d]);
+      const uint64_t pad_bytes = ((uint64_t)max_pad_idx + 1) * sizeof(uint32_t);
+      struct hk_storage_backing src_b, pad_b, dst_b;
+      if (!hk_check_storage_backing(desc, info->src_set, info->src_binding, 0, in_bytes, 16, &src_b) ||
+          !hk_check_storage_backing(desc, info->pad_set, info->pad_binding, 0, pad_bytes, 4, &pad_b) ||
+          !hk_check_storage_backing(desc, info->dst_set, info->dst_binding, 0, out_bytes, 16, &dst_b))
+         return normal;
+      if (!hk_intervals_disjoint(&src_b, 0, in_bytes, &dst_b, 0, out_bytes) ||
+          !hk_intervals_disjoint(&pad_b, 0, pad_bytes, &dst_b, 0, out_bytes))
+         return normal;
+
+      const uint64_t out_x = (uint64_t)(uint32_t)out_s[2] * ((uint32_t)out_s[3] / 4);
+      const uint64_t out_y = (uint64_t)(uint32_t)out_s[0] * (uint32_t)out_s[1];
+      if (out_x > UINT32_MAX || out_y > UINT32_MAX)
+         return normal;
+      grid->count[0] = DIV_ROUND_UP((uint32_t)out_x, copy->b.info.workgroup_size[0]);
+      grid->count[1] = DIV_ROUND_UP((uint32_t)out_y, copy->b.info.workgroup_size[1]);
+      grid->count[2] = 1;
+      return copy;
+   }
+
+   if (copy->b.info.workgroup_size[1] != 1)
+      return normal;
+
+   uint64_t bytes = 0;
+   uint64_t src_start = 0, dst_start = 0;
+   if (info->kind == HK_IDENTITY_COPY4_IM2COL_1X1) {
+      uint32_t k;
+      if (!hk_identity_copy4_required_bytes(desc, info, *grid, info->local, &bytes, &k))
+         return hk_select_im2col_vec4(cmd, api, normal, grid);
+   } else if (info->kind == HK_IDENTITY_COPY4_LINEAR_COPY ||
+              info->kind == HK_IDENTITY_COPY4_LINEAR_OFFSET ||
+              info->kind == HK_IDENTITY_COPY4_LINEAR_FADD) {
+      int32_t count = 0;
+      if (!hk_read_push_i32(desc, info->count_offset, &count))
+         return normal;
+      if (count <= 0 || (count % 4) != 0)
+         return normal;
+      if (grid->count[1] != 1 || grid->count[2] != 1 ||
+          grid->count[0] < DIV_ROUND_UP((uint32_t)count, info->local[0]) ||
+          (uint64_t)grid->count[0] * info->local[0] > (uint64_t)INT32_MAX)
+         return normal;
+      bytes = (uint64_t)(uint32_t)count * sizeof(uint32_t);
+      if (bytes > (uint64_t)INT32_MAX + 1)
+         return normal;
+      if (info->kind == HK_IDENTITY_COPY4_LINEAR_OFFSET) {
+         int32_t so = 0, doff = 0;
+         if (!hk_read_push_i32(desc, info->src_offset_offset, &so) ||
+             !hk_read_push_i32(desc, info->dst_offset_offset, &doff))
+            return normal;
+         if (so < 0 || doff < 0 || (so % 4) != 0 || (doff % 4) != 0 ||
+             (uint64_t)(uint32_t)so + (uint32_t)count > (uint64_t)INT32_MAX ||
+             (uint64_t)(uint32_t)doff + (uint32_t)count > (uint64_t)INT32_MAX)
+            return normal;
+         src_start = (uint64_t)(uint32_t)so * sizeof(uint32_t);
+         dst_start = (uint64_t)(uint32_t)doff * sizeof(uint32_t);
+      }
+   } else {
+      return normal;
+   }
+
+   const unsigned nsrc = info->src_count ? info->src_count : 1;
+   if (nsrc > 2)
+      return normal;
+   const uint8_t sets[3] = {info->src_set, info->src1_set, info->dst_set};
+   const uint16_t bindings[3] = {info->src_binding, info->src1_binding, info->dst_binding};
+   const uint64_t starts[3] = {src_start, src_start, dst_start};
+   struct hk_storage_backing backings[3];
+   for (unsigned i = 0; i < 3; i++) {
+      if (i == 1 && nsrc < 2)
+         continue;
+      if (!hk_check_storage_backing(desc, sets[i], bindings[i], starts[i], bytes, 16, &backings[i]))
+         return normal;
+   }
+
+   const bool allow_inplace =
+      (info->kind == HK_IDENTITY_COPY4_LINEAR_COPY ||
+       info->kind == HK_IDENTITY_COPY4_LINEAR_FADD);
+   if (!hk_copy4_intervals_safe(&backings[0], src_start, &backings[2], dst_start,
+                                bytes, allow_inplace))
+      return normal;
+   if (nsrc == 2 &&
+       !hk_copy4_intervals_safe(&backings[1], src_start, &backings[2], dst_start,
+                                bytes, allow_inplace))
+      return normal;
+
+   /* Flattened 1D vec4 grid: each invocation transfers up to 4 coalesced vec4s. */
+   const uint32_t total_vec4 = (uint32_t)(bytes / 16);
+   const uint32_t wg_vec4 = (uint32_t)copy->b.info.workgroup_size[0] * 4;
+   grid->count[0] = DIV_ROUND_UP(total_vec4, wg_vec4);
+   grid->count[1] = 1;
+   grid->count[2] = 1;
+   return copy;
+}
+
+static struct hk_shader *
+hk_select_depthwise_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
+                         struct hk_shader *normal, struct agx_grid *grid)
+{
+   struct hk_shader *alt = api->depthwise_vec4;
+   const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!alt || !api->compute_pair ||
+       api->compute_pair->role != HK_COMPUTE_PAIR_DEPTHWISE)
+      return normal;
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
+       cmd->in_meta || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+      return normal;
+   if (grid->mode != AGX_CDM_MODE_DIRECT || desc->root.cs.base_group[0] ||
+       desc->root.cs.base_group[1] || desc->root.cs.base_group[2])
+      return normal;
+   if (!hk_g17p_compute_shader_supported(dev->dev.chip, alt, alt->only_linked, 1u << 16) ||
+       alt->b.info.workgroup_size[0] == 0 || alt->b.info.workgroup_size[1] == 0 ||
+       alt->b.info.workgroup_size[2] != 1)
+      return normal;
+
+   const struct hk_nir_depthwise_output *dw = &api->compute_pair->depthwise;
+   if (!dw->vec4_valid || dw->push_bytes > HK_COMPUTE_OPT_PUSH_BYTES)
+      return normal;
+   if (dw->local_size[0] != normal->b.info.workgroup_size[0] ||
+       dw->local_size[1] != normal->b.info.workgroup_size[1] ||
+       dw->local_size[2] != normal->b.info.workgroup_size[2])
+      return normal;
+
+   int32_t iw, ih, ow, oh, kw, kh, sx, sy, dx, dy, px, py, ch, has_bias = 0;
+   if (!hk_read_push_i32(desc, dw->input_width_offset_B, &iw) ||
+       !hk_read_push_i32(desc, dw->input_height_offset_B, &ih) ||
+       !hk_read_push_i32(desc, dw->width_offset_B, &ow) ||
+       !hk_read_push_i32(desc, dw->height_offset_B, &oh) ||
+       !hk_read_push_i32(desc, dw->kernel_width_offset_B, &kw) ||
+       !hk_read_push_i32(desc, dw->kernel_height_offset_B, &kh) ||
+       !hk_read_push_i32(desc, dw->stride_x_offset_B, &sx) ||
+       !hk_read_push_i32(desc, dw->stride_y_offset_B, &sy) ||
+       !hk_read_push_i32(desc, dw->dil_x_offset_B, &dx) ||
+       !hk_read_push_i32(desc, dw->dil_y_offset_B, &dy) ||
+       !hk_read_push_i32(desc, dw->pad_x_offset_B, &px) ||
+       !hk_read_push_i32(desc, dw->pad_y_offset_B, &py) ||
+       !hk_read_push_i32(desc, dw->channels_offset_B, &ch))
+      return normal;
+   if (dw->has_bias_buffer) {
+      if (dw->has_bias_offset_B == UINT32_MAX)
+         has_bias = 1;
+      else if (!hk_read_push_i32(desc, dw->has_bias_offset_B, &has_bias))
+         return normal;
+   }
+
+   if (iw <= 0 || ih <= 0 || ow <= 0 || oh <= 0 || kw <= 0 || kh <= 0 ||
+       sx <= 0 || sy <= 0 || dx <= 0 || dy <= 0 ||
+       px < -1048576 || px > 1048576 || py < -1048576 || py > 1048576 ||
+       (uint64_t)ow * (uint32_t)sx + (uint64_t)kw * (uint32_t)dx > 0x3fffffffu ||
+       (uint64_t)oh * (uint32_t)sy + (uint64_t)kh * (uint32_t)dy > 0x3fffffffu ||
+       ch <= 0 || (ch % 4) != 0 || (has_bias != 0 && has_bias != 1))
+      return normal;
+
+   const uint64_t orig_x = (uint64_t)(uint32_t)ow * (uint32_t)ch;
+   if (orig_x > (uint64_t)INT32_MAX ||
+       grid->count[2] != 1 ||
+       grid->count[0] < DIV_ROUND_UP((uint32_t)orig_x, dw->local_size[0]) ||
+       grid->count[1] < DIV_ROUND_UP((uint32_t)oh, dw->local_size[1]) ||
+       (uint64_t)grid->count[0] * dw->local_size[0] > (uint64_t)INT32_MAX ||
+       (uint64_t)grid->count[1] * dw->local_size[1] > (uint64_t)INT32_MAX)
+      return normal;
+
+   const uint64_t in_bytes = (uint64_t)(uint32_t)iw * (uint32_t)ih * (uint32_t)ch * sizeof(uint32_t);
+   const uint64_t wt_bytes = (uint64_t)(uint32_t)kw * (uint32_t)kh * (uint32_t)ch * sizeof(uint32_t);
+   const uint64_t bs_bytes = has_bias ? (uint64_t)(uint32_t)ch * sizeof(uint32_t) : 0;
+   const uint64_t out_bytes = orig_x * (uint32_t)oh * sizeof(uint32_t);
+   if (in_bytes > (uint64_t)INT32_MAX + 1 || wt_bytes > (uint64_t)INT32_MAX + 1 ||
+       out_bytes > (uint64_t)INT32_MAX + 1)
+      return normal;
+
+   if ((dw->reads[0].offset_B | dw->reads[1].offset_B |
+        (has_bias ? dw->reads[2].offset_B : 0) | dw->output.offset_B) % 16)
+      return normal;
+
+   struct hk_storage_backing in_b, wt_b, bs_b, out_b;
+   if (!hk_check_storage_backing(desc, dw->reads[0].set, dw->reads[0].binding,
+                                 dw->reads[0].offset_B, in_bytes, 16, &in_b) ||
+       !hk_check_storage_backing(desc, dw->reads[1].set, dw->reads[1].binding,
+                                 dw->reads[1].offset_B, wt_bytes, 16, &wt_b) ||
+       !hk_check_storage_backing(desc, dw->output.set, dw->output.binding,
+                                 dw->output.offset_B, out_bytes, 16, &out_b))
+      return normal;
+   if (has_bias &&
+       !hk_check_storage_backing(desc, dw->reads[2].set, dw->reads[2].binding,
+                                 dw->reads[2].offset_B, bs_bytes, 16, &bs_b))
+      return normal;
+
+   if (!hk_intervals_disjoint(&in_b, dw->reads[0].offset_B, in_bytes,
+                              &out_b, dw->output.offset_B, out_bytes) ||
+       !hk_intervals_disjoint(&wt_b, dw->reads[1].offset_B, wt_bytes,
+                              &out_b, dw->output.offset_B, out_bytes) ||
+       (has_bias &&
+        !hk_intervals_disjoint(&bs_b, dw->reads[2].offset_B, bs_bytes,
+                               &out_b, dw->output.offset_B, out_bytes)))
+      return normal;
+
+   const uint64_t out_pairs = DIV_ROUND_UP((uint64_t)(uint32_t)ow, 2);
+   const uint64_t out_x4 = out_pairs * ((uint32_t)ch / 4);
+   if (out_x4 > UINT32_MAX)
+      return normal;
+   grid->count[0] = DIV_ROUND_UP((uint32_t)out_x4, alt->b.info.workgroup_size[0]);
+   grid->count[1] = DIV_ROUND_UP((uint32_t)oh, alt->b.info.workgroup_size[1]);
+   grid->count[2] = 1;
+   return alt;
+}
+
+static void
+dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+                     struct agx_grid grid, bool in_threads)
+{
    if (agx_is_shader_empty(&s->b))
       return;
 
@@ -2925,10 +3921,17 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
    if (!cs)
       return;
 
+   if (cs->compute_pair)
+      hk_cs_invalidate_compute_pair(cs);
+
+   struct hk_api_shader *api = cmd->state.cs.shader;
+   const uint32_t orig_groups[3] = {grid.count[0], grid.count[1], grid.count[2]};
+
    struct agx_workgroup local_size =
       agx_workgroup(s->b.info.workgroup_size[0], s->b.info.workgroup_size[1],
                     s->b.info.workgroup_size[2]);
 
+   bool invocation_stat = false;
    /* Internal compute work must not contribute to the application's active
     * pipeline query. This also honours hk_pipeline_stat_addr's !in_meta
     * contract in debug builds; graphics meta pauses its own counters. */
@@ -2937,12 +3940,28 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
          cmd, VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT);
 
       if (hk_stat_enabled(stat)) {
+         invocation_stat = true;
          perf_debug(cmd, "CS invocation statistic");
          uint64_t grid = cmd->state.cs.descriptors.root.cs.group_count_addr;
 
          libagx_increment_cs_invocations(cmd, agx_1d(1), AGX_BARRIER_ALL, grid,
                                          stat, agx_workgroup_threads(local_size));
       }
+   }
+
+   struct hk_shader *selected = s;
+   if (api && api->identity_copy4 && !api->compute_pair_producer && !in_threads && !invocation_stat) {
+      selected = hk_select_identity_copy4(cmd, api, s, &grid);
+      local_size = agx_workgroup(selected->b.info.workgroup_size[0],
+                                 selected->b.info.workgroup_size[1],
+                                 selected->b.info.workgroup_size[2]);
+   } else if (api && api->depthwise_vec4 && api->compute_pair &&
+              api->compute_pair->role == HK_COMPUTE_PAIR_DEPTHWISE &&
+              !in_threads && !invocation_stat) {
+      selected = hk_select_depthwise_vec4(cmd, api, s, &grid);
+      local_size = agx_workgroup(selected->b.info.workgroup_size[0],
+                                 selected->b.info.workgroup_size[1],
+                                 selected->b.info.workgroup_size[2]);
    }
 
    if (!agx_is_indirect(grid) && !in_threads) {
@@ -2955,10 +3974,52 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
     * launch of a shader whose builtins do not depend on the hardware
     * workgroup uses its smaller hardware workgroup
     * (agx_nir_lower_workgroup_split). */
-   if (!agx_is_indirect(grid) && !in_threads && s->b.info.launch_size[0]) {
-      local_size = agx_workgroup(s->b.info.launch_size[0],
-                                 s->b.info.launch_size[1],
-                                 s->b.info.launch_size[2]);
+   if (!agx_is_indirect(grid) && !in_threads && selected->b.info.launch_size[0]) {
+      local_size = agx_workgroup(selected->b.info.launch_size[0],
+                                 selected->b.info.launch_size[1],
+                                 selected->b.info.launch_size[2]);
+   } else if (!agx_is_indirect(grid) && !in_threads &&
+              agx_chip_has_cap(hk_cmd_buffer_device(cmd)->dev.chip,
+                               AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) &&
+              (selected->info.agx3_root_reads & HK_ROOT_PROVEN_WG_COALESCE_SAFE) &&
+              !selected->b.info.uses_ray_traversal && !selected->b.info.local_size &&
+              !selected->b.info.scratch_size &&
+              !selected->b.info.agx3_spectpr_scratch_size &&
+              !selected->b.info.uses_matrix16 &&
+              !desc->root.cs.trace_rays_addr &&
+              hk_nir_dispatch_zero_base(desc->root.cs.base_group)) {
+      struct hk_device *dev = hk_cmd_buffer_device(cmd);
+      const uint32_t eff_gprs = MAX2((uint32_t)selected->b.info.nr_gprs,
+                                     (uint32_t)selected->b.info.nr_preamble_gprs);
+      uint32_t max_wg =
+         dev->vk.physical->properties.maxComputeWorkGroupInvocations;
+      if (selected->b.info.stats.threads)
+         max_wg = MIN2(max_wg, selected->b.info.stats.threads);
+      if (eff_gprs > 256u)
+         max_wg = 0;
+      else if (eff_gprs)
+         max_wg = MIN2(max_wg,
+                       agx_occupancy_for_register_count(eff_gprs).max_threads);
+      /* Short, low-register, loop-free pure-global shaders still hit AGX3's
+       * per-WG CDM launch floor at wg=256 on massive grids; coalesce them up
+       * to 512 threads (>= 1024 WGs). Account for native constant-program
+       * register usage when preambles are active. General pure-global shaders
+       * cap at 256 (>= 256 WGs, and always >= 4 * num_cores so wide GPUs
+       * never lose core saturation); never 1024, which regresses on AGX3. */
+      const uint32_t target_wg =
+         (!selected->b.info.has_loops && selected->b.info.stats.instrs <= 64u &&
+          eff_gprs <= 24u)
+            ? 512u
+            : 256u;
+      const uint64_t min_wgs =
+         MAX2(256ull, 4ull * agx_get_num_cores(&dev->dev));
+      uint16_t coalesced[3];
+      if (hk_coalesce_workgroup_size_ex(
+             selected->b.info.workgroup_size, grid.count,
+             dev->vk.physical->properties.maxComputeWorkGroupSize, max_wg,
+             target_wg, min_wgs, coalesced)) {
+         local_size = agx_workgroup(coalesced[0], coalesced[1], coalesced[2]);
+      }
    }
 
    if (cs->g18_dispatch_sealed) {
@@ -2966,9 +4027,12 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
       if (!cs)
          return;
    }
-   hk_dispatch_with_local_size(cmd, cs, s, grid, local_size);
-   cs->uses_global_atomics |= s->b.info.uses_global_atomics;
-   cs->pack_loops |= s->b.info.has_loops;
+   hk_dispatch_with_local_size(cmd, cs, selected, grid, local_size);
+   if (!in_threads && !invocation_stat && api && api->compute_pair &&
+       (selected == s || selected == api->depthwise_vec4))
+      hk_record_compute_pair(cmd, cs, api, selected, orig_groups, grid);
+   cs->uses_global_atomics |= selected->b.info.uses_global_atomics;
+   cs->pack_loops |= selected->b.info.has_loops;
    if (agx_is_indirect(grid)) {
       cs->sib_indirect = true;
    } else {
@@ -2981,7 +4045,7 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
        * instruction counts bound a program without loops; pack_loops marks
        * the others, at most one of which a packet holds. */
       uint64_t work;
-      if (__builtin_mul_overflow(threads, (uint64_t)s->b.info.stats.instrs,
+      if (__builtin_mul_overflow(threads, (uint64_t)selected->b.info.stats.instrs,
                                  &work))
          work = UINT64_MAX;
       cs->pack_threads = threads > UINT64_MAX - cs->pack_threads
@@ -2991,14 +4055,22 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
       cs->pack_dispatches++;
    }
    if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
-      hk_frame_anatomy_note_fs(cs, s);
+      hk_frame_anatomy_note_fs(cs, selected);
       const uint64_t wg = agx_workgroup_threads(local_size);
       const uint64_t threads = agx_is_indirect(grid) ? 0 :
          (uint64_t)grid.count[0] * grid.count[1] * grid.count[2];
-      hk_frame_anatomy_note_grid(cs, s, threads, wg ? threads / wg : 0,
+      hk_frame_anatomy_note_grid(cs, selected, threads, wg ? threads / wg : 0,
                                  agx_is_indirect(grid));
    }
    cs->stats.calls++;
+}
+
+static void
+dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
+{
+   hk_cmd_resolve_compute_border(cmd);
+   struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
+   dispatch_grid_shader(cmd, s, grid, in_threads);
 }
 
 static void
@@ -3059,6 +4131,37 @@ hk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
    if (desc->push_dirty)
       hk_cmd_buffer_flush_push_descriptors(cmd, desc);
 
+   if (!cmd->in_meta && cmd->state.cs.shader &&
+       cmd->state.cs.shader->byte_stencil &&
+       !hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
+                                        cmd->conditional_meta) &&
+       !hk_stat_enabled(hk_pipeline_stat_addr(
+          cmd, VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT))) {
+      const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+      struct hk_byte_stencil_variant *bs = cmd->state.cs.shader->byte_stencil;
+      uint32_t tile_gx = 0, tile_gy = 0;
+      if (hk_byte_stencil_validate_dispatch(
+             dev, desc, &bs->plan, baseGroupX, baseGroupY, baseGroupZ,
+             groupCountX, groupCountY, groupCountZ, &tile_gx, &tile_gy)) {
+         desc->root.cs.base_group[0] = 0;
+         desc->root.cs.base_group[1] = 0;
+         desc->root.cs.base_group[2] = 0;
+
+         VkDispatchIndirectCommand tile_gc = {
+            .x = tile_gx,
+            .y = tile_gy,
+            .z = 1,
+         };
+         desc->root.cs.group_count_addr =
+            hk_pool_upload(cmd, &tile_gc, sizeof(tile_gc), 8);
+         desc->root.cs.grid_helper_sparse_map_addr = 0;
+
+         dispatch_grid_shader(cmd, &bs->shader, agx_3d(tile_gx, tile_gy, 1),
+                              false);
+         return;
+      }
+   }
+
    desc->root.cs.base_group[0] = baseGroupX;
    desc->root.cs.base_group[1] = baseGroupY;
    desc->root.cs.base_group[2] = baseGroupZ;
@@ -3093,7 +4196,7 @@ hk_cmd_dispatch_rays(struct hk_cmd_buffer *cmd, struct hk_api_shader *shader,
                      uint64_t record_addr, uint64_t group_count_addr,
                      struct agx_grid grid)
 {
-   struct hk_descriptor_state *rt = &cmd->state.rt.descriptors;
+   struct hk_descriptor_state *rt = &cmd->rt.descriptors;
 
    if (rt->push_dirty)
       hk_cmd_buffer_flush_push_descriptors(cmd, rt);

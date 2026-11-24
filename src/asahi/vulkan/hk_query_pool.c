@@ -112,10 +112,12 @@ static struct hk_cs *
 hk_query_command_cs(struct hk_cmd_buffer *cmd)
 {
    hk_sync_flush_pending_timestamp(cmd);
+   /* Timestamps written as copies of earlier ones are query results too. */
+   hk_sync_flush_stamp_copies(cmd);
    hk_sync_end_cs_if_timestamped(cmd);
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, HK_SYNC_ALL, cmd->current_cs.cs, dep);
+   hk_sync_src_dep(cmd, HK_SYNC_QUERY_SCOPE, cmd->current_cs.cs, dep);
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
    if (cs && agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
       cs->g17p_timestamp_query = true;
@@ -329,6 +331,45 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
    libagx_write_u32s(cmd, agx_1d(count), AGX_BARRIER_ALL | AGX_POSTGFX, params);
    hk_note_dispatched_imm_write_queries(cs);
+}
+
+void
+hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                       const struct hk_stamp_copy *copies, unsigned count)
+{
+   assert(cs->type == HK_CS_CDM && count > 0);
+   assert(cs == cmd->current_cs.cs);
+
+   perf_debug(cmd, "Timestamp copies");
+
+   struct agx_ptr params =
+      hk_pool_alloc(cmd, count * sizeof(struct libagx_timestamp_copy), 16);
+   if (!params.cpu) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+
+   struct libagx_timestamp_copy *pairs = params.cpu;
+   for (unsigned i = 0; i < count; ++i) {
+      pairs[i] = (struct libagx_timestamp_copy){
+         .dest = copies[i].dst.addr,
+         .src = copies[i].src.addr,
+      };
+   }
+
+   /* One launch, then one flush for all of them. */
+   libagx_copy_timestamps(cmd, agx_1d(count), AGX_BARRIER_ALL, params.gpu);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+   /* Both words are query memory the launch accesses. */
+   struct hk_cs *launch = cmd->current_cs.cs;
+   for (unsigned i = 0; i < count; ++i) {
+      hk_cmd_note_query_range(cmd, launch, copies[i].src.handle,
+                              copies[i].src.offset_B, sizeof(uint64_t));
+      hk_cmd_note_query_range(cmd, launch, copies[i].dst.handle,
+                              copies[i].dst.offset_B, sizeof(uint64_t));
+   }
 }
 
 void
@@ -841,8 +882,10 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    cmd->sync.kind_override = HK_SYNC_ALL;
    cmd->state.query_reset_recording = true;
    struct hk_cs *cs = hk_query_command_cs(cmd);
-   if (cs)
+   if (cs) {
+      cmd->sync.has_gpu_query_reset = true;
       emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
+   }
    cmd->state.query_reset_recording = false;
    cmd->sync.kind_override = 0;
    if (!cs)
@@ -1626,6 +1669,19 @@ hk_query_stamps_note_one_locked(struct hk_device *dev, struct hk_queue *queue,
    while (index[pos] != 0)
       pos = (pos + 1) & mask;
    index[pos] = (uint32_t)(count + 1);
+}
+
+void
+hk_query_stamps_note_req(struct hk_device *dev, struct hk_queue *queue,
+                         uint64_t point, uint32_t handle, uint32_t offset_B)
+{
+   if (!handle || !dev->query_stamps.ready ||
+       !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS))
+      return;
+
+   simple_mtx_lock(&dev->query_stamps.lock);
+   hk_query_stamps_note_one_locked(dev, queue, point, handle, offset_B);
+   simple_mtx_unlock(&dev->query_stamps.lock);
 }
 
 void

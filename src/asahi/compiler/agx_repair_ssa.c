@@ -11,12 +11,94 @@
  * https://link.springer.com/content/pdf/10.1007/978-3-642-37051-9_6.pdf
  */
 
-#include "util/hash_table.h"
-#include "util/ralloc.h"
+#include <stdlib.h>
+#include <string.h>
 #include "util/u_dynarray.h"
 #include "agx_builder.h"
 #include "agx_compiler.h"
 #include "agx_opcodes.h"
+
+struct def_entry {
+   uint32_t key; /* UINT32_MAX for empty */
+   agx_index val;
+};
+
+struct def_map {
+   struct def_entry *entries;
+   uint32_t mask;
+   uint32_t count;
+};
+
+static inline uint32_t
+def_map_hash(uint32_t key)
+{
+   uint32_t h = key * 2654435761u;
+   return h ^ (h >> 16);
+}
+
+static inline agx_index *
+def_map_search(const struct def_map *map, uint32_t key)
+{
+   if (!map->entries)
+      return NULL;
+
+   uint32_t idx = def_map_hash(key) & map->mask;
+   for (;;) {
+      struct def_entry *e = &map->entries[idx];
+      if (e->key == key)
+         return &e->val;
+      if (e->key == UINT32_MAX)
+         return NULL;
+      idx = (idx + 1) & map->mask;
+   }
+}
+
+static void
+def_map_grow(struct def_map *map)
+{
+   uint32_t old_cap = map->entries ? map->mask + 1 : 0;
+   uint32_t new_cap = old_cap ? old_cap * 2 : 16;
+   uint32_t new_mask = new_cap - 1;
+   struct def_entry *new_entries = malloc(new_cap * sizeof(*new_entries));
+   memset(new_entries, 0xff, new_cap * sizeof(*new_entries));
+
+   for (uint32_t i = 0; i < old_cap; ++i) {
+      if (map->entries[i].key != UINT32_MAX) {
+         uint32_t idx = def_map_hash(map->entries[i].key) & new_mask;
+         while (new_entries[idx].key != UINT32_MAX)
+            idx = (idx + 1) & new_mask;
+         new_entries[idx] = map->entries[i];
+      }
+   }
+
+   free(map->entries);
+   map->entries = new_entries;
+   map->mask = new_mask;
+}
+
+static inline void
+def_map_insert(struct def_map *map, uint32_t key, agx_index val)
+{
+   assert(key != UINT32_MAX);
+   if (!map->entries || map->count + 1 > ((map->mask + 1) >> 2) * 3)
+      def_map_grow(map);
+
+   uint32_t idx = def_map_hash(key) & map->mask;
+   for (;;) {
+      struct def_entry *e = &map->entries[idx];
+      if (e->key == key) {
+         e->val = val;
+         return;
+      }
+      if (e->key == UINT32_MAX) {
+         e->key = key;
+         e->val = val;
+         map->count++;
+         return;
+      }
+      idx = (idx + 1) & map->mask;
+   }
+}
 
 struct repair_block {
    /* For a loop header, whether phis operands have been added */
@@ -26,7 +108,7 @@ struct repair_block {
     *
     * Definition of a variable at the end of the block.
     */
-   struct hash_table_u64 *defs;
+   struct def_map defs;
 };
 
 struct repair_ctx {
@@ -50,9 +132,7 @@ record_write(struct repair_ctx *ctx, agx_block *block, unsigned node,
              agx_index val)
 {
    assert(node < ctx->n);
-   struct hash_table_u64 *defs = repair_block(ctx, block)->defs;
-   _mesa_hash_table_u64_insert(defs, node,
-                               ralloc_memdup(defs, &val, sizeof(val)));
+   def_map_insert(&repair_block(ctx, block)->defs, node, val);
 }
 
 static void add_phi_operands(struct repair_ctx *ctx, agx_block *block,
@@ -72,7 +152,7 @@ resolve_read(struct repair_ctx *ctx, agx_block *block, agx_index node)
 
    /* Local value numbering */
    assert(node.type == AGX_INDEX_NORMAL);
-   agx_index *local = _mesa_hash_table_u64_search(rb->defs, node.value);
+   agx_index *local = def_map_search(&rb->defs, node.value);
 
    if (local) {
       assert(!agx_is_null(*local));
@@ -244,13 +324,7 @@ agx_opt_trivial_phi(agx_context *ctx)
 void
 agx_repair_ssa(agx_context *ctx)
 {
-   struct repair_block *blocks =
-      rzalloc_array(NULL, struct repair_block, ctx->num_blocks);
-
-   agx_foreach_block(ctx, block) {
-      struct repair_block *rb = &blocks[block->index];
-      rb->defs = _mesa_hash_table_u64_create(blocks);
-   }
+   struct repair_block *blocks = calloc(ctx->num_blocks, sizeof(*blocks));
 
    unsigned n = ctx->alloc;
 
@@ -331,7 +405,9 @@ agx_repair_ssa(agx_context *ctx)
       }
    }
 
-   ralloc_free(blocks);
+   for (unsigned i = 0; i < ctx->num_blocks; ++i)
+      free(blocks[i].defs.entries);
+   free(blocks);
 
    agx_opt_trivial_phi(ctx);
    agx_reindex_ssa(ctx);

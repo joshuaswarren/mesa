@@ -19,6 +19,9 @@ struct hk_physical_device;
 struct hk_buffer {
    struct vk_buffer vk;
 
+   uint32_t storage_backing_handle;
+   uint64_t storage_backing_offset;
+
    /** Reserved VA for sparse buffers, NULL otherwise. */
    struct agx_va *va;
 
@@ -149,6 +152,7 @@ uint32_t hk_sparse_texel_word_at(struct hk_device *dev, uint64_t address,
 /* The residency map page of the sparse buffer holding address, as
  * hk_buffer_address::sparse_map_page carries it, 0 for none. */
 uint32_t hk_sparse_map_page_at(struct hk_device *dev, uint64_t address);
+bool hk_sparse_address_is_sparse(struct hk_device *dev, uint64_t address);
 
 /* Publish a bound/unbound sparse buffer range to physical pointer reads. */
 VkResult hk_update_physical_sparse_map(struct hk_device *dev, uint64_t address,

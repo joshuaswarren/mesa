@@ -256,6 +256,42 @@ main(int argc, char **argv)
       EXPECT(map_page != 0 && word32(desc, 12) == expected,
              "storage buffer: map page 0x%x, expected 0x%x", word32(desc, 12),
              expected);
+
+      /* A binding-only sparse buffer has no residency map (sparse_map == NULL)
+       * even though it sits on sparse_buffers.list. */
+      const VkBufferCreateInfo binding_only_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT,
+         .size = 65536,
+         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+      };
+      VkBuffer binding_only_buf;
+      CHECK(vkCreateBuffer(dev, &binding_only_info, NULL, &binding_only_buf));
+      const VkBufferDeviceAddressInfo binding_only_addr_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+         .buffer = binding_only_buf,
+      };
+      const VkDescriptorAddressInfoEXT bo_ssbo_info = {
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+         .address = vkGetBufferDeviceAddress(dev, &binding_only_addr_info) + 4096,
+         .range = 4096,
+      };
+      const VkDescriptorGetInfoEXT bo_ssbo_get = {
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+         .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .data.pStorageBuffer = &bo_ssbo_info,
+      };
+      memset(desc, 0xcd, sizeof(desc));
+      get_descriptor(dev, &bo_ssbo_get, props.robustStorageBufferDescriptorSize,
+                     desc);
+      EXPECT(word64(desc, 0) == bo_ssbo_info.address,
+             "binding-only storage buffer: address 0x%llx",
+             (unsigned long long)word64(desc, 0));
+      EXPECT(word32(desc, 12) == 0,
+             "binding-only storage buffer: map page 0x%x, expected 0",
+             word32(desc, 12));
+      vkDestroyBuffer(dev, binding_only_buf, NULL);
    }
 
    vkDestroyBuffer(dev, buffer, NULL);

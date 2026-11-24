@@ -71,6 +71,13 @@ enum hk_cmd_slab_class {
    HK_CMD_SLAB_MAIN,
    HK_CMD_SLAB_USC,
    HK_CMD_SLAB_IOTO,
+   /* Unmapped, non-writeback slabs for GPU-written indirect command streams,
+    * Ioto vertex programs, and draw-ID tables. Keeping GPU-written spans out of
+    * CPU-cached slabs prevents shared-cacheline writebacks from clobbering
+    * pre-graphics compute output. */
+   HK_CMD_SLAB_VDM_GPU,
+   HK_CMD_SLAB_IOTO_GPU,
+   HK_CMD_SLAB_DATA_GPU,
    HK_CMD_SLAB_COUNT,
 };
 
@@ -108,18 +115,19 @@ hk_g17p_rt_enabled(const struct agx_device *dev)
              HK_G17P_RT_KERNEL_FEATURES;
 }
 
-/* T6040's 25G83 firmware does not yet admit intersection/SCS commands. AS
- * construction, copies and refits are ordinary compute and can use the same
- * GEN1 node layout without creating a traversal context. Require the bounded
- * AS execution allowance as well as the exact-prior submission contract.
- * Do not infer traversal support from this predicate.
+/* Fallback for kernels that advertise the bounded AS execution allowance and
+ * exact-prior submission contract without RENDER_RAY_QUERY: ordinary compute
+ * AS construction, copies and refits can still use the GEN1 node layout
+ * without creating a traversal context. Decide from the architecture and
+ * kernel capability bits rather than chip IDs. Do not infer traversal support
+ * from this predicate.
  */
 static inline bool
 hk_g16s_as_enabled(const struct agx_device *dev)
 {
    const uint64_t required = DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |
                              DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD;
-   return agx_is_m4_pro(dev) &&
+   return dev->chip == AGX_CHIP_G17P &&
           (dev->params.features & required) == required;
 }
 
