@@ -1291,6 +1291,28 @@ agx_wait_failed_submit(struct agx_device *dev, uint32_t syncobj, bool accepted)
    return ret == 0;
 }
 
+/* Publish a submitted batch's state for agx_get_query_result_flushed(), which
+ * u_threaded_context calls from the frontend thread. A quarantined batch's
+ * completion is unknown, so it publishes no fence and no timestamps. */
+static void
+agx_publish_batch_query_state(struct agx_context *ctx, struct agx_batch *batch,
+                              bool quarantined)
+{
+   unsigned idx = agx_batch_idx(batch);
+
+   simple_mtx_lock(&ctx->query_lock);
+   ctx->batches.query_state[idx].generation = ctx->batches.generation[idx];
+   if (!quarantined)
+      ctx->batches.query_state[idx].syncobj = batch->syncobj;
+   ctx->batches.query_state[idx].submitted = true;
+   ctx->batches.query_state[idx].quarantined = quarantined;
+   ctx->batches.query_state[idx].has_cdm =
+      !quarantined && batch->cdm.bo && !batch->compute_dropped;
+   ctx->batches.query_state[idx].has_vdm =
+      !quarantined && batch->vdm.bo != NULL;
+   simple_mtx_unlock(&ctx->query_lock);
+}
+
 static void
 agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
                          struct drm_asahi_sync *syncs,
@@ -1353,20 +1375,12 @@ agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
          drmSyncobjSignal(dev->fd, &batch->syncobj, 1);
       agx_batch_cleanup(ctx, batch, false);
    } else {
-      unsigned idx = agx_batch_idx(batch);
       batch->submit_quarantined = true;
       batch->failed_syncobjs[0] = accepted_syncobj;
       batch->failed_syncobjs[1] = error_syncobj;
       ctx->submit_quarantined = true;
       p_atomic_set(&agx_screen(ctx->base.screen)->submit_quarantined, true);
-
-      simple_mtx_lock(&ctx->query_lock);
-      ctx->batches.query_state[idx].generation = ctx->batches.generation[idx];
-      ctx->batches.query_state[idx].submitted = true;
-      ctx->batches.query_state[idx].quarantined = true;
-      ctx->batches.query_state[idx].has_cdm = false;
-      ctx->batches.query_state[idx].has_vdm = false;
-      simple_mtx_unlock(&ctx->query_lock);
+      agx_publish_batch_query_state(ctx, batch, true);
 
       agx_msg("submit completion unknown; quarantining context resources\n");
    }
@@ -2575,16 +2589,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    batch->submit_seq = seqid;
    agx_batch_mark_submitted(batch);
 
-   unsigned idx = agx_batch_idx(batch);
-   simple_mtx_lock(&ctx->query_lock);
-   ctx->batches.query_state[idx].generation = ctx->batches.generation[idx];
-   ctx->batches.query_state[idx].syncobj = batch->syncobj;
-   ctx->batches.query_state[idx].submitted = true;
-   ctx->batches.query_state[idx].quarantined = false;
-   ctx->batches.query_state[idx].has_cdm =
-      batch->cdm.bo && !batch->compute_dropped;
-   ctx->batches.query_state[idx].has_vdm = batch->vdm.bo != NULL;
-   simple_mtx_unlock(&ctx->query_lock);
+   agx_publish_batch_query_state(ctx, batch, false);
 
    free(virt.extres);
 
@@ -2646,6 +2651,7 @@ agx_retire_failed_pending(struct agx_context *ctx,
          batch->submit_quarantined = true;
          if (k == 0)
             batch->failed_syncobjs[1] = error_syncobj;
+         agx_publish_batch_query_state(ctx, batch, true);
       }
    }
 
@@ -2660,7 +2666,7 @@ agx_retire_failed_pending(struct agx_context *ctx,
 
    if (!refused && !(g17_refused && complete)) {
       const bool first_fault = !ctx->any_faults;
-      ctx->any_faults = true;
+      p_atomic_set(&ctx->any_faults, true);
       if (first_fault && ctx->reset.reset)
          ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
    }
@@ -3017,7 +3023,7 @@ agx_submit_pending(struct agx_context *ctx)
                     strerror(wait_ret < -1 ? -wait_ret
                                            : (errno ? errno : EIO)));
             const bool first_fault = !ctx->any_faults;
-            ctx->any_faults = true;
+            p_atomic_set(&ctx->any_faults, true);
             if (first_fault && ctx->reset.reset)
                ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
          }
@@ -3034,6 +3040,7 @@ agx_submit_pending(struct agx_context *ctx)
 
       batch->submit_seq = seqid;
       agx_batch_mark_submitted(batch);
+      agx_publish_batch_query_state(ctx, batch, false);
       if (ctx->batch == batch)
          ctx->batch = NULL;
    }

@@ -342,8 +342,9 @@ agx_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *ctx,
    handle->format = rsrc->layout.format;
    handle->modifier = rsrc->modifier;
 
+   /* The frontend passes its context, which may be a u_threaded_context. */
    if (ctx)
-      agx_submit_pending(agx_context(ctx));
+      agx_submit_pending(agx_context(threaded_context_unwrap_sync(ctx)));
 
    return true;
 }
