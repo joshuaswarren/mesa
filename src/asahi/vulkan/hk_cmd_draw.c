@@ -14483,9 +14483,14 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    cs->stats.calls++;
    hk_upload_stat(cmd, draws, 1);
    if (batch) {
-      /* The kernel writes the M5 Index List into a slot reserved after
-       * this point; its restart state goes before it. */
-      if (agx_chip_g17_m5(dev->dev.chip) && draw.restart)
+      /* A HAL300 Index List carries no restart value: the kernel writes it
+       * into a slot reserved after this point, so its restart state goes
+       * before it. Batched records were admitted by
+       * hk_robust_index_rewrite_admitted(), so the record family has an
+       * empty-draw continuation here. */
+      const enum agx_chip records =
+         agx_vdm_index_list_record_chip(agx_chip_record_family(dev->dev.chip));
+      if (agx_vdm_index_list_direct_is_hal300_inline(records) && draw.restart)
          cs->current = hk_m5_emit_restart_index(cmd, cs, cs->current, draw);
       hk_emit_robust_index(cmd, cs, draw, gfx->topology, tail_emitted, batch);
       /* G17P: its GPU-written indexed indirect packets set the restart
