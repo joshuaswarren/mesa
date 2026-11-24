@@ -33,7 +33,13 @@
 #include "libagx_shaders.h"
 
 #include <fcntl.h>
+#include <linux/capability.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <xf86drm.h>
+#include "util/os_misc.h"
+#include "agx_userptr_limits.h"
 #include "drm-uapi/dma-buf.h"
 #include "vdrm.h"
 #include "util/blob.h"
@@ -921,6 +927,48 @@ agx_get_params(struct agx_device *dev, void *buf, size_t size)
    return get_param.size;
 }
 
+static bool
+agx_has_cap_ipc_lock(void)
+{
+   struct __user_cap_header_struct hdr = {
+      .version = _LINUX_CAPABILITY_VERSION_3,
+   };
+   struct __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3] = {0};
+
+   if (syscall(SYS_capget, &hdr, data))
+      return false;
+
+   return data[CAP_TO_INDEX(CAP_IPC_LOCK)].effective &
+          CAP_TO_MASK(CAP_IPC_LOCK);
+}
+
+/* See agx_userptr_imports_any_size(). */
+static bool
+agx_check_userptr_any_size(const struct agx_device *dev)
+{
+   if (!agx_has_userptr(dev))
+      return false;
+
+   const bool no_memlock = !agx_userptr_charges_memlock(dev);
+   if (no_memlock)
+      return true;
+
+   struct rlimit lim;
+   if (getrlimit(RLIMIT_MEMLOCK, &lim))
+      return false;
+   const uint64_t memlock_B =
+      lim.rlim_cur == RLIM_INFINITY ? UINT64_MAX : (uint64_t)lim.rlim_cur;
+
+   uint64_t gpu_limit_B = dev->params.client_memory_limit;
+   if (!gpu_limit_B)
+      gpu_limit_B = dev->params.memory_limit;
+   if (!gpu_limit_B && !os_get_total_physical_memory(&gpu_limit_B))
+      gpu_limit_B = UINT64_MAX;
+
+   return agx_userptr_imports_any_size(no_memlock, agx_has_cap_ipc_lock(),
+                                       memlock_B, gpu_limit_B);
+}
+
 static int
 agx_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
            struct agx_submit_virt *virt)
@@ -1105,6 +1153,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
       sizeof(dev->params.client_memory_limit);
    dev->has_memory_limits =
       !dev->is_virtio && (size_t)params_size >= limits_params_size;
+   dev->userptr_any_size = agx_check_userptr_any_size(dev);
 
    dev->chip = agx_chip_from_params(&dev->params);
 

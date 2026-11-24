@@ -220,6 +220,16 @@ if with_tests
     suite : ['asahi'],
   )
   test(
+    'asahi-userptr-limits',
+    executable(
+      'asahi-userptr-limits',
+      files('tests/test-userptr-limits.c'),
+      include_directories : include_directories('.'),
+      c_args : ['-UNDEBUG'],
+    ),
+    suite : ['asahi'],
+  )
+  test(
     'asahi-chip-admission',
     executable(
       'asahi-chip-admission',

@@ -259,7 +259,7 @@ hk_GetMemoryHostPointerPropertiesEXT(
    struct hk_physical_device *pdev = hk_device_physical(dev);
 
    if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
-       !agx_has_userptr(&dev->dev))
+       !agx_has_host_import(&dev->dev))
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    const uint64_t alignment =
@@ -551,9 +551,14 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       mem->bo = agx_bo_import_host_ptr(&dev->dev, host_info->pHostPointer,
                                        pAllocateInfo->allocationSize, access);
       if (mem->bo == NULL) {
+         /* ENOMEM is GPU memory exhaustion unless the kernel also charges
+          * the pins to RLIMIT_MEMLOCK: then the range may only be refused
+          * past that limit, which more device memory would not cure. */
          const int err = errno;
+         const bool out_of_memory =
+            err == ENOMEM && !agx_userptr_charges_memlock(&dev->dev);
          result = vk_errorf(dev,
-                            err == ENOMEM ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                            out_of_memory ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                                           : VK_ERROR_INVALID_EXTERNAL_HANDLE,
                             "importing %" PRIu64 " bytes of host memory at %p: %s",
                             (uint64_t)pAllocateInfo->allocationSize,
