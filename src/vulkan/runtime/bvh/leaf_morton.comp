@@ -1,0 +1,261 @@
+/*
+ * Copyright © 2026 Aurora Silicon
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ * Single-workgroup fused leaf generation, IR header initialization, optional
+ * H-PLOC range initialization, and 32-bit Morton key sorting for small
+ * single-geometry builds (<= LEAF_MORTON_WORKGROUP_SIZE leaves).
+ */
+
+#version 460
+
+#include "vk_bvh_defines.h"
+#define VK_USED_BUILD_FLAGS VK_LEAF_MORTON_BUILD_FLAGS
+#define VK_LEAF_HELPERS_ONLY 1
+#include "leaf.h"
+
+layout(local_size_x = LEAF_MORTON_WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform CONSTS {
+   leaf_morton_args args;
+};
+
+shared key32_id_pair shared_kvs[LEAF_MORTON_WORKGROUP_SIZE];
+
+/* Up to LEAF_MORTON_WORKGROUP_SIZE / 8 = 32 subgroups. */
+shared uint32_t sh_active[32];
+shared int32_t sh_min_x[32];
+shared int32_t sh_min_y[32];
+shared int32_t sh_min_z[32];
+shared int32_t sh_max_x[32];
+shared int32_t sh_max_y[32];
+shared int32_t sh_max_z[32];
+shared vec3 sh_bvh_min;
+shared vec3 sh_bvh_extent;
+
+uint32_t
+morton_component(uint32_t x)
+{
+   x = (x * 0x00010001u) & 0xFF0000FFu;
+   x = (x * 0x00000101u) & 0x0F00F00Fu;
+   x = (x * 0x00000011u) & 0xC30C30C3u;
+   x = (x * 0x00000005u) & 0x49249249u;
+   return x;
+}
+
+uint32_t
+morton_code(uint32_t x, uint32_t y, uint32_t z)
+{
+   return (morton_component(x) << 2) | (morton_component(y) << 1) | morton_component(z);
+}
+
+uint32_t
+lbvh_key(float x01, float y01, float z01)
+{
+   /* To sort all valid nodes before invalid ones, we do min(0xfffffffe). */
+   return min(morton_code(uint32_t(x01 * 255.0), uint32_t(y01 * 255.0), uint32_t(z01 * 255.0)) << 8, 0xfffffffeu);
+}
+
+void
+subgroup_bitonic_merge_step(inout key32_id_pair kv, uint32_t dst_width)
+{
+   if (dst_width > gl_SubgroupSize)
+      return;
+
+   uint32_t lane = gl_SubgroupInvocationID;
+   [[unroll]]
+   for (uint32_t delta_div = 2u; delta_div <= dst_width; delta_div *= 2u) {
+      uint32_t delta = dst_width / delta_div;
+      key32_id_pair other = key32_id_pair(subgroupShuffle(kv.id, lane ^ delta),
+                                          subgroupShuffle(kv.key, lane ^ delta));
+      bool flip = ((lane & dst_width) != 0u) != ((lane & delta) != 0u);
+      bool take_other = flip ? (other.key > kv.key) : (other.key < kv.key);
+      if (take_other)
+         kv = other;
+   }
+}
+
+void
+subgroup_bitonic_merge(inout key32_id_pair kv)
+{
+   subgroup_bitonic_merge_step(kv, 2u);
+   subgroup_bitonic_merge_step(kv, 4u);
+   subgroup_bitonic_merge_step(kv, 8u);
+   subgroup_bitonic_merge_step(kv, 16u);
+   subgroup_bitonic_merge_step(kv, 32u);
+   subgroup_bitonic_merge_step(kv, 64u);
+}
+
+void
+main(void)
+{
+   uint32_t lid = gl_LocalInvocationID.x;
+   uint32_t leaf_count = args.leaf_count;
+   vk_bvh_geometry_data geom_data = args.geom_data;
+   bool in_range = lid < leaf_count;
+
+   if (args.hploc_ranges != 0ul && lid + 1u < leaf_count)
+      DEREF(INDEX(uint32_t, args.hploc_ranges, lid)) = 0xffffffffu;
+
+   uint32_t dst_stride = vk_ir_node_size(geom_data.geometry_type);
+   uint32_t node_type;
+   if (geom_data.geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR)
+      node_type = vk_ir_node_triangle;
+   else if (geom_data.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR)
+      node_type = vk_ir_node_aabb;
+   else
+      node_type = vk_ir_node_instance;
+
+   uint32_t dst_offset = lid * dst_stride;
+   VOID_REF dst_ptr = OFFSET(args.bvh, dst_offset);
+
+   vk_aabb bounds = vk_aabb(vec3(0.0), vec3(0.0));
+   bool is_active = false;
+   if (in_range) {
+      if (geom_data.geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+         is_active = build_triangle(bounds, dst_ptr, geom_data, lid);
+      } else if (geom_data.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR) {
+         VOID_REF src_ptr = OFFSET(geom_data.data, lid * geom_data.stride);
+         is_active = build_aabb(bounds, src_ptr, dst_ptr, geom_data.geometry_id, lid);
+      } else {
+         VOID_REF src_ptr = OFFSET(geom_data.data, lid * geom_data.stride);
+         if (geom_data.stride == 8u)
+            src_ptr = DEREF(REF(VOID_REF)(src_ptr));
+         is_active = build_instance(bounds, src_ptr, dst_ptr, lid);
+      }
+   }
+
+   if (VK_TEST_BUILD_FLAG_ALWAYS_ACTIVE && in_range &&
+       geom_data.geometry_type != VK_GEOMETRY_TYPE_INSTANCES_KHR)
+      is_active = true;
+
+   uint32_t id = is_active ? pack_ir_node_id(dst_offset, node_type) : VK_BVH_INVALID_NODE;
+
+   uvec4 ballot = subgroupBallot(is_active);
+   uint32_t sg_active = subgroupBallotBitCount(ballot);
+   int32_t sg_min_x = subgroupMin(is_active ? to_emulated_float(bounds.min.x) : 0x7fffffff);
+   int32_t sg_min_y = subgroupMin(is_active ? to_emulated_float(bounds.min.y) : 0x7fffffff);
+   int32_t sg_min_z = subgroupMin(is_active ? to_emulated_float(bounds.min.z) : 0x7fffffff);
+   int32_t sg_max_x = subgroupMax(is_active ? to_emulated_float(bounds.max.x) : int32_t(0x80000000u));
+   int32_t sg_max_y = subgroupMax(is_active ? to_emulated_float(bounds.max.y) : int32_t(0x80000000u));
+   int32_t sg_max_z = subgroupMax(is_active ? to_emulated_float(bounds.max.z) : int32_t(0x80000000u));
+
+   if (subgroupElect()) {
+      sh_active[gl_SubgroupID] = sg_active;
+      sh_min_x[gl_SubgroupID] = sg_min_x;
+      sh_min_y[gl_SubgroupID] = sg_min_y;
+      sh_min_z[gl_SubgroupID] = sg_min_z;
+      sh_max_x[gl_SubgroupID] = sg_max_x;
+      sh_max_y[gl_SubgroupID] = sg_max_y;
+      sh_max_z[gl_SubgroupID] = sg_max_z;
+   }
+
+   barrier();
+
+   if (lid == 0u) {
+      uint32_t total_active = 0u;
+      int32_t min_x = 0x7fffffff;
+      int32_t min_y = 0x7fffffff;
+      int32_t min_z = 0x7fffffff;
+      int32_t max_x = int32_t(0x80000000u);
+      int32_t max_y = int32_t(0x80000000u);
+      int32_t max_z = int32_t(0x80000000u);
+
+      for (uint32_t s = 0u; s < gl_NumSubgroups; ++s) {
+         total_active += sh_active[s];
+         min_x = min(min_x, sh_min_x[s]);
+         min_y = min(min_y, sh_min_y[s]);
+         min_z = min(min_z, sh_min_z[s]);
+         max_x = max(max_x, sh_max_x[s]);
+         max_y = max(max_y, sh_max_y[s]);
+         max_z = max(max_z, sh_max_z[s]);
+      }
+
+      vec3 bmin = vec3(from_emulated_float(min_x),
+                       from_emulated_float(min_y),
+                       from_emulated_float(min_z));
+      vec3 bmax = vec3(from_emulated_float(max_x),
+                       from_emulated_float(max_y),
+                       from_emulated_float(max_z));
+      sh_bvh_min = bmin;
+      sh_bvh_extent = bmax - bmin;
+
+      DEREF(args.header).min_bounds[0] = min_x;
+      DEREF(args.header).min_bounds[1] = min_y;
+      DEREF(args.header).min_bounds[2] = min_z;
+      DEREF(args.header).max_bounds[0] = max_x;
+      DEREF(args.header).max_bounds[1] = max_y;
+      DEREF(args.header).max_bounds[2] = max_z;
+      DEREF(args.header).active_leaf_count = total_active;
+      DEREF(args.header).tmp_active_leaf_count = 0u;
+      DEREF(args.header).ir_internal_node_count = 0u;
+      DEREF(args.header).dispatch_size_y = 1u;
+      DEREF(args.header).dispatch_size_z = 1u;
+      DEREF(args.header).sync_data.task_counts[0] = TASK_INDEX_INVALID;
+      DEREF(args.header).sync_data.task_counts[1] = TASK_INDEX_INVALID;
+      DEREF(args.header).sync_data.task_started_counter = 0u;
+      DEREF(args.header).sync_data.task_done_counter = 0u;
+      DEREF(args.header).sync_data.current_phase_start_counter = 0u;
+      DEREF(args.header).sync_data.current_phase_end_counter = TASK_INDEX_INVALID;
+      DEREF(args.header).sync_data.phase_index = 0u;
+      DEREF(args.header).sync_data.next_phase_exit_flag = 0u;
+      DEREF(args.header).dst_node_offset = 0u;
+      DEREF(args.header).dst_leaf_node_offset = 0u;
+      for (uint32_t k = 0u; k < 6u; ++k)
+         DEREF(args.header).driver_internal[k] = 0u;
+   }
+
+   barrier();
+
+   key32_id_pair kv = key32_id_pair(0xFFFFFFFFu, 0xFFFFFFFFu);
+   if (id != VK_BVH_INVALID_NODE) {
+      vec3 center = (bounds.min + bounds.max) * 0.5;
+      vec3 normalized_center = (center - sh_bvh_min) / sh_bvh_extent;
+      uint32_t key = lbvh_key(normalized_center.x, normalized_center.y, normalized_center.z);
+      kv = key32_id_pair(id, key);
+   }
+
+   subgroup_bitonic_merge(kv);
+
+   for (uint32_t dst_len = gl_SubgroupSize * 2u; dst_len <= LEAF_MORTON_WORKGROUP_SIZE; dst_len *= 2u) {
+      uint32_t src_len = dst_len / 2u;
+      if (src_len >= leaf_count)
+         break;
+
+      shared_kvs[lid] = kv;
+      barrier();
+
+      uint32_t list_idx = lid / dst_len;
+      uint32_t dst_idx = lid % dst_len;
+      uint32_t a_start = list_idx * dst_len;
+      uint32_t b_start = a_start + src_len;
+
+      uint32_t lo = dst_idx > src_len ? (dst_idx - src_len) : 0u;
+      uint32_t hi = min(src_len, dst_idx);
+      while (lo < hi) {
+         uint32_t mid = (lo + hi) / 2u;
+         if (shared_kvs[a_start + mid].key < shared_kvs[b_start + dst_idx - 1u - mid].key)
+            lo = mid + 1u;
+         else
+            hi = mid;
+      }
+
+      uint32_t first_a = lo;
+      uint32_t first_b = dst_idx - first_a;
+      if (first_b >= src_len) {
+         kv = shared_kvs[a_start + first_a];
+      } else if (first_a >= src_len) {
+         kv = shared_kvs[b_start + first_b];
+      } else {
+         key32_id_pair a_kv = shared_kvs[a_start + first_a];
+         key32_id_pair b_kv = shared_kvs[b_start + first_b];
+         kv = a_kv.key < b_kv.key ? a_kv : b_kv;
+      }
+
+      barrier();
+   }
+
+   if (in_range)
+      DEREF(INDEX(key32_id_pair, args.ids_dst, lid)) = kv;
+}

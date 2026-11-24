@@ -204,6 +204,8 @@ encode_explicit(const struct agx3_isel_desc *d,
 {
    const bool tu = d->true_kind == AGX3_ISEL_UNIFORM;
    const bool fu = d->false_kind == AGX3_ISEL_UNIFORM;
+   const bool ti = d->true_kind == AGX3_ISEL_IMMEDIATE;
+   const bool fi = d->false_kind == AGX3_ISEL_IMMEDIATE;
    const bool any_uniform = d->cmp0_uniform || d->cmp1_uniform || tu || fu;
 
    /* Admitted G17P uniform isel shapes (32-bit result): one uniform comparand
@@ -213,7 +215,7 @@ encode_explicit(const struct agx3_isel_desc *d,
       if (d->dest_16 || d->cmp_16 ||
           (d->cmp0_uniform && d->cmp1_uniform) ||
           ((d->cmp0_uniform || d->cmp1_uniform) &&
-           (d->cmp1_immediate || tu || fu)) ||
+           (d->cmp1_immediate || tu || fu || ti || fi)) ||
           (d->cmp0_uniform && !uniform32_ok(d->cmp0)) ||
           (d->cmp1_uniform && !uniform32_ok(d->cmp1)) ||
           (tu && !uniform32_ok(d->sel_true)) ||
@@ -239,8 +241,6 @@ encode_explicit(const struct agx3_isel_desc *d,
          return false;
    }
 
-   const bool ti = d->true_kind == AGX3_ISEL_IMMEDIATE;
-   const bool fi = d->false_kind == AGX3_ISEL_IMMEDIATE;
    if ((d->cmp1_immediate && (d->cache[1] || d->discard[1])) ||
        (ti && (d->cache[2] || d->discard[2])) ||
        (fi && (d->cache[3] || d->discard[3])))

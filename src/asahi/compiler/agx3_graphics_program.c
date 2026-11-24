@@ -239,7 +239,7 @@ agx3_g17p_graphics_external_setup_suffix_generate(
    enum agx_chip chip, const struct agx3_g17p_graphics_program_desc *desc,
    void *output, size_t capacity, size_t *written)
 {
-   if (chip != AGX_CHIP_G17P || !desc || !output || !written ||
+   if (!agx_chip_native_hal200(chip) || !desc || !output || !written ||
        !desc->preloaded_root ||
        (desc->writes_sample_mask && !desc->fragment) ||
        (!desc->fragment && desc->colour_classes) ||
@@ -272,7 +272,7 @@ agx3_g17p_graphics_external_launcher_generate(
    uint64_t program_va, uint64_t root_va, uint64_t setup_va, void *output,
    size_t capacity, size_t *written)
 {
-   if (chip != AGX_CHIP_G17P || !desc || !output || !written ||
+   if (!agx_chip_native_hal200(chip) || !desc || !output || !written ||
        !desc->preloaded_root || !graphics_external_root_uniform_free(desc))
       return false;
 
@@ -343,7 +343,7 @@ agx3_g17p_graphics_external_launcher_template_relocate(
    uint64_t program_va, uint64_t root_va, uint64_t setup_va, void *output,
    size_t capacity, size_t *written)
 {
-   if (chip != AGX_CHIP_G17P || !launcher || !output || !written ||
+   if (!agx_chip_native_hal200(chip) || !launcher || !output || !written ||
        launcher->length > sizeof(launcher->bytes) ||
        launcher->length > capacity ||
        launcher->branch_offset + AGX_IOTO_PRESHADER_BRANCH_SIZE !=
@@ -1076,7 +1076,7 @@ agx3_g17p_graphics_program_desc_bound(
    size_t *size)
 {
    size_t base, input_body, chunks;
-   if (!desc || !size || chip != AGX_CHIP_G17P ||
+   if (!desc || !size || !agx_chip_native_hal200(chip) ||
        desc->uniform_range_count > AGX3_G17P_GRAPHICS_MAX_RANGES ||
        (desc->uniform_range_count && !desc->uniform_ranges) ||
        (desc->constant_program.code_size & 1) ||
@@ -1133,7 +1133,7 @@ agx3_g17p_graphics_root_prefix_generate(
    enum agx_chip chip, uint64_t root_va,
    struct agx3_g17p_graphics_root_prefix *prefix)
 {
-   if (!prefix || chip != AGX_CHIP_G17P || !root_va)
+   if (!prefix || !agx_chip_native_hal200(chip) || !root_va)
       return false;
 
    struct agx3_g17p_graphics_root_prefix staged = {0};

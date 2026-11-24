@@ -14,17 +14,9 @@ extern "C" {
 #endif
 
 /*
- * G17P Ioto programs are tens to a few hundred bytes each, and one is composed
- * per shader per draw and per background/end-of-tile program per render pass.
- * Giving each its own BO costs a whole 16KiB page plus a 16KiB guard page of
- * the 4GiB USC exec window -- more than a hundred times the program -- so a
- * single frame's worth of draws can exhaust the window even though the code it
- * holds is a few hundred kilobytes.
- *
- * Programs are therefore bump-allocated out of chunks, at the 64-byte alignment
- * the launch pointer requires. 128KiB matches HK_CMD_BO_SIZE and holds several
- * hundred programs, so the amortised window cost per program is the program
- * itself plus alignment.
+ * Bump-allocate small G17P Ioto programs (64-byte aligned) out of 128 KiB
+ * chunks (matching HK_CMD_BO_SIZE) instead of per-program BOs, which would
+ * waste 32 KiB (page + guard) of the 4 GiB USC exec window per program.
  */
 #define HK_IOTO_ARENA_CHUNK_SIZE (128u * 1024u)
 

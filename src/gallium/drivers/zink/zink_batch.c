@@ -143,14 +143,26 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
 
    /* only increment batch generation if previously in-use to avoid false detection of batch completion */
    if (bs->fence.submitted)
-      bs->usage.submit_count++;
+      p_atomic_inc(&bs->usage.submit_count);
+   if (bs->fence.batch_id)
+      zink_screen_update_last_finished(screen, bs->fence.batch_id);
+   /* Publish completion and detach tracked tc fences atomically before
+    * clearing submitted/batch_id so concurrent zink_fence_finish() readers
+    * never observe a half-reset batch without seeing reset_id >= target_flush_id,
+    * and concurrent destroy_fence() / zink_flush() cannot race on
+    * bs->fence.mfences or leave completed mfences attached to a recycled batch.
+    */
+   simple_mtx_lock(&screen->mfences_lock);
+   p_atomic_set(&bs->reset_id, p_atomic_read(&bs->flush_id));
+   util_dynarray_foreach(&bs->fence.mfences, struct zink_tc_fence *, mfence)
+      p_atomic_set(&(*mfence)->fence, NULL);
+   util_dynarray_clear(&bs->fence.mfences);
+   simple_mtx_unlock(&screen->mfences_lock);
    /* only reset submitted here so that tc fence desync can pick up the 'completed' flag
     * before the state is reused
     */
-   bs->fence.submitted = false;
-   if (bs->fence.batch_id)
-      zink_screen_update_last_finished(screen, bs->fence.batch_id);
-   bs->fence.batch_id = 0;
+   p_atomic_set(&bs->fence.submitted, false);
+   p_atomic_set(&bs->fence.batch_id, 0);
    bs->usage.usage = 0;
    bs->next = NULL;
    bs->last_added_obj = NULL;
@@ -158,6 +170,7 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
    bs->has_work = false;
    bs->has_reordered_work = false;
    bs->has_unsync = false;
+   bs->has_host_transfer_write = false;
 }
 
 static void
@@ -269,12 +282,14 @@ zink_batch_state_destroy(struct zink_screen *screen, struct zink_batch_state *bs
    util_dynarray_fini(&bs->tracked_semaphores);
    util_dynarray_fini(&bs->acquire_flags);
    util_dynarray_fini(&bs->fences);
+   simple_mtx_lock(&screen->mfences_lock);
    unsigned num_mfences = util_dynarray_num_elements(&bs->fence.mfences, void *);
    struct zink_tc_fence **mfence = bs->fence.mfences.data;
    for (unsigned i = 0; i < num_mfences; i++) {
-      mfence[i]->fence = NULL;
+      p_atomic_set(&mfence[i]->fence, NULL);
    }
    util_dynarray_fini(&bs->fence.mfences);
+   simple_mtx_unlock(&screen->mfences_lock);
    zink_batch_descriptor_deinit(screen, bs);
    ralloc_free(bs);
 }
@@ -652,7 +667,7 @@ submit_queue(void *data, void *gdata, int thread_index)
    VkSubmitInfo *submit = si;
    int num_si = ZINK_SUBMIT_MAX;
    while (!bs->fence.batch_id)
-      bs->fence.batch_id = (uint32_t)p_atomic_inc_return(&screen->curr_batch);
+      p_atomic_set(&bs->fence.batch_id, (uint32_t)p_atomic_inc_return(&screen->curr_batch));
    bs->usage.usage = bs->fence.batch_id;
    assert(bs->usage.usage);
    p_atomic_set(&bs->usage.unflushed, false);
@@ -707,7 +722,7 @@ submit_queue(void *data, void *gdata, int thread_index)
                                                    bs->has_reordered_work ? bs->reordered_cmdbuf :
                                                                             bs->has_unsync ? bs->unsynchronized_cmdbuf :
                                                                                              VK_NULL_HANDLE;
-      if (sync_cmdbuf) {
+      if (sync_cmdbuf && bs->has_host_transfer_write) {
          VkMemoryBarrier mb;
          mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
          mb.pNext = NULL;
@@ -841,7 +856,7 @@ submit_queue(void *data, void *gdata, int thread_index)
    if (bs->sparse_semaphore)
       (void)util_dynarray_pop(&bs->acquires, VkSemaphore);
 
-   bs->usage.submit_count++;
+   p_atomic_inc(&bs->usage.submit_count);
 end:
    /* Pair the notification with the cross-context waiter's predicate check.
     * Otherwise the submission can finish between that check and cnd_wait,
@@ -958,7 +973,7 @@ zink_end_batch(struct zink_context *ctx)
    }
 
    util_dynarray_foreach(&bs->fences, struct zink_tc_fence*, mfence)
-      (*mfence)->deferred_ctx = NULL;
+      p_atomic_set(&(*mfence)->deferred_ctx, NULL);
 
    if (screen->threaded_submit) {
       util_queue_add_job(&screen->flush_queue, bs, &bs->flush_completed,
@@ -966,6 +981,11 @@ zink_end_batch(struct zink_context *ctx)
    } else {
       submit_queue(bs, NULL, 0);
    }
+   /* Publish flush_id after flush_completed is armed (or synchronous submit_queue
+    * completed) so concurrent zink_fence_finish() callers never race ahead of
+    * util_queue_fence_reset(&bs->flush_completed).
+    */
+   p_atomic_inc(&bs->flush_id);
 
    ctx->last_transfer_sync = 0;
    ctx->rp_counter = 0;
