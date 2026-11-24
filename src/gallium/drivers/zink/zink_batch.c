@@ -882,6 +882,18 @@ end:
    simple_mtx_unlock(&screen->active_batch_states_lock);
 }
 
+/* flush_queue job: see zink_end_batch() for why this takes submit_lock */
+static void
+submit_queue_job(void *data, void *gdata, int thread_index)
+{
+   struct zink_batch_state *bs = data;
+   struct zink_screen *screen = zink_screen(bs->ctx->base.screen);
+
+   simple_mtx_lock(&screen->submit_lock);
+   submit_queue(data, gdata, thread_index);
+   simple_mtx_unlock(&screen->submit_lock);
+}
+
 /* called during flush */
 void
 zink_end_batch(struct zink_context *ctx)
@@ -975,9 +987,19 @@ zink_end_batch(struct zink_context *ctx)
    util_dynarray_foreach(&bs->fences, struct zink_tc_fence*, mfence)
       p_atomic_set(&(*mfence)->deferred_ctx, NULL);
 
-   if (screen->threaded_submit) {
-      util_queue_add_job(&screen->flush_queue, bs, &bs->flush_completed,
-                         submit_queue, NULL, 0);
+   /* The submit thread only helps while it has other work queued or running.
+    * Handing a submission to an idle submit thread adds that thread's wakeup
+    * to it, and a caller that waits on the work next pays the wakeup on every
+    * round trip. With nothing queued, submit here, as ZINK_DEBUG=flushsync does
+    * on every flush. submit_lock keeps batch ids in vkQueueSubmit order when
+    * another context's submission reaches the submit thread meanwhile.
+    */
+   if (screen->threaded_submit && p_atomic_read(&screen->flush_queue_jobs)) {
+      zink_flush_queue_add_job(screen, bs, &bs->flush_completed, submit_queue_job);
+   } else if (screen->threaded_submit) {
+      simple_mtx_lock(&screen->submit_lock);
+      submit_queue(bs, NULL, 0);
+      simple_mtx_unlock(&screen->submit_lock);
    } else {
       submit_queue(bs, NULL, 0);
    }
