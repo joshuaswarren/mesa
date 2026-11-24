@@ -505,6 +505,326 @@ agx_nir_unroll_g17p_samples(nir_shader *shader, unsigned nr_samples,
    return agx_nir_unroll_g17p_samples_layout(shader, nr_samples, &layout);
 }
 
+#define G17P_EQUIV_ALL_SAMPLES 0xFFu
+#define G17P_EQUIV_MAX_PROBES  8u
+#define G17P_EQUIV_MAX_DWORDS  8u
+
+struct g17p_equiv_probe {
+   unsigned base;
+   enum pipe_format format;
+   uint8_t num_components;
+   uint8_t bit_size;
+};
+
+static bool
+g17p_equiv_is_all_samples_iand(const nir_alu_instr *alu,
+                               const nir_def *active_def)
+{
+   if (alu->op != nir_op_iand || alu->def.num_components != 1)
+      return false;
+
+   for (unsigned i = 0; i < 2; ++i) {
+      nir_def *a = alu->src[i].src.ssa;
+      nir_def *b = alu->src[1 - i].src.ssa;
+      if (active_def && a != active_def)
+         continue;
+      nir_instr *ai = nir_def_instr(a);
+      if (ai->type != nir_instr_type_intrinsic ||
+          nir_instr_as_intrinsic(ai)->intrinsic !=
+             nir_intrinsic_load_active_samples_agx)
+         continue;
+      if (nir_src_is_const(nir_src_for_ssa(b)) &&
+          nir_src_as_uint(nir_src_for_ssa(b)) == G17P_EQUIV_ALL_SAMPLES)
+         return true;
+   }
+   return false;
+}
+
+static bool
+g17p_equiv_is_tile_mask_use(const nir_src *use)
+{
+   if (nir_src_is_if(use))
+      return false;
+   nir_instr *parent = nir_src_use_instr(use);
+   if (parent->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(parent);
+   if (intr->intrinsic == nir_intrinsic_load_local_pixel_agx)
+      return use == &intr->src[0];
+   if (intr->intrinsic == nir_intrinsic_store_local_pixel_agx)
+      return use == &intr->src[1];
+   return false;
+}
+
+static bool
+g17p_equiv_is_valid_tile_mask(const nir_def *def)
+{
+   const nir_instr *instr = nir_def_instr(def);
+   if (instr->type == nir_instr_type_intrinsic &&
+       nir_instr_as_intrinsic(instr)->intrinsic ==
+          nir_intrinsic_load_active_samples_agx)
+      return true;
+   if (instr->type == nir_instr_type_alu)
+      return g17p_equiv_is_all_samples_iand(nir_instr_as_alu(instr), NULL);
+   return false;
+}
+
+static bool
+g17p_equiv_active_samples_uses_valid(const nir_def *def)
+{
+   nir_foreach_use_including_if(use, def) {
+      if (nir_src_is_if(use))
+         return false;
+      if (g17p_equiv_is_tile_mask_use(use))
+         continue;
+      nir_instr *parent = nir_src_use_instr(use);
+      if (parent->type != nir_instr_type_alu)
+         return false;
+      const nir_alu_instr *alu = nir_instr_as_alu(parent);
+      if (!g17p_equiv_is_all_samples_iand(alu, def))
+         return false;
+      nir_foreach_use_including_if(alu_use, &alu->def) {
+         if (!g17p_equiv_is_tile_mask_use(alu_use))
+            return false;
+      }
+   }
+   return true;
+}
+
+static int
+g17p_equiv_find_probe(const struct g17p_equiv_probe *probes,
+                      unsigned num_probes, const nir_intrinsic_instr *intr)
+{
+   const unsigned base = nir_intrinsic_base(intr);
+   const enum pipe_format format = nir_intrinsic_format(intr);
+   for (unsigned k = 0; k < num_probes; ++k) {
+      if (probes[k].base == base && probes[k].format == format &&
+          probes[k].num_components == intr->def.num_components &&
+          probes[k].bit_size == intr->def.bit_size)
+         return (int)k;
+   }
+   return -1;
+}
+
+static void
+specialize_g17p_equiv_copy(nir_cf_list *copy, nir_def *active_samples,
+                           const struct g17p_equiv_probe *probes,
+                           nir_def *const *reuse_v0, unsigned num_probes)
+{
+   foreach_list_typed(nir_cf_node, node, node, &copy->list) {
+      nir_foreach_block_in_cf_node(block, node) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_active_samples_agx) {
+               nir_def_rewrite_uses(&intr->def, active_samples);
+               nir_instr_remove(instr);
+            } else if (reuse_v0 &&
+                       intr->intrinsic == nir_intrinsic_load_local_pixel_agx) {
+               const int k = g17p_equiv_find_probe(probes, num_probes, intr);
+               assert(k >= 0);
+               nir_def_rewrite_uses(&intr->def, reuse_v0[k]);
+               nir_instr_remove(instr);
+            }
+         }
+      }
+   }
+}
+
+/*
+ * Monolithic MSAA local-read shaders often run on interior pixels where every
+ * sample in the subgroup has full coverage and identical input tilebuffer
+ * contents. Instead of unconditionally unrolling the entire shading body
+ * nr_samples times, probe the input tilebuffer reads across samples, ballot
+ * across the subgroup, and execute the body once with a whole-pixel tile store
+ * when all active lanes are sample-equivalent. Only sample 0's probed values
+ * remain live into the branches, keeping register pressure flat.
+ */
+bool
+agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
+                                  const struct agx_g17p_colour_layout *layout)
+{
+   (void)layout;
+   assert(shader->info.stage == MESA_SHADER_FRAGMENT);
+   if ((nr_samples != 2 && nr_samples != 4) ||
+       shader->info.fs.uses_discard || shader->info.writes_memory)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   struct g17p_equiv_probe probes[G17P_EQUIV_MAX_PROBES];
+   unsigned num_probes = 0;
+   unsigned total_dwords = 0;
+   unsigned store_count = 0;
+   bool saw_store = false;
+   nir_intrinsic_instr *force_early_instr = NULL;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_call)
+            return false;
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         switch (intr->intrinsic) {
+         case nir_intrinsic_sample_mask_agx:
+            if (shader->info.fs.early_fragment_tests && !force_early_instr &&
+                block == nir_start_block(impl) && num_probes == 0 &&
+                !saw_store && nir_src_is_const(intr->src[0]) &&
+                nir_src_is_const(intr->src[1]) &&
+                nir_src_as_uint(intr->src[0]) == G17P_EQUIV_ALL_SAMPLES &&
+                nir_src_as_uint(intr->src[1]) == G17P_EQUIV_ALL_SAMPLES) {
+               force_early_instr = intr;
+               continue;
+            }
+            return false;
+
+         case nir_intrinsic_load_active_samples_agx:
+            if (!g17p_equiv_active_samples_uses_valid(&intr->def))
+               return false;
+            continue;
+
+         case nir_intrinsic_load_local_pixel_agx: {
+            if (saw_store || block->cf_node.parent != &impl->cf_node ||
+                !g17p_equiv_is_valid_tile_mask(intr->src[0].ssa))
+               return false;
+            if (g17p_equiv_find_probe(probes, num_probes, intr) < 0) {
+               if (num_probes >= G17P_EQUIV_MAX_PROBES)
+                  return false;
+               const unsigned dwords =
+                  DIV_ROUND_UP(intr->def.num_components * intr->def.bit_size,
+                               32);
+               if (total_dwords + dwords > G17P_EQUIV_MAX_DWORDS)
+                  return false;
+               probes[num_probes++] = (struct g17p_equiv_probe){
+                  .base = nir_intrinsic_base(intr),
+                  .format = nir_intrinsic_format(intr),
+                  .num_components = intr->def.num_components,
+                  .bit_size = intr->def.bit_size,
+               };
+               total_dwords += dwords;
+            }
+            continue;
+         }
+
+         case nir_intrinsic_store_local_pixel_agx:
+            if (!g17p_equiv_is_valid_tile_mask(intr->src[1].ssa))
+               return false;
+            saw_store = true;
+            store_count++;
+            continue;
+
+         case nir_intrinsic_load_sample_mask:
+            continue;
+
+         case nir_intrinsic_load_sample_id:
+         case nir_intrinsic_load_sample_pos:
+         case nir_intrinsic_load_samples_log2_agx:
+         case nir_intrinsic_load_barycentric_sample:
+         case nir_intrinsic_load_barycentric_at_sample:
+         case nir_intrinsic_load_exported_agx:
+         case nir_intrinsic_ballot:
+         case nir_intrinsic_vote_all:
+         case nir_intrinsic_vote_any:
+         case nir_intrinsic_vote_ieq:
+         case nir_intrinsic_vote_feq:
+         case nir_intrinsic_elect:
+         case nir_intrinsic_first_invocation:
+         case nir_intrinsic_read_invocation:
+         case nir_intrinsic_read_first_invocation:
+         case nir_intrinsic_shuffle:
+         case nir_intrinsic_shuffle_xor:
+         case nir_intrinsic_shuffle_up:
+         case nir_intrinsic_shuffle_down:
+         case nir_intrinsic_quad_broadcast:
+         case nir_intrinsic_quad_swap_horizontal:
+         case nir_intrinsic_quad_swap_vertical:
+         case nir_intrinsic_quad_swap_diagonal:
+         case nir_intrinsic_quad_ballot_agx:
+         case nir_intrinsic_reduce:
+         case nir_intrinsic_inclusive_scan:
+         case nir_intrinsic_exclusive_scan:
+            return false;
+
+         default:
+            if (!(nir_intrinsic_infos[intr->intrinsic].flags &
+                  NIR_INTRINSIC_CAN_ELIMINATE))
+               return false;
+            continue;
+         }
+      }
+   }
+
+   if (num_probes == 0 || store_count == 0)
+      return false;
+
+   const bool force_early = force_early_instr != NULL;
+   if (force_early_instr)
+      nir_instr_remove(&force_early_instr->instr);
+
+   nir_cf_list body;
+   nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
+
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   if (force_early)
+      nir_sample_mask_agx(&b, nir_imm_intN_t(&b, G17P_EQUIV_ALL_SAMPLES, 16),
+                          nir_imm_intN_t(&b, G17P_EQUIV_ALL_SAMPLES, 16));
+
+   const unsigned full_mask = BITFIELD_MASK(nr_samples);
+   nir_def *cov = nir_u2u16(&b, nir_load_sample_mask(&b));
+   nir_def *lane_eq =
+      nir_ieq_imm(&b, nir_iand_imm(&b, cov, full_mask), full_mask);
+
+   nir_def *v0[G17P_EQUIV_MAX_PROBES];
+   for (unsigned k = 0; k < num_probes; ++k) {
+      v0[k] = nir_load_local_pixel_agx(
+         &b, probes[k].num_components, probes[k].bit_size,
+         nir_imm_intN_t(&b, BITFIELD_BIT(0), 16), .base = probes[k].base,
+         .format = probes[k].format);
+
+      for (unsigned s = 1; s < nr_samples; ++s) {
+         nir_def *vs = nir_load_local_pixel_agx(
+            &b, probes[k].num_components, probes[k].bit_size,
+            nir_imm_intN_t(&b, BITFIELD_BIT(s), 16), .base = probes[k].base,
+            .format = probes[k].format);
+         nir_def *diff = nir_ixor(&b, v0[k], vs);
+         nir_def *any_diff = nir_channel(&b, diff, 0);
+         for (unsigned c = 1; c < probes[k].num_components; ++c)
+            any_diff = nir_ior(&b, any_diff, nir_channel(&b, diff, c));
+         lane_eq = nir_iand(&b, lane_eq, nir_ieq_imm(&b, any_diff, 0));
+      }
+   }
+
+   nir_def *any_not_eq = nir_ballot(&b, 1, 32, nir_inot(&b, lane_eq));
+   nir_def *all_equiv = nir_ieq_imm(&b, any_not_eq, 0);
+
+   nir_if *nif = nir_push_if(&b, all_equiv);
+   {
+      nir_def *all_mask = nir_imm_intN_t(&b, G17P_EQUIV_ALL_SAMPLES, 16);
+      nir_cf_list fast_copy;
+      nir_cf_list_clone(&fast_copy, &body, &impl->cf_node, NULL);
+      specialize_g17p_equiv_copy(&fast_copy, all_mask, probes, v0, num_probes);
+      b.cursor = nir_cf_reinsert(&fast_copy, b.cursor);
+   }
+   nir_push_else(&b, nif);
+   {
+      for (unsigned i = 0; i < nr_samples; ++i) {
+         nir_def *sample_mask = nir_imm_intN_t(&b, BITFIELD_BIT(i), 16);
+         nir_cf_list slow_copy;
+         nir_cf_list_clone(&slow_copy, &body, &impl->cf_node, NULL);
+         specialize_g17p_equiv_copy(&slow_copy, sample_mask, probes,
+                                    i == 0 ? v0 : NULL, num_probes);
+         b.cursor = nir_cf_reinsert(&slow_copy, b.cursor);
+      }
+   }
+   nir_pop_if(&b, nif);
+
+   nir_cf_delete(&body);
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
 static bool movable_zs_source(nir_def *def);
 
 /* Conservative set of bits a target can affect. Per-sample lowering ends
