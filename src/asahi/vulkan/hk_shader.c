@@ -1061,24 +1061,28 @@ m5_offset_aligned(nir_scalar s, uint32_t mask, unsigned depth)
    if (!depth || s.def->bit_size != 32 || !nir_scalar_is_alu(s))
       return false;
    const nir_op op = nir_scalar_alu_op(s);
-   if (op == nir_op_mov)
-      return m5_offset_aligned(nir_scalar_chase_alu_src(s, 0), mask, depth - 1);
-   nir_scalar x = nir_scalar_chase_alu_src(s, 0);
-   nir_scalar y;
    switch (op) {
-   case nir_op_iadd: case nir_op_isub: case nir_op_ior: case nir_op_ixor:
-      y = nir_scalar_chase_alu_src(s, 1);
+   case nir_op_mov:
+      return m5_offset_aligned(nir_scalar_chase_alu_src(s, 0), mask, depth - 1);
+   case nir_op_iadd: case nir_op_isub: case nir_op_ior: case nir_op_ixor: {
+      nir_scalar x = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar y = nir_scalar_chase_alu_src(s, 1);
       return m5_offset_aligned(x, mask, depth - 1) &&
              m5_offset_aligned(y, mask, depth - 1);
-   case nir_op_imul: case nir_op_amul: case nir_op_iand:
-      y = nir_scalar_chase_alu_src(s, 1);
+   }
+   case nir_op_imul: case nir_op_amul: case nir_op_iand: {
+      nir_scalar x = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar y = nir_scalar_chase_alu_src(s, 1);
       return m5_offset_aligned(x, mask, depth - 1) ||
              m5_offset_aligned(y, mask, depth - 1);
-   case nir_op_ishl:
-      y = nir_scalar_chase_alu_src(s, 1);
+   }
+   case nir_op_ishl: {
+      nir_scalar x = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar y = nir_scalar_chase_alu_src(s, 1);
       return nir_scalar_is_const(y) &&
              m5_offset_aligned(x, mask >> (nir_scalar_as_uint(y) & 31),
                                depth - 1);
+   }
    case nir_op_bcsel:
       return m5_offset_aligned(nir_scalar_chase_alu_src(s, 1), mask, depth - 1) &&
              m5_offset_aligned(nir_scalar_chase_alu_src(s, 2), mask, depth - 1);
@@ -1131,6 +1135,45 @@ struct m5_bounded_offset {
    uint32_t scale;
    bool valid;
 };
+
+static bool
+lower_aligned_uadd_sat_instr(nir_builder *b, nir_alu_instr *alu,
+                             UNUSED void *data)
+{
+   if (alu->op != nir_op_uadd_sat || alu->def.bit_size != 32 ||
+       alu->def.num_components != 1)
+      return false;
+
+   nir_scalar s0 = nir_scalar_resolved(alu->src[0].src.ssa, alu->src[0].swizzle[0]);
+   nir_scalar s1 = nir_scalar_resolved(alu->src[1].src.ssa, alu->src[1].swizzle[0]);
+   if (nir_scalar_is_const(s0) == nir_scalar_is_const(s1))
+      return false;
+
+   uint32_t k = nir_scalar_as_uint(nir_scalar_is_const(s0) ? s0 : s1);
+   nir_scalar term = nir_scalar_is_const(s0) ? s1 : s0;
+
+   b->cursor = nir_before_instr(&alu->instr);
+   if (k == 0) {
+      nir_def_replace(&alu->def, nir_mov_scalar(b, term));
+      return true;
+   }
+
+   uint32_t mask = UINT32_MAX >> (32 - util_last_bit(k));
+   if (!m5_offset_aligned(term, mask, 12))
+      return false;
+
+   nir_def *sum = nir_iadd(b, nir_mov_scalar(b, term), nir_imm_int(b, k));
+   nir_instr_as_alu(nir_def_instr(sum))->no_unsigned_wrap = true;
+   nir_def_replace(&alu->def, sum);
+   return true;
+}
+
+bool
+hk_nir_lower_aligned_uadd_sat(nir_shader *nir)
+{
+   return nir_shader_alu_pass(nir, lower_aligned_uadd_sat_instr,
+                              nir_metadata_control_flow, NULL);
+}
 
 static struct m5_bounded_offset
 m5_bounded_offset(nir_scalar s, unsigned depth)
@@ -1246,7 +1289,95 @@ static bool
 m5_word_reads_adjacent(const struct m5_word_read *a, const struct m5_word_read *b)
 {
    return m5_word_reads_same_record(a, b) &&
+          a->offset.constant <= UINT32_MAX - 4 &&
           b->offset.constant == a->offset.constant + 4;
+}
+
+/* Prove that r[0].offset_def + 4 * j does not wrap 32-bit unsigned arithmetic
+ * for any 0 <= j < count, so each merged lane's address and bounds_agx end
+ * uadd_sat(r[0].offset_def, 4 * (j + 1)) match its original separate load.
+ * Unbounded descriptor-relative loads (load_global_constant_offset) have no
+ * bounds check and wrapping past 4 GiB is out-of-bounds UB without robustness;
+ * robust loads and raw physical load_global / load_global_constant require the
+ * proof. */
+static bool
+m5_word_group_no_wrap(const struct m5_word_read *r, unsigned count)
+{
+   if (count <= 1 ||
+       r[0].load->intrinsic == nir_intrinsic_load_global_constant_offset)
+      return true;
+
+   const uint32_t c0 = r[0].offset.constant;
+   const uint32_t span = 4 * (count - 1);
+   const bool is_const = !r[0].offset.term.def || r[0].offset.scale == 0;
+
+   /* Constant-offset robust loads whose exclusive end exceeds UINT32_MAX
+    * evaluate to zero in lower_load_global_constant_offset_instr(), whereas
+    * merged loads saturate the end to UINT32_MAX (which passes if size is
+    * UINT32_MAX). Keep overflowing constant lanes separate. */
+   if (is_const) {
+      if (r[0].bound)
+         return c0 <= UINT32_MAX - 4 * count;
+      return c0 <= UINT32_MAX - span;
+   }
+
+   if (c0 <= UINT32_MAX - span) {
+      const uint32_t diff = c0 ^ (c0 + span);
+      const uint32_t mask = UINT32_MAX >> (32 - util_last_bit(diff));
+      const uint32_t scale = r[0].offset.scale;
+      const unsigned tz = util_last_bit(scale & -scale) - 1;
+      if (m5_offset_aligned(r[0].offset.term, mask >> tz, 12))
+         return true;
+   }
+
+   /* Even without power-of-two alignment, if the highest lane's offset is
+    * iadd.nuw(r[0].offset_def, span), or if r[0] and r[count - 1] are
+    * iadd.nuw(base, k0) and iadd.nuw(base, k0 + span) on the same base, then
+    * r[0].offset_def + span cannot wrap, and neither can any earlier lane. */
+   nir_scalar last = nir_scalar_resolved(r[count - 1].offset_def, 0);
+   if (is_op(last, nir_op_iadd) &&
+       nir_instr_as_alu(nir_def_instr(last.def))->no_unsigned_wrap) {
+      nir_scalar a = nir_scalar_chase_alu_src(last, 0);
+      nir_scalar b = nir_scalar_chase_alu_src(last, 1);
+      nir_scalar last_base;
+      uint32_t last_k;
+      if (nir_scalar_is_const(b)) {
+         last_base = a;
+         last_k = nir_scalar_as_uint(b);
+      } else if (nir_scalar_is_const(a)) {
+         last_base = b;
+         last_k = nir_scalar_as_uint(a);
+      } else {
+         return false;
+      }
+
+      nir_scalar first = nir_scalar_resolved(r[0].offset_def, 0);
+      if (nir_scalar_equal(last_base, first) && last_k == span)
+         return true;
+
+      if (is_op(first, nir_op_iadd) &&
+          nir_instr_as_alu(nir_def_instr(first.def))->no_unsigned_wrap) {
+         nir_scalar fa = nir_scalar_chase_alu_src(first, 0);
+         nir_scalar fb = nir_scalar_chase_alu_src(first, 1);
+         nir_scalar first_base;
+         uint32_t first_k;
+         if (nir_scalar_is_const(fb)) {
+            first_base = fa;
+            first_k = nir_scalar_as_uint(fb);
+         } else if (nir_scalar_is_const(fa)) {
+            first_base = fb;
+            first_k = nir_scalar_as_uint(fa);
+         } else {
+            return false;
+         }
+         if (nir_scalar_equal(last_base, first_base) &&
+             first_k <= UINT32_MAX - span &&
+             last_k == first_k + span)
+            return true;
+      }
+   }
+
+   return false;
 }
 
 /* Match a 64-bit address base + u2u64(offset) with a 32-bit offset. */
@@ -1303,34 +1434,38 @@ m5_has_mergeable_buffer_words(nir_shader *nir)
    return false;
 }
 
-/* M5: a structure read field by field (a light record in a loop) issues one
- * load per 32-bit word, each with its own address. Merge the reads of up to
- * four consecutive words at one base and offset term into one vector load.
+/* Merge up to four consecutive 32-bit reads of one record (one base, size and
+ * offset term) into a single vector load.
  *
- * Buffer reads address base + u2u64(X + c) with a 32-bit offset, so the words
- * of one vector load differ from their separate reads only where X + c wraps
- * 2^32. Such an offset lies past the end of any buffer: undefined without
- * robustness, and zeroed by the robust forms here. A robust read (soft fault:
- * load, then zero the word when its end lies past the descriptor's byte size)
- * keeps each word's own check:
+ * Buffer reads address base + u2u64(offset) with a 32-bit offset. Unbounded
+ * descriptor-relative reads (load_global_constant_offset) have undefined
+ * behavior if a 32-bit offset wraps past 4 GiB; robust reads and raw physical
+ * load_global / load_global_constant require a proof (m5_word_group_no_wrap)
+ * that start + 4 * j cannot wrap 2^32 for any lane j < count, so every lane's
+ * 64-bit address and exclusive-end check
  *
  *    word j of a load at X: bounds_agx(v.j, uadd_sat(X, 4 * (j + 1)), size)
  *
- * which is exact, except that a word whose offset wraps is now zeroed instead
- * of read at its wrapped offset. Only such a word's address differs from its
- * separate read, and soft fault covers it. */
-static bool
-m5_merge_buffer_words(nir_shader *nir)
+ * are exact matches for the original separate loads. */
+struct m5_word_replace {
+   nir_intrinsic_instr *load;
+   nir_def *word;
+};
+
+bool
+hk_nir_merge_buffer_words(nir_shader *nir)
 {
    bool any = false;
-   struct util_dynarray reads;
+   struct util_dynarray reads, replacements;
    util_dynarray_init(&reads, NULL);
+   util_dynarray_init(&replacements, NULL);
    nir_foreach_function_impl(impl, nir) {
       bool progress = false;
       nir_index_ssa_defs(impl);
       nir_index_instrs(impl);
       nir_foreach_block(block, impl) {
          util_dynarray_clear(&reads);
+         util_dynarray_clear(&replacements);
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
                continue;
@@ -1383,7 +1518,8 @@ m5_merge_buffer_words(nir_shader *nir)
             for (unsigned i = g; i < g_end && nr_units < ARRAY_SIZE(units);) {
                unsigned count = 1;
                while (i + count < g_end && count < 4 &&
-                      m5_word_reads_adjacent(&r[i + count - 1], &r[i + count]))
+                      m5_word_reads_adjacent(&r[i + count - 1], &r[i + count]) &&
+                      m5_word_group_no_wrap(&r[i], count + 1))
                   count++;
                while (count > 1) {
                   unsigned first = i, last = i;
@@ -1456,15 +1592,26 @@ m5_merge_buffer_words(nir_shader *nir)
                      nir_def *end = nir_uadd_sat(&b, x, nir_imm_int(&b, 4 * (j + 1)));
                      word = nir_bounds_agx(&b, word, end, r[i].bound);
                   }
-                  nir_def_replace(&r[i + j].load->def, word);
+                  struct m5_word_replace rep = {
+                     .load = r[i + j].load,
+                     .word = word,
+                  };
+                  util_dynarray_append(&replacements, rep);
                }
             }
             progress = true;
             g = g_end;
          }
+         /* Apply replacements after all groups in the block are emitted so
+          * cached bound/offset definitions from earlier groups stay live and
+          * get rewritten cleanly to their merged results. */
+         util_dynarray_foreach(&replacements, struct m5_word_replace, rep) {
+            nir_def_replace(&rep->load->def, rep->word);
+         }
       }
       any |= nir_progress(progress, impl, nir_metadata_control_flow);
    }
+   util_dynarray_fini(&replacements);
    util_dynarray_fini(&reads);
    return any;
 }
@@ -3446,9 +3593,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
 
       if (global_loads.storage_result_select && global_loads.soft_fault &&
           m5_has_mergeable_buffer_words(nir)) {
+         /* Lower provably non-overflowing uadd_sat(aligned, k) before CSE
+          * and word merging so robust structured-buffer fields coalesce. */
+         NIR_PASS(_, nir, hk_nir_lower_aligned_uadd_sat);
          /* Reads of one descriptor share its base and size only after CSE. */
          NIR_PASS(_, nir, nir_opt_cse);
-         NIR_PASS(_, nir, m5_merge_buffer_words);
+         NIR_PASS(_, nir, hk_nir_merge_buffer_words);
       }
    } else if (lowered_push_const) {
       NIR_PASS(_, nir, nir_opt_copy_prop);
@@ -3459,6 +3609,10 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
             lower_load_global_constant_offset_instr, nir_metadata_none,
             &global_loads);
+
+   if (global_loads.soft_fault) {
+      NIR_PASS(_, nir, hk_nir_lower_aligned_uadd_sat);
+   }
 
    bool lowered_shared_io = false;
    if (nir->info.stage == MESA_SHADER_TASK || nir->info.stage == MESA_SHADER_MESH) {
