@@ -11165,6 +11165,7 @@ hk_vs_link_key_build(struct hk_device *dev, struct hk_shader *sw_vs, bool hw,
                      enum agx_index_size index_size, bool restart,
                      const struct vk_vertex_input_state *vi,
                      const uint16_t *vi_binding_strides,
+                     VkPipelineRobustnessBufferBehaviorEXT vi_robustness,
                      struct hk_fast_link_key_vs *key)
 {
    *key = (struct hk_fast_link_key_vs){
@@ -11174,14 +11175,8 @@ hk_vs_link_key_build(struct hk_device *dev, struct hk_shader *sw_vs, bool hw,
                                  : 0) +
                              (sw_vs->info.agx3_gen1_fragment_rq ? 168 : 0),
 
-      /* FIXME: handle pipeline robustness "properly" */
       .prolog.robustness.level =
-         (dev->vk.enabled_features.robustBufferAccess2 ||
-          dev->vk.enabled_features.pipelineRobustness)
-            ? AGX_ROBUSTNESS_D3D
-         : dev->vk.enabled_features.robustBufferAccess
-            ? AGX_ROBUSTNESS_GL
-            : AGX_ROBUSTNESS_DISABLED,
+         hk_vertex_robustness_level(dev, sw_vs, vi_robustness),
       .prolog.robustness.soft_fault = agx_has_soft_fault(&dev->dev),
       .prolog.static_vi = !sw_vs->info.vs.use_prolog,
    };
@@ -11285,7 +11280,8 @@ hk_fill_fast_link_key_vs(struct hk_cmd_buffer *cmd, struct hk_shader *sw_vs,
    hk_vs_link_key_build(hk_cmd_buffer_device(cmd), sw_vs, sw_vs == hw_vs,
                         vk_topology_to_mesa(dyn->ia.primitive_topology),
                         indexed, index_size, restart, dyn->vi,
-                        dyn->vi_binding_strides, key);
+                        dyn->vi_binding_strides, dyn->vertex_input_robustness,
+                        key);
    hk_uvs_fs_masks(cmd, sw_vs, &key->uvs_flat, &key->uvs_linear);
 }
 
@@ -11785,24 +11781,28 @@ hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs_api,
 
    struct hk_shader *hw = &vs_api->variants[HK_VS_VARIANT_HW];
    if (hw_program && hw->compiled && !hw->info.vs.attribs_read) {
-      hk_vs_link_key_build(dev, hw, true, MESA_PRIM_TRIANGLES, false,
-                           AGX_INDEX_SIZE_U32, false, &no_vi, no_strides,
-                           &key);
+      hk_vs_link_key_build(
+         dev, hw, true, MESA_PRIM_TRIANGLES, false, AGX_INDEX_SIZE_U32, false,
+         &no_vi, no_strides,
+         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT, &key);
       hk_get_fast_linked(dev, hw, &key);
    }
 
    struct hk_shader *sw = &vs_api->variants[HK_VS_VARIANT_SW];
    if (sw_program && sw->compiled && !sw->info.vs.attribs_read) {
-      hk_vs_link_key_build(dev, sw, false, MESA_PRIM_TRIANGLES, false,
-                           AGX_INDEX_SIZE_U32, false, &no_vi, no_strides,
-                           &key);
+      hk_vs_link_key_build(
+         dev, sw, false, MESA_PRIM_TRIANGLES, false, AGX_INDEX_SIZE_U32, false,
+         &no_vi, no_strides,
+         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT, &key);
       hk_get_fast_linked(dev, sw, &key);
 
       const enum agx_index_size sizes[] = {
          AGX_INDEX_SIZE_U8, AGX_INDEX_SIZE_U16, AGX_INDEX_SIZE_U32};
       for (unsigned i = 0; i < ARRAY_SIZE(sizes); ++i) {
-         hk_vs_link_key_build(dev, sw, false, MESA_PRIM_TRIANGLES, true,
-                              sizes[i], false, &no_vi, no_strides, &key);
+         hk_vs_link_key_build(
+            dev, sw, false, MESA_PRIM_TRIANGLES, true, sizes[i], false, &no_vi,
+            no_strides,
+            VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT, &key);
          hk_get_fast_linked(dev, sw, &key);
       }
    }
@@ -12338,11 +12338,15 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       (linked_prolog->adjacency || !linked_prolog->hw) &&
       linked_prolog->sw_index_size_B !=
          (draw.indexed ? agx_index_size_to_B(draw.index_size) : 0);
+   const bool vi_robustness_changed =
+      !native_mesh &&
+      linked_prolog->robustness.level !=
+         hk_vertex_robustness_level(dev, sw_vs, dyn->vertex_input_robustness);
 
    if (!native_mesh && (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
         IS_DIRTY(VI_BINDING_STRIDES) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
         vgt_dirty || !gfx->fast_link_vs.valid || sw_index_size_changed ||
-        hk_fast_link_vs_uvs_stale(cmd, sw_vs))) {
+        vi_robustness_changed || hk_fast_link_vs_uvs_stale(cmd, sw_vs))) {
       struct hk_fast_link_key_vs key;
       hk_fill_fast_link_key_vs(cmd, sw_vs, hw_vs, draw.indexed,
                                draw.index_size, draw.restart, &key);
@@ -13217,9 +13221,12 @@ hk_needs_index_robustness(struct hk_cmd_buffer *cmd, struct agx_draw *draw,
          return true;
    }
 
-   if (!(dev->vk.enabled_features.robustBufferAccess ||
-         dev->vk.enabled_features.robustBufferAccess2 ||
-         dev->vk.enabled_features.pipelineRobustness))
+   const struct hk_api_shader *api_vs = gfx->shaders[MESA_SHADER_VERTEX];
+   const struct hk_shader *vs =
+      api_vs ? &api_vs->variants[HK_VS_VARIANT_HW] : NULL;
+   if (hk_vertex_robustness_level(
+          dev, vs, cmd->vk.dynamic_graphics_state.vertex_input_robustness) ==
+       AGX_ROBUSTNESS_DISABLED)
       return false;
 
    /* A conditionally lowered direct draw has an immutable indirect record:

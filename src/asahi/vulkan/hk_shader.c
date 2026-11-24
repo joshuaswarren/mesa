@@ -1001,6 +1001,8 @@ hk_hash_graphics_state(struct vk_physical_device *device,
       struct hk_vs_key key;
       hk_populate_vs_key(&key, state);
       _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
+      _mesa_blake3_update(&blake3_ctx, &state->vertex_input_robustness,
+                          sizeof(state->vertex_input_robustness));
    }
 
    if (state && (stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
@@ -8099,6 +8101,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   const struct agx_m5_mesh_varyings *mesh_fs,
                   bool no_default_layer, bool mesh_default_layer,
                   int vs_covers, bool m5_no_grid_record,
+                  bool twin_has_vertex_robustness,
                   struct hk_byte_stencil_candidate *bs_cand,
                   nir_shader *lr_nir,
                   const struct hk_local_read_info *lr_info_in,
@@ -8998,9 +9001,16 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   shader->info.vs.attrib_components_read);
 
          if (sw_stage == MESA_SHADER_VERTEX) {
+            const bool has_vertex_robustness =
+               vk_features != NULL || twin_has_vertex_robustness;
             shader->info.vs.use_prolog = !(key && key->vs.skip_prolog);
             shader->info.vs.attribs_read =
                nir->info.inputs_read >> VERT_ATTRIB_GENERIC0;
+            shader->info.vs.has_vertex_robustness = has_vertex_robustness;
+            shader->info.vs.vertex_robustness =
+               has_vertex_robustness
+                  ? hk_vertex_robustness_from_vk(info->robustness->vertex_inputs)
+                  : AGX_ROBUSTNESS_DISABLED;
 
             if (shader->info.vs.use_prolog) {
                NIR_PASS(_, clone, agx_nir_lower_vs_input_to_prolog);
@@ -9018,24 +9028,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
                struct agx_robustness agx_rs = {
                   .soft_fault = agx_has_soft_fault(&dev->dev),
-
-                  /* Correctly handling GPL + pipeline-robustness requires
-                   * runtime changes, so derive the level from the enabled
-                   * device features exactly as the vertex prolog does
-                   * (hk_cmd_draw.c:3200-3208) rather than pessimising every
-                   * pipeline to D3D.  Hardcoding D3D here made every vertex
-                   * fetch emit an out-of-bounds select even when the
-                   * application never asked for robustness; the two paths
-                   * must agree anyway, since a monolithic VS and a prologue
-                   * fetch the same attributes.
-                   */
-                  .level =
-                     (dev->vk.enabled_features.robustBufferAccess2 ||
-                      dev->vk.enabled_features.pipelineRobustness)
-                        ? AGX_ROBUSTNESS_D3D
-                     : dev->vk.enabled_features.robustBufferAccess
-                        ? AGX_ROBUSTNESS_GL
-                        : AGX_ROBUSTNESS_DISABLED,
+                  .level = hk_vertex_robustness_level(
+                     dev, shader,
+                     VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT),
                };
 
                if (agx_chip_native_or_m5(dev->dev.chip))
@@ -9192,8 +9187,8 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
 
    VkResult result = hk_compile_shader_impl(dev, info, state, features,
                                             allocator, NULL, NULL, false, false,
-                                            -1, false, bs_ptr, NULL, NULL,
-                                            false, shader_out);
+                                            -1, false, false, bs_ptr, NULL,
+                                            NULL, false, shader_out);
    if (bs_cand.tiled_nir)
       ralloc_free(bs_cand.tiled_nir);
    return result;
@@ -9227,10 +9222,14 @@ hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
    const bool has_ia =
       obj->vk.stage == MESA_SHADER_FRAGMENT &&
       obj->variants[0].info.fs.has_input_attachments;
+   const bool twin_has_vertex_robustness =
+      obj->vk.stage == MESA_SHADER_VERTEX &&
+      obj->variants[HK_VS_VARIANT_HW].info.vs.has_vertex_robustness;
    VkResult result = hk_compile_shader_impl(dev, &info, NULL, NULL, NULL, src,
                                             mesh_fs, false, false, -1,
-                                            m5_no_grid_record, NULL, NULL, NULL,
-                                            has_ia, &shader);
+                                            m5_no_grid_record,
+                                            twin_has_vertex_robustness, NULL,
+                                            NULL, NULL, has_ia, &shader);
    *built = result == VK_SUCCESS ? shader : NULL;
    return result;
 }
@@ -9745,7 +9744,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                                 NULL, NULL, no_default_layer,
                                 mesh_default_layer &&
                                    infos[i].stage == MESA_SHADER_MESH,
-                                vs_covers[i], no_grid_record,
+                                vs_covers[i], no_grid_record, false,
                                 bs_cands[i].tiled_nir ? &bs_cands[i] : NULL,
                                 lr_nirs[i], &lr_infos[i], has_ias[i],
                                 (struct hk_api_shader **)&shaders_out[i]);
