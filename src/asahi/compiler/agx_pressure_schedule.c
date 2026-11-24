@@ -158,6 +158,7 @@ instr_mem_space(const agx_instr *I)
    case AGX_OPCODE_LOCAL_STORE:
    case AGX_OPCODE_LOCAL_ATOMIC:
       return SCHED_MEM_LOCAL;
+   case AGX_OPCODE_STACK_ADJUST:
    case AGX_OPCODE_STACK_LOAD:
    case AGX_OPCODE_STACK_STORE:
       return SCHED_MEM_STACK;
@@ -1881,22 +1882,20 @@ agx_ilp_schedule(agx_context *ctx)
          }
          continue;
       }
-      /* The old ALU-only classifier predates native SCS traversal. On M5,
-       * treat every ordered memory operation and completion barrier as
-       * memory, keeping RT polling out of the ALU loop scheduling policy. */
-      bool m5_ordered_memory = false;
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
-         agx_foreach_instr_in_block(block, I) {
-            const enum agx_schedule_class cls =
-               agx_opcodes_info[I->op].schedule_class;
-            m5_ordered_memory |= cls == AGX_SCHEDULE_CLASS_LOAD ||
-                                  cls == AGX_SCHEDULE_CLASS_STORE ||
-                                  cls == AGX_SCHEDULE_CLASS_ATOMIC ||
-                                  cls == AGX_SCHEDULE_CLASS_BARRIER;
-         }
+      /* Treat every ordered memory operation and barrier as memory across all
+       * generations so pure-ALU loop scheduling never reorders protocol/helper
+       * barriers, stack adjustments, or RT polling blocks. */
+      bool ordered_memory = false;
+      agx_foreach_instr_in_block(block, I) {
+         const enum agx_schedule_class cls =
+            agx_opcodes_info[I->op].schedule_class;
+         ordered_memory |= cls == AGX_SCHEDULE_CLASS_LOAD ||
+                           cls == AGX_SCHEDULE_CLASS_STORE ||
+                           cls == AGX_SCHEDULE_CLASS_ATOMIC ||
+                           cls == AGX_SCHEDULE_CLASS_BARRIER;
       }
       if (in_loop[block->index] && !ilp_block_has_memory(block) &&
-          !m5_ordered_memory) {
+          !ordered_memory) {
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, AGX_ILP_SLACK, 0, NULL, is_agx3,
                             false, 0, 0, false, false, false, &dag_state);
