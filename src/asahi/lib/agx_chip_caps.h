@@ -61,6 +61,15 @@ enum agx_chip_cap {
 
    /* VK_EXT_descriptor_buffer is hardware-qualified on this chip. */
    AGX_CAP_DESCRIPTOR_BUFFER = 1u << 9,
+
+   /* Borealis may coalesce small pure-global direct compute workgroups (<= 256
+    * invocations, multiple of 32, proven independent of workgroup shape) into
+    * larger power-of-two hardware workgroups (up to 256 threads, or 512 for
+    * short low-register loop-free shaders) to avoid the AGX3 CDM per-workgroup
+    * launch-rate floor on large grids. Measured and qualified on G17P
+    * (HAL200); off on M5 (G17G/G17S/G17C), G15, G16, G18G, and AGX2 until
+    * per-generation hardware A/B and CTS rows are collected. */
+   AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS = 1u << 10,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -75,7 +84,8 @@ enum agx_chip_cap {
 #define AGX_CAPS_G17P                                                          \
    (AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                                \
     AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |                                        \
-    AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_RESIDENCY_3D)
+    AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_RESIDENCY_3D |      \
+    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \

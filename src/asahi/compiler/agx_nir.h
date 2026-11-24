@@ -110,6 +110,7 @@ bool agx_nir_opt_shared_byte_offsets(struct nir_shader *s);
 bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget,
                       bool cap_rt_compute);
 bool agx_nir_opt_monotonic_bit_insert(struct nir_shader *shader);
+bool agx_nir_opt_iv_divmod(struct nir_shader *shader);
 bool agx_nir_lower_fminmax(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_fminmax_signed_zero(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_word_bounds(struct nir_shader *s);
@@ -399,4 +400,5 @@ bool agx_nir_lower_integer_division(struct nir_shader *nir,
                                     bool forms_preamble);
 bool agx_nir_has_loop(const struct nir_shader *nir);
 bool agx_nir_limit_heavy_branch_unroll(struct nir_shader *nir);
+bool agx_nir_opt_u8x4_hsum(struct nir_shader *shader);
 bool agx_nir_opt_unswitch_affine_bounds(struct nir_shader *shader);

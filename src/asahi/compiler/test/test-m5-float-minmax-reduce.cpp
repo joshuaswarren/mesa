@@ -15,7 +15,7 @@ extern "C" {
 
 namespace {
 
-enum lowering { M5, M5_FTZ32, M5_FTZ16, M5_NO_MINMAX, G17P, AGX2 };
+enum lowering { M5, M5_FTZ32, M5_PRESERVE32, M5_FTZ16, M5_NO_MINMAX, G17P, G17P_FTZ32, G17P_PRESERVE32, AGX2 };
 
 struct op_case {
    nir_intrinsic_op intrinsic;
@@ -45,16 +45,26 @@ kept(struct op_case c, mesa_shader_stage stage, enum lowering l)
       agx_nir_lower_subgroups_m5(b.shader, true, true);
       break;
    case M5_FTZ32:
+   case M5_PRESERVE32:
    case M5_FTZ16:
       b.shader->info.float_controls_execution_mode =
          l == M5_FTZ32 ? FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32
-                       : FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP16;
+         : l == M5_PRESERVE32 ? FLOAT_CONTROLS_DENORM_PRESERVE_FP32
+                              : FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP16;
       agx_nir_lower_subgroups_m5(b.shader, true, true);
       break;
    case M5_NO_MINMAX:
       agx_nir_lower_subgroups_m5(b.shader, true, false);
       break;
    case G17P:
+   case G17P_FTZ32:
+   case G17P_PRESERVE32:
+      if (l == G17P_FTZ32)
+         b.shader->info.float_controls_execution_mode =
+            FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32;
+      else if (l == G17P_PRESERVE32)
+         b.shader->info.float_controls_execution_mode =
+            FLOAT_CONTROLS_DENORM_PRESERVE_FP32;
       agx_nir_lower_subgroups_g17p(b.shader);
       break;
    case AGX2:
@@ -120,10 +130,14 @@ TEST(M5FloatMinMaxReduce, EverythingElseIsLowered)
       /* 32-bit denormals flushed, other stages, the option off (G18), other
        * targets. */
       EXPECT_FALSE(kept(full, MESA_SHADER_COMPUTE, M5_FTZ32));
+      EXPECT_FALSE(kept(full, MESA_SHADER_COMPUTE, M5_PRESERVE32));
       EXPECT_FALSE(kept(full, MESA_SHADER_FRAGMENT, M5));
       EXPECT_FALSE(kept(full, MESA_SHADER_VERTEX, M5));
       EXPECT_FALSE(kept(full, MESA_SHADER_COMPUTE, M5_NO_MINMAX));
-      EXPECT_FALSE(kept(full, MESA_SHADER_COMPUTE, G17P));
+      EXPECT_TRUE(kept(full, MESA_SHADER_COMPUTE, G17P));
+      EXPECT_FALSE(kept(full, MESA_SHADER_COMPUTE, G17P_FTZ32));
+      EXPECT_FALSE(kept(full, MESA_SHADER_COMPUTE, G17P_PRESERVE32));
+      EXPECT_FALSE(kept(full, MESA_SHADER_FRAGMENT, G17P));
       EXPECT_FALSE(kept(full, MESA_SHADER_COMPUTE, AGX2));
    }
 }

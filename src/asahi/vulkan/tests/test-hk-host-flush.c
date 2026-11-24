@@ -1,10 +1,12 @@
 /* Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * Host availability deferred to the end of the submission: which dependencies
- * ask for the memory-scoped flush, that recording one creates no stream, and
- * what the flush that ends the submission waits for, through the real
- * hk_sync resolver. No Vulkan device, DRM or GPU.
+ * Host availability: which dependencies ask for the memory-scoped flush,
+ * when the open compute stream takes it at the dependency, that deferring it
+ * creates no stream, and what the flush that ends the submission waits for,
+ * through the real hk_sync resolver; and the streams and lists of the
+ * flush-only compute commands a queue builds itself. No Vulkan device, DRM or
+ * GPU.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +15,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
 #include "hk_queue.h"
+#include "hk_queue_flush.h"
 
 static unsigned tests, failures;
 static void *ctx;
@@ -68,6 +71,23 @@ add(struct hk_cmd_buffer *c, bool compute)
    return s;
 }
 
+/* An open compute stream holding a dispatch or copy, as recording one
+ * leaves it. */
+static struct hk_cs *
+open_compute(struct hk_cmd_buffer *c)
+{
+   struct hk_cs *s = add(c, true);
+   s->stats.cmds = 1;
+   c->current_cs.cs = s;
+   return s;
+}
+
+static void
+set_chip(struct hk_cmd_buffer *c, enum agx_chip chip)
+{
+   ((struct hk_device *)c->vk.base.device)->dev.chip = chip;
+}
+
 static VkMemoryBarrier2
 mem(VkPipelineStageFlags2 src, VkAccessFlags2 src_access,
     VkPipelineStageFlags2 dst, VkAccessFlags2 dst_access)
@@ -92,14 +112,15 @@ dep(const VkMemoryBarrier2 *b, uint32_t count)
 }
 
 /* What vkCmdPipelineBarrier2 records outside a render pass on G17P and M5,
- * for the synchronization state. */
-static void
+ * for the synchronization state: the stream it records the host flush in,
+ * or NULL. */
+static struct hk_cs *
 pipeline_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info)
 {
    uint8_t src, dst;
    hk_sync_dependency_kinds(info, false, &src, &dst);
    hk_sync_barrier(cmd, src, dst);
-   hk_sync_defer_host_flush(cmd, info);
+   return hk_sync_host_flush(cmd, info);
 }
 
 struct flush {
@@ -127,7 +148,7 @@ submit(struct hk_queue *q, struct hk_cmd_buffer **cmds, unsigned n, bool chain)
    f.ok = hk_sync_resolve_submit(q, cmds, n, false, chain, 0, NULL);
    f.barrier[0] = f.barrier[1] = NONE;
    if (f.ok && f.kinds)
-      f.ok = hk_sync_host_flush_prefix(&q->sync, f.kinds, chain, base, count,
+      f.ok = hk_sync_host_flush_prefix(&q->sync, f.kinds, base, count,
                                        f.barrier, f.prior);
    f.cdm_after = q->sync.submitted[HK_SYNC_CDM];
    return f;
@@ -413,23 +434,81 @@ test_render_barrier_render(bool exact)
            : next->sync.barrier[HK_SYNC_VDM] == 0);
 }
 
-/* Device write to host read in compute: the flush follows the dispatch. */
+/* A render, then a copy in the open compute stream and TRANSFER_WRITE ->
+ * HOST_READ: the copy's command ends with the flush, and the submission sends
+ * the render and the copy only, as before host flushes were deferred. */
 static void
-test_compute_write_host_read(void)
+test_copy_host_read_in_stream(void)
 {
    struct hk_queue *q = new_queue(true);
    struct hk_cmd_buffer *c = new_cmd();
    add(c, false);
-   add(c, true);
-   const VkMemoryBarrier2 b = mem(CS, S_W, HOST, H_R);
+   struct hk_cs *copy = open_compute(c);
+   const VkMemoryBarrier2 b = mem(XFER, T_W, HOST, H_R);
    const VkDependencyInfo d = dep(&b, 1);
-   pipeline_barrier(c, &d);
+   T("TRANSFER_WRITE -> HOST_READ: the copy's stream takes the flush",
+     pipeline_barrier(c, &d) == copy);
+   T("nothing deferred", c->sync.host_flush_kinds == 0);
+   T("no stream created", list_length(&c->control_streams) == 2);
    struct hk_cmd_buffer *cmds[] = {c};
    const struct flush f = submit(q, cmds, 1, false);
-   T("SHADER_WRITE -> HOST_READ flushes", f.ok && f.kinds == HK_SYNC_COMPUTE);
-   T("flush follows the dispatch", f.barrier[HK_SYNC_CDM] == 1);
-   T("flush does not wait on the render",
-     f.barrier[HK_SYNC_VDM] == NONE && f.prior[HK_SYNC_VDM] == 0);
+   T("submission sends no flush command of its own",
+     f.ok && f.kinds == 0 && f.cdm_after == 1);
+   T("the copy keeps its waits",
+     copy->sync.barrier[HK_SYNC_VDM] == NONE &&
+        copy->sync.prior[HK_SYNC_VDM] == 0);
+
+   /* SHADER_WRITE -> HOST_READ after a dispatch in the same stream. */
+   q = new_queue(true);
+   c = new_cmd();
+   add(c, false);
+   struct hk_cs *dispatch = open_compute(c);
+   const VkMemoryBarrier2 cs = mem(CS, S_W, HOST, H_R);
+   const VkDependencyInfo dc = dep(&cs, 1);
+   T("SHADER_WRITE -> HOST_READ: the dispatch's stream takes the flush",
+     pipeline_barrier(c, &dc) == dispatch && c->sync.host_flush_kinds == 0);
+}
+
+/* Where the open compute stream cannot take the flush, it is deferred, and
+ * the flush ending the submission follows the submission's last command on
+ * each subqueue: behind a render it never names no render. */
+static void
+test_deferred_behind_render(void)
+{
+   const VkMemoryBarrier2 b = mem(CS, S_W, HOST, H_R);
+   const VkDependencyInfo d = dep(&b, 1);
+
+   /* A dispatch whose stream a render then closed. */
+   struct hk_queue *q = new_queue(true);
+   struct hk_cmd_buffer *c = new_cmd();
+   open_compute(c);
+   c->current_cs.cs = NULL;
+   add(c, false);
+   T("closed stream: deferred", !pipeline_barrier(c, &d) &&
+                                   c->sync.host_flush_kinds == HK_SYNC_COMPUTE);
+   struct hk_cmd_buffer *cmds[] = {c};
+   const struct flush f = submit(q, cmds, 1, false);
+   T("flush follows the dispatch", f.ok && f.barrier[HK_SYNC_CDM] == 1);
+   T("flush follows the submission's render",
+     f.barrier[HK_SYNC_VDM] == 1 && f.prior[HK_SYNC_VDM] == 0);
+
+   /* An open stream with no work yet would become a flush-only command. */
+   c = new_cmd();
+   add(c, false);
+   struct hk_cs *empty = add(c, true);
+   c->current_cs.cs = empty;
+   T("empty open stream: deferred", !pipeline_barrier(c, &d) &&
+                                       c->sync.host_flush_kinds &&
+                                       empty->stats.cmds == 0);
+
+   /* A first scope whose latest stream follows the open one. */
+   c = new_cmd();
+   open_compute(c);
+   add(c, false);
+   const VkMemoryBarrier2 all = mem(ALL_CMDS, M_W, HOST, H_R);
+   const VkDependencyInfo da = dep(&all, 1);
+   T("render after the open stream: deferred",
+     !pipeline_barrier(c, &da) && c->sync.host_flush_kinds == HK_SYNC_ALL);
 
    /* Inputs on the first command only: the flush follows it too. */
    q = new_queue(true);
@@ -441,6 +520,35 @@ test_compute_write_host_read(void)
    const struct flush g = submit(q, cmds, 1, true);
    T("chained flush follows the first command",
      g.ok && g.barrier[HK_SYNC_VDM] == 1 && g.barrier[HK_SYNC_CDM] == 1);
+}
+
+/* A render before the open compute stream, then COLOR_WRITE -> HOST_READ:
+ * the stream takes the flush and waits for the render, unless on M5 that
+ * would make the work it holds wait for a render it did not wait for. */
+static void
+test_render_scope_in_stream(void)
+{
+   const VkMemoryBarrier2 b = mem(COLOR, C_W, HOST, H_R);
+   const VkDependencyInfo d = dep(&b, 1);
+
+   struct hk_queue *q = new_queue(true);
+   struct hk_cmd_buffer *c = new_cmd();
+   set_chip(c, AGX_CHIP_G17P);
+   struct hk_cs *r = add(c, false);
+   struct hk_cs *s = open_compute(c);
+   T("G17P: the open stream takes the flush", pipeline_barrier(c, &d) == s);
+   T("and waits for the render", s->sync.dep[HK_SYNC_VDM].cut == r);
+   struct hk_cmd_buffer *cmds[] = {c};
+   const struct flush f = submit(q, cmds, 1, false);
+   T("G17P: no flush command",
+     f.ok && f.kinds == 0 && s->sync.barrier[HK_SYNC_VDM] == 1);
+
+   c = new_cmd();
+   set_chip(c, AGX_CHIP_G17G);
+   add(c, false);
+   open_compute(c);
+   T("M5: deferred instead of delaying the stream's work",
+     !pipeline_barrier(c, &d) && c->sync.host_flush_kinds == HK_SYNC_GFX);
 }
 
 /* MEMORY_WRITE -> HOST_READ in a command buffer of its own, after a render
@@ -525,7 +633,7 @@ test_prefix(void)
    uint16_t barrier[2];
    uint64_t prior[2];
    T("ordinal overflow rejected",
-     !hk_sync_host_flush_prefix(&q->sync, HK_SYNC_COMPUTE, false, base, count,
+     !hk_sync_host_flush_prefix(&q->sync, HK_SYNC_COMPUTE, base, count,
                                 barrier, prior));
 
    q = new_queue(false);
@@ -533,15 +641,142 @@ test_prefix(void)
    const uint32_t some[2] = {0, 3};
    const uint64_t zero[2] = {0, 0};
    T("legacy prefix", hk_sync_host_flush_prefix(&q->sync, HK_SYNC_COMPUTE,
-                                                false, zero, some, barrier,
-                                                prior) &&
+                                                zero, some, barrier, prior) &&
                          barrier[HK_SYNC_VDM] == 0 &&
                          barrier[HK_SYNC_CDM] == 3 && !prior[0] && !prior[1]);
    q = new_queue(false);
    T("legacy prefix, nothing ran", hk_sync_host_flush_prefix(
-                                      &q->sync, HK_SYNC_ALL, false, zero,
-                                      count, barrier, prior) &&
+                                      &q->sync, HK_SYNC_ALL, zero, count,
+                                      barrier, prior) &&
                                       barrier[0] == NONE && barrier[1] == NONE);
+}
+
+/* The queue's own flush-only streams, in storage the BO cache returned with
+ * its last user's bytes: the record and the terminator, then the
+ * HK_CS_SPACE_PADDING bytes every stream keeps zero. */
+static void
+test_flush_stream_storage(void)
+{
+   static uint8_t storage[0x4000];
+   memset(storage, 0xa5, sizeof(storage));
+
+   /* The host flush record on G17P: the memory-scoped strong flush. */
+   const struct agx3_cdm_barrier_info info = {
+      .chip = AGX_CHIP_G17P,
+      .flags = 0x5,
+      .flush_memory = true,
+   };
+   uint8_t record[AGX3_CDM_BARRIER_SIZE];
+   uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
+   T("host flush record packs",
+     agx3_cdm_barrier_pack(&info, record) &&
+        agx3_cmdstream_load_le32(record) == UINT32_C(0x6000157c) &&
+        agx3_cdm_stream_terminate_pack(AGX_CHIP_G17P, terminate));
+
+   T("flush stream written into dirty storage",
+     hk_queue_flush_stream_write(AGX_CHIP_G17P, storage, sizeof(storage),
+                                 record, sizeof(record)));
+   T("stream is the record, then the terminator",
+     !memcmp(storage, record, sizeof(record)) &&
+        !memcmp(storage + sizeof(record), terminate, sizeof(terminate)));
+
+   const size_t end = sizeof(record) + sizeof(terminate);
+   bool zero = true;
+   for (size_t i = end; i < end + HK_CS_SPACE_PADDING; ++i)
+      zero &= storage[i] == 0;
+   T("padding after the terminator is cleared", zero);
+
+   T("storage without room for the padding is refused",
+     !hk_queue_flush_stream_write(AGX_CHIP_G17P, storage,
+                                  end + HK_CS_SPACE_PADDING - 1, record,
+                                  sizeof(record)));
+}
+
+/* The attachment set of each compute command of a payload, as the kernel
+ * applies them: a set stays in force until the next one. */
+static unsigned
+compute_attachment_sets(const struct util_dynarray *payload, unsigned *sets,
+                        unsigned max)
+{
+   unsigned current = 0, n = 0;
+   for (size_t at = 0; at < payload->size;) {
+      const struct drm_asahi_cmd_header *h =
+         (const void *)((const uint8_t *)payload->data + at);
+      if (h->cmd_type == DRM_ASAHI_SET_COMPUTE_ATTACHMENTS)
+         current = h->size / sizeof(struct drm_asahi_attachment);
+      else if (h->cmd_type == DRM_ASAHI_CMD_COMPUTE && n < max)
+         sets[n++] = current;
+      at += sizeof(*h) + h->size;
+   }
+   return n;
+}
+
+static void
+append_compute(struct util_dynarray *payload)
+{
+   const struct drm_asahi_cmd_header header = {
+      .cmd_type = DRM_ASAHI_CMD_COMPUTE,
+      .size = sizeof(struct drm_asahi_cmd_compute),
+      .vdm_barrier = NONE,
+      .cdm_barrier = NONE,
+   };
+   const struct drm_asahi_cmd_compute cmd = {0};
+   util_dynarray_append(payload, header);
+   util_dynarray_append(payload, cmd);
+}
+
+/* The lists a flush-only compute command declares, by chip. */
+static void
+test_flush_lists(void)
+{
+   struct util_dynarray p;
+   util_dynarray_init(&p, NULL);
+
+   /* A dispatch with two attachment spans, then a flush-only command. */
+   const struct drm_asahi_cmd_header set = {
+      .cmd_type = DRM_ASAHI_SET_COMPUTE_ATTACHMENTS,
+      .size = 2 * sizeof(struct drm_asahi_attachment),
+      .vdm_barrier = NONE,
+      .cdm_barrier = NONE,
+   };
+   const struct drm_asahi_attachment spans[2] = {
+      {.pointer = 0x100000, .size = 0x4000},
+      {.pointer = 0x200000, .size = 0x4000},
+   };
+   util_dynarray_append(&p, set);
+   util_dynarray_append_array(&p, struct drm_asahi_attachment, spans, 2);
+   append_compute(&p);
+   hk_queue_append_flush_lists(AGX_CHIP_G17P, 0, &p);
+   append_compute(&p);
+   unsigned sets[2] = {~0u, ~0u};
+   T("G17P: the flush declares an empty attachment set",
+     compute_attachment_sets(&p, sets, 2) == 2 && sets[0] == 2 &&
+        sets[1] == 0);
+
+   util_dynarray_clear(&p);
+   hk_queue_append_flush_lists(AGX_CHIP_G17G,
+                               DRM_ASAHI_FEATURE_COMPUTE_RESOURCES, &p);
+   const struct drm_asahi_cmd_header *h = p.data;
+   T("M5: an empty resource list, no attachment set",
+     p.size == sizeof(*h) && h->cmd_type == DRM_ASAHI_SET_COMPUTE_RESOURCES &&
+        h->size == 0);
+
+   util_dynarray_clear(&p);
+   hk_queue_append_flush_lists(AGX_CHIP_G17G, 0, &p);
+   T("M5 without resource lists: nothing", p.size == 0);
+
+   util_dynarray_clear(&p);
+   hk_queue_append_flush_lists(AGX_CHIP_G18G, 0, &p);
+   h = p.data;
+   T("G18G: an empty attachment set",
+     p.size == sizeof(*h) &&
+        h->cmd_type == DRM_ASAHI_SET_COMPUTE_ATTACHMENTS && h->size == 0);
+
+   util_dynarray_clear(&p);
+   hk_queue_append_flush_lists(AGX_CHIP_G13G, ~UINT64_C(0), &p);
+   T("AGX2: nothing", p.size == 0);
+
+   util_dynarray_fini(&p);
 }
 
 int
@@ -554,11 +789,15 @@ main(void)
    test_recording();
    test_render_barrier_render(true);
    test_render_barrier_render(false);
-   test_compute_write_host_read();
+   test_copy_host_read_in_stream();
+   test_deferred_behind_render();
+   test_render_scope_in_stream();
    test_memory_write_earlier_submission();
    test_chain_through_read_only_source();
    test_long_submission();
    test_prefix();
+   test_flush_stream_storage();
+   test_flush_lists();
    ralloc_free(ctx);
    printf("%u tests, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
