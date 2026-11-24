@@ -14285,10 +14285,8 @@ agx_nir_has_temp_vars(const nir_shader *nir)
 
 #ifndef NDEBUG
 static void
-agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p)
+agx_assert_post_lower_invariants(const nir_shader *nir)
 {
-   const bool defer_sincos = g17p && agx_nir_fma_rte_applies(nir);
-
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -14299,10 +14297,8 @@ agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p)
                assert(alu->op != nir_op_frexp_sig &&
                       alu->op != nir_op_frexp_exp &&
                       "post_lower requires frexp already lowered");
-               if (!defer_sincos) {
-                  assert(alu->op != nir_op_fsin && alu->op != nir_op_fcos &&
-                         "post_lower requires sincos already lowered");
-               }
+               assert(alu->op != nir_op_fsin && alu->op != nir_op_fcos &&
+                      "post_lower requires sincos already lowered");
             } else if (instr->type == nir_instr_type_intrinsic) {
                const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
                switch (intr->intrinsic) {
@@ -14412,12 +14408,8 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    if (!post_lower) {
       NIR_PASS(_, nir, nir_lower_flrp, 16 | 32 | 64, false);
-      /* When the explicit-RTE FMA repair applies, G17P lowers sin/cos in
-       * agx_compile_shader_nir after it, so the repair covers the shader's own
-       * FMAs only. Other shaders keep the lowering here. */
-      if (!g17p || !agx_nir_fma_rte_applies(nir))
-         NIR_PASS(_, nir, agx_lower_sincos,
-                  g17p ? 1 : (native_fragment_depth || g18g) ? 2 : 0);
+      NIR_PASS(_, nir, agx_lower_sincos,
+               g17p ? 1 : (native_fragment_depth || g18g) ? 2 : 0);
    }
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, agx_lower_front_face,
             nir_metadata_control_flow, NULL);
@@ -14444,7 +14436,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_dce);
 #ifndef NDEBUG
-      agx_assert_post_lower_invariants(nir, g17p);
+      agx_assert_post_lower_invariants(nir);
 #endif
    }
 
@@ -16481,9 +16473,6 @@ agx_prepare_preoptimized_epilog_nir(nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, agx_nir_lower_denorm_preserve);
-   if (key->dev.chip == AGX_CHIP_G17P ||
-       key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
-      NIR_PASS(_, nir, agx_nir_lower_fma_rte);
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
        key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
       NIR_PASS(_, nir, agx_nir_lower_f2bf_rtne);
@@ -16656,15 +16645,6 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
 
       NIR_PASS(_, nir, agx_nir_lower_denorm_preserve);
-      if (key->dev.chip == AGX_CHIP_G17P ||
-          key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
-         NIR_PASS(_, nir, agx_nir_lower_fma_rte);
-
-      /* Sin/cos that agx_preprocess_nir_g17p left for an explicit-RTE shader.
-       * Their reduction FMAs serve an absolute-error bound, which a tininess
-       * repair of at most 2^-126 cannot affect, so they are lowered after it.
-       * Every other shader has already lowered them. */
-      NIR_PASS(_, nir, agx_lower_sincos, 1);
 
       /* Late VBO lowering creates constant udiv instructions */
       bool idiv_lowered = false;

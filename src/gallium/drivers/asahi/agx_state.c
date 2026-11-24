@@ -4240,6 +4240,10 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
       NIR_PASS(_, nir, agx_nir_rebind_g17g_image_loads);
    NIR_PASS(_, nir, nir_lower_ssbo, NULL);
 
+   /* Before agx_preprocess_nir: only the shader's own strict FMAs take the
+    * explicit-RTE repair (agx_nir_lower_fma_rte()). */
+   NIR_PASS(_, nir, agx_nir_lower_fma_rte, dev->chip);
+
    if (agx_chip_g17_m5(dev->chip)) {
       /* agx3c's name for the same preprocessing mode (false, true), which
        * theirs exposed as agx_preprocess_nir_g17g(). */

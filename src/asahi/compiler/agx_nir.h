@@ -7,6 +7,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "asahi/lib/agx_chip.h"
 
 struct nir_shader;
 struct nir_instr;
@@ -362,8 +363,7 @@ bool agx_nir_lower_to_per_sample_agx2(struct nir_shader *shader);
 bool agx_nir_lower_monolithic_msaa_agx2(struct nir_shader *shader, uint8_t nr_samples);
 
 bool agx_nir_lower_denorm_preserve(struct nir_shader *shader);
-bool agx_nir_fma_rte_applies(const struct nir_shader *shader);
-bool agx_nir_lower_fma_rte(struct nir_shader *shader);
+bool agx_nir_lower_fma_rte(struct nir_shader *shader, enum agx_chip chip);
 struct nir_def *agx_nir_fma_rte_fixup(struct nir_builder *b, struct nir_def *a,
                                     struct nir_def *c, struct nir_def *z,
                                     struct nir_def *native);

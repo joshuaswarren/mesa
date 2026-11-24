@@ -117,23 +117,55 @@ static nir_def *
 lower(nir_builder *b, nir_instr *instr, void *data)
 {
    nir_alu_instr *alu = nir_instr_as_alu(instr);
-   return agx_nir_fma_rte_fixup(b, nir_ssa_for_alu_src(b, alu, 0),
-                                nir_ssa_for_alu_src(b, alu, 1),
-                                nir_ssa_for_alu_src(b, alu, 2), &alu->def);
+   nir_def *a = nir_ssa_for_alu_src(b, alu, 0);
+   nir_def *c = nir_ssa_for_alu_src(b, alu, 1);
+   nir_def *z = nir_ssa_for_alu_src(b, alu, 2);
+
+   /* The shader is not scalarized yet, and the repair branches on each
+    * component's native result. */
+   nir_def *fixed[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < alu->def.num_components; ++i) {
+      fixed[i] = agx_nir_fma_rte_fixup(b, nir_channel(b, a, i),
+                                       nir_channel(b, c, i),
+                                       nir_channel(b, z, i),
+                                       nir_channel(b, &alu->def, i));
+   }
+   return alu->def.num_components == 1
+             ? fixed[0]
+             : nir_vec(b, fixed, alu->def.num_components);
 }
 
-bool
-agx_nir_fma_rte_applies(const nir_shader *shader)
+static bool
+fma_rte_applies(const nir_shader *shader)
 {
    unsigned mode = shader->info.float_controls_execution_mode;
    return (mode & FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32) &&
           !(mode & FLOAT_CONTROLS_DENORM_PRESERVE_FP32);
 }
 
-bool
-agx_nir_lower_fma_rte(nir_shader *shader)
+/* G17P and the AGX3C parts detect FP32 FMA tininess before rounding. */
+static bool
+fma_tininess_before_rounding(enum agx_chip chip)
 {
-   if (!agx_nir_fma_rte_applies(shader))
+   return chip == AGX_CHIP_G17P ||
+          agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3C;
+}
+
+/*
+ * Only a strict ffma promises one correctly rounded result: OpFmaKHR
+ * (VK_KHR_shader_fma) and OpenCL fma() reach NIR as ffma. GLSL.std.450 Fma
+ * reaches it as ffma_weak, which may be evaluated unfused, and NIR fuses
+ * contractable multiply-adds into ffma by itself; neither carries the contract
+ * this repair keeps. nir_opt_algebraic rewrites ffma_weak into ffma, after
+ * which the two cannot be told apart, so the driver runs this once, where a
+ * shader enters it and before any algebraic optimization
+ * (hk_preprocess_nir_internal(), agx_shader_initialize()). The repair guards
+ * the native ffma it keeps, so a second run would repair it again.
+ */
+bool
+agx_nir_lower_fma_rte(nir_shader *shader, enum agx_chip chip)
+{
+   if (!fma_tininess_before_rounding(chip) || !fma_rte_applies(shader))
       return false;
    return nir_shader_lower_instructions(shader, filter, lower, NULL);
 }
