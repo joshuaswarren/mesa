@@ -1106,3 +1106,148 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4Half16EquivCompiles)
       ralloc_free(b.shader);
    }
 }
+
+TEST(G17PMsaaEpilog, LocalReadFirstMaskMatchesEpilogAndPartitions)
+{
+   /* Deferred 5-RT 4x MSAA tile pass where RT4 (final lighting output) is
+    * packed at offset 0 via first_mask to stay inside the 8B uncovered-tile
+    * budget on G17P. Local-read load lowering must apply the same first_mask
+    * layout as the epilog and g17p_tile_partitions; omitting it leaves RT0 at
+    * offset 12 (outside partitions {0, 4, 8, 16, 20}) and causes AGX3 pack
+    * refusal. */
+   const enum agx_chip chips[] = {AGX_CHIP_G17P, AGX_CHIP_G16G};
+   const unsigned samples = 4;
+
+   for (enum agx_chip chip : chips) {
+      agx_fs_epilog_key ekey = {};
+      ekey.nr_samples = samples;
+      ekey.max_sample_size_B = AGX_G17P_MAX_BYTES_PER_SAMPLE;
+      ekey.max_bytes_per_tile = 32768;
+      ekey.max_samples_per_tile = 2048;
+      ekey.rt_formats[0] = PIPE_FORMAT_R8G8B8A8_UNORM;
+      ekey.rt_formats[1] = PIPE_FORMAT_R16G16B16A16_FLOAT;
+      ekey.rt_formats[2] = PIPE_FORMAT_R8G8B8A8_UNORM;
+      ekey.rt_formats[3] = PIPE_FORMAT_R32_FLOAT;
+      ekey.rt_formats[4] = PIPE_FORMAT_R8G8B8A8_UNORM;
+      for (unsigned i = 0; i < 8; ++i)
+         ekey.remap[i] = -1;
+      ekey.remap[4] = 0;
+      ekey.blend.rt[4].colormask = 0xf;
+      ekey.blend.rt[4].mode = agx_pack_blend_standard(
+         PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO,
+         PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO);
+      ekey.link.loc_written = BITFIELD_BIT(0);
+      ekey.link.size_32 = BITFIELD_BIT(0);
+      ekey.link.colour_comps = 0xf;
+      ekey.first_mask = BITFIELD_BIT(4);
+      agx_fs_epilog_apply_device_policy(chip, &ekey);
+
+      struct agx_tilebuffer_layout tib = agx_fs_epilog_tilebuffer_layout(&ekey);
+      ASSERT_EQ(agx_tilebuffer_offset_B(&tib, 4), 0u);
+      ASSERT_EQ(agx_tilebuffer_offset_B(&tib, 3), 4u);
+      ASSERT_EQ(agx_tilebuffer_offset_B(&tib, 1), 8u);
+      ASSERT_EQ(agx_tilebuffer_offset_B(&tib, 0), 16u);
+      ASSERT_EQ(agx_tilebuffer_offset_B(&tib, 2), 20u);
+
+      struct agx_tilebuffer_layout unreordered =
+         agx_build_tilebuffer_layout_with_limits_resident(
+            ekey.rt_formats, ARRAY_SIZE(ekey.rt_formats), ekey.nr_samples, true,
+            ekey.max_sample_size_B, ekey.max_bytes_per_tile,
+            ekey.max_samples_per_tile, ekey.resident_mask);
+      ASSERT_EQ(agx_tilebuffer_offset_B(&unreordered, 0), 12u);
+
+      auto compile_with_tib = [&](struct agx_tilebuffer_layout *load_tib,
+                                  bool *compiled_ok, unsigned *scratch_out) {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_FRAGMENT, &agx_nir_options,
+            "local-read first_mask deferred msaa4");
+         b.shader->info.fs.uses_sample_shading = true;
+         b.shader->info.fs.uses_fbfetch_output = true;
+         b.shader->info.outputs_read = BITFIELD64_RANGE(FRAG_RESULT_DATA0, 4);
+         b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+
+         nir_def *g0 = nir_load_output(
+            &b, 4, 32, nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+            .io_semantics = {.location = FRAG_RESULT_DATA0,
+                             .num_slots = 1,
+                             .fb_fetch_output = 1});
+         nir_def *g1 = nir_load_output(
+            &b, 4, 32, nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+            .io_semantics = {.location = FRAG_RESULT_DATA1,
+                             .num_slots = 1,
+                             .fb_fetch_output = 1});
+         nir_def *g2 = nir_load_output(
+            &b, 4, 32, nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+            .io_semantics = {.location = FRAG_RESULT_DATA2,
+                             .num_slots = 1,
+                             .fb_fetch_output = 1});
+         nir_def *g3 = nir_load_output(
+            &b, 1, 32, nir_imm_int(&b, 0), .dest_type = nir_type_float32,
+            .io_semantics = {.location = FRAG_RESULT_DATA3,
+                             .num_slots = 1,
+                             .fb_fetch_output = 1});
+         nir_def *sum = nir_fadd(&b, nir_fadd(&b, g0, g1), g2);
+         nir_def *lit = nir_fmul(&b, sum, g3);
+
+         agx_nir_lower_tilebuffer_with_conversions(
+            b.shader, load_tib, NULL, NULL, NULL, NULL, false, ekey.lower_srgb,
+            ekey.lower_r11g11b10, ekey.ms_whole_sample, ekey.g17p_tile_formats,
+            ekey.native_epilog);
+
+         /* Store to RT4 at its first_mask offset (0), matching the epilog. */
+         b.cursor = nir_after_impl(b.impl);
+         nir_store_local_pixel_agx(
+            &b, lit, nir_imm_intN_t(&b, 0xff, 16), nir_undef(&b, 2, 16),
+            .base = (int)agx_tilebuffer_offset_B(&tib, 4), .write_mask = 0xf,
+            .format = PIPE_FORMAT_R8_UNORM, .target = 4);
+
+         struct agx_g17p_colour_layout layout;
+         agx_g17p_colour_layout_init(&layout, BITFIELD_BIT(0), BITFIELD_BIT(0),
+                                     0xf, false);
+         ASSERT_TRUE(agx_nir_lower_to_per_sample(b.shader));
+         ASSERT_TRUE(
+            agx_nir_unroll_g17p_samples_equiv(b.shader, samples, &layout));
+
+         bool progress;
+         do {
+            progress = false;
+            progress |= nir_opt_constant_folding(b.shader);
+            progress |= nir_opt_algebraic(b.shader);
+            progress |= nir_opt_dce(b.shader);
+         } while (progress);
+         agx_nir_hoist_g17p_zs_writes(b.shader);
+         agx_nir_lower_g17p_tile_samples(b.shader, samples);
+         b.shader->info.fs.uses_sample_shading = false;
+         agx_preprocess_nir(b.shader);
+
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = chip;
+         key.no_preamble = true;
+         key.agx3_local_read = true;
+         key.fs.nr_samples = samples;
+         for (unsigned rt = 0; rt < 5; ++rt)
+            BITSET_SET(key.g17p_tile_partitions, agx_tilebuffer_offset_B(&tib, rt));
+
+         agx_shader_part part = {};
+         *compiled_ok = agx_compile_shader_nir(b.shader, &key, &part);
+         *scratch_out = part.info.scratch_size;
+         free(part.binary);
+         ralloc_free(b.shader);
+      };
+
+      bool ok = false;
+      unsigned scratch = 0;
+      compile_with_tib(&tib, &ok, &scratch);
+      EXPECT_TRUE(ok) << agx_last_compile_refusal();
+      EXPECT_EQ(scratch, 0u);
+
+      /* Negative control: lowering loads without first_mask mismatches
+       * g17p_tile_partitions (RT0 offset 12 not in {0, 4, 8, 16, 20}) and must
+       * fail closed in AGX3 packing. */
+      bool bad_ok = true;
+      unsigned bad_scratch = 0;
+      compile_with_tib(&unreordered, &bad_ok, &bad_scratch);
+      EXPECT_FALSE(bad_ok);
+   }
+}
