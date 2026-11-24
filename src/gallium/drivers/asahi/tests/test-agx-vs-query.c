@@ -14,6 +14,7 @@
 
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/lib/agx_vdm_hal200_direct_draw_core.h"
+#include "asahi/lib/agx_vdm_index_list_core.h"
 #include "asahi/lib/agx_vdm_state_update_core.h"
 #include "compiler/glsl_types.h"
 #include "compiler/nir/nir_builder.h"
@@ -164,6 +165,99 @@ draw(struct pipe_context *pctx)
 }
 
 static bool
+check_last_indexed_indirect_draw(struct agx_context *ctx,
+                                 uint64_t expected_indirect_va,
+                                 bool check_draw_params,
+                                 unsigned expected_draw_id)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   const size_t body_len =
+      AGX_VDM_HAL200_INDIRECT_INDEXED_DRAW_LENGTH -
+      AGX_VDM_HAL200_DRAW_STATE_POINTER_LENGTH;
+   struct agx_vdm_index_list_indirect_indexed_info unpacked;
+
+   CHECK(ctx->batch && ctx->batch->vdm.bo);
+   CHECK((size_t)(ctx->batch->vdm.current - (uint8_t *)agx_bo_map(ctx->batch->vdm.bo)) >=
+         body_len);
+   CHECK(agx_vdm_index_list_indirect_indexed_unpack(
+      dev->chip, ctx->batch->vdm.current - body_len, body_len, &unpacked));
+   CHECK(unpacked.indirect_buffer == expected_indirect_va);
+   if (check_draw_params) {
+      CHECK(ctx->batch->uniforms.draw_id == expected_draw_id);
+      CHECK(ctx->batch->uniforms.tables[AGX_SYSVAL_TABLE_PARAMS] ==
+            expected_indirect_va + 12);
+   }
+   return true;
+}
+
+static bool
+check_mdi_subdraw_offset_bounds(void)
+{
+   struct pipe_resource fake_buf = {0};
+   struct pipe_draw_indirect_info info = {.buffer = &fake_buf};
+   uint32_t out = 0;
+
+   /* Exact fit on the last draw for both indexed (20 B) and non-indexed (16 B). */
+   fake_buf.width0 = 256u + 1599u * 4096u + 20u;
+   info.offset = 256u;
+   info.stride = 4096u;
+   CHECK(agx_mdi_subdraw_offset(&info, 1599u, 20u, &out) &&
+         out == 256u + 1599u * 4096u);
+   CHECK(!agx_mdi_subdraw_offset(&info, 1600u, 20u, &out));
+
+   fake_buf.width0 = 256u + 1599u * 4096u + 16u;
+   CHECK(!agx_mdi_subdraw_offset(&info, 1599u, 20u, &out));
+   CHECK(agx_mdi_subdraw_offset(&info, 1599u, 16u, &out) &&
+         out == 256u + 1599u * 4096u);
+
+   /* 32-bit multiply wraparound (2 * 0x80000000u == 0 in uint32_t) must fail
+    * before multiplying, even against a full 4 GiB logical buffer. */
+   fake_buf.width0 = UINT32_MAX;
+   info.offset = 0u;
+   info.stride = 0x80000000u;
+   CHECK(agx_mdi_subdraw_offset(&info, 0u, 20u, &out) && out == 0u);
+   CHECK(agx_mdi_subdraw_offset(&info, 1u, 20u, &out) && out == 0x80000000u);
+   CHECK(!agx_mdi_subdraw_offset(&info, 2u, 20u, &out));
+
+   fake_buf.width0 = 64u;
+   CHECK(agx_mdi_subdraw_offset(&info, 0u, 20u, &out) && out == 0u);
+   CHECK(!agx_mdi_subdraw_offset(&info, 1u, 20u, &out));
+   CHECK(!agx_mdi_subdraw_offset(&info, 2u, 20u, &out));
+
+   /* 32-bit addition wraparound (offset + i * stride > UINT32_MAX). */
+   fake_buf.width0 = UINT32_MAX;
+   info.offset = 0xfffffff0u;
+   info.stride = 20u;
+   CHECK(!agx_mdi_subdraw_offset(&info, 0u, 20u, &out));
+   CHECK(!agx_mdi_subdraw_offset(&info, 1u, 20u, &out));
+
+   info.offset = 0xffffffc0u;
+   CHECK(agx_mdi_subdraw_offset(&info, 0u, 20u, &out) && out == 0xffffffc0u);
+   CHECK(agx_mdi_subdraw_offset(&info, 2u, 20u, &out) && out == 0xffffffe8u);
+   CHECK(!agx_mdi_subdraw_offset(&info, 3u, 20u, &out));
+
+   /* Zero stride repeats base offset when the single record fits. */
+   fake_buf.width0 = 36u;
+   info.offset = 16u;
+   info.stride = 0u;
+   CHECK(agx_mdi_subdraw_offset(&info, 0u, 20u, &out) && out == 16u);
+   CHECK(agx_mdi_subdraw_offset(&info, 10000u, 20u, &out) && out == 16u);
+   fake_buf.width0 = 32u;
+   CHECK(!agx_mdi_subdraw_offset(&info, 0u, 20u, &out));
+
+   /* Unaligned base offset or stride must be rejected. */
+   fake_buf.width0 = 256u;
+   info.offset = 2u;
+   info.stride = 20u;
+   CHECK(!agx_mdi_subdraw_offset(&info, 0u, 20u, &out));
+   info.offset = 0u;
+   info.stride = 18u;
+   CHECK(!agx_mdi_subdraw_offset(&info, 0u, 20u, &out));
+
+   return true;
+}
+
+static bool
 check_vs(struct pipe_context *pctx)
 {
    struct agx_context *ctx = agx_context(pctx);
@@ -302,8 +396,10 @@ check_vs(struct pipe_context *pctx)
    }
    pipe_resource_reference(&indirect_buffer, NULL);
 
-   /* Indirect multi-draw: both state-clean (body-only) and per-draw
-    * gl_DrawID + base-param across a 64 KiB VDM STREAM_LINK boundary. */
+   /* Indirect multi-draw: width/range guards, state-clean (body-only),
+    * per-draw gl_DrawID + base-param across a 64 KiB VDM STREAM_LINK boundary,
+    * large-stride last-draw addressing, and forced fallback after STREAM_LINK. */
+   CHECK(check_mdi_subdraw_offset_bounds());
    {
       const uint16_t indices[3] = {0, 1, 2};
       struct pipe_resource *ib =
@@ -313,9 +409,10 @@ check_vs(struct pipe_context *pctx)
       pipe_buffer_write(pctx, ib, 0, sizeof(indices), indices);
 
       const unsigned mdi_count = 1600;
-      uint32_t (*mdi_args)[5] = calloc(mdi_count, sizeof(*mdi_args));
+      const unsigned mdi_clean_link_count = 2200;
+      uint32_t (*mdi_args)[5] = calloc(mdi_clean_link_count, sizeof(*mdi_args));
       CHECK(mdi_args);
-      for (unsigned i = 0; i < mdi_count; ++i) {
+      for (unsigned i = 0; i < mdi_clean_link_count; ++i) {
          mdi_args[i][0] = 3;
          mdi_args[i][1] = 1;
          mdi_args[i][2] = 0;
@@ -324,10 +421,11 @@ check_vs(struct pipe_context *pctx)
       }
       struct pipe_resource *mdi_buf =
          pipe_buffer_create(pctx->screen, PIPE_BIND_COMMAND_ARGS_BUFFER,
-                            PIPE_USAGE_DEFAULT, mdi_count * sizeof(*mdi_args));
+                            PIPE_USAGE_DEFAULT,
+                            mdi_clean_link_count * sizeof(*mdi_args));
       CHECK(mdi_buf);
-      pipe_buffer_write(pctx, mdi_buf, 0, mdi_count * sizeof(*mdi_args),
-                        mdi_args);
+      pipe_buffer_write(pctx, mdi_buf, 0,
+                        mdi_clean_link_count * sizeof(*mdi_args), mdi_args);
       free(mdi_args);
 
       struct pipe_draw_info mdi_info = {
@@ -354,6 +452,8 @@ check_vs(struct pipe_context *pctx)
          pctx->draw_vbo(pctx, &mdi_info, 0, &mdi_clean, &indirect_draw, 1);
          CHECK(ctx->perf.vs_emits == emits);
          CHECK(ctx->batch->scissor.size == scissor_before);
+         CHECK(check_last_indexed_indirect_draw(
+            ctx, agx_map_gpu(agx_resource(mdi_buf)) + 7u * 20u, false, 0));
       }
 
       /* Include a vertex attribute so draw 0 uploads AGX_SYSVAL_TABLE_VS into
@@ -401,6 +501,8 @@ check_vs(struct pipe_context *pctx)
       if (native_agx3) {
          CHECK(ctx->batch->vdm.bo != start_vdm_bo ||
                ctx->batch->vdm.end != start_vdm_end);
+         CHECK(ctx->batch->g17p_bind_tail_latched &&
+               ctx->batch->g17p_have_latched_vs);
          /* Only draw 0 + the VDM STREAM_LINK re-latches emit bind tails. */
          CHECK((ctx->batch->scissor.size - scissor_before) <=
                4 * AGX_SCISSOR_LENGTH);
@@ -408,6 +510,183 @@ check_vs(struct pipe_context *pctx)
           * 1,600 sub-draws without thrashing. */
          CHECK(ctx->linked.vs->g17p_graphics_templates_generated >= 1 &&
                ctx->linked.vs->g17p_graphics_templates_generated <= 4);
+         CHECK(check_last_indexed_indirect_draw(
+            ctx,
+            agx_map_gpu(agx_resource(mdi_buf)) + (uint64_t)(mdi_count - 1) * 20,
+            true, mdi_count - 1));
+
+         /* Large stride + non-zero base offset: verify exact last-draw
+          * addressing on the fast path, a forced per-draw fallback starting in
+          * an unlatched post-STREAM_LINK chunk and crossing another
+          * STREAM_LINK, a mid-MDI fast -> STREAM_LINK -> flush fallback ->
+          * fast recovery, and runtime overflow/range clipping. */
+         const uint32_t large_offset = 256u;
+         const uint32_t large_stride = 4096u;
+         const unsigned large_count = 1600u;
+         const uint32_t large_size =
+            large_offset + (large_count - 1u) * large_stride + 20u;
+         struct pipe_resource *large_buf =
+            pipe_buffer_create(pctx->screen, PIPE_BIND_COMMAND_ARGS_BUFFER,
+                               PIPE_USAGE_DEFAULT, large_size);
+         CHECK(large_buf);
+         struct pipe_transfer *large_xfer = NULL;
+         uint8_t *large_map = pipe_buffer_map(
+            pctx, large_buf, PIPE_MAP_WRITE | PIPE_MAP_DISCARD_WHOLE_RESOURCE,
+            &large_xfer);
+         CHECK(large_map && large_xfer);
+         for (unsigned i = 0; i < large_count; ++i) {
+            const uint32_t cmd[5] = {3, 1, 0, 0, i};
+            memcpy(large_map + large_offset + (size_t)i * large_stride, cmd,
+                   sizeof(cmd));
+         }
+         pipe_buffer_unmap(pctx, large_xfer);
+         const uint64_t large_base_va = agx_map_gpu(agx_resource(large_buf));
+         const uint64_t large_last_va =
+            large_base_va + large_offset +
+            (uint64_t)(large_count - 1u) * large_stride;
+         struct pipe_draw_indirect_info mdi_large = {
+            .buffer = large_buf,
+            .offset = large_offset,
+            .draw_count = large_count,
+            .stride = large_stride,
+         };
+
+         /* 1) Cross a 64 KiB VDM STREAM_LINK with state-clean body-only draws
+          * so the new VDM chunk has g17p_bind_tail_latched == false, then
+          * immediately run a forced per-draw fallback (AGX_DBG_DIRTY) in the
+          * same batch across another STREAM_LINK. */
+         pctx->bind_vs_state(pctx, s.vs);
+         struct pipe_draw_indirect_info mdi_clean_link = {
+            .buffer = mdi_buf,
+            .draw_count = mdi_clean_link_count,
+            .stride = 20,
+         };
+         start_vdm_bo = ctx->batch->vdm.bo;
+         start_vdm_end = ctx->batch->vdm.end;
+         draws_before = ctx->perf.draws;
+         pctx->draw_vbo(pctx, &mdi_info, 0, &mdi_clean_link, &indirect_draw, 1);
+         CHECK(ctx->perf.draws == draws_before + mdi_clean_link_count);
+         CHECK(ctx->batch->vdm.bo != start_vdm_bo ||
+               ctx->batch->vdm.end != start_vdm_end);
+         CHECK(!ctx->batch->g17p_bind_tail_latched);
+         CHECK(check_last_indexed_indirect_draw(
+            ctx,
+            agx_map_gpu(agx_resource(mdi_buf)) +
+               (uint64_t)(mdi_clean_link_count - 1u) * 20u,
+            false, 0));
+
+         pctx->bind_vs_state(pctx, mdi_vs);
+         struct agx_device *dev = agx_device(pctx->screen);
+         const unsigned saved_debug = dev->debug;
+         struct agx_batch *same_batch = ctx->batch;
+         start_vdm_bo = ctx->batch->vdm.bo;
+         start_vdm_end = ctx->batch->vdm.end;
+         emits = ctx->perf.vs_emits;
+         draws_before = ctx->perf.draws;
+         scissor_before = ctx->batch->scissor.size;
+         dev->debug |= AGX_DBG_DIRTY;
+         pctx->draw_vbo(pctx, &mdi_info, 0, &mdi_large, &indirect_draw, 1);
+         dev->debug = saved_debug;
+         CHECK(ctx->batch == same_batch);
+         CHECK(ctx->perf.draws == draws_before + large_count);
+         CHECK(ctx->perf.vs_emits == emits + large_count);
+         CHECK(ctx->batch->vdm.bo != start_vdm_bo ||
+               ctx->batch->vdm.end != start_vdm_end);
+         CHECK(ctx->batch->g17p_bind_tail_latched &&
+               ctx->batch->g17p_have_latched_vs);
+#ifndef NDEBUG
+         CHECK(ctx->batch->scissor.size - scissor_before ==
+               large_count * AGX_SCISSOR_LENGTH);
+#else
+         CHECK(ctx->batch->scissor.size - scissor_before >=
+               2 * AGX_SCISSOR_LENGTH);
+#endif
+         CHECK(check_last_indexed_indirect_draw(ctx, large_last_va, true,
+                                                large_count - 1u));
+
+         /* 2) Large stride + non-zero offset on the fast path across a
+          * STREAM_LINK, verifying last-draw parity with the fallback path. */
+         start_vdm_bo = ctx->batch->vdm.bo;
+         start_vdm_end = ctx->batch->vdm.end;
+         emits = ctx->perf.vs_emits;
+         draws_before = ctx->perf.draws;
+         scissor_before = ctx->batch->scissor.size;
+         pctx->draw_vbo(pctx, &mdi_info, 0, &mdi_large, &indirect_draw, 1);
+         CHECK(ctx->perf.draws == draws_before + large_count);
+         CHECK(ctx->perf.vs_emits == emits + large_count);
+         CHECK(ctx->batch->vdm.bo != start_vdm_bo ||
+               ctx->batch->vdm.end != start_vdm_end);
+         CHECK(ctx->batch->g17p_bind_tail_latched &&
+               ctx->batch->g17p_have_latched_vs);
+         CHECK((ctx->batch->scissor.size - scissor_before) <=
+               4 * AGX_SCISSOR_LENGTH);
+         CHECK(check_last_indexed_indirect_draw(ctx, large_last_va, true,
+                                                large_count - 1u));
+
+         /* 3) Mid-MDI fast path -> VDM STREAM_LINK -> forced fallback on batch
+          * flush (> 100,000 draws) -> fast path recovery through the last draw. */
+         CHECK(ctx->batch->draws < 98700u);
+         struct agx_batch *pre_flush_batch = ctx->batch;
+         ctx->batch->draws = 98700u;
+         emits = ctx->perf.vs_emits;
+         draws_before = ctx->perf.draws;
+         pctx->draw_vbo(pctx, &mdi_info, 0, &mdi_large, &indirect_draw, 1);
+         CHECK(!ctx->any_faults);
+         CHECK(ctx->batch && ctx->batch != pre_flush_batch);
+         CHECK(ctx->batch->draws > 0 && ctx->batch->draws < large_count);
+         CHECK(ctx->perf.draws == draws_before + large_count);
+         CHECK(ctx->perf.vs_emits == emits + large_count);
+         CHECK(ctx->batch->g17p_bind_tail_latched &&
+               ctx->batch->g17p_have_latched_vs);
+         CHECK(check_last_indexed_indirect_draw(ctx, large_last_va, true,
+                                                large_count - 1u));
+
+         /* 4) Runtime overflow and buffer-range clipping on both fast path and
+          * forced fallback: 32-bit multiply wraparound (2 * 0x80000000u) and
+          * trailing out-of-range draws must stop cleanly without emitting
+          * wrapped or unowned addresses. */
+         uint32_t small_args[3][5] = {
+            {3, 1, 0, 0, 10},
+            {3, 1, 0, 0, 11},
+            {3, 1, 0, 0, 12},
+         };
+         struct pipe_resource *small_buf =
+            pipe_buffer_create(pctx->screen, PIPE_BIND_COMMAND_ARGS_BUFFER,
+                               PIPE_USAGE_DEFAULT, 64u);
+         CHECK(small_buf);
+         pipe_buffer_write(pctx, small_buf, 0, sizeof(small_args), small_args);
+         const uint64_t small_va = agx_map_gpu(agx_resource(small_buf));
+
+         struct pipe_draw_indirect_info mdi_wrap = {
+            .buffer = small_buf,
+            .offset = 0,
+            .draw_count = 4,
+            .stride = 0x80000000u,
+         };
+         struct pipe_draw_indirect_info mdi_oob = {
+            .buffer = small_buf,
+            .offset = 0,
+            .draw_count = 5,
+            .stride = 20u,
+         };
+         for (unsigned mode = 0; mode < 2; ++mode) {
+            if (mode == 1)
+               dev->debug |= AGX_DBG_DIRTY;
+            draws_before = ctx->perf.draws;
+            pctx->draw_vbo(pctx, &mdi_info, 0, &mdi_wrap, &indirect_draw, 1);
+            CHECK(ctx->perf.draws == draws_before + 1);
+            CHECK(check_last_indexed_indirect_draw(ctx, small_va, true, 0));
+
+            draws_before = ctx->perf.draws;
+            pctx->draw_vbo(pctx, &mdi_info, 0, &mdi_oob, &indirect_draw, 1);
+            CHECK(ctx->perf.draws == draws_before + 3);
+            CHECK(check_last_indexed_indirect_draw(ctx, small_va + 40u, true,
+                                                   2));
+            dev->debug = saved_debug;
+         }
+
+         pipe_resource_reference(&small_buf, NULL);
+         pipe_resource_reference(&large_buf, NULL);
       }
       pctx->bind_vs_state(pctx, s.vs);
       pctx->delete_vs_state(pctx, mdi_vs);

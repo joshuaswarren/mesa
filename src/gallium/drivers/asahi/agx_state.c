@@ -16968,14 +16968,39 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(pctx->screen);
    const enum agx_primitive primitive = agx_primitive_for_pipe(info->mode);
-   const uint32_t params_offset_B = info->index_size ? 12 : 8;
+   const uint32_t arg_size_B = info->index_size ? 20u : 16u;
+   const uint32_t params_offset_B = info->index_size ? 12u : 8u;
    const size_t command_space =
       AGX_VDM_STATE_UPDATE_LENGTH + AGX_VDM_HAL200_BIND_TAIL_LENGTH +
       AGX_VDM_HAL200_INDIRECT_INDEXED_DRAW_LENGTH + AGX_VDM_BARRIER_LENGTH;
 
+   /* Compute the exact prefix of sub-draws whose 64-bit byte offset fits both
+    * pipe_draw_indirect_info::offset (uint32_t) and indirect->buffer->width0,
+    * keeping the fast path and per-draw fallback on identical bounds. */
+   const uint64_t buf_size = indirect->buffer->width0;
+   const uint64_t base_offset = indirect->offset;
+   const uint64_t indirect_stride = indirect->stride;
+   if ((base_offset & 3u) || (indirect_stride & 3u) ||
+       base_offset > buf_size || arg_size_B > buf_size - base_offset)
+      return;
+
+   const uint64_t max_delta =
+      MIN2((uint64_t)UINT32_MAX - base_offset,
+           buf_size - arg_size_B - base_offset);
+   const unsigned valid_draw_count =
+      indirect_stride
+         ? (unsigned)MIN2((uint64_t)indirect->draw_count,
+                          (max_delta / indirect_stride) + 1)
+         : indirect->draw_count;
+   uint32_t last_sub_offset = 0;
+   if (!valid_draw_count ||
+       !agx_mdi_subdraw_offset(indirect, valid_draw_count - 1, arg_size_B,
+                               &last_sub_offset))
+      return;
+
    struct agx_batch *clean = NULL;
    int can_skip = -1;
-   uint64_t indirect_base = 0;
+   uint64_t indirect_rsrc_base = 0;
    uint64_t ib_base = 0;
    size_t ib_size = 0;
 
@@ -16996,12 +17021,15 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
    unsigned draw_id_end = 0;
    size_t draw_id_stride = 0;
 
-   for (unsigned i = 0; i < indirect->draw_count; ++i) {
+   for (unsigned i = 0; i < valid_draw_count; ++i) {
+      uint32_t sub_offset = 0;
+      if (!agx_mdi_subdraw_offset(indirect, i, arg_size_B, &sub_offset))
+         break;
+
       bool fast = clean != NULL;
 
       if (fast) {
-         const uint64_t indirect_ptr =
-            indirect_base + (uint64_t)i * indirect->stride;
+         const uint64_t indirect_ptr = indirect_rsrc_base + sub_offset;
          agx_ensure_cmdbuf_has_space(clean, &clean->vdm, command_space);
          uint8_t *out = clean->vdm.current;
          uint32_t draw_state_offset = 0;
@@ -17012,16 +17040,16 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
                   const size_t stride = ALIGN_POT(locs.draw_id_size, 4);
                   const unsigned max_chunk = MAX2(1u, (unsigned)(65536u / stride));
                   const unsigned chunk =
-                     MIN2(indirect->draw_count - i, max_chunk);
+                     MIN2(valid_draw_count - i, max_chunk);
                   uint64_t params_start = 1, params_end = 0;
                   if (uses_base_param && locs.params_range >= 0) {
                      const uint64_t p_bytes =
                         (uint64_t)ranges[locs.params_range].size_halfs * 2;
-                     params_start = indirect_base + params_offset_B;
+                     params_start =
+                        indirect_rsrc_base + base_offset + params_offset_B;
                      params_end =
-                        indirect_base +
-                        (uint64_t)(indirect->draw_count - 1) * indirect->stride +
-                        params_offset_B + (p_bytes >= 4 ? p_bytes - 4 : 0);
+                        indirect_rsrc_base + last_sub_offset + params_offset_B +
+                        (p_bytes >= 4 ? p_bytes - 4 : 0);
                   }
                   struct agx_ptr ids = agx_mdi_alloc_draw_id_chunk(
                      &clean->pool, (size_t)chunk * stride, ranges, range_count,
@@ -17090,9 +17118,6 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
                      if (!out) {
                         fast = false;
                      } else {
-                        if (unlikely(dev->debug & AGX_DBG_PERF))
-                           ctx->perf.vs_emits++;
-
                         if (unlikely(!clean->g17p_bind_tail_latched ||
                                      !clean->g17p_have_latched_vs)) {
                            out = agx_g17p_emit_bind_state(
@@ -17108,8 +17133,11 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
                               clean->g17p_latched_vs_outputs[1] = vs_outputs[1];
                            }
                         }
-                        if (fast)
+                        if (fast) {
+                           if (unlikely(dev->debug & AGX_DBG_PERF))
+                              ctx->perf.vs_emits++;
                            clean->vs_root_valid = false;
+                        }
                      }
                   }
                }
@@ -17163,7 +17191,7 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
       const struct pipe_draw_indirect_info subindirect = {
          .buffer = indirect->buffer,
          .count_from_stream_output = indirect->count_from_stream_output,
-         .offset = indirect->offset + (i * indirect->stride),
+         .offset = sub_offset,
          .draw_count = 1,
       };
       struct agx_batch *before = ctx->batch;
@@ -17192,7 +17220,10 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
       }
 
       if (clean) {
-         indirect_base = agx_indirect_buffer_ptr(clean, indirect);
+         struct agx_resource *indirect_rsrc = agx_resource(indirect->buffer);
+         agx_batch_reads(clean, indirect_rsrc);
+         agx_batch_note_vs_read(clean, indirect_rsrc);
+         indirect_rsrc_base = agx_map_gpu(indirect_rsrc);
          if (info->index_size)
             ib_base = agx_index_buffer_rsrc_ptr(clean, info, &ib_size);
          if (ctx->time_elapsed)
