@@ -2394,7 +2394,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * buffer .pointer refers to, so the queue-limits query cannot work there.
     */
    if ((pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) &&
-       !pdev->dev.is_virtio) {
+       !pdev->dev.is_virtio && !(pdev->dev.debug & AGX_DBG_1QUEUE)) {
       struct drm_asahi_queue_limits limits = {0};
       struct drm_asahi_get_params query = {
          .param_group = DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS,
@@ -2447,7 +2447,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * admission via hk_queue_admits_at_entry() on G17P/M5; other runtimes
     * report exhaustion at submit time), unused families consume no kernel
     * queues. */
-   if (pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) {
+   if ((pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) &&
+       !(pdev->dev.debug & AGX_DBG_1QUEUE)) {
       pdev->queue_families[pdev->queue_family_count++] = (struct hk_queue_family){
          .queue_flags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
          .queue_count = queue_count,

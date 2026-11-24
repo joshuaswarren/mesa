@@ -85,6 +85,10 @@ main(void)
       assert(!hk_queue_sibling_compute_supported(&qdev, true));
       qdev.is_virtio = false;
 
+      qdev.debug = AGX_DBG_1QUEUE;
+      assert(!hk_queue_sibling_compute_supported(&qdev, true));
+      qdev.debug = 0;
+
       /* A kernel that fans compute out itself gets no sibling queues. */
       qdev.params.features =
          sib_features | DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL;
