@@ -2,14 +2,10 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * AGX3 device memory encoders (lddev / stdev).
- *
- * The address is base64 + (index << shift) + sext16(byte_offset). The base is
- * never inline: it names a uniform quad or a GPR pair holding the pointer. The
- * index is an immediate (byte or scaled-element form) or a 32-bit register.
- * Loads additionally carry a scoreboard slot and a wait mask; stores signal no
- * slot. Grade A: reproduces Apple's witnessed lddev/stdev bytes exactly via the
- * composer.
+ * AGX3 device memory encoders (`lddev`/`stdev`):
+ * address = base64 (uniform quad or GPR pair) + (index << shift) +
+ * sext16(byte_offset). Loads carry a scoreboard slot and wait mask; stores
+ * signal no slot.
  */
 
 #pragma once

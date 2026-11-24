@@ -210,9 +210,11 @@ alu_cost(nir_alu_instr *alu)
    case nir_op_f2i8:
    case nir_op_f2i16:
    case nir_op_f2i32:
+   case nir_op_f2i32_sat:
    case nir_op_f2u8:
    case nir_op_f2u16:
    case nir_op_f2u32:
+   case nir_op_f2u32_sat:
    case nir_op_i2fmp:
    case nir_op_i2f16:
    case nir_op_i2f32:
@@ -372,14 +374,17 @@ surviving_branches(nir_shader *nir, const nir_opt_preamble_options *options,
                    const unsigned *sizes,
                    const nir_opt_peephole_select_options *flatten)
 {
-   struct set *branches = _mesa_pointer_set_create(NULL);
-   struct util_dynarray ifs, clone_ifs, left;
-   util_dynarray_init(&ifs, NULL);
-   util_dynarray_init(&clone_ifs, NULL);
-   util_dynarray_init(&left, NULL);
+   struct util_dynarray ifs = UTIL_DYNARRAY_INIT;
    collect_ifs(&nir_shader_get_entrypoint(nir)->body, &ifs);
+   if (!ifs.size) {
+      util_dynarray_fini(&ifs);
+      return NULL;
+   }
 
-   if (flatten && ifs.size) {
+   struct set *branches = NULL;
+   if (flatten) {
+      struct util_dynarray clone_ifs = UTIL_DYNARRAY_INIT;
+      struct util_dynarray left = UTIL_DYNARRAY_INIT;
       unsigned used[nir_preamble_num_classes];
       memcpy(used, sizes, sizeof(used));
 
@@ -389,28 +394,32 @@ surviving_branches(nir_shader *nir, const nir_opt_preamble_options *options,
       nir_opt_peephole_select(clone, flatten);
       collect_ifs(&nir_shader_get_entrypoint(clone)->body, &left);
 
-      /* Both walks see the same ifs in the same order, and the select pass
-       * creates no ifs. */
-      struct set *standing = _mesa_pointer_set_create(NULL);
-      util_dynarray_foreach(&left, nir_if *, nif)
-         _mesa_set_add(standing, *nif);
-      for (unsigned i = 0; i < util_dynarray_num_elements(&ifs, nir_if *);
-           ++i) {
-         if (_mesa_set_search(standing, *util_dynarray_element(
-                                           &clone_ifs, nir_if *, i)))
-            _mesa_set_add(branches,
-                          *util_dynarray_element(&ifs, nir_if *, i));
+      if (left.size) {
+         branches = _mesa_pointer_set_create(NULL);
+         /* Both walks see the same ifs in the same order, and the select pass
+          * creates no ifs. */
+         struct set *standing = _mesa_pointer_set_create(NULL);
+         util_dynarray_foreach(&left, nir_if *, nif)
+            _mesa_set_add(standing, *nif);
+         for (unsigned i = 0; i < util_dynarray_num_elements(&ifs, nir_if *);
+              ++i) {
+            if (_mesa_set_search(standing, *util_dynarray_element(
+                                              &clone_ifs, nir_if *, i)))
+               _mesa_set_add(branches,
+                             *util_dynarray_element(&ifs, nir_if *, i));
+         }
+         _mesa_set_destroy(standing, NULL);
       }
-      _mesa_set_destroy(standing, NULL);
       ralloc_free(clone);
+      util_dynarray_fini(&clone_ifs);
+      util_dynarray_fini(&left);
    } else {
+      branches = _mesa_pointer_set_create(NULL);
       util_dynarray_foreach(&ifs, nir_if *, nif)
          _mesa_set_add(branches, *nif);
    }
 
    util_dynarray_fini(&ifs);
-   util_dynarray_fini(&clone_ifs);
-   util_dynarray_fini(&left);
    return branches;
 }
 
@@ -422,6 +431,49 @@ instr_cost_g17p(nir_instr *instr, const void *data)
       nir_alu_instr *alu = nir_instr_as_alu(instr);
       if (alu->op == nir_op_fabs && alu->def.bit_size <= 32)
          return weight;
+   }
+   return instr_cost(instr, data) * weight;
+}
+
+/* On AGX3C, native uniform-operand float instructions never fold fabs(u), and
+ * only fold fneg(u) on fadd and the addend (src 2) of ffma. Give fabs(u) and
+ * non-foldable fneg(u) non-zero cost so loop-invariant modified uniforms are
+ * precomputed once in the constant program instead of copied and negated per
+ * thread or per loop iteration. */
+static bool
+agx3c_fneg_all_uses_fold_uniform(const nir_def *def)
+{
+   bool any = false;
+   nir_foreach_use_including_if(use, def) {
+      any = true;
+      if (nir_src_is_if(use))
+         return false;
+      nir_instr *parent = nir_src_use_instr(use);
+      if (parent->type != nir_instr_type_alu)
+         return false;
+      nir_alu_instr *alu = nir_instr_as_alu(parent);
+      if (alu->op == nir_op_fadd)
+         continue;
+      if (alu->op == nir_op_ffma && use == &alu->src[2].src)
+         continue;
+      return false;
+   }
+   return any;
+}
+
+static float
+instr_cost_agx3c(nir_instr *instr, const void *data)
+{
+   float weight = execution_weight(instr->block, data);
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (alu->def.bit_size <= 32) {
+         if (alu->op == nir_op_fabs)
+            return weight;
+         if (alu->op == nir_op_fneg &&
+             !agx3c_fneg_all_uses_fold_uniform(&alu->def))
+            return weight;
+      }
    }
    return instr_cost(instr, data) * weight;
 }
@@ -877,6 +929,11 @@ speculative_descriptor(const nir_intrinsic_instr *load, unsigned *end)
    return bytes <= AGX_ZERO_PAGE_SIZE ? desc : NULL;
 }
 
+struct speculative_load_state {
+   unsigned free_halves;
+   struct set *promoted;
+};
+
 /* A load that moves takes its pointer with it, so one that then finds no slot
  * leaves the main program rebuilding that pointer from the descriptor. Allow
  * only what fits in the storage left free by everything that moves anyway.
@@ -884,17 +941,41 @@ speculative_descriptor(const nir_intrinsic_instr *load, unsigned *end)
 static bool
 allow_speculative_load(nir_builder *b, nir_intrinsic_instr *load, void *data)
 {
-   unsigned *free_halves = data;
+   struct speculative_load_state *state = data;
    const unsigned halves = load->def.num_components * 2;
    unsigned end;
    if (load->instr.block->cf_node.parent->type == nir_cf_node_function ||
-       !speculative_descriptor(load, &end) || halves > *free_halves)
+       !speculative_descriptor(load, &end) ||
+       (nir_intrinsic_access(load) & ACCESS_CAN_SPECULATE) ||
+       halves > state->free_halves)
       return false;
 
-   *free_halves -= halves;
+   state->free_halves -= halves;
    nir_intrinsic_set_access(
       load, nir_intrinsic_access(load) | ACCESS_CAN_SPECULATE);
+   _mesa_set_add(state->promoted, load);
    return true;
+}
+
+static bool
+has_speculative_load_candidate(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         if (block->cf_node.parent->type == nir_cf_node_function)
+            continue;
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            unsigned end;
+            if (speculative_descriptor(intr, &end) &&
+                !(nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE))
+               return true;
+         }
+      }
+   }
+   return false;
 }
 
 static unsigned
@@ -916,13 +997,16 @@ free_preamble_halves(const nir_shader *nir,
              : 0;
 }
 
-/* What stayed in the main program must not be flattened past its branch now. */
+/* What stayed in the main program must not be flattened past its branch now.
+ * Only clear ACCESS_CAN_SPECULATE from loads that allow_speculative_load()
+ * temporarily promoted, leaving pre-existing speculatable loads intact. */
 static bool
 disallow_speculative_load(nir_builder *b, nir_intrinsic_instr *load, void *data)
 {
+   struct set *promoted = data;
    if ((load->intrinsic != nir_intrinsic_load_agx &&
         load->intrinsic != nir_intrinsic_load_constant_agx) ||
-       !(nir_intrinsic_access(load) & ACCESS_CAN_REORDER))
+       !_mesa_set_search(promoted, load))
       return false;
 
    nir_intrinsic_set_access(
@@ -999,7 +1083,7 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
       /* The G17P uniform fabs cost is not an M5 witness; keep the
        * generic instruction cost there. */
       options.def_size = agx3c ? def_size_agx3c : def_size_agx3b;
-      options.instr_cost_cb = agx3c ? instr_cost : instr_cost_g17p;
+      options.instr_cost_cb = agx3c ? instr_cost_agx3c : instr_cost_g17p;
       options.rewrite_cost_cb = agx3c ? rewrite_cost_agx3c : rewrite_cost_g17p;
    }
    /* Every AGX3B chip: the uniform file it fills is the encoding's. */
@@ -1009,10 +1093,18 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
       options.cb_data = branches;
    }
    bool speculative = false;
-   if (g17p && !agx3c && nir->info.stage == MESA_SHADER_FRAGMENT) {
-      unsigned free_halves = free_preamble_halves(nir, &options, sizes);
+   struct set *promoted_speculative = NULL;
+   if (!agx3c &&
+       (nir->info.stage == MESA_SHADER_FRAGMENT ||
+        nir->info.stage == MESA_SHADER_COMPUTE) &&
+       has_speculative_load_candidate(nir)) {
+      promoted_speculative = _mesa_pointer_set_create(NULL);
+      struct speculative_load_state spec_state = {
+         .free_halves = free_preamble_halves(nir, &options, sizes),
+         .promoted = promoted_speculative,
+      };
       NIR_PASS(speculative, nir, nir_shader_intrinsics_pass,
-               allow_speculative_load, nir_metadata_all, &free_halves);
+               allow_speculative_load, nir_metadata_all, &spec_state);
    }
 
    NIR_PASS(progress, nir, nir_opt_preamble, &options, sizes);
@@ -1020,13 +1112,14 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
    if (speculative) {
       nir_function_intrinsics_pass(nir_shader_get_entrypoint(nir),
                                    disallow_speculative_load, nir_metadata_all,
-                                   NULL);
+                                   promoted_speculative);
       if (progress) {
          nir_function_intrinsics_pass(nir_shader_get_preamble(nir),
                                       guard_speculative_load,
                                       nir_metadata_control_flow, NULL);
       }
    }
+   _mesa_set_destroy(promoted_speculative, NULL);
 
    if (progress && g17p)
       NIR_PASS(_, nir, agx_nir_export_select_flags_as_halves, false);

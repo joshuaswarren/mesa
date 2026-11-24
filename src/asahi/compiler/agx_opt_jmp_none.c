@@ -26,10 +26,12 @@
  *
  * On G17P a group with every lane off still spends a cycle per instruction, so
  * TF3's short light paths pay for the jump: 5 is 4-6% faster than 19 there, and
- * 10, 5 and 2 are alike.
+ * 10, 5 and 2 are alike. M5 (G17G/G17S/G17C) fragment shaders share the lower
+ * threshold, while M5 compute keeps COST_JMP so short bounds-checked kernels
+ * do not emit spurious forward skips.
  */
 #define COST_JMP (19)
-#define COST_JMP_G17P (5)
+#define COST_JMP_AGX3 (5)
 
 static uint32_t
 cost_instr(const agx_context *ctx, agx_instr *I)
@@ -170,8 +172,11 @@ try_insert_jmp(agx_context *ctx, agx_block *from, agx_instr *from_I,
    uint32_t cost_instructions =
       cost_between(ctx, from, from_I, target, skip_to_end_of_target, &must_skip);
 
-   const uint32_t cost_jmp =
-      ctx->key->dev.chip == AGX_CHIP_G17P ? COST_JMP_G17P : COST_JMP;
+   const bool low_cost_jmp =
+      ctx->key->dev.chip == AGX_CHIP_G17P ||
+      (ctx->stage == MESA_SHADER_FRAGMENT &&
+       agx_chip_g17_m5(ctx->key->dev.chip) && !agx_is_g18g(&ctx->key->dev));
+   const uint32_t cost_jmp = low_cost_jmp ? COST_JMP_AGX3 : COST_JMP;
    if (!must_skip && cost_instructions < cost_jmp * inverse_probability)
       return;
 

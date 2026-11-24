@@ -34,6 +34,37 @@ enum hk_cmd_bo_type {
    HK_CMD_BO_TYPE_COUNT,
 };
 
+enum hk_cmd_span_bucket {
+   HK_CMD_SPAN_BUCKET_SMALL,
+   HK_CMD_SPAN_BUCKET_STREAM,
+   HK_CMD_SPAN_BUCKET_COUNT,
+};
+
+static inline enum hk_cmd_span_bucket
+hk_cmd_span_bucket_for_size(uint32_t size)
+{
+   return size == HK_CMD_STREAM_SPAN_SIZE ? HK_CMD_SPAN_BUCKET_STREAM
+                                          : HK_CMD_SPAN_BUCKET_SMALL;
+}
+
+static inline unsigned
+hk_cmd_pool_span_cache_max(const struct agx_device *dev,
+                           enum hk_cmd_bo_type type)
+{
+   return agx_chip_native_or_m5(dev->chip) && !dev->is_virtio &&
+             (type == HK_CMD_BO_MAIN || type == HK_CMD_BO_ROOT)
+             ? HK_G17P_CMD_POOL_MAIN_BO_MAX
+             : HK_CMD_POOL_BO_MAX;
+}
+
+static inline unsigned
+hk_cmd_pool_ioto_span_cache_max(const struct agx_device *dev)
+{
+   return agx_chip_native_or_m5(dev->chip) && !dev->is_virtio
+             ? HK_G17P_CMD_POOL_MAIN_BO_MAX
+             : HK_CMD_POOL_BO_MAX;
+}
+
 /* Recyclable command buffer BO, used for both push buffers and upload */
 struct hk_cmd_bo {
    /* Recording/pool ownership plus immutable in-flight submission pins. */
@@ -105,9 +136,12 @@ struct hk_cmd_pool {
    /** Recyclable hk_cmd_bo lists, kept separate by mapping and VA policy. */
    struct list_head free_bos[HK_CMD_BO_TYPE_COUNT];
    uint32_t num_free_bos[HK_CMD_BO_TYPE_COUNT];
-   /** Spans likewise, so a warm small recording skips the device lock. */
-   struct list_head free_spans[HK_CMD_BO_TYPE_COUNT];
-   uint32_t num_free_spans[HK_CMD_BO_TYPE_COUNT];
+   /** Spans likewise, split by size bucket for O(1) reuse without locking. */
+   struct list_head free_spans[HK_CMD_BO_TYPE_COUNT][HK_CMD_SPAN_BUCKET_COUNT];
+   uint32_t num_free_spans[HK_CMD_BO_TYPE_COUNT][HK_CMD_SPAN_BUCKET_COUNT];
+   /** Recyclable Ioto arena spans (HK_CMD_SLAB_IOTO, HK_CMD_SPAN_SIZE). */
+   struct list_head free_ioto_spans;
+   uint32_t num_free_ioto_spans;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_cmd_pool, vk.base, VkCommandPool,
@@ -136,6 +170,11 @@ VkResult hk_cmd_pool_alloc_span(struct hk_cmd_pool *pool,
                                 enum hk_cmd_slab_class class, uint64_t size,
                                 uint64_t alignment, struct agx_ptr *ptr,
                                 struct hk_vdm_allocation **allocation);
+VkResult hk_cmd_pool_alloc_ioto_span(struct hk_cmd_pool *pool,
+                                     struct agx_ptr *ptr,
+                                     struct hk_vdm_allocation **allocation);
+void hk_cmd_pool_free_ioto_span(struct hk_cmd_pool *pool,
+                                struct hk_vdm_allocation *allocation);
 void hk_device_free_span(struct hk_device *dev,
                          struct hk_vdm_allocation *allocation);
 void hk_device_finish_vdm_slabs(struct hk_device *dev);
@@ -151,7 +190,9 @@ struct hk_queue;
 struct vk_queue_submit;
 VkResult hk_cmd_pending_begin(struct hk_device *dev,
                                const struct vk_queue_submit *submit,
-                               unsigned chunks, struct agx_bo *extra_bo,
+                               unsigned chunks,
+                               struct agx_bo *const *extra_bos,
+                               unsigned extra_bo_count,
                                struct hk_cmd_pending **out);
 uint32_t hk_cmd_pending_signal(struct hk_cmd_pending *pending);
 void hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *pending,

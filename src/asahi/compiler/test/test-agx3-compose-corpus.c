@@ -27,6 +27,80 @@ now_ns(void)
    return ts.tv_sec * 1e9 + ts.tv_nsec;
 }
 
+/* Marks the fields that a predicate tests or a LUT maps in a node or in any
+ * node under it. */
+static void
+mark_whole(const agx3_table *t, const agx3_node *node,
+           bool whole[AGX3_MAX_FIELDS])
+{
+   for (unsigned j = 0; j < node->pred_n; j++)
+      whole[agx3_pred_at(t, node->pred_off + j).field] = true;
+   for (unsigned j = 0; j < node->cmd_n; j++) {
+      const agx3_cmd *cmd = &t->cmds[node->cmd_off + j];
+      if (cmd->lut_n)
+         whole[cmd->field] = true;
+   }
+   for (unsigned j = 0; j < node->grp_n; j++) {
+      const agx3_group *g = &t->groups[node->grp_off + j];
+      for (unsigned a = 0; a < g->alt_n; a++)
+         mark_whole(t, &t->nodes[g->alt_off + a], whole);
+   }
+}
+
+/*
+ * The encoder must refuse a value with bits that nothing accounts for. For a
+ * field that no predicate tests and no LUT maps in any node the form can
+ * reach, only direct deposits can account for bits, and the field does not
+ * decide which of those nodes apply. So with every bit set that no direct
+ * deposit of the table takes, the form does not encode, whatever else the
+ * vector holds. Returns how many of those vectors the form encoded.
+ */
+static unsigned
+uncovered_accepted(const agx3_table *t, uint32_t form,
+                   uint64_t fields[AGX3_MAX_FIELDS], unsigned long *tried)
+{
+   /* Per table: the bits of each field that its direct deposits take. */
+   static struct cover {
+      bool done;
+      uint64_t slices[AGX3_MAX_FIELDS];
+   } covers[3];
+   struct cover *cover =
+      &covers[t == &agx3b_table ? 0 : t == &agx3c_table ? 1 : 2];
+   if (!cover->done) {
+      /* The roots of the forms are the last nodes. */
+      uint32_t num_nodes = 0;
+      for (uint32_t f = 0; f < t->num_forms; f++)
+         num_nodes = t->forms[f].node >= num_nodes ? t->forms[f].node + 1
+                                                   : num_nodes;
+      for (uint32_t n = 0; n < num_nodes; n++) {
+         const agx3_node *node = &t->nodes[n];
+         for (unsigned j = 0; j < node->cmd_n; j++) {
+            const agx3_cmd *cmd = &t->cmds[node->cmd_off + j];
+            if (!cmd->lut_n)
+               cover->slices[cmd->field] |= ((1ull << cmd->width) - 1)
+                                            << cmd->src_shift;
+         }
+      }
+      cover->done = true;
+   }
+
+   bool whole[AGX3_MAX_FIELDS] = {false};
+   mark_whole(t, &t->nodes[t->forms[form].node], whole);
+
+   unsigned accepted = 0;
+   uint8_t out[AGX3_MAX_WORDS * 2];
+   for (unsigned f = 0; f < AGX3_MAX_FIELDS; f++) {
+      if (whole[f] || !~cover->slices[f])
+         continue;
+      const uint64_t was = fields[f];
+      fields[f] |= ~cover->slices[f];
+      accepted += agx3_compose(t, form, fields, out);
+      fields[f] = was;
+      (*tried)++;
+   }
+   return accepted;
+}
+
 /* `agx3_compose_corpus_test N` replays both corpora N times and prints what
  * one instruction costs in the fastest replay: fill the field vector, find
  * the form, encode. */
@@ -113,6 +187,19 @@ main(int argc, char **argv)
             fail++;
          }
 
+         /* apple_order has each mnemonic's forms in the mnemonic's own
+          * range of the table, by ascending size, then ep. */
+         const agx3_form *o = &t->forms[t->apple_order[i]];
+         const agx3_form *po = i > 0 ? &t->forms[t->apple_order[i - 1]] : NULL;
+         if (t->apple_order[i] >= t->num_forms || o->mnemonic != f->mnemonic ||
+             (po && po->mnemonic == o->mnemonic &&
+              (po->size > o->size ||
+               (po->size == o->size && po->ep >= o->ep)))) {
+            fprintf(stderr, "FAIL form order at %s.ep%u (agx3%c)\n", name,
+                    f->ep, letter);
+            fail++;
+         }
+
          if (i > 0) {
             const agx3_form *prev = &t->forms[i - 1];
             if (prev->mnemonic > f->mnemonic ||
@@ -137,6 +224,7 @@ main(int argc, char **argv)
       }
    }
 
+   unsigned long refused = 0;
    for (size_t i = 0; i < agx3_compose_corpus_case_count; ++i) {
       const struct agx3_compose_corpus_case *c = &agx3_compose_corpus_cases[i];
       const agx3_table *t = c->enc == 0 ? &agx3b_table : &agx3c_table;
@@ -154,6 +242,12 @@ main(int argc, char **argv)
          if (fail < 8)
             fprintf(stderr, "FAIL case %zu: %s.ep%d (agx3%c)\n", i, c->mnemonic,
                     c->ep, c->enc == 0 ? 'b' : 'c');
+         fail++;
+      } else if (uncovered_accepted(t, (uint32_t)form, fields, &refused)) {
+         if (fail < 8)
+            fprintf(stderr, "FAIL case %zu: %s.ep%d (agx3%c) encodes with "
+                            "bits nothing accounts for\n",
+                    i, c->mnemonic, c->ep, c->enc == 0 ? 'b' : 'c');
          fail++;
       } else {
          pass++;
@@ -180,6 +274,12 @@ main(int argc, char **argv)
             fprintf(stderr, "FAIL G18G case %zu: %s.ep%u (%s+0x%x)\n", i,
                     c->mnemonic, c->ep, c->text, c->offset);
          fail++;
+      } else if (uncovered_accepted(t, (uint32_t)form, fields, &refused)) {
+         if (fail < 8)
+            fprintf(stderr, "FAIL G18G case %zu: %s.ep%u encodes with bits "
+                            "nothing accounts for\n",
+                    i, c->mnemonic, c->ep);
+         fail++;
       } else {
          g18g_pass++;
       }
@@ -194,5 +294,7 @@ main(int argc, char **argv)
    printf("agx3_compose corpus: all %u instructions reproduced\n", pass);
    printf("agx3_compose G18G corpus: all %u instructions reproduced\n",
           g18g_pass);
+   printf("agx3_compose: all %lu vectors with uncovered bits refused\n",
+          refused);
    return 0;
 }

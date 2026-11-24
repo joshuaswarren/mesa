@@ -73,15 +73,9 @@ struct agx3_cdm_decoded_record {
    } data;
 };
 
-/*
- * Decode one exact record from the beginning of a larger command stream.
- * `available` may include following records; `length` reports only the bytes
- * consumed by the first record.  Unknown block types, unsupported identities,
- * reserved-bit mutations, and truncated records fail with a cleared result.
- *
- * This deliberately does not infer ordering, follow links, read GPU memory,
- * submit work, or admit an AGX3 device.
- */
+/* Decode one CDM record from the start of a stream (`available` may include
+ * trailing records; `record->length` gives bytes consumed). Fails with a
+ * cleared `record` on unknown types, reserved-bit errors, or truncation. */
 bool agx3_cdm_decode_one(enum agx_chip chip, const void *bytes,
                          size_t available,
                          struct agx3_cdm_decoded_record *record);

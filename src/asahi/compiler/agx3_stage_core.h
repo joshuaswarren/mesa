@@ -2,39 +2,12 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * Writers for the AGX3 *staging* register file.
+ * AGX3 staging-register file writers (`ldimm.ep2`, staging/general `clr`).
  *
- * `movmsk`, `depthf`, `uvsw` and the texture coordinate operand do not name a
- * general register. Their operand field is selected by the destination-class
- * selector f9 = 5, and it indexes a separate file that only a small set of
- * instructions can write. agx3_tex_core has carried one such writer since the
- * sampler work (the coordinate `copy`); this header collects the whole family
- * so the coverage/depth writeout path can reach it too.
- *
- * The destination-class selector is shared by every AGX3 form:
- *
- *   f9 = 2  general register, index in f2, plus the one-bit hint f11
- *   f9 = 3  uniform / IOTO destination, index in f3
- *   f9 = 4  thread-parameter-store spill slot, index in f4
- *   f9 = 5  staging register, index in f5, with kill f13 and slot f12
- *
- * A staging write is asynchronous: it takes a scoreboard slot (f12) that the
- * consuming writeout instruction waits on. That is why `copy`, `ldimm.ep2` and
- * the staging `clr` all carry f12 while their general-register siblings do not.
- *
- * Evidence (G17P / AGX3b, offline `applegpu-nt -arch applegpu_g17p`, decoded
- * with the composer that also generates Mesa's own encoder tables):
- *
- *  - `ldimm.ep2` staging form: three distinct witnesses in every Apple vertex
- *    object of apple-g17p-isa.metalar, e.g. `0c 80 23 3e 00 00 00 0c 40 20`
- *    = staging[0] <- 0x3F800000 on slot 2, and the discard constant
- *    `0c 80 23 fe 1c 0c ff 0f 40 00` = staging[0] <- 0xFFFFFF00 on slot 1.
- *  - staging `clr`: `1b 00 20 04` = staging[2] <- 0, slot 1 (vmain).
- *  - general `clr`: `0b 00 00 00` / `1b 00 00 00` / `2b 00 00 00` /
- *    `3b 00 00 00` = r0/r2/r4/r6 <- 0 (uint4(0) store probe).
- *
- * AGX3c has all three forms but no witness, so every entry point here refuses
- * anything but AGX3b rather than guessing the longer encoding's constants.
+ * Destination classes: f9=2 GPR (f2), f9=3 uniform (f3), f9=4 TPS spill (f4),
+ * f9=5 staging register (f5, kill f13, scoreboard slot f12). Staging writes
+ * are asynchronous and signal f12 for consuming writeout instructions.
+ * Currently AGX3B only; other encodings fail closed.
  */
 
 #pragma once

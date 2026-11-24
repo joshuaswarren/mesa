@@ -26,24 +26,10 @@ struct agx_vdm_state_vertex_pipeline_pair {
 };
 
 /*
- * Pack/unpack only the two-word AGX3 VDM State vertex-pipeline field proven
- * in Apple's VDMEncoderGen5/Gen6 command encoders:
- *
- *   word 0 bits  0..21: caller-preserved raw state-template payload
- *   word 0 bits 22..31: pipeline address bits 38..47
- *   word 1 bits  0..31: pipeline address bits  6..37
- *
- * The pipeline address is therefore a 64-byte-aligned, 48-bit GPU virtual
- * address.  The raw template bits remain unnamed because their individual
- * semantics are not completely grounded.
- *
- * The target allowlist contains only identities directly served by the
- * inspected Apple Metal plugins, plus G18G, whose J873 native VDM state and
- * fragment PPP records carry this exact pair.  G16P and G17A share
- * neighboring command-stream generations but are not claimed by those
- * plugins and fail closed.
- * This helper does not represent the surrounding VDM State record, emit a
- * live command, or enable scheduling, submission, or device admission.
+ * Two-word AGX3 VDM State vertex-pipeline pair (64-byte-aligned 48-bit VA):
+ *   word 0[21:0]:  caller-preserved raw state-template bits
+ *   word 0[31:22]: pipeline[47:38]
+ *   word 1[31:0]:  pipeline[37:6]
  */
 bool agx_vdm_state_vertex_pipeline_pair_supported(enum agx_chip chip);
 
