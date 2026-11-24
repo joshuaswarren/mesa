@@ -242,4 +242,160 @@ TEST(M5ByteToFloat, CompilesOnEachTarget)
    EXPECT_GE(g18, m5 + 8);
 }
 
+/* Paired low/high u8-to-f32 unpacks on AGX3B and AGX3C (not AGX3D) fold into
+ * normflt.f16 + hmul + mixed-width ffma when consumed by all-register f32 FMAs,
+ * and cleanly fall back to normflt.f32 + fmul (or widen) when consumed by
+ * stores or uniforms. */
+TEST(M5ByteToFloat, AGX3NormfltBytePairsCompile)
+{
+   const struct {
+      agx_isa_encoding encoding;
+      agx_chip chip;
+      bool emit_agx3d;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true},
+   };
+   for (auto t : targets) {
+      for (bool fma_consumer : {false, true}) {
+         nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                        &agx_nir_options,
+                                                        "normflt-pairs");
+         nir_def *addr = agx_test_load_preamble(&b, 1, 64, 0);
+         nir_def *w = nir_load_global(&b, 1, 32, addr);
+         nir_def *weight = nir_load_global(&b, 1, 32, nir_iadd_imm(&b, addr, 4));
+         nir_def *acc0 = nir_load_global(&b, 1, 32, nir_iadd_imm(&b, addr, 8));
+         nir_def *acc1 = nir_load_global(&b, 1, 32, nir_iadd_imm(&b, addr, 12));
+         nir_def *b0 = nir_u2f32(&b, nir_iand_imm(&b, w, 0xff));
+         nir_def *b1 = nir_u2f32(&b, nir_iand_imm(&b, nir_ushr_imm(&b, w, 8), 0xff));
+         nir_def *b2 = nir_u2f32(&b, nir_iand_imm(&b, nir_ushr_imm(&b, w, 16), 0xff));
+         nir_def *b3 = nir_u2f32(&b, nir_ushr_imm(&b, w, 24));
+         nir_def *out;
+         if (fma_consumer) {
+            nir_def *r0 = nir_ffma(&b, b0, weight, acc0);
+            nir_def *r1 = nir_ffma(&b, b1, weight, acc1);
+            nir_def *r2 = nir_ffma(&b, b2, weight, acc0);
+            nir_def *r3 = nir_ffma(&b, b3, weight, acc1);
+            out = nir_vec4(&b, r0, r1, r2, r3);
+         } else {
+            out = nir_vec4(&b, b0, b1, b2, b3);
+         }
+         nir_store_global(&b, out, nir_iadd_imm(&b, addr, 16), .align_mul = 16);
+         b.shader->info.workgroup_size[0] = 32;
+         b.shader->info.workgroup_size[1] = 1;
+         b.shader->info.workgroup_size[2] = 1;
+
+         agx_shader_key key = {};
+         key.dev.encoding = t.encoding;
+         key.dev.chip = t.chip;
+         key.dev.emit_agx3d = t.emit_agx3d;
+         key.no_preamble = true;
+         key.reserved_preamble = 16;
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+            << "chip=" << t.chip << " fma_consumer=" << fma_consumer;
+         EXPECT_GT(part.info.stats.instrs, 0u);
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
+   }
+}
+
+/* Verify AGX IR selection directly: paired u8->f32 unpacks emit
+ * normflt.f16 + hmul when consumed by all-register f32 FFMA, emit
+ * normflt.f32 + fmul when consumed by non-FMA users (e.g. stores), and emit
+ * no normflt at all when emit_agx3d is set. */
+TEST(M5ByteToFloat, AGX3NormfltBytePairsSelectPath)
+{
+   const struct {
+      agx_isa_encoding encoding;
+      agx_chip chip;
+      bool emit_agx3d;
+      bool expect_normflt;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C, false, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true,  false},
+   };
+   for (auto t : targets) {
+      for (bool fma_consumer : {false, true}) {
+         SCOPED_TRACE(t.chip);
+         SCOPED_TRACE(fma_consumer);
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = t.encoding;
+         key.dev.chip = t.chip;
+         key.dev.emit_agx3d = t.emit_agx3d;
+         b->shader->key = &key;
+
+         agx_index half = agx_preload(b, agx_register(0, AGX_SIZE_16));
+         agx_index weight = agx_preload(b, agx_register(2, AGX_SIZE_32));
+         agx_index acc = agx_preload(b, agx_register(4, AGX_SIZE_32));
+         agx_index zero = agx_mov_imm(b, 16, 0);
+         agx_index sh8 = agx_mov_imm(b, 16, 8);
+         agx_index hi_half = agx_bfeil(b, zero, half, sh8, 0);
+         agx_index lo = agx_temp(b->shader, AGX_SIZE_32);
+         agx_index hi = agx_temp(b->shader, AGX_SIZE_32);
+         agx_convert_to(b, lo, agx_immediate(AGX_CONVERT_U8_TO_F), half,
+                        AGX_ROUND_RTE);
+         agx_convert_to(b, hi, agx_immediate(AGX_CONVERT_U16_TO_F), hi_half,
+                        AGX_ROUND_RTE);
+
+         if (fma_consumer) {
+            agx_index r0 = agx_ffma(b, lo, weight, acc);
+            agx_index r1 = agx_ffma(b, hi, weight, acc);
+            agx_unit_test(b, r0);
+            agx_unit_test(b, r1);
+         } else {
+            agx_unit_test(b, lo);
+            agx_unit_test(b, hi);
+         }
+
+         agx_opt_agx3_normflt_byte_pairs(b->shader);
+
+         unsigned normflt_f16 = 0, normflt_f32 = 0, hmul = 0, fmul = 0;
+         unsigned ffma_f16_src0 = 0;
+         agx_foreach_instr_global(b->shader, I) {
+            if (I->op == AGX_OPCODE_NORMFLT_AGX3) {
+               EXPECT_EQ(I->format, AGX_FORMAT_U8NORM);
+               EXPECT_EQ(I->dest[0].channels_m1, 1u);
+               if (I->dest[0].size == AGX_SIZE_16)
+                  normflt_f16++;
+               else if (I->dest[0].size == AGX_SIZE_32)
+                  normflt_f32++;
+            } else if (I->op == AGX_OPCODE_HMUL) {
+               hmul++;
+            } else if (I->op == AGX_OPCODE_FMUL) {
+               fmul++;
+            } else if (I->op == AGX_OPCODE_FFMA &&
+                       I->src[0].size == AGX_SIZE_16) {
+               ffma_f16_src0++;
+            }
+         }
+
+         if (!t.expect_normflt) {
+            EXPECT_EQ(normflt_f16, 0u);
+            EXPECT_EQ(normflt_f32, 0u);
+            EXPECT_EQ(hmul, 0u);
+            EXPECT_EQ(fmul, 0u);
+         } else if (fma_consumer) {
+            EXPECT_EQ(normflt_f16, 1u);
+            EXPECT_EQ(normflt_f32, 0u);
+            EXPECT_EQ(hmul, 2u);
+            EXPECT_EQ(fmul, 0u);
+            EXPECT_EQ(ffma_f16_src0, 2u);
+         } else {
+            EXPECT_EQ(normflt_f16, 0u);
+            EXPECT_EQ(normflt_f32, 1u);
+            EXPECT_EQ(hmul, 0u);
+            EXPECT_EQ(fmul, 2u);
+         }
+         ralloc_free(mem);
+      }
+   }
+}
+
 } // namespace

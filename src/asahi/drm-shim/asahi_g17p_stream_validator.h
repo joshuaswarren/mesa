@@ -99,6 +99,10 @@ struct asahi_g17p_compute_stats {
    unsigned barriers;
    unsigned prologue_barriers;
    unsigned strong_barriers;
+   /* Indirect (compact) launches, and those of them whose terminating
+    * barrier is the strong cache flush. */
+   unsigned indirect_launches;
+   unsigned indirect_strong_barriers;
    unsigned sstt_flushes;
    bool terminated;
 };

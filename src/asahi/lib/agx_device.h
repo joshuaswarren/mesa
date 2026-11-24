@@ -186,6 +186,9 @@ struct agx_device {
     * client_memory_limit tail of drm_asahi_params_global (where 0 means no
     * driver limit, as opposed to a legacy 600-byte reply or virtio). */
    bool has_memory_limits;
+   /* GEM_USERPTR imports ranges of any size the GPU memory limits admit in
+    * this process (agx_userptr_imports_any_size()), checked at open. */
+   bool userptr_any_size;
    agx_device_ops_t ops;
 
    /* vdrm device */
@@ -522,6 +525,25 @@ agx_has_userptr(const struct agx_device *dev)
 {
    return !dev->is_virtio &&
           (dev->params.features & DRM_ASAHI_FEATURE_USERPTR);
+}
+
+/*
+ * Host memory imports of any size can succeed: GEM_USERPTR is available and
+ * the caller's RLIMIT_MEMLOCK does not bound it below the GPU memory limits.
+ * APIs whose imports have no size bound of their own offer them only then.
+ */
+static inline bool
+agx_has_host_import(const struct agx_device *dev)
+{
+   return agx_has_userptr(dev) && dev->userptr_any_size;
+}
+
+/* The kernel charges GEM_USERPTR pins to RLIMIT_MEMLOCK as well as to the GPU
+ * memory limits (agx_userptr_limits.h). */
+static inline bool
+agx_userptr_charges_memlock(const struct agx_device *dev)
+{
+   return !(dev->params.features & DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK);
 }
 
 /* The kernel can keep a BO resident under memory pressure (GEM_RESIDENCY). */

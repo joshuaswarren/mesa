@@ -6697,6 +6697,32 @@ static void test_threejs_width_kind_modifier_axes(void)
       assert(agx3_falu_fma_mod_runtime(enc, 0, 0, 8, 4, &g, &frt, bytes,
                                        &len));
       exact(bytes, len, "09081e01810402c0");
+
+      /* Unmodified src0_16 alone on all-register f32mul and f32fma across
+       * AGX3B and AGX3C (symmetric to src1_16 above: f43 = 1, f26 = 2). */
+      const enum agx_isa_encoding mixed_encs[2] = {
+         AGX_ISA_ENCODING_AGX3B,
+         AGX_ISA_ENCODING_AGX3C,
+      };
+      for (unsigned ei = 0; ei < 2; ++ei) {
+         struct agx3_falu_mods m0 = {0};
+         m0.src0_16 = true;
+         assert(agx3_falu_mul_mod_runtime(mixed_encs[ei], 0, 4, 0, &m0, &rt,
+                                          bytes, &len));
+         exact(bytes, len, "09011d0400c0");
+
+         assert(agx3_falu_fma_mod_runtime(mixed_encs[ei], 0, 8, 0, 4, &m0,
+                                          &frt, bytes, &len));
+         exact(bytes, len, "09011e08810402c0");
+
+         /* Odd half-register src0 also encodes on both AGX3B and AGX3C. */
+         assert(agx3_falu_mul_mod_runtime(mixed_encs[ei], 0, 5, 0, &m0, &rt,
+                                          bytes, &len));
+         assert(len > 0);
+         assert(agx3_falu_fma_mod_runtime(mixed_encs[ei], 0, 9, 0, 4, &m0,
+                                          &frt, bytes, &len));
+         assert(len > 0);
+      }
    }
 
    /* fsel: an absolute comparator against a minifloat IMMEDIATE. Against the

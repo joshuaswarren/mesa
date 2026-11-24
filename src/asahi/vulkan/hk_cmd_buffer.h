@@ -116,6 +116,7 @@ struct hk_g17p_prepared_bind_tail {
    uint8_t provoking;
    uint8_t occlusion_mode;
    uint8_t viewport_count;
+   uint8_t effective_fragment_pass_type;
    bool generate_primitive_id;
    bool force_never_in_shader;
    bool in_meta;
@@ -329,6 +330,14 @@ enum hk_root_reads {
    /* Push constants: vertex-only push updates leave fragment-visible root
     * bytes unchanged unless the fragment shader reads push constants. */
    HK_ROOT_READS_PUSH = BITFIELD_BIT(3),
+   /* Compute-only positive proof (inverted polarity so older cached binaries
+    * default to 0 = conservative): API workgroup has <= 256 invocations (a
+    * multiple of 32), depends only on global invocation ID / zero base_group
+    * (no shared/tile/scratch/ray/matrix/barrier/subgroup/local/workgroup
+    * builtins, and never observes group_count_addr), so direct zero-base
+    * dispatches may launch in coalesced hardware workgroups up to 256/512
+    * threads that evenly divide the thread grid. */
+   HK_ROOT_PROVEN_WG_COALESCE_SAFE = BITFIELD_BIT(4),
 };
 
 /* Every root byte a draw may republish without the fragment stage observing
@@ -705,6 +714,14 @@ struct hk_rendering_state {
     * this physical stream assuming tile-memory reads. Any subsequent draw that
     * falls back to texture-backed input attachment reads must split first. */
    bool kept_local_read_barrier;
+
+   /* Partial-MRT HSR background liveness for the first stream of the pass:
+    * bg_live_mask marks bound colour attachments whose initial BG contents
+    * must be preserved (LOAD_OP_LOAD or LOAD_OP_CLEAR), and bg_clear_fill_rt
+    * encodes 2-bit agx_epilog_clear_fill codes for LOAD_OP_CLEAR attachments
+    * whose clear value can be materialized directly in the fragment epilog. */
+   uint8_t bg_live_mask;
+   uint16_t bg_clear_fill_rt;
 };
 
 struct hk_index_buffer_state {
@@ -737,6 +754,8 @@ enum hk_g17p_range_source {
     * (dynamic buffers) or a static descriptor set holds at a fixed byte, plus
     * a fixed offset, while that buffer covers the span. */
    HK_G17P_RANGE_SOURCE_BUFFER = 5,
+   /* Hoisted AGX3 vertex preamble output buffer (computed once in PREGFX). */
+   HK_G17P_RANGE_SOURCE_PREAMBLE_OUT = 6,
    /* Uploaded while collecting the ranges (combined-sampler pointers,
     * spilled render-target descriptors), or a buffer span the buffer does
     * not wholly cover: not re-derivable. */
@@ -810,6 +829,7 @@ struct hk_g17p_vdm_update_key {
    bool primitive_id;
    bool ordinary;
    bool selector_valid;
+   bool hoisted_preamble;
 };
 
 struct hk_graphics_state {
@@ -858,6 +878,10 @@ struct hk_graphics_state {
 
    uint64_t draw_params;
    uint64_t draw_id_ptr;
+   /* Hoisted AGX3 vertex preamble output VA active for the current multi-draw
+    * batch, and whether the current multi-draw requested hoisting. */
+   uint64_t g17p_hoisted_preamble_va;
+   bool g17p_hoist_preamble_requested;
    uint32_t g17p_draw_params_value[2];
    uint32_t g17p_draw_id_value;
    bool g17p_draw_params_host_valid;
@@ -1008,11 +1032,18 @@ struct hk_graphics_state {
       struct hk_fast_link_key_fs key;
       uint64_t desc_gen;
       bool valid;
-      /* Colour attachments the linked fragment program writes, and whether
-       * it reads the tilebuffer. */
+      /* Colour attachments the linked fragment program writes (including any
+       * epilog clear-fill targets), those written by the application shader
+       * itself, the stream clear-fill code snapshot used to build `key`, and
+       * whether the linked program reads the tilebuffer. */
       uint8_t color_written;
+      uint8_t app_color_written;
+      uint16_t bg_clear_fill_rt;
       bool reads_tib;
    } fast_link_fs;
+
+   /* Effective AGX_PASS_TYPE_* selected for the active draw (hk_partial_mrt_hsr). */
+   uint8_t effective_fragment_pass_type;
 
    /* Keep these four native graphics caches contiguous: AGX2 resets leave
     * their zero-initialized storage untouched.
@@ -1330,6 +1361,15 @@ struct hk_cs {
    /* A graphics program recorded in this stream writes external memory. */
    bool m5_shader_writes_memory;
 
+   /* Per-render-stream memo of hoisted AGX3 vertex preamble outputs already
+    * computed by a PREGFX dispatch for a given (vertex shader, root VA). */
+   struct {
+      const struct hk_shader *vs;
+      uint64_t root;
+      uint64_t out_va;
+   } preamble_hoist[4];
+   uint8_t preamble_hoist_next;
+
    /* M5: the continued instance was ordered after this stream's earlier work
     * by a dependency that is not framebuffer-local (hk_m5_pass_merge_begin()).
     * While this is the open render stream, every draw recorded into it must
@@ -1415,6 +1455,21 @@ struct hk_cs {
     * (vkCmdEndRendering without SUSPENDING) its render pass: it is the whole
     * pass, not a part split off or continued. */
    bool g17p_pass_begins, g17p_pass_ends;
+
+   /* Partial-MRT HSR per-stream tracking:
+    * - bg_live_mask: bound colour attachments whose stream BG shader (bg.main
+    *   or bg.partial) holds live contents that ISP HSR must not skip.
+    * - bg_clear_fill_rt: 2-bit agx_epilog_clear_fill codes for LOAD_OP_CLEAR
+    *   attachments on the first stream of a non-resuming pass (0 on later
+    *   streams where bg.main reloads partial results).
+    * - user_color_written_mask: colour attachments written by application
+    *   draws or mid-pass vkCmdClearAttachments in this stream.
+    * - opaque_color_written: colour attachments written by pending
+    *   opaque/punch-through draws in the current HSR batch. */
+   uint8_t bg_live_mask;
+   uint16_t bg_clear_fill_rt;
+   uint8_t user_color_written_mask;
+   uint8_t opaque_color_written;
 
    /* A G17P mesh launch is recorded into this render stream. The A18 Pro
     * loses the vertex output of the mesh workgroup in flight whenever the
@@ -1609,6 +1664,47 @@ hk_sync_later(struct hk_cs *a, struct hk_cs *b)
    if (!b)
       return a;
    return b->sync.seq > a->sync.seq ? b : a;
+}
+
+/* Whether the vertex program of a draw is published as an AGX3 VDM State
+ * Update (hk_agx3_publish_vertex_state()): the record
+ * agx_vdm_state_update_supported() admits. */
+static inline bool
+hk_agx3_vertex_state(enum agx_chip chip)
+{
+   return agx_chip_has_record(chip, AGX_RECORD_VDM_STATE);
+}
+
+/* Whether hk_agx3_publish_vertex_state() appends the native bind tail
+ * (hk_g17p_emit_native_bind_tail()) after the VDM State Update: the native
+ * AGX3 path. */
+static inline bool
+hk_vertex_state_has_bind_tail(enum agx_chip chip)
+{
+   return agx_chip_native_agx3(chip);
+}
+
+/* The bind-tail result of a draw that published its vertex state with
+ * hk_agx3_publish_vertex_state(). Every flush that publishes vertex state
+ * reports this, so none drops an emitted tail. */
+static inline bool
+hk_vertex_state_bind_tail(enum agx_chip chip, bool tail_emitted)
+{
+   return hk_vertex_state_has_bind_tail(chip) && tail_emitted;
+}
+
+/* Whether a draw that changes only root descriptors may take the root-only
+ * flush of hk_flush_dynamic_state(): the stream has latched a HAL300 graphics
+ * core (hk_flush_ppp_state()), so a new fragment program needs only its
+ * program record, and the vertex program is published as an AGX3 VDM State
+ * Update with no bind tail. A chip whose publication appends a tail takes
+ * hk_flush_dynamic_state_slow(), which also republishes the PPP state the
+ * tail belongs to. */
+static inline bool
+hk_root_only_flush_supported(enum agx_chip chip, const struct hk_cs *cs)
+{
+   return cs->m5_ppp_emitted_valid && hk_agx3_vertex_state(chip) &&
+          !hk_vertex_state_has_bind_tail(chip);
 }
 
 void *hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
@@ -2055,9 +2151,18 @@ struct hk_cmd_buffer {
     */
    bool in_meta;
 
+   /* Flags passed to vkBeginCommandBuffer(). */
+   VkCommandBufferUsageFlags usage_flags;
+
    /* CmdClearAttachments is the sole vk_meta operation affected by
     * conditional rendering. */
    bool conditional_meta;
+
+   /* True while recording the meta draw inside vkCmdClearAttachments. */
+   bool in_clear_attachments;
+
+   /* True while hk_begin_rendering() records its pass-start clear draw. */
+   bool in_begin_rendering_clear;
 
    /* Single-kick vkCmdTraceRays* on M5: while set, hk_dispatch_m5_native
     * writes the kernel's launch record (40-byte direct launch + barrier) here
@@ -2382,6 +2487,15 @@ hk_pool_alloc_from(struct hk_cmd_buffer *cmd, struct hk_uploader *uploader,
    }
 
    return hk_pool_alloc_from_slow(cmd, uploader, size, alignment, type);
+}
+
+/* Chips with an Ioto program generation fetch ordinary graphics descriptors
+ * from GPU memory through an immutable command-buffer root table and track
+ * descriptor/root lifetimes independently of per-draw USC uniform builders. */
+static inline bool
+hk_chip_uses_ioto_descriptor_root(enum agx_chip chip)
+{
+   return agx_chip_ioto_generation(chip) != AGX_IOTO_GENERATION_NONE;
 }
 
 struct agx_ptr hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
@@ -3046,6 +3160,12 @@ bool hk_agx3_indirect_ioto_prepare(
    uint64_t *ioto_template_gpu, uint32_t *ioto_copy_dwords,
    uint32_t *ioto_stride_B, struct libagx_indirect_ioto_reloc *relocs,
    uint32_t *reloc_count);
+
+/* Dispatch a 1-thread PREGFX compute kernel to materialize a hoisted AGX3
+ * vertex preamble from root_ptr into out_ptr before the render pass runs. */
+bool hk_dispatch_preamble_cs(struct hk_cmd_buffer *cmd,
+                             struct hk_shader *preamble_cs, uint64_t root_ptr,
+                             uint64_t out_ptr);
 
 void hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
                                   const VkCommandBufferBeginInfo *pBeginInfo);

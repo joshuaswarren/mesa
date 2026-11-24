@@ -78,7 +78,13 @@ struct hk_shader_info {
           * triangle covering the whole clip-space square in front of the
           * viewer (hk_vs_covers_clip_square()). */
          bool covers_clip_square;
-         uint8_t _pad[6];
+         /* Per-pipeline vertex input robustness (enum agx_robustness_level).
+          * Valid only when has_vertex_robustness is true; shader objects leave
+          * it false so draw-time prolog/index robustness derives from enabled
+          * device features. */
+         uint8_t vertex_robustness;
+         bool has_vertex_robustness;
+         uint8_t _pad[4];
       } vs;
 
       struct {
@@ -293,6 +299,10 @@ struct hk_shader {
     * with position and up to two ordinary varying slots populate the exact
     * no-preamble fields; other AGX3 layouts remain zero. */
    struct agx_vdm_state_update_program_info agx3_vdm_state_update;
+   /* Matching VertexProgramVariant state with its per-draw constant program
+    * stripped, used when the vertex preamble is hoisted into a PREGFX compute
+    * dispatch for multi-draw batches. */
+   struct agx_vdm_state_update_program_info agx3_vdm_state_update_no_cprog;
 
    const void *code_ptr;
    uint32_t code_size;
@@ -358,6 +368,13 @@ struct hk_shader {
    struct agx_shader_key local_read_key;
    struct hk_local_read_info local_read;
    struct hk_local_read_shader_meta local_read_meta;
+
+   /* Extracted 1-thread compute NIR for a hoistable AGX3 vertex preamble, and
+    * the lazily compiled compute shader built from it under linked.lock. */
+   void *preamble_nir;
+   size_t preamble_nir_size;
+   struct hk_shader *preamble_cs;
+   bool preamble_cs_attempted;
 };
 
 static inline uint64_t
@@ -733,6 +750,13 @@ struct hk_linked_shader {
     * on-chip tile memory instead of texture descriptors. */
    bool uses_local_read_tile;
 
+   /* Linked fragment executable is translucent solely because it writes a
+    * proper non-empty subset of the bound colour attachments without reading
+    * the tilebuffer, blending, logic ops, partial channel/sample masks, or
+    * spilling. Eligible for per-stream opaque/punch-through HSR promotion. */
+   bool partial_mrt_opaque_eligible;
+   uint8_t partial_mrt_written_mask;
+
    /* An inline-blend fragment program that forms its own constant program
     * (hk_g17p_inline_epilog_part()) has its own uniform layout: this shader
     * describes it, and the draw takes the program's launch (uniform ranges,
@@ -911,6 +935,40 @@ hk_allow_vs_cprog(enum agx_chip chip, uint64_t features, bool hw,
           stage == MESA_SHADER_VERTEX && !agx3_gen1_fragment_rq;
 }
 
+static inline enum agx_robustness_level
+hk_vertex_robustness_from_vk(VkPipelineRobustnessBufferBehaviorEXT behavior)
+{
+   switch (behavior) {
+   case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT:
+      return AGX_ROBUSTNESS_DISABLED;
+   case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT:
+      return AGX_ROBUSTNESS_GL;
+   case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT:
+      return AGX_ROBUSTNESS_D3D;
+   default:
+      UNREACHABLE("Invalid VkPipelineRobustnessBufferBehaviorEXT");
+   }
+}
+
+static inline enum agx_robustness_level
+hk_vertex_robustness_level(const struct hk_device *dev,
+                           const struct hk_shader *vs,
+                           VkPipelineRobustnessBufferBehaviorEXT vi_robustness)
+{
+   if (vs && vs->info.vs.has_vertex_robustness) {
+      if (vi_robustness !=
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT)
+         return hk_vertex_robustness_from_vk(vi_robustness);
+      return (enum agx_robustness_level)vs->info.vs.vertex_robustness;
+   }
+
+   if (dev->vk.enabled_features.robustBufferAccess2)
+      return AGX_ROBUSTNESS_D3D;
+   if (dev->vk.enabled_features.robustBufferAccess)
+      return AGX_ROBUSTNESS_GL;
+   return AGX_ROBUSTNESS_DISABLED;
+}
+
 /* A null uniform buffer is based at the zero page, which spans
  * maxUniformBufferRange, so null descriptors need no bounds when uniform
  * buffer robustness is disabled. Null storage buffers still need them to
@@ -999,3 +1057,9 @@ bool hk_tes_ray_queries_in_compute(const struct hk_device *dev);
 /* Lower a G17P task shader, after hk_lower_nir(), to the compute kernel of
  * the software task stage. */
 void hk_g17p_lower_task_kernel(nir_shader *nir);
+
+/* Lazily compile and cache the 1-thread compute shader for a hoistable AGX3
+ * vertex preamble. Returns NULL if the vertex shader has no hoistable preamble
+ * or compilation fails. */
+struct hk_shader *hk_shader_get_preamble_cs(struct hk_device *dev,
+                                            struct hk_shader *vs);

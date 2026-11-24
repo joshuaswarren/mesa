@@ -495,6 +495,13 @@ agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
  *   - 2x/4x multisample single-level, single-layer 2D: <= 8-byte formats;
  *   - 1x single-level 2D array and 3D: <= 8-byte formats.
  *
+ * G16G compresses only 1x single-level, single-layer 2D colour images of
+ * <= 8-byte formats (agx_chip_gen9_color_compression() without
+ * agx_chip_gen9_extended_compression()), plus single-sample UNORM8x4
+ * mip chains when agx_generate_mipmap() can generate their levels in compute
+ * (agx_g17p_compressed_mip_chain_allowed()), so glGenerateMipmap never
+ * stores a level per render pass.
+ *
  * Nothing decompresses such an image in place: it is neither shared nor
  * scanned out, so a spilling MRT framebuffer, feedback loop, or shader-image
  * binding reallocates it uncompressed via agx_decompress().
@@ -506,13 +513,16 @@ static bool
 agx_g17p_private_compression_allowed(const struct agx_device *dev,
                                      const struct pipe_resource *templ)
 {
-   if (dev->chip != AGX_CHIP_G17P ||
+   if (!agx_chip_gen9_color_compression(dev->chip) ||
        templ->width0 < 16 || templ->height0 < 16 ||
        (templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)))
       return false;
 
+   /* Every shape beyond 1x single-level 2D of <= 8-byte formats is G17P's. */
+   const bool extended = agx_chip_gen9_extended_compression(dev->chip);
    const bool color_le8b = agx_g17p_compression_color_format(templ->format);
-   const bool color_16b = agx_g17p_compression_color_format_16b(templ->format);
+   const bool color_16b =
+      extended && agx_g17p_compression_color_format_16b(templ->format);
    if (!color_le8b && !color_16b)
       return false;
 
@@ -522,13 +532,16 @@ agx_g17p_private_compression_allowed(const struct agx_device *dev,
          return false;
 
       if (single_sample)
-         return templ->last_level < 16;
+         return templ->last_level == 0 ||
+                (templ->last_level < 16 &&
+                 (extended ||
+                  agx_g17p_compressed_mip_chain_allowed(dev, templ)));
 
-      return color_le8b && templ->last_level == 0 &&
+      return extended && color_le8b && templ->last_level == 0 &&
              (templ->nr_samples == 2 || templ->nr_samples == 4);
    }
 
-   if (!color_le8b || !single_sample || templ->last_level != 0)
+   if (!extended || !color_le8b || !single_sample || templ->last_level != 0)
       return false;
 
    if (templ->target == PIPE_TEXTURE_2D_ARRAY)
@@ -3044,12 +3057,24 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
     * targets on non-G18 Gen10, and linear layered targets on G18, so a blit
     * transfer into those shapes would drop its render batch while reporting
     * success.
+    *
+    * The M5 profile (Gen10) renders every blit-transfer target through the
+    * paths its mapped transfers already take, since those blit each staged
+    * level of a tiled or compressed texture with u_blitter
+    * (agx_blit_from_staging, agx_blit_to_staging): u_blitter blits a layer at
+    * a time, a layered st/mesa PBO draw is split into layers
+    * (agx_swtnl_applies), the end-of-tile PBE stores sRGB as the linear
+    * format the shaders encoded, and a level of a mipmapped 2D texture is
+    * stored as a one-level image (agx_batch_upload_pbe_internal).  Let
+    * st/mesa upload from PBOs and convert formats on the GPU there instead
+    * of copying every texel through a CPU staging map.
     */
    const enum agx_descriptor_generation desc_gen =
       agx_chip_descriptor_generation(dev->chip);
    caps->texture_transfer_modes =
       agx_gallium_descriptor_generation_is_agx2(desc_gen) ||
-            desc_gen == AGX_DESCRIPTOR_GENERATION_9
+            desc_gen == AGX_DESCRIPTOR_GENERATION_9 ||
+            agx_chip_g17_m5(dev->chip)
          ? PIPE_TEXTURE_TRANSFER_BLIT
          : PIPE_TEXTURE_TRANSFER_DEFAULT;
 
