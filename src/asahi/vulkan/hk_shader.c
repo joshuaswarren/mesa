@@ -23,6 +23,7 @@
 #include "asahi/compiler/agx_nir_m5_mesh.h"
 #include "asahi/compiler/agx3_mesh_core.h"
 #include "asahi/compiler/agx_nir_gen1_ray_query.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "hk_nir_border_index.h"
 #include "util/u_debug.h"
 #include "util/u_atomic.h"
@@ -741,7 +742,7 @@ hk_populate_fs_key(struct hk_fs_key *key,
    /* A fragment library without output-interface state may acquire color
     * attachments later. Alpha-to-coverage also consumes color even without
     * an attachment, so require it to be statically disabled. */
-   if (agx_chip_g17p_or_m5(chip) &&
+   if ((agx_chip_native_hal200(chip) || agx_chip_g17_m5(chip)) &&
        state->rp &&
        (state->cal || BITSET_TEST(state->dynamic,
                                    MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP)) &&
@@ -1000,6 +1001,8 @@ hk_hash_graphics_state(struct vk_physical_device *device,
       struct hk_vs_key key;
       hk_populate_vs_key(&key, state);
       _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
+      _mesa_blake3_update(&blake3_ctx, &state->vertex_input_robustness,
+                          sizeof(state->vertex_input_robustness));
    }
 
    if (state && (stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
@@ -5638,7 +5641,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                      nir_metadata_control_flow, NULL);
          }
          if (sw_stage == MESA_SHADER_VERTEX &&
-             agx_chip_g17p_or_m5(dev->dev.chip))
+             (agx_chip_native_hal200(dev->dev.chip) ||
+              agx_chip_g17_m5(dev->dev.chip)))
             NIR_PASS(_, nir, agx_nir_preserve_position_order);
          hk_lower_hw_vs(dev, nir, shader, kill_psiz,
                         agx_chip_native_or_m5(dev->dev.chip),
@@ -5699,9 +5703,20 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * without it a shader that reads the root but binds no descriptor set --
     * push constants -- got no root range and read its push constants from
     * address 0 + offset, i.e. as zero. */
+   bool wg_coalesce_cand = false;
    if (agx_chip_agx3_path(dev->dev.chip)) {
       shader->info.agx3_uses_root = hk_nir_uses_root(nir);
       shader->info.agx3_root_reads = hk_nir_root_reads(nir);
+      if (agx_chip_has_cap(dev->dev.chip,
+                           AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) &&
+          sw_stage == MESA_SHADER_COMPUTE &&
+          !hk_nir_root_reads_range(
+             nir, hk_root_descriptor_offset(cs.group_count_addr),
+             hk_root_descriptor_offset(cs.group_count_addr) +
+                sizeof(uint64_t),
+             sizeof(struct hk_root_descriptor_table)) &&
+          hk_nir_can_coalesce_workgroup(nir))
+         wg_coalesce_cand = true;
    }
 
    /* Measure while root markers are still explicit. Uniform lowering loads
@@ -6122,6 +6137,18 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * rewritten builtins are exact for that size too. */
    if (launch_size[0] && !shader->b.info.uses_ray_traversal)
       memcpy(shader->b.info.launch_size, launch_size, sizeof(launch_size));
+
+   /* Record the workgroup-coalescing proof only after backend compilation
+    * confirms no ray traversal, split launch, shared/scratch memory, or
+    * matrix16 usage was introduced. Compatible with native AGX3 compute
+    * constant programs: agx_nir_opt_preamble sets load_workgroup_size_allowed
+    * = false and never observes hardware workgroup dimensions. */
+   if (wg_coalesce_cand && !shader->b.info.launch_size[0] &&
+       !shader->b.info.uses_ray_traversal && !shader->b.info.local_size &&
+       !shader->b.info.scratch_size &&
+       !shader->b.info.agx3_spectpr_scratch_size &&
+       !shader->b.info.uses_matrix16)
+      shader->info.agx3_root_reads |= HK_ROOT_PROVEN_WG_COALESCE_SAFE;
 
    shader->code_ptr = shader->b.binary;
    shader->code_size = shader->b.info.binary_size;
@@ -8075,6 +8102,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   const struct agx_m5_mesh_varyings *mesh_fs,
                   bool no_default_layer, bool mesh_default_layer,
                   int vs_covers, bool m5_no_grid_record,
+                  bool twin_has_vertex_robustness,
                   struct hk_byte_stencil_candidate *bs_cand,
                   nir_shader *lr_nir,
                   const struct hk_local_read_info *lr_info_in,
@@ -8974,9 +9002,16 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   shader->info.vs.attrib_components_read);
 
          if (sw_stage == MESA_SHADER_VERTEX) {
+            const bool has_vertex_robustness =
+               vk_features != NULL || twin_has_vertex_robustness;
             shader->info.vs.use_prolog = !(key && key->vs.skip_prolog);
             shader->info.vs.attribs_read =
                nir->info.inputs_read >> VERT_ATTRIB_GENERIC0;
+            shader->info.vs.has_vertex_robustness = has_vertex_robustness;
+            shader->info.vs.vertex_robustness =
+               has_vertex_robustness
+                  ? hk_vertex_robustness_from_vk(info->robustness->vertex_inputs)
+                  : AGX_ROBUSTNESS_DISABLED;
 
             if (shader->info.vs.use_prolog) {
                NIR_PASS(_, clone, agx_nir_lower_vs_input_to_prolog);
@@ -8994,24 +9029,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
                struct agx_robustness agx_rs = {
                   .soft_fault = agx_has_soft_fault(&dev->dev),
-
-                  /* Correctly handling GPL + pipeline-robustness requires
-                   * runtime changes, so derive the level from the enabled
-                   * device features exactly as the vertex prolog does
-                   * (hk_cmd_draw.c:3200-3208) rather than pessimising every
-                   * pipeline to D3D.  Hardcoding D3D here made every vertex
-                   * fetch emit an out-of-bounds select even when the
-                   * application never asked for robustness; the two paths
-                   * must agree anyway, since a monolithic VS and a prologue
-                   * fetch the same attributes.
-                   */
-                  .level =
-                     (dev->vk.enabled_features.robustBufferAccess2 ||
-                      dev->vk.enabled_features.pipelineRobustness)
-                        ? AGX_ROBUSTNESS_D3D
-                     : dev->vk.enabled_features.robustBufferAccess
-                        ? AGX_ROBUSTNESS_GL
-                        : AGX_ROBUSTNESS_DISABLED,
+                  .level = hk_vertex_robustness_level(
+                     dev, shader,
+                     VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT),
                };
 
                if (agx_chip_native_or_m5(dev->dev.chip))
@@ -9168,8 +9188,8 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
 
    VkResult result = hk_compile_shader_impl(dev, info, state, features,
                                             allocator, NULL, NULL, false, false,
-                                            -1, false, bs_ptr, NULL, NULL,
-                                            false, shader_out);
+                                            -1, false, false, bs_ptr, NULL,
+                                            NULL, false, shader_out);
    if (bs_cand.tiled_nir)
       ralloc_free(bs_cand.tiled_nir);
    return result;
@@ -9203,10 +9223,14 @@ hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
    const bool has_ia =
       obj->vk.stage == MESA_SHADER_FRAGMENT &&
       obj->variants[0].info.fs.has_input_attachments;
+   const bool twin_has_vertex_robustness =
+      obj->vk.stage == MESA_SHADER_VERTEX &&
+      obj->variants[HK_VS_VARIANT_HW].info.vs.has_vertex_robustness;
    VkResult result = hk_compile_shader_impl(dev, &info, NULL, NULL, NULL, src,
                                             mesh_fs, false, false, -1,
-                                            m5_no_grid_record, NULL, NULL, NULL,
-                                            has_ia, &shader);
+                                            m5_no_grid_record,
+                                            twin_has_vertex_robustness, NULL,
+                                            NULL, NULL, has_ia, &shader);
    *built = result == VK_SUCCESS ? shader : NULL;
    return result;
 }
@@ -9721,7 +9745,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                                 NULL, NULL, no_default_layer,
                                 mesh_default_layer &&
                                    infos[i].stage == MESA_SHADER_MESH,
-                                vs_covers[i], no_grid_record,
+                                vs_covers[i], no_grid_record, false,
                                 bs_cands[i].tiled_nir ? &bs_cands[i] : NULL,
                                 lr_nirs[i], &lr_infos[i], has_ias[i],
                                 (struct hk_api_shader **)&shaders_out[i]);

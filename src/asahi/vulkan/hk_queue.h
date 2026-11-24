@@ -160,6 +160,9 @@ struct hk_queue {
       bool used;
       /* Timeline point of the latest submission to a sibling. */
       uint64_t last_point;
+      /* Timeline point of the latest packed submission containing global
+       * atomics; sibling routing stays off until it completes. */
+      uint64_t packed_atomic_point;
    } sib;
 };
 

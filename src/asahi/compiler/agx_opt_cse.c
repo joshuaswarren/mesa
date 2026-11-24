@@ -80,11 +80,13 @@ instrs_equal(const void *_i1, const void *_i2)
    if (i1->nr_dests != i2->nr_dests)
       return false;
 
-   /* Explicitly skip everything but size and type */
+   /* Explicitly skip everything but size, channels, and type */
    agx_foreach_dest(i1, d) {
       if (i1->dest[d].type != i2->dest[d].type)
          return false;
       if (i1->dest[d].size != i2->dest[d].size)
+         return false;
+      if (i1->dest[d].channels_m1 != i2->dest[d].channels_m1)
          return false;
    }
 
@@ -137,6 +139,8 @@ instrs_equal(const void *_i1, const void *_i2)
    if (i1->saturate != i2->saturate)
       return false;
    if (i1->mask != i2->mask)
+      return false;
+   if (i1->format != i2->format)
       return false;
 
    return true;
