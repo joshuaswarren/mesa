@@ -607,8 +607,28 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
    case AGX_CS_GENERATION_AGX2:
       if (cs->current == cs->strong_flush_end)
          return;
-      cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
-      cs->strong_flush_end = cs->current;
+
+      if (unlikely(dev->cdm_barrier_mask)) {
+         /* Perftest only: exact CDM_BARRIER flag word from the environment. */
+         uint32_t *word = cs->current;
+         *word = dev->cdm_barrier_mask | (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
+         cs->current = word + 1;
+      } else if (HK_PERF(dev, NOCDMBARRIER)) {
+         /* Perftest only: no cache maintenance at all. */
+      } else if (HK_PERF(dev, DESIGNEDUSCCDMBARRIER)) {
+         /* Perftest only: designed set {0,1,2,4,5,6,8} + USC invalidate. */
+         cs->current = agx_cdm_barrier_designed_usc(cs->current);
+      } else if (HK_PERF(dev, USCCDMBARRIER)) {
+         /* Perftest only: keep the USC cache invalidate, drop the rest. */
+         cs->current = agx_cdm_barrier_usc(cs->current);
+      } else if (HK_PERF(dev, FULLCDMBARRIER)) {
+         /* Perftest only: force the full barrier word on every chip. */
+         cs->current = agx_cdm_barrier(cs->current, AGX_CHIP_G13G);
+         cs->strong_flush_end = cs->current;
+      } else {
+         cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
+         cs->strong_flush_end = cs->current;
+      }
       break;
 
    case AGX_CS_GENERATION_G15:

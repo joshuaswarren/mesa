@@ -97,10 +97,18 @@ static const struct debug_named_value hk_perf_options[] = {
    {"nobatch",   HK_PERF_NOBATCH,  "Disable submission batching"},
    {"norobust",  HK_PERF_NOROBUST, "Disable robustness"},
    {"weakbarrier", HK_PERF_WEAKBARRIER, "Keep ordering-only barriers between compute dispatches"},
+   {"nocdmbarrier", HK_PERF_NOCDMBARRIER,
+    "Omit the AGX2 CDM barrier entirely"},
+   {"usccdmbarrier", HK_PERF_USCCDMBARRIER,
+    "Reduce the AGX2 CDM barrier to a USC cache invalidate"},
+   {"designedusccdmbarrier", HK_PERF_DESIGNEDUSCCDMBARRIER,
+    "G13X designed set {0,1,2,4,5,6,8} plus USC cache invalidate (0x17f)"},
    {"alwayscdmbarrier", HK_PERF_ALWAYSCDMBARRIER,
     "Unconditional per-launch CDM barrier (disable dependency tracking)"},
    {"trackcdmbarrier", HK_PERF_TRACKCDMBARRIER,
     "Opt into dependency-tracked per-launch CDM barriers"},
+   {"fullcdmbarrier", HK_PERF_FULLCDMBARRIER,
+    "Force the full CDM barrier word on every chip"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -1121,6 +1129,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       dev->perftest |= HK_PERF_ALWAYSCDMBARRIER;
 
    dev->dev.compute_timeout_ms = instance->drirc.misc.compute_timeout_ms;
+   dev->cdm_barrier_mask =
+      debug_get_num_option("HK_CDM_BARRIER_MASK", 0) & 0x07ffffff;
 
    /* Bounded poll before blocking syncobj waits (see vk_device.sync_wait_poll_us).
     * Off by default; pays CPU to skip wake-up latency on short submit->signal
