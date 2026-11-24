@@ -949,6 +949,7 @@ struct zink_gfx_pipeline_state {
 };
 
 struct zink_compute_pipeline_state {
+   uint32_t robust;
    /* Pre-hashed value for table lookup, invalid when zero.
     * Members after this point are not included in pipeline state hash key */
    uint32_t hash;
@@ -1023,6 +1024,7 @@ struct zink_program {
    size_t pipeline_cache_size;
    struct zink_batch_usage *batch_uses;
    bool is_compute;
+   bool is_robust;
    bool can_precompile;
    bool uses_shobj; //whether shader objects are used; programs CANNOT mix shader objects and shader modules
    bool precompile_done;
@@ -1481,6 +1483,13 @@ struct zink_screen {
    bool need_2D_zs;
    bool need_2D_sparse;
    bool can_hic_shader_read;
+   bool have_pipeline_robustness;
+   struct {
+      bool buffer_access;
+      bool buffer_access2;
+      bool image_access;
+      bool image_access2;
+   } pdev_robustness;
 
    uint32_t gfx_queue;
    uint32_t sparse_queue;
