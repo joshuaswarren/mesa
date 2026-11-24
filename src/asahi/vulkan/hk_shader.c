@@ -559,15 +559,15 @@ hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
                   UNUSED const struct vk_pipeline_robustness_state *rs)
 {
    hk_preprocess_nir_internal(vk_pdev, nir);
-   const enum agx_chip chip = ((struct hk_physical_device *)vk_pdev)->dev.chip;
-   /* G17P task shaders run as compute kernels, and mesh workgroups map
-    * invocations to lanes as compute does, so they take the same derivatives
-    * (meshAndTaskShaderDerivatives). */
-   const bool g17p_compute_derivatives =
-      ((agx_chip_g17p_or_m5(chip) &&
+   /* Compute derivatives lower via NIR quad swaps and explicit-gradient
+    * samples across all chips; mesh/task derivatives follow
+    * meshAndTaskShaderDerivatives. */
+   const bool lower_compute_derivatives =
+      ((vk_pdev->supported_features.computeDerivativeGroupQuads &&
         nir->info.stage == MESA_SHADER_COMPUTE) ||
-       (chip == AGX_CHIP_G17P && (nir->info.stage == MESA_SHADER_TASK ||
-                                  nir->info.stage == MESA_SHADER_MESH))) &&
+       (vk_pdev->properties.meshAndTaskShaderDerivatives &&
+        (nir->info.stage == MESA_SHADER_TASK ||
+         nir->info.stage == MESA_SHADER_MESH))) &&
       nir->info.derivative_group != DERIVATIVE_GROUP_NONE;
    nir_lower_compute_system_values_options csv_options = {
       /* Only vkCmdDispatchBase has a base workgroup. Task/mesh draws have
@@ -575,13 +575,13 @@ hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
        * (byte 88) overlays root.draw.attrib_clamps[2..4] there. */
       .has_base_workgroup_id = nir->info.stage == MESA_SHADER_COMPUTE,
    };
-   if (g17p_compute_derivatives &&
+   if (lower_compute_derivatives &&
        nir->info.derivative_group == DERIVATIVE_GROUP_QUADS) {
       NIR_PASS(_, nir, agx_nir_lower_quad_derivative_ids);
       csv_options.shuffle_local_ids_for_quad_derivatives = true;
    }
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv_options);
-   if (g17p_compute_derivatives)
+   if (lower_compute_derivatives)
       NIR_PASS(_, nir, agx_nir_lower_compute_derivatives);
 }
 
