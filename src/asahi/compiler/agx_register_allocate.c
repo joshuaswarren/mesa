@@ -3137,6 +3137,23 @@ ra_file_alignment(agx_context *ctx)
    return alignment;
 }
 
+/* The registers assignment uses for a program with the given demand: as many
+ * as it can without affecting occupancy, which reduces live range splitting.
+ */
+static unsigned
+assignment_file(const agx_context *ctx, unsigned demand, unsigned alignment,
+                unsigned max_possible_regs, bool force_spilling)
+{
+   unsigned regs =
+      agx_occupancy_for_register_count(ALIGN_POT(demand, alignment))
+         .max_registers;
+   if (ctx->key->is_helper || force_spilling)
+      regs = max_possible_regs;
+
+   /* Occupancy rounding must not reach past a smaller register file. */
+   return ROUND_DOWN_TO(MIN2(regs, max_possible_regs), alignment);
+}
+
 /* AGX2 declares a register count with every program, and the hardware splits
  * its register file statically: how many threads fit follows from that count
  * (agx_occupancy_for_register_count). The AGX3B and AGX3C encodings declare no
@@ -3422,6 +3439,17 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    agx_compute_liveness(ctx);
    unsigned effective_demand = agx_calc_register_demand(ctx, false);
    bool spilling = (effective_demand > max_possible_regs);
+
+   /* A program that fits can keep loop-invariant operands out of its loops,
+    * as long as its demand, and so every decision below, stays the same and
+    * the registers assignment will use keep room for each loop's values. */
+   if (!spilling && !(agx_compiler_debug & AGX_DBG_NOOPT) &&
+       agx_opt_licm(ctx, effective_demand,
+                    assignment_file(ctx, effective_demand,
+                                    ra_file_alignment(ctx), max_possible_regs,
+                                    force_spilling)))
+      effective_demand = agx_calc_register_demand(ctx, false);
+
    bool remat = false;
    const unsigned full_budget = max_possible_regs;
 
@@ -3926,17 +3954,9 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    unsigned demand = ALIGN_POT(effective_demand, reg_file_alignment);
    assert(demand <= max_possible_regs && "Invariant");
 
-   /* Round up the demand to the maximum number of registers we can use without
-    * affecting occupancy. This reduces live range splitting.
-    */
-   unsigned max_regs = agx_occupancy_for_register_count(demand).max_registers;
-   if (ctx->key->is_helper || force_spilling)
-      max_regs = max_possible_regs;
-
-   /* Occupancy rounding must not reach past a smaller register file. */
-   max_regs = MIN2(max_regs, max_possible_regs);
-
-   max_regs = ROUND_DOWN_TO(max_regs, reg_file_alignment);
+   unsigned max_regs =
+      assignment_file(ctx, effective_demand, reg_file_alignment,
+                      max_possible_regs, force_spilling);
 
    /* Or, we can bound tightly for debugging */
    if (agx_compiler_debug & AGX_DBG_DEMAND)
