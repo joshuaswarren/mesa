@@ -453,7 +453,9 @@ static void
 agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
    if (I->op == AGX_OPCODE_MATMAD8_AGX3 ||
-       I->op == AGX_OPCODE_MATMAD16_AGX3)
+       I->op == AGX_OPCODE_MATMAD16_AGX3 ||
+       I->op == AGX_OPCODE_SIMD_MATRIX_FMADD32 ||
+       I->op == AGX_OPCODE_SIMD_MATRIX_FMADD16)
       return;
    agx_foreach_ssa_src(I, s) {
       agx_index src = I->src[s];
