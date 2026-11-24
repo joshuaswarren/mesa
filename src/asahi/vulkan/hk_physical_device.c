@@ -9,6 +9,7 @@
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/compiler/agx_nir_texture.h"
 #include "asahi/compiler/agx_debug.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/lib/agx_device.h"
 #include "asahi/lib/agx_nir_lower_vbo.h"
 #include "util/disk_cache.h"
@@ -461,8 +462,10 @@ hk_get_device_features(
       .sparseResidencyImage2D = true,
       .sparseResidencyBuffer = true,
 
-      /* This needs investigation. */
-      .sparseResidencyImage3D = false,
+      /* The sparse binder and SSTT use the same slice layout for 3D images
+       * as for 2D arrays (nonstandard, one-slice block shape). */
+      .sparseResidencyImage3D =
+         agx_chip_has_cap(dev->chip, AGX_CAP_SPARSE_RESIDENCY_3D),
       .variableMultisampleRate = false,
       .inheritedQueries = true,
 
@@ -1059,7 +1062,8 @@ hk_get_device_features(
        * as for 2D arrays. Report the nonstandard, one-slice block shape rather
        * than requiring the standard 3D block shape.
        */
-      features->sparseResidencyImage3D = sparse;
+      features->sparseResidencyImage3D =
+         agx_chip_has_cap(dev->chip, AGX_CAP_SPARSE_RESIDENCY_3D);
       features->sparseResidencyBuffer = sparse;
       /* The common Honeykrisp lowering duplicates a draw per view, writes
        * ViewIndex through the draw root and routes it through the packed
