@@ -10890,18 +10890,6 @@ pre_preamble:
          }
       }
 
-      /* M5: let the main program's robust reads of one structure share their
-       * end computation (agx_nir_share_bounds.c). */
-      if (m5) {
-         bool shared = false;
-         NIR_PASS(shared, nir, agx_nir_share_bounds);
-         if (shared) {
-            pre_fuse_dirty = true;
-            NIR_PASS(_, nir, nir_opt_copy_prop);
-            NIR_PASS(_, nir, nir_opt_dce);
-         }
-      }
-
       /* Copy what the launch can copy into the uniforms the constant
        * program leaves free, which then computes on the copies instead of
        * loading. Copying first would take uniforms the constant program's
@@ -10911,6 +10899,20 @@ pre_preamble:
          pre_fuse_dirty = true;
          NIR_PASS(_, nir, nir_opt_dce);
          agx_remove_empty_preamble(nir);
+      }
+
+      /* M5: let the main program's surviving robust reads of one structure
+       * share their end computation (agx_nir_share_bounds.c). Run after
+       * uniform DMA lowering so DMA still sees the original constant ends it
+       * can drop. M5 caps buffer descriptor sizes at INT32_MAX & ~15u. */
+      if (m5) {
+         bool shared = false;
+         NIR_PASS(shared, nir, agx_nir_share_bounds, true);
+         if (shared) {
+            pre_fuse_dirty = true;
+            NIR_PASS(_, nir, nir_opt_copy_prop);
+            NIR_PASS(_, nir, nir_opt_dce);
+         }
       }
 
       if (dma_key && dma_key->g17p_uniform_dma &&
