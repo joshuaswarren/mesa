@@ -91,10 +91,8 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
 
    enum pipe_format p_format = hk_format_to_pipe_format(vk_format);
    /* D16S8 uses the existing independent D16 and S8 planes, as D32S8 does
-    * on G17P and M5. */
+    * across all generations. */
    if (vk_format == VK_FORMAT_D16_UNORM_S8_UINT) {
-      if (!agx_chip_g17p_or_m5(pdev->dev.chip))
-         return 0;
       p_format = PIPE_FORMAT_Z16_UNORM;
    }
    if (p_format == PIPE_FORMAT_NONE)
@@ -233,7 +231,7 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
    /* Our image atomic lowering doesn't bother to handle linear */
    if ((p_format == PIPE_FORMAT_R32_UINT || p_format == PIPE_FORMAT_R32_SINT ||
         (p_format == PIPE_FORMAT_R32_FLOAT &&
-         agx_chip_g17p_or_m5(pdev->dev.chip))) &&
+         pdev->vk.supported_features.shaderImageFloat32Atomics)) &&
        tiling == VK_IMAGE_TILING_OPTIMAL) {
 
       features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;

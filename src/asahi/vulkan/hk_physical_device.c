@@ -180,6 +180,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .KHR_bind_memory2 = true,
       .KHR_buffer_device_address = true,
       .KHR_calibrated_timestamps = true,
+      .KHR_compute_shader_derivatives = true,
       .KHR_copy_commands2 = true,
       .KHR_create_renderpass2 = true,
       .KHR_dedicated_allocation = true,
@@ -346,8 +347,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_sampler_filter_minmax = false,
       .EXT_scalar_block_layout = true,
       .EXT_separate_stencil_usage = true,
-      .EXT_shader_atomic_float = false,
-      .EXT_shader_atomic_float2 = false,
+      .EXT_shader_atomic_float = true,
+      .EXT_shader_atomic_float2 = true,
       .EXT_shader_image_atomic_int64 = false,
       .EXT_shader_demote_to_helper_invocation = true,
       .EXT_shader_module_identifier = true,
@@ -363,6 +364,9 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_swapchain_maintenance1 = true,
 #endif
       .EXT_texel_buffer_alignment = true,
+      /* Hardware ASTC HDR decode is supported across AGX2 and native AGX3
+       * (G13-G17P); keep HAL300 off until qualified on M5 hardware. */
+      .EXT_texture_compression_astc_hdr = !agx_chip_hal300_path(dev->chip),
       .EXT_tooling_info = true,
       .EXT_transform_feedback = true,
       
@@ -1086,21 +1090,16 @@ hk_get_device_features(
        * fragment entry and prevent merging triangles across derivative quads.
        */
       features->shaderQuadControl = dev->chip == AGX_CHIP_G17P;
-
-      /* Qualified on A18 Pro only. */
-      if (dev->chip == AGX_CHIP_G17P) {
-         features->computeDerivativeGroupQuads = true;
-         features->computeDerivativeGroupLinear = true;
-         features->textureCompressionASTC_HDR = true;
-      }
    }
 
-   /* Compute derivatives are NIR quad-swap lowering plus explicit-gradient
-    * samples, both available on M5; quad control remains restricted to G17P. */
-   if (agx_chip_g17_m5(dev->chip)) {
-      features->computeDerivativeGroupQuads = true;
-      features->computeDerivativeGroupLinear = true;
-   }
+   /* Compute derivatives lower in NIR to quad swaps and explicit-gradient
+    * texture operations, available across all generations. */
+   features->computeDerivativeGroupQuads =
+      supported_extensions->KHR_compute_shader_derivatives;
+   features->computeDerivativeGroupLinear =
+      supported_extensions->KHR_compute_shader_derivatives;
+   features->textureCompressionASTC_HDR =
+      supported_extensions->EXT_texture_compression_astc_hdr;
 
    /* A multiview promise for a stage this device does not expose is
     * meaningless, so keep the pair consistent however the stage bits above
@@ -2280,27 +2279,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    if (agx_chip_native_agx3(pdev->dev.chip)) {
       supported_extensions.KHR_shader_quad_control =
          pdev->dev.chip == AGX_CHIP_G17P;
-   }
-
-   if (pdev->dev.chip == AGX_CHIP_G17P) {
-      /* Advanced blending is hardware-qualified on A18 Pro for every
-       * operation and advertised overlap/premultiplication mode, including
-       * coherent sequencing, across the bounded one-attachment profile. */
-      supported_extensions.KHR_compute_shader_derivatives = true;
-      supported_extensions.EXT_shader_atomic_float = true;
-      supported_extensions.EXT_shader_atomic_float2 = true;
-      supported_extensions.EXT_texture_compression_astc_hdr = true;
-   }
-
-   if (agx_chip_g17_m5(pdev->dev.chip))
-      supported_extensions.KHR_compute_shader_derivatives = true;
-
-   /* AGX3C has no witnessed native float atomic; agx_nir_lower_atomics turns
-    * fp32 add/min/max on buffers, shared memory and (lowered) images into
-    * compare-and-swap loops, so the same feature set is exact on M5. */
-   if (agx_chip_g17_m5(pdev->dev.chip)) {
-      supported_extensions.EXT_shader_atomic_float = true;
-      supported_extensions.EXT_shader_atomic_float2 = true;
    }
 
    struct vk_features supported_features;
