@@ -2437,10 +2437,17 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * clears and blits the same way on any family. These families only
     * narrow what the application may record, so they reuse the universal
     * queue implementation, and like it they create their kernel queue on
-    * first submission, in the device's one VM. The G17P and M3 kernels
-    * report independent queues too, but the families are qualified on M5. */
-   if (agx_chip_g17_m5(pdev->dev.chip) &&
-       (pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES)) {
+    * first submission, in the device's one VM.
+    *
+    * Advertising queue_count on each family exposes up to 3 * queue_count
+    * (24) total logical queues across the three families, all drawing from
+    * the kernel's limits.max_queues budget (the G17 context pool or G15's
+    * 58-queue policy bound). Because kernel queues are created lazily on
+    * first submission rather than at vkCreateDevice time (with entry
+    * admission via hk_queue_admits_at_entry() on G17P/M5; other runtimes
+    * report exhaustion at submit time), unused families consume no kernel
+    * queues. */
+   if (pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) {
       pdev->queue_families[pdev->queue_family_count++] = (struct hk_queue_family){
          .queue_flags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
          .queue_count = queue_count,
