@@ -511,6 +511,7 @@ static_assert(hk_root_descriptor_offset(set_dynamic_buffer_start) ==
 struct hk_descriptor_state {
    bool root_dirty;
    uint64_t generation;
+   uint64_t identity_copy4_push_mask;
    struct hk_root_descriptor_table root;
    /* Immutable command-buffer storage; reset with descriptor state. Only the
     * uploaded head and tail are compared, excluding unused dynamic slots. */

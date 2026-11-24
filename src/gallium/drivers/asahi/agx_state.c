@@ -6228,6 +6228,11 @@ agx_destroy_compute_blitter(struct pipe_context *ctx, struct asahi_blitter *bl)
       ctx->delete_compute_state(ctx, ent->data);
    }
 
+   for (unsigned i = 0; i < ARRAY_SIZE(bl->g17p_mip_cs); ++i) {
+      if (bl->g17p_mip_cs[i])
+         ctx->delete_compute_state(ctx, bl->g17p_mip_cs[i]);
+   }
+
    ctx->delete_sampler_state(ctx, bl->sampler[0]);
    ctx->delete_sampler_state(ctx, bl->sampler[1]);
 
@@ -9318,8 +9323,16 @@ agx_g17p_append_compute(struct agx_batch *batch,
     * launch's weak tail orders them on HAL200. On G15, a dependency inside
     * the stream is published only by the wide flush, so there every launch
     * ends in it, as Honeykrisp's software stages do. */
+   /* A dispatch of the driver's compute blitter feeds later reads through the
+    * texture unit as well as memory -- each compressed mip level is sampled by
+    * the dispatch that generates the next one -- so it ends in the strong
+    * flush everywhere, as the precompiled meta kernels' AGX_BARRIER_ALL and
+    * every Borealis launch do. */
    const uint8_t barrier_flags =
-      agx_chip_cdm_wide_visibility(dev->chip) ? 0x5 : 0;
+      agx_chip_cdm_wide_visibility(dev->chip) ||
+            batch->ctx->compute_blitter.active
+         ? 0x5
+         : 0;
    if (indirect_local) {
       /* The kernel that writes this grid is already its own dispatch earlier
        * in the stream, behind a full barrier, so the launch stands alone. */
@@ -9820,6 +9833,41 @@ agx_precomp_agx3_uniform_ranges(struct agx_batch *batch,
    return true;
 }
 
+static bool
+agx_precomp_shader_launchable(const struct agx_device *dev,
+                              const struct agx_precompiled_shader *cs)
+{
+   if (!cs)
+      return false;
+
+   const bool g18 = dev->chip == AGX_CHIP_G18G;
+   const bool native_agx3 = agx_chip_native_agx3(dev->chip);
+   const bool g17_m5 = agx_chip_g17_m5(dev->chip);
+   if (!g18 && !native_agx3 && !g17_m5)
+      return true;
+
+   if (!cs->bo || !cs->info.main_size || !cs->info.nr_gprs ||
+       cs->info.nr_preamble_gprs ||
+       (cs->info.rodata.size_16 && !cs->rodata_offset) ||
+       (cs->info.printf_uniform &&
+        cs->info.printf_uniform < AGX_ABI_AGX3_PRECOMP_ARG_HALFS) ||
+       !cs->info.agx3_staging_known ||
+       cs->entry_offset > UINT64_MAX - cs->ptr ||
+       !cs->b.workgroup.x || !cs->b.workgroup.y || !cs->b.workgroup.z)
+      return false;
+
+   if (g18)
+      return !cs->info.local_size ||
+             (uint64_t)cs->info.local_size * 4 <= 32768;
+
+   if (native_agx3)
+      return true;
+
+   return (!cs->info.agx3_tps_size ||
+           (dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) &&
+          cs->info.local_size <= 32768;
+}
+
 /* G17G's and G18G's precompiled kernels, through the M5 compute profile the
  * API compute path uses (agx_g17p_append_compute): the graphics generator's
  * compute form, re-encoded as agx3d on G18G, and the captured M5 direct
@@ -9849,17 +9897,8 @@ agx_launch_precomp_m5(struct agx_batch *batch, struct agx_grid grid,
               cs->info.local_size, agx_is_indirect(grid), cs->b.workgroup.x,
               cs->b.workgroup.y, cs->b.workgroup.z, cs->info.nr_gprs);
 
-   if (!cs->bo || !cs->info.main_size || !cs->info.nr_gprs ||
-       cs->info.nr_preamble_gprs || (!g18 && cs->info.agx3_tps_size) ||
-       (cs->info.local_size &&
-        (!g18 || (uint64_t)cs->info.local_size * 4 > 32768)) ||
-       (cs->info.rodata.size_16 && !cs->rodata_offset) ||
-       (cs->info.printf_uniform &&
-        cs->info.printf_uniform < AGX_ABI_AGX3_PRECOMP_ARG_HALFS) ||
-       !cs->info.agx3_staging_known || !args || !arg_size ||
-       arg_size > UINT16_MAX * 2u ||
-       cs->entry_offset > UINT64_MAX - cs->ptr ||
-       !cs->b.workgroup.x || !cs->b.workgroup.y || !cs->b.workgroup.z ||
+   if (!agx_precomp_shader_launchable(dev, cs) ||
+       !args || !arg_size || arg_size > UINT16_MAX * 2u ||
        /* G18G launches an indirect-local grid through Apple's six-word
         * record; the setup kernels write the six u32 it reads. */
        (agx_is_indirect(grid) &&
@@ -10049,17 +10088,8 @@ agx_launch_precomp_g17_m5(struct agx_batch *batch, struct agx_grid grid,
 {
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
 
-   if (!cs->bo || !cs->info.main_size || !cs->info.nr_gprs ||
-       cs->info.nr_preamble_gprs ||
-       (cs->info.agx3_tps_size &&
-        !(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) ||
-       cs->info.local_size > 32768 || !cs->info.agx3_staging_known ||
-       (cs->info.rodata.size_16 && !cs->rodata_offset) ||
-       (cs->info.printf_uniform &&
-        cs->info.printf_uniform < AGX_ABI_AGX3_PRECOMP_ARG_HALFS) ||
+   if (!agx_precomp_shader_launchable(dev, cs) ||
        !args || !arg_size || arg_size > UINT16_MAX * 2u ||
-       cs->entry_offset > UINT64_MAX - cs->ptr ||
-       !cs->b.workgroup.x || !cs->b.workgroup.y || !cs->b.workgroup.z ||
        (agx_is_indirect(grid) &&
         (!grid.ptr || grid.ptr >= (UINT64_C(1) << 48) || (grid.ptr & 3)))) {
       agx_native_descriptor_reject_batch(batch, "precompiled M5 compute program");
@@ -10187,6 +10217,24 @@ agx_launch_precomp_g17_m5(struct agx_batch *batch, struct agx_grid grid,
    agx_batch_add_bo(batch, cs->bo);
 }
 
+bool
+agx_precomp_launchable(struct agx_context *ctx, enum libagx_program program)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+
+   if (!dev->libagx_programs || !dev->libagx_programs[program])
+      return false;
+
+   if (agx_chip_g17_m5(dev->chip) &&
+       !(agx_m5_gpu_tess(ctx) &&
+         agx_m5_precomp_admitted(program, ctx->in_tess)))
+      return false;
+
+   const struct agx_precompiled_shader *cs =
+      agx_get_precompiled(&ctx->bg_eot, program);
+   return agx_precomp_shader_launchable(dev, cs);
+}
+
 void
 agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
                    enum agx_barrier barrier, enum libagx_program program,
@@ -10212,15 +10260,8 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
    }
 
    if (agx_chip_native_agx3(dev->chip)) {
-      if (!cs || !cs->bo || !cs->info.main_size || !cs->info.nr_gprs ||
-          cs->info.nr_preamble_gprs ||
-          (cs->info.rodata.size_16 && !cs->rodata_offset) ||
-          (cs->info.printf_uniform &&
-           cs->info.printf_uniform < AGX_ABI_AGX3_PRECOMP_ARG_HALFS) ||
-          !cs->info.agx3_staging_known || !args || !arg_size ||
-          arg_size > UINT16_MAX * 2u ||
-          cs->entry_offset > UINT64_MAX - cs->ptr ||
-          !cs->b.workgroup.x || !cs->b.workgroup.y || !cs->b.workgroup.z ||
+      if (!agx_precomp_shader_launchable(dev, cs) ||
+          !args || !arg_size || arg_size > UINT16_MAX * 2u ||
           (agx_is_indirect(grid) &&
            (grid.mode != AGX_CDM_MODE_INDIRECT_LOCAL || !grid.ptr ||
             grid.ptr >= (UINT64_C(1) << 48) || (grid.ptr & 3)))) {
@@ -16138,9 +16179,11 @@ agx_legalize_feedback_loops(struct agx_context *ctx)
 
          struct agx_resource *rsrc = ctx->stage[stage].textures[i]->rsrc;
 
+         /* The bit names the colour buffer, as every reader of
+          * batch->feedback indexes it by render target. */
          for (unsigned cb = 0; cb < ctx->framebuffer.nr_cbufs; ++cb) {
             agx_legalize_feedback_loop_surf(
-               ctx, rsrc, &ctx->framebuffer.cbufs[cb], PIPE_CLEAR_COLOR0 << i);
+               ctx, rsrc, &ctx->framebuffer.cbufs[cb], PIPE_CLEAR_COLOR0 << cb);
          }
 
          /* TODO: Separate stencil? */
