@@ -7302,17 +7302,16 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
       /* AGX3C's tied min/max consumes full register operands in both
        * positions. Keep constants tied after compact-constant folding. */
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          I->op == AGX_OPCODE_FCMPSEL && I->nr_srcs == 4 &&
-          I->dest[0].size == AGX_SIZE_32 && !I->invert_cond &&
-          (I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN)) {
+          I->dest[0].size == AGX_SIZE_32 && agx_fcmpsel_is_tied_minmax(I)) {
          for (unsigned c = 0; c < 2; ++c) {
             if (I->src[c].type != AGX_INDEX_IMMEDIATE ||
-                !agx_is_equiv(I->src[c], I->src[c + 2]))
+                (!I->fcmpsel_minifloat_select && I->src[c].value != 0))
                continue;
             const agx_index constant = agx_mov_imm(
                &b, 32, fui(agx_minifloat_decode(I->src[c].value)));
             I->src[c] = I->src[c + 2] = constant;
          }
+         I->fcmpsel_minifloat_select = false;
       }
 
       /* General FSEL has register comparators or an implicit zero. Nonzero
@@ -7338,19 +7337,18 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
              I->op == AGX_OPCODE_FCMPSEL && I->dest[0].size == AGX_SIZE_16 &&
              !agx3c_fsel16_imm_encodable(ctx, I)) {
-            /* Select alternatives are bit patterns, not minifloats -- except
-             * in a tied minimum/maximum, where the optimizer deposited the
-             * compared minifloat into the select slot too. */
+            /* Select alternatives are raw bit patterns unless the optimizer
+             * recorded that it folded a minifloat into the select slot
+             * (fcmpsel_minifloat_select). Half-tied shapes such as
+             * `(0.5 < x) ? 0.5 : y` never arrive here with a minifloat in a
+             * select slot because agx_is_float_src() is false for s >= 2 and
+             * agx_optimizer_inline_imm() only copies a minifloat into
+             * src[s + 2] for a full AGX3B tied min/max. */
             for (unsigned s = 2; s < 4; ++s) {
                if (I->src[s].type != AGX_INDEX_IMMEDIATE)
                   continue;
-               const agx_index cmp = I->src[s - 2];
-               const bool tied = cmp.type == AGX_INDEX_IMMEDIATE &&
-                                 cmp.value == I->src[s].value &&
-                                 cmp.abs == I->src[s].abs &&
-                                 cmp.neg == I->src[s].neg;
                uint32_t bits = I->src[s].value;
-               if (tied) {
+               if (I->fcmpsel_minifloat_select) {
                   float value = agx_minifloat_decode(I->src[s].value);
                   if (I->src[s].abs)
                      value = fabsf(value);
@@ -7360,6 +7358,7 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
                }
                I->src[s] = agx_mov_imm(&b, 16, bits);
             }
+            I->fcmpsel_minifloat_select = false;
          }
          /* G18G's half FSEL is grounded only with all four sources in half
           * registers (agx3_alu_fcmp_select_half_gpu1). Compare slots hold

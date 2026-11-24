@@ -412,7 +412,8 @@ TEST_F(Optimizer, G17PFoldsBothHalvesOfATiedConstantFmax)
    /* Burn the index the dead constant held, so only the folding differs. */
    (void)agx_temp(expected->shader, AGX_SIZE_32);
    out = agx_temp(expected->shader, AGX_SIZE_32);
-   agx_fcmpsel_to(expected, out, wx, folded, wx, folded, AGX_FCOND_GTN);
+   agx_fcmpsel_to(expected, out, wx, folded, wx, folded, AGX_FCOND_GTN)
+      ->fcmpsel_minifloat_select = true;
    agx_unit_test(expected, out);
 
    agx_optimize_and_dce(actual->shader);
@@ -465,7 +466,8 @@ TEST_F(Optimizer, G17PFoldsBothHalvesOfATiedConstantFmaxWrittenFirst)
    const agx_index folded = agx_immediate_f(0.0f);
    (void)agx_temp(expected->shader, AGX_SIZE_32);
    out = agx_temp(expected->shader, AGX_SIZE_32);
-   agx_fcmpsel_to(expected, out, folded, wx, folded, wx, AGX_FCOND_GTN);
+   agx_fcmpsel_to(expected, out, folded, wx, folded, wx, AGX_FCOND_GTN)
+      ->fcmpsel_minifloat_select = true;
    agx_unit_test(expected, out);
 
    agx_optimize_and_dce(actual->shader);
