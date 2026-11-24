@@ -3117,7 +3117,8 @@ agx_nir_offset_instance_id(nir_builder *b, nir_intrinsic_instr *intr,
 
 /* Does not take ownership of key. Clones if necessary. */
 static struct agx_compiled_shader *
-agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
+agx_compile_variant(struct agx_device *dev,
+                    struct util_debug_callback *debug_cb,
                     struct agx_uncompiled_shader *so,
                     union asahi_shader_key *key_)
 {
@@ -3132,8 +3133,9 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
     * later API calls, once per context, and the count an application sees
     * would depend on earlier work rather than on its own commands. */
    struct util_debug_callback *debug =
-      dev->chip != AGX_CHIP_G18G || so->report_shader_info ? &pctx->debug
-                                                           : NULL;
+      debug_cb && (dev->chip != AGX_CHIP_G18G || so->report_shader_info)
+         ? debug_cb
+         : NULL;
 
    /* Auxiliary programs */
    struct poly_gs_info gs_info = {0};
@@ -3723,7 +3725,8 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
 }
 
 static struct agx_compiled_shader *
-agx_get_shader_variant(struct agx_screen *screen, struct pipe_context *pctx,
+agx_get_shader_variant(struct agx_screen *screen,
+                       struct util_debug_callback *debug_cb,
                        struct agx_uncompiled_shader *so,
                        union asahi_shader_key *key)
 {
@@ -3731,7 +3734,7 @@ agx_get_shader_variant(struct agx_screen *screen, struct pipe_context *pctx,
       agx_disk_cache_retrieve(screen, so, key);
 
    if (!compiled) {
-      compiled = agx_compile_variant(&screen->dev, pctx, so, key);
+      compiled = agx_compile_variant(&screen->dev, debug_cb, so, key);
 
       /* The serialized form carries only the binary and its info, so a
        * refused variant would come back from the cache indistinguishable
@@ -3790,7 +3793,7 @@ agx_precompile_variant(struct agx_device *dev, struct pipe_context *pctx,
                        union asahi_shader_key *key)
 {
    struct agx_compiled_shader *compiled =
-      agx_get_shader_variant(agx_screen(pctx->screen), pctx, so, key);
+      agx_get_shader_variant(agx_screen(pctx->screen), &pctx->debug, so, key);
 
    if (!cso->report_compile_error || (compiled && !compiled->failed))
       return true;
@@ -4313,6 +4316,117 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    }
 }
 
+static bool
+agx_shader_compile_sync(struct agx_screen *screen, struct pipe_context *pctx,
+                        bool report_compile_error)
+{
+   if (!util_queue_is_initialized(&screen->shader_compiler_queue))
+      return true;
+
+   /* G18G surfaces backend encoding refusals as link-time errors when st/mesa
+    * requests compile-error reporting (WebGL). */
+   if (screen->dev.chip == AGX_CHIP_G18G && report_compile_error)
+      return true;
+
+   if (pctx->debug.debug_message && !pctx->debug.async)
+      return true;
+
+   if (screen->dev.debug & AGX_DBG_PRECOMPILE)
+      return true;
+
+   if (agx_get_compiler_debug() & (AGX_DBG_SHADERS | AGX_DBG_SHADERDB |
+                                   AGX_DBG_VERBOSE | AGX_DBG_INTERNAL))
+      return true;
+
+   return false;
+}
+
+static unsigned
+agx_fill_precompile_keys(const struct agx_device *dev,
+                         const struct agx_uncompiled_shader *so,
+                         mesa_shader_stage next_stage,
+                         union asahi_shader_key keys[2])
+{
+   /* G17G runs geometry and tessellation stages on the CPU (agx_swtnl.c);
+    * their GPU variants are only built if a draw needs them. */
+   const bool cpu_stage = agx_chip_g17_m5(dev->chip) &&
+                          (so->type == MESA_SHADER_TESS_CTRL ||
+                           so->type == MESA_SHADER_GEOMETRY);
+   if (!cpu_stage && ((so->type == MESA_SHADER_TESS_CTRL) ||
+                      (so->type == MESA_SHADER_GEOMETRY) ||
+                      (so->type == MESA_SHADER_FRAGMENT &&
+                       !so->info.uses_fbfetch))) {
+      union asahi_shader_key key = {0};
+      if (so->type == MESA_SHADER_FRAGMENT) {
+         /* Match agx_update_fs()'s single-sample key so the precompiled
+          * variant hits on the first 1x draw instead of recompiling. */
+         if (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
+             dev->chip == AGX_CHIP_G18G || so->info.needs_sample_count ||
+             so->info.uses_sample_shading)
+            key.fs.nr_samples = 1;
+      }
+      keys[0] = key;
+      return 1;
+   }
+
+   if (so->type == MESA_SHADER_VERTEX) {
+      keys[0] = (union asahi_shader_key){
+         .vs.hw = next_stage == MESA_SHADER_FRAGMENT,
+      };
+      if (next_stage == MESA_SHADER_NONE) {
+         keys[1] = (union asahi_shader_key){
+            .vs.hw = true,
+         };
+         return 2;
+      }
+      return 1;
+   }
+
+   return 0;
+}
+
+static void
+agx_precompile_shader_async(void *job, void *gdata, int thread_index)
+{
+   struct agx_uncompiled_shader *so = job;
+   struct agx_screen *screen = so->precompile.screen;
+   struct agx_device *dev = &screen->dev;
+   struct util_debug_callback *debug_cb =
+      so->precompile.debug.debug_message ? &so->precompile.debug : NULL;
+
+   if (p_atomic_read(&so->precompile.cancelled)) {
+      ralloc_free(so->precompile.nir);
+      so->precompile.nir = NULL;
+      return;
+   }
+
+   if (so->precompile.nir) {
+      agx_shader_initialize(dev, so, so->precompile.nir,
+                            so->precompile.support_lod_bias,
+                            so->precompile.robust);
+      ralloc_free(so->precompile.nir);
+      so->precompile.nir = NULL;
+   }
+
+   if (p_atomic_read(&so->precompile.cancelled))
+      return;
+
+   if (so->type == MESA_SHADER_COMPUTE) {
+      union asahi_shader_key key = {0};
+      agx_get_shader_variant(screen, debug_cb, so, &key);
+      return;
+   }
+
+   union asahi_shader_key keys[2];
+   const unsigned num_keys =
+      agx_fill_precompile_keys(dev, so, so->precompile.next_stage, keys);
+   for (unsigned i = 0; i < num_keys; ++i) {
+      if (p_atomic_read(&so->precompile.cancelled))
+         return;
+      agx_get_shader_variant(screen, debug_cb, so, &keys[i]);
+   }
+}
+
 static void *
 agx_create_shader_state(struct pipe_context *pctx,
                         const struct pipe_shader_state *cso)
@@ -4320,16 +4434,21 @@ agx_create_shader_state(struct pipe_context *pctx,
    struct agx_context *ctx = agx_context(pctx);
    struct agx_uncompiled_shader *so =
       rzalloc(NULL, struct agx_uncompiled_shader);
-   struct agx_device *dev = agx_device(pctx->screen);
+   struct agx_screen *screen = agx_screen(pctx->screen);
+   struct agx_device *dev = &screen->dev;
 
    if (!so)
       return NULL;
 
+   util_queue_fence_init(&so->ready);
    so->base = *cso;
 
    nir_shader *nir = cso->type == PIPE_SHADER_IR_NIR
                         ? cso->ir.nir
                         : tgsi_to_nir(cso->tokens, pctx->screen, false);
+
+   so->type = nir->info.stage == MESA_SHADER_KERNEL ? MESA_SHADER_COMPUTE
+                                                    : nir->info.stage;
 
    /* TGSI reaches this driver only from gallium and state-tracker utilities
     * (u_blitter, u_simple_shaders); their NIR shaders come from nir_builder,
@@ -4381,6 +4500,19 @@ agx_create_shader_state(struct pipe_context *pctx,
    if (agx_chip_g17_m5(dev->chip))
       agx_xfb_cpu_create_vs(ctx, so, cso, nir);
 
+   if (!agx_shader_compile_sync(screen, pctx, cso->report_compile_error)) {
+      so->precompile.screen = screen;
+      so->precompile.nir = nir;
+      if (pctx->debug.debug_message)
+         so->precompile.debug = pctx->debug;
+      so->precompile.next_stage = nir->info.next_stage;
+      so->precompile.support_lod_bias = ctx->support_lod_bias;
+      so->precompile.robust = ctx->robust;
+      util_queue_add_job(&screen->shader_compiler_queue, so, &so->ready,
+                         agx_precompile_shader_async, NULL, 0);
+      return so;
+   }
+
    agx_shader_initialize(dev, so, nir, ctx->support_lod_bias, ctx->robust);
    mesa_shader_stage next_stage = nir->info.next_stage;
 
@@ -4392,28 +4524,12 @@ agx_create_shader_state(struct pipe_context *pctx,
     * shader with a default key. This could be improved but hopefully this is
     * acceptable for now.
     */
-   /* G17G runs geometry and tessellation stages on the CPU (agx_swtnl.c);
-    * their GPU variants are only built if a draw needs them. */
-   const bool cpu_stage = agx_chip_g17_m5(dev->chip) &&
-                          (so->type == MESA_SHADER_TESS_CTRL ||
-                           so->type == MESA_SHADER_GEOMETRY);
-   if (!cpu_stage && ((so->type == MESA_SHADER_TESS_CTRL) ||
-                      (so->type == MESA_SHADER_GEOMETRY) ||
-                      (so->type == MESA_SHADER_FRAGMENT &&
-                       !so->info.uses_fbfetch))) {
-      union asahi_shader_key key = {0};
-      if (!agx_precompile_variant(dev, pctx, so, cso, &key))
-         return NULL;
-   } else if (so->type == MESA_SHADER_VERTEX) {
-      union asahi_shader_key key = {
-         .vs.hw = next_stage == MESA_SHADER_FRAGMENT,
-      };
-      if (!agx_precompile_variant(dev, pctx, so, cso, &key))
-         return NULL;
-
-      if (next_stage == MESA_SHADER_NONE) {
-         key.vs.hw = true;
-         if (!agx_precompile_variant(dev, pctx, so, cso, &key))
+   union asahi_shader_key keys[2];
+   const unsigned num_keys =
+      agx_fill_precompile_keys(dev, so, next_stage, keys);
+   if (num_keys) {
+      for (unsigned i = 0; i < num_keys; ++i) {
+         if (!agx_precompile_variant(dev, pctx, so, cso, &keys[i]))
             return NULL;
       }
    } else if (dev->debug & AGX_DBG_PRECOMPILE) {
@@ -4436,7 +4552,7 @@ agx_create_shader_state(struct pipe_context *pctx,
          UNREACHABLE("Unknown shader stage in shader-db precompile");
       }
 
-      agx_compile_variant(dev, pctx, so, &key);
+      agx_compile_variant(dev, &pctx->debug, so, &key);
    }
 
    return so;
@@ -4447,24 +4563,39 @@ agx_create_compute_state(struct pipe_context *pctx,
                          const struct pipe_compute_state *cso)
 {
    struct agx_context *ctx = agx_context(pctx);
-   struct agx_device *dev = agx_device(pctx->screen);
+   struct agx_screen *screen = agx_screen(pctx->screen);
+   struct agx_device *dev = &screen->dev;
    struct agx_uncompiled_shader *so =
       rzalloc(NULL, struct agx_uncompiled_shader);
 
    if (!so)
       return NULL;
 
+   util_queue_fence_init(&so->ready);
+   so->type = MESA_SHADER_COMPUTE;
    so->variants = _mesa_hash_table_create(so, asahi_cs_shader_key_hash,
                                           asahi_cs_shader_key_equal);
-
-   union asahi_shader_key key = {0};
 
    assert(cso->ir_type == PIPE_SHADER_IR_NIR && "TGSI kernels unsupported");
    nir_shader *nir = (void *)cso->prog;
    so->report_shader_info = !nir->info.internal;
 
+   if (!agx_shader_compile_sync(screen, pctx, false)) {
+      so->precompile.screen = screen;
+      so->precompile.nir = nir;
+      if (pctx->debug.debug_message)
+         so->precompile.debug = pctx->debug;
+      so->precompile.support_lod_bias = ctx->support_lod_bias;
+      so->precompile.robust = ctx->robust;
+      util_queue_add_job(&screen->shader_compiler_queue, so, &so->ready,
+                         agx_precompile_shader_async, NULL, 0);
+      return so;
+   }
+
+   union asahi_shader_key key = {0};
+
    agx_shader_initialize(dev, so, nir, ctx->support_lod_bias, ctx->robust);
-   agx_get_shader_variant(agx_screen(pctx->screen), pctx, so, &key);
+   agx_get_shader_variant(screen, &pctx->debug, so, &key);
 
    /* We're done with the NIR, throw it away */
    ralloc_free(nir);
@@ -4475,9 +4606,16 @@ static void
 agx_get_compute_state_info(struct pipe_context *pctx, void *cso,
                            struct pipe_compute_state_object_info *info)
 {
+   struct agx_uncompiled_shader *uncompiled = cso;
+   agx_shader_wait_ready(uncompiled);
+
    union asahi_shader_key key = {0};
+   struct hash_entry *variant =
+      _mesa_hash_table_search(uncompiled->variants, &key);
    struct agx_compiled_shader *so =
-      agx_get_shader_variant(agx_screen(pctx->screen), pctx, cso, &key);
+      variant ? variant->data
+              : agx_get_shader_variant(agx_screen(pctx->screen), &pctx->debug,
+                                       uncompiled, &key);
 
    info->max_threads =
       agx_occupancy_for_register_count(so->b.info.nr_gprs).max_threads;
@@ -4493,6 +4631,7 @@ agx_update_shader(struct agx_context *ctx, struct agx_compiled_shader **out,
 {
    struct agx_uncompiled_shader *so = ctx->stage[stage].shader;
    assert(so != NULL);
+   agx_shader_wait_ready(so);
 
    struct hash_entry *he = _mesa_hash_table_search(so->variants, key);
 
@@ -4505,7 +4644,7 @@ agx_update_shader(struct agx_context *ctx, struct agx_compiled_shader **out,
    }
 
    struct agx_screen *screen = agx_screen(ctx->base.screen);
-   *out = agx_get_shader_variant(screen, &ctx->base, so, key);
+   *out = agx_get_shader_variant(screen, &ctx->base.debug, so, key);
    return true;
 }
 
@@ -5225,8 +5364,10 @@ agx_update_tcs(struct agx_context *ctx, const struct pipe_draw_info *info)
 {
    assert(info->mode == MESA_PRIM_PATCHES);
 
-   struct hash_entry *he = _mesa_hash_table_next_entry(
-      ctx->stage[MESA_SHADER_TESS_CTRL].shader->variants, NULL);
+   struct agx_uncompiled_shader *tcs = ctx->stage[MESA_SHADER_TESS_CTRL].shader;
+   agx_shader_wait_ready(tcs);
+
+   struct hash_entry *he = _mesa_hash_table_next_entry(tcs->variants, NULL);
    if (he) {
       ctx->tcs = he->data;
       return true;
@@ -5719,9 +5860,16 @@ agx_bind_shader_state(struct pipe_context *pctx, void *cso,
 
    struct agx_uncompiled_shader *old = ctx->stage[stage].shader;
    struct agx_uncompiled_shader *next = cso;
-   if ((old && old->info.uses_query_lod) !=
-       (next && next->info.uses_query_lod))
-      ctx->stage[stage].dirty |= AGX_STAGE_DIRTY_SAMPLER;
+   if (stage == MESA_SHADER_FRAGMENT) {
+      const bool old_ready =
+         !old || util_queue_fence_is_signalled(&old->ready);
+      const bool next_ready =
+         !next || util_queue_fence_is_signalled(&next->ready);
+      if (!old_ready || !next_ready ||
+          (old && old->info.uses_query_lod) !=
+             (next && next->info.uses_query_lod))
+         ctx->stage[stage].dirty |= AGX_STAGE_DIRTY_SAMPLER;
+   }
 
    ctx->stage[stage].shader = cso;
 }
@@ -5786,6 +5934,16 @@ static void
 agx_delete_uncompiled_shader(struct agx_device *dev,
                              struct agx_uncompiled_shader *so)
 {
+   if (so->precompile.screen) {
+      p_atomic_set(&so->precompile.cancelled, true);
+      util_queue_drop_job(&so->precompile.screen->shader_compiler_queue,
+                          &so->ready);
+   }
+   util_queue_fence_wait(&so->ready);
+   ralloc_free(so->precompile.nir);
+   so->precompile.nir = NULL;
+   util_queue_fence_destroy(&so->ready);
+
    hash_table_foreach(so->variants, ent) {
       agx_delete_compiled_shader(dev, ent->data);
    }
@@ -16141,6 +16299,9 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    if (unlikely(!agx_render_condition_check(ctx)))
       return;
 
+   for (unsigned s = 0; s < MESA_SHADER_COMPUTE; ++s)
+      agx_shader_wait_ready(ctx->stage[s].shader);
+
    if (num_draws > 1) {
       agx_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
       return;
@@ -17403,6 +17564,7 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
 
    struct agx_uncompiled_shader *uncompiled =
       ctx->stage[MESA_SHADER_COMPUTE].shader;
+   agx_shader_wait_ready(uncompiled);
 
    union asahi_shader_key key = {
       .cs.custom_borders =
@@ -17416,7 +17578,7 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
       _mesa_hash_table_search(uncompiled->variants, &key);
    struct agx_compiled_shader *cs =
       variant ? variant->data
-              : agx_get_shader_variant(agx_screen(pipe->screen), pipe,
+              : agx_get_shader_variant(agx_screen(pipe->screen), &pipe->debug,
                                        uncompiled, &key);
 
    struct agx_grid grid;

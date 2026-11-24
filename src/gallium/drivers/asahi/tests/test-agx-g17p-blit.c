@@ -278,6 +278,7 @@ check_sampler_boundary_compile(struct pipe_context *pctx)
       };
       struct agx_uncompiled_shader *shader =
          pctx->create_fs_state(pctx, &cso);
+      agx_shader_wait_ready(shader);
       const bool indirect =
          samplers[i] >= AGX_GALLIUM_G17P_IMMEDIATE_API_SAMPLERS;
 
@@ -305,6 +306,7 @@ check_sampler_boundary_compile(struct pipe_context *pctx)
    };
    struct agx_uncompiled_shader *dynamic =
       pctx->create_fs_state(pctx, &dynamic_cso);
+   agx_shader_wait_ready(dynamic);
    if (!dynamic || dynamic_cso.error_message ||
        !dynamic->uses_bindless_samplers) {
       fprintf(stderr, "G17P dynamic sampler table did not compile: %s\n",
@@ -434,6 +436,7 @@ check_query_lod_compile(struct pipe_context *pctx)
             .ir.nir = b.shader,
          };
          struct agx_uncompiled_shader *shader = pctx->create_fs_state(pctx, &cso);
+         agx_shader_wait_ready(shader);
          const bool ok = shader && !cso.error_message &&
                          shader->info.uses_query_lod &&
                          shader->uses_bindless_samplers;
@@ -1135,6 +1138,7 @@ static bool
 vertex_state_encoded(void *cso)
 {
    struct agx_uncompiled_shader *so = cso;
+   agx_shader_wait_ready(so);
    bool ok = true;
    hash_table_foreach(so->variants, ent) {
       struct agx_compiled_shader *cs = ent->data;
@@ -1649,6 +1653,7 @@ check_discard_main_sample_key(struct pipe_context *pctx)
    void *ve_cso = pctx->create_vertex_elements_state(pctx, 0, NULL);
    if (!vs_cso || !fs_cso || !rast_cso || !depth_cso || !ve_cso)
       return false;
+   agx_shader_wait_ready(fs_cso);
    if (fs_cso->info.needs_sample_count || fs_cso->info.uses_fbfetch ||
        fs_cso->info.uses_sample_shading)
       return false;

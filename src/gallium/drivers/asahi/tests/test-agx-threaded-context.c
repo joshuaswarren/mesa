@@ -14,6 +14,7 @@
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
+#include "compiler/nir/nir_builder.h"
 #include "util/driconf.h"
 #include "util/u_inlines.h"
 #include "util/xmlconfig.h"
@@ -356,6 +357,98 @@ test_threaded_context(struct pipe_screen *screen)
    pctx->destroy(pctx);
 }
 
+static nir_shader *
+build_simple_cs(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "test_parallel_cs");
+   b.shader->info.workgroup_size[0] = 64;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   return b.shader;
+}
+
+static nir_shader *
+build_simple_fs(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "test_parallel_fs");
+   nir_store_output(&b, nir_imm_vec4(&b, 1.0f, 0.5f, 0.25f, 1.0f),
+                    nir_imm_int(&b, 0), .base = 0, .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_DATA0);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   return b.shader;
+}
+
+static void
+test_parallel_shader_compile(struct pipe_screen *screen)
+{
+   CHECK(screen->set_max_shader_compiler_threads);
+   CHECK(screen->is_parallel_shader_compilation_finished);
+   screen->set_max_shader_compiler_threads(screen, 2);
+
+   struct pipe_context *pctx =
+      screen->context_create(screen, NULL, PIPE_CONTEXT_PREFER_THREADED);
+   CHECK(pctx);
+   struct pipe_context *raw = threaded_context_unwrap_sync(pctx);
+   CHECK(raw);
+
+   /* Async compute create -> get_compute_state_info waits and reuses the
+    * precompiled variant without recompiling. */
+   struct pipe_compute_state cs_state = {
+      .ir_type = PIPE_SHADER_IR_NIR,
+      .prog = build_simple_cs(),
+   };
+   struct agx_uncompiled_shader *cs = pctx->create_compute_state(pctx, &cs_state);
+   CHECK(cs);
+   struct pipe_compute_state_object_info cs_info = {0};
+   raw->get_compute_state_info(raw, cs, &cs_info);
+   CHECK(cs_info.preferred_simd_size == 32 && cs_info.max_threads > 0);
+   CHECK(screen->is_parallel_shader_compilation_finished(screen, cs,
+                                                         MESA_SHADER_COMPUTE));
+   CHECK(_mesa_hash_table_num_entries(cs->variants) == 1);
+   pctx->delete_compute_state(pctx, cs);
+
+   /* Immediate create+delete burst exercises cancellation and drop without
+    * races or leaks. */
+   for (unsigned i = 0; i < 4; ++i) {
+      struct pipe_compute_state burst_cs = {
+         .ir_type = PIPE_SHADER_IR_NIR,
+         .prog = build_simple_cs(),
+      };
+      void *c = pctx->create_compute_state(pctx, &burst_cs);
+      CHECK(c);
+      pctx->delete_compute_state(pctx, c);
+
+      struct pipe_shader_state burst_fs = {
+         .type = PIPE_SHADER_IR_NIR,
+         .ir.nir = build_simple_fs(),
+      };
+      void *f = pctx->create_fs_state(pctx, &burst_fs);
+      CHECK(f);
+      pctx->delete_fs_state(pctx, f);
+   }
+
+   /* Async fragment compile drains cleanly on set_debug_callback and on native
+    * AGX3 precompiles with nr_samples = 1 to match single-sample draws. */
+   struct pipe_shader_state fs_state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = build_simple_fs(),
+   };
+   struct agx_uncompiled_shader *fs = pctx->create_fs_state(pctx, &fs_state);
+   CHECK(fs);
+   pctx->set_debug_callback(pctx, NULL);
+   CHECK(screen->is_parallel_shader_compilation_finished(screen, fs,
+                                                         MESA_SHADER_FRAGMENT));
+   if (agx_chip_native_agx3(agx_device(screen)->chip)) {
+      struct asahi_fs_shader_key key = {.nr_samples = 1};
+      CHECK(_mesa_hash_table_search(fs->variants, &key) != NULL);
+   }
+   pctx->delete_fs_state(pctx, fs);
+
+   pctx->destroy(pctx);
+}
+
 int
 main(void)
 {
@@ -372,6 +465,7 @@ main(void)
    CHECK(screen);
 
    test_threaded_context(screen);
+   test_parallel_shader_compile(screen);
 
    screen->destroy(screen);
    driDestroyOptionInfo(&info);
