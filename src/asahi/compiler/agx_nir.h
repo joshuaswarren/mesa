@@ -406,3 +406,4 @@ bool agx_nir_opt_u8x4_hsum(struct nir_shader *shader);
 bool agx_nir_uniform_unit_global_id(struct nir_shader *nir);
 bool agx_nir_opt_uniform_stride_chains(struct nir_shader *shader,
                                        bool no_textures);
+bool agx_nir_opt_unswitch_affine_bounds(struct nir_shader *shader);
