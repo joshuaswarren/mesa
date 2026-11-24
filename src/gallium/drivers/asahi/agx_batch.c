@@ -557,7 +557,7 @@ agx_batch_cleanup(struct agx_context *ctx, struct agx_batch *batch, bool reset)
                  "nonzero=%zu full=%zu samples=%u first=0x%zx last=0x%zx "
                  "quarters=%zu,%zu,%zu,%zu residues4=%zu,%zu,%zu,%zu\n",
                  (unsigned long long)agx_map_gpu(rt), size, nonzero, full,
-                 util_res_sample_count(&rt->base), first, last,
+                 util_res_sample_count(&rt->base.b), first, last,
                  quarters[0], quarters[1], quarters[2], quarters[3],
                  residues[0], residues[1], residues[2], residues[3]);
       }
@@ -796,7 +796,7 @@ static void
 agx_batch_note_range(struct agx_batch *batch, struct agx_resource *rsrc,
                      uint64_t start, uint64_t end)
 {
-   if (rsrc->base.target != PIPE_BUFFER)
+   if (rsrc->base.b.target != PIPE_BUFFER)
       return;
 
    struct hash_entry *e =
@@ -825,7 +825,7 @@ agx_batch_touches_range(struct agx_batch *batch, struct agx_resource *rsrc,
 {
    if (!agx_batch_uses_bo(batch, rsrc->bo))
       return false;
-   if (rsrc->base.target != PIPE_BUFFER || (start == 0 && end == AGX_RANGE_ALL))
+   if (rsrc->base.b.target != PIPE_BUFFER || (start == 0 && end == AGX_RANGE_ALL))
       return true;
 
    struct hash_entry *e =
@@ -985,7 +985,7 @@ agx_batch_reads_internal(struct agx_batch *batch, struct agx_resource *rsrc,
       agx_batch_add_bo(batch, rsrc->separate_stencil->bo);
 
    /* Don't hazard track fake resources internally created for meta */
-   if (!rsrc->base.screen)
+   if (!rsrc->base.b.screen)
       return;
 
    batch_debug(batch, "Reads BO @ 0x%" PRIx64 " (%s)", rsrc->bo->va->addr,
@@ -1053,10 +1053,9 @@ agx_batch_writes(struct agx_batch *batch, struct agx_resource *rsrc,
 {
    agx_batch_writes_internal(batch, rsrc, level, 0, AGX_RANGE_ALL);
 
-   if (rsrc->base.target == PIPE_BUFFER) {
+   if (rsrc->base.b.target == PIPE_BUFFER) {
       /* Assume BOs written by the GPU are fully valid */
-      rsrc->valid_buffer_range.start = 0;
-      rsrc->valid_buffer_range.end = ~0;
+      agx_valid_buffer_range_set_full(rsrc);
    }
 }
 
@@ -1064,10 +1063,9 @@ void
 agx_batch_writes_range(struct agx_batch *batch, struct agx_resource *rsrc,
                        unsigned offset, unsigned size)
 {
-   assert(rsrc->base.target == PIPE_BUFFER);
+   assert(rsrc->base.b.target == PIPE_BUFFER);
    agx_batch_writes_internal(batch, rsrc, 0, offset, (uint64_t)offset + size);
-   util_range_add(&rsrc->base, &rsrc->valid_buffer_range, offset,
-                  offset + size);
+   agx_valid_buffer_range_add(rsrc, offset, offset + size);
 }
 
 static bool
@@ -1233,18 +1231,28 @@ agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
          drmSyncobjSignal(dev->fd, &batch->syncobj, 1);
       agx_batch_cleanup(ctx, batch, false);
    } else {
+      unsigned idx = agx_batch_idx(batch);
       batch->submit_quarantined = true;
       batch->failed_syncobjs[0] = accepted_syncobj;
       batch->failed_syncobjs[1] = error_syncobj;
       ctx->submit_quarantined = true;
       p_atomic_set(&agx_screen(ctx->base.screen)->submit_quarantined, true);
+
+      simple_mtx_lock(&ctx->query_lock);
+      ctx->batches.query_state[idx].generation = ctx->batches.generation[idx];
+      ctx->batches.query_state[idx].submitted = true;
+      ctx->batches.query_state[idx].quarantined = true;
+      ctx->batches.query_state[idx].has_cdm = false;
+      ctx->batches.query_state[idx].has_vdm = false;
+      simple_mtx_unlock(&ctx->query_lock);
+
       agx_msg("submit completion unknown; quarantining context resources\n");
    }
 
    /* A refused batch is lost on its own; the context stays usable. */
    if (!refused && !(g17_refused && complete)) {
       const bool first_fault = !ctx->any_faults;
-      ctx->any_faults = true;
+      p_atomic_set(&ctx->any_faults, true);
       if (first_fault && ctx->reset.reset)
          ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
    }
@@ -2335,7 +2343,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
             agx_msg("shared BO release-fence fallback wait failed: %s\n",
                     strerror(ret < -1 ? -ret : (errno ? errno : EIO)));
             const bool first_fault = !ctx->any_faults;
-            ctx->any_faults = true;
+            p_atomic_set(&ctx->any_faults, true);
             if (first_fault && ctx->reset.reset)
                ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
          }
@@ -2400,6 +2408,17 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
 
    util_dynarray_fini(&cmdbuf);
    agx_batch_mark_submitted(batch);
+
+   unsigned idx = agx_batch_idx(batch);
+   simple_mtx_lock(&ctx->query_lock);
+   ctx->batches.query_state[idx].generation = ctx->batches.generation[idx];
+   ctx->batches.query_state[idx].syncobj = batch->syncobj;
+   ctx->batches.query_state[idx].submitted = true;
+   ctx->batches.query_state[idx].quarantined = false;
+   ctx->batches.query_state[idx].has_cdm =
+      batch->cdm.bo && !batch->compute_dropped;
+   ctx->batches.query_state[idx].has_vdm = batch->vdm.bo != NULL;
+   simple_mtx_unlock(&ctx->query_lock);
 
    free(virt.extres);
 

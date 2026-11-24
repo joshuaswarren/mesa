@@ -196,8 +196,11 @@ agx_xfb_cpu_create_vs(struct agx_context *ctx, struct agx_uncompiled_shader *so,
        nir->info.num_ssbos || BITSET_COUNT(nir->info.textures_used))
       return;
 
-   if (!agx_xfb_cpu_init(ctx))
+   simple_mtx_lock(&ctx->xfb_cpu_lock);
+   if (!agx_xfb_cpu_init(ctx)) {
+      simple_mtx_unlock(&ctx->xfb_cpu_lock);
       return;
+   }
 
    nir_shader *clone = nir_shader_clone(NULL, nir);
    struct pipe_shader_state state = {
@@ -211,15 +214,18 @@ agx_xfb_cpu_create_vs(struct agx_context *ctx, struct agx_uncompiled_shader *so,
    so->xfb_cpu_vs = draw_create_vertex_shader(ctx->xfb_draw, &state);
    if (!so->xfb_cpu_vs)
       ralloc_free(clone);
+   simple_mtx_unlock(&ctx->xfb_cpu_lock);
 }
 
 void
 agx_xfb_cpu_delete_vs(struct agx_context *ctx, struct agx_uncompiled_shader *so)
 {
+   simple_mtx_lock(&ctx->xfb_cpu_lock);
    if (so->xfb_cpu_vs && ctx->xfb_draw)
       draw_delete_vertex_shader(ctx->xfb_draw, so->xfb_cpu_vs);
 
    so->xfb_cpu_vs = NULL;
+   simple_mtx_unlock(&ctx->xfb_cpu_lock);
 }
 
 /*
@@ -250,6 +256,7 @@ void
 agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
                  const struct pipe_draw_start_count_bias *draw_info)
 {
+   simple_mtx_lock(&ctx->xfb_cpu_lock);
    struct draw_context *draw = ctx->xfb_draw;
    struct agx_xfb_render *r = agx_xfb_render(ctx->xfb_render);
    struct agx_uncompiled_shader *vs = ctx->stage[MESA_SHADER_VERTEX].shader;
@@ -360,8 +367,8 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
          continue;
 
       uint32_t offset_B = targets[i].internal_offset;
-      pipe_buffer_write(&ctx->base, agx_so_target(ctx->streamout.targets[i])->offset,
-                        0, 4, &offset_B);
+      tc_buffer_write(&ctx->base, agx_so_target(ctx->streamout.targets[i])->offset,
+                      0, 4, &offset_B);
    }
 
    /* Unbind before unmapping. */
@@ -397,4 +404,5 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
          }
       }
    }
+   simple_mtx_unlock(&ctx->xfb_cpu_lock);
 }

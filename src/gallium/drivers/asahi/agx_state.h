@@ -20,6 +20,7 @@
 #include "asahi/lib/pool.h"
 #include "compiler/shader_enums.h"
 #include "gallium/auxiliary/util/u_blitter.h"
+#include "gallium/auxiliary/util/u_threaded_context.h"
 #include "gallium/include/pipe/p_context.h"
 #include "gallium/include/pipe/p_screen.h"
 #include "gallium/include/pipe/p_state.h"
@@ -31,6 +32,7 @@
 #include "util/hash_table.h"
 #include "util/rwlock.h"
 #include "util/set.h"
+#include "util/slab.h"
 #include "util/u_atomic.h"
 #include "util/u_range.h"
 #include "agx_bg_eot.h"
@@ -907,6 +909,9 @@ struct agx_oq_heap;
 
 struct agx_context {
    struct pipe_context base;
+   struct threaded_context *tc;
+   struct slab_child_pool transfer_pool;
+   struct slab_child_pool transfer_pool_unsync;
    struct agx_compiled_shader *vs, *fs, *gs, *tcs;
    struct {
       struct agx_linked_shader *vs, *fs;
@@ -930,7 +935,16 @@ struct agx_context {
    struct pipe_resource *heap;
 
    /* Occlusion query heap */
+   simple_mtx_t oq_lock;
    struct agx_oq_heap *oq;
+
+   /* Serializes G17G CPU transform-feedback draw state vs. create_vs_state */
+   simple_mtx_t xfb_cpu_lock;
+
+   /* Protects query/batch completion state shared between the driver thread
+    * and unsynchronized app-thread agx_get_query_result() calls under TC.
+    */
+   simple_mtx_t query_lock;
 
    /* Acts as a context-level shader key */
    bool support_lod_bias;
@@ -960,6 +974,18 @@ struct agx_context {
        * agx_query::writer_generation.
        */
       uint64_t generation[AGX_MAX_BATCHES];
+
+      /* Snapshot of submitted batch state readable under ctx->query_lock from
+       * unsynchronized app-thread agx_get_query_result() calls under TC.
+       */
+      struct {
+         uint64_t generation;
+         uint32_t syncobj;
+         bool submitted;
+         bool quarantined;
+         bool has_cdm;
+         bool has_vdm;
+      } query_state[AGX_MAX_BATCHES];
    } batches;
 
    /* Queue handle */
@@ -1179,6 +1205,7 @@ void agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
 #define MESA_DISPATCH_PRECOMP agx_launch_precomp
 
 void agx_init_query_functions(struct pipe_context *ctx);
+void agx_destroy_oq_heap_ctx(struct agx_context *ctx);
 
 void
 agx_primitives_update_direct(struct agx_context *ctx,
@@ -1264,6 +1291,7 @@ struct agx_rasterizer {
 };
 
 struct agx_query {
+   struct threaded_query base;
    unsigned type;
    unsigned index;
 
@@ -1325,6 +1353,8 @@ struct agx_screen {
    /* Lock to protect syncobj usage vs. destruction in context destroy */
    struct u_rwlock destroy_lock;
 
+   struct slab_parent_pool transfer_pool;
+
    float heap_memory_percent;
 };
 
@@ -1350,7 +1380,7 @@ agx_device(struct pipe_screen *p)
    perf_debug(agx_device((ctx)->base.screen), __VA_ARGS__)
 
 struct agx_resource {
-   struct pipe_resource base;
+   struct threaded_resource base;
    uint64_t modifier;
 
    /* Should probably be part of the modifier. Affects the tiling algorithm, or
@@ -1387,6 +1417,46 @@ static inline struct agx_resource *
 agx_resource(struct pipe_resource *pctx)
 {
    return (struct agx_resource *)pctx;
+}
+
+/* Under u_threaded_context, PIPE_MAP_THREAD_SAFE unmaps update
+ * valid_buffer_range from the caller thread concurrently with driver-thread
+ * readers/writers even when screen->num_contexts == 1 (where util_range_add
+ * skips write_mutex). Always guard valid_buffer_range with write_mutex.
+ */
+static inline void
+agx_valid_buffer_range_add(struct agx_resource *rsrc, unsigned start,
+                           unsigned end)
+{
+   struct util_range *range = &rsrc->valid_buffer_range;
+
+   simple_mtx_lock(&range->write_mutex);
+   range->start = MIN2(start, range->start);
+   range->end = MAX2(end, range->end);
+   simple_mtx_unlock(&range->write_mutex);
+}
+
+static inline void
+agx_valid_buffer_range_set_full(struct agx_resource *rsrc)
+{
+   struct util_range *range = &rsrc->valid_buffer_range;
+
+   simple_mtx_lock(&range->write_mutex);
+   range->start = 0;
+   range->end = ~0;
+   simple_mtx_unlock(&range->write_mutex);
+}
+
+static inline bool
+agx_valid_buffer_range_intersects(struct agx_resource *rsrc, unsigned start,
+                                  unsigned end)
+{
+   struct util_range *range = &rsrc->valid_buffer_range;
+
+   simple_mtx_lock(&range->write_mutex);
+   bool intersects = util_ranges_intersect(range, start, end);
+   simple_mtx_unlock(&range->write_mutex);
+   return intersects;
 }
 
 static inline bool
@@ -1429,7 +1499,7 @@ void agx_legalize_compression(struct agx_context *ctx,
                               enum pipe_format format);
 
 struct agx_transfer {
-   struct pipe_transfer base;
+   struct threaded_transfer base;
    void *map;
    struct {
       struct pipe_resource *rsrc;
@@ -1662,12 +1732,6 @@ bool agx_g17p_staged_resolve_blit_shape(const struct pipe_blit_info *info);
 
 bool agx_g17p_stencil_plane_blit_shape(const struct pipe_blit_info *info);
 
-bool agx_generate_mipmap_g17g(struct pipe_context *pctx,
-                              struct pipe_resource *prsc,
-                              enum pipe_format format, unsigned base_level,
-                              unsigned last_level, unsigned first_layer,
-                              unsigned last_layer);
-
 bool agx_generate_mipmap_agx3_supported(const struct agx_device *dev,
                                         const struct agx_resource *rsrc,
                                         enum pipe_format format,
@@ -1676,11 +1740,10 @@ bool agx_generate_mipmap_agx3_supported(const struct agx_device *dev,
                                         unsigned first_layer,
                                         unsigned last_layer);
 
-bool agx_generate_mipmap_agx3(struct pipe_context *pctx,
-                              struct pipe_resource *prsc,
-                              enum pipe_format format, unsigned base_level,
-                              unsigned last_level, unsigned first_layer,
-                              unsigned last_layer);
+bool agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
+                         enum pipe_format format, unsigned base_level,
+                         unsigned last_level, unsigned first_layer,
+                         unsigned last_layer);
 
 void agx_resource_copy_region(struct pipe_context *pctx,
                               struct pipe_resource *dst, unsigned dst_level,

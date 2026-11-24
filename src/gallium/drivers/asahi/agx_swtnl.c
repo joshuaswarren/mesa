@@ -1410,9 +1410,9 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
          continue;
 
       uint32_t offset_B = targets[i].internal_offset;
-      pipe_buffer_write(&ctx->base,
-                        agx_so_target(ctx->streamout.targets[i])->offset, 0, 4,
-                        &offset_B);
+      tc_buffer_write(&ctx->base,
+                      agx_so_target(ctx->streamout.targets[i])->offset, 0, 4,
+                      &offset_B);
    }
 
    draw_set_mapped_so_targets(draw, 0, NULL);
