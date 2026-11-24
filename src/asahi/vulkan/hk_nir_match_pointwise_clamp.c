@@ -3041,6 +3041,84 @@ extract_dyn_bias_phi(nir_scalar sv, const nir_block *src_block,
    return acc;
 }
 
+static bool
+is_shared_load(const nir_intrinsic_instr *op)
+{
+   return op->intrinsic == nir_intrinsic_load_deref &&
+          nir_def_is_deref(op->src[0].ssa) &&
+          nir_deref_mode_is(nir_def_as_deref(op->src[0].ssa),
+                            nir_var_mem_shared);
+}
+
+/* True if a shared-memory load lies outside the CF subtree `node`. */
+static bool
+has_shared_load_outside(const nir_function_impl *impl, const nir_cf_node *node)
+{
+   nir_foreach_block(blk, (nir_function_impl *)impl) {
+      const nir_cf_node *cur = &blk->cf_node;
+      while (cur && cur != node)
+         cur = cur->parent;
+      if (cur)
+         continue;
+      nir_foreach_instr(instr, blk) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             is_shared_load(nir_instr_as_intrinsic(instr)))
+            return true;
+      }
+   }
+   return false;
+}
+
+/* The cmat alternate writes every in-bounds C element exactly once per
+ * dispatch, so a certified C store may only be predicated by what the
+ * alternate reproduces: the per-element `row < M && col < N` guard (guarded
+ * form: the store's immediate parent, then-arm) and, for stores split per
+ * bias_mode arm, the `bias_mode == mode` dispatch chain (the then-arm of
+ * exactly one `bias_mode == mode` if, plus the else-arms of `bias_mode == m`
+ * ifs with m != mode). Any other enclosing if or loop, at any depth up to
+ * the function body, can skip or repeat the store in the original. */
+static bool
+c_store_cf_accounted(const nir_intrinsic_instr *store, const uint16_t ls[3],
+                     uint32_t j, uint32_t n_off, bool is_guarded,
+                     uint32_t m_off, bool stores_split_by_bias_mode,
+                     uint32_t bias_mode_off, uint32_t mode)
+{
+   nir_cf_node *store_block = &store->instr.block->cf_node;
+   bool seen_guard = false, seen_arm = false;
+
+   for (nir_cf_node *cur = store_block;
+        cur->parent && cur->parent->type != nir_cf_node_function;
+        cur = cur->parent) {
+      if (cur->parent->type != nir_cf_node_if)
+         return false;
+      nir_if *branch = nir_cf_node_as_if(cur->parent);
+      const bool then_arm = in_then(cur, branch);
+
+      uint32_t guard_m_off = UINT32_MAX;
+      if (is_guarded && cur == store_block && then_arm &&
+          match_gemm_store_guard(branch, ls, 8, j, n_off, &guard_m_off) &&
+          guard_m_off == m_off) {
+         seen_guard = true;
+         continue;
+      }
+
+      uint32_t if_off = 0, if_mode = 0;
+      if (stores_split_by_bias_mode &&
+          match_bias_mode_if(branch, &if_off, &if_mode) &&
+          if_off == bias_mode_off) {
+         if (then_arm && !seen_arm && if_mode == mode) {
+            seen_arm = true;
+            continue;
+         }
+         if (!then_arm && if_mode != mode)
+            continue;
+      }
+      return false;
+   }
+
+   return seen_guard == is_guarded && seen_arm == stores_split_by_bias_mode;
+}
+
 /* Certify that a matched 32x4x1, 8-row/thread GEMM producer actually executes
  * a standard 32x32 shared-memory tiled row-major FP32 GEMM K-loop
  * `C[row, col] = sum_{k=0..K-1} A[row*K + k] * B[k*N + col] (+ bias)` with
@@ -3097,8 +3175,9 @@ certify_gemm_row_major_k_loop(const nir_function_impl *impl,
          return false;
 
       const nir_phi_instr *phi = NULL;
+      uint32_t arm_mode = 0;
       if (stores_split_by_bias_mode) {
-         uint32_t arm_off = 0, arm_mode = 0;
+         uint32_t arm_off = 0;
          int kind = -1;
          if (!find_bias_mode_arm(&c_stores[i]->instr.block->cf_node, &arm_off,
                                  &arm_mode) ||
@@ -3134,6 +3213,11 @@ certify_gemm_row_major_k_loop(const nir_function_impl *impl,
          if (!phi || seen_modes != bias_mode_mask)
             return false;
       }
+
+      if (!c_store_cf_accounted(c_stores[i], ls, j, n_off, is_guarded, m_off,
+                                stores_split_by_bias_mode, bias_mode_off,
+                                arm_mode))
+         return false;
 
       if (acc_phi[j] && acc_phi[j] != phi)
          return false;
@@ -3264,6 +3348,14 @@ certify_gemm_row_major_k_loop(const nir_function_impl *impl,
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             const nir_intrinsic_instr *op = nir_instr_as_intrinsic(instr);
+            if (is_shared_load(op)) {
+               /* Tile reads belong to Phase 2 only. The dot_loop form ties
+                * its loads to l_phi; the unrolled form uses constant columns
+                * and would otherwise also accept a read before barrier_1. */
+               if (barrier_stage != 1)
+                  return false;
+               continue;
+            }
             if (op->intrinsic != nir_intrinsic_store_deref)
                continue;
             if (!nir_def_is_deref(op->src[0].ssa))
@@ -3316,6 +3408,14 @@ certify_gemm_row_major_k_loop(const nir_function_impl *impl,
                /* Guarded: either direct if/else stores, or phi(load, 0.0f) store. */
                if (cf->type == nir_cf_node_if) {
                   nir_if *br = nir_cf_node_as_if(cf);
+                  /* The store must sit directly in an arm of the guard `br`.
+                   * A store inside a nested `if` in either arm carries a
+                   * predicate that match_gemm_shared_guard() never sees.
+                   * Nested control flow next to a direct store cannot skip
+                   * it: the only jumps allowed are the loop header breaks
+                   * (checked below). */
+                  if (blk->cf_node.parent != &br->cf_node)
+                     return false;
                   bool in_t = in_then(&blk->cf_node, br);
                   if (in_t && ld) {
                      struct buffer_access acc;
@@ -3427,6 +3527,8 @@ certify_gemm_row_major_k_loop(const nir_function_impl *impl,
 
    if (barrier_stage != 2 || !s_a || !s_b || s_a == s_b ||
        a_load_mask != 0xffu || b_load_mask != 0xffu)
+      return false;
+   if (has_shared_load_outside(impl, &k_loop->cf_node))
       return false;
    if (is_guarded && (a_zero_mask != 0xffu || b_zero_mask != 0xffu))
       return false;

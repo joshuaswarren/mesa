@@ -988,7 +988,63 @@ struct gemm_test_opts {
    bool bias_in_mode2;
    bool drop_mode0_bias;
    bool fixed_row_bias;
+   /* Guarded: store s_a directly in the guard arms instead of via a phi. */
+   bool a_store_in_arms;
+   /* With a_store_in_arms: extra `if (a_row != 0)` around the then-arm store. */
+   bool a_store_inner_if;
+   /* Wrap the whole C store section in an extra `if (col != 0)`. */
+   bool c_store_outer_if;
+   /* Split stores as `if (mode == 0) ... else if (mode == 1) ... else if (mode == 2)`. */
+   bool nested_bias_chain;
+   /* 32-step unrolled dot product with constant tile columns, no dot loop. */
+   bool unroll_dot;
+   /* With unroll_dot: read the shared tile before barrier_1. */
+   bool unroll_early_loads;
 };
+
+/* barrier_1 followed by a 32-step unrolled dot product over the shared tile:
+ * acc[r] += s_a[ly * 8 + r][kk] * s_b[kk][lx] for kk = 0..31. With
+ * unroll_early_loads, the tile reads are emitted before barrier_1 instead. */
+static void
+emit_unrolled_dot(nir_builder *b, const struct gemm_test_opts *o,
+                  nir_variable *s_a, nir_variable *s_b, nir_def *lx,
+                  nir_def *ly, nir_variable *const acc[8])
+{
+   nir_def *a_ld[32][8], *b_ld[32];
+   const bool early = o->unroll_early_loads;
+
+   for (unsigned pass = 0; pass < 2; ++pass) {
+      const bool load_pass = early ? pass == 0 : pass == 1;
+      if (pass == 1)
+         nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+                     .memory_scope = SCOPE_WORKGROUP,
+                     .memory_semantics = NIR_MEMORY_ACQ_REL,
+                     .memory_modes = nir_var_mem_shared);
+      for (unsigned kk = 0; kk < 32; ++kk) {
+         if (load_pass) {
+            nir_def *kc = nir_imm_int(b, kk);
+            b_ld[kk] = nir_load_deref(b, nir_build_deref_array(
+               b, nir_build_deref_array(b, nir_build_deref_var(b, s_b), kc), lx));
+            for (unsigned r = 0; r < 8; ++r) {
+               nir_def *s_row = nir_iadd_imm(b, nir_ishl_imm(b, ly, 3), r);
+               a_ld[kk][r] = nir_load_deref(b, nir_build_deref_array(
+                  b, nir_build_deref_array(b, nir_build_deref_var(b, s_a), s_row), kc));
+            }
+         }
+         if (pass == 0)
+            continue;
+         for (unsigned r = 0; r < 8; ++r) {
+            b->fp_math_ctrl = o->fp_math_ctrl;
+            nir_def *sum = o->use_ffma
+               ? nir_ffma(b, a_ld[kk][r], b_ld[kk], nir_load_var(b, acc[r]))
+               : nir_fadd(b, nir_load_var(b, acc[r]),
+                          nir_fmul(b, a_ld[kk][r], b_ld[kk]));
+            b->fp_math_ctrl = nir_fp_fast_math;
+            nir_store_var(b, acc[r], sum, 1);
+         }
+      }
+   }
+}
 
 static nir_shader *
 build_tiled_gemm_nir_opts(const struct gemm_test_opts *o)
@@ -1057,8 +1113,23 @@ build_tiled_gemm_nir_opts(const struct gemm_test_opts *o)
          nir_def *s_row = nir_iadd_imm(&b, nir_ishl_imm(&b, ly, 3), j);
          nir_def *a_row = nir_iadd_imm(&b, nir_ishl_imm(&b, gid_y, 3), j);
          nir_def *a_col = nir_iadd(&b, k_base, lx);
-         nir_def *a_val;
-         if (guarded) {
+         nir_def *a_val = NULL;
+         if (guarded && o->a_store_in_arms) {
+            nir_deref_instr *da =
+               nir_build_deref_array(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, s_a), s_row), lx);
+            nir_push_if(&b, nir_iand(&b, nir_ilt(&b, a_row, M), nir_ilt(&b, a_col, K)));
+            nir_def *a_idx = nir_iadd(&b, nir_imul(&b, a_row, K), a_col);
+            nir_def *ld = nir_load_deref(&b, nir_def_as_deref(
+               ssbo_elem_deref_off(&b, 0, 0, offset_B, a_idx)));
+            if (o->a_store_inner_if)
+               nir_push_if(&b, nir_ine_imm(&b, a_row, 0));
+            nir_store_deref(&b, da, ld, 1);
+            if (o->a_store_inner_if)
+               nir_pop_if(&b, NULL);
+            nir_push_else(&b, NULL);
+            nir_store_deref(&b, da, nir_imm_float(&b, 0.0f), 1);
+            nir_pop_if(&b, NULL);
+         } else if (guarded) {
             nir_variable *av = nir_local_variable_create(b.impl, glsl_float_type(), "av");
             nir_push_if(&b, nir_iand(&b, nir_ilt(&b, a_row, M), nir_ilt(&b, a_col, K)));
             nir_def *a_idx = nir_iadd(&b, nir_imul(&b, a_row, K), a_col);
@@ -1074,9 +1145,11 @@ build_tiled_gemm_nir_opts(const struct gemm_test_opts *o)
             a_val = nir_load_deref(&b, nir_def_as_deref(
                ssbo_elem_deref_off(&b, 0, 0, offset_B, a_idx)));
          }
-         nir_deref_instr *da =
-            nir_build_deref_array(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, s_a), s_row), lx);
-         nir_store_deref(&b, da, a_val, 1);
+         if (a_val) {
+            nir_deref_instr *da =
+               nir_build_deref_array(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, s_a), s_row), lx);
+            nir_store_deref(&b, da, a_val, 1);
+         }
 
          nir_def *b_row = nir_iadd(&b, k_base, s_row);
          nir_def *b_val;
@@ -1108,47 +1181,51 @@ build_tiled_gemm_nir_opts(const struct gemm_test_opts *o)
             nir_imm_float(&b, 0.0f), 1);
       }
 
-      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
-                  .memory_scope = SCOPE_WORKGROUP,
-                  .memory_semantics = NIR_MEMORY_ACQ_REL,
-                  .memory_modes = nir_var_mem_shared);
+      if (o->unroll_dot) {
+         emit_unrolled_dot(&b, o, s_a, s_b, lx, ly, acc);
+      } else {
+         nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                     .memory_scope = SCOPE_WORKGROUP,
+                     .memory_semantics = NIR_MEMORY_ACQ_REL,
+                     .memory_modes = nir_var_mem_shared);
 
-      nir_variable *lv = nir_local_variable_create(b.impl, glsl_int_type(), "l");
-      nir_store_var(&b, lv, nir_imm_int(&b, 0), 1);
-      nir_push_loop(&b);
-      {
-         nir_def *l = nir_load_var(&b, lv);
-         nir_push_if(&b, nir_ige_imm(&b, l, inner_bound));
-         nir_jump(&b, nir_jump_break);
-         nir_pop_if(&b, NULL);
-         if (o->early_dot_break) {
-            nir_push_if(&b, nir_ige_imm(&b, l, 16));
+         nir_variable *lv = nir_local_variable_create(b.impl, glsl_int_type(), "l");
+         nir_store_var(&b, lv, nir_imm_int(&b, 0), 1);
+         nir_push_loop(&b);
+         {
+            nir_def *l = nir_load_var(&b, lv);
+            nir_push_if(&b, nir_ige_imm(&b, l, inner_bound));
             nir_jump(&b, nir_jump_break);
             nir_pop_if(&b, NULL);
-         }
-
-         nir_deref_instr *db =
-            nir_build_deref_array(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, s_b), l), lx);
-         nir_def *bv = nir_load_deref(&b, db);
-         for (unsigned r = 0; r < 8; ++r) {
-            nir_def *s_row = nir_iadd_imm(&b, nir_ishl_imm(&b, ly, 3), r);
-            nir_deref_instr *da =
-               nir_build_deref_array(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, s_a), s_row), l);
-            nir_def *av = nir_load_deref(&b, da);
-            b.fp_math_ctrl = fp_math_ctrl;
-            nir_def *sum;
-            if (o->use_ffma) {
-               sum = nir_ffma(&b, av, bv, nir_load_var(&b, acc[r]));
-            } else {
-               nir_def *prod = nir_fmul(&b, av, bv);
-               sum = nir_fadd(&b, nir_load_var(&b, acc[r]), prod);
+            if (o->early_dot_break) {
+               nir_push_if(&b, nir_ige_imm(&b, l, 16));
+               nir_jump(&b, nir_jump_break);
+               nir_pop_if(&b, NULL);
             }
-            b.fp_math_ctrl = nir_fp_fast_math;
-            nir_store_var(&b, acc[r], sum, 1);
+
+            nir_deref_instr *db =
+               nir_build_deref_array(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, s_b), l), lx);
+            nir_def *bv = nir_load_deref(&b, db);
+            for (unsigned r = 0; r < 8; ++r) {
+               nir_def *s_row = nir_iadd_imm(&b, nir_ishl_imm(&b, ly, 3), r);
+               nir_deref_instr *da =
+                  nir_build_deref_array(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, s_a), s_row), l);
+               nir_def *av = nir_load_deref(&b, da);
+               b.fp_math_ctrl = fp_math_ctrl;
+               nir_def *sum;
+               if (o->use_ffma) {
+                  sum = nir_ffma(&b, av, bv, nir_load_var(&b, acc[r]));
+               } else {
+                  nir_def *prod = nir_fmul(&b, av, bv);
+                  sum = nir_fadd(&b, nir_load_var(&b, acc[r]), prod);
+               }
+               b.fp_math_ctrl = nir_fp_fast_math;
+               nir_store_var(&b, acc[r], sum, 1);
+            }
+            nir_store_var(&b, lv, nir_iadd_imm(&b, l, 1), 1);
          }
-         nir_store_var(&b, lv, nir_iadd_imm(&b, l, 1), 1);
+         nir_pop_loop(&b, NULL);
       }
-      nir_pop_loop(&b, NULL);
 
       nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
                   .memory_scope = SCOPE_WORKGROUP,
@@ -1161,9 +1238,11 @@ build_tiled_gemm_nir_opts(const struct gemm_test_opts *o)
 
    nir_def *row_base = nir_ishl_imm(&b, nir_channel(&b, gid, 1), 3);
    nir_def *col_ok = guarded ? nir_ilt(&b, col, N) : nir_imm_true(&b);
+   if (o->c_store_outer_if)
+      nir_push_if(&b, nir_ine_imm(&b, col, 0));
    if (has_bias_buf && has_bias_mode && o->split_bias_stores) {
       for (unsigned arm = 0; arm < 3; ++arm) {
-         nir_push_if(&b, nir_ieq_imm(&b, bmode, arm));
+         nir_if *arm_if = nir_push_if(&b, nir_ieq_imm(&b, bmode, arm));
          for (unsigned r = 0; r < 8; ++r) {
             nir_def *row = nir_iadd_imm(&b, row_base, r);
             if (guarded)
@@ -1187,6 +1266,13 @@ build_tiled_gemm_nir_opts(const struct gemm_test_opts *o)
             if (guarded)
                nir_pop_if(&b, NULL);
          }
+         if (o->nested_bias_chain && arm < 2)
+            nir_push_else(&b, arm_if);
+         else
+            nir_pop_if(&b, NULL);
+      }
+      if (o->nested_bias_chain) {
+         nir_pop_if(&b, NULL);
          nir_pop_if(&b, NULL);
       }
    } else {
@@ -1244,6 +1330,8 @@ build_tiled_gemm_nir_opts(const struct gemm_test_opts *o)
             nir_pop_if(&b, NULL);
       }
    }
+   if (o->c_store_outer_if)
+      nir_pop_if(&b, NULL);
 
    NIR_PASS(_, s, nir_lower_vars_to_ssa);
    NIR_PASS(_, s, nir_opt_dce);
@@ -1288,13 +1376,19 @@ gemm_test_rand_f32(uint32_t *state)
    return (float)s * (1.0f / 131072.0f);
 }
 
-static void
-eval_compare_gemm_case(const struct gemm_test_opts *opts, uint32_t M,
-                       uint32_t N, uint32_t K, int32_t bias_mode,
-                       size_t runtime_a_off, size_t runtime_b_off,
-                       uint32_t tile_n,
-                       const struct hk_nir_clamp_epilogue *epilogue,
-                       uint32_t seed)
+/* Runs the original and the cmat alternate of `opts` through the CPU
+ * workgroup evaluator and returns how many C elements differ bitwise.
+ * seed == 0 feeds all-1.0f inputs and pre-fills C with -99.0f. With
+ * `force_uncertified`, the shader must match as a GEMM but fail certification
+ * (cmat_valid == false); the alternate is then built anyway to show what
+ * certifying it would have produced. */
+static unsigned
+gemm_eval_mismatches(const struct gemm_test_opts *opts, uint32_t M,
+                     uint32_t N, uint32_t K, int32_t bias_mode,
+                     size_t runtime_a_off, size_t runtime_b_off,
+                     uint32_t tile_n,
+                     const struct hk_nir_clamp_epilogue *epilogue,
+                     uint32_t seed, bool force_uncertified)
 {
    nir_shader *orig = build_tiled_gemm_nir_opts(opts);
    nir_shader *pre = nir_shader_clone(NULL, orig);
@@ -1303,7 +1397,8 @@ eval_compare_gemm_case(const struct gemm_test_opts *opts, uint32_t M,
    struct hk_nir_gemm_output m = {0};
    HK_EVAL_CHECK(hk_nir_match_gemm_output(
       pre, nir_address_format_64bit_global_32bit_offset, &m));
-   HK_EVAL_CHECK(m.cmat_valid);
+   HK_EVAL_CHECK(m.cmat_valid != force_uncertified);
+   m.cmat_valid = true;
 
    nir_shader *alt = hk_nir_build_gemm_cmat(pre, &m, tile_n, epilogue);
    HK_EVAL_CHECK(alt);
@@ -1325,14 +1420,16 @@ eval_compare_gemm_case(const struct gemm_test_opts *opts, uint32_t M,
 
    uint32_t rng = seed;
    for (size_t i = off_elems; i < a_elems; ++i)
-      a_buf[i] = gemm_test_rand_f32(&rng);
+      a_buf[i] = seed ? gemm_test_rand_f32(&rng) : 1.0f;
    for (size_t i = off_elems; i < b_elems; ++i)
-      b_buf[i] = gemm_test_rand_f32(&rng);
+      b_buf[i] = seed ? gemm_test_rand_f32(&rng) : 1.0f;
    for (size_t i = off_elems; i < bias_elems; ++i)
-      bias_buf[i] = gemm_test_rand_f32(&rng);
-   for (size_t i = 0; i < off_elems; ++i) {
-      c_orig[i] = -123.5f;
-      c_alt[i] = -123.5f;
+      bias_buf[i] = seed ? gemm_test_rand_f32(&rng) : 1.0f;
+   for (size_t i = 0; i < c_elems; ++i) {
+      if (i < off_elems || !seed) {
+         c_orig[i] = seed ? -123.5f : -99.0f;
+         c_alt[i] = c_orig[i];
+      }
    }
 
    struct gemm_push_layout push = {
@@ -1386,16 +1483,19 @@ eval_compare_gemm_case(const struct gemm_test_opts *opts, uint32_t M,
    };
    hk_eval_dispatch_wg(alt, alt_grid, ssbos_alt, 4, &push, sizeof(push));
 
+   unsigned mismatches = 0;
    for (size_t i = 0; i < c_elems; ++i) {
       uint32_t uo = hk_eval_f2u(c_orig[i]);
       uint32_t ua = hk_eval_f2u(c_alt[i]);
       if (uo != ua) {
-         fprintf(stderr,
-                 "GEMM eval mismatch (M=%u N=%u K=%u bmode=%d tile_n=%u off=%u): "
-                 "idx=%zu orig=0x%08x (%g) alt=0x%08x (%g)\n",
-                 M, N, K, bias_mode, tile_n, opts->offset_B, i, uo, c_orig[i],
-                 ua, c_alt[i]);
-         HK_EVAL_CHECK(uo == ua);
+         if (!mismatches)
+            fprintf(stderr,
+                    "GEMM eval %s (M=%u N=%u K=%u bmode=%d tile_n=%u off=%u): "
+                    "first idx=%zu orig=0x%08x (%g) alt=0x%08x (%g)\n",
+                    force_uncertified ? "mismatch (uncertified, expected)" : "mismatch",
+                    M, N, K, bias_mode, tile_n, opts->offset_B, i, uo, c_orig[i],
+                    ua, c_alt[i]);
+         mismatches++;
       }
    }
 
@@ -1407,6 +1507,20 @@ eval_compare_gemm_case(const struct gemm_test_opts *opts, uint32_t M,
    ralloc_free(alt);
    ralloc_free(pre);
    ralloc_free(orig);
+   return mismatches;
+}
+
+static void
+eval_compare_gemm_case(const struct gemm_test_opts *opts, uint32_t M,
+                       uint32_t N, uint32_t K, int32_t bias_mode,
+                       size_t runtime_a_off, size_t runtime_b_off,
+                       uint32_t tile_n,
+                       const struct hk_nir_clamp_epilogue *epilogue,
+                       uint32_t seed)
+{
+   HK_EVAL_CHECK(gemm_eval_mismatches(opts, M, N, K, bias_mode, runtime_a_off,
+                                      runtime_b_off, tile_n, epilogue, seed,
+                                      false) == 0);
 }
 
 static void
@@ -1558,6 +1672,75 @@ test_gemm_cmat_certify_and_build(void)
    eval_compare_gemm_case(&o_guarded_fixed_row, 23, 39, 33, 0, 4, 4, 64, &ep,  600u);
    eval_compare_gemm_case(&o_guarded_fixed_col, 23, 39, 33, 1, 4, 4, 32, NULL, 601u);
    eval_compare_gemm_case(&o_guarded_nobias,    19, 25, 17, 2, 4, 4, 32, &ep,  602u);
+
+   /* Shapes the certifier must keep accepting: shared stores directly in the
+    * guard arms, split stores under an if/else-if bias_mode chain, and the
+    * unrolled dot product. */
+   const struct gemm_test_opts o_a_store_in_arms = {
+      .guarded = true, .has_bias_buf = true, .has_bias_mode = true,
+      .use_ffma = true, .a_store_in_arms = true,
+   };
+   const struct gemm_test_opts o_nested_chain = {
+      .guarded = true, .has_bias_buf = true, .has_bias_mode = true,
+      .use_ffma = true, .split_bias_stores = true, .nested_bias_chain = true,
+   };
+   const struct gemm_test_opts o_unroll_dot = {
+      .guarded = true, .has_bias_buf = true, .has_bias_mode = true,
+      .use_ffma = true, .unroll_dot = true,
+   };
+   for (int bm = 0; bm <= 2; ++bm) {
+      eval_compare_gemm_case(&o_a_store_in_arms, 37, 35, 19, bm, 4, 4, 32, NULL, 700u + bm);
+      eval_compare_gemm_case(&o_nested_chain,    33, 41, 20, bm, 4, 4, 64, &ep,  710u + bm);
+      eval_compare_gemm_case(&o_unroll_dot,      37, 35, 48, bm, 4, 4, 32, NULL, 720u + bm);
+   }
+
+   /* Control-flow negative controls. Each shape matches as a GEMM but adds
+    * a predicate (or a read order) the cmat alternate does not reproduce, so
+    * it must not certify; built anyway, its alternate differs from the
+    * original on M=64 N=32 K=32 all-1.0f inputs with C pre-filled to -99.0f.
+    * Each is paired with the same shape without the defect, which certifies
+    * and matches bit-exactly on the same inputs. */
+   const struct {
+      const char *name;
+      struct gemm_test_opts bad;
+      int32_t bias_mode;
+      unsigned expect; /* forced-alternate mismatches; 0 = any nonzero */
+   } cf_cases[] = {
+      /* s_a store inside `if (a_row != 0)` in the guard's then-arm: matrix
+       * row 0 stays 0.0 in the original, 32.0 in the alternate. */
+      { "shared store in inner if",
+        { .guarded = true, .use_ffma = true, .a_store_in_arms = true,
+          .a_store_inner_if = true }, 2, 32 },
+      /* C stores under `if (col != 0)`: the original keeps column 0 at
+       * -99.0, the alternate writes all 64 rows of it. */
+      { "C stores in outer if, guarded",
+        { .guarded = true, .use_ffma = true, .c_store_outer_if = true }, 2, 64 },
+      { "C stores in outer if, unguarded",
+        { .guarded = false, .use_ffma = true, .c_store_outer_if = true }, 2, 64 },
+      { "split C stores in outer if",
+        { .guarded = true, .has_bias_buf = true, .has_bias_mode = true,
+          .use_ffma = true, .split_bias_stores = true,
+          .c_store_outer_if = true }, 0, 64 },
+      /* Unrolled dot product reading the tile before barrier_1. */
+      { "tile read before barrier",
+        { .guarded = true, .use_ffma = true, .unroll_dot = true,
+          .unroll_early_loads = true }, 2, 0 },
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(cf_cases); ++i) {
+      struct gemm_test_opts good = cf_cases[i].bad;
+      good.a_store_inner_if = false;
+      good.c_store_outer_if = false;
+      good.unroll_early_loads = false;
+      HK_EVAL_CHECK(gemm_eval_mismatches(&good, 64, 32, 32,
+                                         cf_cases[i].bias_mode, 0, 0, 32,
+                                         NULL, 0, false) == 0);
+      const unsigned diff =
+         gemm_eval_mismatches(&cf_cases[i].bad, 64, 32, 32,
+                              cf_cases[i].bias_mode, 0, 0, 32, NULL, 0, true);
+      printf("gemm cmat negative control '%s': not certified; forced "
+             "alternate differs in %u outputs\n", cf_cases[i].name, diff);
+      HK_EVAL_CHECK(cf_cases[i].expect ? diff == cf_cases[i].expect : diff > 0);
+   }
 }
 
 int
