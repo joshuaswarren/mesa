@@ -3334,6 +3334,26 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
 
    switch (instr->intrinsic) {
    case nir_intrinsic_cmat_muladd_agx: {
+      const enum agx_isa_encoding mm_enc = b->shader->key->dev.encoding;
+      if (mm_enc == AGX_ISA_ENCODING_AGX2) {
+         const nir_alu_type ta = nir_intrinsic_src_type(instr);
+         const nir_alu_type tb = nir_intrinsic_src_type2(instr);
+         assert(stage == MESA_SHADER_COMPUTE && !b->shader->is_preamble &&
+                instr->def.num_components == 2 && ta == tb &&
+                (ta == nir_type_float16 || ta == nir_type_float32) &&
+                (instr->def.bit_size == 32 ||
+                 (instr->def.bit_size == 16 && ta == nir_type_float16)));
+         agx_index a = agx_src_index(&instr->src[0]);
+         agx_index bm = agx_src_index(&instr->src[1]);
+         agx_index c = agx_src_index(&instr->src[2]);
+         if (instr->def.bit_size == 16)
+            agx_simd_matrix_fmadd16_to(b, dst, a, bm, c);
+         else
+            agx_simd_matrix_fmadd32_to(b, dst, a, bm, c);
+         agx_emit_cached_split(b, dst, 2);
+         return NULL;
+      }
+
       unsigned type = nir_intrinsic_src_type(instr) == nir_type_uint16
          ? AGX3_MATRIX_INPUT_BF16 : nir_intrinsic_src_type(instr) == nir_type_float32
          ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
@@ -3346,7 +3366,6 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
       /* The 16x16 GEMM form is M5 (AGX3C) only; the 8x8 matmad also exists on
        * the AGX3B encoding (G15/G16/G17P), so the 2-component path is allowed
        * there too. */
-      const enum agx_isa_encoding mm_enc = b->shader->key->dev.encoding;
       assert(stage == MESA_SHADER_COMPUTE && !b->shader->is_preamble &&
              (mm_enc == AGX_ISA_ENCODING_AGX3C ||
               (mm_enc == AGX_ISA_ENCODING_AGX3B &&
@@ -17736,7 +17755,8 @@ agx_prepare_preoptimized_epilog_nir(nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, agx_nir_lower_denorm_preserve);
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX2 ||
+       key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
        key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
       NIR_PASS(_, nir, agx_nir_lower_f2bf_rtne);
    NIR_PASS(_, nir, nir_opt_constant_folding);
@@ -17976,6 +17996,14 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       agx3_options = *original_options;
       agx3_options.lower_int64_options |= nir_lower_iadd64;
       nir->options = &agx3_options;
+   } else if (key->dev.encoding == AGX_ISA_ENCODING_AGX2) {
+      /* AGX2 has no bf16 conversion instructions. Round f2bf to nearest even;
+       * the shared lowering handles exact bf2f widening. */
+      agx3_options = *original_options;
+      if (!pre_preamble_optimized)
+         NIR_PASS(_, nir, agx_nir_lower_f2bf_rtne);
+      agx3_options.lower_bfloat16_conversions = true;
+      nir->options = &agx3_options;
    }
 
    /* The AGX3 packer admits SR 34/36 only on AGX3B and in these stages
@@ -18062,8 +18090,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    if (is_agx3 && source_imul64)
       NIR_PASS(post_opt_progress, nir, agx_nir_lower_imul64, m5_wide_product);
 
-   if (is_agx3)
-      nir->options = original_options;
+   nir->options = original_options;
 
    /* AGX_G17P_UNIFORM_DMA: only when no preamble is formed. */
    if (is_agx3 && key->g17p_uniform_dma && !form_preamble &&

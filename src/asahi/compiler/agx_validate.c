@@ -179,6 +179,10 @@ agx_write_registers(const agx_context *ctx, const agx_instr *I, unsigned d)
       return 16;
    case AGX_OPCODE_MATMAD8_AGX3:
       return (I->matrix_type & AGX3_MATRIX_ACCUM_F16) ? 2 : 4;
+   case AGX_OPCODE_SIMD_MATRIX_FMADD32:
+   case AGX_OPCODE_SIMD_MATRIX_FMADD16:
+      /* paired-register fragment (2 elements/lane) */
+      return agx_index_size_16(I->dest[d]);
    case AGX_OPCODE_MOV:
    case AGX_OPCODE_PHI:
       /* Tautological */
@@ -351,6 +355,10 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
       if (I->matrix_type & AGX3_MATRIX_ACCUM_F16)
          return 2;
       return s == 2 || (I->matrix_type & 15) == 2 ? 4 : 2;
+   case AGX_OPCODE_SIMD_MATRIX_FMADD32:
+   case AGX_OPCODE_SIMD_MATRIX_FMADD16:
+      /* paired-register fragment operands (2 elements/lane) */
+      return agx_index_size_16(I->src[s]);
    case AGX_OPCODE_MOV:
    case AGX_OPCODE_EXPORT:
       /* Tautological */

@@ -73,7 +73,9 @@ enum agx_chip_cap {
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
-#define AGX_CAPS_AGX2 (AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_DESCRIPTOR_BUFFER)
+#define AGX_CAPS_AGX2                                                          \
+   (AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_DESCRIPTOR_BUFFER |                  \
+    AGX_CAP_COOPERATIVE_MATRIX)
 
 /* What the five native AGX3 chips (G15G, G15S, G15C, G16G, G17P) share. */
 #define AGX_CAPS_NATIVE                                                        \
