@@ -500,6 +500,18 @@ find_regs_simple(struct ra_ctx *rctx, enum ra_class cls, unsigned count,
                                   limit, out);
 }
 
+/* A phi reading the uniform file becomes a move from it on that incoming edge
+ * (agx_insert_parallel_copies()), which writes the phi's register. */
+static bool
+phi_reads_uniform(const agx_instr *I)
+{
+   agx_foreach_src(I, s) {
+      if (I->src[s].type == AGX_INDEX_UNIFORM)
+         return true;
+   }
+   return false;
+}
+
 static unsigned
 dest_limit(const struct ra_ctx *rctx, const agx_instr *I, unsigned d)
 {
@@ -522,6 +534,14 @@ dest_limit(const struct ra_ctx *rctx, const agx_instr *I, unsigned d)
    if ((rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
         agx_is_g18g(&rctx->shader->key->dev)) &&
        I->op == AGX_OPCODE_MOV && I->src[0].type == AGX_INDEX_UNIFORM)
+      limit = MIN2(limit, AGX3_COPY_REG16_DEST_HALVES);
+   /* So does the move a phi reading the uniform file becomes on that edge.
+    * G17P's 32-bit uniform copy also names the upper registers; its 16-bit
+    * one, like G18G's at both widths, does not. */
+   if (I->op == AGX_OPCODE_PHI && phi_reads_uniform(I) &&
+       (agx_is_g18g(&rctx->shader->key->dev) ||
+        (rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         I->dest[d].size == AGX_SIZE_16)))
       limit = MIN2(limit, AGX3_COPY_REG16_DEST_HALVES);
    if (rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
        BITSET_TEST(rctx->low_gpr, I->dest[d].value))
