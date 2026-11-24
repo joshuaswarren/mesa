@@ -2254,10 +2254,10 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    supported_extensions.KHR_cooperative_matrix =
       agx_chip_cooperative_matrix_supported(pdev->dev.chip);
 
-   /* bf16 inputs ride the same 8x8 matmad form on AGX3B: a bf16 value
-    * widens to f32 exactly, so a bf16 product accumulated in f32 matches an
-    * f32 matmad of the same values bit for bit. bf16 therefore follows the
-    * cooperative matrix paths on both encodings. */
+   /* bf16 inputs widen to f32: exact because every bf16 value is representable
+    * in f32, so the accumulated f32 product matches bit for bit. bf16
+    * therefore follows the cooperative matrix paths across all supported
+    * encodings. */
    supported_extensions.KHR_shader_bfloat16 =
       agx_chip_cooperative_matrix_supported(pdev->dev.chip);
 
@@ -2688,11 +2688,12 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
                 !pdev->vk.supported_features.shaderBFloat16CooperativeMatrix)
                continue;
             /* An 8x8 accumulator of the 16-bit input type takes half the
-             * registers of an f32 one. f16 is listed on the AGX3B encoding
-             * (G15/G16/G17P) only, where it runs on the f16matmad8x8: AGX3C
-             * (M5) would widen it into an f32 matmad not yet run with it. */
-            const bool f16_accum = agx_chip_isa_encoding(pdev->dev.chip) ==
-                                   AGX_ISA_ENCODING_AGX3B;
+             * registers of an f32 one. f16 is listed on AGX2 (simd_matrix_fmadd16)
+             * and AGX3B (f16matmad8x8): M5 (AGX3C) would widen it into an f32
+             * matmad not yet run with it. */
+            const enum agx_isa_encoding enc = agx_chip_isa_encoding(pdev->dev.chip);
+            const bool f16_accum = enc == AGX_ISA_ENCODING_AGX2 ||
+                                   enc == AGX_ISA_ENCODING_AGX3B;
             unsigned modes = (types[i] == VK_COMPONENT_TYPE_BFLOAT16_KHR || f16_accum) ? 2 : 1;
             for (unsigned accum = 0; accum < modes; ++accum) {
                vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p) {

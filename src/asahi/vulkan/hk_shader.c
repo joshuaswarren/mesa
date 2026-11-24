@@ -3186,14 +3186,33 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(lowered_push_const, nir, nir_lower_explicit_io,
             nir_var_mem_push_const, nir_address_format_32bit_offset);
 
-   /* The cooperative-matrix lowering serves the 8x8 matmad on AGX3B
-    * (G15/G16/G17P) as well as M5's AGX3C; it no-ops on shaders that carry no
-    * cooperative matrix, so gating on the encoding is sufficient. */
+   /* Lower cooperative-matrix operations per encoding:
+    * - AGX2 uses simd_matrix_fmadd16/32 (with bf16 inputs widened to f32) when
+    *   all 32 lanes of every subgroup are guaranteed active, and falls back to
+    *   software subgroup shuffles + FMA otherwise (e.g. non-32-multiple or
+    *   variable workgroup sizes).
+    * - AGX3B and M5 (AGX3C) use agx_nir_lower_cmat.
+    */
+   const enum agx_isa_encoding cmat_enc = agx_chip_isa_encoding(dev->dev.chip);
    bool cmat_lowered = false;
-   if (agx_chip_g17_m5(dev->dev.chip) ||
-       agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3B)
+   if (cmat_enc == AGX_ISA_ENCODING_AGX2) {
+      const bool full_subgroups =
+         nir->info.stage == MESA_SHADER_COMPUTE &&
+         !nir->info.workgroup_size_variable &&
+         nir->info.workgroup_size[0] && nir->info.workgroup_size[1] &&
+         nir->info.workgroup_size[2] &&
+         (((uint64_t)nir->info.workgroup_size[0] *
+              nir->info.workgroup_size[1] * nir->info.workgroup_size[2]) %
+          32) == 0;
+      if (full_subgroups)
+         NIR_PASS(cmat_lowered, nir, agx_nir_lower_cmat, true, true);
+      else
+         NIR_PASS(cmat_lowered, nir, agx_nir_lower_cmat_sw);
+   } else if (agx_chip_g17_m5(dev->dev.chip) ||
+              cmat_enc == AGX_ISA_ENCODING_AGX3B) {
       NIR_PASS(cmat_lowered, nir, agx_nir_lower_cmat,
-               agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3B);
+               cmat_enc == AGX_ISA_ENCODING_AGX3B, false);
+   }
 
    /* A matrix load becomes per-element loads, and a shader that loads one
     * matrix again for each matrix it multiplies with (one B tile per A row)
@@ -3203,6 +3222,9 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     */
    if (cmat_lowered) {
       lowered_complex = true;
+      /* agx_nir_lower_cmat_sw emits load_workgroup_size, which descriptors
+       * lowering expects nir_lower_compute_system_values() to have resolved. */
+      NIR_PASS(_, nir, nir_lower_compute_system_values, NULL);
       NIR_PASS(_, nir, nir_opt_cse);
       NIR_PASS(_, nir, nir_opt_copy_prop_vars);
       NIR_PASS(_, nir, nir_opt_dce);
