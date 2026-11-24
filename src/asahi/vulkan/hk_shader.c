@@ -5493,7 +5493,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                      nir_metadata_control_flow, NULL);
          }
          if (sw_stage == MESA_SHADER_VERTEX &&
-             agx_chip_g17p_or_m5(dev->dev.chip))
+             (agx_chip_native_hal200(dev->dev.chip) ||
+              agx_chip_g17_m5(dev->dev.chip)))
             NIR_PASS(_, nir, agx_nir_preserve_position_order);
          hk_lower_hw_vs(dev, nir, shader, kill_psiz,
                         agx_chip_native_or_m5(dev->dev.chip),
