@@ -15589,9 +15589,11 @@ agx_legalize_feedback_loops(struct agx_context *ctx)
 
          struct agx_resource *rsrc = ctx->stage[stage].textures[i]->rsrc;
 
+         /* The bit names the colour buffer, as every reader of
+          * batch->feedback indexes it by render target. */
          for (unsigned cb = 0; cb < ctx->framebuffer.nr_cbufs; ++cb) {
             agx_legalize_feedback_loop_surf(
-               ctx, rsrc, &ctx->framebuffer.cbufs[cb], PIPE_CLEAR_COLOR0 << i);
+               ctx, rsrc, &ctx->framebuffer.cbufs[cb], PIPE_CLEAR_COLOR0 << cb);
          }
 
          /* TODO: Separate stencil? */
