@@ -877,3 +877,100 @@ TEST_F(G17PMSAAEpilog, MonolithicLocalReadSampleEquivFastPathCompiles)
       ralloc_free(b.shader);
    }
 }
+
+TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4EquivCompiles)
+{
+   const enum agx_chip chips[] = {AGX_CHIP_G17P, AGX_CHIP_G16G};
+   const unsigned samples = 4;
+   static const struct {
+      unsigned base;
+      unsigned target;
+      enum pipe_format fmt;
+   } inputs[4] = {
+      {0, 0, PIPE_FORMAT_R8_UNORM},
+      {4, 1, PIPE_FORMAT_R16_FLOAT},
+      {12, 2, PIPE_FORMAT_R8_UNORM},
+      {16, 3, PIPE_FORMAT_R8_UNORM},
+   };
+   static const unsigned partition_offsets[] = {0, 4, 12, 16, 20};
+
+   for (enum agx_chip chip : chips) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options,
+         "local-read deferred 4-MRT msaa4 equiv");
+      b.shader->info.fs.uses_sample_shading = true;
+      b.shader->info.fs.uses_fbfetch_output = true;
+
+      nir_def *acc = nir_imm_vec4(&b, 0.0f, 0.0f, 0.0f, 0.0f);
+      for (unsigned k = 0; k < ARRAY_SIZE(inputs); ++k) {
+         nir_def *v = nir_load_local_pixel_agx(
+            &b, 4, 32, nir_imm_intN_t(&b, 0xff, 16), .base = inputs[k].base,
+            .format = inputs[k].fmt, .target = inputs[k].target);
+         acc = nir_fadd(&b, acc, v);
+      }
+      nir_def *lit = nir_fmul_imm(&b, acc, 0.25f);
+      nir_store_local_pixel_agx(&b, lit, nir_imm_intN_t(&b, 0xff, 16),
+                                nir_undef(&b, 2, 16), .base = 20,
+                                .write_mask = 0xf,
+                                .format = PIPE_FORMAT_R8_UNORM, .target = 4);
+
+      struct agx_g17p_colour_layout layout;
+      agx_g17p_colour_layout_init(&layout, BITFIELD_BIT(4), BITFIELD_BIT(4),
+                                  0xf, false);
+      ASSERT_TRUE(agx_nir_lower_to_per_sample(b.shader));
+      ASSERT_TRUE(agx_nir_unroll_g17p_samples_equiv(b.shader, samples, &layout));
+
+      bool progress;
+      do {
+         progress = false;
+         progress |= nir_opt_constant_folding(b.shader);
+         progress |= nir_opt_algebraic(b.shader);
+         progress |= nir_opt_dce(b.shader);
+      } while (progress);
+      agx_nir_hoist_g17p_zs_writes(b.shader);
+      agx_nir_lower_g17p_tile_samples(b.shader, samples);
+      b.shader->info.fs.uses_sample_shading = false;
+      nir_validate_shader(b.shader, "deferred 4-MRT local-read equiv");
+
+      unsigned ballots = 0, loads = 0, stores = 0, f16_probes = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            const nir_intrinsic_op op = intr->intrinsic;
+            ballots += op == nir_intrinsic_ballot;
+            if (op == nir_intrinsic_load_local_pixel_agx) {
+               loads++;
+               if (intr->def.bit_size == 16)
+                  f16_probes++;
+            }
+            stores += op == nir_intrinsic_store_local_pixel_agx;
+         }
+      }
+      EXPECT_EQ(ballots, 1u);
+      /* 16 probe loads (3 R8_UNORM narrowed to f16 = 12) + 4 fast-path
+       * sample-0 loads + 16 slow-path loads = 36 total loads. */
+      EXPECT_EQ(loads, 36u);
+      EXPECT_EQ(f16_probes, 12u);
+      /* 1 whole-pixel store in fast path + 4 per-sample stores in slow path. */
+      EXPECT_EQ(stores, 5u);
+
+      agx_preprocess_nir(b.shader);
+
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = chip;
+      key.no_preamble = true;
+      key.agx3_local_read = true;
+      key.fs.nr_samples = samples;
+      for (unsigned off : partition_offsets)
+         BITSET_SET(key.g17p_tile_partitions, off);
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+         << agx_last_compile_refusal();
+      EXPECT_EQ(part.info.scratch_size, 0u);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}

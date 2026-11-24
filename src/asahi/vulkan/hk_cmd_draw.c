@@ -7730,6 +7730,7 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
          progress = false;
          NIR_PASS(progress, nir, nir_opt_constant_folding);
          NIR_PASS(progress, nir, nir_opt_algebraic);
+         NIR_PASS(progress, nir, nir_opt_dce);
       } while (progress);
       NIR_PASS(_, nir, agx_nir_hoist_g17p_zs_writes);
       NIR_PASS(_, nir, agx_nir_lower_g17p_tile_samples, ekey->nr_samples);
@@ -8124,6 +8125,7 @@ hk_g17p_local_read_inline_epilog_part(
          progress = false;
          NIR_PASS(progress, nir, nir_opt_constant_folding);
          NIR_PASS(progress, nir, nir_opt_algebraic);
+         NIR_PASS(progress, nir, nir_opt_dce);
       } while (progress);
       NIR_PASS(_, nir, agx_nir_hoist_g17p_zs_writes);
       NIR_PASS(_, nir, agx_nir_lower_g17p_tile_samples, samples);
