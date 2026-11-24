@@ -82,10 +82,6 @@ bool agx3_cdm_direct_grid_resolve(
    enum agx3_cdm_direct_grid_source source, const uint32_t input_size[3],
    const uint32_t local_size[3], uint32_t global_size[3]);
 
-bool agx3_cdm_direct_template_build(
-   const struct agx3_cdm_direct_template_fields *fields,
-   struct agx3_cdm_direct_template *result);
-
 bool agx3_cdm_direct_template_build_from_sources(
    const struct agx3_cdm_direct_template_sources *sources,
    struct agx3_cdm_direct_template *result);

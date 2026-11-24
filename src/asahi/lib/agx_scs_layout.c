@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "agx_scs_layout.h"
+#include "agx_bytes.h"
 
 #include <string.h>
 
@@ -52,13 +53,6 @@ agx_scs_layout_gen2_init(uint64_t packed, struct agx_scs_layout_gen2 *layout)
    return agx_scs_layout_init(packed, layout, false);
 }
 
-static void
-store32(uint8_t *dst, uint32_t value)
-{
-   for (unsigned i = 0; i < 4; ++i)
-      dst[i] = value >> (i * 8);
-}
-
 void
 agx_scs_layout_gen2_parameters(const struct agx_scs_layout_gen2 *layout,
                               uint8_t parameters[48])
@@ -66,14 +60,14 @@ agx_scs_layout_gen2_parameters(const struct agx_scs_layout_gen2 *layout,
    /* Per-kick state starts zeroed. Payload placement remains a property of
     * the submitted shader rather than a fixed offset in this record. */
    memset(parameters, 0, 48);
-   store32(parameters + 8, layout->end[6]);
-   store32(parameters + 12, layout->end[11]);
-   store32(parameters + 16, layout->packed);
-   store32(parameters + 20, layout->packed >> 32);
-   store32(parameters + 24, layout->end[5]);
-   store32(parameters + 40, layout->end[10] - layout->end[5]);
+   agx_store_le32(parameters + 8, layout->end[6]);
+   agx_store_le32(parameters + 12, layout->end[11]);
+   agx_store_le32(parameters + 16, layout->packed);
+   agx_store_le32(parameters + 20, layout->packed >> 32);
+   agx_store_le32(parameters + 24, layout->end[5]);
+   agx_store_le32(parameters + 40, layout->end[10] - layout->end[5]);
    const unsigned levels = (layout->packed >> 16) & 0xff;
-   store32(parameters + 44, (levels + (levels > 1)) * 8);
+   agx_store_le32(parameters + 44, (levels + (levels > 1)) * 8);
 }
 
 void
@@ -83,11 +77,11 @@ agx_scs_layout_gen1_parameters(const struct agx_scs_layout_gen2 *layout,
    /* On G17P the SCS parameters carry the fixed Gen1 window address and zero
     * level stride, including on a payload-free layout. */
    memset(parameters, 0, 48);
-   store32(parameters + 4, 0x6f);
-   store32(parameters + 8, layout->end[6]);
-   store32(parameters + 12, layout->end[11]);
-   store32(parameters + 16, layout->packed);
-   store32(parameters + 20, layout->packed >> 32);
-   store32(parameters + 24, layout->end[5]);
-   store32(parameters + 40, layout->end[10] - layout->end[5]);
+   agx_store_le32(parameters + 4, 0x6f);
+   agx_store_le32(parameters + 8, layout->end[6]);
+   agx_store_le32(parameters + 12, layout->end[11]);
+   agx_store_le32(parameters + 16, layout->packed);
+   agx_store_le32(parameters + 20, layout->packed >> 32);
+   agx_store_le32(parameters + 24, layout->end[5]);
+   agx_store_le32(parameters + 40, layout->end[10] - layout->end[5]);
 }

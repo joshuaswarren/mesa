@@ -15,14 +15,6 @@
  * Nine-dword direct VDM Tessellate record (identical across G15/HAL200/HAL300).
  * The 48-bit factor-buffer VA is split across header[7:0], word 1, and word 8[7:0].
  */
-static void
-agx_vdm_tessellate_store_le32(uint8_t *dst, uint32_t value)
-{
-   dst[0] = (uint8_t)value;
-   dst[1] = (uint8_t)(value >> 8);
-   dst[2] = (uint8_t)(value >> 16);
-   dst[3] = (uint8_t)(value >> 24);
-}
 
 bool
 agx_vdm_tessellate_direct_target_supported(enum agx_chip chip)
@@ -121,21 +113,16 @@ agx_vdm_tessellate_indirect_pack(
        info->instance_stride_word > AGX_VDM_TESSELLATE_INSTANCE_STRIDE_MAX)
       return false;
 
-   agx_vdm_tessellate_store_le32(
+   agx_store_le32(
       &out->bytes[0],
       AGX_VDM_TESSELLATE_INDIRECT_FIXED |
          (uint32_t)((info->factor_buffer >> 32) & UINT64_C(0xff)));
-   agx_vdm_tessellate_store_le32(&out->bytes[4],
-                                 (uint32_t)info->factor_buffer);
-   agx_vdm_tessellate_store_le32(&out->bytes[8],
-                                 (uint32_t)(info->indirect_buffer >> 32));
-   agx_vdm_tessellate_store_le32(&out->bytes[12],
-                                 (uint32_t)info->indirect_buffer);
-   agx_vdm_tessellate_store_le32(&out->bytes[16],
-                                 info->instance_stride_word);
-   agx_vdm_tessellate_store_le32(&out->bytes[20],
-                                 info->factor_buffer_size_minus_one);
-   agx_vdm_tessellate_store_le32(
+   agx_store_le32(&out->bytes[4], (uint32_t)info->factor_buffer);
+   agx_store_le32(&out->bytes[8], (uint32_t)(info->indirect_buffer >> 32));
+   agx_store_le32(&out->bytes[12], (uint32_t)info->indirect_buffer);
+   agx_store_le32(&out->bytes[16], info->instance_stride_word);
+   agx_store_le32(&out->bytes[20], info->factor_buffer_size_minus_one);
+   agx_store_le32(
       &out->bytes[24],
       (uint32_t)((info->factor_buffer >> 40) & UINT64_C(0xff)));
    out->length = AGX_VDM_TESSELLATE_INDIRECT_CORE_LENGTH;
