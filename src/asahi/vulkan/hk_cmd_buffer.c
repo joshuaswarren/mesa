@@ -4903,11 +4903,12 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     * available.
     *
     * The second is correctness, and it does not retire. A direct colour
-    * resolve is performed by this render's OWN end-of-tile program -- it is
-    * selected precisely when storeOp is not STORE, so the multisample
-    * attachment is never stored and the pass's only output is the resolve
-    * target. Clearing the attachment as an image then writes a surface
-    * nobody reads and leaves the resolve target untouched, which is exactly
+    * resolve is performed by this render's OWN end-of-tile program, and no
+    * resolve runs after the pass: with storeOp other than STORE the
+    * multisample attachment is never stored and the pass's only output is
+    * the resolve target, and with STORE the same program stores the samples
+    * and resolves them. Clearing the attachment as an image then leaves the
+    * resolve target untouched, which is exactly
     * why a clear-only multisample pass resolved to 00 00 00 00 while a pass
     * with any draw in it was correct. Whether fill_uint4 happens to be
     * available cannot be allowed to decide that.
