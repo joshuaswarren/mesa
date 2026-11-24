@@ -874,8 +874,8 @@ zink_init_screen_caps(struct zink_screen *screen)
       screen->info.feats.features.pipelineStatisticsQuery;
 
    caps->robust_buffer_access_behavior =
-      screen->info.feats.features.robustBufferAccess &&
-      (screen->info.rb2_feats.robustImageAccess2 ||
+      screen->pdev_robustness.buffer_access &&
+      (screen->pdev_robustness.image_access2 ||
        screen->driver_compiler_workarounds.lower_robustImageAccess2);
 
    caps->multi_draw_indirect = screen->info.feats.features.multiDrawIndirect;
@@ -3340,6 +3340,36 @@ static void
 disable_features(struct zink_screen *screen)
 {
    screen->info.mesh_feats.primitiveFragmentShadingRateMeshShader = false;
+
+   screen->pdev_robustness.buffer_access = screen->info.feats.features.robustBufferAccess;
+   screen->pdev_robustness.buffer_access2 = screen->info.rb2_feats.robustBufferAccess2;
+   screen->pdev_robustness.image_access = screen->info.rb_image_feats.robustImageAccess ||
+                                          (screen->info.have_vulkan13 && screen->info.feats13.robustImageAccess);
+   screen->pdev_robustness.image_access2 = screen->info.rb2_feats.robustImageAccess2;
+
+   /* Use VK_EXT_pipeline_robustness (promoted to Vulkan 1.4) to keep robustness
+    * disabled at device scope and enable it only on pipelines created for robust
+    * contexts. When descriptor buffers are enabled, ensure non-robust and robust
+    * descriptor sizes match so descriptor buffer allocation stays uniform.
+    */
+   bool db_robust_sizes_match =
+      !screen->info.have_EXT_descriptor_buffer ||
+      (screen->info.db_props.uniformBufferDescriptorSize ==
+       screen->info.db_props.robustUniformBufferDescriptorSize &&
+       screen->info.db_props.storageBufferDescriptorSize ==
+       screen->info.db_props.robustStorageBufferDescriptorSize &&
+       screen->info.db_props.uniformTexelBufferDescriptorSize ==
+       screen->info.db_props.robustUniformTexelBufferDescriptorSize &&
+       screen->info.db_props.storageTexelBufferDescriptorSize ==
+       screen->info.db_props.robustStorageTexelBufferDescriptorSize);
+   if (screen->info.have_EXT_pipeline_robustness && db_robust_sizes_match) {
+      screen->have_pipeline_robustness = true;
+      screen->info.feats.features.robustBufferAccess = VK_FALSE;
+      screen->info.rb2_feats.robustBufferAccess2 = VK_FALSE;
+      screen->info.rb_image_feats.robustImageAccess = VK_FALSE;
+      screen->info.feats13.robustImageAccess = VK_FALSE;
+      screen->info.rb2_feats.robustImageAccess2 = VK_FALSE;
+   }
 }
 
 static void

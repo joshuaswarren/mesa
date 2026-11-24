@@ -5908,6 +5908,7 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
 #if defined(MVK_VERSION)
    ctx->gfx_pipeline_state.uses_dynamic_stride = ctx->gfx_pipeline_state.uses_dynamic_stride && screen->have_dynamic_state_vertex_input_binding_stride;
 #endif
+   ctx->compute_pipeline_state.robust = is_robust;
    ctx->compute_pipeline_state.dirty = true;
    ctx->rp_changed = true;
    ctx->sample_mask_changed = true;
