@@ -1059,12 +1059,16 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          hk_sync_stream_wait(cs, pre);
       }
       /* Tile hazard: the pass instance shares a partly covered tile with an
-       * earlier render that nothing else orders it after. */
+       * earlier render that nothing else orders it after. Both halves wait:
+       * a vertex half started ahead of the earlier render corrupts the
+       * shared tile (seen with M5 staged renders); tiling can reach the
+       * attachments before the fragment half starts, for example through a
+       * partial render when the tiler heap fills. */
       if (st->in_pass) {
          struct hk_sync_dep tile[HK_SYNC_NUM_SQ] = {0};
          for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
             tile[sq].cut = st->pass_tile_wait[sq];
-         stream_wait_frag(cs, tile);
+         hk_sync_stream_wait(cs, tile);
       }
       if (st->in_pass && (st->pass_tile_last || st->resume_pending)) {
          struct hk_sync_dep cont[HK_SYNC_NUM_SQ] = {0};
@@ -2534,8 +2538,10 @@ hk_sync_resolve_submit(struct hk_queue *queue,
       /* Tile hazards: an instance sharing a tile with an instance of an
        * earlier command buffer of this submission waits on that one, and
        * with a possibly still running earlier submission on everything
-       * before this ioctl. Within the command buffer the recorded
-       * dependency already orders it. */
+       * before this submission (before this ioctl on queues without exact
+       * prior ordinals). Within the command buffer the recorded
+       * dependency already orders it. The vertex half waits too, as for the
+       * in-pass hazard (hk_sync_stream_created()). */
       util_dynarray_foreach(&cmd->sync_pass_records,
                             struct hk_sync_pass_record, rec) {
          if (!rec->first || !rec->last)
@@ -2560,11 +2566,27 @@ hk_sync_resolve_submit(struct hk_queue *queue,
          const uint8_t recent = recent_conflict(
             &queue->sync, &rec->fp, completed, indexed ? &recent_index : NULL);
          for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
-            if (v[sq] == HK_SYNC_NONE && (recent & BITFIELD_BIT(sq)))
+            struct hk_sync_stream *s = &rec->first->sync;
+            if (v[sq] == HK_SYNC_NONE && (recent & BITFIELD_BIT(sq))) {
+               if (queue->sync.exact_prior) {
+                  /* Everything before this submission, by its ordinal: a
+                   * zero barrier would name everything before the ioctl
+                   * that carries the render, which for a later ioctl of a
+                   * split submission is more than the whole render's
+                   * prefix may name. */
+                  const uint64_t start = queue->sync.submitted[sq];
+                  s->prior[sq] = MAX2(s->prior[sq], start);
+                  s->prior_ta[sq] = MAX2(s->prior_ta[sq], start);
+                  continue;
+               }
                v[sq] = 0;
-            if (v[sq] != HK_SYNC_NONE)
-               barrier_at_least(queue, sq, &rec->first->sync.barrier[sq],
-                                &rec->first->sync.prior[sq], v[sq]);
+            }
+            if (v[sq] != HK_SYNC_NONE) {
+               barrier_at_least(queue, sq, &s->barrier[sq], &s->prior[sq],
+                                v[sq]);
+               barrier_at_least(queue, sq, &s->barrier_ta[sq],
+                                &s->prior_ta[sq], v[sq]);
+            }
          }
       }
       util_dynarray_foreach(&cmd->sync_pass_records,
@@ -2636,10 +2658,10 @@ hk_sync_resolve_submit(struct hk_queue *queue,
 
          /* A render's vertex half may wait for less than its fragment half
           * only when the kernel orders the halves separately and nothing
-          * above raised the whole render's fields afterwards
-          * (cross-command-buffer tile hazards and the first-command chain
-          * only touch barrier[]): recompute, and keep the vertex half at
-          * least as strict as before. */
+          * above raised the whole render's fields afterwards (the
+          * first-command chain only touches barrier[]; tile hazards raise
+          * both halves): recompute, and keep the vertex half at least as
+          * strict as before. */
          cs->sync.ta_split = false;
          if (cs->type != HK_CS_CDM && (chain_first || first_cdm_is_flush)) {
             memcpy(cs->sync.barrier_ta, cs->sync.barrier,

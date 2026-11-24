@@ -72,6 +72,30 @@ new_queue(bool exact)
    q->sync.exact_prior = exact;
    return q;
 }
+
+/* On an exact-prior queue, a tile hazard against a possibly still running
+ * earlier submission names everything before the submission by its starting
+ * ordinal, in both halves of a render, and no relative barrier: a relative
+ * zero would name everything before a later ioctl of a split submission. */
+static bool
+waits_on_history(const struct hk_cs *cs, unsigned sq, uint64_t start)
+{
+   return start != 0 &&
+          cs->sync.barrier[sq] == DRM_ASAHI_BARRIER_NONE &&
+          cs->sync.prior[sq] == start &&
+          cs->sync.barrier_ta[sq] == DRM_ASAHI_BARRIER_NONE &&
+          cs->sync.prior_ta[sq] == start;
+}
+
+/* No wait on subqueue sq in either half. */
+static bool
+waits_on_nothing(const struct hk_cs *cs, unsigned sq)
+{
+   return cs->sync.barrier[sq] == DRM_ASAHI_BARRIER_NONE &&
+          cs->sync.prior[sq] == 0 &&
+          cs->sync.barrier_ta[sq] == DRM_ASAHI_BARRIER_NONE &&
+          cs->sync.prior_ta[sq] == 0;
+}
 static struct hk_cmd_buffer *
 new_cmd(void)
 {
@@ -630,7 +654,7 @@ test_precise_tile_evictions(void)
       q->drm.timeline_value = i;
       no_query &= !hk_sync_submit_needs_completed(q, one, 1);
       resolved &= submit(q, full);
-      no_barrier &= write->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE;
+      no_barrier &= waits_on_nothing(write, HK_SYNC_VDM);
    }
    T("complete writes skip retirement query through ring wrap", no_query);
    T("complete writes keep overlap through ring wrap", resolved && no_barrier);
@@ -641,15 +665,18 @@ test_precise_tile_evictions(void)
    T("later preserving pass queries complete history",
      hk_sync_submit_needs_completed(q, p, 1));
    const uint64_t point = ++q->drm.timeline_value;
+   uint64_t start = q->sync.submitted[HK_SYNC_VDM];
    T("later preserving pass resolves", submit(q, partial));
    T("later preserving pass waits on evicted complete writes",
-     preserve->sync.barrier[HK_SYNC_VDM] == 0 && q->sync.last_preserve == point);
+     waits_on_history(preserve, HK_SYNC_VDM, start) &&
+     q->sync.last_preserve == point);
    T("complete pass queries preserving history",
      hk_sync_submit_needs_completed(q, one, 1));
    ++q->drm.timeline_value;
+   start = q->sync.submitted[HK_SYNC_VDM];
    T("complete pass resolves against preserving history", submit(q, full));
    T("complete pass waits on live preserving pass",
-     write->sync.barrier[HK_SYNC_VDM] == 0);
+     waits_on_history(write, HK_SYNC_VDM, start));
 
    /* Evict the preserving entry, then retire only through that entry. Later
     * complete writes still run. They must remain independent of a full write,
@@ -663,11 +690,12 @@ test_precise_tile_evictions(void)
    ++q->drm.timeline_value;
    T("retired preserving pass allows complete write",
      hk_sync_resolve_submit(q, one, 1, false, false, point, NULL) &&
-     write->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
+     waits_on_nothing(write, HK_SYNC_VDM));
    ++q->drm.timeline_value;
+   start = q->sync.submitted[HK_SYNC_VDM];
    T("partial pass still waits on live evicted complete writes",
      hk_sync_resolve_submit(q, p, 1, false, false, point, NULL) &&
-     preserve->sync.barrier[HK_SYNC_VDM] == 0);
+     waits_on_history(preserve, HK_SYNC_VDM, start));
 
    q = new_queue(true);
    q->sync.precise_tile_evictions = true;
@@ -857,10 +885,13 @@ test_multiview_layer_preservation(void)
    struct hk_cs *sparse = render_pass(cmd, image, 2, true);
    T("sparse layer store waits on full XY layer0 clear",
      sparse->sync.dep[HK_SYNC_VDM].cut == first);
+   T("sparse layer store vertex half waits on the clear too",
+     sparse->sync.dep_ta[HK_SYNC_VDM].cut == first);
    struct hk_queue *queue = new_queue(true);
    T("multiview same command buffer submit", submit(queue, cmd));
    T("layer preservation resolves to exact earlier render",
-     sparse->sync.barrier[HK_SYNC_VDM] == first->sync.index);
+     sparse->sync.barrier[HK_SYNC_VDM] == first->sync.index &&
+     sparse->sync.barrier_ta[HK_SYNC_VDM] == first->sync.index);
 
    cmd = new_cmd();
    first = render_pass(cmd, image, 2, false);
@@ -879,7 +910,8 @@ test_multiview_layer_preservation(void)
    T("multiview across command buffers submit",
      hk_sync_resolve_submit(queue, pair, 2, false, false, 0, NULL));
    T("across command buffers keeps layer store ordered",
-     sparse->sync.barrier[HK_SYNC_VDM] == first->sync.index);
+     sparse->sync.barrier[HK_SYNC_VDM] == first->sync.index &&
+     sparse->sync.barrier_ta[HK_SYNC_VDM] == first->sync.index);
 
    queue = new_queue(true);
    a = new_cmd(); b = new_cmd();
@@ -889,10 +921,11 @@ test_multiview_layer_preservation(void)
    T("multiview first queue submission", submit(queue, a));
    queue->drm.timeline_value = 2;
    struct hk_cmd_buffer *single[] = {b};
+   const uint64_t start = queue->sync.submitted[HK_SYNC_VDM];
    T("multiview later queue submission",
      hk_sync_resolve_submit(queue, single, 1, false, false, 0, NULL));
    T("across queue submissions waits on prior layer store",
-     sparse->sync.barrier[HK_SYNC_VDM] == 0);
+     waits_on_history(sparse, HK_SYNC_VDM, start));
 }
 
 /* The empty-render optimizer executes the API clear on the compute engine. */
@@ -1035,11 +1068,12 @@ test_loaded_color_preservation(void)
    T("loaded color producer submission", submit(queue, a));
    queue->drm.timeline_value = 2;
    struct hk_cmd_buffer *single[] = {b};
+   const uint64_t start = queue->sync.submitted[HK_SYNC_CDM];
    T("loaded color consumer submission",
      hk_sync_resolve_submit(queue, single, 1, false, false, 0, NULL));
    T("loaded color waits on prior compute history",
-     load->sync.barrier[HK_SYNC_CDM] == 0 &&
-     load->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
+     waits_on_history(load, HK_SYNC_CDM, start) &&
+     waits_on_nothing(load, HK_SYNC_VDM));
 }
 
 static void
@@ -1078,15 +1112,16 @@ test_compute_clear_layer_preservation(void)
    T("compute clear first queue submission", submit(queue, a));
    queue->drm.timeline_value = 2;
    struct hk_cmd_buffer *single[] = {b};
+   const uint64_t start = queue->sync.submitted[HK_SYNC_CDM];
    T("compute clear later queue submission",
      hk_sync_resolve_submit(queue, single, 1, false, false, 0, NULL));
    T("prior compute clear hazard names only compute history",
-     sparse->sync.barrier[HK_SYNC_CDM] == 0 &&
-     sparse->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
+     waits_on_history(sparse, HK_SYNC_CDM, start) &&
+     waits_on_nothing(sparse, HK_SYNC_VDM));
    T("completed prior clear submission", hk_sync_resolve_submit(
       queue, single, 1, false, false, 1, NULL));
    T("completed prior clear has no remaining hazard",
-     sparse->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE);
+     waits_on_nothing(sparse, HK_SYNC_CDM));
 
    /* Separate API layers are written on separate engines; preserving both
     * needs both producers, not just whichever has the larger sequence. */
@@ -1126,6 +1161,70 @@ add_slot(struct hk_cmd_buffer *cmd, struct hk_cs **slot, bool compute)
    *slot = cs;
    hk_sync_stream_created(cmd, cs, slot, compute);
    return cs;
+}
+
+/* A render in a later ioctl of a split submission, with a live tile hazard
+ * against an earlier submission and a fragment-only dependency on a render
+ * in an earlier ioctl of its own submission. After rebasing its staged
+ * packet, its tiling prefix covers the history without naming more than its
+ * whole-render prefix (the kernel rejects a tiling prefix past the whole
+ * one). */
+static void
+test_history_tile_hazard_split(void)
+{
+   const void *image = (void *)0x5151, *other = (void *)0x5252,
+              *third = (void *)0x5353;
+   struct hk_queue *q = new_queue(true);
+   struct hk_cmd_buffer *a = new_cmd(), *b = new_cmd();
+   render_pass(a, image, 1, false);
+   q->drm.timeline_value = 1;
+   T("split history first submission", submit(q, a));
+
+   struct hk_cs *x = render_pass(b, other, 1, false);
+   hk_sync_barrier(b, HK_SYNC_GFX, HK_SYNC_GFX_FRAG);
+   struct hk_cs *z = render_pass(b, third, 1, false);
+   struct hk_cs *y = render_pass(b, image, 1, true);
+   const uint64_t initial[2] = {q->sync.submitted[HK_SYNC_VDM],
+                                q->sync.submitted[HK_SYNC_CDM]};
+   q->drm.timeline_value = 2;
+   struct hk_cmd_buffer *single[] = {b};
+   T("split history later submission",
+     hk_sync_resolve_submit(q, single, 1, false, false, 0, NULL));
+   T("split history whole render waits on X and history",
+     y->sync.barrier[HK_SYNC_VDM] == x->sync.index &&
+     y->sync.prior[HK_SYNC_VDM] == initial[HK_SYNC_VDM]);
+   T("split history tiling waits on history alone",
+     y->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+     y->sync.prior_ta[HK_SYNC_VDM] == initial[HK_SYNC_VDM]);
+
+   /* Y goes in a later ioctl than X and Z. */
+   struct drm_asahi_cmd_render_staged staged = {0};
+   staged.render.legacy.legacy.flags = DRM_ASAHI_RENDER_STAGE_PREFIXES;
+   staged.render.legacy.prior_vdm = y->sync.prior[HK_SYNC_VDM];
+   staged.render.legacy.prior_cdm = y->sync.prior[HK_SYNC_CDM];
+   staged.stage_prefixes.ta_vdm_barrier = y->sync.barrier_ta[HK_SYNC_VDM];
+   staged.stage_prefixes.ta_prior_vdm = y->sync.prior_ta[HK_SYNC_VDM];
+   staged.stage_prefixes.ta_cdm_barrier = y->sync.barrier_ta[HK_SYNC_CDM];
+   staged.stage_prefixes.ta_prior_cdm = y->sync.prior_ta[HK_SYNC_CDM];
+   struct drm_asahi_cmd_header h = {
+      .cmd_type = DRM_ASAHI_CMD_RENDER,
+      .size = sizeof(staged),
+      .vdm_barrier = y->sync.barrier[HK_SYNC_VDM],
+      .cdm_barrier = y->sync.barrier[HK_SYNC_CDM],
+   };
+   const uint32_t vdm_before = z->sync.index;
+   T("split history rebases",
+     hk_drm_rebase_prior(&h, &staged, vdm_before, 0, initial, true));
+   const uint64_t base = initial[HK_SYNC_VDM] + vdm_before;
+   const uint64_t whole = hk_drm_render_prefix(
+      base, h.vdm_barrier, staged.render.legacy.prior_vdm);
+   const uint64_t tiling = hk_drm_render_prefix(
+      base, staged.stage_prefixes.ta_vdm_barrier,
+      staged.stage_prefixes.ta_prior_vdm);
+   T("split history tiling covers history", tiling >= initial[HK_SYNC_VDM]);
+   T("split history whole covers X",
+     whole >= initial[HK_SYNC_VDM] + x->sync.index);
+   T("split history tiling within whole", tiling <= whole);
 }
 
 static void
@@ -2331,6 +2430,7 @@ main(void)
    test_compute_clear_layer_preservation();
    test_resume_after_compute_clear();
    test_loaded_color_preservation();
+   test_history_tile_hazard_split();
    test_pass_software_graphics_dependencies();
    test_image_barrier_vertex_class();
    test_discard_transition();
