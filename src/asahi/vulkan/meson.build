@@ -393,6 +393,23 @@ if with_tests
   )
 
   test(
+    'hk_gen1_as_precomp',
+    executable(
+      'hk_gen1_as_precomp_test',
+      files('tests/test-hk-gen1-as-precomp.c'),
+      include_directories : [
+        include_directories('.'), inc_gallium, inc_gallium_aux, inc_include,
+        inc_src, inc_asahi,
+      ],
+      dependencies : [
+        idep_nir_headers, idep_mesautil, idep_libagx, idep_libagx_shaders_h,
+      ],
+      link_with : [libasahi_lib],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'hk_query_copy',
     executable(
       'hk_query_copy_test',
