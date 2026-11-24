@@ -1355,12 +1355,13 @@ hk_g17p_indirect_launch_supported(struct hk_device *dev, struct agx_grid grid,
 }
 
 /*
- * Append an indirect launch of a built main program: the helper publishes
- * the grid's launch geometry, and the main record consumes it.
+ * Append an indirect launch of a built main program to `cs`: the helper
+ * publishes the grid's launch geometry, and the main record consumes it. The
+ * helper program is built for the same stream as the launch.
  */
 static __attribute__((hot)) bool
 hk_g17p_append_indirect_launch(
-   struct hk_cmd_buffer *cmd, struct agx_grid grid,
+   struct hk_cmd_buffer *cmd, struct hk_cs *cs, struct agx_grid grid,
    struct agx_workgroup local_size, uint64_t sparse_map_addr,
    const struct hk_g17p_compute_program_ref *program,
    struct agx3_compute_dispatch_sink *sink)
@@ -1415,7 +1416,7 @@ hk_g17p_append_indirect_launch(
    uint64_t helper_program_va;
    struct hk_g17p_compute_program_ref helper_program;
    if (!hk_g17p_build_compute_program(
-          cmd, cmd->current_cs.cs, helper_s, helper_s->only_linked,
+          cmd, cs, helper_s, helper_s->only_linked,
           helper_root_ptr.gpu, 0,
           local_size, false,
           AGX3_G17P_GRID_HELPER_LDSHDR_F1, "grid-helper", helper_ranges,
@@ -1590,8 +1591,8 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
          .data = (uint8_t *)cs->current,
          .capacity = (uint8_t *)cs->end - (uint8_t *)cs->current,
       };
-      if (!hk_g17p_append_indirect_launch(cmd, grid, local_size, 0, &program,
-                                          &sink))
+      if (!hk_g17p_append_indirect_launch(cmd, cs, grid, local_size, 0,
+                                          &program, &sink))
          return;
 
       cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
@@ -1604,6 +1605,11 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
        * the G17P stream oracle rejects. */
       cs->weak_barrier_end = cs->current;
       cs->app_dispatch_end = NULL;
+      /* The direct path below ends an AGX_BARRIER_ALL launch in the strong
+       * flush its consumer relies on. Give the indirect launch the same:
+       * strengthen its weak tail in place. */
+      if (barrier & AGX_BARRIER_ALL)
+         hk_cdm_cache_flush(dev, cs);
       if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy))
          hk_frame_anatomy_note_precomp(cs, idx, grid);
       cs->stats.cmds++;
@@ -2660,7 +2666,7 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    };
 
    if (indirect) {
-      if (!hk_g17p_append_indirect_launch(cmd, grid, local_size,
+      if (!hk_g17p_append_indirect_launch(cmd, cs, grid, local_size,
                                           sparse_map_addr, &program, &sink))
          return;
 
