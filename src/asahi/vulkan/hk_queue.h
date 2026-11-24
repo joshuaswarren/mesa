@@ -14,6 +14,12 @@
 struct hk_device;
 struct hk_packed_submit;
 
+/* Queues advertised per family when the kernel reports independent queues
+ * (DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES), and the most Vulkan queues of one
+ * device that keep a kernel queue of their own (hk_queue_independent_budget()).
+ */
+#define HK_ADVERTISED_QUEUES 8u
+
 /* Kernel queues one hk_queue may spread its independent work over. */
 #define HK_QUEUE_SIBLINGS_MAX 4
 
@@ -217,5 +223,7 @@ hk_submit_first_errored_cmd_buffer(const struct vk_queue_submit *submit);
 
 VkResult hk_queue_submit_bind_sparse_memory(struct hk_device *device,
                                             struct vk_queue_submit *submission);
+
+uint32_t hk_queue_independent_budget(struct hk_device *dev);
 
 void hk_queue_share(struct hk_device *dev, struct hk_queue *queue);

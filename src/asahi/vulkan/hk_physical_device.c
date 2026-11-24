@@ -30,6 +30,7 @@
 #include "hk_native_descriptor.h"
 #include "hk_nir_lower_mesh.h"
 #include "hk_private.h"
+#include "hk_queue.h"
 #include "hk_ray_tracing_core.h"
 #include "hk_shader.h"
 #include "hk_wsi.h"
@@ -2440,7 +2441,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     */
    if ((pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) &&
        !pdev->dev.is_virtio) {
-#define HK_ADVERTISED_QUEUES 8u
       struct drm_asahi_queue_limits limits = {0};
       struct drm_asahi_get_params query = {
          .param_group = DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS,
@@ -2458,6 +2458,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
                             "Kernel reports no usable command queues");
          goto fail_disk_cache;
       }
+      pdev->queue_limits = limits;
       /* limits.max_queues is the machine-wide pool of application GART
        * contexts (g17_queue_limits.rs: contexts 5..62), shared with every
        * other client on the device. VkQueueFamilyProperties::queueCount is a

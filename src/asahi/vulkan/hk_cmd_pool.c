@@ -948,8 +948,13 @@ hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *p,
    if (!p)
       return;
 
+   /* Once p is on a queue's list and the lock drops, a reap on another
+    * thread may release it: decide before then whether this thread does.
+    */
+   const bool release = !p->attempted;
+
    simple_mtx_lock(&dev->cmd_pending_lock);
-   if (!p->attempted) {
+   if (release) {
       /* No ioctl used its syncobjs or memory. */
       hk_cmd_pending_recycle(dev, p);
    } else if (result != VK_SUCCESS) {
@@ -974,7 +979,7 @@ hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *p,
    }
    simple_mtx_unlock(&dev->cmd_pending_lock);
 
-   if (!p->attempted)
+   if (release)
       hk_cmd_pending_release(dev, p, false);
 }
 
