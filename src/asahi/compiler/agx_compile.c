@@ -5257,6 +5257,10 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
 {
    /* G18G keeps j873's fused G17G-family half widening (15f6b6a7bd2). */
    const bool g18g = agx_is_g18g(&ctx->key->dev);
+   const bool agx3_mixed_falu =
+      ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+      (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !ctx->key->dev.emit_agx3d);
    if (!agx_isa_is_agx3(ctx->key->dev.encoding))
       return;
 
@@ -5288,6 +5292,43 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
    }
 
    agx_foreach_instr_global_safe(ctx, I) {
+      if (agx3_mixed_falu &&
+          (I->op == AGX_OPCODE_FMUL ||
+           (I->op == AGX_OPCODE_FFMA && I->saturate)) &&
+          I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
+          agx_channels(I->dest[0]) == 1) {
+         bool all_scalar_regs = true;
+         bool has_half_reg = false;
+         agx_foreach_src(I, s) {
+            const bool is_reg = (I->src[s].type == AGX_INDEX_NORMAL ||
+                                 I->src[s].type == AGX_INDEX_REGISTER) &&
+                                !I->src[s].memory &&
+                                agx_channels(I->src[s]) == 1;
+            if (!is_reg)
+               all_scalar_regs = false;
+            else if (I->src[s].size == AGX_SIZE_16)
+               has_half_reg = true;
+         }
+         if (has_half_reg && !all_scalar_regs) {
+            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+            agx_foreach_src(I, s) {
+               if ((I->src[s].type == AGX_INDEX_NORMAL ||
+                    I->src[s].type == AGX_INDEX_REGISTER) &&
+                   !I->src[s].memory && I->src[s].size == AGX_SIZE_16 &&
+                   agx_channels(I->src[s]) == 1) {
+                  agx_index raw = I->src[s];
+                  raw.abs = false;
+                  raw.neg = false;
+                  agx_index widened = agx_temp(ctx, AGX_SIZE_32);
+                  agx_fmov_to(&b, widened, raw);
+                  widened.abs = I->src[s].abs;
+                  widened.neg = I->src[s].neg;
+                  I->src[s] = widened;
+               }
+            }
+         }
+      }
+
       if (I->op != AGX_OPCODE_FFMA || I->nr_srcs != 3 || I->saturate)
          continue;
 
@@ -13792,6 +13833,7 @@ m5_lower_predicated_load(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+
 static bool
 agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
                          struct agx_shader_key *key,
@@ -13903,6 +13945,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
        * optimized properly.
        */
       AGX_PASS(ctx, agx_opt_cse);
+      AGX_PASS(ctx, agx_opt_agx3_normflt_byte_pairs);
 
       /* After DCE, use counts are right so we can run the optimizer. */
       AGX_PASS(ctx, agx_optimizer_backward);
@@ -14530,6 +14573,411 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    *offset_out = offset;
    ralloc_free(ctx);
    return true;
+}
+
+/*
+ * Pair low/high unsigned-byte float32 conversions of the same 16-bit half (or
+ * paired halves of a 32-bit word) on AGX3B and AGX3C (not AGX3D) into one
+ * two-lane `normflt` (U8NORM) followed by scaling by 255.
+ *
+ * Unpacking both bytes of a 16-bit half (`convert u8->f32(h)` and
+ * `convert u16->f32(h >> 8)`) otherwise issues three IC/bitfield ops per half
+ * (two `int2flt` plus one shift/extract). A single `normflt` decodes both
+ * bytes to `b / 255` in one instruction:
+ * - When every consumer is an all-register f32 `FFMA` or `FMUL`, emit a 16-bit
+ *   `normflt` pair and scale each lane by `255.0h` with `hmul`, feeding the
+ *   f16 result directly into the mixed-width `FFMA`/`FMUL` (halving footprint
+ *   and offloading scaling to the F16 pipe).
+ * - Otherwise, emit a 32-bit `normflt` pair and scale each lane by `255.0f`
+ *   with `fmul`.
+ *
+ * For round-to-nearest-even `normflt`, both `f16(b/255) * 255.0h` and
+ * `f32(b/255) * 255.0f` recover exact `float(b)` for every `b in 0..255`.
+ *
+ * Only rewrite halves whose sole uses in the shader are the paired low/high
+ * byte unpacks so the source half is guaranteed dead at `normflt`, matching
+ * the witnessed `f29 = 1` source-discard encoding.
+ */
+static void
+agx_emit_normflt_u8_pair(agx_context *ctx, agx_index half_src,
+                         agx_instr *lo, agx_instr *hi, agx_instr *anchor,
+                         const uint32_t *uses, const bool *narrow_bad,
+                         agx_index *narrow_remap, unsigned nalloc,
+                         bool *any_narrow)
+{
+   agx_builder b = agx_init_builder(ctx, agx_before_instr(anchor));
+   const unsigned lo_v = lo->dest[0].value;
+   const unsigned hi_v = hi->dest[0].value;
+   const bool use_f16 =
+      lo_v < nalloc && hi_v < nalloc &&
+      uses[lo_v] > 0 && uses[hi_v] > 0 &&
+      !narrow_bad[lo_v] && !narrow_bad[hi_v];
+
+   if (use_f16) {
+      agx_index pair = agx_temp(ctx, AGX_SIZE_16);
+      pair.channels_m1 = 1;
+      agx_instr *nf =
+         agx_normflt_agx3_to(&b, pair, half_src, AGX_FORMAT_U8NORM);
+      nf->mask = 0;
+
+      agx_index lanes[2] = {agx_null()};
+      agx_emit_split(&b, lanes, pair, 2);
+      agx_index scale = agx_mov_imm(&b, 16, 0x5bf8); /* 255.0h */
+
+      agx_builder blo = agx_init_builder(ctx, agx_before_instr(lo));
+      narrow_remap[lo_v] = agx_hmul(&blo, lanes[0], scale);
+      agx_remove_instruction(lo);
+
+      agx_builder bhi = agx_init_builder(ctx, agx_before_instr(hi));
+      narrow_remap[hi_v] = agx_hmul(&bhi, lanes[1], scale);
+      agx_remove_instruction(hi);
+
+      *any_narrow = true;
+   } else {
+      agx_index pair = agx_temp(ctx, AGX_SIZE_32);
+      pair.channels_m1 = 1;
+      agx_instr *nf =
+         agx_normflt_agx3_to(&b, pair, half_src, AGX_FORMAT_U8NORM);
+      nf->mask = 0;
+
+      agx_index lanes[2] = {agx_null()};
+      agx_emit_split(&b, lanes, pair, 2);
+      agx_index scale = agx_mov_imm(&b, 32, fui(255.0f));
+
+      agx_builder blo = agx_init_builder(ctx, agx_before_instr(lo));
+      agx_fmul_to(&blo, lo->dest[0], lanes[0], scale);
+      agx_remove_instruction(lo);
+
+      agx_builder bhi = agx_init_builder(ctx, agx_before_instr(hi));
+      agx_fmul_to(&bhi, hi->dest[0], lanes[1], scale);
+      agx_remove_instruction(hi);
+   }
+}
+
+static bool
+agx_normflt_imm_u32(agx_index idx, const bool *is_mov_imm,
+                    const uint64_t *mov_imm_val, unsigned nalloc,
+                    uint32_t *out)
+{
+   if (idx.abs || idx.neg)
+      return false;
+   if (idx.type == AGX_INDEX_IMMEDIATE) {
+      *out = idx.value;
+      return true;
+   }
+   if (idx.type == AGX_INDEX_NORMAL && idx.value < nalloc &&
+       is_mov_imm[idx.value]) {
+      *out = (uint32_t)mov_imm_val[idx.value];
+      return true;
+   }
+   return false;
+}
+
+void
+agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
+{
+   const bool normflt_pairs_ok =
+      ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+      (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !ctx->key->dev.emit_agx3d);
+   if (!normflt_pairs_ok || ctx->is_preamble)
+      return;
+
+   void *memctx = ralloc_context(NULL);
+   const unsigned nalloc = MAX2(ctx->alloc, 1u);
+   uint32_t *uses = rzalloc_array(memctx, uint32_t, nalloc);
+   bool *is_mov_imm = rzalloc_array(memctx, bool, nalloc);
+   uint64_t *mov_imm_val = rzalloc_array(memctx, uint64_t, nalloc);
+   bool *narrow_bad = rzalloc_array(memctx, bool, nalloc);
+   agx_instr **bfeil_def = rzalloc_array(memctx, agx_instr *, nalloc);
+   agx_block **bfeil_blk = rzalloc_array(memctx, agx_block *, nalloc);
+   agx_instr **word_ext_def = rzalloc_array(memctx, agx_instr *, nalloc);
+   agx_block **word_ext_blk = rzalloc_array(memctx, agx_block *, nalloc);
+   agx_index *word_ext_src = rzalloc_array(memctx, agx_index, nalloc);
+   uint8_t *word_ext_lane = rzalloc_array(memctx, uint8_t, nalloc);
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM && I->nr_dests == 1 &&
+             I->dest[0].type == AGX_INDEX_NORMAL && I->dest[0].value < nalloc) {
+            is_mov_imm[I->dest[0].value] = true;
+            mov_imm_val[I->dest[0].value] = I->imm;
+         }
+         agx_foreach_ssa_src(I, s) {
+            if (I->src[s].value < nalloc)
+               uses[I->src[s].value]++;
+         }
+      }
+   }
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         uint32_t imm0 = 0, imm2 = 0;
+         if (I->op == AGX_OPCODE_BFEIL && I->nr_dests == 1 &&
+             I->nr_srcs == 3 && I->dest[0].type == AGX_INDEX_NORMAL &&
+             I->dest[0].size == AGX_SIZE_16 && agx_channels(I->dest[0]) == 1 &&
+             agx_normflt_imm_u32(I->src[0], is_mov_imm, mov_imm_val, nalloc, &imm0) &&
+             imm0 == 0 &&
+             I->src[1].type == AGX_INDEX_NORMAL &&
+             I->src[1].size == AGX_SIZE_16 && agx_channels(I->src[1]) == 1 &&
+             !I->src[1].abs && !I->src[1].neg &&
+             agx_normflt_imm_u32(I->src[2], is_mov_imm, mov_imm_val, nalloc, &imm2) &&
+             imm2 == 8 && I->bfi_mask == 0 &&
+             I->dest[0].value < nalloc) {
+            bfeil_def[I->dest[0].value] = I;
+            bfeil_blk[I->dest[0].value] = block;
+         } else if (I->op == AGX_OPCODE_BITOP && I->truth_table == 8 &&
+                    I->nr_dests == 1 && I->nr_srcs == 2 &&
+                    I->dest[0].type == AGX_INDEX_NORMAL &&
+                    I->dest[0].size == AGX_SIZE_32 &&
+                    agx_channels(I->dest[0]) == 1 &&
+                    I->dest[0].value < nalloc) {
+            for (unsigned s = 0; s < 2; ++s) {
+               const agx_index a = I->src[s];
+               const agx_index b = I->src[1 - s];
+               uint32_t mask = 0;
+               if (a.type == AGX_INDEX_NORMAL && a.size == AGX_SIZE_32 &&
+                   agx_channels(a) == 1 && !a.abs && !a.neg &&
+                   a.value < nalloc &&
+                   agx_normflt_imm_u32(b, is_mov_imm, mov_imm_val, nalloc, &mask) &&
+                   mask == 0xff) {
+                  word_ext_def[I->dest[0].value] = I;
+                  word_ext_blk[I->dest[0].value] = block;
+                  word_ext_src[I->dest[0].value] = a;
+                  word_ext_lane[I->dest[0].value] = 1;
+                  break;
+               }
+            }
+         } else if (I->op == AGX_OPCODE_BFEIL && I->nr_dests == 1 &&
+                    I->nr_srcs == 3 && I->dest[0].type == AGX_INDEX_NORMAL &&
+                    I->dest[0].size == AGX_SIZE_32 &&
+                    agx_channels(I->dest[0]) == 1 &&
+                    agx_normflt_imm_u32(I->src[0], is_mov_imm, mov_imm_val, nalloc, &imm0) &&
+                    imm0 == 0 &&
+                    I->src[1].type == AGX_INDEX_NORMAL &&
+                    I->src[1].size == AGX_SIZE_32 &&
+                    agx_channels(I->src[1]) == 1 &&
+                    !I->src[1].abs && !I->src[1].neg &&
+                    I->src[1].value < nalloc &&
+                    agx_normflt_imm_u32(I->src[2], is_mov_imm, mov_imm_val, nalloc, &imm2) &&
+                    I->dest[0].value < nalloc) {
+            uint8_t lane = 0;
+            if (imm2 == 0 && I->bfi_mask == 8)
+               lane = 1;
+            else if (imm2 == 8 && I->bfi_mask == 8)
+               lane = 2;
+            else if (imm2 == 16 && I->bfi_mask == 8)
+               lane = 3;
+            else if (imm2 == 24 &&
+                     (I->bfi_mask == 0 || I->bfi_mask == 8))
+               lane = 4;
+            if (lane) {
+               word_ext_def[I->dest[0].value] = I;
+               word_ext_blk[I->dest[0].value] = block;
+               word_ext_src[I->dest[0].value] = I->src[1];
+               word_ext_lane[I->dest[0].value] = lane;
+            }
+         }
+      }
+   }
+
+   /* An unpacked byte fits exactly in f16 (0..255), and f16(f16(b/255) * 255h)
+    * equals float(b) bit-for-bit for all 256 inputs. Keep the result in f16
+    * whenever every consumer is an all-register f32 FFMA/FMUL, which reads
+    * f16 sources natively on AGX3B/AGX3C and offloads the *255 scale to the
+    * F16 pipe while halving register footprint. */
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         bool consumer_ok =
+            (I->op == AGX_OPCODE_FFMA || I->op == AGX_OPCODE_FMUL) &&
+            I->nr_dests == 1 && I->dest[0].type == AGX_INDEX_NORMAL &&
+            I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1;
+         if (consumer_ok) {
+            agx_foreach_src(I, s) {
+               if (I->src[s].type != AGX_INDEX_NORMAL ||
+                   agx_channels(I->src[s]) != 1 ||
+                   (I->src[s].value < nalloc && is_mov_imm[I->src[s].value])) {
+                  consumer_ok = false;
+                  break;
+               }
+            }
+         }
+         if (!consumer_ok) {
+            agx_foreach_ssa_src(I, s) {
+               if (I->src[s].value < nalloc)
+                  narrow_bad[I->src[s].value] = true;
+            }
+         }
+      }
+   }
+
+   struct agx_normflt_word_state {
+      agx_instr *conv[4];
+      uint32_t pos[4];
+      agx_index idx;
+   };
+   agx_instr **lo_conv = rzalloc_array(memctx, agx_instr *, nalloc);
+   agx_instr **hi_conv = rzalloc_array(memctx, agx_instr *, nalloc);
+   uint32_t *lo_pos = rzalloc_array(memctx, uint32_t, nalloc);
+   uint32_t *hi_pos = rzalloc_array(memctx, uint32_t, nalloc);
+   uint32_t *candidates = rzalloc_array(memctx, uint32_t, nalloc);
+   struct agx_normflt_word_state *word_st =
+      rzalloc_array(memctx, struct agx_normflt_word_state, nalloc);
+   uint32_t *word_cands = rzalloc_array(memctx, uint32_t, nalloc);
+   agx_index *narrow_remap = rzalloc_array(memctx, agx_index, nalloc);
+   bool any_narrow = false;
+
+   agx_foreach_block(ctx, block) {
+      unsigned ncands = 0;
+      unsigned nword_cands = 0;
+      uint32_t pos = 0;
+      agx_foreach_instr_in_block(block, I) {
+         pos++;
+         if (I->op != AGX_OPCODE_CONVERT || I->nr_dests != 1 ||
+             I->nr_srcs != 2 || I->saturate ||
+             I->dest[0].type != AGX_INDEX_NORMAL ||
+             I->dest[0].size != AGX_SIZE_32 ||
+             agx_channels(I->dest[0]) != 1 ||
+             I->src[0].type != AGX_INDEX_IMMEDIATE ||
+             I->src[1].type != AGX_INDEX_NORMAL ||
+             agx_channels(I->src[1]) != 1 ||
+             I->src[1].abs || I->src[1].neg ||
+             I->src[1].value >= nalloc)
+            continue;
+
+         const enum agx_convert mode = I->src[0].value;
+         const unsigned s = I->src[1].value;
+         if (I->src[1].size == AGX_SIZE_16) {
+            if (mode == AGX_CONVERT_U8_TO_F) {
+               if (!lo_conv[s]) {
+                  if (!hi_conv[s])
+                     candidates[ncands++] = s;
+                  lo_conv[s] = I;
+                  lo_pos[s] = pos;
+               }
+            } else if (mode == AGX_CONVERT_U16_TO_F) {
+               agx_instr *sh = bfeil_def[s];
+               if (sh && bfeil_blk[s] == block && uses[s] == 1 &&
+                   sh->src[1].value < nalloc) {
+                  const unsigned h = sh->src[1].value;
+                  if (!hi_conv[h]) {
+                     if (!lo_conv[h])
+                        candidates[ncands++] = h;
+                     hi_conv[h] = I;
+                     hi_pos[h] = pos;
+                  }
+               }
+            }
+         } else if (I->src[1].size == AGX_SIZE_32 &&
+                    mode == AGX_CONVERT_U32_TO_F) {
+            const uint8_t lane = word_ext_lane[s];
+            if (lane && word_ext_blk[s] == block && uses[s] == 1) {
+               const unsigned w = word_ext_src[s].value;
+               const unsigned idx = lane - 1;
+               if (!word_st[w].conv[idx]) {
+                  if (!word_st[w].conv[0] && !word_st[w].conv[1] &&
+                      !word_st[w].conv[2] && !word_st[w].conv[3]) {
+                     word_cands[nword_cands++] = w;
+                     word_st[w].idx = word_ext_src[s];
+                  }
+                  word_st[w].conv[idx] = I;
+                  word_st[w].pos[idx] = pos;
+               }
+            }
+         }
+      }
+
+      for (unsigned ci = 0; ci < ncands; ++ci) {
+         const unsigned h = candidates[ci];
+         agx_instr *lo = lo_conv[h];
+         agx_instr *hi = hi_conv[h];
+         lo_conv[h] = NULL;
+         hi_conv[h] = NULL;
+         if (!lo || !hi || uses[h] != 2)
+            continue;
+
+         agx_instr *sh = bfeil_def[hi->src[1].value];
+         agx_instr *anchor = lo_pos[h] < hi_pos[h] ? lo : hi;
+         agx_emit_normflt_u8_pair(ctx, lo->src[1], lo, hi, anchor,
+                                  uses, narrow_bad, narrow_remap, nalloc,
+                                  &any_narrow);
+         agx_remove_instruction(sh);
+      }
+
+      for (unsigned ci = 0; ci < nword_cands; ++ci) {
+         const unsigned w = word_cands[ci];
+         agx_instr *c[4] = {
+            word_st[w].conv[0], word_st[w].conv[1],
+            word_st[w].conv[2], word_st[w].conv[3],
+         };
+         uint32_t p[4] = {
+            word_st[w].pos[0], word_st[w].pos[1],
+            word_st[w].pos[2], word_st[w].pos[3],
+         };
+         const agx_index widx = word_st[w].idx;
+         memset(word_st[w].conv, 0, sizeof(word_st[w].conv));
+
+         const bool has_lo = c[0] && c[1];
+         const bool has_hi = c[2] && c[3];
+         const unsigned need = (has_lo ? 2u : 0u) + (has_hi ? 2u : 0u);
+         if (!need || uses[w] != need)
+            continue;
+
+         agx_instr *ext[4] = {
+            has_lo ? word_ext_def[c[0]->src[1].value] : NULL,
+            has_lo ? word_ext_def[c[1]->src[1].value] : NULL,
+            has_hi ? word_ext_def[c[2]->src[1].value] : NULL,
+            has_hi ? word_ext_def[c[3]->src[1].value] : NULL,
+         };
+
+         agx_instr *first = NULL;
+         uint32_t first_pos = UINT32_MAX;
+         for (unsigned k = 0; k < 4; ++k) {
+            if (((k < 2 && has_lo) || (k >= 2 && has_hi)) && p[k] < first_pos) {
+               first = c[k];
+               first_pos = p[k];
+            }
+         }
+
+         agx_builder bs = agx_init_builder(ctx, agx_before_instr(first));
+         agx_instr *sp = agx_split(&bs, 2, widx);
+         agx_index h0 = has_lo ? agx_temp(ctx, AGX_SIZE_16) : agx_null();
+         agx_index h1 = has_hi ? agx_temp(ctx, AGX_SIZE_16) : agx_null();
+         sp->dest[0] = h0;
+         sp->dest[1] = h1;
+
+         if (has_lo) {
+            agx_instr *anchor = p[0] < p[1] ? c[0] : c[1];
+            agx_emit_normflt_u8_pair(ctx, h0, c[0], c[1], anchor,
+                                     uses, narrow_bad, narrow_remap, nalloc,
+                                     &any_narrow);
+            agx_remove_instruction(ext[0]);
+            agx_remove_instruction(ext[1]);
+         }
+         if (has_hi) {
+            agx_instr *anchor = p[2] < p[3] ? c[2] : c[3];
+            agx_emit_normflt_u8_pair(ctx, h1, c[2], c[3], anchor,
+                                     uses, narrow_bad, narrow_remap, nalloc,
+                                     &any_narrow);
+            agx_remove_instruction(ext[2]);
+            agx_remove_instruction(ext[3]);
+         }
+      }
+   }
+
+   if (any_narrow) {
+      agx_foreach_block(ctx, block) {
+         agx_foreach_instr_in_block(block, I) {
+            agx_foreach_ssa_src(I, s) {
+               const unsigned v = I->src[s].value;
+               if (v < nalloc && narrow_remap[v].type == AGX_INDEX_NORMAL)
+                  I->src[s] = agx_replace_index(I->src[s], narrow_remap[v]);
+            }
+         }
+      }
+   }
+
+   ralloc_free(memctx);
 }
 
 /* Retry eligible preambles without changing scratch admission or launch rules. */
