@@ -562,8 +562,12 @@ hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
    /* Compute derivatives lower via NIR quad swaps and explicit-gradient
     * samples across all chips; mesh/task derivatives follow
     * meshAndTaskShaderDerivatives. */
+   const bool compute_derivative_mode_supported =
+      nir->info.derivative_group == DERIVATIVE_GROUP_QUADS
+         ? vk_pdev->supported_features.computeDerivativeGroupQuads
+         : vk_pdev->supported_features.computeDerivativeGroupLinear;
    const bool lower_compute_derivatives =
-      ((vk_pdev->supported_features.computeDerivativeGroupQuads &&
+      ((compute_derivative_mode_supported &&
         nir->info.stage == MESA_SHADER_COMPUTE) ||
        (vk_pdev->properties.meshAndTaskShaderDerivatives &&
         (nir->info.stage == MESA_SHADER_TASK ||
