@@ -243,13 +243,15 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
        * producer-wait/lifetime domain is intentionally narrow, and
        * fma_addend_imm_width_mod still refuses half sources on AGX3B.
        * On AGX3B, unmodified all-scalar-register F32 FFMA carries independent
-       * per-operand f16/f32 width bits via agx3_falu_fma_mod_runtime (verified
-       * bit-exact against explicit f16->f32 widening across 1,024 subnormal,
-       * NaN-payload, and signed-zero cases in every operand slot on G17P
-       * hardware), so allow folding unmodified scalar f16 GPR widenings into
-       * such FFMAs; keep explicit exact widening for FADD, FMUL, G18G, and
-       * modified/mixed-kind FFMAs.  Native patterns such as the scalar-half
-       * sqrt are emitted without an fmov and therefore remain available. */
+       * per-operand f16/f32 width bits via agx3_falu_fma_mod_runtime, and
+       * unmodified all-scalar-register F32 FADD takes one f16 GPR alongside an
+       * f32 GPR via agx3_alu_fadd_mixed_half (both verified bit-exact against
+       * explicit f16->f32 widening on G17P hardware), so allow folding
+       * unmodified scalar f16 GPR widenings into such FFMAs and single-half
+       * FADDs; keep explicit exact widening for two-half FADD, FMUL, G18G, and
+       * modified/mixed-kind FFMAs/FADDs.  Native patterns such as the
+       * scalar-half sqrt are emitted without an fmov and therefore remain
+       * available. */
       if (ctx->key &&
           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
            agx_is_g18g(&ctx->key->dev)) &&
@@ -281,7 +283,25 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
                }
             }
          }
-         if (!allow_half_uniform && !allow_agx3b_ffma_gpr)
+         bool allow_agx3b_fadd_gpr = false;
+         if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+             ins->op == AGX_OPCODE_FADD && ins->nr_srcs == 2 &&
+             !ins->saturate && ins->nr_dests == 1 && !ins->dest[0].memory &&
+             ins->dest[0].size == AGX_SIZE_32 &&
+             agx_channels(ins->dest[0]) == 1 &&
+             (def->src[0].type == AGX_INDEX_NORMAL ||
+              def->src[0].type == AGX_INDEX_REGISTER) &&
+             !def->src[0].memory && agx_channels(def->src[0]) == 1 &&
+             !def->src[0].abs && !def->src[0].neg && !src.abs && !src.neg) {
+            const agx_index other = ins->src[1 - s];
+            allow_agx3b_fadd_gpr =
+               (other.type == AGX_INDEX_NORMAL ||
+                other.type == AGX_INDEX_REGISTER) &&
+               !other.memory && other.size == AGX_SIZE_32 &&
+               agx_channels(other) == 1 && !other.abs && !other.neg;
+         }
+         if (!allow_half_uniform && !allow_agx3b_ffma_gpr &&
+             !allow_agx3b_fadd_gpr)
             continue;
       }
 

@@ -3922,6 +3922,76 @@ static void test_native_fadd_mixed_half(void)
       exact(bytes, len, vectors[i].bytes);
    }
 
+   /* Multi-slot waits that do not fit the compact ep1 wait code (e.g. slots
+    * 0+2 or all 6 slots) fall back cleanly to the 8-byte ep2 mask form.
+    * Independently verify every physical field from agx3b_tables.txt form
+    * f32add 2: opcode bits (w0&7==1, w1&7==4, w2&3==1), width groups
+    * g239/g240/g241 (dest=f32, f32=f32, f16=f16), GPR register/hint encodings
+    * g244/g243/g235/g237 (including odd half bit w2.4 and high-reg bits
+    * w2.12/w2.8/w2.10), and all 6 wait bits (w2[13..15], w3[13..15]). */
+   static const struct {
+      uint16_t dest, f32, f16;
+      enum agx3_alu_hint hint32, hint16;
+      bool dest_cache;
+      uint8_t wait;
+   } ep2_cases[] = {
+      {16, 8, 4, AGX3_ALU_HINT_CACHE, AGX3_ALU_HINT_NONE, false, 0x05},
+      {144, 136, 5, AGX3_ALU_HINT_DISCARD, AGX3_ALU_HINT_CACHE, true, 0x2a},
+      {254, 252, 255, AGX3_ALU_HINT_NONE, AGX3_ALU_HINT_DISCARD, true, 0x3f},
+   };
+   for (unsigned i = 0; i < sizeof(ep2_cases) / sizeof(ep2_cases[0]); ++i) {
+      const uint16_t dest = ep2_cases[i].dest;
+      const uint16_t f32 = ep2_cases[i].f32;
+      const uint16_t f16 = ep2_cases[i].f16;
+      const uint8_t wm = ep2_cases[i].wait;
+      assert(agx3_alu_fadd_mixed_half(
+         AGX_ISA_ENCODING_AGX3B, dest, f32, f16, ep2_cases[i].hint32,
+         ep2_cases[i].hint16, ep2_cases[i].dest_cache, wm, bytes, &len));
+      assert(len == 8);
+      const uint16_t w0 = (uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8);
+      const uint16_t w1 = (uint16_t)bytes[2] | ((uint16_t)bytes[3] << 8);
+      const uint16_t w2 = (uint16_t)bytes[4] | ((uint16_t)bytes[5] << 8);
+      const uint16_t w3 = (uint16_t)bytes[6] | ((uint16_t)bytes[7] << 8);
+      /* Opcode / form bits */
+      assert((w0 & 0x0007u) == 0x0001u);
+      assert((w1 & 0x0007u) == 0x0004u);
+      assert((w2 & 0x0003u) == 0x0001u);
+      /* Width bits: g239 (dest=f32), g240 (f32=f32), g241 (f16=f16) */
+      assert(((w0 >> 3) & 1u) == 1u && ((w3 >> 6) & 1u) == 0u);
+      assert(((w0 >> 8) & 1u) == 1u && ((w3 >> 7) & 1u) == 0u);
+      assert(((w1 >> 8) & 1u) == 0u && ((w3 >> 8) & 1u) == 0u);
+      /* GPR class selectors: g244/g243, g235, g237 */
+      assert(((w2 >> 5) & 1u) == 0u && ((w2 >> 6) & 1u) == 0u);
+      assert(((w2 >> 7) & 1u) == 0u);
+      assert(((w2 >> 9) & 1u) == 0u);
+      /* Reconstructed register fields + cache/discard hints */
+      const uint16_t dec_dest =
+         ((w2 >> 2) & 1u) | (((w0 >> 4) & 0xfu) << 1) |
+         (((w1 >> 6) & 0x3u) << 5) | (((w2 >> 12) & 1u) << 7);
+      const uint16_t dec_f32 =
+         ((w2 >> 3) & 1u) | (((w0 >> 9) & 0x3fu) << 1) |
+         (((w2 >> 8) & 1u) << 7);
+      const uint16_t dec_f16 =
+         ((w2 >> 4) & 1u) | (((w1 >> 9) & 0x3fu) << 1) |
+         (((w2 >> 10) & 1u) << 7);
+      assert(dec_dest == dest);
+      assert(dec_f32 == f32);
+      assert(dec_f16 == f16);
+      assert(((w2 >> 4) & 1u) == (f16 & 1u));
+      assert(((w1 >> 5) & 1u) == (ep2_cases[i].dest_cache ? 1u : 0u));
+      assert(((w0 >> 15) & 1u) ==
+             (ep2_cases[i].hint32 == AGX3_ALU_HINT_CACHE ? 1u : 0u));
+      assert(((w1 >> 3) & 1u) ==
+             (ep2_cases[i].hint32 == AGX3_ALU_HINT_DISCARD ? 1u : 0u));
+      assert(((w1 >> 15) & 1u) ==
+             (ep2_cases[i].hint16 == AGX3_ALU_HINT_CACHE ? 1u : 0u));
+      assert(((w1 >> 4) & 1u) ==
+             (ep2_cases[i].hint16 == AGX3_ALU_HINT_DISCARD ? 1u : 0u));
+      /* All 6 wait mask bits */
+      assert(((w2 >> 13) & 0x7u) == (wm & 0x7u));
+      assert(((w3 >> 13) & 0x7u) == ((wm >> 3) & 0x7u));
+   }
+
    assert(!agx3_alu_fadd_mixed_half(
       AGX_ISA_ENCODING_AGX3B, 1, 0, 0, AGX3_ALU_HINT_NONE,
       AGX3_ALU_HINT_NONE, false, 0, bytes, &len));

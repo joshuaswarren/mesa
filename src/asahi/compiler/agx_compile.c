@@ -4697,7 +4697,7 @@ agx_fminmax_to(agx_builder *b, agx_index dst, agx_index s0, agx_index s1,
    return agx_fcmpsel_to(b, dst, s0, s1, s0, s1, fcond);
 }
 
-static void
+void
 agx_lower_agx3_half_converts(agx_context *ctx)
 {
    const bool is_g18g = agx_is_g18g(&ctx->key->dev);
@@ -4818,6 +4818,21 @@ agx_lower_agx3_half_converts(agx_context *ctx)
       switch (I->src[0].value) {
       case AGX_CONVERT_S32_TO_F:
       case AGX_CONVERT_U32_TO_F:
+         /* AGX3B converts 32-bit integer GPRs directly to f16 via
+          * agx3_alu_i32_to_f16 without an intermediate f32 widening and
+          * narrowing move (verified bit-exact across the full 2^32 signed
+          * and 2^32 unsigned IEEE-754 RTE domains on G17P hardware). Leave
+          * AGX3C untouched. */
+         if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+             !I->saturate && I->nr_dests == 1 && I->nr_srcs == 2 &&
+             I->src[1].size == AGX_SIZE_32 &&
+             agx_channels(I->src[1]) == 1 && agx_channels(I->dest[0]) == 1 &&
+             !I->dest[0].memory && !I->src[1].memory &&
+             !I->src[1].abs && !I->src[1].neg &&
+             (I->src[1].type == AGX_INDEX_NORMAL ||
+              I->src[1].type == AGX_INDEX_REGISTER))
+            continue;
+         break;
       case AGX_CONVERT_S16_TO_F:
       case AGX_CONVERT_U16_TO_F:
          break;
@@ -6652,8 +6667,8 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
       }
 
       /* A general 32-bit FADD of a half and an immediate has no single
-       * AGX3C form. G17G converts first (f32add of the half and -0.0) and
-       * then adds in f32: saturate(float(h)) is f32add, f32add.sat
+       * AGX3 form. G17G/G17P convert first (f32add of the half and -0.0) and
+       * then add in f32: saturate(float(h)) is f32add, f32add.sat
        * (port/hfwit k_sat_h2f, k_h2f_mul). Widen the half the same exact
        * way. The exception is that conversion itself, an unsaturated
        * f32add of the half and -0.0, which is native: widening it again
@@ -6664,7 +6679,7 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          I->src[1].type == AGX_INDEX_IMMEDIATE &&
          agx_is_equiv(I->src[1], agx_negzero()) && !I->src[1].abs &&
          !I->src[1].neg && I->src[0].type != AGX_INDEX_IMMEDIATE;
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
           I->op == AGX_OPCODE_FADD && I->nr_dests == 1 && I->nr_srcs == 2 &&
           I->dest[0].size == AGX_SIZE_32 && !half_to_float &&
           (I->src[0].type == AGX_INDEX_IMMEDIATE ||
@@ -7420,14 +7435,18 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          }
       }
 
-      /* Hyprland's colour-management shaders add a highp accumulator to a
-       * mediump matrix term. There is no grounded plain mixed-width FADD on
-       * G17P, so widen the half input explicitly and use the ordinary f32
-       * register form. Keep the separately witnessed abs(f32) + f16 endpoint
-       * available for its exact modifier shape. */
+      /* Plain mixed-width F32 FADD (f32 GPR + f16 GPR) has a native grounded
+       * encoder (agx3_alu_fadd_mixed_half) on AGX3B (verified bit-exact across
+       * subnormal, NaN-payload, signed-zero, and ep1/ep2 multi-slot wait cases
+       * on G17P hardware). Keep explicit widening on AGX3C/G18G or when either
+       * operand is not a plain scalar GPR (e.g. a uniform). */
       if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
           I->op == AGX_OPCODE_FADD && I->nr_srcs == 2 && !I->saturate &&
           I->dest[0].size == AGX_SIZE_32) {
+         const bool native_mixed_fadd =
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+            I->nr_dests == 1 && !I->dest[0].memory &&
+            agx_channels(I->dest[0]) == 1;
          for (unsigned s = 0; s < 2; ++s) {
             const unsigned other = s ^ 1;
             if (I->src[s].type == AGX_INDEX_IMMEDIATE ||
@@ -7435,6 +7454,14 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
                 I->src[s].neg || I->src[other].type == AGX_INDEX_IMMEDIATE ||
                 I->src[other].size != AGX_SIZE_32 ||
                 I->src[other].abs || I->src[other].neg)
+               continue;
+            if (native_mixed_fadd &&
+                (I->src[s].type == AGX_INDEX_NORMAL ||
+                 I->src[s].type == AGX_INDEX_REGISTER) &&
+                !I->src[s].memory && agx_channels(I->src[s]) == 1 &&
+                (I->src[other].type == AGX_INDEX_NORMAL ||
+                 I->src[other].type == AGX_INDEX_REGISTER) &&
+                !I->src[other].memory && agx_channels(I->src[other]) == 1)
                continue;
 
             agx_index widened = agx_temp(ctx, AGX_SIZE_32);

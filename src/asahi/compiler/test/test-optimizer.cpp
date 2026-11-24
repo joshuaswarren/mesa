@@ -1733,8 +1733,8 @@ TEST_F(Optimizer, Agx3bFoldsUnmodifiedHalfGprIntoFfma)
    const Case cases[] = {
       {"agx3b_ffma_plain", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FFMA,
        false, false, false, false, true},
-      {"agx3b_fadd_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD,
-       false, false, false, false, false},
+      {"agx3b_fadd_plain", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD,
+       false, false, false, false, true},
       {"agx3b_fmul_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FMUL,
        false, false, false, false, false},
       {"agx3b_ffma_saturate_blocked", AGX_ISA_ENCODING_AGX3B, false,
@@ -1817,4 +1817,84 @@ TEST_F(Optimizer, DeviceLoadImmediateIndexKeepsItsDisplacementEncodable)
    EXPECT_EQ(device_load_index_type(mem_ctx, 8, 0), AGX_INDEX_IMMEDIATE);
    EXPECT_EQ(device_load_index_type(mem_ctx, 8, 32735), AGX_INDEX_IMMEDIATE);
    EXPECT_EQ(device_load_index_type(mem_ctx, 8, 32736), AGX_INDEX_NORMAL);
+}
+
+TEST_F(Optimizer, Agx3bFoldsUnmodifiedHalfGprIntoFadd)
+{
+   struct Case {
+      const char *name;
+      enum agx_isa_encoding enc;
+      bool emit_agx3d;
+      enum agx_opcode op;
+      bool half_second;
+      bool both_half;
+      bool saturate;
+      bool src_neg;
+      bool has_imm;
+      bool has_uniform;
+      bool expect_folded;
+   };
+   const Case cases[] = {
+      {"agx3b_fadd_half_first", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD,
+       false, false, false, false, false, false, true},
+      {"agx3b_fadd_half_second", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD,
+       true, false, false, false, false, false, true},
+      {"agx3b_fadd_both_half_keeps_one_wide", AGX_ISA_ENCODING_AGX3B, false,
+       AGX_OPCODE_FADD, false, true, false, false, false, false, true},
+      {"agx3b_fadd_saturate_blocked", AGX_ISA_ENCODING_AGX3B, false,
+       AGX_OPCODE_FADD, false, false, true, false, false, false, false},
+      {"agx3b_fadd_neg_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD,
+       false, false, false, true, false, false, false},
+      {"agx3b_fadd_imm_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FADD,
+       false, false, false, false, true, false, false},
+      {"agx3b_fadd_uniform_blocked", AGX_ISA_ENCODING_AGX3B, false,
+       AGX_OPCODE_FADD, false, false, false, false, false, true, false},
+      {"agx3b_fmul_blocked", AGX_ISA_ENCODING_AGX3B, false, AGX_OPCODE_FMUL,
+       false, false, false, false, false, false, false},
+      {"g18g_fadd_blocked", AGX_ISA_ENCODING_AGX3C, true, AGX_OPCODE_FADD,
+       false, false, false, false, false, false, false},
+   };
+
+   for (const Case &c : cases) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.emit_agx3d = c.emit_agx3d;
+      b->shader->key = &key;
+
+      agx_index half0 = agx_preload(b, hx);
+      agx_index w0 = agx_temp(b->shader, AGX_SIZE_32);
+      agx_fmov_to(b, w0, half0);
+      if (c.src_neg)
+         w0 = agx_neg(w0);
+
+      agx_index other;
+      if (c.both_half) {
+         agx_index half1 = agx_preload(b, hy);
+         other = agx_temp(b->shader, AGX_SIZE_32);
+         agx_fmov_to(b, other, half1);
+      } else if (c.has_imm) {
+         other = agx_immediate_f(1.0f);
+      } else if (c.has_uniform) {
+         other = agx_uniform(0, AGX_SIZE_32);
+      } else {
+         other = agx_preload(b, wy);
+      }
+
+      agx_index s0 = c.half_second ? other : w0;
+      agx_index s1 = c.half_second ? w0 : other;
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *I = c.op == AGX_OPCODE_FADD ? agx_fadd_to(b, out, s0, s1)
+                                             : agx_fmul_to(b, out, s0, s1);
+      I->saturate = c.saturate;
+      agx_unit_test(b, out);
+
+      agx_optimize_and_dce(b->shader);
+
+      const unsigned idx = c.half_second ? 1 : 0;
+      EXPECT_EQ(I->src[idx].size, c.expect_folded ? AGX_SIZE_16 : AGX_SIZE_32)
+         << c.name;
+      if (c.both_half)
+         EXPECT_EQ(I->src[1 - idx].size, AGX_SIZE_32) << c.name;
+   }
 }
