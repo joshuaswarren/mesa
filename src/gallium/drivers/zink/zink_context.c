@@ -1511,25 +1511,42 @@ zink_set_vertex_buffers_internal(struct pipe_context *pctx,
 
    assert(!num_buffers || buffers);
 
+   bool changed = num_buffers != ctx->vertex_buffers_count;
+
    for (unsigned i = 0; i < num_buffers; ++i) {
       const struct pipe_vertex_buffer *vb = buffers + i;
       struct pipe_vertex_buffer *ctx_vb = &ctx->vertex_buffers[i];
-      update_existing_vbo(ctx, i);
-      memcpy(ctx_vb, vb, sizeof(*vb));
+      bool same_res = ctx_vb->buffer.resource == vb->buffer.resource;
+      if (!same_res) {
+         changed = true;
+         update_existing_vbo(ctx, i);
+         memcpy(ctx_vb, vb, sizeof(*vb));
+      } else if (ctx_vb->buffer_offset != vb->buffer_offset ||
+                 ctx_vb->is_user_buffer != vb->is_user_buffer) {
+         changed = true;
+         ctx_vb->buffer_offset = vb->buffer_offset;
+         ctx_vb->is_user_buffer = vb->is_user_buffer;
+      }
 
       if (vb->buffer.resource) {
          struct zink_resource *res = zink_resource(vb->buffer.resource);
-         res->vbo_bind_mask |= BITFIELD_BIT(i);
-         res->vbo_bind_count++;
-         res->gfx_barrier |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
-         res->barrier_access[0] |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
-         update_buf_bind_count(ctx, res, false, false);
+         if (!same_res) {
+            res->vbo_bind_mask |= BITFIELD_BIT(i);
+            res->vbo_bind_count++;
+            res->gfx_barrier |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+            res->barrier_access[0] |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+            update_buf_bind_count(ctx, res, false, false);
+         }
          /* fastpath for viewperf */
          if (res->obj->access != VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT || res->obj->access_stage != VK_PIPELINE_STAGE_VERTEX_INPUT_BIT)
             /* always barrier before possible rebind */
             zink_buffer_barrier(ctx, res, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT);
-         zink_batch_resource_usage_set(ctx->bs, res, false, true);
-         zink_resource_disable_unordered(res, false);
+         if (!same_res ||
+             !zink_batch_usage_matches(res->obj->bo->reads.u, ctx->bs) ||
+             res->obj->bo->reads.submit_count != ctx->bs->usage.submit_count)
+            zink_batch_resource_usage_set(ctx->bs, res, false, true);
+         if (res->obj->unordered_read)
+            zink_resource_disable_unordered(res, false);
       } else {
          enabled_buffers &= ~BITFIELD_BIT(i);
       }
@@ -1539,7 +1556,7 @@ zink_set_vertex_buffers_internal(struct pipe_context *pctx,
       const bool have_input_state = zink_screen(pctx->screen)->info.have_EXT_vertex_input_dynamic_state;
       const bool need_state_change = !zink_screen(pctx->screen)->info.have_EXT_extended_dynamic_state &&
                                      !have_input_state;
-      if (need_state_change)
+      if (changed && need_state_change)
          ctx->vertex_state_changed = true;
       else if (!have_input_state && ctx->gfx_pipeline_state.vertex_buffers_enabled_mask != enabled_buffers)
          ctx->vertex_state_changed = true;
@@ -1552,7 +1569,10 @@ zink_set_vertex_buffers_internal(struct pipe_context *pctx,
    /* avoid potential overdraw conflicts */
    ctx->can_promote_depth_op = false;
    ctx->vertex_buffers_count = num_buffers;
-   ctx->vertex_buffers_dirty = num_buffers > 0;
+   if (changed)
+      ctx->vertex_buffers_dirty = num_buffers > 0;
+   else if (!num_buffers)
+      ctx->vertex_buffers_dirty = false;
 }
 
 static void
@@ -1794,11 +1814,19 @@ zink_set_constant_buffer_internal(struct pipe_context *pctx,
             new_res->barrier_access[shader == MESA_SHADER_COMPUTE] |= VK_ACCESS_UNIFORM_READ_BIT;
             update_buf_bind_count(ctx, new_res, shader == MESA_SHADER_COMPUTE, false);
          }
-         zink_screen(ctx->base.screen)->buffer_barrier(ctx, new_res, VK_ACCESS_UNIFORM_READ_BIT,
-                                      new_res->gfx_barrier);
-         zink_batch_resource_usage_set(ctx->bs, new_res, false, true);
-         if (!ctx->unordered_blitting)
-            zink_resource_disable_unordered(new_res, false);
+         if (new_res != res ||
+             !zink_batch_usage_matches(new_res->obj->bo->reads.u, ctx->bs) ||
+             new_res->obj->bo->reads.submit_count != ctx->bs->usage.submit_count ||
+             new_res->obj->unordered_read ||
+             zink_resource_access_is_write(new_res->obj->access | new_res->obj->unordered_access) ||
+             (new_res->obj->access & VK_ACCESS_UNIFORM_READ_BIT) != VK_ACCESS_UNIFORM_READ_BIT ||
+             (new_res->obj->access_stage & new_res->gfx_barrier) != new_res->gfx_barrier) {
+            zink_screen(ctx->base.screen)->buffer_barrier(ctx, new_res, VK_ACCESS_UNIFORM_READ_BIT,
+                                         new_res->gfx_barrier);
+            zink_batch_resource_usage_set(ctx->bs, new_res, false, true);
+            if (!ctx->unordered_blitting)
+               zink_resource_disable_unordered(new_res, false);
+         }
       }
 
       ctx->ubos[shader][index].buffer = buffer;
