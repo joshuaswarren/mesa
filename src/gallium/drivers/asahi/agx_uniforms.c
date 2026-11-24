@@ -12,10 +12,34 @@
 #include "agx_state.h"
 #include "pool.h"
 
+/* 32 zero bytes, uploaded once per batch, for a constant or storage buffer
+ * binding with nothing in range. Robust access redirects an out-of-bounds
+ * load to offset 0 instead of dropping it, so the sink must hold the widest
+ * load, a dvec4.
+ */
+static uint64_t
+agx_batch_zero_sink(struct agx_batch *batch)
+{
+   if (!batch->zero_sink) {
+      static const uint32_t zeroes[8] = {0};
+      batch->zero_sink =
+         agx_pool_upload_aligned(&batch->pool, zeroes, sizeof(zeroes), 16);
+   }
+
+   return batch->zero_sink;
+}
+
 static uint64_t
 agx_const_buffer_ptr(struct agx_batch *batch, struct pipe_constant_buffer *cb)
 {
    if (cb->buffer) {
+      /* Nothing of the range is inside the buffer (agx_set_constant_buffer()
+       * clamps it), so every load is out of bounds: read the sink, not past
+       * the end of the BO.
+       */
+      if (cb->buffer_size == 0)
+         return agx_batch_zero_sink(batch);
+
       struct agx_resource *rsrc = agx_resource(cb->buffer);
       agx_batch_reads_range(batch, rsrc, cb->buffer_offset, cb->buffer_size);
       return agx_map_gpu(rsrc) + cb->buffer_offset;
@@ -207,9 +231,8 @@ agx_set_ssbo_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
    struct agx_stage *st = &batch->ctx->stage[stage];
    struct agx_stage_uniforms *unif = &batch->stage_uniforms[stage];
 
-   /* Single element sink. TODO: Optimize with soft fault. */
-   uint32_t zeroes[4] = {0};
-   uint64_t sink = agx_pool_upload_aligned(&batch->pool, &zeroes, 16, 16);
+   /* TODO: Optimize the sink with soft fault. */
+   uint64_t sink = agx_batch_zero_sink(batch);
 
    /* Consider all shader buffers, needed to avoid faults with
     * e.g. arb_shader_storage_buffer_object-array-ssbo-binding.

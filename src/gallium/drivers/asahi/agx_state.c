@@ -246,13 +246,28 @@ agx_set_shader_images(struct pipe_context *pctx, mesa_shader_stage shader,
    /* Bind start_slot...start_slot+count */
    for (int i = 0; i < count; i++) {
       const struct pipe_image_view *image = &iviews[i];
+      struct pipe_image_view *dst = &ctx->stage[shader].images[start_slot + i];
 
       if (!image->resource) {
-         util_copy_image_view(&ctx->stage[shader].images[start_slot + i], NULL);
+         util_copy_image_view(dst, NULL);
          ctx->stage[shader].image_mask &= ~BITFIELD64_BIT(start_slot + i);
+      } else if (image->resource->target == PIPE_BUFFER) {
+         unsigned clamped_size = agx_buffer_range_in_resource(
+            image->resource, image->u.buf.offset, image->u.buf.size);
+
+         /* Unbind a buffer image view with no whole elements inside the BO so
+          * neither descriptor packing nor batch tracking addresses past it. */
+         if (!clamped_size ||
+             !agx_texture_buffer_size_el(image->format, clamped_size)) {
+            util_copy_image_view(dst, NULL);
+            ctx->stage[shader].image_mask &= ~BITFIELD64_BIT(start_slot + i);
+         } else {
+            util_copy_image_view(dst, image);
+            dst->u.buf.size = clamped_size;
+            ctx->stage[shader].image_mask |= BITFIELD64_BIT(start_slot + i);
+         }
       } else {
-         util_copy_image_view(&ctx->stage[shader].images[start_slot + i],
-                              image);
+         util_copy_image_view(dst, image);
          ctx->stage[shader].image_mask |= BITFIELD64_BIT(start_slot + i);
       }
    }
@@ -276,6 +291,17 @@ agx_set_shader_buffers(struct pipe_context *pctx, mesa_shader_stage shader,
    util_set_shader_buffers_mask(ctx->stage[shader].ssbo,
                                 &ctx->stage[shader].ssbo_mask, buffers, start,
                                 count);
+
+   /* Every reader of the binding (the shader's bounds, the batch's resource
+    * tracking, the CPU vertex stages) sees only the part inside the buffer. */
+   for (unsigned i = start; i < start + count; ++i) {
+      struct pipe_shader_buffer *sb = &ctx->stage[shader].ssbo[i];
+
+      if (sb->buffer) {
+         sb->buffer_size = agx_buffer_range_in_resource(
+            sb->buffer, sb->buffer_offset, sb->buffer_size);
+      }
+   }
 
    ctx->stage[shader].dirty |= AGX_STAGE_DIRTY_SSBO;
    ctx->stage[shader].ssbo_writable_mask &= ~(BITFIELD_MASK(count) << start);
@@ -2566,6 +2592,12 @@ agx_set_constant_buffer(struct pipe_context *pctx, mesa_shader_stage shader,
       u_upload_data_ref(ctx->base.const_uploader, 0, constants->buffer_size, 64,
                         constants->user_buffer, &constants->buffer_offset,
                         &constants->buffer);
+   }
+
+   /* As for shader buffers: only the part of the range inside the buffer. */
+   if (constants->buffer) {
+      constants->buffer_size = agx_buffer_range_in_resource(
+         constants->buffer, constants->buffer_offset, constants->buffer_size);
    }
 
    unsigned mask = (1 << index);

@@ -28,7 +28,8 @@ agx_create_stream_output_target(struct pipe_context *pctx,
 
    target->base.context = pctx;
    target->base.buffer_offset = buffer_offset;
-   target->base.buffer_size = buffer_size;
+   target->base.buffer_size =
+      agx_buffer_range_in_resource(prsc, buffer_offset, buffer_size);
 
    /* Called directly on the frontend thread under u_threaded_context: allocate
     * the offset buffer via screen and initialize its fresh BO map directly
