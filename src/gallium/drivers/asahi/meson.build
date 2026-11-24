@@ -58,6 +58,31 @@ driver_asahi = declare_dependency(
   link_with : [libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib, libasahi_layout, libasahi_decode]
 )
 
+if with_tests
+  asahi_zero_lod_bias_test = executable(
+    'asahi-zero-lod-bias',
+    files('tests/test-agx-zero-lod-bias.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+  )
+  test(
+    'asahi-zero-lod-bias-nir',
+    asahi_zero_lod_bias_test,
+    args : ['--nir-only'],
+    suite : ['asahi'],
+  )
+endif
+
 if with_tests and with_tools.contains('drm-shim')
   asahi_g17g_raster_state_test = executable(
     'asahi-g17g-raster-state',
@@ -453,4 +478,14 @@ if with_tests and with_tools.contains('drm-shim')
     ],
     suite : ['asahi'],
   )
+
+  foreach chip : ['g14g', 'g17p']
+    test(
+      'asahi-' + chip + '-zero-lod-bias',
+      prog_python,
+      args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_zero_lod_bias_test],
+      env : ['ASAHI_SHIM_CHIP=' + chip, 'MESA_SHADER_CACHE_DISABLE=true'],
+      suite : ['asahi'],
+    )
+  endforeach
 endif

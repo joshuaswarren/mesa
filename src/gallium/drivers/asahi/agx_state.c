@@ -3112,7 +3112,69 @@ agx_nir_offset_instance_id(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* A sampler's LOD bias query that still names a fixed sampler slot directly
+ * after binding lowering. nir_build_texture_query(..., nir_texop_lod_bias,
+ * false, false) only copies binding sources (derefs, offsets, handles), and
+ * agx_nir_lower_bindings() may replace dynamic offsets with texture/sampler
+ * handles. Requiring zero sources rejects offsets, handles, derefs, and any
+ * backend binding source so only direct fixed-slot queries are keyed/folded. */
+static bool
+agx_direct_lod_bias_query(const nir_tex_instr *tex)
+{
+   return tex->op == nir_texop_lod_bias &&
+          tex->num_srcs == 0 &&
+          tex->sampler_index < 32;
+}
+
+uint32_t
+agx_lod_bias_samplers(nir_shader *nir)
+{
+   uint32_t mask = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (agx_direct_lod_bias_query(tex))
+               mask |= BITFIELD_BIT(tex->sampler_index);
+         }
+      }
+   }
+   return mask;
+}
+
+/* Replace a sampler's LOD bias query by the constant zero the sampler holds.
+ * The query would load the same half-float value, so the program computes
+ * exactly what it would with the bias added in. Constant folding then turns
+ * txb(0) back into tex, which samples at the implicit level. */
+static bool
+agx_fold_zero_lod_bias(nir_builder *b, nir_instr *instr, void *data)
+{
+   const uint32_t zero = *(const uint32_t *)data;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (!agx_direct_lod_bias_query(tex) ||
+       !(zero & BITFIELD_BIT(tex->sampler_index)))
+      return false;
+
+   b->cursor = nir_before_instr(instr);
+   nir_def_replace(&tex->def, nir_imm_zero(b, 1, tex->def.bit_size));
+   return true;
+}
+
+bool
+agx_nir_fold_zero_lod_bias(nir_shader *nir, uint32_t zero_lod_bias)
+{
+   return nir_shader_instructions_pass(nir, agx_fold_zero_lod_bias,
+                                       nir_metadata_control_flow,
+                                       &zero_lod_bias);
+}
+
 /* Does not take ownership of key. Clones if necessary. */
+
 static struct agx_compiled_shader *
 agx_compile_variant(struct agx_device *dev,
                     struct util_debug_callback *debug_cb,
@@ -3269,6 +3331,9 @@ agx_compile_variant(struct agx_device *dev,
       struct asahi_fs_shader_key *key = &key_->fs;
       const bool writes_sample_mask =
          nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK);
+
+      if (key->zero_lod_bias)
+         NIR_PASS(_, nir, agx_nir_fold_zero_lod_bias, key->zero_lod_bias);
 
       /* A split G17G draw keeps one colour output, at location 0, so the
        * program is a single-attachment one (agx_g17g_split_mrt). */
@@ -4283,6 +4348,7 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    }
 
    so->type = nir->info.stage;
+   so->info.lod_bias_samplers = agx_lod_bias_samplers(nir);
 
    if (nir->info.stage == MESA_SHADER_TESS_EVAL) {
       nir->info.stage = MESA_SHADER_VERTEX;
@@ -4355,6 +4421,8 @@ agx_fill_precompile_keys(const struct agx_device *dev,
                        !so->info.uses_fbfetch))) {
       union asahi_shader_key key = {0};
       if (so->type == MESA_SHADER_FRAGMENT) {
+         /* A GL sampler's LOD bias defaults to zero. */
+         key.fs.zero_lod_bias = so->info.lod_bias_samplers;
          /* Match agx_update_fs()'s single-sample key so the precompiled
           * variant hits on the first 1x draw instead of recompiling. */
          if (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
@@ -4539,6 +4607,7 @@ agx_create_shader_state(struct pipe_context *pctx,
 
       case MESA_SHADER_FRAGMENT:
          key.fs.nr_samples = 1;
+         key.fs.zero_lod_bias = so->info.lod_bias_samplers;
 
          /* For fbfetch */
          for (unsigned i = 0; i < ARRAY_SIZE(key.fs.rt_formats); ++i) {
@@ -5565,6 +5634,15 @@ agx_update_fs(struct agx_batch *batch)
    /* Get main shader */
    struct asahi_fs_shader_key key = {0};
    key.custom_borders = ctx->stage[MESA_SHADER_FRAGMENT].custom_borders;
+
+   /* Fold the LOD bias of each sampler holding zero, ±0 alike: the shader
+    * adds the same half-float value the sampler state records. */
+   const struct agx_stage *fs_stage = &ctx->stage[MESA_SHADER_FRAGMENT];
+   u_foreach_bit(s, fs_stage->shader->info.lod_bias_samplers &
+                       fs_stage->valid_samplers) {
+      if (!(fs_stage->samplers[s]->lod_bias_as_fp16 & 0x7fff))
+         key.zero_lod_bias |= BITFIELD_BIT(s);
+   }
 
    /* G17P coverage updates use different native words at one and several
     * samples, including discard-only main shaders. Keep their raster sample
