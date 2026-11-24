@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_cmd_buffer.h"
+#include "hk_identity_copy4.h"
 #include "util/format/u_format.h"
 #include "hk_frame_anatomy.h"
 #include "hk_ppp_state.h"
@@ -1645,7 +1646,7 @@ hk_CmdBindDescriptorSets2KHR(
 }
 
 static void
-hk_push_constants(UNUSED struct hk_cmd_buffer *cmd,
+hk_push_constants(struct hk_cmd_buffer *cmd,
                   struct hk_descriptor_state *desc,
                   const VkPushConstantsInfoKHR *info)
 {
@@ -1656,6 +1657,12 @@ hk_push_constants(UNUSED struct hk_cmd_buffer *cmd,
       const uint64_t mask =
          clamped == 64 ? UINT64_MAX : ((UINT64_C(1) << clamped) - 1);
       desc->push_written_dwords |= mask << first_dw;
+   }
+
+   if (!cmd->in_meta && desc == &cmd->state.cs.descriptors &&
+       info->offset < HK_COMPUTE_OPT_PUSH_BYTES) {
+      unsigned size = MIN2(info->size, HK_COMPUTE_OPT_PUSH_BYTES - info->offset);
+      desc->identity_copy4_push_mask |= BITFIELD64_MASK(size) << info->offset;
    }
 
    /* D3D translation layers re-push unchanged constants before most draws.

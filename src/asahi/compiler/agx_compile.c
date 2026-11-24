@@ -14837,7 +14837,8 @@ agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p, bool m5,
 
 static void
 agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_depth,
-                            bool g18g, bool m5, bool chip_g17p, bool post_lower)
+                            bool g18g, bool m5, bool chip_g17p, bool post_lower,
+                            bool defer_idiv)
 {
    if (!nir)
       return;
@@ -14942,9 +14943,14 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
     * provably nonnegative operands first so the remaining lowering drops
     * redundant sign fixups. Other integer division waits for the shader key
     * (agx_nir_lower_integer_division), which decides whether a preamble forms.
+    * The first preprocessing of a Vulkan compute shader may defer these passes
+    * so compute-kernel matchers see the raw idiv/udiv/irem/imod/umod by a
+    * constant; hk_lower_nir() preprocesses it again before backend compilation.
     */
-   NIR_PASS(_, nir, agx_nir_opt_nonneg_idiv);
-   NIR_PASS(_, nir, nir_opt_idiv_const, 16);
+   if (!defer_idiv) {
+      NIR_PASS(_, nir, agx_nir_opt_nonneg_idiv);
+      NIR_PASS(_, nir, nir_opt_idiv_const, 16);
+   }
 
    NIR_PASS(_, nir, nir_opt_deref);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
@@ -15024,14 +15030,22 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 void
 agx_preprocess_nir(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, false, false, false, false, false);
+   agx_preprocess_nir_internal(nir, false, false, false, false, false, false,
+                               false);
 }
 
 void
 agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip)
 {
    agx_preprocess_nir_internal(nir, true, true, false, false,
-                               chip == AGX_CHIP_G17P, false);
+                               chip == AGX_CHIP_G17P, false, false);
+}
+
+void
+agx_preprocess_nir_native_defer_idiv(nir_shader *nir, enum agx_chip chip)
+{
+   agx_preprocess_nir_internal(nir, true, true, false, false,
+                               chip == AGX_CHIP_G17P, false, true);
 }
 
 void
@@ -15044,7 +15058,8 @@ void
 agx_preprocess_nir_g18g(nir_shader *nir)
 {
    /* Select G18 trig without inheriting G17P subgroup/shared-memory rules. */
-   agx_preprocess_nir_internal(nir, false, false, true, false, false, false);
+   agx_preprocess_nir_internal(nir, false, false, true, false, false, false,
+                               false);
 }
 
 void
@@ -15057,7 +15072,7 @@ agx_preprocess_nir_post_lower(nir_shader *nir, enum agx_chip chip)
    const bool chip_g17p = chip == AGX_CHIP_G17P;
 
    agx_preprocess_nir_internal(nir, g17p, native_fragment_depth, g18g, m5,
-                               chip_g17p, true);
+                               chip_g17p, true, false);
 }
 
 static bool
@@ -17805,5 +17820,13 @@ agx_compile_shader_nir_preoptimized(nir_shader *nir, struct agx_shader_key *key,
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true, false, false);
+   agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
+                               false);
+}
+
+void
+agx_preprocess_nir_m5_defer_idiv(nir_shader *nir)
+{
+   agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
+                               true);
 }

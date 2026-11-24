@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_shader.h"
+#include "hk_identity_copy4.h"
 #include "hk_buffer.h"
 #include "hk_frame_anatomy.h"
 #include "hk_agx3_ioto_program_core.h"
@@ -565,14 +566,22 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
             ((struct hk_physical_device *)vk_pdev)->dev.chip);
 
    /* Optimize but allow copies because we haven't lowered them yet */
-   if (agx_chip_native_agx3(((struct hk_physical_device *)vk_pdev)->dev.chip) &&
-       nir->info.stage != MESA_SHADER_MESH)
-      agx_preprocess_nir_native(
-         nir, ((struct hk_physical_device *)vk_pdev)->dev.chip);
+   const enum agx_chip pre_chip = ((struct hk_physical_device *)vk_pdev)->dev.chip;
+   if (agx_chip_native_agx3(pre_chip) &&
+       nir->info.stage != MESA_SHADER_MESH) {
+      if (nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal)
+         agx_preprocess_nir_native_defer_idiv(nir, pre_chip);
+      else
+         agx_preprocess_nir_native(nir, pre_chip);
+   }
    else if (((struct hk_physical_device *)vk_pdev)->dev.chip == AGX_CHIP_G18G)
       agx_preprocess_nir_g18g(nir);
-   else if (agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip))
-      agx_preprocess_nir_m5(nir);
+   else if (agx_chip_g17_m5(pre_chip)) {
+      if (nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal)
+         agx_preprocess_nir_m5_defer_idiv(nir);
+      else
+         agx_preprocess_nir_m5(nir);
+   }
    else
       agx_preprocess_nir(nir);
 
@@ -6456,6 +6465,15 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
       free(obj->byte_stencil);
    }
 
+   if (obj->identity_copy4) {
+      hk_shader_destroy(dev, obj->identity_copy4, true);
+      free(obj->identity_copy4);
+   }
+   if (obj->im2col_vec4) {
+      hk_shader_destroy(dev, obj->im2col_vec4, true);
+      free(obj->im2col_vec4);
+   }
+
    if (obj->binary_cache_entry)
       hk_shader_binary_cache_entry_unref(dev, obj->binary_cache_entry);
 
@@ -9453,6 +9471,83 @@ hk_m5_no_grid_record(const struct hk_device *dev, uint32_t shader_count,
           !hk_nir_reads_intrinsic(mesh->nir, nir_intrinsic_load_num_workgroups);
 }
 
+static struct hk_shader *
+hk_compile_compute_alt_nir(struct hk_device *dev,
+                           const struct vk_shader_compile_info *info,
+                           const VkAllocationCallbacks *allocator,
+                           enum hk_feature_key features,
+                           nir_shader *nir)
+{
+   struct hk_shader *alternate = calloc(1, sizeof(*alternate));
+   if (!alternate) {
+      ralloc_free(nir);
+      return NULL;
+   }
+
+   hk_lower_nir(dev, nir, info->robustness, false, info->next_stage_mask,
+                info->set_layout_count, info->set_layouts, features);
+   const VkResult result =
+      hk_compile_nir(dev, allocator, nir, info->flags, info->robustness, NULL,
+                     features, alternate, MESA_SHADER_COMPUTE, true, NULL,
+                     info->set_layout_count,
+                     hk_static_set_mask(info->set_layout_count, info->set_layouts));
+   if (result == VK_SUCCESS && alternate->only_linked)
+      return alternate;
+
+   hk_shader_destroy(dev, alternate, true);
+   free(alternate);
+   return NULL;
+}
+
+static struct hk_shader *
+hk_compile_identity_copy4(struct hk_device *dev,
+                          const struct vk_shader_compile_info *info,
+                          const VkAllocationCallbacks *allocator,
+                          enum hk_feature_key features,
+                          struct hk_identity_copy4 *path_out,
+                          struct hk_shader **im2col_vec4_out)
+{
+   *im2col_vec4_out = NULL;
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
+       info->stage != MESA_SHADER_COMPUTE || info->nir->info.internal ||
+       hk_set_layouts_use_buffers(info->set_layout_count, info->set_layouts))
+      return NULL;
+
+   nir_shader *candidate = nir_shader_clone(NULL, info->nir);
+   if (!candidate)
+      return NULL;
+
+   const nir_opt_access_options access_options = {.is_vulkan = true};
+   NIR_PASS(_, candidate, nir_opt_access, &access_options);
+   NIR_PASS(_, candidate, nir_lower_explicit_io, nir_var_mem_push_const,
+            nir_address_format_32bit_offset);
+
+   struct hk_identity_copy4 path = {0};
+   nir_shader *copy = hk_nir_copy_identity4(candidate, &path);
+   nir_shader *im2col4 = NULL;
+   if (copy && path.kind == HK_IDENTITY_COPY4_IM2COL_1X1 && path.im2col_vec4_ok)
+      im2col4 = hk_nir_im2col_vec4(candidate);
+   ralloc_free(candidate);
+   if (!copy) {
+      ralloc_free(im2col4);
+      return NULL;
+   }
+
+   struct hk_shader *alternate =
+      hk_compile_compute_alt_nir(dev, info, allocator, features, copy);
+   if (!alternate) {
+      ralloc_free(im2col4);
+      return NULL;
+   }
+
+   if (im2col4)
+      *im2col_vec4_out =
+         hk_compile_compute_alt_nir(dev, info, allocator, features, im2col4);
+
+   *path_out = path;
+   return alternate;
+}
+
 static VkResult
 hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                    struct vk_shader_compile_info *infos,
@@ -9462,6 +9557,9 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                    struct vk_shader **shaders_out)
 {
    struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
+   struct hk_shader *identity_copy4 = NULL;
+   struct hk_shader *im2col_vec4 = NULL;
+   struct hk_identity_copy4 identity_copy4_info = {0};
    nir_shader *shaders[shader_count];
    nir_shader *lr_nirs[shader_count];
    struct hk_local_read_info lr_infos[shader_count];
@@ -9563,6 +9661,12 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
             }
          }
       }
+
+      if (shader_count == 1)
+         identity_copy4 = hk_compile_identity_copy4(dev, info, pAllocator,
+                                                    hk_features, &identity_copy4_info,
+                                                    &im2col_vec4);
+
       hk_lower_nir(dev, nir, info->robustness, is_multiview,
                    info->next_stage_mask, info->set_layout_count,
                     info->set_layouts, hk_features);
@@ -9754,6 +9858,14 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       }
       lr_nirs[i] = NULL;
       if (result != VK_SUCCESS) {
+         if (identity_copy4) {
+            hk_shader_destroy(dev, identity_copy4, true);
+            free(identity_copy4);
+         }
+         if (im2col_vec4) {
+            hk_shader_destroy(dev, im2col_vec4, true);
+            free(im2col_vec4);
+         }
          /* Clean up all the shaders before this point */
          for (uint32_t j = 0; j < i; j++)
             hk_api_shader_destroy(&dev->vk, shaders_out[j], pAllocator);
@@ -9770,6 +9882,14 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
 
          return result;
       }
+   }
+
+   if (identity_copy4) {
+      struct hk_api_shader *obj =
+         container_of(shaders_out[0], struct hk_api_shader, vk);
+      obj->identity_copy4 = identity_copy4;
+      obj->identity_copy4_info = identity_copy4_info;
+      obj->im2col_vec4 = im2col_vec4;
    }
 
    /* G17P and M5 link a fragment shader with its epilog into one program, a
@@ -9994,6 +10114,112 @@ hk_border_source_deserialize(struct hk_border_source **out,
    return VK_SUCCESS;
 }
 
+static void
+hk_identity_copy4_serialize(struct blob *blob,
+                            const struct hk_identity_copy4 *info)
+{
+   blob_write_uint8(blob, info->kind);
+   blob_write_uint8(blob, info->src_count);
+   blob_write_uint8(blob, info->src_set);
+   blob_write_uint8(blob, info->src1_set);
+   blob_write_uint8(blob, info->dst_set);
+   blob_write_uint8(blob, info->pad_set);
+   blob_write_uint16(blob, info->src_binding);
+   blob_write_uint16(blob, info->src1_binding);
+   blob_write_uint16(blob, info->dst_binding);
+   blob_write_uint16(blob, info->pad_binding);
+   blob_write_uint16(blob, info->border_width_offset);
+   blob_write_uint16(blob, info->border_height_offset);
+   blob_write_uint16(blob, info->input_width_offset);
+   blob_write_uint16(blob, info->input_height_offset);
+   blob_write_uint16(blob, info->kernel_width_offset);
+   blob_write_uint16(blob, info->patches_width_offset);
+   blob_write_uint16(blob, info->patches_height_offset);
+   blob_write_uint16(blob, info->stride_width_offset);
+   blob_write_uint16(blob, info->stride_height_offset);
+   blob_write_uint16(blob, info->channels_offset);
+   blob_write_uint16(blob, info->count_offset);
+   blob_write_uint16(blob, info->src_offset_offset);
+   blob_write_uint16(blob, info->dst_offset_offset);
+   blob_write_uint16(blob, info->push_bytes);
+   for (unsigned i = 0; i < 4; ++i)
+      blob_write_uint16(blob, info->in_shape_off[i]);
+   for (unsigned i = 0; i < 4; ++i)
+      blob_write_uint16(blob, info->out_shape_off[i]);
+   for (unsigned i = 0; i < 4; ++i)
+      blob_write_uint32(blob, info->pad_idx[i]);
+   for (unsigned i = 0; i < 3; ++i)
+      blob_write_uint16(blob, info->local[i]);
+   blob_write_uint8(blob, info->im2col_vec4_ok ? 1 : 0);
+}
+
+static void
+hk_identity_copy4_deserialize(struct blob_reader *blob,
+                              struct hk_identity_copy4 *info)
+{
+   *info = (struct hk_identity_copy4){0};
+   info->kind = blob_read_uint8(blob);
+   info->src_count = blob_read_uint8(blob);
+   info->src_set = blob_read_uint8(blob);
+   info->src1_set = blob_read_uint8(blob);
+   info->dst_set = blob_read_uint8(blob);
+   info->pad_set = blob_read_uint8(blob);
+   info->src_binding = blob_read_uint16(blob);
+   info->src1_binding = blob_read_uint16(blob);
+   info->dst_binding = blob_read_uint16(blob);
+   info->pad_binding = blob_read_uint16(blob);
+   info->border_width_offset = blob_read_uint16(blob);
+   info->border_height_offset = blob_read_uint16(blob);
+   info->input_width_offset = blob_read_uint16(blob);
+   info->input_height_offset = blob_read_uint16(blob);
+   info->kernel_width_offset = blob_read_uint16(blob);
+   info->patches_width_offset = blob_read_uint16(blob);
+   info->patches_height_offset = blob_read_uint16(blob);
+   info->stride_width_offset = blob_read_uint16(blob);
+   info->stride_height_offset = blob_read_uint16(blob);
+   info->channels_offset = blob_read_uint16(blob);
+   info->count_offset = blob_read_uint16(blob);
+   info->src_offset_offset = blob_read_uint16(blob);
+   info->dst_offset_offset = blob_read_uint16(blob);
+   info->push_bytes = blob_read_uint16(blob);
+   for (unsigned i = 0; i < 4; ++i)
+      info->in_shape_off[i] = blob_read_uint16(blob);
+   for (unsigned i = 0; i < 4; ++i)
+      info->out_shape_off[i] = blob_read_uint16(blob);
+   for (unsigned i = 0; i < 4; ++i)
+      info->pad_idx[i] = blob_read_uint32(blob);
+   for (unsigned i = 0; i < 3; ++i)
+      info->local[i] = blob_read_uint16(blob);
+   info->im2col_vec4_ok = blob_read_uint8(blob) != 0;
+}
+
+static VkResult
+hk_deserialize_optional_compute_alt(struct hk_device *dev,
+                                    struct blob_reader *blob,
+                                    struct hk_shader **out)
+{
+   const uint32_t size = blob_read_uint32(blob);
+   const void *payload = blob_read_bytes(blob, size);
+   if (blob->overrun || !size)
+      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+
+   struct blob_reader sub;
+   blob_reader_init(&sub, payload, size);
+   struct hk_shader *alternate = calloc(1, sizeof(*alternate));
+   if (!alternate)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   VkResult result = hk_deserialize_shader(dev, &sub, alternate, false, false);
+   if (result != VK_SUCCESS || sub.current != sub.end) {
+      hk_shader_destroy(dev, alternate, true);
+      free(alternate);
+      return result == VK_SUCCESS ? VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT : result;
+   }
+
+   *out = alternate;
+   return VK_SUCCESS;
+}
+
 static VkResult
 hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
                                struct blob_reader *blob,
@@ -10026,13 +10252,17 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    const bool has_local_read = variant_flags2 & 4;
    const bool has_sample_lr = variant_flags2 & 8;
    const bool has_preamble_nir = (variant_flags2 & 16) != 0;
+   const bool has_identity_copy4 = (variant_flags2 & 32) != 0;
+   const bool has_im2col_vec4 = (variant_flags2 & 64) != 0;
    /* Graphics, compute, task and mesh stages. */
    if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES ||
        (clip_z ? !dev->vk.physical->supported_features.depthClipControl
                : dev->vk.enabled_features.depthClipControl) ||
        (has_mesh_source &&
         (stage != MESA_SHADER_FRAGMENT || dev->dev.chip != AGX_CHIP_G17P)) ||
-       (variant_flags2 & ~31u) ||
+       (variant_flags2 & ~127u) ||
+       (has_identity_copy4 && stage != MESA_SHADER_COMPUTE) ||
+       (has_im2col_vec4 && !has_identity_copy4) ||
        (has_fbl_source && stage != MESA_SHADER_FRAGMENT) ||
        (has_byte_stencil && stage != MESA_SHADER_COMPUTE) ||
        (has_local_read && (stage != MESA_SHADER_FRAGMENT ||
@@ -10059,6 +10289,9 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
        !p_atomic_read(&hk_device_physical(dev)->border_emulation))
       return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
 
+   if (cache_candidate && has_identity_copy4)
+      return VK_NOT_READY;
+
    const unsigned sample_variant_count = sample_variants
       ? (m5_sample_variants ? 4 : 3) : 0;
    size_t size = hk_api_shader_size(stage, sample_variant_count);
@@ -10073,6 +10306,14 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    obj->border_emulating = border_emulating;
    obj->clip_m1_1 = clip_z;
 
+   if (has_identity_copy4) {
+      hk_identity_copy4_deserialize(blob, &obj->identity_copy4_info);
+      if (blob->overrun || !hk_identity_copy4_supported_local(obj->identity_copy4_info.local)) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      }
+   }
+
    hk_foreach_variant(obj, shader) {
       VkResult result;
       const uint8_t marker = blob_read_uint8(blob);
@@ -10085,6 +10326,24 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
          result = vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       }
 
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return result;
+      }
+   }
+
+   if (has_identity_copy4) {
+      VkResult result = hk_deserialize_optional_compute_alt(
+         dev, blob, &obj->identity_copy4);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return result;
+      }
+   }
+
+   if (has_im2col_vec4) {
+      VkResult result = hk_deserialize_optional_compute_alt(
+         dev, blob, &obj->im2col_vec4);
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return result;
@@ -10667,7 +10926,11 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
                              (obj->byte_stencil ? 2 : 0) |
                              (local_read ? 4 : 0) |
                              (sample_lr ? 8 : 0) |
-                             (preamble_nir ? 16 : 0));
+                             (preamble_nir ? 16 : 0) |
+                             (obj->identity_copy4 ? 32 : 0) |
+                             (obj->im2col_vec4 ? 64 : 0));
+   if (obj->identity_copy4)
+      hk_identity_copy4_serialize(blob, &obj->identity_copy4_info);
 
    hk_foreach_variant(obj, shader) {
       const unsigned i = shader - obj->variants;
@@ -10716,6 +10979,30 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
             blob_write_uint8(blob, shader->g17p_mono_preoptimized ? 1 : 0);
          }
       }
+   }
+
+   if (obj->identity_copy4) {
+      struct blob alternate;
+      blob_init(&alternate);
+      hk_shader_serialize(vk_dev, obj->identity_copy4, &alternate);
+      const bool encoded = !alternate.out_of_memory && alternate.size <= UINT32_MAX &&
+                           blob_write_uint32(blob, alternate.size) &&
+                           blob_write_bytes(blob, alternate.data, alternate.size);
+      blob_finish(&alternate);
+      if (!encoded)
+         return false;
+   }
+
+   if (obj->im2col_vec4) {
+      struct blob alternate;
+      blob_init(&alternate);
+      hk_shader_serialize(vk_dev, obj->im2col_vec4, &alternate);
+      const bool encoded = !alternate.out_of_memory && alternate.size <= UINT32_MAX &&
+                           blob_write_uint32(blob, alternate.size) &&
+                           blob_write_bytes(blob, alternate.data, alternate.size);
+      blob_finish(&alternate);
+      if (!encoded)
+         return false;
    }
 
    /* A shader compiled without custom-border emulation keeps what its
