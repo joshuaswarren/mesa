@@ -328,6 +328,9 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
    if (!buffer)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
+      p_atomic_set(&dev->sparse_used, 1);
+
    if (buffer->vk.size > 0 &&
        (buffer->vk.create_flags &
         (VK_BUFFER_CREATE_SPARSE_BINDING_BIT |

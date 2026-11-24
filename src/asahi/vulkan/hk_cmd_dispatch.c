@@ -625,6 +625,22 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
          /* Perftest only: force the full barrier word on every chip. */
          cs->current = agx_cdm_barrier(cs->current, AGX_CHIP_G13G);
          cs->strong_flush_end = cs->current;
+      } else if (unlikely(p_atomic_read(&dev->sparse_used))) {
+         /* Sparse resources change page mappings behind the launches. The
+          * reduced G13X word leaves sparse-image atomics wrong and the GPU
+          * faulting, so a device that created one keeps the full word
+          * (bits 0-19, the barrier before the reduction).
+          */
+         uint32_t *word = cs->current;
+         *word = 0xfffff | (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
+         cs->current = word + 1;
+         cs->strong_flush_end = cs->current;
+      } else if (dev->cdm_barrier_default_mask) {
+         uint32_t *word = cs->current;
+         *word = dev->cdm_barrier_default_mask |
+                 (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
+         cs->current = word + 1;
+         cs->strong_flush_end = cs->current;
       } else {
          cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
          cs->strong_flush_end = cs->current;
