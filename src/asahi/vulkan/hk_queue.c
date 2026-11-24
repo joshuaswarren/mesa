@@ -31,6 +31,7 @@
 #include "hk_drm_own_wait.h"
 #include "hk_execution_allowance.h"
 #include "hk_pack.h"
+#include "hk_queue_flush.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
 #include "hk_query_pool.h"
@@ -1648,38 +1649,20 @@ hk_queue_ensure_ts_carrier(struct hk_device *dev, struct hk_queue *queue)
    if (!bo)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
-   uint8_t *stream = agx_bo_map(bo);
    const struct agx3_cdm_barrier_info barrier = {
       .chip = dev->dev.chip,
       .flags = HK_TS_CARRIER_BARRIER_FLAGS,
    };
-   if (!stream || !agx3_cdm_barrier_pack(&barrier, stream) ||
-       !agx3_cdm_stream_terminate_pack(dev->dev.chip,
-                                       stream + AGX3_CDM_BARRIER_SIZE)) {
+   uint8_t record[AGX3_CDM_BARRIER_SIZE];
+   if (!agx3_cdm_barrier_pack(&barrier, record) ||
+       !hk_queue_flush_stream_write(dev->dev.chip, agx_bo_map(bo), bo->size,
+                                    record, sizeof(record))) {
       agx_bo_unreference(&dev->dev, bo);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
 
    queue->ts_carrier_bo = bo;
    return VK_SUCCESS;
-}
-
-/* A flush-only stream dispatches no shader: on M5 kernels that take compute
- * resource lists, it declares an empty one. */
-static void
-hk_queue_append_no_compute_resources(const struct hk_device *dev,
-                                     struct util_dynarray *payload)
-{
-   if (agx_chip_g17_m5(dev->dev.chip) &&
-       (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) {
-      const struct drm_asahi_cmd_header resources = {
-         .cmd_type = DRM_ASAHI_SET_COMPUTE_RESOURCES,
-         .size = 0,
-         .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
-         .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
-      };
-      util_dynarray_append(payload, resources);
-   }
 }
 
 /* The stream of the compute command that ends a submission with its
@@ -1697,10 +1680,10 @@ hk_queue_ensure_host_flush(struct hk_device *dev, struct hk_queue *queue)
    if (!bo)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
-   uint8_t *stream = agx_bo_map(bo);
-   if (!stream || !hk_cdm_pack_visibility_flush(dev, true, stream) ||
-       !agx3_cdm_stream_terminate_pack(dev->dev.chip,
-                                       stream + AGX3_CDM_BARRIER_SIZE)) {
+   uint8_t record[AGX3_CDM_BARRIER_SIZE];
+   if (!hk_cdm_pack_visibility_flush(dev, true, record) ||
+       !hk_queue_flush_stream_write(dev->dev.chip, agx_bo_map(bo), bo->size,
+                                    record, sizeof(record))) {
       agx_bo_unreference(&dev->dev, bo);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
@@ -2086,7 +2069,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
    if (flush_sstt) {
       assert(queue->g17p_sstt_flush_bo);
-      hk_queue_append_no_compute_resources(dev, &payload);
+      hk_queue_append_flush_lists(dev->dev.chip, dev->dev.params.features,
+                                  &payload);
       struct drm_asahi_cmd_header header = agx_cmd_header(true, 0, 0);
       const struct drm_asahi_cmd_compute_with_prior cmd = {
          .legacy = {
@@ -2202,7 +2186,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    if (ts_carrier) {
       assert(queue->ts_carrier_bo);
       assert(!flush_sstt);
-      hk_queue_append_no_compute_resources(dev, &payload);
+      hk_queue_append_flush_lists(dev->dev.chip, dev->dev.params.features,
+                                  &payload);
       struct drm_asahi_cmd_header header = agx_cmd_header(
          true,
          queue->sync.exact_prior ? DRM_ASAHI_BARRIER_NONE : 0,
@@ -2637,7 +2622,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
    if (host_flush) {
       assert(queue->host_flush_bo);
-      hk_queue_append_no_compute_resources(dev, &payload);
+      hk_queue_append_flush_lists(dev->dev.chip, dev->dev.params.features,
+                                  &payload);
       struct drm_asahi_cmd_header header =
          agx_cmd_header(true, flush_barrier[HK_SYNC_VDM],
                         flush_barrier[HK_SYNC_CDM]);
@@ -3619,12 +3605,11 @@ hk_queue_create(struct hk_device *dev,
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
 
-      uint8_t *stream = agx_bo_map(queue->g17p_sstt_flush_bo);
-      if (!stream ||
-          !agx3_cdm_sstt_flush_invalidate_pack(dev->dev.chip, stream) ||
-          !agx3_cdm_stream_terminate_pack(
-             dev->dev.chip,
-             stream + AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE)) {
+      uint8_t record[AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE];
+      if (!agx3_cdm_sstt_flush_invalidate_pack(dev->dev.chip, record) ||
+          !hk_queue_flush_stream_write(
+             dev->dev.chip, agx_bo_map(queue->g17p_sstt_flush_bo),
+             queue->g17p_sstt_flush_bo->size, record, sizeof(record))) {
          hk_queue_finish(dev, queue);
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }

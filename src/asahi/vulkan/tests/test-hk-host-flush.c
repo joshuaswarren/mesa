@@ -4,7 +4,8 @@
  * Host availability deferred to the end of the submission: which dependencies
  * ask for the memory-scoped flush, that recording one creates no stream, and
  * what the flush that ends the submission waits for, through the real
- * hk_sync resolver. No Vulkan device, DRM or GPU.
+ * hk_sync resolver; and the streams and lists of the flush-only compute
+ * commands a queue builds itself. No Vulkan device, DRM or GPU.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
 #include "hk_queue.h"
+#include "hk_queue_flush.h"
 
 static unsigned tests, failures;
 static void *ctx;
@@ -544,6 +546,134 @@ test_prefix(void)
                                       barrier[0] == NONE && barrier[1] == NONE);
 }
 
+/* The queue's own flush-only streams, in storage the BO cache returned with
+ * its last user's bytes: the record and the terminator, then the
+ * HK_CS_SPACE_PADDING bytes every stream keeps zero. */
+static void
+test_flush_stream_storage(void)
+{
+   static uint8_t storage[0x4000];
+   memset(storage, 0xa5, sizeof(storage));
+
+   /* The host flush record on G17P: the memory-scoped strong flush. */
+   const struct agx3_cdm_barrier_info info = {
+      .chip = AGX_CHIP_G17P,
+      .flags = 0x5,
+      .flush_memory = true,
+   };
+   uint8_t record[AGX3_CDM_BARRIER_SIZE];
+   uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
+   T("host flush record packs",
+     agx3_cdm_barrier_pack(&info, record) &&
+        agx3_cmdstream_load_le32(record) == UINT32_C(0x6000157c) &&
+        agx3_cdm_stream_terminate_pack(AGX_CHIP_G17P, terminate));
+
+   T("flush stream written into dirty storage",
+     hk_queue_flush_stream_write(AGX_CHIP_G17P, storage, sizeof(storage),
+                                 record, sizeof(record)));
+   T("stream is the record, then the terminator",
+     !memcmp(storage, record, sizeof(record)) &&
+        !memcmp(storage + sizeof(record), terminate, sizeof(terminate)));
+
+   const size_t end = sizeof(record) + sizeof(terminate);
+   bool zero = true;
+   for (size_t i = end; i < end + HK_CS_SPACE_PADDING; ++i)
+      zero &= storage[i] == 0;
+   T("padding after the terminator is cleared", zero);
+
+   T("storage without room for the padding is refused",
+     !hk_queue_flush_stream_write(AGX_CHIP_G17P, storage,
+                                  end + HK_CS_SPACE_PADDING - 1, record,
+                                  sizeof(record)));
+}
+
+/* The attachment set of each compute command of a payload, as the kernel
+ * applies them: a set stays in force until the next one. */
+static unsigned
+compute_attachment_sets(const struct util_dynarray *payload, unsigned *sets,
+                        unsigned max)
+{
+   unsigned current = 0, n = 0;
+   for (size_t at = 0; at < payload->size;) {
+      const struct drm_asahi_cmd_header *h =
+         (const void *)((const uint8_t *)payload->data + at);
+      if (h->cmd_type == DRM_ASAHI_SET_COMPUTE_ATTACHMENTS)
+         current = h->size / sizeof(struct drm_asahi_attachment);
+      else if (h->cmd_type == DRM_ASAHI_CMD_COMPUTE && n < max)
+         sets[n++] = current;
+      at += sizeof(*h) + h->size;
+   }
+   return n;
+}
+
+static void
+append_compute(struct util_dynarray *payload)
+{
+   const struct drm_asahi_cmd_header header = {
+      .cmd_type = DRM_ASAHI_CMD_COMPUTE,
+      .size = sizeof(struct drm_asahi_cmd_compute),
+      .vdm_barrier = NONE,
+      .cdm_barrier = NONE,
+   };
+   const struct drm_asahi_cmd_compute cmd = {0};
+   util_dynarray_append(payload, header);
+   util_dynarray_append(payload, cmd);
+}
+
+/* The lists a flush-only compute command declares, by chip. */
+static void
+test_flush_lists(void)
+{
+   struct util_dynarray p;
+   util_dynarray_init(&p, NULL);
+
+   /* A dispatch with two attachment spans, then a flush-only command. */
+   const struct drm_asahi_cmd_header set = {
+      .cmd_type = DRM_ASAHI_SET_COMPUTE_ATTACHMENTS,
+      .size = 2 * sizeof(struct drm_asahi_attachment),
+      .vdm_barrier = NONE,
+      .cdm_barrier = NONE,
+   };
+   const struct drm_asahi_attachment spans[2] = {
+      {.pointer = 0x100000, .size = 0x4000},
+      {.pointer = 0x200000, .size = 0x4000},
+   };
+   util_dynarray_append(&p, set);
+   util_dynarray_append_array(&p, struct drm_asahi_attachment, spans, 2);
+   append_compute(&p);
+   hk_queue_append_flush_lists(AGX_CHIP_G17P, 0, &p);
+   append_compute(&p);
+   unsigned sets[2] = {~0u, ~0u};
+   T("G17P: the flush declares an empty attachment set",
+     compute_attachment_sets(&p, sets, 2) == 2 && sets[0] == 2 &&
+        sets[1] == 0);
+
+   util_dynarray_clear(&p);
+   hk_queue_append_flush_lists(AGX_CHIP_G17G,
+                               DRM_ASAHI_FEATURE_COMPUTE_RESOURCES, &p);
+   const struct drm_asahi_cmd_header *h = p.data;
+   T("M5: an empty resource list, no attachment set",
+     p.size == sizeof(*h) && h->cmd_type == DRM_ASAHI_SET_COMPUTE_RESOURCES &&
+        h->size == 0);
+
+   util_dynarray_clear(&p);
+   hk_queue_append_flush_lists(AGX_CHIP_G17G, 0, &p);
+   T("M5 without resource lists: nothing", p.size == 0);
+
+   util_dynarray_clear(&p);
+   hk_queue_append_flush_lists(AGX_CHIP_G18G, 0, &p);
+   h = p.data;
+   T("G18G: an empty attachment set",
+     p.size == sizeof(*h) &&
+        h->cmd_type == DRM_ASAHI_SET_COMPUTE_ATTACHMENTS && h->size == 0);
+
+   util_dynarray_clear(&p);
+   hk_queue_append_flush_lists(AGX_CHIP_G13G, ~UINT64_C(0), &p);
+   T("AGX2: nothing", p.size == 0);
+
+   util_dynarray_fini(&p);
+}
+
 int
 main(void)
 {
@@ -559,6 +689,8 @@ main(void)
    test_chain_through_read_only_source();
    test_long_submission();
    test_prefix();
+   test_flush_stream_storage();
+   test_flush_lists();
    ralloc_free(ctx);
    printf("%u tests, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

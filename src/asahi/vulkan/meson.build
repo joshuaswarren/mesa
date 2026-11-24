@@ -112,6 +112,7 @@ hk_files = files(
   'hk_inline_blend_layout.h',
   'hk_queue.c',
   'hk_queue.h',
+  'hk_queue_flush.h',
   'hk_frame_anatomy.c',
   'hk_frame_anatomy.h',
   'hk_sampler.c',
