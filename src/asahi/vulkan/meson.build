@@ -1442,6 +1442,13 @@ if with_tests
 endif
 
 if with_tests
+  test('hk_ray_tracing_core', executable('hk_ray_tracing_core_test',
+    files('tests/test-hk-ray-tracing-core.c', 'hk_ray_tracing_core.c'),
+    include_directories : [include_directories('.'), inc_include, inc_src]),
+    suite : ['asahi'])
+endif
+
+if with_tests
   test('hk_uma_heap_sizing', executable('hk_uma_heap_sizing_test',
     files('tests/test-hk-uma-heap-sizing.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
