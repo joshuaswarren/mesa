@@ -2262,6 +2262,59 @@ test_direct_single_footprints(void)
    }
 }
 
+/* A dependency into DRAW_INDIRECT names every logically later graphics stage
+ * too (Vulkan 1.4, 7.1.2), so a render of direct draws waits for the compute
+ * work in its vertex half as in its fragment half. The same dependency
+ * recorded by an acceleration-structure build between its own dispatches
+ * orders only the build's compute work; the application's dependency on the
+ * build still orders later renders. */
+static void
+test_draw_indirect_scope(void)
+{
+   const uint8_t src = hk_sync_kinds_src(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+   const uint8_t dst = hk_sync_kinds_dst(VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+                                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+   T("DRAW_INDIRECT names graphics and compute work",
+     (dst & HK_SYNC_GFX) && (dst & HK_SYNC_COMPUTE));
+
+   for (unsigned build = 0; build < 2; ++build) {
+      struct hk_cmd_buffer *cmd = new_cmd();
+      struct hk_cs *comp = add(cmd, true);
+      cmd->sync.as_build = build;
+      hk_sync_barrier(cmd, src, dst);
+      struct hk_cs *next = add(cmd, true);
+      cmd->sync.as_build = false;
+
+      hk_sync_begin_rendering(cmd, false);
+      struct hk_cs *gfx = add(cmd, false);
+      hk_sync_end_rendering(cmd, false);
+
+      T("the dependency orders the next dispatch",
+        next->sync.dep[HK_SYNC_CDM].cut == comp);
+      if (!build) {
+         T("a render of direct draws waits in its vertex half",
+           gfx->sync.dep_ta[HK_SYNC_CDM].cut &&
+              gfx->sync.dep_ta[HK_SYNC_CDM].cut->sync.seq >= comp->sync.seq);
+         T("and in its fragment half",
+           gfx->sync.dep[HK_SYNC_CDM].cut &&
+              gfx->sync.dep[HK_SYNC_CDM].cut->sync.seq >= comp->sync.seq);
+      } else {
+         T("a build's own dependency leaves the render unordered",
+           gfx->sync.dep_ta[HK_SYNC_CDM].cut == NULL &&
+              gfx->sync.dep[HK_SYNC_CDM].cut == NULL);
+      }
+
+      /* The application's dependency after the build. */
+      hk_sync_barrier(cmd, src, dst);
+      hk_sync_begin_rendering(cmd, false);
+      struct hk_cs *later = add(cmd, false);
+      hk_sync_end_rendering(cmd, false);
+      T("an application dependency after the build orders later renders",
+        later->sync.dep_ta[HK_SYNC_CDM].cut == next &&
+           later->sync.dep[HK_SYNC_CDM].cut == next);
+   }
+}
+
 int
 main(void)
 {
@@ -2272,6 +2325,7 @@ main(void)
    test_precise_tile_evictions();
    test_direct_single_footprints();
    test_xfer_write_order();
+   test_draw_indirect_scope();
    test_barrier_chains_without_work();
    test_multiview_layer_preservation();
    test_compute_clear_layer_preservation();

@@ -411,6 +411,10 @@ struct hk_sync_state {
    bool has_unordered_start_ts;
    bool has_gpu_query_reset;
 
+   /* Recording the commands of an acceleration-structure build
+    * (hk_sync_barrier()). */
+   bool as_build;
+
    /* Timestamps written as copies of an earlier end stamp, outside a render
     * pass instance (hk_sync_write_timestamp()), and the latest stream on
     * each subqueue whose stamp they read. They are recorded in one launch

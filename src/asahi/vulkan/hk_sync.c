@@ -573,6 +573,16 @@ hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                 uint8_t dst_kinds)
 {
    cmd->sync.epoch++;
+
+   /* The dependencies an acceleration-structure build records between its
+    * own commands order only its compute and transfer work: nothing else is
+    * recorded until the build returns, and later work is ordered after the
+    * build by the application's own dependency on it. Their DRAW_INDIRECT
+    * destination (the build's indirect dispatches read their sizes) names no
+    * render, so they must not order later renders' vertex halves. */
+   if (cmd->sync.as_build)
+      dst_kinds &= HK_SYNC_COMPUTE | HK_SYNC_XFER;
+
    if (!src_kinds || !dst_kinds)
       return;
 
