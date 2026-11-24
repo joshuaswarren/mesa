@@ -817,6 +817,7 @@ if with_tests
          'test/test-flatten-loads.cpp',
          'test/test-narrow-subword-loads.cpp',
          'test/test-shared-phase-cse.cpp',
+         'test/test-agx2-cmat.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
          # in libasahi_lib, which this test does not link.
          '../lib/agx_chip.c',
