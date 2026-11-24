@@ -415,16 +415,22 @@ struct hk_sync_state {
     * (hk_sync_barrier()). */
    bool as_build;
 
-   /* Timestamps written as copies of an earlier end stamp, outside a render
-    * pass instance (hk_sync_write_timestamp()), and the latest stream on
-    * each subqueue whose stamp they read. They are recorded in one launch
-    * in a compute stream ordered after those streams: the next timestamp
-    * carrier that follows them anyway, or the stream of the next query
-    * command, event write or the end of the command buffer
+   /* Timestamps written as copies of an earlier end stamp
+    * (hk_sync_write_timestamp()), and the latest stream on each subqueue
+    * whose stamp they read. They are recorded in one launch in a
+    * timestamp-only compute stream ordered after those streams: the next
+    * timestamp carrier that follows them anyway, or a command of their own
+    * before the next query command or event write, at the end of the
+    * command buffer, or when the batch is full
     * (hk_sync_flush_stamp_copies()). */
    struct hk_stamp_copy stamp_copies[HK_SYNC_STAMP_COPIES];
    uint8_t stamp_copy_count;
    struct hk_cs *stamp_copy_after[HK_SYNC_NUM_SQ];
+
+   /* Source kinds of the host-availability dependencies recorded and not yet
+    * flushed (hk_sync_defer_host_flush()). Submission flushes them once,
+    * after this submission's work (hk_sync_host_flush_prefix()). */
+   uint8_t host_flush_kinds;
 
    /* Tile hazards: attachment footprints of the open pass instance and
     * the latest earlier render stream it shares a tile with. The command
@@ -557,6 +563,26 @@ void brl_sync_transition_end(struct hk_cmd_buffer *cmd, uint8_t dst_kinds);
 void hk_sync_dependency_kinds(const VkDependencyInfo *info, bool image_class,
                               uint8_t *src, uint8_t *dst);
 
+/* Whether a dependency performs a device-to-host memory domain operation: a
+ * barrier names a host access, or MEMORY_READ or MEMORY_WRITE with the host
+ * stage in its destination scope. */
+bool hk_sync_dependency_has_host_access(const VkDependencyInfo *info);
+
+/* The first synchronization scopes, as kinds, of the barriers of a dependency
+ * that perform a device-to-host domain operation. Zero when none does, or
+ * when their first scopes hold no device work. */
+uint8_t hk_sync_host_flush_kinds(const VkDependencyInfo *info);
+
+/* Defer the host availability a dependency asks for to the submission:
+ * nothing is recorded, so a barrier-only command buffer stays without
+ * streams. */
+void hk_sync_defer_host_flush(struct hk_cmd_buffer *cmd,
+                              const VkDependencyInfo *info);
+
+/* Take the deferred host-availability kinds, for an operation the host can
+ * observe before the submission completes (an event write). */
+uint8_t hk_sync_take_host_flush(struct hk_cmd_buffer *cmd);
+
 /* Record an execution dependency: all earlier streams of the source kinds
  * complete before any later stream of the destination kinds starts. */
 void hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
@@ -617,13 +643,10 @@ void hk_sync_write_timestamp(struct hk_cmd_buffer *cmd,
 void hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd);
 
 /* Record the pending timestamp copies (hk_sync_state::stamp_copies) in a
- * compute stream positioned after the streams they read, and end it. Every
- * later first scope that names HK_SYNC_STAMP orders after them. */
+ * timestamp-only compute stream positioned after the streams they read, and
+ * end it. Every later first scope that names HK_SYNC_STAMP orders after
+ * them; no application dependency does. */
 void hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd);
-
-/* Record the copies a render's later in-pass timestamps take from its end
- * stamp (hk_cs::stamp_copies) as its post-graphics stream cs ends. */
-void hk_sync_dispatch_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 /* G17P transfer writes (see hk_sync_xfer_write). Note that the transfer
  * being recorded writes into cs. */
@@ -711,6 +734,23 @@ bool hk_sync_resolve_submit(struct hk_queue *queue,
  * hk_sync_cmd_kinds() for those after it in the submission. A driver-added
  * flush opening the payload (first_cdm_is_flush) is not counted. */
 uint8_t hk_sync_queue_kinds(const struct hk_sync_queue *q, unsigned sq);
+
+/* The barrier fields of the compute command that ends a submission with the
+ * host flush its command buffers deferred (hk_sync_defer_host_flush()),
+ * called after hk_sync_resolve_submit(). With exact priors it follows the
+ * latest command of each of `kinds` and every requirement still carried, on
+ * both subqueues and earlier submissions included, and with `chain` also the
+ * submission's last command on each subqueue; legacy prefixes follow every
+ * earlier command. base holds the ordinals before the submission, count its
+ * commands on each subqueue. With exact priors it also takes the flush's
+ * ordinal; false if that overflows. The flush is no later command's source:
+ * no kind names it. */
+bool hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds,
+                               bool chain,
+                               const uint64_t base[HK_SYNC_NUM_SQ],
+                               const uint32_t count[HK_SYNC_NUM_SQ],
+                               uint16_t barrier[HK_SYNC_NUM_SQ],
+                               uint64_t prior[HK_SYNC_NUM_SQ]);
 uint8_t hk_sync_cmd_kinds(const struct hk_cmd_buffer *cmd, unsigned sq);
 void hk_sync_load_resolved(struct hk_cs *cs, const struct hk_sync_resolved *r);
 

@@ -697,6 +697,8 @@ struct threaded_context {
    struct pipe_resource *fb_resolve;
    /* accessed by main thread; preserves info across batches */
    struct tc_renderpass_info *renderpass_info_recording;
+   /* number of batch overflows in the current renderpass (main thread only) */
+   unsigned renderpass_batches;
    /* accessed by driver thread */
    struct tc_renderpass_info *renderpass_info;
    /* internal-only: if dsa/fs are bound between render passes */

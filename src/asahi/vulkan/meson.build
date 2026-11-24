@@ -312,6 +312,29 @@ if with_tests
       suite : ['asahi'],
     )
 
+    # Host availability deferred to the end of the submission, resolved
+    # through the real hk_sync resolver; no device or GPU.
+    test(
+      'hk_host_flush',
+      executable(
+        'hk_host_flush_test',
+        files('tests/test-hk-host-flush.c', 'hk_sync.c'),
+        include_directories : [
+          include_directories('.'),
+          inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
+          inc_virtio_gpu, inc_virtio_vdrm,
+        ],
+        dependencies : [
+          idep_nir_headers, idep_mesautil, idep_libagx,
+          idep_libagx_shaders_h, idep_agx_pack,
+          idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+        ],
+        link_args : [ld_args_gc_sections],
+        gnu_symbol_visibility : 'hidden',
+      ),
+      suite : ['asahi'],
+    )
+
     # Submit packing: the member check, the planner and the dependency fold,
     # resolved through the real hk_sync resolver; no device or GPU.
     test(
@@ -814,6 +837,14 @@ if with_tests
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_m5_vs_cprog', executable('hk_m5_vs_cprog_test',
+    files('tests/test-hk-m5-vs-cprog.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections, hk_wrap_test_link_args,
+      '-Wl,--wrap=hk_code_alloc', '-Wl,--wrap=agx_bo_create',
+      '-Wl,--wrap=hk_device_ensure_geometry_heap']), suite : ['asahi'])
   test(
     'hk_rt_pipeline_executable',
     executable(
@@ -1153,6 +1184,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  g17p_vulkan_indirect_multi = executable(
+    'g17p-vulkan-indirect-multi',
+    files('tests/g17p_vulkan_indirect_multi.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   g17p_vulkan_compressed_mip_blit = executable(
     'g17p-vulkan-compressed-mip-blit',
     files('tests/g17p_vulkan_compressed_mip_blit.c'),
@@ -1366,6 +1406,16 @@ if with_tests
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk, libasahi_compiler]),
+    timeout : 30, suite : ['asahi'])
+endif
+
+if with_tests
+  test('hk_attachmentless', executable('hk_attachmentless_test',
+    files('tests/test-hk-attachmentless.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]),
     timeout : 30, suite : ['asahi'])
 endif
 

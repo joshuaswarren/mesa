@@ -13,6 +13,8 @@ struct nir_shader;
 struct nir_instr;
 struct nir_builder;
 struct nir_def;
+struct nir_alu_instr;
+struct hash_table;
 
 /* BASE bit3 selects an explicit byte-scaled AGX3 load/store index. */
 #define AGX_NIR_MEMORY_INDEX_BYTES 8u
@@ -65,6 +67,8 @@ bool agx_nir_m5_split_or_selects(struct nir_shader *shader);
 bool agx_nir_opt_select_load(struct nir_shader *shader);
 bool agx_nir_opt_flatten_loads(struct nir_shader *shader, unsigned limit,
                                unsigned max_loads);
+bool agx_nir_opt_merge_nested_early_exits(struct nir_shader *shader);
+bool agx_nir_hoist_loop_invariant_guard_bits(struct nir_shader *shader);
 bool agx_nir_opt_sink_loop_sample_uses(struct nir_shader *shader);
 bool agx_nir_opt_hoist_loop_samples(struct nir_shader *shader);
 bool agx_nir_opt_factor_const_mul(struct nir_shader *shader);
@@ -377,6 +381,12 @@ bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,
                                                     bool support_lod_bias,
                                                     bool lower_2d_robustness);
 
+bool agx_nir_opt_nonneg_idiv(struct nir_shader *shader);
+
 bool agx_nir_opt_uniform_idiv(struct nir_shader *shader);
+bool agx_nir_uniform_idiv_applies(struct nir_alu_instr *alu,
+                                  struct hash_table *cache);
 bool agx_nir_lower_integer_division(struct nir_shader *nir,
                                     bool forms_preamble);
+bool agx_nir_has_loop(const struct nir_shader *nir);
+bool agx_nir_limit_heavy_branch_unroll(struct nir_shader *nir);

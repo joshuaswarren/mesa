@@ -41,6 +41,7 @@
 #include "hk_cs_root_size.h"
 #include "hk_descriptor_set.h"
 #include "hk_drm_render_core.h"
+#include "hk_g17p_patch.h"
 #include "hk_ioto_arena_core.h"
 #include "hk_nir_root_size.h"
 #include "hk_pipeline_statistics_core.h"
@@ -565,6 +566,8 @@ struct hk_rendering_state {
    VkRect2D area;
    uint32_t layer_count;
    uint32_t view_mask;
+   /* Attachmentless rendering pass with no multiview. */
+   bool no_attachments;
 
    /* The main G17P EOT writes the single-sample resolve target directly. */
    bool g17p_direct_color_resolve;
@@ -1246,12 +1249,6 @@ struct hk_cs {
    struct util_dynarray imm_write_query_ranges;
    bool imm_write_query_untracked;
 
-   /* Post-graphics stream: timestamps a render pass instance writes after
-    * the one its render ends with, copied from that end stamp in one launch
-    * as the stream ends (struct hk_stamp_copy, hk_sync_write_timestamp()).
-    * Implies CDM. */
-   struct util_dynarray stamp_copies;
-
    /* Native private-memory profiles for every dispatch in this stream. */
    struct util_dynarray compute_resources;
    /* Fields of the M5 HAL300 graphics core this stream last emitted, and the
@@ -1278,12 +1275,20 @@ struct hk_cs {
    bool oq_avail_deferred;
 
    /* Number of successfully emitted draws whose last raster producer is
-    * positively known to export only the default Layer=0, without multiview.
+    * positively known to target only hardware Layer=0, without multiview.
     * Compare with stats.cmds: untracked emitters conservatively disqualify.
     * The wider proof count does not wrap with stats.cmds.
     */
-   uint64_t g17p_layer_zero_draws;
-   bool g17p_layer_zero_unknown;
+   uint64_t layer_zero_draws;
+   bool layer_zero_unknown;
+
+   /* Number of successfully emitted draws whose active hardware viewport and
+    * scissor bounds were recorded into attachmentless_max_{x,y}. Compare with
+    * stats.cmds: untracked emitters conservatively fall back to cs->cr size.
+    */
+   uint64_t attachmentless_bounded_draws;
+   uint32_t attachmentless_max_x;
+   uint32_t attachmentless_max_y;
 
    /* An upper bound of the primitives every draw recorded into this G17P
     * render stream submits (hk_draw_primitive_bound()), saturating at
@@ -2701,7 +2706,6 @@ hk_cs_destroy(struct hk_cs *cs)
    } else {
       util_dynarray_fini(&cs->imm_writes);
       util_dynarray_fini(&cs->imm_write_query_ranges);
-      util_dynarray_fini(&cs->stamp_copies);
       util_dynarray_fini(&cs->oq_stamps);
       util_dynarray_fini(&cs->query_access_ranges);
    }
@@ -2732,9 +2736,6 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
       struct hk_cs *cs = *ptr;
       if (unlikely(cs->query_reset_pending))
          hk_flush_query_resets(cmd, cs);
-
-      if (cs->stamp_copies.size)
-         hk_sync_dispatch_stamp_copies(cmd, cs);
 
       /* This control stream may write immediates as it ends. Queue the writes
        * now that we're done emitting everything else. Occlusion availability
@@ -2880,6 +2881,38 @@ uint64_t hk_m5_multi_draw_vertex_program(struct hk_cmd_buffer *cmd,
                                          struct hk_shader *s,
                                          struct hk_linked_shader *linked);
 
+struct hk_agx3_multi_draw_ioto_reloc {
+   uint64_t dest[2];
+   uint32_t delta;
+   uint16_t offset;
+   uint8_t short_mask;
+   bool is_draw_id;
+};
+
+/* Pre-patched vertex-stage Ioto template for a multi-draw indirect loop.
+ * Static uniform ranges are patched into `bytes` once; each record only
+ * reserves arena space, copies `bytes`, and patches `dyn_relocs`. */
+struct hk_agx3_multi_draw_ioto_tpl {
+   uint8_t bytes[HK_AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE];
+   uint16_t length;
+   bool cached_cmd_mem;
+   uint8_t dyn_reloc_count;
+   uint32_t draw_params_mask;
+   uint32_t draw_id_mask;
+   struct hk_agx3_multi_draw_ioto_reloc dyn_relocs[HK_G17P_PATCH_MAX_RELOCS];
+};
+
+bool hk_agx3_multi_draw_ioto_prepare(struct hk_cmd_buffer *cmd,
+                                     struct hk_shader *s,
+                                     struct hk_linked_shader *linked,
+                                     bool uses_base_param, bool uses_draw_id,
+                                     struct hk_agx3_multi_draw_ioto_tpl *tpl);
+
+void hk_agx3_multi_draw_ioto_finish(struct hk_cmd_buffer *cmd,
+                                    const struct hk_agx3_multi_draw_ioto_tpl *tpl,
+                                    uint64_t pipeline_program,
+                                    uint64_t draw_params, uint64_t draw_id_ptr);
+
 void hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
                                   const VkCommandBufferBeginInfo *pBeginInfo);
 void hk_cmd_buffer_begin_compute(struct hk_cmd_buffer *cmd,
@@ -2984,6 +3017,11 @@ bool hk_g17p_dma_ranges(const struct hk_descriptor_state *desc,
                         struct agx3_ioto_uniform_range *ranges,
                         size_t max_ranges, size_t *count_io,
                         uint8_t *sources);
+bool hk_g17p_graphics_uniform_ranges(
+   struct hk_cmd_buffer *cmd, struct hk_shader *s,
+   const struct hk_linked_shader *linked, uint64_t root_ptr,
+   struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES],
+   size_t *range_count, uint8_t *sources);
 
 uint64_t hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd,
                                       struct hk_shader *s,
@@ -3019,6 +3057,12 @@ void brl_discard_init_record(struct hk_cmd_buffer *cmd,
  * ensures space for one barrier record. */
 void hk_cdm_visibility_flush(struct hk_device *dev, struct hk_cs *cs,
                              bool memory);
+
+/* The AGX3 strong flush record hk_cdm_visibility_flush(dev, cs, memory)
+ * appends, for a stream the driver builds outside a command buffer. False
+ * where the chip has no grounded encoding. */
+bool hk_cdm_pack_visibility_flush(const struct hk_device *dev, bool memory,
+                                  uint8_t packed[AGX3_CDM_BARRIER_SIZE]);
 
 /* Whether hk_cdm_visibility_flush(dev, cs, memory) would record anything. */
 bool hk_cdm_visibility_flush_needed(const struct hk_device *dev,
@@ -3172,9 +3216,9 @@ uint64_t hk_apply_conditional_rendering(struct hk_cmd_buffer *cmd,
 
 void hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
                     bool after_gfx);
-/* Launch libagx_copy_timestamps for count copies in the compute stream cs,
- * the open general or post-graphics stream, which is ordered after the
- * stamps they read. */
+/* Launch libagx_copy_timestamps for count copies in cs, the open
+ * timestamp-only compute stream, which is ordered after the stamps they
+ * read. */
 void hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                             const struct hk_stamp_copy *copies,
                             unsigned count);
@@ -3203,3 +3247,8 @@ bool hk_robust_index_rewrite_admitted(const struct hk_device *dev,
                                       enum agx_primitive topology);
 
 struct agx_robustness hk_prolog_robustness(struct hk_device *dev);
+
+bool hk_attachmentless_render(const struct hk_cs *cs);
+
+void hk_attachmentless_vdm_bounds(const struct hk_cs *cs, uint32_t *width_px,
+                                  uint32_t *height_px, uint32_t *layers);

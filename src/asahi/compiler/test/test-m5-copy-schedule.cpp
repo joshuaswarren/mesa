@@ -392,3 +392,277 @@ TEST(M5CopySchedule, ComputeDeviceLoadsFollowTheProgramPeak)
       ralloc_free(s.mem);
    }
 }
+
+namespace {
+
+enum frag_sample_kind {
+   FRAG_SAMPLE_TEX,
+   FRAG_SAMPLE_IMAGE_LOAD,
+   FRAG_SAMPLE_TEX_LOAD,
+};
+
+enum frag_desc_kind {
+   FRAG_DESC_IMM,
+   FRAG_DESC_UNIFORM,
+   FRAG_DESC_REG,
+};
+
+static unsigned
+emit_frag_samples_and_count(enum agx_isa_encoding enc, enum agx_chip chip,
+                            enum agx_dim dim, enum frag_sample_kind kind,
+                            enum frag_desc_kind desc_kind,
+                            enum agx_lod_mode lod_mode, bool reg_lod,
+                            bool with_cube_array, unsigned prefix_live_32)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
+   s.key.dev.encoding = enc;
+   s.key.dev.chip = chip;
+
+   agx_builder *b = s.b;
+   if (prefix_live_32 > 0) {
+      /* Heavy entry block setting program_peak, followed by a light sample
+       * block so the program's occupancy/budget ceiling directly controls
+       * whether the light block's 5 vec4 samples may hoist. */
+      agx_index held[96];
+      assert(prefix_live_32 <= 96);
+      for (unsigned i = 0; i < prefix_live_32; ++i)
+         held[i] = agx_mov_imm(b, 32, 1000 + i);
+      agx_index psum = agx_mov_imm(b, 32, 0);
+      for (unsigned i = 0; i < prefix_live_32; ++i)
+         psum = agx_iadd(b, psum, held[i], 0);
+      agx_unit_test(b, psum);
+
+      agx_block *samp_blk = agx_test_block(b->shader);
+      agx_block_add_successor(s.body, samp_blk);
+      s.body = samp_blk;
+   }
+
+   b->cursor = agx_after_block(s.body);
+   agx_index uv = agx_preload(b, agx_register(2, AGX_SIZE_32));
+   agx_index reg_desc = agx_preload(b, agx_register(6, AGX_SIZE_64));
+   agx_index reg_smp = agx_preload(b, agx_register(10, AGX_SIZE_64));
+   agx_index reg_lod_val = agx_preload(b, agx_register(14, AGX_SIZE_32));
+   agx_index acc = agx_mov_imm(b, 32, 0);
+
+   if (with_cube_array) {
+      /* Place a single cube-array sample in a predecessor block so the shader
+       * carries the 112-half cube-array register budget while the sample block
+       * holds 5 relocatable 2D samples. */
+      agx_index c1 = agx_mov_imm(b, 32, 1);
+      agx_index c2 = agx_mov_imm(b, 32, 2);
+      agx_index c3 = agx_mov_imm(b, 32, 3);
+      agx_index ccoords = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_instr *cc = agx_collect_to(b, ccoords, 4);
+      cc->src[0] = uv;
+      cc->src[1] = c1;
+      cc->src[2] = c2;
+      cc->src[3] = c3;
+      agx_index ctex = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_texture_sample_to(
+         b, ctex, ccoords, agx_immediate(0), agx_immediate(0),
+         agx_immediate(0), agx_immediate(0), agx_null(), AGX_DIM_CUBE_ARRAY,
+         AGX_LOD_MODE_AUTO_LOD, 0xf, false, false, false, AGX_GATHER_NONE,
+         false);
+      agx_instr *csp = agx_split(b, 4, ctex);
+      for (unsigned k = 0; k < 4; ++k)
+         csp->dest[k] = agx_temp(b->shader, AGX_SIZE_32);
+      agx_unit_test(b, csp->dest[0]);
+
+      agx_block *samp_blk = agx_test_block(b->shader);
+      agx_block_add_successor(s.body, samp_blk);
+      s.body = samp_blk;
+      b->cursor = agx_after_block(s.body);
+   }
+
+   const unsigned coord_comps =
+      (dim == AGX_DIM_CUBE_ARRAY) ? 4
+      : (dim == AGX_DIM_2D_ARRAY || dim == AGX_DIM_3D || dim == AGX_DIM_CUBE ||
+         dim == AGX_DIM_2D_MS)
+         ? 3
+         : 2;
+   for (unsigned i = 0; i < 5; ++i) {
+      agx_index csrc[4];
+      csrc[0] = uv;
+      for (unsigned k = 1; k < coord_comps; ++k)
+         csrc[k] = agx_mov_imm(b, 32, i + k);
+      agx_index coords = agx_vec_temp(b->shader, AGX_SIZE_32, coord_comps);
+      agx_instr *c = agx_collect_to(b, coords, coord_comps);
+      for (unsigned k = 0; k < coord_comps; ++k)
+         c->src[k] = csrc[k];
+
+      agx_index lod = agx_immediate(0);
+      if (lod_mode == AGX_LOD_MODE_LOD_GRAD) {
+         agx_index gsrc[4];
+         for (unsigned k = 0; k < 4; ++k)
+            gsrc[k] = agx_mov_imm(b, 32, k + 1);
+         lod = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+         agx_instr *gc = agx_collect_to(b, lod, 4);
+         for (unsigned k = 0; k < 4; ++k)
+            gc->src[k] = gsrc[k];
+      } else if (reg_lod) {
+         lod = reg_lod_val;
+      }
+
+      agx_index tex = (desc_kind == FRAG_DESC_UNIFORM)
+                         ? agx_uniform(4, AGX_SIZE_64)
+                         : (desc_kind == FRAG_DESC_REG) ? reg_desc
+                                                        : agx_immediate(i);
+      agx_index smp = (desc_kind == FRAG_DESC_UNIFORM)
+                         ? agx_uniform(8, AGX_SIZE_64)
+                         : (desc_kind == FRAG_DESC_REG) ? reg_smp
+                                                        : agx_immediate(0);
+
+      agx_index texel = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      if (kind == FRAG_SAMPLE_IMAGE_LOAD) {
+         agx_instr *ld = agx_image_load_to(
+            b, texel, coords, lod, agx_zero(), tex, agx_immediate(0),
+            agx_null(), dim, lod_mode, 0, false, false, false);
+         ld->mask = 0xf;
+      } else if (kind == FRAG_SAMPLE_TEX_LOAD) {
+         agx_texture_load_to(
+            b, texel, coords, lod, agx_zero(), tex, agx_immediate(0),
+            agx_null(), dim, lod_mode, 0xf, false, false);
+      } else {
+         agx_texture_sample_to(
+            b, texel, coords, lod, agx_immediate(0), tex, smp, agx_null(), dim,
+            lod_mode, 0xf, false, false, false, AGX_GATHER_NONE, false);
+      }
+
+      agx_instr *sp = agx_split(b, 4, texel);
+      for (unsigned k = 0; k < 4; ++k) {
+         agx_index ch = agx_temp(b->shader, AGX_SIZE_32);
+         sp->dest[k] = ch;
+         acc = agx_fadd(b, acc, ch);
+      }
+   }
+   agx_unit_test(b, acc);
+   agx_validate(b->shader, "agx3b fragment schedule test");
+
+   agx_ilp_schedule(b->shader);
+
+   unsigned samples_before_fadd = 0;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_FADD)
+         break;
+      samples_before_fadd +=
+         (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+          I->op == AGX_OPCODE_TEXTURE_LOAD || I->op == AGX_OPCODE_IMAGE_LOAD);
+   }
+   ralloc_free(s.mem);
+   return samples_before_fadd;
+}
+
+} /* namespace */
+
+/* AGX3B fragment shaders with >=4 multi-channel relocatable samples hoist all
+ * samples ahead of their consumers when the growth fits within the 1024-thread
+ * occupancy bucket (104 halves), even when it exceeds the fixed 16-half slack. */
+TEST(M5CopySchedule, AGX3BFragmentSamplesUseOccupancySlack)
+{
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
+                FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD, false,
+                false, 0),
+             5u);
+   /* Uniform-descriptor 2D_ARRAY samples allocate disjoint staging banks on
+    * AGX3B (relocatable_2d_array) and hoist inside the occupancy bucket. */
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_ARRAY,
+                FRAG_SAMPLE_TEX, FRAG_DESC_UNIFORM, AGX_LOD_MODE_AUTO_LOD,
+                false, false, 0),
+             5u);
+}
+
+/* AGX3B fragment shaders recognize relocatable AGX_OPCODE_IMAGE_LOAD (2D and
+ * immediate-LOD 2D_ARRAY) as native SMP samples and hoist them within the
+ * occupancy step. */
+TEST(M5CopySchedule, AGX3BFragmentImageLoadsHoist)
+{
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
+                FRAG_SAMPLE_IMAGE_LOAD, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD,
+                false, false, 0),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, AGX_DIM_2D_ARRAY,
+                FRAG_SAMPLE_IMAGE_LOAD, FRAG_DESC_REG, AGX_LOD_MODE_AUTO_LOD,
+                false, false, 0),
+             5u);
+}
+
+/* Non-relocatable AGX3B fragment samples stay pinned to staging bank 0 in
+ * agx3_pack_binary.c, so hoisting them would only inflate GPRs and emit
+ * serializing wait barriers. Keep them in pressure order. */
+TEST(M5CopySchedule, AGX3BFragmentNonRelocatableSamplesStayInOrder)
+{
+   /* Register-descriptor 2D_ARRAY samples (e.g. G16G without preamble or
+    * bindless 2D_ARRAY) are non-relocatable on AGX3B. */
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, AGX_DIM_2D_ARRAY,
+                FRAG_SAMPLE_TEX, FRAG_DESC_REG, AGX_LOD_MODE_AUTO_LOD, false,
+                false, 0),
+             1u);
+   /* 3D, cube-array, gradient-LOD samples, multisample image loads, and
+    * register-LOD texture loads also keep staging bank 0 on AGX3B. */
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_3D,
+                FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD, false,
+                false, 0),
+             1u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_CUBE_ARRAY,
+                FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD, false,
+                false, 0),
+             1u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
+                FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_LOD_GRAD, false,
+                false, 0),
+             1u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D_MS,
+                FRAG_SAMPLE_IMAGE_LOAD, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD,
+                false, false, 0),
+             1u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
+                FRAG_SAMPLE_TEX_LOAD, FRAG_DESC_IMM, AGX_LOD_MODE_LOD_MIN, true,
+                false, 0),
+             1u);
+}
+
+/* AGX3B fragment occupancy cap stops at 184 halves (highest step in the
+ * 192-half file): a program at ~160 halves may still hoist a light block
+ * inside the 184-half step, while one past 176 halves falls back to fixed
+ * 16-half slack and rejects the 5-sample hoist. */
+TEST(M5CopySchedule, AGX3BFragmentRespects184HalfCeiling)
+{
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
+                FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD, false,
+                false, 80),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
+                FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD, false,
+                false, 90),
+             1u);
+}
+
+/* AGX3B shaders with a cube-array sample carry a 112-half register budget:
+ * relocatable 2D samples in the same shader may hoist below 104 halves, but
+ * are refused when the program already exceeds the 112-half ceiling. */
+TEST(M5CopySchedule, AGX3BFragmentCubeBudgetRespected)
+{
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
+                FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD, false,
+                true, 0),
+             5u);
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
+                FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD, false,
+                true, 80),
+             1u);
+}

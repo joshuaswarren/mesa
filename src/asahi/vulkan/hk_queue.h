@@ -101,6 +101,11 @@ struct hk_queue {
     * TOP_OF_PIPE timestamp cannot safely ride on the first command's start. */
    struct agx_bo *ts_carrier_bo;
 
+   /* Lazy command storage for the memory-scoped cache flush that ends a
+    * submission whose command buffers deferred host availability
+    * (hk_sync_defer_host_flush()). */
+   struct agx_bo *host_flush_bo;
+
    /* Kinds of streams this queue has ever run, see hk_sync.h. */
    struct hk_sync_queue sync;
 

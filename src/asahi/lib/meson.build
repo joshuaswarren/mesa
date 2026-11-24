@@ -323,6 +323,18 @@ if with_tests
     ),
     suite : ['asahi'],
   )
+  test(
+    'asahi-agx-chip-caps',
+    executable(
+      'asahi-agx-chip-caps',
+      files('tests/test-chip-caps.c'),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      link_with : [libasahi_lib],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
 
   test(
     'asahi-agx-g17g-tile-format-gate',

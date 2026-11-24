@@ -138,16 +138,6 @@ hk_cache_identity(const uint8_t build_sha[32], const struct agx_device *dev,
    memcpy(disk_cache_id, blake3, sizeof(*disk_cache_id));
 }
 
-/* VK_KHR_shader_fma: G17P with its explicit-RTE tininess repair
- * (agx_nir_lower_fma_rte()) and M5. G13-G15 do not pass the newly exposed
- * cases. */
-static bool
-hk_shader_fma_supported(enum agx_chip chip)
-{
-   return agx_chip_g17p_or_m5(chip) &&
-          agx_chip_exact_fma32(chip);
-}
-
 static void
 hk_get_device_extensions(const struct agx_device *dev,
                          const struct hk_instance *instance,
@@ -293,8 +283,10 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_custom_border_color = true,
       .EXT_debug_marker = true,
       .EXT_depth_bias_control = true,
-      /* Tested on G17P only. */
-      .EXT_depth_clip_control = dev->chip == AGX_CHIP_G17P,
+      /* Lowered in NIR (agx_nir_lower_clip_m1_1) via the shared root table on
+       * AGX2 and native AGX3; HAL300 PPP admission still rejects negative-one
+       * depth clip. */
+      .EXT_depth_clip_control = !agx_chip_hal300_path(dev->chip),
       .EXT_depth_clip_enable = true,
       /* Qualified on G17P only (the whole binding_model.descriptor_buffer
        * group); other chips share the code but need their own run. */
@@ -330,8 +322,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_memory_priority = agx_has_residency_control(dev),
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
-      /* Qualified on G17P and M5; nested replay is shared code. */
-      .EXT_nested_command_buffer = agx_chip_g17p_or_m5(dev->chip),
+      /* Shared secondary command-buffer replay in hk_CmdExecuteCommands(). */
+      .EXT_nested_command_buffer = true,
       .EXT_non_seamless_cube_map = true,
       .EXT_pageable_device_local_memory = agx_has_residency_control(dev),
       .EXT_pipeline_creation_cache_control = true,
@@ -345,7 +337,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_primitive_restart_index = true,
       .EXT_primitive_topology_list_restart = true,
       .EXT_private_data = true,
-      .EXT_primitives_generated_query = false,
+      /* Counted by the shared pre-graphics helpers across all generations. */
+      .EXT_primitives_generated_query = true,
       .EXT_provoking_vertex = true,
       .EXT_queue_family_foreign = true,
       .EXT_robustness2 = true,
@@ -690,13 +683,10 @@ hk_get_device_features(
 
       /* VK_KHR_shader_float_controls2 */
       .shaderFloatControls2 = true,
-      .shaderFmaFloat16 = true,
-      .shaderFmaFloat32 = true,
-      .shaderFmaFloat64 = false,
 
       /* VK_KHR_shader_fma */
-      .shaderFmaFloat16 = hk_shader_fma_supported(dev->chip),
-      .shaderFmaFloat32 = hk_shader_fma_supported(dev->chip),
+      .shaderFmaFloat16 = true,
+      .shaderFmaFloat32 = true,
       .shaderFmaFloat64 = false,
 
       /* VK_KHR_shader_maximal_reconvergence */
@@ -779,8 +769,8 @@ hk_get_device_features(
       .floatRepresentation = false,
       .depthBiasExact = true,
 
-      /* VK_EXT_depth_clip_control, tested on G17P only */
-      .depthClipControl = dev->chip == AGX_CHIP_G17P,
+      /* VK_EXT_depth_clip_control */
+      .depthClipControl = supported_extensions->EXT_depth_clip_control,
 
       /* VK_EXT_depth_clip_enable */
       .depthClipEnable = true,
@@ -829,7 +819,7 @@ hk_get_device_features(
       .extendedDynamicState3LineRasterizationMode = true,
       .extendedDynamicState3LineStippleEnable = false,
       .extendedDynamicState3DepthClipNegativeOneToOne =
-         dev->chip == AGX_CHIP_G17P,
+         supported_extensions->EXT_depth_clip_control,
       .extendedDynamicState3ViewportWScalingEnable = false,
       .extendedDynamicState3ViewportSwizzle = false,
       .extendedDynamicState3CoverageToColorEnable = false,
@@ -1112,14 +1102,6 @@ hk_get_device_features(
     * resolved. */
    features->multiviewGeometryShader &= features->geometryShader;
    features->multiviewTessellationShader &= features->tessellationShader;
-
-   /* G16G inserts explicit view bounds for robust image operations in NIR.
-    * It qualifies both robust modes, and its descriptor swizzle supplies the
-    * required out-of-bounds alpha. */
-   if (dev->chip == AGX_CHIP_G16G) {
-      features->robustImageAccess = true;
-      features->robustImageAccess2 = true;
-   }
 }
 
 #define HK_RAY_TRACING_STAGES                                                 \
@@ -1525,7 +1507,8 @@ hk_get_device_properties(const struct agx_device *dev,
       .shaderSignedZeroInfNanPreserveFloat64 = false,
       .shaderDenormPreserveFloat16 = true,
       /* agx_nir_lower_denorm_preserve() computes flushed cases exactly. */
-      .shaderDenormPreserveFloat32 = dev->chip == AGX_CHIP_G17P,
+      .shaderDenormPreserveFloat32 =
+         agx_chip_has_fp32_denorm_preserve(dev->chip),
       .shaderDenormPreserveFloat64 = false,
       .shaderDenormFlushToZeroFloat16 = false,
       .shaderDenormFlushToZeroFloat32 = true,
@@ -2282,11 +2265,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * VK_KHR_cooperative_matrix does not advertise it. */
    supported_extensions.NV_cooperative_matrix2 = m5_cmat;
 
-   /* Counted by the pre-graphics helpers, which every native chip runs;
-    * hardware-qualified on M5 and G17P. */
-   supported_extensions.EXT_primitives_generated_query =
-      agx_chip_g17p_or_m5(pdev->dev.chip);
-
    supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
       (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2);
 
@@ -2298,10 +2276,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.KHR_shader_quad_control =
          pdev->dev.chip == AGX_CHIP_G17P;
    }
-
-   /* VK_KHR_shader_fma makes shaderFmaFloat32 mandatory. */
-   if (!hk_shader_fma_supported(pdev->dev.chip))
-      supported_extensions.KHR_shader_fma = false;
 
    struct vk_features supported_features;
    /* G17P runs mesh shaders natively and task shaders in software. */

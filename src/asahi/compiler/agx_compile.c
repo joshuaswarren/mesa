@@ -32,6 +32,7 @@
 #include "agx_nir.h"
 #include "agx3_alu_core.h"
 #include "agx3_matrix_core.h"
+#include "agx3_native_stats.h"
 #include "agx_opcodes.h"
 #include "agx3_pack.h"
 #include "agx3_rt_core.h"
@@ -6074,24 +6075,33 @@ agx_lower_g17g_retry_float_operands(agx_context *ctx)
          continue;
 
       for (unsigned s = 0; s < I->nr_srcs; ++s) {
-         if ((I->src[s].type != AGX_INDEX_NORMAL &&
-              I->src[s].type != AGX_INDEX_UNIFORM) ||
-             I->src[s].size != AGX_SIZE_16)
-            continue;
-         /* The 32-bit select compares f32: widen half comparands. */
-         if (select && s < 2 && !cmp_mixed && !sel_mixed)
-            continue;
          /* Selected values are bit patterns: zero-extend them, as the
-          * existing G17G half-select path does. Floats convert (exact). */
+          * existing G17G half-select path does. A half uniform, such as a
+          * constant-program export, is selected the same way: copy it to a
+          * half register first. Left in place, it would be a 16-bit value
+          * selected into the 32-bit destination below. */
          if (select && s >= 2) {
-            if (I->src[s].abs || I->src[s].neg)
+            agx_index half = I->src[s];
+            if ((half.type != AGX_INDEX_NORMAL &&
+                 half.type != AGX_INDEX_UNIFORM) ||
+                half.size != AGX_SIZE_16 || half.abs || half.neg)
                continue;
+            if (half.type == AGX_INDEX_UNIFORM)
+               half = agx_mov(&b, half);
             agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-            agx_mov_to(&b, wide, I->src[s]);
+            agx_mov_to(&b, wide, half);
             I->src[s] = wide;
             progress = true;
             continue;
          }
+         if ((I->src[s].type != AGX_INDEX_NORMAL &&
+              I->src[s].type != AGX_INDEX_UNIFORM) ||
+             I->src[s].size != AGX_SIZE_16)
+            continue;
+         /* The 32-bit select compares f32: widen half comparands. Floats
+          * convert (exact). */
+         if (select && s < 2 && !cmp_mixed && !sel_mixed)
+            continue;
          agx_index plain = I->src[s];
          plain.abs = false;
          plain.neg = false;
@@ -9704,8 +9714,90 @@ agx_set_st_vary_final(agx_context *ctx)
    agx_no_varyings(&_b);
 }
 
+/* Count the instructions of the encoded program in [code, code + size) with the
+ * length rule of the encoding it was emitted in. The walk stops at the first
+ * byte sequence no form matches, so a count is never larger than the program.
+ */
 static void
-agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
+agx_count_native(const agx_context *ctx, const uint8_t *code, size_t size,
+                 struct agx2_stats *stats)
+{
+   signed (*length)(const uint8_t *, size_t, const char **);
+   switch (ctx->key->dev.encoding) {
+   case AGX_ISA_ENCODING_AGX2:
+      length = agx2_instr_length;
+      break;
+   case AGX_ISA_ENCODING_AGX3B:
+      length = agx3b_instr_length;
+      break;
+   case AGX_ISA_ENCODING_AGX3C:
+      /* G18G programs are transcoded to agx3d before this runs. */
+      length = ctx->key->dev.emit_agx3d ? agx3d_instr_length
+                                        : agx3c_instr_length;
+      break;
+   default:
+      return;
+   }
+
+   for (size_t i = 0; i < size;) {
+      const char *display = NULL;
+      const signed n = length(code + i, size - i, &display);
+      if (n <= 0)
+         break;
+
+      stats->native++;
+      if (display && !strncmp(display, "ldimm", 5) &&
+          (display[5] == '\0' || display[5] == ' '))
+         stats->native_ldimm++;
+      i += n;
+   }
+}
+
+/* Immediate moves and uniform-file copies inside loops, counted after register
+ * allocation and before pseudo-instruction lowering turns copies into ALU
+ * truth tables. In structured AGX control flow a loop spans the source-order
+ * interval from its header to the block holding the back edge. */
+static void
+agx_count_loop_copies(agx_context *ctx)
+{
+   unsigned nr_blocks = 0;
+   agx_foreach_block(ctx, block)
+      nr_blocks = MAX2(nr_blocks, block->index + 1);
+
+   bool *in_loop = rzalloc_array(ctx, bool, MAX2(nr_blocks, 1));
+   if (!in_loop)
+      return;
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_successor(block, succ) {
+         if (succ->loop_header && succ->index <= block->index) {
+            for (unsigned i = succ->index; i <= block->index; ++i)
+               in_loop[i] = true;
+         }
+      }
+   }
+
+   ctx->loop_immediates = 0;
+   ctx->loop_uniform_copies = 0;
+   agx_foreach_block(ctx, block) {
+      if (!in_loop[block->index])
+         continue;
+
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM)
+            ctx->loop_immediates++;
+         else if (I->op == AGX_OPCODE_MOV &&
+                  I->src[0].type == AGX_INDEX_UNIFORM)
+            ctx->loop_uniform_copies++;
+      }
+   }
+
+   ralloc_free(in_loop);
+}
+
+static void
+agx_calc_stats(agx_context *ctx, const struct util_dynarray *binary,
+               unsigned offset, struct agx2_stats *stats)
 {
    struct agx_cycle_estimate cycles = agx_estimate_cycles(ctx);
    uint32_t old_preamble_inst = stats->preamble_inst;
@@ -9714,13 +9806,15 @@ agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
       .alu = cycles.alu,
       .fscib = cycles.f_scib,
       .ic = cycles.ic,
-      .code_size = size,
+      .code_size = binary->size,
       .gprs = ctx->max_reg,
       .uniforms = ctx->out->push_count,
       .scratch = ctx->scratch_size_B,
       .threads = agx_occupancy_for_register_count(ctx->max_reg).max_threads,
       .loops = ctx->loop_count,
       .preamble_inst = old_preamble_inst,
+      .loop_immediates = ctx->loop_immediates,
+      .loop_uniform_copies = ctx->loop_uniform_copies,
    };
 
    /* Count instructions */
@@ -9731,6 +9825,22 @@ agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
          stats->spills++;
       else if (I->op == AGX_OPCODE_STACK_LOAD)
          stats->fills++;
+   }
+
+   /* The UVS relocation list, when there is one, follows the main program. */
+   const unsigned end = ctx->out->agx3_uvs_reloc_count
+                           ? ctx->out->agx3_uvs_relocs_offset
+                           : binary->size;
+   if (end > offset)
+      agx_count_native(ctx, (const uint8_t *)binary->data + offset,
+                       end - offset, stats);
+
+   /* agx3_pack_binary() on this thread just encoded this program. */
+   if (agx_isa_is_agx3(ctx->key->dev.encoding)) {
+      stats->carriers = agx3_native_stats.wait_carriers;
+      stats->cf_drains = agx3_native_stats.cf_drains;
+      stats->loop_cf_drains = agx3_native_stats.loop_cf_drains;
+      stats->staging_copies = agx3_native_stats.staging_copies;
    }
 }
 
@@ -9880,6 +9990,200 @@ agx_lower_front_face(struct nir_builder *b, nir_intrinsic_instr *intr,
  */
 #define AGX_G17P_EXPENSIVE_FLATTEN_LIMIT 24
 
+/* Whether any CF list in `list` contains a loop node. Walks only CF nodes so
+ * loop-free shaders skip the loop-only passes in O(CF). */
+static bool
+agx_cf_list_has_loop(const struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, cf, node, list) {
+      if (cf->type == nir_cf_node_loop)
+         return true;
+      if (cf->type == nir_cf_node_if) {
+         const nir_if *nif = nir_cf_node_as_if(cf);
+         if (agx_cf_list_has_loop(&nif->then_list) ||
+             agx_cf_list_has_loop(&nif->else_list))
+            return true;
+      }
+   }
+   return false;
+}
+
+bool
+agx_nir_has_loop(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      if (agx_cf_list_has_loop(&impl->body))
+         return true;
+   }
+   return false;
+}
+
+/* A pure-ALU loop with at least this many iterations and two or more
+ * branches is kept rolled when its scalarized unrolled body would exceed
+ * AGX_HEAVY_BRANCH_UNROLL_MAX_OPS operations. */
+#define AGX_HEAVY_BRANCH_UNROLL_MIN_TRIPS 8
+#define AGX_HEAVY_BRANCH_UNROLL_MAX_OPS   512
+
+struct agx_loop_body_stats {
+   unsigned branch_ifs;
+   unsigned scalar_cost;
+   bool has_mem_or_sync;
+};
+
+static void
+agx_scan_loop_body(const struct exec_list *list, const nir_if *terminator_if,
+                   struct agx_loop_body_stats *st)
+{
+   foreach_list_typed(nir_cf_node, cf, node, list) {
+      switch (cf->type) {
+      case nir_cf_node_block: {
+         const nir_block *block = nir_cf_node_as_block(cf);
+         nir_foreach_instr(instr, block) {
+            switch (instr->type) {
+            case nir_instr_type_alu:
+               st->scalar_cost += nir_instr_as_alu(instr)->def.num_components;
+               break;
+            case nir_instr_type_phi:
+               st->scalar_cost += nir_instr_as_phi(instr)->def.num_components;
+               break;
+            case nir_instr_type_tex:
+               st->has_mem_or_sync = true;
+               st->scalar_cost += 4;
+               break;
+            case nir_instr_type_intrinsic: {
+               const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               switch (intr->intrinsic) {
+               case nir_intrinsic_load_ubo:
+               case nir_intrinsic_load_ssbo:
+               case nir_intrinsic_load_global:
+               case nir_intrinsic_load_global_constant:
+               case nir_intrinsic_load_global_predicated_agx:
+               case nir_intrinsic_load_shared:
+               case nir_intrinsic_load_constant:
+               case nir_intrinsic_load_agx:
+               case nir_intrinsic_load_constant_agx:
+               case nir_intrinsic_load_scratch:
+               case nir_intrinsic_store_ssbo:
+               case nir_intrinsic_store_global:
+               case nir_intrinsic_store_shared:
+               case nir_intrinsic_store_scratch:
+               case nir_intrinsic_image_load:
+               case nir_intrinsic_image_store:
+               case nir_intrinsic_image_deref_load:
+               case nir_intrinsic_image_deref_store:
+               case nir_intrinsic_bindless_image_load:
+               case nir_intrinsic_bindless_image_store:
+               case nir_intrinsic_barrier:
+                  st->has_mem_or_sync = true;
+                  break;
+               case nir_intrinsic_load_deref:
+               case nir_intrinsic_store_deref: {
+                  const nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+                  if (deref &&
+                      nir_deref_mode_may_be(deref, nir_var_mem_ssbo |
+                                                      nir_var_mem_ubo |
+                                                      nir_var_mem_global |
+                                                      nir_var_mem_shared))
+                     st->has_mem_or_sync = true;
+                  break;
+               }
+               default:
+                  break;
+               }
+               st->scalar_cost += 1;
+               break;
+            }
+            case nir_instr_type_load_const:
+            case nir_instr_type_undef:
+            case nir_instr_type_jump:
+               break;
+            default:
+               st->scalar_cost += 1;
+               break;
+            }
+         }
+         break;
+      }
+      case nir_cf_node_if: {
+         const nir_if *nif = nir_cf_node_as_if(cf);
+         if (nif != terminator_if)
+            st->branch_ifs++;
+         agx_scan_loop_body(&nif->then_list, terminator_if, st);
+         agx_scan_loop_body(&nif->else_list, terminator_if, st);
+         break;
+      }
+      case nir_cf_node_loop:
+         st->has_mem_or_sync = true;
+         break;
+      default:
+         break;
+      }
+   }
+}
+
+static bool
+agx_limit_heavy_branch_unroll_cf(struct exec_list *list)
+{
+   bool progress = false;
+   foreach_list_typed(nir_cf_node, cf, node, list) {
+      if (cf->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(cf);
+         progress |= agx_limit_heavy_branch_unroll_cf(&nif->then_list);
+         progress |= agx_limit_heavy_branch_unroll_cf(&nif->else_list);
+      } else if (cf->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(cf);
+         progress |= agx_limit_heavy_branch_unroll_cf(&loop->body);
+         if (loop->control != nir_loop_control_none || !loop->info ||
+             loop->info->force_unroll ||
+             loop->info->flattens_all_control_flow ||
+             !loop->info->exact_trip_count_known ||
+             loop->info->max_trip_count < AGX_HEAVY_BRANCH_UNROLL_MIN_TRIPS)
+            continue;
+
+         const nir_if *term_if =
+            loop->info->limiting_terminator
+               ? loop->info->limiting_terminator->nif
+               : NULL;
+         struct agx_loop_body_stats st = {0};
+         agx_scan_loop_body(&loop->body, term_if, &st);
+         if (st.has_mem_or_sync || st.branch_ifs < 2)
+            continue;
+
+         if ((uint64_t)loop->info->max_trip_count * st.scalar_cost >
+             AGX_HEAVY_BRANCH_UNROLL_MAX_OPS) {
+            loop->control = nir_loop_control_dont_unroll;
+            progress = true;
+         }
+      }
+   }
+   return progress;
+}
+
+/* Pre-scalarization nir_opt_loop_unroll counts vector ALU as 1 op per
+ * instruction, so a multi-branch uvec4 uber loop with 8..23 iterations can
+ * appear below the unroll threshold and explode into a multi-thousand-op
+ * straight-line block after scalarization. Mark pure-ALU multi-branch loops
+ * whose scalarized unrolled footprint exceeds
+ * AGX_HEAVY_BRANCH_UNROLL_MAX_OPS as dont_unroll while
+ * leaving memory/texture/GEMM and branchless loops untouched. */
+bool
+agx_nir_limit_heavy_branch_unroll(nir_shader *nir)
+{
+   bool any = false;
+   nir_foreach_function_impl(impl, nir) {
+      if (!agx_cf_list_has_loop(&impl->body)) {
+         nir_no_progress(impl);
+         continue;
+      }
+      nir_metadata_require(impl, nir_metadata_loop_analysis,
+                           nir->options->force_indirect_unrolling,
+                           (int)nir->options->force_indirect_unrolling_sampler);
+      bool progress = agx_limit_heavy_branch_unroll_cf(&impl->body);
+      any |= nir_progress(progress, impl, nir_metadata_all);
+   }
+   return any;
+}
+
 /*
  * Standard NIR optimization loop. This is run in agx_preprocess_nir, then once
  * again at shader variant compile time. Unless there was a complex shader key,
@@ -10026,7 +10330,10 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
          NIR_PASS(progress, nir, nir_opt_undef);
          break;
       case OPT_LOOP_UNROLL:
-         NIR_PASS(progress, nir, nir_opt_loop_unroll);
+         if (agx_nir_has_loop(nir)) {
+            agx_nir_limit_heavy_branch_unroll(nir);
+            NIR_PASS(progress, nir, nir_opt_loop_unroll);
+         }
          break;
       }
 
@@ -10812,6 +11119,22 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    pre_fuse_dirty =
       spec_progress || any_flattened || addr_progress || sub_progress ||
       pre_alg_progress || progress;
+
+   /* Merge nested early-exit branches sharing an identical fallback arm and
+    * fold redundant range-bound disjunctions before reassociation and preamble
+    * formation so combined bounds hoist cleanly. */
+   if (byte_indices || m5) {
+      bool merged_exits = false;
+      NIR_PASS(merged_exits, nir, agx_nir_opt_merge_nested_early_exits);
+      if (merged_exits) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+         nir_divergence_analysis(nir);
+         pre_fuse_dirty = true;
+      }
+   }
 
    /* Reassociate before forming preambles because it makes preambles more
     * effective. Clean up after. On M5, also order the loop-invariant terms of
@@ -13786,6 +14109,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    if (ctx->any_quad_divergent_shuffle)
       agx_lower_divergent_shuffle(ctx);
 
+   agx_count_loop_copies(ctx);
    agx_lower_pseudo(ctx);
 
    /* AGX3's thread-private storage moves one 16-bit or 32-bit component per
@@ -13960,7 +14284,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
       ctx->out->stats.preamble_inst = instrs;
    } else {
-      agx_calc_stats(ctx, binary->size, &ctx->out->stats);
+      agx_calc_stats(ctx, binary, offset, &ctx->out->stats);
    }
 
    /*
@@ -14451,10 +14775,12 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    }
 
    /* Lower constant divisors after an optimization loop so we can constant
-    * fold more before nir_opt_idiv_const. Other integer division waits for
-    * the shader key (agx_nir_lower_integer_division), which decides whether a
-    * preamble forms.
+    * fold more before nir_opt_idiv_const. Strength-reduce signed div/mod with
+    * provably nonnegative operands first so the remaining lowering drops
+    * redundant sign fixups. Other integer division waits for the shader key
+    * (agx_nir_lower_integer_division), which decides whether a preamble forms.
     */
+   NIR_PASS(_, nir, agx_nir_opt_nonneg_idiv);
    NIR_PASS(_, nir, nir_opt_idiv_const, 16);
 
    NIR_PASS(_, nir, nir_opt_deref);
@@ -16872,6 +17198,9 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
 
       NIR_PASS(post_opt_progress, nir, agx_nir_opt_licm, regs, cap_rt_compute);
    }
+
+   if (is_agx3 && !key->dev.emit_agx3d)
+      NIR_PASS(post_opt_progress, nir, agx_nir_hoist_loop_invariant_guard_bits);
 
    if (is_agx3) {
       NIR_PASS(post_opt_progress, nir, agx_nir_opt_shared_byte_offsets);
