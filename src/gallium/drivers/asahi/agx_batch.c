@@ -200,7 +200,7 @@ agx_encoder_bind_vdm_alias(struct agx_device *dev, struct agx_encoder *encoder)
    assert(encoder->g17p_vdm_alias);
 }
 
-static void
+void
 agx_encoder_cleanup(struct agx_device *dev, struct agx_encoder *encoder)
 {
    agx_bo_unreference(dev, encoder->bo);

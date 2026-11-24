@@ -4,6 +4,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "util/lut.h"
 #include "agx_test.h"
 
 /* Register cache hints (agx_opt_register_cache). On AGX3 a last-use hint
@@ -428,5 +429,133 @@ TEST(RegisterCache, PartialOverwriteKeepsLiveUpperHalf)
       agx_opt_register_cache(b->shader);
 
       EXPECT_FALSE(partial->src[1].discard);
+   }
+}
+
+TEST(RegisterCache, Agx3bRemovesRedundantPhysicalCopiesAllStages)
+{
+   for (mesa_shader_stage stage :
+        {MESA_SHADER_COMPUTE, MESA_SHADER_VERTEX, MESA_SHADER_FRAGMENT}) {
+      SCOPED_TRACE(stage);
+      Shader s(AGX_ISA_ENCODING_AGX3B);
+      agx_builder *b = s.b;
+      b->shader->stage = stage;
+      agx_block *entry = agx_start_block(b->shader);
+      b->cursor = agx_after_block(entry);
+
+      agx_mov_imm_to(b, reg(0), 7);
+      agx_bitop_to(b, reg(4), reg(0), agx_immediate(0), UTIL_LUT2(a));
+      agx_instr *use1 = agx_iadd_to(b, reg(8), reg(4), reg(0), 0);
+      agx_bitop_to(b, reg(4), reg(0), agx_immediate(0), UTIL_LUT2(a));
+      agx_instr *use2 = agx_iadd_to(b, reg(10), reg(4), reg(8), 0);
+      agx_mov_imm_to(b, reg(6), 0x1234);
+      agx_instr *imm_use1 = agx_iadd_to(b, reg(12), reg(6), reg(10), 0);
+      agx_mov_imm_to(b, reg(6), 0x1234);
+      agx_instr *imm_use2 = agx_iadd_to(b, reg(14), reg(6), reg(12), 0);
+      agx_unit_test(b, reg(14));
+
+      agx_opt_register_cache(b->shader);
+
+      unsigned movs = 0, mov_imms = 0;
+      agx_foreach_instr_in_block(entry, I) {
+         if (I->op == AGX_OPCODE_BITOP && I->truth_table == UTIL_LUT2(a))
+            movs++;
+         if (I->op == AGX_OPCODE_MOV_IMM && I->imm == 0x1234)
+            mov_imms++;
+      }
+      EXPECT_EQ(movs, 1u);
+      EXPECT_EQ(mov_imms, 1u);
+      EXPECT_FALSE(use1->src[0].discard);
+      EXPECT_TRUE(use2->src[0].discard);
+      EXPECT_FALSE(imm_use1->src[0].discard);
+      EXPECT_TRUE(imm_use2->src[0].discard);
+   }
+
+   /* Preambles are skipped on AGX3B. */
+   Shader preamble(AGX_ISA_ENCODING_AGX3B);
+   preamble.b->shader->is_preamble = true;
+   agx_block *pb = agx_start_block(preamble.b->shader);
+   preamble.b->cursor = agx_after_block(pb);
+   agx_mov_imm_to(preamble.b, reg(0), 9);
+   agx_bitop_to(preamble.b, reg(4), reg(0), agx_immediate(0), UTIL_LUT2(a));
+   agx_iadd_to(preamble.b, reg(8), reg(4), reg(0), 0);
+   agx_bitop_to(preamble.b, reg(4), reg(0), agx_immediate(0), UTIL_LUT2(a));
+   agx_unit_test(preamble.b, reg(4));
+   agx_opt_register_cache(preamble.b->shader);
+   unsigned pmoves = 0;
+   agx_foreach_instr_in_block(pb, I) {
+      if (I->op == AGX_OPCODE_BITOP && I->truth_table == UTIL_LUT2(a))
+         pmoves++;
+   }
+   EXPECT_EQ(pmoves, 2u);
+}
+
+TEST(RegisterCache, Agx3cComputeKeepsRedundantPhysicalCopies)
+{
+   Shader s(AGX_ISA_ENCODING_AGX3C);
+   agx_builder *b = s.b;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_block *entry = agx_start_block(b->shader);
+   b->cursor = agx_after_block(entry);
+
+   agx_mov_imm_to(b, reg(0), 7);
+   agx_bitop_to(b, reg(4), reg(0), agx_immediate(0), UTIL_LUT2(a));
+   agx_iadd_to(b, reg(8), reg(4), reg(0), 0);
+   agx_bitop_to(b, reg(4), reg(0), agx_immediate(0), UTIL_LUT2(a));
+   agx_unit_test(b, reg(4));
+
+   agx_opt_register_cache(b->shader);
+
+   unsigned movs = 0;
+   agx_foreach_instr_in_block(entry, I) {
+      if (I->op == AGX_OPCODE_BITOP && I->truth_table == UTIL_LUT2(a))
+         movs++;
+   }
+   EXPECT_EQ(movs, 2u);
+}
+
+TEST(RegisterCache, Agx3bCubeSampleInvalidatesPhysicalCopyCache)
+{
+   /* AGX3B cube samples write undeclared physical CEM scratch GPRs during
+    * packing (src[6]/+4/+6 and fixed r0/r7/r2 for immediate-descriptor cubes).
+    * An identical MOV_IMM or register copy after a cube sample must NOT be
+    * eliminated by agx3_remove_redundant_physical_copies(). */
+   for (mesa_shader_stage stage : {MESA_SHADER_FRAGMENT, MESA_SHADER_COMPUTE}) {
+      SCOPED_TRACE(stage);
+      Shader s(AGX_ISA_ENCODING_AGX3B);
+      agx_builder *b = s.b;
+      b->shader->stage = stage;
+      agx_block *entry = agx_start_block(b->shader);
+      b->cursor = agx_after_block(entry);
+
+      agx_mov_imm_to(b, reg(0), 0x1234);
+      agx_bitop_to(b, reg(6), reg(4), agx_immediate(0), UTIL_LUT2(a));
+      agx_iadd_to(b, reg(8), reg(0), reg(6), 0);
+
+      agx_texture_sample_to(b, agx_register(12, AGX_SIZE_16),
+                            agx_register(16, AGX_SIZE_32), agx_immediate(0),
+                            agx_immediate(0), agx_immediate(0),
+                            agx_immediate(0), agx_null(), AGX_DIM_CUBE,
+                            AGX_LOD_MODE_AUTO_LOD, 0xf, false, false, false,
+                            AGX_GATHER_NONE, false);
+
+      /* Identical copies to r0 (immediate-descriptor CEM target) and r6 after
+       * the cube sample must both survive. */
+      agx_mov_imm_to(b, reg(0), 0x1234);
+      agx_bitop_to(b, reg(6), reg(4), agx_immediate(0), UTIL_LUT2(a));
+      agx_iadd_to(b, reg(10), reg(0), reg(6), 0);
+      agx_unit_test(b, reg(10));
+
+      agx_opt_register_cache(b->shader);
+
+      unsigned mov_imms = 0, movs = 0;
+      agx_foreach_instr_in_block(entry, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM && I->imm == 0x1234)
+            mov_imms++;
+         if (I->op == AGX_OPCODE_BITOP && I->truth_table == UTIL_LUT2(a))
+            movs++;
+      }
+      EXPECT_EQ(mov_imms, 2u);
+      EXPECT_EQ(movs, 2u);
    }
 }
