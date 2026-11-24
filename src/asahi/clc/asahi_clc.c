@@ -432,7 +432,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_copy_query_gl") ||
           !strcmp(func->name, "libagx_increment_cs_invocations") ||
           !strcmp(func->name, "libagx_setup_indirect_dispatch") ||
-          !strcmp(func->name, "libagx_copy_timestamp") ||
+          !strcmp(func->name, "libagx_copy_timestamps") ||
           !strcmp(func->name, "libagx_increment_statistic") ||
           /* Software tessellation */
           !strcmp(func->name, "libagx_tess_setup_indirect") ||

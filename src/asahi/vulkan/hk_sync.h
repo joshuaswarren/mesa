@@ -95,12 +95,13 @@ enum hk_sync_kind {
    HK_SYNC_GFX_MEM = 1 << 5,
 
    /* Stream kinds and first scopes only, never named by an application
-    * dependency: a command the driver records to carry a timestamp alone
-    * (hk_sync_write_timestamp()). It writes nothing but query memory, which
-    * only query commands and later timestamps read, so only their first
-    * scopes name it (HK_SYNC_QUERY_SCOPE, hk_sync_stamp_scope()); a pipeline
-    * barrier, even an ALL_COMMANDS one, does not order later work after it.
-    * It waits like work of every class (hk_sync_full_kinds()). */
+    * dependency: a command the driver records to carry a timestamp alone, or
+    * to copy timestamps (hk_sync_write_timestamp()). It writes nothing but
+    * query memory, which only query commands and later timestamps read, so
+    * only their first scopes name it (HK_SYNC_QUERY_SCOPE,
+    * hk_sync_stamp_scope()); a pipeline barrier, even an ALL_COMMANDS one,
+    * does not order later work after it. It waits like work of every class
+    * (hk_sync_full_kinds()). */
    HK_SYNC_STAMP = 1 << 6,
 };
 
@@ -166,6 +167,16 @@ struct agx_timestamp_req {
    uint32_t handle;
    uint32_t offset_B;
 };
+
+/* A timestamp write satisfied by copying an earlier stamp: the query it
+ * writes and the stamp it reads. */
+struct hk_stamp_copy {
+   struct agx_timestamp_req dst;
+   struct agx_timestamp_req src;
+};
+
+/* Copies one recording waits with before it records them in one launch. */
+#define HK_SYNC_STAMP_COPIES 32
 
 /*
  * Tile hazards. A render pass instance's load, store and resolve operations
@@ -400,6 +411,17 @@ struct hk_sync_state {
    bool has_unordered_start_ts;
    bool has_gpu_query_reset;
 
+   /* Timestamps written as copies of an earlier end stamp, outside a render
+    * pass instance (hk_sync_write_timestamp()), and the latest stream on
+    * each subqueue whose stamp they read. They are recorded in one launch
+    * in a compute stream ordered after those streams: the next timestamp
+    * carrier that follows them anyway, or the stream of the next query
+    * command, event write or the end of the command buffer
+    * (hk_sync_flush_stamp_copies()). */
+   struct hk_stamp_copy stamp_copies[HK_SYNC_STAMP_COPIES];
+   uint8_t stamp_copy_count;
+   struct hk_cs *stamp_copy_after[HK_SYNC_NUM_SQ];
+
    /* Tile hazards: attachment footprints of the open pass instance and
     * the latest earlier render stream it shares a tile with. The command
     * buffer keeps the recorded instances (hk_cmd_buffer::sync_pass_records). */
@@ -588,6 +610,15 @@ void hk_sync_write_timestamp(struct hk_cmd_buffer *cmd,
                              VkPipelineStageFlags2 stage,
                              struct agx_timestamp_req req);
 void hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd);
+
+/* Record the pending timestamp copies (hk_sync_state::stamp_copies) in a
+ * compute stream positioned after the streams they read, and end it. Every
+ * later first scope that names HK_SYNC_STAMP orders after them. */
+void hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd);
+
+/* Record the copies a render's later in-pass timestamps take from its end
+ * stamp (hk_cs::stamp_copies) as its post-graphics stream cs ends. */
+void hk_sync_dispatch_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 /* G17P transfer writes (see hk_sync_xfer_write). Note that the transfer
  * being recorded writes into cs. */

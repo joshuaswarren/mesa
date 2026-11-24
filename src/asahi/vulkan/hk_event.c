@@ -103,6 +103,8 @@ hk_event_write(struct hk_cmd_buffer *cmd, struct hk_event *event,
 {
    /* An earlier timestamp write is in a non-empty first scope: the host may
     * read its query once it sees the event. */
+   if (src_kinds)
+      hk_sync_flush_stamp_copies(cmd);
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    hk_sync_src_dep(cmd, hk_sync_stamp_scope(src_kinds), cmd->current_cs.cs,
                    dep);

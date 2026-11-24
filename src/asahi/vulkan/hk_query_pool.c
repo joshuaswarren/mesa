@@ -112,6 +112,8 @@ static struct hk_cs *
 hk_query_command_cs(struct hk_cmd_buffer *cmd)
 {
    hk_sync_flush_pending_timestamp(cmd);
+   /* Timestamps written as copies of earlier ones are query results too. */
+   hk_sync_flush_stamp_copies(cmd);
    hk_sync_end_cs_if_timestamped(cmd);
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
@@ -329,6 +331,51 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
    libagx_write_u32s(cmd, agx_1d(count), AGX_BARRIER_ALL | AGX_POSTGFX, params);
    hk_note_dispatched_imm_write_queries(cs);
+}
+
+void
+hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                       const struct hk_stamp_copy *copies, unsigned count)
+{
+   const bool post = cs == cmd->current_cs.post_gfx;
+   assert(cs->type == HK_CS_CDM && count > 0);
+   assert(post || cs == cmd->current_cs.cs);
+
+   perf_debug(cmd, "Timestamp copies");
+
+   struct agx_ptr params =
+      hk_pool_alloc(cmd, count * sizeof(struct libagx_timestamp_copy), 16);
+   if (!params.cpu) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+
+   struct libagx_timestamp_copy *pairs = params.cpu;
+   for (unsigned i = 0; i < count; ++i) {
+      pairs[i] = (struct libagx_timestamp_copy){
+         .dest = copies[i].dst.addr,
+         .src = copies[i].src.addr,
+      };
+   }
+
+   /* One launch, then one flush for all of them. */
+   if (post) {
+      libagx_copy_timestamps(cmd, agx_1d(count), AGX_BARRIER_ALL | AGX_POSTGFX,
+                             params.gpu);
+   } else {
+      libagx_copy_timestamps(cmd, agx_1d(count), AGX_BARRIER_ALL, params.gpu);
+   }
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+   /* Both words are query memory the launch accesses. */
+   struct hk_cs *launch = post ? cmd->current_cs.post_gfx : cmd->current_cs.cs;
+   for (unsigned i = 0; i < count; ++i) {
+      hk_cmd_note_query_range(cmd, launch, copies[i].src.handle,
+                              copies[i].src.offset_B, sizeof(uint64_t));
+      hk_cmd_note_query_range(cmd, launch, copies[i].dst.handle,
+                              copies[i].dst.offset_B, sizeof(uint64_t));
+   }
 }
 
 void
