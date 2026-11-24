@@ -2363,52 +2363,65 @@ TEST(NativeForms, EndOfTilePreservesSamplesAndResolvesSameTile)
    /* Both outputs read offset zero. Their descriptors are distinct, and
     * only the second descriptor names a single-sample image. Keep all four
     * dimension combinations as controls; no host check establishes pixels. */
-   for (unsigned resolves = 0; resolves < 4; ++resolves) {
-      SCOPED_TRACE(resolves);
-      nir_builder b = nir_builder_init_simple_shader(
-         MESA_SHADER_COMPUTE, &agx_nir_options, "EOT store and resolve");
-      nir_def *xy = nir_trim_vector(&b, nir_load_global_invocation_id(&b, 32), 2);
-      for (unsigned pbe = 0; pbe < 2; ++pbe) {
-         nir_intrinsic_instr *intr = nir_image_store_block_agx(
-            &b, nir_imm_intN_t(&b, pbe, 16), nir_imm_int(&b, 0), xy);
-         nir_intrinsic_set_format(intr, (enum pipe_format)AIL_ISA_FORMAT_U8NORM);
-         nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_2D);
-         nir_intrinsic_set_image_array(intr, false);
-         nir_intrinsic_set_explicit_coord(intr, true);
-      }
-      agx_shader_key key = {};
-      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-      key.dev.chip = AGX_CHIP_G17P;
-      key.no_preamble = true;
-      key.g17p_rt0_eot_multisample = true;
-      key.g17p_mrt_eot_count = 2;
-      key.g17p_mrt_eot_resolve_mask = resolves;
-      key.g17p_mrt_eot_selectors[0] = 0x75;
-      key.g17p_mrt_eot_selectors[1] = 0x75;
-      agx_preprocess_nir(b.shader);
-      agx_shader_part part = {};
-      bool ok = agx_compile_shader_nir(b.shader, &key, &part);
-      EXPECT_TRUE(ok);
-      if (ok) {
-         EXPECT_EQ(part.info.binary_size, 120u);
-         EXPECT_EQ(part.info.main_size, 120u);
-         EXPECT_TRUE(part.info.agx3_staging_known);
-         EXPECT_EQ(part.info.agx3_staging_halfs, 16u);
-         if (part.info.binary_size == 120) {
-            const uint8_t *code = static_cast<const uint8_t *>(part.binary);
-            /* Native single-target MS and SS dimension fields, independently
-             * selected for each store of the existing dual-target program. */
-            for (unsigned pbe = 0; pbe < 2; ++pbe) {
-               bool ms = !(resolves & (1u << pbe));
-               EXPECT_EQ(code[pbe ? 63 : 43],
-                         (pbe ? 0x0c : 0x04) | (ms ? 0x02 : 0x00));
-               EXPECT_EQ(code[92 + 12 * pbe + 8], ms ? 0x28 : 0xa8);
-               EXPECT_EQ(code[92 + 12 * pbe + 9], ms ? 0x72 : 0x75);
+   static const struct {
+      uint8_t selector;
+      enum ail_isa_format format;
+   } cases[] = {
+      {0x75, AIL_ISA_FORMAT_U8NORM},
+      {0x15, AIL_ISA_FORMAT_F16},
+      {0x95, AIL_ISA_FORMAT_U16NORM},
+   };
+   for (const auto &c : cases) {
+      const uint8_t base_sel = c.selector;
+      SCOPED_TRACE(static_cast<unsigned>(base_sel));
+      for (unsigned resolves = 0; resolves < 4; ++resolves) {
+         SCOPED_TRACE(resolves);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "EOT store and resolve");
+         nir_def *xy = nir_trim_vector(&b, nir_load_global_invocation_id(&b, 32), 2);
+         for (unsigned pbe = 0; pbe < 2; ++pbe) {
+            nir_intrinsic_instr *intr = nir_image_store_block_agx(
+               &b, nir_imm_intN_t(&b, pbe, 16), nir_imm_int(&b, 0), xy);
+            nir_intrinsic_set_format(intr, (enum pipe_format)c.format);
+            nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_2D);
+            nir_intrinsic_set_image_array(intr, false);
+            nir_intrinsic_set_explicit_coord(intr, true);
+         }
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = AGX_CHIP_G17P;
+         key.no_preamble = true;
+         key.g17p_rt0_eot_multisample = true;
+         key.g17p_mrt_eot_count = 2;
+         key.g17p_mrt_eot_resolve_mask = resolves;
+         key.g17p_mrt_eot_selectors[0] = base_sel;
+         key.g17p_mrt_eot_selectors[1] = base_sel;
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         bool ok = agx_compile_shader_nir(b.shader, &key, &part);
+         EXPECT_TRUE(ok);
+         if (ok) {
+            EXPECT_EQ(part.info.binary_size, 120u);
+            EXPECT_EQ(part.info.main_size, 120u);
+            EXPECT_TRUE(part.info.agx3_staging_known);
+            EXPECT_EQ(part.info.agx3_staging_halfs, 16u);
+            if (part.info.binary_size == 120) {
+               const uint8_t *code = static_cast<const uint8_t *>(part.binary);
+               /* Native single-target MS and SS dimension fields, independently
+                * selected for each store of the existing dual-target program. */
+               for (unsigned pbe = 0; pbe < 2; ++pbe) {
+                  bool ms = !(resolves & (1u << pbe));
+                  EXPECT_EQ(code[pbe ? 63 : 43],
+                            (pbe ? 0x0c : 0x04) | (ms ? 0x02 : 0x00));
+                  EXPECT_EQ(code[92 + 12 * pbe + 8], ms ? 0x28 : 0xa8);
+                  EXPECT_EQ(code[92 + 12 * pbe + 9],
+                            ms ? ((base_sel & 0xf0) | 0x02) : base_sel);
+               }
             }
          }
+         free(part.binary);
+         ralloc_free(b.shader);
       }
-      free(part.binary);
-      ralloc_free(b.shader);
    }
 }
 
@@ -8036,4 +8049,161 @@ TEST(NativeForms, M5TaskAndMeshMultisampleFetchLowerAndCompile)
          ralloc_free(b.shader);
       }
    }
+}
+
+TEST(NativeForms, Agx3bUsatSub32NativeAnd16Lowered)
+{
+   /* 32-bit usub_sat compiles to a native saturating IADD on AGX3B, while
+    * 16-bit usub_sat lowers to compare/sub/select without refusing. */
+   for (unsigned bits : {32u, 16u}) {
+      SCOPED_TRACE(bits);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "agx3b usub_sat");
+      nir_def *addr = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *in = nir_load_global(&b, 2, bits, addr, .align_mul = 4);
+      nir_def *sat = nir_usub_sat(&b, nir_channel(&b, in, 0),
+                                  nir_channel(&b, in, 1));
+      nir_def *out_addr = nir_iadd_imm(&b, addr, 16);
+      nir_store_global(&b, sat, out_addr, .write_mask = 1,
+                       .align_mul = bits / 8);
+
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.reserved_preamble = 16;
+
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_GT(part.info.main_size, 0u);
+      if (bits == 32u) {
+         /* Native 32-bit usub_sat emits the grounded 10-byte AGX3B saturating
+          * subtract opcode (byte 0 = 0x1f, byte 8 = 0x17, byte 9 = 0x05 for
+          * unsigned subtract with both operands unsigned). */
+         bool found_usub_sat = false;
+         const uint8_t *bin = static_cast<const uint8_t *>(part.binary);
+         for (size_t i = 0; i + 10 <= part.info.main_size; i += 2) {
+            if (bin[i] == 0x1f && (bin[i + 2] & 0xfe) == 0x54 &&
+                (bin[i + 8] & 0x19) == 0x11 &&
+                bin[i + 9] == 0x05) {
+               found_usub_sat = true;
+               break;
+            }
+         }
+         EXPECT_TRUE(found_usub_sat);
+      }
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* agx_nir_share_bounds emits 32-bit usub_sat with a uniform size minuend
+    * for aligned non-wrapping field offsets; verify it shares the bound and
+    * compiles and packs cleanly on AGX3B. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "agx3b share bounds usub_sat");
+      nir_def *addr = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *size = agx_test_load_preamble(&b, 1, 32, 8);
+      nir_def *raw = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+      nir_def *idx = nir_ishl_imm(&b, raw, 4);
+      nir_def *end0 = nir_uadd_sat(&b, idx, nir_imm_int(&b, 4));
+      nir_def *end1 = nir_uadd_sat(&b, nir_iadd_imm(&b, idx, 8),
+                                   nir_imm_int(&b, 4));
+      nir_def *v0 = nir_bounds_agx(&b, raw, end0, size);
+      nir_def *v1 = nir_bounds_agx(&b, raw, end1, size);
+      nir_store_global(&b, nir_iadd(&b, v0, v1), nir_iadd_imm(&b, addr, 16),
+                       .write_mask = 1, .align_mul = 4);
+
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.reserved_preamble = 16;
+
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_GT(part.info.main_size, 0u);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(NativeForms, ShareBoundsRejectsWrappedBaseOffset)
+{
+   /* If X = iadd(y, -64), read A at X+0 can be out of bounds (y < 64) while
+    * read B at X+80 wraps mod 2^32 back into bounds. Sharing via
+    * R = usub_sat(size, X) would compute R = 0 and wrongly zero read B.
+    * Verify agx_nir_share_bounds refuses this for unaligned, 16B-aligned,
+    * and 64B-aligned y (since 80 >= 64), with and without a size bound. */
+   for (bool size_below_u32_max : {false, true}) {
+      for (unsigned shift : {0u, 4u, 6u}) {
+         SCOPED_TRACE(size_below_u32_max);
+         SCOPED_TRACE(shift);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "share bounds wrapped X");
+         nir_def *addr = agx_test_load_preamble(&b, 1, 64, 4);
+         nir_def *size = agx_test_load_preamble(&b, 1, 32, 8);
+         nir_def *raw = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+         nir_def *y = shift ? nir_ishl_imm(&b, raw, shift) : raw;
+         nir_def *x = nir_iadd_imm(&b, y, -64);
+         nir_def *end_a = nir_uadd_sat(&b, x, nir_imm_int(&b, 4));
+         nir_def *end_b = nir_uadd_sat(&b, nir_iadd_imm(&b, x, 80),
+                                       nir_imm_int(&b, 4));
+         nir_def *va = nir_bounds_agx(&b, raw, end_a, size);
+         nir_def *vb = nir_bounds_agx(&b, raw, end_b, size);
+         nir_store_global(&b, nir_iadd(&b, va, vb), nir_iadd_imm(&b, addr, 16),
+                          .write_mask = 1, .align_mul = 4);
+
+         EXPECT_FALSE(agx_nir_share_bounds(b.shader, size_below_u32_max));
+
+         unsigned usub_sats = 0;
+         nir_foreach_block(block, b.impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_alu &&
+                   nir_instr_as_alu(instr)->op == nir_op_usub_sat)
+                  usub_sats++;
+            }
+         }
+         EXPECT_EQ(usub_sats, 0u);
+         ralloc_free(b.shader);
+      }
+   }
+}
+
+TEST(NativeForms, Agx3bCanonicalMinmaxSkipsFlushUnlessDenormPreserve)
+{
+   auto compile_minmax = [](bool denorm_preserve) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "agx3b canonical minmax");
+      if (denorm_preserve)
+         b.shader->info.float_controls_execution_mode |=
+            FLOAT_CONTROLS_DENORM_PRESERVE_FP32;
+      nir_def *addr = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *x = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+      nir_def *scaled = nir_fmul(&b, x, nir_imm_float(&b, 2.0f));
+      nir_def *clamped = nir_fmin(&b, scaled, nir_imm_float(&b, 1.0f));
+      nir_store_global(&b, clamped, nir_iadd_imm(&b, addr, 16),
+                       .write_mask = 1, .align_mul = 4);
+
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.reserved_preamble = 16;
+
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      unsigned instrs = part.info.stats.instrs;
+      free(part.binary);
+      ralloc_free(b.shader);
+      return instrs;
+   };
+
+   unsigned ftz_instrs = compile_minmax(false);
+   unsigned preserve_instrs = compile_minmax(true);
+   EXPECT_GT(ftz_instrs, 0u);
+   EXPECT_LT(ftz_instrs, preserve_instrs);
 }

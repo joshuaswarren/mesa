@@ -200,7 +200,7 @@ agx_encoder_bind_vdm_alias(struct agx_device *dev, struct agx_encoder *encoder)
    assert(encoder->g17p_vdm_alias);
 }
 
-static void
+void
 agx_encoder_cleanup(struct agx_device *dev, struct agx_encoder *encoder)
 {
    agx_bo_unreference(dev, encoder->bo);
@@ -394,6 +394,7 @@ agx_batch_init(struct agx_context *ctx,
    batch->g17p_resolve_reload = false;
    batch->g17p_resolve_preserve = key->resolve != NULL;
    batch->g17g_mrt_resident = false;
+   batch->g17p_resolve_blit_attached = false;
    batch->seqnum = ++ctx->batches.seqnum;
    batch->submit_seq = 0;
    batch->g17p_fragment_program = 0;

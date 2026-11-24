@@ -991,28 +991,6 @@ agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
    return agx_chip_native_or_m5(chip);
 }
 
-/* Whether compute streams split to avoid retroactively stalling independent
- * compute work behind a render barrier or delaying graphics consumers behind
- * post-barrier compute, multi-chunk submissions take per-chunk timeline
- * points, and a render whose tiling half names fewer earlier renders than
- * its fragment half falls back to a staged render. Qualified on G17P and M5;
- * G15 and G16G (~0.3 ms per-command turnaround) remain excluded until
- * measured. */
-static inline bool
-agx_chip_cdm_overlap_split(enum agx_chip chip)
-{
-   return chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip);
-}
-
-/* Whether 2x and 4x multisample render-pass continuation keeps consecutive
- * passes in the tilebuffer. Qualified on G17P and M5; G15 and G16G remain
- * excluded until measured. */
-static inline bool
-agx_chip_msaa_pass_continuation(enum agx_chip chip)
-{
-   return chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip);
-}
-
 /* Number of helper-table slots in the USC code-container lead block.  G15
  * and G16 parts have ten; with six their fragment programs of 256x256 and
  * larger walk past the lead into the guard page.  On G17P the state loader's
@@ -1125,6 +1103,41 @@ static inline bool
 agx_chip_native_imageblock(enum agx_chip chip)
 {
    return agx_chip_info(chip)->quirks & AGX_QUIRK_NATIVE_IMAGEBLOCK;
+}
+
+/*
+ * Whether single-sample 2D colour images are losslessly compressed in the
+ * Gen9 form Borealis implements for G17P. The image is GPU-tiled, and 8 bytes
+ * of metadata per 16x16 tile follow it in the same allocation. The texture
+ * descriptor sets bit 59 (compressed) and bit 127 (extended) and carries the
+ * metadata address >> 4 in its third word. The PBE sets word 0 bit 59 and
+ * word 1 bit 63, with the same third word.
+ *
+ * G16G: macOS 27.2 (26B123) on the M4 allocates a 4096x4096 RGBA8 texture as
+ * 64 MiB of image plus 512 KiB of metadata, and its blit copy into that
+ * texture reads and writes it through these exact descriptors. The capture
+ * shows no compressed depth, multisampled or layered image, so those stay on
+ * agx_chip_gen9_extended_compression().
+ *
+ * The selection is by chip because no device property reports compression.
+ */
+static inline bool
+agx_chip_gen9_color_compression(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G16G;
+}
+
+/*
+ * The compressed shapes beyond single-sample colour, measured on the G17P
+ * parts (A18 Pro, M4 Pro, M4 Max):
+ *  - depth and stencil through the ZLS unit;
+ *  - 2x and 4x attachments;
+ *  - the M4 Pro's layered, cube and 3D shapes.
+ */
+static inline bool
+agx_chip_gen9_extended_compression(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
 }
 
 /*

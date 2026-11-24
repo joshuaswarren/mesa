@@ -12,7 +12,9 @@
 #include "asahi/genxml/agx3_cmdstream.h"
 #include "asahi/layout/layout.h"
 #include "asahi/lib/agx3_compute_program_core.h"
+#include "asahi/lib/agx_bg_eot_key.h"
 #include "asahi/lib/agx_tile_mip.h"
+#include "asahi/vulkan/hk_g17p_meta_copy_core.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_format_convert.h"
 #include "gallium/auxiliary/util/u_blitter.h"
@@ -27,6 +29,7 @@
 #include "util/hash_table.h"
 #include "util/macros.h"
 #include "util/ralloc.h"
+#include "util/u_math.h"
 #include "util/box.h"
 #include "util/u_sampler.h"
 #include "util/u_surface.h"
@@ -541,13 +544,27 @@ agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
  * image. Keep that reverse copy restricted to the original WSI binding shape;
  * its later swap is the operation that supplies the direct resolve target.
  */
+/* AGX3 end-of-tile IMGWBLK averages samples in hardware for every native
+ * normalized and 16-bit floating-point colour selector (0x75, 0x95, 0x15),
+ * matching Borealis's hk_agx3_format_needs_shader_resolve(). Keep integer
+ * formats (sample-zero semantics), sRGB (linear averaging), 32-bit floats and
+ * packed R11G11B10F/R9G9B9E5F words (raw-bit IMGWBLK) on the shader resolve
+ * path. */
 static bool
-agx_g17p_rgba8_resolve_format(enum pipe_format format)
+agx_g17p_direct_resolve_format(enum pipe_format format)
 {
-   return format == PIPE_FORMAT_R8G8B8A8_UNORM ||
-          format == PIPE_FORMAT_B8G8R8A8_UNORM ||
-          format == PIPE_FORMAT_R8G8B8X8_UNORM ||
-          format == PIPE_FORMAT_B8G8R8X8_UNORM;
+   if (util_format_is_depth_or_stencil(format) ||
+       util_format_is_pure_integer(format) ||
+       util_format_is_srgb(format) ||
+       format == PIPE_FORMAT_R11G11B10_FLOAT ||
+       format == PIPE_FORMAT_R9G9B9E5_FLOAT)
+      return false;
+
+   if (util_format_is_float(format) &&
+       util_format_get_component_bits(format, UTIL_FORMAT_COLORSPACE_RGB, 0) == 32)
+      return false;
+
+   return agx_g17p_mrt_eot_selector(format) != 0;
 }
 
 bool
@@ -570,7 +587,7 @@ agx_g17p_direct_resolve_blit_shape(const struct pipe_blit_info *info,
    return (util_res_sample_count(msaa) == 2 ||
            util_res_sample_count(msaa) == 4) &&
           util_res_sample_count(single) == 1 && src->format == dst->format &&
-          agx_g17p_rgba8_resolve_format(src->format) &&
+          agx_g17p_direct_resolve_format(src->format) &&
           (source_multisampled || wsi_seed) &&
           (single->target == PIPE_TEXTURE_2D ||
            single->target == PIPE_TEXTURE_RECT) &&
@@ -605,14 +622,28 @@ agx_g17p_attach_direct_resolve(struct agx_context *ctx,
        (batch->key.resolve && batch->key.resolve != single) ||
        batch->key.nr_cbufs != 1 ||
        batch->key.cbufs[0].texture != msaa ||
+       batch->key.cbufs[0].format != single->format ||
        batch->key.cbufs[0].level != 0 ||
        batch->key.cbufs[0].first_layer != 0 ||
-       batch->key.cbufs[0].last_layer != 0)
+       batch->key.cbufs[0].last_layer != 0 ||
+       batch->key.width != msaa->width0 ||
+       batch->key.height != msaa->height0 ||
+       !agx_g17p_rt0_tile_layout_supported(&batch->tilebuffer_layout))
+      return false;
+
+   /* Do not fuse a resolve into a batch that already references the resolve
+    * target (e.g. sampled during the render pass), because the fused EOT
+    * store would race with reads in other tiles of the same pass. The WSI
+    * seed path (preserve_source == false) intentionally reads the WSI image
+    * once to seed the private MSAA buffer and resolves back into it. */
+   if (!batch->key.resolve && preserve_source &&
+       agx_batch_uses_bo(batch, agx_resource(single)->bo))
       return false;
 
    batch->g17p_resolve_preserve |= preserve_source;
    if (!batch->key.resolve) {
       pipe_resource_reference(&batch->key.resolve, single);
+      batch->g17p_resolve_blit_attached = true;
       if (ctx->batch == batch)
          ctx->batch = NULL;
       agx_batch_writes(batch, agx_resource(single), 0);
@@ -634,7 +665,7 @@ agx_g17p_staged_resolve_blit_shape(const struct pipe_blit_info *info)
           (src->target == PIPE_TEXTURE_2D ||
            src->target == PIPE_TEXTURE_RECT) &&
           src->last_level == 0 && src->array_size == 1 && src->depth0 == 1 &&
-          agx_g17p_rgba8_resolve_format(src->format) &&
+          agx_g17p_direct_resolve_format(src->format) &&
           info->src.level == 0 && info->src.box.z == 0 &&
           info->src.box.depth == 1 && info->src.format == src->format &&
           !(info->mask & ~PIPE_MASK_RGBA) && (info->mask & PIPE_MASK_RGBA) &&
@@ -836,13 +867,15 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
     * written and the next pass reloaded stale memory (dEQP-GLES3
     * multisample.fbo_4_samples.stencil: samples a stencil test rejected
     * came back zero; gpu/msstencil.c in m5air). */
-   if (agx_chip_native_agx3(agx_device(ctx->base.screen)->chip) &&
+   const struct agx_device *dev = agx_device(ctx->base.screen);
+
+   if (agx_chip_native_agx3(dev->chip) &&
        agx_g17p_direct_resolve_blit_shape(info, true) &&
        agx_g17p_attach_direct_resolve(ctx, info->src.resource,
                                       info->dst.resource, true))
       return;
 
-   if (agx_chip_native_agx3(agx_device(ctx->base.screen)->chip) &&
+   if (agx_chip_native_agx3(dev->chip) &&
        agx_g17p_staged_resolve_blit_shape(info) &&
        agx_g17p_staged_resolve_blit(ctx, info))
       return;
@@ -897,7 +930,7 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
     * from the WSI image. Keep that copy in the same tile batch, and publish
     * the tile directly back to the WSI image when the swap resolve arrives.
     */
-   if (agx_chip_native_agx3(agx_device(ctx->base.screen)->chip) &&
+   if (agx_chip_native_agx3(dev->chip) &&
        agx_g17p_direct_resolve_blit_shape(info, false)) {
       if (agx_g17p_attach_direct_resolve(ctx, info->dst.resource,
                                        info->src.resource, false)) {
@@ -1242,6 +1275,525 @@ agx_agx3_mipmap_ensure_cdm_space(struct agx_context *ctx,
    return true;
 }
 
+/*
+ * Compressed UNORM8x4 mip chains on HAL200 (G16G, G17P), the scheme Borealis
+ * uses (hk_g17p_compressed_blit(), build_g17p_mip_shader()).
+ *
+ * util_gen_mipmap() would store every level of a compressed chain in its own
+ * render pass. On classic-submission G16G a mip render pass in a chain costs
+ * 0.13-0.24 ms, against compute at 0.13-0.24 ns per texel
+ * (HK_CLASSIC_MIP_PBE_MIN_TEXELS), so a 2560x1440 chain would take about ten
+ * times as long as it does uncompressed. Instead, one compute dispatch per
+ * level reads the source level through the texture unit, which decodes
+ * compressed tiles, writes the level's texels raw at their GPU-tiled
+ * addresses, and marks each 16x16 metadata tile of the level uncompressed.
+ * Levels smaller than a metadata tile have no metadata.
+ *
+ * Every dispatch of the compute blitter ends in the strong post-dispatch
+ * flush (agx_g17p_append_compute()), which orders the next level's texture
+ * reads after this level's stores, as each Borealis dispatch does.
+ *
+ * The filter is libagx_mipmap_unorm8x4{,_odd}'s: weights in 1/256 per axis,
+ * rounded to four fractional bits, then to the nearest code with exact ties
+ * toward 128.
+ */
+#define AGX_G17P_MIP_WG_SIZE 16
+
+enum agx_g17p_mip_key {
+   AGX_G17P_MIP_ODD = BITFIELD_BIT(0),
+   AGX_G17P_MIP_EXACT_2X2 = BITFIELD_BIT(1),
+   AGX_G17P_MIP_METADATA = BITFIELD_BIT(2),
+   AGX_G17P_MIP_ALIGNED_16 = BITFIELD_BIT(3),
+   AGX_G17P_MIP_TILE_64X64 = BITFIELD_BIT(4),
+};
+
+struct agx_g17p_mip_params {
+   uint32_t dst_lo, dst_hi;
+   uint32_t metadata_lo, metadata_hi;
+   uint32_t axis_lo, axis_hi;
+   uint32_t width;
+   uint32_t height;
+   uint32_t scale_x;
+   uint32_t scale_y;
+   uint32_t tiles_per_row;
+   uint32_t tile_width_log2;
+   uint32_t tile_height_log2;
+   uint32_t metadata_interleave_bits;
+   uint32_t metadata_major_is_x;
+   uint32_t uncompressed_mode;
+};
+static_assert(sizeof(struct agx_g17p_mip_params) == 64,
+              "G17P mip parameters are tightly packed");
+
+#define mip_param(b, field)                                                    \
+   nir_load_ubo(b, 1, 32, nir_imm_int(b, 0),                                   \
+                nir_imm_int(b, offsetof(struct agx_g17p_mip_params, field)),   \
+                .align_mul = 4, .range = ~0)
+
+#define mip_param64(b, field)                                                  \
+   nir_pack_64_2x32_split(b, mip_param(b, field##_lo), mip_param(b, field##_hi))
+
+/* x with a zero bit inserted above each of its low 16 bits */
+static nir_def *
+agx_nir_spread_bits(nir_builder *b, nir_def *v)
+{
+   v = nir_iand_imm(b, nir_ior(b, v, nir_ishl_imm(b, v, 8)), 0x00ff00ff);
+   v = nir_iand_imm(b, nir_ior(b, v, nir_ishl_imm(b, v, 4)), 0x0f0f0f0f);
+   v = nir_iand_imm(b, nir_ior(b, v, nir_ishl_imm(b, v, 2)), 0x33333333);
+   return nir_iand_imm(b, nir_ior(b, v, nir_ishl_imm(b, v, 1)), 0x55555555);
+}
+
+/* The even bits of the low 8 bits of v, packed: inverse of the spread */
+static nir_def *
+agx_nir_compact_bits_8(nir_builder *b, nir_def *v)
+{
+   v = nir_iand_imm(b, v, 0x55);
+   v = nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 1)), 0x33);
+   return nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 2)), 0x0f);
+}
+
+static void *
+agx_g17p_mip_compute_shader(struct pipe_context *pctx, unsigned key)
+{
+   const bool odd = key & AGX_G17P_MIP_ODD;
+   const bool exact_2x2 = key & AGX_G17P_MIP_EXACT_2X2;
+   const bool metadata = key & AGX_G17P_MIP_METADATA;
+   const bool aligned_16 = key & AGX_G17P_MIP_ALIGNED_16;
+   const bool tile_64x64 = key & AGX_G17P_MIP_TILE_64X64;
+   assert(!(odd && exact_2x2));
+
+   nir_builder build = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, pctx->screen->nir_options[MESA_SHADER_COMPUTE],
+      "agx-g17p-mip");
+   nir_builder *b = &build;
+   b->shader->info.workgroup_size[0] = AGX_G17P_MIP_WG_SIZE;
+   b->shader->info.workgroup_size[1] = AGX_G17P_MIP_WG_SIZE;
+   b->shader->info.workgroup_size[2] = 1;
+   b->shader->info.num_ubos = 1;
+   b->shader->info.num_textures = 1;
+   BITSET_SET(b->shader->info.textures_used, 0);
+   BITSET_SET(b->shader->info.textures_used_by_txf, 0);
+
+   /* Lay the 16x16 invocations of a workgroup out in Morton order, matching
+    * both one 16x16 compression metadata tile and the GPU-tiled texel layout:
+    * each 32-invocation subgroup covers an 8x4 block (128 contiguous bytes).
+    */
+   nir_def *lid = nir_load_local_invocation_id(b);
+   nir_def *index = nir_ior(b, nir_channel(b, lid, 0),
+                            nir_ishl_imm(b, nir_channel(b, lid, 1), 4));
+   nir_def *wg = nir_load_workgroup_id(b);
+   nir_def *wg_x = nir_channel(b, wg, 0);
+   nir_def *wg_y = nir_channel(b, wg, 1);
+   nir_def *x =
+      nir_ior(b, nir_ishl_imm(b, wg_x, 4), agx_nir_compact_bits_8(b, index));
+   nir_def *y = nir_ior(b, nir_ishl_imm(b, wg_y, 4),
+                        agx_nir_compact_bits_8(b, nir_ushr_imm(b, index, 1)));
+   nir_def *width = (!aligned_16 || odd) ? mip_param(b, width) : NULL;
+   nir_def *height = !aligned_16 ? mip_param(b, height) : NULL;
+
+   nir_if *x_if = NULL, *y_if = NULL;
+   if (!aligned_16) {
+      x_if = nir_push_if(b, nir_ult(b, x, width));
+      x_if->control = nir_selection_control_dont_flatten;
+      y_if = nir_push_if(b, nir_ult(b, y, height));
+      y_if->control = nir_selection_control_dont_flatten;
+   }
+
+   {
+      nir_def *x0, *y0, *x1, *y1;
+      nir_def *weights[4] = {NULL};
+
+      if (exact_2x2) {
+         x0 = nir_ishl_imm(b, x, 1);
+         y0 = nir_ishl_imm(b, y, 1);
+         x1 = nir_ior_imm(b, x0, 1);
+         y1 = nir_ior_imm(b, y0, 1);
+      } else {
+         nir_def *wx, *wy;
+         if (odd) {
+            /* agx_build_mip_axis() entries: lower | weight << 16 */
+            nir_def *axis = mip_param64(b, axis);
+            nir_def *x_entry = nir_load_global(
+               b, 1, 32, nir_iadd(b, axis, nir_u2u64(b, nir_imul_imm(b, x, 4))),
+               .align_mul = 4);
+            nir_def *y_entry = nir_load_global(
+               b, 1, 32,
+               nir_iadd(b, axis,
+                        nir_u2u64(b, nir_imul_imm(b, nir_iadd(b, width, y), 4))),
+               .align_mul = 4);
+            x0 = nir_iand_imm(b, x_entry, 0xffff);
+            y0 = nir_iand_imm(b, y_entry, 0xffff);
+            wx = nir_iand_imm(b, nir_ushr_imm(b, x_entry, 16), 0xff);
+            wy = nir_iand_imm(b, nir_ushr_imm(b, y_entry, 16), 0xff);
+         } else {
+            nir_def *scale_x = mip_param(b, scale_x);
+            nir_def *scale_y = mip_param(b, scale_y);
+            x0 = nir_imul(b, x, scale_x);
+            y0 = nir_imul(b, y, scale_y);
+            wx = nir_ishl_imm(b, nir_iadd_imm(b, scale_x, -1), 7);
+            wy = nir_ishl_imm(b, nir_iadd_imm(b, scale_y, -1), 7);
+         }
+
+         x1 = nir_iadd(b, x0, nir_b2i32(b, nir_ine_imm(b, wx, 0)));
+         y1 = nir_iadd(b, y0, nir_b2i32(b, nir_ine_imm(b, wy, 0)));
+         nir_def *ix = nir_isub(b, nir_imm_int(b, 256), wx);
+         nir_def *iy = nir_isub(b, nir_imm_int(b, 256), wy);
+
+         weights[0] = nir_imul(b, ix, iy);
+         weights[1] = nir_imul(b, wx, iy);
+         weights[2] = nir_imul(b, ix, wy);
+         weights[3] = nir_imul(b, wx, wy);
+      }
+
+      nir_def *coords[4] = {
+         nir_vec2(b, x0, y0),
+         nir_vec2(b, x1, y0),
+         nir_vec2(b, x0, y1),
+         nir_vec2(b, x1, y1),
+      };
+      nir_def *texels[4];
+      for (unsigned i = 0; i < 4; ++i) {
+         texels[i] =
+            nir_txf(b, coords[i], .texture_index = 0,
+                    .dim = GLSL_SAMPLER_DIM_2D, .dest_type = nir_type_uint32,
+                    .backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP);
+      }
+
+      nir_def *packed = NULL;
+      for (unsigned c = 0; c < 4; ++c) {
+         nir_def *out;
+         if (exact_2x2) {
+            nir_def *sum = nir_iadd(
+               b,
+               nir_iadd(b, nir_channel(b, texels[0], c),
+                        nir_channel(b, texels[1], c)),
+               nir_iadd(b, nir_channel(b, texels[2], c),
+                        nir_channel(b, texels[3], c)));
+            /* The general rounding below when all four weights are 16384
+             * (sum in 0..1020): sum <= 511 rounds ties up, sum >= 512 rounds
+             * ties down, both toward 128. */
+            out = nir_ushr_imm(
+               b, nir_isub(b, nir_iadd_imm(b, sum, 2), nir_ushr_imm(b, sum, 9)),
+               2);
+         } else {
+            nir_def *value = NULL;
+            for (unsigned i = 0; i < 4; ++i) {
+               nir_def *term =
+                  nir_imul(b, nir_channel(b, texels[i], c), weights[i]);
+               value = value ? nir_iadd(b, value, term) : term;
+            }
+
+            nir_def *fixed4 = nir_ushr_imm(b, nir_iadd_imm(b, value, 2048), 12);
+            out = nir_ushr_imm(b, fixed4, 4);
+            nir_def *rem = nir_iand_imm(b, fixed4, 15);
+            nir_def *up = nir_ior(b, nir_ugt_imm(b, rem, 8),
+                                  nir_iand(b, nir_ieq_imm(b, rem, 8),
+                                           nir_ult_imm(b, out, 128)));
+            out = nir_iadd(b, out, nir_b2i32(b, up));
+         }
+
+         nir_def *byte = nir_ishl_imm(b, out, 8 * c);
+         packed = packed ? nir_ior(b, packed, byte) : byte;
+      }
+
+      nir_def *element;
+      if (tile_64x64) {
+         /* A 16x16 workgroup is already Morton-ordered in index (bits 0..7);
+          * its position inside a 64x64 tile supplies Morton bits 8..11. */
+         nir_def *tile = nir_iadd(
+            b, nir_imul(b, nir_ushr_imm(b, wg_y, 2), mip_param(b, tiles_per_row)),
+            nir_ushr_imm(b, wg_x, 2));
+         nir_def *morton_hi = nir_ior(
+            b,
+            nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, wg_x, 1), 8),
+                    nir_ishl_imm(b, nir_iand_imm(b, wg_y, 1), 9)),
+            nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, wg_x, 2), 9),
+                    nir_ishl_imm(b, nir_iand_imm(b, wg_y, 2), 10)));
+         element = nir_ior(b, nir_ior(b, nir_ishl_imm(b, tile, 12), morton_hi),
+                           index);
+      } else {
+         nir_def *tile_width_log2 = mip_param(b, tile_width_log2);
+         nir_def *tile_height_log2 = mip_param(b, tile_height_log2);
+         nir_def *tile_x_mask =
+            nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), tile_width_log2), -1);
+         nir_def *tile_y_mask =
+            nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), tile_height_log2), -1);
+         nir_def *tile = nir_iadd(
+            b,
+            nir_imul(b, nir_ushr(b, y, tile_height_log2),
+                     mip_param(b, tiles_per_row)),
+            nir_ushr(b, x, tile_width_log2));
+         nir_def *morton = nir_ior(
+            b, agx_nir_spread_bits(b, nir_iand(b, x, tile_x_mask)),
+            nir_ishl_imm(b, agx_nir_spread_bits(b, nir_iand(b, y, tile_y_mask)),
+                         1));
+         element = nir_ior(
+            b, nir_ishl(b, tile, nir_iadd(b, tile_width_log2, tile_height_log2)),
+            morton);
+      }
+
+      nir_store_global(b, packed,
+                       nir_iadd(b, mip_param64(b, dst),
+                                nir_u2u64(b, nir_imul_imm(b, element, 4))),
+                       .align_mul = 4);
+   }
+
+   if (!aligned_16) {
+      nir_pop_if(b, y_if);
+      nir_pop_if(b, x_if);
+   }
+
+   if (metadata) {
+      /* Each 16x16 workgroup is one metadata tile (wg_x, wg_y), indexed as
+       * libagx's index_metadata() does; one invocation stores it. */
+      nir_if *meta_if = nir_push_if(b, nir_ieq_imm(b, index, 0));
+      meta_if->control = nir_selection_control_dont_flatten;
+      {
+         nir_def *bits = mip_param(b, metadata_interleave_bits);
+         nir_def *mask =
+            nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), bits), -1);
+         nir_def *major = nir_bcsel(
+            b, nir_ine_imm(b, mip_param(b, metadata_major_is_x), 0), wg_x, wg_y);
+         nir_def *meta_idx = nir_iadd(
+            b,
+            nir_ior(b, agx_nir_spread_bits(b, nir_iand(b, wg_x, mask)),
+                    nir_ishl_imm(
+                       b, agx_nir_spread_bits(b, nir_iand(b, wg_y, mask)), 1)),
+            nir_ishl(b, nir_iand(b, major, nir_inot(b, mask)), bits));
+         nir_def *mode = mip_param(b, uncompressed_mode);
+
+         nir_store_global(b, nir_vec2(b, mode, mode),
+                          nir_iadd(b, mip_param64(b, metadata),
+                                   nir_u2u64(b, nir_imul_imm(b, meta_idx, 8))),
+                          .align_mul = 8);
+      }
+      nir_pop_if(b, meta_if);
+   }
+
+   return pipe_shader_from_nir(pctx, b->shader);
+}
+
+/* Private 2D UNORM8x4 mip chains that the compute path below generates. Like
+ * Borealis on images that are not attachments, keep chains whose top level
+ * is below the size where a compressed level pays for its render-pass upload
+ * plain (hk_mip_level_through_pbe()); GL cannot tell which textures will be
+ * rendered to. */
+bool
+agx_g17p_compressed_mip_chain_allowed(const struct agx_device *dev,
+                                      const struct pipe_resource *templ)
+{
+   return agx_chip_gen9_color_compression(dev->chip) &&
+          templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
+          templ->array_size <= 1 && templ->nr_samples <= 1 &&
+          templ->last_level > 0 &&
+          agx_agx3_mipmap_format_supported(templ->format) &&
+          templ->width0 <= UINT16_MAX + 1u &&
+          templ->height0 <= UINT16_MAX + 1u &&
+          hk_mip_level_through_pbe(dev->chip, templ->width0, templ->height0);
+}
+
+struct agx_g17p_mip_level_plan {
+   struct agx_g17p_mip_params params;
+   unsigned key;
+   uint32_t src_w, src_h;
+   uint32_t groups_x, groups_y;
+};
+
+static bool
+agx_g17p_plan_mip_level(const struct agx_resource *rsrc, unsigned level,
+                        struct agx_g17p_mip_level_plan *plan)
+{
+   const struct pipe_resource *prsc = &rsrc->base.b;
+   const struct ail_layout *layout = &rsrc->layout;
+   const uint32_t src_w = u_minify(prsc->width0, level - 1);
+   const uint32_t src_h = u_minify(prsc->height0, level - 1);
+   const uint32_t width = u_minify(prsc->width0, level);
+   const uint32_t height = u_minify(prsc->height0, level);
+
+   for (unsigned axis = 0; axis < 2; ++axis) {
+      const uint64_t src = axis ? src_h : src_w;
+      const uint64_t dst = axis ? height : width;
+      if (!(src == dst || src == dst * 2 || src == dst * 2 + 1))
+         return false;
+   }
+
+   const struct ail_tile tile = layout->tilesize_el[level];
+   struct agx_tile_address_config tiles;
+   if (!agx_tile_address_config_init(layout->stride_el[level],
+                                          tile.width_el, tile.height_el,
+                                          &tiles))
+      return false;
+
+   const bool odd = src_w == (uint64_t)width * 2 + 1 ||
+                    src_h == (uint64_t)height * 2 + 1;
+   const bool exact_2x2 = !odd && src_w == (uint64_t)width * 2 &&
+                          src_h == (uint64_t)height * 2;
+   const bool metadata = ail_is_level_logically_compressed(layout, level);
+   const uint32_t groups_x = DIV_ROUND_UP(width, AGX_G17P_MIP_WG_SIZE);
+   const uint32_t groups_y = DIV_ROUND_UP(height, AGX_G17P_MIP_WG_SIZE);
+
+   *plan = (struct agx_g17p_mip_level_plan){
+      .key = (odd ? AGX_G17P_MIP_ODD : 0) |
+             (exact_2x2 ? AGX_G17P_MIP_EXACT_2X2 : 0) |
+             (metadata ? AGX_G17P_MIP_METADATA : 0) |
+             (groups_x * AGX_G17P_MIP_WG_SIZE == width &&
+                    groups_y * AGX_G17P_MIP_WG_SIZE == height
+                 ? AGX_G17P_MIP_ALIGNED_16
+                 : 0) |
+             (tiles.tile_width_log2 == 6 && tiles.tile_height_log2 == 6
+                 ? AGX_G17P_MIP_TILE_64X64
+                 : 0),
+      .src_w = src_w,
+      .src_h = src_h,
+      .groups_x = groups_x,
+      .groups_y = groups_y,
+   };
+
+   const uint64_t base = agx_map_gpu((struct agx_resource *)rsrc);
+   const uint64_t dst = base + ail_get_layer_level_B(layout, 0, level);
+   plan->params = (struct agx_g17p_mip_params){
+      .dst_lo = (uint32_t)dst,
+      .dst_hi = (uint32_t)(dst >> 32),
+      .width = width,
+      .height = height,
+      .scale_x = src_w == width ? 1 : 2,
+      .scale_y = src_h == height ? 1 : 2,
+      .tiles_per_row = tiles.tiles_per_row,
+      .tile_width_log2 = tiles.tile_width_log2,
+      .tile_height_log2 = tiles.tile_height_log2,
+   };
+
+   if (metadata) {
+      /* One workgroup per metadata tile; the metadata grid must be the
+       * level's 16x16-texel grid. */
+      const uint32_t width_tl =
+         ail_metadata_width_tl((struct ail_layout *)layout, level);
+      const uint32_t height_tl =
+         ail_metadata_height_tl((struct ail_layout *)layout, level);
+      if (width_tl != groups_x || height_tl != groups_y)
+         return false;
+
+      const uint64_t meta = base + layout->metadata_offset_B +
+                            layout->level_offsets_compressed_B[level];
+      plan->params.metadata_lo = (uint32_t)meta;
+      plan->params.metadata_hi = (uint32_t)(meta >> 32);
+      plan->params.metadata_interleave_bits =
+         util_logbase2_ceil(MIN2(width_tl, height_tl));
+      plan->params.metadata_major_is_x = width_tl > height_tl;
+      plan->params.uncompressed_mode =
+         (uint32_t)ail_tile_mode_uncompressed(layout->format);
+   }
+
+   return true;
+}
+
+static bool
+agx_generate_mipmap_compressed(struct pipe_context *pctx,
+                               struct agx_resource *rsrc,
+                               enum pipe_format format, unsigned base_level,
+                               unsigned last_level, unsigned first_layer,
+                               unsigned last_layer)
+{
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_device *dev = agx_device(pctx->screen);
+   const struct pipe_resource *prsc = &rsrc->base.b;
+   const struct ail_layout *layout = &rsrc->layout;
+
+   if (!agx_chip_gen9_color_compression(dev->chip) || !layout->compressed ||
+       layout->policy == AIL_LAYOUT_POLICY_M5 ||
+       prsc->target != PIPE_TEXTURE_2D || prsc->nr_samples > 1 ||
+       layout->sample_count_sa != 1 || layout->tiling != AIL_TILING_GPU ||
+       layout->format != format || !agx_agx3_mipmap_format_supported(format) ||
+       first_layer != 0 || last_layer != 0 || base_level >= last_level ||
+       last_level > prsc->last_level || last_level >= layout->levels ||
+       last_level - base_level > PIPE_MAX_TEXTURE_LEVELS)
+      return false;
+
+   /* Plan every level before recording anything: an unsupported level makes
+    * the whole request fall back to util_gen_mipmap(). */
+   struct agx_g17p_mip_level_plan plans[PIPE_MAX_TEXTURE_LEVELS];
+   for (unsigned level = base_level + 1; level <= last_level; ++level) {
+      struct agx_g17p_mip_level_plan *plan = &plans[level - base_level - 1];
+      if (!agx_g17p_plan_mip_level(rsrc, level, plan))
+         return false;
+
+      if (!ctx->compute_blitter.g17p_mip_cs[plan->key]) {
+         ctx->compute_blitter.g17p_mip_cs[plan->key] =
+            agx_g17p_mip_compute_shader(pctx, plan->key);
+         if (!ctx->compute_blitter.g17p_mip_cs[plan->key])
+            return false;
+      }
+   }
+
+   asahi_compute_save(ctx);
+
+   /* glGenerateMipmap runs no application compute shader. */
+   struct agx_query *cs_invocations =
+      ctx->pipeline_statistics[PIPE_STAT_QUERY_CS_INVOCATIONS];
+   ctx->pipeline_statistics[PIPE_STAT_QUERY_CS_INVOCATIONS] = NULL;
+
+   for (unsigned level = base_level + 1; level <= last_level; ++level) {
+      struct agx_g17p_mip_level_plan *plan = &plans[level - base_level - 1];
+
+      /* The compute batch launch_grid() records into, which a full encoder
+       * may have replaced since the previous level. */
+      struct agx_batch *batch = agx_get_compute_batch(ctx);
+      agx_batch_init_state(batch);
+      agx_batch_writes(batch, rsrc, level);
+
+      if (plan->key & AGX_G17P_MIP_ODD) {
+         const uint32_t width = plan->params.width;
+         const uint32_t height = plan->params.height;
+         struct agx_ptr axis = agx_pool_alloc_aligned(
+            &batch->pool, (size_t)(width + height) * sizeof(uint32_t), 4);
+         uint32_t *entries = axis.cpu;
+         ASSERTED const bool x_ok =
+            agx_build_mip_axis(plan->src_w, width, entries);
+         ASSERTED const bool y_ok =
+            agx_build_mip_axis(plan->src_h, height, entries + width);
+         assert(x_ok && y_ok);
+         plan->params.axis_lo = (uint32_t)axis.gpu;
+         plan->params.axis_hi = (uint32_t)(axis.gpu >> 32);
+      }
+
+      struct pipe_constant_buffer cb = {
+         .buffer_size = sizeof(plan->params),
+         .user_buffer = &plan->params,
+      };
+      pctx->set_constant_buffer(pctx, MESA_SHADER_COMPUTE, 0, &cb);
+
+      /* An integer view of the same channel class reads the source's raw
+       * bytes and keeps its compression (ail_is_view_compatible()). */
+      struct pipe_sampler_view templ;
+      u_sampler_view_default_template(&templ, &rsrc->base.b,
+                                      PIPE_FORMAT_R8G8B8A8_UINT);
+      templ.target = PIPE_TEXTURE_2D;
+      templ.u.tex.first_level = level - 1;
+      templ.u.tex.last_level = level - 1;
+      templ.u.tex.first_layer = 0;
+      templ.u.tex.last_layer = 0;
+      struct pipe_sampler_view *view =
+         pctx->create_sampler_view(pctx, &rsrc->base.b, &templ);
+      pctx->set_sampler_views(pctx, MESA_SHADER_COMPUTE, 0, 1, 0, &view);
+      pctx->sampler_view_release(pctx, view);
+
+      pctx->bind_compute_state(pctx,
+                               ctx->compute_blitter.g17p_mip_cs[plan->key]);
+
+      const struct pipe_grid_info grid = {
+         .block = {AGX_G17P_MIP_WG_SIZE, AGX_G17P_MIP_WG_SIZE, 1},
+         .grid = {plan->groups_x, plan->groups_y, 1},
+      };
+      pctx->launch_grid(pctx, &grid);
+   }
+
+   ctx->pipeline_statistics[PIPE_STAT_QUERY_CS_INVOCATIONS] = cs_invocations;
+   pctx->set_constant_buffer(pctx, MESA_SHADER_COMPUTE, 0, NULL);
+   pctx->set_sampler_views(pctx, MESA_SHADER_COMPUTE, 0, 0, 1, NULL);
+   asahi_compute_restore(ctx);
+   return true;
+}
+
 /* Native AGX3 compute mipchain generation for uncompressed GPU-tiled UNORM8x4
  * 2D / 2D_ARRAY / CUBE textures. Runs all levels in one CDM compute batch via
  * libagx_mipmap_unorm8x4 / libagx_mipmap_unorm8x4_2level /
@@ -1257,6 +1809,11 @@ agx_generate_mipmap_agx3(struct pipe_context *pctx, struct pipe_resource *prsc,
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(pctx->screen);
    struct agx_resource *rsrc = agx_resource(prsc);
+
+   if (rsrc->layout.compressed)
+      return agx_generate_mipmap_compressed(pctx, rsrc, format, base_level,
+                                            last_level, first_layer,
+                                            last_layer);
 
    if (!agx_generate_mipmap_agx3_supported(dev, rsrc, format, base_level,
                                            last_level, first_layer, last_layer))

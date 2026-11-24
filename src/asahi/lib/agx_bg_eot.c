@@ -395,6 +395,7 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
 
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, &agx_nir_options, "agx_background");
+   b.shader->info.internal = true;
    b.shader->info.fs.untyped_color_outputs = true;
 
    struct agx_shader_key compiler_key = {
@@ -656,6 +657,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
 
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
                                                   &agx_nir_options, "agx_eot");
+   b.shader->info.internal = true;
 
    /* A multisample tile can be written out two ways. The default is to
     * resolve it through an ordinary single-sample PBE target, which is what
