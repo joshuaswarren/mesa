@@ -804,20 +804,29 @@ TEST_F(G17PMSAAEpilog, MonolithicLocalReadSampleEquivFastPathCompiles)
       b.shader->info.fs.uses_sample_shading = false;
       nir_validate_shader(b.shader, "local-read sample equiv");
 
-      unsigned ballots = 0, loads = 0, stores = 0;
+      unsigned ballots = 0, loads = 0, raw_probes = 0, stores = 0;
       nir_foreach_block(block, b.impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
                continue;
-            const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            const nir_intrinsic_op op = intr->intrinsic;
             ballots += op == nir_intrinsic_ballot;
-            loads += op == nir_intrinsic_load_local_pixel_agx;
+            if (op == nir_intrinsic_load_local_pixel_agx) {
+               loads++;
+               raw_probes +=
+                  nir_intrinsic_format(intr) == PIPE_FORMAT_R32_UINT &&
+                  intr->def.num_components == 1 && intr->def.bit_size == 32;
+            }
             stores += op == nir_intrinsic_store_local_pixel_agx;
          }
       }
       EXPECT_EQ(ballots, 1u);
-      /* 4 probe loads + 0 in fast path + 3 in slow path (samples 1..3). */
-      EXPECT_EQ(loads, 7u);
+      /* The RGBA8 target is probed as one raw 32-bit word per sample, which
+       * the body cannot reuse: 4 probe loads + 1 sample-0 load in the fast
+       * path + 4 in the slow path. */
+      EXPECT_EQ(raw_probes, 4u);
+      EXPECT_EQ(loads, 9u);
       /* 1 whole-pixel store in fast path + 4 per-sample stores in slow path. */
       EXPECT_EQ(stores, 5u);
 
@@ -932,9 +941,15 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4EquivCompiles)
       b.shader->info.fs.uses_sample_shading = false;
       nir_validate_shader(b.shader, "deferred 4-MRT local-read equiv");
 
-      unsigned ballots = 0, loads = 0, stores = 0, f16_probes = 0;
+      unsigned ballots = 0, loads = 0, stores = 0, raw32_probes = 0,
+               raw16_probes = 0, ieqs = 0;
       nir_foreach_block(block, b.impl) {
          nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_alu) {
+               const nir_op aop = nir_instr_as_alu(instr)->op;
+               ieqs += aop == nir_op_ieq;
+               continue;
+            }
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
@@ -942,17 +957,28 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4EquivCompiles)
             ballots += op == nir_intrinsic_ballot;
             if (op == nir_intrinsic_load_local_pixel_agx) {
                loads++;
-               if (intr->def.bit_size == 16)
-                  f16_probes++;
+               const enum pipe_format fmt = nir_intrinsic_format(intr);
+               raw32_probes += fmt == PIPE_FORMAT_R32_UINT &&
+                               intr->def.num_components == 1 &&
+                               intr->def.bit_size == 32;
+               raw16_probes += fmt == PIPE_FORMAT_R16_UINT &&
+                               intr->def.num_components == 4 &&
+                               intr->def.bit_size == 16;
             }
             stores += op == nir_intrinsic_store_local_pixel_agx;
          }
       }
       EXPECT_EQ(ballots, 1u);
-      /* 16 probe loads (3 R8_UNORM narrowed to f16 = 12) + 4 fast-path
-       * sample-0 loads + 16 slow-path loads = 36 total loads. */
+      /* 16 probe loads, each target's raw lanes: the three 8-bit targets
+       * as one 32-bit word (12), the 16-bit target as four 16-bit lanes
+       * (4). Then 4 fast-path sample-0 loads + 16 slow-path loads in the
+       * body's own formats = 36 total loads. */
       EXPECT_EQ(loads, 36u);
-      EXPECT_EQ(f16_probes, 12u);
+      EXPECT_EQ(raw32_probes, 12u);
+      EXPECT_EQ(raw16_probes, 4u);
+      /* The differing bits are ORed per bit size and tested once each,
+       * with the coverage test and the ballot result test: 4 compares. */
+      EXPECT_LE(ieqs, 4u);
       /* 1 whole-pixel store in fast path + 4 per-sample stores in slow path. */
       EXPECT_EQ(stores, 5u);
 

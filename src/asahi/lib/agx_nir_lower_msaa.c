@@ -8,6 +8,7 @@
 #include "agx_compile.h"
 #include "agx_nir.h"
 #include "agx_tilebuffer.h"
+#include "layout.h"
 #include "nir.h"
 #include "nir_builder.h"
 #include "nir_builder_opcodes.h"
@@ -511,12 +512,91 @@ agx_nir_unroll_g17p_samples(nir_shader *shader, unsigned nr_samples,
 #define G17P_EQUIV_MAX_DWORDS   16u
 
 struct g17p_equiv_probe {
+   /* The shading body's tilebuffer read, as specialize_g17p_equiv_copy()
+    * matches it. */
    unsigned base;
    unsigned target;
    enum pipe_format format;
    uint8_t num_components;
    uint8_t bit_size;
+
+   /* How the probe reads the same bytes to compare the samples. */
+   enum pipe_format raw_format;
+   uint8_t raw_components;
+   uint8_t raw_bit_size;
 };
+
+/*
+ * The probe only decides whether every sample of a pixel holds the same
+ * bytes, and equal bytes decode to equal values in every format. An AGX3
+ * tile load names a lane width, not a format (agx3_tile_format_width()):
+ * 8-bit and 16-bit normalized lanes, sRGB bytes and the packed 32-bit
+ * formats come back as raw lanes that the shader decodes afterwards
+ * (normflt, the RGB10A2 unpack). Comparing decoded channels costs every
+ * sample of every probe a decode, plus a conversion when a wide probe
+ * narrows them to 16 bits.
+ *
+ * Compare the undecoded lanes instead. Four or two 8-bit lanes are read as
+ * one 32-bit or 16-bit word at the same byte offset (pixel offsets are byte
+ * offsets aligned to the lane width, and the lanes arrive in byte order
+ * either way, as R11G11B10F's raw 32-bit word does). 16-bit lanes are read
+ * as 16-bit integers, a packed 32-bit format as its word. Other shapes, one
+ * or three 8-bit lanes, keep the body's own read.
+ *
+ * Bytes that differ but decode alike (signed normalized -128 and -127, NaN
+ * payloads) take the per-sample path, which is always correct.
+ */
+static void
+g17p_equiv_set_raw_form(struct g17p_equiv_probe *p)
+{
+   p->raw_format = p->format;
+   p->raw_components = p->num_components;
+   p->raw_bit_size = p->bit_size;
+
+   switch ((enum ail_isa_format)p->format) {
+   case AIL_ISA_FORMAT_I8:
+   case AIL_ISA_FORMAT_U8NORM:
+   case AIL_ISA_FORMAT_S8NORM:
+   case AIL_ISA_FORMAT_SRGBA8:
+      if (p->num_components == 4 && (p->base % 4) == 0) {
+         p->raw_format = PIPE_FORMAT_R32_UINT;
+         p->raw_components = 1;
+         p->raw_bit_size = 32;
+      } else if (p->num_components == 2 && (p->base % 2) == 0) {
+         p->raw_format = PIPE_FORMAT_R16_UINT;
+         p->raw_components = 1;
+         p->raw_bit_size = 16;
+      }
+      break;
+
+   case AIL_ISA_FORMAT_I16:
+   case AIL_ISA_FORMAT_F16:
+   case AIL_ISA_FORMAT_U16NORM:
+   case AIL_ISA_FORMAT_S16NORM:
+      p->raw_format = PIPE_FORMAT_R16_UINT;
+      p->raw_bit_size = 16;
+      break;
+
+   case AIL_ISA_FORMAT_RGB10A2:
+   case AIL_ISA_FORMAT_RG11B10F:
+   case AIL_ISA_FORMAT_RGB9E5:
+      p->raw_format = PIPE_FORMAT_R32_UINT;
+      p->raw_components = 1;
+      p->raw_bit_size = 32;
+      break;
+
+   default:
+      break;
+   }
+}
+
+static bool
+g17p_equiv_probe_is_body_read(const struct g17p_equiv_probe *p)
+{
+   return p->raw_format == p->format &&
+          p->raw_components == p->num_components &&
+          p->raw_bit_size == p->bit_size;
+}
 
 static bool
 g17p_equiv_is_all_samples_iand(const nir_alu_instr *alu,
@@ -627,9 +707,11 @@ specialize_g17p_equiv_copy(nir_cf_list *copy, nir_def *load_samples,
                nir_def_rewrite_uses(&intr->def, store_samples);
                nir_instr_remove(instr);
             } else if (intr->intrinsic == nir_intrinsic_load_local_pixel_agx) {
-               if (reuse_v0) {
-                  const int k = g17p_equiv_find_probe(probes, num_probes, intr);
-                  assert(k >= 0);
+               const int k =
+                  reuse_v0 ? g17p_equiv_find_probe(probes, num_probes, intr)
+                           : -1;
+               assert(!reuse_v0 || k >= 0);
+               if (k >= 0 && reuse_v0[k]) {
                   nir_def_rewrite_uses(&intr->def, reuse_v0[k]);
                   nir_instr_remove(instr);
                } else {
@@ -701,18 +783,19 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
             if (g17p_equiv_find_probe(probes, num_probes, intr) < 0) {
                if (num_probes >= G17P_EQUIV_MAX_PROBES)
                   return false;
-               const unsigned dwords =
-                  DIV_ROUND_UP(intr->def.num_components * intr->def.bit_size,
-                               32);
-               if (total_dwords + dwords > G17P_EQUIV_MAX_DWORDS)
-                  return false;
-               probes[num_probes++] = (struct g17p_equiv_probe){
+               struct g17p_equiv_probe probe = {
                   .base = nir_intrinsic_base(intr),
                   .target = nir_intrinsic_target(intr),
                   .format = nir_intrinsic_format(intr),
                   .num_components = intr->def.num_components,
                   .bit_size = intr->def.bit_size,
                };
+               g17p_equiv_set_raw_form(&probe);
+               const unsigned dwords = DIV_ROUND_UP(
+                  probe.raw_components * probe.raw_bit_size, 32);
+               if (total_dwords + dwords > G17P_EQUIV_MAX_DWORDS)
+                  return false;
+               probes[num_probes++] = probe;
                total_dwords += dwords;
             }
             continue;
@@ -787,41 +870,64 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
       nir_ieq_imm(&b, nir_iand_imm(&b, cov, full_mask), full_mask);
 
    /* Reuse sample 0's probed values across the branch when the live footprint
-    * is small. For wider MRT local-read shaders (such as 4-MRT deferred
-    * lighting passes), keeping all probed payloads live across the branch
-    * inflates register pressure; drop the probe values after the ballot and
-    * reload sample 0 in the shading body instead. Narrow 8-bit unorm/snorm
-    * probes to f16 in that mode (injective for all 256 values) so the probe
-    * preamble uses half the registers while the shading body still loads
-    * exact f32 values. */
-   const bool reuse_v0 = total_dwords <= G17P_EQUIV_REUSE_DWORDS;
+    * is small and the probe read is the body's own. For wider MRT local-read
+    * shaders, keeping all probed payloads live across the branch inflates
+    * register pressure; drop the probe values after the ballot and reload
+    * sample 0 in the shading body instead. A probe that reads the raw lanes
+    * of a decoded format is never reused: the body still decodes its own
+    * reload. Narrow the remaining 8-bit unorm/snorm probes (one or three
+    * lanes) to f16 when they are not reused (injective for all 256 values),
+    * so the probe preamble uses half the registers while the shading body
+    * still loads exact f32 values. */
+   const bool reuse_small = total_dwords <= G17P_EQUIV_REUSE_DWORDS;
 
    nir_def *v0[G17P_EQUIV_MAX_PROBES];
+   nir_def *reuse[G17P_EQUIV_MAX_PROBES];
+   bool any_reuse = false;
+
+   /* OR every differing bit of every probe, one accumulator per bit size,
+    * and test them once: a compare and select per sample and channel would
+    * otherwise dominate a wide probe. */
+   nir_def *diff16 = NULL, *diff32 = NULL;
+
    for (unsigned k = 0; k < num_probes; ++k) {
-      uint8_t probe_bits = probes[k].bit_size;
-      if (!reuse_v0 && probe_bits == 32 &&
+      const bool body_read = g17p_equiv_probe_is_body_read(&probes[k]);
+      uint8_t probe_bits = probes[k].raw_bit_size;
+      if (body_read && !reuse_small && probe_bits == 32 &&
           (probes[k].format == PIPE_FORMAT_R8_UNORM ||
            probes[k].format == PIPE_FORMAT_R8_SNORM)) {
          probe_bits = 16;
       }
 
       v0[k] = nir_load_local_pixel_agx(
-         &b, probes[k].num_components, probe_bits,
+         &b, probes[k].raw_components, probe_bits,
          nir_imm_intN_t(&b, BITFIELD_BIT(0), 16), .base = probes[k].base,
-         .format = probes[k].format, .target = probes[k].target);
+         .format = probes[k].raw_format, .target = probes[k].target);
+      reuse[k] = body_read && reuse_small ? v0[k] : NULL;
+      any_reuse |= reuse[k] != NULL;
 
       for (unsigned s = 1; s < nr_samples; ++s) {
          nir_def *vs = nir_load_local_pixel_agx(
-            &b, probes[k].num_components, probe_bits,
+            &b, probes[k].raw_components, probe_bits,
             nir_imm_intN_t(&b, BITFIELD_BIT(s), 16), .base = probes[k].base,
-            .format = probes[k].format, .target = probes[k].target);
+            .format = probes[k].raw_format, .target = probes[k].target);
          nir_def *diff = nir_ixor(&b, v0[k], vs);
-         nir_def *any_diff = nir_channel(&b, diff, 0);
-         for (unsigned c = 1; c < probes[k].num_components; ++c)
-            any_diff = nir_ior(&b, any_diff, nir_channel(&b, diff, c));
-         lane_eq = nir_iand(&b, lane_eq, nir_ieq_imm(&b, any_diff, 0));
+         for (unsigned c = 0; c < probes[k].raw_components; ++c) {
+            nir_def *d = nir_channel(&b, diff, c);
+            nir_def **acc = &diff16;
+            if (d->bit_size != 16) {
+               d = nir_u2u32(&b, d);
+               acc = &diff32;
+            }
+            *acc = *acc ? nir_ior(&b, *acc, d) : d;
+         }
       }
    }
+
+   if (diff16)
+      lane_eq = nir_iand(&b, lane_eq, nir_ieq_imm(&b, diff16, 0));
+   if (diff32)
+      lane_eq = nir_iand(&b, lane_eq, nir_ieq_imm(&b, diff32, 0));
 
    nir_def *any_not_eq = nir_ballot(&b, 1, 32, nir_inot(&b, lane_eq));
    nir_def *all_equiv = nir_ieq_imm(&b, any_not_eq, 0);
@@ -833,7 +939,7 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
       nir_cf_list fast_copy;
       nir_cf_list_clone(&fast_copy, &body, &impl->cf_node, NULL);
       specialize_g17p_equiv_copy(&fast_copy, sample0_mask, all_mask, probes,
-                                 reuse_v0 ? v0 : NULL, num_probes);
+                                 any_reuse ? reuse : NULL, num_probes);
       b.cursor = nir_cf_reinsert(&fast_copy, b.cursor);
    }
    nir_push_else(&b, nif);
@@ -843,7 +949,8 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
          nir_cf_list slow_copy;
          nir_cf_list_clone(&slow_copy, &body, &impl->cf_node, NULL);
          specialize_g17p_equiv_copy(&slow_copy, sample_mask, sample_mask,
-                                    probes, (i == 0 && reuse_v0) ? v0 : NULL,
+                                    probes,
+                                    (i == 0 && any_reuse) ? reuse : NULL,
                                     num_probes);
          b.cursor = nir_cf_reinsert(&slow_copy, b.cursor);
       }
