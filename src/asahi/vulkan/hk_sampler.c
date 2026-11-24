@@ -180,7 +180,12 @@ pack_sampler(const struct hk_physical_device *pdev,
             : 1,
       .magnify = translate_filter(info->magFilter),
       .minify = translate_filter(info->minFilter),
-      .mip_filter = translate_mipfilter(info->mipmapMode),
+      .mip_filter =
+         (info->mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST &&
+          info->minLod == 0.0f && info->maxLod == 0.0f &&
+          info->mipLodBias == 0.0f)
+            ? AGX_MIP_FILTER_NONE
+            : translate_mipfilter(info->mipmapMode),
       .wrap_s = translate_address_mode(info->addressModeU),
       .wrap_t = translate_address_mode(info->addressModeV),
       .wrap_r = translate_address_mode(info->addressModeW),
