@@ -3387,7 +3387,7 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    /* The rebuilt programs may drop every colour store; M5 has an empty
     * end-of-tile program only for single-layer, non-spilling colour tiles
     * (hk_build_m5_empty_bg_eot()), multisampled ones included. */
-   if ((dev->dev.chip != AGX_CHIP_G17P && !m5) ||
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
        cs != render->zls_first_cs || cmd->in_meta || render->color_read ||
        render->view_mask || render->layer_count > 1 ||
        (m5 ? !hk_m5_color_imageblock_supported(&render->tilebuffer)
@@ -3489,7 +3489,7 @@ hk_g17p_note_first_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    render->first_draw_seen = true;
    render->color_covered = 0;
-   if (!agx_chip_g17p_or_m5(dev->dev.chip) ||
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
        cmd->in_meta ||
        cs != render->zls_first_cs || cs->stats.cmds || cs->m5_continued_pass ||
        hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
@@ -4801,7 +4801,6 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
           * their producer even for a whole-tile render area: an earlier
           * attachment clear may have been lowered to compute. */
          preserve_loaded_color[nr_written] =
-            agx_chip_g17p_or_m5(dev->dev.chip) &&
             pRenderingInfo->pColorAttachments[i].loadOp ==
                VK_ATTACHMENT_LOAD_OP_LOAD;
          written[nr_written++] = render->color_att[i].iview;

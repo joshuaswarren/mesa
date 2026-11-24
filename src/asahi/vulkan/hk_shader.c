@@ -7345,7 +7345,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
     * never qualifies then. */
    const bool vs_covers_clip_square =
       vs_covers >= 0 ? vs_covers > 0
-                     : agx_chip_g17p_or_m5(dev->dev.chip) &&
+                     : agx_chip_native_or_m5(dev->dev.chip) &&
                           info->stage == MESA_SHADER_VERTEX &&
                           !info->nir->info.io_lowered &&
                           hk_vs_covers_clip_square(info->nir);
@@ -8686,7 +8686,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          }
       }
 
-      vs_covers[i] = agx_chip_g17p_or_m5(dev->dev.chip) &&
+      vs_covers[i] = agx_chip_native_or_m5(dev->dev.chip) &&
                      nir->info.stage == MESA_SHADER_VERTEX &&
                      hk_vs_covers_clip_square(nir);
       if (!hk_mesh_task_grid(dev, nir, info->flags)) {
