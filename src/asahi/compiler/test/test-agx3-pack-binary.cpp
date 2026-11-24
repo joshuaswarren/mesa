@@ -10600,9 +10600,11 @@ TEST_F(AGX3PackBinary, ImmediateIaddPreservesLiveSource)
    }
 }
 
-TEST_F(AGX3PackBinary, HighHalfZeroExtendUsesNarrowAdd)
+TEST_F(AGX3PackBinary, ZeroExtendUsesNarrowAdd)
 {
-   for (unsigned dest : {126u, 132u, 190u}) {
+   /* Below and above the seven-bit destination of the half COPY alike, the
+    * narrow slot-B add of 0 zero-extends in one instruction. */
+   for (unsigned dest : {0u, 126u, 132u, 190u}) {
       const auto enc = AGX_ISA_ENCODING_AGX3B;
       agx_builder *b = builder(enc);
       agx_index half = agx_register(54, AGX_SIZE_16);
@@ -10611,27 +10613,15 @@ TEST_F(AGX3PackBinary, HighHalfZeroExtendUsesNarrowAdd)
                    AGX3_SEL_TT_MOV);
       agx_stop(b);
 
+      struct agx3_iadd_desc d = {
+         .src_kill = true, .dest = (uint16_t)dest, .immediate = 0,
+         .src = 54, .src_16 = true,
+      };
+      d.dest_cache = int_dest_cache();
+      uint8_t add[AGX3_IADD_MAX_LENGTH], add_len = 0;
+      ASSERT_TRUE(agx3_iadd_encode(enc, &d, add, &add_len));
       std::vector<uint8_t> want;
-      if (dest < AGX3_COPY_REG16_DEST_HALVES) {
-         uint8_t copy[AGX3_COPY_MAX_LENGTH], clr[AGX3_STAGE_MAX_LENGTH];
-         uint8_t copy_len = 0, clr_len = 0;
-         ASSERT_TRUE(agx3_copy_encode_reg16(enc, dest, 54, false, false, true,
-                                            0, copy, &copy_len));
-         ASSERT_TRUE(agx3_clr(enc, dest + 1, true, false, clr, &clr_len));
-         append(want, copy, copy_len);
-         append(want, clr, clr_len);
-      } else {
-         /* The seven-bit half COPY cannot name the destination; the narrow
-          * slot-B add of 0 zero-extends into an eight-bit one. */
-         struct agx3_iadd_desc d = {
-            .src_kill = true, .dest = (uint16_t)dest, .immediate = 0,
-            .src = 54, .src_16 = true,
-         };
-         d.dest_cache = int_dest_cache();
-         uint8_t add[AGX3_IADD_MAX_LENGTH], add_len = 0;
-         ASSERT_TRUE(agx3_iadd_encode(enc, &d, add, &add_len));
-         append(want, add, add_len);
-      }
+      append(want, add, add_len);
       struct agx3_encoded_end end;
       ASSERT_TRUE(agx3_pack_end(enc, &end));
       append(want, end.bytes, end.length);
@@ -10639,7 +10629,7 @@ TEST_F(AGX3PackBinary, HighHalfZeroExtendUsesNarrowAdd)
    }
 }
 
-TEST_F(AGX3PackBinary, LocalIndexZeroExtendUsesCopyAndClear)
+TEST_F(AGX3PackBinary, LocalIndexZeroExtendUsesNarrowAdd)
 {
    for (unsigned source : {0u, 1u, 255u}) {
       agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
@@ -10650,14 +10640,26 @@ TEST_F(AGX3PackBinary, LocalIndexZeroExtendUsesCopyAndClear)
       agx_iadd_to(b, agx_register(4, AGX_SIZE_32), agx_immediate(0), half, 0);
       agx_stop(b);
 
-      uint8_t bytes[AGX3_COPY_MAX_LENGTH], len = 0;
+      /* One add where it encodes; otherwise the copy of the half and the
+       * clear of the upper one. */
+      struct agx3_iadd_desc d = {
+         .src_kill = true, .dest = 4, .immediate = 0,
+         .src = (uint16_t)source, .src_16 = true,
+      };
+      d.dest_cache = int_dest_cache();
+      uint8_t bytes[AGX3_IADD_MAX_LENGTH], len = 0;
       std::vector<uint8_t> want;
-      ASSERT_TRUE(agx3_copy_encode_reg16(AGX_ISA_ENCODING_AGX3B, 4, source,
-                                         false, false, true, 0, bytes, &len));
-      append(want, bytes, len);
-      ASSERT_TRUE(agx3_clr(AGX_ISA_ENCODING_AGX3B, 5, true, false, bytes,
-                           &len));
-      append(want, bytes, len);
+      if (agx3_iadd_encode(AGX_ISA_ENCODING_AGX3B, &d, bytes, &len)) {
+         append(want, bytes, len);
+      } else {
+         ASSERT_TRUE(agx3_copy_encode_reg16(AGX_ISA_ENCODING_AGX3B, 4, source,
+                                            false, false, true, 0, bytes,
+                                            &len));
+         append(want, bytes, len);
+         ASSERT_TRUE(agx3_clr(AGX_ISA_ENCODING_AGX3B, 5, true, false, bytes,
+                              &len));
+         append(want, bytes, len);
+      }
       struct agx3_encoded_end end;
       ASSERT_TRUE(agx3_pack_end(AGX_ISA_ENCODING_AGX3B, &end));
       append(want, end.bytes, end.length);
