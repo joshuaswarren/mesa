@@ -883,7 +883,7 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4EquivCompiles)
    const enum agx_chip chips[] = {AGX_CHIP_G17P, AGX_CHIP_G16G};
    const unsigned samples = 4;
    static const struct {
-      unsigned base;
+      int base;
       unsigned target;
       enum pipe_format fmt;
    } inputs[4] = {
