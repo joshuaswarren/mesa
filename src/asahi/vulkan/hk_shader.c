@@ -23,6 +23,7 @@
 #include "asahi/compiler/agx_nir_m5_mesh.h"
 #include "asahi/compiler/agx3_mesh_core.h"
 #include "asahi/compiler/agx_nir_gen1_ray_query.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "hk_nir_border_index.h"
 #include "util/u_debug.h"
 #include "util/u_atomic.h"
@@ -5699,9 +5700,20 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * without it a shader that reads the root but binds no descriptor set --
     * push constants -- got no root range and read its push constants from
     * address 0 + offset, i.e. as zero. */
+   bool wg_coalesce_cand = false;
    if (agx_chip_agx3_path(dev->dev.chip)) {
       shader->info.agx3_uses_root = hk_nir_uses_root(nir);
       shader->info.agx3_root_reads = hk_nir_root_reads(nir);
+      if (agx_chip_has_cap(dev->dev.chip,
+                           AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) &&
+          sw_stage == MESA_SHADER_COMPUTE &&
+          !hk_nir_root_reads_range(
+             nir, hk_root_descriptor_offset(cs.group_count_addr),
+             hk_root_descriptor_offset(cs.group_count_addr) +
+                sizeof(uint64_t),
+             sizeof(struct hk_root_descriptor_table)) &&
+          hk_nir_can_coalesce_workgroup(nir))
+         wg_coalesce_cand = true;
    }
 
    /* Measure while root markers are still explicit. Uniform lowering loads
@@ -6122,6 +6134,18 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * rewritten builtins are exact for that size too. */
    if (launch_size[0] && !shader->b.info.uses_ray_traversal)
       memcpy(shader->b.info.launch_size, launch_size, sizeof(launch_size));
+
+   /* Record the workgroup-coalescing proof only after backend compilation
+    * confirms no ray traversal, split launch, shared/scratch memory, or
+    * matrix16 usage was introduced. Compatible with native AGX3 compute
+    * constant programs: agx_nir_opt_preamble sets load_workgroup_size_allowed
+    * = false and never observes hardware workgroup dimensions. */
+   if (wg_coalesce_cand && !shader->b.info.launch_size[0] &&
+       !shader->b.info.uses_ray_traversal && !shader->b.info.local_size &&
+       !shader->b.info.scratch_size &&
+       !shader->b.info.agx3_spectpr_scratch_size &&
+       !shader->b.info.uses_matrix16)
+      shader->info.agx3_root_reads |= HK_ROOT_PROVEN_WG_COALESCE_SAFE;
 
    shader->code_ptr = shader->b.binary;
    shader->code_size = shader->b.info.binary_size;
