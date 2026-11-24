@@ -17937,3 +17937,61 @@ TEST_F(AGX3PackBinary, TextureFetchPlain2DUsesSixBanksOnAGX3B)
          << bank;
    }
 }
+
+/* A vertex 2D explicit-LOD sample with a register LOD allocates a 16-half
+ * staging span on AGX3C, which still requires an 8-half-aligned base bank so
+ * the per-lane LOD publication satisfies the texture operand gate. When an
+ * earlier 4-half sample holds bank 0..3, the second sample must land at bank
+ * 8 rather than bank 4. */
+TEST_F(AGX3PackBinary, VertexRegisterLodSampleAlignsWideStagingBankOnAGX3C)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3C;
+   agx_builder *b = builder(enc);
+   key.dev.chip = AGX_CHIP_G17C;
+   key.dev.emit_agx3d = false;
+   b->shader->stage = MESA_SHADER_VERTEX;
+   b->shader->max_reg = 127;
+
+   /* Sample 1: plain 2D immediate-LOD vertex sample holds 4 halves (bank 0..3). */
+   {
+      agx_index dest = agx_register(40, AGX_SIZE_32);
+      dest.channels_m1 = 3;
+      agx_index coord = agx_register(8, AGX_SIZE_32);
+      coord.channels_m1 = 1;
+      auto *I = agx_texture_sample_to(
+         b, dest, coord, agx_immediate(0), agx_immediate(0),
+         agx_immediate(0), agx_immediate(0), agx_null(),
+         AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0,
+         false, false, false, AGX_GATHER_NONE, false);
+      I->mask = 15;
+   }
+
+   /* Sample 2: 2D register-LOD vertex sample allocates a 16-half staging span
+    * while sample 1 still owns bank 0..3; bank_base must align to 8 (bank 8). */
+   {
+      agx_index dest = agx_register(60, AGX_SIZE_32);
+      dest.channels_m1 = 3;
+      agx_index coord = agx_register(20, AGX_SIZE_32);
+      coord.channels_m1 = 1;
+      agx_index lod = agx_register(28, AGX_SIZE_16);
+      lod.discard = true;
+      auto *I = agx_texture_sample_to(
+         b, dest, coord, lod, agx_immediate(0),
+         agx_immediate(1), agx_immediate(0), agx_null(),
+         AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0,
+         false, false, false, AGX_GATHER_NONE, false);
+      I->mask = 15;
+   }
+   agx_stop(b);
+
+   const auto code = pack(b);
+   ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+
+   /* Confirm sample 2 staged its coordinate X at bank 8 (not 4). */
+   uint8_t bytes[AGX3_TEX_MAX_LENGTH], len = 0;
+   ASSERT_TRUE(agx3_tex_stage_copy_hints(
+      enc, 8, 20, 2, 0, true, false, bytes, &len));
+   EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
+             code.end())
+      << "expected second vertex sample to stage coord X at 8-aligned bank 8";
+}

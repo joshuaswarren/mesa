@@ -8359,7 +8359,7 @@ agx3_allocate_staging(struct util_dynarray *emission,
     * LOD, 3D) align to eight halves so consecutive banks stay disjoint and
     * satisfy PACK_SMPIR's bank alignment on both AGX3B and AGX3C. Ordinary
     * four-half coordinates keep their native four-half alignment. */
-   const unsigned alignment = span == 8 ? 8 : 4;
+   const unsigned alignment = span >= 8 ? 8 : 4;
    if (!agx3_staging_plan_above(banks, span, alignment, AGX3_STAGING_HALFS,
                                 avoid_end, base, &waits))
       return false;
