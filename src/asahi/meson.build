@@ -123,6 +123,26 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # HAL200 2x/4x depth compression with zink's feedback-loop usage and
+  # sample-location flag, through vkCreateImage and the host-copy query.
+  foreach chip : ['g17p', 'g16g']
+    test(
+      'hk-' + chip + '-msaa-depth-compression',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hal200_vulkan_msaa_depth_compression,
+      ] + (chip == 'g17p' ? ['--expect-1x-compressed'] : []),
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
+
   # AGX3 multi-draw indirect recording fast path across HAL200, G15 and
   # HAL300/M5 (fixed loader reuse, dynamic DRAW_PARAMS/DRAW_ID relocs,
   # robust-index batching, empty draws, VDM chunk rollover and Ioto growth).

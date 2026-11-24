@@ -357,7 +357,18 @@ check_zink(void)
    CHECK(!ELIGIBLE(depth));
    depth.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
    CHECK(ELIGIBLE(depth));
-   depth.samples = VK_SAMPLE_COUNT_4_BIT;
+   /* The same depth buffer at 2x/4x MSAA, with zink's feedback-loop usage
+    * and sample-location flag: its depth plane compresses, the S8 plane and
+    * input-attachment use stay plain. */
+   for (unsigned s = 2; s <= 4; s <<= 1) {
+      VkImageCreateInfo ms = depth;
+      ms.samples = (VkSampleCountFlagBits)s;
+      CHECK(ELIGIBLE(ms));
+      CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, &ms));
+      ms.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+      CHECK(!ELIGIBLE(ms));
+   }
+   depth.samples = VK_SAMPLE_COUNT_8_BIT;
    CHECK(!ELIGIBLE(depth));
    const VkImageCreateInfo d32 = image(VK_FORMAT_D32_SFLOAT, 2408, 1506, 1, ds);
    CHECK(ELIGIBLE(d32));
@@ -842,12 +853,17 @@ check_g16g_msaa_depth(void)
          VkImageCreateInfo x = d;
          x.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
          CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
+         /* Zink's feedback-loop usage and sample-location flag on every
+          * depth attachment leave the depth plane's storage unchanged. */
          x = d;
          x.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
-         CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
+         CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
+         x.flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+         CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
+         CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 1, &x));
          x = d;
          x.flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
-         CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
+         CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
          x = d;
          x.arrayLayers = 2;
          CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &x));
