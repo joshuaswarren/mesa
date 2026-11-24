@@ -112,7 +112,8 @@ TEST(NativeFMA, WeakFMAIsNotRepaired)
 
 TEST(NativeFMA, RepairTakesOnlyStrictFMA)
 {
-   for (enum agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G17C, AGX_CHIP_G16G}) {
+   for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G14G, AGX_CHIP_G15G,
+                              AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17C}) {
       SCOPED_TRACE(chip);
       nir_builder b = nir_builder_init_simple_shader(
          MESA_SHADER_COMPUTE, &agx_nir_options, "strict and weak FMA");
@@ -128,7 +129,7 @@ TEST(NativeFMA, RepairTakesOnlyStrictFMA)
       nir_store_global(&b, nir_ffma_weak(&b, x, y, z), nir_imm_int64(&b, 8),
                        .align_mul = 4);
 
-      const bool repaired = chip != AGX_CHIP_G16G;
+      const bool repaired = true;
       EXPECT_EQ(agx_nir_lower_fma_rte(b.shader, chip), repaired);
       nir_validate_shader(b.shader, "strict and weak FMA");
 
@@ -265,13 +266,13 @@ TEST(NativeFMA, PreserveModeIsUnchanged)
    EXPECT_EQ(preserve, rte_preserve);
 }
 
-TEST(NativeFMA, LegacyAndOtherAGX3ChipsAreUnchanged)
+TEST(NativeFMA, AllGenerationsRepairExplicitRTE)
 {
    for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G14G, AGX_CHIP_G15S, AGX_CHIP_G16G}) {
       auto plain = compile_native_fma(0, 1, chip);
       auto rte =
          compile_native_fma(FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32, 1, chip);
       EXPECT_FALSE(plain.empty());
-      EXPECT_EQ(plain, rte);
+      EXPECT_NE(plain, rte);
    }
 }
