@@ -17150,6 +17150,7 @@ agx_texture_barrier(struct pipe_context *pipe, unsigned flags)
       return;
 
    agx_flush_all(ctx, "Texture barrier");
+   ctx->batches.barrier_seqnum = ctx->batches.seqnum;
 }
 
 void

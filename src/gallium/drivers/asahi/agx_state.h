@@ -705,10 +705,18 @@ struct agx_batch {
       struct util_dynarray range_list; /* struct agx_bo_range */
    } bo_list;
 
+   /* Per-batch subqueue and barrier-tracking state retained while submitted. */
+   bool submitted_has_vdm;
+   bool submitted_has_cdm;
+   bool barrier_untracked;
+
    /* If true, this batch contains a shader with a potentially incoherent write
     * (e.g. image_write), needing a barrier later to access.
     */
    bool incoherent_writes;
+
+   /* If true, a compute dispatch in this batch accesses a query BO. */
+   bool query_access;
 
    struct agx_pool pool, pipeline_pool;
    struct util_dynarray g17p_vdm_aliases;
@@ -942,6 +950,7 @@ struct agx_pending_batch {
    struct drm_asahi_cmd_render render;
    bool has_compute;
    bool has_render;
+   bool untracked;
 };
 
 struct agx_oq_heap;
@@ -1000,6 +1009,10 @@ struct agx_context {
     */
    struct {
       uint64_t seqnum;
+      /* Batches with seqnum <= barrier_seqnum must be waited on by later
+       * submissions until they retire (explicit memory/texture/resource
+       * barriers). */
+      uint64_t barrier_seqnum;
       struct agx_batch slots[AGX_MAX_BATCHES];
 
       /** Set of active batches for faster traversal */
