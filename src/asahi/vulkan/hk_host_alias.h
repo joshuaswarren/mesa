@@ -7,29 +7,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Whether host memory imported into an M5 device can give the GPU a second
- * virtual address of pages it writes (hk_cdm_alias_scope()). Pure functions,
- * so host tests run them on synthetic /proc/self/maps text.
+/* Classify imported host memory via /proc/self/maps to determine whether an M5
+ * GPU-writable import can alias another GPU virtual address
+ * (hk_cdm_alias_scope()). A range takes the worst class across its mappings.
  *
- * What the mappings over an imported range say, best first: a range takes
- * the worst class of the mappings over it.
- *
- * Known limit: the maps show which mappings cover a range, not which pages
- * they hold, and no other process interface shows whether a page is pinned
- * already. An application that imports a range, then moves it with mremap
- * (MREMAP_MAYMOVE, with or without MREMAP_FIXED or MREMAP_DONTUNMAP), and
- * imports the new address as well, has the first import's pinned pages
- * under a private anonymous mapping that overlaps no import: both imports
- * count as private, and a write through one, a barrier and a read through
- * the other within one submission read stale data. Across submissions the
- * memory-scoped flush at the end of every command (vkEndCommandBuffer)
- * still covers it. The plain move leaves the first import's range unmapped,
- * which the extension does not allow while the import lives; with
- * MREMAP_DONTUNMAP the old range gets new pages, so the first import is no
- * longer coherent with the memory the application sees there either. The
- * robust check is the kernel's: DRM_ASAHI_GEM_USERPTR reporting that a page
- * it pinned was pinned long-term already (folio_maybe_dma_pinned()), which
- * would count as aliasing.
+ * Limitation: /proc/self/maps cannot detect an imported range moved via mremap
+ * and re-imported (both ranges appear private-anonymous, so intra-submit
+ * barriers could read stale data; cross-submit vkEndCommandBuffer flushes still
+ * cover it). Detecting that requires kernel-side folio_maybe_dma_pinned().
  */
 enum hk_host_map_class {
    /* Private anonymous memory: no pathname, "[heap]", or an anonymous

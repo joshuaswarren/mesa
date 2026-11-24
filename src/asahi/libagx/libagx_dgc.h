@@ -1041,10 +1041,10 @@ agx_vdm_draw_robust_index(GLOBAL uint32_t *out, enum agx_chip chip,
     * executes and the following CPU-authored command remains the only parser
     * target.
     */
-   if ((chip == AGX_CHIP_G17P ||
+   if ((agx_chip_native_hal200(chip) ||
         agx_vdm_index_list_direct_is_hal300_inline(chip)) &&
        (draw.b.count[0] == 0 || draw.b.count[1] == 0)) {
-      if (chip == AGX_CHIP_G17P && render_state_emitted)
+      if (agx_chip_native_hal200(chip) && render_state_emitted)
          *out++ = draw_state_context_offset;
 
       *out++ = 0x80000000u | (uint32_t)(empty_draw_jump >> 32);
@@ -1065,7 +1065,7 @@ agx_vdm_draw_robust_index(GLOBAL uint32_t *out, enum agx_chip chip,
              draw.index_bias, range_dwords, &words))
          return out;
 
-      if (chip == AGX_CHIP_G17P) {
+      if (agx_chip_native_hal200(chip)) {
          if (render_state_emitted)
             *out++ = draw_state_context_offset;
 
@@ -1101,7 +1101,7 @@ libagx_draw_robust_index_vdm_size(enum agx_chip chip,
       agx_draw_indexed(0, 1, 0, 0, 0, 0, 4, AGX_INDEX_SIZE_U16, false);
    unsigned size_B = agx_vdm_draw_size(chip, draw);
 
-   if (chip == AGX_CHIP_G17P)
+   if (agx_chip_native_hal200(chip))
       size_B += 8 + (render_state_emitted ? 4 : 0);
 
    return size_B;
@@ -1118,6 +1118,295 @@ struct libagx_robust_index_draw {
 };
 static_assert(sizeof(struct libagx_robust_index_draw) == 32,
               "robust index batch host/device ABI");
+
+#define LIBAGX_INDIRECT_VDM_MAX_RELOCS 8u
+#define LIBAGX_INDIRECT_VDM_LANES_PER_DRAW 4u
+
+struct libagx_indirect_ioto_reloc {
+   uint64_t dest_lo;
+   uint64_t dest_hi;
+   uint32_t delta;
+   uint16_t offset;
+   /* 0 = DRAW_PARAMS, 1 = DRAW_ID */
+   uint8_t kind;
+   /* bit 0: low LDIMM is 2-byte form, bit 1: high LDIMM is 2-byte form */
+   uint8_t short_mask;
+};
+static_assert(sizeof(struct libagx_indirect_ioto_reloc) == 24,
+              "indirect ioto reloc host/device ABI");
+
+struct libagx_indirect_vdm_desc {
+   uint64_t sub_vdm;
+   uint64_t vdm_template;
+   uint64_t in_buffer;
+   /* 0 for fixed drawCount (vkCmdDraw[Indexed]Indirect). */
+   uint64_t count_buffer;
+   uint64_t return_link_compact;
+   /* 0 when the draw does not republish vertex state per record. */
+   uint64_t ioto_out;
+   uint64_t ioto_template;
+   /* 0 when the vertex shader does not read gl_DrawID. */
+   uint64_t draw_ids_out;
+   uint32_t max_draw_count;
+   uint32_t in_stride_B;
+   uint32_t vdm_record_dwords;
+   uint32_t vdm_indirect_word_off;
+   /* 0xffffffffu when no VDM State Update pipeline pair is present. */
+   uint32_t vdm_pipeline_word_off;
+   uint32_t vdm_pipeline_raw_template;
+   uint32_t param_offset_B;
+   uint32_t ioto_copy_dwords;
+   uint32_t ioto_stride_B;
+   uint32_t reloc_count;
+   struct libagx_indirect_ioto_reloc relocs[LIBAGX_INDIRECT_VDM_MAX_RELOCS];
+};
+static_assert(sizeof(struct libagx_indirect_vdm_desc) == 296,
+              "indirect VDM builder host/device ABI");
+
+static inline uint64_t
+libagx_ioto_ldimm_long_immediate(uint32_t immediate)
+{
+   return ((uint64_t)(immediate & 0x7fu) << 8) |
+          ((uint64_t)((immediate >> 25) & 0x7fu) << 25) |
+          ((uint64_t)((((immediate >> 7) & 0xfu) << 1) |
+                      (((immediate >> 11) & 3u) << 10)) << 32) |
+          ((uint64_t)(((immediate >> 13) & 0xfu) |
+                      (((immediate >> 17) & 0xffu) << 4)) << 48);
+}
+
+static inline uint32_t
+libagx_ioto_patch_dword(uint32_t w, uint32_t byte_off, uint32_t patch_off,
+                        bool is_short, uint64_t word, uint32_t immediate)
+{
+   if (is_short) {
+      if (patch_off == byte_off)
+         return (w & 0xffff00ffu) | ((immediate & 0xffu) << 8);
+      if (patch_off == byte_off + 2u)
+         return (w & 0x00ffffffu) | ((immediate & 0xffu) << 24);
+      return w;
+   }
+
+   if (byte_off + 4u <= patch_off || byte_off >= patch_off + 8u)
+      return w;
+
+   if (patch_off == byte_off)
+      return (uint32_t)word;
+   if (patch_off + 4u == byte_off)
+      return (uint32_t)(word >> 32);
+   if (patch_off == byte_off + 2u)
+      return (w & 0x0000ffffu) | (((uint32_t)word & 0xffffu) << 16);
+   if (patch_off + 2u == byte_off)
+      return (uint32_t)(word >> 16);
+   /* patch_off + 6u == byte_off */
+   return (w & 0xffff0000u) | (uint32_t)(word >> 48);
+}
+
+static inline void
+libagx_load_u32x4(CONST uint32_t *src, uint32_t w[4])
+{
+#ifdef __OPENCL_VERSION__
+   uint4 v = *(CONST uint4 *)src;
+   w[0] = v.x;
+   w[1] = v.y;
+   w[2] = v.z;
+   w[3] = v.w;
+#else
+   w[0] = src[0];
+   w[1] = src[1];
+   w[2] = src[2];
+   w[3] = src[3];
+#endif
+}
+
+static inline void
+libagx_store_u32x4(GLOBAL uint32_t *dst, const uint32_t w[4])
+{
+#ifdef __OPENCL_VERSION__
+   *(GLOBAL uint4 *)dst = (uint4)(w[0], w[1], w[2], w[3]);
+#else
+   dst[0] = w[0];
+   dst[1] = w[1];
+   dst[2] = w[2];
+   dst[3] = w[3];
+#endif
+}
+
+static inline void
+libagx_build_indirect_vdm_sublane(CONST struct libagx_indirect_vdm_desc *desc,
+                                  uint32_t tid)
+{
+   uint32_t count = desc->max_draw_count;
+   if (desc->count_buffer) {
+      uint32_t raw_count =
+         *(const GLOBAL uint32_t *)(uintptr_t)desc->count_buffer;
+      if (raw_count < count)
+         count = raw_count;
+   }
+
+   const uint32_t draw = tid / LIBAGX_INDIRECT_VDM_LANES_PER_DRAW;
+   const uint32_t sublane = tid % LIBAGX_INDIRECT_VDM_LANES_PER_DRAW;
+
+   if (draw > count)
+      return;
+
+   GLOBAL uint32_t *vdm_out = (GLOBAL uint32_t *)(uintptr_t)(
+      desc->sub_vdm + (uint64_t)draw * desc->vdm_record_dwords * 4u);
+
+   if (draw == count) {
+      if (sublane == 0) {
+         uint64_t target = desc->return_link_compact;
+         vdm_out[0] = 0x80000000u | (uint32_t)(target >> 32);
+         vdm_out[1] = (uint32_t)target;
+      }
+      return;
+   }
+
+   const uint64_t draw_va = desc->in_buffer + (uint64_t)draw * desc->in_stride_B;
+   uint64_t prog_va = 0;
+
+   if (desc->ioto_out) {
+      if (desc->draw_ids_out && sublane == 0) {
+         GLOBAL uint32_t *draw_ids =
+            (GLOBAL uint32_t *)(uintptr_t)desc->draw_ids_out;
+         draw_ids[draw] = draw;
+      }
+
+      prog_va = desc->ioto_out + (uint64_t)draw * desc->ioto_stride_B;
+      GLOBAL uint32_t *ioto_dst = (GLOBAL uint32_t *)(uintptr_t)prog_va;
+      CONST uint32_t *ioto_src =
+         (CONST uint32_t *)(uintptr_t)desc->ioto_template;
+      const uint64_t params_va = draw_va + desc->param_offset_B;
+      const uint64_t draw_id_va = desc->draw_ids_out + (uint64_t)draw * 4u;
+      const uint32_t ioto_quads = desc->ioto_copy_dwords >> 2;
+
+      for (uint32_t q = sublane; q < ioto_quads;
+           q += LIBAGX_INDIRECT_VDM_LANES_PER_DRAW) {
+         uint32_t w[4];
+         libagx_load_u32x4(ioto_src + q * 4u, w);
+         const uint32_t quad_off = q * 16u;
+
+         for (uint32_t r = 0; r < desc->reloc_count; ++r) {
+            const struct libagx_indirect_ioto_reloc rel = desc->relocs[r];
+            const bool low_short = (rel.short_mask & 1u) != 0;
+            const bool hi_short = (rel.short_mask & 2u) != 0;
+            const uint32_t lo_off = rel.offset;
+            const uint32_t hi_off = lo_off + (low_short ? 2u : 8u);
+            const uint32_t hi_end = hi_off + (hi_short ? 2u : 8u);
+
+            if (quad_off + 16u > lo_off && quad_off < hi_end) {
+               const uint64_t base =
+                  (rel.kind == 0 ? params_va : draw_id_va) + rel.delta;
+               const uint32_t lo_imm = (uint32_t)base;
+               const uint32_t hi_imm = (uint32_t)(base >> 32);
+               const uint64_t lo_word =
+                  low_short
+                     ? 0
+                     : (rel.dest_lo | libagx_ioto_ldimm_long_immediate(lo_imm));
+               const uint64_t hi_word =
+                  hi_short
+                     ? 0
+                     : (rel.dest_hi | libagx_ioto_ldimm_long_immediate(hi_imm));
+
+               for (uint32_t lane = 0; lane < 4u; ++lane) {
+                  const uint32_t byte_off = quad_off + lane * 4u;
+                  w[lane] = libagx_ioto_patch_dword(w[lane], byte_off, lo_off,
+                                                    low_short, lo_word, lo_imm);
+                  w[lane] = libagx_ioto_patch_dword(w[lane], byte_off, hi_off,
+                                                    hi_short, hi_word, hi_imm);
+               }
+            }
+         }
+
+         libagx_store_u32x4(ioto_dst + q * 4u, w);
+      }
+
+      for (uint32_t k = (ioto_quads << 2) + sublane; k < desc->ioto_copy_dwords;
+           k += LIBAGX_INDIRECT_VDM_LANES_PER_DRAW) {
+         uint32_t w = ioto_src[k];
+         const uint32_t byte_off = k * 4u;
+
+         for (uint32_t r = 0; r < desc->reloc_count; ++r) {
+            const struct libagx_indirect_ioto_reloc rel = desc->relocs[r];
+            const bool low_short = (rel.short_mask & 1u) != 0;
+            const bool hi_short = (rel.short_mask & 2u) != 0;
+            const uint32_t lo_off = rel.offset;
+            const uint32_t hi_off = lo_off + (low_short ? 2u : 8u);
+            const uint32_t hi_end = hi_off + (hi_short ? 2u : 8u);
+
+            if (byte_off + 4u > lo_off && byte_off < hi_end) {
+               const uint64_t base =
+                  (rel.kind == 0 ? params_va : draw_id_va) + rel.delta;
+               const uint32_t lo_imm = (uint32_t)base;
+               const uint32_t hi_imm = (uint32_t)(base >> 32);
+               const uint64_t lo_word =
+                  low_short
+                     ? 0
+                     : (rel.dest_lo | libagx_ioto_ldimm_long_immediate(lo_imm));
+               const uint64_t hi_word =
+                  hi_short
+                     ? 0
+                     : (rel.dest_hi | libagx_ioto_ldimm_long_immediate(hi_imm));
+               w = libagx_ioto_patch_dword(w, byte_off, lo_off, low_short,
+                                           lo_word, lo_imm);
+               w = libagx_ioto_patch_dword(w, byte_off, hi_off, hi_short,
+                                           hi_word, hi_imm);
+            }
+         }
+
+         ioto_dst[k] = w;
+      }
+   }
+
+   CONST uint32_t *vdm_src = (CONST uint32_t *)(uintptr_t)desc->vdm_template;
+   const uint32_t pipe_off = desc->vdm_pipeline_word_off;
+   const uint32_t pipe_w0 =
+      desc->vdm_pipeline_raw_template |
+      (uint32_t)(((prog_va >> 38) & 0x3ffu) << 22);
+   const uint32_t pipe_w1 = (uint32_t)(prog_va >> 6);
+   const uint32_t ind_off = desc->vdm_indirect_word_off;
+   const uint32_t ind_w0 = (uint32_t)((draw_va >> 32) & 0xffffu);
+   const uint32_t ind_w1 = (uint32_t)draw_va & 0xfffffffcu;
+
+   if ((desc->vdm_record_dwords & 3u) == 0u) {
+      const uint32_t vdm_quads = desc->vdm_record_dwords >> 2;
+      for (uint32_t q = sublane; q < vdm_quads;
+           q += LIBAGX_INDIRECT_VDM_LANES_PER_DRAW) {
+         uint32_t w[4];
+         libagx_load_u32x4(vdm_src + q * 4u, w);
+         const uint32_t base_k = q * 4u;
+         for (uint32_t lane = 0; lane < 4u; ++lane) {
+            const uint32_t k = base_k + lane;
+            if (pipe_off != 0xffffffffu) {
+               if (k == pipe_off)
+                  w[lane] = pipe_w0;
+               else if (k == pipe_off + 1u)
+                  w[lane] = pipe_w1;
+            }
+            if (k == ind_off)
+               w[lane] = ind_w0;
+            else if (k == ind_off + 1u)
+               w[lane] = ind_w1;
+         }
+         libagx_store_u32x4(vdm_out + q * 4u, w);
+      }
+   } else {
+      for (uint32_t k = sublane; k < desc->vdm_record_dwords;
+           k += LIBAGX_INDIRECT_VDM_LANES_PER_DRAW) {
+         uint32_t w = vdm_src[k];
+         if (pipe_off != 0xffffffffu) {
+            if (k == pipe_off)
+               w = pipe_w0;
+            else if (k == pipe_off + 1u)
+               w = pipe_w1;
+         }
+         if (k == ind_off)
+            w = ind_w0;
+         else if (k == ind_off + 1u)
+            w = ind_w1;
+         vdm_out[k] = w;
+      }
+   }
+}
 
 /* Software task stage (G17P): one record per task draw. The task kernel
  * stores each workgroup's child grid and payload in its entry, and raises
@@ -1154,3 +1443,152 @@ libagx_remap_adj_count(unsigned count, enum mesa_prim prim)
       return count / 2;
    }
 }
+
+/*
+ * Contiguous run of indirect draw VDM records with constant byte stride inside
+ * one VDM chunk. Draw `i` in `[first, first + count)` begins at
+ * `base_addr + (uint64_t)(i - first) * stride` (always a top-level VDM record
+ * boundary with at least 8 bytes written for that draw).
+ */
+struct libagx_vdm_draw_span {
+   uint64_t base_addr;
+   uint32_t first;
+   uint32_t count;
+   uint32_t stride;
+   uint32_t _pad[3];
+};
+static_assert(sizeof(struct libagx_vdm_draw_span) == 32,
+              "VDM draw span host/device ABI");
+
+/*
+ * Per-command-buffer mutable state for reusable command buffers: records the
+ * previously patched VDM address and its original 8 bytes so a subsequent
+ * submission restores them before patching at the new runtime draw count.
+ */
+struct libagx_vdm_truncate_state {
+   uint64_t patched_addr;
+   uint32_t orig_w0;
+   uint32_t orig_w1;
+};
+static_assert(sizeof(struct libagx_vdm_truncate_state) == 16,
+              "VDM truncate state host/device ABI");
+
+static inline bool
+libagx_vdm_span_append(GLOBAL struct libagx_vdm_draw_span *spans,
+                       uint32_t *num_spans, uint32_t capacity,
+                       uint32_t draw_idx, uint64_t addr)
+{
+   if (*num_spans > 0) {
+      GLOBAL struct libagx_vdm_draw_span *last = &spans[*num_spans - 1];
+      if (last->first + last->count == draw_idx) {
+         if (last->count == 1) {
+            if (addr > last->base_addr &&
+                (addr - last->base_addr) <= UINT32_MAX) {
+               last->stride = (uint32_t)(addr - last->base_addr);
+               last->count = 2;
+               return true;
+            }
+         } else if (addr == last->base_addr +
+                               (uint64_t)last->count * last->stride) {
+            last->count++;
+            return true;
+         }
+      }
+   }
+
+   if (*num_spans >= capacity)
+      return false;
+
+   spans[(*num_spans)++] = (struct libagx_vdm_draw_span){
+      .base_addr = addr,
+      .first = draw_idx,
+      .count = 1,
+      .stride = 0,
+   };
+   return true;
+}
+
+static inline uint64_t
+libagx_vdm_span_find_addr(CONST struct libagx_vdm_draw_span *spans,
+                          uint32_t num_spans, uint32_t draw_idx)
+{
+   uint32_t lo = 0;
+   uint32_t hi = num_spans;
+
+   while (lo < hi) {
+      uint32_t mid = lo + ((hi - lo) >> 1);
+      struct libagx_vdm_draw_span s = spans[mid];
+      if (draw_idx < s.first) {
+         hi = mid;
+      } else if (draw_idx >= s.first + s.count) {
+         lo = mid + 1;
+      } else {
+         return s.base_addr + (uint64_t)(draw_idx - s.first) * s.stride;
+      }
+   }
+
+   return 0;
+}
+
+/*
+ * Shared host/device implementation of runtime VDM stream truncation for
+ * DrawIndirectCount. Restores any previously patched 8-byte VDM site first
+ * (supporting reusable command buffers whose draw count changes across
+ * submissions), then patches draw `*draw_count` with the non-returning
+ * VDM_STREAM_LINK `(link_w0, link_w1)` whenever `*draw_count < max_draw_count`.
+ */
+static inline void
+libagx_vdm_patch_indirect_count_impl(
+   GLOBAL struct libagx_vdm_truncate_state *state,
+   CONST struct libagx_vdm_draw_span *spans, CONST uint32_t *draw_count,
+   uint32_t num_spans, uint32_t max_draw_count, uint32_t link_w0,
+   uint32_t link_w1)
+{
+   uint64_t prev = state->patched_addr;
+   if (prev != 0) {
+      GLOBAL uint32_t *prev_dst = (GLOBAL uint32_t *)(uintptr_t)prev;
+      prev_dst[0] = state->orig_w0;
+      prev_dst[1] = state->orig_w1;
+      state->patched_addr = 0;
+   }
+
+   uint32_t n = *draw_count;
+   if (n >= max_draw_count)
+      return;
+
+   uint64_t addr = libagx_vdm_span_find_addr(spans, num_spans, n);
+   if (addr == 0)
+      return;
+
+   GLOBAL uint32_t *dst = (GLOBAL uint32_t *)(uintptr_t)addr;
+   state->orig_w0 = dst[0];
+   state->orig_w1 = dst[1];
+   state->patched_addr = addr;
+
+   dst[0] = link_w0;
+   dst[1] = link_w1;
+}
+
+#ifndef __OPENCL_VERSION__
+/*
+ * Runtime invariant check for VDM stream-truncation recording sites:
+ * every recorded draw must remain in the same graphics control stream (`cs`)
+ * and advance the stream by at least 8 bytes (AGX_VDM_STREAM_LINK_LENGTH)
+ * unless a fresh chunk was opened for the draw.
+ */
+static inline bool
+libagx_vdm_draw_site_valid(const void *cs_before, const void *cs_after,
+                           uint64_t chunk_before, uint64_t chunk_after,
+                           const void *cur_before, const void *cur_after)
+{
+   if (cs_before != cs_after)
+      return false;
+
+   if (chunk_before != chunk_after)
+      return true;
+
+   const uintptr_t before = (uintptr_t)cur_before;
+   const uintptr_t after = (uintptr_t)cur_after;
+   return after >= before && (after - before) >= 8u;
+}
+#endif

@@ -96,3 +96,28 @@ agx_g17p_compression_color_format(enum pipe_format format)
       return false;
    }
 }
+
+/* 16-byte RGBA32 colour formats that G17P may allocate losslessly compressed
+ * on single-sample, single-layer 2D images (including mip chains).
+ *
+ * Kept separate from agx_g17p_compression_color_format() because a wide MRT
+ * framebuffer (e.g. eight 16-byte targets = 128 bytes > G17P's 120-byte
+ * tilebuffer sample budget) spills the tail attachment; Gallium handles that
+ * by pre-decompressing spilling private targets via agx_decompress() in
+ * agx_set_framebuffer_state(). Multisample 16-byte targets stay uncompressed.
+ */
+static inline bool
+agx_g17p_compression_color_format_16b(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R32G32B32X32_FLOAT:
+   case PIPE_FORMAT_R32G32B32X32_UINT:
+   case PIPE_FORMAT_R32G32B32X32_SINT:
+      return true;
+   default:
+      return false;
+   }
+}

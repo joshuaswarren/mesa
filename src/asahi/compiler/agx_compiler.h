@@ -30,6 +30,13 @@ extern "C" {
 /* G18G's ordinary register file ends at r125 (half 251). */
 #define AGX3D_NUM_REGS (252)
 
+/* Register budget, in halves, of M5 compute kernels that use native ray
+ * traversal. Value from 7c91dddf53f (the M5 userspace snapshot), measured on
+ * M5 hardware with the full-resolution RT workload: 160 halves was faster
+ * than 128 and 192. Not derived; the snapshot records no numbers.
+ */
+#define AGX_M5_RT_REGISTER_BUDGET 160u
+
 /* u0-u255 inclusive, as pairs of 16-bits */
 #define AGX_NUM_UNIFORMS (512)
 
@@ -602,6 +609,15 @@ typedef struct agx_block {
    uint8_t pass_flags;
 } agx_block;
 
+/* How the AGX3 packer lets a loop's breaks leave it (agx3_slot_core.h). */
+enum agx3_break_joins {
+   /* Join a break's state into its loop's pop where that gains something
+    * (agx3_break_keeps_state()), drain it otherwise. */
+   AGX3_BREAKS_JOIN_GAINFUL = 0,
+   AGX3_BREAKS_JOIN_ALL,
+   AGX3_BREAKS_DRAIN,
+};
+
 typedef struct {
    nir_shader *nir;
    mesa_shader_stage stage;
@@ -722,6 +738,11 @@ typedef struct {
    unsigned loop_count;
    unsigned max_reg;
 
+   /* Immediate moves and uniform-file copies inside loops after register
+    * allocation, for shader statistics. */
+   unsigned loop_immediates;
+   unsigned loop_uniform_copies;
+
    /* Half of the AGX3 compiler staging footprint. Unlike max_reg, this
     * describes the separate file consumed by UVSW and texture inputs. */
    unsigned agx3_staging_halfs;
@@ -730,11 +751,35 @@ typedef struct {
     * how far its texture reads reached and how many halves the outputs and
     * any image-write bank need above them. */
    unsigned agx3_g18g_output_staging_floor;
+
+   /* Pack with a scoreboard drain at every control-flow boundary, as the
+    * retry when keeping results in flight into if arms leaves a wait no
+    * instruction form can carry (agx3_pack_program()). */
+   bool agx3_cf_drain_all;
+   /* Pack with a drain at every loop entry, and what the last pack did:
+    * how many loop entries kept results in flight, and how many wait
+    * carriers it emitted inside loops (agx3_pack_program()). */
+   bool agx3_loop_entry_drain_all;
+   unsigned agx3_kept_loop_entries;
+   unsigned agx3_loop_carriers;
+   /* Pack with an if's arms draining at their ends instead of joining, and
+    * how many arm ends of the last pack the join kept from draining
+    * (agx3_pack_program()). */
+   bool agx3_arm_join_off;
+   unsigned agx3_joined_arm_drains;
+   /* How a pack's breaks leave their loops (enum agx3_break_joins), and of
+    * the last pack how many breaks a join kept from draining something and
+    * how many joining breaks drain because joining gained nothing
+    * (agx3_pack_program()). */
+   uint8_t agx3_break_joins;
+   unsigned agx3_joined_breaks;
+   unsigned agx3_refused_breaks;
    unsigned agx3_g18g_read_staging_end;
    unsigned agx3_g18g_output_staging_span;
    bool agx3_staging_known;
    bool agx3_fltnorm_start;
    bool agx3_mrt_tile_ops_ordered;
+   bool agx3_local_read_tile_ops;
    /* The packer emitted this fragment's tile accesses through the native1130
     * mixed-format protocol, inside its 0x200 entry and final release (run
     * 1139); its reads then take the long LLDCol form. */
@@ -1287,6 +1332,7 @@ void agx_materialize_agx3_cf_constants(agx_context *ctx);
 void agx_opt_cse(agx_context *ctx);
 bool agx_opt_collect_split(agx_context *ctx);
 void agx_opt_cse_pressure(agx_context *ctx);
+bool agx_opt_licm(agx_context *ctx, unsigned max_demand, unsigned file_regs);
 void agx_opt_cse_bounded(agx_context *ctx);
 bool agx_can_rematerialize_uniform(const agx_context *ctx, const agx_instr *I);
 bool agx_has_uniform_store(const agx_context *ctx);
@@ -1369,6 +1415,9 @@ void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
 void agx_ra_without_remat(agx_context *ctx);
+bool agx_ra_find_regs_simple(const BITSET_WORD *used, unsigned count,
+                             unsigned align, unsigned minimum, unsigned limit,
+                             unsigned *out);
 bool agx3_is_async(const agx_instr *I);
 unsigned agx_calc_register_demand(agx_context *ctx, bool remat);
 unsigned agx3_tile_store_bank(agx_context *ctx);
@@ -1612,6 +1661,8 @@ bool agx_nir_lower_ubo(nir_shader *shader);
 bool agx_nir_lower_shared_bitsize(nir_shader *shader, bool element_indices);
 bool agx_nir_lower_frag_sidefx(nir_shader *s, bool g17p);
 void agx_lower_agx3_fma_sources(agx_context *ctx);
+void agx_lower_agx3_half_converts(agx_context *ctx);
+void agx_opt_agx3_normflt_byte_pairs(agx_context *ctx);
 void agx_materialize_agx3_alu_constants(agx_context *ctx);
 void agx_lower_agx3_mixed_width_unary(agx_context *ctx);
 bool agx_lower_g17g_retry_float_operands(agx_context *ctx);
@@ -1642,6 +1693,7 @@ bool agx3_sink_vertex_outputs(agx_context *ctx);
 bool agx3_coalesce_uniform_half_stores(agx_context *ctx);
 
 bool agx_lower_agx3_device_atomic_sources(agx_context *ctx);
+nir_alu_type agx_image_store_base_type(const nir_intrinsic_instr *intr);
 
 #ifdef __cplusplus
 } /* extern C */

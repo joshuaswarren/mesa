@@ -779,6 +779,51 @@ TEST(Tilebuffer, G17PCompressedTwoSampleTargetsStayResident)
    EXPECT_TRUE(multiview.spilled[5]);
 }
 
+TEST(Tilebuffer, M5CompressedFourSampleInputAttachmentStaysResident)
+{
+   /* M5 at 4x: a 64 KiB tile holds 64 bytes per sample. Seven RGBA32F
+    * uncompressed attachments (112 B/sample) plus a compressed RGBA16F MSAA4
+    * input attachment on RT7 exceed the tilebuffer; plain descending-alignment
+    * order spills RT7. Pinning RT7 via resident_mask keeps it resident and
+    * spills wider uncompressed RGBA32F targets instead. */
+   enum pipe_format formats[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R16G16B16A16_FLOAT,
+   };
+   const auto plain = agx_build_tilebuffer_layout_resident(
+      formats, 8, 4, false, AGX_MAX_RENDER_TARGETS * 16, 65536, 2048, 0);
+   EXPECT_TRUE(plain.spilled[7]);
+   EXPECT_FALSE(plain.spilled[0]);
+   EXPECT_FALSE(plain.spilled[3]);
+   EXPECT_TRUE(plain.spilled[4]);
+
+   const auto resident = agx_build_tilebuffer_layout_resident(
+      formats, 8, 4, false, AGX_MAX_RENDER_TARGETS * 16, 65536, 2048,
+      BITFIELD_BIT(7));
+   EXPECT_FALSE(resident.spilled[7]);
+   EXPECT_EQ(resident._offset_B[7], 0u);
+   EXPECT_FALSE(resident.spilled[0]);
+   EXPECT_FALSE(resident.spilled[1]);
+   EXPECT_FALSE(resident.spilled[2]);
+   EXPECT_TRUE(resident.spilled[3]);
+   EXPECT_TRUE(resident.spilled[4]);
+   EXPECT_TRUE(resident.spilled[5]);
+   EXPECT_TRUE(resident.spilled[6]);
+   EXPECT_EQ(resident.resident_mask, BITFIELD_BIT(7));
+   EXPECT_EQ(resident.sample_size_B, 56u);
+
+   /* All eight 8-byte compressed MSAA4 targets fit without spilling. */
+   enum pipe_format rgba16f[AGX_MAX_RENDER_TARGETS];
+   for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt)
+      rgba16f[rt] = PIPE_FORMAT_R16G16B16A16_FLOAT;
+   const auto eight = agx_build_tilebuffer_layout_resident(
+      rgba16f, 8, 4, false, AGX_MAX_RENDER_TARGETS * 16, 65536, 2048, 0xff);
+   EXPECT_FALSE(agx_tilebuffer_spills(&eight));
+   EXPECT_EQ(eight.sample_size_B, 64u);
+}
+
 class SampleDepthOrder : public ::testing::Test {
  protected:
    SampleDepthOrder()
@@ -979,4 +1024,131 @@ TEST(Tilebuffer, G17PCompressedColourNeverSpills)
    for (enum pipe_format format : refused)
       EXPECT_FALSE(agx_g17p_compression_color_format(format))
          << util_format_name(format);
+
+   /* 16-byte RGBA32 colour formats live in their own helper so wide-MRT spill
+    * invariants on the <=8-byte set stay explicit. */
+   unsigned admitted_16b = 0;
+   for (unsigned f = 1; f < PIPE_FORMAT_COUNT; ++f) {
+      const enum pipe_format format = (enum pipe_format)f;
+      if (!agx_g17p_compression_color_format_16b(format))
+         continue;
+
+      ++admitted_16b;
+      const char *name = util_format_name(format);
+      EXPECT_FALSE(agx_g17p_compression_color_format(format)) << name;
+      EXPECT_NE(ail_pixel_format[format].renderable, PIPE_FORMAT_NONE) << name;
+      EXPECT_FALSE(util_format_is_depth_or_stencil(format)) << name;
+      EXPECT_EQ(util_format_get_blocksize(format), 16u) << name;
+      EXPECT_TRUE(ail_can_compress(format, 16, 16, 1)) << name;
+      EXPECT_FALSE(ail_can_compress(format, 15, 16, 1)) << name;
+      EXPECT_TRUE(ail_formats_compatible(
+         format, agx_g17p_rt0_pbe_format(util_format_linear(format))))
+         << name;
+
+      enum pipe_format one[AGX_MAX_RENDER_TARGETS] = {format};
+      const auto tib1 = g17p_single_sample_layout(one, 1, false);
+      EXPECT_FALSE(tib1.spilled[0]) << name;
+      EXPECT_EQ(tib1.sample_size_B, 16u) << name;
+
+      /* Eight 16-byte targets exceed G17P's 120-byte budget and spill the
+       * eighth target, which agx_set_framebuffer_state() pre-decompresses. */
+      enum pipe_format eight[AGX_MAX_RENDER_TARGETS];
+      for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt)
+         eight[rt] = format;
+      const auto tib8 =
+         g17p_single_sample_layout(eight, AGX_MAX_RENDER_TARGETS, false);
+      EXPECT_TRUE(agx_tilebuffer_spills(&tib8)) << name;
+      EXPECT_TRUE(tib8.spilled[AGX_MAX_RENDER_TARGETS - 1]) << name;
+   }
+   EXPECT_EQ(admitted_16b, 6u);
+
+   static const enum pipe_format x_variants_16b[][2] = {
+      {PIPE_FORMAT_R32G32B32X32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT},
+      {PIPE_FORMAT_R32G32B32X32_UINT, PIPE_FORMAT_R32G32B32A32_UINT},
+      {PIPE_FORMAT_R32G32B32X32_SINT, PIPE_FORMAT_R32G32B32A32_SINT},
+   };
+   for (const auto &pair : x_variants_16b) {
+      const char *name = util_format_name(pair[0]);
+      EXPECT_TRUE(agx_g17p_compression_color_format_16b(pair[0])) << name;
+      EXPECT_TRUE(agx_g17p_compression_color_format_16b(pair[1])) << name;
+      EXPECT_EQ(ail_pixel_format[pair[0]].channels,
+                ail_pixel_format[pair[1]].channels) << name;
+      EXPECT_EQ(ail_pixel_format[pair[0]].type,
+                ail_pixel_format[pair[1]].type) << name;
+      EXPECT_EQ(ail_pixel_format[pair[0]].renderable,
+                ail_pixel_format[pair[1]].renderable) << name;
+   }
+}
+
+TEST(Tilebuffer, PackFirstIfFitsMovesClearedRTIntoFirst8Bytes)
+{
+   /* Default descending-alignment order puts 16B RGBA32F at [0, 16) and
+    * 4B RGBA8 at [16, 20). Packing RT1 first moves it into [0, 4) without
+    * changing sample_size_B, tile_size, or spilling. */
+   enum pipe_format formats[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   auto tib = agx_build_tilebuffer_layout_with_limits(
+      formats, 2, 4, false, AGX_G17P_MAX_BYTES_PER_SAMPLE, 32768, 2048);
+   EXPECT_EQ(agx_tilebuffer_offset_B(&tib, 0), 0u);
+   EXPECT_EQ(agx_tilebuffer_offset_B(&tib, 1), 16u);
+   EXPECT_EQ(agx_tilebuffer_format_size_B(PIPE_FORMAT_R32G32B32A32_FLOAT), 16u);
+   EXPECT_EQ(agx_tilebuffer_format_size_B(PIPE_FORMAT_R8G8B8A8_UNORM), 4u);
+
+   const uint16_t orig_tile = tib.tile_size;
+   EXPECT_TRUE(agx_tilebuffer_pack_first_if_fits(&tib, BITFIELD_BIT(1), 8));
+   EXPECT_EQ(tib.first_mask, BITFIELD_BIT(1));
+   EXPECT_EQ(agx_tilebuffer_offset_B(&tib, 1), 0u);
+   EXPECT_EQ(agx_tilebuffer_offset_B(&tib, 0), 4u);
+   EXPECT_EQ(tib.tile_size, orig_tile);
+   EXPECT_FALSE(agx_tilebuffer_spills(&tib));
+
+   /* Rebuilding + applying first_mask reproduces the layout byte-for-byte. */
+   auto rebuilt = agx_build_tilebuffer_layout_with_limits(
+      formats, 2, 4, false, AGX_G17P_MAX_BYTES_PER_SAMPLE, 32768, 2048);
+   agx_tilebuffer_apply_first_mask(&rebuilt, tib.first_mask);
+   EXPECT_EQ(memcmp(&rebuilt, &tib, sizeof(tib)), 0);
+
+   /* Already within [0, 8): no-op and first_mask stays 0. */
+   enum pipe_format fits_formats[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   auto already = agx_build_tilebuffer_layout_with_limits(
+      fits_formats, 2, 4, false, AGX_G17P_MAX_BYTES_PER_SAMPLE, 32768, 2048);
+   EXPECT_FALSE(agx_tilebuffer_pack_first_if_fits(&already, BITFIELD_BIT(0), 8));
+   EXPECT_EQ(already.first_mask, 0u);
+
+   /* Moving RT1 (4B) ahead of RT0 (8B) fits RT1 into [0, 4). */
+   EXPECT_TRUE(agx_tilebuffer_pack_first_if_fits(&already, BITFIELD_BIT(1), 8));
+   EXPECT_EQ(already.first_mask, BITFIELD_BIT(1));
+   EXPECT_EQ(agx_tilebuffer_offset_B(&already, 1), 0u);
+   EXPECT_EQ(agx_tilebuffer_offset_B(&already, 0), 4u);
+
+   /* Combined cleared size > 8B: refused and layout stays untouched. */
+   auto wide = agx_build_tilebuffer_layout_with_limits(
+      fits_formats, 2, 4, false, AGX_G17P_MAX_BYTES_PER_SAMPLE, 32768, 2048);
+   const auto wide_orig = wide;
+   EXPECT_FALSE(agx_tilebuffer_pack_first_if_fits(
+      &wide, BITFIELD_BIT(0) | BITFIELD_BIT(1), 8));
+   EXPECT_EQ(memcmp(&wide, &wide_orig, sizeof(wide)), 0);
+
+   /* Deferred MSAA4 tile pass: 3 transient G-buffer targets (DONT_CARE) plus
+    * 1 stored RGBA8 lighting output at RT3. Packing only the stored RT3 puts
+    * it at offset 0 within the 8B uncovered-tile limit without spilling. */
+   enum pipe_format deferred_formats[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   auto def = agx_build_tilebuffer_layout_with_limits(
+      deferred_formats, 4, 4, false, AGX_G17P_MAX_BYTES_PER_SAMPLE, 32768,
+      2048);
+   EXPECT_GT(def.sample_size_B, 8u);
+   EXPECT_GT(agx_tilebuffer_offset_B(&def, 3), 8u);
+   EXPECT_TRUE(agx_tilebuffer_pack_first_if_fits(&def, BITFIELD_BIT(3), 8));
+   EXPECT_EQ(agx_tilebuffer_offset_B(&def, 3), 0u);
+   EXPECT_FALSE(agx_tilebuffer_spills(&def));
 }

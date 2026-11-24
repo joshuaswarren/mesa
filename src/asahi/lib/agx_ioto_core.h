@@ -17,11 +17,7 @@ extern "C" {
 
 #define AGX_IOTO_MAX_RECORD_SIZE 22
 
-/*
- * Raw Ioto encoding points recovered from Apple's G15/G16/G17P and HAL300
- * emitters.  These names identify byte forms only; they assign no semantics
- * to the records' anonymous or opaque fields.
- */
+/* Raw AGX3 Ioto instruction encoding points (byte forms only). */
 enum agx_ioto_kind {
    AGX_IOTO_KIND_INVALID = 0,
    AGX_IOTO_KIND_NOP_EP0,
@@ -116,11 +112,8 @@ bool agx_ioto_decode_one(enum agx_chip chip, const void *stream,
                          size_t available, struct agx_ioto_record *out,
                          size_t *consumed);
 
-/* Decode one exact record while walking the program addressed by an AGX3
- * CDM/VDM pipeline pointer.  In addition to the public Ioto grammar this
- * recognizes the separately witnessed GPU0 inline LDDEV boundary and the
- * four-byte terminal suffix.  Truncated special-form prefixes fail rather
- * than being reinterpreted as another record. */
+/* Decode one record in an AGX3 CDM/VDM pipeline program, including the GPU0
+ * inline LDDEV form and 4-byte terminator; truncated special forms fail. */
 bool agx_ioto_decode_program_record(enum agx_chip chip, const void *stream,
                                     size_t available,
                                     struct agx_ioto_program_record *out,

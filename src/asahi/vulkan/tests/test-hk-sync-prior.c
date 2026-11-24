@@ -192,6 +192,100 @@ test_timestamp_top_in_pass(void)
    }
 }
 
+/* G17P and M5: a leading TOP_OF_PIPE timestamp with no earlier work or barrier
+ * in the command buffer rides on the first stream as an unordered start stamp
+ * (saving a separate carrier command when submission has no prior barrier,
+ * input wait, or GPU query reset), while a TOP_OF_PIPE after a barrier stays
+ * on the end-stamp path. */
+static void
+test_timestamp_leading_top(void)
+{
+   for (unsigned c = 0; c < ARRAY_SIZE(end_stamp_chips); ++c) {
+      /* Compute: leading TOP_OF_PIPE + dispatch + ALL_COMMANDS -> one stream. */
+      struct hk_cmd_buffer *cmd = timestamp_cmd(end_stamp_chips[c], true);
+      const struct agx_timestamp_req top = {
+         .handle = 1, .addr = 0x10000, .offset_B = 0};
+      hk_sync_write_timestamp(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, top);
+      T("leading top stamp defers to pending start",
+        cmd->sync.pending_start_ts.handle == 1 &&
+        cmd->sync.pending_start_ts_unordered &&
+        list_is_empty(&cmd->control_streams));
+
+      struct hk_cs *dispatch = add(cmd, true);
+      cmd->current_cs.cs = dispatch;
+      dispatch->stats.cmds++;
+      T("first compute stream takes unordered start stamp",
+        dispatch->timestamp.start.handle == 1 &&
+        dispatch->timestamp.start.offset_B == 0 &&
+        dispatch->unordered_start_ts &&
+        cmd->sync.has_unordered_start_ts &&
+        !cmd->sync.pending_start_ts.handle &&
+        !cmd->sync.pending_start_ts_unordered);
+
+      end_timestamp(cmd, 1);
+      T("leading top plus bottom stays one stream",
+        list_length(&cmd->control_streams) == 1 &&
+        dispatch->timestamp.end.handle == 1 &&
+        dispatch->timestamp.end.offset_B == 8);
+
+      /* Clean queue has no tail; barrier-only submit raises tail once and
+       * later unbarriered submits do not raise it again; fallback carrier
+       * shifts ordinal to 2. */
+      struct hk_queue *q = new_queue(true);
+      uint64_t zero_tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ] = {0};
+      T("fresh queue has zero tail",
+        memcmp(q->sync.tail, zero_tail, sizeof(zero_tail)) == 0);
+      T("leading top resolves on clean queue", submit(q, cmd));
+      T("unbarriered submit leaves tail unchanged",
+        memcmp(q->sync.tail, zero_tail, sizeof(zero_tail)) == 0);
+
+      struct hk_cmd_buffer *bar = timestamp_cmd(end_stamp_chips[c], true);
+      hk_sync_barrier(bar, HK_SYNC_ALL, HK_SYNC_ALL);
+      T("barrier-only submit resolves", submit(q, bar));
+      T("barrier-only submit raises queue tail",
+        memcmp(q->sync.tail, zero_tail, sizeof(zero_tail)) != 0);
+
+      uint64_t saved_tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
+      memcpy(saved_tail, q->sync.tail, sizeof(saved_tail));
+      struct hk_cmd_buffer *one[] = {cmd};
+      T("fallback carrier resolves with shifted ordinal",
+        hk_sync_resolve_submit(q, one, 1, true, false, 0, NULL) &&
+        dispatch->sync.index == 2 &&
+        dispatch->sync.barrier[HK_SYNC_CDM] == 1);
+      T("unbarriered submit after tail does not raise tail further",
+        memcmp(q->sync.tail, saved_tail, sizeof(saved_tail)) == 0);
+
+      /* Render: leading TOP_OF_PIPE before BeginRendering rides on VDM start. */
+      struct hk_cmd_buffer *rcmd = timestamp_cmd(end_stamp_chips[c], true);
+      hk_sync_write_timestamp(rcmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, top);
+      hk_sync_begin_rendering(rcmd, false);
+      struct hk_cs *render = add(rcmd, false);
+      T("first render takes unordered start stamp",
+        render->timestamp.start.handle == 1 &&
+        render->unordered_start_ts &&
+        rcmd->sync.has_unordered_start_ts);
+
+      /* A TOP_OF_PIPE recorded after a barrier in the same command buffer
+       * must NOT defer to unordered_start_ts -- even when no stream has been
+       * recorded yet (exercises the sync_state_has_req() branch directly). */
+      struct hk_cmd_buffer *bcmd = timestamp_cmd(end_stamp_chips[c], true);
+      T("fresh cmdbuf can defer leading top stamp",
+        hk_sync_can_defer_unordered_start_ts(bcmd));
+      hk_sync_barrier(bcmd, HK_SYNC_ALL, HK_SYNC_ALL);
+      T("barrier records pending req before top stamp",
+        bcmd->sync.req[0][HK_SYNC_VDM].prior != 0);
+      T("barrier with no stream prevents unordered top deferral",
+        !hk_sync_can_defer_unordered_start_ts(bcmd));
+      struct hk_cs *prev = add(bcmd, true);
+      prev->stats.cmds++;
+      hk_sync_write_timestamp(bcmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, top);
+      T("top stamp after barrier stays ordered end stamp",
+        !bcmd->sync.pending_start_ts.handle &&
+        !bcmd->sync.has_unordered_start_ts &&
+        prev->timestamp.end.handle == 1);
+   }
+}
+
 /* Exercise actual timestamp placement, barriers and the submission resolver.
  * Existing query-command scopes are not removed by the timestamp scope's
  * redundant same-engine execution edge. No command payload or GPU is needed.
@@ -199,13 +293,28 @@ test_timestamp_top_in_pass(void)
 static void
 test_timestamp_execution_scopes(void)
 {
-   for (unsigned exact = 0; exact < 2; ++exact) {
+   T("start_stamps_ordered distinguishes G16G/AGX2 from G17P/M5",
+     agx_chip_start_stamps_ordered(AGX_CHIP_G13G) &&
+     agx_chip_start_stamps_ordered(AGX_CHIP_G14G) &&
+     agx_chip_start_stamps_ordered(AGX_CHIP_G15G) &&
+     agx_chip_start_stamps_ordered(AGX_CHIP_G16G) &&
+     !agx_chip_start_stamps_ordered(AGX_CHIP_G17P) &&
+     !agx_chip_start_stamps_ordered(AGX_CHIP_G17G) &&
+     !agx_chip_start_stamps_ordered(AGX_CHIP_G17S) &&
+     !agx_chip_start_stamps_ordered(AGX_CHIP_G17C));
+
+   const enum agx_chip ts_chips[] = {
+      AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   };
+   for (unsigned c = 0; c < ARRAY_SIZE(ts_chips); ++c) {
+      const enum agx_chip chip = ts_chips[c];
+      for (unsigned exact = 0; exact < 2; ++exact) {
       struct hk_queue *queue = new_queue(exact);
-      struct hk_cmd_buffer *first = timestamp_cmd(AGX_CHIP_G17P, exact);
+      struct hk_cmd_buffer *first = timestamp_cmd(chip, exact);
       add(first, true);
       end_timestamp(first, 0);
       T("first timed compute resolves", submit(queue, first));
-      struct hk_cmd_buffer *second = timestamp_cmd(AGX_CHIP_G17P, exact);
+      struct hk_cmd_buffer *second = timestamp_cmd(chip, exact);
       struct hk_cs *timed = add(second, true);
       end_timestamp(second, 1);
       T("next timed compute resolves", submit(queue, second));
@@ -218,7 +327,7 @@ test_timestamp_execution_scopes(void)
        * that genuine scope through the production barrier entry point before
        * the consumer, then add a timestamp to it and resolve both submissions.
        */
-      struct hk_cmd_buffer *query = timestamp_cmd(AGX_CHIP_G17P, exact);
+      struct hk_cmd_buffer *query = timestamp_cmd(chip, exact);
       hk_sync_barrier(query, HK_SYNC_ALL, HK_SYNC_ALL);
       struct hk_cs *copy = add(query, true);
       copy->g17p_timestamp_query = true;
@@ -228,10 +337,10 @@ test_timestamp_execution_scopes(void)
         exact ? copy->sync.prior[HK_SYNC_CDM] == 2
               : copy->sync.barrier[HK_SYNC_CDM] == 0);
 
-      struct hk_cmd_buffer *barrier = timestamp_cmd(AGX_CHIP_G17P, exact);
+      struct hk_cmd_buffer *barrier = timestamp_cmd(chip, exact);
       hk_sync_barrier(barrier, HK_SYNC_ALL, HK_SYNC_ALL);
       T("standalone query ordering resolves", submit(queue, barrier));
-      struct hk_cmd_buffer *after = timestamp_cmd(AGX_CHIP_G17P, exact);
+      struct hk_cmd_buffer *after = timestamp_cmd(chip, exact);
       struct hk_cs *inherited = add(after, true);
       end_timestamp(after, 3);
       T("later timestamp with carried requirements resolves", submit(queue, after));
@@ -240,10 +349,10 @@ test_timestamp_execution_scopes(void)
               : inherited->sync.barrier[HK_SYNC_CDM] == 0);
 
       queue = new_queue(exact);
-      first = timestamp_cmd(AGX_CHIP_G17P, exact);
+      first = timestamp_cmd(chip, exact);
       add(first, false);
       T("earlier render resolves", submit(queue, first));
-      second = timestamp_cmd(AGX_CHIP_G17P, exact);
+      second = timestamp_cmd(chip, exact);
       timed = add(second, true);
       end_timestamp(second, 4);
       T("timestamp after render resolves", submit(queue, second));
@@ -252,11 +361,11 @@ test_timestamp_execution_scopes(void)
               : timed->sync.barrier[HK_SYNC_VDM] == 0);
 
       queue = new_queue(exact);
-      first = timestamp_cmd(AGX_CHIP_G17P, exact);
+      first = timestamp_cmd(chip, exact);
       add(first, true);
       end_timestamp(first, 5);
       T("reset producer timestamp resolves", submit(queue, first));
-      struct hk_cmd_buffer *reset_cmd = timestamp_cmd(AGX_CHIP_G17P, exact);
+      struct hk_cmd_buffer *reset_cmd = timestamp_cmd(chip, exact);
       hk_sync_barrier(reset_cmd, HK_SYNC_ALL, HK_SYNC_ALL);
       struct hk_cs *reset = add(reset_cmd, true);
       reset->g17p_timestamp_query = true;
@@ -271,10 +380,10 @@ test_timestamp_execution_scopes(void)
         later->sync.barrier[HK_SYNC_CDM] == 1);
 
       queue = new_queue(exact);
-      first = timestamp_cmd(AGX_CHIP_G17P, exact);
+      first = timestamp_cmd(chip, exact);
       add(first, true);
       T("render timestamp compute source resolves", submit(queue, first));
-      second = timestamp_cmd(AGX_CHIP_G17P, exact);
+      second = timestamp_cmd(chip, exact);
       struct hk_cs *render = add(second, false);
       end_timestamp(second, 7);
       T("render end timestamp resolves", submit(queue, second));
@@ -283,8 +392,12 @@ test_timestamp_execution_scopes(void)
               : render->sync.barrier[HK_SYNC_CDM] == 0);
    }
 
+   }
+
+   /* Unqualified targets (AGX2 and future G18G) retain the original same-CDM
+    * timestamp prefix even if exact-prior barriers are advertised. */
    for (unsigned chip = 0; chip < 2; ++chip) {
-      const enum agx_chip target = chip ? AGX_CHIP_G16G : AGX_CHIP_G13G;
+      const enum agx_chip target = chip ? AGX_CHIP_G18G : AGX_CHIP_G13G;
       struct hk_queue *queue = new_queue(true);
       struct hk_cmd_buffer *first = timestamp_cmd(target, true);
       add(first, true);
@@ -297,12 +410,110 @@ test_timestamp_execution_scopes(void)
         timed->sync.prior[HK_SYNC_CDM] == 1);
    }
 }
+/* A timestamp-only command (HK_SYNC_STAMP) waits like work of every class
+ * but is in no application first scope: a barrier, a later command buffer
+ * and a later submission order renders and dispatches after the work around
+ * it, never after it. Query commands still follow it. */
+static void
+test_stamp_kind_isolation(void)
+{
+   for (unsigned exact = 0; exact < 2; ++exact) {
+      struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G17S, exact);
+      struct hk_cs *work = add(cmd, true);
+      hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
+      cmd->sync.kind_override = HK_SYNC_STAMP;
+      struct hk_cs *carrier = add(cmd, true);
+      cmd->sync.kind_override = 0;
+      T("timestamp stream takes the requirements of every class",
+        carrier->sync.dep[HK_SYNC_CDM].cut == work &&
+        (hk_sync_full_kinds(carrier->sync.kind) & HK_SYNC_ALL) == HK_SYNC_ALL);
+      hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+      struct hk_cs *render = add(cmd, false);
+      struct hk_cs *after = add(cmd, true);
+      T("ALL_COMMANDS barrier orders later work after work, not the stamp",
+        render->sync.dep[HK_SYNC_CDM].cut == work &&
+        after->sync.dep[HK_SYNC_CDM].cut == work);
+      struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+      hk_sync_src_dep(cmd, HK_SYNC_ALL, NULL, dep);
+      T("application scope skips the stamp",
+        dep[HK_SYNC_CDM].cut == after);
+      hk_sync_src_dep(cmd, hk_sync_stamp_scope(HK_SYNC_GFX), NULL, dep);
+      T("a timestamp's scope names the stamp",
+        dep[HK_SYNC_CDM].cut == carrier);
+      T("an empty timestamp scope names nothing",
+        hk_sync_stamp_scope(0) == 0);
+
+      /* Across submissions: the stamp alone on the compute subqueue. */
+      struct hk_queue *q = new_queue(exact);
+      struct hk_cmd_buffer *first = timestamp_cmd(AGX_CHIP_G17S, exact);
+      add(first, false);
+      first->sync.kind_override = HK_SYNC_STAMP;
+      struct hk_cs *stamp = add(first, true);
+      first->sync.kind_override = 0;
+      T("stamp submission resolves", submit(q, first));
+      struct hk_cmd_buffer *app = timestamp_cmd(AGX_CHIP_G17S, exact);
+      hk_sync_barrier(app, HK_SYNC_ALL, HK_SYNC_ALL);
+      struct hk_cs *dispatch = add(app, true);
+      T("later dispatch resolves", submit(q, app));
+      T("later dispatch does not wait for the stamp",
+        dispatch->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+        dispatch->sync.prior[HK_SYNC_CDM] == 0);
+      /* And a query command right after it, on a queue of its own. */
+      struct hk_queue *qq = new_queue(exact);
+      struct hk_cmd_buffer *stamped = timestamp_cmd(AGX_CHIP_G17S, exact);
+      add(stamped, false);
+      stamped->sync.kind_override = HK_SYNC_STAMP;
+      struct hk_cs *only = add(stamped, true);
+      stamped->sync.kind_override = 0;
+      T("second stamp submission resolves", submit(qq, stamped));
+      struct hk_cmd_buffer *query = timestamp_cmd(AGX_CHIP_G17S, exact);
+      hk_sync_barrier(query, HK_SYNC_QUERY_SCOPE, HK_SYNC_ALL);
+      struct hk_cs *copy = add(query, true);
+      T("later query command resolves", submit(qq, query));
+      T("later query command waits for the stamp",
+        exact ? copy->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+                   copy->sync.prior[HK_SYNC_CDM] == only->sync.index
+              : copy->sync.barrier[HK_SYNC_CDM] == 0);
+      T("the stamp submission's compute command is the stamp",
+        stamp->sync.index == 1 && only->sync.index == 1);
+   }
+}
+
 /* Fixtures never queue immediate writes. Emitting one is a bug. */
 void
 hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    (void)cmd;
    (void)cs;
+   abort();
+}
+
+/* hk_cmd_buffer_get_cs_general() serves every stream slot; fixtures never
+ * open a graphics or pre-graphics stream through it. */
+void
+hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
+bool
+hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+   abort();
+}
+
+/* Fixtures never copy timestamps. Emitting a copy is a bug. */
+void
+hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                       const struct hk_stamp_copy *copies, unsigned count)
+{
+   (void)cmd;
+   (void)cs;
+   (void)copies;
+   (void)count;
    abort();
 }
 
@@ -1114,6 +1325,41 @@ test_g17p_tiling_order(void)
    T("ordinals across submissions",
      hk_drm_g17p_tiling_ordered(40, 0, 40, 39, false, &c) && c == 39 &&
      !hk_drm_g17p_tiling_ordered(40, 0, 40, 40, false, &c) && c == 40);
+}
+
+/* Sibling kernel queues: once siblings have run compute work, the primary
+ * kernel queue's compute ordinals run ahead of the queue's own (base 20,
+ * kernel queue 50). Both prefixes of a split render, the whole one and the
+ * tiling half's, are rewritten the same way. */
+static void
+test_sibling_prefix(void)
+{
+   const uint64_t base[2] = {10, 20};
+   const uint64_t kq_base[2] = {10, 50};
+   const uint16_t none[2] = {DRM_ASAHI_BARRIER_NONE, DRM_ASAHI_BARRIER_NONE};
+
+   bool earlier = false;
+   uint64_t whole[2] = {12, 23};
+   hk_drm_sibling_prefix(whole, none, base, kq_base, &earlier);
+   T("a command of this submission keeps its offset",
+     whole[0] == 12 && whole[1] == 53 && !earlier);
+
+   uint64_t tiling[2] = {0, 22};
+   hk_drm_sibling_prefix(tiling, none, base, kq_base, &earlier);
+   T("the tiling half's prior moves with the whole prior",
+     tiling[0] == 0 && tiling[1] == 52 && !earlier);
+
+   uint64_t older[2] = {0, 15};
+   hk_drm_sibling_prefix(older, none, base, kq_base, &earlier);
+   T("an earlier submission's command names the kernel queue's earlier work",
+     older[0] == 0 && older[1] == 50 && earlier);
+
+   earlier = false;
+   const uint16_t zero_cdm[2] = {DRM_ASAHI_BARRIER_NONE, 0};
+   uint64_t header0[2] = {0, 0};
+   hk_drm_sibling_prefix(header0, zero_cdm, base, kq_base, &earlier);
+   T("a zero tiling barrier waits for the siblings' work",
+     header0[0] == 0 && header0[1] == 0 && earlier);
 }
 
 /* G17P image barriers order a render's vertex half only once it draws with a
@@ -2016,6 +2262,206 @@ test_direct_single_footprints(void)
    }
 }
 
+/* A dependency into DRAW_INDIRECT names every logically later graphics stage
+ * too (Vulkan 1.4, 7.1.2), so a render of direct draws waits for the compute
+ * work in its vertex half as in its fragment half. The same dependency
+ * recorded by an acceleration-structure build between its own dispatches
+ * orders only the build's compute work; the application's dependency on the
+ * build still orders later renders. */
+static void
+test_draw_indirect_scope(void)
+{
+   const uint8_t src = hk_sync_kinds_src(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+   const uint8_t dst = hk_sync_kinds_dst(VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+                                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+   T("DRAW_INDIRECT names graphics and compute work",
+     (dst & HK_SYNC_GFX) && (dst & HK_SYNC_COMPUTE));
+
+   for (unsigned build = 0; build < 2; ++build) {
+      struct hk_cmd_buffer *cmd = new_cmd();
+      struct hk_cs *comp = add(cmd, true);
+      cmd->sync.as_build = build;
+      hk_sync_barrier(cmd, src, dst);
+      struct hk_cs *next = add(cmd, true);
+      cmd->sync.as_build = false;
+
+      hk_sync_begin_rendering(cmd, false);
+      struct hk_cs *gfx = add(cmd, false);
+      hk_sync_end_rendering(cmd, false);
+
+      T("the dependency orders the next dispatch",
+        next->sync.dep[HK_SYNC_CDM].cut == comp);
+      if (!build) {
+         T("a render of direct draws waits in its vertex half",
+           gfx->sync.dep_ta[HK_SYNC_CDM].cut &&
+              gfx->sync.dep_ta[HK_SYNC_CDM].cut->sync.seq >= comp->sync.seq);
+         T("and in its fragment half",
+           gfx->sync.dep[HK_SYNC_CDM].cut &&
+              gfx->sync.dep[HK_SYNC_CDM].cut->sync.seq >= comp->sync.seq);
+      } else {
+         T("a build's own dependency leaves the render unordered",
+           gfx->sync.dep_ta[HK_SYNC_CDM].cut == NULL &&
+              gfx->sync.dep[HK_SYNC_CDM].cut == NULL);
+      }
+
+      /* The application's dependency after the build. */
+      hk_sync_barrier(cmd, src, dst);
+      hk_sync_begin_rendering(cmd, false);
+      struct hk_cs *later = add(cmd, false);
+      hk_sync_end_rendering(cmd, false);
+      T("an application dependency after the build orders later renders",
+        later->sync.dep_ta[HK_SYNC_CDM].cut == next &&
+           later->sync.dep[HK_SYNC_CDM].cut == next);
+   }
+}
+
+/* U1/U2: native AGX3 and M5 keep independent compute streams split so later
+ * barriers do not retroactively stall earlier compute behind a render or
+ * delay a graphics consumer behind independent post-barrier compute. */
+static void
+test_cdm_overlap_splits(void)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(end_stamp_chips); ++i) {
+      const enum agx_chip chip = end_stamp_chips[i];
+
+      /* U1 same-CB: R1 -> C1(indep) -> barrier(GFX->COMPUTE) -> C2 */
+      {
+         struct hk_queue *q = new_queue(true);
+         struct hk_cmd_buffer *cmd = timestamp_cmd(chip, true);
+         struct hk_cs *r1 = add(cmd, false);
+         r1->stats.cmds = 1;
+         struct hk_cs *c1 = add(cmd, true);
+         cmd->current_cs.cs = c1;
+         c1->stats.cmds = 1;
+         hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_COMPUTE);
+         hk_sync_check_cs(cmd);
+         T("U1 same-CB closes C1 before render-dependent C2",
+           cmd->current_cs.cs == NULL);
+         T("U1 same-CB C1 keeps no VDM wait",
+           c1->sync.dep[HK_SYNC_VDM].cut == NULL &&
+           c1->sync.dep[HK_SYNC_VDM].prior == 0);
+         struct hk_cs *c2 = add(cmd, true);
+         c2->stats.cmds = 1;
+         T("U1 same-CB C2 waits for R1", c2->sync.dep[HK_SYNC_VDM].cut == r1);
+         T("U1 same-CB merge_delays preserves split",
+           hk_sync_merge_delays(cmd, c1, c2));
+         T("U1 same-CB resolves", submit(q, cmd));
+         T("U1 same-CB C1 has no VDM barrier, C2 waits for R1",
+           c1->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+           c1->sync.prior[HK_SYNC_VDM] == 0 &&
+           c2->sync.barrier[HK_SYNC_VDM] == 1);
+      }
+
+      /* U1 cross-CB prior: CB1(R1), CB2(C1 -> barrier(GFX->COMPUTE) -> C2) */
+      {
+         struct hk_queue *q = new_queue(true);
+         struct hk_cmd_buffer *cb1 = timestamp_cmd(chip, true);
+         struct hk_cs *r1 = add(cb1, false);
+         r1->stats.cmds = 1;
+         T("U1 cross-CB CB1 resolves", submit(q, cb1));
+
+         struct hk_cmd_buffer *cb2 = timestamp_cmd(chip, true);
+         struct hk_cs *c1 = add(cb2, true);
+         cb2->current_cs.cs = c1;
+         c1->stats.cmds = 1;
+         hk_sync_barrier(cb2, HK_SYNC_GFX, HK_SYNC_COMPUTE);
+         hk_sync_check_cs(cb2);
+         T("U1 cross-CB closes C1 before prior-VDM-dependent C2",
+           cb2->current_cs.cs == NULL);
+         T("U1 cross-CB C1 keeps no prior VDM wait",
+           c1->sync.dep[HK_SYNC_VDM].prior == 0);
+         struct hk_cs *c2 = add(cb2, true);
+         c2->stats.cmds = 1;
+         T("U1 cross-CB C2 carries prior VDM wait",
+           c2->sync.dep[HK_SYNC_VDM].prior != 0);
+         T("U1 cross-CB merge_delays preserves split",
+           hk_sync_merge_delays(cb2, c1, c2));
+         T("U1 cross-CB CB2 resolves", submit(q, cb2));
+         T("U1 cross-CB C1 prior_vdm=0, C2 prior_vdm=1",
+           c1->sync.prior[HK_SYNC_VDM] == 0 &&
+           c2->sync.prior[HK_SYNC_VDM] == 1);
+      }
+
+      /* U2 same-CB: C1 -> barrier(COMPUTE->GFX) -> C2(indep) -> R1 */
+      {
+         struct hk_queue *q = new_queue(true);
+         struct hk_cmd_buffer *cmd = timestamp_cmd(chip, true);
+         struct hk_cs *c1 = add(cmd, true);
+         cmd->current_cs.cs = c1;
+         c1->stats.cmds = 1;
+         hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+         hk_sync_check_cs(cmd);
+         T("U2 same-CB closes C1 after COMPUTE->GFX barrier",
+           cmd->current_cs.cs == NULL);
+         struct hk_cs *c2 = add(cmd, true);
+         cmd->current_cs.cs = c2;
+         c2->stats.cmds = 1;
+         struct hk_cs *r1 = add(cmd, false);
+         r1->stats.cmds = 1;
+         T("U2 same-CB R1 waits on C1 not C2",
+           r1->sync.dep[HK_SYNC_CDM].cut == c1);
+         T("U2 same-CB merge_delays preserves C1/C2 split",
+           hk_sync_merge_delays(cmd, c1, c2));
+         T("U2 same-CB resolves", submit(q, cmd));
+         T("U2 same-CB R1 barrier_cdm=1 while C2 index=2",
+           r1->sync.barrier[HK_SYNC_CDM] == 1 && c2->sync.index == 2);
+      }
+
+      /* U2 cross-CB: CB1(C1 -> barrier(COMPUTE->GFX) -> C2), CB2(R1) */
+      {
+         struct hk_queue *q = new_queue(true);
+         struct hk_cmd_buffer *cb1 = timestamp_cmd(chip, true);
+         struct hk_cs *c1 = add(cb1, true);
+         cb1->current_cs.cs = c1;
+         c1->stats.cmds = 1;
+         hk_sync_barrier(cb1, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+         hk_sync_check_cs(cb1);
+         T("U2 cross-CB closes C1", cb1->current_cs.cs == NULL);
+         struct hk_cs *c2 = add(cb1, true);
+         c2->stats.cmds = 1;
+         T("U2 cross-CB merge_delays preserves C1/C2 split for tail GFX req",
+           hk_sync_merge_delays(cb1, c1, c2));
+         T("U2 cross-CB CB1 resolves", submit(q, cb1));
+
+         struct hk_cmd_buffer *cb2 = timestamp_cmd(chip, true);
+         struct hk_cs *r1 = add(cb2, false);
+         r1->stats.cmds = 1;
+         T("U2 cross-CB CB2 resolves", submit(q, cb2));
+         T("U2 cross-CB R1 prior_cdm=1 (C1) not 2 (C2)",
+           r1->sync.prior[HK_SYNC_CDM] == 1 && q->sync.submitted[HK_SYNC_CDM] == 2);
+      }
+
+      /* U2 re-merge: C1 -> bar(C->G) -> C2 -> bar(C->G) allows merging C1+C2 */
+      {
+         struct hk_cmd_buffer *cmd = timestamp_cmd(chip, true);
+         struct hk_cs *c1 = add(cmd, true);
+         cmd->current_cs.cs = c1;
+         c1->stats.cmds = 1;
+         hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+         hk_sync_check_cs(cmd);
+         struct hk_cs *c2 = add(cmd, true);
+         cmd->current_cs.cs = c2;
+         c2->stats.cmds = 1;
+         hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+         T("U2 later COMPUTE->GFX barrier lets C1 and C2 merge",
+           !hk_sync_merge_delays(cmd, c1, c2));
+      }
+   }
+
+   /* Unmeasured chips (G15, G16G) do not enable compute overlap splits yet. */
+   const enum agx_chip excluded[] = {AGX_CHIP_G15G, AGX_CHIP_G16G};
+   for (unsigned i = 0; i < ARRAY_SIZE(excluded); ++i) {
+      struct hk_cmd_buffer *cmd = timestamp_cmd(excluded[i], true);
+      struct hk_cs *c1 = add(cmd, true);
+      cmd->current_cs.cs = c1;
+      c1->stats.cmds = 1;
+      hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+      hk_sync_check_cs(cmd);
+      T("unmeasured chip keeps C1 open (no extra CDM split)",
+        cmd->current_cs.cs == c1);
+   }
+}
+
 int
 main(void)
 {
@@ -2026,6 +2472,7 @@ main(void)
    test_precise_tile_evictions();
    test_direct_single_footprints();
    test_xfer_write_order();
+   test_draw_indirect_scope();
    test_barrier_chains_without_work();
    test_multiview_layer_preservation();
    test_compute_clear_layer_preservation();
@@ -2037,12 +2484,16 @@ main(void)
    test_discard_transition_carry();
    test_g17p_vertex_after_memory_writers();
    test_g17p_tiling_order();
+   test_sibling_prefix();
    test_chain_first_skips_empty_buffers();
    test_repeated_recording();
    test_rt_kernel_gate();
    test_timestamp_execution_scopes();
    test_timestamp_reused_compute();
    test_timestamp_top_in_pass();
+   test_timestamp_leading_top();
+   test_stamp_kind_isolation();
+   test_cdm_overlap_splits();
    {
       /* A submission longer than the 16-bit barrier field: a wait on a
        * command past it is named by its ordinal (that command went in an
@@ -2240,6 +2691,29 @@ main(void)
                                                  .prior_vdm = 17,
                                                  .prior_cdm = 29};
    T("legacy compute bytes", memcmp(&lc, &ec, sizeof(lc)) == 0);
+   /* Do not merge a later independent compute stream into an earlier compute
+    * stream that a subsequent graphics pass waits on (e.g. AS build after
+    * deform ahead of a G-buffer pass). */
+   {
+      struct hk_cmd_buffer *m = new_cmd();
+      hk_cmd_buffer_device(m)->dev.chip = AGX_CHIP_G17C;
+      struct hk_cs *deform = add(m, true);
+      deform->stats.cmds = 1;
+      struct hk_cs *as_build = add(m, true);
+      as_build->stats.cmds = 1;
+      struct hk_cs *render = add(m, false);
+      render->stats.cmds = 1;
+      render->sync.dep[HK_SYNC_CDM].cut = deform;
+      T("merge delays when later render waits on earlier compute",
+        hk_sync_merge_delays(m, deform, as_build));
+      render->sync.dep[HK_SYNC_CDM].cut = NULL;
+      render->sync.dep_ta[HK_SYNC_CDM].cut = deform;
+      T("merge delays when later render TA waits on earlier compute",
+        hk_sync_merge_delays(m, deform, as_build));
+      render->sync.dep_ta[HK_SYNC_CDM].cut = NULL;
+      T("merge allowed when later render does not wait on earlier compute",
+        !hk_sync_merge_delays(m, deform, as_build));
+   }
    printf("RESULT checks=%u failures=%u\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

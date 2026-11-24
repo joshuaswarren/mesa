@@ -2,47 +2,13 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * AGX3 coverage / depth-stencil writeout encoders: `movmsk` and `depthf`.
+ * AGX3 coverage and depth-stencil writeout encoders: `movmsk` and `depthf`
+ * (6 bytes on AGX3B, 8 bytes on AGX3C).
  *
- * These are the AGX3 counterparts of AGX2's `sample_mask` and `zs_emit`. Both
- * are six bytes on AGX3b and eight on AGX3c, and both have the same shape: one
- * register operand naming the staged writeout word, a kill bit on it, the
- * scoreboard slot the instruction takes, and the per-slot wait mask -- plus,
- * for `depthf`, the depth/stencil enable pair.
- *
- * AGX2 spells both instructions with *two* operands (sample_mask's target and
- * live masks; zs_emit's sample mask and z/s value). AGX3 carries a single
- * register, and every Apple witness stages it with an asynchronous `copy` or
- * `ldimm` immediately before. What that register must contain is therefore a
- * separate contract from the encoding, and only part of it is grounded; see
- * agx3_pack_binary.c for exactly which IR shapes are routed here and which
- * stay refused.
- *
- * Operand roles, and the evidence for each:
- *
- *  - f9 = 5 selects the 13-bit operand field f5. Baseline in every witness of
- *    both mnemonics on both encodings.
- *  - f5 = the staged word's half-register index. Established by def-use, not
- *    by correlation: the corpus `discard_msaa4` shader contains two `movmsk`
- *    instructions, at f5=0 (defined by `ldimm r0` immediately before) and
- *    f5=2 (defined by `copy r1 <- r2`). The same 13-bit field with the same
- *    f9=5 selector is a half-register operand in the independently grounded
- *    `uvsw` and `copy` forms (agx3_vary_core, agx3_tex_core).
- *  - f13 = kill (last use) on that operand, as on uvsw's value. It is 1 in
- *    every 1x witness and 0 in the 4x depth witness, matching a liveness bit
- *    rather than a constant.
- *  - f12 = the scoreboard slot, through the encoder LUT the composer applies.
- *  - f17..f22 (AGX3b) / f17..f24 (AGX3c) = the per-slot wait mask, one bit per
- *    slot starting at slot 1, exactly as agx3_pixel_core spells it for pixrel.
- *  - depthf f25 / f26 = depth written / stencil written; AGX3c additionally
- *    carries the redundant mode selector f35 (1 depth, 2 stencil, 3 both).
- *
- * Every field that no role names is left at the baseline the composer's own
- * strict check requires, so a wrong value cannot silently produce a
- * valid-looking instruction.
- *
- * Derived from Apple's tile, depth/stencil, discard and sample-mask compiler
- * output.
+ * Both take a staged half-register operand (f9=5, f5=index, f13=kill),
+ * scoreboard slot (f12), and per-slot wait mask (f17..f22 on AGX3B, f17..f24
+ * on AGX3C). `depthf` adds depth/stencil enable bits f25/f26 (plus AGX3C mode
+ * f35: 1=depth, 2=stencil, 3=both).
  */
 
 #pragma once
@@ -59,18 +25,8 @@ extern "C" {
 /* movmsk and depthf are 6 bytes on AGX3b and 8 on AGX3c. */
 #define AGX3_ZS_MAX_LENGTH 8u
 
-/*
- * The 32-bit word Apple's compiler stages for an unconditional kill of every
- * sample -- `discard_fragment()` with no surviving coverage, which is what
- * Mesa's `sample_mask(target = ALL_SAMPLES, live = 0)` means.
- *
- * Directly witnessed, not derived: three independent probes (an unconditional
- * `discard_fragment()`, the same with a void fragment function, and
- * `[[sample_mask]] = 0`) all compile to `ldimm r0, 0xFFFFFF00` immediately
- * followed by `movmsk r0`, on g15g/g16g/g17s alike, and the corpus
- * `discard_msaa4` shader stages the same constant for its first movmsk. No
- * other movmsk operand value is witnessed as a constant.
- */
+/* Staged coverage word for unconditional kill-all-samples `movmsk`
+ * (`sample_mask(target = ALL_SAMPLES, live = 0)`). */
 #define AGX3_ZS_KILL_ALL_SAMPLES 0xFFFFFF00u
 
 struct agx3_zs_desc {

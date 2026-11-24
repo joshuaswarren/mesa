@@ -1799,6 +1799,7 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
          return VK_PIPELINE_COMPILE_REQUIRED;
 
       struct vk_shader_compile_info infos[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
+      struct vk_pipeline_robustness_state stage_rs[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
       for (uint32_t i = compile_info->partition[p]; i < compile_info->partition[p + 1]; i++) {
          struct vk_pipeline_stage *stage = &compile_info->stages[i];
 
@@ -1826,9 +1827,17 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
             next_stage = VK_SHADER_STAGE_FRAGMENT_BIT;
          }
 
+         stage_rs[i] = stage->precomp->rs;
+         if (stage->stage == MESA_SHADER_VERTEX &&
+             compile_info->state->vertex_input_robustness !=
+                VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT) {
+            stage_rs[i].vertex_inputs =
+               compile_info->state->vertex_input_robustness;
+         }
+
          const struct nir_shader_compiler_options *nir_options =
             ops->get_nir_options(device->physical, stage->stage,
-                                 &stage->precomp->rs);
+                                 &stage_rs[i]);
 
          nir_shader *nir =
             vk_pipeline_precomp_shader_get_nir(stage->precomp, nir_options);
@@ -1851,7 +1860,7 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
             .flags = shader_flags,
             .next_stage_mask = next_stage,
             .nir = nir,
-            .robustness = &stage->precomp->rs,
+            .robustness = &stage_rs[i],
             .set_layout_count = compile_info->set_layout_count,
             .set_layouts = compile_info->set_layouts,
             .embedded_sampler_count = stage->precomp->embedded_sampler_count,

@@ -9,14 +9,8 @@
 
 #define KV(f, v) {(uint16_t)(f), (uint64_t)(v)}
 
-static bool
-encoding_ok(enum agx_isa_encoding enc)
-{
-   return enc == AGX_ISA_ENCODING_AGX3B ||
-          enc == AGX_ISA_ENCODING_AGX3C;
-}
 /* Scoreboard slots are machine behaviour: eight on every G17-class part.
- * Device atomics retain the agx3b/agx3c encoding_ok boundary. */
+ * Device atomics retain the agx3b/agx3c boundary. */
 static unsigned
 slot_count(enum agx_isa_encoding enc)
 {
@@ -84,7 +78,7 @@ agx3_atomic_encode_device(enum agx_isa_encoding enc,
    const unsigned base_max = wide ? 252 : 188;
    const unsigned idx_max = wide ? 254 : 190;
 
-   if (!encoding_ok(enc) || d == NULL || out == NULL || len == NULL ||
+   if (!agx_isa_is_agx3(enc) || d == NULL || out == NULL || len == NULL ||
        !op_ok(d->op) || d->value > reg_max || d->result > reg_max ||
        d->index_shift > 4 || d->byte_offset < -32768 ||
        d->byte_offset > 32767 ||
@@ -214,7 +208,7 @@ encode_local(enum agx_isa_encoding enc, const struct agx3_local_atomic_desc *d,
    g18g = g18g || enc == AGX_ISA_ENCODING_AGX3D;
    const unsigned reg_max = agx_encoding_is_g17_class(enc) ? 255 : 191;
 
-   if ((!encoding_ok(enc) && enc != AGX_ISA_ENCODING_AGX3D) ||
+   if ((!agx_isa_is_agx3(enc) && enc != AGX_ISA_ENCODING_AGX3D) ||
        d == NULL || out == NULL || len == NULL ||
        !op_ok(d->op) || d->op == AGX3_ATOMIC_FADD || d->value > reg_max ||
        (d->wait_mask & ~((1u << slot_count(enc)) - 1u)))
