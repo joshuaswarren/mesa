@@ -134,20 +134,10 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
    uint64_t rw_base = hk_buffer_address_rw(buffer, 0) + head_offset_B;
    uint64_t ro_base = hk_buffer_address_ro(buffer, 0) + head_offset_B;
 
-   /* Which mapping the sampled texel-buffer descriptor addresses on G17P.
-    *
-    * The read-only shadow at +sparse_ro_offset is the mechanism every other
-    * read-only descriptor uses to get sparseResidencyNonResidentStrict for
-    * free: an unbound page reads as zero there.  For a texel buffer G17P
-    * cannot rely on it, so the descriptor names the primary mapping and the
-    * shader masks a non-resident texel to zero from the residency bitmap
-    * instead -- one address and one residency source for both the sparse
-    * fetch and the ordinary read.  See buffer_texel_resident() in
-    * agx_nir_lower_texture.c.
-    *
-    * For a non-sparse buffer hk_buffer_address() returns the same address
-    * either way (the shadow only exists for buffer->va != NULL), so this
-    * cannot move an ordinary texel buffer.
+   /* On AGX3/M5, address the primary mapping rather than the read-only sparse
+    * shadow; non-resident texels are masked to zero in the shader from the
+    * residency bitmap (see buffer_texel_resident() in agx_nir_lower_texture.c).
+    * Non-sparse buffers return the same VA from both helpers.
     */
    const uint64_t sampled_base = g17p ? rw_base : ro_base;
 
@@ -201,13 +191,10 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       texture.stride = texture.width * sizeof(uint32_t) - 16;
    }
    if (g17p) {
-      /* A sparse-resident buffer carries a per-page residency bitmap, and the
-       * buffer texture descriptor has no hardware sparse mode to report
-       * residency with, so a sparse texel fetch reads that bitmap instead.
-       * Pack the map and the element size the shader needs to find the page;
-       * see AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET.  A non-power-of-two
-       * element size (the emulated RGB32 layout) takes the raw load path,
-       * which claims residency anyway, so leave the word zero for it. */
+      /* Pack the per-page residency bitmap and element size for sparse texel
+       * fetches (AGX_G17P_BUFFER_TEXTURE_SPARSE_OFFSET); leave zero for
+       * non-power-of-two emulated RGB32, which uses raw loads.
+       */
       const uint32_t sparse = hk_buffer_sparse_texel_word(
          buffer, util_format_get_blocksize(format));
 
@@ -279,11 +266,7 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       memset(&view->pbe, 0, sizeof(view->pbe));
    }
 
-   /* G17P reaches a sampled texture through the device heap, so the view's
-    * texture descriptor has to live there and the descriptor carries only its
-    * index.  Without this the index stays 0 and every texel-buffer fetch
-    * resolves to the null texture.  Mirrors hk_image_view.c's per-plane
-    * hk_descriptor_table_add(). */
+   /* Register the sampled texture in the device heap (mirrors hk_image_view.c). */
    if (g17p) {
       VkResult result = hk_descriptor_table_add(
          device, &device->sampled_images, &view->tex,
@@ -317,24 +300,16 @@ hk_DestroyBufferView(VkDevice _device, VkBufferView bufferView,
 }
 
 /*
- * VK_EXT_descriptor_buffer texel buffers on G17P.
+ * VK_EXT_descriptor_buffer texel buffers on AGX3/M5.
  *
- * vkGetDescriptorEXT() names a texel buffer by address, range and format, so
- * there is no view object to own the device heap texture that G17P samples
- * through (hk_CreateBufferView()). Instead each format gets a fixed set of
- * maximum-sized buffer textures, "windows", over the application VA: 2^28
- * texels each, one starting every 2^27 texels, so any view of at most 2^27
- * texels lies inside one of them. The descriptor's software metadata selects
- * the view's texels in the window: the element offset and count that the
- * texel fetch, image load/store and atomic lowerings already apply
- * (agx_nir_lower_texture.c). The heap indices are reserved when the device is
- * created, in a fixed order, and a window is written when first used, so a
- * descriptor does not depend on the order views were asked for
- * (capture/replay). A larger view, or one outside the VA, gets a texture of
- * its own, kept until the device is destroyed.
- *
- * The emulated RGB32 formats read memory directly at the metadata address;
- * their texture is only read out of bounds, so one window serves each.
+ * Since vkGetDescriptorEXT() has no VkBufferView object to own a heap slot,
+ * each format reserves overlapping 2^28-texel "windows" stepped every 2^27
+ * texels across the application VA so any view <= 2^27 texels fits in one,
+ * with software metadata selecting offset and count (agx_nir_lower_texture.c).
+ * Indices are reserved in fixed order at device creation and populated on first
+ * use for capture/replay determinism; larger/out-of-range views allocate a
+ * dedicated device-lifetime slot. Emulated RGB32 reads memory directly and
+ * needs only one window per format.
  */
 #define HK_TEXEL_WINDOW_EL      (AGX_TEXTURE_BUFFER_WIDTH * AGX_TEXTURE_BUFFER_MAX_HEIGHT)
 #define HK_TEXEL_WINDOW_STEP_EL (HK_TEXEL_WINDOW_EL / 2)
@@ -651,8 +626,109 @@ hk_texel_buffer_descriptor(struct hk_device *dev,
    uint8_t *packed = out;
 
    const enum pipe_format format =
-      info && info->address ? hk_format_to_pipe_format(info->format)
-                            : PIPE_FORMAT_NONE;
+      info && info->address && info->range
+         ? hk_format_to_pipe_format(info->format)
+         : PIPE_FORMAT_NONE;
+
+   /* AGX2 embeds its 24-byte texture and PBE descriptors directly in the
+    * descriptor record with inline buffer_size_sw and buffer_offset_sw, so it
+    * does not need a device texture heap or texel windows. */
+   if (!agx_chip_agx3_path(dev->dev.chip)) {
+      bool ok = false;
+      if (format != PIPE_FORMAT_NONE) {
+         const struct util_format_description *desc =
+            util_format_description(format);
+         const unsigned blocksize_B = util_format_get_blocksize(format);
+         const uint64_t elements = info->range / blocksize_B;
+         const uint64_t rw_base = info->address & ~UINT64_C(0xf);
+         const uint32_t tail_offset_B = info->address & 0xf;
+         const uint32_t tail_offset_el = tail_offset_B / blocksize_B;
+         const uint64_t sampled_base =
+            hk_sparse_address_is_sparse(dev, info->address)
+               ? rw_base + dev->dev.sparse_ro_offset
+               : rw_base;
+
+         uint8_t format_swizzle[4] = {
+            desc->swizzle[0],
+            desc->swizzle[1],
+            desc->swizzle[2],
+            desc->swizzle[3],
+         };
+         if (util_format_is_depth_or_stencil(format)) {
+            format_swizzle[0] = 0;
+            format_swizzle[1] = 0;
+            format_swizzle[2] = 0;
+            format_swizzle[3] = 0;
+         }
+
+         struct AGX_TEXTURE texture = {AGX_TEXTURE_header};
+         texture.dimension = AGX_TEXTURE_DIMENSION_2D;
+         texture.layout = AGX_LAYOUT_LINEAR;
+         texture.channels = ail_pixel_format[format].channels;
+         texture.type = ail_pixel_format[format].type;
+         texture.swizzle_r = agx_channel_from_pipe(format_swizzle[0]);
+         texture.swizzle_g = agx_channel_from_pipe(format_swizzle[1]);
+         texture.swizzle_b = agx_channel_from_pipe(format_swizzle[2]);
+         texture.swizzle_a = agx_channel_from_pipe(format_swizzle[3]);
+         texture.width = AGX_TEXTURE_BUFFER_WIDTH;
+         texture.height =
+            MAX2(DIV_ROUND_UP(elements, AGX_TEXTURE_BUFFER_WIDTH), 1);
+         texture.first_level = texture.last_level = 0;
+         texture.address = sampled_base;
+         texture.buffer_size_sw = elements;
+         texture.buffer_offset_sw = tail_offset_el;
+         texture.srgb = (desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB);
+         texture.srgb_2_channel =
+            texture.srgb && util_format_colormask(desc) == 0x3;
+         texture.depth = 1;
+         texture.stride = (texture.width * blocksize_B) - 16;
+
+         ok = (tail_offset_B % blocksize_B == 0) &&
+              texture.height <= AGX_TEXTURE_BUFFER_MAX_HEIGHT &&
+              hk_pack_native_texture(generation, &tex, &texture);
+         if (ok && storage) {
+            struct AGX_PBE pbe_cfg = {AGX_PBE_header};
+            pbe_cfg.dimension = AGX_TEXTURE_DIMENSION_2D;
+            pbe_cfg.layout = AGX_LAYOUT_LINEAR;
+            pbe_cfg.channels = ail_pixel_format[format].channels;
+            pbe_cfg.type = ail_pixel_format[format].type;
+            pbe_cfg.srgb = util_format_is_srgb(format);
+            for (unsigned i = 0; i < desc->nr_channels; ++i) {
+               if (desc->swizzle[i] == 0)
+                  pbe_cfg.swizzle_r = i;
+               else if (desc->swizzle[i] == 1)
+                  pbe_cfg.swizzle_g = i;
+               else if (desc->swizzle[i] == 2)
+                  pbe_cfg.swizzle_b = i;
+               else if (desc->swizzle[i] == 3)
+                  pbe_cfg.swizzle_a = i;
+            }
+            pbe_cfg.buffer = rw_base;
+            pbe_cfg.buffer_offset_sw = tail_offset_el;
+            pbe_cfg.width = AGX_TEXTURE_BUFFER_WIDTH;
+            pbe_cfg.height = texture.height;
+            pbe_cfg.level = 0;
+            pbe_cfg.stride = (pbe_cfg.width * blocksize_B) - 4;
+            pbe_cfg.layers = 1;
+            pbe_cfg.levels = 1;
+            if (!hk_pack_native_pbe(generation, &pbe, &pbe_cfg))
+               hk_set_null_native_pbe(generation, &pbe);
+         } else {
+            hk_set_null_native_pbe(generation, &pbe);
+         }
+      }
+
+      if (!ok) {
+         hk_set_null_native_texture(generation, &tex);
+         hk_set_null_native_pbe(generation, &pbe);
+      }
+
+      memcpy(packed + native.texture, &tex,
+             hk_texture_descriptor_size(generation));
+      memcpy(packed + native.pbe, &pbe, hk_pbe_descriptor_size(generation));
+      return;
+   }
+
    uint32_t index = 0, offset_el = 0;
    uint64_t base = 0, elements = 0;
    if (format != PIPE_FORMAT_NONE && dev->texel_windows) {

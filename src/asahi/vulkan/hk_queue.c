@@ -31,6 +31,7 @@
 #include "hk_drm_own_wait.h"
 #include "hk_execution_allowance.h"
 #include "hk_pack.h"
+#include "hk_queue_flush.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
 #include "hk_query_pool.h"
@@ -1390,6 +1391,7 @@ hk_queue_restart_sync(struct hk_queue *queue)
    /* The submission that starts it waits for all sibling work too. */
    memset(queue->sib.submitted[0], 0, sizeof(queue->sib.submitted[0]));
    queue->sib.used = false;
+   queue->sib.packed_atomic_point = 0;
 }
 
 /* Kernel queues come from a machine-wide pool shared by every client, so
@@ -1614,6 +1616,39 @@ hk_sibling_deep(struct hk_device *dev, struct hk_queue *queue,
    return submitted_point >= done + HK_G17P_SIBLING_MIN_IN_FLIGHT;
 }
 
+/* Whether any sibling kernel queue may still be executing work. */
+static bool
+hk_sibling_in_flight(struct hk_device *dev, const struct hk_queue *queue)
+{
+   if (queue->sib.count <= 1 || !queue->sib.used || !queue->sib.last_point)
+      return false;
+
+   uint32_t handle = queue->drm.syncobj;
+   uint64_t done = 0;
+   if (drmSyncobjQuery(dev->dev.fd, &handle, &done, 1))
+      return true;
+   return done < queue->sib.last_point;
+}
+
+/* Whether a packed submission carrying global atomics is still in flight on
+ * the primary kernel queue; sibling routing stays off until it completes so
+ * no second kernel queue can run beside a packed atomic chain. */
+static bool
+hk_sibling_packed_atomic_busy(struct hk_device *dev, struct hk_queue *queue)
+{
+   if (!queue->sib.packed_atomic_point)
+      return false;
+
+   uint64_t done = 0;
+   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1))
+      return true;
+   if (done >= queue->sib.packed_atomic_point) {
+      queue->sib.packed_atomic_point = 0;
+      return false;
+   }
+   return true;
+}
+
 static struct hk_cs *
 hk_submit_unordered_start_ts(const struct vk_queue_submit *submit)
 {
@@ -1648,38 +1683,20 @@ hk_queue_ensure_ts_carrier(struct hk_device *dev, struct hk_queue *queue)
    if (!bo)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
-   uint8_t *stream = agx_bo_map(bo);
    const struct agx3_cdm_barrier_info barrier = {
       .chip = dev->dev.chip,
       .flags = HK_TS_CARRIER_BARRIER_FLAGS,
    };
-   if (!stream || !agx3_cdm_barrier_pack(&barrier, stream) ||
-       !agx3_cdm_stream_terminate_pack(dev->dev.chip,
-                                       stream + AGX3_CDM_BARRIER_SIZE)) {
+   uint8_t record[AGX3_CDM_BARRIER_SIZE];
+   if (!agx3_cdm_barrier_pack(&barrier, record) ||
+       !hk_queue_flush_stream_write(dev->dev.chip, agx_bo_map(bo), bo->size,
+                                    record, sizeof(record))) {
       agx_bo_unreference(&dev->dev, bo);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
 
    queue->ts_carrier_bo = bo;
    return VK_SUCCESS;
-}
-
-/* A flush-only stream dispatches no shader: on M5 kernels that take compute
- * resource lists, it declares an empty one. */
-static void
-hk_queue_append_no_compute_resources(const struct hk_device *dev,
-                                     struct util_dynarray *payload)
-{
-   if (agx_chip_g17_m5(dev->dev.chip) &&
-       (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) {
-      const struct drm_asahi_cmd_header resources = {
-         .cmd_type = DRM_ASAHI_SET_COMPUTE_RESOURCES,
-         .size = 0,
-         .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
-         .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
-      };
-      util_dynarray_append(payload, resources);
-   }
 }
 
 /* The stream of the compute command that ends a submission with its
@@ -1697,10 +1714,10 @@ hk_queue_ensure_host_flush(struct hk_device *dev, struct hk_queue *queue)
    if (!bo)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
-   uint8_t *stream = agx_bo_map(bo);
-   if (!stream || !hk_cdm_pack_visibility_flush(dev, true, stream) ||
-       !agx3_cdm_stream_terminate_pack(dev->dev.chip,
-                                       stream + AGX3_CDM_BARRIER_SIZE)) {
+   uint8_t record[AGX3_CDM_BARRIER_SIZE];
+   if (!hk_cdm_pack_visibility_flush(dev, true, record) ||
+       !hk_queue_flush_stream_write(dev->dev.chip, agx_bo_map(bo), bo->size,
+                                    record, sizeof(record))) {
       agx_bo_unreference(&dev->dev, bo);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
@@ -2086,7 +2103,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
    if (flush_sstt) {
       assert(queue->g17p_sstt_flush_bo);
-      hk_queue_append_no_compute_resources(dev, &payload);
+      hk_queue_append_flush_lists(dev->dev.chip, dev->dev.params.features,
+                                  &payload);
       struct drm_asahi_cmd_header header = agx_cmd_header(true, 0, 0);
       const struct drm_asahi_cmd_compute_with_prior cmd = {
          .legacy = {
@@ -2147,15 +2165,14 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       memcmp(prev_tail, queue->sync.tail, sizeof(prev_tail)) != 0;
 
    /* The deferred host flush follows the first scopes of the dependencies
-    * that asked for it, as resolved for the whole submission. Like every
-    * command, it follows the first one where that carries the input syncs
-    * or a leading flush. */
+    * that asked for it, as resolved for the whole submission, and the
+    * submission's last command on each subqueue, which covers the first one
+    * where that carries the input syncs or a leading flush. */
    uint16_t flush_barrier[HK_SYNC_NUM_SQ] = {DRM_ASAHI_BARRIER_NONE,
                                              DRM_ASAHI_BARRIER_NONE};
    uint64_t flush_prior[HK_SYNC_NUM_SQ] = {0, 0};
    if (host_flush &&
-       !hk_sync_host_flush_prefix(&queue->sync, host_flush_kinds,
-                                  chain_first || prepend_cdm, prior_base,
+       !hk_sync_host_flush_prefix(&queue->sync, host_flush_kinds, prior_base,
                                   sq_count, flush_barrier, flush_prior)) {
       util_dynarray_fini(&payload);
       if (unlikely(anatomy))
@@ -2173,7 +2190,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
    bool sib_earlier = false;
    if (queue->sib.count > 1 && !replaced && !prepend_cdm && !unlikely(anatomy) &&
-       !packed_bo &&
+       !packed_bo && !hk_sibling_packed_atomic_busy(dev, queue) &&
        !(host_flush &&
          hk_host_flush_names_earlier(flush_barrier, flush_prior, prior_base)) &&
        hk_sibling_eligible(dev, queue, submit, resolved, prior_base,
@@ -2202,7 +2219,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    if (ts_carrier) {
       assert(queue->ts_carrier_bo);
       assert(!flush_sstt);
-      hk_queue_append_no_compute_resources(dev, &payload);
+      hk_queue_append_flush_lists(dev->dev.chip, dev->dev.params.features,
+                                  &payload);
       struct drm_asahi_cmd_header header = agx_cmd_header(
          true,
          queue->sync.exact_prior ? DRM_ASAHI_BARRIER_NONE : 0,
@@ -2244,6 +2262,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       nr_cdm++;
    }
 
+   bool packed_atomics = false;
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
@@ -2260,6 +2279,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       }
 
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         if (packed_bo && cs->uses_global_atomics)
+            packed_atomics = true;
          if (resolved)
             hk_sync_load_resolved(cs, resolved++);
          struct drm_asahi_cmd_header header =
@@ -2478,16 +2499,17 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             if (stage_prefixes || m5_staged_v2)
                cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
 
-            /* G17P: a render whose vertex half depends on less compute work
-             * than its fragment half (image-only producers ordered by image
-             * barriers, fragment-only destinations) goes as a staged render:
-             * the kernel orders its tiling kick after the narrower prefixes
-             * alone, so its vertex work overlaps compute work that only its
-             * fragment half waits for. Every other render keeps the forms
-             * below, which the kernel can publish directly. */
+            /* Native HAL200: a render whose vertex half depends on less
+             * compute work than its fragment half (image-only producers
+             * ordered by image barriers, fragment-only destinations) goes as
+             * a staged render: the kernel orders its tiling kick after the
+             * narrower prefixes alone, so its vertex work overlaps compute
+             * work that only its fragment half waits for. Every other render
+             * keeps the forms below, which the kernel can publish directly.
+             */
             const bool g17p_staged =
-               dev->dev.chip == AGX_CHIP_G17P && !queue->sync.serialize &&
-               queue->sync.exact_prior &&
+               agx_chip_native_hal200(dev->dev.chip) &&
+               !queue->sync.serialize && queue->sync.exact_prior &&
                (dev->dev.params.features &
                 DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
                cs->sync.ta_split &&
@@ -2496,7 +2518,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                 ta_command_prior[HK_SYNC_CDM] != command_prior[HK_SYNC_CDM]);
             if (g17p_staged) {
                cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
-               perf_debug_dev(&dev->dev, "G17P staged render");
+               perf_debug_dev(&dev->dev, "HAL200 staged render");
             }
 
             /* The render's vertex half depends on no earlier render while its
@@ -2529,12 +2551,12 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                          cs->sync.prior[HK_SYNC_VDM] == 0))
                cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
 
-            /* G17P: a vertex half that still names earlier renders can use
-             * the fragment-only barriers too when the order of tiling kicks
-             * already covers what it names. A staged render takes neither
-             * the flag nor part in ta_cover: its tiling waits only for its
-             * narrower tiling prefix. */
-            if (dev->dev.chip == AGX_CHIP_G17P && !g17p_staged &&
+            /* Native HAL200: a vertex half that still names earlier renders
+             * can use the fragment-only barriers too when the order of tiling
+             * kicks already covers what it names. A staged render takes
+             * neither the flag nor part in ta_cover: its tiling waits only
+             * for its narrower tiling prefix. */
+            if (agx_chip_native_hal200(dev->dev.chip) && !g17p_staged &&
                 !queue->sync.serialize && queue->sync.exact_prior &&
                 (dev->dev.params.features &
                  DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)) {
@@ -2636,7 +2658,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
    if (host_flush) {
       assert(queue->host_flush_bo);
-      hk_queue_append_no_compute_resources(dev, &payload);
+      hk_queue_append_flush_lists(dev->dev.chip, dev->dev.params.features,
+                                  &payload);
       struct drm_asahi_cmd_header header =
          agx_cmd_header(true, flush_barrier[HK_SYNC_VDM],
                         flush_barrier[HK_SYNC_CDM]);
@@ -2759,6 +2782,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       if (sib_target) {
          queue->sib.used = true;
          queue->sib.last_point = queue->drm.timeline_value;
+      } else if (packed_atomics) {
+         queue->sib.packed_atomic_point = queue->drm.timeline_value;
       }
    }
    if (cumulative_signals && !kernel_cumulative) {
@@ -2838,11 +2863,16 @@ DEBUG_GET_ONCE_OPTION(m5_pack_cdm_submit_opt, "ASAHI_M5_PACK_CDM_SUBMIT", NULL)
 static bool
 hk_pack_trace(void)
 {
+   /* Queue submissions on multiple queues may ask first, so keep the cached
+    * answer atomic. Racing first calls compute the same value. */
    static int trace = -1;
-   if (trace < 0)
-      trace = debug_get_bool_option("HK_PACK_CDM_TRACE", false) ||
-              debug_get_bool_option("ASAHI_M5_PACK_CDM_TRACE", false);
-   return trace;
+   int cached = p_atomic_read_relaxed(&trace);
+   if (unlikely(cached < 0)) {
+      cached = debug_get_bool_option("HK_PACK_CDM_TRACE", false) ||
+               debug_get_bool_option("ASAHI_M5_PACK_CDM_TRACE", false);
+      p_atomic_set(&trace, cached);
+   }
+   return cached;
 }
 
 static bool
@@ -2875,12 +2905,17 @@ hk_pack_attachment_limit(const struct hk_device *dev)
  * running packed atomic chains on the same memory lost contributions (root
  * cause unknown), so such streams stay separate commands unless
  * ASAHI_M5_PACK_ATOMICS=1 (or HK_PACK_ATOMICS=1) and the device has a
- * single kernel queue, which runs its commands in order. A second kernel
- * queue created while a packet runs is not covered; unpacked atomic work
- * has the same exposure. The G16 kernel puts every compute command of a VM
- * on its one firmware compute queue and never runs one beside another VM's:
- * several commands of one VM may be in flight there, but the firmware runs
- * them one after another, never beside a packet. G16G packs them unless
+ * single active kernel queue, which runs its commands in order. On G17P,
+ * packed atomics are enabled by default (disable with HK_PACK_ATOMICS=0)
+ * whenever the single-active-kernel-queue invariant holds: no sibling kernel
+ * queue is in flight (hk_sibling_in_flight()), sibling routing stays off
+ * until any packed atomic submission completes (packed_atomic_point), and no
+ * other VkQueue or host-AS queue on the device has a kernel queue. A second
+ * kernel queue created while a packet runs is not covered; unpacked atomic
+ * work has the same exposure. The G16 kernel puts every compute command of a
+ * VM on its one firmware compute queue and never runs one beside another
+ * VM's: several commands of one VM may be in flight there, but the firmware
+ * runs them one after another, never beside a packet. G16G packs them unless
  * HK_PACK_ATOMICS=0. That is a property of the G16 kernel, the only one for
  * G16G, which no uAPI feature reports yet; the chip stands for it until one
  * does (hk_pack_atomics_choice()). */
@@ -2900,7 +2935,13 @@ hk_pack_atomics_allowed(struct hk_device *dev, const struct hk_queue *queue)
 
    if (dev->dev.chip == AGX_CHIP_G16G)
       return hk_pack_atomics_choice(true, opt, queue->sib.count);
-   if (!hk_pack_atomics_choice(false, opt, queue->sib.count))
+
+   /* Check the chip default / option before querying the syncobj for
+    * sibling activity so disabled callers never pay a drmSyncobjQuery ioctl. */
+   const bool default_on = dev->dev.chip == AGX_CHIP_G17P;
+   if (!hk_pack_atomics_choice(default_on, opt, 1))
+      return false;
+   if (hk_sibling_in_flight(dev, queue))
       return false;
 
    vk_foreach_queue(iter, &dev->vk) {
@@ -3613,12 +3654,11 @@ hk_queue_create(struct hk_device *dev,
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
 
-      uint8_t *stream = agx_bo_map(queue->g17p_sstt_flush_bo);
-      if (!stream ||
-          !agx3_cdm_sstt_flush_invalidate_pack(dev->dev.chip, stream) ||
-          !agx3_cdm_stream_terminate_pack(
-             dev->dev.chip,
-             stream + AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE)) {
+      uint8_t record[AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE];
+      if (!agx3_cdm_sstt_flush_invalidate_pack(dev->dev.chip, record) ||
+          !hk_queue_flush_stream_write(
+             dev->dev.chip, agx_bo_map(queue->g17p_sstt_flush_bo),
+             queue->g17p_sstt_flush_bo->size, record, sizeof(record))) {
          hk_queue_finish(dev, queue);
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }

@@ -774,6 +774,17 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
          linked->no_op = true;
       }
 
+      const struct agx_shader_part *colour_part = epilog ? epilog : main;
+      const bool non_colour_reads_tib =
+         (prolog && prolog->info.reads_tib) ||
+         (epilog && main && main->info.reads_tib);
+      linked->translucent_only_for_unwritten_rts =
+         !tag_write_disable && colour_part &&
+         colour_part->info.translucent_only_for_unwritten_rts &&
+         !non_colour_reads_tib;
+      linked->color_rts_written =
+         colour_part ? colour_part->info.color_rts_written : 0;
+
       agx_pack(&linked->fragment_control, FRAGMENT_CONTROL, cfg) {
          cfg.tag_write_disable = tag_write_disable;
          cfg.disable_tri_merging = disable_tri_merging;

@@ -666,6 +666,7 @@ asahi_g17p_compute_validate(
             return fail_at(cursor, "invalid compact compute launch ordering");
 
          local.launches++;
+         local.indirect_launches++;
          need_barrier = true;
          direct_tail = false;
          cursor += AGX3_CDM_INDIRECT_LAUNCH_SIZE;
@@ -731,6 +732,8 @@ asahi_g17p_compute_validate(
 
          local.barriers++;
          local.strong_barriers += record.data.barrier.flags == 0x5;
+         local.indirect_strong_barriers +=
+            !direct_tail && record.data.barrier.flags == 0x5;
          need_barrier = false;
          break;
 

@@ -1032,16 +1032,29 @@ TEST(NativeForms, NegatedSqrtStepReachesPacker)
    }
 }
 
-TEST(NativeForms, G17PHalfSqrtStepAcceptsLastUse)
+/* A last-use or unhinted half feeding the square-root step encodes as the
+ * retained form on both G17P and M5. The M5 packer used to pass the source's
+ * own hint through, and refused `srsqrt d32, h16.discard`. */
+TEST(NativeForms, HalfSqrtStepAcceptsLastUse)
 {
-   for (agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G16G}) {
+   static const struct {
+      agx_isa_encoding encoding;
+      agx_chip chip;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S},
+   };
+   for (const auto &target : targets) {
+      const agx_chip chip = target.chip;
+      const bool m5 = target.encoding == AGX_ISA_ENCODING_AGX3C;
       for (unsigned hint : {0u, 1u, 2u}) {
          SCOPED_TRACE(chip);
          SCOPED_TRACE(hint);
          void *mem = ralloc_context(NULL);
          agx_builder *b = agx_test_builder(mem);
          agx_shader_key key = {};
-         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.encoding = target.encoding;
          key.dev.chip = chip;
          b->shader->key = &key;
          b->shader->stage = MESA_SHADER_COMPUTE;
@@ -1053,13 +1066,16 @@ TEST(NativeForms, G17PHalfSqrtStepAcceptsLastUse)
          agx_stop(b);
          util_dynarray binary;
          util_dynarray_init(&binary, mem);
-         ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+         const bool packed = agx3_pack_binary(b->shader, &binary);
+         EXPECT_TRUE(packed) << agx3_last_pack_refusal();
          uint8_t expected[AGX3_ALU_MAX_LENGTH], length;
          ASSERT_TRUE(agx3_alu_sqrt_step_half(
-            AGX_ISA_ENCODING_AGX3B, 4, 3, AGX3_ALU_HINT_CACHE, true, 0,
+            target.encoding, 4, 3, AGX3_ALU_HINT_CACHE, !m5, 0,
             expected, &length));
-         ASSERT_GE(binary.size, length);
-         EXPECT_EQ(memcmp(binary.data, expected, length), 0);
+         if (packed) {
+            ASSERT_GE(binary.size, length);
+            EXPECT_EQ(memcmp(binary.data, expected, length), 0);
+         }
          util_dynarray_fini(&binary);
          ralloc_free(mem);
       }
@@ -6659,64 +6675,101 @@ TEST(NativeForms, M5OrSelectTracksVectorConversionComponent)
    }
 }
 
-TEST(NativeForms, G17PHalfImmediateMultiplyReachesPacker)
+TEST(NativeForms, AGX3HalfImmediateMultiplyReachesPacker)
 {
-   for (unsigned multiplier : {6u, 7u, 9u, 11u, 17u, 255u}) {
-      for (bool constant_first : {false, true}) {
-         SCOPED_TRACE(multiplier);
-         SCOPED_TRACE(constant_first);
-         void *mem = ralloc_context(NULL);
-         agx_builder *b = agx_test_builder(mem);
-         agx_shader_key key = {};
-         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-         key.dev.chip = AGX_CHIP_G17P;
-         b->shader->key = &key;
-         b->shader->stage = MESA_SHADER_COMPUTE;
-         b->shader->max_reg = 15;
-         agx_index input = agx_register(2, AGX_SIZE_16);
-         agx_index imm = agx_immediate(multiplier);
-         agx_instr *mul = agx_imad_to(
-            b, agx_register(4, AGX_SIZE_16), constant_first ? imm : input,
-            constant_first ? input : imm, agx_zero(), 0);
-         agx_materialize_agx3_alu_constants(b->shader);
-         ASSERT_TRUE(agx_is_equiv(mul->src[0], input));
-         ASSERT_EQ(mul->src[1].type, AGX_INDEX_NORMAL);
-         agx_instr *constant = NULL;
-         agx_foreach_instr_global(b->shader, I) {
-            if (I->nr_dests && agx_is_equiv(I->dest[0], mul->src[1]))
-               constant = I;
+   const struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+      bool emit_agx3d;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true},
+   };
+   for (const auto &target : targets) {
+      for (unsigned multiplier : {6u, 7u, 9u, 11u, 17u, 255u}) {
+         for (bool constant_first : {false, true}) {
+            SCOPED_TRACE(target.chip);
+            SCOPED_TRACE(multiplier);
+            SCOPED_TRACE(constant_first);
+            void *mem = ralloc_context(NULL);
+            agx_builder *b = agx_test_builder(mem);
+            agx_shader_key key = {};
+            key.dev.encoding = target.encoding;
+            key.dev.chip = target.chip;
+            key.dev.emit_agx3d = target.emit_agx3d;
+            b->shader->key = &key;
+            b->shader->stage = MESA_SHADER_COMPUTE;
+            b->shader->max_reg = 15;
+            agx_index input = agx_register(2, AGX_SIZE_16);
+            agx_index imm = agx_immediate(multiplier);
+            agx_instr *mul = agx_imad_to(
+               b, agx_register(4, AGX_SIZE_16), constant_first ? imm : input,
+               constant_first ? input : imm, agx_zero(), 0);
+            agx_materialize_agx3_alu_constants(b->shader);
+            ASSERT_TRUE(agx_is_equiv(mul->src[0], input));
+            ASSERT_EQ(mul->src[1].type, AGX_INDEX_NORMAL);
+            agx_instr *constant = NULL;
+            agx_foreach_instr_global(b->shader, I) {
+               if (I->nr_dests && agx_is_equiv(I->dest[0], mul->src[1]))
+                  constant = I;
+            }
+            ASSERT_NE(constant, nullptr);
+            ASSERT_EQ(constant->op, AGX_OPCODE_MOV_IMM);
+            EXPECT_EQ(constant->imm, multiplier);
+            EXPECT_EQ(constant->dest[0].size, AGX_SIZE_16);
+            /* Stand in for allocation, then check the real register-multiply
+             * encoding rather than accepting only a change in the IR. */
+            constant->dest[0] = agx_register(6, AGX_SIZE_16);
+            mul->src[1] = constant->dest[0];
+            agx_stop(b);
+            util_dynarray binary;
+            util_dynarray_init(&binary, mem);
+            EXPECT_TRUE(agx3_pack_binary(b->shader, &binary));
+            util_dynarray_fini(&binary);
+            ralloc_free(mem);
          }
-         ASSERT_NE(constant, nullptr);
-         ASSERT_EQ(constant->op, AGX_OPCODE_MOV_IMM);
-         EXPECT_EQ(constant->imm, multiplier);
-         EXPECT_EQ(constant->dest[0].size, AGX_SIZE_16);
-         /* Stand in for allocation, then check the real register-multiply
-          * encoding rather than accepting only a change in the IR. */
-         constant->dest[0] = agx_register(6, AGX_SIZE_16);
-         mul->src[1] = constant->dest[0];
-         agx_stop(b);
-         util_dynarray binary;
-         util_dynarray_init(&binary, mem);
-         EXPECT_TRUE(agx3_pack_binary(b->shader, &binary));
-         util_dynarray_fini(&binary);
-         ralloc_free(mem);
       }
+   }
+
+   /* Also verify explicit AGX_ISA_ENCODING_AGX3D materializes the pure half
+    * immediate multiply before reaching the G18G encoder. */
+   {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3D;
+      key.dev.chip = AGX_CHIP_G18G;
+      b->shader->key = &key;
+      agx_instr *mul = agx_imad_to(b, agx_register(4, AGX_SIZE_16),
+                                   agx_register(2, AGX_SIZE_16),
+                                   agx_immediate(7), agx_zero(), 0);
+      agx_materialize_agx3_alu_constants(b->shader);
+      EXPECT_EQ(mul->src[1].type, AGX_INDEX_NORMAL);
+      ralloc_free(mem);
    }
 }
 
 TEST(NativeForms, HalfMultiplyMaterializationPreservesOtherDomains)
 {
-   for (unsigned control = 0; control < 3; ++control) {
+   for (unsigned control = 0; control < 5; ++control) {
       void *mem = ralloc_context(NULL);
       agx_builder *b = agx_test_builder(mem);
       agx_shader_key key = {};
-      key.dev.encoding = control == 0 ? AGX_ISA_ENCODING_AGX2 : AGX_ISA_ENCODING_AGX3B;
-      key.dev.chip = control == 0 ? AGX_CHIP_G13G : AGX_CHIP_G17P;
+      key.dev.encoding = control == 0
+                            ? AGX_ISA_ENCODING_AGX2
+                            : (control < 3 ? AGX_ISA_ENCODING_AGX3B
+                                           : AGX_ISA_ENCODING_AGX3C);
+      key.dev.chip = control == 0
+                        ? AGX_CHIP_G13G
+                        : (control < 3 ? AGX_CHIP_G17P : AGX_CHIP_G17S);
       b->shader->key = &key;
-      agx_size size = control == 1 ? AGX_SIZE_32 : AGX_SIZE_16;
-      agx_instr *mul = agx_imad_to(b, agx_register(4, size),
-         agx_register(2, size), agx_immediate(7),
-         control == 2 ? agx_immediate(1) : agx_zero(), 0);
+      agx_size size = (control == 1 || control == 3) ? AGX_SIZE_32 : AGX_SIZE_16;
+      agx_instr *mul = agx_imad_to(
+         b, agx_register(4, size), agx_register(2, size), agx_immediate(7),
+         (control == 2 || control == 4) ? agx_immediate(1) : agx_zero(), 0);
       agx_materialize_agx3_alu_constants(b->shader);
       EXPECT_EQ(mul->src[1].type, AGX_INDEX_IMMEDIATE);
       EXPECT_EQ(mul->src[1].value, 7u);

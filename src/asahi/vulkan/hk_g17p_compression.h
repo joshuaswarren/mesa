@@ -40,8 +40,9 @@
  *    plane 0 only). Multisampled depth goes through ZLS rather than the colour
  *    tilebuffer's background reload program, so it is unaffected by
  *    AGX_QUIRK_UNCOVERED_TILE_MS_DEFECT. The 2x/4x depth plane excludes
- *    input-attachment, feedback-loop and sample-location use (its S8 plane
- *    stays plain). The ZLS unit compresses the S8 stencil plane with the same
+ *    input-attachment use (its S8 plane stays plain); it admits the
+ *    feedback-loop usage and sample-location flag zink sets on every depth
+ *    attachment, as single-sample depth does. The ZLS unit compresses the S8 stencil plane with the same
  *    metadata layout as depth (stencil
  *    load/store compression bits 4/8), it is read through its R8_UINT
  *    alias, and its clears are metadata fast clears. Zink stores GL Z24S8
@@ -267,16 +268,20 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
        * colour tilebuffer's background reload program, so it is unaffected by
        * AGX_QUIRK_UNCOVERED_TILE_MS_DEFECT across native HAL200. Plane 0 is
        * verified lossless on M4 (G16G) and A18 Pro (G17P); 2x depth was also
-       * measured on M4 Pro / M4 Max (G17P). The S8 plane stays plain. */
+       * measured on M4 Pro / M4 Max (G17P). The S8 plane stays plain.
+       *
+       * Zink gives every depth attachment feedback-loop usage and the
+       * sample-location flag, so excluding them leaves every GL multisampled
+       * depth buffer plain. Neither changes how the plane is stored: the
+       * compression is lossless over the stored sample values, which custom
+       * sample locations only choose where to evaluate, and a feedback-loop
+       * read samples the plane through the texture unit, which already reads
+       * compressed 2x/4x depth. Input attachments stay excluded. */
       const bool depth_ms =
          plane == 0 &&
          (info->samples == VK_SAMPLE_COUNT_2_BIT ||
           info->samples == VK_SAMPLE_COUNT_4_BIT) &&
-         depth &&
-         !(info->usage & (VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
-                          VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)) &&
-         !(info->flags &
-           VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT);
+         depth && !(info->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
       /* Non-G17P HAL200 parts (G16G) only take 2x/4x MSAA depth here;
        * single-sample depth stays plain until verified separately on G16G. */
       if (chip != AGX_CHIP_G17P && !depth_ms)
@@ -474,6 +479,17 @@ hk_m5_compression_one_byte(VkFormat format)
           format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_SINT;
 }
 
+/* Whether shader storage-image stores through a Gen10 compressed PBE
+ * descriptor are qualified to merge into compressed tiles and maintain
+ * compression metadata. Keep image creation (hk_m5_storage_compression_eligible)
+ * and compute meta blits (hk_agx3_gen10_mip_blit_supported) on this single
+ * gate so they cannot drift apart. */
+static inline bool
+hk_chip_supports_compressed_storage_pbe(enum agx_chip chip)
+{
+   return agx_chip_g17_m5(chip);
+}
+
 static inline bool
 hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
                                  const VkImageCreateInfo *info)
@@ -544,16 +560,28 @@ hk_m5_msaa_color_compression_format(VkFormat format)
 /* Qualified multisample metadata shapes. Sharing and aliasing flags are not
  * admitted; a mutable format is, and hk_can_compress() then requires a format
  * list of compression-compatible views.
+ *
+ * INPUT_ATTACHMENT_BIT is safe on M5 (unlike G17P): M5's 64 KiB tilebuffer
+ * holds 64 B/sample at 4x MSAA (all 8 max targets x <= 8 B fit without
+ * spilling), and hk_resident_attachments() pins every compressed MSAA colour
+ * attachment first in the tilebuffer so an MRT mix with wider uncompressed
+ * attachments spills the uncompressed targets instead. Same-pass input reads
+ * therefore read the resident tilebuffer, and separate-pass reads decode
+ * through the Gen10 compressed MSAA texture descriptor.
  */
 static inline bool
 hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
                                      const VkImageCreateInfo *info)
 {
+   const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
    const VkImageUsageFlags allowed_usage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 
-   if (chip != AGX_CHIP_G17S || plane != 0 || !info)
+   if (!agx_chip_g17_m5(chip) || plane != 0 || !info)
       return false;
 
    for (const void *next = info->pNext; next;) {
@@ -565,7 +593,7 @@ hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
              sizeof(next));
    }
 
-   return !(info->flags & ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+   return !(info->flags & ~allowed_flags) &&
           info->imageType == VK_IMAGE_TYPE_2D &&
           info->extent.depth == 1 && info->extent.width >= 16 &&
           info->extent.height >= 16 && info->arrayLayers == 1 &&

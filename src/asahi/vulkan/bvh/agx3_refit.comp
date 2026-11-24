@@ -1,25 +1,15 @@
 /* Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * Retained jobs of updatable structures (see hk_agx3_retained_job).
- * HK_AGX3_REFIT_SAVE keeps a full build's encoding jobs after its image, one
- * thread per job: it hands out their child offsets and positions.
- * HK_AGX3_REFIT_NUMBER numbers them leaf first and writes their records,
- * giving triangle leaves their slots, and HK_AGX3_REFIT_COUNT_LEVELS and
- * LIST_LEVELS link the records and list the inner jobs by level. Each job
- * keeps its children in their order, so the numbering changes no encoded
- * byte. HK_AGX3_REFIT_PREPARE readies an update, after its leaves: it
- * finds the source's jobs, copies them when updating into another
- * structure, clears the arrival counters and writes the refit state, the
- * level dispatches and the envelope job. Refit encoding then encodes the
- * leaf jobs, which the leaf-first numbering puts at the start, so its grid
- * and propagation's cover only those. HK_AGX3_REFIT_PROPAGATE encodes the
- * inner jobs deeper than the levels, one thread per leaf job, and
- * HK_AGX3_REFIT_INNER those of one level, eight lanes per job.
- *
- * Propagation runs apart from encoding: its device-scope arrivals wait for
- * the thread's earlier global stores, which in node encoding are a whole
- * node's.
+ * Retained-job BVH refit passes (see hk_agx3_retained_job):
+ * - SAVE/NUMBER/COUNT_LEVELS/LIST_LEVELS: persist full-build jobs after the AS
+ *   image, numbered leaf-first (preserving child order and encoded bytes) with
+ *   top inner levels indexed by depth.
+ * - PREPARE: locate/copy retained jobs, clear arrival counters, and emit refit
+ *   state, per-level dispatches, and the envelope job.
+ * - PROPAGATE/INNER: encode deep inner nodes bottom-up via device-scope arrival
+ *   counters (separate from leaf encoding so arrivals order full-node stores),
+ *   then encode top levels 8 lanes per job.
  */
 #version 460
 #extension GL_GOOGLE_include_directive : require

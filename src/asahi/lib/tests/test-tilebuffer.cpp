@@ -779,6 +779,51 @@ TEST(Tilebuffer, G17PCompressedTwoSampleTargetsStayResident)
    EXPECT_TRUE(multiview.spilled[5]);
 }
 
+TEST(Tilebuffer, M5CompressedFourSampleInputAttachmentStaysResident)
+{
+   /* M5 at 4x: a 64 KiB tile holds 64 bytes per sample. Seven RGBA32F
+    * uncompressed attachments (112 B/sample) plus a compressed RGBA16F MSAA4
+    * input attachment on RT7 exceed the tilebuffer; plain descending-alignment
+    * order spills RT7. Pinning RT7 via resident_mask keeps it resident and
+    * spills wider uncompressed RGBA32F targets instead. */
+   enum pipe_format formats[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R16G16B16A16_FLOAT,
+   };
+   const auto plain = agx_build_tilebuffer_layout_resident(
+      formats, 8, 4, false, AGX_MAX_RENDER_TARGETS * 16, 65536, 2048, 0);
+   EXPECT_TRUE(plain.spilled[7]);
+   EXPECT_FALSE(plain.spilled[0]);
+   EXPECT_FALSE(plain.spilled[3]);
+   EXPECT_TRUE(plain.spilled[4]);
+
+   const auto resident = agx_build_tilebuffer_layout_resident(
+      formats, 8, 4, false, AGX_MAX_RENDER_TARGETS * 16, 65536, 2048,
+      BITFIELD_BIT(7));
+   EXPECT_FALSE(resident.spilled[7]);
+   EXPECT_EQ(resident._offset_B[7], 0u);
+   EXPECT_FALSE(resident.spilled[0]);
+   EXPECT_FALSE(resident.spilled[1]);
+   EXPECT_FALSE(resident.spilled[2]);
+   EXPECT_TRUE(resident.spilled[3]);
+   EXPECT_TRUE(resident.spilled[4]);
+   EXPECT_TRUE(resident.spilled[5]);
+   EXPECT_TRUE(resident.spilled[6]);
+   EXPECT_EQ(resident.resident_mask, BITFIELD_BIT(7));
+   EXPECT_EQ(resident.sample_size_B, 56u);
+
+   /* All eight 8-byte compressed MSAA4 targets fit without spilling. */
+   enum pipe_format rgba16f[AGX_MAX_RENDER_TARGETS];
+   for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt)
+      rgba16f[rt] = PIPE_FORMAT_R16G16B16A16_FLOAT;
+   const auto eight = agx_build_tilebuffer_layout_resident(
+      rgba16f, 8, 4, false, AGX_MAX_RENDER_TARGETS * 16, 65536, 2048, 0xff);
+   EXPECT_FALSE(agx_tilebuffer_spills(&eight));
+   EXPECT_EQ(eight.sample_size_B, 64u);
+}
+
 class SampleDepthOrder : public ::testing::Test {
  protected:
    SampleDepthOrder()
@@ -979,6 +1024,60 @@ TEST(Tilebuffer, G17PCompressedColourNeverSpills)
    for (enum pipe_format format : refused)
       EXPECT_FALSE(agx_g17p_compression_color_format(format))
          << util_format_name(format);
+
+   /* 16-byte RGBA32 colour formats live in their own helper so wide-MRT spill
+    * invariants on the <=8-byte set stay explicit. */
+   unsigned admitted_16b = 0;
+   for (unsigned f = 1; f < PIPE_FORMAT_COUNT; ++f) {
+      const enum pipe_format format = (enum pipe_format)f;
+      if (!agx_g17p_compression_color_format_16b(format))
+         continue;
+
+      ++admitted_16b;
+      const char *name = util_format_name(format);
+      EXPECT_FALSE(agx_g17p_compression_color_format(format)) << name;
+      EXPECT_NE(ail_pixel_format[format].renderable, PIPE_FORMAT_NONE) << name;
+      EXPECT_FALSE(util_format_is_depth_or_stencil(format)) << name;
+      EXPECT_EQ(util_format_get_blocksize(format), 16u) << name;
+      EXPECT_TRUE(ail_can_compress(format, 16, 16, 1)) << name;
+      EXPECT_FALSE(ail_can_compress(format, 15, 16, 1)) << name;
+      EXPECT_TRUE(ail_formats_compatible(
+         format, agx_g17p_rt0_pbe_format(util_format_linear(format))))
+         << name;
+
+      enum pipe_format one[AGX_MAX_RENDER_TARGETS] = {format};
+      const auto tib1 = g17p_single_sample_layout(one, 1, false);
+      EXPECT_FALSE(tib1.spilled[0]) << name;
+      EXPECT_EQ(tib1.sample_size_B, 16u) << name;
+
+      /* Eight 16-byte targets exceed G17P's 120-byte budget and spill the
+       * eighth target, which agx_set_framebuffer_state() pre-decompresses. */
+      enum pipe_format eight[AGX_MAX_RENDER_TARGETS];
+      for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt)
+         eight[rt] = format;
+      const auto tib8 =
+         g17p_single_sample_layout(eight, AGX_MAX_RENDER_TARGETS, false);
+      EXPECT_TRUE(agx_tilebuffer_spills(&tib8)) << name;
+      EXPECT_TRUE(tib8.spilled[AGX_MAX_RENDER_TARGETS - 1]) << name;
+   }
+   EXPECT_EQ(admitted_16b, 6u);
+
+   static const enum pipe_format x_variants_16b[][2] = {
+      {PIPE_FORMAT_R32G32B32X32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT},
+      {PIPE_FORMAT_R32G32B32X32_UINT, PIPE_FORMAT_R32G32B32A32_UINT},
+      {PIPE_FORMAT_R32G32B32X32_SINT, PIPE_FORMAT_R32G32B32A32_SINT},
+   };
+   for (const auto &pair : x_variants_16b) {
+      const char *name = util_format_name(pair[0]);
+      EXPECT_TRUE(agx_g17p_compression_color_format_16b(pair[0])) << name;
+      EXPECT_TRUE(agx_g17p_compression_color_format_16b(pair[1])) << name;
+      EXPECT_EQ(ail_pixel_format[pair[0]].channels,
+                ail_pixel_format[pair[1]].channels) << name;
+      EXPECT_EQ(ail_pixel_format[pair[0]].type,
+                ail_pixel_format[pair[1]].type) << name;
+      EXPECT_EQ(ail_pixel_format[pair[0]].renderable,
+                ail_pixel_format[pair[1]].renderable) << name;
+   }
 }
 
 TEST(Tilebuffer, PackFirstIfFitsMovesClearedRTIntoFirst8Bytes)

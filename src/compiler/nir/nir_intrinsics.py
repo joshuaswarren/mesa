@@ -2613,10 +2613,10 @@ intrinsic("load_uvs_index_agx", dest_comp = 1, bit_sizes=[16],
 # src[] = { sample mask }
 # base = byte offset, target = logical colour attachment index. The latter
 # remains unchanged when inactive attachments compact the physical layout.
-load("local_pixel_agx", [1], [BASE, FORMAT, TARGET], [CAN_REORDER, CAN_ELIMINATE])
+load("local_pixel_agx", [1], [BASE, FORMAT, TARGET], [CAN_ELIMINATE])
 # src[] = { value, sample mask, coordinates }
 # base = byte offset, target = logical colour attachment index
-store("local_pixel_agx", [1, -1], [BASE, WRITE_MASK, FORMAT, EXPLICIT_COORD, TARGET], [CAN_REORDER])
+store("local_pixel_agx", [1, -1], [BASE, WRITE_MASK, FORMAT, EXPLICIT_COORD, TARGET], [])
 
 # Combined depth/stencil emit, applying to a mask of samples. base indicates
 # which to write (1 = depth, 2 = stencil, 3 = both).

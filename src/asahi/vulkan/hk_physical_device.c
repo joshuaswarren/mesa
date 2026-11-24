@@ -289,9 +289,8 @@ hk_get_device_extensions(const struct agx_device *dev,
        * depth clip. */
       .EXT_depth_clip_control = !agx_chip_hal300_path(dev->chip),
       .EXT_depth_clip_enable = true,
-      /* Qualified on G17P only (the whole binding_model.descriptor_buffer
-       * group); other chips share the code but need their own run. */
-      .EXT_descriptor_buffer = dev->chip == AGX_CHIP_G17P,
+      .EXT_descriptor_buffer =
+         agx_chip_has_cap(dev->chip, AGX_CAP_DESCRIPTOR_BUFFER),
       .EXT_descriptor_indexing = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = false,
@@ -301,7 +300,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
-      .EXT_external_memory_host = agx_has_userptr(dev),
+      .EXT_external_memory_host = agx_has_host_import(dev),
       .EXT_fragment_shader_interlock = agx_chip_native_agx3(dev->chip),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
@@ -1210,8 +1209,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .apiVersion = hk_get_vk_version(),
       .driverVersion = vk_get_driver_version(),
       .vendorID = instance->drirc.debug.force_vk_vendor ?: VK_VENDOR_ID_MESA,
-      .deviceID = agx_chip_native_or_m5(dev->chip)
-                     ? dev->params.chip_id : 0,
+      .deviceID = dev->params.chip_id,
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
 
       /* Vulkan 1.0 limits */

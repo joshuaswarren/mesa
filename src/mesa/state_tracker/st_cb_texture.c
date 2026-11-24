@@ -1788,6 +1788,21 @@ try_pbo_upload_common(struct gl_context *ctx,
    unsigned width, height;
    pipe_surface_size(surface, &width, &height);
 
+   /* If the driver opts in and the upload overwrites the entire single-level
+    * resource, invalidate it before binding the framebuffer so tile-based
+    * drivers can skip loading the previous contents into the tilebuffer.
+    */
+   if (st->screen->caps.invalidate_pbo_upload_destination &&
+       pipe->invalidate_resource &&
+       surface->texture->last_level == 0 &&
+       surface->texture->nr_samples <= 1 &&
+       addr->xoffset == 0 && addr->yoffset == 0 &&
+       addr->width == width && addr->height == height &&
+       surface->first_layer == 0 &&
+       surface->last_layer == util_max_layer(surface->texture, surface->level) &&
+       addr->depth == surface->last_layer + 1)
+      pipe->invalidate_resource(pipe, surface->texture);
+
    /* Framebuffer_state */
    {
       struct pipe_framebuffer_state fb;

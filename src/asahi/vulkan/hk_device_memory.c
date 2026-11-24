@@ -60,6 +60,17 @@ hk_system_memory_fits(uint64_t size)
    return available >= size + reserve;
 }
 
+static bool
+hk_allow_bo_alloc(size_t size, void *data)
+{
+   bool *mem_rejected = data;
+
+   /* agx_bo_create_checked() asks again after evicting the BO cache, so
+    * record only the latest answer. */
+   *mem_rejected = !hk_system_memory_fits(size);
+   return !*mem_rejected;
+}
+
 /* Supports opaque fd only */
 const VkExternalMemoryProperties hk_opaque_fd_mem_props = {
    .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
@@ -248,7 +259,7 @@ hk_GetMemoryHostPointerPropertiesEXT(
    struct hk_physical_device *pdev = hk_device_physical(dev);
 
    if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
-       !agx_has_userptr(&dev->dev))
+       !agx_has_host_import(&dev->dev))
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    const uint64_t alignment =
@@ -398,18 +409,44 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    struct hk_device_memory *mem;
    VkResult result = VK_SUCCESS;
 
-   const VkImportMemoryFdInfoKHR *fd_info =
-      vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
-   const VkExportMemoryAllocateInfo *export_info =
-      vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
-   const VkMemoryOpaqueCaptureAddressAllocateInfo *capture_info =
-      vk_find_struct_const(pAllocateInfo->pNext,
-                           MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
-   const VkImportMemoryHostPointerInfoEXT *host_info = vk_find_struct_const(
-      pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
-   const VkMemoryPriorityAllocateInfoEXT *priority_info =
-      vk_find_struct_const(pAllocateInfo->pNext,
-                           MEMORY_PRIORITY_ALLOCATE_INFO_EXT);
+   const VkImportMemoryFdInfoKHR *fd_info = NULL;
+   const VkExportMemoryAllocateInfo *export_info = NULL;
+   const VkMemoryOpaqueCaptureAddressAllocateInfo *capture_info = NULL;
+   const VkImportMemoryHostPointerInfoEXT *host_info = NULL;
+   const VkMemoryPriorityAllocateInfoEXT *priority_info = NULL;
+   bool wsi_alloc = false;
+
+   if (unlikely(pAllocateInfo->pNext != NULL)) {
+      vk_foreach_struct_const(sType, ext, pAllocateInfo->pNext) {
+         switch ((uint32_t)sType) {
+         case VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR:
+            if (!fd_info)
+               fd_info = ext;
+            break;
+         case VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO:
+            if (!export_info)
+               export_info = ext;
+            break;
+         case VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO:
+            if (!capture_info)
+               capture_info = ext;
+            break;
+         case VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT:
+            if (!host_info)
+               host_info = ext;
+            break;
+         case VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT:
+            if (!priority_info)
+               priority_info = ext;
+            break;
+         case VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA:
+            wsi_alloc = true;
+            break;
+         default:
+            break;
+         }
+      }
+   }
    const VkMemoryType *type = &pdev->mem_types[pAllocateInfo->memoryTypeIndex];
    /* The mappings over a host import before its pages are pinned
     * (hk_host_import_track()). */
@@ -530,34 +567,29 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          flags |= AGX_BO_SHAREABLE;
       /* A failed WSI export must not leave pinned backing in the BO cache.
        * Successful exports already acquire AGX_BO_SHARED. */
-      if (!dev->dev.is_virtio &&
-          vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA))
+      if (!dev->dev.is_virtio && wsi_alloc)
          flags |= AGX_BO_NO_CACHE;
       if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
          flags |= AGX_BO_WRITEBACK;
 
-      /* A BO from the cache allocates nothing new. If the kernel purged it
-       * meanwhile, one allocation can still pass the check. agx_bo_cache_has()
-       * is only a hint, so concurrent allocators can each pass on the same
-       * cached BO and any overshoot is bounded by the number of threads
-       * allocating at once. Guard with HK_MEMORY_CHECK_MIN first so sub-1 MiB
-       * allocations never take bo_cache.lock, then ask the cache before
-       * hk_system_memory_fits() reads /proc/meminfo. */
-      if (aligned_size >= HK_MEMORY_CHECK_MIN &&
-          !agx_bo_cache_has(&dev->dev, aligned_size, 64 * 1024, flags) &&
-          !hk_system_memory_fits(aligned_size)) {
-         result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                            "Not enough free system memory for %" PRIu64
-                            " MiB", aligned_size >> 20);
-         goto fail_alloc;
-      }
-
+      /* A BO from the cache allocates nothing new. Fetch from the cache once
+       * and run hk_system_memory_fits() only on a real miss (including after
+       * discarding purged entries), avoiding both a duplicate cache-lock walk
+       * and per-allocation /proc/meminfo reads. */
+      bool mem_rejected = false;
       /* D3D12 promises 64 KiB alignment for heap addresses, and this costs
        * only virtual address space. */
-      mem->bo = agx_bo_create(&dev->dev, aligned_size, 64 * 1024, flags,
-                              "App memory");
+      mem->bo = agx_bo_create_checked(&dev->dev, aligned_size, 64 * 1024, flags,
+                                      "App memory", hk_allow_bo_alloc,
+                                      &mem_rejected);
       if (!mem->bo) {
-         result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         if (mem_rejected) {
+            result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                               "Not enough free system memory for %" PRIu64
+                               " MiB", aligned_size >> 20);
+         } else {
+            result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         }
          goto fail_alloc;
       }
    }
@@ -609,10 +641,10 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
             : mem->bo->va->addr;
    }
 
-   /* Shadow map in case this is used for a sparse resident buffer */
-   int ret = agx_bo_bind(&dev->dev, mem->bo,
-                         agx_rw_addr_to_ro(&dev->dev, mem->bo->va->addr),
-                         mem->bo->size, 0, DRM_ASAHI_BIND_READ);
+   /* Shadow map in case this is used for a sparse resident buffer. The mapping
+    * persists with the BO across userspace cache reuse, so cached allocations
+    * skip the redundant VM_BIND ioctl. */
+   int ret = agx_bo_ensure_ro_shadow(&dev->dev, mem->bo);
    if (ret) {
       /* The bind fails once the VM carries a sticky error. */
       hk_memory_release_replay_va(dev, mem);

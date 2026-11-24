@@ -202,6 +202,34 @@ if with_tests
     )
   endforeach
   test(
+    'asahi-agx-bo-cache',
+    executable(
+      'asahi-agx-bo-cache',
+      files('tests/test-agx-bo-cache.c'),
+      include_directories : [
+        inc_include, inc_src, inc_asahi, libasahi_lib_includes,
+        include_directories('../libagx'),
+      ],
+      dependencies : [
+        idep_nir, idep_agx_pack, idep_mesautil, idep_libagx_shaders_h,
+      ],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],
+      c_args : [c_msvc_compat_args, '-UNDEBUG'],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
+    'asahi-userptr-limits',
+    executable(
+      'asahi-userptr-limits',
+      files('tests/test-userptr-limits.c'),
+      include_directories : include_directories('.'),
+      c_args : ['-UNDEBUG'],
+    ),
+    suite : ['asahi'],
+  )
+  test(
     'asahi-chip-admission',
     executable(
       'asahi-chip-admission',
@@ -488,6 +516,21 @@ if with_tests
         'tests/test-agx-ioto-preshader-core.c',
       ),
       include_directories : [inc_include, inc_src, inc_asahi],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'asahi-agx-ioto-state-core',
+    executable(
+      'asahi-agx-ioto-state-core',
+      files(
+        'agx_ioto_core.c',
+        'agx_ioto_state_core.c',
+        'tests/test-agx-ioto-state-core.c',
+      ),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      c_args : ['-UNDEBUG'],
     ),
     suite : ['asahi'],
   )

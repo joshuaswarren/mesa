@@ -228,7 +228,8 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
                   VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
    }
 
-   /* Our image atomic lowering doesn't bother to handle linear */
+   /* Our image atomic lowering doesn't bother to handle linear. R32_SFLOAT
+    * atomics are required wherever shaderImageFloat32Atomics is advertised. */
    if ((p_format == PIPE_FORMAT_R32_UINT || p_format == PIPE_FORMAT_R32_SINT ||
         (p_format == PIPE_FORMAT_R32_FLOAT &&
          pdev->vk.supported_features.shaderImageFloat32Atomics)) &&
@@ -446,15 +447,16 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
     * Feedback loops are problematic with compression. The GL driver bans them.
     * Interestingly, the relevant CTS tests pass on G13G and G14C, but not on
     * G13D. Keep that restriction except for depth images already admitted by
-    * the G17P or M5 policy. Rejecting those here contradicts the depth policy and
-    * makes the host-copy performance query report a plain device layout;
-    * Zink then retains HOST_TRANSFER and never compresses its depth images.
+    * the HAL200 (G16G, G17P) or M5 policy. Rejecting those here contradicts the
+    * depth policy and makes the host-copy performance query report a plain
+    * device layout; Zink then retains HOST_TRANSFER and never compresses its
+    * depth images.
     */
    /* Decided on the API format: the stencil plane of D32_SFLOAT_S8_UINT is
     * S8_UINT here, and zink gives its depth/stencil images feedback-loop
     * usage. */
    const bool depth_feedback =
-      agx_chip_g17p_or_m5(dev->chip) &&
+      (agx_chip_native_hal200(dev->chip) || agx_chip_g17_m5(dev->chip)) &&
       allow_agx3 && hk_g17p_compression_depth_format(api_format);
    if ((usage & (VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT |
                  VK_IMAGE_USAGE_STORAGE_BIT)) ||
@@ -575,7 +577,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    if (dev->chip == AGX_CHIP_G17P)
       return false;
 
-   if (dev->chip != AGX_CHIP_G17S || plane ||
+   if (!hk_chip_supports_compressed_storage_pbe(dev->chip) || plane ||
        (info->pNext && !format_list_only) ||
        (info->flags & ~allowed_flags) ||
        info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
@@ -1180,14 +1182,17 @@ hk_GetPhysicalDeviceImageFormatProperties2(
           *
           * The query omits dimensions, levels, layers and samples. Choose a
           * shape that permits compression: if any such image can compress,
-          * host-transfer images cannot promise the same layout.
+          * host-transfer images cannot promise the same layout. Probe every
+          * supported sample count, since a policy may compress only the
+          * multisampled images of a format (G16G compresses 2x/4x depth but
+          * not single-sample depth).
           */
          const VkExternalMemoryImageCreateInfo external_create_info = {
             .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
             .pNext = pImageFormatInfo->pNext,
             .handleTypes = external_info ? external_info->handleType : 0,
          };
-         const VkImageCreateInfo device_copy_info = {
+         VkImageCreateInfo device_copy_info = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = &external_create_info,
             .flags = pImageFormatInfo->flags,
@@ -1208,9 +1213,12 @@ hk_GetPhysicalDeviceImageFormatProperties2(
          };
          bool can_compress = false;
          if (pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL) {
-            for (unsigned plane = 0; plane < plane_count; ++plane) {
-               can_compress |= hk_can_compress_create_info(
-                  &pdev->dev, plane, &device_copy_info, false, false);
+            u_foreach_bit(s, sampleCounts) {
+               device_copy_info.samples = (VkSampleCountFlagBits)BITFIELD_BIT(s);
+               for (unsigned plane = 0; plane < plane_count; ++plane) {
+                  can_compress |= hk_can_compress_create_info(
+                     &pdev->dev, plane, &device_copy_info, false, false);
+               }
             }
          }
 
