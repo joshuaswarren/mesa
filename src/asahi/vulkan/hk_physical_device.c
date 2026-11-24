@@ -138,16 +138,6 @@ hk_cache_identity(const uint8_t build_sha[32], const struct agx_device *dev,
    memcpy(disk_cache_id, blake3, sizeof(*disk_cache_id));
 }
 
-/* VK_KHR_shader_fma: G17P with its explicit-RTE tininess repair
- * (agx_nir_lower_fma_rte()) and M5. G13-G15 do not pass the newly exposed
- * cases. */
-static bool
-hk_shader_fma_supported(enum agx_chip chip)
-{
-   return agx_chip_g17p_or_m5(chip) &&
-          agx_chip_exact_fma32(chip);
-}
-
 static void
 hk_get_device_extensions(const struct agx_device *dev,
                          const struct hk_instance *instance,
@@ -686,13 +676,10 @@ hk_get_device_features(
 
       /* VK_KHR_shader_float_controls2 */
       .shaderFloatControls2 = true,
-      .shaderFmaFloat16 = true,
-      .shaderFmaFloat32 = true,
-      .shaderFmaFloat64 = false,
 
       /* VK_KHR_shader_fma */
-      .shaderFmaFloat16 = hk_shader_fma_supported(dev->chip),
-      .shaderFmaFloat32 = hk_shader_fma_supported(dev->chip),
+      .shaderFmaFloat16 = true,
+      .shaderFmaFloat32 = true,
       .shaderFmaFloat64 = false,
 
       /* VK_KHR_shader_maximal_reconvergence */
@@ -2299,10 +2286,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.KHR_shader_quad_control =
          pdev->dev.chip == AGX_CHIP_G17P;
    }
-
-   /* VK_KHR_shader_fma makes shaderFmaFloat32 mandatory. */
-   if (!hk_shader_fma_supported(pdev->dev.chip))
-      supported_extensions.KHR_shader_fma = false;
 
    if (pdev->dev.chip == AGX_CHIP_G17P) {
       /* Advanced blending is hardware-qualified on A18 Pro for every
