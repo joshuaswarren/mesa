@@ -109,7 +109,8 @@ struct hk_shader_info {
          /* G17P: the main part applies alpha-to-coverage in the coverage
           * update that tests (agx_fs_epilog_key::a2c_in_main). */
          bool a2c_in_main;
-         uint8_t _pad[1];
+         /* Fragment shader reads gl_Layer (VARYING_SLOT_LAYER or LAYER_ID). */
+         bool reads_layer;
       } fs;
 
       struct {
@@ -141,10 +142,9 @@ struct hk_shader_info {
    uint8_t set_count;
 
    /* Positive proof recorded before inserting the default Layer output.
-    * Only original vertex hardware variants qualify.  False is unknown.
-    * Serialized with shader binary version 26 or newer.
+    * Only original vertex/tess/geom hardware variants qualify. False is unknown.
     */
-   bool g17p_default_layer_zero;
+   bool default_layer_zero;
 
    /* External API memory writes (stores, atomics, transform feedback). */
    bool writes_external_memory;

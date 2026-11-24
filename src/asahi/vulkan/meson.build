@@ -1370,6 +1370,16 @@ if with_tests
 endif
 
 if with_tests
+  test('hk_attachmentless', executable('hk_attachmentless_test',
+    files('tests/test-hk-attachmentless.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]),
+    timeout : 30, suite : ['asahi'])
+endif
+
+if with_tests
   test('hk_uma_heap_sizing', executable('hk_uma_heap_sizing_test',
     files('tests/test-hk-uma-heap-sizing.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,

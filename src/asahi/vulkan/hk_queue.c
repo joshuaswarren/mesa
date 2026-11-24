@@ -205,20 +205,18 @@ hk_queue_fill_cdm_command(struct hk_device *dev, struct hk_queue *queue,
 }
 
 /* Neither attachment storage nor empty-tile operations may observe the
- * layers eliminated below.  Draws and their XY coverage remain untouched.
+ * layers or tiles outside active draw scissors eliminated below.
  */
-static bool
-hk_g17p_attachmentless_render(const struct hk_device *dev,
-                                    const struct hk_cs *cs)
+bool
+hk_attachmentless_render(const struct hk_cs *cs)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P ||
-       cs->tib.sample_size_B != 0 || cs->cr.process_empty_tiles ||
+   if (cs->tib.sample_size_B != 0 || cs->cr.process_empty_tiles ||
        cs->cr.depth.buffer || cs->cr.depth.meta ||
        cs->cr.stencil.buffer || cs->cr.stencil.meta)
       return false;
 
    /* The tilebuffer builder normalizes an attachmentless sample count to
-    * one.  Check attachment formats explicitly; nr_samples is not a tag.
+    * one. Check attachment formats explicitly; nr_samples is not a tag.
     * This also excludes colour attachments spilled outside the tilebuffer.
     */
    for (unsigned i = 0; i < ARRAY_SIZE(cs->tib.logical_format); ++i) {
@@ -227,6 +225,47 @@ hk_g17p_attachmentless_render(const struct hk_device *dev,
    }
 
    return true;
+}
+
+void
+hk_attachmentless_vdm_bounds(const struct hk_cs *cs, uint32_t *width_px,
+                             uint32_t *height_px, uint32_t *layers)
+{
+   const bool attachmentless = hk_attachmentless_render(cs);
+   const bool empty_attachmentless = attachmentless && cs->stats.cmds == 0;
+   const bool bounded_attachmentless =
+      attachmentless && cs->stats.cmds > 0 &&
+      cs->attachmentless_bounded_draws == cs->stats.cmds;
+   const bool layer_zero_attachmentless =
+      attachmentless && cs->stats.cmds > 0 && !cs->layer_zero_unknown &&
+      cs->layer_zero_draws == cs->stats.cmds;
+
+   uint32_t w, h;
+   if (empty_attachmentless) {
+      w = 1;
+      h = 1;
+   } else if (bounded_attachmentless) {
+      w = MIN2(cs->cr.width, cs->attachmentless_max_x);
+      h = MIN2(cs->cr.height, cs->attachmentless_max_y);
+   } else {
+      w = cs->cr.width;
+      h = cs->cr.height;
+   }
+
+   /* Draws stay inside the render area and the tiles past its bottom-right
+    * corner keep their contents, so do not walk them: user interfaces render
+    * small areas of full-screen targets. */
+   if (cs->area_x1 && cs->area_y1) {
+      w = MIN2(w, cs->area_x1);
+      h = MIN2(h, cs->area_y1);
+   }
+
+   /* An attachmentless pass takes its size from the render area or draw
+    * scissors, which can be empty, and the kernel refuses a zero dimension. */
+   *width_px = MAX2(w, 1);
+   *height_px = MAX2(h, 1);
+   *layers = (empty_attachmentless || layer_zero_attachmentless)
+                ? 1 : cs->cr.layers;
 }
 
 static void
@@ -245,27 +284,10 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       cfg.fixed_point_format = 1;
    }
 
-   const bool empty_attachmentless =
-      cs->stats.cmds == 0 && hk_g17p_attachmentless_render(dev, cs);
-   const bool layer_zero_attachmentless =
-      cs->stats.cmds > 0 && !cs->g17p_layer_zero_unknown &&
-      cs->g17p_layer_zero_draws == cs->stats.cmds &&
-      hk_g17p_attachmentless_render(dev, cs);
-   c->width_px = empty_attachmentless ? 1 : cs->cr.width;
-   c->height_px = empty_attachmentless ? 1 : cs->cr.height;
-
-   /* Draws stay inside the render area and the tiles past its bottom-right
-    * corner keep their contents, so do not walk them: user interfaces render
-    * small areas of full-screen targets. */
-   if (cs->area_x1 && cs->area_y1) {
-      c->width_px = MIN2(c->width_px, cs->area_x1);
-      c->height_px = MIN2(c->height_px, cs->area_y1);
-   }
-
-   /* An attachmentless pass takes its size from the render area, which can be
-    * empty, and the kernel refuses a zero dimension. */
-   c->width_px = MAX2(c->width_px, 1);
-   c->height_px = MAX2(c->height_px, 1);
+   uint32_t width_px = 0, height_px = 0, layers = 0;
+   hk_attachmentless_vdm_bounds(cs, &width_px, &height_px, &layers);
+   c->width_px = width_px;
+   c->height_px = height_px;
 
    c->isp_bgobjdepth = cs->cr.isp_bgobjdepth;
    c->isp_bgobjvals = cs->cr.isp_bgobjvals;
@@ -337,8 +359,7 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
 
    /* Can be 0 for attachmentless rendering with no draws */
    c->samples = MAX2(cs->tib.nr_samples, 1);
-   c->layers = (empty_attachmentless || layer_zero_attachmentless)
-                  ? 1 : cs->cr.layers;
+   c->layers = layers;
 
    /* Drawing max size will OOM and fail submission. But vkd3d-proton does this
     * for emulating no-attachment rendering. Clamp to something reasonable and

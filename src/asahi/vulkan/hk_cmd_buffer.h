@@ -565,6 +565,8 @@ struct hk_rendering_state {
    VkRect2D area;
    uint32_t layer_count;
    uint32_t view_mask;
+   /* Attachmentless rendering pass with no multiview. */
+   bool no_attachments;
 
    /* The main G17P EOT writes the single-sample resolve target directly. */
    bool g17p_direct_color_resolve;
@@ -1278,12 +1280,20 @@ struct hk_cs {
    bool oq_avail_deferred;
 
    /* Number of successfully emitted draws whose last raster producer is
-    * positively known to export only the default Layer=0, without multiview.
+    * positively known to target only hardware Layer=0, without multiview.
     * Compare with stats.cmds: untracked emitters conservatively disqualify.
     * The wider proof count does not wrap with stats.cmds.
     */
-   uint64_t g17p_layer_zero_draws;
-   bool g17p_layer_zero_unknown;
+   uint64_t layer_zero_draws;
+   bool layer_zero_unknown;
+
+   /* Number of successfully emitted draws whose active hardware viewport and
+    * scissor bounds were recorded into attachmentless_max_{x,y}. Compare with
+    * stats.cmds: untracked emitters conservatively fall back to cs->cr size.
+    */
+   uint64_t attachmentless_bounded_draws;
+   uint32_t attachmentless_max_x;
+   uint32_t attachmentless_max_y;
 
    /* An upper bound of the primitives every draw recorded into this G17P
     * render stream submits (hk_draw_primitive_bound()), saturating at
@@ -3203,3 +3213,8 @@ bool hk_robust_index_rewrite_admitted(const struct hk_device *dev,
                                       enum agx_primitive topology);
 
 struct agx_robustness hk_prolog_robustness(struct hk_device *dev);
+
+bool hk_attachmentless_render(const struct hk_cs *cs);
+
+void hk_attachmentless_vdm_bounds(const struct hk_cs *cs, uint32_t *width_px,
+                                  uint32_t *height_px, uint32_t *layers);
