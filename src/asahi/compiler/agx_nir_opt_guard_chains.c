@@ -349,6 +349,31 @@ match_ine(nir_def *cond, nir_def **a, nir_def **b)
    return false;
 }
 
+static bool expr_equal_with_subst(const nir_def *u, const nir_def *v,
+                                  const nir_def *from, const nir_def *to,
+                                  unsigned depth);
+
+/* Whether source `i` of `au` and source `j` of `av` read the same channels of
+ * equal expressions. Every channel the ALU reads is compared, which can be more
+ * than the destination has (pack_64_2x32 reads two channels for one). */
+static bool
+alu_src_equal_with_subst(const nir_alu_instr *au, unsigned i,
+                         const nir_alu_instr *av, unsigned j,
+                         const nir_def *from, const nir_def *to, unsigned depth)
+{
+   const unsigned comps = nir_ssa_alu_instr_src_components(au, i);
+   if (comps != nir_ssa_alu_instr_src_components(av, j))
+      return false;
+
+   for (unsigned c = 0; c < comps; ++c) {
+      if (au->src[i].swizzle[c] != av->src[j].swizzle[c])
+         return false;
+   }
+
+   return expr_equal_with_subst(au->src[i].src.ssa, av->src[j].src.ssa, from,
+                                to, depth);
+}
+
 static bool
 expr_equal_with_subst(const nir_def *u, const nir_def *v, const nir_def *from,
                       const nir_def *to, unsigned depth)
@@ -378,15 +403,7 @@ expr_equal_with_subst(const nir_def *u, const nir_def *v, const nir_def *from,
    const unsigned n = nir_op_infos[au->op].num_inputs;
    bool direct = true;
    for (unsigned i = 0; i < n; ++i) {
-      for (unsigned c = 0; c < u->num_components; ++c) {
-         if (au->src[i].swizzle[c] != av->src[i].swizzle[c]) {
-            direct = false;
-            break;
-         }
-      }
-      if (!direct ||
-          !expr_equal_with_subst(au->src[i].src.ssa, av->src[i].src.ssa, from,
-                                 to, depth - 1)) {
+      if (!alu_src_equal_with_subst(au, i, av, i, from, to, depth - 1)) {
          direct = false;
          break;
       }
@@ -394,20 +411,11 @@ expr_equal_with_subst(const nir_def *u, const nir_def *v, const nir_def *from,
    if (direct)
       return true;
 
-   if (n == 2 && (nir_op_infos[au->op].algebraic_properties &
-                  NIR_OP_IS_2SRC_COMMUTATIVE)) {
-      for (unsigned c = 0; c < u->num_components; ++c) {
-         if (au->src[0].swizzle[c] != av->src[1].swizzle[c] ||
-             au->src[1].swizzle[c] != av->src[0].swizzle[c])
-            return false;
-      }
-      return expr_equal_with_subst(au->src[0].src.ssa, av->src[1].src.ssa, from,
-                                   to, depth - 1) &&
-             expr_equal_with_subst(au->src[1].src.ssa, av->src[0].src.ssa, from,
-                                   to, depth - 1);
-   }
-
-   return false;
+   return n == 2 &&
+          (nir_op_infos[au->op].algebraic_properties &
+           NIR_OP_IS_2SRC_COMMUTATIVE) &&
+          alu_src_equal_with_subst(au, 0, av, 1, from, to, depth - 1) &&
+          alu_src_equal_with_subst(au, 1, av, 0, from, to, depth - 1);
 }
 
 /* True if `intr` (guarded by `cond`) is proven mapped and aligned even when
@@ -464,9 +472,10 @@ phi_src_for_pred(const nir_phi_instr *phi, const nir_block *pred, nir_def **out)
 }
 
 /* Check whether `alu` in `suffix_block` is `op(else_val, inner_phi)` (or
- * commutative) where `inner_phi` evaluates to the identity element of `op` on
- * `inner_else`, so `alu` evaluates to `else_val` whenever `inner_if` is not
- * taken. If so, returns the `inner_then` input of `inner_phi` in `*then_rhs`. */
+ * commutative) where the scalar `inner_phi` evaluates to the identity element
+ * of `op` on `inner_else`, so `alu` evaluates to `else_val` whenever `inner_if`
+ * is not taken. If so, returns the `inner_then` input of `inner_phi` in
+ * `*then_rhs`, which has the same single component as `alu`. */
 static bool
 match_suffix_identity_alu(const nir_alu_instr *alu, const nir_block *suffix_block,
                           const nir_block *inner_then, const nir_block *inner_else,
@@ -477,7 +486,6 @@ match_suffix_identity_alu(const nir_alu_instr *alu, const nir_block *suffix_bloc
       return false;
 
    uint64_t identity = 0;
-   bool commutative = true;
    switch (alu->op) {
    case nir_op_ior:
    case nir_op_ixor:
@@ -490,15 +498,17 @@ match_suffix_identity_alu(const nir_alu_instr *alu, const nir_block *suffix_bloc
    default:
       return false;
    }
-   (void)commutative;
 
    for (unsigned side = 0; side < 2; ++side) {
       if (alu->src[1 - side].src.ssa != else_val ||
           alu->src[1 - side].swizzle[0] != 0 ||
           alu->src[side].swizzle[0] != 0)
          continue;
+      /* The rewrite rebuilds `alu` from the phi's `inner_then` input, so a
+       * vector phi read through a swizzle would yield a vector result. */
       nir_def *other = alu->src[side].src.ssa;
-      if (nir_def_instr(other)->type != nir_instr_type_phi ||
+      if (other->num_components != 1 ||
+          nir_def_instr(other)->type != nir_instr_type_phi ||
           nir_def_block(other) != suffix_block)
          continue;
       const nir_phi_instr *iphi = nir_def_as_phi(other);

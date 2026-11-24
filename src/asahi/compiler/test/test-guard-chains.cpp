@@ -50,6 +50,32 @@ make_store_global(nir_builder *b, nir_def *val, nir_def *addr,
    nir_intrinsic_set_write_mask(intr, nir_component_mask(val->num_components));
 }
 
+/* `scalar | vec.chan`, reading the channel through the ALU source swizzle (as
+ * copy propagation leaves it) rather than through a separate mov. */
+static nir_def *
+ior_channel(nir_builder *b, nir_def *scalar, nir_def *vec, unsigned chan)
+{
+   nir_alu_instr *alu = nir_alu_instr_create(b->shader, nir_op_ior);
+   alu->src[0].src = nir_src_for_ssa(scalar);
+   alu->src[1].src = nir_src_for_ssa(vec);
+   alu->src[1].swizzle[0] = chan;
+   nir_def_init(&alu->instr, &alu->def, 1, scalar->bit_size);
+   nir_builder_instr_insert(b, &alu->instr);
+   return &alu->def;
+}
+
+/* pack_64_2x32 of channels `lo` and `hi` of `vec`, through the source
+ * swizzle. */
+static nir_def *
+pack_64_2x32_channels(nir_builder *b, nir_def *vec, unsigned lo, unsigned hi)
+{
+   nir_alu_instr *alu = nir_alu_instr_create(b->shader, nir_op_pack_64_2x32);
+   alu->src[0].src = nir_src_for_ssa(vec);
+   alu->src[0].swizzle[0] = lo;
+   alu->src[0].swizzle[1] = hi;
+   return nir_builder_alu_instr_finish_and_insert(b, alu);
+}
+
 static unsigned
 count_ifs(const nir_shader *nir)
 {
@@ -199,6 +225,93 @@ TEST(GuardChains, FuseNestedGuardWithoutDominatingLoadRedirectsToZeroPage)
    nir_validate_shader(b.shader, "after fuse-redir");
    EXPECT_EQ(count_ifs(b.shader), 1u);
    EXPECT_TRUE(uses_zero_page_const(b.shader));
+   ralloc_free(b.shader);
+}
+
+TEST(GuardChains, DominatingLoadProofComparesEveryPackedAddressChannel)
+{
+   /* pack_64_2x32 has one destination channel but reads two. With a high
+    * word from a different channel (v.xz against v.xy), the dominating load
+    * covers another address, so the guarded load must still be redirected.
+    * With the same channels the proof holds and nothing is redirected. */
+   for (unsigned mode = 0; mode < 2; ++mode) {
+      const bool same_hi = mode == 1;
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "fuse-pack-channels");
+      b.shader->info.workgroup_size[0] = 32;
+
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *wid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+      nir_def *hi_a = agx_test_load_preamble(&b, 1, 32, 0);
+      nir_def *hi_b = agx_test_load_preamble(&b, 1, 32, 2);
+      nir_def *out_base = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *zero = nir_imm_float(&b, 0.0f);
+
+      nir_def *v_dom = nir_vec3(&b, nir_ishl_imm(&b, wid, 2), hi_a, hi_b);
+      nir_def *self =
+         make_load_global(&b, 1, 32, pack_64_2x32_channels(&b, v_dom, 0, 1), 4,
+                          (gl_access_qualifier)0);
+
+      nir_push_if(&b, nir_ine(&b, tid, wid));
+      nir_def *v_pre = nir_vec3(&b, nir_ishl_imm(&b, tid, 2), hi_a, hi_b);
+      nir_def *other = make_load_global(
+         &b, 1, 32, pack_64_2x32_channels(&b, v_pre, 0, same_hi ? 1 : 2), 4,
+         (gl_access_qualifier)0);
+      nir_push_if(&b, nir_flt(&b, other, self));
+      nir_def *r = nir_frsq(&b, other);
+      nir_pop_if(&b, NULL);
+      nir_def *inner_r = nir_if_phi(&b, r, zero);
+      nir_pop_if(&b, NULL);
+
+      nir_def *res = nir_if_phi(&b, inner_r, zero);
+      make_store_global(
+         &b, res,
+         nir_iadd(&b, out_base, nir_ishl_imm(&b, nir_u2u64(&b, tid), 2)), 4);
+
+      EXPECT_TRUE(agx_nir_opt_guard_chains(b.shader));
+      nir_validate_shader(b.shader, "after fuse-pack-channels");
+      EXPECT_EQ(count_ifs(b.shader), 1u);
+      EXPECT_EQ(uses_zero_page_const(b.shader), !same_hi) << "mode " << mode;
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(GuardChains, FuseRejectsVectorInnerPhiReadByScalarSuffix)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "fuse-vector-phi");
+   b.shader->info.workgroup_size[0] = 32;
+
+   nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+   nir_def *pos_base = agx_test_load_preamble(&b, 1, 64, 0);
+   nir_def *out_base = agx_test_load_preamble(&b, 1, 64, 4);
+   nir_def *acc_in = nir_imm_int(&b, 1);
+   nir_def *zero2 = nir_imm_ivec2(&b, 0, 0);
+
+   nir_push_if(&b, nir_ult(&b, tid, nir_imm_int(&b, 16)));
+   nir_def *addr =
+      nir_iadd(&b, pos_base, nir_ishl_imm(&b, nir_u2u64(&b, tid), 2));
+   nir_def *val = make_load_global(&b, 1, 32, addr, 4, (gl_access_qualifier)0);
+   nir_push_if(&b, nir_flt(&b, val, nir_imm_float(&b, 1.0f)));
+   nir_def *flags =
+      nir_vec2(&b, nir_f2i32(&b, nir_frsq(&b, val)), nir_imm_int(&b, 4));
+   nir_pop_if(&b, NULL);
+   /* 32x2 inner phi whose .x feeds the scalar 32x1 suffix reduction. */
+   nir_def *inner_flags = nir_if_phi(&b, flags, zero2);
+   nir_def *ored = ior_channel(&b, acc_in, inner_flags, 0);
+   nir_pop_if(&b, NULL);
+
+   nir_def *res = nir_if_phi(&b, ored, acc_in);
+   make_store_global(
+      &b, res, nir_iadd(&b, out_base, nir_ishl_imm(&b, nir_u2u64(&b, tid), 2)),
+      4);
+
+   /* Fusing would rebuild the reduction from the 32x2 then-value and feed a
+    * vector into the scalar merge phi: the guards must stay as they are. */
+   EXPECT_EQ(count_ifs(b.shader), 2u);
+   EXPECT_FALSE(agx_nir_opt_guard_chains(b.shader));
+   nir_validate_shader(b.shader, "after fuse-vector-phi");
+   EXPECT_EQ(count_ifs(b.shader), 2u);
    ralloc_free(b.shader);
 }
 
