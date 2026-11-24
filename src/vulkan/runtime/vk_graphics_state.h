@@ -976,6 +976,9 @@ struct vk_dynamic_graphics_state {
    /** Rasterization order attachment access flags (from pipeline state) */
    VkImageAspectFlags rasterization_order_access;
 
+   /** Per-pipeline vertex input robustness (from VERTEX_INPUT_INTERFACE) */
+   VkPipelineRobustnessBufferBehaviorEXT vertex_input_robustness;
+
    /** MESA_VK_DYNAMIC_INPUT_ATTACHMENT_MAP */
    struct vk_input_attachment_location_state ial;
 
@@ -1050,6 +1053,12 @@ struct vk_graphics_pipeline_state {
     * create flags or subpass description flags.
     */
    VkImageAspectFlags rasterization_order_access;
+
+   /** Per-pipeline vertex input robustness from the vertex input interface
+    * subset (VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT when
+    * not overridden by the vertex input interface).
+    */
+   VkPipelineRobustnessBufferBehaviorEXT vertex_input_robustness;
 
    /** Vertex input state */
    const struct vk_vertex_input_state *vi;

@@ -1443,3 +1443,152 @@ libagx_remap_adj_count(unsigned count, enum mesa_prim prim)
       return count / 2;
    }
 }
+
+/*
+ * Contiguous run of indirect draw VDM records with constant byte stride inside
+ * one VDM chunk. Draw `i` in `[first, first + count)` begins at
+ * `base_addr + (uint64_t)(i - first) * stride` (always a top-level VDM record
+ * boundary with at least 8 bytes written for that draw).
+ */
+struct libagx_vdm_draw_span {
+   uint64_t base_addr;
+   uint32_t first;
+   uint32_t count;
+   uint32_t stride;
+   uint32_t _pad[3];
+};
+static_assert(sizeof(struct libagx_vdm_draw_span) == 32,
+              "VDM draw span host/device ABI");
+
+/*
+ * Per-command-buffer mutable state for reusable command buffers: records the
+ * previously patched VDM address and its original 8 bytes so a subsequent
+ * submission restores them before patching at the new runtime draw count.
+ */
+struct libagx_vdm_truncate_state {
+   uint64_t patched_addr;
+   uint32_t orig_w0;
+   uint32_t orig_w1;
+};
+static_assert(sizeof(struct libagx_vdm_truncate_state) == 16,
+              "VDM truncate state host/device ABI");
+
+static inline bool
+libagx_vdm_span_append(GLOBAL struct libagx_vdm_draw_span *spans,
+                       uint32_t *num_spans, uint32_t capacity,
+                       uint32_t draw_idx, uint64_t addr)
+{
+   if (*num_spans > 0) {
+      GLOBAL struct libagx_vdm_draw_span *last = &spans[*num_spans - 1];
+      if (last->first + last->count == draw_idx) {
+         if (last->count == 1) {
+            if (addr > last->base_addr &&
+                (addr - last->base_addr) <= UINT32_MAX) {
+               last->stride = (uint32_t)(addr - last->base_addr);
+               last->count = 2;
+               return true;
+            }
+         } else if (addr == last->base_addr +
+                               (uint64_t)last->count * last->stride) {
+            last->count++;
+            return true;
+         }
+      }
+   }
+
+   if (*num_spans >= capacity)
+      return false;
+
+   spans[(*num_spans)++] = (struct libagx_vdm_draw_span){
+      .base_addr = addr,
+      .first = draw_idx,
+      .count = 1,
+      .stride = 0,
+   };
+   return true;
+}
+
+static inline uint64_t
+libagx_vdm_span_find_addr(CONST struct libagx_vdm_draw_span *spans,
+                          uint32_t num_spans, uint32_t draw_idx)
+{
+   uint32_t lo = 0;
+   uint32_t hi = num_spans;
+
+   while (lo < hi) {
+      uint32_t mid = lo + ((hi - lo) >> 1);
+      struct libagx_vdm_draw_span s = spans[mid];
+      if (draw_idx < s.first) {
+         hi = mid;
+      } else if (draw_idx >= s.first + s.count) {
+         lo = mid + 1;
+      } else {
+         return s.base_addr + (uint64_t)(draw_idx - s.first) * s.stride;
+      }
+   }
+
+   return 0;
+}
+
+/*
+ * Shared host/device implementation of runtime VDM stream truncation for
+ * DrawIndirectCount. Restores any previously patched 8-byte VDM site first
+ * (supporting reusable command buffers whose draw count changes across
+ * submissions), then patches draw `*draw_count` with the non-returning
+ * VDM_STREAM_LINK `(link_w0, link_w1)` whenever `*draw_count < max_draw_count`.
+ */
+static inline void
+libagx_vdm_patch_indirect_count_impl(
+   GLOBAL struct libagx_vdm_truncate_state *state,
+   CONST struct libagx_vdm_draw_span *spans, CONST uint32_t *draw_count,
+   uint32_t num_spans, uint32_t max_draw_count, uint32_t link_w0,
+   uint32_t link_w1)
+{
+   uint64_t prev = state->patched_addr;
+   if (prev != 0) {
+      GLOBAL uint32_t *prev_dst = (GLOBAL uint32_t *)(uintptr_t)prev;
+      prev_dst[0] = state->orig_w0;
+      prev_dst[1] = state->orig_w1;
+      state->patched_addr = 0;
+   }
+
+   uint32_t n = *draw_count;
+   if (n >= max_draw_count)
+      return;
+
+   uint64_t addr = libagx_vdm_span_find_addr(spans, num_spans, n);
+   if (addr == 0)
+      return;
+
+   GLOBAL uint32_t *dst = (GLOBAL uint32_t *)(uintptr_t)addr;
+   state->orig_w0 = dst[0];
+   state->orig_w1 = dst[1];
+   state->patched_addr = addr;
+
+   dst[0] = link_w0;
+   dst[1] = link_w1;
+}
+
+#ifndef __OPENCL_VERSION__
+/*
+ * Runtime invariant check for VDM stream-truncation recording sites:
+ * every recorded draw must remain in the same graphics control stream (`cs`)
+ * and advance the stream by at least 8 bytes (AGX_VDM_STREAM_LINK_LENGTH)
+ * unless a fresh chunk was opened for the draw.
+ */
+static inline bool
+libagx_vdm_draw_site_valid(const void *cs_before, const void *cs_after,
+                           uint64_t chunk_before, uint64_t chunk_after,
+                           const void *cur_before, const void *cur_after)
+{
+   if (cs_before != cs_after)
+      return false;
+
+   if (chunk_before != chunk_after)
+      return true;
+
+   const uintptr_t before = (uintptr_t)cur_before;
+   const uintptr_t after = (uintptr_t)cur_after;
+   return after >= before && (after - before) >= 8u;
+}
+#endif

@@ -57,6 +57,7 @@
 #include "hk_private.h"
 #include "asahi/lib/agx_m5_va.h"
 #include "hk_shader.h"
+#include "hk_partial_mrt_hsr.h"
 #include "hk_native_write_class.h"
 #include "hk_g17p_patch.h"
 #include "util/disk_cache.h"
@@ -3578,7 +3579,7 @@ hk_g17p_note_first_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       const struct hk_attachment *att = &render->color_att[i];
       /* A disabled colour write keeps the attachment (preserve_rt in the
        * epilog), so it is not covered even when its write mask is full. */
-      if (!att->iview || !(gfx->fast_link_fs.color_written & BITFIELD_BIT(i)) ||
+      if (!att->iview || !(gfx->fast_link_fs.app_color_written & BITFIELD_BIT(i)) ||
           !(dyn->cb.color_write_enables & BITFIELD_BIT(i)) ||
           dyn->cb.attachments[i].blend_enable)
          continue;
@@ -4005,8 +4006,12 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
    const unsigned samples = render->tilebuffer.nr_samples;
    const bool msaa = samples > 1;
-   const bool msaa_enabled = msaa && agx_chip_g17_m5(dev->dev.chip) &&
-      (samples == 2 || samples == 4);
+   const bool msaa_enabled =
+      msaa && agx_chip_msaa_pass_continuation(dev->dev.chip) &&
+      (samples == 2 || samples == 4) &&
+      (!agx_chip_uncovered_tile_ms_defect(dev->dev.chip) ||
+       render->tilebuffer.sample_size_B <=
+          AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE);
 
    /* The instance is one ordinary render stream with draws, with no
     * pre/post-graphics streams, heap use or timestamps attached. */
@@ -5248,6 +5253,34 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       cmd->state.gfx.descriptors.root_dirty = true;
    }
 
+   render->bg_live_mask = 0;
+   render->bg_clear_fill_rt = 0;
+   const bool allow_clear_fill =
+      agx_chip_isa(dev->dev.chip) == AGX_ISA_AGX3 && !incomplete_render_area &&
+      !(render->flags & VK_RENDERING_RESUMING_BIT) &&
+      !agx_tilebuffer_spills(&render->tilebuffer);
+   for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; ++i) {
+      const VkRenderingAttachmentInfo *att_info =
+         &pRenderingInfo->pColorAttachments[i];
+      if (att_info->imageView == VK_NULL_HANDLE)
+         continue;
+      if (att_info->loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+         render->bg_live_mask |= BITFIELD_BIT(i);
+      if (allow_clear_fill && att_info->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+         const enum pipe_format logical =
+            hk_format_to_pipe_format(render->color_att[i].vk_format);
+         const enum pipe_format padded = hk_padded_image_format(logical);
+         if (padded == logical &&
+             hk_scaled_texture_format(padded) == PIPE_FORMAT_NONE) {
+            uint32_t clear_u32[4];
+            memcpy(clear_u32, &att_info->clearValue.color, sizeof(clear_u32));
+            const enum agx_epilog_clear_fill cf =
+               hk_partial_mrt_classify_clear_value(logical, clear_u32);
+            render->bg_clear_fill_rt |= (uint16_t)((uint32_t)cf << (i * 2));
+         }
+      }
+   }
+
    if (render->flags & VK_RENDERING_RESUMING_BIT)
       return;
 
@@ -5267,6 +5300,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    cs->cr.bg.main = render->cr.bg.main;
    cs->cr.zls_control = render->cr.zls_control;
    cs->g17p_pass_begins = true;
+   cs->bg_live_mask = render->bg_live_mask;
+   cs->bg_clear_fill_rt = render->bg_clear_fill_rt;
    render->zls_first_cs = cs;
 
    /* Reordering barrier for post-gfx, in case we had any. */
@@ -5580,8 +5615,10 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
             (clear_draw_skips_zs && (resolved_clear_z || resolved_clear_s));
       }
 
+      cmd->in_begin_rendering_clear = true;
       hk_CmdClearAttachments(hk_cmd_buffer_to_handle(cmd), clear_count,
                              clear_att, 1, &clear_rect);
+      cmd->in_begin_rendering_clear = false;
    } else {
       /* If a tile is empty, we do not want to process it, as the redundant
        * roundtrip of memory-->tilebuffer-->memory wastes a tremendous amount of
@@ -6944,7 +6981,7 @@ hk_prolog_epilog_disk_key(struct hk_device *dev, const struct hk_internal_key *k
       BITSET_WORD partitions[ARRAY_SIZE(((struct agx_shader_key *)0)->g17p_tile_partitions)];
    } h;
    memset(&h, 0, sizeof(h));
-   memcpy(h.magic, "hkpe-v1", 8);
+   memcpy(h.magic, "hkpe-v2", 8);
    h.builder = builder;
    h.stop = stop;
    h.preprocess = preprocess_nir;
@@ -7075,7 +7112,15 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
    }
 
    nir_builder b = nir_builder_init_simple_shader(0, &agx_nir_options, NULL);
-   builder(&b, key->key);
+   struct agx_fs_epilog_result epilog_res = {0};
+   if (builder == build_g17p_fs_epilog)
+      agx_nir_fs_epilog_g17p_ex(
+         &b, (const struct agx_fs_epilog_key *)key->key, &epilog_res);
+   else if (builder == agx_nir_fs_epilog)
+      agx_nir_fs_epilog_ex(
+         &b, (const struct agx_fs_epilog_key *)key->key, &epilog_res);
+   else
+      builder(&b, key->key);
 
    if (preprocess_nir)
       agx_preprocess_nir(b.shader);
@@ -7167,6 +7212,10 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
       ralloc_free(part);
       return NULL;
    }
+
+   part->info.translucent_only_for_unwritten_rts =
+      epilog_res.translucent_only_for_unwritten_rts;
+   part->info.color_rts_written = epilog_res.color_rts_written;
 
    /* ..and cache it before we return. */
    if (!hk_prolog_epilog_insert(dev, key, part)) {
@@ -7460,7 +7509,8 @@ hk_m5_uniform_blend_key(const struct agx_fs_epilog_key *key)
        key->link.broadcast_rt0 || key->link.write_z || key->link.write_s ||
        key->link.already_ran_zs || key->link.sample_mask_after_force_early ||
        key->native_spills || key->smooth_line_alpha || key->preserve_rt ||
-       key->blend.logicop_enable || key->blend.alpha_to_coverage ||
+       key->clear_fill_rt || key->blend.logicop_enable ||
+       key->blend.alpha_to_coverage ||
        key->blend.alpha_to_one || key->defer_api_sample_mask ||
        key->remap[0] != 0 || key->rt_formats[0] != PIPE_FORMAT_R8G8B8A8_UNORM ||
        key->blend.rt[0].advanced_blend || key->blend.rt[0].colormask != 0xf ||
@@ -7507,7 +7557,7 @@ hk_g17p_mono_disk_key(struct hk_device *dev, const struct hk_shader *shader,
       memcpy(parts, partitions, sizeof(parts));
 
    /* Bumped when the admission changes: refusals are cached as well. */
-   const char magic[8] = "hkmono6";
+   const char magic[8] = "hkmono7";
    const uint8_t preopt_flag = shader->g17p_mono_preoptimized ? 1 : 0;
    const size_t rodata_size =
       shader->b.binary ? shader->b.info.rodata.size_16 * 2 : 0;
@@ -7649,16 +7699,17 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
 
    /* The epilog, exactly as the split path builds it. */
    eb = nir_builder_init_simple_shader(0, &agx_nir_options, NULL);
+   struct agx_fs_epilog_result epilog_res = {0};
    if (inline_samples) {
       struct agx_fs_epilog_key pixel = *ekey;
       pixel.link.sample_shading = false;
       pixel.defer_monolithic_msaa = true;
-      agx_nir_fs_epilog(&eb, &pixel);
+      agx_nir_fs_epilog_ex(&eb, &pixel, &epilog_res);
       agx_nir_lower_sample_exports_to_end(nir);
    } else if (uniform_blend) {
-      agx_nir_fs_epilog(&eb, ekey);
+      agx_nir_fs_epilog_ex(&eb, ekey, &epilog_res);
    } else {
-      build_g17p_fs_epilog(&eb, ekey);
+      agx_nir_fs_epilog_g17p_ex(&eb, ekey, &epilog_res);
    }
    agx_preprocess_nir(eb.shader);
    if (!inline_samples && !uniform_blend)
@@ -7842,6 +7893,11 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
    if (why)
       HK_MONO_REFUSE(why);
 
+   part->info.translucent_only_for_unwritten_rts =
+      epilog_res.translucent_only_for_unwritten_rts &&
+      !shader->b.info.reads_tib;
+   part->info.color_rts_written = epilog_res.color_rts_written;
+
    if (disk)
       hk_part_disk_put(dev, disk_key, part);
    ralloc_free(mem);
@@ -7897,7 +7953,7 @@ hk_g17p_local_read_disk_key(struct hk_device *dev,
    if (partitions)
       memcpy(parts, partitions, sizeof(parts));
 
-   const char magic[8] = "hkmlr4\0";
+   const char magic[8] = "hkmlr5\0";
    const size_t size = sizeof(magic) + sizeof(shader->local_read_key) +
                        sizeof(shader->local_read_meta) + sizeof(*ekey) +
                        sizeof(*local_read) + sizeof(parts) +
@@ -8207,6 +8263,28 @@ fail:
 #undef HK_LR_FAIL
 }
 
+static bool
+hk_fs_partial_mrt_opaque_eligible(const struct hk_linked_shader *linked,
+                                  uint8_t *written_mask_out)
+{
+   *written_mask_out = 0;
+
+   if (!linked || linked->b.no_op || linked->uses_local_read_tile ||
+       linked->b.g17p_colour_classes == 0 ||
+       !linked->b.translucent_only_for_unwritten_rts ||
+       linked->b.color_rts_written == 0)
+      return false;
+
+   agx_unpack(NULL, &linked->b.fragment_control, FRAGMENT_CONTROL, fc);
+   if (fc.tag_write_disable ||
+       (fc.pass_type != AGX_PASS_TYPE_TRANSLUCENT &&
+        fc.pass_type != AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH))
+      return false;
+
+   *written_mask_out = linked->b.color_rts_written;
+   return true;
+}
+
 static struct hk_linked_shader *
 hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
                              struct hk_fast_link_key_fs *key)
@@ -8350,6 +8428,9 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
                key->epilog.blend_constant_base;
             mono_linked->g17p_emrt_heap_base = key->epilog.emrt_heap_base;
             mono_linked->g17p_prolog_uses_root = key->prolog.statistics;
+            mono_linked->partial_mrt_opaque_eligible =
+               hk_fs_partial_mrt_opaque_eligible(
+                  mono_linked, &mono_linked->partial_mrt_written_mask);
             _mesa_hash_table_insert(shader->linked.ht, mono_key_clone,
                                     mono_linked);
             return mono_linked;
@@ -8414,6 +8495,9 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
    linked->g17p_blend_constant_base = key->epilog.blend_constant_base;
    linked->g17p_emrt_heap_base = key->epilog.emrt_heap_base;
    linked->g17p_prolog_uses_root = key->prolog.statistics;
+   linked->partial_mrt_opaque_eligible =
+      hk_fs_partial_mrt_opaque_eligible(linked,
+                                        &linked->partial_mrt_written_mask);
 
    _mesa_hash_table_insert(shader->linked.ht, key_clone, linked);
    return linked;
@@ -9515,8 +9599,8 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
     * within the 0xe6600000 field mask and ORed with 0x200. It is not the
     * older-generation FRAGMENT_CONTROL location in our PRIMARY record.
     */
-   uint32_t linked_fragment_control =
-      linked_fs->b.fragment_control.opaque[0];
+   agx_unpack(NULL, &linked_fs->b.fragment_control, FRAGMENT_CONTROL, fc);
+   fc.pass_type = gfx->effective_fragment_pass_type;
 
    /* The rasterizer clips x/y at about +-1.5 NDC, and only bit 26 clear
     * stitches the pieces back into whole quads. Native keeps bit 26 for
@@ -9526,19 +9610,22 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
     * shader that needs full quads is promoted to it. A derivative shader
     * keeps bit 26 regardless (shader_tri_merge_disable), so it stays type 2
     * and keeps hidden-surface removal. */
-   if ((linked_fragment_control >> 29) == AGX_PASS_TYPE_PUNCH_THROUGH &&
+   if (fc.pass_type == AGX_PASS_TYPE_PUNCH_THROUGH &&
        render->tilebuffer.nr_samples == 1 && fs->b.info.needs_full_quads &&
        !fs->b.info.needs_quad_derivatives) {
-      linked_fragment_control =
-         (linked_fragment_control & ~BITFIELD_RANGE(29, 3)) |
-         (AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH << 29);
+      fc.pass_type = AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH;
    }
-   const uint32_t pass_type = linked_fragment_control >> 29;
-   if (pass_type != AGX_PASS_TYPE_OPAQUE &&
-       pass_type != AGX_PASS_TYPE_TRANSLUCENT &&
-       pass_type != AGX_PASS_TYPE_PUNCH_THROUGH &&
-       pass_type != AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH)
+   if (fc.pass_type != AGX_PASS_TYPE_OPAQUE &&
+       fc.pass_type != AGX_PASS_TYPE_TRANSLUCENT &&
+       fc.pass_type != AGX_PASS_TYPE_PUNCH_THROUGH &&
+       fc.pass_type != AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH)
       return hk_g17p_bind_tail_refused(__LINE__);
+
+   struct agx_fragment_control_packed fc_packed;
+   agx_pack(&fc_packed, FRAGMENT_CONTROL, cfg) {
+      cfg = fc;
+   }
+   const uint32_t linked_fragment_control = fc_packed.opaque[0];
    /* Native458934..45896c retains both stencil-control bits in the
     * same per-draw record as depth. No extra state allocation or launch. */
    uint32_t fragment_control = raster_state->fragment_control |
@@ -9588,14 +9675,14 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
           fs->info.fs.epilog_key.write_z) ||
          /* The linker's own merge-disable bit. */
          (!agx_chip_tri_merge_across_side_effects(dev->dev.chip) &&
-          (linked_fragment_control & (UINT32_C(1) << 26))),
+          fc.disable_tri_merging),
 
       /* Native forces bit26 for type 2, and for type 3 only in a multisampled
        * pass: Metal on the M4 Pro clears it for single-sample type 3 in every
        * state tried, and a 1x/4x pair differs in this bit alone. */
       .coverage_tri_merge_disable =
-         pass_type == AGX_PASS_TYPE_PUNCH_THROUGH ||
-         (pass_type == AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH &&
+         fc.pass_type == AGX_PASS_TYPE_PUNCH_THROUGH ||
+         (fc.pass_type == AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH &&
           render->tilebuffer.nr_samples > 1),
 
       /* The ISP primitive type selects the runtime override for points,
@@ -9741,6 +9828,7 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    prepared->provoking = gfx->provoking;
    prepared->occlusion_mode = gfx->occlusion.mode;
    prepared->viewport_count = viewport_count;
+   prepared->effective_fragment_pass_type = gfx->effective_fragment_pass_type;
    prepared->generate_primitive_id = gfx->generate_primitive_id;
    prepared->force_never_in_shader =
       gfx->descriptors.root.draw.force_never_in_shader;
@@ -9797,6 +9885,8 @@ hk_g17p_bind_tail_state_matches(
           prepared->provoking == gfx->provoking &&
           prepared->occlusion_mode == gfx->occlusion.mode &&
           prepared->viewport_count == MAX2(dyn->vp.viewport_count, 1) &&
+          prepared->effective_fragment_pass_type ==
+             gfx->effective_fragment_pass_type &&
           prepared->generate_primitive_id == gfx->generate_primitive_id &&
           prepared->force_never_in_shader ==
              gfx->descriptors.root.draw.force_never_in_shader &&
@@ -10076,6 +10166,58 @@ hk_default_sample_positions(unsigned nr_samples)
    }
 }
 
+static bool
+hk_m5_emit_ppp_fragment_program(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                                uint8_t **out, uint64_t fragment_program)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   __typeof__(gfx->m5_ppp_pack_memo) *pack = &gfx->m5_ppp_pack_memo;
+
+   assert(cs->m5_ppp_emitted_valid);
+   if (!agx_ppp_hal300_graphics_core_patch_program(
+          dev->dev.chip, &cs->m5_ppp_emitted_state, fragment_program)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+
+   if (pack->valid) {
+      struct agx_ppp_hal300_graphics_fields probe = pack->fields;
+      probe.fragment_program = cs->m5_ppp_emitted.fragment_program;
+      if (!memcmp(&probe, &cs->m5_ppp_emitted, sizeof(probe))) {
+         memcpy(pack->state.bytes +
+                   pack->state.offsets[AGX_PPP_HAL300_PROGRAM_RECORD] +
+                   AGX_PPP_HAL300_PROGRAM_RECORD_PAIR_OFFSET,
+                cs->m5_ppp_emitted_state.bytes +
+                   cs->m5_ppp_emitted_state
+                      .offsets[AGX_PPP_HAL300_PROGRAM_RECORD] +
+                   AGX_PPP_HAL300_PROGRAM_RECORD_PAIR_OFFSET,
+                AGX_PPP_HAL300_PROGRAM_RECORD_PAIR_SIZE);
+         pack->fields.fragment_program = fragment_program;
+      }
+   }
+
+   const unsigned idx = AGX_PPP_HAL300_PROGRAM_RECORD;
+   const uint8_t length = cs->m5_ppp_emitted_state.lengths[idx];
+   struct agx_ptr upload = hk_pool_vdm_alloc(cmd, length, 64);
+   if (!upload.cpu)
+      return false;
+   memcpy(upload.cpu,
+          cs->m5_ppp_emitted_state.bytes + cs->m5_ppp_emitted_state.offsets[idx],
+          length);
+
+   uint8_t *start = *out;
+   if (!hk_ppp_emit_state(dev->dev.chip, out, upload.gpu, length)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+   if (unlikely(dev->frame_anatomy))
+      cs->anatomy_ppp += (*out - start) / AGX_PPP_STATE_LENGTH;
+
+   cs->m5_ppp_emitted.fragment_program = fragment_program;
+   return true;
+}
+
 static void
 hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
 {
@@ -10124,6 +10266,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
          gfx->object_type == AGX_OBJECT_TYPE_TRIANGLE &&
          (dyn->rs.depth_bias.constant_factor != 0.0f ||
           dyn->rs.depth_bias.slope_factor != 0.0f);
+      agx_unpack(NULL, &linked->b.fragment_control, FRAGMENT_CONTROL, fc);
       const struct agx_ppp_hal300_graphics_fields fields = {
          .fragment_program = fragment_program,
          .varying_table = gfx->varyings,
@@ -10134,9 +10277,8 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
          .occlusion_query_mode = gfx->occlusion.mode,
          .occlusion_query_index = gfx->occlusion.index,
          .no_color_attachment = render->color_att_count == 0,
-         .fragment_pass = linked->b.fragment_control.opaque[0] >> 29,
-         .disable_tri_merging =
-            (linked->b.fragment_control.opaque[0] & BITFIELD_BIT(26)) != 0,
+         .fragment_pass = gfx->effective_fragment_pass_type,
+         .disable_tri_merging = fc.disable_tri_merging,
          .front_face_ccw =
             dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE,
          .point_size_output =
@@ -10371,7 +10513,8 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
          hk_pack_stencil_face(front_stencil_state, stencil_active);
       const struct agx_fragment_stencil_packed back_stencil =
          hk_pack_stencil_face(back_stencil_state, stencil_active);
-      const unsigned fragment_pass = linked ? linked->b.fragment_control.opaque[0] >> 29 : 0;
+      const unsigned fragment_pass =
+         linked ? gfx->effective_fragment_pass_type : 0;
       const bool has_zs_attachment =
          render->depth_att.iview || render->stencil_att.iview;
       /* v70 depth928 and depth/stencil945 use the ordinary four-sample 32x16
@@ -10590,9 +10733,18 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       fields.visibility_mode = gfx->occlusion.mode;
       fields.visibility_index = gfx->occlusion.index;
       /* The stream already latched this state (see hk_cs). */
-      if (cs->m5_ppp_emitted_valid &&
-          !memcmp(&cs->m5_ppp_emitted, &fields, sizeof(fields)))
-         return;
+      if (cs->m5_ppp_emitted_valid) {
+         if (!memcmp(&cs->m5_ppp_emitted, &fields, sizeof(fields)))
+            return;
+
+         struct agx_ppp_hal300_graphics_fields probe = cs->m5_ppp_emitted;
+         probe.fragment_program = fields.fragment_program;
+         if (!memcmp(&probe, &fields, sizeof(fields))) {
+            hk_m5_emit_ppp_fragment_program(cmd, cs, out,
+                                            fields.fragment_program);
+            return;
+         }
+      }
 
       __typeof__(gfx->m5_ppp_pack_memo) *pack = &gfx->m5_ppp_pack_memo;
       if (!pack->valid || memcmp(&pack->fields, &fields, sizeof(fields))) {
@@ -11104,6 +11256,7 @@ hk_vs_link_key_build(struct hk_device *dev, struct hk_shader *sw_vs, bool hw,
                      enum agx_index_size index_size, bool restart,
                      const struct vk_vertex_input_state *vi,
                      const uint16_t *vi_binding_strides,
+                     VkPipelineRobustnessBufferBehaviorEXT vi_robustness,
                      struct hk_fast_link_key_vs *key)
 {
    *key = (struct hk_fast_link_key_vs){
@@ -11113,14 +11266,8 @@ hk_vs_link_key_build(struct hk_device *dev, struct hk_shader *sw_vs, bool hw,
                                  : 0) +
                              (sw_vs->info.agx3_gen1_fragment_rq ? 168 : 0),
 
-      /* FIXME: handle pipeline robustness "properly" */
       .prolog.robustness.level =
-         (dev->vk.enabled_features.robustBufferAccess2 ||
-          dev->vk.enabled_features.pipelineRobustness)
-            ? AGX_ROBUSTNESS_D3D
-         : dev->vk.enabled_features.robustBufferAccess
-            ? AGX_ROBUSTNESS_GL
-            : AGX_ROBUSTNESS_DISABLED,
+         hk_vertex_robustness_level(dev, sw_vs, vi_robustness),
       .prolog.robustness.soft_fault = agx_has_soft_fault(&dev->dev),
       .prolog.static_vi = !sw_vs->info.vs.use_prolog,
    };
@@ -11224,7 +11371,8 @@ hk_fill_fast_link_key_vs(struct hk_cmd_buffer *cmd, struct hk_shader *sw_vs,
    hk_vs_link_key_build(hk_cmd_buffer_device(cmd), sw_vs, sw_vs == hw_vs,
                         vk_topology_to_mesa(dyn->ia.primitive_topology),
                         indexed, index_size, restart, dyn->vi,
-                        dyn->vi_binding_strides, key);
+                        dyn->vi_binding_strides, dyn->vertex_input_robustness,
+                        key);
    hk_uvs_fs_masks(cmd, sw_vs, &key->uvs_flat, &key->uvs_linear);
 }
 
@@ -11558,6 +11706,78 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
       }
    }
 
+   /* Epilog constant clear-fill: when an opaque partial-MRT shader leaves
+    * LOAD_OP_CLEAR attachment(s) untouched on the first stream of a pass and
+    * no prior user draw has written them, materialize their constant clear
+    * value in the epilog so the draw writes every live attachment and keeps
+    * OPAQUE/PUNCH_THROUGH ISP HSR even across hardware partial renders. */
+   if (in->cmd && in->cmd->current_cs.gfx && !in->cmd->in_meta &&
+       !in->cmd->in_clear_attachments &&
+       (key->epilog.g17p_tile_formats || key->epilog.native_epilog) && fs &&
+       !fs->b.info.reads_tib && !key->local_read.enabled &&
+       !key->epilog.native_spills && !key->epilog.blend.logicop_enable &&
+       !key->epilog.preserve_rt && !key->epilog.blend.alpha_to_coverage &&
+       !key->epilog.blend.alpha_to_one &&
+       !key->epilog.link.sample_mask_after_force_early &&
+       !key->epilog.defer_api_sample_mask && !key->epilog.link.broadcast_rt0 &&
+       in->cmd->current_cs.gfx->bg_clear_fill_rt != 0) {
+      const struct hk_cs *cs = in->cmd->current_cs.gfx;
+      const unsigned opaque_blend = agx_pack_blend_standard(
+         PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO,
+         PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO);
+
+      uint8_t bound_mask = 0;
+      uint8_t app_written_mask = 0;
+      bool written_opaque = true;
+      for (unsigned rt = 0; rt < ARRAY_SIZE(key->epilog.rt_formats); ++rt) {
+         if (key->epilog.rt_formats[rt] == PIPE_FORMAT_NONE)
+            continue;
+         bound_mask |= BITFIELD_BIT(rt);
+         const int loc = key->epilog.remap[rt];
+         if (loc < 0 || !(key->epilog.link.loc_written & BITFIELD_BIT(loc)))
+            continue;
+         const unsigned comps =
+            util_format_get_nr_components(key->epilog.rt_formats[rt]);
+         if (key->epilog.blend.rt[rt].advanced_blend ||
+             key->epilog.blend.rt[rt].mode != opaque_blend ||
+             (key->epilog.blend.rt[rt].colormask & BITFIELD_MASK(comps)) !=
+                BITFIELD_MASK(comps)) {
+            written_opaque = false;
+            break;
+         }
+         app_written_mask |= BITFIELD_BIT(rt);
+      }
+
+      const uint8_t unwritten_mask = bound_mask & ~app_written_mask;
+      if (written_opaque && app_written_mask != 0 && unwritten_mask != 0 &&
+          (cs->user_color_written_mask & unwritten_mask) == 0) {
+         uint16_t candidate_cf = 0;
+         bool all_live_covered = true;
+         u_foreach_bit(rt, unwritten_mask) {
+            if (!(cs->bg_live_mask & BITFIELD_BIT(rt)))
+               continue;
+            const unsigned cf = (cs->bg_clear_fill_rt >> (rt * 2)) & 3u;
+            if (cf == AGX_EPILOG_CLEAR_FILL_NONE || in->tib->spilled[rt] ||
+                key->epilog.scaled_formats[rt] != PIPE_FORMAT_NONE ||
+                key->epilog.blend_formats[rt] != PIPE_FORMAT_NONE) {
+               all_live_covered = false;
+               break;
+            }
+            candidate_cf |= (uint16_t)(cf << (rt * 2));
+         }
+
+         if (all_live_covered && candidate_cf != 0) {
+            key->epilog.clear_fill_rt = candidate_cf;
+            u_foreach_bit(rt, agx_fs_epilog_clear_fill_mask(candidate_cf)) {
+               key->epilog.blend.rt[rt] = (struct agx_blend_rt_key){
+                  .colormask = BITFIELD_MASK(4),
+                  .mode = opaque_blend,
+               };
+            }
+         }
+      }
+   }
+
    return true;
 }
 
@@ -11724,24 +11944,28 @@ hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs_api,
 
    struct hk_shader *hw = &vs_api->variants[HK_VS_VARIANT_HW];
    if (hw_program && hw->compiled && !hw->info.vs.attribs_read) {
-      hk_vs_link_key_build(dev, hw, true, MESA_PRIM_TRIANGLES, false,
-                           AGX_INDEX_SIZE_U32, false, &no_vi, no_strides,
-                           &key);
+      hk_vs_link_key_build(
+         dev, hw, true, MESA_PRIM_TRIANGLES, false, AGX_INDEX_SIZE_U32, false,
+         &no_vi, no_strides,
+         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT, &key);
       hk_get_fast_linked(dev, hw, &key);
    }
 
    struct hk_shader *sw = &vs_api->variants[HK_VS_VARIANT_SW];
    if (sw_program && sw->compiled && !sw->info.vs.attribs_read) {
-      hk_vs_link_key_build(dev, sw, false, MESA_PRIM_TRIANGLES, false,
-                           AGX_INDEX_SIZE_U32, false, &no_vi, no_strides,
-                           &key);
+      hk_vs_link_key_build(
+         dev, sw, false, MESA_PRIM_TRIANGLES, false, AGX_INDEX_SIZE_U32, false,
+         &no_vi, no_strides,
+         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT, &key);
       hk_get_fast_linked(dev, sw, &key);
 
       const enum agx_index_size sizes[] = {
          AGX_INDEX_SIZE_U8, AGX_INDEX_SIZE_U16, AGX_INDEX_SIZE_U32};
       for (unsigned i = 0; i < ARRAY_SIZE(sizes); ++i) {
-         hk_vs_link_key_build(dev, sw, false, MESA_PRIM_TRIANGLES, true,
-                              sizes[i], false, &no_vi, no_strides, &key);
+         hk_vs_link_key_build(
+            dev, sw, false, MESA_PRIM_TRIANGLES, true, sizes[i], false, &no_vi,
+            no_strides,
+            VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT, &key);
          hk_get_fast_linked(dev, sw, &key);
       }
    }
@@ -11758,6 +11982,20 @@ hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs_api,
  * flush -- has already run, otherwise it answers for a different draw than the
  * one that gets recorded.
  */
+static inline bool
+hk_fs_clear_fill_stale(const struct hk_cmd_buffer *cmd,
+                       const struct hk_cs *cs)
+{
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if (!cs || !gfx->fast_link_fs.valid)
+      return false;
+   if (cs->bg_clear_fill_rt != gfx->fast_link_fs.bg_clear_fill_rt)
+      return true;
+   const uint8_t cf_mask =
+      agx_fs_epilog_clear_fill_mask(gfx->fast_link_fs.key.epilog.clear_fill_rt);
+   return (cs->user_color_written_mask & cf_mask) != 0;
+}
+
 static bool
 hk_gfx_republishes_render_state(struct hk_cmd_buffer *cmd)
 {
@@ -11767,6 +12005,7 @@ hk_gfx_republishes_render_state(struct hk_cmd_buffer *cmd)
 
    return vk_dynamic_graphics_state_any_dirty(dyn) || gfx->dirty ||
           gfx->descriptors.root_dirty || gfx->shaders_dirty ||
+          hk_fs_clear_fill_stale(cmd, cmd->current_cs.gfx) ||
           sw_vs->b.info.uses_draw_id || sw_vs->b.info.uses_base_param ||
           (gfx->linked[MESA_SHADER_VERTEX] &&
            gfx->linked[MESA_SHADER_VERTEX]->b.uses_base_param);
@@ -12003,7 +12242,7 @@ tail:
          cs->anatomy_vdm_new++;
       cs->anatomy_last_program = pipeline_program;
    }
-   if (agx_chip_native_agx3(dev->dev.chip)) {
+   if (hk_vertex_state_has_bind_tail(dev->dev.chip)) {
       if (!hk_g17p_emit_native_bind_tail(
              cmd, cs, &out, tail_known_match,
              agx_chip_native_hal200(dev->dev.chip), tail_emitted)) {
@@ -12102,6 +12341,55 @@ hk_flush_draw_params_and_id(struct hk_cmd_buffer *cmd,
       gfx->draw_id_ptr = 0;
       gfx->g17p_draw_id_host_valid = false;
    }
+}
+
+static void
+hk_update_effective_fragment_pass_type(struct hk_cmd_buffer *cmd,
+                                       struct hk_cs *cs)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_linked_shader *linked_fs = gfx->linked[MESA_SHADER_FRAGMENT];
+
+   if (!linked_fs) {
+      gfx->effective_fragment_pass_type = AGX_PASS_TYPE_OPAQUE;
+      return;
+   }
+
+   agx_unpack(NULL, &linked_fs->b.fragment_control, FRAGMENT_CONTROL, fc);
+   const uint8_t linked_pass = fc.pass_type;
+   if (agx_chip_isa(dev->dev.chip) != AGX_ISA_AGX3) {
+      gfx->effective_fragment_pass_type = linked_pass;
+      return;
+   }
+
+   const struct hk_shader *fs = hk_bound_fs(cmd);
+   if (fs && linked_fs->g17p_layout)
+      fs = linked_fs->g17p_layout;
+   if (fs)
+      fs = hk_linked_shader_source((struct hk_shader *)fs, linked_fs);
+
+   const bool tag_write_disable = fc.tag_write_disable;
+   const bool promote_pt_for_full_quads =
+      agx_chip_native_agx3(dev->dev.chip) &&
+      gfx->render.tilebuffer.nr_samples == 1 && fs &&
+      fs->b.info.needs_full_quads && !fs->b.info.needs_quad_derivatives;
+   const uint8_t color_written =
+      linked_fs->partial_mrt_opaque_eligible
+         ? linked_fs->partial_mrt_written_mask
+         : gfx->fast_link_fs.color_written;
+   const uint8_t preserved_color_mask =
+      cs->bg_live_mask | cs->user_color_written_mask;
+
+   gfx->effective_fragment_pass_type = hk_partial_mrt_hsr_select_pass_type(
+      linked_pass, linked_fs->partial_mrt_opaque_eligible, tag_write_disable,
+      hk_rast_discard(cmd), cmd->in_clear_attachments,
+      promote_pt_for_full_quads, color_written, preserved_color_mask,
+      &cs->opaque_color_written);
+
+   if (!hk_rast_discard(cmd) && !tag_write_disable &&
+       !cmd->in_begin_rendering_clear)
+      cs->user_color_written_mask |= gfx->fast_link_fs.app_color_written;
 }
 
 static __attribute__((noinline)) void
@@ -12277,11 +12565,15 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       (linked_prolog->adjacency || !linked_prolog->hw) &&
       linked_prolog->sw_index_size_B !=
          (draw.indexed ? agx_index_size_to_B(draw.index_size) : 0);
+   const bool vi_robustness_changed =
+      !native_mesh &&
+      linked_prolog->robustness.level !=
+         hk_vertex_robustness_level(dev, sw_vs, dyn->vertex_input_robustness);
 
    if (!native_mesh && (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
         IS_DIRTY(VI_BINDING_STRIDES) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
         vgt_dirty || !gfx->fast_link_vs.valid || sw_index_size_changed ||
-        hk_fast_link_vs_uvs_stale(cmd, sw_vs))) {
+        vi_robustness_changed || hk_fast_link_vs_uvs_stale(cmd, sw_vs))) {
       struct hk_fast_link_key_vs key;
       hk_fill_fast_link_key_vs(cmd, sw_vs, hw_vs, draw.indexed,
                                draw.index_size, draw.restart, &key);
@@ -12323,6 +12615,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        hk_stat_enabled(hk_pipeline_stat_addr(
           cmd, VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)) !=
           gfx->fast_link_fs.key.prolog.statistics ||
+       hk_fs_clear_fill_stale(cmd, cs) ||
        !gfx->fast_link_fs.valid) {
 
       struct hk_fast_link_key_fs key;
@@ -12336,15 +12629,19 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          cs->current = out;
          return;
       }
-      gfx->fast_link_fs.color_written =
+      gfx->fast_link_fs.app_color_written =
          hk_fs_color_written(&key, agx_chip_g17_m5(dev->dev.chip));
+      gfx->fast_link_fs.color_written =
+         gfx->fast_link_fs.app_color_written |
+         agx_fs_epilog_clear_fill_mask(key.epilog.clear_fill_rt);
+      gfx->fast_link_fs.bg_clear_fill_rt = cs ? cs->bg_clear_fill_rt : 0;
       gfx->fast_link_fs.reads_tib =
          fs->b.info.reads_tib ||
          (gfx->linked[MESA_SHADER_FRAGMENT] &&
           gfx->linked[MESA_SHADER_FRAGMENT]->uses_local_read_tile);
       gfx->fast_link_fs.desc_gen = desc->generation;
    }
-   gfx->render.color_written |= gfx->fast_link_fs.color_written;
+   gfx->render.color_written |= gfx->fast_link_fs.app_color_written;
    gfx->render.color_read |= gfx->fast_link_fs.reads_tib;
 
    hk_flush_draw_params_and_id(cmd, sw_vs, gfx->linked[MESA_SHADER_VERTEX],
@@ -12443,6 +12740,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    struct hk_linked_shader *linked_fs = gfx->linked[MESA_SHADER_FRAGMENT];
    bool linked_vs_dirty = IS_LINKED_DIRTY(VERTEX);
    bool linked_fs_dirty = IS_LINKED_DIRTY(FRAGMENT);
+   hk_update_effective_fragment_pass_type(cmd, cs);
    const bool prepared_varyings =
       agx_chip_native_agx3(dev->dev.chip) &&
       hk_g17p_prepared_bind_tail_matches(cmd, &gfx->g17p_bind_tail);
@@ -12723,10 +13021,10 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                 prepared_varyings && gfx->root == prepared_varyings_root,
                 &tail_emitted))
             return;
-         if (agx_chip_native_agx3(dev->dev.chip)) {
+         *g17p_native_bind_tail_emitted_out =
+            hk_vertex_state_bind_tail(dev->dev.chip, tail_emitted);
+         if (agx_chip_native_agx3(dev->dev.chip))
             g17p_native_ppp_handled = true;
-            *g17p_native_bind_tail_emitted_out = tail_emitted;
-         }
          break;
       }
 
@@ -12944,7 +13242,8 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (!hk_agx3_publish_vertex_state(cmd, cs, &out, hw_vs, pipeline_program,
                                      draw, true, false, &tail_emitted))
       return true;
-   *g17p_native_bind_tail_emitted_out = tail_emitted;
+   *g17p_native_bind_tail_emitted_out =
+      hk_vertex_state_bind_tail(dev->dev.chip, tail_emitted);
 
    cs->current = out;
    if (vk_command_buffer_has_error(&cmd->vk))
@@ -12965,6 +13264,98 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                                         ordinary_draw_path,
                                         g17p_native_bind_tail_emitted_out))
       return;
+
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+
+   if (likely(hk_root_only_flush_supported(dev->dev.chip, cs) &&
+              ordinary_draw_path && !dev->frame_anatomy &&
+              !vk_dynamic_graphics_state_any_dirty(dyn) && !gfx->dirty &&
+              !gfx->shaders_dirty && !gfx->linked_dirty &&
+              !gfx->shaders[MESA_SHADER_TESS_EVAL] &&
+              !gfx->shaders[MESA_SHADER_GEOMETRY] &&
+              !gfx->shaders[MESA_SHADER_MESH] &&
+              gfx->fast_link_vs.valid && gfx->fast_link_fs.valid &&
+              gfx->fast_link_vs.key.prolog.hw &&
+              !gfx->fast_link_vs.key.prolog.adjacency &&
+              !(dyn->ms.rasterization_samples &&
+                !gfx->render.tilebuffer.nr_samples) &&
+              gfx->linked[MESA_SHADER_VERTEX] &&
+              !gfx->linked[MESA_SHADER_VERTEX]->sw_indexing &&
+              gfx->linked[MESA_SHADER_FRAGMENT])) {
+      *g17p_native_bind_tail_emitted_out = false;
+      struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
+      struct hk_shader *fs = hk_bound_fs(cmd);
+      struct hk_linked_shader *linked_vs = gfx->linked[MESA_SHADER_VERTEX];
+      struct hk_linked_shader *linked_fs = gfx->linked[MESA_SHADER_FRAGMENT];
+      struct hk_shader *fs_src = hk_linked_shader_source(fs, linked_fs);
+
+      if (!hk_fast_link_vs_uvs_stale(cmd, hw_vs) &&
+          hk_stat_enabled(hk_pipeline_stat_addr(
+             cmd,
+             VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)) ==
+             gfx->fast_link_fs.key.prolog.statistics) {
+         if (!gfx->descriptors.root_dirty && !hw_vs->b.info.uses_draw_id &&
+             !linked_vs->b.uses_base_param)
+            return;
+
+         if (!linked_vs->b.uses_base_param && !hw_vs->b.info.uses_draw_id &&
+             !fs_src->info.agx3_gen1_fragment_rq) {
+            /* hk_flush_gfx_state() reserves HK_GFX_DRAW_RESERVATION (0x2000)
+             * bytes via hk_ensure_cs_has_space() before calling us, matching
+             * hk_flush_dynamic_state_slow(). */
+            assert(cs->current + 0x1000 < cs->end &&
+                   "HK_GFX_DRAW_RESERVATION already ensured space");
+            gfx->render.color_written |= gfx->fast_link_fs.color_written;
+            gfx->render.color_read |= gfx->fast_link_fs.reads_tib;
+
+            const uint64_t prev_fs_root = gfx->fs_root;
+            gfx->root =
+               hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+            if (unlikely(!gfx->root))
+               return;
+
+            uint8_t *out = cs->current;
+            const uint64_t pipeline_program =
+               hk_upload_usc_words(cmd, hw_vs, linked_vs);
+            if (unlikely(vk_command_buffer_has_error(&cmd->vk))) {
+               cs->current = out;
+               return;
+            }
+
+            bool tail_emitted = false;
+            if (unlikely(!hk_agx3_publish_vertex_state(
+                   cmd, cs, &out, hw_vs, pipeline_program, draw, true, false,
+                   &tail_emitted)))
+               return;
+            *g17p_native_bind_tail_emitted_out =
+               hk_vertex_state_bind_tail(dev->dev.chip, tail_emitted);
+
+            const uint64_t fs_root = hk_agx3_fragment_root_select(
+               gfx, fs_src->info.agx3_root_reads, fs_src->root_descriptor_size,
+               true, true);
+            if (fs_root != prev_fs_root) {
+               const uint64_t fragment_program =
+                  hk_upload_usc_words(cmd, fs, linked_fs);
+               if (unlikely(vk_command_buffer_has_error(&cmd->vk))) {
+                  cs->current = out;
+                  return;
+               }
+               if (fragment_program != cs->m5_ppp_emitted.fragment_program &&
+                   unlikely(!hk_m5_emit_ppp_fragment_program(
+                      cmd, cs, &out, fragment_program))) {
+                  cs->current = out;
+                  return;
+               }
+            }
+
+            cs->current = out;
+            gfx->descriptors.root_dirty = false;
+            return;
+         }
+      }
+   }
 
    hk_flush_dynamic_state_slow(
       cmd, cs, draw_id, draw, ordinary_draw_path,
@@ -13063,9 +13454,12 @@ hk_needs_index_robustness(struct hk_cmd_buffer *cmd, struct agx_draw *draw,
          return true;
    }
 
-   if (!(dev->vk.enabled_features.robustBufferAccess ||
-         dev->vk.enabled_features.robustBufferAccess2 ||
-         dev->vk.enabled_features.pipelineRobustness))
+   const struct hk_api_shader *api_vs = gfx->shaders[MESA_SHADER_VERTEX];
+   const struct hk_shader *vs =
+      api_vs ? &api_vs->variants[HK_VS_VARIANT_HW] : NULL;
+   if (hk_vertex_robustness_level(
+          dev, vs, cmd->vk.dynamic_graphics_state.vertex_input_robustness) ==
+       AGX_ROBUSTNESS_DISABLED)
       return false;
 
    /* A conditionally lowered direct draw has an immutable indirect record:
@@ -13440,8 +13834,13 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
                                          false)) {
                lr_enabled = lr_key.local_read.enabled;
                if (hk_update_fast_linked(cmd, fs, &lr_key)) {
-                  gfx->fast_link_fs.color_written =
+                  gfx->fast_link_fs.app_color_written =
                      hk_fs_color_written(&lr_key, agx_chip_g17_m5(dev->dev.chip));
+                  gfx->fast_link_fs.color_written =
+                     gfx->fast_link_fs.app_color_written |
+                     agx_fs_epilog_clear_fill_mask(lr_key.epilog.clear_fill_rt);
+                  gfx->fast_link_fs.bg_clear_fill_rt =
+                     cs ? cs->bg_clear_fill_rt : 0;
                   gfx->fast_link_fs.reads_tib =
                      fs->b.info.reads_tib ||
                      (gfx->linked[MESA_SHADER_FRAGMENT] &&
@@ -15087,7 +15486,8 @@ hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
    if (gfx->shaders_dirty || gfx->linked_dirty || gfx->dirty ||
        desc->root_dirty || desc->push_dirty ||
        vk_dynamic_graphics_state_any_dirty(dyn) ||
-       !gfx->fast_link_vs.valid || !gfx->fast_link_fs.valid)
+       !gfx->fast_link_vs.valid || !gfx->fast_link_fs.valid ||
+       hk_fs_clear_fill_stale(cmd, cmd->current_cs.gfx))
       return false;
 
    struct hk_api_shader *fs_obj = gfx->shaders[MESA_SHADER_FRAGMENT];
@@ -15194,6 +15594,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
 
       /* Only the native bind tail consumes this (hk_agx3_publish_vertex_state),
        * as in hk_flush_dynamic_state_slow(). */
+      hk_update_effective_fragment_pass_type(cmd, cs);
       const bool prepared_varyings =
          agx_chip_native_agx3(dev->dev.chip) &&
          hk_g17p_prepared_bind_tail_matches(cmd, &gfx->g17p_bind_tail);
@@ -16509,6 +16910,428 @@ hk_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer,
       commandBuffer, hk_buffer_address_ro(buffer, offset), drawCount, stride);
 }
 
+static bool
+hk_vdm_spans_grow(struct hk_cmd_buffer *cmd,
+                  struct libagx_vdm_draw_span **spans,
+                  struct libagx_vdm_draw_span *stack_spans,
+                  uint32_t *span_cap, uint32_t num_spans)
+{
+   uint32_t new_cap = *span_cap * 2;
+   struct libagx_vdm_draw_span *grown =
+      malloc((size_t)new_cap * sizeof(*grown));
+   if (!grown) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return false;
+   }
+   memcpy(grown, *spans, (size_t)num_spans * sizeof(*grown));
+   if (*spans != stack_spans)
+      free(*spans);
+   *spans = grown;
+   *span_cap = new_cap;
+   return true;
+}
+
+static bool
+hk_vdm_spans_append_one(struct hk_cmd_buffer *cmd,
+                        struct libagx_vdm_draw_span **spans,
+                        struct libagx_vdm_draw_span *stack_spans,
+                        uint32_t *span_cap, uint32_t *num_spans,
+                        uint32_t draw_id, uint64_t draw_addr)
+{
+   if (libagx_vdm_span_append(*spans, num_spans, *span_cap, draw_id, draw_addr))
+      return true;
+   if (!hk_vdm_spans_grow(cmd, spans, stack_spans, span_cap, *num_spans))
+      return false;
+
+   ASSERTED bool appended =
+      libagx_vdm_span_append(*spans, num_spans, *span_cap, draw_id, draw_addr);
+   assert(appended);
+   return true;
+}
+
+static bool
+hk_vdm_spans_append_range(struct hk_cmd_buffer *cmd,
+                          struct libagx_vdm_draw_span **spans,
+                          struct libagx_vdm_draw_span *stack_spans,
+                          uint32_t *span_cap, uint32_t *num_spans,
+                          uint32_t first, uint32_t count, uint64_t base_addr,
+                          uint32_t stride)
+{
+   assert(count > 0 && stride > 0);
+   if (*num_spans > 0) {
+      struct libagx_vdm_draw_span *last = &(*spans)[*num_spans - 1];
+      if (last->first + last->count == first && last->stride == stride &&
+          base_addr == last->base_addr + (uint64_t)last->count * stride) {
+         last->count += count;
+         return true;
+      }
+   }
+
+   if (*num_spans >= *span_cap &&
+       !hk_vdm_spans_grow(cmd, spans, stack_spans, span_cap, *num_spans))
+      return false;
+
+   (*spans)[(*num_spans)++] = (struct libagx_vdm_draw_span){
+      .base_addr = base_addr,
+      .first = first,
+      .count = count,
+      .stride = stride,
+   };
+   return true;
+}
+
+/*
+ * Fast path for vkCmdDrawIndirectCount / vkCmdDrawIndexedIndirectCount:
+ *
+ * Record the maxDrawCount indirect draws directly against the application's
+ * indirect buffer (avoiding the O(maxDrawCount) copy/zero pass), track each
+ * draw's starting VDM GPU address as compact constant-stride spans, and
+ * dispatch a 1-thread pre-graphics compute kernel that overwrites the first
+ * 8 bytes of draw `*countBuffer` with a non-returning VDM_STREAM_LINK jumping
+ * past the entire multi-draw.
+ *
+ * When draws 1..maxDrawCount-1 do not republish per-draw vertex state on
+ * native AGX3 / HAL300 targets, emit them chunk-by-chunk from a prepacked
+ * indirect-record template (updating only the two indirect-buffer address
+ * words per draw) so CPU recording stays linear in memory bandwidth rather
+ * than per-draw state overhead.
+ *
+ * Returns true if this path handled the command (including on command-buffer
+ * error), or false to fall back to the generic libagx_predicate_indirect path.
+ */
+static bool
+hk_draw_indirect_count_vdm_truncate(struct hk_cmd_buffer *cmd,
+                                    struct hk_buffer *buffer,
+                                    VkDeviceSize offset, uint64_t in,
+                                    uint64_t count_addr, uint32_t maxDrawCount,
+                                    uint32_t stride, bool indexed)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   const size_t out_stride = sizeof(uint32_t) * (indexed ? 5 : 4);
+
+   /* Reusable command buffers patch the VDM stream in place across serial
+    * submissions (saving/restoring the previously patched 8 bytes). Concurrent
+    * submissions of the same command buffer would race on that state. */
+   if (maxDrawCount <= 1 || !agx_chip_vdm_stream_link_supported(dev->dev.chip) ||
+       (cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) ||
+       stride < out_stride || !in)
+      return false;
+
+   /* Require every recorded indirect-command address to lie within the bound
+    * buffer so no VDM record references out-of-range GPU addresses. */
+   if (offset > buffer->vk.size ||
+       (uint64_t)stride * (maxDrawCount - 1) + out_stride >
+          buffer->vk.size - offset)
+      return false;
+
+   /* Exclude draws that dispatch per-draw pre-graphics compute work, split the
+    * graphics control stream, use multiview, or emit transform feedback. */
+   if (gfx->shaders[MESA_SHADER_GEOMETRY] ||
+       gfx->shaders[MESA_SHADER_TESS_CTRL] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       mesa_prim_has_adjacency(
+          vk_topology_to_mesa(dyn->ia.primitive_topology)) ||
+       hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
+                                       cmd->conditional_meta) ||
+       (gfx->descriptors.root.draw.pipeline_stats_flags &
+        (VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT |
+         VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT |
+         VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT |
+         VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
+         VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT)) ||
+       hk_prims_generated_active(cmd) || gfx->xfb_enabled ||
+       gfx->render.view_mask ||
+       (dyn->ms.rasterization_samples && !gfx->render.tilebuffer.nr_samples))
+      return false;
+
+   /* Draws with depthBiasEnable can split the graphics control stream on a
+    * dbias_is_int transition inside hk_flush_gfx_state(); keep them on the
+    * O(maxDrawCount) predicate pass. */
+   if (dyn->rs.depth_bias.enable) {
+      perf_debug(cmd, "DrawIndirectCount: depthBiasEnable falls back to "
+                      "O(maxDrawCount) predicate pass");
+      return false;
+   }
+
+   if (indexed) {
+      struct hk_addr_range ib = gfx->index.buffer;
+      struct agx_draw probe =
+         agx_draw_indexed_indirect(in, ib.addr, ib.range, 0, 0);
+      probe.restart = dyn->ia.primitive_restart_enable;
+      probe.index_size = gfx->index.size;
+      if (agx_chip_native_or_m5(dev->dev.chip) &&
+          probe.index_buffer_range_B == 0) {
+         probe.index_buffer = AGX_ZERO_PAGE_ADDRESS;
+         probe.index_buffer_range_B = 4;
+         probe.start = 0;
+      }
+      if ((probe.index_size != AGX_INDEX_SIZE_U8 &&
+           probe.index_size != AGX_INDEX_SIZE_U16 &&
+           probe.index_size != AGX_INDEX_SIZE_U32) ||
+          !probe.index_buffer || hk_needs_index_robustness(cmd, &probe, NULL))
+         return false;
+   }
+
+   /* Rule out mid-draw graphics stream splits in hk_flush_gfx_state(), leaving
+    * margin for draw 0's own scissor/depth-bias records before subsequent draws
+    * reuse the same tail. */
+   struct hk_cs *existing = cmd->current_cs.gfx;
+   if (existing) {
+      const unsigned ppp_margin =
+         2 * (AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS + 1);
+      if (existing->m5_continued_pass ||
+          (agx_chip_native_agx3(dev->dev.chip) &&
+           (existing->scissor.size / AGX_SCISSOR_LENGTH + ppp_margin >
+               UINT16_MAX ||
+            existing->depth_bias.size / AGX_DEPTH_BIAS_LENGTH + ppp_margin >
+               UINT16_MAX)))
+         return false;
+   }
+
+   struct hk_cs *cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
+   if (!cs)
+      return true;
+
+   struct libagx_vdm_draw_span stack_spans[64];
+   struct libagx_vdm_draw_span *spans = stack_spans;
+   uint32_t span_cap = ARRAY_SIZE(stack_spans);
+   uint32_t num_spans = 0;
+
+   int eligible = agx_chip_native_or_m5(dev->dev.chip) ? -1 : 0;
+   struct hk_addr_range ib = gfx->index.buffer;
+
+   /* Draw 0 flushes any pending graphics state through the standard path. */
+   {
+      hk_ensure_cs_has_space(cmd, cs, HK_GFX_DRAW_RESERVATION);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         goto out;
+
+      const uint64_t draw_addr = hk_cs_current_addr(cs);
+      const uint64_t chunk_before = cs->chunk.gpu;
+      const uint8_t *cur_before = cs->current;
+
+      struct agx_draw draw0 =
+         indexed ? agx_draw_indexed_indirect(in, ib.addr, ib.range, 0, 0)
+                 : agx_draw_indirect(in);
+      hk_draw_indirect_record(cmd, 0, draw0, &eligible);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         goto out;
+
+      if (unlikely(!libagx_vdm_draw_site_valid(cs, cmd->current_cs.gfx,
+                                               chunk_before, cs->chunk.gpu,
+                                               cur_before, cs->current))) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         goto out;
+      }
+
+      if (!hk_vdm_spans_append_one(cmd, &spans, stack_spans, &span_cap,
+                                   &num_spans, 0, draw_addr))
+         goto out;
+   }
+
+   /* Fast chunked template emission for draws 1..maxDrawCount-1 when every
+    * subsequent record is an identical native AGX3 / HAL300 indirect Index
+    * List differing only in its 48-bit indirect-command pointer. */
+   bool emitted_fast = false;
+   const uint64_t last_in = in + (uint64_t)stride * (maxDrawCount - 1);
+   if (agx_chip_native_or_m5(dev->dev.chip) &&
+       !hk_gfx_republishes_render_state(cmd) && (in & 3u) == 0 &&
+       last_in >= in && last_in < (UINT64_C(1) << 48)) {
+      struct agx_draw next_draw =
+         indexed ? agx_draw_indexed_indirect(in + stride, ib.addr, ib.range, 0, 0)
+                 : agx_draw_indirect(in + stride);
+      hk_g17p_normalize_indirect_draw(cmd, &next_draw);
+
+      uint32_t size_word = 0;
+      bool ib_ok = !indexed;
+      if (indexed &&
+          agx_draw_indirect_index_buffer_size_word(next_draw, &size_word)) {
+         const unsigned ib_align = agx_index_size_to_B(next_draw.index_size);
+         const uint64_t limit = UINT64_C(1) << 48;
+         ib_ok = next_draw.index_buffer &&
+                 (next_draw.index_buffer & (ib_align - 1)) == 0 &&
+                 next_draw.index_buffer < limit &&
+                 next_draw.index_buffer_range_B > 0 &&
+                 next_draw.index_buffer_range_B <= limit - next_draw.index_buffer;
+      }
+
+      const enum agx_chip record_chip =
+         agx_vdm_index_list_record_chip(dev->dev.chip);
+      struct agx_vdm_index_list_indirect_words tmpl;
+      if (ib_ok && hk_g17p_indirect_records_eligible(cmd, &next_draw, false) &&
+          agx_vdm_index_list_indirect_pack_words(
+             record_chip, (uint8_t)gfx->topology, indexed, next_draw.restart,
+             (uint8_t)next_draw.index_size,
+             indexed ? next_draw.index_buffer : 0, next_draw.b.ptr,
+             indexed ? hk_draw_restart_index(cmd, next_draw) : 0, size_word,
+             &tmpl)) {
+         const unsigned rec_words = tmpl.count;
+         const uint32_t rec_bytes = rec_words * sizeof(uint32_t);
+         const unsigned addr_hi_idx = indexed ? 4u : 1u;
+         const unsigned addr_lo_idx = indexed ? 5u : 2u;
+         const uint32_t remaining = maxDrawCount - 1;
+         assert(rec_bytes >= AGX_VDM_STREAM_LINK_LENGTH);
+
+         /* Hoist per-draw bookkeeping once for draws 1..maxDrawCount-1,
+          * matching hk_g17p_emit_indirect_record(..., republishes=false). */
+         hk_g17p_note_depth_use(cmd);
+         cs->g17p_primitive_bound = UINT64_MAX;
+         cs->stats.calls += remaining;
+         hk_upload_stat(cmd, draws, remaining);
+         if (agx_chip_native_agx3(dev->dev.chip) ||
+             (agx_chip_g17_m5(dev->dev.chip) && indexed))
+            cs->restart_index_set = false;
+         hk_note_attachmentless_draw(cmd, cs);
+         hk_note_pre_raster_images(cmd, cs);
+         hk_m5_note_render_resources(cmd, cs);
+         if (unlikely(dev->frame_anatomy)) {
+            hk_frame_anatomy_note_fs(cs, hk_bound_fs(cmd));
+            hk_frame_anatomy_note_vs(cs, hk_bound_hw_vs(gfx));
+            hk_frame_anatomy_note_m5_fragment(cs);
+         }
+         cs->stats.cmds += remaining;
+
+         const size_t reserve = AGX_VDM_STREAM_LINK_LENGTH + HK_CS_SPACE_PADDING;
+         uint32_t draw_id = 1;
+         uint64_t addr = in + stride;
+         while (draw_id < maxDrawCount) {
+            hk_ensure_cs_has_space(cmd, cs, HK_GFX_DRAW_RESERVATION);
+            if (vk_command_buffer_has_error(&cmd->vk))
+               goto out;
+
+            const size_t rem = (size_t)((uint8_t *)cs->end - (uint8_t *)cs->current);
+            assert(rem > reserve);
+            assert(((uintptr_t)cs->current & 3u) == 0);
+            const uint32_t batch_n =
+               MIN2(maxDrawCount - draw_id, (uint32_t)((rem - reserve) / rec_bytes));
+            assert(batch_n >= 1);
+
+            const uint64_t chunk_addr = hk_cs_current_addr(cs);
+            if (!hk_vdm_spans_append_range(cmd, &spans, stack_spans, &span_cap,
+                                           &num_spans, draw_id, batch_n,
+                                           chunk_addr, rec_bytes))
+               goto out;
+
+            uint32_t *dst = (uint32_t *)cs->current;
+            ASSERTED const uint32_t *batch_dst0 = dst;
+            ASSERTED const uint64_t batch_addr0 = addr;
+            for (uint32_t k = 0; k < batch_n; ++k, addr += stride, dst += rec_words) {
+               memcpy(dst, tmpl.words, rec_bytes);
+               dst[addr_hi_idx] = (uint32_t)((addr >> 32) & 0xffffu);
+               dst[addr_lo_idx] = (uint32_t)addr;
+            }
+            cs->current = dst;
+
+#ifndef NDEBUG
+            {
+               const uint64_t check_addrs[2] = {
+                  batch_addr0,
+                  batch_addr0 + (uint64_t)stride * (batch_n - 1),
+               };
+               const uint32_t *check_ptrs[2] = {
+                  batch_dst0,
+                  batch_dst0 + (size_t)(batch_n - 1) * rec_words,
+               };
+               for (unsigned c = 0; c < 2; ++c) {
+                  struct agx_vdm_index_list_indirect_words ref;
+                  bool ok = agx_vdm_index_list_indirect_pack_words(
+                     record_chip, (uint8_t)gfx->topology, indexed,
+                     next_draw.restart, (uint8_t)next_draw.index_size,
+                     indexed ? next_draw.index_buffer : 0, check_addrs[c],
+                     indexed ? hk_draw_restart_index(cmd, next_draw) : 0,
+                     size_word, &ref);
+                  assert(ok && ref.count == rec_words &&
+                         memcmp(check_ptrs[c], ref.words, rec_bytes) == 0);
+               }
+            }
+#endif
+            draw_id += batch_n;
+         }
+         emitted_fast = true;
+      }
+   }
+
+   if (!emitted_fast) {
+      for (uint32_t draw_id = 1; draw_id < maxDrawCount; ++draw_id) {
+         hk_ensure_cs_has_space(cmd, cs, HK_GFX_DRAW_RESERVATION);
+         if (vk_command_buffer_has_error(&cmd->vk))
+            goto out;
+
+         const uint64_t draw_addr = hk_cs_current_addr(cs);
+         const uint64_t chunk_before = cs->chunk.gpu;
+         const uint8_t *cur_before = cs->current;
+
+         uint64_t addr = in + (uint64_t)stride * draw_id;
+         struct agx_draw draw =
+            indexed ? agx_draw_indexed_indirect(addr, ib.addr, ib.range, 0, 0)
+                    : agx_draw_indirect(addr);
+
+         hk_draw_indirect_record(cmd, draw_id, draw, &eligible);
+         if (vk_command_buffer_has_error(&cmd->vk))
+            goto out;
+
+         if (unlikely(!libagx_vdm_draw_site_valid(cs, cmd->current_cs.gfx,
+                                                  chunk_before, cs->chunk.gpu,
+                                                  cur_before, cs->current))) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            goto out;
+         }
+
+         if (!hk_vdm_spans_append_one(cmd, &spans, stack_spans, &span_cap,
+                                      &num_spans, draw_id, draw_addr))
+            goto out;
+      }
+   }
+
+   /* Ensure end_vdm_addr sits at a clean top-level VDM boundary with room for
+    * subsequent commands or VDM_STREAM_TERMINATE (never chunk tail padding). */
+   hk_ensure_cs_has_space(cmd, cs, HK_GFX_DRAW_RESERVATION);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      goto out;
+
+   const uint64_t end_vdm_addr = hk_cs_current_addr(cs);
+
+   uint32_t link_words[2] = {0, 0};
+   static_assert(sizeof(link_words) == AGX_VDM_STREAM_LINK_LENGTH,
+                 "VDM stream link must be 8 bytes");
+   void *link_end =
+      hk_cmd_buffer_emit_cs_jump(cmd, link_words, end_vdm_addr, true);
+   if ((uint8_t *)link_end != (uint8_t *)link_words + sizeof(link_words) ||
+       vk_command_buffer_has_error(&cmd->vk))
+      goto out;
+
+   struct agx_ptr state =
+      hk_pool_alloc(cmd, sizeof(struct libagx_vdm_truncate_state), 8);
+   if (!state.cpu)
+      goto out;
+   memset(state.cpu, 0, sizeof(struct libagx_vdm_truncate_state));
+
+   uint64_t spans_gpu =
+      hk_pool_upload(cmd, spans, (size_t)num_spans * sizeof(*spans), 8);
+   if (!spans_gpu)
+      goto out;
+
+   libagx_patch_vdm_indirect_count(cmd, agx_1d(1),
+                                   AGX_BARRIER_ALL | AGX_PREGFX, state.gpu,
+                                   spans_gpu, count_addr, num_spans,
+                                   maxDrawCount, link_words[0], link_words[1]);
+
+   /* When *countBuffer == 0, VDM jumps straight over draw 0 and any graphics
+    * state draw 0 flushed. Invalidate all cached VDM state so any subsequent
+    * draw in this render pass re-emits complete state at end_vdm_addr. */
+   hk_cmd_buffer_dirty_all(cmd);
+   cs->restart_index_set = false;
+   cs->g17p_bind_tail.valid = false;
+   cs->m5_ppp_emitted_valid = false;
+
+out:
+   if (spans != stack_spans)
+      free(spans);
+   return true;
+}
+
 /*
  * To implement drawIndirectCount generically, we dispatch a compute kernel to
  * patch the indirect buffer and then we dispatch the predicated maxDrawCount
@@ -16538,14 +17361,21 @@ hk_draw_indirect_count(VkCommandBuffer commandBuffer, VkBuffer _buffer,
    uint64_t in = hk_buffer_address_ro(buffer, offset);
    uint64_t count_addr = hk_buffer_address_ro(count_buffer, countBufferOffset);
 
-   /* The pre-graphics compute builder / predicate reads both buffers before
-    * the draw is recorded. */
+   /* The pre-graphics compute builder, the VDM truncation patcher and the
+    * predicate all read both buffers before the draw is recorded. */
    hk_xfer_check_draw(cmd, in, in + (uint64_t)stride * (maxDrawCount - 1) +
                                   out_stride);
    hk_xfer_check_draw(cmd, count_addr, count_addr + sizeof(uint32_t));
 
    if (hk_agx3_draw_indirect_gpu(cmd, in, count_addr, maxDrawCount, stride,
                                  indexed))
+      return;
+
+   /* Draws the GPU builder does not take, and every chip it does not cover,
+    * stop the VDM at the runtime count instead of predicating all
+    * maxDrawCount records. */
+   if (hk_draw_indirect_count_vdm_truncate(cmd, buffer, offset, in, count_addr,
+                                           maxDrawCount, stride, indexed))
       return;
 
    uint64_t patched = hk_pool_alloc(cmd, out_stride * maxDrawCount, 4).gpu;

@@ -1032,16 +1032,29 @@ TEST(NativeForms, NegatedSqrtStepReachesPacker)
    }
 }
 
-TEST(NativeForms, G17PHalfSqrtStepAcceptsLastUse)
+/* A last-use or unhinted half feeding the square-root step encodes as the
+ * retained form on both G17P and M5. The M5 packer used to pass the source's
+ * own hint through, and refused `srsqrt d32, h16.discard`. */
+TEST(NativeForms, HalfSqrtStepAcceptsLastUse)
 {
-   for (agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G16G}) {
+   static const struct {
+      agx_isa_encoding encoding;
+      agx_chip chip;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S},
+   };
+   for (const auto &target : targets) {
+      const agx_chip chip = target.chip;
+      const bool m5 = target.encoding == AGX_ISA_ENCODING_AGX3C;
       for (unsigned hint : {0u, 1u, 2u}) {
          SCOPED_TRACE(chip);
          SCOPED_TRACE(hint);
          void *mem = ralloc_context(NULL);
          agx_builder *b = agx_test_builder(mem);
          agx_shader_key key = {};
-         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.encoding = target.encoding;
          key.dev.chip = chip;
          b->shader->key = &key;
          b->shader->stage = MESA_SHADER_COMPUTE;
@@ -1053,13 +1066,16 @@ TEST(NativeForms, G17PHalfSqrtStepAcceptsLastUse)
          agx_stop(b);
          util_dynarray binary;
          util_dynarray_init(&binary, mem);
-         ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+         const bool packed = agx3_pack_binary(b->shader, &binary);
+         EXPECT_TRUE(packed) << agx3_last_pack_refusal();
          uint8_t expected[AGX3_ALU_MAX_LENGTH], length;
          ASSERT_TRUE(agx3_alu_sqrt_step_half(
-            AGX_ISA_ENCODING_AGX3B, 4, 3, AGX3_ALU_HINT_CACHE, true, 0,
+            target.encoding, 4, 3, AGX3_ALU_HINT_CACHE, !m5, 0,
             expected, &length));
-         ASSERT_GE(binary.size, length);
-         EXPECT_EQ(memcmp(binary.data, expected, length), 0);
+         if (packed) {
+            ASSERT_GE(binary.size, length);
+            EXPECT_EQ(memcmp(binary.data, expected, length), 0);
+         }
          util_dynarray_fini(&binary);
          ralloc_free(mem);
       }

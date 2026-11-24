@@ -43,6 +43,23 @@ libagx_build_indirect_vdm(constant struct libagx_indirect_vdm_desc *desc)
    libagx_build_indirect_vdm_sublane(desc, cl_global_id.x);
 }
 
+/*
+ * Fast path for drawIndirectCount: instead of copying and predicating every
+ * indirect command and letting VDM execute all maxDrawCount records, patch a
+ * non-returning VDM_STREAM_LINK over draw `*draw_count`'s first 8 bytes so VDM
+ * jumps straight past the remaining records.
+ */
+KERNEL(1)
+libagx_patch_vdm_indirect_count(
+   global struct libagx_vdm_truncate_state *state,
+   constant struct libagx_vdm_draw_span *spans, constant uint32_t *draw_count,
+   uint32_t num_spans, uint32_t max_draw_count, uint32_t link_w0,
+   uint32_t link_w1)
+{
+   libagx_vdm_patch_indirect_count_impl(state, spans, draw_count, num_spans,
+                                        max_draw_count, link_w0, link_w1);
+}
+
 /* VK_EXT_transform_feedback exposes the byte count written by streamout as a
  * draw source.  Generate the complete VkDrawIndirectCommand on the GPU so a
  * producer earlier in this command buffer never needs CPU readback. */

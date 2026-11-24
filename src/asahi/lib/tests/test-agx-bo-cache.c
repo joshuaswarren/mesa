@@ -531,9 +531,91 @@ test_create_checked_admission_and_purged_miss(void)
       agx_bo_create_checked(&dev, 64 * MIB, 64 * 1024, 0, "purged",
                             deny_alloc, &check_calls);
    assert(purged_miss == NULL);
+   /* The idle "poke" BO is still cached, so the refusal evicts it and asks
+    * once more. */
+   assert(check_calls == 2);
+   assert(mock.alloc_calls == allocs_before);
+   assert(mock.freed_count == 2 && mock.freed_handles[0] == h);
+   assert(dev.bo_cache.size == 0);
+
+   finish_mock_device(&dev);
+}
+
+/* Admission that only fits once the BO cache holds nothing, like free system
+ * memory that idle cached BOs are still using. */
+struct cache_gated_admission {
+   struct agx_device *dev;
+   unsigned calls;
+   bool cache_empty_at_call[4];
+};
+
+static bool
+admit_when_cache_empty(size_t size, void *data)
+{
+   struct cache_gated_admission *a = data;
+   simple_mtx_lock(&a->dev->bo_cache.lock);
+   const bool empty = a->dev->bo_cache.size == 0;
+   simple_mtx_unlock(&a->dev->bo_cache.lock);
+   assert(a->calls < ARRAY_SIZE(a->cache_empty_at_call));
+   a->cache_empty_at_call[a->calls++] = empty;
+   return empty;
+}
+
+static void
+test_create_checked_evicts_cache_before_refusing(void)
+{
+   struct agx_device dev;
+   init_mock_device(&dev);
+
+   /* 128 MiB sits idle in the cache; a 64 MiB request cannot reuse it. */
+   struct agx_bo *cached = agx_bo_create(&dev, 128 * MIB, 64 * 1024, 0, "128m");
+   assert(cached);
+   const uint32_t h = cached->handle;
+   agx_bo_unreference(&dev, cached);
+   assert(dev.bo_cache.size == 128 * MIB);
+   assert(!agx_bo_cache_has(&dev, 48 * MIB, 64 * 1024, 0));
+
+   /* The first check refuses, the cache is evicted, the second check fits
+    * and the BO is allocated. */
+   struct cache_gated_admission a = {.dev = &dev};
+   unsigned allocs_before = mock.alloc_calls;
+   struct agx_bo *bo = agx_bo_create_checked(&dev, 48 * MIB, 64 * 1024, 0,
+                                             "after-evict",
+                                             admit_when_cache_empty, &a);
+   assert(bo && bo->size == 48 * MIB);
+   assert(a.calls == 2);
+   assert(!a.cache_empty_at_call[0] && a.cache_empty_at_call[1]);
+   assert(mock.alloc_calls == allocs_before + 1);
+   assert(dev.bo_cache.size == 0);
+   assert(mock.freed_count == 1 && mock.freed_handles[0] == h);
+   agx_bo_unreference(&dev, bo);
+   agx_bo_cache_evict_all(&dev);
+
+   /* Negative control: admission still refuses after eviction, so the call
+    * returns NULL without reaching bo_alloc(). */
+   cached = agx_bo_create(&dev, 128 * MIB, 64 * 1024, 0, "128m-again");
+   const uint32_t h2 = cached->handle;
+   agx_bo_unreference(&dev, cached);
+   const unsigned freed_before = mock.freed_count;
+   unsigned check_calls = 0;
+   allocs_before = mock.alloc_calls;
+   struct agx_bo *refused = agx_bo_create_checked(&dev, 48 * MIB, 64 * 1024, 0,
+                                                  "refused", deny_alloc,
+                                                  &check_calls);
+   assert(refused == NULL);
+   assert(check_calls == 2);
+   assert(mock.alloc_calls == allocs_before);
+   assert(dev.bo_cache.size == 0);
+   assert(mock.freed_count == freed_before + 1 &&
+          mock.freed_handles[freed_before] == h2);
+
+   /* With an empty cache there is nothing to free: one check, no retry. */
+   check_calls = 0;
+   refused = agx_bo_create_checked(&dev, 48 * MIB, 64 * 1024, 0, "refused-empty",
+                                   deny_alloc, &check_calls);
+   assert(refused == NULL);
    assert(check_calls == 1);
    assert(mock.alloc_calls == allocs_before);
-   assert(mock.freed_count == 1 && mock.freed_handles[0] == h);
 
    finish_mock_device(&dev);
 }
@@ -662,6 +744,7 @@ main(void)
    test_idle_pending_wake_protocol();
    test_ro_shadow_cache_reuse();
    test_create_checked_admission_and_purged_miss();
+   test_create_checked_evicts_cache_before_refusing();
    test_large_buckets_flag_isolation_and_cross_pot_reuse();
    test_mmap_offset_cache_propagation();
 

@@ -1122,6 +1122,10 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    if (slot == &cmd->current_cs.cs)
       st->cs_check_pending = false;
+   else if (!compute && cmd->current_cs.cs &&
+            (cs->sync.dep[HK_SYNC_CDM].cut == cmd->current_cs.cs ||
+             cs->sync.dep_ta[HK_SYNC_CDM].cut == cmd->current_cs.cs))
+      st->cs_check_pending = true;
 
    /* A top-of-pipe timestamp waiting for a command to ride on. */
    if (st->pending_start_ts.handle) {
@@ -1176,25 +1180,88 @@ cdm_waits_for_render(struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
    return false;
 }
 
-/* M5: whether a requirement on the render subqueue would make the work a
- * compute stream already holds wait for a render it does not wait for yet.
- * A requirement recorded after that work (a barrier between two dispatches)
- * has none of it in its second scope, so the work keeps the requirements it
- * was recorded under and only later work takes the new one. */
+/* Whether the compute stream cs already waits for all prior-submission render
+ * kinds in prior_mask: directly, or through the compute prefix it waits on. */
+static bool
+cdm_waits_for_render_prior(struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
+                           uint8_t prior_mask)
+{
+   uint8_t covered = cs->sync.dep[HK_SYNC_VDM].prior;
+   if (!(prior_mask & ~covered))
+      return true;
+
+   const struct hk_cs *prefix = cs->sync.dep[HK_SYNC_CDM].cut;
+   if (!prefix || prefix == cs)
+      return false;
+
+   list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
+      if (it->type != HK_CS_CDM || it == cs ||
+          it->sync.seq > prefix->sync.seq)
+         continue;
+      covered |= it->sync.dep[HK_SYNC_VDM].prior;
+      if (!(prior_mask & ~covered))
+         return true;
+   }
+   return false;
+}
+
+static bool
+cdm_overlap_split_enabled(struct hk_cmd_buffer *cmd)
+{
+   return agx_chip_cdm_overlap_split(hk_cmd_buffer_device(cmd)->dev.chip);
+}
+
+/* Whether a requirement on the render subqueue would make the work a compute
+ * stream already holds wait for a render it does not wait for yet. A
+ * requirement recorded after that work (a barrier between two dispatches) has
+ * none of it in its second scope, so the work keeps the requirements it was
+ * recorded under and only later work takes the new one. */
 static bool
 cdm_raise_delays_work(struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
-                      const struct hk_cs *r)
+                      const struct hk_sync_dep *vdm)
 {
-   return r && cs->stats.cmds &&
-          agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
-          !cdm_waits_for_render(cmd, cs, r);
+   if (!cs->stats.cmds || !cdm_overlap_split_enabled(cmd))
+      return false;
+
+   if (vdm->cut && !cdm_waits_for_render(cmd, cs, vdm->cut))
+      return true;
+   if (vdm->prior && !cdm_waits_for_render_prior(cmd, cs, vdm->prior))
+      return true;
+   return false;
+}
+
+/* Whether a render stream or pending graphics requirement waits specifically
+ * on cs: appending or merging independent post-barrier compute work into cs
+ * would force that graphics work to wait on the later compute too. */
+static bool
+cdm_waited_by_render(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
+{
+   if (!cs->stats.cmds || !cdm_overlap_split_enabled(cmd))
+      return false;
+
+   const uint8_t gfx_kinds = HK_SYNC_GFX | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG;
+   u_foreach_bit(k, gfx_kinds) {
+      if (cmd->sync.req[k][HK_SYNC_CDM].cut == cs ||
+          (cmd->sync.in_pass && cmd->sync.pass_req[k][HK_SYNC_CDM].cut == cs))
+         return true;
+   }
+
+   list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
+      if (it->type != HK_CS_VDM)
+         continue;
+      if (it->sync.dep[HK_SYNC_CDM].cut == cs ||
+          it->sync.dep_ta[HK_SYNC_CDM].cut == cs)
+         return true;
+   }
+   return false;
 }
 
 bool
 hk_sync_merge_delays(struct hk_cmd_buffer *cmd, const struct hk_cs *into,
                      const struct hk_cs *from)
 {
-   if (cdm_raise_delays_work(cmd, into, from->sync.dep[HK_SYNC_VDM].cut))
+   if (cdm_raise_delays_work(cmd, into, &from->sync.dep[HK_SYNC_VDM]) ||
+       cdm_waited_by_render(cmd, into))
       return true;
 
    /* If a later render waits on `into` (and not on `from`, which follows it),
@@ -1233,8 +1300,11 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
 
    /* The new work goes into a stream of its own, created under the whole
     * requirement; a first scope that names compute work orders it after
-    * this stream through last[]. */
-   if (cdm_raise_delays_work(cmd, cs, dep[HK_SYNC_VDM].cut)) {
+    * this stream through last[]. Likewise, if a graphics barrier or render
+    * stream already waits on this stream, keep post-barrier compute separate
+    * so graphics can overlap it. */
+   if (cdm_raise_delays_work(cmd, cs, &dep[HK_SYNC_VDM]) ||
+       cdm_waited_by_render(cmd, cs)) {
       hk_cmd_buffer_end_compute(cmd);
       return;
    }
@@ -1285,6 +1355,43 @@ hk_sync_get_cs_after(struct hk_cmd_buffer *cmd,
    if (cs)
       hk_sync_stream_wait(cs, full);
    return cs;
+}
+
+/* A host-availability flush is recorded at its dependency into the open
+ * compute stream when that stream already holds work and is positioned after
+ * every stream of the dependency's first scope, so recording the flush there
+ * creates no stream and needs none. The stream takes the dependency's waits,
+ * as it did when every such flush was recorded at its dependency, unless that
+ * would make work it holds wait for a render it does not wait for yet
+ * (cdm_raise_delays_work()). No kind names the flush. Otherwise the flush is
+ * deferred to the end of the submission (hk_sync_defer_host_flush()). */
+struct hk_cs *
+hk_sync_host_flush(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info)
+{
+   const uint8_t kinds = hk_sync_host_flush_kinds(info);
+   if (!kinds)
+      return NULL;
+
+   struct hk_cs *cs = cmd->current_cs.cs;
+   if (cs && cs->stats.cmds && !cmd->sync.pin_cs &&
+       !cmd->sync.brl_transition_active) {
+      struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+      hk_sync_src_dep(cmd, kinds, cs, dep);
+
+      bool after = !cdm_raise_delays_work(cmd, cs, dep[HK_SYNC_VDM].cut);
+      for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+         if (dep[sq].cut && dep[sq].cut->sync.seq > cs->sync.seq)
+            after = false;
+      }
+
+      if (after) {
+         hk_sync_stream_wait(cs, dep);
+         return cs;
+      }
+   }
+
+   cmd->sync.host_flush_kinds |= kinds;
+   return NULL;
 }
 
 /* A standalone G17P timestamp still needs an executable command carrier.
@@ -2128,7 +2235,7 @@ hk_sync_queue_kinds(const struct hk_sync_queue *q, unsigned sq)
 }
 
 bool
-hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds, bool chain,
+hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds,
                           const uint64_t base[HK_SYNC_NUM_SQ],
                           const uint32_t count[HK_SYNC_NUM_SQ],
                           uint16_t barrier[HK_SYNC_NUM_SQ],
@@ -2142,15 +2249,17 @@ hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds, bool chain,
          /* What resolve_one() gives a stream of every kind whose first
           * scope is `kinds`, at the end of the submission: the latest
           * command of those kinds, and every requirement still carried, as
-          * a stream recorded at the dependency itself would have picked up.
-          * A command of this submission within the 16-bit field is named by
-          * its position, any other by its ordinal. Waits are prefixes. */
+          * a stream recorded at the dependency itself would have picked up;
+          * and the submission's last command on the subqueue (see
+          * hk_sync.h). A command of this submission within the 16-bit field
+          * is named by its position, any other by its ordinal. Waits are
+          * prefixes. */
          uint64_t v = 0;
          u_foreach_bit(k, kinds)
             v = MAX2(v, q->last_absolute[k][sq]);
          for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k)
             v = MAX2(v, q->tail[k][sq]);
-         if (chain && count[sq])
+         if (count[sq])
             v = MAX2(v, base[sq] + count[sq]);
          if (v > base[sq] && v - base[sq] < DRM_ASAHI_BARRIER_NONE)
             barrier[sq] = (uint16_t)(v - base[sq]);
