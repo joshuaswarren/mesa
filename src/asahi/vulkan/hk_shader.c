@@ -1663,13 +1663,179 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
       access |= ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
    }
 
-   nir_def *val = nir_load_global(
-      b, intr->def.num_components, intr->def.bit_size,
-      nir_iadd(b, base, nir_u2u64(b, offset)),
-      .align_mul = nir_intrinsic_align_mul(intr),
-      .align_offset = nir_intrinsic_align_offset(intr), .access = access);
+   nir_def *address = nir_iadd(b, base, nir_u2u64(b, offset));
+   nir_def *val =
+      intr->intrinsic == nir_intrinsic_load_global_constant_bounded
+         ? nir_load_global_constant(
+              b, intr->def.num_components, intr->def.bit_size, address,
+              .align_mul = nir_intrinsic_align_mul(intr),
+              .align_offset = nir_intrinsic_align_offset(intr), .access = access)
+         : nir_load_global(
+              b, intr->def.num_components, intr->def.bit_size, address,
+              .align_mul = nir_intrinsic_align_mul(intr),
+              .align_offset = nir_intrinsic_align_offset(intr), .access = access);
 
    nir_def_replace(&intr->def, val);
+}
+
+static bool
+hk_ubo_offset_is_const(nir_def *def, unsigned depth)
+{
+   if (nir_def_is_const(def))
+      return true;
+   if (depth == 0)
+      return false;
+
+   nir_alu_instr *alu = nir_def_as_alu_or_null(def);
+   if (!alu)
+      return false;
+
+   const unsigned num_inputs = nir_op_infos[alu->op].num_inputs;
+   for (unsigned i = 0; i < num_inputs; ++i) {
+      if (!hk_ubo_offset_is_const(alu->src[i].src.ssa, depth - 1))
+         return false;
+   }
+   return num_inputs > 0;
+}
+
+/* Return whether a uniform buffer descriptor can be prefetched by uniform DMA
+ * (root-table dynamic UBO, inline uniform block, or constant-index UBO in a
+ * static descriptor set). Bindless/mutable or dynamically-indexed UBO
+ * descriptors cannot be prefetched by uniform DMA. */
+static bool
+hk_ubo_desc_can_uniform_dma(nir_def *desc, uint8_t static_set_mask)
+{
+   nir_scalar s = nir_scalar_resolved(desc, 0);
+   nir_intrinsic_instr *load = nir_def_as_intrinsic_or_null(s.def);
+   if (!load)
+      return true;
+
+   if (load->intrinsic == nir_intrinsic_load_global_constant_offset) {
+      if (!hk_ubo_offset_is_const(load->src[1].ssa, 4))
+         return false;
+      nir_intrinsic_instr *set_load = nir_src_as_intrinsic(load->src[0]);
+      if (set_load &&
+          set_load->intrinsic == nir_intrinsic_load_descriptor_set_agx) {
+         const unsigned set = nir_intrinsic_desc_set(set_load);
+         return set < 8 && (static_set_mask & BITFIELD_BIT(set));
+      }
+      return false;
+   }
+
+   /* Dynamic UBOs load from the root table via load_global_constant. */
+   return true;
+}
+
+/* Keep naturally aligned robustBufferAccess2 UBO loads as base-plus-index
+ * global constant loads. Constant-offset loads from uniform-DMA-eligible
+ * descriptors are left for nir_lower_explicit_io + uniform DMA prefetching so
+ * static UBO contents stay in uniform registers.
+ *
+ * Both maxUniformBufferRange and AGX_ZERO_PAGE_SIZE are 64 KiB, and
+ * robustUniformBufferAccessSizeAlignment equals HK_MIN_UBO_ALIGNMENT (64 B).
+ * Checking the 64-byte record offset against the descriptor bound lets
+ * neighboring fields share one bounds check and base select, while masking the
+ * offset into the 64 KiB zero page keeps out-of-bounds loads within the zero
+ * page without clamping the offset inside the select. */
+static bool
+hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const uint8_t static_set_mask = *(const uint8_t *)data;
+   if (intr->intrinsic != nir_intrinsic_load_deref ||
+       intr->def.bit_size != 32 ||
+       intr->num_components > 4 ||
+       (nir_intrinsic_access(intr) & ACCESS_VOLATILE))
+      return false;
+
+   nir_deref_instr *leaf = nir_src_as_deref(intr->src[0]);
+   if (leaf->modes != nir_var_mem_ubo ||
+       (glsl_get_explicit_stride(leaf->type) != 0 &&
+        glsl_get_explicit_stride(leaf->type) != 4))
+      return false;
+
+   uint32_t mul, disp;
+   if (!nir_get_explicit_deref_align(leaf, true, &mul, &disp) ||
+       mul < 4 || (disp & 3) || (mul & (mul - 1)))
+      return false;
+
+   const uint32_t size = intr->num_components * 4u;
+   if ((disp & 63u) + size > 64u || (mul < 64u && (disp % mul) + size > mul))
+      return false;
+
+   nir_deref_path path;
+   nir_deref_path_init(&path, leaf, NULL);
+   nir_deref_instr *root = path.path[0];
+   if (root->deref_type != nir_deref_type_cast ||
+       root->parent.ssa->num_components != 4 ||
+       root->parent.ssa->bit_size != 32) {
+      nir_deref_path_finish(&path);
+      return false;
+   }
+
+   /* Require a zero base offset on the bounded descriptor so the deref
+    * alignment matches the byte offset from the descriptor base. */
+   nir_scalar base_off = nir_scalar_resolved(root->parent.ssa, 3);
+   if (!nir_scalar_is_const(base_off) || nir_scalar_as_uint(base_off) != 0) {
+      nir_deref_path_finish(&path);
+      return false;
+   }
+
+   /* Inline uniform blocks in descriptor buffers may exceed 64 KiB; their full
+    * binding size is a constant in channel 2. Fall back to explicit I/O so
+    * offsets >= AGX_ZERO_PAGE_SIZE are not masked. */
+   nir_scalar root_bound = nir_scalar_resolved(root->parent.ssa, 2);
+   if (nir_scalar_is_const(root_bound) &&
+       nir_scalar_as_uint(root_bound) > AGX_ZERO_PAGE_SIZE) {
+      nir_deref_path_finish(&path);
+      return false;
+   }
+
+   /* Preserve constant-offset UBO loads on uniform-DMA-eligible descriptors
+    * for uniform DMA prefetching. */
+   bool const_offset = true;
+   for (unsigned i = 1; const_offset && path.path[i]; ++i) {
+      nir_deref_instr *d = path.path[i];
+      if ((d->deref_type == nir_deref_type_array ||
+           d->deref_type == nir_deref_type_ptr_as_array) &&
+          !nir_src_is_const(d->arr.index))
+         const_offset = false;
+   }
+   if (const_offset &&
+       hk_ubo_desc_can_uniform_dma(root->parent.ssa, static_set_mask)) {
+      nir_deref_path_finish(&path);
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *addr = root->parent.ssa;
+   for (unsigned i = 1; path.path[i]; ++i)
+      addr = nir_explicit_io_address_from_deref(
+         b, path.path[i], addr, nir_address_format_64bit_bounded_global);
+   nir_deref_path_finish(&path);
+
+   nir_def *base = nir_pack_64_2x32_split(b, nir_channel(b, addr, 0),
+                                          nir_channel(b, addr, 1));
+   nir_def *off = nir_channel(b, addr, 3);
+   nir_def *bound = nir_channel(b, addr, 2);
+
+   STATIC_ASSERT(HK_MIN_UBO_ALIGNMENT == 64);
+   STATIC_ASSERT(AGX_ZERO_PAGE_SIZE == 65536);
+   nir_def *record = nir_iand_imm(b, off, ~63u);
+   nir_def *valid = nir_ult(b, record, bound);
+   const unsigned alignment = MIN2(mul, 64u);
+   nir_def *safe = nir_bcsel(b, valid, base,
+                             nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+   nir_def *index =
+      nir_iand_imm(b, off, (AGX_ZERO_PAGE_SIZE - 1u) & ~(alignment - 1u));
+   index = nir_ior_imm(b, index, disp % alignment);
+   nir_def *address = nir_iadd(b, safe, nir_u2u64(b, index));
+   nir_def *value = nir_load_global_constant(
+      b, intr->num_components, 32, address,
+      .align_mul = alignment, .align_offset = disp % alignment,
+      .access = nir_intrinsic_access(intr) | ACCESS_NON_WRITEABLE |
+                ACCESS_CAN_REORDER);
+   nir_def_replace(&intr->def, value);
+   return true;
 }
 
 struct global_load_lowering {
@@ -3217,6 +3383,10 @@ hk_coherent_images_in_memory(const struct agx_device *dev)
           dev->params.num_clusters_total > 1;
 }
 
+static uint8_t
+hk_static_set_mask(uint32_t set_layout_count,
+                   struct vk_descriptor_set_layout *const *set_layouts);
+
 static void
 hk_lower_nir(struct hk_device *dev, nir_shader *nir,
              const struct vk_pipeline_robustness_state *rs, bool is_multiview,
@@ -3502,6 +3672,14 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             hk_buffer_addr_format(rs->storage_buffers,
                                   rs->null_storage_buffer_descriptor,
                                   agx_chip_g17_m5(dev->dev.chip)));
+   if (rs->uniform_buffers ==
+       VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT) {
+      uint8_t static_set_mask =
+         hk_static_set_mask(set_layout_count, set_layouts);
+      NIR_PASS(lowered_buf_io, nir, nir_shader_intrinsics_pass,
+               hk_lower_aligned_ubo, nir_metadata_control_flow,
+               &static_set_mask);
+   }
    NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_ubo_addr_format(rs->uniform_buffers));
 

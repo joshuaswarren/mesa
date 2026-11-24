@@ -367,18 +367,26 @@ load_descriptor_for_idx_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    index = nir_iadd(b, index, intrin->src[0].ssa);
    b->constant_fold_alu = false;
 
+   const nir_descriptor_type desc_type = nir_intrinsic_desc_type(intrin);
+
    /* A buffer descriptor is a vec4 (address, size, ...); an acceleration
     * structure is a bare 64-bit BVH address, and rq_initialize consumes it
     * as one.  Loading it as a vec4 would both read past the descriptor and
     * hand the ray-query lowering the wrong-shaped value. */
-   if (nir_intrinsic_desc_type(intrin) ==
-       nir_descriptor_type_acceleration_structure)
+   if (desc_type == nir_descriptor_type_acceleration_structure)
       return load_descriptor(b, 1, 64, set, binding, index, 0, ctx);
 
    const unsigned components =
-      nir_intrinsic_desc_type(intrin) == nir_descriptor_type_storage_buffer &&
+      desc_type == nir_descriptor_type_storage_buffer &&
       storage_address_has_map(ctx) ? 5 : 4;
-   return load_descriptor(b, components, 32, set, binding, index, 0, ctx);
+   nir_def *desc = load_descriptor(b, components, 32, set, binding, index, 0, ctx);
+   if (desc_type == nir_descriptor_type_uniform_buffer &&
+       !nir_scalar_is_const(nir_scalar_resolved(desc, 3))) {
+      /* Every uniform buffer descriptor (including mutable slots written as
+       * VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) leaves the .w offset word zero. */
+      desc = nir_vector_insert_imm(b, desc, nir_imm_int(b, 0), 3);
+   }
+   return desc;
 }
 
 static bool
