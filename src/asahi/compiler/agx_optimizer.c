@@ -240,20 +240,70 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
 
       /* G17P and G18G do not have generally grounded f32 arithmetic over an f16
        * register.  FMUL has a few native mixed endpoints, but their combined
-       * producer-wait/lifetime domain is intentionally narrow.  Preserve the
-       * explicit exact widening for ordinary full-width arithmetic; native
-       * patterns such as the scalar-half sqrt are emitted without an fmov and
-       * therefore remain available. */
+       * producer-wait/lifetime domain is intentionally narrow, and
+       * fma_addend_imm_width_mod still refuses half sources on AGX3B.
+       * On AGX3B, unmodified all-scalar-register F32 FFMA carries independent
+       * per-operand f16/f32 width bits via agx3_falu_fma_mod_runtime, and
+       * unmodified all-scalar-register F32 FADD takes one f16 GPR alongside an
+       * f32 GPR via agx3_alu_fadd_mixed_half (both verified bit-exact against
+       * explicit f16->f32 widening on G17P hardware), so allow folding
+       * unmodified scalar f16 GPR widenings into such FFMAs and single-half
+       * FADDs; keep explicit exact widening for two-half FADD, FMUL, G18G, and
+       * modified/mixed-kind FFMAs/FADDs.  Native patterns such as the
+       * scalar-half sqrt are emitted without an fmov and therefore remain
+       * available. */
       if (ctx->key &&
           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
            agx_is_g18g(&ctx->key->dev)) &&
           (ins->op == AGX_OPCODE_FADD || ins->op == AGX_OPCODE_FMUL ||
            ins->op == AGX_OPCODE_FFMA) &&
-          src.size == AGX_SIZE_32 && def->src[0].size == AGX_SIZE_16 &&
-          !(def->src[0].type == AGX_INDEX_UNIFORM && !def->src[0].memory &&
+          src.size == AGX_SIZE_32 && def->src[0].size == AGX_SIZE_16) {
+         bool allow_half_uniform =
+            def->src[0].type == AGX_INDEX_UNIFORM && !def->src[0].memory &&
             !def->src[0].abs && !def->src[0].neg && !src.abs && !src.neg &&
-            agx_can_fold_half_uniform(ins, defs)))
-         continue;
+            agx_can_fold_half_uniform(ins, defs);
+         bool allow_agx3b_ffma_gpr =
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+            ins->op == AGX_OPCODE_FFMA && !ins->saturate &&
+            ins->nr_dests == 1 && !ins->dest[0].memory &&
+            ins->dest[0].size == AGX_SIZE_32 &&
+            agx_channels(ins->dest[0]) == 1 &&
+            (def->src[0].type == AGX_INDEX_NORMAL ||
+             def->src[0].type == AGX_INDEX_REGISTER) &&
+            !def->src[0].memory && agx_channels(def->src[0]) == 1 &&
+            !def->src[0].abs && !def->src[0].neg && !src.abs && !src.neg;
+         if (allow_agx3b_ffma_gpr) {
+            agx_foreach_src(ins, k) {
+               if ((ins->src[k].type != AGX_INDEX_NORMAL &&
+                    ins->src[k].type != AGX_INDEX_REGISTER) ||
+                   ins->src[k].memory || agx_channels(ins->src[k]) != 1 ||
+                   ins->src[k].abs || ins->src[k].neg) {
+                  allow_agx3b_ffma_gpr = false;
+                  break;
+               }
+            }
+         }
+         bool allow_agx3b_fadd_gpr = false;
+         if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+             ins->op == AGX_OPCODE_FADD && ins->nr_srcs == 2 &&
+             !ins->saturate && ins->nr_dests == 1 && !ins->dest[0].memory &&
+             ins->dest[0].size == AGX_SIZE_32 &&
+             agx_channels(ins->dest[0]) == 1 &&
+             (def->src[0].type == AGX_INDEX_NORMAL ||
+              def->src[0].type == AGX_INDEX_REGISTER) &&
+             !def->src[0].memory && agx_channels(def->src[0]) == 1 &&
+             !def->src[0].abs && !def->src[0].neg && !src.abs && !src.neg) {
+            const agx_index other = ins->src[1 - s];
+            allow_agx3b_fadd_gpr =
+               (other.type == AGX_INDEX_NORMAL ||
+                other.type == AGX_INDEX_REGISTER) &&
+               !other.memory && other.size == AGX_SIZE_32 &&
+               agx_channels(other) == 1 && !other.abs && !other.neg;
+         }
+         if (!allow_half_uniform && !allow_agx3b_ffma_gpr &&
+             !allow_agx3b_fadd_gpr)
+            continue;
+      }
 
       /* M5's f32 add takes at most one half register (f32 + f16, or a half
        * plus a minifloat immediate); two half registers into an f32 result
@@ -384,6 +434,19 @@ agx_optimizer_minifloat_select(agx_context *ctx, agx_instr **defs,
       I->fcmpsel_minifloat_select = true;
       return;
    }
+}
+
+
+/* Whether agx3_translate_mem() can encode an immediate index: with a byte
+ * displacement it must fold into that displacement; without one it may also
+ * take a scaled element index.
+ */
+static bool
+device_immediate_index_fits(const agx_instr *I, uint64_t imm)
+{
+   int32_t bytes;
+   return !I->memory_byte_offset ||
+          agx3_mem_immediate_byte_offset(I, (uint32_t)imm, &bytes);
 }
 
 static void
@@ -573,6 +636,14 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
       if ((I->op == AGX_OPCODE_LOCAL_LOAD || I->op == AGX_OPCODE_DEVICE_LOAD ||
            I->op == AGX_OPCODE_STACK_STORE) &&
           s != 1)
+         continue;
+      /* A device access with a byte displacement takes an immediate index
+       * only as part of that displacement, which must stay a signed 16-bit
+       * byte offset; otherwise keep the index in its register.
+       */
+      if (((I->op == AGX_OPCODE_DEVICE_LOAD && s == 1) ||
+           (I->op == AGX_OPCODE_DEVICE_STORE && s == 2)) &&
+          !device_immediate_index_fits(I, def->imm))
          continue;
       if (I->op == AGX_OPCODE_SPLIT)
          continue;
@@ -938,24 +1009,30 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
          const bool m5_uniform_base =
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
 
-         /* On AGX3B a scalar W8 load and four packed W8 components both
-          * return one physical word, and the LDDEV encoding reads an aligned
-          * base directly from the low uniform file. Both are properties of
-          * the encoding, so this holds on every AGX3B part. */
-         const bool agx3b_w8_uniform_base =
+         /* On AGX3B the LDDEV base operand (group 567) is orthogonal to
+          * element width and component mask and reads any four-half-aligned
+          * low-file uniform directly. Keep the compute, non-internal,
+          * non-secondary, non-coherent scope so vertex/fragment fixed-shape
+          * paths remain unchanged, and widen to 16-bit and 32-bit scalar or
+          * vector loads (in addition to W8). */
+         const bool agx3b_uniform_base =
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
             ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
             ctx->nir && !ctx->nir->info.internal && !ctx->key->secondary &&
-            I->format == AGX_FORMAT_I8 && !I->coherent &&
-            I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
-            agx_channels(I->dest[0]) == 1 &&
-            ((!I->memory_is_packed && I->mask == 0x1) ||
-             (I->memory_is_packed && I->mask == 0xf)) &&
+            !I->coherent &&
+            I->nr_dests == 1 &&
+            ((I->format == AGX_FORMAT_I8 && I->dest[0].size == AGX_SIZE_32 &&
+              agx_channels(I->dest[0]) == 1 &&
+              ((!I->memory_is_packed && I->mask == 0x1) ||
+               (I->memory_is_packed && I->mask == 0xf))) ||
+             ((I->format == AGX_FORMAT_I16 || I->format == AGX_FORMAT_I32) &&
+              (I->dest[0].size == AGX_SIZE_16 ||
+               I->dest[0].size == AGX_SIZE_32))) &&
             !src.kill && !src.cache && !src.discard &&
             !lo.kill && !lo.cache && !lo.discard &&
             !hi.kill && !hi.cache && !hi.discard;
 
-         if ((m5_uniform_base || agx3b_w8_uniform_base) &&
+         if ((m5_uniform_base || agx3b_uniform_base) &&
              lo.type == AGX_INDEX_UNIFORM && hi.type == AGX_INDEX_UNIFORM &&
              lo.size == AGX_SIZE_32 && hi.size == AGX_SIZE_32 &&
              agx_channels(lo) == 1 && agx_channels(hi) == 1 &&
@@ -997,18 +1074,59 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
          continue;
 
       /* AGX2 can carry the zero-extension modifier on integer arithmetic and
-       * compare-select, but the grounded G17P forms are width-matched.
-       * Preserve the explicit 16-to-32 move so the AGX3 packer emits its
-       * witnessed COPY-low plus CLR-high sequence first. G18G keeps it too.
-       * j873 reached this through the Gen10 texture-descriptor crawl, whose
-       * level field is a half extract: folding the widening left an
-       * `and d32, h5, r8` the packer has no encoding for, and the whole
-       * fragment program -- the depth blitter's -- was dropped. */
+       * compare-select, while most grounded AGX3B forms are width-matched and
+       * G18G keeps explicit 16-to-32 moves. Unshifted, non-saturating 32-bit
+       * AGX3B iadd/isub encodes 16-bit zero-extended register sources natively
+       * (agx3_iadd_core.c, f24/f39 width fields), so fold those directly.
+       * j873 reached the remaining ops through the Gen10 texture-descriptor
+       * crawl, whose level field is a half extract: folding the widening left
+       * an `and d32, h5, r8` the packer has no encoding for, and the whole
+       * fragment program -- the depth blitter's -- was dropped.
+       *
+       * `other` is inspected before `src[1 - s]`'s own copyprop and before
+       * `agx_optimizer_inline_imm()` runs on this instruction. Already-inlined
+       * immediates are checked directly against the packer's 8-bit immediate
+       * forms; a normal/register partner that later receives an inlined
+       * immediate (`0..0xff`, or `-1..-255` on slot 1 when `src[0]` is not
+       * negated) or a second 16-to-32 widening still lands inside those same
+       * AGX3B `iadd`/`isub` packer paths, and any uniform is lowered back to a
+       * plain register by `agx_lower_uniform_sources()`. */
+      bool agx3b_zext_iadd = false;
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          I->op == AGX_OPCODE_IADD &&
+          I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
+          agx_channels(I->dest[0]) == 1 && !I->saturate && I->shift == 0 &&
+          def->src[0].size == AGX_SIZE_16 && src.size == AGX_SIZE_32 &&
+          !src.abs && !src.memory && agx_channels(src) == 1 &&
+          (def->src[0].type == AGX_INDEX_NORMAL ||
+           def->src[0].type == AGX_INDEX_REGISTER) &&
+          !def->src[0].memory && !def->src[0].abs && !def->src[0].neg &&
+          agx_channels(def->src[0]) == 1) {
+         const agx_index other = I->src[1 - s];
+         const bool other_reg =
+            (other.type == AGX_INDEX_NORMAL ||
+             other.type == AGX_INDEX_REGISTER) &&
+            (other.size == AGX_SIZE_16 ||
+             (other.size == AGX_SIZE_32 && !other.abs));
+         const bool other_imm =
+            other.type == AGX_INDEX_IMMEDIATE && other.value <= 0xff &&
+            !other.abs && !(other.neg && (s != 0 || src.neg));
+         agx3b_zext_iadd = !other.memory && agx_channels(other) == 1 &&
+                           !(src.neg && other.neg) && (other_reg || other_imm);
+      }
+
+      /* Unshifted, non-saturating register+register iadd/isub with a normal
+       * partner also takes sign-extended (plain) halves on AGX3B, which
+       * agx_lower_agx3_widening_int() then leaves to agx3_iadd_encode(). */
       if (ctx->key &&
           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
            agx_is_g18g(&ctx->key->dev)) &&
           def->src[0].size == AGX_SIZE_16 && src.size == AGX_SIZE_32 &&
-          (I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD ||
+          ((I->op == AGX_OPCODE_IADD && !agx3b_zext_iadd &&
+            (I->saturate || I->shift != 0 || agx_is_g18g(&ctx->key->dev) ||
+             I->src[1 - s].type != AGX_INDEX_NORMAL ||
+             (I->src[0].neg && I->src[1].neg))) ||
+           I->op == AGX_OPCODE_IMAD ||
            I->op == AGX_OPCODE_ICMP || I->op == AGX_OPCODE_ICMPSEL ||
            I->op == AGX_OPCODE_BFI || I->op == AGX_OPCODE_BFEIL ||
            (I->op == AGX_OPCODE_EXTR && s < 2) ||
@@ -1620,6 +1738,13 @@ agx3b_ballot_compare_encodable(const agx_instr *def)
    }
 }
 
+static bool
+agx_ballot_compare_has_modifiers(const agx_instr *def)
+{
+   return def->src[0].abs || def->src[0].neg || def->src[1].abs ||
+          def->src[1].neg;
+}
+
 static void
 agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
@@ -1678,14 +1803,15 @@ agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
    bool quad = I->op == AGX_OPCODE_QUAD_BALLOT;
    assert(quad || I->op == AGX_OPCODE_BALLOT);
 
-   /* G17P's half-width quad ballot compares a register against zero. AGX2
-    * can fuse general integer/float comparisons, but those forms do not
-    * encode an AGX3 half-width quad result. Keep the predicate calculation
-    * for quad any/all and let lower_pseudo ballot its nonzero boolean.
+   /* The AGX3 half-width quad ballot only compares a register against zero
+    * (agx3_emit_subgroup_ballot and its G18G variant refuse every other
+    * shape). AGX2 can fuse general integer/float comparisons, but those forms
+    * do not encode an AGX3 half-width quad result. Keep the predicate
+    * calculation for quad any/all and let lower_pseudo ballot its nonzero
+    * boolean.
     */
    if (quad && I->dest[0].size == AGX_SIZE_16 && ctx->key &&
-       ctx->key->dev.chip == AGX_CHIP_G17P &&
-       ctx->key->dev.shader_quad_control &&
+       agx_isa_is_agx3(ctx->key->dev.encoding) &&
        (def->op != AGX_OPCODE_ICMP ||
         def->src[1].type != AGX_INDEX_IMMEDIATE || def->src[1].value != 0 ||
         (def->icond != AGX_ICOND_UEQ && def->icond != AGX_ICOND_SEQ)))
@@ -1696,6 +1822,18 @@ agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
     * M6 only: the M5 keeps the fused register form. */
    if (!quad && ctx->key && agx_is_g18g(&ctx->key->dev) &&
        def->src[1].type != AGX_INDEX_IMMEDIATE)
+      return;
+
+   /* No AGX3 ballot compare takes a source modifier
+    * (agx3_emit_subgroup_ballot), but agx_optimizer_fmov folds |x| and -x
+    * into the comparison, which does encode them. A quad ballot keeps the
+    * comparison and lets lower_pseudo ballot its boolean, as above; a SIMD
+    * ballot takes the opposite comparison below.
+    */
+   const bool agx3_modifiers =
+      ctx->key && agx_isa_is_agx3(ctx->key->dev.encoding) &&
+      agx_ballot_compare_has_modifiers(def);
+   if (quad && agx3_modifiers)
       return;
 
    /* Replace with a fused instruction since the # of sources changes */
@@ -1712,9 +1850,12 @@ agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
     * equality form it would otherwise take is measured wrong on G17P), signed
     * and float comparisons against anything but zero, `!(x < 0)`,
     * `!(x > 0xffff)`, and any 16-bit source but `x == 0`. Ballot the opposite compare instead, exactly as for a
-    * register operand below. */
-   if (!quad && ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-       !agx3b_ballot_compare_encodable(def)) {
+    * register operand below. The same applies on every AGX3 encoder to a
+    * comparison with a source modifier. */
+   if (!quad && ctx->key &&
+       ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         !agx3b_ballot_compare_encodable(def)) ||
+        agx3_modifiers)) {
       agx_index opposite = agx_temp(ctx, AGX_SIZE_16);
 
       if (def->op == AGX_OPCODE_ICMP) {
@@ -1884,6 +2025,34 @@ agx_optimizer_forward(agx_context *ctx)
          agx_optimizer_bitop(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD) {
          agx_optimizer_signext(ctx, defs, I);
+      }
+   }
+
+   /* Back-edge sources of loop-header phis had defs[v] == NULL during the
+    * single forward pass above, leaving scalarized vector loop phis with
+    * `split -> mov -> phi` chains. Propagate plain register moves into those
+    * phi edges now that defs[] is complete. */
+   agx_foreach_block(ctx, block) {
+      if (!block->loop_header)
+         continue;
+
+      agx_foreach_phi_in_block(block, phi) {
+         agx_foreach_ssa_src(phi, s) {
+            const agx_index src = phi->src[s];
+            const agx_instr *def = defs[src.value];
+            if (!def || def->op != AGX_OPCODE_MOV || def->saturate ||
+                def->dest[0].memory)
+               continue;
+
+            const agx_index rep = def->src[0];
+            if (rep.type != AGX_INDEX_NORMAL || rep.memory || rep.abs ||
+                rep.neg || rep.size != src.size ||
+                agx_channels(rep) != agx_channels(src) ||
+                rep.value == phi->dest[0].value)
+               continue;
+
+            agx_replace_src(phi, s, rep);
+         }
       }
    }
 

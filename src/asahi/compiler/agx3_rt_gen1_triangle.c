@@ -13,23 +13,23 @@
 #define TRI_COUNT (sizeof(agx3_rt_gen1_triangle_ops)/sizeof(agx3_rt_gen1_triangle_ops[0]))
 struct stream {uint8_t bytes[CAPACITY];size_t size;bool ok;};
 static void append(struct stream *s,const uint8_t *bytes,unsigned n,const char *name,int original){(void)name;(void)original;if(!n||n>16||s->size+n>CAPACITY){s->ok=false;return;}memcpy(s->bytes+s->size,bytes,n);s->size+=n;}
-#undef assert
-#define assert(x) do { if (!(x)) { s->ok = false; return; } } while (0)
+/* Fail the stream (s->ok = false) and return from the emitting function */
+#define RT_ENSURE(x) do { if (!(x)) { s->ok = false; return; } } while (0)
 static void fsel(struct stream *s,unsigned dest,unsigned a,unsigned b,unsigned cond,unsigned t,bool ti,unsigned f,bool fi,bool absolute,const char *name){
  struct agx3_fsel_desc d={.dest=dest,.dest_16=true,.dest_cache=true,.cmp0=a,.cmp1=b,.cmp0_abs=absolute,.sel0_kind=ti?AGX3_FSEL_SEL_IMMEDIATE:AGX3_FSEL_SEL_REGISTER,.sel1_kind=fi?AGX3_FSEL_SEL_IMMEDIATE:AGX3_FSEL_SEL_REGISTER,.sel0=t,.sel1=f,.sel_16=true,.condition=cond};
- uint8_t bytes[AGX3_ALU_MAX_LENGTH],n;assert(agx3_alu_fcmp_select(AGX_ISA_ENCODING_AGX3B,&d,bytes,&n));append(s,bytes,n,name,-1);
+ uint8_t bytes[AGX3_ALU_MAX_LENGTH],n;RT_ENSURE(agx3_alu_fcmp_select(AGX_ISA_ENCODING_AGX3B,&d,bytes,&n));append(s,bytes,n,name,-1);
 }
 static void isel(struct stream *s,unsigned dest,unsigned a,unsigned b,bool narrow,unsigned t,bool ti,unsigned f,bool fi,const char *name){
  struct agx3_isel_desc d={.dest=dest,.dest_16=true,.cmp0=a,.cmp1=b,.cond=AGX3_ISEL_ICOND_EQ,.cmp1_immediate=true,.cmp_16=narrow,.explicit_hints=true,.dest_cache=true,.true_kind=ti?AGX3_ISEL_IMMEDIATE:AGX3_ISEL_REGISTER,.false_kind=fi?AGX3_ISEL_IMMEDIATE:AGX3_ISEL_REGISTER,.sel_true=t,.sel_false=f};
- uint8_t bytes[AGX3_ISEL_MAX_LENGTH],n;assert(agx3_isel_encode(AGX_ISA_ENCODING_AGX3B,&d,bytes,&n));append(s,bytes,n,name,-1);
+ uint8_t bytes[AGX3_ISEL_MAX_LENGTH],n;RT_ENSURE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3B,&d,bytes,&n));append(s,bytes,n,name,-1);
 }
 static void imm16(struct stream *s,unsigned dest,unsigned value,const char *name){
  const struct agx3_field_kv fields[]={{2,dest},{9,2},{10,1},{14,value}};
- uint8_t bytes[16],n;assert(agx3_bind_compose(AGX_ISA_ENCODING_AGX3B,AGX3_MN_ldimm,1,fields,4,NULL,0,bytes,&n));append(s,bytes,n,name,-1);
+ uint8_t bytes[16],n;RT_ENSURE(agx3_bind_compose(AGX_ISA_ENCODING_AGX3B,AGX3_MN_ldimm,1,fields,4,NULL,0,bytes,&n));append(s,bytes,n,name,-1);
 }
-static void imm32(struct stream *s,unsigned dest,uint32_t value,const char *name){struct agx3_encoded_ldimm i;assert(agx3_pack_ldimm_u32(AGX_ISA_ENCODING_AGX3B,dest,value,&i));append(s,i.bytes,i.length,name,-1);}
-static void bitreg(struct stream *s,enum agx3_alu_op op,unsigned dest,unsigned a,unsigned b,const char *name){const uint16_t src[]={a,b};const enum agx3_alu_hint hints[]={AGX3_ALU_HINT_NONE,AGX3_ALU_HINT_NONE};uint8_t bytes[16],n;assert(agx3_alu_bit_reg16(AGX_ISA_ENCODING_AGX3B,op,dest,src,hints,0,bytes,&n));append(s,bytes,n,name,-1);}
-static void bitimm(struct stream *s,unsigned dest,unsigned a,unsigned mask,const char *name){uint8_t bytes[16],n;assert(mask<=255);assert(agx3_alu_bit_imm(AGX_ISA_ENCODING_AGX3B,AGX3_ALU_BAND,true,dest,a,mask,AGX3_ALU_HINT_NONE,0,bytes,&n));append(s,bytes,n,name,-1);}
+static void imm32(struct stream *s,unsigned dest,uint32_t value,const char *name){struct agx3_encoded_ldimm i;RT_ENSURE(agx3_pack_ldimm_u32(AGX_ISA_ENCODING_AGX3B,dest,value,&i));append(s,i.bytes,i.length,name,-1);}
+static void bitreg(struct stream *s,enum agx3_alu_op op,unsigned dest,unsigned a,unsigned b,const char *name){const uint16_t src[]={a,b};const enum agx3_alu_hint hints[]={AGX3_ALU_HINT_NONE,AGX3_ALU_HINT_NONE};uint8_t bytes[16],n;RT_ENSURE(agx3_alu_bit_reg16(AGX_ISA_ENCODING_AGX3B,op,dest,src,hints,0,bytes,&n));append(s,bytes,n,name,-1);}
+static void bitimm(struct stream *s,unsigned dest,unsigned a,unsigned mask,const char *name){uint8_t bytes[16],n;RT_ENSURE(mask<=255);RT_ENSURE(agx3_alu_bit_imm(AGX_ISA_ENCODING_AGX3B,AGX3_ALU_BAND,true,dest,a,mask,AGX3_ALU_HINT_NONE,0,bytes,&n));append(s,bytes,n,name,-1);}
 static void setflag(struct stream *s,unsigned flag,const char *name){imm16(s,98,flag,name);isel(s,98,97,0,true,0,true,98,false,name);bitreg(s,AGX3_ALU_BOR,96,96,98,name);}
 static void edge(struct stream *s,unsigned ax,unsigned ay,unsigned bx,unsigned by,unsigned flag){
  fsel(s,97,by,ay,1,1,true,0,true,false,"edge-dy-negative");
@@ -39,15 +39,15 @@ static void edge(struct stream *s,unsigned ax,unsigned ay,unsigned bx,unsigned b
 static void vertex(struct stream *s,unsigned ax,unsigned bx,unsigned cx,unsigned flag){fsel(s,97,bx,ax,6,1,true,0,true,false,"vertex-left-inclusive");fsel(s,97,cx,ax,2,97,false,0,true,false,"vertex-right-exclusive");setflag(s,flag,"vertex-eligible");}
 static void zero_factor(struct stream *s,unsigned a,unsigned b,unsigned flag){
  uint8_t bytes[16],n;
- assert(agx3_alu_shift_imm32(AGX_ISA_ENCODING_AGX3B,true,98,a,1,AGX3_ALU_HINT_NONE,true,0,bytes,&n));append(s,bytes,n,"factor-a-bitwise-abs-zero",-1);
+ RT_ENSURE(agx3_alu_shift_imm32(AGX_ISA_ENCODING_AGX3B,true,98,a,1,AGX3_ALU_HINT_NONE,true,0,bytes,&n));append(s,bytes,n,"factor-a-bitwise-abs-zero",-1);
  isel(s,97,98,0,false,1,true,0,true,"factor-a-zero");
- assert(agx3_alu_shift_imm32(AGX_ISA_ENCODING_AGX3B,true,98,b,1,AGX3_ALU_HINT_NONE,true,0,bytes,&n));append(s,bytes,n,"factor-b-bitwise-abs-zero",-1);
+ RT_ENSURE(agx3_alu_shift_imm32(AGX_ISA_ENCODING_AGX3B,true,98,b,1,AGX3_ALU_HINT_NONE,true,0,bytes,&n));append(s,bytes,n,"factor-b-bitwise-abs-zero",-1);
  isel(s,97,98,0,false,1,true,97,false,"factor-b-zero");setflag(s,flag,"zero-factor-proof");
 }
 static void subnormal_coordinate(struct stream *s,unsigned coordinate){
- uint8_t bytes[16],n;assert(agx3_alu_shift_imm32(AGX_ISA_ENCODING_AGX3B,true,98,coordinate,1,AGX3_ALU_HINT_NONE,true,0,bytes,&n));append(s,bytes,n,"coordinate-absolute-bits",-1);
+ uint8_t bytes[16],n;RT_ENSURE(agx3_alu_shift_imm32(AGX_ISA_ENCODING_AGX3B,true,98,coordinate,1,AGX3_ALU_HINT_NONE,true,0,bytes,&n));append(s,bytes,n,"coordinate-absolute-bits",-1);
  isel(s,97,98,0,false,0,true,1,true,"coordinate-bitwise-nonzero");
- assert(agx3_alu_shift_imm32(AGX_ISA_ENCODING_AGX3B,false,98,98,24,AGX3_ALU_HINT_NONE,true,0,bytes,&n));append(s,bytes,n,"coordinate-exponent",-1);
+ RT_ENSURE(agx3_alu_shift_imm32(AGX_ISA_ENCODING_AGX3B,false,98,98,24,AGX3_ALU_HINT_NONE,true,0,bytes,&n));append(s,bytes,n,"coordinate-exponent",-1);
  isel(s,97,98,0,false,97,false,0,true,"coordinate-is-subnormal");setflag(s,32768,"preserve-native-subnormal-coordinate");
 }
 /* Edge and vertex ownership of the record's triangle A = (v0, v1, v2), or
@@ -66,7 +66,7 @@ static void prepare_policy(struct stream *s,bool second){
  zero_factor(s,2,4,512);zero_factor(s,22,14,1024);zero_factor(s,22,0,2048);zero_factor(s,18,4,4096);zero_factor(s,18,14,8192);zero_factor(s,2,0,16384);
 }
 static void finite_product(struct stream *s,unsigned product){
- uint8_t bytes[16],n;assert(agx3_alu_shift_imm32(AGX_ISA_ENCODING_AGX3B,false,98,product,23,AGX3_ALU_HINT_NONE,true,0,bytes,&n));append(s,bytes,n,"product-exponent",-1);
+ uint8_t bytes[16],n;RT_ENSURE(agx3_alu_shift_imm32(AGX_ISA_ENCODING_AGX3B,false,98,product,23,AGX3_ALU_HINT_NONE,true,0,bytes,&n));append(s,bytes,n,"product-exponent",-1);
  bitimm(s,98,98,255,"product-exponent-mask");isel(s,97,98,255,true,0,true,97,false,"finite-product-range");
 }
 static void residual_zero(struct stream *s,unsigned p0,unsigned p1,unsigned q0,unsigned q1,unsigned flag,unsigned proof0,unsigned proof1){
@@ -94,11 +94,11 @@ static void finish_policy(struct stream *s,unsigned valid){
 }
 static void fmul(struct stream *s,unsigned dest,unsigned a,unsigned b,const char *name){
  const uint16_t src[3]={a,b,0};const enum agx3_alu_hint hints[3]={AGX3_ALU_HINT_NONE,AGX3_ALU_HINT_NONE,AGX3_ALU_HINT_NONE};
- uint8_t bytes[AGX3_ALU_MAX_LENGTH],n;assert(agx3_alu_float_reg(AGX_ISA_ENCODING_AGX3B,AGX3_ALU_FMUL,dest,src,hints,0,bytes,&n));append(s,bytes,n,name,-1);
+ uint8_t bytes[AGX3_ALU_MAX_LENGTH],n;RT_ENSURE(agx3_alu_float_reg(AGX_ISA_ENCODING_AGX3B,AGX3_ALU_FMUL,dest,src,hints,0,bytes,&n));append(s,bytes,n,name,-1);
 }
 static void ffma(struct stream *s,unsigned dest,unsigned a,unsigned b,unsigned c,const char *name){
  const uint16_t src[3]={a,b,c};const enum agx3_alu_hint hints[3]={AGX3_ALU_HINT_NONE,AGX3_ALU_HINT_NONE,AGX3_ALU_HINT_NONE};
- uint8_t bytes[AGX3_ALU_MAX_LENGTH],n;assert(agx3_alu_float_reg(AGX_ISA_ENCODING_AGX3B,AGX3_ALU_FMA,dest,src,hints,0,bytes,&n));append(s,bytes,n,name,-1);
+ uint8_t bytes[AGX3_ALU_MAX_LENGTH],n;RT_ENSURE(agx3_alu_float_reg(AGX_ISA_ENCODING_AGX3B,AGX3_ALU_FMA,dest,src,hints,0,bytes,&n));append(s,bytes,n,name,-1);
 }
 /* Rounded product a * b in p and its exact residual a * b - p in q. */
 static void two_product(struct stream *s,unsigned p,unsigned q,unsigned a,unsigned b){
@@ -157,18 +157,18 @@ static void body(struct stream *s,bool corrected){
   if(corrected&&op->offset==620)prepare_policy(s,false);
   if(corrected&&op->offset==1096)prepare_second(s);
   uint8_t bytes[16],n;
-  if(op->target!=UINT32_MAX)assert(agx3_cf_branch(AGX_ISA_ENCODING_AGX3B,true,bytes,&n));
-  else assert(agx3_bind_compose(AGX_ISA_ENCODING_AGX3B,op->name,op->ep,op->fields,op->nfields,NULL,0,bytes,&n));
-  assert(n==op->size);append(s,bytes,n,agx3_mnemonic_name(op->name),op->offset);
+  if(op->target!=UINT32_MAX)RT_ENSURE(agx3_cf_branch(AGX_ISA_ENCODING_AGX3B,true,bytes,&n));
+  else RT_ENSURE(agx3_bind_compose(AGX_ISA_ENCODING_AGX3B,op->name,op->ep,op->fields,op->nfields,NULL,0,bytes,&n));
+  RT_ENSURE(n==op->size);append(s,bytes,n,agx3_mnemonic_name(op->name),op->offset);
   if(corrected){switch(op->offset){case 648:residual_zero(s,72,10,76,78,1,512,1024);break;case 700:residual_zero(s,80,82,84,86,2,2048,4096);break;case 722:residual_zero(s,88,18,90,92,4,8192,16384);break;case 908:finish_policy(s,72);break;
    /* Triangle B: edge v2-v3 (products 38/16, residuals 24/4), edge v1-v3
     * (76/14, residuals 48/2), then its validity, which the native code
     * leaves in 16. */
    case 1148:residual_zero(s,38,16,24,4,2,2048,4096);break;case 1170:residual_zero(s,76,14,48,2,4,8192,16384);break;case 1390:finish_second(s);break;default:break;}}
  }
- for(unsigned j=0;j<TRI_COUNT;j++)if(agx3_rt_gen1_triangle_ops[j].target!=UINT32_MAX){size_t at=positions[j],target=positions[agx3_rt_gen1_triangle_ops[j].target];assert(agx3_cf_patch_branch(AGX_ISA_ENCODING_AGX3B,true,s->bytes+at,(int64_t)target-(int64_t)at));}
+ for(unsigned j=0;j<TRI_COUNT;j++)if(agx3_rt_gen1_triangle_ops[j].target!=UINT32_MAX){size_t at=positions[j],target=positions[agx3_rt_gen1_triangle_ops[j].target];RT_ENSURE(agx3_cf_patch_branch(AGX_ISA_ENCODING_AGX3B,true,s->bytes+at,(int64_t)target-(int64_t)at));}
 }
-#undef assert
+#undef RT_ENSURE
 bool
 agx3_rt_gen1_triangle_body_generate(uint8_t *out, size_t capacity, size_t *length)
 {

@@ -19,7 +19,9 @@ on purpose no longer has those rows: delete its line of LEGACY_SHA256 in the
 same change, and --verify has nothing to compare that table with.
 
 Every run, with or without --verify, checks the exclusive flags and the key
-indexes it prints against the predicates of the alternatives (check_keys()).
+indexes it prints against the predicates of the alternatives (check_keys()),
+and what it prints of each node's consumption against the node's rows
+(check_uses(), check_slices()), and the shape of every row (check_rows()).
 The encoder trusts them.
 """
 
@@ -93,10 +95,78 @@ def key_index(alts):
     return fields, rows
 
 
+def direct_slices(node):
+    """The bits of each field that the direct deposits of a node take."""
+    slices = {}
+    for field, _, _, width, src_shift, lut in node[2]:
+        if lut is None:
+            slices[field] = (slices.get(field, 0) |
+                             agx3_table.wmask(width) << src_shift)
+    return slices
+
+
+def check_slices(groups, forms):
+    """No two nodes that one instruction can apply deposit the same field
+    directly.
+
+    The encoder tests a value against the slices of the node that deposits
+    it (agx3_cmd in agx3_compose.h), which is the test against all direct
+    deposits of the field only then. Checked without the predicates: two
+    groups of a node, or a node and a group under it, count as applied
+    together whatever their alternatives test.
+    """
+    under = {}
+
+    def fields(node, what):
+        seen = set(direct_slices(node))
+        for g in node[3]:
+            if g not in under:
+                under[g] = set().union(*(fields(alt, 'group %d' % g)
+                                         for alt in groups[g]))
+            require(not seen & under[g],
+                    '%s: fields %s are deposited directly in two nodes',
+                    what, sorted(seen & under[g]))
+            seen |= under[g]
+        return seen
+
+    for mnemonic, ep, _, root in forms:
+        fields(root, 'form %s %d' % (mnemonic, ep))
+
+
+def check_rows(groups, forms):
+    """What the encoder does not test when it applies a row: a field id is
+    one, a deposit stays inside its 16-bit word, and a form reaches no
+    deposit into a word it does not have."""
+    for node in [alt for alts in groups for alt in alts] + [f[3] for f in forms]:
+        preds, fixeds, cmds, _ = node
+        for field in [p[0] for p in preds] + [c[0] for c in cmds]:
+            require(0 <= field < agx3_table.NUM_FIELDS, 'no field %d', field)
+        for _, _, dst_shift, width, src_shift, _ in cmds:
+            require(width >= 1 and dst_shift + width <= 16 and src_shift < 64,
+                    'a deposit of %d bits from bit %d to bit %d',
+                    width, src_shift, dst_shift)
+
+    under = {}
+
+    def last_word(node):
+        words = [f[0] for f in node[1]] + [c[1] for c in node[2]]
+        for g in node[3]:
+            if g not in under:
+                under[g] = max(last_word(alt) for alt in groups[g])
+            words.append(under[g])
+        return max(words, default=-1)
+
+    for mnemonic, ep, size, root in forms:
+        require(size % 2 == 0 and last_word(root) < size // 2,
+                'form %s %d of %d bytes deposits into word %d',
+                mnemonic, ep, size, last_word(root))
+
+
 def dense(name, groups, forms):
     """The arrays of the C table, as lists of tuples in struct field order."""
     pools = {k: Pool() for k in ('fixeds', 'predrefs', 'preds', 'cmds',
-                                 'groups', 'lutpool', 'setpool', 'keys')}
+                                 'groups', 'lutpool', 'setpool', 'keys',
+                                 'uses', 'slices')}
     D = {k: p.rows for k, p in pools.items()}
     # A group's alternatives are the nodes from here on.
     alt_off = [0]
@@ -132,17 +202,27 @@ def dense(name, groups, forms):
 
     def node(n):
         preds, fixeds, cmds, grefs = n
-        cmds = [((pools['lutpool'].add(lut), len(lut)) if lut else (0, 0)) +
+        # lut_n 0 is a direct deposit.
+        require(all(lut is None or len(lut) for *_, lut in cmds),
+                'a deposit with an empty value list')
+        # What the encoder checks after its walk, resolved here: the bits of
+        # each field that this node's direct deposits take, and the fields
+        # the node consumes.
+        slices = direct_slices(n)
+        whole = set(p[0] for p in preds) | set(c[0] for c in cmds if c[5])
+        consumed = whole | set(slices)
+        use = tuple(sum(1 << (f - w) for f in fields if w <= f < w + 64)
+                    for fields in (consumed, whole) for w in (0, 64, 128))
+        cmds = [((pools['lutpool'].add(lut), len(lut)) if lut else
+                 (pools['slices'].add((slices[field],)), 0)) +
                 (field, word, dst_shift, width, src_shift)
                 for field, word, dst_shift, width, src_shift, lut in cmds]
-        # lut_n 0 is a direct deposit.
-        require(all(lut is None or len(lut) for *_, lut in n[2]),
-                'a deposit with an empty value list')
         return (pools['predrefs'].add(tuple(predref(*p) for p in preds)),
                 pools['fixeds'].add(tuple((mask, value, word)
                                           for word, mask, value in fixeds)),
                 pools['cmds'].add(tuple(cmds)),
                 pools['groups'].add(tuple(group_rows[g] for g in grefs)),
+                pools['uses'].add(use),
                 len(fixeds), len(preds), len(cmds), len(grefs))
 
     D['nodes'] = [node(a) for alts in groups for a in alts]
@@ -172,7 +252,7 @@ def expand(D):
             (a, b) if kind != 1 else (tuple(D['setpool'][a:a + b]), 0))
 
     def node(i):
-        (pred_off, fixed_off, cmd_off, grp_off,
+        (pred_off, fixed_off, cmd_off, grp_off, _,
          fixed_n, pred_n, cmd_n, grp_n) = D['nodes'][i]
         return (
             tuple(pred(*r) for r in D['predrefs'][pred_off:pred_off + pred_n]),
@@ -228,6 +308,34 @@ def check_keys(D, groups):
                     'group %d: a key value its alternative does not test', g)
 
 
+def check_uses(D):
+    """The use masks and slice rows of D against the rows of each node."""
+    def bits(fields):
+        return [sum(1 << (f - w) for f in fields if w <= f < w + 64)
+                for w in (0, 64, 128)]
+
+    for pred_off, _, cmd_off, _, use_off, _, pred_n, cmd_n, _ in D['nodes']:
+        whole, slices = set(), {}
+        for field, value in D['predrefs'][pred_off:pred_off + pred_n]:
+            if field >= agx3_table.NUM_FIELDS:
+                field = D['preds'][(field - agx3_table.NUM_FIELDS) << 8
+                                   | value][2]
+            whole.add(field)
+        cmds = D['cmds'][cmd_off:cmd_off + cmd_n]
+        for _, lut_n, field, _, _, width, src_shift in cmds:
+            if lut_n:
+                whole.add(field)
+            else:
+                slices[field] = (slices.get(field, 0) |
+                                 agx3_table.wmask(width) << src_shift)
+        require(D['uses'][use_off:use_off + 6] ==
+                bits(whole | set(slices)) + bits(whole),
+                'a node whose use masks are not what its rows consume')
+        require(all(lut_n or D['slices'][lut_off] == slices[field]
+                    for lut_off, lut_n, field, *_ in cmds),
+                'a direct deposit whose slices are not its node\'s')
+
+
 # C type of each array, and the bits each struct member holds.
 LAYOUT = {
     'fixeds': ('agx3_fixed', (16, 16, 8)),
@@ -235,11 +343,13 @@ LAYOUT = {
     'preds': ('agx3_pred', (64, 16, 8, 8, 8, 8)),
     'cmds': ('agx3_cmd', (16, 8, 8, 8, 8, 8, 8)),
     'groups': ('agx3_group', (32, 32, 16, 8, 1)),
-    'nodes': ('agx3_node', (32, 16, 16, 16, 8, 8, 8, 8)),
+    'nodes': ('agx3_node', (32, 16, 16, 16, 16, 8, 8, 8, 8)),
     'forms': ('agx3_form', (32, None, 8, 8)),
     'lutpool': ('uint8_t', 8),
     'setpool': ('uint8_t', 8),
     'keys': ('uint8_t', 8),
+    'uses': ('uint64_t', 64),
+    'slices': ('uint64_t', 64),
 }
 
 
@@ -274,9 +384,15 @@ def print_c(name, D, out):
             out.write('[AGX3_MN_%s] = %s,\n' %
                       (form[1], cell('mnemonic_forms', i + 1, 16)))
     out.write('};\n')
+    # Each mnemonic's forms by ascending size, ep breaking ties.
+    order = sorted(range(len(D['forms'])), key=lambda i: (
+        D['forms'][i][1].encode(), D['forms'][i][3], D['forms'][i][2]))
+    out.write('static const uint16_t apple_order[] = {\n%s,\n};\n' % ','.join(
+        cell('apple_order', i, 16) for i in order))
     out.write('const agx3_table %s_table = {\n'
-              '   forms, %d, mnemonic_forms, nodes, groups, fixeds, predrefs,\n'
-              '   preds, cmds, lutpool, setpool, keys,\n'
+              '   forms, %d, mnemonic_forms, apple_order, nodes, groups, fixeds,\n'
+              '   predrefs,\n'
+              '   preds, cmds, lutpool, setpool, keys, uses, slices,\n'
               '};\n' % (name, len(D['forms'])))
 
 
@@ -288,8 +404,11 @@ def main():
     args = parser.parse_args()
 
     name, groups, forms = agx3_table.parse(args.description)
+    check_rows(groups, forms)
+    check_slices(groups, forms)
     D = dense(name, groups, forms)
     check_keys(D, groups)
+    check_uses(D)
     if args.verify and name in LEGACY_SHA256:
         rows = agx3_table.legacy_c(agx3_table.unfold(name, *expand(D)))
         got = hashlib.sha256(rows.encode()).hexdigest()

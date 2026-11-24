@@ -1904,6 +1904,27 @@ vk_graphics_pipeline_state_fill(const struct vk_device *device,
       }
    }
 
+   if (lib & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT) {
+      const VkPipelineRobustnessCreateInfoEXT *pipeline_robustness =
+         vk_find_struct_const(info->pNext, PIPELINE_ROBUSTNESS_CREATE_INFO_EXT);
+      const VkPipelineRobustnessCreateInfoEXT *vs_robustness = NULL;
+      for (uint32_t i = 0; i < info->stageCount; i++) {
+         if (info->pStages[i].stage == VK_SHADER_STAGE_VERTEX_BIT) {
+            vs_robustness =
+               vk_find_struct_const(info->pStages[i].pNext,
+                                    PIPELINE_ROBUSTNESS_CREATE_INFO_EXT);
+            break;
+         }
+      }
+      const VkPipelineRobustnessCreateInfoEXT *vi_robustness =
+         vs_robustness ? vs_robustness : pipeline_robustness;
+      if (vi_robustness &&
+          vi_robustness->vertexInputs !=
+             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT) {
+         state->vertex_input_robustness = vi_robustness->vertexInputs;
+      }
+   }
+
    return VK_SUCCESS;
 }
 
@@ -1924,6 +1945,9 @@ vk_graphics_pipeline_state_merge(struct vk_graphics_pipeline_state *dst,
    dst->pipeline_flags |= src->pipeline_flags;
    dst->feedback_loop_not_input_only |= src->feedback_loop_not_input_only;
    dst->rasterization_order_access |= src->rasterization_order_access;
+   if (dst->vertex_input_robustness ==
+       VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT)
+      dst->vertex_input_robustness = src->vertex_input_robustness;
 
    /* Render pass state needs special care because a render pass state may be
     * incomplete (view mask only).  See vk_render_pass_state_init().
@@ -2020,6 +2044,7 @@ vk_graphics_pipeline_state_copy(const struct vk_device *device,
    state->feedback_loop_not_input_only =
       old_state->feedback_loop_not_input_only;
    state->rasterization_order_access = old_state->rasterization_order_access;
+   state->vertex_input_robustness = old_state->vertex_input_robustness;
 
    vk_graphics_pipeline_state_validate(state);
    return VK_SUCCESS;
@@ -2144,6 +2169,7 @@ vk_dynamic_graphics_state_fill(struct vk_dynamic_graphics_state *dyn,
    dyn->feedback_loops = 0;
 
    dyn->rasterization_order_access = p->rasterization_order_access;
+   dyn->vertex_input_robustness = p->vertex_input_robustness;
 
    get_dynamic_state_groups(dyn->set, groups);
 
@@ -2413,6 +2439,11 @@ vk_dynamic_graphics_state_copy(struct vk_dynamic_graphics_state *dst,
     * unconditionally when copying (e.g., secondary command buffer execution).
     */
    dst->rasterization_order_access |= src->rasterization_order_access;
+
+   if (dst->vertex_input_robustness != src->vertex_input_robustness) {
+      dst->vertex_input_robustness = src->vertex_input_robustness;
+      dst->generation++;
+   }
 
 #undef IS_SET_IN_SRC
 #undef MARK_DIRTY

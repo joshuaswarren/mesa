@@ -557,3 +557,26 @@ agx_link_varyings_vs_fs(void *out, struct agx_varyings_vs *vs,
       }
    }
 }
+
+/*
+ * G17G's and G18G's varying tables select perspective-correct coefficients
+ * with shade model 5. AGX2's 7 sets them up linearly there, which only a
+ * clip-space W other than 1 exposes: a constant colour reads back as c * W,
+ * the shader's 1/W divide applied to an undivided coefficient (dEQP
+ * fill_rules.projected; gpu/persp1.c measures 5 exact, 7/3/1/4 not). On G18G
+ * es2gears' lit gears saturated to white and yellow and Google Maps' area
+ * fills to the R11G11B10F maximum; against llvmpipe with constant and
+ * per-vertex W at 1, 2 and 4 samples, 5 is exact.
+ */
+void
+agx_cf_bindings_select_perspective(void *out, const struct agx_varyings_fs *fs)
+{
+   struct agx_cf_binding_packed *bindings =
+      (void *)((uint8_t *)out + AGX_CF_BINDING_HEADER_LENGTH);
+
+   for (unsigned i = 0; i < fs->nr_bindings; ++i) {
+      if (fs->bindings[i].smooth && fs->bindings[i].perspective)
+         bindings[i].opaque[0] =
+            (bindings[i].opaque[0] & ~BITFIELD_RANGE(2, 3)) | (5u << 2);
+   }
+}

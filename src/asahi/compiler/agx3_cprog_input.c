@@ -69,7 +69,7 @@ agx3_cprog_input_publish(const struct agx3_cprog_inputs *inputs,
          inputs, uniform_half + i, &destinations[i]);
 
    unsigned mask = selected[0] | (selected[1] << 1);
-   return agx3_cprog_input_publish_at(mask,
+   return agx3_cprog_input_publish_at_encoding(AGX_ISA_ENCODING_AGX3B, mask,
       selected[0] ? destinations[0] : selected[1] ? destinations[1] : 8,
       source_half, output, capacity, written);
 }
@@ -146,11 +146,3 @@ agx3_cprog_input_import_encoding(
    return true;
 }
 
-bool
-agx3_cprog_input_publish_at(unsigned mask, unsigned tps_half,
-                            unsigned source_half, void *output,
-                            size_t capacity, size_t *written)
-{
-   return agx3_cprog_input_publish_at_encoding(AGX_ISA_ENCODING_AGX3B,
-      mask, tps_half, source_half, output, capacity, written);
-}

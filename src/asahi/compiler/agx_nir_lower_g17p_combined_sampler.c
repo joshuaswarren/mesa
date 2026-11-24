@@ -1043,16 +1043,11 @@ agx_nir_lower_g17p_indexed_samplers(nir_shader *shader, bool g17p)
 }
 
 
-/* G17G multisample texel fetches: fragment, compute and vertex. The vertex
- * form is the fragment form with sampler index 0 (port/vmswit v_ms_f, v_ms_u,
- * v_msa_f, v_ms_k against f_ms_f). */
-static bool
-g17g_ms_read_stage(mesa_shader_stage stage)
-{
-   return stage == MESA_SHADER_FRAGMENT || stage == MESA_SHADER_COMPUTE ||
-          stage == MESA_SHADER_VERTEX;
-}
-
+/* G17G multisample texel fetches run on every stage admitted by
+ * agx_nir_lower_g17g_indexed_reads(): fragment (sampler selector 1), compute
+ * and Poly's CDM-dispatched tessellation-control / geometry / sw-TES stages,
+ * hardware vertex / TES, and TA mesh / task (all sampler selector 0,
+ * port/vmswit v_ms_f, v_ms_u, v_msa_f, v_ms_k against f_ms_f). */
 bool
 agx_nir_lower_g17g_indexed_reads(nir_shader *shader)
 {
@@ -1070,9 +1065,6 @@ agx_nir_lower_g17g_indexed_reads(nir_shader *shader)
                const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
                if (intr->intrinsic == nir_intrinsic_bindless_image_load ||
                    intr->intrinsic == nir_intrinsic_bindless_image_sparse_load) {
-                  if (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_MS &&
-                      !g17g_ms_read_stage(shader->info.stage))
-                     return false;
                   if ((nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_2D &&
                        nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_3D &&
                        nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_CUBE &&
@@ -1093,8 +1085,6 @@ agx_nir_lower_g17g_indexed_reads(nir_shader *shader)
                (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
                 tex->sampler_dim == GLSL_SAMPLER_DIM_3D ||
                 tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE);
-            if (multisample && !g17g_ms_read_stage(shader->info.stage))
-               return false;
             if ((!multisample && !query_lod &&
                  tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
                  tex->sampler_dim != GLSL_SAMPLER_DIM_3D &&
@@ -1116,7 +1106,7 @@ agx_nir_lower_g17g_indexed_reads(nir_shader *shader)
             const bool ms_fetch = multisample &&
                g17p_indexed_fetch_shape(tex) && offset < 0 && packed_offset < 0;
             const bool fetch = ms_fetch || (!multisample &&
-               tex->op == nir_texop_txf && lod >= 0 &&
+               tex->op == nir_texop_txf &&
                (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
                 tex->sampler_dim == GLSL_SAMPLER_DIM_3D) &&
                offset < 0 && packed_offset < 0 &&

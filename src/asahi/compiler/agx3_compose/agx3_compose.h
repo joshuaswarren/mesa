@@ -48,6 +48,11 @@ typedef struct { uint64_t b; uint16_t a; uint8_t field, kind, shift, width; } ag
  * itself, fields[field] == value, which nearly all are.  Any other one is
  * preds[(field - AGX3_MAX_FIELDS) << 8 | value]. */
 typedef struct { uint8_t field, value; } agx3_predref;
+/* A direct deposit puts bits of the field's value in the word, and its
+ * lut_off is the row of slices[] with every bit of the field that the node's
+ * direct deposits take.  A value with other bits set does not encode, unless
+ * a predicate or a LUT on the path covers the field.  No two nodes of a form
+ * that can both apply deposit the same field directly. */
 typedef struct {
    uint16_t lut_off;
    uint8_t lut_n;                /* 0: direct deposit */
@@ -66,9 +71,13 @@ typedef struct {
    uint8_t key_n;
    bool exclusive;
 } agx3_group;
+/* uses[use_off .. use_off + 6) is what the node consumes, one bit per field
+ * id in three words twice: the fields its predicates test or its commands
+ * read, then those of them a predicate tests or a LUT maps, whose value is
+ * covered whatever it is. */
 typedef struct {
    uint32_t pred_off;
-   uint16_t fixed_off, cmd_off, grp_off;
+   uint16_t fixed_off, cmd_off, grp_off, use_off;
    uint8_t fixed_n, pred_n, cmd_n, grp_n;
 } agx3_node;
 /* mnemonic is an enum agx3_mnemonic. */
@@ -76,9 +85,12 @@ typedef struct { uint32_t node; uint16_t mnemonic; uint8_t ep, size; } agx3_form
 
 typedef struct {
    /* In (mnemonic, ep) order.  mnemonic_forms[m] is one more than the index
-    * of mnemonic m's first form, 0 if the table has none. */
+    * of mnemonic m's first form, 0 if the table has none.  apple_order has
+    * the forms of each mnemonic again, in the order Apple's encoder tries
+    * them: by ascending size, ep breaking ties. */
    const agx3_form *forms; uint32_t num_forms;
    const uint16_t *mnemonic_forms;
+   const uint16_t *apple_order;
    const agx3_node *nodes;
    const agx3_group *groups;
    const agx3_fixed *fixeds;
@@ -88,6 +100,8 @@ typedef struct {
    const uint8_t *lutpool;
    const uint8_t *setpool;
    const uint8_t *keys;
+   const uint64_t *uses;
+   const uint64_t *slices;
 } agx3_table;
 
 /* The preds row that a predref with field >= AGX3_MAX_FIELDS names. */
@@ -114,6 +128,9 @@ extern const agx3_table agx3b_table;
 extern const agx3_table agx3c_table;
 extern const agx3_table agx3d_table;
 
+/* Whether predicate p of t holds for its field's value v */
+bool agx3_pred_holds(const agx3_table *t, const agx3_pred *p, uint64_t v);
+
 /* Pack forms[form] from fields[0..159].  On success writes size bytes into
  * out and returns true; any violation of the contract returns false with out
  * untouched. */
@@ -136,6 +153,13 @@ int32_t agx3_compose_apple_order(const agx3_table *t,
                                  enum agx3_mnemonic mnemonic,
                                  const uint64_t fields[AGX3_MAX_FIELDS],
                                  uint8_t *out);
+
+/* agx3_compose_apple_order() with nonzero as for agx3_compose_known(). */
+int32_t agx3_compose_apple_order_known(const agx3_table *t,
+                                       enum agx3_mnemonic mnemonic,
+                                       const uint64_t fields[AGX3_MAX_FIELDS],
+                                       const uint64_t nonzero[3],
+                                       uint8_t *out);
 
 /* A mnemonic's spelling, "?" for AGX3_MN_NONE and for no mnemonic at all;
  * and back: AGX3_MN_NONE for a name no table has. */

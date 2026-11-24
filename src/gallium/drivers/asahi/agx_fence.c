@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <errno.h>
 #include <xf86drm.h>
 #include <string.h>
 
@@ -30,11 +31,35 @@ agx_fence_reference(struct pipe_screen *pscreen, struct pipe_fence_handle **ptr,
 
    if (pipe_reference(old ? &old->reference : NULL,
                       fence ? &fence->reference : NULL)) {
-      drmSyncobjDestroy(dev->fd, old->syncobj);
+      tc_unflushed_batch_token_reference(&old->tc_token, NULL);
+      util_queue_fence_destroy(&old->ready);
+      if (old->syncobj)
+         drmSyncobjDestroy(dev->fd, old->syncobj);
       free(old);
    }
 
    *ptr = fence;
+}
+
+static bool
+agx_fence_wait_ready(struct pipe_context *ctx, struct pipe_fence_handle *fence,
+                     uint64_t timeout, int64_t abs_timeout)
+{
+   if (util_queue_fence_is_signalled(&fence->ready))
+      return true;
+
+   if (fence->tc_token && ctx)
+      threaded_context_flush(ctx, fence->tc_token, timeout == 0);
+
+   if (!timeout)
+      return util_queue_fence_is_signalled(&fence->ready);
+
+   if (timeout == OS_TIMEOUT_INFINITE) {
+      util_queue_fence_wait(&fence->ready);
+      return true;
+   }
+
+   return util_queue_fence_wait_timeout(&fence->ready, abs_timeout);
 }
 
 bool
@@ -44,14 +69,24 @@ agx_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
    struct agx_device *dev = agx_device(pscreen);
    int ret;
 
-   if (fence->signaled)
+   int64_t abs_timeout = os_time_get_absolute_timeout(timeout);
+   if (!agx_fence_wait_ready(ctx, fence, timeout, abs_timeout))
+      return false;
+
+   /* Preserve pre-TC NULL fence semantics for faulted fences so glClientWaitSync
+    * completes instead of timing out forever; the reset is reported on the
+    * faulting context itself.
+    */
+   if (fence->faulted || !fence->syncobj)
       return true;
 
-   uint64_t abs_timeout = os_time_get_absolute_timeout(timeout);
-   if (abs_timeout == OS_TIMEOUT_INFINITE)
-      abs_timeout = INT64_MAX;
+   if (p_atomic_read(&fence->signaled))
+      return true;
 
-   ret = drmSyncobjWait(dev->fd, &fence->syncobj, 1, abs_timeout,
+   uint64_t drm_timeout =
+      (uint64_t)abs_timeout == OS_TIMEOUT_INFINITE ? INT64_MAX : abs_timeout;
+
+   ret = drmSyncobjWait(dev->fd, &fence->syncobj, 1, drm_timeout,
                         DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
 
    if (ret < 0 && ret != -ETIME) {
@@ -59,8 +94,10 @@ agx_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
       return false;
    }
 
-   fence->signaled = (ret >= 0);
-   return fence->signaled;
+   bool signaled = (ret >= 0);
+   if (signaled)
+      p_atomic_set(&fence->signaled, true);
+   return signaled;
 }
 
 int
@@ -68,6 +105,12 @@ agx_fence_get_fd(struct pipe_screen *screen, struct pipe_fence_handle *f)
 {
    struct agx_device *dev = agx_device(screen);
    int fd = -1;
+
+   if (!util_queue_fence_is_signalled(&f->ready))
+      util_queue_fence_wait(&f->ready);
+
+   if (f->faulted || !f->syncobj)
+      return -1;
 
    int ret = drmSyncobjExportSyncFile(dev->fd, f->syncobj, &fd);
    if (ret || fd < 0) {
@@ -110,6 +153,7 @@ agx_fence_from_fd(struct agx_context *ctx, int fd, enum pipe_fd_type type)
    }
 
    pipe_reference_init(&f->reference, 1);
+   util_queue_fence_init(&f->ready);
 
    return f;
 
@@ -120,25 +164,55 @@ err_free_fence:
    return NULL;
 }
 
-struct pipe_fence_handle *
-agx_fence_create(struct agx_context *ctx)
+static bool
+agx_fence_snapshot_syncobj(struct agx_context *ctx, uint32_t *out_syncobj)
 {
    struct agx_device *dev = agx_device(ctx->base.screen);
    int fd = -1, ret;
 
    /* A failed submission must not export an earlier rendering success. */
    if (ctx->any_faults)
-      return NULL;
+      return false;
 
-   /* Snapshot the last rendering out fence. We'd rather have another
-    * syncobj instead of a sync file, but this is all we get.
-    * (HandleToFD/FDToHandle just gives you another syncobj ID for the
-    * same syncobj).
+   /* Ensure ctx->syncobj reflects any queued work before snapshotting it. */
+   agx_submit_pending(ctx);
+   if (ctx->any_faults)
+      return false;
+
+   /* Common path with no deferred server-wait fence: snapshot ctx->syncobj
+    * directly into a fresh syncobj via DRM_IOCTL_SYNCOBJ_TRANSFER, avoiding
+    * sync_file allocation and fd install/close on every glFenceSync().
+    * agx_fence_get_fd() exports a sync_file lazily only when requested.
     */
+   if (ctx->in_sync_fd < 0) {
+      uint32_t syncobj = 0;
+
+      ret = drmSyncobjCreate(dev->fd, 0, &syncobj);
+      if (ret) {
+         agx_msg("create syncobj failed\n");
+         return false;
+      }
+
+      ret = drmSyncobjTransfer(dev->fd, syncobj, 0, ctx->syncobj, 0, 0);
+      if (!ret) {
+         *out_syncobj = syncobj;
+         return true;
+      }
+
+      int err = ret == -1 ? errno : -ret;
+      drmSyncobjDestroy(dev->fd, syncobj);
+
+      if (err != EOPNOTSUPP && err != ENOSYS) {
+         agx_msg("syncobj transfer failed: %s\n", strerror(err));
+         return false;
+      }
+   }
+
+   /* Fallback path (or pending deferred server-wait): export a sync_file. */
    ret = drmSyncobjExportSyncFile(dev->fd, ctx->syncobj, &fd);
    if (ret || fd == -1) {
       agx_msg("export failed\n");
-      return NULL;
+      return false;
    }
 
    /* fence_server_sync() defers an imported native fence until the next GPU
@@ -182,16 +256,74 @@ agx_fence_create(struct agx_context *ctx)
 
       if (fd < 0) {
          agx_msg("failed to snapshot pending server wait\n");
-         return NULL;
+         return false;
       }
    }
 
-   struct pipe_fence_handle *f =
-      agx_fence_from_fd(ctx, fd, PIPE_FD_TYPE_NATIVE_SYNC);
+   uint32_t syncobj = 0;
+   ret = drmSyncobjCreate(dev->fd, 0, &syncobj);
+   if (ret) {
+      agx_msg("create syncobj failed\n");
+      close(fd);
+      return false;
+   }
 
+   ret = drmSyncobjImportSyncFile(dev->fd, syncobj, fd);
    close(fd);
+   if (ret) {
+      agx_msg("import syncfile failed\n");
+      drmSyncobjDestroy(dev->fd, syncobj);
+      return false;
+   }
 
+   *out_syncobj = syncobj;
+   return true;
+}
+
+struct pipe_fence_handle *
+agx_fence_create(struct agx_context *ctx)
+{
+   uint32_t syncobj = 0;
+   if (!agx_fence_snapshot_syncobj(ctx, &syncobj))
+      return NULL;
+
+   struct pipe_fence_handle *f = calloc(1, sizeof(*f));
+   if (!f) {
+      drmSyncobjDestroy(agx_device(ctx->base.screen)->fd, syncobj);
+      return NULL;
+   }
+
+   pipe_reference_init(&f->reference, 1);
+   util_queue_fence_init(&f->ready);
+   f->syncobj = syncobj;
    return f;
+}
+
+struct pipe_fence_handle *
+agx_fence_create_unflushed(struct pipe_context *pctx,
+                           struct tc_unflushed_batch_token *token)
+{
+   struct pipe_fence_handle *f = calloc(1, sizeof(*f));
+   if (!f)
+      return NULL;
+
+   pipe_reference_init(&f->reference, 1);
+   util_queue_fence_init(&f->ready);
+   util_queue_fence_reset(&f->ready);
+   tc_unflushed_batch_token_reference(&f->tc_token, token);
+   return f;
+}
+
+void
+agx_fence_populate(struct agx_context *ctx, struct pipe_fence_handle *f)
+{
+   uint32_t syncobj = 0;
+   if (agx_fence_snapshot_syncobj(ctx, &syncobj))
+      f->syncobj = syncobj;
+   else
+      f->faulted = true;
+
+   util_queue_fence_signal(&f->ready);
 }
 
 void
@@ -211,10 +343,23 @@ agx_fence_server_sync(struct pipe_context *pctx, struct pipe_fence_handle *f,
    int fd = -1, ret;
    assert(!value);
 
+   if (!util_queue_fence_is_signalled(&f->ready))
+      util_queue_fence_wait(&f->ready);
+
+   /* Preserve pre-TC NULL fence semantics: server-waiting on a faulted fence
+    * is a no-op and must not mark an innocent waiting context as faulted.
+    */
+   if (f->faulted || !f->syncobj)
+      return;
+
+   /* Batches queued before this server wait must not depend on the incoming
+    * acquire fence (which may even depend on those earlier batches). */
+   agx_submit_pending(ctx);
+
    ret = drmSyncobjExportSyncFile(dev->fd, f->syncobj, &fd);
    if (ret || fd < 0) {
       agx_msg("server-wait fence export failed\n");
-      ctx->any_faults = true;
+      p_atomic_set(&ctx->any_faults, true);
       return;
    }
 
@@ -226,7 +371,7 @@ agx_fence_server_sync(struct pipe_context *pctx, struct pipe_fence_handle *f,
       if (agx_fallback_wait(fd, "fence accumulation failed")) {
          agx_msg("server-wait fence accumulation and fallback wait failed\n");
          const bool first_fault = !ctx->any_faults;
-         ctx->any_faults = true;
+         p_atomic_set(&ctx->any_faults, true);
          if (first_fault && ctx->reset.reset)
             ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
       }
