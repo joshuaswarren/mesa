@@ -30,6 +30,13 @@ extern "C" {
 /* G18G's ordinary register file ends at r125 (half 251). */
 #define AGX3D_NUM_REGS (252)
 
+/* Register budget, in halves, of M5 compute kernels that use native ray
+ * traversal. Value from 7c91dddf53f (the M5 userspace snapshot), measured on
+ * M5 hardware with the full-resolution RT workload: 160 halves was faster
+ * than 128 and 192. Not derived; the snapshot records no numbers.
+ */
+#define AGX_M5_RT_REGISTER_BUDGET 160u
+
 /* u0-u255 inclusive, as pairs of 16-bits */
 #define AGX_NUM_UNIFORMS (512)
 

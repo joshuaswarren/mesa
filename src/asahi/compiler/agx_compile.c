@@ -16859,19 +16859,26 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    }
 
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
-      /* Hoist only what the register file can hold through the loop: the
-       * file a workgroup allows (agx_ra), less what spilling reserves.
+      /* Hoist only what the register file can hold through the loop, matching
+       * agx_ra_impl's shader-specific limits. Only static-split targets
+       * (emit_agx3d) cap compute shaders by workgroup occupancy.
        */
-      unsigned regs = ROUND_DOWN_TO(AGX3C_NUM_REGS, 8);
-      if (mesa_shader_stage_is_compute(nir->info.stage)) {
+      unsigned regs = key->dev.emit_agx3d ? AGX3D_NUM_REGS : AGX3C_NUM_REGS;
+      if (mesa_shader_stage_is_compute(nir->info.stage) &&
+          key->dev.emit_agx3d) {
          const unsigned threads = nir->info.workgroup_size_variable
             ? 1024
             : nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
                  nir->info.workgroup_size[2];
          regs = MIN2(regs, agx_max_registers_for_occupancy(threads));
       }
+      const bool cap_rt_compute =
+         nir->info.stage == MESA_SHADER_COMPUTE && !key->is_helper &&
+         (nir->info.ray_queries != 0 || uses_scs);
+      if (key->is_helper)
+         regs = MIN2(regs, 32);
 
-      NIR_PASS(post_opt_progress, nir, agx_nir_opt_licm, regs - 8);
+      NIR_PASS(post_opt_progress, nir, agx_nir_opt_licm, regs, cap_rt_compute);
    }
 
    if (is_agx3) {
