@@ -2131,6 +2131,14 @@ struct hk_cmd_buffer {
       struct hk_rendering_state render;
    } pass_merge;
 
+   /* Per-recording compute group-count cache (384 B) lives outside `state` so
+    * empty and graphics-only command buffer resets skip zeroing it. */
+   struct hk_group_count_cache_entry {
+      uint32_t x, y, z, valid;
+      uint64_t addr;
+   } group_count_cache[16];
+   bool used_group_count_cache;
+
    /* Set by hk_reset_cmd_buffer, cleared by vkBeginCommandBuffer. */
    bool g17p_pristine;
 
@@ -2140,10 +2148,6 @@ struct hk_cmd_buffer {
       struct {
          uint64_t id, addr;
       } constant_data[MESA_SHADER_STAGES];
-      struct hk_group_count_cache_entry {
-         uint32_t x, y, z, valid;
-         uint64_t addr;
-      } group_count_cache[16];
       /* vkCmdBindDescriptorBuffersEXT() */
       uint64_t descriptor_buffers[HK_MAX_DESCRIPTOR_BUFFERS];
       struct hk_graphics_state gfx;

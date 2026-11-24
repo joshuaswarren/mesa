@@ -731,6 +731,12 @@ void hk_sync_resolve_end(struct hk_cmd_buffer *cmd);
  * into its stream (hk_sync_load_resolved()) before emitting it. The streams
  * keep the fields of their last occurrence.
  */
+bool hk_sync_resolve_submit_ex(struct hk_queue *queue,
+                               struct hk_cmd_buffer *const *cmdbufs,
+                               unsigned count, bool first_cdm_is_flush,
+                               bool chain_first, uint64_t completed,
+                               struct hk_sync_resolved *out,
+                               bool *tail_raised_out);
 bool hk_sync_resolve_submit(struct hk_queue *queue,
                             struct hk_cmd_buffer *const *cmdbufs,
                             unsigned count, bool first_cdm_is_flush,
