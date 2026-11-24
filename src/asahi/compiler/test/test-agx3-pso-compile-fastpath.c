@@ -860,6 +860,244 @@ test_subgroup_predicate_matches_lowering(void)
 }
 #endif
 
+static bool
+block_in_loop(nir_block *block, nir_loop *loop)
+{
+   for (nir_cf_node *n = &block->cf_node; n; n = n->parent) {
+      if (n == &loop->cf_node)
+         return true;
+   }
+   return false;
+}
+
+static bool
+ungroup_loop_invariant_add(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool rewrote = false;
+
+   nir_foreach_block(block, impl) {
+      nir_loop *loop = NULL;
+      for (nir_cf_node *n = &block->cf_node; n; n = n->parent) {
+         if (n->type == nir_cf_node_loop) {
+            loop = nir_cf_node_as_loop(n);
+            break;
+         }
+      }
+      if (!loop)
+         continue;
+
+      /* Match the reassociated 4-term chain ((inv + v1) + v2) where
+       * inv = u0 + u1 has two loop-invariant terms and v1, v2 are loop-varying,
+       * and rewrite it back to (((v1 + u0) + v2) + u1). Because length == 4 and
+       * the chain is non-local, nir_opt_reassociate's CSE heuristic is skipped
+       * and only nir_reassociate_loop_invariant can regroup (u0 + u1). */
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *outer = nir_instr_as_alu(instr);
+         if (outer->op != nir_op_iadd || outer->def.bit_size != 32)
+            continue;
+
+         for (unsigned os = 0; os < 2; ++os) {
+            nir_instr *mid_instr = nir_def_instr(outer->src[os].src.ssa);
+            nir_def *v2 = outer->src[1 - os].src.ssa;
+            if (mid_instr->type != nir_instr_type_alu ||
+                !block_in_loop(nir_def_instr(v2)->block, loop))
+               continue;
+            nir_alu_instr *mid = nir_instr_as_alu(mid_instr);
+            if (mid->op != nir_op_iadd || mid->def.bit_size != 32)
+               continue;
+
+            for (unsigned ms = 0; ms < 2; ++ms) {
+               nir_instr *inv_instr = nir_def_instr(mid->src[ms].src.ssa);
+               nir_def *v1 = mid->src[1 - ms].src.ssa;
+               if (inv_instr->type != nir_instr_type_alu ||
+                   !block_in_loop(nir_def_instr(v1)->block, loop))
+                  continue;
+               nir_alu_instr *inv = nir_instr_as_alu(inv_instr);
+               if (inv->op != nir_op_iadd || inv->def.bit_size != 32)
+                  continue;
+
+               nir_def *u0 = inv->src[0].src.ssa;
+               nir_def *u1 = inv->src[1].src.ssa;
+               if (block_in_loop(nir_def_instr(u0)->block, loop) ||
+                   block_in_loop(nir_def_instr(u1)->block, loop))
+                  continue;
+
+               nir_builder b = nir_builder_at(nir_before_instr(&outer->instr));
+               nir_def *ungrouped = nir_iadd(
+                  &b, nir_iadd(&b, nir_iadd(&b, v1, u0), v2), u1);
+               nir_def_rewrite_uses(&outer->def, ungrouped);
+               nir_instr_remove(&outer->instr);
+               if (nir_def_is_unused(&mid->def))
+                  nir_instr_remove(&mid->instr);
+               if (nir_def_is_unused(&inv->def))
+                  nir_instr_remove(&inv->instr);
+               rewrote = true;
+               break;
+            }
+            if (rewrote)
+               break;
+         }
+         if (rewrote)
+            break;
+      }
+      if (rewrote)
+         break;
+   }
+
+   if (rewrote)
+      nir_progress(true, impl, nir_metadata_control_flow);
+   return rewrote;
+}
+
+static bool
+test_preoptimized_fs_inline_loop_invariant_reassoc(bool blended,
+                                                   bool uniform_exports)
+{
+   /* Regression test: serialize a pre-preamble SSA fragment shader whose loop
+    * still has an ungrouped invariant chain ((i + u0) + u1) with byte_indices
+    * enabled (G17P). Full compilation passes nir_reassociate_loop_invariant to
+    * group (u0 + u1) and hoist it into the preamble; the pre-preamble fast
+    * path must pass the same flag so fast and full outputs match byte-for-byte
+    * (reverting the fast-path byte_indices gate causes a mismatch here). */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options,
+      uniform_exports ? "fs_loop_invar_uniform" : "fs_loop_invar_main");
+   nir_function_impl *impl = nir_shader_get_entrypoint(b.shader);
+
+   nir_def *addr = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *count = nir_load_global_constant(
+      &b, 1, 32, addr, .align_mul = 4);
+   nir_def *u0 = nir_load_global_constant(
+      &b, 1, 32, nir_iadd_imm(&b, addr, 16), .align_mul = 4);
+   nir_def *u1 = nir_load_global_constant(
+      &b, 1, 32, nir_iadd_imm(&b, addr, 32), .align_mul = 4);
+
+   nir_def *in = NULL;
+   if (!uniform_exports) {
+      nir_def *bary = nir_load_barycentric_pixel(
+         &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+      in = nir_load_interpolated_input(
+         &b, 4, 32, bary, nir_imm_int(&b, 0), .base = 0,
+         .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+   }
+
+   nir_variable *idx_var =
+      nir_local_variable_create(impl, glsl_uint_type(), "idx");
+   nir_variable *acc_var =
+      nir_local_variable_create(impl, glsl_uint_type(), "acc");
+   nir_store_var(&b, idx_var, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc_var, nir_imm_int(&b, 0), 1);
+
+   nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, idx_var);
+      nir_push_if(&b, nir_uge(&b, i, count));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, NULL);
+
+      nir_def *a = nir_load_var(&b, acc_var);
+      nir_def *v2 = nir_ixor(&b, a, i);
+      nir_def *x = nir_iadd(&b, nir_iadd(&b, nir_iadd(&b, i, u0), v2), u1);
+      nir_store_var(&b, acc_var, nir_ixor(&b, a, x), 1);
+      nir_store_var(&b, idx_var, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, NULL);
+
+   nir_def *sum = nir_u2f32(&b, nir_load_var(&b, acc_var));
+   for (unsigned c = 0; c < 4; ++c) {
+      nir_def *val = uniform_exports
+         ? nir_fmul_imm(&b, sum, 0.25f * (c + 1))
+         : nir_fadd(&b, nir_channel(&b, in, c), sum);
+      nir_export_agx(&b, val, .base = c * 2);
+   }
+   b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+   agx_preprocess_nir_native(b.shader, AGX_CHIP_G17P);
+   NIR_PASS(_, b.shader, agx_nir_lower_interpolation, false);
+   nir_shader *src = b.shader;
+
+   nir_shader *ref_nir = nir_shader_clone(NULL, src);
+   nir_shader *ref_epilog = build_test_epilog(blended);
+   inline_and_resolve(ref_nir, ref_epilog);
+   ralloc_free(ref_epilog);
+
+   struct agx_shader_key ref_key = g17p_key(false);
+   struct agx_shader_part ref_part = {0};
+   bool ok = agx_compile_shader_nir(ref_nir, &ref_key, &ref_part);
+   ralloc_free(ref_nir);
+
+   /* Capture pre-preamble NIR, ungroup the loop-invariant add chain, and
+    * re-serialize so mono_blob carries an ungrouped ((i + u0) + u1) chain.
+    * Only agx_compile_shader_nir_preoptimized()'s fast-path reassociation can
+    * re-group (u0 + u1) and match the full compile. */
+   struct blob captured_blob;
+   blob_init(&captured_blob);
+   struct agx_shader_key standalone_key = g17p_key(uniform_exports);
+   standalone_key.no_stop = true;
+   struct agx_shader_part standalone_part = {0};
+   ok &= agx_compile_shader_nir_capture(src, &standalone_key, &standalone_part,
+                                        &captured_blob);
+   ralloc_free(src);
+
+   struct blob_reader cap_reader;
+   blob_reader_init(&cap_reader, captured_blob.data, captured_blob.size);
+   nir_shader *ungrouped_nir =
+      nir_deserialize(NULL, &agx_nir_options, &cap_reader);
+   ok &= ungrouped_nir != NULL && !cap_reader.overrun;
+   if (ok)
+      ok &= ungroup_loop_invariant_add(ungrouped_nir);
+
+   struct blob mono_blob;
+   blob_init(&mono_blob);
+   if (ok)
+      nir_serialize(&mono_blob, ungrouped_nir, false);
+   ralloc_free(ungrouped_nir);
+   blob_finish(&captured_blob);
+
+   nir_shader *fast_nir = NULL;
+   if (ok) {
+      struct blob_reader reader;
+      blob_reader_init(&reader, mono_blob.data, mono_blob.size);
+      fast_nir = nir_deserialize(NULL, &agx_nir_options, &reader);
+      ok &= fast_nir != NULL && !reader.overrun;
+   }
+
+   struct agx_shader_part fast_part = {0};
+   if (ok) {
+      struct agx_shader_key fast_key = g17p_key(false);
+      nir_shader *fast_epilog = build_test_epilog(blended);
+      agx_prepare_preoptimized_epilog_nir(fast_epilog, &fast_key);
+      inline_and_resolve(fast_nir, fast_epilog);
+      ralloc_free(fast_epilog);
+      ok &= agx_compile_shader_nir_preoptimized(fast_nir, &fast_key, &fast_part,
+                                                blended, uniform_exports);
+      ok &= ref_part.info.binary_size > 0 &&
+            ref_part.info.push_count == fast_part.info.push_count &&
+            ref_part.info.binary_size == fast_part.info.binary_size &&
+            memcmp(ref_part.binary, fast_part.binary,
+                   ref_part.info.binary_size) == 0;
+   }
+
+   if (!ok) {
+      fprintf(stderr,
+              "preoptimized_fs_inline_loop_invariant_reassoc(blended=%d, "
+              "uniform_exports=%d) failed: ref=(%u B, push=%u) fast=(%u B, "
+              "push=%u)\n",
+              blended, uniform_exports, ref_part.info.binary_size,
+              ref_part.info.push_count, fast_part.info.binary_size,
+              fast_part.info.push_count);
+   }
+
+   blob_finish(&mono_blob);
+   free(ref_part.binary);
+   free(standalone_part.binary);
+   free(fast_part.binary);
+   ralloc_free(fast_nir);
+   return ok;
+}
+
 int
 main(void)
 {
@@ -880,6 +1118,9 @@ main(void)
    ok &= test_preoptimized_fs_inline(false, true);
    ok &= test_preoptimized_fs_inline(true, true);
    ok &= test_preoptimized_fs_inline_undef_clamp();
+   ok &= test_preoptimized_fs_inline_loop_invariant_reassoc(true, false);
+   ok &= test_preoptimized_fs_inline_loop_invariant_reassoc(false, true);
+   ok &= test_preoptimized_fs_inline_loop_invariant_reassoc(true, true);
    if (!ok)
       return 1;
    puts("agx3_pso_compile_fastpath: PASS");

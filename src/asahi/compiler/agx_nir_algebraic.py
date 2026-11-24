@@ -485,20 +485,22 @@ for shift in (1, 2):
              ('ult', ('ushr', folded_offset, shift), ('ushr', b, shift))))
 
 # D3D float-to-integer conversions saturate and map NaN to 0. DXVK spells them
-# out as a conversion plus clamping selects; the M5 hardware conversion already
-# does exactly this (verified for both signs of NaN, infinities and every
-# boundary), so fold the selects into the bare conversion.
+# out as a conversion plus clamping selects; the AGX3 hardware conversion
+# already does exactly this (verified for both signs of NaN, infinities and
+# every boundary). Fold the selects into NIR's saturating conversions
+# (f2i32_sat/f2u32_sat) so subsequent constant folding preserves saturation and
+# NaN-to-zero semantics rather than treating out-of-range inputs as poison.
 fold_d3d_float_to_int = [
     (('bcsel', ('fneu', 'a@32', a), 0,
       ('bcsel', ('flt', a, -2147483648.0), -0x80000000,
        ('bcsel', ('flt', 2147483520.0, a), 0x7fffffff, ('f2i32', a)))),
-     ('f2i32', a)),
+     ('f2i32_sat', a)),
     (('bcsel', ('flt', 4294967040.0, 'a@32'), 0xffffffff,
       ('f2u32', ('bcsel', ('fneu', a, a), 0.0, ('fmax', a, 0.0)))),
-     ('f2u32', a)),
+     ('f2u32_sat', a)),
     (('bcsel', ('flt', 4294967040.0, 'a@32'), 0xffffffff,
       ('f2u32', ('fmax', a, 0.0))),
-     ('f2u32', a)),
+     ('f2u32_sat', a)),
 ]
 
 fold_selected_f2i32 = [
