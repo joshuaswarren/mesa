@@ -1150,8 +1150,10 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
  * proof. Never infer disjointness from different Vulkan handles alone.
  */
 static uint32_t
-hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info)
+hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
+                         bool *used_local_read)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
    VkImage images[HK_MAX_RTS + 2];
    struct hk_barrier_state state = {
@@ -1188,10 +1190,21 @@ hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info
       /* Do not mark a shared image client_visible while recording in parallel. */
       images[state.attachment_count++] =
          (VkImage)(uintptr_t)vk_object_to_u64_handle(&image->base);
+      if (i < render->color_att_count)
+         state.color_attachment_count++;
    }
    state.attachments_alias = state.attachment_count && aliases;
+   state.depth_stencil_writes =
+      state.attachment_count > state.color_attachment_count;
+   state.color_input_local_read =
+      agx_chip_local_read_tilebuffer(dev->dev.chip) && render->view_mask == 0 &&
+      cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
+      !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
+                         VK_RENDERING_RESUMING_BIT |
+                         VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) &&
+      !state.tilebuffer_spilled && !state.attachments_alias;
 
-   return hk_barrier_classify(info, &state);
+   return hk_barrier_classify_ex(info, &state, used_local_read);
 }
 
 /* Whether an image barrier discards the contents of a compressed storage
@@ -1367,15 +1380,20 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       uint8_t src_kinds, dst_kinds;
       hk_sync_dependency_kinds(pDependencyInfo, hk_sync_image_class(cmd),
                             &src_kinds, &dst_kinds);
-      const uint32_t reasons = hk_classify_pass_barrier(cmd, pDependencyInfo);
+      bool used_local_read = false;
+      const uint32_t reasons =
+         hk_classify_pass_barrier(cmd, pDependencyInfo, &used_local_read);
       if (reasons) {
          if (hk_cmd_buffer_end_graphics(cmd)) {
             cmd->state.barrier_stats.splits++;
             u_foreach_bit(r, reasons)
                cmd->state.barrier_stats.reason[r]++;
          }
-      } else if (cmd->current_cs.gfx) {
-         cmd->state.barrier_stats.kept++;
+      } else {
+         if (cmd->current_cs.gfx)
+            cmd->state.barrier_stats.kept++;
+         if (used_local_read)
+            cmd->state.gfx.render.kept_local_read_barrier = true;
       }
       /* Ending an empty render can replace its clear with a CDM job. Capture
        * the first scope only after that replacement has its physical stream. */

@@ -7834,6 +7834,348 @@ fail:
 #undef HK_MONO_FAIL
 }
 
+static const char *
+hk_g17p_local_read_part_refusal(const struct hk_shader *shader,
+                                const struct agx_shader_part *part)
+{
+   const struct agx_shader_info *info = &part->info;
+   if (info->stage != MESA_SHADER_FRAGMENT)
+      return "wrong stage";
+   if (!info->agx3_colour_link.entry_emitted ||
+       info->agx3_colour_link.colour_classes == 0 ||
+       info->agx3_colour_link.rt_query_write_acquired)
+      return "pixel protocol not proven";
+   if (info->has_preamble && !hk_g17p_native_cprog_qualified(info))
+      return "constant program outside the native protocol";
+   if (info->early_fragment_tests != shader->local_read_meta.early_fragment_tests ||
+       info->uses_draw_id || info->uses_base_param)
+      return "launch contract mismatch";
+   return NULL;
+}
+
+static bool
+hk_g17p_local_read_disk_key(struct hk_device *dev,
+                            const struct hk_shader *shader,
+                            const struct agx_fs_epilog_key *ekey,
+                            const struct hk_local_read_link_key *local_read,
+                            const BITSET_WORD *partitions, cache_key out)
+{
+   struct disk_cache *cache = dev->vk.physical->disk_cache;
+   if (!cache)
+      return false;
+
+   BITSET_DECLARE(parts, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
+   if (partitions)
+      memcpy(parts, partitions, sizeof(parts));
+
+   const char magic[8] = "hkmlr4\0";
+   const size_t size = sizeof(magic) + sizeof(shader->local_read_key) +
+                       sizeof(shader->local_read_meta) + sizeof(*ekey) +
+                       sizeof(*local_read) + sizeof(parts) +
+                       shader->local_read_nir_size;
+   uint8_t *buf = malloc(size);
+   if (!buf)
+      return false;
+
+   uint8_t *p = buf;
+   memcpy(p, magic, sizeof(magic));
+   p += sizeof(magic);
+   memcpy(p, &shader->local_read_key, sizeof(shader->local_read_key));
+   p += sizeof(shader->local_read_key);
+   memcpy(p, &shader->local_read_meta, sizeof(shader->local_read_meta));
+   p += sizeof(shader->local_read_meta);
+   memcpy(p, ekey, sizeof(*ekey));
+   p += sizeof(*ekey);
+   memcpy(p, local_read, sizeof(*local_read));
+   p += sizeof(*local_read);
+   memcpy(p, parts, sizeof(parts));
+   p += sizeof(parts);
+   memcpy(p, shader->local_read_nir, shader->local_read_nir_size);
+
+   disk_cache_compute_key(cache, buf, size, out);
+   free(buf);
+   return true;
+}
+
+static struct agx_shader_part *
+hk_g17p_local_read_inline_epilog_part(
+   struct hk_device *dev, struct hk_shader *shader,
+   const struct agx_fs_epilog_key *ekey,
+   const struct hk_local_read_link_key *local_read,
+   const BITSET_WORD *partitions)
+{
+#define HK_LR_REFUSE(why)                                                      \
+   do {                                                                        \
+      perf_debug_dev(&dev->dev, "local_read refused: %s", (why));              \
+      final_refusal = true;                                                    \
+      goto fail;                                                               \
+   } while (0)
+#define HK_LR_FAIL(why)                                                        \
+   do {                                                                        \
+      perf_debug_dev(&dev->dev, "local_read failed: %s", (why));               \
+      goto fail;                                                               \
+   } while (0)
+   static const char refused_marker[8] = "hkmlrN\0";
+
+   void *mem = ralloc_context(NULL);
+   struct agx_shader_part *part = NULL;
+   nir_shader *nir = NULL;
+   nir_builder eb = {0};
+   cache_key disk_key;
+   bool disk = false, final_refusal = false;
+
+   if (!mem)
+      return NULL;
+
+   const unsigned main_samples = MAX2(shader->local_read_key.fs.nr_samples, 1);
+   const unsigned samples = MAX2(ekey->nr_samples, 1);
+   if (ekey->native_spills || samples != main_samples)
+      HK_LR_REFUSE("epilog shape");
+
+   disk = hk_g17p_local_read_disk_key(dev, shader, ekey, local_read, partitions,
+                                      disk_key);
+   if (disk) {
+      size_t size = 0;
+      uint8_t *data =
+         disk_cache_get(dev->vk.physical->disk_cache, disk_key, &size);
+      if (data) {
+         const bool refused = size == sizeof(refused_marker) &&
+                              !memcmp(data, refused_marker, size);
+         part = refused ? NULL : hk_part_from_blob(data, size, NULL);
+         free(data);
+         if (refused)
+            HK_LR_FAIL("refused before");
+         if (part) {
+            if (hk_g17p_local_read_part_refusal(shader, part) != NULL)
+               HK_LR_FAIL("cached program");
+            ralloc_free(mem);
+            return part;
+         }
+      }
+   }
+
+   struct blob_reader reader;
+   blob_reader_init(&reader, shader->local_read_nir,
+                    shader->local_read_nir_size);
+   nir = nir_deserialize(mem, &agx_nir_options, &reader);
+   if (!nir || reader.overrun)
+      HK_LR_FAIL("nir");
+
+   struct agx_fs_epilog_key lr_ekey = *ekey;
+   lr_ekey.link = shader->local_read_meta.epilog_key;
+   lr_ekey.colour_unit_range = shader->local_read_meta.g17p_colour_unit_range;
+   lr_ekey.a2c_in_main = shader->local_read_meta.a2c_in_main;
+
+   struct agx_tilebuffer_layout tib =
+      lr_ekey.native_imageblock
+         ? agx_build_tilebuffer_layout_resident(
+              lr_ekey.rt_formats, ARRAY_SIZE(lr_ekey.rt_formats),
+              lr_ekey.nr_samples, true, lr_ekey.max_sample_size_B,
+              lr_ekey.max_bytes_per_tile, lr_ekey.max_samples_per_tile,
+              lr_ekey.resident_mask)
+         : agx_build_tilebuffer_layout_with_limits_resident(
+              lr_ekey.rt_formats, ARRAY_SIZE(lr_ekey.rt_formats),
+              lr_ekey.nr_samples, true, lr_ekey.max_sample_size_B,
+              lr_ekey.max_bytes_per_tile, lr_ekey.max_samples_per_tile,
+              lr_ekey.resident_mask);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   uint64_t new_outputs_read = 0;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_exported_agx)
+            HK_LR_REFUSE("main reads a prolog export");
+         if (intr->intrinsic != nir_intrinsic_load_output)
+            continue;
+
+         nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+         if (!sem.fb_fetch_output)
+            continue;
+         if (sem.location < FRAG_RESULT_DATA0 ||
+             sem.location >= FRAG_RESULT_DATA0 + HK_MAX_RTS)
+            HK_LR_REFUSE("non-color input attachment");
+
+         const unsigned ia_idx = sem.location - FRAG_RESULT_DATA0;
+         const int rt = local_read->ia_to_rt[ia_idx];
+         if (rt < 0 || rt >= HK_MAX_RTS ||
+             tib.logical_format[rt] == PIPE_FORMAT_NONE || tib.spilled[rt])
+            HK_LR_REFUSE("unmapped or spilled input attachment");
+
+         const enum pipe_format logical = tib.logical_format[rt];
+         const bool is_int = util_format_is_pure_integer(logical);
+         const nir_alu_type dest_type = nir_intrinsic_dest_type(intr);
+         const nir_alu_type base_type = nir_alu_type_get_base_type(dest_type);
+         if ((base_type != nir_type_float) != is_int)
+            HK_LR_REFUSE("integer/float type mismatch");
+
+         const unsigned logical_comps = util_format_get_nr_components(logical);
+         if (logical_comps == 0 || logical_comps > 4)
+            HK_LR_REFUSE("invalid logical component count");
+
+         sem.location = FRAG_RESULT_DATA0 + rt;
+         new_outputs_read |= BITFIELD64_BIT(sem.location);
+
+         if (intr->def.num_components > logical_comps) {
+            nir_builder b = nir_builder_at(nir_before_instr(instr));
+            const unsigned bit_size = intr->def.bit_size;
+            nir_def *narrow = nir_load_output(
+               &b, logical_comps, bit_size, intr->src[0].ssa,
+               .base = nir_intrinsic_base(intr),
+               .component = nir_intrinsic_component(intr),
+               .dest_type = dest_type, .io_semantics = sem);
+            nir_def *comps[4];
+            for (unsigned c = 0; c < intr->def.num_components; ++c) {
+               if (c < logical_comps) {
+                  comps[c] = nir_channel(&b, narrow, c);
+               } else if (c < 3) {
+                  comps[c] = is_int ? nir_imm_intN_t(&b, 0, bit_size)
+                                    : nir_imm_floatN_t(&b, 0.0, bit_size);
+               } else {
+                  comps[c] = is_int ? nir_imm_intN_t(&b, 1, bit_size)
+                                    : nir_imm_floatN_t(&b, 1.0, bit_size);
+               }
+            }
+            nir_def_replace(&intr->def,
+                            nir_vec(&b, comps, intr->def.num_components));
+         } else {
+            nir_intrinsic_set_io_semantics(intr, sem);
+         }
+      }
+   }
+   if (!new_outputs_read)
+      HK_LR_REFUSE("no local-read loads");
+   nir->info.outputs_read = new_outputs_read;
+
+   NIR_PASS(_, nir, agx_nir_lower_tilebuffer_with_conversions, &tib, NULL, NULL,
+            NULL, NULL, false, lr_ekey.lower_srgb, lr_ekey.lower_r11g11b10,
+            lr_ekey.ms_whole_sample, lr_ekey.g17p_tile_formats,
+            lr_ekey.native_epilog);
+
+   const bool inline_samples =
+      samples > 1 && shader->local_read.uses_sample_shading;
+   eb = nir_builder_init_simple_shader(0, &agx_nir_options, NULL);
+   if (inline_samples) {
+      struct agx_fs_epilog_key pixel = lr_ekey;
+      pixel.link.sample_shading = false;
+      pixel.defer_monolithic_msaa = true;
+      agx_nir_fs_epilog(&eb, &pixel);
+      agx_nir_lower_sample_exports_to_end(nir);
+   } else if (agx_chip_native_agx3(dev->dev.chip)) {
+      build_g17p_fs_epilog(&eb, &lr_ekey);
+   } else {
+      agx_nir_fs_epilog(&eb, &lr_ekey);
+   }
+   agx_preprocess_nir(eb.shader);
+
+   nir_foreach_block(block, eb.impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+         if (op == nir_intrinsic_load_preamble ||
+             op == nir_intrinsic_load_blend_const_color_rgba ||
+             op == nir_intrinsic_load_blend_const_color_r_float ||
+             op == nir_intrinsic_load_blend_const_color_g_float ||
+             op == nir_intrinsic_load_blend_const_color_b_float ||
+             op == nir_intrinsic_load_blend_const_color_a_float ||
+             op == nir_intrinsic_bindless_image_agx ||
+             op == nir_intrinsic_image_store ||
+             op == nir_intrinsic_bindless_image_store)
+            HK_LR_REFUSE("epilog uses uniforms or images");
+      }
+   }
+
+   {
+      struct hash_table *remap = _mesa_pointer_hash_table_create(mem);
+      nir_builder b = nir_builder_at(nir_after_impl(impl));
+      nir_inline_function_impl(&b, eb.impl, NULL, remap);
+      nir_index_ssa_defs(impl);
+      nir_progress(true, impl, nir_metadata_none);
+   }
+   nir->info.outputs_read |= eb.shader->info.outputs_read;
+   nir->info.outputs_written |= eb.shader->info.outputs_written;
+   nir->info.fs.uses_fbfetch_output |= eb.shader->info.fs.uses_fbfetch_output;
+   nir->info.fs.uses_sample_shading |= eb.shader->info.fs.uses_sample_shading;
+   nir->info.writes_memory |= eb.shader->info.writes_memory;
+   ralloc_free(eb.shader);
+   eb.shader = NULL;
+
+   if (!hk_g17p_mono_resolve_exports(nir))
+      HK_LR_REFUSE("exports");
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_dce);
+
+   if (inline_samples) {
+      struct agx_g17p_colour_layout layout;
+      agx_g17p_colour_layout_init(&layout, lr_ekey.link.loc_written,
+                                  lr_ekey.link.size_32,
+                                  lr_ekey.link.colour_comps,
+                                  lr_ekey.link.packed_colour);
+      NIR_PASS(_, nir, agx_nir_lower_to_per_sample);
+      NIR_PASS(_, nir, agx_nir_unroll_g17p_samples_layout, samples, &layout);
+      bool progress;
+      do {
+         progress = false;
+         NIR_PASS(progress, nir, nir_opt_constant_folding);
+         NIR_PASS(progress, nir, nir_opt_algebraic);
+      } while (progress);
+      NIR_PASS(_, nir, agx_nir_hoist_g17p_zs_writes);
+      NIR_PASS(_, nir, agx_nir_lower_g17p_tile_samples, samples);
+      nir->info.fs.uses_sample_shading = false;
+   } else if (agx_chip_native_agx3(dev->dev.chip)) {
+      NIR_PASS(_, nir, agx_nir_lower_g17p_tile_samples, 1);
+   }
+
+   struct agx_shader_key key = shader->local_read_key;
+   key.no_stop = false;
+   key.secondary = false;
+   key.agx3_local_read = true;
+   key.fs.inside_sample_loop = false;
+   key.fs.nr_samples = samples;
+   if (partitions)
+      memcpy(key.g17p_tile_partitions, partitions,
+             sizeof(key.g17p_tile_partitions));
+
+   part = rzalloc(NULL, struct agx_shader_part);
+   if (!part)
+      HK_LR_FAIL("oom");
+   const bool compiled = agx_compile_shader_nir(nir, &key, part);
+   nir = NULL;
+   if (!compiled) {
+      perf_debug_dev(&dev->dev, "local_read backend refusal: %s",
+                     agx3_last_pack_refusal());
+      HK_LR_REFUSE("backend refused local-read program");
+   }
+   const char *part_refusal = hk_g17p_local_read_part_refusal(shader, part);
+   if (part_refusal != NULL)
+      HK_LR_REFUSE(part_refusal);
+
+   if (disk)
+      hk_part_disk_put(dev, disk_key, part);
+   ralloc_free(mem);
+   return part;
+
+fail:
+   if (disk && final_refusal)
+      disk_cache_put(dev->vk.physical->disk_cache, disk_key, refused_marker,
+                     sizeof(refused_marker), NULL);
+   if (eb.shader)
+      ralloc_free(eb.shader);
+   if (part) {
+      free(part->binary);
+      ralloc_free(part);
+   }
+   ralloc_free(mem);
+   return NULL;
+#undef HK_LR_REFUSE
+#undef HK_LR_FAIL
+}
+
 static struct hk_linked_shader *
 hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
                              struct hk_fast_link_key_fs *key)
@@ -7888,6 +8230,46 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
       }
       if (BITSET_COUNT(g17p_tile_partitions) < 2)
          BITSET_ZERO(g17p_tile_partitions);
+   }
+
+   /* On-chip tile-memory local_read: compile a monolithic fragment program
+    * reading eligible color input attachments directly from the tilebuffer.
+    * Any refusal falls through to the split DRAM path below. */
+   if (key->local_read.enabled && !prolog && key->nr_samples_shaded == 0 &&
+       shader->local_read_nir) {
+      struct agx_shader_part *mono = hk_g17p_local_read_inline_epilog_part(
+         dev, shader, &key->epilog, &key->local_read, g17p_tile_partitions);
+      if (mono) {
+         struct hk_fast_link_key *mono_key_clone =
+            ralloc_memdup(shader->linked.ht, key, sizeof(*key));
+         struct hk_shader *layout =
+            mono_key_clone
+               ? hk_g17p_layout_shader_create_local_read(dev, shader, mono)
+               : NULL;
+         struct hk_linked_shader *mono_linked =
+            layout ? hk_fast_link_part(dev, true, layout, NULL, NULL, NULL, 0,
+                                       NULL)
+                   : NULL;
+         free(mono->binary);
+         ralloc_free(mono);
+         if (mono_linked) {
+            mono_linked->g17p_layout = layout;
+            mono_linked->uses_local_read_tile = true;
+            mono_linked->g17p_blend_constant_base =
+               key->epilog.blend_constant_base;
+            mono_linked->g17p_emrt_heap_base = key->epilog.emrt_heap_base;
+            mono_linked->g17p_prolog_uses_root = key->prolog.statistics;
+            _mesa_hash_table_insert(shader->linked.ht, mono_key_clone,
+                                    mono_linked);
+            return mono_linked;
+         }
+         if (layout) {
+            free(layout->b.binary);
+            agx_bo_unreference(&dev->dev, layout->bo);
+            free(layout);
+         }
+         ralloc_free(mono_key_clone);
+      }
    }
 
    /* Inline blend: try one monolithic fragment program first;
@@ -10580,12 +10962,14 @@ hk_fs_epilog_discards(const struct hk_shader *fs,
 
 /* Everything outside a fragment shader that its fast-link key depends on. */
 struct hk_fs_link_inputs {
+   const struct hk_cmd_buffer *cmd;
    const struct vk_dynamic_graphics_state *dyn;
    const struct agx_tilebuffer_layout *tib;
    const VkFormat *color_formats;
    unsigned color_formats_stride;
    unsigned color_att_count;
    unsigned cull_distance_size;
+   uint32_t view_mask;
    bool statistics;
    bool depth_attachment;
    bool stencil_attachment;
@@ -10621,12 +11005,14 @@ hk_cmd_fs_link_inputs(struct hk_cmd_buffer *cmd, const struct hk_shader *hw_vs)
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
    const struct hk_rendering_state *render = &gfx->render;
    return (struct hk_fs_link_inputs){
+      .cmd = cmd,
       .dyn = &cmd->vk.dynamic_graphics_state,
       .tib = &render->tilebuffer,
       .color_formats = &render->color_att[0].vk_format,
       .color_formats_stride = sizeof(render->color_att[0]),
       .color_att_count = render->color_att_count,
       .cull_distance_size = hw_vs->info.cull_distance_array_size,
+      .view_mask = render->view_mask,
       .statistics = hk_stat_enabled(hk_pipeline_stat_addr(
          cmd, VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)),
       .depth_attachment = render->depth_att.vk_format != VK_FORMAT_UNDEFINED,
@@ -10809,6 +11195,76 @@ hk_fill_fast_link_key_vs(struct hk_cmd_buffer *cmd, struct hk_shader *sw_vs,
                         indexed, index_size, restart, dyn->vi,
                         dyn->vi_binding_strides, key);
    hk_uvs_fs_masks(cmd, sw_vs, &key->uvs_flat, &key->uvs_linear);
+}
+
+static bool
+hk_image_view_identity_swizzle(const VkComponentMapping *sw)
+{
+   return (sw->r == VK_COMPONENT_SWIZZLE_IDENTITY ||
+           sw->r == VK_COMPONENT_SWIZZLE_R) &&
+          (sw->g == VK_COMPONENT_SWIZZLE_IDENTITY ||
+           sw->g == VK_COMPONENT_SWIZZLE_G) &&
+          (sw->b == VK_COMPONENT_SWIZZLE_IDENTITY ||
+           sw->b == VK_COMPONENT_SWIZZLE_B) &&
+          (sw->a == VK_COMPONENT_SWIZZLE_IDENTITY ||
+           sw->a == VK_COMPONENT_SWIZZLE_A);
+}
+
+static bool
+hk_local_read_descriptors_match(const struct hk_cmd_buffer *cmd,
+                                const struct hk_shader *fs,
+                                const int8_t ia_to_rt[HK_MAX_RTS])
+{
+   const struct hk_rendering_state *render = &cmd->state.gfx.render;
+   const struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+
+   for (unsigned i = 0; i < fs->local_read.binding_count; ++i) {
+      const struct hk_local_read_binding *b = &fs->local_read.bindings[i];
+      if (b->ia_idx >= HK_MAX_RTS || b->set >= HK_MAX_SETS)
+         return false;
+
+      const int rt = ia_to_rt[b->ia_idx];
+      if (rt < 0 || (unsigned)rt >= render->color_att_count)
+         return false;
+
+      const struct hk_attachment *att = &render->color_att[rt];
+      const struct hk_image_view *iview = att->iview;
+      if (!iview || iview->plane_count != 1 ||
+          iview->vk.format != att->vk_format ||
+          !hk_image_view_identity_swizzle(&iview->vk.swizzle))
+         return false;
+
+      if ((desc->buffer_active & BITFIELD_BIT(b->set)) ||
+          (desc->push_active & BITFIELD_BIT(b->set)))
+         return false;
+
+      const struct hk_descriptor_set *set = desc->sets[b->set];
+      if (!set || !set->mapped_ptr || !set->layout ||
+          b->binding >= set->layout->binding_count)
+         return false;
+
+      const struct hk_descriptor_set_binding_layout *bl =
+         &set->layout->binding[b->binding];
+      if (bl->type != VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+          (bl->flags & VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT) ||
+          b->elem >= bl->array_size)
+         return false;
+
+      const uint64_t offset = (uint64_t)bl->offset +
+                              (uint64_t)b->elem * (uint64_t)bl->stride;
+      if (offset + sizeof(struct hk_sampled_image_descriptor) >
+          desc->set_sizes[b->set])
+         return false;
+
+      const struct hk_sampled_image_descriptor *d =
+         (const struct hk_sampled_image_descriptor *)((const uint8_t *)set->mapped_ptr +
+                                                      offset);
+      if (memcmp(&d->tex, &iview->planes[0].ia, sizeof(d->tex)) != 0 ||
+          d->sw.sampled_heap_index != iview->planes[0].input_heap_index)
+         return false;
+   }
+
+   return true;
 }
 
 static bool
@@ -11016,6 +11472,61 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
       }
    }
 
+   if (fs && fs->local_read_nir && agx_chip_local_read_tilebuffer(dev->dev.chip) &&
+       !key->epilog.native_spills && !key->epilog.blend.logicop_enable &&
+       !key->epilog.blend.alpha_to_coverage &&
+       !key->epilog.blend.alpha_to_one && !key->epilog.defer_api_sample_mask &&
+       !key->prolog.statistics && !key->prolog.run_zs_tests &&
+       !key->prolog.cull_distance_size && key->prolog.api_sample_mask == 0xff &&
+       !key->epilog.link.write_z && !key->epilog.link.write_s &&
+       !agx_tilebuffer_spills(in->tib) && in->view_mask == 0 &&
+       key->nr_samples_shaded == 0 &&
+       (samples == 1 ||
+        ((fs->local_read.ia_mask & ~fs->local_read.ms_mask) == 0 &&
+         fs->local_read.uses_sample_shading))) {
+      int8_t ia_to_rt[HK_MAX_RTS];
+      memset(ia_to_rt, -1, sizeof(ia_to_rt));
+      bool map_ok = fs->local_read.ia_mask != 0;
+
+      u_foreach_bit(ia_idx, fs->local_read.ia_mask) {
+         if (dyn->ial.depth_att == ia_idx || dyn->ial.stencil_att == ia_idx) {
+            map_ok = false;
+            break;
+         }
+         int matched_rt = -1;
+         for (unsigned rt = 0; rt < in->color_att_count; ++rt) {
+            if (dyn->ial.color_map[rt] == ia_idx) {
+               if (matched_rt >= 0) {
+                  map_ok = false;
+                  break;
+               }
+               matched_rt = (int)rt;
+            }
+         }
+         if (!map_ok || matched_rt < 0) {
+            map_ok = false;
+            break;
+         }
+         const enum pipe_format rt_fmt = key->epilog.rt_formats[matched_rt];
+         if (rt_fmt == PIPE_FORMAT_NONE ||
+             key->epilog.scaled_formats[matched_rt] != PIPE_FORMAT_NONE ||
+             key->epilog.blend_formats[matched_rt] != PIPE_FORMAT_NONE ||
+             in->tib->spilled[matched_rt] ||
+             util_format_is_depth_or_stencil(rt_fmt) ||
+             util_format_get_nr_components(rt_fmt) == 0) {
+            map_ok = false;
+            break;
+         }
+         ia_to_rt[ia_idx] = (int8_t)matched_rt;
+      }
+
+      if (map_ok &&
+          (!in->cmd || hk_local_read_descriptors_match(in->cmd, fs, ia_to_rt))) {
+         key->local_read.enabled = 1;
+         memcpy(key->local_read.ia_to_rt, ia_to_rt, sizeof(ia_to_rt));
+      }
+   }
+
    return true;
 }
 
@@ -11082,6 +11593,7 @@ hk_prelink_fragment(struct hk_device *dev, struct hk_api_shader *fs_api,
       .color_formats_stride = sizeof(VkFormat),
       .color_att_count = color_att_count,
       .cull_distance_size = hw_vs ? hw_vs->info.cull_distance_array_size : 0,
+      .view_mask = view_mask,
       .depth_attachment = depth,
       .stencil_attachment = stencil,
    };
@@ -11699,7 +12211,9 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        IS_DIRTY(DS_DEPTH_BOUNDS_TEST_ENABLE) ||
        IS_DIRTY(DS_STENCIL_TEST_ENABLE) ||
        (gfx->dirty & HK_DIRTY_OCCLUSION) ||
-       IS_DIRTY(COLOR_ATTACHMENT_MAP) ||
+       IS_DIRTY(COLOR_ATTACHMENT_MAP) || IS_DIRTY(INPUT_ATTACHMENT_MAP) ||
+       (fs && fs->local_read_nir &&
+        gfx->fast_link_fs.desc_gen != desc->generation) ||
        /* The only root-derived input of the fragment key is whether the
         * fragment-invocation statistic is enabled. Other root changes (a
         * descriptor bind, push constants, vertex buffers) leave the key and
@@ -11723,7 +12237,11 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
       gfx->fast_link_fs.color_written =
          hk_fs_color_written(&key, agx_chip_g17_m5(dev->dev.chip));
-      gfx->fast_link_fs.reads_tib = fs->b.info.reads_tib;
+      gfx->fast_link_fs.reads_tib =
+         fs->b.info.reads_tib ||
+         (gfx->linked[MESA_SHADER_FRAGMENT] &&
+          gfx->linked[MESA_SHADER_FRAGMENT]->uses_local_read_tile);
+      gfx->fast_link_fs.desc_gen = desc->generation;
    }
    gfx->render.color_written |= gfx->fast_link_fs.color_written;
    gfx->render.color_read |= gfx->fast_link_fs.reads_tib;
@@ -12800,6 +13318,57 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       (geom || tess || adj);
    if (desc->push_dirty)
       hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+
+   /* An earlier BY_REGION input-attachment barrier stayed inside this physical
+    * render pass on the assumption that subsequent input-attachment reads will
+    * consume on-chip tile memory. If a draw's fragment shader reads input
+    * attachments via the DRAM texture path instead, split the pass now before
+    * any draw records are emitted so its texture fetch sees the flushed writes. */
+   if (unlikely(gfx->render.kept_local_read_barrier) && !cmd->in_meta) {
+      struct hk_shader *fs = hk_bound_fs(cmd);
+      if (fs && fs->info.fs.has_input_attachments) {
+         bool on_chip = false;
+         bool lr_enabled = false;
+         if (fs->local_read_nir) {
+            struct hk_fast_link_key_fs lr_key;
+            if (hk_fill_fast_link_key_fs(cmd, fs, hk_bound_hw_vs(gfx), &lr_key,
+                                         false)) {
+               lr_enabled = lr_key.local_read.enabled;
+               if (hk_update_fast_linked(cmd, fs, &lr_key)) {
+                  gfx->fast_link_fs.color_written =
+                     hk_fs_color_written(&lr_key, agx_chip_g17_m5(dev->dev.chip));
+                  gfx->fast_link_fs.reads_tib =
+                     fs->b.info.reads_tib ||
+                     (gfx->linked[MESA_SHADER_FRAGMENT] &&
+                      gfx->linked[MESA_SHADER_FRAGMENT]->uses_local_read_tile);
+                  gfx->fast_link_fs.desc_gen = desc->generation;
+                  on_chip = gfx->linked[MESA_SHADER_FRAGMENT] &&
+                            gfx->linked[MESA_SHADER_FRAGMENT]->uses_local_read_tile;
+                  if (gfx->linked_dirty & BITFIELD_BIT(MESA_SHADER_FRAGMENT))
+                     gfx->shaders_dirty |= BITFIELD_BIT(MESA_SHADER_FRAGMENT);
+               }
+            }
+         }
+         if (hk_barrier_local_read_draw_needs_split(
+                gfx->render.kept_local_read_barrier, cmd->in_meta,
+                fs->info.fs.has_input_attachments, on_chip)) {
+            perf_debug(cmd, "Splitting pass for DRAM input-attachment read (lr_nir=%u lr_en=%u)",
+                       fs->local_read_nir != NULL, lr_enabled);
+            hk_cmd_buffer_end_graphics(cmd);
+            cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
+            if (!cs)
+               return NULL;
+            if (dbias_selected) {
+               ASSERTED bool succ =
+                  u_tristate_set(&cs->cr.dbias_is_int, dbias_is_int);
+               assert(succ && "can always set tri-state on a new control stream");
+            }
+            hk_ensure_cs_has_space(cmd, cs, HK_GFX_DRAW_RESERVATION);
+            if (vk_command_buffer_has_error(&cmd->vk))
+               return NULL;
+         }
+      }
+   }
 
    /* HAL200's indexed draw packet carries its own native restart-state
     * record. Geometry/XFB lowers even a non-indexed API draw to that packet,
@@ -14425,6 +14994,16 @@ hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
        gfx->shaders[MESA_SHADER_TESS_EVAL] || gfx->render.view_mask ||
        mesa_prim_has_adjacency(
           vk_topology_to_mesa(dyn->ia.primitive_topology)))
+      return false;
+
+   struct hk_shader *fs = hk_bound_fs(cmd);
+   if (fs &&
+       ((fs->local_read_nir &&
+         gfx->fast_link_fs.desc_gen != desc->generation) ||
+        hk_barrier_local_read_draw_needs_split(
+           gfx->render.kept_local_read_barrier, cmd->in_meta,
+           fs->info.fs.has_input_attachments,
+           gfx->linked[MESA_SHADER_FRAGMENT]->uses_local_read_tile)))
       return false;
 
    if (hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,

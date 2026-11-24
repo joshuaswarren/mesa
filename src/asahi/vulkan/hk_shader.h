@@ -112,6 +112,8 @@ struct hk_shader_info {
          bool a2c_in_main;
          /* Fragment shader reads gl_Layer (VARYING_SLOT_LAYER or LAYER_ID). */
          bool reads_layer;
+         /* Fragment shader declares or reads any subpass input attachment. */
+         bool has_input_attachments;
       } fs;
 
       struct {
@@ -213,10 +215,63 @@ struct hk_fast_link_key_vs {
    struct agx_vs_prolog_key prolog;
 };
 
+#define HK_MAX_LOCAL_READ_BINDINGS 8
+
+struct hk_local_read_binding {
+   uint8_t ia_idx;
+   uint8_t set;
+   uint16_t binding;
+   uint16_t elem;
+   uint8_t is_ms;
+   uint8_t _pad;
+};
+
+struct hk_local_read_info {
+   uint8_t ia_mask;
+   uint8_t ms_mask;
+   uint8_t binding_count;
+   bool uses_sample_shading;
+   struct hk_local_read_binding bindings[HK_MAX_LOCAL_READ_BINDINGS];
+};
+
+struct hk_local_read_shader_meta {
+   struct agx_fs_epilog_link_info epilog_key;
+   uint8_t set_count;
+   uint8_t agx3_root_reads;
+   bool g17p_colour_unit_range;
+   bool static_tests;
+   bool may_kill;
+   bool a2c_in_main;
+   bool early_fragment_tests;
+   bool writes_memory;
+   bool writes_external_memory;
+   bool reads_images;
+   bool agx3_uses_root;
+   bool agx3_combined_sampler_valid;
+   bool agx3_txf_texture_valid;
+   bool agx3_storage_image_valid;
+   bool agx3_sampled_storage_valid;
+   bool agx3_indexed_sampler_valid;
+   bool agx3_indexed_storage_valid;
+   unsigned agx3_root_uniform;
+   struct agx_g17p_combined_sampler_binding agx3_combined_sampler;
+   struct agx_g17p_txf_binding agx3_txf_texture;
+   struct agx_g17p_storage_image_binding agx3_storage_image;
+   struct agx_g17p_sampled_storage_binding agx3_sampled_storage;
+   struct agx_g17p_indexed_storage_binding agx3_indexed_storage;
+};
+
+struct hk_local_read_link_key {
+   int8_t ia_to_rt[HK_MAX_RTS];
+   uint8_t enabled;
+   uint8_t _pad[3];
+};
+
 struct hk_fast_link_key_fs {
    unsigned nr_samples_shaded;
    struct agx_fs_prolog_key prolog;
    struct agx_fs_epilog_key epilog;
+   struct hk_local_read_link_key local_read;
 };
 
 struct hk_shader {
@@ -294,6 +349,15 @@ struct hk_shader {
    size_t g17p_mono_nir_size;
    struct agx_shader_key g17p_mono_key;
    bool g17p_mono_preoptimized;
+
+   /* Fragment NIR with eligible color subpass input attachments lowered to
+    * fb_fetch_output load_output intrinsics, so fast-link can inline the
+    * colour epilog and read on-chip tile memory directly. NULL if ineligible. */
+   void *local_read_nir;
+   size_t local_read_nir_size;
+   struct agx_shader_key local_read_key;
+   struct hk_local_read_info local_read;
+   struct hk_local_read_shader_meta local_read_meta;
 };
 
 static inline uint64_t
@@ -665,6 +729,10 @@ struct hk_linked_shader {
     * the descriptor root even when the application fragment shader does not. */
    bool g17p_prolog_uses_root;
 
+   /* Linked fragment executable reads color input attachments directly from
+    * on-chip tile memory instead of texture descriptors. */
+   bool uses_local_read_tile;
+
    /* An inline-blend fragment program that forms its own constant program
     * (hk_g17p_inline_epilog_part()) has its own uniform layout: this shader
     * describes it, and the draw takes the program's launch (uniform ranges,
@@ -690,7 +758,11 @@ static inline struct hk_shader *
 hk_linked_shader_source(struct hk_shader *source,
                         const struct hk_linked_shader *linked)
 {
-   return linked && linked->variant_source ? linked->variant_source : source;
+   if (linked && linked->variant_source)
+      return linked->variant_source;
+   if (linked && linked->g17p_layout)
+      return linked->g17p_layout;
+   return source;
 }
 
 /* `main_part`, when non-NULL, replaces main->b as the linked main part
@@ -709,6 +781,12 @@ struct hk_linked_shader *hk_fast_link_part(struct hk_device *dev, bool fragment,
 struct hk_shader *hk_g17p_layout_shader_create(struct hk_device *dev,
                                                const struct hk_shader *api,
                                                struct agx_shader_part *part);
+/* Like hk_g17p_layout_shader_create(), and replaces fragment resource metadata
+ * with api->local_read_meta for a monolithic tile-memory local_read program. */
+struct hk_shader *
+hk_g17p_layout_shader_create_local_read(struct hk_device *dev,
+                                        const struct hk_shader *api,
+                                        struct agx_shader_part *part);
 
 struct hk_linked_shader *hk_fast_link(struct hk_device *dev, bool fragment,
                                       struct hk_shader *main,

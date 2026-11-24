@@ -1263,6 +1263,29 @@ agx_chip_has_agx3_ray_opcodes(enum agx_chip chip)
    return agx_isa_is_agx3(agx_chip_isa_encoding(chip));
 }
 
+/*
+ * Whether Borealis may keep in-pass color input-attachment reads
+ * (VK_KHR_dynamic_rendering_local_read and in-subpass self-dependencies) in
+ * on-chip tile memory via the monolithic local-read pixel-class protocol.
+ *
+ * Selected by ISA encoding and command-stream generation rather than a chip
+ * list: HAL200/AGX3B (M4 / M4 Pro / M4 Max / A18 Pro, including G16G, G16S,
+ * G16C, and G17P) and HAL300/AGX3C (M5 family: G17G, G17S, G17C) share the
+ * monolithic AGX3B/AGX3C pixel-class tilebuffer protocol. G15 (M3, unverified
+ * command-stream generation) and AGX3D (G18G, no AGX3D local-read encoder)
+ * remain on the DRAM fallback path.
+ */
+static inline bool
+agx_chip_local_read_tilebuffer(enum agx_chip chip)
+{
+   const enum agx_isa_encoding enc = agx_chip_isa_encoding(chip);
+   const enum agx_command_stream_generation cs =
+      agx_chip_command_stream_generation(chip);
+
+   return (enc == AGX_ISA_ENCODING_AGX3B && cs == AGX_CS_GENERATION_HAL200) ||
+          (enc == AGX_ISA_ENCODING_AGX3C && cs == AGX_CS_GENERATION_HAL300);
+}
+
 /* Stable name for diagnostics, e.g. "G15G". Never NULL. */
 static inline const char *
 agx_chip_name(enum agx_chip chip)
