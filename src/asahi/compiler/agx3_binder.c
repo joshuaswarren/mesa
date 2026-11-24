@@ -29,10 +29,11 @@ agx3_bind_form_size(enum agx_isa_encoding encoding,
    return form < 0 ? 0 : t->forms[form].size;
 }
 
+#include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 
-#include <stdatomic.h>
-
+#include "c11/threads.h"
 #include "util/bitscan.h"
 
 /*
@@ -51,8 +52,40 @@ agx3d_table_or_null(void)
 
 /* Per-thread zeroed scratch vector: only the fields touched by baseline and
  * overrides are written and cleared back to zero before returning, avoiding
- * a 1.5 KiB memset on every composed instruction. */
-static _Thread_local uint64_t agx3_bind_scratch[AGX3_MAX_FIELDS];
+ * a 1.5 KiB memset on every composed instruction.
+ *
+ * Thread-specific storage rather than a _Thread_local array: libgallium and
+ * libvulkan_asahi build with the initial-exec TLS model, and a dlopen() of
+ * either only gets glibc's small static TLS surplus, which a 1280-byte
+ * static TLS array exhausts (EGL then fails to load with "cannot allocate
+ * memory in static TLS block"). */
+static tss_t agx3_bind_scratch_key;
+static once_flag agx3_bind_scratch_once = ONCE_FLAG_INIT;
+static bool agx3_bind_scratch_key_valid;
+
+static void
+agx3_bind_scratch_key_init(void)
+{
+   agx3_bind_scratch_key_valid =
+      tss_create(&agx3_bind_scratch_key, free) == thrd_success;
+}
+
+static uint64_t *
+agx3_bind_scratch_buffer(void)
+{
+   call_once(&agx3_bind_scratch_once, agx3_bind_scratch_key_init);
+   if (!agx3_bind_scratch_key_valid)
+      return NULL;
+   uint64_t *buf = tss_get(agx3_bind_scratch_key);
+   if (!buf) {
+      buf = calloc(AGX3_MAX_FIELDS, sizeof(uint64_t));
+      if (buf && tss_set(agx3_bind_scratch_key, buf) != thrd_success) {
+         free(buf);
+         buf = NULL;
+      }
+   }
+   return buf;
+}
 
 static bool
 agx3_bind_fields_populate(const struct agx3_field_kv *baseline,
@@ -113,7 +146,7 @@ agx3_bind_fields_clear(const struct agx3_field_kv *baseline, unsigned nbaseline,
  * the Ioto program generators compose the same instructions for every draw:
  * on the M6 the table walk was about half of Chromium's GPU-process time
  * while dragging Google Maps. Remember recent compositions, keyed by exactly
- * those inputs. Only nonzero fields enter the vector (agx3_bind_scratch is
+ * those inputs. Only nonzero fields enter the vector (the scratch vector is
  * kept zero-filled), so the key is the nonzero fields in field order. Only
  * successful compositions are kept; a hit returns the bytes the table walk
  * returned for the same inputs.
@@ -269,7 +302,12 @@ agx3_bind_compose(enum agx_isa_encoding encoding, enum agx3_mnemonic mnemonic,
          return false;
    }
 
-   uint64_t *fields = agx3_bind_scratch;
+   uint64_t stack_fields[AGX3_MAX_FIELDS];
+   uint64_t *fields = agx3_bind_scratch_buffer();
+   if (!fields) {
+      memset(stack_fields, 0, sizeof(stack_fields));
+      fields = stack_fields;
+   }
    uint64_t nonzero[3] = {0};
    if (!agx3_bind_fields_populate(baseline, nbaseline, overrides, noverrides,
                                   fields, nonzero))
