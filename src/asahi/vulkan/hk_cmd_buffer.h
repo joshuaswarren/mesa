@@ -1635,6 +1635,47 @@ hk_sync_later(struct hk_cs *a, struct hk_cs *b)
    return b->sync.seq > a->sync.seq ? b : a;
 }
 
+/* Whether the vertex program of a draw is published as an AGX3 VDM State
+ * Update (hk_agx3_publish_vertex_state()): the record
+ * agx_vdm_state_update_supported() admits. */
+static inline bool
+hk_agx3_vertex_state(enum agx_chip chip)
+{
+   return agx_chip_has_record(chip, AGX_RECORD_VDM_STATE);
+}
+
+/* Whether hk_agx3_publish_vertex_state() appends the native bind tail
+ * (hk_g17p_emit_native_bind_tail()) after the VDM State Update: the native
+ * AGX3 path. */
+static inline bool
+hk_vertex_state_has_bind_tail(enum agx_chip chip)
+{
+   return agx_chip_native_agx3(chip);
+}
+
+/* The bind-tail result of a draw that published its vertex state with
+ * hk_agx3_publish_vertex_state(). Every flush that publishes vertex state
+ * reports this, so none drops an emitted tail. */
+static inline bool
+hk_vertex_state_bind_tail(enum agx_chip chip, bool tail_emitted)
+{
+   return hk_vertex_state_has_bind_tail(chip) && tail_emitted;
+}
+
+/* Whether a draw that changes only root descriptors may take the root-only
+ * flush of hk_flush_dynamic_state(): the stream has latched a HAL300 graphics
+ * core (hk_flush_ppp_state()), so a new fragment program needs only its
+ * program record, and the vertex program is published as an AGX3 VDM State
+ * Update with no bind tail. A chip whose publication appends a tail takes
+ * hk_flush_dynamic_state_slow(), which also republishes the PPP state the
+ * tail belongs to. */
+static inline bool
+hk_root_only_flush_supported(enum agx_chip chip, const struct hk_cs *cs)
+{
+   return cs->m5_ppp_emitted_valid && hk_agx3_vertex_state(chip) &&
+          !hk_vertex_state_has_bind_tail(chip);
+}
+
 void *hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
                                  uint64_t target, bool vdm);
 

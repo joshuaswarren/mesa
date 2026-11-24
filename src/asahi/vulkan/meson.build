@@ -1446,6 +1446,14 @@ if with_tests
     files('tests/test-hk-ray-tracing-core.c', 'hk_ray_tracing_core.c'),
     include_directories : [include_directories('.'), inc_include, inc_src]),
     suite : ['asahi'])
+  test('hk_root_only_flush', executable('hk_root_only_flush_test',
+    files('tests/test-hk-root-only-flush.c'),
+    c_args : ['-DNDEBUG'],
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]),
+    timeout : 30, suite : ['asahi'])
 endif
 
 if with_tests
