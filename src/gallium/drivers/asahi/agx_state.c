@@ -1514,6 +1514,78 @@ agx_fb_has_colour(const struct pipe_framebuffer_state *fb)
    return false;
 }
 
+/*
+ * M5 keeps every colour attachment in the tilebuffer when its tile programs
+ * move all of them in one render, as Borealis's M5 render passes do
+ * (hk_m5_mrt_layout_supported, hk_build_m5_mrt_bg_eot): one background
+ * program clears or reloads each attachment and one end-of-tile program
+ * stores each through its own PBE (the multi-target programs of
+ * agx_bg_eot.c). Their admission is the same here: a single-sample layout of
+ * two or more attachments that all fit in the tilebuffer, each with a
+ * multi-target end-of-tile store class, in a layout the multi-target
+ * classifier names. Such a framebuffer is drawn and cleared once, as a
+ * single-attachment one is, instead of an attachment at a time or with
+ * spilled attachments loaded and stored by every fragment.
+ *
+ * The answer depends on the formats and the sample count alone, so the
+ * batch's layout (agx_batch_init_state), its fragment epilogs and the
+ * framebuffer fetches compiled for it (agx_compile_variant) all agree.
+ */
+static bool
+agx_g17g_mrt_resident_layout(enum agx_chip chip,
+                             const enum pipe_format *formats,
+                             unsigned nr_cbufs, unsigned nr_samples)
+{
+   if (!agx_chip_g17_m5(chip) || nr_samples > 1)
+      return false;
+
+   unsigned active = 0;
+   for (unsigned rt = 0; rt < nr_cbufs; ++rt)
+      active += formats[rt] != PIPE_FORMAT_NONE;
+   if (active < 2)
+      return false;
+
+   /* As agx_batch_init_state lays the attachments out. */
+   const struct agx_tilebuffer_layout tib =
+      agx_build_tilebuffer_layout_with_limits(
+         formats, nr_cbufs, 1, false, 0, AGX_G17G_MAX_BYTES_PER_TILE,
+         AGX_G17G_MAX_SAMPLES_PER_TILE);
+   if (agx_tilebuffer_spills(&tib) || tib.tile_size != 32 * 32 ||
+       agx_g17p_classify_mrt(&tib) == AGX_G17P_MRT_NONE)
+      return false;
+
+   for (unsigned rt = 0; rt < nr_cbufs; ++rt) {
+      if (tib.logical_format[rt] == PIPE_FORMAT_NONE)
+         continue;
+
+      const uint8_t selector =
+         agx_g17p_mrt_eot_selector(tib.logical_format[rt]);
+      if (selector != 0x15 && selector != 0x35 && selector != 0x55 &&
+          selector != 0x75 && selector != 0x95)
+         return false;
+   }
+
+   return true;
+}
+
+/* A G17G framebuffer is drawn a layer at a time (agx_g17g_layered_draw), so
+ * only a single-layer one is a batch's. */
+static bool
+agx_g17g_fb_mrt_resident(const struct agx_device *dev,
+                         const struct pipe_framebuffer_state *fb)
+{
+   if (!agx_chip_g17_m5(dev->chip) || fb->nr_cbufs < 2 ||
+       util_framebuffer_get_num_layers(fb) != 1)
+      return false;
+
+   enum pipe_format formats[PIPE_MAX_COLOR_BUFS] = {0};
+   for (unsigned rt = 0; rt < fb->nr_cbufs; ++rt)
+      formats[rt] = fb->cbufs[rt].format;
+
+   return agx_g17g_mrt_resident_layout(dev->chip, formats, fb->nr_cbufs,
+                                       util_framebuffer_get_num_samples(fb));
+}
+
 /* G17G's tile programs move one colour attachment and it renders one layer,
  * so it draws and clears a framebuffer with more colour attachments or layers
  * in passes that each bind part of it and then bind the whole framebuffer
@@ -1661,6 +1733,7 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
 
    util_copy_framebuffer_state(&ctx->framebuffer, state);
    ctx->g17g_mrt_spills_known = false;
+   ctx->g17g_mrt_resident_known = false;
    ctx->zs_merge = false;
 
    /* The frontend still reads and resolves the window's multisample colour
@@ -3366,7 +3439,12 @@ agx_compile_variant(struct agx_device *dev,
          bool rt0_resident = false;
          for (unsigned rt = 1; rt < ARRAY_SIZE(key->rt_formats); ++rt)
             rt0_resident |= key->rt_formats[rt] != PIPE_FORMAT_NONE;
-         rt0_resident &= agx_chip_g17_m5(dev->chip);
+         /* As the batch decides (agx_g17g_fb_mrt_resident), from the same
+          * formats and sample count. */
+         rt0_resident &= agx_chip_g17_m5(dev->chip) &&
+                         !agx_g17g_mrt_resident_layout(
+                            dev->chip, key->rt_formats,
+                            ARRAY_SIZE(key->rt_formats), key->nr_samples);
 
          /* As the batch lays the attachments out (agx_batch_init_state). */
          struct agx_tilebuffer_layout tib =
@@ -5652,7 +5730,8 @@ agx_update_fs(struct agx_batch *batch)
       .epilog.fs.main_pixel_held =
          agx_chip_g17_m5(dev->chip) ? ctx->fs->b.info.agx3_pixel_held : 0,
       .epilog.fs.rt0_resident =
-         agx_chip_g17_m5(dev->chip) && batch->key.nr_cbufs > 1,
+         agx_chip_g17_m5(dev->chip) && batch->key.nr_cbufs > 1 &&
+         !batch->g17g_mrt_resident,
 
       .main = ctx->fs,
       .nr_samples_shaded = !agx_chip_native_agx3(dev->chip) &&
@@ -10691,6 +10770,231 @@ agx_g17p_build_mixed_bg_eot(struct agx_batch *batch,
    };
 }
 
+/* Publish an M5 background or end-of-tile program: the Ioto program that
+ * launches shader with the given uniform ranges over the batch's tile. */
+static struct asahi_bg_eot
+agx_m5_publish_tile_program(struct agx_batch *batch,
+                            const struct agx_bg_eot_key *key,
+                            struct agx_bg_eot_shader *shader,
+                            const struct agx3_ioto_uniform_range *ranges,
+                            unsigned range_count, bool store,
+                            uint64_t rsrc_spec)
+{
+   struct agx_device *dev = agx_device(batch->ctx->base.screen);
+
+   size_t capacity;
+   if (!agx3_g17g_graphics_program_bound(dev->chip, ranges, range_count, &capacity))
+      return agx_reject_g17g_tile(batch, "M5 tile program size");
+   struct agx_bo *program_bo = NULL;
+   struct agx_ptr ptr = agx_pool_alloc_aligned_with_bo(
+      &batch->pipeline_pool, capacity, AGX_IOTO_PROGRAM_ALIGNMENT, &program_bo);
+   if (!ptr.cpu || !program_bo || !agx_va_in_usc_window(dev, ptr.gpu) ||
+       !agx_va_in_usc_window(dev, shader->ptr + shader->info.main_offset))
+      return agx_reject_g17g_tile(batch, "M5 tile program allocation");
+   const struct agx3_g17p_graphics_program_desc desc = {
+      .program_va = ptr.gpu,
+      .shader_va = shader->ptr + shader->info.main_offset,
+      .shader_binary_size = shader->info.binary_size,
+      .scratch_size = shader->info.scratch_size,
+      .nr_gprs = shader->info.nr_gprs,
+      .compiler_d_valid = shader->info.agx3_staging_known,
+      .compiler_d = (uint32_t)shader->info.agx3_staging_halfs * 2,
+      .fragment = true,
+      .imageblock = {key->tib.sample_size_B, key->tib.nr_samples, key->tib.tile_size},
+      .uniform_ranges = ranges,
+      .uniform_range_count = range_count,
+   };
+   struct agx3_g17p_graphics_program program;
+   if (!agx3_g17g_tile_program_generate(dev->chip, &desc, store, &program) ||
+       program.length > capacity)
+      return agx_reject_g17g_tile(batch, "M5 tile Ioto program");
+   memcpy(ptr.cpu, program.bytes, program.length);
+   if (agx_bo_sync_for_device(program_bo, ptr.gpu - program_bo->va->addr,
+                              program.length))
+      return agx_reject_g17g_tile(batch, "M5 tile program upload");
+   agx_batch_add_bo(batch, shader->bo);
+   if (dev->debug & AGX_DBG_FAULTTRACE) {
+      fprintf(stderr, "M5_TILE op=%u program=%#llx shader=%#llx size=%u gprs=%u staging=%u ranges=%u\n",
+              key->op[0], (unsigned long long)ptr.gpu,
+              (unsigned long long)desc.shader_va, shader->info.binary_size,
+              shader->info.nr_gprs, shader->info.agx3_staging_halfs, range_count);
+      for (unsigned i = 0; i < range_count; ++i)
+         fprintf(stderr, "M5_TILE_RANGE start=%u halfs=%u address=%#llx\n",
+                 ranges[i].start_halfs, ranges[i].size_halfs,
+                 (unsigned long long)ranges[i].address);
+      fprintf(stderr, "M5_TILE_IOTO data=");
+      for (unsigned i = 0; i < program.length; ++i)
+         fprintf(stderr, "%02x", program.bytes[i]);
+      fputc('\n', stderr);
+   }
+   return (struct asahi_bg_eot){
+      .usc = agx_usc_addr(dev, ptr.gpu),
+      .rsrc_spec = rsrc_spec,
+      .primary_storage_B = desc.scratch_size,
+      .staging_storage_B = desc.compiler_d,
+   };
+}
+
+/* The texel-fetch sampler an M5 background program reloads attachments
+ * with: the same Gen5 sampler as hk_pack_native_txf_sampler(G17G). Gen5's
+ * comparison mode bit is required even for a non-shadow fetch. */
+static uint64_t
+agx_m5_upload_txf_sampler(struct agx_batch *batch)
+{
+   struct agx_gallium_sampler_descriptor sampler = {0};
+   agx_pack(sampler.opaque, SAMPLER_GEN5, cfg) {
+      cfg.minimum_lod = 0.0f;
+      cfg.maximum_lod = INFINITY;
+      cfg.maximum_anisotropy = 1;
+      cfg.mip_filter = AGX_MIP_FILTER_NEAREST;
+      cfg.wrap_s = cfg.wrap_t = cfg.wrap_r = AGX_WRAP_CLAMP_TO_BORDER;
+      cfg.compare_mode = true;
+      cfg.compare_func = AGX_COMPARE_FUNC_LEQUAL;
+      cfg.border_colour = AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
+   }
+   return agx_pool_upload_aligned(&batch->pool, &sampler, sizeof(sampler), 32);
+}
+
+/*
+ * The tile programs of a batch that keeps two or more colour attachments in
+ * the tilebuffer (agx_batch::g17g_mrt_resident), in the argument layout of
+ * Borealis's M5 multi-target tile programs (hk_build_m5_mrt_bg_eot), whose
+ * shaders both drivers take from agx_bg_eot.c:
+ *
+ *  - the end of tile stores the stored attachments in attachment order. u0
+ *    holds the dense table of their PBEs and u4 + 4i the tile offset of the
+ *    i-th; the program addresses the PBE of each by its position;
+ *  - the background reads its clear colours from 16 bytes per attachment at
+ *    u4 (u8 when it also reloads), and reloads attachment i through texture
+ *    descriptor 2i of the table at u0, with the texel-fetch sampler at u4.
+ *
+ * An attachment without defined contents is cleared to zero, as the
+ * single-attachment programs do.
+ */
+static struct asahi_bg_eot
+agx_build_native_g17g_mrt_bg_eot(struct agx_batch *batch,
+                                 struct agx_bg_eot_key *key, bool store)
+{
+   struct agx_context *ctx = batch->ctx;
+   const unsigned count = batch->key.nr_cbufs;
+   unsigned active[PIPE_MAX_COLOR_BUFS], active_count = 0;
+   bool undefined[PIPE_MAX_COLOR_BUFS] = {0};
+   bool loads = false, clears = false;
+
+   if (agx_tilebuffer_spills(&key->tib) || key->tib.layered ||
+       key->tib.nr_samples != 1 || key->tib.tile_size != 32 * 32 ||
+       batch->key.resolve)
+      return agx_reject_g17g_tile(batch, "M5 multi-target tile layout");
+
+   for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt) {
+      if (rt >= count || !batch->key.cbufs[rt].texture) {
+         if (key->op[rt] != AGX_BG_EOT_NONE)
+            return agx_reject_g17g_tile(batch, "M5 tile inactive attachment");
+         continue;
+      }
+
+      if (store) {
+         if (key->op[rt] != AGX_EOT_STORE)
+            return agx_reject_g17g_tile(batch, "M5 tile attachment operation");
+      } else {
+         undefined[rt] = key->op[rt] == AGX_BG_EOT_NONE;
+         if (undefined[rt])
+            key->op[rt] = AGX_BG_CLEAR;
+         if (key->op[rt] != AGX_BG_CLEAR && key->op[rt] != AGX_BG_LOAD)
+            return agx_reject_g17g_tile(batch, "M5 tile attachment operation");
+         loads |= key->op[rt] == AGX_BG_LOAD;
+         clears |= key->op[rt] == AGX_BG_CLEAR;
+      }
+      active[active_count++] = rt;
+   }
+   if (active_count < 2)
+      return agx_reject_g17g_tile(batch, "M5 tile attachment count");
+
+   key->mixed_mrt = true;
+   const unsigned clear_base = loads ? 8 : 4;
+   if (clears)
+      key->reserved_preamble = clear_base + 8 * count;
+
+   struct agx_bg_eot_shader *shader = agx_get_bg_eot_shader(&ctx->bg_eot, key);
+   if (!shader || !shader->bo || !shader->bo->va || !shader->ptr ||
+       !shader->info.binary_size || !shader->info.nr_gprs ||
+       shader->info.has_preamble || shader->info.rodata.size_16 ||
+       shader->info.scratch_size || !shader->info.agx3_staging_known ||
+       shader->info.push_count != key->reserved_preamble ||
+       shader->info.uses_txf != loads)
+      return agx_reject_g17g_tile(batch, "M5 multi-target tile shader");
+
+   struct agx3_ioto_uniform_range ranges[3];
+   unsigned range_count = 0;
+   if (store) {
+      struct agx_gallium_pbe_descriptor pbes[PIPE_MAX_COLOR_BUFS];
+      uint64_t arguments[1 + PIPE_MAX_COLOR_BUFS] = {0};
+      for (unsigned i = 0; i < active_count; ++i) {
+         const unsigned rt = active[i];
+         struct pipe_image_view view =
+            image_view_for_surface(&batch->key.cbufs[rt]);
+         /* The fragment and background shaders already encode sRGB into the
+          * packed imageblock. Store those bytes without a second
+          * conversion. */
+         view.format = util_format_linear(view.format);
+         if (!agx_batch_upload_pbe(batch, &pbes[i], &view, true, true, false,
+                                   batch->feedback & (PIPE_CLEAR_COLOR0 << rt)))
+            return agx_reject_g17g_tile(batch, "M5 EOT PBE");
+         arguments[1 + i] = agx_tilebuffer_offset_B(&key->tib, rt);
+      }
+      arguments[0] = agx_pool_upload_aligned(
+         &batch->pool, pbes, active_count * sizeof(pbes[0]), 32);
+      const uint64_t table = agx_pool_upload_aligned(
+         &batch->pool, arguments, 8 * (1 + active_count), 16);
+      ranges[range_count++] = (struct agx3_ioto_uniform_range){
+         0, 4 * (1 + active_count), table};
+   } else {
+      if (loads) {
+         struct agx_gallium_texture_descriptor textures[2 * PIPE_MAX_COLOR_BUFS];
+         memset(textures, 0, 2 * count * sizeof(textures[0]));
+         for (unsigned rt = 0; rt < count; ++rt) {
+            if (key->op[rt] != AGX_BG_LOAD)
+               continue;
+
+            const struct pipe_surface *surf = &batch->key.cbufs[rt];
+            struct pipe_sampler_view sampler_view =
+               sampler_view_for_surface(surf);
+            if (!agx_pack_texture(AGX_DESCRIPTOR_GENERATION_10,
+                                  &textures[2 * rt],
+                                  agx_resource(surf->texture), surf->format,
+                                  &sampler_view))
+               return agx_reject_g17g_tile(batch, "M5 reload texture");
+         }
+         const uint64_t pointers[2] = {
+            agx_pool_upload_aligned(&batch->pool, textures,
+                                    2 * count * sizeof(textures[0]), 32),
+            agx_m5_upload_txf_sampler(batch),
+         };
+         const uint64_t table = agx_pool_upload_aligned(
+            &batch->pool, pointers, sizeof(pointers), 16);
+         ranges[range_count++] = (struct agx3_ioto_uniform_range){0, 4, table};
+         ranges[range_count++] =
+            (struct agx3_ioto_uniform_range){4, 4, table + 8};
+      }
+      if (clears) {
+         union pipe_color_union colors[PIPE_MAX_COLOR_BUFS];
+         memset(colors, 0, count * sizeof(colors[0]));
+         for (unsigned rt = 0; rt < count; ++rt) {
+            if (key->op[rt] == AGX_BG_CLEAR && !undefined[rt])
+               colors[rt] = batch->clear_color[rt];
+         }
+         const uint64_t table = agx_pool_upload_aligned(
+            &batch->pool, colors, count * sizeof(colors[0]), 16);
+         ranges[range_count++] = (struct agx3_ioto_uniform_range){
+            clear_base, 8 * count, table};
+      }
+   }
+
+   return agx_m5_publish_tile_program(
+      batch, key, shader, ranges, range_count, store,
+      store ? 0 : UINT64_C(0xffff800000000040));
+}
+
 static struct asahi_bg_eot
 agx_build_native_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key,
                       bool store, bool partial_render)
@@ -10698,6 +11002,9 @@ agx_build_native_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key
    struct agx_context *ctx = batch->ctx;
    struct agx_device *dev = agx_device(ctx->base.screen);
    const struct pipe_surface *surf = &batch->key.cbufs[0];
+   if (batch->g17g_mrt_resident)
+      return agx_build_native_g17g_mrt_bg_eot(batch, key, store);
+
    /* A render with no colour attachment still runs a background and an
     * end-of-tile program per tile; both simply have nothing to move, because
     * the tilebuffer holds no colour. Apple's own colour-free render carries
@@ -10846,23 +11153,8 @@ agx_build_native_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key
                             agx_resource(surf->texture), surf->format,
                             &sampler_view))
          return agx_reject_g17g_tile(batch, "M5 reload texture");
-      struct agx_gallium_sampler_descriptor sampler = {0};
-      /* Same Gen5 texel-fetch sampler as hk_pack_native_txf_sampler(G17G).
-       * Gen5's comparison mode bit is required even for a non-shadow fetch.
-       */
-      agx_pack(sampler.opaque, SAMPLER_GEN5, cfg) {
-         cfg.minimum_lod = 0.0f;
-         cfg.maximum_lod = INFINITY;
-         cfg.maximum_anisotropy = 1;
-         cfg.mip_filter = AGX_MIP_FILTER_NEAREST;
-         cfg.wrap_s = cfg.wrap_t = cfg.wrap_r = AGX_WRAP_CLAMP_TO_BORDER;
-         cfg.compare_mode = true;
-         cfg.compare_func = AGX_COMPARE_FUNC_LEQUAL;
-         cfg.border_colour = AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
-      }
-      const uint64_t sampler_va = agx_pool_upload_aligned(
-         &batch->pool, &sampler, sizeof(sampler), 32);
-      const uint64_t pointers[2] = {texture.gpu, sampler_va};
+      const uint64_t pointers[2] = {texture.gpu,
+                                    agx_m5_upload_txf_sampler(batch)};
       const uint64_t table = agx_pool_upload_aligned(
          &batch->pool, pointers, sizeof(pointers), 8);
       ranges[0] = (struct agx3_ioto_uniform_range){0, 4, table};
@@ -10870,57 +11162,9 @@ agx_build_native_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key
       range_count = 2;
    }
 
-   size_t capacity;
-   if (!agx3_g17g_graphics_program_bound(dev->chip, ranges, range_count, &capacity))
-      return agx_reject_g17g_tile(batch, "M5 tile program size");
-   struct agx_bo *program_bo = NULL;
-   struct agx_ptr ptr = agx_pool_alloc_aligned_with_bo(
-      &batch->pipeline_pool, capacity, AGX_IOTO_PROGRAM_ALIGNMENT, &program_bo);
-   if (!ptr.cpu || !program_bo || !agx_va_in_usc_window(dev, ptr.gpu) ||
-       !agx_va_in_usc_window(dev, shader->ptr + shader->info.main_offset))
-      return agx_reject_g17g_tile(batch, "M5 tile program allocation");
-   const struct agx3_g17p_graphics_program_desc desc = {
-      .program_va = ptr.gpu,
-      .shader_va = shader->ptr + shader->info.main_offset,
-      .shader_binary_size = shader->info.binary_size,
-      .scratch_size = shader->info.scratch_size,
-      .nr_gprs = shader->info.nr_gprs,
-      .compiler_d_valid = shader->info.agx3_staging_known,
-      .compiler_d = (uint32_t)shader->info.agx3_staging_halfs * 2,
-      .fragment = true,
-      .imageblock = {key->tib.sample_size_B, key->tib.nr_samples, key->tib.tile_size},
-      .uniform_ranges = ranges,
-      .uniform_range_count = range_count,
-   };
-   struct agx3_g17p_graphics_program program;
-   if (!agx3_g17g_tile_program_generate(dev->chip, &desc, store, &program) ||
-       program.length > capacity)
-      return agx_reject_g17g_tile(batch, "M5 tile Ioto program");
-   memcpy(ptr.cpu, program.bytes, program.length);
-   if (agx_bo_sync_for_device(program_bo, ptr.gpu - program_bo->va->addr,
-                              program.length))
-      return agx_reject_g17g_tile(batch, "M5 tile program upload");
-   agx_batch_add_bo(batch, shader->bo);
-   if (dev->debug & AGX_DBG_FAULTTRACE) {
-      fprintf(stderr, "M5_TILE op=%u program=%#llx shader=%#llx size=%u gprs=%u staging=%u ranges=%u\n",
-              op, (unsigned long long)ptr.gpu,
-              (unsigned long long)desc.shader_va, shader->info.binary_size,
-              shader->info.nr_gprs, shader->info.agx3_staging_halfs, range_count);
-      for (unsigned i = 0; i < range_count; ++i)
-         fprintf(stderr, "M5_TILE_RANGE start=%u halfs=%u address=%#llx\n",
-                 ranges[i].start_halfs, ranges[i].size_halfs,
-                 (unsigned long long)ranges[i].address);
-      fprintf(stderr, "M5_TILE_IOTO data=");
-      for (unsigned i = 0; i < program.length; ++i)
-         fprintf(stderr, "%02x", program.bytes[i]);
-      fputc('\n', stderr);
-   }
-   return (struct asahi_bg_eot){
-      .usc = agx_usc_addr(dev, ptr.gpu),
-      .rsrc_spec = store || no_color ? 0 : UINT64_C(0xffff800000000040),
-      .primary_storage_B = desc.scratch_size,
-      .staging_storage_B = desc.compiler_d,
-   };
+   return agx_m5_publish_tile_program(
+      batch, key, shader, ranges, range_count, store,
+      store || no_color ? 0 : UINT64_C(0xffff800000000040));
 }
 
 static bool agx_g18_layered_d16_native(const struct agx_device *dev,
@@ -11809,11 +12053,19 @@ agx_batch_init_state(struct agx_batch *batch)
     * tile its tile programs take. The default 32 KiB - 1 halved it to 16x16,
     * which they refuse (dEQP-GLES3 fbo.msaa.4_samples.rgba32f). The epilog
     * key carries the same limits (agx_fs_epilog_apply_device_policy). */
-   /* G17G's tile programs move one colour attachment. A render of more
-    * (agx_g17g_mrt_one_pass) keeps attachment 0 in the tilebuffer and
-    * spills the others, which its fragments load and store as images. */
-   if (agx_chip_g17_m5(agx_device(batch->ctx->base.screen)->chip) &&
-       batch->key.nr_cbufs > 1) {
+   /* A G17G render of more than one colour attachment keeps them all in the
+    * tilebuffer where the multi-target tile programs move them
+    * (agx_g17g_mrt_resident). Otherwise (agx_g17g_mrt_one_pass) it keeps
+    * attachment 0 there and spills the others, which its fragments load and
+    * store as images. */
+   batch->g17g_mrt_resident = agx_g17g_fb_mrt_resident(
+      agx_device(batch->ctx->base.screen), &batch->key);
+   if (batch->g17g_mrt_resident) {
+      batch->tilebuffer_layout = agx_build_tilebuffer_layout_with_limits(
+         formats, batch->key.nr_cbufs, 1, false, 0,
+         AGX_G17G_MAX_BYTES_PER_TILE, AGX_G17G_MAX_SAMPLES_PER_TILE);
+   } else if (agx_chip_g17_m5(agx_device(batch->ctx->base.screen)->chip) &&
+              batch->key.nr_cbufs > 1) {
       batch->tilebuffer_layout = agx_build_tilebuffer_layout_rt0_resident(
          formats, batch->key.nr_cbufs,
          util_framebuffer_get_num_samples(&batch->key),
@@ -12141,16 +12393,18 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
     * else, including the colour-free tile programs, is untouched because
     * there is no colour to load or store.
     */
-   /* A render of more attachments keeps attachment 0 alone in the tile and
-    * spills the others (agx_g17g_mrt_one_pass): the tile programs and the
-    * records see one colour attachment. */
+   /* A render of more attachments keeps them all in the tile, where the
+    * multi-target tile programs move them (agx_g17g_mrt_resident), or keeps
+    * attachment 0 alone there and spills the others
+    * (agx_g17g_mrt_one_pass). The records below only see whether there is
+    * colour (no_color_attachment). */
    bool others_spilled = true;
    for (unsigned rt = 1; rt < batch->key.nr_cbufs; ++rt) {
       others_spilled &= !batch->key.cbufs[rt].texture ||
                         batch->tilebuffer_layout.spilled[rt];
    }
    const bool color_attachment_ok =
-      batch->key.nr_cbufs == 0 ||
+      batch->key.nr_cbufs == 0 || batch->g17g_mrt_resident ||
       (batch->key.cbufs[0].texture && others_spilled);
    const struct pipe_surface *zsbuf = &batch->key.zsbuf;
    /* With the comparison disabled the depth unit performs no test and, per
@@ -15708,14 +15962,16 @@ agx_g17g_mrt_inputs(struct agx_uncompiled_shader *so, unsigned rt)
 }
 
 /*
- * G17G's tile programs move one colour attachment (agx_build_g17g_bg_eot),
- * and a render with more is dropped. Draw such a framebuffer one attachment
- * at a time: bind each attachment alone at slot 0 with the depth/stencil
- * attachment, and let the epilog store that attachment's output location
- * with its blend state (agx_update_fs). Blending, colour masks and outputs
- * are per attachment, so the colour results are exact. Depth and stencil
- * are updated by the first pass only; later passes test depth for equality
- * against what it wrote, with all depth and stencil writes off.
+ * A G17G render keeps several colour attachments in the tilebuffer only in
+ * the layouts its multi-target tile programs move (agx_g17g_mrt_resident),
+ * and a render of more than one attachment in any other is dropped. Draw
+ * such a framebuffer one attachment at a time: bind each attachment alone at
+ * slot 0 with the depth/stencil attachment, and let the epilog store that
+ * attachment's output location with its blend state (agx_update_fs).
+ * Blending, colour masks and outputs are per attachment, so the colour
+ * results are exact. Depth and stencil are updated by the first pass only;
+ * later passes test depth for equality against what it wrote, with all depth
+ * and stencil writes off.
  */
 static void
 agx_g17g_split_mrt(struct agx_context *ctx, bool app_draw,
@@ -15866,6 +16122,17 @@ agx_g17g_mrt_spills_encodable(struct agx_context *ctx)
    }
 
    return true;
+}
+
+bool
+agx_g17g_mrt_resident(struct agx_context *ctx)
+{
+   if (!ctx->g17g_mrt_resident_known) {
+      ctx->g17g_mrt_resident_ok = agx_g17g_fb_mrt_resident(
+         agx_device(ctx->base.screen), &ctx->framebuffer);
+      ctx->g17g_mrt_resident_known = true;
+   }
+   return ctx->g17g_mrt_resident_ok;
 }
 
 static bool
@@ -16570,7 +16837,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
 
    if (agx_chip_g17_m5(agx_device(pctx->screen)->chip) &&
        !ctx->g17g_mrt_split && !ctx->g17g_mrt_spill &&
-       ctx->framebuffer.nr_cbufs > 1) {
+       ctx->framebuffer.nr_cbufs > 1 && !agx_g17g_mrt_resident(ctx)) {
       if (agx_g17g_mrt_one_pass(ctx))
          agx_g17g_one_pass_mrt_draw(ctx, info, drawid_offset, indirect, draws);
       else
