@@ -382,3 +382,5 @@ bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,
 bool agx_nir_opt_uniform_idiv(struct nir_shader *shader);
 bool agx_nir_lower_integer_division(struct nir_shader *nir,
                                     bool forms_preamble);
+bool agx_nir_has_loop(const struct nir_shader *nir);
+bool agx_nir_limit_heavy_branch_unroll(struct nir_shader *nir);

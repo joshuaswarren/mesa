@@ -469,8 +469,11 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
-      NIR_PASS(progress, nir, nir_opt_loop);
-      NIR_PASS(progress, nir, nir_opt_loop_unroll);
+      if (agx_nir_has_loop(nir)) {
+         NIR_PASS(progress, nir, nir_opt_loop);
+         agx_nir_limit_heavy_branch_unroll(nir);
+         NIR_PASS(progress, nir, nir_opt_loop_unroll);
+      }
    } while (progress);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
