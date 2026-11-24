@@ -7988,11 +7988,12 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          I->src[1] = tmp;
       }
 
-      /* G17P has a register half multiply, but its immediate half form
+      /* AGX3 has a register half multiply, but its immediate half form
        * requires an addend. Keep a pure half multiply in the witnessed
        * register domain instead of passing an unencodable immediate to the
        * packer. The low-half product has the same modulo-2^16 value. */
-      if (ctx->key->dev.chip == AGX_CHIP_G17P &&
+      if ((agx_isa_is_agx3(ctx->key->dev.encoding) ||
+           ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3D) &&
           I->op == AGX_OPCODE_IMAD && I->nr_dests == 1 && I->nr_srcs == 3 &&
           I->dest[0].size == AGX_SIZE_16 && I->shift == 0 && !I->saturate &&
           agx_channels(I->dest[0]) == 1 &&
