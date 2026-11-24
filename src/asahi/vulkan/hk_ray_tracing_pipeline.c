@@ -13,20 +13,22 @@
  * (hk_nir_ray_tracing.c) is already a port of lavapipe's, so the two halves fit
  * without reinterpretation.
  *
- * On M5, two departures from lavapipe's single megakernel, both for
- * throughput:
+ * Two departures from lavapipe's single megakernel, both for throughput:
  *
- *  - One kernel is compiled PER RAY-GENERATION GROUP rather than one for the
- *    whole pipeline.  A trace runs exactly one raygen, so inlining every raygen
- *    into one kernel only makes each dispatch pay for the union: its code
- *    size, its register count (the occupancy of every trace was that of the
- *    worst raygen) and its scratch (the stack was sized for the largest raygen
- *    frame).  hk_cmd_trace_rays.c selects the kernel on the GPU from the SBT.
+ *  - On M5, one kernel is compiled PER RAY-GENERATION GROUP rather than one
+ *    for the whole pipeline.  A trace runs exactly one raygen, so inlining
+ *    every raygen into one kernel only makes each dispatch pay for the union:
+ *    its code size, its register count (the occupancy of every trace was that
+ *    of the worst raygen) and its scratch (the stack was sized for the largest
+ *    raygen frame).  hk_cmd_trace_rays.c selects the kernel on the GPU from
+ *    the SBT.
  *
- *  - A stage that several groups name (a hit group with and without an
- *    any-hit shader commonly share one closest-hit) is inlined once per call
- *    site, guarded by the disjunction of the groups' handle tests, instead of
- *    once per group.
+ *  - On all chips, a stage that several groups name (a hit group with and
+ *    without an any-hit shader commonly share one closest-hit) is inlined once
+ *    per call site, guarded by the disjunction of the groups' handle tests,
+ *    instead of once per group.  This is pure NIR control flow with no
+ *    chip-specific encoding requirement; the shader record pointer is loaded
+ *    from the SBT entry before the group dispatch.
  *
  * The one real divergence is how the trace-rays record reaches the shader.
  * lavapipe binds it as an internal SSBO; hk has no internal descriptor set, so
@@ -341,10 +343,6 @@ struct hk_rt_compiler {
    VkPipelineCreateFlags2KHR flags;
    bool position_fetch;
    bool native_agx;
-   /* M5 compiles one kernel per ray-generation group and shares a stage's
-    * call site between the groups naming it. Other chips keep the single
-    * megakernel with one call site per group. */
-   bool m5;
    bool callable_dispatch;
 
    struct hk_rt_shader_state state;
@@ -629,10 +627,6 @@ struct hk_rt_stage_call {
     * reportIntersectionEXT lowering binds it to the intersection body. */
    nir_shader *ahit;
    nir_def *cond;
-   /* Without merged call sites (cond == NULL), the group's handle test is
-    * emitted where the call is. */
-   nir_def *handle;
-   uint32_t handle_index;
 };
 
 /*
@@ -669,14 +663,6 @@ hk_rt_collect_stage_calls(nir_builder *b, struct hk_rt_compiler *compiler,
       if (which == HK_RT_GROUP_ISEC && group->ahit_index != VK_SHADER_UNUSED_KHR)
          ahit = compiler->pipeline->stages[group->ahit_index]->nir;
 
-      if (!compiler->m5) {
-         calls[count++] = (struct hk_rt_stage_call){
-            .stage = stage, .ahit = ahit, .handle = handle,
-            .handle_index = group->handle.index,
-         };
-         continue;
-      }
-
       nir_def *test = nir_ieq_imm(b, handle, group->handle.index);
 
       unsigned j;
@@ -695,13 +681,6 @@ hk_rt_collect_stage_calls(nir_builder *b, struct hk_rt_compiler *compiler,
    }
 
    return count;
-}
-
-static nir_def *
-hk_rt_stage_call_cond(nir_builder *b, const struct hk_rt_stage_call *call)
-{
-   return call->cond ? call->cond
-                     : nir_ieq_imm(b, call->handle, call->handle_index);
 }
 
 /* Preserve invocation state across nested calls. SSA/DCE eliminates fields
@@ -790,7 +769,7 @@ hk_execute_callable_inline(nir_builder *b, struct hk_rt_compiler *compiler,
       b, compiler, callable_entry.value, HK_RT_GROUP_RECURSIVE,
       MESA_SHADER_CALLABLE, calls);
    for (unsigned i = 0; i < count; i++) {
-      nir_push_if(b, hk_rt_stage_call_cond(b, &calls[i]));
+      nir_push_if(b, calls[i].cond);
       hk_call_ray_tracing_stage(b, compiler, calls[i].stage, false);
       nir_pop_if(b, NULL);
    }
@@ -1142,7 +1121,7 @@ hk_handle_aabb_intersection(nir_builder *b,
    const unsigned count = hk_rt_collect_stage_calls(
       b, compiler, isec_entry.value, HK_RT_GROUP_ISEC, MESA_SHADER_NONE, calls);
    for (unsigned i = 0; i < count; i++) {
-      nir_push_if(b, hk_rt_stage_call_cond(b, &calls[i]));
+      nir_push_if(b, calls[i].cond);
       hk_call_ray_tracing_stage(b, compiler, calls[i].stage, true);
       nir_pop_if(b, NULL);
 
@@ -1231,7 +1210,7 @@ hk_handle_triangle_intersection(nir_builder *b,
          b, compiler, ahit_entry.value, HK_RT_GROUP_AHIT, MESA_SHADER_NONE,
          calls);
       for (unsigned i = 0; i < count; i++) {
-         nir_push_if(b, hk_rt_stage_call_cond(b, &calls[i]));
+         nir_push_if(b, calls[i].cond);
          hk_call_ray_tracing_stage(b, compiler, calls[i].stage, true);
          nir_pop_if(b, NULL);
       }
@@ -1411,13 +1390,13 @@ hk_trace_ray_native(nir_builder *b, struct hk_rt_compiler *compiler,
          nir_store_var(b, state->shader_record_ptr,
                        hit_entry.shader_record_ptr, 1);
          nir_store_var(b, state->accept, nir_imm_true(b), 1);
-         for (uint32_t i = 0; i < compiler->pipeline->group_count; ++i) {
-            struct hk_ray_tracing_group *group = compiler->pipeline->groups + i;
-            if (group->ahit_index == VK_SHADER_UNUSED_KHR)
-               continue;
-            nir_shader *stage = compiler->pipeline->stages[group->ahit_index]->nir;
-            nir_push_if(b, nir_ieq_imm(b, hit_entry.value, group->handle.index));
-            hk_call_ray_tracing_stage(b, compiler, stage, true);
+         struct hk_rt_stage_call calls[compiler->pipeline->group_count];
+         const unsigned count = hk_rt_collect_stage_calls(
+            b, compiler, hit_entry.value, HK_RT_GROUP_AHIT, MESA_SHADER_NONE,
+            calls);
+         for (unsigned i = 0; i < count; ++i) {
+            nir_push_if(b, calls[i].cond);
+            hk_call_ray_tracing_stage(b, compiler, calls[i].stage, true);
             nir_pop_if(b, NULL);
          }
          nir_push_if(b, nir_load_var(b, state->accept));
@@ -1453,18 +1432,17 @@ hk_trace_ray_native(nir_builder *b, struct hk_rt_compiler *compiler,
             nir_store_var(b, state->opaque, nir_rq_load(b, 1, 1, q,
                .committed = false,
                .ray_query_value = nir_ray_query_value_intersection_candidate_aabb_opaque), 1);
-            for (uint32_t i = 0; i < compiler->pipeline->group_count; ++i) {
-               struct hk_ray_tracing_group *group = compiler->pipeline->groups + i;
-               if (group->isec_index == VK_SHADER_UNUSED_KHR)
-                  continue;
-               nir_shader *stage = compiler->pipeline->stages[group->isec_index]->nir;
-               nir_push_if(b, nir_ieq_imm(b, hit_entry.value, group->handle.index));
-               hk_call_ray_tracing_stage(b, compiler, stage, true);
+            struct hk_rt_stage_call calls[compiler->pipeline->group_count];
+            const unsigned count = hk_rt_collect_stage_calls(
+               b, compiler, hit_entry.value, HK_RT_GROUP_ISEC,
+               MESA_SHADER_NONE, calls);
+            for (unsigned i = 0; i < count; ++i) {
+               nir_push_if(b, calls[i].cond);
+               hk_call_ray_tracing_stage(b, compiler, calls[i].stage, true);
                nir_pop_if(b, NULL);
                struct hk_lower_isec_state isec_state = {
                   .compiler = compiler,
-                  .ahit = group->ahit_index == VK_SHADER_UNUSED_KHR ? NULL :
-                     compiler->pipeline->stages[group->ahit_index]->nir,
+                  .ahit = calls[i].ahit,
                };
                nir_shader_intrinsics_pass(b->shader, hk_lower_isec_intrinsic,
                                           nir_metadata_none, &isec_state);
@@ -1474,13 +1452,13 @@ hk_trace_ray_native(nir_builder *b, struct hk_rt_compiler *compiler,
          {
             nir_store_var(b, state->accept, nir_imm_true(b), 1);
             if (has_ahit) {
-               for (uint32_t i = 0; i < compiler->pipeline->group_count; ++i) {
-                  struct hk_ray_tracing_group *group = compiler->pipeline->groups + i;
-                  if (group->ahit_index == VK_SHADER_UNUSED_KHR)
-                     continue;
-                  nir_shader *stage = compiler->pipeline->stages[group->ahit_index]->nir;
-                  nir_push_if(b, nir_ieq_imm(b, hit_entry.value, group->handle.index));
-                  hk_call_ray_tracing_stage(b, compiler, stage, true);
+               struct hk_rt_stage_call calls[compiler->pipeline->group_count];
+               const unsigned count = hk_rt_collect_stage_calls(
+                  b, compiler, hit_entry.value, HK_RT_GROUP_AHIT,
+                  MESA_SHADER_NONE, calls);
+               for (unsigned i = 0; i < count; ++i) {
+                  nir_push_if(b, calls[i].cond);
+                  hk_call_ray_tracing_stage(b, compiler, calls[i].stage, true);
                   nir_pop_if(b, NULL);
                }
             }
@@ -1693,7 +1671,7 @@ hk_rt_dispatch_hit_or_miss(nir_builder *b, struct hk_rt_compiler *compiler,
          b, compiler, chit_entry.value, HK_RT_GROUP_RECURSIVE,
          MESA_SHADER_CLOSEST_HIT, calls);
       for (unsigned i = 0; i < count; i++) {
-         nir_push_if(b, hk_rt_stage_call_cond(b, &calls[i]));
+         nir_push_if(b, calls[i].cond);
          hk_call_ray_tracing_stage(b, compiler, calls[i].stage, true);
          nir_pop_if(b, NULL);
       }
@@ -1712,7 +1690,7 @@ hk_rt_dispatch_hit_or_miss(nir_builder *b, struct hk_rt_compiler *compiler,
          b, compiler, miss_entry.value, HK_RT_GROUP_RECURSIVE,
          MESA_SHADER_MISS, calls);
       for (unsigned i = 0; i < count; i++) {
-         nir_push_if(b, hk_rt_stage_call_cond(b, &calls[i]));
+         nir_push_if(b, calls[i].cond);
          hk_call_ray_tracing_stage(b, compiler, calls[i].stage, true);
          nir_pop_if(b, NULL);
       }
@@ -3820,7 +3798,6 @@ hk_compile_rt_kernel(
       .flags = vk_rt_pipeline_create_flags(create_info),
       .position_fetch = dev->vk.enabled_features.rayTracingPositionFetch,
       .native_agx = dev->gen1_native_rq && dev->gen1_rq_instances,
-      .m5 = agx_chip_g17_m5(dev->dev.chip),
       .callable_dispatch = hk_callable_dispatch_needed(pipeline),
       .max_depth = create_info->maxPipelineRayRecursionDepth,
    };

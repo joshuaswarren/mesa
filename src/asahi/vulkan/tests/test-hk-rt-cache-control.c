@@ -48,6 +48,8 @@
 static unsigned translations, backends, shader_destroys, live_nir;
 static unsigned last_instrs, last_calls, last_max_block;
 static void (*inspect_nir)(nir_shader *nir);
+static bool capture_last_nir;
+static nir_shader *captured_nir;
 static nir_shader *tracked_nir[64];
 static VkResult backend_result = VK_SUCCESS;
 static unsigned fail_translation;
@@ -167,7 +169,12 @@ __wrap_hk_compile_shader(struct hk_device *dev,
    }
    if (inspect_nir)
       inspect_nir(info->nir);
-   ralloc_free(info->nir);
+   if (capture_last_nir) {
+      ralloc_free(captured_nir);
+      captured_nir = info->nir;
+   } else {
+      ralloc_free(info->nir);
+   }
    if (backend_result != VK_SUCCESS)
       return backend_result;
    *out = calloc(1, sizeof(**out));
@@ -659,6 +666,263 @@ inspect_tiled_launch_oob(nir_shader *nir)
       CHECK(active == total);
       CHECK(retired == launched - total);
    }
+}
+
+static bool
+cf_list_contains_node(const struct exec_list *list, const nir_cf_node *target)
+{
+   foreach_list_typed(nir_cf_node, n, node, list) {
+      if (n == target)
+         return true;
+   }
+   return false;
+}
+
+static unsigned
+find_xor_magic(nir_shader *nir, uint32_t magic, nir_alu_instr **first_out)
+{
+   unsigned count = 0;
+   if (first_out)
+      *first_out = NULL;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op != nir_op_ixor)
+               continue;
+            for (unsigned s = 0; s < 2; ++s) {
+               if (nir_src_is_const(alu->src[s].src) &&
+                   nir_src_as_uint(alu->src[s].src) == magic) {
+                  if (first_out && !*first_out)
+                     *first_out = alu;
+                  count++;
+                  break;
+               }
+            }
+         }
+      }
+   }
+   return count;
+}
+
+static uint32_t
+read_handle_index(const uint8_t *handles, unsigned group)
+{
+   const uint8_t *h = handles + group * HK_RAY_TRACING_GROUP_HANDLE_SIZE;
+   uint32_t idx = 0;
+   memcpy(&idx, h, sizeof(idx));
+   for (unsigned b = sizeof(idx); b < HK_RAY_TRACING_GROUP_HANDLE_SIZE; ++b)
+      CHECK(h[b] == 0);
+   return idx;
+}
+
+/* Verify that shared hit groups with distinct SBT records merge into a single
+ * call site across all chips (software traversal on G13G, native traversal on
+ * G17P and M5/G17G), that the merged guard accepts every sharing group's
+ * handle and rejects unrelated handles, and that each group still reads its
+ * own distinct SBT record without aliasing. */
+static void
+test_shared_stage_call_sites(void)
+{
+   static const struct {
+      const uint32_t *code;
+      size_t size;
+      VkShaderStageFlagBits stage;
+   } spv[] = {
+      {hk_rt_recursion_rgen_spv, sizeof(hk_rt_recursion_rgen_spv),
+       VK_SHADER_STAGE_RAYGEN_BIT_KHR},
+      {hk_rt_sbt_chit_spv, sizeof(hk_rt_sbt_chit_spv),
+       VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
+      {hk_rt_recursion_ahit_spv, sizeof(hk_rt_recursion_ahit_spv),
+       VK_SHADER_STAGE_ANY_HIT_BIT_KHR},
+      {hk_rt_recursion_miss_spv, sizeof(hk_rt_recursion_miss_spv),
+       VK_SHADER_STAGE_MISS_BIT_KHR},
+      {hk_rt_isec_spv, sizeof(hk_rt_isec_spv),
+       VK_SHADER_STAGE_INTERSECTION_BIT_KHR},
+   };
+   VkShaderModule mods[ARRAY_SIZE(spv)];
+   VkPipelineShaderStageCreateInfo stages[ARRAY_SIZE(spv)];
+   for (unsigned i = 0; i < ARRAY_SIZE(spv); ++i) {
+      VkShaderModuleCreateInfo mi = {
+         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+         .codeSize = spv[i].size,
+         .pCode = spv[i].code,
+      };
+      CHECK(vk_common_CreateShaderModule(device, &mi, NULL, &mods[i]) ==
+            VK_SUCCESS);
+      stages[i] = (VkPipelineShaderStageCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = spv[i].stage,
+         .module = mods[i],
+         .pName = "main",
+      };
+   }
+
+   /* Place miss (group 2) between hit group A (group 1) and hit groups B/C
+    * (groups 3, 4) so the sharing groups' handle indices are non-adjacent. */
+   VkRayTracingShaderGroupCreateInfoKHR tri_groups[5] = {
+      group, group, group, group, group,
+   };
+   tri_groups[1].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+   tri_groups[1].generalShader = VK_SHADER_UNUSED_KHR;
+   tri_groups[1].closestHitShader = 1;
+   tri_groups[1].anyHitShader = VK_SHADER_UNUSED_KHR;
+   tri_groups[2].generalShader = 3;
+   tri_groups[3].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+   tri_groups[3].generalShader = VK_SHADER_UNUSED_KHR;
+   tri_groups[3].closestHitShader = 1;
+   tri_groups[3].anyHitShader = 2;
+   tri_groups[4].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+   tri_groups[4].generalShader = VK_SHADER_UNUSED_KHR;
+   tri_groups[4].closestHitShader = 1;
+   tri_groups[4].anyHitShader = 2;
+
+   /* Procedural hit groups: P1 and P2 share both (isec, ahit=unused) and must
+    * merge into one intersection call site; P3 shares isec with a different
+    * any-hit shader and must keep a second intersection call site, while all
+    * three still share one closest-hit call site. */
+   VkRayTracingShaderGroupCreateInfoKHR proc_groups[4] = {
+      group, group, group, group,
+   };
+   for (unsigned g = 1; g < 4; ++g) {
+      proc_groups[g].type =
+         VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR;
+      proc_groups[g].generalShader = VK_SHADER_UNUSED_KHR;
+      proc_groups[g].closestHitShader = 1;
+      proc_groups[g].intersectionShader = 4;
+      proc_groups[g].anyHitShader = g == 3 ? 2 : VK_SHADER_UNUSED_KHR;
+   }
+
+   const struct {
+      enum agx_chip chip;
+      bool native_rq;
+   } configs[] = {
+      {AGX_CHIP_G13G, false},
+      {AGX_CHIP_G17P, true},
+      {AGX_CHIP_G17G, true},
+   };
+   const enum agx_chip saved_chip = dev.dev.chip;
+   const bool saved_native = dev.gen1_native_rq;
+   const bool saved_instances = dev.gen1_rq_instances;
+
+   for (unsigned c = 0; c < ARRAY_SIZE(configs); ++c) {
+      dev.dev.chip = configs[c].chip;
+      dev.gen1_native_rq = configs[c].native_rq;
+      dev.gen1_rq_instances = configs[c].native_rq;
+
+      VkRayTracingPipelineCreateInfoKHR ci = info(0);
+      ci.stageCount = 4;
+      ci.pStages = stages;
+      ci.groupCount = ARRAY_SIZE(tri_groups);
+      ci.pGroups = tri_groups;
+      ci.maxPipelineRayRecursionDepth = 1;
+
+      VkPipeline p = VK_NULL_HANDLE;
+      capture_last_nir = true;
+      CHECK(create(VK_NULL_HANDLE, &ci, &p) == VK_SUCCESS);
+      capture_last_nir = false;
+      CHECK(captured_nir != NULL);
+
+      uint8_t handles[ARRAY_SIZE(tri_groups) * HK_RAY_TRACING_GROUP_HANDLE_SIZE];
+      CHECK(hk_GetRayTracingShaderGroupHandlesKHR(
+               device, p, 0, ARRAY_SIZE(tri_groups), sizeof(handles),
+               handles) == VK_SUCCESS);
+      const uint32_t hA = read_handle_index(handles, 1);
+      const uint32_t hMiss = read_handle_index(handles, 2);
+      const uint32_t hB = read_handle_index(handles, 3);
+      const uint32_t hC = read_handle_index(handles, 4);
+      CHECK(hA != hMiss && hA != hB && hA != hC && hB != hC &&
+            hB != hMiss && hC != hMiss);
+
+      /* Shared closest-hit must appear exactly once across all three hit groups. */
+      nir_alu_instr *chit_xor = NULL;
+      CHECK(find_xor_magic(captured_nir, 0x51a7c0deu, &chit_xor) == 1);
+      CHECK(chit_xor != NULL);
+
+      /* Build a hit SBT with 6 records (stride 64): records 0..2 hold the three
+       * sharing hit groups with distinct SBT payload tags; records 3..5 hold
+       * miss, zero, and an unrelated handle. */
+      enum { SBT_STRIDE = 64, SBT_RECORDS = 6 };
+      uint8_t sbt[SBT_RECORDS * SBT_STRIDE];
+      memset(sbt, 0, sizeof(sbt));
+      const uint32_t rec_handles[SBT_RECORDS] = {
+         hA, hB, hC, hMiss, 0u, hC + 17u,
+      };
+      const uint32_t rec_tags[SBT_RECORDS] = {
+         0x11110001u, 0x22220002u, 0x33330003u, 0x44440004u, 0u, 0x55550005u,
+      };
+      for (unsigned r = 0; r < SBT_RECORDS; ++r) {
+         memcpy(sbt + r * SBT_STRIDE, &rec_handles[r], sizeof(uint32_t));
+         memcpy(sbt + r * SBT_STRIDE + HK_RAY_TRACING_GROUP_HANDLE_SIZE,
+                &rec_tags[r], sizeof(uint32_t));
+      }
+
+      struct nir_eval_env env = {
+         .root_addr = UINT64_C(0x100000),
+         .cmd_addr = UINT64_C(0x200000),
+         .cmd = {
+            .hitShaderBindingTableAddress = UINT64_C(0x10000000),
+            .hitShaderBindingTableStride = SBT_STRIDE,
+            .width = 8, .height = 4, .depth = 1,
+         },
+         .hit_sbt = sbt,
+         .hit_sbt_size = sizeof(sbt),
+      };
+
+      /* Each sharing group's SBT index must read its own distinct SBT record
+       * through the single merged closest-hit body (zero aliasing). */
+      for (unsigned r = 0; r < 3; ++r) {
+         env.sbt_index = r;
+         const uint32_t got = (uint32_t)nir_eval_def(&chit_xor->def, 0, &env);
+         CHECK(got == (rec_tags[r] ^ 0x51a7c0deu));
+      }
+
+      /* Walk to the enclosing nir_if guarding the merged closest-hit body and
+       * verify it accepts hA, hB, hC and rejects hMiss, 0, and hC + 17. */
+      nir_cf_node *child = &chit_xor->instr.block->cf_node;
+      nir_cf_node *parent = child->parent;
+      CHECK(parent && parent->type == nir_cf_node_if);
+      nir_if *guard = nir_cf_node_as_if(parent);
+      const bool in_then = cf_list_contains_node(&guard->then_list, child);
+      CHECK(in_then || cf_list_contains_node(&guard->else_list, child));
+      for (unsigned r = 0; r < SBT_RECORDS; ++r) {
+         env.sbt_index = r;
+         const bool cond =
+            (nir_eval_def(guard->condition.ssa, 0, &env) & 1) != 0;
+         const bool entered = in_then ? cond : !cond;
+         CHECK(entered == (r < 3));
+      }
+
+      ralloc_free(captured_nir);
+      captured_nir = NULL;
+      destroy(p);
+
+      /* Procedural hit groups: (isec, no-ahit) merges P1+P2 into 1 copy;
+       * (isec, ahit) for P3 remains a 2nd distinct copy; chit merges to 1. */
+      ci.stageCount = ARRAY_SIZE(stages);
+      ci.pStages = stages;
+      ci.groupCount = ARRAY_SIZE(proc_groups);
+      ci.pGroups = proc_groups;
+      capture_last_nir = true;
+      CHECK(create(VK_NULL_HANDLE, &ci, &p) == VK_SUCCESS);
+      capture_last_nir = false;
+      CHECK(captured_nir != NULL);
+      CHECK(find_xor_magic(captured_nir, 0x51a7c0deu, NULL) == 1);
+      CHECK(find_xor_magic(captured_nir, 0x15ec0de1u, NULL) == 2);
+      ralloc_free(captured_nir);
+      captured_nir = NULL;
+      destroy(p);
+   }
+
+   dev.dev.chip = saved_chip;
+   dev.gen1_native_rq = saved_native;
+   dev.gen1_rq_instances = saved_instances;
+   for (unsigned i = 0; i < ARRAY_SIZE(mods); ++i)
+      vk_common_DestroyShaderModule(device, mods[i], NULL);
+   puts("PASS: shared hit groups merge stage call sites with distinct SBT "
+        "records across G13G, G17P and M5");
 }
 
 int
@@ -1196,6 +1460,7 @@ main(void)
       destroy(p);
       puts("PASS: compiled NIR launch-ID OOB guard covers partial edge tiles at "
            "heights 1, 2, 4 and 5");
+      test_shared_stage_call_sites();
 
       for (unsigned i = 0; i < ARRAY_SIZE(mods); ++i)
          vk_common_DestroyShaderModule(device, mods[i], NULL);
