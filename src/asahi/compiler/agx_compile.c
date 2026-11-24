@@ -11258,7 +11258,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
 
    /* This runs only once up front since other optimizations don't affect it */
    NIR_PASS(_, nir, nir_opt_shrink_stores, true);
-   NIR_PASS(_, nir, agx_nir_uniform_unit_global_id);
+   /* Do not run agx_nir_uniform_unit_global_id here: Borealis workgroup
+    * coalescing (hk_coalesce_workgroup_size_ex) checks eligibility before
+    * backend compile and widens size-1 axes at dispatch, so rewriting
+    * global_invocation_id[c] to workgroup_id[c] corrupts coalesced dispatches.
+    */
 
    agx_optimize_loop_nir(nir, m5, g17p, agx3b || m5);
 
