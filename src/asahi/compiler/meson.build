@@ -744,6 +744,7 @@ if with_tests
          'test/test-minmax-canonical.cpp',
          'test/test-workgroup-split.cpp',
          'test/test-selected-f2i.cpp',
+         'test/test-flrp-contract.cpp',
          'test/test-buffer-format-groups.cpp',
          'test/test-scalarize-int64.cpp',
          'test/test-lower-divmod64.cpp',

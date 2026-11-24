@@ -479,6 +479,23 @@ fold_selected_f2i32 = [
      ('f2i32', ('bcsel', a, b, c))),
 ]
 
+# Contract inexact linear interpolation a*(1 - t) + b*t (and its FMA form
+# ffma(1 - t, a, b*t)) into ffma(t, b - a, a), cutting 4 ops to 2 (fneg is a
+# free source modifier on AGX3 f32add). Only non-exact (~) ops without
+# SignedZeroInfNanPreserve (nnan,ninf,nsz) match, preserving precise /
+# NoContraction and VK_KHR_shader_float_controls semantics.
+opt_flrp_contract = [
+    (('~ffma(nnan,ninf,nsz)',
+      ('~fadd(nnan,ninf,nsz)', 1.0, ('fneg', 't')), 'a',
+      ('~fmul(is_used_once,nnan,ninf,nsz)', 't', 'b')),
+     ('ffma', 't', ('fadd', 'b', ('fneg', 'a')), 'a')),
+    (('~fadd(nnan,ninf,nsz)',
+      ('~fmul(is_used_once,nnan,ninf,nsz)',
+       ('~fadd(nnan,ninf,nsz)', 1.0, ('fneg', 't')), 'a'),
+      ('~fmul(is_used_once,nnan,ninf,nsz)', 't', 'b')),
+     ('ffma', 't', ('fadd', 'b', ('fneg', 'a')), 'a')),
+]
+
 # A sign-extended byte converted to float: (x << (24 - 8k)) >> 24 is three
 # instructions on M5 (insert, arithmetic shift, word conversion). int2flt has a
 # signed-byte form that reads the low eight bits of a half register, so convert
@@ -619,7 +636,8 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
                                       fuse_extr + fuse_ubfe +
                                       fuse_imad + ixor_bcsel +
                                       fold_aligned_bounds + fold_byte_swap +
-                                      fold_selected_f2i32).render())
+                                      fold_selected_f2i32 +
+                                      opt_flrp_contract).render())
 
 
 if __name__ == '__main__':
