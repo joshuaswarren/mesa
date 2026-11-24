@@ -7,8 +7,15 @@
  * tilebuffer: one clear and one draw go into one batch, the layout spills
  * nothing, the background and end-of-tile programs are the multi-target ones
  * and the M5 submission gate accepts the render. A framebuffer the
- * multi-target programs do not cover keeps the previous paths. This test does
- * not execute GPU work or compare rendered pixels.
+ * multi-target programs do not cover keeps the previous paths.
+ *
+ * Then, on eight framebuffer slots of mixed integer and normalized formats
+ * with two empty slots, every fragment program must still link: a clear
+ * through a quad that masks all attachments but one, and a draw with a
+ * partial colour mask per attachment. On M5 each masked attachment keeps its
+ * contents with a tile load/store pair, so neither epilog stores the
+ * attachment at byte 0 of the tile. This test does not execute GPU work or
+ * compare rendered pixels.
  */
 #include <fcntl.h>
 #include <stdio.h>
@@ -16,11 +23,14 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "asahi/compiler/agx_compile.h"
 #include "asahi/lib/agx_bg_eot.h"
+#include "compiler/nir/nir_builder.h"
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "util/driconf.h"
+#include "util/format/u_format.h"
 #include "util/u_inlines.h"
 #include "util/u_simple_shaders.h"
 #include "util/xmlconfig.h"
@@ -76,6 +86,162 @@ draw(struct pipe_context *pipe)
    };
    struct pipe_draw_start_count_bias range = {.count = 3};
    pipe->draw_vbo(pipe, &info, 0, NULL, &range, 1);
+}
+
+/* Eight slots of mixed formats, two of them empty, that all fit in the
+ * tile: a draw buffer set of the indexed draw buffer conformance tests. */
+static const enum pipe_format mixed_formats[8] = {
+   PIPE_FORMAT_R8_SINT,          PIPE_FORMAT_R16G16_UINT,
+   PIPE_FORMAT_NONE,             PIPE_FORMAT_R10G10B10A2_UINT,
+   PIPE_FORMAT_R8_UNORM,         PIPE_FORMAT_R16_UINT,
+   PIPE_FORMAT_NONE,             PIPE_FORMAT_R32G32B32A32_SINT,
+};
+
+/* st/mesa's clear through a quad: one colour from constant buffer 0,
+ * written to every colour buffer. */
+static void *
+create_clear_fs(struct pipe_context *pipe)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "clear quad FS");
+   b.shader->info.io_lowered = true;
+   nir_def *zero = nir_imm_int(&b, 0);
+   nir_def *colour = nir_load_ubo(&b, 4, 32, zero, zero, .align_mul = 16,
+                                  .align_offset = 0, .range = 16);
+   nir_store_output(&b, colour, zero, .write_mask = 0xf,
+                    .src_type = nir_type_float32,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   b.shader->info.num_ubos = 1;
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+   void *fs = pipe->create_fs_state(pipe, &state);
+   CHECK(fs);
+   return fs;
+}
+
+/* One output per slot, typed by the slot's format. */
+static void *
+create_typed_fs(struct pipe_context *pipe, const enum pipe_format *formats)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "typed MRT FS");
+   b.shader->info.io_lowered = true;
+   nir_def *coord = nir_load_frag_coord(&b);
+   nir_def *x = nir_fmul_imm(&b, nir_channel(&b, coord, 0), 1.0 / 64);
+   nir_def *y = nir_fmul_imm(&b, nir_channel(&b, coord, 1), 1.0 / 64);
+   nir_def *v[4] = {x, y, nir_fsub_imm(&b, 1.0, x), nir_fsub_imm(&b, 1.0, y)};
+   for (unsigned rt = 0; rt < 8; ++rt) {
+      nir_def *value =
+         nir_vec4(&b, v[rt % 4], v[(rt + 1) % 4], v[(rt + 2) % 4],
+                  v[(rt + 3) % 4]);
+      nir_alu_type type = nir_type_float32;
+      if (util_format_is_pure_uint(formats[rt])) {
+         value = nir_f2u32(&b, value);
+         type = nir_type_uint32;
+      } else if (util_format_is_pure_sint(formats[rt])) {
+         value = nir_f2i32(&b, value);
+         type = nir_type_int32;
+      }
+      nir_store_output(&b, value, nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .src_type = type,
+                       .io_semantics.location = FRAG_RESULT_DATA0 + rt);
+   }
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+   void *fs = pipe->create_fs_state(pipe, &state);
+   CHECK(fs);
+   return fs;
+}
+
+/* Draw with these colour masks and check that the draw reaches the batch. */
+static void
+draw_masked(struct pipe_context *pipe, const unsigned *masks)
+{
+   struct agx_context *ctx = agx_context(pipe);
+   struct pipe_blend_state blend = {.independent_blend_enable = true};
+   for (unsigned rt = 0; rt < 8; ++rt)
+      blend.rt[rt].colormask = masks[rt];
+   void *blend_state = pipe->create_blend_state(pipe, &blend);
+   CHECK(blend_state);
+   pipe->bind_blend_state(pipe, blend_state);
+
+   const unsigned refused = ctx->skipped_no_program;
+   draw(pipe);
+   CHECK(ctx->skipped_no_program == refused);
+   CHECK(ctx->batch && ctx->batch->g17g_mrt_resident);
+   CHECK(!ctx->batch->draws_refused && !ctx->batch->native_rejected);
+   pipe->flush(pipe, NULL, 0);
+
+   pipe->bind_blend_state(pipe, NULL);
+   pipe->delete_blend_state(pipe, blend_state);
+}
+
+static void
+check_mixed_masked(struct pipe_screen *screen, struct pipe_context *pipe)
+{
+   struct pipe_resource *targets[8] = {0};
+   struct pipe_framebuffer_state fb = {
+      .width = 64, .height = 64, .layers = 1, .nr_cbufs = 8,
+   };
+   for (unsigned rt = 0; rt < 8; ++rt) {
+      if (mixed_formats[rt] == PIPE_FORMAT_NONE)
+         continue;
+      targets[rt] = create_target(screen, mixed_formats[rt], 1);
+      fb.cbufs[rt] = (struct pipe_surface){
+         .texture = targets[rt], .format = targets[rt]->format,
+      };
+   }
+   pipe->set_framebuffer_state(pipe, &fb);
+   CHECK(agx_g17g_mrt_resident(agx_context(pipe)));
+
+   /* A clear through a quad of each attachment in turn, with all channels
+    * and with one. */
+   const float colour[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+   struct pipe_constant_buffer cb = {
+      .buffer_size = sizeof(colour),
+      .user_buffer = colour,
+   };
+   pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, &cb);
+   void *clear_fs = create_clear_fs(pipe);
+   pipe->bind_fs_state(pipe, clear_fs);
+   for (unsigned rt = 0; rt < 8; ++rt) {
+      if (mixed_formats[rt] == PIPE_FORMAT_NONE)
+         continue;
+      static const unsigned clear_masks[] = {PIPE_MASK_R, PIPE_MASK_RGBA};
+      for (unsigned i = 0; i < ARRAY_SIZE(clear_masks); ++i) {
+         unsigned masks[8] = {0};
+         masks[rt] = clear_masks[i];
+         draw_masked(pipe, masks);
+      }
+   }
+
+   /* A draw of every slot under a partial colour mask each. */
+   void *typed_fs = create_typed_fs(pipe, mixed_formats);
+   pipe->bind_fs_state(pipe, typed_fs);
+   const unsigned partial[8] = {
+      PIPE_MASK_B, PIPE_MASK_B, PIPE_MASK_B, PIPE_MASK_B,
+      PIPE_MASK_B, PIPE_MASK_B, PIPE_MASK_B, PIPE_MASK_B,
+   };
+   draw_masked(pipe, partial);
+   const unsigned full[8] = {
+      PIPE_MASK_RGBA, PIPE_MASK_RGBA, PIPE_MASK_RGBA, PIPE_MASK_RGBA,
+      PIPE_MASK_RGBA, PIPE_MASK_RGBA, PIPE_MASK_RGBA, PIPE_MASK_RGBA,
+   };
+   draw_masked(pipe, full);
+
+   pipe->bind_fs_state(pipe, NULL);
+   pipe->delete_fs_state(pipe, clear_fs);
+   pipe->delete_fs_state(pipe, typed_fs);
+   struct pipe_framebuffer_state none = {0};
+   pipe->set_framebuffer_state(pipe, &none);
+   for (unsigned rt = 0; rt < 8; ++rt)
+      pipe_resource_reference(&targets[rt], NULL);
 }
 
 int
@@ -213,6 +379,8 @@ main(void)
    /* Back to the single-sample attachments: resident again. */
    bind_targets(pipe, targets, NR_CBUFS);
    CHECK(agx_g17g_mrt_resident(ctx));
+
+   check_mixed_masked(screen, pipe);
 
    pipe->bind_vs_state(pipe, NULL);
    pipe->bind_fs_state(pipe, NULL);

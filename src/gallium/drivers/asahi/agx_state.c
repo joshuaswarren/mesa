@@ -6178,6 +6178,23 @@ agx_build_meta_shader_internal(struct agx_context *ctx,
       data_size == sizeof(struct agx_fs_epilog_key) &&
       ((const struct agx_fs_epilog_key *)data)->g18_native_mixed;
 
+   /* The compiler orders a fragment epilog's tile loads and stores by the
+    * framebuffer's tile partitions, which it takes from the epilog key
+    * (agx_compile_nir_tile). An M5 batch that keeps every colour attachment
+    * in the tile (agx_g17g_mrt_resident) stores each through its own
+    * partition. Its single-sample epilog needs the partitions as well:
+    * without them, an epilog that leaves the attachment at byte 0 alone (a
+    * masked attachment or a clear of another one) cannot be ordered and the
+    * whole fragment program is refused. The epilog that keeps only
+    * attachment 0 in the tile (rt0_resident) has a single partition.
+    */
+   const struct agx_fs_epilog_key *fs_epilog = NULL;
+   if (builder == build_g17p_fs_epilog)
+      fs_epilog = data;
+   else if (builder == agx_nir_fs_epilog && agx_chip_g17_m5(dev->chip) &&
+            !((const struct agx_fs_epilog_key *)data)->rt0_resident)
+      fs_epilog = data;
+
    struct agx_compiled_shader *shader = agx_compile_nir_tile(
       dev, b.shader, NULL,
       dev->chip == AGX_CHIP_G18G ? MESA_SHADER_COMPUTE : b.shader->info.stage,
@@ -6185,8 +6202,8 @@ agx_build_meta_shader_internal(struct agx_context *ctx,
       !prolog && !(!agx_chip_native_agx3(dev->chip) &&
                    b.shader->info.stage == MESA_SHADER_FRAGMENT &&
                    b.shader->info.fs.uses_sample_shading),
-      prolog || epilog, cf_base, compile_samples,
-      builder == build_g17p_fs_epilog ? data : NULL, NULL, g18_native_mixed);
+      prolog || epilog, cf_base, compile_samples, fs_epilog, NULL,
+      g18_native_mixed);
 
    ralloc_free(b.shader);
 
