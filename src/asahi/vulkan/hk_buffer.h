@@ -19,6 +19,9 @@ struct hk_physical_device;
 struct hk_buffer {
    struct vk_buffer vk;
 
+   uint32_t storage_backing_handle;
+   uint64_t storage_backing_offset;
+
    /** Reserved VA for sparse buffers, NULL otherwise. */
    struct agx_va *va;
 

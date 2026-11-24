@@ -493,8 +493,8 @@ typedef struct {
    /* NIR permits either sign for a zero result of this floating add. */
    bool no_signed_zero : 1;
 
-   /* M5 FCMPSEL: a selected immediate is a minifloat (native fself32), not
-    * raw integer bits. */
+   /* FCMPSEL: a selected immediate was folded as a minifloat by the optimizer
+    * (AGX3C 32-bit fself or AGX3B tied min/max), rather than raw integer bits. */
    bool fcmpsel_minifloat_select : 1;
 
    /* Output modifiers */
@@ -608,6 +608,15 @@ typedef struct agx_block {
    /** Available for passes to use for metadata */
    uint8_t pass_flags;
 } agx_block;
+
+/* How the AGX3 packer lets a loop's breaks leave it (agx3_slot_core.h). */
+enum agx3_break_joins {
+   /* Join a break's state into its loop's pop where that gains something
+    * (agx3_break_keeps_state()), drain it otherwise. */
+   AGX3_BREAKS_JOIN_GAINFUL = 0,
+   AGX3_BREAKS_JOIN_ALL,
+   AGX3_BREAKS_DRAIN,
+};
 
 typedef struct {
    nir_shader *nir;
@@ -742,11 +751,35 @@ typedef struct {
     * how far its texture reads reached and how many halves the outputs and
     * any image-write bank need above them. */
    unsigned agx3_g18g_output_staging_floor;
+
+   /* Pack with a scoreboard drain at every control-flow boundary, as the
+    * retry when keeping results in flight into if arms leaves a wait no
+    * instruction form can carry (agx3_pack_program()). */
+   bool agx3_cf_drain_all;
+   /* Pack with a drain at every loop entry, and what the last pack did:
+    * how many loop entries kept results in flight, and how many wait
+    * carriers it emitted inside loops (agx3_pack_program()). */
+   bool agx3_loop_entry_drain_all;
+   unsigned agx3_kept_loop_entries;
+   unsigned agx3_loop_carriers;
+   /* Pack with an if's arms draining at their ends instead of joining, and
+    * how many arm ends of the last pack the join kept from draining
+    * (agx3_pack_program()). */
+   bool agx3_arm_join_off;
+   unsigned agx3_joined_arm_drains;
+   /* How a pack's breaks leave their loops (enum agx3_break_joins), and of
+    * the last pack how many breaks a join kept from draining something and
+    * how many joining breaks drain because joining gained nothing
+    * (agx3_pack_program()). */
+   uint8_t agx3_break_joins;
+   unsigned agx3_joined_breaks;
+   unsigned agx3_refused_breaks;
    unsigned agx3_g18g_read_staging_end;
    unsigned agx3_g18g_output_staging_span;
    bool agx3_staging_known;
    bool agx3_fltnorm_start;
    bool agx3_mrt_tile_ops_ordered;
+   bool agx3_local_read_tile_ops;
    /* The packer emitted this fragment's tile accesses through the native1130
     * mixed-format protocol, inside its 0x200 entry and final release (run
     * 1139); its reads then take the long LLDCol form. */
@@ -1471,6 +1504,29 @@ agx_is_float_src(const agx_instr *I, unsigned s)
    return info.is_float || (s < 2 && fcmp);
 }
 
+/* Whether an FCMPSEL is a fully tied minNum/maxNum pattern:
+ * (a LTN b) ? a : b or (a GTN b) ? a : b, with identical sizes, modifiers,
+ * and memory flags on each compare/select pair. */
+static inline bool
+agx_fcmpsel_is_tied_minmax(const agx_instr *I)
+{
+   if (I->op != AGX_OPCODE_FCMPSEL || I->nr_srcs != 4 || I->invert_cond ||
+       I->saturate ||
+       (I->fcond != AGX_FCOND_GTN && I->fcond != AGX_FCOND_LTN))
+      return false;
+
+   /* agx_is_equiv() ignores modifiers, and a modifier on one half of a tie
+    * would make the two operands different values. Require them identical. */
+   for (unsigned i = 0; i < 2; ++i) {
+      const agx_index a = I->src[i], b = I->src[i + 2];
+      if (!agx_is_equiv(a, b) || a.size != b.size || a.abs != b.abs ||
+          a.neg != b.neg || a.memory != b.memory)
+         return false;
+   }
+
+   return true;
+}
+
 /* The M5 select with a uniform first comparand that native G17G
  * fragments use (agx3_alu_fcmp_select32_gpu1 cmp0_uniform): a 32-bit
  * result choosing a zero immediate or a 32-bit register after comparing an
@@ -1607,6 +1663,7 @@ bool agx_nir_lower_shared_bitsize(nir_shader *shader, bool element_indices);
 bool agx_nir_lower_frag_sidefx(nir_shader *s, bool g17p);
 void agx_lower_agx3_fma_sources(agx_context *ctx);
 void agx_lower_agx3_half_converts(agx_context *ctx);
+void agx_opt_agx3_normflt_byte_pairs(agx_context *ctx);
 void agx_materialize_agx3_alu_constants(agx_context *ctx);
 void agx_lower_agx3_mixed_width_unary(agx_context *ctx);
 bool agx_lower_g17g_retry_float_operands(agx_context *ctx);

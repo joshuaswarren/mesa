@@ -2,22 +2,13 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * VK_KHR_ray_tracing_pipeline for Honeykrisp on G17P.
+ * VK_KHR_ray_tracing_pipeline for Borealis.
  *
- * The whole pipeline compiles to ONE compute shader.  Every stage the
- * application supplies is inlined into it as a NIR function, traceRayEXT
- * becomes an inlined copy of the software traversal that VK_KHR_ray_query
- * already uses, and the shader binding table selects between the inlined
- * copies with a comparison on the group index.  There is no indirect shader
- * call, no resume shader and no shader-call stack: recursion is bounded by
- * maxPipelineRayRecursionDepth at compile time and unrolled.  Pipelines deeper
- * than HK_RT_INLINE_MAX_RAY_RECURSION_DEPTH instead split their stages at
- * every call and run them as continuations from one scheduler loop, with
+ * Stages compile into compute shader(s) with SBT dispatch lowered to group
+ * index switches (AGX3 has no command-stream indirect branch). Pipelines up to
+ * HK_RT_INLINE_MAX_RAY_RECURSION_DEPTH inline and unroll recursion; deeper
+ * pipelines split stages into continuations driven by a scheduler loop with
  * return records on the invocation's scratch stack.
- *
- * This is the shape lavapipe uses, and it is used here for the same reason:
- * the AGX3 backend has no way to branch to an address the command stream
- * supplies, so a real shader-binding-table dispatch is not expressible today.
  */
 
 #ifndef HK_RAY_TRACING_PIPELINE_H

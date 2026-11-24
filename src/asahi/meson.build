@@ -123,6 +123,26 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # HAL200 2x/4x depth compression with zink's feedback-loop usage and
+  # sample-location flag, through vkCreateImage and the host-copy query.
+  foreach chip : ['g17p', 'g16g']
+    test(
+      'hk-' + chip + '-msaa-depth-compression',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hal200_vulkan_msaa_depth_compression,
+      ] + (chip == 'g17p' ? ['--expect-1x-compressed'] : []),
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
+
   # AGX3 multi-draw indirect recording fast path across HAL200, G15 and
   # HAL300/M5 (fixed loader reuse, dynamic DRAW_PARAMS/DRAW_ID relocs,
   # robust-index batching, empty draws, VDM chunk rollover and Ioto growth).
@@ -294,6 +314,28 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
       'ASAHI_SHIM_G17P_EXPECT_COMPUTE=1',
       'ASAHI_SHIM_G17P_EXPECT_BACK_TO_BACK=1',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  # An indirect tessellated draw is not batched: its tessellation launches
+  # are indirect precompiled dispatches that ask for AGX_BARRIER_ALL, so each
+  # must end in the strong cache flush its consumer relies on.
+  test(
+    'hk-g17p-tess-indirect-stream',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim, vulkan_tess_batch_order, '--shim', '--indirect',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_COMPUTE=1',
+      'ASAHI_SHIM_G17P_EXPECT_STRONG_INDIRECT_COMPUTE_BARRIER=1',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
     depends : [_dev_icd, libvulkan_asahi],

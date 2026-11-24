@@ -29,12 +29,19 @@ extern "C" {
  * needs_full_quads, to 39 when G17P payloads record the fragment
  * twins of unlinked mesh shaders, to 42 when unlinked G17P vertex
  * shaders over the canonical size carry relocatable varying writes, to 43
- * when agx_shader_info gains launch_size, and to 44 when unlinked G17P vertex
- * shaders drop the canonical layout for the relocatable one. */
-#define HK_AGX3_SHADER_BINARY_VERSION 45u
-#define HK_CLASSIC_SHADER_BINARY_VERSION 35u
-/* AGX2 binaries include attachmentless layer-zero root lowering and fs.reads_layer. */
-#define HK_AGX2_SHADER_BINARY_VERSION 37u
+ * when agx_shader_info gains launch_size, to 44 when unlinked G17P vertex
+ * shaders drop the canonical layout for the relocatable one, to 45 for
+ * attachmentless layer-zero root lowering and fs.reads_layer, to 46 when
+ * AGX3 fragment binaries carry on-chip local_read NIR payloads, to 47
+ * when agx_shader_info gains AGX3 vertex preamble hoist metadata and
+ * vertex binaries may carry extracted preamble NIR, to 48 when
+ * hk_shader_info.vs records per-pipeline vertex input robustness, and to 49
+ * when compute shaders carry packed vec4 alternates. */
+#define HK_AGX3_SHADER_BINARY_VERSION 49u
+#define HK_CLASSIC_SHADER_BINARY_VERSION 37u
+/* AGX2 binaries include attachmentless layer-zero root lowering, fs.reads_layer,
+ * and per-pipeline vertex input robustness in hk_shader_info.vs. */
+#define HK_AGX2_SHADER_BINARY_VERSION 38u
 
 static inline uint32_t
 hk_shader_binary_version(enum agx_chip chip)

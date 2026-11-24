@@ -384,6 +384,9 @@ struct agx_uncompiled_shader {
       uint64_t inputs_linear_shaded;
       /* Every varying slot a fragment shader reads. */
       uint64_t inputs_read;
+      /* Samplers whose LOD bias the shader adds itself (nir_lower_tex's
+       * sampler bias lowering), through a direct lod_bias query. */
+      uint32_t lod_bias_samplers;
       uint8_t cull_distance_size;
       bool has_edgeflags;
       bool uses_fbfetch;
@@ -394,6 +397,8 @@ struct agx_uncompiled_shader {
       bool uses_buffer_textures;
       bool uses_query_lod;
       bool writes_memory;
+      /* A vertex or tessellation evaluation shader that writes gl_Layer. */
+      bool writes_layer;
       /* API output, excluding synthetic early depth/stencil mask updates. */
       bool writes_api_sample_mask;
 
@@ -601,6 +606,14 @@ struct agx_batch {
    struct agx_compiled_shader *g17p_fragment_shader;
    struct agx_linked_shader *g17p_fragment_linked;
 
+   /* HAL200 VDM bind-tail and vertex-state tracking for the current VDM chunk.
+    * Reset on a new batch and whenever a VDM STREAM_LINK starts a new chunk. */
+   bool g17p_bind_tail_latched;
+   bool g17p_have_latched_vs;
+   const struct agx_compiled_shader *g17p_latched_vs_shader;
+   uint32_t g17p_latched_vs_word0;
+   uint32_t g17p_latched_vs_outputs[2];
+
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;
    /* G17G: this render holds the output of a tessellation stage and keeps
@@ -616,6 +629,13 @@ struct agx_batch {
    /* Only a loader-provided resolve may seed the multisample tile reload. */
    bool g17p_resolve_reload;
    bool g17p_resolve_preserve;
+   bool g17p_resolve_blit_attached;
+
+   /* M5: every colour attachment of this multi-attachment batch stays in the
+    * tilebuffer, moved by the multi-target tile programs
+    * (agx_g17g_mrt_resident). Otherwise attachment 0 alone does and the
+    * others are spilled (agx_g17g_mrt_one_pass). */
+   bool g17g_mrt_resident;
 
    /* Set when a descriptor or state in this batch has no proven native
     * encoding on the current chip. Nothing from the batch may reach the
@@ -836,7 +856,10 @@ struct asahi_fs_shader_key {
    /* G17G: keep colour output g17g_mrt_output - 1 alone, at location 0
     * (agx_g17g_split_mrt). Zero keeps every output. */
    uint8_t g17g_mrt_output;
-   bool padding[5];
+   bool padding;
+   /* Samplers among agx_uncompiled_shader::info.lod_bias_samplers whose
+    * LOD bias is zero, compiled with that bias as a constant. */
+   uint32_t zero_lod_bias;
 };
 static_assert(sizeof(struct asahi_fs_shader_key) == 40, "no holes");
 
@@ -927,6 +950,9 @@ DERIVE_HASH_TABLE(asahi_blit_key);
 struct asahi_blitter {
    bool active;
    struct hash_table *blit_cs;
+
+   /* Compressed mip-level compute shaders, by enum agx_g17p_mip_key */
+   void *g17p_mip_cs[32];
 
    /* [filter] */
    void *sampler[2];
@@ -1080,6 +1106,10 @@ struct agx_context {
    /* Whether the bound framebuffer's spilled attachments can be described
     * (agx_g17g_mrt_spills_encodable), once it has been worked out. */
    bool g17g_mrt_spills_known, g17g_mrt_spills_ok;
+
+   /* Whether the bound framebuffer keeps every colour attachment in the
+    * tilebuffer (agx_g17g_mrt_resident), once it has been worked out. */
+   bool g17g_mrt_resident_known, g17g_mrt_resident_ok;
 
    /* G17G renders one layer at a time (agx_g17g_bind_layer): while a draw
     * or clear of a layered framebuffer is split, the bound framebuffer holds
@@ -1266,6 +1296,9 @@ void agx_launch(struct agx_batch *batch, struct agx_grid grid,
                 struct agx_linked_shader *linked, mesa_shader_stage stage,
                 unsigned variable_shared_mem, uint64_t indirect_num_workgroups);
 
+bool agx_precomp_launchable(struct agx_context *ctx,
+                            enum libagx_program program);
+
 void agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
                         enum agx_barrier barrier, enum libagx_program program,
                         void *args, size_t arg_size);
@@ -1329,6 +1362,7 @@ void agx_g17g_split_mrt_clear(struct agx_context *ctx, unsigned buffers,
                               uint8_t stencil_clear_mask,
                               const union pipe_color_union *color,
                               double depth, unsigned stencil);
+bool agx_g17g_mrt_resident(struct agx_context *ctx);
 
 static inline void
 agx_dirty_all(struct agx_context *ctx)
@@ -1464,6 +1498,18 @@ struct agx_resource {
 
    BITSET_DECLARE(data_valid, PIPE_MAX_TEXTURE_LEVELS);
 
+   /* Levels whose data_valid bit was cleared by agx_invalidate_resource().
+    * Kept per-level so agx_prepare_for_map() still synchronizes against any
+    * in-flight GPU batch referencing bo, while a subsequent GPU or CPU write
+    * (agx_resource_set_valid()) clears the level bit and shadowing or syncing
+    * all referencing batches zeroes the set.
+    *
+    * Invariant: data_valid and invalidated_levels are disjoint; a level bit
+    * is set here only when agx_invalidate_resource() cleared a previously
+    * valid level without shadowing or syncing bo.
+    */
+   BITSET_DECLARE(invalidated_levels, PIPE_MAX_TEXTURE_LEVELS);
+
    struct ail_layout layout;
 
    /* Metal does not support packed depth/stencil formats; presumably AGX does
@@ -1573,6 +1619,13 @@ agx_resource_valid(struct agx_resource *rsrc, int level)
    return BITSET_TEST(rsrc->data_valid, level);
 }
 
+static inline void
+agx_resource_set_valid(struct agx_resource *rsrc, unsigned level)
+{
+   BITSET_SET(rsrc->data_valid, level);
+   BITSET_CLEAR(rsrc->invalidated_levels, level);
+}
+
 static inline void *
 agx_map_texture_cpu(struct agx_resource *rsrc, unsigned level, unsigned z)
 {
@@ -1591,6 +1644,37 @@ agx_map_texture_gpu(struct agx_resource *rsrc, unsigned z)
 {
    return agx_map_gpu(rsrc) +
           (uint64_t)ail_get_layer_offset_B(&rsrc->layout, z);
+}
+
+static inline bool
+agx_mdi_subdraw_offset(const struct pipe_draw_indirect_info *indirect,
+                       unsigned draw_index, uint32_t arg_size_B,
+                       uint32_t *offset_out)
+{
+   assert(indirect && indirect->buffer && offset_out);
+
+   const uint64_t buf_size = indirect->buffer->width0;
+   const uint64_t base_offset = indirect->offset;
+   const uint64_t stride = indirect->stride;
+
+   if ((base_offset & 3u) || (stride & 3u) ||
+       base_offset > buf_size || arg_size_B > buf_size - base_offset)
+      return false;
+
+   /* Widen and bound the delta against both the 32-bit
+    * pipe_draw_indirect_info::offset field and the indirect buffer size
+    * before multiplying draw_index * stride. */
+   const uint64_t max_delta =
+      MIN2((uint64_t)UINT32_MAX - base_offset,
+           buf_size - arg_size_B - base_offset);
+   if (stride && (uint64_t)draw_index > max_delta / stride)
+      return false;
+
+   const uint64_t sub_offset = base_offset + (uint64_t)draw_index * stride;
+   assert(sub_offset <= UINT32_MAX &&
+          sub_offset <= buf_size - arg_size_B);
+   *offset_out = (uint32_t)sub_offset;
+   return true;
 }
 
 void agx_decompress(struct agx_context *ctx, struct agx_resource *rsrc,
@@ -1656,6 +1740,8 @@ struct agx_lower_bindings_options {
 
 bool agx_nir_lower_bindings(nir_shader *shader,
                        struct agx_lower_bindings_options *options);
+uint32_t agx_lod_bias_samplers(nir_shader *nir);
+bool agx_nir_fold_zero_lod_bias(nir_shader *nir, uint32_t zero_lod_bias);
 bool agx_nir_lower_custom_border_g17p(nir_shader *shader, bool shadow_gather);
 /* As agx_nir_lower_custom_border_g17p; g18 selects G18G's shadow border
  * emulation and reports shadow operations it cannot emulate. */
@@ -1756,6 +1842,7 @@ void agx_batch_queue_or_submit(struct agx_context *ctx, struct agx_batch *batch,
 void agx_submit_pending(struct agx_context *ctx);
 
 void agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch);
+bool agx_try_fast_clear_batch(struct agx_context *ctx, struct agx_batch *batch);
 void agx_flush_batch_for_reason(struct agx_context *ctx,
                                 struct agx_batch *batch, const char *reason);
 void agx_flush_all(struct agx_context *ctx, const char *reason);
@@ -1856,6 +1943,9 @@ bool agx_generate_mipmap_agx3_supported(const struct agx_device *dev,
                                         unsigned first_layer,
                                         unsigned last_layer);
 
+bool agx_g17p_compressed_mip_chain_allowed(const struct agx_device *dev,
+                                           const struct pipe_resource *templ);
+
 bool agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
                          enum pipe_format format, unsigned base_level,
                          unsigned last_level, unsigned first_layer,
@@ -1875,6 +1965,8 @@ void agx_copy_buffer_range(struct pipe_context *pctx, struct pipe_resource *dst,
 
 struct agx_encoder agx_encoder_allocate(struct agx_batch *batch,
                                         struct agx_device *dev);
+
+void agx_encoder_cleanup(struct agx_device *dev, struct agx_encoder *encoder);
 
 uint64_t agx_batch_get_g17p_vdm_alias(struct agx_batch *batch,
                                       struct agx_bo *bo, uint64_t address);

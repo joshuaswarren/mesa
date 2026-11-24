@@ -5,6 +5,7 @@
 
 #include "agx_ioto_state_core.h"
 
+#include "agx_bytes.h"
 #include "agx_ioto_core.h"
 
 #include <stdlib.h>
@@ -526,13 +527,10 @@ agx_ioto_g17p_compiler_ldshdr_pack(
       (uint16_t)(((shader_va >> 47) & 1) |
                  ((uint16_t)agx_ioto_e4[fetch_span] << 1)),
    };
-   uint8_t staged[AGX_IOTO_LDSHDR_SIZE];
-   for (unsigned i = 0; i < 5; ++i) {
-      staged[2 * i] = (uint8_t)words[i];
-      staged[2 * i + 1] = (uint8_t)(words[i] >> 8);
-   }
+   uint8_t *dst = output;
+   for (unsigned i = 0; i < 5; ++i)
+      agx_store_le16(&dst[2 * i], words[i]);
 
-   memcpy(output, staged, sizeof(staged));
    return true;
 }
 
@@ -659,13 +657,10 @@ agx_ioto_g17p_compiler_spectpr_pack(
                  ((spill_quads & 0x3f) << 10)),
       (uint16_t)((spill_quads >> 6) & 0x3ff),
    };
-   uint8_t staged[AGX_IOTO_SPECTPR_SIZE];
-   for (unsigned i = 0; i < 5; ++i) {
-      staged[2 * i] = (uint8_t)words[i];
-      staged[2 * i + 1] = (uint8_t)(words[i] >> 8);
-   }
+   uint8_t *dst = output;
+   for (unsigned i = 0; i < 5; ++i)
+      agx_store_le16(&dst[2 * i], words[i]);
 
-   memcpy(output, staged, sizeof(staged));
    return true;
 }
 

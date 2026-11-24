@@ -1032,16 +1032,29 @@ TEST(NativeForms, NegatedSqrtStepReachesPacker)
    }
 }
 
-TEST(NativeForms, G17PHalfSqrtStepAcceptsLastUse)
+/* A last-use or unhinted half feeding the square-root step encodes as the
+ * retained form on both G17P and M5. The M5 packer used to pass the source's
+ * own hint through, and refused `srsqrt d32, h16.discard`. */
+TEST(NativeForms, HalfSqrtStepAcceptsLastUse)
 {
-   for (agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G16G}) {
+   static const struct {
+      agx_isa_encoding encoding;
+      agx_chip chip;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S},
+   };
+   for (const auto &target : targets) {
+      const agx_chip chip = target.chip;
+      const bool m5 = target.encoding == AGX_ISA_ENCODING_AGX3C;
       for (unsigned hint : {0u, 1u, 2u}) {
          SCOPED_TRACE(chip);
          SCOPED_TRACE(hint);
          void *mem = ralloc_context(NULL);
          agx_builder *b = agx_test_builder(mem);
          agx_shader_key key = {};
-         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.encoding = target.encoding;
          key.dev.chip = chip;
          b->shader->key = &key;
          b->shader->stage = MESA_SHADER_COMPUTE;
@@ -1053,13 +1066,16 @@ TEST(NativeForms, G17PHalfSqrtStepAcceptsLastUse)
          agx_stop(b);
          util_dynarray binary;
          util_dynarray_init(&binary, mem);
-         ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+         const bool packed = agx3_pack_binary(b->shader, &binary);
+         EXPECT_TRUE(packed) << agx3_last_pack_refusal();
          uint8_t expected[AGX3_ALU_MAX_LENGTH], length;
          ASSERT_TRUE(agx3_alu_sqrt_step_half(
-            AGX_ISA_ENCODING_AGX3B, 4, 3, AGX3_ALU_HINT_CACHE, true, 0,
+            target.encoding, 4, 3, AGX3_ALU_HINT_CACHE, !m5, 0,
             expected, &length));
-         ASSERT_GE(binary.size, length);
-         EXPECT_EQ(memcmp(binary.data, expected, length), 0);
+         if (packed) {
+            ASSERT_GE(binary.size, length);
+            EXPECT_EQ(memcmp(binary.data, expected, length), 0);
+         }
          util_dynarray_fini(&binary);
          ralloc_free(mem);
       }
@@ -2347,52 +2363,65 @@ TEST(NativeForms, EndOfTilePreservesSamplesAndResolvesSameTile)
    /* Both outputs read offset zero. Their descriptors are distinct, and
     * only the second descriptor names a single-sample image. Keep all four
     * dimension combinations as controls; no host check establishes pixels. */
-   for (unsigned resolves = 0; resolves < 4; ++resolves) {
-      SCOPED_TRACE(resolves);
-      nir_builder b = nir_builder_init_simple_shader(
-         MESA_SHADER_COMPUTE, &agx_nir_options, "EOT store and resolve");
-      nir_def *xy = nir_trim_vector(&b, nir_load_global_invocation_id(&b, 32), 2);
-      for (unsigned pbe = 0; pbe < 2; ++pbe) {
-         nir_intrinsic_instr *intr = nir_image_store_block_agx(
-            &b, nir_imm_intN_t(&b, pbe, 16), nir_imm_int(&b, 0), xy);
-         nir_intrinsic_set_format(intr, (enum pipe_format)AIL_ISA_FORMAT_U8NORM);
-         nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_2D);
-         nir_intrinsic_set_image_array(intr, false);
-         nir_intrinsic_set_explicit_coord(intr, true);
-      }
-      agx_shader_key key = {};
-      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-      key.dev.chip = AGX_CHIP_G17P;
-      key.no_preamble = true;
-      key.g17p_rt0_eot_multisample = true;
-      key.g17p_mrt_eot_count = 2;
-      key.g17p_mrt_eot_resolve_mask = resolves;
-      key.g17p_mrt_eot_selectors[0] = 0x75;
-      key.g17p_mrt_eot_selectors[1] = 0x75;
-      agx_preprocess_nir(b.shader);
-      agx_shader_part part = {};
-      bool ok = agx_compile_shader_nir(b.shader, &key, &part);
-      EXPECT_TRUE(ok);
-      if (ok) {
-         EXPECT_EQ(part.info.binary_size, 120u);
-         EXPECT_EQ(part.info.main_size, 120u);
-         EXPECT_TRUE(part.info.agx3_staging_known);
-         EXPECT_EQ(part.info.agx3_staging_halfs, 16u);
-         if (part.info.binary_size == 120) {
-            const uint8_t *code = static_cast<const uint8_t *>(part.binary);
-            /* Native single-target MS and SS dimension fields, independently
-             * selected for each store of the existing dual-target program. */
-            for (unsigned pbe = 0; pbe < 2; ++pbe) {
-               bool ms = !(resolves & (1u << pbe));
-               EXPECT_EQ(code[pbe ? 63 : 43],
-                         (pbe ? 0x0c : 0x04) | (ms ? 0x02 : 0x00));
-               EXPECT_EQ(code[92 + 12 * pbe + 8], ms ? 0x28 : 0xa8);
-               EXPECT_EQ(code[92 + 12 * pbe + 9], ms ? 0x72 : 0x75);
+   static const struct {
+      uint8_t selector;
+      enum ail_isa_format format;
+   } cases[] = {
+      {0x75, AIL_ISA_FORMAT_U8NORM},
+      {0x15, AIL_ISA_FORMAT_F16},
+      {0x95, AIL_ISA_FORMAT_U16NORM},
+   };
+   for (const auto &c : cases) {
+      const uint8_t base_sel = c.selector;
+      SCOPED_TRACE(static_cast<unsigned>(base_sel));
+      for (unsigned resolves = 0; resolves < 4; ++resolves) {
+         SCOPED_TRACE(resolves);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "EOT store and resolve");
+         nir_def *xy = nir_trim_vector(&b, nir_load_global_invocation_id(&b, 32), 2);
+         for (unsigned pbe = 0; pbe < 2; ++pbe) {
+            nir_intrinsic_instr *intr = nir_image_store_block_agx(
+               &b, nir_imm_intN_t(&b, pbe, 16), nir_imm_int(&b, 0), xy);
+            nir_intrinsic_set_format(intr, (enum pipe_format)c.format);
+            nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_2D);
+            nir_intrinsic_set_image_array(intr, false);
+            nir_intrinsic_set_explicit_coord(intr, true);
+         }
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = AGX_CHIP_G17P;
+         key.no_preamble = true;
+         key.g17p_rt0_eot_multisample = true;
+         key.g17p_mrt_eot_count = 2;
+         key.g17p_mrt_eot_resolve_mask = resolves;
+         key.g17p_mrt_eot_selectors[0] = base_sel;
+         key.g17p_mrt_eot_selectors[1] = base_sel;
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         bool ok = agx_compile_shader_nir(b.shader, &key, &part);
+         EXPECT_TRUE(ok);
+         if (ok) {
+            EXPECT_EQ(part.info.binary_size, 120u);
+            EXPECT_EQ(part.info.main_size, 120u);
+            EXPECT_TRUE(part.info.agx3_staging_known);
+            EXPECT_EQ(part.info.agx3_staging_halfs, 16u);
+            if (part.info.binary_size == 120) {
+               const uint8_t *code = static_cast<const uint8_t *>(part.binary);
+               /* Native single-target MS and SS dimension fields, independently
+                * selected for each store of the existing dual-target program. */
+               for (unsigned pbe = 0; pbe < 2; ++pbe) {
+                  bool ms = !(resolves & (1u << pbe));
+                  EXPECT_EQ(code[pbe ? 63 : 43],
+                            (pbe ? 0x0c : 0x04) | (ms ? 0x02 : 0x00));
+                  EXPECT_EQ(code[92 + 12 * pbe + 8], ms ? 0x28 : 0xa8);
+                  EXPECT_EQ(code[92 + 12 * pbe + 9],
+                            ms ? ((base_sel & 0xf0) | 0x02) : base_sel);
+               }
             }
          }
+         free(part.binary);
+         ralloc_free(b.shader);
       }
-      free(part.binary);
-      ralloc_free(b.shader);
    }
 }
 
@@ -6659,64 +6688,101 @@ TEST(NativeForms, M5OrSelectTracksVectorConversionComponent)
    }
 }
 
-TEST(NativeForms, G17PHalfImmediateMultiplyReachesPacker)
+TEST(NativeForms, AGX3HalfImmediateMultiplyReachesPacker)
 {
-   for (unsigned multiplier : {6u, 7u, 9u, 11u, 17u, 255u}) {
-      for (bool constant_first : {false, true}) {
-         SCOPED_TRACE(multiplier);
-         SCOPED_TRACE(constant_first);
-         void *mem = ralloc_context(NULL);
-         agx_builder *b = agx_test_builder(mem);
-         agx_shader_key key = {};
-         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-         key.dev.chip = AGX_CHIP_G17P;
-         b->shader->key = &key;
-         b->shader->stage = MESA_SHADER_COMPUTE;
-         b->shader->max_reg = 15;
-         agx_index input = agx_register(2, AGX_SIZE_16);
-         agx_index imm = agx_immediate(multiplier);
-         agx_instr *mul = agx_imad_to(
-            b, agx_register(4, AGX_SIZE_16), constant_first ? imm : input,
-            constant_first ? input : imm, agx_zero(), 0);
-         agx_materialize_agx3_alu_constants(b->shader);
-         ASSERT_TRUE(agx_is_equiv(mul->src[0], input));
-         ASSERT_EQ(mul->src[1].type, AGX_INDEX_NORMAL);
-         agx_instr *constant = NULL;
-         agx_foreach_instr_global(b->shader, I) {
-            if (I->nr_dests && agx_is_equiv(I->dest[0], mul->src[1]))
-               constant = I;
+   const struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+      bool emit_agx3d;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true},
+   };
+   for (const auto &target : targets) {
+      for (unsigned multiplier : {6u, 7u, 9u, 11u, 17u, 255u}) {
+         for (bool constant_first : {false, true}) {
+            SCOPED_TRACE(target.chip);
+            SCOPED_TRACE(multiplier);
+            SCOPED_TRACE(constant_first);
+            void *mem = ralloc_context(NULL);
+            agx_builder *b = agx_test_builder(mem);
+            agx_shader_key key = {};
+            key.dev.encoding = target.encoding;
+            key.dev.chip = target.chip;
+            key.dev.emit_agx3d = target.emit_agx3d;
+            b->shader->key = &key;
+            b->shader->stage = MESA_SHADER_COMPUTE;
+            b->shader->max_reg = 15;
+            agx_index input = agx_register(2, AGX_SIZE_16);
+            agx_index imm = agx_immediate(multiplier);
+            agx_instr *mul = agx_imad_to(
+               b, agx_register(4, AGX_SIZE_16), constant_first ? imm : input,
+               constant_first ? input : imm, agx_zero(), 0);
+            agx_materialize_agx3_alu_constants(b->shader);
+            ASSERT_TRUE(agx_is_equiv(mul->src[0], input));
+            ASSERT_EQ(mul->src[1].type, AGX_INDEX_NORMAL);
+            agx_instr *constant = NULL;
+            agx_foreach_instr_global(b->shader, I) {
+               if (I->nr_dests && agx_is_equiv(I->dest[0], mul->src[1]))
+                  constant = I;
+            }
+            ASSERT_NE(constant, nullptr);
+            ASSERT_EQ(constant->op, AGX_OPCODE_MOV_IMM);
+            EXPECT_EQ(constant->imm, multiplier);
+            EXPECT_EQ(constant->dest[0].size, AGX_SIZE_16);
+            /* Stand in for allocation, then check the real register-multiply
+             * encoding rather than accepting only a change in the IR. */
+            constant->dest[0] = agx_register(6, AGX_SIZE_16);
+            mul->src[1] = constant->dest[0];
+            agx_stop(b);
+            util_dynarray binary;
+            util_dynarray_init(&binary, mem);
+            EXPECT_TRUE(agx3_pack_binary(b->shader, &binary));
+            util_dynarray_fini(&binary);
+            ralloc_free(mem);
          }
-         ASSERT_NE(constant, nullptr);
-         ASSERT_EQ(constant->op, AGX_OPCODE_MOV_IMM);
-         EXPECT_EQ(constant->imm, multiplier);
-         EXPECT_EQ(constant->dest[0].size, AGX_SIZE_16);
-         /* Stand in for allocation, then check the real register-multiply
-          * encoding rather than accepting only a change in the IR. */
-         constant->dest[0] = agx_register(6, AGX_SIZE_16);
-         mul->src[1] = constant->dest[0];
-         agx_stop(b);
-         util_dynarray binary;
-         util_dynarray_init(&binary, mem);
-         EXPECT_TRUE(agx3_pack_binary(b->shader, &binary));
-         util_dynarray_fini(&binary);
-         ralloc_free(mem);
       }
+   }
+
+   /* Also verify explicit AGX_ISA_ENCODING_AGX3D materializes the pure half
+    * immediate multiply before reaching the G18G encoder. */
+   {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3D;
+      key.dev.chip = AGX_CHIP_G18G;
+      b->shader->key = &key;
+      agx_instr *mul = agx_imad_to(b, agx_register(4, AGX_SIZE_16),
+                                   agx_register(2, AGX_SIZE_16),
+                                   agx_immediate(7), agx_zero(), 0);
+      agx_materialize_agx3_alu_constants(b->shader);
+      EXPECT_EQ(mul->src[1].type, AGX_INDEX_NORMAL);
+      ralloc_free(mem);
    }
 }
 
 TEST(NativeForms, HalfMultiplyMaterializationPreservesOtherDomains)
 {
-   for (unsigned control = 0; control < 3; ++control) {
+   for (unsigned control = 0; control < 5; ++control) {
       void *mem = ralloc_context(NULL);
       agx_builder *b = agx_test_builder(mem);
       agx_shader_key key = {};
-      key.dev.encoding = control == 0 ? AGX_ISA_ENCODING_AGX2 : AGX_ISA_ENCODING_AGX3B;
-      key.dev.chip = control == 0 ? AGX_CHIP_G13G : AGX_CHIP_G17P;
+      key.dev.encoding = control == 0
+                            ? AGX_ISA_ENCODING_AGX2
+                            : (control < 3 ? AGX_ISA_ENCODING_AGX3B
+                                           : AGX_ISA_ENCODING_AGX3C);
+      key.dev.chip = control == 0
+                        ? AGX_CHIP_G13G
+                        : (control < 3 ? AGX_CHIP_G17P : AGX_CHIP_G17S);
       b->shader->key = &key;
-      agx_size size = control == 1 ? AGX_SIZE_32 : AGX_SIZE_16;
-      agx_instr *mul = agx_imad_to(b, agx_register(4, size),
-         agx_register(2, size), agx_immediate(7),
-         control == 2 ? agx_immediate(1) : agx_zero(), 0);
+      agx_size size = (control == 1 || control == 3) ? AGX_SIZE_32 : AGX_SIZE_16;
+      agx_instr *mul = agx_imad_to(
+         b, agx_register(4, size), agx_register(2, size), agx_immediate(7),
+         (control == 2 || control == 4) ? agx_immediate(1) : agx_zero(), 0);
       agx_materialize_agx3_alu_constants(b->shader);
       EXPECT_EQ(mul->src[1].type, AGX_INDEX_IMMEDIATE);
       EXPECT_EQ(mul->src[1].value, 7u);
@@ -7210,25 +7276,26 @@ TEST(NativeForms, UnaryBitopMovIgnoresUnreadSecondSourceOnMultiSlotWait)
    ralloc_free(mem);
 }
 
-/* The implemented cooperative-matrix path is enabled for every AGX3B
- * encoding and for M5. Earlier AGX2 devices do not gain the extension. */
+/* The implemented cooperative-matrix path is enabled for AGX2, every AGX3B
+ * encoding, and M5. */
 TEST(NativeForms, CooperativeMatrixDefaultsFollowTheImplementedEncoding)
 {
    /* G16S and the other AGX3B parts use the same 8x8 path. */
    EXPECT_TRUE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G16S));
    EXPECT_EQ(agx_chip_isa_encoding(AGX_CHIP_G16S), AGX_ISA_ENCODING_AGX3B);
 
-   /* All AGX3B parts advertise the implemented path by default. */
-   for (enum agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G17A, AGX_CHIP_G16P,
-                              AGX_CHIP_G16G, AGX_CHIP_G16C, AGX_CHIP_G15G,
-                              AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D}) {
-      EXPECT_EQ(agx_chip_isa_encoding(chip), AGX_ISA_ENCODING_AGX3B);
+   /* All AGX2 and AGX3B parts advertise the implemented path by default. */
+   for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G13X, AGX_CHIP_G14G,
+                              AGX_CHIP_G14X, AGX_CHIP_G17P, AGX_CHIP_G17A,
+                              AGX_CHIP_G16P, AGX_CHIP_G16G, AGX_CHIP_G16C,
+                              AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C,
+                              AGX_CHIP_G15D}) {
       EXPECT_TRUE(agx_chip_cooperative_matrix_supported(chip));
    }
 
-   /* M5 has the AGX3C path; AGX2 has neither implementation. */
+   /* M5 has the AGX3C path; G18G has no cooperative-matrix implementation. */
    EXPECT_TRUE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G17G));
-   EXPECT_FALSE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G13G));
+   EXPECT_FALSE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G18G));
 }
 
 /* A G17P 2D-array comparison keeps a nonzero constant level or bias in a
@@ -7983,4 +8050,268 @@ TEST(NativeForms, M5TaskAndMeshMultisampleFetchLowerAndCompile)
          ralloc_free(b.shader);
       }
    }
+}
+
+/* A 16-bit FCMPSEL select immediate must keep raw integer bits unless the
+ * optimizer explicitly folded a minifloat into the select slot
+ * (fcmpsel_minifloat_select):
+ * - untied `(0.5f < x) ? 0x0020 : 0` (8x MSAA sample 5 discard mask) -> 0x0020
+ * - adversarial `(h < 0.5h) ? h : uint16(0x0020)` (ties src0/src2 and has
+ *   immediate 0x20 in both src1 and src3) -> 0x0020
+ * - tied `max(h, 0.5h)` positive control -> 0x3800 (FP16 0.5). */
+TEST(NativeForms, Agx3HalfFcmpselUntiedImmediateNotDecodedAsMinifloat)
+{
+   const struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S},
+   };
+
+   auto find_mov_imm = [](agx_context *ctx, agx_index ssa) -> const agx_instr * {
+      if (ssa.type != AGX_INDEX_NORMAL)
+         return NULL;
+      agx_foreach_instr_global(ctx, I) {
+         if (I->nr_dests && I->dest[0].type == AGX_INDEX_NORMAL &&
+             I->dest[0].value == ssa.value)
+            return I;
+      }
+      return NULL;
+   };
+
+   for (const auto &target : targets) {
+      SCOPED_TRACE(target.chip);
+
+      /* Case 1: untied (0.5f < x) ? uint16(0x0020) : 0 */
+      {
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = target.encoding;
+         key.dev.chip = target.chip;
+         b->shader->key = &key;
+         agx_index x = agx_preload(b, agx_register(0, AGX_SIZE_32));
+         agx_index half_f32 = agx_mov_imm(b, 32, 0x3f000000);
+         agx_index bit5 = agx_mov_imm(b, 16, 0x0020);
+         agx_index zero = agx_mov_imm(b, 16, 0x0000);
+         agx_instr *sel = agx_fcmpsel_to(b, agx_temp(b->shader, AGX_SIZE_16),
+                                         half_f32, x, bit5, zero, AGX_FCOND_LT);
+         agx_unit_test(b, sel->dest[0]);
+         agx_optimizer_forward(b->shader);
+         agx_materialize_agx3_alu_constants(b->shader);
+         const agx_instr *def = find_mov_imm(b->shader, sel->src[2]);
+         ASSERT_NE(def, nullptr);
+         EXPECT_EQ(def->op, AGX_OPCODE_MOV_IMM);
+         EXPECT_EQ(def->dest[0].size, AGX_SIZE_16);
+         EXPECT_EQ(def->imm, 0x0020u);
+         ralloc_free(mem);
+      }
+
+      /* Case 2: adversarial (h < 0.5h) ? h : uint16(0x0020) */
+      {
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = target.encoding;
+         key.dev.chip = target.chip;
+         b->shader->key = &key;
+         agx_index h = agx_preload(b, agx_register(0, AGX_SIZE_16));
+         agx_index half_f16 = agx_mov_imm(b, 16, 0x3800);
+         agx_index raw_20 = agx_mov_imm(b, 16, 0x0020);
+         agx_instr *sel = agx_fcmpsel_to(b, agx_temp(b->shader, AGX_SIZE_16), h,
+                                         half_f16, h, raw_20, AGX_FCOND_LTN);
+         agx_unit_test(b, sel->dest[0]);
+         agx_optimizer_forward(b->shader);
+         EXPECT_FALSE(sel->fcmpsel_minifloat_select);
+         agx_materialize_agx3_alu_constants(b->shader);
+         const agx_instr *def = find_mov_imm(b->shader, sel->src[3]);
+         ASSERT_NE(def, nullptr);
+         EXPECT_EQ(def->op, AGX_OPCODE_MOV_IMM);
+         EXPECT_EQ(def->dest[0].size, AGX_SIZE_16);
+         EXPECT_EQ(def->imm, 0x0020u);
+         ralloc_free(mem);
+      }
+
+      /* Case 3: positive control tied max(h, 0.5h) -> 0x3800 */
+      {
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = target.encoding;
+         key.dev.chip = target.chip;
+         b->shader->key = &key;
+         agx_index h = agx_preload(b, agx_register(0, AGX_SIZE_16));
+         agx_index half_f16 = agx_mov_imm(b, 16, 0x3800);
+         agx_instr *sel = agx_fcmpsel_to(b, agx_temp(b->shader, AGX_SIZE_16), h,
+                                         half_f16, h, half_f16, AGX_FCOND_GTN);
+         agx_unit_test(b, sel->dest[0]);
+         agx_optimizer_forward(b->shader);
+         agx_materialize_agx3_alu_constants(b->shader);
+         const agx_instr *def = find_mov_imm(b->shader, sel->src[3]);
+         ASSERT_NE(def, nullptr);
+         EXPECT_EQ(def->op, AGX_OPCODE_MOV_IMM);
+         EXPECT_EQ(def->dest[0].size, AGX_SIZE_16);
+         EXPECT_EQ(def->imm, 0x3800u);
+         ralloc_free(mem);
+      }
+   }
+}
+
+TEST(NativeForms, Agx3bUsatSub32NativeAnd16Lowered)
+{
+   /* 32-bit usub_sat compiles to a native saturating IADD on AGX3B, while
+    * 16-bit usub_sat lowers to compare/sub/select without refusing. */
+   for (unsigned bits : {32u, 16u}) {
+      SCOPED_TRACE(bits);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "agx3b usub_sat");
+      nir_def *addr = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *in = nir_load_global(&b, 2, bits, addr, .align_mul = 4);
+      nir_def *sat = nir_usub_sat(&b, nir_channel(&b, in, 0),
+                                  nir_channel(&b, in, 1));
+      nir_def *out_addr = nir_iadd_imm(&b, addr, 16);
+      nir_store_global(&b, sat, out_addr, .write_mask = 1,
+                       .align_mul = bits / 8);
+
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.reserved_preamble = 16;
+
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_GT(part.info.main_size, 0u);
+      if (bits == 32u) {
+         /* Native 32-bit usub_sat emits the grounded 10-byte AGX3B saturating
+          * subtract opcode (byte 0 = 0x1f, byte 8 = 0x17, byte 9 = 0x05 for
+          * unsigned subtract with both operands unsigned). */
+         bool found_usub_sat = false;
+         const uint8_t *bin = static_cast<const uint8_t *>(part.binary);
+         for (size_t i = 0; i + 10 <= part.info.main_size; i += 2) {
+            if (bin[i] == 0x1f && (bin[i + 2] & 0xfe) == 0x54 &&
+                (bin[i + 8] & 0x19) == 0x11 &&
+                bin[i + 9] == 0x05) {
+               found_usub_sat = true;
+               break;
+            }
+         }
+         EXPECT_TRUE(found_usub_sat);
+      }
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* agx_nir_share_bounds emits 32-bit usub_sat with a uniform size minuend
+    * for aligned non-wrapping field offsets; verify it shares the bound and
+    * compiles and packs cleanly on AGX3B. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "agx3b share bounds usub_sat");
+      nir_def *addr = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *size = agx_test_load_preamble(&b, 1, 32, 8);
+      nir_def *raw = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+      nir_def *idx = nir_ishl_imm(&b, raw, 4);
+      nir_def *end0 = nir_uadd_sat(&b, idx, nir_imm_int(&b, 4));
+      nir_def *end1 = nir_uadd_sat(&b, nir_iadd_imm(&b, idx, 8),
+                                   nir_imm_int(&b, 4));
+      nir_def *v0 = nir_bounds_agx(&b, raw, end0, size);
+      nir_def *v1 = nir_bounds_agx(&b, raw, end1, size);
+      nir_store_global(&b, nir_iadd(&b, v0, v1), nir_iadd_imm(&b, addr, 16),
+                       .write_mask = 1, .align_mul = 4);
+
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.reserved_preamble = 16;
+
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_GT(part.info.main_size, 0u);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(NativeForms, ShareBoundsRejectsWrappedBaseOffset)
+{
+   /* If X = iadd(y, -64), read A at X+0 can be out of bounds (y < 64) while
+    * read B at X+80 wraps mod 2^32 back into bounds. Sharing via
+    * R = usub_sat(size, X) would compute R = 0 and wrongly zero read B.
+    * Verify agx_nir_share_bounds refuses this for unaligned, 16B-aligned,
+    * and 64B-aligned y (since 80 >= 64), with and without a size bound. */
+   for (bool size_below_u32_max : {false, true}) {
+      for (unsigned shift : {0u, 4u, 6u}) {
+         SCOPED_TRACE(size_below_u32_max);
+         SCOPED_TRACE(shift);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "share bounds wrapped X");
+         nir_def *addr = agx_test_load_preamble(&b, 1, 64, 4);
+         nir_def *size = agx_test_load_preamble(&b, 1, 32, 8);
+         nir_def *raw = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+         nir_def *y = shift ? nir_ishl_imm(&b, raw, shift) : raw;
+         nir_def *x = nir_iadd_imm(&b, y, -64);
+         nir_def *end_a = nir_uadd_sat(&b, x, nir_imm_int(&b, 4));
+         nir_def *end_b = nir_uadd_sat(&b, nir_iadd_imm(&b, x, 80),
+                                       nir_imm_int(&b, 4));
+         nir_def *va = nir_bounds_agx(&b, raw, end_a, size);
+         nir_def *vb = nir_bounds_agx(&b, raw, end_b, size);
+         nir_store_global(&b, nir_iadd(&b, va, vb), nir_iadd_imm(&b, addr, 16),
+                          .write_mask = 1, .align_mul = 4);
+
+         EXPECT_FALSE(agx_nir_share_bounds(b.shader, size_below_u32_max));
+
+         unsigned usub_sats = 0;
+         nir_foreach_block(block, b.impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_alu &&
+                   nir_instr_as_alu(instr)->op == nir_op_usub_sat)
+                  usub_sats++;
+            }
+         }
+         EXPECT_EQ(usub_sats, 0u);
+         ralloc_free(b.shader);
+      }
+   }
+}
+
+TEST(NativeForms, Agx3bCanonicalMinmaxSkipsFlushUnlessDenormPreserve)
+{
+   auto compile_minmax = [](bool denorm_preserve) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "agx3b canonical minmax");
+      if (denorm_preserve)
+         b.shader->info.float_controls_execution_mode |=
+            FLOAT_CONTROLS_DENORM_PRESERVE_FP32;
+      nir_def *addr = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *x = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+      nir_def *scaled = nir_fmul(&b, x, nir_imm_float(&b, 2.0f));
+      nir_def *clamped = nir_fmin(&b, scaled, nir_imm_float(&b, 1.0f));
+      nir_store_global(&b, clamped, nir_iadd_imm(&b, addr, 16),
+                       .write_mask = 1, .align_mul = 4);
+
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.reserved_preamble = 16;
+
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      unsigned instrs = part.info.stats.instrs;
+      free(part.binary);
+      ralloc_free(b.shader);
+      return instrs;
+   };
+
+   unsigned ftz_instrs = compile_minmax(false);
+   unsigned preserve_instrs = compile_minmax(true);
+   EXPECT_GT(ftz_instrs, 0u);
+   EXPECT_LT(ftz_instrs, preserve_instrs);
 }

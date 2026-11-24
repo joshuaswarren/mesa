@@ -1456,10 +1456,12 @@ agx3_alu_fmul_mixed(enum agx_isa_encoding enc, uint16_t dest,
    };
    unsigned n = 8;
    for (unsigned bit = 0; bit < 6; ++bit)
-      if (wait_mask & (1u << bit))
-         fields[n++] = (struct agx3_field_kv){80 + bit, 1};
-   return agx3_bind_compose(enc, AGX3_MN_f32mul, 0, base, 8, fields, n, out, len) ||
-          agx3_bind_compose(enc, AGX3_MN_f32mul, 1, base, 8, fields, n, out, len);
+      fields[n++] = (struct agx3_field_kv){80 + bit, !!(wait_mask & (1u << bit))};
+   for (unsigned ep = 0; ep < 4; ++ep)
+      if (agx3_bind_compose(enc, AGX3_MN_f32mul, ep, base, 8, fields, n, out,
+                            len))
+         return true;
+   return false;
 }
 
 bool
@@ -1654,7 +1656,7 @@ agx3_alu_fmul_mixed_half(enum agx_isa_encoding enc, uint16_t dest, uint16_t f32,
       fields[16] = (struct agx3_field_kv){86, !!(wait_mask & 64)};
       fields[17] = (struct agx3_field_kv){87, !!(wait_mask & 128)};
    }
-   for (unsigned ep = 0; ep < (m5 ? 4 : 2); ++ep)
+   for (unsigned ep = 0; ep < 4; ++ep)
       if (agx3_bind_compose(enc, AGX3_MN_f32mul, ep, base, 8, fields, m5 ? 18 : 14,
                             out, len))
          return true;
@@ -5535,7 +5537,7 @@ agx3_alu_fmul_narrow(enum agx_isa_encoding enc, uint16_t dest,
       fields[16] = (struct agx3_field_kv){86, !!(wait_mask & 64)};
       fields[17] = (struct agx3_field_kv){87, !!(wait_mask & 128)};
    }
-   for (unsigned ep = 0; ep < (m5 ? 4 : 2); ep++)
+   for (unsigned ep = 0; ep < 4; ep++)
       if (agx3_bind_compose(enc, AGX3_MN_f32mul, ep, base, 8, fields, m5 ? 18 : 14,
                             out, len))
          return true;
@@ -5694,7 +5696,7 @@ agx3_alu_hmul_minifloat(enum agx_isa_encoding enc, uint16_t dest,
       fields[n++] = (struct agx3_field_kv){51 + i,
                                             !!(wait_mask & (1u << i))};
 
-   for (unsigned ep = 0; ep < (m5 ? 4 : 2); ++ep)
+   for (unsigned ep = 0; ep < 4; ++ep)
       if (agx3_bind_compose(enc, AGX3_MN_f16mul, ep, base, 6, fields, n, out,
                             len))
          return true;

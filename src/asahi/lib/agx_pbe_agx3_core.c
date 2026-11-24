@@ -22,22 +22,6 @@
  * Interchange stride is counted in macroblocks). */
 #define AGX_PBE_LAYOUT_INTERCHANGE 3u
 
-static void
-store_le64(uint8_t *dst, uint64_t value)
-{
-   for (unsigned i = 0; i < 8; ++i)
-      dst[i] = (uint8_t)(value >> (i * 8));
-}
-
-static uint64_t
-load_le64(const uint8_t *src)
-{
-   uint64_t value = 0;
-   for (unsigned i = 0; i < 8; ++i)
-      value |= (uint64_t)src[i] << (i * 8);
-   return value;
-}
-
 static bool
 channel_is_uncompressed(uint8_t channels)
 {
@@ -253,12 +237,12 @@ agx_pbe_g18_layered_mip_pack(const struct agx_pbe_agx3_2d_fields *fields,
     * the dimension/count and page flag compose with the ordinary 2D mip fields
     * without rebasing the address or dimensions. The base codec preserves the
     * layer flag. */
-   uint64_t word0 = load_le64(&out->bytes[0]);
-   uint64_t word1 = load_le64(&out->bytes[8]);
+   uint64_t word0 = agx_load_le64(&out->bytes[0]);
+   uint64_t word1 = agx_load_le64(&out->bytes[8]);
    word0 = (word0 & ~UINT64_C(0xf)) | dimension;
    word1 |= (uint64_t)(layers - 1) << 44;
-   store_le64(&out->bytes[0], word0);
-   store_le64(&out->bytes[8], word1);
+   agx_store_le64(&out->bytes[0], word0);
+   agx_store_le64(&out->bytes[8], word1);
    return true;
 }
 
@@ -378,23 +362,23 @@ pack_gen10_multisample(const struct agx_pbe_agx3_2d_fields *fields,
    if (!agx_pbe_agx3_2d_pack(AGX_PBE_AGX3_GENERATION_10, &base, out))
       return false;
 
-   uint64_t word0 = load_le64(&out->bytes[0]);
+   uint64_t word0 = agx_load_le64(&out->bytes[0]);
    word0 = (word0 & ~UINT64_C(0xf)) |
            (array ? AGX_PBE_DIMENSION_2D_ARRAY_MULTISAMPLE
                   : AGX_PBE_DIMENSION_2D_MULTISAMPLE);
    word0 |= (uint64_t)(samples >> 2) << 58;
    word0 |= (uint64_t)fields->compressed << 61;
 
-   uint64_t word1 = load_le64(&out->bytes[8]);
+   uint64_t word1 = agx_load_le64(&out->bytes[8]);
    if (array) {
       word1 |= (uint64_t)(layers - 1) << 44;
       word1 |= (uint64_t)fields->page_aligned_layers << 60;
    }
    word1 |= (uint64_t)fields->compressed << 63;
-   store_le64(&out->bytes[0], word0);
-   store_le64(&out->bytes[8], word1);
+   agx_store_le64(&out->bytes[0], word0);
+   agx_store_le64(&out->bytes[8], word1);
    if (fields->compressed)
-      store_le64(&out->bytes[16], fields->acceleration_buffer >> 4);
+      agx_store_le64(&out->bytes[16], fields->acceleration_buffer >> 4);
    return true;
 }
 
@@ -534,10 +518,12 @@ agx_pbe_g18_2d_mip_pack(
     * [51:48]. Preserve the base address and dimensions so the hardware
     * performs native mip-tail addressing. */
    if (level || levels != 1) {
-      store_le64(&out->bytes[0], load_le64(&out->bytes[0]) | (UINT64_C(1) << 60));
-      store_le64(&out->bytes[8], load_le64(&out->bytes[8]) | (UINT64_C(1) << 63));
-      store_le64(&out->bytes[16],
-                 ((uint64_t)level | ((uint64_t)(levels - 1) << 4)) << 44);
+      agx_store_le64(&out->bytes[0],
+                     agx_load_le64(&out->bytes[0]) | (UINT64_C(1) << 60));
+      agx_store_le64(&out->bytes[8],
+                     agx_load_le64(&out->bytes[8]) | (UINT64_C(1) << 63));
+      agx_store_le64(&out->bytes[16],
+                     ((uint64_t)level | ((uint64_t)(levels - 1) << 4)) << 44);
    }
    return true;
 }

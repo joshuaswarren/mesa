@@ -1136,6 +1136,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_fd;
    }
 
+   /* Splitting a long submission lets the GPU start work from the first ioctl
+    * while the kernel validates later ioctls, so a profile may cap batch size. */
+   dev->submit_batch_size = instance->drirc.performance.submit_batch_size;
+
    vk_device_set_drm_fd(&dev->vk, dev->dev.fd);
    dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
    dev->vk.command_buffer_ops = &hk_cmd_buffer_ops;

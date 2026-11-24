@@ -203,6 +203,8 @@ TEST(SpillLoopHeader, ManyLiveValuesGrowNextUsesAndValidate)
    agx_block_add_successor(header, exit);
    agx_block_add_successor(body, header);
 
+   /* RCP is not rematerializable, so the spiller must store and fill these
+    * values rather than repeat them at their uses. */
    constexpr unsigned N = 24;
    agx_index live[N];
    b->cursor = agx_after_block(entry);
@@ -351,5 +353,125 @@ TEST(SpillLoopHeader, RematRemovesDeadLoopHeaderPhi)
 
    EXPECT_EQ(header_phis, 0u);
    EXPECT_EQ(mem_ops, 0u);
+   ralloc_free(mem);
+}
+
+/* Positive AGX3B rematerialization tests: uniform fadd and reorderable
+ * device loads live through a full-pressure loop are repeated at exit
+ * instead of spilling to scratch memory. */
+TEST(SpillLoopHeader, AGX3BRepeatsUniformFaddInsteadOfSpilling)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.has_scratch = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->any_cf = true;
+
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *header = agx_test_block(b->shader);
+   agx_block *body = agx_test_block(b->shader);
+   agx_block *exit = agx_test_block(b->shader);
+   header->loop_header = true;
+   agx_block_add_successor(entry, header);
+   agx_block_add_successor(header, body);
+   agx_block_add_successor(header, exit);
+   agx_block_add_successor(body, header);
+
+   b->cursor = agx_after_block(entry);
+   agx_index through =
+      agx_fadd(b, agx_uniform(0, AGX_SIZE_32), agx_uniform(2, AGX_SIZE_32));
+
+   b->cursor = agx_after_block(body);
+   agx_index values[8];
+   for (unsigned i = 0; i < ARRAY_SIZE(values); ++i)
+      values[i] = agx_rcp(b, agx_uniform(4 + 2 * i, AGX_SIZE_32));
+   for (agx_index value : values)
+      agx_unit_test(b, value);
+
+   b->cursor = agx_after_block(exit);
+   agx_unit_test(b, through);
+
+   agx_compute_liveness(b->shader);
+   agx_spill(b->shader, 16 + 8, false);
+
+   unsigned stores = 0, fills = 0, exit_fadds = 0;
+   agx_foreach_block(b->shader, block) {
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_MOV && I->dest[0].memory)
+            stores++;
+         if (I->op == AGX_OPCODE_MOV && I->src[0].memory)
+            fills++;
+         if (block == exit && I->op == AGX_OPCODE_FADD)
+            exit_fadds++;
+      }
+   }
+
+   EXPECT_EQ(stores, 0u);
+   EXPECT_EQ(fills, 0u);
+   EXPECT_EQ(exit_fadds, 1u);
+   ralloc_free(mem);
+}
+
+TEST(SpillLoopHeader, AGX3BRepeatsReorderableDeviceLoadInsteadOfSpilling)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.has_scratch = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->any_cf = true;
+
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *header = agx_test_block(b->shader);
+   agx_block *body = agx_test_block(b->shader);
+   agx_block *exit = agx_test_block(b->shader);
+   header->loop_header = true;
+   agx_block_add_successor(entry, header);
+   agx_block_add_successor(header, body);
+   agx_block_add_successor(header, exit);
+   agx_block_add_successor(body, header);
+
+   b->cursor = agx_after_block(entry);
+   agx_index through = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *ld = agx_device_load_to(
+      b, through, agx_uniform(0, AGX_SIZE_64), agx_immediate(0),
+      AGX_FORMAT_I32, 1, 0, false);
+   ld->memory_can_reorder = true;
+
+   b->cursor = agx_after_block(body);
+   agx_index values[8];
+   for (unsigned i = 0; i < ARRAY_SIZE(values); ++i)
+      values[i] = agx_rcp(b, agx_uniform(4 + 2 * i, AGX_SIZE_32));
+   for (agx_index value : values)
+      agx_unit_test(b, value);
+
+   b->cursor = agx_after_block(exit);
+   agx_unit_test(b, through);
+
+   agx_compute_liveness(b->shader);
+   agx_spill(b->shader, 16 + 8, false);
+
+   unsigned stores = 0, fills = 0, exit_loads = 0;
+   agx_foreach_block(b->shader, block) {
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_MOV && I->dest[0].memory)
+            stores++;
+         if (I->op == AGX_OPCODE_MOV && I->src[0].memory)
+            fills++;
+         if (block == exit && I->op == AGX_OPCODE_DEVICE_LOAD)
+            exit_loads++;
+      }
+   }
+
+   EXPECT_EQ(stores, 0u);
+   EXPECT_EQ(fills, 0u);
+   EXPECT_EQ(exit_loads, 1u);
    ralloc_free(mem);
 }

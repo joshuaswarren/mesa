@@ -579,6 +579,14 @@ uint8_t hk_sync_host_flush_kinds(const VkDependencyInfo *info);
 void hk_sync_defer_host_flush(struct hk_cmd_buffer *cmd,
                               const VkDependencyInfo *info);
 
+/* The host availability a pipeline barrier asks for: the open compute stream
+ * to record the memory-scoped flush in, when that stream holds work and
+ * already follows the dependency's first scope (it then also waits for what
+ * that scope names), or NULL, with the flush deferred to the submission
+ * (hk_sync_defer_host_flush()) or none needed. */
+struct hk_cs *hk_sync_host_flush(struct hk_cmd_buffer *cmd,
+                                 const VkDependencyInfo *info);
+
 /* Take the deferred host-availability kinds, for an operation the host can
  * observe before the submission completes (an event write). */
 uint8_t hk_sync_take_host_flush(struct hk_cmd_buffer *cmd);
@@ -739,14 +747,16 @@ uint8_t hk_sync_queue_kinds(const struct hk_sync_queue *q, unsigned sq);
  * host flush its command buffers deferred (hk_sync_defer_host_flush()),
  * called after hk_sync_resolve_submit(). With exact priors it follows the
  * latest command of each of `kinds` and every requirement still carried, on
- * both subqueues and earlier submissions included, and with `chain` also the
- * submission's last command on each subqueue; legacy prefixes follow every
- * earlier command. base holds the ordinals before the submission, count its
- * commands on each subqueue. With exact priors it also takes the flush's
- * ordinal; false if that overflows. The flush is no later command's source:
- * no kind names it. */
+ * both subqueues and earlier submissions included, and the submission's last
+ * command on each subqueue it has commands on, as legacy prefixes do; with
+ * none there, legacy prefixes follow every earlier command. A flush that
+ * trails render-dependent compute work then names a render too, so the
+ * kernel takes it behind a render dependency like that work instead of as a
+ * command with no dependency. base holds the
+ * ordinals before the submission, count its commands on each subqueue. With
+ * exact priors it also takes the flush's ordinal; false if that overflows.
+ * The flush is no later command's source: no kind names it. */
 bool hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds,
-                               bool chain,
                                const uint64_t base[HK_SYNC_NUM_SQ],
                                const uint32_t count[HK_SYNC_NUM_SQ],
                                uint16_t barrier[HK_SYNC_NUM_SQ],
