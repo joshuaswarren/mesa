@@ -551,12 +551,14 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       mem->bo = agx_bo_import_host_ptr(&dev->dev, host_info->pHostPointer,
                                        pAllocateInfo->allocationSize, access);
       if (mem->bo == NULL) {
-         /* ENOMEM is GPU memory exhaustion unless the kernel also charges
-          * the pins to RLIMIT_MEMLOCK: then the range may only be refused
-          * past that limit, which more device memory would not cure. */
+         /* ENOMEM is GPU memory exhaustion, unless a kernel that charges
+          * the pins to RLIMIT_MEMLOCK refused the range for that limit,
+          * which more device memory would not cure. */
          const int err = errno;
          const bool out_of_memory =
-            err == ENOMEM && !agx_userptr_charges_memlock(&dev->dev);
+            err == ENOMEM &&
+            !agx_userptr_refused_by_memlock(&dev->dev,
+                                            pAllocateInfo->allocationSize);
          result = vk_errorf(dev,
                             out_of_memory ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                                           : VK_ERROR_INVALID_EXTERNAL_HANDLE,

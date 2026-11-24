@@ -33,10 +33,8 @@
 #include "libagx_shaders.h"
 
 #include <fcntl.h>
-#include <linux/capability.h>
+#include <stdio.h>
 #include <sys/resource.h>
-#include <sys/syscall.h>
-#include <unistd.h>
 #include <xf86drm.h>
 #include "util/os_misc.h"
 #include "agx_userptr_limits.h"
@@ -927,19 +925,15 @@ agx_get_params(struct agx_device *dev, void *buf, size_t size)
    return get_param.size;
 }
 
-static bool
-agx_has_cap_ipc_lock(void)
+/* The RLIMIT_MEMLOCK soft limit in bytes, UINT64_MAX if unlimited, 0 if it
+ * cannot be read. */
+static uint64_t
+agx_memlock_limit(void)
 {
-   struct __user_cap_header_struct hdr = {
-      .version = _LINUX_CAPABILITY_VERSION_3,
-   };
-   struct __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3] = {0};
-
-   if (syscall(SYS_capget, &hdr, data))
-      return false;
-
-   return data[CAP_TO_INDEX(CAP_IPC_LOCK)].effective &
-          CAP_TO_MASK(CAP_IPC_LOCK);
+   struct rlimit lim;
+   if (getrlimit(RLIMIT_MEMLOCK, &lim))
+      return 0;
+   return lim.rlim_cur == RLIM_INFINITY ? UINT64_MAX : (uint64_t)lim.rlim_cur;
 }
 
 /* See agx_userptr_imports_any_size(). */
@@ -953,20 +947,43 @@ agx_check_userptr_any_size(const struct agx_device *dev)
    if (no_memlock)
       return true;
 
-   struct rlimit lim;
-   if (getrlimit(RLIMIT_MEMLOCK, &lim))
-      return false;
-   const uint64_t memlock_B =
-      lim.rlim_cur == RLIM_INFINITY ? UINT64_MAX : (uint64_t)lim.rlim_cur;
-
    uint64_t gpu_limit_B = dev->params.client_memory_limit;
    if (!gpu_limit_B)
       gpu_limit_B = dev->params.memory_limit;
    if (!gpu_limit_B && !os_get_total_physical_memory(&gpu_limit_B))
       gpu_limit_B = UINT64_MAX;
 
-   return agx_userptr_imports_any_size(no_memlock, agx_has_cap_ipc_lock(),
-                                       memlock_B, gpu_limit_B);
+   return agx_userptr_imports_any_size(no_memlock, agx_memlock_limit(),
+                                       gpu_limit_B);
+}
+
+/* The process's long-term pinned memory in bytes (VmPin), 0 if unknown. */
+static uint64_t
+agx_pinned_bytes(void)
+{
+   FILE *f = fopen("/proc/self/status", "re");
+   if (!f)
+      return 0;
+
+   char line[128];
+   unsigned long long kib = 0;
+   while (fgets(line, sizeof(line), f)) {
+      if (sscanf(line, "VmPin: %llu kB", &kib) == 1)
+         break;
+   }
+   fclose(f);
+   return (uint64_t)kib * 1024;
+}
+
+bool
+agx_userptr_refused_by_memlock(const struct agx_device *dev, uint64_t size)
+{
+   if (!agx_userptr_charges_memlock(dev))
+      return false;
+
+   /* A failed import leaves VmPin as it was before the ioctl. */
+   return agx_userptr_memlock_exceeded(agx_pinned_bytes(), size,
+                                       agx_memlock_limit());
 }
 
 static int

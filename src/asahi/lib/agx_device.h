@@ -546,6 +546,11 @@ agx_userptr_charges_memlock(const struct agx_device *dev)
    return !(dev->params.features & DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK);
 }
 
+/* After an ENOMEM from importing size bytes of host memory: whether the
+ * caller's RLIMIT_MEMLOCK refused it, rather than the GPU memory limits. */
+bool agx_userptr_refused_by_memlock(const struct agx_device *dev,
+                                    uint64_t size);
+
 /* The kernel can keep a BO resident under memory pressure (GEM_RESIDENCY). */
 static inline bool
 agx_has_residency_control(const struct agx_device *dev)
