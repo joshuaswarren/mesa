@@ -9054,6 +9054,14 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
    }
 
    case nir_op_usub_sat: {
+      /* AGX3B has a grounded native 32-bit unsigned saturating subtract
+       * (agx3_iadd_encode), while 16-bit saturating iadd on AGX3B only covers
+       * addition. Lower non-32-bit usub_sat on AGX3B to compare/sub/select. */
+      if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          dst.size != AGX_SIZE_32) {
+         agx_index diff = agx_iadd(b, s0, agx_neg(s1), 0);
+         return agx_icmpsel_to(b, dst, s0, s1, agx_zero(), diff, AGX_ICOND_ULT);
+      }
       agx_instr *I = agx_iadd_to(b, dst, agx_abs(s0), agx_neg(agx_abs(s1)), 0);
       I->saturate = true;
       return I;
@@ -11546,12 +11554,12 @@ pre_preamble:
 
       *preamble_size = sizes[0];
 
-      /* M5: check the constant program's constant-offset buffer reads past
+      /* AGX3: check the constant program's constant-offset buffer reads past
        * 255 bytes in words, so their ends stay immediates
        * (agx_nir_lower_word_bounds.c). The main program keeps its checks.
        * A uniform DMA launch drops the byte checks of the reads it copies by
        * matching their byte form, so leave those programs alone. */
-      if (m5 && !(dma_key && dma_key->g17p_uniform_dma)) {
+      if ((byte_indices || m5) && !(dma_key && dma_key->g17p_uniform_dma)) {
          bool words = false;
          NIR_PASS(words, nir, agx_nir_lower_word_bounds);
          if (words) {
@@ -11572,13 +11580,14 @@ pre_preamble:
          agx_remove_empty_preamble(nir);
       }
 
-      /* M5: let the main program's surviving robust reads of one structure
+      /* AGX3: let the main program's surviving robust reads of one structure
        * share their end computation (agx_nir_share_bounds.c). Run after
        * uniform DMA lowering so DMA still sees the original constant ends it
-       * can drop. M5 caps buffer descriptor sizes at INT32_MAX & ~15u. */
-      if (m5) {
+       * can drop. Only M5 caps buffer descriptor sizes (at INT32_MAX & ~15u),
+       * so only M5 also shares saturating ends. */
+      if (byte_indices || m5) {
          bool shared = false;
-         NIR_PASS(shared, nir, agx_nir_share_bounds, true);
+         NIR_PASS(shared, nir, agx_nir_share_bounds, m5);
          if (shared) {
             pre_fuse_dirty = true;
             NIR_PASS(_, nir, nir_opt_copy_prop);
@@ -11622,7 +11631,7 @@ pre_preamble:
       NIR_PASS(pre_fuse_dirty, nir, agx_nir_export_select_flags_as_halves, true);
 
    /* After the selects of trivial if-else statements exist. */
-   if (m5) {
+   if (byte_indices || m5) {
       bool folded = false;
       NIR_PASS(folded, nir, agx_nir_m5_split_or_selects);
       if (folded) {
@@ -11675,7 +11684,7 @@ pre_preamble:
       progress = false;
 
       NIR_PASS(progress, nir, agx_nir_fuse_algebraic_late);
-      if (m5)
+      if (byte_indices || m5)
          NIR_PASS(progress, nir, agx_nir_fuse_doubled_add);
       if (progress) {
          late_progress = true;
@@ -17245,8 +17254,8 @@ agx_b2f_of(nir_def *d, unsigned d_comp, nir_def *c, unsigned c_comp,
  * for b in place of a). Minecraft's linear fog builds this per distance (0
  * before the start, 1 past the end, the ramp between); AGX has no boolean
  * OR or NOT, so the backend built it from three selects, two of them needing
- * their uniform comparand copied into a GPR on M5. Apple's fragment uses two
- * selects. The values are exact (b2f gives +0.0 and 1.0). M5 only, so other
+ * their uniform comparand copied into a GPR on AGX3. Apple's fragment uses two
+ * selects. The values are exact (b2f gives +0.0 and 1.0). AGX3 only, so other
  * targets keep their compiles.
  */
 static bool
@@ -17903,10 +17912,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          agx3_options.lower_bfloat16_conversions = true;
       }
       if (is_agx3b) {
-         /* G17P's saturate form is a standalone f32add.ep2 operation. */
+         /* AGX3B's saturate form is a standalone f32add.ep2 operation. */
          agx3_options.lower_fsat = false;
-         /* G17P lowers unsigned saturating subtract to compare/sub/select. */
-         agx3_options.lower_usub_sat = true;
       }
       if (source_iadd64)
          agx3_options.lower_int64_options |= nir_lower_iadd64;
@@ -17969,7 +17976,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    /* Only the one-sample AGX3B coverage path reads
     * bit 0 alone; sample loops and multisampled variants keep whole masks. */
    const bool discard_word =
-      (is_agx3b || key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+      is_agx3 &&
       nir->info.stage == MESA_SHADER_FRAGMENT &&
       MAX2(key->fs.nr_samples, 1) == 1 && !key->fs.inside_sample_loop;
 

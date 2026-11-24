@@ -18,8 +18,10 @@
 static void
 agx3_remove_redundant_physical_copies(agx_context *ctx)
 {
-   if (!agx_isa_is_agx3(ctx->key->dev.encoding) ||
-       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
+   if (!agx_isa_is_agx3(ctx->key->dev.encoding) || ctx->is_preamble)
+      return;
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       ctx->stage != MESA_SHADER_FRAGMENT)
       return;
 
    uint32_t serial = 0;
@@ -27,9 +29,16 @@ agx3_remove_redundant_physical_copies(agx_context *ctx)
       uint32_t value[AGX_NUM_REGS] = {0};
       agx_foreach_instr_in_block_safe(block, I) {
          const struct agx_opcode_info *info = &agx_opcodes_info[I->op];
+         /* Texture and image instructions can clobber undeclared physical
+          * scratch GPRs during packing (for example AGX3B cube CEM scratch in
+          * src[6]/+4/+6 and fixed r0/r7/r2 on immediate-descriptor cubes), so
+          * always reset the physical-copy table across them. */
          if (!info->can_eliminate || !info->can_reorder ||
              info->schedule_class != AGX_SCHEDULE_CLASS_NONE ||
-             !I->nr_dests) {
+             !I->nr_dests ||
+             I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+             I->op == AGX_OPCODE_TEXTURE_LOAD ||
+             I->op == AGX_OPCODE_IMAGE_LOAD) {
             memset(value, 0, sizeof(value));
             continue;
          }
