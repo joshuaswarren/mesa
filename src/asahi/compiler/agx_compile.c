@@ -7321,17 +7321,16 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
       /* AGX3C's tied min/max consumes full register operands in both
        * positions. Keep constants tied after compact-constant folding. */
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          I->op == AGX_OPCODE_FCMPSEL && I->nr_srcs == 4 &&
-          I->dest[0].size == AGX_SIZE_32 && !I->invert_cond &&
-          (I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN)) {
+          I->dest[0].size == AGX_SIZE_32 && agx_fcmpsel_is_tied_minmax(I)) {
          for (unsigned c = 0; c < 2; ++c) {
             if (I->src[c].type != AGX_INDEX_IMMEDIATE ||
-                !agx_is_equiv(I->src[c], I->src[c + 2]))
+                (!I->fcmpsel_minifloat_select && I->src[c].value != 0))
                continue;
             const agx_index constant = agx_mov_imm(
                &b, 32, fui(agx_minifloat_decode(I->src[c].value)));
             I->src[c] = I->src[c + 2] = constant;
          }
+         I->fcmpsel_minifloat_select = false;
       }
 
       /* General FSEL has register comparators or an implicit zero. Nonzero
@@ -7357,19 +7356,18 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
              I->op == AGX_OPCODE_FCMPSEL && I->dest[0].size == AGX_SIZE_16 &&
              !agx3c_fsel16_imm_encodable(ctx, I)) {
-            /* Select alternatives are bit patterns, not minifloats -- except
-             * in a tied minimum/maximum, where the optimizer deposited the
-             * compared minifloat into the select slot too. */
+            /* Select alternatives are raw bit patterns unless the optimizer
+             * recorded that it folded a minifloat into the select slot
+             * (fcmpsel_minifloat_select). Half-tied shapes such as
+             * `(0.5 < x) ? 0.5 : y` never arrive here with a minifloat in a
+             * select slot because agx_is_float_src() is false for s >= 2 and
+             * agx_optimizer_inline_imm() only copies a minifloat into
+             * src[s + 2] for a full AGX3B tied min/max. */
             for (unsigned s = 2; s < 4; ++s) {
                if (I->src[s].type != AGX_INDEX_IMMEDIATE)
                   continue;
-               const agx_index cmp = I->src[s - 2];
-               const bool tied = cmp.type == AGX_INDEX_IMMEDIATE &&
-                                 cmp.value == I->src[s].value &&
-                                 cmp.abs == I->src[s].abs &&
-                                 cmp.neg == I->src[s].neg;
                uint32_t bits = I->src[s].value;
-               if (tied) {
+               if (I->fcmpsel_minifloat_select) {
                   float value = agx_minifloat_decode(I->src[s].value);
                   if (I->src[s].abs)
                      value = fabsf(value);
@@ -7379,6 +7377,7 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
                }
                I->src[s] = agx_mov_imm(&b, 16, bits);
             }
+            I->fcmpsel_minifloat_select = false;
          }
          /* G18G's half FSEL is grounded only with all four sources in half
           * registers (agx3_alu_fcmp_select_half_gpu1). Compare slots hold
@@ -11292,18 +11291,27 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    NIR_PASS(pre_alg_progress, nir, nir_opt_peephole_select,
             &peephole_select_options);
 
-   /* Small uniform ifs whose arms load from memory, which peephole select
-    * keeps: on AGX3 an if costs five control-flow instructions and a wait for
-    * every load in flight. Flattening one can expose another around it.
+   /* Small ifs whose arms load from memory, which peephole select keeps: on
+    * AGX3 an if costs a compare, an exec-mask push, a skip branch and a pop,
+    * and waits for every load in flight. AGX3 flattens small uniform ifs and
+    * the divergent if of a short-circuit operand that reads a uniform address
+    * (agx_nir_opt_flatten_loads.c). Flattening one can expose another around
+    * it, and peephole select reruns only then.
     * Not on G18G, which compiles as AGX3C with emit_agx3d (g18_scans). */
    bool any_flattened = false;
    if ((agx3b || m5) && !g18_scans) {
-      bool flattened;
+      bool flattened, selected = false;
       do {
          flattened = false;
          NIR_PASS(flattened, nir, agx_nir_opt_flatten_loads, 64, 4);
-         NIR_PASS(flattened, nir, nir_opt_peephole_select,
-                  &peephole_select_options);
+         NIR_PASS(flattened, nir,
+                  agx_nir_opt_flatten_short_circuit_uniform_loads);
+         if (flattened || selected) {
+            selected = false;
+            NIR_PASS(selected, nir, nir_opt_peephole_select,
+                     &peephole_select_options);
+         }
+         flattened |= selected;
          any_flattened |= flattened;
       } while (flattened);
       if (any_flattened) {
@@ -11322,6 +11330,20 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          agx_optimize_loop_nir(nir, m5, g17p, agx3b || m5);
    }
 
+   /* Fuse nested guards, hoist independent load/test prefixes across pure
+    * ifs to overlap memory latency, and coalesce adjacent expensive
+    * divergent ifs under a combined fast-path guard. Runs across AGX3B and
+    * AGX3C (excluding G18G). */
+   if ((byte_indices || m5) && !g18_scans) {
+      bool guarded = false;
+      NIR_PASS(guarded, nir, agx_nir_opt_guard_chains);
+      if (guarded) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
+
    /* Compute shaders defer shared-offset lowering until after
     * nir_lower_mem_access_bit_sizes() and nir_opt_load_store_vectorize() so
     * adjacent byte-addressed shared loads and stores merge into wider vector
@@ -11333,6 +11355,14 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       !nir->info.shared_element_index_agx;
    const bool lower_agx3_compute_shared =
       (byte_indices || m5) && vectorize_compute_shared;
+
+   {
+      bool unswitched = false;
+      NIR_PASS(unswitched, nir, agx_nir_opt_unswitch_affine_bounds);
+      if (unswitched)
+         agx_optimize_loop_nir(nir, m5, g17p, agx3b || m5);
+   }
+
    NIR_PASS(pre_alg_progress, nir, nir_opt_load_store_vectorize,
             &(const nir_load_store_vectorize_options){
                .modes = nir_var_mem_global | nir_var_mem_constant |
