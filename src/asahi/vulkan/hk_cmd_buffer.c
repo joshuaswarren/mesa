@@ -2781,7 +2781,7 @@ hk_g17p_dma_ranges(const struct hk_descriptor_state *desc,
 
 /* sources, when not NULL, receives each range's enum hk_g17p_range_source.
  * Root ranges address root_ptr, the root this stage's program follows. */
-static bool
+bool
 hk_g17p_graphics_uniform_ranges(
    struct hk_cmd_buffer *cmd, struct hk_shader *s,
    const struct hk_linked_shader *linked, uint64_t root_ptr,

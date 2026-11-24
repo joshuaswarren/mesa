@@ -2968,6 +2968,11 @@ bool hk_g17p_dma_ranges(const struct hk_descriptor_state *desc,
                         struct agx3_ioto_uniform_range *ranges,
                         size_t max_ranges, size_t *count_io,
                         uint8_t *sources);
+bool hk_g17p_graphics_uniform_ranges(
+   struct hk_cmd_buffer *cmd, struct hk_shader *s,
+   const struct hk_linked_shader *linked, uint64_t root_ptr,
+   struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES],
+   size_t *range_count, uint8_t *sources);
 
 uint64_t hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd,
                                       struct hk_shader *s,
