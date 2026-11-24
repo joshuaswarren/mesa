@@ -14668,10 +14668,14 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
             agx_pool_alloc_aligned(&batch->pool, size, 4).gpu;
       }
 
-      if (vb_size) {
-         vp.output_buffer =
-            agx_pool_alloc_aligned(&batch->pool, vb_size, 4).gpu;
-      }
+      /* Allocate if there are any outputs, or use the scratch page to trap
+       * speculative reads (such as lowered gl_PrimitiveIDIn checking
+       * vp.outputs) when the vertex shader writes no varyings. Matches
+       * Borealis hk_upload_vertex_params().
+       */
+      vp.output_buffer =
+         vb_size ? agx_pool_alloc_aligned(&batch->pool, vb_size, 4).gpu
+                 : AGX_SCRATCH_PAGE_ADDRESS;
 
       if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
          unsigned idx_size = params.input_primitives * gsi->max_indices;
@@ -15340,7 +15344,9 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
 
       unsigned vb_size = poly_tcs_in_size(draws->count * info->instance_count,
                                           batch->uniforms.vertex_outputs);
-      vp.output_buffer = agx_pool_alloc_aligned(&batch->pool, vb_size, 4).gpu;
+      vp.output_buffer =
+         vb_size ? agx_pool_alloc_aligned(&batch->pool, vb_size, 4).gpu
+                 : AGX_SCRATCH_PAGE_ADDRESS;
 
       vs_grid = agx_3d(draws->count, info->instance_count, 1);
       tcs_grid = agx_3d(in_patches * tcs->tess.output_patch_size,
