@@ -737,6 +737,7 @@ if with_tests
          'test/test-rte-fma.cpp',
          'test/test-image-atomic-metadata.cpp',
          'test/test-ballot-count.cpp',
+         'test/test-agx3-ballot-modifiers.cpp',
          'test/test-border-index.cpp',
          'test/test-aligned-bounds.cpp',
          'test/test-agx2-image-acquire.cpp',

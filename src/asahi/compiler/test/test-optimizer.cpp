@@ -1001,6 +1001,64 @@ TEST_F(Optimizer, G17PBallotOfTwoRegistersKeepsTheComparison)
    ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
 }
 
+/* No AGX3 ballot compare takes a source modifier. A SIMD ballot of a
+ * comparison against |y| or -y ballots the opposite comparison against zero
+ * instead; a quad ballot keeps the comparison as its boolean. */
+TEST_F(Optimizer, AGX3BallotOfModifiedComparisonKeepsTheComparison)
+{
+   for (enum agx_isa_encoding encoding :
+        {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      for (bool negate : {false, true}) {
+         for (bool quad : {false, true}) {
+            SCOPED_TRACE(testing::Message() << encoding << negate << quad);
+            agx_builder *actual = agx_test_builder(mem_ctx);
+            agx_builder *expected = agx_test_builder(mem_ctx);
+            struct agx_shader_key key = {};
+            key.dev.encoding = encoding;
+            actual->shader->key = &key;
+            expected->shader->key = &key;
+
+            agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+            agx_index rhs = agx_fmov(actual, negate ? agx_neg(wy) : agx_abs(wy));
+            agx_index cmp = agx_fcmp(actual, wx, rhs, AGX_FCOND_LT, false);
+            if (quad)
+               agx_quad_ballot_to(actual, out, cmp);
+            else
+               agx_ballot_to(actual, out, cmp);
+            agx_unit_test(actual, out);
+
+            agx_index modified = negate ? agx_neg(wy) : agx_abs(wy);
+            out = agx_temp(expected->shader, AGX_SIZE_32);
+            agx_temp(expected->shader, AGX_SIZE_32);
+            if (quad) {
+               cmp = agx_temp(expected->shader, AGX_SIZE_32);
+               agx_fcmp_to(expected, cmp, wx, modified, AGX_FCOND_LT, false);
+               agx_quad_ballot_to(expected, out, cmp);
+            } else {
+               agx_temp(expected->shader, AGX_SIZE_16);
+               agx_index opposite = agx_temp(expected->shader, AGX_SIZE_16);
+               agx_fcmp_to(expected, opposite, wx, modified, AGX_FCOND_LT,
+                           true);
+               agx_icmp_ballot_to(expected, out, opposite, agx_zero(),
+                                  AGX_ICOND_UEQ, false);
+            }
+            agx_unit_test(expected, out);
+
+            agx_optimize_and_dce(actual->shader);
+            ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+         }
+      }
+   }
+}
+
+/* AGX2 encodes source modifiers on its fused ballot compare. */
+TEST_F(Optimizer, BallotConditionKeepsModifiersOnAGX2)
+{
+   CASE32(agx_ballot_to(b, out, agx_fcmp(b, wx, agx_fmov(b, agx_abs(wy)),
+                                         AGX_FCOND_LT, false)),
+          agx_fcmp_ballot_to(b, out, wx, agx_abs(wy), AGX_FCOND_LT, false));
+}
+
 /* Astro Bot's mesh shader: ballot(x < 6), signed. AGX3B has no immediate
  * ballot form for a signed comparison against a nonzero constant. */
 TEST_F(Optimizer, G17PBallotOfSignedCompareWithConstantKeepsTheComparison)
