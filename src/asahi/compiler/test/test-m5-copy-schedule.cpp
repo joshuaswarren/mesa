@@ -475,7 +475,7 @@ TEST(M5CopySchedule, PreambleUniformStoreDependenciesPreserved)
       agx_builder *b = s.b;
 
       agx_index in_ptr = agx_uniform(0, AGX_SIZE_64);
-      agx_index loaded = agx_temp(b->shader, AGX_SIZE_64);
+      agx_index loaded = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
       agx_device_load_to(b, loaded, in_ptr, agx_zero(), AGX_FORMAT_I32, 0x3, 0, 0);
       agx_uniform_store(b, loaded, agx_immediate(16), 0x3);
 

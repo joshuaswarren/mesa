@@ -239,14 +239,13 @@ check_g17p_task_kernel_shared(void)
    return valid;
 }
 
-/* AGX2 (M1/M2) never sets shared_element_index_agx and must keep its scalar
- * byte-addressed shared lowering without enabling nir_var_mem_shared
- * vectorization by default. */
+/* AGX2 (M1/M2) never sets shared_element_index_agx, keeps 16-bit byte-addressed
+ * shared offsets, and vectorizes adjacent compute shared loads and stores. */
 static bool
-check_agx2_compute_shared_not_vectorized(void)
+check_agx2_compute_shared_vectorized(void)
 {
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_COMPUTE, &agx_nir_options, "agx2 compute shared scalar");
+      MESA_SHADER_COMPUTE, &agx_nir_options, "agx2 compute shared vec2");
    b.shader->info.workgroup_size[0] = 32;
    b.shader->info.workgroup_size[1] = 1;
    b.shader->info.workgroup_size[2] = 1;
@@ -421,7 +420,7 @@ int
 main(void)
 {
    if (!check_g17p_task_kernel_shared() ||
-       !check_agx2_compute_shared_not_vectorized() ||
+       !check_agx2_compute_shared_vectorized() ||
        !check_agx3_generic_preprocess_shared_byte_offsets(AGX_CHIP_G17P) ||
        !check_agx3_generic_preprocess_shared_byte_offsets(AGX_CHIP_G17G) ||
        !check_agx3_generic_preprocess_shared_byte_offsets(AGX_CHIP_G18G))

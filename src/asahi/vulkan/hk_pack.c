@@ -26,10 +26,15 @@
  *   M5 part.
  * - AGX2 (G13/G14) streams end every dispatch with an in-stream CDM barrier
  *   (strong_flush_end) followed by AGX2's 8-byte CDM_STREAM_TERMINATE, and
- *   publish writes on command completion.
+ *   publish writes on command completion. Packet duration is bounded by the
+ *   planner's per-packet caps (HK_PACK_MAX_DISPATCHES, HK_PACK_MAX_THREADS,
+ *   HK_PACK_MAX_STATIC_WORK, and at most one looping-shader stream per packet;
+ *   see hk_pack.h) while hk_pack_attachment_limit() enforces the kernel's
+ *   max_attachments UAPI limit whenever reported.
  * - G15 streams end with an ordering barrier or wide-visibility strong flush
  *   (agx_chip_cdm_wide_visibility()) and AGX3's 4-byte terminate; boundaries
- *   upgrade the trailing barrier in place.
+ *   upgrade the trailing barrier in place, subject to the same planner work
+ *   and max_attachments caps.
  * - G16 and G17P (HAL200) streams pack where the caches are qualified
  *   (!hk_cdm_caches_pending()). On G17P, whose caches are tagged by virtual
  *   address, hk_pack_runs() passes hk_cdm_alias_scope(dev) to the boundary
@@ -58,13 +63,19 @@ hk_pack_cdm_terminate(enum agx_chip chip,
 {
    static_assert(AGX_CDM_STREAM_TERMINATE_LENGTH <= HK_PACK_CDM_TERMINATE_MAX,
                  "AGX2 CDM terminate fits in HK_PACK_CDM_TERMINATE_MAX");
+   static_assert(HK_PACK_CDM_TERMINATE_MAX % sizeof(uint32_t) == 0,
+                 "HK_PACK_CDM_TERMINATE_MAX is 32-bit word aligned");
    static_assert(AGX3_CDM_STREAM_TERMINATE_SIZE <= HK_PACK_CDM_TERMINATE_MAX,
                  "AGX3 CDM terminate fits in HK_PACK_CDM_TERMINATE_MAX");
 
    switch (agx_chip_command_stream_generation(chip)) {
    case AGX_CS_GENERATION_AGX2: {
-      uint32_t *end = agx_cdm_terminate((uint32_t *)out);
-      return (size_t)((uint8_t *)end - out);
+      uint32_t words[HK_PACK_CDM_TERMINATE_MAX / sizeof(uint32_t)];
+      uint32_t *end = agx_cdm_terminate(words);
+      const size_t len = (size_t)((uint8_t *)end - (uint8_t *)words);
+      assert(len <= HK_PACK_CDM_TERMINATE_MAX);
+      memcpy(out, words, len);
+      return len;
    }
    case AGX_CS_GENERATION_G15:
    case AGX_CS_GENERATION_HAL200:

@@ -1821,13 +1821,15 @@ agx_ilp_schedule(agx_context *ctx)
           * program's (preshader_register_count), so pressure is bounded only
           * to keep allocation comfortably inside the file.
           *
-          * On AGX2 compute shaders, the static register split caps preamble
-          * registers to agx_max_registers_for_occupancy(threads_per_workgroup)
-          * (104 halves at 1024 threads); stay strictly under that limit so
-          * preambles never spill into legacy scratch. */
+          * On static-register-split compute shaders (AGX2, AGX3D), the split
+          * caps preamble registers to
+          * agx_max_registers_for_occupancy(threads_per_workgroup) (104 halves
+          * at 1024 threads); stay strictly under that limit so preambles never
+          * spill into legacy scratch. */
          signed cprog_cap = AGX_ILP_CPROG_HALVES;
          signed cprog_slack = AGX_ILP_SLACK;
-         if (!is_agx3 && mesa_shader_stage_is_compute(ctx->stage)) {
+         if ((!is_agx3 || ctx->key->dev.emit_agx3d) &&
+             mesa_shader_stage_is_compute(ctx->stage)) {
             signed static_cap = ilp_static_compute_cap(ctx);
             if (static_cap < cprog_cap) {
                cprog_cap = static_cap;
