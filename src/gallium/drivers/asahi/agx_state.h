@@ -1061,6 +1061,13 @@ struct agx_context {
    float default_inner_level[2];
 
    struct agx_stage stage[MESA_SHADER_STAGES];
+
+   /* Graphics stages whose shader was still compiling on the screen's
+    * compiler queue when agx_bind_shader_state() bound it. agx_draw_vbo()
+    * waits for these before the draw reads the shaders, then clears them.
+    */
+   uint32_t stages_compiling;
+
    struct agx_vertex_elements *attributes;
    struct agx_rasterizer *rast;
    struct agx_zsa *zs;

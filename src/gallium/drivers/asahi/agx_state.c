@@ -5871,6 +5871,16 @@ agx_bind_shader_state(struct pipe_context *pctx, void *cso,
          ctx->stage[stage].dirty |= AGX_STAGE_DIRTY_SAMPLER;
    }
 
+   /* A shader's ready fence is reset once, when its asynchronous compile is
+    * queued at creation, and is only signalled after that. A shader that is
+    * ready when it is bound therefore stays ready, and only the stages bound
+    * while still compiling need a wait at the next draw. agx_launch_grid()
+    * waits for its compute shader itself.
+    */
+   if (stage != MESA_SHADER_COMPUTE && next &&
+       !util_queue_fence_is_signalled(&next->ready))
+      ctx->stages_compiling |= BITFIELD_BIT(stage);
+
    ctx->stage[stage].shader = cso;
 }
 
@@ -16299,8 +16309,16 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    if (unlikely(!agx_render_condition_check(ctx)))
       return;
 
-   for (unsigned s = 0; s < MESA_SHADER_COMPUTE; ++s)
-      agx_shader_wait_ready(ctx->stage[s].shader);
+   /* Finish compiling any graphics shader that was bound before its
+    * asynchronous compile completed (agx_bind_shader_state()). Every other
+    * bound shader is already ready, so most draws skip this.
+    */
+   const uint32_t compiling = ctx->stages_compiling;
+   if (unlikely(compiling)) {
+      u_foreach_bit(s, compiling)
+         agx_shader_wait_ready(ctx->stage[s].shader);
+      ctx->stages_compiling = 0;
+   }
 
    if (num_draws > 1) {
       agx_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
