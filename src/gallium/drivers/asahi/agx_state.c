@@ -851,10 +851,15 @@ agx_m5_dispatch_barrier_flags(const struct agx_device *dev)
 static bool
 agx_swtnl_can_tessellate(void)
 {
+   /* Draws on any context may ask first, so keep the cached answer atomic.
+    * Racing first calls compute the same value. */
    static int can = -1;
-   if (can < 0)
-      can = draw_get_option_use_llvm();
-   return can;
+   int value = p_atomic_read_relaxed(&can);
+   if (unlikely(value < 0)) {
+      value = draw_get_option_use_llvm();
+      p_atomic_set(&can, value);
+   }
+   return value;
 }
 
 /* M5 tessellates on the GPU (agx_draw_patches), as hk does, when the CPU path

@@ -2838,11 +2838,16 @@ DEBUG_GET_ONCE_OPTION(m5_pack_cdm_submit_opt, "ASAHI_M5_PACK_CDM_SUBMIT", NULL)
 static bool
 hk_pack_trace(void)
 {
+   /* Queue submissions on multiple queues may ask first, so keep the cached
+    * answer atomic. Racing first calls compute the same value. */
    static int trace = -1;
-   if (trace < 0)
-      trace = debug_get_bool_option("HK_PACK_CDM_TRACE", false) ||
-              debug_get_bool_option("ASAHI_M5_PACK_CDM_TRACE", false);
-   return trace;
+   int cached = p_atomic_read_relaxed(&trace);
+   if (unlikely(cached < 0)) {
+      cached = debug_get_bool_option("HK_PACK_CDM_TRACE", false) ||
+               debug_get_bool_option("ASAHI_M5_PACK_CDM_TRACE", false);
+      p_atomic_set(&trace, cached);
+   }
+   return cached;
 }
 
 static bool
