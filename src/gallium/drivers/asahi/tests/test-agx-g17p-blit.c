@@ -1751,6 +1751,262 @@ check_discard_main_sample_key(struct pipe_context *pctx)
    return ok;
 }
 
+static bool
+check_invalidate_and_bgra_readback(struct pipe_screen *screen,
+                                   struct pipe_context *pctx,
+                                   bool check_pixels)
+{
+   struct agx_context *ctx = agx_context(pctx);
+
+   /* 1. Flushed texture: invalidate_resource() must move previously valid
+    * levels from data_valid into invalidated_levels without tainting never-
+    * written levels, skip COLOR0 reload on the next batch, and clear
+    * invalidated_levels[0] as soon as the next batch writes level 0. */
+   struct pipe_resource tmpl = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .width0 = 64,
+      .height0 = 64,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 1,
+      .usage = PIPE_USAGE_DEFAULT,
+      .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+   };
+   struct pipe_resource *tex = screen->resource_create(screen, &tmpl);
+   if (!tex) {
+      fprintf(stderr, "invalidate test resource_create failed\n");
+      return false;
+   }
+   struct agx_resource *rsrc = agx_resource(tex);
+
+   struct pipe_framebuffer_state fb = {
+      .width = 64,
+      .height = 64,
+      .layers = 1,
+      .samples = 1,
+      .nr_cbufs = 1,
+   };
+   fb.cbufs[0] = (struct pipe_surface){
+      .texture = tex,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   pctx->set_framebuffer_state(pctx, &fb);
+
+   const union pipe_color_union c0 = {.f = {0.25f, 0.5f, 0.75f, 1.0f}};
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &c0, 0.0, 0);
+   pctx->flush(pctx, NULL, 0);
+
+   if (!agx_resource_valid(rsrc, 0) || agx_resource_valid(rsrc, 1) ||
+       BITSET_TEST(rsrc->invalidated_levels, 0) ||
+       BITSET_TEST(rsrc->invalidated_levels, 1)) {
+      fprintf(stderr, "unexpected valid/invalidated state after clear+flush\n");
+      pipe_resource_reference(&tex, NULL);
+      return false;
+   }
+
+   /* Unbind before invalidating (the try_pbo_upload_common() order). */
+   struct pipe_framebuffer_state empty_fb = {0};
+   pctx->set_framebuffer_state(pctx, &empty_fb);
+   pctx->invalidate_resource(pctx, tex);
+
+   if (agx_resource_valid(rsrc, 0) ||
+       !BITSET_TEST(rsrc->invalidated_levels, 0) ||
+       BITSET_TEST(rsrc->invalidated_levels, 1)) {
+      fprintf(stderr,
+              "expected invalidate_resource() to move level 0 to "
+              "invalidated_levels without tainting level 1 (valid0=%d inv0=%d "
+              "inv1=%d)\n",
+              agx_resource_valid(rsrc, 0),
+              BITSET_TEST(rsrc->invalidated_levels, 0),
+              BITSET_TEST(rsrc->invalidated_levels, 1));
+      pipe_resource_reference(&tex, NULL);
+      return false;
+   }
+
+   /* Re-binding and initializing a new batch must skip COLOR0 reload, mark
+    * level 0 valid again, and clear invalidated_levels[0]. */
+   pctx->set_framebuffer_state(pctx, &fb);
+   struct agx_batch *batch = agx_get_batch(ctx);
+   agx_batch_init_state(batch);
+   if ((batch->load & PIPE_CLEAR_COLOR0) || !agx_resource_valid(rsrc, 0) ||
+       BITSET_TEST(rsrc->invalidated_levels, 0)) {
+      fprintf(stderr,
+              "post-invalidate batch init wrong (load=%#x valid0=%d inv0=%d)\n",
+              batch->load, agx_resource_valid(rsrc, 0),
+              BITSET_TEST(rsrc->invalidated_levels, 0));
+      pipe_resource_reference(&tex, NULL);
+      return false;
+   }
+
+   /* 2. Active initialized batch: invalidate_resource() must drop resolve and
+    * dirty AGX_DIRTY_BLEND so a later draw in the same batch re-enables store,
+    * while preserving data_valid and keeping invalidated_levels clear. */
+   batch->resolve |= PIPE_CLEAR_COLOR0;
+   ctx->dirty &= ~AGX_DIRTY_BLEND;
+   pctx->invalidate_resource(pctx, tex);
+   if ((batch->resolve & PIPE_CLEAR_COLOR0) ||
+       !(ctx->dirty & AGX_DIRTY_BLEND) || !agx_resource_valid(rsrc, 0) ||
+       BITSET_TEST(rsrc->invalidated_levels, 0)) {
+      fprintf(stderr,
+              "active-batch invalidate state wrong (resolve=%#x dirty=%#x "
+              "valid=%d inv=%d)\n",
+              batch->resolve, ctx->dirty, agx_resource_valid(rsrc, 0),
+              BITSET_TEST(rsrc->invalidated_levels, 0));
+      pipe_resource_reference(&tex, NULL);
+      return false;
+   }
+   pctx->flush(pctx, NULL, 0);
+   pctx->set_framebuffer_state(pctx, &empty_fb);
+   pipe_resource_reference(&tex, NULL);
+
+   /* 3. Separate stencil: active-batch invalidate dirties AGX_DIRTY_ZS, and
+    * post-flush invalidate clears both depth and separate_stencil data_valid
+    * into invalidated_levels. */
+   struct pipe_resource *zs =
+      make_2d(screen, PIPE_FORMAT_Z32_FLOAT_S8X24_UINT, 64, 64,
+              PIPE_BIND_DEPTH_STENCIL);
+   if (!zs) {
+      fprintf(stderr, "invalidate test zs resource_create failed\n");
+      return false;
+   }
+   struct agx_resource *zrsrc = agx_resource(zs);
+   struct pipe_framebuffer_state zs_fb = {
+      .width = 64,
+      .height = 64,
+      .layers = 1,
+      .samples = 1,
+   };
+   zs_fb.zsbuf = (struct pipe_surface){
+      .texture = zs,
+      .format = PIPE_FORMAT_Z32_FLOAT_S8X24_UINT,
+   };
+   pctx->set_framebuffer_state(pctx, &zs_fb);
+   pctx->clear(pctx, PIPE_CLEAR_DEPTHSTENCIL, 0, 0, NULL, &c0, 0.5, 0x5a);
+
+   struct agx_batch *zs_batch = agx_get_batch(ctx);
+   zs_batch->resolve |= PIPE_CLEAR_DEPTHSTENCIL;
+   ctx->dirty &= ~AGX_DIRTY_ZS;
+   pctx->invalidate_resource(pctx, zs);
+   if ((zs_batch->resolve & PIPE_CLEAR_DEPTHSTENCIL) ||
+       !(ctx->dirty & AGX_DIRTY_ZS)) {
+      fprintf(stderr,
+              "active-batch ZS invalidate state wrong (resolve=%#x dirty=%#x)\n",
+              zs_batch->resolve, ctx->dirty);
+      pipe_resource_reference(&zs, NULL);
+      return false;
+   }
+
+   pctx->flush(pctx, NULL, 0);
+   pctx->set_framebuffer_state(pctx, &empty_fb);
+   pctx->invalidate_resource(pctx, zs);
+   if (agx_resource_valid(zrsrc, 0) ||
+       !BITSET_TEST(zrsrc->invalidated_levels, 0) ||
+       (zrsrc->separate_stencil &&
+        (agx_resource_valid(zrsrc->separate_stencil, 0) ||
+         !BITSET_TEST(zrsrc->separate_stencil->invalidated_levels, 0)))) {
+      fprintf(stderr,
+              "expected invalidate_resource() to move Z+S valid state into "
+              "invalidated_levels\n");
+      pipe_resource_reference(&zs, NULL);
+      return false;
+   }
+   pipe_resource_reference(&zs, NULL);
+
+   /* 4. BGRA8_UNORM -> RGBA8_UNORM blit readback (both uncompressed 32x32 and
+    * compression-eligible 256x256). Under the no-op shim this exercises the
+    * descriptor/shader path; on real hardware (check_pixels=true) it checks
+    * exact R/G/B/A channel values. */
+   const unsigned sizes[2] = {32, 256};
+   const uint8_t want[4] = {64, 128, 191, 255};
+   for (unsigned s = 0; s < ARRAY_SIZE(sizes); ++s) {
+      const unsigned dim = sizes[s];
+      struct pipe_resource *bgra =
+         make_2d(screen, PIPE_FORMAT_B8G8R8A8_UNORM, dim, dim,
+                 PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+      struct pipe_resource *rgba =
+         make_2d(screen, PIPE_FORMAT_R8G8B8A8_UNORM, dim, dim,
+                 PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+      if (!bgra || !rgba) {
+         fprintf(stderr, "BGRA->RGBA %ux%u resource_create failed\n", dim, dim);
+         pipe_resource_reference(&bgra, NULL);
+         pipe_resource_reference(&rgba, NULL);
+         return false;
+      }
+
+      struct pipe_framebuffer_state bfb = {
+         .width = dim,
+         .height = dim,
+         .layers = 1,
+         .samples = 1,
+         .nr_cbufs = 1,
+      };
+      bfb.cbufs[0] = (struct pipe_surface){
+         .texture = bgra,
+         .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+      };
+      pctx->set_framebuffer_state(pctx, &bfb);
+      pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &c0, 0.0, 0);
+
+      struct pipe_blit_info binfo = {
+         .src = {
+            .resource = bgra,
+            .level = 0,
+            .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+            .box = {.width = dim, .height = dim, .depth = 1},
+         },
+         .dst = {
+            .resource = rgba,
+            .level = 0,
+            .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+            .box = {.width = dim, .height = dim, .depth = 1},
+         },
+         .mask = PIPE_MASK_RGBA,
+         .filter = PIPE_TEX_FILTER_NEAREST,
+      };
+      pctx->blit(pctx, &binfo);
+      pctx->flush(pctx, NULL, 0);
+
+      if (check_pixels) {
+         struct pipe_transfer *xfer = NULL;
+         uint8_t *map = pipe_texture_map(pctx, rgba, 0, 0, PIPE_MAP_READ, 0, 0,
+                                         dim, dim, &xfer);
+         if (!map || !xfer) {
+            fprintf(stderr, "BGRA->RGBA %ux%u transfer_map failed\n", dim, dim);
+            pipe_resource_reference(&bgra, NULL);
+            pipe_resource_reference(&rgba, NULL);
+            return false;
+         }
+         for (unsigned y = 0; y < dim; ++y) {
+            const uint8_t *row = map + y * xfer->stride;
+            for (unsigned x = 0; x < dim; ++x) {
+               const uint8_t *px = row + x * 4;
+               if (memcmp(px, want, 4) != 0) {
+                  fprintf(stderr,
+                          "BGRA->RGBA %ux%u mismatch at (%u,%u): got "
+                          "(%u,%u,%u,%u) want (%u,%u,%u,%u)\n",
+                          dim, dim, x, y, px[0], px[1], px[2], px[3], want[0],
+                          want[1], want[2], want[3]);
+                  pipe_texture_unmap(pctx, xfer);
+                  pipe_resource_reference(&bgra, NULL);
+                  pipe_resource_reference(&rgba, NULL);
+                  return false;
+               }
+            }
+         }
+         pipe_texture_unmap(pctx, xfer);
+      }
+
+      pctx->set_framebuffer_state(pctx, &empty_fb);
+      pipe_resource_reference(&bgra, NULL);
+      pipe_resource_reference(&rgba, NULL);
+   }
+
+   printf("invalidate + BGRA8->RGBA8 readback check passed (check_pixels=%d)\n",
+          check_pixels);
+   return true;
+}
+
 int
 main(void)
 {
@@ -1813,6 +2069,14 @@ main(void)
       return ok ? 0 : 1;
    }
 
+   if (getenv("AGX_TEST_BGRA_READBACK_HW")) {
+      const bool ok = check_invalidate_and_bgra_readback(screen, pctx, true);
+      pctx->destroy(pctx);
+      screen->destroy(screen);
+      close(fd);
+      return ok ? 0 : 1;
+   }
+
    if (getenv("AGX_TEST_XFB_COPY_PROGRAM")) {
       glsl_type_singleton_init_or_ref();
       /* A triangle capture shades one of three candidate vertices, so its
@@ -1845,6 +2109,9 @@ main(void)
       return 1;
 
    if (!check_staged_resolve_shapes())
+      return 1;
+
+   if (!check_invalidate_and_bgra_readback(screen, pctx, false))
       return 1;
 
    if (!check_es3_compile_contract(pctx))
@@ -2102,14 +2369,23 @@ main(void)
       agx_chip_command_stream_generation(dev->chip) == AGX_CS_GENERATION_AGX2;
    int status = 0;
 
-   /* AGX2 keeps blit-based texture transfers. Later generations use mapped
-    * transfers, which convert formats on the CPU. */
+   /* AGX2 and Gen9 AGX3 advertise blit-based texture transfers; Gen10 keeps
+    * mapped CPU transfers while its PBE encoder refuses sRGB, mipmapped
+    * (non-G18), and linear layered (G18) transfer targets. */
+   const enum agx_descriptor_generation desc_gen =
+      agx_chip_descriptor_generation(dev->chip);
    const unsigned want_transfer_modes =
-      agx2 ? PIPE_TEXTURE_TRANSFER_BLIT : PIPE_TEXTURE_TRANSFER_DEFAULT;
-   if (screen->caps.texture_transfer_modes != want_transfer_modes) {
-      fprintf(stderr, "texture transfer modes %#x on %s, expected %#x\n",
-              screen->caps.texture_transfer_modes, agx_chip_name(dev->chip),
-              want_transfer_modes);
+      (agx_gallium_descriptor_generation_is_agx2(desc_gen) ||
+       desc_gen == AGX_DESCRIPTOR_GENERATION_9)
+         ? PIPE_TEXTURE_TRANSFER_BLIT
+         : PIPE_TEXTURE_TRANSFER_DEFAULT;
+   if (screen->caps.texture_transfer_modes != want_transfer_modes ||
+       !screen->caps.invalidate_pbo_upload_destination) {
+      fprintf(stderr,
+              "texture transfer caps (%#x, inv_pbo=%d) on %s, expected (%#x, 1)\n",
+              screen->caps.texture_transfer_modes,
+              screen->caps.invalidate_pbo_upload_destination,
+              agx_chip_name(dev->chip), want_transfer_modes);
       status = 1;
    }
 
