@@ -2489,15 +2489,6 @@ hk_pool_alloc_from(struct hk_cmd_buffer *cmd, struct hk_uploader *uploader,
    return hk_pool_alloc_from_slow(cmd, uploader, size, alignment, type);
 }
 
-/* Chips with an Ioto program generation fetch ordinary graphics descriptors
- * from GPU memory through an immutable command-buffer root table and track
- * descriptor/root lifetimes independently of per-draw USC uniform builders. */
-static inline bool
-hk_chip_uses_ioto_descriptor_root(enum agx_chip chip)
-{
-   return agx_chip_ioto_generation(chip) != AGX_IOTO_GENERATION_NONE;
-}
-
 struct agx_ptr hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
                                 uint32_t alignment);
 struct agx_ptr hk_pool_vdm_primary_alloc(struct hk_cmd_buffer *cmd,
