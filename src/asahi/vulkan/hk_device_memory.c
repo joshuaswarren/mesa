@@ -530,7 +530,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          flags |= AGX_BO_SHAREABLE;
       /* A failed WSI export must not leave pinned backing in the BO cache.
        * Successful exports already acquire AGX_BO_SHARED. */
-      if (dev->dev.chip == AGX_CHIP_G17P &&
+      if (!dev->dev.is_virtio &&
           vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA))
          flags |= AGX_BO_NO_CACHE;
       if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
@@ -953,7 +953,7 @@ hk_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo,
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
       *pFD = agx_bo_export(&dev->dev, memory->bo);
-      if (*pFD < 0 && dev->dev.chip == AGX_CHIP_G17P)
+      if (*pFD < 0 && !dev->dev.is_virtio)
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       return VK_SUCCESS;
    default:

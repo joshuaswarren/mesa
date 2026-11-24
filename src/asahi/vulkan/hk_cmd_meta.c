@@ -85,9 +85,8 @@ hk_device_init_meta(struct hk_device *dev)
    /* hk never uses layered rendering for meta, so a one-layer attachment
     * view always renders Layer 0: the specialization holds on every chip. */
    dev->meta.specialize_single_layer_buffer_upload = true;
-   /* Other native chips lower a stencil blit to eight bit-selective discard
-    * passes. G17P exports stencil in one draw, which also resolves depth and
-    * stencil together: 1.50 to 0.48 ms for a 2x D32S8 at 3456x2234. */
+   /* Export stencil in one draw across all chips, which also resolves depth
+    * and stencil together (1.50 to 0.48 ms for a 2x D32S8 at 3456x2234). */
    dev->meta.use_stencil_export = true;
    /* A scaled image is read through an exact integer descriptor or a
     * filterable normalized one depending on whether the sampler filters, so
