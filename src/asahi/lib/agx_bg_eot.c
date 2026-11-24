@@ -227,6 +227,7 @@ agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
                &bindless_base, NULL, NULL, false,
                cache->dev->chip == AGX_CHIP_G18G,
                cache->dev->chip == AGX_CHIP_G18G,
+               cache->dev->chip == AGX_CHIP_G18G,
                agx_chip_native_or_m5(cache->dev->chip),
                cache->dev->chip == AGX_CHIP_G18G);
       NIR_PASS(_, shader, agx_nir_lower_monolithic_msaa, tib->nr_samples);
@@ -465,8 +466,8 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
       bool layered = key->tib.layered;
       assert(nr > 0);
 
-      if (key->g17p_packed_clear && key->op[rt] == AGX_BG_CLEAR &&
-          agx_chip_native_agx3(cache->dev->chip) && rt == 0 &&
+      if (key->packed_clear && key->op[rt] == AGX_BG_CLEAR &&
+          agx_chip_native_or_m5(cache->dev->chip) && rt == 0 &&
           agx_g17p_packed_clear_ok(&key->tib)) {
          /* One raw tile word: the driver packed the clear colour exactly as
           * the R8G8B8A8_UNORM FLTNORM pair would, so store its 32 bits. */

@@ -1576,7 +1576,9 @@ intrinsic("cmat_insert", src_comp=[-1, 1, -1, 1])
 intrinsic("cmat_copy", src_comp=[-1, -1])
 intrinsic("cmat_transpose", src_comp=[-1, -1], indices=[SATURATE, CMAT_SIGNED_MASK, FP_MATH_CTRL])
 intrinsic("cmat_get_coordinate", src_comp=[1], dest_comp=2, indices=[CMAT_DESC], bit_sizes=[32])
-intrinsic("cmat_muladd_agx", src_comp=[0, 0, 0], dest_comp=0, bit_sizes=[32], indices=[SRC_TYPE, SRC_TYPE2],
+# AGX matmad: src[] = { A, B, C }; the result has C's width (f32, or f16 for an
+# f16 accumulator the hardware sums natively).
+intrinsic("cmat_muladd_agx", src_comp=[0, 0, 0], dest_comp=0, bit_sizes=('src', 2), indices=[SRC_TYPE, SRC_TYPE2],
           flags=[CAN_ELIMINATE, SUBGROUP])
 
 # src[] = { deref }.
@@ -2611,10 +2613,10 @@ intrinsic("load_uvs_index_agx", dest_comp = 1, bit_sizes=[16],
 # src[] = { sample mask }
 # base = byte offset, target = logical colour attachment index. The latter
 # remains unchanged when inactive attachments compact the physical layout.
-load("local_pixel_agx", [1], [BASE, FORMAT, TARGET], [CAN_REORDER, CAN_ELIMINATE])
+load("local_pixel_agx", [1], [BASE, FORMAT, TARGET], [CAN_ELIMINATE])
 # src[] = { value, sample mask, coordinates }
 # base = byte offset, target = logical colour attachment index
-store("local_pixel_agx", [1, -1], [BASE, WRITE_MASK, FORMAT, EXPLICIT_COORD, TARGET], [CAN_REORDER])
+store("local_pixel_agx", [1, -1], [BASE, WRITE_MASK, FORMAT, EXPLICIT_COORD, TARGET], [])
 
 # Combined depth/stencil emit, applying to a mask of samples. base indicates
 # which to write (1 = depth, 2 = stencil, 3 = both).

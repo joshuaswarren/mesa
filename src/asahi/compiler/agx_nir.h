@@ -7,11 +7,14 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "asahi/lib/agx_chip.h"
 
 struct nir_shader;
 struct nir_instr;
 struct nir_builder;
 struct nir_def;
+struct nir_alu_instr;
+struct hash_table;
 
 /* BASE bit3 selects an explicit byte-scaled AGX3 load/store index. */
 #define AGX_NIR_MEMORY_INDEX_BYTES 8u
@@ -43,6 +46,7 @@ struct nir_def;
 bool agx_nir_lower_address(struct nir_shader *shader, bool byte_indices,
                            bool byte_offsets, bool checked_offsets);
 bool agx_nir_preserve_position_order(struct nir_shader *shader);
+bool agx_nir_opt_shared_phase_cse(struct nir_shader *shader);
 bool agx_nir_scalarize_int64(struct nir_shader *shader);
 bool agx_nir_lower_divmod64(struct nir_shader *shader, bool native_add64);
 bool agx_nir_lower_algebraic_late(struct nir_shader *shader);
@@ -54,16 +58,21 @@ bool agx_nir_lower_g17p_1x_tile_samples(struct nir_shader *s);
 bool agx_nir_fold_d3d_float_to_int(struct nir_shader *shader);
 bool agx_nir_fold_pixel_coord(struct nir_shader *shader);
 bool agx_nir_fold_extract16_bfe(struct nir_shader *shader);
+bool agx_nir_opt_half_bitfield_extract(struct nir_shader *shader);
 bool agx_nir_cleanup_amul(struct nir_shader *shader);
 bool agx_nir_fuse_lea(struct nir_shader *shader);
 bool agx_nir_lower_lea(struct nir_shader *shader);
 bool agx_nir_fuse_selects(struct nir_shader *shader);
 bool agx_nir_m5_split_or_selects(struct nir_shader *shader);
 bool agx_nir_opt_select_load(struct nir_shader *shader);
+bool agx_nir_opt_narrow_subword_loads(struct nir_shader *shader);
 bool agx_nir_opt_flatten_loads(struct nir_shader *shader, unsigned limit,
                                unsigned max_loads);
+bool agx_nir_opt_merge_nested_early_exits(struct nir_shader *shader);
+bool agx_nir_hoist_loop_invariant_guard_bits(struct nir_shader *shader);
 bool agx_nir_opt_sink_loop_sample_uses(struct nir_shader *shader);
 bool agx_nir_opt_hoist_loop_samples(struct nir_shader *shader);
+bool agx_nir_opt_factor_const_mul(struct nir_shader *shader);
 bool agx_nir_fuse_algebraic_late(struct nir_shader *shader);
 bool agx_nir_fuse_doubled_add(struct nir_shader *shader);
 bool agx_nir_fold_byte_to_float(struct nir_shader *shader);
@@ -75,6 +84,13 @@ bool agx_nir_lower_subgroups(struct nir_shader *s);
 bool agx_nir_lower_subgroups_g17p(struct nir_shader *s);
 bool agx_nir_lower_subgroups_m5(struct nir_shader *s, bool native_shuffle_xor,
                                 bool native_float_minmax);
+bool agx_nir_lower_subgroups_for_target(struct nir_shader *s, bool g17p,
+                                        bool m5, bool g18g);
+#ifndef NDEBUG
+bool agx_nir_subgroup_intrinsic_needs_lowering(
+   const struct nir_shader *s, const struct nir_intrinsic_instr *intr,
+   bool g17p, bool m5, bool g18g);
+#endif
 bool agx_nir_flush_subgroup_minmax(struct nir_shader *s);
 bool agx_nir_lower_dynamic_shuffle_xor(struct nir_shader *s);
 bool agx_nir_lower_quad_derivative_ids(struct nir_shader *s);
@@ -91,11 +107,14 @@ struct nir_def *agx_nir_quad_ddy(struct nir_builder *b, struct nir_def *v);
  * still guarantees it for any AGX3 target. */
 bool agx_nir_lower_shared_element_index(struct nir_shader *s);
 bool agx_nir_opt_shared_byte_offsets(struct nir_shader *s);
-bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget);
+bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget,
+                      bool cap_rt_compute);
+bool agx_nir_opt_monotonic_bit_insert(struct nir_shader *shader);
+bool agx_nir_opt_iv_divmod(struct nir_shader *shader);
 bool agx_nir_lower_fminmax(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_fminmax_signed_zero(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_word_bounds(struct nir_shader *s);
-bool agx_nir_share_bounds(struct nir_shader *s);
+bool agx_nir_share_bounds(struct nir_shader *s, bool size_below_u32_max);
 bool agx_nir_lower_atomics(struct nir_shader *s, bool native_fadd);
 bool agx_nir_opt_canonical_minmax(struct nir_shader *s);
 
@@ -122,6 +141,12 @@ bool agx_nir_lower_texture(struct nir_shader *s);
  * read the word from the PBE's last eight bytes, where Gallium keeps it.
  * Texel-buffer atomics are not affected. */
 #define AGX_NIR_TEXTURE_IMAGE_SIDEBAND (1u << 9)
+/* Hardware enforces view bounds and missing-alpha one on integer texelFetch
+ * for spatial coordinates and 16-bit array layers given a valid LOD and
+ * sample index (agx_chip_hw_texel_fetch_bounds). Saturate wide
+ * layer/LOD/sample indices before 16-bit narrowing and predicate nonzero LODs
+ * and multisample sample indices against view metadata. */
+#define AGX_NIR_TEXTURE_HW_TXF_BOUNDS (1u << 10)
 /* Answer a constant level-zero size query of a non-array 2D view from the
  * extent the driver keeps in the descriptor's last word
  * (AGX_GEN10_IMAGE_EXTENT_OFFSET, agx_chip_texture_descriptor_spare_word). */
@@ -352,12 +377,11 @@ bool agx_nir_lower_to_per_sample_agx2(struct nir_shader *shader);
 bool agx_nir_lower_monolithic_msaa_agx2(struct nir_shader *shader, uint8_t nr_samples);
 
 bool agx_nir_lower_denorm_preserve(struct nir_shader *shader);
-bool agx_nir_fma_rte_applies(const struct nir_shader *shader);
-bool agx_nir_lower_fma_rte(struct nir_shader *shader);
+bool agx_nir_lower_fma_rte(struct nir_shader *shader, enum agx_chip chip);
 struct nir_def *agx_nir_fma_rte_fixup(struct nir_builder *b, struct nir_def *a,
                                     struct nir_def *c, struct nir_def *z,
                                     struct nir_def *native);
-bool agx_nir_lower_cmat(struct nir_shader *s);
+bool agx_nir_lower_cmat(struct nir_shader *s, bool native_f16_accum8);
 bool agx_nir_lower_cmat_calls(struct nir_shader *s);
 bool agx_nir_cmat_supported(struct nir_shader *s);
 bool agx_nir_lower_cmat_tensor(struct nir_shader *s, bool pairing);
@@ -366,3 +390,14 @@ bool agx_nir_lower_cmat_flexible(struct nir_shader *s, bool *pairing);
 bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,
                                                     bool support_lod_bias,
                                                     bool lower_2d_robustness);
+
+bool agx_nir_opt_nonneg_idiv(struct nir_shader *shader);
+
+bool agx_nir_opt_uniform_idiv(struct nir_shader *shader);
+bool agx_nir_uniform_idiv_applies(struct nir_alu_instr *alu,
+                                  struct hash_table *cache);
+bool agx_nir_lower_integer_division(struct nir_shader *nir,
+                                    bool forms_preamble);
+bool agx_nir_has_loop(const struct nir_shader *nir);
+bool agx_nir_limit_heavy_branch_unroll(struct nir_shader *nir);
+bool agx_nir_opt_u8x4_hsum(struct nir_shader *shader);

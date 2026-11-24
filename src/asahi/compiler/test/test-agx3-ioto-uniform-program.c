@@ -454,7 +454,9 @@ test_cprog_publication_refusals(void)
    desc.fast_path_enabled = true;
    CHECK(generate_fails_unchanged(AGX_CHIP_G17P, &desc, workspace(&f), 1200));
    desc.fast_path_enabled = false;
-   CHECK(generate_fails_unchanged(AGX_CHIP_G16G, &desc, workspace(&f), 1200));
+   CHECK(generate_fails_unchanged(AGX_CHIP_G15G, &desc, workspace(&f), 1200));
+   CHECK(agx3_ioto_uniform_program_desc_body_bound(
+      AGX_CHIP_G16G, &desc, &size, &chunks));
    struct agx3_ioto_uniform_program_workspace small = workspace(&f);
    small.body_capacity = 1;
    CHECK(generate_fails_unchanged(AGX_CHIP_G17P, &desc, small, 1200));

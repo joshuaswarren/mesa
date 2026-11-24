@@ -109,6 +109,12 @@ constant_use_accepts_uniform(agx_context *ctx, const agx_instr *I, unsigned s,
        agx3_m5_float_accepts_uniform(ctx, I, s, uniform, size))
       return true;
 
+   /* M5 32-bit integer compare-select reads an aligned 32-bit uniform in its
+    * right comparand and/or either selected operand natively. */
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       agx3_m5_isel_accepts_uniform(ctx, I, s, uniform, size))
+      return true;
+
    if (I->nr_srcs > 3 ||
        uniform >= AGX_NUM_UNIFORMS)
       return false;

@@ -19,7 +19,8 @@ one node tree per form again. legacy_c() prints the rows as the C file they
 were checked in as, which is how gen_agx3_tables.py --verify proves that a
 description still holds exactly those rows.
 
-Composer mirrors agx3_compose.c exactly, including every fail-closed rule.
+Composer agrees with agx3_compose.c, including every fail-closed rule, on
+every description gen_agx3_tables.py accepts.
 
 Decoder is the inverse: for an instruction's bytes it walks the candidate
 forms' choice groups (alternatives in table order, pruned by their constant

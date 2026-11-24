@@ -2,71 +2,15 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * AGX3 `isel` -- the fused integer compare-and-select.
+ * AGX3 `isel` (fused integer compare-and-select, AGX_OPCODE_ICMPSEL).
  *
- * AGX3 keeps AGX2's fused compare-select: one instruction compares two
- * registers under a condition and returns one of two further operands. That
- * is Mesa's AGX_OPCODE_ICMPSEL exactly, which matters because
- * agx_lower_pseudo() turns *every* AGX_OPCODE_ICMP into an icmpsel -- without
- * this encoder no shader containing any integer comparison can be compiled.
- *
- * The GPU0 forms below are probe-witnessed. GPU1 additionally has a separate
- * 32-bit iseli32 encoder derived from the AGX3c tables; its field mapping and
- * encoding regression do not by themselves establish hardware correctness.
- * A ladder of 12 MSL
- * kernels differing only in the comparison operator was compiled by Apple's
- * own offline translator (`metal-nt -arch applegpu_g16g`, the AGX3b encoding
- * G17P uses) and decoded through the encoder tables. The condition
- * field f106 tracked the operator one-for-one and turned out to be numbered
- * exactly like `enum agx_icond`:
- *
- *     ult = 1   ugt = 2   eq = 4   slt = 5   sgt = 6
- *
- * which is the same numbering agx3_cf_core.c already carries for `icmp`'s
- * f42. There is no le/ge/ne condition and no invert bit: Apple emits the
- * inverse condition with the two selected operands swapped, which is also how
- * Mesa spells them, so no translation is needed. Condition 3 is witnessed in
- * Apple's corpus with unknown meaning and is refused here, as in the CF core.
- *
- * Each selected operand is independently a register or an 8-bit immediate,
- * and the two kinds use different value fields, which the probes pin
- * separately:
- *
- *   both registers   ep27  kind 3, values f66 / f83
- *   both immediates  ep27  kind 1, values f64 / f81   (ep25 when 16-bit)
- *   register + imm   ep27  kind 2 register in f65, immediate in f81
- *   imm + register   ep27  kind 1 immediate in f64, register in f82
- *
- * The mixed register fields f65/f82 were pinned by a kernel containing two
- * such selects over different registers: only those fields tracked the two
- * register numbers. Every shape below reproduces its witnessed instruction
- * byte-for-byte. Both widths support all four selected-operand shapes.
- *
- * Scoreboard waits ride on fields f98..f103, one per slot 1..6. That is
- * probe-derived at both ends: a select consuming a load that signalled slot 6
- * sets f103, and one consuming a load that signalled slot 1 sets f98.
- *
- * The production explicit-hint form uses kind-2 register operands and actual
- * post-RA cache/discard bits. Fresh G17P uint/ushort dead/live witnesses pin
- * comparator fields f44/f46 and f59/f61, and selection fields f74/f76 and
- * f91/f93. Native 16-bit signed comparisons/equality carry f47/f62 on register
- * comparands, matching the signed short and unsigned equality witnesses.
- * A right-hand u8 immediate uses f49/kind1; the packer reverses comparisons
- * with an immediate on the left. Signed/unsigned 16-bit and u8-comparand forms stay
- * fused, without temporary register materialization.
- *
- * f12 is destination cache. A fresh direct-store/continued-use pair changes
- * only destination register allocation and f12; the continued-use form sets
- * it for a 16-bit boolean result even though both selected values are
- * immediates. The compact native wait selector represents one slot or slots1+2;
- * other producer combinations must be retired separately before this form.
- *
- * GPU1 (applegpu_g17g) witnesses from gpu/m5-xfb-alu8-reference.metal pin a
- * ushort comparand against the immediate 2 with a word result -- selecting a
- * register or zero, and two registers -- plus the uint-comparand twin. All
- * three store their result directly and carry f11=0 whatever the selected
- * operands, so on GPU1 f11 is the destination-cache hint (as in every other
- * GPU1 form with the f9/f10/f2/f11 header), not a mixed-selection flag.
+ * Condition field f106 matches `enum agx_icond` (ult=1, ugt=2, eq=4, slt=5,
+ * sgt=6; le/ge/ne swap the selected operands, condition 3 is refused).
+ * Selected operands may independently be registers or 8-bit immediates;
+ * scoreboard waits use f98..f103 on AGX3B (compact form supports a single slot
+ * or slots 1+2). Destination cache is f12 on AGX3B and f11 on AGX3C.
+ * Note: GPU0 forms are probe-verified; the separate AGX3C iseli32 encoder is
+ * derived from the AGX3C tables.
  */
 
 #pragma once

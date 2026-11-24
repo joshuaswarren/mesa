@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "asahi/lib/agx_chip.h"
 #include "hk_sync.h"
 
 struct hk_cmd_buffer;
@@ -32,6 +33,7 @@ struct hk_sync_queue;
 #define HK_PACK_MAX_DISPATCHES 256u
 #define HK_PACK_MAX_THREADS (UINT64_C(1) << 28)
 #define HK_PACK_MAX_STATIC_WORK (UINT64_C(1) << 35)
+#define HK_PACK_CDM_TERMINATE_MAX 8u
 
 /* One command buffer of a submission, as the planner sees it. */
 struct hk_pack_member {
@@ -84,6 +86,11 @@ enum hk_pack_boundary {
 
 enum hk_pack_boundary hk_pack_boundary(const struct hk_device *dev);
 
+/* Packs the CDM stream-terminate record for `chip` into `out` and returns its
+ * byte length (8 for AGX2, 4 for AGX3), or 0 if unsupported. */
+size_t hk_pack_cdm_terminate(enum agx_chip chip,
+                             uint8_t out[HK_PACK_CDM_TERMINATE_MAX]);
+
 /* Whether a member may end with a strong flush without memory scope, as an
  * application barrier at the end of a command buffer leaves it: at every
  * boundary. The HAL200 boundary upgrades it in place; at the
@@ -124,6 +131,13 @@ unsigned hk_pack_plan(const struct hk_pack_member *members, unsigned n,
                       const struct hk_pack_limits *limits,
                       struct hk_pack_run *runs, unsigned *packed_members,
                       size_t *total);
+
+/* Initializes a reusable packet's command buffer and compute control stream,
+ * resetting only the compute-relevant state and preserving dynarray backing
+ * storage across submissions. */
+void hk_pack_init_packet(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                         struct hk_device *dev, uint8_t *start, uint64_t addr,
+                         size_t bytes, bool visible_completion);
 
 /* Records member `item` (the stream of `source`) in the packet's
  * synchronization: what it waits for, what it makes later command buffers

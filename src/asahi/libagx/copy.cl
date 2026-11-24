@@ -30,19 +30,22 @@ libagx_copy_uchar(global uint8_t *dest, global uint8_t *src)
 static uint
 libagx_space_bits(uint x)
 {
-   uint accum = 0;
-   for (uint i = 0; i < 14; ++i)
-      accum |= (x & (1u << i)) << i;
-   return accum;
+   x &= 0x3fffu;
+   x = (x | (x << 8)) & 0x00ff00ffu;
+   x = (x | (x << 4)) & 0x0f0f0f0fu;
+   x = (x | (x << 2)) & 0x33333333u;
+   x = (x | (x << 1)) & 0x55555555u;
+   return x;
 }
 
 static uint
 libagx_space_bits_7(uint x)
 {
-   uint accum = 0;
-   for (uint i = 0; i < 7; ++i)
-      accum |= (x & (1u << i)) << i;
-   return accum;
+   x &= 0x7fu;
+   x = (x | (x << 4)) & 0x0f0fu;
+   x = (x | (x << 2)) & 0x3333u;
+   x = (x | (x << 1)) & 0x5555u;
+   return x;
 }
 
 /*
@@ -129,16 +132,45 @@ libagx_copy_image(global uint8_t *dest, global uint8_t *src,
 
 /* Round an unsigned four-sample average like G17P's linear sampler followed
  * by a normalized colour write. Exact output ties move toward code 128. This
- * avoids the still-unqualified G17P float-to-integer convert encoding. */
-static uint8_t
-libagx_average4_unorm8(uint a, uint b, uint c, uint d)
+ * avoids the still-unqualified G17P float-to-integer convert encoding.
+ *
+ * Each 16-bit SWAR lane holds the sum of four bytes in [0, 1020] (bit 9 is 1
+ * iff quotient >= 128), so adding 2 - ((sum >> 9) & 1) before >> 2 rounds
+ * exact half-ties upward below 128 and downward at or above 128, bit-exact
+ * with the scalar rule. */
+static uint
+libagx_average4_unorm8x4(uint p00, uint p10, uint p01, uint p11)
 {
-   uint sum = a + b + c + d;
-   uint quotient = sum >> 2;
-   uint remainder = sum & 3u;
-   return (uint8_t)(quotient +
-                    (remainder > 2u ||
-                     (remainder == 2u && quotient < 128u)));
+   uint rb = (p00 & 0x00ff00ffu) + (p10 & 0x00ff00ffu) +
+             (p01 & 0x00ff00ffu) + (p11 & 0x00ff00ffu);
+   uint ga = ((p00 >> 8) & 0x00ff00ffu) + ((p10 >> 8) & 0x00ff00ffu) +
+             ((p01 >> 8) & 0x00ff00ffu) + ((p11 >> 8) & 0x00ff00ffu);
+   rb = ((rb + 0x00020002u - ((rb >> 9) & 0x00010001u)) >> 2) & 0x00ff00ffu;
+   ga = ((ga + 0x00020002u - ((ga >> 9) & 0x00010001u)) >> 2) & 0x00ff00ffu;
+   return rb | (ga << 8);
+}
+
+/* Compact the even bits of a 6-bit Morton index (0..63) to 0..7. */
+static uint
+libagx_compact_bits_6(uint v)
+{
+   v &= 0x55u;
+   v = (v | (v >> 1)) & 0x33u;
+   return (v | (v >> 2)) & 0x0fu;
+}
+
+/* Byte offset of a 4-byte GPU-tiled pixel with tile_width/height_log2 <= 7. */
+static uint
+libagx_tiled_offset_4b(uint x, uint y, uint tiles_per_row,
+                       uint tile_width_log2, uint tile_height_log2)
+{
+   uint tile_idx = (y >> tile_height_log2) * tiles_per_row +
+                   (x >> tile_width_log2);
+   uint tile_x = x & ((1u << tile_width_log2) - 1u);
+   uint tile_y = y & ((1u << tile_height_log2) - 1u);
+   uint morton = libagx_space_bits_7(tile_x) |
+                 (libagx_space_bits_7(tile_y) << 1);
+   return ((tile_idx << (tile_width_log2 + tile_height_log2)) + morton) << 2;
 }
 
 /*
@@ -146,7 +178,7 @@ libagx_average4_unorm8(uint a, uint b, uint c, uint d)
  * RGBA and BGRA are both channel-order agnostic here: each stored byte is
  * filtered independently and written back in the same order.
  */
-KERNEL(32)
+KERNEL2D(8, 8)
 libagx_mipmap_unorm8x4(global uint8_t *dest, global uint8_t *src,
                        uint dest_width_px, uint dest_height_px,
                        uint src_scale_x, uint src_scale_y,
@@ -159,29 +191,103 @@ libagx_mipmap_unorm8x4(global uint8_t *dest, global uint8_t *src,
    if (x >= dest_width_px || y >= dest_height_px)
       return;
 
-   uint dest_offset = libagx_copy_image_offset_pow2(
-      x, y, 0, dest_tiles_per_row, dest_tile_width_log2,
-      dest_tile_height_log2, 4, 1);
+   uint dest_offset = libagx_tiled_offset_4b(
+      x, y, dest_tiles_per_row, dest_tile_width_log2, dest_tile_height_log2);
    uint src_x = x * src_scale_x;
    uint src_y = y * src_scale_y;
-   uint src00 = libagx_copy_image_offset_pow2(
-      src_x, src_y, 0, src_tiles_per_row, src_tile_width_log2,
-      src_tile_height_log2, 4, 1);
-   uint src10 = libagx_copy_image_offset_pow2(
-      src_x + src_scale_x - 1, src_y, 0, src_tiles_per_row,
-      src_tile_width_log2, src_tile_height_log2, 4, 1);
-   uint src01 = libagx_copy_image_offset_pow2(
-      src_x, src_y + src_scale_y - 1, 0, src_tiles_per_row,
-      src_tile_width_log2, src_tile_height_log2, 4, 1);
-   uint src11 = libagx_copy_image_offset_pow2(
-      src_x + src_scale_x - 1, src_y + src_scale_y - 1, 0,
-      src_tiles_per_row, src_tile_width_log2, src_tile_height_log2, 4, 1);
+   uint src00 = libagx_tiled_offset_4b(
+      src_x, src_y, src_tiles_per_row, src_tile_width_log2,
+      src_tile_height_log2);
 
-   for (uint channel = 0; channel < 4; ++channel) {
-      dest[dest_offset + channel] = libagx_average4_unorm8(
-         src[src00 + channel], src[src10 + channel],
-         src[src01 + channel], src[src11 + channel]);
+   uint p00, p10, p01, p11;
+   if (src_scale_x == 2u && src_scale_y == 2u &&
+       src_tile_width_log2 >= 1u && src_tile_height_log2 >= 1u &&
+       (((uintptr_t)src) & 0xfu) == 0u) {
+      /* In AIL Morton order, the 2x2 texel block at even (src_x, src_y)
+       * occupies four contiguous 32-bit pixels (16 bytes, 16-byte aligned). */
+      uint4 block = *((const global uint4 *)(src + src00));
+      p00 = block.x;
+      p10 = block.y;
+      p01 = block.z;
+      p11 = block.w;
+   } else {
+      uint src10 = libagx_tiled_offset_4b(
+         src_x + src_scale_x - 1u, src_y, src_tiles_per_row,
+         src_tile_width_log2, src_tile_height_log2);
+      uint src01 = libagx_tiled_offset_4b(
+         src_x, src_y + src_scale_y - 1u, src_tiles_per_row,
+         src_tile_width_log2, src_tile_height_log2);
+      uint src11 = libagx_tiled_offset_4b(
+         src_x + src_scale_x - 1u, src_y + src_scale_y - 1u,
+         src_tiles_per_row, src_tile_width_log2, src_tile_height_log2);
+      p00 = *((const global uint *)(src + src00));
+      p10 = *((const global uint *)(src + src10));
+      p01 = *((const global uint *)(src + src01));
+      p11 = *((const global uint *)(src + src11));
    }
+
+   *((global uint *)(dest + dest_offset)) =
+      libagx_average4_unorm8x4(p00, p10, p01, p11);
+}
+
+/*
+ * Fused two-level exact 2x+2x downsample for GPU-tiled UNORM8x4 images:
+ * each invocation reads one 4x4 Morton-contiguous block (4 x uint4) from src,
+ * writes the resulting 2x2 Morton-contiguous block (1 x uint4) to dest1, and
+ * averages those four results in registers to write one pixel to dest2.
+ *
+ * Callers must dispatch full 16x8 workgroups (aligned to 16 in X, 8 in Y)
+ * with src_tile_log2 >= 2, dest1_tile_log2 >= 1, all tile_log2 <= 7, and
+ * 16-byte aligned src and dest1 pointers.
+ */
+KERNEL2D(16, 8)
+libagx_mipmap_unorm8x4_2level(global uint8_t *dest2, global uint8_t *dest1,
+                              global uint8_t *src,
+                              uint dest2_width_px, uint dest2_height_px,
+                              uint dest2_tiles_per_row,
+                              uint dest1_tiles_per_row,
+                              uint src_tiles_per_row,
+                              uint tile_log2_packed)
+{
+   /* Order each 32-lane subgroup in Morton order (8x4 blocks in dest2) so
+    * reads from src and writes to dest1 and dest2 coalesce into contiguous
+    * cachelines. */
+   uint lid = cl_local_id.y * 16u + cl_local_id.x;
+   uint lx = libagx_compact_bits_6(lid & 63u) | ((lid >> 3) & 8u);
+   uint ly = libagx_compact_bits_6((lid & 63u) >> 1);
+   uint x = cl_group_id.x * 16u + lx;
+   uint y = cl_group_id.y * 8u + ly;
+   if (x >= dest2_width_px || y >= dest2_height_px)
+      return;
+
+   uint d2_tw = tile_log2_packed & 0xfu;
+   uint d2_th = (tile_log2_packed >> 4) & 0xfu;
+   uint d1_tw = (tile_log2_packed >> 8) & 0xfu;
+   uint d1_th = (tile_log2_packed >> 12) & 0xfu;
+   uint s_tw = (tile_log2_packed >> 16) & 0xfu;
+   uint s_th = (tile_log2_packed >> 20) & 0xfu;
+
+   uint src_off = libagx_tiled_offset_4b(x << 2, y << 2, src_tiles_per_row,
+                                         s_tw, s_th);
+   const global uint4 *src4 = (const global uint4 *)(src + src_off);
+   uint4 b00 = src4[0];
+   uint4 b10 = src4[1];
+   uint4 b01 = src4[2];
+   uint4 b11 = src4[3];
+
+   uint o00 = libagx_average4_unorm8x4(b00.x, b00.y, b00.z, b00.w);
+   uint o10 = libagx_average4_unorm8x4(b10.x, b10.y, b10.z, b10.w);
+   uint o01 = libagx_average4_unorm8x4(b01.x, b01.y, b01.z, b01.w);
+   uint o11 = libagx_average4_unorm8x4(b11.x, b11.y, b11.z, b11.w);
+
+   uint d1_off = libagx_tiled_offset_4b(x << 1, y << 1, dest1_tiles_per_row,
+                                        d1_tw, d1_th);
+   *((global uint4 *)(dest1 + d1_off)) = (uint4)(o00, o10, o01, o11);
+
+   uint d2_off = libagx_tiled_offset_4b(x, y, dest2_tiles_per_row, d2_tw,
+                                        d2_th);
+   *((global uint *)(dest2 + d2_off)) =
+      libagx_average4_unorm8x4(o00, o10, o01, o11);
 }
 
 /*
@@ -191,7 +297,7 @@ libagx_mipmap_unorm8x4(global uint8_t *dest, global uint8_t *src,
  * rounds the four-tap result half-up to four fractional colour bits; its
  * normalized write rounds exact ties toward the midpoint code 128.
  */
-KERNEL(32)
+KERNEL2D(8, 8)
 libagx_mipmap_unorm8x4_odd(global uint8_t *dest, global uint8_t *src,
                            global uint *axis,
                            uint dest_width_px, uint dest_height_px,
@@ -215,35 +321,47 @@ libagx_mipmap_unorm8x4_odd(global uint8_t *dest, global uint8_t *src,
    uint src_x1 = src_x0 + (wx != 0u);
    uint src_y1 = src_y0 + (wy != 0u);
 
-   uint dest_offset = libagx_copy_image_offset_pow2(
-      x, y, 0, dest_tiles_per_row, dest_tile_width_log2,
-      dest_tile_height_log2, 4, 1);
-   uint src00 = libagx_copy_image_offset_pow2(
-      src_x0, src_y0, 0, src_tiles_per_row, src_tile_width_log2,
-      src_tile_height_log2, 4, 1);
-   uint src10 = libagx_copy_image_offset_pow2(
-      src_x1, src_y0, 0, src_tiles_per_row, src_tile_width_log2,
-      src_tile_height_log2, 4, 1);
-   uint src01 = libagx_copy_image_offset_pow2(
-      src_x0, src_y1, 0, src_tiles_per_row, src_tile_width_log2,
-      src_tile_height_log2, 4, 1);
-   uint src11 = libagx_copy_image_offset_pow2(
-      src_x1, src_y1, 0, src_tiles_per_row, src_tile_width_log2,
-      src_tile_height_log2, 4, 1);
+   uint dest_offset = libagx_tiled_offset_4b(
+      x, y, dest_tiles_per_row, dest_tile_width_log2, dest_tile_height_log2);
+   uint src00 = libagx_tiled_offset_4b(
+      src_x0, src_y0, src_tiles_per_row, src_tile_width_log2,
+      src_tile_height_log2);
+   uint src10 = libagx_tiled_offset_4b(
+      src_x1, src_y0, src_tiles_per_row, src_tile_width_log2,
+      src_tile_height_log2);
+   uint src01 = libagx_tiled_offset_4b(
+      src_x0, src_y1, src_tiles_per_row, src_tile_width_log2,
+      src_tile_height_log2);
+   uint src11 = libagx_tiled_offset_4b(
+      src_x1, src_y1, src_tiles_per_row, src_tile_width_log2,
+      src_tile_height_log2);
+
+   uint p00 = *((const global uint *)(src + src00));
+   uint p10 = *((const global uint *)(src + src10));
+   uint p01 = *((const global uint *)(src + src01));
+   uint p11 = *((const global uint *)(src + src11));
+
    uint ix = 256u - wx;
    uint iy = 256u - wy;
+   uint w00 = ix * iy;
+   uint w10 = wx * iy;
+   uint w01 = ix * wy;
+   uint w11 = wx * wy;
 
+   uint packed = 0u;
    for (uint channel = 0; channel < 4; ++channel) {
-      uint value = src[src00 + channel] * ix * iy +
-                   src[src10 + channel] * wx * iy +
-                   src[src01 + channel] * ix * wy +
-                   src[src11 + channel] * wx * wy;
+      uint shift = channel * 8u;
+      uint value = ((p00 >> shift) & 0xffu) * w00 +
+                   ((p10 >> shift) & 0xffu) * w10 +
+                   ((p01 >> shift) & 0xffu) * w01 +
+                   ((p11 >> shift) & 0xffu) * w11;
       uint fixed4 = (value + 2048u) >> 12;
       uint out = fixed4 >> 4;
       uint remainder = fixed4 & 15u;
       out += remainder > 8u || (remainder == 8u && out < 128u);
-      dest[dest_offset + channel] = (uint8_t)out;
+      packed |= (out & 0xffu) << shift;
    }
+   *((global uint *)(dest + dest_offset)) = packed;
 }
 
 /*

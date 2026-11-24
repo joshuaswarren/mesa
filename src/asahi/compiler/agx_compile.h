@@ -22,6 +22,14 @@
 /* G17P's register file: halves 0..191. */
 #define AGX3B_NUM_REGS (192)
 
+/* AGX3B cube/cube-array register budgets shared between NIR LICM and RA
+ * (agx3_cube_register_budget): cube-array face staging without own scratch
+ * and bias+min_lod place 16 halves of CEM scratch above the allocation inside
+ * the 7-bit register-field limit (112 = 128 - 16 halves); plain cube reserves
+ * 8 halves above the allocation for CEM scratch. */
+#define AGX3B_CUBE_ARRAY_MAX_REGS (112)
+#define AGX3B_CUBE_MAX_REGS       (AGX3B_NUM_REGS - 8)
+
 struct agx_cf_binding {
    /* Base coefficient register */
    uint8_t cf_base;
@@ -198,10 +206,32 @@ struct agx_shader_info {
     * This occupies existing alignment padding, but all ABI layouts are checked. */
    uint8_t agx3_preamble_static_spill_version;
    struct agx3_cprog_inputs agx3_preamble_inputs;
+   /* AGX3 hoistable vertex preamble contract: when set, the vertex shader's
+    * @preamble reads at most one 64-bit uniform slot
+    * [agx3_preamble_in_base_half, +agx3_preamble_in_size_halfs), performs only
+    * pure read-only memory loads and ALU, and writes general preamble uniforms
+    * strictly inside [agx3_preamble_out_start_half,
+    * +agx3_preamble_out_size_halfs). The driver may execute @preamble once as a
+    * 1-thread compute shader and bind the output buffer as a vertex uniform
+    * range instead of re-running the per-draw vertex constant program. */
+   bool agx3_preamble_hoistable;
+   uint16_t agx3_preamble_in_base_half;
+   uint16_t agx3_preamble_in_size_halfs;
+   uint16_t agx3_preamble_out_start_half;
+   uint16_t agx3_preamble_out_size_halfs;
    unsigned preamble_offset, main_offset;
 
    /* Does the shader read the tilebuffer? */
    bool reads_tib;
+
+   /* Set on fragment epilogs / monolithic fragment shaders whose reads_tib was
+    * forced solely because one or more bound colour attachments are unwritten.
+    */
+   bool translucent_only_for_unwritten_rts;
+
+   /* Bitmask of bound colour attachments written by this fragment epilog /
+    * monolithic fragment shader. */
+   uint8_t color_rts_written;
 
    /* Does the shader require early fragment tests? */
    bool early_fragment_tests;
@@ -535,6 +565,11 @@ struct agx_shader_key {
    /* Whether scratch memory is available in the given shader stage */
    bool has_scratch;
 
+   /* Maximum thread-private scratch/spill frame in bytes admitted by the
+    * driver for this AGX3 shader. Zero defaults to AGX3_G17P_MAX_SPILL_B
+    * (4 KiB). Ignored on AGX2, which stays capped at AGX2_MAX_SPILL_SLOTS. */
+   uint32_t max_scratch_B;
+
    /* Whether we're compiling the helper program used for scratch allocation.
     * This has special register allocation requirements.
     */
@@ -568,6 +603,10 @@ struct agx_shader_key {
    /* A complete, single-sample M5 uniform-colour blend variant. The packer
     * still proves its one read/write pixel transaction before admitting it. */
    bool m5_uniform_blend;
+
+   /* Monolithic AGX3 fragment program reading color input attachments from
+    * on-chip tile memory (local_read / subpassLoad) across arbitrary CFG. */
+   bool agx3_local_read;
 
    /* AGX3B: build the preamble as a native constant program (CProg inputs
     * imported through its TPS frame, arithmetic results selected straight
@@ -723,6 +762,10 @@ void agx_preprocess_nir_g17p(nir_shader *nir);
  * alone check chip. */
 void agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip);
 void agx_preprocess_nir_g18g(nir_shader *nir);
+/* Fast second-stage preprocessing for shaders already preprocessed once before
+ * simple I/O or push-constant lowering. Falls back to full preprocessing if any
+ * temporary variables were introduced. */
+void agx_preprocess_nir_post_lower(nir_shader *nir, enum agx_chip chip);
 
 /* Access private (scratch) memory in whole 32-bit words, the only width the
  * AGX3 stack protocol encodes. agx_preprocess_nir_g17p() runs it. */
@@ -775,8 +818,20 @@ bool agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
 #define AGX3_CPROG_FS_STATIC_SPILL_VERSION 2u
 bool agx3_cprog_static_spill_info_valid(const struct agx_shader_info *info);
 
+struct blob;
+
 bool agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                             struct agx_shader_part *out);
+bool agx_compile_shader_nir_capture(nir_shader *nir, struct agx_shader_key *key,
+                                    struct agx_shader_part *out,
+                                    struct blob *pre_preamble_blob);
+void agx_prepare_preoptimized_epilog_nir(nir_shader *nir,
+                                         const struct agx_shader_key *key);
+bool agx_compile_shader_nir_preoptimized(nir_shader *nir,
+                                         struct agx_shader_key *key,
+                                         struct agx_shader_part *out,
+                                         bool epilog_has_alu,
+                                         bool preamble_newly_enabled);
 
 struct agx_occupancy {
    unsigned max_registers;
@@ -874,4 +929,9 @@ static const nir_shader_compiler_options agx_nir_options = {
    .discard_is_demote = true,
    .scalarize_ddx = true,
    .io_options = nir_io_always_interpolate_convergent_fs_inputs,
+   /* Match hk_physical_device's maxComputeWorkGroupCount / Invocations (Gallium
+    * caps all axes at 65535), letting range analysis prove Y/Z (and 1-wide X)
+    * global_invocation_id bounds <= INT32_MAX. */
+   .max_workgroup_invocations = 1024,
+   .max_workgroup_count = {0x7fffffff, 65535, 65535},
 };

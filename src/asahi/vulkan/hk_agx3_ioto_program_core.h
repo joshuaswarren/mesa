@@ -230,6 +230,32 @@ bool hk_agx3_g17p_direct_color_resolve_supported(
    struct agx_tilebuffer_layout *tib, unsigned color_attachment_count,
    bool has_resolve_target, bool average_resolve, bool store_source);
 
+/* The single colour attachment of a pass whose final end-of-tile program
+ * would both store the multisample samples and resolve them. */
+struct hk_agx3_g17p_store_and_resolve_target {
+   unsigned color_attachment_count;
+   /* The pass's own final end-of-tile program, not a partial render. */
+   bool final_store;
+   /* The render area covers every attachment, each of which is exactly the
+    * framebuffer size (hk_rendering_state::cr.whole_attachments). */
+   bool whole_attachments;
+   bool store_source;
+   bool has_resolve_target;
+   bool average_resolve;
+   unsigned source_samples;
+   unsigned resolve_samples;
+   bool resolve_format_matches;
+   bool source_pbe_valid;
+   bool resolve_pbe_valid;
+};
+
+/* Admit one end-of-tile program that stores a multisample tile unresolved
+ * (storeOp = STORE) and also resolves it into a single-sample attachment,
+ * instead of storing it and resolving it in a meta pass after the render. */
+bool hk_agx3_g17p_store_and_resolve_supported(
+   const struct agx_tilebuffer_layout *tib,
+   const struct hk_agx3_g17p_store_and_resolve_target *target);
+
 #define HK_AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE 6144u
 
 #define HK_AGX3_G17P_MAX_ROOT_SETS            16u

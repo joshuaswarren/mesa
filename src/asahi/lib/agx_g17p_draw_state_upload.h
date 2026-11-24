@@ -10,15 +10,7 @@
 #include <stdint.h>
 #include <string.h>
 
-/*
- * Fixed words the HAL200 draw-state records carry, named so a decoder or an
- * oracle can compare against the encoder instead of restating its constants.
- *
- * A hand-copied accept-set falls behind the composer silently: the six-byte
- * fragment release was whitelisted for three payloads while the composer could
- * derive seven, and every multiple-render-target program was reported as a
- * corrupt command stream as a result. Export the value; do not retype it.
- */
+/* Fixed HAL200 draw-state header words shared between encoder and decoder. */
 #define AGX_G17P_DRAW_STATE_SELECTOR_WORD0 UINT32_C(0x00000100)
 #define AGX_G17P_VARYING_RECORD_WORD0      UINT32_C(0x10040000)
 
@@ -29,8 +21,6 @@
 #define AGX_G17P_VARYING_RECORD_BYTES 20u
 #define AGX_G17P_VARYING_RECORD_OFFSET                                  \
    (AGX_G17P_BIND_GROUP_BYTES + AGX_G17P_VIEWPORT_RECORD_BYTES)
-#define AGX_G17P_BIND_STATE_BYTES                                        \
-   (AGX_G17P_VARYING_RECORD_OFFSET + AGX_G17P_VARYING_RECORD_BYTES)
 
 struct agx_g17p_bind_state_upload {
    struct agx_vdm_hal200_bind_pair pairs[AGX_VDM_HAL200_BIND_COUNT];

@@ -79,13 +79,6 @@ agx3_build_m5_container_lead(void *image, size_t capacity, unsigned clusters)
    return true;
 }
 
-/* The single-cluster M5 (G17G) lead; kept for its callers. */
-bool
-agx3_build_g17g_container_lead(void *image, size_t capacity)
-{
-   return agx3_build_m5_container_lead(image, capacity, 1);
-}
-
 size_t
 agx3_code_block_size(size_t main_span)
 {

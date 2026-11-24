@@ -222,3 +222,47 @@ TEST(AGX3UniformInteger, M5MadPromotionRefusesUnwitnessedDomains)
       ralloc_free(mem);
    }
 }
+
+TEST(AGX3IntegerLowering, Agx3bLowersIabsToCompareSelect)
+{
+   glsl_type_singleton_init_or_ref();
+   for (unsigned bits : {16u, 32u}) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "agx3b lower iabs");
+      nir_def *in = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *out = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *id = nir_load_subgroup_invocation(&b);
+      nir_def *addr = nir_iadd(&b, in, nir_u2u64(&b, nir_ishl_imm(&b, id, 3)));
+      nir_def *pair = nir_load_global(&b, 2, bits, addr, .align_mul = bits / 8);
+      nir_def *diff =
+         nir_isub(&b, nir_channel(&b, pair, 0), nir_channel(&b, pair, 1));
+      nir_def *sad = nir_iabs(&b, diff);
+      nir_def *single = nir_iabs(&b, nir_channel(&b, pair, 0));
+      nir_store_global(&b, nir_iadd(&b, sad, single), out,
+                       .align_mul = bits / 8);
+
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      agx_preprocess_nir(b.shader);
+      struct agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part)) << bits;
+      EXPECT_GT(part.info.stats.instrs, 0u) << bits;
+      unsigned iabs_count = 0, ishr_count = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_op op = nir_instr_as_alu(instr)->op;
+            if (op == nir_op_iabs)
+               iabs_count++;
+            else if (op == nir_op_ishr)
+               ishr_count++;
+         }
+      }
+      EXPECT_EQ(iabs_count, 0u) << bits;
+      EXPECT_EQ(ishr_count, 0u) << bits;
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+   glsl_type_singleton_decref();
+}

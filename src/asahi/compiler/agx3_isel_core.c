@@ -208,6 +208,8 @@ encode_explicit(const struct agx3_isel_desc *d,
 {
    const bool tu = d->true_kind == AGX3_ISEL_UNIFORM;
    const bool fu = d->false_kind == AGX3_ISEL_UNIFORM;
+   const bool ti = d->true_kind == AGX3_ISEL_IMMEDIATE;
+   const bool fi = d->false_kind == AGX3_ISEL_IMMEDIATE;
    const bool any_uniform = d->cmp0_uniform || d->cmp1_uniform || tu || fu;
 
    /* Native G17P (metal-nt -arch applegpu_g17p) uniform isel witnesses:
@@ -217,13 +219,14 @@ encode_explicit(const struct agx3_isel_desc *d,
     *   (r == 7) ? r : u     02010f86060217c2200c   false f83, f89 = 3
     *   (r == 7) ? u : u     02010f86260a17c2200c
     *   (r < r) ? u : 3      02010f03220a05c02083
-    * Keep to those shapes: one uniform comparand beside a 32-bit register,
-    * or uniform selects beside register/immediate comparands, 32-bit result. */
+    * Keep to those shapes: one uniform comparand beside a 32-bit register
+    * and register selects, or uniform selects beside register/immediate
+    * comparands, 32-bit result. */
    if (any_uniform) {
       if (d->dest_16 || d->cmp_16 ||
           (d->cmp0_uniform && d->cmp1_uniform) ||
           ((d->cmp0_uniform || d->cmp1_uniform) &&
-           (d->cmp1_immediate || tu || fu)) ||
+           (d->cmp1_immediate || tu || fu || ti || fi)) ||
           (d->cmp0_uniform && !uniform32_ok(d->cmp0)) ||
           (d->cmp1_uniform && !uniform32_ok(d->cmp1)) ||
           (tu && !uniform32_ok(d->sel_true)) ||
@@ -249,8 +252,6 @@ encode_explicit(const struct agx3_isel_desc *d,
          return false;
    }
 
-   const bool ti = d->true_kind == AGX3_ISEL_IMMEDIATE;
-   const bool fi = d->false_kind == AGX3_ISEL_IMMEDIATE;
    if ((d->cmp1_immediate && (d->cache[1] || d->discard[1])) ||
        (ti && (d->cache[2] || d->discard[2])) ||
        (fi && (d->cache[3] || d->discard[3])))

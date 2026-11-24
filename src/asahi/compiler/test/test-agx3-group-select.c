@@ -41,7 +41,8 @@ selected(const agx3_table *t, const agx3_group *g, agx3_node *nodes,
       };
    }
 
-   ctx c = {.t = &copy, .fields = fields, .nwords = 1};
+   const agx3_node *path[AGX3_MAX_PATH];
+   ctx c = {.t = &copy, .fields = fields, .nwords = 1, .path = path};
    return apply_group(&c, &group) ? c.words[0] : g->alt_n;
 }
 

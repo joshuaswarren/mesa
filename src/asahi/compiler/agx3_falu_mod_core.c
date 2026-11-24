@@ -51,7 +51,7 @@ runtime_enc_ok(enum agx_isa_encoding e, uint16_t wait_mask)
 {
    if (e == AGX_ISA_ENCODING_AGX3D)
       return (wait_mask & (wait_mask - 1)) == 0 && wait_mask <= 0xff;
-   return e == AGX_ISA_ENCODING_AGX3B || e == AGX_ISA_ENCODING_AGX3C;
+   return agx_isa_is_agx3(e);
 }
 
 static unsigned

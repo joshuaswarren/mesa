@@ -153,6 +153,8 @@ is_any_comp_nan(UNUSED const nir_search_state *state, const nir_alu_instr *instr
                                      unsigned src, unsigned num_components,  \
                                      const uint8_t *swizzle)                 \
    {                                                                         \
+      if (unlikely(!state->numlsb_ht->table))                                \
+         _mesa_pointer_hash_table_init(state->numlsb_ht, NULL);              \
       unsigned num = ffs(test) - 1;                                          \
       for (unsigned i = 0; i < num_components; i++) {                        \
          nir_scalar s = nir_get_scalar(instr->src[src].src.ssa, swizzle[i]); \
