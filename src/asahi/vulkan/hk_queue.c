@@ -2726,6 +2726,10 @@ hk_pack_atomics_allowed(struct hk_device *dev, const struct hk_queue *queue)
    if (!opt)
       opt = debug_get_option_m5_pack_atomics_opt();
 
+   const struct hk_queue *as = dev->host_as.queue;
+   if (as && as != queue && p_atomic_read(&as->drm.id) != UINT32_MAX)
+      return false;
+
    if (dev->dev.chip == AGX_CHIP_G16G)
       return hk_pack_atomics_choice(true, opt, queue->sib.count);
    if (!hk_pack_atomics_choice(false, opt, queue->sib.count))
@@ -2738,8 +2742,7 @@ hk_pack_atomics_allowed(struct hk_device *dev, const struct hk_queue *queue)
       if (other != queue && p_atomic_read(&other->drm.id) != UINT32_MAX)
          return false;
    }
-   const struct hk_queue *as = dev->host_as.queue;
-   return !as || as == queue || p_atomic_read(&as->drm.id) == UINT32_MAX;
+   return true;
 }
 
 /* A submission-owned replacement for a run of command buffers. The

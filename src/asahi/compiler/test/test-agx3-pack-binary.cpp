@@ -13375,6 +13375,71 @@ TEST_F(AGX3PackBinary, BeginCfDeepBreakUsesNextFlagSlot)
              code.end());
 }
 
+TEST_F(AGX3PackBinary, G16GDeepBreakUsesNextFlagSlot)
+{
+   /* G16G must advance flag_slot for nested BREAK_IF (nest > 1) just like
+    * other AGX3B/HAL200 chips so the break comparison does not overwrite an
+    * enclosing conditional's flag slot. Check both outer (loop_slot 0 ->
+    * flag_slot 1) and nested (loop_slot 1 -> flag_slot 2) loops. */
+   for (unsigned depth : {1u, 2u}) {
+      SCOPED_TRACE(depth);
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+      key.dev.chip = AGX_CHIP_G16G;
+      agx_block *body = agx_test_block(b->shader);
+      agx_block *after = agx_test_block(b->shader);
+
+      for (unsigned d = 0; d < depth; ++d)
+         agx_push_exec(b, 1);
+
+      agx_builder lb = agx_init_builder(b->shader, agx_after_block(body));
+      agx_index counter = agx_register(2, AGX_SIZE_16);
+      agx_if_icmp(&lb, counter, agx_immediate(8), 1, AGX_ICOND_UEQ, true, NULL);
+      agx_index r0l = agx_register(0, AGX_SIZE_16);
+      r0l.cache = true;
+      r0l.kill = true;
+      agx_break_if_icmp(&lb, r0l, r0l, 2, false, AGX_ICOND_UEQ, after);
+      agx_pop_exec(&lb, 1);
+      agx_jmp_exec_any(&lb, body);
+      for (unsigned d = 0; d < depth; ++d)
+         agx_pop_exec(&lb, 1);
+
+      agx_builder ab = agx_init_builder(b->shader, agx_after_block(after));
+      agx_stop(&ab);
+
+      const auto code = pack(b);
+      const unsigned expected_slot = (depth - 1 + 1) % 6;
+      const unsigned stale_slot = (depth - 1) % 6;
+      uint8_t bytes[AGX3_CF_MAX_LENGTH];
+      uint8_t len = 0;
+      const uint16_t src[] = {0, 0};
+      const struct agx3_cf_source_hints live[] = {
+         {false, false}, {false, false},
+      };
+
+      std::vector<uint8_t> native;
+      ASSERT_TRUE(agx3_cf_icmp_reg16(AGX_ISA_ENCODING_AGX3B, AGX3_CF_ICOND_EQ,
+                                     expected_slot, src, live, 0, bytes, &len));
+      append(native, bytes, len);
+      ASSERT_TRUE(agx3_cf_cndcf(AGX_ISA_ENCODING_AGX3B, expected_slot, false, 3,
+                                bytes, &len));
+      append(native, bytes, len);
+      EXPECT_NE(
+         std::search(code.begin(), code.end(), native.begin(), native.end()),
+         code.end());
+
+      std::vector<uint8_t> stale;
+      ASSERT_TRUE(agx3_cf_icmp_reg16(AGX_ISA_ENCODING_AGX3B, AGX3_CF_ICOND_EQ,
+                                     stale_slot, src, live, 0, bytes, &len));
+      append(stale, bytes, len);
+      ASSERT_TRUE(agx3_cf_cndcf(AGX_ISA_ENCODING_AGX3B, stale_slot, false, 3,
+                                bytes, &len));
+      append(stale, bytes, len);
+      EXPECT_EQ(
+         std::search(code.begin(), code.end(), stale.begin(), stale.end()),
+         code.end());
+   }
+}
+
 TEST_F(AGX3PackBinary, DeepBreakConsumesBreakPredicateInsteadOfContinuePredicate)
 {
    /* Full native pairs, decoded with Apple's composed tables:
