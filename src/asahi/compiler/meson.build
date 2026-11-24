@@ -18,11 +18,18 @@ libasahi_agx_files = files(
   'agx_nir_opt_nonneg_idiv.c',
   'agx_nir_opt_half_bitfield_extract.c',
   'agx_nir_opt_flatten_loads.c',
+  'agx_nir_opt_factor_loop_mac.c',
   'agx_nir_opt_merge_nested_early_exits.c',
+  'agx_nir_opt_narrow_subword_loads.c',
   'agx_nir_opt_select_load.c',
+  'agx_nir_opt_u8x4_hsum.c',
   'agx_nir_opt_licm.c',
   'agx_nir_opt_uniform_idiv.c',
+  'agx_nir_opt_monotonic_bit_insert.c',
+  'agx_nir_opt_iv_divmod.c',
+  'agx_nir_opt_unswitch_affine_bounds.c',
   'agx_nir_opt_sink_loop_sample_uses.c',
+  'agx_nir_opt_uniform_stride_chains.c',
   'agx_nir_lower_clip_m1_1.c',
   'agx_nir_lower_cull_distance.c',
   'agx_nir_lower_fminmax.c',
@@ -736,6 +743,7 @@ if with_tests
          'test/test-rte-fma.cpp',
          'test/test-image-atomic-metadata.cpp',
          'test/test-ballot-count.cpp',
+         'test/test-agx3-ballot-modifiers.cpp',
          'test/test-border-index.cpp',
          'test/test-aligned-bounds.cpp',
          'test/test-agx2-image-acquire.cpp',
@@ -744,6 +752,9 @@ if with_tests
          'test/test-minmax-canonical.cpp',
          'test/test-workgroup-split.cpp',
          'test/test-selected-f2i.cpp',
+         'test/test-flrp-contract.cpp',
+         'test/test-monotonic-bit-insert.cpp',
+         'test/test-iv-divmod.cpp',
          'test/test-buffer-format-groups.cpp',
          'test/test-scalarize-int64.cpp',
          'test/test-lower-divmod64.cpp',
@@ -768,6 +779,7 @@ if with_tests
          'test/test-preamble-half-exports.cpp',
          'test/test-demote-early-kill.cpp',
          'test/test-preamble-half-word-exports.cpp',
+         'test/test-preamble-hoist.cpp',
          'test/test-quad-control.cpp',
          'test/test-preamble-priority.cpp',
          'test/test-signed-zero-fma.cpp',
@@ -791,6 +803,7 @@ if with_tests
          'test/test-agx3-uniform-comparands.cpp',
          'test/test-agx3-g17g-retry-select.cpp',
          'test/test-agx3-cube-scratch.cpp',
+         'test/test-bg-shader-schedule.cpp',
          'test/test-fminmax-constant-denorm.cpp',
          'test/test-denorm-preserve-fma.cpp',
          'test/test-fminmax-signed-zero.cpp',
@@ -812,7 +825,9 @@ if with_tests
          'test/test-nonneg-idiv.cpp',
          'test/test-half-bitfield-extract.cpp',
          'test/test-flatten-loads.cpp',
+         'test/test-narrow-subword-loads.cpp',
          'test/test-shared-phase-cse.cpp',
+         'test/test-u8x4-hsum.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
          # in libasahi_lib, which this test does not link.
          '../lib/agx_chip.c',
@@ -950,6 +965,19 @@ if with_tests
     suite : ['asahi'],
   )
   test(
+    'agx_nir_factor_loop_mac',
+    executable(
+      'agx_nir_factor_loop_mac_test',
+      files('test/test-factor-loop-mac.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'agx_nir_merge_nested_early_exits',
     executable(
       'agx_nir_merge_nested_early_exits_test',
@@ -967,6 +995,30 @@ if with_tests
     executable(
       'agx_nir_sink_loop_sample_uses_test',
       files('test/test-sink-loop-sample-uses.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+  test(
+    'agx_nir_uniform_unit_global_id',
+    executable(
+      'agx_nir_uniform_unit_global_id_test',
+      files('test/test-uniform-unit-global-id.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+  test(
+    'agx_nir_uniform_stride_chains',
+    executable(
+      'agx_nir_uniform_stride_chains_test',
+      files('test/test-uniform-stride-chains.c'),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies : [idep_nir, idep_mesautil],
@@ -1042,6 +1094,19 @@ if with_tests
     executable(
       'agx_uniform_idiv_test',
       files('test/test-agx-uniform-idiv.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx_unswitch_affine_bounds',
+    executable(
+      'agx_unswitch_affine_bounds_test',
+      files('test/test-agx-unswitch-affine-bounds.c'),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies : [idep_nir, idep_mesautil],

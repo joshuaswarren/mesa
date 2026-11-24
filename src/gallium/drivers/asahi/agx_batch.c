@@ -200,7 +200,7 @@ agx_encoder_bind_vdm_alias(struct agx_device *dev, struct agx_encoder *encoder)
    assert(encoder->g17p_vdm_alias);
 }
 
-static void
+void
 agx_encoder_cleanup(struct agx_device *dev, struct agx_encoder *encoder)
 {
    agx_bo_unreference(dev, encoder->bo);
@@ -393,6 +393,8 @@ agx_batch_init(struct agx_context *ctx,
     * copy (agx_blit) reloads from the single-sample image. */
    batch->g17p_resolve_reload = false;
    batch->g17p_resolve_preserve = key->resolve != NULL;
+   batch->g17g_mrt_resident = false;
+   batch->g17p_resolve_blit_attached = false;
    batch->seqnum = ++ctx->batches.seqnum;
    batch->submit_seq = 0;
    batch->g17p_fragment_program = 0;
@@ -400,6 +402,9 @@ agx_batch_init(struct agx_context *ctx,
    batch->g17p_emrt_heap = 0;
    batch->g17p_fragment_shader = NULL;
    batch->g17p_fragment_linked = NULL;
+   batch->g17p_bind_tail_latched = false;
+   batch->g17p_have_latched_vs = false;
+   batch->g17p_latched_vs_shader = NULL;
 
    agx_bo_reference(screen->rodata);
    agx_pool_init(&batch->pool, dev, "Batch pool", 0, true);
@@ -1124,7 +1129,7 @@ agx_batch_writes_internal(struct agx_batch *batch, struct agx_resource *rsrc,
    agx_flush_readers_except_range(ctx, rsrc, batch, "Write from other batch",
                                   false, start, end);
 
-   BITSET_SET(rsrc->data_valid, level);
+   agx_resource_set_valid(rsrc, level);
    if (!agx_batch_is_compute(batch))
       rsrc->render_written = true;
 

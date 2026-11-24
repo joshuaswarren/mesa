@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "agx_compile.h"
+#include "agx_nir.h"
 #include "compiler/glsl_types.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_serialize.h"
@@ -490,11 +491,386 @@ test_preoptimized_fs_inline_undef_clamp(void)
    return ok;
 }
 
+/* Verify that native 1x32 nir_intrinsic_ballot (emitted by subgroup vote
+ * lowering during the first preprocess) passes agx_assert_post_lower_invariants
+ * on the post-lower fast path instead of triggering a false subgroup assert. */
+static bool
+test_post_lower_native_ballot(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "post_lower_native_ballot");
+
+   nir_variable *in_var =
+      nir_variable_create(b.shader, nir_var_shader_in, glsl_uint_type(), "in0");
+   in_var->data.location = VARYING_SLOT_VAR0;
+   in_var->data.interpolation = INTERP_MODE_FLAT;
+
+   nir_variable *out_var =
+      nir_variable_create(b.shader, nir_var_shader_out, glsl_uint_type(), "out0");
+   out_var->data.location = FRAG_RESULT_DATA0;
+
+   nir_def *cond = nir_ine_imm(&b, nir_load_var(&b, in_var), 0);
+   nir_def *any = nir_vote_any(&b, 1, cond);
+   nir_store_var(&b, out_var, nir_b2i32(&b, any), 0x1);
+
+   agx_preprocess_nir_native(b.shader, AGX_CHIP_G17P);
+   agx_preprocess_nir_post_lower(b.shader, AGX_CHIP_G17P);
+
+   bool saw_ballot = false;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_ballot)
+               saw_ballot = true;
+         }
+      }
+   }
+   ralloc_free(b.shader);
+   return saw_ballot;
+}
+
+/* Verify that M5 compute shaders keep native 1x32 shuffle_xor (including with
+ * a dynamic mask that is lowered later by agx_nir_lower_dynamic_shuffle_xor())
+ * and non-ftz32 32-bit float min/max reduce across agx_preprocess_nir_post_lower. */
+static bool
+test_post_lower_m5_compute_shuffle_xor(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "post_lower_m5_compute_shuf_xor");
+
+   nir_def *addr = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0),
+                                          .base = 0, .range = 16);
+   nir_def *dyn_mask = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8),
+                                              .base = 8, .range = 4);
+   nir_def *lid = nir_load_local_invocation_index(&b);
+   nir_def *lane_addr = nir_iadd(&b, addr, nir_u2u64(&b, nir_imul_imm(&b, lid, 4)));
+   nir_def *val = nir_load_global(&b, 1, 32, lane_addr);
+   nir_def *shuf = nir_shuffle_xor(&b, val, dyn_mask);
+   nir_def *fmin = nir_reduce(&b, shuf, .reduction_op = nir_op_fmin,
+                              .cluster_size = 0);
+   nir_store_global(&b, fmin, lane_addr);
+
+   agx_preprocess_nir_m5(b.shader);
+   agx_preprocess_nir_post_lower(b.shader, AGX_CHIP_G17S);
+
+   bool saw_shuf_xor = false;
+   bool saw_fmin_reduce = false;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_shuffle_xor)
+               saw_shuf_xor = true;
+            if (intr->intrinsic == nir_intrinsic_reduce &&
+                nir_intrinsic_reduction_op(intr) == nir_op_fmin)
+               saw_fmin_reduce = true;
+         }
+      }
+   }
+   ralloc_free(b.shader);
+   if (!saw_shuf_xor || !saw_fmin_reduce) {
+      fprintf(stderr,
+              "FAIL: m5 compute post_lower saw_shuf_xor=%d saw_fmin_reduce=%d\n",
+              saw_shuf_xor, saw_fmin_reduce);
+      return false;
+   }
+   return true;
+}
+
+/* Verify that G18G quad ops and clustered reductions are lowered by the first
+ * preprocess (leaving native 1x32 ballot/read_invocation) and pass
+ * agx_preprocess_nir_post_lower() without asserting. */
+static bool
+test_post_lower_g18g_quad_clustered(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "post_lower_g18g_quad_clustered");
+
+   nir_def *addr = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0),
+                                          .base = 0, .range = 16);
+   nir_def *lid = nir_load_local_invocation_index(&b);
+   nir_def *lane_addr = nir_iadd(&b, addr, nir_u2u64(&b, nir_imul_imm(&b, lid, 4)));
+   nir_def *val = nir_load_global(&b, 1, 32, lane_addr);
+   nir_def *q = nir_quad_swap_horizontal(&b, val);
+   nir_def *c = nir_reduce(&b, q, .reduction_op = nir_op_iadd,
+                           .cluster_size = 4);
+   nir_store_global(&b, c, lane_addr);
+
+   agx_preprocess_nir_g18g(b.shader);
+   agx_preprocess_nir_post_lower(b.shader, AGX_CHIP_G18G);
+
+   bool saw_quad = false;
+   bool saw_clustered = false;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_quad_swap_horizontal)
+               saw_quad = true;
+            if (intr->intrinsic == nir_intrinsic_reduce &&
+                nir_intrinsic_cluster_size(intr) == 4)
+               saw_clustered = true;
+         }
+      }
+   }
+   ralloc_free(b.shader);
+   if (saw_quad || saw_clustered) {
+      fprintf(stderr,
+              "FAIL: g18g post_lower saw_quad=%d saw_clustered=%d\n",
+              saw_quad, saw_clustered);
+      return false;
+   }
+   return true;
+}
+
+#ifndef NDEBUG
+/* Self-check that agx_nir_subgroup_intrinsic_needs_lowering() agrees with
+ * whether agx_nir_lower_subgroups_for_target() actually makes progress across
+ * every subgroup intrinsic, shape, and target profile. */
+static bool
+check_one_subgroup_case(const char *name, mesa_shader_stage stage, bool ftz32,
+                        bool g17p, bool m5, bool g18g,
+                        nir_intrinsic_instr *(*emit)(nir_builder *b,
+                                                     nir_def *addr,
+                                                     bool ftz32))
+{
+   nir_builder b =
+      nir_builder_init_simple_shader(stage, &agx_nir_options, "%s", name);
+   if (ftz32)
+      b.shader->info.float_controls_execution_mode |=
+         FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32;
+
+   nir_def *addr = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0),
+                                          .base = 0, .range = 16);
+   nir_intrinsic_instr *intr = emit(&b, addr, ftz32);
+   nir_def *out = &intr->def;
+   if (out->bit_size == 1)
+      out = nir_b2i32(&b, out);
+   nir_store_global(&b, out, addr);
+
+   bool pred = agx_nir_subgroup_intrinsic_needs_lowering(b.shader, intr, g17p,
+                                                         m5, g18g);
+   bool progress =
+      agx_nir_lower_subgroups_for_target(b.shader, g17p, m5, g18g);
+
+   ralloc_free(b.shader);
+   if (pred != progress) {
+      fprintf(stderr,
+              "FAIL: subgroup predicate mismatch on %s (stage=%d ftz32=%d "
+              "g17p=%d m5=%d g18g=%d): pred=%d progress=%d\n",
+              name, stage, ftz32, g17p, m5, g18g, pred, progress);
+      return false;
+   }
+   return true;
+}
+
+#define DEF_EMIT(fname, body)                                                  \
+   static nir_intrinsic_instr *emit_##fname(nir_builder *b, nir_def *addr,     \
+                                            bool ftz32)                        \
+   {                                                                           \
+      (void)ftz32;                                                             \
+      nir_def *v32 = nir_load_global(b, 1, 32, addr);                          \
+      nir_def *v32x2 = nir_load_global(b, 2, 32, addr);                        \
+      nir_def *v16 = nir_load_global(b, 1, 16, addr);                          \
+      nir_def *v64 = nir_load_global(b, 1, 64, addr);                          \
+      nir_def *cond = nir_ine_imm(b, v32, 0);                                  \
+      nir_def *idx = nir_load_global(b, 1, 32, nir_iadd_imm(b, addr, 16));     \
+      nir_def *m4 = nir_load_global(b, 4, 32, addr);                           \
+      nir_def *f32 = ftz32 ? nir_fcanonicalize(b, v32) : v32;                  \
+      (void)v32; (void)v32x2; (void)v16; (void)v64; (void)cond;                \
+      (void)idx; (void)m4; (void)f32;                                          \
+      nir_def *res = (body);                                                   \
+      return nir_def_as_intrinsic(res);                                        \
+   }
+
+DEF_EMIT(ballot_1x32, nir_ballot(b, 1, 32, cond))
+DEF_EMIT(ballot_4x32, nir_ballot(b, 4, 32, cond))
+DEF_EMIT(ballot_1x64, nir_ballot(b, 1, 64, cond))
+DEF_EMIT(elect, nir_elect(b, 1))
+DEF_EMIT(first_inv, nir_first_invocation(b))
+DEF_EMIT(last_inv, nir_last_invocation(b))
+DEF_EMIT(vote_any, nir_vote_any(b, 1, cond))
+DEF_EMIT(vote_all, nir_vote_all(b, 1, cond))
+DEF_EMIT(vote_ieq, nir_vote_ieq(b, 1, v32))
+DEF_EMIT(vote_feq, nir_vote_feq(b, 1, v32))
+DEF_EMIT(quad_vote_any, nir_quad_vote_any(b, 1, cond))
+DEF_EMIT(quad_vote_all, nir_quad_vote_all(b, 1, cond))
+DEF_EMIT(subgroup_size, nir_load_subgroup_size(b))
+DEF_EMIT(num_subgroups, nir_load_num_subgroups(b))
+DEF_EMIT(eq_mask, nir_load_subgroup_eq_mask(b, 4, 32))
+DEF_EMIT(ge_mask, nir_load_subgroup_ge_mask(b, 4, 32))
+DEF_EMIT(gt_mask, nir_load_subgroup_gt_mask(b, 4, 32))
+DEF_EMIT(le_mask, nir_load_subgroup_le_mask(b, 4, 32))
+DEF_EMIT(lt_mask, nir_load_subgroup_lt_mask(b, 4, 32))
+DEF_EMIT(inv_ballot, nir_inverse_ballot(b, m4))
+DEF_EMIT(ballot_bfe, nir_ballot_bitfield_extract(b, m4, idx))
+DEF_EMIT(ballot_cnt, nir_ballot_bit_count_reduce(b, m4))
+DEF_EMIT(ballot_lsb, nir_ballot_find_lsb(b, m4))
+DEF_EMIT(ballot_msb, nir_ballot_find_msb(b, m4))
+DEF_EMIT(ballot_exc, nir_ballot_bit_count_exclusive(b, m4))
+DEF_EMIT(ballot_inc, nir_ballot_bit_count_inclusive(b, m4))
+DEF_EMIT(read_inv_s, nir_read_invocation(b, v32, idx))
+DEF_EMIT(read_inv_v2, nir_read_invocation(b, v32x2, idx))
+DEF_EMIT(read_first, nir_read_first_invocation(b, v32))
+DEF_EMIT(quad_bcast_s, nir_quad_broadcast(b, v32, nir_imm_int(b, 1)))
+DEF_EMIT(quad_bcast_v2, nir_quad_broadcast(b, v32x2, nir_imm_int(b, 1)))
+DEF_EMIT(quad_h_s, nir_quad_swap_horizontal(b, v32))
+DEF_EMIT(quad_h_v2, nir_quad_swap_horizontal(b, v32x2))
+DEF_EMIT(quad_v_s, nir_quad_swap_vertical(b, v32))
+DEF_EMIT(quad_v_v2, nir_quad_swap_vertical(b, v32x2))
+DEF_EMIT(quad_d_s, nir_quad_swap_diagonal(b, v32))
+DEF_EMIT(quad_d_v2, nir_quad_swap_diagonal(b, v32x2))
+DEF_EMIT(shuffle, nir_shuffle(b, v32, idx))
+DEF_EMIT(shuf_xor_32c, nir_shuffle_xor(b, v32, nir_imm_int(b, 1)))
+DEF_EMIT(shuf_xor_32d, nir_shuffle_xor(b, v32, idx))
+DEF_EMIT(shuf_xor_16, nir_shuffle_xor(b, v16, nir_imm_int(b, 1)))
+DEF_EMIT(shuf_xor_v2, nir_shuffle_xor(b, v32x2, nir_imm_int(b, 1)))
+DEF_EMIT(shuf_up, nir_shuffle_up(b, v32, idx))
+DEF_EMIT(shuf_down, nir_shuffle_down(b, v32, idx))
+DEF_EMIT(rotate, nir_rotate(b, v32, idx, .cluster_size = 0))
+DEF_EMIT(red_iadd_32, nir_reduce(b, v32, .reduction_op = nir_op_iadd, .cluster_size = 0))
+DEF_EMIT(red_iadd_64, nir_reduce(b, v64, .reduction_op = nir_op_iadd, .cluster_size = 0))
+DEF_EMIT(red_iadd_v2, nir_reduce(b, v32x2, .reduction_op = nir_op_iadd, .cluster_size = 0))
+DEF_EMIT(red_iadd_c2, nir_reduce(b, v32, .reduction_op = nir_op_iadd, .cluster_size = 2))
+DEF_EMIT(red_iadd_c4, nir_reduce(b, v32, .reduction_op = nir_op_iadd, .cluster_size = 4))
+DEF_EMIT(red_iadd_c32, nir_reduce(b, v32, .reduction_op = nir_op_iadd, .cluster_size = 32))
+DEF_EMIT(red_imin_32, nir_reduce(b, v32, .reduction_op = nir_op_imin, .cluster_size = 0))
+DEF_EMIT(red_imin_64, nir_reduce(b, v64, .reduction_op = nir_op_imin, .cluster_size = 0))
+DEF_EMIT(red_imul_32, nir_reduce(b, v32, .reduction_op = nir_op_imul, .cluster_size = 0))
+DEF_EMIT(red_fmin_32, nir_reduce(b, f32, .reduction_op = nir_op_fmin, .cluster_size = 0))
+DEF_EMIT(red_fmin_32_c4, nir_reduce(b, f32, .reduction_op = nir_op_fmin, .cluster_size = 4))
+DEF_EMIT(red_fmax_32_c32, nir_reduce(b, f32, .reduction_op = nir_op_fmax, .cluster_size = 32))
+DEF_EMIT(red_fmin_16_c4, nir_reduce(b, v16, .reduction_op = nir_op_fmin, .cluster_size = 4))
+DEF_EMIT(red_fadd_32, nir_reduce(b, v32, .reduction_op = nir_op_fadd, .cluster_size = 0))
+DEF_EMIT(red_fadd_64, nir_reduce(b, v64, .reduction_op = nir_op_fadd, .cluster_size = 0))
+DEF_EMIT(inc_iadd_32, nir_inclusive_scan(b, v32, .reduction_op = nir_op_iadd))
+DEF_EMIT(inc_fmin_32, nir_inclusive_scan(b, f32, .reduction_op = nir_op_fmin))
+DEF_EMIT(exc_iadd_32, nir_exclusive_scan(b, v32, .reduction_op = nir_op_iadd))
+DEF_EMIT(exc_iadd_64, nir_exclusive_scan(b, v64, .reduction_op = nir_op_iadd))
+DEF_EMIT(exc_imin_64, nir_exclusive_scan(b, v64, .reduction_op = nir_op_imin))
+DEF_EMIT(exc_imul_32, nir_exclusive_scan(b, v32, .reduction_op = nir_op_imul))
+DEF_EMIT(exc_fmin_32, nir_exclusive_scan(b, f32, .reduction_op = nir_op_fmin))
+
+static bool
+test_subgroup_predicate_matches_lowering(void)
+{
+   static const struct {
+      const char *name;
+      nir_intrinsic_instr *(*emit)(nir_builder *b, nir_def *addr, bool ftz32);
+   } cases[] = {
+      {"ballot_1x32", emit_ballot_1x32},
+      {"ballot_4x32", emit_ballot_4x32},
+      {"ballot_1x64", emit_ballot_1x64},
+      {"elect", emit_elect},
+      {"first_inv", emit_first_inv},
+      {"last_inv", emit_last_inv},
+      {"vote_any", emit_vote_any},
+      {"vote_all", emit_vote_all},
+      {"vote_ieq", emit_vote_ieq},
+      {"vote_feq", emit_vote_feq},
+      {"quad_vote_any", emit_quad_vote_any},
+      {"quad_vote_all", emit_quad_vote_all},
+      {"subgroup_size", emit_subgroup_size},
+      {"num_subgroups", emit_num_subgroups},
+      {"eq_mask", emit_eq_mask},
+      {"ge_mask", emit_ge_mask},
+      {"gt_mask", emit_gt_mask},
+      {"le_mask", emit_le_mask},
+      {"lt_mask", emit_lt_mask},
+      {"inv_ballot", emit_inv_ballot},
+      {"ballot_bfe", emit_ballot_bfe},
+      {"ballot_cnt", emit_ballot_cnt},
+      {"ballot_lsb", emit_ballot_lsb},
+      {"ballot_msb", emit_ballot_msb},
+      {"ballot_exc", emit_ballot_exc},
+      {"ballot_inc", emit_ballot_inc},
+      {"read_inv_s", emit_read_inv_s},
+      {"read_inv_v2", emit_read_inv_v2},
+      {"read_first", emit_read_first},
+      {"quad_bcast_s", emit_quad_bcast_s},
+      {"quad_bcast_v2", emit_quad_bcast_v2},
+      {"quad_h_s", emit_quad_h_s},
+      {"quad_h_v2", emit_quad_h_v2},
+      {"quad_v_s", emit_quad_v_s},
+      {"quad_v_v2", emit_quad_v_v2},
+      {"quad_d_s", emit_quad_d_s},
+      {"quad_d_v2", emit_quad_d_v2},
+      {"shuffle", emit_shuffle},
+      {"shuf_xor_32c", emit_shuf_xor_32c},
+      {"shuf_xor_32d", emit_shuf_xor_32d},
+      {"shuf_xor_16", emit_shuf_xor_16},
+      {"shuf_xor_v2", emit_shuf_xor_v2},
+      {"shuf_up", emit_shuf_up},
+      {"shuf_down", emit_shuf_down},
+      {"rotate", emit_rotate},
+      {"red_iadd_32", emit_red_iadd_32},
+      {"red_iadd_64", emit_red_iadd_64},
+      {"red_iadd_v2", emit_red_iadd_v2},
+      {"red_iadd_c2", emit_red_iadd_c2},
+      {"red_iadd_c4", emit_red_iadd_c4},
+      {"red_iadd_c32", emit_red_iadd_c32},
+      {"red_imin_32", emit_red_imin_32},
+      {"red_imin_64", emit_red_imin_64},
+      {"red_imul_32", emit_red_imul_32},
+      {"red_fmin_32", emit_red_fmin_32},
+      {"red_fmin_32_c4", emit_red_fmin_32_c4},
+      {"red_fmax_32_c32", emit_red_fmax_32_c32},
+      {"red_fmin_16_c4", emit_red_fmin_16_c4},
+      {"red_fadd_32", emit_red_fadd_32},
+      {"red_fadd_64", emit_red_fadd_64},
+      {"inc_iadd_32", emit_inc_iadd_32},
+      {"inc_fmin_32", emit_inc_fmin_32},
+      {"exc_iadd_32", emit_exc_iadd_32},
+      {"exc_iadd_64", emit_exc_iadd_64},
+      {"exc_imin_64", emit_exc_imin_64},
+      {"exc_imul_32", emit_exc_imul_32},
+      {"exc_fmin_32", emit_exc_fmin_32},
+   };
+
+   static const struct {
+      mesa_shader_stage stage;
+      bool ftz32;
+      bool g17p;
+      bool m5;
+      bool g18g;
+   } profiles[] = {
+      {MESA_SHADER_COMPUTE, false, false, false, false}, /* AGX2 */
+      {MESA_SHADER_COMPUTE, false, true, false, false},  /* G17P */
+      {MESA_SHADER_COMPUTE, false, false, true, false},  /* M5 compute */
+      {MESA_SHADER_COMPUTE, true, false, true, false},   /* M5 compute ftz32 */
+      {MESA_SHADER_FRAGMENT, false, false, true, false}, /* M5 fragment */
+      {MESA_SHADER_COMPUTE, false, false, true, true},   /* G18G compute */
+   };
+
+   bool ok = true;
+   for (unsigned p = 0; p < ARRAY_SIZE(profiles); ++p) {
+      for (unsigned c = 0; c < ARRAY_SIZE(cases); ++c) {
+         ok &= check_one_subgroup_case(cases[c].name, profiles[p].stage,
+                                       profiles[p].ftz32, profiles[p].g17p,
+                                       profiles[p].m5, profiles[p].g18g,
+                                       cases[c].emit);
+      }
+   }
+   return ok;
+}
+#endif
+
 int
 main(void)
 {
    bool ok = true;
    ok &= test_post_lower_equivalence();
+   ok &= test_post_lower_native_ballot();
+   ok &= test_post_lower_m5_compute_shuffle_xor();
+   ok &= test_post_lower_g18g_quad_clustered();
+#ifndef NDEBUG
+   ok &= test_subgroup_predicate_matches_lowering();
+#endif
    ok &= test_post_lower_temp_var_fallback(false);
    ok &= test_post_lower_temp_var_fallback(true);
    ok &= test_dead_sysval_before_divergence();

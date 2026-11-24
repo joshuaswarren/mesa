@@ -11,23 +11,11 @@
 #include "util/format/u_format.h"
 
 /*
- * A G17P image read does not observe a write issued earlier in the same
- * shader invocation. Apple's compiler never asks it to: metal-nt -arch
- * applegpu_g17p compiles
- *
- *    t.write(uint4(1, 2, 3, 4), gid);
- *    out[0] = t.read(gid);
- *
- * to a sample of t followed by the imgwci, and stores the sample's result, so
- * the read yields the texel as it was before the write. Vulkan instead gives
- * a load of a texel the value stored to it earlier in the same invocation.
- *
- * Provide that ordering in NIR. Every store to an image that the invocation
- * also loads records the texel it wrote and the value, converted through the
- * image format exactly as a load would return it. A later load of that image
- * at the same coordinate and sample selects the recorded value. The record
- * lives in function-local variables, so it follows the store across control
- * flow. Each image keeps its latest store; the store itself is unchanged.
+ * G17P image reads do not observe writes issued earlier in the same shader
+ * invocation, whereas Vulkan requires intra-invocation read-after-write
+ * visibility. Forward each image's latest store to subsequent loads of the same
+ * coordinate and sample via function-local variables (converted through the
+ * image format) while leaving the store itself intact.
  */
 
 #define MAX_TRACKED_IMAGES 8

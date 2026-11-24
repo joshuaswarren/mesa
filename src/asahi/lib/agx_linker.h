@@ -28,6 +28,7 @@ struct agx_linked_shader {
    /* Gallium-owned, bounded Ioto template cache. Entries are ralloc children
     * of this linked shader and contain no live batch allocations. */
    struct agx_g17p_graphics_template *g17p_graphics_templates;
+   uint32_t g17p_graphics_templates_generated;
 
    /* The same for the M5 family's native programs (agx_state.c). */
    struct agx_m5_graphics_template *m5_graphics_templates;
@@ -83,6 +84,15 @@ struct agx_linked_shader {
 
    /* Whether the program is a no-op and can be skipped. */
    bool no_op;
+
+   /* True if the linked fragment program is translucent solely because one or
+    * more bound colour attachments are unwritten (no blend, mask, tile load,
+    * or spill). */
+   bool translucent_only_for_unwritten_rts;
+
+   /* Bitmask of bound colour attachments written by the linked fragment
+    * epilog / monolithic fragment shader. */
+   uint8_t color_rts_written;
 
    /* Coefficient register bindings */
    struct agx_varyings_fs cf;
@@ -335,6 +345,13 @@ struct agx_fs_epilog_link_info {
 };
 static_assert(sizeof(struct agx_fs_epilog_link_info) == 8, "packed");
 
+enum agx_epilog_clear_fill {
+   AGX_EPILOG_CLEAR_FILL_NONE = 0,
+   AGX_EPILOG_CLEAR_FILL_ZERO = 1,         /* (0, 0, 0, 0) */
+   AGX_EPILOG_CLEAR_FILL_BLACK_OPAQUE = 2, /* (0, 0, 0, 1) */
+   AGX_EPILOG_CLEAR_FILL_WHITE = 3,        /* (1, 1, 1, 1) */
+};
+
 struct agx_fs_epilog_key {
    struct agx_fs_epilog_link_info link;
 
@@ -367,6 +384,8 @@ struct agx_fs_epilog_key {
    uint8_t max_sample_size_B;
    /* agx_tilebuffer_layout::resident_mask of the render pass. */
    uint8_t resident_mask;
+   /* agx_tilebuffer_layout::first_mask of the render pass. */
+   uint8_t first_mask;
    bool native_imageblock;
    uint32_t max_bytes_per_tile;
    uint16_t max_samples_per_tile;
@@ -418,6 +437,13 @@ struct agx_fs_epilog_key {
     * the constants after the main shader's uniform footprint instead. */
    uint16_t blend_constant_base;
 
+   /* Two-bit enum agx_epilog_clear_fill code per render target (bits 2*rt+1:2*rt).
+    * When non-zero for a bound, shader-unwritten LOAD_OP_CLEAR attachment, the
+    * epilog stores that constant clear colour directly so every bound attachment
+    * is written and the draw can keep OPAQUE/PUNCH_THROUGH HSR without relying
+    * on the ISP background shader surviving covered tiles or partial renders. */
+   uint16_t clear_fill_rt;
+
    /* Render targets whose tile value must be stored back unchanged (colour
     * write disabled while raster coverage still makes the tile nonempty).
     * Independent of blending, so it also holds for pure-integer formats. */
@@ -437,6 +463,24 @@ struct agx_fs_epilog_key {
    uint8_t g18_native_mixed;
 };
 
+static inline enum agx_epilog_clear_fill
+agx_fs_epilog_clear_fill_for_rt(const struct agx_fs_epilog_key *key,
+                                unsigned rt)
+{
+   return (enum agx_epilog_clear_fill)((key->clear_fill_rt >> (rt * 2)) & 3u);
+}
+
+static inline uint8_t
+agx_fs_epilog_clear_fill_mask(uint16_t clear_fill_rt)
+{
+   uint8_t mask = 0;
+   for (unsigned rt = 0; rt < 8; ++rt) {
+      if ((clear_fill_rt >> (rt * 2)) & 3u)
+         mask |= BITFIELD_BIT(rt);
+   }
+   return mask;
+}
+
 /* Apply framebuffer rules which are properties of the hardware generation,
  * not API state. Keep Gallium and Honeykrisp on the same epilog contract. */
 void agx_fs_epilog_apply_device_policy(enum agx_chip chip,
@@ -448,11 +492,26 @@ bool agx_fs_epilog_may_discard(const struct agx_fs_epilog_link_info *link,
                                bool alpha_to_coverage,
                                bool nontrivial_force_early);
 
+struct agx_fs_epilog_result {
+   /* True if epilog translucency was forced solely because one or more bound
+    * colour attachments are unwritten. */
+   bool translucent_only_for_unwritten_rts;
+
+   /* Bitmask of bound colour attachments statically written by the epilog. */
+   uint8_t color_rts_written;
+};
+
 void agx_nir_vs_prolog(struct nir_builder *b, const void *key_);
 void agx_nir_vs_prolog_raw(struct nir_builder *b, const void *key_);
 void agx_nir_fs_epilog(struct nir_builder *b, const void *key_);
+void agx_nir_fs_epilog_ex(struct nir_builder *b,
+                          const struct agx_fs_epilog_key *key,
+                          struct agx_fs_epilog_result *res);
 void agx_nir_fs_epilog_agx2(struct nir_builder *b, const void *key_);
 void agx_nir_fs_epilog_g17p(struct nir_builder *b, const void *key);
+void agx_nir_fs_epilog_g17p_ex(struct nir_builder *b,
+                               const struct agx_fs_epilog_key *key,
+                               struct agx_fs_epilog_result *res);
 bool agx_nir_lower_g17p_sample_shading(
    nir_shader *nir, struct agx_fs_epilog_link_info *link, unsigned samples);
 bool agx_nir_lower_g17p_sample_shading_file(

@@ -842,6 +842,7 @@ test_g17p_background_clear(void)
 
 static nir_shader *build_fs_alpha_discard_word(void);
 static nir_shader *build_fs_kill_then_alpha_discard_word(void);
+static nir_shader *build_fs_constant_target_alpha_discard(uint16_t target);
 
 /* At one sample both non-constant coverage sources
  * are reduced to bit 0 (FLAGS = 3); at four samples the whole masks are kept
@@ -891,9 +892,51 @@ static bool
 test_g17p_discard_word(void)
 {
    static const unsigned one[] = {3}, two[] = {1, 3};
-   return g17p_discard_word_case(build_fs_alpha_discard_word, 1, one, 1) &&
-          g17p_discard_word_case(build_fs_kill_then_alpha_discard_word, 1,
-                                 two, 2);
+   if (!g17p_discard_word_case(build_fs_alpha_discard_word, 1, one, 1) ||
+       !g17p_discard_word_case(build_fs_kill_then_alpha_discard_word, 1, two, 2))
+      return false;
+
+   /* Constant target 0xffff at one sample passes immediate 1 directly and
+    * zero-extends the coverage word instead of materializing 0xffff and
+    * multiplying by a dynamic target. Verify it compiles cleanly and emits
+    * fewer instructions than the dynamic-target form, while target 0 and
+    * multisample forms still compile. */
+   nir_shader *const_nir = build_fs_constant_target_alpha_discard(0xffff);
+   nir_shader *dyn_nir = build_fs_alpha_discard_word();
+   nir_shader *zero_nir = build_fs_constant_target_alpha_discard(0);
+   nir_shader *msaa_nir = build_fs_constant_target_alpha_discard(0xffff);
+   struct agx_shader_key key = {
+      .dev.encoding = AGX_ISA_ENCODING_AGX3B,
+      .no_preamble = true,
+      .fs.nr_samples = 1,
+   };
+   struct agx_shader_key msaa_key = key;
+   msaa_key.fs.nr_samples = 4;
+
+   struct agx_shader_part const_part = {0}, dyn_part = {0}, zero_part = {0},
+      msaa_part = {0};
+   bool ok = agx_compile_shader_nir(const_nir, &key, &const_part) &&
+             agx_compile_shader_nir(dyn_nir, &key, &dyn_part) &&
+             agx_compile_shader_nir(zero_nir, &key, &zero_part) &&
+             agx_compile_shader_nir(msaa_nir, &msaa_key, &msaa_part) &&
+             const_part.info.stats.instrs + 3 <= dyn_part.info.stats.instrs &&
+             const_part.info.binary_size < dyn_part.info.binary_size;
+   if (!ok) {
+      fprintf(stderr,
+              "AGX3b constant-target discard mismatch: const=%u instrs/%u B "
+              "dyn=%u instrs/%u B\n",
+              const_part.info.stats.instrs, const_part.info.binary_size,
+              dyn_part.info.stats.instrs, dyn_part.info.binary_size);
+   }
+   free(const_part.binary);
+   free(dyn_part.binary);
+   free(zero_part.binary);
+   free(msaa_part.binary);
+   ralloc_free(const_nir);
+   ralloc_free(dyn_nir);
+   ralloc_free(zero_nir);
+   ralloc_free(msaa_nir);
+   return ok;
 }
 
 static bool
@@ -1501,6 +1544,28 @@ build_fs_alpha_discard_word(void)
                                nir_imm_intN_t(&b, 0, 16));
    nir_def *tests = nir_load_preamble(&b, 1, 16, .base = 0);
    nir_sample_mask_agx(&b, nir_ior(&b, tests, killed),
+                       nir_ixor(&b, killed, nir_imm_intN_t(&b, 0xff, 16)));
+   fs_store_colour(&b, colour);
+   b.shader->info.fs.uses_discard = true;
+   b.shader->info.inputs_read = BITFIELD64_BIT(VARYING_SLOT_VAR0);
+   return fs_finish(&b);
+}
+
+static nir_shader *
+build_fs_constant_target_alpha_discard(uint16_t target)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options,
+      "G17P constant-target alpha discard FS");
+   nir_def *bary = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *colour = nir_load_interpolated_input(
+      &b, 4, 32, bary, nir_imm_int(&b, 0), .base = 0, .component = 0,
+      .io_semantics.location = VARYING_SLOT_VAR0, .io_semantics.num_slots = 1);
+   nir_def *c = nir_feq(&b, nir_channel(&b, colour, 3), nir_imm_float(&b, 0));
+   nir_def *killed = nir_bcsel(&b, c, nir_imm_intN_t(&b, 0xff, 16),
+                               nir_imm_intN_t(&b, 0, 16));
+   nir_sample_mask_agx(&b, nir_imm_intN_t(&b, target, 16),
                        nir_ixor(&b, killed, nir_imm_intN_t(&b, 0xff, 16)));
    fs_store_colour(&b, colour);
    b.shader->info.fs.uses_discard = true;

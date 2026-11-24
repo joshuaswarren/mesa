@@ -113,8 +113,10 @@ hk_files = files(
   'hk_pack.c',
   'hk_pack.h',
   'hk_inline_blend_layout.h',
+  'hk_partial_mrt_hsr.h',
   'hk_queue.c',
   'hk_queue.h',
+  'hk_queue_flush.h',
   'hk_frame_anatomy.c',
   'hk_frame_anatomy.h',
   'hk_sampler.c',
@@ -166,6 +168,21 @@ if with_tests
         inc_src, inc_asahi,
       ],
       dependencies : [idep_nir, idep_mesautil]),
+    suite : ['asahi'])
+
+  test('hk_partial_mrt_hsr',
+    executable('hk_partial_mrt_hsr_test',
+      files('tests/test-hk-partial-mrt-hsr.c'),
+      include_directories : [
+        include_directories('.'), inc_gallium, inc_gallium_aux, inc_include,
+        inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm,
+      ],
+      dependencies : [
+        idep_nir, idep_mesautil, idep_libagx,
+        idep_libagx_shaders_h, idep_agx_pack,
+        idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+      ],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout]),
     suite : ['asahi'])
 
   test('hk_memory_budget', executable('hk_memory_budget_test',
@@ -224,6 +241,18 @@ if with_tests
     files('tests/test-hk-root-size.c', 'hk_nir_root_size.c'),
     include_directories : [include_directories('.'), inc_include, inc_src],
     dependencies : [idep_nir, idep_mesautil]), suite : ['asahi'])
+
+  test('hk_vdm_indirect_count',
+    executable('hk_vdm_indirect_count_test',
+      files('tests/test-hk-vdm-indirect-count.c'),
+      include_directories : [
+        include_directories('.'), inc_include, inc_src, inc_asahi,
+      ],
+      dependencies : [idep_mesautil, idep_agx_pack],
+      link_with : [libasahi_lib],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden'),
+    suite : ['asahi'])
   # Unused recording functions require section garbage collection so the
   # test can link the production resolver without the rest of the driver.
   if ld_args_gc_sections.length() > 0
@@ -793,8 +822,7 @@ if with_tests
       '-Wl,--wrap=agx_bo_export', '-Wl,--wrap=agx_bo_import',
       '-Wl,--wrap=hk_get_cgroup_memory_available', '-Wl,--wrap=__vk_errorf',
       '-Wl,--wrap=os_get_available_system_memory',
-      '-Wl,--wrap=os_get_total_physical_memory',
-      '-Wl,--wrap=agx_bo_cache_has']),
+      '-Wl,--wrap=os_get_total_physical_memory']),
     suite : ['asahi'])
   test('hk_cache_identity', executable('hk_cache_identity_test',
     files('tests/test-hk-cache-identity.c'),
@@ -824,6 +852,12 @@ if with_tests
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test('hk_g17p_task_kernel', executable('hk_g17p_task_kernel_test',
     files('tests/test-hk-g17p-task-kernel.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_indirect_vdm', executable('hk_indirect_vdm_test',
+    files('tests/test-hk-indirect-vdm.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
@@ -910,6 +944,14 @@ _dev_icd = custom_target(
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
 
 if with_tests and ld_args_gc_sections.length() > 0
+  test(
+    'hk_compression_contract', executable('hk_compression_contract_test',
+      files('tests/test-hk-compression-contract.c'),
+      include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+        inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+      dependencies : [hk_deps], link_with : [libhk, libasahi_layout],
+      link_args : [ld_args_gc_sections],
+      gnu_symbol_visibility : 'hidden'), suite : ['asahi'])
   test(
     'hk_sparse_formats', executable('hk_sparse_formats_test',
       files('tests/test-hk-sparse-formats.c'),
@@ -1295,6 +1337,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  hal200_vulkan_msaa_depth_compression = executable(
+    'hal200-vulkan-msaa-depth-compression',
+    files('tests/hal200_vulkan_msaa_depth_compression.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   g17p_vulkan_layered_depth = executable(
     'g17p-vulkan-layered-depth',
     files('tests/g17p_vulkan_layered_depth.c'),
@@ -1415,6 +1466,21 @@ endif
 if with_tests
   test('hk_attachmentless', executable('hk_attachmentless_test',
     files('tests/test-hk-attachmentless.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]),
+    timeout : 30, suite : ['asahi'])
+endif
+
+if with_tests
+  test('hk_ray_tracing_core', executable('hk_ray_tracing_core_test',
+    files('tests/test-hk-ray-tracing-core.c', 'hk_ray_tracing_core.c'),
+    include_directories : [include_directories('.'), inc_include, inc_src]),
+    suite : ['asahi'])
+  test('hk_root_only_flush', executable('hk_root_only_flush_test',
+    files('tests/test-hk-root-only-flush.c'),
+    c_args : ['-DNDEBUG'],
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk],

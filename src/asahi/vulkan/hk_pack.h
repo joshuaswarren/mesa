@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "asahi/lib/agx_chip.h"
 #include "util/u_dynarray.h"
 #include "hk_sync.h"
 
@@ -35,6 +36,7 @@ struct hk_sync_queue;
 #define HK_PACK_MAX_DISPATCHES 256u
 #define HK_PACK_MAX_THREADS (UINT64_C(1) << 28)
 #define HK_PACK_MAX_STATIC_WORK (UINT64_C(1) << 35)
+#define HK_PACK_CDM_TERMINATE_MAX 8u
 
 /* One command buffer of a submission, as the planner sees it. */
 struct hk_pack_member {
@@ -86,6 +88,11 @@ enum hk_pack_boundary {
 };
 
 enum hk_pack_boundary hk_pack_boundary(const struct hk_device *dev);
+
+/* Packs the CDM stream-terminate record for `chip` into `out` and returns its
+ * byte length (8 for AGX2, 4 for AGX3), or 0 if unsupported. */
+size_t hk_pack_cdm_terminate(enum agx_chip chip,
+                             uint8_t out[HK_PACK_CDM_TERMINATE_MAX]);
 
 /* Whether a member may end with a strong flush without memory scope, as an
  * application barrier at the end of a command buffer leaves it: at every

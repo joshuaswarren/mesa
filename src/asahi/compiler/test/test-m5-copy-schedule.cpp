@@ -393,6 +393,115 @@ TEST(M5CopySchedule, ComputeDeviceLoadsFollowTheProgramPeak)
    }
 }
 
+/* Global device memory and threadgroup local memory are disjoint address
+ * spaces: a local_store must not serialize independent device_loads behind it,
+ * while a barrier still orders both spaces. Applies across AGX2 and AGX3. */
+TEST(M5CopySchedule, DeviceLoadsHoistPastLocalStoresAcrossGenerations)
+{
+   for (enum agx_isa_encoding enc :
+        {AGX_ISA_ENCODING_AGX2, AGX_ISA_ENCODING_AGX3B,
+         AGX_ISA_ENCODING_AGX3C}) {
+      SCOPED_TRACE(enc);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.key.dev.encoding = enc;
+      agx_builder *b = s.b;
+      agx_index base = agx_uniform(0, AGX_SIZE_64);
+      agx_index off = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_index lbase = agx_preload(b, agx_register(4, AGX_SIZE_16));
+
+      for (unsigned i = 0; i < 6; ++i) {
+         agx_index idx = agx_iadd(b, off, agx_immediate(i * 4), 0);
+         agx_index v = agx_temp(b->shader, AGX_SIZE_32);
+         agx_device_load_to(b, v, base, idx, AGX_FORMAT_I32, 0x1, 0, 0);
+         agx_index loff = agx_iadd(b, lbase, agx_immediate(i * 4), 0);
+         agx_local_store(b, v, loff, agx_zero(), AGX_FORMAT_I32, 0x1);
+      }
+
+      agx_ilp_schedule(b->shader);
+      EXPECT_GE(max_device_loads_in_flight(s.body), 4u);
+      ralloc_free(s.mem);
+   }
+}
+
+/* Independent threadgroup local_loads batch ahead of their ALU consumers
+ * within the shader's occupancy step on both AGX2 and AGX3. */
+TEST(M5CopySchedule, ComputeLocalLoadsHoistWithinOccupancyStep)
+{
+   for (enum agx_isa_encoding enc :
+        {AGX_ISA_ENCODING_AGX2, AGX_ISA_ENCODING_AGX3B,
+         AGX_ISA_ENCODING_AGX3C}) {
+      SCOPED_TRACE(enc);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.key.dev.encoding = enc;
+      agx_builder *b = s.b;
+      agx_index lbase = agx_preload(b, agx_register(2, AGX_SIZE_16));
+      agx_index bv = agx_preload(b, agx_register(4, AGX_SIZE_32));
+      agx_index acc = agx_mov_imm(b, 32, 0);
+
+      for (unsigned i = 0; i < 8; ++i) {
+         agx_index loff = agx_iadd(b, lbase, agx_immediate(i * 4), 0);
+         agx_index v = agx_temp(b->shader, AGX_SIZE_32);
+         agx_local_load_to(b, v, loff, agx_zero(), AGX_FORMAT_I32, 0x1);
+         acc = agx_ffma(b, v, bv, acc);
+      }
+      agx_unit_test(b, acc);
+
+      agx_ilp_schedule(b->shader);
+      unsigned leading_local_loads = 0;
+      agx_foreach_instr_in_block(s.body, I) {
+         if (I->op == AGX_OPCODE_LOCAL_LOAD)
+            ++leading_local_loads;
+         else if (I->op == AGX_OPCODE_FFMA)
+            break;
+      }
+      EXPECT_GE(leading_local_loads, 4u);
+      ralloc_free(s.mem);
+   }
+}
+
+/* Uniform stores in a preamble must preserve RAW/WAR ordering against uniform
+ * reads even when the shader has no AGX3 native uniform ALU instructions. */
+TEST(M5CopySchedule, PreambleUniformStoreDependenciesPreserved)
+{
+   for (enum agx_isa_encoding enc :
+        {AGX_ISA_ENCODING_AGX2, AGX_ISA_ENCODING_AGX3B}) {
+      SCOPED_TRACE(enc);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.key.dev.encoding = enc;
+      s.b->shader->is_preamble = true;
+      agx_builder *b = s.b;
+
+      agx_index in_ptr = agx_uniform(0, AGX_SIZE_64);
+      agx_index loaded = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+      agx_device_load_to(b, loaded, in_ptr, agx_zero(), AGX_FORMAT_I32, 0x3, 0, 0);
+      agx_uniform_store(b, loaded, agx_immediate(16), 0x3);
+
+      agx_index dep_ptr = agx_uniform(16, AGX_SIZE_64);
+      agx_index loaded2 = agx_temp(b->shader, AGX_SIZE_32);
+      agx_device_load_to(b, loaded2, dep_ptr, agx_zero(), AGX_FORMAT_I32, 0x1, 0, 0);
+      agx_uniform_store(b, loaded2, agx_immediate(24), 0x1);
+
+      agx_ilp_schedule(b->shader);
+
+      int store_pos = -1, dep_load_pos = -1, idx = 0;
+      agx_foreach_instr_in_block(s.body, I) {
+         if (I->op == AGX_OPCODE_UNIFORM_STORE && I->src[1].value == 16)
+            store_pos = idx;
+         if (I->op == AGX_OPCODE_DEVICE_LOAD &&
+             I->src[0].type == AGX_INDEX_UNIFORM && I->src[0].value == 16)
+            dep_load_pos = idx;
+         ++idx;
+      }
+      ASSERT_GE(store_pos, 0);
+      ASSERT_GE(dep_load_pos, 0);
+      EXPECT_LT(store_pos, dep_load_pos);
+      ralloc_free(s.mem);
+   }
+}
+
 namespace {
 
 enum frag_sample_kind {
@@ -665,4 +774,137 @@ TEST(M5CopySchedule, AGX3BFragmentCubeBudgetRespected)
                 FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD, false,
                 true, 80),
              1u);
+}
+
+/* Helper-kernel protocol ops (doorbell, stack_map, stack_unmap) must carry
+ * AGX_SCHEDULE_CLASS_BARRIER and never be reordered past get_sr_barrier inside
+ * AGX2 loop bodies (libagx_helper deadlock regression). */
+TEST(M5CopySchedule, AGX2HelperDoorbellOrderPreserved)
+{
+   EXPECT_EQ(agx_opcodes_info[AGX_OPCODE_DOORBELL].schedule_class,
+             AGX_SCHEDULE_CLASS_BARRIER);
+   EXPECT_EQ(agx_opcodes_info[AGX_OPCODE_STACK_MAP].schedule_class,
+             AGX_SCHEDULE_CLASS_BARRIER);
+   EXPECT_EQ(agx_opcodes_info[AGX_OPCODE_STACK_UNMAP].schedule_class,
+             AGX_SCHEDULE_CLASS_BARRIER);
+
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, true);
+   s.key.dev.encoding = AGX_ISA_ENCODING_AGX2;
+   s.key.dev.chip = AGX_CHIP_G13G;
+
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+   agx_doorbell(b, 0x20);
+   agx_index op = agx_get_sr_barrier(b, 32, (enum agx_sr)0x90);
+   agx_index arg = agx_get_sr_barrier(b, 32, (enum agx_sr)0x92);
+   agx_index sum = agx_iadd(b, op, arg, 0);
+   agx_if_icmp(b, sum, agx_zero(), 1, AGX_ICOND_UEQ, false, s.body);
+
+   agx_pressure_schedule(b->shader);
+   agx_ilp_schedule(b->shader);
+
+   int doorbell_pos = -1, first_sr_pos = -1, pos = 0;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_DOORBELL)
+         doorbell_pos = pos;
+      else if (I->op == AGX_OPCODE_GET_SR_BARRIER && first_sr_pos < 0)
+         first_sr_pos = pos;
+      ++pos;
+   }
+   EXPECT_GE(doorbell_pos, 0);
+   EXPECT_GT(first_sr_pos, doorbell_pos);
+   ralloc_free(s.mem);
+}
+
+/* stack_adjust must live in SCHED_MEM_STACK so stack_load/stack_store stay
+ * strictly ordered between frame allocation and deallocation. */
+TEST(M5CopySchedule, StackAdjustSerializesStackAccesses)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   s.key.dev.encoding = AGX_ISA_ENCODING_AGX2;
+   s.key.dev.chip = AGX_CHIP_G13G;
+
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+   agx_index val = agx_mov_imm(b, 32, 0x1234);
+   agx_index off = agx_zero();
+   agx_stack_adjust(b, 16);
+   agx_stack_store(b, val, off, AGX_FORMAT_I32, 1);
+   agx_index loaded = agx_stack_load(b, off, AGX_FORMAT_I32, 1);
+   agx_stack_adjust(b, -16);
+   agx_device_store(b, loaded, agx_uniform(0, AGX_SIZE_64), agx_zero(),
+                    AGX_FORMAT_I32, 1, 0, false);
+
+   agx_pressure_schedule(b->shader);
+   agx_ilp_schedule(b->shader);
+
+   int adj_alloc = -1, st_pos = -1, ld_pos = -1, adj_free = -1, pos = 0;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_STACK_ADJUST) {
+         if (adj_alloc < 0)
+            adj_alloc = pos;
+         else
+            adj_free = pos;
+      } else if (I->op == AGX_OPCODE_STACK_STORE) {
+         st_pos = pos;
+      } else if (I->op == AGX_OPCODE_STACK_LOAD) {
+         ld_pos = pos;
+      }
+      ++pos;
+   }
+   EXPECT_GE(adj_alloc, 0);
+   EXPECT_GT(st_pos, adj_alloc);
+   EXPECT_GT(ld_pos, st_pos);
+   EXPECT_GT(adj_free, ld_pos);
+   ralloc_free(s.mem);
+}
+
+/* Multi-channel loads unpacked by SPLIT remain tracked as in-flight loads
+ * until a real consumer reads a split lane, and independent ALU chains
+ * interleave rather than serializing one chain after another. */
+TEST(M5CopySchedule, SplitLoadChainsInterleaveIndependentAlu)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+   agx_index address = agx_preload(b, agx_register(2, AGX_SIZE_64));
+   agx_index w = agx_preload(b, agx_register(6, AGX_SIZE_32));
+   agx_index acc[4];
+   for (unsigned c = 0; c < 4; ++c)
+      acc[c] = agx_mov_imm(b, 32, 0);
+
+   for (unsigned i = 0; i < 6; ++i) {
+      agx_index vec = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_device_load_to(b, vec, address, agx_immediate(i * 16),
+                         AGX_FORMAT_I32, 0xf, 0, false);
+      agx_instr *split = agx_split(b, 4, vec);
+      for (unsigned c = 0; c < 4; ++c)
+         split->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+      for (unsigned c = 0; c < 4; ++c) {
+         agx_index scaled = agx_fmul(b, split->dest[c], w);
+         acc[c] = agx_ffma(b, scaled, w, acc[c]);
+      }
+   }
+   agx_index total = agx_fadd(b, agx_fadd(b, acc[0], acc[1]),
+                              agx_fadd(b, acc[2], acc[3]));
+   agx_unit_test(b, total);
+
+   agx_ilp_schedule(b->shader);
+   const unsigned in_flight = max_device_loads_in_flight(s.body);
+   EXPECT_GE(in_flight, 2u);
+   EXPECT_LE(in_flight, 4u);
+
+   /* Verify that the first two FMULs issue before the first FFMA (interleaving
+    * independent chains instead of completing lane 0's FMUL->FFMA before lane 1). */
+   unsigned fmuls_before_first_ffma = 0;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_FFMA)
+         break;
+      fmuls_before_first_ffma += I->op == AGX_OPCODE_FMUL;
+   }
+   EXPECT_GE(fmuls_before_first_ffma, 2u);
+   ralloc_free(s.mem);
 }

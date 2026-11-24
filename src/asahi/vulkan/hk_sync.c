@@ -1287,6 +1287,43 @@ hk_sync_get_cs_after(struct hk_cmd_buffer *cmd,
    return cs;
 }
 
+/* A host-availability flush is recorded at its dependency into the open
+ * compute stream when that stream already holds work and is positioned after
+ * every stream of the dependency's first scope, so recording the flush there
+ * creates no stream and needs none. The stream takes the dependency's waits,
+ * as it did when every such flush was recorded at its dependency, unless that
+ * would make work it holds wait for a render it does not wait for yet
+ * (cdm_raise_delays_work()). No kind names the flush. Otherwise the flush is
+ * deferred to the end of the submission (hk_sync_defer_host_flush()). */
+struct hk_cs *
+hk_sync_host_flush(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info)
+{
+   const uint8_t kinds = hk_sync_host_flush_kinds(info);
+   if (!kinds)
+      return NULL;
+
+   struct hk_cs *cs = cmd->current_cs.cs;
+   if (cs && cs->stats.cmds && !cmd->sync.pin_cs &&
+       !cmd->sync.brl_transition_active) {
+      struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+      hk_sync_src_dep(cmd, kinds, cs, dep);
+
+      bool after = !cdm_raise_delays_work(cmd, cs, dep[HK_SYNC_VDM].cut);
+      for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+         if (dep[sq].cut && dep[sq].cut->sync.seq > cs->sync.seq)
+            after = false;
+      }
+
+      if (after) {
+         hk_sync_stream_wait(cs, dep);
+         return cs;
+      }
+   }
+
+   cmd->sync.host_flush_kinds |= kinds;
+   return NULL;
+}
+
 /* A standalone G17P timestamp still needs an executable command carrier.
  * Only an otherwise empty timestamp producer uses this owned scratch store;
  * ordinary compute and barriers keep their existing streams unchanged.
@@ -2128,7 +2165,7 @@ hk_sync_queue_kinds(const struct hk_sync_queue *q, unsigned sq)
 }
 
 bool
-hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds, bool chain,
+hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds,
                           const uint64_t base[HK_SYNC_NUM_SQ],
                           const uint32_t count[HK_SYNC_NUM_SQ],
                           uint16_t barrier[HK_SYNC_NUM_SQ],
@@ -2142,15 +2179,17 @@ hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds, bool chain,
          /* What resolve_one() gives a stream of every kind whose first
           * scope is `kinds`, at the end of the submission: the latest
           * command of those kinds, and every requirement still carried, as
-          * a stream recorded at the dependency itself would have picked up.
-          * A command of this submission within the 16-bit field is named by
-          * its position, any other by its ordinal. Waits are prefixes. */
+          * a stream recorded at the dependency itself would have picked up;
+          * and the submission's last command on the subqueue (see
+          * hk_sync.h). A command of this submission within the 16-bit field
+          * is named by its position, any other by its ordinal. Waits are
+          * prefixes. */
          uint64_t v = 0;
          u_foreach_bit(k, kinds)
             v = MAX2(v, q->last_absolute[k][sq]);
          for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k)
             v = MAX2(v, q->tail[k][sq]);
-         if (chain && count[sq])
+         if (count[sq])
             v = MAX2(v, base[sq] + count[sq]);
          if (v > base[sq] && v - base[sq] < DRM_ASAHI_BARRIER_NONE)
             barrier[sq] = (uint16_t)(v - base[sq]);

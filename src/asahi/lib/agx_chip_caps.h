@@ -55,16 +55,37 @@ enum agx_chip_cap {
    /* The matrix multiply-add backing a subgroup-scope cooperative matrix
     * (agx_chip_cooperative_matrix_supported). */
    AGX_CAP_COOPERATIVE_MATRIX = 1u << 7,
+
+   /* 3D sparse image residency (sliced 64 KiB tiles) is qualified on this chip. */
+   AGX_CAP_SPARSE_RESIDENCY_3D = 1u << 8,
+
+   /* VK_EXT_descriptor_buffer is hardware-qualified on this chip. */
+   AGX_CAP_DESCRIPTOR_BUFFER = 1u << 9,
+
+   /* Borealis may coalesce small pure-global direct compute workgroups (<= 256
+    * invocations, multiple of 32, proven independent of workgroup shape) into
+    * larger power-of-two hardware workgroups (up to 256 threads, or 512 for
+    * short low-register loop-free shaders) to avoid the AGX3 CDM per-workgroup
+    * launch-rate floor on large grids. Measured and qualified on G17P
+    * (HAL200); off on M5 (G17G/G17S/G17C), G15, G16, G18G, and AGX2 until
+    * per-generation hardware A/B and CTS rows are collected. */
+   AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS = 1u << 10,
 };
+
+/* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
+#define AGX_CAPS_AGX2 (AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_DESCRIPTOR_BUFFER)
 
 /* What the five native AGX3 chips (G15G, G15S, G15C, G16G, G17P) share. */
 #define AGX_CAPS_NATIVE                                                        \
    (AGX_CAP_NATIVE_INDIRECT_COMPUTE | AGX_CAP_NATIVE_IMAGEBLOCK |              \
-    AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX)
+    AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX |          \
+    AGX_CAP_DESCRIPTOR_BUFFER)
 
 #define AGX_CAPS_G17P                                                          \
    (AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                                \
-    AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS)
+    AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |                                        \
+    AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_RESIDENCY_3D |      \
+    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
@@ -79,17 +100,17 @@ enum agx_chip_cap {
  * predicates do.
  */
 #define AGX_CHIP_CAPS(X, ...)                                                  \
-   X(G13G, 0, __VA_ARGS__)                                                     \
-   X(G13X, 0, __VA_ARGS__)                                                     \
-   X(G14G, 0, __VA_ARGS__)                                                     \
-   X(G14X, 0, __VA_ARGS__)                                                     \
+   X(G13G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
+   X(G13X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
+   X(G14G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
+   X(G14X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G15P, 0, __VA_ARGS__)                                                     \
    X(G15G, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
    X(G15S, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
    X(G15C, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
    X(G15D, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G16P, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
-   X(G16G, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
+   X(G16G, AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE, __VA_ARGS__)             \
    X(G16S, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G16C, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G17P, AGX_CAPS_G17P, __VA_ARGS__)                                         \

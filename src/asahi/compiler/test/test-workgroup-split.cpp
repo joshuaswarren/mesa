@@ -194,3 +194,36 @@ TEST_F(WorkgroupSplit, DeviceScopeBarrierAndSubgroupIdRefusal)
    keep(nir_load_subgroup_id(&b));
    EXPECT_FALSE(agx_workgroup_split_size(b.shader, hw));
 }
+
+TEST_F(WorkgroupSplit, CompilesCleanlyOnAGX3C)
+{
+   uint16_t hw[3] = {0};
+   size(16, 32, 1);
+   nir_def *base = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_def *lid = nir_load_local_invocation_id(&b);
+   nir_def *wg = nir_load_workgroup_id(&b);
+   nir_def *idx = nir_iadd(&b, nir_channel(&b, gid, 0),
+                           nir_iadd(&b, nir_channel(&b, lid, 1),
+                                    nir_channel(&b, wg, 0)));
+   nir_def *addr = nir_iadd(&b, base, nir_u2u64(&b, nir_ishl_imm(&b, idx, 2)));
+   nir_store_global(&b, idx, addr, .align_mul = 4);
+
+   ASSERT_TRUE(agx_workgroup_split_size(b.shader, hw));
+   EXPECT_EQ(hw[0], 16u);
+   EXPECT_EQ(hw[1], 16u);
+   EXPECT_EQ(hw[2], 1u);
+   ASSERT_TRUE(agx_nir_lower_workgroup_split(b.shader, hw));
+
+   agx_preprocess_nir_m5(b.shader);
+
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   key.no_preamble = true;
+   key.reserved_preamble = 8;
+   agx_shader_part part = {};
+   ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+   ASSERT_NE(part.binary, nullptr);
+   free(part.binary);
+}

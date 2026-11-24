@@ -143,12 +143,12 @@ fma_rte_applies(const nir_shader *shader)
           !(mode & FLOAT_CONTROLS_DENORM_PRESERVE_FP32);
 }
 
-/* G17P and the AGX3C parts detect FP32 FMA tininess before rounding. */
+/* Apple Silicon GPUs (AGX2 G13/G14 and AGX3 G15/G16/G17) detect FP32 FMA
+ * tininess before rounding. */
 static bool
 fma_tininess_before_rounding(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17P ||
-          agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3C;
+   return chip != AGX_CHIP_UNKNOWN;
 }
 
 /*

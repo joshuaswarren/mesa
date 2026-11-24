@@ -340,7 +340,7 @@ check_layered_and_msaa(void)
 /* Preserve the pre-port depth/stencil policy across the shapes observed in
  * depth sampling, feedback loops, host copies and transfer clears. Allocation
  * tests alone did not catch the unsupported colour-alias command paths.
- * The exceptions are the depth plane at 2x (one layer), without
+ * The exceptions are the depth plane at 2x/4x (one layer), including
  * feedback-loop use, and single-level single-sample arrays. */
 static void
 check_legacy_depth_policy(void)
@@ -366,8 +366,7 @@ check_legacy_depth_policy(void)
                   const bool expected =
                      f < 3 && u < 3 && levels == 1 &&
                      (samples == 1 ||
-                      ((samples == 2 || samples == 4) && layers == 1 &&
-                       u != 1));
+                      ((samples == 2 || samples == 4) && layers == 1));
                   CHECK(ELIGIBLE(i) == expected);
                   CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &i) ==
                         (expected && f == 2 && samples == 1));
@@ -579,13 +578,13 @@ check_zink(void)
    CHECK(!ELIGIBLE(depth));
    depth.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
    CHECK(ELIGIBLE(depth));
+   /* At 2x/4x, with its feedback-loop usage and sample-location flag, the
+    * depth plane compresses too. */
    depth.samples = VK_SAMPLE_COUNT_4_BIT;
-   CHECK(!ELIGIBLE(depth));
-   /* At 2x neither its feedback-loop usage nor its sample-location flag. */
+   CHECK(ELIGIBLE(depth));
    depth.samples = VK_SAMPLE_COUNT_2_BIT;
-   CHECK(!ELIGIBLE(depth));
+   CHECK(ELIGIBLE(depth));
    depth.usage &= ~VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
-   CHECK(!ELIGIBLE(depth));
    depth.flags = 0;
    CHECK(ELIGIBLE(depth));
    CHECK(!g16s_eligible(AGX_CHIP_G17P, 1, &depth));
