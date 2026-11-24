@@ -43,8 +43,8 @@ static unsigned checks;
 
 #define CAP_BIT(cap, predicate) | (cap)
 static const unsigned all_caps =
-   (0 CAPS(CAP_BIT)) | AGX_CAP_SPARSE_RESIDENCY_3D |
-   AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS;
+   (0 CAPS(CAP_BIT)) | AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_DESCRIPTOR_BUFFER |
+   AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its
@@ -116,6 +116,21 @@ test_coalesce_pure_global_workgroups(void)
    }
 }
 
+/* AGX_CAP_CDM_WAR_WEAK_BARRIER is enabled on G17P and M5 only. G15 and G16G
+ * elide application dispatch barriers too but keep the flush at execution-only
+ * and WAR barriers until hardware rows qualify them. */
+static void
+test_cdm_war_weak_barrier(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
+                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_CDM_WAR_WEAK_BARRIER) == expected,
+                 c);
+   }
+}
+
 int
 main(void)
 {
@@ -123,6 +138,7 @@ main(void)
    test_caps_match_predicates();
    test_unknown_has_none();
    test_coalesce_pure_global_workgroups();
+   test_cdm_war_weak_barrier();
 
    if (failures) {
       fprintf(stderr, "agx_chip_caps: %u of %u checks failed\n", failures,

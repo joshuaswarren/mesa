@@ -1307,12 +1307,16 @@ bool agx_chip_has_hardware_ray_tracing(enum agx_chip chip);
 
 bool agx_chip_needs_scheduling_stalls(enum agx_chip chip);
 
-/* Every AGX3B part carries the 8x8 f16/f32 matmad backing a subgroup-scope
- * cooperative matrix. M5 has its own AGX3C encoding and matrix16 support. */
+/* AGX2 (G13/G14 via simd_matrix_fmadd and software fallback for partial
+ * subgroups; G15P is an uncharacterized A16 part), every AGX3B part
+ * (8x8 matmad), and M5 (AGX3C matrix16/matmad8) support subgroup-scope
+ * cooperative matrices. */
 static inline bool
 agx_chip_cooperative_matrix_supported(enum agx_chip chip)
 {
-   return agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B ||
+   const enum agx_isa_encoding enc = agx_chip_isa_encoding(chip);
+   return (enc == AGX_ISA_ENCODING_AGX2 && chip != AGX_CHIP_G15P) ||
+          enc == AGX_ISA_ENCODING_AGX3B ||
           agx_chip_g17_m5(chip);
 }
 

@@ -10,7 +10,10 @@
 #include <stdint.h>
 
 #include "asahi/lib/agx_chip.h"
+#include "util/u_dynarray.h"
 #include "hk_sync.h"
+
+struct agx_bo;
 
 struct hk_cmd_buffer;
 struct hk_cs;
@@ -111,6 +114,10 @@ bool hk_pack_admits_strong_tail(enum hk_pack_boundary boundary);
 bool hk_pack_atomics_choice(bool serial_kernel, const char *opt,
                             unsigned queues);
 
+/* Whether `cs` is a clean single-dispatch compute stream eligible to
+ * participate as producer or consumer in submit-time compute pair fusion. */
+bool hk_compute_pair_stream_eligible(const struct hk_cs *cs);
+
 /* The single compute stream of `cmd` that a packet may copy, or NULL. */
 const struct hk_cs *hk_pack_run_member(const struct hk_device *dev,
                                        const struct hk_cmd_buffer *cmd,
@@ -150,3 +157,8 @@ void hk_pack_fold_member(struct hk_cmd_buffer *packet, struct hk_cs *cs,
 
 /* The packet's stream is its command buffer's latest of every kind. */
 void hk_pack_finish_sync(struct hk_cmd_buffer *packet, struct hk_cs *cs);
+
+/* Adds `bo` once to `bos`, the buffers a packed submission keeps alive until
+ * it completes (hk_cmd_pending_begin()). A NULL `bo` adds nothing. Returns
+ * false if the list cannot grow. */
+bool hk_pack_add_bo(struct util_dynarray *bos, struct agx_bo *bo);

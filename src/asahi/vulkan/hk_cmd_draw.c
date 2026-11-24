@@ -7949,7 +7949,7 @@ hk_g17p_local_read_disk_key(struct hk_device *dev,
    if (partitions)
       memcpy(parts, partitions, sizeof(parts));
 
-   const char magic[8] = "hkmlr5\0";
+   const char magic[8] = "hkmlr6\0";
    const size_t size = sizeof(magic) + sizeof(shader->local_read_key) +
                        sizeof(shader->local_read_meta) + sizeof(*ekey) +
                        sizeof(*local_read) + sizeof(parts) +
@@ -8047,18 +8047,7 @@ hk_g17p_local_read_inline_epilog_part(
    lr_ekey.colour_unit_range = shader->local_read_meta.g17p_colour_unit_range;
    lr_ekey.a2c_in_main = shader->local_read_meta.a2c_in_main;
 
-   struct agx_tilebuffer_layout tib =
-      lr_ekey.native_imageblock
-         ? agx_build_tilebuffer_layout_resident(
-              lr_ekey.rt_formats, ARRAY_SIZE(lr_ekey.rt_formats),
-              lr_ekey.nr_samples, true, lr_ekey.max_sample_size_B,
-              lr_ekey.max_bytes_per_tile, lr_ekey.max_samples_per_tile,
-              lr_ekey.resident_mask)
-         : agx_build_tilebuffer_layout_with_limits_resident(
-              lr_ekey.rt_formats, ARRAY_SIZE(lr_ekey.rt_formats),
-              lr_ekey.nr_samples, true, lr_ekey.max_sample_size_B,
-              lr_ekey.max_bytes_per_tile, lr_ekey.max_samples_per_tile,
-              lr_ekey.resident_mask);
+   struct agx_tilebuffer_layout tib = agx_fs_epilog_tilebuffer_layout(&lr_ekey);
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    uint64_t new_outputs_read = 0;
@@ -8316,19 +8305,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
    BITSET_DECLARE(g17p_tile_partitions, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
    if (agx_chip_native_or_m5(dev->dev.chip)) {
       struct agx_tilebuffer_layout tib =
-         key->epilog.native_imageblock
-            ? agx_build_tilebuffer_layout_resident(
-                 key->epilog.rt_formats, ARRAY_SIZE(key->epilog.rt_formats),
-                 key->epilog.nr_samples, true, key->epilog.max_sample_size_B,
-                 key->epilog.max_bytes_per_tile,
-                 key->epilog.max_samples_per_tile, key->epilog.resident_mask)
-            : agx_build_tilebuffer_layout_with_limits_resident(
-                 key->epilog.rt_formats, ARRAY_SIZE(key->epilog.rt_formats),
-                 key->epilog.nr_samples, true, key->epilog.max_sample_size_B,
-                 key->epilog.max_bytes_per_tile,
-                 key->epilog.max_samples_per_tile, key->epilog.resident_mask);
-      if (key->epilog.first_mask && !tib.resident_mask)
-         agx_tilebuffer_apply_first_mask(&tib, key->epilog.first_mask);
+         agx_fs_epilog_tilebuffer_layout(&key->epilog);
       for (unsigned rt = 0; rt < ARRAY_SIZE(tib.logical_format); ++rt) {
          if (tib.logical_format[rt] != PIPE_FORMAT_NONE && !tib.spilled[rt])
             BITSET_SET(g17p_tile_partitions, tib._offset_B[rt]);

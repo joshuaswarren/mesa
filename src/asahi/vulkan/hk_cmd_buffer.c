@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_cmd_buffer.h"
+#include "hk_compute_pair.h"
 #include "hk_identity_copy4.h"
 #include "util/format/u_format.h"
 #include "hk_frame_anatomy.h"
@@ -28,6 +29,7 @@
 #include "asahi/compiler/agx_debug.h"
 #include "hk_agx3_vdm_decode.h"
 #include "asahi/lib/agx_ioto_load_core.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "hk_buffer.h"
 #include "hk_acceleration_structure.h"
 #include "hk_cmd_pool.h"
@@ -904,6 +906,8 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    cmd->g17p_pristine = false;
    cmd->usage_flags = pBeginInfo->flags;
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
+   cmd->state.compute_pair_simultaneous =
+      pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
 
    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY &&
        pBeginInfo->pInheritanceInfo) {
@@ -1145,6 +1149,57 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
 
    hk_cmd_print_upload_stats(cmd);
    return vk_command_buffer_end(&cmd->vk);
+}
+
+/* Whether any barrier in the dependency requests write availability (source
+ * write accesses) or read/host visibility (destination read or host write
+ * accesses), or performs a memory operation of its own. A barrier with none
+ * is execution-only or WAR and requires execution ordering rather than a
+ * cache flush/invalidation.
+ *
+ * Image layout transitions and queue family ownership transfers are such
+ * operations whatever the access masks say: a buffer or image barrier whose
+ * srcQueueFamilyIndex and dstQueueFamilyIndex differ is a release or an
+ * acquire, and Vulkan defines it through the queue family indices even when
+ * the other half's synchronization scope does not apply. Both stay
+ * conservative here, as in hk_barrier_classify_ex(). */
+static bool
+hk_dependency_needs_cache_flush(const VkDependencyInfo *info)
+{
+   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      if (vk_filter_src_access_flags2(
+             vk_expand_src_stage_flags2(b->srcStageMask), b->srcAccessMask) ||
+          vk_filter_dst_access_flags2(
+             vk_expand_dst_stage_flags2(b->dstStageMask), b->dstAccessMask))
+         return true;
+   }
+
+   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
+      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
+      if (b->srcQueueFamilyIndex != b->dstQueueFamilyIndex)
+         return true;
+      if (vk_filter_src_access_flags2(
+             vk_expand_src_stage_flags2(b->srcStageMask), b->srcAccessMask) ||
+          vk_filter_dst_access_flags2(
+             vk_expand_dst_stage_flags2(b->dstStageMask), b->dstAccessMask))
+         return true;
+   }
+
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
+      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      /* Equal layouts, including UNDEFINED, are not transitions (sync2). */
+      if (b->oldLayout != b->newLayout ||
+          b->srcQueueFamilyIndex != b->dstQueueFamilyIndex)
+         return true;
+      if (vk_filter_src_access_flags2(
+             vk_expand_src_stage_flags2(b->srcStageMask), b->srcAccessMask) ||
+          vk_filter_dst_access_flags2(
+             vk_expand_dst_stage_flags2(b->dstStageMask), b->dstAccessMask))
+         return true;
+   }
+
+   return false;
 }
 
 /* Images are compared as whole resources. Subresource-disjoint barriers may
@@ -1421,7 +1476,11 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * the record is a patch site. */
    struct hk_cs *cs = cmd->current_cs.cs;
    const bool alias_scope = hk_cmd_alias_scope(cmd);
-   if (cs && HK_PERF(dev, WEAKBARRIER) && !alias_scope &&
+   const bool weak_only =
+      HK_PERF(dev, WEAKBARRIER) ||
+      (agx_chip_has_cap(dev->dev.chip, AGX_CAP_CDM_WAR_WEAK_BARRIER) &&
+       !hk_dependency_needs_cache_flush(pDependencyInfo));
+   if (cs && weak_only && !alias_scope &&
        src_kinds && !(src_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
        dst_kinds && !(dst_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
        !hk_sync_xfer_pending(&cmd->sync) &&
@@ -1430,8 +1489,9 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
         !hk_cdm_visibility_flush_needed(dev, cs, alias_scope))) {
       /* Keep the preceding launch's weak ordering record in place (do not let
        * the next application dispatch elide it) and skip the flags-5 cache
-       * flush when testing ordering-only compute barriers. Where a later host
-       * import could alias, the record is a patch site like any other. */
+       * flush when the barrier is execution-only/WAR or when testing
+       * ordering-only compute barriers. Where a later host import could alias,
+       * the record is a patch site like any other. */
       cs->app_dispatch_end = NULL;
       hk_cdm_note_alias_site(cmd, cs);
    } else if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&

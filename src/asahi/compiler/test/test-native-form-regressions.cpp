@@ -7276,25 +7276,26 @@ TEST(NativeForms, UnaryBitopMovIgnoresUnreadSecondSourceOnMultiSlotWait)
    ralloc_free(mem);
 }
 
-/* The implemented cooperative-matrix path is enabled for every AGX3B
- * encoding and for M5. Earlier AGX2 devices do not gain the extension. */
+/* The implemented cooperative-matrix path is enabled for AGX2, every AGX3B
+ * encoding, and M5. */
 TEST(NativeForms, CooperativeMatrixDefaultsFollowTheImplementedEncoding)
 {
    /* G16S and the other AGX3B parts use the same 8x8 path. */
    EXPECT_TRUE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G16S));
    EXPECT_EQ(agx_chip_isa_encoding(AGX_CHIP_G16S), AGX_ISA_ENCODING_AGX3B);
 
-   /* All AGX3B parts advertise the implemented path by default. */
-   for (enum agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G17A, AGX_CHIP_G16P,
-                              AGX_CHIP_G16G, AGX_CHIP_G16C, AGX_CHIP_G15G,
-                              AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D}) {
-      EXPECT_EQ(agx_chip_isa_encoding(chip), AGX_ISA_ENCODING_AGX3B);
+   /* All AGX2 and AGX3B parts advertise the implemented path by default. */
+   for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G13X, AGX_CHIP_G14G,
+                              AGX_CHIP_G14X, AGX_CHIP_G17P, AGX_CHIP_G17A,
+                              AGX_CHIP_G16P, AGX_CHIP_G16G, AGX_CHIP_G16C,
+                              AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C,
+                              AGX_CHIP_G15D}) {
       EXPECT_TRUE(agx_chip_cooperative_matrix_supported(chip));
    }
 
-   /* M5 has the AGX3C path; AGX2 has neither implementation. */
+   /* M5 has the AGX3C path; G18G has no cooperative-matrix implementation. */
    EXPECT_TRUE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G17G));
-   EXPECT_FALSE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G13G));
+   EXPECT_FALSE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G18G));
 }
 
 /* A G17P 2D-array comparison keeps a nonzero constant level or bias in a
