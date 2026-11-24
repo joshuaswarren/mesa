@@ -10550,6 +10550,16 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
    return progress;
 }
 
+/* Whether a compile with a preamble size forms its preamble. Internal shaders
+ * always do: hk's meta copies depend on it for correctness with imgwblk
+ * intrinsics.
+ */
+static bool
+agx_preamble_allowed(const nir_shader *nir)
+{
+   return !(agx_compiler_debug & AGX_DBG_NOPREAMBLE) || nir->info.internal;
+}
+
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool byte_indices, bool discard_word, bool g17p, bool m5,
@@ -10832,11 +10842,7 @@ pre_preamble:
       }
    }
 
-   /* Force preamble generation for internal shaders since hk's meta copies
-    * depend on it for correctness with imgwblk intrinsics.
-    */
-   if (preamble_size &&
-       (!(agx_compiler_debug & AGX_DBG_NOPREAMBLE) || nir->info.internal)) {
+   if (preamble_size && agx_preamble_allowed(nir)) {
       /* AGX3 (byte_indices: the AGX3B encoding) has no texture/sampler
        * state-store encoding: its descriptor lowering uses immediate native
        * state slots, so a bindless handle hoisted into the image/sampler
@@ -14118,6 +14124,39 @@ agx_nir_lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *_)
    return true;
 }
 
+/*
+ * Lower 32-bit integer division. When the compile forms a preamble, a division
+ * by a uniform value uses magic multipliers (agx_nir_opt_uniform_idiv), whose
+ * calculation the preamble then runs once. Without a preamble that calculation
+ * would run in every invocation and cost more than nir_lower_idiv's
+ * reciprocal, so everything takes nir_lower_idiv.
+ */
+bool
+agx_nir_lower_integer_division(nir_shader *nir, bool forms_preamble)
+{
+   bool progress = false;
+
+   if (forms_preamble) {
+      bool uniform = false;
+      NIR_PASS(uniform, nir, agx_nir_opt_uniform_idiv);
+      if (uniform) {
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+         progress = true;
+      }
+   }
+
+   nir_lower_idiv_options idiv_options = {
+      .allow_fp16 = true,
+   };
+   NIR_PASS(progress, nir, nir_lower_idiv, &idiv_options);
+
+   /* Has to run after nir_lower_idiv */
+   NIR_PASS(progress, nir, nir_shader_alu_pass, agx_nir_lower_fdiv,
+            nir_metadata_control_flow, NULL);
+   return progress;
+}
+
 static bool
 agx_nir_lower_g17p_f16_classify(nir_builder *b, nir_alu_instr *alu,
                                 void *_data)
@@ -14399,20 +14438,12 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 #endif
    }
 
-   /* Lower idiv after an optimization loop so we can constant fold more before
-    * nir_opt_idiv_const.
+   /* Lower constant divisors after an optimization loop so we can constant
+    * fold more before nir_opt_idiv_const. Other integer division waits for
+    * the shader key (agx_nir_lower_integer_division), which decides whether a
+    * preamble forms.
     */
    NIR_PASS(_, nir, nir_opt_idiv_const, 16);
-
-   nir_lower_idiv_options idiv_options = {
-      .allow_fp16 = true,
-   };
-
-   NIR_PASS(_, nir, nir_lower_idiv, &idiv_options);
-
-   /* Has to run after nir_lower_idiv */
-   NIR_PASS(_, nir, nir_shader_alu_pass, agx_nir_lower_fdiv,
-            nir_metadata_control_flow, NULL);
 
    NIR_PASS(_, nir, nir_opt_deref);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
@@ -16628,6 +16659,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       /* Late VBO lowering creates constant udiv instructions */
       bool idiv_lowered = false;
       NIR_PASS(idiv_lowered, nir, nir_opt_idiv_const, 16);
+      NIR_PASS(idiv_lowered, nir, agx_nir_lower_integer_division,
+               form_preamble && agx_preamble_allowed(nir));
 
       if (idiv_lowered || needs_bit_size)
          NIR_PASS(_, nir, nir_opt_constant_folding);
