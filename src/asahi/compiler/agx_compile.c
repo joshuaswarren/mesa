@@ -6074,24 +6074,33 @@ agx_lower_g17g_retry_float_operands(agx_context *ctx)
          continue;
 
       for (unsigned s = 0; s < I->nr_srcs; ++s) {
-         if ((I->src[s].type != AGX_INDEX_NORMAL &&
-              I->src[s].type != AGX_INDEX_UNIFORM) ||
-             I->src[s].size != AGX_SIZE_16)
-            continue;
-         /* The 32-bit select compares f32: widen half comparands. */
-         if (select && s < 2 && !cmp_mixed && !sel_mixed)
-            continue;
          /* Selected values are bit patterns: zero-extend them, as the
-          * existing G17G half-select path does. Floats convert (exact). */
+          * existing G17G half-select path does. A half uniform, such as a
+          * constant-program export, is selected the same way: copy it to a
+          * half register first. Left in place, it would be a 16-bit value
+          * selected into the 32-bit destination below. */
          if (select && s >= 2) {
-            if (I->src[s].abs || I->src[s].neg)
+            agx_index half = I->src[s];
+            if ((half.type != AGX_INDEX_NORMAL &&
+                 half.type != AGX_INDEX_UNIFORM) ||
+                half.size != AGX_SIZE_16 || half.abs || half.neg)
                continue;
+            if (half.type == AGX_INDEX_UNIFORM)
+               half = agx_mov(&b, half);
             agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-            agx_mov_to(&b, wide, I->src[s]);
+            agx_mov_to(&b, wide, half);
             I->src[s] = wide;
             progress = true;
             continue;
          }
+         if ((I->src[s].type != AGX_INDEX_NORMAL &&
+              I->src[s].type != AGX_INDEX_UNIFORM) ||
+             I->src[s].size != AGX_SIZE_16)
+            continue;
+         /* The 32-bit select compares f32: widen half comparands. Floats
+          * convert (exact). */
+         if (select && s < 2 && !cmp_mixed && !sel_mixed)
+            continue;
          agx_index plain = I->src[s];
          plain.abs = false;
          plain.neg = false;
