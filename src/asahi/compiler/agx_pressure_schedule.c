@@ -143,6 +143,29 @@ struct sched_dag_state {
    unsigned end;
 };
 
+enum sched_mem_space {
+   SCHED_MEM_DEVICE = 0,
+   SCHED_MEM_LOCAL = 1,
+   SCHED_MEM_STACK = 2,
+   SCHED_MEM_NUM = 3,
+};
+
+static enum sched_mem_space
+instr_mem_space(const agx_instr *I)
+{
+   switch (I->op) {
+   case AGX_OPCODE_LOCAL_LOAD:
+   case AGX_OPCODE_LOCAL_STORE:
+   case AGX_OPCODE_LOCAL_ATOMIC:
+      return SCHED_MEM_LOCAL;
+   case AGX_OPCODE_STACK_LOAD:
+   case AGX_OPCODE_STACK_STORE:
+      return SCHED_MEM_STACK;
+   default:
+      return SCHED_MEM_DEVICE;
+   }
+}
+
 static struct dag *
 create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniforms,
            struct util_dynarray *all_nodes, struct sched_dag_state *state,
@@ -164,11 +187,13 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniform
    struct sched_node *coverage = NULL;
    struct sched_node *preload = NULL;
 
-   /* Last memory load, to serialize stores against */
-   struct sched_node *memory_load = NULL;
-
-   /* Last memory store, to serialize loads and stores against */
-   struct sched_node *memory_store = NULL;
+   /* Last memory load/store per disjoint address space (device, threadgroup
+    * local, private stack).  Global device memory, on-chip local memory, and
+    * per-thread stack cannot alias each other, so a local_store must not
+    * serialize an independent device_load (and vice versa).  Barriers
+    * serialize all spaces. */
+   struct sched_node *memory_load[SCHED_MEM_NUM] = {NULL};
+   struct sched_node *memory_store[SCHED_MEM_NUM] = {NULL};
 
    /* Last unified-vertex-store write, to keep UVS writeout in program order.
     *
@@ -244,21 +269,31 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniform
          I->op == AGX_OPCODE_SAMPLE_MASK_AGX3 ||
          I->op == AGX_OPCODE_ZS_EMIT_AGX3;
 
-      if (dep == AGX_SCHEDULE_CLASS_STORE)
-         add_dep(node, memory_load);
-      else if (dep == AGX_SCHEDULE_CLASS_ATOMIC || barrier)
-         serialize(node, &memory_load);
+      if (barrier) {
+         for (unsigned sp = 0; sp < SCHED_MEM_NUM; ++sp) {
+            serialize(node, &memory_load[sp]);
+            serialize(node, &memory_store[sp]);
+         }
+      } else {
+         const enum sched_mem_space sp = instr_mem_space(I);
 
-      if (dep == AGX_SCHEDULE_CLASS_LOAD || dep == AGX_SCHEDULE_CLASS_STORE ||
-          dep == AGX_SCHEDULE_CLASS_ATOMIC || barrier)
-         serialize(node, &memory_store);
+         if (dep == AGX_SCHEDULE_CLASS_STORE)
+            add_dep(node, memory_load[sp]);
+         else if (dep == AGX_SCHEDULE_CLASS_ATOMIC)
+            serialize(node, &memory_load[sp]);
+
+         if (dep == AGX_SCHEDULE_CLASS_LOAD ||
+             dep == AGX_SCHEDULE_CLASS_STORE ||
+             dep == AGX_SCHEDULE_CLASS_ATOMIC)
+            serialize(node, &memory_store[sp]);
+      }
 
       if (dep == AGX_SCHEDULE_CLASS_COVERAGE || barrier)
          serialize(node, &coverage);
 
-      /* Make sure side effects happen before a discard */
+      /* Make sure externally visible side effects happen before a discard */
       if (discards)
-         add_dep(node, memory_store);
+         add_dep(node, memory_store[SCHED_MEM_DEVICE]);
 
       if (order_vary_stores && I->op == AGX_OPCODE_ST_VARY)
          serialize(node, &vary_store);
@@ -559,7 +594,8 @@ agx_pressure_schedule(agx_context *ctx)
 
    bool native_uniforms = false;
    agx_foreach_instr_global(ctx, I) {
-      native_uniforms |= native_uniform_write(I);
+      native_uniforms |= native_uniform_write(I) ||
+                         I->op == AGX_OPCODE_UNIFORM_STORE;
    }
 
    BITSET_DECLARE(stack_live, 4096);
@@ -662,11 +698,13 @@ ilp_is_sample(const agx_context *ctx, const agx_instr *I)
 }
 
 /* What the sample-issue schedule moves up: samples, and with `loads` device
- * loads too (M5 compute, see agx_ilp_schedule). */
+ * and threadgroup local loads too (see agx_ilp_schedule). */
 static bool
 ilp_is_hoisted(const agx_context *ctx, const agx_instr *I, bool loads)
 {
-   return ilp_is_sample(ctx, I) || (loads && I->op == AGX_OPCODE_DEVICE_LOAD);
+   return ilp_is_sample(ctx, I) ||
+          (loads && (I->op == AGX_OPCODE_DEVICE_LOAD ||
+                     I->op == AGX_OPCODE_LOCAL_LOAD));
 }
 
 static unsigned
@@ -1295,11 +1333,12 @@ ilp_block_samples(const agx_context *ctx, const agx_block *block)
 }
 
 static unsigned
-ilp_block_device_loads(const agx_block *block)
+ilp_block_compute_loads(const agx_block *block)
 {
    unsigned loads = 0;
    agx_foreach_instr_in_block(block, I)
-      loads += I->op == AGX_OPCODE_DEVICE_LOAD;
+      loads += I->op == AGX_OPCODE_DEVICE_LOAD ||
+               I->op == AGX_OPCODE_LOCAL_LOAD;
    return loads;
 }
 
@@ -1384,8 +1423,7 @@ ilp_m5_sink_constants(agx_context *ctx, agx_block *block,
 static bool
 ilp_single_tile_blend(const agx_context *ctx, const agx_block *block)
 {
-   if (!agx_isa_is_agx3(ctx->key->dev.encoding) ||
-       ctx->stage != MESA_SHADER_FRAGMENT)
+   if (ctx->stage != MESA_SHADER_FRAGMENT)
       return false;
 
    unsigned loads = 0, stores = 0, load_target = 0, store_target = 0;
@@ -1488,6 +1526,22 @@ ilp_block_peak(agx_context *ctx, agx_block *block, const uint8_t *size16,
    return out + peak;
 }
 
+static signed
+ilp_static_compute_cap(const agx_context *ctx)
+{
+   unsigned tpw = (!ctx->nir || ctx->nir->info.workgroup_size_variable)
+                     ? 1024
+                     : ctx->nir->info.workgroup_size[0] *
+                          ctx->nir->info.workgroup_size[1] *
+                          ctx->nir->info.workgroup_size[2];
+   if (!tpw)
+      tpw = 1024;
+   unsigned static_max = agx_max_registers_for_occupancy(tpw);
+   return static_max > AGX_ILP_M5_OCCUPANCY_MARGIN
+             ? (signed)(static_max - AGX_ILP_M5_OCCUPANCY_MARGIN)
+             : 0;
+}
+
 void
 agx_ilp_schedule(agx_context *ctx)
 {
@@ -1499,7 +1553,8 @@ agx_ilp_schedule(agx_context *ctx)
 
    bool native_uniforms = false;
    agx_foreach_instr_global(ctx, I) {
-      native_uniforms |= native_uniform_write(I);
+      native_uniforms |= native_uniform_write(I) ||
+                         I->op == AGX_OPCODE_UNIFORM_STORE;
    }
 
    /* Loop bodies, single-tile blend blocks and constant programs: that is
@@ -1525,9 +1580,13 @@ agx_ilp_schedule(agx_context *ctx)
       }
    }
 
+   const bool is_agx3 = agx_isa_is_agx3(ctx->key->dev.encoding);
    const bool m5 = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
    const bool m5_compute =
       m5 && ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble;
+   const bool shared_compute_loads =
+      !ctx->is_preamble && ctx->stage == MESA_SHADER_COMPUTE &&
+      !ctx->key->dev.emit_agx3d;
    /* M5 compute uses only the sample-issue schedule below, as Apple's
     * compute kernels issue independent samples back to back (svgfVariance:
     * nine SMP in a row, then the accumulation).
@@ -1610,7 +1669,7 @@ agx_ilp_schedule(agx_context *ctx)
 
    uint8_t *size16 = NULL;
    signed m5_occupancy_cap = 0, m5_load_cap = 0;
-   if (m5_compute || m5_copy || m5_fragment || ctx->is_preamble) {
+   if (shared_compute_loads || m5_copy || m5_fragment || ctx->is_preamble) {
       size16 = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
       if (!size16) {
          ralloc_free(memctx);
@@ -1621,7 +1680,7 @@ agx_ilp_schedule(agx_context *ctx)
             size16[I->dest[d].value] = agx_index_size_16(I->dest[d]);
       }
    }
-   if (m5_compute || m5_copy || m5_fragment) {
+   if (shared_compute_loads || m5_copy || m5_fragment) {
       signed program_peak = 0;
       agx_foreach_block(ctx, block)
          program_peak = MAX2(program_peak,
@@ -1632,6 +1691,11 @@ agx_ilp_schedule(agx_context *ctx)
             program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN).max_registers -
             AGX_ILP_M5_OCCUPANCY_MARGIN;
          m5_load_cap = agx_ilp_m5_device_load_cap(program_peak);
+         if (!is_agx3 && mesa_shader_stage_is_compute(ctx->stage)) {
+            signed static_cap = ilp_static_compute_cap(ctx);
+            m5_occupancy_cap = MIN2(m5_occupancy_cap, static_cap);
+            m5_load_cap = MIN2(m5_load_cap, static_cap);
+         }
       }
    }
 
@@ -1639,21 +1703,25 @@ agx_ilp_schedule(agx_context *ctx)
       if (block->index >= nr_blocks)
          continue;
       /* M5 compute: only the occupancy-capped sample-issue schedule. Other
-       * M5 stages take the shared AGX3 policy below, as agx_isa_is_agx3()
-       * gates it. */
+       * stages and generations hoist compute device/local loads inside their
+       * occupancy step, while pure-ALU compute loops still take ALU ILP
+       * scheduling below. */
       const bool copy = copy_mode[block->index];
       const bool loop_samples = loop_sample_mode[block->index];
-      /* Device loads too, in and outside loops: the pressure order places
-       * each right before its first use, so the block waits for one load at
-       * a time, as it would for samples. A copy block keeps its own
-       * schedule. M5 only: not G18G, which compiles as AGX3C with
-       * emit_agx3d. */
-      const bool compute_loads = m5_compute && !ctx->key->dev.emit_agx3d &&
-                                 !copy;
-      const unsigned loads = compute_loads ? ilp_block_device_loads(block) : 0;
-      if (m5_compute || copy || loop_samples) {
+      /* Device and local loads too, in and outside loops: the pressure order
+       * places each right before its first use, so the block waits for one
+       * load at a time, as it would for samples. A copy block keeps its own
+       * schedule. Exclude G18G (AGX3C with emit_agx3d). */
+      const bool compute_loads = shared_compute_loads && !copy;
+      const unsigned loads = compute_loads ? ilp_block_compute_loads(block) : 0;
+      const unsigned samples = ilp_block_samples(ctx, block);
+      const bool take_compute_hoist =
+         (m5_compute || copy || loop_samples) ||
+         (compute_loads && (!in_loop[block->index] || loads) &&
+          samples + loads >= AGX_ILP_FS_MIN_SAMPLES);
+      if (take_compute_hoist) {
          if ((!in_loop[block->index] || copy || loop_samples || loads) &&
-             ilp_block_samples(ctx, block) + loads >=
+             samples + loads >=
                 (loop_samples ? AGX_ILP_M5_LOOP_MIN_SAMPLES
                               : AGX_ILP_FS_MIN_SAMPLES)) {
             /* Let the block's peak grow only up to the largest register
@@ -1674,11 +1742,11 @@ agx_ilp_schedule(agx_context *ctx)
                                         AGX_ILP_FS_SAMPLE_SLACK);
             }
             if (loads && m5_load_cap > 0) {
-               /* Prefer to hoist only a few device loads ahead of the oldest
-                * one no instruction has read yet: four, else two, else one,
-                * whichever first fits the program's occupancy step. This
-                * ranks candidates; register pressure and scoreboard waits
-                * remain what keeps the schedule safe. */
+               /* Prefer to hoist a bounded window of loads ahead of the oldest
+                * one no instruction has read yet, whichever first fits the
+                * program's occupancy step. This ranks candidates; register
+                * pressure and scoreboard waits remain what keeps the schedule
+                * safe. */
                static const unsigned windows[] = {4, 2, 1};
                const signed load_growth =
                   m5_load_cap > peak ? m5_load_cap - peak : 0;
@@ -1718,12 +1786,12 @@ agx_ilp_schedule(agx_context *ctx)
       if (in_loop[block->index] && !ilp_block_has_memory(block) &&
           !m5_ordered_memory) {
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
-                            4 * alu_latency, AGX_ILP_SLACK, 0, NULL, true,
+                            4 * alu_latency, AGX_ILP_SLACK, 0, NULL, is_agx3,
                             false, 0, 0, false, false, false, &dag_state);
       } else if (!in_loop[block->index] && ilp_single_tile_blend(ctx, block)) {
          /* Hardware-qualified color-only budget; leave loop pressure alone. */
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
-                            4 * alu_latency, 8, 0, NULL, true, false, 0, 0,
+                            4 * alu_latency, 8, 0, NULL, is_agx3, false, 0, 0,
                             false, false, false, &dag_state);
       } else if (!in_loop[block->index] && !ctx->is_preamble &&
                  ctx->stage == MESA_SHADER_FRAGMENT &&
@@ -1751,12 +1819,28 @@ agx_ilp_schedule(agx_context *ctx)
           * programs issue their loads in batches of up to about twenty before
           * storing. Its registers are counted separately from the main
           * program's (preshader_register_count), so pressure is bounded only
-          * to keep allocation comfortably inside the file. */
-         ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
-                            16 * alu_latency, AGX_ILP_SLACK,
-                            AGX_ILP_CPROG_HALVES, size16, false, true,
-                            AGX_ILP_CPROG_HALVES - 16, 0, false, false, false,
-                            &dag_state);
+          * to keep allocation comfortably inside the file.
+          *
+          * On AGX2 compute shaders, the static register split caps preamble
+          * registers to agx_max_registers_for_occupancy(threads_per_workgroup)
+          * (104 halves at 1024 threads); stay strictly under that limit so
+          * preambles never spill into legacy scratch. */
+         signed cprog_cap = AGX_ILP_CPROG_HALVES;
+         signed cprog_slack = AGX_ILP_SLACK;
+         if (!is_agx3 && mesa_shader_stage_is_compute(ctx->stage)) {
+            signed static_cap = ilp_static_compute_cap(ctx);
+            if (static_cap < cprog_cap) {
+               cprog_cap = static_cap;
+               cprog_slack = 0;
+            }
+         }
+         if (cprog_cap > 16) {
+            ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
+                               16 * alu_latency, cprog_slack,
+                               cprog_cap, size16, false, true,
+                               cprog_cap - 16, 0, false, false, false,
+                               &dag_state);
+         }
       }
    }
 

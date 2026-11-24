@@ -13571,8 +13571,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
    if (likely(!(agx_compiler_debug & AGX_DBG_NOSCHED))) {
       AGX_PASS(ctx, agx_pressure_schedule);
-      if (agx_isa_is_agx3(ctx->key->dev.encoding))
-         AGX_PASS(ctx, agx_ilp_schedule);
+      AGX_PASS(ctx, agx_ilp_schedule);
    }
 
    AGX_PASS(ctx, agx3_order_fragment_device_loads);
