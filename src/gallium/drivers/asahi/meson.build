@@ -347,7 +347,7 @@ if with_tests and with_tools.contains('drm-shim')
     suite : ['asahi'],
   )
 
-  foreach chip : ['g13g', 'g17p', 't6041']
+  foreach chip : ['g13g', 'g16g', 'g17p', 't6041']
     test(
       'asahi-' + chip + '-gallium-submit',
       prog_python,

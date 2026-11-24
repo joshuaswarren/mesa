@@ -93,15 +93,6 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    abort();
 }
 
-/* Fixtures never copy timestamps. Emitting a copy is a bug. */
-void
-hk_sync_dispatch_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
-{
-   (void)cmd;
-   (void)cs;
-   abort();
-}
-
 bool
 hk_defer_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {

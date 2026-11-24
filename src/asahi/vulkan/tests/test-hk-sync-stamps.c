@@ -305,6 +305,15 @@ last_cs(struct hk_cmd_buffer *cmd)
 static const enum agx_chip chips[] = {
    AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17G, AGX_CHIP_G17P};
 
+/* Whether a stamp on a compute command is ordered through the compute queue
+ * alone, as stamp_wait() decides: exact-prior barriers on a native AGX3 or
+ * M5 part. */
+static bool
+cdm_stamp_queue_ordered(enum agx_chip chip, bool exact)
+{
+   return agx_chip_native_or_m5(chip) && exact;
+}
+
 /* A timestamp-only command is no producer for application work: a barrier,
  * even ALL_COMMANDS, orders later renders and dispatches after the work
  * before it, not after the carrier. Within the command buffer, across
@@ -469,10 +478,10 @@ test_consecutive_stamps_coalesce(void)
             stamp_all(cmd, i);
          T("first stamp ends the dispatch", is_end(d, 0));
 
-         /* G17P with exact priors orders a stamp on a compute command
+         /* With exact priors a stamp on a compute command is ordered
           * through its compute queue alone (stamp_wait()), so the second
           * stamp takes a carrier, which the rest copy. */
-         const bool own = chips[c] == AGX_CHIP_G17P && exact;
+         const bool own = cdm_stamp_queue_ordered(chips[c], exact);
          struct hk_cs *src = own ? last_cs(cmd) : d;
          const unsigned copies = own ? 3 : 4;
          T("a run of stamps records at most one carrier",
@@ -544,7 +553,7 @@ test_stamps_with_work_stay_distinct(void)
            !cmd->sync.stamp_copy_count);
          T("later stamped work follows the earlier stamp",
            d1->sync.dep[HK_SYNC_CDM].cut == d0 ||
-           (chips[c] == AGX_CHIP_G17P && exact));
+           cdm_stamp_queue_ordered(chips[c], exact));
 
          /* Work in a stream recorded before the latest one: the open
           * compute stream stays open across a render that does not wait
@@ -649,8 +658,9 @@ test_batched_copies(void)
    }
 }
 
-/* Later stamps inside one render pass instance copy the render's end stamp
- * in one launch when its post-graphics stream ends. */
+/* Later stamps inside one render pass instance copy the render's end stamp.
+ * The copies pend with the command buffer's others and launch together in a
+ * timestamp-only command after the render; a full batch launches first. */
 static void
 test_in_pass_copies(void)
 {
@@ -662,20 +672,205 @@ test_in_pass_copies(void)
          stamp_all(cmd, 0);
          for (unsigned i = 1; i <= n; ++i)
             stamp_all(cmd, i);
-         struct hk_cs *post = cmd->current_cs.post_gfx;
          T("first in-pass stamp ends the render", is_end(r, 0));
-         T("later in-pass stamps wait in the post-graphics stream",
-           post && !record_count &&
-           util_dynarray_num_elements(&post->stamp_copies,
-                                      struct hk_stamp_copy) == n &&
-           post->sync.dep[HK_SYNC_VDM].cut == r);
+         T("no post-graphics stream for in-pass copies",
+           !cmd->current_cs.post_gfx);
+
+         /* A batch that filled inside the pass launched there, after the
+          * render. */
+         const unsigned early = n > HK_SYNC_STAMP_COPIES;
+         const unsigned rest = n - early * HK_SYNC_STAMP_COPIES;
+         bool full = record_count == early;
+         if (early) {
+            const struct hk_cs *f = records[0].cs;
+            full &= records[0].count == HK_SYNC_STAMP_COPIES &&
+                    f->sync.dep[HK_SYNC_VDM].cut == r &&
+                    (f->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP;
+            for (unsigned i = 0; full && i < HK_SYNC_STAMP_COPIES; ++i)
+               full &= copy_is(&records[0].copies[i], 1 + i, query(0));
+         }
+         T("a full in-pass batch launches after the render", full);
+         T("later in-pass stamps pend as copies of the render's",
+           cmd->sync.stamp_copy_count == rest &&
+           cmd->sync.stamp_copy_after[HK_SYNC_VDM] == r &&
+           copy_is(&cmd->sync.stamp_copies[rest - 1], n, query(0)));
+
          end_render(cmd);
-         bool all = record_count == 1 && records[0].cs == post &&
-                    records[0].count == n;
-         for (unsigned i = 0; all && i < n; ++i)
-            all &= copy_is(&records[0].copies[i], 1 + i, query(0));
-         T("the render's copies launch once as its stream ends", all);
-         T("post-graphics stream keeps no copies", !post->stamp_copies.size);
+         T("ending the render launches nothing", record_count == early);
+         hk_sync_flush_stamp_copies(cmd);
+         const struct hk_cs *f = last_cs(cmd);
+         bool all = record_count == early + 1 && records[early].cs == f &&
+                    records[early].count == rest;
+         for (unsigned i = 0; all && i < rest; ++i) {
+            all &= copy_is(&records[early].copies[i],
+                           1 + early * HK_SYNC_STAMP_COPIES + i, query(0));
+         }
+         T("the rest launch once, in a timestamp command after the render",
+           all && f->sync.dep[HK_SYNC_VDM].cut == r &&
+           (f->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP);
+         T("in-pass copies resolve", submit(new_queue(false), &cmd, 1));
+      }
+   }
+}
+
+/* vkCmdCopyQueryPoolResults, as hk_CmdCopyQueryPoolResults() records it:
+ * the pending stamps and copies first, then a stream of every kind after
+ * every earlier stream (hk_query_command_cs()). */
+static struct hk_cs *
+copy_query_results(struct hk_cmd_buffer *cmd)
+{
+   cmd->sync.kind_override = HK_SYNC_ALL;
+   hk_sync_flush_pending_timestamp(cmd);
+   hk_sync_flush_stamp_copies(cmd);
+   hk_sync_end_cs_if_timestamped(cmd);
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+   hk_sync_src_dep(cmd, HK_SYNC_QUERY_SCOPE, cmd->current_cs.cs, dep);
+   struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
+   cs->stats.cmds++;
+   cmd->sync.kind_override = 0;
+   return cs;
+}
+
+/* A render whose pass instance writes several timestamps: its end stamp and
+ * copies of it. */
+static struct hk_cs *
+profiled_render(struct hk_cmd_buffer *cmd, uint32_t q, unsigned stamps)
+{
+   struct hk_cs *r = begin_render(cmd);
+   for (unsigned i = 0; i < stamps; ++i)
+      stamp(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, q + i);
+   end_render(cmd);
+   return r;
+}
+
+/* Timestamp copies write query memory only. A render or dispatch recorded
+ * after them waits for the work its barriers name, never for the copies,
+ * whatever stages the barrier names. */
+static void
+test_copies_order_no_application_work(void)
+{
+   for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
+      for (unsigned exact = 0; exact < 2; ++exact) {
+         record_count = 0;
+         struct hk_cmd_buffer *cmd = new_cmd(chips[c], exact);
+
+         /* Render, stamps inside and after it, then an unrelated render
+          * behind a barrier from every graphics stage, then another behind
+          * an ALL_COMMANDS barrier. */
+         struct hk_cs *r0 = profiled_render(cmd, 0, 3);
+         stamp(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 3);
+         T("stamps of a profiled render pend as copies",
+           is_end(r0, 0) && cmd->sync.stamp_copy_count == 3 &&
+           list_length(&cmd->control_streams) == 1 && !record_count);
+         hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_ALL);
+         struct hk_cs *r1 = profiled_render(cmd, 4, 2);
+         T("render after a graphics barrier waits for the render alone",
+           r1->sync.dep[HK_SYNC_VDM].cut == r0 &&
+           !r1->sync.dep[HK_SYNC_CDM].cut &&
+           !r1->sync.dep_ta[HK_SYNC_CDM].cut);
+         hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+         struct hk_cs *r2 = render(cmd);
+         T("render after an ALL_COMMANDS barrier skips the copies",
+           r2->sync.dep[HK_SYNC_VDM].cut == r1 &&
+           !r2->sync.dep[HK_SYNC_CDM].cut);
+         hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+         struct hk_cs *d = dispatch(cmd);
+         T("dispatch after an ALL_COMMANDS barrier skips the copies",
+           d->sync.dep[HK_SYNC_VDM].cut == r2 &&
+           !d->sync.dep[HK_SYNC_CDM].cut);
+         T("only CDM work so far is application work",
+           list_length(&cmd->control_streams) == 4 && !record_count &&
+           cmd->sync.stamp_copy_count == 4);
+
+         /* The end of the command buffer: one launch in a command of its
+          * own, after both renders, never in the open dispatch's stream. */
+         hk_sync_flush_stamp_copies(cmd);
+         struct hk_cs *f = last_cs(cmd);
+         T("copies launch once, in their own timestamp command",
+           record_count == 1 && records[0].count == 4 && records[0].cs == f &&
+           f != d && f->sync.dep[HK_SYNC_VDM].cut == r2 &&
+           (f->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP);
+         T("profiled renders resolve", submit(new_queue(exact), &cmd, 1));
+
+         /* An open dispatch recorded after the profiled render, which it
+          * does not wait for, keeps its own requirements when the copies
+          * launch. */
+         record_count = 0;
+         struct hk_cmd_buffer *open = new_cmd(chips[c], exact);
+         struct hk_cs *pr = profiled_render(open, 0, 2);
+         struct hk_cs *od = dispatch(open);
+         T("the dispatch is independent of the profiled render",
+           open->current_cs.cs == od && !od->sync.dep[HK_SYNC_VDM].cut);
+         hk_sync_flush_stamp_copies(open);
+         struct hk_cs *of = last_cs(open);
+         T("copies do not ride on the open dispatch",
+           record_count == 1 && records[0].cs == of && of != od &&
+           !od->sync.dep[HK_SYNC_VDM].cut &&
+           of->sync.dep[HK_SYNC_VDM].cut == pr &&
+           (of->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP);
+         T("open dispatch and copies resolve",
+           submit(new_queue(exact), &open, 1));
+      }
+   }
+}
+
+/* What does read the results waits for the copies: a query result copy, the
+ * work a transfer barrier orders after that copy, and a host-visibility
+ * flush after it. */
+static void
+test_copy_consumers_wait(void)
+{
+   for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
+      for (unsigned exact = 0; exact < 2; ++exact) {
+         record_count = 0;
+         struct hk_cmd_buffer *cmd = new_cmd(chips[c], exact);
+         struct hk_cs *r0 = profiled_render(cmd, 0, 3);
+         struct hk_cs *qc = copy_query_results(cmd);
+         T("result copy launches the pending copies first",
+           record_count == 1 && records[0].count == 2 &&
+           !cmd->sync.stamp_copy_count);
+         struct hk_cs *f = records[0].cs;
+         T("copies follow the render, the result copy follows the copies",
+           f != qc && f->sync.dep[HK_SYNC_VDM].cut == r0 &&
+           (f->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP &&
+           qc->sync.dep[HK_SYNC_CDM].cut == f &&
+           qc->sync.dep[HK_SYNC_VDM].cut == r0);
+
+         /* TRANSFER_WRITE -> SHADER_READ: the consumer waits for the result
+          * copy, and so for the copies before it. */
+         hk_sync_barrier(cmd, hk_sync_kinds_src(VK_PIPELINE_STAGE_2_COPY_BIT),
+                         hk_sync_kinds_dst(
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT));
+         hk_cmd_buffer_end_compute(cmd);
+         struct hk_cs *d = dispatch(cmd);
+         T("shader after a transfer barrier waits for the result copy",
+           d->sync.dep[HK_SYNC_CDM].cut == qc);
+         hk_sync_barrier(cmd, hk_sync_kinds_src(VK_PIPELINE_STAGE_2_COPY_BIT),
+                         hk_sync_kinds_dst(
+                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT));
+         struct hk_cs *r1 = render(cmd);
+         T("render after a transfer barrier waits for the result copy",
+           r1->sync.dep[HK_SYNC_CDM].cut == d ||
+           r1->sync.dep[HK_SYNC_CDM].cut == qc);
+
+         /* TRANSFER_WRITE -> HOST_READ, as hk_CmdPipelineBarrier2() records
+          * the host-visibility flush on M5 and G17P. */
+         struct hk_cmd_buffer *host = new_cmd(chips[c], exact);
+         profiled_render(host, 0, 2);
+         struct hk_cs *hq = copy_query_results(host);
+         const uint8_t src = hk_sync_kinds_src(VK_PIPELINE_STAGE_2_COPY_BIT);
+         hk_sync_barrier(host, src,
+                         hk_sync_kinds_dst(VK_PIPELINE_STAGE_2_HOST_BIT));
+         struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+         hk_sync_src_dep(host, src, host->current_cs.cs, dep);
+         host->sync.kind_override = HK_SYNC_ALL;
+         struct hk_cs *flush = hk_sync_get_cs_after(host, dep);
+         host->sync.kind_override = 0;
+         T("host flush follows the result copy",
+           flush && (flush == hq || flush->sync.dep[HK_SYNC_CDM].cut == hq));
+         T("consumers resolve", submit(new_queue(exact), &cmd, 1) &&
+                                submit(new_queue(exact), &host, 1));
       }
    }
 }
@@ -693,6 +888,8 @@ main(void)
    test_stamps_with_work_stay_distinct();
    test_batched_copies();
    test_in_pass_copies();
+   test_copies_order_no_application_work();
+   test_copy_consumers_wait();
 
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);

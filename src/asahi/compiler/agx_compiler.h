@@ -729,6 +729,11 @@ typedef struct {
    unsigned loop_count;
    unsigned max_reg;
 
+   /* Immediate moves and uniform-file copies inside loops after register
+    * allocation, for shader statistics. */
+   unsigned loop_immediates;
+   unsigned loop_uniform_copies;
+
    /* Half of the AGX3 compiler staging footprint. Unlike max_reg, this
     * describes the separate file consumed by UVSW and texture inputs. */
    unsigned agx3_staging_halfs;

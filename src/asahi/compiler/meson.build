@@ -15,8 +15,10 @@ libasahi_agx_files = files(
   'agx_nir_lower_divmod64.c',
   'agx_nir_lower_atomics.c',
   'agx_nir_opt_factor_const_mul.c',
+  'agx_nir_opt_nonneg_idiv.c',
   'agx_nir_opt_half_bitfield_extract.c',
   'agx_nir_opt_flatten_loads.c',
+  'agx_nir_opt_merge_nested_early_exits.c',
   'agx_nir_opt_select_load.c',
   'agx_nir_opt_licm.c',
   'agx_nir_opt_uniform_idiv.c',
@@ -205,7 +207,8 @@ libasahi_compiler = static_library(
   'asahi_compiler',
   [libasahi_agx_files, agx_opcodes_c, agx_nir_algebraic_c],
   dependencies: [idep_nir, idep_agx_opcodes_h, idep_agx_builder_h, idep_mesautil, idep_libagx],
-  link_with : [libagx3_compose, libagx2_disasm, libagx3c_disasm, libagx3d_disasm],
+  link_with : [libagx3_compose, libagx2_disasm, libagx3b_disasm, libagx3c_disasm,
+               libagx3d_disasm],
   c_args : [no_override_init_args, '-Wno-c2x-extensions',
             '-DAGX3_HAVE_AGX3D_TABLE'],
   gnu_symbol_visibility : 'hidden',
@@ -786,6 +789,7 @@ if with_tests
          'test/test-agx3-unary-lowering.cpp',
          'test/test-agx3-fsel-uniform.cpp',
          'test/test-agx3-uniform-comparands.cpp',
+         'test/test-agx3-g17g-retry-select.cpp',
          'test/test-agx3-cube-scratch.cpp',
          'test/test-fminmax-constant-denorm.cpp',
          'test/test-denorm-preserve-fma.cpp',
@@ -805,6 +809,7 @@ if with_tests
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',
          'test/test-factor-const-mul.cpp',
+         'test/test-nonneg-idiv.cpp',
          'test/test-half-bitfield-extract.cpp',
          'test/test-flatten-loads.cpp',
          'test/test-shared-phase-cse.cpp',
@@ -944,6 +949,19 @@ if with_tests
     ),
     suite : ['asahi'],
   )
+  test(
+    'agx_nir_merge_nested_early_exits',
+    executable(
+      'agx_nir_merge_nested_early_exits_test',
+      files('test/test-merge-nested-early-exits.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
   test(
     'agx_nir_sink_loop_sample_uses',
     executable(

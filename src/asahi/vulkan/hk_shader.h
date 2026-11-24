@@ -109,7 +109,8 @@ struct hk_shader_info {
          /* G17P: the main part applies alpha-to-coverage in the coverage
           * update that tests (agx_fs_epilog_key::a2c_in_main). */
          bool a2c_in_main;
-         uint8_t _pad[1];
+         /* Fragment shader reads gl_Layer (VARYING_SLOT_LAYER or LAYER_ID). */
+         bool reads_layer;
       } fs;
 
       struct {
@@ -141,10 +142,9 @@ struct hk_shader_info {
    uint8_t set_count;
 
    /* Positive proof recorded before inserting the default Layer output.
-    * Only original vertex hardware variants qualify.  False is unknown.
-    * Serialized with shader binary version 26 or newer.
+    * Only original vertex/tess/geom hardware variants qualify. False is unknown.
     */
-   bool g17p_default_layer_zero;
+   bool default_layer_zero;
 
    /* External API memory writes (stores, atomics, transform feedback). */
    bool writes_external_memory;
@@ -797,6 +797,39 @@ hk_agx3_compute_cprog_supported(enum agx_chip chip, mesa_shader_stage stage,
           (agx_chip_g17_m5(chip) ||
            (hk_g17p_native_cprog_qualified(info) &&
             !info->uses_ray_traversal && !info->uses_resource_info_query));
+}
+
+/* Whether a hardware vertex shader should attempt a native vertex constant
+ * program (preamble).
+ *
+ * A native vertex constant program imports its inputs through thread-private
+ * storage (preamble_scratch_size > 0). On M5, any vertex-stage TPS allocation
+ * sets cs->m5_vertex_tps and forces the vertex half to keep the full
+ * render-subqueue prefix instead of overlapping earlier fragment work through
+ * stage prefixes. When the kernel advertises stage-prefix overlap on M5 (both
+ * DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS and either
+ * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES or
+ * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2, matching queue submission
+ * admission in hk_queue.c), omit the vertex constant program so non-spilling
+ * hardware vertex shaders stay free of TPS and stage-prefix overlap can engage
+ * (vertex shaders whose main body spills still set cs->m5_vertex_tps). API
+ * vertex shaders receive driver-resolvable descriptors and push data through
+ * uniform DMA (vs_dma), while GS raster and native TES variants keep their
+ * root and descriptor pointers for direct loads. When the kernel lacks the
+ * full stage-prefix submission capability on M5, preserve the existing vertex
+ * constant program. */
+static inline bool
+hk_allow_vs_cprog(enum agx_chip chip, uint64_t features, bool hw,
+                  mesa_shader_stage stage, bool agx3_gen1_fragment_rq)
+{
+   const bool m5_stage_prefixes =
+      agx_chip_g17_m5(chip) &&
+      (features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) &&
+      (features & (DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES |
+                   DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2));
+   const bool m5_cprog = agx_chip_g17_m5(chip) && !m5_stage_prefixes;
+   return (agx_chip_native_preamble(chip) || m5_cprog) && hw &&
+          stage == MESA_SHADER_VERTEX && !agx3_gen1_fragment_rq;
 }
 
 /* A null uniform buffer is based at the zero page, which spans

@@ -337,9 +337,8 @@ void
 hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                        const struct hk_stamp_copy *copies, unsigned count)
 {
-   const bool post = cs == cmd->current_cs.post_gfx;
    assert(cs->type == HK_CS_CDM && count > 0);
-   assert(post || cs == cmd->current_cs.cs);
+   assert(cs == cmd->current_cs.cs);
 
    perf_debug(cmd, "Timestamp copies");
 
@@ -359,17 +358,12 @@ hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    /* One launch, then one flush for all of them. */
-   if (post) {
-      libagx_copy_timestamps(cmd, agx_1d(count), AGX_BARRIER_ALL | AGX_POSTGFX,
-                             params.gpu);
-   } else {
-      libagx_copy_timestamps(cmd, agx_1d(count), AGX_BARRIER_ALL, params.gpu);
-   }
+   libagx_copy_timestamps(cmd, agx_1d(count), AGX_BARRIER_ALL, params.gpu);
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
    /* Both words are query memory the launch accesses. */
-   struct hk_cs *launch = post ? cmd->current_cs.post_gfx : cmd->current_cs.cs;
+   struct hk_cs *launch = cmd->current_cs.cs;
    for (unsigned i = 0; i < count; ++i) {
       hk_cmd_note_query_range(cmd, launch, copies[i].src.handle,
                               copies[i].src.offset_B, sizeof(uint64_t));

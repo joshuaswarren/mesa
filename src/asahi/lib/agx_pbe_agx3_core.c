@@ -285,7 +285,9 @@ pack_layered(uint32_t generation, const struct agx_pbe_agx3_2d_fields *fields,
    if ((generation != AGX_PBE_AGX3_GENERATION_9 && !m5_layered) || !fields ||
        (fields->compressed &&
         !((generation == AGX_PBE_AGX3_GENERATION_9 &&
-           fields->layout == AGX_PBE_LAYOUT_GPU && level == 0 && levels == 1) ||
+           fields->layout == AGX_PBE_LAYOUT_GPU &&
+           (dimension == AGX_PBE_DIMENSION_2D_ARRAY ||
+            (level == 0 && levels == 1))) ||
           (generation == AGX_PBE_AGX3_GENERATION_10 &&
            dimension == AGX_PBE_DIMENSION_2D_ARRAY && layers == 1 &&
            level == 0 && levels == 1))) ||

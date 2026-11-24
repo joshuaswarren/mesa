@@ -685,15 +685,68 @@ agx_pressure_schedule(agx_context *ctx)
 /* Samples a fragment block may issue ahead of the first unissued one. */
 #define AGX_ILP_FS_HOIST_SAMPLES 6
 
-/* A sample for the sample-issue schedule. M5 encodes a storage-image read as
+/* Whether an AGX3B fragment sample or texel fetch can allocate disjoint
+ * staging banks in agx3_pack_binary.c and genuinely overlap in flight.
+ * Non-relocatable forms (register-descriptor 2D_ARRAY samples, 3D or cube
+ * samples, gradient/register-LOD/dynamic-offset samples, and multisample or
+ * register-LOD fetches) stay pinned to staging bank 0, where hoisting only
+ * inflates GPR pressure and forces serializing result-wait barriers between
+ * consecutive samples. */
+static bool
+ilp_agx3b_fragment_sample_relocatable(const agx_instr *I)
+{
+   switch (I->op) {
+   case AGX_OPCODE_TEXTURE_SAMPLE: {
+      if (I->nr_srcs < 5 || I->query_lod || (I->offset && !I->offset_xyz))
+         return false;
+
+      const bool lod_ok =
+         I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
+         ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
+           I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
+          I->src[1].type == AGX_INDEX_IMMEDIATE);
+      if (!lod_ok)
+         return false;
+
+      if (I->dim == AGX_DIM_2D)
+         return true;
+
+      if (I->dim == AGX_DIM_2D_ARRAY) {
+         return (I->src[3].type == AGX_INDEX_UNIFORM ||
+                 I->src[3].type == AGX_INDEX_IMMEDIATE) &&
+                (I->src[4].type == AGX_INDEX_UNIFORM ||
+                 I->src[4].type == AGX_INDEX_IMMEDIATE);
+      }
+
+      return false;
+   }
+   case AGX_OPCODE_TEXTURE_LOAD:
+   case AGX_OPCODE_IMAGE_LOAD:
+      if (I->nr_srcs < 2 ||
+          (I->dim != AGX_DIM_2D && I->dim != AGX_DIM_2D_ARRAY &&
+           I->dim != AGX_DIM_3D))
+         return false;
+
+      return !(I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
+               I->src[1].type != AGX_INDEX_IMMEDIATE);
+   default:
+      return false;
+   }
+}
+
+/* A sample for the sample-issue schedule. AGX3 encodes a storage-image read as
  * the same native SMP as a texture fetch (Apple's texture.read), so it has
  * the same latency to hide and is batched the same way. */
 static bool
 ilp_is_sample(const agx_context *ctx, const agx_instr *I)
 {
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+       ctx->stage == MESA_SHADER_FRAGMENT)
+      return ilp_agx3b_fragment_sample_relocatable(I);
+
    return I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
           I->op == AGX_OPCODE_TEXTURE_LOAD ||
-          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          (agx_isa_is_agx3(ctx->key->dev.encoding) &&
            I->op == AGX_OPCODE_IMAGE_LOAD);
 }
 
@@ -1542,6 +1595,63 @@ ilp_static_compute_cap(const agx_context *ctx)
              : 0;
 }
 
+/* Highest occupancy step inside AGX3B's 192-half register file (also matching
+ * the 2D_MS_ARRAY cap in RA). */
+#define AGX_ILP_AGX3B_MAX_HALVES 184
+
+static int
+agx_ilp_agx3b_fragment_max_halves(const agx_context *ctx)
+{
+   /* Respect narrower AGX3B cube-sample register budgets (matching
+    * agx3_cube_register_budget in agx_register_allocate.c) so sample hoisting
+    * cannot push a cube shader above its reduced register file. Because
+    * agx3_reserve_cube_scratch runs after scheduling, cap cube-array and
+    * bias-min samples conservatively at 112 halves and plain cube samples at
+    * 160 halves (highest occupancy step inside the 176-half budget). */
+   int max_halves = AGX_ILP_AGX3B_MAX_HALVES;
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs < 6 ||
+          (I->dim != AGX_DIM_CUBE && I->dim != AGX_DIM_CUBE_ARRAY))
+         continue;
+
+      if (I->dim == AGX_DIM_CUBE_ARRAY ||
+          I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS_MIN)
+         max_halves = MIN2(max_halves, 112);
+      else
+         max_halves = MIN2(max_halves, 160);
+   }
+   return max_halves;
+}
+
+static signed
+agx_ilp_agx3b_fragment_cap(agx_context *ctx, uint8_t **size16_out, void *memctx)
+{
+   uint8_t *size16 = *size16_out;
+   if (!size16) {
+      size16 = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
+      if (!size16)
+         return 0;
+      agx_foreach_instr_global(ctx, I) {
+         agx_foreach_ssa_dest(I, d)
+            size16[I->dest[d].value] = agx_index_size_16(I->dest[d]);
+      }
+      *size16_out = size16;
+   }
+
+   signed program_peak = 0;
+   agx_foreach_block(ctx, block)
+      program_peak = MAX2(program_peak,
+                          ilp_block_peak(ctx, block, size16, memctx));
+
+   const int max_halves = agx_ilp_agx3b_fragment_max_halves(ctx);
+   if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN > max_halves)
+      return 0;
+
+   return agx_occupancy_for_register_count(
+             program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN).max_registers -
+          AGX_ILP_M5_OCCUPANCY_MARGIN;
+}
+
 void
 agx_ilp_schedule(agx_context *ctx)
 {
@@ -1552,6 +1662,8 @@ agx_ilp_schedule(agx_context *ctx)
    struct sched_dag_state dag_state = {0};
 
    bool native_uniforms = false;
+   bool agx3b_frag_cap_ready = false;
+   signed agx3b_frag_cap = 0;
    agx_foreach_instr_global(ctx, I) {
       native_uniforms |= native_uniform_write(I) ||
                          I->op == AGX_OPCODE_UNIFORM_STORE;
@@ -1805,6 +1917,16 @@ agx_ilp_schedule(agx_context *ctx)
          if (m5_fragment) {
             const signed peak = ilp_block_peak(ctx, block, size16, memctx);
             slack = MAX2(slack, m5_occupancy_cap - peak);
+         } else if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
+            if (!agx3b_frag_cap_ready) {
+               agx3b_frag_cap =
+                  agx_ilp_agx3b_fragment_cap(ctx, &size16, memctx);
+               agx3b_frag_cap_ready = true;
+            }
+            if (size16) {
+               const signed peak = ilp_block_peak(ctx, block, size16, memctx);
+               slack = MAX2(slack, agx3b_frag_cap - peak);
+            }
          }
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             16 * alu_latency, slack, 0, NULL, false,

@@ -154,7 +154,7 @@ static unsigned checks;
        "0000 01110 0100 10000 0 0")                                            \
    ROW(agx_chip_tri_merge_across_side_effects(c), "0000 00000 0000 10000 0 0") \
    ROW(agx_chip_image_load_misses_own_store(c), "0000 00000 0000 10000 0 0")   \
-   ROW(agx_chip_exact_fma32(c), "1111 10001 1011 11111 1 1")                   \
+   ROW(agx_chip_exact_fma32(c), "1111 11111 1111 11111 1 1")                   \
    ROW(agx_chip_sampler_has_lod_bias(c), "0000 00000 1111 11000 0 0")          \
    ROW(agx_chip_native_preamble(c), "0000 00000 0000 10000 0 0")               \
    ROW(agx_chip_query_ti_spill(c), "0000 00000 0000 10000 0 0")                \

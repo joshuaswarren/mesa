@@ -420,6 +420,26 @@ hk_nir_has_ray_query(nir_shader *nir)
    return false;
 }
 
+/* nir_lower_system_values() builds gl_GlobalInvocationID as the invocation ID
+ * plus a base global invocation ID, a global offset only OpenCL has. Borealis
+ * applies the vkCmdDispatchBase base workgroup itself (has_base_workgroup_id
+ * in hk_preprocess_nir()), so the base is zero, as the Gallium state tracker
+ * lowers it for GL. Folding it before agx_preprocess_nir() lets range
+ * analysis bound the invocation ID by the dispatch limits.
+ */
+static bool
+hk_lower_base_global_invocation_id(nir_builder *b, nir_intrinsic_instr *intr,
+                                   UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_base_global_invocation_id)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components,
+                                            intr->def.bit_size));
+   return true;
+}
+
 void
 hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 {
@@ -469,8 +489,11 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
-      NIR_PASS(progress, nir, nir_opt_loop);
-      NIR_PASS(progress, nir, nir_opt_loop_unroll);
+      if (agx_nir_has_loop(nir)) {
+         NIR_PASS(progress, nir, nir_opt_loop);
+         agx_nir_limit_heavy_branch_unroll(nir);
+         NIR_PASS(progress, nir, nir_opt_loop_unroll);
+      }
    } while (progress);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -484,6 +507,9 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
    }
 
    NIR_PASS(_, nir, nir_lower_system_values);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+            hk_lower_base_global_invocation_id, nir_metadata_control_flow,
+            NULL);
 
    /* Gather info before preprocess_nir but after some general lowering, so
     * inputs_read and system_values_read are accurately set.
@@ -4194,12 +4220,11 @@ hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
    NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out, NULL, NULL);
    NIR_PASS(_, nir, agx_nir_lower_cull_distance_vs);
 
-   /* Native fragment Layer reads use a flat coefficient, including for
-    * independently compiled stages whose VS does not explicitly write Layer.
-    * This program is the last stage before the rasterizer whatever API stage
-    * it came from, so the same holds for tessellation and geometry. */
-   shader->info.g17p_default_layer_zero =
-      layer_as_varying && !nir->info.layer_viewport_relative &&
+   /* Hardware rasterizer Layer defaults to 0 when the last pre-rasterization
+    * stage does not explicitly write Layer and is not viewport-relative.
+    * Native AGX3 fragment Layer reads additionally require a flat varying. */
+   shader->info.default_layer_zero =
+      !nir->info.layer_viewport_relative &&
       !(nir->info.outputs_written & VARYING_BIT_LAYER);
    if (layer_as_varying && default_layer)
       NIR_PASS(_, nir, agx_nir_lower_default_layer);
@@ -4925,10 +4950,14 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 {
    const bool writes_external_memory = hk_shader_writes_external_memory(nir);
    const bool reads_images = hk_shader_reads_images(nir);
-   /* Facts hk_g17p_note_first_draw() needs, before lowering obscures them. */
-   if (agx_chip_g17p_or_m5(dev->dev.chip) &&
-       sw_stage == MESA_SHADER_FRAGMENT)
-      shader->info.fs.may_kill = hk_fs_may_kill(nir);
+   /* Facts recorded before lowering obscures them. */
+   if (sw_stage == MESA_SHADER_FRAGMENT) {
+      shader->info.fs.reads_layer =
+         (nir->info.inputs_read & VARYING_BIT_LAYER) ||
+         BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_LAYER_ID);
+      if (agx_chip_g17p_or_m5(dev->dev.chip))
+         shader->info.fs.may_kill = hk_fs_may_kill(nir);
+   }
    unsigned nr_vbos = 0;
    bool kill_psiz = false;
    bool default_layer = true;
@@ -5495,9 +5524,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          hk_lower_hw_vs(dev, nir, shader, kill_psiz,
                         agx_chip_native_or_m5(dev->dev.chip),
                         default_layer, hk_clip_m1_1(dev, features),
-                        agx_chip_native_agx3(dev->dev.chip)
-                           ? hk_root_descriptor_offset(draw.no_attachments)
-                           : -1);
+                        hk_root_descriptor_offset(draw.no_attachments));
          outputs = nir->info.outputs_written;
       } else {
          NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
@@ -5817,14 +5844,13 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    /* G17P hardware vertex programs (API VS, GS raster and native TES
     * variants) run per-draw uniform work once in a native vertex constant
-    * program, as Apple's compiler does: e.g. ProjMat * ModelViewMat. */
-   /* HAL300 sets the same vertex constant program and packs its TI IPR/spill
-    * quads into every VDM template exactly as HAL200 does. */
-   const bool vs_cprog =
-      (agx_chip_native_preamble(dev->dev.chip) ||
-       agx_chip_g17_m5(dev->dev.chip)) &&
-      hw && nir->info.stage == MESA_SHADER_VERTEX &&
-      !shader->info.agx3_gen1_fragment_rq;
+    * program (e.g. ProjMat * ModelViewMat). On M5 kernels that advertise
+    * render stage prefixes, omit the vertex constant program so non-spilling
+    * vertex shaders stay free of TPS and can overlap earlier fragment work
+    * through stage prefixes (hk_allow_vs_cprog()). */
+   const bool vs_cprog = hk_allow_vs_cprog(
+      dev->dev.chip, dev->dev.params.features, hw, nir->info.stage,
+      shader->info.agx3_gen1_fragment_rq);
    bool compiled = vs_cprog &&
       hk_g17p_compile_vs_cprog(dev, &nir, &backend_key, shader);
    if (!compiled &&
@@ -8042,9 +8068,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       hk_lower_hw_vs(dev, rast, shader, false,
                      agx_chip_native_or_m5(dev->dev.chip),
                      true, hk_clip_m1_1(dev, features),
-                     agx_chip_native_agx3(dev->dev.chip)
-                        ? hk_root_descriptor_offset(draw.no_attachments)
-                        : -1);
+                     hk_root_descriptor_offset(draw.no_attachments));
       shader->info.gs = count_variant->info.gs;
       main_variant->info.gs = count_variant->info.gs;
 

@@ -2140,6 +2140,108 @@ fail:
 }
 
 
+static bool
+try_pbo_image_copy_buffer(struct gl_context *ctx, GLuint dims,
+                          struct gl_texture_image *texImage,
+                          struct pipe_resource *dst,
+                          unsigned dst_level, unsigned dstz,
+                          GLint xoffset, GLint yoffset, GLint zoffset,
+                          GLint width, GLint height, GLint depth,
+                          GLenum format, GLenum type, const void *pixels,
+                          const struct gl_pixelstore_attrib *unpack)
+{
+   struct st_context *st = st_context(ctx);
+   struct pipe_context *pipe = st->pipe;
+   GLenum gl_target = texImage->TexObject->Target;
+
+   if (!pipe->image_copy_buffer || !unpack->BufferObj)
+      return false;
+
+   if (width <= 0 || height <= 0 || depth <= 0)
+      return false;
+
+   if (unpack->Invert || unpack->LsbFirst)
+      return false;
+
+   if (st_compressed_format_fallback(st, texImage->TexFormat))
+      return false;
+
+   if (util_format_is_depth_or_stencil(dst->format) ||
+       util_format_is_compressed(dst->format) ||
+       util_format_get_blockwidth(dst->format) != 1 ||
+       util_format_get_blockheight(dst->format) != 1)
+      return false;
+
+   if (!_mesa_texstore_can_use_memcpy(ctx, texImage->_BaseFormat,
+                                      texImage->TexFormat, format, type,
+                                      unpack))
+      return false;
+
+   struct pipe_resource *buf = unpack->BufferObj->buffer;
+   if (!buf || buf->target != PIPE_BUFFER)
+      return false;
+
+   unsigned blocksize = util_format_get_blocksize(dst->format);
+   if (!blocksize || blocksize != _mesa_get_format_bytes(texImage->TexFormat))
+      return false;
+
+   intptr_t base_offset = (intptr_t)pixels;
+   if (base_offset < 0)
+      return false;
+
+   intptr_t buf_offset =
+      (intptr_t)_mesa_image_address(dims, unpack, pixels, width, height,
+                                    format, type, 0, 0, 0);
+   if (buf_offset < base_offset || buf_offset > UINT32_MAX ||
+       ((unsigned)buf_offset % blocksize) != 0)
+      return false;
+
+   int stride = _mesa_image_row_stride(unpack, width, format, type);
+   intptr_t layer_stride = _mesa_image_image_stride(unpack, width, height,
+                                                    format, type);
+
+   /* Convert to Gallium coordinates. */
+   if (gl_target == GL_TEXTURE_1D_ARRAY) {
+      zoffset = yoffset;
+      yoffset = 0;
+      depth = height;
+      height = 1;
+      layer_stride = stride;
+   }
+
+   unsigned copy_stride = 0;
+   unsigned copy_layer_stride = 0;
+   if (height > 1 || depth > 1) {
+      if (stride <= 0 || (uint64_t)stride > UINT32_MAX ||
+          (uint64_t)stride < (uint64_t)width * blocksize ||
+          ((unsigned)stride % blocksize) != 0)
+         return false;
+      copy_stride = (unsigned)stride;
+   }
+   if (depth > 1) {
+      if (layer_stride <= 0 || layer_stride > UINT32_MAX ||
+          (uint64_t)layer_stride < (uint64_t)copy_stride * height ||
+          ((unsigned)layer_stride % copy_stride) != 0)
+         return false;
+      copy_layer_stride = (unsigned)layer_stride;
+   }
+
+   uint64_t last_byte = (uint64_t)buf_offset + (uint64_t)width * blocksize;
+   if (height > 1)
+      last_byte += (uint64_t)(height - 1) * copy_stride;
+   if (depth > 1)
+      last_byte += (uint64_t)(depth - 1) * copy_layer_stride;
+   if (last_byte > buf->width0)
+      return false;
+
+   struct pipe_box box;
+   u_box_3d(xoffset, yoffset, zoffset + dstz, width, height, depth, &box);
+   pipe->image_copy_buffer(pipe, dst, buf, (unsigned)buf_offset,
+                           copy_stride, copy_layer_stride, dst_level, &box);
+   return true;
+}
+
+
 void
 st_TexSubImage(struct gl_context *ctx, GLuint dims,
                struct gl_texture_image *texImage,
@@ -2218,6 +2320,13 @@ st_TexSubImage(struct gl_context *ctx, GLuint dims,
                             &box, data, stride, layer_stride);
       return;
    }
+
+   if (!is_ms &&
+       try_pbo_image_copy_buffer(ctx, dims, texImage, dst, dst_level, dstz,
+                                 xoffset, yoffset, zoffset,
+                                 width, height, depth,
+                                 format, type, pixels, unpack))
+      return;
 
    if (!st->prefer_blit_based_texture_transfer) {
       goto fallback;
