@@ -2519,16 +2519,84 @@ agx_lower_agx3_device_atomic_sources(agx_context *ctx)
 static bool
 agx_lower_agx3_matrix_sources(agx_context *ctx)
 {
-   bool progress = false;
-   agx_foreach_instr_global_safe(ctx, I) {
-      if (I->op != AGX_OPCODE_MATMAD16_AGX3)
-         continue;
-      agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-      agx_index tied = agx_vec_temp(ctx, AGX_SIZE_32, 8);
-      agx_mov_to(&b, tied, I->src[2]);
-      I->src[2] = tied;
-      progress = true;
+   bool any_matrix = false;
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_MATMAD8_AGX3 ||
+          I->op == AGX_OPCODE_MATMAD16_AGX3) {
+         any_matrix = true;
+         break;
+      }
    }
+   if (!any_matrix)
+      return false;
+
+   /* Scalarized vector loop phis leave `collect(phi_x, phi_y)` in the loop
+    * header before the exit branch, where the scalar phis are still live-out
+    * to the loop exit. Cloning cross-block accumulator collects into the
+    * consumer's block lets the scalar phis die at the collect so RA can
+    * coalesce the collect, matmad8/16, split, and back-edge in place. */
+   const unsigned orig_alloc = ctx->alloc;
+   agx_instr **collect_defs = calloc(orig_alloc, sizeof(*collect_defs));
+   agx_block **collect_blocks = calloc(orig_alloc, sizeof(*collect_blocks));
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_COLLECT && I->nr_dests == 1 &&
+             I->dest[0].type == AGX_INDEX_NORMAL && !I->dest[0].memory &&
+             agx_channels(I->dest[0]) == I->nr_srcs) {
+            collect_defs[I->dest[0].value] = I;
+            collect_blocks[I->dest[0].value] = block;
+         }
+      }
+   }
+
+   bool progress = false;
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block_safe(block, I) {
+         if (I->op != AGX_OPCODE_MATMAD8_AGX3 &&
+             I->op != AGX_OPCODE_MATMAD16_AGX3)
+            continue;
+
+         if (I->nr_srcs >= 3 && I->src[2].type == AGX_INDEX_NORMAL &&
+             !I->src[2].memory && I->src[2].value < orig_alloc) {
+            agx_instr *col = collect_defs[I->src[2].value];
+            if (col && collect_blocks[I->src[2].value] != block &&
+                col->dest[0].size == I->src[2].size &&
+                agx_channels(col->dest[0]) == agx_channels(I->src[2])) {
+               bool can_clone = true;
+               agx_foreach_src(col, k) {
+                  enum agx_index_type t = col->src[k].type;
+                  if (col->src[k].memory ||
+                      (t != AGX_INDEX_NORMAL && t != AGX_INDEX_IMMEDIATE &&
+                       t != AGX_INDEX_UNIFORM && t != AGX_INDEX_NULL)) {
+                     can_clone = false;
+                     break;
+                  }
+               }
+               if (can_clone) {
+                  agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+                  agx_index dst = agx_vec_temp(ctx, col->dest[0].size,
+                                               agx_channels(col->dest[0]));
+                  agx_instr *clone = agx_collect_to(&b, dst, col->nr_srcs);
+                  agx_foreach_src(col, k)
+                     clone->src[k] = col->src[k];
+                  I->src[2] = dst;
+                  progress = true;
+               }
+            }
+         }
+
+         if (I->op == AGX_OPCODE_MATMAD16_AGX3) {
+            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+            agx_index tied = agx_vec_temp(ctx, AGX_SIZE_32, 8);
+            agx_mov_to(&b, tied, I->src[2]);
+            I->src[2] = tied;
+            progress = true;
+         }
+      }
+   }
+
+   free(collect_defs);
+   free(collect_blocks);
    return progress;
 }
 
@@ -14073,7 +14141,10 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    AGX_PASS(ctx, agx3_merge_unread_pixel_waits);
 
    AGX_PASS(ctx, agx_lower_agx3_device_atomic_sources);
-   AGX_PASS(ctx, agx_lower_agx3_matrix_sources);
+   if (agx_lower_agx3_matrix_sources(ctx)) {
+      agx_validate(ctx, "agx_lower_agx3_matrix_sources");
+      AGX_PASS(ctx, agx_dce, true);
+   }
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       agx_print_shader(ctx, stdout);
