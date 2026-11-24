@@ -30,12 +30,12 @@ main(void)
    struct hk_device dev;
    struct hk_cmd_buffer cmd;
 
-   /* With robustness enabled, M5 HAL300 parts (G17G/G17S/G17C) bound aligned
-    * 16/32-bit indirect draws within 32-bit byte bounds in hardware;
+   /* With robustness enabled, G17P (HAL200) and M5 (G17G/G17S/G17C) bound
+    * aligned 16/32-bit indirect draws within 32-bit byte bounds in hardware;
     * oversized, unaligned, and 8-bit indirect draws take the software rewrite
     * path. */
-   static const enum agx_chip native_chips[] = {AGX_CHIP_G17G, AGX_CHIP_G17S,
-                                                AGX_CHIP_G17C};
+   static const enum agx_chip native_chips[] = {AGX_CHIP_G17P, AGX_CHIP_G17G,
+                                                AGX_CHIP_G17S, AGX_CHIP_G17C};
    for (unsigned i = 0; i < sizeof(native_chips) / sizeof(native_chips[0]);
         ++i) {
       assert(agx_chip_vdm_indirect_index_bounds(native_chips[i]));
@@ -83,7 +83,7 @@ main(void)
     * continuation) keeps the software rewrite for robust indirect draws. */
    static const enum agx_chip rewrite_chips[] = {
       AGX_CHIP_G13G, AGX_CHIP_G14X, AGX_CHIP_G15G, AGX_CHIP_G15S,
-      AGX_CHIP_G15C, AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G18G,
+      AGX_CHIP_G15C, AGX_CHIP_G16G, AGX_CHIP_G18G,
    };
    for (unsigned i = 0; i < sizeof(rewrite_chips) / sizeof(rewrite_chips[0]);
         ++i) {
