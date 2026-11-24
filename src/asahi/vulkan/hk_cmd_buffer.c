@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_cmd_buffer.h"
+#include "hk_compute_pair.h"
 #include "hk_identity_copy4.h"
 #include "util/format/u_format.h"
 #include "hk_frame_anatomy.h"
@@ -904,6 +905,8 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    cmd->g17p_pristine = false;
    cmd->usage_flags = pBeginInfo->flags;
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
+   cmd->state.compute_pair_simultaneous =
+      pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
 
    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY &&
        pBeginInfo->pInheritanceInfo) {

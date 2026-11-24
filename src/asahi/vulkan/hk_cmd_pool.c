@@ -919,12 +919,16 @@ hk_cmd_pending_reap(struct hk_device *dev)
 VkResult
 hk_cmd_pending_begin(struct hk_device *dev,
                      const struct vk_queue_submit *submit, unsigned chunks,
-                     struct agx_bo *extra_bo, struct hk_cmd_pending **out)
+                     struct agx_bo *const *extra_bos, unsigned extra_bo_count,
+                     struct hk_cmd_pending **out)
 {
    *out = NULL;
    hk_cmd_pending_reap(dev);
 
-   size_t count = hk_cmd_collect_pins(submit, NULL) + (extra_bo != NULL);
+   size_t extra_count = 0;
+   for (unsigned i = 0; i < extra_bo_count; ++i)
+      extra_count += (extra_bos[i] != NULL);
+   size_t count = hk_cmd_collect_pins(submit, NULL) + extra_count;
    if (count > UINT32_MAX ||
        count > (SIZE_MAX - sizeof(struct hk_cmd_pending)) /
                   sizeof(struct hk_cmd_pin))
@@ -963,8 +967,10 @@ hk_cmd_pending_begin(struct hk_device *dev,
    }
 
    size_t used = hk_cmd_collect_pins(submit, p->pins);
-   if (extra_bo)
-      hk_cmd_add_pin(p->pins, &used, HK_PIN_LARGE, extra_bo);
+   for (unsigned i = 0; i < extra_bo_count; ++i) {
+      if (extra_bos[i])
+         hk_cmd_add_pin(p->pins, &used, HK_PIN_LARGE, extra_bos[i]);
+   }
    assert(used == count);
    p->count = used;
    for (unsigned i = 0; i < p->count; ++i)

@@ -190,7 +190,9 @@ struct hk_queue;
 struct vk_queue_submit;
 VkResult hk_cmd_pending_begin(struct hk_device *dev,
                                const struct vk_queue_submit *submit,
-                               unsigned chunks, struct agx_bo *extra_bo,
+                               unsigned chunks,
+                               struct agx_bo *const *extra_bos,
+                               unsigned extra_bo_count,
                                struct hk_cmd_pending **out);
 uint32_t hk_cmd_pending_signal(struct hk_cmd_pending *pending);
 void hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *pending,

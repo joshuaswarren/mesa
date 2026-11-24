@@ -66,6 +66,7 @@ hk_files = files(
   'hk_identity_copy4.h',
   'hk_image_view.c',
   'hk_nir_copy_identity4.c',
+  'hk_nir_match_pointwise_clamp.c',
   'hk_image_view.h',
   'hk_instance.c',
   'hk_instance.h',
@@ -1506,6 +1507,17 @@ if with_tests
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi],
     dependencies : [idep_nir, idep_mesautil, idep_libagx, dep_m],
+    link_with : [libasahi_compiler],
+    link_args : [ld_args_gc_sections]),
+    timeout : 30, suite : ['asahi'])
+endif
+
+if with_tests
+  test('hk_compute_pair', executable('hk_compute_pair_test',
+    files('tests/test-hk-compute-pair.c', 'hk_nir_match_pointwise_clamp.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi],
+    dependencies : [idep_nir, idep_mesautil, idep_libagx],
     link_with : [libasahi_compiler],
     link_args : [ld_args_gc_sections]),
     timeout : 30, suite : ['asahi'])
