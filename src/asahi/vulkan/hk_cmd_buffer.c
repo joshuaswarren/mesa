@@ -4893,6 +4893,20 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    cs->cr.eot.main = render->cr.eot.partial;
    cs->cr.zls_control = render->cr.zls_control_partial;
 
+   /* Conservative default for continuation/split streams where bg.main is
+    * bg.partial: every bound colour attachment has live BG contents and cannot
+    * be synthesized by constant epilog clear-fill. hk_begin_rendering()
+    * overrides these on the first stream of a non-resuming pass. */
+   uint8_t bound_color_mask = 0;
+   for (uint32_t i = 0; i < render->color_att_count; ++i) {
+      if (render->color_att[i].iview)
+         bound_color_mask |= BITFIELD_BIT(i);
+   }
+   cs->bg_live_mask = bound_color_mask;
+   cs->bg_clear_fill_rt = 0;
+   cs->user_color_written_mask = 0;
+   cs->opaque_color_written = 0;
+
    /* Barrier to enforce GPU-CPU coherency, in case this batch is back to back
     * with another that caused stale data to be cached and the CPU wrote to it
     * in the meantime.

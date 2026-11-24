@@ -750,6 +750,13 @@ struct hk_linked_shader {
     * on-chip tile memory instead of texture descriptors. */
    bool uses_local_read_tile;
 
+   /* Linked fragment executable is translucent solely because it writes a
+    * proper non-empty subset of the bound colour attachments without reading
+    * the tilebuffer, blending, logic ops, partial channel/sample masks, or
+    * spilling. Eligible for per-stream opaque/punch-through HSR promotion. */
+   bool partial_mrt_opaque_eligible;
+   uint8_t partial_mrt_written_mask;
+
    /* An inline-blend fragment program that forms its own constant program
     * (hk_g17p_inline_epilog_part()) has its own uniform layout: this shader
     * describes it, and the draw takes the program's launch (uniform ranges,
