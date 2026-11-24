@@ -573,6 +573,23 @@ hk_cdm_visibility_flush_needed(const struct hk_device *dev,
           cs->current != cs->memory_flush_end;
 }
 
+bool
+hk_cdm_pack_visibility_flush(const struct hk_device *dev, bool memory,
+                             uint8_t packed[AGX3_CDM_BARRIER_SIZE])
+{
+   /* The AGX3 compute encoding uses flags=5 for its strong
+    * post-dispatch cache flush on every grounded G15--G17 identity.  Keep
+    * Honeykrisp's deliberately conservative flush-after-every-launch
+    * policy, but encode it in the target command-stream ISA. */
+   const struct agx3_cdm_barrier_info info = {
+      .chip = dev->dev.chip,
+      .flags = 0x5,
+      .wide_visibility = agx_chip_cdm_wide_visibility(dev->dev.chip),
+      .flush_memory = hk_cdm_flush_has_memory_scope(dev, memory),
+   };
+   return agx3_cdm_barrier_pack(&info, packed);
+}
+
 static void
 hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
 {
@@ -611,18 +628,8 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
       if (dev->dev.chip == AGX_CHIP_G18G)
          return;
 
-      /* The AGX3 compute encoding uses flags=5 for its strong
-       * post-dispatch cache flush on every grounded G15--G17 identity.  Keep
-       * Honeykrisp's deliberately conservative flush-after-every-launch
-       * policy, but encode it in the target command-stream ISA. */
-      const struct agx3_cdm_barrier_info info = {
-         .chip = dev->dev.chip,
-         .flags = 0x5,
-         .wide_visibility = agx_chip_cdm_wide_visibility(dev->dev.chip),
-         .flush_memory = memory_scope,
-      };
       uint8_t packed[AGX3_CDM_BARRIER_SIZE];
-      if (!agx3_cdm_barrier_pack(&info, packed)) {
+      if (!hk_cdm_pack_visibility_flush(dev, memory, packed)) {
          mesa_loge("no grounded AGX3 CDM cache flush for %s",
                    agx_chip_name(dev->dev.chip));
          vk_command_buffer_set_error(&cs->cmd->vk,

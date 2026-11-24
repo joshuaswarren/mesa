@@ -1123,9 +1123,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
           * memory-scoped flush, upgrading the weak record in place, and say
           * so in the command (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
           */
-         if (agx_chip_g17_m5(dev->dev.chip) &&
-             (dev->dev.params.features &
-              DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION)) {
+         if (hk_cdm_visible_completion(dev)) {
             if (cs->current == cs->weak_barrier_end)
                hk_cdm_visibility_flush(dev, cs, true);
             cs->visible_completion = cs->current == cs->strong_flush_end &&
@@ -1144,48 +1142,6 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
 
    hk_cmd_print_upload_stats(cmd);
    return vk_command_buffer_end(&cmd->vk);
-}
-
-/* Whether one barrier of a dependency reaches the host: it names a host
- * access, or MEMORY_READ or MEMORY_WRITE with the host stage in its
- * destination scope. Those stand for every read or write valid in the scope,
- * the host's too. ALL_COMMANDS does not include the host stage. A host write
- * needs the earlier device writes written back first as much as a host read
- * does: a line written back after it would overwrite it. */
-static bool
-hk_barrier_has_host_access(VkPipelineStageFlags2 dst_stages,
-                           VkAccessFlags2 dst_access)
-{
-   if (dst_access & (VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_HOST_WRITE_BIT))
-      return true;
-
-   return (dst_stages & VK_PIPELINE_STAGE_2_HOST_BIT) &&
-          (dst_access &
-           (VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT));
-}
-
-static bool
-hk_dependency_has_host_access(const VkDependencyInfo *info)
-{
-   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
-      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
-      if (hk_barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
-         return true;
-   }
-
-   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
-      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
-      if (hk_barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
-         return true;
-   }
-
-   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
-      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
-      if (hk_barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
-         return true;
-   }
-
-   return false;
 }
 
 /* Images are compared as whole resources. Subresource-disjoint barriers may
@@ -1397,7 +1353,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    /* Host availability is recorded against the work already recorded. */
    if (cmd->state.deferred_clear_count &&
-       hk_dependency_has_host_access(pDependencyInfo))
+       hk_sync_dependency_has_host_access(pDependencyInfo))
       hk_flush_deferred_clears(cmd);
 
    /* In-pass dependencies stay scoped to the API pass, even when its
@@ -1448,7 +1404,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
        src_kinds && !(src_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
        dst_kinds && !(dst_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
        !hk_sync_xfer_pending(&cmd->sync) &&
-       !hk_dependency_has_host_access(pDependencyInfo) &&
+       !hk_sync_dependency_has_host_access(pDependencyInfo) &&
        (cs->current == cs->weak_barrier_end ||
         !hk_cdm_visibility_flush_needed(dev, cs, alias_scope))) {
       /* Keep the preceding launch's weak ordering record in place (do not let
@@ -1472,28 +1428,16 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    if (init)
       brl_discard_init_record(cmd, pDependencyInfo, init_dst);
 
-   /* A barrier-only command buffer otherwise records no GPU work, so it
-    * cannot make a preceding fragment store visible to the host. Emit the
-    * native strong CDM cache-maintenance record only when the API requests
-    * host availability, in a stream ordered after the source scope. The
-    * host accesses memory, so the record has memory scope: a strong flush
-    * alone leaves the data in the GPU caches, and the end of the command
-    * does not reliably write it back before completion is reported when
-    * render work shares the queue. */
-   if (agx_chip_g17p_or_m5(dev->dev.chip) &&
-       hk_dependency_has_host_access(pDependencyInfo)) {
-      struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-      hk_sync_src_dep(cmd, src_kinds, cmd->current_cs.cs, dep);
-
-      cmd->sync.kind_override = HK_SYNC_ALL;
-      struct hk_cs *flush = hk_sync_get_cs_after(cmd, dep);
-      cmd->sync.kind_override = 0;
-      if (!flush)
-         return;
-
-      hk_ensure_cs_has_space(cmd, flush, AGX3_CDM_BARRIER_SIZE);
-      hk_cdm_visibility_flush(dev, flush, true);
-   }
+   /* Host availability: where the strong CDM flush has a memory-scoped form,
+    * that record writes the device's writes back for the host (a strong
+    * flush alone leaves them in the GPU caches, and the end of a command
+    * does not reliably write them back before completion is reported when
+    * render work shares the queue). The host can only observe it at the end
+    * of the submission or through an event, so it is deferred there
+    * (hk_sync_defer_host_flush()) instead of taking a compute command of its
+    * own between the work around it. */
+   if (hk_cdm_memory_scope_form(dev))
+      hk_sync_defer_host_flush(cmd, pDependencyInfo);
 
    /* The dependency this barrier recorded is the one a continued instance
     * applies to its stream (hk_sync_merge_rendering()); a stream it created

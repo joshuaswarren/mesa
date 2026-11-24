@@ -312,6 +312,29 @@ if with_tests
       suite : ['asahi'],
     )
 
+    # Host availability deferred to the end of the submission, resolved
+    # through the real hk_sync resolver; no device or GPU.
+    test(
+      'hk_host_flush',
+      executable(
+        'hk_host_flush_test',
+        files('tests/test-hk-host-flush.c', 'hk_sync.c'),
+        include_directories : [
+          include_directories('.'),
+          inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
+          inc_virtio_gpu, inc_virtio_vdrm,
+        ],
+        dependencies : [
+          idep_nir_headers, idep_mesautil, idep_libagx,
+          idep_libagx_shaders_h, idep_agx_pack,
+          idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+        ],
+        link_args : [ld_args_gc_sections],
+        gnu_symbol_visibility : 'hidden',
+      ),
+      suite : ['asahi'],
+    )
+
     # Submit packing: the member check, the planner and the dependency fold,
     # resolved through the real hk_sync resolver; no device or GPU.
     test(
