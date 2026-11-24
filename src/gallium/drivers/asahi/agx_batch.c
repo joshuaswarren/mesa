@@ -420,6 +420,9 @@ agx_batch_init(struct agx_context *ctx,
       _mesa_hash_table_clear(batch->bo_list.ranges, NULL);
       util_dynarray_clear(&batch->bo_list.range_list);
    }
+   batch->submitted_has_vdm = false;
+   batch->submitted_has_cdm = false;
+   batch->barrier_untracked = false;
 
    if (agx_batch_is_compute(batch)) {
       batch->cdm = agx_encoder_allocate(batch, dev);
@@ -464,6 +467,7 @@ agx_batch_init(struct agx_context *ctx,
    batch->g17g_prims = 0;
    batch->g17g_small_budget = false;
    batch->incoherent_writes = false;
+   batch->query_access = false;
    agx_bo_unreference(dev, batch->sampler_heap.bo);
    batch->sampler_heap.bo = NULL;
    batch->sampler_heap.count = 0;
@@ -1147,6 +1151,8 @@ agx_batch_writes_internal(struct agx_batch *batch, struct agx_resource *rsrc,
    agx_writer_remove(ctx, rsrc->bo->handle);
    agx_writer_add(ctx, agx_batch_idx(batch), rsrc->bo->handle);
    util_dynarray_append(&batch->bo_list.written, rsrc->bo);
+   if (rsrc->separate_stencil && rsrc->separate_stencil->bo)
+      util_dynarray_append(&batch->bo_list.written, rsrc->separate_stencil->bo);
    assert(agx_batch_is_active(batch));
    batch_debug(batch, "Becomes writer of BO @ 0x%" PRIx64 " (%s)",
                rsrc->bo->va->addr,
@@ -1172,6 +1178,71 @@ agx_batch_writes_range(struct agx_batch *batch, struct agx_resource *rsrc,
    assert(rsrc->base.b.target == PIPE_BUFFER);
    agx_batch_writes_internal(batch, rsrc, 0, offset, (uint64_t)offset + size);
    agx_valid_buffer_range_add(rsrc, offset, offset + size);
+}
+
+/* Compute inter-submission VDM/CDM barriers for @batch on native AGX3 queues.
+ * Disjoint in-flight batches need not serialize across subqueues (for example,
+ * an independent CDM dispatch overlapping an in-flight VDM render). Any
+ * untracked side effect, external/shared fence, explicit API barrier, or
+ * RAW/WAR/WAW BO overlap fails closed to barrier 0. */
+static void
+agx_batch_compute_barriers(struct agx_context *ctx, struct agx_batch *batch,
+                           bool untracked_current, uint16_t *out_vdm_barrier,
+                           uint16_t *out_cdm_barrier)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+
+   if (!agx_chip_native_agx3(dev->chip) ||
+       (dev->debug & (AGX_DBG_TRACE | AGX_DBG_SYNC | AGX_DBG_SCRATCH)) ||
+       ctx->any_faults || untracked_current) {
+      *out_vdm_barrier = 0;
+      *out_cdm_barrier = 0;
+      return;
+   }
+
+   bool need_vdm = false;
+   bool need_cdm = false;
+   unsigned i;
+   foreach_submitted(ctx, i) {
+      struct agx_batch *prev = &ctx->batches.slots[i];
+
+      /* A quarantined batch's subqueue state is unknown: wait on both. */
+      if (prev->submit_quarantined) {
+         need_vdm = need_cdm = true;
+         break;
+      }
+
+      bool hazard = prev->barrier_untracked ||
+                    prev->seqnum <= ctx->batches.barrier_seqnum;
+
+      if (!hazard && prev->bo_list.written.size) {
+         util_dynarray_foreach(&prev->bo_list.written, struct agx_bo *, entry) {
+            if (_mesa_set_search(batch->bo_list.set, *entry)) {
+               hazard = true;
+               break;
+            }
+         }
+      }
+
+      if (!hazard && batch->bo_list.written.size) {
+         util_dynarray_foreach(&batch->bo_list.written, struct agx_bo *, entry) {
+            if (_mesa_set_search(prev->bo_list.set, *entry)) {
+               hazard = true;
+               break;
+            }
+         }
+      }
+
+      if (hazard) {
+         need_vdm |= prev->submitted_has_vdm;
+         need_cdm |= prev->submitted_has_cdm;
+         if (need_vdm && need_cdm)
+            break;
+      }
+   }
+
+   *out_vdm_barrier = need_vdm ? 0 : DRM_ASAHI_BARRIER_NONE;
+   *out_cdm_barrier = need_cdm ? 0 : DRM_ASAHI_BARRIER_NONE;
 }
 
 static bool
@@ -2113,6 +2184,16 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    /* Compute commands in this submission, which the render waits on. */
    unsigned compute_commands = 0;
 
+   const bool untracked_current =
+      batch->barrier_untracked || batch->heap || batch->vs_scratch ||
+      batch->fs_scratch || batch->cs_scratch || batch->timestamps.size > 0 ||
+      batch->query_access || ctx->global_buffers.size > 0 ||
+      in_sync_count > 0 || shared_bo_count > 0 || split_compute ||
+      m5_split_prepass || m5_compute_commands;
+   uint16_t vdm_barrier = 0, cdm_barrier = 0;
+   agx_batch_compute_barriers(ctx, batch, untracked_current, &vdm_barrier,
+                              &cdm_barrier);
+
    /* Submit! */
    if (compute && !split_compute && m5_compute_commands) {
       /* The G17 runtime (M5 Pro, M5 Max, and M5 on it) takes a mixed
@@ -2200,8 +2281,9 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
                                      cdm_dispatch_count, 0, 0, &cmdbuf);
       compute_commands = cdm_dispatch_count - first;
    } else if (compute && !split_compute) {
-      /* Barrier on previous submission */
-      struct drm_asahi_cmd_header header = agx_cmd_header(true, 0, 0);
+      /* Barrier on prior dependent submissions (NONE when disjoint on AGX3). */
+      struct drm_asahi_cmd_header header =
+         agx_cmd_header(true, vdm_barrier, cdm_barrier);
 
       util_dynarray_append(&cmdbuf, header);
       util_dynarray_append(&cmdbuf, *compute);
@@ -2362,11 +2444,12 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       const bool compute_here =
          compute && !split_compute && !m5_split_prepass && compute_commands;
       struct drm_asahi_cmd_header header = agx_cmd_header(
-         false, compute_here ? DRM_ASAHI_BARRIER_NONE : 0,
-         compute_here ? compute_commands : 0);
+         false, compute_here ? DRM_ASAHI_BARRIER_NONE : vdm_barrier,
+         compute_here ? compute_commands : cdm_barrier);
       if ((dev->params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
-          header.vdm_barrier != DRM_ASAHI_BARRIER_NONE &&
-          !batch->vs_needs_render_barrier)
+          (header.vdm_barrier != DRM_ASAHI_BARRIER_NONE ||
+           header.cdm_barrier != DRM_ASAHI_BARRIER_NONE) &&
+          !compute_here && !batch->vs_needs_render_barrier)
          render->flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
       /* G18G takes the full drm_asahi_cmd_render. */
       header.size = dev->chip == AGX_CHIP_G18G
@@ -2586,6 +2669,9 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    }
 
    util_dynarray_fini(&cmdbuf);
+   batch->submitted_has_cdm = compute != NULL;
+   batch->submitted_has_vdm = render != NULL;
+   batch->barrier_untracked = untracked_current;
    batch->submit_seq = seqid;
    agx_batch_mark_submitted(batch);
 
@@ -2879,6 +2965,28 @@ agx_submit_pending(struct agx_context *ctx)
       };
    }
 
+   const bool untracked_submit = in_sync_count > 0 || shared_bo_count > 0 ||
+                                 ctx->global_buffers.size > 0 ||
+                                 agx_m5_render_resources(dev);
+   uint16_t prior_vdm = DRM_ASAHI_BARRIER_NONE;
+   uint16_t prior_cdm = DRM_ASAHI_BARRIER_NONE;
+   for (unsigned k = 0; k < count; ++k) {
+      struct agx_batch *batch = entries[k].batch;
+      const bool untracked_k =
+         untracked_submit || batch->barrier_untracked || batch->heap ||
+         batch->vs_scratch || batch->fs_scratch || batch->cs_scratch ||
+         batch->timestamps.size > 0 || batch->query_access;
+      entries[k].untracked = untracked_k;
+
+      uint16_t batch_vdm = 0, batch_cdm = 0;
+      agx_batch_compute_barriers(ctx, batch, untracked_k, &batch_vdm,
+                                 &batch_cdm);
+      if (batch_vdm == 0)
+         prior_vdm = 0;
+      if (batch_cdm == 0)
+         prior_cdm = 0;
+   }
+
    unsigned nr_vdm = 0, nr_cdm = 0;
    bool prev_frag_att = false;
    bool prev_m5_comp_res = false;
@@ -2906,8 +3014,8 @@ agx_submit_pending(struct agx_context *ctx)
             batch_compute_cmds = cdm_dispatch_count;
             nr_cdm += cdm_dispatch_count;
          } else {
-            struct drm_asahi_cmd_header header =
-               agx_cmd_header(true, nr_vdm, nr_cdm);
+            struct drm_asahi_cmd_header header = agx_cmd_header(
+               true, nr_vdm ? nr_vdm : prior_vdm, nr_cdm ? nr_cdm : prior_cdm);
             util_dynarray_append(&cmdbuf, header);
             util_dynarray_append(&cmdbuf, entry->compute);
             batch_compute_cmds = 1;
@@ -2928,12 +3036,16 @@ agx_submit_pending(struct agx_context *ctx)
                entry->render.flags |= DRM_ASAHI_RENDER_SHADER_WRITES;
          }
 
-         struct drm_asahi_cmd_header header = agx_cmd_header(
-            false, batch_compute_cmds ? DRM_ASAHI_BARRIER_NONE : nr_vdm,
-            nr_cdm);
+         const uint16_t render_vdm =
+            batch_compute_cmds ? DRM_ASAHI_BARRIER_NONE
+                               : (nr_vdm ? nr_vdm : prior_vdm);
+         const uint16_t render_cdm = nr_cdm ? nr_cdm : prior_cdm;
+         struct drm_asahi_cmd_header header =
+            agx_cmd_header(false, render_vdm, render_cdm);
          if ((dev->params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
-             header.vdm_barrier != DRM_ASAHI_BARRIER_NONE &&
-             !batch->vs_needs_render_barrier)
+             !batch_compute_cmds && !batch->vs_needs_render_barrier &&
+             (render_vdm != DRM_ASAHI_BARRIER_NONE ||
+              render_cdm != DRM_ASAHI_BARRIER_NONE))
             entry->render.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
          header.size = dev->chip == AGX_CHIP_G18G
                           ? sizeof(struct drm_asahi_cmd_render)
@@ -3038,6 +3150,9 @@ agx_submit_pending(struct agx_context *ctx)
          batch_debug(batch, "Writes to BO @ 0x%" PRIx64, bo->va->addr);
       }
 
+      batch->submitted_has_cdm = entries[k].has_compute;
+      batch->submitted_has_vdm = entries[k].has_render;
+      batch->barrier_untracked = entries[k].untracked;
       batch->submit_seq = seqid;
       agx_batch_mark_submitted(batch);
       agx_publish_batch_query_state(ctx, batch, false);
@@ -3279,4 +3394,6 @@ agx_memory_barrier(struct pipe_context *pctx, unsigned flags)
       if (batch->incoherent_writes)
          agx_flush_batch_for_reason(ctx, batch, "Memory barrier");
    }
+
+   ctx->batches.barrier_seqnum = ctx->batches.seqnum;
 }

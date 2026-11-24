@@ -723,6 +723,17 @@ hk_g17p_unorm8(float x)
    return x == x ? (uint32_t)_mesa_float_to_unorm(x, 8) : 0;
 }
 
+static inline VkClearColorValue
+hk_pack_rgba8_clear_value(const VkClearColorValue *color)
+{
+   const float *c = color->float32;
+   VkClearColorValue packed = {0};
+   packed.uint32[0] = hk_g17p_unorm8(c[0]) | (hk_g17p_unorm8(c[1]) << 8) |
+                      (hk_g17p_unorm8(c[2]) << 16) |
+                      (hk_g17p_unorm8(c[3]) << 24);
+   return packed;
+}
+
 /* frg-codegen v4 BG/EOT device cache.
  *
  * The per-recording cache above dies with every vkResetCommandBuffer, so an
@@ -1207,7 +1218,7 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return (struct hk_bg_eot){0};
    }
-   key->g17p_packed_clear =
+   key->packed_clear =
       !store && op == AGX_BG_CLEAR && !dual_mrt_active && !multi_mrt_active &&
       agx_g17p_packed_clear_ok(&key->tib);
    if (!store && op == AGX_BG_CLEAR)
@@ -1552,15 +1563,10 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
             for (unsigned rt = 1; rt < attachment_count; ++rt)
                clear_values[rt] = info->pColorAttachments[rt].clearValue.color;
          }
-         if (key->g17p_packed_clear) {
+         if (key->packed_clear) {
             /* The background program reads one packed word at uniform 4. */
-            const float *c = att_info->clearValue.color.float32;
-            const uint32_t packed = hk_g17p_unorm8(c[0]) |
-                                    (hk_g17p_unorm8(c[1]) << 8) |
-                                    (hk_g17p_unorm8(c[2]) << 16) |
-                                    (hk_g17p_unorm8(c[3]) << 24);
-            memset(&clear_values[0], 0, sizeof(clear_values[0]));
-            clear_values[0].uint32[0] = packed;
+            clear_values[0] =
+               hk_pack_rgba8_clear_value(&att_info->clearValue.color);
          }
          const size_t clear_size =
             multi_mrt_active ? 16 * attachment_count
@@ -2637,6 +2643,8 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
    if (multisample)
       key->multisample_store = store && (!final_resolve || store_source);
    key->m5_store_and_resolve = final_resolve && store_source;
+   key->packed_clear =
+      !store && op == AGX_BG_CLEAR && agx_g17p_packed_clear_ok(&key->tib);
    if (op == AGX_BG_CLEAR)
       key->reserved_preamble = AGX3_G17P_RT0_CLEAR_PUSH_HALFS;
    shader = agx_get_bg_eot_shader(&dev->bg_eot, key);
@@ -2681,10 +2689,12 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       if (shader->info.push_count != AGX3_G17P_RT0_CLEAR_PUSH_HALFS ||
           shader->info.uses_txf)
          goto unsupported;
-      const VkClearColorValue zero = {0};
-      uint64_t clear = hk_pool_upload(cmd,
-         clear_dont_care ? &zero : &info->pColorAttachments[0].clearValue.color,
-         sizeof(zero), 16);
+      VkClearColorValue clear_value =
+         clear_dont_care ? (VkClearColorValue){0}
+                         : info->pColorAttachments[0].clearValue.color;
+      if (key->packed_clear && !clear_dont_care)
+         clear_value = hk_pack_rgba8_clear_value(&clear_value);
+      uint64_t clear = hk_pool_upload(cmd, &clear_value, sizeof(clear_value), 16);
       if (!clear)
          return (struct hk_bg_eot){0};
       ranges[0] = (struct agx3_ioto_uniform_range){4, 8, clear};
@@ -3377,7 +3387,7 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    /* The rebuilt programs may drop every colour store; M5 has an empty
     * end-of-tile program only for single-layer, non-spilling colour tiles
     * (hk_build_m5_empty_bg_eot()), multisampled ones included. */
-   if ((dev->dev.chip != AGX_CHIP_G17P && !m5) ||
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
        cs != render->zls_first_cs || cmd->in_meta || render->color_read ||
        render->view_mask || render->layer_count > 1 ||
        (m5 ? !hk_m5_color_imageblock_supported(&render->tilebuffer)
@@ -3479,7 +3489,7 @@ hk_g17p_note_first_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    render->first_draw_seen = true;
    render->color_covered = 0;
-   if (!agx_chip_g17p_or_m5(dev->dev.chip) ||
+   if (!agx_chip_native_or_m5(dev->dev.chip) ||
        cmd->in_meta ||
        cs != render->zls_first_cs || cs->stats.cmds || cs->m5_continued_pass ||
        hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
@@ -4791,7 +4801,6 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
           * their producer even for a whole-tile render area: an earlier
           * attachment clear may have been lowered to compute. */
          preserve_loaded_color[nr_written] =
-            agx_chip_g17p_or_m5(dev->dev.chip) &&
             pRenderingInfo->pColorAttachments[i].loadOp ==
                VK_ATTACHMENT_LOAD_OP_LOAD;
          written[nr_written++] = render->color_att[i].iview;
@@ -4867,6 +4876,33 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       !agx_chip_native_or_m5(dev->dev.chip) ||
          !hk_agx3_g17p_single_layer_rendering(render->view_mask, layer_count),
       g17p_wide_ms_to_memory, hk_resident_attachments(dev, render));
+
+   const bool suspending_or_resuming =
+      (render->flags & (VK_RENDERING_SUSPENDING_BIT |
+                        VK_RENDERING_RESUMING_BIT)) != 0;
+   if (agx_chip_uncovered_tile_ms_defect(dev->dev.chip) &&
+       render->tilebuffer.nr_samples > 1 && !suspending_or_resuming &&
+       render->tilebuffer.sample_size_B >
+          AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE) {
+      uint8_t clear_mask = 0;
+      for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
+         const VkRenderingAttachmentInfo *att =
+            &pRenderingInfo->pColorAttachments[i];
+         if (att->imageView != VK_NULL_HANDLE &&
+             att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
+             is_attachment_stored(att))
+            clear_mask |= BITFIELD_BIT(i);
+      }
+      if (clear_mask) {
+         struct agx_tilebuffer_layout cand = render->tilebuffer;
+         if (agx_tilebuffer_pack_first_if_fits(
+                &cand, clear_mask,
+                AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE) &&
+             hk_agx3_g17p_rt0_tile_layout_supported(&cand)) {
+            render->tilebuffer = cand;
+         }
+      }
+   }
 
    if (agx_chip_native_or_m5(dev->dev.chip))
       render->g17p_rt0_layout_supported =
@@ -5366,7 +5402,9 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
 
    uint32_t clear_count = 0;
    VkClearAttachment clear_att[HK_MAX_RTS + 1];
-   bool resolved_clear = false, resolved_clear_z = false;
+   bool resolved_clear = false, resolved_clear_z = false,
+        resolved_clear_s = false;
+   uint32_t max_cleared_end_B = 0;
 
    for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
       const VkRenderingAttachmentInfo *att_info =
@@ -5388,7 +5426,15 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       memcpy(render->color_att[i].clear_colour, &att_info->clearValue,
              sizeof(att_info->clearValue));
 
-      resolved_clear |= is_attachment_stored(att_info);
+      const bool stored = is_attachment_stored(att_info);
+      if (!render->tilebuffer.spilled[i] && stored) {
+         const uint32_t end_B =
+            agx_tilebuffer_offset_B(&render->tilebuffer, i) +
+            agx_tilebuffer_format_size_B(render->tilebuffer.logical_format[i]);
+         max_cleared_end_B = MAX2(max_cleared_end_B, end_B);
+      }
+
+      resolved_clear |= stored;
    }
 
    const uint32_t color_clear_count = clear_count;
@@ -5420,7 +5466,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       render->stencil_att.clear_colour[1] =
          attach_s->clearValue.depthStencil.stencil;
 
-      resolved_clear |= is_attachment_stored(attach_s);
+      resolved_clear_s = is_attachment_stored(attach_s);
    }
 
    if (clear_att[clear_count].aspectMask != 0)
@@ -5433,22 +5479,26 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    /* A G17P multisample tilebuffer wider than eight bytes per sample cannot
     * survive a tile that no colour-writing geometry covered: see
     * AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE. Emit the load-op clear as
-    * an ordinary full-area draw instead. That covers every tile, so the
-    * background program only ever runs on a tile the hardware also
-    * rasterizes, which keeps the whole sample. The target stays in the
-    * tilebuffer.
+    * an ordinary full-area draw instead whenever any cleared target extends
+    * past byte 8 (or conservatively when suspending/resuming). That covers
+    * every tile, so the background program only ever runs on a tile the
+    * hardware also rasterizes, which keeps the whole sample. The target stays
+    * in the tilebuffer.
     *
     * A spilling multisample tilebuffer takes the same full clear on every
     * chip: a draw that clears only the spilled targets makes its epilog
     * preserve the resident ones by reading the tile back, a multisample eMRT
     * shape the packer cannot encode. (On G17P such a tilebuffer is always
     * wider than eight bytes a sample, so this adds nothing there.) */
+   const uint32_t wide_ms_cleared_B =
+      suspending_or_resuming ? render->tilebuffer.sample_size_B
+                             : max_cleared_end_B;
    const bool clear_wide_multisample =
       color_clear_count > 0 && render->tilebuffer.nr_samples > 1 &&
       (clear_spills ||
        (agx_chip_uncovered_tile_ms_defect(dev->dev.chip) &&
-        render->tilebuffer.sample_size_B >
-           AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE));
+        wide_ms_cleared_B > AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE));
+   bool clear_draw_skips_zs = false;
    if (clear_spills && !incomplete_render_area && !clear_wide_multisample) {
       unsigned selected = 0;
       for (unsigned i = 0; i < clear_count; ++i) {
@@ -5457,14 +5507,22 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
             clear_att[selected++] = clear_att[i];
       }
       clear_count = selected;
+   } else if (clear_wide_multisample && !incomplete_render_area &&
+              clear_count > color_clear_count) {
+      /* The uncovered-tile MSAA defect affects only colour tilebuffer bytes
+       * beyond byte 8; hardware ZLS clears depth/stencil on empty tiles
+       * without needing the clear draw to write Z/S. */
+      clear_count = color_clear_count;
+      clear_draw_skips_zs = true;
    }
    /* Resolves of loaded samples write the destination even without geometry. */
    const bool loaded_resolve =
       render->g17p_direct_color_resolve &&
       pRenderingInfo->pColorAttachments[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
    const bool process_empty_tiles =
-      resolved_clear || resolved_clear_z || loaded_resolve;
-   render->process_empty_tiles_without_z = resolved_clear || loaded_resolve;
+      resolved_clear || resolved_clear_z || resolved_clear_s || loaded_resolve;
+   render->process_empty_tiles_without_z =
+      resolved_clear || resolved_clear_s || loaded_resolve;
    cs->cr.process_empty_tiles = process_empty_tiles;
    if (unlikely(dev->frame_anatomy) && incomplete_render_area)
       cs->anatomy_area = render->area;
@@ -5482,11 +5540,14 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
        * unchanged (and an incomplete render area always loads). On M5 that
        * was a whole-framebuffer load/store round trip, ~50 us for a 1x
        * RGBA8 3024x1964 target, for a clear of a small HUD rectangle. Only
-       * a resolve of loaded samples still writes its destination from empty
-       * tiles. */
-      if (agx_chip_g17_m5(dev->dev.chip)) {
-         render->process_empty_tiles_without_z = loaded_resolve;
-         cs->cr.process_empty_tiles = loaded_resolve;
+       * a resolve of loaded samples (or Z/S clears left to ZLS when the clear
+       * draw is colour-only) still writes its destination from empty tiles. */
+      if (agx_chip_native_or_m5(dev->dev.chip)) {
+         render->process_empty_tiles_without_z =
+            loaded_resolve || (clear_draw_skips_zs && resolved_clear_s);
+         cs->cr.process_empty_tiles =
+            loaded_resolve ||
+            (clear_draw_skips_zs && (resolved_clear_z || resolved_clear_s));
       }
 
       hk_CmdClearAttachments(hk_cmd_buffer_to_handle(cmd), clear_count,
@@ -7805,7 +7866,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
     * position among all of the framebuffer's colour targets. */
    BITSET_DECLARE(g17p_tile_partitions, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
    if (agx_chip_native_or_m5(dev->dev.chip)) {
-      const struct agx_tilebuffer_layout tib =
+      struct agx_tilebuffer_layout tib =
          key->epilog.native_imageblock
             ? agx_build_tilebuffer_layout_resident(
                  key->epilog.rt_formats, ARRAY_SIZE(key->epilog.rt_formats),
@@ -7817,6 +7878,8 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
                  key->epilog.nr_samples, true, key->epilog.max_sample_size_B,
                  key->epilog.max_bytes_per_tile,
                  key->epilog.max_samples_per_tile, key->epilog.resident_mask);
+      if (key->epilog.first_mask && !tib.resident_mask)
+         agx_tilebuffer_apply_first_mask(&tib, key->epilog.first_mask);
       for (unsigned rt = 0; rt < ARRAY_SIZE(tib.logical_format); ++rt) {
          if (tib.logical_format[rt] != PIPE_FORMAT_NONE && !tib.spilled[rt])
             BITSET_SET(g17p_tile_partitions, tib._offset_B[rt]);
@@ -10827,7 +10890,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
 
    key->epilog = (struct agx_fs_epilog_key){
       .link = fs->info.fs.epilog_key,
-      .colour_unit_range = fs->info.fs.g17p_colour_unit_range,
+      .colour_unit_range = fs->info.fs.colour_unit_range,
       .nr_samples = samples,
       .a2c_in_main = fs->info.fs.a2c_in_main,
       .blend.alpha_to_coverage = dyn->ms.alpha_to_coverage_enable,
@@ -10885,6 +10948,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    key->epilog.native_imageblock = in->tib->native_imageblock;
    key->epilog.max_sample_size_B = in->tib->max_sample_size_B;
    key->epilog.resident_mask = in->tib->resident_mask;
+   key->epilog.first_mask = in->tib->first_mask;
    key->epilog.max_bytes_per_tile = in->tib->max_bytes_per_tile;
    key->epilog.max_samples_per_tile = in->tib->max_samples_per_tile;
 
@@ -14483,9 +14547,14 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    cs->stats.calls++;
    hk_upload_stat(cmd, draws, 1);
    if (batch) {
-      /* The kernel writes the M5 Index List into a slot reserved after
-       * this point; its restart state goes before it. */
-      if (agx_chip_g17_m5(dev->dev.chip) && draw.restart)
+      /* A HAL300 Index List carries no restart value: the kernel writes it
+       * into a slot reserved after this point, so its restart state goes
+       * before it. Batched records were admitted by
+       * hk_robust_index_rewrite_admitted(), so the record family has an
+       * empty-draw continuation here. */
+      const enum agx_chip records =
+         agx_vdm_index_list_record_chip(agx_chip_record_family(dev->dev.chip));
+      if (agx_vdm_index_list_direct_is_hal300_inline(records) && draw.restart)
          cs->current = hk_m5_emit_restart_index(cmd, cs, cs->current, draw);
       hk_emit_robust_index(cmd, cs, draw, gfx->topology, tail_emitted, batch);
       /* G17P: its GPU-written indexed indirect packets set the restart

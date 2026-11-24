@@ -85,11 +85,9 @@ hk_device_init_meta(struct hk_device *dev)
    /* hk never uses layered rendering for meta, so a one-layer attachment
     * view always renders Layer 0: the specialization holds on every chip. */
    dev->meta.specialize_single_layer_buffer_upload = true;
-   /* Other native chips lower a stencil blit to eight bit-selective discard
-    * passes. G17P exports stencil in one draw, which also resolves depth and
-    * stencil together: 1.50 to 0.48 ms for a 2x D32S8 at 3456x2234. */
-   dev->meta.use_stencil_export = !agx_chip_native_agx3(dev->dev.chip) ||
-                                  dev->dev.chip == AGX_CHIP_G17P;
+   /* Export stencil in one draw across all chips, which also resolves depth
+    * and stencil together (1.50 to 0.48 ms for a 2x D32S8 at 3456x2234). */
+   dev->meta.use_stencil_export = true;
    /* A scaled image is read through an exact integer descriptor or a
     * filterable normalized one depending on whether the sampler filters, so
     * a blit source has to arrive together with its sampler for the driver to
@@ -97,7 +95,7 @@ hk_device_init_meta(struct hk_device *dev)
    dev->meta.use_combined_blit_descriptors =
       agx_chip_native_agx3(dev->dev.chip);
    dev->meta.use_masked_rgba8_buffer_unpack =
-      agx_chip_native_agx3(dev->dev.chip);
+      agx_chip_native_or_m5(dev->dev.chip);
    dev->meta.use_rect_list_pipeline = true;
    dev->meta.cmd_bind_map_buffer = hk_cmd_bind_map_buffer;
    dev->meta.max_bind_map_buffer_size_B = 64 * 1024;
@@ -4045,7 +4043,7 @@ hk_g17p_tiled_upload_shape(const struct hk_device *dev, bool dest_tiled,
                            struct hk_g17p_tiled_upload_key *key,
                            uint32_t groups[3])
 {
-   if (dev->dev.chip != AGX_CHIP_G17P || !dest_tiled || !plan->width_el ||
+   if (!agx_chip_g17p_or_m5(dev->dev.chip) || !dest_tiled || !plan->width_el ||
        !plan->height_el)
       return false;
 
@@ -5165,7 +5163,7 @@ hk_g17p_fill_buffer_pbe_supported(const struct hk_device *dev,
 {
    const struct hk_physical_device *pdev =
       (const struct hk_physical_device *)dev->vk.physical;
-   if (!agx_chip_g17p_or_m5(dev->dev.chip) || buffer->va ||
+   if (!agx_chip_native_or_m5(dev->dev.chip) || buffer->va ||
        size < (64u << 20) || ((address | offset | size) & 15) ||
        !address || size > UINT64_MAX - address ||
        size / 16 > pdev->vk.properties.maxTexelBufferElements)

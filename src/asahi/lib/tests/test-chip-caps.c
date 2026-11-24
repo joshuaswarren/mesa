@@ -43,7 +43,7 @@ static unsigned checks;
 
 #define CAP_BIT(cap, predicate) | (cap)
 static const unsigned all_caps =
-   (0 CAPS(CAP_BIT)) | AGX_CAP_DESCRIPTOR_BUFFER;
+   (0 CAPS(CAP_BIT)) | AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_DESCRIPTOR_BUFFER;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its

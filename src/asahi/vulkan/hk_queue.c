@@ -1332,7 +1332,7 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
       p_atomic_set(&queue->drm.id, UINT32_MAX);
    }
 
-   /* M5 and G17P admit GPU work at the API entrypoint, before semaphore
+   /* Native AGX3 and M5 admit GPU work at the API entrypoint, before semaphore
     * payloads move (hk_queue_admits_at_entry). Other devices retain admission
     * in the serialized driver callback. Host-only synchronization does not
     * need a kernel scheduling context. */
@@ -1398,7 +1398,7 @@ hk_queue_restart_sync(struct hk_queue *queue)
 static bool
 hk_queue_admits_at_entry(const struct hk_device *dev)
 {
-   return agx_chip_g17p_or_m5(dev->dev.chip);
+   return agx_chip_native_or_m5(dev->dev.chip);
 }
 
 static inline struct hk_queue *

@@ -489,8 +489,11 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
-      NIR_PASS(progress, nir, nir_opt_loop);
-      NIR_PASS(progress, nir, nir_opt_loop_unroll);
+      if (agx_nir_has_loop(nir)) {
+         NIR_PASS(progress, nir, nir_opt_loop);
+         agx_nir_limit_heavy_branch_unroll(nir);
+         NIR_PASS(progress, nir, nir_opt_loop_unroll);
+      }
    } while (progress);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -5270,9 +5273,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          NIR_PASS(_, nir, nir_lower_alpha_to_coverage, false, enable);
       }
 
-      if (agx_chip_native_agx3(dev->dev.chip))
-         shader->info.fs.g17p_colour_unit_range =
-            agx_nir_fs_colour_outputs_unit_range(nir);
+      shader->info.fs.colour_unit_range =
+         agx_nir_fs_colour_outputs_unit_range(nir);
 
       /* Only a shader that already discards has an early coverage update to
        * carry the kill. A shader with no way to apply it keeps it in the
@@ -7343,7 +7345,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
     * never qualifies then. */
    const bool vs_covers_clip_square =
       vs_covers >= 0 ? vs_covers > 0
-                     : agx_chip_g17p_or_m5(dev->dev.chip) &&
+                     : agx_chip_native_or_m5(dev->dev.chip) &&
                           info->stage == MESA_SHADER_VERTEX &&
                           !info->nir->info.io_lowered &&
                           hk_vs_covers_clip_square(info->nir);
@@ -8684,7 +8686,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          }
       }
 
-      vs_covers[i] = agx_chip_g17p_or_m5(dev->dev.chip) &&
+      vs_covers[i] = agx_chip_native_or_m5(dev->dev.chip) &&
                      nir->info.stage == MESA_SHADER_VERTEX &&
                      hk_vs_covers_clip_square(nir);
       if (!hk_mesh_task_grid(dev, nir, info->flags)) {

@@ -9990,6 +9990,200 @@ agx_lower_front_face(struct nir_builder *b, nir_intrinsic_instr *intr,
  */
 #define AGX_G17P_EXPENSIVE_FLATTEN_LIMIT 24
 
+/* Whether any CF list in `list` contains a loop node. Walks only CF nodes so
+ * loop-free shaders skip the loop-only passes in O(CF). */
+static bool
+agx_cf_list_has_loop(const struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, cf, node, list) {
+      if (cf->type == nir_cf_node_loop)
+         return true;
+      if (cf->type == nir_cf_node_if) {
+         const nir_if *nif = nir_cf_node_as_if(cf);
+         if (agx_cf_list_has_loop(&nif->then_list) ||
+             agx_cf_list_has_loop(&nif->else_list))
+            return true;
+      }
+   }
+   return false;
+}
+
+bool
+agx_nir_has_loop(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      if (agx_cf_list_has_loop(&impl->body))
+         return true;
+   }
+   return false;
+}
+
+/* A pure-ALU loop with at least this many iterations and two or more
+ * branches is kept rolled when its scalarized unrolled body would exceed
+ * AGX_HEAVY_BRANCH_UNROLL_MAX_OPS operations. */
+#define AGX_HEAVY_BRANCH_UNROLL_MIN_TRIPS 8
+#define AGX_HEAVY_BRANCH_UNROLL_MAX_OPS   512
+
+struct agx_loop_body_stats {
+   unsigned branch_ifs;
+   unsigned scalar_cost;
+   bool has_mem_or_sync;
+};
+
+static void
+agx_scan_loop_body(const struct exec_list *list, const nir_if *terminator_if,
+                   struct agx_loop_body_stats *st)
+{
+   foreach_list_typed(nir_cf_node, cf, node, list) {
+      switch (cf->type) {
+      case nir_cf_node_block: {
+         const nir_block *block = nir_cf_node_as_block(cf);
+         nir_foreach_instr(instr, block) {
+            switch (instr->type) {
+            case nir_instr_type_alu:
+               st->scalar_cost += nir_instr_as_alu(instr)->def.num_components;
+               break;
+            case nir_instr_type_phi:
+               st->scalar_cost += nir_instr_as_phi(instr)->def.num_components;
+               break;
+            case nir_instr_type_tex:
+               st->has_mem_or_sync = true;
+               st->scalar_cost += 4;
+               break;
+            case nir_instr_type_intrinsic: {
+               const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               switch (intr->intrinsic) {
+               case nir_intrinsic_load_ubo:
+               case nir_intrinsic_load_ssbo:
+               case nir_intrinsic_load_global:
+               case nir_intrinsic_load_global_constant:
+               case nir_intrinsic_load_global_predicated_agx:
+               case nir_intrinsic_load_shared:
+               case nir_intrinsic_load_constant:
+               case nir_intrinsic_load_agx:
+               case nir_intrinsic_load_constant_agx:
+               case nir_intrinsic_load_scratch:
+               case nir_intrinsic_store_ssbo:
+               case nir_intrinsic_store_global:
+               case nir_intrinsic_store_shared:
+               case nir_intrinsic_store_scratch:
+               case nir_intrinsic_image_load:
+               case nir_intrinsic_image_store:
+               case nir_intrinsic_image_deref_load:
+               case nir_intrinsic_image_deref_store:
+               case nir_intrinsic_bindless_image_load:
+               case nir_intrinsic_bindless_image_store:
+               case nir_intrinsic_barrier:
+                  st->has_mem_or_sync = true;
+                  break;
+               case nir_intrinsic_load_deref:
+               case nir_intrinsic_store_deref: {
+                  const nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+                  if (deref &&
+                      nir_deref_mode_may_be(deref, nir_var_mem_ssbo |
+                                                      nir_var_mem_ubo |
+                                                      nir_var_mem_global |
+                                                      nir_var_mem_shared))
+                     st->has_mem_or_sync = true;
+                  break;
+               }
+               default:
+                  break;
+               }
+               st->scalar_cost += 1;
+               break;
+            }
+            case nir_instr_type_load_const:
+            case nir_instr_type_undef:
+            case nir_instr_type_jump:
+               break;
+            default:
+               st->scalar_cost += 1;
+               break;
+            }
+         }
+         break;
+      }
+      case nir_cf_node_if: {
+         const nir_if *nif = nir_cf_node_as_if(cf);
+         if (nif != terminator_if)
+            st->branch_ifs++;
+         agx_scan_loop_body(&nif->then_list, terminator_if, st);
+         agx_scan_loop_body(&nif->else_list, terminator_if, st);
+         break;
+      }
+      case nir_cf_node_loop:
+         st->has_mem_or_sync = true;
+         break;
+      default:
+         break;
+      }
+   }
+}
+
+static bool
+agx_limit_heavy_branch_unroll_cf(struct exec_list *list)
+{
+   bool progress = false;
+   foreach_list_typed(nir_cf_node, cf, node, list) {
+      if (cf->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(cf);
+         progress |= agx_limit_heavy_branch_unroll_cf(&nif->then_list);
+         progress |= agx_limit_heavy_branch_unroll_cf(&nif->else_list);
+      } else if (cf->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(cf);
+         progress |= agx_limit_heavy_branch_unroll_cf(&loop->body);
+         if (loop->control != nir_loop_control_none || !loop->info ||
+             loop->info->force_unroll ||
+             loop->info->flattens_all_control_flow ||
+             !loop->info->exact_trip_count_known ||
+             loop->info->max_trip_count < AGX_HEAVY_BRANCH_UNROLL_MIN_TRIPS)
+            continue;
+
+         const nir_if *term_if =
+            loop->info->limiting_terminator
+               ? loop->info->limiting_terminator->nif
+               : NULL;
+         struct agx_loop_body_stats st = {0};
+         agx_scan_loop_body(&loop->body, term_if, &st);
+         if (st.has_mem_or_sync || st.branch_ifs < 2)
+            continue;
+
+         if ((uint64_t)loop->info->max_trip_count * st.scalar_cost >
+             AGX_HEAVY_BRANCH_UNROLL_MAX_OPS) {
+            loop->control = nir_loop_control_dont_unroll;
+            progress = true;
+         }
+      }
+   }
+   return progress;
+}
+
+/* Pre-scalarization nir_opt_loop_unroll counts vector ALU as 1 op per
+ * instruction, so a multi-branch uvec4 uber loop with 8..23 iterations can
+ * appear below the unroll threshold and explode into a multi-thousand-op
+ * straight-line block after scalarization. Mark pure-ALU multi-branch loops
+ * whose scalarized unrolled footprint exceeds
+ * AGX_HEAVY_BRANCH_UNROLL_MAX_OPS as dont_unroll while
+ * leaving memory/texture/GEMM and branchless loops untouched. */
+bool
+agx_nir_limit_heavy_branch_unroll(nir_shader *nir)
+{
+   bool any = false;
+   nir_foreach_function_impl(impl, nir) {
+      if (!agx_cf_list_has_loop(&impl->body)) {
+         nir_no_progress(impl);
+         continue;
+      }
+      nir_metadata_require(impl, nir_metadata_loop_analysis,
+                           nir->options->force_indirect_unrolling,
+                           (int)nir->options->force_indirect_unrolling_sampler);
+      bool progress = agx_limit_heavy_branch_unroll_cf(&impl->body);
+      any |= nir_progress(progress, impl, nir_metadata_all);
+   }
+   return any;
+}
+
 /*
  * Standard NIR optimization loop. This is run in agx_preprocess_nir, then once
  * again at shader variant compile time. Unless there was a complex shader key,
@@ -10136,7 +10330,10 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
          NIR_PASS(progress, nir, nir_opt_undef);
          break;
       case OPT_LOOP_UNROLL:
-         NIR_PASS(progress, nir, nir_opt_loop_unroll);
+         if (agx_nir_has_loop(nir)) {
+            agx_nir_limit_heavy_branch_unroll(nir);
+            NIR_PASS(progress, nir, nir_opt_loop_unroll);
+         }
          break;
       }
 

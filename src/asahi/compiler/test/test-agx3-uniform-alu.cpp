@@ -1210,6 +1210,51 @@ TEST(AGX3PixelTests, EmptyExecutionSkipsShortTestingElse)
    }
 }
 
+TEST(AGX3PixelTests, EmptyExecutionSkipsShortAluArmOnAgx3)
+{
+   const struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+      bool emit_agx3d;
+      mesa_shader_stage stage;
+      bool expect_jump;
+   } cases[] = {
+      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, false, MESA_SHADER_FRAGMENT, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false, MESA_SHADER_FRAGMENT, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, MESA_SHADER_FRAGMENT, true},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, MESA_SHADER_COMPUTE, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, MESA_SHADER_FRAGMENT, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, MESA_SHADER_COMPUTE, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, true, MESA_SHADER_FRAGMENT, false},
+   };
+
+   for (const auto &c : cases) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = c.encoding;
+      key.dev.chip = c.chip;
+      key.dev.emit_agx3d = c.emit_agx3d;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = c.stage;
+      agx_block *entry = list_first_entry(&b->shader->blocks, agx_block, link);
+      agx_block *body = agx_test_block(b->shader);
+      agx_block *end = agx_test_block(b->shader);
+      agx_if_icmp(b, agx_register(0, AGX_SIZE_16), agx_immediate(0),
+                  1, AGX_ICOND_UEQ, true, end);
+      agx_builder middle = agx_init_builder(b->shader, agx_after_block(body));
+      for (unsigned i = 0; i < 12; ++i)
+         agx_iadd_to(&middle, agx_register(2, AGX_SIZE_32),
+                     agx_register(2, AGX_SIZE_32), agx_immediate(1), 0);
+      agx_builder last = agx_init_builder(b->shader, agx_after_block(end));
+      agx_stop(&last);
+      agx_opt_jmp_none(b->shader);
+      agx_instr *jump = agx_last_instr(entry);
+      EXPECT_EQ(jump->op == AGX_OPCODE_JMP_EXEC_NONE, c.expect_jump);
+      ralloc_free(mem);
+   }
+}
+
 TEST(AGX3UniformALU, M5NativeMultiplyAndFmaUniformWitnesses)
 {
    const struct {

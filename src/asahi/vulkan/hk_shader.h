@@ -94,9 +94,10 @@ struct hk_shader_info {
          /* Rasterization samples the G17P coverage updates are compiled for */
          uint8_t g17p_samples;
 
-         /* AGX_G17P_UNIT_RANGE_BLEND: every colour output is provably in
-          * [0, 1] (computed only with the flag set). */
-         bool g17p_colour_unit_range;
+         /* Every colour output is provably in [0, 1]
+          * (agx_nir_fs_colour_outputs_unit_range), allowing blend epilogs to
+          * elide redundant UNORM/sRGB source clamps. */
+         bool colour_unit_range;
 
          /* AGX3: the main part's depth/stencil test selector was folded to
           * "this part tests" (hk_fs_key::static_tests); its epilog must not

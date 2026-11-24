@@ -150,6 +150,34 @@ struct hk_agx3_refit_state {
 
 #define HK_AGX3_REFIT_PROPAGATE_DISPATCH 24u /* bytes into hk_agx3_refit_state */
 #define HK_AGX3_REFIT_GROUP_SIZE 64u
+/* Single-workgroup fused inner-level + envelope pass (bvh/agx3_refit.comp). */
+#define HK_AGX3_REFIT_TOP_GROUP_SIZE 256u
+#define HK_AGX3_REFIT_TOP_KEEP_RETAINED 1u
+#define HK_AGX3_REFIT_TOP_NO_LEAVES 2u
+
+struct hk_agx3_refit_top_args {
+   /* Nonzero: refit state written by prepare; zero: read retained jobs from
+    * metadata directly (in-place update that skipped prepare). */
+   VOID_REF refit;
+   VOID_REF counters;
+   VOID_REF bounds;
+   VOID_REF output_bvh;
+   REF(uint32_t) status;
+   REF(uint32_t) envelope_status;
+   VOID_REF metadata;
+   REF(vk_ir_header) header;
+   uint64_t retained_offset;
+   uint32_t leaf_bound;
+   uint32_t node_bound;
+   uint32_t slot_bias;
+   uint32_t resource_id;
+   uint32_t geometry_type;
+   uint32_t build_flags;
+   /* Number of top levels (0 .. top_levels - 1) encoded by this pass. When
+    * equal to HK_AGX3_REFIT_LEVELS, also handles any deeper levels inline. */
+   uint32_t top_levels;
+   uint32_t flags;
+};
 
 #ifdef VULKAN
 TYPE(hk_agx3_refit_state, 8);
@@ -231,6 +259,20 @@ struct hk_agx3_refit_encode_args {
    VOID_REF triangles;
 };
 
+/* Push constants of direct single-geometry in-place triangle refit encoding
+ * (agx3_leaf.comp built with HK_AGX3_REFIT_DIRECT): skips prepare and
+ * triangle placement by loading vertices directly from the application's
+ * buffers using the source structure's retained child offsets. */
+struct hk_agx3_refit_direct_args {
+   VOID_REF metadata;
+   VOID_REF bounds;
+   VOID_REF output_bvh;
+   REF(uint32_t) status;
+   vk_bvh_geometry_data geometry;
+   uint32_t slot_bias;
+   uint32_t leaf_bound;
+};
+
 /* A triangle as an update's leaf pass leaves it, at its leaf's slot: its
  * vertices, zero for an inactive triangle as updatable structures keep it,
  * and its geometry and primitive IDs, as an IR triangle leaf has them. */
@@ -248,8 +290,9 @@ TYPE(hk_agx3_refit_triangle, 4);
 /* Push constants of an update's leaf pass, one dispatch per geometry with
  * a thread per primitive. */
 struct hk_agx3_refit_leaf_args {
-   /* The refit state, which finds the retained jobs. */
-   VOID_REF refit;
+   /* The source structure's live metadata, which finds its retained jobs so
+    * placement can run in parallel with the prepare phase. */
+   VOID_REF metadata;
    REF(hk_agx3_refit_triangle) triangles;
    vk_bvh_geometry_data geometry;
    uint32_t leaf_bound;

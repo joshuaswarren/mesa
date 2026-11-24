@@ -234,8 +234,7 @@ enum agx_chip_quirk {
 
 /* The native chips that are not G17P: G15G, G15S, G15C and G16G. */
 #define AGX_QUIRKS_NATIVE_PRE_G17                                              \
-   (AGX_QUIRKS_NATIVE | AGX_QUIRK_EXPLICIT_ROBUST_IMAGE_BOUNDS |               \
-    AGX_QUIRK_INEXACT_FMA32)
+   (AGX_QUIRKS_NATIVE | AGX_QUIRK_EXPLICIT_ROBUST_IMAGE_BOUNDS)
 
 #define AGX_QUIRKS_G17P                                                        \
    (AGX_QUIRKS_NATIVE | AGX_QUIRK_NATIVE_RENDER_CONTEXT |                      \
