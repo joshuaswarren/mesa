@@ -323,6 +323,14 @@ struct agx_compiled_shader {
 
    struct agx_fs_epilog_link_info epilog_key;
 
+   /* A native AGX3 fragment main's NIR (serialized) and backend key exactly
+    * as its backend compile took them, so that a link can compile the main
+    * and its colour epilog as one program (agx_compile_inline_blend_fs()).
+    * NULL when the main cannot blend inline. */
+   void *inline_blend_nir;
+   size_t inline_blend_nir_size;
+   struct agx_shader_key inline_blend_key;
+
    /* Auxiliary programs, or NULL if not used */
    struct agx_compiled_shader *gs_count, *pre_gs;
    struct agx_compiled_shader *gs_copy;

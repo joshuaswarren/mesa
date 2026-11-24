@@ -391,6 +391,18 @@ if with_tests
   )
 
   test(
+    'asahi-inline-fs-epilog',
+    executable(
+      'asahi-inline-fs-epilog',
+      files('tests/test-agx-inline-fs-epilog.c'),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'asahi-g17p-mrt-quad',
     executable(
       'asahi-g17p-mrt-quad',
