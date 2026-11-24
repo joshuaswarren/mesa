@@ -10676,29 +10676,29 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       }
    }
 
-   /* Only AGX3 compute shaders defer element-index lowering here; AGX2 never
-    * sets shared_element_index_agx and must keep its existing scalar shared
-    * lowering. Frontends that ran agx_preprocess_nir() with g17p == false
-    * (G18G, Gallium, libagx, Borealis internal helpers) already narrowed
-    * shared offsets to u2u16(off32), so narrow any remaining 32-bit offsets
-    * first with element_indices = false and then run
-    * agx_nir_lower_shared_element_index to chase through u2u16 in 32 bits and
-    * preserve constant byte-offset folding in
-    * agx_nir_opt_shared_byte_offsets(). */
-   const bool lower_agx3_compute_shared =
-      (byte_indices || m5) && nir->info.stage == MESA_SHADER_COMPUTE &&
+   /* Compute shaders defer shared-offset lowering until after
+    * nir_lower_mem_access_bit_sizes() and nir_opt_load_store_vectorize() so
+    * adjacent byte-addressed shared loads and stores merge into wider vector
+    * accesses on both AGX2 and AGX3.  Frontends that ran agx_preprocess_nir()
+    * on non-compute stages already narrowed offsets; AGX3 compute shaders also
+    * convert byte offsets to width-scaled element indices afterwards. */
+   const bool vectorize_compute_shared =
+      nir->info.stage == MESA_SHADER_COMPUTE &&
       !nir->info.shared_element_index_agx;
+   const bool lower_agx3_compute_shared =
+      (byte_indices || m5) && vectorize_compute_shared;
    NIR_PASS(pre_alg_progress, nir, nir_opt_load_store_vectorize,
             &(const nir_load_store_vectorize_options){
                .modes = nir_var_mem_global | nir_var_mem_constant |
-                        (lower_agx3_compute_shared ? nir_var_mem_shared : 0) |
+                        (vectorize_compute_shared ? nir_var_mem_shared : 0) |
                         nir_var_shader_temp,
                .callback = agx_mem_vectorize_cb,
             });
    NIR_PASS(pre_alg_progress, nir, nir_lower_pack);
-   if (lower_agx3_compute_shared) {
+   if (vectorize_compute_shared) {
       NIR_PASS(pre_alg_progress, nir, agx_nir_lower_shared_bitsize, false);
-      NIR_PASS(pre_alg_progress, nir, agx_nir_lower_shared_element_index);
+      if (lower_agx3_compute_shared)
+         NIR_PASS(pre_alg_progress, nir, agx_nir_lower_shared_element_index);
    }
    if (pre_alg_progress)
       NIR_PASS(_, nir, nir_opt_algebraic);
@@ -14489,14 +14489,13 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
     * into 32-bit halves, leaving each half addressing half its element.
     * Accesses of 32 bits and narrower are not split, so they are unaffected.
     */
-   /* Compute shaders defer shared element-index lowering until after
+   /* Compute shaders defer shared-offset lowering until after
     * nir_lower_mem_access_bit_sizes() and nir_opt_load_store_vectorize() in
     * agx_compile_shader_nir() so adjacent byte-addressed shared loads and
-    * stores merge into wider vector accesses before byte offsets become
-    * width-scaled element indices. Non-compute stages keep preprocess lowering.
+    * stores merge into wider vector accesses on both AGX2 and AGX3.
+    * Non-compute stages keep preprocess lowering.
     */
-   const bool defer_compute_shared =
-      (g17p || native_fragment_depth) && nir->info.stage == MESA_SHADER_COMPUTE;
+   const bool defer_compute_shared = nir->info.stage == MESA_SHADER_COMPUTE;
    if (!defer_compute_shared) {
       if (g17p || native_fragment_depth) {
          nir_lower_mem_access_bit_sizes_options shared_split = {

@@ -1078,7 +1078,9 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
       options.cb_data = branches;
    }
    bool speculative = false;
-   if (g17p && !agx3c && nir->info.stage == MESA_SHADER_FRAGMENT &&
+   if (!agx3c &&
+       (nir->info.stage == MESA_SHADER_FRAGMENT ||
+        nir->info.stage == MESA_SHADER_COMPUTE) &&
        has_speculative_load_candidate(nir)) {
       unsigned free_halves = free_preamble_halves(nir, &options, sizes);
       NIR_PASS(speculative, nir, nir_shader_intrinsics_pass,

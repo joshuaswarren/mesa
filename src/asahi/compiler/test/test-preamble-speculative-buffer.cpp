@@ -120,3 +120,63 @@ TEST(PreambleSpeculativeBuffer, StaysPastTheZeroPage)
    EXPECT_EQ(r.guarded, 0u);
    EXPECT_FALSE(r.main_speculatable);
 }
+
+TEST(PreambleSpeculativeBuffer, MovesInComputeAndAgx2)
+{
+   for (bool g17p : {false, true}) {
+      SCOPED_TRACE(g17p);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "speculative compute read");
+
+      nir_def *zero = nir_imm_int(&b, 0);
+      nir_def *desc = nir_load_constant_agx(
+         &b, 4, 32, agx_test_load_preamble(&b, 1, 64, 0), zero,
+         .access = VALID_DESCRIPTOR, .base = 0, .format = PIPE_FORMAT_R32_UINT);
+      nir_def *addr = nir_pack_64_2x32_split(&b, nir_channel(&b, desc, 0),
+                                             nir_channel(&b, desc, 1));
+
+      nir_def *lid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *elsewhere = nir_imm_vec4(&b, 0, 0, 0, 0);
+      nir_push_if(&b, nir_ine_imm(&b, lid, 0));
+      nir_def *read = nir_load_constant_agx(
+         &b, 4, 32, addr, nir_imm_int(&b, 2), .access = BUFFER_READ,
+         .base = 2, .format = PIPE_FORMAT_R32_UINT);
+      nir_pop_if(&b, NULL);
+      nir_store_global(&b, nir_if_phi(&b, read, elsewhere),
+                       nir_imm_int64(&b, UINT64_C(0x2000000000)),
+                       .align_mul = 16);
+
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      unsigned sizes[] = {4, 0, 0};
+      agx_nir_opt_preamble(b.shader, sizes, g17p, false, NULL);
+      nir_validate_shader(b.shader, "after compute preamble");
+
+      unsigned main_loads = 0, preamble_loads = 0, guarded = 0;
+      nir_foreach_function_impl(impl, b.shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *I = nir_instr_as_intrinsic(instr);
+               if (I->intrinsic != nir_intrinsic_load_constant_agx ||
+                   !(nir_intrinsic_access(I) & ACCESS_CAN_REORDER))
+                  continue;
+               if (impl->function->is_preamble) {
+                  nir_alu_instr *base = nir_src_as_alu(I->src[0]);
+                  preamble_loads++;
+                  guarded += base && base->op == nir_op_bcsel &&
+                             nir_alu_src_as_uint(base->src[2]) ==
+                                AGX_ZERO_PAGE_ADDRESS;
+               } else {
+                  main_loads++;
+               }
+            }
+         }
+      }
+      EXPECT_EQ(main_loads, 0u);
+      EXPECT_EQ(preamble_loads, 1u);
+      EXPECT_EQ(guarded, 1u);
+      ralloc_free(b.shader);
+   }
+}
