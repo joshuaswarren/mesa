@@ -4005,8 +4005,12 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
    const unsigned samples = render->tilebuffer.nr_samples;
    const bool msaa = samples > 1;
-   const bool msaa_enabled = msaa && agx_chip_g17_m5(dev->dev.chip) &&
-      (samples == 2 || samples == 4);
+   const bool msaa_enabled =
+      msaa && agx_chip_msaa_pass_continuation(dev->dev.chip) &&
+      (samples == 2 || samples == 4) &&
+      (!agx_chip_uncovered_tile_ms_defect(dev->dev.chip) ||
+       render->tilebuffer.sample_size_B <=
+          AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE);
 
    /* The instance is one ordinary render stream with draws, with no
     * pre/post-graphics streams, heap use or timestamps attached. */
