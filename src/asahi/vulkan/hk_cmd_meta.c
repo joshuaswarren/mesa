@@ -2264,11 +2264,19 @@ hk_g17p_compressed_blit_supported(const struct hk_device *dev,
    return true;
 }
 
+#define HK_G17P_MIP_WG_SIZE 16
+
 struct hk_g17p_mip_key {
    enum hk_meta_object_key_type key_type;
    bool odd;
+   bool exact_2x2;
    bool metadata;
+   bool aligned_16;
+   bool tile_64x64;
+   uint8_t pad[3];
 };
+static_assert(sizeof(struct hk_g17p_mip_key) == 12,
+              "G17P mip pipeline key must have no implicit padding");
 
 struct hk_g17p_mip_push {
    uint64_t dst;
@@ -2281,13 +2289,11 @@ struct hk_g17p_mip_push {
    uint32_t tiles_per_row;
    uint32_t tile_width_log2;
    uint32_t tile_height_log2;
-   uint32_t metadata_width_tl;
-   uint32_t metadata_height_tl;
    uint32_t metadata_interleave_bits;
    uint32_t metadata_major_is_x;
    uint32_t uncompressed_mode;
 };
-static_assert(sizeof(struct hk_g17p_mip_push) == 72,
+static_assert(sizeof(struct hk_g17p_mip_push) == 64,
               "G17P mip push data must be tightly packed");
 
 #define mip_push(b, field)                                                     \
@@ -2305,24 +2311,25 @@ hk_nir_spread_bits(nir_builder *b, nir_def *v)
    return nir_iand_imm(b, nir_ior(b, v, nir_ishl_imm(b, v, 1)), 0x55555555);
 }
 
-/* The even bits of the low 10 bits of v, packed: inverse of the spread */
+/* The even bits of the low 8 bits of v, packed: inverse of the spread */
 static nir_def *
-hk_nir_compact_bits(nir_builder *b, nir_def *v)
+hk_nir_compact_bits_8(nir_builder *b, nir_def *v)
 {
-   v = nir_iand_imm(b, v, 0x155);
-   v = nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 1)), 0x133);
-   v = nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 2)), 0x10f);
-   return nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 4)), 0x1f);
+   v = nir_iand_imm(b, v, 0x55);
+   v = nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 1)), 0x33);
+   return nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 2)), 0x0f);
 }
 
 static nir_shader *
 build_g17p_mip_shader(const struct hk_g17p_mip_key *key)
 {
+   assert(!(key->exact_2x2 && key->odd));
+
    nir_builder build =
       nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL, "hk-g17p-mip");
    nir_builder *b = &build;
-   b->shader->info.workgroup_size[0] = TILE_WIDTH;
-   b->shader->info.workgroup_size[1] = TILE_HEIGHT;
+   b->shader->info.workgroup_size[0] = HK_G17P_MIP_WG_SIZE;
+   b->shader->info.workgroup_size[1] = HK_G17P_MIP_WG_SIZE;
 
    nir_variable *texture = nir_variable_create(
       b->shader, nir_var_uniform,
@@ -2331,52 +2338,81 @@ build_g17p_mip_shader(const struct hk_g17p_mip_key *key)
    texture->data.descriptor_set = 0;
    texture->data.binding = 0;
 
-   /* Lay the 32x32 invocations of a workgroup out in Morton order, as the
-    * GPU-tiled layout stores texels: each 32-invocation group then covers an
-    * 8x4 block, whose texels are 128 contiguous bytes, instead of a 32-texel
-    * row scattered over two tiles.
+   /* Lay the 16x16 invocations of a workgroup out in Morton order, matching
+    * both one 16x16 compression metadata tile and the GPU-tiled texel layout:
+    * each 32-invocation subgroup covers an 8x4 block (128 contiguous bytes),
+    * while 256-thread workgroups allow up to 4 concurrent groups per core.
     */
    nir_def *lid = nir_load_local_invocation_id(b);
-   nir_def *index = nir_iadd(b, nir_channel(b, lid, 0),
-                             nir_imul_imm(b, nir_channel(b, lid, 1), TILE_WIDTH));
+   nir_def *index =
+      nir_ior(b, nir_channel(b, lid, 0),
+              nir_ishl_imm(b, nir_channel(b, lid, 1), 4));
    nir_def *wg = nir_load_workgroup_id(b);
-   nir_def *x = nir_iadd(b, nir_imul_imm(b, nir_channel(b, wg, 0), TILE_WIDTH),
-                         hk_nir_compact_bits(b, index));
-   nir_def *y = nir_iadd(b, nir_imul_imm(b, nir_channel(b, wg, 1), TILE_HEIGHT),
-                         hk_nir_compact_bits(b, nir_ushr_imm(b, index, 1)));
-   nir_def *width = mip_push(b, width);
-   nir_def *height = mip_push(b, height);
+   nir_def *wg_x = nir_channel(b, wg, 0);
+   nir_def *wg_y = nir_channel(b, wg, 1);
+   nir_def *x =
+      nir_ior(b, nir_ishl_imm(b, wg_x, 4), hk_nir_compact_bits_8(b, index));
+   nir_def *y = nir_ior(b, nir_ishl_imm(b, wg_y, 4),
+                        hk_nir_compact_bits_8(b, nir_ushr_imm(b, index, 1)));
+   nir_def *width = (!key->aligned_16 || key->odd) ? mip_push(b, width) : NULL;
+   nir_def *height = !key->aligned_16 ? mip_push(b, height) : NULL;
 
-   nir_push_if(b, nir_iand(b, nir_ult(b, x, width), nir_ult(b, y, height)));
+   /* When dimensions are not multiples of 16, guard each axis in its own
+    * non-flattened branch so each test lowers to a single AGX3B IF_ICMP
+    * against the aligned push-constant uniform without materializing uniform
+    * comparands into GPRs. */
+   nir_if *x_if = NULL, *y_if = NULL;
+   if (!key->aligned_16) {
+      x_if = nir_push_if(b, nir_ult(b, x, width));
+      x_if->control = nir_selection_control_dont_flatten;
+      y_if = nir_push_if(b, nir_ult(b, y, height));
+      y_if->control = nir_selection_control_dont_flatten;
+   }
+
    {
-      nir_def *x0, *y0, *wx, *wy;
-      if (key->odd) {
-         nir_def *axis = mip_push(b, axis);
-         nir_def *x_entry = nir_load_global(
-            b, 1, 32, nir_iadd(b, axis, nir_u2u64(b, nir_imul_imm(b, x, 4))),
-            .align_mul = 4);
-         nir_def *y_entry = nir_load_global(
-            b, 1, 32,
-            nir_iadd(b, axis,
-                     nir_u2u64(b, nir_imul_imm(b, nir_iadd(b, width, y), 4))),
-            .align_mul = 4);
-         x0 = nir_iand_imm(b, x_entry, 0xffff);
-         y0 = nir_iand_imm(b, y_entry, 0xffff);
-         wx = nir_iand_imm(b, nir_ushr_imm(b, x_entry, 16), 0xff);
-         wy = nir_iand_imm(b, nir_ushr_imm(b, y_entry, 16), 0xff);
-      } else {
-         nir_def *scale_x = mip_push(b, scale_x);
-         nir_def *scale_y = mip_push(b, scale_y);
-         x0 = nir_imul(b, x, scale_x);
-         y0 = nir_imul(b, y, scale_y);
-         wx = nir_ishl_imm(b, nir_iadd_imm(b, scale_x, -1), 7);
-         wy = nir_ishl_imm(b, nir_iadd_imm(b, scale_y, -1), 7);
-      }
+      nir_def *x0, *y0, *x1, *y1;
+      nir_def *weights[4] = {NULL};
 
-      nir_def *x1 = nir_iadd(b, x0, nir_b2i32(b, nir_ine_imm(b, wx, 0)));
-      nir_def *y1 = nir_iadd(b, y0, nir_b2i32(b, nir_ine_imm(b, wy, 0)));
-      nir_def *ix = nir_isub(b, nir_imm_int(b, 256), wx);
-      nir_def *iy = nir_isub(b, nir_imm_int(b, 256), wy);
+      if (key->exact_2x2) {
+         x0 = nir_ishl_imm(b, x, 1);
+         y0 = nir_ishl_imm(b, y, 1);
+         x1 = nir_ior_imm(b, x0, 1);
+         y1 = nir_ior_imm(b, y0, 1);
+      } else {
+         nir_def *wx, *wy;
+         if (key->odd) {
+            nir_def *axis = mip_push(b, axis);
+            nir_def *x_entry = nir_load_global(
+               b, 1, 32, nir_iadd(b, axis, nir_u2u64(b, nir_imul_imm(b, x, 4))),
+               .align_mul = 4);
+            nir_def *y_entry = nir_load_global(
+               b, 1, 32,
+               nir_iadd(b, axis,
+                        nir_u2u64(b, nir_imul_imm(b, nir_iadd(b, width, y), 4))),
+               .align_mul = 4);
+            x0 = nir_iand_imm(b, x_entry, 0xffff);
+            y0 = nir_iand_imm(b, y_entry, 0xffff);
+            wx = nir_iand_imm(b, nir_ushr_imm(b, x_entry, 16), 0xff);
+            wy = nir_iand_imm(b, nir_ushr_imm(b, y_entry, 16), 0xff);
+         } else {
+            nir_def *scale_x = mip_push(b, scale_x);
+            nir_def *scale_y = mip_push(b, scale_y);
+            x0 = nir_imul(b, x, scale_x);
+            y0 = nir_imul(b, y, scale_y);
+            wx = nir_ishl_imm(b, nir_iadd_imm(b, scale_x, -1), 7);
+            wy = nir_ishl_imm(b, nir_iadd_imm(b, scale_y, -1), 7);
+         }
+
+         x1 = nir_iadd(b, x0, nir_b2i32(b, nir_ine_imm(b, wx, 0)));
+         y1 = nir_iadd(b, y0, nir_b2i32(b, nir_ine_imm(b, wy, 0)));
+         nir_def *ix = nir_isub(b, nir_imm_int(b, 256), wx);
+         nir_def *iy = nir_isub(b, nir_imm_int(b, 256), wy);
+
+         weights[0] = nir_imul(b, ix, iy);
+         weights[1] = nir_imul(b, wx, iy);
+         weights[2] = nir_imul(b, ix, wy);
+         weights[3] = nir_imul(b, wx, wy);
+      }
 
       nir_def *zero = nir_imm_int(b, 0);
       nir_def *coords[4] = {
@@ -2384,12 +2420,6 @@ build_g17p_mip_shader(const struct hk_g17p_mip_key *key)
          nir_vec3(b, x1, y0, zero),
          nir_vec3(b, x0, y1, zero),
          nir_vec3(b, x1, y1, zero),
-      };
-      nir_def *weights[4] = {
-         nir_imul(b, ix, iy),
-         nir_imul(b, wx, iy),
-         nir_imul(b, ix, wy),
-         nir_imul(b, wx, wy),
       };
       nir_def *texels[4];
       for (unsigned i = 0; i < 4; ++i) {
@@ -2400,79 +2430,117 @@ build_g17p_mip_shader(const struct hk_g17p_mip_key *key)
 
       nir_def *packed = NULL;
       for (unsigned c = 0; c < 4; ++c) {
-         nir_def *value = NULL;
-         for (unsigned i = 0; i < 4; ++i) {
-            nir_def *term = nir_imul(b, nir_channel(b, texels[i], c), weights[i]);
-            value = value ? nir_iadd(b, value, term) : term;
-         }
+         nir_def *out;
+         if (key->exact_2x2) {
+            nir_def *sum = nir_iadd(
+               b,
+               nir_iadd(b, nir_channel(b, texels[0], c),
+                        nir_channel(b, texels[1], c)),
+               nir_iadd(b, nir_channel(b, texels[2], c),
+                        nir_channel(b, texels[3], c)));
+            /* Bit-exact match for the general fixed4 ties-toward-128 rounding
+             * when all four weights are 16384 (sum in 0..1020):
+             *   sum <= 511 -> (sum + 2) >> 2 (0.5 ties round up toward 128)
+             *   sum >= 512 -> (sum + 1) >> 2 (0.5 ties round down toward 128) */
+            out = nir_ushr_imm(
+               b, nir_isub(b, nir_iadd_imm(b, sum, 2), nir_ushr_imm(b, sum, 9)),
+               2);
+         } else {
+            nir_def *value = NULL;
+            for (unsigned i = 0; i < 4; ++i) {
+               nir_def *term =
+                  nir_imul(b, nir_channel(b, texels[i], c), weights[i]);
+               value = value ? nir_iadd(b, value, term) : term;
+            }
 
-         /* Rounded to four fractional bits, then to the nearest code with
-          * exact ties toward 128, as libagx_mipmap_unorm8x4_odd */
-         nir_def *fixed4 = nir_ushr_imm(b, nir_iadd_imm(b, value, 2048), 12);
-         nir_def *out = nir_ushr_imm(b, fixed4, 4);
-         nir_def *rem = nir_iand_imm(b, fixed4, 15);
-         nir_def *up = nir_ior(b, nir_ugt_imm(b, rem, 8),
-                               nir_iand(b, nir_ieq_imm(b, rem, 8),
-                                        nir_ult_imm(b, out, 128)));
-         out = nir_iadd(b, out, nir_b2i32(b, up));
+            /* Rounded to four fractional bits, then to the nearest code with
+             * exact ties toward 128, as libagx_mipmap_unorm8x4_odd */
+            nir_def *fixed4 = nir_ushr_imm(b, nir_iadd_imm(b, value, 2048), 12);
+            out = nir_ushr_imm(b, fixed4, 4);
+            nir_def *rem = nir_iand_imm(b, fixed4, 15);
+            nir_def *up = nir_ior(b, nir_ugt_imm(b, rem, 8),
+                                  nir_iand(b, nir_ieq_imm(b, rem, 8),
+                                           nir_ult_imm(b, out, 128)));
+            out = nir_iadd(b, out, nir_b2i32(b, up));
+         }
 
          nir_def *byte = nir_ishl_imm(b, out, 8 * c);
          packed = packed ? nir_ior(b, packed, byte) : byte;
       }
 
-      nir_def *tile_width_log2 = mip_push(b, tile_width_log2);
-      nir_def *tile_height_log2 = mip_push(b, tile_height_log2);
-      nir_def *tile_x_mask =
-         nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), tile_width_log2), -1);
-      nir_def *tile_y_mask =
-         nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), tile_height_log2), -1);
-      nir_def *tile = nir_iadd(
-         b, nir_imul(b, nir_ushr(b, y, tile_height_log2),
+      nir_def *element;
+      if (key->tile_64x64) {
+         /* A 16x16 workgroup is already Morton-ordered in index (bits 0..7);
+          * its 2-bit position inside a 64x64 tile supplies Morton bits 8..11,
+          * keeping tile and high Morton bits workgroup-uniform. */
+         nir_def *tile = nir_iadd(
+            b, nir_imul(b, nir_ushr_imm(b, wg_y, 2), mip_push(b, tiles_per_row)),
+            nir_ushr_imm(b, wg_x, 2));
+         nir_def *morton_hi = nir_ior(
+            b,
+            nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, wg_x, 1), 8),
+                    nir_ishl_imm(b, nir_iand_imm(b, wg_y, 1), 9)),
+            nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, wg_x, 2), 9),
+                    nir_ishl_imm(b, nir_iand_imm(b, wg_y, 2), 10)));
+         element = nir_ior(b, nir_ior(b, nir_ishl_imm(b, tile, 12), morton_hi),
+                           index);
+      } else {
+         nir_def *tile_width_log2 = mip_push(b, tile_width_log2);
+         nir_def *tile_height_log2 = mip_push(b, tile_height_log2);
+         nir_def *tile_x_mask =
+            nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), tile_width_log2), -1);
+         nir_def *tile_y_mask =
+            nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), tile_height_log2), -1);
+         nir_def *tile = nir_iadd(
+            b,
+            nir_imul(b, nir_ushr(b, y, tile_height_log2),
                      mip_push(b, tiles_per_row)),
-         nir_ushr(b, x, tile_width_log2));
-      nir_def *morton =
-         nir_ior(b, hk_nir_spread_bits(b, nir_iand(b, x, tile_x_mask)),
-                 nir_ishl_imm(b, hk_nir_spread_bits(b, nir_iand(b, y, tile_y_mask)), 1));
-      nir_def *element = nir_ior(
-         b, nir_ishl(b, tile, nir_iadd(b, tile_width_log2, tile_height_log2)),
-         morton);
+            nir_ushr(b, x, tile_width_log2));
+         nir_def *morton = nir_ior(
+            b, hk_nir_spread_bits(b, nir_iand(b, x, tile_x_mask)),
+            nir_ishl_imm(b, hk_nir_spread_bits(b, nir_iand(b, y, tile_y_mask)),
+                         1));
+         element = nir_ior(
+            b, nir_ishl(b, tile, nir_iadd(b, tile_width_log2, tile_height_log2)),
+            morton);
+      }
 
       nir_store_global(b, packed,
                        nir_iadd(b, mip_push(b, dst),
                                 nir_u2u64(b, nir_imul_imm(b, element, 4))),
                        .align_mul = 4);
    }
-   nir_pop_if(b, NULL);
+
+   if (!key->aligned_16) {
+      nir_pop_if(b, y_if);
+      nir_pop_if(b, x_if);
+   }
 
    if (key->metadata) {
-      nir_def *x_tl = nir_ushr_imm(b, x, 4);
-      nir_def *y_tl = nir_ushr_imm(b, y, 4);
-      nir_def *origin =
-         nir_ieq_imm(b, nir_iand_imm(b, nir_ior(b, x, y), 15), 0);
-      nir_def *in_grid =
-         nir_iand(b, nir_ult(b, x_tl, mip_push(b, metadata_width_tl)),
-                  nir_ult(b, y_tl, mip_push(b, metadata_height_tl)));
-
-      nir_push_if(b, nir_iand(b, origin, in_grid));
+      /* Each 16x16 workgroup maps 1:1 to metadata tile (wg_x, wg_y), so no
+       * metadata grid bounds compare is needed and only subgroup 0 enters. */
+      nir_if *meta_if = nir_push_if(b, nir_ieq_imm(b, index, 0));
+      meta_if->control = nir_selection_control_dont_flatten;
       {
          nir_def *bits = mip_push(b, metadata_interleave_bits);
          nir_def *mask =
             nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), bits), -1);
          nir_def *major = nir_bcsel(
-            b, nir_ine_imm(b, mip_push(b, metadata_major_is_x), 0), x_tl, y_tl);
-         nir_def *index = nir_iadd(
+            b, nir_ine_imm(b, mip_push(b, metadata_major_is_x), 0), wg_x, wg_y);
+         nir_def *meta_idx = nir_iadd(
             b,
-            nir_ior(b, hk_nir_spread_bits(b, nir_iand(b, x_tl, mask)),
-                    nir_ishl_imm(b, hk_nir_spread_bits(b, nir_iand(b, y_tl, mask)), 1)),
+            nir_ior(b, hk_nir_spread_bits(b, nir_iand(b, wg_x, mask)),
+                    nir_ishl_imm(
+                       b, hk_nir_spread_bits(b, nir_iand(b, wg_y, mask)), 1)),
             nir_ishl(b, nir_iand(b, major, nir_inot(b, mask)), bits));
          nir_def *mode = mip_push(b, uncompressed_mode);
 
          nir_store_global(b, nir_vec2(b, mode, mode),
                           nir_iadd(b, mip_push(b, metadata),
-                                   nir_u2u64(b, nir_imul_imm(b, index, 8))),
+                                   nir_u2u64(b, nir_imul_imm(b, meta_idx, 8))),
                           .align_mul = 8);
       }
-      nir_pop_if(b, NULL);
+      nir_pop_if(b, meta_if);
    }
 
    return b->shader;
@@ -2553,6 +2621,8 @@ hk_g17p_compressed_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
       const uint32_t src_height = (uint32_t)region->srcOffsets[1].y;
       const bool odd = src_width == (uint64_t)width * 2 + 1 ||
                        src_height == (uint64_t)height * 2 + 1;
+      const bool exact_2x2 = !odd && src_width == (uint64_t)width * 2 &&
+                             src_height == (uint64_t)height * 2;
       const bool metadata =
          ail_is_level_logically_compressed(dst_layout, dst_level);
 
@@ -2571,10 +2641,22 @@ hk_g17p_compressed_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
          return;
       }
 
+      const uint32_t groups_x = DIV_ROUND_UP(width, HK_G17P_MIP_WG_SIZE);
+      const uint32_t groups_y = DIV_ROUND_UP(height, HK_G17P_MIP_WG_SIZE);
+      assert(!metadata ||
+             (groups_x == grid.width_tl && groups_y == grid.height_tl));
+      const bool aligned_16 = groups_x * HK_G17P_MIP_WG_SIZE == width &&
+                              groups_y * HK_G17P_MIP_WG_SIZE == height;
+      const bool tile_64x64 =
+         tiles.tile_width_log2 == 6 && tiles.tile_height_log2 == 6;
+
       const struct hk_g17p_mip_key key = {
          .key_type = HK_META_OBJECT_KEY_G17P_MIP,
          .odd = odd,
+         .exact_2x2 = exact_2x2,
          .metadata = metadata,
+         .aligned_16 = aligned_16,
+         .tile_64x64 = tile_64x64,
       };
       VkPipelineLayout layout;
       VkPipeline pipeline;
@@ -2602,8 +2684,6 @@ hk_g17p_compressed_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
                          (uint64_t)dst_layer *
                             dst_layout->compression_layer_stride_B +
                          dst_layout->level_offsets_compressed_B[dst_level];
-         push.metadata_width_tl = grid.width_tl;
-         push.metadata_height_tl = grid.height_tl;
          push.metadata_interleave_bits = grid.interleave_bits;
          push.metadata_major_is_x = grid.major_is_x;
          push.uncompressed_mode =
@@ -2671,11 +2751,7 @@ hk_g17p_compressed_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
       disp->CmdPushConstants(handle, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                              sizeof(push), &push);
 
-      /* Cover the metadata grid too, which may extend past the texels */
-      const uint32_t grid_w = MAX2(width, grid.width_tl * 16);
-      const uint32_t grid_h = MAX2(height, grid.height_tl * 16);
-      disp->CmdDispatch(handle, DIV_ROUND_UP(grid_w, TILE_WIDTH),
-                        DIV_ROUND_UP(grid_h, TILE_HEIGHT), 1);
+      disp->CmdDispatch(handle, groups_x, groups_y, 1);
    }
 }
 
