@@ -109,4 +109,44 @@ TEST(M5HalfWidenOnce, OtherFormsAndTargetsCompile)
    }
 }
 
+
+/* Subtracting a shifted zero- or sign-extended 16-bit integer from a 32-bit
+ * value folds into a 32-bit IADD with a 16-bit negated source and nonzero
+ * shift. After agx_lower_agx3_widening_int() widens the source to 32-bit,
+ * AGX3C must still lower the shifted negated operand so packing succeeds. */
+TEST(M5HalfWidenOnce, WidenedShiftedNegatedIaddPacksOnAGX3C)
+{
+   for (bool is_signed : {false, true}) {
+      for (unsigned shift : {1u, 2u}) {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "widened_shifted_sub");
+         nir_def *addr = agx_test_load_preamble(&b, 1, 64, 0);
+         nir_def *base = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+         nir_def *half = nir_load_global(&b, 1, 16, nir_iadd_imm(&b, addr, 16),
+                                         .align_mul = 2);
+         nir_def *wide = is_signed ? nir_i2i32(&b, half) : nir_u2u32(&b, half);
+         nir_def *res = nir_isub(&b, base, nir_ishl_imm(&b, wide, shift));
+         nir_store_global(&b, res, nir_iadd_imm(&b, addr, 32), .align_mul = 4);
+
+         b.shader->info.workgroup_size[0] = 32;
+         b.shader->info.workgroup_size[1] = 1;
+         b.shader->info.workgroup_size[2] = 1;
+
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.dev.chip = AGX_CHIP_G17S;
+         key.no_preamble = true;
+         key.reserved_preamble = 16;
+
+         agx_preprocess_nir_m5(b.shader);
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+            << "is_signed=" << is_signed << " shift=" << shift;
+         ASSERT_NE(part.binary, nullptr);
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
+   }
+}
+
 } // namespace

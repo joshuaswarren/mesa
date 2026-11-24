@@ -182,7 +182,7 @@ encode(enum agx_isa_encoding enc, const struct agx3_scs_desc *d,
 
    uint8_t bytes[AGX3_SCS_MAX_LENGTH] = {0};
    uint8_t len = 0;
-   if (!agx3_bind_compose(enc, is_load ? "ldscs" : "stscs", 0, base, nb,
+   if (!agx3_bind_compose(enc, is_load ? AGX3_MN_ldscs : AGX3_MN_stscs, 0, base, nb,
                           ov, n, bytes, &len) ||
        len > sizeof(bytes))
       return false;
@@ -289,51 +289,9 @@ agx3_scs_encode_epilogue(enum agx_isa_encoding enc,
       KV(68, d->component_mask), KV(70, d->address_selector),
       KV(71, (uint16_t)d->byte_offset), KV(76, d->c_load_marker ? 2 : 0),
    };
-   return agx3_bind_compose(enc, "ldscs", 0, base,
+   return agx3_bind_compose(enc, AGX3_MN_ldscs, 0, base,
                            sizeof(base) / sizeof(base[0]), fields,
                            sizeof(fields) / sizeof(fields[0]), out, length);
-}
-
-bool
-agx3_scs_decode_epilogue(enum agx_isa_encoding enc, const uint8_t *bytes,
-                          size_t length, struct agx3_scs_epilogue_desc *out)
-{
-   if (out == NULL)
-      return false;
-   memset(out, 0, sizeof(*out));
-   if (enc != AGX_ISA_ENCODING_AGX3C || bytes == NULL || length != 16)
-      return false;
-
-   const uint16_t w0 = word(bytes, 0), w1 = word(bytes, 1);
-   const uint16_t w2 = word(bytes, 2), w3 = word(bytes, 3);
-   const uint16_t w4 = word(bytes, 4), w5 = word(bytes, 5);
-   struct agx3_scs_epilogue_desc d = {
-      .index = ((w5 >> 4) & 3u) | (((w5 >> 7) & 0x1fu) << 2) |
-               (((w5 >> 13) & 1u) << 7) | ((w4 & 1u) << 8),
-      .base_register = ((w2 >> 12) & 0xfu) | (((w3 >> 14) & 1u) << 4) |
-                       (((w1 >> 10) & 1u) << 5) | (((w1 >> 15) & 1u) << 6) |
-                       (((w0 >> 8) & 3u) << 7),
-      .byte_offset = (int16_t)decode_c_offset(bytes, true),
-      .index_kill = (w4 >> 6) & 1u,
-      .base_kill = (w2 >> 7) & 1u,
-      .c_load_marker = ((w2 >> 5) & 3u) == 0,
-   };
-
-   /* Only accept a descriptor whose complete re-encoding matches. This also
-    * rejects ordinary loads, unknown controls and extra operand bits. */
-   for (unsigned mask = 1; mask <= 15; ++mask) {
-      for (unsigned selector = 2; selector <= 4; selector += 2) {
-         d.component_mask = mask;
-         d.address_selector = selector;
-         uint8_t canonical[AGX3_SCS_MAX_LENGTH], canonical_length;
-         if (agx3_scs_encode_epilogue(enc, &d, canonical, &canonical_length) &&
-             canonical_length == length && !memcmp(canonical, bytes, length)) {
-            *out = d;
-            return true;
-         }
-      }
-   }
-   return false;
 }
 
 /* G17P's register file is 192 halves. */
@@ -376,7 +334,7 @@ agx3_scs_encode_touch(enum agx_isa_encoding enc,
    };
    uint8_t bytes[AGX3_SCS_MAX_LENGTH] = {0};
    uint8_t len = 0;
-   if (!agx3_bind_compose(enc, "ldscs", 0, base,
+   if (!agx3_bind_compose(enc, AGX3_MN_ldscs, 0, base,
                           sizeof(base) / sizeof(base[0]), fields,
                           sizeof(fields) / sizeof(fields[0]), bytes, &len) ||
        len > sizeof(bytes))

@@ -168,12 +168,12 @@ uniform_float_encode(enum agx_isa_encoding encoding,
    /* Apple G17P/G16G uniform_repeat: 09010e0d210e02c2. Domain 3 selects
     * uniform f36/f53 instead of register f35/f52. ADD and MUL use the same
     * first two operand records. */
-   const char *mnemonic = half ? (op == AGX3_UNIFORM_FADD   ? "f16add"
-                                  : op == AGX3_UNIFORM_FMUL ? "f16mul"
-                                                            : "f16fma")
-                               : (op == AGX3_UNIFORM_FADD   ? "f32add"
-                                  : op == AGX3_UNIFORM_FMUL ? "f32mul"
-                                                            : "f32fma");
+   enum agx3_mnemonic mnemonic = half ? (op == AGX3_UNIFORM_FADD   ? AGX3_MN_f16add
+                                  : op == AGX3_UNIFORM_FMUL ? AGX3_MN_f16mul
+                                                            : AGX3_MN_f16fma)
+                               : (op == AGX3_UNIFORM_FADD   ? AGX3_MN_f32add
+                                  : op == AGX3_UNIFORM_FMUL ? AGX3_MN_f32mul
+                                                            : AGX3_MN_f32fma);
    uint8_t best[16], best_length = 0;
    for (unsigned swap = 0; swap < 2; ++swap) {
       /* M5 places an FMA's uniform multiplicand in the second operand
@@ -342,7 +342,7 @@ agx3_uniform_minmax_encode(enum agx_isa_encoding encoding, uint16_t dest,
       fields[n++] = (struct agx3_field_kv){102 + i, (wait_mask >> i) & 1};
    for (unsigned ep = half ? 5 : 7; ep < 28; ++ep) {
       uint8_t candidate[16], size;
-      if (agx3_bind_compose(encoding, "fsel", ep, NULL, 0, fields, n, candidate,
+      if (agx3_bind_compose(encoding, AGX3_MN_fsel, ep, NULL, 0, fields, n, candidate,
                             &size)) {
          memcpy(output, candidate, size);
          *length = size;

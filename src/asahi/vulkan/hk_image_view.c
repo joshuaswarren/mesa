@@ -236,17 +236,17 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
    unsigned layer = view->vk.base_array_layer;
 
    enum pipe_format p_format = format_for_plane(view, view_plane);
-   const unsigned packed_ycbcr = agx_native_graphics(&dev->dev)
+   const unsigned packed_ycbcr = agx_chip_native_agx3(dev->dev.chip)
       ? hk_packed_ycbcr_bits(view->vk.format) : 0;
    if (packed_ycbcr)
       p_format = packed_ycbcr == 8 ? PIPE_FORMAT_R8G8B8A8_UNORM :
                                     PIPE_FORMAT_R16G16B16A16_UNORM;
    const bool padded_rgb =
-      (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
+      agx_chip_native_or_m5(dev->dev.chip) &&
                           hk_padded_image_format(p_format) != p_format;
    if (padded_rgb)
       p_format = hk_padded_image_format(p_format);
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       enum pipe_format integer = hk_scaled_texture_format(p_format);
       enum pipe_format normalized = hk_uscaled_normalized_format(p_format);
       if (usage == HK_DESC_USAGE_SAMPLED_FILTERABLE &&
@@ -341,7 +341,7 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
           * false) and native meta copies view one layer
           * (copied_layers_src_view).
           */
-         if (unlikely(layers > 1) && agx_native_graphics(&dev->dev))
+         if (unlikely(layers > 1) && agx_chip_native_agx3(dev->dev.chip))
             mesa_loge_once("hk: uncompressed view of %u layers of a "
                            "block-compressed image addresses only the first",
                            layers);
@@ -350,7 +350,7 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
          cfg.width = DIV_ROUND_UP(u_minify(layout->width_px, level), denom.x);
          cfg.height = DIV_ROUND_UP(u_minify(layout->height_px, level), denom.y);
          cfg.first_level = 0;
-         cfg.last_level = agx_native_graphics(&dev->dev) ? 0 : 1;
+         cfg.last_level = agx_chip_native_agx3(dev->dev.chip) ? 0 : 1;
       } else {
          cfg.address = base_addr + ail_get_layer_offset_B(layout, layer);
          cfg.width = layout->width_px;
@@ -402,12 +402,18 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
       cfg.unk_mipmapped = layout->levels > 1;
       cfg.srgb_2_channel = cfg.srgb && util_format_colormask(desc) == 0x3;
 
-      if (layout->compressed) {
+      /* On native HAL200 (G16G/G17P), spilled compressed colour attachments are
+       * decompressed in place before the render pass and written through an
+       * uncompressed eMRT PBE. Keeping emrt_texture uncompressed avoids
+       * compressed-read vs uncompressed-write texture-cache hazards during
+       * in-pass blending. */
+      const bool compressed_tex =
+         layout->compressed &&
+         !(agx_chip_native_hal200(dev->dev.chip) &&
+           usage == HK_DESC_USAGE_EMRT);
+      if (compressed_tex) {
          cfg.compressed = true;
          cfg.extended = true;
-      }
-
-      if (layout->compressed) {
          cfg.acceleration_buffer = base_addr + layout->metadata_offset_B +
                                    (layer * layout->compression_layer_stride_B);
       }
@@ -440,8 +446,21 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
 
    }
 
-   return hk_pack_native_texture(
-      agx_chip_descriptor_generation(dev->dev.chip), out, &cfg);
+   if (!hk_pack_native_texture(agx_chip_descriptor_generation(dev->dev.chip), out, &cfg))
+      return false;
+
+   /* Only sampled and storage descriptors answer an application's size
+    * query. Input attachments are fetched as arrays, and the attachment,
+    * eMRT and background descriptors are read by driver code that does not
+    * take the level-zero lowering (AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT). */
+   if (agx_chip_texture_descriptor_spare_word(dev->dev.chip) &&
+       (sampled_like || usage == HK_DESC_USAGE_STORAGE)) {
+      hk_native_texture_set_level_zero_extent(
+         out, u_minify(cfg.width, cfg.first_level),
+         u_minify(cfg.height, cfg.first_level));
+   }
+
+   return true;
 }
 
 static bool
@@ -468,7 +487,7 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
    unsigned layer = view->vk.base_array_layer;
 
    enum pipe_format p_format = format_for_plane(view, view_plane);
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
+   if (agx_chip_native_or_m5(dev->dev.chip)) {
       p_format = hk_padded_image_format(p_format);
       enum pipe_format integer = hk_scaled_texture_format(p_format);
       if (integer != PIPE_FORMAT_NONE)
@@ -484,8 +503,7 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
    if (eot)
       p_format = util_format_linear(p_format);
 
-   if (eot && (agx_native_graphics(&dev->dev) ||
-                agx_chip_g17_m5(dev->dev.chip)))
+   if (eot && agx_chip_native_or_m5(dev->dev.chip))
       p_format = hk_eot_pbe_format(&dev->dev, p_format);
 
    const struct util_format_description *desc =
@@ -675,7 +693,11 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
             cfg.stride = (layout->stride_el[0] / 16) * 16 - 4;
             assert(cfg.levels == 1);
          } else {
-            cfg.page_aligned_layers = layout->page_aligned_layers;
+            /* The 2D EOT view starts at this layer's surface and metadata.
+             * The array stride is not part of a compressed 2D PBE. */
+            cfg.page_aligned_layers = layout->page_aligned_layers &&
+               !(agx_chip_g17_m5(dev->dev.chip) && layout->compressed &&
+                 layers == 1 && usage == HK_DESC_USAGE_BG_EOT);
          }
 
          if (image->vk.samples > 1)
@@ -881,8 +903,7 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
       if (!textures_valid)
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-      if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
-          dev->dev.chip == AGX_CHIP_G18G) {
+      if (agx_chip_agx3_path(dev->dev.chip)) {
          VkResult result = hk_image_view_heap_add(
             dev, view, replay, p, HK_VIEW_HEAP_SAMPLED, &view->planes[p].sampled,
             &view->planes[p].sampled_heap_index);
@@ -936,8 +957,7 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
          view->planes[p].emrt_pbe_valid = pack_pbe(
             dev, view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_pbe,
             &view->planes[p].emrt_atomic_sw, NULL);
-         if ((agx_native_graphics(&dev->dev) ||
-              agx_chip_g17_m5(dev->dev.chip)) &&
+         if (agx_chip_native_or_m5(dev->dev.chip) &&
              (view->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
              view->planes[p].emrt_pbe_valid) {
             const struct ail_layout *layout =
@@ -972,8 +992,7 @@ hk_DestroyImageView(VkDevice _device, VkImageView imageView,
    if (!view)
       return;
 
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
-       dev->dev.chip == AGX_CHIP_G18G) {
+   if (agx_chip_agx3_path(dev->dev.chip)) {
       for (unsigned p = 0; p < view->plane_count; ++p) {
          if (view->planes[p].emrt_read_heap_index)
             hk_image_view_heap_remove(dev, view,

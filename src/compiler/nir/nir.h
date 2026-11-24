@@ -1431,8 +1431,21 @@ nir_op_vec(unsigned num_components);
  *
  * Returns false for nir_op_mov.  See nir_op_vec() for more details.
  */
-bool
-nir_op_is_vec(nir_op op);
+static inline bool
+nir_op_is_vec(nir_op op)
+{
+   switch (op) {
+   case nir_op_vec2:
+   case nir_op_vec3:
+   case nir_op_vec4:
+   case nir_op_vec5:
+   case nir_op_vec8:
+   case nir_op_vec16:
+      return true;
+   default:
+      return false;
+   }
+}
 
 static inline bool
 nir_op_is_vec_or_mov(nir_op op)
@@ -1776,8 +1789,12 @@ nir_alu_instr_src_read_mask(const nir_alu_instr *instr, unsigned src);
 /**
  * Get the number of channels used for a source
  */
-unsigned
-nir_ssa_alu_instr_src_components(const nir_alu_instr *instr, unsigned src);
+static inline unsigned
+nir_ssa_alu_instr_src_components(const nir_alu_instr *instr, unsigned src)
+{
+   const unsigned input_size = nir_op_infos[instr->op].input_sizes[src];
+   return input_size ? input_size : instr->def.num_components;
+}
 
 /* is this source channel used? */
 static inline bool

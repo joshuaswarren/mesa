@@ -1,0 +1,561 @@
+/*
+ * Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <gtest/gtest.h>
+#include "util/lut.h"
+#include "agx_test.h"
+
+/* Register cache hints (agx_opt_register_cache). On AGX3 a last-use hint
+ * releases the register for the whole SIMD-group, so a register that any
+ * thread reads again never gets one. */
+
+namespace {
+
+struct Shader {
+   void *mem;
+   agx_builder *b;
+   agx_shader_key key;
+
+   Shader(enum agx_isa_encoding encoding = AGX_ISA_ENCODING_AGX3B)
+   {
+      mem = ralloc_context(NULL);
+      b = agx_test_builder(mem);
+      key = {};
+      key.dev.encoding = encoding;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->any_cf = true;
+   }
+
+   ~Shader() { ralloc_free(mem); }
+};
+
+agx_index
+reg(unsigned r)
+{
+   return agx_register(r, AGX_SIZE_32);
+}
+
+/* The first source of the first instruction in `block` that reads `r`. */
+agx_index *
+read_of(agx_block *block, unsigned r)
+{
+   agx_foreach_instr_in_block(block, I) {
+      agx_foreach_reg_src(I, s) {
+         if (I->src[s].value == r)
+            return &I->src[s];
+      }
+   }
+   return NULL;
+}
+
+} // namespace
+
+/* A uniform loop whose `if (c) break;` agx_opt_break_if fused into the block
+ * after the if: the edge to the exit stays on the emptied then block. The
+ * break's compare source is read again after the loop, so it is not a last
+ * use, in a uniform loop and in a divergent one. */
+TEST(RegisterCache, FusedBreakKeepsTheExitsValue)
+{
+   for (int divergent = 0; divergent < 2; ++divergent) {
+      Shader s;
+      agx_builder *b = s.b;
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *header = agx_test_block(b->shader);
+      agx_block *then_ = agx_test_block(b->shader);
+      agx_block *else_ = agx_test_block(b->shader);
+      agx_block *after = agx_test_block(b->shader);
+      agx_block *exit = agx_test_block(b->shader);
+      agx_block_add_successor(entry, header);
+      agx_block_add_successor(header, then_);
+      agx_block_add_successor(header, else_);
+      agx_block_add_successor(then_, exit);
+      agx_block_add_successor(else_, after);
+      agx_block_add_successor(after, header);
+      header->loop_header = true;
+      /* A divergent loop takes AGX3's physical liveness. */
+      header->cf_divergent = then_->cf_divergent = else_->cf_divergent =
+         after->cf_divergent = divergent;
+
+      b->cursor = agx_after_block(entry);
+      agx_mov_imm_to(b, reg(2), 0);
+      b->cursor = agx_after_block(header);
+      agx_iadd_to(b, reg(0), reg(2), reg(2), 0);
+      b->cursor = agx_after_block(after);
+      agx_instr *brk = agx_break_if_icmp(b, reg(0), agx_immediate(9), 1, false,
+                                         AGX_ICOND_UEQ, exit);
+      agx_iadd_to(b, reg(2), reg(2), agx_immediate(1), 0);
+      b->cursor = agx_after_block(exit);
+      agx_unit_test(b, reg(0));
+
+      agx_opt_register_cache(b->shader);
+      EXPECT_FALSE(brk->src[0].discard) << "divergent " << divergent;
+   }
+}
+
+/* Last-use hints in divergent control flow, on AGX3. A last use releases the
+ * register for the whole SIMD-group, so a register that a masked-off thread
+ * still needs never gets one. */
+
+/* entry: v -> r0. A divergent if: the then side reuses r0 for its own
+ * temporaries, the else side reads v. The then side's reads of r0 must keep
+ * it (the else threads, masked off, still need v); the else side's read is
+ * the last one for every thread. */
+TEST(DivergentLastUse, ThenSideKeepsTheElseSidesRegister)
+{
+   Shader s;
+   agx_builder *b = s.b;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *then_ = agx_test_block(b->shader);
+   agx_block *else_ = agx_test_block(b->shader);
+   agx_block *merge = agx_test_block(b->shader);
+   agx_block_add_successor(entry, then_);
+   agx_block_add_successor(entry, else_);
+   agx_block_add_successor(then_, merge);
+   agx_block_add_successor(else_, merge);
+   then_->cf_divergent = else_->cf_divergent = true;
+
+   b->cursor = agx_after_block(entry);
+   agx_mov_imm_to(b, reg(0), 7);
+
+   b->cursor = agx_after_block(then_);
+   agx_mov_imm_to(b, reg(0), 3);                 /* u, then only */
+   agx_iadd_to(b, reg(2), reg(0), reg(0), 0);    /* last read of u */
+   agx_mov_imm_to(b, reg(0), 5);                 /* t, then only */
+   agx_iadd_to(b, reg(4), reg(0), reg(2), 0);    /* last read of t, r2 */
+
+   b->cursor = agx_after_block(else_);
+   agx_iadd_to(b, reg(4), reg(0), agx_immediate(1), 0); /* reads v */
+
+   b->cursor = agx_after_block(merge);
+   agx_unit_test(b, reg(4));
+
+   agx_opt_register_cache(b->shader);
+
+   /* u's last read: r0 still holds v for the else threads. */
+   EXPECT_FALSE(read_of(then_, 0)->discard);
+   /* r2 is read nowhere else: its last use in a divergent block is marked. */
+   EXPECT_TRUE(read_of(then_, 2)->discard);
+   /* v's read on the else side is the last read of r0 for every thread. */
+   EXPECT_TRUE(read_of(else_, 0)->discard);
+}
+
+/* A loop whose break is divergent: threads that broke out wait at the exit
+ * with their value of r6 while the others keep iterating and reuse r6 for a
+ * temporary. The loop body must not release r6. */
+TEST(DivergentLastUse, LoopKeepsTheExitedThreadsRegister)
+{
+   Shader s;
+   agx_builder *b = s.b;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *body = agx_test_block(b->shader);
+   agx_block *brk = agx_test_block(b->shader);
+   agx_block *latch = agx_test_block(b->shader);
+   agx_block *exit = agx_test_block(b->shader);
+   agx_block_add_successor(entry, body);
+   agx_block_add_successor(body, brk);
+   agx_block_add_successor(body, latch);
+   agx_block_add_successor(brk, exit);
+   agx_block_add_successor(latch, body);
+   body->loop_header = true;
+   body->cf_divergent = brk->cf_divergent = latch->cf_divergent = true;
+
+   b->cursor = agx_after_block(entry);
+   agx_mov_imm_to(b, reg(8), 1);
+
+   b->cursor = agx_after_block(brk);
+   agx_iadd_to(b, reg(6), reg(8), agx_immediate(2), 0); /* y, needed at exit */
+
+   b->cursor = agx_after_block(latch);
+   agx_mov_imm_to(b, reg(6), 9);                        /* temporary in r6 */
+   agx_iadd_to(b, reg(8), reg(6), reg(8), 0);           /* its last read */
+
+   b->cursor = agx_after_block(exit);
+   agx_unit_test(b, reg(6));
+
+   agx_opt_register_cache(b->shader);
+
+   /* The temporary's read must not release r6: exited threads hold y in it. */
+   EXPECT_FALSE(read_of(latch, 6)->discard);
+}
+
+/* Nested divergent loops:
+ * - Threads that broke out of the outer loop wait at outer_exit with r6 while
+ *   the inner loop runs again; outer_brk is after the inner loop, so r6 is
+ *   kept in inner_latch only via the loop-propagation step.
+ * - Threads that broke out of the inner loop wait at inner_exit with r10 while
+ *   inner_latch runs again, so inner_latch must keep r10; after inner_exit,
+ *   r10 is dead (and re-initialized at outer_hdr), so inner_exit and a later
+ *   reuse in outer_latch must still get their last-use hints. */
+TEST(DivergentLastUse, NestedLoopKeepsOuterExitAndReleasesInnerExit)
+{
+   Shader s;
+   agx_builder *b = s.b;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *outer_hdr = agx_test_block(b->shader);
+   agx_block *inner_hdr = agx_test_block(b->shader);
+   agx_block *inner_brk = agx_test_block(b->shader);
+   agx_block *inner_latch = agx_test_block(b->shader);
+   agx_block *inner_exit = agx_test_block(b->shader);
+   agx_block *outer_brk = agx_test_block(b->shader);
+   agx_block *outer_latch = agx_test_block(b->shader);
+   agx_block *outer_exit = agx_test_block(b->shader);
+
+   agx_block_add_successor(entry, outer_hdr);
+   agx_block_add_successor(outer_hdr, inner_hdr);
+   agx_block_add_successor(inner_hdr, inner_brk);
+   agx_block_add_successor(inner_hdr, inner_latch);
+   agx_block_add_successor(inner_brk, inner_exit);
+   agx_block_add_successor(inner_latch, inner_hdr);
+   agx_block_add_successor(inner_exit, outer_brk);
+   agx_block_add_successor(inner_exit, outer_latch);
+   agx_block_add_successor(outer_brk, outer_exit);
+   agx_block_add_successor(outer_latch, outer_hdr);
+
+   outer_hdr->loop_header = true;
+   inner_hdr->loop_header = true;
+   outer_hdr->cf_divergent = inner_hdr->cf_divergent =
+      inner_brk->cf_divergent = inner_latch->cf_divergent =
+         inner_exit->cf_divergent = outer_brk->cf_divergent =
+            outer_latch->cf_divergent = true;
+
+   b->cursor = agx_after_block(entry);
+   agx_mov_imm_to(b, reg(8), 1);
+
+   b->cursor = agx_after_block(outer_hdr);
+   agx_mov_imm_to(b, reg(10), 0);
+
+   b->cursor = agx_after_block(inner_hdr);
+   agx_mov_imm_to(b, reg(10), 7);                         /* temporary in r10 */
+   agx_iadd_to(b, reg(8), reg(10), reg(8), 0);            /* must keep r10 via inner loop step */
+
+   b->cursor = agx_after_block(inner_brk);
+   agx_iadd_to(b, reg(10), reg(8), agx_immediate(3), 0); /* needed at inner_exit */
+
+   b->cursor = agx_after_block(inner_latch);
+   agx_mov_imm_to(b, reg(6), 9);                          /* temporary in r6 */
+   agx_iadd_to(b, reg(8), reg(6), reg(8), 0);             /* must keep r6 */
+   agx_mov_imm_to(b, reg(10), 11);                        /* temporary in r10 */
+   agx_iadd_to(b, reg(8), reg(10), reg(8), 0);            /* must keep r10 */
+
+   b->cursor = agx_after_block(inner_exit);
+   agx_iadd_to(b, reg(8), reg(10), reg(8), 0);            /* last read of r10 */
+
+   b->cursor = agx_after_block(outer_brk);
+   agx_iadd_to(b, reg(6), reg(8), agx_immediate(2), 0);   /* needed at outer_exit */
+
+   b->cursor = agx_after_block(outer_latch);
+   agx_mov_imm_to(b, reg(10), 13);                        /* post-exit reuse of r10 */
+   agx_iadd_to(b, reg(8), reg(10), reg(8), 0);            /* last read of r10 */
+
+   b->cursor = agx_after_block(outer_exit);
+   agx_unit_test(b, reg(6));
+
+   agx_opt_register_cache(b->shader);
+
+   /* Outer-exited threads hold r6 while the inner loop runs again. */
+   EXPECT_FALSE(read_of(inner_latch, 6)->discard);
+   /* Inner-exited threads hold r10 while the inner loop runs again
+    * (inner_hdr gets inner_exit solely from the inner loop propagation step). */
+   EXPECT_FALSE(read_of(inner_hdr, 10)->discard);
+   EXPECT_FALSE(read_of(inner_latch, 10)->discard);
+   /* r10 is live only into inner_exit, so it is released at and after inner_exit. */
+   EXPECT_TRUE(read_of(inner_exit, 10)->discard);
+   EXPECT_TRUE(read_of(outer_latch, 10)->discard);
+   /* outer_exit is the final read of r6 for every thread. */
+   EXPECT_TRUE(read_of(outer_exit, 6)->discard);
+}
+
+/* A register reused on one side of a divergent if, which no masked-off
+ * thread needs (the else side and the code after never read it): each value
+ * it holds gets its last use, as in uniform control flow. */
+TEST(DivergentLastUse, ReuseNoMaskedThreadNeedsIsMarked)
+{
+   Shader s;
+   agx_builder *b = s.b;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *then_ = agx_test_block(b->shader);
+   agx_block *else_ = agx_test_block(b->shader);
+   agx_block *merge = agx_test_block(b->shader);
+   agx_block_add_successor(entry, then_);
+   agx_block_add_successor(entry, else_);
+   agx_block_add_successor(then_, merge);
+   agx_block_add_successor(else_, merge);
+   then_->cf_divergent = else_->cf_divergent = true;
+
+   b->cursor = agx_after_block(then_);
+   agx_mov_imm_to(b, reg(0), 3);                     /* u */
+   agx_instr *u_read = agx_iadd_to(b, reg(2), reg(0), agx_immediate(1), 0);
+   agx_mov_imm_to(b, reg(0), 5);                     /* t, same register */
+   agx_iadd_to(b, reg(4), reg(0), reg(2), 0);
+
+   b->cursor = agx_after_block(else_);
+   agx_mov_imm_to(b, reg(4), 1);
+
+   b->cursor = agx_after_block(merge);
+   agx_unit_test(b, reg(4));
+
+   agx_opt_register_cache(b->shader);
+
+   EXPECT_TRUE(u_read->src[0].discard);
+}
+
+/* The rule follows the instruction set: AGX3B and AGX3C (Dynamic Caching) mark
+ * the last use of ReuseNoMaskedThreadNeedsIsMarked, while AGX2 (register-cache
+ * discard only) and AGX3D (static register count, unverified) keep no hints in
+ * divergent control flow. */
+TEST(DivergentLastUse, FollowsTheInstructionSet)
+{
+   const struct {
+      enum agx_isa_encoding encoding;
+      bool emit_agx3d;
+      bool marked;
+   } cases[] = {
+      {AGX_ISA_ENCODING_AGX3B, false, true},
+      {AGX_ISA_ENCODING_AGX3C, false, true},
+      {AGX_ISA_ENCODING_AGX3C, true, false},
+      {AGX_ISA_ENCODING_AGX2, false, false},
+   };
+
+   for (const auto &c : cases) {
+      Shader s(c.encoding);
+      s.key.dev.emit_agx3d = c.emit_agx3d;
+      agx_builder *b = s.b;
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *then_ = agx_test_block(b->shader);
+      agx_block *else_ = agx_test_block(b->shader);
+      agx_block *merge = agx_test_block(b->shader);
+      agx_block_add_successor(entry, then_);
+      agx_block_add_successor(entry, else_);
+      agx_block_add_successor(then_, merge);
+      agx_block_add_successor(else_, merge);
+      then_->cf_divergent = else_->cf_divergent = true;
+
+      b->cursor = agx_after_block(then_);
+      agx_mov_imm_to(b, reg(0), 3);
+      agx_instr *u_read = agx_iadd_to(b, reg(2), reg(0), agx_immediate(1), 0);
+      agx_mov_imm_to(b, reg(0), 5);
+      agx_iadd_to(b, reg(4), reg(0), reg(2), 0);
+
+      b->cursor = agx_after_block(else_);
+      agx_mov_imm_to(b, reg(4), 1);
+
+      b->cursor = agx_after_block(merge);
+      agx_unit_test(b, reg(4));
+
+      agx_opt_register_cache(b->shader);
+
+      EXPECT_EQ(u_read->src[0].discard, c.marked)
+         << "encoding " << c.encoding << " emit_agx3d " << c.emit_agx3d;
+   }
+}
+
+/* subgroupShuffle in divergent control flow: each register lane index goes
+ * through the scratch register of agx_lower_divergent_shuffle, which must
+ * stay zero in every masked-off thread (the hardware adds the index up over
+ * the whole quad). No read of it may release it. */
+TEST(DivergentLastUse, ShuffleScratchKeepsMaskedLanesZero)
+{
+   Shader s;
+   agx_builder *b = s.b;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *then_ = agx_test_block(b->shader);
+   agx_block *else_ = agx_test_block(b->shader);
+   agx_block *merge = agx_test_block(b->shader);
+   agx_block_add_successor(entry, then_);
+   agx_block_add_successor(entry, else_);
+   agx_block_add_successor(then_, merge);
+   agx_block_add_successor(else_, merge);
+   then_->cf_divergent = else_->cf_divergent = true;
+   b->shader->any_quad_divergent_shuffle = true;
+
+   const agx_index scratch = reg(2);
+
+   b->cursor = agx_after_block(entry);
+   agx_mov_imm_to(b, scratch, 0);
+   agx_mov_imm_to(b, reg(4), 1);
+   agx_mov_imm_to(b, reg(6), 0);
+   agx_mov_imm_to(b, reg(8), 1);
+
+   b->cursor = agx_after_block(then_);
+   agx_mov_to(b, scratch, reg(6));
+   agx_instr *s0 = agx_shuffle_to(b, reg(10), reg(4), scratch);
+   agx_mov_to(b, scratch, reg(8));
+   agx_instr *s1 = agx_shuffle_to(b, reg(12), reg(4), scratch);
+   agx_mov_imm_to(b, scratch, 0);
+   agx_iadd_to(b, reg(14), reg(10), reg(12), 0);
+
+   b->cursor = agx_after_block(else_);
+   agx_mov_imm_to(b, reg(14), 0);
+
+   b->cursor = agx_after_block(merge);
+   agx_unit_test(b, reg(14));
+
+   agx_opt_register_cache(b->shader);
+
+   EXPECT_FALSE(s0->src[1].discard);
+   EXPECT_FALSE(s1->src[1].discard);
+}
+
+/* Overwriting only the low half of a multi-half source must not mark the
+ * source as a last use while its upper half remains live. On AGX3B and AGX3C
+ * (Dynamic Caching), a discard on r0 releases both r0l and r0h; on AGX2 it is
+ * a register-cache hint that likewise applies to the whole source register. */
+TEST(RegisterCache, PartialOverwriteKeepsLiveUpperHalf)
+{
+   for (enum agx_isa_encoding enc : {AGX_ISA_ENCODING_AGX3C,
+                                     AGX_ISA_ENCODING_AGX3B,
+                                     AGX_ISA_ENCODING_AGX2}) {
+      SCOPED_TRACE(enc);
+      Shader s(enc);
+      agx_builder *b = s.b;
+      agx_block *entry = agx_start_block(b->shader);
+      b->cursor = agx_after_block(entry);
+
+      const agx_index r0 = agx_register(0, AGX_SIZE_32);
+      const agx_index r0l = agx_register(0, AGX_SIZE_16);
+      const agx_index r0h = agx_register(1, AGX_SIZE_16);
+      const agx_index r2 = agx_register(4, AGX_SIZE_32);
+
+      agx_mov_imm_to(b, r0, 0x01000000);
+      agx_mov_imm_to(b, r2, 1);
+      agx_instr *partial = agx_icmpsel_to(b, r0l, r2, r0, agx_immediate(1),
+                                          agx_immediate(0), AGX_ICOND_UEQ);
+      agx_unit_test(b, r0l);
+      agx_unit_test(b, r0h);
+
+      agx_opt_register_cache(b->shader);
+
+      EXPECT_FALSE(partial->src[1].discard);
+   }
+}
+
+TEST(RegisterCache, Agx3bRemovesRedundantPhysicalCopiesAllStages)
+{
+   for (mesa_shader_stage stage :
+        {MESA_SHADER_COMPUTE, MESA_SHADER_VERTEX, MESA_SHADER_FRAGMENT}) {
+      SCOPED_TRACE(stage);
+      Shader s(AGX_ISA_ENCODING_AGX3B);
+      agx_builder *b = s.b;
+      b->shader->stage = stage;
+      agx_block *entry = agx_start_block(b->shader);
+      b->cursor = agx_after_block(entry);
+
+      agx_mov_imm_to(b, reg(0), 7);
+      agx_bitop_to(b, reg(4), reg(0), agx_immediate(0), UTIL_LUT2(a));
+      agx_instr *use1 = agx_iadd_to(b, reg(8), reg(4), reg(0), 0);
+      agx_bitop_to(b, reg(4), reg(0), agx_immediate(0), UTIL_LUT2(a));
+      agx_instr *use2 = agx_iadd_to(b, reg(10), reg(4), reg(8), 0);
+      agx_mov_imm_to(b, reg(6), 0x1234);
+      agx_instr *imm_use1 = agx_iadd_to(b, reg(12), reg(6), reg(10), 0);
+      agx_mov_imm_to(b, reg(6), 0x1234);
+      agx_instr *imm_use2 = agx_iadd_to(b, reg(14), reg(6), reg(12), 0);
+      agx_unit_test(b, reg(14));
+
+      agx_opt_register_cache(b->shader);
+
+      unsigned movs = 0, mov_imms = 0;
+      agx_foreach_instr_in_block(entry, I) {
+         if (I->op == AGX_OPCODE_BITOP && I->truth_table == UTIL_LUT2(a))
+            movs++;
+         if (I->op == AGX_OPCODE_MOV_IMM && I->imm == 0x1234)
+            mov_imms++;
+      }
+      EXPECT_EQ(movs, 1u);
+      EXPECT_EQ(mov_imms, 1u);
+      EXPECT_FALSE(use1->src[0].discard);
+      EXPECT_TRUE(use2->src[0].discard);
+      EXPECT_FALSE(imm_use1->src[0].discard);
+      EXPECT_TRUE(imm_use2->src[0].discard);
+   }
+
+   /* Preambles are skipped on AGX3B. */
+   Shader preamble(AGX_ISA_ENCODING_AGX3B);
+   preamble.b->shader->is_preamble = true;
+   agx_block *pb = agx_start_block(preamble.b->shader);
+   preamble.b->cursor = agx_after_block(pb);
+   agx_mov_imm_to(preamble.b, reg(0), 9);
+   agx_bitop_to(preamble.b, reg(4), reg(0), agx_immediate(0), UTIL_LUT2(a));
+   agx_iadd_to(preamble.b, reg(8), reg(4), reg(0), 0);
+   agx_bitop_to(preamble.b, reg(4), reg(0), agx_immediate(0), UTIL_LUT2(a));
+   agx_unit_test(preamble.b, reg(4));
+   agx_opt_register_cache(preamble.b->shader);
+   unsigned pmoves = 0;
+   agx_foreach_instr_in_block(pb, I) {
+      if (I->op == AGX_OPCODE_BITOP && I->truth_table == UTIL_LUT2(a))
+         pmoves++;
+   }
+   EXPECT_EQ(pmoves, 2u);
+}
+
+TEST(RegisterCache, Agx3cComputeKeepsRedundantPhysicalCopies)
+{
+   Shader s(AGX_ISA_ENCODING_AGX3C);
+   agx_builder *b = s.b;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_block *entry = agx_start_block(b->shader);
+   b->cursor = agx_after_block(entry);
+
+   agx_mov_imm_to(b, reg(0), 7);
+   agx_bitop_to(b, reg(4), reg(0), agx_immediate(0), UTIL_LUT2(a));
+   agx_iadd_to(b, reg(8), reg(4), reg(0), 0);
+   agx_bitop_to(b, reg(4), reg(0), agx_immediate(0), UTIL_LUT2(a));
+   agx_unit_test(b, reg(4));
+
+   agx_opt_register_cache(b->shader);
+
+   unsigned movs = 0;
+   agx_foreach_instr_in_block(entry, I) {
+      if (I->op == AGX_OPCODE_BITOP && I->truth_table == UTIL_LUT2(a))
+         movs++;
+   }
+   EXPECT_EQ(movs, 2u);
+}
+
+TEST(RegisterCache, Agx3bCubeSampleInvalidatesPhysicalCopyCache)
+{
+   /* AGX3B cube samples write undeclared physical CEM scratch GPRs during
+    * packing (src[6]/+4/+6 and fixed r0/r7/r2 for immediate-descriptor cubes).
+    * An identical MOV_IMM or register copy after a cube sample must NOT be
+    * eliminated by agx3_remove_redundant_physical_copies(). */
+   for (mesa_shader_stage stage : {MESA_SHADER_FRAGMENT, MESA_SHADER_COMPUTE}) {
+      SCOPED_TRACE(stage);
+      Shader s(AGX_ISA_ENCODING_AGX3B);
+      agx_builder *b = s.b;
+      b->shader->stage = stage;
+      agx_block *entry = agx_start_block(b->shader);
+      b->cursor = agx_after_block(entry);
+
+      agx_mov_imm_to(b, reg(0), 0x1234);
+      agx_bitop_to(b, reg(6), reg(4), agx_immediate(0), UTIL_LUT2(a));
+      agx_iadd_to(b, reg(8), reg(0), reg(6), 0);
+
+      agx_texture_sample_to(b, agx_register(12, AGX_SIZE_16),
+                            agx_register(16, AGX_SIZE_32), agx_immediate(0),
+                            agx_immediate(0), agx_immediate(0),
+                            agx_immediate(0), agx_null(), AGX_DIM_CUBE,
+                            AGX_LOD_MODE_AUTO_LOD, 0xf, false, false, false,
+                            AGX_GATHER_NONE, false);
+
+      /* Identical copies to r0 (immediate-descriptor CEM target) and r6 after
+       * the cube sample must both survive. */
+      agx_mov_imm_to(b, reg(0), 0x1234);
+      agx_bitop_to(b, reg(6), reg(4), agx_immediate(0), UTIL_LUT2(a));
+      agx_iadd_to(b, reg(10), reg(0), reg(6), 0);
+      agx_unit_test(b, reg(10));
+
+      agx_opt_register_cache(b->shader);
+
+      unsigned mov_imms = 0, movs = 0;
+      agx_foreach_instr_in_block(entry, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM && I->imm == 0x1234)
+            mov_imms++;
+         if (I->op == AGX_OPCODE_BITOP && I->truth_table == UTIL_LUT2(a))
+            movs++;
+      }
+      EXPECT_EQ(mov_imms, 2u);
+      EXPECT_EQ(movs, 2u);
+   }
+}

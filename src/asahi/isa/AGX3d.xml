@@ -16,7 +16,7 @@
   Only a form's own constant bits and field deposits are transcribed; bits
   set by its choice groups decode as unknown bits.
 
-  Transcribed from src/asahi/compiler/agx3_compose/agx3d_tables.c; keep
+  Transcribed from src/asahi/compiler/agx3_compose/agx3d_tables.txt; keep
   the two in step and do not edit one by hand.
 -->
 <isa>

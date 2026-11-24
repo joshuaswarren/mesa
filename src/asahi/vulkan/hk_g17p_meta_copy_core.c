@@ -4,6 +4,7 @@
  */
 
 #include "hk_g17p_meta_copy_core.h"
+#include "asahi/lib/agx_tile_mip.h"
 #include "util/compiler.h"
 #include "util/u_math.h"
 #include "vk_format.h"
@@ -15,40 +16,7 @@ bool
 hk_g17p_build_mip_axis(uint32_t src_extent, uint32_t dst_extent,
                        uint32_t *entries)
 {
-   if (!entries || !src_extent || !dst_extent || src_extent > UINT16_MAX + 1u ||
-       !(src_extent == dst_extent ||
-         src_extent == (uint64_t)dst_extent * 2u ||
-         src_extent == (uint64_t)dst_extent * 2u + 1u))
-      return false;
-
-   if (src_extent == dst_extent) {
-      for (uint32_t i = 0; i < dst_extent; ++i)
-         entries[i] = i;
-      return true;
-   }
-
-   /* vk_meta computes the normalized scale in double on the CPU, casts it to
-    * f32 push data, then applies it to FragCoord with an FFMA. */
-   const float scale = (float)(1.0 / (double)dst_extent);
-   for (uint32_t i = 0; i < dst_extent; ++i) {
-      /* This work happens once while recording the dispatch, not per pixel. */
-      const float uv = ((float)i + 0.5f) * scale;
-      const float source = uv * (float)src_extent - 0.5f;
-      uint32_t lower = (uint32_t)source;
-      uint32_t weight = (uint32_t)((source - (float)lower) * 256.0f + 0.5f);
-
-      if (weight == 256) {
-         ++lower;
-         weight = 0;
-      }
-
-      if (lower >= src_extent)
-         lower = src_extent - 1;
-
-      entries[i] = lower | (weight << 16);
-   }
-
-   return true;
+   return agx_build_mip_axis(src_extent, dst_extent, entries);
 }
 
 bool
@@ -59,21 +27,15 @@ hk_g17p_tile_address_config_init(
    if (config)
       memset(config, 0, sizeof(*config));
 
-   if (!config || !stride_el || !tile_width_el || !tile_height_el ||
-       (tile_width_el & (tile_width_el - 1)) ||
-       (tile_height_el & (tile_height_el - 1)))
-      return false;
-
-   const uint32_t width_log2 = util_logbase2(tile_width_el);
-   const uint32_t height_log2 = util_logbase2(tile_height_el);
-   if (width_log2 > 7 || height_log2 > 7)
+   struct agx_tile_address_config shared;
+   if (!config || !agx_tile_address_config_init(stride_el, tile_width_el,
+                                                tile_height_el, &shared))
       return false;
 
    *config = (struct hk_g17p_tile_address_config){
-      .tiles_per_row =
-         ((uint64_t)stride_el + tile_width_el - 1) >> width_log2,
-      .tile_width_log2 = width_log2,
-      .tile_height_log2 = height_log2,
+      .tiles_per_row = shared.tiles_per_row,
+      .tile_width_log2 = shared.tile_width_log2,
+      .tile_height_log2 = shared.tile_height_log2,
    };
    return true;
 }
@@ -235,7 +197,7 @@ hk_g17p_compressed_copy_plan(
       memset(plan, 0, sizeof(*plan));
 
    if (!copy || !plan ||
-       (!agx_chip_native_agx3(copy->chip) && !agx_chip_g17_m5(copy->chip)) ||
+       !agx_chip_native_or_m5(copy->chip) ||
        hk_g17p_block_format_family(copy->format) ==
           HK_G17P_BLOCK_FORMAT_NONE ||
        !(image_is_source
@@ -509,8 +471,7 @@ hk_g17p_buffer_to_image_copy_supported(
    const bool one_dimensional =
       copy && copy->image_type == VK_IMAGE_TYPE_1D;
    const bool volume = copy && copy->image_type == VK_IMAGE_TYPE_3D;
-   if (!copy || (!agx_chip_native_agx3(copy->chip) &&
-                 !agx_chip_g17_m5(copy->chip)) ||
+   if (!copy || !agx_chip_native_or_m5(copy->chip) ||
        !hk_g17p_transfer_dst_layout_supported(copy->layout) ||
        (!one_dimensional && copy->image_type != VK_IMAGE_TYPE_2D && !volume) ||
        copy->samples != VK_SAMPLE_COUNT_1_BIT ||
@@ -578,16 +539,16 @@ hk_g17p_buffer_to_image_copy_supported(
       /* Compressed D32/D16 cannot use the raw AIL upload kernel. The graphics
        * copy writes its bit-compatible R32_UINT/R16_UINT view through the
        * PBE, which also updates compression metadata. Keep this fallback
-       * bounded to the single-level 2D shapes G17P depth compression admits
+       * bounded to the single-level 2D shapes depth compression admits
        * (hk_g17p_compression.h): arrays only where the caller uploads them
-       * one layer per pass (native AGX3). A combined depth/stencil image is
-       * split into a depth plane and a stencil plane; the stencil aspect is
-       * the branch below. */
+       * one layer per pass (native AGX3 or M5). A combined depth/stencil
+       * image is split into a depth plane and a stencil plane; the stencil
+       * aspect is the branch below. */
       const bool split = copy->format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
                          copy->format == VK_FORMAT_D16_UNORM_S8_UINT;
       if (copy->plane_count != (split ? 2 : 1) ||
           copy->image_type != VK_IMAGE_TYPE_2D || copy->mip_levels != 1 ||
-          (copy->array_layers != 1 && !agx_chip_native_agx3(copy->chip)))
+          (copy->array_layers != 1 && !agx_chip_native_or_m5(copy->chip)))
          return false;
       plane_format = (copy->format == VK_FORMAT_D32_SFLOAT ||
                       copy->format == VK_FORMAT_D32_SFLOAT_S8_UINT)
@@ -600,7 +561,7 @@ hk_g17p_buffer_to_image_copy_supported(
        * bit-compatible R8_UINT view, in the same single-level 2D shapes. */
       if (copy->plane_count != 2 || copy->image_type != VK_IMAGE_TYPE_2D ||
           copy->mip_levels != 1 ||
-          (copy->array_layers != 1 && !agx_chip_native_agx3(copy->chip)))
+          (copy->array_layers != 1 && !agx_chip_native_or_m5(copy->chip)))
          return false;
       plane_format = VK_FORMAT_R8_UINT;
    } else if (copy->plane_count != 1 ||
@@ -645,9 +606,16 @@ hk_g17p_buffer_to_image_copy_supported(
         (z >= mip_depth || copy->copy_extent.depth > mip_depth - z)))
       return false;
 
-   return (copy->buffer_row_length == 0 ||
+   const uint32_t slices =
+      volume ? copy->copy_extent.depth
+             : (copy->layer_count == VK_REMAINING_ARRAY_LAYERS
+                   ? copy->array_layers - copy->base_array_layer
+                   : copy->layer_count);
+
+   return ((copy->copy_extent.height == 1 && slices == 1) ||
+           copy->buffer_row_length == 0 ||
            copy->buffer_row_length >= copy->copy_extent.width) &&
-          (copy->buffer_image_height == 0 ||
+          (slices == 1 || copy->buffer_image_height == 0 ||
            copy->buffer_image_height >= copy->copy_extent.height);
 }
 
@@ -676,7 +644,7 @@ hk_g17p_image_copy_slice(enum agx_chip chip, VkImageType src_type,
    const bool two_d_three_d = (src_1d_or_2d && dst_3d) ||
                               (dst_1d_or_2d && src_3d);
    const bool valid_pair = same_type || one_d_two_d || two_d_three_d;
-   if ((!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip)) ||
+   if (!agx_chip_native_or_m5(chip) ||
        !region || !out || !valid_types ||
        !valid_pair || src_layers == 0 ||
        src_layers != dst_layers || slice >= src_layers ||

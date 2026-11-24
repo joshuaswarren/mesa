@@ -154,8 +154,8 @@ agx3_iadd_encode(enum agx_isa_encoding encoding,
    }
 
    return agx3_bind_compose(encoding,
-                            agx3b ? (d->subtract ? "isub" : "iadd")
-                                  : (d->subtract ? "isub32" : "iadd32"),
+                            agx3b ? (d->subtract ? AGX3_MN_isub : AGX3_MN_iadd)
+                                  : (d->subtract ? AGX3_MN_isub32 : AGX3_MN_iadd32),
                             0, baseline, nbaseline, ov, n, out, len);
 }
 
@@ -194,7 +194,7 @@ agx3_add_sub_immediate_encode(enum agx_isa_encoding encoding, bool subtract,
    for (unsigned slot=0;slot<slots;slot++)
       if(d->wait_mask & (1u<<slot))
          fields[n++]=(struct agx3_field_kv)KV((gpu1 ? 46 : 45)+slot,1);
-   return agx3_bind_compose(encoding,gpu1 ? (subtract ? "isub32" : "iadd32") : "isub",0,
+   return agx3_bind_compose(encoding,gpu1 ? (subtract ? AGX3_MN_isub32 : AGX3_MN_iadd32) : AGX3_MN_isub,0,
                             base,gpu1 ? 8 : 6,fields,n,out,len);
 }
 
@@ -269,27 +269,9 @@ agx3_imad_encode(enum agx_isa_encoding encoding,
                   (d->multiplier_sign_extend && d->multiplier_16)))
          return false;
    } else if (!d->dest_16) {
-      /* A 32-bit product widens each 16-bit operand by exactly one step, by
-       * that operand's own bit: f28 for slot A, f43 for a slot-B register.
-       * A 32-bit operand widens nothing and carries neither.
-       *
-       *   int(short  a) * 129 + int(short  c)
-       *      9f 00 56 00 02 02 04 02 10 2a 66 00     f24 = 1, f28 = 1
-       *   int(ushort a) * 129 + int(ushort c)
-       *      9f 00 56 00 02 02 04 02 10 2a 22 00     f24 = 1, f28 = 0
-       *   int(short) * int(ushort), unsigned slot A
-       *      9f 00 56 00 02 00 04 00 10 26 1a 00     f43 = 1 alone
-       *   int(ushort) * int(short), unsigned slot B
-       *      9f 00 56 00 02 00 04 00 10 26 0e 00     f28 = 1 alone
-       *   int a * int(short b)
-       *      9f 00 56 00 02 00 10 00 50 26 1a 00     f24 = 2, f39 = 1, f43 = 1
-       *   int(short a) * int(short b) + int c
-       *      9f 00 56 00 02 08 14 00 10 2f 3e 00     f54 = 2
-       *   int(short a) * 129 + int c
-       *      9f 00 56 00 02 08 04 02 10 2b 26 00     f54 = 2
-       *
-       * A half multiplier appears only with no addend or a 32-bit register
-       * addend, and no narrow operand appears with an immediate addend. */
+      /* 32-bit product sign-extends 16-bit operands independently via f28
+       * (slot A) and f43 (slot B register). Narrow operands only combine with
+       * no addend or a 32-bit register addend (not an immediate addend). */
       if ((d->src_a_sign_extend && !d->src_a_16) ||
           (d->multiplier_sign_extend && !d->multiplier_16))
          return false;
@@ -417,8 +399,8 @@ agx3_imad_encode(enum agx_isa_encoding encoding,
       return false;
 
    return agx3_bind_compose(encoding,
-                            m5 ? (d->dest_64 ? "imadd64" : "imadd32")
-                               : (d->negate_addend ? "imsub" : "imadd"), 0,
+                            m5 ? (d->dest_64 ? AGX3_MN_imadd64 : AGX3_MN_imadd32)
+                               : (d->negate_addend ? AGX3_MN_imsub : AGX3_MN_imadd), 0,
                             baseline, nbaseline, ov, n, out, len);
 }
 
@@ -607,7 +589,7 @@ agx3_iadd_encode_g18g(enum agx_isa_encoding encoding,
    }
 
    return agx3_bind_compose(encoding,
-                            agx3b ? (d->subtract ? "isub" : "iadd") : (d->subtract ? "isub32" : "iadd32"),
+                            agx3b ? (d->subtract ? AGX3_MN_isub : AGX3_MN_iadd) : (d->subtract ? AGX3_MN_isub32 : AGX3_MN_iadd32),
                             agx3_bind_ep(encoding, 0), baseline, nbaseline,
                             ov, n, out, len);
 }
@@ -657,18 +639,9 @@ agx3_imad_encode_g18g(enum agx_isa_encoding encoding,
       d->multiplier_is_register && d->multiplier_16 &&
       !d->src_c_16 && !d->src_c_64 && !d->src_c_sign_extend &&
       !d->addend_is_immediate;
-   /* M5's 32x32->64 form is `imadd64` (f10=3, f60=85): a register
-    * multiplier with an immediate or a 64-bit register addend, both operands
-    * zero-extended. Witnessed byte-exactly against applegpu_g17g
-    * (gpu/m5-xfb-alu-reference.metal):
-    *
-    *   ulong(a)*ulong(b) + 12    2f 00 04 03 21 00 a9 02 a8 80 21 30
-    *   ulong(a)*ulong(b) + c     2f 02 04 22 21 00 a9 02 a8 81 20 48
-    *   ulong(a)*ulong(b)         2f 00 04 02 21 00 a9 02 a8 80 20 30
-    *   long(a)*long(b)           2f 00 04 02 21 08 a9 02 a8 80 20 b0   f28, f43
-    *
-    * The addend-free product is the immediate form adding #0 (identical
-    * bytes); a product signed on one side only has no witness. */
+   /* G17G 32x32->64 `imadd64` (f10=3, f60=85): register multiplier with an
+    * immediate (0 for addend-free) or 64-bit register addend; f28/f43 set
+    * together for signed products (mixed-sign refused). */
    if (m5 && !g17_half_product && !g17_narrow_product &&
        (d->dest_16 || d->src_a_16 ||
               d->multiplier_16 || d->src_c_16 ||
@@ -716,27 +689,9 @@ agx3_imad_encode_g18g(enum agx_isa_encoding encoding,
           (d->multiplier_sign_extend && d->multiplier_16))
          return false;
    } else if (!d->dest_16) {
-      /* A 32-bit product widens each 16-bit operand by exactly one step, by
-       * that operand's own bit: f28 for slot A, f43 for a slot-B register.
-       * A 32-bit operand widens nothing and carries neither.
-       *
-       *   int(short  a) * 129 + int(short  c)
-       *      9f 00 56 00 02 02 04 02 10 2a 66 00     f24 = 1, f28 = 1
-       *   int(ushort a) * 129 + int(ushort c)
-       *      9f 00 56 00 02 02 04 02 10 2a 22 00     f24 = 1, f28 = 0
-       *   int(short) * int(ushort), unsigned slot A
-       *      9f 00 56 00 02 00 04 00 10 26 1a 00     f43 = 1 alone
-       *   int(ushort) * int(short), unsigned slot B
-       *      9f 00 56 00 02 00 04 00 10 26 0e 00     f28 = 1 alone
-       *   int a * int(short b)
-       *      9f 00 56 00 02 00 10 00 50 26 1a 00     f24 = 2, f39 = 1, f43 = 1
-       *   int(short a) * int(short b) + int c
-       *      9f 00 56 00 02 08 14 00 10 2f 3e 00     f54 = 2
-       *   int(short a) * 129 + int c
-       *      9f 00 56 00 02 08 04 02 10 2b 26 00     f54 = 2
-       *
-       * A half multiplier appears only with no addend or a 32-bit register
-       * addend, and no narrow operand appears with an immediate addend. */
+      /* 32-bit product sign-extends 16-bit operands independently via f28
+       * (slot A) and f43 (slot B register). Narrow operands only combine with
+       * no addend or a 32-bit register addend (not an immediate addend). */
       if ((d->src_a_sign_extend && !d->src_a_16) ||
           (d->multiplier_sign_extend && !d->multiplier_16))
          return false;
@@ -865,7 +820,7 @@ agx3_imad_encode_g18g(enum agx_isa_encoding encoding,
 
    return agx3_bind_compose(
       encoding,
-      m5 ? (d->dest_64 ? "imadd64" : "imadd32")
-         : (d->negate_addend ? "imsub" : "imadd"),
+      m5 ? (d->dest_64 ? AGX3_MN_imadd64 : AGX3_MN_imadd32)
+         : (d->negate_addend ? AGX3_MN_imsub : AGX3_MN_imadd),
       agx3_bind_ep(encoding, 0), baseline, nbaseline, ov, n, out, len);
 }

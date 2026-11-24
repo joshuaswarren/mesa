@@ -63,44 +63,6 @@ struct agx_gallium_storage_descriptor_layout {
    uint8_t stride;
 };
 
-/* G15P/A16 executes AGX2, but its complete descriptor/command-stream ABI is
- * not grounded.  Keep it UNKNOWN here just like the shared chip policy.
- */
-static inline enum agx_descriptor_generation
-agx_gallium_descriptor_generation(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G13G:
-   case AGX_CHIP_G13X:
-      return AGX_DESCRIPTOR_GENERATION_7;
-   case AGX_CHIP_G14G:
-   case AGX_CHIP_G14X:
-      return AGX_DESCRIPTOR_GENERATION_8;
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17A:
-      return AGX_DESCRIPTOR_GENERATION_9;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   /* The J873 native captures carry Gen10 texture and PBE descriptors that
-    * Mesa's G17G packers reproduce byte for byte. */
-   case AGX_CHIP_G18G:
-      return AGX_DESCRIPTOR_GENERATION_10;
-   case AGX_CHIP_G15P:
-   case AGX_CHIP_UNKNOWN:
-   default:
-      return AGX_DESCRIPTOR_GENERATION_UNKNOWN;
-   }
-}
-
 static inline bool
 agx_gallium_descriptor_generation_is_agx2(
    enum agx_descriptor_generation generation)
@@ -196,12 +158,13 @@ agx_gallium_native_texture_sample_count_representable(
  *
  * This is a generation predicate, not a per-image one.  AGX3's recovered PBE
  * geometry is a bounded subset -- non-sparse 2D (on Gen9 also arrays, 3D,
- * mips and multisample, and the GPU-tiled compressed single-layer 2D packet)
- * with no software addressing sideband -- and that subset is enforced per
- * descriptor by agx_gallium_pack_native_pbe(), which fails closed for
- * anything outside it.  Gallium still feeds AGX2 sideband state (image
- * atomics, EMRT, spilled render targets) through the same packet, so those
- * images are refused rather than silently encoded with the bits dropped.
+ * mips and multisample, and the GPU-tiled compressed single-layer 2D and
+ * 2x/4x multisample 2D packets) with no software addressing sideband -- and
+ * that subset is enforced per descriptor by agx_gallium_pack_native_pbe(),
+ * which fails closed for anything outside it.  Gallium still feeds AGX2
+ * sideband state (image atomics, EMRT, spilled render targets) through the
+ * same packet, so those images are refused rather than silently encoded with
+ * the bits dropped.
  */
 static inline bool
 agx_gallium_native_pbe_supported(
@@ -213,14 +176,15 @@ agx_gallium_native_pbe_supported(
 
 /* Whether Gallium may write any compressed image, shared ones included.
  *
- * Gallium decompresses a compressed render target in place when its
- * tilebuffer spills it, and a shared one when a feedback loop samples it
- * (agx_decompress_inplace()). That kernel takes the AGX2 24+24-byte
- * descriptor pair and has no AGX3 build, so only AGX2 qualifies. On AGX3
- * the compressed PBE itself is encoded (Gen9 GPU-tiled 2D, see
- * agx_gallium_pack_native_pbe()); G17P compresses its private images within
- * agx_g17p_compression_color_format(), which never spill, and imported
- * compressed images stay sample-only (external) there.
+ * Gallium decompresses a shared compressed image in place when a feedback
+ * loop samples it (agx_decompress_inplace()). That kernel takes the AGX2
+ * 24+24-byte descriptor pair and has no AGX3 build, so only AGX2 qualifies.
+ * On AGX3 the compressed PBE itself is encoded (Gen9 GPU-tiled 2D and 2x/4x
+ * multisample 2D, see agx_gallium_pack_native_pbe()); G17P compresses its
+ * private images within agx_g17p_compression_color_format() and reallocates
+ * them uncompressed via agx_decompress() if a framebuffer spills them or a
+ * feedback loop/shader image binds them, while imported compressed images
+ * stay sample-only (external) there.
  */
 static inline bool
 agx_gallium_shared_compression_supported(

@@ -73,6 +73,8 @@ struct alu_timing op_timings[] = {
     * hints; it is not a measured latency for the subsequent UVSW. */
    [AGX_OPCODE_ST_VARY_MUL_AGX3] = { F32, 2, 1 },
    [AGX_OPCODE_ST_VARY_FMA_AGX3] = { F32, 2, 1 },
+   [AGX_OPCODE_MATMAD8_AGX3]     = { F32, 4, 2 },
+   [AGX_OPCODE_MATMAD16_AGX3]    = { F32, 8, 4 },
 
    [AGX_OPCODE_HFMA]          = { F16, 2, 1 },
    [AGX_OPCODE_HADD]          = { F16, 2, 1 },
@@ -80,6 +82,8 @@ struct alu_timing op_timings[] = {
 
    [AGX_OPCODE_MOV_IMM]       = { SCIB, 1, 1 },
    [AGX_OPCODE_BITOP]         = { SCIB, 2, 1 }, /* tp might be 2 for 32-bit / no $? */
+   [AGX_OPCODE_CONVERT]       = { SCIB, 2, 1 },
+   [AGX_OPCODE_INTL]          = { SCIB, 2, 1 },
    [AGX_OPCODE_ICMPSEL]       = { SCIB, 2, 1 },
    [AGX_OPCODE_FCMPSEL]       = { SCIB, 2, 1 },
    [AGX_OPCODE_IADD]          = { SCIB, 2, 1 },
@@ -108,7 +112,13 @@ struct alu_timing op_timings[] = {
    [AGX_OPCODE_QUAD_PREFIX]      = { SCIB, 18, 18 },
    [AGX_OPCODE_QUAD_REDUCE]      = { SCIB, 24, 24 },
    [AGX_OPCODE_SHUFFLE]          = { SCIB, 5, 2   },
+   [AGX_OPCODE_SHUFFLE_XOR]      = { SCIB, 5, 2   },
+   [AGX_OPCODE_SHUFFLE_UP]       = { SCIB, 5, 2   },
+   [AGX_OPCODE_SHUFFLE_DOWN]     = { SCIB, 5, 2   },
    [AGX_OPCODE_QUAD_SHUFFLE]     = { SCIB, 5, 2   },
+   [AGX_OPCODE_QUAD_SHUFFLE_XOR] = { SCIB, 5, 2   },
+   [AGX_OPCODE_QUAD_SHUFFLE_UP]  = { SCIB, 5, 2   },
+   [AGX_OPCODE_QUAD_SHUFFLE_DOWN] = { SCIB, 5, 2  },
 
    [AGX_OPCODE_ICMP_BALLOT]      = { SCIB, 5, 2   },
    [AGX_OPCODE_FCMP_BALLOT]      = { SCIB, 5, 2   },

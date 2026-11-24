@@ -45,7 +45,7 @@ agx3_rt_gen1_entry_generate(const struct agx3_rt_gen1_entry_desc *d,
          KV(23, 1), KV(24, 1), KV(31, 8), KV(38, 2), KV(39, 2),
          KV(54, 1), KV(68, 3), KV(70, 2), KV(71, i ? 48 : 80),
       };
-      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "ldscs", 0,
+      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_ldscs, 0,
                             fields, sizeof(fields) / sizeof(fields[0]),
                             NULL, 0, staged + used, &n))
          return false;
@@ -60,25 +60,25 @@ agx3_rt_gen1_entry_generate(const struct agx3_rt_gen1_entry_desc *d,
          KV(42, c == 0), KV(54, 1), KV(73, (1u << words) - 1),
          KV(75, 2), KV(76, 16 * c),
       };
-      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "lddev", 0,
+      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_lddev, 0,
                             fields, sizeof(fields) / sizeof(fields[0]),
                             NULL, 0, staged + used, &n))
          return false;
       used += n;
    }
-   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "specLM", 0,
+   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_specLM, 0,
                          NULL, 0, NULL, 0, staged + used, &n))
       return false;
    used += n;
    const struct agx3_field_kv shader[] = {
       KV(0, d->shader_va), KV(1, d->fetch_span), KV(23, 1),
    };
-   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "ldshdr", 0,
+   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_ldshdr, 0,
                          shader, sizeof(shader) / sizeof(shader[0]),
                          NULL, 0, staged + used, &n))
       return false;
    used += n;
-   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "specTPR", 0,
+   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_specTPR, 0,
                          NULL, 0, NULL, 0, staged + used, &n))
       return false;
    used += n;
@@ -88,14 +88,14 @@ agx3_rt_gen1_entry_generate(const struct agx3_rt_gen1_entry_desc *d,
          KV(16, d->uniforms[i].register_half), KV(23, 2), KV(24, 2),
          KV(27, 1), KV(31, i == 0),
       };
-      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "copy", 0,
+      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_copy, 0,
                             fields, sizeof(fields) / sizeof(fields[0]),
                             NULL, 0, staged + used, &n))
          return false;
       used += n;
    }
    const struct agx3_field_kv branch[] = {KV(0, d->branch_va), KV(11, 1)};
-   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "b", 0,
+   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_b, 0,
                          branch, sizeof(branch) / sizeof(branch[0]),
                          NULL, 0, staged + used, &n))
       return false;

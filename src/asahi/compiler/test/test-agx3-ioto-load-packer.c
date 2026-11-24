@@ -231,7 +231,7 @@ test_copy_records(void)
          load.native_slot_half = destination;
          load.data.half = source;
          CHECK(ops.pack_copy(ops.context, AGX_CHIP_G17P, &load, 0, 3, &raw));
-         CHECK(agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "copy", 1,
+         CHECK(agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_copy, 1,
                                  baseline, ARRAY_SIZE(baseline), overrides,
                                  ARRAY_SIZE(overrides), expected,
                                  &expected_length));
@@ -705,7 +705,7 @@ test_gpu0_copy_specializations(bool source_kill)
          bool reference = false;
          unsigned ep;
          for (ep = 0; ep < 2; ++ep) {
-            reference = agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "copy", ep,
+            reference = agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_copy, ep,
                baseline, ARRAY_SIZE(baseline), fields, ARRAY_SIZE(fields),
                expected, &length);
             if (reference)

@@ -11,29 +11,15 @@
 static bool
 agx_ppp_w_clamp_cull2_header(enum agx_chip chip, uint32_t *header)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-      *header = AGX_PPP_W_CLAMP_CULL2_GEN6_HEADER;
-      return true;
-
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   case AGX_CHIP_G18G:
-      *header = AGX_PPP_W_CLAMP_CULL2_GEN7_HEADER;
-      return true;
-
-   default:
+   if (!agx_chip_has_record(chip, AGX_RECORD_PPP_W_CLAMP_CULL2)) {
       *header = 0;
       return false;
    }
+
+   /* PPPEncoderGen7 on the HAL300 path, PPPEncoderGen6 before it. */
+   *header = agx_chip_hal300_path(chip) ? AGX_PPP_W_CLAMP_CULL2_GEN7_HEADER
+                                        : AGX_PPP_W_CLAMP_CULL2_GEN6_HEADER;
+   return true;
 }
 
 bool

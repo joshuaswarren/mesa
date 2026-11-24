@@ -58,20 +58,33 @@ bool poly_nir_lower_gs(struct nir_shader *gs, struct nir_shader **gs_count,
                        struct nir_shader **gs_copy, struct nir_shader **pre_gs,
                        struct poly_gs_info *info);
 
+enum poly_gs_side_effects {
+   /* Legacy mode: keep API stores and atomics in the count and raster
+    * variants and strip them from the main kernel. */
+   POLY_GS_SIDE_EFFECTS_REPLAY = 0,
+   /* Perform API stores and atomics once per invocation in the main kernel
+    * and strip them from the count and raster variants (M5). */
+   POLY_GS_SIDE_EFFECTS_MAIN,
+   /* Use POLY_GS_SIDE_EFFECTS_MAIN only when the shader has no unlowered ray
+    * queries, replay drops every API side effect, and replay retains no
+    * non-Poly memory/UBO/image/texture loads, barriers, subgroup/quadgroup
+    * ops, or shader clocks; otherwise fall back to
+    * POLY_GS_SIDE_EFFECTS_REPLAY. */
+   POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT,
+};
+
 /* G17P native GS replay may discard unobserved invocation-local queries.
  *
- * With main_side_effects, the main kernel performs the API stores and atomics
- * once per invocation and the count and raster variants drop them, together
- * with what only fed them; remove_dead is then an optional driver pass for
- * work NIR DCE keeps (M5). Otherwise the raster variant performs them, as
- * poly_nir_lower_gs() does. */
+ * side_effects selects whether API stores and atomics run in replay or in the
+ * main kernel; when running in main, remove_dead is an optional driver pass
+ * for work NIR DCE keeps (M5). */
 bool poly_nir_lower_gs_with_options(struct nir_shader *gs,
                                     struct nir_shader **gs_count,
                                     struct nir_shader **gs_copy,
                                     struct nir_shader **pre_gs,
                                     struct poly_gs_info *info,
                                     bool eliminate_local_ray_queries,
-                                    bool main_side_effects,
+                                    enum poly_gs_side_effects side_effects,
                                     poly_nir_remove_dead_fn remove_dead);
 
 bool poly_nir_lower_tcs(struct nir_shader *tcs,

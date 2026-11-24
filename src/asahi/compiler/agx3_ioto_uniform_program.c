@@ -44,7 +44,7 @@ agx3_ioto_uniform_program_body_bound_with_inputs(
        agx_ioto_load_target_encoding(chip) ==
           AGX_IOTO_LOAD_ENCODING_UNSUPPORTED ||
        (range_count != 0 && ranges == NULL) ||
-       (inputs != NULL && (chip != AGX_CHIP_G17P || !inputs->known)))
+       (inputs != NULL && (!agx_chip_native_hal200(chip) || !inputs->known)))
       return false;
 
    size_t staged_bytes =

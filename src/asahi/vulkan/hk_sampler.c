@@ -104,11 +104,11 @@ is_border_color_custom(VkBorderColor color, bool workaround_rgba4,
    case VK_BORDER_COLOR_INT_OPAQUE_WHITE:
    case VK_BORDER_COLOR_INT_OPAQUE_BLACK:
       /* Native scaled views sample a normalized twin and rescale in the
-       * shader; the hardware's opaque white there is the format maximum,
-       * while the integer border means the texel value one
-       * (pipeline.*.sampler.*.a2r10g10b10_uscaled_pack32.*clamp_to_border*).
-       * Emulate like a custom border so the shader applies the recorded
-       * integer value. */
+       * shader; hardware opaque white would rescale to the format maximum
+       * instead of integer 1
+       * (pipeline.*.sampler.*.a2r10g10b10_uscaled_pack32.*clamp_to_border*),
+       * so emulate integer borders like custom borders.
+       */
       return int_border_custom;
 
    case VK_BORDER_COLOR_INT_CUSTOM_EXT:
@@ -180,7 +180,12 @@ pack_sampler(const struct hk_physical_device *pdev,
             : 1,
       .magnify = translate_filter(info->magFilter),
       .minify = translate_filter(info->minFilter),
-      .mip_filter = translate_mipfilter(info->mipmapMode),
+      .mip_filter =
+         (info->mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST &&
+          info->minLod == 0.0f && info->maxLod == 0.0f &&
+          info->mipLodBias == 0.0f)
+            ? AGX_MIP_FILTER_NONE
+            : translate_mipfilter(info->mipmapMode),
       .wrap_s = translate_address_mode(info->addressModeU),
       .wrap_t = translate_address_mode(info->addressModeV),
       .wrap_r = translate_address_mode(info->addressModeW),
@@ -286,28 +291,14 @@ hk_CreateSampler(VkDevice device,
    sampler->mip_lod_bias = info->mipLodBias;
    if (sampler->vk.ycbcr_conversion) {
       sampler->ycbcr = sampler->vk.ycbcr_conversion->state;
-      /* This is a lowering switch on our private copy of the conversion
-       * state, not an echo of the API's forceExplicitReconstruction, and it
-       * stays even though G17P no longer advertises either
-       * CHROMA_RECONSTRUCTION_EXPLICIT bit for these formats.
-       *
-       * On G17P a packed 4:2:2 view is programmed as a plain four-component
-       * word texture -- R8G8B8A8_UNORM or R16G16B16A16_UNORM, see
-       * hk_image_view.c -- because the texture unit does not reconstruct
-       * these formats for us.  Every luma and chroma sample therefore comes
-       * out of hk_shader.c's lowering, and that lowering is reached only
-       * through lower_ycbcr_explicit(), which this flag gates:
-       * lower_packed_ycbcr_center() fires on the txl taps that pass emits,
-       * and the common nir_vk_lower_ycbcr_tex() deliberately skips packed
-       * formats.  Clear the flag and an application's texture() would sample
-       * raw packed words as RGBA with no conversion at all.
-       *
-       * Withdrawing the format features is therefore not a promise that we
-       * stopped reconstructing at luma texel centres; it is a statement that
-       * we no longer guarantee it, which is what "reconstruction is
-       * implementation-defined" means.
+      /* Packed 4:2:2 views on native AGX3 are backed by plain RGBA word
+       * textures (see hk_image_view.c) and lowered via lower_ycbcr_explicit() /
+       * lower_packed_ycbcr_center(), since nir_vk_lower_ycbcr_tex() skips
+       * packed formats. Keep this internal lowering flag enabled regardless of
+       * advertised CHROMA_RECONSTRUCTION_EXPLICIT format features.
        */
-      if (agx_native_graphics(&dev->dev) && hk_packed_ycbcr_bits(sampler->ycbcr.format))
+      if (agx_chip_native_agx3(dev->dev.chip) &&
+          hk_packed_ycbcr_bits(sampler->ycbcr.format))
          sampler->ycbcr.force_explicit_reconstruction = true;
       /* Explicit nearest chroma maps luma (i,j) to (i/2,j/2), independent
        * of chroma location. Linear reconstruction retains the offset. */
@@ -317,8 +308,8 @@ hk_CreateSampler(VkDevice device,
    }
 
    bool workaround_rgba4 = dev->vk.enabled_features.customBorderColors ||
-                           agx_native_graphics(&dev->dev);
-   bool int_border_custom = agx_native_graphics(&dev->dev);
+                           agx_chip_native_agx3(dev->dev.chip);
+   bool int_border_custom = agx_chip_native_agx3(dev->dev.chip);
    bool custom_border =
       uses_border(info) &&
       is_border_color_custom(info->borderColor, workaround_rgba4,
@@ -389,7 +380,8 @@ hk_CreateSampler(VkDevice device,
    /* Packed conversion fetches raw words; chroma filtering runs in the
     * shader and does not consume a second sampler/descriptor plane. */
    if (sampler->vk.ycbcr_conversion &&
-       !(agx_native_graphics(&dev->dev) && hk_packed_ycbcr_bits(sampler->ycbcr.format))) {
+       !(agx_chip_native_agx3(dev->dev.chip) &&
+         hk_packed_ycbcr_bits(sampler->ycbcr.format))) {
       assert(!uses_border(info) &&
              "consequence of VUID-VkSamplerCreateInfo-addressModeU-01646");
 

@@ -560,12 +560,50 @@ get_buffer_address(const VkDescriptorBufferInfo *const info, bool read_only)
    };
 }
 
+static bool
+ordinary_storage_binding(const struct hk_descriptor_set *set, uint32_t binding)
+{
+   if (!set || !set->storage_backings || binding >= set->layout->binding_count)
+      return false;
+
+   const struct hk_descriptor_set_binding_layout *b = &set->layout->binding[binding];
+   return b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && !b->flags &&
+          b->array_size == 1 && b->stride == sizeof(struct hk_buffer_address);
+}
+
+bool
+hk_descriptor_set_storage_backing(const struct hk_descriptor_set *set,
+                                  uint32_t binding, struct hk_storage_backing *backing)
+{
+   if (!ordinary_storage_binding(set, binding))
+      return false;
+   if (!set->storage_backings[binding].handle)
+      return false;
+
+   *backing = set->storage_backings[binding];
+   return true;
+}
+
 static void
 write_buffer_desc(struct hk_descriptor_set *set,
                   const VkDescriptorBufferInfo *const info, uint32_t binding,
                   uint32_t elem, bool read_only)
 {
    const struct hk_buffer_address desc = get_buffer_address(info, read_only);
+   if (ordinary_storage_binding(set, binding) && elem == 0) {
+      VK_FROM_HANDLE(hk_buffer, buffer, info->buffer);
+      struct hk_storage_backing *backing = &set->storage_backings[binding];
+      *backing = (struct hk_storage_backing){0};
+      if (!read_only && buffer && buffer->storage_backing_handle &&
+          info->offset <= UINT64_MAX - buffer->storage_backing_offset) {
+         *backing = (struct hk_storage_backing){
+            .address = desc.base_addr,
+            .offset = buffer->storage_backing_offset + info->offset,
+            .size = desc.size,
+            .handle = buffer->storage_backing_handle,
+         };
+      }
+   }
 
    /* A null descriptor in a mutable slot reads as null through any type, so it
     * must not keep the previous descriptor's heap index past the buffer
@@ -591,6 +629,10 @@ write_buffer_desc_array(struct hk_descriptor_set *set, const void *data,
                         size_t data_stride, uint32_t binding,
                         uint32_t first_elem, uint32_t count, bool read_only)
 {
+   if (count > 1 && set->storage_backings) {
+      memset(set->storage_backings, 0,
+             set->layout->binding_count * sizeof(*set->storage_backings));
+   }
    if (count <= 1 || !set->cpu_cached ||
        set->layout->binding[binding].stride != sizeof(struct hk_buffer_address)) {
       for (uint32_t i = 0; i < count; ++i) {
@@ -725,6 +767,17 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
          &src->layout->binding[copy->srcBinding];
       const struct hk_descriptor_set_binding_layout *dst_binding_layout =
          &dst->layout->binding[copy->dstBinding];
+
+      if (dst->storage_backings && copy->descriptorCount > 1) {
+         memset(dst->storage_backings, 0,
+                dst->layout->binding_count * sizeof(*dst->storage_backings));
+      } else if (copy->descriptorCount == 1 &&
+                 ordinary_storage_binding(dst, copy->dstBinding) && !copy->dstArrayElement) {
+         struct hk_storage_backing backing = {0};
+         if (!copy->srcArrayElement)
+            hk_descriptor_set_storage_backing(src, copy->srcBinding, &backing);
+         dst->storage_backings[copy->dstBinding] = backing;
+      }
 
       /* Equal strides make the existing per-record copies contiguous. Vulkan
        * requires source and destination descriptor ranges not to overlap,
@@ -991,6 +1044,7 @@ hk_descriptor_set_destroy(struct hk_device *dev,
    if (set->size > 0)
       hk_descriptor_pool_free(pool, set->addr, set->size);
    vk_descriptor_set_layout_unref(&dev->vk, &set->layout->vk);
+   free(set->storage_backings);
 
    vk_object_free(&dev->vk, NULL, set);
 }
@@ -1097,7 +1151,7 @@ hk_CreateDescriptorPool(VkDevice _device,
        * the recording core. */
       pool->cpu_cached = hk_g17p_cached_cmd_memory(&dev->dev);
       const enum agx_bo_flags pool_flags =
-         agx_native_graphics(&dev->dev)
+         agx_chip_native_agx3(dev->dev.chip)
             ? AGX_BO_ZERO_ON_REUSE |
                  (pool->cpu_cached ? AGX_BO_WRITEBACK : 0)
             : 0;
@@ -1202,7 +1256,7 @@ hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
        * null texture / heap index 0, which is bound and safe.
        */
       set->cpu_cached = pool->cpu_cached;
-      if (agx_native_graphics(&dev->dev)) {
+      if (agx_chip_native_agx3(dev->dev.chip)) {
          memset(set->mapped_ptr, 0, set->size);
          hk_descriptor_set_publish(set, set->mapped_ptr, set->size);
       }
@@ -1210,6 +1264,18 @@ hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
 
    vk_descriptor_set_layout_ref(&layout->vk);
    set->layout = layout;
+
+   if (layout->binding_count && !layout->vk.flags &&
+       agx_chip_native_or_m5(dev->dev.chip)) {
+      for (uint32_t b = 0; b < layout->binding_count; ++b) {
+         const struct hk_descriptor_set_binding_layout *binding = &layout->binding[b];
+         if (binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && !binding->flags &&
+             binding->array_size == 1) {
+            set->storage_backings = calloc(layout->binding_count, sizeof(*set->storage_backings));
+            break;
+         }
+      }
+   }
 
    for (uint32_t b = 0; b < layout->binding_count; b++) {
       if (layout->binding[b].type != VK_DESCRIPTOR_TYPE_SAMPLER &&
@@ -1470,7 +1536,7 @@ hk_GetDescriptorEXT(VkDevice _device,
    layout->descriptor_generation =
       agx_chip_descriptor_generation(dev->dev.chip);
    layout->native_sampler_indices =
-      agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip);
+      agx_chip_native_or_m5(dev->dev.chip);
    layout->binding_count = 1;
    layout->binding[0] = (struct hk_descriptor_set_binding_layout){
       .type = type,

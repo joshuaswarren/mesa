@@ -306,9 +306,9 @@ static_assert(sizeof(struct hk_bvh_instance_node) == 120, "node format");
 static_assert(sizeof(struct hk_bvh_box_node) == 56, "node format");
 static_assert(sizeof(struct hk_agx3_leaf_job) == 64, "native node job ABI");
 /* hk_build_interface.h is shared with the GEN1 encoders, whose leaf and plan
- * arguments end in fields (counts; pairs) that M5 leaves zero and its
- * encoders never read. */
-static_assert(sizeof(struct hk_agx3_leaf_args) == 32, "native node push ABI");
+ * arguments end in fields (counts, leaf_bound; pairs) that M5 leaves zero and
+ * its encoders never read. */
+static_assert(sizeof(struct hk_agx3_leaf_args) == 40, "native node push ABI");
 static_assert(sizeof(struct hk_agx3_envelope_job) == 48, "native envelope job ABI");
 static_assert(sizeof(struct hk_agx3_envelope_args) == 64, "native envelope push ABI");
 static_assert(sizeof(struct hk_agx3_plan_node) == 16, "native planner node ABI");

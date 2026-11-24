@@ -81,38 +81,38 @@ agx3_uniform_integer_encode(enum agx_isa_encoding encoding,
    if (d->op == AGX3_UI_ANDC && src[0].kind != AGX3_UI_UNIFORM)
       return false;
 
-   const char *mnemonic = NULL;
+   enum agx3_mnemonic mnemonic = AGX3_MN_NONE;
    unsigned endpoint = 0;
    switch (d->op) {
    case AGX3_UI_ADD:
-      mnemonic = m5 ? "iadd32" : "iadd";
+      mnemonic = m5 ? AGX3_MN_iadd32 : AGX3_MN_iadd;
       break;
    case AGX3_UI_SUB:
-      mnemonic = m5 ? "isub32" : "isub";
+      mnemonic = m5 ? AGX3_MN_isub32 : AGX3_MN_isub;
       break;
    case AGX3_UI_MAD:
-      mnemonic = m5 ? "imadd32" : "imadd";
+      mnemonic = m5 ? AGX3_MN_imadd32 : AGX3_MN_imadd;
       break;
    case AGX3_UI_AND:
-      mnemonic = "bit_and";
+      mnemonic = AGX3_MN_bit_and;
       endpoint = 1;
       break;
    case AGX3_UI_OR:
-      mnemonic = "bit_or";
+      mnemonic = AGX3_MN_bit_or;
       endpoint = 1;
       break;
    case AGX3_UI_XOR:
-      mnemonic = "bit_xor";
+      mnemonic = AGX3_MN_bit_xor;
       endpoint = 1;
       break;
    case AGX3_UI_NAND:
-      mnemonic = "bit_nand";
+      mnemonic = AGX3_MN_bit_nand;
       break;
    case AGX3_UI_NOR:
-      mnemonic = "bit_nor";
+      mnemonic = AGX3_MN_bit_nor;
       break;
    case AGX3_UI_ANDC:
-      mnemonic = "bit_andc";
+      mnemonic = AGX3_MN_bit_andc;
       break;
    }
 

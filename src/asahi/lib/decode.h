@@ -9,6 +9,7 @@
 
 #include <sys/types.h>
 #include "agx_bo.h"
+#include "agx_chip.h"
 
 #include "drm-uapi/asahi_drm.h"
 
@@ -17,6 +18,11 @@ struct agxdecode_ctx;
 struct agxdecode_ctx *agxdecode_new_context(uint64_t shader_base);
 
 void agxdecode_destroy_context(struct agxdecode_ctx *ctx);
+
+/* The chip the decoder takes a trace's kernel parameters as. NULL is
+ * unknown. Declared for tests/test-chip.c. */
+enum agx_chip
+agxdecode_chip_from_params(const struct drm_asahi_params_global *params);
 
 void agxdecode_next_frame(void);
 

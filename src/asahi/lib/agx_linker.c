@@ -50,7 +50,7 @@ agx_fs_epilog_apply_device_policy(enum agx_chip chip,
    /* G18 coverage also dirties color during depth-only or fully masked draws.
     * Preserve the previous tile value while executing the other side effects.
     */
-   key->preserve_zero_mask = g17p || agx_chip_g17_m5(chip) || chip == AGX_CHIP_G18G;
+   key->preserve_zero_mask = g17p || agx_chip_hal300_path(chip);
    key->sample_loop_mrt = chip == AGX_CHIP_G18G && key->nr_samples > 1;
    /* G18G: both AGX3 tile interfaces move packed bytes. The RGB transfer
     * function belongs around blending; alpha remains linear. R11G11B10 is
@@ -58,6 +58,7 @@ agx_fs_epilog_apply_device_policy(enum agx_chip chip,
     * PBE. */
    key->lower_srgb = chip == AGX_CHIP_G18G;
    key->lower_r11g11b10 = chip == AGX_CHIP_G18G;
+   key->ms_whole_sample = chip == AGX_CHIP_G18G;
    key->native_epilog = chip == AGX_CHIP_G18G;
    if (chip == AGX_CHIP_G18G &&
        (key->nr_samples == 1 || key->nr_samples == 2 || key->nr_samples == 4)) {
@@ -296,8 +297,7 @@ agx3_build_container(const struct agx_device *dev, uint8_t *image,
 static bool
 agx3_uses_code_container(const struct agx_device *dev)
 {
-   return agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
-          dev->chip == AGX_CHIP_G18G;
+   return agx_chip_agx3_path(dev->chip);
 }
 
 /* Give a relocatable vertex program's varyings the indices of the bound
@@ -331,6 +331,39 @@ agx3_relocate_main_uvs(const struct agx_device *dev,
    return true;
 }
 
+/*
+ * The packer emits the AGX3b pixel transaction protocol only for fragment
+ * shapes it has proven. It returns any other shape without the protocol
+ * instead of failing, so a program that blends inline is checked by its bytes,
+ * as Borealis checks its own (hk_g17p_mono_part_refusal()). The program must
+ * contain the colour entry gate (agx3_pixel_colour_entry()) and end with a
+ * final release: a pixrel whose descriptor carries the 0x200 end-of-sequence
+ * bit (agx3_pixel_release() with last set) directly ahead of the 4-byte END.
+ * The release's writeout and scoreboard fields depend on the program, so only
+ * its fixed bytes are compared.
+ */
+bool
+agx3_fragment_pixel_protocol_proven(const struct agx_shader_part *part)
+{
+   uint8_t gate[AGX3_PIXEL_MAX_LENGTH], gate_len;
+   if (!part || !part->binary ||
+       !agx3_pixel_colour_entry(AGX_ISA_ENCODING_AGX3B, gate, &gate_len))
+      return false;
+
+   const uint8_t *code = (const uint8_t *)part->binary + part->info.main_offset;
+   const size_t n = part->info.main_size;
+   bool has_gate = false;
+   for (size_t o = 0; o + gate_len <= n && !has_gate; o += 2)
+      has_gate = !memcmp(code + o, gate, gate_len);
+
+   const bool final_release =
+      n >= 10 && code[n - 4] == 0x0e && code[n - 10] == 0x07 &&
+      code[n - 9] == 0x02 && code[n - 8] == 0x54 && (code[n - 6] & 0x02) &&
+      code[n - 5] == 0x00;
+
+   return has_gate && final_release;
+}
+
 bool
 agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
               bool fragment, struct agx_shader_part *main,
@@ -340,8 +373,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    /* These literal loop fragments are AGX2 machine code. G17P exposes only
     * one sample and its Vulkan path folds sample shading before split-FS
     * lowering; fail closed if a caller ever bypasses that canonicalization. */
-   if ((agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
-        dev->chip == AGX_CHIP_G18G) &&
+   if (agx_chip_agx3_path(dev->chip) &&
        nr_samples_shaded) {
       fprintf(stderr,
               "agx_fast_link: external sample loop is not AGX3 machine code\n");
@@ -367,8 +399,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    bool nop_entry[ARRAY_SIZE(parts)] = {false};
    bool entry_seen = false;
    int kept_entry = -1;
-   if ((agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
-        dev->chip == AGX_CHIP_G18G) &&
+   if (agx_chip_agx3_path(dev->chip) &&
        fragment && !nr_samples_shaded && !colour_fused) {
       for (unsigned i = 0; i < ARRAY_SIZE(parts); ++i) {
          struct agx_shader_part *part = parts[i];
@@ -479,8 +510,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    /* The staging accounting is per instruction, so a linked software vertex
     * shader (a compute-stage main behind the vertex prolog) is described the
     * same way as a hardware vertex or fragment program. */
-   if ((agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
-        dev->chip == AGX_CHIP_G18G) &&
+   if (agx_chip_agx3_path(dev->chip) &&
        (main->info.stage == MESA_SHADER_VERTEX ||
         main->info.stage == MESA_SHADER_FRAGMENT ||
         main->info.stage == MESA_SHADER_COMPUTE ||
@@ -743,6 +773,17 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
          writes_sample_mask = false;
          linked->no_op = true;
       }
+
+      const struct agx_shader_part *colour_part = epilog ? epilog : main;
+      const bool non_colour_reads_tib =
+         (prolog && prolog->info.reads_tib) ||
+         (epilog && main && main->info.reads_tib);
+      linked->translucent_only_for_unwritten_rts =
+         !tag_write_disable && colour_part &&
+         colour_part->info.translucent_only_for_unwritten_rts &&
+         !non_colour_reads_tib;
+      linked->color_rts_written =
+         colour_part ? colour_part->info.color_rts_written : 0;
 
       agx_pack(&linked->fragment_control, FRAGMENT_CONTROL, cfg) {
          cfg.tag_write_disable = tag_write_disable;

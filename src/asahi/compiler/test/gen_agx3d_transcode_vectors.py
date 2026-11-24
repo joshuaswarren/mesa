@@ -37,8 +37,8 @@ import agx3_table  # noqa: E402
 from isa import load_isa  # noqa: E402
 from gen_agx3d_compose_corpus_vectors import segment  # noqa: E402
 
-ARCH = {'applegpu_g17g': ('AGX3c.xml', 'agx3c_tables.c'),
-        'applegpu_g18g': ('AGX3d.xml', 'agx3d_tables.c')}
+ARCH = {'applegpu_g17g': ('AGX3c.xml', 'agx3c_tables.txt'),
+        'applegpu_g18g': ('AGX3d.xml', 'agx3d_tables.txt')}
 CODEC = {}
 for arch, (xml, table) in ARCH.items():
     T = agx3_table.load(os.path.join(COMPOSE, table))

@@ -24,18 +24,70 @@
  *   application barrier or deferred clears at the end), and a packet's end
  *   can carry the memory-scoped one (hk_pack_runs()). This holds for every
  *   M5 part.
- * - G16 (HAL200) streams pack where the strong flush is the whole visibility
- *   record. G17P differs: its caches are tagged by virtual address and its
- *   strong flush also has a memory-scoped form, which memory reached through
- *   a second address needs (hk_cdm_alias_scope()); no boundary of this kind
- *   asks for it. G17A, the other HAL200 part, sits between G17P and M5,
- *   which both have that form; until its caches are known
- *   (hk_cdm_caches_pending()) it has no boundary either.
- * - G15: the boundary would be the wide barrier its in-stream dependencies
- *   get (agx_chip_cdm_wide_visibility()), but packing there (the kernel's
- *   command deadline, attachment limits) is not qualified. AGX2 streams have
- *   neither the terminate nor the tail records this checks.
+ * - AGX2 (G13/G14) streams end every dispatch with an in-stream CDM barrier
+ *   (strong_flush_end) followed by AGX2's 8-byte CDM_STREAM_TERMINATE, and
+ *   publish writes on command completion. Packet duration is bounded by the
+ *   planner's per-packet caps (HK_PACK_MAX_DISPATCHES, HK_PACK_MAX_THREADS,
+ *   HK_PACK_MAX_STATIC_WORK, and at most one looping-shader stream per packet;
+ *   see hk_pack.h) while hk_pack_attachment_limit() enforces the kernel's
+ *   max_attachments UAPI limit whenever reported.
+ * - G15 streams end with an ordering barrier or wide-visibility strong flush
+ *   (agx_chip_cdm_wide_visibility()) and AGX3's 4-byte terminate; boundaries
+ *   upgrade the trailing barrier in place, subject to the same planner work
+ *   and max_attachments caps.
+ * - G16 and G17P (HAL200) streams pack where the caches are qualified
+ *   (!hk_cdm_caches_pending()). On G17P, whose caches are tagged by virtual
+ *   address, hk_pack_runs() passes hk_cdm_alias_scope(dev) to the boundary
+ *   and tail flushes so aliased mappings get the memory-scoped form. G17A,
+ *   whose caches are still pending (hk_cdm_caches_pending()), keeps no
+ *   boundary.
  */
+static size_t
+hk_pack_cdm_terminate_size(enum agx_chip chip)
+{
+   switch (agx_chip_command_stream_generation(chip)) {
+   case AGX_CS_GENERATION_AGX2:
+      return AGX_CDM_STREAM_TERMINATE_LENGTH;
+   case AGX_CS_GENERATION_G15:
+   case AGX_CS_GENERATION_HAL200:
+   case AGX_CS_GENERATION_HAL300:
+      return AGX3_CDM_STREAM_TERMINATE_SIZE;
+   default:
+      return 0;
+   }
+}
+
+size_t
+hk_pack_cdm_terminate(enum agx_chip chip,
+                      uint8_t out[HK_PACK_CDM_TERMINATE_MAX])
+{
+   static_assert(AGX_CDM_STREAM_TERMINATE_LENGTH <= HK_PACK_CDM_TERMINATE_MAX,
+                 "AGX2 CDM terminate fits in HK_PACK_CDM_TERMINATE_MAX");
+   static_assert(HK_PACK_CDM_TERMINATE_MAX % sizeof(uint32_t) == 0,
+                 "HK_PACK_CDM_TERMINATE_MAX is 32-bit word aligned");
+   static_assert(AGX3_CDM_STREAM_TERMINATE_SIZE <= HK_PACK_CDM_TERMINATE_MAX,
+                 "AGX3 CDM terminate fits in HK_PACK_CDM_TERMINATE_MAX");
+
+   switch (agx_chip_command_stream_generation(chip)) {
+   case AGX_CS_GENERATION_AGX2: {
+      uint32_t words[HK_PACK_CDM_TERMINATE_MAX / sizeof(uint32_t)];
+      uint32_t *end = agx_cdm_terminate(words);
+      const size_t len = (size_t)((uint8_t *)end - (uint8_t *)words);
+      assert(len <= HK_PACK_CDM_TERMINATE_MAX);
+      memcpy(out, words, len);
+      return len;
+   }
+   case AGX_CS_GENERATION_G15:
+   case AGX_CS_GENERATION_HAL200:
+   case AGX_CS_GENERATION_HAL300:
+      return agx3_cdm_stream_terminate_pack(chip, out)
+                ? AGX3_CDM_STREAM_TERMINATE_SIZE
+                : 0;
+   default:
+      return 0;
+   }
+}
+
 enum hk_pack_boundary
 hk_pack_boundary(const struct hk_device *dev)
 {
@@ -47,11 +99,16 @@ hk_pack_boundary(const struct hk_device *dev)
                 : HK_PACK_BOUNDARY_NONE;
    }
 
-   if (agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_HAL200 &&
-       !hk_cdm_memory_scope_form(dev) && !hk_cdm_caches_pending(dev))
+   switch (agx_chip_command_stream_generation(chip)) {
+   case AGX_CS_GENERATION_AGX2:
+   case AGX_CS_GENERATION_G15:
       return HK_PACK_BOUNDARY_STRONG_FLUSH;
-
-   return HK_PACK_BOUNDARY_NONE;
+   case AGX_CS_GENERATION_HAL200:
+      return !hk_cdm_caches_pending(dev) ? HK_PACK_BOUNDARY_STRONG_FLUSH
+                                         : HK_PACK_BOUNDARY_NONE;
+   default:
+      return HK_PACK_BOUNDARY_NONE;
+   }
 }
 
 bool
@@ -113,11 +170,13 @@ hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
        cs->gen1_native_rq || cs->as_build || cs->imm_writes.size)
       return NULL;
 
+   const size_t terminate_size = hk_pack_cdm_terminate_size(dev->dev.chip);
    const uint8_t *end = (const uint8_t *)cs->current;
-   if (end - (const uint8_t *)cs->start <= AGX3_CDM_STREAM_TERMINATE_SIZE)
+   if (!terminate_size ||
+       end - (const uint8_t *)cs->start <= (ptrdiff_t)terminate_size)
       return NULL;
-   end -= AGX3_CDM_STREAM_TERMINATE_SIZE;
-   if (memcmp(end, terminate, AGX3_CDM_STREAM_TERMINATE_SIZE))
+   end -= terminate_size;
+   if (memcmp(end, terminate, terminate_size))
       return NULL;
 
    /* The stream ends with a strong flush, at a boundary that admits one
@@ -158,7 +217,8 @@ hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
 
 static void
 hk_pack_describe(struct hk_pack_member *member, const struct hk_cmd_buffer *cmd,
-                 const struct hk_cs *cs, uint8_t render_kinds)
+                 const struct hk_cs *cs, uint8_t render_kinds,
+                 size_t terminate_size)
 {
    memset(member, 0, sizeof(*member));
    if (!cs)
@@ -169,8 +229,8 @@ hk_pack_describe(struct hk_pack_member *member, const struct hk_cmd_buffer *cmd,
     * the render subqueue too. The resolver makes a wait of such a kind only
     * once the render subqueue ran work of it; neither does the planner. */
    member->cs = cs;
-   member->bytes = (const uint8_t *)cs->current - (const uint8_t *)cs->start -
-                   AGX3_CDM_STREAM_TERMINATE_SIZE;
+   member->bytes =
+      (const uint8_t *)cs->current - (const uint8_t *)cs->start - terminate_size;
    member->kinds = cs->sync.kind;
    member->render_waits = cs->sync.dep[HK_SYNC_VDM].prior & render_kinds;
    for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k)
@@ -190,11 +250,12 @@ hk_pack_describe_submit(struct hk_pack_member *members,
                         const uint8_t *terminate, bool atomics)
 {
    unsigned eligible = 0;
+   const size_t terminate_size = hk_pack_cdm_terminate_size(dev->dev.chip);
    uint8_t render_kinds = hk_sync_queue_kinds(sync, HK_SYNC_VDM);
    for (unsigned i = 0; i < n; ++i) {
       const struct hk_cs *cs =
          hk_pack_run_member(dev, cmds[i], terminate, atomics);
-      hk_pack_describe(&members[i], cmds[i], cs, render_kinds);
+      hk_pack_describe(&members[i], cmds[i], cs, render_kinds, terminate_size);
       render_kinds |= hk_sync_cmd_kinds(cmds[i], HK_SYNC_VDM);
       eligible += cs != NULL;
    }
@@ -320,6 +381,39 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
    }
 
    return run_count;
+}
+
+void
+hk_pack_init_packet(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                    struct hk_device *dev, uint8_t *start, uint64_t addr,
+                    size_t bytes, bool visible_completion)
+{
+   /* Preserve dynarray backing allocations across submissions and reset only
+    * the CDM prefix of hk_cs and synchronization fields of hk_cmd_buffer,
+    * avoiding per-submit heap traffic and zeroing unused graphics state. */
+   struct util_dynarray compute_resources = cs->compute_resources;
+   struct util_dynarray query_access_ranges = cs->query_access_ranges;
+   util_dynarray_clear(&compute_resources);
+   util_dynarray_clear(&query_access_ranges);
+
+   memset(cs, 0, offsetof(struct hk_cs, tib));
+   cs->compute_resources = compute_resources;
+   cs->query_access_ranges = query_access_ranges;
+
+   memset(&cmd->sync, 0, sizeof(cmd->sync));
+   assert(!cmd->sync_pass_records.size);
+   cmd->vk.base.device = &dev->vk;
+   list_inithead(&cmd->control_streams);
+   list_addtail(&cs->node, &cmd->control_streams);
+   cs->cmd = cmd;
+   cs->type = HK_CS_CDM;
+   cs->start = cs->current = start;
+   cs->end = start + bytes;
+   cs->addr = addr;
+   cs->root_size = bytes;
+   cs->sync.seq = 1;
+   cs->visible_completion = visible_completion;
+   hk_drm_attachment_set_init(&cs->compute_attachments);
 }
 
 void
