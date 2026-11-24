@@ -793,12 +793,56 @@ check_gen9_interchange_compressed(void)
    return 0;
 }
 
+/* Verify the Gen10 linear R32G32B32A32_UINT storage texel-buffer PBE shape
+ * used by large aligned buffer fills (width = 16384, height = 256, 64 MiB). */
+static int
+check_gen10_linear_buffer_fill(void)
+{
+   const uint64_t size = UINT64_C(64) << 20;
+   const uint64_t base = UINT64_C(0x1000000000);
+   struct agx_pbe_agx3_2d_fields fields = {
+      .layout = 0,
+      .channels = 0x38, /* R32G32B32A32 */
+      .type = 2,        /* UINT */
+      .swizzle_r = 0,
+      .swizzle_g = 1,
+      .swizzle_b = 2,
+      .swizzle_a = 3,
+      .width = 16384,
+      .height = (uint32_t)((size / 16) / 16384),
+      .buffer = base,
+      .stride_B = 16384 * 16,
+   };
+   struct agx_pbe_agx3_descriptor packed;
+   struct agx_pbe_agx3_2d_fields decoded;
+
+   CHECK(agx_pbe_agx3_2d_mip_pack(AGX_PBE_AGX3_GENERATION_10, &fields, 0, 1,
+                                  &packed));
+   CHECK(agx_pbe_agx3_2d_unpack(AGX_PBE_AGX3_GENERATION_10, packed.bytes,
+                                packed.length, &decoded));
+   CHECK(same_fields(AGX_PBE_AGX3_GENERATION_10, &decoded, &fields));
+
+   fields.buffer = base + size - 16;
+   CHECK(agx_pbe_agx3_2d_mip_pack(AGX_PBE_AGX3_GENERATION_10, &fields, 0, 1,
+                                  &packed));
+   CHECK(agx_pbe_agx3_2d_unpack(AGX_PBE_AGX3_GENERATION_10, packed.bytes,
+                                packed.length, &decoded));
+   CHECK(same_fields(AGX_PBE_AGX3_GENERATION_10, &decoded, &fields));
+
+   /* Fail closed past the Gen10 linear 44-bit address domain. */
+   fields.buffer = UINT64_C(1) << 44;
+   CHECK(!agx_pbe_agx3_2d_mip_pack(AGX_PBE_AGX3_GENERATION_10, &fields, 0, 1,
+                                   &packed));
+   return 0;
+}
+
 int
 main(void)
 {
    if (check_exact_generation_vectors() || check_exact_gen9_array_vector() ||
        check_exact_gen9_linear_vector() ||
        check_gen10_linear() ||
+       check_gen10_linear_buffer_fill() ||
        check_exhaustive_format_axes() ||
        check_dimension_and_address_bits() || check_fail_closed_axes() ||
        check_gen9_srgb_vector() ||

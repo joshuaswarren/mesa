@@ -102,7 +102,7 @@ hk_device_init_meta(struct hk_device *dev)
    dev->meta.cmd_bind_map_buffer = hk_cmd_bind_map_buffer;
    dev->meta.max_bind_map_buffer_size_B = 64 * 1024;
    dev->meta.buffer_access.max_fill_chunk_size =
-      agx_chip_native_agx3(dev->dev.chip) ? 16 : 0;
+      agx_chip_native_or_m5(dev->dev.chip) ? 16 : 0;
 
    for (unsigned i = 0; i < VK_META_BUFFER_CHUNK_SIZE_COUNT; ++i) {
       dev->meta.buffer_access.optimal_wg_size[i] = 64;
@@ -5165,7 +5165,7 @@ hk_g17p_fill_buffer_pbe_supported(const struct hk_device *dev,
 {
    const struct hk_physical_device *pdev =
       (const struct hk_physical_device *)dev->vk.physical;
-   if (dev->dev.chip != AGX_CHIP_G17P || buffer->va ||
+   if (!agx_chip_g17p_or_m5(dev->dev.chip) || buffer->va ||
        size < (64u << 20) || ((address | offset | size) & 15) ||
        !address || size > UINT64_MAX - address ||
        size / 16 > pdev->vk.properties.maxTexelBufferElements)
@@ -5206,7 +5206,7 @@ hk_xfer_fillbuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
    VK_FROM_HANDLE(hk_buffer, buffer, dstBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   if (agx_chip_native_agx3(dev->dev.chip)) {
+   if (agx_chip_native_or_m5(dev->dev.chip)) {
       /* VK_WHOLE_SIZE fills only complete 32-bit words. */
       VkDeviceSize size =
          vk_buffer_range(&buffer->vk, dstOffset, dstRange) & ~(VkDeviceSize)3;
