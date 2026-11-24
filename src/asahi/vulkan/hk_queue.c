@@ -2748,13 +2748,51 @@ struct hk_packed_runs {
 };
 
 static void
+hk_queue_pack_free_packets(struct hk_queue *queue)
+{
+   for (unsigned i = 0; i < queue->pack.packets_cap; ++i) {
+      util_dynarray_fini(&queue->pack.packets[i].cs.compute_resources);
+      util_dynarray_fini(&queue->pack.packets[i].cs.query_access_ranges);
+   }
+   free(queue->pack.packets);
+   queue->pack.packets = NULL;
+   queue->pack.packets_cap = 0;
+}
+
+static void *
+hk_queue_pack_scratch(struct util_dynarray *buf, unsigned count,
+                      size_t elem_size)
+{
+   util_dynarray_clear(buf);
+   if (!util_dynarray_resize_bytes(buf, count, elem_size))
+      return NULL;
+   return buf->data;
+}
+
+static bool
+hk_queue_pack_ensure_packets(struct hk_queue *queue, unsigned count)
+{
+   if (count <= queue->pack.packets_cap)
+      return true;
+
+   unsigned new_cap = queue->pack.packets_cap ? queue->pack.packets_cap * 2 : 8;
+   if (new_cap < count)
+      new_cap = count;
+
+   struct hk_packed_submit *packets = calloc(new_cap, sizeof(*packets));
+   if (!packets)
+      return false;
+
+   hk_queue_pack_free_packets(queue);
+   queue->pack.packets = packets;
+   queue->pack.packets_cap = new_cap;
+   return true;
+}
+
+static void
 hk_packed_runs_free(struct hk_device *dev, struct hk_packed_runs *p)
 {
-   for (unsigned i = 0; i < p->packet_count; ++i)
-      util_dynarray_fini(&p->packets[i].cs.compute_resources);
    agx_bo_unreference(&dev->dev, p->bo);
-   free(p->packets);
-   free(p->commands);
 }
 
 /* Keep each distinct resource profile once: the kernel folds the list into
@@ -2782,7 +2820,7 @@ hk_pack_dedup_resources(struct util_dynarray *list, size_t unique)
 }
 
 static bool
-hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
+hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
              const struct vk_queue_submit *submit, struct hk_packed_runs *out)
 {
    memset(out, 0, sizeof(*out));
@@ -2803,13 +2841,12 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
       .overhead =
          sizeof(terminate) + HK_CS_SPACE_PADDING + AGX_CDM_STREAM_LINK_LENGTH,
    };
-   struct hk_pack_member *members = malloc(n * sizeof(*members));
-   struct hk_pack_run *runs = malloc(n * sizeof(*runs));
-   if (!members || !runs) {
-      free(members);
-      free(runs);
+   struct hk_pack_member *members =
+      hk_queue_pack_scratch(&queue->pack.members, n, sizeof(*members));
+   struct hk_pack_run *runs =
+      hk_queue_pack_scratch(&queue->pack.runs, n, sizeof(*runs));
+   if (!members || !runs)
       return false;
-   }
 
    const unsigned eligible = hk_pack_describe_submit(
       members, dev, &queue->sync,
@@ -2820,27 +2857,30 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
    size_t total;
    const unsigned run_count =
       hk_pack_plan(members, n, &limits, runs, &packed_members, &total);
-   free(members);
 
    if (!run_count) {
       if (hk_pack_trace())
          fprintf(stderr, "HK_PACK runs=0 eligible=%u of %u strong_tails=%d\n",
                  eligible, n,
                  hk_pack_admits_strong_tail(hk_pack_boundary(dev)));
-      free(runs);
       return false;
    }
 
-   out->bo = agx_bo_create(&dev->dev, total, 0, 0, "Packed compute submit");
+   const bool cached = hk_g17p_cached_cmd_memory(&dev->dev);
+   out->bo = agx_bo_create(&dev->dev, total, 0,
+                           cached ? AGX_BO_WRITEBACK : 0,
+                           "Packed compute submit");
    uint8_t *map = out->bo ? agx_bo_map(out->bo) : NULL;
-   out->packets = calloc(run_count, sizeof(*out->packets));
-   out->commands = malloc((n - packed_members + run_count) * sizeof(*out->commands));
-   if (!map || !out->packets || !out->commands) {
-      free(runs);
+   struct vk_command_buffer **commands =
+      hk_queue_pack_scratch(&queue->pack.commands,
+                            n - packed_members + run_count, sizeof(*commands));
+   if (!map || !commands || !hk_queue_pack_ensure_packets(queue, run_count)) {
       hk_packed_runs_free(dev, out);
       memset(out, 0, sizeof(*out));
       return false;
    }
+   out->packets = queue->pack.packets;
+   out->commands = commands;
 
    unsigned r = 0;
    for (unsigned i = 0; i < n;) {
@@ -2853,19 +2893,9 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
       struct hk_packed_submit *packet = &out->packets[out->packet_count++];
       struct hk_cmd_buffer *cmd = &packet->cmd;
       struct hk_cs *cs = &packet->cs;
-      cmd->vk.base.device = &dev->vk;
-      list_inithead(&cmd->control_streams);
-      list_addtail(&cs->node, &cmd->control_streams);
-      cs->cmd = cmd;
-      cs->type = HK_CS_CDM;
-      cs->start = cs->current = map + pr->offset;
-      cs->end = map + pr->offset + pr->bytes;
-      cs->addr = out->bo->va->addr + pr->offset;
-      cs->root_size = pr->bytes;
-      cs->sync.seq = 1;
-      cs->visible_completion = visible_completion;
-      hk_drm_attachment_set_init(&cs->compute_attachments);
-      util_dynarray_init(&cs->compute_resources, NULL);
+      hk_pack_init_packet(cmd, cs, dev, map + pr->offset,
+                          out->bo->va->addr + pr->offset, pr->bytes,
+                          visible_completion);
 
       for (unsigned m = 0; m < pr->count; ++m) {
          const struct hk_cmd_buffer *source =
@@ -2892,7 +2922,6 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
                                (uint8_t *)item_end - (uint8_t *)item->start,
                                AGX_CDM_STREAM_LINK_LENGTH)) {
             assert(!"packet sized too small");
-            free(runs);
             hk_packed_runs_free(dev, out);
             memset(out, 0, sizeof(*out));
             return false;
@@ -2944,6 +2973,11 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
       memcpy(cs->current, terminate, sizeof(terminate));
       cs->current = (uint8_t *)cs->current + sizeof(terminate);
       memset(cs->current, 0, HK_CS_SPACE_PADDING);
+      if (cached) {
+         const size_t written =
+            (uint8_t *)cs->current - (uint8_t *)cs->start + HK_CS_SPACE_PADDING;
+         util_flush_range_no_fence(cs->start, written);
+      }
       hk_pack_finish_sync(cmd, cs);
 
       out->commands[out->command_count++] = &cmd->vk;
@@ -2951,12 +2985,14 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
       r++;
    }
 
+   if (cached)
+      util_post_flush_fence();
+
    if (hk_pack_trace())
       fprintf(stderr, "HK_PACK runs=%u members=%u eligible=%u of %u commands=%u "
               "bytes=%zu strong_tails=%d\n", run_count, packed_members,
               eligible, n, out->command_count, total,
               hk_pack_admits_strong_tail(hk_pack_boundary(dev)));
-   free(runs);
    return true;
 }
 
@@ -3425,5 +3461,9 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
    agx_bo_unreference(&dev->dev, queue->g17p_sstt_flush_bo);
    agx_bo_unreference(&dev->dev, queue->ts_carrier_bo);
    util_dynarray_fini(&queue->sync_resolved);
+   hk_queue_pack_free_packets(queue);
+   util_dynarray_fini(&queue->pack.members);
+   util_dynarray_fini(&queue->pack.runs);
+   util_dynarray_fini(&queue->pack.commands);
    vk_free(&dev->vk.alloc, queue);
 }

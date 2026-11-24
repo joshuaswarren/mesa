@@ -3023,7 +3023,8 @@ hk_ray_tracing_pipeline_cmd_bind(struct vk_command_buffer *vk_cmd,
    struct hk_cmd_buffer *cmd =
       container_of(vk_cmd, struct hk_cmd_buffer, vk);
 
-   cmd->state.rt.pipeline =
+   cmd->used_rt = true;
+   cmd->rt.pipeline =
       vk_pipeline ? hk_pipeline_to_ray_tracing(vk_pipeline) : NULL;
 }
 

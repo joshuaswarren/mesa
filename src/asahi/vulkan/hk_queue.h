@@ -12,6 +12,7 @@
 #include "vk_queue.h"
 
 struct hk_device;
+struct hk_packed_submit;
 
 /* Kernel queues one hk_queue may spread its independent work over. */
 #define HK_QUEUE_SIBLINGS_MAX 4
@@ -100,6 +101,15 @@ struct hk_queue {
    /* Scratch for queue_submit: the resolved sync fields of each stream
     * occurrence of the submission being built (hk_sync_resolve_submit()). */
    struct util_dynarray sync_resolved;
+
+   /* Reusable scratch for submit packing (hk_pack_runs()). */
+   struct {
+      struct util_dynarray members;
+      struct util_dynarray runs;
+      struct util_dynarray commands;
+      struct hk_packed_submit *packets;
+      unsigned packets_cap;
+   } pack;
 
    /* Compute kick (hk_compute_kick.c). watched is set at device creation
     * for a queue whose priority class has a kick queue. The rest is

@@ -339,7 +339,8 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
 
    hk_descriptor_state_fini(cmd, &cmd->state.gfx.descriptors);
    hk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
-   hk_descriptor_state_fini(cmd, &cmd->state.rt.descriptors);
+   if (unlikely(cmd->used_rt))
+      hk_descriptor_state_fini(cmd, &cmd->rt.descriptors);
 
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_MAIN, &cmd->uploader.main.bos);
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_USC, &cmd->uploader.usc.bos);
@@ -478,12 +479,11 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       _mesa_set_clear(cmd->m5_pushed_images, NULL);
    util_dynarray_clear(&cmd->oq_ends);
 
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (dev->dev.params.gpu_generation == 13 ||
-       dev->dev.params.gpu_generation == 14) {
+   if (!cmd->g17p_gfx_caches_used) {
       /* These native graphics caches are zero-initialized at allocation and
-       * never used on AGX2. Reset the common state on either side without
-       * clearing their 8.5 KiB again for every recording. */
+       * untouched on AGX2 or compute-only recordings. Reset the common state
+       * on either side without clearing their 8.5 KiB again for every
+       * recording. */
       const size_t first =
          offsetof(struct hk_cmd_buffer, state.gfx.g17p_ioto) -
          offsetof(struct hk_cmd_buffer, state);
@@ -495,10 +495,19 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       memset((char *)&cmd->state + end, 0, sizeof(cmd->state) - end);
    } else {
       memset(&cmd->state, 0, sizeof(cmd->state));
+      cmd->g17p_gfx_caches_used = false;
+   }
+   if (cmd->g17p_bg_eot_cache_used) {
       for (unsigned i = 0; i < HK_G17P_BG_EOT_CACHE_ENTRIES; ++i)
          cmd->g17p_bg_eot_cache[i].valid = false;
       cmd->g17p_bg_eot_cache_next = 0;
+      cmd->g17p_bg_eot_cache_used = false;
    }
+   if (unlikely(cmd->used_rt)) {
+      memset(&cmd->rt, 0, sizeof(cmd->rt));
+      cmd->used_rt = false;
+   }
+   cmd->pass_merge.valid = false;
    /* Nothing has been recorded since this reset. */
    cmd->g17p_pristine = true;
 }
@@ -951,7 +960,8 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
 }
 
 static void
-hk_cmd_buffer_publish_root_uploads(struct hk_cmd_buffer *cmd)
+hk_cmd_buffer_publish_root_uploads(struct hk_cmd_buffer *cmd,
+                                   bool already_fenced)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (!agx_chip_native_agx3(dev->dev.chip) ||
@@ -961,7 +971,8 @@ hk_cmd_buffer_publish_root_uploads(struct hk_cmd_buffer *cmd)
    if (util_has_cache_ops()) {
       /* Every root range was cleaned when written. Complete those cache
        * operations once, after recording has made all roots immutable. */
-      util_post_flush_fence();
+      if (!already_fenced)
+         util_post_flush_fence();
       return;
    }
 
@@ -976,7 +987,7 @@ hk_cmd_buffer_publish_root_uploads(struct hk_cmd_buffer *cmd)
  * are no longer referenced. Linked layouts retain the conservative path. */
 static bool
 hk_cmd_bo_clean_unlinked_streams(struct hk_cmd_buffer *cmd,
-                                 const struct hk_cmd_bo *bo)
+                                 const struct hk_cmd_bo *bo, bool *cleaned)
 {
    const uintptr_t base = (uintptr_t)bo->map;
    if (bo->size > UINTPTR_MAX - base)
@@ -993,21 +1004,23 @@ hk_cmd_bo_clean_unlinked_streams(struct hk_cmd_buffer *cmd,
          return false;
       const size_t padding = MIN2(end - current, HK_CS_SPACE_PADDING);
       const size_t bytes = current - start + padding;
-      if (bytes)
+      if (bytes) {
          util_flush_range_no_fence((void *)start, bytes);
+         *cleaned = true;
+      }
    }
    return true;
 }
 
 /* Clean everything recording wrote to CPU-cached command memory (see
- * hk_g17p_cached_cmd_memory()); hk_cmd_buffer_publish_root_uploads() and
- * queue submission fence the cleans. */
-static void
+ * hk_g17p_cached_cmd_memory()) and issue one completion fence covering both
+ * these cleans and any per-upload root cleans. */
+static bool
 hk_cmd_buffer_publish_cached_uploads(struct hk_cmd_buffer *cmd)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (!hk_g17p_cached_cmd_memory(&dev->dev))
-      return;
+      return false;
 
    bool linked_stream = false;
    list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node)
@@ -1019,27 +1032,36 @@ hk_cmd_buffer_publish_cached_uploads(struct hk_cmd_buffer *cmd)
    const struct hk_uploader *current[] = {
       &cmd->uploader.main, &cmd->uploader.streams, &cmd->uploader.usc,
    };
+   bool cleaned = false;
    for (unsigned l = 0; l < 2; ++l) {
       struct list_head *bos =
          l == 0 ? &cmd->uploader.main.bos : &cmd->uploader.usc.bos;
       list_for_each_entry(struct hk_cmd_bo, bo, bos, link) {
          if (bo->stream_only && !linked_stream &&
-             hk_cmd_bo_clean_unlinked_streams(cmd, bo))
+             hk_cmd_bo_clean_unlinked_streams(cmd, bo, &cleaned))
             continue;
          size_t size = bo->size;
          for (unsigned u = 0; u < ARRAY_SIZE(current); ++u) {
             if (current[u]->map == bo->map)
                size = MIN2(size, current[u]->offset);
          }
-         if (size)
+         if (size) {
             util_flush_range_no_fence(bo->map, size);
+            cleaned = true;
+         }
       }
    }
    list_for_each_entry(struct hk_vdm_allocation, allocation,
-                       &cmd->vdm_allocations, link)
+                       &cmd->vdm_allocations, link) {
       hk_cmd_pool_clean_vdm(allocation);
-   hk_ioto_arena_clean(cmd);
+      cleaned = true;
+   }
+   cleaned |= hk_ioto_arena_clean(cmd);
+   if (!cleaned && list_is_empty(&cmd->uploader.root.bos))
+      return false;
+
    util_post_flush_fence();
+   return true;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1115,8 +1137,8 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    /* G17P roots use cached mappings. Publish the completed recording once,
     * after every root table is immutable and before submission can consume
     * any address embedded in the command streams. */
-   hk_cmd_buffer_publish_cached_uploads(cmd);
-   hk_cmd_buffer_publish_root_uploads(cmd);
+   const bool fenced = hk_cmd_buffer_publish_cached_uploads(cmd);
+   hk_cmd_buffer_publish_root_uploads(cmd, fenced);
    hk_cmd_buffer_end_alias_sites(cmd);
 
    hk_cmd_print_upload_stats(cmd);
@@ -1311,7 +1333,7 @@ brl_discard_init_record(struct hk_cmd_buffer *cmd,
 
    /* The transition is work now: an ended pass instance cannot continue
     * across it (hk_m5_pass_merge_classify() assumes transitions do none). */
-   cmd->state.pass_merge.valid = false;
+   cmd->pass_merge.valid = false;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1369,7 +1391,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    /* M5: a render pass instance that ended may still be continued by the
     * next one if this dependency is framebuffer-local. */
-   if (unlikely(cmd->state.pass_merge.valid))
+   if (unlikely(cmd->pass_merge.valid))
       hk_m5_pass_merge_barrier(cmd, pDependencyInfo);
 
    /* Host availability is recorded against the work already recorded. */
@@ -1475,8 +1497,8 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    /* The dependency this barrier recorded is the one a continued instance
     * applies to its stream (hk_sync_merge_rendering()); a stream it created
     * or extended still ends the candidacy there. */
-   if (unlikely(cmd->state.pass_merge.valid))
-      cmd->state.pass_merge.sync_epoch = cmd->sync.epoch;
+   if (unlikely(cmd->pass_merge.valid))
+      cmd->pass_merge.sync_epoch = cmd->sync.epoch;
 }
 
 __attribute__((hot)) void
@@ -1645,7 +1667,8 @@ hk_CmdBindDescriptorSets2KHR(
    }
 
    if (pBindDescriptorSetsInfo->stageFlags & HK_RT_SHADER_STAGES) {
-      hk_bind_descriptor_sets(cmd, &cmd->state.rt.descriptors,
+      cmd->used_rt = true;
+      hk_bind_descriptor_sets(cmd, &cmd->rt.descriptors,
                               pBindDescriptorSetsInfo);
    }
 }
@@ -1680,8 +1703,10 @@ hk_CmdPushConstants2KHR(VkCommandBuffer commandBuffer,
    if (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
       hk_push_constants(cmd, &cmd->state.cs.descriptors, pPushConstantsInfo);
 
-   if (pPushConstantsInfo->stageFlags & HK_RT_SHADER_STAGES)
-      hk_push_constants(cmd, &cmd->state.rt.descriptors, pPushConstantsInfo);
+   if (pPushConstantsInfo->stageFlags & HK_RT_SHADER_STAGES) {
+      cmd->used_rt = true;
+      hk_push_constants(cmd, &cmd->rt.descriptors, pPushConstantsInfo);
+   }
 }
 
 /* VK_EXT_descriptor_buffer */
@@ -1761,8 +1786,10 @@ hk_CmdSetDescriptorBufferOffsets2EXT(
    if (pInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
       hk_set_descriptor_buffer_offsets(cmd, &cmd->state.cs.descriptors, pInfo);
 
-   if (pInfo->stageFlags & HK_RT_SHADER_STAGES)
-      hk_set_descriptor_buffer_offsets(cmd, &cmd->state.rt.descriptors, pInfo);
+   if (pInfo->stageFlags & HK_RT_SHADER_STAGES) {
+      cmd->used_rt = true;
+      hk_set_descriptor_buffer_offsets(cmd, &cmd->rt.descriptors, pInfo);
+   }
 }
 
 static void
@@ -1804,8 +1831,10 @@ hk_CmdBindDescriptorBufferEmbeddedSamplers2EXT(
    if (pInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
       hk_bind_embedded_samplers(cmd, &cmd->state.cs.descriptors, pInfo);
 
-   if (pInfo->stageFlags & HK_RT_SHADER_STAGES)
-      hk_bind_embedded_samplers(cmd, &cmd->state.rt.descriptors, pInfo);
+   if (pInfo->stageFlags & HK_RT_SHADER_STAGES) {
+      cmd->used_rt = true;
+      hk_bind_embedded_samplers(cmd, &cmd->rt.descriptors, pInfo);
+   }
 }
 
 static struct hk_push_descriptor_set *
@@ -1933,7 +1962,8 @@ hk_CmdPushDescriptorSet2KHR(
    }
 
    if (pPushDescriptorSetInfo->stageFlags & HK_RT_SHADER_STAGES) {
-      hk_push_descriptor_set(cmd, &cmd->state.rt.descriptors,
+      cmd->used_rt = true;
+      hk_push_descriptor_set(cmd, &cmd->rt.descriptors,
                              pPushDescriptorSetInfo);
    }
 }
@@ -2031,6 +2061,7 @@ hk_upload_native_spilled_rt_descs(struct hk_cmd_buffer *cmd)
       cached->pointer = pointer;
       cached->color_att_count = render->color_att_count;
       cached->valid = true;
+      cmd->g17p_gfx_caches_used = true;
    }
    return pointer;
 }
@@ -3005,6 +3036,7 @@ hk_g17p_graphics_uniform_ranges(
             memcpy(cached->published, published, sizeof(published));
             cached->address = pointers_va;
             cached->valid = true;
+            cmd->g17p_gfx_caches_used = true;
          }
       }
       if (!pointers_va)
@@ -3734,6 +3766,7 @@ static uint64_t
 hk_m5_upload_graphics_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                               struct hk_linked_shader *linked)
 {
+   cmd->g17p_gfx_caches_used = true;
    s = hk_linked_shader_source(s, linked);
    const unsigned stage = s->info.stage == MESA_SHADER_FRAGMENT ? 1 : 0;
    struct hk_g17p_graphics_ioto_cache_entry *cached =
@@ -3924,6 +3957,7 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       return hk_m5_upload_graphics_program(cmd, s, linked);
 
    if (agx_chip_native_agx3(dev->dev.chip)) {
+      cmd->g17p_gfx_caches_used = true;
       const unsigned stage = s->info.stage == MESA_SHADER_FRAGMENT ? 1 : 0;
       struct hk_g17p_graphics_ioto_cache_entry *cached =
          &cmd->state.gfx.g17p_ioto[stage];

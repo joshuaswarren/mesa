@@ -1688,6 +1688,7 @@ hk_g17p_bg_eot_cache_get(struct hk_cmd_buffer *cmd,
    cached->direct_color_resolve_variants = 0;
    cached->dev_entry = NULL;
    cached->valid = true;
+   cmd->g17p_bg_eot_cache_used = true;
 
    /* frg-codegen v4 BG/EOT device cache: one value lookup per new
     * pass. A hit fills every variant this recording will ask for; a miss
@@ -4052,7 +4053,7 @@ hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
                           VkAccessFlags2 dst_access, bool buffer,
                           bool transition, const struct vk_image *image)
 {
-   struct hk_pass_merge_candidate *m = &cmd->state.pass_merge;
+   struct hk_pass_merge_candidate *m = &cmd->pass_merge;
    if (!m->valid)
       return;
 
@@ -4387,7 +4388,7 @@ static bool
 hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   struct hk_pass_merge_candidate *m = &cmd->state.pass_merge;
+   struct hk_pass_merge_candidate *m = &cmd->pass_merge;
    struct hk_cs *cs = m->cs;
    const struct hk_rendering_state *prev = &m->render;
    struct hk_rendering_state *render = &cmd->state.gfx.render;
@@ -4534,7 +4535,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_rendering_state *render = &cmd->state.gfx.render;
 
-   if (unlikely(cmd->state.pass_merge.valid) &&
+   if (unlikely(cmd->pass_merge.valid) &&
        hk_m5_pass_merge_begin(cmd, pRenderingInfo))
       return;
 
@@ -5402,7 +5403,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    /* M5: the next instance may continue in this stream, see
     * hk_m5_pass_merge_begin(). Where the draws ended and the chunk they
     * ended in, before the terminator. */
-   struct hk_pass_merge_candidate *merge = &cmd->state.pass_merge;
+   struct hk_pass_merge_candidate *merge = &cmd->pass_merge;
    merge->valid = false;
    const bool continuable = cs && hk_m5_pass_merge_candidate(cmd, cs);
    void *const resume_current = cs ? cs->current : NULL;
