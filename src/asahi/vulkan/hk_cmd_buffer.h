@@ -1243,6 +1243,12 @@ struct hk_cs {
    struct util_dynarray imm_write_query_ranges;
    bool imm_write_query_untracked;
 
+   /* Post-graphics stream: timestamps a render pass instance writes after
+    * the one its render ends with, copied from that end stamp in one launch
+    * as the stream ends (struct hk_stamp_copy, hk_sync_write_timestamp()).
+    * Implies CDM. */
+   struct util_dynarray stamp_copies;
+
    /* Native private-memory profiles for every dispatch in this stream. */
    struct util_dynarray compute_resources;
    /* Fields of the M5 HAL300 graphics core this stream last emitted, and the
@@ -2680,6 +2686,7 @@ hk_cs_destroy(struct hk_cs *cs)
    } else {
       util_dynarray_fini(&cs->imm_writes);
       util_dynarray_fini(&cs->imm_write_query_ranges);
+      util_dynarray_fini(&cs->stamp_copies);
       util_dynarray_fini(&cs->oq_stamps);
       util_dynarray_fini(&cs->query_access_ranges);
    }
@@ -2710,6 +2717,9 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
       struct hk_cs *cs = *ptr;
       if (unlikely(cs->query_reset_pending))
          hk_flush_query_resets(cmd, cs);
+
+      if (cs->stamp_copies.size)
+         hk_sync_dispatch_stamp_copies(cmd, cs);
 
       /* This control stream may write immediates as it ends. Queue the writes
        * now that we're done emitting everything else. Occlusion availability
@@ -3146,6 +3156,12 @@ uint64_t hk_apply_conditional_rendering(struct hk_cmd_buffer *cmd,
 
 void hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
                     bool after_gfx);
+/* Launch libagx_copy_timestamps for count copies in the compute stream cs,
+ * the open general or post-graphics stream, which is ordered after the
+ * stamps they read. */
+void hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                            const struct hk_stamp_copy *copies,
+                            unsigned count);
 bool hk_ensure_occlusion_query_for_draw(struct hk_cmd_buffer *cmd);
 
 /* Dispatch the native G17P raw-address fill meta shader into an explicitly

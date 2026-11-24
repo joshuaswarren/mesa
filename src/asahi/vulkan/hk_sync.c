@@ -17,7 +17,6 @@
 #include "hk_queue.h"
 
 #include "libagx_dgc.h"
-#include "libagx_shaders.h"
 
 #include "drm-uapi/asahi_drm.h"
 #include "util/bitscan.h"
@@ -1302,6 +1301,7 @@ hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    replace_pointer(&st->brl_transition_dep[sq].cut, cs, prev);
    replace_pointer(&st->brl_transition_last[sq], cs, prev);
    replace_pointer(&st->brl_event_poll, cs, prev);
+   replace_pointer(&st->stamp_copy_after[sq], cs, prev);
    replace_pointer(&st->pass_vdm, cs, NULL);
    xfer_replace_stream(st, cs, prev);
    if (st->pass_tile_first == cs) {
@@ -1388,6 +1388,7 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
    replace_pointer(&st->brl_transition_dep[sq].cut, from, into);
    replace_pointer(&st->brl_transition_last[sq], from, into);
    replace_pointer(&st->brl_event_poll, from, into);
+   replace_pointer(&st->stamp_copy_after[sq], from, into);
    records_replace_stream(cmd, from, into);
    xfer_replace_stream(st, from, into);
 
@@ -1479,14 +1480,123 @@ last_stream(struct hk_cmd_buffer *cmd)
    return list_last_entry(&cmd->control_streams, struct hk_cs, node);
 }
 
+/* A compute stream that carries timestamps alone, or copies them: it waits
+ * like work of every class, and only query commands and later timestamps
+ * wait for it (HK_SYNC_STAMP). */
 static struct hk_cs *
 timestamp_only_stream(struct hk_cmd_buffer *cmd,
                       const struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
 {
-   cmd->sync.kind_override = HK_SYNC_ALL;
+   const uint8_t kind = cmd->sync.kind_override;
+   cmd->sync.kind_override = HK_SYNC_STAMP;
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
-   cmd->sync.kind_override = 0;
+   cmd->sync.kind_override = kind;
    return cs;
+}
+
+/* Whether the end stamp of tail, the latest stream, also gives a timestamp
+ * recorded now whose own first scope is dep (hk_sync_src_dep() with tail as
+ * self): a command carrying that stamp alone would wait for nothing tail
+ * does not, tail itself aside, so its stamp could be latched no earlier.
+ * Copying tail's value is then a valid result for it, and later than every
+ * earlier stamp, which is in dep or at most tail's. */
+static bool
+stamp_covered(struct hk_cmd_buffer *cmd, struct hk_cs *tail,
+              const struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
+{
+   const struct hk_sync_state *st = &cmd->sync;
+   if (st->in_pass || st->internal_active || st->brl_transition_active)
+      return false;
+
+   /* What hk_sync_stream_created() adds for such a command: the recorded
+    * requirements of every class. */
+   struct hk_sync_dep need[HK_SYNC_NUM_SQ];
+   req_for_kinds(cmd, HK_SYNC_STAMP, need);
+
+   /* And at submission the requirements earlier command buffers carry into
+    * every class (stream_carry()). tail takes those of fewer classes unless
+    * it waits for the whole earlier prefix, which covers them. */
+   const bool carried =
+      !(full_kinds(HK_SYNC_STAMP) & ~stream_carry(tail));
+
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      const struct hk_sync_dep *have = &tail->sync.dep[sq];
+      dep_max(&need[sq], &dep[sq]);
+
+      if (need[sq].prior & ~have->prior)
+         return false;
+      if (!carried && (have->prior & HK_SYNC_STREAM_KINDS) !=
+                         HK_SYNC_STREAM_KINDS)
+         return false;
+
+      /* A wait on tail's own prefix is a wait on the streams before it. */
+      struct hk_cs *cut = need[sq].cut;
+      if (cut == tail)
+         cut = previous_on_sq(cmd, tail);
+      if (cut && (!have->cut || cut->sync.seq > have->cut->sync.seq))
+         return false;
+   }
+
+   return true;
+}
+
+/* Record the pending copies in cs, the open general compute stream, which
+ * follows the streams they read. The launch keeps it a timestamp stream. */
+static void
+stamp_copies_record(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_sync_state *st = &cmd->sync;
+   const uint8_t kind = st->kind_override;
+   st->kind_override = HK_SYNC_STAMP;
+   hk_record_stamp_copies(cmd, cs, st->stamp_copies, st->stamp_copy_count);
+   st->kind_override = kind;
+   st->stamp_copy_count = 0;
+   memset(st->stamp_copy_after, 0, sizeof(st->stamp_copy_after));
+   st->epoch++;
+}
+
+/* Whether cs, a compute stream, waits for every stream the pending copies
+ * read. */
+static bool
+stamp_copies_follow(const struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
+{
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      const struct hk_cs *after = cmd->sync.stamp_copy_after[sq];
+      const struct hk_cs *cut = cs->sync.dep[sq].cut;
+      if (after && (!cut || cut->sync.seq < after->sync.seq))
+         return false;
+   }
+   return true;
+}
+
+void
+hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd)
+{
+   struct hk_sync_state *st = &cmd->sync;
+   if (!st->stamp_copy_count)
+      return;
+
+   struct hk_sync_dep after[HK_SYNC_NUM_SQ];
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
+      after[sq] = (struct hk_sync_dep){.cut = st->stamp_copy_after[sq]};
+
+   struct hk_cs *cs = timestamp_only_stream(cmd, after);
+   if (!cs)
+      return;
+
+   stamp_copies_record(cmd, cs);
+   /* Ended, a later first scope naming HK_SYNC_STAMP orders after it
+    * whatever stream that work lands in. */
+   hk_cmd_buffer_end_compute(cmd);
+}
+
+void
+hk_sync_dispatch_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   const unsigned count =
+      util_dynarray_num_elements(&cs->stamp_copies, struct hk_stamp_copy);
+   hk_record_stamp_copies(cmd, cs, cs->stamp_copies.data, count);
+   util_dynarray_clear(&cs->stamp_copies);
 }
 
 static bool
@@ -1567,7 +1677,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       }
 
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-      hk_sync_src_dep(cmd, src_kinds, gfx, dep);
+      hk_sync_src_dep(cmd, hk_sync_stamp_scope(src_kinds), gfx, dep);
       /* The render can only wait on streams positioned before it. The
        * latest stream of a kind may be this render's own post-graphics
        * stream (an in-pass stamp's copy, an occlusion query's availability
@@ -1582,13 +1692,20 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       stamp_wait(cmd, gfx, dep);
 
       if (gfx->timestamp.end.handle) {
-         libagx_copy_timestamp(cmd, agx_1d(1), AGX_BARRIER_ALL | AGX_POSTGFX,
-                               req.addr, gfx->timestamp.end.addr);
-         hk_cmd_note_query_range(cmd, cmd->current_cs.post_gfx,
-                                 gfx->timestamp.end.handle,
-                                 gfx->timestamp.end.offset_B, sizeof(uint64_t));
-         hk_cmd_note_query_range(cmd, cmd->current_cs.post_gfx, req.handle,
-                                 req.offset_B, sizeof(uint64_t));
+         /* The copy runs after the render, with the render's other copies
+          * in one launch when its post-graphics stream ends
+          * (hk_sync_dispatch_stamp_copies()). */
+         struct hk_cs *post = hk_cmd_buffer_get_cs_general(
+            cmd, &cmd->current_cs.post_gfx, true);
+         if (!post)
+            return;
+         if (!post->stamp_copies.data)
+            post->stamp_copies = UTIL_DYNARRAY_INIT;
+         const struct hk_stamp_copy copy = {
+            .dst = req,
+            .src = gfx->timestamp.end,
+         };
+         util_dynarray_append(&post->stamp_copies, copy);
       } else {
          gfx->timestamp.end = req;
       }
@@ -1622,9 +1739,10 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
 
    hk_sync_flush_pending_timestamp(cmd);
 
+   const uint8_t scope = hk_sync_stamp_scope(src_kinds);
    struct hk_cs *tail = last_stream(cmd);
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, src_kinds, tail, dep);
+   hk_sync_src_dep(cmd, scope, tail, dep);
 
    if (tail && !tail->timestamp.end.handle) {
       tail->timestamp.end = req;
@@ -1639,10 +1757,30 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       return;
    }
 
+   /* Nothing was recorded since tail took its end stamp and nothing this
+    * stamp waits for is missing from it: copy that stamp instead of
+    * recording a command for this one alone. */
+   if (tail && st->stamp_copy_count < HK_SYNC_STAMP_COPIES &&
+       stamp_covered(cmd, tail, dep)) {
+      const unsigned sq = hk_sync_sq(tail);
+      st->stamp_copies[st->stamp_copy_count++] = (struct hk_stamp_copy){
+         .dst = req,
+         .src = tail->timestamp.end,
+      };
+      st->stamp_copy_after[sq] = hk_sync_later(st->stamp_copy_after[sq], tail);
+      return;
+   }
+
+   /* A command of its own, after every earlier stream in the first scope,
+    * tail included: tail is no stream this stamp rides on. */
+   hk_sync_src_dep(cmd, scope, NULL, dep);
    struct hk_cs *cs = timestamp_only_stream(cmd, dep);
    if (!cs)
       return;
    cs->timestamp.end = req;
+   /* The pending copies ride on it when it follows the stamps they read. */
+   if (st->stamp_copy_count && stamp_copies_follow(cmd, cs))
+      stamp_copies_record(cmd, cs);
    stamp_carrier_launch(cmd);
    hk_cmd_buffer_end_compute(cmd);
 }

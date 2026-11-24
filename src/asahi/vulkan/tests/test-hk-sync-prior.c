@@ -391,12 +391,110 @@ test_timestamp_execution_scopes(void)
         timed->sync.prior[HK_SYNC_CDM] == 1);
    }
 }
+/* A timestamp-only command (HK_SYNC_STAMP) waits like work of every class
+ * but is in no application first scope: a barrier, a later command buffer
+ * and a later submission order renders and dispatches after the work around
+ * it, never after it. Query commands still follow it. */
+static void
+test_stamp_kind_isolation(void)
+{
+   for (unsigned exact = 0; exact < 2; ++exact) {
+      struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G17S, exact);
+      struct hk_cs *work = add(cmd, true);
+      hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
+      cmd->sync.kind_override = HK_SYNC_STAMP;
+      struct hk_cs *carrier = add(cmd, true);
+      cmd->sync.kind_override = 0;
+      T("timestamp stream takes the requirements of every class",
+        carrier->sync.dep[HK_SYNC_CDM].cut == work &&
+        (hk_sync_full_kinds(carrier->sync.kind) & HK_SYNC_ALL) == HK_SYNC_ALL);
+      hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+      struct hk_cs *render = add(cmd, false);
+      struct hk_cs *after = add(cmd, true);
+      T("ALL_COMMANDS barrier orders later work after work, not the stamp",
+        render->sync.dep[HK_SYNC_CDM].cut == work &&
+        after->sync.dep[HK_SYNC_CDM].cut == work);
+      struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+      hk_sync_src_dep(cmd, HK_SYNC_ALL, NULL, dep);
+      T("application scope skips the stamp",
+        dep[HK_SYNC_CDM].cut == after);
+      hk_sync_src_dep(cmd, hk_sync_stamp_scope(HK_SYNC_GFX), NULL, dep);
+      T("a timestamp's scope names the stamp",
+        dep[HK_SYNC_CDM].cut == carrier);
+      T("an empty timestamp scope names nothing",
+        hk_sync_stamp_scope(0) == 0);
+
+      /* Across submissions: the stamp alone on the compute subqueue. */
+      struct hk_queue *q = new_queue(exact);
+      struct hk_cmd_buffer *first = timestamp_cmd(AGX_CHIP_G17S, exact);
+      add(first, false);
+      first->sync.kind_override = HK_SYNC_STAMP;
+      struct hk_cs *stamp = add(first, true);
+      first->sync.kind_override = 0;
+      T("stamp submission resolves", submit(q, first));
+      struct hk_cmd_buffer *app = timestamp_cmd(AGX_CHIP_G17S, exact);
+      hk_sync_barrier(app, HK_SYNC_ALL, HK_SYNC_ALL);
+      struct hk_cs *dispatch = add(app, true);
+      T("later dispatch resolves", submit(q, app));
+      T("later dispatch does not wait for the stamp",
+        dispatch->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+        dispatch->sync.prior[HK_SYNC_CDM] == 0);
+      /* And a query command right after it, on a queue of its own. */
+      struct hk_queue *qq = new_queue(exact);
+      struct hk_cmd_buffer *stamped = timestamp_cmd(AGX_CHIP_G17S, exact);
+      add(stamped, false);
+      stamped->sync.kind_override = HK_SYNC_STAMP;
+      struct hk_cs *only = add(stamped, true);
+      stamped->sync.kind_override = 0;
+      T("second stamp submission resolves", submit(qq, stamped));
+      struct hk_cmd_buffer *query = timestamp_cmd(AGX_CHIP_G17S, exact);
+      hk_sync_barrier(query, HK_SYNC_QUERY_SCOPE, HK_SYNC_ALL);
+      struct hk_cs *copy = add(query, true);
+      T("later query command resolves", submit(qq, query));
+      T("later query command waits for the stamp",
+        exact ? copy->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+                   copy->sync.prior[HK_SYNC_CDM] == only->sync.index
+              : copy->sync.barrier[HK_SYNC_CDM] == 0);
+      T("the stamp submission's compute command is the stamp",
+        stamp->sync.index == 1 && only->sync.index == 1);
+   }
+}
+
 /* Fixtures never queue immediate writes. Emitting one is a bug. */
 void
 hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    (void)cmd;
    (void)cs;
+   abort();
+}
+
+/* hk_cmd_buffer_get_cs_general() serves every stream slot; fixtures never
+ * open a graphics or pre-graphics stream through it. */
+void
+hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
+bool
+hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+   abort();
+}
+
+/* Fixtures never copy timestamps. Emitting a copy is a bug. */
+void
+hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                       const struct hk_stamp_copy *copies, unsigned count)
+{
+   (void)cmd;
+   (void)cs;
+   (void)copies;
+   (void)count;
    abort();
 }
 
@@ -2138,6 +2236,7 @@ main(void)
    test_timestamp_reused_compute();
    test_timestamp_top_in_pass();
    test_timestamp_leading_top();
+   test_stamp_kind_isolation();
    {
       /* A submission longer than the 16-bit barrier field: a wait on a
        * command past it is named by its ordinal (that command went in an

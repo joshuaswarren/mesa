@@ -101,8 +101,13 @@ static void
 hk_event_write(struct hk_cmd_buffer *cmd, struct hk_event *event,
                uint8_t src_kinds, uint32_t value)
 {
+   /* An earlier timestamp write is in a non-empty first scope: the host may
+    * read its query once it sees the event. */
+   if (src_kinds)
+      hk_sync_flush_stamp_copies(cmd);
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, src_kinds, cmd->current_cs.cs, dep);
+   hk_sync_src_dep(cmd, hk_sync_stamp_scope(src_kinds), cmd->current_cs.cs,
+                   dep);
 
    cmd->sync.kind_override = HK_SYNC_ALL;
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
