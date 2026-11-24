@@ -23,12 +23,20 @@ struct mock_state {
    uint32_t next_handle;
    uint32_t freed_handles[64];
    unsigned freed_count;
+   unsigned alloc_calls;
+   unsigned bind_calls;
+   struct drm_asahi_gem_bind_op last_bind;
+   bool bind_fail;
    bool expect_bo_map_locked;
    bool madvise_retain;
    unsigned dontneed_calls;
    unsigned willneed_calls;
    uint32_t last_dontneed_handle;
    uint32_t last_willneed_handle;
+   unsigned mmap_offset_queries;
+   unsigned mmap_calls;
+   unsigned munmap_calls;
+   bool alloc_va;
 };
 
 static struct mock_state mock;
@@ -37,6 +45,7 @@ static struct agx_bo *
 mock_bo_alloc(struct agx_device *dev, size_t size, size_t align,
               enum agx_bo_flags flags)
 {
+   mock.alloc_calls++;
    const uint32_t handle = ++mock.next_handle;
 
    simple_mtx_lock(&dev->bo_map_lock);
@@ -51,7 +60,43 @@ mock_bo_alloc(struct agx_device *dev, size_t size, size_t align,
    bo->flags = flags;
    bo->handle = bo->uapi_handle = handle;
    bo->prime_fd = -1;
+   if (mock.alloc_va) {
+      bo->va = agx_va_alloc(dev, size, align, 0, 0);
+      assert(bo->va != NULL);
+   }
    return bo;
+}
+
+static int
+mock_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
+             uint32_t count)
+{
+   assert(count >= 1);
+   mock.bind_calls += count;
+   mock.last_bind = ops[count - 1];
+   return mock.bind_fail ? -1 : 0;
+}
+
+static void
+mock_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
+             size_t length)
+{
+   assert(bo->_map == NULL);
+   mock.mmap_calls++;
+   if (!bo->has_mmap_offset) {
+      mock.mmap_offset_queries++;
+      bo->mmap_offset = UINT64_C(0x100000000) + (uint64_t)bo->handle * 0x10000ull;
+      bo->has_mmap_offset = true;
+   }
+   bo->_map_size = length ?: bo->size;
+   bo->_map = fixed_addr ? fixed_addr : (void *)(uintptr_t)(0x20000000ull + bo->handle * 0x10000ull);
+}
+
+static void
+mock_bo_munmap(struct agx_device *dev, struct agx_bo *bo)
+{
+   mock.munmap_calls++;
+   bo->_map_size = 0;
 }
 
 static void
@@ -113,7 +158,16 @@ init_mock_device(struct agx_device *dev)
    for (unsigned i = 0; i < ARRAY_SIZE(dev->bo_cache.buckets); ++i)
       list_inithead(&dev->bo_cache.buckets[i]);
 
+   dev->guard_size = AIL_PAGESIZE;
+   dev->sparse_ro_offset = UINT64_C(1) << 36;
+   util_vma_heap_init(&dev->main_heap, UINT64_C(0x2000000000),
+                      UINT64_C(1) << 36);
+
    dev->ops.bo_alloc = mock_bo_alloc;
+   dev->ops.bo_bind = mock_bo_bind;
+   dev->ops.bo_mmap = mock_bo_mmap;
+   dev->ops.bo_munmap = mock_bo_munmap;
+   dev->ops.bo_mmap_independent = true;
    dev->ops.bo_free = mock_bo_free;
    dev->ops.bo_madvise = mock_bo_madvise;
 }
@@ -126,6 +180,7 @@ finish_mock_device(struct agx_device *dev)
    assert(dev->bo_cache.size == 0);
    assert(list_is_empty(&dev->bo_cache.lru));
 
+   util_vma_heap_finish(&dev->main_heap);
    util_sparse_array_finish(&dev->bo_map);
    simple_mtx_destroy(&dev->bo_cache.lock);
    simple_mtx_destroy(&dev->bo_map_lock);
@@ -359,6 +414,244 @@ test_idle_pending_wake_protocol(void)
    finish_mock_device(&dev);
 }
 
+static bool
+deny_alloc(size_t size, void *data)
+{
+   unsigned *calls = data;
+   (*calls)++;
+   return false;
+}
+
+static void
+test_ro_shadow_cache_reuse(void)
+{
+   struct agx_device dev;
+   init_mock_device(&dev);
+   mock.alloc_va = true;
+
+   const size_t sz = 64 * 1024;
+   struct agx_bo *bo = agx_bo_create(&dev, sz, 64 * 1024, 0, "app");
+   assert(bo && !bo->ro_shadow_bound);
+
+   /* First bind maps the read-only shadow once and records the state. */
+   assert(agx_bo_ensure_ro_shadow(&dev, bo) == 0);
+   assert(bo->ro_shadow_bound);
+   assert(mock.bind_calls == 1);
+   assert(mock.last_bind.addr == agx_rw_addr_to_ro(&dev, bo->va->addr));
+   assert(mock.last_bind.range == bo->size);
+   assert(mock.last_bind.offset == 0);
+   assert(mock.last_bind.handle == bo->uapi_handle);
+   assert(mock.last_bind.flags == DRM_ASAHI_BIND_READ);
+
+   /* Repeated ensure on the same BO skips VM_BIND. */
+   assert(agx_bo_ensure_ro_shadow(&dev, bo) == 0);
+   assert(mock.bind_calls == 1);
+
+   /* Returning to cache and reusing preserves the RO shadow with zero binds. */
+   const uint32_t cached_handle = bo->handle;
+   agx_bo_unreference(&dev, bo);
+   struct agx_bo *reused = agx_bo_create(&dev, sz, 64 * 1024, 0, "app2");
+   assert(reused && reused->handle == cached_handle);
+   assert(reused->ro_shadow_bound);
+   assert(agx_bo_ensure_ro_shadow(&dev, reused) == 0);
+   assert(mock.bind_calls == 1);
+
+   /* Evicting and freeing clears the slot so a fresh BO binds again. */
+   agx_bo_unreference(&dev, reused);
+   agx_bo_cache_evict_all(&dev);
+   assert(mock.freed_count == 1 && mock.freed_handles[0] == cached_handle);
+
+   /* A failed shadow bind must leave ro_shadow_bound false so a retry binds. */
+   struct agx_bo *fresh = agx_bo_create(&dev, sz, 64 * 1024, 0, "fresh");
+   assert(fresh && !fresh->ro_shadow_bound);
+   mock.bind_fail = true;
+   assert(agx_bo_ensure_ro_shadow(&dev, fresh) != 0);
+   assert(!fresh->ro_shadow_bound);
+   assert(mock.bind_calls == 2);
+   mock.bind_fail = false;
+   assert(agx_bo_ensure_ro_shadow(&dev, fresh) == 0);
+   assert(fresh->ro_shadow_bound);
+   assert(mock.bind_calls == 3);
+   agx_bo_unreference(&dev, fresh);
+
+   /* Shareable/shared BOs take bo_map_lock cleanly and still bind once. */
+   struct agx_bo *shared =
+      agx_bo_create(&dev, sz, 64 * 1024, AGX_BO_SHAREABLE, "shared");
+   assert(shared && !shared->ro_shadow_bound);
+   assert(agx_bo_ensure_ro_shadow(&dev, shared) == 0);
+   assert(shared->ro_shadow_bound);
+   assert(mock.bind_calls == 4);
+   assert(agx_bo_ensure_ro_shadow(&dev, shared) == 0);
+   assert(mock.bind_calls == 4);
+   agx_bo_unreference(&dev, shared);
+
+   finish_mock_device(&dev);
+}
+
+static void
+test_create_checked_admission_and_purged_miss(void)
+{
+   struct agx_device dev;
+   init_mock_device(&dev);
+
+   struct agx_bo *bo = agx_bo_create(&dev, 64 * MIB, 64 * 1024, 0, "64m");
+   assert(bo);
+   const uint32_t h = bo->handle;
+   agx_bo_unreference(&dev, bo);
+
+   /* Cache hit must succeed without invoking the admission callback. */
+   unsigned check_calls = 0;
+   unsigned allocs_before = mock.alloc_calls;
+   struct agx_bo *hit = agx_bo_create_checked(&dev, 64 * MIB, 64 * 1024, 0,
+                                              "hit", deny_alloc, &check_calls);
+   assert(hit && hit->handle == h);
+   assert(check_calls == 0);
+   assert(mock.alloc_calls == allocs_before);
+
+   /* Cache miss must invoke admission check and stop before bo_alloc(). */
+   struct agx_bo *miss = agx_bo_create_checked(&dev, 16 * MIB, 64 * 1024, 0,
+                                               "miss", deny_alloc, &check_calls);
+   assert(miss == NULL);
+   assert(check_calls == 1);
+   assert(mock.alloc_calls == allocs_before);
+
+   /* A kernel-purged cached BO must be freed and still consult admission. */
+   agx_bo_unreference(&dev, hit);
+   simple_mtx_lock(&dev.bo_cache.lock);
+   hit->cached_ns -= INT64_C(500) * 1000 * 1000;
+   simple_mtx_unlock(&dev.bo_cache.lock);
+   struct agx_bo *poke = agx_bo_create(&dev, AIL_PAGESIZE, AIL_PAGESIZE, 0, "poke");
+   agx_bo_unreference(&dev, poke);
+   assert(hit->purgeable);
+
+   mock.madvise_retain = false;
+   check_calls = 0;
+   allocs_before = mock.alloc_calls;
+   struct agx_bo *purged_miss =
+      agx_bo_create_checked(&dev, 64 * MIB, 64 * 1024, 0, "purged",
+                            deny_alloc, &check_calls);
+   assert(purged_miss == NULL);
+   assert(check_calls == 1);
+   assert(mock.alloc_calls == allocs_before);
+   assert(mock.freed_count == 1 && mock.freed_handles[0] == h);
+
+   finish_mock_device(&dev);
+}
+
+static void
+test_large_buckets_flag_isolation_and_cross_pot_reuse(void)
+{
+   struct agx_device dev;
+   init_mock_device(&dev);
+
+   /* Cache 16 MiB, 64 MiB, 128 MiB (flags=0) and 16 MiB (AGX_BO_WRITEBACK).
+    * Total = 224 MiB <= 256 MiB cap -> zero evictions. */
+   struct agx_bo *b16 = agx_bo_create(&dev, 16 * MIB, 64 * 1024, 0, "16m");
+   struct agx_bo *b64 = agx_bo_create(&dev, 64 * MIB, 64 * 1024, 0, "64m");
+   struct agx_bo *b128 = agx_bo_create(&dev, 128 * MIB, 64 * 1024, 0, "128m");
+   struct agx_bo *b16_wb =
+      agx_bo_create(&dev, 16 * MIB, 64 * 1024, AGX_BO_WRITEBACK, "16m-wb");
+   const uint32_t h16 = b16->handle, h64 = b64->handle, h128 = b128->handle;
+   const uint32_t h16_wb = b16_wb->handle;
+
+   agx_bo_unreference(&dev, b16);
+   agx_bo_unreference(&dev, b64);
+   agx_bo_unreference(&dev, b128);
+   agx_bo_unreference(&dev, b16_wb);
+   assert(dev.bo_cache.size == 224 * MIB);
+   assert(mock.freed_count == 0);
+
+   /* Flag isolation + dedicated large buckets hit exact BOs. */
+   struct agx_bo *g16_wb =
+      agx_bo_create(&dev, 16 * MIB, 64 * 1024, AGX_BO_WRITEBACK, "g16-wb");
+   struct agx_bo *g16 = agx_bo_create(&dev, 16 * MIB, 64 * 1024, 0, "g16");
+   struct agx_bo *g64 = agx_bo_create(&dev, 64 * MIB, 64 * 1024, 0, "g64");
+   struct agx_bo *g128 = agx_bo_create(&dev, 128 * MIB, 64 * 1024, 0, "g128");
+   assert(g16_wb->handle == h16_wb);
+   assert(g16->handle == h16);
+   assert(g64->handle == h64);
+   assert(g128->handle == h128);
+   assert(dev.bo_cache.size == 0);
+
+   agx_bo_unreference(&dev, g16_wb);
+   agx_bo_unreference(&dev, g16);
+   agx_bo_unreference(&dev, g64);
+   agx_bo_unreference(&dev, g128);
+   agx_bo_cache_evict_all(&dev);
+   assert(dev.bo_cache.size == 0);
+
+   /* Cross-POT <= 2x reuse: 6 MiB reuses cached 8 MiB, while 3 MiB misses. */
+   struct agx_bo *b8 = agx_bo_create(&dev, 8 * MIB, 64 * 1024, 0, "8m");
+   const uint32_t h8 = b8->handle;
+   agx_bo_unreference(&dev, b8);
+   assert(!agx_bo_cache_has(&dev, 3 * MIB, 64 * 1024, 0));
+   assert(agx_bo_cache_has(&dev, 6 * MIB, 64 * 1024, 0));
+   struct agx_bo *g6 = agx_bo_create(&dev, 6 * MIB, 64 * 1024, 0, "6m");
+   assert(g6->handle == h8);
+   agx_bo_unreference(&dev, g6);
+   agx_bo_cache_evict_all(&dev);
+
+   /* Uncacheable flags and > 256 MiB allocations bypass cache completely. */
+   const unsigned freed_before = mock.freed_count;
+   struct agx_bo *nc =
+      agx_bo_create(&dev, 64 * 1024, 64 * 1024, AGX_BO_NO_CACHE, "nocache");
+   struct agx_bo *sh =
+      agx_bo_create(&dev, 64 * 1024, 64 * 1024, AGX_BO_SHARED, "shared");
+   struct agx_bo *huge =
+      agx_bo_create(&dev, 300 * MIB, 64 * 1024, 0, "huge");
+   agx_bo_unreference(&dev, nc);
+   agx_bo_unreference(&dev, sh);
+   agx_bo_unreference(&dev, huge);
+   assert(dev.bo_cache.size == 0);
+   assert(mock.freed_count == freed_before + 3);
+   assert(!agx_bo_cache_has(&dev, 64 * 1024, 64 * 1024, AGX_BO_NO_CACHE));
+   assert(!agx_bo_cache_has(&dev, 300 * MIB, 64 * 1024, 0));
+
+   finish_mock_device(&dev);
+}
+
+static void
+test_mmap_offset_cache_propagation(void)
+{
+   struct agx_device dev;
+   init_mock_device(&dev);
+
+   struct agx_bo *bo = agx_bo_create(&dev, 64 * 1024, 64 * 1024, 0, "map");
+   assert(bo && !bo->has_mmap_offset);
+
+   /* First agx_bo_map() queries the mmap offset once and caches it on bo. */
+   void *p1 = agx_bo_map(bo);
+   assert(p1 != NULL);
+   assert(bo->has_mmap_offset && bo->mmap_offset != 0);
+   assert(mock.mmap_offset_queries == 1);
+   assert(mock.mmap_calls == 1);
+
+   /* Simulate vkUnmapMemory + cache round trip: remap skips offset query. */
+   bo->_map = NULL;
+   bo->_map_size = 0;
+   const uint32_t h = bo->handle;
+   agx_bo_unreference(&dev, bo);
+   struct agx_bo *reused = agx_bo_create(&dev, 64 * 1024, 64 * 1024, 0, "map2");
+   assert(reused && reused->handle == h && reused->has_mmap_offset);
+
+   void *p2 = agx_bo_map(reused);
+   assert(p2 != NULL);
+   assert(mock.mmap_offset_queries == 1);
+   assert(mock.mmap_calls == 2);
+
+   /* Owned mapping also reuses the cached offset without another query. */
+   size_t owned_size = 0;
+   void *p3 = agx_bo_map_owned(reused, NULL, 0, &owned_size);
+   assert(p3 != NULL && owned_size == reused->size);
+   assert(mock.mmap_offset_queries == 1);
+   assert(mock.mmap_calls == 3);
+   agx_bo_unmap_owned(reused, p3, owned_size);
+   assert(mock.munmap_calls == 1);
+
+   agx_bo_unreference(&dev, reused);
+   finish_mock_device(&dev);
+}
+
 int
 main(void)
 {
@@ -367,6 +660,10 @@ main(void)
    test_lru_stale_eviction_drops_oldest();
    test_lru_capacity_eviction_drops_oldest();
    test_idle_pending_wake_protocol();
+   test_ro_shadow_cache_reuse();
+   test_create_checked_admission_and_purged_miss();
+   test_large_buckets_flag_isolation_and_cross_pot_reuse();
+   test_mmap_offset_cache_propagation();
 
    printf("agx bo cache: ok\n");
    return 0;

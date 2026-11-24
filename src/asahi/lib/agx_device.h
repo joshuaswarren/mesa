@@ -85,15 +85,19 @@ enum agx_dbg {
 };
 
 /* How many power-of-two levels in the BO cache do we want? 2^14 minimum chosen
- * as it is the page size that all allocations are rounded to
+ * as it is the page size that all allocations are rounded to, up to 2^28
+ * (256 MiB, matching AGX_BO_CACHE_MAX_SIZE) so large allocations do not collide
+ * in a single bucket.
  */
 #define MIN_BO_CACHE_BUCKET (14) /* 2^14 = 16KB */
-#define MAX_BO_CACHE_BUCKET (22) /* 2^22 = 4MB */
+#define MAX_BO_CACHE_BUCKET (28) /* 2^28 = 256MB */
 
 /* Fencepost problem, hence the off-by-one */
+#define NR_BO_CACHE_SIZE_BUCKETS \
+   (MAX_BO_CACHE_BUCKET - MIN_BO_CACHE_BUCKET + 1)
 #define NR_BO_CACHE_FLAG_BUCKETS 16
 #define NR_BO_CACHE_BUCKETS \
-   ((MAX_BO_CACHE_BUCKET - MIN_BO_CACHE_BUCKET + 1) * NR_BO_CACHE_FLAG_BUCKETS)
+   (NR_BO_CACHE_SIZE_BUCKETS * NR_BO_CACHE_FLAG_BUCKETS)
 
 /* Forward decl only, do not pull in all of NIR */
 struct nir_shader;
@@ -429,11 +433,21 @@ agx_bo_map_placed(struct agx_bo *bo, void *fixed_addr, size_t length)
       }
 
       if (bo->dev->ops.bo_mmap_independent) {
-         struct agx_bo copy = *bo;
-         copy._map = NULL;
-         copy._map_size = 0;
+         struct agx_bo copy = {
+            .dev = bo->dev,
+            .flags = bo->flags,
+            .size = bo->size,
+            .handle = bo->handle,
+            .uapi_handle = bo->uapi_handle,
+            .has_mmap_offset = bo->has_mmap_offset,
+            .mmap_offset = bo->mmap_offset,
+         };
          bo->dev->ops.bo_mmap(bo->dev, &copy, fixed_addr,
                               fixed_addr ? length : 0);
+         if (!bo->has_mmap_offset && copy.has_mmap_offset) {
+            bo->mmap_offset = copy.mmap_offset;
+            p_atomic_set(&bo->has_mmap_offset, true);
+         }
          map = copy._map;
          bo->_map_size = copy._map_size;
          p_atomic_set(&bo->_map, map);
@@ -469,10 +483,26 @@ agx_bo_map_owned(struct agx_bo *bo, void *fixed_addr, size_t length,
    if (!bo->dev->ops.bo_mmap_independent || (bo->flags & AGX_BO_HOST_PTR))
       return NULL;
 
-   struct agx_bo copy = *bo;
-   copy._map = NULL;
-   copy._map_size = 0;
+   struct agx_bo copy = {
+      .dev = bo->dev,
+      .flags = bo->flags,
+      .size = bo->size,
+      .handle = bo->handle,
+      .uapi_handle = bo->uapi_handle,
+   };
+   if (p_atomic_read(&bo->has_mmap_offset)) {
+      copy.has_mmap_offset = true;
+      copy.mmap_offset = bo->mmap_offset;
+   }
    bo->dev->ops.bo_mmap(bo->dev, &copy, fixed_addr, fixed_addr ? length : 0);
+   if (copy.has_mmap_offset && !p_atomic_read(&bo->has_mmap_offset)) {
+      simple_mtx_lock(&bo->dev->bo_mmap_lock);
+      if (!bo->has_mmap_offset) {
+         bo->mmap_offset = copy.mmap_offset;
+         p_atomic_set(&bo->has_mmap_offset, true);
+      }
+      simple_mtx_unlock(&bo->dev->bo_mmap_lock);
+   }
    *size = agx_bo_map_size(&copy);
    return copy._map;
 }

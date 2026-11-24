@@ -10,6 +10,7 @@
 #include "util/hash_table.h"
 #include "util/os_time.h"
 #include "util/ralloc.h"
+#include "util/u_math.h"
 #include "agx_device.h"
 #include "decode.h"
 #include "layout.h"
@@ -21,12 +22,19 @@
  * command/resource reuse while making the cache a bounded optimization. */
 #define AGX_BO_CACHE_MAX_SIZE (256ull * 1024 * 1024)
 
+static bool
+agx_bo_cache_eligible(size_t size, uint32_t flags)
+{
+   return !(flags & (AGX_BO_SHARED | AGX_BO_NO_CACHE | AGX_BO_HOST_PTR)) &&
+          size <= AGX_BO_CACHE_MAX_SIZE;
+}
+
 /* Helper to calculate the bucket index of a BO */
 static unsigned
 agx_bucket_index(size_t size)
 {
    /* Round down to POT to compute a bucket index */
-   unsigned bucket_index = util_logbase2(size);
+   unsigned bucket_index = util_logbase2_64(size);
 
    /* Clamp to supported buckets. Huge allocations use the largest bucket */
    bucket_index = CLAMP(bucket_index, MIN_BO_CACHE_BUCKET, MAX_BO_CACHE_BUCKET);
@@ -35,8 +43,8 @@ agx_bucket_index(size_t size)
    return (bucket_index - MIN_BO_CACHE_BUCKET);
 }
 
-static struct list_head *
-agx_bucket(struct agx_device *dev, size_t size, uint32_t flags)
+static unsigned
+agx_flag_bucket_index(uint32_t flags)
 {
    /* Shader, command and resource allocations of the same size often have
     * incompatible flags. Keep their searches apart instead of repeatedly
@@ -44,9 +52,22 @@ agx_bucket(struct agx_device *dev, size_t size, uint32_t flags)
     * bits; collisions remain safe because fetch checks exact equality.
     */
    static_assert(NR_BO_CACHE_FLAG_BUCKETS == 16, "flag hash width");
-   const unsigned flag_bucket = (flags * UINT32_C(0x9e3779b9)) >> 28;
-   return &dev->bo_cache.buckets[agx_bucket_index(size) *
-                                NR_BO_CACHE_FLAG_BUCKETS + flag_bucket];
+   return (flags * UINT32_C(0x9e3779b9)) >> 28;
+}
+
+static struct list_head *
+agx_bucket_at(struct agx_device *dev, unsigned size_bucket,
+              unsigned flag_bucket)
+{
+   return &dev->bo_cache.buckets[size_bucket * NR_BO_CACHE_FLAG_BUCKETS +
+                                 flag_bucket];
+}
+
+static struct list_head *
+agx_bucket(struct agx_device *dev, size_t size, uint32_t flags)
+{
+   return agx_bucket_at(dev, agx_bucket_index(size),
+                        agx_flag_bucket_index(flags));
 }
 
 static void
@@ -175,30 +196,41 @@ struct agx_bo *
 agx_bo_cache_fetch(struct agx_device *dev, size_t size, size_t align,
                    uint32_t flags, const bool dontwait)
 {
+   if (!agx_bo_cache_eligible(size, flags))
+      return NULL;
+
    struct list_head purged;
    list_inithead(&purged);
 
+   const unsigned first_bucket = agx_bucket_index(size);
+   const unsigned last_bucket =
+      MIN2(first_bucket + 1, NR_BO_CACHE_SIZE_BUCKETS - 1);
+   const unsigned flag_bucket = agx_flag_bucket_index(flags);
+
    simple_mtx_lock(&dev->bo_cache.lock);
-   struct list_head *bucket = agx_bucket(dev, size, flags);
    struct agx_bo *bo = NULL;
 
-   /* Iterate the bucket looking for something suitable */
-   list_for_each_entry_safe(struct agx_bo, entry, bucket, bucket_link) {
-      if (!agx_bo_cache_entry_fits(entry, size, align, flags))
-         continue;
+   /* Search the matching power-of-two bucket first (LIFO for exact/same-band
+    * reuse), then the next bucket up where <= 2x oversized BOs can reside. */
+   for (unsigned b = first_bucket; b <= last_bucket && !bo; ++b) {
+      struct list_head *bucket = agx_bucket_at(dev, b, flag_bucket);
+      list_for_each_entry_safe(struct agx_bo, entry, bucket, bucket_link) {
+         if (!agx_bo_cache_entry_fits(entry, size, align, flags))
+            continue;
 
-      agx_bo_cache_remove_locked(dev, entry);
+         agx_bo_cache_remove_locked(dev, entry);
 
-      /* The kernel may have discarded a purgeable BO's contents under
-       * memory pressure. Such a BO is dead: free it below and keep looking. */
-      if (!agx_bo_cache_advise_willneed(dev, entry)) {
-         list_addtail(&entry->bucket_link, &purged);
-         continue;
+         /* The kernel may have discarded a purgeable BO's contents under
+          * memory pressure. Such a BO is dead: free it below and keep looking. */
+         if (!agx_bo_cache_advise_willneed(dev, entry)) {
+            list_addtail(&entry->bucket_link, &purged);
+            continue;
+         }
+
+         /* This one works, use it */
+         bo = entry;
+         break;
       }
-
-      /* This one works, use it */
-      bo = entry;
-      break;
    }
    simple_mtx_unlock(&dev->bo_cache.lock);
 
@@ -222,13 +254,23 @@ agx_bo_cache_has(struct agx_device *dev, size_t size, size_t align,
    size = ALIGN_POT(size, AIL_PAGESIZE);
    align = MAX2(align, AIL_PAGESIZE);
 
+   if (!agx_bo_cache_eligible(size, flags))
+      return false;
+
+   const unsigned first_bucket = agx_bucket_index(size);
+   const unsigned last_bucket =
+      MIN2(first_bucket + 1, NR_BO_CACHE_SIZE_BUCKETS - 1);
+   const unsigned flag_bucket = agx_flag_bucket_index(flags);
+
    simple_mtx_lock(&dev->bo_cache.lock);
    bool found = false;
-   list_for_each_entry(struct agx_bo, entry, agx_bucket(dev, size, flags),
-                       bucket_link) {
-      if (agx_bo_cache_entry_fits(entry, size, align, flags)) {
-         found = true;
-         break;
+   for (unsigned b = first_bucket; b <= last_bucket && !found; ++b) {
+      struct list_head *bucket = agx_bucket_at(dev, b, flag_bucket);
+      list_for_each_entry(struct agx_bo, entry, bucket, bucket_link) {
+         if (agx_bo_cache_entry_fits(entry, size, align, flags)) {
+            found = true;
+            break;
+         }
       }
    }
    simple_mtx_unlock(&dev->bo_cache.lock);
@@ -414,8 +456,7 @@ agx_bo_cache_put_locked(struct agx_device *dev, struct agx_bo *bo,
 static bool
 agx_bo_cache_put(struct agx_device *dev, struct agx_bo *bo)
 {
-   if ((bo->flags & (AGX_BO_SHARED | AGX_BO_NO_CACHE)) ||
-       bo->size > AGX_BO_CACHE_MAX_SIZE) {
+   if (!agx_bo_cache_eligible(bo->size, bo->flags)) {
       return false;
    }
 
@@ -667,9 +708,40 @@ agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo)
    simple_mtx_unlock(&dev->bo_map_lock);
 }
 
+int
+agx_bo_ensure_ro_shadow(struct agx_device *dev, struct agx_bo *bo)
+{
+   assert(bo != NULL && bo->va != NULL && !(bo->va->flags & AGX_VA_USC));
+
+   if (likely(p_atomic_read(&bo->ro_shadow_bound)))
+      return 0;
+
+   /* Private BOs (freshly allocated or fetched from the cache) are exclusively
+    * owned until the caller publishes them. Shared/shareable BOs may be
+    * concurrently imported by multiple threads, so serialize their first
+    * read-only shadow bind under bo_map_lock (matching agx_bo_import()). */
+   const bool shared = bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE);
+   if (shared)
+      simple_mtx_lock(&dev->bo_map_lock);
+
+   int ret = 0;
+   if (!p_atomic_read(&bo->ro_shadow_bound)) {
+      ret = agx_bo_bind(dev, bo, agx_rw_addr_to_ro(dev, bo->va->addr),
+                        bo->size, 0, DRM_ASAHI_BIND_READ);
+      if (!ret)
+         p_atomic_set(&bo->ro_shadow_bound, true);
+   }
+
+   if (shared)
+      simple_mtx_unlock(&dev->bo_map_lock);
+
+   return ret;
+}
+
 struct agx_bo *
-agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
-              enum agx_bo_flags flags, const char *label)
+agx_bo_create_checked(struct agx_device *dev, size_t size, unsigned align,
+                      enum agx_bo_flags flags, const char *label,
+                      agx_bo_alloc_check_fn can_alloc, void *can_alloc_data)
 {
    struct agx_bo *bo;
    bool reused = false;
@@ -688,6 +760,13 @@ agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
       p_atomic_inc(&dev->bo_cache.hits);
    else
       p_atomic_inc(&dev->bo_cache.misses);
+
+   /* When the cache has no live BO to hand out, consult the caller's admission
+    * policy before entering the kernel allocator. Running this after
+    * agx_bo_cache_fetch() avoids a second cache-lock walk and ensures a purged
+    * or concurrently claimed cache entry cannot bypass the check. */
+   if (!bo && can_alloc && !can_alloc(size, can_alloc_data))
+      return NULL;
 
    /* Otherwise, allocate a fresh BO. If allocation fails, we can try waiting
     * for something in the cache. But if there's no nothing suitable, we should
@@ -758,4 +837,11 @@ agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
 
    agx_bo_dump_all_periodic(dev);
    return bo;
+}
+
+struct agx_bo *
+agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
+              enum agx_bo_flags flags, const char *label)
+{
+   return agx_bo_create_checked(dev, size, align, flags, label, NULL, NULL);
 }
