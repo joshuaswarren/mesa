@@ -1144,6 +1144,18 @@ agx_chip_exact_fma32(enum agx_chip chip)
    return !(agx_chip_info(chip)->quirks & AGX_QUIRK_INEXACT_FMA32);
 }
 
+/* Whether agx_nir_lower_denorm_preserve() guarantees FP32 DenormPreserve
+ * across every advertised shader stage and encoding: native AGX3 (AGX3B) and
+ * M5 (AGX3C), where agx_compile_shader_nir() runs the exact integer lowering
+ * unconditionally. AGX2 and bring-up G18G stay off. */
+static inline bool
+agx_chip_has_fp32_denorm_preserve(enum agx_chip chip)
+{
+   const enum agx_isa_encoding enc = agx_chip_isa_encoding(chip);
+   return (enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C) &&
+          agx_chip_native_or_m5(chip);
+}
+
 /* Whether the sampler state word carries the LOD bias.  The HAL200 sampler
  * layout has a bias field; Gen4 does not, so the shader applies the bias. */
 static inline bool
