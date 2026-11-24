@@ -3697,10 +3697,18 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
          const unsigned reduced =
             samples == 1 ? nir_intrinsic_flags(instr) : 0;
 
+         const bool whole_target = samples == 1 &&
+            !b->shader->key->dev.emit_agx3d &&
+            nir_src_is_const(instr->src[0]) &&
+            (nir_src_as_uint(instr->src[0]) & 1);
+
          if (samples == 1) {
             /* Apple's one-sample fragments read SR2 and repeat it in both
-             * coverage nibbles. */
-            target = (reduced & 1) ? agx_g17p_reg16(b, target_in)
+             * coverage nibbles. When the target is constant with bit 0 set,
+             * sample 0 is unconditionally affected, so pass immediate 1
+             * directly instead of materializing and masking the target. */
+            target = whole_target ? agx_immediate(1)
+                   : (reduced & 1) ? agx_g17p_reg16(b, target_in)
                                    : agx_and(b, target_in, agx_immediate(1));
             keep = (reduced & 2) ? agx_g17p_reg16(b, live_in)
                                  : agx_and(b, live_in, agx_immediate(1));
@@ -3750,11 +3758,17 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
 
          agx_index word = agx_iadd(b, keep, mid, 4);
          agx_index selected = agx_temp(b->shader, AGX_SIZE_32);
-         /* target is 0 or 1 and word < 0x1000, so the zero-extended 16x16->32
-          * product (Apple's half-operand imadd form) is the selected word,
-          * high half zero. */
-         agx_imad_to(b, selected, agx_abs(target), agx_abs(word), agx_zero(),
-                     0);
+         if (whole_target) {
+            /* Constant target 1 always selects `word`, zero-extended to 32
+             * bits (agx3_encode_zext_half()). */
+            agx_mov_to(b, selected, word);
+         } else {
+            /* target is 0 or 1 and word < 0x1000, so the zero-extended 16x16->32
+             * product (Apple's half-operand imadd form) is the selected word,
+             * high half zero. */
+            agx_imad_to(b, selected, agx_abs(target), agx_abs(word), agx_zero(),
+                        0);
+         }
          return agx_sample_mask_agx3(
             b, target, selected,
             (!no_tests ? 2 : 0) | (force_early ? 1 : 0));
