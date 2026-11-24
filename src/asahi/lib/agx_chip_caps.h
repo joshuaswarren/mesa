@@ -58,15 +58,19 @@ enum agx_chip_cap {
 
    /* 3D sparse image residency (sliced 64 KiB tiles) is qualified on this chip. */
    AGX_CAP_SPARSE_RESIDENCY_3D = 1u << 8,
+
+   /* VK_EXT_descriptor_buffer is hardware-qualified on this chip. */
+   AGX_CAP_DESCRIPTOR_BUFFER = 1u << 9,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
-#define AGX_CAPS_AGX2 AGX_CAP_SPARSE_RESIDENCY_3D
+#define AGX_CAPS_AGX2 (AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_DESCRIPTOR_BUFFER)
 
 /* What the five native AGX3 chips (G15G, G15S, G15C, G16G, G17P) share. */
 #define AGX_CAPS_NATIVE                                                        \
    (AGX_CAP_NATIVE_INDIRECT_COMPUTE | AGX_CAP_NATIVE_IMAGEBLOCK |              \
-    AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX)
+    AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX |          \
+    AGX_CAP_DESCRIPTOR_BUFFER)
 
 #define AGX_CAPS_G17P                                                          \
    (AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                                \

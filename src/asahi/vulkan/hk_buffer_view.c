@@ -651,8 +651,109 @@ hk_texel_buffer_descriptor(struct hk_device *dev,
    uint8_t *packed = out;
 
    const enum pipe_format format =
-      info && info->address ? hk_format_to_pipe_format(info->format)
-                            : PIPE_FORMAT_NONE;
+      info && info->address && info->range
+         ? hk_format_to_pipe_format(info->format)
+         : PIPE_FORMAT_NONE;
+
+   /* AGX2 embeds its 24-byte texture and PBE descriptors directly in the
+    * descriptor record with inline buffer_size_sw and buffer_offset_sw, so it
+    * does not need a device texture heap or texel windows. */
+   if (!agx_chip_agx3_path(dev->dev.chip)) {
+      bool ok = false;
+      if (format != PIPE_FORMAT_NONE) {
+         const struct util_format_description *desc =
+            util_format_description(format);
+         const unsigned blocksize_B = util_format_get_blocksize(format);
+         const uint64_t elements = info->range / blocksize_B;
+         const uint64_t rw_base = info->address & ~UINT64_C(0xf);
+         const uint32_t tail_offset_B = info->address & 0xf;
+         const uint32_t tail_offset_el = tail_offset_B / blocksize_B;
+         const uint64_t sampled_base =
+            hk_sparse_address_is_sparse(dev, info->address)
+               ? rw_base + dev->dev.sparse_ro_offset
+               : rw_base;
+
+         uint8_t format_swizzle[4] = {
+            desc->swizzle[0],
+            desc->swizzle[1],
+            desc->swizzle[2],
+            desc->swizzle[3],
+         };
+         if (util_format_is_depth_or_stencil(format)) {
+            format_swizzle[0] = 0;
+            format_swizzle[1] = 0;
+            format_swizzle[2] = 0;
+            format_swizzle[3] = 0;
+         }
+
+         struct AGX_TEXTURE texture = {AGX_TEXTURE_header};
+         texture.dimension = AGX_TEXTURE_DIMENSION_2D;
+         texture.layout = AGX_LAYOUT_LINEAR;
+         texture.channels = ail_pixel_format[format].channels;
+         texture.type = ail_pixel_format[format].type;
+         texture.swizzle_r = agx_channel_from_pipe(format_swizzle[0]);
+         texture.swizzle_g = agx_channel_from_pipe(format_swizzle[1]);
+         texture.swizzle_b = agx_channel_from_pipe(format_swizzle[2]);
+         texture.swizzle_a = agx_channel_from_pipe(format_swizzle[3]);
+         texture.width = AGX_TEXTURE_BUFFER_WIDTH;
+         texture.height =
+            MAX2(DIV_ROUND_UP(elements, AGX_TEXTURE_BUFFER_WIDTH), 1);
+         texture.first_level = texture.last_level = 0;
+         texture.address = sampled_base;
+         texture.buffer_size_sw = elements;
+         texture.buffer_offset_sw = tail_offset_el;
+         texture.srgb = (desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB);
+         texture.srgb_2_channel =
+            texture.srgb && util_format_colormask(desc) == 0x3;
+         texture.depth = 1;
+         texture.stride = (texture.width * blocksize_B) - 16;
+
+         ok = (tail_offset_B % blocksize_B == 0) &&
+              texture.height <= AGX_TEXTURE_BUFFER_MAX_HEIGHT &&
+              hk_pack_native_texture(generation, &tex, &texture);
+         if (ok && storage) {
+            struct AGX_PBE pbe_cfg = {AGX_PBE_header};
+            pbe_cfg.dimension = AGX_TEXTURE_DIMENSION_2D;
+            pbe_cfg.layout = AGX_LAYOUT_LINEAR;
+            pbe_cfg.channels = ail_pixel_format[format].channels;
+            pbe_cfg.type = ail_pixel_format[format].type;
+            pbe_cfg.srgb = util_format_is_srgb(format);
+            for (unsigned i = 0; i < desc->nr_channels; ++i) {
+               if (desc->swizzle[i] == 0)
+                  pbe_cfg.swizzle_r = i;
+               else if (desc->swizzle[i] == 1)
+                  pbe_cfg.swizzle_g = i;
+               else if (desc->swizzle[i] == 2)
+                  pbe_cfg.swizzle_b = i;
+               else if (desc->swizzle[i] == 3)
+                  pbe_cfg.swizzle_a = i;
+            }
+            pbe_cfg.buffer = rw_base;
+            pbe_cfg.buffer_offset_sw = tail_offset_el;
+            pbe_cfg.width = AGX_TEXTURE_BUFFER_WIDTH;
+            pbe_cfg.height = texture.height;
+            pbe_cfg.level = 0;
+            pbe_cfg.stride = (pbe_cfg.width * blocksize_B) - 4;
+            pbe_cfg.layers = 1;
+            pbe_cfg.levels = 1;
+            if (!hk_pack_native_pbe(generation, &pbe, &pbe_cfg))
+               hk_set_null_native_pbe(generation, &pbe);
+         } else {
+            hk_set_null_native_pbe(generation, &pbe);
+         }
+      }
+
+      if (!ok) {
+         hk_set_null_native_texture(generation, &tex);
+         hk_set_null_native_pbe(generation, &pbe);
+      }
+
+      memcpy(packed + native.texture, &tex,
+             hk_texture_descriptor_size(generation));
+      memcpy(packed + native.pbe, &pbe, hk_pbe_descriptor_size(generation));
+      return;
+   }
+
    uint32_t index = 0, offset_el = 0;
    uint64_t base = 0, elements = 0;
    if (format != PIPE_FORMAT_NONE && dev->texel_windows) {

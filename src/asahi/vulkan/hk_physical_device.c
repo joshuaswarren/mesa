@@ -289,9 +289,8 @@ hk_get_device_extensions(const struct agx_device *dev,
        * depth clip. */
       .EXT_depth_clip_control = !agx_chip_hal300_path(dev->chip),
       .EXT_depth_clip_enable = true,
-      /* Qualified on G17P only (the whole binding_model.descriptor_buffer
-       * group); other chips share the code but need their own run. */
-      .EXT_descriptor_buffer = dev->chip == AGX_CHIP_G17P,
+      .EXT_descriptor_buffer =
+         agx_chip_has_cap(dev->chip, AGX_CAP_DESCRIPTOR_BUFFER),
       .EXT_descriptor_indexing = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = false,
