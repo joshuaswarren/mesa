@@ -85,6 +85,7 @@
 
 #include "asahi/compiler/agx3_vary_core.h"
 #include "asahi/compiler/agx_compile.h"
+#include "asahi/compiler/agx3_compute_program.h"
 #include "asahi/compiler/agx_nir.h"
 #include "asahi/compiler/agx_nir_texture.h"
 #include "asahi/lib/agx_abi.h"
@@ -5590,12 +5591,17 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       robust2_modes |= nir_var_mem_ssbo;
 #endif
 
-   /* Native M5 compute launches publish invariant inputs through TPS and
-    * execute a separate constant program. Apply that same compile/launch
-    * contract to every compute pipeline, including ordinary compute and
-    * meta compute, while excluding graphics variants dispatched on CDM. */
+   /* Native AGX3 compute launches with native preamble support (G17P and M5)
+    * publish invariant inputs through TPS and execute a separate constant
+    * program. Apply that same compile/launch contract to every compute
+    * pipeline, including ordinary compute and meta compute, while excluding
+    * graphics variants dispatched on CDM. */
    const bool m5_compute_cprog = agx_chip_g17_m5(dev->dev.chip) &&
       sw_stage == MESA_SHADER_COMPUTE && nir->info.stage == MESA_SHADER_COMPUTE;
+   const bool g17p_compute_cprog = agx_chip_native_agx3(dev->dev.chip) &&
+      agx_chip_native_preamble(dev->dev.chip) &&
+      sw_stage == MESA_SHADER_COMPUTE && nir->info.stage == MESA_SHADER_COMPUTE;
+   const bool compute_cprog = m5_compute_cprog || g17p_compute_cprog;
 
    /* A fragment shader that reads descriptor-backed memory forms its native
     * constant program, as on G17P. The native HAL300 fragment program state
@@ -5671,12 +5677,13 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * texture/sampler-state-store protocol. Only G17P's constant program
        * is qualified among the AGX3B chips; G15 never forms a preamble.
        * G18G never forms a preamble. */
-      .agx3_native_cprog = m5_compute_cprog,
+      .agx3_native_cprog = compute_cprog,
       .no_preamble = dev->dev.chip == AGX_CHIP_G18G ||
          (agx_chip_g17_m5(dev->dev.chip) && !m5_compute_cprog &&
           !m5_fs_cprog) ||
          (agx_chip_native_agx3(dev->dev.chip) &&
-          (!agx_chip_native_preamble(dev->dev.chip) || !fs_reads_descriptors)),
+          (!agx_chip_native_preamble(dev->dev.chip) ||
+           (!fs_reads_descriptors && !g17p_compute_cprog))),
    };
 
    /* The native constant-program lowering applies exactly when G17P or an
@@ -5826,21 +5833,56 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * Compile such a kernel without its constant program, as M5 runs the
     * compute variants of graphics stages, rather than refusing the pipeline.
     * Kernels that compile with one are unchanged. */
-   if (!compiled && m5_compute_cprog && !backend_key.no_preamble) {
+   if (!compiled && compute_cprog && !backend_key.no_preamble) {
       nir_shader *attempt = nir_shader_clone(NULL, nir);
       compiled = attempt &&
                  agx_compile_shader_nir(attempt, &backend_key, &shader->b);
-      if (compiled) {
+      const unsigned max_cprog_spill_B =
+         g17p_compute_cprog ? AGX3_G17P_MAX_COMPUTE_SPILL_B : (1u << 16);
+      const bool cprog_ok = hk_agx3_compute_cprog_supported(
+         dev->dev.chip, sw_stage, &shader->info, &shader->b.info,
+         max_cprog_spill_B);
+      if (compiled && cprog_ok) {
          ralloc_free(nir);
          nir = attempt;
       } else {
-         mesa_logw("M5 compute constant program failed to compile (%s); "
-                   "compiling without it", agx_last_compile_refusal());
+         if (compiled) {
+            const struct agx_shader_info *cinfo = &shader->b.info;
+            mesa_logw("%s compute constant program not launchable "
+                      "(preamble=%uB tps=%uB inputs=%uB gprs=%u "
+                      "staging_known=%u/%u scratch=%uB local=%uB "
+                      "textures=%u samplers=%u sampler_heap=%u "
+                      "ray_traversal=%u res_info=%u); compiling without it",
+                      g17p_compute_cprog ? "G17P" : "M5", cinfo->preamble_size,
+                      cinfo->preamble_scratch_size,
+                      cinfo->agx3_preamble_inputs.storage_bytes,
+                      cinfo->nr_preamble_gprs, cinfo->agx3_staging_known,
+                      cinfo->agx3_preamble_staging_known, cinfo->scratch_size,
+                      cinfo->local_size, cinfo->texture_state_count,
+                      cinfo->sampler_state_count, cinfo->uses_sampler_heap,
+                      cinfo->uses_ray_traversal,
+                      cinfo->uses_resource_info_query);
+            free(shader->b.binary);
+            compiled = false;
+         } else {
+            mesa_logw("%s compute constant program failed to compile (%s); "
+                      "compiling without it",
+                      g17p_compute_cprog ? "G17P" : "M5",
+                      agx_last_compile_refusal());
+         }
          ralloc_free(attempt);
          memset(&shader->b, 0, sizeof(shader->b));
          backend_key.agx3_native_cprog = false;
          backend_key.no_preamble = true;
-         backend_key.g17p_uniform_dma = false;
+         /* On G17P, g17p_native_uniforms is set only when a preamble is
+          * enabled while g17p_uniform_dma remains active for non-preamble
+          * compute (hk_g17p_compute_uniform_ranges()). On M5, compute never
+          * sets g17p_native_uniforms and enables g17p_uniform_dma only for
+          * native constant programs (hk_m5_compute_uniform_dma_ranges()). */
+         if (g17p_compute_cprog)
+            backend_key.g17p_native_uniforms = false;
+         else
+            backend_key.g17p_uniform_dma = false;
       }
    }
    if (!compiled)

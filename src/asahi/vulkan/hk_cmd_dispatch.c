@@ -829,21 +829,15 @@ hk_g17p_compute_shader_supported(enum agx_chip chip, struct hk_shader *s,
                                  struct hk_linked_shader *linked, unsigned max_spill_B)
 {
    /* poly_nir_lower_gs preserves the API geometry stage on the main kernel,
-    * even though Honeykrisp has always launched that binary through CDM. */
+    * even though Borealis has always launched that binary through CDM. */
    return s && linked &&
           (s->b.info.stage == MESA_SHADER_COMPUTE ||
            s->info.stage == MESA_SHADER_GEOMETRY ||
            s->info.stage == MESA_SHADER_TESS_CTRL) &&
           linked->b.bo && linked->b.bo->va && linked->b.size != 0 &&
           linked->b.size <= UINT32_MAX && linked->b.nr_gprs != 0 &&
-          ((!s->b.info.has_preamble && s->b.info.preamble_scratch_size == 0) ||
-           /* Only an M5 compute compile forms a constant program
-            * (hk_shader.c), and it carries its TPS frame in the launch. */
-           (agx_chip_g17_m5(chip) && s->info.stage == MESA_SHADER_COMPUTE &&
-            s->b.info.agx3_preamble_staging_known &&
-            s->b.info.preamble_scratch_size <= max_spill_B &&
-            s->b.info.preamble_scratch_size >=
-               s->b.info.agx3_preamble_inputs.storage_bytes)) &&
+          hk_agx3_compute_cprog_supported(chip, s->info.stage, &s->info,
+                                          &s->b.info, max_spill_B) &&
           MAX2(s->b.info.scratch_size, s->b.info.agx3_spectpr_scratch_size) <=
              max_spill_B &&
           MAX2(linked->b.scratch_size, linked->b.agx3_spectpr_scratch_size) <=
@@ -1091,6 +1085,30 @@ hk_g17p_linked_program_desc(struct hk_shader *s,
           s->b.info.ray_traversal_depth_nonzero, &launch_sources))
       return false;
 
+   struct agx_ioto_constant_program constant_program = {0};
+   const struct agx3_cprog_inputs *cprog_inputs = NULL;
+   if (s->b.info.has_preamble) {
+      if (!s->bo || !s->bo->va ||
+          !hk_agx3_g17p_constant_program_from_binary(
+             s->code_ptr, s->code_size, s->b.info.preamble_offset,
+             s->b.info.preamble_size, hk_shader_code_va(s),
+             s->b.info.binary_size, &constant_program))
+         return false;
+      constant_program.force_external = true;
+      constant_program.absolute_branch = true;
+      constant_program.request_prelude = s->b.info.agx3_preamble_uniform_inputs;
+      if (s->b.info.agx3_preamble_tps_inputs)
+         cprog_inputs = &s->b.info.agx3_preamble_inputs;
+      const unsigned cprog_frame =
+         ALIGN_POT(MAX2((unsigned)s->b.info.agx3_preamble_inputs.storage_bytes,
+                        s->b.info.preamble_scratch_size), 16);
+      launch_sources.ti_spill_bytes =
+         MAX2(launch_sources.ti_spill_bytes, cprog_frame);
+      launch_sources.ti_largest_ipr_bytes =
+         MAX2(launch_sources.ti_largest_ipr_bytes,
+              (uint32_t)s->b.info.agx3_preamble_staging_halfs * 2u);
+   }
+
    *desc = (struct agx3_g17p_compute_program_desc){
       .shader_va = linked->b.bo->va->addr + linked->b.entry_offset,
       .uniform_ranges = ranges,
@@ -1098,14 +1116,17 @@ hk_g17p_linked_program_desc(struct hk_shader *s,
       .shader_binary_size = linked->b.size,
       .scratch_size =
          MAX2(linked->b.scratch_size, linked->b.agx3_spectpr_scratch_size),
-      .nr_gprs = linked->b.nr_gprs,
+      .nr_gprs = MAX2(linked->b.nr_gprs, s->b.info.nr_preamble_gprs),
       .compiler_d_valid = s->b.info.agx3_staging_known,
-      .compiler_d = (uint32_t)s->b.info.agx3_staging_halfs * 2,
+      .compiler_d = MAX2((uint32_t)s->b.info.agx3_staging_halfs * 2,
+                         (uint32_t)s->b.info.agx3_preamble_staging_halfs * 2),
       .threadgroup_memory_size_B =
          s->b.info.local_size ? MAX2(256u, ALIGN_POT(s->b.info.local_size, 64u))
                               : 0,
       .launch_sources = launch_sources,
       .ldshdr_f1 = kind,
+      .constant_program = constant_program,
+      .cprog_inputs = cprog_inputs,
    };
    return true;
 }
@@ -1197,7 +1218,7 @@ hk_g17p_build_compute_program(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * after vkQueueSubmit returns. Their originating pipeline need not remain
     * alive after command recording, so the command buffer owns references. */
    hk_cmd_buffer_retain_bo(cmd, linked->b.bo);
-   if (s->b.info.rodata.size_16 != 0)
+   if (s->b.info.rodata.size_16 != 0 || s->b.info.has_preamble)
       hk_cmd_buffer_retain_bo(cmd, s->bo);
 
    const bool ok = hk_g17p_build_compute_program_raw(

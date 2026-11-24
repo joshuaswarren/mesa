@@ -747,6 +747,47 @@ hk_g17p_native_cprog_qualified(const struct agx_shader_info *info)
            info->agx3_preamble_tps_inputs);
 }
 
+/* Whether a compiled compute shader's constant program (preamble) satisfies
+ * the CDM launch contract on G17P or M5. Shared between compile-time fallback
+ * (hk_compile_nir()) and record-time validation
+ * (hk_g17p_compute_shader_supported()) so any kernel whose preamble dispatch
+ * would refuse (including texture/sampler state promotion, scratch/local-size
+ * caps, or staging metadata) falls back cleanly to compiling without a
+ * preamble. */
+static inline bool
+hk_agx3_compute_cprog_supported(enum agx_chip chip, mesa_shader_stage stage,
+                                const struct hk_shader_info *hk_info,
+                                const struct agx_shader_info *info,
+                                unsigned max_spill_B)
+{
+   if (!info->has_preamble && info->preamble_scratch_size == 0)
+      return true;
+
+   const bool tex_sampler_ok =
+      info->texture_state_count == 0 && !info->uses_sampler_heap &&
+      (info->sampler_state_count == 0 ||
+       ((hk_info->agx3_txf_texture_valid ||
+         hk_info->agx3_storage_image_valid ||
+         hk_info->agx3_sampled_storage_valid ||
+         hk_info->agx3_indexed_storage_valid ||
+         hk_info->agx3_indexed_sampler_valid) &&
+        info->sampler_state_count == 1));
+
+   return (agx_chip_g17_m5(chip) || agx_chip_native_preamble(chip)) &&
+          stage == MESA_SHADER_COMPUTE &&
+          info->agx3_staging_known &&
+          info->agx3_preamble_staging_known &&
+          info->scratch_size <= max_spill_B &&
+          info->local_size <= 32768 &&
+          info->preamble_scratch_size <= max_spill_B &&
+          info->preamble_scratch_size >=
+             info->agx3_preamble_inputs.storage_bytes &&
+          tex_sampler_ok &&
+          (agx_chip_g17_m5(chip) ||
+           (hk_g17p_native_cprog_qualified(info) &&
+            !info->uses_ray_traversal && !info->uses_resource_info_query));
+}
+
 /* A null uniform buffer is based at the zero page, which spans
  * maxUniformBufferRange, so null descriptors need no bounds when uniform
  * buffer robustness is disabled. Null storage buffers still need them to
