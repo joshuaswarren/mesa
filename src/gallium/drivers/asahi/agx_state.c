@@ -17270,7 +17270,6 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
       if (clean) {
          struct agx_resource *indirect_rsrc = agx_resource(indirect->buffer);
          agx_batch_reads(clean, indirect_rsrc);
-         agx_batch_note_vs_read(clean, indirect_rsrc);
          indirect_rsrc_base = agx_map_gpu(indirect_rsrc);
          if (info->index_size)
             ib_base = agx_index_buffer_rsrc_ptr(clean, info, &ib_size);
@@ -18122,7 +18121,6 @@ agx_texture_barrier(struct pipe_context *pipe, unsigned flags)
       return;
 
    agx_flush_all(ctx, "Texture barrier");
-   ctx->batches.barrier_seqnum = ctx->batches.seqnum;
 }
 
 void
