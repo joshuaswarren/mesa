@@ -5984,6 +5984,76 @@ TEST_F(AGX3PackBinary, TextureFetch2DLod2Immediate)
    EXPECT_EQ(pack(b), want);
 }
 
+static agx_instr *
+staged_fetch_2d(agx_builder *b, unsigned dest_reg, unsigned coord_reg)
+{
+   agx_index dest = agx_register(dest_reg, AGX_SIZE_32);
+   agx_index coord = agx_register(coord_reg, AGX_SIZE_32);
+   dest.channels_m1 = 3;
+   coord.channels_m1 = 1;
+   agx_instr *I = agx_texture_sample_to(
+      b, dest, coord, agx_immediate(0), agx_immediate(0), agx_immediate(0),
+      agx_immediate(0), agx_null(), AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0, false,
+      false, false, AGX_GATHER_NONE, false);
+   I->op = AGX_OPCODE_TEXTURE_LOAD;
+   I->mask = 15;
+   return I;
+}
+
+/* Register indices are halves. fetch h0 <- h24; if (h48 < h50) { h40 =
+ * h0 + h2; fetch h8 <- h28 } pop; fetch h16 <- h32. The arm waits for the
+ * first fetch, so its own fetch may stage in the first fetch's bank. Lanes
+ * that skipped the arm did not wait, so after the pop the first fetch may
+ * still be reading its staged coordinates: the last fetch must stage them
+ * elsewhere or wait for it. */
+static void
+build_fetch_if_fetch(agx_builder *b)
+{
+   b->shader->stage = MESA_SHADER_VERTEX;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *arm = agx_test_block(b->shader);
+   agx_block *pop = agx_test_block(b->shader);
+   staged_fetch_2d(b, 0, 24);
+   agx_begin_cf(b);
+   agx_if_icmp(b, agx_register(48, AGX_SIZE_32), agx_register(50, AGX_SIZE_32),
+               1, AGX_ICOND_ULT, false, pop);
+   agx_jmp_exec_none(b, pop);
+   agx_block_add_successor(entry, arm);
+   agx_block_add_successor(entry, pop);
+
+   agx_builder ab = agx_init_builder(b->shader, agx_after_block(arm));
+   agx_fadd_to(&ab, agx_register(40, AGX_SIZE_32), agx_register(0, AGX_SIZE_32),
+               agx_register(2, AGX_SIZE_32));
+   staged_fetch_2d(&ab, 8, 28);
+   agx_index arm_out = agx_register(8, AGX_SIZE_32);
+   arm_out.channels_m1 = 3;
+   agx_device_store(&ab, arm_out, agx_uniform(0, AGX_SIZE_64), agx_immediate(32),
+                    AGX_FORMAT_I32, 15, 0, false);
+   agx_block_add_successor(arm, pop);
+
+   agx_builder pb = agx_init_builder(b->shader, agx_after_block(pop));
+   agx_pop_exec(&pb, 1);
+   staged_fetch_2d(&pb, 16, 32);
+   for (unsigned h = 0; h <= 16; h += 16) {
+      agx_index v = agx_register(h, AGX_SIZE_32);
+      v.channels_m1 = 3;
+      agx_device_store(&pb, v, agx_uniform(0, AGX_SIZE_64),
+                       agx_immediate(h), AGX_FORMAT_I32, 15, 0, false);
+   }
+   agx_stop(&pb);
+}
+
+TEST_F(AGX3PackBinary, ArmEndKeepsStagedCoordinatesOfAnEarlierFetch)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   build_fetch_if_fetch(b);
+   ASSERT_FALSE(pack(b).empty());
+   /* The arm's fetch reuses bank 0 (halves 0..3); the last one takes bank 1
+    * (halves 8..11) rather than overwrite the first fetch's coordinates. */
+   EXPECT_TRUE(b->shader->agx3_staging_known);
+   EXPECT_EQ(b->shader->agx3_staging_halfs, 12u);
+}
+
 TEST_F(AGX3PackBinary, TextureFetchRepeatedWaitKeepsCoordinateUntilFinalCopy)
 {
    const auto enc = AGX_ISA_ENCODING_AGX3B;
@@ -7960,6 +8030,105 @@ TEST_F(AGX3PackBinary, NativeStatsCountControlFlowDrains)
          EXPECT_EQ(agx3_native_stats.loop_cf_drains, 0u);
          EXPECT_GE(agx3_native_stats.wait_carriers, 1u);
       }
+   }
+}
+
+/* Build: load r4; if (r0 < r2) { <arm> } <after>, with the arm's exec-none
+ * skip jumping to the pop block. `arm_uses` puts the load's consumer in the
+ * arm; otherwise it follows the pop. */
+static void
+build_load_then_if(agx_builder *b, bool arm_uses, bool compare_reads_load)
+{
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *arm = agx_test_block(b->shader);
+   agx_block *pop = agx_test_block(b->shader);
+   agx_index loaded = agx_register(4, AGX_SIZE_32);
+   agx_device_load_to(b, loaded, agx_uniform(0, AGX_SIZE_64), agx_immediate(0),
+                      AGX_FORMAT_I32, 1, 0, false);
+   agx_begin_cf(b);
+   agx_if_icmp(b, compare_reads_load ? loaded : agx_register(0, AGX_SIZE_32),
+               agx_register(2, AGX_SIZE_32), 1, AGX_ICOND_ULT, false, pop);
+   agx_jmp_exec_none(b, pop);
+   agx_block_add_successor(entry, arm);
+   agx_block_add_successor(entry, pop);
+
+   agx_builder ab = agx_init_builder(b->shader, agx_after_block(arm));
+   agx_device_store(&ab, arm_uses ? loaded : agx_register(6, AGX_SIZE_32),
+                    agx_uniform(0, AGX_SIZE_64), agx_immediate(8),
+                    AGX_FORMAT_I32, 1, 0, false);
+   agx_block_add_successor(arm, pop);
+
+   agx_builder pb = agx_init_builder(b->shader, agx_after_block(pop));
+   agx_pop_exec(&pb, 1);
+   agx_device_store(&pb, loaded, agx_uniform(0, AGX_SIZE_64), agx_immediate(4),
+                    AGX_FORMAT_I32, 1, 0, false);
+   agx_stop(&pb);
+}
+
+/* A forward if keeps the load in flight into its arm: no drain at the if,
+ * the consumer in the arm waits for it, and the pop at the end of the arm
+ * retires nothing more. A consumer only after the pop leaves the load
+ * outstanding until the pop, which drains it; so does the skipped-arm path,
+ * whose jump lands on that pop's carrier. */
+TEST_F(AGX3PackBinary, ForwardIfKeepsLoadsInFlightIntoTheArm)
+{
+   for (int e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      for (bool arm_uses : {true, false}) {
+         agx_builder *b = builder(enc);
+         build_load_then_if(b, arm_uses, false);
+         EXPECT_FALSE(pack(b).empty());
+         /* The consumer in the arm waited; the pop still drains on the
+          * skip path's behalf only when something is outstanding there. */
+         EXPECT_EQ(agx3_native_stats.cf_drains, arm_uses ? 0u : 1u);
+      }
+   }
+}
+
+/* The skip jump must land ahead of the pop's retire carrier: the carrier
+ * is the first thing in the pop block, and the branch displacement reaches
+ * exactly the block start. */
+TEST_F(AGX3PackBinary, SkippedArmLandsOnTheRetireCarrier)
+{
+   for (int e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      agx_builder *b = builder(enc);
+      build_load_then_if(b, false, false);
+      std::vector<uint8_t> bin = pack(b);
+      ASSERT_FALSE(bin.empty());
+      agx_block *pop = NULL;
+      agx_foreach_block(b->shader, block)
+         pop = block;
+      ASSERT_NE(pop, nullptr);
+      /* The pop block starts with the carrier, not the cndend: a jump to
+       * the block start runs the carrier. The cndend follows it. */
+      uint8_t cndend[AGX3_CF_MAX_LENGTH], len = 0;
+      ASSERT_TRUE(agx3_cf_cndend(enc, 1, cndend, &len));
+      ASSERT_LE((size_t)pop->offset + len, bin.size());
+      EXPECT_NE(memcmp(bin.data() + pop->offset, cndend, len), 0);
+      bool cndend_follows = false;
+      for (size_t at = pop->offset + 1; at + len <= bin.size(); ++at)
+         cndend_follows |= !memcmp(bin.data() + at, cndend, len);
+      EXPECT_TRUE(cndend_follows);
+      EXPECT_EQ(agx3_native_stats.cf_drains, 1u);
+      EXPECT_GE(agx3_native_stats.wait_carriers, 1u);
+   }
+}
+
+/* A compare reading the load waits for it, which no branch form carries:
+ * the if drains as before and nothing is left for the pop. */
+TEST_F(AGX3PackBinary, IfReadingALoadStillDrains)
+{
+   for (int e = 0; e < 2; ++e) {
+      agx_builder *b =
+         builder(e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B);
+      build_load_then_if(b, false, true);
+      EXPECT_FALSE(pack(b).empty());
+      EXPECT_EQ(agx3_native_stats.cf_drains, 0u);
+      EXPECT_GE(agx3_native_stats.wait_carriers, 1u);
    }
 }
 

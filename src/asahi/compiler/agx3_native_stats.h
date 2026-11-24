@@ -20,10 +20,9 @@ extern "C" {
  *  wait_carriers   identity instructions emitted only to carry a scoreboard
  *                  wait (agx3_band_carrier() and the in-place identities);
  *  cf_drains       control-flow instructions before which outstanding
- *                  asynchronous results were retired that neither the
- *                  instruction nor, for the zero-byte begin, the branch
- *                  right after it reads: slot assignment does not carry
- *                  state across a branch;
+ *                  asynchronous results the instruction does not read were
+ *                  retired: slot assignment does not carry state across a
+ *                  merge or a loop (agx3_slot_cf_kind());
  *  loop_cf_drains  the subset of cf_drains inside a loop;
  *  staging_copies  copies into the staging file (texture coordinates,
  *                  image and tile payloads, vertex outputs).

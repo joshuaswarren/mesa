@@ -4,7 +4,9 @@
  */
 
 #include "agx3_slot_core.h"
+#include "util/macros.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* Whether a register still belongs to this generation, as result or payload. */
@@ -52,12 +54,28 @@ agx3_slot_token_count(const struct agx3_slot_instr *instrs, unsigned n)
    return count;
 }
 
+/* The assignment state at the if that opened an arm. */
+struct agx3_slot_level {
+   bool arm;
+   uint16_t pending, entry_pending, active_reader_slots;
+   bool waited[9], reissuable[9];
+   uint8_t join_class[9], join_count[9];
+   uint8_t *reg_slot;
+   uint16_t *reader_slots;
+};
+
+struct agx3_slot_levels {
+   struct agx3_slot_level *levels;
+   unsigned max_depth;
+};
+
 static bool
-agx3_slot_assign_initial(const struct agx3_slot_instr *instrs, unsigned n,
-                            unsigned nslots, const struct agx3_slot_entry *entry,
-                            unsigned entry_count,
-                            const struct agx3_slot_live_range *live,
-                            unsigned live_count, struct agx3_slot_result *out)
+agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
+                      unsigned nslots, const struct agx3_slot_entry *entry,
+                      unsigned entry_count,
+                      const struct agx3_slot_live_range *live,
+                      unsigned live_count, struct agx3_slot_result *out,
+                      const struct agx3_slot_levels *lv)
 {
    if (instrs == NULL || out == NULL || nslots < 1 || nslots > 8 ||
        (entry_count && entry == NULL) || entry_count > AGX3_SLOT_NUM_TOKENS ||
@@ -127,6 +145,7 @@ agx3_slot_assign_initial(const struct agx3_slot_instr *instrs, unsigned n,
    uint8_t slot_join_count[9] = {0};
 
    unsigned next = 0; /* round-robin cursor into 0..nslots-1 */
+   unsigned depth = 0; /* open structured control-flow levels */
 
    for (unsigned i = 0; i < n; ++i) {
       const struct agx3_slot_instr *I = &instrs[i];
@@ -368,9 +387,130 @@ agx3_slot_assign_initial(const struct agx3_slot_instr *instrs, unsigned n,
             reg_slot[I->dst[d]] = 0; /* synchronous result, no wait needed */
          }
       }
+
+      /* Emission retires every outstanding generation before a draining
+       * control-flow boundary. Start the code after it from that empty
+       * scoreboard, so allocation neither skips nor waits for generations
+       * the drain already retired. */
+      if (I->cf != AGX3_SLOT_CF_NONE) {
+         memset(reg_slot, 0, token_count * sizeof(reg_slot[0]));
+         memset(reader_slots, 0, token_count * sizeof(reader_slots[0]));
+         active_reader_slots = 0;
+         pending = 0;
+         entry_pending = 0;
+         for (unsigned slot = 1; slot <= nslots; ++slot) {
+            slot_waited[slot] = true;
+            slot_reissuable[slot] = false;
+            slot_join_count[slot] = 0;
+            slot_join_class[slot] = 0;
+         }
+      }
+
+      /* An arm's end retires only what the arm issued: resume from the
+       * state at its if (enum agx3_slot_cf). */
+#define AGX3_SLOT_LOAD(L)                                                     \
+   do {                                                                       \
+      memcpy(reg_slot, (L)->reg_slot, token_count * sizeof(reg_slot[0]));    \
+      memcpy(reader_slots, (L)->reader_slots,                                \
+             token_count * sizeof(reader_slots[0]));                         \
+      pending = (L)->pending;                                                \
+      entry_pending = (L)->entry_pending;                                    \
+      active_reader_slots = (L)->active_reader_slots;                        \
+      memcpy(slot_waited, (L)->waited, sizeof(slot_waited));                 \
+      memcpy(slot_reissuable, (L)->reissuable, sizeof(slot_reissuable));     \
+      memcpy(slot_join_class, (L)->join_class, sizeof(slot_join_class));     \
+      memcpy(slot_join_count, (L)->join_count, sizeof(slot_join_count));     \
+   } while (0)
+      if (I->cf_else) {
+         if (!depth)
+            return false;
+         if (lv->levels[depth - 1].arm)
+            AGX3_SLOT_LOAD(&lv->levels[depth - 1]);
+      }
+      for (unsigned p = 0; p < I->cf_pop; ++p) {
+         if (!depth)
+            return false;
+         const struct agx3_slot_level *L = &lv->levels[--depth];
+         if (L->arm) {
+            /* An arm keeps state only when its pop closes it alone. */
+            if (I->cf_pop != 1)
+               return false;
+            AGX3_SLOT_LOAD(L);
+         }
+      }
+#undef AGX3_SLOT_LOAD
+      for (unsigned p = 0; p < I->cf_push; ++p) {
+         if (depth >= lv->max_depth)
+            return false;
+         struct agx3_slot_level *L = &lv->levels[depth++];
+         L->arm = I->cf_arm;
+         if (!L->arm)
+            continue;
+         memcpy(L->reg_slot, reg_slot, token_count * sizeof(reg_slot[0]));
+         memcpy(L->reader_slots, reader_slots,
+                token_count * sizeof(reader_slots[0]));
+         L->pending = pending;
+         L->entry_pending = entry_pending;
+         L->active_reader_slots = active_reader_slots;
+         memcpy(L->waited, slot_waited, sizeof(slot_waited));
+         memcpy(L->reissuable, slot_reissuable, sizeof(slot_reissuable));
+         memcpy(L->join_class, slot_join_class, sizeof(slot_join_class));
+         memcpy(L->join_count, slot_join_count, sizeof(slot_join_count));
+      }
    }
 
    return true;
+}
+
+/* Size the per-level snapshots like agx3_slot_assign_core() sizes its token
+ * domain, run it, and free them. */
+static bool
+agx3_slot_assign_initial(const struct agx3_slot_instr *instrs, unsigned n,
+                         unsigned nslots, const struct agx3_slot_entry *entry,
+                         unsigned entry_count,
+                         const struct agx3_slot_live_range *live,
+                         unsigned live_count, struct agx3_slot_result *out)
+{
+   if (instrs == NULL)
+      return false;
+
+   unsigned depth = 0, max_depth = 0;
+   for (unsigned i = 0; i < n; ++i) {
+      if (instrs[i].cf_pop > depth)
+         return false;
+      depth = depth - instrs[i].cf_pop + instrs[i].cf_push;
+      max_depth = MAX2(max_depth, depth);
+   }
+
+   unsigned stride = agx3_slot_token_count(instrs, n);
+   for (unsigned i = 0; entry && i < entry_count; ++i)
+      stride = MAX2(stride, (unsigned)entry[i].token + 1u);
+   for (unsigned i = 0; live && i < live_count; ++i)
+      stride = MAX2(stride, (unsigned)live[i].first + live[i].count);
+   stride = MIN2(stride, AGX3_SLOT_NUM_TOKENS);
+
+   struct agx3_slot_levels lv = {.max_depth = max_depth};
+   uint8_t *arena = NULL;
+   if (max_depth) {
+      lv.levels = calloc(max_depth, sizeof(*lv.levels));
+      arena = calloc(max_depth, stride * (sizeof(uint8_t) + sizeof(uint16_t)));
+      if (!lv.levels || !arena) {
+         free(lv.levels);
+         free(arena);
+         return false;
+      }
+      for (unsigned d = 0; d < max_depth; ++d) {
+         uint8_t *base = arena + d * stride * (sizeof(uint8_t) + sizeof(uint16_t));
+         lv.levels[d].reader_slots = (uint16_t *)base;
+         lv.levels[d].reg_slot = base + stride * sizeof(uint16_t);
+      }
+   }
+
+   const bool ok = agx3_slot_assign_core(instrs, n, nslots, entry, entry_count,
+                                         live, live_count, out, &lv);
+   free(lv.levels);
+   free(arena);
+   return ok;
 }
 
 bool
@@ -397,4 +537,44 @@ agx3_slot_assign(const struct agx3_slot_instr *instrs, unsigned n,
                  unsigned nslots, struct agx3_slot_result *out)
 {
    return agx3_slot_assign_with_entry(instrs, n, nslots, NULL, 0, out);
+}
+
+void
+agx3_slot_retire_at_cf(const struct agx3_slot_instr *instrs, unsigned n,
+                       uint16_t entry_wait, struct agx3_slot_result *res,
+                       bool *drained)
+{
+   /* Assignment already starts from the state each drain leaves, so no
+    * wait names a generation a drain retired; only report the drains,
+    * following the same arm structure. */
+   uint16_t live = entry_wait;
+   uint16_t *at_if = calloc(n ? n : 1, sizeof(uint16_t));
+   bool *arm = calloc(n ? n : 1, sizeof(bool));
+   unsigned depth = 0;
+   for (unsigned i = 0; i < n; ++i) {
+      live &= (uint16_t)~res[i].wait_mask;
+      if (res[i].slot)
+         live |= (uint16_t)(1u << (res[i].slot - 1));
+
+      if (instrs[i].cf != AGX3_SLOT_CF_NONE) {
+         if (drained)
+            drained[i] = live != 0;
+         live = 0;
+      }
+      if (!at_if || !arm)
+         continue;
+      if (instrs[i].cf_else && depth && arm[depth - 1])
+         live = at_if[depth - 1];
+      for (unsigned p = 0; p < instrs[i].cf_pop && depth; ++p) {
+         --depth;
+         if (arm[depth])
+            live = at_if[depth];
+      }
+      for (unsigned p = 0; p < instrs[i].cf_push && depth < n; ++p) {
+         arm[depth] = instrs[i].cf_arm;
+         at_if[depth++] = live;
+      }
+   }
+   free(at_if);
+   free(arm);
 }

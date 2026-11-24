@@ -738,6 +738,140 @@ int main(void)
       CHECK(!agx3_slot_assign(p, 4, 6, r));
    }
 
+   /* Control-flow drains: emission retires the load before the branch, so
+    * assignment gives its consumer after the branch no wait, and the drain
+    * counts. */
+   {
+      struct agx3_slot_instr branch = st(0);
+      branch.cf = AGX3_SLOT_CF_DRAIN;
+      struct agx3_slot_instr p[] = { ld(10), branch, alu(12, 10, 10) };
+      bool drained[3] = {0};
+      CHECK(agx3_slot_assign(p, 3, 6, r));
+      CHECK(r[2].wait_mask == 0);
+      agx3_slot_retire_at_cf(p, 3, 0, r, drained);
+      CHECK(r[2].wait_mask == 0);
+      CHECK(!drained[0] && drained[1] && !drained[2]);
+   }
+   /* A branch that reads the load waits for it itself: not a drain. */
+   {
+      struct agx3_slot_instr branch = st(10);
+      branch.cf = AGX3_SLOT_CF_DRAIN;
+      struct agx3_slot_instr p[] = { ld(10), branch, alu(12, 10, 10) };
+      bool drained[3] = {0};
+      CHECK(agx3_slot_assign(p, 3, 6, r));
+      CHECK(r[1].wait_mask == (1u << (r[0].slot - 1)));
+      agx3_slot_retire_at_cf(p, 3, 0, r, drained);
+      CHECK(!drained[1] && r[2].wait_mask == 0);
+   }
+   /* A non-draining boundary (a forward if) keeps the load in flight: its
+    * consumer inside the arm still waits for it. */
+   {
+      struct agx3_slot_instr branch = st(0);
+      struct agx3_slot_instr p[] = { ld(10), branch, alu(12, 10, 10) };
+      bool drained[3] = {0};
+      CHECK(agx3_slot_assign(p, 3, 6, r));
+      agx3_slot_retire_at_cf(p, 3, 0, r, drained);
+      CHECK(r[2].wait_mask == (1u << (r[0].slot - 1)));
+      CHECK(!drained[1]);
+   }
+   /* After a drain every slot is free: the next load takes the next slot in
+    * turn without waiting, keeps its own wait, and the pre-drain value
+    * needs none. */
+   {
+      struct agx3_slot_instr branch = st(0);
+      branch.cf = AGX3_SLOT_CF_DRAIN;
+      struct agx3_slot_instr p[] = { ld(10), branch, ld(12), alu(14, 12, 10) };
+      CHECK(agx3_slot_assign(p, 4, 6, r));
+      CHECK(r[2].wait_mask == 0 && r[2].slot != 0);
+      agx3_slot_retire_at_cf(p, 4, 0, r, NULL);
+      CHECK(r[3].wait_mask == (1u << (r[2].slot - 1)));
+   }
+   /* Six loads fill every AGX3B slot; after a drain, six more need no
+    * forced retire of an earlier generation. */
+   {
+      struct agx3_slot_instr p[14];
+      for (unsigned i = 0; i < 6; ++i)
+         p[i] = ld(20 + 2 * i);
+      p[6] = st(0);
+      p[6].cf = AGX3_SLOT_CF_DRAIN;
+      for (unsigned i = 0; i < 6; ++i)
+         p[7 + i] = ld(40 + 2 * i);
+      p[13] = alu(60, 40, 50);
+      CHECK(agx3_slot_assign(p, 14, 6, r));
+      for (unsigned i = 7; i < 13; ++i)
+         CHECK(r[i].wait_mask == 0);
+      CHECK(r[13].wait_mask == ((1u << (r[7].slot - 1)) | (1u << (r[12].slot - 1))));
+   }
+
+   /* Arms (enum agx3_slot_cf): a drain at the end of an arm runs under
+    * the arm's exec mask, which may be empty, so it retires only what the
+    * arm issued. A load from before the if is still waited for by its
+    * consumers after the arm and in an else arm. */
+   {
+      struct agx3_slot_instr open = st(0), close = st(0);
+      open.cf_push = 1;
+      open.cf_arm = true;
+      close.cf = AGX3_SLOT_CF_DRAIN;
+      close.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         ld(10), open, alu(12, 10, 10), close, alu(14, 10, 10),
+      };
+      CHECK(agx3_slot_assign(p, 5, 6, r));
+      CHECK(r[2].wait_mask == (1u << (r[0].slot - 1)));
+      CHECK(r[4].wait_mask == (1u << (r[0].slot - 1)));
+   }
+   {
+      struct agx3_slot_instr open = st(0), other = st(0), close = st(0);
+      open.cf_push = 1;
+      open.cf_arm = true;
+      other.cf = AGX3_SLOT_CF_DRAIN;
+      other.cf_else = true;
+      close.cf = AGX3_SLOT_CF_DRAIN;
+      close.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         ld(10), open, alu(12, 10, 10), other, alu(14, 10, 10), close,
+      };
+      CHECK(agx3_slot_assign(p, 6, 6, r));
+      CHECK(r[4].wait_mask == (1u << (r[0].slot - 1)));
+   }
+   /* What the arm issued is retired by the drain at its end. */
+   {
+      struct agx3_slot_instr open = st(0), close = st(0);
+      open.cf_push = 1;
+      open.cf_arm = true;
+      close.cf = AGX3_SLOT_CF_DRAIN;
+      close.cf_pop = 1;
+      struct agx3_slot_instr p[] = { open, ld(10), close, alu(12, 10, 10) };
+      CHECK(agx3_slot_assign(p, 4, 6, r));
+      CHECK(r[3].wait_mask == 0);
+   }
+   /* A non-arm level (a loop push, or an if that drains) drains as before. */
+   {
+      struct agx3_slot_instr open = st(0), close = st(0);
+      open.cf = AGX3_SLOT_CF_DRAIN;
+      open.cf_push = 1;
+      close.cf = AGX3_SLOT_CF_DRAIN;
+      close.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         ld(10), open, alu(12, 10, 10), close, alu(14, 10, 10),
+      };
+      CHECK(agx3_slot_assign(p, 5, 6, r));
+      CHECK(r[2].wait_mask == 0 && r[4].wait_mask == 0);
+   }
+   /* An arm closed together with another level, or an unbalanced pop, is
+    * refused: the packer then drains everywhere. */
+   {
+      struct agx3_slot_instr open = st(0), close = st(0);
+      open.cf_push = 1;
+      open.cf_arm = true;
+      close.cf = AGX3_SLOT_CF_DRAIN;
+      close.cf_pop = 2;
+      struct agx3_slot_instr p[] = { open, open, close };
+      CHECK(!agx3_slot_assign(p, 3, 6, r));
+      struct agx3_slot_instr q[] = { close };
+      CHECK(!agx3_slot_assign(q, 1, 6, r));
+   }
+
    /* Malformed inputs. */
    CHECK(!agx3_slot_assign(NULL, 1, 6, r));
    { struct agx3_slot_instr p=ld(0); CHECK(!agx3_slot_assign(&p,1,0,r)); CHECK(!agx3_slot_assign(&p,1,9,r)); }
