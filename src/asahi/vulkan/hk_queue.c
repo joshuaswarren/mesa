@@ -1590,22 +1590,6 @@ hk_sibling_deep(struct hk_device *dev, struct hk_queue *queue,
    return submitted_point >= done + HK_G17P_SIBLING_MIN_IN_FLIGHT;
 }
 
-/* A stream's prior in the ordinals of the kernel queue it is sent to: a
- * command of this submission keeps its offset from the submission's first
- * ordinal; an earlier submission's command becomes every earlier command of
- * that kernel queue, and the submission also waits for the siblings' work
- * (*earlier). */
-static inline uint64_t
-hk_sibling_prior(uint64_t prior, uint64_t base, uint64_t kq_base, bool *earlier)
-{
-   if (prior == 0)
-      return 0;
-   if (prior > base)
-      return kq_base + (prior - base);
-   *earlier = true;
-   return kq_base;
-}
-
 static struct hk_cs *
 hk_submit_unordered_start_ts(const struct vk_queue_submit *submit)
 {
@@ -2072,7 +2056,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    /* Sibling kernel queues (hk_queue::sib): an eligible submission takes the
     * next kernel queue in turn. Once a sibling has run work, the primary's
     * ordinals differ from sync.submitted: priors are then rewritten for the
-    * kernel queue they go to (hk_sibling_prior), and a submission that
+    * kernel queue they go to (hk_drm_sibling_prior), and a submission that
     * depends on an earlier one also waits for the latest sibling point. */
    unsigned sib_target = 0;
    const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
@@ -2140,8 +2124,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
          };
          if (sib_rewrite) {
             for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
-               prior[sq] = hk_sibling_prior(prior[sq], prior_base[sq],
-                                            kq_base[sq], &sib_earlier);
+               prior[sq] = hk_drm_sibling_prior(prior[sq], prior_base[sq],
+                                                kq_base[sq], &sib_earlier);
             }
          }
          header.size = sizeof(cmd);
@@ -2180,14 +2164,18 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
          uint64_t command_prior[HK_SYNC_NUM_SQ] = {
             cs->sync.prior[HK_SYNC_VDM], cs->sync.prior[HK_SYNC_CDM],
          };
+         /* The tiling half's prefix of a render that splits it, which the
+          * staged forms below send. It counts in the same ordinals as the
+          * whole prefix, so it is rewritten for the same kernel queue. */
+         uint64_t ta_command_prior[HK_SYNC_NUM_SQ] = {
+            cs->sync.prior_ta[HK_SYNC_VDM], cs->sync.prior_ta[HK_SYNC_CDM],
+         };
          if (sib_rewrite) {
-            for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
-               command_prior[sq] = hk_sibling_prior(
-                  command_prior[sq], prior_base[sq], kq_base[sq], &sib_earlier);
-               /* A zero barrier names this kernel queue's earlier ioctls. */
-               if (cs->sync.barrier[sq] == 0)
-                  sib_earlier = true;
-            }
+            hk_drm_sibling_prefix(command_prior, cs->sync.barrier, prior_base,
+                                  kq_base, &sib_earlier);
+            if (cs->sync.ta_split)
+               hk_drm_sibling_prefix(ta_command_prior, cs->sync.barrier_ta,
+                                     prior_base, kq_base, &sib_earlier);
          }
          /* The same recording can occur twice in a merged submit (for
           * example synchronization2.basic.event.none_set_reset). Assign
@@ -2401,7 +2389,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                cs->sync.ta_split &&
                (cs->sync.barrier_ta[HK_SYNC_CDM] !=
                    cs->sync.barrier[HK_SYNC_CDM] ||
-                cs->sync.prior_ta[HK_SYNC_CDM] != cs->sync.prior[HK_SYNC_CDM]);
+                ta_command_prior[HK_SYNC_CDM] != command_prior[HK_SYNC_CDM]);
             if (g17p_staged) {
                cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
                perf_debug_dev(&dev->dev, "G17P staged render");
@@ -2474,7 +2462,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                cs->sync.ta_split &&
                (cs->sync.barrier_ta[HK_SYNC_CDM] !=
                    cs->sync.barrier[HK_SYNC_CDM] ||
-                cs->sync.prior_ta[HK_SYNC_CDM] != cs->sync.prior[HK_SYNC_CDM]);
+                ta_command_prior[HK_SYNC_CDM] != command_prior[HK_SYNC_CDM]);
             if (stage_cdm)
                cmd.legacy.flags |= DRM_ASAHI_RENDER_COMPUTE_STAGE_BARRIERS;
             if (unlikely(anatomy))
@@ -2494,9 +2482,9 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                   .render = {.legacy = cmd},
                   .stage_prefixes = {
                      .ta_cdm_barrier = cs->sync.barrier_ta[HK_SYNC_CDM],
-                     .ta_prior_cdm = cs->sync.prior_ta[HK_SYNC_CDM],
+                     .ta_prior_cdm = ta_command_prior[HK_SYNC_CDM],
                      .ta_vdm_barrier = cs->sync.barrier_ta[HK_SYNC_VDM],
-                     .ta_prior_vdm = cs->sync.prior_ta[HK_SYNC_VDM],
+                     .ta_prior_vdm = ta_command_prior[HK_SYNC_VDM],
                   },
                };
                if (g17p_staged)
@@ -2515,9 +2503,9 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                const struct drm_asahi_cmd_render_with_stage_prefixes staged = {
                   .legacy = cmd,
                   .ta_cdm_barrier = cs->sync.barrier_ta[HK_SYNC_CDM],
-                  .ta_prior_cdm = cs->sync.prior_ta[HK_SYNC_CDM],
+                  .ta_prior_cdm = ta_command_prior[HK_SYNC_CDM],
                   .ta_vdm_barrier = cs->sync.barrier_ta[HK_SYNC_VDM],
-                  .ta_prior_vdm = cs->sync.prior_ta[HK_SYNC_VDM],
+                  .ta_prior_vdm = ta_command_prior[HK_SYNC_VDM],
                };
                header.size = sizeof(staged);
                util_dynarray_append(&payload, header);
@@ -2527,7 +2515,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                const struct drm_asahi_cmd_render_with_stage_prior staged = {
                   .legacy = cmd,
                   .ta_cdm_barrier = cs->sync.barrier_ta[HK_SYNC_CDM],
-                  .ta_prior_cdm = cs->sync.prior_ta[HK_SYNC_CDM],
+                  .ta_prior_cdm = ta_command_prior[HK_SYNC_CDM],
                };
                header.size = sizeof(staged);
                util_dynarray_append(&payload, header);

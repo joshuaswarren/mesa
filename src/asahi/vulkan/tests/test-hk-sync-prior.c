@@ -1308,6 +1308,41 @@ test_g17p_tiling_order(void)
      !hk_drm_g17p_tiling_ordered(40, 0, 40, 40, false, &c) && c == 40);
 }
 
+/* Sibling kernel queues: once siblings have run compute work, the primary
+ * kernel queue's compute ordinals run ahead of the queue's own (base 20,
+ * kernel queue 50). Both prefixes of a split render, the whole one and the
+ * tiling half's, are rewritten the same way. */
+static void
+test_sibling_prefix(void)
+{
+   const uint64_t base[2] = {10, 20};
+   const uint64_t kq_base[2] = {10, 50};
+   const uint16_t none[2] = {DRM_ASAHI_BARRIER_NONE, DRM_ASAHI_BARRIER_NONE};
+
+   bool earlier = false;
+   uint64_t whole[2] = {12, 23};
+   hk_drm_sibling_prefix(whole, none, base, kq_base, &earlier);
+   T("a command of this submission keeps its offset",
+     whole[0] == 12 && whole[1] == 53 && !earlier);
+
+   uint64_t tiling[2] = {0, 22};
+   hk_drm_sibling_prefix(tiling, none, base, kq_base, &earlier);
+   T("the tiling half's prior moves with the whole prior",
+     tiling[0] == 0 && tiling[1] == 52 && !earlier);
+
+   uint64_t older[2] = {0, 15};
+   hk_drm_sibling_prefix(older, none, base, kq_base, &earlier);
+   T("an earlier submission's command names the kernel queue's earlier work",
+     older[0] == 0 && older[1] == 50 && earlier);
+
+   earlier = false;
+   const uint16_t zero_cdm[2] = {DRM_ASAHI_BARRIER_NONE, 0};
+   uint64_t header0[2] = {0, 0};
+   hk_drm_sibling_prefix(header0, zero_cdm, base, kq_base, &earlier);
+   T("a zero tiling barrier waits for the siblings' work",
+     header0[0] == 0 && header0[1] == 0 && earlier);
+}
+
 /* G17P image barriers order a render's vertex half only once it draws with a
  * pre-rasterization shader that reads images (HK_SYNC_GFX_IMG). */
 static void
@@ -2229,6 +2264,7 @@ main(void)
    test_discard_transition_carry();
    test_g17p_vertex_after_memory_writers();
    test_g17p_tiling_order();
+   test_sibling_prefix();
    test_chain_first_skips_empty_buffers();
    test_repeated_recording();
    test_rt_kernel_gate();
