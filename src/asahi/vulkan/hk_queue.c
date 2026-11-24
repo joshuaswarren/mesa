@@ -3011,8 +3011,10 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
        submit->image_opaque_bind_count || !hk_pack_runs_enabled(dev))
       return false;
 
-   uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
-   if (!agx3_cdm_stream_terminate_pack(dev->dev.chip, terminate))
+   uint8_t terminate[HK_PACK_CDM_TERMINATE_MAX];
+   const size_t terminate_size =
+      hk_pack_cdm_terminate(dev->dev.chip, terminate);
+   if (!terminate_size)
       return false;
 
    const bool visible_completion =
@@ -3021,7 +3023,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
    const struct hk_pack_limits limits = {
       .max_attachments = hk_pack_attachment_limit(dev),
       .overhead =
-         sizeof(terminate) + HK_CS_SPACE_PADDING + AGX_CDM_STREAM_LINK_LENGTH,
+         terminate_size + HK_CS_SPACE_PADDING + AGX_CDM_STREAM_LINK_LENGTH,
    };
    struct hk_pack_member *members =
       hk_queue_pack_scratch(&queue->pack.members, n, sizeof(*members));
@@ -3092,7 +3094,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             (const void *)submit->command_buffers[pr->first + m];
          const struct hk_cs *item = list_first_entry(&source->control_streams,
                                                      struct hk_cs, node);
-         void *item_end = (uint8_t *)item->current - sizeof(terminate);
+         void *item_end = (uint8_t *)item->current - terminate_size;
          const bool last = m + 1 == pr->count;
 
          /* The reserved range keeps the merge inline: the link path, which
@@ -3152,8 +3154,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                 ? cs->memory_flush_end == cs->current
                 : cs->strong_flush_end == cs->current ||
                      cs->weak_barrier_end == cs->current);
-      memcpy(cs->current, terminate, sizeof(terminate));
-      cs->current = (uint8_t *)cs->current + sizeof(terminate);
+      memcpy(cs->current, terminate, terminate_size);
+      cs->current = (uint8_t *)cs->current + terminate_size;
       memset(cs->current, 0, HK_CS_SPACE_PADDING);
       if (cached) {
          const size_t written =

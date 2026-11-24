@@ -393,6 +393,115 @@ TEST(M5CopySchedule, ComputeDeviceLoadsFollowTheProgramPeak)
    }
 }
 
+/* Global device memory and threadgroup local memory are disjoint address
+ * spaces: a local_store must not serialize independent device_loads behind it,
+ * while a barrier still orders both spaces. Applies across AGX2 and AGX3. */
+TEST(M5CopySchedule, DeviceLoadsHoistPastLocalStoresAcrossGenerations)
+{
+   for (enum agx_isa_encoding enc :
+        {AGX_ISA_ENCODING_AGX2, AGX_ISA_ENCODING_AGX3B,
+         AGX_ISA_ENCODING_AGX3C}) {
+      SCOPED_TRACE(enc);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.key.dev.encoding = enc;
+      agx_builder *b = s.b;
+      agx_index base = agx_uniform(0, AGX_SIZE_64);
+      agx_index off = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_index lbase = agx_preload(b, agx_register(4, AGX_SIZE_16));
+
+      for (unsigned i = 0; i < 6; ++i) {
+         agx_index idx = agx_iadd(b, off, agx_immediate(i * 4), 0);
+         agx_index v = agx_temp(b->shader, AGX_SIZE_32);
+         agx_device_load_to(b, v, base, idx, AGX_FORMAT_I32, 0x1, 0, 0);
+         agx_index loff = agx_iadd(b, lbase, agx_immediate(i * 4), 0);
+         agx_local_store(b, v, loff, agx_zero(), AGX_FORMAT_I32, 0x1);
+      }
+
+      agx_ilp_schedule(b->shader);
+      EXPECT_GE(max_device_loads_in_flight(s.body), 4u);
+      ralloc_free(s.mem);
+   }
+}
+
+/* Independent threadgroup local_loads batch ahead of their ALU consumers
+ * within the shader's occupancy step on both AGX2 and AGX3. */
+TEST(M5CopySchedule, ComputeLocalLoadsHoistWithinOccupancyStep)
+{
+   for (enum agx_isa_encoding enc :
+        {AGX_ISA_ENCODING_AGX2, AGX_ISA_ENCODING_AGX3B,
+         AGX_ISA_ENCODING_AGX3C}) {
+      SCOPED_TRACE(enc);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.key.dev.encoding = enc;
+      agx_builder *b = s.b;
+      agx_index lbase = agx_preload(b, agx_register(2, AGX_SIZE_16));
+      agx_index bv = agx_preload(b, agx_register(4, AGX_SIZE_32));
+      agx_index acc = agx_mov_imm(b, 32, 0);
+
+      for (unsigned i = 0; i < 8; ++i) {
+         agx_index loff = agx_iadd(b, lbase, agx_immediate(i * 4), 0);
+         agx_index v = agx_temp(b->shader, AGX_SIZE_32);
+         agx_local_load_to(b, v, loff, agx_zero(), AGX_FORMAT_I32, 0x1);
+         acc = agx_ffma(b, v, bv, acc);
+      }
+      agx_unit_test(b, acc);
+
+      agx_ilp_schedule(b->shader);
+      unsigned leading_local_loads = 0;
+      agx_foreach_instr_in_block(s.body, I) {
+         if (I->op == AGX_OPCODE_LOCAL_LOAD)
+            ++leading_local_loads;
+         else if (I->op == AGX_OPCODE_FFMA)
+            break;
+      }
+      EXPECT_GE(leading_local_loads, 4u);
+      ralloc_free(s.mem);
+   }
+}
+
+/* Uniform stores in a preamble must preserve RAW/WAR ordering against uniform
+ * reads even when the shader has no AGX3 native uniform ALU instructions. */
+TEST(M5CopySchedule, PreambleUniformStoreDependenciesPreserved)
+{
+   for (enum agx_isa_encoding enc :
+        {AGX_ISA_ENCODING_AGX2, AGX_ISA_ENCODING_AGX3B}) {
+      SCOPED_TRACE(enc);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.key.dev.encoding = enc;
+      s.b->shader->is_preamble = true;
+      agx_builder *b = s.b;
+
+      agx_index in_ptr = agx_uniform(0, AGX_SIZE_64);
+      agx_index loaded = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+      agx_device_load_to(b, loaded, in_ptr, agx_zero(), AGX_FORMAT_I32, 0x3, 0, 0);
+      agx_uniform_store(b, loaded, agx_immediate(16), 0x3);
+
+      agx_index dep_ptr = agx_uniform(16, AGX_SIZE_64);
+      agx_index loaded2 = agx_temp(b->shader, AGX_SIZE_32);
+      agx_device_load_to(b, loaded2, dep_ptr, agx_zero(), AGX_FORMAT_I32, 0x1, 0, 0);
+      agx_uniform_store(b, loaded2, agx_immediate(24), 0x1);
+
+      agx_ilp_schedule(b->shader);
+
+      int store_pos = -1, dep_load_pos = -1, idx = 0;
+      agx_foreach_instr_in_block(s.body, I) {
+         if (I->op == AGX_OPCODE_UNIFORM_STORE && I->src[1].value == 16)
+            store_pos = idx;
+         if (I->op == AGX_OPCODE_DEVICE_LOAD &&
+             I->src[0].type == AGX_INDEX_UNIFORM && I->src[0].value == 16)
+            dep_load_pos = idx;
+         ++idx;
+      }
+      ASSERT_GE(store_pos, 0);
+      ASSERT_GE(dep_load_pos, 0);
+      EXPECT_LT(store_pos, dep_load_pos);
+      ralloc_free(s.mem);
+   }
+}
+
 namespace {
 
 enum frag_sample_kind {
