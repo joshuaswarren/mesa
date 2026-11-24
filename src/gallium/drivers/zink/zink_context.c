@@ -5191,6 +5191,7 @@ zink_copy_buffer(struct zink_context *ctx, struct zink_resource *dst, struct zin
    }
    bool marker = zink_cmd_debug_marker_begin(ctx, cmdbuf, "copy_buffer(%d)", size);
    VKCTX(CmdCopyBuffer)(cmdbuf, src->obj->buffer, dst->obj->buffer, 1, &region);
+   zink_batch_mark_host_transfer_write(ctx->bs, dst);
    zink_cmd_debug_marker_end(ctx, cmdbuf, marker);
 
    if (unsync)
@@ -5352,6 +5353,7 @@ zink_copy_image_buffer(struct zink_context *ctx, struct zink_resource *dst, stru
                                                    region.imageExtent.height,
                                                    MAX2(region.imageSubresource.layerCount, region.imageExtent.depth));
          VKCTX(CmdCopyBufferToImage)(cmdbuf, buf->obj->buffer, use_img->obj->image, use_img->layout, 1, &region);
+         zink_batch_mark_host_transfer_write(ctx->bs, use_img);
       } else {
          marker = zink_cmd_debug_marker_begin(ctx, cmdbuf, "copy_image2buffer(%s, %dx%dx%d)",
                                                    util_format_short_name(src->base.b.format),
@@ -5359,6 +5361,7 @@ zink_copy_image_buffer(struct zink_context *ctx, struct zink_resource *dst, stru
                                                    region.imageExtent.height,
                                                    MAX2(region.imageSubresource.layerCount, region.imageExtent.depth));
          VKCTX(CmdCopyImageToBuffer)(cmdbuf, use_img->obj->image, use_img->layout, buf->obj->buffer, 1, &region);
+         zink_batch_mark_host_transfer_write(ctx->bs, buf);
       }
       zink_cmd_debug_marker_end(ctx, cmdbuf, marker);
    }
@@ -5567,6 +5570,7 @@ zink_resource_copy_region(struct pipe_context *pctx,
       VKCTX(CmdCopyImage)(cmdbuf, src->obj->image, src->layout,
                      dst->obj->image, dst->layout,
                      1, &region);
+      zink_batch_mark_host_transfer_write(ctx->bs, dst);
       zink_cmd_debug_marker_end(ctx, cmdbuf, marker);
       if (dst->fb_bind_count)
          ctx->rp_tc_info_updated = true;

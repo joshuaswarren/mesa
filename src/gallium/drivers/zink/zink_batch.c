@@ -158,6 +158,7 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
    bs->has_work = false;
    bs->has_reordered_work = false;
    bs->has_unsync = false;
+   bs->has_host_transfer_write = false;
 }
 
 static void
@@ -707,7 +708,7 @@ submit_queue(void *data, void *gdata, int thread_index)
                                                    bs->has_reordered_work ? bs->reordered_cmdbuf :
                                                                             bs->has_unsync ? bs->unsynchronized_cmdbuf :
                                                                                              VK_NULL_HANDLE;
-      if (sync_cmdbuf) {
+      if (sync_cmdbuf && bs->has_host_transfer_write) {
          VkMemoryBarrier mb;
          mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
          mb.pNext = NULL;

@@ -680,6 +680,7 @@ struct zink_batch_state {
    bool has_work;
    bool has_reordered_work;
    bool has_unsync;
+   bool has_host_transfer_write;
 };
 
 static inline struct zink_batch_state *
