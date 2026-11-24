@@ -552,14 +552,21 @@ agx_opt_register_cache(agx_context *ctx)
             uint64_t reg = I->src[s].value;
             unsigned nr = agx_index_size_16(I->src[s]);
 
-            /* If the register dead after this instruction, it's the last use.
-             * That includes if the register is overwritten this cycle, but that
-             * won't show up in the liveness analysis, unless masked-off
-             * threads still need the register (its inactive set).
+            /* If every half of the register is dead after this instruction,
+             * it's the last use. That includes halves overwritten this cycle
+             * (which won't show up in liveness analysis), unless masked-off
+             * threads still need them (the inactive set).
              */
-            bool lu = !BITSET_TEST_COUNT(live, reg, nr) ||
-                      (writes_reg(I, reg) &&
-                       !(inactive && BITSET_TEST_COUNT(inactive, reg, nr)));
+            bool lu = true;
+            for (unsigned c = 0; c < nr; ++c) {
+               const unsigned r = reg + c;
+               if (BITSET_TEST(live, r) &&
+                   (!writes_reg(I, r) ||
+                    (inactive && BITSET_TEST(inactive, r)))) {
+                  lu = false;
+                  break;
+               }
+            }
 
             if (keep_scratch && reg <= scratch_hi && reg + nr > scratch_lo)
                lu = false;
@@ -659,7 +666,10 @@ agx_opt_register_cache(agx_context *ctx)
                   read = agx_is_alu(H);
                   break;
                }
-               if (writes_reg(H, reg))
+               bool overwrites = true;
+               for (unsigned c = 0; c < nr; ++c)
+                  overwrites &= writes_reg(H, reg + c);
+               if (overwrites)
                   break;
             }
             I->src[s].cache = read;
