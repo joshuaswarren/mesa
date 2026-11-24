@@ -4269,6 +4269,7 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    } else if (nir->info.stage == MESA_SHADER_VERTEX ||
               nir->info.stage == MESA_SHADER_TESS_EVAL) {
       so->info.has_edgeflags = nir->info.outputs_written & VARYING_BIT_EDGE;
+      so->info.writes_layer = nir->info.outputs_written & VARYING_BIT_LAYER;
       so->info.cull_distance_size = nir->info.cull_distance_array_size;
    } else if (nir->info.stage == MESA_SHADER_GEOMETRY) {
       so->info.cull_distance_size = nir->info.cull_distance_array_size;
@@ -16049,8 +16050,9 @@ agx_g17g_split_mrt_clear(struct agx_context *ctx, unsigned buffers,
  * G17G renders one layer: the kernel and the tile programs refuse a layered
  * render. A layered framebuffer is drawn a layer at a time through each
  * attachment's single-layer view. Primitives without a layer output go to
- * layer 0, as in a layered render; agx_swtnl.c draws a CPU geometry stage's
- * primitives into the layer each selects.
+ * layer 0, as in a layered render; agx_swtnl.c draws the primitives of a CPU
+ * geometry stage, or of a vertex shader that writes gl_Layer, into the layer
+ * each selects.
  */
 void
 agx_g17g_bind_layer(struct agx_context *ctx,
