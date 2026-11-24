@@ -1295,6 +1295,9 @@ void agx_launch(struct agx_batch *batch, struct agx_grid grid,
                 struct agx_linked_shader *linked, mesa_shader_stage stage,
                 unsigned variable_shared_mem, uint64_t indirect_num_workgroups);
 
+bool agx_precomp_launchable(struct agx_context *ctx,
+                            enum libagx_program program);
+
 void agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
                         enum agx_barrier barrier, enum libagx_program program,
                         void *args, size_t arg_size);
@@ -1838,6 +1841,7 @@ void agx_batch_queue_or_submit(struct agx_context *ctx, struct agx_batch *batch,
 void agx_submit_pending(struct agx_context *ctx);
 
 void agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch);
+bool agx_try_fast_clear_batch(struct agx_context *ctx, struct agx_batch *batch);
 void agx_flush_batch_for_reason(struct agx_context *ctx,
                                 struct agx_batch *batch, const char *reason);
 void agx_flush_all(struct agx_context *ctx, const char *reason);
@@ -1960,6 +1964,8 @@ void agx_copy_buffer_range(struct pipe_context *pctx, struct pipe_resource *dst,
 
 struct agx_encoder agx_encoder_allocate(struct agx_batch *batch,
                                         struct agx_device *dev);
+
+void agx_encoder_cleanup(struct agx_device *dev, struct agx_encoder *encoder);
 
 uint64_t agx_batch_get_g17p_vdm_alias(struct agx_batch *batch,
                                       struct agx_bo *bo, uint64_t address);
