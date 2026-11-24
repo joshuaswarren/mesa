@@ -1391,6 +1391,7 @@ hk_queue_restart_sync(struct hk_queue *queue)
    /* The submission that starts it waits for all sibling work too. */
    memset(queue->sib.submitted[0], 0, sizeof(queue->sib.submitted[0]));
    queue->sib.used = false;
+   queue->sib.packed_atomic_point = 0;
 }
 
 /* Kernel queues come from a machine-wide pool shared by every client, so
@@ -1613,6 +1614,39 @@ hk_sibling_deep(struct hk_device *dev, struct hk_queue *queue,
    if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1))
       return false;
    return submitted_point >= done + HK_G17P_SIBLING_MIN_IN_FLIGHT;
+}
+
+/* Whether any sibling kernel queue may still be executing work. */
+static bool
+hk_sibling_in_flight(struct hk_device *dev, const struct hk_queue *queue)
+{
+   if (queue->sib.count <= 1 || !queue->sib.used || !queue->sib.last_point)
+      return false;
+
+   uint32_t handle = queue->drm.syncobj;
+   uint64_t done = 0;
+   if (drmSyncobjQuery(dev->dev.fd, &handle, &done, 1))
+      return true;
+   return done < queue->sib.last_point;
+}
+
+/* Whether a packed submission carrying global atomics is still in flight on
+ * the primary kernel queue; sibling routing stays off until it completes so
+ * no second kernel queue can run beside a packed atomic chain. */
+static bool
+hk_sibling_packed_atomic_busy(struct hk_device *dev, struct hk_queue *queue)
+{
+   if (!queue->sib.packed_atomic_point)
+      return false;
+
+   uint64_t done = 0;
+   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1))
+      return true;
+   if (done >= queue->sib.packed_atomic_point) {
+      queue->sib.packed_atomic_point = 0;
+      return false;
+   }
+   return true;
 }
 
 static struct hk_cs *
@@ -2156,7 +2190,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
    bool sib_earlier = false;
    if (queue->sib.count > 1 && !replaced && !prepend_cdm && !unlikely(anatomy) &&
-       !packed_bo &&
+       !packed_bo && !hk_sibling_packed_atomic_busy(dev, queue) &&
        !(host_flush &&
          hk_host_flush_names_earlier(flush_barrier, flush_prior, prior_base)) &&
        hk_sibling_eligible(dev, queue, submit, resolved, prior_base,
@@ -2228,6 +2262,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       nr_cdm++;
    }
 
+   bool packed_atomics = false;
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
@@ -2244,6 +2279,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       }
 
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         if (packed_bo && cs->uses_global_atomics)
+            packed_atomics = true;
          if (resolved)
             hk_sync_load_resolved(cs, resolved++);
          struct drm_asahi_cmd_header header =
@@ -2745,6 +2782,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       if (sib_target) {
          queue->sib.used = true;
          queue->sib.last_point = queue->drm.timeline_value;
+      } else if (packed_atomics) {
+         queue->sib.packed_atomic_point = queue->drm.timeline_value;
       }
    }
    if (cumulative_signals && !kernel_cumulative) {
@@ -2866,12 +2905,17 @@ hk_pack_attachment_limit(const struct hk_device *dev)
  * running packed atomic chains on the same memory lost contributions (root
  * cause unknown), so such streams stay separate commands unless
  * ASAHI_M5_PACK_ATOMICS=1 (or HK_PACK_ATOMICS=1) and the device has a
- * single kernel queue, which runs its commands in order. A second kernel
- * queue created while a packet runs is not covered; unpacked atomic work
- * has the same exposure. The G16 kernel puts every compute command of a VM
- * on its one firmware compute queue and never runs one beside another VM's:
- * several commands of one VM may be in flight there, but the firmware runs
- * them one after another, never beside a packet. G16G packs them unless
+ * single active kernel queue, which runs its commands in order. On G17P,
+ * packed atomics are enabled by default (disable with HK_PACK_ATOMICS=0)
+ * whenever the single-active-kernel-queue invariant holds: no sibling kernel
+ * queue is in flight (hk_sibling_in_flight()), sibling routing stays off
+ * until any packed atomic submission completes (packed_atomic_point), and no
+ * other VkQueue or host-AS queue on the device has a kernel queue. A second
+ * kernel queue created while a packet runs is not covered; unpacked atomic
+ * work has the same exposure. The G16 kernel puts every compute command of a
+ * VM on its one firmware compute queue and never runs one beside another
+ * VM's: several commands of one VM may be in flight there, but the firmware
+ * runs them one after another, never beside a packet. G16G packs them unless
  * HK_PACK_ATOMICS=0. That is a property of the G16 kernel, the only one for
  * G16G, which no uAPI feature reports yet; the chip stands for it until one
  * does (hk_pack_atomics_choice()). */
@@ -2891,7 +2935,13 @@ hk_pack_atomics_allowed(struct hk_device *dev, const struct hk_queue *queue)
 
    if (dev->dev.chip == AGX_CHIP_G16G)
       return hk_pack_atomics_choice(true, opt, queue->sib.count);
-   if (!hk_pack_atomics_choice(false, opt, queue->sib.count))
+
+   /* Check the chip default / option before querying the syncobj for
+    * sibling activity so disabled callers never pay a drmSyncobjQuery ioctl. */
+   const bool default_on = dev->dev.chip == AGX_CHIP_G17P;
+   if (!hk_pack_atomics_choice(default_on, opt, 1))
+      return false;
+   if (hk_sibling_in_flight(dev, queue))
       return false;
 
    vk_foreach_queue(iter, &dev->vk) {
