@@ -361,7 +361,7 @@ convert_matrix_value(nir_builder *b, nir_def *value,
 
 static bool
 lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types,
-                   bool native_f16_accum8)
+                   bool native_f16_accum8, bool widen_bf16_inputs)
 {
    if (instr->type == nir_instr_type_deref) {
       nir_deref_instr *deref = nir_instr_as_deref(instr);
@@ -469,7 +469,10 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types,
               accum == GLSL_TYPE_BFLOAT16) && result == accum);
       nir_def *a = load_matrix(b, intr->src[1]);
       nir_def *bb = load_matrix(b, intr->src[2]);
-      if (mixed_8x8) {
+      const bool widen_bf16 =
+         widen_bf16_inputs && rows == 8 &&
+         (input == GLSL_TYPE_BFLOAT16 || input_b == GLSL_TYPE_BFLOAT16);
+      if (mixed_8x8 || widen_bf16) {
          a = convert_matrix_value(b, a, input, GLSL_TYPE_FLOAT);
          bb = convert_matrix_value(b, bb, input_b, GLSL_TYPE_FLOAT);
          input = input_b = GLSL_TYPE_FLOAT;
@@ -480,7 +483,8 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types,
        * exact: fast-math folding of f2f32(f2f16(x)) to x would carry f32
        * accumulators of twice the registers from one product to the next. */
       b->fp_math_ctrl = nir_fp_exact;
-      /* AGX3B's f16matmad8x8 takes an f16 accumulator as it is */
+      /* AGX2's simd_matrix_fmadd16 and AGX3B's f16matmad8x8 take an f16
+       * accumulator as it is */
       const bool native = native_f16_accum8 && rows == 8 &&
                           input == GLSL_TYPE_FLOAT16 &&
                           input_b == GLSL_TYPE_FLOAT16 &&
@@ -574,7 +578,8 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types,
 }
 
 bool
-agx_nir_lower_cmat(nir_shader *nir, bool native_f16_accum8)
+agx_nir_lower_cmat(nir_shader *nir, bool native_f16_accum8,
+                   bool widen_bf16_inputs)
 {
    if (nir->info.stage != MESA_SHADER_COMPUTE || !nir->info.cs.has_cooperative_matrix)
       return false;
@@ -587,7 +592,8 @@ agx_nir_lower_cmat(nir_shader *nir, bool native_f16_accum8)
       nir_builder b = nir_builder_create(impl);
       nir_foreach_block_reverse_safe(block, impl) {
          nir_foreach_instr_reverse_safe(instr, block)
-            lower_matrix_instr(&b, instr, types, native_f16_accum8);
+            lower_matrix_instr(&b, instr, types, native_f16_accum8,
+                               widen_bf16_inputs);
       }
       nir_progress(true, impl, nir_metadata_control_flow);
    }

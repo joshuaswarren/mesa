@@ -5,6 +5,7 @@
 libasahi_agx_files = files(
   'agx_compile.c',
   'agx_nir_lower_cmat.c',
+  'agx_nir_lower_cmat_sw.c',
   'agx_dce.c',
   'agx_liveness.c',
   'agx_insert_waits.c',
@@ -754,6 +755,7 @@ if with_tests
          'test/test-border-index.cpp',
          'test/test-aligned-bounds.cpp',
          'test/test-agx2-image-acquire.cpp',
+         'test/test-agx2-cmat.cpp',
          'test/test-agx3-shared-fence.cpp',
          'test/test-byte-swap.cpp',
          'test/test-minmax-canonical.cpp',

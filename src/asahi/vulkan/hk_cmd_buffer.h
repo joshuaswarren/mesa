@@ -34,6 +34,7 @@
 #include "hk_barrier.h"
 #include "hk_conditional_render_core.h"
 #include "hk_shader.h"
+#include "hk_compute_pair.h"
 #include "hk_sync.h"
 #include "hk_tess_batch.h"
 
@@ -1241,8 +1242,13 @@ enum hk_cs_type {
  * profiler (hk_frame_anatomy.h). */
 #define HK_FA_FS_MAX 4
 
+struct hk_compute_pair_dispatch;
+
+
 struct hk_cs {
    struct list_head node;
+
+   struct hk_compute_pair_dispatch *compute_pair;
 
    /* Parent command buffer. Convenience. */
    struct hk_cmd_buffer *cmd;
@@ -1728,9 +1734,20 @@ void hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd,
  * is never taken for it.
  */
 static inline void
+hk_cs_invalidate_compute_pair(struct hk_cs *cs)
+{
+   if (!cs || !cs->compute_pair)
+      return;
+   hk_compute_pair_producer_unref(cs->compute_pair->producer);
+   free(cs->compute_pair);
+   cs->compute_pair = NULL;
+}
+
+static inline void
 hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
 {
    assert(a->type == HK_CS_CDM && b->type == HK_CS_CDM);
+   hk_cs_invalidate_compute_pair(a);
    assert(!a->timestamp.end.handle);
    a->m5_matrix_ops |= b->m5_matrix_ops;
 
@@ -2034,6 +2051,7 @@ struct hk_cmd_buffer {
 
    struct {
       struct hk_upload_stats upload_stats;
+      bool compute_pair_simultaneous;
       struct {
          uint64_t id, addr;
       } constant_data[MESA_SHADER_STAGES];
@@ -2923,6 +2941,7 @@ hk_cmd_note_imm_write_query_range(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 static inline void
 hk_cs_destroy(struct hk_cs *cs)
 {
+   hk_cs_invalidate_compute_pair(cs);
    util_dynarray_fini(&cs->compute_resources);
    util_dynarray_fini(&cs->render_resources);
    if (cs->type == HK_CS_VDM) {

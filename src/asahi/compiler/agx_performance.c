@@ -75,6 +75,8 @@ struct alu_timing op_timings[] = {
    [AGX_OPCODE_ST_VARY_FMA_AGX3] = { F32, 2, 1 },
    [AGX_OPCODE_MATMAD8_AGX3]     = { F32, 4, 2 },
    [AGX_OPCODE_MATMAD16_AGX3]    = { F32, 8, 4 },
+   [AGX_OPCODE_SIMD_MATRIX_FMADD32] = { F32, 4, 2 },
+   [AGX_OPCODE_SIMD_MATRIX_FMADD16] = { F16, 4, 2 },
 
    [AGX_OPCODE_HFMA]          = { F16, 2, 1 },
    [AGX_OPCODE_HADD]          = { F16, 2, 1 },

@@ -137,6 +137,25 @@ hk_pack_atomics_choice(bool serial_kernel, const char *opt, unsigned queues)
    return opt && hk_pack_parse_bool(opt, false) && queues <= 1;
 }
 
+bool
+hk_compute_pair_stream_eligible(const struct hk_cs *cs)
+{
+   /* alias_sites are only recorded after the first dispatch
+    * (hk_cdm_note_alias_site()), so on a single-dispatch stream every alias
+    * site is on the trailing barrier.  When hk_pack_runs() fuses a pair it
+    * holds host_alias.patch_lock, discards both original tails, and emits a
+    * fresh fused dispatch + hk_cdm_visibility_flush(..., hk_cdm_alias_scope()). */
+   return cs && cs->type == HK_CS_CDM && cs->compute_pair &&
+          cs->stats.cmds == 1 && cs->stats.calls == 1 &&
+          cs->pack_dispatches == 1 && !cs->stream_linked &&
+          !cs->calls_stream && !cs->sib_indirect &&
+          !cs->uses_global_atomics && !cs->imm_writes.size &&
+          !cs->query_access && !cs->query_reset_pending &&
+          !cs->timestamp.start.handle && !cs->timestamp.end.handle &&
+          !cs->g17p_timestamp_query && !cs->gen1_native_rq &&
+          !cs->as_build && cs->alias_sites <= 1 && !cs->g18_dispatch_sealed;
+}
+
 const struct hk_cs *
 hk_pack_run_member(const struct hk_device *dev, const struct hk_cmd_buffer *cmd,
                    const uint8_t *terminate, bool atomics)
@@ -448,4 +467,20 @@ hk_pack_finish_sync(struct hk_cmd_buffer *packet, struct hk_cs *cs)
    u_foreach_bit(k, cs->sync.kind)
       packet->sync.last[k][HK_SYNC_CDM] = cs;
    packet->sync.last_any[HK_SYNC_CDM] = cs;
+}
+
+bool
+hk_pack_add_bo(struct util_dynarray *bos, struct agx_bo *bo)
+{
+   if (!bo)
+      return true;
+   util_dynarray_foreach(bos, struct agx_bo *, it) {
+      if (*it == bo)
+         return true;
+   }
+   struct agx_bo **slot = util_dynarray_grow(bos, struct agx_bo *, 1);
+   if (!slot)
+      return false;
+   *slot = bo;
+   return true;
 }
