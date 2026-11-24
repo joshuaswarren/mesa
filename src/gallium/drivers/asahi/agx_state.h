@@ -275,6 +275,10 @@ struct agx_compiled_shader {
    /* Mapped executable memory */
    struct agx_bo *bo;
 
+   /* Persistent AGX3 compute code container for non-linked native dispatches */
+   struct agx_bo *agx3_compute_bo;
+   uint64_t agx3_compute_va;
+
    /* The backend refused to encode this variant. agx_compile_shader_nir() is
     * fail-closed: it returns false and leaves a zeroed agx_shader_part, so
     * binary_size is 0 and no executable BO is ever allocated. A main shader
