@@ -991,28 +991,6 @@ agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
    return agx_chip_native_or_m5(chip);
 }
 
-/* Whether compute streams split to avoid retroactively stalling independent
- * compute work behind a render barrier or delaying graphics consumers behind
- * post-barrier compute, multi-chunk submissions take per-chunk timeline
- * points, and a render whose tiling half names fewer earlier renders than
- * its fragment half falls back to a staged render. Qualified on G17P and M5;
- * G15 and G16G (~0.3 ms per-command turnaround) remain excluded until
- * measured. */
-static inline bool
-agx_chip_cdm_overlap_split(enum agx_chip chip)
-{
-   return chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip);
-}
-
-/* Whether 2x and 4x multisample render-pass continuation keeps consecutive
- * passes in the tilebuffer. Qualified on G17P and M5; G15 and G16G remain
- * excluded until measured. */
-static inline bool
-agx_chip_msaa_pass_continuation(enum agx_chip chip)
-{
-   return chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip);
-}
-
 /* Number of helper-table slots in the USC code-container lead block.  G15
  * and G16 parts have ten; with six their fragment programs of 256x256 and
  * larger walk past the lead into the guard page.  On G17P the state loader's

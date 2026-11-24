@@ -1122,10 +1122,6 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    if (slot == &cmd->current_cs.cs)
       st->cs_check_pending = false;
-   else if (!compute && cmd->current_cs.cs &&
-            (cs->sync.dep[HK_SYNC_CDM].cut == cmd->current_cs.cs ||
-             cs->sync.dep_ta[HK_SYNC_CDM].cut == cmd->current_cs.cs))
-      st->cs_check_pending = true;
 
    /* A top-of-pipe timestamp waiting for a command to ride on. */
    if (st->pending_start_ts.handle) {
@@ -1180,88 +1176,25 @@ cdm_waits_for_render(struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
    return false;
 }
 
-/* Whether the compute stream cs already waits for all prior-submission render
- * kinds in prior_mask: directly, or through the compute prefix it waits on. */
-static bool
-cdm_waits_for_render_prior(struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
-                           uint8_t prior_mask)
-{
-   uint8_t covered = cs->sync.dep[HK_SYNC_VDM].prior;
-   if (!(prior_mask & ~covered))
-      return true;
-
-   const struct hk_cs *prefix = cs->sync.dep[HK_SYNC_CDM].cut;
-   if (!prefix || prefix == cs)
-      return false;
-
-   list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
-      if (it->type != HK_CS_CDM || it == cs ||
-          it->sync.seq > prefix->sync.seq)
-         continue;
-      covered |= it->sync.dep[HK_SYNC_VDM].prior;
-      if (!(prior_mask & ~covered))
-         return true;
-   }
-   return false;
-}
-
-static bool
-cdm_overlap_split_enabled(struct hk_cmd_buffer *cmd)
-{
-   return agx_chip_cdm_overlap_split(hk_cmd_buffer_device(cmd)->dev.chip);
-}
-
-/* Whether a requirement on the render subqueue would make the work a compute
- * stream already holds wait for a render it does not wait for yet. A
- * requirement recorded after that work (a barrier between two dispatches) has
- * none of it in its second scope, so the work keeps the requirements it was
- * recorded under and only later work takes the new one. */
+/* M5: whether a requirement on the render subqueue would make the work a
+ * compute stream already holds wait for a render it does not wait for yet.
+ * A requirement recorded after that work (a barrier between two dispatches)
+ * has none of it in its second scope, so the work keeps the requirements it
+ * was recorded under and only later work takes the new one. */
 static bool
 cdm_raise_delays_work(struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
-                      const struct hk_sync_dep *vdm)
+                      const struct hk_cs *r)
 {
-   if (!cs->stats.cmds || !cdm_overlap_split_enabled(cmd))
-      return false;
-
-   if (vdm->cut && !cdm_waits_for_render(cmd, cs, vdm->cut))
-      return true;
-   if (vdm->prior && !cdm_waits_for_render_prior(cmd, cs, vdm->prior))
-      return true;
-   return false;
-}
-
-/* Whether a render stream or pending graphics requirement waits specifically
- * on cs: appending or merging independent post-barrier compute work into cs
- * would force that graphics work to wait on the later compute too. */
-static bool
-cdm_waited_by_render(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
-{
-   if (!cs->stats.cmds || !cdm_overlap_split_enabled(cmd))
-      return false;
-
-   const uint8_t gfx_kinds = HK_SYNC_GFX | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG;
-   u_foreach_bit(k, gfx_kinds) {
-      if (cmd->sync.req[k][HK_SYNC_CDM].cut == cs ||
-          (cmd->sync.in_pass && cmd->sync.pass_req[k][HK_SYNC_CDM].cut == cs))
-         return true;
-   }
-
-   list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
-      if (it->type != HK_CS_VDM)
-         continue;
-      if (it->sync.dep[HK_SYNC_CDM].cut == cs ||
-          it->sync.dep_ta[HK_SYNC_CDM].cut == cs)
-         return true;
-   }
-   return false;
+   return r && cs->stats.cmds &&
+          agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
+          !cdm_waits_for_render(cmd, cs, r);
 }
 
 bool
 hk_sync_merge_delays(struct hk_cmd_buffer *cmd, const struct hk_cs *into,
                      const struct hk_cs *from)
 {
-   if (cdm_raise_delays_work(cmd, into, &from->sync.dep[HK_SYNC_VDM]) ||
-       cdm_waited_by_render(cmd, into))
+   if (cdm_raise_delays_work(cmd, into, from->sync.dep[HK_SYNC_VDM].cut))
       return true;
 
    /* If a later render waits on `into` (and not on `from`, which follows it),
@@ -1300,11 +1233,8 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
 
    /* The new work goes into a stream of its own, created under the whole
     * requirement; a first scope that names compute work orders it after
-    * this stream through last[]. Likewise, if a graphics barrier or render
-    * stream already waits on this stream, keep post-barrier compute separate
-    * so graphics can overlap it. */
-   if (cdm_raise_delays_work(cmd, cs, &dep[HK_SYNC_VDM]) ||
-       cdm_waited_by_render(cmd, cs)) {
+    * this stream through last[]. */
+   if (cdm_raise_delays_work(cmd, cs, dep[HK_SYNC_VDM].cut)) {
       hk_cmd_buffer_end_compute(cmd);
       return;
    }
