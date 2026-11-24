@@ -14476,10 +14476,12 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    }
 
    /* Lower constant divisors after an optimization loop so we can constant
-    * fold more before nir_opt_idiv_const. Other integer division waits for
-    * the shader key (agx_nir_lower_integer_division), which decides whether a
-    * preamble forms.
+    * fold more before nir_opt_idiv_const. Strength-reduce signed div/mod with
+    * provably nonnegative operands first so the remaining lowering drops
+    * redundant sign fixups. Other integer division waits for the shader key
+    * (agx_nir_lower_integer_division), which decides whether a preamble forms.
     */
+   NIR_PASS(_, nir, agx_nir_opt_nonneg_idiv);
    NIR_PASS(_, nir, nir_opt_idiv_const, 16);
 
    NIR_PASS(_, nir, nir_opt_deref);

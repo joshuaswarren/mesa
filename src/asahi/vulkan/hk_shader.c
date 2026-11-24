@@ -420,6 +420,26 @@ hk_nir_has_ray_query(nir_shader *nir)
    return false;
 }
 
+/* nir_lower_system_values() builds gl_GlobalInvocationID as the invocation ID
+ * plus a base global invocation ID, a global offset only OpenCL has. Borealis
+ * applies the vkCmdDispatchBase base workgroup itself (has_base_workgroup_id
+ * in hk_preprocess_nir()), so the base is zero, as the Gallium state tracker
+ * lowers it for GL. Folding it before agx_preprocess_nir() lets range
+ * analysis bound the invocation ID by the dispatch limits.
+ */
+static bool
+hk_lower_base_global_invocation_id(nir_builder *b, nir_intrinsic_instr *intr,
+                                   UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_base_global_invocation_id)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components,
+                                            intr->def.bit_size));
+   return true;
+}
+
 void
 hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 {
@@ -484,6 +504,9 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
    }
 
    NIR_PASS(_, nir, nir_lower_system_values);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+            hk_lower_base_global_invocation_id, nir_metadata_control_flow,
+            NULL);
 
    /* Gather info before preprocess_nir but after some general lowering, so
     * inputs_read and system_values_read are accurately set.

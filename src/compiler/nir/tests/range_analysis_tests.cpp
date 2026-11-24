@@ -298,6 +298,70 @@ TEST_F(unsigned_upper_bound_test, loop_phi_bcsel)
    _mesa_hash_table_destroy(range_ht, NULL);
 }
 
+TEST_F(unsigned_upper_bound_test, global_invocation_id_overflow)
+{
+   options.max_workgroup_invocations = 1024;
+   options.max_workgroup_count[0] = 0x7fffffffu;
+   options.max_workgroup_count[1] = 65535u;
+   options.max_workgroup_count[2] = 65535u;
+
+   nir_def *gid = nir_load_global_invocation_id(b, 32);
+   nir_store_global(b, gid, nir_undef(b, 1, 64));
+   nir_validate_shader(b->shader, NULL);
+
+   /* Fixed odd workgroup_size[0] = 3 with max_workgroup_count[0] = 0x7fffffff
+    * must saturate to UINT32_MAX rather than wrapping 3 * 0x7fffffff - 1 to
+    * 0x7ffffffc (<= INT32_MAX). */
+   b->shader->info.workgroup_size_variable = false;
+   b->shader->info.workgroup_size[0] = 3;
+   b->shader->info.workgroup_size[1] = 3;
+   b->shader->info.workgroup_size[2] = 1;
+   {
+      struct hash_table *range_ht = _mesa_pointer_hash_table_create(NULL);
+      EXPECT_EQ(nir_unsigned_upper_bound(b->shader, range_ht,
+                                         nir_get_scalar(gid, 0)),
+                UINT32_MAX);
+      EXPECT_EQ(nir_unsigned_upper_bound(b->shader, range_ht,
+                                         nir_get_scalar(gid, 1)),
+                3u * 65535u - 1u);
+      EXPECT_EQ(nir_unsigned_upper_bound(b->shader, range_ht,
+                                         nir_get_scalar(gid, 2)),
+                65534u);
+      _mesa_hash_table_destroy(range_ht, NULL);
+   }
+
+   /* Non-overflowing fixed workgroup sizes remain tight. */
+   b->shader->info.workgroup_size[0] = 1;
+   {
+      struct hash_table *range_ht = _mesa_pointer_hash_table_create(NULL);
+      EXPECT_EQ(nir_unsigned_upper_bound(b->shader, range_ht,
+                                         nir_get_scalar(gid, 0)),
+                0x7ffffffeu);
+      _mesa_hash_table_destroy(range_ht, NULL);
+   }
+   b->shader->info.workgroup_size[0] = 2;
+   {
+      struct hash_table *range_ht = _mesa_pointer_hash_table_create(NULL);
+      EXPECT_EQ(nir_unsigned_upper_bound(b->shader, range_ht,
+                                         nir_get_scalar(gid, 0)),
+                0xfffffffdu);
+      _mesa_hash_table_destroy(range_ht, NULL);
+   }
+
+   /* Variable workgroup size saturates on X and remains tight on Y. */
+   b->shader->info.workgroup_size_variable = true;
+   {
+      struct hash_table *range_ht = _mesa_pointer_hash_table_create(NULL);
+      EXPECT_EQ(nir_unsigned_upper_bound(b->shader, range_ht,
+                                         nir_get_scalar(gid, 0)),
+                UINT32_MAX);
+      EXPECT_EQ(nir_unsigned_upper_bound(b->shader, range_ht,
+                                         nir_get_scalar(gid, 1)),
+                1024u * 65535u - 1u);
+      _mesa_hash_table_destroy(range_ht, NULL);
+   }
+}
+
 TEST_F(ssa_def_bits_used_test, ubfe_ibfe)
 {
    nir_def *load1 = nir_load_global(b, 1, 32, nir_undef(b, 1, 64));
