@@ -1547,7 +1547,14 @@ stamp_covered(struct hk_cmd_buffer *cmd, struct hk_cs *tail,
    return true;
 }
 
-/* Record the pending copies in cs, the open general compute stream, which
+/* Whether cs holds nothing but timestamps and timestamp copies. */
+static bool
+stamp_only(const struct hk_cs *cs)
+{
+   return !(cs->sync.kind & HK_SYNC_ALL);
+}
+
+/* Record the pending copies in cs, a timestamp-only compute stream that
  * follows the streams they read. The launch keeps it a timestamp stream. */
 static void
 stamp_copies_record(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
@@ -1587,6 +1594,14 @@ hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd)
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
       after[sq] = (struct hk_sync_dep){.cut = st->stamp_copy_after[sq]};
 
+   /* The copies wait for the commands whose stamps they read. Recorded in
+    * an open stream that holds application work, they would make that work
+    * wait for those commands too, and every later dependency on the work
+    * wait for the copies. They get a command of their own. */
+   struct hk_cs *open = cmd->current_cs.cs;
+   if (open && !st->pin_cs && !stamp_only(open))
+      hk_cmd_buffer_end_compute(cmd);
+
    struct hk_cs *cs = timestamp_only_stream(cmd, after);
    if (!cs)
       return;
@@ -1595,15 +1610,6 @@ hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd)
    /* Ended, a later first scope naming HK_SYNC_STAMP orders after it
     * whatever stream that work lands in. */
    hk_cmd_buffer_end_compute(cmd);
-}
-
-void
-hk_sync_dispatch_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
-{
-   const unsigned count =
-      util_dynarray_num_elements(&cs->stamp_copies, struct hk_stamp_copy);
-   hk_record_stamp_copies(cmd, cs, cs->stamp_copies.data, count);
-   util_dynarray_clear(&cs->stamp_copies);
 }
 
 static bool
@@ -1699,20 +1705,21 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       stamp_wait(cmd, gfx, dep);
 
       if (gfx->timestamp.end.handle) {
-         /* The copy runs after the render, with the render's other copies
-          * in one launch when its post-graphics stream ends
-          * (hk_sync_dispatch_stamp_copies()). */
-         struct hk_cs *post = hk_cmd_buffer_get_cs_general(
-            cmd, &cmd->current_cs.post_gfx, true);
-         if (!post)
+         /* A copy of the render's end stamp, pending with the command
+          * buffer's other copies until they launch together in a
+          * timestamp-only command after the render
+          * (hk_sync_flush_stamp_copies()). Application work recorded after
+          * the render does not wait for it. A full batch launches first. */
+         if (st->stamp_copy_count == HK_SYNC_STAMP_COPIES)
+            hk_sync_flush_stamp_copies(cmd);
+         if (st->stamp_copy_count == HK_SYNC_STAMP_COPIES)
             return;
-         if (!post->stamp_copies.data)
-            post->stamp_copies = UTIL_DYNARRAY_INIT;
-         const struct hk_stamp_copy copy = {
+         st->stamp_copies[st->stamp_copy_count++] = (struct hk_stamp_copy){
             .dst = req,
             .src = gfx->timestamp.end,
          };
-         util_dynarray_append(&post->stamp_copies, copy);
+         st->stamp_copy_after[HK_SYNC_VDM] =
+            hk_sync_later(st->stamp_copy_after[HK_SYNC_VDM], gfx);
       } else {
          gfx->timestamp.end = req;
       }
@@ -1786,7 +1793,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       return;
    cs->timestamp.end = req;
    /* The pending copies ride on it when it follows the stamps they read. */
-   if (st->stamp_copy_count && stamp_copies_follow(cmd, cs))
+   if (st->stamp_copy_count && stamp_only(cs) && stamp_copies_follow(cmd, cs))
       stamp_copies_record(cmd, cs);
    stamp_carrier_launch(cmd);
    hk_cmd_buffer_end_compute(cmd);
