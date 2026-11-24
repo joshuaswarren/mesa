@@ -115,7 +115,7 @@ hk_query_command_cs(struct hk_cmd_buffer *cmd)
    hk_sync_end_cs_if_timestamped(cmd);
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, HK_SYNC_ALL, cmd->current_cs.cs, dep);
+   hk_sync_src_dep(cmd, HK_SYNC_QUERY_SCOPE, cmd->current_cs.cs, dep);
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
    if (cs && agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
       cs->g17p_timestamp_query = true;

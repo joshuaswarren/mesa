@@ -1438,13 +1438,17 @@ last_stream(struct hk_cmd_buffer *cmd)
    return list_last_entry(&cmd->control_streams, struct hk_cs, node);
 }
 
+/* A compute stream that carries timestamps alone: it waits like work of
+ * every class, and only query commands and later timestamps wait for it
+ * (HK_SYNC_STAMP). */
 static struct hk_cs *
 timestamp_only_stream(struct hk_cmd_buffer *cmd,
                       const struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
 {
-   cmd->sync.kind_override = HK_SYNC_ALL;
+   const uint8_t kind = cmd->sync.kind_override;
+   cmd->sync.kind_override = HK_SYNC_STAMP;
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
-   cmd->sync.kind_override = 0;
+   cmd->sync.kind_override = kind;
    return cs;
 }
 
@@ -1526,7 +1530,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       }
 
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-      hk_sync_src_dep(cmd, src_kinds, gfx, dep);
+      hk_sync_src_dep(cmd, hk_sync_stamp_scope(src_kinds), gfx, dep);
       /* The render can only wait on streams positioned before it. The
        * latest stream of a kind may be this render's own post-graphics
        * stream (an in-pass stamp's copy, an occlusion query's availability
@@ -1581,9 +1585,10 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
 
    hk_sync_flush_pending_timestamp(cmd);
 
+   const uint8_t scope = hk_sync_stamp_scope(src_kinds);
    struct hk_cs *tail = last_stream(cmd);
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, src_kinds, tail, dep);
+   hk_sync_src_dep(cmd, scope, tail, dep);
 
    if (tail && !tail->timestamp.end.handle) {
       tail->timestamp.end = req;
@@ -1598,6 +1603,9 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       return;
    }
 
+   /* A command of its own, after every earlier stream in the first scope,
+    * tail included: tail is no stream this stamp rides on. */
+   hk_sync_src_dep(cmd, scope, NULL, dep);
    struct hk_cs *cs = timestamp_only_stream(cmd, dep);
    if (!cs)
       return;

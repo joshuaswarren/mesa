@@ -55,7 +55,8 @@ struct hk_queue;
 
 /* Which class of Vulkan pipeline stages a stream's work belongs to. Streams
  * the driver adds for its own bookkeeping are HK_SYNC_ALL: every source scope
- * covers them and they wait as their own semantics require.
+ * covers them and they wait as their own semantics require. Streams that only
+ * write timestamps are HK_SYNC_STAMP instead.
  */
 enum hk_sync_kind {
    HK_SYNC_GFX = 1 << 0,
@@ -92,16 +93,44 @@ enum hk_sync_kind {
     * render's vertex half only after the latest such stream on the render
     * subqueue (hk_sync_barrier()). */
    HK_SYNC_GFX_MEM = 1 << 5,
+
+   /* Stream kinds and first scopes only, never named by an application
+    * dependency: a command the driver records to carry a timestamp alone
+    * (hk_sync_write_timestamp()). It writes nothing but query memory, which
+    * only query commands and later timestamps read, so only their first
+    * scopes name it (HK_SYNC_QUERY_SCOPE, hk_sync_stamp_scope()); a pipeline
+    * barrier, even an ALL_COMMANDS one, does not order later work after it.
+    * It waits like work of every class (hk_sync_full_kinds()). */
+   HK_SYNC_STAMP = 1 << 6,
 };
 
-#define HK_SYNC_NUM_KINDS 6
+#define HK_SYNC_NUM_KINDS 7
+
+/* Every kind a stream can be of: a first scope naming all of them is every
+ * earlier stream on a subqueue. */
+#define HK_SYNC_STREAM_KINDS (HK_SYNC_ALL | HK_SYNC_STAMP)
+
+/* The first scope of a query command (reset, result copy, property write):
+ * every earlier stream, timestamp carriers included. */
+#define HK_SYNC_QUERY_SCOPE HK_SYNC_STREAM_KINDS
+
+/* The first scope of a timestamp or event of the given source kinds: an
+ * earlier timestamp write is in it unless it is empty (TOP_OF_PIPE). */
+static inline uint8_t
+hk_sync_stamp_scope(uint8_t src_kinds)
+{
+   return src_kinds ? src_kinds | HK_SYNC_STAMP : 0;
+}
 
 /* The destination classes a stream of the given kinds belongs to: graphics
- * work is in every graphics class (HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG). A
- * stream waits for the requirements carried in for each of them. */
+ * work is in every graphics class (HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG), and a
+ * timestamp stream in every class. A stream waits for the requirements
+ * carried in for each of them. */
 static inline uint8_t
 hk_sync_full_kinds(uint8_t kinds)
 {
+   if (kinds & HK_SYNC_STAMP)
+      kinds |= HK_SYNC_ALL;
    return kinds & HK_SYNC_GFX
              ? kinds | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG
              : kinds;
