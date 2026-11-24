@@ -1377,7 +1377,7 @@ hk_queue_restart_sync(struct hk_queue *queue)
 static bool
 hk_queue_admits_at_entry(const struct hk_device *dev)
 {
-   return agx_chip_g17p_or_m5(dev->dev.chip);
+   return agx_chip_native_or_m5(dev->dev.chip);
 }
 
 static inline struct hk_queue *

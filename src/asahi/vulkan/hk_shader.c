@@ -8663,7 +8663,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          }
       }
 
-      vs_covers[i] = agx_chip_g17p_or_m5(dev->dev.chip) &&
+      vs_covers[i] = agx_chip_native_or_m5(dev->dev.chip) &&
                      nir->info.stage == MESA_SHADER_VERTEX &&
                      hk_vs_covers_clip_square(nir);
       if (!hk_mesh_task_grid(dev, nir, info->flags)) {
