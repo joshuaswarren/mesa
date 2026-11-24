@@ -270,14 +270,9 @@ pack_layered(uint32_t generation, const struct agx_pbe_agx3_2d_fields *fields,
    if (out)
       memset(out, 0, sizeof(*out));
 
-   /* The pinned native G17X Gen10 PBE encoder selects array
-    * dimension 3, deposits layers-1 at word1[59:44], and
-    * controls page alignment at word1[60]. Full 2/4/16-layer
-    * packets agree over Gen10's own 2D width/height geometry.
-    * The 3D branch selects dimension 5, then takes its
-    * depth from w2 and deposits depth-1 in the same field.
-    * Gen10 mip chains retain the shared level fields but move the extension
-    * flag from word0 bit58 to bit60. */
+   /* Array/3D packets use dimension 3/5, layers-1 (or depth-1) in
+    * word1[59:44], and page alignment in word1[60]. Gen10 mip chains place
+    * the extension flag at word0[60] instead of word0[58]. */
    const bool m5_layered = generation == AGX_PBE_AGX3_GENERATION_10 &&
       (dimension == AGX_PBE_DIMENSION_2D_ARRAY ||
        dimension == AGX_PBE_DIMENSION_2D_ARRAY_MULTISAMPLE ||
@@ -427,20 +422,10 @@ agx_pbe_agx3_2d_multisample_pack(
    if (out)
       memset(out, 0, sizeof(*out));
 
-   /* A multisample colour target is never linear and never mipmapped: the
-    * end-of-tile store addresses it through the sample-expanded twiddled
-    * layout. The pinned native PBE encoder deposits its sample selector at
-    * word0[59:58], two bits above Gen9's. Native 2x/4x
-    * complete packets ground both generations here, and the native 8x packet
-    * grounds Gen10's selector 2. Tile profiles are qualified independently.
-    */
-   /* Preserve raw D32 copies alongside the private RGBA16 and RGBA8 color
-    * cases. A compressed multisample packet is the compressed single-sample
-    * packet with the multisample dimension and selector; the metadata follows
-    * the sample-expanded surface, so it depends only on the texel size, which
-    * RGBA8 shares with the witnessed R32_UINT shape. Gen10 keeps the sRGB
-    * store conversion at word1 bit 61, as in the single-sample packet. Image
-    * allocation policy remains separate from packet encoding. */
+   /* Multisample colour targets are tiled and non-mipmapped. Sample selector
+    * sits at word0[57:56] (Gen9) or word0[59:58] (Gen10, supporting 2x/4x/8x).
+    * Compressed MSAA packets reuse the single-sample compressed layout with
+    * the multisample dimension/selector and Gen10 sRGB bit at word1[61]. */
    const bool compressed_r32_uint = fields &&
       generation == AGX_PBE_AGX3_GENERATION_10 &&
       fields->layout == AGX_PBE_LAYOUT_GPU &&
@@ -515,15 +500,9 @@ agx_pbe_agx3_2d_mip_pack(
 {
    if (out)
       memset(out, 0, sizeof(*out));
-   /* A compressed Gen10 level keeps the compressed single-level packet
-    * (word0 bit61, word1 bit63, word2[43:0] = metadata >> 4) and takes the
-    * same chain fields as an uncompressed one: the pinned native PBE encoder
-    * (level and level count passed as arguments) gives
-    * 0x30001f803fe40a22 / 0x8000000001234500 / 0x0004200004567800 for an
-    * RGBA8 UNORM 64x64 level 2 of 5 with metadata 0x45678000. The metadata
-    * address stays the level-0 one: the native framebuffer PBE setup asks
-    * for the GPU address of level 0 of both the surface and the metadata
-    * (two calls on the same path). */
+   /* Compressed Gen10 mip levels combine the compressed packet (word0[61],
+    * word1[63], word2[43:0] = metadata >> 4) with the standard mip-chain
+    * fields; both surface and metadata addresses remain at level 0. */
    if ((generation != AGX_PBE_AGX3_GENERATION_9 &&
         generation != AGX_PBE_AGX3_GENERATION_10) || !levels || levels > 16 ||
        (fields && fields->layout == AGX_PBE_LAYOUT_LINEAR &&
