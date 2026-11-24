@@ -70,6 +70,7 @@ bool agx_nir_opt_flatten_loads(struct nir_shader *shader, unsigned limit,
                                unsigned max_loads);
 bool agx_nir_opt_merge_nested_early_exits(struct nir_shader *shader);
 bool agx_nir_hoist_loop_invariant_guard_bits(struct nir_shader *shader);
+bool agx_nir_opt_guard_chains(struct nir_shader *shader);
 bool agx_nir_opt_factor_loop_mac(struct nir_shader *shader);
 bool agx_nir_opt_flatten_short_circuit_uniform_loads(struct nir_shader *shader);
 bool agx_nir_opt_sink_loop_sample_uses(struct nir_shader *shader);
@@ -383,7 +384,9 @@ bool agx_nir_lower_fma_rte(struct nir_shader *shader, enum agx_chip chip);
 struct nir_def *agx_nir_fma_rte_fixup(struct nir_builder *b, struct nir_def *a,
                                     struct nir_def *c, struct nir_def *z,
                                     struct nir_def *native);
-bool agx_nir_lower_cmat(struct nir_shader *s, bool native_f16_accum8);
+bool agx_nir_lower_cmat(struct nir_shader *s, bool native_f16_accum8,
+                        bool widen_bf16_inputs);
+bool agx_nir_lower_cmat_sw(struct nir_shader *s);
 bool agx_nir_lower_cmat_calls(struct nir_shader *s);
 bool agx_nir_cmat_supported(struct nir_shader *s);
 bool agx_nir_lower_cmat_tensor(struct nir_shader *s, bool pairing);

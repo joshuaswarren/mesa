@@ -5,6 +5,7 @@
 libasahi_agx_files = files(
   'agx_compile.c',
   'agx_nir_lower_cmat.c',
+  'agx_nir_lower_cmat_sw.c',
   'agx_dce.c',
   'agx_liveness.c',
   'agx_insert_waits.c',
@@ -21,6 +22,7 @@ libasahi_agx_files = files(
   'agx_nir_opt_factor_loop_mac.c',
   'agx_nir_opt_merge_nested_early_exits.c',
   'agx_nir_opt_narrow_subword_loads.c',
+  'agx_nir_opt_guard_chains.c',
   'agx_nir_opt_select_load.c',
   'agx_nir_opt_u8x4_hsum.c',
   'agx_nir_opt_licm.c',
@@ -747,6 +749,7 @@ if with_tests
          'test/test-border-index.cpp',
          'test/test-aligned-bounds.cpp',
          'test/test-agx2-image-acquire.cpp',
+         'test/test-agx2-cmat.cpp',
          'test/test-agx3-shared-fence.cpp',
          'test/test-byte-swap.cpp',
          'test/test-minmax-canonical.cpp',
@@ -828,6 +831,7 @@ if with_tests
          'test/test-narrow-subword-loads.cpp',
          'test/test-shared-phase-cse.cpp',
          'test/test-u8x4-hsum.cpp',
+         'test/test-guard-chains.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
          # in libasahi_lib, which this test does not link.
          '../lib/agx_chip.c',

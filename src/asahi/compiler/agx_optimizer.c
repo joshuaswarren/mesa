@@ -118,22 +118,8 @@ agx_preserve_g17p_tied_fcmpsel(agx_context *ctx, agx_instr *I, unsigned src)
 static bool
 agx_g17p_tied_minmax(agx_context *ctx, const agx_instr *I)
 {
-   if (!(ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-         I->op == AGX_OPCODE_FCMPSEL && I->nr_srcs == 4 && !I->invert_cond &&
-         !I->saturate &&
-         (I->fcond == AGX_FCOND_GTN || I->fcond == AGX_FCOND_LTN)))
-      return false;
-
-   /* agx_is_equiv() ignores modifiers, and a modifier on one half of a tie
-    * would make the two operands different values. Require them identical. */
-   for (unsigned i = 0; i < 2; ++i) {
-      const agx_index a = I->src[i], b = I->src[i + 2];
-      if (!agx_is_equiv(a, b) || a.size != b.size || a.abs != b.abs ||
-          a.neg != b.neg || a.memory != b.memory)
-         return false;
-   }
-
-   return true;
+   return ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          agx_fcmpsel_is_tied_minmax(I);
 }
 
 /*
@@ -453,7 +439,9 @@ static void
 agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
    if (I->op == AGX_OPCODE_MATMAD8_AGX3 ||
-       I->op == AGX_OPCODE_MATMAD16_AGX3)
+       I->op == AGX_OPCODE_MATMAD16_AGX3 ||
+       I->op == AGX_OPCODE_SIMD_MATRIX_FMADD32 ||
+       I->op == AGX_OPCODE_SIMD_MATRIX_FMADD16)
       return;
    agx_foreach_ssa_src(I, s) {
       agx_index src = I->src[s];
@@ -678,9 +666,12 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
          if (!agx_minifloat_exact(f))
             continue;
 
-         /* Both halves of a tied minimum/maximum, or neither. */
-         if (s < 2 && agx_g17p_tied_minmax(ctx, I))
+         /* Both halves of a tied minimum/maximum, or neither. Record that the
+          * select slot now holds a minifloat rather than raw integer bits. */
+         if (s < 2 && agx_g17p_tied_minmax(ctx, I)) {
             I->src[s + 2] = agx_immediate_f(f);
+            I->fcmpsel_minifloat_select = true;
+         }
 
          I->src[s] = agx_immediate_f(f);
       } else if (value == def->imm) {

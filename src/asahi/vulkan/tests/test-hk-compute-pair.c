@@ -15,6 +15,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "hk_nir_eval_test.h"
 #include "hk_nir_match_pointwise_clamp.h"
+#include "hk_nir_wgid.h"
 
 static nir_shader *
 new_compute_shader(const char *name, uint16_t lx, uint16_t ly, uint16_t lz)
@@ -436,6 +437,19 @@ test_depthwise_clamp_footprint(void)
    cons.push = &clamp_count;
    prod.groups[0] -= 1;
    HK_EVAL_CHECK(!hk_nir_depthwise_clamp_footprint(&dw, &clamp, &prod, &cons, p_ends, c_ends));
+
+   /* Nonzero base_group on either dispatch must refuse fusion and fall back
+    * to the original shaders (required for bare unit-axis load_workgroup_id). */
+   prod.groups[0] += 1;
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      prod.base_group[axis] = 1;
+      HK_EVAL_CHECK(!hk_nir_depthwise_clamp_footprint(&dw, &clamp, &prod, &cons, p_ends, c_ends));
+      prod.base_group[axis] = 0;
+
+      cons.base_group[axis] = 1;
+      HK_EVAL_CHECK(!hk_nir_depthwise_clamp_footprint(&dw, &clamp, &prod, &cons, p_ends, c_ends));
+      cons.base_group[axis] = 0;
+   }
 }
 
 static void
@@ -514,6 +528,17 @@ test_gemm_clamp_footprint(void)
    prod.groups[1] = 128 / (4 * 4);
    HK_EVAL_CHECK(hk_nir_gemm_clamp_footprint(&gemm4, &clamp, &prod, &cons, p_ends, c_ends));
    HK_EVAL_CHECK(p_ends[2] == 0);
+
+   /* Nonzero base_group on either dispatch must refuse GEMM+clamp fusion. */
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      prod.base_group[axis] = 1;
+      HK_EVAL_CHECK(!hk_nir_gemm_clamp_footprint(&gemm4, &clamp, &prod, &cons, p_ends, c_ends));
+      prod.base_group[axis] = 0;
+
+      cons.base_group[axis] = 1;
+      HK_EVAL_CHECK(!hk_nir_gemm_clamp_footprint(&gemm4, &clamp, &prod, &cons, p_ends, c_ends));
+      cons.base_group[axis] = 0;
+   }
 }
 
 static void
@@ -833,6 +858,314 @@ test_depthwise_vec4_and_fusion(void)
 
    /* Unconditional bias buffer (no has_bias push flag). */
    run_depthwise_case(true, false, &cfg2, &relu);
+}
+
+static void
+rewrite_gid_axis_to_wgid(nir_shader *s, unsigned target_axis, unsigned wg_axis,
+                         bool add_base, unsigned base_axis, uint32_t base_scale)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_def *wg = nir_channel(&b, nir_load_workgroup_id(&b), wg_axis);
+   if (add_base) {
+      nir_def *bwg =
+         nir_channel(&b, nir_load_base_workgroup_id(&b, 32), base_axis);
+      if (base_scale != 1)
+         bwg = nir_imul_imm(&b, bwg, base_scale);
+      wg = nir_iadd(&b, wg, bwg);
+   }
+   nir_def *repl = nir_vec3(&b, target_axis == 0 ? wg : nir_channel(&b, gid, 0),
+                            target_axis == 1 ? wg : nir_channel(&b, gid, 1),
+                            target_axis == 2 ? wg : nir_channel(&b, gid, 2));
+   nir_foreach_block(blk, impl) {
+      nir_foreach_instr(instr, blk) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+         if (intrin->intrinsic == nir_intrinsic_load_global_invocation_id &&
+             &intrin->def != gid)
+            nir_def_rewrite_uses(&intrin->def, repl);
+      }
+   }
+   nir_opt_dce(s);
+   nir_validate_shader(s, "rewrite_gid_axis_to_wgid");
+}
+
+static void
+test_unit_axis_wgid_compute_pair(void)
+{
+   /* Shaders whose source reads SPIR-V WorkgroupId (gl_WorkGroupID) directly
+    * on a unit axis (local_size[axis] == 1) lower to load_workgroup_id[axis]
+    * (plus load_base_workgroup_id[axis] when base workgroup offsets are
+    * lowered). Verify bit-exact orig-vs-alt outputs for depthwise,
+    * pointwise_clamp, and gemm_output, plus negative guards and dispatch-side
+    * nonzero-base refusal. */
+   const struct hk_nir_clamp_epilogue relu6 = {
+      .has_lower = true, .has_upper = true, .upper_first = false,
+      .lower_bits = 0x00000000u, .upper_bits = 0x40c00000u,
+      .max_fp_math_ctrl = nir_fp_preserve_inf,
+      .min_fp_math_ctrl = nir_fp_preserve_inf,
+   };
+
+   /* 1. Depthwise 3x3 with wg=32x1x1 reading wg.y (+ base.y): verify bit-exact
+    *    orig+clamp vs both vec4 alternate and spliced epilogue. */
+   const struct dw_push_layout cfg = {
+      .channels = 8, .out_w = 5, .out_h = 4, .in_w = 5, .in_h = 4,
+      .ker_w = 3, .ker_h = 3, .pad_x = -1, .pad_y = -1,
+      .str_x = 1, .str_y = 1, .dil_x = 1, .dil_y = 1, .has_bias = 1,
+   };
+   for (unsigned add_base = 0; add_base < 2; ++add_base) {
+      nir_shader *dw32 = build_depthwise_nir(true, true, 0, 0, 1, 2, 3);
+      dw32->info.workgroup_size[0] = 32;
+      dw32->info.workgroup_size[1] = 1;
+      dw32->info.workgroup_size[2] = 1;
+      rewrite_gid_axis_to_wgid(dw32, 1, 1, add_base != 0, 1, 1);
+
+      struct hk_nir_depthwise_output info = {0};
+      HK_EVAL_CHECK(hk_nir_match_depthwise_output(
+         dw32, nir_address_format_64bit_global_32bit_offset, &info));
+      HK_EVAL_CHECK(info.vec4_valid && info.local_size[0] == 32 &&
+                    info.local_size[1] == 1);
+      nir_shader *vec4 = hk_nir_build_depthwise_vec4(dw32, &info, &relu6);
+      HK_EVAL_CHECK(vec4 != NULL);
+      nir_validate_shader(vec4, "dw_vec4_wg32x1_relu6");
+      nir_shader *spliced = hk_nir_splice_epilogue(dw32, info.output, &relu6);
+      HK_EVAL_CHECK(spliced != NULL);
+      nir_validate_shader(spliced, "dw_spliced_wg32x1_relu6");
+
+      const size_t in_n = (size_t)cfg.in_h * cfg.in_w * cfg.channels;
+      const size_t wt_n = (size_t)cfg.ker_h * cfg.ker_w * cfg.channels;
+      const size_t bs_n = (size_t)cfg.channels;
+      const size_t out_n = (size_t)cfg.out_h * cfg.out_w * cfg.channels;
+      float *in_buf = calloc(in_n, sizeof(float));
+      float *wt_buf = calloc(wt_n, sizeof(float));
+      float *bs_buf = calloc(bs_n, sizeof(float));
+      float *ref_out = calloc(out_n, sizeof(float));
+      float *v4_out = calloc(out_n, sizeof(float));
+      float *sp_out = calloc(out_n, sizeof(float));
+      HK_EVAL_CHECK(in_buf && wt_buf && bs_buf && ref_out && v4_out && sp_out);
+      for (size_t i = 0; i < in_n; ++i)
+         in_buf[i] = ((int)((i * 7u + 3u + add_base) % 13u) - 6) * 0.25f;
+      for (size_t i = 0; i < wt_n; ++i)
+         wt_buf[i] = ((int)((i * 5u + 1u) % 9u) - 4) * 0.5f;
+      for (size_t i = 0; i < bs_n; ++i)
+         bs_buf[i] = ((int)(i % 7u) - 3) * 0.75f;
+
+      struct hk_eval_ssbo ssbos[4] = {
+         { .set = 0, .binding = 0, .data = in_buf, .size = in_n * sizeof(float) },
+         { .set = 0, .binding = 1, .data = wt_buf, .size = wt_n * sizeof(float) },
+         { .set = 0, .binding = 2, .data = bs_buf, .size = bs_n * sizeof(float) },
+         { .set = 0, .binding = 3, .data = ref_out, .size = out_n * sizeof(float) },
+      };
+      const uint32_t orig_grid[3] = {
+         DIV_ROUND_UP((uint32_t)cfg.out_w * cfg.channels, 32u),
+         (uint32_t)cfg.out_h,
+         1,
+      };
+      hk_eval_dispatch(dw32, orig_grid, ssbos, 4, &cfg, sizeof(cfg));
+      nir_shader *clamp = build_clamp_nir(0, 3, 3, 0, &relu6, 64);
+      int32_t count = (int32_t)out_n;
+      const uint32_t c_grid[3] = { DIV_ROUND_UP((uint32_t)out_n, 64u), 1, 1 };
+      hk_eval_dispatch(clamp, c_grid, ssbos, 4, &count, sizeof(count));
+      ralloc_free(clamp);
+
+      ssbos[3].data = v4_out;
+      const uint32_t out_pairs = DIV_ROUND_UP((uint32_t)cfg.out_w, 2u);
+      const uint32_t v4_grid[3] = {
+         DIV_ROUND_UP((uint32_t)cfg.channels / 4u, vec4->info.workgroup_size[0]),
+         DIV_ROUND_UP(out_pairs, vec4->info.workgroup_size[1]),
+         DIV_ROUND_UP((uint32_t)cfg.out_h, vec4->info.workgroup_size[2]),
+      };
+      hk_eval_dispatch(vec4, v4_grid, ssbos, 4, &cfg, sizeof(cfg));
+      HK_EVAL_CHECK(memcmp(ref_out, v4_out, out_n * sizeof(float)) == 0);
+
+      ssbos[3].data = sp_out;
+      hk_eval_dispatch(spliced, orig_grid, ssbos, 4, &cfg, sizeof(cfg));
+      HK_EVAL_CHECK(memcmp(ref_out, sp_out, out_n * sizeof(float)) == 0);
+
+      free(in_buf);
+      free(wt_buf);
+      free(bs_buf);
+      free(ref_out);
+      free(v4_out);
+      free(sp_out);
+      ralloc_free(spliced);
+      ralloc_free(vec4);
+
+      /* Negative 1: same load_workgroup_id.y with local_size[1] == 2 rejects. */
+      dw32->info.workgroup_size[1] = 2;
+      struct hk_nir_depthwise_output bad = {0};
+      HK_EVAL_CHECK(!hk_nir_match_depthwise_output(
+         dw32, nir_address_format_64bit_global_32bit_offset, &bad));
+      ralloc_free(dw32);
+   }
+
+   /* Negative 2: wrong-axis base (wg.y + base.x) rejects. */
+   {
+      nir_shader *dw = build_depthwise_nir(true, true, 0, 0, 1, 2, 3);
+      dw->info.workgroup_size[0] = 32;
+      dw->info.workgroup_size[1] = 1;
+      dw->info.workgroup_size[2] = 1;
+      rewrite_gid_axis_to_wgid(dw, 1, 1, true, 0, 1);
+      struct hk_nir_depthwise_output bad = {0};
+      HK_EVAL_CHECK(!hk_nir_match_depthwise_output(
+         dw, nir_address_format_64bit_global_32bit_offset, &bad));
+      ralloc_free(dw);
+   }
+
+   /* Negative 3: base scaled by wrong constant (wg.y + base.y * 2) rejects. */
+   {
+      nir_shader *dw = build_depthwise_nir(true, true, 0, 0, 1, 2, 3);
+      dw->info.workgroup_size[0] = 32;
+      dw->info.workgroup_size[1] = 1;
+      dw->info.workgroup_size[2] = 1;
+      rewrite_gid_axis_to_wgid(dw, 1, 1, true, 1, 2);
+      struct hk_nir_depthwise_output bad = {0};
+      HK_EVAL_CHECK(!hk_nir_match_depthwise_output(
+         dw, nir_address_format_64bit_global_32bit_offset, &bad));
+      ralloc_free(dw);
+   }
+
+   /* Negative 4: wg.x used as row index with local_size[0] == 32 rejects. */
+   {
+      nir_shader *dw = build_depthwise_nir(true, true, 0, 0, 1, 2, 3);
+      dw->info.workgroup_size[0] = 32;
+      dw->info.workgroup_size[1] = 1;
+      dw->info.workgroup_size[2] = 1;
+      rewrite_gid_axis_to_wgid(dw, 1, 0, false, 0, 1);
+      struct hk_nir_depthwise_output bad = {0};
+      HK_EVAL_CHECK(!hk_nir_match_depthwise_output(
+         dw, nir_address_format_64bit_global_32bit_offset, &bad));
+      ralloc_free(dw);
+   }
+
+   /* 2. hk_nir_match_pointwise_clamp with local_size = 1x1x1 reading wg.x
+    *    (+ base.x): match, splice, and verify bit-exact output. */
+   for (unsigned add_base = 0; add_base < 2; ++add_base) {
+      nir_shader *clamp = build_clamp_nir(1, 2, 2, 8, &relu6, 1);
+      rewrite_gid_axis_to_wgid(clamp, 0, 0, add_base != 0, 0, 1);
+
+      struct hk_nir_pointwise_clamp matched = {0};
+      HK_EVAL_CHECK(hk_nir_match_pointwise_clamp(clamp, &matched));
+      HK_EVAL_CHECK(matched.local_size_x == 1 && matched.count_offset_B == 8);
+      HK_EVAL_CHECK(hk_nir_clamp_epilogue_equal(&matched.epilogue, &relu6));
+
+      nir_shader *prod = new_compute_shader("copy_prod_wg1", 16, 1, 1);
+      prod->info.num_ssbos = 2;
+      nir_builder pb = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(prod)));
+      nir_def *gx = nir_channel(&pb, nir_load_global_invocation_id(&pb, 32), 0);
+      nir_def *v = nir_load_deref(&pb, nir_def_as_deref(ssbo_elem_deref(&pb, 1, 0, gx)));
+      nir_store_deref(&pb, nir_def_as_deref(ssbo_elem_deref(&pb, 1, 2, gx)), v, 0x1);
+      nir_shader *spliced = hk_nir_splice_epilogue(
+         prod, (struct hk_nir_clamp_buffer){ .set = 1, .binding = 2 }, &matched.epilogue);
+      HK_EVAL_CHECK(spliced != NULL);
+
+      float in_buf[16], ref_buf[16] = {0}, fused_buf[16] = {0};
+      for (unsigned i = 0; i < 16; ++i)
+         in_buf[i] = ((int)i - 4) * 1.0f;
+      uint32_t push[3] = { 0, 0, 16 };
+      struct hk_eval_ssbo sr[2] = {
+         { .set = 1, .binding = 0, .data = in_buf, .size = sizeof(in_buf) },
+         { .set = 1, .binding = 2, .data = ref_buf, .size = sizeof(ref_buf) },
+      };
+      struct hk_eval_ssbo sf[2] = {
+         { .set = 1, .binding = 0, .data = in_buf, .size = sizeof(in_buf) },
+         { .set = 1, .binding = 2, .data = fused_buf, .size = sizeof(fused_buf) },
+      };
+      const uint32_t pgrid[3] = { 1, 1, 1 };
+      const uint32_t cgrid[3] = { 16, 1, 1 };
+      hk_eval_dispatch(prod, pgrid, sr, 2, push, sizeof(push));
+      hk_eval_dispatch(clamp, cgrid, sr, 2, push, sizeof(push));
+      hk_eval_dispatch(spliced, pgrid, sf, 2, push, sizeof(push));
+      HK_EVAL_CHECK(memcmp(ref_buf, fused_buf, sizeof(ref_buf)) == 0);
+      ralloc_free(spliced);
+      ralloc_free(prod);
+
+      clamp->info.workgroup_size[0] = 4;
+      struct hk_nir_pointwise_clamp bad = {0};
+      HK_EVAL_CHECK(!hk_nir_match_pointwise_clamp(clamp, &bad));
+      ralloc_free(clamp);
+   }
+
+   /* 3. hk_nir_match_gemm_output with wg=32x1x1 reading wg.y (+ base.y):
+    *    match, splice, and verify bit-exact orig+clamp vs spliced. */
+   for (unsigned add_base = 0; add_base < 2; ++add_base) {
+      const uint32_t rows_per_thread = 4;
+      const int32_t M = 13, N = 11, K = 7;
+      nir_shader *orig = build_gemm_nir(rows_per_thread, true, true, true);
+      orig->info.workgroup_size[0] = 32;
+      orig->info.workgroup_size[1] = 1;
+      orig->info.workgroup_size[2] = 1;
+      rewrite_gid_axis_to_wgid(orig, 1, 1, add_base != 0, 1, 1);
+
+      struct hk_nir_gemm_output info = {0};
+      HK_EVAL_CHECK(hk_nir_match_gemm_output(
+         orig, nir_address_format_64bit_global_32bit_offset, &info));
+      HK_EVAL_CHECK(info.rows_per_thread == rows_per_thread &&
+                    info.local_size[0] == 32 && info.local_size[1] == 1);
+
+      nir_shader *spliced = hk_nir_splice_epilogue(orig, info.output, &relu6);
+      HK_EVAL_CHECK(spliced != NULL);
+      nir_validate_shader(spliced, "gemm_spliced_wg32x1");
+
+      const size_t a_n = (size_t)M * K, b_n = (size_t)K * N,
+                   bias_n = (size_t)MAX2(M, N), o_n = (size_t)M * N;
+      float *a_buf = calloc(a_n, sizeof(float));
+      float *b_buf = calloc(b_n, sizeof(float));
+      float *bias_buf = calloc(bias_n, sizeof(float));
+      float *ref_out = calloc(o_n, sizeof(float));
+      float *sp_out = calloc(o_n, sizeof(float));
+      HK_EVAL_CHECK(a_buf && b_buf && bias_buf && ref_out && sp_out);
+      for (size_t i = 0; i < a_n; ++i)
+         a_buf[i] = ((int)((i * 3u + 1u + add_base) % 11u) - 5) * 0.5f;
+      for (size_t i = 0; i < b_n; ++i)
+         b_buf[i] = ((int)((i * 7u + 2u) % 9u) - 4) * 0.25f;
+      for (size_t i = 0; i < bias_n; ++i)
+         bias_buf[i] = ((int)(i % 5u) - 2) * 0.5f;
+
+      struct gemm_push_layout push = { .k = K, .bias_mode = 1, .n = N, .m = M };
+      struct hk_eval_ssbo ssbos[4] = {
+         { .set = 0, .binding = 0, .data = a_buf, .size = a_n * sizeof(float) },
+         { .set = 0, .binding = 1, .data = b_buf, .size = b_n * sizeof(float) },
+         { .set = 0, .binding = 2, .data = bias_buf, .size = bias_n * sizeof(float) },
+         { .set = 0, .binding = 3, .data = ref_out, .size = o_n * sizeof(float) },
+      };
+      const uint32_t grid[3] = {
+         DIV_ROUND_UP((uint32_t)N, 32u),
+         DIV_ROUND_UP((uint32_t)M, rows_per_thread),
+         1,
+      };
+      hk_eval_dispatch(orig, grid, ssbos, 4, &push, sizeof(push));
+      nir_shader *clamp = build_clamp_nir(0, 3, 3, 0, &relu6, 64);
+      int32_t count = (int32_t)o_n;
+      const uint32_t cgrid[3] = { DIV_ROUND_UP((uint32_t)o_n, 64u), 1, 1 };
+      hk_eval_dispatch(clamp, cgrid, ssbos, 4, &count, sizeof(count));
+      ralloc_free(clamp);
+
+      ssbos[3].data = sp_out;
+      hk_eval_dispatch(spliced, grid, ssbos, 4, &push, sizeof(push));
+      HK_EVAL_CHECK(memcmp(ref_out, sp_out, o_n * sizeof(float)) == 0);
+
+      free(a_buf);
+      free(b_buf);
+      free(bias_buf);
+      free(ref_out);
+      free(sp_out);
+      ralloc_free(spliced);
+
+      orig->info.workgroup_size[1] = 2;
+      struct hk_nir_gemm_output bad = {0};
+      HK_EVAL_CHECK(!hk_nir_match_gemm_output(
+         orig, nir_address_format_64bit_global_32bit_offset, &bad));
+      ralloc_free(orig);
+   }
+
+   /* 4. Dispatch-side nonzero base_group refusal gate. */
+   const uint32_t zero_base[3] = { 0, 0, 0 };
+   const uint32_t nz_y[3] = { 0, 1, 0 };
+   HK_EVAL_CHECK(hk_nir_dispatch_zero_base(zero_base));
+   HK_EVAL_CHECK(!hk_nir_dispatch_zero_base(nz_y));
 }
 
 static void
@@ -1752,6 +2085,7 @@ main(void)
    test_clamp_match_and_splice();
    test_depthwise_vec4_and_fusion();
    test_gemm_match_and_splice();
+   test_unit_axis_wgid_compute_pair();
    test_gemm_cmat_certify_and_build();
    glsl_type_singleton_decref();
    printf("test-hk-compute-pair: PASS\n");
