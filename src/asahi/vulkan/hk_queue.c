@@ -2478,16 +2478,17 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             if (stage_prefixes || m5_staged_v2)
                cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
 
-            /* G17P: a render whose vertex half depends on less compute work
-             * than its fragment half (image-only producers ordered by image
-             * barriers, fragment-only destinations) goes as a staged render:
-             * the kernel orders its tiling kick after the narrower prefixes
-             * alone, so its vertex work overlaps compute work that only its
-             * fragment half waits for. Every other render keeps the forms
-             * below, which the kernel can publish directly. */
+            /* Native HAL200: a render whose vertex half depends on less
+             * compute work than its fragment half (image-only producers
+             * ordered by image barriers, fragment-only destinations) goes as
+             * a staged render: the kernel orders its tiling kick after the
+             * narrower prefixes alone, so its vertex work overlaps compute
+             * work that only its fragment half waits for. Every other render
+             * keeps the forms below, which the kernel can publish directly.
+             */
             const bool g17p_staged =
-               dev->dev.chip == AGX_CHIP_G17P && !queue->sync.serialize &&
-               queue->sync.exact_prior &&
+               agx_chip_native_hal200(dev->dev.chip) &&
+               !queue->sync.serialize && queue->sync.exact_prior &&
                (dev->dev.params.features &
                 DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
                cs->sync.ta_split &&
@@ -2496,7 +2497,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                 ta_command_prior[HK_SYNC_CDM] != command_prior[HK_SYNC_CDM]);
             if (g17p_staged) {
                cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
-               perf_debug_dev(&dev->dev, "G17P staged render");
+               perf_debug_dev(&dev->dev, "HAL200 staged render");
             }
 
             /* The render's vertex half depends on no earlier render while its
@@ -2529,12 +2530,12 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                          cs->sync.prior[HK_SYNC_VDM] == 0))
                cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
 
-            /* G17P: a vertex half that still names earlier renders can use
-             * the fragment-only barriers too when the order of tiling kicks
-             * already covers what it names. A staged render takes neither
-             * the flag nor part in ta_cover: its tiling waits only for its
-             * narrower tiling prefix. */
-            if (dev->dev.chip == AGX_CHIP_G17P && !g17p_staged &&
+            /* Native HAL200: a vertex half that still names earlier renders
+             * can use the fragment-only barriers too when the order of tiling
+             * kicks already covers what it names. A staged render takes
+             * neither the flag nor part in ta_cover: its tiling waits only
+             * for its narrower tiling prefix. */
+            if (agx_chip_native_hal200(dev->dev.chip) && !g17p_staged &&
                 !queue->sync.serialize && queue->sync.exact_prior &&
                 (dev->dev.params.features &
                  DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)) {
