@@ -415,12 +415,13 @@ struct hk_sync_state {
     * (hk_sync_barrier()). */
    bool as_build;
 
-   /* Timestamps written as copies of an earlier end stamp, outside a render
-    * pass instance (hk_sync_write_timestamp()), and the latest stream on
-    * each subqueue whose stamp they read. They are recorded in one launch
-    * in a compute stream ordered after those streams: the next timestamp
-    * carrier that follows them anyway, or the stream of the next query
-    * command, event write or the end of the command buffer
+   /* Timestamps written as copies of an earlier end stamp
+    * (hk_sync_write_timestamp()), and the latest stream on each subqueue
+    * whose stamp they read. They are recorded in one launch in a
+    * timestamp-only compute stream ordered after those streams: the next
+    * timestamp carrier that follows them anyway, or a command of their own
+    * before the next query command or event write, at the end of the
+    * command buffer, or when the batch is full
     * (hk_sync_flush_stamp_copies()). */
    struct hk_stamp_copy stamp_copies[HK_SYNC_STAMP_COPIES];
    uint8_t stamp_copy_count;
@@ -617,13 +618,10 @@ void hk_sync_write_timestamp(struct hk_cmd_buffer *cmd,
 void hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd);
 
 /* Record the pending timestamp copies (hk_sync_state::stamp_copies) in a
- * compute stream positioned after the streams they read, and end it. Every
- * later first scope that names HK_SYNC_STAMP orders after them. */
+ * timestamp-only compute stream positioned after the streams they read, and
+ * end it. Every later first scope that names HK_SYNC_STAMP orders after
+ * them; no application dependency does. */
 void hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd);
-
-/* Record the copies a render's later in-pass timestamps take from its end
- * stamp (hk_cs::stamp_copies) as its post-graphics stream cs ends. */
-void hk_sync_dispatch_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 /* G17P transfer writes (see hk_sync_xfer_write). Note that the transfer
  * being recorded writes into cs. */
