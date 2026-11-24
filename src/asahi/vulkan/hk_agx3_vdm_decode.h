@@ -34,9 +34,10 @@ extern "C" {
  * attachmentless layer-zero root lowering and fs.reads_layer, to 46 when
  * AGX3 fragment binaries carry on-chip local_read NIR payloads, to 47
  * when agx_shader_info gains AGX3 vertex preamble hoist metadata and
- * vertex binaries may carry extracted preamble NIR, and to 48 when
- * hk_shader_info.vs records per-pipeline vertex input robustness. */
-#define HK_AGX3_SHADER_BINARY_VERSION 48u
+ * vertex binaries may carry extracted preamble NIR, to 48 when
+ * hk_shader_info.vs records per-pipeline vertex input robustness, and to 49
+ * when compute shaders carry packed vec4 alternates. */
+#define HK_AGX3_SHADER_BINARY_VERSION 49u
 #define HK_CLASSIC_SHADER_BINARY_VERSION 37u
 /* AGX2 binaries include attachmentless layer-zero root lowering, fs.reads_layer,
  * and per-pipeline vertex input robustness in hk_shader_info.vs. */

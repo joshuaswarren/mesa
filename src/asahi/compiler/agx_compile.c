@@ -9054,6 +9054,14 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
    }
 
    case nir_op_usub_sat: {
+      /* AGX3B has a grounded native 32-bit unsigned saturating subtract
+       * (agx3_iadd_encode), while 16-bit saturating iadd on AGX3B only covers
+       * addition. Lower non-32-bit usub_sat on AGX3B to compare/sub/select. */
+      if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          dst.size != AGX_SIZE_32) {
+         agx_index diff = agx_iadd(b, s0, agx_neg(s1), 0);
+         return agx_icmpsel_to(b, dst, s0, s1, agx_zero(), diff, AGX_ICOND_ULT);
+      }
       agx_instr *I = agx_iadd_to(b, dst, agx_abs(s0), agx_neg(agx_abs(s1)), 0);
       I->saturate = true;
       return I;
@@ -11100,6 +11108,86 @@ agx_preamble_allowed(const nir_shader *nir)
    return !(agx_compiler_debug & AGX_DBG_NOPREAMBLE) || nir->info.internal;
 }
 
+/* When a compute workgroup has static size 1 along an axis, every invocation
+ * in the workgroup has local_invocation_id[c] == 0, so
+ * global_invocation_id[c] == workgroup_id[c]. Replacing those components with
+ * load_workgroup_id exposes their workgroup-uniformity to divergence analysis,
+ * preamble hoisting, and uniform addressing. */
+bool
+agx_nir_uniform_unit_global_id(nir_shader *nir)
+{
+   if (nir->info.internal ||
+       (nir->info.stage != MESA_SHADER_COMPUTE &&
+        nir->info.stage != MESA_SHADER_KERNEL) ||
+       nir->info.workgroup_size_variable ||
+       !nir->info.workgroup_size[0] || !nir->info.workgroup_size[1] ||
+       !nir->info.workgroup_size[2])
+      return false;
+
+   /* Only multi-thread workgroups benefit from exposing unit axes as
+    * workgroup-uniform; single-thread (1x1x1) dispatches have no
+    * intra-workgroup uniformity to expose. Driver-generated EOT and
+    * background programs are marked info.internal = true explicitly and
+    * filtered above regardless of workgroup shape. */
+   const uint64_t wg_threads = (uint64_t)nir->info.workgroup_size[0] *
+                               nir->info.workgroup_size[1] *
+                               nir->info.workgroup_size[2];
+   if (wg_threads <= 1)
+      return false;
+
+   bool any_unit = false;
+   for (unsigned c = 0; c < 3; ++c)
+      any_unit |= nir->info.workgroup_size[c] == 1;
+   if (!any_unit)
+      return false;
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      bool impl_progress = false;
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic != nir_intrinsic_load_global_invocation_id)
+               continue;
+
+            const unsigned ncomp = intrin->def.num_components;
+            bool hit = false, all = true;
+            for (unsigned c = 0; c < ncomp; ++c) {
+               const bool unit = c < 3 && nir->info.workgroup_size[c] == 1;
+               hit |= unit;
+               all &= unit;
+            }
+            if (!hit)
+               continue;
+
+            b.cursor = nir_after_instr(instr);
+            nir_def *wg =
+               nir_u2uN(&b, nir_load_workgroup_id(&b), intrin->def.bit_size);
+            nir_def *chans[4];
+            for (unsigned c = 0; c < ncomp; ++c) {
+               if (c < 3 && nir->info.workgroup_size[c] == 1)
+                  chans[c] = nir_channel(&b, wg, c);
+               else
+                  chans[c] = nir_channel(&b, &intrin->def, c);
+            }
+            nir_def *vec = nir_vec(&b, chans, ncomp);
+            if (all) {
+               nir_def_rewrite_uses(&intrin->def, vec);
+               nir_instr_remove(instr);
+            } else {
+               nir_def_rewrite_uses_after(&intrin->def, vec);
+            }
+            impl_progress = true;
+         }
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool byte_indices, bool discard_word, bool g17p, bool m5,
@@ -11152,6 +11240,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
 
    /* This runs only once up front since other optimizations don't affect it */
    NIR_PASS(_, nir, nir_opt_shrink_stores, true);
+   NIR_PASS(_, nir, agx_nir_uniform_unit_global_id);
 
    agx_optimize_loop_nir(nir, m5, g17p, agx3b || m5);
 
@@ -11284,6 +11373,13 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    NIR_PASS(addr_progress, nir, agx_nir_lower_address, byte_indices || m5,
             byte_indices || m5, checked_offsets);
 
+   /* Flatten serial uniform-stride 32-bit addition chains into base + (j * s)
+    * when preamble formation is enabled so the hoistable stride multiples
+    * j * s move into the preamble and every address computes independently in
+    * one add, breaking serial address dependencies ahead of strided loads. */
+   if (preamble_size && agx_preamble_allowed(nir))
+      NIR_PASS(_, nir, agx_nir_opt_uniform_stride_chains, m5);
+
    /* Now that loads carry an index, a select between two of them can choose
     * the index instead of the loaded data. Run it to a fixed point with the
     * cleanup below, so a chain of candidate selects collapses to one load.
@@ -11393,6 +11489,22 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                   ((agx3b || m5) ? nir_reassociate_loop_invariant : 0)))
       pre_fuse_dirty = false;
 
+   /* Split loop-invariant additive address chains and factor loop-invariant
+    * and linear-IV integer MAC reductions after reassociation (so
+    * reassociation cannot pull hoisted loop-invariant sums back into inner
+    * loops) and before preamble formation. */
+   {
+      bool factored = false;
+      NIR_PASS(factored, nir, agx_nir_opt_factor_loop_mac);
+      if (factored) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+         nir_divergence_analysis(nir);
+      }
+   }
+
    /* Lower fmin/fmax before optimizing preambles so we can see across uniform
     * expressions. Do it after nir_opt_reassociate because nir_opt_reassociate
     * should work on unlowered fmin/fmax.
@@ -11450,12 +11562,12 @@ pre_preamble:
 
       *preamble_size = sizes[0];
 
-      /* M5: check the constant program's constant-offset buffer reads past
+      /* AGX3: check the constant program's constant-offset buffer reads past
        * 255 bytes in words, so their ends stay immediates
        * (agx_nir_lower_word_bounds.c). The main program keeps its checks.
        * A uniform DMA launch drops the byte checks of the reads it copies by
        * matching their byte form, so leave those programs alone. */
-      if (m5 && !(dma_key && dma_key->g17p_uniform_dma)) {
+      if ((byte_indices || m5) && !(dma_key && dma_key->g17p_uniform_dma)) {
          bool words = false;
          NIR_PASS(words, nir, agx_nir_lower_word_bounds);
          if (words) {
@@ -11476,13 +11588,14 @@ pre_preamble:
          agx_remove_empty_preamble(nir);
       }
 
-      /* M5: let the main program's surviving robust reads of one structure
+      /* AGX3: let the main program's surviving robust reads of one structure
        * share their end computation (agx_nir_share_bounds.c). Run after
        * uniform DMA lowering so DMA still sees the original constant ends it
-       * can drop. M5 caps buffer descriptor sizes at INT32_MAX & ~15u. */
-      if (m5) {
+       * can drop. Only M5 caps buffer descriptor sizes (at INT32_MAX & ~15u),
+       * so only M5 also shares saturating ends. */
+      if (byte_indices || m5) {
          bool shared = false;
-         NIR_PASS(shared, nir, agx_nir_share_bounds, true);
+         NIR_PASS(shared, nir, agx_nir_share_bounds, m5);
          if (shared) {
             pre_fuse_dirty = true;
             NIR_PASS(_, nir, nir_opt_copy_prop);
@@ -11526,7 +11639,7 @@ pre_preamble:
       NIR_PASS(pre_fuse_dirty, nir, agx_nir_export_select_flags_as_halves, true);
 
    /* After the selects of trivial if-else statements exist. */
-   if (m5) {
+   if (byte_indices || m5) {
       bool folded = false;
       NIR_PASS(folded, nir, agx_nir_m5_split_or_selects);
       if (folded) {
@@ -11579,7 +11692,7 @@ pre_preamble:
       progress = false;
 
       NIR_PASS(progress, nir, agx_nir_fuse_algebraic_late);
-      if (m5)
+      if (byte_indices || m5)
          NIR_PASS(progress, nir, agx_nir_fuse_doubled_add);
       if (progress) {
          late_progress = true;
@@ -15450,7 +15563,8 @@ agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p, bool m5,
 
 static void
 agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_depth,
-                            bool g18g, bool m5, bool chip_g17p, bool post_lower)
+                            bool g18g, bool m5, bool chip_g17p, bool post_lower,
+                            bool defer_idiv)
 {
    if (!nir)
       return;
@@ -15556,10 +15670,15 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
     * provably nonnegative operands first so the remaining lowering drops
     * redundant sign fixups. Other integer division waits for the shader key
     * (agx_nir_lower_integer_division), which decides whether a preamble forms.
+    * The first preprocessing of a Vulkan compute shader may defer these passes
+    * so compute-kernel matchers see the raw idiv/udiv/irem/imod/umod by a
+    * constant; hk_lower_nir() preprocesses it again before backend compilation.
     */
-   NIR_PASS(_, nir, agx_nir_opt_iv_divmod);
-   NIR_PASS(_, nir, agx_nir_opt_nonneg_idiv);
-   NIR_PASS(_, nir, nir_opt_idiv_const, 16);
+   if (!defer_idiv) {
+      NIR_PASS(_, nir, agx_nir_opt_iv_divmod);
+      NIR_PASS(_, nir, agx_nir_opt_nonneg_idiv);
+      NIR_PASS(_, nir, nir_opt_idiv_const, 16);
+   }
 
    NIR_PASS(_, nir, nir_opt_deref);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
@@ -15639,14 +15758,22 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 void
 agx_preprocess_nir(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, false, false, false, false, false);
+   agx_preprocess_nir_internal(nir, false, false, false, false, false, false,
+                               false);
 }
 
 void
 agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip)
 {
    agx_preprocess_nir_internal(nir, true, true, false, false,
-                               chip == AGX_CHIP_G17P, false);
+                               chip == AGX_CHIP_G17P, false, false);
+}
+
+void
+agx_preprocess_nir_native_defer_idiv(nir_shader *nir, enum agx_chip chip)
+{
+   agx_preprocess_nir_internal(nir, true, true, false, false,
+                               chip == AGX_CHIP_G17P, false, true);
 }
 
 void
@@ -15659,7 +15786,8 @@ void
 agx_preprocess_nir_g18g(nir_shader *nir)
 {
    /* Select G18 trig without inheriting G17P subgroup/shared-memory rules. */
-   agx_preprocess_nir_internal(nir, false, false, true, false, false, false);
+   agx_preprocess_nir_internal(nir, false, false, true, false, false, false,
+                               false);
 }
 
 void
@@ -15672,7 +15800,7 @@ agx_preprocess_nir_post_lower(nir_shader *nir, enum agx_chip chip)
    const bool chip_g17p = chip == AGX_CHIP_G17P;
 
    agx_preprocess_nir_internal(nir, g17p, native_fragment_depth, g18g, m5,
-                               chip_g17p, true);
+                               chip_g17p, true, false);
 }
 
 static bool
@@ -17149,8 +17277,8 @@ agx_b2f_of(nir_def *d, unsigned d_comp, nir_def *c, unsigned c_comp,
  * for b in place of a). Minecraft's linear fog builds this per distance (0
  * before the start, 1 past the end, the ramp between); AGX has no boolean
  * OR or NOT, so the backend built it from three selects, two of them needing
- * their uniform comparand copied into a GPR on M5. Apple's fragment uses two
- * selects. The values are exact (b2f gives +0.0 and 1.0). M5 only, so other
+ * their uniform comparand copied into a GPR on AGX3. Apple's fragment uses two
+ * selects. The values are exact (b2f gives +0.0 and 1.0). AGX3 only, so other
  * targets keep their compiles.
  */
 static bool
@@ -17807,10 +17935,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          agx3_options.lower_bfloat16_conversions = true;
       }
       if (is_agx3b) {
-         /* G17P's saturate form is a standalone f32add.ep2 operation. */
+         /* AGX3B's saturate form is a standalone f32add.ep2 operation. */
          agx3_options.lower_fsat = false;
-         /* G17P lowers unsigned saturating subtract to compare/sub/select. */
-         agx3_options.lower_usub_sat = true;
       }
       if (source_iadd64)
          agx3_options.lower_int64_options |= nir_lower_iadd64;
@@ -17873,7 +17999,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    /* Only the one-sample AGX3B coverage path reads
     * bit 0 alone; sample loops and multisampled variants keep whole masks. */
    const bool discard_word =
-      (is_agx3b || key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+      is_agx3 &&
       nir->info.stage == MESA_SHADER_FRAGMENT &&
       MAX2(key->fs.nr_samples, 1) == 1 && !key->fs.inside_sample_loop;
 
@@ -18467,5 +18593,13 @@ agx_compile_shader_nir_preoptimized(nir_shader *nir, struct agx_shader_key *key,
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true, false, false);
+   agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
+                               false);
+}
+
+void
+agx_preprocess_nir_m5_defer_idiv(nir_shader *nir)
+{
+   agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
+                               true);
 }
