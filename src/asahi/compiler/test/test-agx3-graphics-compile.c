@@ -9073,6 +9073,112 @@ test_g17p_gallium_vertex_param_abi(void)
           AGX_ABI_VUNI_VERTEX_PARAMS(2) == 20;
 }
 
+static bool
+test_agx3_heavy_branch_loop_unroll_limit(void)
+{
+   /* 1. Loop-free shader reports !agx_nir_has_loop(). */
+   nir_builder b0 = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "loop-free-check");
+   nir_def *gid0 = nir_channel(&b0, nir_load_global_invocation_id(&b0, 32), 0);
+   nir_store_global(&b0, nir_iadd_imm(&b0, gid0, 1), nir_imm_int64(&b0, 0x1000));
+   if (agx_nir_has_loop(b0.shader)) {
+      ralloc_free(b0.shader);
+      return false;
+   }
+   ralloc_free(b0.shader);
+
+   /* 2. Multi-branch pure-ALU vector loop (pso_uber shape: 12 iterations,
+    * 2+ nested ifs, >512 scalarized ops total, zero memory loads) must be
+    * marked nir_loop_control_dont_unroll so pre-scalarization unrolling does
+    * not explode compile time. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "heavy-branch-unroll-limit");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *acc =
+      nir_local_variable_create(b.impl, glsl_vector_type(GLSL_TYPE_UINT, 4), "v");
+   nir_def *id = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_vec4(&b, id, nir_iadd_imm(&b, id, 1),
+                                   nir_iadd_imm(&b, id, 2),
+                                   nir_iadd_imm(&b, id, 3)), 0xf);
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_push_if(&b, nir_uge_imm(&b, i, 12));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, NULL);
+
+      nir_def *sel = nir_iand_imm(&b, nir_iadd(&b, id, i), 3);
+      nir_def *v = nir_load_var(&b, acc);
+      nir_push_if(&b, nir_ieq_imm(&b, sel, 0));
+      {
+         nir_def *t = v;
+         for (unsigned k = 0; k < 8; ++k)
+            t = nir_ixor(&b, nir_imul_imm(&b, t, 16777619u + k),
+                         nir_ushr_imm(&b, t, 3));
+         nir_store_var(&b, acc, t, 0xf);
+      }
+      nir_push_else(&b, NULL);
+      {
+         nir_push_if(&b, nir_ieq_imm(&b, sel, 1));
+         {
+            nir_def *t = v;
+            for (unsigned k = 0; k < 8; ++k)
+               t = nir_iadd(&b, nir_imul_imm(&b, t, 747796405u + k),
+                            nir_ishl_imm(&b, t, 5));
+            nir_store_var(&b, acc, t, 0xf);
+         }
+         nir_pop_if(&b, NULL);
+      }
+      nir_pop_if(&b, NULL);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, loop);
+   nir_def *fin = nir_load_var(&b, acc);
+   nir_store_global(&b, nir_channel(&b, fin, 0), nir_imm_int64(&b, 0x2000));
+   nir_lower_vars_to_ssa(b.shader);
+   nir_opt_copy_prop(b.shader);
+   nir_opt_dce(b.shader);
+   nir_remove_dead_variables(b.shader, nir_var_function_temp, NULL);
+
+   if (!agx_nir_has_loop(b.shader)) {
+      ralloc_free(b.shader);
+      return false;
+   }
+   agx_nir_limit_heavy_branch_unroll(b.shader);
+   bool marked_dont_unroll = (loop->control == nir_loop_control_dont_unroll);
+   ralloc_free(b.shader);
+   if (!marked_dont_unroll)
+      return false;
+
+   /* 3. Negative control: a short 4-iteration loop must remain unrollable. */
+   nir_builder b2 = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "short-loop-unroll-ok");
+   nir_variable *iv2 = nir_local_variable_create(b2.impl, glsl_uint_type(), "i");
+   nir_variable *acc2 = nir_local_variable_create(b2.impl, glsl_uint_type(), "a");
+   nir_store_var(&b2, iv2, nir_imm_int(&b2, 0), 1);
+   nir_store_var(&b2, acc2, nir_imm_int(&b2, 1), 1);
+   nir_loop *loop2 = nir_push_loop(&b2);
+   {
+      nir_def *i = nir_load_var(&b2, iv2);
+      nir_push_if(&b2, nir_uge_imm(&b2, i, 4));
+      nir_jump(&b2, nir_jump_break);
+      nir_pop_if(&b2, NULL);
+      nir_store_var(&b2, acc2, nir_iadd(&b2, nir_load_var(&b2, acc2), i), 1);
+      nir_store_var(&b2, iv2, nir_iadd_imm(&b2, i, 1), 1);
+   }
+   nir_pop_loop(&b2, loop2);
+   nir_store_global(&b2, nir_load_var(&b2, acc2), nir_imm_int64(&b2, 0x3000));
+   nir_lower_vars_to_ssa(b2.shader);
+   nir_opt_copy_prop(b2.shader);
+   nir_opt_dce(b2.shader);
+   nir_remove_dead_variables(b2.shader, nir_var_function_temp, NULL);
+   agx_nir_limit_heavy_branch_unroll(b2.shader);
+   bool kept_unrollable = (loop2->control == nir_loop_control_none);
+   ralloc_free(b2.shader);
+   return kept_unrollable;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -9548,6 +9654,7 @@ main(int argc, char **argv)
    RUN(test_agx3_native_relative_shuffles);
    RUN(test_g17p_half_rgb10_epilog);
    RUN(test_g17p_frag_sidefx_late_depth_once);
+   RUN(test_agx3_heavy_branch_loop_unroll_limit);
    RUN(test_g17c_txf_layer_saturation);
 #undef RUN
 

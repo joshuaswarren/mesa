@@ -388,3 +388,5 @@ bool agx_nir_uniform_idiv_applies(struct nir_alu_instr *alu,
                                   struct hash_table *cache);
 bool agx_nir_lower_integer_division(struct nir_shader *nir,
                                     bool forms_preamble);
+bool agx_nir_has_loop(const struct nir_shader *nir);
+bool agx_nir_limit_heavy_branch_unroll(struct nir_shader *nir);
