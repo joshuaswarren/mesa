@@ -326,7 +326,7 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
       return false;
    }
 
-   if ((three_d || info->arrayLayers > 1) && info->mipLevels != 1)
+   if (three_d && info->mipLevels != 1)
       return false;
 
    /* An RGBA8/BGRA8 UNORM mip chain the application never renders to is

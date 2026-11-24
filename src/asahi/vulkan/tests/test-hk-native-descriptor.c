@@ -780,7 +780,24 @@ check_lossless_layered_packets(void)
       if (layered) {
          REFUSE(p.layers = 0);
          REFUSE(p.layers = 65537);
-         REFUSE(p.levels = 2);
+         if (cases[i].dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY) {
+            p = original;
+            p.level = 1;
+            p.levels = 4;
+            p.unk_mipmapped = true;
+            assert(hk_pack_native_pbe(9, &packed, &p));
+            uint64_t mw[4];
+            memcpy(mw, packed.opaque, sizeof(mw));
+            assert(((mw[0] >> 58) & 1) == 1);
+            assert(((mw[0] >> 59) & 1) == 1);
+            assert((mw[2] & ((UINT64_C(1) << 44) - 1)) ==
+                   (p.acceleration_buffer >> 4));
+            assert(((mw[2] >> 44) & 0xf) == 1);
+            assert(((mw[2] >> 48) & 0xf) == 3);
+            REFUSE(p.levels = 17);
+         } else {
+            REFUSE(p.levels = 2);
+         }
       }
 #undef REFUSE
    }
