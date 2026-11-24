@@ -401,6 +401,191 @@ run(struct fixture *f, const char *name, unsigned change_every, unsigned batches
           sizeof(struct hk_root_descriptor_table));
 }
 
+static void
+mixed_gfx_compute_reset_reuse_regression(struct fixture *f)
+{
+   /* Verify the two independent capability predicates across chip families:
+    * stream-uploader split follows control-stream allocation layout, while
+    * descriptor-root retention follows the Ioto GPU-memory root contract. */
+   const enum agx_chip split_chips[] = {
+      AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G16G,
+      AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   };
+   const enum agx_chip nonsplit_chips[] = {
+      AGX_CHIP_G13G, AGX_CHIP_G13X, AGX_CHIP_G14G, AGX_CHIP_G14X,
+      AGX_CHIP_G18G,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(split_chips); ++i) {
+      CHECK(hk_cs_uses_dedicated_stream_uploader(split_chips[i]));
+      CHECK(hk_chip_uses_ioto_descriptor_root(split_chips[i]));
+   }
+   for (unsigned i = 0; i < ARRAY_SIZE(nonsplit_chips); ++i) {
+      CHECK(!hk_cs_uses_dedicated_stream_uploader(nonsplit_chips[i]));
+      CHECK(!hk_chip_uses_ioto_descriptor_root(nonsplit_chips[i]));
+   }
+
+   struct hk_cmd_buffer *cmd = &f->cmd;
+   struct hk_cmd_pool pool = {0};
+   pool.vk.base.device = &f->dev.vk;
+   for (unsigned i = 0; i < HK_CMD_BO_TYPE_COUNT; ++i) {
+      list_inithead(&pool.free_bos[i]);
+      list_inithead(&pool.free_spans[i]);
+   }
+
+   cmd->vk.pool = &pool.vk;
+   cmd->vk.ops = &hk_cmd_buffer_ops;
+   cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
+   cmd->vk.dynamic_graphics_state.ms.sample_locations =
+      &cmd->state.gfx._dynamic_sl;
+   list_inithead(&cmd->uploader.main.bos);
+   list_inithead(&cmd->uploader.usc.bos);
+   list_inithead(&cmd->uploader.root.bos);
+   list_inithead(&cmd->vdm_allocations);
+   list_inithead(&cmd->control_streams);
+   list_inithead(&cmd->alias_link);
+
+   void *streams_map = calloc(1, HK_CMD_BO_SIZE);
+   struct hk_api_shader *gs_api =
+      calloc(1, hk_api_shader_size(MESA_SHADER_GEOMETRY, false));
+   CHECK(streams_map && gs_api);
+   gs_api->vk.stage = MESA_SHADER_GEOMETRY;
+
+   const enum agx_chip m5_chips[] = {
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17P,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(m5_chips); ++i) {
+      const enum agx_chip chip = m5_chips[i];
+      f->dev.dev.chip = chip;
+      f->dev.dev.params.gpu_generation = agx_chip_g17_m5(chip) ? 17 : 16;
+
+      /* Run two full mixed graphics/compute record -> reset -> reuse cycles. */
+      for (unsigned cycle = 0; cycle < 2; ++cycle) {
+         hk_cmd_buffer_ops.reset(&cmd->vk, 0);
+         CHECK(cmd->uploader.main.map == NULL && cmd->uploader.main.offset == 0);
+         CHECK(cmd->uploader.streams.map == NULL &&
+               cmd->uploader.streams.offset == 0);
+         CHECK(cmd->state.gfx.descriptors.generation == 0);
+         CHECK(cmd->state.cs.descriptors.generation == 0);
+
+         /* Arm distinct main and control-stream upload windows. */
+         cmd->uploader.main.map = f->main_map;
+         cmd->uploader.main.base = 0x100000;
+         cmd->uploader.main.offset = 0;
+         cmd->uploader.main.capacity = HK_CMD_BO_SIZE;
+         cmd->uploader.root.map = f->root_map;
+         cmd->uploader.root.base = 0x200000;
+         cmd->uploader.root.offset = 0;
+         cmd->uploader.root.capacity = HK_CMD_BO_SIZE;
+         cmd->uploader.streams.map = streams_map;
+         cmd->uploader.streams.base = 0x500000;
+         cmd->uploader.streams.offset = 0;
+         cmd->uploader.streams.capacity = HK_CMD_BO_SIZE;
+
+         cmd->state.gfx.shaders[MESA_SHADER_VERTEX] = f->vs_api;
+         cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = f->fs_api;
+
+         /* Mixed graphics (VDM) + compute (CDM) control-stream roots must use
+          * uploader.streams without moving uploader.main. */
+         const struct agx_ptr main_before = hk_pool_alloc(cmd, 64, 16);
+         CHECK(main_before.gpu == 0x100000);
+         const uint32_t main_off_before = cmd->uploader.main.offset;
+
+         const size_t vdm_sz = hk_cs_root_size(chip, false);
+         const size_t cdm_sz = hk_cs_root_size(chip, true);
+         const struct agx_ptr vdm_root = hk_pool_cs_alloc(cmd, vdm_sz, 1024);
+         const struct agx_ptr cdm_root = hk_pool_cs_alloc(cmd, cdm_sz, 1024);
+         CHECK(vdm_root.gpu == 0x500000);
+         CHECK(cdm_root.gpu == 0x500000 + vdm_sz);
+         CHECK(cmd->uploader.streams.offset == vdm_sz + cdm_sz);
+         CHECK(cmd->uploader.main.offset == main_off_before);
+
+         /* First mixed bind after reset must dirty both graphics and compute
+          * roots (never falsely retained across a reset). */
+         bind(f, 16, VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT);
+         CHECK(cmd->state.gfx.descriptors.root_dirty);
+         CHECK(cmd->state.cs.descriptors.root_dirty);
+         CHECK(cmd->state.gfx.descriptors.generation == 1);
+         CHECK(cmd->state.cs.descriptors.generation == 1);
+
+         const uint64_t gfx_root =
+            hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         const uint64_t cs_root =
+            hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+         CHECK(gfx_root != 0 && cs_root != 0 && gfx_root != cs_root);
+         cmd->state.gfx.descriptors.root_dirty = false;
+         cmd->state.cs.descriptors.root_dirty = false;
+
+         /* Identical mixed re-bind: graphics retains its root as a no-op while
+          * compute (outside graphics retention) stays conservatively dirty. */
+         const uint64_t noops_before = cmd->state.upload_stats.descriptor_noops;
+         bind(f, 16, VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT);
+         CHECK(!cmd->state.gfx.descriptors.root_dirty);
+         CHECK(cmd->state.gfx.descriptors.generation == 1);
+         CHECK(cmd->state.upload_stats.descriptor_noops == noops_before + 1);
+         CHECK(cmd->state.cs.descriptors.root_dirty);
+         CHECK(cmd->state.cs.descriptors.generation == 2);
+
+         /* Dynamic-offset change dirties graphics root and advances generation. */
+         bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+         CHECK(cmd->state.gfx.descriptors.root_dirty);
+         CHECK(cmd->state.gfx.descriptors.generation == 2);
+         cmd->state.gfx.descriptors.root_dirty = false;
+
+         /* Shader-stage exclusion (geometry shader) disables retention even
+          * for an identical bind. */
+         cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] = gs_api;
+         bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+         CHECK(cmd->state.gfx.descriptors.root_dirty);
+         CHECK(cmd->state.gfx.descriptors.generation == 3);
+         cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] = NULL;
+      }
+   }
+
+   /* Non-split / non-Ioto chips (AGX2 G13G, G18G) keep cs roots on main and
+    * do not enable graphics descriptor-root retention. */
+   const enum agx_chip legacy_chips[] = {AGX_CHIP_G13G, AGX_CHIP_G18G};
+   for (unsigned i = 0; i < ARRAY_SIZE(legacy_chips); ++i) {
+      f->dev.dev.chip = legacy_chips[i];
+      f->dev.dev.params.gpu_generation =
+         legacy_chips[i] == AGX_CHIP_G13G ? 13 : 18;
+      hk_cmd_buffer_ops.reset(&cmd->vk, 0);
+      cmd->uploader.main.map = f->main_map;
+      cmd->uploader.main.base = 0x100000;
+      cmd->uploader.main.capacity = HK_CMD_BO_SIZE;
+      cmd->uploader.streams.map = streams_map;
+      cmd->uploader.streams.base = 0x500000;
+      cmd->uploader.streams.capacity = HK_CMD_BO_SIZE;
+      cmd->state.gfx.shaders[MESA_SHADER_VERTEX] = f->vs_api;
+      cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT] = f->fs_api;
+
+      const struct agx_ptr cs_root = hk_pool_cs_alloc(cmd, 4096, 1024);
+      CHECK(cs_root.gpu == 0x100000);
+      CHECK(cmd->uploader.streams.offset == 0);
+
+      bind(f, 16, VK_SHADER_STAGE_ALL_GRAPHICS);
+      cmd->state.gfx.descriptors.root_dirty = false;
+      bind(f, 16, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(cmd->state.gfx.descriptors.root_dirty);
+      CHECK(cmd->state.gfx.descriptors.generation == 2);
+   }
+
+   hk_cmd_buffer_ops.reset(&cmd->vk, 0);
+   cmd->vk.pool = NULL;
+   cmd->vk.ops = NULL;
+   free(gs_api);
+   free(streams_map);
+
+   f->dev.dev.chip = AGX_CHIP_G17P;
+   f->dev.dev.params.gpu_generation = 17;
+   cmd->uploader.main.map = f->main_map;
+   cmd->uploader.main.base = 0x100000;
+   cmd->uploader.main.capacity = HK_CMD_BO_SIZE;
+   cmd->uploader.root.map = f->root_map;
+   cmd->uploader.root.base = 0x200000;
+   cmd->uploader.root.capacity = HK_CMD_BO_SIZE;
+   reset(f);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -409,6 +594,7 @@ main(int argc, char **argv)
    struct fixture *f = fixture();
    correctness(f);
    reuse_correctness(f);
+   mixed_gfx_compute_reset_reuse_regression(f);
    run(f, "identical", 16, batches);
    run(f, "change_every_4", 4, batches);
    run(f, "change_every_draw", 1, batches);

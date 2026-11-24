@@ -6228,6 +6228,11 @@ agx_destroy_compute_blitter(struct pipe_context *ctx, struct asahi_blitter *bl)
       ctx->delete_compute_state(ctx, ent->data);
    }
 
+   for (unsigned i = 0; i < ARRAY_SIZE(bl->g17p_mip_cs); ++i) {
+      if (bl->g17p_mip_cs[i])
+         ctx->delete_compute_state(ctx, bl->g17p_mip_cs[i]);
+   }
+
    ctx->delete_sampler_state(ctx, bl->sampler[0]);
    ctx->delete_sampler_state(ctx, bl->sampler[1]);
 
@@ -9318,8 +9323,16 @@ agx_g17p_append_compute(struct agx_batch *batch,
     * launch's weak tail orders them on HAL200. On G15, a dependency inside
     * the stream is published only by the wide flush, so there every launch
     * ends in it, as Honeykrisp's software stages do. */
+   /* A dispatch of the driver's compute blitter feeds later reads through the
+    * texture unit as well as memory -- each compressed mip level is sampled by
+    * the dispatch that generates the next one -- so it ends in the strong
+    * flush everywhere, as the precompiled meta kernels' AGX_BARRIER_ALL and
+    * every Borealis launch do. */
    const uint8_t barrier_flags =
-      agx_chip_cdm_wide_visibility(dev->chip) ? 0x5 : 0;
+      agx_chip_cdm_wide_visibility(dev->chip) ||
+            batch->ctx->compute_blitter.active
+         ? 0x5
+         : 0;
    if (indirect_local) {
       /* The kernel that writes this grid is already its own dispatch earlier
        * in the stream, behind a full barrier, so the launch stands alone. */
@@ -16138,9 +16151,11 @@ agx_legalize_feedback_loops(struct agx_context *ctx)
 
          struct agx_resource *rsrc = ctx->stage[stage].textures[i]->rsrc;
 
+         /* The bit names the colour buffer, as every reader of
+          * batch->feedback indexes it by render target. */
          for (unsigned cb = 0; cb < ctx->framebuffer.nr_cbufs; ++cb) {
             agx_legalize_feedback_loop_surf(
-               ctx, rsrc, &ctx->framebuffer.cbufs[cb], PIPE_CLEAR_COLOR0 << i);
+               ctx, rsrc, &ctx->framebuffer.cbufs[cb], PIPE_CLEAR_COLOR0 << cb);
          }
 
          /* TODO: Separate stencil? */

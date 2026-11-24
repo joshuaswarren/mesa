@@ -32,6 +32,17 @@ hk_cs_root_size(enum agx_chip chip, bool compute)
                                                  : HK_CS_ROOT_SIZE;
 }
 
+/* Keep control-stream roots on their own bump cursor (cmd->uploader.streams)
+ * when the chip's control-stream allocation layout uses compact stream roots
+ * smaller than the legacy 64 KiB root, so allocating a VDM or CDM root cannot
+ * evict a partially used main upload BO mid-recording. */
+static inline bool
+hk_cs_uses_dedicated_stream_uploader(enum agx_chip chip)
+{
+   return hk_cs_root_size(chip, false) < HK_CS_ROOT_SIZE ||
+          hk_cs_root_size(chip, true) < HK_CS_ROOT_SIZE;
+}
+
 static inline bool
 hk_cs_space_fits(size_t remaining, size_t requested, size_t link_length)
 {

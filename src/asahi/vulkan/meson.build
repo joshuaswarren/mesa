@@ -112,6 +112,7 @@ hk_files = files(
   'hk_pack.c',
   'hk_pack.h',
   'hk_inline_blend_layout.h',
+  'hk_partial_mrt_hsr.h',
   'hk_queue.c',
   'hk_queue.h',
   'hk_queue_flush.h',
@@ -166,6 +167,21 @@ if with_tests
         inc_src, inc_asahi,
       ],
       dependencies : [idep_nir, idep_mesautil]),
+    suite : ['asahi'])
+
+  test('hk_partial_mrt_hsr',
+    executable('hk_partial_mrt_hsr_test',
+      files('tests/test-hk-partial-mrt-hsr.c'),
+      include_directories : [
+        include_directories('.'), inc_gallium, inc_gallium_aux, inc_include,
+        inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm,
+      ],
+      dependencies : [
+        idep_nir, idep_mesautil, idep_libagx,
+        idep_libagx_shaders_h, idep_agx_pack,
+        idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+      ],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout]),
     suite : ['asahi'])
 
   test('hk_memory_budget', executable('hk_memory_budget_test',
@@ -224,6 +240,18 @@ if with_tests
     files('tests/test-hk-root-size.c', 'hk_nir_root_size.c'),
     include_directories : [include_directories('.'), inc_include, inc_src],
     dependencies : [idep_nir, idep_mesautil]), suite : ['asahi'])
+
+  test('hk_vdm_indirect_count',
+    executable('hk_vdm_indirect_count_test',
+      files('tests/test-hk-vdm-indirect-count.c'),
+      include_directories : [
+        include_directories('.'), inc_include, inc_src, inc_asahi,
+      ],
+      dependencies : [idep_mesautil, idep_agx_pack],
+      link_with : [libasahi_lib],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden'),
+    suite : ['asahi'])
   # Unused recording functions require section garbage collection so the
   # test can link the production resolver without the rest of the driver.
   if ld_args_gc_sections.length() > 0

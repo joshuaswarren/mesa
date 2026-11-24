@@ -259,7 +259,7 @@ hk_GetMemoryHostPointerPropertiesEXT(
    struct hk_physical_device *pdev = hk_device_physical(dev);
 
    if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
-       !agx_has_userptr(&dev->dev))
+       !agx_has_host_import(&dev->dev))
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    const uint64_t alignment =
