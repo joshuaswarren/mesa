@@ -392,14 +392,16 @@ main()
       }
    }
 
-   /* Reductions over the node's eight lanes, and over each QTB block's four
-    * (children 0-3 and 4-7; a node of four or fewer has one block). Every
-    * lane takes part, in uniform control flow. */
-   uint loaded_bad = subgroupClusteredOr(my_bad, 8u);
-   vec3 node_lo = subgroupClusteredMin(my_lo, 8u);
-   vec3 node_hi = subgroupClusteredMax(my_hi, 8u);
+   /* Reductions over each QTB block's four lanes (children 0-3 and 4-7; a node
+    * of four or fewer has one block), then combine the two quads with a single
+    * XOR-4 shuffle to form the 8-lane node reduction. Every lane takes part,
+    * in uniform control flow. */
+   uint quad_bad = subgroupClusteredOr(my_bad, 4u);
+   uint loaded_bad = quad_bad | subgroupShuffleXor(quad_bad, 4u);
    vec3 block_lo = subgroupClusteredMin(my_lo, 4u);
    vec3 block_hi = subgroupClusteredMax(my_hi, 4u);
+   vec3 node_lo = min(block_lo, subgroupShuffleXor(block_lo, 4u));
+   vec3 node_hi = max(block_hi, subgroupShuffleXor(block_hi, 4u));
    uint type0 = subgroupShuffle(my_type, gl_SubgroupInvocationID & ~7u);
 
    /* Root word of child lane: its header bits, then its quantized bounds;
@@ -436,7 +438,8 @@ main()
       if (!ok)
          my_bad |= HK_AGX3_LEAF_RANGE;
    }
-   uint node_bad = subgroupClusteredOr(my_bad, 8u);
+   uint quad_node_bad = subgroupClusteredOr(my_bad, 4u);
+   uint node_bad = quad_node_bad | subgroupShuffleXor(quad_node_bad, 4u);
    if (!valid)
       return;
    if (node_bad != 0u) {
