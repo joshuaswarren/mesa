@@ -41,6 +41,10 @@ static const uint32_t leaf_spv[] = {
 #include "bvh/leaf.spv.h"
 };
 
+static const uint32_t leaf_morton32_spv[] = {
+#include "bvh/leaf_morton_32.spv.h"
+};
+
 static const uint32_t morton64_spv[] = {
 #include "bvh/morton_sort_64.spv.h"
 };
@@ -338,6 +342,8 @@ struct bvh_batch_state {
    bool any_hploc;
    bool any_lbvh;
    bool any_update;
+   bool any_fused_leaf_morton;
+   bool any_unfused_build;
 };
 
 struct vk_bvh_build_pipeline_layout_key {
@@ -683,6 +689,8 @@ build_leaves(VkCommandBuffer commandBuffer, struct vk_device *device,
    for (uint32_t i = 0; i < build_count; ++i) {
       if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
          continue;
+      if (states[i].fused_leaf_morton)
+         continue;
       if ((states[i].config.build_flags & VK_LEAF_BUILD_FLAGS) != build_flags)
          continue;
 
@@ -746,6 +754,118 @@ vk_cmd_build_as_leaves(VkCommandBuffer commandBuffer, struct vk_device *device,
                        leaves.config.build_flags & VK_LEAF_BUILD_FLAGS);
 }
 
+static bool
+vk_build_uses_fused_leaf_morton(struct vk_device *device,
+                                const struct vk_acceleration_structure_build_state *state,
+                                const VkAccelerationStructureBuildGeometryInfoKHR *build_info,
+                                const VkAccelerationStructureBuildRangeInfoKHR *build_range_infos,
+                                uint32_t leaf_node_count,
+                                const struct vk_acceleration_structure_build_args *args,
+                                uint32_t *out_geom_index)
+{
+   if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+      return false;
+   if (state->config.build_flags & VK_BUILD_FLAG_64BIT_KEYS)
+      return false;
+   if (state->indirect_addr != 0)
+      return false;
+   if (device->as_build_ops->build_leaves || device->as_build_ops->leaf_spirv_override)
+      return false;
+   if (leaf_node_count == 0 || leaf_node_count > LEAF_MORTON_WORKGROUP_SIZE)
+      return false;
+   if (args->subgroup_size < 8 || args->subgroup_size > 64 ||
+       (LEAF_MORTON_WORKGROUP_SIZE % args->subgroup_size) != 0)
+      return false;
+
+   uint32_t non_empty_count = 0;
+   uint32_t geom_index = 0;
+   for (uint32_t j = 0; j < build_info->geometryCount; ++j) {
+      if (build_range_infos[j].primitiveCount > 0) {
+         ++non_empty_count;
+         geom_index = j;
+      }
+   }
+   if (non_empty_count != 1)
+      return false;
+
+   *out_geom_index = geom_index;
+   return true;
+}
+
+static VkResult
+leaf_morton_generate(VkCommandBuffer commandBuffer, struct vk_device *device,
+                     struct vk_meta_device *meta,
+                     const struct vk_acceleration_structure_build_args *args,
+                     struct vk_acceleration_structure_build_state *states,
+                     uint32_t build_count, uint32_t build_flags)
+{
+   VkPipeline pipeline;
+   VkPipelineLayout layout;
+
+   VkResult result = vk_get_bvh_build_pipeline_spv(device, meta, VK_META_OBJECT_KEY_LEAF_MORTON,
+                                                   leaf_morton32_spv, sizeof(leaf_morton32_spv),
+                                                   sizeof(struct leaf_morton_args), args,
+                                                   build_flags, &pipeline,
+                                                   false /* unaligned_dispatch */);
+   if (result != VK_SUCCESS)
+      return result;
+
+   result = vk_get_bvh_build_pipeline_layout(device, meta, sizeof(struct leaf_morton_args), &layout);
+   if (result != VK_SUCCESS)
+      return result;
+
+   if (args->emit_markers) {
+      struct vk_acceleration_structure_build_marker marker = {
+         .step = VK_ACCELERATION_STRUCTURE_BUILD_STEP_MORTON_SORT,
+      };
+      device->as_build_ops->begin_debug_marker(commandBuffer, &marker);
+   }
+
+   const struct vk_device_dispatch_table *disp = &device->dispatch_table;
+   disp->CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+
+   for (uint32_t i = 0; i < build_count; ++i) {
+      if (!states[i].fused_leaf_morton)
+         continue;
+      if ((states[i].config.build_flags & VK_LEAF_MORTON_BUILD_FLAGS) != build_flags)
+         continue;
+
+      const VkAccelerationStructureBuildGeometryInfoKHR *build_info = states[i].build_info;
+      uint32_t j = states[i].fused_geom_index;
+      const VkAccelerationStructureGeometryKHR *geom =
+         build_info->pGeometries ? &build_info->pGeometries[j] : build_info->ppGeometries[j];
+      const VkAccelerationStructureBuildRangeInfoKHR *build_range_info = &states[i].build_range_infos[j];
+
+      uint64_t scratch_addr = build_info->scratchData.deviceAddress;
+      struct leaf_morton_args consts = {
+         .bvh = scratch_addr + states[i].scratch.ir_offset,
+         .header = scratch_addr + states[i].scratch.header_offset,
+         .ids_dst = scratch_addr + states[i].scratch.sort_buffer_offset[1],
+         .hploc_ranges = (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_HPLOC &&
+                          states[i].leaf_node_count > 1)
+                            ? (scratch_addr + states[i].scratch.hploc_ranges_offset)
+                            : 0,
+         .geom_data = vk_fill_geometry_data(build_info->type, 0, j, geom, build_range_info),
+         .leaf_count = states[i].leaf_node_count,
+      };
+
+      disp->CmdPushConstants(commandBuffer, layout,
+                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(consts), &consts);
+      disp->CmdDispatch(commandBuffer, 1, 1, 1);
+
+      states[i].scratch_offset = states[i].scratch.sort_buffer_offset[1];
+   }
+
+   if (args->emit_markers) {
+      struct vk_acceleration_structure_build_marker marker = {
+         .step = VK_ACCELERATION_STRUCTURE_BUILD_STEP_MORTON_SORT,
+      };
+      device->as_build_ops->end_debug_marker(commandBuffer, &marker);
+   }
+
+   return VK_SUCCESS;
+}
+
 static VkResult
 morton_generate(VkCommandBuffer commandBuffer, struct vk_device *device,
                 struct vk_meta_device *meta,
@@ -791,6 +911,8 @@ morton_generate(VkCommandBuffer commandBuffer, struct vk_device *device,
 
    for (uint32_t i = 0; i < build_count; ++i) {
       if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+         continue;
+      if (states[i].fused_leaf_morton)
          continue;
       if ((states[i].config.build_flags & VK_MORTON_BUILD_FLAGS) != build_flags)
          continue;
@@ -1374,23 +1496,33 @@ vk_cmd_build_acceleration_structures_indirect(VkCommandBuffer commandBuffer,
       }
 
       if (states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE) {
-         /* The internal node count is updated in lbvh_build_internal for LBVH
-          * and from the PLOC shader for PLOC. */
-         struct vk_ir_header header = {
-            .min_bounds = {0x7fffffff, 0x7fffffff, 0x7fffffff},
-            .max_bounds = {0x80000000, 0x80000000, 0x80000000},
-            .dispatch_size_y = 1,
-            .dispatch_size_z = 1,
-            .sync_data =
-               {
-                  .current_phase_end_counter = TASK_INDEX_INVALID,
-                  /* Will be updated by the first PLOC shader invocation */
-                  .task_counts = {TASK_INDEX_INVALID, TASK_INDEX_INVALID},
-               },
-         };
+         uint32_t fused_geom = 0;
+         if (vk_build_uses_fused_leaf_morton(device, &states[i], &pInfos[i], ppBuildRangeInfos[i],
+                                             leaf_node_count, args, &fused_geom)) {
+            states[i].fused_leaf_morton = true;
+            states[i].fused_geom_index = fused_geom;
+            states[i].leaf_node_count = leaf_node_count;
+            batch_state.any_fused_leaf_morton = true;
+         } else {
+            batch_state.any_unfused_build = true;
+            /* The internal node count is updated in lbvh_build_internal for LBVH
+             * and from the PLOC shader for PLOC. */
+            struct vk_ir_header header = {
+               .min_bounds = {0x7fffffff, 0x7fffffff, 0x7fffffff},
+               .max_bounds = {0x80000000, 0x80000000, 0x80000000},
+               .dispatch_size_y = 1,
+               .dispatch_size_z = 1,
+               .sync_data =
+                  {
+                     .current_phase_end_counter = TASK_INDEX_INVALID,
+                     /* Will be updated by the first PLOC shader invocation */
+                     .task_counts = {TASK_INDEX_INVALID, TASK_INDEX_INVALID},
+                  },
+            };
 
-         device->write_buffer_cp(commandBuffer, pInfos[i].scratchData.deviceAddress + states[i].scratch.header_offset,
-                                 &header, sizeof(header));
+            device->write_buffer_cp(commandBuffer, pInfos[i].scratchData.deviceAddress + states[i].scratch.header_offset,
+                                    &header, sizeof(header));
+         }
       }
    }
 
@@ -1400,60 +1532,62 @@ vk_cmd_build_acceleration_structures_indirect(VkCommandBuffer commandBuffer,
    bool flushed_compute_after_init_update_scratch = false;
 
    /* Wait for the write_buffer_cp to land before using in compute shaders */
-   device->flush_buffer_write_cp(commandBuffer);
-   device->dispatch_table.CmdPipelineBarrier(commandBuffer,
-                                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                             0, /* dependencyFlags */
-                                             1,
-                                             &(VkMemoryBarrier) {
-                                                .srcAccessMask = 0,
-                                                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-                                             }, 0, NULL, 0, NULL);
+   if (batch_state.any_unfused_build || batch_state.any_update) {
+      device->flush_buffer_write_cp(commandBuffer);
+      device->dispatch_table.CmdPipelineBarrier(commandBuffer,
+                                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                0, /* dependencyFlags */
+                                                1,
+                                                &(VkMemoryBarrier) {
+                                                   .srcAccessMask = 0,
+                                                   .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                                                }, 0, NULL, 0, NULL);
+   }
 
    if (batch_state.any_lbvh || batch_state.any_ploc || batch_state.any_hploc) {
-      VkResult result = vk_build_stage(build_leaves, commandBuffer, device, meta, args, states, infoCount,
-                                       VK_LEAF_BUILD_FLAGS, false);
-      if (result != VK_SUCCESS) {
-         free(states);
-         vk_command_buffer_set_error(cmd_buffer, result);
-         return;
-      }
+      VkResult result;
+      if (batch_state.any_unfused_build) {
+         result = vk_build_stage(build_leaves, commandBuffer, device, meta, args, states, infoCount,
+                                 VK_LEAF_BUILD_FLAGS, false);
+         if (result != VK_SUCCESS) {
+            free(states);
+            vk_command_buffer_set_error(cmd_buffer, result);
+            return;
+         }
 
-      if (args->emit_markers &&
-          getenv("ASAHI_G17P_AS_STOP_AFTER") &&
-          strcmp(getenv("ASAHI_G17P_AS_STOP_AFTER"), "leaves") == 0) {
-         free(states);
-         return;
-      }
-
-      for (uint32_t i = 0; i < infoCount; ++i) {
-         if (states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE) {
+         for (uint32_t i = 0; i < infoCount; ++i) {
+            if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE ||
+                states[i].fused_leaf_morton)
+               continue;
             device->cmd_fill_buffer_addr(commandBuffer, pInfos[i].scratchData.deviceAddress + states[i].scratch.sort_internal_offset,
                                          sizeof(struct morton_ready_count) * states[i].morton_sort_passes, 0x0);
+
+            if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_HPLOC) {
+               device->cmd_fill_buffer_addr(commandBuffer, pInfos[i].scratchData.deviceAddress + states[i].scratch.hploc_ranges_offset,
+                                            sizeof(uint32_t) * states[i].internal_node_count, 0xffffffff);
+            }
          }
 
-         if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_HPLOC) {
-            device->cmd_fill_buffer_addr(commandBuffer, pInfos[i].scratchData.deviceAddress + states[i].scratch.hploc_ranges_offset,
-                                         sizeof(uint32_t) * states[i].internal_node_count, 0xffffffff);
+         vk_bvh_build_barrier_transfer_to_compute(commandBuffer);
+         vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+
+         result = vk_build_stage(morton_generate, commandBuffer, device, meta, args, states, infoCount, VK_MORTON_BUILD_FLAGS, false);
+         if (result != VK_SUCCESS) {
+            free(states);
+            vk_command_buffer_set_error(cmd_buffer, result);
+            return;
          }
       }
 
-      vk_bvh_build_barrier_transfer_to_compute(commandBuffer);
-      vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
-
-      if (args->emit_markers &&
-          getenv("ASAHI_G17P_AS_STOP_AFTER") &&
-          strcmp(getenv("ASAHI_G17P_AS_STOP_AFTER"), "fills") == 0) {
-         free(states);
-         return;
-      }
-
-      result = vk_build_stage(morton_generate, commandBuffer, device, meta, args, states, infoCount, VK_MORTON_BUILD_FLAGS, false);
-      if (result != VK_SUCCESS) {
-         free(states);
-         vk_command_buffer_set_error(cmd_buffer, result);
-         return;
+      if (batch_state.any_fused_leaf_morton) {
+         result = vk_build_stage(leaf_morton_generate, commandBuffer, device, meta, args, states, infoCount,
+                                 VK_LEAF_MORTON_BUILD_FLAGS, false);
+         if (result != VK_SUCCESS) {
+            free(states);
+            vk_command_buffer_set_error(cmd_buffer, result);
+            return;
+         }
       }
 
       vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
