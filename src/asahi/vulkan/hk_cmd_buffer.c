@@ -27,6 +27,7 @@
 #include "asahi/compiler/agx_debug.h"
 #include "hk_agx3_vdm_decode.h"
 #include "asahi/lib/agx_ioto_load_core.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "hk_buffer.h"
 #include "hk_acceleration_structure.h"
 #include "hk_cmd_pool.h"
@@ -1148,11 +1149,16 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
 
 /* Whether any barrier in the dependency requests write availability (source
  * write accesses) or read/host visibility (destination read or host write
- * accesses). A barrier with neither is execution-only or WAR and requires
- * execution ordering rather than a cache flush/invalidation. */
-/* Queue-family ownership transfer releases/acquires carry their own source
- * write / destination read access masks per the Vulkan spec, so checking the
- * filtered access masks below covers them without a separate QFOT branch. */
+ * accesses), or performs a memory operation of its own. A barrier with none
+ * is execution-only or WAR and requires execution ordering rather than a
+ * cache flush/invalidation.
+ *
+ * Image layout transitions and queue family ownership transfers are such
+ * operations whatever the access masks say: a buffer or image barrier whose
+ * srcQueueFamilyIndex and dstQueueFamilyIndex differ is a release or an
+ * acquire, and Vulkan defines it through the queue family indices even when
+ * the other half's synchronization scope does not apply. Both stay
+ * conservative here, as in hk_barrier_classify_ex(). */
 static bool
 hk_dependency_needs_cache_flush(const VkDependencyInfo *info)
 {
@@ -1167,6 +1173,8 @@ hk_dependency_needs_cache_flush(const VkDependencyInfo *info)
 
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
       const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
+      if (b->srcQueueFamilyIndex != b->dstQueueFamilyIndex)
+         return true;
       if (vk_filter_src_access_flags2(
              vk_expand_src_stage_flags2(b->srcStageMask), b->srcAccessMask) ||
           vk_filter_dst_access_flags2(
@@ -1176,10 +1184,9 @@ hk_dependency_needs_cache_flush(const VkDependencyInfo *info)
 
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
       const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
-      /* Equal layouts, including UNDEFINED, are not transitions (sync2).
-       * Keep any real layout transition conservative and flush, matching
-       * hk_barrier.c. */
-      if (b->oldLayout != b->newLayout)
+      /* Equal layouts, including UNDEFINED, are not transitions (sync2). */
+      if (b->oldLayout != b->newLayout ||
+          b->srcQueueFamilyIndex != b->dstQueueFamilyIndex)
          return true;
       if (vk_filter_src_access_flags2(
              vk_expand_src_stage_flags2(b->srcStageMask), b->srcAccessMask) ||
@@ -1467,7 +1474,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    const bool alias_scope = hk_cmd_alias_scope(cmd);
    const bool weak_only =
       HK_PERF(dev, WEAKBARRIER) ||
-      (agx_chip_cdm_war_weak_barrier(dev->dev.chip) &&
+      (agx_chip_has_cap(dev->dev.chip, AGX_CAP_CDM_WAR_WEAK_BARRIER) &&
        !hk_dependency_needs_cache_flush(pDependencyInfo));
    if (cs && weak_only && !alias_scope &&
        src_kinds && !(src_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&

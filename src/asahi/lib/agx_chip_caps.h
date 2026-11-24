@@ -70,6 +70,14 @@ enum agx_chip_cap {
     * (HAL200); off on M5 (G17G/G17S/G17C), G15, G16, G18G, and AGX2 until
     * per-generation hardware A/B and CTS rows are collected. */
    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS = 1u << 10,
+
+   /* A compute or transfer barrier between work of one CDM stream that makes
+    * no write available and no access visible (execution-only or
+    * write-after-read) is met by the weak ordering record ending the
+    * preceding launch, which holds the next launch until every earlier one
+    * has finished, without the strong cache flush. Measured on G17P and M5
+    * (G17G, G17S, G17C); G15 and G16G keep the flush until measured there. */
+   AGX_CAP_CDM_WAR_WEAK_BARRIER = 1u << 11,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -85,12 +93,13 @@ enum agx_chip_cap {
    (AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                                \
     AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |                                        \
     AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_RESIDENCY_3D |      \
-    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS)
+    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
-    AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX)
+    AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
+    AGX_CAP_CDM_WAR_WEAK_BARRIER)
 
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.

@@ -1348,18 +1348,6 @@ agx_chip_local_read_tilebuffer(enum agx_chip chip)
           (enc == AGX_ISA_ENCODING_AGX3C && cs == AGX_CS_GENERATION_HAL300);
 }
 
-/* Whether an intra-CDM execution-only or WAR barrier (no source writes and no
- * destination reads) can retain the preceding launch's weak ordering record
- * without upgrading it to a strong cache flush. Keyed on the same native AGX3
- * CDM ordering-barrier predicate as agx_chip_elide_app_dispatch_barrier()
- * (G15, HAL200, and M5 HAL300), where the weak ordering record holds the next
- * launch until all prior dispatches complete. */
-static inline bool
-agx_chip_cdm_war_weak_barrier(enum agx_chip chip)
-{
-   return agx_chip_elide_app_dispatch_barrier(chip);
-}
-
 /* Stable name for diagnostics, e.g. "G15G". Never NULL. */
 static inline const char *
 agx_chip_name(enum agx_chip chip)
