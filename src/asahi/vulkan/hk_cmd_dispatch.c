@@ -759,6 +759,17 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
+   /* A dependency declared but not yet emitted on AGX2 lands on the
+    * trailing edge of the closing compute stream. Every stream close
+    * funnels here, so no caller can end the compute stream with a declared
+    * dependency left unemitted. This also keeps the drain out of
+    * hk_cmd_buffer.h: standalone test binaries stub this function. */
+   if (cs == cmd->current_cs.cs && cmd->state.cs.cdm_barrier_pending) {
+      cmd->state.cs.cdm_barrier_pending = false;
+      hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
+      hk_cdm_cache_flush(dev, cs);
+   }
+
    /* A dependency recorded while no compute stream holding work is open
     * records no flush: the first barrier of a command buffer, or one after a
     * timestamp closed the stream. The writes of this stream may then be read
@@ -817,10 +828,22 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
 
    hk_ensure_cs_has_space(cs->cmd, cs, 0x2000 /* TODO */);
    cs->stats.cmds++;
+
+   if (!HK_PERF(dev, ALWAYSCDMBARRIER) &&
+       cs->cmd->state.cs.cdm_barrier_pending) {
+      /* The app declared a memory dependency since the last launch: carry
+       * the full barrier ahead of this launch and clear it. Launches the
+       * app left unordered have no Vulkan-defined ordering to enforce, so
+       * their drain is skipped. */
+      cs->cmd->state.cs.cdm_barrier_pending = false;
+      hk_cdm_cache_flush(dev, cs);
+   }
+
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
 
-   hk_cdm_cache_flush(dev, cs);
+   if (HK_PERF(dev, ALWAYSCDMBARRIER))
+      hk_cdm_cache_flush(dev, cs);
 }
 
 void
@@ -838,6 +861,17 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
    }
 
    hk_dispatch_with_usc_launch(dev, cs, launch, usc, grid, local_size);
+
+   /* Software graphics stages communicate through memory: VS outputs,
+    * geometry counts and XFB bases are consumed by the next dispatch, and
+    * the application cannot supply barriers between these internal
+    * stages. Keep the flush-after-launch contract for them (as
+    * hk_dispatch_with_local_size does on AGX3); compute launches stay
+    * dependency-tracked. */
+   if (info->stage != MESA_SHADER_COMPUTE) {
+      hk_ensure_cs_has_space(cs->cmd, cs, AGX_CDM_BARRIER_LENGTH);
+      hk_cdm_cache_flush(dev, cs);
+   }
 }
 
 static bool

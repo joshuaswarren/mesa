@@ -97,6 +97,10 @@ static const struct debug_named_value hk_perf_options[] = {
    {"nobatch",   HK_PERF_NOBATCH,  "Disable submission batching"},
    {"norobust",  HK_PERF_NOROBUST, "Disable robustness"},
    {"weakbarrier", HK_PERF_WEAKBARRIER, "Keep ordering-only barriers between compute dispatches"},
+   {"alwayscdmbarrier", HK_PERF_ALWAYSCDMBARRIER,
+    "Unconditional per-launch CDM barrier (disable dependency tracking)"},
+   {"trackcdmbarrier", HK_PERF_TRACKCDMBARRIER,
+    "Opt into dependency-tracked per-launch CDM barriers"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -1106,6 +1110,16 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    }
 
    dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
+
+   /* Dependency-tracked per-launch CDM barriers default on the AGX2
+    * command-stream generation. Elsewhere the unconditional flush stays
+    * unless trackcdmbarrier opts in. */
+   const bool tracked_by_default =
+      agx_chip_command_stream_generation(pdev->dev.chip) ==
+      AGX_CS_GENERATION_AGX2;
+   if (!tracked_by_default && !HK_PERF(dev, TRACKCDMBARRIER))
+      dev->perftest |= HK_PERF_ALWAYSCDMBARRIER;
+
    dev->dev.compute_timeout_ms = instance->drirc.misc.compute_timeout_ms;
 
    /* Native graphics compiles the emulation in only once a custom border
