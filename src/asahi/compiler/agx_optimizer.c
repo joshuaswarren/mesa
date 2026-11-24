@@ -1726,6 +1726,13 @@ agx3b_ballot_compare_encodable(const agx_instr *def)
    }
 }
 
+static bool
+agx_ballot_compare_has_modifiers(const agx_instr *def)
+{
+   return def->src[0].abs || def->src[0].neg || def->src[1].abs ||
+          def->src[1].neg;
+}
+
 static void
 agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
@@ -1805,6 +1812,18 @@ agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
        def->src[1].type != AGX_INDEX_IMMEDIATE)
       return;
 
+   /* No AGX3 ballot compare takes a source modifier
+    * (agx3_emit_subgroup_ballot), but agx_optimizer_fmov folds |x| and -x
+    * into the comparison, which does encode them. A quad ballot keeps the
+    * comparison and lets lower_pseudo ballot its boolean, as above; a SIMD
+    * ballot takes the opposite comparison below.
+    */
+   const bool agx3_modifiers =
+      ctx->key && agx_isa_is_agx3(ctx->key->dev.encoding) &&
+      agx_ballot_compare_has_modifiers(def);
+   if (quad && agx3_modifiers)
+      return;
+
    /* Replace with a fused instruction since the # of sources changes */
    agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
 
@@ -1819,9 +1838,12 @@ agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
     * equality form it would otherwise take is measured wrong on G17P), signed
     * and float comparisons against anything but zero, `!(x < 0)`,
     * `!(x > 0xffff)`, and any 16-bit source but `x == 0`. Ballot the opposite compare instead, exactly as for a
-    * register operand below. */
-   if (!quad && ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-       !agx3b_ballot_compare_encodable(def)) {
+    * register operand below. The same applies on every AGX3 encoder to a
+    * comparison with a source modifier. */
+   if (!quad && ctx->key &&
+       ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         !agx3b_ballot_compare_encodable(def)) ||
+        agx3_modifiers)) {
       agx_index opposite = agx_temp(ctx, AGX_SIZE_16);
 
       if (def->op == AGX_OPCODE_ICMP) {
