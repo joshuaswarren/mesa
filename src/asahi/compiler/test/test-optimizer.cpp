@@ -1898,3 +1898,36 @@ TEST_F(Optimizer, Agx3bFoldsUnmodifiedHalfGprIntoFadd)
          EXPECT_EQ(I->src[1 - idx].size, AGX_SIZE_32) << c.name;
    }
 }
+
+/* Folding a half into an AGX3B f32 add leaves the other operand as the add's
+ * one word source. Compacting constants afterwards must not narrow it, or the
+ * add reads two halves, which no AGX3B form encodes: `float(h) + 5.15625`,
+ * whose constant is exact in f16, failed dEQP-GLES3 random shaders. */
+TEST_F(Optimizer, Agx3bHalfFaddKeepsOneWordSourceThroughCompaction)
+{
+   for (bool constant_first : {false, true}) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      b->shader->key = &key;
+
+      agx_index half = agx_preload(b, hx);
+      agx_index wide = agx_temp(b->shader, AGX_SIZE_32);
+      agx_fmov_to(b, wide, half);
+      agx_index c = agx_mov_imm(b, 32, fui(5.15625));
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *I = constant_first ? agx_fadd_to(b, out, c, wide)
+                                    : agx_fadd_to(b, out, wide, c);
+      agx_unit_test(b, out);
+
+      agx_optimize_and_dce(b->shader);
+      agx_opt_compact_constants(b->shader);
+
+      unsigned halves = 0;
+      for (unsigned s = 0; s < 2; ++s)
+         halves += I->src[s].size == AGX_SIZE_16;
+      EXPECT_EQ(I->src[constant_first ? 1 : 0].size, AGX_SIZE_16)
+         << constant_first;
+      EXPECT_EQ(halves, 1u) << constant_first;
+   }
+}
