@@ -1827,24 +1827,21 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
    /* Independent engines and physical render queues may finish
     * out of order. Publish API signals from the cumulative queue point,
-    * preserving independent execution while covering earlier work: on G17P
-    * in the ioctl when the kernel accepts a cumulative output
-    * (DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS), otherwise by a transfer after
-    * the ioctl. M5 always transfers, also for its chunked timelines.
+    * preserving independent execution while covering earlier work: in the
+    * ioctl whenever the kernel accepts a cumulative output
+    * (DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) and the submission does not split
+    * across per-chunk timeline points, otherwise by a transfer after the
+    * ioctl.
     */
-   const bool cumulative_signals =
-      dev->dev.chip == AGX_CHIP_G17P ||
-      (agx_chip_g17_m5(dev->dev.chip) &&
-       (dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES));
-   const bool kernel_cumulative = dev->dev.chip == AGX_CHIP_G17P &&
-      submit->signal_count > 0 &&
-      (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS);
-   const unsigned kernel_signal_count =
-      cumulative_signals && !kernel_cumulative ? 0 : submit->signal_count;
+   const bool cumulative_signals = hk_queue_uses_cumulative_signals(&dev->dev);
    const bool chunk_timelines = cumulative_signals &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS) &&
       agx_chip_g17_m5(dev->dev.chip) &&
       command_count > max_commands_per_submit(dev);
+   const bool kernel_cumulative = hk_queue_kernel_cumulative_supported(
+      &dev->dev, cumulative_signals, chunk_timelines, submit->signal_count);
+   const unsigned kernel_signal_count =
+      cumulative_signals && !kernel_cumulative ? 0 : submit->signal_count;
    const uint64_t point_count = chunk_timelines
       ? 1 + (command_count - 1) / max_commands_per_submit(dev) : 1;
    if (queue->drm.timeline_value > UINT64_MAX - point_count) {
@@ -3300,12 +3297,10 @@ hk_queue_create(struct hk_device *dev,
    for (unsigned i = 0; i < HK_QUEUE_SIBLINGS_MAX; ++i)
       queue->sib.id[i] = UINT32_MAX;
    queue->sib.count = 1;
-   if (dev->dev.chip == AGX_CHIP_G17P && !dev->dev.is_virtio &&
-       queue->sync.exact_prior &&
-       (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) &&
-       (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)) {
-      /* G17P firmware runs compute kicks of one context from sibling
-       * kernel queues at once, so independent compute streams overlap
+   if (hk_queue_sibling_compute_supported(&dev->dev,
+                                          queue->sync.exact_prior)) {
+      /* Firmware runs compute kicks of one context from sibling kernel queues
+       * at once, so independent compute streams overlap
        * (see HK_G17P_SIBLING_QUEUES). */
       queue->sib.count = HK_G17P_SIBLING_QUEUES;
    }
