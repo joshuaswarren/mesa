@@ -4969,18 +4969,6 @@ agx_lower_m5_alu_operands(agx_context *ctx)
          }
       }
 
-      if (I->op == AGX_OPCODE_IADD && I->shift && !I->saturate &&
-          I->dest[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_32 &&
-          I->src[1].neg && !I->src[1].abs) {
-         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-         agx_index source = I->src[1];
-         source.neg = false;
-         agx_index shifted = agx_temp(ctx, AGX_SIZE_32);
-         agx_bfi_to(&b, shifted, agx_zero(), source, agx_immediate(I->shift), 0);
-         I->src[1] = agx_neg(shifted);
-         I->shift = 0;
-         continue;
-      }
       if (I->op == AGX_OPCODE_FFS && I->src[0].size == AGX_SIZE_16) {
          agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
          I->src[0] = agx_pad_to_32(&b, I->src[0]);
@@ -5059,6 +5047,30 @@ agx_lower_m5_alu_operands(agx_context *ctx)
    }
 
    util_dynarray_fini(&comparands);
+}
+
+/* AGX3C has no shifted-subtract 32-bit IADD form (`iadd d32, s0, s1.neg, shift`).
+ * Run after agx_lower_agx3_widening_int() so 16-bit negated sources widened to
+ * 32-bit with a nonzero shift are legalized alongside originally 32-bit ones. */
+static void
+agx_lower_m5_shifted_neg_iadd(agx_context *ctx)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C)
+      return;
+
+   agx_foreach_instr_global_safe(ctx, I) {
+      if (I->op == AGX_OPCODE_IADD && I->shift && !I->saturate &&
+          I->dest[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_32 &&
+          I->src[1].neg && !I->src[1].abs) {
+         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+         agx_index source = I->src[1];
+         source.neg = false;
+         agx_index shifted = agx_temp(ctx, AGX_SIZE_32);
+         agx_bfi_to(&b, shifted, agx_zero(), source, agx_immediate(I->shift), 0);
+         I->src[1] = agx_neg(shifted);
+         I->shift = 0;
+      }
+   }
 }
 
 static void
@@ -13727,6 +13739,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
    /* Before materialization, which lowers the SIGNEXT this introduces. */
    AGX_PASS(ctx, agx_lower_agx3_widening_int);
+   agx_lower_m5_shifted_neg_iadd(ctx);
 
    if (key->dev.encoding != AGX_ISA_ENCODING_AGX2)
       agx_materialize_agx3_alu_constants(ctx);
