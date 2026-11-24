@@ -7340,11 +7340,50 @@ agx_update_descriptors(struct agx_batch *batch, struct agx_compiled_shader *cs)
       agx_upload_samplers(batch, cs, stage);
 
    struct agx_stage_uniforms *unif = &batch->stage_uniforms[stage];
-   const size_t size =
+   const size_t full_size =
       agx_stage_uniforms_size(agx_device(ctx->base.screen)->chip);
+   size_t size = full_size;
+
+   /* A vertex or fragment shader reads its stage table only through the
+    * ranges it pushes, unless it indexes the table dynamically, which loads
+    * the table address from the root table. Without such a load, upload only
+    * the pushed prefix of the table, or nothing when no range is pushed.
+    * Geometry and tessellation draws keep the whole table.
+    */
+   if (!ctx->gs && !ctx->in_tess &&
+       (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT)) {
+      const unsigned stage_table = AGX_SYSVAL_STAGE(stage);
+      const size_t table_ptr_off =
+         offsetof(struct agx_draw_uniforms, tables[stage_table]);
+      const size_t table_ptr_end = table_ptr_off + sizeof(uint64_t);
+      bool indirect = false;
+      size_t pushed_end = 0;
+
+      for (unsigned i = 0; i < cs->push_range_count; ++i) {
+         const struct agx_push_range *push = &cs->push[i];
+         if (push->table == AGX_SYSVAL_TABLE_ROOT) {
+            const size_t start = push->offset;
+            const size_t end = start + (size_t)push->length * 2;
+            if (start < table_ptr_end && end > table_ptr_off) {
+               indirect = true;
+               break;
+            }
+         } else if (push->table == stage_table) {
+            /* Native Ioto loaders move uniform dwords, so an odd 16-bit
+             * range reads one more half (agx_build_g17p_graphics_program).
+             */
+            const size_t end =
+               (size_t)push->offset + (size_t)ALIGN_POT(push->length, 2) * 2;
+            pushed_end = MAX2(pushed_end, end);
+         }
+      }
+
+      if (!indirect)
+         size = MIN2(ALIGN_POT(pushed_end, 16), full_size);
+   }
 
    batch->uniforms.tables[AGX_SYSVAL_STAGE(stage)] =
-      agx_pool_upload_aligned(&batch->pool, unif, size, 16);
+      size ? agx_pool_upload_aligned(&batch->pool, unif, size, 16) : 0;
 }
 
 static bool
