@@ -18956,3 +18956,54 @@ TEST_F(AGX3PackBinary, AGX3CMixedWidthIaddAndByteOffsetEndToEnd)
       ralloc_free(b.shader);
    }
 }
+
+/* Trimmed 16-bit vec3 loads (6 bytes) from global and global-constant memory
+ * (the lowered form of SSBO and UBO loads) must encode and pack cleanly on
+ * AGX2, AGX3B, and AGX3C. */
+TEST_F(AGX3PackBinary, TrimmedF16Vec3MemoryLoadsPack)
+{
+   const struct {
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S},
+   };
+
+   for (bool is_ubo : {false, true}) {
+      for (const auto &t : targets) {
+         SCOPED_TRACE(t.chip);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "f16_vec3_shrink");
+         nir_def *base = agx_test_load_preamble(&b, 1, 64, 0);
+         nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+         nir_def *addr = nir_iadd(&b, base, nir_u2u64(&b, nir_ishl_imm(&b, gid, 3)));
+         nir_def *loaded =
+            is_ubo
+               ? agx_test_load_global_constant(&b, 4, 16, addr, 8,
+                                               (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER))
+               : nir_load_global(&b, 4, 16, addr, .align_mul = 8);
+         nir_def *sum = nir_fadd(&b,
+            nir_fadd(&b, nir_channel(&b, loaded, 0), nir_channel(&b, loaded, 1)),
+            nir_channel(&b, loaded, 2));
+         nir_store_global(&b, sum, nir_iadd_imm(&b, addr, 4096), .align_mul = 2);
+         b.shader->info.workgroup_size[0] = 32;
+         b.shader->info.workgroup_size[1] = 1;
+         b.shader->info.workgroup_size[2] = 1;
+
+         agx_shader_key k = {};
+         k.dev.encoding = t.enc;
+         k.dev.chip = t.chip;
+         k.no_preamble = true;
+         k.reserved_preamble = 16;
+
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(b.shader, &k, &part));
+         EXPECT_GT(part.info.stats.instrs, 0u);
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
+   }
+}

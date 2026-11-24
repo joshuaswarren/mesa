@@ -11117,6 +11117,65 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
 }
 
 static bool
+agx_alu_constructs_vector(const nir_alu_instr *alu)
+{
+   if (alu->def.num_components > 1)
+      return true;
+
+   switch (alu->op) {
+   case nir_op_pack_32_2x16_split:
+   case nir_op_pack_64_2x32_split:
+   case nir_op_pack_32_4x8_split:
+   case nir_op_pack_half_2x16_split:
+   case nir_op_pack_half_2x16_rtz_split:
+   case nir_op_pack_32_2x16:
+   case nir_op_pack_64_2x32:
+   case nir_op_pack_32_4x8:
+   case nir_op_pack_64_4x16:
+   case nir_op_pack_half_2x16:
+   case nir_op_pack_unorm_2x16:
+   case nir_op_pack_snorm_2x16:
+   case nir_op_pack_unorm_4x8:
+   case nir_op_pack_snorm_4x8:
+   case nir_op_pack_uint_2x16:
+   case nir_op_pack_sint_2x16:
+   case nir_op_pack_uvec2_to_uint:
+   case nir_op_pack_uvec4_to_uint:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+agx_def_only_scalar_alu_uses(nir_def *def, unsigned depth)
+{
+   if (depth >= 4)
+      return false;
+
+   nir_foreach_use_including_if(use_src, def) {
+      if (nir_src_is_if(use_src))
+         return false;
+
+      nir_instr *use_instr = nir_src_use_instr(use_src);
+      if (use_instr->type != nir_instr_type_alu)
+         return false;
+
+      nir_alu_instr *alu = nir_instr_as_alu(use_instr);
+      if (agx_alu_constructs_vector(alu))
+         return false;
+
+      /* Scalar movs before copy-prop may forward a load channel into a vector
+       * constructor, phi, or intrinsic where register affinity still matters. */
+      if (alu->op == nir_op_mov &&
+          !agx_def_only_scalar_alu_uses(&alu->def, depth + 1))
+         return false;
+   }
+
+   return true;
+}
+
+static bool
 agx_nir_shrink_memory_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    switch (intr->intrinsic) {
@@ -11141,10 +11200,10 @@ agx_nir_shrink_memory_load(nir_builder *b, nir_intrinsic_instr *intr, void *data
         (ACCESS_BUFFER_DESCRIPTOR_AGX | ACCESS_VOLATILE)))
       return false;
 
-   nir_foreach_use(use_src, &intr->def) {
-      if (nir_src_use_instr(use_src)->type == nir_instr_type_intrinsic)
-         return false;
-   }
+   /* Leave non-ALU uses (intrinsics, phis, texture ops, ifs) and vector
+    * constructors/packers untouched so vector register affinity stays intact. */
+   if (!agx_def_only_scalar_alu_uses(&intr->def, 0))
+      return false;
 
    unsigned mask = nir_def_components_read(&intr->def);
    if (!mask)
@@ -11160,7 +11219,7 @@ agx_nir_shrink_memory_load(nir_builder *b, nir_intrinsic_instr *intr, void *data
    return true;
 }
 
-static bool
+bool
 agx_nir_shrink_memory_loads(nir_shader *nir)
 {
    return nir_shader_intrinsics_pass(nir, agx_nir_shrink_memory_load,
