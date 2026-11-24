@@ -620,6 +620,12 @@ struct agx_batch {
    bool g17p_resolve_reload;
    bool g17p_resolve_preserve;
 
+   /* M5: every colour attachment of this multi-attachment batch stays in the
+    * tilebuffer, moved by the multi-target tile programs
+    * (agx_g17g_mrt_resident). Otherwise attachment 0 alone does and the
+    * others are spilled (agx_g17g_mrt_one_pass). */
+   bool g17g_mrt_resident;
+
    /* Set when a descriptor or state in this batch has no proven native
     * encoding on the current chip. Nothing from the batch may reach the
     * hardware; agx_batch_submit drops it without a context reset.
@@ -1087,6 +1093,10 @@ struct agx_context {
     * (agx_g17g_mrt_spills_encodable), once it has been worked out. */
    bool g17g_mrt_spills_known, g17g_mrt_spills_ok;
 
+   /* Whether the bound framebuffer keeps every colour attachment in the
+    * tilebuffer (agx_g17g_mrt_resident), once it has been worked out. */
+   bool g17g_mrt_resident_known, g17g_mrt_resident_ok;
+
    /* G17G renders one layer at a time (agx_g17g_bind_layer): while a draw
     * or clear of a layered framebuffer is split, the bound framebuffer holds
     * one layer's views. g17g_layered_fb is the application's framebuffer
@@ -1335,6 +1345,7 @@ void agx_g17g_split_mrt_clear(struct agx_context *ctx, unsigned buffers,
                               uint8_t stencil_clear_mask,
                               const union pipe_color_union *color,
                               double depth, unsigned stencil);
+bool agx_g17g_mrt_resident(struct agx_context *ctx);
 
 static inline void
 agx_dirty_all(struct agx_context *ctx)

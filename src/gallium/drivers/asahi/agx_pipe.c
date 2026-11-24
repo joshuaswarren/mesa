@@ -1592,9 +1592,11 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
       return;
    }
 
-   /* G17G clears a colour attachment at a time, as it draws. */
+   /* G17G clears a colour attachment at a time, as it draws, unless it keeps
+    * them all in the tilebuffer (agx_g17g_mrt_resident): then the
+    * background program clears every attachment in the one render. */
    if (agx_chip_g17_m5(agx_device(pctx->screen)->chip) &&
-       ctx->framebuffer.nr_cbufs > 1) {
+       ctx->framebuffer.nr_cbufs > 1 && !agx_g17g_mrt_resident(ctx)) {
       if (agx_render_condition_check(ctx))
          agx_g17g_split_mrt_clear(ctx, buffers, color_clear_mask,
                                   stencil_clear_mask, color, depth, stencil);
