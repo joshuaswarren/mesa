@@ -135,8 +135,8 @@ lower(nir_builder *b, nir_instr *instr, void *data)
              : nir_vec(b, fixed, alu->def.num_components);
 }
 
-bool
-agx_nir_fma_rte_applies(const nir_shader *shader)
+static bool
+fma_rte_applies(const nir_shader *shader)
 {
    unsigned mode = shader->info.float_controls_execution_mode;
    return (mode & FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32) &&
@@ -165,7 +165,7 @@ fma_tininess_before_rounding(enum agx_chip chip)
 bool
 agx_nir_lower_fma_rte(nir_shader *shader, enum agx_chip chip)
 {
-   if (!fma_tininess_before_rounding(chip) || !agx_nir_fma_rte_applies(shader))
+   if (!fma_tininess_before_rounding(chip) || !fma_rte_applies(shader))
       return false;
    return nir_shader_lower_instructions(shader, filter, lower, NULL);
 }
