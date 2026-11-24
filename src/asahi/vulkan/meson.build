@@ -502,6 +502,24 @@ if with_tests
   )
 
   test(
+    'hk_g17p_decompress',
+    executable(
+      'hk_g17p_decompress_test',
+      files('tests/test-hk-g17p-decompress.c', 'hk_native_descriptor_pack.c'),
+      include_directories : [
+        include_directories('.'), inc_gallium, inc_gallium_aux, inc_include,
+        inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm,
+      ],
+      dependencies : [
+        idep_nir_headers, idep_mesautil, idep_libagx, idep_libagx_shaders_h,
+        idep_agx_pack, idep_vulkan_util, idep_vulkan_runtime_headers,
+      ],
+      link_with : [libasahi_lib, libasahi_layout],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'hk_g16s_compression',
     executable(
       'hk_g16s_compression_test',

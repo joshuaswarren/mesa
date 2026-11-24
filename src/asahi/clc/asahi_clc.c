@@ -327,8 +327,8 @@ target_supports_program(const char *target, const nir_function *func)
 {
    if (!strcmp(func->name, "libagx_m5_decompress_rgba16f"))
       return !strcmp(target, "g17g");
-   if (!strcmp(func->name, "libagx_g17p_decompress_16b"))
-      return !strcmp(target, "g17p");
+   if (!strcmp(func->name, "libagx_agx3_decompress"))
+      return agx_chip_native_hal200(target_chip(target));
 
    if (!strcmp(target, "g17g") &&
        !strncmp(func->name, "libagx_d3d12_", strlen("libagx_d3d12_")))
@@ -371,7 +371,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_gen1_as_empty") ||
           (strcmp(target, "g18g") &&
            !strcmp(func->name, "libagx_fast_clear")) ||
-          (!strcmp(target, "g17p") &&
+          (agx_chip_native_hal200(target_chip(target)) &&
            !strcmp(func->name, "libagx_reset_compression_metadata")) ||
           !strcmp(func->name, "libagx_copy_image") ||
           !strcmp(func->name, "libagx_mipmap_unorm8x4") ||
@@ -725,7 +725,7 @@ main(int argc, char **argv)
             }
 
             if (!strcmp(libfunc->name, "libagx_m5_decompress_rgba16f") ||
-                !strcmp(libfunc->name, "libagx_g17p_decompress_16b")) {
+                !strcmp(libfunc->name, "libagx_agx3_decompress")) {
                key.g17p_texture_uniform_base = AGX_ABI_AGX3_PRECOMP_ARG_HALFS;
                NIR_PASS(_, clone, nir_shader_intrinsics_pass,
                         lower_m5_decompress_load, nir_metadata_none, NULL);

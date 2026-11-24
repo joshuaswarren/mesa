@@ -63,6 +63,8 @@
 
 #include "asahi/genxml/agx_pack.h"
 #include "asahi/libagx/compression.h"
+#include "hk_g17p_decompress.h"
+#include "hk_native_descriptor_pack.h"
 #include "asahi/libagx/libagx.h"
 #include "asahi/libagx/query.h"
 #include "asahi/libagx/tessellator.h"
@@ -3560,19 +3562,16 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
  * Compressed multisample targets are at most eight bytes, so all eight fit
  * the 4x sample budget (64 bytes) and do not spill when allocated first.
  *
- * G17P cannot spill a compressed MSAA/1-8 B target (no MSAA/1-8 B
- * decompression program), and compresses multisample colour only at 2x on M4
- * Pro. A 2x tile holds 64 bytes a sample (32 KiB over 16x16 pixels), so
- * allocated first they fit too.
- *
- * A multiview pass has an eight-byte budget, so over that it would spill one:
- * 2x colour is not compressed on a device with the multiview feature
- * (hk_g17p_multiview_spill_risk()). */
+ * On native HAL200 (G16G/G17P), spilled compressed colour attachments
+ * decompress in place via libagx_agx3_decompress before the render pass.
+ * Keeping compressed MSAA targets resident when they fit avoids unnecessary
+ * decompression. */
 static uint8_t
 hk_resident_attachments(const struct hk_device *dev,
                         const struct hk_rendering_state *render)
 {
-   if (!agx_chip_g17p_or_m5(dev->dev.chip) ||
+   if (!(agx_chip_native_hal200(dev->dev.chip) ||
+         agx_chip_g17_m5(dev->dev.chip)) ||
        render->tilebuffer.nr_samples <= 1)
       return 0;
 
@@ -4527,6 +4526,119 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    return true;
 }
 
+static bool
+hk_hal200_decompress_attachment(struct hk_cmd_buffer *cmd,
+                                struct hk_device *dev,
+                                const struct hk_rendering_state *render,
+                                const struct hk_image *image,
+                                struct ail_layout *layout,
+                                unsigned level, unsigned layer,
+                                uint32_t layer_count, uint64_t base,
+                                VkAttachmentLoadOp load_op,
+                                VkRenderingFlags rendering_flags,
+                                bool incomplete_render_area)
+{
+   if (!hk_g17p_decompress_image_type_supported(image->vk.image_type))
+      return false;
+
+   const uint16_t width_tl = ail_metadata_width_tl(layout, level);
+   const uint16_t height_tl = ail_metadata_height_tl(layout, level);
+   const uint64_t metadata =
+      base + layout->metadata_offset_B +
+      layout->level_offsets_compressed_B[level] +
+      ((uint64_t)layer * layout->compression_layer_stride_B);
+   const uint64_t tile_uncompressed = ail_tile_mode_uncompressed(layout->format);
+
+   /* A resumed dynamic render pass preserves pixels rendered by the suspended
+    * pass even when loadOp is CLEAR/DONT_CARE, and a sparse multiview mask
+    * leaves untouched layers live, so never drop existing tiles in those cases. */
+   const bool sparse_view_mask =
+      render->view_mask &&
+      render->view_mask != BITFIELD64_MASK(layer_count);
+   const bool discard =
+      !incomplete_render_area && !sparse_view_mask &&
+      !(rendering_flags & VK_RENDERING_RESUMING_BIT) &&
+      u_minify(image->vk.extent.width, level) == render->cr.width &&
+      u_minify(image->vk.extent.height, level) == render->cr.height &&
+      (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
+       load_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
+   if (discard) {
+      libagx_reset_compression_metadata(
+         cmd, agx_3d(width_tl, height_tl, layer_count),
+         AGX_BARRIER_ALL | AGX_PREGFX, metadata, tile_uncompressed,
+         layout->compression_layer_stride_B / 8, width_tl, height_tl);
+      return true;
+   }
+
+   uint32_t pack_mode;
+   const enum agx_channels channels = ail_pixel_format[layout->format].channels;
+   if (layout->tiling != AIL_TILING_GPU || !dev->samplers.table.bo ||
+       (layout->sample_count_sa != 1 && layout->sample_count_sa != 2 &&
+        layout->sample_count_sa != 4) ||
+       !hk_g17p_decompress_pack_mode(channels, &pack_mode))
+      return false;
+
+   const bool msaa = layout->sample_count_sa > 1;
+   const bool layered = layer_count > 1;
+   struct AGX_TEXTURE cfg = {
+      AGX_TEXTURE_header,
+      .dimension = msaa
+                      ? (layered ? AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED
+                                 : AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED)
+                      : (layered ? AGX_TEXTURE_DIMENSION_2D_ARRAY
+                                 : AGX_TEXTURE_DIMENSION_2D),
+      .layout = AGX_LAYOUT_GPU,
+      .channels = channels,
+      .type = channels == AGX_CHANNELS_R5G6B5 ? AGX_TEXTURE_TYPE_UNORM
+                                              : AGX_TEXTURE_TYPE_UINT,
+      .swizzle_r = AGX_CHANNEL_R,
+      .swizzle_g = AGX_CHANNEL_G,
+      .swizzle_b = AGX_CHANNEL_B,
+      .swizzle_a = AGX_CHANNEL_A,
+      .address = base + ail_get_layer_offset_B(layout, layer),
+      .width = layout->width_px,
+      .height = layout->height_px,
+      .first_level = level,
+      .last_level = level,
+      .unk_mipmapped = layout->levels > 1,
+      .compressed = true,
+      .extended = true,
+      .acceleration_buffer =
+         base + layout->metadata_offset_B +
+         ((uint64_t)layer * layout->compression_layer_stride_B),
+      .depth = layered ? layer_count : 1,
+      .page_aligned_layers = layout->page_aligned_layers,
+   };
+   if (msaa)
+      cfg.samples = agx_translate_sample_count(layout->sample_count_sa);
+
+   struct hk_native_texture_descriptor tex_desc;
+   if (!hk_pack_native_texture(agx_chip_descriptor_generation(dev->dev.chip),
+                               &tex_desc, &cfg))
+      return false;
+
+   const uint64_t desc_va =
+      hk_pool_upload(cmd, &tex_desc, sizeof(tex_desc.opaque), 64);
+   if (!desc_va)
+      return false;
+
+   const struct ail_tile tile = layout->tilesize_el[level];
+   const uint32_t level_width_px = u_minify(layout->width_px, level);
+   const uint32_t level_height_px = u_minify(layout->height_px, level);
+   struct agx_grid grid = agx_3d(width_tl * 32, height_tl, layer_count);
+
+   libagx_agx3_decompress(
+      cmd, grid, AGX_BARRIER_ALL | AGX_PREGFX, desc_va,
+      dev->samplers.table.bo->va->addr, metadata,
+      base + ail_get_layer_level_B(layout, layer, level), tile_uncompressed,
+      layout->layer_stride_B, layout->compression_layer_stride_B / 8,
+      align(level_width_px, tile.width_el), level_width_px, level_height_px,
+      width_tl, height_tl, tile.width_el, tile.height_el,
+      ail_metadata_tile(layout).height_el, 0, pack_mode,
+      util_logbase2(layout->sample_count_sa), layered ? 1 : 0);
+   return true;
+}
+
 static void
 hk_begin_rendering(VkCommandBuffer commandBuffer,
                    const VkRenderingInfo *pRenderingInfo)
@@ -5082,6 +5194,25 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                unsigned level = view->vk.base_mip_level;
                unsigned layer = view->vk.base_array_layer;
                uint64_t base = hk_image_base_address(image, image_plane);
+
+               if (agx_chip_native_hal200(dev->dev.chip)) {
+                  if (!hk_hal200_decompress_attachment(
+                         cmd, dev, render, image, layout, level, layer,
+                         layer_count, base,
+                         pRenderingInfo->pColorAttachments[i].loadOp,
+                         pRenderingInfo->flags, incomplete_render_area)) {
+                     mesa_loge_once("HAL200: spilled render pass with a "
+                                    "compressed attachment (%s, %ux) is "
+                                    "unsupported",
+                                    util_format_short_name(layout->format),
+                                    layout->sample_count_sa);
+                     vk_command_buffer_set_error(&cmd->vk,
+                                                 VK_ERROR_FEATURE_NOT_PRESENT);
+                     return;
+                  }
+                  continue;
+               }
+
                const uint16_t width_tl = ail_metadata_width_tl(layout, level);
                const uint16_t height_tl = ail_metadata_height_tl(layout, level);
 
@@ -5099,61 +5230,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                   (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
                    load_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
 
-               if (dev->dev.chip == AGX_CHIP_G17P) {
-                  /* A resumed dynamic render pass preserves pixels rendered by
-                   * the suspended pass even when the attachment's loadOp is
-                   * CLEAR or DONT_CARE, so never drop existing tiles there. */
-                  const bool g17p_discard =
-                     discard &&
-                     !(pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT);
-                  const uint32_t read_index =
-                     view->planes[plane].emrt_read_heap_index;
-                  if (layout->sample_count_sa != 1 ||
-                      ail_get_blocksize_B(layout) != 16 ||
-                      (layout->layer_stride_B % 16) != 0 ||
-                      (!g17p_discard &&
-                       (!dev->sampled_images.base_va ||
-                        !dev->samplers.table.bo ||
-                        !read_index ||
-                        read_index >= dev->sampled_images.alloc))) {
-                     mesa_loge_once("G17P: spilled render pass with a compressed "
-                                    "attachment (%s, %ux) is unsupported",
-                                    util_format_short_name(layout->format),
-                                    layout->sample_count_sa);
-                     vk_command_buffer_set_error(&cmd->vk,
-                                                 VK_ERROR_FEATURE_NOT_PRESENT);
-                     return;
-                  }
-
-                  const uint64_t metadata =
-                     base + layout->metadata_offset_B +
-                     layout->level_offsets_compressed_B[level] +
-                     (layer * layout->compression_layer_stride_B);
-                  if (g17p_discard) {
-                     libagx_reset_compression_metadata(
-                        cmd, agx_3d(width_tl, height_tl, layer_count),
-                        AGX_BARRIER_ALL | AGX_PREGFX, metadata,
-                        ail_tile_mode_uncompressed(layout->format),
-                        layout->compression_layer_stride_B / 8, width_tl,
-                        height_tl);
-                  } else {
-                     const struct ail_tile tile = layout->tilesize_el[level];
-                     const uint32_t level_w = u_minify(layout->width_px, level);
-                     const uint32_t level_h =
-                        u_minify(layout->height_px, level);
-                     libagx_g17p_decompress_16b(
-                        cmd, grid, AGX_BARRIER_ALL | AGX_PREGFX,
-                        dev->sampled_images.base_va,
-                        dev->samplers.table.bo->va->addr, metadata,
-                        base + ail_get_layer_level_B(layout, layer, level),
-                        ail_tile_mode_uncompressed(layout->format),
-                        read_index,
-                        layout->compression_layer_stride_B / 8,
-                        layout->layer_stride_B / 16, width_tl, height_tl,
-                        level_w, level_h, align(level_w, tile.width_el),
-                        tile.width_el, tile.height_el);
-                  }
-               } else if (agx_chip_g17_m5(dev->dev.chip)) {
+               if (agx_chip_g17_m5(dev->dev.chip)) {
                   if (layout->format != PIPE_FORMAT_R16G16B16A16_FLOAT ||
                       (layout->sample_count_sa != 2 &&
                        layout->sample_count_sa != 4) ||

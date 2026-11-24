@@ -402,12 +402,18 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
       cfg.unk_mipmapped = layout->levels > 1;
       cfg.srgb_2_channel = cfg.srgb && util_format_colormask(desc) == 0x3;
 
-      if (layout->compressed) {
+      /* On native HAL200 (G16G/G17P), spilled compressed colour attachments are
+       * decompressed in place before the render pass and written through an
+       * uncompressed eMRT PBE. Keeping emrt_texture uncompressed avoids
+       * compressed-read vs uncompressed-write texture-cache hazards during
+       * in-pass blending. */
+      const bool compressed_tex =
+         layout->compressed &&
+         !(agx_chip_native_hal200(dev->dev.chip) &&
+           usage == HK_DESC_USAGE_EMRT);
+      if (compressed_tex) {
          cfg.compressed = true;
          cfg.extended = true;
-      }
-
-      if (layout->compressed) {
          cfg.acceleration_buffer = base_addr + layout->metadata_offset_B +
                                    (layer * layout->compression_layer_stride_B);
       }
