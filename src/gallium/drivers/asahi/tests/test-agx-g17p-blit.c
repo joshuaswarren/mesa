@@ -36,6 +36,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "drm-uapi/drm_fourcc.h"
 #include "pipe/p_context.h"
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
@@ -1244,9 +1245,12 @@ check_agx3_compute_mipmap_case(struct pipe_screen *screen,
       .last_level = last_level,
       .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
    };
-   struct pipe_resource *tex = screen->resource_create(screen, &tmpl);
+   const uint64_t uncomp_mod = DRM_FORMAT_MOD_APPLE_GPU_TILED;
+   struct pipe_resource *tex =
+      screen->resource_create_with_modifiers(screen, &tmpl, &uncomp_mod, 1);
    if (!tex) {
-      fprintf(stderr, "mipmap %s: resource_create failed\n", name);
+      fprintf(stderr, "mipmap %s: resource_create_with_modifiers failed\n",
+              name);
       return false;
    }
 
@@ -1426,7 +1430,8 @@ check_agx3_compute_mipmap(struct pipe_screen *screen, struct pipe_context *pctx,
    if (!agx_chip_native_agx3(mdev->chip))
       return true;
 
-   /* Verify predicate accept/reject matrix. */
+   /* Verify predicate accept/reject matrix on an explicitly uncompressed
+    * GPU-tiled mipmap chain. */
    const struct pipe_resource mip_tmpl = {
       .target = PIPE_TEXTURE_2D,
       .format = PIPE_FORMAT_R8G8B8A8_UNORM,
@@ -1437,9 +1442,11 @@ check_agx3_compute_mipmap(struct pipe_screen *screen, struct pipe_context *pctx,
       .last_level = 6,
       .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
    };
-   struct pipe_resource *mip_tex = screen->resource_create(screen, &mip_tmpl);
+   const uint64_t uncomp_mod = DRM_FORMAT_MOD_APPLE_GPU_TILED;
+   struct pipe_resource *mip_tex =
+      screen->resource_create_with_modifiers(screen, &mip_tmpl, &uncomp_mod, 1);
    if (!mip_tex) {
-      fprintf(stderr, "mip_tex resource_create failed\n");
+      fprintf(stderr, "mip_tex resource_create_with_modifiers failed\n");
       return false;
    }
    struct agx_resource *mrsrc = agx_resource(mip_tex);
@@ -1456,6 +1463,27 @@ check_agx3_compute_mipmap(struct pipe_screen *screen, struct pipe_context *pctx,
       return false;
    }
    pipe_resource_reference(&mip_tex, NULL);
+
+   /* Default private mipmapped 2D RGBA8 textures compress on G17P and are
+    * rejected by the uncompressed CDM mipchain so util_gen_mipmap() preserves
+    * compression. */
+   struct pipe_resource *priv_mip_tex =
+      screen->resource_create(screen, &mip_tmpl);
+   if (!priv_mip_tex) {
+      fprintf(stderr, "priv_mip_tex resource_create failed\n");
+      return false;
+   }
+   struct agx_resource *priv_mrsrc = agx_resource(priv_mip_tex);
+   const bool expect_comp = mdev->chip == AGX_CHIP_G17P;
+   if (priv_mrsrc->layout.compressed != expect_comp ||
+       (expect_comp && agx_generate_mipmap_agx3_supported(
+                          mdev, priv_mrsrc, PIPE_FORMAT_R8G8B8A8_UNORM, 0, 6, 0,
+                          0))) {
+      fprintf(stderr, "AGX3 private mipchain compression guard failed\n");
+      pipe_resource_reference(&priv_mip_tex, NULL);
+      return false;
+   }
+   pipe_resource_reference(&priv_mip_tex, NULL);
 
    if (!check_agx3_compute_mipmap_case(screen, pctx, "even_64x64_fused",
                                        PIPE_TEXTURE_2D, 64, 64, 1, 6, true,
