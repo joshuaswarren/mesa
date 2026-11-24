@@ -2718,6 +2718,48 @@ agx_compile_nir(struct agx_device *dev, nir_shader *nir,
                                epilog, attrib_components_read, false);
 }
 
+/* Set key->g17p_tile_partitions to the colour tile partitions a fragment
+ * epilog's tile accesses address. */
+static void
+agx_epilog_tile_partitions(const struct agx_fs_epilog_key *epilog,
+                           unsigned nr_samples, struct agx_shader_key *key)
+{
+   const struct agx_tilebuffer_layout tib =
+      agx_build_tilebuffer_layout_with_limits(
+         epilog->rt_formats, ARRAY_SIZE(epilog->rt_formats), nr_samples, true,
+         epilog->max_sample_size_B, epilog->max_bytes_per_tile,
+         epilog->max_samples_per_tile);
+
+   BITSET_ZERO(key->g17p_tile_partitions);
+   for (unsigned rt = 0; rt < ARRAY_SIZE(epilog->rt_formats); ++rt) {
+      if (tib.logical_format[rt] != PIPE_FORMAT_NONE && !tib.spilled[rt])
+         BITSET_SET(key->g17p_tile_partitions, tib._offset_B[rt]);
+   }
+   if (BITSET_COUNT(key->g17p_tile_partitions) < 2)
+      BITSET_ZERO(key->g17p_tile_partitions);
+}
+
+/* Keep a fragment main's NIR and backend key as its backend compile takes
+ * them, for agx_compile_inline_blend_fs(). Without memory the main simply
+ * keeps blending in its split epilog. */
+static void
+agx_keep_inline_blend_nir(struct agx_compiled_shader *compiled,
+                          const nir_shader *nir,
+                          const struct agx_shader_key *key)
+{
+   struct blob blob;
+   blob_init(&blob);
+   nir_serialize(&blob, nir, true);
+   if (blob.out_of_memory) {
+      blob_finish(&blob);
+      return;
+   }
+
+   blob_finish_get_buffer(&blob, &compiled->inline_blend_nir,
+                          &compiled->inline_blend_nir_size);
+   compiled->inline_blend_key = *key;
+}
+
 /* As agx_compile_nir(); g18_native_mixed marks a fragment epilog of a G18
  * single-sample mixed-format tile (run 1139) for the backend's tile protocol. */
 static struct agx_compiled_shader *
@@ -2858,18 +2900,8 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
       key.fs.nr_samples = nr_samples;
    }
 
-   if (epilog) {
-      const struct agx_tilebuffer_layout tib = agx_build_tilebuffer_layout_with_limits(
-         epilog->rt_formats, ARRAY_SIZE(epilog->rt_formats), nr_samples, true,
-         epilog->max_sample_size_B, epilog->max_bytes_per_tile,
-         epilog->max_samples_per_tile);
-      for (unsigned rt = 0; rt < ARRAY_SIZE(epilog->rt_formats); ++rt) {
-         if (tib.logical_format[rt] != PIPE_FORMAT_NONE && !tib.spilled[rt])
-            BITSET_SET(key.g17p_tile_partitions, tib._offset_B[rt]);
-      }
-      if (BITSET_COUNT(key.g17p_tile_partitions) < 2)
-         BITSET_ZERO(key.g17p_tile_partitions);
-   }
+   if (epilog)
+      agx_epilog_tile_partitions(epilog, nr_samples, &key);
 
    if (key.g17p_emrt) {
       nir_function_impl *impl = nir_shader_get_entrypoint(nir);
@@ -2889,6 +2921,17 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
       }
    }
 
+   /* A native AGX3 fragment main that a colour epilog follows may later be
+    * compiled together with it (agx_compile_inline_blend_fs()), so keep it as
+    * the backend takes it. A main that runs per sample or reads the tile
+    * itself always keeps its split epilog. */
+   if (agx_chip_native_agx3(dev->chip) && agx_chip_native_preamble(dev->chip) &&
+       stage == MESA_SHADER_FRAGMENT &&
+       nir->info.stage == MESA_SHADER_FRAGMENT && !terminal && !secondary &&
+       !internal_kernel && !nir->info.internal &&
+       !nir->info.fs.uses_sample_shading && !nir->info.fs.uses_fbfetch_output)
+      agx_keep_inline_blend_nir(compiled, nir, &key);
+
    /* G17P fragment constant program, as hk_g17p_compile_fs_cprog(): a fragment
     * that reads descriptor-backed memory compiles a clone with the native
     * constant program and keeps it only when the native protocol can launch
@@ -2902,10 +2945,12 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
       struct agx_shader_key ckey = key;
       ckey.no_preamble = false;
       ckey.g17p_native_uniforms = true;
+      const struct agx_shader_key cprog_key = ckey;
       if (attempt && agx_compile_shader_nir(attempt, &ckey, &compiled->b)) {
          if (!compiled->b.info.has_preamble ||
              agx_g17p_fs_cprog_qualified(&compiled->b.info)) {
             fs_cprog_done = true;
+            compiled->inline_blend_key = cprog_key;
          } else {
             free(compiled->b.binary);
             memset(&compiled->b, 0, sizeof(compiled->b));
@@ -4667,6 +4712,257 @@ build_g18_msaa4_fs_epilog(nir_builder *b, const void *key_)
    NIR_PASS(_, b->shader, agx_nir_lower_g18_tile_samples, key->nr_samples);
 }
 
+/* The preparation each meta shader part gets between its builder and the
+ * backend. Returns the sample count the part is compiled for. */
+static unsigned
+agx_prepare_meta_nir(struct agx_device *dev, nir_shader *nir,
+                     meta_shader_builder_t builder, const void *data,
+                     bool prolog, unsigned nr_samples)
+{
+   if (!prolog) {
+      agx_gallium_preprocess_nir(dev, nir);
+      NIR_PASS(_, nir, agx_nir_lower_texture);
+      NIR_PASS(_, nir, agx_nir_lower_multisampled_image_store);
+   }
+
+   /* Match the compiler's sample protocol to the epilog's tile operands.
+    * Preprocessing may expose literal masks while unrolling a sample loop;
+    * lower them after that transformation, as the Vulkan path does.
+    * G18G compiles its prolog and epilog for the sample count keyed here.
+    */
+   unsigned compile_samples = 0;
+   if (dev->chip == AGX_CHIP_G18G) {
+      compile_samples = nr_samples;
+   } else if (builder == build_g17p_fs_epilog) {
+      const struct agx_fs_epilog_key *fs = data;
+      compile_samples = fs->nr_samples;
+      if (!fs->link.sample_shading)
+         NIR_PASS(_, nir, agx_nir_hoist_g17p_zs_writes);
+      NIR_PASS(_, nir, agx_nir_lower_g17p_tile_samples, compile_samples);
+   } else if (builder == build_fs_prolog &&
+              agx_chip_native_or_m5(dev->chip)) {
+      compile_samples = ((const struct agx_fs_prolog_key *)data)->nr_samples;
+   }
+
+   return compile_samples;
+}
+
+static void agx_delete_compiled_shader(struct agx_device *dev,
+                                       struct agx_compiled_shader *so);
+
+static bool
+agx_g17p_fragment_blend_constant_base(enum agx_chip chip,
+                                       const struct agx_compiled_shader *cs,
+                                       uint16_t *base);
+
+/* An epilog that reads uniforms (blend constants), images (spilled render
+ * targets) or memory needs the split link's uniform layout. */
+static bool
+agx_inline_blend_epilog_admitted(nir_shader *epilog)
+{
+   if (epilog->info.writes_memory)
+      return false;
+
+   nir_foreach_function_impl(impl, epilog) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+            case nir_intrinsic_load_preamble:
+            case nir_intrinsic_load_blend_const_color_rgba:
+            case nir_intrinsic_load_blend_const_color_r_float:
+            case nir_intrinsic_load_blend_const_color_g_float:
+            case nir_intrinsic_load_blend_const_color_b_float:
+            case nir_intrinsic_load_blend_const_color_a_float:
+            case nir_intrinsic_load_texture_handle_agx:
+            case nir_intrinsic_bindless_image_agx:
+            case nir_intrinsic_image_store:
+            case nir_intrinsic_bindless_image_store:
+               return false;
+            default:
+               break;
+            }
+         }
+      }
+   }
+
+   return true;
+}
+
+/* The draw takes the fragment's resources, varyings and fragment state from
+ * the API shader (ctx->fs) and only the uniform layout and constant program
+ * from the program it launches, so the two must agree on the rest, as
+ * Borealis requires of its inline-blend programs
+ * (hk_g17p_mono_layout_mismatch()). */
+static bool
+agx_inline_blend_fs_launchable(const struct agx_compiled_shader *main,
+                               const struct agx_shader_part *part)
+{
+   const struct agx_shader_info *a = &main->b.info, *m = &part->info;
+
+   /* agx_build_g17p_graphics_program() launches only a constant program the
+    * native protocol accepts, and agx_g17p_collect_graphics_uniform_ranges()
+    * only rodata in whole dwords. Anything else would drop the draw that the
+    * split link runs. */
+   if ((m->has_preamble || m->preamble_scratch_size) &&
+       !agx_g17p_fs_cprog_qualified(m))
+      return false;
+   if (m->has_preamble &&
+       (m->preamble_offset > m->binary_size ||
+        m->preamble_size > m->binary_size - m->preamble_offset ||
+        (m->agx3_preamble_tps_inputs &&
+         m->preamble_scratch_size < m->agx3_preamble_inputs.storage_bytes)))
+      return false;
+   if (m->rodata.size_16 != a->rodata.size_16 ||
+       (m->rodata.size_16 && (m->rodata.base_uniform & 1)))
+      return false;
+
+   /* A program that spills where the main does not runs slower than the
+    * split link. */
+   if (m->scratch_size > a->scratch_size)
+      return false;
+
+   return m->texture_state_count == a->texture_state_count &&
+          m->sampler_state_count == a->sampler_state_count &&
+          m->uses_txf == a->uses_txf &&
+          m->uses_sampler_heap == a->uses_sampler_heap &&
+          m->g17p_sampled_fragment == a->g17p_sampled_fragment &&
+          m->uses_draw_id == a->uses_draw_id &&
+          m->uses_base_param == a->uses_base_param &&
+          m->early_fragment_tests == a->early_fragment_tests &&
+          m->needs_quad_derivatives == a->needs_quad_derivatives &&
+          m->depth_layout == a->depth_layout &&
+          !memcmp(&m->varyings.fs, &a->varyings.fs, sizeof(m->varyings.fs)) &&
+          agx3_fragment_pixel_protocol_proven(part);
+}
+
+/*
+ * Inline blending on native AGX3. The split link runs the API fragment main
+ * and then its colour epilog, and hands the colours over in registers: the
+ * main exports them and the epilog, a separately compiled part, blends them
+ * with the tile. Borealis compiles the two as one program instead
+ * (hk_g17p_inline_epilog_part()), as Apple's compiler does. The backend then
+ * sees the whole blend: the terms that depend on uniforms only, such as a
+ * uniform colour's clamps, 1 - alpha and the source products, join the main's
+ * constant program and run once per draw instead of once per pixel.
+ *
+ * Compile the main's kept NIR (agx_keep_inline_blend_nir()) with the epilog
+ * the split link would build appended (agx_nir_inline_fs_epilog()), under the
+ * main's own backend key. The program launches with its own uniform layout
+ * and constant program (agx_fs_launch_shader()) and with *blend_constant_base
+ * placed after them. Return NULL, which keeps the split link, for any shape
+ * this does not admit or that does not compile.
+ */
+static struct agx_compiled_shader *
+agx_compile_inline_blend_fs(struct agx_context *ctx,
+                            const struct agx_fast_link_key *key,
+                            uint16_t *blend_constant_base)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   const struct agx_compiled_shader *main = key->main;
+   const struct agx_fs_epilog_key *ekey = &key->epilog.fs;
+
+   /* Borealis's admission: no sample shading, spilled render targets or
+    * external sample loop, and a main compiled for the epilog's sample count.
+    * A main that leaves a ray query's colour write wait to its epilog keeps
+    * the split link, which rewrites that wait (agx_fast_link()), and so does
+    * one with memory side effects, whose order against the tile accesses the
+    * split link fixes. Inline blending pays for its compile through the
+    * constant program, so chips without a native one keep the split link.
+    */
+   if (!agx_chip_native_agx3(dev->chip) ||
+       !agx_chip_native_preamble(dev->chip) || !main->inline_blend_nir ||
+       main->failed || main->g17g_samples_unrolled ||
+       (main->so && main->so->info.writes_memory) ||
+       key->nr_samples_shaded || ekey->link.sample_shading ||
+       ekey->native_spills || ekey->link.rt_spill_base ||
+       MAX2(ekey->nr_samples, 1) !=
+          MAX2(main->inline_blend_key.fs.nr_samples, 1) ||
+       main->b.info.agx3_colour_link.rt_query_write_acquired)
+      return NULL;
+
+   void *mem = ralloc_context(NULL);
+   if (!mem)
+      return NULL;
+
+   struct agx_compiled_shader *fs = NULL;
+   struct blob_reader reader;
+   blob_reader_init(&reader, main->inline_blend_nir,
+                    main->inline_blend_nir_size);
+   nir_shader *nir = nir_deserialize(mem, &agx_nir_options, &reader);
+   if (!nir || reader.overrun)
+      goto out;
+
+   /* The epilog exactly as the split link builds and compiles it
+    * (asahi_fast_link(), agx_build_meta_shader_internal(),
+    * agx_compile_nir_tile()). */
+   nir_builder eb = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "AGX inline blend epilog");
+   ralloc_steal(mem, eb.shader);
+   build_g17p_fs_epilog(&eb, ekey);
+   const unsigned samples = agx_prepare_meta_nir(
+      dev, eb.shader, build_g17p_fs_epilog, ekey, false, ekey->nr_samples);
+   NIR_PASS(_, eb.shader, agx_nir_lower_interpolation,
+            agx_chip_native_or_g18g(dev->chip));
+
+   if (!agx_inline_blend_epilog_admitted(eb.shader) ||
+       !agx_nir_inline_fs_epilog(nir, eb.shader))
+      goto out;
+
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_dce);
+
+   /* The main's key, now ending the program and addressing the epilog's
+    * tile partitions. */
+   struct agx_shader_key bkey = main->inline_blend_key;
+   bkey.no_stop = false;
+   agx_epilog_tile_partitions(ekey, samples, &bkey);
+
+   fs = CALLOC_STRUCT(agx_compiled_shader);
+   if (!fs)
+      goto out;
+
+   if (!agx_compile_shader_nir(nir, &bkey, &fs->b) ||
+       !fs->b.info.binary_size || !agx_inline_blend_fs_launchable(main, &fs->b))
+      goto fail;
+
+   fs->so = main->so;
+   fs->stage = main->stage;
+   fs->g17p_texture_resources = main->g17p_texture_resources;
+   fs->g17p_custom_border_emulation = main->g17p_custom_border_emulation;
+   fs->push_range_count = main->push_range_count;
+   memcpy(fs->push, main->push, sizeof(fs->push[0]) * main->push_range_count);
+   fs->epilog_key = main->epilog_key;
+
+   /* Blend constants are uploaded with every fragment program. A textured
+    * one takes them after its whole uniform footprint (agx_update_fs()),
+    * which here includes this program's constant program results. */
+   *blend_constant_base = ekey->blend_constant_base;
+   if (*blend_constant_base &&
+       !agx_g17p_fragment_blend_constant_base(dev->chip, fs,
+                                              blend_constant_base))
+      goto fail;
+
+   fs->bo = agx_bo_create(dev, fs->b.info.binary_size, 0,
+                          AGX_BO_EXEC | AGX_BO_LOW_VA, "Executable");
+   if (!fs->bo)
+      goto fail;
+
+   memcpy(agx_bo_map(fs->bo), fs->b.binary, fs->b.info.binary_size);
+   goto out;
+
+fail:
+   agx_delete_compiled_shader(dev, fs);
+   fs = NULL;
+out:
+   ralloc_free(mem);
+   return fs;
+}
+
 static struct agx_linked_shader *
 asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
                 struct agx_fast_link_key *key)
@@ -4685,6 +4981,8 @@ asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
       return NULL;
 
    struct agx_compiled_shader *prolog = NULL, *epilog = NULL;
+   struct agx_compiled_shader *inline_fs = NULL;
+   uint16_t blend_constant_base = key->epilog.fs.blend_constant_base;
 
    /* Build the prolog/epilog now */
    if (so->type == MESA_SHADER_FRAGMENT) {
@@ -4695,21 +4993,28 @@ asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
             ? key->epilog.fs.nr_samples : 0,
          false);
 
+      /* Blend inline where the main and the epilog admit it, else link the
+       * split epilog. */
+      inline_fs = agx_compile_inline_blend_fs(ctx, key, &blend_constant_base);
+
       /* A multisampled G17G epilog stores through the coverage register as
        * G17P's does: Apple's 4x fragment reads SR39 and names it in LSTCOL
        * (gpu/g17g-witness/pos-25g72/ms4-fs_c). */
       const enum agx_chip chip = agx_device(ctx->base.screen)->chip;
-      epilog = agx_build_meta_shader_internal(
-         ctx,
-         agx_chip_native_agx3(agx_device(ctx->base.screen)->chip) ||
-               (agx_chip_g17_m5(chip) && key->epilog.fs.nr_samples > 1)
-            ? build_g17p_fs_epilog
-         : agx_device(ctx->base.screen)->chip == AGX_CHIP_G18G &&
-               (key->epilog.fs.nr_samples == 2 || key->epilog.fs.nr_samples == 4)
-            ? build_g18_msaa4_fs_epilog
-            : agx_nir_fs_epilog,
-         &key->epilog.fs, sizeof(key->epilog.fs), false, true, 0,
-         key->epilog.fs.nr_samples, false);
+      if (!inline_fs) {
+         epilog = agx_build_meta_shader_internal(
+            ctx,
+            agx_chip_native_agx3(agx_device(ctx->base.screen)->chip) ||
+                  (agx_chip_g17_m5(chip) && key->epilog.fs.nr_samples > 1)
+               ? build_g17p_fs_epilog
+            : agx_device(ctx->base.screen)->chip == AGX_CHIP_G18G &&
+                  (key->epilog.fs.nr_samples == 2 ||
+                   key->epilog.fs.nr_samples == 4)
+               ? build_g18_msaa4_fs_epilog
+               : agx_nir_fs_epilog,
+            &key->epilog.fs, sizeof(key->epilog.fs), false, true, 0,
+            key->epilog.fs.nr_samples, false);
+      }
 
    } else if (so->type == MESA_SHADER_TESS_EVAL) {
       /* No prolog/epilog needed */
@@ -4735,27 +5040,33 @@ asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
          false, 0, 0, false);
    }
 
+   struct agx_device *dev = agx_device(ctx->base.screen);
+
    /* A refused prolog or epilog is just as fatal as a refused main: the
     * linked program would be missing the code that feeds or drains it.
     */
-   if ((prolog && prolog->failed) || (epilog && epilog->failed))
+   if ((prolog && prolog->failed) || (epilog && epilog->failed)) {
+      if (inline_fs)
+         agx_delete_compiled_shader(dev, inline_fs);
       return NULL;
+   }
 
    /* Fast-link it all together */
-   struct agx_device *dev = agx_device(ctx->base.screen);
-
    struct agx_linked_shader *linked =
       rzalloc(so->linked_shaders, struct agx_linked_shader);
    if (!agx_fast_link(linked, dev, so->type == MESA_SHADER_FRAGMENT,
-                      &key->main->b, &prolog->b, &epilog->b,
-                      key->nr_samples_shaded, NULL)) {
+                      inline_fs ? &inline_fs->b : &key->main->b, &prolog->b,
+                      &epilog->b, key->nr_samples_shaded, NULL)) {
+      if (inline_fs)
+         agx_delete_compiled_shader(dev, inline_fs);
       ralloc_free(linked);
       return NULL;
    }
 
    if (so->type == MESA_SHADER_FRAGMENT) {
       linked->g17p_emrt_heap_base = key->epilog.fs.emrt_heap_base;
-      linked->g17p_blend_constant_base = key->epilog.fs.blend_constant_base;
+      linked->g17p_blend_constant_base = blend_constant_base;
+      linked->inline_blend_fs = inline_fs;
    }
 
    /* Cache the fast linked program */
@@ -5026,6 +5337,19 @@ agx_last_uncompiled_vgt(struct agx_context *ctx)
       return ctx->stage[MESA_SHADER_GEOMETRY].shader;
    else
       return ctx->stage[MESA_SHADER_VERTEX].shader;
+}
+
+/* The compiled shader whose uniform layout and constant program launch the
+ * bound fragment program: an inline-blend program's own
+ * (agx_compile_inline_blend_fs()), otherwise the API shader's. Everything
+ * else about the fragment the draw takes from ctx->fs. */
+static struct agx_compiled_shader *
+agx_fs_launch_shader(const struct agx_context *ctx)
+{
+   if (ctx->linked.fs && ctx->linked.fs->inline_blend_fs)
+      return ctx->linked.fs->inline_blend_fs;
+
+   return ctx->fs;
 }
 
 static bool
@@ -5319,8 +5643,13 @@ agx_update_fs(struct agx_batch *batch)
    if (ctx->fs->bo)
       agx_batch_add_bo(batch, ctx->fs->bo);
 
-   if (ctx->linked.fs)
+   if (ctx->linked.fs) {
       agx_batch_add_bo(batch, ctx->linked.fs->bo);
+
+      /* The launch holds its constant program and rodata. */
+      if (ctx->linked.fs->inline_blend_fs)
+         agx_batch_add_bo(batch, ctx->linked.fs->inline_blend_fs->bo);
+   }
 
    return old != ctx->linked.fs;
 }
@@ -5397,6 +5726,7 @@ agx_delete_compiled_shader(struct agx_device *dev,
       agx_delete_compiled_shader(dev, so->gs_copy);
 
    free(so->b.binary);
+   free(so->inline_blend_nir);
    agx_bo_unreference(dev, so->bo);
    FREE(so);
 }
@@ -5415,6 +5745,8 @@ agx_delete_uncompiled_shader(struct agx_device *dev,
       hash_table_foreach(so->linked_shaders, ent) {
          struct agx_linked_shader *link = ent->data;
          agx_bo_unreference(dev, link->bo);
+         if (link->inline_blend_fs)
+            agx_delete_compiled_shader(dev, link->inline_blend_fs);
       }
 
       _mesa_hash_table_destroy(so->linked_shaders, NULL);
@@ -5541,11 +5873,8 @@ agx_build_meta_shader_internal(struct agx_context *ctx,
    builder(&b, data);
 
    struct agx_device *dev = agx_device(ctx->base.screen);
-   if (!prolog) {
-      agx_gallium_preprocess_nir(dev, b.shader);
-      NIR_PASS(_, b.shader, agx_nir_lower_texture);
-      NIR_PASS(_, b.shader, agx_nir_lower_multisampled_image_store);
-   }
+   const unsigned compile_samples =
+      agx_prepare_meta_nir(dev, b.shader, builder, data, prolog, nr_samples);
 
    /* Run 1139: a fragment epilog's key carries the mixed-format tile flag;
     * other meta shaders never set it. */
@@ -5553,25 +5882,6 @@ agx_build_meta_shader_internal(struct agx_context *ctx,
       epilog && b.shader->info.stage == MESA_SHADER_FRAGMENT &&
       data_size == sizeof(struct agx_fs_epilog_key) &&
       ((const struct agx_fs_epilog_key *)data)->g18_native_mixed;
-
-   /* Match the compiler's sample protocol to the epilog's tile operands.
-    * Preprocessing may expose literal masks while unrolling a sample loop;
-    * lower them after that transformation, as the Vulkan path does.
-    * G18G compiles its prolog and epilog for the sample count keyed here.
-    */
-   unsigned compile_samples = 0;
-   if (dev->chip == AGX_CHIP_G18G) {
-      compile_samples = nr_samples;
-   } else if (builder == build_g17p_fs_epilog) {
-      const struct agx_fs_epilog_key *fs = data;
-      compile_samples = fs->nr_samples;
-      if (!fs->link.sample_shading)
-         NIR_PASS(_, b.shader, agx_nir_hoist_g17p_zs_writes);
-      NIR_PASS(_, b.shader, agx_nir_lower_g17p_tile_samples, compile_samples);
-   } else if (builder == build_fs_prolog &&
-              agx_chip_native_or_m5(dev->chip)) {
-      compile_samples = ((const struct agx_fs_prolog_key *)data)->nr_samples;
-   }
 
    struct agx_compiled_shader *shader = agx_compile_nir_tile(
       dev, b.shader, NULL,
@@ -11759,7 +12069,7 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
    uint64_t vertex_program = 0, fragment_program = 0;
    agx_build_pipeline(batch, ctx->vs, ctx->linked.vs,
                       MESA_SHADER_VERTEX, 0, 0, &vertex_program, NULL);
-   agx_build_pipeline(batch, ctx->fs, ctx->linked.fs,
+   agx_build_pipeline(batch, agx_fs_launch_shader(ctx), ctx->linked.fs,
                       MESA_SHADER_FRAGMENT, 0, 0, &fragment_program, NULL);
    if (!vertex_program || !fragment_program) {
       mesa_loge("G17G Gallium could not build the native %s program",
@@ -12033,7 +12343,7 @@ agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
       return NULL;
 
    uint64_t fragment_program = 0;
-   agx_build_pipeline(batch, ctx->fs, ctx->linked.fs,
+   agx_build_pipeline(batch, agx_fs_launch_shader(ctx), ctx->linked.fs,
                       MESA_SHADER_FRAGMENT, 0, 0, &fragment_program, NULL);
    if (agx_drop_for_null_g17p_program(ctx, ctx->fs, fragment_program,
                                       "fragment", NULL))
@@ -13083,7 +13393,7 @@ agx_encode_g17g_state(struct agx_batch *batch, uint8_t *out)
    const char *vertex_why = NULL, *fragment_why = NULL;
    agx_build_pipeline(batch, hw_vs, hw_vs_linked,
                       MESA_SHADER_VERTEX, 0, 0, &vertex_program, &vertex_why);
-   agx_build_pipeline(batch, ctx->fs, ctx->linked.fs,
+   agx_build_pipeline(batch, agx_fs_launch_shader(ctx), ctx->linked.fs,
                       MESA_SHADER_FRAGMENT, 0, 0, &fragment_program, &fragment_why);
    const bool dropped_vertex = agx_drop_for_null_g17p_program(
       ctx, hw_vs, vertex_program, "vertex", vertex_why);
@@ -13556,7 +13866,8 @@ agx_encode_state(struct agx_batch *batch, uint8_t *out,
       }
 
       agx_ppp_push(&ppp, FRAGMENT_SHADER_WORD_1, cfg) {
-         cfg.pipeline = agx_build_pipeline(batch, ctx->fs, ctx->linked.fs,
+         cfg.pipeline = agx_build_pipeline(batch, agx_fs_launch_shader(ctx),
+                                           ctx->linked.fs,
                                            MESA_SHADER_FRAGMENT, 0, 0, NULL,
                                            NULL);
       }
