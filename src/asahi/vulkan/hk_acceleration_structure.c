@@ -2163,6 +2163,8 @@ hk_cmd_build_acceleration_structures(
       }
    }
 
+
+   hk_sync_end_cs_if_gfx_waits(cmd);
    const bool was_as_build = cmd->state.as_build_recording;
    cmd->state.as_build_recording = dev->dev.chip == AGX_CHIP_G17P;
    /* Launches of separate build calls, or of a build and the application's

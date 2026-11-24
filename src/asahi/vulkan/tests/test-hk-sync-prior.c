@@ -2335,6 +2335,29 @@ main(void)
                                                  .prior_vdm = 17,
                                                  .prior_cdm = 29};
    T("legacy compute bytes", memcmp(&lc, &ec, sizeof(lc)) == 0);
+   /* Do not merge a later independent compute stream into an earlier compute
+    * stream that a subsequent graphics pass waits on (e.g. AS build after
+    * deform ahead of a G-buffer pass). */
+   {
+      struct hk_cmd_buffer *m = new_cmd();
+      hk_cmd_buffer_device(m)->dev.chip = AGX_CHIP_G17C;
+      struct hk_cs *deform = add(m, true);
+      deform->stats.cmds = 1;
+      struct hk_cs *as_build = add(m, true);
+      as_build->stats.cmds = 1;
+      struct hk_cs *render = add(m, false);
+      render->stats.cmds = 1;
+      render->sync.dep[HK_SYNC_CDM].cut = deform;
+      T("merge delays when later render waits on earlier compute",
+        hk_sync_merge_delays(m, deform, as_build));
+      render->sync.dep[HK_SYNC_CDM].cut = NULL;
+      render->sync.dep_ta[HK_SYNC_CDM].cut = deform;
+      T("merge delays when later render TA waits on earlier compute",
+        hk_sync_merge_delays(m, deform, as_build));
+      render->sync.dep_ta[HK_SYNC_CDM].cut = NULL;
+      T("merge allowed when later render does not wait on earlier compute",
+        !hk_sync_merge_delays(m, deform, as_build));
+   }
    printf("RESULT checks=%u failures=%u\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
