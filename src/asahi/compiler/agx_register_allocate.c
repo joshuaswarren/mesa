@@ -583,11 +583,16 @@ dest_minimum(const struct ra_ctx *rctx, const agx_instr *I, unsigned d)
    return 0;
 }
 
+static unsigned
+ssa_texture_gpr_limit(const struct ra_ctx *rctx)
+{
+   return agx_is_g18g(&rctx->shader->key->dev) ? 64 : 128;
+}
+
 static bool
 ssa_has_bank_constraint(const struct ra_ctx *rctx, unsigned ssa)
 {
-   if (rctx->shader->key->dev.chip != AGX_CHIP_G17P ||
-       rctx->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX3B)
+   if (!agx_isa_is_agx3(rctx->shader->key->dev.encoding))
       return BITSET_TEST(rctx->low_gpr, ssa) ||
              BITSET_TEST(rctx->texture_gpr, ssa) ||
              BITSET_TEST(rctx->log2_gpr, ssa) ||
@@ -596,13 +601,17 @@ ssa_has_bank_constraint(const struct ra_ctx *rctx, unsigned ssa)
    /* A bank restriction cannot prevent relocation when the complete register
     * file fits inside that bank. In particular, pinning a texture coordinate
     * in a 112-half allocation can strand the only partly free eight-half
-    * region, even though every possible new home satisfies its 128-half
-    * encoding limit. Keep the restriction for genuinely narrower banks.
+    * region, even though every possible new home satisfies its encoding limit.
+    * Keep the restriction for genuinely narrower banks.
     */
+   const bool agx3b =
+      rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
    const unsigned bound = rctx->bound[RA_GPR];
-   return (BITSET_TEST(rctx->low_gpr, ssa) && bound > rctx->tile_gpr_limit) ||
-          (BITSET_TEST(rctx->texture_gpr, ssa) && bound > 128) ||
-          (BITSET_TEST(rctx->log2_gpr, ssa) && bound > 192) ||
+   return (agx3b && BITSET_TEST(rctx->low_gpr, ssa) &&
+           bound > rctx->tile_gpr_limit) ||
+          (BITSET_TEST(rctx->texture_gpr, ssa) &&
+           bound > ssa_texture_gpr_limit(rctx)) ||
+          (agx3b && BITSET_TEST(rctx->log2_gpr, ssa) && bound > 192) ||
           BITSET_TEST(rctx->high_gpr, ssa);
 }
 
@@ -619,16 +628,14 @@ ssa_bank_range(const struct ra_ctx *rctx, unsigned ssa, unsigned *floor,
    if (agx3b && BITSET_TEST(rctx->low_gpr, ssa))
       *limit = MIN2(*limit, rctx->tile_gpr_limit);
    if (BITSET_TEST(rctx->texture_gpr, ssa))
-      *limit = MIN2(*limit, 128);
+      *limit = MIN2(*limit, ssa_texture_gpr_limit(rctx));
    if (agx3b && BITSET_TEST(rctx->log2_gpr, ssa))
       *limit = MIN2(*limit, 192);
 }
 
 /* Whether a value's bank limit narrows the current register file, mirroring
- * dest_limit(): the low-bank and log2 bounds are G17P (AGX3B) encodings, and
- * the seven-bit texture/COPY bound means nothing in a file of 128 halves or
- * fewer, which is what compute shaders get once the workgroup bounds their
- * registers. */
+ * dest_limit(): the low-bank and log2 bounds are AGX3B encodings, and
+ * the texture/COPY bound means nothing when the register file fits inside it. */
 static bool
 ssa_has_binding_bank_constraint(const struct ra_ctx *rctx, unsigned ssa)
 {
@@ -638,7 +645,8 @@ ssa_has_binding_bank_constraint(const struct ra_ctx *rctx, unsigned ssa)
 
    return (agx3b && BITSET_TEST(rctx->low_gpr, ssa) &&
            bound > rctx->tile_gpr_limit) ||
-          (BITSET_TEST(rctx->texture_gpr, ssa) && bound > 128) ||
+          (BITSET_TEST(rctx->texture_gpr, ssa) &&
+           bound > ssa_texture_gpr_limit(rctx)) ||
           (agx3b && BITSET_TEST(rctx->log2_gpr, ssa) && bound > 192) ||
           BITSET_TEST(rctx->high_gpr, ssa);
 }
