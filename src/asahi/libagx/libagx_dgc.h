@@ -1041,10 +1041,10 @@ agx_vdm_draw_robust_index(GLOBAL uint32_t *out, enum agx_chip chip,
     * executes and the following CPU-authored command remains the only parser
     * target.
     */
-   if ((chip == AGX_CHIP_G17P ||
+   if ((agx_chip_native_hal200(chip) ||
         agx_vdm_index_list_direct_is_hal300_inline(chip)) &&
        (draw.b.count[0] == 0 || draw.b.count[1] == 0)) {
-      if (chip == AGX_CHIP_G17P && render_state_emitted)
+      if (agx_chip_native_hal200(chip) && render_state_emitted)
          *out++ = draw_state_context_offset;
 
       *out++ = 0x80000000u | (uint32_t)(empty_draw_jump >> 32);
@@ -1065,7 +1065,7 @@ agx_vdm_draw_robust_index(GLOBAL uint32_t *out, enum agx_chip chip,
              draw.index_bias, range_dwords, &words))
          return out;
 
-      if (chip == AGX_CHIP_G17P) {
+      if (agx_chip_native_hal200(chip)) {
          if (render_state_emitted)
             *out++ = draw_state_context_offset;
 
@@ -1101,7 +1101,7 @@ libagx_draw_robust_index_vdm_size(enum agx_chip chip,
       agx_draw_indexed(0, 1, 0, 0, 0, 0, 4, AGX_INDEX_SIZE_U16, false);
    unsigned size_B = agx_vdm_draw_size(chip, draw);
 
-   if (chip == AGX_CHIP_G17P)
+   if (agx_chip_native_hal200(chip))
       size_B += 8 + (render_state_emitted ? 4 : 0);
 
    return size_B;

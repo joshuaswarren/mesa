@@ -565,7 +565,7 @@ test_order(void)
 static void
 test_order_forward(void)
 {
-   test_chip = AGX_CHIP_G16G;
+   test_chip = AGX_CHIP_G15G;
    struct hk_cmd_buffer *c = new_cmd();
    struct hk_cs *r[3], *p[3];
    for (unsigned i = 0; i < 3; ++i) {

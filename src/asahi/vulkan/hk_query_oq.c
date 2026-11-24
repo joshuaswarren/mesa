@@ -293,9 +293,9 @@ hk_oq_render_stamps_supported(enum agx_chip chip)
 void
 hk_resolve_deferred_oq_available(struct hk_cmd_buffer *cmd)
 {
-   /* The reverse order is qualified on G17P; the other native AGX3 chips keep
-    * recording order until it is measured there. */
-   if (hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P)
+   /* Reverse order applies across native HAL200 chips; G15 keeps recording
+    * order until measured there. */
+   if (agx_chip_native_hal200(hk_cmd_buffer_device(cmd)->dev.chip))
       hk_resolve_oq_reverse(cmd);
    else
       hk_resolve_oq_forward(cmd);

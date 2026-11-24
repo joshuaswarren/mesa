@@ -80,8 +80,8 @@ static inline bool
 hk_tess_batchable(enum agx_chip chip, struct agx_draw draw, bool geometry,
                   bool counters)
 {
-   return chip == AGX_CHIP_G17P && !agx_is_indirect(draw.b) && !geometry &&
-          !counters;
+   return agx_chip_native_hal200(chip) && !agx_is_indirect(draw.b) &&
+          !geometry && !counters;
 }
 
 /* Create the side streams that are missing. False, with the command buffer
