@@ -1633,6 +1633,30 @@ agx3_band_carrier(enum agx_isa_encoding enc, uint16_t reg, uint16_t mask,
              : agx3_alu_band_identity_wait(enc, reg, mask, out, len);
 }
 
+/* Zero-extends the half `src` into the word `dest` in one instruction: an
+ * add of it to an immediate 0, agx3_iadd_encode()'s narrow slot-B source form
+ * as Apple emits it for `uint(ushort a[i]) + 7`. Unlike a copy of the half,
+ * it carries any wait for the half. */
+static bool
+agx3_encode_zext_half(const agx_context *ctx, enum agx_isa_encoding enc,
+                      uint16_t dest, uint16_t src, bool src_kill,
+                      uint16_t wait, uint8_t bytes[AGX3_IADD_MAX_LENGTH],
+                      uint8_t *len)
+{
+   const struct agx3_iadd_desc d = {
+      .dest = dest,
+      .dest_cache = true,
+      .immediate = 0,
+      .src = src,
+      .src_kill = src_kill,
+      .src_16 = true,
+      .wait_mask = wait,
+   };
+   return (agx_is_g18g(&ctx->key->dev) ? agx3_iadd_encode_g18g
+                                        : agx3_iadd_encode)(enc, &d, bytes,
+                                                            len);
+}
+
 static bool
 agx3_retire_slots_noop(struct util_dynarray *emission,
                        enum agx_isa_encoding enc, uint16_t mask);
@@ -19317,11 +19341,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          }
 
          /* A local-memory byte offset widens the 16-bit local invocation
-          * index with `iadd dst32, #0, src16.abs`. The native integer iadd
-          * immediate form does not admit zero in its witnessed endpoint, but
-          * zero-extension needs no new arithmetic encoding: copy the low half
-          * and clear the high half, exactly like the existing widened BITOP
-          * move below. The copy carries the source's real wait/lifetime. */
+          * index with `iadd dst32, #0, src16.abs`: the zero-extension of the
+          * widened BITOP move below, packed the same way. */
          if (enc == AGX_ISA_ENCODING_AGX3B && I->op == AGX_OPCODE_IADD &&
              I->nr_dests == 1 && I->nr_srcs == 2 && !I->saturate &&
              I->shift == 0 && agx3_src_is_register(I->dest[0]) &&
@@ -19338,6 +19359,16 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 agx3_src_is_register(half) && !half.memory && half.abs &&
                 !half.neg && half.size == AGX_SIZE_16 &&
                 agx_channels(half) == 1 && !(half.cache && half.discard)) {
+               uint8_t bytes[AGX3_IADD_MAX_LENGTH];
+               uint8_t len = 0;
+               if (agx3_encode_zext_half(ctx, enc, I->dest[0].value,
+                                         half.value, half.discard, wait,
+                                         bytes, &len)) {
+                  if (!agx3_append(emission, bytes, len))
+                     AGX3_REFUSE(I);
+                  continue;
+               }
+
                uint8_t lo[AGX3_COPY_MAX_LENGTH], hi[AGX3_STAGE_MAX_LENGTH];
                uint8_t lo_len = 0, hi_len = 0;
                if (!agx3_copy_encode_reg16(enc, I->dest[0].value, half.value,
@@ -19874,17 +19905,19 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          }
 
          /*
-          * Widening move: a 32-bit destination fed by a 16-bit half. Apple
-          * does not have a widening `copy`; its compiler moves the half and
-          * clears the upper one, which is what a zero-extend is. (Its ALU can
-          * also just consume a 16-bit operand in a 32-bit op -- the width is
-          * per-operand -- but that folds into the consumer and there is no
-          * consumer here.) Both halves of this pair are witnessed encodings.
-          * The half-copy corpus does not map every combination of scoreboard
-          * waits. Preserve its directly encodable waits. For any other mask,
-          * retire the producer through the grounded band no-op first, as for
-          * uniform copies and derivatives, then emit the exact zero-wait
-          * copy-and-clear pair.
+          * Widening move: a 32-bit destination fed by a 16-bit half. (Its ALU
+          * can also just consume a 16-bit operand in a 32-bit op -- the width
+          * is per-operand -- but that folds into the consumer and there is no
+          * consumer here.) On AGX3b, and above the seven-bit destination of
+          * the half COPY, it is one add (agx3_encode_zext_half()).
+          *
+          * Otherwise move the half and clear the upper one, Apple's own
+          * zero-extension on M5 (corpus by835); both halves of that pair are
+          * witnessed encodings. The half-copy corpus does not map every
+          * combination of scoreboard waits. Preserve its directly encodable
+          * waits. For any other mask, retire the producer through the
+          * grounded band no-op first, as for uniform copies and derivatives,
+          * then emit the exact zero-wait copy-and-clear pair.
           */
          if (I->op == AGX_OPCODE_BITOP &&
              (I->truth_table & 0xfu) == AGX3_SEL_TT_MOV &&
@@ -19896,28 +19929,19 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              agx3_src_is_register(I->dest[0]) && !I->dest[0].memory &&
              I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1 &&
              (I->dest[0].value & 1) == 0) {
-            /* The half COPY names a seven-bit destination. Above it, add the
-             * zero-extended half to an immediate 0: agx3_iadd_encode()'s
-             * narrow slot-B source form, as Apple emits for
-             * `uint(ushort a[i]) + 7`, names an eight-bit destination. */
-            if (I->dest[0].value >= AGX3_COPY_REG16_DEST_HALVES) {
-               const struct agx3_iadd_desc d = {
-                  .dest = I->dest[0].value,
-                  .dest_cache = true,
-                  .immediate = 0,
-                  .src = I->src[0].value,
-                  .src_kill = I->src[0].discard,
-                  .src_16 = true,
-                  .wait_mask = wait,
-               };
+            const bool high = I->dest[0].value >= AGX3_COPY_REG16_DEST_HALVES;
+            if (enc == AGX_ISA_ENCODING_AGX3B || high) {
                uint8_t bytes[AGX3_IADD_MAX_LENGTH];
                uint8_t len = 0;
-               if (!(agx_is_g18g(&ctx->key->dev)
-                      ? agx3_iadd_encode_g18g
-                      : agx3_iadd_encode)(enc, &d, bytes, &len) ||
-                   !agx3_append(emission, bytes, len))
+               if (agx3_encode_zext_half(ctx, enc, I->dest[0].value,
+                                         I->src[0].value, I->src[0].discard,
+                                         wait, bytes, &len)) {
+                  if (!agx3_append(emission, bytes, len))
+                     AGX3_REFUSE(I);
+                  continue;
+               }
+               if (high)
                   AGX3_REFUSE(I);
-               continue;
             }
             uint8_t lo[AGX3_COPY_MAX_LENGTH], hi[AGX3_STAGE_MAX_LENGTH];
             uint8_t lo_len = 0, hi_len = 0;
