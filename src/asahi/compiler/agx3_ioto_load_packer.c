@@ -18,7 +18,7 @@ agx3_ioto_pack_cprog_copy(enum agx_chip chip,
                          const struct agx3_ioto_cprog_copy_desc *desc,
                          struct agx3_ioto_cprog_copy_output *output)
 {
-   if (chip != AGX_CHIP_G17P || desc == NULL || output == NULL ||
+   if (!agx_chip_native_hal200(chip) || desc == NULL || output == NULL ||
        (desc->destination_bytes & 1) || desc->source_half >= 256 ||
        (desc->source_half & 1) || desc->lane_mask < 1 || desc->lane_mask > 3 ||
        desc->source_wait_slot < -1 || desc->source_wait_slot >= 6)
@@ -271,7 +271,7 @@ cprog_lanes(const struct agx3_ioto_load_packer *packer,
    *offset = 0;
    if (packer->cprog_inputs == NULL)
       return true;
-   if (packer->chip != AGX_CHIP_G17P || !packer->cprog_inputs->known ||
+   if (!agx_chip_native_hal200(packer->chip) || !packer->cprog_inputs->known ||
        !direct_load_registers_ok(load) || dword >= load->count_dwords)
       return false;
 

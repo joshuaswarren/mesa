@@ -51,6 +51,10 @@
  * `limit` counted instructions and `max_loads` memory reads, both arms
  * together, are flattened: the untaken arm's work is executed too, and a
  * large arm costs more than the branch saves.
+ *
+ * agx_nir_opt_flatten_short_circuit_uniform_loads() handles one divergent
+ * shape too, the second operand of a short-circuit && or || that reads
+ * memory at a subgroup-uniform address (see there).
  */
 
 struct flatten_options {
@@ -411,7 +415,8 @@ flatten_block(nir_builder *b, nir_block *block,
 
    /* Only branches every lane takes the same way: a divergent if may run
     * neither arm or one arm for a whole subgroup, and flattening it would run
-    * both every time. */
+    * both every time. The one divergent shape worth that cost is
+    * agx_nir_opt_flatten_short_circuit_uniform_loads()'s. */
    nir_if *nif = nir_cf_node_as_if(prev_node);
    if (nif->control == nir_selection_control_dont_flatten ||
        nir_src_is_divergent(&nif->condition))
@@ -482,6 +487,184 @@ agx_nir_opt_flatten_loads(nir_shader *shader, unsigned limit,
 
       nir_foreach_block_safe(block, impl)
          impl_progress |= flatten_block(&b, block, &options);
+
+      progress |= nir_progress(impl_progress, impl, nir_metadata_none);
+   }
+
+   return progress;
+}
+
+/*
+ * Flatten the divergent if of a short-circuit && or ||, whose one non-empty
+ * arm computes the second operand from global loads at a subgroup-uniform
+ * address:
+ *
+ *    if (c) { v = load_global(addr) < k; }   r = phi(v, false)
+ *
+ * Chained tensor bounds checks reading uniform padding descriptors have this
+ * shape. agx_nir_opt_flatten_loads() keeps divergent ifs, since flattening
+ * runs the arm for every lane. This arm is small, and the if costs every lane
+ * a control-flow boundary that waits for all loads in flight.
+ *
+ * The flattened arm runs for every lane, so each of its loads must be safe at
+ * any lane: arm_is_flattenable() admits only redirectable or speculatable
+ * loads and instructions safe to speculate (no stores, atomics, barriers or
+ * subgroup operations), and the moved loads cross only the computation of
+ * the condition. A load is redirected to the zero page unless some active
+ * lane takes the arm. Its address is the same for every lane, so if any lane
+ * takes the arm, the program reads that address anyway, and every lane may.
+ * Testing "any lane" rather than each lane's own condition keeps the address,
+ * and so the load, uniform.
+ *
+ * The arm holds the loads, their compares and the boolean logic joining
+ * them: at most FLATTEN_SHORT_CIRCUIT_LOADS loads and
+ * FLATTEN_SHORT_CIRCUIT_COST counted instructions, which a two-term check
+ * such as (x >= lo && x < hi) on two descriptor words stays within. Every
+ * lane now pays for the arm, so longer arms are left alone.
+ */
+#define FLATTEN_SHORT_CIRCUIT_LOADS 2
+#define FLATTEN_SHORT_CIRCUIT_COST  8
+
+static bool
+block_only_consts(nir_block *blk)
+{
+   nir_foreach_instr(instr, blk) {
+      if (instr->type != nir_instr_type_load_const &&
+          instr->type != nir_instr_type_undef)
+         return false;
+   }
+   return true;
+}
+
+static bool
+flatten_short_circuit_uniform_load_block(nir_builder *b, nir_block *block)
+{
+   if (nir_cf_node_is_first(&block->cf_node))
+      return false;
+
+   nir_cf_node *prev_node = nir_cf_node_prev(&block->cf_node);
+   if (prev_node->type != nir_cf_node_if)
+      return false;
+
+   nir_block *prev_block = nir_cf_node_as_block(nir_cf_node_prev(prev_node));
+   if (nir_block_ends_in_jump(prev_block))
+      return false;
+
+   nir_if *nif = nir_cf_node_as_if(prev_node);
+   if (nif->control == nir_selection_control_dont_flatten ||
+       !nir_src_is_divergent(&nif->condition))
+      return false;
+
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_block *else_block = nir_if_first_else_block(nif);
+   if (nir_if_last_then_block(nif) != then_block ||
+       nir_if_last_else_block(nif) != else_block)
+      return false;
+
+   const bool then_empty = block_only_consts(then_block);
+   const bool else_empty = block_only_consts(else_block);
+   if (then_empty == else_empty)
+      return false;
+
+   nir_block *arm = then_empty ? else_block : then_block;
+   nir_block *empty_arm = then_empty ? then_block : else_block;
+
+   /* Require at least one phi, and every phi to be a 1-bit short-circuit
+    * boolean whose empty-arm value is a constant. */
+   unsigned phi_count = 0;
+   nir_foreach_phi(phi, block) {
+      if (phi->def.bit_size != 1 || phi->def.num_components != 1)
+         return false;
+      bool empty_const = false;
+      nir_foreach_phi_src(ps, phi) {
+         if (ps->pred == empty_arm)
+            empty_const = nir_src_is_const(ps->src);
+      }
+      if (!empty_const)
+         return false;
+      phi_count++;
+   }
+   if (phi_count == 0)
+      return false;
+
+   struct arm_cost cost = {0};
+   if (!arm_is_flattenable(b->shader, arm, &cost))
+      return false;
+   if (cost.loads == 0 || cost.loads > FLATTEN_SHORT_CIRCUIT_LOADS ||
+       cost.count > FLATTEN_SHORT_CIRCUIT_COST)
+      return false;
+
+   /* Every memory read must be a global load at a uniform address, which the
+    * "any lane" redirect relies on. Read-only, non-coherent loads are the
+    * descriptor reads this shape is for; that is a heuristic, not part of the
+    * safety argument above. */
+   unsigned uniform_global_loads = 0;
+   nir_foreach_instr(instr, arm) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (!reads_memory(intr))
+         continue;
+      const enum gl_access_qualifier access = nir_intrinsic_access(intr);
+      if ((intr->intrinsic == nir_intrinsic_load_global ||
+           intr->intrinsic == nir_intrinsic_load_global_constant) &&
+          (access & ACCESS_NON_WRITEABLE) &&
+          !(access & (ACCESS_VOLATILE | ACCESS_ATOMIC | ACCESS_COHERENT)) &&
+          !intr->src[0].ssa->divergent) {
+         uniform_global_loads++;
+      } else {
+         return false;
+      }
+   }
+   if (uniform_global_loads == 0)
+      return false;
+
+   nir_def *cond = nif->condition.ssa;
+   b->cursor = nir_after_block(prev_block);
+   nir_def *taken = then_empty ? nir_inot(b, cond) : cond;
+   nir_def *any_taken = nir_ine_imm(b, nir_ballot(b, 1, 32, taken), 0);
+   redirect_loads(b, arm, any_taken);
+
+   nir_foreach_instr_safe(instr, empty_arm) {
+      exec_node_remove(&instr->node);
+      instr->block = prev_block;
+      exec_list_push_tail(&prev_block->instr_list, &instr->node);
+   }
+
+   nir_foreach_instr_safe(instr, arm) {
+      exec_node_remove(&instr->node);
+      instr->block = prev_block;
+      exec_list_push_tail(&prev_block->instr_list, &instr->node);
+   }
+
+   nir_foreach_phi_safe(phi, block) {
+      nir_def *then_def = NULL, *else_def = NULL;
+      nir_foreach_phi_src(src, phi) {
+         if (src->pred == then_block)
+            then_def = src->src.ssa;
+         else
+            else_def = src->src.ssa;
+      }
+      b->cursor = nir_after_block(prev_block);
+      nir_def_replace(&phi->def, nir_bcsel(b, cond, then_def, else_def));
+   }
+
+   nir_cf_node_remove(&nif->cf_node);
+   return true;
+}
+
+bool
+agx_nir_opt_flatten_short_circuit_uniform_loads(nir_shader *shader)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_metadata_require(impl, nir_metadata_divergence);
+      nir_builder b = nir_builder_create(impl);
+      bool impl_progress = false;
+
+      nir_foreach_block_safe(block, impl)
+         impl_progress |= flatten_short_circuit_uniform_load_block(&b, block);
 
       progress |= nir_progress(impl_progress, impl, nir_metadata_none);
    }
