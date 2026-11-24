@@ -582,7 +582,10 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
 
    switch (agx_chip_command_stream_generation(dev->dev.chip)) {
    case AGX_CS_GENERATION_AGX2:
+      if (cs->current == cs->strong_flush_end)
+         return;
       cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
+      cs->strong_flush_end = cs->current;
       break;
 
    case AGX_CS_GENERATION_G15:

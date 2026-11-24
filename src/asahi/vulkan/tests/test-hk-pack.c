@@ -520,14 +520,49 @@ test_boundary(void)
    dev->dev.chip = AGX_CHIP_G17P;
    T("G17P: HAL200 strong flush boundary (alias-scoped at pack time)",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_STRONG_FLUSH);
+   dev->dev.chip = AGX_CHIP_G15G;
+   T("G15G: strong flush boundary",
+     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_STRONG_FLUSH);
    dev->dev.chip = AGX_CHIP_G15S;
-   T("G15S: not qualified, no boundary",
-     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
+   T("G15S: strong flush boundary",
+     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_STRONG_FLUSH);
    dev->dev.chip = AGX_CHIP_G17A;
    T("G17A: HAL200, caches pending, no boundary",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
+   dev->dev.chip = AGX_CHIP_G13X;
+   T("G13X: AGX2 strong flush boundary",
+     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_STRONG_FLUSH);
    dev->dev.chip = AGX_CHIP_G14G;
-   T("G14G: no boundary", hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
+   T("G14G: AGX2 strong flush boundary",
+     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_STRONG_FLUSH);
+
+   uint8_t agx2_term[HK_PACK_CDM_TERMINATE_MAX] = {0};
+   const size_t agx2_term_size =
+      hk_pack_cdm_terminate(AGX_CHIP_G14G, agx2_term);
+   T("AGX2 terminate packs 8 bytes",
+     agx2_term_size == AGX_CDM_STREAM_TERMINATE_LENGTH);
+   struct hk_cmd_buffer *agx2_cmd = new_cmd();
+   struct hk_cs *agx2_cs = add(agx2_cmd, true);
+   uint8_t *agx2_bytes =
+      test_alloc(64 + agx2_term_size + HK_CS_SPACE_PADDING);
+   memcpy(agx2_bytes + 64, agx2_term, agx2_term_size);
+   agx2_cs->start = agx2_bytes;
+   agx2_cs->current = agx2_bytes + 64 + agx2_term_size;
+   agx2_cs->end = (uint8_t *)agx2_cs->current + HK_CS_SPACE_PADDING;
+   agx2_cs->strong_flush_end = agx2_bytes + 64;
+   agx2_cs->stats.cmds = agx2_cs->stats.calls = 1;
+   agx2_cs->pack_dispatches = 1;
+   agx2_cs->pack_threads = 64;
+   agx2_cs->pack_static_work = 64 * 16;
+   util_dynarray_init(&agx2_cs->imm_writes, NULL);
+   util_dynarray_init(&agx2_cs->compute_resources, NULL);
+   T("AGX2 G14G accepts strong-flush stream with 8-byte terminate",
+     hk_pack_run_member(dev_with(AGX_CHIP_G14G, 0), agx2_cmd, agx2_term,
+                        false) == agx2_cs);
+   agx2_cs->strong_flush_end = NULL;
+   T("AGX2 G14G rejects stream without strong-flush tail",
+     !hk_pack_run_member(dev_with(AGX_CHIP_G14G, 0), agx2_cmd, agx2_term,
+                         false));
 
    chip = AGX_CHIP_G17S;
    struct hk_cmd_buffer *c = plain(1);
