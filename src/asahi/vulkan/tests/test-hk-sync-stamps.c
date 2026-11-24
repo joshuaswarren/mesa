@@ -305,6 +305,15 @@ last_cs(struct hk_cmd_buffer *cmd)
 static const enum agx_chip chips[] = {
    AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17G, AGX_CHIP_G17P};
 
+/* Whether a stamp on a compute command is ordered through the compute queue
+ * alone, as stamp_wait() decides: exact-prior barriers on a native AGX3 or
+ * M5 part. */
+static bool
+cdm_stamp_queue_ordered(enum agx_chip chip, bool exact)
+{
+   return agx_chip_native_or_m5(chip) && exact;
+}
+
 /* A timestamp-only command is no producer for application work: a barrier,
  * even ALL_COMMANDS, orders later renders and dispatches after the work
  * before it, not after the carrier. Within the command buffer, across
@@ -469,10 +478,10 @@ test_consecutive_stamps_coalesce(void)
             stamp_all(cmd, i);
          T("first stamp ends the dispatch", is_end(d, 0));
 
-         /* G17P with exact priors orders a stamp on a compute command
+         /* With exact priors a stamp on a compute command is ordered
           * through its compute queue alone (stamp_wait()), so the second
           * stamp takes a carrier, which the rest copy. */
-         const bool own = chips[c] == AGX_CHIP_G17P && exact;
+         const bool own = cdm_stamp_queue_ordered(chips[c], exact);
          struct hk_cs *src = own ? last_cs(cmd) : d;
          const unsigned copies = own ? 3 : 4;
          T("a run of stamps records at most one carrier",
@@ -544,7 +553,7 @@ test_stamps_with_work_stay_distinct(void)
            !cmd->sync.stamp_copy_count);
          T("later stamped work follows the earlier stamp",
            d1->sync.dep[HK_SYNC_CDM].cut == d0 ||
-           (chips[c] == AGX_CHIP_G17P && exact));
+           cdm_stamp_queue_ordered(chips[c], exact));
 
          /* Work in a stream recorded before the latest one: the open
           * compute stream stays open across a render that does not wait
