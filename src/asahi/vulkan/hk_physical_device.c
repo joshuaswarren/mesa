@@ -328,9 +328,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_memory_priority = agx_has_residency_control(dev),
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
-      /* Qualified on G17P and G17S; nested replay is shared code. */
-      .EXT_nested_command_buffer =
-         dev->chip == AGX_CHIP_G17P || dev->chip == AGX_CHIP_G17S,
+      /* Qualified on G17P and M5; nested replay is shared code. */
+      .EXT_nested_command_buffer = agx_chip_g17p_or_m5(dev->chip),
       .EXT_non_seamless_cube_map = true,
       .EXT_pageable_device_local_memory = agx_has_residency_control(dev),
       .EXT_pipeline_creation_cache_control = true,
