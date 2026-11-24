@@ -5400,6 +5400,7 @@ zink_image_copy_buffer(struct pipe_context *pctx,
                        unsigned level,
                        const struct pipe_box *box)
 {
+   struct zink_context *ctx = zink_context(pctx);
    /* convert bytes to texels */
    struct pipe_resource *img = pdst->target != PIPE_BUFFER ? pdst : psrc;
    unsigned stride = (box->height > 1 || box->depth > 1) && buffer_stride ?
@@ -5409,10 +5410,13 @@ zink_image_copy_buffer(struct pipe_context *pctx,
                            buffer_layer_stride / buffer_stride * util_format_get_blockheight(img->format) :
                            0;
 
-   zink_copy_image_buffer(zink_context(pctx), zink_resource(pdst), zink_resource(psrc),
+   if (zink_resource(img)->fb_bind_count)
+      zink_fb_clears_apply(ctx, img, 0, INT32_MAX);
+
+   zink_copy_image_buffer(ctx, zink_resource(pdst), zink_resource(psrc),
                           buffer_offset, stride, layer_stride, level, box, 0);
    if (zink_resource(img)->fb_bind_count)
-      zink_context(pctx)->rp_tc_info_updated = true;
+      ctx->rp_tc_info_updated = true;
 }
 
 static void
