@@ -4391,14 +4391,22 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
    }
 
    case nir_intrinsic_shuffle_xor:
-      /* Only constant masks reach here, see agx_nir_lower_subgroups_m5() */
+   case nir_intrinsic_shuffle_up:
+   case nir_intrinsic_shuffle_down: {
+      /* Only constant masks/deltas reach here, see agx_nir_lower_subgroups.c */
       if (!nir_src_is_const(instr->src[1])) {
          b->shader->unsupported_instruction = true;
          return NULL;
       }
 
-      return agx_shuffle_xor_to(b, dst, agx_src_index(&instr->src[0]),
-                                agx_immediate(nir_src_as_uint(instr->src[1])));
+      agx_index data = agx_src_index(&instr->src[0]);
+      agx_index delta = agx_immediate(nir_src_as_uint(instr->src[1]));
+      if (instr->intrinsic == nir_intrinsic_shuffle_xor)
+         return agx_shuffle_xor_to(b, dst, data, delta);
+      if (instr->intrinsic == nir_intrinsic_shuffle_up)
+         return agx_shuffle_up_to(b, dst, data, delta);
+      return agx_shuffle_down_to(b, dst, data, delta);
+   }
 
    case nir_intrinsic_quad_swap_horizontal: {
       return agx_quad_shuffle_xor_to(b, dst, agx_src_index(&instr->src[0]),
@@ -10624,10 +10632,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
 
    agx_optimize_loop_nir(nir, m5, g17p);
 
-   /* Loops are unrolled now: a subgroup XOR shuffle whose mask is still not
-    * a constant takes the general lowering (agx_nir_lower_subgroups.c).
+   /* Loops are unrolled now: a subgroup relative shuffle whose mask/delta is
+    * still not a constant in 1..31 takes the general lowering
+    * (agx_nir_lower_subgroups.c).
     */
-   if (m5 && !g18_scans) {
+   if (byte_indices || (m5 && !g18_scans)) {
       bool lowered = false;
       NIR_PASS(lowered, nir, agx_nir_lower_dynamic_shuffle_xor);
       if (lowered)
@@ -10757,6 +10766,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          NIR_PASS(_, nir, agx_nir_lower_subgroups_m5, !g18_scans, !g18_scans);
       else
          NIR_PASS(_, nir, agx_nir_lower_subgroups);
+      if (byte_indices || (m5 && !g18_scans))
+         NIR_PASS(_, nir, agx_nir_lower_dynamic_shuffle_xor);
    }
 
    /* The above create operations that need lowering/optimizing */
