@@ -3205,8 +3205,27 @@ static void test_native_half_multiply(void)
    const bool both_abs[]={true,true};
    uint8_t bytes[AGX3_ALU_MAX_LENGTH],len;
    assert(agx3_alu_hmul_abs(AGX_ISA_ENCODING_AGX3B,2,src,hints,both_abs,
-                            false,32,bytes,&len));
+                            false,false,32,bytes,&len));
    exact(bytes,len,"10031d02020000800300");
+
+   /* saturate(|a| * |b|) is the same ep3 form with only f14 added. */
+   for (unsigned e = 0; e < 2; ++e) {
+      const enum agx_isa_encoding enc =
+         e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+      uint8_t plain[AGX3_ALU_MAX_LENGTH], plain_len;
+      uint8_t sat[AGX3_ALU_MAX_LENGTH], sat_len;
+      assert(agx3_alu_hmul_abs(enc,2,src,hints,both_abs,false,false,32,
+                               plain,&plain_len));
+      assert(agx3_alu_hmul_abs(enc,2,src,hints,both_abs,true,false,32,
+                               sat,&sat_len));
+      assert(plain_len == 10 && sat_len == plain_len);
+      unsigned differing_bits = 0;
+      for (unsigned i = 0; i < sat_len; ++i) {
+         for (unsigned x = plain[i] ^ sat[i]; x; x &= x - 1)
+            ++differing_bits;
+      }
+      assert(differing_bits == 1);
+   }
    puts("Native half multiply: live/dead and absolute Apple vectors PASS");
 }
 

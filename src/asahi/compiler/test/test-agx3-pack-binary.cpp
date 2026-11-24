@@ -1522,6 +1522,58 @@ TEST_F(AGX3PackBinary, HalfMultiplyOddSourcesHasExactFmaFallback)
    EXPECT_EQ((native[7] >> 5) | ((native[9] >> 5) << 3), UINT16_C(0x5));
 }
 
+/* The optimizer folds fsat into a half multiply whose source already carries
+ * fabs: saturate(|a| * b). This post-RA compute shape (odd half registers,
+ * the destination reusing a discarded source) was refused. An absolute
+ * source selects the ep3 form, which also carries saturation, so the
+ * saturating multiply must be that form with exactly one bit added -- on
+ * every AGX3 encoding, as AGX2 already sets one bit for it.
+ */
+TEST_F(AGX3PackBinary, SaturatingHalfMultiplyKeepsAbsoluteSource)
+{
+   for (enum agx_isa_encoding enc :
+        {AGX_ISA_ENCODING_AGX2, AGX_ISA_ENCODING_AGX3B,
+         AGX_ISA_ENCODING_AGX3C}) {
+      for (unsigned abs_mask = 1; abs_mask < 4; ++abs_mask) {
+         std::vector<uint8_t> code[2];
+         for (unsigned saturate = 0; saturate < 2; ++saturate) {
+            agx_builder *b = builder(enc);
+            key.dev.chip = enc == AGX_ISA_ENCODING_AGX2  ? AGX_CHIP_G13G
+                           : enc == AGX_ISA_ENCODING_AGX3B ? AGX_CHIP_G17P
+                                                           : AGX_CHIP_G17S;
+            agx_index s0 = agx_register(79, AGX_SIZE_16);
+            agx_index s1 = agx_register(107, AGX_SIZE_16);
+            s0.cache = true;
+            s1.discard = true;
+            s0.abs = abs_mask & 1;
+            s1.abs = abs_mask & 2;
+            agx_instr *I =
+               agx_hmul_to(b, agx_register(107, AGX_SIZE_16), s0, s1);
+            I->saturate = saturate;
+            agx_stop(b);
+            if (enc == AGX_ISA_ENCODING_AGX2) {
+               struct util_dynarray bin;
+               util_dynarray_init(&bin, mem_ctx);
+               agx_pack_binary(b->shader, &bin);
+               const uint8_t *d = (const uint8_t *)bin.data;
+               code[saturate].assign(d, d + bin.size);
+            } else {
+               code[saturate] = pack(b);
+            }
+         }
+         ASSERT_FALSE(code[0].empty()) << "enc=" << enc << " abs=" << abs_mask;
+         ASSERT_EQ(code[0].size(), code[1].size())
+            << "enc=" << enc << " abs=" << abs_mask;
+         unsigned differing_bits = 0;
+         for (size_t i = 0; i < code[0].size(); ++i) {
+            for (unsigned x = code[0][i] ^ code[1][i]; x; x &= x - 1)
+               ++differing_bits;
+         }
+         EXPECT_EQ(differing_bits, 1u) << "enc=" << enc << " abs=" << abs_mask;
+      }
+   }
+}
+
 TEST_F(AGX3PackBinary, MinifloatMixedSelectMatchesNativeAndRefusesModifier)
 {
    agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
