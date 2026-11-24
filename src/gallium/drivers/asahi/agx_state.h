@@ -928,6 +928,9 @@ struct asahi_blitter {
    bool active;
    struct hash_table *blit_cs;
 
+   /* Compressed mip-level compute shaders, by enum agx_g17p_mip_key */
+   void *g17p_mip_cs[32];
+
    /* [filter] */
    void *sampler[2];
 
