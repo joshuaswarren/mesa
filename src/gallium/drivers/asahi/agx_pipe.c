@@ -489,7 +489,10 @@ agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
  *
  * G16G compresses only 1x single-level, single-layer 2D colour images of
  * <= 8-byte formats (agx_chip_gen9_color_compression() without
- * agx_chip_gen9_extended_compression()).
+ * agx_chip_gen9_extended_compression()), plus single-sample UNORM8x4
+ * mip chains when agx_generate_mipmap() can generate their levels in compute
+ * (agx_g17p_compressed_mip_chain_allowed()), so glGenerateMipmap never
+ * stores a level per render pass.
  *
  * Nothing decompresses such an image in place: it is neither shared nor
  * scanned out, so a spilling MRT framebuffer, feedback loop, or shader-image
@@ -522,7 +525,9 @@ agx_g17p_private_compression_allowed(const struct agx_device *dev,
 
       if (single_sample)
          return templ->last_level == 0 ||
-                (extended && templ->last_level < 16);
+                (templ->last_level < 16 &&
+                 (extended ||
+                  agx_g17p_compressed_mip_chain_allowed(dev, templ)));
 
       return extended && color_le8b && templ->last_level == 0 &&
              (templ->nr_samples == 2 || templ->nr_samples == 4);

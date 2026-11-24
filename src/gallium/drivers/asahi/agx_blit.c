@@ -13,6 +13,7 @@
 #include "asahi/layout/layout.h"
 #include "asahi/lib/agx3_compute_program_core.h"
 #include "asahi/lib/agx_tile_mip.h"
+#include "asahi/vulkan/hk_g17p_meta_copy_core.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_format_convert.h"
 #include "gallium/auxiliary/util/u_blitter.h"
@@ -1539,6 +1540,25 @@ agx_g17p_mip_compute_shader(struct pipe_context *pctx, unsigned key)
    }
 
    return pipe_shader_from_nir(pctx, b->shader);
+}
+
+/* Private 2D UNORM8x4 mip chains that the compute path below generates. Like
+ * Borealis on images that are not attachments, keep chains whose top level
+ * is below the size where a compressed level pays for its render-pass upload
+ * plain (hk_mip_level_through_pbe()); GL cannot tell which textures will be
+ * rendered to. */
+bool
+agx_g17p_compressed_mip_chain_allowed(const struct agx_device *dev,
+                                      const struct pipe_resource *templ)
+{
+   return agx_chip_gen9_color_compression(dev->chip) &&
+          templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
+          templ->array_size <= 1 && templ->nr_samples <= 1 &&
+          templ->last_level > 0 &&
+          agx_agx3_mipmap_format_supported(templ->format) &&
+          templ->width0 <= UINT16_MAX + 1u &&
+          templ->height0 <= UINT16_MAX + 1u &&
+          hk_mip_level_through_pbe(dev->chip, templ->width0, templ->height0);
 }
 
 struct agx_g17p_mip_level_plan {

@@ -1859,6 +1859,9 @@ bool agx_generate_mipmap_agx3_supported(const struct agx_device *dev,
                                         unsigned first_layer,
                                         unsigned last_layer);
 
+bool agx_g17p_compressed_mip_chain_allowed(const struct agx_device *dev,
+                                           const struct pipe_resource *templ);
+
 bool agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
                          enum pipe_format format, unsigned base_level,
                          unsigned last_level, unsigned first_layer,
