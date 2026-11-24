@@ -121,6 +121,12 @@ agx_validate_sources(agx_instr *I)
       } else if (I->op == AGX_OPCODE_PHI) {
          agx_validate_assert(src.size == I->dest[0].size);
          agx_validate_assert(!agx_is_null(src));
+      } else if ((I->op == AGX_OPCODE_FCMPSEL ||
+                  I->op == AGX_OPCODE_ICMPSEL) &&
+                 s >= 2 && I->nr_dests == 1) {
+         /* A selected register or uniform is a bit pattern of the
+          * destination's width: no encoding extends or narrows it. */
+         agx_validate_assert(src.size == I->dest[0].size);
       }
 
       agx_validate_assert(!src.memory || is_stack_valid(I));
