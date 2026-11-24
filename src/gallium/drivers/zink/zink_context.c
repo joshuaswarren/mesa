@@ -2995,6 +2995,7 @@ zink_update_fbfetch(struct zink_context *ctx)
       if (!had_fbfetch) {
          ret = true;
          zink_batch_no_rp(ctx);
+         ctx->rp_tc_info_updated = true;
       }
    }
    return ret;
