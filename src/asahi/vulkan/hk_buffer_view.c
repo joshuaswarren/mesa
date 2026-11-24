@@ -79,8 +79,7 @@ hk_get_buffer_format_features(struct hk_physical_device *pdev,
 
       if (p_format == PIPE_FORMAT_R32_UINT || p_format == PIPE_FORMAT_R32_SINT ||
           (p_format == PIPE_FORMAT_R32_FLOAT &&
-           (agx_chip_native_hal200(pdev->dev.chip) ||
-            agx_chip_g17_m5(pdev->dev.chip))))
+           pdev->vk.supported_features.shaderImageFloat32Atomics))
          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
    }
 
