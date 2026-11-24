@@ -25,17 +25,18 @@
 #include "agx_opcodes.h"
 #include "shader_enums.h"
 
-/* The eight scalars collected into an operand of a 16x16x16 matrix
- * multiply-accumulate, as the phi webs they belong to. The instruction takes
- * each operand from an aligned run of registers, so the webs want consecutive
- * registers of one such run: then the collect, the phis around it and the
- * copy into the accumulator the instruction overwrites are all in place.
+/* The scalars collected into an operand of an AGX3 matrix multiply-accumulate
+ * (8 for matmad16, 2 for matmad8), as the phi webs they belong to. The
+ * instruction takes each operand from an aligned run of registers, so the webs
+ * want consecutive registers of one such run: then the collect, the phis around
+ * it and the accumulator overwrite are all in place.
  */
 struct matrix_group {
    uint32_t root[8];
 
-   /* Registers (16-bit halves) of each member */
+   /* Registers (16-bit halves) of each member, and number of members (2 or 8) */
    uint8_t size;
+   uint8_t count;
 };
 
 /* SSA-based register allocator */
@@ -1442,7 +1443,7 @@ reserve_live_in(struct ra_ctx *rctx)
 }
 
 /* The first web of a matrix operand to get a register picks the run of
- * registers for all eight (see struct matrix_group).
+ * registers for all members (see struct matrix_group).
  */
 static void
 place_matrix_group(struct ra_ctx *rctx, unsigned root, unsigned minimum,
@@ -1454,13 +1455,13 @@ place_matrix_group(struct ra_ctx *rctx, unsigned root, unsigned minimum,
 
    const struct matrix_group *group =
       &rctx->matrix_groups[rctx->web_matrix_group[root] - 1];
-   const unsigned run = 8 * group->size;
+   const unsigned run = group->count * group->size;
    unsigned base;
 
    if (!find_regs_simple(rctx, RA_GPR, run, run, minimum, limit, &base))
       return;
 
-   for (unsigned k = 0; k < 8; ++k) {
+   for (unsigned k = 0; k < group->count; ++k) {
       struct phi_web_node *node = &rctx->phi_web[group->root[k]];
       if (!node->assigned) {
          node->reg = base + k * group->size;
@@ -1881,6 +1882,19 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
 
       unsigned out;
       if (try_coalesce_with(rctx, I->src[0], count, false, &out))
+         return out;
+   }
+
+   /* Accumulate matmad8_agx3 in place when its accumulator source (src[2]) is
+    * dead after this instruction (early-killed above), avoiding register
+    * fragmentation and loop back-edge parallel copies on unrolled K-slices. */
+   if (I->op == AGX_OPCODE_MATMAD8_AGX3 && d == 0 &&
+       I->src[2].type == AGX_INDEX_NORMAL &&
+       I->src[2].memory == idx.memory &&
+       I->src[2].size == idx.size &&
+       rctx->ncomps[I->src[2].value] == count) {
+      unsigned out;
+      if (try_coalesce_with(rctx, I->src[2], count, false, &out))
          return out;
    }
 
@@ -2618,6 +2632,32 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          agx_set_sources(rctx, I);
          agx_set_dests(rctx, I);
          continue;
+      }
+
+      /* Accumulate matmad8_agx3 in place when its accumulator source (src[2])
+       * dies here and matches the destination width and bounds. Handling this
+       * directly ensures a dead accumulator is always reused instead of
+       * drifting into a lower free hole or failing early-kill next to a
+       * narrower f16 A/B source. */
+      if (I->op == AGX_OPCODE_MATMAD8_AGX3 && I->nr_dests == 1 &&
+          !agx_is_null(I->dest[0]) && !I->dest[0].memory && I->nr_srcs == 3 &&
+          I->src[2].type == AGX_INDEX_NORMAL && !I->src[2].memory &&
+          I->src[2].kill && I->src[2].size == I->dest[0].size &&
+          rctx->ncomps[I->src[2].value] == rctx->ncomps[I->dest[0].value]) {
+         const unsigned count = rctx->ncomps[I->dest[0].value];
+         const unsigned reg = ssa_to_reg[I->src[2].value];
+         if ((reg % count) == 0 && reg >= dest_minimum(rctx, I, 0) &&
+             reg + count <= dest_limit(rctx, I, 0)) {
+            kill_source(rctx, I, 2);
+            assign_regs(rctx, I->dest[0], reg);
+            for (unsigned s = 0; s < 2; ++s) {
+               if (I->src[s].type == AGX_INDEX_NORMAL && I->src[s].kill)
+                  kill_source(rctx, I, s);
+            }
+            agx_set_sources(rctx, I);
+            agx_set_dests(rctx, I);
+            continue;
+         }
       }
 
       /* Search for regions of contiguous killed sources to early-kill. */
@@ -3590,20 +3630,50 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
    /* Record all phi webs. First initialize the union-find data structure with
     * all SSA defs in their own singletons, then union together anything related
-    * by a phi. The resulting union-find structure will be the webs.
+    * by a phi. Skip sources shared by multiple phis on the same predecessor
+    * edge of a block (such as a CSE'd 0.0f constant initializing multiple loop
+    * accumulators): those phis are simultaneously live at block entry and must
+    * not be merged into one web.
     */
    struct phi_web_node *phi_web = calloc(ctx->alloc, sizeof(*phi_web));
    for (unsigned i = 0; i < ctx->alloc; ++i) {
       phi_web[i].parent = i;
    }
 
+   uint32_t *phi_edge_owner = calloc(ctx->alloc, sizeof(*phi_edge_owner));
    agx_foreach_block(ctx, block) {
-      agx_foreach_phi_in_block(block, phi) {
-         agx_foreach_ssa_src(phi, s) {
-            phi_web_union(phi_web, phi->dest[0].value, phi->src[s].value);
+      unsigned max_srcs = 0;
+      agx_foreach_phi_in_block(block, phi)
+         max_srcs = MAX2(max_srcs, phi->nr_srcs);
+
+      for (unsigned s = 0; s < max_srcs; ++s) {
+         agx_foreach_phi_in_block(block, phi) {
+            if (s >= phi->nr_srcs || phi->src[s].type != AGX_INDEX_NORMAL)
+               continue;
+            const uint32_t owner = phi->dest[0].value + 1;
+            const unsigned v = phi->src[s].value;
+            if (phi_edge_owner[v] == 0)
+               phi_edge_owner[v] = owner;
+            else if (phi_edge_owner[v] != owner)
+               phi_edge_owner[v] = UINT32_MAX;
+         }
+
+         agx_foreach_phi_in_block(block, phi) {
+            if (s >= phi->nr_srcs || phi->src[s].type != AGX_INDEX_NORMAL)
+               continue;
+            const unsigned v = phi->src[s].value;
+            if (phi_edge_owner[v] != UINT32_MAX)
+               phi_web_union(phi_web, phi->dest[0].value, v);
+         }
+
+         agx_foreach_phi_in_block(block, phi) {
+            if (s >= phi->nr_srcs || phi->src[s].type != AGX_INDEX_NORMAL)
+               continue;
+            phi_edge_owner[phi->src[s].value] = 0;
          }
       }
    }
+   free(phi_edge_owner);
 
    /* Group the phi webs that make up the operands of matrix multiplies */
    struct util_dynarray matrix_groups;
@@ -3611,7 +3681,8 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    uint16_t *web_matrix_group = NULL;
    bool any_matrix = false;
    agx_foreach_instr_global(ctx, I)
-      any_matrix |= I->op == AGX_OPCODE_MATMAD16_AGX3;
+      any_matrix |= I->op == AGX_OPCODE_MATMAD16_AGX3 ||
+                    I->op == AGX_OPCODE_MATMAD8_AGX3;
 
    if (any_matrix) {
       agx_instr **defs = calloc(ctx->alloc, sizeof(*defs));
@@ -3623,7 +3694,10 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
       }
 
       agx_foreach_instr_global(ctx, I) {
-         if (I->op != AGX_OPCODE_MATMAD16_AGX3)
+         const unsigned mat_comps =
+            I->op == AGX_OPCODE_MATMAD16_AGX3 ? 8 :
+            I->op == AGX_OPCODE_MATMAD8_AGX3 ? 2 : 0;
+         if (!mat_comps)
             continue;
 
          agx_foreach_ssa_src(I, s) {
@@ -3633,12 +3707,13 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
                 def->src[0].type == AGX_INDEX_NORMAL)
                def = defs[def->src[0].value];
 
-            if (!def || def->op != AGX_OPCODE_COLLECT || def->nr_srcs != 8)
+            if (!def || def->op != AGX_OPCODE_COLLECT ||
+                def->nr_srcs != mat_comps)
                continue;
 
             struct matrix_group group = {0};
             bool valid = true;
-            for (unsigned k = 0; k < 8 && valid; ++k) {
+            for (unsigned k = 0; k < mat_comps && valid; ++k) {
                const agx_index src = def->src[k];
                valid = src.type == AGX_INDEX_NORMAL && !src.memory &&
                        agx_channels(src) == 1 &&
@@ -3656,6 +3731,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
                continue;
 
             group.size = agx_size_align_16(def->src[0].size);
+            group.count = mat_comps;
             util_dynarray_append(&matrix_groups, group);
             const unsigned id = util_dynarray_num_elements(
                &matrix_groups, struct matrix_group);
@@ -3663,7 +3739,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
                (void)util_dynarray_pop(&matrix_groups, struct matrix_group);
                continue;
             }
-            for (unsigned k = 0; k < 8; ++k)
+            for (unsigned k = 0; k < mat_comps; ++k)
                web_matrix_group[group.root[k]] = id;
          }
       }

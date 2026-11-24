@@ -2028,6 +2028,34 @@ agx_optimizer_forward(agx_context *ctx)
       }
    }
 
+   /* Back-edge sources of loop-header phis had defs[v] == NULL during the
+    * single forward pass above, leaving scalarized vector loop phis with
+    * `split -> mov -> phi` chains. Propagate plain register moves into those
+    * phi edges now that defs[] is complete. */
+   agx_foreach_block(ctx, block) {
+      if (!block->loop_header)
+         continue;
+
+      agx_foreach_phi_in_block(block, phi) {
+         agx_foreach_ssa_src(phi, s) {
+            const agx_index src = phi->src[s];
+            const agx_instr *def = defs[src.value];
+            if (!def || def->op != AGX_OPCODE_MOV || def->saturate ||
+                def->dest[0].memory)
+               continue;
+
+            const agx_index rep = def->src[0];
+            if (rep.type != AGX_INDEX_NORMAL || rep.memory || rep.abs ||
+                rep.neg || rep.size != src.size ||
+                agx_channels(rep) != agx_channels(src) ||
+                rep.value == phi->dest[0].value)
+               continue;
+
+            agx_replace_src(phi, s, rep);
+         }
+      }
+   }
+
    free(defs);
 }
 
