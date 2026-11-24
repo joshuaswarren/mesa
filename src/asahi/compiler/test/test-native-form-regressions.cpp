@@ -7873,3 +7873,107 @@ TEST(NativeForms, M5PreRasterMultisampleAndImplicitLod0FetchLowerAndCompile)
       ralloc_free(b.shader);
    }
 }
+
+/* Replace load_descriptor_set_agx(0) with load_preamble(12), as hk does with
+ * root = AGX_G17P_TXF_ROOT_HALFS (8). */
+static void
+m5_lower_descriptor_set_to_preamble(nir_shader *s)
+{
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_descriptor_set_agx)
+            continue;
+         nir_builder lb = nir_builder_at(nir_before_instr(instr));
+         nir_def *set = nir_load_preamble(&lb, 1, 64, .base = 12);
+         nir_def_replace(&intr->def, set);
+      }
+   }
+}
+
+/* Task (object) and mesh programs run on M5 as TA programs, which take the
+ * heap-indexed fetch form of compute. A texelFetch on a 2D-MS image in either
+ * stage lowers to a 64-bit heap index and compiles with known staging. */
+TEST(NativeForms, M5TaskAndMeshMultisampleFetchLowerAndCompile)
+{
+   for (mesa_shader_stage stage : {MESA_SHADER_TASK, MESA_SHADER_MESH}) {
+      for (bool is_array : {false, true}) {
+         SCOPED_TRACE(::testing::Message()
+                      << "stage=" << stage << " array=" << is_array);
+         nir_builder b = nir_builder_init_simple_shader(
+            stage, &agx_nir_options, "m5 ta ms fetch");
+         b.shader->info.workgroup_size[0] = 32;
+         b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+         b.shader->info.io_lowered = true;
+         if (stage == MESA_SHADER_MESH) {
+            b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+            b.shader->info.mesh.max_vertices_out = 1;
+            b.shader->info.mesh.max_primitives_out = 1;
+         }
+
+         nir_def *handle = agx_test_bindless_image_agx(&b, nir_imm_int(&b, 64), 0);
+         nir_def *coord = nir_imm_ivec3(&b, 3, 5, is_array ? ((1u << 16) | 2u) : 2u);
+         nir_tex_instr *tex = nir_tex_instr_create(b.shader, 2);
+         tex->op = nir_texop_txf_ms;
+         tex->sampler_dim = GLSL_SAMPLER_DIM_MS;
+         tex->is_array = is_array;
+         tex->dest_type = nir_type_float32;
+         tex->coord_components = is_array ? 3 : 2;
+         tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_backend1, coord);
+         tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, handle);
+         nir_def_init(&tex->instr, &tex->def, 4, 32);
+         nir_builder_instr_insert(&b, &tex->instr);
+         nir_def *lane = nir_load_local_invocation_index(&b);
+         nir_store_global(&b, &tex->def,
+                          nir_iadd(&b, nir_imm_int64(&b, 0x2000000),
+                                   nir_u2u64(&b, nir_imul_imm(&b, lane, 16))),
+                          .write_mask = 15, .align_mul = 16);
+         if (stage == MESA_SHADER_TASK) {
+            nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 1, 1, 1));
+         } else {
+            nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 0),
+               nir_imm_int(&b, 0), nir_undef(&b, 1, 32));
+         }
+
+         /* The lowered form: a 64-bit heap index replaces the bindless
+          * handle. */
+         ASSERT_TRUE(agx_nir_lower_g17g_indexed_reads(b.shader));
+         const int tex_off =
+            nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
+         ASSERT_GE(tex_off, 0);
+         EXPECT_EQ(nir_src_bit_size(tex->src[tex_off].src), 64u);
+         EXPECT_LT(nir_tex_instr_src_index(tex, nir_tex_src_texture_handle), 0);
+         EXPECT_EQ(tex->op, nir_texop_txf_ms);
+         EXPECT_EQ(tex->sampler_dim, GLSL_SAMPLER_DIM_MS);
+         EXPECT_EQ(tex->is_array, is_array);
+         nir_validate_shader(b.shader, "m5 ta ms fetch");
+
+         m5_lower_descriptor_set_to_preamble(b.shader);
+         if (stage == MESA_SHADER_TASK)
+            ASSERT_TRUE(agx_nir_lower_m5_task(b.shader, 0, false));
+         else
+            ASSERT_TRUE(agx_nir_lower_m5_mesh_triangle_probe(b.shader));
+         nir_validate_shader(b.shader, "m5 ta ms fetch lowered");
+         agx_preprocess_nir_m5(b.shader);
+
+         struct agx_shader_key key = {};
+         key.dev.chip = AGX_CHIP_G17S;
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.reserved_preamble = 16;
+         key.no_preamble = true;
+         struct agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+            << agx_last_compile_refusal();
+         EXPECT_TRUE(part.info.uses_txf);
+         EXPECT_EQ(part.info.texture_state_count, 0u);
+         EXPECT_EQ(part.info.sampler_state_count, 1u);
+         EXPECT_FALSE(part.info.uses_sampler_heap);
+         EXPECT_TRUE(part.info.agx3_staging_known);
+         EXPECT_GT(part.info.agx3_staging_halfs, 0u);
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
+   }
+}
