@@ -8897,9 +8897,12 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
                                   AGX_ROUND_RTE);
       }
 
-      enum agx_convert mode = (src_sz == 32)   ? AGX_CONVERT_U32_TO_F
-                              : (src_sz == 16) ? AGX_CONVERT_U16_TO_F
-                                               : AGX_CONVERT_U8_TO_F;
+      /* An 8-bit value is kept zero-extended in its half register, as the
+       * u2u16 and u2u32 above rely on (u2u8 masks to the byte). The unsigned
+       * half conversion of that register is therefore exact, and needs no
+       * mask: the byte form masks first wherever it is not native. */
+      enum agx_convert mode = (src_sz == 32) ? AGX_CONVERT_U32_TO_F
+                                             : AGX_CONVERT_U16_TO_F;
 
       return agx_convert_to(b, dst, agx_immediate(mode), s0, AGX_ROUND_RTE);
    }
