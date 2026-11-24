@@ -51,6 +51,8 @@ static bool meminfo_readable = true;
 /* hk_AllocateMemory() reads /proc/meminfo only when the BO cache misses, and
  * never below 1 MiB. Count the reads to check that. */
 static unsigned meminfo_reads;
+/* Freeing a BO returns its pages to the system. */
+static bool free_returns_available;
 
 bool
 __wrap_os_get_available_system_memory(uint64_t *size)
@@ -108,6 +110,8 @@ mock_bo_free(struct agx_device *dev, uint32_t handle)
    assert(handle && handle < ARRAY_SIZE(live_bos) && live_bos[handle]);
    assert(pinned >= bo_sizes[handle]);
    pinned -= bo_sizes[handle];
+   if (free_returns_available)
+      fake_available += bo_sizes[handle];
    free(live_bos[handle]);
    live_bos[handle] = NULL;
 }
@@ -529,8 +533,11 @@ main(void)
    assert(alloc(dev, MIB / 2, &memory) == VK_SUCCESS);
    assert(!meminfo_reads);
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+   /* The freed 512 KiB BO is still cached, so the refusal evicts it and
+    * reads /proc/meminfo once more. */
    assert(alloc(dev, MIB, &memory) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
-   assert(meminfo_reads == 1);
+   assert(meminfo_reads == 2);
+   assert(!dev->dev.bo_cache.size);
 
    /* An unreadable /proc/meminfo leaves only the heap limit. */
    meminfo_readable = false;
@@ -555,9 +562,30 @@ main(void)
    assert(bo_calls == before && bind_calls == binds_before);
    assert(!meminfo_reads);
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+   /* A miss that does not fit evicts the cache, then asks once more. Freeing
+    * the cached BO does not raise fake_available here, so it is refused. */
    assert(alloc(dev, 512 * MIB, &memory) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
    assert(bo_calls == before && bind_calls == binds_before);
-   assert(meminfo_reads == 1);
+   assert(meminfo_reads == 2);
+   assert(!pinned && !dev->dev.bo_cache.size);
+   agx_bo_cache_evict_all(&dev->dev);
+
+   /* When freeing the idle cached BOs gives back enough memory, the retry
+    * after eviction admits the allocation instead of failing it. */
+   fake_available = 64 * 1024 * MIB;
+   assert(alloc(dev, 128 * MIB, &memory) == VK_SUCCESS);
+   hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+   assert(dev->dev.bo_cache.size == 128 * MIB);
+   fake_available = 512 * MIB + 1024 * MIB - 1;
+   free_returns_available = true;
+   meminfo_reads = 0;
+   before = bo_calls;
+   assert(alloc(dev, 512 * MIB, &memory) == VK_SUCCESS);
+   assert(meminfo_reads == 2);
+   assert(bo_calls == before + 1);
+   assert(!dev->dev.bo_cache.size && pinned == 512 * MIB);
+   free_returns_available = false;
+   hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    agx_bo_cache_evict_all(&dev->dev);
 
    /* Warm BO-cache reuse across 4 KiB..64 MiB must issue zero VM_BINDs,

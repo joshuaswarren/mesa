@@ -901,6 +901,7 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    if (!cmd->g17p_pristine)
       hk_reset_cmd_buffer(&cmd->vk, 0);
    cmd->g17p_pristine = false;
+   cmd->usage_flags = pBeginInfo->flags;
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
 
    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY &&
@@ -1501,12 +1502,19 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * that record writes the device's writes back for the host (a strong
     * flush alone leaves them in the GPU caches, and the end of a command
     * does not reliably write them back before completion is reported when
-    * render work shares the queue). The host can only observe it at the end
-    * of the submission or through an event, so it is deferred there
-    * (hk_sync_defer_host_flush()) instead of taking a compute command of its
-    * own between the work around it. */
-   if (hk_cdm_memory_scope_form(dev))
-      hk_sync_defer_host_flush(cmd, pDependencyInfo);
+    * render work shares the queue). An open compute stream holding work
+    * after the dependency's first scope takes the record, so the command
+    * that ends with the scope's work ends with the flush. Otherwise the
+    * host, which can only observe it at the end of the submission or
+    * through an event, gets it there (hk_sync_defer_host_flush()) instead of
+    * from a compute command of its own between the work around it. */
+   if (hk_cdm_memory_scope_form(dev)) {
+      struct hk_cs *flush = hk_sync_host_flush(cmd, pDependencyInfo);
+      if (flush) {
+         hk_ensure_cs_has_space(cmd, flush, AGX3_CDM_BARRIER_SIZE);
+         hk_cdm_visibility_flush(dev, flush, true);
+      }
+   }
 
    /* The dependency this barrier recorded is the one a continued instance
     * applies to its stream (hk_sync_merge_rendering()); a stream it created
@@ -4935,6 +4943,20 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    cs->cr.bg.main = render->cr.bg.partial;
    cs->cr.eot.main = render->cr.eot.partial;
    cs->cr.zls_control = render->cr.zls_control_partial;
+
+   /* Conservative default for continuation/split streams where bg.main is
+    * bg.partial: every bound colour attachment has live BG contents and cannot
+    * be synthesized by constant epilog clear-fill. hk_begin_rendering()
+    * overrides these on the first stream of a non-resuming pass. */
+   uint8_t bound_color_mask = 0;
+   for (uint32_t i = 0; i < render->color_att_count; ++i) {
+      if (render->color_att[i].iview)
+         bound_color_mask |= BITFIELD_BIT(i);
+   }
+   cs->bg_live_mask = bound_color_mask;
+   cs->bg_clear_fill_rt = 0;
+   cs->user_color_written_mask = 0;
+   cs->opaque_color_written = 0;
 
    /* Barrier to enforce GPU-CPU coherency, in case this batch is back to back
     * with another that caused stale data to be cached and the CPU wrote to it

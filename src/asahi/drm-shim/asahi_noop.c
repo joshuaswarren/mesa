@@ -962,12 +962,17 @@ check_compute_coverage(void)
        (getenv("ASAHI_SHIM_G17P_EXPECT_STRONG_COMPUTE_BARRIER") &&
         !compute_stats.strong_barriers) ||
        (getenv("ASAHI_SHIM_G17P_EXPECT_BACK_TO_BACK") &&
-        !compute_stats.unbarriered_launches)) {
+        !compute_stats.unbarriered_launches) ||
+       (getenv("ASAHI_SHIM_G17P_EXPECT_STRONG_INDIRECT_COMPUTE_BARRIER") &&
+        !compute_stats.indirect_strong_barriers)) {
       fprintf(stderr,
               "shim: incomplete G17P compute coverage: launches=%u "
-              "back-to-back=%u barriers=%u strong=%u terminated=%u\n",
+              "back-to-back=%u barriers=%u strong=%u indirect=%u "
+              "indirect-strong=%u terminated=%u\n",
               compute_stats.launches, compute_stats.unbarriered_launches,
               compute_stats.barriers, compute_stats.strong_barriers,
+              compute_stats.indirect_launches,
+              compute_stats.indirect_strong_barriers,
               compute_stats.terminated);
       _Exit(EXIT_FAILURE);
    }
@@ -2250,6 +2255,9 @@ asahi_ioctl_submit_unlocked(int fd, unsigned long request, void *arg)
          compute_stats.barriers += stats.barriers;
          compute_stats.prologue_barriers += stats.prologue_barriers;
          compute_stats.strong_barriers += stats.strong_barriers;
+         compute_stats.indirect_launches += stats.indirect_launches;
+         compute_stats.indirect_strong_barriers +=
+            stats.indirect_strong_barriers;
          compute_stats.sstt_flushes += stats.sstt_flushes;
          compute_stats.terminated |= stats.terminated;
          g17p_streams_validated++;

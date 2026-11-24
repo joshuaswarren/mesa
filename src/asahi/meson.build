@@ -320,6 +320,28 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # An indirect tessellated draw is not batched: its tessellation launches
+  # are indirect precompiled dispatches that ask for AGX_BARRIER_ALL, so each
+  # must end in the strong cache flush its consumer relies on.
+  test(
+    'hk-g17p-tess-indirect-stream',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim, vulkan_tess_batch_order, '--shim', '--indirect',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_COMPUTE=1',
+      'ASAHI_SHIM_G17P_EXPECT_STRONG_INDIRECT_COMPUTE_BARRIER=1',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # Global queue priorities: HIGH is advertised on every chip and passed to
   # the kernel, whose refusal (no CAP_SYS_NICE: EACCES; a GPU backend without
   # HIGH: EINVAL) is VK_ERROR_NOT_PERMITTED; REALTIME is always refused.
