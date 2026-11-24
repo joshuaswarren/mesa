@@ -32,6 +32,7 @@
 #include "agx_nir.h"
 #include "agx3_alu_core.h"
 #include "agx3_matrix_core.h"
+#include "agx3_native_stats.h"
 #include "agx_opcodes.h"
 #include "agx3_pack.h"
 #include "agx3_rt_core.h"
@@ -9713,8 +9714,90 @@ agx_set_st_vary_final(agx_context *ctx)
    agx_no_varyings(&_b);
 }
 
+/* Count the instructions of the encoded program in [code, code + size) with the
+ * length rule of the encoding it was emitted in. The walk stops at the first
+ * byte sequence no form matches, so a count is never larger than the program.
+ */
 static void
-agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
+agx_count_native(const agx_context *ctx, const uint8_t *code, size_t size,
+                 struct agx2_stats *stats)
+{
+   signed (*length)(const uint8_t *, size_t, const char **);
+   switch (ctx->key->dev.encoding) {
+   case AGX_ISA_ENCODING_AGX2:
+      length = agx2_instr_length;
+      break;
+   case AGX_ISA_ENCODING_AGX3B:
+      length = agx3b_instr_length;
+      break;
+   case AGX_ISA_ENCODING_AGX3C:
+      /* G18G programs are transcoded to agx3d before this runs. */
+      length = ctx->key->dev.emit_agx3d ? agx3d_instr_length
+                                        : agx3c_instr_length;
+      break;
+   default:
+      return;
+   }
+
+   for (size_t i = 0; i < size;) {
+      const char *display = NULL;
+      const signed n = length(code + i, size - i, &display);
+      if (n <= 0)
+         break;
+
+      stats->native++;
+      if (display && !strncmp(display, "ldimm", 5) &&
+          (display[5] == '\0' || display[5] == ' '))
+         stats->native_ldimm++;
+      i += n;
+   }
+}
+
+/* Immediate moves and uniform-file copies inside loops, counted after register
+ * allocation and before pseudo-instruction lowering turns copies into ALU
+ * truth tables. In structured AGX control flow a loop spans the source-order
+ * interval from its header to the block holding the back edge. */
+static void
+agx_count_loop_copies(agx_context *ctx)
+{
+   unsigned nr_blocks = 0;
+   agx_foreach_block(ctx, block)
+      nr_blocks = MAX2(nr_blocks, block->index + 1);
+
+   bool *in_loop = rzalloc_array(ctx, bool, MAX2(nr_blocks, 1));
+   if (!in_loop)
+      return;
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_successor(block, succ) {
+         if (succ->loop_header && succ->index <= block->index) {
+            for (unsigned i = succ->index; i <= block->index; ++i)
+               in_loop[i] = true;
+         }
+      }
+   }
+
+   ctx->loop_immediates = 0;
+   ctx->loop_uniform_copies = 0;
+   agx_foreach_block(ctx, block) {
+      if (!in_loop[block->index])
+         continue;
+
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM)
+            ctx->loop_immediates++;
+         else if (I->op == AGX_OPCODE_MOV &&
+                  I->src[0].type == AGX_INDEX_UNIFORM)
+            ctx->loop_uniform_copies++;
+      }
+   }
+
+   ralloc_free(in_loop);
+}
+
+static void
+agx_calc_stats(agx_context *ctx, const struct util_dynarray *binary,
+               unsigned offset, struct agx2_stats *stats)
 {
    struct agx_cycle_estimate cycles = agx_estimate_cycles(ctx);
    uint32_t old_preamble_inst = stats->preamble_inst;
@@ -9723,13 +9806,15 @@ agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
       .alu = cycles.alu,
       .fscib = cycles.f_scib,
       .ic = cycles.ic,
-      .code_size = size,
+      .code_size = binary->size,
       .gprs = ctx->max_reg,
       .uniforms = ctx->out->push_count,
       .scratch = ctx->scratch_size_B,
       .threads = agx_occupancy_for_register_count(ctx->max_reg).max_threads,
       .loops = ctx->loop_count,
       .preamble_inst = old_preamble_inst,
+      .loop_immediates = ctx->loop_immediates,
+      .loop_uniform_copies = ctx->loop_uniform_copies,
    };
 
    /* Count instructions */
@@ -9740,6 +9825,22 @@ agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
          stats->spills++;
       else if (I->op == AGX_OPCODE_STACK_LOAD)
          stats->fills++;
+   }
+
+   /* The UVS relocation list, when there is one, follows the main program. */
+   const unsigned end = ctx->out->agx3_uvs_reloc_count
+                           ? ctx->out->agx3_uvs_relocs_offset
+                           : binary->size;
+   if (end > offset)
+      agx_count_native(ctx, (const uint8_t *)binary->data + offset,
+                       end - offset, stats);
+
+   /* agx3_pack_binary() on this thread just encoded this program. */
+   if (agx_isa_is_agx3(ctx->key->dev.encoding)) {
+      stats->carriers = agx3_native_stats.wait_carriers;
+      stats->cf_drains = agx3_native_stats.cf_drains;
+      stats->loop_cf_drains = agx3_native_stats.loop_cf_drains;
+      stats->staging_copies = agx3_native_stats.staging_copies;
    }
 }
 
@@ -13811,6 +13912,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    if (ctx->any_quad_divergent_shuffle)
       agx_lower_divergent_shuffle(ctx);
 
+   agx_count_loop_copies(ctx);
    agx_lower_pseudo(ctx);
 
    /* AGX3's thread-private storage moves one 16-bit or 32-bit component per
@@ -13985,7 +14087,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
       ctx->out->stats.preamble_inst = instrs;
    } else {
-      agx_calc_stats(ctx, binary->size, &ctx->out->stats);
+      agx_calc_stats(ctx, binary, offset, &ctx->out->stats);
    }
 
    /*

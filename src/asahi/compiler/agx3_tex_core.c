@@ -8,6 +8,7 @@
 
 #include "agx3_alu_core.h"
 #include "agx3_binder.h"
+#include "agx3_native_stats.h"
 
 #include <string.h>
 
@@ -1010,7 +1011,7 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
 }
 
 static bool
-agx3_tex_stage_copy_hints_impl(enum agx_isa_encoding enc, bool wide_source,
+agx3_tex_stage_copy_hints_encode(enum agx_isa_encoding enc, bool wide_source,
                     uint16_t dest, uint16_t src,
                     uint8_t slot, uint16_t wait_mask,
                           bool src_cache, bool src_discard,
@@ -1073,6 +1074,21 @@ agx3_tex_stage_copy_hints_impl(enum agx_isa_encoding enc, bool wide_source,
    memset(out, 0, AGX3_TEX_COPY_MAX_LENGTH);
    *len = 0;
    return false;
+}
+
+static bool
+agx3_tex_stage_copy_hints_impl(enum agx_isa_encoding enc, bool wide_source,
+                               uint16_t dest, uint16_t src, uint8_t slot,
+                               uint16_t wait_mask, bool src_cache,
+                               bool src_discard,
+                               uint8_t out[AGX3_TEX_COPY_MAX_LENGTH],
+                               uint8_t *len)
+{
+   const bool ok = agx3_tex_stage_copy_hints_encode(
+      enc, wide_source, dest, src, slot, wait_mask, src_cache, src_discard, out,
+      len);
+   agx3_native_stats.staging_copies += ok;
+   return ok;
 }
 
 bool

@@ -32,6 +32,7 @@ extern "C" {
 #include "agx3_iadd_core.h"
 #include "agx3_local_tps_core.h"
 #include "agx3_mem_core.h"
+#include "agx3_native_stats.h"
 #include "agx3_pack.h"
 #include "agx3_scs_core.h"
 #include "agx3_slot_core.h"
@@ -7922,6 +7923,42 @@ TEST_F(AGX3PackBinary, ImmediateLeftIntegerComparisonsCanonicalize)
          ASSERT_TRUE(agx3_pack_end(enc, &end));
          append(want, end.bytes, end.length);
          EXPECT_EQ(pack(b), want);
+      }
+   }
+}
+
+/* Native statistics: a load still in flight at a branch that does not read it
+ * is a control-flow drain; a load the branch compare reads is only waited for,
+ * as it would be anyway. Both waits ride on carriers. */
+TEST_F(AGX3PackBinary, NativeStatsCountControlFlowDrains)
+{
+   for (int e = 0; e < 2; ++e) {
+      for (bool compare_reads_load : {false, true}) {
+         const enum agx_isa_encoding enc =
+            e ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B;
+         agx_builder *b = builder(enc);
+         b->shader->stage = MESA_SHADER_COMPUTE;
+         agx_block *pop = agx_test_block(b->shader);
+         agx_index loaded = agx_register(4, AGX_SIZE_32);
+         agx_device_load_to(b, loaded, agx_uniform(0, AGX_SIZE_64),
+                            agx_immediate(0), AGX_FORMAT_I32, 1, 0, false);
+
+         agx_begin_cf(b);
+         agx_if_icmp(b, compare_reads_load ? loaded : agx_register(0, AGX_SIZE_32),
+                     agx_register(2, AGX_SIZE_32), 1, AGX_ICOND_ULT, false, pop);
+         agx_jmp_exec_none(b, pop);
+         agx_block_add_successor(agx_start_block(b->shader), pop);
+
+         agx_builder pb = agx_init_builder(b->shader, agx_after_block(pop));
+         agx_pop_exec(&pb, 1);
+         agx_device_store(&pb, loaded, agx_uniform(0, AGX_SIZE_64),
+                          agx_immediate(4), AGX_FORMAT_I32, 1, 0, false);
+         agx_stop(&pb);
+
+         EXPECT_FALSE(pack(b).empty());
+         EXPECT_EQ(agx3_native_stats.cf_drains, compare_reads_load ? 0u : 1u);
+         EXPECT_EQ(agx3_native_stats.loop_cf_drains, 0u);
+         EXPECT_GE(agx3_native_stats.wait_carriers, 1u);
       }
    }
 }
