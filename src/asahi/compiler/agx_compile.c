@@ -4045,13 +4045,21 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
                emitted = true;
             }
 
+            /* Shared memory takes the threadgroup rendezvous only for a
+             * workgroup execution barrier. A memory-only fence
+             * (memoryBarrierShared(), or the shared part of memoryBarrier())
+             * may sit in divergent control flow, where a rendezvous would
+             * count arrivals the rest of the workgroup never makes, so it
+             * takes the threadgroup-memory fence instead. Within a subgroup
+             * no instruction is needed. */
             if (modes & nir_var_mem_shared) {
                const bool subgroup =
                   nir_intrinsic_execution_scope(instr) <= SCOPE_SUBGROUP &&
                   nir_intrinsic_memory_scope(instr) <= SCOPE_SUBGROUP;
                agx_scoped_barrier_agx3(
-                  b, subgroup ? AGX3_BARRIER_SCOPE_SUBGROUP_SHARED
-                              : AGX3_BARRIER_SCOPE_THREADGROUP);
+                  b, subgroup      ? AGX3_BARRIER_SCOPE_SUBGROUP_SHARED
+                     : memory_only ? AGX3_BARRIER_SCOPE_THREADGROUP_FENCE
+                                   : AGX3_BARRIER_SCOPE_THREADGROUP);
                emitted = true;
             }
          }

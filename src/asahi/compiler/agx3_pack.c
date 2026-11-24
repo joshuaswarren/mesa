@@ -1436,6 +1436,33 @@ agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
       memset(out, 0, sizeof(*out));
       return true;
    }
+   /*
+    * The barrier's fields mean the same on both encodings: the memory class
+    * (f24 device, f26 threadgroup, f28 texture), f29 the threadgroup
+    * rendezvous, f39 the threadgroup memory scope. Each witnessed
+    * memory-only fence is its barrier with f29 cleared and f40 set: the
+    * device fence (device barrier f24 f29 f39 -> f24 f39 f40) and, on AGX3C,
+    * atomic_thread_fence(mem_texture, thread_scope_threadgroup) (texture
+    * barrier f28 f29 f39 f40 f41 -> f28 f39 f40 f41). The threadgroup-memory
+    * fence is the threadgroup barrier (f26 f29 f39) with the same rule
+    * applied. A rendezvous in its place would count arrivals that a fence
+    * in divergent control flow never gets from the rest of the workgroup.
+    */
+   if (scope == AGX3_BARRIER_SCOPE_THREADGROUP_FENCE) {
+      if (out == NULL || (encoding != AGX_ISA_ENCODING_AGX3B &&
+                          encoding != AGX_ISA_ENCODING_AGX3C))
+         return false;
+      const struct agx3_field_kv fields[] = {
+         {14, 3}, {15, 9}, {26, 1}, {30, 2}, {39, 1}, {40, 1},
+      };
+      const bool agx3c = encoding == AGX_ISA_ENCODING_AGX3C;
+      memset(out, 0, sizeof(*out));
+      /* f14/f15 are fixed fields of the AGX3C form only. */
+      return agx3_bind_compose(encoding, AGX3_MN_barrier, 0,
+                               fields + (agx3c ? 0 : 2),
+                               agx3c ? 6 : 4, NULL, 0, out->bytes,
+                               &out->length);
+   }
    if (scope == AGX3_BARRIER_SCOPE_MESH_PAYLOAD_ENTRY ||
        scope == AGX3_BARRIER_SCOPE_OBJECT_PAYLOAD_EXIT) {
       if (encoding != AGX_ISA_ENCODING_AGX3C || out == NULL) return false;

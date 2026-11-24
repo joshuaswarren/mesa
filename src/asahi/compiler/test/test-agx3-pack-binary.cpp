@@ -5244,7 +5244,7 @@ TEST_F(AGX3PackBinary, ScopedMemoryBarriers)
 TEST_F(AGX3PackBinary, ScopedMemoryBarrierRefusesUnknownScope)
 {
    agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C);
-   agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_OBJECT_PAYLOAD_EXIT + 1);
+   agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_THREADGROUP_FENCE + 1);
    agx_stop(b);
    pack(b, /*expect_ok=*/false);
 }
