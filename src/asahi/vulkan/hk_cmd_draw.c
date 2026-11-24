@@ -10837,7 +10837,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
 
    key->epilog = (struct agx_fs_epilog_key){
       .link = fs->info.fs.epilog_key,
-      .colour_unit_range = fs->info.fs.g17p_colour_unit_range,
+      .colour_unit_range = fs->info.fs.colour_unit_range,
       .nr_samples = samples,
       .a2c_in_main = fs->info.fs.a2c_in_main,
       .blend.alpha_to_coverage = dyn->ms.alpha_to_coverage_enable,
