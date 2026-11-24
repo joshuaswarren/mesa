@@ -643,10 +643,10 @@ hk_populate_vs_key(struct hk_vs_key *key,
    }
 }
 
-/* The native AGX3B parts (G15, G17P) run a discarding shader's read-only
- * depth test in the prolog instead (hk_g17p_read_only_early_reject_in()),
- * with the main part's selector off. Whether a draw takes that path is
- * draw-time state; these pipeline states rule it out for every draw. */
+/* AGX3 (native and M5) runs a discarding shader's read-only depth test in the
+ * prolog instead (hk_g17p_read_only_early_reject_in()), with the main part's
+ * selector off. Whether a draw takes that path is draw-time state; these
+ * pipeline states rule it out for every draw. */
 static bool
 hk_g17p_static_no_early_reject(const struct vk_graphics_pipeline_state *state)
 {
@@ -693,13 +693,12 @@ hk_populate_fs_key(struct hk_fs_key *key,
        !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES))
       key->m5_position_samples = state->ms->rasterization_samples;
 
-   /* M5 has no read-only early reject to rule out. */
    if (agx_chip_native_or_m5(chip) &&
        state->ms != NULL &&
        !BITSET_TEST(state->dynamic,
                     MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
        !state->ms->alpha_to_coverage_enable &&
-       (agx_chip_g17_m5(chip) || hk_g17p_static_no_early_reject(state)))
+       hk_g17p_static_no_early_reject(state))
       key->static_tests = true;
 
    if (chip == AGX_CHIP_G17P && state->ms != NULL &&

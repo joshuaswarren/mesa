@@ -739,3 +739,32 @@ TEST_F(G17PMSAAEpilog, PerSampleFramebufferFetchMainCompilesForNativeAGX3)
       }
    }
 }
+
+TEST_F(G17PMSAAEpilog, ReadOnlyEarlyRejectPrologCompilesForAGX3)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G17S}) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "read-only early reject");
+      struct agx_fs_prolog_key pkey = {};
+      pkey.api_sample_mask = 0xff;
+      pkey.run_zs_tests = true;
+      pkey.nr_samples = 1;
+      agx_nir_fs_prolog(&b, &pkey);
+      agx_preprocess_nir(b.shader);
+
+      agx_shader_key key = {};
+      key.dev.encoding = chip == AGX_CHIP_G17S ? AGX_ISA_ENCODING_AGX3C
+                                               : AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = chip;
+      key.no_preamble = true;
+      key.no_stop = true;
+      key.fs.nr_samples = 1;
+
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+         << "chip " << chip << ": " << agx_last_compile_refusal();
+      EXPECT_TRUE(part.info.writes_sample_mask) << "chip " << chip;
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
