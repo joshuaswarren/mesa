@@ -95,6 +95,17 @@ lower_pack = [
     (('u2f32', ('u2u32', a)), ('u2f32', a)),
     (('i2f32', ('i2i32', a)), ('i2f32', a)),
 
+    # A value zero-extended from 8 or 16 bits is non-negative as a signed
+    # integer, so its signed conversion is the unsigned conversion of the
+    # narrow value, which reads the half register directly instead of
+    # widening it first (SPIR-V's OpUConvert of a byte, then OpConvertSToF).
+    # Only for a byte loaded on its own: one taken from a word, a four-byte
+    # load included, converts better through the word (fold_ubyte_to_float,
+    # fold_w8_word_unpack()).
+    (('i2f32', ('u2u32', 'a@8(is_scalar_intrinsic_result)')), ('u2f32', a)),
+    (('i2f32', ('u2u32', 'a@16')), ('u2f32', a)),
+    (('i2f16', ('u2u16', 'a@8(is_scalar_intrinsic_result)')), ('u2f16', a)),
+
     # Chew through some 8-bit before the backend has to deal with it
     (('f2u8', a), ('u2u8', ('f2u16', a))),
     (('f2i8', a), ('u2u8', ('f2i16', a))),
@@ -509,6 +520,7 @@ def run():
 
     print('#include "agx_nir.h"')
     print('#include "agx_nir_aligned_bounds.h"')
+    print('#include "agx_nir_algebraic_helpers.h"')
     print('#include "nir.h"')
     print("""
 static bool
