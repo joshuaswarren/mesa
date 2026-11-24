@@ -84,6 +84,13 @@ enum agx_chip_cap {
     * Gen9 colour compression is gated separately by
     * agx_chip_gen9_color_compression() (G16G and G17P). */
    AGX_CAP_GEN9_2D_COMPRESSION = 1u << 12,
+
+   /* Register allocation tie-breaks co-read GPR pairs across the three 32-bit
+    * register banks ((reg / 2) % 3) and coalesces single-use loop RMW
+    * accumulator chains on non-preamble shaders. Enabled on G17P (HAL200); off
+    * on M5 (G17G/G17S/G17C), G15, G16, G18G, and AGX2 until per-generation
+    * hardware A/B and CTS rows are collected. */
+   AGX_CAP_MOD3_REG_BANK_RA = 1u << 13,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -102,7 +109,7 @@ enum agx_chip_cap {
     AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |                                        \
     AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_RESIDENCY_3D |      \
     AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
-    AGX_CAP_GEN9_2D_COMPRESSION)
+    AGX_CAP_GEN9_2D_COMPRESSION | AGX_CAP_MOD3_REG_BANK_RA)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
