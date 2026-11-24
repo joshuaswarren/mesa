@@ -17,6 +17,7 @@
 #include "compiler/nir/nir_format_convert.h"
 #include "gallium/auxiliary/util/u_blitter.h"
 #include "gallium/auxiliary/util/u_dump.h"
+#include "gallium/auxiliary/util/u_gen_mipmap.h"
 #include "nir/pipe_nir.h"
 #include "pipe/p_context.h"
 #include "pipe/p_defines.h"
@@ -1060,7 +1061,7 @@ agx_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
  * against 1 ms rendered. Such a texture goes to the generic path when every
  * level it would render into passes a dry run of that PBE.
  */
-bool
+static bool
 agx_generate_mipmap_g17g(struct pipe_context *pctx, struct pipe_resource *prsc,
                          enum pipe_format format, unsigned base_level,
                          unsigned last_level, unsigned first_layer,
@@ -1247,7 +1248,7 @@ agx_agx3_mipmap_ensure_cdm_space(struct agx_context *ctx,
  * libagx_mipmap_unorm8x4_odd (matching Borealis's hk_g17p_compute_blit()),
  * avoiding one 3D render pass per mip level. Unsupported formats or layouts
  * return false and fall back to util_gen_mipmap(). */
-bool
+static bool
 agx_generate_mipmap_agx3(struct pipe_context *pctx, struct pipe_resource *prsc,
                          enum pipe_format format, unsigned base_level,
                          unsigned last_level, unsigned first_layer,
@@ -1414,4 +1415,29 @@ agx_generate_mipmap_agx3(struct pipe_context *pctx, struct pipe_resource *prsc,
    }
 
    return true;
+}
+
+/* pipe_context::generate_mipmap. A native path declines what it does not
+ * handle, and the blitter then generates the levels here rather than leaving
+ * them to the state tracker: under u_threaded_context, tc_generate_mipmap()
+ * has already told the state tracker the driver generates them, and
+ * tc_call_generate_mipmap() asserts that it did. tc_generate_mipmap() only
+ * accepts a format the driver renders to, which util_gen_mipmap() needs. */
+bool
+agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
+                    enum pipe_format format, unsigned base_level,
+                    unsigned last_level, unsigned first_layer,
+                    unsigned last_layer)
+{
+   const enum agx_chip chip = agx_device(pctx->screen)->chip;
+   const bool native =
+      agx_chip_g17_m5(chip)
+         ? agx_generate_mipmap_g17g(pctx, prsc, format, base_level,
+                                    last_level, first_layer, last_layer)
+         : agx_generate_mipmap_agx3(pctx, prsc, format, base_level,
+                                    last_level, first_layer, last_layer);
+
+   return native ||
+          util_gen_mipmap(pctx, prsc, format, base_level, last_level,
+                          first_layer, last_layer, PIPE_TEX_FILTER_LINEAR);
 }

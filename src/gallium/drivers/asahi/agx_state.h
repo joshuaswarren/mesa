@@ -1732,12 +1732,6 @@ bool agx_g17p_staged_resolve_blit_shape(const struct pipe_blit_info *info);
 
 bool agx_g17p_stencil_plane_blit_shape(const struct pipe_blit_info *info);
 
-bool agx_generate_mipmap_g17g(struct pipe_context *pctx,
-                              struct pipe_resource *prsc,
-                              enum pipe_format format, unsigned base_level,
-                              unsigned last_level, unsigned first_layer,
-                              unsigned last_layer);
-
 bool agx_generate_mipmap_agx3_supported(const struct agx_device *dev,
                                         const struct agx_resource *rsrc,
                                         enum pipe_format format,
@@ -1746,11 +1740,10 @@ bool agx_generate_mipmap_agx3_supported(const struct agx_device *dev,
                                         unsigned first_layer,
                                         unsigned last_layer);
 
-bool agx_generate_mipmap_agx3(struct pipe_context *pctx,
-                              struct pipe_resource *prsc,
-                              enum pipe_format format, unsigned base_level,
-                              unsigned last_level, unsigned first_layer,
-                              unsigned last_layer);
+bool agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
+                         enum pipe_format format, unsigned base_level,
+                         unsigned last_level, unsigned first_layer,
+                         unsigned last_layer);
 
 void agx_resource_copy_region(struct pipe_context *pctx,
                               struct pipe_resource *dst, unsigned dst_level,
