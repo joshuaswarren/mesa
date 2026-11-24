@@ -1563,7 +1563,7 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
 
 struct global_load_lowering {
    bool soft_fault;
-   /* G17P and M5: storage-buffer loads use the soft-fault form as well:
+   /* With soft faults, storage-buffer loads use the soft-fault form as well:
     * load, then zero the value when the access is out of bounds. */
    bool storage_result_select;
 };
@@ -3332,24 +3332,14 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    bool lowered_global_io = false;
    NIR_PASS(lowered_global_io, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
-   /* While UBO (and G17P/M5 SSBO) offsets are still 32-bit deref offsets,
-    * merge adjacent scalar and component loads: once lowered to 64-bit
-    * base + u2u64(offset32), potential 32-bit wrap hides adjacency from later
-    * nir_opt_load_store_vectorize. Gate pre-lowering SSBO vectorization on
-    * G17P and M5 (matching storage_result_select below) so AGX2 and other
-    * generations keep their exact existing lowering sequence. A uniform buffer
-    * does not change during a draw or dispatch, so its loads may also be
-    * marked reorderable before CSE and vectorization. */
-   const bool agx3_ssbo_vec = agx_chip_g17p_or_m5(dev->dev.chip);
-   bool lowered_buf_io = false;
-   if (!agx3_ssbo_vec) {
-      NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
-               hk_buffer_addr_format(rs->storage_buffers,
-                                     rs->null_storage_buffer_descriptor,
-                                     agx_chip_g17_m5(dev->dev.chip)));
-   }
+   /* While UBO and SSBO offsets are still 32-bit deref offsets, merge adjacent
+    * scalar and component loads: once lowered to 64-bit base + u2u64(offset32),
+    * potential 32-bit wrap hides adjacency from later
+    * nir_opt_load_store_vectorize. A uniform buffer does not change during a
+    * draw or dispatch, so its loads may also be marked reorderable before CSE
+    * and vectorization. */
    const nir_variable_mode pre_lower_vec_modes =
-      nir_var_mem_ubo | (agx3_ssbo_vec ? nir_var_mem_ssbo : 0);
+      nir_var_mem_ubo | nir_var_mem_ssbo;
    bool lowered_pre_vec = false;
    NIR_PASS(lowered_pre_vec, nir, nir_lower_array_deref_of_vec,
             pre_lower_vec_modes, NULL,
@@ -3367,20 +3357,18 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
                             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
                          ? 0
                          : nir_var_mem_ubo) |
-                     (!agx3_ssbo_vec ||
-                            rs->storage_buffers ==
-                               VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
+                     (rs->storage_buffers ==
+                            VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
                          ? 0
                          : nir_var_mem_ssbo),
                   .callback = agx_mem_vectorize_cb,
                });
    }
-   if (agx3_ssbo_vec) {
-      NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
-               hk_buffer_addr_format(rs->storage_buffers,
-                                     rs->null_storage_buffer_descriptor,
-                                     agx_chip_g17_m5(dev->dev.chip)));
-   }
+   bool lowered_buf_io = false;
+   NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
+            hk_buffer_addr_format(rs->storage_buffers,
+                                  rs->null_storage_buffer_descriptor,
+                                  agx_chip_g17_m5(dev->dev.chip)));
    NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_ubo_addr_format(rs->uniform_buffers));
 
@@ -3436,7 +3424,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     */
    struct global_load_lowering global_loads = {
       .soft_fault = agx_has_soft_fault(&dev->dev),
-      .storage_result_select = agx3_ssbo_vec,
+      .storage_result_select = agx_has_soft_fault(&dev->dev),
    };
    const bool need_pre_bounds_opt =
       !already_preprocessed || lowered_desc || lowered_global_io ||

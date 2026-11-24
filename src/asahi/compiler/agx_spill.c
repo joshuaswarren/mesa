@@ -1290,8 +1290,7 @@ compute_w_entry_loop_header(struct spill_ctx *ctx)
 
    BITSET_WORD *used = NULL;
    unsigned room = 0;
-   if (agx_chip_g17p_or_m5(ctx->shader->key->dev.chip) &&
-       !ctx->remat_only) {
+   if (!ctx->remat_only) {
       used = BITSET_CALLOC(ctx->n);
       room = loop_room_for_live_through(ctx, used);
    }

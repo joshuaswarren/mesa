@@ -18,7 +18,7 @@
 static void
 agx3_remove_redundant_physical_copies(agx_context *ctx)
 {
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+   if (!agx_isa_is_agx3(ctx->key->dev.encoding) ||
        ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
       return;
 
