@@ -136,4 +136,27 @@ hk_agx3_refit_prepare_threads(uint32_t leaf_bound, uint32_t node_bound,
       threads = group;
    return (uint32_t)((threads + group - 1) & ~(group - 1));
 }
+
+static inline uint32_t
+hk_agx3_refit_direct_leaf_invocations(uint32_t leaf_node_count)
+{
+   const uint32_t jobs_per_group = HK_AGX3_GEN1_NODE_GROUP_LANES / 8u;
+   const uint32_t groups =
+      leaf_node_count ? (leaf_node_count + jobs_per_group - 1u) / jobs_per_group : 1u;
+   return groups * HK_AGX3_GEN1_NODE_GROUP_LANES;
+}
+
+/* Single-geometry, in-place small/medium triangle updates load vertices
+ * directly inside the leaf-job encoder, skipping prepare, triangle placement
+ * scratch writes/reads, and the intermediate barrier. */
+static inline bool
+hk_agx3_refit_uses_direct_triangles(bool skips_leaves, bool in_place,
+                                    uint32_t geometry_count,
+                                    uint32_t primitive_count,
+                                    uint32_t leaf_node_count)
+{
+   return skips_leaves && in_place && geometry_count == 1u &&
+          leaf_node_count > 0u && primitive_count == leaf_node_count &&
+          hk_agx3_refit_fused_all(leaf_node_count);
+}
 #endif

@@ -43,6 +43,7 @@ const uint32_t *hk_agx3_refit_spirv(enum agx_chip chip, size_t *size_B);
 const uint32_t *hk_gen1_agx3_node_encoder_spirv(bool pairs, size_t *size_B);
 const uint32_t *hk_gen1_agx3_refit_spirv(size_t *size_B);
 const uint32_t *hk_gen1_agx3_refit_top_spirv(size_t *size_B);
+const uint32_t *hk_gen1_agx3_refit_encode_direct_spirv(size_t *size_B);
 const uint32_t *hk_m5_agx3_node_encoder_spirv(size_t *size_B);
 const uint32_t *hk_m5_agx3_refit_spirv(size_t *size_B);
 

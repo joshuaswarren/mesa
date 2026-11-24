@@ -259,6 +259,20 @@ struct hk_agx3_refit_encode_args {
    VOID_REF triangles;
 };
 
+/* Push constants of direct single-geometry in-place triangle refit encoding
+ * (agx3_leaf.comp built with HK_AGX3_REFIT_DIRECT): skips prepare and
+ * triangle placement by loading vertices directly from the application's
+ * buffers using the source structure's retained child offsets. */
+struct hk_agx3_refit_direct_args {
+   VOID_REF metadata;
+   VOID_REF bounds;
+   VOID_REF output_bvh;
+   REF(uint32_t) status;
+   vk_bvh_geometry_data geometry;
+   uint32_t slot_bias;
+   uint32_t leaf_bound;
+};
+
 /* A triangle as an update's leaf pass leaves it, at its leaf's slot: its
  * vertices, zero for an inactive triangle as updatable structures keep it,
  * and its geometry and primitive IDs, as an IR triangle leaf has them. */

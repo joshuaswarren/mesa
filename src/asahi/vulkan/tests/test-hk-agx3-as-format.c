@@ -126,6 +126,13 @@ main(void)
    assert(refit_top && refit_top != gen1_refit && refit_top != m5_refit);
    assert(spirv_local_size_x(refit_top, refit_top_B) == HK_AGX3_REFIT_TOP_LANES);
 
+   size_t refit_direct_B;
+   const uint32_t *refit_direct =
+      hk_gen1_agx3_refit_encode_direct_spirv(&refit_direct_B);
+   assert(refit_direct && refit_direct != gen1_enc && refit_direct != m5_enc);
+   assert(spirv_local_size_x(refit_direct, refit_direct_B) ==
+          HK_AGX3_GEN1_NODE_GROUP_LANES);
+
    /* GEN1 refit scheduling policy: small/medium updates fuse every inner level
     * and envelope into one direct workgroup; larger updates fuse the top three
     * levels plus envelope and keep aligned prepare grids. */
@@ -160,6 +167,25 @@ main(void)
          }
       }
    }
+
+   /* Direct leaf-job refit dispatch sizing and single-geometry triangle fast
+    * path predicates. */
+   assert(hk_agx3_refit_direct_leaf_invocations(0) == 32u);
+   assert(hk_agx3_refit_direct_leaf_invocations(1) == 32u);
+   assert(hk_agx3_refit_direct_leaf_invocations(4) == 32u);
+   assert(hk_agx3_refit_direct_leaf_invocations(5) == 64u);
+   assert(hk_agx3_refit_direct_leaf_invocations(256) == 2048u);
+   assert(hk_agx3_refit_direct_leaf_invocations(272) == 2176u);
+   assert(hk_agx3_refit_direct_leaf_invocations(2048) == 16384u);
+   assert(hk_agx3_refit_direct_leaf_invocations(8192) == 65536u);
+   assert(hk_agx3_refit_uses_direct_triangles(true, true, 1, 2048, 2048));
+   assert(hk_agx3_refit_uses_direct_triangles(true, true, 1, 8192, 8192));
+   assert(!hk_agx3_refit_uses_direct_triangles(false, true, 1, 2048, 2048));
+   assert(!hk_agx3_refit_uses_direct_triangles(true, false, 1, 2048, 2048));
+   assert(!hk_agx3_refit_uses_direct_triangles(true, true, 2, 2048, 2048));
+   assert(!hk_agx3_refit_uses_direct_triangles(true, true, 1, 1024, 2048));
+   assert(!hk_agx3_refit_uses_direct_triangles(true, true, 1, 0, 0));
+   assert(!hk_agx3_refit_uses_direct_triangles(true, true, 1, 8193, 8193));
 
    /* The layouts differ exactly where the formats do. */
    struct hk_agx3_as_layout g, m;
