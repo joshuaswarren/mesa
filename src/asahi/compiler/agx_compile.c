@@ -5869,6 +5869,21 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
             continue;
       }
 
+      /* A minifloat multiplier takes the other multiplicand's negation in its
+       * sign bit. The exact product's sign is the XOR of the operand signs
+       * and the FMA still rounds once, so fma(-x, #k, c) is fma(x, #-k, c)
+       * for every x, including zeros, infinities and NaNs. Only an absolute
+       * value is left to materialize below. */
+      for (unsigned s = 0; s < 2; ++s) {
+         agx_index *imm = &I->src[1 - s];
+         if (I->src[s].neg && I->src[s].type != AGX_INDEX_IMMEDIATE &&
+             imm->type == AGX_INDEX_IMMEDIATE && imm->value <= 0xff &&
+             !imm->memory) {
+            I->src[s].neg = false;
+            imm->value ^= 0x80;
+         }
+      }
+
       agx_foreach_src(I, s) {
          const bool absolute = I->src[s].abs, negate = I->src[s].neg;
          if (!absolute && !negate)
