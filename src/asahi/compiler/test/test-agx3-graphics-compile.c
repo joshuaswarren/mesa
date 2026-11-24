@@ -1780,6 +1780,125 @@ g17p_count_bytes(const struct agx_shader_part *part, const uint8_t *needle,
 }
 
 static bool
+test_agx3_native_relative_shuffles(void)
+{
+   static const nir_intrinsic_op ops[] = {
+      nir_intrinsic_shuffle_xor,
+      nir_intrinsic_shuffle_up,
+      nir_intrinsic_shuffle_down,
+   };
+
+   for (unsigned oi = 0; oi < ARRAY_SIZE(ops); ++oi) {
+      /* Constant deltas in 1..31 stay native on G17P and M5 compute and compile
+       * end-to-end on AGX3B and AGX3C. */
+      static const uint32_t valid_deltas[] = {1, 4, 16, 31};
+      for (unsigned di = 0; di < ARRAY_SIZE(valid_deltas); ++di) {
+         for (unsigned m5 = 0; m5 < 2; ++m5) {
+            nir_builder b = nir_builder_init_simple_shader(
+               MESA_SHADER_COMPUTE, &agx_nir_options,
+               "native relative shuffle");
+            b.shader->info.workgroup_size[0] = 32;
+            b.shader->info.workgroup_size[1] = 1;
+            b.shader->info.workgroup_size[2] = 1;
+            nir_def *addr = nir_load_preamble(&b, 1, 64, .base = 0);
+            nir_def *val = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+            nir_def *delta = nir_imm_int(&b, valid_deltas[di]);
+            nir_def *res = ops[oi] == nir_intrinsic_shuffle_xor
+                              ? nir_shuffle_xor(&b, val, delta)
+                           : ops[oi] == nir_intrinsic_shuffle_up
+                              ? nir_shuffle_up(&b, val, delta)
+                              : nir_shuffle_down(&b, val, delta);
+            nir_store_global(&b, res, nir_iadd_imm(&b, addr, 64),
+                             .align_mul = 4);
+
+            if (m5)
+               agx_nir_lower_subgroups_m5(b.shader, true, true);
+            else
+               agx_nir_lower_subgroups_g17p(b.shader);
+
+            unsigned kept = 0;
+            nir_foreach_function_impl(impl, b.shader) {
+               nir_foreach_block(block, impl) {
+                  nir_foreach_instr(instr, block) {
+                     kept += instr->type == nir_instr_type_intrinsic &&
+                             nir_instr_as_intrinsic(instr)->intrinsic == ops[oi];
+                  }
+               }
+            }
+            if (kept != 1) {
+               fprintf(stderr,
+                       "relative shuffle op=%u delta=%u m5=%u kept=%u\n", oi,
+                       valid_deltas[di], m5, kept);
+               ralloc_free(b.shader);
+               return false;
+            }
+
+            b.shader->info.io_lowered = true;
+            struct agx_shader_key key = {
+               .dev.encoding =
+                  m5 ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B,
+               .no_preamble = true,
+            };
+            struct agx_shader_part part = {0};
+            const bool compiled = agx_compile_shader_nir(b.shader, &key, &part);
+            free(part.binary);
+            ralloc_free(b.shader);
+            if (!compiled) {
+               fprintf(stderr,
+                       "relative shuffle compile failed op=%u delta=%u m5=%u\n",
+                       oi, valid_deltas[di], m5);
+               return false;
+            }
+         }
+      }
+
+      /* Dynamic, zero, and out-of-range deltas must be lowered before backend
+       * emission. */
+      static const int invalid_deltas[] = {-1, 0, 32};
+      for (unsigned di = 0; di < ARRAY_SIZE(invalid_deltas); ++di) {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options,
+            "lowered relative shuffle");
+         nir_def *addr = nir_load_preamble(&b, 1, 64, .base = 0);
+         nir_def *val = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+         nir_def *delta = invalid_deltas[di] < 0
+                             ? nir_load_global(&b, 1, 32,
+                                               nir_iadd_imm(&b, addr, 4),
+                                               .align_mul = 4)
+                             : nir_imm_int(&b, invalid_deltas[di]);
+         nir_def *res = ops[oi] == nir_intrinsic_shuffle_xor
+                           ? nir_shuffle_xor(&b, val, delta)
+                        : ops[oi] == nir_intrinsic_shuffle_up
+                           ? nir_shuffle_up(&b, val, delta)
+                           : nir_shuffle_down(&b, val, delta);
+         nir_store_global(&b, res, nir_iadd_imm(&b, addr, 64), .align_mul = 4);
+
+         agx_nir_lower_subgroups_g17p(b.shader);
+         agx_nir_lower_dynamic_shuffle_xor(b.shader);
+
+         unsigned remaining = 0;
+         nir_foreach_function_impl(impl, b.shader) {
+            nir_foreach_block(block, impl) {
+               nir_foreach_instr(instr, block) {
+                  remaining += instr->type == nir_instr_type_intrinsic &&
+                               nir_instr_as_intrinsic(instr)->intrinsic ==
+                                  ops[oi];
+               }
+            }
+         }
+         ralloc_free(b.shader);
+         if (remaining != 0) {
+            fprintf(stderr,
+                    "invalid relative shuffle not lowered op=%u delta=%d\n", oi,
+                    invalid_deltas[di]);
+            return false;
+         }
+      }
+   }
+   return true;
+}
+
+static bool
 test_g17p_clustered_minmax_width(void)
 {
    for (unsigned bits = 16; bits <= 64; bits *= 2) {
@@ -9426,6 +9545,7 @@ main(int argc, char **argv)
    RUN(test_g17p_blended_payloads_beyond_bank);
    RUN(test_g17p_pbe_to_texture_fence);
    RUN(test_g17p_clustered_minmax_width);
+   RUN(test_agx3_native_relative_shuffles);
    RUN(test_g17p_half_rgb10_epilog);
    RUN(test_g17p_frag_sidefx_late_depth_once);
    RUN(test_g17c_txf_layer_saturation);

@@ -26,22 +26,25 @@ struct agx_subgroup_lower_options {
    bool m5_float_minmax;
 };
 
-/* M5 shuffles a 32-bit value across the subgroup by a constant lane XOR in
- * one instruction (simd_shuffle_xor with an immediate), where the general
- * shuffle is four broadcasts and three selects. The mask is usually a
- * constant only once loops are unrolled, so such shuffles are kept through
- * the early lowering and agx_nir_lower_dynamic_shuffle_xor() lowers the ones
- * that are left with any other mask.
+/* AGX3B (G17P) and AGX3C (M5) shuffle a 32-bit value across the subgroup by a
+ * constant lane XOR or up/down shift in one instruction (simd_shuffle_{xor,up,down}
+ * with an immediate 1..31), where the general shuffle is four broadcasts and
+ * three selects. The mask/delta is usually a constant only once loops are
+ * unrolled, so such shuffles are kept through the early lowering and
+ * agx_nir_lower_dynamic_shuffle_xor() lowers the ones that are left with any
+ * other operand.
  */
 static bool
-is_native_shuffle_xor(const nir_intrinsic_instr *intr)
+is_native_relative_shuffle(const nir_intrinsic_instr *intr)
 {
-   return intr->intrinsic == nir_intrinsic_shuffle_xor &&
+   return (intr->intrinsic == nir_intrinsic_shuffle_xor ||
+           intr->intrinsic == nir_intrinsic_shuffle_up ||
+           intr->intrinsic == nir_intrinsic_shuffle_down) &&
           intr->def.num_components == 1 && intr->def.bit_size == 32;
 }
 
 static bool
-has_native_shuffle_xor_mask(const nir_intrinsic_instr *intr)
+has_native_relative_shuffle_delta(const nir_intrinsic_instr *intr)
 {
    return nir_src_is_const(intr->src[1]) &&
           nir_src_as_uint(intr->src[1]) >= 1 &&
@@ -211,7 +214,7 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
    const struct agx_subgroup_lower_options *agx_options = data;
    unsigned cluster = 0;
 
-   if (agx_options->native_shuffle_xor && is_native_shuffle_xor(intr))
+   if (agx_options->native_shuffle_xor && is_native_relative_shuffle(intr))
       return false;
 
    /* Use default behaviour for everything but scans */
@@ -370,7 +373,8 @@ agx_nir_lower_subgroups(nir_shader *s)
 bool
 agx_nir_lower_subgroups_g17p(nir_shader *s)
 {
-   return agx_nir_lower_subgroups_internal(s, true, false, false, false);
+   return agx_nir_lower_subgroups_internal(
+      s, true, false, s->info.stage == MESA_SHADER_COMPUTE, false);
 }
 
 bool
@@ -395,7 +399,8 @@ agx_nir_lower_subgroups_m5(nir_shader *s, bool native_shuffle_xor,
 static bool
 dynamic_shuffle_xor_filter(const nir_intrinsic_instr *intr, const void *data)
 {
-   return is_native_shuffle_xor(intr) && !has_native_shuffle_xor_mask(intr);
+   return is_native_relative_shuffle(intr) &&
+          !has_native_relative_shuffle_delta(intr);
 }
 
 /*
