@@ -5729,6 +5729,10 @@ hk_xfer_begin_buffer(struct hk_cmd_buffer *cmd, VkBuffer _buffer,
    const bool device_address =
       (buffer->vk.usage & VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT) ||
       buffer->va;
+   if (lo_B >= hi_B || lo_B >= buffer->vk.size) {
+      hk_sync_xfer_begin_dst(cmd, 0, 0, device_address);
+      return;
+   }
    hk_sync_xfer_begin_dst(cmd, base + lo_B, base + MIN2(hi_B, buffer->vk.size),
                           device_address);
 }
@@ -5763,6 +5767,9 @@ VKAPI_ATTR void VKAPI_CALL
 hk_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   if (!info->regionCount)
+      return;
 
    if (cmd->state.deferred_clear_count) {
       VK_FROM_HANDLE(hk_buffer, src, info->srcBuffer);

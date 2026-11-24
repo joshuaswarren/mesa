@@ -2299,7 +2299,7 @@ hk_sync_xfer_begin_dst(struct hk_cmd_buffer *cmd, uint64_t lo, uint64_t hi,
          .valid = lo < hi,
          .device_address = device_address,
       };
-   } else if (dst->valid) {
+   } else if (dst->valid && lo < hi) {
       dst->lo = MIN2(dst->lo, lo);
       dst->hi = MAX2(dst->hi, hi);
       dst->device_address |= device_address;

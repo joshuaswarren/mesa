@@ -611,10 +611,24 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
          return (struct agx_ptr){0};
       }
 
-      util_dynarray_append(&cmd->large_bos, bo);
+      void *cpu = agx_bo_map(bo);
+      if (unlikely(cpu == NULL)) {
+         agx_bo_unreference(&dev->dev, bo);
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return (struct agx_ptr){0};
+      }
+
+      struct agx_bo **slot =
+         util_dynarray_grow(&cmd->large_bos, struct agx_bo *, 1);
+      if (unlikely(slot == NULL)) {
+         agx_bo_unreference(&dev->dev, bo);
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return (struct agx_ptr){0};
+      }
+      *slot = bo;
       return (struct agx_ptr){
          .gpu = bo->va->addr,
-         .cpu = agx_bo_map(bo),
+         .cpu = cpu,
       };
    }
 
