@@ -4105,7 +4105,7 @@ static uint8_t
 hk_nir_root_use_reads(nir_src *use)
 {
    const uint8_t any = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
-                       HK_ROOT_READS_DYNAMIC_BUFFERS;
+                       HK_ROOT_READS_DYNAMIC_BUFFERS | HK_ROOT_READS_PUSH;
    if (nir_src_is_if(use) ||
        nir_src_use_instr(use)->type != nir_instr_type_alu)
       return any;
