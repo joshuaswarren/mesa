@@ -25,11 +25,41 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
 #include "hk_build_interface.h"
 
+#ifdef HK_AGX3_PLAN_FUSED_PAIRS
+#define HK_AGX3_PLAN_FUSED 1
+#define HK_AGX3_PLAN_PAIRS 1
+#endif
+
+#ifdef HK_AGX3_PLAN_FUSED
+layout(local_size_x = HK_AGX3_PLAN_FUSED_GROUP_SIZE) in;
+#else
 layout(local_size_x = 64) in;
+#endif
 layout(push_constant) uniform CONSTS
 {
    hk_agx3_plan_args args;
 };
+
+#ifdef HK_AGX3_PLAN_FUSED
+/* Single-workgroup shared scratch for small builds (node_bound <=
+ * HK_AGX3_PLAN_FUSED_MAX_NODES). Lifetimes across phases are disjoint:
+ *   s_parent:     written in phase 0 & 1 (atomicCompSwap), read in phase 2.
+ *   s_leaf_count: written in phase 0 & 1 (by owner id), read in phase 2 & 3.
+ *   s_job:        bits 16..17 hold pair flags written in phase 0 (read-only
+ *                 after); bits 0..15 hold job id written in phase 2 by owner
+ *                 id (0xffffu = none) and read in phase 3.
+ */
+shared uint s_parent[HK_AGX3_PLAN_FUSED_MAX_NODES];
+shared uint s_leaf_count[HK_AGX3_PLAN_FUSED_MAX_NODES];
+shared uint s_job[HK_AGX3_PLAN_FUSED_MAX_NODES];
+shared uint s_job_count;
+shared uint s_next_slot;
+shared uint s_depth;
+shared uint s_error;
+#define HK_AGX3_FUSED_NO_JOB 0xffffu
+#define HK_AGX3_FUSED_PAIR 0x10000u
+#define HK_AGX3_FUSED_PAIR_OPAQUE 0x20000u
+#endif
 
 /* The common builder's internal node count, final before planning starts:
  * main() reads it once rather than every source_index() reloading it past
@@ -39,7 +69,11 @@ uint internal_count;
 void
 fail(uint flag)
 {
+#ifdef HK_AGX3_PLAN_FUSED
+   atomicOr(s_error, flag);
+#else
    atomicOr(DEREF(args.state).error, flag);
+#endif
 }
 
 
@@ -150,9 +184,14 @@ pair_flags(uint index)
 bool
 is_pair(uint index)
 {
+#ifdef HK_AGX3_PLAN_FUSED
+   return index >= args.leaf_bound &&
+          (s_job[index] & HK_AGX3_FUSED_PAIR) != 0u;
+#else
    return index >= args.leaf_bound &&
           (DEREF(INDEX(hk_agx3_plan_node, args.nodes, index)).depth &
            HK_AGX3_PLAN_PAIR) != 0u;
+#endif
 }
 #endif
 
@@ -173,9 +212,14 @@ count_leaves(uint start)
       }
       uint index = stack[--sp];
 #ifdef HK_AGX3_PLAN_PAIRS
+#ifdef HK_AGX3_PLAN_FUSED
+      uint flags = index < args.leaf_bound ? 0u : s_job[index];
+      if (index < args.leaf_bound || (flags & HK_AGX3_FUSED_PAIR) != 0u) {
+#else
       uint flags = index < args.leaf_bound ? 0u
          : DEREF(INDEX(hk_agx3_plan_node, args.nodes, index)).depth;
       if (index < args.leaf_bound || (flags & HK_AGX3_PLAN_PAIR) != 0u) {
+#endif
          if (args.geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
             uint current_opacity;
             if (index < args.leaf_bound) {
@@ -184,8 +228,13 @@ count_leaves(uint start)
                current_opacity = DEREF(triangle).geometry_id_and_flags &
                                  VK_GEOMETRY_OPAQUE;
             } else {
+#ifdef HK_AGX3_PLAN_FUSED
+               current_opacity = (flags & HK_AGX3_FUSED_PAIR_OPAQUE) != 0u
+                                    ? VK_GEOMETRY_OPAQUE : 0u;
+#else
                current_opacity = (flags & HK_AGX3_PLAN_PAIR_OPAQUE) != 0u
                                     ? VK_GEOMETRY_OPAQUE : 0u;
+#endif
             }
 #else
       if (index < args.leaf_bound) {
@@ -222,6 +271,320 @@ count_leaves(uint start)
    return count;
 }
 
+#ifdef HK_AGX3_PLAN_FUSED
+void
+initialize_fused(uint tid)
+{
+   uint bound = min(args.node_bound, HK_AGX3_PLAN_FUSED_MAX_NODES);
+   for (uint id = tid; id < bound; id += HK_AGX3_PLAN_FUSED_GROUP_SIZE) {
+      s_parent[id] = 0xffffffffu;
+      uint lc = id < args.leaf_bound ? 1u : 0u;
+      uint jw = HK_AGX3_FUSED_NO_JOB;
+#ifdef HK_AGX3_PLAN_PAIRS
+      uint pf = pair_flags(id);
+      if (pf != 0u) {
+         lc = 1u;
+         jw |= HK_AGX3_FUSED_PAIR |
+               ((pf & HK_AGX3_PLAN_PAIR_OPAQUE) != 0u ? HK_AGX3_FUSED_PAIR_OPAQUE : 0u);
+      }
+#endif
+      s_leaf_count[id] = lc;
+      s_job[id] = jw;
+   }
+   if (tid == 0u) {
+      s_job_count = 0u;
+      s_next_slot = 3u;
+      s_depth = 0u;
+      uint err = 0u;
+      if (DEREF(args.header).active_leaf_count == 0)
+         err = HK_AGX3_PLAN_EMPTY;
+      if (args.node_bound > HK_AGX3_PLAN_FUSED_MAX_NODES ||
+          args.leaf_bound > args.node_bound || args.node_bound > 0xffffffffu / 64u ||
+          (DEREF(args.header).active_leaf_count != 0 &&
+           (DEREF(args.header).ir_internal_node_count == 0 ||
+            DEREF(args.header).ir_internal_node_count >
+               args.node_bound - args.leaf_bound)) ||
+          DEREF(args.header).active_leaf_count > args.leaf_bound ||
+          args.root_offset != args.leaf_bound * leaf_size() ||
+          args.output_bvh == 0 || (args.output_bvh & 63ul) != 0 ||
+          args.output_bvh >= (1ul << 48) ||
+          uint64_t(args.slot_bound) * 64ul + 184ul > (1ul << 48) - args.output_bvh ||
+          args.slot_bound < 5)
+         err |= HK_AGX3_PLAN_INDEX;
+      s_error = err;
+   }
+}
+
+void
+link_and_count_fused(uint id)
+{
+   uvec2 pair = children(id);
+   for (uint c = 0; c < 2; c++)
+      if (pair[c] != VK_BVH_INVALID_NODE) {
+         uint child = source_index(pair[c]);
+         if (child == 0xffffffffu)
+            return;
+         uint old = atomicCompSwap(s_parent[child], 0xffffffffu, id);
+         if (old != 0xffffffffu)
+            fail(HK_AGX3_PLAN_SHAPE);
+      }
+#ifdef HK_AGX3_PLAN_PAIRS
+   if (!is_pair(id))
+#endif
+      s_leaf_count[id] = count_leaves(id);
+}
+
+void
+classify_fused(uint id)
+{
+   uint parent = s_parent[id];
+   uint leaf_count = s_leaf_count[id];
+   uint root = root_index();
+   bool allow_update = (args.build_flags & 1u) != 0u;
+   if (id != root && parent == 0xffffffffu) {
+      if (allow_update)
+         DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)).job = 0xffffffffu;
+      return; /* inactive IR leaf */
+   }
+   uint cursor = id, depth = 0;
+   while (cursor != root) {
+      if (depth++ >= args.node_bound) {
+         fail(HK_AGX3_PLAN_CYCLE);
+         return;
+      }
+      cursor = s_parent[cursor];
+      if (cursor >= args.node_bound) {
+         fail(HK_AGX3_PLAN_INDEX);
+         return;
+      }
+   }
+   bool selected = id == root;
+   if (!selected)
+      selected = leaf_count <= 8u
+                    ? s_leaf_count[parent] > 8u
+                    : depth % 3u == 0u;
+   if (!selected) {
+      if (allow_update) {
+         DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)).depth = depth;
+         DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)).job = 0xffffffffu;
+      }
+      return;
+   }
+   uint job = atomicAdd(s_job_count, 1u);
+   if (job >= args.node_bound) {
+      fail(HK_AGX3_PLAN_ALLOCATION);
+      return;
+   }
+   s_job[id] = (s_job[id] & ~HK_AGX3_FUSED_NO_JOB) | job;
+   if (allow_update) {
+#ifdef HK_AGX3_PLAN_PAIRS
+      uint pf = s_job[id];
+      uint out_depth = depth |
+         ((pf & HK_AGX3_FUSED_PAIR) != 0u ? HK_AGX3_PLAN_PAIR : 0u) |
+         ((pf & HK_AGX3_FUSED_PAIR_OPAQUE) != 0u ? HK_AGX3_PLAN_PAIR_OPAQUE : 0u);
+      DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)).depth = out_depth;
+#else
+      DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)).depth = depth;
+#endif
+      DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)).job = job;
+   }
+   hk_agx3_leaf_job output_job;
+   output_job.intermediate_bvh = args.intermediate_bvh;
+   output_job.output_bvh = args.output_bvh;
+   output_job.root_slot = id == root ? 0u : 0xffffffffu;
+   output_job.child_slot = 0;
+   output_job.child_count = 0;
+   output_job.node_kind =
+      leaf_count <= 8u
+         ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
+               ? HK_AGX3_NODE_INSTANCES
+               : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
+                  ? HK_AGX3_NODE_AABBS : HK_AGX3_NODE_LEAF)
+         : HK_AGX3_NODE_INNER;
+   for (uint i = 0; i < 8; i++)
+      output_job.triangle_offsets[i] = 0;
+   DEREF(INDEX(hk_agx3_leaf_job, args.jobs, job)) = output_job;
+   atomicMax(s_depth, (depth + 2u) / 3u + 1u);
+}
+
+void
+emit_fused(uint id)
+{
+   uint my_job = s_job[id] & HK_AGX3_FUSED_NO_JOB;
+   if (my_job == HK_AGX3_FUSED_NO_JOB)
+      return;
+   uint leaf_count = s_leaf_count[id];
+   bool leaf = leaf_count <= 8u;
+   uint stack[9], level[9], selected[8], sp = 1, count = 0, steps = 0;
+   stack[0] = id;
+   level[0] = 0;
+   while (sp != 0) {
+      if (++steps > args.node_bound * 2u) {
+         fail(HK_AGX3_PLAN_CYCLE);
+         return;
+      }
+      uint current = stack[--sp], d = level[sp];
+#ifdef HK_AGX3_PLAN_PAIRS
+      bool end = leaf ? current < args.leaf_bound || is_pair(current)
+                      : current != id &&
+#else
+      bool end = leaf ? current < args.leaf_bound
+                      : current != id &&
+#endif
+                           (s_leaf_count[current] <= 8u || d == 3u);
+      if (end) {
+         if (count == 8) {
+            fail(HK_AGX3_PLAN_SHAPE);
+            return;
+         }
+         selected[count++] = current;
+      } else {
+         uvec2 pair = children(current);
+         /* Stack is LIFO; visit the common builder's left child first. */
+         for (int c = 1; c >= 0; c--)
+            if (pair[c] != VK_BVH_INVALID_NODE) {
+               uint child = source_index(pair[c]);
+               if (child == 0xffffffffu || sp == 9) {
+                  fail(HK_AGX3_PLAN_SHAPE);
+                  return;
+               }
+               stack[sp] = child;
+               level[sp++] = d + 1;
+            }
+      }
+   }
+   if (count == 0 || (leaf && count != leaf_count)) {
+      fail(HK_AGX3_PLAN_SHAPE);
+      return;
+   }
+   uint slots = leaf ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
+                           ? 2u * count
+                           : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
+                              ? count : count + (count + 3u) / 4u) : count;
+   uint first = atomicAdd(s_next_slot, slots);
+   if (slots > args.slot_bound || first > args.slot_bound - slots) {
+      fail(HK_AGX3_PLAN_ALLOCATION);
+      return;
+   }
+   REF(hk_agx3_leaf_job) job = INDEX(hk_agx3_leaf_job, args.jobs, my_job);
+   DEREF(job).child_slot = first;
+   DEREF(job).child_count = count;
+   for (uint c = 0; c < count; c++) {
+#ifdef HK_AGX3_PLAN_PAIRS
+      DEREF(job).triangle_offsets[c] =
+         source_offset(selected[c]) |
+         (leaf && selected[c] >= args.leaf_bound ? HK_AGX3_LEAF_PAIR_OFFSET : 0u);
+#else
+      DEREF(job).triangle_offsets[c] = source_offset(selected[c]);
+#endif
+      if (!leaf) {
+         uint child_job = s_job[selected[c]] & HK_AGX3_FUSED_NO_JOB;
+         if (child_job >= s_job_count) {
+            fail(HK_AGX3_PLAN_SHAPE);
+            return;
+         }
+         DEREF(INDEX(hk_agx3_leaf_job, args.jobs, child_job)).root_slot =
+            first + c;
+      }
+   }
+}
+
+void
+finish_fused(uint tid)
+{
+   uint err = s_error;
+   uint next_slot = s_next_slot;
+   /* Clear the TLAS instance pointer table cooperatively in the same dispatch
+    * so the envelope shader can run with refit=1 and skip the clear pass. */
+   if (err == 0u &&
+       args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR &&
+       next_slot >= 3u) {
+      uint64_t pointers =
+         uint64_t(next_slot) * 64ul + uint64_t(args.leaf_bound) * 64ul;
+      uint64_t size = pointers + uint64_t(args.leaf_bound) * 16ul + 184ul;
+      if (size <= (1ul << 48) - args.output_bvh) {
+         for (uint i = tid; i < args.leaf_bound; i += HK_AGX3_PLAN_FUSED_GROUP_SIZE)
+            DEREF(REF(uvec4)(args.output_bvh + pointers + uint64_t(i) * 16ul)) =
+               uvec4(0u);
+      }
+   }
+   if (tid != 0u)
+      return;
+   uint raw_jobs = s_job_count;
+   uint jobs = err != 0u ? 0u : raw_jobs;
+   hk_agx3_plan_state state;
+   state.job_count = jobs;
+   state.groups_y = 1u;
+   state.groups_z = 1u;
+   state.next_slot = next_slot;
+   state.depth = s_depth;
+   state.error = err;
+   state.saved_offsets = 0u;
+   state.saved_positions = 0u;
+   DEREF(args.state) = state;
+
+   hk_agx3_envelope_job job;
+   uint root = err == 0u ? root_index() : 0u;
+   job.bounds =
+      REF(vk_ir_node)(OFFSET(args.intermediate_bvh, source_offset(root)));
+   job.output_bvh = args.output_bvh;
+   job.end_slot = next_slot;
+   job.primitive_count =
+      err == 0u ? DEREF(args.header).active_leaf_count : 0u;
+   job.node_count = raw_jobs;
+   job.depth = s_depth;
+   job.opaque_build_word = err == HK_AGX3_PLAN_EMPTY ? HK_AGX3_PLAN_EMPTY : 0u;
+   job.resource_id = args.resource_id;
+   job.geometry_type = args.geometry_type;
+   job.leaf_bound = args.leaf_bound;
+   DEREF(args.envelope) = job;
+
+   uint64_t dispatch = uint64_t(args.state) + uint64_t(HK_AGX3_PLAN_ENCODE_DISPATCH);
+   DEREF(REF(uint32_t)(dispatch)) =
+      (jobs + HK_AGX3_NODE_JOBS_PER_GROUP - 1u) / HK_AGX3_NODE_JOBS_PER_GROUP;
+   DEREF(REF(uint32_t)(dispatch + 4ul)) = 1u;
+   DEREF(REF(uint32_t)(dispatch + 8ul)) = 1u;
+}
+
+void
+main()
+{
+   uint tid = gl_LocalInvocationID.x;
+   internal_count = DEREF(args.header).ir_internal_node_count;
+
+   initialize_fused(tid);
+   memoryBarrierShared();
+   barrier();
+
+   if (s_error == 0u) {
+      uint end_internal = args.leaf_bound + internal_count;
+      for (uint id = args.leaf_bound + tid; id < end_internal;
+           id += HK_AGX3_PLAN_FUSED_GROUP_SIZE)
+         link_and_count_fused(id);
+      memoryBarrierShared();
+      barrier();
+   }
+
+   if (s_error == 0u) {
+      for (uint id = tid; id < args.node_bound;
+           id += HK_AGX3_PLAN_FUSED_GROUP_SIZE)
+         classify_fused(id);
+      memoryBarrierBuffer();
+      memoryBarrierShared();
+      barrier();
+   }
+
+   if (s_error == 0u) {
+      for (uint id = tid; id < args.node_bound;
+           id += HK_AGX3_PLAN_FUSED_GROUP_SIZE)
+         emit_fused(id);
+      memoryBarrierShared();
+      barrier();
+   }
+
+   finish_fused(tid);
+}
+#else
 void
 initialize(uint id)
 {
@@ -492,3 +855,4 @@ main()
    if (args.phase == 3)
       emit(id);
 }
+#endif

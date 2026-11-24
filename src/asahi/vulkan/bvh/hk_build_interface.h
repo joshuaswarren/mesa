@@ -305,9 +305,15 @@ struct hk_agx3_leaf_args {
     * reference (see libagx/gen1_as.h). Zero when output_bvh is the base.
     * M5 uses this ABI word for its diagnostic bounding-box record stride. */
    uint32_t slot_bias;
-   /* When nonzero, the number of jobs written by planning (its first word),
-    * which the indirect dispatch rounds up to whole workgroups. */
+   /* When nonzero, the plan state written by planning (job_count at 0,
+    * next_slot at 12), which indirect or over-provisioned direct dispatches
+    * clamp against and TLAS instance encoding uses for tail offsets. */
    VOID_REF counts;
+   /* When nonzero alongside counts, TLAS instance encoding derives transform
+    * and pointer table offsets from counts->next_slot and leaf_bound directly
+    * instead of reading them back from the envelope header. */
+   uint32_t leaf_bound;
+   uint32_t padding;
 };
 
 /* Node jobs per encoding workgroup, eight lanes each. */
@@ -426,6 +432,12 @@ struct hk_agx3_plan_args {
 #define HK_AGX3_M5_AABB_RECORD_B 48u
 
 #define HK_AGX3_PLAN_ENCODE_DISPATCH 32u /* bytes after hk_agx3_plan_state */
+/* Single-workgroup fused planner limits (bvh/agx3_plan.comp).
+ * 768 nodes (9 KiB shared scratch) keeps small TLAS/BLAS builds (<= 384 leaves)
+ * on one workgroup without serializing larger multi-core builds like 1024-tri
+ * BLAS (node_bound=2047) onto a single core. */
+#define HK_AGX3_PLAN_FUSED_MAX_NODES 768u
+#define HK_AGX3_PLAN_FUSED_GROUP_SIZE 256u
 /* hk_agx3_plan_node.depth flags of an internal node whose two children are
  * triangles encoded as one record, and whether that record is opaque. */
 #define HK_AGX3_PLAN_PAIR 0x80000000u
