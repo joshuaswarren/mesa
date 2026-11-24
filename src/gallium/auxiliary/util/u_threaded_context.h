@@ -582,6 +582,12 @@ struct threaded_context_options {
     */
    void (*dsa_parse)(void *state, struct tc_renderpass_info *info);
    void (*fs_parse)(void *state, struct tc_renderpass_info *info);
+   /**
+    * If true, an asynchronous frontend flush (glFlush, glFinish) that finds
+    * the driver thread idle runs on the calling thread, so the submission
+    * does not wait for that thread to wake up.
+    */
+   bool inline_idle_flush;
 };
 
 struct tc_vertex_buffers {

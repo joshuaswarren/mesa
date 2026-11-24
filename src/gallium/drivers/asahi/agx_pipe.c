@@ -2943,6 +2943,7 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
       &(struct threaded_context_options){
          .create_fence = agx_fence_create_unflushed,
          .unsynchronized_get_device_reset_status = true,
+         .inline_idle_flush = true,
       },
       &ctx->tc);
 

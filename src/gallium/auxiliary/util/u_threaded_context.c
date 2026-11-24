@@ -3803,11 +3803,12 @@ tc_flush_impl(struct pipe_context *_pipe, struct pipe_fence_handle **fence,
     * has already executed every flushed batch only adds that thread's wakeup
     * to the submission, and a caller that waits on the work next
     * (glFlush + glClientWaitSync, glFinish) pays it on every round trip.
-    * Execute the unflushed calls here instead, as a synchronous flush does;
-    * a busy driver thread still gets the batch queued behind its own work.
-    * The memory-limit flushes issued while recording stay asynchronous.
+    * Drivers that opt in execute the unflushed calls here instead, as a
+    * synchronous flush does; a busy driver thread still gets the batch queued
+    * behind its own work. The memory-limit flushes issued while recording
+    * stay asynchronous.
     */
-   if (frontend && async && !deferred &&
+   if (frontend && tc->options.inline_idle_flush && async && !deferred &&
        util_queue_fence_is_signalled(&tc->batch_slots[tc->last].fence))
       async = false;
 
