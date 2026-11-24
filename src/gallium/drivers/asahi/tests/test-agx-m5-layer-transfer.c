@@ -3,9 +3,11 @@
  */
 
 /* Under the no-op DRM shim, check how the M5 profile draws into a layered
- * framebuffer. G17G draws a layered framebuffer a layer at a time, so a draw
- * whose vertex shader writes gl_Layer must take the CPU vertex stages
- * (agx_swtnl_applies), which draw each primitive into the layer it selects.
+ * framebuffer and which texture transfers it asks st/mesa for. G17G draws a
+ * layered framebuffer a layer at a time, so a draw whose vertex shader writes
+ * gl_Layer must take the CPU vertex stages (agx_swtnl_applies), which draw
+ * each primitive into the layer it selects. With that in place, the M5
+ * profile asks for blit-based texture transfers, as AGX2 and Gen9 AGX3 do.
  */
 #include <fcntl.h>
 #include <stdio.h>
@@ -121,7 +123,16 @@ main(void)
 
    const enum agx_chip chip = agx_device(screen)->chip;
    const bool m5 = agx_chip_g17_m5(chip);
+   const enum agx_descriptor_generation desc_gen =
+      agx_chip_descriptor_generation(chip);
+   const bool blit_transfers =
+      agx_gallium_descriptor_generation_is_agx2(desc_gen) ||
+      desc_gen == AGX_DESCRIPTOR_GENERATION_9 || m5;
    CHECK(m5 == !strcmp(chip_name, "g17s"));
+
+   CHECK(screen->caps.texture_transfer_modes ==
+         (blit_transfers ? PIPE_TEXTURE_TRANSFER_BLIT
+                         : PIPE_TEXTURE_TRANSFER_DEFAULT));
 
    struct pipe_context *pipe = screen->context_create(screen, NULL, 0);
    CHECK(pipe);
@@ -158,6 +169,6 @@ main(void)
    pipe->destroy(pipe);
    screen->destroy(screen);
 
-   printf("%s: layer split ok\n", chip_name);
+   printf("%s: layer split and transfer modes ok\n", chip_name);
    return 0;
 }
