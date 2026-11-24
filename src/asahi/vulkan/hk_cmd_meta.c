@@ -2850,9 +2850,9 @@ build_agx3_gen10_mip_shader(const struct hk_agx3_gen10_mip_key *key)
                              nir_imul_imm(b, nir_channel(b, lid, 1), wg_dim));
    nir_def *wg = nir_load_workgroup_id(b);
    nir_def *x = nir_iadd(b, nir_imul_imm(b, nir_channel(b, wg, 0), wg_dim),
-                         hk_nir_compact_bits(b, index));
+                         hk_nir_compact_bits_8(b, index));
    nir_def *y = nir_iadd(b, nir_imul_imm(b, nir_channel(b, wg, 1), wg_dim),
-                         hk_nir_compact_bits(b, nir_ushr_imm(b, index, 1)));
+                         hk_nir_compact_bits_8(b, nir_ushr_imm(b, index, 1)));
    nir_def *width = gen10_mip_push(b, width);
    nir_def *height = gen10_mip_push(b, height);
 

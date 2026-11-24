@@ -6111,7 +6111,7 @@ hk_g17p_layout_shader_create_local_read(struct hk_device *dev,
 
    const struct hk_local_read_shader_meta *meta = &api->local_read_meta;
    s->info.fs.epilog_key = meta->epilog_key;
-   s->info.fs.g17p_colour_unit_range = meta->g17p_colour_unit_range;
+   s->info.fs.colour_unit_range = meta->g17p_colour_unit_range;
    s->info.fs.static_tests = meta->static_tests;
    s->info.fs.may_kill = meta->may_kill;
    s->info.fs.a2c_in_main = meta->a2c_in_main;
