@@ -5848,26 +5848,52 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       } else {
          if (compiled) {
             const struct agx_shader_info *cinfo = &shader->b.info;
-            mesa_logw("%s compute constant program not launchable "
-                      "(preamble=%uB tps=%uB inputs=%uB gprs=%u "
-                      "staging_known=%u/%u scratch=%uB local=%uB "
-                      "textures=%u samplers=%u sampler_heap=%u "
-                      "ray_traversal=%u res_info=%u); compiling without it",
-                      g17p_compute_cprog ? "G17P" : "M5", cinfo->preamble_size,
-                      cinfo->preamble_scratch_size,
-                      cinfo->agx3_preamble_inputs.storage_bytes,
-                      cinfo->nr_preamble_gprs, cinfo->agx3_staging_known,
-                      cinfo->agx3_preamble_staging_known, cinfo->scratch_size,
-                      cinfo->local_size, cinfo->texture_state_count,
-                      cinfo->sampler_state_count, cinfo->uses_sampler_heap,
-                      cinfo->uses_ray_traversal,
-                      cinfo->uses_resource_info_query);
+
+            /* hk_agx3_compute_cprog_supported() never launches a native
+             * constant program beside ray traversal or a resource-info query
+             * on native-preamble chips. When nothing else refuses it, falling
+             * back is the expected path for such a kernel, so report it only
+             * with ASAHI_MESA_DEBUG=perf. */
+            struct agx_shader_info by_design_probe = *cinfo;
+            by_design_probe.uses_ray_traversal = false;
+            by_design_probe.uses_resource_info_query = false;
+            const bool by_design =
+               g17p_compute_cprog &&
+               (cinfo->uses_ray_traversal ||
+                cinfo->uses_resource_info_query) &&
+               hk_agx3_compute_cprog_supported(dev->dev.chip, sw_stage,
+                                               &shader->info, &by_design_probe,
+                                               max_cprog_spill_B);
+
+            if (by_design) {
+               if (unlikely(dev->dev.debug & AGX_DBG_PERF))
+                  mesa_logw("%s compute kernel uses ray traversal or a "
+                            "resource-info query; compiling it without its "
+                            "constant program",
+                            agx_chip_name(dev->dev.chip));
+            } else {
+               mesa_logw("%s compute constant program not launchable "
+                         "(preamble=%uB tps=%uB inputs=%uB gprs=%u "
+                         "staging_known=%u/%u scratch=%uB local=%uB "
+                         "textures=%u samplers=%u sampler_heap=%u "
+                         "ray_traversal=%u res_info=%u); compiling without it",
+                         agx_chip_name(dev->dev.chip), cinfo->preamble_size,
+                         cinfo->preamble_scratch_size,
+                         cinfo->agx3_preamble_inputs.storage_bytes,
+                         cinfo->nr_preamble_gprs, cinfo->agx3_staging_known,
+                         cinfo->agx3_preamble_staging_known,
+                         cinfo->scratch_size, cinfo->local_size,
+                         cinfo->texture_state_count,
+                         cinfo->sampler_state_count, cinfo->uses_sampler_heap,
+                         cinfo->uses_ray_traversal,
+                         cinfo->uses_resource_info_query);
+            }
             free(shader->b.binary);
             compiled = false;
          } else {
             mesa_logw("%s compute constant program failed to compile (%s); "
                       "compiling without it",
-                      g17p_compute_cprog ? "G17P" : "M5",
+                      agx_chip_name(dev->dev.chip),
                       agx_last_compile_refusal());
          }
          ralloc_free(attempt);
