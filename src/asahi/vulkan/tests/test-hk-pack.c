@@ -1269,8 +1269,136 @@ hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 void
 hk_drm_attachment_set_init(struct hk_drm_attachment_set *set)
 {
-   (void)set;
-   abort();
+   memset(set, 0, sizeof(*set));
+   set->complete = true;
+}
+
+/* Reusing one packet across submissions must clear every CDM and sync field
+ * while preserving dynarray backing allocations and leaving unused graphics
+ * state untouched. */
+static void
+test_packet_reuse(bool negctl)
+{
+   struct hk_device *dev = dev_with(AGX_CHIP_G17P, 0);
+   struct hk_cmd_buffer *cmd = test_alloc(sizeof(*cmd));
+   struct hk_cs *cs = test_alloc(sizeof(*cs));
+   uint8_t buf1[256] = {0}, buf2[256] = {0};
+
+   /* Fill unused graphics tails with a sentinel to verify hk_pack_init_packet
+    * does not touch them. */
+   memset(&cmd->state.gfx, 0x5a, sizeof(cmd->state.gfx));
+   memset(&cs->tib, 0x5a, sizeof(*cs) - offsetof(struct hk_cs, tib));
+
+   /* First submission populates CDM state, sync state, and both dynarrays. */
+   hk_pack_init_packet(cmd, cs, dev, buf1, 0x10000, sizeof(buf1), false);
+   const uint32_t dummy_res = 0x12345678u;
+   const uint64_t dummy_q[2] = {0x2000, 0x40};
+   util_dynarray_append(&cs->compute_resources, dummy_res);
+   util_dynarray_append(&cs->query_access_ranges, dummy_q[0]);
+   util_dynarray_append(&cs->query_access_ranges, dummy_q[1]);
+   void *res_data = cs->compute_resources.data;
+   size_t res_cap = cs->compute_resources.capacity;
+   void *q_data = cs->query_access_ranges.data;
+   size_t q_cap = cs->query_access_ranges.capacity;
+
+   cs->stats.cmds = 42;
+   cs->pack_threads = 9999;
+   cs->uses_sampler_heap = true;
+   cs->strong_flush_end = buf1 + 64;
+   cs->compute_attachments.count = 3;
+   cs->compute_attachments.complete = false;
+   cs->sync.kind = HK_SYNC_COMPUTE;
+   cs->sync.dep[HK_SYNC_VDM].prior = HK_SYNC_GFX;
+   cmd->sync.req[0][HK_SYNC_CDM].prior = HK_SYNC_COMPUTE;
+   cmd->sync.req[0][HK_SYNC_CDM].cut = cs;
+   cmd->sync.last_any[HK_SYNC_CDM] = cs;
+
+   /* Reinitialize the same packet for a second submission (skipped in negctl
+    * mode to prove the checks below catch stale packet state). */
+   if (!negctl)
+      hk_pack_init_packet(cmd, cs, dev, buf2, 0x20000, 128, true);
+
+   T("packet reuse preserves compute_resources backing",
+     cs->compute_resources.data == res_data &&
+        cs->compute_resources.capacity == res_cap &&
+        cs->compute_resources.size == 0);
+   T("packet reuse preserves query_access_ranges backing",
+     cs->query_access_ranges.data == q_data &&
+        cs->query_access_ranges.capacity == q_cap &&
+        cs->query_access_ranges.size == 0);
+   T("packet reuse clears CDM fields",
+     cs->stats.cmds == 0 && cs->pack_threads == 0 && !cs->uses_sampler_heap &&
+        cs->strong_flush_end == NULL && cs->compute_attachments.count == 0 &&
+        cs->compute_attachments.complete && cs->sync.kind == 0 &&
+        cs->sync.dep[HK_SYNC_VDM].prior == 0);
+   T("packet reuse initializes stream pointers and flags",
+     cs->cmd == cmd && cs->type == HK_CS_CDM && cs->start == buf2 &&
+        cs->current == buf2 && cs->end == buf2 + 128 && cs->addr == 0x20000 &&
+        cs->root_size == 128 && cs->sync.seq == 1 && cs->visible_completion &&
+        list_is_singular(&cmd->control_streams) &&
+        first_cs(cmd) == cs && cmd->vk.base.device == &dev->vk);
+   T("packet reuse clears command sync state",
+     cmd->sync.req[0][HK_SYNC_CDM].prior == 0 &&
+        cmd->sync.req[0][HK_SYNC_CDM].cut == NULL &&
+        cmd->sync.last_any[HK_SYNC_CDM] == NULL);
+
+   bool gfx_untouched = true;
+   const uint8_t *gfx_bytes = (const uint8_t *)&cmd->state.gfx;
+   for (size_t i = 0; i < sizeof(cmd->state.gfx); ++i) {
+      if (gfx_bytes[i] != 0x5a) {
+         gfx_untouched = false;
+         break;
+      }
+   }
+   bool cs_tail_untouched = true;
+   const uint8_t *tail_bytes = (const uint8_t *)&cs->tib;
+   for (size_t i = 0; i < sizeof(*cs) - offsetof(struct hk_cs, tib); ++i) {
+      if (tail_bytes[i] != 0x5a) {
+         cs_tail_untouched = false;
+         break;
+      }
+   }
+   T("packet reuse leaves unused graphics state untouched",
+     gfx_untouched && cs_tail_untouched);
+
+   util_dynarray_fini(&cs->compute_resources);
+   util_dynarray_fini(&cs->query_access_ranges);
+}
+
+static void
+test_span_pool_policy(void)
+{
+   T("16 KiB and 64 KiB spans map to distinct O(1) buckets",
+     hk_cmd_span_bucket_for_size(HK_CMD_SPAN_SIZE) !=
+        hk_cmd_span_bucket_for_size(HK_CMD_STREAM_SPAN_SIZE));
+
+   struct agx_device g17p = {.chip = AGX_CHIP_G17P, .is_virtio = false};
+   struct agx_device g17p_virtio = {.chip = AGX_CHIP_G17P, .is_virtio = true};
+   struct agx_device g17s = {.chip = AGX_CHIP_G17S, .is_virtio = false};
+   struct agx_device g13g = {.chip = AGX_CHIP_G13G, .is_virtio = false};
+
+   T("native AGX3 caches up to 256 main/root/ioto spans",
+     hk_cmd_pool_span_cache_max(&g17p, HK_CMD_BO_MAIN) ==
+        HK_G17P_CMD_POOL_MAIN_BO_MAX &&
+        hk_cmd_pool_span_cache_max(&g17p, HK_CMD_BO_ROOT) ==
+           HK_G17P_CMD_POOL_MAIN_BO_MAX &&
+        hk_cmd_pool_span_cache_max(&g17p, HK_CMD_BO_USC) ==
+           HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_ioto_span_cache_max(&g17p) ==
+           HK_G17P_CMD_POOL_MAIN_BO_MAX &&
+        hk_cmd_pool_span_cache_max(&g17s, HK_CMD_BO_MAIN) ==
+           HK_G17P_CMD_POOL_MAIN_BO_MAX &&
+        hk_cmd_pool_ioto_span_cache_max(&g17s) ==
+           HK_G17P_CMD_POOL_MAIN_BO_MAX);
+   T("virtio and AGX2 keep default span cache cap",
+     hk_cmd_pool_span_cache_max(&g17p_virtio, HK_CMD_BO_MAIN) ==
+        HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_span_cache_max(&g17p_virtio, HK_CMD_BO_ROOT) ==
+           HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_ioto_span_cache_max(&g17p_virtio) == HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_span_cache_max(&g13g, HK_CMD_BO_MAIN) ==
+           HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_ioto_span_cache_max(&g13g) == HK_CMD_POOL_BO_MAX);
 }
 
 void
@@ -1290,11 +1418,18 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+   const bool negctl = argc > 1 && !strcmp(argv[1], "--negctl");
    test_context = ralloc_context(NULL);
    if (!test_context)
       return EXIT_FAILURE;
+   if (negctl) {
+      test_packet_reuse(true);
+      printf("%u tests, %u failures\n", tests, failures);
+      ralloc_free(test_context);
+      return failures ? EXIT_FAILURE : EXIT_SUCCESS;
+   }
    test_boundary();
    test_atomics_choice();
    test_rejections();
@@ -1310,6 +1445,8 @@ main(void)
    test_full_classes();
    test_random();
    test_history();
+   test_packet_reuse(false);
+   test_span_pool_policy();
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

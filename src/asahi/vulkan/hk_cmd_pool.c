@@ -302,10 +302,12 @@ VkResult
 hk_cmd_pool_alloc_bo_span(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
                           uint32_t size, struct hk_cmd_bo **bo_out)
 {
-   list_for_each_entry(struct hk_cmd_bo, bo, &pool->free_spans[type], link) {
+   const enum hk_cmd_span_bucket bucket = hk_cmd_span_bucket_for_size(size);
+   list_for_each_entry(struct hk_cmd_bo, bo, &pool->free_spans[type][bucket],
+                       link) {
       if (bo->size == size) {
          list_del(&bo->link);
-         pool->num_free_spans[type]--;
+         pool->num_free_spans[type][bucket]--;
          *bo_out = bo;
          return VK_SUCCESS;
       }
@@ -334,6 +336,47 @@ hk_cmd_pool_alloc_bo_span(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
    bo->size = size;
    *bo_out = bo;
    return VK_SUCCESS;
+}
+
+VkResult
+hk_cmd_pool_alloc_ioto_span(struct hk_cmd_pool *pool, struct agx_ptr *ptr,
+                            struct hk_vdm_allocation **allocation)
+{
+   if (!list_is_empty(&pool->free_ioto_spans)) {
+      struct hk_vdm_allocation *span = list_first_entry(
+         &pool->free_ioto_spans, struct hk_vdm_allocation, link);
+      list_del(&span->link);
+      pool->num_free_ioto_spans--;
+      *ptr = (struct agx_ptr){
+         .gpu = span->addr,
+         .cpu = (uint8_t *)span->slab->map +
+                (span->addr - span->slab->bo->va->addr),
+      };
+      *allocation = span;
+      return VK_SUCCESS;
+   }
+
+   return hk_cmd_pool_alloc_span(pool, HK_CMD_SLAB_IOTO, HK_CMD_SPAN_SIZE,
+                                 HK_CMD_SPAN_SIZE, ptr, allocation);
+}
+
+void
+hk_cmd_pool_free_ioto_span(struct hk_cmd_pool *pool,
+                           struct hk_vdm_allocation *allocation)
+{
+   if (!allocation)
+      return;
+
+   struct hk_device *dev = hk_cmd_pool_device(pool);
+   const unsigned max_free = hk_cmd_pool_ioto_span_cache_max(&dev->dev);
+   if (p_atomic_read(&allocation->refcount) == 1 &&
+       pool->num_free_ioto_spans < max_free) {
+      list_add(&allocation->link, &pool->free_ioto_spans);
+      pool->num_free_ioto_spans++;
+      return;
+   }
+
+   hk_device_free_span(dev, allocation);
 }
 
 void
@@ -396,9 +439,13 @@ hk_CreateCommandPool(VkDevice _device,
    for (enum hk_cmd_bo_type type = 0; type < HK_CMD_BO_TYPE_COUNT; ++type) {
       list_inithead(&pool->free_bos[type]);
       pool->num_free_bos[type] = 0;
-      list_inithead(&pool->free_spans[type]);
-      pool->num_free_spans[type] = 0;
+      for (unsigned bucket = 0; bucket < HK_CMD_SPAN_BUCKET_COUNT; ++bucket) {
+         list_inithead(&pool->free_spans[type][bucket]);
+         pool->num_free_spans[type][bucket] = 0;
+      }
    }
+   list_inithead(&pool->free_ioto_spans);
+   pool->num_free_ioto_spans = 0;
 
    *pCmdPool = hk_cmd_pool_to_handle(pool);
 
@@ -413,15 +460,25 @@ hk_cmd_pool_destroy_bos(struct hk_cmd_pool *pool)
       list_for_each_entry_safe(struct hk_cmd_bo, bo, &pool->free_bos[type],
                                link)
          hk_cmd_bo_destroy(dev, &pool->vk.alloc, bo);
-      list_for_each_entry_safe(struct hk_cmd_bo, bo, &pool->free_spans[type],
-                               link)
-         hk_cmd_bo_destroy(dev, &pool->vk.alloc, bo);
-
       list_inithead(&pool->free_bos[type]);
       pool->num_free_bos[type] = 0;
-      list_inithead(&pool->free_spans[type]);
-      pool->num_free_spans[type] = 0;
+
+      for (unsigned bucket = 0; bucket < HK_CMD_SPAN_BUCKET_COUNT; ++bucket) {
+         list_for_each_entry_safe(struct hk_cmd_bo, bo,
+                                  &pool->free_spans[type][bucket], link)
+            hk_cmd_bo_destroy(dev, &pool->vk.alloc, bo);
+         list_inithead(&pool->free_spans[type][bucket]);
+         pool->num_free_spans[type][bucket] = 0;
+      }
    }
+
+   list_for_each_entry_safe(struct hk_vdm_allocation, span,
+                            &pool->free_ioto_spans, link) {
+      list_del(&span->link);
+      hk_device_free_span(dev, span);
+   }
+   list_inithead(&pool->free_ioto_spans);
+   pool->num_free_ioto_spans = 0;
 }
 
 VkResult
@@ -455,6 +512,8 @@ hk_cmd_pool_free_bo_list(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
          type == HK_CMD_BO_MAIN && !dev->dev.is_virtio
          ? HK_G17P_CMD_POOL_MAIN_BO_MAX
          : HK_CMD_POOL_BO_MAX;
+   const unsigned max_free_spans =
+      hk_cmd_pool_span_cache_max(&dev->dev, type);
 
    list_for_each_entry_safe(struct hk_cmd_bo, bo, bos, link) {
       list_del(&bo->link);
@@ -462,10 +521,16 @@ hk_cmd_pool_free_bo_list(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
          /* Drop recording ownership, but never put pending bytes in either
           * pool reuse list. Submission pins also retain aliases and spans. */
          hk_cmd_bo_destroy(hk_cmd_pool_device(pool), &pool->vk.alloc, bo);
-      } else if (bo->span && pool->num_free_spans[type] < HK_CMD_POOL_BO_MAX) {
-         list_add(&bo->link, &pool->free_spans[type]);
-         pool->num_free_spans[type]++;
-      } else if (bo->span || pool->num_free_bos[type] >= max_free) {
+      } else if (bo->span) {
+         const enum hk_cmd_span_bucket bucket =
+            hk_cmd_span_bucket_for_size(bo->size);
+         if (pool->num_free_spans[type][bucket] < max_free_spans) {
+            list_add(&bo->link, &pool->free_spans[type][bucket]);
+            pool->num_free_spans[type][bucket]++;
+         } else {
+            hk_cmd_bo_destroy(hk_cmd_pool_device(pool), &pool->vk.alloc, bo);
+         }
+      } else if (pool->num_free_bos[type] >= max_free) {
          hk_cmd_bo_destroy(hk_cmd_pool_device(pool),
                            &pool->vk.alloc, bo);
       } else {

@@ -125,6 +125,13 @@ unsigned hk_pack_plan(const struct hk_pack_member *members, unsigned n,
                       struct hk_pack_run *runs, unsigned *packed_members,
                       size_t *total);
 
+/* Initializes a reusable packet's command buffer and compute control stream,
+ * resetting only the compute-relevant state and preserving dynarray backing
+ * storage across submissions. */
+void hk_pack_init_packet(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                         struct hk_device *dev, uint8_t *start, uint64_t addr,
+                         size_t bytes, bool visible_completion);
+
 /* Records member `item` (the stream of `source`) in the packet's
  * synchronization: what it waits for, what it makes later command buffers
  * wait for, and, unless it is the last member, its tail as a requirement of

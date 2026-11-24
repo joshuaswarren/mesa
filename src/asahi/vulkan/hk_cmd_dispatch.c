@@ -3114,7 +3114,7 @@ hk_cmd_dispatch_rays(struct hk_cmd_buffer *cmd, struct hk_api_shader *shader,
                      uint64_t record_addr, uint64_t group_count_addr,
                      struct agx_grid grid)
 {
-   struct hk_descriptor_state *rt = &cmd->state.rt.descriptors;
+   struct hk_descriptor_state *rt = &cmd->rt.descriptors;
 
    if (rt->push_dirty)
       hk_cmd_buffer_flush_push_descriptors(cmd, rt);

@@ -322,6 +322,39 @@ hk_pack_plan(const struct hk_pack_member *members, unsigned n,
 }
 
 void
+hk_pack_init_packet(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                    struct hk_device *dev, uint8_t *start, uint64_t addr,
+                    size_t bytes, bool visible_completion)
+{
+   /* Preserve dynarray backing allocations across submissions and reset only
+    * the CDM prefix of hk_cs and synchronization fields of hk_cmd_buffer,
+    * avoiding per-submit heap traffic and zeroing unused graphics state. */
+   struct util_dynarray compute_resources = cs->compute_resources;
+   struct util_dynarray query_access_ranges = cs->query_access_ranges;
+   util_dynarray_clear(&compute_resources);
+   util_dynarray_clear(&query_access_ranges);
+
+   memset(cs, 0, offsetof(struct hk_cs, tib));
+   cs->compute_resources = compute_resources;
+   cs->query_access_ranges = query_access_ranges;
+
+   memset(&cmd->sync, 0, sizeof(cmd->sync));
+   assert(!cmd->sync_pass_records.size);
+   cmd->vk.base.device = &dev->vk;
+   list_inithead(&cmd->control_streams);
+   list_addtail(&cs->node, &cmd->control_streams);
+   cs->cmd = cmd;
+   cs->type = HK_CS_CDM;
+   cs->start = cs->current = start;
+   cs->end = start + bytes;
+   cs->addr = addr;
+   cs->root_size = bytes;
+   cs->sync.seq = 1;
+   cs->visible_completion = visible_completion;
+   hk_drm_attachment_set_init(&cs->compute_attachments);
+}
+
+void
 hk_pack_fold_member(struct hk_cmd_buffer *packet, struct hk_cs *cs,
                     const struct hk_cmd_buffer *source,
                     const struct hk_cs *item, bool last,

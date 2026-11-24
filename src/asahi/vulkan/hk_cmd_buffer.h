@@ -1766,11 +1766,48 @@ struct hk_cmd_buffer {
 
    /* frg-codegen v4: the per-recording BG/EOT cache (13.5 KiB) lives outside
     * `state` so the full-state memset of every reset no longer clears it;
-    * hk_reset_cmd_buffer() invalidates the entries instead. Entries are only
-    * read when valid, so this is the same cache contract. */
+    * hk_reset_cmd_buffer() invalidates the entries only when used. Entries are
+    * only read when valid, so this is the same cache contract. */
    struct hk_g17p_bg_eot_cache_entry
       g17p_bg_eot_cache[HK_G17P_BG_EOT_CACHE_ENTRIES];
    uint8_t g17p_bg_eot_cache_next;
+   bool g17p_bg_eot_cache_used;
+
+   /* Set when any of the four contiguous native graphics caches inside
+    * state.gfx (g17p_ioto..g17p_spilled_rt_descs) is populated, so AGX2 and
+    * compute-only recordings skip clearing their 8.5 KiB on reset. */
+   bool g17p_gfx_caches_used;
+
+   /* Ray-tracing bind point state lives outside `state` so graphics and
+    * compute recordings skip clearing and tearing down its descriptors. */
+   struct hk_ray_tracing_state rt;
+   bool used_rt;
+
+   /* M5: the render pass instance that ended last, while the next one may
+    * continue in its render stream instead of storing and reloading the
+    * attachments (hk_m5_pass_merge_begin()). Kept outside `state` because its
+    * fields are read only when `valid` is set. */
+   struct hk_pass_merge_candidate {
+      bool valid;
+      /* The instance's single render stream, where its draws ended and
+       * where its terminator left the stream and chunk. */
+      struct hk_cs *cs;
+      void *resume_current;
+      void *after_current;
+      void *end;
+      /* The tracked state when the instance ended; the next instance may
+       * continue only if none of it moved. */
+      uint32_t next_seq;
+      uint32_t sync_epoch;
+      struct hk_cs *open_cs;
+      void *open_cs_current;
+      /* A recorded dependency orders the next instance after this one
+       * beyond attachment operations; continuing then needs the stronger
+       * conditions of hk_m5_ordered_refusal(). */
+      bool ordered;
+      /* The render state the instance ended with. */
+      struct hk_rendering_state render;
+   } pass_merge;
 
    /* Set by hk_reset_cmd_buffer, cleared by vkBeginCommandBuffer. */
    bool g17p_pristine;
@@ -1788,7 +1825,6 @@ struct hk_cmd_buffer {
       uint64_t descriptor_buffers[HK_MAX_DESCRIPTOR_BUFFERS];
       struct hk_graphics_state gfx;
       struct hk_compute_state cs;
-      struct hk_ray_tracing_state rt;
       struct hk_conditional_render_state conditional;
 
       /* Whole-image clears not yet recorded, see
@@ -1828,30 +1864,6 @@ struct hk_cmd_buffer {
          struct agx_zls_control_packed zls_control;
          bool process_empty_tiles;
       } pending_z_store;
-      /* M5: the render pass instance that ended last, while the next one may
-       * continue in its render stream instead of storing and reloading the
-       * attachments (hk_m5_pass_merge_begin()). */
-      struct hk_pass_merge_candidate {
-         bool valid;
-         /* The instance's single render stream, where its draws ended and
-          * where its terminator left the stream and chunk. */
-         struct hk_cs *cs;
-         void *resume_current;
-         void *after_current;
-         void *end;
-         /* The tracked state when the instance ended; the next instance may
-          * continue only if none of it moved. */
-         uint32_t next_seq;
-         uint32_t sync_epoch;
-         struct hk_cs *open_cs;
-         void *open_cs_current;
-         /* A recorded dependency orders the next instance after this one
-          * beyond attachment operations; continuing then needs the stronger
-          * conditions of hk_m5_ordered_refusal(). */
-         bool ordered;
-         /* The render state the instance ended with. */
-         struct hk_rendering_state render;
-      } pass_merge;
 
       /* M5: the open render stream is an ordered continuation (hk_cs::
        * m5_ordered) and a command recorded since may read the instance's
@@ -2108,7 +2120,7 @@ uint64_t hk_cmd_publish_ioto_program(struct hk_cmd_buffer *cmd,
 
 /* Clean the current chunk's programs from the CPU cache (cached command
  * memory); hk_cmd_buffer_publish_cached_uploads() fences it. */
-void hk_ioto_arena_clean(struct hk_cmd_buffer *cmd);
+bool hk_ioto_arena_clean(struct hk_cmd_buffer *cmd);
 
 /* Release the arena's bookkeeping. The chunks themselves are in large_bos. */
 void hk_ioto_arena_finish(struct hk_cmd_buffer *cmd);
@@ -2897,7 +2909,8 @@ hk_get_descriptors_state(struct hk_cmd_buffer *cmd,
    case VK_PIPELINE_BIND_POINT_COMPUTE:
       return &cmd->state.cs.descriptors;
    case VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR:
-      return &cmd->state.rt.descriptors;
+      cmd->used_rt = true;
+      return &cmd->rt.descriptors;
    default:
       UNREACHABLE("Unhandled bind point");
    }
