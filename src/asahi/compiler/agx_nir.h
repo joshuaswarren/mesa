@@ -83,6 +83,13 @@ bool agx_nir_lower_subgroups(struct nir_shader *s);
 bool agx_nir_lower_subgroups_g17p(struct nir_shader *s);
 bool agx_nir_lower_subgroups_m5(struct nir_shader *s, bool native_shuffle_xor,
                                 bool native_float_minmax);
+bool agx_nir_lower_subgroups_for_target(struct nir_shader *s, bool g17p,
+                                        bool m5, bool g18g);
+#ifndef NDEBUG
+bool agx_nir_subgroup_intrinsic_needs_lowering(
+   const struct nir_shader *s, const struct nir_intrinsic_instr *intr,
+   bool g17p, bool m5, bool g18g);
+#endif
 bool agx_nir_flush_subgroup_minmax(struct nir_shader *s);
 bool agx_nir_lower_dynamic_shuffle_xor(struct nir_shader *s);
 bool agx_nir_lower_quad_derivative_ids(struct nir_shader *s);

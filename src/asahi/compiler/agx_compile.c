@@ -11061,12 +11061,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (g18_scans)
       NIR_PASS(sub_progress, nir, agx_nir_lower_g18_subgroups);
    if (sub_progress) {
-      if (byte_indices)
-         NIR_PASS(_, nir, agx_nir_lower_subgroups_g17p);
-      else if (m5)
-         NIR_PASS(_, nir, agx_nir_lower_subgroups_m5, !g18_scans, !g18_scans);
-      else
-         NIR_PASS(_, nir, agx_nir_lower_subgroups);
+      NIR_PASS(_, nir, agx_nir_lower_subgroups_for_target, byte_indices, m5,
+               g18_scans);
       if (byte_indices || (m5 && !g18_scans))
          NIR_PASS(_, nir, agx_nir_lower_dynamic_shuffle_xor);
    }
@@ -14618,7 +14614,8 @@ agx_nir_has_temp_vars(const nir_shader *nir)
 
 #ifndef NDEBUG
 static void
-agx_assert_post_lower_invariants(const nir_shader *nir)
+agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p, bool m5,
+                                 bool g18g)
 {
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -14634,31 +14631,13 @@ agx_assert_post_lower_invariants(const nir_shader *nir)
                       "post_lower requires sincos already lowered");
             } else if (instr->type == nir_instr_type_intrinsic) {
                const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-               switch (intr->intrinsic) {
-               case nir_intrinsic_ballot:
-               case nir_intrinsic_elect:
-               case nir_intrinsic_vote_all:
-               case nir_intrinsic_vote_any:
-               case nir_intrinsic_vote_feq:
-               case nir_intrinsic_vote_ieq:
-               case nir_intrinsic_shuffle:
-               case nir_intrinsic_shuffle_xor:
-               case nir_intrinsic_shuffle_up:
-               case nir_intrinsic_shuffle_down:
-               case nir_intrinsic_quad_broadcast:
-               case nir_intrinsic_quad_swap_horizontal:
-               case nir_intrinsic_quad_swap_vertical:
-               case nir_intrinsic_quad_swap_diagonal:
-               case nir_intrinsic_reduce:
-               case nir_intrinsic_inclusive_scan:
-               case nir_intrinsic_exclusive_scan:
-               case nir_intrinsic_read_invocation:
-               case nir_intrinsic_read_first_invocation:
-                  assert(!"post_lower requires subgroups already lowered");
-                  break;
-               default:
-                  break;
+               if (g18g) {
+                  assert(!agx_g18_subgroup_filter(intr, NULL) &&
+                         "post_lower requires G18G subgroups already lowered");
                }
+               assert(!agx_nir_subgroup_intrinsic_needs_lowering(
+                         nir, intr, g17p, m5, g18g) &&
+                      "post_lower requires subgroups already lowered");
             }
          }
       }
@@ -14749,12 +14728,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    if (!post_lower) {
       if (g18g)
          NIR_PASS(_, nir, agx_nir_lower_g18_subgroups);
-      if (g17p)
-         NIR_PASS(_, nir, agx_nir_lower_subgroups_g17p);
-      else if (m5)
-         NIR_PASS(_, nir, agx_nir_lower_subgroups_m5, !g18g, !g18g);
-      else
-         NIR_PASS(_, nir, agx_nir_lower_subgroups);
+      NIR_PASS(_, nir, agx_nir_lower_subgroups_for_target, g17p, m5, g18g);
    }
    NIR_PASS(_, nir, nir_lower_all_phis_to_scalar);
 
@@ -14769,7 +14743,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_dce);
 #ifndef NDEBUG
-      agx_assert_post_lower_invariants(nir);
+      agx_assert_post_lower_invariants(nir, g17p, m5, g18g);
 #endif
    }
 
