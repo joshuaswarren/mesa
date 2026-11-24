@@ -294,12 +294,47 @@ lower_fma(nir_builder *b, nir_def *x, nir_def *y, nir_def *z)
    return nir_bcsel(b, inf_denorm, nir_fadd(b, inf, z), result);
 }
 
+static nir_def *
+is_nan(nir_builder *b, nir_def *x)
+{
+   return nir_ult(b, nir_imm_int(b, 0x7f800000u),
+                  nir_iand_imm(b, x, 0x7fffffffu));
+}
+
 /* The order of x as an unsigned integer, for x not NaN; -0 sorts below +0. */
 static nir_def *
 order_key(nir_builder *b, nir_def *x)
 {
    return nir_bcsel(b, nir_ilt_imm(b, x, 0), nir_inot(b, x),
                     nir_ixor(b, x, nir_imm_int(b, 0x80000000u)));
+}
+
+/* Hardware fmin/fmax (fcmpsel) can flush denormal operands during comparison
+ * on AGX3B chips (such as G15/G16). Compare denormal cases as ordered integers
+ * while preserving IEEE 754 minNum/maxNum NaN semantics (returning the non-NaN
+ * operand) and signed-zero ordering (-0 < +0). */
+static nir_def *
+lower_minmax(nir_builder *b, nir_op op, nir_def *x, nir_def *y)
+{
+   const bool is_max = op == nir_op_fmax || op == nir_op_fmax_agx;
+   nir_def *native = nir_build_alu2(b, op, x, y);
+   nir_def *kx = order_key(b, x);
+   nir_def *ky = order_key(b, y);
+   nir_def *take_x = is_max ? nir_uge(b, kx, ky) : nir_uge(b, ky, kx);
+   nir_def *ordered = nir_bcsel(b, take_x, x, y);
+   nir_def *exact = nir_bcsel(b, is_nan(b, x), y,
+                              nir_bcsel(b, is_nan(b, y), x, ordered));
+   return nir_bcsel(b, nir_ior(b, is_denorm(b, x), is_denorm(b, y)), exact,
+                    native);
+}
+
+/* fsat lowers to fadd.sat(x, -0.0), which flushes positive denormals to 0. */
+static nir_def *
+lower_fsat(nir_builder *b, nir_def *x)
+{
+   nir_def *native = nir_fsat(b, x);
+   nir_def *exact = nir_bcsel(b, nir_ilt_imm(b, x, 0), nir_imm_int(b, 0), x);
+   return nir_bcsel(b, is_denorm(b, x), exact, native);
 }
 
 /* Float comparisons flush denormal operands, so compare them as integers. */
@@ -372,6 +407,16 @@ lower(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
    case nir_op_fneu:
       r = lower_compare(b, alu->op, nir_ssa_for_alu_src(b, alu, 0),
                         nir_ssa_for_alu_src(b, alu, 1));
+      break;
+   case nir_op_fmin:
+   case nir_op_fmax:
+   case nir_op_fmin_agx:
+   case nir_op_fmax_agx:
+      r = lower_minmax(b, alu->op, nir_ssa_for_alu_src(b, alu, 0),
+                       nir_ssa_for_alu_src(b, alu, 1));
+      break;
+   case nir_op_fsat:
+      r = lower_fsat(b, nir_ssa_for_alu_src(b, alu, 0));
       break;
    case nir_op_fsign: {
       /* A denormal has the sign of a nonzero value. */

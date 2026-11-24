@@ -356,11 +356,28 @@ run_rq(bool rq_first)
    CHECK(queue.drm.render_rq == (rq_first ? HK_RENDER_RQ_FRAGMENT : 0));
    CHECK(created_layouts[0] == 0 && (created_layouts[1] != 0) == rq_first);
 
-   /* A later call that needs the scratch never replaces at admission. */
+   /* A later call that needs the scratch never replaces at admission, and
+    * steady-state submissions bypass admission without re-entering queue
+    * creation or holding the queue lock. */
    cs.gen1_native_fragment_rq = true;
+   create_error = ENOSPC;
    CHECK(hk_QueueSubmit2(q, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
    CHECK(creates == 2 && submits == 2 && queue.drm.id == 42);
    CHECK(queue.drm.render_rq == (rq_first ? HK_RENDER_RQ_FRAGMENT : 0));
+
+   /* Emulated queues sharing an admitted backing queue take the same
+    * lockless fast path. */
+   struct hk_queue alias = {0};
+   CHECK(vk_queue_init(&alias.vk, &dev->vk, &qi, 0) == VK_SUCCESS);
+   alias.vk.driver_submit = NULL;
+   alias.drm.id = UINT32_MAX;
+   vk_queue_set_emulated(&alias.vk, &queue.vk);
+   CHECK(hk_QueueSubmit2(vk_queue_to_handle(&alias.vk), 1, &si,
+                         VK_NULL_HANDLE) == VK_SUCCESS);
+   CHECK(creates == 2 && submits == 3 && queue.drm.id == 42 &&
+         alias.drm.id == UINT32_MAX);
+   vk_queue_finish(&alias.vk);
+   create_error = 0;
 
    vk_queue_finish(&queue.vk);
    CHECK(!vk_device_is_lost_no_report(&dev->vk));

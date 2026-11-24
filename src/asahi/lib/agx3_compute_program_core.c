@@ -195,7 +195,8 @@ agx3_g17p_native_compute_launch_pack(
     * carries the upper pointer bits and must be derived from the VA, not
     * hard-coded -- see the note on the store below. */
    uint32_t word0 = program->launch_template.word0;
-   if ((program->chip == AGX_CHIP_G17P || program->m5_native_compute_live_bound) &&
+   if ((agx_chip_native_hal200(program->chip) ||
+        program->m5_native_compute_live_bound) &&
        global_size[1] < 2 && global_size[2] < 2)
       word0 &= UINT32_C(0xfff1ffff);
    agx3_cmdstream_store_le32(packed, word0);

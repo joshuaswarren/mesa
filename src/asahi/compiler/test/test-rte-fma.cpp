@@ -12,7 +12,7 @@ extern "C" {
 
 static std::vector<uint8_t>
 compile_native_fma(unsigned mode, unsigned components,
-                   enum agx_chip chip = AGX_CHIP_G17P)
+                   enum agx_chip chip = AGX_CHIP_G17P, bool weak = false)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, &agx_nir_options, "native fused FP32 operation");
@@ -21,7 +21,7 @@ compile_native_fma(unsigned mode, unsigned components,
    nir_def *x = agx_test_load_preamble(&b, components, 32, 4);
    nir_def *y = agx_test_load_preamble(&b, components, 32, 12);
    nir_def *z = agx_test_load_preamble(&b, components, 32, 20);
-   nir_def *result = nir_ffma(&b, x, y, z);
+   nir_def *result = weak ? nir_ffma_weak(&b, x, y, z) : nir_ffma(&b, x, y, z);
    agx_test_store_local_pixel_agx(
       &b, nir_pad_vector(&b, result, 4), nir_imm_intN_t(&b, 0xff, 16),
       nir_undef(&b, 2, 16), 0, BITFIELD_MASK(components),
@@ -37,6 +37,8 @@ compile_native_fma(unsigned mode, unsigned components,
    key.no_preamble = true;
    key.reserved_preamble = 32;
    key.fs.nr_samples = 1;
+   /* As the drivers do, where the shader enters them. */
+   agx_nir_lower_fma_rte(b.shader, chip);
    if (chip == AGX_CHIP_G17C)
       agx_preprocess_nir_m5(b.shader);
    else
@@ -87,6 +89,65 @@ TEST(NativeFMA, OnlyRTERequiresTheTininessRepair)
          EXPECT_EQ(plain, ftz);
          EXPECT_NE(plain, rte_ftz);
       }
+   }
+}
+
+/* GLSL.std.450 Fma compiles as it would without an explicit rounding mode. */
+TEST(NativeFMA, WeakFMAIsNotRepaired)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G17C}) {
+      SCOPED_TRACE(chip);
+      for (unsigned components = 1; components <= 4; ++components) {
+         SCOPED_TRACE(components);
+         auto plain = compile_native_fma(0, components, chip, true);
+         auto rte_ftz =
+            compile_native_fma(FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32 |
+                                  FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32,
+                               components, chip, true);
+         EXPECT_FALSE(plain.empty());
+         EXPECT_EQ(plain, rte_ftz);
+      }
+   }
+}
+
+TEST(NativeFMA, RepairTakesOnlyStrictFMA)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G14G, AGX_CHIP_G15G,
+                              AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17C}) {
+      SCOPED_TRACE(chip);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "strict and weak FMA");
+      b.shader->info.float_controls_execution_mode =
+         FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32 |
+         FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32;
+      /* Not scalarized yet: a vector FMA is repaired per component. */
+      nir_def *x = agx_test_load_preamble(&b, 2, 32, 4);
+      nir_def *y = agx_test_load_preamble(&b, 2, 32, 8);
+      nir_def *z = agx_test_load_preamble(&b, 2, 32, 12);
+      nir_store_global(&b, nir_ffma(&b, x, y, z), nir_imm_int64(&b, 0),
+                       .align_mul = 4);
+      nir_store_global(&b, nir_ffma_weak(&b, x, y, z), nir_imm_int64(&b, 8),
+                       .align_mul = 4);
+
+      const bool repaired = true;
+      EXPECT_EQ(agx_nir_lower_fma_rte(b.shader, chip), repaired);
+      nir_validate_shader(b.shader, "strict and weak FMA");
+
+      unsigned ifs = 0, strict = 0, weak = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_if *nif = nir_block_get_following_if(block);
+         ifs += nif != NULL;
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            strict += nir_instr_as_alu(instr)->op == nir_op_ffma;
+            weak += nir_instr_as_alu(instr)->op == nir_op_ffma_weak;
+         }
+      }
+      EXPECT_EQ(ifs, repaired ? 2u : 0u);
+      EXPECT_EQ(strict, 1u);
+      EXPECT_EQ(weak, 1u);
+      ralloc_free(b.shader);
    }
 }
 
@@ -205,13 +266,13 @@ TEST(NativeFMA, PreserveModeIsUnchanged)
    EXPECT_EQ(preserve, rte_preserve);
 }
 
-TEST(NativeFMA, LegacyAndOtherAGX3ChipsAreUnchanged)
+TEST(NativeFMA, AllGenerationsRepairExplicitRTE)
 {
    for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G14G, AGX_CHIP_G15S, AGX_CHIP_G16G}) {
       auto plain = compile_native_fma(0, 1, chip);
       auto rte =
          compile_native_fma(FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32, 1, chip);
       EXPECT_FALSE(plain.empty());
-      EXPECT_EQ(plain, rte);
+      EXPECT_NE(plain, rte);
    }
 }

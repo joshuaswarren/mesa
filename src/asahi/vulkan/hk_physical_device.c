@@ -9,6 +9,7 @@
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/compiler/agx_nir_texture.h"
 #include "asahi/compiler/agx_debug.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/lib/agx_device.h"
 #include "asahi/lib/agx_nir_lower_vbo.h"
 #include "util/disk_cache.h"
@@ -30,6 +31,7 @@
 #include "hk_native_descriptor.h"
 #include "hk_nir_lower_mesh.h"
 #include "hk_private.h"
+#include "hk_queue.h"
 #include "hk_ray_tracing_core.h"
 #include "hk_shader.h"
 #include "hk_wsi.h"
@@ -137,16 +139,6 @@ hk_cache_identity(const uint8_t build_sha[32], const struct agx_device *dev,
    memcpy(disk_cache_id, blake3, sizeof(*disk_cache_id));
 }
 
-/* VK_KHR_shader_fma: G17P with its explicit-RTE tininess repair
- * (agx_nir_lower_fma_rte()) and M5. G13-G15 do not pass the newly exposed
- * cases. */
-static bool
-hk_shader_fma_supported(enum agx_chip chip)
-{
-   return agx_chip_g17p_or_m5(chip) &&
-          agx_chip_exact_fma32(chip);
-}
-
 static void
 hk_get_device_extensions(const struct agx_device *dev,
                          const struct hk_instance *instance,
@@ -188,6 +180,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .KHR_bind_memory2 = true,
       .KHR_buffer_device_address = true,
       .KHR_calibrated_timestamps = true,
+      .KHR_compute_shader_derivatives = true,
       .KHR_copy_commands2 = true,
       .KHR_create_renderpass2 = true,
       .KHR_dedicated_allocation = true,
@@ -291,12 +284,13 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_custom_border_color = true,
       .EXT_debug_marker = true,
       .EXT_depth_bias_control = true,
-      /* Tested on G17P only. */
-      .EXT_depth_clip_control = dev->chip == AGX_CHIP_G17P,
+      /* Lowered in NIR (agx_nir_lower_clip_m1_1) via the shared root table on
+       * AGX2 and native AGX3; HAL300 PPP admission still rejects negative-one
+       * depth clip. */
+      .EXT_depth_clip_control = !agx_chip_hal300_path(dev->chip),
       .EXT_depth_clip_enable = true,
-      /* Qualified on G17P only (the whole binding_model.descriptor_buffer
-       * group); other chips share the code but need their own run. */
-      .EXT_descriptor_buffer = dev->chip == AGX_CHIP_G17P,
+      .EXT_descriptor_buffer =
+         agx_chip_has_cap(dev->chip, AGX_CAP_DESCRIPTOR_BUFFER),
       .EXT_descriptor_indexing = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = false,
@@ -306,7 +300,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
-      .EXT_external_memory_host = agx_has_userptr(dev),
+      .EXT_external_memory_host = agx_has_host_import(dev),
       .EXT_fragment_shader_interlock = agx_chip_native_agx3(dev->chip),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
@@ -328,9 +322,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_memory_priority = agx_has_residency_control(dev),
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
-      /* Qualified on G17P and G17S; nested replay is shared code. */
-      .EXT_nested_command_buffer =
-         dev->chip == AGX_CHIP_G17P || dev->chip == AGX_CHIP_G17S,
+      /* Shared secondary command-buffer replay in hk_CmdExecuteCommands(). */
+      .EXT_nested_command_buffer = true,
       .EXT_non_seamless_cube_map = true,
       .EXT_pageable_device_local_memory = agx_has_residency_control(dev),
       .EXT_pipeline_creation_cache_control = true,
@@ -344,7 +337,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_primitive_restart_index = true,
       .EXT_primitive_topology_list_restart = true,
       .EXT_private_data = true,
-      .EXT_primitives_generated_query = false,
+      /* Counted by the shared pre-graphics helpers across all generations. */
+      .EXT_primitives_generated_query = true,
       .EXT_provoking_vertex = true,
       .EXT_queue_family_foreign = true,
       .EXT_robustness2 = true,
@@ -352,8 +346,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_sampler_filter_minmax = false,
       .EXT_scalar_block_layout = true,
       .EXT_separate_stencil_usage = true,
-      .EXT_shader_atomic_float = false,
-      .EXT_shader_atomic_float2 = false,
+      .EXT_shader_atomic_float = true,
+      .EXT_shader_atomic_float2 = true,
       .EXT_shader_image_atomic_int64 = false,
       .EXT_shader_demote_to_helper_invocation = true,
       .EXT_shader_module_identifier = true,
@@ -369,6 +363,9 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_swapchain_maintenance1 = true,
 #endif
       .EXT_texel_buffer_alignment = true,
+      /* Hardware ASTC HDR decode is supported across AGX2 and native AGX3
+       * (G13-G17P); keep HAL300 off until qualified on M5 hardware. */
+      .EXT_texture_compression_astc_hdr = !agx_chip_hal300_path(dev->chip),
       .EXT_tooling_info = true,
       .EXT_transform_feedback = true,
       
@@ -468,8 +465,10 @@ hk_get_device_features(
       .sparseResidencyImage2D = true,
       .sparseResidencyBuffer = true,
 
-      /* This needs investigation. */
-      .sparseResidencyImage3D = false,
+      /* The sparse binder and SSTT use the same slice layout for 3D images
+       * as for 2D arrays (nonstandard, one-slice block shape). */
+      .sparseResidencyImage3D =
+         agx_chip_has_cap(dev->chip, AGX_CAP_SPARSE_RESIDENCY_3D),
       .variableMultisampleRate = false,
       .inheritedQueries = true,
 
@@ -686,13 +685,10 @@ hk_get_device_features(
 
       /* VK_KHR_shader_float_controls2 */
       .shaderFloatControls2 = true,
-      .shaderFmaFloat16 = true,
-      .shaderFmaFloat32 = true,
-      .shaderFmaFloat64 = false,
 
       /* VK_KHR_shader_fma */
-      .shaderFmaFloat16 = hk_shader_fma_supported(dev->chip),
-      .shaderFmaFloat32 = hk_shader_fma_supported(dev->chip),
+      .shaderFmaFloat16 = true,
+      .shaderFmaFloat32 = true,
       .shaderFmaFloat64 = false,
 
       /* VK_KHR_shader_maximal_reconvergence */
@@ -775,8 +771,8 @@ hk_get_device_features(
       .floatRepresentation = false,
       .depthBiasExact = true,
 
-      /* VK_EXT_depth_clip_control, tested on G17P only */
-      .depthClipControl = dev->chip == AGX_CHIP_G17P,
+      /* VK_EXT_depth_clip_control */
+      .depthClipControl = supported_extensions->EXT_depth_clip_control,
 
       /* VK_EXT_depth_clip_enable */
       .depthClipEnable = true,
@@ -825,7 +821,7 @@ hk_get_device_features(
       .extendedDynamicState3LineRasterizationMode = true,
       .extendedDynamicState3LineStippleEnable = false,
       .extendedDynamicState3DepthClipNegativeOneToOne =
-         dev->chip == AGX_CHIP_G17P,
+         supported_extensions->EXT_depth_clip_control,
       .extendedDynamicState3ViewportWScalingEnable = false,
       .extendedDynamicState3ViewportSwizzle = false,
       .extendedDynamicState3CoverageToColorEnable = false,
@@ -1069,7 +1065,8 @@ hk_get_device_features(
        * as for 2D arrays. Report the nonstandard, one-slice block shape rather
        * than requiring the standard 3D block shape.
        */
-      features->sparseResidencyImage3D = sparse;
+      features->sparseResidencyImage3D =
+         agx_chip_has_cap(dev->chip, AGX_CAP_SPARSE_RESIDENCY_3D);
       features->sparseResidencyBuffer = sparse;
       /* The common Honeykrisp lowering duplicates a draw per view, writes
        * ViewIndex through the draw root and routes it through the packed
@@ -1092,35 +1089,22 @@ hk_get_device_features(
        * fragment entry and prevent merging triangles across derivative quads.
        */
       features->shaderQuadControl = dev->chip == AGX_CHIP_G17P;
-
-      /* Qualified on A18 Pro only. */
-      if (dev->chip == AGX_CHIP_G17P) {
-         features->computeDerivativeGroupQuads = true;
-         features->computeDerivativeGroupLinear = true;
-         features->textureCompressionASTC_HDR = true;
-      }
    }
 
-   /* Compute derivatives are NIR quad-swap lowering plus explicit-gradient
-    * samples, both available on M5; quad control remains restricted to G17P. */
-   if (agx_chip_g17_m5(dev->chip)) {
-      features->computeDerivativeGroupQuads = true;
-      features->computeDerivativeGroupLinear = true;
-   }
+   /* Compute derivatives lower in NIR to quad swaps and explicit-gradient
+    * texture operations, available across all generations. */
+   features->computeDerivativeGroupQuads =
+      supported_extensions->KHR_compute_shader_derivatives;
+   features->computeDerivativeGroupLinear =
+      supported_extensions->KHR_compute_shader_derivatives;
+   features->textureCompressionASTC_HDR =
+      supported_extensions->EXT_texture_compression_astc_hdr;
 
    /* A multiview promise for a stage this device does not expose is
     * meaningless, so keep the pair consistent however the stage bits above
     * resolved. */
    features->multiviewGeometryShader &= features->geometryShader;
    features->multiviewTessellationShader &= features->tessellationShader;
-
-   /* G16G inserts explicit view bounds for robust image operations in NIR.
-    * It qualifies both robust modes, and its descriptor swizzle supplies the
-    * required out-of-bounds alpha. */
-   if (dev->chip == AGX_CHIP_G16G) {
-      features->robustImageAccess = true;
-      features->robustImageAccess2 = true;
-   }
 }
 
 #define HK_RAY_TRACING_STAGES                                                 \
@@ -1225,8 +1209,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .apiVersion = hk_get_vk_version(),
       .driverVersion = vk_get_driver_version(),
       .vendorID = instance->drirc.debug.force_vk_vendor ?: VK_VENDOR_ID_MESA,
-      .deviceID = agx_chip_native_or_m5(dev->chip)
-                     ? dev->params.chip_id : 0,
+      .deviceID = dev->params.chip_id,
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
 
       /* Vulkan 1.0 limits */
@@ -1526,7 +1509,8 @@ hk_get_device_properties(const struct agx_device *dev,
       .shaderSignedZeroInfNanPreserveFloat64 = false,
       .shaderDenormPreserveFloat16 = true,
       /* agx_nir_lower_denorm_preserve() computes flushed cases exactly. */
-      .shaderDenormPreserveFloat32 = dev->chip == AGX_CHIP_G17P,
+      .shaderDenormPreserveFloat32 =
+         agx_chip_has_fp32_denorm_preserve(dev->chip),
       .shaderDenormPreserveFloat64 = false,
       .shaderDenormFlushToZeroFloat16 = false,
       .shaderDenormFlushToZeroFloat32 = true,
@@ -2270,10 +2254,10 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    supported_extensions.KHR_cooperative_matrix =
       agx_chip_cooperative_matrix_supported(pdev->dev.chip);
 
-   /* bf16 inputs ride the same 8x8 matmad form on AGX3B: a bf16 value
-    * widens to f32 exactly, so a bf16 product accumulated in f32 matches an
-    * f32 matmad of the same values bit for bit. bf16 therefore follows the
-    * cooperative matrix paths on both encodings. */
+   /* bf16 inputs widen to f32: exact because every bf16 value is representable
+    * in f32, so the accumulated f32 product matches bit for bit. bf16
+    * therefore follows the cooperative matrix paths across all supported
+    * encodings. */
    supported_extensions.KHR_shader_bfloat16 =
       agx_chip_cooperative_matrix_supported(pdev->dev.chip);
 
@@ -2282,11 +2266,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * for the M5 only, so an AGX3B part that enables the 8x8
     * VK_KHR_cooperative_matrix does not advertise it. */
    supported_extensions.NV_cooperative_matrix2 = m5_cmat;
-
-   /* Counted by the pre-graphics helpers, which every native chip runs;
-    * hardware-qualified on M5 and G17P. */
-   supported_extensions.EXT_primitives_generated_query =
-      agx_chip_g17p_or_m5(pdev->dev.chip);
 
    supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
       (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2);
@@ -2298,31 +2277,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    if (agx_chip_native_agx3(pdev->dev.chip)) {
       supported_extensions.KHR_shader_quad_control =
          pdev->dev.chip == AGX_CHIP_G17P;
-   }
-
-   /* VK_KHR_shader_fma makes shaderFmaFloat32 mandatory. */
-   if (!hk_shader_fma_supported(pdev->dev.chip))
-      supported_extensions.KHR_shader_fma = false;
-
-   if (pdev->dev.chip == AGX_CHIP_G17P) {
-      /* Advanced blending is hardware-qualified on A18 Pro for every
-       * operation and advertised overlap/premultiplication mode, including
-       * coherent sequencing, across the bounded one-attachment profile. */
-      supported_extensions.KHR_compute_shader_derivatives = true;
-      supported_extensions.EXT_shader_atomic_float = true;
-      supported_extensions.EXT_shader_atomic_float2 = true;
-      supported_extensions.EXT_texture_compression_astc_hdr = true;
-   }
-
-   if (agx_chip_g17_m5(pdev->dev.chip))
-      supported_extensions.KHR_compute_shader_derivatives = true;
-
-   /* AGX3C has no witnessed native float atomic; agx_nir_lower_atomics turns
-    * fp32 add/min/max on buffers, shared memory and (lowered) images into
-    * compare-and-swap loops, so the same feature set is exact on M5. */
-   if (agx_chip_g17_m5(pdev->dev.chip)) {
-      supported_extensions.EXT_shader_atomic_float = true;
-      supported_extensions.EXT_shader_atomic_float2 = true;
    }
 
    struct vk_features supported_features;
@@ -2441,7 +2395,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     */
    if ((pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) &&
        !pdev->dev.is_virtio) {
-#define HK_ADVERTISED_QUEUES 8u
       struct drm_asahi_queue_limits limits = {0};
       struct drm_asahi_get_params query = {
          .param_group = DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS,
@@ -2459,6 +2412,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
                             "Kernel reports no usable command queues");
          goto fail_disk_cache;
       }
+      pdev->queue_limits = limits;
       /* limits.max_queues is the machine-wide pool of application GART
        * contexts (g17_queue_limits.rs: contexts 5..62), shared with every
        * other client on the device. VkQueueFamilyProperties::queueCount is a
@@ -2483,10 +2437,17 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * clears and blits the same way on any family. These families only
     * narrow what the application may record, so they reuse the universal
     * queue implementation, and like it they create their kernel queue on
-    * first submission, in the device's one VM. The G17P and M3 kernels
-    * report independent queues too, but the families are qualified on M5. */
-   if (agx_chip_g17_m5(pdev->dev.chip) &&
-       (pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES)) {
+    * first submission, in the device's one VM.
+    *
+    * Advertising queue_count on each family exposes up to 3 * queue_count
+    * (24) total logical queues across the three families, all drawing from
+    * the kernel's limits.max_queues budget (the G17 context pool or G15's
+    * 58-queue policy bound). Because kernel queues are created lazily on
+    * first submission rather than at vkCreateDevice time (with entry
+    * admission via hk_queue_admits_at_entry() on G17P/M5; other runtimes
+    * report exhaustion at submit time), unused families consume no kernel
+    * queues. */
+   if (pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) {
       pdev->queue_families[pdev->queue_family_count++] = (struct hk_queue_family){
          .queue_flags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
          .queue_count = queue_count,
@@ -2734,11 +2695,12 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
                 !pdev->vk.supported_features.shaderBFloat16CooperativeMatrix)
                continue;
             /* An 8x8 accumulator of the 16-bit input type takes half the
-             * registers of an f32 one. f16 is listed on the AGX3B encoding
-             * (G15/G16/G17P) only, where it runs on the f16matmad8x8: AGX3C
-             * (M5) would widen it into an f32 matmad not yet run with it. */
-            const bool f16_accum = agx_chip_isa_encoding(pdev->dev.chip) ==
-                                   AGX_ISA_ENCODING_AGX3B;
+             * registers of an f32 one. f16 is listed on AGX2 (simd_matrix_fmadd16)
+             * and AGX3B (f16matmad8x8): M5 (AGX3C) would widen it into an f32
+             * matmad not yet run with it. */
+            const enum agx_isa_encoding enc = agx_chip_isa_encoding(pdev->dev.chip);
+            const bool f16_accum = enc == AGX_ISA_ENCODING_AGX2 ||
+                                   enc == AGX_ISA_ENCODING_AGX3B;
             unsigned modes = (types[i] == VK_COMPONENT_TYPE_BFLOAT16_KHR || f16_accum) ? 2 : 1;
             for (unsigned accum = 0; accum < modes; ++accum) {
                vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p) {

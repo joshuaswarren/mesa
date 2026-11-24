@@ -21,8 +21,10 @@
  * between them: the expected values are what Honeykrisp's in-order stages
  * give, batched or not, and are not a Vulkan guarantee.
  *
- * Usage: vulkan-tess-batch-order [passes] [--shim]
- *   --shim  no-op DRM shim: record and submit one pass, skip the checks.
+ * Usage: vulkan-tess-batch-order [passes] [--shim [--indirect]]
+ *   --shim      no-op DRM shim: record and submit one pass, skip the checks.
+ *   --indirect  with --shim: record the pass as one vkCmdDrawIndirect, which
+ *               is not batched and takes the indirect tessellation launches.
  * Exit status 0 = correct output.
  */
 #include <stdbool.h>
@@ -125,12 +127,18 @@ static unsigned check(const struct out *o, unsigned iter, bool prev,
 
 int main(int argc, char **argv) {
   unsigned passes = 64;
-  bool shim = false;
+  bool shim = false, indirect = false;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--shim"))
       shim = true;
+    else if (!strcmp(argv[i], "--indirect"))
+      indirect = true;
     else
       passes = atoi(argv[i]);
+  }
+  if (indirect && !shim) {
+    fprintf(stderr, "--indirect requires --shim\n");
+    return 2;
   }
   if (shim)
     passes = 1;
@@ -193,6 +201,31 @@ int main(int argc, char **argv) {
   CHECK(vkBindBufferMemory(dev, buf, bmem, 0));
   struct out *out;
   CHECK(vkMapMemory(dev, bmem, 0, VK_WHOLE_SIZE, 0, (void **)&out));
+
+  /* The indirect draw command, host visible. */
+  VkBuffer ibuf;
+  CHECK(vkCreateBuffer(
+     dev,
+     &(VkBufferCreateInfo){
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = sizeof(VkDrawIndirectCommand),
+        .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT},
+     NULL, &ibuf));
+  vkGetBufferMemoryRequirements(dev, ibuf, &mr);
+  VkDeviceMemory indmem;
+  CHECK(vkAllocateMemory(
+     dev,
+     &(VkMemoryAllocateInfo){
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mr.size,
+        .memoryTypeIndex =
+           memory_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)},
+     NULL, &indmem));
+  CHECK(vkBindBufferMemory(dev, ibuf, indmem, 0));
+  VkDrawIndirectCommand *icmd;
+  CHECK(vkMapMemory(dev, indmem, 0, VK_WHOLE_SIZE, 0, (void **)&icmd));
+  *icmd = (VkDrawIndirectCommand){.vertexCount = 3, .instanceCount = 1};
 
   /* A small colour target: the work under test is before the render. */
   const VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
@@ -393,11 +426,14 @@ int main(int argc, char **argv) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1,
                             &set, 0, NULL);
-    for (unsigned d = 0; d < DRAWS; d++) {
+    for (unsigned d = 0; d < (indirect ? 1 : DRAWS); d++) {
       const struct pc p = params(d, iter, prev, slow_vs, slow_tcs);
       vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_ALL_GRAPHICS, 0, sizeof(p),
                          &p);
-      vkCmdDraw(cb, 3, 1, 0, 0);
+      if (indirect)
+        vkCmdDrawIndirect(cb, ibuf, 0, 1, 0);
+      else
+        vkCmdDraw(cb, 3, 1, 0, 0);
     }
     vkCmdEndRendering(cb);
     vkCmdPipelineBarrier2(
@@ -423,7 +459,8 @@ int main(int argc, char **argv) {
   }
 
   if (shim) {
-    printf("1 pass of %u draws recorded (no readback)\n", DRAWS);
+    printf("1 pass of %u draws recorded (no readback)\n",
+           indirect ? 1 : DRAWS);
     return 0;
   }
   if (bad) {

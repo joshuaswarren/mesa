@@ -78,6 +78,10 @@ struct hk_physical_device {
    struct hk_queue_family queue_families[3];
    uint8_t queue_family_count;
 
+   /* Kernel queue limits with DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES, zero
+    * when the kernel does not report them. */
+   struct drm_asahi_queue_limits queue_limits;
+
    struct vk_sync_type syncobj_sync_type;
    const struct vk_sync_type *sync_types[2];
 

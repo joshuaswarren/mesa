@@ -195,6 +195,9 @@ enum agx3_barrier_scope {
    AGX3_BARRIER_SCOPE_MESH_PAYLOAD_ENTRY,
    /* Captured object.write_childcount after the API workgroup barrier. */
    AGX3_BARRIER_SCOPE_OBJECT_PAYLOAD_EXIT,
+   /* A memory-only fence over threadgroup memory: the threadgroup-memory
+    * barrier without its rendezvous (see agx3_pack_scoped_barrier()). */
+   AGX3_BARRIER_SCOPE_THREADGROUP_FENCE,
 };
 
 struct agx3_encoded_scoped_barrier {
