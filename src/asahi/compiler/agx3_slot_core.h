@@ -69,14 +69,18 @@ enum agx3_slot_cf {
 };
 
 /*
- * A drain's retire carrier runs under the exec mask current where it is
- * emitted, and an instruction no lane executes does not reliably wait. So the
- * carrier at the end of an if arm (its else or pop_exec) retires only what
- * that arm issued: a generation issued before the if, under the enclosing
- * mask, may still be outstanding if the arm had no lanes. After an arm ends,
- * assignment therefore resumes from the state at the if, and consumers of
- * generations issued before it wait for them themselves; each consumer only
- * runs with lanes, where its wait holds.
+ * The arms of a structured if join. A divergent group runs both arms, one
+ * after the other under complementary exec masks, so the second arm starts
+ * with what the first left in flight; and an instruction no lane executes
+ * does not reliably wait, so an arm that had no lanes may have retired none
+ * of what its waits name. Assignment therefore starts an else's arm from the
+ * state at the if joined with the first arm's end, and the code after the
+ * pop from the second arm's end joined with the first arm's (or, with no
+ * else, with the state at the if). A joined state names, for each register,
+ * every slot whose generation may still write it, and a slot is retired only
+ * where every joined path retired it, so a consumer waits on the union. An
+ * arm's else and pop need no drain. A loop's body is a level too: its pop
+ * joins the state at its entry push.
  */
 
 struct agx3_slot_instr {
@@ -85,8 +89,8 @@ struct agx3_slot_instr {
    uint8_t cf;      /* enum agx3_slot_cf */
    /* Structured control flow: exec levels this instruction opens (an if or
     * a loop push) and closes (pop_exec). cf_arm marks an opened level whose
-    * arm keeps results in flight (cf == AGX3_SLOT_CF_NONE); cf_else ends one
-    * arm of the innermost level and starts the next. */
+    * arms join as described above; cf_else ends one arm of the innermost
+    * level and starts the next. */
    uint8_t cf_push, cf_pop;
    bool cf_arm, cf_else;
    /* This asynchronous instruction reads its sources when it retires rather
