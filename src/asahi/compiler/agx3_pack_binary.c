@@ -20643,13 +20643,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             }
             uint8_t bytes[AGX3_ALU_MAX_LENGTH],len;
             const bool src_abs[2] = {I->src[0].abs, I->src[1].abs};
-            bool encoded = I->saturate
-               ? !src_abs[0] && !src_abs[1] &&
-                    agx3_alu_hmul_saturate(enc,dst.value,src,hints,dst.cache,
-                                           wait,bytes,&len)
-               : (src_abs[0] || src_abs[1])
-                    ? agx3_alu_hmul_abs(enc, dst.value, src, hints, src_abs,
-                                        dst.cache, wait, bytes, &len)
+            /* An absolute source selects ep3, which also carries f14, so a
+             * saturate folded onto |a| * b keeps that form. */
+            bool encoded = (src_abs[0] || src_abs[1])
+               ? agx3_alu_hmul_abs(enc, dst.value, src, hints, src_abs,
+                                   I->saturate, dst.cache, wait, bytes, &len)
+               : I->saturate
+                    ? agx3_alu_hmul_saturate(enc,dst.value,src,hints,dst.cache,
+                                             wait,bytes,&len)
                     : agx3_alu_hmul(enc,dst.value,src,hints,dst.cache,wait,
                                     bytes,&len);
 

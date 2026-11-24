@@ -5629,16 +5629,20 @@ agx3_alu_hmul(enum agx_isa_encoding enc, uint16_t dest,
                            false, src_abs, NULL, wait_mask, out, len);
 }
 
+/* An absolute source needs the ten-byte ep3 point, which carries the f29/f46
+ * absolute bits and the f14 saturate bit independently, so |a| * b and
+ * saturate(|a| * b) share one form, as agx3_alu_hadd_mod_m5() does for the
+ * add. */
 bool
 agx3_alu_hmul_abs(enum agx_isa_encoding enc, uint16_t dest,
                   const uint16_t src[2],
                   const enum agx3_alu_hint hints[2],
-                  const bool src_abs[2], bool dest_cache,
+                  const bool src_abs[2], bool saturate, bool dest_cache,
                   uint16_t wait_mask,
                   uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
    return agx3_alu_h_binop(enc, AGX3_MN_f16mul, 4, dest, src, hints, dest_cache,
-                           false, src_abs, NULL, wait_mask, out, len);
+                           saturate, src_abs, NULL, wait_mask, out, len);
 }
 
 bool
