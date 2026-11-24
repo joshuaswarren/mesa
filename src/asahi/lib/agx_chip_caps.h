@@ -74,6 +74,7 @@ enum agx_chip_cap {
 
 #define AGX_CAPS_G17P                                                          \
    (AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                                \
+    AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |                                        \
     AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_RESIDENCY_3D)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
@@ -99,7 +100,7 @@ enum agx_chip_cap {
    X(G15C, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
    X(G15D, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G16P, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
-   X(G16G, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
+   X(G16G, AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE, __VA_ARGS__)             \
    X(G16S, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G16C, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G17P, AGX_CAPS_G17P, __VA_ARGS__)                                         \
