@@ -19,6 +19,7 @@ libasahi_agx_files = files(
   'agx_nir_opt_half_bitfield_extract.c',
   'agx_nir_opt_flatten_loads.c',
   'agx_nir_opt_merge_nested_early_exits.c',
+  'agx_nir_opt_narrow_subword_loads.c',
   'agx_nir_opt_select_load.c',
   'agx_nir_opt_licm.c',
   'agx_nir_opt_uniform_idiv.c',
@@ -813,6 +814,7 @@ if with_tests
          'test/test-nonneg-idiv.cpp',
          'test/test-half-bitfield-extract.cpp',
          'test/test-flatten-loads.cpp',
+         'test/test-narrow-subword-loads.cpp',
          'test/test-shared-phase-cse.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
          # in libasahi_lib, which this test does not link.

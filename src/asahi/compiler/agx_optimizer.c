@@ -1068,18 +1068,53 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
          continue;
 
       /* AGX2 can carry the zero-extension modifier on integer arithmetic and
-       * compare-select, but the grounded G17P forms are width-matched.
-       * Preserve the explicit 16-to-32 move so the AGX3 packer emits its
-       * witnessed COPY-low plus CLR-high sequence first. G18G keeps it too.
-       * j873 reached this through the Gen10 texture-descriptor crawl, whose
-       * level field is a half extract: folding the widening left an
-       * `and d32, h5, r8` the packer has no encoding for, and the whole
-       * fragment program -- the depth blitter's -- was dropped. */
+       * compare-select, while most grounded AGX3B forms are width-matched and
+       * G18G keeps explicit 16-to-32 moves. Unshifted, non-saturating 32-bit
+       * AGX3B iadd/isub encodes 16-bit zero-extended register sources natively
+       * (agx3_iadd_core.c, f24/f39 width fields), so fold those directly.
+       * j873 reached the remaining ops through the Gen10 texture-descriptor
+       * crawl, whose level field is a half extract: folding the widening left
+       * an `and d32, h5, r8` the packer has no encoding for, and the whole
+       * fragment program -- the depth blitter's -- was dropped.
+       *
+       * `other` is inspected before `src[1 - s]`'s own copyprop and before
+       * `agx_optimizer_inline_imm()` runs on this instruction. Already-inlined
+       * immediates are checked directly against the packer's 8-bit immediate
+       * forms; a normal/register partner that later receives an inlined
+       * immediate (`0..0xff`, or `-1..-255` on slot 1 when `src[0]` is not
+       * negated) or a second 16-to-32 widening still lands inside those same
+       * AGX3B `iadd`/`isub` packer paths, and any uniform is lowered back to a
+       * plain register by `agx_lower_uniform_sources()`. */
+      bool agx3b_zext_iadd = false;
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          I->op == AGX_OPCODE_IADD &&
+          I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
+          agx_channels(I->dest[0]) == 1 && !I->saturate && I->shift == 0 &&
+          def->src[0].size == AGX_SIZE_16 && src.size == AGX_SIZE_32 &&
+          !src.abs && !src.memory && agx_channels(src) == 1 &&
+          (def->src[0].type == AGX_INDEX_NORMAL ||
+           def->src[0].type == AGX_INDEX_REGISTER) &&
+          !def->src[0].memory && !def->src[0].abs && !def->src[0].neg &&
+          agx_channels(def->src[0]) == 1) {
+         const agx_index other = I->src[1 - s];
+         const bool other_reg =
+            (other.type == AGX_INDEX_NORMAL ||
+             other.type == AGX_INDEX_REGISTER) &&
+            (other.size == AGX_SIZE_16 ||
+             (other.size == AGX_SIZE_32 && !other.abs));
+         const bool other_imm =
+            other.type == AGX_INDEX_IMMEDIATE && other.value <= 0xff &&
+            !other.abs && !(other.neg && (s != 0 || src.neg));
+         agx3b_zext_iadd = !other.memory && agx_channels(other) == 1 &&
+                           !(src.neg && other.neg) && (other_reg || other_imm);
+      }
+
       if (ctx->key &&
           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
            agx_is_g18g(&ctx->key->dev)) &&
           def->src[0].size == AGX_SIZE_16 && src.size == AGX_SIZE_32 &&
-          (I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD ||
+          ((I->op == AGX_OPCODE_IADD && !agx3b_zext_iadd) ||
+           I->op == AGX_OPCODE_IMAD ||
            I->op == AGX_OPCODE_ICMP || I->op == AGX_OPCODE_ICMPSEL ||
            I->op == AGX_OPCODE_BFI || I->op == AGX_OPCODE_BFEIL ||
            (I->op == AGX_OPCODE_EXTR && s < 2) ||
