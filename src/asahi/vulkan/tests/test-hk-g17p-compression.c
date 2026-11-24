@@ -651,6 +651,11 @@ check_m5_color(void)
    c = i;
    c.format = VK_FORMAT_R8G8_UNORM;
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   /* B10G11R11_UFLOAT_PACK32 stays plain on M5 (compressed tiles lose NaN). */
+   c = i;
+   c.mipLevels = 1;
+   c.format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
 
    /* A placed alias of identical parameters gets the same layout on every M5
     * part. A single-plane alias of a multi-planar plane needs DISJOINT, which

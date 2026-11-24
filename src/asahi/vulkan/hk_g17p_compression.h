@@ -518,9 +518,9 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
                           VK_IMAGE_USAGE_TRANSFER_DST_BIT)) &&
           !(info->usage & ~allowed_usage) && info->extent.width >= 16 &&
           info->extent.height >= 16 &&
-          (hk_g17p_compression_color_format(info->format) ||
-           /* M5 stores it in its own class (agx_rt0_pbe_format). */
-           info->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+          /* Exclude B10G11R11_UFLOAT_PACK32 just like G17P: compressed tiles
+           * of its class corrupt NaN payloads on M5 hardware too. */
+          hk_g17p_compression_color_format(info->format);
 }
 
 /* Multisample colour formats with a qualified compressed metadata shape:
