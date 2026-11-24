@@ -1014,6 +1014,119 @@ int main(void)
       CHECK(r[7].wait_mask == (1u << (r[0].slot - 1)));
    }
 
+   /* Breaks that join (agx3_slot_core.h): a break does not drain. The lanes
+    * that stay wait for the body's load where they consume it; the lanes that
+    * broke never did, so the consumer after the loop waits for it too. */
+   {
+      struct agx3_slot_instr push = st(0), brk = st(0), back = st(0),
+                             pop = st(0);
+      push.cf_push = 1;
+      push.cf_loop = true;
+      brk.cf_break = 1;
+      back.cf = AGX3_SLOT_CF_DRAIN;
+      pop.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         push, ld(10), brk, alu(12, 10, 10), back, pop, alu(14, 10, 10),
+      };
+      bool drained[7] = {false};
+      CHECK(agx3_slot_assign(p, 7, 6, r));
+      CHECK(r[2].wait_mask == 0);
+      CHECK(r[3].wait_mask == (1u << (r[1].slot - 1)));
+      CHECK(r[6].wait_mask == (1u << (r[1].slot - 1)));
+      agx3_slot_retire_at_cf(p, 7, 0, r, drained);
+      for (unsigned i = 0; i < 7; ++i)
+         CHECK(!drained[i]);
+   }
+   /* Two breaks leave one register written by different slots: the body's
+    * second load waits out the first (write-after-write for the lanes that
+    * stay), and after the loop the register may hold either, since lanes
+    * left at both breaks. */
+   {
+      struct agx3_slot_instr push = st(0), brk = st(0), back = st(0),
+                             pop = st(0);
+      push.cf_push = 1;
+      push.cf_loop = true;
+      brk.cf_break = 1;
+      back.cf = AGX3_SLOT_CF_DRAIN;
+      pop.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         push, ld(10), brk, ld(10), brk, back, pop, alu(12, 10, 10),
+      };
+      CHECK(agx3_slot_assign(p, 8, 6, r));
+      CHECK(r[3].wait_mask == (1u << (r[1].slot - 1)));
+      CHECK(r[7].wait_mask ==
+            ((1u << (r[1].slot - 1)) | (1u << (r[3].slot - 1))));
+   }
+   /* A break out of an if inside the loop (nest 2) joins the loop's pop, not
+    * the if's. */
+   {
+      struct agx3_slot_instr push = st(0), open = st(0), brk = st(0),
+                             close = st(0), back = st(0), pop = st(0);
+      push.cf_push = 1;
+      push.cf_loop = true;
+      open.cf_push = 1;
+      open.cf_arm = true;
+      brk.cf_break = 2;
+      close.cf_pop = 1;
+      back.cf = AGX3_SLOT_CF_DRAIN;
+      pop.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         push, ld(10), open, brk, close, back, pop, alu(12, 10, 10),
+      };
+      CHECK(agx3_slot_assign(p, 8, 6, r));
+      CHECK(r[7].wait_mask == (1u << (r[1].slot - 1)));
+   }
+   /* Nested loops: the inner break takes the outer body's load and its own
+    * out of the inner loop, whose consumer waits for both; once it has, the
+    * outer break leaves nothing in flight. */
+   {
+      struct agx3_slot_instr push = st(0), brk = st(0), back = st(0),
+                             pop = st(0);
+      push.cf_push = 1;
+      push.cf_loop = true;
+      brk.cf_break = 1;
+      back.cf = AGX3_SLOT_CF_DRAIN;
+      pop.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         push, ld(20), push, ld(30), brk, back, pop, alu(22, 20, 30), brk,
+         back, pop, alu(24, 22, 20),
+      };
+      CHECK(agx3_slot_assign(p, 12, 6, r));
+      CHECK(r[7].wait_mask ==
+            ((1u << (r[1].slot - 1)) | (1u << (r[3].slot - 1))));
+      CHECK(r[11].wait_mask == 0);
+   }
+   /* A break that drains (its compare waits) joins nothing still in flight. */
+   {
+      struct agx3_slot_instr push = st(0), brk = st(0), back = st(0),
+                             pop = st(0);
+      push.cf_push = 1;
+      push.cf_loop = true;
+      brk.cf_break = 1;
+      brk.cf = back.cf = AGX3_SLOT_CF_DRAIN;
+      pop.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         push, ld(10), brk, back, pop, alu(12, 10, 10),
+      };
+      CHECK(agx3_slot_assign(p, 6, 6, r));
+      CHECK(r[5].wait_mask == 0);
+   }
+   /* A break must name an open loop level. */
+   {
+      struct agx3_slot_instr push = st(0), loop = st(0), brk = st(0),
+                             pop = st(0);
+      push.cf_push = 1;
+      loop.cf_push = 1;
+      loop.cf_loop = true;
+      brk.cf_break = 1;
+      pop.cf_pop = 1;
+      struct agx3_slot_instr p[] = { push, brk, pop };
+      CHECK(!agx3_slot_assign(p, 3, 6, r));
+      brk.cf_break = 2;
+      struct agx3_slot_instr q[] = { loop, brk, pop };
+      CHECK(!agx3_slot_assign(q, 3, 6, r));
+   }
+
    /* An arm closed together with another level, or an unbalanced pop, is
     * refused: the packer then drains everywhere. */
    {

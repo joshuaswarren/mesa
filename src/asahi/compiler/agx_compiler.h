@@ -609,6 +609,15 @@ typedef struct agx_block {
    uint8_t pass_flags;
 } agx_block;
 
+/* How the AGX3 packer lets a loop's breaks leave it (agx3_slot_core.h). */
+enum agx3_break_joins {
+   /* Join a break's state into its loop's pop where that gains something
+    * (agx3_break_keeps_state()), drain it otherwise. */
+   AGX3_BREAKS_JOIN_GAINFUL = 0,
+   AGX3_BREAKS_JOIN_ALL,
+   AGX3_BREAKS_DRAIN,
+};
+
 typedef struct {
    nir_shader *nir;
    mesa_shader_stage stage;
@@ -758,6 +767,13 @@ typedef struct {
     * (agx3_pack_program()). */
    bool agx3_arm_join_off;
    unsigned agx3_joined_arm_drains;
+   /* How a pack's breaks leave their loops (enum agx3_break_joins), and of
+    * the last pack how many breaks a join kept from draining something and
+    * how many joining breaks drain because joining gained nothing
+    * (agx3_pack_program()). */
+   uint8_t agx3_break_joins;
+   unsigned agx3_joined_breaks;
+   unsigned agx3_refused_breaks;
    unsigned agx3_g18g_read_staging_end;
    unsigned agx3_g18g_output_staging_span;
    bool agx3_staging_known;

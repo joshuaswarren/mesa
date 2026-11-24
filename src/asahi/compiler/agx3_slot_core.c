@@ -65,11 +65,12 @@ struct agx3_slot_state {
    uint16_t *reader_slots;
 };
 
-/* A structured if (or loop) level: the state at the if, and at the end of
- * its first arm once an else has started the second. */
+/* A structured if (or loop) level: the state at the if, at the end of its
+ * first arm once an else has started the second, and, for a loop, the join
+ * of the states its breaks left. */
 struct agx3_slot_level {
-   bool arm, has_else;
-   struct agx3_slot_state at_if, then_end;
+   bool arm, has_else, loop, has_break;
+   struct agx3_slot_state at_if, then_end, breaks;
 };
 
 /* Two paths' join class for one slot, when both leave it pending with
@@ -79,6 +80,9 @@ struct agx3_slot_level {
 struct agx3_slot_levels {
    struct agx3_slot_level *levels;
    unsigned max_depth;
+   /* Where a break keeps the state it continues with while it joins that
+    * state into its loop's. */
+   struct agx3_slot_state scratch;
 };
 
 static bool
@@ -87,7 +91,7 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
                       unsigned entry_count,
                       const struct agx3_slot_live_range *live,
                       unsigned live_count, struct agx3_slot_result *out,
-                      const struct agx3_slot_levels *lv)
+                      struct agx3_slot_levels *lv)
 {
    if (instrs == NULL || out == NULL || nslots < 1 || nslots > 8 ||
        (entry_count && entry == NULL) || entry_count > AGX3_SLOT_NUM_TOKENS ||
@@ -441,6 +445,19 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
       memcpy((S)->join_class, slot_join_class, sizeof(slot_join_class));     \
       memcpy((S)->join_count, slot_join_count, sizeof(slot_join_count));     \
    } while (0)
+#define AGX3_SLOT_RESTORE(S)                                                  \
+   do {                                                                       \
+      memcpy(reg_slots, (S)->reg_slots, token_count * sizeof(reg_slots[0])); \
+      memcpy(reader_slots, (S)->reader_slots,                                \
+             token_count * sizeof(reader_slots[0]));                         \
+      pending = (S)->pending;                                                \
+      entry_pending = (S)->entry_pending;                                    \
+      active_reader_slots = (S)->active_reader_slots;                        \
+      memcpy(slot_waited, (S)->waited, sizeof(slot_waited));                 \
+      memcpy(slot_reissuable, (S)->reissuable, sizeof(slot_reissuable));     \
+      memcpy(slot_join_class, (S)->join_class, sizeof(slot_join_class));     \
+      memcpy(slot_join_count, (S)->join_count, sizeof(slot_join_count));     \
+   } while (0)
 #define AGX3_SLOT_JOIN(S)                                                     \
    do {                                                                       \
       for (unsigned r = 0; r < token_count; ++r) {                           \
@@ -471,6 +488,24 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
       entry_pending |= (S)->entry_pending;                                   \
       active_reader_slots |= (S)->active_reader_slots;                       \
    } while (0)
+      /* A break's lanes resume at its loop's pop with what they left in
+       * flight; the lanes that stay continue with the same state. */
+      if (I->cf_break) {
+         if (I->cf_break > depth)
+            return false;
+         struct agx3_slot_level *L = &lv->levels[depth - I->cf_break];
+         if (!L->loop)
+            return false;
+         if (!L->has_break) {
+            AGX3_SLOT_SAVE(&L->breaks);
+            L->has_break = true;
+         } else {
+            AGX3_SLOT_SAVE(&lv->scratch);
+            AGX3_SLOT_JOIN(&L->breaks);
+            AGX3_SLOT_SAVE(&L->breaks);
+            AGX3_SLOT_RESTORE(&lv->scratch);
+         }
+      }
       if (I->cf_else) {
          if (!depth)
             return false;
@@ -485,12 +520,14 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
          if (!depth)
             return false;
          const struct agx3_slot_level *L = &lv->levels[--depth];
-         if (L->arm) {
-            /* An arm keeps state only when its pop closes it alone. */
-            if (I->cf_pop != 1)
-               return false;
+         /* An arm, or a loop's breaks, keep state only when its pop closes
+          * it alone. */
+         if ((L->arm || L->has_break) && I->cf_pop != 1)
+            return false;
+         if (L->arm)
             AGX3_SLOT_JOIN(L->has_else ? &L->then_end : &L->at_if);
-         }
+         if (L->has_break)
+            AGX3_SLOT_JOIN(&L->breaks);
       }
       for (unsigned p = 0; p < I->cf_push; ++p) {
          if (depth >= lv->max_depth)
@@ -498,10 +535,13 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
          struct agx3_slot_level *L = &lv->levels[depth++];
          L->arm = I->cf_arm;
          L->has_else = false;
+         L->loop = I->cf_loop;
+         L->has_break = false;
          if (L->arm)
             AGX3_SLOT_SAVE(&L->at_if);
       }
 #undef AGX3_SLOT_JOIN
+#undef AGX3_SLOT_RESTORE
 #undef AGX3_SLOT_SAVE
    }
 
@@ -539,19 +579,26 @@ agx3_slot_assign_initial(const struct agx3_slot_instr *instrs, unsigned n,
    uint8_t *arena = NULL;
    if (max_depth) {
       lv.levels = calloc(max_depth, sizeof(*lv.levels));
-      /* Two states per level, each a writer and a reader word per token. */
-      arena = calloc(max_depth, 4 * stride * sizeof(uint16_t));
+      /* Three states per level and the scratch state, each a writer and a
+       * reader word per token. */
+      arena = calloc(3 * max_depth + 1, 2 * stride * sizeof(uint16_t));
       if (!lv.levels || !arena) {
          free(lv.levels);
          free(arena);
          return false;
       }
+      uint16_t *base = (uint16_t *)arena;
+      lv.scratch.reg_slots = base;
+      lv.scratch.reader_slots = base + stride;
+      base += 2 * stride;
       for (unsigned d = 0; d < max_depth; ++d) {
-         uint16_t *base = (uint16_t *)arena + d * 4 * stride;
-         lv.levels[d].at_if.reg_slots = base;
-         lv.levels[d].at_if.reader_slots = base + stride;
-         lv.levels[d].then_end.reg_slots = base + 2 * stride;
-         lv.levels[d].then_end.reader_slots = base + 3 * stride;
+         struct agx3_slot_state *level[] = {
+            &lv.levels[d].at_if, &lv.levels[d].then_end, &lv.levels[d].breaks,
+         };
+         for (unsigned i = 0; i < ARRAY_SIZE(level); ++i, base += 2 * stride) {
+            level[i]->reg_slots = base;
+            level[i]->reader_slots = base + stride;
+         }
       }
    }
 
@@ -596,7 +643,10 @@ agx3_slot_retire_at_cf(const struct agx3_slot_instr *instrs, unsigned n,
    /* Assignment already starts from the state each drain leaves, so no
     * wait names a generation a drain retired; only report the drains,
     * following the same arm joins. */
-   struct level { bool arm, has_else; uint16_t at_if, then_end; };
+   struct level {
+      bool arm, has_else, loop;
+      uint16_t at_if, then_end, breaks;
+   };
    struct level *levels = calloc(n ? n : 1, sizeof(*levels));
    uint16_t live = entry_wait;
    unsigned depth = 0;
@@ -612,6 +662,8 @@ agx3_slot_retire_at_cf(const struct agx3_slot_instr *instrs, unsigned n,
       }
       if (!levels)
          continue;
+      if (instrs[i].cf_break && instrs[i].cf_break <= depth)
+         levels[depth - instrs[i].cf_break].breaks |= live;
       if (instrs[i].cf_else && depth && levels[depth - 1].arm) {
          levels[depth - 1].then_end = live;
          levels[depth - 1].has_else = true;
@@ -621,10 +673,12 @@ agx3_slot_retire_at_cf(const struct agx3_slot_instr *instrs, unsigned n,
          const struct level *L = &levels[--depth];
          if (L->arm)
             live |= L->has_else ? L->then_end : L->at_if;
+         if (L->loop)
+            live |= L->breaks;
       }
       for (unsigned p = 0; p < instrs[i].cf_push && depth < n; ++p) {
          levels[depth++] = (struct level){
-            .arm = instrs[i].cf_arm, .at_if = live,
+            .arm = instrs[i].cf_arm, .loop = instrs[i].cf_loop, .at_if = live,
          };
       }
    }
