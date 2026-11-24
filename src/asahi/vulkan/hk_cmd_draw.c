@@ -13183,11 +13183,26 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    *g17p_native_bind_tail_emitted_out = false;
 
+   /* Only push constants changed since the root was uploaded, and the
+    * fragment program, which keeps following the uploaded root
+    * (hk_agx3_fragment_root()), cannot read them: the vertex program can be
+    * launched over a copy of the push constants it reads, keeping the
+    * uploaded root (hk_agx3_try_push_only_vs_program()). Once it has been,
+    * a draw that changes nothing keeps that launch as a clean root would
+    * keep its own. */
+   const bool push_launch_fits =
+      hk_root_push_only_dirty(desc) && !agx_is_indirect(draw.b) &&
+      !hw_vs->b.info.has_preamble &&
+      !(fs->info.agx3_root_reads &
+        (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_PUSH)) &&
+      !hk_root_upload_needs_growth(desc->uploaded_root_size,
+                                   hk_gfx_root_descriptor_size(cmd));
+
    const bool republishes_base_param =
       sw_vs->b.info.uses_base_param || linked_vs->b.uses_base_param;
    const bool uses_draw_id = sw_vs->b.info.uses_draw_id;
-   if (!gfx->dirty && !hk_root_dirty(desc) && !republishes_base_param &&
-       !uses_draw_id)
+   if (!gfx->dirty && hk_root_launch_current(desc, push_launch_fits) &&
+       !republishes_base_param && !uses_draw_id)
       return true;
 
    if (unlikely(dev->frame_anatomy))
@@ -13201,7 +13216,17 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    hk_flush_draw_params_and_id(cmd, sw_vs, linked_vs, draw_id, draw);
 
-   if (hk_root_dirty(desc)) {
+   /* hk_flush_vertex_attribs_root() may have changed more of the root since
+    * push_launch_fits was decided. The root stays dirty after a push-only
+    * launch, so the next draw that needs all of it, through any path,
+    * uploads it. */
+   uint64_t pipeline_program = 0;
+   if (push_launch_fits && hk_root_push_only_dirty(desc))
+      pipeline_program =
+         hk_agx3_try_push_only_vs_program(cmd, hw_vs, linked_vs);
+   const bool push_only = pipeline_program != 0;
+
+   if (!push_only && hk_root_dirty(desc)) {
       gfx->root =
          hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
    }
@@ -13210,8 +13235,8 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    uint8_t *out = cs->current;
 
    hk_reserve_scratch(cmd, cs, hw_vs);
-   const uint64_t pipeline_program =
-      hk_upload_usc_words(cmd, hw_vs, linked_vs);
+   if (!push_only)
+      pipeline_program = hk_upload_usc_words(cmd, hw_vs, linked_vs);
    bool tail_emitted = false;
    if (!hk_agx3_publish_vertex_state(cmd, cs, &out, hw_vs, pipeline_program,
                                      draw, true, false, &tail_emitted))
@@ -13224,7 +13249,10 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return true;
 
    gfx->dirty = 0;
-   hk_root_mark_clean(desc);
+   if (push_only)
+      hk_root_mark_push_launched(desc);
+   else
+      hk_root_mark_clean(desc);
    return true;
 }
 
