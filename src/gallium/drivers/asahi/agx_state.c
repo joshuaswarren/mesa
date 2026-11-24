@@ -3306,6 +3306,23 @@ agx_compile_variant(struct agx_device *dev,
             NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs, key->layer_as_varying,
                      false, -1);
          } else {
+            /* The M5 profile renders one layer per draw: a layered
+             * framebuffer is drawn a layer at a time, a vertex shader's
+             * gl_Layer into it takes the CPU vertex stages
+             * (agx_swtnl_applies), and a fragment shader reads gl_Layer
+             * from the draw uniforms (agx_nir_lower_g17g_fs_layer). So a
+             * hardware vertex shader's layer export reaches nothing, while
+             * the layer/viewport UVS group it adds is outside every shape
+             * the M5 draw profile admits. st/mesa's PBO vertex shader
+             * (st_pbo_create_vs) writes gl_Layer for every upload and
+             * download, which dropped all of those draws.
+             */
+            if (agx_chip_g17_m5(dev->chip) &&
+                (nir->info.outputs_written & VARYING_BIT_LAYER)) {
+               NIR_PASS(_, nir, nir_remove_outputs, MESA_SHADER_FRAGMENT,
+                        VARYING_BIT_LAYER, VARYING_BIT_LAYER);
+               nir->info.outputs_written &= ~VARYING_BIT_LAYER;
+            }
             NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs,
                      agx_chip_native_agx3(dev->chip), false, -1);
          }
