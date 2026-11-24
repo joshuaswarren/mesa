@@ -2860,10 +2860,10 @@ hk_CopyMemoryToAccelerationStructureKHR(
    if (result != VK_SUCCESS)
       return result;
    struct agx_bo *blob = hk_host_as_bo(&run, bytes, true, "Host AS deserialize input");
-   if (!blob) {
+   void *blob_map = blob ? agx_bo_map(blob) : NULL;
+   if (!blob_map) {
       result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    } else {
-      void *blob_map = agx_bo_map(blob);
       memcpy(blob_map, pInfo->src.hostAddress, bytes);
       if (util_has_cache_ops())
          util_flush_range(blob_map, bytes);
@@ -2897,10 +2897,10 @@ hk_CopyAccelerationStructureToMemoryKHR(
       return result;
    const uint64_t bound = src->size * 2 + 4096;
    struct agx_bo *blob = hk_host_as_bo(&run, bound, true, "Host AS serialize output");
-   if (!blob) {
+   uint8_t *blob_map = blob ? agx_bo_map(blob) : NULL;
+   if (!blob_map) {
       result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    } else {
-      uint8_t *blob_map = agx_bo_map(blob);
       memset(blob_map, 0, bound);
       if (util_has_cache_ops())
          util_flush_inval_range(blob_map, bound);

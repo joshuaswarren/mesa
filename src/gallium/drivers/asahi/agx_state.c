@@ -5871,6 +5871,16 @@ agx_bind_shader_state(struct pipe_context *pctx, void *cso,
          ctx->stage[stage].dirty |= AGX_STAGE_DIRTY_SAMPLER;
    }
 
+   /* A shader's ready fence is reset once, when its asynchronous compile is
+    * queued at creation, and is only signalled after that. A shader that is
+    * ready when it is bound therefore stays ready, and only the stages bound
+    * while still compiling need a wait at the next draw. agx_launch_grid()
+    * waits for its compute shader itself.
+    */
+   if (stage != MESA_SHADER_COMPUTE && next &&
+       !util_queue_fence_is_signalled(&next->ready))
+      ctx->stages_compiling |= BITFIELD_BIT(stage);
+
    ctx->stage[stage].shader = cso;
 }
 
@@ -6512,6 +6522,8 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
       struct agx_resource *rsrc = tex->rsrc;
       agx_batch_reads(batch, tex->rsrc);
+      if (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE)
+         agx_batch_note_vs_read(batch, rsrc);
 
       /* Admit only resources covered by the native-backed stored path. */
       if (dev->chip == AGX_CHIP_G18G && rsrc->base.b.nr_samples > 1 &&
@@ -6591,6 +6603,13 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
       struct pipe_image_view *view = &ctx->stage[stage].images[i];
       agx_batch_track_image(batch, view);
+      if (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE) {
+         if ((view->access & PIPE_IMAGE_ACCESS_WRITE) ||
+             (cs->so->info.image_pbe_mask & BITFIELD64_BIT(i)))
+            batch->vs_needs_render_barrier = true;
+         else
+            agx_batch_note_vs_read(batch, agx_resource(view->resource));
+      }
       if (agx_chip_native_or_g18g(dev->chip) &&
           view->resource->target == PIPE_BUFFER)
          batch->stage_uniforms[stage].image_buffer_size[i] =
@@ -14329,6 +14348,7 @@ agx_index_buffer_rsrc_ptr(struct agx_batch *batch,
 
    struct agx_resource *rsrc = agx_resource(info->index.resource);
    agx_batch_reads(batch, rsrc);
+   agx_batch_note_vs_read(batch, rsrc);
 
    *extent =
       ALIGN_POT(rsrc->layout.size_B - rsrc->layout.level_offsets_B[0], 4);
@@ -14683,6 +14703,7 @@ agx_indirect_buffer_ptr(struct agx_batch *batch,
 
    struct agx_resource *rsrc = agx_resource(indirect->buffer);
    agx_batch_reads(batch, rsrc);
+   agx_batch_note_vs_read(batch, rsrc);
    return agx_map_gpu(rsrc) + indirect->offset;
 }
 
@@ -16155,6 +16176,28 @@ agx_multidraw_can_skip(struct agx_context *ctx,
    return !agx_needs_passthrough_gs(ctx, info, NULL, &xfb_passthrough, false);
 }
 
+static inline void
+agx_batch_note_draw_prims(struct agx_batch *batch,
+                          const struct pipe_draw_info *info,
+                          const struct pipe_draw_start_count_bias *draw)
+{
+   if (batch->prims_unknown)
+      return;
+
+   if (info->primitive_restart || info->instance_count > 4) {
+      batch->prims_unknown = true;
+      return;
+   }
+
+   uint64_t p = (uint64_t)u_decomposed_prims_for_vertices(info->mode,
+                                                          draw->count) *
+                info->instance_count;
+   if (p > 4 || batch->known_prims + p > 4)
+      batch->known_prims = 5;
+   else
+      batch->known_prims += p;
+}
+
 static void
 agx_multidraw_emit_body(struct agx_context *ctx, struct agx_batch *batch,
                         const struct pipe_draw_info *info,
@@ -16162,6 +16205,8 @@ agx_multidraw_emit_body(struct agx_context *ctx, struct agx_batch *batch,
                         uint64_t ib, size_t ib_extent)
 {
    struct agx_device *dev = agx_device(ctx->base.screen);
+
+   agx_batch_note_draw_prims(batch, info, d);
 
    if (ctx->time_elapsed)
       agx_batch_add_timestamp_query(batch, ctx->time_elapsed);
@@ -16305,8 +16350,16 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    if (unlikely(!agx_render_condition_check(ctx)))
       return;
 
-   for (unsigned s = 0; s < MESA_SHADER_COMPUTE; ++s)
-      agx_shader_wait_ready(ctx->stage[s].shader);
+   /* Finish compiling any graphics shader that was bound before its
+    * asynchronous compile completed (agx_bind_shader_state()). Every other
+    * bound shader is already ready, so most draws skip this.
+    */
+   const uint32_t compiling = ctx->stages_compiling;
+   if (unlikely(compiling)) {
+      u_foreach_bit(s, compiling)
+         agx_shader_wait_ready(ctx->stage[s].shader);
+      ctx->stages_compiling = 0;
+   }
 
    if (num_draws > 1) {
       agx_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
@@ -16574,6 +16627,22 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    struct agx_batch *batch = agx_get_batch(ctx);
    batch->g17g_prims += prims;
    batch->g17g_small_budget |= g17g_budget && g17g_small;
+
+   if (indirect || ctx->cond_query ||
+       ctx->stage[MESA_SHADER_GEOMETRY].shader ||
+       ctx->stage[MESA_SHADER_TESS_EVAL].shader || ctx->in_tess ||
+       ctx->streamout.num_targets ||
+       (ctx->stage[MESA_SHADER_VERTEX].shader &&
+        ctx->stage[MESA_SHADER_VERTEX].shader->info.writes_memory))
+      batch->vs_needs_render_barrier = true;
+
+   if (indirect || info->mode == MESA_PRIM_PATCHES ||
+       ctx->stage[MESA_SHADER_GEOMETRY].shader ||
+       ctx->stage[MESA_SHADER_TESS_EVAL].shader || ctx->in_tess ||
+       ctx->streamout.num_targets)
+      batch->prims_unknown = true;
+   else
+      agx_batch_note_draw_prims(batch, info, draws);
    uint64_t ib = 0;
    size_t ib_extent = 0;
 
@@ -16679,6 +16748,8 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       return;
 
    if (ctx->gs) {
+      batch->vs_needs_render_barrier = true;
+      batch->prims_unknown = true;
       batch->uniforms.geometry_params =
          agx_batch_geometry_params(batch, ib, ib_extent, info, draws, indirect);
 

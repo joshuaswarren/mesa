@@ -385,6 +385,102 @@ hk_sync_dependency_kinds(const VkDependencyInfo *info, bool image_class,
                                    src, dst);
 }
 
+/* A host access, or MEMORY_READ or MEMORY_WRITE with the host stage in the
+ * destination scope: those stand for every read or write valid in the scope,
+ * the host's too. ALL_COMMANDS does not include the host stage. A host write
+ * needs the earlier device writes written back first as much as a host read
+ * does: a line written back after it would overwrite it. */
+static bool
+barrier_has_host_access(VkPipelineStageFlags2 dst_stages,
+                        VkAccessFlags2 dst_access)
+{
+   if (dst_access & (VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_HOST_WRITE_BIT))
+      return true;
+
+   return (dst_stages & VK_PIPELINE_STAGE_2_HOST_BIT) &&
+          (dst_access &
+           (VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT));
+}
+
+bool
+hk_sync_dependency_has_host_access(const VkDependencyInfo *info)
+{
+   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      if (barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
+         return true;
+   }
+
+   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
+      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
+      if (barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
+         return true;
+   }
+
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
+      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      if (barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
+         return true;
+   }
+
+   return false;
+}
+
+/* Vulkan 1.4, 7.1 "Execution and Memory Dependencies": a destination access
+ * scope with a host access adds a memory domain operation that makes the
+ * memory available in the device domain available to the host domain. That
+ * is any write an earlier availability operation in an execution dependency
+ * chain reaching this one made available, not only the writes of this
+ * barrier's source access scope, so a barrier with read-only or empty source
+ * access still flushes. A domain operation happens after the first
+ * synchronization scope, and only one with device work in it can follow
+ * device writes: an empty or host-only first scope needs no flush. */
+uint8_t
+hk_sync_host_flush_kinds(const VkDependencyInfo *info)
+{
+   uint8_t kinds = 0;
+
+   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      if (barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
+         kinds |= hk_sync_kinds_src(b->srcStageMask);
+   }
+
+   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
+      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
+      if (barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
+         kinds |= hk_sync_kinds_src(b->srcStageMask);
+   }
+
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
+      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      if (barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
+         kinds |= hk_sync_kinds_src(b->srcStageMask);
+   }
+
+   return kinds;
+}
+
+/* The host observes memory only through a fence, semaphore or queue wait at
+ * the end of a submission, or through an event status written before then
+ * (hk_sync_take_host_flush()), so the flush can wait until the submission's
+ * end. One flush there serves every such dependency of the submission, and
+ * no stream is created between the work around them. */
+void
+hk_sync_defer_host_flush(struct hk_cmd_buffer *cmd,
+                         const VkDependencyInfo *info)
+{
+   cmd->sync.host_flush_kinds |= hk_sync_host_flush_kinds(info);
+}
+
+uint8_t
+hk_sync_take_host_flush(struct hk_cmd_buffer *cmd)
+{
+   const uint8_t kinds = cmd->sync.host_flush_kinds;
+   cmd->sync.host_flush_kinds = 0;
+   return kinds;
+}
+
 void
 brl_sync_transition_kinds(const VkDependencyInfo *info,
                           const VkImageMemoryBarrier2 *barrier,
@@ -1547,7 +1643,14 @@ stamp_covered(struct hk_cmd_buffer *cmd, struct hk_cs *tail,
    return true;
 }
 
-/* Record the pending copies in cs, the open general compute stream, which
+/* Whether cs holds nothing but timestamps and timestamp copies. */
+static bool
+stamp_only(const struct hk_cs *cs)
+{
+   return !(cs->sync.kind & HK_SYNC_ALL);
+}
+
+/* Record the pending copies in cs, a timestamp-only compute stream that
  * follows the streams they read. The launch keeps it a timestamp stream. */
 static void
 stamp_copies_record(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
@@ -1587,6 +1690,14 @@ hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd)
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
       after[sq] = (struct hk_sync_dep){.cut = st->stamp_copy_after[sq]};
 
+   /* The copies wait for the commands whose stamps they read. Recorded in
+    * an open stream that holds application work, they would make that work
+    * wait for those commands too, and every later dependency on the work
+    * wait for the copies. They get a command of their own. */
+   struct hk_cs *open = cmd->current_cs.cs;
+   if (open && !st->pin_cs && !stamp_only(open))
+      hk_cmd_buffer_end_compute(cmd);
+
    struct hk_cs *cs = timestamp_only_stream(cmd, after);
    if (!cs)
       return;
@@ -1595,15 +1706,6 @@ hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd)
    /* Ended, a later first scope naming HK_SYNC_STAMP orders after it
     * whatever stream that work lands in. */
    hk_cmd_buffer_end_compute(cmd);
-}
-
-void
-hk_sync_dispatch_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
-{
-   const unsigned count =
-      util_dynarray_num_elements(&cs->stamp_copies, struct hk_stamp_copy);
-   hk_record_stamp_copies(cmd, cs, cs->stamp_copies.data, count);
-   util_dynarray_clear(&cs->stamp_copies);
 }
 
 static bool
@@ -1699,20 +1801,21 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       stamp_wait(cmd, gfx, dep);
 
       if (gfx->timestamp.end.handle) {
-         /* The copy runs after the render, with the render's other copies
-          * in one launch when its post-graphics stream ends
-          * (hk_sync_dispatch_stamp_copies()). */
-         struct hk_cs *post = hk_cmd_buffer_get_cs_general(
-            cmd, &cmd->current_cs.post_gfx, true);
-         if (!post)
+         /* A copy of the render's end stamp, pending with the command
+          * buffer's other copies until they launch together in a
+          * timestamp-only command after the render
+          * (hk_sync_flush_stamp_copies()). Application work recorded after
+          * the render does not wait for it. A full batch launches first. */
+         if (st->stamp_copy_count == HK_SYNC_STAMP_COPIES)
+            hk_sync_flush_stamp_copies(cmd);
+         if (st->stamp_copy_count == HK_SYNC_STAMP_COPIES)
             return;
-         if (!post->stamp_copies.data)
-            post->stamp_copies = UTIL_DYNARRAY_INIT;
-         const struct hk_stamp_copy copy = {
+         st->stamp_copies[st->stamp_copy_count++] = (struct hk_stamp_copy){
             .dst = req,
             .src = gfx->timestamp.end,
          };
-         util_dynarray_append(&post->stamp_copies, copy);
+         st->stamp_copy_after[HK_SYNC_VDM] =
+            hk_sync_later(st->stamp_copy_after[HK_SYNC_VDM], gfx);
       } else {
          gfx->timestamp.end = req;
       }
@@ -1786,7 +1889,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       return;
    cs->timestamp.end = req;
    /* The pending copies ride on it when it follows the stamps they read. */
-   if (st->stamp_copy_count && stamp_copies_follow(cmd, cs))
+   if (st->stamp_copy_count && stamp_only(cs) && stamp_copies_follow(cmd, cs))
       stamp_copies_record(cmd, cs);
    stamp_carrier_launch(cmd);
    hk_cmd_buffer_end_compute(cmd);
@@ -2022,6 +2125,53 @@ hk_sync_queue_kinds(const struct hk_sync_queue *q, unsigned sq)
          kinds |= BITFIELD_BIT(k);
    }
    return kinds;
+}
+
+bool
+hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds, bool chain,
+                          const uint64_t base[HK_SYNC_NUM_SQ],
+                          const uint32_t count[HK_SYNC_NUM_SQ],
+                          uint16_t barrier[HK_SYNC_NUM_SQ],
+                          uint64_t prior[HK_SYNC_NUM_SQ])
+{
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      barrier[sq] = DRM_ASAHI_BARRIER_NONE;
+      prior[sq] = 0;
+
+      if (q->exact_prior) {
+         /* What resolve_one() gives a stream of every kind whose first
+          * scope is `kinds`, at the end of the submission: the latest
+          * command of those kinds, and every requirement still carried, as
+          * a stream recorded at the dependency itself would have picked up.
+          * A command of this submission within the 16-bit field is named by
+          * its position, any other by its ordinal. Waits are prefixes. */
+         uint64_t v = 0;
+         u_foreach_bit(k, kinds)
+            v = MAX2(v, q->last_absolute[k][sq]);
+         for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k)
+            v = MAX2(v, q->tail[k][sq]);
+         if (chain && count[sq])
+            v = MAX2(v, base[sq] + count[sq]);
+         if (v > base[sq] && v - base[sq] < DRM_ASAHI_BARRIER_NONE)
+            barrier[sq] = (uint16_t)(v - base[sq]);
+         else
+            prior[sq] = v;
+      } else if (count[sq]) {
+         /* Legacy prefixes carry no history to resolve against here: follow
+          * the submission's last command on the subqueue, */
+         barrier[sq] = MIN2(count[sq], DRM_ASAHI_BARRIER_NONE - 1);
+      } else if (q->ever[sq]) {
+         /* or with none, every command of earlier ioctls. */
+         barrier[sq] = 0;
+      }
+   }
+
+   if (q->exact_prior) {
+      if (q->submitted[HK_SYNC_CDM] == UINT64_MAX)
+         return false;
+      q->submitted[HK_SYNC_CDM]++;
+   }
+   return true;
 }
 
 uint8_t
