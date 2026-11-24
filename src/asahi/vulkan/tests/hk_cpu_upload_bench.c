@@ -36,6 +36,11 @@ static void
 reset(struct fixture *f)
 {
    memset(&f->cmd.state, 0, sizeof(f->cmd.state));
+   if (f->cmd.used_group_count_cache) {
+      for (unsigned i = 0; i < ARRAY_SIZE(f->cmd.group_count_cache); ++i)
+         f->cmd.group_count_cache[i].valid = 0;
+      f->cmd.used_group_count_cache = false;
+   }
    f->cmd.uploader.main.offset = f->cmd.uploader.root.offset = 0;
    f->cmd.state.gfx.shaders[MESA_SHADER_VERTEX] = f->vs_api;
    f->cmd.state.gfx.shaders[MESA_SHADER_FRAGMENT] = f->fs_api;
@@ -327,8 +332,10 @@ reuse_correctness(struct fixture *f)
 
    const VkDispatchIndirectCommand gc_a = {32, 4, 1};
    const VkDispatchIndirectCommand gc_b = {64, 1, 1};
+   CHECK(!cmd->used_group_count_cache);
    const uint64_t gc_addr_a = hk_cmd_upload_group_count(cmd, gc_a);
    CHECK(gc_addr_a != 0);
+   CHECK(cmd->used_group_count_cache);
    const uint32_t main_off_after_a = cmd->uploader.main.offset;
    CHECK(hk_cmd_upload_group_count(cmd, gc_a) == gc_addr_a);
    CHECK(cmd->uploader.main.offset == main_off_after_a);
@@ -336,8 +343,16 @@ reuse_correctness(struct fixture *f)
    CHECK(gc_addr_b != 0 && gc_addr_b != gc_addr_a);
    CHECK(hk_cmd_upload_group_count(cmd, gc_a) == gc_addr_a);
    reset(f);
-   for (unsigned i = 0; i < ARRAY_SIZE(cmd->state.group_count_cache); ++i)
-      CHECK(!cmd->state.group_count_cache[i].valid);
+   CHECK(!cmd->used_group_count_cache);
+   for (unsigned i = 0; i < ARRAY_SIZE(cmd->group_count_cache); ++i)
+      CHECK(!cmd->group_count_cache[i].valid);
+   /* After reset, uploading gc_a again must not return a stale address from
+    * the previous recording even when the bump allocator rewinds to 0. */
+   const uint64_t gc_addr_a2 = hk_cmd_upload_group_count(cmd, gc_a);
+   CHECK(gc_addr_a2 != 0 && cmd->used_group_count_cache);
+   CHECK(cmd->uploader.main.offset > 0);
+   reset(f);
+   CHECK(!cmd->used_group_count_cache);
 }
 
 static uint64_t

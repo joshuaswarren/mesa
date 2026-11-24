@@ -2566,6 +2566,117 @@ main(void)
       T("merge allowed when later render does not wait on earlier compute",
         !hk_sync_merge_delays(m, deform, as_build));
    }
+   /* hk_sync_resolve_submit_ex() tail_raised_out and barrier-free empty CBs. */
+   {
+      struct hk_queue *eq = new_queue(true);
+      struct hk_cmd_buffer *empty = new_cmd();
+      T("barrier-free empty CB has epoch 0", empty->sync.epoch == 0);
+      bool tail_raised = true;
+      T("empty CB on idle queue",
+        hk_sync_resolve_submit_ex(eq, &empty, 1, false, false, 0, NULL,
+                                  &tail_raised) &&
+           !tail_raised);
+
+      /* Barrier-only CB on idle queue cannot raise tail from 0. */
+      struct hk_cmd_buffer *bar = new_cmd();
+      hk_sync_barrier(bar, HK_SYNC_GFX, HK_SYNC_COMPUTE);
+      T("barrier-only CB sets epoch", bar->sync.epoch != 0);
+      tail_raised = true;
+      T("barrier-only CB on idle queue does not raise tail",
+        hk_sync_resolve_submit_ex(eq, &bar, 1, false, false, 0, NULL,
+                                  &tail_raised) &&
+           !tail_raised);
+
+      /* Non-empty render without trailing barrier does not raise tail. */
+      struct hk_cmd_buffer *src = new_cmd();
+      add(src, false);
+      tail_raised = true;
+      T("render without barrier does not raise tail",
+        hk_sync_resolve_submit_ex(eq, &src, 1, false, false, 0, NULL,
+                                  &tail_raised) &&
+           !tail_raised);
+
+      /* Barrier-free empty CB after render does not change tail or ordinals. */
+      uint64_t tail_before[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
+      memcpy(tail_before, eq->sync.tail, sizeof(tail_before));
+      tail_raised = true;
+      T("barrier-free empty CB after render leaves tail unchanged",
+        hk_sync_resolve_submit_ex(eq, &empty, 1, false, false, 0, NULL,
+                                  &tail_raised) &&
+           !tail_raised &&
+           memcmp(tail_before, eq->sync.tail, sizeof(tail_before)) == 0 &&
+           eq->sync.submitted[HK_SYNC_VDM] == 1 &&
+           eq->sync.submitted[HK_SYNC_CDM] == 0);
+
+      /* Barrier-only CB after render raises tail once, not on repeat. */
+      tail_raised = false;
+      T("barrier-only CB after render raises tail",
+        hk_sync_resolve_submit_ex(eq, &bar, 1, false, false, 0, NULL,
+                                  &tail_raised) &&
+           tail_raised);
+      tail_raised = true;
+      T("repeated barrier-only CB with no new work does not raise tail again",
+        hk_sync_resolve_submit_ex(eq, &bar, 1, false, false, 0, NULL,
+                                  &tail_raised) &&
+           !tail_raised);
+
+      /* Non-empty CB with a trailing barrier raises tail. */
+      struct hk_cmd_buffer *src2 = new_cmd();
+      add(src2, true);
+      hk_sync_barrier(src2, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+      tail_raised = false;
+      T("compute with trailing barrier raises tail",
+        hk_sync_resolve_submit_ex(eq, &src2, 1, false, false, 0, NULL,
+                                  &tail_raised) &&
+           tail_raised);
+
+      /* Legacy queue (exact_prior == false) never sets tail_raised. */
+      struct hk_queue *lq = new_queue(false);
+      tail_raised = true;
+      T("legacy queue never raises exact tail",
+        hk_sync_resolve_submit_ex(lq, &src2, 1, false, false, 0, NULL,
+                                  &tail_raised) &&
+           !tail_raised);
+   }
+   /* ta_carry == carry dedup keeps identical TA fields on compute and split
+    * fields on fragment-only graphics barriers. */
+   {
+      struct hk_queue *tq = new_queue(true);
+      struct hk_cmd_buffer *s0 = new_cmd();
+      add(s0, false);
+      hk_sync_barrier(s0, HK_SYNC_GFX, HK_SYNC_COMPUTE | HK_SYNC_GFX_FRAG);
+      T("ta dedup setup submit", submit(tq, s0));
+
+      struct hk_cmd_buffer *s1 = new_cmd();
+      struct hk_cs *cs_cdm = add(s1, true);
+      struct hk_cs *cs_vdm = add(s1, false);
+      T("ta dedup consumer submit", submit(tq, s1));
+      T("compute dedup matches main and TA fields",
+        cs_cdm->sync.prior[HK_SYNC_VDM] == 1 &&
+           cs_cdm->sync.prior_ta[HK_SYNC_VDM] == 1 &&
+           cs_cdm->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+           cs_cdm->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
+      T("render fragment-only barrier still splits TA",
+        cs_vdm->sync.prior[HK_SYNC_VDM] == 1 &&
+           cs_vdm->sync.prior_ta[HK_SYNC_VDM] == 0 && cs_vdm->sync.ta_split);
+   }
+   /* hk_queue_note_signalled() advances monotonically without regressing. */
+   {
+      struct hk_queue *mq = new_queue(true);
+      mq->drm.signalled_value = 0;
+      hk_queue_note_signalled(mq, 5);
+      T("signalled_value advances from 0 to 5",
+        p_atomic_read(&mq->drm.signalled_value) == 5);
+      hk_queue_note_signalled(mq, 12);
+      T("signalled_value advances from 5 to 12",
+        p_atomic_read(&mq->drm.signalled_value) == 12);
+      hk_queue_note_signalled(mq, 7);
+      T("signalled_value ignores lower point",
+        p_atomic_read(&mq->drm.signalled_value) == 12);
+      hk_queue_note_signalled(mq, 12);
+      T("signalled_value ignores equal point",
+        p_atomic_read(&mq->drm.signalled_value) == 12);
+   }
    printf("RESULT checks=%u failures=%u\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

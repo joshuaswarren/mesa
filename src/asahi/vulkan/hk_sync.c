@@ -2388,11 +2388,14 @@ hk_sync_load_resolved(struct hk_cs *cs, const struct hk_sync_resolved *r)
 }
 
 bool
-hk_sync_resolve_submit(struct hk_queue *queue,
-                       struct hk_cmd_buffer *const *cmdbufs, unsigned count,
-                       bool first_cdm_is_flush, bool chain_first,
-                       uint64_t completed, struct hk_sync_resolved *out)
+hk_sync_resolve_submit_ex(struct hk_queue *queue,
+                          struct hk_cmd_buffer *const *cmdbufs, unsigned count,
+                          bool first_cdm_is_flush, bool chain_first,
+                          uint64_t completed, struct hk_sync_resolved *out,
+                          bool *tail_raised_out)
 {
+   if (tail_raised_out)
+      *tail_raised_out = false;
    /* Validate all ordinal arithmetic before mutating command or queue state.
     * Historical ordinals use zero for absence, so wrapping them is invalid.
     * Positions past the 16-bit relative fields become ordinals
@@ -2520,14 +2523,21 @@ hk_sync_resolve_submit(struct hk_queue *queue,
             /* The whole render waits on the carried requirements of all its
              * destination classes, its vertex half on those of its kinds. A
              * layout transition waits on those of its first scope alone. */
-            resolve_one(&ss, sq, &cs->sync.dep[sq], stream_carry(cs),
-                        &cs->sync.barrier[sq], &cs->sync.prior[sq]);
-            resolve_one(&ss, sq, &cs->sync.dep_ta[sq],
-                        cs->sync.brl_transition
-                           ? cs->sync.brl_carry
-                           : cs->sync.kind |
-                                (cs->sync.vtx_images ? HK_SYNC_GFX_IMG : 0),
-                        &cs->sync.barrier_ta[sq], &cs->sync.prior_ta[sq]);
+            const uint8_t carry = stream_carry(cs);
+            const uint8_t ta_carry =
+               cs->sync.brl_transition
+                  ? cs->sync.brl_carry
+                  : cs->sync.kind |
+                       (cs->sync.vtx_images ? HK_SYNC_GFX_IMG : 0);
+            resolve_one(&ss, sq, d, carry, &cs->sync.barrier[sq],
+                        &cs->sync.prior[sq]);
+            if (ta_carry == carry && t->cut == d->cut && t->prior == d->prior) {
+               cs->sync.barrier_ta[sq] = cs->sync.barrier[sq];
+               cs->sync.prior_ta[sq] = cs->sync.prior[sq];
+            } else {
+               resolve_one(&ss, sq, t, ta_carry, &cs->sync.barrier_ta[sq],
+                           &cs->sync.prior_ta[sq]);
+            }
          }
       }
 
@@ -2694,14 +2704,20 @@ hk_sync_resolve_submit(struct hk_queue *queue,
    util_dynarray_fini(&submitted);
 
    if (queue->sync.exact_prior) {
+      bool tail_raised = false;
       for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
          for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
-            queue->sync.tail[k][sq] = ss.carry_absolute[k][sq];
+            if (ss.carry_absolute[k][sq] != queue->sync.tail[k][sq]) {
+               queue->sync.tail[k][sq] = ss.carry_absolute[k][sq];
+               tail_raised = true;
+            }
             if (ss.last[k][sq] > 0)
                queue->sync.last_absolute[k][sq] =
                   queue->sync.submitted[sq] + ss.last[k][sq];
          }
       }
+      if (tail_raised_out)
+         *tail_raised_out = tail_raised;
       for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
          queue->sync.submitted[sq] += ss.count[sq];
    }
@@ -2715,4 +2731,14 @@ hk_sync_resolve_submit(struct hk_queue *queue,
    if (first_cdm_is_flush)
       queue->sync.ever[HK_SYNC_CDM] |= HK_SYNC_ALL;
    return true;
+}
+
+bool
+hk_sync_resolve_submit(struct hk_queue *queue,
+                       struct hk_cmd_buffer *const *cmdbufs, unsigned count,
+                       bool first_cdm_is_flush, bool chain_first,
+                       uint64_t completed, struct hk_sync_resolved *out)
+{
+   return hk_sync_resolve_submit_ex(queue, cmdbufs, count, first_cdm_is_flush,
+                                    chain_first, completed, out, NULL);
 }

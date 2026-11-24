@@ -1208,19 +1208,6 @@ hk_query_note_submit(struct hk_cmd_buffer *cmd, struct hk_queue *queue,
    }
 }
 
-static void
-hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
-{
-   uint64_t seen = p_atomic_read(&queue->drm.signalled_value);
-   while (seen < point) {
-      const uint64_t prev =
-         p_atomic_cmpxchg(&queue->drm.signalled_value, seen, point);
-      if (prev == seen)
-         break;
-      seen = prev;
-   }
-}
-
 struct hk_pending_query_stamp {
    uint32_t handle;
    uint64_t offset_B;

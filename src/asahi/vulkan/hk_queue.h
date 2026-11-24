@@ -9,6 +9,7 @@
 
 #include "hk_private.h"
 #include "hk_sync.h"
+#include "util/u_atomic.h"
 #include "vk_queue.h"
 
 struct hk_device;
@@ -54,9 +55,9 @@ struct hk_queue {
        */
       uint64_t timeline_value;
 
-      /* The highest timeline value a host wait has seen signalled, for
-       * occlusion query reads (hk_oq_submission_done()). Every value at or
-       * below it is complete. */
+      /* The highest timeline value a host wait or syncobj query has seen
+       * signalled, updated monotonically via hk_queue_note_signalled(). Every
+       * value at or below it is complete. */
       uint64_t signalled_value;
 
       /* Latest timeline point that received the waits of a submission
@@ -176,6 +177,19 @@ static inline struct hk_device *
 hk_queue_device(struct hk_queue *queue)
 {
    return (struct hk_device *)queue->vk.base.device;
+}
+
+static inline void
+hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
+{
+   uint64_t seen = p_atomic_read(&queue->drm.signalled_value);
+   while (seen < point) {
+      const uint64_t prev =
+         p_atomic_cmpxchg(&queue->drm.signalled_value, seen, point);
+      if (prev == seen)
+         break;
+      seen = prev;
+   }
 }
 
 

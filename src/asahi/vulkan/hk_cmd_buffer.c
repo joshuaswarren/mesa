@@ -511,6 +511,11 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       memset(&cmd->rt, 0, sizeof(cmd->rt));
       cmd->used_rt = false;
    }
+   if (cmd->used_group_count_cache) {
+      for (unsigned i = 0; i < ARRAY_SIZE(cmd->group_count_cache); ++i)
+         cmd->group_count_cache[i].valid = 0;
+      cmd->used_group_count_cache = false;
+   }
    cmd->pass_merge.valid = false;
    /* Nothing has been recorded since this reset. */
    cmd->g17p_pristine = true;
