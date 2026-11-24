@@ -4566,10 +4566,13 @@ zink_flush(struct pipe_context *pctx,
    }
 
    bool has_work = ctx->bs->has_work | ctx->bs->has_reordered_work | ctx->bs->has_unsync;
+   uint32_t target_flush_id = 0;
    if (!has_work) {
       if (pfence) {
          /* reuse last fence */
          bs = ctx->last_batch_state;
+         if (bs)
+            target_flush_id = p_atomic_read(&bs->flush_id);
       }
       if (!deferred) {
          struct zink_batch_state *last = ctx->last_batch_state;
@@ -4583,6 +4586,7 @@ zink_flush(struct pipe_context *pctx,
       tc_driver_internal_flush_notify(ctx->tc);
    } else {
       bs = ctx->bs;
+      target_flush_id = p_atomic_read(&bs->flush_id) + 1;
       if (deferred && !(flags & PIPE_FLUSH_FENCE_FD) && pfence)
          deferred_fence = true;
       else
@@ -4602,21 +4606,31 @@ zink_flush(struct pipe_context *pctx,
          *pfence = (struct pipe_fence_handle *)mfence;
       }
 
-      assert(!mfence->fence);
-      mfence->fence = &bs->fence;
+      assert(!p_atomic_read(&mfence->fence));
       mfence->sem = export_sem;
       if (bs) {
-         mfence->submit_count = bs->usage.submit_count;
-         util_dynarray_append(&bs->fence.mfences, mfence);
+         mfence->submit_count = p_atomic_read(&bs->usage.submit_count);
+         mfence->target_flush_id = target_flush_id;
+         simple_mtx_lock(&screen->mfences_lock);
+         if (screen->device_lost ||
+             (!deferred_fence && (int32_t)(p_atomic_read(&bs->reset_id) - target_flush_id) >= 0)) {
+            p_atomic_set(&mfence->fence, NULL);
+         } else {
+            p_atomic_set(&mfence->fence, &bs->fence);
+            util_dynarray_append(&bs->fence.mfences, mfence);
+         }
+         simple_mtx_unlock(&screen->mfences_lock);
+      } else {
+         p_atomic_set(&mfence->fence, NULL);
       }
       if (export_sem) {
          pipe_reference(NULL, &mfence->reference);
          util_dynarray_append(&ctx->bs->fences, mfence);
       }
 
-      if (deferred_fence) {
+      if (deferred_fence && !screen->device_lost) {
          assert(bs);
-         mfence->deferred_ctx = pctx;
+         p_atomic_set(&mfence->deferred_ctx, pctx);
          assert(!ctx->deferred_fence || ctx->deferred_fence == &bs->fence);
          ctx->deferred_fence = &bs->fence;
       }
