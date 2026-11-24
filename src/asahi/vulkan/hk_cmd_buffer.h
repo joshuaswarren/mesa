@@ -2151,6 +2151,9 @@ struct hk_cmd_buffer {
     */
    bool in_meta;
 
+   /* Flags passed to vkBeginCommandBuffer(). */
+   VkCommandBufferUsageFlags usage_flags;
+
    /* CmdClearAttachments is the sole vk_meta operation affected by
     * conditional rendering. */
    bool conditional_meta;

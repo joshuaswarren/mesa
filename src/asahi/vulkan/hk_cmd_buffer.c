@@ -901,6 +901,7 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    if (!cmd->g17p_pristine)
       hk_reset_cmd_buffer(&cmd->vk, 0);
    cmd->g17p_pristine = false;
+   cmd->usage_flags = pBeginInfo->flags;
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
 
    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY &&
