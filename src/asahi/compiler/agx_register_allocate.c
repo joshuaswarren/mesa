@@ -103,6 +103,7 @@ struct ra_ctx {
    agx_block *block;
    agx_instr *instr;
    uint16_t *ssa_to_reg;
+   uint16_t *pred_ssa_to_reg;
    uint8_t *ncomps;
    uint8_t *ncomps_unrounded;
    enum agx_size *sizes;
@@ -1349,18 +1350,6 @@ find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
    }
 }
 
-static uint32_t
-search_ssa_to_reg_out(struct ra_ctx *ctx, struct agx_block *blk,
-                      enum ra_class cls, unsigned ssa)
-{
-   for (unsigned reg = 0; reg < ctx->bound[cls]; ++reg) {
-      if (blk->reg_to_ssa_out[cls][reg] == ssa)
-         return reg;
-   }
-
-   UNREACHABLE("variable not defined in block");
-}
-
 /*
  * Loop over live-in values at the start of the block and mark their registers
  * as in-use. We process blocks in dominance order, so this handles everything
@@ -1379,15 +1368,56 @@ reserve_live_in(struct ra_ctx *rctx)
    if (nr_preds == 0)
       return;
 
+   if (nr_preds == 1) {
+      /* If we don't emit a phi, there is already a unique register. Scan the
+       * predecessor's register map once instead of searching it per live-in.
+       */
+      agx_block **pred = util_dynarray_begin(&rctx->block->predecessors);
+#ifndef NDEBUG
+      unsigned found = 0;
+#endif
+
+      for (unsigned cls = 0; cls < RA_CLASSES; ++cls) {
+         const uint32_t *out = (*pred)->reg_to_ssa_out[cls];
+         if (!out)
+            continue;
+
+         const unsigned bound = rctx->bound[cls];
+         for (unsigned reg = 0; reg < bound; ++reg) {
+            const uint32_t i = out[reg];
+            if (i == ~0u || !BITSET_TEST(rctx->visited, i) ||
+                !u_sparse_bitset_test(&rctx->block->live_in, i))
+               continue;
+
+            assert(rctx->classes[i] == cls);
+            set_ssa_to_reg(rctx, i, reg);
+            BITSET_SET_COUNT(rctx->used_regs[cls], reg, rctx->ncomps[i]);
+#ifndef NDEBUG
+            found++;
+#endif
+         }
+      }
+
+#ifndef NDEBUG
+      unsigned expected = 0;
+      U_SPARSE_BITSET_FOREACH_SET(&rctx->block->live_in, i) {
+         if (BITSET_TEST(rctx->visited, i))
+            expected++;
+      }
+      assert(found == expected && "variable not defined in block");
+#endif
+      return;
+   }
+
    agx_builder b =
       agx_init_builder(rctx->shader, agx_before_block(rctx->block));
+   struct list_head *first_old = rctx->block->instructions.next;
 
    U_SPARSE_BITSET_FOREACH_SET(&rctx->block->live_in, i) {
       /* Skip values defined in loops when processing the loop header */
       if (!BITSET_TEST(rctx->visited, i))
          continue;
 
-      unsigned base;
       enum ra_class cls = rctx->classes[i];
       enum agx_size size = rctx->sizes[i];
 
@@ -1400,53 +1430,81 @@ reserve_live_in(struct ra_ctx *rctx)
        * the end of each predecessor. Join them together with a phi inserted at
        * the start of the block.
        */
-      if (nr_preds > 1) {
-         /* We'll fill in the destination after, to coalesce one of the moves */
-         agx_instr *phi = agx_phi_to(&b, agx_null(), nr_preds);
+      /* We'll fill in the destination after, to coalesce one of the moves */
+      agx_instr *phi = agx_phi_to(&b, agx_null(), nr_preds);
+      agx_index src = agx_get_vec_index(i, size, channels);
+      src.memory = cls == RA_MEM;
 
-         agx_foreach_predecessor(rctx->block, pred) {
-            unsigned pred_idx = agx_predecessor_index(rctx->block, *pred);
+      for (unsigned pred_idx = 0; pred_idx < nr_preds; ++pred_idx)
+         phi->src[pred_idx] = src;
+   }
 
-            phi->src[pred_idx] = agx_get_vec_index(i, size, channels);
-            phi->src[pred_idx].memory = cls == RA_MEM;
+   if (rctx->block->instructions.next == first_old)
+      return;
 
-            if ((*pred)->reg_to_ssa_out[cls] == NULL) {
-               /* If this is a loop header, we don't know where the register
-                * will end up. So, we create a phi conservatively but don't fill
-                * it in until the end of the loop. Stash in the information
-                * we'll need to fill in the real register later.
-                */
-               assert(rctx->block->loop_header);
-            } else {
-               /* Otherwise, we can build the phi now */
-               phi->src[pred_idx].reg =
-                  search_ssa_to_reg_out(rctx, *pred, cls, i);
-               phi->src[pred_idx].has_reg = true;
-            }
-         }
+   /* Invert each already-allocated predecessor's reg_to_ssa_out once instead
+    * of scanning it for every live-in phi.
+    */
+   agx_foreach_predecessor(rctx->block, pred) {
+      unsigned pred_idx = agx_predecessor_index(rctx->block, *pred);
 
-         /* Pick the phi destination to coalesce a move. Predecessor ordering is
-          * stable, so this means all live-in values get their registers from a
-          * particular predecessor. That means that such a register allocation
-          * is valid here, because it was valid in the predecessor.
+      /* RA_GPR bound is always non-zero, so reg_to_ssa_out[RA_GPR] == NULL iff
+       * this predecessor has not been allocated yet (loop back-edge).
+       */
+      if ((*pred)->reg_to_ssa_out[RA_GPR] == NULL) {
+         /* If this is a loop header, we don't know where the register will end
+          * up. So, we create a phi conservatively but don't fill it in until
+          * the end of the loop. Stash in the information we'll need to fill in
+          * the real register later.
           */
-         assert(phi->src[0].has_reg && "not loop source");
-         phi->dest[0] = phi->src[0];
-         base = phi->dest[0].reg;
-      } else {
-         /* If we don't emit a phi, there is already a unique register */
-         assert(nr_preds == 1);
-
-         agx_block **pred = util_dynarray_begin(&rctx->block->predecessors);
-         /* TODO: Flip logic to eliminate the search */
-         base = search_ssa_to_reg_out(rctx, *pred, cls, i);
+         assert(rctx->block->loop_header);
+         continue;
       }
+
+      for (unsigned cls = 0; cls < RA_CLASSES; ++cls) {
+         const uint32_t *out = (*pred)->reg_to_ssa_out[cls];
+         if (!out)
+            continue;
+
+         const unsigned bound = rctx->bound[cls];
+         for (unsigned reg = 0; reg < bound; ++reg) {
+            const uint32_t ssa = out[reg];
+            if (ssa != ~0u)
+               rctx->pred_ssa_to_reg[ssa] = reg;
+         }
+      }
+
+      for (struct list_head *n = rctx->block->instructions.next; n != first_old;
+           n = n->next) {
+         agx_instr *phi = list_entry(n, agx_instr, link);
+         unsigned i = phi->src[pred_idx].value;
+         enum ra_class cls = rctx->classes[i];
+         unsigned reg = rctx->pred_ssa_to_reg[i];
+         assert((*pred)->reg_to_ssa_out[cls] != NULL &&
+                reg < rctx->bound[cls] &&
+                (*pred)->reg_to_ssa_out[cls][reg] == i &&
+                "variable not defined in block");
+         phi->src[pred_idx].reg = reg;
+         phi->src[pred_idx].has_reg = true;
+      }
+   }
+
+   /* Pick the phi destination to coalesce a move. Predecessor ordering is
+    * stable, so this means all live-in values get their registers from a
+    * particular predecessor. That means that such a register allocation
+    * is valid here, because it was valid in the predecessor.
+    */
+   for (struct list_head *n = rctx->block->instructions.next; n != first_old;
+        n = n->next) {
+      agx_instr *phi = list_entry(n, agx_instr, link);
+      assert(phi->src[0].has_reg && "not loop source");
+      phi->dest[0] = phi->src[0];
+      unsigned i = phi->dest[0].value;
+      unsigned base = phi->dest[0].reg;
+      enum ra_class cls = rctx->classes[i];
 
       set_ssa_to_reg(rctx, i, base);
-
-      for (unsigned j = 0; j < rctx->ncomps[i]; ++j) {
-         BITSET_SET(rctx->used_regs[cls], base + j);
-      }
+      BITSET_SET_COUNT(rctx->used_regs[cls], base, rctx->ncomps[i]);
    }
 }
 
@@ -2436,12 +2494,13 @@ agx_ra_assign_local(struct ra_ctx *rctx)
       memset(used_regs_mem, 0,
              BITSET_WORDS(rctx->bound[RA_MEM]) * sizeof(BITSET_WORD));
    }
-   uint16_t *ssa_to_reg = calloc(rctx->shader->alloc, sizeof(uint16_t));
+   uint16_t *ssa_to_reg = rctx->ssa_to_reg;
 
    agx_block *block = rctx->block;
+   if (block != agx_start_block(rctx->shader))
+      memset(ssa_to_reg, 0, rctx->shader->alloc * sizeof(uint16_t));
    rctx->used_regs[RA_GPR] = used_regs_gpr;
    rctx->used_regs[RA_MEM] = used_regs_mem;
-   rctx->ssa_to_reg = ssa_to_reg;
 
    reserve_live_in(rctx);
 
@@ -2778,6 +2837,11 @@ agx_ra_assign_local(struct ra_ctx *rctx)
    }
 
    for (unsigned i = 0; i < RA_CLASSES; ++i) {
+      if (rctx->bound[i] == 0) {
+         block->reg_to_ssa_out[i] = NULL;
+         continue;
+      }
+
       block->reg_to_ssa_out[i] =
          malloc(rctx->bound[i] * sizeof(*block->reg_to_ssa_out[i]));
 
@@ -2806,8 +2870,6 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          }
       }
    }
-
-   free(rctx->ssa_to_reg);
 }
 
 /*
@@ -3772,11 +3834,15 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    BITSET_WORD *early_scalar_export = BITSET_CALLOC(ctx->alloc);
    BITSET_WORD *effectful_use = BITSET_CALLOC(ctx->alloc);
    unsigned instruction_order = 0;
+   bool any_enter_query_m5 = false;
+   bool any_mem = false;
 
    const unsigned tile_gpr_limit = agx3_tile_store_bank(ctx);
 
    agx_foreach_instr_global(ctx, I) {
       instruction_order++;
+      if (I->op == AGX_OPCODE_ENTER_QUERY_M5)
+         any_enter_query_m5 = true;
       const struct agx_opcode_info *info = &agx_opcodes_info[I->op];
       if (!info->can_reorder || !info->can_eliminate ||
           info->schedule_class != AGX_SCHEDULE_CLASS_NONE) {
@@ -3958,6 +4024,8 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          sizes[v] = I->dest[d].size;
          definition_order[v] = instruction_order;
          classes[v] = ra_class_for_index(I->dest[d]);
+         if (classes[v] == RA_MEM)
+            any_mem = true;
 
          max_ncomps = MAX2(max_ncomps, ncomps[v]);
       }
@@ -4071,7 +4139,11 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    /* Assign registers in dominance-order. This coincides with source-order due
     * to a NIR invariant, so we do not need special handling for this.
     */
-   BITSET_WORD *dest_read = agx_values_read(ctx);
+   BITSET_WORD *dest_read = any_enter_query_m5 ? agx_values_read(ctx) : NULL;
+   uint16_t *ssa_to_reg = calloc(ctx->alloc, sizeof(uint16_t));
+   uint16_t *pred_ssa_to_reg =
+      list_length(&ctx->blocks) > 1 ? malloc(ctx->alloc * sizeof(uint16_t))
+                                    : NULL;
 
    /* Everything assign_local reads below was allocated above, and nothing the
     * cleanup reads is changed after this point, so it survives a longjmp. */
@@ -4083,12 +4155,14 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    }
    ctx->ra_abort = &ra_abort;
 
-   const unsigned mem_bound = agx_ra_mem_bound(ctx);
+   const unsigned mem_bound = any_mem ? agx_ra_mem_bound(ctx) : 0;
 
    agx_foreach_block(ctx, block) {
       agx_ra_assign_local(&(struct ra_ctx){
          .shader = ctx,
          .block = block,
+         .ssa_to_reg = ssa_to_reg,
+         .pred_ssa_to_reg = pred_ssa_to_reg,
          .dest_read = dest_read,
          .src_to_collect_phi = src_to_collect_phi,
          .early_scalar_export = early_scalar_export,
@@ -4267,6 +4341,8 @@ cleanup:
       }
    }
 
+   free(ssa_to_reg);
+   free(pred_ssa_to_reg);
    free(phi_web);
    util_dynarray_fini(&matrix_groups);
    free(web_matrix_group);
