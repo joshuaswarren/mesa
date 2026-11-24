@@ -12,6 +12,7 @@
 #include "asahi/genxml/agx3_cmdstream.h"
 #include "asahi/layout/layout.h"
 #include "asahi/lib/agx3_compute_program_core.h"
+#include "asahi/lib/agx_bg_eot_key.h"
 #include "asahi/lib/agx_tile_mip.h"
 #include "asahi/vulkan/hk_g17p_meta_copy_core.h"
 #include "compiler/nir/nir_builder.h"
@@ -543,13 +544,27 @@ agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
  * image. Keep that reverse copy restricted to the original WSI binding shape;
  * its later swap is the operation that supplies the direct resolve target.
  */
+/* AGX3 end-of-tile IMGWBLK averages samples in hardware for every native
+ * normalized and 16-bit floating-point colour selector (0x75, 0x95, 0x15),
+ * matching Borealis's hk_agx3_format_needs_shader_resolve(). Keep integer
+ * formats (sample-zero semantics), sRGB (linear averaging), 32-bit floats and
+ * packed R11G11B10F/R9G9B9E5F words (raw-bit IMGWBLK) on the shader resolve
+ * path. */
 static bool
-agx_g17p_rgba8_resolve_format(enum pipe_format format)
+agx_g17p_direct_resolve_format(enum pipe_format format)
 {
-   return format == PIPE_FORMAT_R8G8B8A8_UNORM ||
-          format == PIPE_FORMAT_B8G8R8A8_UNORM ||
-          format == PIPE_FORMAT_R8G8B8X8_UNORM ||
-          format == PIPE_FORMAT_B8G8R8X8_UNORM;
+   if (util_format_is_depth_or_stencil(format) ||
+       util_format_is_pure_integer(format) ||
+       util_format_is_srgb(format) ||
+       format == PIPE_FORMAT_R11G11B10_FLOAT ||
+       format == PIPE_FORMAT_R9G9B9E5_FLOAT)
+      return false;
+
+   if (util_format_is_float(format) &&
+       util_format_get_component_bits(format, UTIL_FORMAT_COLORSPACE_RGB, 0) == 32)
+      return false;
+
+   return agx_g17p_mrt_eot_selector(format) != 0;
 }
 
 bool
@@ -572,7 +587,7 @@ agx_g17p_direct_resolve_blit_shape(const struct pipe_blit_info *info,
    return (util_res_sample_count(msaa) == 2 ||
            util_res_sample_count(msaa) == 4) &&
           util_res_sample_count(single) == 1 && src->format == dst->format &&
-          agx_g17p_rgba8_resolve_format(src->format) &&
+          agx_g17p_direct_resolve_format(src->format) &&
           (source_multisampled || wsi_seed) &&
           (single->target == PIPE_TEXTURE_2D ||
            single->target == PIPE_TEXTURE_RECT) &&
@@ -607,14 +622,28 @@ agx_g17p_attach_direct_resolve(struct agx_context *ctx,
        (batch->key.resolve && batch->key.resolve != single) ||
        batch->key.nr_cbufs != 1 ||
        batch->key.cbufs[0].texture != msaa ||
+       batch->key.cbufs[0].format != single->format ||
        batch->key.cbufs[0].level != 0 ||
        batch->key.cbufs[0].first_layer != 0 ||
-       batch->key.cbufs[0].last_layer != 0)
+       batch->key.cbufs[0].last_layer != 0 ||
+       batch->key.width != msaa->width0 ||
+       batch->key.height != msaa->height0 ||
+       !agx_g17p_rt0_tile_layout_supported(&batch->tilebuffer_layout))
+      return false;
+
+   /* Do not fuse a resolve into a batch that already references the resolve
+    * target (e.g. sampled during the render pass), because the fused EOT
+    * store would race with reads in other tiles of the same pass. The WSI
+    * seed path (preserve_source == false) intentionally reads the WSI image
+    * once to seed the private MSAA buffer and resolves back into it. */
+   if (!batch->key.resolve && preserve_source &&
+       agx_batch_uses_bo(batch, agx_resource(single)->bo))
       return false;
 
    batch->g17p_resolve_preserve |= preserve_source;
    if (!batch->key.resolve) {
       pipe_resource_reference(&batch->key.resolve, single);
+      batch->g17p_resolve_blit_attached = true;
       if (ctx->batch == batch)
          ctx->batch = NULL;
       agx_batch_writes(batch, agx_resource(single), 0);
@@ -636,7 +665,7 @@ agx_g17p_staged_resolve_blit_shape(const struct pipe_blit_info *info)
           (src->target == PIPE_TEXTURE_2D ||
            src->target == PIPE_TEXTURE_RECT) &&
           src->last_level == 0 && src->array_size == 1 && src->depth0 == 1 &&
-          agx_g17p_rgba8_resolve_format(src->format) &&
+          agx_g17p_direct_resolve_format(src->format) &&
           info->src.level == 0 && info->src.box.z == 0 &&
           info->src.box.depth == 1 && info->src.format == src->format &&
           !(info->mask & ~PIPE_MASK_RGBA) && (info->mask & PIPE_MASK_RGBA) &&
@@ -838,13 +867,15 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
     * written and the next pass reloaded stale memory (dEQP-GLES3
     * multisample.fbo_4_samples.stencil: samples a stencil test rejected
     * came back zero; gpu/msstencil.c in m5air). */
-   if (agx_chip_native_agx3(agx_device(ctx->base.screen)->chip) &&
+   const struct agx_device *dev = agx_device(ctx->base.screen);
+
+   if (agx_chip_native_agx3(dev->chip) &&
        agx_g17p_direct_resolve_blit_shape(info, true) &&
        agx_g17p_attach_direct_resolve(ctx, info->src.resource,
                                       info->dst.resource, true))
       return;
 
-   if (agx_chip_native_agx3(agx_device(ctx->base.screen)->chip) &&
+   if (agx_chip_native_agx3(dev->chip) &&
        agx_g17p_staged_resolve_blit_shape(info) &&
        agx_g17p_staged_resolve_blit(ctx, info))
       return;
@@ -899,7 +930,7 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
     * from the WSI image. Keep that copy in the same tile batch, and publish
     * the tile directly back to the WSI image when the swap resolve arrives.
     */
-   if (agx_chip_native_agx3(agx_device(ctx->base.screen)->chip) &&
+   if (agx_chip_native_agx3(dev->chip) &&
        agx_g17p_direct_resolve_blit_shape(info, false)) {
       if (agx_g17p_attach_direct_resolve(ctx, info->dst.resource,
                                        info->src.resource, false)) {
