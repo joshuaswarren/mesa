@@ -797,6 +797,7 @@ if with_tests
          'test/test-agx3-uniform-comparands.cpp',
          'test/test-agx3-g17g-retry-select.cpp',
          'test/test-agx3-cube-scratch.cpp',
+         'test/test-bg-shader-schedule.cpp',
          'test/test-fminmax-constant-denorm.cpp',
          'test/test-denorm-preserve-fma.cpp',
          'test/test-fminmax-signed-zero.cpp',
