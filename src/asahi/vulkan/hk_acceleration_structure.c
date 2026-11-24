@@ -2171,6 +2171,8 @@ hk_cmd_build_acceleration_structures(
 
 
    hk_sync_end_cs_if_gfx_waits(cmd);
+   const bool was_sync_as_build = cmd->sync.as_build;
+   cmd->sync.as_build = true;
    const bool was_as_build = cmd->state.as_build_recording;
    cmd->state.as_build_recording = dev->dev.chip == AGX_CHIP_G17P;
    /* Launches of separate build calls, or of a build and the application's
@@ -2220,6 +2222,7 @@ hk_cmd_build_acceleration_structures(
 
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
    cmd->state.as_build_recording = was_as_build;
+   cmd->sync.as_build = was_sync_as_build;
    if (cmd->current_cs.cs)
       cmd->current_cs.cs->app_dispatch_end = NULL;
    free(nonempty_infos);
