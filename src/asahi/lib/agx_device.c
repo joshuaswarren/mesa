@@ -154,9 +154,25 @@ agx_bo_free(struct agx_device *dev, struct agx_bo *bo)
     * vdrm_bo_create() flushes this ahead of any blob that reuses the VA. Keep
     * (leak) the VA if the unbind cannot be queued.
     */
-   if (!dev->is_virtio || !bo->va ||
-       !agx_bo_bind(dev, NULL, bo->va->addr, bo->size, 0,
-                    DRM_ASAHI_BIND_UNBIND))
+   bool free_va = true;
+   if (dev->is_virtio && bo->va) {
+      struct drm_asahi_gem_bind_op ops[2] = {
+         {
+            .flags = DRM_ASAHI_BIND_UNBIND,
+            .range = bo->size,
+            .addr = bo->va->addr,
+         },
+         {
+            .flags = DRM_ASAHI_BIND_UNBIND,
+            .range = bo->size,
+            .addr = bo->ro_shadow_bound
+                       ? agx_rw_addr_to_ro(dev, bo->va->addr)
+                       : 0,
+         },
+      };
+      free_va = !dev->ops.bo_bind(dev, ops, bo->ro_shadow_bound ? 2 : 1);
+   }
+   if (free_va)
       agx_va_free(dev, bo->va, false);
 
    if (bo->prime_fd != -1)
@@ -592,27 +608,36 @@ agx_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
 {
    assert(bo->_map == NULL && "not double mapped");
 
-   struct drm_asahi_gem_mmap_offset gem_mmap_offset = {.handle =
-                                                          bo->uapi_handle};
-   int ret, flags;
+   uint64_t offset;
+   if (likely(bo->has_mmap_offset)) {
+      offset = bo->mmap_offset;
+   } else {
+      struct drm_asahi_gem_mmap_offset gem_mmap_offset = {
+         .handle = bo->uapi_handle,
+      };
+      int ret =
+         drmIoctl(dev->fd, DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET, &gem_mmap_offset);
+      if (ret) {
+         fprintf(stderr, "DRM_IOCTL_ASAHI_MMAP_BO failed: %m\n");
+         assert(0);
+         return;
+      }
 
-   ret = drmIoctl(dev->fd, DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET, &gem_mmap_offset);
-   if (ret) {
-      fprintf(stderr, "DRM_IOCTL_ASAHI_MMAP_BO failed: %m\n");
-      assert(0);
+      offset = gem_mmap_offset.offset;
+      bo->mmap_offset = offset;
+      bo->has_mmap_offset = true;
    }
 
-   flags = MAP_SHARED | (fixed_addr ? MAP_FIXED : 0);
+   int flags = MAP_SHARED | (fixed_addr ? MAP_FIXED : 0);
    bo->_map_size = length ?: bo->size;
    bo->_map = os_mmap(fixed_addr, bo->_map_size, PROT_READ | PROT_WRITE,
-                      flags, dev->fd, gem_mmap_offset.offset);
+                      flags, dev->fd, offset);
    if (bo->_map == MAP_FAILED) {
       bo->_map = NULL;
       bo->_map_size = 0;
       fprintf(stderr,
               "mmap failed: result=%p size=0x%llx fd=%i offset=0x%llx %m\n",
-              bo->_map, (long long)bo->size, dev->fd,
-              (long long)gem_mmap_offset.offset);
+              bo->_map, (long long)bo->size, dev->fd, (long long)offset);
    }
 }
 

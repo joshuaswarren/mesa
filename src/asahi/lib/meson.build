@@ -202,6 +202,24 @@ if with_tests
     )
   endforeach
   test(
+    'asahi-agx-bo-cache',
+    executable(
+      'asahi-agx-bo-cache',
+      files('tests/test-agx-bo-cache.c'),
+      include_directories : [
+        inc_include, inc_src, inc_asahi, libasahi_lib_includes,
+        include_directories('../libagx'),
+      ],
+      dependencies : [
+        idep_nir, idep_agx_pack, idep_mesautil, idep_libagx_shaders_h,
+      ],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],
+      c_args : [c_msvc_compat_args, '-UNDEBUG'],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
     'asahi-chip-admission',
     executable(
       'asahi-chip-admission',

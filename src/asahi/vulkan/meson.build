@@ -790,8 +790,7 @@ if with_tests
       '-Wl,--wrap=agx_bo_export', '-Wl,--wrap=agx_bo_import',
       '-Wl,--wrap=hk_get_cgroup_memory_available', '-Wl,--wrap=__vk_errorf',
       '-Wl,--wrap=os_get_available_system_memory',
-      '-Wl,--wrap=os_get_total_physical_memory',
-      '-Wl,--wrap=agx_bo_cache_has']),
+      '-Wl,--wrap=os_get_total_physical_memory']),
     suite : ['asahi'])
   test('hk_cache_identity', executable('hk_cache_identity_test',
     files('tests/test-hk-cache-identity.c'),
