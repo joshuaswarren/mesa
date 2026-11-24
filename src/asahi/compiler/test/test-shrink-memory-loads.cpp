@@ -168,7 +168,7 @@ TEST_F(ShrinkMemoryLoadsTest, CompilesVectorConstructingLoadWithoutSpillingOnG16
 
       struct agx_shader_key key = {};
       key.dev.chip = g17p ? AGX_CHIP_G17P : AGX_CHIP_G16G;
-      key.dev.encoding = g17p ? AGX_ISA_ENCODING_AGX3B : AGX_ISA_ENCODING_AGX2;
+      key.dev.encoding = agx_chip_isa_encoding(key.dev.chip);
       if (g17p) {
          key.agx3_native_cprog = true;
          key.g17p_native_uniforms = true;
