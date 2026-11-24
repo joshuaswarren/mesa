@@ -2355,13 +2355,20 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
              * they are narrower than the whole render's, so its tiling can
              * overlap the fragment work of the renders only its fragment
              * half depends on. Supersedes the single-subqueue forms below. */
+            const bool m5_staged_v2 =
+               agx_chip_g17_m5(dev->dev.chip) && !queue->sync.serialize &&
+               queue->sync.exact_prior &&
+               (dev->dev.params.features &
+                DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
+               cs->sync.ta_split;
             const bool stage_prefixes =
+               !m5_staged_v2 &&
                agx_chip_g17_m5(dev->dev.chip) && !queue->sync.serialize &&
                queue->sync.exact_prior &&
                (dev->dev.params.features &
                 DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES) &&
                cs->sync.ta_split;
-            if (stage_prefixes)
+            if (stage_prefixes || m5_staged_v2)
                cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
 
             /* G17P: a render whose vertex half depends on less compute work
@@ -2391,7 +2398,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
              * the fragment half after them, so this render's vertex work can
              * overlap their fragment work. Compute dependencies keep ordering
              * the vertex half either way. */
-            if (!stage_prefixes && !g17p_staged && !queue->sync.serialize &&
+            if (!stage_prefixes && !m5_staged_v2 && !g17p_staged && !queue->sync.serialize &&
                 (dev->dev.params.features &
                  DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
                 cs->sync.ta_split &&
@@ -2445,7 +2452,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_with_stage_prior) ==
                           sizeof(struct drm_asahi_cmd_render_with_prior) + 16);
             const bool stage_cdm =
-               !stage_prefixes &&
+               !stage_prefixes && !m5_staged_v2 &&
                agx_chip_g17_m5(dev->dev.chip) && queue->sync.exact_prior &&
                (dev->dev.params.features &
                 DRM_ASAHI_FEATURE_COMPUTE_STAGE_BARRIERS) &&
@@ -2467,7 +2474,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             }
             STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_with_ray_query) == 448);
             STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_staged) == 480);
-            if (g17p_staged) {
+            if (g17p_staged || m5_staged_v2) {
                struct drm_asahi_cmd_render_staged staged = {
                   .render = {.legacy = cmd},
                   .stage_prefixes = {
@@ -2477,7 +2484,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                      .ta_prior_vdm = cs->sync.prior_ta[HK_SYNC_VDM],
                   },
                };
-               hk_gen1_render_ray_query_stages(dev, cs, staged.render.ray_query);
+               if (g17p_staged)
+                  hk_gen1_render_ray_query_stages(dev, cs, staged.render.ray_query);
                header.size = sizeof(staged);
                util_dynarray_append(&payload, header);
                util_dynarray_append_array(&payload, uint8_t, &staged, header.size);

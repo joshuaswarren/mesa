@@ -553,6 +553,7 @@ struct hk_cs *hk_sync_get_cs_after(struct hk_cmd_buffer *cmd,
 /* End the general compute stream if it carries an end timestamp, so a query
  * command that follows cannot run before the stamp is taken. */
 void hk_sync_end_cs_if_timestamped(struct hk_cmd_buffer *cmd);
+void hk_sync_end_cs_if_gfx_waits(struct hk_cmd_buffer *cmd);
 
 /* Timestamps. */
 void hk_sync_write_timestamp(struct hk_cmd_buffer *cmd,

@@ -1089,7 +1089,23 @@ bool
 hk_sync_merge_delays(struct hk_cmd_buffer *cmd, const struct hk_cs *into,
                      const struct hk_cs *from)
 {
-   return cdm_raise_delays_work(cmd, into, from->sync.dep[HK_SYNC_VDM].cut);
+   if (cdm_raise_delays_work(cmd, into, from->sync.dep[HK_SYNC_VDM].cut))
+      return true;
+
+   /* If a later render waits on `into` (and not on `from`, which follows it),
+    * merging `from` into `into` would make that render wait for `from` too,
+    * serializing independent compute work such as an AS build ahead of a
+    * G-buffer pass. */
+   if (from->stats.cmds) {
+      list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
+         if (it->type != HK_CS_VDM || it->sync.seq <= from->sync.seq)
+            continue;
+         if (it->sync.dep[HK_SYNC_CDM].cut == into ||
+             it->sync.dep_ta[HK_SYNC_CDM].cut == into)
+            return true;
+      }
+   }
+   return false;
 }
 
 void
@@ -1198,6 +1214,31 @@ hk_sync_end_cs_if_timestamped(struct hk_cmd_buffer *cmd)
    if (cs->timestamp.end.handle || g17p_start) {
       stamp_carrier_launch(cmd);
       hk_cmd_buffer_end_compute(cmd);
+   }
+}
+
+/* Close the open compute stream before recording long independent compute work
+ * (such as acceleration-structure builds) when a graphics barrier already
+ * points at it. Keeping that prefix in its own stream lets the upcoming render
+ * pass wait only for the work before the barrier and overlap the new compute
+ * work. */
+void
+hk_sync_end_cs_if_gfx_waits(struct hk_cmd_buffer *cmd)
+{
+   struct hk_cs *cs = cmd->current_cs.cs;
+   if (!cs || !cs->stats.cmds || cmd->sync.pin_cs ||
+       cmd->sync.brl_transition_active)
+      return;
+
+   const uint8_t gfx_kinds =
+      HK_SYNC_GFX | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG;
+   u_foreach_bit(k, gfx_kinds) {
+      if (cmd->sync.req[k][HK_SYNC_CDM].cut == cs ||
+          (cmd->sync.in_pass &&
+           cmd->sync.pass_req[k][HK_SYNC_CDM].cut == cs)) {
+         hk_cmd_buffer_end_compute(cmd);
+         return;
+      }
    }
 }
 
