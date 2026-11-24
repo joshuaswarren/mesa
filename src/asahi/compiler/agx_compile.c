@@ -10996,6 +10996,15 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       }
    }
 
+   /* Eliminate tautological monotonic bit-insert guards inside <=32-trip loops
+    * so affected loops become straight-line before vectorization and unrolling. */
+   {
+      bool folded_bits = false;
+      NIR_PASS(folded_bits, nir, agx_nir_opt_monotonic_bit_insert);
+      if (folded_bits)
+         agx_optimize_loop_nir(nir, m5, g17p);
+   }
+
    /* Compute shaders defer shared-offset lowering until after
     * nir_lower_mem_access_bit_sizes() and nir_opt_load_store_vectorize() so
     * adjacent byte-addressed shared loads and stores merge into wider vector
