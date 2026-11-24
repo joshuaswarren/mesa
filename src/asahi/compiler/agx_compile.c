@@ -13828,20 +13828,12 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       !ctx->is_preamble;
    if ((agx3_cse || m5_bounded_cse) &&
        !(agx_compiler_debug & AGX_DBG_NOOPT)) {
-      /* AGX3B main programs use the pressure-aware CSE, which merges only
-       * while the earlier result is still live. Uniform source lowering
-       * copies a uniform into a GPR for each operation that cannot read it in
-       * place, so a value used by a run of selects is copied once per select,
-       * and each copy is read right after it is made. On G17P and in M5
-       * main programs, also merge such copies where that keeps the register
-       * pressure within the shader's existing peak. */
-      if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble &&
-          ctx->stage != MESA_SHADER_VERTEX) {
-         if (key->dev.chip == AGX_CHIP_G17P)
-            AGX_PASS(ctx, agx_opt_cse_bounded);
-         else
-            AGX_PASS(ctx, agx_opt_cse_pressure);
-      } else if (m5_bounded_cse) {
+      /* AGX3B and AGX3C main programs use bounded pressure-aware CSE so
+       * uniform-source copies can merge without exceeding the shader's
+       * existing peak register pressure. */
+      if ((key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble &&
+           ctx->stage != MESA_SHADER_VERTEX) ||
+          m5_bounded_cse) {
          AGX_PASS(ctx, agx_opt_cse_bounded);
       } else {
          AGX_PASS(ctx, agx_opt_cse);
@@ -17208,10 +17200,10 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          NIR_PASS(_, nir, nir_opt_dce);
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
-      NIR_PASS(_, nir, agx_nir_opt_canonical_minmax);
+   bool canonical_minmax_progress = false;
+   NIR_PASS(canonical_minmax_progress, nir, agx_nir_opt_canonical_minmax);
+   if (canonical_minmax_progress)
       NIR_PASS(_, nir, nir_opt_dce);
-   }
 
 
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
