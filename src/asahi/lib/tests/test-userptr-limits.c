@@ -35,17 +35,6 @@ main(void)
    assert(!agx_userptr_imports_any_size(false, 64 * GiB, UINT64_MAX));
    assert(agx_userptr_imports_any_size(false, UINT64_MAX, UINT64_MAX));
 
-   /* Refusals by memlock: existing pins plus the range past the limit. */
-   const uint64_t gb6 = 95104204ull; /* 90.7 MiB */
-   assert(agx_userptr_memlock_exceeded(0, gb6, memlock));
-   assert(!agx_userptr_memlock_exceeded(0, 8 * MiB, memlock));
-   assert(agx_userptr_memlock_exceeded(16 * 1024, 8 * MiB, memlock));
-   assert(agx_userptr_memlock_exceeded(9 * MiB, 0, memlock));
-   assert(!agx_userptr_memlock_exceeded(1 * GiB, gb6, client));
-   assert(agx_userptr_memlock_exceeded(client - gb6 + 1, gb6, client));
-   /* Unlimited: never memlock, an ENOMEM is the GPU limits'. */
-   assert(!agx_userptr_memlock_exceeded(UINT64_MAX - 1, 64 * GiB, UINT64_MAX));
-
    printf("ok\n");
    return 0;
 }

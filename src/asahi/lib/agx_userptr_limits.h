@@ -29,8 +29,8 @@
  * limit, else its device limit, else the system's memory): the GPU limit
  * already bounds the client's GEM_USERPTR pins, so memlock refuses an import
  * the GPU limits would take only when other pins of the process use up the
- * difference. Such a refusal is reported as an invalid handle
- * (agx_userptr_memlock_exceeded()).
+ * difference. The ioctl's ENOMEM does not say which limit refused a range
+ * (the GPU limits are checked first), so it stays an out-of-memory error.
  *
  * A capability check is not used: CAP_IPC_LOCK in a user namespace shows in
  * capget() but does not lift the kernel's charge.
@@ -40,17 +40,4 @@ agx_userptr_imports_any_size(bool kernel_no_memlock, uint64_t memlock_B,
                              uint64_t gpu_limit_B)
 {
    return kernel_no_memlock || memlock_B >= gpu_limit_B;
-}
-
-/*
- * Whether a kernel that charges memlock refuses pinning size_B more bytes
- * for that limit, with pinned_B already pinned by the process. An ENOMEM it
- * returns otherwise is the GPU memory limits'.
- */
-static inline bool
-agx_userptr_memlock_exceeded(uint64_t pinned_B, uint64_t size_B,
-                             uint64_t memlock_B)
-{
-   return memlock_B != UINT64_MAX &&
-          (pinned_B > memlock_B || size_B > memlock_B - pinned_B);
 }

@@ -33,7 +33,6 @@
 #include "libagx_shaders.h"
 
 #include <fcntl.h>
-#include <stdio.h>
 #include <sys/resource.h>
 #include <xf86drm.h>
 #include "util/os_misc.h"
@@ -957,34 +956,6 @@ agx_check_userptr_any_size(const struct agx_device *dev)
                                        gpu_limit_B);
 }
 
-/* The process's long-term pinned memory in bytes (VmPin), 0 if unknown. */
-static uint64_t
-agx_pinned_bytes(void)
-{
-   FILE *f = fopen("/proc/self/status", "re");
-   if (!f)
-      return 0;
-
-   char line[128];
-   unsigned long long kib = 0;
-   while (fgets(line, sizeof(line), f)) {
-      if (sscanf(line, "VmPin: %llu kB", &kib) == 1)
-         break;
-   }
-   fclose(f);
-   return (uint64_t)kib * 1024;
-}
-
-bool
-agx_userptr_refused_by_memlock(const struct agx_device *dev, uint64_t size)
-{
-   if (!agx_userptr_charges_memlock(dev))
-      return false;
-
-   /* A failed import leaves VmPin as it was before the ioctl. */
-   return agx_userptr_memlock_exceeded(agx_pinned_bytes(), size,
-                                       agx_memlock_limit());
-}
 
 static int
 agx_submit(struct agx_device *dev, struct drm_asahi_submit *submit,

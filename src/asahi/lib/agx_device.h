@@ -538,18 +538,13 @@ agx_has_host_import(const struct agx_device *dev)
    return agx_has_userptr(dev) && dev->userptr_any_size;
 }
 
-/* The kernel charges GEM_USERPTR pins to RLIMIT_MEMLOCK, so an ENOMEM from an
- * import may be that limit rather than GPU memory. */
+/* The kernel charges GEM_USERPTR pins to RLIMIT_MEMLOCK as well as to the GPU
+ * memory limits (agx_userptr_limits.h). */
 static inline bool
 agx_userptr_charges_memlock(const struct agx_device *dev)
 {
    return !(dev->params.features & DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK);
 }
-
-/* After an ENOMEM from importing size bytes of host memory: whether the
- * caller's RLIMIT_MEMLOCK refused it, rather than the GPU memory limits. */
-bool agx_userptr_refused_by_memlock(const struct agx_device *dev,
-                                    uint64_t size);
 
 /* The kernel can keep a BO resident under memory pressure (GEM_RESIDENCY). */
 static inline bool
