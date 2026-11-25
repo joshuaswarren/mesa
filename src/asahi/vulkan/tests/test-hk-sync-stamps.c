@@ -478,23 +478,20 @@ test_consecutive_stamps_coalesce(void)
             stamp_all(cmd, i);
          T("first stamp ends the dispatch", is_end(d, 0));
 
-         /* With exact priors a stamp on a compute command is ordered
-          * through its compute queue alone (stamp_wait()), so the second
-          * stamp takes a carrier, which the rest copy. */
-         const bool own = cdm_stamp_queue_ordered(chips[c], exact);
-         struct hk_cs *src = own ? last_cs(cmd) : d;
-         const unsigned copies = own ? 3 : 4;
-         T("a run of stamps records at most one carrier",
-           list_length(&cmd->control_streams) == (own ? 2 : 1) &&
-           stamped_streams(cmd) == (own ? 2 : 1));
-         T("the rest are pending copies of the run's last command",
-           cmd->sync.stamp_copy_count == copies &&
-           cmd->sync.stamp_copy_after[HK_SYNC_CDM] == src &&
+         /* Both exact-prior queue-ordered compute stamps and legacy prefix
+          * waits coalesce all five consecutive stamps onto the dispatch with
+          * no extra carrier stream. */
+         T("a run of stamps records no extra carrier",
+           list_length(&cmd->control_streams) == 1 &&
+           stamped_streams(cmd) == 1);
+         T("the rest are pending copies of the dispatch",
+           cmd->sync.stamp_copy_count == 4 &&
+           cmd->sync.stamp_copy_after[HK_SYNC_CDM] == d &&
            !cmd->sync.stamp_copy_after[HK_SYNC_VDM] && !record_count);
          bool sources = true;
-         for (unsigned i = 0; i < copies; ++i) {
-            sources &= copy_is(&cmd->sync.stamp_copies[i], 5 - copies + i,
-                               src->timestamp.end);
+         for (unsigned i = 0; i < 4; ++i) {
+            sources &= copy_is(&cmd->sync.stamp_copies[i], 1 + i,
+                               d->timestamp.end);
          }
          T("each copy reads the stamp it repeats", sources);
 
@@ -502,9 +499,9 @@ test_consecutive_stamps_coalesce(void)
          struct hk_cs *f = last_cs(cmd);
          T("flush launches every copy once",
            record_count == 1 && records[0].cs == f &&
-           records[0].count == copies && !cmd->sync.stamp_copy_count);
+           records[0].count == 4 && !cmd->sync.stamp_copy_count);
          T("flush stream follows the stamp it reads",
-           f->sync.dep[HK_SYNC_CDM].cut == src &&
+           f->sync.dep[HK_SYNC_CDM].cut == d &&
            (f->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP);
          T("flush stream is ended", !cmd->current_cs.cs);
 
