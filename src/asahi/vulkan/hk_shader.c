@@ -5558,16 +5558,19 @@ hk_g18g_keep_lowered(nir_shader **nir, nir_shader *clone, bool lowered)
  * descriptor handle (the indexed sampler route keeps it); it is not an
  * access. */
 static bool
-hk_g18g_has_unlowered_image(nir_shader *nir)
+hk_g18g_has_unlowered_image(nir_shader *nir, bool indexed_reads_ok)
 {
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
                continue;
-            const char *name =
-               nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic]
-                  .name;
+            const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            if (indexed_reads_ok &&
+                (op == nir_intrinsic_bindless_image_load ||
+                 op == nir_intrinsic_bindless_image_sparse_load))
+               continue;
+            const char *name = nir_intrinsic_infos[op].name;
             if ((!strncmp(name, "bindless_image_", 15) &&
                  strcmp(name, "bindless_image_agx")) ||
                 !strncmp(name, "image_deref_", 12))
@@ -5750,7 +5753,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                &nir, c, c && agx_nir_lower_g17p_indexed_samplers(c, g17p));
          }
       }
-      shader->info.g18_unlowered_image = hk_g18g_has_unlowered_image(nir);
+      shader->info.g18_unlowered_image =
+         hk_g18g_has_unlowered_image(nir, shader->info.agx3_indexed_sampler_valid);
    } else if (agx_chip_native_agx3(dev->dev.chip) &&
               nir->info.stage == MESA_SHADER_COMPUTE) {
       /* Descriptor buffers keep only the heap-indexed paths, which never
