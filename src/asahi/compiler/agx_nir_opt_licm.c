@@ -9,6 +9,7 @@
 #include "agx_compiler.h"
 #include "agx_nir.h"
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_worklist.h"
 
 /*
@@ -616,6 +617,175 @@ cf_list_has_loop(struct exec_list *list)
       }
    }
    return false;
+}
+
+static bool
+def_outside_loop(nir_def *def, const nir_loop *loop)
+{
+   for (const nir_cf_node *node = nir_def_block(def)->cf_node.parent; node;
+        node = node->parent) {
+      if (node == &loop->cf_node)
+         return false;
+   }
+   return true;
+}
+
+#define AGX_MAX_REASSOC_EQ_HOISTS_PER_LOOP 4
+
+static bool
+reassociate_eq_in_block(nir_builder *b, nir_block *block,
+                        nir_loop *loop, unsigned *hoisted_in_loop)
+{
+   bool progress = false;
+   nir_block *pre = nir_loop_predecessor_block(loop);
+   const bool top_level = block->cf_node.parent == &loop->cf_node;
+
+   nir_foreach_instr_safe(instr, block) {
+      if (*hoisted_in_loop >= AGX_MAX_REASSOC_EQ_HOISTS_PER_LOOP)
+         break;
+      if (instr->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if ((alu->op != nir_op_ieq && alu->op != nir_op_ine) ||
+          alu->def.num_components != 1)
+         continue;
+
+      const unsigned bit_size = alu->src[0].src.ssa->bit_size;
+      if (bit_size != 16 && bit_size != 32)
+         continue;
+
+      for (unsigned s = 0; s < 2; ++s) {
+         nir_def *lhs = alu->src[s].src.ssa;
+         nir_def *inv = alu->src[1 - s].src.ssa;
+         if (lhs->num_components != 1 || alu->src[s].swizzle[0] != 0 ||
+             inv->num_components != 1 || alu->src[1 - s].swizzle[0] != 0 ||
+             nir_def_is_const(inv) || !def_outside_loop(inv, loop) ||
+             def_outside_loop(lhs, loop) || !list_is_singular(&lhs->uses))
+            continue;
+
+         nir_instr *lhs_instr = nir_def_instr(lhs);
+         if (lhs_instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *add = nir_instr_as_alu(lhs_instr);
+         if (add->op != nir_op_iadd || add->def.num_components != 1 ||
+             add->def.bit_size != bit_size)
+            continue;
+
+         int const_idx = -1;
+         if (nir_src_is_const(add->src[0].src) &&
+             !nir_src_is_const(add->src[1].src))
+            const_idx = 0;
+         else if (nir_src_is_const(add->src[1].src) &&
+                  !nir_src_is_const(add->src[0].src))
+            const_idx = 1;
+         if (const_idx < 0)
+            continue;
+
+         const uint64_t c = nir_src_comp_as_uint(add->src[const_idx].src,
+                                                 add->src[const_idx].swizzle[0]);
+         if (c == 0)
+            continue;
+
+         const uint64_t neg_c =
+            (uint64_t)(-(int64_t)c) & BITFIELD64_MASK(bit_size);
+         /* Top-tested loops place their body after `if (exit) break`, so the
+          * body block does not dominate the loop successor and nir_opt_licm
+          * will not visit it. Integer addition cannot trap and `inv` is
+          * defined outside the loop, so materialize `inv - C` directly in the
+          * preheader for unconditional loop-body blocks (bounded per loop to
+          * keep live-through register demand small). */
+         if (top_level && pre) {
+            b->cursor = nir_after_block_before_jump(pre);
+            (*hoisted_in_loop)++;
+         } else {
+            b->cursor = nir_before_instr(&alu->instr);
+         }
+         nir_def *adj = nir_iadd_imm(b, inv, neg_c);
+
+         nir_src_rewrite(&alu->src[s].src, add->src[1 - const_idx].src.ssa);
+         alu->src[s].swizzle[0] = add->src[1 - const_idx].swizzle[0];
+         nir_src_rewrite(&alu->src[1 - s].src, adj);
+         alu->src[1 - s].swizzle[0] = 0;
+         nir_instr_remove(&add->instr);
+         progress = true;
+         break;
+      }
+   }
+
+   return progress;
+}
+
+static bool
+reassociate_eq_in_cf_list(nir_builder *b, struct exec_list *list,
+                          nir_loop *loop, unsigned *hoisted_in_loop)
+{
+   bool progress = false;
+
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_block:
+         if (loop)
+            progress |= reassociate_eq_in_block(b, nir_cf_node_as_block(node),
+                                                loop, hoisted_in_loop);
+         break;
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= reassociate_eq_in_cf_list(b, &nif->then_list, loop,
+                                               hoisted_in_loop);
+         progress |= reassociate_eq_in_cf_list(b, &nif->else_list, loop,
+                                               hoisted_in_loop);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *inner = nir_cf_node_as_loop(node);
+         unsigned inner_hoists = 0;
+         progress |=
+            reassociate_eq_in_cf_list(b, &inner->body, inner, &inner_hoists);
+         progress |= reassociate_eq_in_cf_list(b, &inner->continue_list, inner,
+                                               &inner_hoists);
+         break;
+      }
+      default:
+         break;
+      }
+   }
+
+   return progress;
+}
+
+/*
+ * Reassociate loop-variant constant-offset equality comparisons against a
+ * loop-invariant value so the constant adjustment becomes loop-invariant:
+ *
+ *    (x + C) == inv  <==>  x == (inv - C)
+ *    (x + C) != inv  <==>  x != (inv - C)
+ *
+ * Modular two's-complement equality holds for all bit patterns with no
+ * overflow preconditions. For unconditional loop-body blocks the pure integer
+ * adjustment `inv - C` is placed directly in the loop preheader (bounded per
+ * loop), since top-tested loop bodies sit after `if (exit) break` and do not
+ * dominate the loop successor visited by nir_opt_licm.
+ */
+bool
+agx_nir_reassociate_loop_invariant_eq(nir_shader *shader)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, shader) {
+      if (impl->function->is_preamble || !cf_list_has_loop(&impl->body))
+         continue;
+
+      nir_builder b = nir_builder_create(impl);
+      unsigned top_hoists = 0;
+      if (reassociate_eq_in_cf_list(&b, &impl->body, NULL, &top_hoists)) {
+         nir_progress(true, impl, nir_metadata_control_flow);
+         progress = true;
+      } else {
+         nir_no_progress(impl);
+      }
+   }
+
+   return progress;
 }
 
 /*

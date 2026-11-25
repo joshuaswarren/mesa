@@ -14656,6 +14656,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       /* After DCE, use counts are right so we can run the optimizer. */
       AGX_PASS(ctx, agx_optimizer_backward);
       AGX_PASS(ctx, agx_optimizer_forward);
+      AGX_PASS(ctx, agx_opt_pack_bool_or_branch);
       AGX_PASS(ctx, agx_opt_compact_constants);
 
       /* After inlining constants, promote what's left */
@@ -18679,6 +18680,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
     * dropping writes to general uniform slots nobody reads anymore.
     */
    if (is_agx3 && form_preamble) {
+      NIR_PASS(post_opt_progress, nir, agx_nir_cancel_preamble_fneg,
+               key->reserved_preamble);
       NIR_PASS(post_opt_progress, nir, agx_nir_remove_unused_preamble_exports,
                key->reserved_preamble);
       NIR_PASS(post_opt_progress, nir, agx_nir_coalesce_preamble_half_exports,
@@ -18759,6 +18762,9 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       if (key->is_helper)
          regs = MIN2(regs, 32);
 
+      if (is_agx3)
+         NIR_PASS(post_opt_progress, nir,
+                  agx_nir_reassociate_loop_invariant_eq);
       NIR_PASS(post_opt_progress, nir, agx_nir_opt_licm, regs, cap_rt_compute);
    }
 

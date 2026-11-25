@@ -693,16 +693,48 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
    }
 }
 
+static bool
+agx_is_bool_invert(const agx_instr *I, agx_index *inner)
+{
+   if (I->op != AGX_OPCODE_BITOP || I->truth_table != UTIL_LUT2(a ^ b) ||
+       I->nr_srcs != 2 || I->nr_dests != 1 || I->dest[0].size != AGX_SIZE_16)
+      return false;
+
+   for (unsigned s = 0; s < 2; ++s) {
+      const agx_index other = I->src[1 - s];
+      if (agx_is_equiv(I->src[s], agx_immediate(1)) &&
+          other.type == AGX_INDEX_NORMAL && other.size == AGX_SIZE_16 &&
+          !other.memory && !other.abs && !other.neg &&
+          agx_channels(other) == 1) {
+         *inner = other;
+         return true;
+      }
+   }
+
+   return false;
+}
+
 /*
- * Fuse not into and/or/xor. Specifically, acts on not and fuses:
+ * Fuse not into and/or/xor, and boolean xor(cmp, #1) into cmp:
  *
- *    not(and(x, y) -> nand(x, y)
- *    not(or(x, y) -> nor(x, y)
- *    not(xor(x, y) -> xnor(x, y)
+ *    not(and(x, y)) -> nand(x, y)
+ *    not(or(x, y)) -> nor(x, y)
+ *    not(xor(x, y)) -> xnor(x, y)
+ *    xor(fcmp/icmp(x, y, c), #1) -> fcmp/icmp(x, y, !c)
  */
 static bool
 agx_optimizer_not(agx_context *ctx, agx_instr *I, agx_instr *use)
 {
+   if ((I->op == AGX_OPCODE_FCMP || I->op == AGX_OPCODE_ICMP) &&
+       I->dest[0].size == AGX_SIZE_16 && !I->dest[0].memory) {
+      agx_index inner;
+      if (agx_is_bool_invert(use, &inner) && inner.value == I->dest[0].value) {
+         I->invert_cond = !I->invert_cond;
+         I->dest[0] = use->dest[0];
+         return true;
+      }
+   }
+
    /* Check for bit op and use of not op */
    if (I->op != AGX_OPCODE_BITOP || use->op != AGX_OPCODE_NOT)
       return false;
@@ -2118,4 +2150,184 @@ agx_optimizer_backward(agx_context *ctx)
 
    free(uses);
    free(multiple);
+}
+
+static bool
+agx_is_plain_h16(agx_index idx)
+{
+   return idx.type == AGX_INDEX_NORMAL && idx.size == AGX_SIZE_16 &&
+          !idx.memory && !idx.abs && !idx.neg && agx_channels(idx) == 1;
+}
+
+/* Match a 16-bit boolean OR node:
+ *   icmpsel(a, #0, b, #nonzero, UEQ)  ==>  (a != 0) || (b != 0)
+ *   bitop(a | b)                      ==>  (a != 0) || (b != 0)
+ */
+static bool
+agx_match_bool_or_node(const agx_instr *I, agx_index *a, agx_index *b)
+{
+   if (I->nr_dests != 1 || !agx_is_plain_h16(I->dest[0]))
+      return false;
+
+   if (I->op == AGX_OPCODE_ICMPSEL && I->icond == AGX_ICOND_UEQ &&
+       !I->saturate && !I->invert_cond &&
+       agx_is_equiv(I->src[1], agx_zero()) &&
+       I->src[3].type == AGX_INDEX_IMMEDIATE && I->src[3].value != 0 &&
+       !I->src[3].abs && !I->src[3].neg &&
+       agx_is_plain_h16(I->src[0]) && agx_is_plain_h16(I->src[2])) {
+      *a = I->src[0];
+      *b = I->src[2];
+      return true;
+   }
+
+   if (I->op == AGX_OPCODE_BITOP && I->truth_table == UTIL_LUT2(a | b) &&
+       agx_is_plain_h16(I->src[0]) && agx_is_plain_h16(I->src[1])) {
+      *a = I->src[0];
+      *b = I->src[1];
+      return true;
+   }
+
+   return false;
+}
+
+/*
+ * Pack a 4-way 16-bit boolean OR-tree feeding if_icmp(x, #0, UEQ) into a
+ * single 32-bit bitwise OR over two collected half pairs:
+ *
+ *    ((c0 != 0) || (c1 != 0) || (c2 != 0) || (c3 != 0))
+ *      <==> (or32(collect(c0, c1), collect(c2, c3)) != 0)
+ *
+ * Replaces three serial 16-bit selects/ORs with one 32-bit OR.
+ */
+void
+agx_opt_pack_bool_or_branch(agx_context *ctx)
+{
+   const unsigned alloc = ctx->alloc;
+   if (!alloc)
+      return;
+
+   agx_instr **defs = calloc(alloc, sizeof(*defs));
+   agx_block **def_blocks = calloc(alloc, sizeof(*def_blocks));
+   uint8_t *use_count = calloc(alloc, sizeof(*use_count));
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         agx_foreach_ssa_dest(I, d) {
+            if (I->dest[d].value < alloc) {
+               defs[I->dest[d].value] = I;
+               def_blocks[I->dest[d].value] = block;
+            }
+         }
+         agx_foreach_ssa_src(I, s) {
+            unsigned v = I->src[s].value;
+            if (v < alloc && use_count[v] < UINT8_MAX)
+               use_count[v]++;
+         }
+      }
+   }
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block_safe(block, I) {
+         if (I->op != AGX_OPCODE_IF_ICMP || I->icond != AGX_ICOND_UEQ ||
+             !agx_is_equiv(I->src[1], agx_zero()) ||
+             !agx_is_plain_h16(I->src[0]) || I->src[0].value >= alloc)
+            continue;
+
+         agx_index leaves[4];
+         agx_instr *internal[3];
+         unsigned nr_leaves = 1;
+         unsigned nr_internal = 0;
+         leaves[0] = I->src[0];
+
+         while (nr_internal < 3) {
+            bool expanded = false;
+            for (unsigned i = 0; i < nr_leaves; ++i) {
+               unsigned v = leaves[i].value;
+               if (v >= alloc || use_count[v] != 1 || def_blocks[v] != block)
+                  continue;
+
+               agx_instr *def = defs[v];
+               agx_index a, b;
+               if (!def || !agx_match_bool_or_node(def, &a, &b))
+                  continue;
+
+               internal[nr_internal++] = def;
+               leaves[i] = a;
+               leaves[nr_leaves++] = b;
+               expanded = true;
+               break;
+            }
+            if (!expanded)
+               break;
+         }
+
+         if (nr_internal != 3 || nr_leaves != 4)
+            continue;
+
+         bool distinct = true;
+         for (unsigned i = 0; i < 4 && distinct; ++i) {
+            for (unsigned j = i + 1; j < 4; ++j) {
+               if (leaves[i].value == leaves[j].value) {
+                  distinct = false;
+                  break;
+               }
+            }
+         }
+         if (!distinct)
+            continue;
+
+         bool leaves_single_use = true;
+         for (unsigned i = 0; i < 4; ++i) {
+            if (leaves[i].value >= alloc || use_count[leaves[i].value] != 1) {
+               leaves_single_use = false;
+               break;
+            }
+         }
+
+         bool has_icmpsel = false;
+         for (unsigned i = 0; i < nr_internal; ++i) {
+            if (internal[i]->op == AGX_OPCODE_ICMPSEL) {
+               has_icmpsel = true;
+               break;
+            }
+         }
+
+         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+         if (leaves_single_use) {
+            /* All 4 leaves die here, so RA coalesces each collect pair cleanly
+             * with zero copies and replaces three serial selects with one
+             * 32-bit OR. */
+            agx_index w0 = agx_temp(ctx, AGX_SIZE_32);
+            agx_instr *c0 = agx_collect_to(&b, w0, 2);
+            c0->src[0] = leaves[0];
+            c0->src[1] = leaves[1];
+
+            agx_index w1 = agx_temp(ctx, AGX_SIZE_32);
+            agx_instr *c1 = agx_collect_to(&b, w1, 2);
+            c1->src[0] = leaves[2];
+            c1->src[1] = leaves[3];
+
+            I->src[0] = agx_or(&b, w0, w1);
+         } else if (has_icmpsel) {
+            /* Leaves remain live into nested branches, so collecting them
+             * would force register copies. Rewrite the serial icmpsel chain
+             * into a balanced 16-bit bitwise OR tree (depth 2, compact 6B
+             * bitops, zero extra copies or GPR pressure). */
+            agx_index lo = agx_or(&b, leaves[0], leaves[1]);
+            agx_index hi = agx_or(&b, leaves[2], leaves[3]);
+            I->src[0] = agx_or(&b, lo, hi);
+         } else {
+            continue;
+         }
+
+         for (unsigned i = 0; i < nr_internal; ++i) {
+            defs[internal[i]->dest[0].value] = NULL;
+            agx_remove_instruction(internal[i]);
+         }
+      }
+   }
+
+   free(defs);
+   free(def_blocks);
+   free(use_count);
 }
