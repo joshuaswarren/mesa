@@ -4057,8 +4057,11 @@ compute_pair_dw_gemm_match(const struct hk_compute_pair_dispatch *dw,
       return false;
    memcpy(&k_i, gemm->push + p->k_offset_B, sizeof(k_i));
    const uint32_t k_step = hk_compute_pair_alt_gemm_k_step(gemm->alt_kind);
+   const bool can_fallback_64x16 =
+      gemm->alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32X16_UNGUARDED &&
+      ((uint32_t)k_i % 16u) == 0 && (gemm->exec_threads[1] & 1u) == 0;
    if (k_i <= 0 || (uint32_t)k_i != (uint32_t)ch ||
-       ((uint32_t)k_i % k_step) != 0)
+       (((uint32_t)k_i % k_step) != 0 && !can_fallback_64x16))
       return false;
 
    struct hk_nir_direct_shape ps = {gemm->push, sizeof(gemm->push)};
@@ -4301,20 +4304,31 @@ compute_pair_gemm_pad4_dw_match(const struct hk_compute_pair_dispatch *gemm,
       return false;
 
    enum hk_compute_pair_alt_kind eff_alt = gemm->alt_kind;
+   const uint32_t orig_tm = hk_compute_pair_alt_gemm_tile_m(eff_alt);
    const uint32_t orig_tn = hk_compute_pair_alt_gemm_tile_n(eff_alt);
-   if (orig_tn == 64 || orig_tn == 48) {
-      if ((n_u % 32u) == 0) {
+   /* tile_n=48 allocates 15.5 KiB shared memory (2 WGs/core), so only select it
+    * for single-K-step (K <= 16) fused GEMM+DW where cutting A re-reads outweighs
+    * higher occupancy; larger K stays on 32/24 (3-4 WGs/core). */
+   if (orig_tm != 64 || orig_tn == 64 || (orig_tn == 48 && k_i > 16)) {
+      if ((n_u % 48u) == 0 && k_i <= 16) {
+         eff_alt = HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED;
+      } else if ((n_u % 32u) == 0) {
          eff_alt = gemm->info.gemm.is_guarded
                       ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED
                       : HK_COMPUTE_PAIR_ALT_GEMM_CMAT32;
       } else if ((n_u % 24u) == 0) {
          eff_alt = HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED;
+      } else if ((n_u % 16u) == 0) {
+         eff_alt = gemm->info.gemm.is_guarded
+                      ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED
+                      : HK_COMPUTE_PAIR_ALT_GEMM_CMAT16;
       } else {
          return false;
       }
    }
    const uint32_t eff_tile_n = hk_compute_pair_alt_gemm_tile_n(eff_alt);
-   if ((eff_tile_n != 16 && eff_tile_n != 24 && eff_tile_n != 32) ||
+   if (hk_compute_pair_alt_gemm_tile_m(eff_alt) != 64u ||
+       (eff_tile_n != 16 && eff_tile_n != 24 && eff_tile_n != 32 && eff_tile_n != 48) ||
        (n_u % eff_tile_n) != 0 || (m_u % 64u) != 0 ||
        n_u / eff_tile_n > 65535u || m_u / 64u > 65535u)
       return false;
@@ -5341,6 +5355,16 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                                              ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED
                                              : HK_COMPUTE_PAIR_ALT_GEMM_CMAT64;
                         }
+                     } else if (eff_alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32X16_UNGUARDED) {
+                        int32_t k_dw = 0;
+                        memcpy(&k_dw, p->push + p->info.gemm.k_offset_B, 4);
+                        if (k_dw > 0 && ((uint32_t)k_dw % 32u) != 0 &&
+                            ((uint32_t)k_dw % 16u) == 0 &&
+                            (p->exec_threads[1] & 1u) == 0) {
+                           eff_alt_kind = p->info.gemm.is_guarded
+                                             ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED
+                                             : HK_COMPUTE_PAIR_ALT_GEMM_CMAT16;
+                        }
                      }
                   }
                }
@@ -5417,6 +5441,9 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   } else if (hk_compute_pair_alt_gemm_tile_m(eff_alt_kind) == 32u &&
                              hk_compute_pair_alt_gemm_tile_m(p->alt_kind) == 64u) {
                      eff_p.exec_threads[1] = p->exec_threads[1] * 2u;
+                  } else if (hk_compute_pair_alt_gemm_tile_m(eff_alt_kind) == 64u &&
+                             hk_compute_pair_alt_gemm_tile_m(p->alt_kind) == 32u) {
+                     eff_p.exec_threads[1] = p->exec_threads[1] / 2u;
                   }
                }
                if (!cand || !hk_fused_compute_shader_eligible(dev, cand, &eff_p))
@@ -6295,6 +6322,9 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                      if (hk_compute_pair_alt_gemm_tile_m(pl->alt_kind_override) == 32u &&
                          hk_compute_pair_alt_gemm_tile_m(p_disp->alt_kind) == 64u) {
                         tmp_disp.exec_threads[1] = p_disp->exec_threads[1] * 2u;
+                     } else if (hk_compute_pair_alt_gemm_tile_m(pl->alt_kind_override) == 64u &&
+                                hk_compute_pair_alt_gemm_tile_m(p_disp->alt_kind) == 32u) {
+                        tmp_disp.exec_threads[1] = p_disp->exec_threads[1] / 2u;
                      }
                   }
                   if (root_ok && pl->im2col_idx_off) {
