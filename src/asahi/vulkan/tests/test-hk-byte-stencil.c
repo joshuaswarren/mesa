@@ -812,6 +812,13 @@ test_rgba8_matcher_builder_and_dispatch(void)
                   assert(tiled->info.shared_size == 0);
                   assert(tiled->info.workgroup_size[0] == (vert ? 16 : 32));
                   assert(tiled->info.workgroup_size[1] == (vert ? 16 : 4));
+                  /* The tiled kernel already batches its taps and pixels. */
+                  nir_foreach_block(block, nir_shader_get_entrypoint(tiled)) {
+                     nir_cf_node *parent = block->cf_node.parent;
+                     if (parent->type == nir_cf_node_loop)
+                        assert(nir_cf_node_as_loop(parent)->control ==
+                               nir_loop_control_dont_unroll);
+                  }
                   ralloc_free(tiled);
                }
             }
