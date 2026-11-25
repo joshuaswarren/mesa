@@ -2447,7 +2447,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                   .resources = cs->g18_compute_resources,
                };
                g18.base.legacy.flags |= DRM_ASAHI_COMPUTE_G18_RESOURCES;
-               g18.resources.version = 1;
+               if (!g18.resources.version)
+                  g18.resources.version = 1;
                struct drm_asahi_cmd_header g18_header = header;
                g18_header.size = sizeof(g18);
                util_dynarray_append(&payload, g18_header);
