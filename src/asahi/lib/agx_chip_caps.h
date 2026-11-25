@@ -147,6 +147,13 @@ enum agx_chip_cap {
     * to order denormals exactly whenever the shader preserves them. Measured
     * on G17P and on M5 (G17S); the M5 parts share one instruction set. */
    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT = 1u << 20,
+
+   /* Command-buffer, root-descriptor, VDM-slab, Ioto-arena, and descriptor-pool
+    * BOs are mapped CPU write-back (AGX_BO_WRITEBACK) when util_has_cache_ops()
+    * is available, cleaned before GPU submission, enabling CPU-cached root
+    * reuse, push-descriptor elision, and direct fragment-root comparisons
+    * without shadow snapshots. Qualified on G17P and M5 (G17G, G17S, G17C). */
+   AGX_CAP_CACHED_CMD_MEMORY = 1u << 21,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -167,7 +174,8 @@ enum agx_chip_cap {
     AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS |    \
     AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN9_2D_COMPRESSION |               \
     AGX_CAP_MOD3_REG_BANK_RA | AGX_CAP_HAL200_LOSSLESS_COMPRESSION |           \
-    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT)
+    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION |                                    \
+    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CACHED_CMD_MEMORY)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
@@ -175,7 +183,8 @@ enum agx_chip_cap {
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
     AGX_CAP_SPARSE_BINDING | AGX_CAP_DESCRIPTOR_BUFFER |                       \
     AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
-    AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT)
+    AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT |         \
+    AGX_CAP_CACHED_CMD_MEMORY)
 
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.

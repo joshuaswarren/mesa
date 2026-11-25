@@ -6281,9 +6281,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * every driver-synthesized root load while trimming unused push-constant,
     * dynamic-buffer and trailing tail bytes. Round up for native
     * uniform/global load granularity. */
-   if (agx_chip_native_hal200(dev->dev.chip))
+   const bool trimmed_root =
+      agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip);
+   if (trimmed_root)
       shader->root_descriptor_size = sizeof(struct hk_root_descriptor_table);
-   if (agx_chip_native_hal200(dev->dev.chip) &&
+   if (trimmed_root &&
        (sw_stage == MESA_SHADER_COMPUTE ||
         sw_stage == MESA_SHADER_FRAGMENT ||
         (sw_stage == MESA_SHADER_VERTEX &&
@@ -11338,7 +11340,9 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
    struct hk_shader_info info;
    blob_copy_bytes(blob, &info, sizeof(info));
    const uint32_t root_descriptor_size =
-      agx_chip_native_hal200(dev->dev.chip) ? blob_read_uint32(blob) : 0;
+      (agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip))
+         ? blob_read_uint32(blob)
+         : 0;
    uint8_t mesh_primitive_comps[64] = {0};
    if (dev->dev.chip == AGX_CHIP_G17P && info.stage == MESA_SHADER_MESH)
       blob_copy_bytes(blob, mesh_primitive_comps, sizeof(mesh_primitive_comps));
@@ -12766,7 +12770,7 @@ hk_shader_serialize(struct vk_device *vk_dev, const struct hk_shader *shader,
 {
    struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
-   if (agx_chip_native_hal200(dev->dev.chip))
+   if (agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip))
       blob_write_uint32(blob, shader->root_descriptor_size);
    if (dev->dev.chip == AGX_CHIP_G17P &&
        shader->info.stage == MESA_SHADER_MESH)

@@ -9,6 +9,7 @@
 
 #include "hk_private.h"
 #include "util/macros.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/lib/agx_device.h"
 #include "util/cache_ops.h"
 
@@ -106,13 +107,14 @@ struct agx_device;
 struct agx_ptr;
 struct hk_device;
 
-/* G17P command-buffer memory (main/USC pools, VDM slabs, Ioto arenas) is
- * CPU-cached; recording cleans what it wrote before submission
- * (hk_cmd_buffer_publish_cached_uploads()). */
+/* Command-buffer memory (main/USC/root pools, VDM slabs, Ioto arenas) is
+ * CPU-cached on chips with AGX_CAP_CACHED_CMD_MEMORY; recording cleans what it
+ * wrote before submission (hk_cmd_buffer_publish_cached_uploads()). */
 static inline bool
 hk_g17p_cached_cmd_memory(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G17P && util_has_cache_ops();
+   return agx_chip_has_cap(dev->chip, AGX_CAP_CACHED_CMD_MEMORY) &&
+          util_has_cache_ops();
 }
 
 struct hk_cmd_pool;
