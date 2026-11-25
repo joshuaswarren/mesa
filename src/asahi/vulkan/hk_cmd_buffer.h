@@ -2071,6 +2071,9 @@ struct hk_uploader {
 
    /* VDM uploader only: low alias of base (its hk_vdm_allocation's alias). */
    uint64_t vdm_alias;
+
+   /* Current backing BO is mapped CPU write-back (AGX_BO_WRITEBACK). */
+   bool cpu_cached;
 };
 
 /*

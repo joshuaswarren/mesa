@@ -60,12 +60,16 @@ fixture(void)
    f->dev.dev.debug = AGX_DBG_PERF;
    f->cmd.vk.base.device = &f->dev.vk;
    f->cmd.vk.base.type = VK_OBJECT_TYPE_COMMAND_BUFFER;
+   list_inithead(&f->cmd.uploader.main.bos);
    f->cmd.uploader.main.map = f->main_map;
    f->cmd.uploader.main.base = 0x100000;
    f->cmd.uploader.main.capacity = HK_CMD_BO_SIZE;
+   f->cmd.uploader.main.cpu_cached = true;
+   list_inithead(&f->cmd.uploader.root.bos);
    f->cmd.uploader.root.map = f->root_map;
    f->cmd.uploader.root.base = 0x200000;
    f->cmd.uploader.root.capacity = HK_CMD_BO_SIZE;
+   f->cmd.uploader.root.cpu_cached = true;
    f->layout.base.type = VK_OBJECT_TYPE_PIPELINE_LAYOUT;
    f->set_layout.vk.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT;
    f->set_layout.vk.dynamic_descriptor_count = 1;
@@ -322,20 +326,162 @@ push_descriptor_and_msaa_correctness(struct fixture *f)
       CHECK(hk_root_dirty(desc) && desc->generation == gen + 1);
       push_layout->non_variable_descriptor_buffer_size = 64;
 
-      /* Non-G17P chips (uncached WC command memory) never read last_cpu_ptr. */
-      const enum agx_chip wc_chips[] = {AGX_CHIP_G13G, AGX_CHIP_G17S};
-      for (unsigned i = 0; i < ARRAY_SIZE(wc_chips); ++i) {
-         f->dev.dev.chip = wc_chips[i];
+      /* Reuse follows the backing command-pool BO cache mode (AGX_BO_WRITEBACK),
+       * not the GPU chip: CPU-cached pool BOs elide on non-G17P chips, while
+       * write-combined (!AGX_BO_WRITEBACK) pool BOs never record last_cpu_ptr
+       * or read mapped memory even on G17P. */
+      {
+         struct hk_cmd_pool mock_pool = {0};
+         mock_pool.vk.base.device = &f->dev.vk;
+         for (enum hk_cmd_bo_type t = 0; t < HK_CMD_BO_TYPE_COUNT; ++t)
+            list_inithead(&mock_pool.free_bos[t]);
+         cmd->vk.pool = &mock_pool.vk;
+
+         uint8_t wb_storage[256] = {0};
+         uint8_t wc_storage[256] = {0};
+         struct agx_bo wb_agx_bo = {.flags = AGX_BO_WRITEBACK};
+         struct agx_bo wc_agx_bo = {.flags = 0};
+         struct hk_cmd_bo wb_bo = {
+            .bo = &wb_agx_bo,
+            .map = wb_storage,
+            .addr = 0x1000000,
+            .size = sizeof(wb_storage),
+         };
+         struct hk_cmd_bo wc_bo = {
+            .bo = &wc_agx_bo,
+            .map = wc_storage,
+            .addr = 0x2000000,
+            .size = sizeof(wc_storage),
+         };
+
+         const struct hk_uploader saved_main = cmd->uploader.main;
+
+         /* Non-G17P chips with an AGX_BO_WRITEBACK command-pool BO elide. */
+         const enum agx_chip other_chips[] = {AGX_CHIP_G13G, AGX_CHIP_G17S};
+         for (unsigned i = 0; i < ARRAY_SIZE(other_chips); ++i) {
+            f->dev.dev.chip = other_chips[i];
+            hk_push_descriptor_set_reset_upload(push);
+            desc->root.sets[0] = 0;
+            list_inithead(&cmd->uploader.main.bos);
+            cmd->uploader.main.map = NULL;
+            cmd->uploader.main.base = 0;
+            cmd->uploader.main.offset = 0;
+            cmd->uploader.main.capacity = 0;
+            cmd->uploader.main.cpu_cached = false;
+            list_addtail(&wb_bo.link, &mock_pool.free_bos[HK_CMD_BO_MAIN]);
+            mock_pool.num_free_bos[HK_CMD_BO_MAIN] = 1;
+
+            hk_root_mark_clean(desc);
+            gen = desc->generation;
+            hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd),
+                                        &push_info);
+            hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+            const uint64_t wb_addr = desc->root.sets[0];
+            const uint32_t wb_off = cmd->uploader.main.offset;
+            CHECK(wb_addr == wb_bo.addr && cmd->uploader.main.cpu_cached);
+            CHECK(push->last_gpu_addr == wb_addr &&
+                  push->last_cpu_ptr == wb_bo.map && push->last_size == 64);
+            CHECK(hk_root_dirty(desc) && desc->generation == gen + 1);
+
+            hk_root_mark_clean(desc);
+            gen = desc->generation;
+            hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd),
+                                        &push_info);
+            hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+            CHECK(desc->root.sets[0] == wb_addr &&
+                  cmd->uploader.main.offset == wb_off);
+            CHECK(!hk_root_dirty(desc) && desc->generation == gen);
+            list_del(&wb_bo.link);
+         }
+
+         /* Write-combined (!AGX_BO_WRITEBACK) pool BOs never read mapped
+          * memory on either G17P or non-G17P chips. */
+         const enum agx_chip wc_chips[] = {
+            AGX_CHIP_G17P, AGX_CHIP_G13G, AGX_CHIP_G17S,
+         };
+         for (unsigned i = 0; i < ARRAY_SIZE(wc_chips); ++i) {
+            f->dev.dev.chip = wc_chips[i];
+            hk_push_descriptor_set_reset_upload(push);
+            list_inithead(&cmd->uploader.main.bos);
+            cmd->uploader.main.map = NULL;
+            cmd->uploader.main.base = 0;
+            cmd->uploader.main.offset = 0;
+            cmd->uploader.main.capacity = 0;
+            cmd->uploader.main.cpu_cached = true;
+            list_addtail(&wc_bo.link, &mock_pool.free_bos[HK_CMD_BO_MAIN]);
+            mock_pool.num_free_bos[HK_CMD_BO_MAIN] = 1;
+
+            hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd),
+                                        &push_info);
+            hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+            const uint64_t wc_addr1 = desc->root.sets[0];
+            CHECK(wc_addr1 == wc_bo.addr && !cmd->uploader.main.cpu_cached);
+            CHECK(push->last_gpu_addr == 0 && push->last_cpu_ptr == NULL &&
+                  push->last_size == 0);
+
+            hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd),
+                                        &push_info);
+            hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+            CHECK(desc->root.sets[0] != wc_addr1 &&
+                  push->last_gpu_addr == 0 && push->last_cpu_ptr == NULL &&
+                  push->last_size == 0);
+            list_del(&wc_bo.link);
+         }
+
+         /* Slow-path BO burn without replacing the current uploader must use
+          * the returned BO's cache mode, not the retained uploader's. */
+         f->dev.dev.chip = AGX_CHIP_G17P;
+         hk_push_descriptor_set_reset_upload(push);
+         list_inithead(&cmd->uploader.main.bos);
+         cmd->uploader.main.map = wb_storage;
+         cmd->uploader.main.base = 0x1000000;
+         cmd->uploader.main.capacity = 256;
+         cmd->uploader.main.offset = 200; /* 56 B left < 64 B push set */
+         cmd->uploader.main.cpu_cached = true;
+         wc_bo.size = 100; /* 100 - 64 = 36 <= 56: old cached BO stays current */
+         list_addtail(&wc_bo.link, &mock_pool.free_bos[HK_CMD_BO_MAIN]);
+         mock_pool.num_free_bos[HK_CMD_BO_MAIN] = 1;
          hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
          hk_cmd_buffer_flush_push_descriptors(cmd, desc);
-         const uint64_t wc_addr1 = desc->root.sets[0];
-         CHECK(wc_addr1 != 0 && push->last_gpu_addr == 0 &&
-               push->last_cpu_ptr == NULL && push->last_size == 0);
+         CHECK(desc->root.sets[0] == wc_bo.addr &&
+               cmd->uploader.main.map == wb_storage &&
+               cmd->uploader.main.cpu_cached);
+         CHECK(push->last_gpu_addr == 0 && push->last_cpu_ptr == NULL &&
+               push->last_size == 0);
+         list_del(&wc_bo.link);
+
+         /* Inverse: current uploader is WC, burned BO is AGX_BO_WRITEBACK. */
+         hk_push_descriptor_set_reset_upload(push);
+         list_inithead(&cmd->uploader.main.bos);
+         cmd->uploader.main.map = wc_storage;
+         cmd->uploader.main.base = 0x2000000;
+         cmd->uploader.main.capacity = 256;
+         cmd->uploader.main.offset = 200;
+         cmd->uploader.main.cpu_cached = false;
+         wb_bo.size = 100;
+         list_addtail(&wb_bo.link, &mock_pool.free_bos[HK_CMD_BO_MAIN]);
+         mock_pool.num_free_bos[HK_CMD_BO_MAIN] = 1;
          hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
          hk_cmd_buffer_flush_push_descriptors(cmd, desc);
-         CHECK(desc->root.sets[0] != wc_addr1 && push->last_cpu_ptr == NULL);
+         CHECK(desc->root.sets[0] == wb_bo.addr &&
+               cmd->uploader.main.map == wc_storage &&
+               !cmd->uploader.main.cpu_cached);
+         CHECK(push->last_gpu_addr == wb_bo.addr &&
+               push->last_cpu_ptr == wb_bo.map && push->last_size == 64);
+         hk_root_mark_clean(desc);
+         gen = desc->generation;
+         hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);
+         hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+         CHECK(desc->root.sets[0] == wb_bo.addr &&
+               !hk_root_dirty(desc) && desc->generation == gen);
+         list_del(&wb_bo.link);
+
+         cmd->vk.pool = NULL;
+         cmd->uploader.main = saved_main;
+         list_inithead(&cmd->uploader.main.bos);
+         hk_push_descriptor_set_reset_upload(push);
+         f->dev.dev.chip = AGX_CHIP_G17P;
       }
-      f->dev.dev.chip = AGX_CHIP_G17P;
 
       /* Binding a regular descriptor set resets the push upload snapshot. */
       hk_CmdPushDescriptorSet2KHR(hk_cmd_buffer_to_handle(cmd), &push_info);

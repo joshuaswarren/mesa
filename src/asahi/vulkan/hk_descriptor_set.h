@@ -163,7 +163,9 @@ struct hk_push_descriptor_set {
    /* Bytes of data the last update's layout uses */
    uint32_t size;
    /* Snapshot of the last pool upload for this push set in this command
-    * buffer; reused when a subsequent flush sees identical bytes. */
+    * buffer; populated only when backed by CPU-cached (AGX_BO_WRITEBACK)
+    * command memory so a subsequent flush can compare bytes without reading
+    * write-combined mappings. */
    uint64_t last_gpu_addr;
    const void *last_cpu_ptr;
    uint32_t last_size;

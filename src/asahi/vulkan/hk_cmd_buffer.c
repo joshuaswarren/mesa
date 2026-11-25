@@ -450,23 +450,28 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    cmd->uploader.main.base = 0;
    cmd->uploader.main.offset = 0;
    cmd->uploader.main.capacity = 0;
+   cmd->uploader.main.cpu_cached = false;
    cmd->uploader.usc.map = NULL;
    cmd->uploader.usc.base = 0;
    cmd->uploader.usc.offset = 0;
    cmd->uploader.usc.capacity = 0;
+   cmd->uploader.usc.cpu_cached = false;
    cmd->uploader.root.map = NULL;
    cmd->uploader.root.base = 0;
    cmd->uploader.root.offset = 0;
    cmd->uploader.root.capacity = 0;
+   cmd->uploader.root.cpu_cached = false;
    cmd->uploader.vdm.map = NULL;
    cmd->uploader.vdm.base = 0;
    cmd->uploader.vdm.offset = 0;
    cmd->uploader.vdm.capacity = 0;
    cmd->uploader.vdm.vdm_alias = 0;
+   cmd->uploader.vdm.cpu_cached = false;
    cmd->uploader.streams.map = NULL;
    cmd->uploader.streams.base = 0;
    cmd->uploader.streams.offset = 0;
    cmd->uploader.streams.capacity = 0;
+   cmd->uploader.streams.cpu_cached = false;
 
    cmd->current_cs.gfx = NULL;
    cmd->current_cs.cs = NULL;
@@ -594,12 +599,16 @@ hk_cmd_buffer_alloc_bo(struct hk_cmd_buffer *cmd,
    return VK_SUCCESS;
 }
 
-struct agx_ptr
-hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
-                        struct hk_uploader *uploader, uint32_t size,
-                        uint32_t alignment, enum hk_cmd_bo_type type)
+static struct agx_ptr
+hk_pool_alloc_from_slow_cached(struct hk_cmd_buffer *cmd,
+                               struct hk_uploader *uploader, uint32_t size,
+                               uint32_t alignment, enum hk_cmd_bo_type type,
+                               bool *cpu_cached_out)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (cpu_cached_out)
+      *cpu_cached_out = false;
 
    /* Specially handle large allocations owned by the command buffer, e.g. used
     * for statically allocated vertex output buffers with geometry shaders.
@@ -632,6 +641,8 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
          return (struct agx_ptr){0};
       }
       *slot = bo;
+      if (cpu_cached_out)
+         *cpu_cached_out = (bo->flags & AGX_BO_WRITEBACK) != 0;
       return (struct agx_ptr){
          .gpu = bo->va->addr,
          .cpu = cpu,
@@ -646,6 +657,8 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
    if (uploader->map != NULL && offset <= uploader->capacity &&
        size <= uploader->capacity - offset) {
       uploader->offset = offset + size;
+      if (cpu_cached_out)
+         *cpu_cached_out = uploader->cpu_cached;
 
       return (struct agx_ptr){
          .gpu = uploader->base + offset,
@@ -662,6 +675,8 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
    bo->stream_only = type == HK_CMD_BO_MAIN &&
                      uploader == &cmd->uploader.streams;
 
+   const bool bo_cpu_cached = bo->bo && (bo->bo->flags & AGX_BO_WRITEBACK);
+
    /* Pick whichever of the current upload BO and the new BO will have more
     * room left to be the BO for the next upload.  If our upload size is
     * bigger than the old offset, we're better off burning the whole new
@@ -674,12 +689,46 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
       uploader->base = bo->addr;
       uploader->offset = size;
       uploader->capacity = bo->size;
+      uploader->cpu_cached = bo_cpu_cached;
    }
+
+   if (cpu_cached_out)
+      *cpu_cached_out = bo_cpu_cached;
 
    return (struct agx_ptr){
       .gpu = bo->addr,
       .cpu = bo->map,
    };
+}
+
+struct agx_ptr
+hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
+                        struct hk_uploader *uploader, uint32_t size,
+                        uint32_t alignment, enum hk_cmd_bo_type type)
+{
+   return hk_pool_alloc_from_slow_cached(cmd, uploader, size, alignment, type,
+                                         NULL);
+}
+
+static inline struct agx_ptr
+hk_pool_alloc_cached(struct hk_cmd_buffer *cmd, uint32_t size,
+                     uint32_t alignment, bool *cpu_cached_out)
+{
+   struct hk_uploader *uploader = &cmd->uploader.main;
+   assert(alignment > 0);
+   const uint32_t offset = align(uploader->offset, alignment);
+   if (likely(uploader->map != NULL && offset <= uploader->capacity &&
+              size <= uploader->capacity - offset)) {
+      uploader->offset = offset + size;
+      *cpu_cached_out = uploader->cpu_cached;
+      return (struct agx_ptr){
+         .gpu = uploader->base + offset,
+         .cpu = uploader->map + offset,
+      };
+   }
+
+   return hk_pool_alloc_from_slow_cached(cmd, uploader, size, alignment,
+                                         HK_CMD_BO_MAIN, cpu_cached_out);
 }
 
 static __attribute__((hot)) struct agx_ptr
@@ -2096,8 +2145,6 @@ void
 hk_cmd_buffer_flush_push_descriptors(struct hk_cmd_buffer *cmd,
                                      struct hk_descriptor_state *desc)
 {
-   const bool can_reuse =
-      hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev);
    bool root_changed = false;
 
    u_foreach_bit(set_idx, desc->push_dirty) {
@@ -2108,19 +2155,21 @@ hk_cmd_buffer_flush_push_descriptors(struct hk_cmd_buffer *cmd,
       const uint32_t size = MAX2(push_set->size, HK_MIN_UBO_ALIGNMENT);
       uint64_t push_set_addr;
 
-      /* Reading back uploaded pool memory is only fast when HK_CMD_BO_MAIN is
-       * CPU-cached (AGX_BO_WRITEBACK); on uncached WC command memory, re-upload
-       * instead of reading WC pages or keeping a duplicate 10 KiB shadow. */
-      if (can_reuse && push_set->last_gpu_addr && push_set->last_cpu_ptr &&
+      /* last_cpu_ptr is only populated when the backing command-pool allocation
+       * is mapped CPU write-back (AGX_BO_WRITEBACK); write-combined allocations
+       * leave it NULL so this path never reads back WC pages or keeps a
+       * duplicate 10 KiB shadow copy. */
+      if (push_set->last_gpu_addr && push_set->last_cpu_ptr &&
           push_set->last_size == size &&
           memcmp(push_set->last_cpu_ptr, push_set->data, size) == 0) {
          push_set_addr = push_set->last_gpu_addr;
       } else {
+         bool cpu_cached = false;
          struct agx_ptr uploaded =
-            hk_pool_alloc(cmd, size, HK_MIN_UBO_ALIGNMENT);
+            hk_pool_alloc_cached(cmd, size, HK_MIN_UBO_ALIGNMENT, &cpu_cached);
          if (likely(uploaded.cpu != NULL)) {
             memcpy(uploaded.cpu, push_set->data, size);
-            if (can_reuse) {
+            if (cpu_cached) {
                push_set->last_gpu_addr = uploaded.gpu;
                push_set->last_cpu_ptr = uploaded.cpu;
                push_set->last_size = size;
