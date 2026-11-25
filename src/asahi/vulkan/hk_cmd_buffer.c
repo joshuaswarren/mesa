@@ -1102,7 +1102,14 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_flush_deferred_clears(cmd);
    hk_sync_flush_stamp_copies(cmd);
    hk_sync_flush_pending_timestamp(cmd);
+
+   /* A barrier declared with no following launch in this command buffer
+    * still orders this buffer's writes against whatever runs next (the
+    * queue's next submission). The closing compute stream lands it on its
+    * trailing edge (hk_cdm_end_stream_flush); with no open stream there is
+    * no local work to order and the flag is simply cleared. */
    hk_cmd_buffer_end_compute(cmd);
+   cmd->state.cs.cdm_barrier_pending = false;
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
    hk_resolve_deferred_oq_available(cmd);
 
@@ -1423,7 +1430,25 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    /* M5 records its barriers with the native dependency tracker. */
    if (!agx_chip_native_or_m5(dev->dev.chip)) {
-      hk_cmd_buffer_end_compute(cmd);
+      /* The app declared a memory dependency: the next CDM launch carries
+       * the full barrier set (hk_cmd_dispatch.c). Launches before the
+       * barrier were already flushed by the previous launch's gating. */
+      const bool track = !HK_PERF(dev, ALWAYSCDMBARRIER);
+      if (track)
+         cmd->state.cs.cdm_barrier_pending = true;
+
+      /* Outside a render pass only a CDM control stream can be open; the
+       * pending flag orders it against the next launch. Ending the compute
+       * batch here would only produce the stream merge_control_streams
+       * stitches back together at hk_EndCommandBuffer, plus a stream link
+       * and a fresh chunk per barrier; keep it open. The batch must end
+       * when a graphics batch is open: the dependency then spans batch
+       * types and the kernel orders the resulting commands. */
+      const bool gfx_open = cmd->current_cs.gfx ||
+                            cmd->current_cs.pre_gfx ||
+                            cmd->current_cs.post_gfx;
+      if (!track || gfx_open)
+         hk_cmd_buffer_end_compute(cmd);
       hk_cmd_buffer_end_graphics(cmd);
       /* Preserve the same conservative ordering in the shared submit graph,
        * including kernels that advertise exact prior barriers on AGX2. */
@@ -4940,6 +4965,14 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    hk_dispatch_with_usc_launch(dev, cs, prog->b.launch,
                                agx_usc_addr(&dev->dev, t.gpu), grid,
                                prog->b.workgroup);
+
+   /* Internal helpers communicate through memory with their consumer. Match
+    * the AGX2 flush-after-launch contract when the caller requests the
+    * common all-memory barrier (as hk_dispatch_precomp_g17p does). */
+   if (barrier & AGX_BARRIER_ALL) {
+      hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
+      hk_cdm_cache_flush(dev, cs);
+   }
 }
 
 uint64_t
