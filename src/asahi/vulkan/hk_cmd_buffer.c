@@ -1597,20 +1597,21 @@ hk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
 
 }
 
-/* Only ordinary G17P graphics programs whose descriptor values are fetched
- * through the root/table in GPU memory qualify.  CPU-decoded combined sampler
- * programs and variant selection retain the existing publication path.
+/* Only ordinary graphics programs whose descriptor values are fetched through
+ * the root/table in GPU memory qualify.  CPU-decoded combined sampler programs
+ * and variant selection retain the existing publication path.
  */
 static bool
-hk_g17p_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
-                                  const struct hk_descriptor_state *desc)
+hk_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
+                              const struct hk_descriptor_state *desc)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   if (!agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) ||
-       desc != &gfx->descriptors ||
+   if (desc != &gfx->descriptors ||
        gfx->shaders[MESA_SHADER_GEOMETRY] ||
        gfx->shaders[MESA_SHADER_TESS_CTRL] ||
-       gfx->shaders[MESA_SHADER_TESS_EVAL])
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_MESH] ||
+       gfx->shaders[MESA_SHADER_TASK])
       return false;
 
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
@@ -1712,7 +1713,7 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
    desc->dynamic_buffer_end = MAX2(desc->dynamic_buffer_end, dyn_buffer_start);
 
    hk_upload_stat(cmd, descriptor_binds, 1);
-   const bool retain_root = hk_g17p_can_retain_descriptor_root(cmd, desc);
+   const bool retain_root = hk_can_retain_descriptor_root(cmd, desc);
    if (!root_changed && !binding_changed && retain_root) {
       hk_upload_stat(cmd, descriptor_noops, 1);
       return;

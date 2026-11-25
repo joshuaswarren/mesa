@@ -286,6 +286,26 @@ reuse_correctness(struct fixture *f)
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) != root);
    f->dev.dev.printf_buffer_address = 0;
 
+   /* Redundant graphics descriptor binds retain the uploaded root across all
+    * GPU generations, not only native AGX3. */
+   const enum agx_chip retain_chips[] = {
+      AGX_CHIP_G13G, AGX_CHIP_G14G, AGX_CHIP_G16G,
+      AGX_CHIP_G17P, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(retain_chips); ++i) {
+      f->dev.dev.chip = retain_chips[i];
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      const uint64_t gen = desc->generation;
+      hk_root_mark_clean(desc);
+      desc->sets_dirty = 0;
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(desc->generation == gen && !hk_root_dirty(desc) && !desc->sets_dirty);
+      bind(f, 64, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(desc->generation == gen + 1 && hk_root_dirty(desc));
+   }
+   f->dev.dev.chip = AGX_CHIP_G17P;
+   bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+
    /* CPU-decoded descriptors deliberately keep their publication path. */
    f->fs_api->variants[0].info.agx3_combined_sampler_valid = true;
    root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
