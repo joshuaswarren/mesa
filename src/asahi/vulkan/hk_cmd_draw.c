@@ -58,6 +58,7 @@
 #include "asahi/lib/agx_m5_va.h"
 #include "hk_shader.h"
 #include "hk_partial_mrt_hsr.h"
+#include "hk_pass_merge.h"
 #include "hk_native_write_class.h"
 #include "hk_g17p_patch.h"
 #include "util/disk_cache.h"
@@ -4006,8 +4007,10 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
    const unsigned samples = render->tilebuffer.nr_samples;
    const bool msaa = samples > 1;
-   const bool msaa_enabled = msaa && agx_chip_g17_m5(dev->dev.chip) &&
-      (samples == 2 || samples == 4);
+   const bool msaa_enabled =
+      msaa && hk_msaa_pass_merge_supported(dev->dev.chip, dev->dev.params.chip_id,
+                                           samples,
+                                           render->tilebuffer.sample_size_B);
 
    /* The instance is one ordinary render stream with draws, with no
     * pre/post-graphics streams, heap use or timestamps attached. */
@@ -4170,7 +4173,7 @@ hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
     * instance would load. */
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
    if (transition && image &&
-       agx_chip_g17p_or_m5(chip) &&
+       hk_pass_merge_layout_proof_supported(chip) &&
        !hk_m5_image_is_attachment(&m->render, image) &&
        !(image->create_flags & (VK_IMAGE_CREATE_ALIAS_BIT |
                                 VK_IMAGE_CREATE_SPARSE_BINDING_BIT)))
@@ -4314,7 +4317,7 @@ hk_m5_attachments_exclude_descriptors(const struct hk_cmd_buffer *cmd,
                                       const VkRenderingInfo *info)
 {
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
-   if (!agx_chip_g17p_or_m5(chip))
+   if (!hk_pass_merge_layout_proof_supported(chip))
       return false;
 
    const VkRenderingAttachmentInfo *ds[] = {info->pDepthAttachment,

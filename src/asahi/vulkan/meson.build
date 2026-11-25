@@ -223,6 +223,15 @@ if with_tests
     ),
     suite : ['asahi'],
   )
+  test(
+    'hk_pass_merge',
+    executable(
+      'hk_pass_merge_test',
+      files('tests/test-hk-pass-merge.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src],
+    ),
+    suite : ['asahi'],
+  )
 
   test(
     'hk_gen1_query_state',
