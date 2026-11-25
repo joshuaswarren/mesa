@@ -30,8 +30,11 @@
  * vkCmdClearAttachments writes every layer, or with `layer0` only layer 0,
  * which leaves the other layers without any geometry.
  *
+ * With rgba8, 4 samples and write=rounding, compare the hardware resolve and
+ * the shader fallback to a CPU byte average (discard-mask 1 and 0).
+ *
  *   vulkan-msaa-mrt [formats=rgba8,r11g11b10f,none] [attachments=3] [samples=4]
- *                   [pass2=load|clear] [write=clear|layer0|draw|a2c|none] [layers=1] [discard-mask=0]
+ *                   [pass2=load|clear] [write=clear|layer0|draw|a2c|rounding|none] [layers=1] [discard-mask=0]
  *   formats: one name repeated `attachments` times, or a comma-separated list
  *   with one name per attachment ("none" = VK_NULL_HANDLE view):
  *   rgba16f rgba8 rg16f r32f rg32f rgba32f rgb10a2 bgr10a2 r11g11b10f r8 rg8
@@ -180,6 +183,22 @@ colour(unsigned att, unsigned pass)
    return c;
 }
 
+/* Three samples keep the clear value and the fourth gets the draw value.
+ * Exercise both sides of a tie and ties with odd and even lower bytes. */
+static VkClearColorValue
+rounding_colour(unsigned phase)
+{
+   static const uint8_t clear[4] = {165, 164, 46, 20};
+   static const uint8_t draw[4] = {255, 254, 47, 23};
+   VkClearColorValue c;
+   for (unsigned i = 0; i < 4; i++) {
+      unsigned resolved = (3u * clear[i] + draw[i] + 2) / 4;
+      const unsigned values[] = {clear[i], draw[i], resolved};
+      c.float32[i] = values[phase] / 255.0f;
+   }
+   return c;
+}
+
 static VkShaderModule
 make_module(const uint32_t *code, size_t size)
 {
@@ -192,7 +211,7 @@ make_module(const uint32_t *code, size_t size)
 
 static VkPipeline
 make_pipeline(const VkFormat *fmt, unsigned count, unsigned samples, bool a2c,
-              VkPipelineLayout *layout)
+              const VkSampleMask *mask, VkPipelineLayout *layout)
 {
    VkPushConstantRange pcr = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8 * 16};
    VkPipelineLayoutCreateInfo lci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -224,7 +243,7 @@ make_pipeline(const VkFormat *fmt, unsigned count, unsigned samples, bool a2c,
       .lineWidth = 1.0f};
    VkPipelineMultisampleStateCreateInfo ms = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-      .rasterizationSamples = samples, .alphaToCoverageEnable = a2c};
+      .rasterizationSamples = samples, .alphaToCoverageEnable = a2c, .pSampleMask = mask};
    VkPipelineColorBlendAttachmentState blend[MAX_ATT];
    for (unsigned i = 0; i < count; i++)
       blend[i] = (VkPipelineColorBlendAttachmentState){.colorWriteMask = 0xf};
@@ -253,7 +272,8 @@ main(int argc, char **argv)
    unsigned samples = argc > 3 ? atoi(argv[3]) : 4;
    bool pass2_load = !(argc > 4 && !strcmp(argv[4], "clear"));
    const char *write = argc > 5 ? argv[5] : "clear";
-   const bool draw = !strcmp(write, "draw") || !strcmp(write, "a2c");
+   const bool rounding = !strcmp(write, "rounding");
+   const bool draw = !strcmp(write, "draw") || !strcmp(write, "a2c") || rounding;
    const bool none = !strcmp(write, "none");
    const bool layer0 = !strcmp(write, "layer0");
    layers = argc > 6 ? atoi(argv[6]) : 1;
@@ -278,10 +298,11 @@ main(int argc, char **argv)
    }
    if (listed > 1)
       count = listed;
-   if (!listed || !count || count > MAX_ATT) {
+   if (!listed || !count || count > MAX_ATT ||
+       (rounding && (count != 1 || fmt[0] != VK_FORMAT_R8G8B8A8_UNORM || samples != 4))) {
    usage:
       fprintf(stderr, "usage: %s [format[,format...]] [attachments<=8] [samples] [load|clear] "
-                      "[clear|layer0|draw|a2c|none] [layers (not draw|a2c)] [discard-mask]\n",
+                      "[clear|layer0|draw|a2c|rounding|none] [layers (not draw|a2c)] [discard-mask]\n",
               argv[0]);
       return 2;
    }
@@ -328,7 +349,7 @@ main(int argc, char **argv)
 
    VkPipelineLayout layout = VK_NULL_HANDLE;
    VkPipeline pipeline = draw ? make_pipeline(fmt, count, samples,
-                                              !strcmp(write, "a2c"), &layout)
+                                              !strcmp(write, "a2c"), rounding ? &(VkSampleMask){0x8} : NULL, &layout)
                               : VK_NULL_HANDLE;
 
    VkImage ms[MAX_ATT], res[MAX_ATT], ref[MAX_ATT];
@@ -378,7 +399,7 @@ main(int argc, char **argv)
    for (unsigned i = 0; i < count; i++) {
       if (!fmt[i])
          continue;
-      VkClearColorValue c = colour(i, 0);
+      VkClearColorValue c = rounding ? rounding_colour(0) : colour(i, 0);
       VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
       vkCmdClearColorImage(cb, ref[i], VK_IMAGE_LAYOUT_GENERAL, &c, 1, &range);
    }
@@ -398,7 +419,7 @@ main(int argc, char **argv)
             .loadOp = pass && pass2_load ? VK_ATTACHMENT_LOAD_OP_LOAD
                                          : VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue.color = colour(i, 0),
+            .clearValue.color = rounding ? rounding_colour(0) : colour(i, 0),
          };
          /* A single-sample pass has nothing to resolve: read it back. */
          if (pass && fmt[i] && samples > 1) {
@@ -414,7 +435,7 @@ main(int argc, char **argv)
       if (pass && draw) {
          VkClearColorValue pc[8] = {0};
          for (unsigned i = 0; i < count; i++)
-            pc[i] = colour(i, 1);
+            pc[i] = rounding ? rounding_colour(1) : colour(i, 1);
          vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
          vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                             sizeof(pc), pc);
@@ -448,7 +469,7 @@ main(int argc, char **argv)
       VkClearAttachment ca[MAX_ATT];
       for (unsigned i = 0; i < count; i++)
          ca[i] = (VkClearAttachment){VK_IMAGE_ASPECT_COLOR_BIT, i,
-                                     {.color = colour(i, 1)}};
+                                     {.color = rounding ? rounding_colour(2) : colour(i, 1)}};
       VkClearRect rect = {WRITE_RECT, 0, layer0 ? 1 : layers};
       vkCmdClearAttachments(cb, count, ca, 1, &rect);
       vkCmdEndRendering(cb);

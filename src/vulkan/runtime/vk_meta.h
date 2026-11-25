@@ -132,6 +132,8 @@ struct vk_meta_device {
     */
    bool use_combined_blit_descriptors;
    bool use_masked_rgba8_buffer_unpack;
+   /* Match fixed-function RGBA8 4x average resolves that round half up. */
+   bool resolve_rgba8_4x_half_up;
    /* A driver without layered rendering may split a 3D graphics copy into
     * one attachment view per destination Z slice.  The fragment Layer value
     * is then relative to that view, so it must not be rebased by the absolute
