@@ -380,9 +380,9 @@ TEST(AGX3VisionOpts, GuardSelectedLoadsWrapsReadonlyAndRefusesWritable)
          readonly ? (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER)
                   : (enum gl_access_qualifier)0;
       nir_def *n0 = nir_load_agx(&b, 1, 32, base_ptr, nir_iadd_imm(&b, idx, -1),
-                                 .format = PIPE_FORMAT_R32_UINT, .access = acc);
+                                 .access = acc, .format = PIPE_FORMAT_R32_UINT);
       nir_def *n1 = nir_load_agx(&b, 1, 32, base_ptr, nir_iadd_imm(&b, idx, 1),
-                                 .format = PIPE_FORMAT_R32_UINT, .access = acc);
+                                 .access = acc, .format = PIPE_FORMAT_R32_UINT);
       nir_def *c0 = nir_uge(&b, center, n0);
       nir_def *c1 = nir_uge(&b, center, n1);
       nir_def *zero = nir_imm_int(&b, 0);
