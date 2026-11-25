@@ -22,6 +22,7 @@ struct ctx {
    struct agx_tilebuffer_layout *tib;
    uint8_t *colormasks;
    bool *translucent;
+   bool translucent_other;
    unsigned bindless_base;
    bool any_memory_stores;
    uint8_t outputs_written;
@@ -29,6 +30,7 @@ struct ctx {
    bool preserve_zero_mask;
    bool lower_srgb;
    bool lower_r11g11b10;
+   bool ms_whole_sample;
    bool lower_g17p_formats;
    bool x_alpha_one;
 };
@@ -117,8 +119,10 @@ load_tilebuffer(nir_builder *b, struct ctx *ctx,
                           format == PIPE_FORMAT_R16_UINT &&
                           util_format_is_pure_integer(logical_format);
 
-   /* Don't load with F16 */
-   if (f16)
+   /* Don't load with F16, except where multisampled tile accesses move whole
+    * samples (G18 at 2x/4x): those take U8NORM, I32 and F16 accesses and
+    * refuse I16, so a blended RGBA16F epilog reads its target as F16. */
+   if (f16 && !(ctx->ms_whole_sample && tib->nr_samples > 1))
       format = PIPE_FORMAT_R16_UINT;
 
    uint8_t offset_B = agx_tilebuffer_offset_B(tib, rt);
@@ -193,6 +197,18 @@ store_memory(nir_builder *b, unsigned bindless_base, unsigned nr_samples,
              enum pipe_format format, unsigned rt, nir_def *value,
              nir_def *samples)
 {
+   /* AGX3 image writes take 32-bit sources. Widen 16-bit fragment outputs
+    * according to the attachment format class before storing to a spilled
+    * render target. */
+   if (value->bit_size == 16) {
+      if (util_format_is_pure_sint(format))
+         value = nir_i2i32(b, value);
+      else if (util_format_is_pure_uint(format))
+         value = nir_u2u32(b, value);
+      else
+         value = nir_f2f32(b, value);
+   }
+
    nir_def *image = handle_for_rt(b, bindless_base, rt, true);
    nir_def *tex_image = handle_for_rt(b, bindless_base, rt, false);
    nir_def *zero = nir_imm_intN_t(b, 0, 16);
@@ -367,7 +383,8 @@ pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
     * the raw word. */
    const bool lower_r11g11b10 =
       ctx->lower_r11g11b10 &&
-      logical_format == PIPE_FORMAT_R11G11B10_FLOAT;
+      (logical_format == PIPE_FORMAT_R11G11B10_FLOAT ||
+       logical_format == PIPE_FORMAT_R9G9B9E5_FLOAT);
    const bool native_r11g11b10 =
       ctx->lower_g17p_formats && logical_format == PIPE_FORMAT_R11G11B10_FLOAT;
    const bool raw_r11g11b10 = lower_r11g11b10 || native_r11g11b10;
@@ -409,6 +426,7 @@ pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
           * a full store of the value it has just loaded. */
          assert(write_mask == 0 || agx_tilebuffer_supports_mask(tib, rt));
          *(ctx->translucent) = true;
+         ctx->translucent_other = true;
       }
 
       if (ctx->write_samples) {
@@ -416,6 +434,7 @@ pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                 "sample masking requires translucency");
 
          *(ctx->translucent) = true;
+         ctx->translucent_other = true;
       }
 
       /* But we ignore the NIR write mask for that, since it's basically an
@@ -450,15 +469,20 @@ pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
       /* An RGBX/BGRX target lives in a 4-channel tile whose fourth channel
        * reaches memory (the PBE has no constant swizzle source).  Write 1.0
-       * there so the X byte is 0xff rather than whatever the tile held: a
-       * display firmware that blends the byte as alpha (Apple H17P) otherwise
-       * shows the frame scaled by it. Requested by G18G, whose PBE points
-       * swizzle_a at this channel.
+       * there so the X channel is all-ones rather than whatever the tile held:
+       * a display firmware that blends the channel as alpha (Apple H17P, or
+       * DCP L10R on 10-bit RGBX) otherwise shows the frame scaled by it.
+       * Requested by G18G for all RGBX/BGRX formats, and required on G17P/M5
+       * for RGB10X2/BGR10X2 because AGX3's packed RGB10A2 tile store always
+       * encodes all four channels into one 32-bit word.
        */
       const struct util_format_description *ldesc =
          util_format_description(logical_format);
       const bool x_alpha =
-         ctx->x_alpha_one && comps == 3 && ldesc->nr_channels == 4 &&
+         (ctx->x_alpha_one ||
+          (ctx->lower_g17p_formats &&
+           (enum ail_isa_format)format == AIL_ISA_FORMAT_RGB10A2)) &&
+         comps == 3 && ldesc->nr_channels == 4 &&
          ldesc->channel[3].type == UTIL_FORMAT_TYPE_VOID &&
          util_format_get_nr_components(format) == 4 &&
          !util_format_is_pure_integer(logical_format) && !lower_r11g11b10;
@@ -507,10 +531,12 @@ pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          def = nir_undef(b, intr->num_components, bit_size);
       } else if (tib->spilled[rt]) {
          *(ctx->translucent) = true;
+         ctx->translucent_other = true;
 
          def = load_memory(b, ctx->bindless_base, tib->nr_samples,
                            intr->num_components, bit_size, rt, logical_format);
       } else if (lower_r11g11b10 || lower_srgb) {
+         ctx->translucent_other = true;
          /* G17G/G18 keep their qualified explicit format conversions. */
          def = load_tilebuffer(
             b, ctx, lower_r11g11b10 ? 1 : intr->num_components,
@@ -524,6 +550,7 @@ pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          if (bit_size != 32)
             def = nir_f2f16(b, def);
       } else {
+         ctx->translucent_other = true;
          /* G17P has no grounded half-width tile load of an RGB10A2 tile
           * (ld_tile d16 fmt=RGB10A2 is refused, which drops every blended
           * mediump draw into a 10-bit target). Load it at 32 bits and narrow
@@ -549,11 +576,12 @@ pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 bool
-agx_nir_lower_tilebuffer_with_conversions(
+agx_nir_lower_tilebuffer_with_conversions_info(
    nir_shader *shader, struct agx_tilebuffer_layout *tib, uint8_t *colormasks,
    unsigned *bindless_base, nir_def *write_samples, bool *translucent,
    bool preserve_zero_mask, bool lower_srgb, bool lower_r11g11b10,
-   bool lower_g17p_formats, bool x_alpha_one)
+   bool ms_whole_sample, bool lower_g17p_formats, bool x_alpha_one,
+   struct agx_tilebuffer_lower_info *info_out)
 {
    assert(shader->info.stage == MESA_SHADER_FRAGMENT);
 
@@ -565,6 +593,7 @@ agx_nir_lower_tilebuffer_with_conversions(
       .preserve_zero_mask = preserve_zero_mask,
       .lower_srgb = lower_srgb,
       .lower_r11g11b10 = lower_r11g11b10,
+      .ms_whole_sample = ms_whole_sample,
       .lower_g17p_formats = lower_g17p_formats,
       .x_alpha_one = x_alpha_one,
    };
@@ -592,12 +621,16 @@ agx_nir_lower_tilebuffer_with_conversions(
     *
     * XXX: Could be optimized.
     */
+   bool has_unwritten_rt = false;
    for (unsigned i = 0; i < ARRAY_SIZE(tib->logical_format); ++i) {
       bool exists = tib->logical_format[i] != PIPE_FORMAT_NONE;
       bool written = ctx.outputs_written & BITFIELD_BIT(i);
 
-      if (translucent)
-         *translucent |= (exists && !written);
+      if (exists && !written) {
+         has_unwritten_rt = true;
+         if (translucent)
+            *translucent = true;
+      }
 
       /* HAL200 coverage dirties the tile even when this shader has no color
        * output at all (for example, a depth-only meta clear). The explicit
@@ -627,8 +660,11 @@ agx_nir_lower_tilebuffer_with_conversions(
          nir_function_impl *impl = nir_shader_get_entrypoint(shader);
          nir_builder b = nir_builder_at(nir_after_impl(impl));
          enum pipe_format logical = tib->logical_format[i];
-         const bool raw_r11g11b10 = (lower_r11g11b10 || lower_g17p_formats) &&
-                                  logical == PIPE_FORMAT_R11G11B10_FLOAT;
+         const bool raw_r11g11b10 =
+            (lower_r11g11b10 &&
+             (logical == PIPE_FORMAT_R11G11B10_FLOAT ||
+              logical == PIPE_FORMAT_R9G9B9E5_FLOAT)) ||
+            (lower_g17p_formats && logical == PIPE_FORMAT_R11G11B10_FLOAT);
          enum pipe_format format = raw_r11g11b10 ? PIPE_FORMAT_R32_UINT :
             (lower_srgb || lower_g17p_formats) && util_format_is_srgb(logical)
                ? (enum pipe_format)AIL_ISA_FORMAT_U8NORM
@@ -637,12 +673,33 @@ agx_nir_lower_tilebuffer_with_conversions(
          nir_def *value = load_tilebuffer(&b, &ctx, comps, 32, i, format, logical);
          store_tilebuffer(&b, tib, format, logical, i, value, write_samples,
                           BITFIELD_MASK(comps));
+         ctx.translucent_other = true;
          nir_progress(true, impl, nir_metadata_control_flow);
          progress = true;
       }
    }
 
+   if (info_out) {
+      info_out->translucent_other =
+         ctx.translucent_other || agx_tilebuffer_spills(tib);
+      info_out->has_unwritten_rt = has_unwritten_rt;
+      info_out->outputs_written = ctx.outputs_written;
+   }
+
    return progress;
+}
+
+bool
+agx_nir_lower_tilebuffer_with_conversions(
+   nir_shader *shader, struct agx_tilebuffer_layout *tib, uint8_t *colormasks,
+   unsigned *bindless_base, nir_def *write_samples, bool *translucent,
+   bool preserve_zero_mask, bool lower_srgb, bool lower_r11g11b10,
+   bool ms_whole_sample, bool lower_g17p_formats, bool x_alpha_one)
+{
+   return agx_nir_lower_tilebuffer_with_conversions_info(
+      shader, tib, colormasks, bindless_base, write_samples, translucent,
+      preserve_zero_mask, lower_srgb, lower_r11g11b10, ms_whole_sample,
+      lower_g17p_formats, x_alpha_one, NULL);
 }
 
 bool
@@ -653,5 +710,5 @@ agx_nir_lower_tilebuffer(nir_shader *shader, struct agx_tilebuffer_layout *tib,
 {
    return agx_nir_lower_tilebuffer_with_conversions(
       shader, tib, colormasks, bindless_base, write_samples, translucent,
-      preserve_zero_mask, false, false, lower_g17p_formats, false);
+      preserve_zero_mask, false, false, false, lower_g17p_formats, false);
 }

@@ -132,6 +132,12 @@ class Field(object):
             self.default = safe_name(f'{global_prefix}_{self.type}_{self.default}').upper()
 
 
+    def is_wide_uint(self):
+        bits = self.end - self.start + 1
+        if self.modifier and self.modifier[0] == 'shr':
+            bits += self.modifier[1]
+        return self.type in ['uint', 'hex'] and bits > 32
+
     def emit_template_struct(self, dim):
         if self.type == 'address':
             type = 'uint64_t'
@@ -139,7 +145,7 @@ class Field(object):
             type = 'bool'
         elif self.type in ['float', 'half', 'lod', 'lod15', 'slod']:
             type = 'float'
-        elif self.type in ['uint', 'hex'] and self.end - self.start > 32:
+        elif self.is_wide_uint():
             type = 'uint64_t'
         elif self.type == 'int':
             type = 'int32_t'
@@ -430,6 +436,8 @@ class Group(object):
                 if field.modifier[0] == "minus":
                     suffix = f" + {field.modifier[1]}"
                 elif field.modifier[0] == "shr":
+                    if field.is_wide_uint():
+                        prefix = "(uint64_t)"
                     suffix = f" << {field.modifier[1]}"
                 if field.modifier[0] == "log2":
                     prefix = "1 << "
@@ -490,8 +498,10 @@ class Group(object):
                 print(f'   fprintf(fp, "%*s{name}: %s\\n", indent, "", {val} ? "true" : "false");')
             elif field.type in ["float", "lod", "lod15", "slod", "half"]:
                 print(f'   fprintf(fp, "%*s{name}: %f\\n", indent, "", {val});')
-            elif field.type in ["uint", "hex"] and (field.end - field.start) >= 32:
+            elif field.type == "hex" and field.is_wide_uint():
                 print(f'   fprintf(fp, "%*s{name}: 0x%" PRIx64 "\\n", indent, "", {val});')
+            elif field.type == "uint" and field.is_wide_uint():
+                print(f'   fprintf(fp, "%*s{name}: %" PRIu64 "\\n", indent, "", {val});')
             elif field.type == "hex":
                 print(f'   fprintf(fp, "%*s{name}: 0x%" PRIx32 "\\n", indent, "", {val});')
             else:

@@ -75,6 +75,8 @@ struct alu_timing op_timings[] = {
    [AGX_OPCODE_ST_VARY_FMA_AGX3] = { F32, 2, 1 },
    [AGX_OPCODE_MATMAD8_AGX3]     = { F32, 4, 2 },
    [AGX_OPCODE_MATMAD16_AGX3]    = { F32, 8, 4 },
+   [AGX_OPCODE_SIMD_MATRIX_FMADD32] = { F32, 4, 2 },
+   [AGX_OPCODE_SIMD_MATRIX_FMADD16] = { F16, 4, 2 },
 
    [AGX_OPCODE_HFMA]          = { F16, 2, 1 },
    [AGX_OPCODE_HADD]          = { F16, 2, 1 },
@@ -112,7 +114,13 @@ struct alu_timing op_timings[] = {
    [AGX_OPCODE_QUAD_PREFIX]      = { SCIB, 18, 18 },
    [AGX_OPCODE_QUAD_REDUCE]      = { SCIB, 24, 24 },
    [AGX_OPCODE_SHUFFLE]          = { SCIB, 5, 2   },
+   [AGX_OPCODE_SHUFFLE_XOR]      = { SCIB, 5, 2   },
+   [AGX_OPCODE_SHUFFLE_UP]       = { SCIB, 5, 2   },
+   [AGX_OPCODE_SHUFFLE_DOWN]     = { SCIB, 5, 2   },
    [AGX_OPCODE_QUAD_SHUFFLE]     = { SCIB, 5, 2   },
+   [AGX_OPCODE_QUAD_SHUFFLE_XOR] = { SCIB, 5, 2   },
+   [AGX_OPCODE_QUAD_SHUFFLE_UP]  = { SCIB, 5, 2   },
+   [AGX_OPCODE_QUAD_SHUFFLE_DOWN] = { SCIB, 5, 2  },
 
    [AGX_OPCODE_ICMP_BALLOT]      = { SCIB, 5, 2   },
    [AGX_OPCODE_FCMP_BALLOT]      = { SCIB, 5, 2   },

@@ -81,5 +81,11 @@ struct hk_mesh_info {
    bool m5_no_grid_record;
 
    
+   /* Task payload slot footprint in bytes:
+    * - G17P: software-task ring entry stride
+    *   (LIBAGX_TASK_ENTRY_PAYLOAD_B + ALIGN_POT(task_payload_size, 16)).
+    * - G17S: hardware TA mesh storage slot size
+    *   ((grid_record ? AGX_M5_TASK_RECORD_PAYLOAD_BYTES : 0) +
+    *    task_payload_size), passed to agx_vdm_m5_mesh_set_task_payload(). */
    uint32_t payload_size_B;
 };

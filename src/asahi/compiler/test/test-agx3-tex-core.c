@@ -4,6 +4,7 @@
  */
 
 #include "agx3_tex_core.h"
+#include "agx3_compose/agx3_decode.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -4111,6 +4112,47 @@ test_g17g_sample_lod_witnesses(void)
       CHECK(agx3_tex_stage_array_lod(AGX_ISA_ENCODING_AGX3C, 8, 9, 1, 0, false,
                                      true, false, true, bytes, &length));
       CHECK(length == 14 && hex_eq(bytes, length, "3700004a2500aa0a400260302100"));
+      {
+         uint8_t bank0[AGX3_TEX_MAX_LENGTH], bank8[AGX3_TEX_MAX_LENGTH],
+                 bank248[AGX3_TEX_MAX_LENGTH];
+         uint8_t len0 = 0, len8 = 0, len248 = 0;
+         uint64_t f0[AGX3_MAX_FIELDS], f8[AGX3_MAX_FIELDS],
+                  f248[AGX3_MAX_FIELDS];
+         CHECK(agx3_tex_stage_array_lod_at(AGX_ISA_ENCODING_AGX3C, 0, 8, 9, 1,
+                                           0, false, true, false, true, bank0,
+                                           &len0));
+         CHECK(len0 == length && memcmp(bank0, bytes, length) == 0);
+         CHECK(agx3_decode(&agx3c_table, bank0, len0, AGX3_MN_pack_smpir, f0) >=
+               0);
+         CHECK(f0[5] == 6);
+
+         CHECK(agx3_tex_stage_array_lod_at(AGX_ISA_ENCODING_AGX3C, 8, 8, 9, 1,
+                                           0, false, true, false, true, bank8,
+                                           &len8));
+         CHECK(len8 == 14 &&
+               agx3_decode(&agx3c_table, bank8, len8, AGX3_MN_pack_smpir, f8) >=
+                  0);
+         CHECK(f8[5] == 14);
+         f8[5] = f0[5];
+         CHECK(memcmp(f8, f0, sizeof(f0)) == 0);
+
+         CHECK(agx3_tex_stage_array_lod_at(AGX_ISA_ENCODING_AGX3C, 248, 8, 9,
+                                           1, 0, false, true, false, true,
+                                           bank248, &len248));
+         CHECK(len248 == 14 &&
+               agx3_decode(&agx3c_table, bank248, len248, AGX3_MN_pack_smpir,
+                           f248) >= 0);
+         CHECK(f248[5] == 254);
+         f248[5] = f0[5];
+         CHECK(memcmp(f248, f0, sizeof(f0)) == 0);
+
+         CHECK(!agx3_tex_stage_array_lod_at(AGX_ISA_ENCODING_AGX3C, 4, 8, 9, 1,
+                                            0, false, true, false, true, bank8,
+                                            &len8));
+         CHECK(!agx3_tex_stage_array_lod_at(AGX_ISA_ENCODING_AGX3C, 256, 8, 9,
+                                            1, 0, false, true, false, true,
+                                            bank8, &len8));
+      }
       CHECK(agx3_tex_stage_cube_z(AGX_ISA_ENCODING_AGX3C, 2, 1, 0, false, true,
                                   bytes, &length));
       CHECK(length == 14 && hex_eq(bytes, length, "3702000a2500aa0a00005a300900"));
