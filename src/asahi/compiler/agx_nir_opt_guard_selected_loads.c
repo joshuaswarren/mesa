@@ -129,6 +129,12 @@ try_guard_select_in_block(nir_builder *b, nir_block *block,
             }
          }
 
+         /* A lone select has no shared fallback. Guarding it can turn a
+          * predicate such as "set this bit" into an extra divergent branch
+          * around the loads that produce the condition. */
+         if (chain_len < 2)
+            continue;
+
          nir_def *base_val = cur.def;
          nir_def *fallback = fb_sc.def;
          if (base_val->num_components != 1 || fallback->num_components != 1 ||

@@ -367,17 +367,22 @@ TEST(AGX3VisionOpts, UnrollAndJam2DNestedLoopAndBarrierRejection)
 
 /* --- Commit 3: guard_selected_loads, forward_merge_loads, fuse_selects --- */
 
-TEST(AGX3VisionOpts, GuardSelectedLoadsWrapsReadonlyAndRefusesWritable)
+TEST(AGX3VisionOpts, GuardSelectedLoadsRequiresReadonlyChain)
 {
-   for (bool readonly : {true, false}) {
-      nir_builder b = make_compute_shader(readonly ? "guard-ro" : "guard-rw");
+   struct {
+      bool readonly;
+      bool chain;
+      bool expect_guard;
+   } cases[] = {{true, true, true}, {false, true, false}, {true, false, false}};
+   for (auto test : cases) {
+      nir_builder b = make_compute_shader(test.readonly ? "guard-ro" : "guard-rw");
       nir_def *base_ptr = make_desc_base(&b, 4);
       nir_def *out_ptr = make_desc_base(&b, 8);
       nir_def *idx = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
       nir_def *center = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 16);
 
       enum gl_access_qualifier acc =
-         readonly ? (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER)
+         test.readonly ? (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER)
                   : (enum gl_access_qualifier)0;
       nir_def *n0 = nir_load_agx(&b, 1, 32, base_ptr, nir_iadd_imm(&b, idx, -1),
                                  .access = acc, .format = PIPE_FORMAT_R32_UINT);
@@ -386,14 +391,16 @@ TEST(AGX3VisionOpts, GuardSelectedLoadsWrapsReadonlyAndRefusesWritable)
       nir_def *c0 = nir_uge(&b, center, n0);
       nir_def *c1 = nir_uge(&b, center, n1);
       nir_def *zero = nir_imm_int(&b, 0);
-      nir_def *res = nir_bcsel(&b, c1, nir_bcsel(&b, c0, center, zero), zero);
+      nir_def *res = test.chain
+                        ? nir_bcsel(&b, c1, nir_bcsel(&b, c0, center, zero), zero)
+                        : nir_bcsel(&b, nir_iand(&b, c0, c1), center, zero);
       nir_store_agx(&b, res, out_ptr, idx, .format = PIPE_FORMAT_R32_UINT);
 
       ASSERT_EQ(count_ifs(b.shader), 0u);
       bool changed = agx_nir_opt_guard_selected_loads(b.shader);
       nir_validate_shader(b.shader, "guard selected loads");
-      EXPECT_EQ(changed, readonly);
-      EXPECT_EQ(count_ifs(b.shader), readonly ? 1u : 0u);
+      EXPECT_EQ(changed, test.expect_guard);
+      EXPECT_EQ(count_ifs(b.shader), test.expect_guard ? 1u : 0u);
       ralloc_free(b.shader);
    }
 }
