@@ -130,6 +130,13 @@ zink_batch_state_append(struct zink_batch_state **list, struct zink_batch_state 
    bs->next = NULL;
 }
 
+static inline void
+zink_batch_mark_host_transfer_write(struct zink_batch_state *bs, const struct zink_resource *res)
+{
+   if (res->obj->host_visible && (res->obj->is_buffer || res->linear))
+      bs->has_host_transfer_write = true;
+}
+
 bool
 zink_screen_usage_check_completion(struct zink_screen *screen, const struct zink_batch_usage *u);
 bool

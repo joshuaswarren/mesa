@@ -235,6 +235,48 @@ hk_agx3_g17p_mixed_direct_color_resolve_supported(
 }
 
 bool
+hk_agx3_g17p_store_and_resolve_supported(
+   const struct agx_tilebuffer_layout *tib,
+   const struct hk_agx3_g17p_store_and_resolve_target *target)
+{
+   if (!tib || !target)
+      return false;
+
+   /* The program writes both outputs from the same tile at the end of the
+    * pass: the samples through a multisample PBE and their average through a
+    * single-sample one. A partial render must keep the samples for its
+    * reload and must not resolve yet. The resolve writes whole tiles, so the
+    * render area must cover the attachments exactly: there is no background
+    * merge for the area outside it, unlike the resolve-only program
+    * (agx_bg_eot_key::preserve_resolve_outside). The layered and spilled
+    * forms of the two-output program are not built (agx_bg_eot.c). */
+   if (target->color_attachment_count != 1 || !target->final_store ||
+       !target->whole_attachments || !target->store_source ||
+       !target->has_resolve_target || !target->average_resolve ||
+       target->resolve_samples != 1 || !target->resolve_format_matches ||
+       !target->source_pbe_valid || !target->resolve_pbe_valid ||
+       tib->layered || agx_tilebuffer_spills(tib))
+      return false;
+
+   /* The resolve averages the tile lanes as the resolve-only program does,
+    * so the same formats keep their samples for a resolve after the pass:
+    * raw 32-bit float lanes and RGB9E5 words, and an R11G11B10 tile kept as
+    * one raw word (hk_eot_key_format() moves it to its own lane class where
+    * the PBE averages it). AVERAGE never applies to integer formats. */
+   const enum pipe_format format = tib->logical_format[0];
+   if (format == PIPE_FORMAT_NONE ||
+       hk_agx3_format_needs_shader_resolve(format) ||
+       format == PIPE_FORMAT_R11G11B10_FLOAT ||
+       util_format_is_pure_integer(format))
+      return false;
+
+   /* The stored half is the unresolved multisample store. */
+   struct agx_tilebuffer_layout layout = *tib;
+   return hk_agx3_g17p_multisample_store_supported(&layout, 1, true,
+                                                   target->source_samples);
+}
+
+bool
 hk_agx3_g17p_multisample_store_supported(struct agx_tilebuffer_layout *tib,
                                          unsigned color_attachment_count,
                                          bool store_source,

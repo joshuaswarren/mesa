@@ -22,14 +22,19 @@
 #include "agx_vdm_hal200_bind_tail_core.h"
 #include "decode.h"
 #include "hk_cmd_buffer.h"
+#include "hk_agx3_ioto_program_core.h"
+#include "hk_compute_pair.h"
+#include "hk_compute_pair_interval.h"
 #include "hk_compute_kick.h"
 #include "hk_frame_anatomy.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_drm_render_core.h"
 #include "hk_drm_prior_core.h"
+#include "hk_drm_own_wait.h"
 #include "hk_execution_allowance.h"
 #include "hk_pack.h"
+#include "hk_queue_flush.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
 #include "hk_query_pool.h"
@@ -44,6 +49,7 @@
 #include <xf86drm.h>
 #include "util/cache_ops.h"
 #include "util/list.h"
+#include "util/log.h"
 #include "util/macros.h"
 #include "util/os_time.h"
 #include "util/u_atomic.h"
@@ -204,20 +210,18 @@ hk_queue_fill_cdm_command(struct hk_device *dev, struct hk_queue *queue,
 }
 
 /* Neither attachment storage nor empty-tile operations may observe the
- * layers eliminated below.  Draws and their XY coverage remain untouched.
+ * layers or tiles outside active draw scissors eliminated below.
  */
-static bool
-hk_g17p_attachmentless_render(const struct hk_device *dev,
-                                    const struct hk_cs *cs)
+bool
+hk_attachmentless_render(const struct hk_cs *cs)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P ||
-       cs->tib.sample_size_B != 0 || cs->cr.process_empty_tiles ||
+   if (cs->tib.sample_size_B != 0 || cs->cr.process_empty_tiles ||
        cs->cr.depth.buffer || cs->cr.depth.meta ||
        cs->cr.stencil.buffer || cs->cr.stencil.meta)
       return false;
 
    /* The tilebuffer builder normalizes an attachmentless sample count to
-    * one.  Check attachment formats explicitly; nr_samples is not a tag.
+    * one. Check attachment formats explicitly; nr_samples is not a tag.
     * This also excludes colour attachments spilled outside the tilebuffer.
     */
    for (unsigned i = 0; i < ARRAY_SIZE(cs->tib.logical_format); ++i) {
@@ -226,6 +230,47 @@ hk_g17p_attachmentless_render(const struct hk_device *dev,
    }
 
    return true;
+}
+
+void
+hk_attachmentless_vdm_bounds(const struct hk_cs *cs, uint32_t *width_px,
+                             uint32_t *height_px, uint32_t *layers)
+{
+   const bool attachmentless = hk_attachmentless_render(cs);
+   const bool empty_attachmentless = attachmentless && cs->stats.cmds == 0;
+   const bool bounded_attachmentless =
+      attachmentless && cs->stats.cmds > 0 &&
+      cs->attachmentless_bounded_draws == cs->stats.cmds;
+   const bool layer_zero_attachmentless =
+      attachmentless && cs->stats.cmds > 0 && !cs->layer_zero_unknown &&
+      cs->layer_zero_draws == cs->stats.cmds;
+
+   uint32_t w, h;
+   if (empty_attachmentless) {
+      w = 1;
+      h = 1;
+   } else if (bounded_attachmentless) {
+      w = MIN2(cs->cr.width, cs->attachmentless_max_x);
+      h = MIN2(cs->cr.height, cs->attachmentless_max_y);
+   } else {
+      w = cs->cr.width;
+      h = cs->cr.height;
+   }
+
+   /* Draws stay inside the render area and the tiles past its bottom-right
+    * corner keep their contents, so do not walk them: user interfaces render
+    * small areas of full-screen targets. */
+   if (cs->area_x1 && cs->area_y1) {
+      w = MIN2(w, cs->area_x1);
+      h = MIN2(h, cs->area_y1);
+   }
+
+   /* An attachmentless pass takes its size from the render area or draw
+    * scissors, which can be empty, and the kernel refuses a zero dimension. */
+   *width_px = MAX2(w, 1);
+   *height_px = MAX2(h, 1);
+   *layers = (empty_attachmentless || layer_zero_attachmentless)
+                ? 1 : cs->cr.layers;
 }
 
 static void
@@ -244,27 +289,10 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       cfg.fixed_point_format = 1;
    }
 
-   const bool empty_attachmentless =
-      cs->stats.cmds == 0 && hk_g17p_attachmentless_render(dev, cs);
-   const bool layer_zero_attachmentless =
-      cs->stats.cmds > 0 && !cs->g17p_layer_zero_unknown &&
-      cs->g17p_layer_zero_draws == cs->stats.cmds &&
-      hk_g17p_attachmentless_render(dev, cs);
-   c->width_px = empty_attachmentless ? 1 : cs->cr.width;
-   c->height_px = empty_attachmentless ? 1 : cs->cr.height;
-
-   /* Draws stay inside the render area and the tiles past its bottom-right
-    * corner keep their contents, so do not walk them: user interfaces render
-    * small areas of full-screen targets. */
-   if (cs->area_x1 && cs->area_y1) {
-      c->width_px = MIN2(c->width_px, cs->area_x1);
-      c->height_px = MIN2(c->height_px, cs->area_y1);
-   }
-
-   /* An attachmentless pass takes its size from the render area, which can be
-    * empty, and the kernel refuses a zero dimension. */
-   c->width_px = MAX2(c->width_px, 1);
-   c->height_px = MAX2(c->height_px, 1);
+   uint32_t width_px = 0, height_px = 0, layers = 0;
+   hk_attachmentless_vdm_bounds(cs, &width_px, &height_px, &layers);
+   c->width_px = width_px;
+   c->height_px = height_px;
 
    c->isp_bgobjdepth = cs->cr.isp_bgobjdepth;
    c->isp_bgobjvals = cs->cr.isp_bgobjvals;
@@ -336,8 +364,7 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
 
    /* Can be 0 for attachmentless rendering with no draws */
    c->samples = MAX2(cs->tib.nr_samples, 1);
-   c->layers = (empty_attachmentless || layer_zero_attachmentless)
-                  ? 1 : cs->cr.layers;
+   c->layers = layers;
 
    /* Drawing max size will OOM and fail submission. But vkd3d-proton does this
     * for emulating no-attachment rendering. Clamp to something reasonable and
@@ -521,9 +548,10 @@ asahi_append_fragment_attachments(struct hk_device *dev,
 static inline unsigned
 max_commands_per_submit(struct hk_device *dev)
 {
-   return hk_drm_submit_command_limit(
+   unsigned limit = hk_drm_submit_command_limit(
       dev->dev.chip != AGX_CHIP_G13X && !HK_PERF(dev, NOBATCH),
       dev->dev.params.max_commands_per_submission);
+   return dev->submit_batch_size ? MIN2(limit, dev->submit_batch_size) : limit;
 }
 
 static VkResult
@@ -1253,8 +1281,12 @@ hk_cmd_buffer_needs_render_rq(struct hk_cmd_buffer *cmdbuf)
 }
 
 static unsigned
-hk_submit_needs_render_rq(const struct vk_queue_submit *submit)
+hk_submit_needs_render_rq(const struct hk_device *dev,
+                          const struct vk_queue_submit *submit)
 {
+   if (!dev->gen1_native_graphics_rq && !dev->gen1_native_fragment_rq)
+      return 0;
+
    unsigned stages = 0;
 
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
@@ -1306,11 +1338,12 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
          return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
                           "Waiting for the replaced kernel queue failed: %s",
                           strerror(errno));
+      hk_queue_note_signalled(queue, queue->drm.timeline_value);
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
-      queue->drm.id = UINT32_MAX;
+      p_atomic_set(&queue->drm.id, UINT32_MAX);
    }
 
-   /* M5 and G17P admit GPU work at the API entrypoint, before semaphore
+   /* Native AGX3 and M5 admit GPU work at the API entrypoint, before semaphore
     * payloads move (hk_queue_admits_at_entry). Other devices retain admission
     * in the serialized driver callback. Host-only synchronization does not
     * need a kernel scheduling context. */
@@ -1321,8 +1354,8 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
       &dev->dev, (enum drm_asahi_priority)(queue->drm.virt_ring_idx - 1), layouts);
    if (id != UINT32_MAX) {
       *replaced = had_queue;
-      queue->drm.id = id;
       queue->drm.render_rq = render_rq;
+      p_atomic_set(&queue->drm.id, id);
       return VK_SUCCESS;
    }
 
@@ -1368,6 +1401,7 @@ hk_queue_restart_sync(struct hk_queue *queue)
    /* The submission that starts it waits for all sibling work too. */
    memset(queue->sib.submitted[0], 0, sizeof(queue->sib.submitted[0]));
    queue->sib.used = false;
+   queue->sib.packed_atomic_point = 0;
 }
 
 /* Kernel queues come from a machine-wide pool shared by every client, so
@@ -1376,7 +1410,15 @@ hk_queue_restart_sync(struct hk_queue *queue)
 static bool
 hk_queue_admits_at_entry(const struct hk_device *dev)
 {
-   return agx_chip_g17p_or_m5(dev->dev.chip);
+   return agx_chip_native_or_m5(dev->dev.chip);
+}
+
+static inline struct hk_queue *
+hk_queue_backing(struct hk_queue *queue)
+{
+   return queue->vk.real_queue
+             ? container_of(queue->vk.real_queue, struct hk_queue, vk)
+             : queue;
 }
 
 /* Admission must precede the common runtime's semaphore payload moves and
@@ -1388,8 +1430,7 @@ static VkResult
 hk_queue_admit(struct hk_queue *queue, unsigned render_rq)
 {
    /* Admission and callbacks must use the same backing queue and lock. */
-   if (queue->vk.real_queue)
-      queue = container_of(queue->vk.real_queue, struct hk_queue, vk);
+   queue = hk_queue_backing(queue);
    simple_mtx_lock(&queue->vk.lock);
    /* Admission only creates a missing kernel queue, with the render ray-query
     * scratch the call needs (G17P), so a first submission that needs it does
@@ -1425,6 +1466,13 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
       if (vk_device_is_lost(&dev->vk))
          return VK_ERROR_DEVICE_LOST;
 
+      /* Once the backing kernel queue exists, admission is a no-op: skip the
+       * command-buffer scan and queue lock on steady-state submissions. If a
+       * G17P ray-query replacement briefly clears drm.id, this falls through
+       * to the locked path below. */
+      if (p_atomic_read(&hk_queue_backing(queue)->drm.id) != UINT32_MAX)
+         return vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
+
       const bool rq_capable =
          dev->gen1_native_graphics_rq || dev->gen1_native_fragment_rq;
       bool needs_queue = false;
@@ -1433,7 +1481,10 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
          for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
             VK_FROM_HANDLE(hk_cmd_buffer, cmd,
                            pSubmits[i].pCommandBufferInfos[j].commandBuffer);
-            if (list_is_empty(&cmd->control_streams))
+            /* A command buffer without streams still sends the host flush
+             * it deferred (hk_sync_defer_host_flush()). */
+            if (list_is_empty(&cmd->control_streams) &&
+                !cmd->sync.host_flush_kinds)
                continue;
             needs_queue = true;
             if (rq_capable)
@@ -1461,6 +1512,10 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
    if (hk_queue_admits_at_entry(dev)) {
       if (vk_device_is_lost(&dev->vk))
          return VK_ERROR_DEVICE_LOST;
+
+      if (p_atomic_read(&hk_queue_backing(queue)->drm.id) != UINT32_MAX)
+         return vk_common_QueueBindSparse(_queue, bindInfoCount, pBindInfo,
+                                          fence);
 
       /* Sparse image changes may require a GPU maintenance command. Reserve
        * its queue before any bind or semaphore operation in this API call.
@@ -1560,44 +1615,179 @@ hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
  * (a depth-2 compute stream ran 19% slower with siblings on the M4 Pro).
  * With work queued behind them, the overlap fills the launch and drain gaps
  * between kicks instead. */
+/* Query the queue timeline's signalled point, short-circuiting through the
+ * cached monotonic lower bound whenever it already covers `target`. */
+static bool
+hk_queue_query_progress(struct hk_device *dev, struct hk_queue *queue,
+                        uint64_t target, uint64_t *done_out)
+{
+   uint64_t done = p_atomic_read(&queue->drm.signalled_value);
+   if (done >= target) {
+      *done_out = done;
+      return true;
+   }
+
+   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1) != 0)
+      return false;
+
+   hk_queue_note_signalled(queue, done);
+   *done_out = done;
+   return true;
+}
+
 static bool
 hk_sibling_deep(struct hk_device *dev, struct hk_queue *queue,
                 uint64_t submitted_point)
 {
-   uint64_t done = 0;
+   uint64_t done = p_atomic_read(&queue->drm.signalled_value);
+   if (submitted_point <= done ||
+       submitted_point - done < HK_G17P_SIBLING_MIN_IN_FLIGHT)
+      return false;
 
    if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1))
       return false;
-   return submitted_point >= done + HK_G17P_SIBLING_MIN_IN_FLIGHT;
+   hk_queue_note_signalled(queue, done);
+   return submitted_point > done &&
+          submitted_point - done >= HK_G17P_SIBLING_MIN_IN_FLIGHT;
 }
 
-/* A stream's prior in the ordinals of the kernel queue it is sent to: a
- * command of this submission keeps its offset from the submission's first
- * ordinal; an earlier submission's command becomes every earlier command of
- * that kernel queue, and the submission also waits for the siblings' work
- * (*earlier). */
-static inline uint64_t
-hk_sibling_prior(uint64_t prior, uint64_t base, uint64_t kq_base, bool *earlier)
+/* Whether any sibling kernel queue may still be executing work. */
+static bool
+hk_sibling_in_flight(struct hk_device *dev, struct hk_queue *queue)
 {
-   if (prior == 0)
-      return 0;
-   if (prior > base)
-      return kq_base + (prior - base);
-   *earlier = true;
-   return kq_base;
+   if (queue->sib.count <= 1 || !queue->sib.used || !queue->sib.last_point)
+      return false;
+
+   uint64_t done = 0;
+   if (!hk_queue_query_progress(dev, queue, queue->sib.last_point, &done))
+      return true;
+   return done < queue->sib.last_point;
+}
+
+/* Whether a packed submission carrying global atomics is still in flight on
+ * the primary kernel queue; sibling routing stays off until it completes so
+ * no second kernel queue can run beside a packed atomic chain. */
+static bool
+hk_sibling_packed_atomic_busy(struct hk_device *dev, struct hk_queue *queue)
+{
+   if (!queue->sib.packed_atomic_point)
+      return false;
+
+   uint64_t done = 0;
+   if (!hk_queue_query_progress(dev, queue, queue->sib.packed_atomic_point,
+                                &done))
+      return true;
+   if (done >= queue->sib.packed_atomic_point) {
+      queue->sib.packed_atomic_point = 0;
+      return false;
+   }
+   return true;
+}
+
+static struct hk_cs *
+hk_submit_unordered_start_ts(const struct vk_queue_submit *submit)
+{
+   if (!submit->command_buffer_count)
+      return NULL;
+
+   struct hk_cmd_buffer *cmd =
+      (struct hk_cmd_buffer *)submit->command_buffers[0];
+   if (!cmd->sync.has_unordered_start_ts)
+      return NULL;
+
+   list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
+      if (cs->unordered_start_ts && cs->timestamp.start.handle)
+         return cs;
+   }
+
+   return NULL;
+}
+
+/* Strong AGX3 CDM barrier flags, grounded on every G15--G18 identity
+ * (agx3_cmdstream.h); flag-free (0) barriers can hang CDM when chained. */
+#define HK_TS_CARRIER_BARRIER_FLAGS 0x5
+
+static VkResult
+hk_queue_ensure_ts_carrier(struct hk_device *dev, struct hk_queue *queue)
+{
+   if (queue->ts_carrier_bo)
+      return VK_SUCCESS;
+
+   struct agx_bo *bo =
+      agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0, "Timestamp carrier");
+   if (!bo)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   const struct agx3_cdm_barrier_info barrier = {
+      .chip = dev->dev.chip,
+      .flags = HK_TS_CARRIER_BARRIER_FLAGS,
+   };
+   uint8_t record[AGX3_CDM_BARRIER_SIZE];
+   if (!agx3_cdm_barrier_pack(&barrier, record) ||
+       !hk_queue_flush_stream_write(dev->dev.chip, agx_bo_map(bo), bo->size,
+                                    record, sizeof(record))) {
+      agx_bo_unreference(&dev->dev, bo);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   queue->ts_carrier_bo = bo;
+   return VK_SUCCESS;
+}
+
+/* The stream of the compute command that ends a submission with its
+ * deferred host availability: the memory-scoped strong flush, encoded as
+ * hk_cdm_visibility_flush() records it in a command buffer, and the
+ * terminator. */
+static VkResult
+hk_queue_ensure_host_flush(struct hk_device *dev, struct hk_queue *queue)
+{
+   if (queue->host_flush_bo)
+      return VK_SUCCESS;
+
+   struct agx_bo *bo =
+      agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0, "Host flush");
+   if (!bo)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   uint8_t record[AGX3_CDM_BARRIER_SIZE];
+   if (!hk_cdm_pack_visibility_flush(dev, true, record) ||
+       !hk_queue_flush_stream_write(dev->dev.chip, agx_bo_map(bo), bo->size,
+                                    record, sizeof(record))) {
+      agx_bo_unreference(&dev->dev, bo);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   queue->host_flush_bo = bo;
+   return VK_SUCCESS;
+}
+
+/* Whether the deferred host flush depends on an earlier submission, by the
+ * rule hk_sibling_eligible() applies to streams. */
+static bool
+hk_host_flush_names_earlier(const uint16_t barrier[HK_SYNC_NUM_SQ],
+                            const uint64_t prior[HK_SYNC_NUM_SQ],
+                            const uint64_t base[HK_SYNC_NUM_SQ])
+{
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      if ((prior[sq] && prior[sq] <= base[sq]) || barrier[sq] == 0)
+         return true;
+   }
+   return false;
 }
 
 /* Submits the recordings of `submit`. With submit packing these are the
  * submission's packets and the command buffers it left alone; `original`
- * is the application's submission, and `packed_bo` holds the packets'
- * streams (hk_pack_runs()). *untouched is set when a host allocation failed
+ * is the application's submission, and `extra_bos` are the buffers the
+ * packets read: their streams and the fused compute pairs' code and uniform
+ * loaders (hk_pack_runs()). *untouched is set when a host allocation failed
  * before any queue or synchronization state changed: the submission can
  * fail with that error and the queue stays usable. */
 static VkResult
 queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                         struct vk_queue_submit *submit,
                         const struct vk_queue_submit *original,
-                        struct agx_bo *packed_bo, bool *untouched)
+                        struct agx_bo *const *extra_bos,
+                        unsigned extra_bo_count, bool *untouched)
 {
    *untouched = false;
    bool flush_sstt = false;
@@ -1615,36 +1805,146 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                    hk_sparse_submission_updates_sstt(submit);
    }
 
-   unsigned command_count = flush_sstt ? 1 : 0;
-
-   /* Gather the number of individual commands to submit up front */
+   /* Gather recorded control streams, deferred host flushes, query resets, and
+    * barrier epochs up front so empty submissions take the fast path without
+    * scanning timestamps or ray-query stages. */
+   uint32_t sq_count[HK_SYNC_NUM_SQ] = {0, 0};
+   bool any_sync_epoch = false;
+   bool has_query_reset = false;
+   uint8_t host_flush_kinds = 0;
+   const bool same_submit = submit == original;
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
 
-      command_count += list_length(&cmdbuf->control_streams);
+      list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node)
+         sq_count[hk_sync_sq(cs)]++;
+      any_sync_epoch |= cmdbuf->sync.epoch != 0;
+      if (same_submit) {
+         has_query_reset |= cmdbuf->sync.has_gpu_query_reset;
+         host_flush_kinds |= cmdbuf->sync.host_flush_kinds;
+      }
    }
+   if (!same_submit) {
+      for (unsigned i = 0; i < original->command_buffer_count; ++i) {
+         const struct hk_cmd_buffer *cmdbuf =
+            (const struct hk_cmd_buffer *)original->command_buffers[i];
+         has_query_reset |= cmdbuf->sync.has_gpu_query_reset;
+         host_flush_kinds |= cmdbuf->sync.host_flush_kinds;
+      }
+   }
+   const bool host_flush = host_flush_kinds != 0;
+   const unsigned stream_count = sq_count[HK_SYNC_VDM] + sq_count[HK_SYNC_CDM];
+
+   if (!flush_sstt && !host_flush && stream_count == 0) {
+      /* A barrier-only command buffer still has a second scope in later
+       * submissions, while a barrier-free empty submission (sync.epoch == 0)
+       * cannot change queue->sync.tail and skips the resolver completely. */
+      if (queue->sync.exact_prior && any_sync_epoch) {
+         bool tail_raised = false;
+         if (!hk_sync_resolve_submit_ex(
+                queue, (struct hk_cmd_buffer *const *)submit->command_buffers,
+                submit->command_buffer_count, false, false, 0, NULL,
+                &tail_raised))
+            return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
+         if (tail_raised) {
+            uint64_t sq_pt = MAX2(queue->drm.last_sq_point[HK_SYNC_VDM],
+                                  queue->drm.last_sq_point[HK_SYNC_CDM]);
+            if (queue->sib.used)
+               sq_pt = MAX2(sq_pt, queue->sib.last_point);
+            queue->drm.last_tail_point = MAX2(queue->drm.last_tail_point, sq_pt);
+         }
+      }
+      return queue_submit_empty(dev, queue, submit);
+   }
+
+   struct hk_cs *uts_cs = hk_submit_unordered_start_ts(submit);
+   const unsigned render_rq = hk_submit_needs_render_rq(dev, submit);
+   /* VDM and CDM subqueues (and sibling kernel queues) can start commands
+    * independently. If the opposite subqueue, a sibling kernel queue, an
+    * earlier GPU query reset submission, or an earlier submission that raised
+    * a queue barrier tail (queue->sync.tail) still has incomplete work on this
+    * VkQueue, take the ordered carrier so the leading TOP_OF_PIPE timestamp
+    * cannot latch ahead of it.
+    *
+    * Tracking last_query_reset_point closes the same-subqueue hazard where
+    * submit N runs [vkCmdResetQueryPool(Q), HK_SYNC_ALL, compute X] (leaving
+    * no new barrier tail after X consumes the barrier) and submit N+1 starts
+    * with a leading TOP_OF_PIPE timestamp on Q before N's reset has finished
+    * zeroing. Tracking last_tail_point closes barrier-tail ordering without
+    * permanently disabling the fast path once the tail's source work has
+    * completed (queue->sync.tail holds monotonic ordinals that never reset to
+    * 0). Cross-queue resets require a semaphore wait (submit->wait_count > 0)
+    * or host completion.
+    *
+    * Sparse binds and command buffers are never merged into one submit, so
+    * uts_cs != NULL implies !flush_sstt (asserted below). */
+   bool prior_busy = false;
+   if (uts_cs != NULL) {
+      const enum hk_sync_sq first_sq = hk_sync_sq(uts_cs);
+      const enum hk_sync_sq other_sq =
+         first_sq == HK_SYNC_VDM ? HK_SYNC_CDM : HK_SYNC_VDM;
+      uint64_t check_point = MAX2(queue->drm.last_sq_point[other_sq],
+                                  queue->drm.last_query_reset_point);
+      check_point = MAX2(check_point, queue->drm.last_tail_point);
+      if (queue->sib.used)
+         check_point = MAX2(check_point, queue->sib.last_point);
+      if (check_point > 0) {
+         uint64_t done = 0;
+         const bool ok =
+            hk_queue_query_progress(dev, queue, check_point, &done);
+         prior_busy = !ok || done < check_point;
+         if (ok) {
+            if (queue->drm.last_sq_point[other_sq] > 0 &&
+                done >= queue->drm.last_sq_point[other_sq])
+               queue->drm.last_sq_point[other_sq] = 0;
+            if (queue->drm.last_query_reset_point > 0 &&
+                done >= queue->drm.last_query_reset_point)
+               queue->drm.last_query_reset_point = 0;
+            if (queue->drm.last_tail_point > 0 &&
+                done >= queue->drm.last_tail_point)
+               queue->drm.last_tail_point = 0;
+         }
+      }
+   }
+   const bool ts_carrier =
+      uts_cs != NULL &&
+      (submit->wait_count > 0 || prior_busy ||
+       queue->drm.empty_wait_point != 0 ||
+       (queue->drm.id != UINT32_MAX && (render_rq & ~queue->drm.render_rq)) ||
+       queue->sync.serialize || !queue->sync.exact_prior);
+   const bool prepend_cdm = flush_sstt || ts_carrier;
+
+   if (prepend_cdm)
+      sq_count[HK_SYNC_CDM]++;
+   const unsigned command_count =
+      sq_count[HK_SYNC_VDM] + sq_count[HK_SYNC_CDM] + (host_flush ? 1 : 0);
 
    perf_debug_dev(&dev->dev,
                   "Submitting %u control streams (%u command buffers)",
                   command_count, submit->command_buffer_count);
 
-   if (command_count == 0) {
-      /* A barrier-only command buffer still has a second scope in later
-       * submissions. Unsupported kernels retain their existing path. */
-      if (queue->sync.exact_prior &&
-          !hk_sync_resolve_submit(
-             queue, (struct hk_cmd_buffer *const *)submit->command_buffers,
-             submit->command_buffer_count, false, false, 0, NULL))
-         return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
-      return queue_submit_empty(dev, queue, submit);
+   if (ts_carrier) {
+      VkResult carrier_result = hk_queue_ensure_ts_carrier(dev, queue);
+      if (carrier_result != VK_SUCCESS) {
+         *untouched = !bound;
+         return vk_error(queue, carrier_result);
+      }
+   }
+
+   if (host_flush) {
+      VkResult flush_result = hk_queue_ensure_host_flush(dev, queue);
+      if (flush_result != VK_SUCCESS) {
+         *untouched = !bound;
+         return vk_error(queue, flush_result);
+      }
    }
 
    /* Resolved sync fields, one entry per stream occurrence: a
     * simultaneous-use command buffer may occur more than once. A sparse bind
     * that only flushes the sparse table has none, and resizing a never
     * allocated array to zero returns NULL. */
-   const unsigned resolved_count = command_count - flush_sstt;
+   const unsigned resolved_count = command_count - prepend_cdm - host_flush;
    if (resolved_count &&
        !util_dynarray_resize(&queue->sync_resolved, struct hk_sync_resolved,
                              resolved_count)) {
@@ -1652,20 +1952,18 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
-   /* Native M5 keeps the memory of every submitted recording until the
-    * submission retires. Elsewhere the application keeps its recordings
-    * alive, and only the packets' buffer needs it: the BO cache would hand
-    * it out again without waiting for the GPU. Pin before anything below
-    * changes queue or synchronization state, so that a failed allocation
-    * leaves nothing to roll back. */
+   /* Driver-owned buffers used by packed submissions have no application handle to
+    * keep them alive: the BO cache would hand them out again without waiting
+    * for the GPU. Application recordings follow Vulkan lifetime rules while
+    * the device is healthy and are retained during device-loss unwinding in
+    * hk_free_resettable_cmd_buffer(). Pin before anything below changes queue
+    * or synchronization state, so a failed allocation leaves nothing to roll
+    * back. */
    struct hk_cmd_pending *pending = NULL;
-   const bool pin_recordings = agx_chip_g17_m5(dev->dev.chip);
-   if ((pin_recordings || packed_bo) && !dev->dev.is_virtio) {
-      const struct vk_queue_submit no_recordings = {0};
+   if (extra_bo_count && !dev->dev.is_virtio) {
       unsigned chunks = 1 + (command_count - 1) / max_commands_per_submit(dev);
-      VkResult pin_result = hk_cmd_pending_begin(
-         dev, pin_recordings ? original : &no_recordings, chunks, packed_bo,
-         &pending);
+      VkResult pin_result =
+         hk_cmd_pending_begin(dev, chunks, extra_bos, extra_bo_count, &pending);
       if (pin_result != VK_SUCCESS) {
          *untouched = !bound;
          return vk_error(queue, pin_result);
@@ -1673,8 +1971,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    }
 
    bool replaced;
-   VkResult queue_result = hk_queue_ensure_drm(
-      dev, queue, hk_submit_needs_render_rq(submit), &replaced);
+   VkResult queue_result =
+      hk_queue_ensure_drm(dev, queue, render_rq, &replaced);
    if (queue_result != VK_SUCCESS) {
       hk_cmd_pending_end(dev, pending, queue, queue_result);
       return queue_result;
@@ -1691,24 +1989,21 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
    /* Independent engines and physical render queues may finish
     * out of order. Publish API signals from the cumulative queue point,
-    * preserving independent execution while covering earlier work: on G17P
-    * in the ioctl when the kernel accepts a cumulative output
-    * (DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS), otherwise by a transfer after
-    * the ioctl. M5 always transfers, also for its chunked timelines.
+    * preserving independent execution while covering earlier work: in the
+    * ioctl whenever the kernel accepts a cumulative output
+    * (DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) and the submission does not split
+    * across per-chunk timeline points, otherwise by a transfer after the
+    * ioctl.
     */
-   const bool cumulative_signals =
-      dev->dev.chip == AGX_CHIP_G17P ||
-      (agx_chip_g17_m5(dev->dev.chip) &&
-       (dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES));
-   const bool kernel_cumulative = dev->dev.chip == AGX_CHIP_G17P &&
-      submit->signal_count > 0 &&
-      (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS);
-   const unsigned kernel_signal_count =
-      cumulative_signals && !kernel_cumulative ? 0 : submit->signal_count;
+   const bool cumulative_signals = hk_queue_uses_cumulative_signals(&dev->dev);
    const bool chunk_timelines = cumulative_signals &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS) &&
       agx_chip_g17_m5(dev->dev.chip) &&
       command_count > max_commands_per_submit(dev);
+   const bool kernel_cumulative = hk_queue_kernel_cumulative_supported(
+      &dev->dev, cumulative_signals, chunk_timelines, submit->signal_count);
+   const unsigned kernel_signal_count =
+      cumulative_signals && !kernel_cumulative ? 0 : submit->signal_count;
    const uint64_t point_count = chunk_timelines
       ? 1 + (command_count - 1) / max_commands_per_submit(dev) : 1;
    if (queue->drm.timeline_value > UINT64_MAX - point_count) {
@@ -1726,12 +2021,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
     * points of one timeline in a submission. own_wait is its index. */
    int own_wait = -1;
    if (replaced) {
-      own_wait = wait_count;
-      syncs[wait_count++] = (struct drm_asahi_sync){
-         .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
-         .handle = queue->drm.syncobj,
-         .timeline_value = replaced_point,
-      };
+      hk_drm_wait_own_timeline(syncs, &wait_count, 0, &own_wait,
+                               queue->drm.syncobj, replaced_point);
    }
 
    /* Waits an earlier empty submission transferred into the queue timeline
@@ -1740,19 +2031,16 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
     * ordered after the kernel job that first carried them. */
    if (queue->drm.empty_wait_point) {
       uint64_t done = 0;
-      if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1) == 0 &&
-          done >= queue->drm.empty_wait_point) {
-         queue->drm.empty_wait_point = 0;
-      } else if (own_wait >= 0) {
-         syncs[own_wait].timeline_value =
-            MAX2(syncs[own_wait].timeline_value, queue->drm.empty_wait_point);
+      const bool queried =
+         hk_queue_query_progress(dev, queue, queue->drm.empty_wait_point,
+                                 &done);
+      if (hk_drm_empty_wait_pending(queue->drm.empty_wait_point, queried,
+                                    done)) {
+         hk_drm_wait_own_timeline(syncs, &wait_count, 0, &own_wait,
+                                  queue->drm.syncobj,
+                                  queue->drm.empty_wait_point);
       } else {
-         own_wait = wait_count;
-         syncs[wait_count++] = (struct drm_asahi_sync){
-            .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
-            .handle = queue->drm.syncobj,
-            .timeline_value = queue->drm.empty_wait_point,
-         };
+         queue->drm.empty_wait_point = 0;
       }
    }
 
@@ -1764,8 +2052,9 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
        *
        * XXX: This is quadratic time.
        */
-      bool skip = false;
-      if (submit->waits[i].sync->flags & VK_SYNC_IS_TIMELINE) {
+      if (submit->wait_count > 1 &&
+          (submit->waits[i].sync->flags & VK_SYNC_IS_TIMELINE)) {
+         bool skip = false;
          const uint64_t v1 = submit->waits[i].wait_value;
          for (unsigned j = 0; j < submit->wait_count; ++j) {
             const uint64_t v2 = submit->waits[j].wait_value;
@@ -1854,19 +2143,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
    if (flush_sstt) {
       assert(queue->g17p_sstt_flush_bo);
-      if (agx_chip_g17_m5(dev->dev.chip) &&
-          (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) {
-         /* This stream flushes metadata without dispatching a shader. Declare
-          * its empty resource list, as for other flush-only M5 streams.
-          */
-         const struct drm_asahi_cmd_header resources = {
-            .cmd_type = DRM_ASAHI_SET_COMPUTE_RESOURCES,
-            .size = 0,
-            .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
-            .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
-         };
-         util_dynarray_append(&payload, resources);
-      }
+      hk_queue_append_flush_lists(dev->dev.chip, dev->dev.params.features,
+                                  &payload);
       struct drm_asahi_cmd_header header = agx_cmd_header(true, 0, 0);
       const struct drm_asahi_cmd_compute_with_prior cmd = {
          .legacy = {
@@ -1893,8 +2171,10 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
           queue, (struct hk_cmd_buffer *const *)submit->command_buffers,
           submit->command_buffer_count)) {
       uint64_t point = 0;
-      if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &point, 1) == 0)
+      if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &point, 1) == 0) {
+         hk_queue_note_signalled(queue, point);
          completed = point;
+      }
    }
 
    /* Every command's barrier fields come from recorded dependencies. Legacy
@@ -1906,13 +2186,32 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                         queue->sync.stage_overlap;
    const struct hk_sync_resolved *resolved =
       resolve ? queue->sync_resolved.data : NULL;
-   if (resolve && !hk_sync_resolve_submit(queue,
+   const bool chain_first =
+      wait_count > 0 &&
+      !(dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS);
+   bool tail_raised = false;
+   if (resolve && !hk_sync_resolve_submit_ex(queue,
                           (struct hk_cmd_buffer *const *)submit->command_buffers,
-                          submit->command_buffer_count, flush_sstt,
-                          wait_count > 0 &&
-                          !(dev->dev.params.features &
-                            DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS),
-                          completed, queue->sync_resolved.data)) {
+                          submit->command_buffer_count, prepend_cdm,
+                          chain_first, completed, queue->sync_resolved.data,
+                          &tail_raised)) {
+      util_dynarray_fini(&payload);
+      if (unlikely(anatomy))
+         hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
+      hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
+      return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
+   }
+
+   /* The deferred host flush follows the first scopes of the dependencies
+    * that asked for it, as resolved for the whole submission, and the
+    * submission's last command on each subqueue, which covers the first one
+    * where that carries the input syncs or a leading flush. */
+   uint16_t flush_barrier[HK_SYNC_NUM_SQ] = {DRM_ASAHI_BARRIER_NONE,
+                                             DRM_ASAHI_BARRIER_NONE};
+   uint64_t flush_prior[HK_SYNC_NUM_SQ] = {0, 0};
+   if (host_flush &&
+       !hk_sync_host_flush_prefix(&queue->sync, host_flush_kinds, prior_base,
+                                  sq_count, flush_barrier, flush_prior)) {
       util_dynarray_fini(&payload);
       if (unlikely(anatomy))
          hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
@@ -1923,13 +2222,15 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    /* Sibling kernel queues (hk_queue::sib): an eligible submission takes the
     * next kernel queue in turn. Once a sibling has run work, the primary's
     * ordinals differ from sync.submitted: priors are then rewritten for the
-    * kernel queue they go to (hk_sibling_prior), and a submission that
+    * kernel queue they go to (hk_drm_sibling_prior), and a submission that
     * depends on an earlier one also waits for the latest sibling point. */
    unsigned sib_target = 0;
    const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
    bool sib_earlier = false;
-   if (queue->sib.count > 1 && !replaced && !flush_sstt && !unlikely(anatomy) &&
-       !packed_bo &&
+   if (queue->sib.count > 1 && !replaced && !prepend_cdm && !unlikely(anatomy) &&
+       !extra_bo_count && !hk_sibling_packed_atomic_busy(dev, queue) &&
+       !(host_flush &&
+         hk_host_flush_names_earlier(flush_barrier, flush_prior, prior_base)) &&
        hk_sibling_eligible(dev, queue, submit, resolved, prior_base,
                            command_count, kernel_cumulative) &&
        hk_sibling_deep(dev, queue, first_chunk_point - 1)) {
@@ -1953,6 +2254,53 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       kq_base[HK_SYNC_CDM] = queue->sib.submitted[sib_target][HK_SYNC_CDM];
    }
 
+   if (ts_carrier) {
+      assert(queue->ts_carrier_bo);
+      assert(!flush_sstt);
+      hk_queue_append_flush_lists(dev->dev.chip, dev->dev.params.features,
+                                  &payload);
+      struct drm_asahi_cmd_header header = agx_cmd_header(
+         true,
+         queue->sync.exact_prior ? DRM_ASAHI_BARRIER_NONE : 0,
+         queue->sync.exact_prior ? DRM_ASAHI_BARRIER_NONE : 0);
+      struct drm_asahi_cmd_compute_with_prior cmd = {
+         .legacy = {
+            .flags = (dev->dev.params.features &
+                      DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
+                        ? DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS
+                        : 0,
+            .cdm_ctrl_stream_base = queue->ts_carrier_bo->va->addr,
+            .cdm_ctrl_stream_end =
+               queue->ts_carrier_bo->va->addr +
+               AGX3_CDM_BARRIER_SIZE + AGX3_CDM_STREAM_TERMINATE_SIZE,
+            .ts.end.handle = uts_cs->timestamp.start.handle,
+            .ts.end.offset = uts_cs->timestamp.start.offset_B,
+         },
+      };
+      if (queue->sync.exact_prior) {
+         uint64_t prior[HK_SYNC_NUM_SQ] = {
+            prior_base[HK_SYNC_VDM],
+            prior_base[HK_SYNC_CDM],
+         };
+         if (sib_rewrite) {
+            for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+               prior[sq] = hk_drm_sibling_prior(prior[sq], prior_base[sq],
+                                                kq_base[sq], &sib_earlier);
+            }
+         }
+         header.size = sizeof(cmd);
+         cmd.prior_vdm = prior[HK_SYNC_VDM];
+         cmd.prior_cdm = prior[HK_SYNC_CDM];
+      }
+      hk_query_stamps_note_req(dev, queue, queue->drm.timeline_value,
+                               uts_cs->timestamp.start.handle,
+                               uts_cs->timestamp.start.offset_B);
+      util_dynarray_append(&payload, header);
+      util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
+      nr_cdm++;
+   }
+
+   bool packed_atomics = false;
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
@@ -1969,6 +2317,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       }
 
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         if (extra_bo_count && cs->uses_global_atomics)
+            packed_atomics = true;
          if (resolved)
             hk_sync_load_resolved(cs, resolved++);
          struct drm_asahi_cmd_header header =
@@ -1977,14 +2327,18 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
          uint64_t command_prior[HK_SYNC_NUM_SQ] = {
             cs->sync.prior[HK_SYNC_VDM], cs->sync.prior[HK_SYNC_CDM],
          };
+         /* The tiling half's prefix of a render that splits it, which the
+          * staged forms below send. It counts in the same ordinals as the
+          * whole prefix, so it is rewritten for the same kernel queue. */
+         uint64_t ta_command_prior[HK_SYNC_NUM_SQ] = {
+            cs->sync.prior_ta[HK_SYNC_VDM], cs->sync.prior_ta[HK_SYNC_CDM],
+         };
          if (sib_rewrite) {
-            for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
-               command_prior[sq] = hk_sibling_prior(
-                  command_prior[sq], prior_base[sq], kq_base[sq], &sib_earlier);
-               /* A zero barrier names this kernel queue's earlier ioctls. */
-               if (cs->sync.barrier[sq] == 0)
-                  sib_earlier = true;
-            }
+            hk_drm_sibling_prefix(command_prior, cs->sync.barrier, prior_base,
+                                  kq_base, &sib_earlier);
+            if (cs->sync.ta_split)
+               hk_drm_sibling_prefix(ta_command_prior, cs->sync.barrier_ta,
+                                     prior_base, kq_base, &sib_earlier);
          }
          /* The same recording can occur twice in a merged submit (for
           * example synchronization2.basic.event.none_set_reset). Assign
@@ -2053,6 +2407,10 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             }
             struct drm_asahi_cmd_compute_with_prior cmd = {0};
             hk_queue_fill_cdm_command(dev, queue, cs, &cmd.legacy);
+            if (ts_carrier && cs == uts_cs) {
+               cmd.legacy.ts.start.handle = 0;
+               cmd.legacy.ts.start.offset = 0;
+            }
             cmd.legacy.flags |= hk_as_build_flags(dev->dev.chip,
                                                   dev->dev.params.features,
                                                   cs->as_build);
@@ -2089,7 +2447,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                   .resources = cs->g18_compute_resources,
                };
                g18.base.legacy.flags |= DRM_ASAHI_COMPUTE_G18_RESOURCES;
-               g18.resources.version = 1;
+               if (!g18.resources.version)
+                  g18.resources.version = 1;
                struct drm_asahi_cmd_header g18_header = header;
                g18_header.size = sizeof(g18);
                util_dynarray_append(&payload, g18_header);
@@ -2151,42 +2510,56 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                                          cs->render_resources.data,
                                          cs->render_resources.size);
             }
-            struct drm_asahi_cmd_render_with_prior cmd = {0};
+            struct drm_asahi_cmd_render_with_prior cmd;
             asahi_fill_vdm_command(dev, cs, &cmd.legacy);
+            cmd.prior_vdm = 0;
+            cmd.prior_cdm = 0;
+            if (ts_carrier && cs == uts_cs) {
+               cmd.legacy.ts_vtx.start.handle = 0;
+               cmd.legacy.ts_vtx.start.offset = 0;
+            }
             hk_query_stamps_note_cs(dev, queue, queue->drm.timeline_value, cs);
 
             /* M5: the vertex half's own render and compute prefixes, when
              * they are narrower than the whole render's, so its tiling can
              * overlap the fragment work of the renders only its fragment
              * half depends on. Supersedes the single-subqueue forms below. */
+            const bool m5_staged_v2 =
+               agx_chip_g17_m5(dev->dev.chip) && !queue->sync.serialize &&
+               queue->sync.exact_prior &&
+               (dev->dev.params.features &
+                DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
+               cs->sync.ta_split;
             const bool stage_prefixes =
+               !m5_staged_v2 &&
                agx_chip_g17_m5(dev->dev.chip) && !queue->sync.serialize &&
                queue->sync.exact_prior &&
                (dev->dev.params.features &
                 DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES) &&
                cs->sync.ta_split;
-            if (stage_prefixes)
+            if (stage_prefixes || m5_staged_v2)
                cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
 
-            /* G17P: a render whose vertex half depends on less compute work
-             * than its fragment half (image-only producers ordered by image
-             * barriers, fragment-only destinations) goes as a staged render:
-             * the kernel orders its tiling kick after the narrower prefixes
-             * alone, so its vertex work overlaps compute work that only its
-             * fragment half waits for. Every other render keeps the forms
-             * below, which the kernel can publish directly. */
+            /* Native HAL200: a render whose vertex half depends on less
+             * compute work than its fragment half (image-only producers
+             * ordered by image barriers, fragment-only destinations) goes as
+             * a staged render: the kernel orders its tiling kick after the
+             * narrower prefixes alone, so its vertex work overlaps compute
+             * work that only its fragment half waits for. Every other render
+             * keeps the forms below, which the kernel can publish directly.
+             */
             const bool g17p_staged =
-               dev->dev.chip == AGX_CHIP_G17P && !queue->sync.serialize &&
-               queue->sync.exact_prior &&
+               agx_chip_native_hal200(dev->dev.chip) &&
+               !queue->sync.serialize && queue->sync.exact_prior &&
                (dev->dev.params.features &
                 DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
                cs->sync.ta_split &&
                (cs->sync.barrier_ta[HK_SYNC_CDM] !=
                    cs->sync.barrier[HK_SYNC_CDM] ||
-                cs->sync.prior_ta[HK_SYNC_CDM] != cs->sync.prior[HK_SYNC_CDM]);
+                ta_command_prior[HK_SYNC_CDM] != command_prior[HK_SYNC_CDM]);
             if (g17p_staged) {
                cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
-               perf_debug_dev(&dev->dev, "G17P staged render");
+               perf_debug_dev(&dev->dev, "HAL200 staged render");
             }
 
             /* The render's vertex half depends on no earlier render while its
@@ -2195,7 +2568,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
              * the fragment half after them, so this render's vertex work can
              * overlap their fragment work. Compute dependencies keep ordering
              * the vertex half either way. */
-            if (!stage_prefixes && !g17p_staged && !queue->sync.serialize &&
+            if (!stage_prefixes && !m5_staged_v2 && !g17p_staged && !queue->sync.serialize &&
                 (dev->dev.params.features &
                  DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
                 cs->sync.ta_split &&
@@ -2219,12 +2592,12 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                          cs->sync.prior[HK_SYNC_VDM] == 0))
                cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
 
-            /* G17P: a vertex half that still names earlier renders can use
-             * the fragment-only barriers too when the order of tiling kicks
-             * already covers what it names. A staged render takes neither
-             * the flag nor part in ta_cover: its tiling waits only for its
-             * narrower tiling prefix. */
-            if (dev->dev.chip == AGX_CHIP_G17P && !g17p_staged &&
+            /* Native HAL200: a vertex half that still names earlier renders
+             * can use the fragment-only barriers too when the order of tiling
+             * kicks already covers what it names. A staged render takes
+             * neither the flag nor part in ta_cover: its tiling waits only
+             * for its narrower tiling prefix. */
+            if (agx_chip_native_hal200(dev->dev.chip) && !g17p_staged &&
                 !queue->sync.serialize && queue->sync.exact_prior &&
                 (dev->dev.params.features &
                  DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)) {
@@ -2249,14 +2622,14 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_with_stage_prior) ==
                           sizeof(struct drm_asahi_cmd_render_with_prior) + 16);
             const bool stage_cdm =
-               !stage_prefixes &&
+               !stage_prefixes && !m5_staged_v2 &&
                agx_chip_g17_m5(dev->dev.chip) && queue->sync.exact_prior &&
                (dev->dev.params.features &
                 DRM_ASAHI_FEATURE_COMPUTE_STAGE_BARRIERS) &&
                cs->sync.ta_split &&
                (cs->sync.barrier_ta[HK_SYNC_CDM] !=
                    cs->sync.barrier[HK_SYNC_CDM] ||
-                cs->sync.prior_ta[HK_SYNC_CDM] != cs->sync.prior[HK_SYNC_CDM]);
+                ta_command_prior[HK_SYNC_CDM] != command_prior[HK_SYNC_CDM]);
             if (stage_cdm)
                cmd.legacy.flags |= DRM_ASAHI_RENDER_COMPUTE_STAGE_BARRIERS;
             if (unlikely(anatomy))
@@ -2271,17 +2644,18 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             }
             STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_with_ray_query) == 448);
             STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_staged) == 480);
-            if (g17p_staged) {
+            if (g17p_staged || m5_staged_v2) {
                struct drm_asahi_cmd_render_staged staged = {
                   .render = {.legacy = cmd},
                   .stage_prefixes = {
                      .ta_cdm_barrier = cs->sync.barrier_ta[HK_SYNC_CDM],
-                     .ta_prior_cdm = cs->sync.prior_ta[HK_SYNC_CDM],
+                     .ta_prior_cdm = ta_command_prior[HK_SYNC_CDM],
                      .ta_vdm_barrier = cs->sync.barrier_ta[HK_SYNC_VDM],
-                     .ta_prior_vdm = cs->sync.prior_ta[HK_SYNC_VDM],
+                     .ta_prior_vdm = ta_command_prior[HK_SYNC_VDM],
                   },
                };
-               hk_gen1_render_ray_query_stages(dev, cs, staged.render.ray_query);
+               if (g17p_staged)
+                  hk_gen1_render_ray_query_stages(dev, cs, staged.render.ray_query);
                header.size = sizeof(staged);
                util_dynarray_append(&payload, header);
                util_dynarray_append_array(&payload, uint8_t, &staged, header.size);
@@ -2296,9 +2670,9 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                const struct drm_asahi_cmd_render_with_stage_prefixes staged = {
                   .legacy = cmd,
                   .ta_cdm_barrier = cs->sync.barrier_ta[HK_SYNC_CDM],
-                  .ta_prior_cdm = cs->sync.prior_ta[HK_SYNC_CDM],
+                  .ta_prior_cdm = ta_command_prior[HK_SYNC_CDM],
                   .ta_vdm_barrier = cs->sync.barrier_ta[HK_SYNC_VDM],
-                  .ta_prior_vdm = cs->sync.prior_ta[HK_SYNC_VDM],
+                  .ta_prior_vdm = ta_command_prior[HK_SYNC_VDM],
                };
                header.size = sizeof(staged);
                util_dynarray_append(&payload, header);
@@ -2308,7 +2682,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                const struct drm_asahi_cmd_render_with_stage_prior staged = {
                   .legacy = cmd,
                   .ta_cdm_barrier = cs->sync.barrier_ta[HK_SYNC_CDM],
-                  .ta_prior_cdm = cs->sync.prior_ta[HK_SYNC_CDM],
+                  .ta_prior_cdm = ta_command_prior[HK_SYNC_CDM],
                };
                header.size = sizeof(staged);
                util_dynarray_append(&payload, header);
@@ -2323,6 +2697,71 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       }
    }
 
+   if (host_flush) {
+      assert(queue->host_flush_bo);
+      hk_queue_append_flush_lists(dev->dev.chip, dev->dev.params.features,
+                                  &payload);
+      struct drm_asahi_cmd_header header =
+         agx_cmd_header(true, flush_barrier[HK_SYNC_VDM],
+                        flush_barrier[HK_SYNC_CDM]);
+      /* The stream ends with the memory-scoped strong flush, so where the
+       * kernel takes a stream's own completion flush it takes this one, as
+       * for the flush streams command buffers end (hk_EndCommandBuffer()). */
+      const bool visible_completion = hk_cdm_visible_completion(dev);
+      struct drm_asahi_cmd_compute_with_prior cmd = {
+         .legacy = {
+            .flags = ((dev->dev.params.features &
+                       DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
+                         ? DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS
+                         : 0) |
+                     (visible_completion ? DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION
+                                         : 0),
+            .cdm_ctrl_stream_base = queue->host_flush_bo->va->addr,
+            .cdm_ctrl_stream_end =
+               queue->host_flush_bo->va->addr +
+               AGX3_CDM_BARRIER_SIZE + AGX3_CDM_STREAM_TERMINATE_SIZE,
+         },
+      };
+      uint64_t prior[HK_SYNC_NUM_SQ] = {
+         flush_prior[HK_SYNC_VDM], flush_prior[HK_SYNC_CDM],
+      };
+      if (sib_rewrite) {
+         for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+            prior[sq] = hk_drm_sibling_prior(prior[sq], prior_base[sq],
+                                             kq_base[sq], &sib_earlier);
+            if (flush_barrier[sq] == 0)
+               sib_earlier = true;
+         }
+      }
+      if (queue->sync.serialize &&
+          !hk_drm_serialize_prefix(&header, prior, nr_vdm, nr_cdm, prior_base,
+                                   queue->sync.exact_prior)) {
+         util_dynarray_fini(&payload);
+         if (unlikely(anatomy))
+            hk_frame_anatomy_end_submit(anatomy, dev, queue,
+                                        VK_ERROR_DEVICE_LOST);
+         hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
+         return vk_device_set_lost(&dev->vk,
+                                   "Asahi serialization ordinal overflow");
+      }
+      assert(header.vdm_barrier == DRM_ASAHI_BARRIER_NONE ||
+             header.vdm_barrier <= nr_vdm);
+      assert(header.cdm_barrier == DRM_ASAHI_BARRIER_NONE ||
+             header.cdm_barrier <= nr_cdm);
+      if (queue->sync.exact_prior) {
+         header.size = sizeof(cmd);
+         cmd.prior_vdm = prior[HK_SYNC_VDM];
+         cmd.prior_cdm = prior[HK_SYNC_CDM];
+      }
+      if (unlikely(anatomy))
+         hk_frame_anatomy_note(dev, "host flush kinds=0x%x barrier=%u,%u",
+                               host_flush_kinds, header.vdm_barrier,
+                               header.cdm_barrier);
+      util_dynarray_append(&payload, header);
+      util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
+      nr_cdm++;
+   }
+
    if (dev->dev.debug & AGX_DBG_TRACE) {
       agxdecode_drm_cmdbuf(dev->dev.agxdecode, &dev->dev.params, &payload,
                            true);
@@ -2335,18 +2774,10 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
     * first submission already waits for every earlier point. */
    if (sib_remap && sib_earlier && !replaced) {
       assert(sib_target == 0);
-      if (own_wait >= 0) {
-         syncs[own_wait].timeline_value =
-            MAX2(syncs[own_wait].timeline_value, queue->sib.last_point);
-      } else {
-         memmove(&syncs[wait_count + 1], &syncs[wait_count],
-                 (kernel_signal_count + 1) * sizeof(*syncs));
-         syncs[wait_count++] = (struct drm_asahi_sync){
-            .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
-            .handle = queue->drm.syncobj,
-            .timeline_value = queue->sib.last_point,
-         };
-      }
+      /* The signals and the queue's own signal follow the waits. */
+      hk_drm_wait_own_timeline(syncs, &wait_count, kernel_signal_count + 1,
+                               &own_wait, queue->drm.syncobj,
+                               queue->sib.last_point);
    }
 
    struct drm_asahi_submit submit_ioctl = {
@@ -2376,12 +2807,24 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                                    pending);
    }
    hk_cmd_pending_end(dev, pending, queue, result);
+   if (result == VK_SUCCESS) {
+      if (nr_vdm)
+         queue->drm.last_sq_point[HK_SYNC_VDM] = queue->drm.timeline_value;
+      if (nr_cdm)
+         queue->drm.last_sq_point[HK_SYNC_CDM] = queue->drm.timeline_value;
+      if (has_query_reset)
+         queue->drm.last_query_reset_point = queue->drm.timeline_value;
+      if (tail_raised)
+         queue->drm.last_tail_point = queue->drm.timeline_value;
+   }
    if (queue->sib.count > 1 && result == VK_SUCCESS) {
       queue->sib.submitted[sib_target][HK_SYNC_VDM] += nr_vdm;
       queue->sib.submitted[sib_target][HK_SYNC_CDM] += nr_cdm;
       if (sib_target) {
          queue->sib.used = true;
          queue->sib.last_point = queue->drm.timeline_value;
+      } else if (packed_atomics) {
+         queue->sib.packed_atomic_point = queue->drm.timeline_value;
       }
    }
    if (cumulative_signals && !kernel_cumulative) {
@@ -2461,11 +2904,16 @@ DEBUG_GET_ONCE_OPTION(m5_pack_cdm_submit_opt, "ASAHI_M5_PACK_CDM_SUBMIT", NULL)
 static bool
 hk_pack_trace(void)
 {
+   /* Queue submissions on multiple queues may ask first, so keep the cached
+    * answer atomic. Racing first calls compute the same value. */
    static int trace = -1;
-   if (trace < 0)
-      trace = debug_get_bool_option("HK_PACK_CDM_TRACE", false) ||
-              debug_get_bool_option("ASAHI_M5_PACK_CDM_TRACE", false);
-   return trace;
+   int cached = p_atomic_read_relaxed(&trace);
+   if (unlikely(cached < 0)) {
+      cached = debug_get_bool_option("HK_PACK_CDM_TRACE", false) ||
+               debug_get_bool_option("ASAHI_M5_PACK_CDM_TRACE", false);
+      p_atomic_set(&trace, cached);
+   }
+   return cached;
 }
 
 static bool
@@ -2498,39 +2946,57 @@ hk_pack_attachment_limit(const struct hk_device *dev)
  * running packed atomic chains on the same memory lost contributions (root
  * cause unknown), so such streams stay separate commands unless
  * ASAHI_M5_PACK_ATOMICS=1 (or HK_PACK_ATOMICS=1) and the device has a
- * single kernel queue, which runs its commands in order. A second kernel
- * queue created while a packet runs is not covered; unpacked atomic work
- * has the same exposure. The G16 kernel puts every compute command of a VM
- * on its one firmware compute queue and never runs one beside another VM's:
- * several commands of one VM may be in flight there, but the firmware runs
- * them one after another, never beside a packet. G16G packs them unless
- * HK_PACK_ATOMICS=0. That is a property of the G16 kernel, the only one for
- * G16G, which no uAPI feature reports yet; the chip stands for it until one
- * does (hk_pack_atomics_choice()). */
+ * single active kernel queue, which runs its commands in order. On G17P,
+ * packed atomics are enabled by default (disable with HK_PACK_ATOMICS=0)
+ * whenever the single-kernel-queue invariant holds for the lifetime of the
+ * device: no sibling kernel queue is in flight (hk_sibling_in_flight()),
+ * sibling routing stays off until any packed atomic submission completes
+ * (packed_atomic_point), and no other non-emulated VkQueue, host-AS queue,
+ * or compute-kick queue exists on the device. Because kernel queues are
+ * admitted lazily on first submission, checking only whether another queue
+ * already has a kernel queue ID leaves a race where a second queue admits
+ * and submits concurrently before an in-flight packed atomic chain finishes
+ * (and waiting for packed_atomic_point at admission would deadlock valid
+ * wait-before-signal timeline semaphore submits). The G16 kernel puts every
+ * compute command of a VM on its one firmware compute queue and never runs
+ * one beside another VM's: several commands of one VM may be in flight there,
+ * but the firmware runs them one after another, never beside a packet. G16G
+ * packs them unless HK_PACK_ATOMICS=0. That is a property of the G16 kernel,
+ * the only one for G16G, which no uAPI feature reports yet; the chip stands
+ * for it until one does (hk_pack_atomics_choice()). */
 DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
 DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
 
-static bool
-hk_pack_atomics_allowed(struct hk_device *dev, const struct hk_queue *queue)
+bool
+hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue)
 {
    const char *opt = debug_get_option_hk_pack_atomics_opt();
    if (!opt)
       opt = debug_get_option_m5_pack_atomics_opt();
 
+   const struct hk_queue *as = dev->host_as.queue;
+   if (as && as != queue && !vk_queue_is_emulated(&as->vk))
+      return false;
+
    if (dev->dev.chip == AGX_CHIP_G16G)
       return hk_pack_atomics_choice(true, opt, queue->sib.count);
-   if (!hk_pack_atomics_choice(false, opt, queue->sib.count))
+
+   /* Check the chip default / option before querying the syncobj for
+    * sibling activity so disabled callers never pay a drmSyncobjQuery ioctl. */
+   const bool default_on = dev->dev.chip == AGX_CHIP_G17P;
+   if (!hk_pack_atomics_choice(default_on, opt, 1))
+      return false;
+   if (queue->kick.watched || hk_sibling_in_flight(dev, queue))
       return false;
 
    vk_foreach_queue(iter, &dev->vk) {
       if (vk_queue_is_emulated(iter))
          continue;
       const struct hk_queue *other = container_of(iter, struct hk_queue, vk);
-      if (other != queue && other->drm.id != UINT32_MAX)
+      if (other != queue)
          return false;
    }
-   const struct hk_queue *as = dev->host_as.queue;
-   return !as || as == queue || as->drm.id == UINT32_MAX;
+   return true;
 }
 
 /* A submission-owned replacement for a run of command buffers. The
@@ -2541,8 +3007,26 @@ struct hk_packed_submit {
    struct hk_cs cs;
 };
 
+/* A packet member's replacement and the members it spans (hk_pack_runs()). */
+struct hk_pack_fuse_plan {
+   struct hk_shader *shader;
+   enum hk_compute_pair_dual_write dual_write;
+   uint8_t span;
+   uint8_t dual_idx_off;
+   uint8_t copy_idx_off;
+   uint8_t fadd_res_idx;
+   bool is_self_copy;
+   bool suppressed;
+};
+
 struct hk_packed_runs {
    struct agx_bo *bo;
+   /* The fused programs' uniform loaders (hk_emit_fused_compute_dispatch()). */
+   struct agx_bo *ioto_bo;
+   struct agx_bo *root_bo;
+   /* Every buffer the packets read, for the submission to pin
+    * (queue->pack.extra_bos). */
+   struct util_dynarray *extra_bos;
    unsigned packet_count;
    struct hk_packed_submit *packets;
    struct vk_command_buffer **commands;
@@ -2550,13 +3034,53 @@ struct hk_packed_runs {
 };
 
 static void
+hk_queue_pack_free_packets(struct hk_queue *queue)
+{
+   for (unsigned i = 0; i < queue->pack.packets_cap; ++i) {
+      util_dynarray_fini(&queue->pack.packets[i].cs.compute_resources);
+      util_dynarray_fini(&queue->pack.packets[i].cs.query_access_ranges);
+   }
+   free(queue->pack.packets);
+   queue->pack.packets = NULL;
+   queue->pack.packets_cap = 0;
+}
+
+static void *
+hk_queue_pack_scratch(struct util_dynarray *buf, unsigned count,
+                      size_t elem_size)
+{
+   util_dynarray_clear(buf);
+   if (!util_dynarray_resize_bytes(buf, count, elem_size))
+      return NULL;
+   return buf->data;
+}
+
+static bool
+hk_queue_pack_ensure_packets(struct hk_queue *queue, unsigned count)
+{
+   if (count <= queue->pack.packets_cap)
+      return true;
+
+   unsigned new_cap = queue->pack.packets_cap ? queue->pack.packets_cap * 2 : 8;
+   if (new_cap < count)
+      new_cap = count;
+
+   struct hk_packed_submit *packets = calloc(new_cap, sizeof(*packets));
+   if (!packets)
+      return false;
+
+   hk_queue_pack_free_packets(queue);
+   queue->pack.packets = packets;
+   queue->pack.packets_cap = new_cap;
+   return true;
+}
+
+static void
 hk_packed_runs_free(struct hk_device *dev, struct hk_packed_runs *p)
 {
-   for (unsigned i = 0; i < p->packet_count; ++i)
-      util_dynarray_fini(&p->packets[i].cs.compute_resources);
    agx_bo_unreference(&dev->dev, p->bo);
-   free(p->packets);
-   free(p->commands);
+   agx_bo_unreference(&dev->dev, p->ioto_bo);
+   agx_bo_unreference(&dev->dev, p->root_bo);
 }
 
 /* Keep each distinct resource profile once: the kernel folds the list into
@@ -2584,7 +3108,339 @@ hk_pack_dedup_resources(struct util_dynarray *list, size_t unique)
 }
 
 static bool
-hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
+compute_pair_buffers_match(const struct hk_compute_pair_dispatch *producer,
+                           const struct hk_compute_pair_dispatch *clamp)
+{
+   const struct hk_nir_pointwise_clamp *c = &clamp->info.clamp;
+   struct hk_nir_direct_shape ps = {producer->push, sizeof(producer->push)};
+   struct hk_nir_direct_shape cs = {clamp->push, sizeof(clamp->push)};
+   memcpy(ps.groups, producer->groups, sizeof(ps.groups));
+   memcpy(cs.groups, clamp->groups, sizeof(cs.groups));
+
+   uint64_t p_end[4], c_end[2];
+   uint32_t out_off;
+   uint32_t read_off[3];
+   if (producer->info.role == HK_COMPUTE_PAIR_DEPTHWISE) {
+      const struct hk_nir_depthwise_output *p = &producer->info.depthwise;
+      if (!hk_nir_depthwise_clamp_footprint(p, c, &ps, &cs, p_end, c_end))
+         return false;
+      out_off = p->output.offset_B;
+      for (unsigned i = 0; i < 3; ++i)
+         read_off[i] = p->reads[i].offset_B;
+   } else if (producer->info.role == HK_COMPUTE_PAIR_GEMM) {
+      const struct hk_nir_gemm_output *p = &producer->info.gemm;
+      if (!hk_nir_gemm_clamp_footprint(p, c, &ps, &cs, p_end, c_end))
+         return false;
+      out_off = p->output.offset_B;
+      for (unsigned i = 0; i < 3; ++i)
+         read_off[i] = p->reads[i].offset_B;
+   } else {
+      return false;
+   }
+
+   struct hk_compute_pair_interval output, input, result;
+   if (!compute_pair_interval(&producer->bindings[3], out_off, p_end[3], &output) ||
+       !compute_pair_interval(&clamp->bindings[0], c->input.offset_B, c_end[0], &input) ||
+       !compute_pair_interval(&clamp->bindings[1], c->output.offset_B, c_end[1], &result) ||
+       !compute_pair_same_interval(&output, &input) || !compute_pair_same_interval(&output, &result))
+      return false;
+
+   for (unsigned i = 0; i < 3; ++i) {
+      if (i == 2 && p_end[2] == 0)
+         continue; /* Optional bias buffer is absent or unread. */
+      struct hk_compute_pair_interval read;
+      if (!compute_pair_interval(&producer->bindings[i], read_off[i], p_end[i], &read) ||
+          (read.handle == output.handle && read.start < output.end && output.start < read.end))
+         return false;
+   }
+   return true;
+}
+
+static bool
+compute_pair_submit_safe(const struct vk_queue_submit *submit)
+{
+   if (submit->is_protected || vk_queue_submit_has_bind(submit))
+      return false;
+
+   for (unsigned i = 0; i < submit->command_buffer_count; ++i)
+      for (unsigned j = 0; j < i; ++j)
+         if (submit->command_buffers[i] == submit->command_buffers[j])
+            return false;
+   return true;
+}
+
+static bool
+compute_pair_can_replace(const struct hk_cs *producer, const struct hk_cs *consumer)
+{
+   if (!hk_compute_pair_stream_eligible(producer) ||
+       !hk_compute_pair_stream_eligible(consumer))
+      return false;
+
+   const struct hk_compute_pair_dispatch *p = producer->compute_pair;
+   const struct hk_compute_pair_dispatch *c = consumer->compute_pair;
+   if (!p->producer || !p->root_va ||
+       (p->info.role != HK_COMPUTE_PAIR_DEPTHWISE &&
+        p->info.role != HK_COMPUTE_PAIR_GEMM) ||
+       c->info.role != HK_COMPUTE_PAIR_CLAMP ||
+       !hk_nir_clamp_epilogue_valid(&c->info.clamp.epilogue))
+      return false;
+
+   const uint32_t prod_fc =
+      p->info.role == HK_COMPUTE_PAIR_DEPTHWISE
+         ? p->info.depthwise.float_controls_execution_mode
+         : p->info.gemm.float_controls_execution_mode;
+   if (prod_fc != c->info.clamp.epilogue.float_controls_execution_mode)
+      return false;
+
+   return compute_pair_buffers_match(p, c);
+}
+
+static bool
+compute_pair_copy4_match(const struct hk_compute_pair_dispatch *producer,
+                         const struct hk_compute_pair_dispatch *copy4)
+{
+   if (!producer || !copy4 || !producer->producer || !producer->root_va ||
+       producer->alt_kind == HK_COMPUTE_PAIR_ALT_NONE ||
+       copy4->info.role != HK_COMPUTE_PAIR_COPY4)
+      return false;
+
+   const struct hk_compute_pair_copy4 *cp = &copy4->extra.copy4;
+   if (!copy4->bindings[1].address ||
+       copy4->bindings[1].address > UINT64_MAX - cp->dst_start ||
+       cp->src_start > UINT64_MAX - cp->bytes ||
+       cp->dst_start > UINT64_MAX - cp->bytes)
+      return false;
+
+   if (producer->info.role == HK_COMPUTE_PAIR_FADD)
+      return hk_compute_pair_fadd_copy4_match(producer, copy4);
+
+   struct hk_nir_direct_shape ps = {producer->push, sizeof(producer->push)};
+   memcpy(ps.groups, producer->groups, sizeof(ps.groups));
+
+   uint64_t p_end[4] = {0};
+   uint32_t out_off = 0, read_off[3] = {0}, push_bytes = 0, dst_align = 4;
+   if (producer->info.role == HK_COMPUTE_PAIR_DEPTHWISE) {
+      const struct hk_nir_depthwise_output *p = &producer->info.depthwise;
+      if (producer->alt_kind != HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4 ||
+          !hk_nir_depthwise_producer_footprint(p, &ps, p_end, NULL))
+         return false;
+      out_off = p->output.offset_B;
+      for (unsigned i = 0; i < 3; ++i)
+         read_off[i] = p->reads[i].offset_B;
+      push_bytes = p->push_bytes;
+      dst_align = 16;
+   } else if (producer->info.role == HK_COMPUTE_PAIR_GEMM) {
+      const struct hk_nir_gemm_output *p = &producer->info.gemm;
+      if (!hk_compute_pair_alt_is_gemm_cmat(producer->alt_kind) ||
+          !hk_nir_gemm_producer_footprint(p, &ps, p_end, NULL, NULL))
+         return false;
+      out_off = p->output.offset_B;
+      for (unsigned i = 0; i < 3; ++i)
+         read_off[i] = p->reads[i].offset_B;
+      push_bytes = p->push_bytes;
+      dst_align = 4;
+   } else {
+      return false;
+   }
+
+   if (hk_dual_write_push_offset(push_bytes) + sizeof(struct hk_dual_copy_push) >
+       HK_MAX_PUSH_SIZE ||
+       ((copy4->bindings[1].address + cp->dst_start) % dst_align) != 0)
+      return false;
+
+   struct hk_compute_pair_interval output, src, dst;
+   if (!compute_pair_interval(&producer->bindings[3], out_off, p_end[3], &output) ||
+       !compute_pair_interval(&copy4->bindings[0], cp->src_start,
+                              cp->src_start + cp->bytes, &src) ||
+       !compute_pair_interval(&copy4->bindings[1], cp->dst_start,
+                              cp->dst_start + cp->bytes, &dst) ||
+       !compute_pair_same_interval(&output, &src) ||
+       !compute_pair_intervals_disjoint(&output, &dst))
+      return false;
+
+   for (unsigned i = 0; i < 3; ++i) {
+      if (i == 2 && p_end[2] == 0)
+         continue;
+      struct hk_compute_pair_interval read;
+      if (!compute_pair_interval(&producer->bindings[i], read_off[i], p_end[i], &read) ||
+          !compute_pair_intervals_disjoint(&read, &output) ||
+          !compute_pair_intervals_disjoint(&read, &dst))
+         return false;
+   }
+   return true;
+}
+
+static bool
+compute_pair_pad4_match(const struct hk_compute_pair_dispatch *producer,
+                        const struct hk_compute_pair_dispatch *pad4)
+{
+   if (!producer || !pad4 || !producer->producer || !producer->root_va ||
+       producer->info.role != HK_COMPUTE_PAIR_GEMM ||
+       !hk_compute_pair_alt_is_gemm_cmat(producer->alt_kind) ||
+       pad4->info.role != HK_COMPUTE_PAIR_PAD4)
+      return false;
+
+   const struct hk_nir_gemm_output *p = &producer->info.gemm;
+   if (hk_dual_write_push_offset(p->push_bytes) + sizeof(struct hk_dual_pad4_push) >
+       HK_MAX_PUSH_SIZE)
+      return false;
+
+   struct hk_nir_direct_shape ps = {producer->push, sizeof(producer->push)};
+   memcpy(ps.groups, producer->groups, sizeof(ps.groups));
+   uint64_t p_end[4] = {0};
+   uint32_t m = 0, n = 0;
+   if (!hk_nir_gemm_producer_footprint(p, &ps, p_end, &m, &n))
+      return false;
+
+   const struct hk_compute_pair_pad4 *pd = &pad4->extra.pad4;
+   if (pd->in_shape[0] != 1 || pd->out_shape[0] != 1 ||
+       pd->in_shape[3] != pd->out_shape[3] || pd->in_shape[3] != n ||
+       (uint64_t)pd->in_shape[1] * pd->in_shape[2] != m)
+      return false;
+   if (!pad4->bindings[1].address || (pad4->bindings[1].address % 4) != 0 ||
+       !pad4->bindings[2].address || (pad4->bindings[2].address % 4) != 0)
+      return false;
+
+   struct hk_compute_pair_interval output, src, pad_b, dst;
+   if (!compute_pair_interval(&producer->bindings[3], p->output.offset_B, p_end[3], &output) ||
+       !compute_pair_interval(&pad4->bindings[0], 0, pd->in_bytes, &src) ||
+       !compute_pair_interval(&pad4->bindings[1], 0, pd->pad_bytes, &pad_b) ||
+       !compute_pair_interval(&pad4->bindings[2], 0, pd->out_bytes, &dst) ||
+       !compute_pair_same_interval(&output, &src) ||
+       !compute_pair_intervals_disjoint(&output, &dst) ||
+       !compute_pair_intervals_disjoint(&output, &pad_b) ||
+       !compute_pair_intervals_disjoint(&pad_b, &dst))
+      return false;
+
+   for (unsigned i = 0; i < 3; ++i) {
+      if (i == 2 && p_end[2] == 0)
+         continue;
+      struct hk_compute_pair_interval read;
+      if (!compute_pair_interval(&producer->bindings[i], p->reads[i].offset_B,
+                                 p_end[i], &read) ||
+          !compute_pair_intervals_disjoint(&read, &output) ||
+          !compute_pair_intervals_disjoint(&read, &dst))
+         return false;
+   }
+   return true;
+}
+
+static bool
+compute_pair_gemm_fadd_match(const struct hk_compute_pair_dispatch *producer,
+                             const struct hk_compute_pair_dispatch *fadd,
+                             const struct hk_compute_pair_dispatch *copy4,
+                             uint8_t *res_idx_out, bool *inplace_out)
+{
+   if (!producer || !fadd || !producer->producer || !producer->root_va ||
+       producer->info.role != HK_COMPUTE_PAIR_GEMM ||
+       !hk_compute_pair_alt_is_gemm_cmat(producer->alt_kind) ||
+       fadd->info.role != HK_COMPUTE_PAIR_FADD)
+      return false;
+
+   const struct hk_compute_pair_copy4 *fc = &fadd->extra.copy4;
+   if (fc->src_start != 0 || fc->dst_start != 0 || !fc->bytes ||
+       !fadd->bindings[0].address || !fadd->bindings[1].address ||
+       !fadd->bindings[2].address)
+      return false;
+
+   const struct hk_nir_gemm_output *p = &producer->info.gemm;
+   struct hk_nir_direct_shape ps = {producer->push, sizeof(producer->push)};
+   memcpy(ps.groups, producer->groups, sizeof(ps.groups));
+   uint64_t p_end[4] = {0};
+   if (!hk_nir_gemm_producer_footprint(p, &ps, p_end, NULL, NULL))
+      return false;
+
+   struct hk_compute_pair_interval output, src0, src1, fadd_dst;
+   if (!compute_pair_interval(&producer->bindings[3], p->output.offset_B, p_end[3], &output) ||
+       !compute_pair_interval(&fadd->bindings[0], 0, fc->bytes, &src0) ||
+       !compute_pair_interval(&fadd->bindings[1], 0, fc->bytes, &src1) ||
+       !compute_pair_interval(&fadd->bindings[2], 0, fc->bytes, &fadd_dst))
+      return false;
+
+   uint8_t res_idx = 0;
+   struct hk_compute_pair_interval res;
+   if (compute_pair_same_interval(&output, &src0) &&
+       compute_pair_intervals_disjoint(&output, &src1)) {
+      res_idx = 1;
+      res = src1;
+   } else if (compute_pair_same_interval(&output, &src1) &&
+              compute_pair_intervals_disjoint(&output, &src0)) {
+      res_idx = 0;
+      res = src0;
+   } else {
+      return false;
+   }
+
+   const bool inplace = compute_pair_same_interval(&output, &fadd_dst);
+   const bool res_inplace = compute_pair_same_interval(&res, &fadd_dst);
+   if (!inplace && !res_inplace &&
+       (!compute_pair_intervals_disjoint(&output, &fadd_dst) ||
+        !compute_pair_intervals_disjoint(&res, &fadd_dst)))
+      return false;
+
+   if ((fadd->bindings[res_idx].address % 4) != 0 ||
+       (fadd->bindings[2].address % 4) != 0)
+      return false;
+
+   const uint32_t need_extra = copy4 ? sizeof(struct hk_dual_fadd_push)
+                                     : (inplace ? 8u : 16u);
+   if (hk_dual_write_push_offset(p->push_bytes) + need_extra > HK_MAX_PUSH_SIZE)
+      return false;
+
+   struct hk_compute_pair_interval copy_dst = {0};
+   if (copy4) {
+      if (copy4->info.role != HK_COMPUTE_PAIR_COPY4)
+         return false;
+      const struct hk_compute_pair_copy4 *cp = &copy4->extra.copy4;
+      if (!copy4->bindings[1].address ||
+          copy4->bindings[1].address > UINT64_MAX - cp->dst_start ||
+          cp->src_start > UINT64_MAX - cp->bytes ||
+          cp->dst_start > UINT64_MAX - cp->bytes ||
+          ((copy4->bindings[1].address + cp->dst_start) % 4) != 0)
+         return false;
+      struct hk_compute_pair_interval copy_src;
+      if (!compute_pair_interval(&copy4->bindings[0], cp->src_start,
+                                 cp->src_start + cp->bytes, &copy_src) ||
+          !compute_pair_interval(&copy4->bindings[1], cp->dst_start,
+                                 cp->dst_start + cp->bytes, &copy_dst) ||
+          !compute_pair_same_interval(&fadd_dst, &copy_src) ||
+          !compute_pair_intervals_disjoint(&output, &copy_dst) ||
+          !compute_pair_intervals_disjoint(&res, &copy_dst) ||
+          !compute_pair_intervals_disjoint(&fadd_dst, &copy_dst))
+         return false;
+   }
+
+   for (unsigned i = 0; i < 3; ++i) {
+      if (i == 2 && p_end[2] == 0)
+         continue;
+      struct hk_compute_pair_interval read;
+      if (!compute_pair_interval(&producer->bindings[i], p->reads[i].offset_B,
+                                 p_end[i], &read) ||
+          !compute_pair_intervals_disjoint(&read, &output) ||
+          !compute_pair_intervals_disjoint(&read, &fadd_dst) ||
+          (copy4 && !compute_pair_intervals_disjoint(&read, &copy_dst)))
+         return false;
+   }
+
+   *res_idx_out = res_idx;
+   *inplace_out = inplace;
+   return true;
+}
+
+static void
+hk_pack_fold_attachments(struct hk_cs *cs, const struct hk_cs *item)
+{
+   for (unsigned i = 0; i < item->compute_attachments.count; ++i) {
+      const struct drm_asahi_attachment *attachment =
+         &item->compute_attachments.list[i];
+      hk_drm_attachment_set_add(&cs->compute_attachments,
+                                attachment->pointer, attachment->size);
+   }
+   cs->compute_attachments.complete &= item->compute_attachments.complete;
+}
+
+static ATTRIBUTE_NOINLINE bool
+hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
              const struct vk_queue_submit *submit, struct hk_packed_runs *out)
 {
    memset(out, 0, sizeof(*out));
@@ -2593,8 +3449,10 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
        submit->image_opaque_bind_count || !hk_pack_runs_enabled(dev))
       return false;
 
-   uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
-   if (!agx3_cdm_stream_terminate_pack(dev->dev.chip, terminate))
+   uint8_t terminate[HK_PACK_CDM_TERMINATE_MAX];
+   const size_t terminate_size =
+      hk_pack_cdm_terminate(dev->dev.chip, terminate);
+   if (!terminate_size)
       return false;
 
    const bool visible_completion =
@@ -2603,48 +3461,249 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
    const struct hk_pack_limits limits = {
       .max_attachments = hk_pack_attachment_limit(dev),
       .overhead =
-         sizeof(terminate) + HK_CS_SPACE_PADDING + AGX_CDM_STREAM_LINK_LENGTH,
+         terminate_size + HK_CS_SPACE_PADDING + AGX_CDM_STREAM_LINK_LENGTH,
    };
-   struct hk_pack_member *members = malloc(n * sizeof(*members));
-   struct hk_pack_run *runs = malloc(n * sizeof(*runs));
-   if (!members || !runs) {
-      free(members);
-      free(runs);
+   struct hk_pack_member *members =
+      hk_queue_pack_scratch(&queue->pack.members, n, sizeof(*members));
+   struct hk_pack_run *runs =
+      hk_queue_pack_scratch(&queue->pack.runs, n, sizeof(*runs));
+   struct hk_pack_fuse_plan *plans =
+      hk_queue_pack_scratch(&queue->pack.fused, n, sizeof(*plans));
+   if (!members || !runs || !plans)
       return false;
-   }
+   memset(plans, 0, n * sizeof(*plans));
+   util_dynarray_clear(&queue->pack.extra_bos);
+   out->extra_bos = &queue->pack.extra_bos;
 
    const unsigned eligible = hk_pack_describe_submit(
       members, dev, &queue->sync,
       (struct hk_cmd_buffer *const *)submit->command_buffers, n, terminate,
       atomics);
 
+   const bool pair_safe =
+      agx_chip_native_or_m5(dev->dev.chip) && compute_pair_submit_safe(submit);
+   if (pair_safe) {
+      for (unsigned i = 0; i < n; ++i) {
+         if (members[i].cs && hk_compute_pair_stream_eligible(members[i].cs)) {
+            const struct hk_compute_pair_dispatch *p = members[i].cs->compute_pair;
+            if ((p->info.role == HK_COMPUTE_PAIR_DEPTHWISE ||
+                 p->info.role == HK_COMPUTE_PAIR_GEMM ||
+                 p->info.role == HK_COMPUTE_PAIR_FADD) &&
+                AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE > members[i].bytes) {
+               members[i].bytes = AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE;
+            }
+         }
+      }
+   }
+
    unsigned packed_members;
    size_t total;
    const unsigned run_count =
       hk_pack_plan(members, n, &limits, runs, &packed_members, &total);
-   free(members);
 
    if (!run_count) {
       if (hk_pack_trace())
          fprintf(stderr, "HK_PACK runs=0 eligible=%u of %u strong_tails=%d\n",
                  eligible, n,
                  hk_pack_admits_strong_tail(hk_pack_boundary(dev)));
-      free(runs);
+
       return false;
    }
 
-   out->bo = agx_bo_create(&dev->dev, total, 0, 0, "Packed compute submit");
+   unsigned fused_cand_count = 0, dual_cand_count = 0;
+   if (pair_safe) {
+      for (unsigned r = 0; r < run_count; ++r) {
+         const unsigned start = runs[r].first;
+         const unsigned end = start + runs[r].count;
+         for (unsigned i = start; i < end; ++i) {
+            const struct hk_cs *cs_i = members[i].cs;
+            if (!cs_i || !hk_compute_pair_stream_eligible(cs_i))
+               continue;
+            const struct hk_compute_pair_dispatch *p = cs_i->compute_pair;
+            if (p->info.role == HK_COMPUTE_PAIR_SELF_COPY) {
+               plans[i].is_self_copy = true;
+               continue;
+            }
+            if ((p->info.role != HK_COMPUTE_PAIR_DEPTHWISE &&
+                 p->info.role != HK_COMPUTE_PAIR_GEMM &&
+                 p->info.role != HK_COMPUTE_PAIR_FADD) ||
+                !p->producer || !p->root_va)
+               continue;
+
+            unsigned k = i + 1;
+            const struct hk_nir_clamp_epilogue *ep = NULL;
+            if (k < end && members[k].cs &&
+                compute_pair_can_replace(cs_i, members[k].cs)) {
+               ep = &members[k].cs->compute_pair->info.clamp.epilogue;
+               k++;
+            }
+
+            unsigned k_after_self = k;
+            while (k_after_self < end && k_after_self - i < 8 &&
+                   members[k_after_self].cs &&
+                   hk_compute_pair_stream_eligible(members[k_after_self].cs) &&
+                   members[k_after_self].cs->compute_pair->info.role ==
+                      HK_COMPUTE_PAIR_SELF_COPY) {
+               k_after_self++;
+            }
+
+            enum hk_compute_pair_dual_write dual = HK_COMPUTE_PAIR_DUAL_NONE;
+            unsigned dual_idx = 0;
+            unsigned copy_idx = 0;
+            uint8_t fadd_res_idx = 0;
+            if (k_after_self < end && members[k_after_self].cs &&
+                hk_compute_pair_stream_eligible(members[k_after_self].cs)) {
+               const struct hk_compute_pair_dispatch *d =
+                  members[k_after_self].cs->compute_pair;
+               if (d->info.role == HK_COMPUTE_PAIR_COPY4 &&
+                   compute_pair_copy4_match(p, d)) {
+                  dual = HK_COMPUTE_PAIR_DUAL_COPY;
+                  dual_idx = k_after_self;
+               } else if (d->info.role == HK_COMPUTE_PAIR_PAD4 &&
+                          compute_pair_pad4_match(p, d)) {
+                  dual = HK_COMPUTE_PAIR_DUAL_PAD4;
+                  dual_idx = k_after_self;
+               } else if (d->info.role == HK_COMPUTE_PAIR_FADD) {
+                  bool inplace = false;
+                  unsigned k_after_fadd = k_after_self + 1;
+                  while (k_after_fadd < end && k_after_fadd - k_after_self < 8 &&
+                         members[k_after_fadd].cs &&
+                         hk_compute_pair_stream_eligible(members[k_after_fadd].cs) &&
+                         members[k_after_fadd].cs->compute_pair->info.role ==
+                            HK_COMPUTE_PAIR_SELF_COPY) {
+                     k_after_fadd++;
+                  }
+                  const struct hk_compute_pair_dispatch *d2 =
+                     (k_after_fadd < end && members[k_after_fadd].cs &&
+                      hk_compute_pair_stream_eligible(members[k_after_fadd].cs) &&
+                      members[k_after_fadd].cs->compute_pair->info.role ==
+                         HK_COMPUTE_PAIR_COPY4)
+                        ? members[k_after_fadd].cs->compute_pair
+                        : NULL;
+                  if (d2 && compute_pair_gemm_fadd_match(p, d, d2, &fadd_res_idx, &inplace)) {
+                     dual = inplace ? HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE
+                                    : HK_COMPUTE_PAIR_DUAL_FADD_COPY_OUT;
+                     dual_idx = k_after_self;
+                     copy_idx = k_after_fadd;
+                  } else if (compute_pair_gemm_fadd_match(p, d, NULL, &fadd_res_idx, &inplace)) {
+                     dual = inplace ? HK_COMPUTE_PAIR_DUAL_FADD_INPLACE
+                                    : HK_COMPUTE_PAIR_DUAL_FADD_OUT;
+                     dual_idx = k_after_self;
+                  }
+               }
+            }
+
+            if (!ep && dual == HK_COMPUTE_PAIR_DUAL_NONE)
+               continue;
+
+            struct hk_shader *fused = hk_compute_pair_get_or_compile_fused(
+               dev, p->producer, ep, p->alt_kind, dual);
+            if (!fused || !hk_fused_compute_shader_eligible(dev, fused, p)) {
+               /* If dual-write compilation failed but clamp-only is available,
+                * fall back cleanly to clamp-only fusion. */
+               if (ep && dual != HK_COMPUTE_PAIR_DUAL_NONE) {
+                  dual = HK_COMPUTE_PAIR_DUAL_NONE;
+                  dual_idx = 0;
+                  copy_idx = 0;
+                  fused = hk_compute_pair_get_or_compile_fused(
+                     dev, p->producer, ep, p->alt_kind, HK_COMPUTE_PAIR_DUAL_NONE);
+                  if (!fused || !hk_fused_compute_shader_eligible(dev, fused, p))
+                     continue;
+               } else {
+                  continue;
+               }
+            }
+
+            const unsigned end_idx = copy_idx ? copy_idx : dual_idx;
+            const unsigned span =
+               dual != HK_COMPUTE_PAIR_DUAL_NONE ? (end_idx - i + 1) : 2u;
+            plans[i] = (struct hk_pack_fuse_plan){
+               .shader = fused,
+               .dual_write = dual,
+               .span = (uint8_t)span,
+               .dual_idx_off = dual != HK_COMPUTE_PAIR_DUAL_NONE
+                                  ? (uint8_t)(dual_idx - i) : 0,
+               .copy_idx_off = copy_idx ? (uint8_t)(copy_idx - i) : 0,
+               .fadd_res_idx = fadd_res_idx,
+            };
+            fused_cand_count++;
+            if (dual != HK_COMPUTE_PAIR_DUAL_NONE)
+               dual_cand_count++;
+            i += span - 1;
+         }
+      }
+   }
+
+   const bool cached = hk_g17p_cached_cmd_memory(&dev->dev);
+   out->bo = agx_bo_create(&dev->dev, total, 0,
+                           cached ? AGX_BO_WRITEBACK : 0,
+                           "Packed compute submit");
    uint8_t *map = out->bo ? agx_bo_map(out->bo) : NULL;
-   out->packets = calloc(run_count, sizeof(*out->packets));
-   out->commands = malloc((n - packed_members + run_count) * sizeof(*out->commands));
-   if (!map || !out->packets || !out->commands) {
-      free(runs);
+   struct vk_command_buffer **commands =
+      hk_queue_pack_scratch(&queue->pack.commands,
+                            n - packed_members + run_count, sizeof(*commands));
+   if (!map || !commands || !hk_queue_pack_ensure_packets(queue, run_count) ||
+       !hk_pack_add_bo(out->extra_bos, out->bo)) {
       hk_packed_runs_free(dev, out);
       memset(out, 0, sizeof(*out));
       return false;
    }
+   out->packets = queue->pack.packets;
+   out->commands = commands;
 
-   unsigned r = 0;
+   const size_t ioto_stride = ALIGN_POT(
+      MAX2(HK_AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE,
+           HK_AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE),
+      64u);
+   uint8_t *ioto_map = NULL;
+   uint64_t ioto_va = 0;
+   size_t ioto_off = 0, ioto_total = 0;
+   if (fused_cand_count > 0) {
+      ioto_total = ALIGN_POT((size_t)fused_cand_count * ioto_stride, 4096u);
+      out->ioto_bo = agx_bo_create(&dev->dev, ioto_total,
+                                   0, AGX_BO_EXEC | AGX_BO_LOW_VA,
+                                   "Packed compute fused Ioto");
+      ioto_map = out->ioto_bo ? agx_bo_map(out->ioto_bo) : NULL;
+      ioto_va = (out->ioto_bo && out->ioto_bo->va) ? out->ioto_bo->va->addr : 0;
+      if (!ioto_map || !ioto_va ||
+          !agx_va_in_usc_window(&dev->dev, ioto_va) ||
+          !agx_va_in_usc_window(&dev->dev, ioto_va + ioto_total - 1) ||
+          !hk_pack_add_bo(out->extra_bos, out->ioto_bo)) {
+         /* Fall back cleanly to unfused packing. */
+         for (unsigned k = 0; k < n; ++k) {
+            plans[k].shader = NULL;
+            plans[k].dual_write = HK_COMPUTE_PAIR_DUAL_NONE;
+            plans[k].span = 0;
+         }
+         ioto_map = NULL;
+         ioto_va = 0;
+      }
+   }
+
+   const size_t root_stride = ALIGN_POT(sizeof(struct hk_root_descriptor_table), 64u);
+   uint8_t *root_map = NULL;
+   uint64_t root_va = 0;
+   size_t root_off = 0, root_total = 0;
+   if (dual_cand_count > 0 && ioto_map) {
+      root_total = ALIGN_POT((size_t)dual_cand_count * root_stride, 4096u);
+      out->root_bo = agx_bo_create(&dev->dev, root_total, 0, 0,
+                                   "Packed compute dual-write root");
+      root_map = out->root_bo ? agx_bo_map(out->root_bo) : NULL;
+      root_va = (out->root_bo && out->root_bo->va) ? out->root_bo->va->addr : 0;
+      if (!root_map || !root_va || !hk_pack_add_bo(out->extra_bos, out->root_bo)) {
+         for (unsigned k = 0; k < n; ++k) {
+            if (plans[k].dual_write != HK_COMPUTE_PAIR_DUAL_NONE) {
+               plans[k].shader = NULL;
+               plans[k].dual_write = HK_COMPUTE_PAIR_DUAL_NONE;
+               plans[k].span = 0;
+            }
+         }
+         root_map = NULL;
+         root_va = 0;
+      }
+   }
+
+   unsigned r = 0, fused_pairs = 0, self_elided = 0;
    for (unsigned i = 0; i < n;) {
       if (r == run_count || i != runs[r].first) {
          out->commands[out->command_count++] = submit->command_buffers[i++];
@@ -2655,84 +3714,226 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
       struct hk_packed_submit *packet = &out->packets[out->packet_count++];
       struct hk_cmd_buffer *cmd = &packet->cmd;
       struct hk_cs *cs = &packet->cs;
-      cmd->vk.base.device = &dev->vk;
-      list_inithead(&cmd->control_streams);
-      list_addtail(&cs->node, &cmd->control_streams);
-      cs->cmd = cmd;
-      cs->type = HK_CS_CDM;
-      cs->start = cs->current = map + pr->offset;
-      cs->end = map + pr->offset + pr->bytes;
-      cs->addr = out->bo->va->addr + pr->offset;
-      cs->root_size = pr->bytes;
-      cs->sync.seq = 1;
-      cs->visible_completion = visible_completion;
-      hk_drm_attachment_set_init(&cs->compute_attachments);
-      util_dynarray_init(&cs->compute_resources, NULL);
+      hk_pack_init_packet(cmd, cs, dev, map + pr->offset,
+                          out->bo->va->addr + pr->offset, pr->bytes,
+                          visible_completion);
 
+      bool has_non_self = false;
       for (unsigned m = 0; m < pr->count; ++m) {
+         const unsigned idx = pr->first + m;
          const struct hk_cmd_buffer *source =
-            (const void *)submit->command_buffers[pr->first + m];
+            (const void *)submit->command_buffers[idx];
          cs->sync.kind |= list_first_entry(&source->control_streams,
                                            struct hk_cs, node)->sync.kind;
+         if (!plans[idx].is_self_copy)
+            has_non_self = true;
       }
 
       uint8_t preceding_kinds = 0;
       for (unsigned m = 0; m < pr->count; ++m) {
+         const unsigned idx = pr->first + m;
          const struct hk_cmd_buffer *source =
-            (const void *)submit->command_buffers[pr->first + m];
+            (const void *)submit->command_buffers[idx];
          const struct hk_cs *item = list_first_entry(&source->control_streams,
                                                      struct hk_cs, node);
-         void *item_end = (uint8_t *)item->current - sizeof(terminate);
+         const bool is_suppressed_self = has_non_self && plans[idx].is_self_copy;
+         const bool suppressed = plans[idx].suppressed || is_suppressed_self;
          const bool last = m + 1 == pr->count;
 
-         /* The reserved range keeps the merge inline: the link path, which
-          * allocates from the packet's (absent) pool and would point the
-          * packet into the source's stream, must stay unreachable. The
-          * sources are only read here; the application keeps them alive
-          * until the submission completes. */
-         if (!hk_cs_space_fits((uint8_t *)cs->end - (uint8_t *)cs->current,
-                               (uint8_t *)item_end - (uint8_t *)item->start,
-                               AGX_CDM_STREAM_LINK_LENGTH)) {
-            assert(!"packet sized too small");
-            free(runs);
-            hk_packed_runs_free(dev, out);
-            memset(out, 0, sizeof(*out));
-            return false;
-         }
-         const size_t unique = cs->compute_resources.size;
-         hk_cs_merge_cdm_until(cs, item, item_end);
-         hk_pack_dedup_resources(&cs->compute_resources, unique);
+         if (suppressed) {
+            if (is_suppressed_self && !plans[idx].suppressed)
+               self_elided++;
+            hk_pack_fold_attachments(cs, item);
+         } else {
+            bool emitted = false;
+            const struct hk_pack_fuse_plan *pl = &plans[idx];
+            struct hk_shader *fused_shader =
+               (ioto_map && pl->shader && m + pl->span <= pr->count)
+                  ? pl->shader : NULL;
+            const bool needs_root = pl->dual_write != HK_COMPUTE_PAIR_DUAL_NONE;
+            if (fused_shader && ioto_off + ioto_stride <= ioto_total &&
+                (!needs_root || (root_map && root_off + root_stride <= root_total))) {
+               const struct hk_compute_pair_dispatch *p_disp = item->compute_pair;
+               struct hk_compute_pair_dispatch tmp_disp = *p_disp;
+               bool root_ok = true;
+               if (needs_root) {
+                  struct hk_root_descriptor_table *rt =
+                     (struct hk_root_descriptor_table *)(root_map + root_off);
+                  memset(rt, 0, sizeof(*rt));
+                  rt->root_desc_addr = root_va + root_off;
+                  memcpy(rt->sets, p_disp->root_sets, sizeof(rt->sets));
+                  rt->cs.group_count_addr = p_disp->cs_group_count_addr;
+                  memcpy(rt->cs.base_group, p_disp->cs_base_group,
+                         sizeof(rt->cs.base_group));
+                  rt->printf_buffer_address = p_disp->printf_buffer_address;
+                  memcpy(rt->push, p_disp->push, sizeof(rt->push));
 
-         if (visible_completion) {
-            /* Each source ends with a strong flush (hk_pack_run_member()).
-             * The packet's end gets the memory scope, upgrading the record
-             * in place if the source's lacked it, for the host and other
-             * queues, which observe nothing of a packet before its
-             * completion. Between members, the next one reads through the
-             * same addresses, so the scope is needed only where memory can
-             * also be reached through a second address
-             * (hk_cdm_alias_scope()); a source without it keeps its plain
-             * strong flush there. */
-            if (!last && !hk_cdm_alias_scope(dev) &&
-                cs->current == cs->memory_flush_end &&
-                cs->current == cs->strong_flush_end) {
-               uint8_t *word = (uint8_t *)cs->current - AGX3_CDM_BARRIER_SIZE;
-               agx3_cmdstream_store_le32(
-                  word, agx3_cmdstream_load_le32(word) &
-                           ~AGX3_CDM_BARRIER_FLUSH_MEMORY);
-               cs->memory_flush_end = NULL;
+                  const struct hk_cmd_buffer *d_src =
+                     (const void *)submit->command_buffers[idx + pl->dual_idx_off];
+                  const struct hk_cs *d_cs =
+                     list_first_entry(&d_src->control_streams, struct hk_cs, node);
+                  const struct hk_compute_pair_dispatch *d_disp = d_cs->compute_pair;
+                  const uint32_t prod_pb =
+                     p_disp->info.role == HK_COMPUTE_PAIR_DEPTHWISE
+                        ? p_disp->info.depthwise.push_bytes
+                        : p_disp->info.role == HK_COMPUTE_PAIR_FADD
+                             ? p_disp->info.fadd_push_bytes
+                             : p_disp->info.gemm.push_bytes;
+                  const uint32_t dual_off = hk_dual_write_push_offset(prod_pb);
+                  if (pl->dual_write == HK_COMPUTE_PAIR_DUAL_COPY) {
+                     const uint64_t dst2_va =
+                        d_disp->bindings[1].address + d_disp->extra.copy4.dst_start;
+                     struct hk_dual_copy_push dp = {
+                        .dst2_va_lo = (uint32_t)dst2_va,
+                        .dst2_va_hi = (uint32_t)(dst2_va >> 32),
+                     };
+                     memcpy(rt->push + dual_off, &dp, sizeof(dp));
+                  } else if (pl->dual_write == HK_COMPUTE_PAIR_DUAL_PAD4) {
+                     const uint64_t dst2_va = d_disp->bindings[2].address;
+                     const uint64_t pad_va = d_disp->bindings[1].address;
+                     const struct hk_compute_pair_pad4 *pd = &d_disp->extra.pad4;
+                     struct hk_dual_pad4_push dp = {
+                        .dst2_va_lo = (uint32_t)dst2_va,
+                        .dst2_va_hi = (uint32_t)(dst2_va >> 32),
+                        .pad_va_lo = (uint32_t)pad_va,
+                        .pad_va_hi = (uint32_t)(pad_va >> 32),
+                        .in_h = pd->in_shape[1],
+                        .in_w = pd->in_shape[2],
+                        .out_h = pd->out_shape[1],
+                        .out_w = pd->out_shape[2],
+                        .pad_idx = {pd->pad_idx[0], pd->pad_idx[1],
+                                    pd->pad_idx[2], pd->pad_idx[3]},
+                     };
+                     memcpy(rt->push + dual_off, &dp, sizeof(dp));
+                  } else if (hk_compute_pair_dual_is_fadd(pl->dual_write)) {
+                     const uint64_t out_va =
+                        p_disp->bindings[3].address + p_disp->info.gemm.output.offset_B;
+                     const uint64_t res_va =
+                        d_disp->bindings[pl->fadd_res_idx].address + d_disp->extra.copy4.src_start;
+                     const uint64_t dst1_va =
+                        d_disp->bindings[2].address + d_disp->extra.copy4.dst_start;
+                     const uint64_t res_delta = res_va - out_va;
+                     const uint64_t dst1_delta = dst1_va - out_va;
+                     uint64_t dst2_delta = 0;
+                     if (pl->copy_idx_off) {
+                        const struct hk_cmd_buffer *c_src =
+                           (const void *)submit->command_buffers[idx + pl->copy_idx_off];
+                        const struct hk_cs *c_cs =
+                           list_first_entry(&c_src->control_streams, struct hk_cs, node);
+                        const struct hk_compute_pair_dispatch *c_disp = c_cs->compute_pair;
+                        const uint64_t dst2_va =
+                           c_disp->bindings[1].address + c_disp->extra.copy4.dst_start;
+                        dst2_delta = dst2_va - out_va;
+                     }
+                     const bool inplace =
+                        pl->dual_write == HK_COMPUTE_PAIR_DUAL_FADD_INPLACE ||
+                        pl->dual_write == HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE;
+                     struct hk_dual_fadd_push dp = {
+                        .res_delta_lo = (uint32_t)res_delta,
+                        .res_delta_hi = (uint32_t)(res_delta >> 32),
+                        .dst1_delta_lo = (uint32_t)dst1_delta,
+                        .dst1_delta_hi = (uint32_t)(dst1_delta >> 32),
+                        .dst2_delta_lo = (uint32_t)dst2_delta,
+                        .dst2_delta_hi = (uint32_t)(dst2_delta >> 32),
+                     };
+                     const size_t dp_sz = pl->copy_idx_off ? sizeof(dp) : (inplace ? 8u : 16u);
+                     memcpy(rt->push + dual_off, &dp, dp_sz);
+                  } else {
+                     root_ok = false;
+                  }
+                  tmp_disp.root_va = root_va + root_off;
+               }
+
+               const size_t unique = cs->compute_resources.size;
+               size_t ioto_used = 0;
+               if (root_ok &&
+                   hk_pack_add_bo(out->extra_bos, fused_shader->only_linked->b.bo) &&
+                   (!(fused_shader->b.info.has_preamble ||
+                      fused_shader->b.info.rodata.size_16) ||
+                    hk_pack_add_bo(out->extra_bos, fused_shader->bo)) &&
+                   hk_emit_fused_compute_dispatch(dev, cs, fused_shader,
+                                                  &tmp_disp,
+                                                  ioto_map + ioto_off,
+                                                  ioto_va + ioto_off,
+                                                  ioto_stride, &ioto_used)) {
+                  ioto_off += ALIGN_POT(ioto_used, 64u);
+                  if (needs_root)
+                     root_off += root_stride;
+                  hk_pack_fold_attachments(cs, item);
+                  hk_pack_dedup_resources(&cs->compute_resources, unique);
+                  for (unsigned k = 1; k < pl->span; ++k)
+                     plans[idx + k].suppressed = true;
+                  emitted = true;
+                  fused_pairs++;
+               }
             }
-            hk_cdm_visibility_flush(dev, cs, last || hk_cdm_alias_scope(dev));
-         } else if (!last) {
-            /* HAL200: the member's ordering barrier becomes the strong
-             * flush, or its strong flush stays; on parts with a memory-scoped
-             * flush (G17P), add memory scope while aliased mappings exist. */
-            hk_cdm_visibility_flush(dev, cs, hk_cdm_alias_scope(dev));
-         } else if (hk_cdm_memory_scope_form(dev) && hk_cdm_alias_scope(dev) &&
-                    hk_cdm_visibility_flush_needed(dev, cs, true)) {
-            /* A VA-aliasing resource may have been created after the final
-             * member was recorded: upgrade its tail to memory scope in place. */
-            hk_cdm_visibility_flush(dev, cs, true);
+
+            if (!emitted) {
+               void *item_end = (uint8_t *)item->current - terminate_size;
+
+               /* The reserved range keeps the merge inline: the link path,
+                * which allocates from the packet's (absent) pool and would
+                * point the packet into the source's stream, must stay
+                * unreachable. The sources are only read here; the
+                * application keeps them alive until the submission
+                * completes. */
+               if (!hk_cs_space_fits((uint8_t *)cs->end - (uint8_t *)cs->current,
+                                     (uint8_t *)item_end - (uint8_t *)item->start,
+                                     AGX_CDM_STREAM_LINK_LENGTH)) {
+                  assert(!"packet sized too small");
+                  hk_packed_runs_free(dev, out);
+                  memset(out, 0, sizeof(*out));
+                  return false;
+               }
+               const size_t unique = cs->compute_resources.size;
+               hk_cs_merge_cdm_until(cs, item, item_end);
+               hk_pack_dedup_resources(&cs->compute_resources, unique);
+            }
+
+            bool has_later_emitted = false;
+            for (unsigned m2 = m + 1; m2 < pr->count; ++m2) {
+               const unsigned idx2 = pr->first + m2;
+               if (!plans[idx2].suppressed &&
+                   !(has_non_self && plans[idx2].is_self_copy)) {
+                  has_later_emitted = true;
+                  break;
+               }
+            }
+            const bool end = !has_later_emitted;
+
+            if (visible_completion) {
+               /* Each source ends with a strong flush (hk_pack_run_member()).
+                * The packet's end gets the memory scope, upgrading the record
+                * in place if the source's lacked it, for the host and other
+                * queues, which observe nothing of a packet before its
+                * completion. Between members, the next one reads through the
+                * same addresses, so the scope is needed only where memory can
+                * also be reached through a second address
+                * (hk_cdm_alias_scope()); a source without it keeps its plain
+                * strong flush there. */
+               if (!end && !hk_cdm_alias_scope(dev) &&
+                   cs->current == cs->memory_flush_end &&
+                   cs->current == cs->strong_flush_end) {
+                  uint8_t *word = (uint8_t *)cs->current - AGX3_CDM_BARRIER_SIZE;
+                  agx3_cmdstream_store_le32(
+                     word, agx3_cmdstream_load_le32(word) &
+                              ~AGX3_CDM_BARRIER_FLUSH_MEMORY);
+                  cs->memory_flush_end = NULL;
+               }
+               hk_cdm_visibility_flush(dev, cs, end || hk_cdm_alias_scope(dev));
+            } else if (!end) {
+               /* HAL200: the member's ordering barrier becomes the strong
+                * flush, or its strong flush stays; on parts with a
+                * memory-scoped flush (G17P), add memory scope while aliased
+                * mappings exist. */
+               hk_cdm_visibility_flush(dev, cs, hk_cdm_alias_scope(dev));
+            } else if (hk_cdm_memory_scope_form(dev) && hk_cdm_alias_scope(dev) &&
+                       hk_cdm_visibility_flush_needed(dev, cs, true)) {
+               /* A VA-aliasing resource may have been created after the final
+                * member was recorded: upgrade its tail to memory scope in
+                * place. */
+               hk_cdm_visibility_flush(dev, cs, true);
+            }
          }
 
          hk_pack_fold_member(cmd, cs, source, item, last, &preceding_kinds);
@@ -2743,9 +3944,14 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
                 ? cs->memory_flush_end == cs->current
                 : cs->strong_flush_end == cs->current ||
                      cs->weak_barrier_end == cs->current);
-      memcpy(cs->current, terminate, sizeof(terminate));
-      cs->current = (uint8_t *)cs->current + sizeof(terminate);
+      memcpy(cs->current, terminate, terminate_size);
+      cs->current = (uint8_t *)cs->current + terminate_size;
       memset(cs->current, 0, HK_CS_SPACE_PADDING);
+      if (cached) {
+         const size_t written =
+            (uint8_t *)cs->current - (uint8_t *)cs->start + HK_CS_SPACE_PADDING;
+         util_flush_range_no_fence(cs->start, written);
+      }
       hk_pack_finish_sync(cmd, cs);
 
       out->commands[out->command_count++] = &cmd->vk;
@@ -2753,19 +3959,30 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
       r++;
    }
 
+   if (cached)
+      util_post_flush_fence();
+
    if (hk_pack_trace())
-      fprintf(stderr, "HK_PACK runs=%u members=%u eligible=%u of %u commands=%u "
-              "bytes=%zu strong_tails=%d\n", run_count, packed_members,
-              eligible, n, out->command_count, total,
+      fprintf(stderr, "HK_PACK runs=%u members=%u fused=%u self=%u eligible=%u of %u commands=%u "
+              "bytes=%zu strong_tails=%d\n", run_count, packed_members, fused_pairs,
+              self_elided, eligible, n, out->command_count, total,
               hk_pack_admits_strong_tail(hk_pack_boundary(dev)));
-   free(runs);
    return true;
 }
 
 static VkResult
-queue_submit(struct hk_device *dev, struct hk_queue *queue,
-             struct vk_queue_submit *submit, bool *untouched)
+queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
+                     struct vk_queue_submit *submit, bool *untouched)
 {
+   /* Fast-path single-CB and sparse-bind submits before taking the alias
+    * patch rwlock or calling into submit packing (which carries stack buffers
+    * for multi-CB runs). */
+   if (submit->command_buffer_count < 2 || submit->buffer_bind_count ||
+       submit->image_bind_count || submit->image_opaque_bind_count ||
+       !hk_pack_runs_enabled(dev))
+      return queue_submit_recordings(dev, queue, submit, submit, NULL, 0,
+                                     untouched);
+
    /* Packing copies the command buffers' streams: no patch site may be
     * written meanwhile (host_alias.patch_lock). The copies are the only CPU
     * reads of stream words at submission; the GPU reads each word whole. */
@@ -2778,16 +3995,73 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       u_rwlock_rdunlock(&dev->host_alias.patch_lock);
 
    if (!have_runs)
-      return queue_submit_recordings(dev, queue, submit, submit, NULL,
+      return queue_submit_recordings(dev, queue, submit, submit, NULL, 0,
                                      untouched);
 
    struct vk_queue_submit effective = *submit;
    effective.command_buffer_count = runs.command_count;
    effective.command_buffers = runs.commands;
    VkResult result = queue_submit_recordings(dev, queue, &effective, submit,
-                                             runs.bo, untouched);
+                                             util_dynarray_begin(runs.extra_bos),
+                                             util_dynarray_num_elements(
+                                                runs.extra_bos, struct agx_bo *),
+                                             untouched);
    hk_packed_runs_free(dev, &runs);
    return result;
+}
+
+static VkResult
+queue_submit(struct hk_device *dev, struct hk_queue *queue,
+             struct vk_queue_submit *submit, bool *untouched)
+{
+   if (submit->command_buffer_count <= 1)
+      return queue_submit_segment(dev, queue, submit, untouched);
+   bool needs_split = false;
+   for (unsigned i = 1; i < submit->command_buffer_count; ++i) {
+      const struct hk_cmd_buffer *cmd =
+         (const struct hk_cmd_buffer *)submit->command_buffers[i];
+      if (cmd->sync.has_unordered_start_ts) {
+         needs_split = true;
+         break;
+      }
+   }
+   if (!needs_split)
+      return queue_submit_segment(dev, queue, submit, untouched);
+
+   *untouched = true;
+   unsigned start = 0;
+   while (start < submit->command_buffer_count) {
+      unsigned end = start + 1;
+      while (end < submit->command_buffer_count) {
+         const struct hk_cmd_buffer *cmd =
+            (const struct hk_cmd_buffer *)submit->command_buffers[end];
+         if (cmd->sync.has_unordered_start_ts)
+            break;
+         end++;
+      }
+
+      struct vk_queue_submit seg = *submit;
+      seg.command_buffers = submit->command_buffers + start;
+      seg.command_buffer_count = end - start;
+      if (start > 0) {
+         seg.waits = NULL;
+         seg.wait_count = 0;
+      }
+      if (end < submit->command_buffer_count) {
+         seg.signals = NULL;
+         seg.signal_count = 0;
+      }
+
+      bool seg_untouched = false;
+      VkResult result = queue_submit_segment(dev, queue, &seg, &seg_untouched);
+      if (start > 0 || !seg_untouched)
+         *untouched = false;
+      if (result != VK_SUCCESS)
+         return result;
+      start = end;
+   }
+
+   return VK_SUCCESS;
 }
 
 static bool
@@ -2868,6 +4142,7 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       if (err) {
          result = vk_queue_set_lost(&queue->vk, "Wait failed");
       } else {
+         hk_queue_note_signalled(queue, queue->drm.timeline_value);
          VkResult res = dev->vk.check_status(&dev->vk);
          if (result == VK_SUCCESS)
             result = res;
@@ -2877,11 +4152,49 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    return result;
 }
 
+/* Wait, up to timeout_ns in all, for the GPU to finish everything the
+ * application's queues have handed to the kernel, also when the device is
+ * lost: its earlier submissions may still run. Work still queued in the
+ * runtime's submit thread has not reached the kernel and is not waited for.
+ */
+void
+hk_device_wait_submitted(struct hk_device *dev, uint64_t timeout_ns)
+{
+   const uint64_t deadline = os_time_get_absolute_timeout(timeout_ns);
+   const int64_t abs_timeout = (int64_t)MIN2(deadline, (uint64_t)INT64_MAX);
+   bool warned = false;
+
+   list_for_each_entry(struct vk_queue, iter, &dev->vk.queues, link) {
+      struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
+      uint64_t point = 0;
+
+      if (!queue->drm.syncobj)
+         continue;
+
+      /* The last point the kernel accepted, which has a fence: the cursor
+       * may sit past it on a point a failed submission skipped. Failed work
+       * carries an error fence and does not delay this. */
+      if (drmSyncobjQuery2(dev->dev.fd, &queue->drm.syncobj, &point, 1,
+                           DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED) ||
+          !point)
+         continue;
+
+      int ret;
+      do {
+         ret = drmSyncobjTimelineWait(dev->dev.fd, &queue->drm.syncobj, &point,
+                                      1, abs_timeout, 0, NULL);
+      } while (ret == -EINTR);
+      if (ret == -ETIME && !warned) {
+         mesa_logw("hk: device destroyed while its GPU work was still running");
+         warned = true;
+      }
+   }
+}
+
 void
 hk_device_quiesce_lost_submissions(struct hk_device *dev)
 {
-   if (!agx_chip_g17_m5(dev->dev.chip) ||
-       !vk_device_is_lost_no_report(&dev->vk))
+   if (!vk_device_is_lost_no_report(&dev->vk))
       return;
 
    /* GPU storage remains pinned separately. This protects host object data
@@ -2934,30 +4247,90 @@ translate_priority(VkQueueGlobalPriorityKHR prio)
    }
 }
 
+/* Vulkan queues of one device that keep a kernel queue of their own
+ * (hk_queue_share()).
+ *
+ * drm_asahi_queue_limits::max_queues is the kernel's machine-wide pool of
+ * kernel queues, shared with every other client. One Vulkan queue may hold up
+ * to HK_QUEUE_SIBLINGS_MAX of them, its primary and sibling kernel queues.
+ * Dividing the pool by one more than that keeps a single device from claiming
+ * all of it, leaving room for the device's helper queues and for other
+ * clients, and no device needs more than one family advertises. Without
+ * independent kernel queues, including under virtio where the limits cannot
+ * be queried, the Vulkan queues of a priority class and creation flags share
+ * one kernel queue.
+ */
+uint32_t
+hk_queue_independent_budget(struct hk_device *dev)
+{
+   if (!(dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) ||
+       dev->dev.is_virtio || (dev->dev.debug & AGX_DBG_1QUEUE))
+      return 1;
+
+   const uint32_t max_queues = hk_device_physical(dev)->queue_limits.max_queues;
+   return CLAMP(max_queues / (1u + HK_QUEUE_SIBLINGS_MAX), 1u,
+                HK_ADVERTISED_QUEUES);
+}
+
+/* Vulkan queues of the device that run on the kernel queue of `real`, other
+ * than `real` itself. */
+static unsigned
+hk_queue_sharers(struct hk_device *dev, const struct vk_queue *real)
+{
+   unsigned sharers = 0;
+   vk_foreach_queue(iter, &dev->vk) {
+      if (iter != real && iter->real_queue == real)
+         sharers++;
+   }
+   return sharers;
+}
+
 void
 hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
 {
-   /* Keep independent Vulkan submit workers while bounding scarce kernel
-    * contexts per device. Queue families differ in exposed capabilities, but
-    * each kernel queue supports both engines. Priority and creation flags
-    * must match; the common runtime serializes callbacks on the backing queue.
+   /* Every Vulkan queue keeps an independent submit worker. The first ones,
+    * up to the device's budget (hk_queue_independent_budget()), also get a
+    * kernel queue of their own. A later queue shares the kernel queue of an
+    * earlier queue of the same priority class and creation flags, the one
+    * the fewest queues share, so shared work spreads over all of them; it
+    * gets its own only when its class has none yet. Queue families differ in
+    * exposed capabilities, but each kernel queue supports both engines. The
+    * common runtime serializes callbacks on the backing queue.
     */
-   if (!agx_chip_g17_m5(dev->dev.chip))
+   unsigned independent = 0;
+   vk_foreach_queue(iter, &dev->vk) {
+      if (iter == &queue->vk)
+         break;
+      if (!vk_queue_is_emulated(iter))
+         independent++;
+   }
+   if (independent < hk_queue_independent_budget(dev))
       return;
 
+   const bool single_kernel_queue = (dev->dev.debug & AGX_DBG_1QUEUE) != 0;
+   struct vk_queue *backing = NULL;
+   unsigned backing_sharers = 0;
    vk_foreach_queue(iter, &dev->vk) {
       if (iter == &queue->vk)
          break;
       if (vk_queue_is_emulated(iter))
          continue;
-      struct hk_queue *real = container_of(iter, struct hk_queue, vk);
-      if (real->drm.virt_ring_idx != queue->drm.virt_ring_idx ||
-          real->vk.flags != queue->vk.flags)
+      const struct hk_queue *real = container_of(iter, struct hk_queue, vk);
+      if (!single_kernel_queue &&
+          (real->drm.virt_ring_idx != queue->drm.virt_ring_idx ||
+           real->vk.flags != queue->vk.flags))
          continue;
-      queue->vk.driver_submit = NULL;
-      vk_queue_set_emulated(&queue->vk, iter);
-      break;
+      const unsigned sharers = hk_queue_sharers(dev, iter);
+      if (!backing || sharers < backing_sharers) {
+         backing = iter;
+         backing_sharers = sharers;
+      }
    }
+   if (!backing)
+      return;
+
+   queue->vk.driver_submit = NULL;
+   vk_queue_set_emulated(&queue->vk, backing);
 }
 
 static VkResult
@@ -2996,13 +4369,13 @@ hk_queue_create(struct hk_device *dev,
       return VK_ERROR_NOT_PERMITTED_KHR;
    }
 
-   /* On M5, quantize relative priorities to the two unprivileged classes.
-    * M5 only: there the Vulkan queues of one priority class share a kernel
-    * queue (hk_queue_share), so the class is the only scheduling distinction
-    * left between them; this mapping was qualified with the M5 snapshot.
-    * Elsewhere each VkQueue owns its kernel queue and relative priorities
-    * stay a hint, as the spec allows. An explicit global class takes
-    * precedence. No scheduling work is needed during submission.
+   /* On M5, quantize relative priorities to the two unprivileged classes;
+    * this mapping was qualified with the M5 snapshot. Vulkan queues of one
+    * class past the device's budget share kernel queues (hk_queue_share()),
+    * and the class is then the only scheduling distinction left between
+    * them. Elsewhere relative priorities stay a hint, as the spec allows. An
+    * explicit global class takes precedence. No scheduling work is needed
+    * during submission.
     */
    if (agx_chip_g17_m5(dev->dev.chip) && !priority_info &&
        pCreateInfo->pQueuePriorities[index_in_family] < 0.5f)
@@ -3038,16 +4411,14 @@ hk_queue_create(struct hk_device *dev,
       !queue->sync.serialize &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
 
-   queue->drm.id = UINT32_MAX;
+   p_atomic_set(&queue->drm.id, UINT32_MAX);
    for (unsigned i = 0; i < HK_QUEUE_SIBLINGS_MAX; ++i)
       queue->sib.id[i] = UINT32_MAX;
    queue->sib.count = 1;
-   if (dev->dev.chip == AGX_CHIP_G17P && !dev->dev.is_virtio &&
-       queue->sync.exact_prior &&
-       (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) &&
-       (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)) {
-      /* G17P firmware runs compute kicks of one context from sibling
-       * kernel queues at once, so independent compute streams overlap
+   if (hk_queue_sibling_compute_supported(&dev->dev,
+                                          queue->sync.exact_prior)) {
+      /* Firmware runs compute kicks of one context from sibling kernel queues
+       * at once, so independent compute streams overlap
        * (see HK_G17P_SIBLING_QUEUES). */
       queue->sib.count = HK_G17P_SIBLING_QUEUES;
    }
@@ -3087,12 +4458,11 @@ hk_queue_create(struct hk_device *dev,
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
 
-      uint8_t *stream = agx_bo_map(queue->g17p_sstt_flush_bo);
-      if (!stream ||
-          !agx3_cdm_sstt_flush_invalidate_pack(dev->dev.chip, stream) ||
-          !agx3_cdm_stream_terminate_pack(
-             dev->dev.chip,
-             stream + AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE)) {
+      uint8_t record[AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE];
+      if (!agx3_cdm_sstt_flush_invalidate_pack(dev->dev.chip, record) ||
+          !hk_queue_flush_stream_write(
+             dev->dev.chip, agx_bo_map(queue->g17p_sstt_flush_bo),
+             queue->g17p_sstt_flush_bo->size, record, sizeof(record))) {
          hk_queue_finish(dev, queue);
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
@@ -3173,6 +4543,14 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
          agx_destroy_command_queue(&dev->dev, queue->sib.id[i]);
    }
    agx_bo_unreference(&dev->dev, queue->g17p_sstt_flush_bo);
+   agx_bo_unreference(&dev->dev, queue->ts_carrier_bo);
+   agx_bo_unreference(&dev->dev, queue->host_flush_bo);
    util_dynarray_fini(&queue->sync_resolved);
+   hk_queue_pack_free_packets(queue);
+   util_dynarray_fini(&queue->pack.members);
+   util_dynarray_fini(&queue->pack.runs);
+   util_dynarray_fini(&queue->pack.commands);
+   util_dynarray_fini(&queue->pack.fused);
+   util_dynarray_fini(&queue->pack.extra_bos);
    vk_free(&dev->vk.alloc, queue);
 }

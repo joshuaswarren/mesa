@@ -147,3 +147,57 @@ TEST(M5MeshLimits, RejectsInvalidLimitsWithoutMutation)
       EXPECT_EQ(memcmp(&info, &before, sizeof(info)), 0);
    }
 }
+
+TEST(M5MeshTaskPayload, SizesSlotStrideAndRoundTrips)
+{
+   const struct {
+      uint32_t payload_size_B;
+      uint32_t expected_blocks;
+   } cases[] = {
+      {0, 1},
+      {16, 1},
+      {1024, 1},
+      {1025, 2},
+      {1040, 2},
+      {2048, 2},
+      {16400, 17},
+   };
+
+   for (const auto &c : cases) {
+      agx_vdm_mesh_state_info info = {};
+      info.object_pipeline = UINT64_C(0x100000);
+      info.mesh_pipeline = UINT64_C(0x200000);
+      info.raw_mesh_template = 0x40;
+      ASSERT_TRUE(agx_vdm_m5_mesh_set_output_limits(&info, 192, 64, 8));
+      ASSERT_TRUE(agx_vdm_m5_mesh_set_task_payload(&info, c.payload_size_B));
+      EXPECT_EQ(info.raw_tail[0], c.expected_blocks);
+
+      uint8_t bytes[AGX_VDM_MESH_STATE_LENGTH];
+      ASSERT_TRUE(agx_vdm_mesh_state_pack(AGX_CHIP_G17S, &info, bytes));
+
+      uint32_t packed_tail0 = 0;
+      memcpy(&packed_tail0, bytes + 36, sizeof(packed_tail0));
+      EXPECT_EQ(packed_tail0, c.expected_blocks);
+
+      agx_vdm_mesh_state_info unpacked = {};
+      ASSERT_TRUE(
+         agx_vdm_mesh_state_unpack(AGX_CHIP_G17S, bytes, sizeof(bytes), &unpacked));
+      EXPECT_EQ(unpacked.raw_tail[0], c.expected_blocks);
+      EXPECT_EQ(unpacked.raw_tail[1], info.raw_tail[1]);
+      EXPECT_EQ(unpacked.raw_tail[4], info.raw_tail[4]);
+   }
+}
+
+TEST(M5MeshTaskPayload, RejectsInvalidPayloadWithoutMutation)
+{
+   EXPECT_FALSE(agx_vdm_m5_mesh_set_task_payload(nullptr, 1024));
+
+   for (uint32_t bad : {AGX_VDM_M5_MESH_MAX_TASK_PAYLOAD_BYTES + 1u,
+                        UINT32_C(32768), UINT32_MAX}) {
+      agx_vdm_mesh_state_info info;
+      memset(&info, 0x5a, sizeof(info));
+      const auto before = info;
+      EXPECT_FALSE(agx_vdm_m5_mesh_set_task_payload(&info, bad));
+      EXPECT_EQ(memcmp(&info, &before, sizeof(info)), 0);
+   }
+}

@@ -184,14 +184,19 @@ libagx_write_u32s(constant struct libagx_imm_write *p)
 }
 
 /*
+ * Copy earlier timestamps into later queries, one pair per thread, so a batch
+ * of copies is one launch and one flush.
+ *
  * We set the source as volatile since the caching situation around timestamps
  * is a bit unclear. It might not be necessary but - absent hardware/firmware
  * documentation - this gives me peace of mind.
  */
-KERNEL(1)
-libagx_copy_timestamp(global uint64_t *dest, volatile global uint64_t *src)
+KERNEL(32)
+libagx_copy_timestamps(constant struct libagx_timestamp_copy *p)
 {
-   *dest = *src;
+   uint id = cl_global_id.x;
+   volatile global uint64_t *src = p[id].src;
+   *(p[id].dest) = *src;
 }
 
 KERNEL(1)

@@ -1304,6 +1304,15 @@ enum gl_access_qualifier
     * address and the bound size in bytes, whatever path the program takes.
     */
    ACCESS_BUFFER_DESCRIPTOR_AGX = (1 << 24),
+
+   /**
+    * On Asahi, this load reads a buffer binding descriptor (address low,
+    * address high, bound size in bytes, ...) emitted by descriptor lowering.
+    * Unlike ACCESS_BUFFER_DESCRIPTOR_AGX, the binding may be partially bound
+    * or dynamically indexed, so this identifies the descriptor's origin only
+    * when an access through it executes (never that speculation is safe).
+    */
+   ACCESS_BUFFER_BINDING_AGX = (1 << 25),
 };
 
 enum gl_tess_spacing

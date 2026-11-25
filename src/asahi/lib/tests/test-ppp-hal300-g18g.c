@@ -745,14 +745,15 @@ test_closed_forms(void)
    CHECK(!agx_vdm_stream_link_core_supported(AGX_CHIP_G18G));
    CHECK(!agx_vdm_tessellate_direct_target_supported(AGX_CHIP_G18G));
 
-   /* Lines are a G18G shape; a point size on a line has no capture. */
+   /* Lines are a G18G shape, including TES isolines carrying a default
+    * point-size UVS word. */
    struct agx_ppp_hal300_graphics_fields lines = {
       .fragment_program = 0x10000168780,
       .object_type = AGX_PPP_HAL300_LINES,
       .point_size_output = true,
    };
    struct agx_ppp_hal300_graphics_core out;
-   CHECK(!agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G18G, &lines, &out));
+   CHECK(agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G18G, &lines, &out));
    lines.point_size_output = false;
    CHECK(agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G18G, &lines, &out));
    lines.object_type = (enum agx_ppp_hal300_object_type)3;

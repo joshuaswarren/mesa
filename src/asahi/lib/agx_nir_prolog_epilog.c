@@ -167,14 +167,6 @@ lower_native_emrt_uniforms(nir_builder *b, nir_intrinsic_instr *intr, void *data
    b->cursor = nir_before_instr(&intr->instr);
 
    if (intr->intrinsic == nir_intrinsic_bindless_image_store) {
-      nir_def *value = intr->src[3].ssa;
-      nir_alu_type type = nir_alu_type_get_base_type(nir_intrinsic_src_type(intr));
-      if (value->bit_size < 32) {
-         value = type == nir_type_float ? nir_f2f32(b, value) :
-                 type == nir_type_int ? nir_i2i32(b, value) : nir_u2u32(b, value);
-         nir_src_rewrite(&intr->src[3], value);
-         nir_intrinsic_set_src_type(intr, type | 32);
-      }
       /* G17P's existing bindless store consumes native 32-byte PBE records,
        * not byte offsets. Descriptor crawls retain their byte handles. */
       nir_intrinsic_instr *handle = nir_src_as_intrinsic(intr->src[0]);
@@ -536,6 +528,21 @@ lower_tests_zs(nir_shader *s, bool value)
                                      nir_metadata_control_flow, &value);
 }
 
+/* A shader part that does not own Z/S tests only kills its targeted samples.
+ * Its generated LIVE complement is disjoint from TARGET, so canonicalize
+ * LIVE to zero before source provenance is lost during later lowering. */
+static bool
+lower_sample_mask_kill_only(nir_builder *b, nir_intrinsic_instr *intr,
+                            UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_sample_mask_agx)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(&intr->src[1],
+                   nir_imm_intN_t(b, 0, intr->src[1].ssa->bit_size));
+   return true;
+}
+
 static inline bool
 blend_uses_2src(struct agx_blend_rt_key rt)
 {
@@ -707,31 +714,16 @@ convert_scaled_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 static void
-agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
+agx_nir_fs_epilog_native(nir_builder *b, const void *key_,
+                         struct agx_fs_epilog_result *res)
 {
    const struct agx_fs_epilog_key *key = key_;
+   if (res)
+      *res = (struct agx_fs_epilog_result){0};
    b->shader->info.stage = MESA_SHADER_FRAGMENT;
    b->shader->info.name = "FS epilog";
 
-   struct agx_tilebuffer_layout tib =
-      key->g18_native_mixed
-         ? agx_build_tilebuffer_layout_g18_mixed(key->rt_formats,
-                                                 ARRAY_SIZE(key->rt_formats))
-      : key->rt0_resident
-         ? agx_build_tilebuffer_layout_rt0_resident(
-              key->rt_formats, ARRAY_SIZE(key->rt_formats), key->nr_samples,
-              key->max_bytes_per_tile, key->max_samples_per_tile)
-         : key->native_imageblock
-              ? agx_build_tilebuffer_layout_resident(
-                   key->rt_formats, ARRAY_SIZE(key->rt_formats),
-                   key->nr_samples, true, key->max_sample_size_B,
-                   key->max_bytes_per_tile, key->max_samples_per_tile,
-                   key->resident_mask)
-              : agx_build_tilebuffer_layout_with_limits_resident(
-                   key->rt_formats, ARRAY_SIZE(key->rt_formats),
-                   key->nr_samples, true, key->max_sample_size_B,
-                   key->max_bytes_per_tile, key->max_samples_per_tile,
-                   key->resident_mask);
+   struct agx_tilebuffer_layout tib = agx_fs_epilog_tilebuffer_layout(key);
 
    unsigned rt_order[AGX_MAX_RENDER_TARGETS];
    for (unsigned rt = 0; rt < ARRAY_SIZE(rt_order); ++rt)
@@ -807,6 +799,34 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
          continue;
       }
 
+      /* Constant clear-fill for an unwritten LOAD_OP_CLEAR attachment so every
+       * bound attachment is written and the draw can stay OPAQUE/PUNCH_THROUGH
+       * for ISP hidden-surface removal even across hardware partial renders. */
+      const enum agx_epilog_clear_fill cf =
+         agx_fs_epilog_clear_fill_for_rt(key, rt);
+      if (cf != AGX_EPILOG_CLEAR_FILL_NONE &&
+          key->rt_formats[rt] != PIPE_FORMAT_NONE) {
+         const enum pipe_format fmt = key->rt_formats[rt];
+         nir_def *val;
+         if (util_format_is_pure_integer(fmt)) {
+            const uint32_t c0 = cf == AGX_EPILOG_CLEAR_FILL_WHITE ? 1u : 0u;
+            const uint32_t ca = cf == AGX_EPILOG_CLEAR_FILL_ZERO ? 0u : 1u;
+            val = nir_imm_ivec4(b, c0, c0, c0, ca);
+         } else {
+            const float c0 = cf == AGX_EPILOG_CLEAR_FILL_WHITE ? 1.0f : 0.0f;
+            const float ca = cf == AGX_EPILOG_CLEAR_FILL_ZERO ? 0.0f : 1.0f;
+            val = nir_imm_vec4(b, c0, c0, c0, ca);
+         }
+         const nir_alu_type src_type =
+            util_format_is_pure_sint(fmt)   ? nir_type_int32
+            : util_format_is_pure_uint(fmt) ? nir_type_uint32
+                                            : nir_type_float32;
+         nir_store_output(b, val, nir_imm_int(b, 0),
+                          .io_semantics.location = FRAG_RESULT_DATA0 + rt,
+                          .src_type = src_type);
+         continue;
+      }
+
       /* Negative remaps indicate the attachment isn't written. */
       if (location >= 0 && key->link.loc_written & BITFIELD_BIT(location)) {
          copy_colour(b, key, rt, location, false);
@@ -832,6 +852,7 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
       tib.tile_size = 16 * 16;
 
    bool force_translucent = false;
+   bool non_unwritten_translucent = false;
    nir_lower_blend_options opts = {
       .scalar_blend_const = true,
       .logicop_enable = key->blend.logicop_enable,
@@ -841,7 +862,19 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
    static_assert(ARRAY_SIZE(opts.rt) == 8, "max RTs out of sync");
 
    for (unsigned i = 0; i < 8; ++i) {
-      if (key->blend.rt[i].advanced_blend) {
+      if (agx_fs_epilog_clear_fill_for_rt(key, i) !=
+          AGX_EPILOG_CLEAR_FILL_NONE) {
+         opts.rt[i] = (nir_lower_blend_rt){
+            .format = key->rt_formats[i],
+            .rgb.src_factor = PIPE_BLENDFACTOR_ONE,
+            .rgb.dst_factor = PIPE_BLENDFACTOR_ZERO,
+            .rgb.func = PIPE_BLEND_ADD,
+            .alpha.src_factor = PIPE_BLENDFACTOR_ONE,
+            .alpha.dst_factor = PIPE_BLENDFACTOR_ZERO,
+            .alpha.func = PIPE_BLEND_ADD,
+            .colormask = (uint8_t)BITFIELD_MASK(4),
+         };
+      } else if (key->blend.rt[i].advanced_blend) {
          const struct agx_blend_advanced blend =
             agx_unpack_blend_advanced(key->blend.rt[i].mode);
 
@@ -880,15 +913,27 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
 
    /* It's more efficient to use masked stores (with
     * agx_nir_lower_tilebuffer) than to emulate colour masking with
-    * nir_lower_blend.
+    * nir_lower_blend. Not where multisampled tile accesses move whole
+    * samples (ms_whole_sample, at 2x/4x): a mask that leaves some of the
+    * format's channels unwritten there reads, merges and stores each sample
+    * whole, as blending does. A mask of every channel the format has is a
+    * full one. Alpha-to-coverage keeps the masked store: its epilog computes
+    * the coverage, which the merge's per-sample stores cannot take as their
+    * mask.
     */
    uint8_t colormasks[8] = {0};
+   const bool g18_ms = key->ms_whole_sample && key->nr_samples > 1 &&
+                       !key->blend.alpha_to_coverage;
 
    for (unsigned i = 0; i < 8; ++i) {
       if (key->rt_formats[i] == PIPE_FORMAT_NONE)
          continue;
 
-      if (key->blend.rt[i].colormask == 0) {
+      if (agx_fs_epilog_clear_fill_for_rt(key, i) !=
+          AGX_EPILOG_CLEAR_FILL_NONE) {
+         colormasks[i] = (uint8_t)BITFIELD_MASK(4);
+         opts.rt[i].colormask = (uint8_t)BITFIELD_MASK(4);
+      } else if (key->blend.rt[i].colormask == 0) {
          /* Writing nothing needs no masked store, so this costs nothing even
           * where the tilebuffer cannot mask -- and it must go this way. Left
           * to nir_lower_blend, a mask of zero deletes the store outright, and
@@ -897,7 +942,11 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
           */
          colormasks[i] = 0;
          opts.rt[i].colormask = (uint8_t)BITFIELD_MASK(4);
-      } else if (agx_tilebuffer_supports_mask(&tib, i)) {
+      } else if ((!g18_ms ||
+                  util_format_colormask_full(
+                     util_format_description(key->rt_formats[i]),
+                     key->blend.rt[i].colormask)) &&
+                 agx_tilebuffer_supports_mask(&tib, i)) {
          colormasks[i] = key->blend.rt[i].colormask;
          opts.rt[i].colormask = (uint8_t)BITFIELD_MASK(4);
       } else {
@@ -912,6 +961,7 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
       if ((opts.rt[i].colormask & BITFIELD_MASK(comps)) !=
           BITFIELD_MASK(comps)) {
          force_translucent = true;
+         non_unwritten_translucent = true;
       }
    }
 
@@ -1092,14 +1142,21 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
          ? NULL : write_samples;
    if (write_samples && !store_samples) {
       /* A masked colour store still requires a translucent pass. */
-      for (unsigned rt = 0; rt < ARRAY_SIZE(tib.logical_format); ++rt)
-         force_translucent |= tib.logical_format[rt] != PIPE_FORMAT_NONE;
+      for (unsigned rt = 0; rt < ARRAY_SIZE(tib.logical_format); ++rt) {
+         if (tib.logical_format[rt] != PIPE_FORMAT_NONE) {
+            force_translucent = true;
+            non_unwritten_translucent = true;
+         }
+      }
    }
    unsigned rt_spill = key->link.rt_spill_base;
-   NIR_PASS(_, b->shader, agx_nir_lower_tilebuffer_with_conversions, &tib,
+   struct agx_tilebuffer_lower_info tib_info = {0};
+   NIR_PASS(_, b->shader, agx_nir_lower_tilebuffer_with_conversions_info, &tib,
             colormasks, &rt_spill, store_samples, &force_translucent,
             preserve_zero_mask, key->lower_srgb, key->lower_r11g11b10,
-            key->g17p_tile_formats, key->native_epilog);
+            key->ms_whole_sample, key->g17p_tile_formats, key->native_epilog,
+            &tib_info);
+   non_unwritten_translucent |= tib_info.translucent_other;
    const bool native_spills = key->native_spills && agx_tilebuffer_spills(&tib);
    const unsigned spill_generation = native_spills
       ? (key->native_spill_generation ? key->native_spill_generation : 9) : 0;
@@ -1216,10 +1273,20 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
     * running our own tests, unless the fragment shader forced early tests.
     */
    NIR_PASS(_, b->shader, lower_tests_zs, !key->link.already_ran_zs);
+   if (key->link.already_ran_zs && b->shader->info.fs.uses_discard)
+      NIR_PASS(_, b->shader, nir_shader_intrinsics_pass,
+               lower_sample_mask_kill_only, nir_metadata_control_flow, NULL);
 
+   non_unwritten_translucent |= b->shader->info.fs.uses_fbfetch_output;
    b->shader->info.io_lowered = true;
    b->shader->info.fs.uses_fbfetch_output |= force_translucent;
    b->shader->info.fs.uses_sample_shading = key->link.sample_shading;
+   if (res) {
+      res->translucent_only_for_unwritten_rts =
+         force_translucent && tib_info.has_unwritten_rt &&
+         !non_unwritten_translucent && tib_info.outputs_written != 0;
+      res->color_rts_written = tib_info.outputs_written;
+   }
    /* The epilog runs inside the interlock its main opened by waiting for
     * the read class alone (a framebuffer fetch); agx_compile.c seeds the
     * epilog's waited classes from this. */
@@ -1228,13 +1295,21 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
 }
 
 void
-agx_nir_fs_epilog(nir_builder *b, const void *key_)
+agx_nir_fs_epilog_ex(nir_builder *b, const struct agx_fs_epilog_key *key,
+                     struct agx_fs_epilog_result *res)
 {
-   const struct agx_fs_epilog_key *key = key_;
+   if (res)
+      *res = (struct agx_fs_epilog_result){0};
    if (!key->g17p_tile_formats && !key->native_epilog)
       agx_nir_fs_epilog_agx2(b, key);
    else
-      agx_nir_fs_epilog_native(b, key);
+      agx_nir_fs_epilog_native(b, key, res);
+}
+
+void
+agx_nir_fs_epilog(nir_builder *b, const void *key_)
+{
+   agx_nir_fs_epilog_ex(b, key_, NULL);
 }
 
 /*
@@ -1617,7 +1692,7 @@ agx_nir_lower_fs_output_to_epilog_for_device(
    nir_shader *s, enum agx_chip chip, struct agx_fs_epilog_link_info *out)
 {
    return lower_fs_output_to_epilog(
-      s, out, agx_chip_native_or_m5(chip),
+      s, out, agx_chip_agx3_path(chip),
       agx_chip_native_agx3(chip), agx_chip_native_agx3(chip));
 }
 
@@ -1802,21 +1877,6 @@ agx_nir_lower_stats_fs(nir_shader *s)
    return nir_progress(true, b->impl, nir_metadata_control_flow);
 }
 
-/* A prolog that does not own Z/S tests only kills its targeted samples.
- * Its generated LIVE complement is disjoint from TARGET, so canonicalize
- * LIVE to zero before source provenance is lost during later lowering. */
-static bool
-lower_prolog_kill_only(nir_builder *b, nir_intrinsic_instr *intr,
-                      UNUSED void *data)
-{
-   if (intr->intrinsic != nir_intrinsic_sample_mask_agx)
-      return false;
-   b->cursor = nir_before_instr(&intr->instr);
-   nir_src_rewrite(&intr->src[1],
-                   nir_imm_intN_t(b, 0, intr->src[1].ssa->bit_size));
-   return true;
-}
-
 void
 agx_nir_fs_prolog(nir_builder *b, const void *key_)
 {
@@ -1867,22 +1927,24 @@ agx_nir_fs_prolog(nir_builder *b, const void *key_)
     * from sample_mask semantics, not from a chip. */
    if (!key->run_zs_tests)
       NIR_PASS(_, b->shader, nir_shader_intrinsics_pass,
-               lower_prolog_kill_only, nir_metadata_control_flow, NULL);
+               lower_sample_mask_kill_only, nir_metadata_control_flow, NULL);
 
    b->shader->info.io_lowered = true;
 }
 
 void
-agx_nir_fs_epilog_g17p(nir_builder *b, const void *key_)
+agx_nir_fs_epilog_g17p_ex(nir_builder *b, const struct agx_fs_epilog_key *key,
+                          struct agx_fs_epilog_result *res)
 {
-   const struct agx_fs_epilog_key *key = key_;
+   if (res)
+      *res = (struct agx_fs_epilog_result){0};
    if (key->link.sample_shading) {
       /* The main fragment exported every sample's colours. Build the per-pixel
        * epilog, then store and blend each sample from its own colours. */
       struct agx_fs_epilog_key pixel = *key;
       pixel.link.sample_shading = false;
       pixel.defer_monolithic_msaa = true;
-      agx_nir_fs_epilog_native(b, &pixel);
+      agx_nir_fs_epilog_native(b, &pixel, res);
 
       struct agx_g17p_colour_layout layout;
       agx_g17p_colour_layout_init(&layout, key->link.loc_written,
@@ -1914,10 +1976,16 @@ agx_nir_fs_epilog_g17p(nir_builder *b, const void *key_)
       struct agx_fs_epilog_key pixel = *key;
       pixel.defer_monolithic_msaa = key->blend.alpha_to_coverage &&
                                     key->nr_samples > 1 && !key->native_spills;
-      agx_nir_fs_epilog_native(b, &pixel);
+      agx_nir_fs_epilog_native(b, &pixel, res);
    }
 
    NIR_PASS(_, b->shader, agx_nir_lower_g17p_tile_samples, key->nr_samples);
+}
+
+void
+agx_nir_fs_epilog_g17p(nir_builder *b, const void *key_)
+{
+   agx_nir_fs_epilog_g17p_ex(b, key_, NULL);
 }
 
 /* Both API frontends use the same bounded register ABI for an unrolled main
@@ -1957,4 +2025,138 @@ agx_nir_lower_g17p_sample_shading(nir_shader *nir,
 {
    return agx_nir_lower_g17p_sample_shading_file(nir, link, samples,
                                                  AGX3B_NUM_REGS, false);
+}
+
+/*
+ * Inline blending: append a colour epilog to the fragment main it was built
+ * for, so the backend compiles a single program.
+ *
+ * In a split link, export_agx copies a value into GPRs at the end of the main
+ * and load_exported_agx reads those GPRs at the start of the epilog. Nothing
+ * runs in between, so in one program each such load is the exported value
+ * itself. That holds only for a load of exactly what the main exported, so
+ * this refuses:
+ *
+ *  - a main that reads exported registers itself (a prolog's exports or a
+ *    hardware preload): load_exported_agx must stay in the first block of its
+ *    shader part;
+ *  - an export outside the main's last block, or one overlapping another;
+ *  - a load of an exported register at another width or offset;
+ *  - a load of a register below the colour exports that the main never wrote.
+ *    The split epilog reads whatever the hardware or the prolog left there.
+ *
+ * A colour component the main never wrote is undefined in the API. The split
+ * epilog reads a register nothing wrote, and the single program reads an
+ * undefined value.
+ */
+#define AGX_EXPORT_HALFS 256
+
+bool
+agx_nir_inline_fs_epilog(nir_shader *nir, nir_shader *epilog)
+{
+   assert(nir->info.stage == MESA_SHADER_FRAGMENT);
+   assert(epilog->info.stage == MESA_SHADER_FRAGMENT);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_block *last = nir_impl_last_block(impl);
+   nir_scalar value[AGX_EXPORT_HALFS];
+   uint8_t width[AGX_EXPORT_HALFS] = {0};
+   bool written[AGX_EXPORT_HALFS] = {false};
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_exported_agx)
+            return false;
+         if (intr->intrinsic != nir_intrinsic_export_agx)
+            continue;
+
+         nir_def *v = intr->src[0].ssa;
+         if (block != last || (v->bit_size != 16 && v->bit_size != 32))
+            return false;
+
+         const unsigned step = v->bit_size / 16;
+         for (unsigned c = 0; c < v->num_components; ++c) {
+            const unsigned h = nir_intrinsic_base(intr) + c * step;
+            if (h + step > AGX_EXPORT_HALFS)
+               return false;
+
+            for (unsigned i = 0; i < step; ++i) {
+               if (written[h + i])
+                  return false;
+
+               written[h + i] = true;
+            }
+
+            value[h] = nir_get_scalar(v, c);
+            width[h] = v->bit_size;
+         }
+
+         nir_instr_remove(instr);
+      }
+   }
+
+   /* The epilog runs where the main ends. */
+   struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+   if (!remap)
+      return false;
+
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   nir_inline_function_impl(&b, nir_shader_get_entrypoint(epilog), NULL,
+                            remap);
+   _mesa_hash_table_destroy(remap, NULL);
+
+   /* The main's exports are gone, so every load left is the epilog's. */
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_exported_agx)
+            continue;
+
+         nir_def *def = &intr->def;
+         if (def->bit_size != 16 && def->bit_size != 32)
+            return false;
+
+         const unsigned step = def->bit_size / 16;
+         nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+         b.cursor = nir_before_instr(instr);
+
+         for (unsigned c = 0; c < def->num_components; ++c) {
+            const unsigned h = nir_intrinsic_base(intr) + c * step;
+            if (h + step > AGX_EXPORT_HALFS)
+               return false;
+
+            if (width[h] == def->bit_size) {
+               comps[c] = nir_mov_scalar(&b, value[h]);
+            } else if (written[h] || written[h + step - 1] ||
+                       h < AGX_ABI_FOUT_COLOUR(0)) {
+               return false;
+            } else {
+               comps[c] = nir_undef(&b, 1, def->bit_size);
+            }
+         }
+
+         nir_def_replace(def, nir_vec(&b, comps, def->num_components));
+      }
+   }
+
+   /* What the backend derives from the shader info must cover both parts. */
+   nir->info.outputs_read |= epilog->info.outputs_read;
+   nir->info.outputs_written |= epilog->info.outputs_written;
+   BITSET_OR(nir->info.system_values_read, nir->info.system_values_read,
+             epilog->info.system_values_read);
+   nir->info.writes_memory |= epilog->info.writes_memory;
+   nir->info.fs.uses_discard |= epilog->info.fs.uses_discard;
+   nir->info.fs.uses_fbfetch_output |= epilog->info.fs.uses_fbfetch_output;
+   nir->info.fs.uses_sample_shading |= epilog->info.fs.uses_sample_shading;
+
+   nir_index_ssa_defs(impl);
+   nir_progress(true, impl, nir_metadata_none);
+   return true;
 }

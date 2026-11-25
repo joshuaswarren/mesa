@@ -14,38 +14,19 @@
 /*
  * Native AGX3 occlusion availability.
  *
- * A render's retirement record carries four timestamp slots (vertex start
- * and end, fragment start and end). The G17 kernel writes the vertex start,
- * vertex end and fragment start slots when it retires the render, which is
- * after the end-of-render cache maintenance that makes the render's
- * occlusion counts visible, and before it signals the submission. A nonzero
- * timestamp written there in a query's 64-bit availability slot is
- * therefore exactly "available".
- *
- * The fragment end slot is different: the kernel hands its address to the
- * firmware, which writes it at the end of the fragment pass. That can land
- * before the counts are visible (a depth-only pass on G17P read a stamped
- * query as 0 that held the full count once the submission completed), so
- * availability never rides on it.
- *
- * That holds only for a kernel that publishes the slots at retirement (see
- * hk_oq_render_stamps_supported()). The G15 firmware writes each slot from
- * its stage's own start or end record: the vertex end lands when tiling
- * finishes, before the fragment work writes the counts. Those chips keep the
- * queued store and the submission wait on readback.
- *
- * The queued post-graphics store remains the general mechanism: it is
- * recorded as usual, and the stream that would carry it is kept empty until
- * the end of the command buffer. Only then is it known whether any later
- * compute work in this command buffer depends on the render; such work would
- * have to wait for the render's host-side retirement once the render writes
- * timestamps, where it now waits in firmware. When nothing does and the
- * render has free slots, the render carries the availability and the extra
- * compute command is dropped. Otherwise the store is emitted as before.
+ * On G17P and M5, the kernel writes the vertex-start, vertex-end, and
+ * fragment-start render timestamp slots at render retirement (after cache
+ * maintenance makes occlusion counts visible and before signaling). Fragment
+ * end is written by firmware and may land before counts are visible (a G17P
+ * depth-only pass read 0 from a stamped query that held the full count after
+ * submission completion), so it is never used for availability. When a render
+ * has free retirement slots and no subsequent compute work in the command
+ * buffer depends on it, availability is stamped via the render instead of
+ * emitting a post-graphics compute store.
  */
-/* Whether renders on @chip may carry occlusion availability in their
- * retirement timestamp slots: only chips whose kernel writes the slots at
- * retirement, which is the G17 runtime (G17P and M5). */
+/* Supported only on G17P and M5, where the kernel writes these slots at
+ * retirement; G15 is excluded because its firmware writes the vertex-end slot
+ * when tiling finishes, before fragment occlusion counts land. */
 bool hk_oq_render_stamps_supported(enum agx_chip chip);
 
 struct hk_oq_stamp {

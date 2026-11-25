@@ -84,7 +84,8 @@ struct agx_bo {
    /* Must be first for casting */
    struct list_head bucket_link;
 
-   /* Used to link the BO to the BO cache LRU list. */
+   /* BO-cache LRU link while unreferenced. Borealis reuses it to quarantine
+    * a BO after device loss while holding a reference. */
    struct list_head lru_link;
 
    /* Convenience */
@@ -98,6 +99,15 @@ struct agx_bo {
    int64_t cached_ns;
    bool purgeable;
 
+   /* True once the read-only sparse-resident shadow mapping at
+    * agx_rw_addr_to_ro(dev, va->addr) has been bound in the GPU VM. The
+    * mapping lives with the GEM handle and its VA across BO-cache reuse;
+    * cleared when agx_bo_free() zeroes the slot. */
+   bool ro_shadow_bound;
+
+   /* True once mmap_offset holds the kernel's immutable GEM mmap offset. */
+   bool has_mmap_offset;
+
    /* Creation attributes */
    enum agx_bo_flags flags;
    size_t size;
@@ -105,6 +115,9 @@ struct agx_bo {
 
    /* Mapping */
    struct agx_va *va;
+
+   /* Cached DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET result for this GEM handle. */
+   uint64_t mmap_offset;
 
    /* Gallium's compact G17P command address. Protected by vma_lock and
     * retained through BO-cache reuse; released with the final GEM handle. */
@@ -160,9 +173,19 @@ agx_bo_writer(uint32_t queue, uint32_t syncobj)
    return (((uint64_t)queue) << 32) | syncobj;
 }
 
+typedef bool (*agx_bo_alloc_check_fn)(size_t size, void *data);
+
+struct agx_bo *agx_bo_create_checked(struct agx_device *dev, size_t size,
+                                     unsigned align, enum agx_bo_flags flags,
+                                     const char *label,
+                                     agx_bo_alloc_check_fn can_alloc,
+                                     void *can_alloc_data);
+
 struct agx_bo *agx_bo_create(struct agx_device *dev, size_t size,
                              unsigned align, enum agx_bo_flags flags,
                              const char *label);
+
+int agx_bo_ensure_ro_shadow(struct agx_device *dev, struct agx_bo *bo);
 
 void agx_bo_reference(struct agx_bo *bo);
 void agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo);

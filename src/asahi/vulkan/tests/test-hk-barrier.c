@@ -462,6 +462,219 @@ test_resources_and_fallbacks(void)
             hk_barrier_split_reason_name(r) != NULL, 1);
 }
 
+static void
+test_local_read(void)
+{
+   VkImage color_img = (VkImage)(uintptr_t)10;
+   VkImage depth_img = (VkImage)(uintptr_t)11;
+   VkImage atts[2] = {color_img, depth_img};
+
+   struct hk_barrier_state color_only = {
+      .color_input_local_read = true,
+      .depth_stencil_writes = false,
+      .color_attachment_count = 1,
+      .attachment_count = 1,
+      .attachments = atts,
+   };
+   struct hk_barrier_state color_and_ds = {
+      .color_input_local_read = true,
+      .depth_stencil_writes = true,
+      .color_attachment_count = 1,
+      .attachment_count = 2,
+      .attachments = atts,
+   };
+
+   VkMemoryBarrier2 b =
+      memory(COLOR, CW, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   VkDependencyInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &b,
+   };
+
+   check("local_read color CW -> input read kept",
+         hk_barrier_classify(&info, &color_only), 0);
+   check("local_read color CW -> input read kept even with writable D/S",
+         hk_barrier_classify(&info, &color_and_ds), 0);
+
+   b = memory(COLOR, CW, FRAG,
+              VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT | CR);
+   check("local_read color CW -> input read + CR kept",
+         hk_barrier_classify(&info, &color_and_ds), 0);
+
+   /* Non-BY_REGION still splits globally + texture. */
+   info.dependencyFlags = 0;
+   b = memory(COLOR, CW, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   check("local_read without BY_REGION splits",
+         hk_barrier_classify(&info, &color_only), BIT(GLOBAL) | BIT(TEXTURE));
+   info.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+
+   /* Depth/stencil write -> input read must split. */
+   b = memory(LATE, ZW, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   check("local_read depth ZW -> input read splits",
+         hk_barrier_classify(&info, &color_and_ds), BIT(TEXTURE));
+   b = memory(LATE, 0, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   check("local_read depth stage -> input read splits when D/S writable",
+         hk_barrier_classify(&info, &color_and_ds), BIT(TEXTURE));
+   b = memory(COLOR, VK_ACCESS_2_MEMORY_WRITE_BIT, FRAG,
+              VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   check("local_read MEMORY_WRITE splits when D/S writable",
+         hk_barrier_classify(&info, &color_and_ds), BIT(TEXTURE));
+   check("local_read MEMORY_WRITE kept when color-only",
+         hk_barrier_classify(&info, &color_only), 0);
+
+   /* Availability chain: CW -> CR then CR -> input read stays in tile. */
+   b = memory(COLOR, CR, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   check("local_read availability chain CR -> input read kept",
+         hk_barrier_classify(&info, &color_and_ds), 0);
+
+   /* Sampled / generic shader reads still split. */
+   b = memory(COLOR, CW, FRAG, SR);
+   check("local_read sampled read still splits",
+         hk_barrier_classify(&info, &color_only), BIT(TEXTURE));
+   b = memory(COLOR, CW, FRAG, VK_ACCESS_2_SHADER_READ_BIT);
+   check("local_read generic shader read still splits",
+         hk_barrier_classify(&info, &color_only), BIT(TEXTURE));
+
+   /* Tilebuffer spill and aliasing disable local_read. */
+   struct hk_barrier_state spilled = color_only;
+   spilled.tilebuffer_spilled = true;
+   b = memory(COLOR, CW, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   check("local_read spilled splits",
+         hk_barrier_classify(&info, &spilled), BIT(TEXTURE));
+   struct hk_barrier_state aliased = color_only;
+   aliased.attachments_alias = true;
+   check("local_read aliased splits",
+         hk_barrier_classify(&info, &aliased), BIT(TEXTURE));
+
+   /* Image barriers: color attachment kept, D/S attachment splits. */
+   VkImageMemoryBarrier2 img = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = COLOR,
+      .srcAccessMask = CW,
+      .dstStageMask = FRAG,
+      .dstAccessMask = VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT,
+      .image = color_img,
+      .oldLayout = VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ,
+      .newLayout = VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ,
+      .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+   };
+   info.memoryBarrierCount = 0;
+   info.imageMemoryBarrierCount = 1;
+   info.pImageMemoryBarriers = &img;
+   check("local_read color image barrier kept",
+         hk_barrier_classify(&info, &color_and_ds), 0);
+   img.image = depth_img;
+   img.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+   check("local_read depth image barrier splits",
+         hk_barrier_classify(&info, &color_and_ds), BIT(TEXTURE));
+
+   /* used_local_read is set ONLY when the local-read rule actually kept the
+    * barrier (reasons == 0 and a written color attachment was admitted via
+    * color_input_local_read). */
+   bool used_lr = false;
+   info.imageMemoryBarrierCount = 0;
+   info.memoryBarrierCount = 1;
+   b = memory(COLOR, CW, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   info.pMemoryBarriers = &b;
+   check("used_local_read: kept color CW -> input read returns 0",
+         hk_barrier_classify_ex(&info, &color_only, &used_lr), 0);
+   check("used_local_read: kept color CW -> input read sets flag", used_lr, 1);
+
+   /* Kept barrier without INPUT_ATTACHMENT_READ must NOT set used_local_read. */
+   b = memory(COLOR, CW, COLOR, CR);
+   used_lr = true;
+   check("used_local_read: color CW -> CR returns 0",
+         hk_barrier_classify_ex(&info, &color_only, &used_lr), 0);
+   check("used_local_read: color CW -> CR clears flag", used_lr, 0);
+
+   /* Split barrier with INPUT_ATTACHMENT_READ must NOT set used_local_read. */
+   b = memory(LATE, ZW, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   used_lr = true;
+   check("used_local_read: depth ZW -> input read splits",
+         hk_barrier_classify_ex(&info, &color_and_ds, &used_lr), BIT(TEXTURE));
+   check("used_local_read: split barrier clears flag", used_lr, 0);
+
+   /* Kept barrier with INPUT_ATTACHMENT_READ when color_input_local_read is
+    * false and no attachment writes exist must NOT set used_local_read. */
+   struct hk_barrier_state no_writes = {
+      .color_input_local_read = false,
+      .attachment_count = 0,
+   };
+   b = memory(COLOR, 0, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   used_lr = true;
+   check("used_local_read: no writable attachments keeps barrier",
+         hk_barrier_classify_ex(&info, &no_writes, &used_lr), 0);
+   check("used_local_read: no writable attachments clears flag", used_lr, 0);
+
+   /* Image barrier on an unrelated image with INPUT_ATTACHMENT_READ must NOT
+    * set used_local_read even when color_input_local_read is true. */
+   img.image = (VkImage)(uintptr_t)99;
+   img.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   info.memoryBarrierCount = 0;
+   info.imageMemoryBarrierCount = 1;
+   info.pImageMemoryBarriers = &img;
+   used_lr = true;
+   check("used_local_read: unrelated image barrier returns 0",
+         hk_barrier_classify_ex(&info, &color_only, &used_lr), 0);
+   check("used_local_read: unrelated image barrier clears flag", used_lr, 0);
+
+   /* Deferred draw-time fallback split transition:
+    * - A kept local-read barrier arms kept_local_read_barrier.
+    * - Non-input-attachment draws, meta draws, and on-chip local-read draws
+    *   keep the pass open.
+    * - The first texture-path input-attachment draw (e.g. depth input after a
+    *   memory barrier, different view of the same image, or constant-sample
+    *   MSAA read) triggers the deferred split and clears the armed flag.
+    * - An unrelated kept barrier never arms the flag, so a subsequent
+    *   texture-path input-attachment draw does not split needlessly. */
+   info.imageMemoryBarrierCount = 0;
+   info.memoryBarrierCount = 1;
+   b = memory(COLOR, CW, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   info.pMemoryBarriers = &b;
+   bool kept_local_read_barrier = false;
+   used_lr = false;
+   if (hk_barrier_classify_ex(&info, &color_only, &used_lr) == 0 && used_lr)
+      kept_local_read_barrier = true;
+   check("deferred split: barrier arms kept_local_read_barrier",
+         kept_local_read_barrier, 1);
+   check("deferred split: draw without input attachments keeps pass",
+         hk_barrier_local_read_draw_needs_split(kept_local_read_barrier, false,
+                                                false, false),
+         0);
+   check("deferred split: on-chip local_read draw keeps pass",
+         hk_barrier_local_read_draw_needs_split(kept_local_read_barrier, false,
+                                                true, true),
+         0);
+   check("deferred split: meta draw keeps pass",
+         hk_barrier_local_read_draw_needs_split(kept_local_read_barrier, true,
+                                                true, false),
+         0);
+   check("deferred split: texture-path input-attachment draw splits",
+         hk_barrier_local_read_draw_needs_split(kept_local_read_barrier, false,
+                                                true, false),
+         1);
+   /* Ending graphics clears kept_local_read_barrier. */
+   kept_local_read_barrier = false;
+   check("deferred split: after split, subsequent fallback draw does not split",
+         hk_barrier_local_read_draw_needs_split(kept_local_read_barrier, false,
+                                                true, false),
+         0);
+
+   /* Unrelated kept barrier with INPUT_ATTACHMENT_READ does not arm a split. */
+   b = memory(COLOR, 0, FRAG, VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+   used_lr = false;
+   if (hk_barrier_classify_ex(&info, &no_writes, &used_lr) == 0 && used_lr)
+      kept_local_read_barrier = true;
+   check("deferred split: unrelated barrier does not arm split",
+         hk_barrier_local_read_draw_needs_split(kept_local_read_barrier, false,
+                                                true, false),
+         0);
+}
+
 int
 main(void)
 {
@@ -469,6 +682,7 @@ main(void)
    test_sides_and_writes();
    test_read_only_attachments();
    test_resources_and_fallbacks();
+   test_local_read();
    printf("hk_barrier: %u checks, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

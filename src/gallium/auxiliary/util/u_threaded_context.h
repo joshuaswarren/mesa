@@ -582,6 +582,12 @@ struct threaded_context_options {
     */
    void (*dsa_parse)(void *state, struct tc_renderpass_info *info);
    void (*fs_parse)(void *state, struct tc_renderpass_info *info);
+   /**
+    * If true, an asynchronous frontend flush (glFlush, glFinish) that finds
+    * the driver thread idle runs on the calling thread, so the submission
+    * does not wait for that thread to wake up.
+    */
+   bool inline_idle_flush;
 };
 
 struct tc_vertex_buffers {
@@ -697,6 +703,8 @@ struct threaded_context {
    struct pipe_resource *fb_resolve;
    /* accessed by main thread; preserves info across batches */
    struct tc_renderpass_info *renderpass_info_recording;
+   /* number of batch overflows in the current renderpass (main thread only) */
+   unsigned renderpass_batches;
    /* accessed by driver thread */
    struct tc_renderpass_info *renderpass_info;
    /* internal-only: if dsa/fs are bound between render passes */
