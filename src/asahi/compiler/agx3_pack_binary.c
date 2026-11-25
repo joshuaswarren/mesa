@@ -2282,7 +2282,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       const bool encoded = agx3_emit_texture_fetch_g17g(emission, enc, I, slot, wait_mask,
           final, stage_coordinates, separate_write_coords, image_read_bank0,
           g18g, ms_array_scratch, pixel_entry, pixel_entry_offset, &why);
-      if (!encoded)
+      if (!encoded && (agx_compiler_debug & (AGX_DBG_SHADERS | AGX_DBG_REFUSE)))
          fprintf(stderr, "AGX3 fetch refused: %s (g18=%u stage=%u slot=%u scratch=%u)\n",
                  why, g18g, stage_coordinates, slot, ms_array_scratch);
       return encoded;
