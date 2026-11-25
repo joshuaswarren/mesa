@@ -666,6 +666,7 @@ asahi_g17p_compute_validate(
             return fail_at(cursor, "invalid compact compute launch ordering");
 
          local.launches++;
+         local.indirect_launches++;
          need_barrier = true;
          direct_tail = false;
          cursor += AGX3_CDM_INDIRECT_LAUNCH_SIZE;
@@ -731,6 +732,8 @@ asahi_g17p_compute_validate(
 
          local.barriers++;
          local.strong_barriers += record.data.barrier.flags == 0x5;
+         local.indirect_strong_barriers +=
+            !direct_tail && record.data.barrier.flags == 0x5;
          need_barrier = false;
          break;
 
@@ -1054,7 +1057,8 @@ validate_slot(const struct asahi_g17p_stream_memory *memory, unsigned slot,
 static bool
 validate_bind_tail(const struct asahi_g17p_stream_memory *memory,
                    uint64_t address,
-                   struct asahi_g17p_stream_stats *stats)
+                   struct asahi_g17p_stream_stats *stats,
+                   uint8_t fs_slot_out[AGX_PPP_HAL200_FS_LENGTH])
 {
    uint32_t controls[8] = {
       0x700, 0x500, 0x700, 0x500, 0, 0x300, 0x200, 0x200,
@@ -1133,6 +1137,11 @@ validate_bind_tail(const struct asahi_g17p_stream_memory *memory,
          return false;
    }
 
+   if (fs_slot_out &&
+       !read_owned(memory, compact_address(decoded[1].context_offset),
+                   fs_slot_out, AGX_PPP_HAL200_FS_LENGTH))
+      return fail_at(address, "fragment bind slot is not readable");
+
    return true;
 }
 
@@ -1160,6 +1169,10 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
    struct asahi_g17p_stream_stats local = {0};
    bool pending_selector = false;
    bool have_state = false;
+   bool bind_tail_latched = false;
+   bool have_latched_vs = false;
+   struct agx_vdm_state_update_info latched_vs = {0};
+   uint8_t latched_fs_slot[AGX_PPP_HAL200_FS_LENGTH] = {0};
    bool tessellation_state_seen = false;
    bool restart_seen = false;
    /* Honeykrisp re-emits the restart State Update only when the restart
@@ -1252,6 +1265,7 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
             }
          }
          pending_selector = false;
+         bind_tail_latched = true;
          cursor += 4;
          continue;
       }
@@ -1264,7 +1278,7 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
        * without a preceding VS update. Do not decode its first bind pair as
        * the separate initial 12-byte PPP record. */
       if (have_state && load_le32(bytes) == UINT32_C(0x00000500)) {
-         if (!validate_bind_tail(memory, cursor, &local))
+         if (!validate_bind_tail(memory, cursor, &local, latched_fs_slot))
             return false;
          cursor += AGX_VDM_HAL200_BIND_TAIL_LENGTH;
          pending_selector = true;
@@ -1293,10 +1307,39 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
          break;
 
       case AGX_VDM_RECORD_PPP_STATE_UPDATE:
-         if (!validate_initial_ppp(memory,
-                                   record.data.ppp_state_update.pointer,
-                                   record.data.ppp_state_update.size_words))
-            return false;
+         if (record.data.ppp_state_update.size_words ==
+             AGX_PPP_HAL200_FS_LENGTH / 4) {
+            if (!bind_tail_latched)
+               return fail_at(cursor,
+                              "standalone FS PPP update without latched bind tail");
+            const uint64_t ptr = record.data.ppp_state_update.pointer;
+            if (!ptr || ptr > UINT32_MAX || (ptr & 63) != 0)
+               return fail_at(cursor,
+                              "standalone FS PPP update has invalid/unaligned pointer");
+            const uint64_t fs_addr = compact_address((uint32_t)ptr);
+            uint8_t fs_bytes[AGX_PPP_HAL200_FS_LENGTH];
+            if (!validate_slot(memory, 1, fs_addr, AGX_PPP_HAL200_FS_LENGTH,
+                               &local) ||
+                !read_owned(memory, fs_addr, fs_bytes, sizeof(fs_bytes)))
+               return false;
+            /* Standalone FS updates may only move the 48-bit stage_program
+             * address; header, resource counts, VIT, unknown_0c, template
+             * bits and flags must match the latched bind tail's slot 1. */
+            if (memcmp(fs_bytes, latched_fs_slot, 16) != 0 ||
+                (load_le32(fs_bytes + 16) & UINT32_C(0x003fffff)) !=
+                   (load_le32(latched_fs_slot + 16) & UINT32_C(0x003fffff)) ||
+                load_le32(fs_bytes + 24) != load_le32(latched_fs_slot + 24))
+               return fail_at(cursor,
+                              "standalone FS PPP update changed non-program "
+                              "state without full bind tail");
+            local.incremental_fs_ppp_updates++;
+         } else {
+            if (!validate_initial_ppp(
+                   memory, record.data.ppp_state_update.pointer,
+                   record.data.ppp_state_update.size_words))
+               return false;
+            bind_tail_latched = false;
+         }
          cursor += record.length;
          break;
 
@@ -1316,11 +1359,46 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
             return false;
          }
          cursor += record.length;
-         if (!validate_bind_tail(memory, cursor, &local))
-            return false;
-         cursor += AGX_VDM_HAL200_BIND_TAIL_LENGTH;
-         pending_selector = true;
-         have_state = true;
+         if (!have_state || !bind_tail_latched) {
+            if (!validate_bind_tail(memory, cursor, &local, latched_fs_slot))
+               return false;
+            cursor += AGX_VDM_HAL200_BIND_TAIL_LENGTH;
+            pending_selector = true;
+            have_state = true;
+            latched_vs = record.data.state_update;
+            have_latched_vs = true;
+         } else {
+            uint8_t next_word[4];
+            if (read_owned(memory, cursor, next_word, sizeof(next_word)) &&
+                load_le32(next_word) == UINT32_C(0x00000500)) {
+               if (!validate_bind_tail(memory, cursor, &local, latched_fs_slot))
+                  return false;
+               cursor += AGX_VDM_HAL200_BIND_TAIL_LENGTH;
+               pending_selector = true;
+               latched_vs = record.data.state_update;
+               have_latched_vs = true;
+            } else {
+               /* Eliding the bind tail is only legal when a bind tail is
+                * latched in this chunk and every non-pipeline VDM state word
+                * (vertex outputs, template, provoking/primitive flags) matches
+                * the latched vertex state. */
+               if (!have_latched_vs ||
+                   record.data.state_update.raw_vertex_shader_word0 !=
+                      latched_vs.raw_vertex_shader_word0 ||
+                   record.data.state_update.raw_pipeline_template !=
+                      latched_vs.raw_pipeline_template ||
+                   record.data.state_update.raw_vertex_outputs[0] !=
+                      latched_vs.raw_vertex_outputs[0] ||
+                   record.data.state_update.raw_vertex_outputs[1] !=
+                      latched_vs.raw_vertex_outputs[1] ||
+                   record.data.state_update.raw_vertex_unknown !=
+                      latched_vs.raw_vertex_unknown)
+                  return fail_at(cursor,
+                                 "VDM state update changed vertex output or "
+                                 "template state without bind tail");
+               local.elided_bind_tails++;
+            }
+         }
          local.state_updates++;
          if (local.draws > 0 && !barrier_since_last_draw)
             local.unbarriered_state_republications++;
@@ -1376,6 +1454,8 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
          cursor = target;
          local.links++;
          restart_held = false;
+         bind_tail_latched = false;
+         have_latched_vs = false;
          break;
       }
 

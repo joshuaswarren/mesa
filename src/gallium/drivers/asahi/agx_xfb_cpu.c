@@ -196,8 +196,11 @@ agx_xfb_cpu_create_vs(struct agx_context *ctx, struct agx_uncompiled_shader *so,
        nir->info.num_ssbos || BITSET_COUNT(nir->info.textures_used))
       return;
 
-   if (!agx_xfb_cpu_init(ctx))
+   simple_mtx_lock(&ctx->xfb_cpu_lock);
+   if (!agx_xfb_cpu_init(ctx)) {
+      simple_mtx_unlock(&ctx->xfb_cpu_lock);
       return;
+   }
 
    nir_shader *clone = nir_shader_clone(NULL, nir);
    struct pipe_shader_state state = {
@@ -211,15 +214,18 @@ agx_xfb_cpu_create_vs(struct agx_context *ctx, struct agx_uncompiled_shader *so,
    so->xfb_cpu_vs = draw_create_vertex_shader(ctx->xfb_draw, &state);
    if (!so->xfb_cpu_vs)
       ralloc_free(clone);
+   simple_mtx_unlock(&ctx->xfb_cpu_lock);
 }
 
 void
 agx_xfb_cpu_delete_vs(struct agx_context *ctx, struct agx_uncompiled_shader *so)
 {
+   simple_mtx_lock(&ctx->xfb_cpu_lock);
    if (so->xfb_cpu_vs && ctx->xfb_draw)
       draw_delete_vertex_shader(ctx->xfb_draw, so->xfb_cpu_vs);
 
    so->xfb_cpu_vs = NULL;
+   simple_mtx_unlock(&ctx->xfb_cpu_lock);
 }
 
 /*
@@ -246,10 +252,35 @@ map_buffer(struct agx_context *ctx, struct pipe_resource *prsc, unsigned usage,
                                 transfer);
 }
 
+/* Constant buffer i of stage s for the draw module, in the range bound
+ * (clamped to the buffer by agx_set_constant_buffer()). Returns false when the
+ * buffer cannot be mapped. */
+bool
+agx_cpu_bind_constant_buffer(struct agx_context *ctx, struct draw_context *draw,
+                             mesa_shader_stage s, unsigned i,
+                             struct pipe_transfer **transfer)
+{
+   const struct pipe_constant_buffer *cb = &ctx->stage[s].cb[i];
+   const uint8_t *ptr = cb->user_buffer;
+   unsigned size = cb->buffer_size;
+   bool mapped = true;
+
+   if (!ptr && cb->buffer && size) {
+      ptr = map_buffer(ctx, cb->buffer, PIPE_MAP_READ, transfer);
+      mapped = ptr != NULL;
+      if (ptr)
+         ptr += cb->buffer_offset;
+   }
+
+   draw_set_mapped_constant_buffer(draw, s, i, ptr, ptr ? size : 0);
+   return mapped;
+}
+
 void
 agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
                  const struct pipe_draw_start_count_bias *draw_info)
 {
+   simple_mtx_lock(&ctx->xfb_cpu_lock);
    struct draw_context *draw = ctx->xfb_draw;
    struct agx_xfb_render *r = agx_xfb_render(ctx->xfb_render);
    struct agx_uncompiled_shader *vs = ctx->stage[MESA_SHADER_VERTEX].shader;
@@ -260,6 +291,7 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    struct draw_so_target targets[PIPE_MAX_SO_BUFFERS];
    struct draw_so_target *target_ptrs[PIPE_MAX_SO_BUFFERS] = {0};
    unsigned num_targets = ctx->streamout.num_targets;
+   bool mapped = true;
 
    const struct pipe_rasterizer_state rast = {
       .flatshade_first = ctx->rast->base.flatshade_first,
@@ -292,7 +324,8 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       } else if (vb->buffer.resource) {
          ptr = map_buffer(ctx, vb->buffer.resource, PIPE_MAP_READ,
                           &vb_transfers[i]);
-         size = vb->buffer.resource->width0;
+         size = ptr ? vb->buffer.resource->width0 : 0;
+         mapped &= ptr != NULL;
       }
 
       draw_set_mapped_vertex_buffer(draw, i, ptr, size);
@@ -306,24 +339,16 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       } else {
          indices = map_buffer(ctx, info->index.resource, PIPE_MAP_READ,
                               &ib_transfer);
-         available = info->index.resource->width0;
+         available = indices ? info->index.resource->width0 : 0;
+         mapped &= indices != NULL;
       }
       draw_set_indexes(draw, indices, info->index_size, available);
    }
 
-   struct agx_stage *stage = &ctx->stage[MESA_SHADER_VERTEX];
-   u_foreach_bit(i, stage->cb_mask) {
-      const struct pipe_constant_buffer *cb = &stage->cb[i];
-      const uint8_t *ptr = cb->user_buffer;
-
-      if (!ptr && cb->buffer) {
-         ptr = map_buffer(ctx, cb->buffer, PIPE_MAP_READ, &cb_transfers[i]);
-         if (ptr)
-            ptr += cb->buffer_offset;
-      }
-
-      draw_set_mapped_constant_buffer(draw, MESA_SHADER_VERTEX, i, ptr,
-                                      cb->buffer_size);
+   const unsigned cb_mask = ctx->stage[MESA_SHADER_VERTEX].cb_mask;
+   u_foreach_bit(i, cb_mask) {
+      mapped &= agx_cpu_bind_constant_buffer(ctx, draw, MESA_SHADER_VERTEX, i,
+                                             &cb_transfers[i]);
    }
 
    for (unsigned i = 0; i < num_targets; ++i) {
@@ -342,6 +367,7 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
                                        &so_transfers[i]),
          .internal_offset = offset_B,
       };
+      mapped &= targets[i].mapping != NULL;
       atgt->stride = vs->xfb_strides[i] * 4;
       target_ptrs[i] = &targets[i];
    }
@@ -352,16 +378,22 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    memset(r->written, 0, sizeof(r->written));
    memset(r->generated, 0, sizeof(r->generated));
 
-   draw_vbo(draw, info, 0, NULL, draw_info, 1, 0);
-   draw_flush(draw);
+   /* A buffer that could not be mapped leaves the draw out. */
+   if (mapped) {
+      draw_vbo(draw, info, 0, NULL, draw_info, 1, 0);
+      draw_flush(draw);
+   } else {
+      mesa_loge_once("asahi: transform feedback on the CPU: a buffer could "
+                     "not be mapped, draw skipped");
+   }
 
    for (unsigned i = 0; i < num_targets; ++i) {
       if (!target_ptrs[i])
          continue;
 
       uint32_t offset_B = targets[i].internal_offset;
-      pipe_buffer_write(&ctx->base, agx_so_target(ctx->streamout.targets[i])->offset,
-                        0, 4, &offset_B);
+      tc_buffer_write(&ctx->base, agx_so_target(ctx->streamout.targets[i])->offset,
+                      0, 4, &offset_B);
    }
 
    /* Unbind before unmapping. */
@@ -370,6 +402,8 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       draw_set_mapped_vertex_buffer(draw, i, NULL, 0);
    if (indices)
       draw_set_indexes(draw, NULL, 0, 0);
+   u_foreach_bit(i, cb_mask)
+      draw_set_mapped_constant_buffer(draw, MESA_SHADER_VERTEX, i, NULL, 0);
 
    for (unsigned i = 0; i < ARRAY_SIZE(vb_transfers); ++i) {
       if (vb_transfers[i])
@@ -397,4 +431,5 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
          }
       }
    }
+   simple_mtx_unlock(&ctx->xfb_cpu_lock);
 }

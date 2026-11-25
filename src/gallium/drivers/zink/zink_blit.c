@@ -152,6 +152,7 @@ blit_resolve(struct zink_context *ctx, const struct pipe_blit_info *info, bool *
    VKCTX(CmdResolveImage)(cmdbuf, use_src->obj->image, src->layout,
                      dst->obj->image, dst->layout,
                      1, &region);
+   zink_batch_mark_host_transfer_write(ctx->bs, dst);
    zink_cmd_debug_marker_end(ctx, cmdbuf, marker);
 
    if (cmdbuf == ctx->bs->cmdbuf) {
@@ -208,6 +209,10 @@ blit_native(struct zink_context *ctx, const struct pipe_blit_info *info, bool *n
        dst->format != zink_get_format(screen, info->dst.format))
       return false;
    if (src->format != VK_FORMAT_A8_UNORM_KHR && zink_format_is_emulated_alpha(info->src.format))
+      return false;
+   if (dst->format != VK_FORMAT_A8_UNORM_KHR &&
+       (zink_format_is_emulated_alpha(info->dst.format) ||
+        zink_format_is_emulated_alpha(dst->base.b.format)))
       return false;
 
    if (!(src->obj->vkfeats & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
@@ -342,6 +347,7 @@ blit_native(struct zink_context *ctx, const struct pipe_blit_info *info, bool *n
                   dst->obj->image, dst->layout,
                   1, &region,
                   zink_filter(info->filter));
+   zink_batch_mark_host_transfer_write(ctx->bs, dst);
 
    zink_cmd_debug_marker_end(ctx, cmdbuf, marker);
 

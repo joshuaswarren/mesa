@@ -83,7 +83,7 @@ main(void)
 {
    uint8_t m5_lead[0x341], previous[0x341];
    memset(m5_lead, 0xa5, sizeof(m5_lead));
-   if (!agx3_build_g17g_container_lead(m5_lead, sizeof(m5_lead)) ||
+   if (!agx3_build_m5_container_lead(m5_lead, sizeof(m5_lead), 1) ||
        memcmp(m5_lead, (uint8_t[]){0x40, 3, 0, 0}, 4) ||
        memcmp(m5_lead + 0x100, m5_lead + 0x200, 0x100) ||
        memcmp(m5_lead + 0x100,
@@ -96,8 +96,8 @@ main(void)
        m5_lead[0x340] != 0xa5)
       return fprintf(stderr, "M5 container lead mismatch\n"), 1;
    memcpy(previous, m5_lead, sizeof(previous));
-   if (agx3_build_g17g_container_lead(m5_lead, 0x33f) ||
-       agx3_build_g17g_container_lead(NULL, sizeof(m5_lead)) ||
+   if (agx3_build_m5_container_lead(m5_lead, 0x33f, 1) ||
+       agx3_build_m5_container_lead(NULL, sizeof(m5_lead), 1) ||
        memcmp(previous, m5_lead, sizeof(previous)))
       return fprintf(stderr, "M5 container bounds mismatch\n"), 1;
 

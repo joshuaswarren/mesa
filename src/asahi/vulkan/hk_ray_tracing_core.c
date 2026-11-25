@@ -180,17 +180,20 @@ void
 hk_rt_launch_group_count(uint32_t width, uint32_t height, uint32_t depth,
                          uint32_t out[3])
 {
-   const uint32_t local[3] = {
-      HK_RT_WORKGROUP_SIZE_X,
-      HK_RT_WORKGROUP_SIZE_Y,
-      HK_RT_WORKGROUP_SIZE_Z,
-   };
-   const uint32_t dim[3] = {width, height, depth};
-
-   for (unsigned i = 0; i < 3; ++i) {
-      /* Round up without overflowing: a launch of 0xffffffff rays is refused
-       * by maxRayDispatchInvocationCount long before it gets here, but the
-       * arithmetic must not wrap even so. */
-      out[i] = dim[i] / local[i] + (dim[i] % local[i] ? 1 : 0);
+   /* Round up without overflowing: a launch of 0xffffffff rays is refused
+    * by maxRayDispatchInvocationCount long before it gets here, but the
+    * arithmetic must not wrap even so.  2D/3D launches (height > 1) use 8x4
+    * tiles per 32-lane workgroup; 1D launches (height <= 1) keep 32x1 strips. */
+   if (height > 1) {
+      out[0] = (width >> HK_RT_TILE_2D_X_LOG2) +
+               ((width & (HK_RT_TILE_2D_X - 1)) ? 1u : 0u);
+      out[1] = (height >> HK_RT_TILE_2D_Y_LOG2) +
+               ((height & (HK_RT_TILE_2D_Y - 1)) ? 1u : 0u);
+      out[2] = depth;
+   } else {
+      out[0] = (width >> HK_RT_WORKGROUP_SIZE_X_LOG2) +
+               ((width & (HK_RT_WORKGROUP_SIZE_X - 1)) ? 1u : 0u);
+      out[1] = height;
+      out[2] = depth;
    }
 }

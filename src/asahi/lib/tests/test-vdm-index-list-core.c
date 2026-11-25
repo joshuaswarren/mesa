@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "../agx_vdm_hal200_direct_draw_core.h"
 #include "../agx_vdm_index_list_core.h"
 
 #include <stdio.h>
@@ -705,12 +706,52 @@ check_indirect(void)
    return 0;
 }
 
+static int
+check_hal200_large_ranges(void)
+{
+   const uint64_t four_gib = UINT64_C(1) << 32;
+   const uint64_t sixteen_gib = UINT64_C(1) << 34;
+
+   for (unsigned shift = 0; shift <= 2; ++shift) {
+      const uint8_t width = (uint8_t)(1u << shift);
+      uint64_t reloc = 0;
+      uint32_t size_word = 0;
+      CHECK(agx_vdm_hal200_index_range(UINT64_C(0x10000), four_gib + 4, 0, 4,
+                                       width, &reloc, &size_word));
+      CHECK(reloc == UINT64_C(0x10000));
+      CHECK(size_word == UINT32_C(0x40000000));
+
+      CHECK(agx_vdm_hal200_index_range(UINT64_C(0x10000), sixteen_gib, 0, 4,
+                                       width, &reloc, &size_word));
+      CHECK(reloc == UINT64_C(0x10000));
+      CHECK(size_word == UINT32_MAX - 1);
+   }
+
+   /* HAL200 indirect draw packs 4 GiB + 4 cleanly and rejects 16 GiB (which
+    * exceeds the 32-bit dword count encoding). */
+   struct agx_vdm_hal200_indirect_draw_fields fields = {
+      .draw_state_context_offset = 0x40,
+      .primitive = 6,
+      .indexed = true,
+      .index_size_B = 4,
+      .index_buffer = UINT64_C(0x10000),
+      .index_buffer_range_B = four_gib + 4,
+      .indirect_buffer = UINT64_C(0x20000),
+   };
+   struct agx_vdm_hal200_indirect_draw encoded;
+   CHECK(agx_vdm_hal200_indirect_draw_pack(AGX_CHIP_G17P, &fields, &encoded));
+   fields.index_buffer_range_B = sixteen_gib;
+   CHECK(!agx_vdm_hal200_indirect_draw_pack(AGX_CHIP_G17P, &fields, &encoded));
+
+   return 0;
+}
+
 int
 main(void)
 {
    if (check_exact_witnesses() || check_full_domains() ||
        check_corruption_classification() || check_rejections() ||
-       check_indirect())
+       check_indirect() || check_hal200_large_ranges())
       return 1;
 
    printf("agx_vdm_index_list_core: %u checks passed\n", checks);

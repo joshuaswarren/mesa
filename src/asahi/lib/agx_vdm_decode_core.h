@@ -66,16 +66,9 @@ struct agx_vdm_decoded_record {
    } data;
 };
 
-/*
- * Decode one exact record from the beginning of a larger VDM stream.
- * `available` may include following records; `length` reports only the bytes
- * consumed by the first record. Unknown block types, unsupported identities,
- * malformed headers, reserved-bit mutations, and truncation fail with a
- * cleared result.
- *
- * This deliberately does not infer ordering, follow links, inspect a PPP
- * payload, read GPU memory, submit work, or admit an AGX3 device.
- */
+/* Decode one VDM record from the start of a stream (`available` may include
+ * trailing records; `record->length` gives bytes consumed). Fails with a
+ * cleared `record` on unknown types, reserved-bit errors, or truncation. */
 bool agx_vdm_decode_one(enum agx_chip chip, const void *bytes, size_t available,
                         struct agx_vdm_decoded_record *record);
 

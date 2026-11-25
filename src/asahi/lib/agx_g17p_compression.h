@@ -5,9 +5,12 @@
 
 #pragma once
 
+#include "drm-uapi/drm_fourcc.h"
 #include "util/format/u_formats.h"
+#include "agx_chip_caps.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* Colour formats whose G17P images Gallium may allocate losslessly
  * compressed.
@@ -22,11 +25,13 @@
  *
  * Every format here has a tilebuffer footprint of at most 8 bytes per
  * sample, and none has a different store class (R11G11B10 and RGB9E5 are
- * stored as R32_UINT words). With at most seven other render targets of at
- * most 16 bytes, a single-sample G17P tilebuffer (120 bytes per sample)
- * therefore never spills one of these, so a compressed render target never
- * needs the in-place decompression kernel, which has no G17P build.
- * test-tilebuffer.cpp checks both properties for every format here.
+ * stored as R32_UINT words). At 1x, with at most seven other render targets
+ * of at most 16 bytes, a G17P tilebuffer (120 bytes per sample) never spills
+ * one of these; test-tilebuffer.cpp checks both properties at 1x. At 2x/4x
+ * MSAA, wide MRT framebuffers (such as 5x RGBA16F at 4x) can exceed the
+ * tilebuffer byte budget and spill, so Gallium pre-decompresses spilling
+ * private targets via agx_decompress() in agx_set_framebuffer_state() rather
+ * than relying on AGX2-only in-place decompression.
  */
 static inline bool
 agx_g17p_compression_color_format(enum pipe_format format)
@@ -93,4 +98,84 @@ agx_g17p_compression_color_format(enum pipe_format format)
    default:
       return false;
    }
+}
+
+/* 16-byte RGBA32 colour formats that G17P may allocate losslessly compressed
+ * on single-sample, single-layer 2D images (including mip chains).
+ *
+ * Kept separate from agx_g17p_compression_color_format() because a wide MRT
+ * framebuffer (e.g. eight 16-byte targets = 128 bytes > G17P's 120-byte
+ * tilebuffer sample budget) spills the tail attachment; Gallium handles that
+ * by pre-decompressing spilling private targets via agx_decompress() in
+ * agx_set_framebuffer_state(). Multisample 16-byte targets stay uncompressed.
+ */
+static inline bool
+agx_g17p_compression_color_format_16b(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R32G32B32X32_FLOAT:
+   case PIPE_FORMAT_R32G32B32X32_UINT:
+   case PIPE_FORMAT_R32G32B32X32_SINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Whether a chip enables compressed 2D Interchange
+ * (DRM_FORMAT_MOD_APPLE_INTERCHANGE), sharing AGX_CAP_GEN9_2D_COMPRESSION
+ * with Gallium depth compression and Borealis interchange so they cannot drift
+ * apart (private Gen9 colour compression is gated separately by
+ * agx_chip_gen9_color_compression() for G16G and G17P). Which modifiers the
+ * display accepts comes from the display's own modifier list.
+ */
+static inline bool
+agx_chip_supports_interchange(enum agx_chip chip)
+{
+   return agx_chip_has_cap(chip, AGX_CAP_GEN9_2D_COMPRESSION);
+}
+
+/* The plain 32-bit 8-bit and 10-bit RGB/RGBA formats an Interchange image
+ * may have (4-byte texels matching ail_initialize_interchange()). */
+static inline bool
+agx_interchange_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+   case PIPE_FORMAT_B10G10R10X2_UNORM:
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+   case PIPE_FORMAT_R10G10B10X2_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* The one rule for advertising and choosing Interchange: GPU capability
+ * plus format. Modifier queries and agx_interchange_allowed() share it, so
+ * other chips and formats see the modifier list they always did. */
+static inline bool
+agx_interchange_modifier_supported(enum agx_chip chip, enum pipe_format format)
+{
+   return agx_chip_supports_interchange(chip) &&
+          agx_interchange_format(format);
+}
+
+static inline bool
+agx_dmabuf_modifier_supported(enum agx_chip chip, bool nocompress,
+                              uint64_t modifier, enum pipe_format format)
+{
+   if (modifier == DRM_FORMAT_MOD_APPLE_INTERCHANGE)
+      return !nocompress && agx_interchange_modifier_supported(chip, format);
+
+   return modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED ||
+          modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED ||
+          modifier == DRM_FORMAT_MOD_LINEAR;
 }

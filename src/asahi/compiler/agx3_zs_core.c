@@ -18,12 +18,6 @@ is_b(enum agx_isa_encoding e)
    return e == AGX_ISA_ENCODING_AGX3B;
 }
 
-static bool
-enc_ok(enum agx_isa_encoding e)
-{
-   return e == AGX_ISA_ENCODING_AGX3B || e == AGX_ISA_ENCODING_AGX3C;
-}
-
 static unsigned
 nslots(enum agx_isa_encoding e)
 {
@@ -33,7 +27,7 @@ nslots(enum agx_isa_encoding e)
 static bool
 desc_ok(enum agx_isa_encoding e, const struct agx3_zs_desc *d)
 {
-   if (d == NULL || !enc_ok(e))
+   if (d == NULL || !agx_isa_is_agx3(e))
       return false;
 
    /* The staged word is a 32-bit register pair in every witness. */

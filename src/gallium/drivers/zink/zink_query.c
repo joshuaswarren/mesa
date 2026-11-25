@@ -820,6 +820,7 @@ copy_pool_results_to_buffer(struct zink_context *ctx, struct zink_query *query, 
    ctx->bs->has_work = true;
    VKCTX(CmdCopyQueryPoolResults)(ctx->bs->cmdbuf, pool, query_id, num_results, res->obj->buffer,
                                   offset, base_result_size, flags);
+   zink_batch_mark_host_transfer_write(ctx->bs, res);
    zink_cmd_debug_marker_end(ctx, ctx->bs->cmdbuf, marker);
 }
 

@@ -26,7 +26,7 @@ agx_ioto_cprog_input_offset(enum agx_chip chip,
                             const struct agx_ioto_cprog_inputs *inputs,
                             uint16_t source_half, uint16_t *offset_bytes)
 {
-   if (chip != AGX_CHIP_G17P || inputs == NULL || !inputs->known ||
+   if (!agx_chip_native_preamble(chip) || inputs == NULL || !inputs->known ||
        offset_bytes == NULL || source_half >= AGX_IOTO_CPROG_UNIFORM_HALFS)
       return false;
 
@@ -362,7 +362,7 @@ agx_ioto_load_finish_worst_case_size_with_ops(
        ((ops->extra_copy_bound == NULL) != (ops->pack_extra_copies == NULL)))
       return false;
    if (ops != NULL && ops->pack_extra_copies != NULL) {
-      if (core->chip != AGX_CHIP_G17P || core->fast_path_enabled ||
+      if (!agx_chip_native_preamble(core->chip) || core->fast_path_enabled ||
           !core->gpu0_round_nops)
          return false;
       if (complete_round) {

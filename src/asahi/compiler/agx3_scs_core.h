@@ -2,19 +2,10 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * AGX3 scalar SCS load/store encoders and decoders.
- *
- * The supported address-space(5) forms were recovered with controlled Apple
- * G17P/G17S compiler probes.  Four address kinds are represented, spanning
- * every combination Apple's G17P ray-query setup emits: direct-absolute, a
- * scalar register index plus a uniform-register base, a scalar register index
- * plus a register base, and a register base with no index -- each with a
- * signed 16-bit byte displacement.  Loads and stores may move one through four
- * 32-bit components.
- *
- * AGX3c supports W32 vectors and direct, uniform-indexed, and register-base
- * addressing witnessed in Apple's ray setup. Its destination-less traversal
- * epilogue has a separate descriptor and API below.
+ * AGX3 scalar SCS (address-space 5) load/store encoders and decoders.
+ * Supports 1..4 32-bit components across direct, uniform-indexed,
+ * register-indexed, and register-base addressing with signed 16-bit byte
+ * displacement (AGX3C also provides a destination-less traversal epilogue).
  */
 
 #pragma once
@@ -125,9 +116,6 @@ struct agx3_scs_epilogue_desc {
 bool agx3_scs_encode_epilogue(enum agx_isa_encoding enc,
                               const struct agx3_scs_epilogue_desc *desc,
                               uint8_t out[AGX3_SCS_MAX_LENGTH], uint8_t *length);
-bool agx3_scs_decode_epilogue(enum agx_isa_encoding enc, const uint8_t *bytes,
-                              size_t length,
-                              struct agx3_scs_epilogue_desc *out);
 
 /* AGX3b destination-less load, the form every Gen1 leaf program ends with
  * (agx3_rt_gen1_*_ops.h, and the bodies in agx3_rt_gen1_default.c). As on
