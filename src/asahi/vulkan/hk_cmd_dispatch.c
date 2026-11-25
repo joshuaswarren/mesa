@@ -2810,15 +2810,27 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_linked_shader *linked = s ? s->only_linked : NULL;
+   if (s && !linked && s->info.stage == MESA_SHADER_VERTEX)
+      linked = cmd->state.gfx.linked[MESA_SHADER_VERTEX];
    const bool g18 = dev->dev.chip == AGX_CHIP_G18G;
+   const bool internal = s && s->info.stage != MESA_SHADER_COMPUTE;
+   const uint32_t scratch_bytes =
+      (s && linked)
+         ? MAX3(s->b.info.scratch_size, linked->b.scratch_size,
+                MAX2(s->b.info.agx3_spectpr_scratch_size,
+                     linked->b.agx3_spectpr_scratch_size))
+         : 0;
+   const uint32_t max_spill = g18 ? (1u << 16) : AGX3_G17P_MAX_SPILL_B;
    if ((!g18 && dev->dev.chip != AGX_CHIP_G17G) || cs->type != HK_CS_CDM ||
-       !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked,
-                                         AGX3_G17P_MAX_SPILL_B) ||
-       s->info.stage != MESA_SHADER_COMPUTE || agx_is_indirect(grid) ||
-      (!g18 && s->b.info.local_size) || s->b.info.uses_ray_traversal ||
-       (g18 && (s->b.info.scratch_size || linked->b.scratch_size ||
-                s->b.info.agx3_spectpr_scratch_size ||
-                s->b.info.nr_preamble_gprs)) ||
+       (g18 && cs->g18_dispatch_sealed) ||
+       !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked, max_spill) ||
+       (!g18 && (internal || s->b.info.local_size)) ||
+       (internal && s->info.stage != MESA_SHADER_VERTEX && s->data_size) ||
+       agx_is_indirect(grid) ||
+       s->b.info.uses_ray_traversal ||
+       (g18 && (s->b.info.nr_preamble_gprs ||
+                scratch_bytes > max_spill ||
+                s->b.info.local_size > 32768u)) ||
        (g18 && s->info.g18_unlowered_image) ||
        s->info.agx3_txf_texture_valid ||
        (s->info.agx3_storage_image_valid && !g18) ||
@@ -2827,8 +2839,9 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        (uint64_t)local_size.x * local_size.y * local_size.z > 1024) {
       mesa_loge(
          "AGX3 native compute: unsupported shader or indirect/shared-memory launch"
-         " (scratch %u/%u, spectpr scratch %u, preamble GPRs %u,"
+         " (stage=%u indirect=%u scratch %u/%u, spectpr scratch %u, preamble GPRs %u,"
          " unlowered image access %d, shared memory %u B)",
+         s ? s->info.stage : 0, agx_is_indirect(grid),
          s ? s->b.info.scratch_size : 0, linked ? linked->b.scratch_size : 0,
          s ? s->b.info.agx3_spectpr_scratch_size : 0,
          s ? s->b.info.nr_preamble_gprs : 0,
@@ -2839,14 +2852,20 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (!grid.count[0] || !grid.count[1] || !grid.count[2])
       return;
 
-   struct hk_descriptor_state *descriptors = &cmd->state.cs.descriptors;
-   descriptors->root.cs.constant_data_addr = s->data_size
-      ? hk_pool_upload(cmd, s->data_ptr, s->data_size, HK_MIN_UBO_ALIGNMENT) : 0;
-   if (s->data_size && !descriptors->root.cs.constant_data_addr) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-      return;
+   struct hk_descriptor_state *descriptors =
+      internal ? &cmd->state.gfx.descriptors : &cmd->state.cs.descriptors;
+   if (!internal) {
+      descriptors->root.cs.constant_data_addr = s->data_size
+         ? hk_pool_upload(cmd, s->data_ptr, s->data_size, HK_MIN_UBO_ALIGNMENT)
+         : 0;
+      if (s->data_size && !descriptors->root.cs.constant_data_addr) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
    }
-   const uint64_t root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+   const uint64_t root = internal
+      ? cmd->state.gfx.root
+      : hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
    uint64_t texture_pointers = 0;
    if (s->info.agx3_indexed_sampler_valid) {
       /* The sampled-image heap may be a chunked table (no single BO): its
@@ -2973,8 +2992,13 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
    struct agx3_ioto_uniform_range ranges[HK_G17P_COMPUTE_MAX_RANGES];
    size_t range_count;
-   if (!hk_g17p_compute_uniform_ranges(dev->dev.chip, cmd, s, root,
-                                       texture_pointers, ranges, &range_count)) {
+   const bool ranges_ok = internal
+      ? hk_g17p_internal_graphics_uniform_ranges(cmd, s, linked, root,
+                                                 texture_pointers, ranges,
+                                                 &range_count)
+      : hk_g17p_compute_uniform_ranges(dev->dev.chip, cmd, s, root,
+                                       texture_pointers, ranges, &range_count);
+   if (!ranges_ok) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -3004,7 +3028,9 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const struct agx3_g17p_graphics_program_desc desc = {
       .program_va = program_t.gpu, .shader_va = shader_va,
       .uniform_ranges = ranges, .uniform_range_count = range_count,
-      .shader_binary_size = linked->b.size, .nr_gprs = linked->b.nr_gprs,
+      .shader_binary_size = linked->b.size,
+      .scratch_size = g18 ? scratch_bytes : 0,
+      .nr_gprs = linked->b.nr_gprs,
       .compiler_d_valid = s->b.info.agx3_staging_known,
       .compiler_d = (uint32_t)s->b.info.agx3_staging_halfs * 2,
       .threadgroup_memory_size_B = threadgroup_bytes,
@@ -3078,6 +3104,12 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * The flags=5 chaining is grounded on hardware (rel24b+), unlike the
     * standalone flush word in hk_cdm_cache_flush, whose only grounded G18G
     * encoding is the flag-free tail. */
+   if (g18) {
+      if (direct.size[1] < 2 && direct.size[2] < 2)
+         launch.launch_template.word0 &= UINT32_C(0xfff1ffff);
+      if (s->b.info.local_size)
+         launch.launch_template.word0 |= UINT32_C(1) << 23;
+   }
    if (!agx3_g17g_native_compute_dispatch_append(&launch, &direct, 5, &sink)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -3096,9 +3128,9 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        * resource words alone, and last-wins under-sizes a stream whose
        * big launches precede a small last launch (job 131: 1024-thread
        * launches + the small helper last = small plan = stall). Every
-       * scalar field takes the running max; local dims and local_bytes
-       * come from the launch with the LARGEST x*y*z product (a per-axis
-       * max can exceed the validator's 1024-thread bound, w7P check c). */
+       * scalar field takes the running max; local dims come from the launch
+       * with the LARGEST x*y*z product (a per-axis max can exceed the
+       * validator's 1024-thread bound, w7P check c). */
       const uint32_t prod =
          local_size.x * local_size.y * local_size.z;
       const uint32_t prev_prod = cs->g18_compute_resources.local_size[0] *
@@ -3112,18 +3144,34 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       const uint32_t stride =
          MAX2(cs->g18_compute_resources.imageblock_stride,
               s->b.info.imageblock_stride);
+      const uint32_t local_bytes =
+         MAX2(cs->g18_compute_resources.local_bytes, s->b.info.local_size);
+      const uint32_t main_scratch =
+         MAX2(cs->g18_compute_resources.scratch_bytes,
+              MAX2(s->b.info.scratch_size, linked->b.scratch_size));
+      const uint32_t spectpr_scratch =
+         MAX2(cs->g18_compute_resources.spectpr_scratch_bytes,
+              MAX2(s->b.info.agx3_spectpr_scratch_size,
+                   linked->b.agx3_spectpr_scratch_size));
       if (prod >= prev_prod || cs->stats.cmds == 0) {
          cs->g18_compute_resources = (struct drm_asahi_g18_compute_resources){
-            .version = 1,
-            .flags = 1,
+            .version = 2,
+            .flags = 1u,
             .registers_16 = regs,
+            .scratch_bytes = main_scratch,
+            .spectpr_scratch_bytes = spectpr_scratch,
             .staging_16 = staging,
+            .local_bytes = local_bytes,
             .imageblock_stride = stride,
             .local_size = {local_size.x, local_size.y, local_size.z},
          };
       } else {
+         cs->g18_compute_resources.version = 2;
          cs->g18_compute_resources.registers_16 = regs;
+         cs->g18_compute_resources.scratch_bytes = main_scratch;
+         cs->g18_compute_resources.spectpr_scratch_bytes = spectpr_scratch;
          cs->g18_compute_resources.staging_16 = staging;
+         cs->g18_compute_resources.local_bytes = local_bytes;
          cs->g18_compute_resources.imageblock_stride = stride;
       }
       /* Launch-count cap only (the rel30 code cap is retired: the gate
