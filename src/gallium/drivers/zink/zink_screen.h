@@ -37,23 +37,52 @@ void
 zink_init_screen_pipeline_libs(struct zink_screen *screen);
 
 
+static inline void
+zink_flush_queue_job_done(void *job, void *gdata, int thread_index)
+{
+   struct zink_screen *screen = (struct zink_screen *)gdata;
+   p_atomic_dec(&screen->flush_queue_jobs);
+}
+
+/* Queue a job on flush_queue, counting it in flush_queue_jobs until it finishes. */
+static inline void
+zink_flush_queue_add_job(struct zink_screen *screen, void *job,
+                         struct util_queue_fence *fence,
+                         util_queue_execute_func execute)
+{
+   p_atomic_inc(&screen->flush_queue_jobs);
+   util_queue_add_job(&screen->flush_queue, job, fence, execute,
+                      zink_flush_queue_job_done, 0);
+}
+
 /* update last_finished to account for batch_id wrapping */
 static inline void
 zink_screen_update_last_finished(struct zink_screen *screen, uint64_t batch_id)
 {
    const uint32_t check_id = (uint32_t)batch_id;
-   /* last_finished may have wrapped */
-   if (screen->last_finished < UINT_MAX / 2) {
-      /* last_finished has wrapped, batch_id has not */
-      if (check_id > UINT_MAX / 2)
+   uint32_t last = p_atomic_read(&screen->last_finished);
+   for (;;) {
+      uint32_t next;
+      /* last_finished may have wrapped */
+      if (last < UINT_MAX / 2) {
+         /* last_finished has wrapped, batch_id has not */
+         if (check_id > UINT_MAX / 2)
+            return;
+         next = MAX2(check_id, last);
+      } else if (check_id < UINT_MAX / 2) {
+         /* batch_id has wrapped, last_finished has not */
+         next = check_id;
+      } else {
+         /* neither have wrapped */
+         next = MAX2(check_id, last);
+      }
+      if (next == last)
          return;
-   } else if (check_id < UINT_MAX / 2) {
-      /* batch_id has wrapped, last_finished has not */
-      screen->last_finished = check_id;
-      return;
+      uint32_t prev = p_atomic_cmpxchg(&screen->last_finished, last, next);
+      if (prev == last)
+         return;
+      last = prev;
    }
-   /* neither have wrapped */
-   screen->last_finished = MAX2(check_id, screen->last_finished);
 }
 
 /* check a batch_id against last_finished while accounting for wrapping */
@@ -64,8 +93,9 @@ zink_screen_check_last_finished(struct zink_screen *screen, uint32_t batch_id)
    /* 0 means an in-flight batch */
    if (check_id == 0)
       return false;
+   const uint32_t last = p_atomic_read(&screen->last_finished);
    /* last_finished may have wrapped */
-   if (screen->last_finished < UINT_MAX / 2) {
+   if (last < UINT_MAX / 2) {
       /* last_finished has wrapped, batch_id has not */
       if (check_id > UINT_MAX / 2)
          return true;
@@ -73,7 +103,7 @@ zink_screen_check_last_finished(struct zink_screen *screen, uint32_t batch_id)
       /* batch_id has wrapped, last_finished has not */
       return false;
    }
-   return screen->last_finished >= check_id;
+   return last >= check_id;
 }
 
 bool

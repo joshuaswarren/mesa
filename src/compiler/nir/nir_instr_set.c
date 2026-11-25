@@ -881,6 +881,38 @@ nir_instr_set_fini(struct set *instr_set)
    _mesa_set_fini(instr_set, NULL);
 }
 
+static void
+rewrite_matched_instr(nir_instr *instr, nir_instr *match)
+{
+   nir_def *def = nir_instr_def(instr);
+   nir_def *new_def = nir_instr_def(match);
+
+   /* It's safe to replace an instruction with an one with different fp_math_ctrl as
+    * long as we take the fp_math_ctrl union. If we got here, the two instructions are
+    * exactly identical in every other way.
+    */
+   if (instr->type == nir_instr_type_alu) {
+      nir_instr_as_alu(match)->fp_math_ctrl |= nir_instr_as_alu(instr)->fp_math_ctrl;
+   } else if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      nir_intrinsic_instr *match_intr = nir_instr_as_intrinsic(match);
+      if (nir_intrinsic_has_io_semantics(intr) &&
+          !nir_intrinsic_io_semantics(intr).no_signed_zero) {
+         nir_io_semantics sem = nir_intrinsic_io_semantics(match_intr);
+         sem.no_signed_zero = false;
+         nir_intrinsic_set_io_semantics(match_intr, sem);
+      } else if (nir_intrinsic_has_fp_math_ctrl(intr)) {
+         unsigned fp_math_ctrl = nir_intrinsic_fp_math_ctrl(match_intr);
+         fp_math_ctrl |= nir_intrinsic_fp_math_ctrl(intr);
+         nir_intrinsic_set_fp_math_ctrl(match_intr, fp_math_ctrl);
+      }
+   }
+
+   assert(!def == !new_def);
+   if (def)
+      nir_def_rewrite_uses(def, new_def);
+}
+
 nir_instr *
 nir_instr_set_add_or_rewrite(struct set *instr_set, nir_instr *instr,
                              nir_intrin_filter_cb allow_additional_intrin,
@@ -898,34 +930,7 @@ nir_instr_set_add_or_rewrite(struct set *instr_set, nir_instr *instr,
 
    if (!cond_function || cond_function(match, instr)) {
       /* rewrite instruction if condition is matched */
-      nir_def *def = nir_instr_def(instr);
-      nir_def *new_def = nir_instr_def(match);
-
-      /* It's safe to replace an instruction with an one with different fp_math_ctrl as
-       * long as we take the fp_math_ctrl union. If we got here, the two instructions are
-       * exactly identical in every other way.
-       */
-      if (instr->type == nir_instr_type_alu) {
-         nir_instr_as_alu(match)->fp_math_ctrl |= nir_instr_as_alu(instr)->fp_math_ctrl;
-      } else if (instr->type == nir_instr_type_intrinsic) {
-         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         nir_intrinsic_instr *match_intr = nir_instr_as_intrinsic(match);
-         if (nir_intrinsic_has_io_semantics(intr) &&
-             !nir_intrinsic_io_semantics(intr).no_signed_zero) {
-            nir_io_semantics sem = nir_intrinsic_io_semantics(match_intr);
-            sem.no_signed_zero = false;
-            nir_intrinsic_set_io_semantics(match_intr, sem);
-         } else if (nir_intrinsic_has_fp_math_ctrl(intr)) {
-            unsigned fp_math_ctrl = nir_intrinsic_fp_math_ctrl(match_intr);
-            fp_math_ctrl |= nir_intrinsic_fp_math_ctrl(intr);
-            nir_intrinsic_set_fp_math_ctrl(match_intr, fp_math_ctrl);
-         }
-      }
-
-      assert(!def == !new_def);
-      if (def)
-         nir_def_rewrite_uses(def, new_def);
-
+      rewrite_matched_instr(instr, match);
       return match;
    } else {
       /* otherwise, replace hashed instruction */
@@ -943,4 +948,159 @@ nir_instr_set_remove(struct set *instr_set, nir_instr *instr)
    struct set_entry *entry = _mesa_set_search(instr_set, instr);
    if (entry)
       _mesa_set_remove(instr_set, entry);
+}
+
+static inline uint32_t
+nir_cse_instr_set_max_entries(uint32_t capacity)
+{
+   return (capacity * 2u) / 3u;
+}
+
+void
+nir_cse_instr_set_init(struct nir_cse_instr_set *set,
+                       uint32_t expected_entries)
+{
+   set->count = 0;
+   if (expected_entries <= NIR_CSE_INSTR_SET_INLINE_CAP) {
+      set->capacity = NIR_CSE_INSTR_SET_INLINE_CAP;
+      set->max_entries = nir_cse_instr_set_max_entries(set->capacity);
+      set->hashes = set->inline_hashes;
+      set->instrs = set->inline_instrs;
+      memset(set->inline_hashes, 0, sizeof(set->inline_hashes));
+      return;
+   }
+
+   uint32_t cap = util_next_power_of_two(MAX2(256u, expected_entries));
+   size_t hashes_bytes = (size_t)cap * sizeof(uint32_t);
+   size_t instrs_bytes = (size_t)cap * sizeof(nir_instr *);
+   void *buf = malloc(hashes_bytes + instrs_bytes);
+   if (!buf) {
+      set->capacity = 0;
+      set->max_entries = 0;
+      set->hashes = NULL;
+      set->instrs = NULL;
+      return;
+   }
+
+   set->capacity = cap;
+   set->max_entries = nir_cse_instr_set_max_entries(cap);
+   set->hashes = (uint32_t *)buf;
+   set->instrs = (nir_instr **)((char *)buf + hashes_bytes);
+   memset(set->hashes, 0, hashes_bytes);
+}
+
+void
+nir_cse_instr_set_fini(struct nir_cse_instr_set *set)
+{
+   if (set->hashes && set->hashes != set->inline_hashes)
+      free(set->hashes);
+   set->hashes = NULL;
+   set->instrs = NULL;
+   set->capacity = 0;
+   set->count = 0;
+   set->max_entries = 0;
+}
+
+void
+nir_cse_instr_set_clear(struct nir_cse_instr_set *set)
+{
+   if (set->count) {
+      memset(set->hashes, 0, (size_t)set->capacity * sizeof(uint32_t));
+      set->count = 0;
+   }
+}
+
+static bool
+nir_cse_instr_set_grow(struct nir_cse_instr_set *set)
+{
+   uint32_t old_cap = set->capacity;
+   uint32_t new_cap = old_cap * 2u;
+   size_t hashes_bytes = (size_t)new_cap * sizeof(uint32_t);
+   size_t instrs_bytes = (size_t)new_cap * sizeof(nir_instr *);
+   void *buf = malloc(hashes_bytes + instrs_bytes);
+   if (!buf)
+      return false;
+
+   uint32_t *new_hashes = (uint32_t *)buf;
+   nir_instr **new_instrs = (nir_instr **)((char *)buf + hashes_bytes);
+   memset(new_hashes, 0, hashes_bytes);
+
+   uint32_t mask = new_cap - 1u;
+   uint32_t *old_hashes = set->hashes;
+   nir_instr **old_instrs = set->instrs;
+   for (uint32_t i = 0; i < old_cap; i++) {
+      uint32_t h = old_hashes[i];
+      if (!h)
+         continue;
+      uint32_t idx = h & mask;
+      while (new_hashes[idx])
+         idx = (idx + 1u) & mask;
+      new_hashes[idx] = h;
+      new_instrs[idx] = old_instrs[i];
+   }
+
+   if (old_hashes != set->inline_hashes)
+      free(old_hashes);
+
+   set->hashes = new_hashes;
+   set->instrs = new_instrs;
+   set->capacity = new_cap;
+   set->max_entries = nir_cse_instr_set_max_entries(new_cap);
+   return true;
+}
+
+nir_instr *
+nir_cse_instr_set_add_or_rewrite(struct nir_cse_instr_set *set,
+                                 nir_instr *instr,
+                                 nir_intrin_filter_cb allow_additional_intrin,
+                                 const void *intrin_data,
+                                 bool (*cond_function)(const nir_instr *a,
+                                                       const nir_instr *b))
+{
+   if (!instr_can_rewrite(instr, allow_additional_intrin, intrin_data))
+      return NULL;
+
+   if (unlikely(!set->capacity))
+      return NULL;
+
+   uint32_t h = hash_instr(instr);
+   if (unlikely(h == 0))
+      h = 1;
+
+   uint32_t mask = set->capacity - 1u;
+   uint32_t idx = h & mask;
+   uint32_t *hashes = set->hashes;
+   nir_instr **instrs = set->instrs;
+
+   for (;;) {
+      uint32_t eh = hashes[idx];
+      if (eh == 0) {
+         if (unlikely(set->count >= set->max_entries)) {
+            if (!nir_cse_instr_set_grow(set))
+               return NULL;
+            mask = set->capacity - 1u;
+            hashes = set->hashes;
+            instrs = set->instrs;
+            idx = h & mask;
+            while (hashes[idx] != 0)
+               idx = (idx + 1u) & mask;
+         }
+         hashes[idx] = h;
+         instrs[idx] = instr;
+         set->count++;
+         return NULL;
+      }
+      if (eh == h) {
+         nir_instr *match = instrs[idx];
+         if (nir_instrs_equal(match, instr)) {
+            if (!cond_function || cond_function(match, instr)) {
+               rewrite_matched_instr(instr, match);
+               return match;
+            }
+            instrs[idx] = instr;
+            return NULL;
+         }
+      }
+      idx = (idx + 1u) & mask;
+   }
 }

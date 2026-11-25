@@ -171,3 +171,41 @@ TEST_F(RepairSSA, RemovesTrivialJoinPhi)
       });
    }
 }
+
+/* Exercise def_map growth (>16 definitions in a block) across a diamond join. */
+TEST_F(RepairSSA, ManyDefsGrowMap)
+{
+   CASE({
+      agx_block *A = agx_start_block(b->shader);
+      agx_block *B = agx_test_block(b->shader);
+      agx_block *C = agx_test_block(b->shader);
+      agx_block *D = agx_test_block(b->shader);
+
+      agx_block_add_successor(A, B);
+      agx_block_add_successor(A, C);
+      agx_block_add_successor(B, D);
+      agx_block_add_successor(C, D);
+
+      constexpr unsigned N = 32;
+      agx_index x[N];
+      agx_index x2[N];
+
+      b->cursor = agx_after_block(B);
+      for (unsigned i = 0; i < N; ++i)
+         x[i] = agx_mov_imm(b, 32, 0x100 + i);
+
+      b->cursor = agx_after_block(C);
+      for (unsigned i = 0; i < N; ++i) {
+         x2[i] = repaired ? agx_temp(b->shader, AGX_SIZE_32) : x[i];
+         agx_mov_imm_to(b, x2[i], 0x200 + i);
+      }
+
+      b->cursor = agx_after_block(D);
+      if (repaired) {
+         for (int i = N - 1; i >= 0; --i)
+            x[i] = agx_phi_2(b, x[i], x2[i]);
+      }
+      for (unsigned i = 0; i < N; ++i)
+         agx_unit_test(b, x[i]);
+   });
+}

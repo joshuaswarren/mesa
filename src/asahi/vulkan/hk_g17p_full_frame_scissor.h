@@ -15,17 +15,13 @@ struct hk_g17p_full_frame_scissor {
    bool default_depth;
 };
 
-/* The default clip region is the full attachment with Z=[0,1]. A scissor
- * that matches that full frame, bounds and Z alike, needs no scissor test:
- * only PRIMARY bit16 is cleared.
+/* A scissor matching the full attachment with Z=[0,1] needs no scissor test
+ * (only PRIMARY bit16 cleared). Require exact un-truncated full-frame inputs;
+ * callers still retain array records and indices.
  *
- * Restrict Linux to exact original full-frame inputs: checking
- * only the integer bounds after viewport truncation would admit fractions.
- * The caller retains all array records and indices, even when this is true.
+ * HAL300 supports up to 16 viewport/scissor records (0 means unbound dynamic
+ * state, materialized as a single zero viewport).
  */
-/* HAL300 carries at most sixteen viewport transforms, region clips and
- * consecutive scissor/depth records. Zero remains the legal not-yet-bound
- * dynamic state and is materialized as one zero viewport for hardware. */
 static inline bool
 hk_g17p_viewport_state_supported(uint32_t viewport_count,
                                  uint32_t scissor_count)

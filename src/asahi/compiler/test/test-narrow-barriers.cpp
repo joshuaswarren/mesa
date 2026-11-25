@@ -26,12 +26,13 @@ static nir_intrinsic_instr *
 emit_barrier(nir_builder *b, nir_variable_mode modes, mesa_scope exec,
              mesa_scope mem)
 {
-   nir_barrier(b, .execution_scope = exec, .memory_scope = mem,
-               .memory_semantics = mem == SCOPE_NONE ? (nir_memory_semantics)0
-                                                     : NIR_MEMORY_ACQ_REL,
-               .memory_modes = modes);
-   return nir_instr_as_intrinsic(
-      nir_block_last_instr(nir_cursor_current_block(b->cursor)));
+   nir_intrinsic_instr *barrier = nir_barrier(b);
+   nir_intrinsic_set_execution_scope(barrier, exec);
+   nir_intrinsic_set_memory_scope(barrier, mem);
+   nir_intrinsic_set_memory_semantics(barrier, mem == SCOPE_NONE
+      ? (nir_memory_semantics)0 : NIR_MEMORY_ACQ_REL);
+   nir_intrinsic_set_memory_modes(barrier, modes);
+   return barrier;
 }
 
 static void
@@ -94,6 +95,26 @@ TEST(NarrowBarriers, SingleSubgroupWorkgroupAndPreservesGlobal)
    ralloc_free(var.shader);
 }
 
+static nir_def *
+load_shared_word(nir_builder *b, nir_def *addr)
+{
+   nir_def *value = nir_load_shared(b, 1, 32, addr);
+   nir_intrinsic_set_align(nir_def_as_intrinsic(value), 4, 0);
+   return value;
+}
+
+static void
+store_shared_word(nir_builder *b, nir_def *value, nir_def *addr)
+{
+   nir_intrinsic_set_align(nir_store_shared(b, value, addr), 4, 0);
+}
+
+static void
+store_global_word(nir_builder *b, nir_def *value, nir_def *addr)
+{
+   nir_intrinsic_set_align(nir_store_global(b, value, addr), 4, 0);
+}
+
 static nir_shader *
 build_reduction_shader(unsigned first_off)
 {
@@ -101,22 +122,20 @@ build_reduction_shader(unsigned first_off)
    b.shader->info.shared_size = 256;
    nir_def *t = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
    nir_def *addr = nir_u2u16(&b, nir_ishl_imm(&b, t, 2));
-   nir_store_shared(&b, t, addr, .align_mul = 4);
+   store_shared_word(&b, t, addr);
    emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
    for (unsigned off : {first_off, 16u}) {
       nir_push_if(&b, nir_ult_imm(&b, t, off));
-      nir_def *other = nir_load_shared(
-         &b, 1, 32, nir_u2u16(&b, nir_ishl_imm(&b, nir_iadd_imm(&b, t, off), 2)),
-         .align_mul = 4);
-      nir_def *mine = nir_load_shared(&b, 1, 32, addr, .align_mul = 4);
-      nir_store_shared(&b, nir_iadd(&b, mine, other), addr, .align_mul = 4);
+      nir_def *other = load_shared_word(&b, nir_u2u16(&b, nir_ishl_imm(&b, nir_iadd_imm(&b, t, off), 2)));
+      nir_def *mine = load_shared_word(&b, addr);
+      store_shared_word(&b, nir_iadd(&b, mine, other), addr);
       nir_pop_if(&b, NULL);
       emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
    }
    nir_push_if(&b, nir_ieq_imm(&b, t, 0));
    nir_def *sum =
-      nir_load_shared(&b, 1, 32, nir_imm_intN_t(&b, 0, 16), .align_mul = 4);
-   nir_store_global(&b, sum, nir_imm_int64(&b, 0), .align_mul = 4);
+      load_shared_word(&b, nir_imm_intN_t(&b, 0, 16));
+   store_global_word(&b, sum, nir_imm_int64(&b, 0));
    nir_pop_if(&b, NULL);
    return b.shader;
 }
@@ -157,14 +176,12 @@ TEST(NarrowBarriers, Subgroup0MergedPhasePreservesCrossSubgroupHazard)
    b.shader->info.shared_size = 256;
    nir_def *t = nir_load_local_invocation_index(&b);
    nir_def *addr = nir_u2u16(&b, nir_ishl_imm(&b, t, 2));
-   nir_store_shared(&b, t, addr, .align_mul = 4);
+   store_shared_word(&b, t, addr);
    emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
    /* Empty gap 1 */
    emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
-   nir_def *other = nir_load_shared(
-      &b, 1, 32, nir_u2u16(&b, nir_ishl_imm(&b, nir_isub(&b, nir_imm_int(&b, 63), t), 2)),
-      .align_mul = 4);
-   nir_store_global(&b, other, nir_imm_int64(&b, 0), .align_mul = 4);
+   nir_def *other = load_shared_word(&b, nir_u2u16(&b, nir_ishl_imm(&b, nir_isub(&b, nir_imm_int(&b, 63), t), 2)));
+   store_global_word(&b, other, nir_imm_int64(&b, 0));
 
    EXPECT_TRUE(agx_nir_narrow_subgroup0_barriers(b.shader));
    nir_validate_shader(b.shader, "merged-phase-hazard");
@@ -183,15 +200,15 @@ TEST(NarrowBarriers, Subgroup0OtherMemoryOrdered)
       nir_def *t = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
       const gl_access_qualifier ro =
          (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
-      nir_def *flag = nir_load_global(&b, 1, 32, nir_imm_int64(&b, 0),
-                                      .access = readonly ? ro : (gl_access_qualifier)0,
-                                      .align_mul = 4);
+      nir_def *flag = nir_load_global(&b, 1, 32, nir_imm_int64(&b, 0));
+      nir_intrinsic_set_align(nir_def_as_intrinsic(flag), 4, 0);
+      if (readonly)
+         nir_intrinsic_set_access(nir_def_as_intrinsic(flag), ro);
       emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
       nir_push_if(&b, nir_ieq_imm(&b, t, 63));
-      nir_store_global(&b, nir_imm_int(&b, 1), nir_imm_int64(&b, 0),
-                       .align_mul = 4);
+      store_global_word(&b, nir_imm_int(&b, 1), nir_imm_int64(&b, 0));
       nir_pop_if(&b, NULL);
-      nir_store_global(&b, flag, nir_imm_int64(&b, 4), .align_mul = 4);
+      store_global_word(&b, flag, nir_imm_int64(&b, 4));
 
       agx_nir_narrow_subgroup0_barriers(b.shader);
       nir_validate_shader(b.shader, "other-mem-order");
@@ -219,40 +236,40 @@ TEST(NarrowBarriers, Subgroup0RefusesUnsafeShapes)
       nir_def *addr = nir_u2u16(&b, nir_ishl_imm(&b, t, 2));
 
       if (shape == 0) {
-         nir_store_shared(&b, t, addr, .align_mul = 4);
+         store_shared_word(&b, t, addr);
          emit_barrier(&b, nir_var_mem_ssbo, SCOPE_NONE, SCOPE_DEVICE);
          emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
       } else if (shape == 1) {
-         nir_store_shared(&b, t, addr, .align_mul = 4);
+         store_shared_word(&b, t, addr);
          emit_barrier(&b, nir_var_mem_shared, SCOPE_NONE, SCOPE_WORKGROUP);
          emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
       } else if (shape == 2) {
-         nir_store_shared(&b, t, addr, .align_mul = 4);
+         store_shared_word(&b, t, addr);
          emit_barrier(&b, nir_var_mem_shared, SCOPE_SUBGROUP, SCOPE_SUBGROUP);
          emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
       } else if (shape == 3) {
          nir_loop *loop = nir_push_loop(&b);
          nir_push_if(&b, nir_ieq_imm(&b, t, 0));
-         nir_store_shared(&b, t, addr, .align_mul = 4);
+         store_shared_word(&b, t, addr);
          nir_pop_if(&b, NULL);
          emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
          nir_jump(&b, nir_jump_break);
          nir_pop_loop(&b, loop);
       } else if (shape == 4) {
          nir_push_if(&b, nir_ult_imm(&b, t, 32));
-         nir_store_shared(&b, t, addr, .align_mul = 4);
+         store_shared_word(&b, t, addr);
          emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
          nir_pop_if(&b, NULL);
       } else {
          /* 32x2 workgroup: local_invocation_id.x < 32 holds for BOTH
           * subgroup 0 (y=0) and subgroup 1 (y=1), so must NOT narrow! */
          nir_push_if(&b, nir_ult_imm(&b, t, 32));
-         nir_store_shared(&b, t, addr, .align_mul = 4);
+         store_shared_word(&b, t, addr);
          nir_pop_if(&b, NULL);
          emit_barrier(&b, nir_var_mem_shared, SCOPE_WORKGROUP, SCOPE_WORKGROUP);
          nir_push_if(&b, nir_ult_imm(&b, t, 32));
-         nir_def *v = nir_load_shared(&b, 1, 32, addr, .align_mul = 4);
-         nir_store_global(&b, v, nir_imm_int64(&b, 0), .align_mul = 4);
+         nir_def *v = load_shared_word(&b, addr);
+         store_global_word(&b, v, nir_imm_int64(&b, 0));
          nir_pop_if(&b, NULL);
       }
 

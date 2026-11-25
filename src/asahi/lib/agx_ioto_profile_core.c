@@ -52,7 +52,8 @@ agx_ioto_profile_control_pack(const struct agx_ioto_profile_control *profile,
    if (!profile || !agx_ioto_profile_control_supported(profile->chip))
       return false;
 
-   if (agx_chip_g17_m5(profile->chip)) {
+   const bool is_m5 = agx_chip_g17_m5(profile->chip);
+   if (is_m5) {
       if ((profile->payload0 & ~AGX_IOTO_PROFILE_CONTROL_HAL300_PAYLOAD0) != 0 ||
           (profile->payload1 & ~AGX_IOTO_PROFILE_CONTROL_HAL300_PAYLOAD1) != 0)
          return false;
@@ -62,15 +63,12 @@ agx_ioto_profile_control_pack(const struct agx_ioto_profile_control *profile,
       return false;
    }
 
-   agx_store_le16(out, agx_chip_g17_m5(profile->chip)
-                      ? AGX_IOTO_PROFILE_CONTROL_HAL300_OPCODE
-                      : AGX_IOTO_PROFILE_CONTROL_CLASSIC_OPCODE);
+   agx_store_le16(out, is_m5 ? AGX_IOTO_PROFILE_CONTROL_HAL300_OPCODE
+                             : AGX_IOTO_PROFILE_CONTROL_CLASSIC_OPCODE);
    agx_store_le16(out + 2,
-              profile->payload0 |
-                 (agx_chip_g17_m5(profile->chip)
-                     ? AGX_IOTO_PROFILE_CONTROL_HAL300_WORD1_FIXED
-                     : 0));
-   if (agx_chip_g17_m5(profile->chip))
+                  profile->payload0 |
+                     (is_m5 ? AGX_IOTO_PROFILE_CONTROL_HAL300_WORD1_FIXED : 0));
+   if (is_m5)
       agx_store_le16(out + 4, profile->payload1);
 
    return true;

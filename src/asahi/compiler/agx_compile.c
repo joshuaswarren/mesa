@@ -30,8 +30,10 @@
 #include "agx_nir_texture.h"
 #include "agx_debug.h"
 #include "agx_nir.h"
+#include "agx_nir_match_gemm.h"
 #include "agx3_alu_core.h"
 #include "agx3_matrix_core.h"
+#include "agx3_native_stats.h"
 #include "agx_opcodes.h"
 #include "agx3_pack.h"
 #include "agx3_rt_core.h"
@@ -943,10 +945,10 @@ agx_pack_normalized_agx3(agx_builder *b, const agx_index *channels,
       return 0;
 
    if (format == AGX_FORMAT_RGB10A2) {
-      if (nr_channels != 4)
+      if (nr_channels != 3 && nr_channels != 4)
          return 0;
       agx_index pack_sources[4];
-      for (unsigned i = 0; i < 4; ++i) {
+      for (unsigned i = 0; i < nr_channels; ++i) {
          if (channels[i].size == AGX_SIZE_32) {
             pack_sources[i] = channels[i];
          } else if (channels[i].size == AGX_SIZE_16) {
@@ -960,6 +962,8 @@ agx_pack_normalized_agx3(agx_builder *b, const agx_index *channels,
             return 0;
          }
       }
+      if (nr_channels == 3)
+         pack_sources[3] = agx_mov_imm(b, 32, fui(1.0f));
       packed[0] = agx_pack_rgb10a2_agx3(b, pack_sources[0], pack_sources[1],
                                       pack_sources[2], pack_sources[3]);
       return 1;
@@ -1095,6 +1099,24 @@ agx_unpack_integer_8_agx3(agx_builder *b, agx_index dest,
                           const agx_index *halfs, unsigned nr_channels)
 {
    agx_index channels[4] = {agx_null()};
+
+   /* AGX3C: unpack each byte in one 16-bit operation: even bytes mask
+    * the low byte and odd bytes shift right by 8, clearing the upper byte. */
+   if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !b->shader->key->dev.emit_agx3d) {
+      for (unsigned i = 0; i < nr_channels; ++i) {
+         channels[i] = (i & 1) ? agx_ushr(b, halfs[i / 2], agx_immediate(8))
+                               : agx_and(b, halfs[i / 2], agx_immediate(0xff));
+         if (dest.size == AGX_SIZE_32) {
+            agx_index zext = agx_temp(b->shader, AGX_SIZE_32);
+            agx_mov_to(b, zext, channels[i]);
+            channels[i] = zext;
+         }
+      }
+      agx_emit_collect_to(b, dest, nr_channels, channels);
+      return;
+   }
+
    agx_index shift = agx_mov_imm(b, 32, 8);
    for (unsigned i = 0; i < nr_channels; ++i) {
       agx_index wide = agx_pad_to_32(b, halfs[i / 2]);
@@ -1756,14 +1778,22 @@ agx_unpack_normalized_agx3(agx_builder *b, agx_index dest,
    if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX2)
       return false;
    if (format == AGX_FORMAT_RGB10A2) {
-      if (nr_comps != 4 || dest.size != AGX_SIZE_32)
+      if (nr_comps < 1 || nr_comps > 4 || dest.size != AGX_SIZE_32)
          return false;
       agx_index packed = agx_temp(b->shader, AGX_SIZE_32);
       agx_ld_tile_to(b, packed, agx_src_index(&instr->src[0]), agx_null(),
                     format, 1, nir_intrinsic_base(instr), false,
                     nir_intrinsic_target(instr));
-      agx_unpack_rgb10a2_agx3_to(b, dest, packed);
-      agx_emit_cached_split(b, dest, 4);
+      if (nr_comps == 4) {
+         agx_unpack_rgb10a2_agx3_to(b, dest, packed);
+         agx_emit_cached_split(b, dest, 4);
+      } else {
+         agx_index rgba = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+         agx_unpack_rgb10a2_agx3_to(b, rgba, packed);
+         agx_index channels[4] = {agx_null()};
+         agx_emit_split(b, channels, rgba, 4);
+         agx_emit_collect_to(b, dest, nr_comps, channels);
+      }
       return true;
    }
    /* Apple reads an RGB9E5 or RG11B10 target's three float lanes back with
@@ -1871,6 +1901,32 @@ nir_is_coherent(nir_intrinsic_instr *instr)
           (ACCESS_COHERENT | ACCESS_VOLATILE | ACCESS_ATOMIC);
 }
 
+/* Shared predicate for agx_emit_load() and agx_emit_alu() so both sites agree
+ * on when pack_32_4x8(load_agx 8x4) consumes the raw packed W8 payload
+ * directly. Scoped to AGX3C (non-G18G) to match agx_nir_opt_u8x4_hsum();
+ * G18G (emit_agx3d) stays excluded until verified on G18G hardware. */
+static bool
+agx_pack_32_4x8_zero_copy_load(const struct agx_device_key *dev,
+                               const nir_intrinsic_instr *ld,
+                               const nir_alu_instr *pack)
+{
+   if (dev->encoding != AGX_ISA_ENCODING_AGX3C || dev->emit_agx3d ||
+       ld->intrinsic != nir_intrinsic_load_agx ||
+       agx_format_for_pipe(nir_intrinsic_format(ld)) != AGX_FORMAT_I8 ||
+       (nir_intrinsic_base(ld) & (AGX_NIR_MEMORY_PACKED_COUNT_MASK |
+                                  AGX_NIR_MEMORY_UNPACK_W8_WORD)) ||
+       ld->def.num_components != 4 || ld->def.bit_size != 8 ||
+       !list_is_singular(&ld->def.uses))
+      return false;
+
+   if (pack->op != nir_op_pack_32_4x8 || pack->def.num_components != 1 ||
+       pack->def.bit_size != 32 || pack->src[0].src.ssa != &ld->def)
+      return false;
+
+   return pack->src[0].swizzle[0] == 0 && pack->src[0].swizzle[1] == 1 &&
+          pack->src[0].swizzle[2] == 2 && pack->src[0].swizzle[3] == 3;
+}
+
 static void
 agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
 {
@@ -1888,7 +1944,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
    const int16_t byte_offset =
       (int16_t)(shift >> AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT);
    assert(!byte_offset ||
-          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C);
+          agx_isa_is_agx3(b->shader->key->dev.encoding));
    shift &= ~(AGX_NIR_MEMORY_INDEX_BYTES | AGX_NIR_MEMORY_PACKED_COUNT_MASK |
               AGX_NIR_MEMORY_UNPACK_W8_WORD | AGX_NIR_MEMORY_BYTE_OFFSET_MASK);
 
@@ -2015,6 +2071,24 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
         (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
          dest.size == AGX_SIZE_32)) && packed_count == 0) {
       const unsigned nr = instr->def.num_components;
+      if (list_is_singular(&instr->def.uses)) {
+         nir_src *use = list_first_entry(&instr->def.uses, nir_src, use_link);
+         if (!nir_src_is_if(use) &&
+             nir_src_use_instr(use)->type == nir_instr_type_alu) {
+            nir_alu_instr *pack = nir_instr_as_alu(nir_src_use_instr(use));
+            if (agx_pack_32_4x8_zero_copy_load(&b->shader->key->dev, instr,
+                                               pack)) {
+               agx_instr *load = agx_device_load_to(
+                  b, agx_def_index(&pack->def), addr, offset, fmt,
+                  BITFIELD_MASK(nr), shift, nir_is_coherent(instr));
+               load->memory_index_is_bytes = index_bytes;
+               load->memory_byte_offset = byte_offset;
+               load->memory_is_packed = true;
+               return;
+            }
+         }
+      }
+
       agx_index payload = agx_temp(b->shader, AGX_SIZE_32);
       agx_instr *load = agx_device_load_to(b, payload, addr, offset, fmt,
                                            BITFIELD_MASK(nr), shift,
@@ -2064,10 +2138,11 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
       load->memory_byte_offset = byte_offset;
    load->memory_is_packed = packed_count != 0;
    /* nir_opt_access proved nothing writes this memory and it is not
-    * volatile, so the read is a function of its address alone. The M5 spiller
-    * may then repeat it in place of filling the value from a spill slot. */
+    * volatile, so the read is a function of its address alone. The AGX3
+    * spiller may then repeat it in place of filling the value from a spill
+    * slot. */
    load->memory_can_reorder =
-      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      agx_isa_is_agx3(b->shader->key->dev.encoding) &&
       nir_intrinsic_can_reorder(instr) && !nir_is_coherent(instr);
    agx_emit_cached_split(b, dest, instr->def.num_components);
 }
@@ -2084,7 +2159,7 @@ agx_emit_store(agx_builder *b, nir_intrinsic_instr *instr)
    const int16_t byte_offset =
       (int16_t)(shift >> AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT);
    assert(!byte_offset ||
-          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C);
+          agx_isa_is_agx3(b->shader->key->dev.encoding));
    shift &= ~(AGX_NIR_MEMORY_INDEX_BYTES | AGX_NIR_MEMORY_BYTE_OFFSET_MASK);
 
    assert(shift <= 3);
@@ -2518,16 +2593,84 @@ agx_lower_agx3_device_atomic_sources(agx_context *ctx)
 static bool
 agx_lower_agx3_matrix_sources(agx_context *ctx)
 {
-   bool progress = false;
-   agx_foreach_instr_global_safe(ctx, I) {
-      if (I->op != AGX_OPCODE_MATMAD16_AGX3)
-         continue;
-      agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-      agx_index tied = agx_vec_temp(ctx, AGX_SIZE_32, 8);
-      agx_mov_to(&b, tied, I->src[2]);
-      I->src[2] = tied;
-      progress = true;
+   bool any_matrix = false;
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_MATMAD8_AGX3 ||
+          I->op == AGX_OPCODE_MATMAD16_AGX3) {
+         any_matrix = true;
+         break;
+      }
    }
+   if (!any_matrix)
+      return false;
+
+   /* Scalarized vector loop phis leave `collect(phi_x, phi_y)` in the loop
+    * header before the exit branch, where the scalar phis are still live-out
+    * to the loop exit. Cloning cross-block accumulator collects into the
+    * consumer's block lets the scalar phis die at the collect so RA can
+    * coalesce the collect, matmad8/16, split, and back-edge in place. */
+   const unsigned orig_alloc = ctx->alloc;
+   agx_instr **collect_defs = calloc(orig_alloc, sizeof(*collect_defs));
+   agx_block **collect_blocks = calloc(orig_alloc, sizeof(*collect_blocks));
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_COLLECT && I->nr_dests == 1 &&
+             I->dest[0].type == AGX_INDEX_NORMAL && !I->dest[0].memory &&
+             agx_channels(I->dest[0]) == I->nr_srcs) {
+            collect_defs[I->dest[0].value] = I;
+            collect_blocks[I->dest[0].value] = block;
+         }
+      }
+   }
+
+   bool progress = false;
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block_safe(block, I) {
+         if (I->op != AGX_OPCODE_MATMAD8_AGX3 &&
+             I->op != AGX_OPCODE_MATMAD16_AGX3)
+            continue;
+
+         if (I->nr_srcs >= 3 && I->src[2].type == AGX_INDEX_NORMAL &&
+             !I->src[2].memory && I->src[2].value < orig_alloc) {
+            agx_instr *col = collect_defs[I->src[2].value];
+            if (col && collect_blocks[I->src[2].value] != block &&
+                col->dest[0].size == I->src[2].size &&
+                agx_channels(col->dest[0]) == agx_channels(I->src[2])) {
+               bool can_clone = true;
+               agx_foreach_src(col, k) {
+                  enum agx_index_type t = col->src[k].type;
+                  if (col->src[k].memory ||
+                      (t != AGX_INDEX_NORMAL && t != AGX_INDEX_IMMEDIATE &&
+                       t != AGX_INDEX_UNIFORM && t != AGX_INDEX_NULL)) {
+                     can_clone = false;
+                     break;
+                  }
+               }
+               if (can_clone) {
+                  agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+                  agx_index dst = agx_vec_temp(ctx, col->dest[0].size,
+                                               agx_channels(col->dest[0]));
+                  agx_instr *clone = agx_collect_to(&b, dst, col->nr_srcs);
+                  agx_foreach_src(col, k)
+                     clone->src[k] = col->src[k];
+                  I->src[2] = dst;
+                  progress = true;
+               }
+            }
+         }
+
+         if (I->op == AGX_OPCODE_MATMAD16_AGX3) {
+            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+            agx_index tied = agx_vec_temp(ctx, AGX_SIZE_32, 8);
+            agx_mov_to(&b, tied, I->src[2]);
+            I->src[2] = tied;
+            progress = true;
+         }
+      }
+   }
+
+   free(collect_defs);
+   free(collect_blocks);
    return progress;
 }
 
@@ -2886,7 +3029,7 @@ agx_emit_image_load(agx_builder *b, agx_index dst, nir_intrinsic_instr *intr)
     * image writes (native725 vs_copy). */
    const enum gl_access_qualifier access = nir_intrinsic_access(intr);
    I->memory_can_reorder =
-      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      agx_isa_is_agx3(b->shader->key->dev.encoding) &&
       (access & ACCESS_CAN_REORDER) && (access & ACCESS_RESTRICT) &&
       !nir_is_coherent(intr);
    I->mask = agx_expand_tex_to(b, &intr->def, tmp,
@@ -3029,36 +3172,7 @@ agx_emit_image_store(agx_builder *b, nir_intrinsic_instr *instr)
        * copy kernels all declare. Select on the stored type instead: it
        * gives the same f70 for those three formats and is the rule Apple's
        * compiler is following. */
-      nir_alu_type stored =
-         nir_alu_type_get_base_type(nir_intrinsic_src_type(instr));
-      if (stored == nir_type_invalid) {
-         /* Not every producer of an image store fills in src_type. Fall back
-          * to the declared format, which says the same thing whenever it is
-          * there at all. */
-         switch (nir_intrinsic_format(instr)) {
-         case PIPE_FORMAT_R8G8B8A8_UINT:
-         case PIPE_FORMAT_R32_UINT:
-            stored = nir_type_uint;
-            break;
-         case PIPE_FORMAT_R8G8B8A8_SINT:
-         case PIPE_FORMAT_R32_SINT:
-            stored = nir_type_int;
-            break;
-         case PIPE_FORMAT_R32_FLOAT:
-         case PIPE_FORMAT_R8G8B8A8_UNORM:
-         case PIPE_FORMAT_R10G10B10A2_UNORM:
-            stored = nir_type_float;
-            break;
-         default:
-            /* Any other declared format names its data class the same way
-             * (the G18G branch below already does this): the PBE converts
-             * the four 32-bit lanes, f70 only says float or integer. */
-            if (nir_intrinsic_format(instr) != PIPE_FORMAT_NONE)
-               stored = util_format_is_pure_integer(nir_intrinsic_format(instr))
-                           ? nir_type_int : nir_type_float;
-            break;
-         }
-      }
+      nir_alu_type stored = agx_image_store_base_type(instr);
 
       switch (stored) {
       case nir_type_float:
@@ -3095,11 +3209,7 @@ agx_emit_image_store(agx_builder *b, nir_intrinsic_instr *instr)
        * A store that names no type falls back to its declared format's
        * class; with neither, it stays unnamed and the packer refuses it. */
       const enum pipe_format format = nir_intrinsic_format(instr);
-      nir_alu_type stored =
-         nir_alu_type_get_base_type(nir_intrinsic_src_type(instr));
-      if (stored == nir_type_invalid && format != PIPE_FORMAT_NONE)
-         stored = util_format_is_pure_integer(format) ? nir_type_int
-                                                      : nir_type_float;
+      nir_alu_type stored = agx_image_store_base_type(instr);
       if ((format == PIPE_FORMAT_R32_UINT || format == PIPE_FORMAT_R32_SINT) &&
           (stored == nir_type_uint || stored == nir_type_int))
          write->format = AGX_FORMAT_I32;
@@ -3253,6 +3363,26 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
 
    switch (instr->intrinsic) {
    case nir_intrinsic_cmat_muladd_agx: {
+      const enum agx_isa_encoding mm_enc = b->shader->key->dev.encoding;
+      if (mm_enc == AGX_ISA_ENCODING_AGX2) {
+         const nir_alu_type ta = nir_intrinsic_src_type(instr);
+         const nir_alu_type tb = nir_intrinsic_src_type2(instr);
+         assert(stage == MESA_SHADER_COMPUTE && !b->shader->is_preamble &&
+                instr->def.num_components == 2 && ta == tb &&
+                (ta == nir_type_float16 || ta == nir_type_float32) &&
+                (instr->def.bit_size == 32 ||
+                 (instr->def.bit_size == 16 && ta == nir_type_float16)));
+         agx_index a = agx_src_index(&instr->src[0]);
+         agx_index bm = agx_src_index(&instr->src[1]);
+         agx_index c = agx_src_index(&instr->src[2]);
+         if (instr->def.bit_size == 16)
+            agx_simd_matrix_fmadd16_to(b, dst, a, bm, c);
+         else
+            agx_simd_matrix_fmadd32_to(b, dst, a, bm, c);
+         agx_emit_cached_split(b, dst, 2);
+         return NULL;
+      }
+
       unsigned type = nir_intrinsic_src_type(instr) == nir_type_uint16
          ? AGX3_MATRIX_INPUT_BF16 : nir_intrinsic_src_type(instr) == nir_type_float32
          ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
@@ -3260,14 +3390,16 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
          ? AGX3_MATRIX_INPUT_BF16 : nir_intrinsic_src_type2(instr) == nir_type_float32
          ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
       type |= type_b << 4;
+      if (instr->def.bit_size == 16)
+         type |= AGX3_MATRIX_ACCUM_F16;
       /* The 16x16 GEMM form is M5 (AGX3C) only; the 8x8 matmad also exists on
        * the AGX3B encoding (G15/G16/G17P), so the 2-component path is allowed
        * there too. */
-      const enum agx_isa_encoding mm_enc = b->shader->key->dev.encoding;
       assert(stage == MESA_SHADER_COMPUTE && !b->shader->is_preamble &&
              (mm_enc == AGX_ISA_ENCODING_AGX3C ||
               (mm_enc == AGX_ISA_ENCODING_AGX3B &&
-               instr->def.num_components == 2)));
+               instr->def.num_components == 2)) &&
+             (instr->def.bit_size == 32 || mm_enc == AGX_ISA_ENCODING_AGX3B));
       if (instr->def.num_components == 8) {
          agx_matmad16_agx3_to(b, dst, agx_src_index(&instr->src[0]),
                             agx_src_index(&instr->src[1]),
@@ -3466,9 +3598,13 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
       if (b->shader->key->dev.emit_agx3d &&
           (g18_samples == 2 || g18_samples == 4) &&
           !b->shader->key->fs.inside_sample_loop &&
-          !b->shader->force_early_tests_pending && !no_tests &&
+          !no_tests &&
           (agx_g18_all_sample_targets(instr->src[0]) ||
            nir_intrinsic_flags(instr) == AGX_SAMPLE_MASK_FULL_OR_KILL)) {
+         const bool force_early = b->shader->force_early_tests_pending;
+         b->shader->force_early_tests_pending = false;
+         if (force_early)
+            agx_wait_pixel_mask(b, 0x1);
          b->shader->out->g18_sample_mask_forms |= AGX_G18_SAMPLE_MASK_FULL;
          agx_index coverage = agx_temp(b->shader, AGX_SIZE_16);
          agx_get_sr_coverage_to(b, coverage, AGX_SR_INPUT_SAMPLE_MASK);
@@ -3502,7 +3638,8 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
                            AGX_ICOND_UEQ);
             word = selected;
          }
-         return agx_sample_mask_agx3(b, agx_mov_imm(b, 16, 1), word, 2);
+         return agx_sample_mask_agx3(b, agx_mov_imm(b, 16, 1), word,
+                                     2 | (force_early ? 1 : 0));
       }
 
       /* Native1121 psdiscard (Apple M6, verified capture 1121, run 1128):
@@ -3726,10 +3863,18 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
          const unsigned reduced =
             samples == 1 ? nir_intrinsic_flags(instr) : 0;
 
+         const bool whole_target = samples == 1 &&
+            !b->shader->key->dev.emit_agx3d &&
+            nir_src_is_const(instr->src[0]) &&
+            (nir_src_as_uint(instr->src[0]) & 1);
+
          if (samples == 1) {
             /* Apple's one-sample fragments read SR2 and repeat it in both
-             * coverage nibbles. */
-            target = (reduced & 1) ? agx_g17p_reg16(b, target_in)
+             * coverage nibbles. When the target is constant with bit 0 set,
+             * sample 0 is unconditionally affected, so pass immediate 1
+             * directly instead of materializing and masking the target. */
+            target = whole_target ? agx_immediate(1)
+                   : (reduced & 1) ? agx_g17p_reg16(b, target_in)
                                    : agx_and(b, target_in, agx_immediate(1));
             keep = (reduced & 2) ? agx_g17p_reg16(b, live_in)
                                  : agx_and(b, live_in, agx_immediate(1));
@@ -3779,11 +3924,17 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
 
          agx_index word = agx_iadd(b, keep, mid, 4);
          agx_index selected = agx_temp(b->shader, AGX_SIZE_32);
-         /* target is 0 or 1 and word < 0x1000, so the zero-extended 16x16->32
-          * product (Apple's half-operand imadd form) is the selected word,
-          * high half zero. */
-         agx_imad_to(b, selected, agx_abs(target), agx_abs(word), agx_zero(),
-                     0);
+         if (whole_target) {
+            /* Constant target 1 always selects `word`, zero-extended to 32
+             * bits (agx3_encode_zext_half()). */
+            agx_mov_to(b, selected, word);
+         } else {
+            /* target is 0 or 1 and word < 0x1000, so the zero-extended 16x16->32
+             * product (Apple's half-operand imadd form) is the selected word,
+             * high half zero. */
+            agx_imad_to(b, selected, agx_abs(target), agx_abs(word), agx_zero(),
+                        0);
+         }
          return agx_sample_mask_agx3(
             b, target, selected,
             (!no_tests ? 2 : 0) | (force_early ? 1 : 0));
@@ -4075,13 +4226,21 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
                emitted = true;
             }
 
+            /* Shared memory takes the threadgroup rendezvous only for a
+             * workgroup execution barrier. A memory-only fence
+             * (memoryBarrierShared(), or the shared part of memoryBarrier())
+             * may sit in divergent control flow, where a rendezvous would
+             * count arrivals the rest of the workgroup never makes, so it
+             * takes the threadgroup-memory fence instead. Within a subgroup
+             * no instruction is needed. */
             if (modes & nir_var_mem_shared) {
                const bool subgroup =
                   nir_intrinsic_execution_scope(instr) <= SCOPE_SUBGROUP &&
                   nir_intrinsic_memory_scope(instr) <= SCOPE_SUBGROUP;
                agx_scoped_barrier_agx3(
-                  b, subgroup ? AGX3_BARRIER_SCOPE_SUBGROUP_SHARED
-                              : AGX3_BARRIER_SCOPE_THREADGROUP);
+                  b, subgroup      ? AGX3_BARRIER_SCOPE_SUBGROUP_SHARED
+                     : memory_only ? AGX3_BARRIER_SCOPE_THREADGROUP_FENCE
+                                   : AGX3_BARRIER_SCOPE_THREADGROUP);
                emitted = true;
             }
          }
@@ -4413,14 +4572,22 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
    }
 
    case nir_intrinsic_shuffle_xor:
-      /* Only constant masks reach here, see agx_nir_lower_subgroups_m5() */
+   case nir_intrinsic_shuffle_up:
+   case nir_intrinsic_shuffle_down: {
+      /* Only constant masks/deltas reach here, see agx_nir_lower_subgroups.c */
       if (!nir_src_is_const(instr->src[1])) {
          b->shader->unsupported_instruction = true;
          return NULL;
       }
 
-      return agx_shuffle_xor_to(b, dst, agx_src_index(&instr->src[0]),
-                                agx_immediate(nir_src_as_uint(instr->src[1])));
+      agx_index data = agx_src_index(&instr->src[0]);
+      agx_index delta = agx_immediate(nir_src_as_uint(instr->src[1]));
+      if (instr->intrinsic == nir_intrinsic_shuffle_xor)
+         return agx_shuffle_xor_to(b, dst, data, delta);
+      if (instr->intrinsic == nir_intrinsic_shuffle_up)
+         return agx_shuffle_up_to(b, dst, data, delta);
+      return agx_shuffle_down_to(b, dst, data, delta);
+   }
 
    case nir_intrinsic_quad_swap_horizontal: {
       return agx_quad_shuffle_xor_to(b, dst, agx_src_index(&instr->src[0]),
@@ -4727,7 +4894,7 @@ agx_fminmax_to(agx_builder *b, agx_index dst, agx_index s0, agx_index s1,
    return agx_fcmpsel_to(b, dst, s0, s1, s0, s1, fcond);
 }
 
-static void
+void
 agx_lower_agx3_half_converts(agx_context *ctx)
 {
    const bool is_g18g = agx_is_g18g(&ctx->key->dev);
@@ -4848,6 +5015,21 @@ agx_lower_agx3_half_converts(agx_context *ctx)
       switch (I->src[0].value) {
       case AGX_CONVERT_S32_TO_F:
       case AGX_CONVERT_U32_TO_F:
+         /* AGX3B converts 32-bit integer GPRs directly to f16 via
+          * agx3_alu_i32_to_f16 without an intermediate f32 widening and
+          * narrowing move (verified bit-exact across the full 2^32 signed
+          * and 2^32 unsigned IEEE-754 RTE domains on G17P hardware). Leave
+          * AGX3C untouched. */
+         if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+             !I->saturate && I->nr_dests == 1 && I->nr_srcs == 2 &&
+             I->src[1].size == AGX_SIZE_32 &&
+             agx_channels(I->src[1]) == 1 && agx_channels(I->dest[0]) == 1 &&
+             !I->dest[0].memory && !I->src[1].memory &&
+             !I->src[1].abs && !I->src[1].neg &&
+             (I->src[1].type == AGX_INDEX_NORMAL ||
+              I->src[1].type == AGX_INDEX_REGISTER))
+            continue;
+         break;
       case AGX_CONVERT_S16_TO_F:
       case AGX_CONVERT_U16_TO_F:
          break;
@@ -4967,18 +5149,6 @@ agx_lower_m5_alu_operands(agx_context *ctx)
          }
       }
 
-      if (I->op == AGX_OPCODE_IADD && I->shift && !I->saturate &&
-          I->dest[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_32 &&
-          I->src[1].neg && !I->src[1].abs) {
-         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-         agx_index source = I->src[1];
-         source.neg = false;
-         agx_index shifted = agx_temp(ctx, AGX_SIZE_32);
-         agx_bfi_to(&b, shifted, agx_zero(), source, agx_immediate(I->shift), 0);
-         I->src[1] = agx_neg(shifted);
-         I->shift = 0;
-         continue;
-      }
       if (I->op == AGX_OPCODE_FFS && I->src[0].size == AGX_SIZE_16) {
          agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
          I->src[0] = agx_pad_to_32(&b, I->src[0]);
@@ -5057,6 +5227,30 @@ agx_lower_m5_alu_operands(agx_context *ctx)
    }
 
    util_dynarray_fini(&comparands);
+}
+
+/* AGX3C has no shifted-subtract 32-bit IADD form (`iadd d32, s0, s1.neg, shift`).
+ * Run after agx_lower_agx3_widening_int() so 16-bit negated sources widened to
+ * 32-bit with a nonzero shift are legalized alongside originally 32-bit ones. */
+static void
+agx_lower_m5_shifted_neg_iadd(agx_context *ctx)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C)
+      return;
+
+   agx_foreach_instr_global_safe(ctx, I) {
+      if (I->op == AGX_OPCODE_IADD && I->shift && !I->saturate &&
+          I->dest[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_32 &&
+          I->src[1].neg && !I->src[1].abs) {
+         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+         agx_index source = I->src[1];
+         source.neg = false;
+         agx_index shifted = agx_temp(ctx, AGX_SIZE_32);
+         agx_bfi_to(&b, shifted, agx_zero(), source, agx_immediate(I->shift), 0);
+         I->src[1] = agx_neg(shifted);
+         I->shift = 0;
+      }
+   }
 }
 
 static void
@@ -5229,6 +5423,10 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
 {
    /* G18G keeps j873's fused G17G-family half widening (15f6b6a7bd2). */
    const bool g18g = agx_is_g18g(&ctx->key->dev);
+   const bool agx3_mixed_falu =
+      ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+      (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !ctx->key->dev.emit_agx3d);
    if (!agx_isa_is_agx3(ctx->key->dev.encoding))
       return;
 
@@ -5260,6 +5458,43 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
    }
 
    agx_foreach_instr_global_safe(ctx, I) {
+      if (agx3_mixed_falu &&
+          (I->op == AGX_OPCODE_FMUL ||
+           (I->op == AGX_OPCODE_FFMA && I->saturate)) &&
+          I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
+          agx_channels(I->dest[0]) == 1) {
+         bool all_scalar_regs = true;
+         bool has_half_reg = false;
+         agx_foreach_src(I, s) {
+            const bool is_reg = (I->src[s].type == AGX_INDEX_NORMAL ||
+                                 I->src[s].type == AGX_INDEX_REGISTER) &&
+                                !I->src[s].memory &&
+                                agx_channels(I->src[s]) == 1;
+            if (!is_reg)
+               all_scalar_regs = false;
+            else if (I->src[s].size == AGX_SIZE_16)
+               has_half_reg = true;
+         }
+         if (has_half_reg && !all_scalar_regs) {
+            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+            agx_foreach_src(I, s) {
+               if ((I->src[s].type == AGX_INDEX_NORMAL ||
+                    I->src[s].type == AGX_INDEX_REGISTER) &&
+                   !I->src[s].memory && I->src[s].size == AGX_SIZE_16 &&
+                   agx_channels(I->src[s]) == 1) {
+                  agx_index raw = I->src[s];
+                  raw.abs = false;
+                  raw.neg = false;
+                  agx_index widened = agx_temp(ctx, AGX_SIZE_32);
+                  agx_fmov_to(&b, widened, raw);
+                  widened.abs = I->src[s].abs;
+                  widened.neg = I->src[s].neg;
+                  I->src[s] = widened;
+               }
+            }
+         }
+      }
+
       if (I->op != AGX_OPCODE_FFMA || I->nr_srcs != 3 || I->saturate)
          continue;
 
@@ -6050,7 +6285,8 @@ agx_lower_g17g_retry_float_operands(agx_context *ctx)
        * single rounding for arithmetic, as the native mixed op would do). */
       bool any32 = false, any16 = false;
       for (unsigned s = 0; s < I->nr_srcs; ++s) {
-         if (I->src[s].type != AGX_INDEX_NORMAL)
+         if (I->src[s].type != AGX_INDEX_NORMAL &&
+             I->src[s].type != AGX_INDEX_UNIFORM)
             continue;
          any32 |= I->src[s].size == AGX_SIZE_32;
          any16 |= I->src[s].size == AGX_SIZE_16;
@@ -6072,23 +6308,33 @@ agx_lower_g17g_retry_float_operands(agx_context *ctx)
          continue;
 
       for (unsigned s = 0; s < I->nr_srcs; ++s) {
-         if (I->src[s].type != AGX_INDEX_NORMAL ||
-             I->src[s].size != AGX_SIZE_16)
-            continue;
-         /* The 32-bit select compares f32: widen half comparands. */
-         if (select && s < 2 && !cmp_mixed && !sel_mixed)
-            continue;
          /* Selected values are bit patterns: zero-extend them, as the
-          * existing G17G half-select path does. Floats convert (exact). */
+          * existing G17G half-select path does. A half uniform, such as a
+          * constant-program export, is selected the same way: copy it to a
+          * half register first. Left in place, it would be a 16-bit value
+          * selected into the 32-bit destination below. */
          if (select && s >= 2) {
-            if (I->src[s].abs || I->src[s].neg)
+            agx_index half = I->src[s];
+            if ((half.type != AGX_INDEX_NORMAL &&
+                 half.type != AGX_INDEX_UNIFORM) ||
+                half.size != AGX_SIZE_16 || half.abs || half.neg)
                continue;
+            if (half.type == AGX_INDEX_UNIFORM)
+               half = agx_mov(&b, half);
             agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-            agx_mov_to(&b, wide, I->src[s]);
+            agx_mov_to(&b, wide, half);
             I->src[s] = wide;
             progress = true;
             continue;
          }
+         if ((I->src[s].type != AGX_INDEX_NORMAL &&
+              I->src[s].type != AGX_INDEX_UNIFORM) ||
+             I->src[s].size != AGX_SIZE_16)
+            continue;
+         /* The 32-bit select compares f32: widen half comparands. Floats
+          * convert (exact). */
+         if (select && s < 2 && !cmp_mixed && !sel_mixed)
+            continue;
          agx_index plain = I->src[s];
          plain.abs = false;
          plain.neg = false;
@@ -6336,23 +6582,51 @@ agx_lower_agx3_half_iadd_constants(agx_context *ctx)
    return progress;
 }
 
-/* A 32-bit add or multiply-add of halves -- 16-bit integer arithmetic the
- * optimizer widened, as hk's int16 shaders and dynamically indexed uniform
- * arrays produce -- has no mixed-width AGX3 form. Extend each half register
+/* Lower 32-bit integer adds or multiply-adds of half sources -- 16-bit
+ * integer arithmetic the optimizer widened, as hk's int16 shaders and
+ * dynamically indexed uniform arrays produce -- that have no native
+ * mixed-width AGX3 encoding (all IMADs, immediate/uniform or saturated
+ * IADDs, double-negated IADDs, shifted IADDs outside AGX3C's shift 1..4
+ * non-negated form, and all AGX3D forms). Extend each half register
  * explicitly: AGX IR plain half sources are signed and abs selects zero
- * extension; negation and the add's shift stay on the widened operation. */
-static bool
+ * extension; negation and the add's shift stay on the widened operation.
+ *
+ * On AGX3B, 32x32->64 IMAD (dest_64) also requires a 32-bit register in slot A
+ * and either a 32-bit register or an 8-bit non-abs immediate in slot B (and
+ * no >8-bit or .abs immediate in slot C). Legalize narrow register operands
+ * and immediate shapes here before register allocation. */
+bool
 agx_lower_agx3_widening_int(agx_context *ctx)
 {
    if (!agx_isa_is_agx3(ctx->key->dev.encoding))
       return false;
 
+   const bool agx3b = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
    bool progress = false;
    agx_foreach_instr_global_safe(ctx, I) {
-      if (!((I->op == AGX_OPCODE_IMAD && I->nr_srcs == 3) ||
-            (I->op == AGX_OPCODE_IADD && I->nr_srcs == 2 && !I->saturate)) ||
-          I->nr_dests != 1 || I->dest[0].size != AGX_SIZE_32 ||
-          agx_channels(I->dest[0]) != 1)
+      const bool agx3b_wide_imad =
+         agx3b && I->op == AGX_OPCODE_IMAD && I->nr_srcs == 3 &&
+         I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_64 &&
+         agx_channels(I->dest[0]) == 1;
+      if (!agx3b_wide_imad &&
+          (!((I->op == AGX_OPCODE_IMAD && I->nr_srcs == 3) ||
+             (I->op == AGX_OPCODE_IADD && I->nr_srcs == 2 && !I->saturate)) ||
+           I->nr_dests != 1 || I->dest[0].size != AGX_SIZE_32 ||
+           agx_channels(I->dest[0]) != 1))
+         continue;
+
+      /* AGX3B/AGX3C natively encode unshifted 32-bit register+register IADD
+       * with 16-bit source width (plain=sext, abs=zext) in agx3_iadd_encode().
+       * AGX3C additionally encodes shifted (1..4) non-negated mixed-width
+       * register+register IADD in the same form. Keep explicit widening for
+       * unsupported shifts, uniforms/immediates, or G18G. */
+      const bool agx3c_shifted =
+         ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+         I->shift <= 4 && !I->src[0].neg && !I->src[1].neg;
+      if (I->op == AGX_OPCODE_IADD && !ctx->key->dev.emit_agx3d &&
+          (I->shift == 0 || agx3c_shifted) &&
+          I->src[0].type == AGX_INDEX_NORMAL && I->src[1].type == AGX_INDEX_NORMAL &&
+          !(I->src[0].neg && I->src[1].neg))
          continue;
 
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
@@ -6370,8 +6644,68 @@ agx_lower_agx3_widening_int(agx_context *ctx)
             agx_mov_to(&b, wide, src);
          else
             agx_signext_to(&b, wide, src);
+         if (agx3b_wide_imad && is_unsigned)
+            wide.abs = true;
          I->src[s] = negate ? agx_neg(wide) : wide;
          progress = true;
+      }
+
+      if (agx3b_wide_imad) {
+         /* Commute a lone immediate in slot A into slot B so the packer sees
+          * the register in slot A and can use the 8-bit immediate multiplier
+          * form when it fits. */
+         if (I->src[0].type == AGX_INDEX_IMMEDIATE &&
+             I->src[1].type != AGX_INDEX_IMMEDIATE) {
+            agx_index tmp = I->src[0];
+            I->src[0] = I->src[1];
+            I->src[1] = tmp;
+            progress = true;
+         }
+
+         if (I->src[0].type == AGX_INDEX_IMMEDIATE) {
+            uint32_t imm =
+               I->src[0].neg ? -(uint32_t)I->src[0].value : I->src[0].value;
+            agx_index wide = agx_mov_imm(&b, 32, imm);
+            if (!I->src[0].neg)
+               wide.abs = I->src[0].abs;
+            I->src[0] = wide;
+            progress = true;
+         }
+
+         /* Slot B accepts only an 8-bit unsigned immediate (without .abs/.neg).
+          * Clear .abs on an 8-bit immediate (hardware always zero-extends it)
+          * and materialize wider or negated immediates into a 32-bit register. */
+         if (I->src[1].type == AGX_INDEX_IMMEDIATE) {
+            if (I->src[1].value <= 0xff && !I->src[1].neg) {
+               if (I->src[1].abs) {
+                  I->src[1].abs = false;
+                  progress = true;
+               }
+            } else {
+               uint32_t imm =
+                  I->src[1].neg ? -(uint32_t)I->src[1].value : I->src[1].value;
+               agx_index wide = agx_mov_imm(&b, 32, imm);
+               if (!I->src[1].neg)
+                  wide.abs = I->src[1].abs;
+               I->src[1] = wide;
+               progress = true;
+            }
+         }
+
+         if (I->src[2].type == AGX_INDEX_IMMEDIATE &&
+             (I->src[2].value > 0xff || I->src[2].abs)) {
+            if (I->src[2].value <= 0xff && !I->src[2].neg) {
+               I->src[2].abs = false;
+            } else {
+               uint32_t imm =
+                  I->src[2].neg ? -(uint32_t)I->src[2].value : I->src[2].value;
+               agx_index wide = agx_mov_imm(&b, 32, imm);
+               if (!I->src[2].neg)
+                  wide.abs = I->src[2].abs;
+               I->src[2] = wide;
+            }
+            progress = true;
+         }
       }
    }
    return progress;
@@ -6682,8 +7016,8 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
       }
 
       /* A general 32-bit FADD of a half and an immediate has no single
-       * AGX3C form. G17G converts first (f32add of the half and -0.0) and
-       * then adds in f32: saturate(float(h)) is f32add, f32add.sat
+       * AGX3 form. G17G/G17P convert first (f32add of the half and -0.0) and
+       * then add in f32: saturate(float(h)) is f32add, f32add.sat
        * (port/hfwit k_sat_h2f, k_h2f_mul). Widen the half the same exact
        * way. The exception is that conversion itself, an unsaturated
        * f32add of the half and -0.0, which is native: widening it again
@@ -6694,7 +7028,7 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          I->src[1].type == AGX_INDEX_IMMEDIATE &&
          agx_is_equiv(I->src[1], agx_negzero()) && !I->src[1].abs &&
          !I->src[1].neg && I->src[0].type != AGX_INDEX_IMMEDIATE;
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
           I->op == AGX_OPCODE_FADD && I->nr_dests == 1 && I->nr_srcs == 2 &&
           I->dest[0].size == AGX_SIZE_32 && !half_to_float &&
           (I->src[0].type == AGX_INDEX_IMMEDIATE ||
@@ -7092,17 +7426,16 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
       /* AGX3C's tied min/max consumes full register operands in both
        * positions. Keep constants tied after compact-constant folding. */
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          I->op == AGX_OPCODE_FCMPSEL && I->nr_srcs == 4 &&
-          I->dest[0].size == AGX_SIZE_32 && !I->invert_cond &&
-          (I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN)) {
+          I->dest[0].size == AGX_SIZE_32 && agx_fcmpsel_is_tied_minmax(I)) {
          for (unsigned c = 0; c < 2; ++c) {
             if (I->src[c].type != AGX_INDEX_IMMEDIATE ||
-                !agx_is_equiv(I->src[c], I->src[c + 2]))
+                (!I->fcmpsel_minifloat_select && I->src[c].value != 0))
                continue;
             const agx_index constant = agx_mov_imm(
                &b, 32, fui(agx_minifloat_decode(I->src[c].value)));
             I->src[c] = I->src[c + 2] = constant;
          }
+         I->fcmpsel_minifloat_select = false;
       }
 
       /* General FSEL has register comparators or an implicit zero. Nonzero
@@ -7128,19 +7461,18 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
              I->op == AGX_OPCODE_FCMPSEL && I->dest[0].size == AGX_SIZE_16 &&
              !agx3c_fsel16_imm_encodable(ctx, I)) {
-            /* Select alternatives are bit patterns, not minifloats -- except
-             * in a tied minimum/maximum, where the optimizer deposited the
-             * compared minifloat into the select slot too. */
+            /* Select alternatives are raw bit patterns unless the optimizer
+             * recorded that it folded a minifloat into the select slot
+             * (fcmpsel_minifloat_select). Half-tied shapes such as
+             * `(0.5 < x) ? 0.5 : y` never arrive here with a minifloat in a
+             * select slot because agx_is_float_src() is false for s >= 2 and
+             * agx_optimizer_inline_imm() only copies a minifloat into
+             * src[s + 2] for a full AGX3B tied min/max. */
             for (unsigned s = 2; s < 4; ++s) {
                if (I->src[s].type != AGX_INDEX_IMMEDIATE)
                   continue;
-               const agx_index cmp = I->src[s - 2];
-               const bool tied = cmp.type == AGX_INDEX_IMMEDIATE &&
-                                 cmp.value == I->src[s].value &&
-                                 cmp.abs == I->src[s].abs &&
-                                 cmp.neg == I->src[s].neg;
                uint32_t bits = I->src[s].value;
-               if (tied) {
+               if (I->fcmpsel_minifloat_select) {
                   float value = agx_minifloat_decode(I->src[s].value);
                   if (I->src[s].abs)
                      value = fabsf(value);
@@ -7150,6 +7482,7 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
                }
                I->src[s] = agx_mov_imm(&b, 16, bits);
             }
+            I->fcmpsel_minifloat_select = false;
          }
          /* G18G's half FSEL is grounded only with all four sources in half
           * registers (agx3_alu_fcmp_select_half_gpu1). Compare slots hold
@@ -7450,14 +7783,18 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          }
       }
 
-      /* Hyprland's colour-management shaders add a highp accumulator to a
-       * mediump matrix term. There is no grounded plain mixed-width FADD on
-       * G17P, so widen the half input explicitly and use the ordinary f32
-       * register form. Keep the separately witnessed abs(f32) + f16 endpoint
-       * available for its exact modifier shape. */
+      /* Plain mixed-width F32 FADD (f32 GPR + f16 GPR) has a native grounded
+       * encoder (agx3_alu_fadd_mixed_half) on AGX3B (verified bit-exact across
+       * subnormal, NaN-payload, signed-zero, and ep1/ep2 multi-slot wait cases
+       * on G17P hardware). Keep explicit widening on AGX3C/G18G or when either
+       * operand is not a plain scalar GPR (e.g. a uniform). */
       if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
           I->op == AGX_OPCODE_FADD && I->nr_srcs == 2 && !I->saturate &&
           I->dest[0].size == AGX_SIZE_32) {
+         const bool native_mixed_fadd =
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+            I->nr_dests == 1 && !I->dest[0].memory &&
+            agx_channels(I->dest[0]) == 1;
          for (unsigned s = 0; s < 2; ++s) {
             const unsigned other = s ^ 1;
             if (I->src[s].type == AGX_INDEX_IMMEDIATE ||
@@ -7465,6 +7802,14 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
                 I->src[s].neg || I->src[other].type == AGX_INDEX_IMMEDIATE ||
                 I->src[other].size != AGX_SIZE_32 ||
                 I->src[other].abs || I->src[other].neg)
+               continue;
+            if (native_mixed_fadd &&
+                (I->src[s].type == AGX_INDEX_NORMAL ||
+                 I->src[s].type == AGX_INDEX_REGISTER) &&
+                !I->src[s].memory && agx_channels(I->src[s]) == 1 &&
+                (I->src[other].type == AGX_INDEX_NORMAL ||
+                 I->src[other].type == AGX_INDEX_REGISTER) &&
+                !I->src[other].memory && agx_channels(I->src[other]) == 1)
                continue;
 
             agx_index widened = agx_temp(ctx, AGX_SIZE_32);
@@ -7879,17 +8224,7 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
             if (I->src[s].type != AGX_INDEX_IMMEDIATE)
                continue;
 
-            if (ctx->key->dev.chip == AGX_CHIP_G17P) {
-               I->src[s] = agx_mov_imm(&b, 16, I->src[s].value);
-               continue;
-            }
-
-            float value = agx_minifloat_decode(I->src[s].value);
-            if (I->src[s].abs)
-               value = fabsf(value);
-            if (I->src[s].neg)
-               value = -value;
-            I->src[s] = agx_mov_imm(&b, 16, _mesa_float_to_half(value));
+            I->src[s] = agx_mov_imm(&b, 16, I->src[s].value);
          }
       }
 
@@ -7961,11 +8296,12 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          I->src[1] = tmp;
       }
 
-      /* G17P has a register half multiply, but its immediate half form
+      /* AGX3 has a register half multiply, but its immediate half form
        * requires an addend. Keep a pure half multiply in the witnessed
        * register domain instead of passing an unencodable immediate to the
        * packer. The low-half product has the same modulo-2^16 value. */
-      if (ctx->key->dev.chip == AGX_CHIP_G17P &&
+      if ((agx_isa_is_agx3(ctx->key->dev.encoding) ||
+           ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3D) &&
           I->op == AGX_OPCODE_IMAD && I->nr_dests == 1 && I->nr_srcs == 3 &&
           I->dest[0].size == AGX_SIZE_16 && I->shift == 0 && !I->saturate &&
           agx_channels(I->dest[0]) == 1 &&
@@ -8399,6 +8735,30 @@ agx_emit_g17p_ufind_msb(agx_builder *b, agx_index dst, agx_index value)
 static agx_instr *
 agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
 {
+   if (instr->op == nir_op_pack_32_4x8 &&
+       instr->def.num_components == 1 && instr->def.bit_size == 32) {
+      nir_def *src = instr->src[0].src.ssa;
+      if (nir_def_instr(src)->type == nir_instr_type_intrinsic &&
+          agx_pack_32_4x8_zero_copy_load(
+             &b->shader->key->dev,
+             nir_instr_as_intrinsic(nir_def_instr(src)), instr))
+         return NULL;
+
+      /* pack_32_4x8 is only emitted by agx_nir_opt_u8x4_hsum() on AGX3C
+       * (non-G18G); G18G (emit_agx3d) stays excluded until verified on G18G
+       * hardware. */
+      assert(b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+             !b->shader->key->dev.emit_agx3d);
+      agx_index ch[4] = {agx_null()};
+      for (unsigned i = 0; i < 4; ++i)
+         ch[i] = agx_extract_nir_src(b, instr->src[0].src, instr->src[0].swizzle[i]);
+      agx_index packed[2] = {agx_null()};
+      ASSERTED unsigned n_packed =
+         agx_pack_integer_8_agx3(b, ch, 4, AGX_FORMAT_I8, packed);
+      assert(n_packed == 2);
+      return agx_emit_collect_to(b, agx_def_index(&instr->def), 2, packed);
+   }
+
    unsigned srcs = nir_op_infos[instr->op].num_inputs;
    unsigned sz = instr->def.bit_size;
    unsigned src_sz = srcs ? nir_src_bit_size(instr->src[0].src) : 0;
@@ -8817,6 +9177,14 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
    }
 
    case nir_op_usub_sat: {
+      /* AGX3B has a grounded native 32-bit unsigned saturating subtract
+       * (agx3_iadd_encode), while 16-bit saturating iadd on AGX3B only covers
+       * addition. Lower non-32-bit usub_sat on AGX3B to compare/sub/select. */
+      if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          dst.size != AGX_SIZE_32) {
+         agx_index diff = agx_iadd(b, s0, agx_neg(s1), 0);
+         return agx_icmpsel_to(b, dst, s0, s1, agx_zero(), diff, AGX_ICOND_ULT);
+      }
       agx_instr *I = agx_iadd_to(b, dst, agx_abs(s0), agx_neg(agx_abs(s1)), 0);
       I->saturate = true;
       return I;
@@ -8867,6 +9235,7 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
                             AGX_ROUND_RTZ);
 
    case nir_op_f2i32:
+   case nir_op_f2i32_sat:
       return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_F_TO_S32), s0,
                             AGX_ROUND_RTZ);
 
@@ -8875,6 +9244,7 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
                             AGX_ROUND_RTZ);
 
    case nir_op_f2u32:
+   case nir_op_f2u32_sat:
       return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_F_TO_U32), s0,
                             AGX_ROUND_RTZ);
 
@@ -8886,7 +9256,8 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
       /* As for i2f below: the unsigned-byte float32 conversion reads only
        * the low eight bits of its half (agx_nir_fold_ubyte_to_float). */
       if (src_sz == 8 && sz == 32 &&
-          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
           !agx_is_g18g(&b->shader->key->dev)) {
          nir_alu_instr *narrow = nir_src_as_alu(instr->src[0].src);
          if (narrow &&
@@ -8897,9 +9268,101 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
                                   AGX_ROUND_RTE);
       }
 
-      enum agx_convert mode = (src_sz == 32)   ? AGX_CONVERT_U32_TO_F
-                              : (src_sz == 16) ? AGX_CONVERT_U16_TO_F
-                                               : AGX_CONVERT_U8_TO_F;
+      /* M5 converts the low byte of a half register to f32 directly. Byte 0
+       * or 2 of a word, as a packed RGBA8 pixel is unpacked, is the low byte
+       * of its low or high half: no mask or shift. Bytes 1 and 3 take a
+       * 16-bit shift of their half. All four read only the halves, so the
+       * word dies at its split and needs no copy. */
+      if (instr->op == nir_op_u2f32 && src_sz == 32 &&
+          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !b->shader->key->dev.emit_agx3d) {
+         nir_scalar x = nir_scalar_chase_movs(
+            nir_get_scalar(instr->src[0].src.ssa, instr->src[0].swizzle[0]));
+         nir_scalar word = {0};
+         int half = -1;
+         bool high_byte = false;
+         if (nir_scalar_is_alu(x) && nir_scalar_alu_op(x) == nir_op_ushr) {
+            nir_scalar k = nir_scalar_chase_alu_src(x, 1);
+            if (nir_scalar_is_const(k) && (nir_scalar_as_uint(k) & 31) == 24) {
+               word = nir_scalar_chase_alu_src(x, 0);
+               half = 1;
+               high_byte = true;
+            }
+         } else if (nir_scalar_is_alu(x) && nir_scalar_alu_op(x) == nir_op_iand) {
+            for (unsigned i = 0; i < 2; ++i) {
+               nir_scalar k = nir_scalar_chase_alu_src(x, i);
+               if (nir_scalar_is_const(k) && nir_scalar_as_uint(k) == 0xff) {
+                  word = nir_scalar_chase_alu_src(x, 1 - i);
+                  half = 0;
+               }
+            }
+            /* (w >> 8k) & 0xff: byte k of w. */
+            if (half == 0 && nir_scalar_is_alu(word) &&
+                nir_scalar_alu_op(word) == nir_op_ushr) {
+               nir_scalar k = nir_scalar_chase_alu_src(word, 1);
+               const unsigned sh =
+                  nir_scalar_is_const(k) ? nir_scalar_as_uint(k) & 31 : 0;
+               if (sh == 8 || sh == 16 || sh == 24) {
+                  word = nir_scalar_chase_alu_src(word, 0);
+                  half = sh / 16;
+                  high_byte = sh & 8;
+               }
+            }
+         } else if (nir_scalar_is_alu(x) &&
+                    (nir_scalar_alu_op(x) == nir_op_ubitfield_extract ||
+                     nir_scalar_alu_op(x) == nir_op_ubfe)) {
+            nir_scalar off = nir_scalar_chase_alu_src(x, 1);
+            nir_scalar bits = nir_scalar_chase_alu_src(x, 2);
+            if (nir_scalar_is_const(off) && nir_scalar_is_const(bits) &&
+                nir_scalar_as_uint(bits) == 8 && nir_scalar_as_uint(off) < 32 &&
+                !(nir_scalar_as_uint(off) & 7)) {
+               word = nir_scalar_chase_alu_src(x, 0);
+               half = nir_scalar_as_uint(off) / 16;
+               high_byte = nir_scalar_as_uint(off) & 8;
+            }
+         } else if (nir_scalar_is_alu(x) &&
+                    nir_scalar_alu_op(x) == nir_op_extract_u8) {
+            nir_scalar idx = nir_scalar_chase_alu_src(x, 1);
+            if (nir_scalar_is_const(idx) && nir_scalar_as_uint(idx) < 4) {
+               word = nir_scalar_chase_alu_src(x, 0);
+               half = nir_scalar_as_uint(idx) / 2;
+               high_byte = nir_scalar_as_uint(idx) & 1;
+            }
+         }
+         if (half >= 0 && word.def->bit_size == 32) {
+            agx_index h;
+            nir_scalar narrow = {0};
+            if (nir_scalar_is_alu(word) &&
+                nir_scalar_alu_op(word) == nir_op_u2u32)
+               narrow = nir_scalar_chase_alu_src(word, 0);
+            if (half == 0 && narrow.def && narrow.def->bit_size == 16) {
+               /* The low half of a zero-extended half is the half. */
+               h = agx_extract_nir_src(b, nir_src_for_ssa(narrow.def),
+                                       narrow.comp);
+            } else {
+               agx_index w = agx_extract_nir_src(b, nir_src_for_ssa(word.def),
+                                                 word.comp);
+               h = agx_temp(b->shader, AGX_SIZE_16);
+               agx_subdivide_to(b, h, w, half);
+            }
+            /* The odd bytes: shift the half, whose upper byte is then zero. */
+            if (high_byte) {
+               return agx_convert_to(b, dst,
+                                     agx_immediate(AGX_CONVERT_U16_TO_F),
+                                     agx_ushr(b, h, agx_immediate(8)),
+                                     AGX_ROUND_RTE);
+            }
+            return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_U8_TO_F),
+                                  h, AGX_ROUND_RTE);
+         }
+      }
+
+      /* An 8-bit value is kept zero-extended in its half register, as the
+       * u2u16 and u2u32 above rely on (u2u8 masks to the byte). The unsigned
+       * half conversion of that register is therefore exact, and needs no
+       * mask: the byte form masks first wherever it is not native. */
+      enum agx_convert mode = (src_sz == 32) ? AGX_CONVERT_U32_TO_F
+                                             : AGX_CONVERT_U16_TO_F;
 
       return agx_convert_to(b, dst, agx_immediate(mode), s0, AGX_ROUND_RTE);
    }
@@ -9696,8 +10159,90 @@ agx_set_st_vary_final(agx_context *ctx)
    agx_no_varyings(&_b);
 }
 
+/* Count the instructions of the encoded program in [code, code + size) with the
+ * length rule of the encoding it was emitted in. The walk stops at the first
+ * byte sequence no form matches, so a count is never larger than the program.
+ */
 static void
-agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
+agx_count_native(const agx_context *ctx, const uint8_t *code, size_t size,
+                 struct agx2_stats *stats)
+{
+   signed (*length)(const uint8_t *, size_t, const char **);
+   switch (ctx->key->dev.encoding) {
+   case AGX_ISA_ENCODING_AGX2:
+      length = agx2_instr_length;
+      break;
+   case AGX_ISA_ENCODING_AGX3B:
+      length = agx3b_instr_length;
+      break;
+   case AGX_ISA_ENCODING_AGX3C:
+      /* G18G programs are transcoded to agx3d before this runs. */
+      length = ctx->key->dev.emit_agx3d ? agx3d_instr_length
+                                        : agx3c_instr_length;
+      break;
+   default:
+      return;
+   }
+
+   for (size_t i = 0; i < size;) {
+      const char *display = NULL;
+      const signed n = length(code + i, size - i, &display);
+      if (n <= 0)
+         break;
+
+      stats->native++;
+      if (display && !strncmp(display, "ldimm", 5) &&
+          (display[5] == '\0' || display[5] == ' '))
+         stats->native_ldimm++;
+      i += n;
+   }
+}
+
+/* Immediate moves and uniform-file copies inside loops, counted after register
+ * allocation and before pseudo-instruction lowering turns copies into ALU
+ * truth tables. In structured AGX control flow a loop spans the source-order
+ * interval from its header to the block holding the back edge. */
+static void
+agx_count_loop_copies(agx_context *ctx)
+{
+   unsigned nr_blocks = 0;
+   agx_foreach_block(ctx, block)
+      nr_blocks = MAX2(nr_blocks, block->index + 1);
+
+   bool *in_loop = rzalloc_array(ctx, bool, MAX2(nr_blocks, 1));
+   if (!in_loop)
+      return;
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_successor(block, succ) {
+         if (succ->loop_header && succ->index <= block->index) {
+            for (unsigned i = succ->index; i <= block->index; ++i)
+               in_loop[i] = true;
+         }
+      }
+   }
+
+   ctx->loop_immediates = 0;
+   ctx->loop_uniform_copies = 0;
+   agx_foreach_block(ctx, block) {
+      if (!in_loop[block->index])
+         continue;
+
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM)
+            ctx->loop_immediates++;
+         else if (I->op == AGX_OPCODE_MOV &&
+                  I->src[0].type == AGX_INDEX_UNIFORM)
+            ctx->loop_uniform_copies++;
+      }
+   }
+
+   ralloc_free(in_loop);
+}
+
+static void
+agx_calc_stats(agx_context *ctx, const struct util_dynarray *binary,
+               unsigned offset, struct agx2_stats *stats)
 {
    struct agx_cycle_estimate cycles = agx_estimate_cycles(ctx);
    uint32_t old_preamble_inst = stats->preamble_inst;
@@ -9706,13 +10251,15 @@ agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
       .alu = cycles.alu,
       .fscib = cycles.f_scib,
       .ic = cycles.ic,
-      .code_size = size,
+      .code_size = binary->size,
       .gprs = ctx->max_reg,
       .uniforms = ctx->out->push_count,
       .scratch = ctx->scratch_size_B,
       .threads = agx_occupancy_for_register_count(ctx->max_reg).max_threads,
       .loops = ctx->loop_count,
       .preamble_inst = old_preamble_inst,
+      .loop_immediates = ctx->loop_immediates,
+      .loop_uniform_copies = ctx->loop_uniform_copies,
    };
 
    /* Count instructions */
@@ -9723,6 +10270,22 @@ agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
          stats->spills++;
       else if (I->op == AGX_OPCODE_STACK_LOAD)
          stats->fills++;
+   }
+
+   /* The UVS relocation list, when there is one, follows the main program. */
+   const unsigned end = ctx->out->agx3_uvs_reloc_count
+                           ? ctx->out->agx3_uvs_relocs_offset
+                           : binary->size;
+   if (end > offset)
+      agx_count_native(ctx, (const uint8_t *)binary->data + offset,
+                       end - offset, stats);
+
+   /* agx3_pack_binary() on this thread just encoded this program. */
+   if (agx_isa_is_agx3(ctx->key->dev.encoding)) {
+      stats->carriers = agx3_native_stats.wait_carriers;
+      stats->cf_drains = agx3_native_stats.cf_drains;
+      stats->loop_cf_drains = agx3_native_stats.loop_cf_drains;
+      stats->staging_copies = agx3_native_stats.staging_copies;
    }
 }
 
@@ -9865,12 +10428,208 @@ agx_lower_front_face(struct nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
-/* Lanes of a G17P SIMD group mostly agree on the kind of a light, so a rare
- * arm under a type test is skipped whole. Flattened, its rcp and rsq run every
- * loop iteration and every load it reads stays above the test. 24 is the best
- * of 12, 16, 24, 32 and 48 on TF3's light loop; smaller arms pay for a branch.
+/* Lanes of an AGX3 (AGX3B or AGX3C) SIMD group mostly agree on a rare guard,
+ * so an expensive arm under a type/collision test is skipped whole. Flattened,
+ * its rcp and rsq run every loop iteration and every load it reads stays above
+ * the test. 24 was chosen on AGX3B (best of 12, 16, 24, 32 and 48 on TF3's
+ * light loop; smaller arms pay for a branch) and validated across AGX3B and
+ * AGX3C.
  */
-#define AGX_G17P_EXPENSIVE_FLATTEN_LIMIT 24
+#define AGX_EXPENSIVE_FLATTEN_LIMIT 24
+
+/* Whether any CF list in `list` contains a loop node. Walks only CF nodes so
+ * loop-free shaders skip the loop-only passes in O(CF). */
+static bool
+agx_cf_list_has_loop(const struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, cf, node, list) {
+      if (cf->type == nir_cf_node_loop)
+         return true;
+      if (cf->type == nir_cf_node_if) {
+         const nir_if *nif = nir_cf_node_as_if(cf);
+         if (agx_cf_list_has_loop(&nif->then_list) ||
+             agx_cf_list_has_loop(&nif->else_list))
+            return true;
+      }
+   }
+   return false;
+}
+
+bool
+agx_nir_has_loop(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      if (agx_cf_list_has_loop(&impl->body))
+         return true;
+   }
+   return false;
+}
+
+/* A pure-ALU loop with at least this many iterations and two or more
+ * branches is kept rolled when its scalarized unrolled body would exceed
+ * AGX_HEAVY_BRANCH_UNROLL_MAX_OPS operations. */
+#define AGX_HEAVY_BRANCH_UNROLL_MIN_TRIPS 8
+#define AGX_HEAVY_BRANCH_UNROLL_MAX_OPS   512
+
+struct agx_loop_body_stats {
+   unsigned branch_ifs;
+   unsigned scalar_cost;
+   bool has_mem_or_sync;
+};
+
+static void
+agx_scan_loop_body(const struct exec_list *list, const nir_if *terminator_if,
+                   struct agx_loop_body_stats *st)
+{
+   foreach_list_typed(nir_cf_node, cf, node, list) {
+      switch (cf->type) {
+      case nir_cf_node_block: {
+         const nir_block *block = nir_cf_node_as_block(cf);
+         nir_foreach_instr(instr, block) {
+            switch (instr->type) {
+            case nir_instr_type_alu:
+               st->scalar_cost += nir_instr_as_alu(instr)->def.num_components;
+               break;
+            case nir_instr_type_phi:
+               st->scalar_cost += nir_instr_as_phi(instr)->def.num_components;
+               break;
+            case nir_instr_type_tex:
+               st->has_mem_or_sync = true;
+               st->scalar_cost += 4;
+               break;
+            case nir_instr_type_intrinsic: {
+               const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               switch (intr->intrinsic) {
+               case nir_intrinsic_load_ubo:
+               case nir_intrinsic_load_ssbo:
+               case nir_intrinsic_load_global:
+               case nir_intrinsic_load_global_constant:
+               case nir_intrinsic_load_global_predicated_agx:
+               case nir_intrinsic_load_shared:
+               case nir_intrinsic_load_constant:
+               case nir_intrinsic_load_agx:
+               case nir_intrinsic_load_constant_agx:
+               case nir_intrinsic_load_scratch:
+               case nir_intrinsic_store_ssbo:
+               case nir_intrinsic_store_global:
+               case nir_intrinsic_store_shared:
+               case nir_intrinsic_store_scratch:
+               case nir_intrinsic_image_load:
+               case nir_intrinsic_image_store:
+               case nir_intrinsic_image_deref_load:
+               case nir_intrinsic_image_deref_store:
+               case nir_intrinsic_bindless_image_load:
+               case nir_intrinsic_bindless_image_store:
+               case nir_intrinsic_barrier:
+                  st->has_mem_or_sync = true;
+                  break;
+               case nir_intrinsic_load_deref:
+               case nir_intrinsic_store_deref: {
+                  const nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+                  if (deref &&
+                      nir_deref_mode_may_be(deref, nir_var_mem_ssbo |
+                                                      nir_var_mem_ubo |
+                                                      nir_var_mem_global |
+                                                      nir_var_mem_shared))
+                     st->has_mem_or_sync = true;
+                  break;
+               }
+               default:
+                  break;
+               }
+               st->scalar_cost += 1;
+               break;
+            }
+            case nir_instr_type_load_const:
+            case nir_instr_type_undef:
+            case nir_instr_type_jump:
+               break;
+            default:
+               st->scalar_cost += 1;
+               break;
+            }
+         }
+         break;
+      }
+      case nir_cf_node_if: {
+         const nir_if *nif = nir_cf_node_as_if(cf);
+         if (nif != terminator_if)
+            st->branch_ifs++;
+         agx_scan_loop_body(&nif->then_list, terminator_if, st);
+         agx_scan_loop_body(&nif->else_list, terminator_if, st);
+         break;
+      }
+      case nir_cf_node_loop:
+         st->has_mem_or_sync = true;
+         break;
+      default:
+         break;
+      }
+   }
+}
+
+static bool
+agx_limit_heavy_branch_unroll_cf(struct exec_list *list)
+{
+   bool progress = false;
+   foreach_list_typed(nir_cf_node, cf, node, list) {
+      if (cf->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(cf);
+         progress |= agx_limit_heavy_branch_unroll_cf(&nif->then_list);
+         progress |= agx_limit_heavy_branch_unroll_cf(&nif->else_list);
+      } else if (cf->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(cf);
+         progress |= agx_limit_heavy_branch_unroll_cf(&loop->body);
+         if (loop->control != nir_loop_control_none || !loop->info ||
+             loop->info->force_unroll ||
+             loop->info->flattens_all_control_flow ||
+             !loop->info->exact_trip_count_known ||
+             loop->info->max_trip_count < AGX_HEAVY_BRANCH_UNROLL_MIN_TRIPS)
+            continue;
+
+         const nir_if *term_if =
+            loop->info->limiting_terminator
+               ? loop->info->limiting_terminator->nif
+               : NULL;
+         struct agx_loop_body_stats st = {0};
+         agx_scan_loop_body(&loop->body, term_if, &st);
+         if (st.has_mem_or_sync || st.branch_ifs < 2)
+            continue;
+
+         if ((uint64_t)loop->info->max_trip_count * st.scalar_cost >
+             AGX_HEAVY_BRANCH_UNROLL_MAX_OPS) {
+            loop->control = nir_loop_control_dont_unroll;
+            progress = true;
+         }
+      }
+   }
+   return progress;
+}
+
+/* Pre-scalarization nir_opt_loop_unroll counts vector ALU as 1 op per
+ * instruction, so a multi-branch uvec4 uber loop with 8..23 iterations can
+ * appear below the unroll threshold and explode into a multi-thousand-op
+ * straight-line block after scalarization. Mark pure-ALU multi-branch loops
+ * whose scalarized unrolled footprint exceeds
+ * AGX_HEAVY_BRANCH_UNROLL_MAX_OPS as dont_unroll while
+ * leaving memory/texture/GEMM and branchless loops untouched. */
+bool
+agx_nir_limit_heavy_branch_unroll(nir_shader *nir)
+{
+   bool any = false;
+   nir_foreach_function_impl(impl, nir) {
+      if (!agx_cf_list_has_loop(&impl->body)) {
+         nir_no_progress(impl);
+         continue;
+      }
+      nir_metadata_require(impl, nir_metadata_loop_analysis,
+                           nir->options->force_indirect_unrolling,
+                           (int)nir->options->force_indirect_unrolling_sampler);
+      bool progress = agx_limit_heavy_branch_unroll_cf(&impl->body);
+      any |= nir_progress(progress, impl, nir_metadata_all);
+   }
+   return any;
+}
 
 /*
  * Standard NIR optimization loop. This is run in agx_preprocess_nir, then once
@@ -9878,13 +10637,14 @@ agx_lower_front_face(struct nir_builder *b, nir_intrinsic_instr *intr,
  * the latter run should be almost a no-op.
  */
 static void
-agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
+agx_optimize_loop_nir(nir_shader *nir, bool fold_d3d,
+                      bool preserve_expensive_branches, bool unroll_64)
 {
    const nir_shader_compiler_options *saved_options = nir->options;
    nir_shader_compiler_options options;
-   /* Native M5 ALU throughput benefits from exposing its 64-iteration
+   /* Native AGX3 ALU throughput benefits from exposing its 64-iteration
     * loops before scheduling. Keep earlier GPU generations unchanged. */
-   if (m5) {
+   if (unroll_64) {
       options = *saved_options;
       options.max_unroll_iterations = 64;
       nir->options = &options;
@@ -9893,7 +10653,8 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 64,
       .expensive_alu_ok = true,
-      .expensive_limit = g17p ? AGX_G17P_EXPENSIVE_FLATTEN_LIMIT : 0,
+      .expensive_limit =
+         preserve_expensive_branches ? AGX_EXPENSIVE_FLATTEN_LIMIT : 0,
    };
 
    /* Track which passes may still find work via a bitmask. Skip passes that
@@ -9951,7 +10712,7 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
    };
 
    uint32_t active = (1u << NUM_PASSES) - 1u;
-   if (!m5)
+   if (!fold_d3d)
       active &= ~(1u << OPT_FOLD_D3D);
    if (!has_loops)
       active &= ~(1u << OPT_LOOP_UNROLL);
@@ -10002,9 +10763,9 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
          NIR_PASS(progress, nir, nir_opt_phi_precision);
          break;
       case OPT_FOLD_D3D:
-         /* The M5 conversion has D3D's saturating, NaN-to-zero semantics.
-          * Fold before nir_opt_algebraic distributes a following add into the
-          * clamping selects. */
+         /* AGX3 (both AGX3B and AGX3C) hardware conversions have D3D's
+          * saturating, NaN-to-zero semantics. Fold before nir_opt_algebraic
+          * distributes a following add into the clamping selects. */
          NIR_PASS(progress, nir, agx_nir_fold_d3d_float_to_int);
          break;
       case OPT_ALGEBRAIC:
@@ -10018,7 +10779,10 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
          NIR_PASS(progress, nir, nir_opt_undef);
          break;
       case OPT_LOOP_UNROLL:
-         NIR_PASS(progress, nir, nir_opt_loop_unroll);
+         if (agx_nir_has_loop(nir)) {
+            agx_nir_limit_heavy_branch_unroll(nir);
+            NIR_PASS(progress, nir, nir_opt_loop_unroll);
+         }
          break;
       }
 
@@ -10302,11 +11066,81 @@ agx_preamble_halfs(const nir_def *def)
  * them). Move such a program back into the main program. One that loads
  * from memory or does real work (a matrix product) stays.
  */
+/* Fast 1-cycle scalar ALU ops eligible for inlining a tiny vertex preamble
+ * back into the main vertex program when its uniform-DMA input is <= 16 bytes
+ * (e.g. a 4-byte push-constant draw_id tile offset). Explicitly excludes slow
+ * or multi-cycle ops (frcp, frsq, fsqrt, trig, log/exp, umul_high, idiv). */
+static bool
+agx3_is_cheap_vertex_preamble_alu(nir_op op)
+{
+   switch (op) {
+   case nir_op_iadd:
+   case nir_op_isub:
+   case nir_op_imul:
+   case nir_op_ineg:
+   case nir_op_iabs:
+   case nir_op_iand:
+   case nir_op_ior:
+   case nir_op_ixor:
+   case nir_op_inot:
+   case nir_op_ishl:
+   case nir_op_ishr:
+   case nir_op_ushr:
+   case nir_op_umin:
+   case nir_op_umax:
+   case nir_op_imin:
+   case nir_op_imax:
+   case nir_op_ieq:
+   case nir_op_ine:
+   case nir_op_ult:
+   case nir_op_uge:
+   case nir_op_ilt:
+   case nir_op_ige:
+   case nir_op_bcsel:
+   case nir_op_b2i32:
+   case nir_op_b2i16:
+   case nir_op_i2i32:
+   case nir_op_u2u32:
+   case nir_op_i2i16:
+   case nir_op_u2u16:
+   case nir_op_extract_u16:
+   case nir_op_extract_i16:
+   case nir_op_extract_u8:
+   case nir_op_extract_i8:
+   case nir_op_ubitfield_extract:
+   case nir_op_ibitfield_extract:
+   case nir_op_fadd:
+   case nir_op_fsub:
+   case nir_op_fmul:
+   case nir_op_ffma:
+   case nir_op_fneg:
+   case nir_op_fabs:
+   case nir_op_fsat:
+   case nir_op_fmin:
+   case nir_op_fmax:
+   case nir_op_u2f32:
+   case nir_op_i2f32:
+   case nir_op_f2f16:
+   case nir_op_f2f32:
+   case nir_op_f2u32:
+   case nir_op_f2i32:
+   case nir_op_feq:
+   case nir_op_fneu:
+   case nir_op_flt:
+   case nir_op_fge:
+      return true;
+   default:
+      return false;
+   }
+}
+
 static void
 agx3_inline_cheap_vertex_preamble(nir_shader *nir)
 {
    /* Arithmetic the main program would repeat per vertex. */
    const unsigned max_ops = 4;
+   const unsigned max_cheap_alu = 12;
+   const unsigned max_cheap_input_halfs = 8;
 
    nir_function_impl *main = nir_shader_get_entrypoint(nir);
    if (!main->preamble)
@@ -10320,7 +11154,9 @@ agx3_inline_cheap_vertex_preamble(nir_shader *nir)
    /* Per half: 1 + the base of the store writing it, or 0. */
    uint16_t stored_halfs[512] = {0};
    const nir_def *stored[512] = {NULL};
-   unsigned ops = 0;
+   unsigned other_ops = 0;
+   unsigned cheap_ops = 0;
+   unsigned input_halfs = 0;
 
    nir_foreach_instr(instr, block) {
       switch (instr->type) {
@@ -10335,8 +11171,17 @@ agx3_inline_cheap_vertex_preamble(nir_shader *nir)
              op != nir_op_unpack_64_2x32_split_y &&
              op != nir_op_pack_32_2x16_split &&
              op != nir_op_unpack_32_2x16_split_x &&
-             op != nir_op_unpack_32_2x16_split_y && ++ops > max_ops)
-            return;
+             op != nir_op_unpack_32_2x16_split_y) {
+            if (agx3_is_cheap_vertex_preamble_alu(op))
+               ++cheap_ops;
+            else
+               ++other_ops;
+            const bool basic_ok = other_ops + cheap_ops <= max_ops;
+            const bool cheap_ok =
+               other_ops == 0 && cheap_ops <= max_cheap_alu;
+            if (!basic_ok && !cheap_ok)
+               return;
+         }
          break;
       }
       case nir_instr_type_intrinsic: {
@@ -10354,6 +11199,7 @@ agx3_inline_cheap_vertex_preamble(nir_shader *nir)
                if (stored_halfs[h])
                   return;
             }
+            input_halfs += size;
          } else if (intr->intrinsic == nir_intrinsic_store_preamble) {
             if (nir_intrinsic_preamble_class(intr) !=
                 nir_preamble_class_general)
@@ -10377,6 +11223,11 @@ agx3_inline_cheap_vertex_preamble(nir_shader *nir)
          return;
       }
    }
+
+   if (other_ops + cheap_ops > max_ops &&
+       !(other_ops == 0 && cheap_ops <= max_cheap_alu &&
+         input_halfs <= max_cheap_input_halfs))
+      return;
 
    /* Every main read of a result must be exactly one store's value. */
    nir_foreach_block(b, main) {
@@ -10553,20 +11404,137 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
    return progress;
 }
 
+/* Whether a compile with a preamble size forms its preamble. Internal shaders
+ * always do: hk's meta copies depend on it for correctness with imgwblk
+ * intrinsics.
+ */
+static bool
+agx_preamble_allowed(const nir_shader *nir)
+{
+   return !(agx_compiler_debug & AGX_DBG_NOPREAMBLE) || nir->info.internal;
+}
+
+/* When a compute workgroup has static size 1 along an axis, every invocation
+ * in the workgroup has local_invocation_id[c] == 0, so
+ * global_invocation_id[c] == workgroup_id[c]. Replacing those components with
+ * load_workgroup_id exposes their workgroup-uniformity to divergence analysis,
+ * preamble hoisting, and uniform addressing. */
+bool
+agx_nir_uniform_unit_global_id(nir_shader *nir)
+{
+   if (nir->info.internal ||
+       (nir->info.stage != MESA_SHADER_COMPUTE &&
+        nir->info.stage != MESA_SHADER_KERNEL) ||
+       nir->info.workgroup_size_variable ||
+       !nir->info.workgroup_size[0] || !nir->info.workgroup_size[1] ||
+       !nir->info.workgroup_size[2])
+      return false;
+
+   /* Only multi-thread workgroups benefit from exposing unit axes as
+    * workgroup-uniform; single-thread (1x1x1) dispatches have no
+    * intra-workgroup uniformity to expose. Driver-generated EOT and
+    * background programs are marked info.internal = true explicitly and
+    * filtered above regardless of workgroup shape. */
+   const uint64_t wg_threads = (uint64_t)nir->info.workgroup_size[0] *
+                               nir->info.workgroup_size[1] *
+                               nir->info.workgroup_size[2];
+   if (wg_threads <= 1)
+      return false;
+
+   bool any_unit = false;
+   for (unsigned c = 0; c < 3; ++c)
+      any_unit |= nir->info.workgroup_size[c] == 1;
+   if (!any_unit)
+      return false;
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      bool impl_progress = false;
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            if (intrin->intrinsic != nir_intrinsic_load_global_invocation_id)
+               continue;
+
+            const unsigned ncomp = intrin->def.num_components;
+            bool hit = false, all = true;
+            for (unsigned c = 0; c < ncomp; ++c) {
+               const bool unit = c < 3 && nir->info.workgroup_size[c] == 1;
+               hit |= unit;
+               all &= unit;
+            }
+            if (!hit)
+               continue;
+
+            b.cursor = nir_after_instr(instr);
+            nir_def *wg =
+               nir_u2uN(&b, nir_load_workgroup_id(&b), intrin->def.bit_size);
+            nir_def *chans[4];
+            for (unsigned c = 0; c < ncomp; ++c) {
+               if (c < 3 && nir->info.workgroup_size[c] == 1)
+                  chans[c] = nir_channel(&b, wg, c);
+               else
+                  chans[c] = nir_channel(&b, &intrin->def, c);
+            }
+            nir_def *vec = nir_vec(&b, chans, ncomp);
+            if (all) {
+               nir_def_rewrite_uses(&intrin->def, vec);
+               nir_instr_remove(instr);
+            } else {
+               nir_def_rewrite_uses_after(&intrin->def, vec);
+            }
+            impl_progress = true;
+         }
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
+/* Split loop-invariant additive address chains and factor loop-invariant and
+ * linear-IV integer MAC reductions. Run after every nir_opt_reassociate_loop
+ * (so reassociation cannot pull hoisted loop-invariant sums back into inner
+ * loops) and before preamble formation.
+ */
+static void
+agx_factor_loop_mac(nir_shader *nir)
+{
+   bool factored = false;
+   NIR_PASS(factored, nir, agx_nir_opt_factor_loop_mac);
+   if (factored) {
+      NIR_PASS(_, nir, nir_opt_algebraic);
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_cse);
+      NIR_PASS(_, nir, nir_opt_dce);
+      nir_divergence_analysis(nir);
+   }
+}
+
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
-                 bool byte_indices, bool discard_word, bool g17p, bool m5,
+                 bool byte_indices, bool discard_word, bool m5,
                  bool g18_scans, bool checked_offsets,
                  uint16_t *preamble_size, uint8_t *ts_count, uint8_t *ss_count,
                  const struct agx_shader_key *dma_key,
                  struct agx_shader_info *dma_info,
                  struct blob *pre_preamble_blob, bool pre_preamble_optimized,
-                 bool epilog_has_alu, bool preamble_newly_enabled)
+                 bool epilog_has_alu, bool preamble_newly_enabled,
+                 unsigned m5_unroll_factor, unsigned *m5_unroll_widest)
 {
+   /* byte_indices is set exactly for the AGX3B encoding (M3, M4 and the A18
+    * Pro). Lowerings that depend on the instruction set, rather than on one
+    * part's measured tuning, key on it instead of on the G17P part. */
+   const bool agx3b = byte_indices;
+   const bool agx3_compute_opts = (agx3b || m5) && !g18_scans &&
+                                  mesa_shader_stage_is_compute(nir->info.stage);
+   const bool runtime_loop_opts = agx3_compute_opts || (m5 && !g18_scans);
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 64,
       .expensive_alu_ok = true,
-      .expensive_limit = g17p ? AGX_G17P_EXPENSIVE_FLATTEN_LIMIT : 0,
+      .expensive_limit = (agx3b || m5) ? AGX_EXPENSIVE_FLATTEN_LIMIT : 0,
    };
    bool progress = false;
    bool pre_fuse_dirty = false;
@@ -10592,26 +11560,119 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       if (preamble_size && (epilog_has_alu || preamble_newly_enabled)) {
          nir_opt_reassociate_loop(
             nir, nir_reassociate_scalar_math | nir_reassociate_cse_heuristic |
-                    (m5 ? nir_reassociate_loop_invariant : 0));
+                    ((agx3b || m5) ? nir_reassociate_loop_invariant : 0));
+         agx_factor_loop_mac(nir);
       }
       if (epilog_has_alu)
-         NIR_PASS(_, nir, agx_nir_lower_fminmax, g17p || m5);
+         NIR_PASS(_, nir, agx_nir_lower_fminmax, agx3b || m5);
       goto pre_preamble;
    }
 
    /* This runs only once up front since other optimizations don't affect it */
    NIR_PASS(_, nir, nir_opt_shrink_stores, true);
-
-   agx_optimize_loop_nir(nir, m5, g17p);
-
-   /* Loops are unrolled now: a subgroup XOR shuffle whose mask is still not
-    * a constant takes the general lowering (agx_nir_lower_subgroups.c).
+   /* Do not run agx_nir_uniform_unit_global_id here: Borealis workgroup
+    * coalescing (hk_coalesce_workgroup_size_ex) checks eligibility before
+    * backend compile and widens size-1 axes at dispatch, so rewriting
+    * global_invocation_id[c] to workgroup_id[c] corrupts coalesced dispatches.
     */
-   if (m5 && !g18_scans) {
+
+   agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
+
+   /* Loops are unrolled now: a subgroup relative shuffle whose mask/delta is
+    * still not a constant in 1..31 takes the general lowering
+    * (agx_nir_lower_subgroups.c).
+    */
+   if (byte_indices || (m5 && !g18_scans)) {
       bool lowered = false;
       NIR_PASS(lowered, nir, agx_nir_lower_dynamic_shuffle_xor);
       if (lowered)
-         agx_optimize_loop_nir(nir, m5, g17p);
+         agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
+   }
+
+   /* Eliminate tautological monotonic bit-insert guards inside <=32-trip loops
+    * before runtime-loop unrolling and vectorization, while the loop induction
+    * variable is still unit-stepped. */
+   {
+      bool folded_bits = false;
+      NIR_PASS(folded_bits, nir, agx_nir_opt_monotonic_bit_insert);
+      if (folded_bits)
+         agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
+   }
+
+   /* Counted loops whose trip count is only known at run time: run several
+    * iterations per loop test where the bound allows it. On AGX3 the loop
+    * control of a short body costs about as much as the body, and the
+    * unrolled body's loads issue together and vectorize below. Bodies of up
+    * to 40 instructions run 8 iterations per test (Metal's compiler unrolls
+    * such loops by 8 when the source asks for it, as Geekbench's Hamming
+    * distance does; SPIR-V carries no such hint), up to 80 run 4, up to 160
+    * run 2. agx_compile_shader_nir compiles again with 4 if 8 costs
+    * occupancy (AGX3C) or Dynamic Caching register pressure (AGX3B). */
+   if (runtime_loop_opts && m5_unroll_factor >= 2) {
+      bool jammed = false;
+      if (agx3_compute_opts)
+         NIR_PASS(jammed, nir, agx_nir_unroll_and_jam, m5_unroll_factor,
+                  m5_unroll_widest);
+      if (jammed)
+         agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
+
+      bool unrolled = false;
+      NIR_PASS(unrolled, nir, agx_nir_unroll_runtime_loops, m5_unroll_factor,
+               320, m5_unroll_widest);
+      if (unrolled)
+         agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
+      if (agx3_compute_opts && (jammed || unrolled)) {
+         bool reassoc = false;
+         NIR_PASS(reassoc, nir, agx_nir_reassoc_const_offsets);
+         if (reassoc) {
+            NIR_PASS(_, nir, nir_opt_constant_folding);
+            NIR_PASS(_, nir, nir_opt_algebraic);
+            NIR_PASS(_, nir, nir_opt_cse);
+            NIR_PASS(_, nir, nir_opt_dce);
+         }
+      }
+   }
+
+   if (runtime_loop_opts)
+      NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
+
+   /* Bit-exact FP32-blocked u8 absolute-difference sums when u8 operands are
+    * reused across terms, followed by 16-bit integer narrowing for the rest. */
+   if (runtime_loop_opts) {
+      bool fp_absdiff = false;
+      if (agx3_compute_opts)
+         NIR_PASS(fp_absdiff, nir, agx_nir_opt_u8_absdiff_fp);
+      if (fp_absdiff) {
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+      bool narrowed = false;
+      NIR_PASS(narrowed, nir, agx_nir_opt_u8_absdiff);
+      if (narrowed) {
+         NIR_PASS(_, nir, nir_opt_copy_prop);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
+
+   /* Zero-extended bytes and halves convert to f32 from their half register. */
+   if (runtime_loop_opts)
+      NIR_PASS(_, nir, agx_nir_opt_m5_narrow_to_float);
+
+   /* Consecutive words read together, such as the unrolled iterations' reads
+    * of one array, become one vector load. Leave bounds-checked (robust)
+    * shaders alone: with soft faults, robust buffer reads are plain reads
+    * followed by a bounds select, so a read past the end is defined rather
+    * than undefined behaviour. Non-robust shaders remain safe even when soft
+    * faults are active because set_speculate() has not run yet. */
+   if (runtime_loop_opts && !checked_offsets) {
+      bool merged = false;
+      NIR_PASS(merged, nir, agx_nir_merge_global_words);
+      if (merged) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
    }
 
    /* If soft fault is enabled, we can freely speculate everything. That lets us
@@ -10632,18 +11693,27 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    NIR_PASS(pre_alg_progress, nir, nir_opt_peephole_select,
             &peephole_select_options);
 
-   /* Small uniform ifs whose arms load from memory, which peephole select
-    * keeps: on M5 an if costs five control-flow instructions and a wait for
-    * every load in flight. Flattening one can expose another around it.
+   /* Small ifs whose arms load from memory, which peephole select keeps: on
+    * AGX3 an if costs a compare, an exec-mask push, a skip branch and a pop,
+    * and waits for every load in flight. AGX3 flattens small uniform ifs and
+    * the divergent if of a short-circuit operand that reads a uniform address
+    * (agx_nir_opt_flatten_loads.c). Flattening one can expose another around
+    * it, and peephole select reruns only then.
     * Not on G18G, which compiles as AGX3C with emit_agx3d (g18_scans). */
    bool any_flattened = false;
-   if (m5 && !g18_scans) {
-      bool flattened;
+   if ((agx3b || m5) && !g18_scans) {
+      bool flattened, selected = false;
       do {
          flattened = false;
          NIR_PASS(flattened, nir, agx_nir_opt_flatten_loads, 64, 4);
-         NIR_PASS(flattened, nir, nir_opt_peephole_select,
-                  &peephole_select_options);
+         NIR_PASS(flattened, nir,
+                  agx_nir_opt_flatten_short_circuit_uniform_loads);
+         if (flattened || selected) {
+            selected = false;
+            NIR_PASS(selected, nir, nir_opt_peephole_select,
+                     &peephole_select_options);
+         }
+         flattened |= selected;
          any_flattened |= flattened;
       } while (flattened);
       if (any_flattened) {
@@ -10653,29 +11723,51 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       }
    }
 
-   /* Only AGX3 compute shaders defer element-index lowering here; AGX2 never
-    * sets shared_element_index_agx and must keep its existing scalar shared
-    * lowering. Frontends that ran agx_preprocess_nir() with g17p == false
-    * (G18G, Gallium, libagx, Borealis internal helpers) already narrowed
-    * shared offsets to u2u16(off32), so narrow any remaining 32-bit offsets
-    * first with element_indices = false and then run
-    * agx_nir_lower_shared_element_index to chase through u2u16 in 32 bits and
-    * preserve constant byte-offset folding in
-    * agx_nir_opt_shared_byte_offsets(). */
-   const bool lower_agx3_compute_shared =
-      (byte_indices || m5) && nir->info.stage == MESA_SHADER_COMPUTE &&
+   /* Fuse nested guards, hoist independent load/test prefixes across pure
+    * ifs to overlap memory latency, and coalesce adjacent expensive
+    * divergent ifs under a combined fast-path guard. Runs across AGX3B and
+    * AGX3C (excluding G18G). */
+   if ((byte_indices || m5) && !g18_scans) {
+      bool guarded = false;
+      NIR_PASS(guarded, nir, agx_nir_opt_guard_chains);
+      if (guarded) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
+
+   /* Compute shaders defer shared-offset lowering until after
+    * nir_lower_mem_access_bit_sizes() and nir_opt_load_store_vectorize() so
+    * adjacent byte-addressed shared loads and stores merge into wider vector
+    * accesses on both AGX2 and AGX3.  Frontends that ran agx_preprocess_nir()
+    * on non-compute stages already narrowed offsets; AGX3 compute shaders also
+    * convert byte offsets to width-scaled element indices afterwards. */
+   const bool vectorize_compute_shared =
+      nir->info.stage == MESA_SHADER_COMPUTE &&
       !nir->info.shared_element_index_agx;
+   const bool lower_agx3_compute_shared =
+      (byte_indices || m5) && vectorize_compute_shared;
+
+   {
+      bool unswitched = false;
+      NIR_PASS(unswitched, nir, agx_nir_opt_unswitch_affine_bounds);
+      if (unswitched)
+         agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
+   }
+
    NIR_PASS(pre_alg_progress, nir, nir_opt_load_store_vectorize,
             &(const nir_load_store_vectorize_options){
                .modes = nir_var_mem_global | nir_var_mem_constant |
-                        (lower_agx3_compute_shared ? nir_var_mem_shared : 0) |
+                        (vectorize_compute_shared ? nir_var_mem_shared : 0) |
                         nir_var_shader_temp,
                .callback = agx_mem_vectorize_cb,
             });
    NIR_PASS(pre_alg_progress, nir, nir_lower_pack);
-   if (lower_agx3_compute_shared) {
+   if (vectorize_compute_shared) {
       NIR_PASS(pre_alg_progress, nir, agx_nir_lower_shared_bitsize, false);
-      NIR_PASS(pre_alg_progress, nir, agx_nir_lower_shared_element_index);
+      if (lower_agx3_compute_shared)
+         NIR_PASS(pre_alg_progress, nir, agx_nir_lower_shared_element_index);
    }
    if (pre_alg_progress)
       NIR_PASS(_, nir, nir_opt_algebraic);
@@ -10707,13 +11799,37 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       addr_progress |= uatom;
    }
 
+   /* Constant index addends that agx_nir_lower_address cannot see through
+    * its LEA fusion go to M5's byte offsets first. Skip when offsets are
+    * bounds-checked (robustness); with soft faults on non-robust shaders,
+    * agx_nir_fold_m5_offsets() sign-extends speculative byte-sibling indices
+    * so wrapping past 2^32 cannot shift an executed lane. */
+   if (m5 && !g18_scans && !checked_offsets) {
+      bool folded = false;
+      NIR_PASS(folded, nir, agx_nir_fold_m5_offsets, soft_fault);
+      if (folded)
+         NIR_PASS(_, nir, nir_opt_dce);
+   }
+
    /* Lower addressing modes. The sooner we do this, the sooner we get rid of
     * amul/aadd instructions and can let nir_opt_algebraic do its job. But we
     * want to vectorize first since nir_opt_load_store_vectorize doesn't know
     * how to handle our loads. Likewise for uniform atomic optimization.
     */
-   NIR_PASS(addr_progress, nir, agx_nir_lower_address, byte_indices, m5,
-            checked_offsets);
+   NIR_PASS(addr_progress, nir, agx_nir_lower_address, byte_indices || m5,
+            byte_indices || m5, checked_offsets);
+
+   /* Flatten serial uniform-stride 32-bit addition chains into base + (j * s)
+    * when preamble formation is enabled so the hoistable stride multiples
+    * j * s move into the preamble and every address computes independently in
+    * one add, breaking serial address dependencies ahead of strided loads. */
+   if (preamble_size && agx_preamble_allowed(nir))
+      NIR_PASS(_, nir, agx_nir_opt_uniform_stride_chains, m5);
+
+   /* Rows at (x + c) * uniform stride: one shared multiply-add, then an add
+    * of a preamble-uniform c * stride per row. */
+   if (runtime_loop_opts)
+      NIR_PASS(_, nir, agx_nir_opt_uniform_stride);
 
    /* Now that loads carry an index, a select between two of them can choose
     * the index instead of the loaded data. Run it to a fixed point with the
@@ -10731,12 +11847,10 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (g18_scans)
       NIR_PASS(sub_progress, nir, agx_nir_lower_g18_subgroups);
    if (sub_progress) {
-      if (byte_indices)
-         NIR_PASS(_, nir, agx_nir_lower_subgroups_g17p);
-      else if (m5)
-         NIR_PASS(_, nir, agx_nir_lower_subgroups_m5, !g18_scans, !g18_scans);
-      else
-         NIR_PASS(_, nir, agx_nir_lower_subgroups);
+      NIR_PASS(_, nir, agx_nir_lower_subgroups_for_target, byte_indices, m5,
+               g18_scans);
+      if (byte_indices || (m5 && !g18_scans))
+         NIR_PASS(_, nir, agx_nir_lower_dynamic_shuffle_xor);
    }
 
    /* The above create operations that need lowering/optimizing */
@@ -10754,16 +11868,23 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       } while (alg_progress);
    }
 
+   progress = false;
+   NIR_PASS(progress, nir, agx_nir_opt_narrow_subword_loads);
+   if (progress) {
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+
    /* Only lower int64 after optimizing address arithmetic, so that u2u64/i2i64
     * conversions remain.
     */
    progress = false;
    if (byte_indices)
       NIR_PASS(progress, nir, agx_nir_scalarize_int64);
-   /* G17P and M5: normalized 64-bit division instead of nir_lower_int64's
-    * fully unrolled 64-step division (agx_nir_lower_divmod64.c). M5 keeps
-    * the loop's 64-bit add and subtract native. */
-   if (g17p || m5)
+   /* AGX3: normalized 64-bit division instead of nir_lower_int64's fully
+    * unrolled 64-step division (agx_nir_lower_divmod64.c). M5 keeps the
+    * loop's 64-bit add and subtract native. */
+   if (agx3b || m5)
       NIR_PASS(progress, nir, agx_nir_lower_divmod64, m5);
    NIR_PASS(progress, nir, nir_lower_int64);
 
@@ -10788,8 +11909,24 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       spec_progress || any_flattened || addr_progress || sub_progress ||
       pre_alg_progress || progress;
 
+   /* Merge nested early-exit branches sharing an identical fallback arm and
+    * fold redundant range-bound disjunctions before reassociation and preamble
+    * formation so combined bounds hoist cleanly. */
+   if (byte_indices || m5) {
+      bool merged_exits = false;
+      NIR_PASS(merged_exits, nir, agx_nir_opt_merge_nested_early_exits);
+      if (merged_exits) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+         nir_divergence_analysis(nir);
+         pre_fuse_dirty = true;
+      }
+   }
+
    /* Reassociate before forming preambles because it makes preambles more
-    * effective. Clean up after. On M5, also order the loop-invariant terms of
+    * effective. Clean up after. On AGX3, also order the loop-invariant terms of
     * a chain in a loop first, so accumulations of per-iteration constants
     * (robustness loops add the same size queries every iteration) are summed
     * once in the preamble instead of once per term and iteration.
@@ -10800,14 +11937,16 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     */
    if (nir_opt_reassociate_loop(
           nir, nir_reassociate_scalar_math | nir_reassociate_cse_heuristic |
-                  (m5 ? nir_reassociate_loop_invariant : 0)))
+                  ((agx3b || m5) ? nir_reassociate_loop_invariant : 0)))
       pre_fuse_dirty = false;
+
+   agx_factor_loop_mac(nir);
 
    /* Lower fmin/fmax before optimizing preambles so we can see across uniform
     * expressions. Do it after nir_opt_reassociate because nir_opt_reassociate
     * should work on unlowered fmin/fmax.
     */
-   NIR_PASS(pre_fuse_dirty, nir, agx_nir_lower_fminmax, g17p || m5);
+   NIR_PASS(pre_fuse_dirty, nir, agx_nir_lower_fminmax, agx3b || m5);
 
    if (pre_preamble_blob)
       nir_serialize(pre_preamble_blob, nir, false);
@@ -10835,11 +11974,7 @@ pre_preamble:
       }
    }
 
-   /* Force preamble generation for internal shaders since hk's meta copies
-    * depend on it for correctness with imgwblk intrinsics.
-    */
-   if (preamble_size &&
-       (!(agx_compiler_debug & AGX_DBG_NOPREAMBLE) || nir->info.internal)) {
+   if (preamble_size && agx_preamble_allowed(nir)) {
       /* AGX3 (byte_indices: the AGX3B encoding) has no texture/sampler
        * state-store encoding: its descriptor lowering uses immediate native
        * state slots, so a bindless handle hoisted into the image/sampler
@@ -10864,29 +11999,17 @@ pre_preamble:
 
       *preamble_size = sizes[0];
 
-      /* M5: check the constant program's constant-offset buffer reads past
+      /* AGX3: check the constant program's constant-offset buffer reads past
        * 255 bytes in words, so their ends stay immediates
        * (agx_nir_lower_word_bounds.c). The main program keeps its checks.
        * A uniform DMA launch drops the byte checks of the reads it copies by
        * matching their byte form, so leave those programs alone. */
-      if (m5 && !(dma_key && dma_key->g17p_uniform_dma)) {
+      if ((byte_indices || m5) && !(dma_key && dma_key->g17p_uniform_dma)) {
          bool words = false;
          NIR_PASS(words, nir, agx_nir_lower_word_bounds);
          if (words) {
             pre_fuse_dirty = true;
             NIR_PASS(_, nir, nir_opt_cse);
-            NIR_PASS(_, nir, nir_opt_dce);
-         }
-      }
-
-      /* M5: let the main program's robust reads of one structure share their
-       * end computation (agx_nir_share_bounds.c). */
-      if (m5) {
-         bool shared = false;
-         NIR_PASS(shared, nir, agx_nir_share_bounds);
-         if (shared) {
-            pre_fuse_dirty = true;
-            NIR_PASS(_, nir, nir_opt_copy_prop);
             NIR_PASS(_, nir, nir_opt_dce);
          }
       }
@@ -10900,6 +12023,21 @@ pre_preamble:
          pre_fuse_dirty = true;
          NIR_PASS(_, nir, nir_opt_dce);
          agx_remove_empty_preamble(nir);
+      }
+
+      /* AGX3: let the main program's surviving robust reads of one structure
+       * share their end computation (agx_nir_share_bounds.c). Run after
+       * uniform DMA lowering so DMA still sees the original constant ends it
+       * can drop. Only M5 caps buffer descriptor sizes (at INT32_MAX & ~15u),
+       * so only M5 also shares saturating ends. */
+      if (byte_indices || m5) {
+         bool shared = false;
+         NIR_PASS(shared, nir, agx_nir_share_bounds, m5);
+         if (shared) {
+            pre_fuse_dirty = true;
+            NIR_PASS(_, nir, nir_opt_copy_prop);
+            NIR_PASS(_, nir, nir_opt_dce);
+         }
       }
 
       if (dma_key && dma_key->g17p_uniform_dma &&
@@ -10938,7 +12076,7 @@ pre_preamble:
       NIR_PASS(pre_fuse_dirty, nir, agx_nir_export_select_flags_as_halves, true);
 
    /* After the selects of trivial if-else statements exist. */
-   if (m5) {
+   if (byte_indices || m5) {
       bool folded = false;
       NIR_PASS(folded, nir, agx_nir_m5_split_or_selects);
       if (folded) {
@@ -10954,20 +12092,27 @@ pre_preamble:
     */
    bool late_progress = false;
    NIR_PASS(late_progress, nir, nir_opt_algebraic_late);
-   NIR_PASS(late_progress, nir, agx_nir_lower_fminmax, g17p || m5);
+   NIR_PASS(late_progress, nir, agx_nir_lower_fminmax, agx3b || m5);
 
    /* The AGX3 byte-address backend cannot encode 64-bit shifted adds.
-    * Lower remaining multiplies before fusion turns x * 3 into one; the
-    * normal late multiply pass cannot recognize fused backend opcodes. */
+    * Lower remaining 64x64 multiplies before fusion turns x * 3 into one; the
+    * normal late multiply pass cannot recognize fused backend opcodes. Keep
+    * native 32x32->64 products whole for AGX3B's grounded dest_64 imadd. */
    if (byte_indices)
-      NIR_PASS(late_progress, nir, agx_nir_lower_imul64, false);
+      NIR_PASS(late_progress, nir, agx_nir_lower_imul64, true);
 
    /* Before the shift fusions below rewrite the byte extracts it matches. */
    /* M5 only: G18 legalizes byte conversions through its halfword forms
     * (agx_lower_agx3_half_converts). */
    if (m5 && !g18_scans) {
       NIR_PASS(late_progress, nir, agx_nir_fold_byte_to_float);
-      NIR_PASS(late_progress, nir, agx_nir_fold_ubyte_to_float);
+      /* Unsigned byte-to-float stays on the direct AGX3C half-register path:
+       * agx_emit_alu (u2f32) converts every byte of a word and the low byte of
+       * a zero-extended half directly from their mask, shift, and extract
+       * forms, and agx_opt_agx3_normflt_byte_pairs pairs the low and high
+       * bytes of a half it leaves. Narrowing them to u2u8 here makes later
+       * passes lengthen them (byte 2 as split_y, u2u32, split_x, u2u8; byte 1
+       * as a 32-bit shift), so agx_nir_fold_ubyte_to_float is skipped here. */
    }
 
    /* Factor shared constant multipliers and shifts in integer add trees before
@@ -10990,8 +12135,10 @@ pre_preamble:
    do {
       progress = false;
 
+      if (agx3_compute_opts)
+         NIR_PASS(progress, nir, agx_nir_opt_narrow_u8_fadd_tree);
       NIR_PASS(progress, nir, agx_nir_fuse_algebraic_late);
-      if (m5)
+      if (byte_indices || m5)
          NIR_PASS(progress, nir, agx_nir_fuse_doubled_add);
       if (progress) {
          late_progress = true;
@@ -11029,7 +12176,23 @@ pre_preamble:
    if (g18_scans)
       NIR_PASS(late_progress, nir, agx_nir_avoid_square_overflow);
    NIR_PASS(late_progress, nir, agx_nir_fold_pixel_coord);
-   NIR_PASS(late_progress, nir, agx_nir_fuse_selects);
+   if (agx3_compute_opts) {
+      bool fused_selects = false;
+      for (unsigned iter = 0; iter < 4; ++iter) {
+         bool p = false;
+         NIR_PASS(p, nir, agx_nir_fuse_selects);
+         fused_selects |= p;
+         late_progress |= p;
+         if (!p)
+            break;
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+      NIR_PASS(late_progress, nir, agx_nir_fold_const_select_alu);
+      if (fused_selects)
+         NIR_PASS(_, nir, nir_opt_remove_phis);
+   } else {
+      NIR_PASS(late_progress, nir, agx_nir_fuse_selects);
+   }
    if (late_progress) {
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_copy_prop);
@@ -11049,12 +12212,14 @@ pre_preamble:
       move_all &= ~(nir_move_load_input | nir_move_load_frag_coord |
                     nir_move_alu);
 
-   /* Sinking a G17P buffer load into the arm that reads it saves the load when
+   /* Sinking an AGX3 buffer load into the arm that reads it saves the load when
     * the arm is skipped. Sink leaves it at the top of that block; moving it on
     * to its use would make each load wait alone instead of overlapping.
     */
    NIR_PASS(_, nir, nir_opt_sink,
-            g17p ? move_all : move_all & ~nir_move_load_ssbo);
+            (agx3b || m5) ? move_all : move_all & ~nir_move_load_ssbo);
+   if ((agx3b || m5) && !g18_scans)
+      NIR_PASS(_, nir, agx_nir_opt_sink_conditional_loads);
    NIR_PASS(_, nir, nir_opt_move, move_all & ~nir_move_load_ssbo);
    NIR_PASS(progress, nir, nir_lower_all_phis_to_scalar);
 
@@ -11066,6 +12231,20 @@ pre_preamble:
       NIR_PASS(progress, nir, nir_opt_dce);
       progress = false;
    } while (progress);
+
+   if ((byte_indices || m5) && nir->info.stage == MESA_SHADER_COMPUTE) {
+      bool conv_opt = false;
+      NIR_PASS(conv_opt, nir, agx_nir_opt_dw_conv_3x3);
+      if (conv_opt) {
+         NIR_PASS(_, nir, nir_opt_copy_prop);
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+         NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+         nir_divergence_analysis(nir);
+      }
+   }
 }
 
 /*
@@ -12237,7 +13416,7 @@ agx3_order_g18_msaa_tile_ops(agx_context *ctx)
 }
 
 static bool
-agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
+agx3_order_g17p_mrt_tile_ops_strict(agx_context *ctx)
 {
    /* G18G: this optional pass cannot affect a non-fragment program or a
     * preamble. Returning false means no transformation, not a refused shader.
@@ -12651,6 +13830,160 @@ agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
    }
    ctx->agx3_mrt_tile_ops_ordered = true;
    return true;
+}
+
+/* Monolithic fragment shaders with on-chip tile-memory input-attachment reads
+ * (local_read / subpassLoad) can read partitions they never write and contain
+ * arbitrary control flow (e.g. lighting loops, per-sample unrolled loops)
+ * between their tile loads and final tile stores. Admit those shapes on
+ * chips with agx_chip_local_read_tilebuffer() (HAL200/AGX3B and HAL300/AGX3C)
+ * under a single uniform pixel-class transaction covering every touched
+ * partition. */
+static bool
+agx3_order_g17p_local_read_tile_ops(agx_context *ctx)
+{
+   if (!ctx->key->agx3_local_read || ctx->key->m5_uniform_blend)
+      return false;
+
+   if (!agx_chip_local_read_tilebuffer(ctx->key->dev.chip) ||
+       (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B &&
+        !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !ctx->key->dev.emit_agx3d && ctx->key->fs.nr_samples <= 8)) ||
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||
+       ctx->key->secondary || ctx->key->fs.ignore_tib_dependencies ||
+       ctx->key->no_stop || ctx->key->g17p_emrt ||
+       list_is_empty(&ctx->blocks))
+      return false;
+
+   const bool multisample = ctx->key->fs.nr_samples > 1;
+   const BITSET_WORD *partitions = ctx->key->g17p_tile_partitions;
+   const bool keyed = !__bitset_is_empty(
+      partitions, BITSET_WORDS(AGX_G17P_MAX_BYTES_PER_SAMPLE));
+   agx_block *first_block = list_first_entry(&ctx->blocks, agx_block, link);
+   agx_block *exit_block = list_last_entry(&ctx->blocks, agx_block, link);
+
+   unsigned load_count = 0;
+   bool saw_stop = false;
+   bool saw_block0_cf = false;
+   bool tile_started = false;
+   bool saw_store = false;
+   bool all_loads_before_cf_and_stores = true;
+
+   agx_foreach_block(ctx, block) {
+      if (block == exit_block) {
+         if (block->successors[0] || block->successors[1])
+            return false;
+      } else {
+         if (!block->successors[0] && !block->successors[1])
+            return false;
+      }
+
+      agx_foreach_instr_in_block(block, I) {
+         if (saw_stop)
+            return false;
+
+         switch (I->op) {
+         case AGX_OPCODE_ZS_EMIT_AGX3:
+         case AGX_OPCODE_SIGNAL_PIX:
+            return false;
+         case AGX_OPCODE_SAMPLE_MASK_AGX3:
+            if (tile_started || block != first_block || saw_block0_cf)
+               return false;
+            break;
+         case AGX_OPCODE_LD_TILE:
+            if (I->nr_dests != 1 || I->nr_srcs != 2 || I->explicit_coords ||
+                I->pixel_offset >= AGX_G17P_MAX_BYTES_PER_SAMPLE ||
+                I->pixel_offset > UINT8_MAX ||
+                (keyed && !BITSET_TEST(partitions, I->pixel_offset)) ||
+                !(multisample
+                     ? (I->src[0].type == AGX_INDEX_NORMAL &&
+                        I->src[0].size == AGX_SIZE_16)
+                     : (I->src[0].type == AGX_INDEX_IMMEDIATE &&
+                        I->src[0].value == 0xff)) ||
+                !agx_is_null(I->src[1]))
+               return false;
+            if (block != first_block || saw_block0_cf || saw_store)
+               all_loads_before_cf_and_stores = false;
+            tile_started = true;
+            load_count++;
+            break;
+         case AGX_OPCODE_ST_TILE:
+            if (I->nr_dests != 0 || I->nr_srcs != 3 || I->explicit_coords ||
+                I->pixel_offset >= AGX_G17P_MAX_BYTES_PER_SAMPLE ||
+                I->pixel_offset > UINT8_MAX ||
+                (keyed && !BITSET_TEST(partitions, I->pixel_offset)) ||
+                I->src[0].type != AGX_INDEX_NORMAL || I->src[0].memory ||
+                !(multisample
+                     ? (I->src[1].type == AGX_INDEX_NORMAL &&
+                        I->src[1].size == AGX_SIZE_16)
+                     : (I->src[1].type == AGX_INDEX_IMMEDIATE &&
+                        I->src[1].value == 0xff)) ||
+                !agx_is_null(I->src[2]))
+               return false;
+            tile_started = true;
+            saw_store = true;
+            break;
+         case AGX_OPCODE_STOP:
+            if (block != exit_block)
+               return false;
+            saw_stop = true;
+            break;
+         case AGX_OPCODE_IF_ICMP:
+         case AGX_OPCODE_WHILE_ICMP:
+         case AGX_OPCODE_ELSE_ICMP:
+         case AGX_OPCODE_IF_FCMP:
+         case AGX_OPCODE_WHILE_FCMP:
+         case AGX_OPCODE_ELSE_FCMP:
+         case AGX_OPCODE_JMP_EXEC_ANY:
+         case AGX_OPCODE_JMP_EXEC_NONE:
+         case AGX_OPCODE_JMP_EXEC_NONE_AFTER:
+         case AGX_OPCODE_POP_EXEC:
+         case AGX_OPCODE_BREAK_IF_ICMP:
+         case AGX_OPCODE_BREAK_IF_FCMP:
+         case AGX_OPCODE_BEGIN_CF:
+            if (block == first_block)
+               saw_block0_cf = true;
+            break;
+         default:
+            break;
+         }
+      }
+   }
+
+   if (!saw_stop || !load_count)
+      return false;
+
+   /* Single-sample tile loads take only the immediate 0xff sample mask and
+    * have no register inputs. When every load sits in the entry block ahead
+    * of control flow and stores, group them back-to-back after the first load
+    * so all tilebuffer fetches overlap on independent scoreboard slots and
+    * load-only colour classes can release before lighting ALU begins. */
+   if (!multisample && all_loads_before_cf_and_stores && load_count > 1) {
+      agx_instr *anchor = NULL;
+      agx_foreach_instr_in_block_safe(first_block, I) {
+         if (I->op != AGX_OPCODE_LD_TILE)
+            continue;
+         if (!anchor) {
+            anchor = I;
+            continue;
+         }
+         list_del(&I->link);
+         list_add(&I->link, &anchor->link);
+         anchor = I;
+      }
+   }
+
+   ctx->agx3_mrt_tile_ops_ordered = true;
+   ctx->agx3_local_read_tile_ops = true;
+   return true;
+}
+
+static bool
+agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
+{
+   if (ctx->key->agx3_local_read && !ctx->key->m5_uniform_blend)
+      return agx3_order_g17p_local_read_tile_ops(ctx);
+   return agx3_order_g17p_mrt_tile_ops_strict(ctx);
 }
 
 /* The tile load whose value a store writes back unchanged, or NULL. The value
@@ -13253,6 +14586,7 @@ m5_lower_predicated_load(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+
 static bool
 agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
                          struct agx_shader_key *key,
@@ -13364,10 +14698,12 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
        * optimized properly.
        */
       AGX_PASS(ctx, agx_opt_cse);
+      AGX_PASS(ctx, agx_opt_agx3_normflt_byte_pairs);
 
       /* After DCE, use counts are right so we can run the optimizer. */
       AGX_PASS(ctx, agx_optimizer_backward);
       AGX_PASS(ctx, agx_optimizer_forward);
+      AGX_PASS(ctx, agx_opt_pack_bool_or_branch);
       AGX_PASS(ctx, agx_opt_compact_constants);
 
       /* After inlining constants, promote what's left */
@@ -13385,6 +14721,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
    /* Before materialization, which lowers the SIGNEXT this introduces. */
    AGX_PASS(ctx, agx_lower_agx3_widening_int);
+   agx_lower_m5_shifted_neg_iadd(ctx);
 
    if (key->dev.encoding != AGX_ISA_ENCODING_AGX2)
       agx_materialize_agx3_alu_constants(ctx);
@@ -13482,20 +14819,12 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       !ctx->is_preamble;
    if ((agx3_cse || m5_bounded_cse) &&
        !(agx_compiler_debug & AGX_DBG_NOOPT)) {
-      /* AGX3B main programs use the pressure-aware CSE, which merges only
-       * while the earlier result is still live. Uniform source lowering
-       * copies a uniform into a GPR for each operation that cannot read it in
-       * place, so a value used by a run of selects is copied once per select,
-       * and each copy is read right after it is made. On G17P and in M5
-       * main programs, also merge such copies where that keeps the register
-       * pressure within the shader's existing peak. */
-      if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble &&
-          ctx->stage != MESA_SHADER_VERTEX) {
-         if (key->dev.chip == AGX_CHIP_G17P)
-            AGX_PASS(ctx, agx_opt_cse_bounded);
-         else
-            AGX_PASS(ctx, agx_opt_cse_pressure);
-      } else if (m5_bounded_cse) {
+      /* AGX3B and AGX3C main programs use bounded pressure-aware CSE so
+       * uniform-source copies can merge without exceeding the shader's
+       * existing peak register pressure. */
+      if ((key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble &&
+           ctx->stage != MESA_SHADER_VERTEX) ||
+          m5_bounded_cse) {
          AGX_PASS(ctx, agx_opt_cse_bounded);
       } else {
          AGX_PASS(ctx, agx_opt_cse);
@@ -13541,15 +14870,17 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    AGX_PASS(ctx, agx3_merge_unread_pixel_waits);
 
    AGX_PASS(ctx, agx_lower_agx3_device_atomic_sources);
-   AGX_PASS(ctx, agx_lower_agx3_matrix_sources);
+   if (agx_lower_agx3_matrix_sources(ctx)) {
+      agx_validate(ctx, "agx_lower_agx3_matrix_sources");
+      AGX_PASS(ctx, agx_dce, true);
+   }
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       agx_print_shader(ctx, stdout);
 
    if (likely(!(agx_compiler_debug & AGX_DBG_NOSCHED))) {
       AGX_PASS(ctx, agx_pressure_schedule);
-      if (agx_isa_is_agx3(ctx->key->dev.encoding))
-         AGX_PASS(ctx, agx_ilp_schedule);
+      AGX_PASS(ctx, agx_ilp_schedule);
    }
 
    AGX_PASS(ctx, agx3_order_fragment_device_loads);
@@ -13763,6 +15094,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    if (ctx->any_quad_divergent_shuffle)
       agx_lower_divergent_shuffle(ctx);
 
+   agx_count_loop_copies(ctx);
    agx_lower_pseudo(ctx);
 
    /* AGX3's thread-private storage moves one 16-bit or 32-bit component per
@@ -13937,7 +15269,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
       ctx->out->stats.preamble_inst = instrs;
    } else {
-      agx_calc_stats(ctx, binary->size, &ctx->out->stats);
+      agx_calc_stats(ctx, binary, offset, &ctx->out->stats);
    }
 
    /*
@@ -13998,6 +15330,547 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    *offset_out = offset;
    ralloc_free(ctx);
    return true;
+}
+
+/*
+ * Pair low/high unsigned-byte float32 conversions of the same 16-bit half (or
+ * paired halves of a 32-bit word) on AGX3B and AGX3C (not AGX3D) into one
+ * two-lane `normflt` (U8NORM) followed by scaling by 255.
+ *
+ * Unpacking both bytes of a 16-bit half (`convert u8->f32(h)` and
+ * `convert u16->f32(h >> 8)`) otherwise issues three IC/bitfield ops per half
+ * (two `int2flt` plus one shift/extract). A single `normflt` decodes both
+ * bytes to `b / 255` in one instruction:
+ * - When every consumer is an all-register f32 `FFMA` or `FMUL`, emit a 16-bit
+ *   `normflt` pair and scale each lane by `255.0h` with `hmul`, feeding the
+ *   f16 result directly into the mixed-width `FFMA`/`FMUL` (halving footprint
+ *   and offloading scaling to the F16 pipe).
+ * - Otherwise, emit a 32-bit `normflt` pair and scale each lane by `255.0f`
+ *   with `fmul`.
+ *
+ * For round-to-nearest-even `normflt`, both `f16(b/255) * 255.0h` and
+ * `f32(b/255) * 255.0f` recover exact `float(b)` for every `b in 0..255`.
+ *
+ * Only rewrite halves whose sole uses in the shader are the paired low/high
+ * byte unpacks so the source half is guaranteed dead at `normflt`, matching
+ * the witnessed `f29 = 1` source-discard encoding.
+ */
+static bool
+agx_normflt_pair_use_f16(const agx_instr *lo, const agx_instr *hi,
+                         const uint32_t *uses, const bool *narrow_bad,
+                         unsigned nalloc)
+{
+   const unsigned lo_v = lo->dest[0].value;
+   const unsigned hi_v = hi->dest[0].value;
+   return lo_v < nalloc && hi_v < nalloc &&
+          uses[lo_v] > 0 && uses[hi_v] > 0 &&
+          !narrow_bad[lo_v] && !narrow_bad[hi_v];
+}
+
+static void
+agx_emit_normflt_u8_pair(agx_context *ctx, agx_index half_src,
+                         agx_instr *lo, agx_instr *hi, agx_instr *anchor,
+                         agx_index scale_f16, agx_index scale_f32,
+                         const uint32_t *uses, const bool *narrow_bad,
+                         agx_index *narrow_remap, unsigned nalloc,
+                         bool *any_narrow)
+{
+   agx_builder b = agx_init_builder(ctx, agx_before_instr(anchor));
+   const unsigned lo_v = lo->dest[0].value;
+   const unsigned hi_v = hi->dest[0].value;
+   const bool use_f16 =
+      agx_normflt_pair_use_f16(lo, hi, uses, narrow_bad, nalloc);
+
+   if (use_f16) {
+      agx_index pair = agx_temp(ctx, AGX_SIZE_16);
+      pair.channels_m1 = 1;
+      agx_instr *nf =
+         agx_normflt_agx3_to(&b, pair, half_src, AGX_FORMAT_U8NORM);
+      nf->mask = 0;
+
+      agx_index lanes[2] = {agx_null()};
+      agx_emit_split(&b, lanes, pair, 2);
+      agx_index scale = scale_f16.type == AGX_INDEX_NORMAL
+                           ? scale_f16
+                           : agx_mov_imm(&b, 16, 0x5bf8); /* 255.0h */
+
+      agx_builder blo = agx_init_builder(ctx, agx_before_instr(lo));
+      narrow_remap[lo_v] = agx_hmul(&blo, lanes[0], scale);
+      agx_remove_instruction(lo);
+
+      agx_builder bhi = agx_init_builder(ctx, agx_before_instr(hi));
+      narrow_remap[hi_v] = agx_hmul(&bhi, lanes[1], scale);
+      agx_remove_instruction(hi);
+
+      *any_narrow = true;
+   } else {
+      agx_index pair = agx_temp(ctx, AGX_SIZE_32);
+      pair.channels_m1 = 1;
+      agx_instr *nf =
+         agx_normflt_agx3_to(&b, pair, half_src, AGX_FORMAT_U8NORM);
+      nf->mask = 0;
+
+      agx_index lanes[2] = {agx_null()};
+      agx_emit_split(&b, lanes, pair, 2);
+      agx_index scale = scale_f32.type == AGX_INDEX_NORMAL
+                           ? scale_f32
+                           : agx_mov_imm(&b, 32, fui(255.0f));
+
+      agx_builder blo = agx_init_builder(ctx, agx_before_instr(lo));
+      agx_fmul_to(&blo, lo->dest[0], lanes[0], scale);
+      agx_remove_instruction(lo);
+
+      agx_builder bhi = agx_init_builder(ctx, agx_before_instr(hi));
+      agx_fmul_to(&bhi, hi->dest[0], lanes[1], scale);
+      agx_remove_instruction(hi);
+   }
+}
+
+static bool
+agx_normflt_imm_u32(agx_index idx, const bool *is_mov_imm,
+                    const uint64_t *mov_imm_val, unsigned nalloc,
+                    uint32_t *out)
+{
+   if (idx.abs || idx.neg)
+      return false;
+   if (idx.type == AGX_INDEX_IMMEDIATE) {
+      *out = idx.value;
+      return true;
+   }
+   if (idx.type == AGX_INDEX_NORMAL && idx.value < nalloc &&
+       is_mov_imm[idx.value]) {
+      *out = (uint32_t)mov_imm_val[idx.value];
+      return true;
+   }
+   return false;
+}
+
+void
+agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
+{
+   const bool normflt_pairs_ok =
+      ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+      (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !ctx->key->dev.emit_agx3d);
+   if (!normflt_pairs_ok || ctx->is_preamble)
+      return;
+
+   void *memctx = ralloc_context(NULL);
+   const unsigned nalloc = MAX2(ctx->alloc, 1u);
+   uint32_t *uses = rzalloc_array(memctx, uint32_t, nalloc);
+   bool *is_mov_imm = rzalloc_array(memctx, bool, nalloc);
+   uint64_t *mov_imm_val = rzalloc_array(memctx, uint64_t, nalloc);
+   bool *narrow_bad = rzalloc_array(memctx, bool, nalloc);
+   agx_instr **bfeil_def = rzalloc_array(memctx, agx_instr *, nalloc);
+   agx_block **bfeil_blk = rzalloc_array(memctx, agx_block *, nalloc);
+   agx_instr **and16_def = rzalloc_array(memctx, agx_instr *, nalloc);
+   agx_block **and16_blk = rzalloc_array(memctx, agx_block *, nalloc);
+   agx_index *and16_src = rzalloc_array(memctx, agx_index, nalloc);
+   agx_instr **word_ext_def = rzalloc_array(memctx, agx_instr *, nalloc);
+   agx_block **word_ext_blk = rzalloc_array(memctx, agx_block *, nalloc);
+   agx_index *word_ext_src = rzalloc_array(memctx, agx_index, nalloc);
+   uint8_t *word_ext_lane = rzalloc_array(memctx, uint8_t, nalloc);
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM && I->nr_dests == 1 &&
+             I->dest[0].type == AGX_INDEX_NORMAL && I->dest[0].value < nalloc) {
+            is_mov_imm[I->dest[0].value] = true;
+            mov_imm_val[I->dest[0].value] = I->imm;
+         }
+         agx_foreach_ssa_src(I, s) {
+            if (I->src[s].value < nalloc)
+               uses[I->src[s].value]++;
+         }
+      }
+   }
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         uint32_t imm0 = 0, imm2 = 0;
+         if (I->op == AGX_OPCODE_BFEIL && I->nr_dests == 1 &&
+             I->nr_srcs == 3 && I->dest[0].type == AGX_INDEX_NORMAL &&
+             I->dest[0].size == AGX_SIZE_16 && agx_channels(I->dest[0]) == 1 &&
+             agx_normflt_imm_u32(I->src[0], is_mov_imm, mov_imm_val, nalloc, &imm0) &&
+             imm0 == 0 &&
+             I->src[1].type == AGX_INDEX_NORMAL &&
+             I->src[1].size == AGX_SIZE_16 && agx_channels(I->src[1]) == 1 &&
+             !I->src[1].abs && !I->src[1].neg &&
+             agx_normflt_imm_u32(I->src[2], is_mov_imm, mov_imm_val, nalloc, &imm2) &&
+             imm2 == 8 && I->bfi_mask == 0 &&
+             I->dest[0].value < nalloc) {
+            bfeil_def[I->dest[0].value] = I;
+            bfeil_blk[I->dest[0].value] = block;
+         } else if (I->op == AGX_OPCODE_BITOP && I->truth_table == 8 &&
+                    I->nr_dests == 1 && I->nr_srcs == 2 &&
+                    I->dest[0].type == AGX_INDEX_NORMAL &&
+                    I->dest[0].size == AGX_SIZE_16 &&
+                    agx_channels(I->dest[0]) == 1 &&
+                    I->dest[0].value < nalloc) {
+            for (unsigned s = 0; s < 2; ++s) {
+               const agx_index a = I->src[s];
+               const agx_index b = I->src[1 - s];
+               uint32_t mask = 0;
+               if (a.type == AGX_INDEX_NORMAL && a.size == AGX_SIZE_16 &&
+                   agx_channels(a) == 1 && !a.abs && !a.neg &&
+                   a.value < nalloc && !is_mov_imm[a.value] &&
+                   agx_normflt_imm_u32(b, is_mov_imm, mov_imm_val, nalloc, &mask) &&
+                   mask == 0xff) {
+                  and16_def[I->dest[0].value] = I;
+                  and16_blk[I->dest[0].value] = block;
+                  and16_src[I->dest[0].value] = a;
+                  break;
+               }
+            }
+         } else if (I->op == AGX_OPCODE_BITOP && I->truth_table == 8 &&
+                    I->nr_dests == 1 && I->nr_srcs == 2 &&
+                    I->dest[0].type == AGX_INDEX_NORMAL &&
+                    I->dest[0].size == AGX_SIZE_32 &&
+                    agx_channels(I->dest[0]) == 1 &&
+                    I->dest[0].value < nalloc) {
+            for (unsigned s = 0; s < 2; ++s) {
+               const agx_index a = I->src[s];
+               const agx_index b = I->src[1 - s];
+               uint32_t mask = 0;
+               if (a.type == AGX_INDEX_NORMAL && a.size == AGX_SIZE_32 &&
+                   agx_channels(a) == 1 && !a.abs && !a.neg &&
+                   a.value < nalloc &&
+                   agx_normflt_imm_u32(b, is_mov_imm, mov_imm_val, nalloc, &mask) &&
+                   mask == 0xff) {
+                  word_ext_def[I->dest[0].value] = I;
+                  word_ext_blk[I->dest[0].value] = block;
+                  word_ext_src[I->dest[0].value] = a;
+                  word_ext_lane[I->dest[0].value] = 1;
+                  break;
+               }
+            }
+         } else if (I->op == AGX_OPCODE_BFEIL && I->nr_dests == 1 &&
+                    I->nr_srcs == 3 && I->dest[0].type == AGX_INDEX_NORMAL &&
+                    I->dest[0].size == AGX_SIZE_32 &&
+                    agx_channels(I->dest[0]) == 1 &&
+                    agx_normflt_imm_u32(I->src[0], is_mov_imm, mov_imm_val, nalloc, &imm0) &&
+                    imm0 == 0 &&
+                    I->src[1].type == AGX_INDEX_NORMAL &&
+                    I->src[1].size == AGX_SIZE_32 &&
+                    agx_channels(I->src[1]) == 1 &&
+                    !I->src[1].abs && !I->src[1].neg &&
+                    I->src[1].value < nalloc &&
+                    agx_normflt_imm_u32(I->src[2], is_mov_imm, mov_imm_val, nalloc, &imm2) &&
+                    I->dest[0].value < nalloc) {
+            uint8_t lane = 0;
+            if (imm2 == 0 && I->bfi_mask == 8)
+               lane = 1;
+            else if (imm2 == 8 && I->bfi_mask == 8)
+               lane = 2;
+            else if (imm2 == 16 && I->bfi_mask == 8)
+               lane = 3;
+            else if (imm2 == 24 &&
+                     (I->bfi_mask == 0 || I->bfi_mask == 8))
+               lane = 4;
+            if (lane) {
+               word_ext_def[I->dest[0].value] = I;
+               word_ext_blk[I->dest[0].value] = block;
+               word_ext_src[I->dest[0].value] = I->src[1];
+               word_ext_lane[I->dest[0].value] = lane;
+            }
+         }
+      }
+   }
+
+   /* An unpacked byte fits exactly in f16 (0..255), and f16(f16(b/255) * 255h)
+    * equals float(b) bit-for-bit for all 256 inputs. Keep the result in f16
+    * whenever every consumer is an all-register f32 FFMA/FMUL, which reads
+    * f16 sources natively on AGX3B/AGX3C and offloads the *255 scale to the
+    * F16 pipe while halving register footprint. */
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         bool consumer_ok =
+            (I->op == AGX_OPCODE_FFMA || I->op == AGX_OPCODE_FMUL) &&
+            I->nr_dests == 1 && I->dest[0].type == AGX_INDEX_NORMAL &&
+            I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1;
+         if (consumer_ok) {
+            agx_foreach_src(I, s) {
+               if (I->src[s].type != AGX_INDEX_NORMAL ||
+                   agx_channels(I->src[s]) != 1 ||
+                   (I->src[s].value < nalloc && is_mov_imm[I->src[s].value])) {
+                  consumer_ok = false;
+                  break;
+               }
+            }
+         }
+         if (!consumer_ok) {
+            agx_foreach_ssa_src(I, s) {
+               if (I->src[s].value < nalloc)
+                  narrow_bad[I->src[s].value] = true;
+            }
+         }
+      }
+   }
+
+   struct agx_normflt_word_state {
+      agx_instr *conv[4];
+      uint32_t pos[4];
+      agx_index idx;
+   };
+   agx_instr **lo_conv = rzalloc_array(memctx, agx_instr *, nalloc);
+   agx_instr **hi_conv = rzalloc_array(memctx, agx_instr *, nalloc);
+   uint32_t *lo_pos = rzalloc_array(memctx, uint32_t, nalloc);
+   uint32_t *hi_pos = rzalloc_array(memctx, uint32_t, nalloc);
+   uint32_t *candidates = rzalloc_array(memctx, uint32_t, nalloc);
+   struct agx_normflt_word_state *word_st =
+      rzalloc_array(memctx, struct agx_normflt_word_state, nalloc);
+   uint32_t *word_cands = rzalloc_array(memctx, uint32_t, nalloc);
+   agx_index *narrow_remap = rzalloc_array(memctx, agx_index, nalloc);
+   bool any_narrow = false;
+
+   agx_foreach_block(ctx, block) {
+      unsigned ncands = 0;
+      unsigned nword_cands = 0;
+      uint32_t pos = 0;
+      agx_foreach_instr_in_block(block, I) {
+         pos++;
+         if (I->op != AGX_OPCODE_CONVERT || I->nr_dests != 1 ||
+             I->nr_srcs != 2 || I->saturate ||
+             I->dest[0].type != AGX_INDEX_NORMAL ||
+             I->dest[0].size != AGX_SIZE_32 ||
+             agx_channels(I->dest[0]) != 1 ||
+             I->src[0].type != AGX_INDEX_IMMEDIATE ||
+             I->src[1].type != AGX_INDEX_NORMAL ||
+             agx_channels(I->src[1]) != 1 ||
+             I->src[1].abs || I->src[1].neg ||
+             I->src[1].value >= nalloc)
+            continue;
+
+         const enum agx_convert mode = I->src[0].value;
+         const unsigned s = I->src[1].value;
+         if (I->src[1].size == AGX_SIZE_16) {
+            if (mode == AGX_CONVERT_U8_TO_F) {
+               if (!lo_conv[s]) {
+                  if (!hi_conv[s])
+                     candidates[ncands++] = s;
+                  lo_conv[s] = I;
+                  lo_pos[s] = pos;
+               }
+            } else if (mode == AGX_CONVERT_U16_TO_F) {
+               agx_instr *sh = bfeil_def[s];
+               if (sh && bfeil_blk[s] == block && uses[s] == 1 &&
+                   sh->src[1].value < nalloc) {
+                  const unsigned h = sh->src[1].value;
+                  if (!hi_conv[h]) {
+                     if (!lo_conv[h])
+                        candidates[ncands++] = h;
+                     hi_conv[h] = I;
+                     hi_pos[h] = pos;
+                  }
+               } else if (and16_def[s] && and16_blk[s] == block &&
+                          uses[s] == 1 && and16_src[s].value < nalloc) {
+                  const unsigned h = and16_src[s].value;
+                  if (!lo_conv[h]) {
+                     if (!hi_conv[h])
+                        candidates[ncands++] = h;
+                     lo_conv[h] = I;
+                     lo_pos[h] = pos;
+                  }
+               }
+            }
+         } else if (I->src[1].size == AGX_SIZE_32 &&
+                    mode == AGX_CONVERT_U32_TO_F) {
+            const uint8_t lane = word_ext_lane[s];
+            if (lane && word_ext_blk[s] == block && uses[s] == 1) {
+               const unsigned w = word_ext_src[s].value;
+               const unsigned idx = lane - 1;
+               if (!word_st[w].conv[idx]) {
+                  if (!word_st[w].conv[0] && !word_st[w].conv[1] &&
+                      !word_st[w].conv[2] && !word_st[w].conv[3]) {
+                     word_cands[nword_cands++] = w;
+                     word_st[w].idx = word_ext_src[s];
+                  }
+                  word_st[w].conv[idx] = I;
+                  word_st[w].pos[idx] = pos;
+               }
+            }
+         }
+      }
+
+      /* Emit at most one 255.0h and one 255.0f scale immediate per block, right
+       * before the earliest matched byte-pair conversion so it dominates every
+       * rewritten pair without extending live ranges across earlier loads. */
+      agx_instr *scale_anchor = NULL;
+      uint32_t scale_anchor_pos = UINT32_MAX;
+      bool need_f16_scale = false;
+      bool need_f32_scale = false;
+
+      for (unsigned ci = 0; ci < ncands; ++ci) {
+         const unsigned h = candidates[ci];
+         agx_instr *lo = lo_conv[h];
+         agx_instr *hi = hi_conv[h];
+         if (!lo || !hi || uses[h] != 2)
+            continue;
+         agx_instr *anchor = lo_pos[h] < hi_pos[h] ? lo : hi;
+         uint32_t apos = MIN2(lo_pos[h], hi_pos[h]);
+         if (apos < scale_anchor_pos) {
+            scale_anchor_pos = apos;
+            scale_anchor = anchor;
+         }
+         if (agx_normflt_pair_use_f16(lo, hi, uses, narrow_bad, nalloc))
+            need_f16_scale = true;
+         else
+            need_f32_scale = true;
+      }
+
+      for (unsigned ci = 0; ci < nword_cands; ++ci) {
+         const unsigned w = word_cands[ci];
+         agx_instr *c[4] = {
+            word_st[w].conv[0], word_st[w].conv[1],
+            word_st[w].conv[2], word_st[w].conv[3],
+         };
+         uint32_t p[4] = {
+            word_st[w].pos[0], word_st[w].pos[1],
+            word_st[w].pos[2], word_st[w].pos[3],
+         };
+         const bool has_lo = c[0] && c[1];
+         const bool has_hi = c[2] && c[3];
+         const unsigned need = (has_lo ? 2u : 0u) + (has_hi ? 2u : 0u);
+         if (!need || uses[w] != need)
+            continue;
+         if (has_lo) {
+            agx_instr *anchor = p[0] < p[1] ? c[0] : c[1];
+            uint32_t apos = MIN2(p[0], p[1]);
+            if (apos < scale_anchor_pos) {
+               scale_anchor_pos = apos;
+               scale_anchor = anchor;
+            }
+            if (agx_normflt_pair_use_f16(c[0], c[1], uses, narrow_bad, nalloc))
+               need_f16_scale = true;
+            else
+               need_f32_scale = true;
+         }
+         if (has_hi) {
+            agx_instr *anchor = p[2] < p[3] ? c[2] : c[3];
+            uint32_t apos = MIN2(p[2], p[3]);
+            if (apos < scale_anchor_pos) {
+               scale_anchor_pos = apos;
+               scale_anchor = anchor;
+            }
+            if (agx_normflt_pair_use_f16(c[2], c[3], uses, narrow_bad, nalloc))
+               need_f16_scale = true;
+            else
+               need_f32_scale = true;
+         }
+      }
+
+      agx_index scale_f16 = agx_null();
+      agx_index scale_f32 = agx_null();
+      if (scale_anchor) {
+         agx_builder bscale = agx_init_builder(ctx, agx_before_instr(scale_anchor));
+         if (need_f16_scale)
+            scale_f16 = agx_mov_imm(&bscale, 16, 0x5bf8); /* 255.0h */
+         if (need_f32_scale)
+            scale_f32 = agx_mov_imm(&bscale, 32, fui(255.0f));
+      }
+
+      for (unsigned ci = 0; ci < ncands; ++ci) {
+         const unsigned h = candidates[ci];
+         agx_instr *lo = lo_conv[h];
+         agx_instr *hi = hi_conv[h];
+         lo_conv[h] = NULL;
+         hi_conv[h] = NULL;
+         if (!lo || !hi || uses[h] != 2)
+            continue;
+
+         agx_instr *sh = bfeil_def[hi->src[1].value];
+         const bool lo_is_and16 =
+            lo->src[0].value == AGX_CONVERT_U16_TO_F &&
+            and16_def[lo->src[1].value] != NULL;
+         agx_instr *lo_and = lo_is_and16 ? and16_def[lo->src[1].value] : NULL;
+         agx_index half_src =
+            lo_is_and16 ? and16_src[lo->src[1].value] : lo->src[1];
+         agx_instr *anchor = lo_pos[h] < hi_pos[h] ? lo : hi;
+         agx_emit_normflt_u8_pair(ctx, half_src, lo, hi, anchor,
+                                  scale_f16, scale_f32,
+                                  uses, narrow_bad, narrow_remap, nalloc,
+                                  &any_narrow);
+         if (lo_and)
+            agx_remove_instruction(lo_and);
+         agx_remove_instruction(sh);
+      }
+
+      for (unsigned ci = 0; ci < nword_cands; ++ci) {
+         const unsigned w = word_cands[ci];
+         agx_instr *c[4] = {
+            word_st[w].conv[0], word_st[w].conv[1],
+            word_st[w].conv[2], word_st[w].conv[3],
+         };
+         uint32_t p[4] = {
+            word_st[w].pos[0], word_st[w].pos[1],
+            word_st[w].pos[2], word_st[w].pos[3],
+         };
+         const agx_index widx = word_st[w].idx;
+         memset(word_st[w].conv, 0, sizeof(word_st[w].conv));
+
+         const bool has_lo = c[0] && c[1];
+         const bool has_hi = c[2] && c[3];
+         const unsigned need = (has_lo ? 2u : 0u) + (has_hi ? 2u : 0u);
+         if (!need || uses[w] != need)
+            continue;
+
+         agx_instr *ext[4] = {
+            has_lo ? word_ext_def[c[0]->src[1].value] : NULL,
+            has_lo ? word_ext_def[c[1]->src[1].value] : NULL,
+            has_hi ? word_ext_def[c[2]->src[1].value] : NULL,
+            has_hi ? word_ext_def[c[3]->src[1].value] : NULL,
+         };
+
+         agx_instr *first = NULL;
+         uint32_t first_pos = UINT32_MAX;
+         for (unsigned k = 0; k < 4; ++k) {
+            if (((k < 2 && has_lo) || (k >= 2 && has_hi)) && p[k] < first_pos) {
+               first = c[k];
+               first_pos = p[k];
+            }
+         }
+
+         agx_builder bs = agx_init_builder(ctx, agx_before_instr(first));
+         agx_instr *sp = agx_split(&bs, 2, widx);
+         agx_index h0 = has_lo ? agx_temp(ctx, AGX_SIZE_16) : agx_null();
+         agx_index h1 = has_hi ? agx_temp(ctx, AGX_SIZE_16) : agx_null();
+         sp->dest[0] = h0;
+         sp->dest[1] = h1;
+
+         if (has_lo) {
+            agx_instr *anchor = p[0] < p[1] ? c[0] : c[1];
+            agx_emit_normflt_u8_pair(ctx, h0, c[0], c[1], anchor,
+                                     scale_f16, scale_f32,
+                                     uses, narrow_bad, narrow_remap, nalloc,
+                                     &any_narrow);
+            agx_remove_instruction(ext[0]);
+            agx_remove_instruction(ext[1]);
+         }
+         if (has_hi) {
+            agx_instr *anchor = p[2] < p[3] ? c[2] : c[3];
+            agx_emit_normflt_u8_pair(ctx, h1, c[2], c[3], anchor,
+                                     scale_f16, scale_f32,
+                                     uses, narrow_bad, narrow_remap, nalloc,
+                                     &any_narrow);
+            agx_remove_instruction(ext[2]);
+            agx_remove_instruction(ext[3]);
+         }
+      }
+   }
+
+   if (any_narrow) {
+      agx_foreach_block(ctx, block) {
+         agx_foreach_instr_in_block(block, I) {
+            agx_foreach_ssa_src(I, s) {
+               const unsigned v = I->src[s].value;
+               if (v < nalloc && narrow_remap[v].type == AGX_INDEX_NORMAL)
+                  I->src[s] = agx_replace_index(I->src[s], narrow_remap[v]);
+            }
+         }
+      }
+   }
+
+   ralloc_free(memctx);
 }
 
 /* Retry eligible preambles without changing scratch admission or launch rules. */
@@ -14121,6 +15994,39 @@ agx_nir_lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *_)
    return true;
 }
 
+/*
+ * Lower 32-bit integer division. When the compile forms a preamble, a division
+ * by a uniform value uses magic multipliers (agx_nir_opt_uniform_idiv), whose
+ * calculation the preamble then runs once. Without a preamble that calculation
+ * would run in every invocation and cost more than nir_lower_idiv's
+ * reciprocal, so everything takes nir_lower_idiv.
+ */
+bool
+agx_nir_lower_integer_division(nir_shader *nir, bool forms_preamble)
+{
+   bool progress = false;
+
+   if (forms_preamble) {
+      bool uniform = false;
+      NIR_PASS(uniform, nir, agx_nir_opt_uniform_idiv);
+      if (uniform) {
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+         progress = true;
+      }
+   }
+
+   nir_lower_idiv_options idiv_options = {
+      .allow_fp16 = true,
+   };
+   NIR_PASS(progress, nir, nir_lower_idiv, &idiv_options);
+
+   /* Has to run after nir_lower_idiv */
+   NIR_PASS(progress, nir, nir_shader_alu_pass, agx_nir_lower_fdiv,
+            nir_metadata_control_flow, NULL);
+   return progress;
+}
+
 static bool
 agx_nir_lower_g17p_f16_classify(nir_builder *b, nir_alu_instr *alu,
                                 void *_data)
@@ -14239,10 +16145,9 @@ agx_nir_has_temp_vars(const nir_shader *nir)
 
 #ifndef NDEBUG
 static void
-agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p)
+agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p, bool m5,
+                                 bool g18g)
 {
-   const bool defer_sincos = g17p && agx_nir_fma_rte_applies(nir);
-
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -14253,37 +16158,17 @@ agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p)
                assert(alu->op != nir_op_frexp_sig &&
                       alu->op != nir_op_frexp_exp &&
                       "post_lower requires frexp already lowered");
-               if (!defer_sincos) {
-                  assert(alu->op != nir_op_fsin && alu->op != nir_op_fcos &&
-                         "post_lower requires sincos already lowered");
-               }
+               assert(alu->op != nir_op_fsin && alu->op != nir_op_fcos &&
+                      "post_lower requires sincos already lowered");
             } else if (instr->type == nir_instr_type_intrinsic) {
                const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-               switch (intr->intrinsic) {
-               case nir_intrinsic_ballot:
-               case nir_intrinsic_elect:
-               case nir_intrinsic_vote_all:
-               case nir_intrinsic_vote_any:
-               case nir_intrinsic_vote_feq:
-               case nir_intrinsic_vote_ieq:
-               case nir_intrinsic_shuffle:
-               case nir_intrinsic_shuffle_xor:
-               case nir_intrinsic_shuffle_up:
-               case nir_intrinsic_shuffle_down:
-               case nir_intrinsic_quad_broadcast:
-               case nir_intrinsic_quad_swap_horizontal:
-               case nir_intrinsic_quad_swap_vertical:
-               case nir_intrinsic_quad_swap_diagonal:
-               case nir_intrinsic_reduce:
-               case nir_intrinsic_inclusive_scan:
-               case nir_intrinsic_exclusive_scan:
-               case nir_intrinsic_read_invocation:
-               case nir_intrinsic_read_first_invocation:
-                  assert(!"post_lower requires subgroups already lowered");
-                  break;
-               default:
-                  break;
+               if (g18g) {
+                  assert(!agx_g18_subgroup_filter(intr, NULL) &&
+                         "post_lower requires G18G subgroups already lowered");
                }
+               assert(!agx_nir_subgroup_intrinsic_needs_lowering(
+                         nir, intr, g17p, m5, g18g) &&
+                      "post_lower requires subgroups already lowered");
             }
          }
       }
@@ -14293,7 +16178,8 @@ agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p)
 
 static void
 agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_depth,
-                            bool g18g, bool m5, bool chip_g17p, bool post_lower)
+                            bool g18g, bool m5, bool chip_g17p, bool post_lower,
+                            bool defer_idiv, bool preserve_branches)
 {
    if (!nir)
       return;
@@ -14366,24 +16252,15 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    if (!post_lower) {
       NIR_PASS(_, nir, nir_lower_flrp, 16 | 32 | 64, false);
-      /* When the explicit-RTE FMA repair applies, G17P lowers sin/cos in
-       * agx_compile_shader_nir after it, so the repair covers the shader's own
-       * FMAs only. Other shaders keep the lowering here. */
-      if (!g17p || !agx_nir_fma_rte_applies(nir))
-         NIR_PASS(_, nir, agx_lower_sincos,
-                  g17p ? 1 : (native_fragment_depth || g18g) ? 2 : 0);
+      NIR_PASS(_, nir, agx_lower_sincos,
+               g17p ? 1 : (native_fragment_depth || g18g) ? 2 : 0);
    }
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, agx_lower_front_face,
             nir_metadata_control_flow, NULL);
    if (!post_lower) {
       if (g18g)
          NIR_PASS(_, nir, agx_nir_lower_g18_subgroups);
-      if (g17p)
-         NIR_PASS(_, nir, agx_nir_lower_subgroups_g17p);
-      else if (m5)
-         NIR_PASS(_, nir, agx_nir_lower_subgroups_m5, !g18g, !g18g);
-      else
-         NIR_PASS(_, nir, agx_nir_lower_subgroups);
+      NIR_PASS(_, nir, agx_nir_lower_subgroups_for_target, g17p, m5, g18g);
    }
    NIR_PASS(_, nir, nir_lower_all_phis_to_scalar);
 
@@ -14392,30 +16269,37 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
        * will run through the loop later, once we have the shader key, but if we
        * run now, that run will ideally be almost a no-op.
        */
-      agx_optimize_loop_nir(nir, !g17p && native_fragment_depth, g17p);
+      /* Match agx_optimize_nir()'s AGX3B/AGX3C scope (excluding G18G) for
+       * branch preservation and conditional load sinking, while keeping
+       * OPT_FOLD_D3D on the existing native/M5 predicate. */
+      const bool preserve_agx3_branches = preserve_branches || m5;
+      if (preserve_agx3_branches)
+         NIR_PASS(_, nir, agx_nir_opt_sink_conditional_loads);
+      agx_optimize_loop_nir(nir, g17p || native_fragment_depth,
+                            preserve_agx3_branches, g17p || m5);
    } else {
       NIR_PASS(_, nir, nir_opt_copy_prop);
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_dce);
 #ifndef NDEBUG
-      agx_assert_post_lower_invariants(nir, g17p);
+      agx_assert_post_lower_invariants(nir, g17p, m5, g18g);
 #endif
    }
 
-   /* Lower idiv after an optimization loop so we can constant fold more before
-    * nir_opt_idiv_const.
+   /* Lower constant divisors after an optimization loop so we can constant
+    * fold more before nir_opt_idiv_const. Strength-reduce signed div/mod with
+    * provably nonnegative operands first so the remaining lowering drops
+    * redundant sign fixups. Other integer division waits for the shader key
+    * (agx_nir_lower_integer_division), which decides whether a preamble forms.
+    * The first preprocessing of a Vulkan compute shader may defer these passes
+    * so compute-kernel matchers see the raw idiv/udiv/irem/imod/umod by a
+    * constant; hk_lower_nir() preprocesses it again before backend compilation.
     */
-   NIR_PASS(_, nir, nir_opt_idiv_const, 16);
-
-   nir_lower_idiv_options idiv_options = {
-      .allow_fp16 = true,
-   };
-
-   NIR_PASS(_, nir, nir_lower_idiv, &idiv_options);
-
-   /* Has to run after nir_lower_idiv */
-   NIR_PASS(_, nir, nir_shader_alu_pass, agx_nir_lower_fdiv,
-            nir_metadata_control_flow, NULL);
+   if (!defer_idiv) {
+      NIR_PASS(_, nir, agx_nir_opt_iv_divmod);
+      NIR_PASS(_, nir, agx_nir_opt_nonneg_idiv);
+      NIR_PASS(_, nir, nir_opt_idiv_const, 16);
+   }
 
    NIR_PASS(_, nir, nir_opt_deref);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
@@ -14450,14 +16334,13 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
     * into 32-bit halves, leaving each half addressing half its element.
     * Accesses of 32 bits and narrower are not split, so they are unaffected.
     */
-   /* Compute shaders defer shared element-index lowering until after
+   /* Compute shaders defer shared-offset lowering until after
     * nir_lower_mem_access_bit_sizes() and nir_opt_load_store_vectorize() in
     * agx_compile_shader_nir() so adjacent byte-addressed shared loads and
-    * stores merge into wider vector accesses before byte offsets become
-    * width-scaled element indices. Non-compute stages keep preprocess lowering.
+    * stores merge into wider vector accesses on both AGX2 and AGX3.
+    * Non-compute stages keep preprocess lowering.
     */
-   const bool defer_compute_shared =
-      (g17p || native_fragment_depth) && nir->info.stage == MESA_SHADER_COMPUTE;
+   const bool defer_compute_shared = nir->info.stage == MESA_SHADER_COMPUTE;
    if (!defer_compute_shared) {
       if (g17p || native_fragment_depth) {
          nir_lower_mem_access_bit_sizes_options shared_split = {
@@ -14494,16 +16377,44 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 }
 
 void
+agx_preprocess_nir_for_encoding(nir_shader *nir, enum agx_isa_encoding encoding)
+{
+   agx_preprocess_nir_internal(nir, false, false, false, false, false, false,
+                               false, encoding == AGX_ISA_ENCODING_AGX3B);
+}
+
+void
 agx_preprocess_nir(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, false, false, false, false, false);
+   agx_preprocess_nir_for_encoding(nir, AGX_ISA_ENCODING_UNKNOWN);
+}
+
+/* Before the main optimization loop reassociates the last addition of a
+ * written-out population count into its user. */
+static void
+agx_preprocess_popcount_idiom(nir_shader *nir)
+{
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
 }
 
 void
 agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip)
 {
-   agx_preprocess_nir_internal(nir, true, true, false, false,
-                               chip == AGX_CHIP_G17P, false);
+   agx_preprocess_popcount_idiom(nir);
+   agx_preprocess_nir_internal(
+      nir, true, true, false, false, chip == AGX_CHIP_G17P, false, false,
+      agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B);
+}
+
+void
+agx_preprocess_nir_native_defer_idiv(nir_shader *nir, enum agx_chip chip)
+{
+   agx_preprocess_popcount_idiom(nir);
+   agx_preprocess_nir_internal(
+      nir, true, true, false, false, chip == AGX_CHIP_G17P, false, true,
+      agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B);
 }
 
 void
@@ -14516,7 +16427,8 @@ void
 agx_preprocess_nir_g18g(nir_shader *nir)
 {
    /* Select G18 trig without inheriting G17P subgroup/shared-memory rules. */
-   agx_preprocess_nir_internal(nir, false, false, true, false, false, false);
+   agx_preprocess_nir_internal(nir, false, false, true, false, false, false,
+                               false, false);
 }
 
 void
@@ -14527,9 +16439,11 @@ agx_preprocess_nir_post_lower(nir_shader *nir, enum agx_chip chip)
    const bool m5 = !g17p && !g18g && agx_chip_g17_m5(chip);
    const bool native_fragment_depth = g17p || m5;
    const bool chip_g17p = chip == AGX_CHIP_G17P;
+   const bool preserve_branches =
+      agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B;
 
    agx_preprocess_nir_internal(nir, g17p, native_fragment_depth, g18g, m5,
-                               chip_g17p, true);
+                               chip_g17p, true, false, preserve_branches);
 }
 
 static bool
@@ -14798,6 +16712,23 @@ agx3_uniform_dma_offset(nir_intrinsic_instr *intr, unsigned *size_B)
 
    *size_B = intr->def.num_components << format_shift;
    return offset_B;
+}
+
+/* A PREGFX dispatch can run even if every indirect draw is empty. The
+ * root table itself is resident then, but addresses obtained from it can
+ * name unused descriptors or application memory. Prove each load directly
+ * against the root allocation, including the last byte of a vector load. */
+static bool
+agx3_preamble_load_within_root(const struct agx_shader_key *key,
+                               nir_intrinsic_instr *intr)
+{
+   if (agx3_uniform_dma_pointer(key, intr->src[0].ssa, 0) != key->g17p_dma_root ||
+       nir_is_coherent(intr))
+      return false;
+
+   unsigned size_B;
+   const int64_t offset_B = agx3_uniform_dma_offset(intr, &size_B);
+   return offset_B >= 0 && offset_B + size_B <= key->preamble_root_size_B;
 }
 
 /* Fill in a candidate whose address is a buffer descriptor's: the 64-bit
@@ -15680,11 +17611,17 @@ static bool
 agx3_vertex_preamble_only_forwards(nir_shader *nir)
 {
    /* As many other operations as agx3_inline_cheap_vertex_preamble() moves
-    * into the main program once the copies leave nothing else. */
+    * into the main program once the copies leave nothing else: up to 4
+    * arbitrary ops, or up to 12 fast 1-cycle scalar ALU ops over <= 16 bytes
+    * of uniform-DMA loads. */
    unsigned other = 0;
+   unsigned cheap_alu = 0;
+   unsigned load_bytes = 0;
    nir_foreach_function_impl(impl, nir) {
       if (!impl->function->is_preamble)
          continue;
+      if (exec_list_length(&impl->body) != 1)
+         return false;
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
             switch (instr->type) {
@@ -15692,16 +17629,21 @@ agx3_vertex_preamble_only_forwards(nir_shader *nir)
             case nir_instr_type_undef:
                continue;
             case nir_instr_type_intrinsic: {
-               const nir_intrinsic_op op =
-                  nir_instr_as_intrinsic(instr)->intrinsic;
+               const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               const nir_intrinsic_op op = intr->intrinsic;
                if (op == nir_intrinsic_load_preamble ||
-                   op == nir_intrinsic_store_preamble ||
-                   op == nir_intrinsic_load_constant_agx)
+                   op == nir_intrinsic_store_preamble)
                   continue;
+               if (op == nir_intrinsic_load_constant_agx) {
+                  load_bytes += intr->def.num_components *
+                                DIV_ROUND_UP(intr->def.bit_size, 8);
+                  continue;
+               }
                return false;
             }
-            case nir_instr_type_alu:
-               switch (nir_instr_as_alu(instr)->op) {
+            case nir_instr_type_alu: {
+               const nir_op op = nir_instr_as_alu(instr)->op;
+               switch (op) {
                case nir_op_mov:
                case nir_op_vec2:
                case nir_op_vec3:
@@ -15713,17 +17655,24 @@ agx3_vertex_preamble_only_forwards(nir_shader *nir)
                case nir_op_bounds_agx:
                   continue;
                default:
-                  if (++other > 4)
+                  if (agx3_is_cheap_vertex_preamble_alu(op))
+                     ++cheap_alu;
+                  else
+                     ++other;
+                  if (other + cheap_alu > 4 &&
+                      !(other == 0 && cheap_alu <= 12))
                      return false;
                   continue;
                }
+            }
             default:
                return false;
             }
          }
       }
    }
-   return true;
+   return (other + cheap_alu <= 4) ||
+          (other == 0 && cheap_alu <= 12 && load_bytes <= 16);
 }
 
 bool
@@ -16006,8 +17955,8 @@ agx_b2f_of(nir_def *d, unsigned d_comp, nir_def *c, unsigned c_comp,
  * for b in place of a). Minecraft's linear fog builds this per distance (0
  * before the start, 1 past the end, the ramp between); AGX has no boolean
  * OR or NOT, so the backend built it from three selects, two of them needing
- * their uniform comparand copied into a GPR on M5. Apple's fragment uses two
- * selects. The values are exact (b2f gives +0.0 and 1.0). M5 only, so other
+ * their uniform comparand copied into a GPR on AGX3. Apple's fragment uses two
+ * selects. The values are exact (b2f gives +0.0 and 1.0). AGX3 only, so other
  * targets keep their compiles.
  */
 static bool
@@ -16443,10 +18392,8 @@ agx_prepare_preoptimized_epilog_nir(nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, agx_nir_lower_denorm_preserve);
-   if (key->dev.chip == AGX_CHIP_G17P ||
-       key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
-      NIR_PASS(_, nir, agx_nir_lower_fma_rte);
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX2 ||
+       key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
        key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
       NIR_PASS(_, nir, agx_nir_lower_f2bf_rtne);
    NIR_PASS(_, nir, nir_opt_constant_folding);
@@ -16462,7 +18409,9 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
                                 struct blob *pre_preamble_blob,
                                 bool pre_preamble_optimized,
                                 bool epilog_has_alu,
-                                bool preamble_newly_enabled)
+                                bool preamble_newly_enabled,
+                                unsigned m5_unroll_factor,
+                                unsigned *m5_unroll_widest)
 {
    /* Specialization or shader linking may gather info again after
     * preprocessing, clearing the operation-derived helper flags. Execution
@@ -16528,9 +18477,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    const bool form_preamble = !key->secondary && !key->no_preamble;
    const bool is_agx3 = key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
                        key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
-   const bool is_g17p = key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
-   const bool m5_wide_product =
-      key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !key->dev.emit_agx3d;
+   const bool is_agx3b = key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+   const bool native_wide_product = is_agx3 && !key->dev.emit_agx3d;
 
    const nir_shader_compiler_options *original_options = nir->options;
    nir_shader_compiler_options agx3_options;
@@ -16618,19 +18566,12 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
 
       NIR_PASS(_, nir, agx_nir_lower_denorm_preserve);
-      if (key->dev.chip == AGX_CHIP_G17P ||
-          key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
-         NIR_PASS(_, nir, agx_nir_lower_fma_rte);
-
-      /* Sin/cos that agx_preprocess_nir_g17p left for an explicit-RTE shader.
-       * Their reduction FMAs serve an absolute-error bound, which a tininess
-       * repair of at most 2^-126 cannot affect, so they are lowered after it.
-       * Every other shader has already lowered them. */
-      NIR_PASS(_, nir, agx_lower_sincos, 1);
 
       /* Late VBO lowering creates constant udiv instructions */
       bool idiv_lowered = false;
       NIR_PASS(idiv_lowered, nir, nir_opt_idiv_const, 16);
+      NIR_PASS(idiv_lowered, nir, agx_nir_lower_integer_division,
+               form_preamble && agx_preamble_allowed(nir));
 
       if (idiv_lowered || needs_bit_size)
          NIR_PASS(_, nir, nir_opt_constant_folding);
@@ -16652,13 +18593,9 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
     * compiler options preserve them.  AGX3 has no grounded 64-bit add, so
     * lower it to low/add, carry, high/add.
     *
-    * G17P's 32x32->64 multiply IS grounded (agx3_iadd_core.h, dest_64), but a
-    * full 64x64->64 multiply still needs several of them plus the carry
-    * arithmetic, which is what agx_nir_lower_imul64 builds out of 32-bit
-    * pieces.  Keep that lowering; the only cost of leaving it alone is that
-    * its inner high-word multiply is expanded in software rather than using
-    * one wide imad.  Changing that is a codegen optimisation and belongs with
-    * a hardware measurement, not with enabling the instruction.
+    * Both AGX3B and non-G18G AGX3C have grounded 32x32->64 multiply forms
+    * (agx3_iadd_core.c, dest_64), so keep 32x32->64 products native and build
+    * 64x64->64 multiplies on them via agx_nir_lower_imul64.
     *
     * Keep the override local to this compile so the other encodings retain
     * their paths and frontends continue sharing agx_nir_options. */
@@ -16673,12 +18610,9 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
             NIR_PASS(_, nir, agx_nir_lower_f2bf_rtne);
          agx3_options.lower_bfloat16_conversions = true;
       }
-      if (is_g17p) {
-         agx3_options.lower_iabs = false;
-         /* G17P's saturate form is a standalone f32add.ep2 operation. */
+      if (is_agx3b) {
+         /* AGX3B's saturate form is a standalone f32add.ep2 operation. */
          agx3_options.lower_fsat = false;
-         /* G17P lowers unsigned saturating subtract to compare/sub/select. */
-         agx3_options.lower_usub_sat = true;
       }
       if (source_iadd64)
          agx3_options.lower_int64_options |= nir_lower_iadd64;
@@ -16688,13 +18622,21 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
 
       /* Lower the 64-bit multiply BEFORE agx_optimize_nir, not only after. */
       if (source_imul64)
-         NIR_PASS(_, nir, agx_nir_lower_imul64, m5_wide_product);
+         NIR_PASS(_, nir, agx_nir_lower_imul64, native_wide_product);
    } else if (agx_is_g18g(&key->dev) && source_iadd64) {
       /* G18G's generated geometry shaders also add full-width addresses.
        * Apple G17G-family ulong addition uses low/add, carry and high/add;
        * keep that lowering local instead of reaching an ungrounded IADD64. */
       agx3_options = *original_options;
       agx3_options.lower_int64_options |= nir_lower_iadd64;
+      nir->options = &agx3_options;
+   } else if (key->dev.encoding == AGX_ISA_ENCODING_AGX2) {
+      /* AGX2 has no bf16 conversion instructions. Round f2bf to nearest even;
+       * the shared lowering handles exact bf2f widening. */
+      agx3_options = *original_options;
+      if (!pre_preamble_optimized)
+         NIR_PASS(_, nir, agx_nir_lower_f2bf_rtne);
+      agx3_options.lower_bfloat16_conversions = true;
       nir->options = &agx3_options;
    }
 
@@ -16705,7 +18647,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    const mesa_shader_stage stage = nir->info.stage;
    const bool uniform_atomics =
       !is_agx3 ||
-      (is_g17p && (stage == MESA_SHADER_COMPUTE ||
+      (is_agx3b && (stage == MESA_SHADER_COMPUTE ||
                    stage == MESA_SHADER_VERTEX ||
                    stage == MESA_SHADER_TESS_CTRL ||
                    stage == MESA_SHADER_FRAGMENT));
@@ -16741,15 +18683,13 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    /* Only the one-sample AGX3B coverage path reads
     * bit 0 alone; sample loops and multisampled variants keep whole masks. */
    const bool discard_word =
-      ((is_g17p && key->dev.encoding == AGX_ISA_ENCODING_AGX3B) ||
-       key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+      is_agx3 &&
       nir->info.stage == MESA_SHADER_FRAGMENT &&
       MAX2(key->fs.nr_samples, 1) == 1 && !key->fs.inside_sample_loop;
 
    agx_optimize_nir(
       nir, key->dev.soft_fault, uniform_atomics,
       key->dev.encoding == AGX_ISA_ENCODING_AGX3B, discard_word,
-      key->dev.chip == AGX_CHIP_G17P,
       key->dev.encoding == AGX_ISA_ENCODING_AGX3C,
       key->dev.emit_agx3d, key->checked_offsets,
       form_preamble ? &info->push_count : NULL,
@@ -16758,7 +18698,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       (form_preamble && key->promote_textures) ? &info->sampler_state_count
                                               : NULL,
       form_preamble ? key : NULL, info, pre_preamble_blob,
-      pre_preamble_optimized, epilog_has_alu, preamble_newly_enabled);
+      pre_preamble_optimized, epilog_has_alu, preamble_newly_enabled,
+      m5_unroll_factor, m5_unroll_widest);
 
    /* Safe uniform-load speculation and if/phi folding have now exposed
     * matching sample copies. Preserve early subset proofs through those
@@ -16781,10 +18722,10 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
                key->fs.nr_samples);
 
    if (is_agx3 && source_imul64)
-      NIR_PASS(post_opt_progress, nir, agx_nir_lower_imul64, m5_wide_product);
+      NIR_PASS(post_opt_progress, nir, agx_nir_lower_imul64,
+               native_wide_product);
 
-   if (is_agx3)
-      nir->options = original_options;
+   nir->options = original_options;
 
    /* AGX_G17P_UNIFORM_DMA: only when no preamble is formed. */
    if (is_agx3 && key->g17p_uniform_dma && !form_preamble &&
@@ -16798,6 +18739,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
     * dropping writes to general uniform slots nobody reads anymore.
     */
    if (is_agx3 && form_preamble) {
+      NIR_PASS(post_opt_progress, nir, agx_nir_cancel_preamble_fneg,
+               key->reserved_preamble);
       NIR_PASS(post_opt_progress, nir, agx_nir_remove_unused_preamble_exports,
                key->reserved_preamble);
       NIR_PASS(post_opt_progress, nir, agx_nir_coalesce_preamble_half_exports,
@@ -16810,7 +18753,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
                key->reserved_preamble,
                info->agx3_uniform_dma_count ? info->agx3_uniform_dma[0].dest
                                             : push_count,
-               &push_count, is_g17p);
+               &push_count, is_agx3b);
       info->push_count = push_count;
    }
 
@@ -16820,21 +18763,72 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       post_opt_progress = true;
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
-      /* Hoist only what the register file can hold through the loop: the
-       * file a workgroup allows (agx_ra), less what spilling reserves.
+   if (is_agx3) {
+      /* Hoist only what the register file can hold through the loop, matching
+       * agx_ra_impl's shader-specific limits. Only static-split targets
+       * (emit_agx3d) cap compute shaders by workgroup occupancy. AGX3B uses
+       * Dynamic Caching (no static per-workgroup register split), so bound it
+       * by its 192-half file less headroom for backend register expansion,
+       * and mirror RA's agx3_cube_register_budget() cap when sampling
+       * cube/cube-array maps.
        */
-      unsigned regs = ROUND_DOWN_TO(AGX3C_NUM_REGS, 8);
-      if (mesa_shader_stage_is_compute(nir->info.stage)) {
-         const unsigned threads = nir->info.workgroup_size_variable
-            ? 1024
-            : nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
-                 nir->info.workgroup_size[2];
-         regs = MIN2(regs, agx_max_registers_for_occupancy(threads));
-      }
+      unsigned regs;
+      if (is_agx3b) {
+         regs = AGX3B_NUM_REGS;
+         nir_foreach_function_impl(impl, nir) {
+            nir_foreach_block(block, impl) {
+               nir_foreach_instr(instr, block) {
+                  if (instr->type != nir_instr_type_tex)
+                     continue;
+                  nir_tex_instr *tex = nir_instr_as_tex(instr);
+                  if (tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE)
+                     continue;
+                  const bool has_bias_min =
+                     tex->op == nir_texop_txb &&
+                     nir_tex_instr_src_index(tex, nir_tex_src_min_lod) >= 0;
+                  regs = MIN2(regs,
+                              (tex->is_array || has_bias_min)
+                                 ? AGX3B_CUBE_ARRAY_MAX_REGS
+                                 : AGX3B_CUBE_MAX_REGS);
+               }
+            }
+         }
+         regs -= 16;
 
-      NIR_PASS(post_opt_progress, nir, agx_nir_opt_licm, regs - 8);
+         /* On AGX3B graphics stages, cap NIR LICM at the 1024-thread tier so
+          * backend varying/sample register expansion cannot push
+          * medium-pressure fragment/vertex shaders into spills or lower thread
+          * counts. Compute shaders keep the full Dynamic Caching budget (176
+          * halves, or 96 when sampling cube arrays). */
+         if (!mesa_shader_stage_is_compute(nir->info.stage))
+            regs = MIN2(regs, agx_max_registers_for_occupancy(1024));
+      } else {
+         regs = key->dev.emit_agx3d ? AGX3D_NUM_REGS : AGX3C_NUM_REGS;
+         if (mesa_shader_stage_is_compute(nir->info.stage) &&
+             key->dev.emit_agx3d) {
+            const unsigned threads = nir->info.workgroup_size_variable
+               ? 1024
+               : nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
+                    nir->info.workgroup_size[2];
+            regs = MIN2(regs, agx_max_registers_for_occupancy(threads));
+         }
+      }
+      /* RA's ray-traversal compute budget applies to AGX3C only. */
+      const bool cap_rt_compute =
+         key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+         nir->info.stage == MESA_SHADER_COMPUTE && !key->is_helper &&
+         (nir->info.ray_queries != 0 || uses_scs);
+      if (key->is_helper)
+         regs = MIN2(regs, 32);
+
+      if (is_agx3)
+         NIR_PASS(post_opt_progress, nir,
+                  agx_nir_reassociate_loop_invariant_eq);
+      NIR_PASS(post_opt_progress, nir, agx_nir_opt_licm, regs, cap_rt_compute);
    }
+
+   if (is_agx3 && !key->dev.emit_agx3d)
+      NIR_PASS(post_opt_progress, nir, agx_nir_hoist_loop_invariant_guard_bits);
 
    if (is_agx3) {
       NIR_PASS(post_opt_progress, nir, agx_nir_opt_shared_byte_offsets);
@@ -16844,9 +18838,35 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          NIR_PASS(_, nir, nir_opt_dce);
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
-      NIR_PASS(_, nir, agx_nir_opt_canonical_minmax);
+   bool canonical_minmax_progress = false;
+   NIR_PASS(canonical_minmax_progress, nir, agx_nir_opt_canonical_minmax);
+   if (canonical_minmax_progress)
       NIR_PASS(_, nir, nir_opt_dce);
+
+   /* G18G (emit_agx3d) is gated out until verified on G18G hardware. */
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !key->dev.emit_agx3d) {
+      bool u8_hsum = false;
+      NIR_PASS(u8_hsum, nir, agx_nir_opt_u8x4_hsum);
+      if (u8_hsum) {
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
+
+   if ((key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+        key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+       !key->dev.emit_agx3d) {
+      NIR_PASS(_, nir, agx_nir_opt_forward_merge_loads);
+      NIR_PASS(_, nir, nir_opt_dce);
+
+      if (mesa_shader_stage_is_compute(nir->info.stage)) {
+         bool guarded_sel = false;
+         NIR_PASS(guarded_sel, nir, agx_nir_opt_guard_selected_loads);
+         if (guarded_sel) {
+            NIR_PASS(_, nir, nir_opt_dce);
+            nir_divergence_analysis(nir);
+         }
+      }
    }
 
 
@@ -16872,9 +18892,9 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
 
    /* Apple issues a loop body's samples in source order and consumes all of
     * them after the last one (native robust_loop witness); Mesa consumed each
-    * right after its sample. Geometry-side M5 stages, like the M5 copy-loop
+    * right after its sample. Geometry-side AGX3 stages, like the AGX3 copy-loop
     * schedule; see agx_nir_opt_sink_loop_sample_uses.c. */
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+   if (is_agx3 &&
        nir->info.stage != MESA_SHADER_FRAGMENT &&
        nir->info.stage != MESA_SHADER_COMPUTE) {
       NIR_PASS(_, nir, agx_nir_opt_sink_loop_sample_uses);
@@ -16911,10 +18931,39 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
          NIR_PASS(_, nir, nir_shader_intrinsics_pass, fold_w8_word_unpack,
                   nir_metadata_control_flow, NULL);
+   }
 
-      /* Narrow workgroup shared-memory barriers whose traffic stays inside a
-       * single 32-wide subgroup (runs after agx_nir_opt_shared_phase_cse,
-       * which delimits read-only phases by workgroup barriers). */
+   const bool agx3_native_compute =
+      (key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+       key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+      !key->dev.emit_agx3d;
+
+   if (agx3_native_compute &&
+       nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
+       nir->info.shared_size && !key->secondary) {
+      /* Match 32x32 FP32 shared-memory GEMM tiles whose K-chain ffmads carry
+       * no float-math-control bits (no NoContraction, no FPFastMathMode
+       * lacking AllowReassoc/AllowContract, and no float-controls execution
+       * mode) and lower them to AGX3 f32matmad8x8 matrix operations. */
+      struct agx_gemm_match gemm;
+      if (agx_nir_match_gemm(nir, &gemm))
+         NIR_PASS(_, nir, agx_nir_lower_gemm, &gemm);
+
+      NIR_PASS(_, nir, agx_nir_opt_shared_flat_phase_cse);
+
+      bool packed = false;
+      NIR_PASS(packed, nir, agx_nir_opt_shared_vec2);
+      if (packed) {
+         NIR_PASS(_, nir, nir_opt_dce);
+         nir_divergence_analysis(nir);
+      }
+   }
+
+   /* Run after all passes that delimit shared-memory phases by workgroup
+    * barriers. Preserve existing coverage for internal AGX3 shaders. */
+   if (agx3_native_compute ||
+       (nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
+        !key->secondary)) {
       NIR_PASS(_, nir, agx_nir_narrow_single_subgroup_barriers);
       NIR_PASS(_, nir, agx_nir_narrow_subgroup0_barriers);
    }
@@ -16922,19 +18971,47 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       nir_print_shader(nir, stdout);
 
-   if (is_g17p) {
-      info->agx3_uniform_halfs_valid = true;
+   if (is_agx3b || (is_agx3 && key->g17p_uniform_dma)) {
+      const bool track_root = is_agx3 && key->g17p_uniform_dma;
+      const unsigned root_base = key->g17p_dma_root;
+      if (is_agx3b)
+         info->agx3_uniform_halfs_valid = true;
+      if (track_root) {
+         info->agx3_root_uniform_usage_valid = true;
+         info->agx3_main_uses_root_uniform = false;
+         info->agx3_preamble_uses_root_uniform = false;
+      }
       nir_foreach_function_with_impl(func, impl, nir) {
          nir_foreach_block(block, impl) {
             nir_foreach_instr(instr, block) {
                if (instr->type != nir_instr_type_intrinsic)
                   continue;
                nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-               if (intr->intrinsic != nir_intrinsic_load_preamble)
+               const bool load = intr->intrinsic == nir_intrinsic_load_preamble;
+               unsigned base, halves;
+               if (load) {
+                  base = nir_intrinsic_base(intr);
+                  halves = intr->def.num_components *
+                           DIV_ROUND_UP(intr->def.bit_size, 16);
+               } else if (intr->intrinsic == nir_intrinsic_bindless_image_agx ||
+                          intr->intrinsic ==
+                             nir_intrinsic_bindless_sampler_agx) {
+                  /* The 64-bit heap base the texture or sampler instruction
+                   * reads as a uniform (agx_translate_bindless_handle()). */
+                  base = nir_intrinsic_desc_set(intr);
+                  halves = 4;
+               } else {
                   continue;
-               unsigned base = nir_intrinsic_base(intr);
-               unsigned halves = intr->def.num_components *
-                                 DIV_ROUND_UP(intr->def.bit_size, 16);
+               }
+               if (track_root && load && base < root_base + 4u &&
+                   base + halves > root_base) {
+                  if (func->is_preamble)
+                     info->agx3_preamble_uses_root_uniform = true;
+                  else
+                     info->agx3_main_uses_root_uniform = true;
+               }
+               if (!is_agx3b)
+                  continue;
                if (base >= AGX3_CPROG_INPUT_HALVES ||
                    halves > AGX3_CPROG_INPUT_HALVES - base) {
                   info->agx3_uniform_halfs_valid = false;
@@ -16967,6 +19044,124 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
     * one-shot/full traversal lowerings must set uses_ray_traversal without
     * automatically setting this committed-path property. */
    info->ray_traversal_depth_nonzero = nir->info.ray_queries != 0;
+
+   struct {
+      bool candidate;
+      uint16_t in_base_half;
+      uint16_t in_size_halfs;
+      uint16_t out_start_half;
+      uint16_t out_size_halfs;
+   } hoistable_preamble = {0};
+
+   if (nir->info.stage == MESA_SHADER_VERTEX &&
+       agx_isa_is_agx3(key->dev.encoding) && !key->no_preamble &&
+       !key->secondary) {
+      /* nir_shader_get_preamble() would create an empty one, which would
+       * then be compiled as a constant program of a shader that has none. */
+      nir_function *preamble_fn = nir_shader_get_entrypoint(nir)->preamble;
+      nir_function_impl *preamble = preamble_fn ? preamble_fn->impl : NULL;
+      if (preamble) {
+         bool ok = true;
+         bool have_in = false;
+         unsigned in_min = UINT_MAX, in_max = 0;
+         bool have_store = false;
+         unsigned out_min = UINT_MAX, out_max = 0;
+
+         nir_foreach_block(block, preamble) {
+            nir_foreach_instr(instr, block) {
+               switch (instr->type) {
+               case nir_instr_type_alu:
+               case nir_instr_type_load_const:
+               case nir_instr_type_undef:
+               case nir_instr_type_phi:
+               case nir_instr_type_jump:
+                  break;
+               case nir_instr_type_intrinsic: {
+                  nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+                  switch (intr->intrinsic) {
+                  case nir_intrinsic_load_preamble: {
+                     unsigned base = nir_intrinsic_base(intr);
+                     unsigned bit_size = intr->def.bit_size;
+                     unsigned comps = intr->def.num_components;
+                     unsigned halves = comps * DIV_ROUND_UP(bit_size, 16);
+                     if (!halves || (base & 1u) ||
+                         !((bit_size == 64 && comps == 1) ||
+                           (bit_size == 32 && (comps == 1 || comps == 2)))) {
+                        ok = false;
+                     } else {
+                        have_in = true;
+                        in_min = MIN2(in_min, base);
+                        in_max = MAX2(in_max, base + halves);
+                     }
+                     break;
+                  }
+                  case nir_intrinsic_store_preamble: {
+                     if (nir_intrinsic_preamble_class(intr) != 0) {
+                        ok = false;
+                        break;
+                     }
+                     unsigned base = nir_intrinsic_base(intr);
+                     unsigned bit_size = intr->src[0].ssa->bit_size;
+                     unsigned comps = intr->src[0].ssa->num_components;
+                     unsigned halves = comps * DIV_ROUND_UP(bit_size, 16);
+                     if (!halves || (base & 1u) ||
+                         (bit_size != 16 && bit_size != 32 &&
+                          bit_size != 64)) {
+                        ok = false;
+                     } else {
+                        have_store = true;
+                        out_min = MIN2(out_min, base);
+                        out_max = MAX2(out_max, base + halves);
+                     }
+                     break;
+                  }
+                  case nir_intrinsic_load_constant_agx:
+                     ok = agx3_preamble_load_within_root(key, intr);
+                     break;
+                  case nir_intrinsic_as_uniform:
+                  case nir_intrinsic_convert_alu_types:
+                     break;
+                  default:
+                     ok = false;
+                     break;
+                  }
+                  break;
+               }
+               default:
+                  ok = false;
+                  break;
+               }
+               if (!ok)
+                  break;
+            }
+            if (!ok)
+               break;
+         }
+
+         if (ok && have_store && out_min < out_max) {
+            unsigned out_size = ALIGN_POT(out_max - out_min, 2);
+            if (out_size > 0 && out_size <= 128 &&
+                out_min <= UINT16_MAX - out_size) {
+               if (have_in) {
+                  unsigned in_size = in_max - in_min;
+                  if (in_size > 0 && in_size <= 4 &&
+                      in_min <= UINT16_MAX - in_size &&
+                      (out_min >= in_max || out_min + out_size <= in_min)) {
+                     hoistable_preamble.in_base_half = in_min;
+                     hoistable_preamble.in_size_halfs = in_size;
+                     hoistable_preamble.out_start_half = out_min;
+                     hoistable_preamble.out_size_halfs = out_size;
+                     hoistable_preamble.candidate = true;
+                  }
+               } else {
+                  hoistable_preamble.out_start_half = out_min;
+                  hoistable_preamble.out_size_halfs = out_size;
+                  hoistable_preamble.candidate = true;
+               }
+            }
+         }
+      }
+   }
 
    nir_foreach_function_with_impl(func, impl, nir) {
       unsigned offset;
@@ -17014,6 +19209,39 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    /* The preamble may be compiled after main and legalize a final half-word
     * export into a native dword. Report the complete physical footprint. */
    info->stats.uniforms = info->push_count;
+
+   if (hoistable_preamble.candidate && info->has_preamble &&
+       info->texture_state_count == 0 && info->sampler_state_count == 0 &&
+       !info->uses_sampler_heap && !info->uses_ray_traversal &&
+       !info->uses_resource_info_query) {
+      unsigned out_start = hoistable_preamble.out_start_half;
+      unsigned out_end = out_start + hoistable_preamble.out_size_halfs;
+      bool overlap = false;
+
+      if (info->rodata.size_16) {
+         unsigned ro_start = info->rodata.base_uniform;
+         unsigned ro_end = ro_start + info->rodata.size_16;
+         if (!(out_end <= ro_start || out_start >= ro_end))
+            overlap = true;
+      }
+
+      for (unsigned i = 0; i < info->agx3_uniform_dma_count; ++i) {
+         unsigned dma_start = info->agx3_uniform_dma[i].dest;
+         unsigned dma_end = dma_start + info->agx3_uniform_dma[i].halfs;
+         if (!(out_end <= dma_start || out_start >= dma_end))
+            overlap = true;
+      }
+
+      if (!overlap) {
+         info->agx3_preamble_hoistable = true;
+         info->agx3_preamble_in_base_half = hoistable_preamble.in_base_half;
+         info->agx3_preamble_in_size_halfs = hoistable_preamble.in_size_halfs;
+         info->agx3_preamble_out_start_half =
+            hoistable_preamble.out_start_half;
+         info->agx3_preamble_out_size_halfs =
+            hoistable_preamble.out_size_halfs;
+      }
+   }
 
    if (agx_should_dump(nir, AGX_DBG_SHADERDB)) {
       agx2_stats_fprintf(stderr, _mesa_shader_stage_to_abbrev(nir->info.stage),
@@ -17102,12 +19330,109 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    return true;
 }
 
+/* M5 unrolls short run-time-counted loops by up to 8 (see agx_optimize_nir).
+ * More iterations per test never pays for fewer resident threads: when the
+ * wider unroll leaves the shader below the occupancy of a register-light
+ * program, compile it again unrolled by at most 4. pre_preamble_blob then
+ * holds the NIR of the compile that is kept. */
+static bool
+agx_compile_shader_nir_unrolled(nir_shader *nir, struct agx_shader_key *key,
+                                struct agx_shader_part *out,
+                                struct blob *pre_preamble_blob)
+{
+   const unsigned factor = 8;
+   const bool agx3_native =
+      ((key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+        mesa_shader_stage_is_compute(nir->info.stage)) ||
+       key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+      !key->dev.emit_agx3d;
+   if (!agx3_native)
+      return agx_compile_shader_nir_internal(nir, key, out, pre_preamble_blob,
+                                             false, false, false, 4, NULL);
+
+   nir_shader *clone = nir_shader_clone(NULL, nir);
+   const struct agx_shader_key saved_key = *key;
+   const size_t blob_start = pre_preamble_blob ? pre_preamble_blob->size : 0;
+   unsigned widest = 0;
+   bool ok = agx_compile_shader_nir_internal(nir, key, out, pre_preamble_blob,
+                                             false, false, false, factor,
+                                             &widest);
+   const unsigned full = agx_occupancy_for_register_count(0).max_threads;
+   const unsigned first =
+      ok ? agx_occupancy_for_register_count(out->info.nr_gprs).max_threads : 0;
+   /* Also when the wider unroll did not compile at all. */
+   if (widest > 4 && first < full) {
+      nir_shader *narrow_nir = nir_shader_clone(NULL, clone);
+      struct agx_shader_part narrow = {0};
+      struct blob narrow_blob;
+      blob_init(&narrow_blob);
+      *key = saved_key;
+      if (agx_compile_shader_nir_internal(narrow_nir, key, &narrow,
+                                          pre_preamble_blob ? &narrow_blob
+                                                            : NULL,
+                                          false, false, false, 4, NULL) &&
+          agx_occupancy_for_register_count(narrow.info.nr_gprs).max_threads >
+             first) {
+         if (ok)
+            free(out->binary);
+         *out = narrow;
+         ok = true;
+         if (pre_preamble_blob) {
+            pre_preamble_blob->size = blob_start;
+            blob_write_bytes(pre_preamble_blob, narrow_blob.data,
+                             narrow_blob.size);
+         }
+      } else {
+         /* Keep the first result. */
+         if (narrow.binary && narrow.binary != out->binary)
+            free(narrow.binary);
+         *key = saved_key;
+      }
+      ralloc_free(narrow_nir);
+      blob_finish(&narrow_blob);
+   }
+
+   /* On a 192-half register file (AGX3B), unrolling an already-wide loop
+    * (such as a tiled multi-pixel stencil) can push register usage past half
+    * the register file (> 96 halves), reducing Dynamic Caching headroom while
+    * 252-half AGX3C targets still fit comfortably. Fall back to compact
+    * (un-unrolled) compilation when it saves registers on AGX3B. */
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B && widest >= 2 &&
+       (!ok || out->info.nr_gprs > AGX3B_NUM_REGS / 2)) {
+      struct agx_shader_part compact = {0};
+      struct blob compact_blob;
+      blob_init(&compact_blob);
+      *key = saved_key;
+      if (agx_compile_shader_nir_internal(clone, key, &compact,
+                                          pre_preamble_blob ? &compact_blob
+                                                            : NULL,
+                                          false, false, false, 1, NULL) &&
+          (!ok || compact.info.nr_gprs < out->info.nr_gprs)) {
+         if (ok)
+            free(out->binary);
+         *out = compact;
+         ok = true;
+         if (pre_preamble_blob) {
+            pre_preamble_blob->size = blob_start;
+            blob_write_bytes(pre_preamble_blob, compact_blob.data,
+                             compact_blob.size);
+         }
+      } else {
+         if (compact.binary && compact.binary != out->binary)
+            free(compact.binary);
+         *key = saved_key;
+      }
+      blob_finish(&compact_blob);
+   }
+   ralloc_free(clone);
+   return ok;
+}
+
 bool
 agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                        struct agx_shader_part *out)
 {
-   return agx_compile_shader_nir_internal(nir, key, out, NULL, false, false,
-                                          false);
+   return agx_compile_shader_nir_unrolled(nir, key, out, NULL);
 }
 
 bool
@@ -17115,10 +19440,10 @@ agx_compile_shader_nir_capture(nir_shader *nir, struct agx_shader_key *key,
                                struct agx_shader_part *out,
                                struct blob *pre_preamble_blob)
 {
-   return agx_compile_shader_nir_internal(nir, key, out, pre_preamble_blob,
-                                          false, false, false);
+   return agx_compile_shader_nir_unrolled(nir, key, out, pre_preamble_blob);
 }
 
+/* The captured NIR is past the loop passes, so no unroll factor applies. */
 bool
 agx_compile_shader_nir_preoptimized(nir_shader *nir, struct agx_shader_key *key,
                                     struct agx_shader_part *out,
@@ -17127,11 +19452,21 @@ agx_compile_shader_nir_preoptimized(nir_shader *nir, struct agx_shader_key *key,
 {
    return agx_compile_shader_nir_internal(nir, key, out, NULL, true,
                                           epilog_has_alu,
-                                          preamble_newly_enabled);
+                                          preamble_newly_enabled, 4, NULL);
 }
 
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true, false, false);
+   agx_preprocess_popcount_idiom(nir);
+   agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
+                               false, false);
+}
+
+void
+agx_preprocess_nir_m5_defer_idiv(nir_shader *nir)
+{
+   agx_preprocess_popcount_idiom(nir);
+   agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
+                               true, false);
 }

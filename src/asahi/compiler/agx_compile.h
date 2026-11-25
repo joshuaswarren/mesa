@@ -22,6 +22,14 @@
 /* G17P's register file: halves 0..191. */
 #define AGX3B_NUM_REGS (192)
 
+/* AGX3B cube/cube-array register budgets shared between NIR LICM and RA
+ * (agx3_cube_register_budget): cube-array face staging without own scratch
+ * and bias+min_lod place 16 halves of CEM scratch above the allocation inside
+ * the 7-bit register-field limit (112 = 128 - 16 halves); plain cube reserves
+ * 8 halves above the allocation for CEM scratch. */
+#define AGX3B_CUBE_ARRAY_MAX_REGS (112)
+#define AGX3B_CUBE_MAX_REGS       (AGX3B_NUM_REGS - 8)
+
 struct agx_cf_binding {
    /* Base coefficient register */
    uint8_t cf_base;
@@ -143,8 +151,8 @@ struct agx_shader_info {
    /* Number of uniforms */
    uint16_t push_count;
 
-   /* G17P load_preamble declarations after NIR optimization, in native
-    * half-register units. This is a publication contract, not a CProg TPS
+   /* G17P load_preamble declarations and bindless texture/sampler heap bases
+    * after NIR optimization, in native half-register units. This is a publication contract, not a CProg TPS
     * import layout. Consumers must also publish compiler rodata separately. */
    uint64_t agx3_uniform_halfs[AGX3_CPROG_INPUT_WORDS];
    bool agx3_uniform_halfs_valid;
@@ -198,10 +206,42 @@ struct agx_shader_info {
     * This occupies existing alignment padding, but all ABI layouts are checked. */
    uint8_t agx3_preamble_static_spill_version;
    struct agx3_cprog_inputs agx3_preamble_inputs;
+   /* AGX3 hoistable vertex preamble contract: when set, the vertex shader's
+    * @preamble reads at most one 64-bit uniform slot
+    * [agx3_preamble_in_base_half, +agx3_preamble_in_size_halfs), performs only
+    * pure read-only memory loads and ALU, and writes general preamble uniforms
+    * strictly inside [agx3_preamble_out_start_half,
+    * +agx3_preamble_out_size_halfs). The driver may execute @preamble once as a
+    * 1-thread compute shader and bind the output buffer as a vertex uniform
+    * range instead of re-running the per-draw vertex constant program. */
+   /* Post-DMA root-uniform liveness for AGX3 shaders compiled with
+    * g17p_uniform_dma: distinguishes whether the main shader and/or its
+    * @preamble still load the 64-bit root pointer uniform at g17p_dma_root.
+    * When false, uniform DMA and/or preamble hoisting retired every root load
+    * so the driver can omit the dead root-pointer range (when set_count == 0
+    * and no prolog reads the root). */
+   bool agx3_root_uniform_usage_valid;
+   bool agx3_main_uses_root_uniform;
+   bool agx3_preamble_uses_root_uniform;
+
+   bool agx3_preamble_hoistable;
+   uint16_t agx3_preamble_in_base_half;
+   uint16_t agx3_preamble_in_size_halfs;
+   uint16_t agx3_preamble_out_start_half;
+   uint16_t agx3_preamble_out_size_halfs;
    unsigned preamble_offset, main_offset;
 
    /* Does the shader read the tilebuffer? */
    bool reads_tib;
+
+   /* Set on fragment epilogs / monolithic fragment shaders whose reads_tib was
+    * forced solely because one or more bound colour attachments are unwritten.
+    */
+   bool translucent_only_for_unwritten_rts;
+
+   /* Bitmask of bound colour attachments written by this fragment epilog /
+    * monolithic fragment shader. */
+   uint8_t color_rts_written;
 
    /* Does the shader require early fragment tests? */
    bool early_fragment_tests;
@@ -574,6 +614,10 @@ struct agx_shader_key {
     * still proves its one read/write pixel transaction before admitting it. */
    bool m5_uniform_blend;
 
+   /* Monolithic AGX3 fragment program reading color input attachments from
+    * on-chip tile memory (local_read / subpassLoad) across arbitrary CFG. */
+   bool agx3_local_read;
+
    /* AGX3B: build the preamble as a native constant program (CProg inputs
     * imported through its TPS frame, arithmetic results selected straight
     * into uniform destinations, half exports legalized) for this shader.
@@ -596,6 +640,8 @@ struct agx_shader_key {
     * g17p_dma_static_set_mask. !g17p_uniform_dma leaves code unchanged. */
    bool g17p_uniform_dma;
    uint16_t g17p_dma_root;
+   /* Guaranteed resident prefix at g17p_dma_root for speculative VS loads. */
+   uint16_t preamble_root_size_B;
    uint8_t g17p_dma_set_mask;
    uint8_t g17p_dma_static_set_mask;
    uint8_t g17p_dma_buffer_count;
@@ -723,10 +769,16 @@ extern "C" {
 uint64_t agx_gather_texcoords(nir_shader *nir);
 
 void agx_preprocess_nir(nir_shader *nir);
+/* Generic preprocessing with an explicit ISA encoding so frontends that keep
+ * the generic lowering mode (such as Gallium on AGX3B) still inherit AGX3B's
+ * early branch-preservation and conditional-load-sinking policy. */
+void agx_preprocess_nir_for_encoding(nir_shader *nir,
+                                     enum agx_isa_encoding encoding);
 void agx_preprocess_nir_g17p(nir_shader *nir);
 /* For any native AGX3 chip (agx_chip_native_agx3); passes validated on G17P
  * alone check chip. */
 void agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip);
+void agx_preprocess_nir_native_defer_idiv(nir_shader *nir, enum agx_chip chip);
 void agx_preprocess_nir_g18g(nir_shader *nir);
 /* Fast second-stage preprocessing for shaders already preprocessed once before
  * simple I/O or push-constant lowering. Falls back to full preprocessing if any
@@ -737,6 +789,7 @@ void agx_preprocess_nir_post_lower(nir_shader *nir, enum agx_chip chip);
  * AGX3 stack protocol encodes. agx_preprocess_nir_g17p() runs it. */
 bool agx3_nir_lower_scratch_words(nir_shader *nir);
 void agx_preprocess_nir_m5(nir_shader *nir);
+void agx_preprocess_nir_m5_defer_idiv(nir_shader *nir);
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
 /* TARGET/LIVE retain their normal semantics. This flag records the proof that
@@ -895,4 +948,9 @@ static const nir_shader_compiler_options agx_nir_options = {
    .discard_is_demote = true,
    .scalarize_ddx = true,
    .io_options = nir_io_always_interpolate_convergent_fs_inputs,
+   /* Match hk_physical_device's maxComputeWorkGroupCount / Invocations (Gallium
+    * caps all axes at 65535), letting range analysis prove Y/Z (and 1-wide X)
+    * global_invocation_id bounds <= INT32_MAX. */
+   .max_workgroup_invocations = 1024,
+   .max_workgroup_count = {0x7fffffff, 65535, 65535},
 };
