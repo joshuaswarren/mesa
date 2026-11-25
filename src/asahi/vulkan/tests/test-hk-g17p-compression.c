@@ -1071,22 +1071,21 @@ check_g16g_hal200_compression(void)
       CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &bad));
    }
 
-   /* 1-8 byte MRT/colour targets: 1x, layered, cube, 3D, and input attachments
-    * compress on G16G; 2x/4x MSAA colour stays plain on G16G and compresses on
-    * G17P (AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION); R11G11B10F and storage stay
-    * plain on both. */
+   /* 1-8 byte MRT/colour targets: 1x, 2x/4x MSAA, layered, cube, 3D, and input
+    * attachments compress across native HAL200 (G16G and G17P); R11G11B10F and
+    * storage stay plain on both. */
    for (unsigned f = 0; f < sizeof(mrt4_formats) / sizeof(mrt4_formats[0]); ++f) {
       VkImageCreateInfo c = image(mrt4_formats[f], 1920, 1080, 1, color_usage);
       CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &c));
       c.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
       CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &c));
       c.samples = VK_SAMPLE_COUNT_2_BIT;
-      CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &c));
+      CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &c));
       CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, AGX_CHIP_ID_A18_PRO,
                                            0, &c));
       c.samples = VK_SAMPLE_COUNT_4_BIT;
       c.arrayLayers = 4;
-      CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &c));
+      CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &c));
       CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, AGX_CHIP_ID_A18_PRO,
                                            0, &c));
       c.usage |= VK_IMAGE_USAGE_STORAGE_BIT;

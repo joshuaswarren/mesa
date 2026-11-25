@@ -28,11 +28,9 @@
  *    and 3D single-sample, plus 16-byte texels
  *    (R32G32B32A32_{UINT,SINT,SFLOAT}) for single-sample 2D (single-layer,
  *    arrays, and cubemaps). The 1-8 byte 2x/4x MSAA variants (attachments,
- *    arrays, input attachments, multiview) are gated separately by
- *    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION (G17P): their Gen9 encodings are
- *    identical across G16G and G17P but the --jobs 4 full CTS still witnesses
- *    intermittent PBE unmapped reads under diff_layout_copy_before_resolving
- *    on G16G, so a measurement on one AGX3B part does not imply the other.
+ *    arrays, input attachments, multiview) are gated by
+ *    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION (G16G and G17P), sharing the Gen9
+ *    PBE/texture/AIL metadata encodings and per-layer compressed resolve split.
  *    Any spilled compressed colour attachment is decompressed in-place before
  *    the render pass via libagx_agx3_decompress /
  *    libagx_reset_compression_metadata (with emrt_texture packed uncompressed
@@ -313,9 +311,7 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
       return false;
 
    /* 1-8B 2x/4x MSAA colour is gated by AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION
-    * (G17P), separately from the 1x and depth shapes above: the --jobs 4 full
-    * CTS witnesses intermittent diff_layout_copy_before_resolving PBE unmapped
-    * reads on G16G which stay unresolved pending triage. */
+    * across native HAL200 parts (G16G and G17P). */
    if (color && multisampled &&
        !agx_chip_has_cap(chip, AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION))
       return false;
