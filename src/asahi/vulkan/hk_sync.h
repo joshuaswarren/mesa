@@ -273,8 +273,11 @@ struct hk_sync_xfer_dst {
 struct hk_sync_stream {
    /* Recording order. Equal to list order for every pair the tracking
     * compares: a pre-graphics stream takes the number reserved just below
-    * its render so it sorts before it, where the list places it. */
+    * its render so it sorts before it, where the list places it. Multiple
+    * pre-graphics streams ahead of the same render break ties by pre_seq. */
    uint32_t seq;
+   uint32_t pre_seq;
+   uint32_t pre_count;
 
    /* The latest HK_SYNC_GFX_MEM stream on this stream's subqueue recorded
     * before it. */

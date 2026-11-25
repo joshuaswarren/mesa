@@ -4700,6 +4700,314 @@ hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    return hk_upload_usc_words_internal(cmd, s, linked);
 }
 
+static bool
+hk_g18_prepare_precomp_launch(
+   struct hk_cmd_buffer *cmd, enum libagx_program idx,
+   struct agx_precompiled_shader *prog, const void *data, size_t data_size,
+   struct agx3_compute_program *launch_out,
+   struct drm_asahi_g18_compute_resources *res_out)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const uint32_t scratch_bytes =
+      MAX3(prog->info.scratch_size, prog->info.agx3_spectpr_scratch_size,
+           prog->info.agx3_tps_size);
+   const uint32_t max_spill = 1u << 16;
+   const uint32_t shared_bytes =
+      prog->info.local_size
+         ? MAX2(256u, ALIGN_POT(prog->info.local_size * 4u, 64u))
+         : 0;
+   if (!prog->bo || !prog->info.main_size || !prog->info.nr_gprs ||
+       prog->info.nr_preamble_gprs || scratch_bytes > max_spill ||
+       shared_bytes > 32768u ||
+       (prog->info.rodata.size_16 && !prog->rodata_offset) ||
+       (prog->info.printf_uniform &&
+        prog->info.printf_uniform < AGX_ABI_AGX3_PRECOMP_ARG_HALFS) ||
+       !prog->info.agx3_staging_known || !data || !data_size ||
+       data_size > UINT16_MAX * 2u ||
+       prog->entry_offset > UINT64_MAX - prog->ptr ||
+       !prog->b.workgroup.x || !prog->b.workgroup.y ||
+       !prog->b.workgroup.z) {
+      mesa_loge("hk: refusing precompiled G18G program %u shape "
+                "(preamble_gprs=%u scratch=%u tps=%u local=%u "
+                "staging_known=%u)",
+                idx, prog->info.nr_preamble_gprs, scratch_bytes,
+                prog->info.agx3_tps_size, prog->info.local_size,
+                prog->info.agx3_staging_known);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+
+   const size_t printf_offset =
+      prog->info.printf_uniform
+         ? (size_t)(prog->info.printf_uniform -
+                    AGX_ABI_AGX3_PRECOMP_ARG_HALFS) * 2
+         : 0;
+   const size_t upload_size =
+      ALIGN_POT(prog->info.printf_uniform
+                   ? MAX2(data_size, printf_offset + 8)
+                   : data_size, 4);
+   struct agx_ptr uploaded = hk_pool_alloc(cmd, upload_size, 4);
+   if (!uploaded.cpu || upload_size / 2 > UINT16_MAX) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   memcpy(uploaded.cpu, data, data_size);
+   memset((uint8_t *)uploaded.cpu + data_size, 0, upload_size - data_size);
+   if (prog->info.printf_uniform)
+      memcpy((uint8_t *)uploaded.cpu + printf_offset,
+             &dev->dev.printf_buffer_address, sizeof(uint64_t));
+   struct agx3_ioto_uniform_range ranges[2] = {0};
+   unsigned range_count = 0;
+   ranges[range_count++] = (struct agx3_ioto_uniform_range){
+      .start_halfs = AGX_ABI_AGX3_PRECOMP_ARG_HALFS,
+      .size_halfs = upload_size / 2,
+      .address = uploaded.gpu,
+   };
+   if (prog->info.rodata.size_16) {
+      ranges[range_count++] = (struct agx3_ioto_uniform_range){
+         .start_halfs = prog->info.rodata.base_uniform,
+         .size_halfs = prog->info.rodata.size_16,
+         .address = prog->ptr + prog->rodata_offset,
+      };
+   }
+
+   struct agx_ptr program_t = hk_pool_usc_alloc(
+      cmd, AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE, AGX_IOTO_PROGRAM_ALIGNMENT);
+   if (!program_t.cpu) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   if (!agx_va_in_usc_window(&dev->dev, program_t.gpu) ||
+       !agx_va_in_usc_window(&dev->dev, prog->ptr + prog->entry_offset)) {
+      mesa_loge("hk: G18G helper %u: program %" PRIx64 " or entry %" PRIx64
+                " outside the USC window (base %" PRIx64 ")",
+                idx, (uint64_t)program_t.gpu,
+                (uint64_t)(prog->ptr + prog->entry_offset),
+                (uint64_t)dev->dev.shader_base);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_UNKNOWN);
+      return false;
+   }
+   const struct agx3_g17p_graphics_program_desc desc = {
+      .program_va = program_t.gpu,
+      .shader_va = prog->ptr + prog->entry_offset,
+      .uniform_ranges = ranges,
+      .uniform_range_count = range_count,
+      .shader_binary_size = prog->info.main_size,
+      .scratch_size = scratch_bytes,
+      .nr_gprs = prog->info.nr_gprs,
+      .compiler_d_valid = prog->info.agx3_staging_known,
+      .compiler_d = (uint32_t)prog->info.agx3_staging_halfs * 2,
+      .threadgroup_memory_size_B = shared_bytes,
+   };
+   struct agx3_g17p_graphics_program generated;
+   if (!agx3_g18g_compute_program_generate(&desc, &generated) ||
+       generated.length > AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE) {
+      mesa_loge("hk: G18G compute program %u generation failed", idx);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+   struct util_dynarray code;
+   util_dynarray_init(&code, NULL);
+   memcpy(util_dynarray_grow_bytes(&code, 1, generated.length),
+          generated.bytes, generated.length);
+   const struct agx3_transcode_ioto ioto = {
+      .api_program = true,
+      .shader_gprs = prog->info.nr_gprs,
+   };
+   const char *why = NULL;
+   unsigned at = 0;
+   const bool ok = agx3_transcode_agx3d_ioto(&code, 0, &ioto, &why, &at) &&
+                   code.size <= AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE;
+   if (!ok) {
+      mesa_loge("hk: G18G compute program %u not re-encoded: %s at +0x%x", idx,
+                why ? why : "too long", at);
+      util_dynarray_fini(&code);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+   memcpy(program_t.cpu, code.data, code.size);
+   util_dynarray_fini(&code);
+
+   struct agx3_g17p_native_compute_program_desc bind_desc = {
+      .chip = AGX_CHIP_G17G,
+      .program_va = program_t.gpu,
+      .shader_va = prog->ptr + prog->entry_offset,
+   };
+   if (!agx3_cdm_direct_template_sources_compute(false, false, false,
+                                                 &bind_desc.launch_sources) ||
+       !agx3_g17g_native_compute_program_bind(&bind_desc, launch_out)) {
+      mesa_loge("hk: G18G compute program %u bind failed", idx);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+   if (prog->info.local_size)
+      launch_out->launch_template.word0 |= UINT32_C(1) << 23;
+
+   const uint32_t main_scratch =
+      MAX2(prog->info.scratch_size, prog->info.agx3_tps_size);
+   *res_out = (struct drm_asahi_g18_compute_resources){
+      .version = 1,
+      .flags = 1u,
+      .registers_16 = prog->info.nr_gprs,
+      .scratch_bytes = main_scratch,
+      .spectpr_scratch_bytes = prog->info.agx3_spectpr_scratch_size,
+      .staging_16 = prog->info.agx3_staging_halfs,
+      .local_bytes = prog->info.local_size,
+      .imageblock_stride = prog->info.imageblock_stride,
+      .local_size = {prog->b.workgroup.x, prog->b.workgroup.y,
+                     prog->b.workgroup.z},
+   };
+   return true;
+}
+
+bool
+hk_g18_emit_indirect_launch(
+   struct hk_cmd_buffer *cmd, struct hk_cs **target,
+   const struct agx3_compute_program *launch, struct agx_grid grid,
+   struct agx_workgroup local_size,
+   const struct drm_asahi_g18_compute_resources *target_res)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!agx_is_indirect(grid) || !grid.ptr || !launch || !target || !target_res) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+
+   /* Build the 48-byte direct CDM template (40B launch + 4B strong barrier +
+    * 4B terminate) with 3D bits preserved; libagx_g18_indirect_launch clears
+    * them when global_y < 2 && global_z < 2. */
+   uint32_t tmpl[12] = {0};
+   struct agx3_compute_dispatch_sink tmpl_sink = {
+      .data = (uint8_t *)tmpl,
+      .capacity = sizeof(tmpl),
+   };
+   const struct agx3_compute_direct_grid dummy_3d = {
+      .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
+      .size = {2, 2, 2},
+      .local_size = {1, 1, 1},
+      .dimensions = 3,
+   };
+   uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
+   if (!agx3_g17g_native_compute_dispatch_append(launch, &dummy_3d, 5,
+                                                 &tmpl_sink) ||
+       !agx3_cdm_stream_terminate_pack(dev->dev.chip, terminate) ||
+       tmpl_sink.length != 44) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+   memcpy((uint8_t *)tmpl + 44, terminate, sizeof(terminate));
+
+   /* Build the 48-byte 1-thread no-op fallback launch for zero grids so G18
+    * CDM never sees an empty or zero-dimension dispatch. */
+   struct agx_precompiled_shader *noop_prog =
+      agx_get_precompiled(&dev->bg_eot, LIBAGX_G18_NOOP);
+   if (!noop_prog) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+   struct agx_ptr scratch = hk_pool_alloc(cmd, 16, 16);
+   if (!scratch.gpu) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   struct agx3_compute_program noop_launch;
+   struct drm_asahi_g18_compute_resources noop_res;
+   if (!hk_g18_prepare_precomp_launch(cmd, LIBAGX_G18_NOOP, noop_prog,
+                                      &scratch.gpu, sizeof(scratch.gpu),
+                                      &noop_launch, &noop_res))
+      return false;
+   noop_launch.launch_template.word0 &= UINT32_C(0xfff1ffff);
+
+   uint32_t noop_tmpl[12] = {0};
+   struct agx3_compute_dispatch_sink noop_sink = {
+      .data = (uint8_t *)noop_tmpl,
+      .capacity = sizeof(noop_tmpl),
+   };
+   const struct agx3_compute_direct_grid noop_direct = {
+      .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
+      .size = {1, 1, 1},
+      .local_size = {1, 1, 1},
+      .dimensions = 1,
+   };
+   if (!agx3_g17g_native_compute_dispatch_append(&noop_launch, &noop_direct, 5,
+                                                 &noop_sink) ||
+       noop_sink.length != 44) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+   memcpy((uint8_t *)noop_tmpl + 44, terminate, sizeof(terminate));
+
+   const uint64_t tmpl_gpu = hk_pool_upload(cmd, tmpl, sizeof(tmpl), 16);
+   const uint64_t noop_gpu =
+      hk_pool_upload(cmd, noop_tmpl, sizeof(noop_tmpl), 16);
+   struct agx_ptr stream_mem =
+      hk_pool_cs_alloc(cmd, hk_cs_root_size(dev->dev.chip, true), 1024);
+   if (!tmpl_gpu || !noop_gpu || !stream_mem.cpu) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   memcpy(stream_mem.cpu, noop_tmpl, sizeof(noop_tmpl));
+   memset((uint8_t *)stream_mem.cpu + sizeof(noop_tmpl), 0,
+          HK_CS_SPACE_PADDING);
+
+   const enum agx_barrier helper_barrier =
+      AGX_BARRIER_ALL |
+      (target == &cmd->current_cs.pre_gfx    ? AGX_PREGFX
+       : target == &cmd->current_cs.post_gfx ? AGX_POSTGFX
+                                             : 0);
+   libagx_g18_indirect_launch(cmd, agx_1d(1), helper_barrier, grid.ptr,
+                              tmpl_gpu, noop_gpu, stream_mem.gpu, local_size.x,
+                              local_size.y, local_size.z,
+                              grid.mode == AGX_CDM_MODE_INDIRECT_LOCAL ? 1u : 0u);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return false;
+
+   struct hk_cs *helper_cs = *target;
+   struct hk_cs *exec_cs = hk_cs_create_at(cmd, true, stream_mem);
+   if (!exec_cs) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return false;
+   }
+   if (target == &cmd->current_cs.pre_gfx && cmd->current_cs.gfx) {
+      list_addtail(&exec_cs->node, &cmd->current_cs.gfx->node);
+   } else {
+      list_addtail(&exec_cs->node, &cmd->control_streams);
+   }
+   *target = exec_cs;
+   hk_sync_stream_created(cmd, exec_cs, target, true);
+   if (helper_cs) {
+      exec_cs->sync.dep[HK_SYNC_CDM].cut =
+         hk_sync_later(exec_cs->sync.dep[HK_SYNC_CDM].cut, helper_cs);
+      exec_cs->sync.dep_ta[HK_SYNC_CDM].cut =
+         hk_sync_later(exec_cs->sync.dep_ta[HK_SYNC_CDM].cut, helper_cs);
+   }
+   exec_cs->current = (uint8_t *)exec_cs->current + sizeof(tmpl);
+   exec_cs->stats.cmds = 1;
+   exec_cs->g18_dispatch_sealed = true;
+
+   struct drm_asahi_g18_compute_resources exec_res = *target_res;
+   exec_res.registers_16 = MAX2(exec_res.registers_16, noop_res.registers_16);
+   exec_res.scratch_bytes =
+      MAX2(exec_res.scratch_bytes, noop_res.scratch_bytes);
+   exec_res.spectpr_scratch_bytes =
+      MAX2(exec_res.spectpr_scratch_bytes, noop_res.spectpr_scratch_bytes);
+   exec_res.staging_16 = MAX2(exec_res.staging_16, noop_res.staging_16);
+   if (grid.mode == AGX_CDM_MODE_INDIRECT_LOCAL) {
+      exec_res.flags = (1u << 0) | (1u << 3);
+      exec_res.local_size[0] = 0;
+      exec_res.local_size[1] = 0;
+      exec_res.local_size[2] = 0;
+   } else {
+      exec_res.flags = (1u << 0);
+      exec_res.local_size[0] = local_size.x;
+      exec_res.local_size[1] = local_size.y;
+      exec_res.local_size[2] = local_size.z;
+   }
+   exec_cs->g18_compute_resources = exec_res;
+   hk_cmd_buffer_retain_bo(cmd, noop_prog->bo);
+   return true;
+}
+
 void
 hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
                     enum agx_barrier barrier, enum libagx_program idx,
@@ -4726,16 +5034,27 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    }
 
    if (dev->dev.chip == AGX_CHIP_G18G) {
-      /* M5 compute launch (the grounded Gallium agx_launch_precomp_m5
-       * shape): a per-dispatch Ioto program re-encoded as agx3d, the
-       * native direct CDM record, and one terminated dispatch per
-       * command stream. Separate from any prior non-empty user stream
-       * so precomp's version=1 shared-memory metadata never mixes with or
-       * overwrites an earlier version=2 launch. */
       struct hk_cs **target =
          (barrier & AGX_POSTGFX)  ? &cmd->current_cs.post_gfx
          : (barrier & AGX_PREGFX) ? &cmd->current_cs.pre_gfx
                                   : &cmd->current_cs.cs;
+      if (!agx_is_indirect(grid) &&
+          (!grid.count[0] || !grid.count[1] || !grid.count[2]))
+         return;
+
+      struct agx3_compute_program launch;
+      struct drm_asahi_g18_compute_resources prog_res;
+      if (!hk_g18_prepare_precomp_launch(cmd, idx, prog, data, data_size,
+                                         &launch, &prog_res))
+         return;
+
+      if (agx_is_indirect(grid)) {
+         if (hk_g18_emit_indirect_launch(cmd, target, &launch, grid,
+                                         prog->b.workgroup, &prog_res))
+            hk_cmd_buffer_retain_bo(cmd, prog->bo);
+         return;
+      }
+
       if (*target && (*target)->stats.cmds > 0 &&
           !(*target)->g18_dispatch_sealed && (*target)->imm_writes.size == 0)
          *target = NULL;
@@ -4743,171 +5062,15 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       if (!cs)
          return;
 
-      const uint32_t scratch_bytes =
-         MAX3(prog->info.scratch_size, prog->info.agx3_spectpr_scratch_size,
-              prog->info.agx3_tps_size);
-      const uint32_t max_spill = 1u << 16;
       const uint32_t shared_bytes =
          prog->info.local_size
             ? MAX2(256u, ALIGN_POT(prog->info.local_size * 4u, 64u))
             : 0;
-      if (!prog->bo || !prog->info.main_size || !prog->info.nr_gprs ||
-          prog->info.nr_preamble_gprs || scratch_bytes > max_spill ||
-          shared_bytes > 32768u ||
-          (prog->info.rodata.size_16 && !prog->rodata_offset) ||
-          (prog->info.printf_uniform &&
-           prog->info.printf_uniform < AGX_ABI_AGX3_PRECOMP_ARG_HALFS) ||
-          !prog->info.agx3_staging_known || !data || !data_size ||
-          data_size > UINT16_MAX * 2u ||
-          prog->entry_offset > UINT64_MAX - prog->ptr ||
-          !prog->b.workgroup.x || !prog->b.workgroup.y ||
-          !prog->b.workgroup.z ||
-          agx_is_indirect(grid) ||
-          !grid.count[0] || !grid.count[1] || !grid.count[2]) {
-         mesa_loge("hk: refusing precompiled G18G program %u shape "
-                   "(preamble_gprs=%u scratch=%u tps=%u local=%u "
-                   "staging_known=%u indirect=%u)",
-                   idx, prog->info.nr_preamble_gprs, scratch_bytes,
-                   prog->info.agx3_tps_size, prog->info.local_size,
-                   prog->info.agx3_staging_known, agx_is_indirect(grid));
-         vk_command_buffer_set_error(&cmd->vk,
-                                     VK_ERROR_FEATURE_NOT_PRESENT);
-         return;
-      }
-
-      /* Uniform ranges: rebased arguments above the hardware ABI halves,
-       * then promoted constants (agx_precomp_agx3_uniform_ranges). */
-      const size_t printf_offset =
-         prog->info.printf_uniform
-            ? (size_t)(prog->info.printf_uniform -
-                       AGX_ABI_AGX3_PRECOMP_ARG_HALFS) * 2
-            : 0;
-      const size_t upload_size =
-         ALIGN_POT(prog->info.printf_uniform
-                      ? MAX2(data_size, printf_offset + 8)
-                      : data_size, 4);
-      struct agx_ptr uploaded = hk_pool_alloc(cmd, upload_size, 4);
-      if (!uploaded.cpu || upload_size / 2 > UINT16_MAX) {
-         vk_command_buffer_set_error(&cmd->vk,
-                                     VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         return;
-      }
-      memcpy(uploaded.cpu, data, data_size);
-      memset((uint8_t *)uploaded.cpu + data_size, 0,
-             upload_size - data_size);
-      if (prog->info.printf_uniform)
-         memcpy((uint8_t *)uploaded.cpu + printf_offset,
-                &dev->dev.printf_buffer_address, sizeof(uint64_t));
-      struct agx3_ioto_uniform_range ranges[2] = {0};
-      unsigned range_count = 0;
-      ranges[range_count++] = (struct agx3_ioto_uniform_range){
-         .start_halfs = AGX_ABI_AGX3_PRECOMP_ARG_HALFS,
-         .size_halfs = upload_size / 2,
-         .address = uploaded.gpu,
-      };
-      if (prog->info.rodata.size_16) {
-         ranges[range_count++] = (struct agx3_ioto_uniform_range){
-            .start_halfs = prog->info.rodata.base_uniform,
-            .size_halfs = prog->info.rodata.size_16,
-            .address = prog->ptr + prog->rodata_offset,
-         };
-      }
-
-      /* The Ioto program must lie in the USC window (checked below).  The main
-       * command pool is not allocated LOW_VA, so its addresses never are:
-       * every G18G precompiled-helper dispatch used to fail here with
-       * VK_ERROR_UNKNOWN at vkEndCommandBuffer.  Use the USC pool. */
-      struct agx_ptr program_t = hk_pool_usc_alloc(
-         cmd, AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE,
-         AGX_IOTO_PROGRAM_ALIGNMENT);
-      if (!program_t.cpu) {
-         vk_command_buffer_set_error(&cmd->vk,
-                                     VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         return;
-      }
-      if (!agx_va_in_usc_window(&dev->dev, program_t.gpu) ||
-          !agx_va_in_usc_window(&dev->dev,
-                                prog->ptr + prog->entry_offset)) {
-         mesa_loge("hk: G18G helper %u: program %" PRIx64 " or entry %" PRIx64
-                   " outside the USC window (base %" PRIx64 ")",
-                   idx, (uint64_t)program_t.gpu,
-                   (uint64_t)(prog->ptr + prog->entry_offset),
-                   (uint64_t)dev->dev.shader_base);
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_UNKNOWN);
-         return;
-      }
-      const struct agx3_g17p_graphics_program_desc desc = {
-         .program_va = program_t.gpu,
-         .shader_va = prog->ptr + prog->entry_offset,
-         .uniform_ranges = ranges,
-         .uniform_range_count = range_count,
-         .shader_binary_size = prog->info.main_size,
-         .scratch_size = scratch_bytes,
-         .nr_gprs = prog->info.nr_gprs,
-         .compiler_d_valid = prog->info.agx3_staging_known,
-         .compiler_d = (uint32_t)prog->info.agx3_staging_halfs * 2,
-         .threadgroup_memory_size_B = shared_bytes,
-      };
-      struct agx3_g17p_graphics_program generated;
-      if (!agx3_g18g_compute_program_generate(&desc, &generated) ||
-          generated.length > AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE) {
-         mesa_loge("hk: G18G compute program %u generation failed", idx);
-         vk_command_buffer_set_error(&cmd->vk,
-                                     VK_ERROR_FEATURE_NOT_PRESENT);
-         return;
-      }
-      struct util_dynarray code;
-      util_dynarray_init(&code, NULL);
-      memcpy(util_dynarray_grow_bytes(&code, 1, generated.length),
-             generated.bytes, generated.length);
-      const struct agx3_transcode_ioto ioto = {
-         .api_program = true,
-         .shader_gprs = prog->info.nr_gprs,
-      };
-      const char *why = NULL;
-      unsigned at = 0;
-      const bool ok =
-         agx3_transcode_agx3d_ioto(&code, 0, &ioto, &why, &at) &&
-         code.size <= AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE;
-      if (!ok) {
-         mesa_loge("hk: G18G compute program %u not re-encoded: %s at "
-                   "+0x%x", idx, why ? why : "too long", at);
-         util_dynarray_fini(&code);
-         vk_command_buffer_set_error(&cmd->vk,
-                                     VK_ERROR_FEATURE_NOT_PRESENT);
-         return;
-      }
-      memcpy(program_t.cpu, code.data, code.size);
-      util_dynarray_fini(&code);
-
-      struct agx3_g17p_native_compute_program_desc bind_desc = {
-         .chip = AGX_CHIP_G17G,
-         .program_va = program_t.gpu,
-         .shader_va = prog->ptr + prog->entry_offset,
-      };
-      struct agx3_compute_program launch;
-      if (!agx3_cdm_direct_template_sources_compute(false, false, false,
-                                                    &bind_desc.launch_sources) ||
-          !agx3_g17g_native_compute_program_bind(&bind_desc, &launch)) {
-         mesa_loge("hk: G18G compute program %u bind failed", idx);
-         vk_command_buffer_set_error(&cmd->vk,
-                                     VK_ERROR_FEATURE_NOT_PRESENT);
-         return;
-      }
-      /* w7C/w7P: the helper's identity and size, for the stream decodes. */
-      mesa_logi("hk: G18G precomp helper %u dispatch: main_size=%u "
-                "generated=%u grid=%ux%ux%u wg=%ux%ux%u",
-                idx, prog->info.main_size, (unsigned)generated.length,
-                grid.count[0], grid.count[1], grid.count[2],
-                prog->b.workgroup.x, prog->b.workgroup.y,
-                prog->b.workgroup.z);
       hk_ensure_cs_has_space(cmd, cs, 0x200);
       struct agx3_compute_dispatch_sink sink = {
          .data = cs->current,
          .capacity = (size_t)((uint8_t *)cs->end - (uint8_t *)cs->current),
       };
-      /* G18G's only grounded post-dispatch barrier word is the flag-free
-       * form the dispatcher embeds. */
       const struct agx3_compute_direct_grid direct = {
          .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
          .size = {grid.count[0], grid.count[1], grid.count[2]},
@@ -4919,17 +5082,8 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
                                 ? 2
                                 : 1),
       };
-      /* rel29: the helper joins an open batch with the SAME strong (flags=5)
-       * barrier the user launches use — the stall signature had the helper's
-       * weak 0x60000160 as the Nth (>=10th) launch's tail word, and user
-       * batches of 16 pass when the helper is sealed away (rel28b), so the
-       * weak barrier mid-batch at position >=10 is the suspect, not the
-       * launch count. */
-      if (prog->info.local_size) {
-         if (direct.size[1] < 2 && direct.size[2] < 2)
-            launch.launch_template.word0 &= UINT32_C(0xfff1ffff);
-         launch.launch_template.word0 |= UINT32_C(1) << 23;
-      }
+      if (prog->info.local_size && direct.size[1] < 2 && direct.size[2] < 2)
+         launch.launch_template.word0 &= UINT32_C(0xfff1ffff);
       const bool launched = agx3_g17g_native_compute_dispatch_append(
          &launch, &direct, 5, &sink);
       uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
@@ -4948,21 +5102,8 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       const bool had_cmds = cs->stats.cmds > 0;
       cs->stats.cmds++;
       cs->g18_dispatch_sealed = true;
-      const uint32_t main_scratch =
-         MAX2(prog->info.scratch_size, prog->info.agx3_tps_size);
       if (!had_cmds) {
-         cs->g18_compute_resources = (struct drm_asahi_g18_compute_resources){
-            .version = 1,
-            .flags = 1u,
-            .registers_16 = prog->info.nr_gprs,
-            .scratch_bytes = main_scratch,
-            .spectpr_scratch_bytes = prog->info.agx3_spectpr_scratch_size,
-            .staging_16 = prog->info.agx3_staging_halfs,
-            .local_bytes = prog->info.local_size,
-            .imageblock_stride = prog->info.imageblock_stride,
-            .local_size = {prog->b.workgroup.x, prog->b.workgroup.y,
-                           prog->b.workgroup.z},
-         };
+         cs->g18_compute_resources = prog_res;
       } else {
          const uint32_t prod = prog->b.workgroup.x * prog->b.workgroup.y *
                                prog->b.workgroup.z;
@@ -4970,23 +5111,23 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
                                     cs->g18_compute_resources.local_size[1] *
                                     cs->g18_compute_resources.local_size[2];
          cs->g18_compute_resources.registers_16 =
-            MAX2(cs->g18_compute_resources.registers_16, prog->info.nr_gprs);
+            MAX2(cs->g18_compute_resources.registers_16, prog_res.registers_16);
          cs->g18_compute_resources.scratch_bytes =
-            MAX2(cs->g18_compute_resources.scratch_bytes, main_scratch);
+            MAX2(cs->g18_compute_resources.scratch_bytes,
+                 prog_res.scratch_bytes);
          cs->g18_compute_resources.spectpr_scratch_bytes =
             MAX2(cs->g18_compute_resources.spectpr_scratch_bytes,
-                 prog->info.agx3_spectpr_scratch_size);
+                 prog_res.spectpr_scratch_bytes);
          cs->g18_compute_resources.staging_16 =
-            MAX2(cs->g18_compute_resources.staging_16,
-                 prog->info.agx3_staging_halfs);
+            MAX2(cs->g18_compute_resources.staging_16, prog_res.staging_16);
          const uint32_t helper_local =
             cs->g18_compute_resources.version == 2 ? shared_bytes
-                                                   : prog->info.local_size;
+                                                   : prog_res.local_bytes;
          cs->g18_compute_resources.local_bytes =
             MAX2(cs->g18_compute_resources.local_bytes, helper_local);
          cs->g18_compute_resources.imageblock_stride =
             MAX2(cs->g18_compute_resources.imageblock_stride,
-                 prog->info.imageblock_stride);
+                 prog_res.imageblock_stride);
          if (prod >= prev_prod) {
             cs->g18_compute_resources.local_size[0] = prog->b.workgroup.x;
             cs->g18_compute_resources.local_size[1] = prog->b.workgroup.y;

@@ -1777,7 +1777,9 @@ hk_sync_later(struct hk_cs *a, struct hk_cs *b)
       return b;
    if (!b)
       return a;
-   return b->sync.seq > a->sync.seq ? b : a;
+   if (b->sync.seq != a->sync.seq)
+      return b->sync.seq > a->sync.seq ? b : a;
+   return b->sync.pre_seq > a->sync.pre_seq ? b : a;
 }
 
 /* Whether the vertex program of a draw is published as an AGX3 VDM State
@@ -3635,6 +3637,11 @@ void hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
 void hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
                             enum agx_barrier barrier, enum libagx_program idx,
                             const void *data, size_t data_size);
+bool hk_g18_emit_indirect_launch(
+   struct hk_cmd_buffer *cmd, struct hk_cs **target,
+   const struct agx3_compute_program *launch, struct agx_grid grid,
+   struct agx_workgroup local_size,
+   const struct drm_asahi_g18_compute_resources *target_res);
 void hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
                               enum agx_barrier barrier,
                               enum libagx_program idx, const void *data,
