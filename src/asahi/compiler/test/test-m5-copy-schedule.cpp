@@ -30,6 +30,7 @@ copy_shader_init(copy_shader *s, mesa_shader_stage stage, bool loop)
    s->key.dev.chip = AGX_CHIP_G17S;
    s->b = agx_test_builder(s->mem);
    s->b->shader->key = &s->key;
+   s->b->shader->out = rzalloc(s->mem, agx_shader_info);
    s->b->shader->stage = stage;
    s->b->shader->nir = rzalloc(s->mem, nir_shader);
    s->b->shader->nir->info.stage = stage;
@@ -189,11 +190,11 @@ TEST(M5CopySchedule, LoopConstantsRematerializedInBody)
    ralloc_free(s.mem);
 }
 
-TEST(M5CopySchedule, OtherGenerationsUnchanged)
+TEST(M5CopySchedule, LegacyISAIsUnchanged)
 {
    copy_shader s;
    copy_shader_init(&s, MESA_SHADER_VERTEX, false);
-   s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   s.key.dev.encoding = AGX_ISA_ENCODING_AGX2;
    s.key.dev.chip = AGX_CHIP_G17P;
    emit_copies(&s, 8, true);
    agx_ilp_schedule(s.b->shader);
@@ -202,6 +203,22 @@ TEST(M5CopySchedule, OtherGenerationsUnchanged)
    EXPECT_EQ(loads_before_first_write(s.body), 1u);
    EXPECT_EQ(max_reads_in_flight(s.body, &first_write), 1u);
    ralloc_free(s.mem);
+}
+
+TEST(M5CopySchedule, AGX3BVertexReadsIssueAheadOfWrites)
+{
+   for (bool reorderable : {false, true}) {
+      SCOPED_TRACE(reorderable);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_VERTEX, false);
+      s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      s.key.dev.chip = AGX_CHIP_G17P;
+      emit_copies(&s, 8, reorderable);
+      agx_ilp_schedule(s.b->shader);
+
+      EXPECT_EQ(loads_before_first_write(s.body), reorderable ? 4u : 1u);
+      ralloc_free(s.mem);
+   }
 }
 
 /* M5 compute device loads issue ahead of their uses, as samples do. */
@@ -225,6 +242,21 @@ TEST(M5CopySchedule, G18GComputeDeviceLoadsKeepTheirOrder)
    emit_load_uses(&s, 6);
    agx_ilp_schedule(s.b->shader);
    EXPECT_EQ(loads_before_first_add(s.body), 1u);
+   ralloc_free(s.mem);
+}
+
+/* G18G compute blocks taking the sample-hoist path still need size16 allocated
+ * for ilp_block_peak() even when shared_compute_loads is disabled. */
+TEST(M5CopySchedule, G18GComputeCopyLoopMeasuresPeakWithoutCrash)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, true);
+   s.key.dev.chip = AGX_CHIP_G17G;
+   s.key.dev.emit_agx3d = true;
+   emit_copies(&s, 4, true);
+   agx_ilp_schedule(s.b->shader);
+   unsigned first_write = 0;
+   EXPECT_GT(max_reads_in_flight(s.body, &first_write), 1u);
    ralloc_free(s.mem);
 }
 
@@ -305,14 +337,34 @@ TEST(M5CopySchedule, ComputeDeviceLoadsStayBoundedInFlight)
 
 /* Near the top of an occupancy step there is no room for a vec4 load's
  * result ahead of its use: the loads keep their order. */
-TEST(M5CopySchedule, ComputeDeviceLoadsStayInsideTheOccupancyStep)
+TEST(M5CopySchedule, TraversalDeviceLoadsStayInsideTheOccupancyStep)
 {
    copy_shader s;
    copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   s.b->shader->out->uses_ray_traversal = true;
    emit_wide_load_uses(&s, 8, 4, 46);
    agx_ilp_schedule(s.b->shader);
    EXPECT_EQ(max_device_loads_in_flight(s.body), 1u);
    ralloc_free(s.mem);
+}
+
+/* These vec4 loads straddle a legacy occupancy boundary. Both files have
+ * room to overlap them under Dynamic Caching. */
+TEST(M5CopySchedule, DynamicCachingDeviceLoadsCrossAnOccupancyBoundary)
+{
+   for (auto encoding : {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      SCOPED_TRACE(encoding);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.key.dev.encoding = encoding;
+      s.key.dev.chip = encoding == AGX_ISA_ENCODING_AGX3B
+                         ? AGX_CHIP_G17P : AGX_CHIP_G17S;
+      emit_wide_load_uses(&s, 8, 4, 46);
+      agx_ilp_schedule(s.b->shader);
+      EXPECT_GE(max_device_loads_in_flight(s.body), 2u);
+      EXPECT_LE(max_device_loads_in_flight(s.body), 4u);
+      ralloc_free(s.mem);
+   }
 }
 
 /* The headroom rule at its edges: at least 16 halves free below the top of
@@ -344,6 +396,7 @@ TEST(M5CopySchedule, ComputeDeviceLoadWindowsFallBack)
       SCOPED_TRACE(live);
       copy_shader s;
       copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.b->shader->out->uses_ray_traversal = true;
       emit_wide_load_uses(&s, 8, 4, live);
       agx_ilp_schedule(s.b->shader);
       const unsigned in_flight = max_device_loads_in_flight(s.body);
@@ -369,6 +422,7 @@ TEST(M5CopySchedule, ComputeDeviceLoadsFollowTheProgramPeak)
       SCOPED_TRACE(heavy);
       copy_shader s;
       copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.b->shader->out->uses_ray_traversal = true;
       agx_builder *b = s.b;
       if (heavy) {
          agx_index held[46];

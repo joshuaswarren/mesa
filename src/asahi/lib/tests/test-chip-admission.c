@@ -381,6 +381,18 @@ main(void)
    bad = g15g;
    bad.features = (UINT64_C(1) << 3) | (UINT64_C(1) << 5);
    assert(!agx_params_native_kernel_abi_supported(&bad));
+   /* The shared g16 backend on T8122: VM status and independent queues
+    * plus the native contract, no scheduled queues (J615 feature word). */
+   bad = g15g;
+   bad.features = UINT64_C(0x10260005c06);
+   assert(agx_params_native_kernel_abi_supported(&bad));
+   bad.features &= ~DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
+   assert(!agx_params_native_kernel_abi_supported(&bad));
+   bad.features = UINT64_C(0x10260005c06) &
+                  ~DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
+   assert(!agx_params_native_kernel_abi_supported(&bad));
+   bad.features = UINT64_C(0x10260005c06) & ~DRM_ASAHI_FEATURE_VM_STATUS;
+   assert(!agx_params_native_kernel_abi_supported(&bad));
 
    bad = g15g;
    bad.chip_id = 0x6030;

@@ -24,17 +24,17 @@
  * ubershaders. It needs to be retuned in lockstep with changes to the cost
  * estimation heuristic.
  *
- * On G17P a group with every lane off still spends a cycle per instruction, so
- * TF3's short light paths pay for the jump: 5 is 4-6% faster than 19 there, and
- * 10, 5 and 2 are alike. M5 (G17G/G17S/G17C) fragment shaders share the lower
- * threshold, while M5 compute keeps COST_JMP so short bounds-checked kernels
- * do not emit spurious forward skips.
+ * On AGX3B a group with every lane off still spends a cycle per instruction, so
+ * short guarded paths pay for the jump: 5 is 4-6% faster than 19 there, and
+ * 10, 5 and 2 are alike. AGX3C fragment shaders share the lower threshold,
+ * while AGX3C compute keeps COST_JMP so short bounds-checked kernels do not
+ * emit spurious forward skips.
  */
 #define COST_JMP (19)
 #define COST_JMP_AGX3 (5)
 
 static uint32_t
-cost_instr(agx_instr *I)
+cost_instr(const agx_context *ctx, agx_instr *I)
 {
    /* TODO: Better heuristic */
    switch (I->op) {
@@ -43,6 +43,23 @@ cost_instr(agx_instr *I)
    case AGX_OPCODE_TEXTURE_LOAD:
    case AGX_OPCODE_TEXTURE_SAMPLE:
       return 50;
+   case AGX_OPCODE_RSQRT:
+   case AGX_OPCODE_SRSQRT:
+   case AGX_OPCODE_RCP:
+   case AGX_OPCODE_LOG2:
+   case AGX_OPCODE_EXP2:
+   case AGX_OPCODE_SIN_PT_1:
+   case AGX_OPCODE_SINC_AGX3:
+      /* AGX3 SFU transcendentals are much slower than regular FP32 ALU.
+       * Against COST_JMP (19) * inverse_probability (2) = 38, device load
+       * cost 10, and ALU cost 1, weighting SFU ops at 16 lets a guarded body
+       * with an SFU op plus a load and ~12+ ALU clear 38 and emit
+       * jmp_exec_none, while short bounds checks (e.g. 2 loads + 5 ALU = 25)
+       * and standalone SFU ops stay jump-free. */
+      return (agx_isa_is_agx3(ctx->key->dev.encoding) &&
+              !ctx->key->dev.emit_agx3d)
+                ? 16
+                : 1;
    default:
       return 1;
    }
@@ -83,7 +100,7 @@ cost_between(agx_context *ctx, agx_block *from, agx_instr *from_I,
             break;
 
          *must_skip |= testing_coverage_update(ctx, J);
-         cost += cost_instr(J);
+         cost += cost_instr(ctx, J);
       }
    }
 
@@ -103,7 +120,7 @@ cost_between(agx_context *ctx, agx_block *from, agx_instr *from_I,
             break;
 
          *must_skip |= testing_coverage_update(ctx, I);
-         cost += cost_instr(I);
+         cost += cost_instr(ctx, I);
       }
 
       if (block == target) {
@@ -153,9 +170,10 @@ try_insert_jmp(agx_context *ctx, agx_block *from, agx_instr *from_I,
       cost_between(ctx, from, from_I, target, skip_to_end_of_target, &must_skip);
 
    const bool low_cost_jmp =
-      ctx->key->dev.chip == AGX_CHIP_G17P ||
+      ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
       (ctx->stage == MESA_SHADER_FRAGMENT &&
-       agx_chip_g17_m5(ctx->key->dev.chip) && !agx_is_g18g(&ctx->key->dev));
+       ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !ctx->key->dev.emit_agx3d);
    const uint32_t cost_jmp = low_cost_jmp ? COST_JMP_AGX3 : COST_JMP;
    if (!must_skip && cost_instructions < cost_jmp * inverse_probability)
       return;

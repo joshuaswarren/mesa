@@ -52,10 +52,12 @@
 #include "asahi/genxml/agx_pack.h"
 #include "asahi/lib/agx3_cdm_decode_core.h"
 #include "asahi/lib/agx_tile_mip.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_xfb_info.h"
 #include "compiler/glsl_types.h"
 
+#include "agx_native_descriptor.h"
 #include "agx_public.h"
 #include "agx_state.h"
 
@@ -506,6 +508,637 @@ check_es3_compile_contract(struct pipe_context *pctx)
       free(shadow.error_message);
    }
    return compiled;
+}
+
+static nir_shader *
+build_image_store_cs(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "shared storage image store test");
+   b.shader->info.workgroup_size[0] = 1;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.num_images = 1;
+   BITSET_SET(b.shader->info.images_used, 0);
+
+   nir_image_store(&b, nir_imm_int(&b, 0),
+                   nir_imm_ivec4(&b, 0, 0, 0, 0),
+                   nir_imm_int(&b, 0),
+                   nir_imm_vec4(&b, 1.0f, 0.0f, 0.0f, 1.0f),
+                   nir_imm_int(&b, 0),
+                   .image_dim = GLSL_SAMPLER_DIM_2D,
+                   .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+                   .access = ACCESS_NON_READABLE);
+   return b.shader;
+}
+
+static bool
+has_rejected_active_batch(struct agx_context *ctx)
+{
+   unsigned idx;
+   BITSET_FOREACH_SET(idx, ctx->batches.active, AGX_MAX_BATCHES) {
+      if (ctx->batches.slots[idx].native_rejected)
+         return true;
+   }
+   return false;
+}
+
+static bool
+check_interchange_and_shared_bo(struct pipe_context *pctx)
+{
+   struct pipe_screen *screen = pctx->screen;
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_device *dev = agx_device(screen);
+   bool ok = true;
+
+   const bool want_ix =
+      agx_chip_has_cap(dev->chip, AGX_CAP_GEN9_2D_COMPRESSION);
+   bool ext_only = true;
+   const bool ix_bgra = screen->is_dmabuf_modifier_supported(
+      screen, DRM_FORMAT_MOD_APPLE_INTERCHANGE, PIPE_FORMAT_B8G8R8A8_UNORM,
+      &ext_only);
+   if (ix_bgra != want_ix || (ix_bgra && ext_only)) {
+      fprintf(stderr,
+              "interchange BGRA8 support=%d ext_only=%d on %s (want %d, 0)\n",
+              ix_bgra, ext_only, agx_chip_name(dev->chip), want_ix);
+      ok = false;
+   }
+
+   ext_only = false;
+   const bool comp_ok = screen->is_dmabuf_modifier_supported(
+      screen, DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
+      PIPE_FORMAT_B8G8R8A8_UNORM, &ext_only);
+   const bool want_comp_ext = !agx_gallium_shared_compression_supported(
+      agx_chip_descriptor_generation(dev->chip));
+   if (!comp_ok || ext_only != want_comp_ext) {
+      fprintf(stderr,
+              "GPU_TILED_COMPRESSED support=%d ext_only=%d on %s (want 1, %d)\n",
+              comp_ok, ext_only, agx_chip_name(dev->chip), want_comp_ext);
+      ok = false;
+   }
+
+   const uint64_t display_mods[] = {
+      DRM_FORMAT_MOD_APPLE_INTERCHANGE,
+      DRM_FORMAT_MOD_LINEAR,
+   };
+   struct pipe_resource ix_templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+      .width0 = 256,
+      .height0 = 256,
+      .depth0 = 1,
+      .array_size = 1,
+      .bind = PIPE_BIND_SCANOUT | PIPE_BIND_RENDER_TARGET |
+              PIPE_BIND_SAMPLER_VIEW,
+   };
+   struct pipe_resource *ix = screen->resource_create_with_modifiers(
+      screen, &ix_templ, display_mods, ARRAY_SIZE(display_mods));
+   bool rt_rejected = false;
+   bool comp_cs_rejected = false;
+   if (!ix) {
+      fprintf(stderr, "failed to allocate scanout image on %s\n",
+              agx_chip_name(dev->chip));
+      ok = false;
+   } else {
+      struct agx_resource *ix_rsrc = agx_resource(ix);
+      const uint64_t want_mod = want_ix ? DRM_FORMAT_MOD_APPLE_INTERCHANGE
+                                        : DRM_FORMAT_MOD_LINEAR;
+      if (ix_rsrc->modifier != want_mod) {
+         fprintf(stderr, "scanout modifier %#llx on %s (want %#llx)\n",
+                 (unsigned long long)ix_rsrc->modifier,
+                 agx_chip_name(dev->chip), (unsigned long long)want_mod);
+         ok = false;
+      }
+      if (want_ix) {
+         struct agx_bo *orig_bo = ix_rsrc->bo;
+         if (!agx_resource_is_shared(ix_rsrc) || !ix_rsrc->layout.compressed) {
+            fprintf(stderr,
+                    "interchange scanout image not shared+compressed\n");
+            ok = false;
+         }
+         /* Incompatible format view and direct agx_decompress() must never swap
+          * the shared BO. */
+         agx_legalize_compression(ctx, ix_rsrc, PIPE_FORMAT_R32_UINT);
+         agx_decompress(ctx, ix_rsrc, "test shared");
+         if (ix_rsrc->bo != orig_bo || !ix_rsrc->layout.compressed) {
+            fprintf(stderr,
+                    "shared interchange BO was reallocated on decompress path\n");
+            ok = false;
+         }
+
+         /* Full-extent clear on compressed Interchange scanout must stay on
+          * VDM+PBE and never convert to libagx_fast_clear() CDM. */
+         pctx->flush(pctx, NULL, 0);
+         struct pipe_framebuffer_state ix_fb = {
+            .width = 256,
+            .height = 256,
+            .layers = 1,
+            .samples = 1,
+            .nr_cbufs = 1,
+            .cbufs[0] = {.texture = ix, .format = PIPE_FORMAT_B8G8R8A8_UNORM},
+         };
+         pctx->set_framebuffer_state(pctx, &ix_fb);
+         const union pipe_color_union ix_clear_col = {
+            .f = {0.25f, 0.5f, 0.75f, 1.0f},
+         };
+         pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &ix_clear_col, 0.0,
+                     0);
+         struct agx_batch *ix_fc_batch = ctx->batch;
+         if (!ix_fc_batch || agx_try_fast_clear_batch(ctx, ix_fc_batch) ||
+             ix_fc_batch->vdm.bo == NULL || ix_fc_batch->cdm.bo != NULL ||
+             has_rejected_active_batch(ctx)) {
+            fprintf(stderr,
+                    "interchange BGRA8 clear unexpectedly took fast-clear or "
+                    "rejected (batch=%p vdm=%p cdm=%p rejected=%d)\n",
+                    (void *)ix_fc_batch,
+                    ix_fc_batch ? (void *)ix_fc_batch->vdm.bo : NULL,
+                    ix_fc_batch ? (void *)ix_fc_batch->cdm.bo : NULL,
+                    has_rejected_active_batch(ctx));
+            ok = false;
+         }
+         pctx->flush(pctx, NULL, 0);
+         struct pipe_framebuffer_state ix_empty_fb = {0};
+         pctx->set_framebuffer_state(pctx, &ix_empty_fb);
+
+         /* Rendering into an incompatible-format view of a shared compressed
+          * target must fail closed via batch rejection without aborting or
+          * swapping rsrc->bo. */
+         pctx->flush(pctx, NULL, 0);
+         struct pipe_surface bad_cbuf = {
+            .texture = ix,
+            .format = PIPE_FORMAT_R32_UINT,
+            .first_layer = 0,
+            .last_layer = 0,
+            .level = 0,
+         };
+         struct pipe_framebuffer_state bad_fb = {
+            .width = 256,
+            .height = 256,
+            .layers = 1,
+            .samples = 1,
+            .nr_cbufs = 1,
+         };
+         bad_fb.cbufs[0] = bad_cbuf;
+         pctx->set_framebuffer_state(pctx, &bad_fb);
+         const union pipe_color_union clear_u32 = {.ui = {1, 0, 0, 0}};
+         pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &clear_u32, 0.0, 0);
+         rt_rejected = has_rejected_active_batch(ctx);
+         pctx->flush(pctx, NULL, 0);
+         struct pipe_framebuffer_state empty_fb = {0};
+         pctx->set_framebuffer_state(pctx, &empty_fb);
+         if (!rt_rejected || ix_rsrc->bo != orig_bo ||
+             !ix_rsrc->layout.compressed) {
+            fprintf(stderr,
+                    "incompatible shared interchange RT view: rejected=%d "
+                    "bo_same=%d compressed=%d\n",
+                    rt_rejected, ix_rsrc->bo == orig_bo,
+                    ix_rsrc->layout.compressed);
+            ok = false;
+         }
+
+         /* Dispatching a writable shader image store on a shared compressed
+          * resource must reject the batch cleanly without swapping BO. */
+         struct pipe_compute_state cs_templ = {
+            .ir_type = PIPE_SHADER_IR_NIR,
+            .prog = build_image_store_cs(),
+         };
+         void *store_cs = pctx->create_compute_state(pctx, &cs_templ);
+         if (!store_cs) {
+            fprintf(stderr, "failed to create image store CS on %s\n",
+                    agx_chip_name(dev->chip));
+            ok = false;
+         } else {
+            struct pipe_image_view iv = {
+               .resource = ix,
+               .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+               .shader_access = PIPE_IMAGE_ACCESS_WRITE,
+            };
+            const struct pipe_grid_info grid = {
+               .block = {1, 1, 1},
+               .grid = {1, 1, 1},
+            };
+            pctx->bind_compute_state(pctx, store_cs);
+            pctx->set_shader_images(pctx, MESA_SHADER_COMPUTE, 0, 1, 0, &iv);
+            const unsigned skipped_before_cs = ctx->skipped_no_program;
+            pctx->launch_grid(pctx, &grid);
+            comp_cs_rejected = has_rejected_active_batch(ctx);
+            pctx->flush(pctx, NULL, 0);
+            pctx->set_shader_images(pctx, MESA_SHADER_COMPUTE, 0, 0, 1, NULL);
+            pctx->bind_compute_state(pctx, NULL);
+            pctx->delete_compute_state(pctx, store_cs);
+            if (!comp_cs_rejected ||
+                ctx->skipped_no_program != skipped_before_cs ||
+                ix_rsrc->bo != orig_bo || !ix_rsrc->layout.compressed) {
+               fprintf(stderr,
+                       "shared compressed writable image: rejected=%d "
+                       "skipped=%u bo_same=%d compressed=%d\n",
+                       comp_cs_rejected,
+                       ctx->skipped_no_program - skipped_before_cs,
+                       ix_rsrc->bo == orig_bo, ix_rsrc->layout.compressed);
+               ok = false;
+            }
+         }
+      }
+      pipe_resource_reference(&ix, NULL);
+   }
+
+   /* Non-interchange uncompressed storage images (shared LINEAR/GPU_TILED 2D
+    * and private 3D promoted via agx_decompress()) must keep upstream behavior
+    * and must not be rejected on any chip. */
+   const uint64_t non_ix_mods[] = {
+      DRM_FORMAT_MOD_LINEAR,
+      DRM_FORMAT_MOD_APPLE_GPU_TILED,
+   };
+   bool non_ix_cs_ok = true;
+   {
+      struct pipe_compute_state cs_templ = {
+         .ir_type = PIPE_SHADER_IR_NIR,
+         .prog = build_image_store_cs(),
+      };
+      void *store_cs = pctx->create_compute_state(pctx, &cs_templ);
+      if (!store_cs) {
+         fprintf(stderr, "failed to create non-ix image store CS on %s\n",
+                 agx_chip_name(dev->chip));
+         ok = false;
+         non_ix_cs_ok = false;
+      } else {
+         const struct pipe_grid_info grid = {
+            .block = {1, 1, 1},
+            .grid = {1, 1, 1},
+         };
+         for (unsigned m = 0; m < ARRAY_SIZE(non_ix_mods); ++m) {
+            struct pipe_resource sh2d_templ = {
+               .target = PIPE_TEXTURE_2D,
+               .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+               .width0 = 32,
+               .height0 = 32,
+               .depth0 = 1,
+               .array_size = 1,
+               .bind = PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW,
+            };
+            struct pipe_resource *sh2d = screen->resource_create_with_modifiers(
+               screen, &sh2d_templ, &non_ix_mods[m], 1);
+            if (!sh2d) {
+               fprintf(stderr, "failed to allocate shared 2D mod=%#llx on %s\n",
+                       (unsigned long long)non_ix_mods[m],
+                       agx_chip_name(dev->chip));
+               ok = false;
+               non_ix_cs_ok = false;
+               continue;
+            }
+            struct agx_resource *sh2d_rsrc = agx_resource(sh2d);
+            struct agx_bo *orig_bo = sh2d_rsrc->bo;
+            struct pipe_image_view iv = {
+               .resource = sh2d,
+               .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+               .shader_access = PIPE_IMAGE_ACCESS_WRITE,
+            };
+            pctx->flush(pctx, NULL, 0);
+            pctx->bind_compute_state(pctx, store_cs);
+            pctx->set_shader_images(pctx, MESA_SHADER_COMPUTE, 0, 1, 0, &iv);
+            pctx->launch_grid(pctx, &grid);
+            const bool rejected = has_rejected_active_batch(ctx);
+            pctx->flush(pctx, NULL, 0);
+            pctx->set_shader_images(pctx, MESA_SHADER_COMPUTE, 0, 0, 1, NULL);
+            if (rejected || sh2d_rsrc->bo != orig_bo ||
+                !sh2d_rsrc->layout.writeable_image) {
+               fprintf(stderr,
+                       "shared uncompressed 2D mod=%#llx imageStore on %s: "
+                       "rejected=%d bo_same=%d writeable=%d\n",
+                       (unsigned long long)non_ix_mods[m],
+                       agx_chip_name(dev->chip), rejected,
+                       sh2d_rsrc->bo == orig_bo,
+                       sh2d_rsrc->layout.writeable_image);
+               ok = false;
+               non_ix_cs_ok = false;
+            }
+            pipe_resource_reference(&sh2d, NULL);
+         }
+
+         /* Private 3D GPU-tiled image starts with writeable_image=false and
+          * must still promote via agx_decompress() without batch rejection. */
+         const uint64_t tiled_mod = DRM_FORMAT_MOD_APPLE_GPU_TILED;
+         struct pipe_resource priv3d_templ = {
+            .target = PIPE_TEXTURE_3D,
+            .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+            .width0 = 32,
+            .height0 = 32,
+            .depth0 = 2,
+            .array_size = 1,
+            .bind = PIPE_BIND_SAMPLER_VIEW,
+         };
+         struct pipe_resource *priv3d = screen->resource_create_with_modifiers(
+            screen, &priv3d_templ, &tiled_mod, 1);
+         if (!priv3d) {
+            fprintf(stderr, "failed to allocate private 3D image on %s\n",
+                    agx_chip_name(dev->chip));
+            ok = false;
+            non_ix_cs_ok = false;
+         } else {
+            struct agx_resource *priv3d_rsrc = agx_resource(priv3d);
+            struct pipe_image_view iv = {
+               .resource = priv3d,
+               .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+               .shader_access = PIPE_IMAGE_ACCESS_WRITE,
+               .u.tex = {.first_layer = 0, .last_layer = 0, .level = 0,
+                         .single_layer_view = true},
+            };
+            pctx->flush(pctx, NULL, 0);
+            pctx->bind_compute_state(pctx, store_cs);
+            pctx->set_shader_images(pctx, MESA_SHADER_COMPUTE, 0, 1, 0, &iv);
+            pctx->launch_grid(pctx, &grid);
+            const bool rejected = has_rejected_active_batch(ctx);
+            pctx->flush(pctx, NULL, 0);
+            pctx->set_shader_images(pctx, MESA_SHADER_COMPUTE, 0, 0, 1, NULL);
+            if (rejected || !priv3d_rsrc->layout.writeable_image) {
+               fprintf(stderr,
+                       "private 3D imageStore promotion on %s: rejected=%d "
+                       "writeable=%d\n",
+                       agx_chip_name(dev->chip), rejected,
+                       priv3d_rsrc->layout.writeable_image);
+               ok = false;
+               non_ix_cs_ok = false;
+            }
+            pipe_resource_reference(&priv3d, NULL);
+         }
+
+         pctx->bind_compute_state(pctx, NULL);
+         pctx->delete_compute_state(pctx, store_cs);
+      }
+   }
+
+   printf("interchange/shared-BO safety on %s: want_ix=%d rt_rejected=%d "
+          "comp_cs_rejected=%d non_ix_cs_ok=%d\n",
+          agx_chip_name(dev->chip), want_ix, rt_rejected, comp_cs_rejected,
+          non_ix_cs_ok);
+
+   /* 10-bit RGB Interchange modifier advertising, scanout allocation, X2
+    * clear+blended-draw compilation, and FP16/UINT non-advertisement. */
+   static const enum pipe_format tenbit_fmts[] = {
+      PIPE_FORMAT_B10G10R10A2_UNORM,
+      PIPE_FORMAT_B10G10R10X2_UNORM,
+      PIPE_FORMAT_R10G10B10A2_UNORM,
+      PIPE_FORMAT_R10G10B10X2_UNORM,
+   };
+   static const enum pipe_format unsupported_ix_fmts[] = {
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R10G10B10A2_UINT,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(unsupported_ix_fmts); ++i) {
+      bool u_ext = true;
+      const bool u_ix = screen->is_dmabuf_modifier_supported(
+         screen, DRM_FORMAT_MOD_APPLE_INTERCHANGE, unsupported_ix_fmts[i],
+         &u_ext);
+      if (u_ix) {
+         fprintf(stderr, "unsupported interchange format %s advertised on %s\n",
+                 util_format_name(unsupported_ix_fmts[i]),
+                 agx_chip_name(dev->chip));
+         ok = false;
+      }
+      struct pipe_resource u_templ = ix_templ;
+      u_templ.format = unsupported_ix_fmts[i];
+      struct pipe_resource *u_res = screen->resource_create_with_modifiers(
+         screen, &u_templ, display_mods, ARRAY_SIZE(display_mods));
+      if (!u_res || agx_resource(u_res)->modifier != DRM_FORMAT_MOD_LINEAR) {
+         fprintf(stderr,
+                 "unsupported interchange format %s did not fall back to linear on %s\n",
+                 util_format_name(unsupported_ix_fmts[i]),
+                 agx_chip_name(dev->chip));
+         ok = false;
+      }
+      pipe_resource_reference(&u_res, NULL);
+   }
+
+   /* Prepare minimal VS/FS + blended state to verify 10-bit A2 and X2
+    * Interchange clear + blended draw compile and emit without batch reject. */
+   nir_builder vs_b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "interchange10 vs");
+   nir_store_output(&vs_b, nir_imm_vec4(&vs_b, 0.0f, 0.0f, 0.0f, 1.0f),
+                    nir_imm_int(&vs_b, 0), .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_POS);
+   nir_shader_gather_info(vs_b.shader, nir_shader_get_entrypoint(vs_b.shader));
+   struct pipe_shader_state vs_st = {.type = PIPE_SHADER_IR_NIR,
+                                     .ir.nir = vs_b.shader};
+   void *vs_cso = pctx->create_vs_state(pctx, &vs_st);
+
+   nir_builder fs_b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "interchange10 fs");
+   nir_store_output(&fs_b, nir_imm_vec4(&fs_b, 0.25f, 0.5f, 0.75f, 0.5f),
+                    nir_imm_int(&fs_b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_DATA0);
+   nir_shader_gather_info(fs_b.shader, nir_shader_get_entrypoint(fs_b.shader));
+   struct pipe_shader_state fs_st = {.type = PIPE_SHADER_IR_NIR,
+                                     .ir.nir = fs_b.shader};
+   void *fs_cso = pctx->create_fs_state(pctx, &fs_st);
+
+   struct pipe_blend_state blend = {0};
+   blend.rt[0].blend_enable = 1;
+   blend.rt[0].rgb_func = PIPE_BLEND_ADD;
+   blend.rt[0].rgb_src_factor = PIPE_BLENDFACTOR_SRC_ALPHA;
+   blend.rt[0].rgb_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
+   blend.rt[0].alpha_func = PIPE_BLEND_ADD;
+   blend.rt[0].alpha_src_factor = PIPE_BLENDFACTOR_ONE;
+   blend.rt[0].alpha_dst_factor = PIPE_BLENDFACTOR_ZERO;
+   blend.rt[0].colormask = 0xf;
+   void *blend_cso = pctx->create_blend_state(pctx, &blend);
+
+   struct pipe_rasterizer_state rast = {
+      .depth_clip_near = true,
+      .depth_clip_far = true,
+      .point_size = 1,
+      .line_width = 1,
+   };
+   void *rast_cso = pctx->create_rasterizer_state(pctx, &rast);
+   struct pipe_depth_stencil_alpha_state dsa = {0};
+   void *dsa_cso = pctx->create_depth_stencil_alpha_state(pctx, &dsa);
+   void *ve_cso = pctx->create_vertex_elements_state(pctx, 0, NULL);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(tenbit_fmts); ++i) {
+      const enum pipe_format fmt = tenbit_fmts[i];
+      bool tb_ext = true;
+      const bool tb_ix = screen->is_dmabuf_modifier_supported(
+         screen, DRM_FORMAT_MOD_APPLE_INTERCHANGE, fmt, &tb_ext);
+      if (tb_ix != want_ix || (tb_ix && tb_ext)) {
+         fprintf(stderr,
+                 "interchange %s support=%d ext_only=%d on %s (want %d, 0)\n",
+                 util_format_name(fmt), tb_ix, tb_ext, agx_chip_name(dev->chip),
+                 want_ix);
+         ok = false;
+      }
+
+      uint64_t qmods[8] = {0};
+      unsigned qext[8] = {0};
+      int qcount = 0;
+      screen->query_dmabuf_modifiers(screen, fmt, ARRAY_SIZE(qmods), qmods,
+                                     qext, &qcount);
+      bool found_ix = false;
+      for (int m = 0; m < qcount; ++m) {
+         if (qmods[m] == DRM_FORMAT_MOD_APPLE_INTERCHANGE) {
+            found_ix = true;
+            if (qext[m]) {
+               fprintf(stderr, "query_dmabuf_modifiers %s marked IX ext_only\n",
+                       util_format_name(fmt));
+               ok = false;
+            }
+         }
+      }
+      if (found_ix != want_ix) {
+         fprintf(stderr, "query_dmabuf_modifiers %s found_ix=%d (want %d)\n",
+                 util_format_name(fmt), found_ix, want_ix);
+         ok = false;
+      }
+
+      struct pipe_resource tb_templ = ix_templ;
+      tb_templ.format = fmt;
+      struct pipe_resource *tb = screen->resource_create_with_modifiers(
+         screen, &tb_templ, display_mods, ARRAY_SIZE(display_mods));
+      if (!tb) {
+         fprintf(stderr, "failed to allocate 10-bit scanout %s on %s\n",
+                 util_format_name(fmt), agx_chip_name(dev->chip));
+         ok = false;
+         continue;
+      }
+
+      struct agx_resource *tb_rsrc = agx_resource(tb);
+      const uint64_t want_mod = want_ix ? DRM_FORMAT_MOD_APPLE_INTERCHANGE
+                                        : DRM_FORMAT_MOD_LINEAR;
+      if (tb_rsrc->modifier != want_mod) {
+         fprintf(stderr, "10-bit %s modifier %#llx on %s (want %#llx)\n",
+                 util_format_name(fmt), (unsigned long long)tb_rsrc->modifier,
+                 agx_chip_name(dev->chip), (unsigned long long)want_mod);
+         ok = false;
+      }
+
+      if (want_ix) {
+         struct agx_bo *orig_bo = tb_rsrc->bo;
+         if (!agx_resource_is_shared(tb_rsrc) || !tb_rsrc->layout.compressed ||
+             tb_rsrc->layout.tiling != AIL_TILING_INTERCHANGE) {
+            fprintf(stderr, "10-bit %s not shared+compressed+interchange\n",
+                    util_format_name(fmt));
+            ok = false;
+         }
+
+         /* Full-extent clear-only batches on 10-bit Interchange scanout (both
+          * A2 and void-alpha X2) must NOT convert to libagx_fast_clear() CDM:
+          * fast clear packs void alpha as 00 (0x3fffffff) instead of opaque
+          * 11 (0xffffffff) and bypasses PBE swizzle_a=3 + 1.0 padding. Test
+          * both an initial clear and a second clear with data_valid set. */
+         pctx->flush(pctx, NULL, 0);
+         struct pipe_framebuffer_state fb = {
+            .width = 256,
+            .height = 256,
+            .layers = 1,
+            .samples = 1,
+            .nr_cbufs = 1,
+            .cbufs[0] = {.texture = tb, .format = fmt},
+         };
+         pctx->set_framebuffer_state(pctx, &fb);
+         const union pipe_color_union clear_col = {.f = {0.1f, 0.2f, 0.3f, 1.0f}};
+         for (unsigned pass = 0; pass < 2; ++pass) {
+            pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &clear_col, 0.0,
+                        0);
+            struct agx_batch *fc_batch = ctx->batch;
+            if (!fc_batch || agx_try_fast_clear_batch(ctx, fc_batch) ||
+                fc_batch->vdm.bo == NULL || fc_batch->cdm.bo != NULL ||
+                has_rejected_active_batch(ctx)) {
+               fprintf(stderr,
+                       "10-bit %s clear-only pass %u unexpectedly took "
+                       "fast-clear or rejected on %s (batch=%p vdm=%p cdm=%p "
+                       "rejected=%d)\n",
+                       util_format_name(fmt), pass, agx_chip_name(dev->chip),
+                       (void *)fc_batch,
+                       fc_batch ? (void *)fc_batch->vdm.bo : NULL,
+                       fc_batch ? (void *)fc_batch->cdm.bo : NULL,
+                       has_rejected_active_batch(ctx));
+               ok = false;
+            }
+            pctx->flush(pctx, NULL, 0);
+            if (tb_rsrc->bo != orig_bo || !tb_rsrc->layout.compressed) {
+               fprintf(stderr,
+                       "10-bit %s clear-only pass %u mutated BO/compression\n",
+                       util_format_name(fmt), pass);
+               ok = false;
+            }
+         }
+
+         /* Clear + blended draw must compile and submit cleanly (exercises
+          * RGB10A2 unpack + x_alpha=1.0 padding + PACK_RGB10A2_AGX3 + Gen9
+          * compressed Interchange PBE with swizzle_a=3 for X2). */
+         pctx->bind_vs_state(pctx, vs_cso);
+         pctx->bind_fs_state(pctx, fs_cso);
+         pctx->bind_blend_state(pctx, blend_cso);
+         pctx->bind_rasterizer_state(pctx, rast_cso);
+         pctx->bind_depth_stencil_alpha_state(pctx, dsa_cso);
+         pctx->bind_vertex_elements_state(pctx, ve_cso);
+         struct pipe_viewport_state vp = {.scale = {128, 128, 0.5},
+                                          .translate = {128, 128, 0.5}};
+         pctx->set_viewport_states(pctx, 0, 1, &vp);
+         pctx->set_sample_mask(pctx, ~0u);
+
+         const unsigned skipped_before = ctx->skipped_no_program;
+         pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &clear_col, 0.0, 0);
+         const struct pipe_draw_info dinfo = {.mode = MESA_PRIM_TRIANGLES,
+                                              .instance_count = 1};
+         const struct pipe_draw_start_count_bias draw = {.count = 3};
+         pctx->draw_vbo(pctx, &dinfo, 0, NULL, &draw, 1);
+         const bool rejected = has_rejected_active_batch(ctx);
+         const bool drew = ctx->batch && ctx->batch->draws;
+         pctx->flush(pctx, NULL, 0);
+         if (rejected || !drew || ctx->skipped_no_program != skipped_before ||
+             tb_rsrc->bo != orig_bo || !tb_rsrc->layout.compressed) {
+            fprintf(stderr,
+                    "10-bit %s clear+blend draw failed on %s: rejected=%d "
+                    "drew=%d skipped=%u bo_same=%d compressed=%d\n",
+                    util_format_name(fmt), agx_chip_name(dev->chip), rejected,
+                    drew, ctx->skipped_no_program - skipped_before,
+                    tb_rsrc->bo == orig_bo, tb_rsrc->layout.compressed);
+            ok = false;
+         }
+
+         /* Incompatible R32_UINT view on shared 10-bit Interchange must fail
+          * closed without reallocating BO. */
+         struct pipe_framebuffer_state bad_fb = {
+            .width = 256,
+            .height = 256,
+            .layers = 1,
+            .samples = 1,
+            .nr_cbufs = 1,
+            .cbufs[0] = {.texture = tb, .format = PIPE_FORMAT_R32_UINT},
+         };
+         pctx->set_framebuffer_state(pctx, &bad_fb);
+         const union pipe_color_union clear_u32 = {.ui = {1, 0, 0, 0}};
+         pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &clear_u32, 0.0, 0);
+         const bool bad_rejected = has_rejected_active_batch(ctx);
+         pctx->flush(pctx, NULL, 0);
+         struct pipe_framebuffer_state empty_fb = {0};
+         pctx->set_framebuffer_state(pctx, &empty_fb);
+         if (!bad_rejected || tb_rsrc->bo != orig_bo ||
+             !tb_rsrc->layout.compressed) {
+            fprintf(stderr,
+                    "10-bit %s incompatible RT view: rejected=%d bo_same=%d "
+                    "compressed=%d\n",
+                    util_format_name(fmt), bad_rejected, tb_rsrc->bo == orig_bo,
+                    tb_rsrc->layout.compressed);
+            ok = false;
+         }
+      }
+      pipe_resource_reference(&tb, NULL);
+   }
+
+   pctx->bind_vs_state(pctx, NULL);
+   pctx->bind_fs_state(pctx, NULL);
+   pctx->bind_blend_state(pctx, NULL);
+   pctx->bind_rasterizer_state(pctx, NULL);
+   pctx->bind_depth_stencil_alpha_state(pctx, NULL);
+   pctx->bind_vertex_elements_state(pctx, NULL);
+   pctx->delete_vs_state(pctx, vs_cso);
+   pctx->delete_fs_state(pctx, fs_cso);
+   pctx->delete_blend_state(pctx, blend_cso);
+   pctx->delete_rasterizer_state(pctx, rast_cso);
+   pctx->delete_depth_stencil_alpha_state(pctx, dsa_cso);
+   pctx->delete_vertex_elements_state(pctx, ve_cso);
+
+   return ok;
 }
 
 static struct pipe_resource *
@@ -1523,6 +2156,43 @@ check_compressed_mip_chain(struct pipe_screen *screen,
       pipe_resource_reference(&big_tex, NULL);
       return false;
    }
+   /* For 2560x1440, level 1 decodes compressed level 0 via the sampled shader
+    * and levels 2..11 use precompiled libagx_mipmap_unorm8x4{,_2level,_odd}
+    * (with two fused 16x8 2-level dispatches for 2+3 and 4+5) plus one
+    * libagx_fill_uint4 for levels 2..6 metadata. */
+   if (chain_compresses) {
+      const uint8_t *cdm_base = agx_bo_map(mctx->batch->cdm.bo);
+      const size_t cdm_len = (size_t)(mctx->batch->cdm.current - cdm_base);
+      size_t off = 0;
+      unsigned launches = 0, fused_launches = 0;
+      while (off < cdm_len) {
+         struct agx3_cdm_decoded_record rec;
+         if (!agx3_cdm_decode_one(mdev->chip, cdm_base + off, cdm_len - off,
+                                  &rec) ||
+             !rec.length) {
+            fprintf(stderr, "compressed mipchain CDM decode failed at +%zu/%zu\n",
+                    off, cdm_len);
+            pipe_resource_reference(&big_tex, NULL);
+            return false;
+         }
+         if (rec.kind == AGX3_CDM_RECORD_LAUNCH) {
+            ++launches;
+            if (rec.data.launch.local_size[0] == 16 &&
+                rec.data.launch.local_size[1] == 8 &&
+                rec.data.launch.local_size[2] == 1)
+               ++fused_launches;
+         }
+         off += rec.length;
+      }
+      if (fused_launches < 2 || launches >= 11) {
+         fprintf(stderr,
+                 "compressed 2560x1440 mipchain did not take precompiled tail "
+                 "(fused=%u launches=%u)\n",
+                 fused_launches, launches);
+         pipe_resource_reference(&big_tex, NULL);
+         return false;
+      }
+   }
    pctx->flush(pctx, NULL, 0);
    pipe_resource_reference(&big_tex, NULL);
 
@@ -1544,6 +2214,11 @@ check_agx3_compute_mipmap(struct pipe_screen *screen, struct pipe_context *pctx,
                           bool check_pixels)
 {
    struct agx_device *mdev = agx_device(screen);
+   if (agx_chip_descriptor_generation(mdev->chip) == AGX_DESCRIPTOR_GENERATION_10)
+      return check_agx3_compute_mipmap_case(screen, pctx, "sampled_65x33",
+                                            PIPE_TEXTURE_2D, 65, 33, 1, 6,
+                                            false, check_pixels);
+
    if (!agx_chip_native_agx3(mdev->chip))
       return true;
 
@@ -2595,6 +3270,14 @@ main(void)
       return ok ? 0 : 1;
    }
 
+   if (getenv("AGX_TEST_INTERCHANGE_SHARED_BO")) {
+      const bool ok = check_interchange_and_shared_bo(pctx);
+      pctx->destroy(pctx);
+      screen->destroy(screen);
+      close(fd);
+      return ok ? 0 : 1;
+   }
+
    if (getenv("AGX_TEST_XFB_COPY_PROGRAM")) {
       glsl_type_singleton_init_or_ref();
       /* A triangle capture shades one of three candidate vertices, so its
@@ -3031,19 +3714,26 @@ main(void)
           agx_chip_name(dev->chip), vs_ok ? "ok" : "refused",
           fs_ok ? "ok" : "refused", linked_ok ? "ok" : "refused");
 
-   /* Gen9 colour-compression parts (G17P, G16G) compress this 2408x1506 RGBA8
+   /* Gen9 colour-compression parts (G17P, G16G) and Gen10 ones
+    * (AGX_CAP_GEN10_2D_COMPRESSION, the M5) compress this 2408x1506 RGBA8
     * render target, so the clear, the flush and the blit above took the
     * compressed end-of-tile PBE and background texture; an unencodable
     * descriptor would have aborted in agx_native_descriptor_rejected(). Other
     * AGX3 parts keep it plain. */
    if (!agx2 &&
        agx_resource(dst)->layout.compressed !=
-          agx_chip_gen9_color_compression(dev->chip)) {
+          (agx_chip_gen9_color_compression(dev->chip) ||
+           agx_chip_has_cap(dev->chip, AGX_CAP_GEN10_2D_COMPRESSION))) {
       fprintf(stderr,
-              "AGX3 render target compression does not follow the Gen9 colour "
-              "policy\n");
+              "AGX3 render target compression does not follow the colour "
+              "compression policy\n");
       status = 1;
    }
+
+   /* Verify DRM_FORMAT_MOD_APPLE_INTERCHANGE modifier queries, external_only
+    * flags, scanout allocation, and shared-BO decompression safety. */
+   if (!check_interchange_and_shared_bo(pctx))
+      status = 1;
 
    /* AGX3-encoding parts must not take Gallium's AGX2 compute blitter.
     * The render blitter binds a vertex stage; the compute one never does, so

@@ -1152,3 +1152,137 @@ TEST(Tilebuffer, PackFirstIfFitsMovesClearedRTIntoFirst8Bytes)
    EXPECT_EQ(agx_tilebuffer_offset_B(&def, 3), 0u);
    EXPECT_FALSE(agx_tilebuffer_spills(&def));
 }
+
+/* Interchange is advertised exactly where the shared Gen9 2D compression
+ * capability is enabled, and for the eight plain 32-bit 8-bit and 10-bit
+ * RGB/RGBA formats. Every other chip and format (including FP16 and 10-bit
+ * UINT) keeps the modifier list it had before. */
+TEST(Interchange, ModifierSupport)
+{
+   static const uint64_t all_modifiers[] = {
+      DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
+      DRM_FORMAT_MOD_APPLE_GPU_TILED,
+      DRM_FORMAT_MOD_APPLE_INTERCHANGE,
+      DRM_FORMAT_MOD_LINEAR,
+   };
+   const std::vector<uint64_t> base_list = {
+      DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
+      DRM_FORMAT_MOD_APPLE_GPU_TILED,
+      DRM_FORMAT_MOD_LINEAR,
+   };
+   const std::vector<uint64_t> interchange_list = {
+      DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
+      DRM_FORMAT_MOD_APPLE_GPU_TILED,
+      DRM_FORMAT_MOD_APPLE_INTERCHANGE,
+      DRM_FORMAT_MOD_LINEAR,
+   };
+
+   /* Explicit sanity checks: AGX2 (M1/M2), unmeasured Gen9 parts (G15/G16),
+    * and Gen10 (M5/M6) refuse Interchange; G17P admits it via the shared
+    * AGX_CAP_GEN9_2D_COMPRESSION capability. */
+   EXPECT_FALSE(agx_chip_supports_interchange(AGX_CHIP_G13G));
+   EXPECT_FALSE(agx_chip_supports_interchange(AGX_CHIP_G14G));
+   EXPECT_FALSE(agx_chip_supports_interchange(AGX_CHIP_G15P));
+   EXPECT_FALSE(agx_chip_supports_interchange(AGX_CHIP_G15G));
+   EXPECT_FALSE(agx_chip_supports_interchange(AGX_CHIP_G15S));
+   EXPECT_FALSE(agx_chip_supports_interchange(AGX_CHIP_G15C));
+   EXPECT_FALSE(agx_chip_supports_interchange(AGX_CHIP_G16G));
+   EXPECT_TRUE(agx_chip_supports_interchange(AGX_CHIP_G17P));
+   EXPECT_FALSE(agx_chip_supports_interchange(AGX_CHIP_G17G));
+   EXPECT_FALSE(agx_chip_supports_interchange(AGX_CHIP_G18G));
+   EXPECT_FALSE(agx_chip_supports_interchange(AGX_CHIP_UNKNOWN));
+
+   /* Explicit negative checks for unsupported display/HDR formats. */
+   EXPECT_FALSE(agx_interchange_modifier_supported(AGX_CHIP_G17P,
+                                                   PIPE_FORMAT_R16G16B16A16_FLOAT));
+   EXPECT_FALSE(agx_interchange_modifier_supported(AGX_CHIP_G17P,
+                                                   PIPE_FORMAT_R10G10B10A2_UINT));
+   EXPECT_FALSE(agx_interchange_modifier_supported(AGX_CHIP_G17P,
+                                                   PIPE_FORMAT_B10G10R10A2_UINT));
+   EXPECT_FALSE(agx_interchange_modifier_supported(AGX_CHIP_G17P,
+                                                   PIPE_FORMAT_R11G11B10_FLOAT));
+   EXPECT_FALSE(agx_interchange_modifier_supported(AGX_CHIP_G17P,
+                                                   PIPE_FORMAT_B8G8R8A8_SRGB));
+
+   for (unsigned c = 0; c <= AGX_CHIP_UNKNOWN; ++c) {
+      const enum agx_chip chip = (enum agx_chip)c;
+      const bool capable = agx_chip_has_cap(chip, AGX_CAP_GEN9_2D_COMPRESSION);
+
+      EXPECT_EQ(agx_chip_supports_interchange(chip), capable) << c;
+
+      for (unsigned f = 1; f < PIPE_FORMAT_COUNT; ++f) {
+         const enum pipe_format format = (enum pipe_format)f;
+         const bool supported = format == PIPE_FORMAT_B8G8R8A8_UNORM ||
+                                format == PIPE_FORMAT_B8G8R8X8_UNORM ||
+                                format == PIPE_FORMAT_R8G8B8A8_UNORM ||
+                                format == PIPE_FORMAT_R8G8B8X8_UNORM ||
+                                format == PIPE_FORMAT_B10G10R10A2_UNORM ||
+                                format == PIPE_FORMAT_B10G10R10X2_UNORM ||
+                                format == PIPE_FORMAT_R10G10B10A2_UNORM ||
+                                format == PIPE_FORMAT_R10G10B10X2_UNORM;
+
+         EXPECT_EQ(agx_interchange_modifier_supported(chip, format),
+                   capable && supported)
+            << c << " " << util_format_name(format);
+
+         for (bool nocompress : {false, true}) {
+            std::vector<uint64_t> advertised;
+            for (uint64_t mod : all_modifiers) {
+               if (agx_dmabuf_modifier_supported(chip, nocompress, mod, format))
+                  advertised.push_back(mod);
+            }
+            EXPECT_EQ(advertised,
+                      (capable && supported && !nocompress) ? interchange_list
+                                                            : base_list)
+               << c << " " << util_format_name(format) << " " << nocompress;
+         }
+      }
+   }
+}
+
+TEST(Tilebuffer, G18GNativeMixedEpilogMask)
+{
+   enum pipe_format rgba8[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   struct agx_tilebuffer_layout tib =
+      agx_build_tilebuffer_layout_resident(rgba8, 3, 1, false, 64, 65536, 2048,
+                                           0);
+   EXPECT_EQ(agx_g18g_word_mrt_mask(&tib), 0x7u);
+   EXPECT_EQ(agx_g18g_native_mixed_mask(&tib), 0u);
+   EXPECT_EQ(agx_g18g_native_mixed_epilog_mask(&tib), 0x7u);
+
+   /* Non-native1130 formats (e.g. sRGB) stay excluded. */
+   enum pipe_format srgb[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R8G8B8A8_SRGB,
+      PIPE_FORMAT_R8G8B8A8_SRGB,
+      PIPE_FORMAT_R8G8B8A8_SRGB,
+   };
+   struct agx_tilebuffer_layout srgb_tib =
+      agx_build_tilebuffer_layout_resident(srgb, 3, 1, false, 64, 65536, 2048,
+                                           0);
+   EXPECT_EQ(agx_g18g_native_mixed_epilog_mask(&srgb_tib), 0u);
+
+   /* Layered and multisample layouts stay excluded. */
+   struct agx_tilebuffer_layout layered_tib =
+      agx_build_tilebuffer_layout_resident(rgba8, 3, 1, true, 32, 32768, 2048,
+                                           0);
+   EXPECT_EQ(agx_g18g_native_mixed_epilog_mask(&layered_tib), 0u);
+
+   struct agx_tilebuffer_layout msaa_tib =
+      agx_build_tilebuffer_layout_resident(rgba8, 3, 4, false, 64, 65536, 2048,
+                                           0);
+   EXPECT_EQ(agx_g18g_native_mixed_epilog_mask(&msaa_tib), 0u);
+
+   /* Genuine mixed layouts match both masks. */
+   enum pipe_format mixed[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+   };
+   struct agx_tilebuffer_layout mixed_tib =
+      agx_build_tilebuffer_layout_g18_mixed(mixed, 2);
+   EXPECT_EQ(agx_g18g_native_mixed_mask(&mixed_tib), 0x3u);
+   EXPECT_EQ(agx_g18g_native_mixed_epilog_mask(&mixed_tib), 0x3u);
+}

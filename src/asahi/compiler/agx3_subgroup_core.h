@@ -2,10 +2,8 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * Bounded AGX3 subgroup encoder over the pinned no-load G15G/G16G/G17S
- * control corpus.  The API exposes only register-source f32 shapes with no
- * unresolved scoreboard dependency.  Unsupported operand kinds, conditions,
- * widths, prefix operations and marker profiles fail closed.
+ * AGX3 subgroup shuffle, ballot, and reduction encoders. Unsupported operand
+ * kinds, conditions, widths, prefix operations, and marker profiles fail closed.
  */
 
 #pragma once
@@ -127,14 +125,8 @@ struct agx3_subgroup_reduce_desc {
    uint16_t wait_mask;
    /* f11, the general-destination hint. */
    bool dest_hint;
-   /*
-    * Float reductions carry a two-way liveness selector on their source:
-    * f29 = 1 when this is the last read, f27 = 1 when the value stays live.
-    * Both are witnessed on g17p -- f29 in the `o[t] = simd_sum(a[t])` probes,
-    * where the source dies, and f27 in the corpus csimd shader, where it is
-    * reduced twice. The default (false) keeps the f29 the previously pinned
-    * corpus expects.
-    */
+   /* Float reduction source liveness: false sets f29=1 (last use), true sets
+    * f27=1 (source stays live). */
    bool src_live;
 
    /* 16-bit destination and source, in half units (AGX3b only). */

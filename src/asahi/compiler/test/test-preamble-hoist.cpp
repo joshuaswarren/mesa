@@ -31,6 +31,8 @@ class PreambleHoistTest : public testing::Test {
       key.agx3_native_cprog = true;
       key.g17p_native_uniforms = true;
       key.reserved_preamble = 64;
+      key.g17p_dma_root = 60;
+      key.preamble_root_size_B = 512;
       return key;
    }
 
@@ -56,10 +58,9 @@ TEST_F(PreambleHoistTest, RootOnlyPreambleIsHoistable)
    nir_builder b = make_vs("hoist_root_only");
 
    nir_def *root = nir_load_preamble(&b, 1, 64, .base = 60);
-   nir_def *ubo_ptr = nir_load_global_constant(&b, 1, 64, root, .align_mul = 8);
-   nir_def *m0 = nir_load_global_constant(&b, 4, 32, ubo_ptr, .align_mul = 16);
+   nir_def *m0 = nir_load_global_constant(&b, 4, 32, root, .align_mul = 16);
    nir_def *m1 = nir_load_global_constant(&b, 4, 32,
-                                          nir_iadd_imm(&b, ubo_ptr, 16),
+                                          nir_iadd_imm(&b, root, 16),
                                           .align_mul = 16);
    nir_def *sum = nir_fadd(&b, m0, m1);
 
@@ -85,15 +86,34 @@ TEST_F(PreambleHoistTest, RootOnlyPreambleIsHoistable)
    ralloc_free(b.shader);
 }
 
+/* With a zero runtime count, even a uniform pointer read from valid root
+ * storage need not refer to a bound buffer. Its CProg stays on the draw. */
+TEST_F(PreambleHoistTest, PointerChaseCannotRunOnEmptyDraw)
+{
+   nir_builder b = make_vs("hoist_reject_indirect_pointer");
+   nir_def *root = nir_load_preamble(&b, 1, 64, .base = 60);
+   nir_def *ptr = nir_load_global_constant(&b, 1, 64, root, .align_mul = 8);
+   nir_def *v = nir_load_global_constant(&b, 4, 32, ptr, .align_mul = 16);
+   nir_def *vid = nir_u2f32(&b, nir_load_vertex_id(&b));
+   emit_pos_store(&b, nir_fadd(&b, v, nir_vec4(&b, vid, vid, vid, vid)));
+
+   struct agx_shader_key key = make_agx3_vs_key();
+   struct agx_shader_part out = {};
+   ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &out));
+   EXPECT_TRUE(out.info.has_preamble);
+   EXPECT_FALSE(out.info.agx3_preamble_hoistable);
+   free(out.binary);
+   ralloc_free(b.shader);
+}
+
 TEST_F(PreambleHoistTest, ExtraPerDrawInputIsNotHoistable)
 {
    nir_builder b = make_vs("hoist_reject_base_instance");
 
    nir_def *root = nir_load_preamble(&b, 1, 64, .base = 60);
    nir_def *base_inst = nir_load_preamble(&b, 1, 32, .base = 46);
-   nir_def *ubo_ptr = nir_load_global_constant(&b, 1, 64, root, .align_mul = 8);
    nir_def *off = nir_u2u64(&b, nir_imul_imm(&b, base_inst, 16));
-   nir_def *v = nir_load_global_constant(&b, 4, 32, nir_iadd(&b, ubo_ptr, off),
+   nir_def *v = nir_load_global_constant(&b, 4, 32, nir_iadd(&b, root, off),
                                          .align_mul = 16);
 
    nir_def *vid = nir_u2f32(&b, nir_load_vertex_id(&b));
@@ -115,14 +135,13 @@ TEST_F(PreambleHoistTest, OversizedPreambleOutputIsNotHoistable)
    nir_builder b = make_vs("hoist_reject_oversized");
 
    nir_def *root = nir_load_preamble(&b, 1, 64, .base = 60);
-   nir_def *ubo_ptr = nir_load_global_constant(&b, 1, 64, root, .align_mul = 8);
    nir_def *vid = nir_load_vertex_id(&b);
    nir_def *acc = nir_imm_vec4(&b, 0.0f, 0.0f, 0.0f, 0.0f);
 
    /* 17 distinct vec4s = 68 dwords = 136 halfs > 128-half hoist cap. */
    for (unsigned i = 0; i < 17; ++i) {
       nir_def *v = nir_load_global_constant(&b, 4, 32,
-                                            nir_iadd_imm(&b, ubo_ptr, i * 16),
+                                            nir_iadd_imm(&b, root, i * 16),
                                             .align_mul = 16);
       nir_def *s = nir_fadd(&b, v, nir_imm_float(&b, (float)(i + 1)));
       nir_def *cond = nir_ieq_imm(&b, vid, i);

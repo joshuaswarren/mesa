@@ -383,7 +383,8 @@ pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
     * the raw word. */
    const bool lower_r11g11b10 =
       ctx->lower_r11g11b10 &&
-      logical_format == PIPE_FORMAT_R11G11B10_FLOAT;
+      (logical_format == PIPE_FORMAT_R11G11B10_FLOAT ||
+       logical_format == PIPE_FORMAT_R9G9B9E5_FLOAT);
    const bool native_r11g11b10 =
       ctx->lower_g17p_formats && logical_format == PIPE_FORMAT_R11G11B10_FLOAT;
    const bool raw_r11g11b10 = lower_r11g11b10 || native_r11g11b10;
@@ -468,15 +469,20 @@ pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
       /* An RGBX/BGRX target lives in a 4-channel tile whose fourth channel
        * reaches memory (the PBE has no constant swizzle source).  Write 1.0
-       * there so the X byte is 0xff rather than whatever the tile held: a
-       * display firmware that blends the byte as alpha (Apple H17P) otherwise
-       * shows the frame scaled by it. Requested by G18G, whose PBE points
-       * swizzle_a at this channel.
+       * there so the X channel is all-ones rather than whatever the tile held:
+       * a display firmware that blends the channel as alpha (Apple H17P, or
+       * DCP L10R on 10-bit RGBX) otherwise shows the frame scaled by it.
+       * Requested by G18G for all RGBX/BGRX formats, and required on G17P/M5
+       * for RGB10X2/BGR10X2 because AGX3's packed RGB10A2 tile store always
+       * encodes all four channels into one 32-bit word.
        */
       const struct util_format_description *ldesc =
          util_format_description(logical_format);
       const bool x_alpha =
-         ctx->x_alpha_one && comps == 3 && ldesc->nr_channels == 4 &&
+         (ctx->x_alpha_one ||
+          (ctx->lower_g17p_formats &&
+           (enum ail_isa_format)format == AIL_ISA_FORMAT_RGB10A2)) &&
+         comps == 3 && ldesc->nr_channels == 4 &&
          ldesc->channel[3].type == UTIL_FORMAT_TYPE_VOID &&
          util_format_get_nr_components(format) == 4 &&
          !util_format_is_pure_integer(logical_format) && !lower_r11g11b10;
@@ -654,8 +660,11 @@ agx_nir_lower_tilebuffer_with_conversions_info(
          nir_function_impl *impl = nir_shader_get_entrypoint(shader);
          nir_builder b = nir_builder_at(nir_after_impl(impl));
          enum pipe_format logical = tib->logical_format[i];
-         const bool raw_r11g11b10 = (lower_r11g11b10 || lower_g17p_formats) &&
-                                  logical == PIPE_FORMAT_R11G11B10_FLOAT;
+         const bool raw_r11g11b10 =
+            (lower_r11g11b10 &&
+             (logical == PIPE_FORMAT_R11G11B10_FLOAT ||
+              logical == PIPE_FORMAT_R9G9B9E5_FLOAT)) ||
+            (lower_g17p_formats && logical == PIPE_FORMAT_R11G11B10_FLOAT);
          enum pipe_format format = raw_r11g11b10 ? PIPE_FORMAT_R32_UINT :
             (lower_srgb || lower_g17p_formats) && util_format_is_srgb(logical)
                ? (enum pipe_format)AIL_ISA_FORMAT_U8NORM

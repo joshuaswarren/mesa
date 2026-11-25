@@ -30,14 +30,25 @@ struct hk_buffer {
 
    /** One residency bit per sparse-buffer page on Gen9/Gen10 AGX3. */
    struct agx_bo *sparse_map;
+   /** Capture/replay VA bound to sparse_map, NULL when not capture/replay. */
+   struct agx_va *sparse_map_va;
    uint32_t sparse_map_entries;
    /** Link in hk_device::sparse_buffers while sparse_map is set. */
    struct list_head sparse_link;
 };
 
+static inline uint64_t
+hk_buffer_sparse_map_addr(const struct hk_buffer *buffer)
+{
+   if (buffer->sparse_map_va)
+      return buffer->sparse_map_va->addr;
+   return buffer->sparse_map ? buffer->sparse_map->va->addr : 0;
+}
+
 /* VK_EXT_descriptor_buffer capture/replay data of a buffer */
 struct hk_buffer_capture {
    uint64_t va;
+   uint64_t sparse_map_va;
 };
 
 struct hk_sparse_buffer_map_header {
@@ -149,6 +160,9 @@ uint32_t hk_buffer_sparse_texel_word(const struct hk_buffer *buffer,
                                      unsigned blocksize_B);
 uint32_t hk_sparse_texel_word_at(struct hk_device *dev, uint64_t address,
                                  unsigned blocksize_B);
+/* The residency map page of the sparse buffer holding address, as
+ * hk_buffer_address::sparse_map_page carries it, 0 for none. */
+uint32_t hk_sparse_map_page_at(struct hk_device *dev, uint64_t address);
 bool hk_sparse_address_is_sparse(struct hk_device *dev, uint64_t address);
 
 /* Publish a bound/unbound sparse buffer range to physical pointer reads. */

@@ -344,9 +344,119 @@ check_mip_16x16_tile64_morton(void)
    }
 }
 
+static void
+check_g18g_meta_copy_admission(void)
+{
+   const struct hk_g17p_buffer_to_image_copy comp = {
+      .chip = AGX_CHIP_G18G,
+      .format = VK_FORMAT_ASTC_4x4_SRGB_BLOCK,
+      .plane_format_renderable = false,
+      .layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      .image_type = VK_IMAGE_TYPE_3D,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .plane_count = 1,
+      .mip_levels = 1,
+      .array_layers = 1,
+      .image_extent = {16, 16, 4},
+      .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+      .mip_level = 0,
+      .base_array_layer = 0,
+      .layer_count = 1,
+      .image_offset = {0, 0, 0},
+      .copy_extent = {16, 16, 4},
+   };
+   struct hk_g17p_compressed_copy_plan plan;
+   EXPECT(hk_g17p_compressed_buffer_to_image_copy_plan(&comp, 0, 16384, &plan),
+          "G18G compressed 3D buffer-to-image plan refused");
+
+   struct hk_g17p_buffer_to_image_copy color = comp;
+   color.format = VK_FORMAT_R8G8B8A8_UNORM;
+   color.plane_format_renderable = true;
+   EXPECT(hk_g17p_buffer_to_image_copy_supported(&color),
+          "G18G graphics buffer-to-image copy refused");
+
+   const VkImageCopy2 region = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
+      .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .extent = {16, 16, 4},
+   };
+   VkImageCopy2 slice;
+   EXPECT(hk_g17p_image_copy_slice(AGX_CHIP_G18G, VK_IMAGE_TYPE_3D,
+                                   VK_IMAGE_TYPE_3D, 4, 4, &region, 2, &slice) &&
+             slice.extent.depth == 1 && slice.srcOffset.z == 2 &&
+             slice.dstOffset.z == 2,
+          "G18G 3D image copy slice helper refused");
+}
+
+static void
+check_resolve_slice(void)
+{
+   /* Multi-layer 2D array resolve on native AGX3: splits into single-layer
+    * passes. The sample count comes from srcSubresource.layerCount. */
+   const VkImageResolve2 region = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_RESOLVE_2,
+      .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 2, 3},
+      .srcOffset = {0, 0, 0},
+      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 2, 3},
+      .dstOffset = {0, 0, 0},
+      .extent = {64, 64, 1},
+   };
+   VkImageResolve2 out;
+
+   EXPECT(hk_g17p_image_resolve_slice(AGX_CHIP_G16G, VK_IMAGE_TYPE_2D,
+                                      VK_IMAGE_TYPE_2D, 3, 3, &region, 0,
+                                      &out) &&
+             out.srcSubresource.baseArrayLayer == 2 &&
+             out.srcSubresource.layerCount == 1 &&
+             out.dstSubresource.baseArrayLayer == 2 &&
+             out.dstSubresource.layerCount == 1 &&
+             out.extent.width == 64 && out.extent.height == 64,
+          "G16G resolve slice helper refused slice 0");
+
+   EXPECT(hk_g17p_image_resolve_slice(AGX_CHIP_G17P, VK_IMAGE_TYPE_2D,
+                                      VK_IMAGE_TYPE_2D, 5, 5, &region, 2,
+                                      &out) &&
+             out.srcSubresource.baseArrayLayer == 4 &&
+             out.srcSubresource.layerCount == 1 &&
+             out.dstSubresource.baseArrayLayer == 4 &&
+             out.dstSubresource.layerCount == 1,
+          "G17P resolve slice helper refused slice 2");
+
+   /* Non-native-AGX3 chips, 3D image types, mismatched layer counts and
+    * out-of-range slices are refused. */
+   EXPECT(!hk_g17p_image_resolve_slice(AGX_CHIP_G13G, VK_IMAGE_TYPE_2D,
+                                       VK_IMAGE_TYPE_2D, 3, 3, &region, 0,
+                                       &out),
+          "AGX2 should refuse resolve slice helper");
+   EXPECT(!hk_g17p_image_resolve_slice(AGX_CHIP_G17P, VK_IMAGE_TYPE_3D,
+                                       VK_IMAGE_TYPE_2D, 3, 3, &region, 0,
+                                       &out),
+          "3D source should refuse resolve slice helper");
+   EXPECT(!hk_g17p_image_resolve_slice(AGX_CHIP_G17P, VK_IMAGE_TYPE_2D,
+                                       VK_IMAGE_TYPE_2D, 3, 4, &region, 0,
+                                       &out),
+          "mismatched layer counts should refuse resolve slice helper");
+   EXPECT(!hk_g17p_image_resolve_slice(AGX_CHIP_G17P, VK_IMAGE_TYPE_2D,
+                                       VK_IMAGE_TYPE_2D, 3, 3, &region, 3,
+                                       &out),
+          "slice past layer count should refuse resolve slice helper");
+
+   /* Non-zero z offsets are refused: VkImageResolve addresses 2D arrays
+    * through baseArrayLayer, not z. */
+   VkImageResolve2 bad_z_src = region;
+   bad_z_src.srcOffset.z = 1;
+   EXPECT(!hk_g17p_image_resolve_slice(AGX_CHIP_G17P, VK_IMAGE_TYPE_2D,
+                                       VK_IMAGE_TYPE_2D, 3, 3, &bad_z_src, 0,
+                                       &out),
+          "non-zero srcOffset.z should refuse resolve slice helper");
+}
+
 int
 main(void)
 {
+   check_g18g_meta_copy_admission();
+   check_resolve_slice();
    check_layered_layouts();
    check_mip_split();
    check_exact_2x2_rounding();

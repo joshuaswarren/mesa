@@ -171,7 +171,7 @@ instr_mem_space(const agx_instr *I)
 static struct dag *
 create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniforms,
            struct util_dynarray *all_nodes, struct sched_dag_state *state,
-           bool reorder_loads)
+           bool reorder_loads, bool reorder_indep_loads)
 {
    struct dag *dag = dag_create(ctx);
    struct util_dynarray nodes;
@@ -196,6 +196,11 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniform
     * serialize all spaces. */
    struct sched_node *memory_load[SCHED_MEM_NUM] = {NULL};
    struct sched_node *memory_store[SCHED_MEM_NUM] = {NULL};
+   struct util_dynarray pending_loads[SCHED_MEM_NUM];
+   if (reorder_indep_loads) {
+      for (unsigned sp = 0; sp < SCHED_MEM_NUM; ++sp)
+         util_dynarray_init(&pending_loads[sp], memctx);
+   }
 
    /* Last unified-vertex-store write, to keep UVS writeout in program order.
     *
@@ -273,21 +278,48 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniform
 
       if (barrier) {
          for (unsigned sp = 0; sp < SCHED_MEM_NUM; ++sp) {
+            if (reorder_indep_loads) {
+               util_dynarray_foreach(&pending_loads[sp], struct sched_node *, l)
+                  add_dep(node, *l);
+               util_dynarray_clear(&pending_loads[sp]);
+            }
             serialize(node, &memory_load[sp]);
             serialize(node, &memory_store[sp]);
          }
       } else {
          const enum sched_mem_space sp = instr_mem_space(I);
 
-         if (dep == AGX_SCHEDULE_CLASS_STORE)
-            add_dep(node, memory_load[sp]);
-         else if (dep == AGX_SCHEDULE_CLASS_ATOMIC)
-            serialize(node, &memory_load[sp]);
+         /* Independent non-coherent device/local loads have no RAR hazard
+          * with each other: order them after prior stores/atomics/barriers
+          * while allowing outer loads in two-level indirect chains to issue
+          * ahead of inner dependent loads. Stores, atomics, barriers, and
+          * coherent loads still flush pending_loads to preserve WAR/RAW. */
+         if (reorder_indep_loads && dep == AGX_SCHEDULE_CLASS_LOAD &&
+             !I->coherent &&
+             (I->op == AGX_OPCODE_DEVICE_LOAD ||
+              I->op == AGX_OPCODE_LOCAL_LOAD)) {
+            add_dep(node, memory_store[sp]);
+            util_dynarray_append(&pending_loads[sp], node);
+         } else {
+            if (reorder_indep_loads &&
+                (dep == AGX_SCHEDULE_CLASS_LOAD ||
+                 dep == AGX_SCHEDULE_CLASS_STORE ||
+                 dep == AGX_SCHEDULE_CLASS_ATOMIC)) {
+               util_dynarray_foreach(&pending_loads[sp], struct sched_node *, l)
+                  add_dep(node, *l);
+               util_dynarray_clear(&pending_loads[sp]);
+            }
 
-         if (dep == AGX_SCHEDULE_CLASS_LOAD ||
-             dep == AGX_SCHEDULE_CLASS_STORE ||
-             dep == AGX_SCHEDULE_CLASS_ATOMIC)
-            serialize(node, &memory_store[sp]);
+            if (dep == AGX_SCHEDULE_CLASS_STORE)
+               add_dep(node, memory_load[sp]);
+            else if (dep == AGX_SCHEDULE_CLASS_ATOMIC)
+               serialize(node, &memory_load[sp]);
+
+            if (dep == AGX_SCHEDULE_CLASS_LOAD ||
+                dep == AGX_SCHEDULE_CLASS_STORE ||
+                dep == AGX_SCHEDULE_CLASS_ATOMIC)
+               serialize(node, &memory_store[sp]);
+         }
       }
 
       if (dep == AGX_SCHEDULE_CLASS_COVERAGE || barrier)
@@ -627,7 +659,7 @@ agx_pressure_schedule(agx_context *ctx)
 
       util_dynarray_clear(&all_nodes);
       sctx.dag = create_dag(ctx, block, memctx, native_uniforms, &all_nodes,
-                            &dag_state, false);
+                            &dag_state, false, false);
       /* Preserve the original order if a complete dependency graph cannot be
        * built (invalid range or workspace allocation failure). */
       if (!sctx.dag)
@@ -687,7 +719,7 @@ agx_pressure_schedule(agx_context *ctx)
 /* Samples a fragment block may issue ahead of the first unissued one. */
 #define AGX_ILP_FS_HOIST_SAMPLES 6
 
-/* Whether an AGX3B fragment sample or texel fetch can allocate disjoint
+/* Whether an AGX3B sample or texel fetch can allocate disjoint
  * staging banks in agx3_pack_binary.c and genuinely overlap in flight.
  * Non-relocatable forms (register-descriptor 2D_ARRAY samples, 3D or cube
  * samples, gradient/register-LOD/dynamic-offset samples, and multisample or
@@ -695,7 +727,7 @@ agx_pressure_schedule(agx_context *ctx)
  * inflates GPR pressure and forces serializing result-wait barriers between
  * consecutive samples. */
 static bool
-ilp_agx3b_fragment_sample_relocatable(const agx_instr *I)
+ilp_agx3b_sample_relocatable(const agx_instr *I)
 {
    switch (I->op) {
    case AGX_OPCODE_TEXTURE_SAMPLE: {
@@ -736,6 +768,17 @@ ilp_agx3b_fragment_sample_relocatable(const agx_instr *I)
    }
 }
 
+/* Traversal pressure affects the amount of work in flight. Fragment
+ * programs also retain their tuned policy: sample staging and constrained
+ * operands can exhaust their low banks well before the full file fills. */
+static bool
+ilp_dynamic_caching(const agx_context *ctx)
+{
+   return agx_isa_is_agx3(ctx->key->dev.encoding) &&
+          !ctx->key->dev.emit_agx3d && !ctx->is_preamble &&
+          ctx->stage != MESA_SHADER_FRAGMENT && !ctx->key->is_helper && !(ctx->out && ctx->out->uses_ray_traversal);
+}
+
 /* A sample for the sample-issue schedule. AGX3 encodes a storage-image read as
  * the same native SMP as a texture fetch (Apple's texture.read), so it has
  * the same latency to hide and is batched the same way. */
@@ -743,8 +786,8 @@ static bool
 ilp_is_sample(const agx_context *ctx, const agx_instr *I)
 {
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-       ctx->stage == MESA_SHADER_FRAGMENT)
-      return ilp_agx3b_fragment_sample_relocatable(I);
+       (ctx->stage == MESA_SHADER_FRAGMENT || ilp_dynamic_caching(ctx)))
+      return ilp_agx3b_sample_relocatable(I);
 
    return I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
           I->op == AGX_OPCODE_TEXTURE_LOAD ||
@@ -1086,13 +1129,14 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                    bool order_edges_free, signed fwd_cap,
                    unsigned hoist_samples, bool hoist_past_writes,
                    bool hoist_loads, bool loads_in_flight, bool interleave_alu,
-                   bool interleave_in_flight,
+                   bool interleave_in_flight, bool chained_loads,
                    struct sched_dag_state *dag_state)
 {
    struct util_dynarray all;
    util_dynarray_init(&all, memctx);
    struct dag *dag = create_dag(ctx, block, memctx, native_uniforms, &all,
-                                dag_state, hoist_past_writes);
+                                dag_state, hoist_past_writes,
+                                chained_loads && hoist_loads && loads_in_flight);
    if (!dag)
       return false;
 
@@ -1264,12 +1308,14 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
             const bool hoist_b = first_sample[best] < window;
             if (hoist_i != hoist_b)
                better = hoist_i;
-            else if (interleave_in_flight && in_flight && !hoist_i &&
-                     first_sample[i] == ~0u && first_sample[best] == ~0u &&
-                     t != best_t)
-               /* Among ready work that consumes no load, prefer what is
-                * ready earlier, so independent ALU chains interleave while
-                * loads are in flight instead of issuing in source order. */
+            else if (interleave_in_flight && in_flight && t != best_t &&
+                     ((chained_loads && hoist_i) ||
+                      (!hoist_i && first_sample[i] == ~0u &&
+                       first_sample[best] == ~0u)))
+               /* Among ready work inside the hoist window of a two-level
+                * indirect load chain (such as an independent outer load vs an
+                * ALU consumer stalled on an earlier load) or ready work that
+                * consumes no load, prefer what is ready earlier. */
                better = t < best_t;
             else
                better = i < (unsigned)best;
@@ -1487,13 +1533,58 @@ ilp_block_samples(const agx_context *ctx, const agx_block *block)
 }
 
 static unsigned
-ilp_block_compute_loads(const agx_block *block)
+ilp_block_compute_loads(const agx_block *block, unsigned *device_loads)
 {
-   unsigned loads = 0;
-   agx_foreach_instr_in_block(block, I)
-      loads += I->op == AGX_OPCODE_DEVICE_LOAD ||
-               I->op == AGX_OPCODE_LOCAL_LOAD;
-   return loads;
+   unsigned local_loads = 0;
+   *device_loads = 0;
+   agx_foreach_instr_in_block(block, I) {
+      *device_loads += I->op == AGX_OPCODE_DEVICE_LOAD;
+      local_loads += I->op == AGX_OPCODE_LOCAL_LOAD;
+   }
+   return *device_loads + local_loads;
+}
+
+/* True when a compute block contains a two-level indirect load chain where a
+ * device/local load consumes an SSA value derived from an earlier device/local
+ * load in the same block. */
+static bool
+ilp_block_has_chained_loads(const agx_context *ctx, const agx_block *block,
+                            void *memctx)
+{
+   bool *from_load = rzalloc_array(memctx, bool, MAX2(ctx->alloc, 1));
+   if (!from_load)
+      return false;
+
+   bool chained = false;
+   agx_foreach_instr_in_block(block, I) {
+      if (instr_after_logical_end(I))
+         break;
+
+      bool reads_load = false;
+      agx_foreach_ssa_src(I, s) {
+         if (I->src[s].value < ctx->alloc && from_load[I->src[s].value]) {
+            reads_load = true;
+            break;
+         }
+      }
+
+      const bool is_load = I->op == AGX_OPCODE_DEVICE_LOAD ||
+                           I->op == AGX_OPCODE_LOCAL_LOAD;
+      if (is_load && reads_load) {
+         chained = true;
+         break;
+      }
+
+      if (is_load || reads_load) {
+         agx_foreach_ssa_dest(I, d) {
+            if (I->dest[d].value < ctx->alloc)
+               from_load[I->dest[d].value] = true;
+         }
+      }
+   }
+
+   ralloc_free(from_load);
+   return chained;
 }
 
 /* True when a block emits multiple ST_TILE stores to the same pixel_offset and
@@ -1584,7 +1675,7 @@ ilp_block_sample_halves(const agx_context *ctx, const agx_block *block)
 #define AGX_ILP_M5_LOOP_MIN_SAMPLES 2
 
 static bool
-ilp_m5_copy_block(const agx_context *ctx, const agx_block *block)
+ilp_copy_block(const agx_context *ctx, const agx_block *block)
 {
    return ilp_block_samples(ctx, block) >= AGX_ILP_FS_MIN_SAMPLES &&
           ilp_block_writes_memory(block);
@@ -1597,7 +1688,7 @@ ilp_m5_copy_block(const agx_context *ctx, const agx_block *block)
  * Rematerialize such constants in the copy block, ahead of their first use
  * there (Apple computes these coordinates in the loop, with IADD). */
 static bool
-ilp_m5_sink_constants(agx_context *ctx, agx_block *block,
+ilp_sink_copy_constants(agx_context *ctx, agx_block *block,
                       agx_instr **defs, agx_block **def_blocks, void *memctx)
 {
    unsigned *remap = rzalloc_array(memctx, unsigned, MAX2(ctx->alloc, 1));
@@ -1816,6 +1907,21 @@ agx_ilp_agx3b_fragment_cap(agx_context *ctx, uint8_t **size16_out, void *memctx)
           AGX_ILP_M5_OCCUPANCY_MARGIN;
 }
 
+/* Work within the shader's physical budget, retaining space for later
+ * lowering, vector alignment and the allocator's late kills. The sample
+ * issue path separately bounds forward pressure, and RA applies the ISA's
+ * operand limits to the actual source and destination registers. */
+static signed
+ilp_dynamic_growth(signed program_peak, signed block_peak, unsigned budget,
+                   unsigned window_halves)
+{
+   const signed cap = (signed)budget - AGX_ILP_FS_SAMPLE_SLACK;
+   if (program_peak > cap)
+      return 0;
+
+   return MIN2(MAX2(cap - block_peak, 0), (signed)window_halves);
+}
+
 void
 agx_ilp_schedule(agx_context *ctx)
 {
@@ -1858,35 +1964,30 @@ agx_ilp_schedule(agx_context *ctx)
 
    const bool is_agx3 = agx_isa_is_agx3(ctx->key->dev.encoding);
    const bool m5 = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
+   const bool dynamic = ilp_dynamic_caching(ctx);
    const bool m5_compute =
       m5 && ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble;
    const bool shared_compute_loads =
       !ctx->is_preamble && ctx->stage == MESA_SHADER_COMPUTE &&
       !ctx->key->dev.emit_agx3d;
-   /* M5 compute uses only the sample-issue schedule below, as Apple's
-    * compute kernels issue independent samples back to back (svgfVariance:
-    * nine SMP in a row, then the accumulation).
-    *
-    * Other M5 geometry-side stages (vertex and its lowered relatives) take
-    * the same occupancy-capped sample-issue schedule, but only for blocks
-    * that also write memory (copy loops); everything else keeps the shared
-    * AGX3 policy below. */
-   const bool m5_copy = m5 && !ctx->is_preamble &&
+   /* Geometry-side stages use the sample schedule for copies and loop
+    * samples, while other blocks retain their usual schedule below. */
+   const bool geometry_copy = (m5 || dynamic) && !ctx->is_preamble &&
       ctx->stage != MESA_SHADER_COMPUTE &&
       ctx->stage != MESA_SHADER_FRAGMENT;
-   /* Copy blocks the M5 sample-issue schedule newly covers: every such block
-    * of those other stages, and compute loop bodies. */
+   /* Geometry copy blocks and compute copy loops use the sample schedule. */
    bool *copy_mode = rzalloc_array(memctx, bool, MAX2(nr_blocks, 1));
    if (!copy_mode) {
       ralloc_free(memctx);
       return;
    }
    bool any_copy = false;
-   if (m5_copy || m5_compute) {
+   if (geometry_copy || m5_compute ||
+       (dynamic && ctx->stage == MESA_SHADER_COMPUTE)) {
       agx_foreach_block(ctx, block) {
          if (block->index < nr_blocks &&
-             (m5_copy || in_loop[block->index]) &&
-             ilp_m5_copy_block(ctx, block)) {
+             (geometry_copy || in_loop[block->index]) &&
+             ilp_copy_block(ctx, block)) {
             copy_mode[block->index] = true;
             any_copy = true;
          }
@@ -1911,7 +2012,7 @@ agx_ilp_schedule(agx_context *ctx)
       bool sunk = false;
       agx_foreach_block(ctx, block) {
          if (block->index < nr_blocks && copy_mode[block->index])
-            sunk |= ilp_m5_sink_constants(ctx, block, defs, def_blocks, memctx);
+            sunk |= ilp_sink_copy_constants(ctx, block, defs, def_blocks, memctx);
       }
       if (sunk) {
          agx_dce(ctx, true);
@@ -1919,7 +2020,7 @@ agx_ilp_schedule(agx_context *ctx)
       }
    }
 
-   /* Geometry-side M5 loop blocks with several samples and no memory writes:
+   /* Geometry-side loop blocks with several samples and no memory writes:
     * after agx_nir_opt_sink_loop_sample_uses the robustness2 sampled_image
     * 3D vertex loop ends in a block holding two samples and the consumers of
     * all twelve; the pressure order placed those two samples late, behind
@@ -1929,7 +2030,7 @@ agx_ilp_schedule(agx_context *ctx)
       ralloc_free(memctx);
       return;
    }
-   if (m5_copy) {
+   if (geometry_copy) {
       agx_foreach_block(ctx, block) {
          if (block->index < nr_blocks && in_loop[block->index] &&
              !copy_mode[block->index] &&
@@ -1938,14 +2039,15 @@ agx_ilp_schedule(agx_context *ctx)
       }
    }
 
-   /* M5 fragments: the same occupancy-capped growth as M5 compute where it
-    * exceeds the G17P fragment slack below. */
+   /* Keep the legacy fragment policy for shaders outside Dynamic Caching ILP. */
    const bool m5_fragment = m5 && !ctx->is_preamble &&
       ctx->stage == MESA_SHADER_FRAGMENT;
 
    uint8_t *size16 = NULL;
-   signed m5_occupancy_cap = 0, m5_load_cap = 0;
-   if (shared_compute_loads || m5_copy || m5_fragment || ctx->is_preamble) {
+   signed occupancy_cap = 0, load_cap = 0, program_peak = 0;
+   const bool measure_peak =
+      m5_compute || shared_compute_loads || geometry_copy || m5_fragment;
+   if (measure_peak || ctx->is_preamble) {
       size16 = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
       if (!size16) {
          ralloc_free(memctx);
@@ -1956,24 +2058,29 @@ agx_ilp_schedule(agx_context *ctx)
             size16[I->dest[d].value] = agx_index_size_16(I->dest[d]);
       }
    }
-   if (shared_compute_loads || m5_copy || m5_fragment) {
-      signed program_peak = 0;
+   if (measure_peak) {
       agx_foreach_block(ctx, block)
          program_peak = MAX2(program_peak,
                              ilp_block_peak(ctx, block, size16, memctx));
-      /* Keep a margin for register-allocation alignment. */
+   }
+   if (measure_peak && !dynamic) {
+      /* Keep the original occupancy policy for static splits and traversal. */
       if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN <= AGX_ILP_M5_MAX_HALVES) {
-         m5_occupancy_cap = agx_occupancy_for_register_count(
+         occupancy_cap = agx_occupancy_for_register_count(
             program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN).max_registers -
             AGX_ILP_M5_OCCUPANCY_MARGIN;
-         m5_load_cap = agx_ilp_m5_device_load_cap(program_peak);
+         load_cap = agx_ilp_m5_device_load_cap(program_peak);
          if (!is_agx3 && mesa_shader_stage_is_compute(ctx->stage)) {
             signed static_cap = ilp_static_compute_cap(ctx);
-            m5_occupancy_cap = MIN2(m5_occupancy_cap, static_cap);
-            m5_load_cap = MIN2(m5_load_cap, static_cap);
+            occupancy_cap = MIN2(occupancy_cap, static_cap);
+            load_cap = MIN2(load_cap, static_cap);
          }
       }
    }
+
+   const unsigned budget = dynamic ? agx3_register_budget(ctx) : 0;
+   const signed device_load_cap =
+      shared_compute_loads ? agx_ilp_m5_device_load_cap(program_peak) : 0;
 
    agx_foreach_block(ctx, block) {
       if (block->index >= nr_blocks)
@@ -1989,53 +2096,110 @@ agx_ilp_schedule(agx_context *ctx)
        * load at a time, as it would for samples. A copy block keeps its own
        * schedule. Exclude G18G (AGX3C with emit_agx3d). */
       const bool compute_loads = shared_compute_loads && !copy;
-      const unsigned loads = compute_loads ? ilp_block_compute_loads(block) : 0;
+      unsigned device_loads = 0;
+      const unsigned loads =
+         compute_loads ? ilp_block_compute_loads(block, &device_loads) : 0;
       const unsigned samples = ilp_block_samples(ctx, block);
+      const bool small_loop_loads =
+         compute_loads && in_loop[block->index] &&
+         loads >= AGX_ILP_M5_LOOP_MIN_SAMPLES &&
+         samples + loads < AGX_ILP_FS_MIN_SAMPLES &&
+         device_load_cap > 0 &&
+         (!ctx->nir || !ctx->nir->info.cs.has_cooperative_matrix);
       const bool take_compute_hoist =
          (m5_compute || copy || loop_samples) ||
+         (dynamic && shared_compute_loads &&
+          samples >= AGX_ILP_FS_MIN_SAMPLES) ||
          (compute_loads && (!in_loop[block->index] || loads) &&
-          samples + loads >= AGX_ILP_FS_MIN_SAMPLES);
+          (samples + loads >= AGX_ILP_FS_MIN_SAMPLES || small_loop_loads));
       if (take_compute_hoist) {
-         if ((!in_loop[block->index] || copy || loop_samples || loads) &&
-             samples + loads >=
-                (loop_samples ? AGX_ILP_M5_LOOP_MIN_SAMPLES
-                              : AGX_ILP_FS_MIN_SAMPLES)) {
-            /* Let the block's peak grow only up to the largest register
-             * count with the occupancy the whole program already has, so
-             * batching never costs threads; a program at or past the last
-             * bucket (the spilling raygens) may not grow at all. */
+         if ((!in_loop[block->index] || copy || loop_samples || loads ||
+              (dynamic && samples >= AGX_ILP_FS_MIN_SAMPLES)) &&
+             (samples + loads >=
+                 (loop_samples ? AGX_ILP_M5_LOOP_MIN_SAMPLES
+                               : AGX_ILP_FS_MIN_SAMPLES) ||
+              small_loop_loads)) {
             const signed peak = ilp_block_peak(ctx, block, size16, memctx);
-            signed growth = m5_occupancy_cap > peak
-                               ? m5_occupancy_cap - peak : 0;
+            const unsigned sample_halves = dynamic || loop_samples
+               ? ilp_block_sample_halves(ctx, block) : 0;
+            signed growth = dynamic
+               ? ilp_dynamic_growth(program_peak, peak, budget,
+                                    MIN2(sample_halves, AGX_ILP_FS_SAMPLE_HALVES) +
+                                       AGX_ILP_FS_SAMPLE_SLACK)
+               : MAX2(occupancy_cap - peak, 0);
             /* A loop block's samples otherwise complete one after another
              * on every iteration. Let the block hold all of its sample
              * results in flight, plus the fragment sample-issue slack for
              * their operands, even past the occupancy bucket (the
              * robustness2 3D vertex loop's last block: two vec4 results,
              * 21 halves of growth). */
-            if (loop_samples) {
-               growth = MAX2(growth, ilp_block_sample_halves(ctx, block) +
-                                        AGX_ILP_FS_SAMPLE_SLACK);
+            if (loop_samples && !dynamic)
+               growth = MAX2(growth, sample_halves + AGX_ILP_FS_SAMPLE_SLACK);
+            /* Compute loops already carry values across iterations. Bound
+             * extra live state to the results of one window of vec4 samples.
+             * The copy schedule has its own window and immediate consumers. */
+            if (dynamic && !copy && in_loop[block->index] &&
+                ctx->stage == MESA_SHADER_COMPUTE) {
+               const unsigned vec4_halves = 4 * agx_size_align_16(AGX_SIZE_32);
+               growth = MIN2(growth,
+                  (signed)(AGX_ILP_FS_HOIST_SAMPLES * vec4_halves));
             }
-            if (loads && m5_load_cap > 0) {
+
+            if (loads && (dynamic || load_cap > 0)) {
                /* Prefer to hoist a bounded window of loads ahead of the oldest
                 * one no instruction has read yet, whichever first fits the
-                * program's occupancy step. This ranks candidates; register
+                * register budget. This ranks candidates; register
                 * pressure and scoreboard waits remain what keeps the schedule
-                * safe. */
-               static const unsigned windows[] = {4, 2, 1};
-               const signed load_growth =
-                  m5_load_cap > peak ? m5_load_cap - peak : 0;
+                * safe. Wider windows for indirect chains and AGX3B device
+                * loads must fit inside the program's current occupancy step. */
+               static const unsigned flat_windows[] = {8, 6, 4, 2, 1};
+               static const unsigned chained_windows[] = {12, 8, 4, 2, 1};
+               const bool chained =
+                  ctx->key->has_scratch &&
+                  (!ctx->nir || !ctx->nir->info.internal) &&
+                  ilp_block_has_chained_loads(ctx, block, memctx);
+               const unsigned *windows =
+                  chained ? chained_windows : flat_windows;
+               const unsigned nwindows =
+                  chained ? ARRAY_SIZE(chained_windows)
+                          : ARRAY_SIZE(flat_windows);
+               /* Allow room for the load window's operands and results. */
+               const signed load_growth = dynamic
+                  ? ilp_dynamic_growth(program_peak, peak, budget,
+                                       AGX_ILP_FS_SAMPLE_HALVES)
+                  : MAX2(load_cap - peak, 0);
+               const signed occ_step_cap =
+                  (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN <=
+                   AGX_ILP_M5_MAX_HALVES)
+                     ? agx_occupancy_for_register_count(
+                          program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN)
+                             .max_registers -
+                          AGX_ILP_M5_OCCUPANCY_MARGIN
+                     : 0;
+               const bool wide_flat =
+                  ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                  device_loads == loads && loads > 4 && device_load_cap > peak;
+               const signed step_cap = small_loop_loads || !chained
+                                          ? device_load_cap : occ_step_cap;
                /* Each window first tries interleaving independent ALU chains
                 * while loads are in flight, then the source order. */
                bool scheduled = false;
-               for (unsigned w = 0; w < ARRAY_SIZE(windows) && !scheduled; ++w) {
+               for (unsigned w = 0; w < nwindows && !scheduled; ++w) {
+                  if (!chained && windows[w] > 4 && !wide_flat)
+                     continue;
+
+                  const bool occ_cap = windows[w] > 4 || small_loop_loads;
+                  const signed w_growth =
+                     occ_cap ? MIN2(load_growth, MAX2(step_cap - peak, 0))
+                             : load_growth;
+                  if (occ_cap && w_growth <= 0)
+                     continue;
                   for (unsigned pass = 0; pass < 2 && !scheduled; ++pass) {
                      scheduled = ilp_schedule_block(
                         ctx, block, memctx, native_uniforms, alu_latency,
-                        16 * alu_latency, load_growth, 0, NULL, false, true,
+                        16 * alu_latency, w_growth, 0, NULL, false, true,
                         AGX_ILP_FS_SAMPLE_HALVES, windows[w], false, true, true,
-                        false, pass == 0, &dag_state);
+                        false, pass == 0, chained, &dag_state);
                   }
                }
             } else {
@@ -2044,7 +2208,7 @@ agx_ilp_schedule(agx_context *ctx)
                                   NULL, false, true, AGX_ILP_FS_SAMPLE_HALVES,
                                   copy ? AGX_ILP_M5_COPY_SAMPLES
                                        : AGX_ILP_FS_HOIST_SAMPLES,
-                                  copy, loads > 0, false, false, false,
+                                  copy, loads > 0, false, false, false, false,
                                   &dag_state);
             }
          }
@@ -2067,12 +2231,13 @@ agx_ilp_schedule(agx_context *ctx)
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, AGX_ILP_SLACK, 0, NULL, is_agx3,
                             false, 0, 0, false, false, false, is_agx3 && !m5,
-                            false, &dag_state);
+                            false, false, &dag_state);
       } else if (!in_loop[block->index] && ilp_single_tile_blend(ctx, block)) {
          /* Hardware-qualified color-only budget; leave loop pressure alone. */
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, 8, 0, NULL, is_agx3, false, 0, 0,
-                            false, false, false, false, false, &dag_state);
+                            false, false, false, false, false, false,
+                            &dag_state);
       } else if (!in_loop[block->index] && !ctx->is_preamble &&
                  ctx->stage == MESA_SHADER_FRAGMENT &&
                  /* On AGX3B, agx3_tile_store_bank() assumes per-sample ST_TILE
@@ -2090,7 +2255,7 @@ agx_ilp_schedule(agx_context *ctx)
          signed slack = AGX_ILP_FS_SAMPLE_SLACK;
          if (m5_fragment) {
             const signed peak = ilp_block_peak(ctx, block, size16, memctx);
-            slack = MAX2(slack, m5_occupancy_cap - peak);
+            slack = MAX2(slack, occupancy_cap - peak);
          } else if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
             if (!agx3b_frag_cap_ready) {
                agx3b_frag_cap =
@@ -2106,7 +2271,7 @@ agx_ilp_schedule(agx_context *ctx)
                             16 * alu_latency, slack, 0, NULL, false,
                             true, AGX_ILP_FS_SAMPLE_HALVES,
                             AGX_ILP_FS_HOIST_SAMPLES, false, false, false,
-                            false, false, &dag_state);
+                            false, false, false, &dag_state);
       } else if (!in_loop[block->index] && ctx->is_preamble) {
          /* A constant program's device loads are mostly independent, but the
           * pressure schedule places each right before its uniform store, so
@@ -2137,7 +2302,7 @@ agx_ilp_schedule(agx_context *ctx)
                                16 * alu_latency, cprog_slack,
                                cprog_cap, size16, false, true,
                                cprog_cap - 16, 0, false, false, false,
-                               false, false, &dag_state);
+                               false, false, false, &dag_state);
          }
       }
    }

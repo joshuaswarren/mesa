@@ -864,6 +864,129 @@ check_lossless_layered_packets(void)
    }
 }
 
+static void
+check_gen9_interchange_descriptors(void)
+{
+   static const struct {
+      enum agx_channels channels;
+      enum agx_channel swizzle_r, swizzle_g, swizzle_b, swizzle_a;
+      uint8_t expected_pbe_byte1;
+      uint8_t expected_pbe_byte2;
+   } cases[] = {
+      /* 8-bit BGRA / RGBA */
+      {AGX_CHANNELS_R8G8B8A8, AGX_CHANNEL_B, AGX_CHANNEL_G, AGX_CHANNEL_R,
+       AGX_CHANNEL_A, 0x0a, 0xc6},
+      {AGX_CHANNELS_R8G8B8A8, AGX_CHANNEL_R, AGX_CHANNEL_G, AGX_CHANNEL_B,
+       AGX_CHANNEL_A, 0x0a, 0xe4},
+      /* 10-bit BGR10A2 (MTL94 channels 0x26, swizzle 0xc6) and RGB10A2 (0xe4) */
+      {AGX_CHANNELS_R10G10B10A2, AGX_CHANNEL_B, AGX_CHANNEL_G, AGX_CHANNEL_R,
+       AGX_CHANNEL_A, 0x09, 0xc6},
+      {AGX_CHANNELS_R10G10B10A2, AGX_CHANNEL_R, AGX_CHANNEL_G, AGX_CHANNEL_B,
+       AGX_CHANNEL_A, 0x09, 0xe4},
+   };
+
+   const unsigned width = 3456, height = 2234;
+   const unsigned tiles_x = (width + 15u) / 16u;
+   const uint64_t base_va = UINT64_C(0x1000080000);
+   const uint64_t meta_va = UINT64_C(0x1001ec0000);
+
+   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+      struct AGX_PBE pbe = {
+         AGX_PBE_header,
+         .dimension = AGX_TEXTURE_DIMENSION_2D,
+         .layout = AGX_LAYOUT_INTERCHANGE,
+         .channels = cases[i].channels,
+         .type = AGX_TEXTURE_TYPE_UNORM,
+         .swizzle_r = cases[i].swizzle_r,
+         .swizzle_g = cases[i].swizzle_g,
+         .swizzle_b = cases[i].swizzle_b,
+         .swizzle_a = cases[i].swizzle_a,
+         .width = width,
+         .height = height,
+         .layers = 1,
+         .levels = 1,
+         .buffer = base_va,
+         .compressed = true,
+         .extended = true,
+         .acceleration_buffer = meta_va,
+         .stride = tiles_x * 16u - 4u,
+      };
+      struct hk_native_pbe_descriptor packed_pbe;
+      assert(hk_pack_native_pbe(9, &packed_pbe, &pbe));
+      const uint8_t *bytes = (const uint8_t *)packed_pbe.opaque;
+      assert((bytes[0] & 0x3fu) == 0x32u);
+      assert(bytes[1] == cases[i].expected_pbe_byte1);
+      assert(bytes[2] == cases[i].expected_pbe_byte2);
+
+      struct agx_pbe_agx3_2d_fields decoded_pbe;
+      assert(agx_pbe_agx3_2d_unpack(9, &packed_pbe, sizeof(packed_pbe),
+                                    &decoded_pbe));
+      assert(decoded_pbe.layout == AGX_LAYOUT_INTERCHANGE);
+      assert(decoded_pbe.channels == cases[i].channels);
+      assert(decoded_pbe.type == AGX_TEXTURE_TYPE_UNORM);
+      assert(decoded_pbe.swizzle_r == cases[i].swizzle_r &&
+             decoded_pbe.swizzle_g == cases[i].swizzle_g &&
+             decoded_pbe.swizzle_b == cases[i].swizzle_b &&
+             decoded_pbe.swizzle_a == cases[i].swizzle_a);
+      assert(decoded_pbe.compressed);
+      assert(decoded_pbe.buffer == base_va);
+      assert(decoded_pbe.acceleration_buffer == meta_va);
+      assert(decoded_pbe.stride_B == tiles_x * 16u);
+
+      /* Gen10, uncompressed, mipmapped, and layered Interchange PBEs reject. */
+      assert(!hk_pack_native_pbe(10, &packed_pbe, &pbe));
+      struct AGX_PBE bad = pbe;
+      bad.compressed = false;
+      bad.extended = false;
+      bad.acceleration_buffer = 0;
+      assert(!hk_pack_native_pbe(9, &packed_pbe, &bad));
+      bad = pbe;
+      bad.levels = 2;
+      assert(!hk_pack_native_pbe(9, &packed_pbe, &bad));
+      bad = pbe;
+      bad.dimension = AGX_TEXTURE_DIMENSION_2D_ARRAY;
+      bad.layers = 2;
+      assert(!hk_pack_native_pbe(9, &packed_pbe, &bad));
+
+      struct AGX_TEXTURE tex = {
+         AGX_TEXTURE_header,
+         .dimension = AGX_TEXTURE_DIMENSION_2D,
+         .layout = AGX_LAYOUT_INTERCHANGE,
+         .channels = cases[i].channels,
+         .type = AGX_TEXTURE_TYPE_UNORM,
+         .swizzle_r = cases[i].swizzle_r,
+         .swizzle_g = cases[i].swizzle_g,
+         .swizzle_b = cases[i].swizzle_b,
+         .swizzle_a = cases[i].swizzle_a,
+         .width = width,
+         .height = height,
+         .depth = 1,
+         .address = base_va,
+         .compressed = true,
+         .extended = true,
+         .acceleration_buffer = meta_va,
+         .stride = (tiles_x - 1u) << 4,
+      };
+      struct hk_native_texture_descriptor packed_tex;
+      assert(hk_pack_native_texture(9, &packed_tex, &tex));
+      struct AGX_TEXTURE_GEN9 decoded_tex = {0};
+      assert(AGX_TEXTURE_GEN9_unpack(NULL, (const uint8_t *)packed_tex.opaque,
+                                     &decoded_tex));
+      assert(decoded_tex.layout == AGX_LAYOUT_INTERCHANGE);
+      assert(decoded_tex.channels == cases[i].channels);
+      assert(decoded_tex.type == AGX_TEXTURE_TYPE_UNORM);
+      assert(decoded_tex.swizzle_r == cases[i].swizzle_r &&
+             decoded_tex.swizzle_g == cases[i].swizzle_g &&
+             decoded_tex.swizzle_b == cases[i].swizzle_b &&
+             decoded_tex.swizzle_a == cases[i].swizzle_a);
+      assert(decoded_tex.compressed && decoded_tex.extended);
+      assert(decoded_tex.address == base_va);
+      assert(decoded_tex.acceleration_buffer == meta_va);
+      assert(decoded_tex.stride == ((tiles_x - 1u) << 4));
+      assert(!hk_pack_native_texture(10, &packed_tex, &tex));
+   }
+}
+
 int
 main(void)
 {
@@ -2027,13 +2150,20 @@ main(void)
       array_expected[0] |= 1;
       assert(!memcmp(&packed, array_expected, sizeof(array_expected)));
       semantic.layers = 2;
-      assert(!hk_pack_native_pbe(10, &packed, &semantic));
+      assert(hk_pack_native_pbe(10, &packed, &semantic));
       semantic.layers = 1;
+      semantic.levels = 2;
+      assert(hk_pack_native_pbe(10, &packed, &semantic));
+      semantic.dimension = AGX_TEXTURE_DIMENSION_3D;
+      semantic.layers = 4;
+      semantic.levels = 1;
+      assert(hk_pack_native_pbe(10, &packed, &semantic));
       semantic.levels = 2;
       assert(!hk_pack_native_pbe(10, &packed, &semantic));
    }
    check_compressed_msaa_pbe();
    check_captured_rgba8_lossless_pbe();
+   check_gen9_interchange_descriptors();
    puts("honeykrisp native descriptor geometry/policy: passed");
    return 0;
 }

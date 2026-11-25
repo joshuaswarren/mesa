@@ -64,6 +64,7 @@
 uint64_t agx_best_modifiers[] = {
    DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
    DRM_FORMAT_MOD_APPLE_GPU_TILED,
+   DRM_FORMAT_MOD_APPLE_INTERCHANGE,
    DRM_FORMAT_MOD_LINEAR,
 };
 
@@ -90,6 +91,7 @@ void agx_init_state_functions(struct pipe_context *ctx);
 const static char *s_tiling[] = {
    [AIL_TILING_LINEAR] = "LINR",
    [AIL_TILING_GPU] = "GPU",
+   [AIL_TILING_INTERCHANGE] = "INTR",
 };
 
 #define rsrc_debug(res, ...)                                                   \
@@ -212,6 +214,18 @@ agx_resource_from_handle(struct pipe_screen *pscreen,
     * gracefully so the app can handle the error.
     */
    if (rsc->modifier == DRM_FORMAT_MOD_LINEAR && (whandle->stride % 16) != 0) {
+      FREE(rsc);
+      return NULL;
+   }
+
+   if (rsc->modifier == DRM_FORMAT_MOD_APPLE_INTERCHANGE &&
+       (!agx_dmabuf_modifier_supported(
+           dev->chip, (dev->debug & AGX_DBG_NOCOMPRESS) != 0, rsc->modifier,
+           templat->format) ||
+        templat->target != PIPE_TEXTURE_2D || templat->last_level ||
+        templat->depth0 != 1 || templat->array_size > 1 ||
+        templat->nr_samples > 1 || templat->width0 < 16 ||
+        templat->height0 < 16)) {
       FREE(rsc);
       return NULL;
    }
@@ -342,10 +356,6 @@ agx_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *ctx,
    handle->offset = rsrc->layout.level_offsets_B[0];
    handle->format = rsrc->layout.format;
    handle->modifier = rsrc->modifier;
-
-   /* The frontend passes its context, which may be a u_threaded_context. */
-   if (ctx)
-      agx_submit_pending(agx_context(threaded_context_unwrap_sync(ctx)));
 
    return true;
 }
@@ -479,8 +489,8 @@ agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
        templ->target == PIPE_TEXTURE_2D_ARRAY && templ->array_size >= 1 &&
        templ->nr_samples <= 1);
 
-   return dev->chip == AGX_CHIP_G17P && target_ok &&
-          templ->depth0 == 1 && templ->last_level == 0 &&
+   return agx_chip_has_cap(dev->chip, AGX_CAP_GEN9_2D_COMPRESSION) &&
+          target_ok && templ->depth0 == 1 && templ->last_level == 0 &&
           (templ->format == PIPE_FORMAT_Z32_FLOAT ||
            templ->format == PIPE_FORMAT_Z16_UNORM) &&
           templ->width0 >= 16 && templ->height0 >= 16 &&
@@ -553,6 +563,88 @@ agx_g17p_private_compression_allowed(const struct agx_device *dev,
    return false;
 }
 
+/* The colour formats the Gen10 compressed 2x/4x multisample PBE encodes
+ * (agx_pbe_agx3_2d_multisample_pack()): RGBA8/BGRA8 UNORM and sRGB, RGBA16
+ * FLOAT and UINT, and R32 UINT.
+ */
+static bool
+agx_gen10_msaa_compression_color_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_SRGB:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_SRGB:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_SRGB:
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_UINT:
+   case PIPE_FORMAT_R32_UINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* AGX_CAP_GEN10_2D_COMPRESSION colour: a private, single-level,
+ * single-layer 2D image, at 1x of agx_g17p_compression_color_format() and at
+ * 2x/4x of agx_gen10_msaa_compression_color_format(). It is written by the
+ * compressed Gen10 2D or 2x/4x multisample PBE (end-of-tile stores, blits,
+ * staging uploads) and read by the compressed texture descriptor. As on
+ * Gen9, nothing decompresses it in place: a spilling MRT framebuffer,
+ * feedback loop or shader-image binding reallocates it uncompressed through
+ * agx_decompress().
+ */
+static bool
+agx_gen10_private_compression_allowed(const struct agx_device *dev,
+                                      const struct pipe_resource *templ)
+{
+   const bool msaa = templ->nr_samples > 1;
+
+   return agx_chip_has_cap(dev->chip, AGX_CAP_GEN10_2D_COMPRESSION) &&
+          templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
+          templ->array_size <= 1 && templ->last_level == 0 &&
+          (!msaa || templ->nr_samples == 2 || templ->nr_samples == 4) &&
+          templ->width0 >= 16 && templ->height0 >= 16 &&
+          !(templ->bind &
+            ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)) &&
+          (msaa ? agx_gen10_msaa_compression_color_format(templ->format)
+                : agx_g17p_compression_color_format(templ->format));
+}
+
+/* AGX_CAP_GEN10_2D_COMPRESSION depth: a private, single-level, single-layer
+ * 2D depth buffer (including the separated Z32_FLOAT plane of Z32F_S8 and
+ * Z24S8), Z32_FLOAT or Z16_UNORM at 1x and Z32_FLOAT at 2x/4x.
+ *
+ * The M5 kernel validates every render's ZLS form. It admits compressed
+ * depth on a single-layer 2x/4x render only when it reports
+ * DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION, and refuses the submission
+ * with EOPNOTSUPP otherwise, so without that bit a multisample depth buffer
+ * stays plain. Borealis checks the same bit
+ * (hk_m5_depth_msaa_compression_eligible()).
+ */
+static bool
+agx_gen10_private_depth_compression_allowed(const struct agx_device *dev,
+                                            const struct pipe_resource *templ)
+{
+   const bool format_ok =
+      templ->nr_samples <= 1
+         ? templ->format == PIPE_FORMAT_Z32_FLOAT ||
+              templ->format == PIPE_FORMAT_Z16_UNORM
+         : (templ->nr_samples == 2 || templ->nr_samples == 4) &&
+              templ->format == PIPE_FORMAT_Z32_FLOAT &&
+              (dev->params.features &
+               DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION);
+
+   return agx_chip_has_cap(dev->chip, AGX_CAP_GEN10_2D_COMPRESSION) &&
+          templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
+          templ->array_size <= 1 && templ->last_level == 0 && format_ok &&
+          templ->width0 >= 16 && templ->height0 >= 16 &&
+          !(templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DEPTH_STENCIL));
+}
+
 static bool
 agx_compression_allowed(const struct agx_resource *pres)
 {
@@ -569,13 +661,17 @@ agx_compression_allowed(const struct agx_resource *pres)
    /* Compression changes both the image allocation and every write
     * descriptor of it. AGX2 handles any compressed image, decompressing in
     * place where needed (agx_gallium_shared_compression_supported()). AGX3
-    * has no in-place decompression, so it compresses only the G17P images
-    * that never need it.
+    * has no in-place decompression, so it compresses only the private images
+    * that never need it: those admitted by agx_chip_gen9_color_compression()
+    * (G16G/G17P colour) and AGX_CAP_GEN9_2D_COMPRESSION (G17P depth), and by
+    * AGX_CAP_GEN10_2D_COMPRESSION (M5 colour and depth).
     */
    if (agx_gallium_descriptor_generation_is_agx3(generation)) {
       if (!agx_g17p_private_compression_allowed(dev, &pres->base.b) &&
-          !agx_g17p_private_depth_compression_allowed(dev, &pres->base.b)) {
-         rsrc_debug(pres, "No compression: outside the G17P policy\n");
+          !agx_g17p_private_depth_compression_allowed(dev, &pres->base.b) &&
+          !agx_gen10_private_compression_allowed(dev, &pres->base.b) &&
+          !agx_gen10_private_depth_compression_allowed(dev, &pres->base.b)) {
+         rsrc_debug(pres, "No compression: outside the private AGX3 policy\n");
          return false;
       }
    } else if (!agx_gallium_shared_compression_supported(generation)) {
@@ -606,6 +702,26 @@ agx_compression_allowed(const struct agx_resource *pres)
    return true;
 }
 
+/* The compressed layout DCP scans out: one plain 32-bit 2D level. */
+static bool
+agx_interchange_allowed(const struct agx_resource *pres)
+{
+   struct agx_device *dev = agx_device(pres->base.b.screen);
+
+   if (!agx_interchange_modifier_supported(dev->chip, pres->base.b.format) ||
+       (dev->debug & AGX_DBG_NOCOMPRESS))
+      return false;
+   if (pres->base.b.target != PIPE_TEXTURE_2D || pres->base.b.last_level ||
+       pres->base.b.array_size > 1 || pres->base.b.nr_samples > 1 ||
+       pres->base.b.width0 < 16 || pres->base.b.height0 < 16)
+      return false;
+   if (pres->base.b.bind & (PIPE_BIND_SHADER_IMAGE | PIPE_BIND_LINEAR |
+                            PIPE_BIND_DISPLAY_TARGET))
+      return false;
+
+   return true;
+}
+
 static uint64_t
 agx_select_modifier_from_list(const struct agx_resource *pres,
                               const uint64_t *modifiers, int count)
@@ -618,6 +734,12 @@ agx_select_modifier_from_list(const struct agx_resource *pres,
    if (agx_twiddled_allowed(pres) &&
        drm_find_modifier(DRM_FORMAT_MOD_APPLE_GPU_TILED, modifiers, count))
       return DRM_FORMAT_MOD_APPLE_GPU_TILED;
+
+   /* Only wins against LINEAR, in a display list that cannot take GPU tiling. */
+   if (agx_interchange_allowed(pres) &&
+       drm_find_modifier(DRM_FORMAT_MOD_APPLE_INTERCHANGE, modifiers,
+                         count))
+      return DRM_FORMAT_MOD_APPLE_INTERCHANGE;
 
    if (agx_linear_allowed(pres) &&
        drm_find_modifier(DRM_FORMAT_MOD_LINEAR, modifiers, count))
@@ -707,6 +829,17 @@ agx_resource_create_with_modifiers(struct pipe_screen *screen,
    pipe_reference_init(&nresource->base.b.reference, 1);
 
    ail_make_miptree(&nresource->layout);
+
+   /* appledrm sizes interchange metadata from power-of-two dimensions. */
+   if (nresource->layout.tiling == AIL_TILING_INTERCHANGE) {
+      uint64_t meta_B =
+         (uint64_t)DIV_ROUND_UP(util_next_power_of_two(templ->width0), 16) *
+         DIV_ROUND_UP(util_next_power_of_two(templ->height0), 16) * 8;
+
+      nresource->layout.size_B =
+         MAX2(nresource->layout.size_B,
+              ALIGN_POT(nresource->layout.metadata_offset_B + meta_B, AIL_CACHELINE));
+   }
 
    /* Fail Piglit's obnoxious allocations */
    if (nresource->layout.size_B >= (1ull << 32)) {
@@ -852,7 +985,7 @@ agx_shadow(struct agx_context *ctx, struct agx_resource *rsrc, bool needs_copy)
    /* If a resource is (or could be) shared, shadowing would desync across
     * processes. (It's also not what this path is for.)
     */
-   if (flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE))
+   if (agx_resource_is_shared(rsrc))
       return false;
 
    /* Do not shadow resources that are too large */
@@ -1032,7 +1165,7 @@ agx_prepare_for_map(struct agx_context *ctx, struct agx_resource *rsrc,
    }
 
    /* Shadowing doesn't work separate stencil or shared resources */
-   if (rsrc->separate_stencil || (rsrc->bo->flags & AGX_BO_SHARED))
+   if (rsrc->separate_stencil || agx_resource_is_shared(rsrc))
       usage &= ~PIPE_MAP_DISCARD_WHOLE_RESOURCE;
 
    /* If the access is unsynchronized, there's nothing to do */
@@ -1705,7 +1838,9 @@ transition_resource(struct pipe_context *pctx, struct agx_resource *rsrc,
       agx_resource(pctx->screen->resource_create(pctx->screen, templ));
 
    assert(new_res);
-   assert(!(rsrc->base.b.bind & PIPE_BIND_SHARED) && "cannot swap BOs if shared");
+   assert(!(rsrc->base.b.bind & PIPE_BIND_SHARED) &&
+          !agx_resource_is_shared_interchange(rsrc) &&
+          "cannot swap BOs if shared");
 
    int level;
    BITSET_FOREACH_SET(level, rsrc->data_valid, PIPE_MAX_TEXTURE_LEVELS) {
@@ -1744,6 +1879,17 @@ void
 agx_decompress(struct agx_context *ctx, struct agx_resource *rsrc,
                const char *reason)
 {
+   /* A shared compressed Interchange resource cannot be reallocated to a new
+    * BO: swapping rsrc->bo would detach it from the display or peer holding
+    * the dma-buf. Callers fail closed at descriptor upload instead.
+    */
+   if (agx_resource_is_shared_interchange(rsrc)) {
+      perf_debug_ctx(
+         ctx, "Refusing to reallocate shared interchange resource due to %s",
+         reason);
+      return;
+   }
+
    if (rsrc->layout.compressed) {
       perf_debug_ctx(ctx, "Decompressing resource due to %s", reason);
    } else if (!rsrc->layout.writeable_image) {
@@ -1782,11 +1928,16 @@ agx_flush_resource(struct pipe_context *pctx, struct pipe_resource *pres)
       agx_flush_writer(agx_context(pctx), rsrc, "flush_resource");
    }
    rsrc->base.is_shared = true;
-
-   agx_submit_pending(agx_context(pctx));
-   agx_context(pctx)->batches.barrier_seqnum =
-      agx_context(pctx)->batches.seqnum;
 }
+
+static unsigned
+build_timestamp_offset(struct agx_batch *batch, unsigned offset)
+{
+   return (agx_batch_idx(batch) * sizeof(struct agx_timestamps)) + offset;
+}
+
+#define timestamp_offset(batch, offs)                                          \
+   build_timestamp_offset(batch, offsetof(struct agx_timestamps, offs))
 
 /* Native G18 ZLS arrays use either 16-KiB pages (bit 0) or 128-byte
  * cachelines. The upper field stores units minus one. In particular, a
@@ -1979,11 +2130,6 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    if ((dev->debug & AGX_DBG_NOCLUSTER) && !agx_chip_native_hal200(dev->chip))
       c->flags |= DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING;
 
-   if (agx_chip_native_or_m5(dev->chip) &&
-       (dev->params.features & DRM_ASAHI_FEATURE_FEW_PRIMITIVES) &&
-       !batch->prims_unknown && batch->known_prims <= 4)
-      c->flags |= DRM_ASAHI_RENDER_FEW_PRIMITIVES;
-
    c->bg.rsrc_spec = (uint32_t)pipeline_clear.rsrc_spec;
    c->eot.rsrc_spec = (uint32_t)pipeline_store.rsrc_spec;
    c->partial_bg.rsrc_spec = (uint32_t)pipeline_load.rsrc_spec;
@@ -2077,8 +2223,8 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
         batch->ctx->timestamps)) {
       c->ts_vtx.start.handle = batch->ctx->timestamp_handle;
       c->ts_frag.end.handle = batch->ctx->timestamp_handle;
-      c->ts_vtx.start.offset = agx_timestamp_offset(batch, vtx_start);
-      c->ts_frag.end.offset = agx_timestamp_offset(batch, frag_end);
+      c->ts_vtx.start.offset = timestamp_offset(batch, vtx_start);
+      c->ts_frag.end.offset = timestamp_offset(batch, frag_end);
    }
 }
 
@@ -2232,11 +2378,11 @@ agx_flush_compute(struct agx_context *ctx, struct agx_batch *batch,
    if (batch->timestamps.size > 0 || stats) {
       cmdbuf->ts.start.handle = ctx->timestamp_handle;
       cmdbuf->ts.end.handle = ctx->timestamp_handle;
-      cmdbuf->ts.start.offset = agx_timestamp_offset(batch, comp_start);
+      cmdbuf->ts.start.offset = timestamp_offset(batch, comp_start);
       /* Always write comp_end so GL_TIME_ELAPSED queries on compute-only
        * batches observe the real completion timestamp even without
        * AGX_DBG_STATS (agx_batch_submit/retire reads ts->comp_end). */
-      cmdbuf->ts.end.offset = agx_timestamp_offset(batch, comp_end);
+      cmdbuf->ts.end.offset = timestamp_offset(batch, comp_end);
    }
 }
 
@@ -2317,9 +2463,22 @@ agx_fast_clear_surface_eligible(const struct agx_batch *batch,
                                 unsigned first_layer, unsigned last_layer,
                                 enum pipe_format pack_fmt)
 {
+   const struct agx_device *dev = agx_device(batch->ctx->base.screen);
+
    if (!rsrc || rsrc->base.b.target == PIPE_BUFFER ||
        rsrc->base.b.target == PIPE_TEXTURE_3D ||
        !ail_is_level_logically_compressed(&rsrc->layout, level))
+      return false;
+
+   /* libagx_fast_clear targets GPU-tiled compressed layouts and packs
+    * void-alpha channels (X8/X2) as zero via util_format_pack_rgba(). Keep
+    * Interchange scanout and AGX3 shared compressed BOs on the VDM+PBE clear
+    * path so display scanout gets PBE-encoded compression with opaque void
+    * alpha. */
+   if (rsrc->layout.tiling != AIL_TILING_GPU ||
+       (agx_resource_is_shared(rsrc) &&
+        !agx_gallium_shared_compression_supported(
+           agx_chip_descriptor_generation(dev->chip))))
       return false;
 
    if (batch->key.width != u_minify(rsrc->base.b.width0, level) ||
@@ -2414,8 +2573,7 @@ agx_try_fast_clear_batch(struct agx_context *ctx, struct agx_batch *batch)
     * overwritten by its clear, matching agx_flush_render()'s
     * `batch->load & ~batch->clear`. */
    if (batch->cdm.bo || !batch->vdm.bo || !batch->initialized ||
-       batch->draws || batch->draw || batch->known_prims ||
-       batch->prims_unknown || !batch->clear ||
+       batch->draws || batch->draw || !batch->clear ||
        batch->resolve != batch->clear ||
        batch->key.resolve || batch->feedback || batch->native_rejected)
       return false;
@@ -2560,8 +2718,8 @@ agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch)
       return;
    }
 
-   agx_batch_queue_or_submit(ctx, batch, has_cdm ? &compute : NULL,
-                             has_vdm ? &render : NULL);
+   agx_batch_submit(ctx, batch, has_cdm ? &compute : NULL,
+                    has_vdm ? &render : NULL);
 }
 
 static void
@@ -2801,7 +2959,6 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 
    util_dynarray_init(&ctx->writer, ctx);
    util_dynarray_init(&ctx->global_buffers, ctx);
-   util_dynarray_init(&ctx->pending.batches, ctx);
 
    pctx->stream_uploader = u_upload_create_default(pctx);
    if (!pctx->stream_uploader) {
@@ -2943,6 +3100,7 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
       &(struct threaded_context_options){
          .create_fence = agx_fence_create_unflushed,
          .unsynchronized_get_device_reset_status = true,
+         .inline_idle_flush = true,
       },
       &ctx->tc);
 
@@ -3479,14 +3637,21 @@ agx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
 static bool
 agx_dmabuf_modifier_external_only(struct pipe_screen *screen, uint64_t modifier)
 {
-   /* AGX3 samples imported compressed images, but a shared compressed
-    * render target may need in-place decompression, which has no AGX3 build
-    * (agx_gallium_shared_compression_supported()). Keep the modifier
-    * sample-only there.
-    */
-   return modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
-          !agx_gallium_shared_compression_supported(
-             agx_chip_descriptor_generation(agx_device(screen)->chip));
+   return agx_gallium_dmabuf_modifier_external_only(
+      agx_chip_descriptor_generation(agx_device(screen)->chip), modifier);
+}
+
+/* The modifiers of agx_best_modifiers the device can use for this format.
+ * Interchange is only offered where agx_interchange_allowed() could pick it.
+ */
+static bool
+agx_dmabuf_modifier_usable(struct pipe_screen *screen, uint64_t modifier,
+                           enum pipe_format format)
+{
+   const struct agx_device *dev = agx_device(screen);
+
+   return agx_dmabuf_modifier_supported(
+      dev->chip, (dev->debug & AGX_DBG_NOCOMPRESS) != 0, modifier, format);
 }
 
 static void
@@ -3494,23 +3659,28 @@ agx_query_dmabuf_modifiers(struct pipe_screen *screen, enum pipe_format format,
                            int max, uint64_t *modifiers,
                            unsigned int *external_only, int *out_count)
 {
-   int i;
+   int n = 0;
 
-   if (max == 0) {
-      *out_count = ARRAY_SIZE(agx_best_modifiers);
-      return;
+   for (unsigned i = 0; i < ARRAY_SIZE(agx_best_modifiers); i++) {
+      if (!agx_dmabuf_modifier_usable(screen, agx_best_modifiers[i], format))
+         continue;
+
+      if (max != 0) {
+         if (n >= max)
+            break;
+
+         if (external_only)
+            external_only[n] = agx_dmabuf_modifier_external_only(
+               screen, agx_best_modifiers[i]);
+
+         modifiers[n] = agx_best_modifiers[i];
+      }
+
+      n++;
    }
 
-   for (i = 0; i < ARRAY_SIZE(agx_best_modifiers) && i < max; i++) {
-      if (external_only)
-         external_only[i] =
-            agx_dmabuf_modifier_external_only(screen, agx_best_modifiers[i]);
-
-      modifiers[i] = agx_best_modifiers[i];
-   }
-
-   /* Return the number of modifiers copied */
-   *out_count = i;
+   /* The count of modifiers, or the number copied */
+   *out_count = n;
 }
 
 static bool
@@ -3518,7 +3688,8 @@ agx_is_dmabuf_modifier_supported(struct pipe_screen *screen, uint64_t modifier,
                                  enum pipe_format format, bool *external_only)
 {
    for (unsigned i = 0; i < ARRAY_SIZE(agx_best_modifiers); ++i) {
-      if (agx_best_modifiers[i] == modifier) {
+      if (agx_best_modifiers[i] == modifier &&
+          agx_dmabuf_modifier_usable(screen, modifier, format)) {
          if (external_only)
             *external_only =
                agx_dmabuf_modifier_external_only(screen, modifier);

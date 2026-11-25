@@ -18,6 +18,9 @@ extern "C" {
 
 #define AIL_CACHELINE      0x80
 #define AIL_PAGESIZE       0x4000
+/* Under AIL_LAYOUT_POLICY_M5, a compressed mip level of the power-of-two tail
+ * starts on this boundary, as the M5 hardware places it. */
+#define AIL_M5_COMPRESSED_LEVEL_ALIGN_B 0x800
 #define AIL_MAX_MIP_LEVELS 16
 
 enum ail_tiling {
@@ -38,7 +41,7 @@ enum ail_tiling {
    AIL_TILING_TWIDDLED,
 
    /**
-    * G17P Interchange (descriptor Layout 3): 16x16-element macroblocks in
+    * Gen9/G17P Interchange (descriptor Layout 3): 16x16-element macroblocks in
     * row-major order, row pitch ceil(width / 16) * 256 * blocksize; inside a
     * macroblock, 8x4 blocks in row-major order, each x-first Morton. This is
     * the layout the display coprocessor scans out as an address-format-5
@@ -219,7 +222,9 @@ ail_get_wsi_stride_B(const struct ail_layout *layout, unsigned level)
    if (layout->tiling == AIL_TILING_LINEAR)
       return ail_get_linear_stride_B(layout, level);
    else if (layout->tiling == AIL_TILING_INTERCHANGE)
-      return ail_get_interchange_stride_B(layout);
+      /* Per pixel row: DRM core checks pitch * height against the buffer, and
+       * appledrm derives the macroblock layout itself. */
+      return ail_get_interchange_stride_B(layout) / 16;
    else
       return util_format_get_stride(layout->format, layout->width_px);
 }

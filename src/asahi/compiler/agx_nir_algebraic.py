@@ -12,6 +12,7 @@ b = 'b'
 c = 'c'
 d = 'd'
 e = 'e'
+f = 'f'
 
 lower_sm5_shift = []
 
@@ -183,6 +184,57 @@ for T, sizes, one in [('f', [16, 32], 1.0),
 # This needs to be a separate pass that runs after lower_selects, in order to
 # pick up patterns like b2f32(iand(...))
 opt_selects = [
+        # Direct condition dominance in nested selects (only when the
+        # rewritten intermediate select becomes dead, avoiding live-range
+        # extension).
+        (('bcsel', a, ('bcsel(is_used_once)', a, b, c), d), ('bcsel', a, b, d)),
+        (('bcsel', a, b, ('bcsel(is_used_once)', a, c, d)), ('bcsel', a, b, d)),
+        (('bcsel', a, c, ('bcsel(is_used_once)', b, ('bcsel', a, 'x', d), e)),
+         ('bcsel', a, c, ('bcsel', b, d, e))),
+        (('bcsel', a, c, ('bcsel(is_used_once)', b, d, ('bcsel', a, 'x', e))),
+         ('bcsel', a, c, ('bcsel', b, d, e))),
+        (('bcsel', a, ('bcsel(is_used_once)', b, ('bcsel', a, c, 'x'), d), e),
+         ('bcsel', a, ('bcsel', b, c, d), e)),
+        (('bcsel', a, ('bcsel(is_used_once)', b, d, ('bcsel', a, c, 'x')), e),
+         ('bcsel', a, ('bcsel', b, d, c), e)),
+
+        # Collapse selects whose boolean condition (ior/iand or boolean bcsel)
+        # shares a predicate with an arm select, provided every use of the
+        # boolean condition collapses so it becomes dead.
+        (('bcsel', ('ior(agx_bcsel_cond_collapses)', a, b), ('bcsel(is_used_once)', a, c, d), e),
+         ('bcsel', a, c, ('bcsel', b, d, e))),
+        (('bcsel', ('ior(agx_bcsel_cond_collapses)', a, b), c, ('bcsel(is_used_once)', a, d, e)),
+         ('bcsel', a, c, ('bcsel', b, c, e))),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, True, b), ('bcsel(is_used_once)', a, c, d), e),
+         ('bcsel', a, c, ('bcsel', b, d, e))),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, True, b), c, ('bcsel(is_used_once)', a, d, e)),
+         ('bcsel', a, c, ('bcsel', b, c, e))),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, b, True), ('bcsel(is_used_once)', a, c, d), e),
+         ('bcsel', a, ('bcsel', b, c, e), d)),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, b, True), c, ('bcsel(is_used_once)', a, d, e)),
+         ('bcsel', a, ('bcsel', b, c, d), c)),
+        (('bcsel', ('iand(agx_bcsel_cond_collapses)', a, b), ('bcsel(is_used_once)', a, c, d), e),
+         ('bcsel', a, ('bcsel', b, c, e), e)),
+        (('bcsel', ('iand(agx_bcsel_cond_collapses)', a, b), c, ('bcsel(is_used_once)', a, d, e)),
+         ('bcsel', a, ('bcsel', b, c, d), e)),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, b, False), ('bcsel(is_used_once)', a, c, d), e),
+         ('bcsel', a, ('bcsel', b, c, e), e)),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, b, False), c, ('bcsel(is_used_once)', a, d, e)),
+         ('bcsel', a, ('bcsel', b, c, d), e)),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, False, b), ('bcsel(is_used_once)', a, c, d), e),
+         ('bcsel', a, e, ('bcsel', b, d, e))),
+        (('bcsel', ('bcsel(agx_bcsel_cond_collapses)', a, False, b), c, ('bcsel(is_used_once)', a, d, e)),
+         ('bcsel', a, d, ('bcsel', b, c, e))),
+
+        # Hoist single-use negation out of select trees to cut live values and
+        # let the final negation fold into a downstream add/sub.
+        (('bcsel', a, ('ineg(is_used_once)', b), ('ineg(is_used_once)', c)),
+         ('ineg', ('bcsel', a, b, c))),
+        (('bcsel', a, ('u2u32', 'b@8'), ('u2u32', 'c@8')),
+         ('u2u32', ('bcsel', a, b, c))),
+        (('bcsel', a, ('u2u32', 'b@16'), ('u2u32', 'c@16')),
+         ('u2u32', ('bcsel', a, b, c))),
+
         (('bcsel', ('ior(is_used_once)', ('inot', a), b), c, d),
          ('bcsel', a, ('bcsel', b, c, d), c)),
 
@@ -194,6 +246,7 @@ opt_selects = [
 
         (('bcsel', ('iand(is_used_once)', a, b), c, d),
          ('bcsel', a, ('bcsel', b, c, d), d)),
+
 ]
 
 # When the ior/iand is used multiple times, we can instead fuse the other way.
@@ -485,20 +538,22 @@ for shift in (1, 2):
              ('ult', ('ushr', folded_offset, shift), ('ushr', b, shift))))
 
 # D3D float-to-integer conversions saturate and map NaN to 0. DXVK spells them
-# out as a conversion plus clamping selects; the M5 hardware conversion already
-# does exactly this (verified for both signs of NaN, infinities and every
-# boundary), so fold the selects into the bare conversion.
+# out as a conversion plus clamping selects; the AGX3 hardware conversion
+# already does exactly this (verified for both signs of NaN, infinities and
+# every boundary). Fold the selects into NIR's saturating conversions
+# (f2i32_sat/f2u32_sat) so subsequent constant folding preserves saturation and
+# NaN-to-zero semantics rather than treating out-of-range inputs as poison.
 fold_d3d_float_to_int = [
     (('bcsel', ('fneu', 'a@32', a), 0,
       ('bcsel', ('flt', a, -2147483648.0), -0x80000000,
        ('bcsel', ('flt', 2147483520.0, a), 0x7fffffff, ('f2i32', a)))),
-     ('f2i32', a)),
+     ('f2i32_sat', a)),
     (('bcsel', ('flt', 4294967040.0, 'a@32'), 0xffffffff,
       ('f2u32', ('bcsel', ('fneu', a, a), 0.0, ('fmax', a, 0.0)))),
-     ('f2u32', a)),
+     ('f2u32_sat', a)),
     (('bcsel', ('flt', 4294967040.0, 'a@32'), 0xffffffff,
       ('f2u32', ('fmax', a, 0.0))),
-     ('f2u32', a)),
+     ('f2u32_sat', a)),
 ]
 
 fold_selected_f2i32 = [
@@ -564,6 +619,54 @@ fold_ubyte_to_float = [
      ('u2f32', ('u2u8', ('unpack_32_2x16_split_x', a)))),
     (('u2f32', ('ubitfield_extract', 'a@32', 16, 8)),
      ('u2f32', ('u2u8', ('unpack_32_2x16_split_y', a)))),
+]
+
+# |a - b| of two unsigned bytes: their 16-bit differences a - b and b - a are
+# |a - b| and 2^16 - |a - b| > 255 (or both 0), so the smaller one is the
+# magnitude. Two independent 16-bit subtracts and an unsigned minimum replace
+# the widened subtract, its negation and the signed maximum.
+def u8_absdiff():
+    left, right = ('u2u16', 'a@8'), ('u2u16', 'b@8')
+    absdiff = ('u2u32', ('umin@16', ('isub@16', left, right),
+                         ('isub@16', right, left)))
+    rules = []
+    for delta in (('isub@32(is_used_once)', ('u2u32', 'a@8'), ('u2u32', 'b@8')),
+                  ('iadd@32(is_used_once)', ('u2u32', 'a@8'),
+                   ('ineg', ('u2u32', 'b@8')))):
+        rules += [(('iabs', delta), absdiff)]
+    for delta in (('isub@32', ('u2u32', 'a@8'), ('u2u32', 'b@8')),
+                  ('iadd@32', ('u2u32', 'a@8'), ('ineg', ('u2u32', 'b@8')))):
+        rules += [(('imax@32(agx_u8_absdiff_uses_match)', delta, ('ineg', delta)),
+                   absdiff),
+                  (('imax@32(agx_u8_absdiff_uses_match)', ('ineg', delta), delta),
+                   absdiff)]
+    return rules
+
+# M5 converts an unsigned byte or half in a half register to f32 directly. A
+# zero-extended value converts exactly as signed or unsigned, so the widening
+# copy is not needed.
+# Canonicalize constant offsets across integer subtractions so unrolled
+# diagonal address expressions like (a + c1) - (b + c2) CSE onto (a - b) + (c1 - c2).
+reassoc_const_offsets = [
+    (('ineg@32', ('iadd@32(is_used_once)', 'a(is_not_const)', '#c')),
+     ('iadd', ('ineg', a), ('ineg', c))),
+    (('iadd@32', ('iadd@32(is_used_once)', 'a(is_not_const)', '#c'), ('iadd@32(is_used_once)', 'b(is_not_const)', '#d')),
+     ('iadd', ('iadd', a, b), ('iadd', c, d))),
+    (('iadd@32', ('iadd@32(is_used_once)', 'a(is_not_const)', '#c'), 'b(is_not_const)'),
+     ('iadd', ('iadd', a, b), c)),
+    (('isub@32', ('iadd@32', 'a(is_not_const)', '#c'), ('iadd@32', 'b(is_not_const)', '#d')),
+     ('iadd', ('isub', a, b), ('isub', c, d))),
+    (('isub@32', 'a(is_not_const)', ('iadd@32', 'b(is_not_const)', '#c')),
+     ('iadd', ('isub', a, b), ('ineg', c))),
+    (('isub@32', ('iadd@32', 'a(is_not_const)', '#c'), 'b(is_not_const)'),
+     ('iadd', ('isub', a, b), c)),
+]
+
+m5_narrow_to_float = [
+    (('i2f32', ('u2u32', 'a@8')), ('u2f32', a)),
+    (('u2f32', ('u2u32', 'a@8')), ('u2f32', a)),
+    (('i2f32', ('u2u32', 'a@16')), ('u2f32', a)),
+    (('u2f32', ('u2u32', 'a@16')), ('u2f32', a)),
 ]
 
 def main():
@@ -635,6 +738,76 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
 }
 """)
 
+    print("""
+/* imax(d, -d) where d has no other use than this maximum and its negation. */
+/* True when every use of a 1-bit boolean op is the condition of a bcsel whose
+ * true or false arm is a single-use bcsel sharing one of this op's predicates,
+ * so collapsing all uses kills the boolean op with zero live-value increase. */
+static bool
+agx_bcsel_cond_collapses(const nir_alu_instr *instr)
+{
+   if (instr->def.bit_size != 1 || instr->def.num_components != 1)
+      return false;
+   if (list_is_singular(&instr->def.uses))
+      return true;
+   nir_def *op0 = instr->src[0].src.ssa;
+   nir_def *op1 = NULL;
+   if (instr->op == nir_op_ior || instr->op == nir_op_iand) {
+      op1 = instr->src[1].src.ssa;
+   } else if (instr->op == nir_op_bcsel) {
+      if (nir_src_is_const(instr->src[1].src))
+         op1 = instr->src[2].src.ssa;
+      else if (nir_src_is_const(instr->src[2].src))
+         op1 = instr->src[1].src.ssa;
+      else
+         return false;
+   } else {
+      return false;
+   }
+   nir_foreach_use_including_if(src, &instr->def) {
+      if (nir_src_is_if(src))
+         return false;
+      nir_instr *use = nir_src_use_instr(src);
+      if (use->type != nir_instr_type_alu)
+         return false;
+      nir_alu_instr *ualu = nir_instr_as_alu(use);
+      if (ualu->op != nir_op_bcsel || src != &ualu->src[0].src)
+         return false;
+      bool matched = false;
+      for (unsigned arm = 1; arm <= 2; arm++) {
+         nir_alu_instr *arm_alu = nir_src_as_alu(ualu->src[arm].src);
+         if (arm_alu && arm_alu->op == nir_op_bcsel &&
+             list_is_singular(&arm_alu->def.uses) &&
+             (arm_alu->src[0].src.ssa == op0 ||
+              arm_alu->src[0].src.ssa == op1)) {
+            matched = true;
+            break;
+         }
+      }
+      if (!matched)
+         return false;
+   }
+   return true;
+}
+
+static bool
+agx_u8_absdiff_uses_match(const nir_alu_instr *instr)
+{
+   const nir_alu_instr *x = nir_src_as_alu(instr->src[0].src);
+   const nir_alu_instr *y = nir_src_as_alu(instr->src[1].src);
+   if (!x || !y)
+      return false;
+   const nir_alu_instr *neg = x->op == nir_op_ineg ? x : y;
+   const nir_alu_instr *delta = x->op == nir_op_ineg ? y : x;
+   return neg->op == nir_op_ineg && neg != delta &&
+          neg->src[0].src.ssa == &delta->def &&
+          neg->instr.block == instr->instr.block &&
+          delta->instr.block == instr->instr.block &&
+          list_is_singular(&neg->def.uses) &&
+          list_length(&delta->def.uses) == 2;
+}
+""")
+
     print(nir_algebraic.AlgebraicPass("agx_nir_cleanup_amul", cleanup_amul).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_lea", fuse_lea).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_lower_lea", lower_lea).render())
@@ -660,6 +833,12 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
                                       fold_ubyte_to_float).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fold_d3d_float_to_int",
                                       fold_d3d_float_to_int).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_opt_u8_absdiff",
+                                      u8_absdiff()).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_opt_m5_narrow_to_float",
+                                      m5_narrow_to_float).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_reassoc_const_offsets",
+                                      reassoc_const_offsets).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_algebraic_late",
                                       fuse_extr + fuse_ubfe +
                                       fuse_imad + ixor_bcsel +

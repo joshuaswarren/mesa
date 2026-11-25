@@ -227,7 +227,7 @@ struct spill_ctx {
     */
    agx_instr **remat;
 
-   /* M5 instructions the spiller may repeat to reload a value (see
+   /* AGX3 instructions the spiller may repeat to reload a value (see
     * can_repeat_alu and can_remat_load), indexed by the node holding their
     * result or one component of it, and that component. NULL for other nodes.
     */
@@ -334,10 +334,23 @@ agx_has_uniform_store(const agx_context *ctx)
    return false;
 }
 
+/*
+ * A spilled copy of a uniform word can be made again at its use: the AGX3B
+ * and AGX3C copy forms read any even uniform pair into any 32-bit register.
+ * This covers the AGX3 word copy only; AGX2 reads uniforms with its own bitop
+ * and keeps its spill behaviour. Not on G18G (AGX3C re-encoded as agx3d,
+ * emit_agx3d): a rematerialized copy is placed under register pressure, where
+ * its destination is often at or above half 128, and agx3d copies into those
+ * destinations have not been verified to execute correctly (the direct agx3d
+ * encoder, agx3_copy_encode_uniform_to_reg32, only emits lower ones).
+ */
 bool
 agx_can_rematerialize_uniform(const agx_context *ctx, const agx_instr *I)
 {
-   return ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+   return ctx->key &&
+          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+            !agx_is_g18g(&ctx->key->dev))) &&
           !ctx->is_preamble && !ctx->uniforms_written &&
           I->op == AGX_OPCODE_MOV && I->nr_dests == 1 && I->nr_srcs == 1 &&
           I->dest[0].type == AGX_INDEX_NORMAL && !I->dest[0].memory &&
@@ -379,7 +392,7 @@ remat_to(agx_builder *b, agx_index dst, struct spill_ctx *ctx, unsigned node)
 }
 
 /*
- * On M5, a spilled value can often be computed again instead of filled from
+ * On AGX3, a spilled value can often be computed again instead of filled from
  * its spill slot: by repeating the device load that produced it, where one
  * load replaces a fill per component, or the arithmetic instruction that did.
  * Once no fill reads the slot, DCE removes the spill stores too.
@@ -563,10 +576,10 @@ reload_by_repeat(agx_builder *b, struct spill_ctx *ctx, unsigned node)
 static void
 record_spill(struct spill_ctx *ctx)
 {
-   if (ctx->remat_only) {
-      assert(ctx->shader->key->has_scratch && "remat fallback needs scratch");
+   if (!ctx->shader->key->has_scratch)
+      ctx->shader->ra_failed = true;
+   if (ctx->remat_only)
       ctx->shader->remat_fallback_spilled = true;
-   }
    ctx->shader->has_spill_pcopy_reserved = true;
 }
 
@@ -1749,7 +1762,7 @@ constant_phi_prove(agx_instr **defs, const int *parents,
 }
 
 bool
-agx_fold_m5_spill_constant_phis(agx_context *ctx)
+agx_fold_agx3_spill_constant_phis(agx_context *ctx)
 {
    if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
        ctx->is_preamble || !ctx->alloc)
@@ -1816,6 +1829,98 @@ agx_fold_m5_spill_constant_phis(agx_context *ctx)
 
    ralloc_free(memctx);
    return progress;
+}
+
+/*
+ * Reachability-based dead code elimination after spilling.
+ *
+ * Unlike agx_dce(), this removes dead loop-header PHIs and dead PHI cycles.
+ * Spilling with repeatable ALU/load rematerialization or constant-PHI folding
+ * can eliminate every fill of a spilled value, making its spill store dead and
+ * leaving a loop-header PHI inserted by agx_repair_ssa() with zero uses. Such
+ * a dead loop-header PHI is excluded from liveness and demand accounting, yet
+ * RA still assigns it a register that is never killed, causing register leaks
+ * and spurious RA failures.
+ */
+static void
+agx_spill_dce(agx_context *ctx)
+{
+   if (!ctx->alloc)
+      return;
+
+   agx_instr **defs = calloc(ctx->alloc, sizeof(*defs));
+   uint32_t *worklist = malloc(ctx->alloc * sizeof(*worklist));
+   BITSET_WORD *live = BITSET_CALLOC(ctx->alloc);
+   unsigned head = 0, tail = 0;
+
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d) {
+         assert(I->dest[d].value < ctx->alloc);
+         defs[I->dest[d].value] = I;
+      }
+   }
+
+   agx_foreach_instr_global(ctx, I) {
+      const bool rt_completion =
+         (I->op == AGX_OPCODE_SCS_LOAD_REGISTER_INDEXED_AGX3 ||
+          I->op == AGX_OPCODE_SCS_LOAD_REGISTER_BASE_AGX3) &&
+         I->scs_rt_completion;
+      if (agx_opcodes_info[I->op].can_eliminate &&
+          !I->agx3_tex_coord_stage && !rt_completion)
+         continue;
+
+      agx_foreach_ssa_src(I, s) {
+         unsigned v = I->src[s].value;
+         if (!BITSET_TEST(live, v)) {
+            BITSET_SET(live, v);
+            worklist[tail++] = v;
+         }
+      }
+   }
+
+   while (head < tail) {
+      unsigned v = worklist[head++];
+      agx_instr *I = defs[v];
+      if (!I)
+         continue;
+
+      agx_foreach_ssa_dest(I, d) {
+         defs[I->dest[d].value] = NULL;
+      }
+
+      agx_foreach_ssa_src(I, s) {
+         unsigned src = I->src[s].value;
+         if (!BITSET_TEST(live, src)) {
+            BITSET_SET(live, src);
+            worklist[tail++] = src;
+         }
+      }
+   }
+
+   agx_foreach_instr_global_safe(ctx, I) {
+      const bool rt_completion =
+         (I->op == AGX_OPCODE_SCS_LOAD_REGISTER_INDEXED_AGX3 ||
+          I->op == AGX_OPCODE_SCS_LOAD_REGISTER_BASE_AGX3) &&
+         I->scs_rt_completion;
+      if (!agx_opcodes_info[I->op].can_eliminate ||
+          I->agx3_tex_coord_stage || rt_completion)
+         continue;
+
+      bool needed = false;
+      agx_foreach_ssa_dest(I, d) {
+         if (BITSET_TEST(live, I->dest[d].value)) {
+            needed = true;
+            break;
+         }
+      }
+
+      if (!needed)
+         agx_remove_instruction(I);
+   }
+
+   free(defs);
+   free(worklist);
+   free(live);
 }
 
 void
@@ -1962,7 +2067,11 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
 
    /* Spilling breaks SSA, so we need to repair before validating */
    agx_repair_ssa(ctx);
-   agx_fold_m5_spill_constant_phis(ctx);
+   agx_fold_agx3_spill_constant_phis(ctx);
+
+   /* Remat and constant-PHI folding can leave dead spill stores and dead
+    * loop-header PHIs whose backedge reloads are also dead. */
+   agx_spill_dce(ctx);
    agx_validate(ctx, "Spilling");
 
    /* Remat can introduce dead code. When every reload of a spilled split
@@ -1992,7 +2101,8 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
    }
 
    if (memory) {
-      assert(ctx->key->has_scratch && "memory values need scratch");
+      if (!ctx->key->has_scratch)
+         ctx->ra_failed = true;
       ctx->has_spill_pcopy_reserved = true;
       ctx->remat_fallback_spilled |= remat_only;
    }

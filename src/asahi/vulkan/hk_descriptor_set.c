@@ -364,6 +364,13 @@ write_sampled_image_view_desc(struct hk_descriptor_set *set,
       else
          plane_count = MAX2(plane_count, sampler->plane_count);
 
+      /* A null converted image and a standalone sampler each have a single
+       * output record in vkGetDescriptorEXT, even with two filter modes.
+       * Any converted sample of the null image stops at its first plane.
+       */
+      if (view_planes == 0 && sampler->vk.ycbcr_conversion)
+         plane_count = MIN2(plane_count, binding_layout->stride / native.stride);
+
       for (uint8_t plane = 0; plane < plane_count; plane++) {
          /* We need to replicate the last sampler plane out to all image
           * planes due to sampler table entry limitations. See
@@ -376,7 +383,8 @@ write_sampled_image_view_desc(struct hk_descriptor_set *set,
           * image plane. G17P consumes the native heap index directly. */
          desc[plane].sw.sampler_index = hk_sampler_descriptor_index(
             set->layout, sampler->planes[sampler_plane].hw->index);
-         if (set->layout->descriptor_generation == 9)
+         if (set->layout->descriptor_generation == 9 ||
+             set->layout->descriptor_generation == 10)
             write_g17p_sampler_bias(&desc[plane].sw, sampler, sampler_plane);
          else
             desc[plane].sw.sampler = sampler->planes[sampler_plane].hw->key;
@@ -547,7 +555,7 @@ get_buffer_address(const VkDescriptorBufferInfo *const info, bool read_only)
    if (!read_only && buffer && buffer->sparse_map &&
        agx_chip_g17_m5(
           ((const struct hk_device *)buffer->vk.base.device)->dev.chip)) {
-      const uint64_t map_addr = buffer->sparse_map->va->addr;
+      const uint64_t map_addr = hk_buffer_sparse_map_addr(buffer);
       assert((map_addr % AIL_PAGESIZE) == 0);
       assert((map_addr / AIL_PAGESIZE) <= UINT32_MAX);
       sparse_map_page = map_addr / AIL_PAGESIZE;
@@ -758,6 +766,7 @@ static ATTRIBUTE_NOINLINE void
 hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
                         const VkCopyDescriptorSet *pDescriptorCopies)
 {
+   struct hk_descriptor_set *last_dst = NULL;
    for (uint32_t i = 0; i < descriptorCopyCount; i++) {
       const VkCopyDescriptorSet *copy = &pDescriptorCopies[i];
       VK_FROM_HANDLE(hk_descriptor_set, src, copy->srcSet);
@@ -779,6 +788,8 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
          dst->storage_backings[copy->dstBinding] = backing;
       }
 
+      bool updated = false;
+
       /* Equal strides make the existing per-record copies contiguous. Vulkan
        * requires source and destination descriptor ranges not to overlap,
        * including when they belong to the same descriptor set.
@@ -799,6 +810,7 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
             else
                memcpy(dst_map, src_map, size);
             hk_descriptor_set_publish(dst, dst_map, size);
+            updated = copy->descriptorCount > 0;
          }
       } else if (dst_binding_layout->stride > 0 && src_binding_layout->stride > 0) {
          for (uint32_t j = 0; j < copy->descriptorCount; j++) {
@@ -814,6 +826,7 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
 
             memcpy(dst_map, src_map, copy_size);
             hk_descriptor_set_publish(dst, dst_map, copy_size);
+            updated = true;
          }
       }
 
@@ -825,8 +838,17 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
          typed_memcpy(&dst->dynamic_buffers[dst_dyn_start],
                       &src->dynamic_buffers[src_dyn_start],
                       copy->descriptorCount);
+         updated |= copy->descriptorCount > 0;
+      }
+
+      if (updated) {
+         if (last_dst != NULL && last_dst != dst)
+            p_atomic_inc(&last_dst->update_seq);
+         last_dst = dst;
       }
    }
+   if (last_dst != NULL)
+      p_atomic_inc(&last_dst->update_seq);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -835,9 +857,18 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
                         uint32_t descriptorCopyCount,
                         const VkCopyDescriptorSet *pDescriptorCopies)
 {
+   struct hk_descriptor_set *last_set = NULL;
    for (uint32_t w = 0; w < descriptorWriteCount; w++) {
       const VkWriteDescriptorSet *write = &pDescriptorWrites[w];
       VK_FROM_HANDLE(hk_descriptor_set, set, write->dstSet);
+
+      if (write->descriptorCount == 0)
+         continue;
+
+      if (last_set != NULL && last_set != set) {
+         p_atomic_inc(&last_set->update_seq);
+         last_set = NULL;
+      }
 
       switch (write->descriptorType) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -919,9 +950,13 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
       }
 
       default:
-         break;
+         continue;
       }
+
+      last_set = set;
    }
+   if (last_set != NULL)
+      p_atomic_inc(&last_set->update_seq);
 
    if (descriptorCopyCount)
       hk_copy_descriptor_sets(descriptorCopyCount, pDescriptorCopies);
@@ -946,6 +981,7 @@ hk_push_descriptor_set_begin(struct hk_push_descriptor_set *push_set,
                 layout->non_variable_descriptor_buffer_size,
                 sizeof(push_set->data));
       push_set->size = 0;
+      hk_push_descriptor_set_reset_upload(push_set);
       return false;
    }
 
@@ -1163,6 +1199,10 @@ hk_CreateDescriptorPool(VkDevice _device,
       }
 
       pool->mapped_ptr = agx_bo_map(pool->bo);
+      if (!pool->mapped_ptr) {
+         hk_destroy_descriptor_pool(dev, pAllocator, pool);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
 
       /* The BO may be larger thanks to GPU page alignment.  We may as well
        * make that extra space available to the client.
@@ -1393,13 +1433,16 @@ hk_ResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool,
    return VK_SUCCESS;
 }
 
-static void
+static bool
 hk_descriptor_set_write_template(
    struct hk_descriptor_set *set,
    const struct vk_descriptor_update_template *template, const void *data)
 {
+   bool updated = false;
    for (uint32_t i = 0; i < template->entry_count; i++) {
       const struct vk_descriptor_template_entry *entry = &template->entries[i];
+      if (entry->array_count == 0)
+         continue;
 
       switch (entry->type) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -1480,9 +1523,12 @@ hk_descriptor_set_write_template(
          break;
 
       default:
-         break;
+         continue;
       }
+
+      updated = true;
    }
+   return updated;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1494,7 +1540,8 @@ hk_UpdateDescriptorSetWithTemplate(
    VK_FROM_HANDLE(vk_descriptor_update_template, template,
                   descriptorUpdateTemplate);
 
-   hk_descriptor_set_write_template(set, template, pData);
+   if (hk_descriptor_set_write_template(set, template, pData))
+      p_atomic_inc(&set->update_seq);
 }
 
 bool
@@ -1536,7 +1583,7 @@ hk_GetDescriptorEXT(VkDevice _device,
    layout->descriptor_generation =
       agx_chip_descriptor_generation(dev->dev.chip);
    layout->native_sampler_indices =
-      agx_chip_native_or_m5(dev->dev.chip);
+      agx_chip_agx3_path(dev->dev.chip);
    layout->binding_count = 1;
    layout->binding[0] = (struct hk_descriptor_set_binding_layout){
       .type = type,
@@ -1610,6 +1657,9 @@ hk_GetDescriptorEXT(VkDevice _device,
          desc = (struct hk_buffer_address){
             .base_addr = info->address,
             .size = MIN2(info->range, UINT32_MAX),
+            .sparse_map_page = type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                  ? hk_sparse_map_page_at(dev, info->address)
+                                  : 0,
          };
       }
       write_desc(&set, 0, 0, &desc, sizeof(desc));

@@ -95,35 +95,6 @@ hk_reports_per_query(struct hk_query_pool *pool)
    }
 }
 
-/*
- * Prepare the compute stream a query command (reset, result copy) records
- * into. Query state is updated in submission order without application
- * barriers (Vulkan 1.3, 17 "Queries": vkCmdCopyQueryPoolResults sees every
- * earlier vkCmdResetQueryPool on the queue, and vkCmdBeginQuery requires the
- * query to be unavailable, which an earlier reset in the same command buffer
- * provides). The stream therefore waits on every earlier stream, and it is
- * never the stream carrying a pending end timestamp. On G17P, both start
- * and end timestamps reach query memory at command retirement, so neither
- * producer may contain the query command or be merged back into it. The caller
- * marks later streams as ordered after it where the command's semantics require
- * that.
- */
-static struct hk_cs *
-hk_query_command_cs(struct hk_cmd_buffer *cmd)
-{
-   hk_sync_flush_pending_timestamp(cmd);
-   /* Timestamps written as copies of earlier ones are query results too. */
-   hk_sync_flush_stamp_copies(cmd);
-   hk_sync_end_cs_if_timestamped(cmd);
-
-   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, HK_SYNC_QUERY_SCOPE, cmd->current_cs.cs, dep);
-   struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
-   if (cs && agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
-      cs->g17p_timestamp_query = true;
-   return cs;
-}
-
 static uint64_t
 hk_query_available_size(const struct hk_query_pool *pool)
 {
@@ -455,14 +426,36 @@ static void
 hk_cmd_end_query_stamped(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                          uint32_t query)
 {
-   const uint32_t render_seq = cmd->current_cs.gfx->sync.seq;
+   struct hk_cs *render = cmd->current_cs.gfx;
+   const uint64_t offset_B = hk_query_available_offset(pool, query);
+
+   /* Fast path: stage up to 3 availability writes inline on the active render
+    * stream so single-render command buffers never allocate and discard a
+    * post_gfx CDM stream and its 64 KiB control-stream root. */
+   if (!cmd->current_cs.post_gfx &&
+       (!cmd->state.oq_pending_render ||
+        cmd->state.oq_pending_render == render) &&
+       render->oq_pending_count < ARRAY_SIZE(render->oq_pending) &&
+       offset_B <= UINT32_MAX) {
+      render->oq_pending[render->oq_pending_count++] = (struct hk_oq_pending){
+         .avail_addr = hk_query_available_addr(pool, query),
+         .handle = pool->handle,
+         .offset_B = (uint32_t)offset_B,
+         .avail_size = (uint8_t)hk_query_available_size(pool),
+      };
+      cmd->state.oq_pending_render = render;
+      return;
+   }
+
+   hk_flush_oq_pending(cmd);
+
+   const uint32_t render_seq = render->sync.seq;
    hk_queue_query_available_write(cmd, pool, query, 1, true);
 
    struct hk_cs *cs = cmd->current_cs.post_gfx;
    if (!cs || vk_command_buffer_has_error(&cmd->vk))
       return;
 
-   const uint64_t offset_B = hk_query_available_offset(pool, query);
    if (offset_B > UINT32_MAX)
       return;
 
@@ -1074,7 +1067,7 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    }
 
    case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT: {
-      cmd->state.gfx.descriptors.root_dirty = true;
+      hk_root_mark_dirty(&cmd->state.gfx.descriptors);
       cmd->state.gfx.descriptors.root.mesh_prims_query =
          end ? 0 : hk_query_report_addr(dev, pool, query);
       graphics = true;
@@ -1083,7 +1076,7 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
 
    case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
       struct hk_root_descriptor_table *root = &cmd->state.gfx.descriptors.root;
-      cmd->state.gfx.descriptors.root_dirty = true;
+      hk_root_mark_dirty(&cmd->state.gfx.descriptors);
 
       root->draw.pipeline_stats =
          end ? 0 : hk_query_report_addr(dev, pool, query);
@@ -1205,19 +1198,6 @@ hk_query_note_submit(struct hk_cmd_buffer *cmd, struct hk_queue *queue,
       p_atomic_set(&s->point, 0);
       p_atomic_set(&s->queue, queue);
       p_atomic_set(&s->point, point);
-   }
-}
-
-static void
-hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
-{
-   uint64_t seen = p_atomic_read(&queue->drm.signalled_value);
-   while (seen < point) {
-      const uint64_t prev =
-         p_atomic_cmpxchg(&queue->drm.signalled_value, seen, point);
-      if (prev == seen)
-         break;
-      seen = prev;
    }
 }
 

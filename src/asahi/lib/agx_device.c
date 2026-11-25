@@ -1157,7 +1157,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * (agx_gather_device_key). */
    const bool g18g_bringup =
       agx_params_g18g_bringup_supported(&dev->params);
-   if (g18g_bringup)
+   if (g18g_bringup && (dev->debug & AGX_DBG_FAULTTRACE))
       fprintf(stderr, "Experimental M6 G18G integration enabled (M5 paths, agx3d code); rendering is unqualified\n");
    if (!agx_params_driver_supported(&dev->params) && !m5 && !g18g_bringup) {
       if (dev->chip == AGX_CHIP_UNKNOWN) {
@@ -2085,6 +2085,6 @@ agx_gather_device_key(struct agx_device *dev)
       .needs_g13x_coherency = u_tristate_make(g13x_coh),
       .soft_fault = agx_has_soft_fault(dev),
       .emit_agx3d = g18g,
-      .shader_quad_control = dev->chip == AGX_CHIP_G17P,
+      .shader_quad_control = agx_chip_agx3_shader_quad_control(chip),
    };
 }

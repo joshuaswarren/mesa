@@ -8,6 +8,8 @@
 #include "util/ralloc.h"
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
+#include "hk_compute_pair.h"
+#include "hk_compute_pair_interval.h"
 #include "hk_pack.h"
 #include "hk_queue.h"
 
@@ -1412,7 +1414,7 @@ test_span_pool_policy(void)
    struct agx_device g17s = {.chip = AGX_CHIP_G17S, .is_virtio = false};
    struct agx_device g13g = {.chip = AGX_CHIP_G13G, .is_virtio = false};
 
-   T("native AGX3 caches up to 256 main/root/ioto spans",
+   T("native AGX3 caches up to 256 main/root/ioto/vdm spans",
      hk_cmd_pool_span_cache_max(&g17p, HK_CMD_BO_MAIN) ==
         HK_G17P_CMD_POOL_MAIN_BO_MAX &&
         hk_cmd_pool_span_cache_max(&g17p, HK_CMD_BO_ROOT) ==
@@ -1421,9 +1423,13 @@ test_span_pool_policy(void)
            HK_CMD_POOL_BO_MAX &&
         hk_cmd_pool_ioto_span_cache_max(&g17p) ==
            HK_G17P_CMD_POOL_MAIN_BO_MAX &&
+        hk_cmd_pool_vdm_span_cache_max(&g17p) ==
+           HK_G17P_CMD_POOL_MAIN_BO_MAX &&
         hk_cmd_pool_span_cache_max(&g17s, HK_CMD_BO_MAIN) ==
            HK_G17P_CMD_POOL_MAIN_BO_MAX &&
         hk_cmd_pool_ioto_span_cache_max(&g17s) ==
+           HK_G17P_CMD_POOL_MAIN_BO_MAX &&
+        hk_cmd_pool_vdm_span_cache_max(&g17s) ==
            HK_G17P_CMD_POOL_MAIN_BO_MAX);
    T("virtio and AGX2 keep default span cache cap",
      hk_cmd_pool_span_cache_max(&g17p_virtio, HK_CMD_BO_MAIN) ==
@@ -1431,9 +1437,11 @@ test_span_pool_policy(void)
         hk_cmd_pool_span_cache_max(&g17p_virtio, HK_CMD_BO_ROOT) ==
            HK_CMD_POOL_BO_MAX &&
         hk_cmd_pool_ioto_span_cache_max(&g17p_virtio) == HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_vdm_span_cache_max(&g17p_virtio) == HK_CMD_POOL_BO_MAX &&
         hk_cmd_pool_span_cache_max(&g13g, HK_CMD_BO_MAIN) ==
            HK_CMD_POOL_BO_MAX &&
-        hk_cmd_pool_ioto_span_cache_max(&g13g) == HK_CMD_POOL_BO_MAX);
+        hk_cmd_pool_ioto_span_cache_max(&g13g) == HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_vdm_span_cache_max(&g13g) == HK_CMD_POOL_BO_MAX);
 }
 
 void
@@ -1452,6 +1460,488 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    abort();
 }
 
+static void
+test_compute_pair_stream_safety(void)
+{
+   struct hk_compute_pair_dispatch pair = {0};
+   struct hk_cs base = {
+      .type = HK_CS_CDM,
+      .compute_pair = &pair,
+      .stats = { .cmds = 1, .calls = 1 },
+      .pack_dispatches = 1,
+   };
+   T("compute_pair clean single-dispatch",
+     hk_compute_pair_stream_eligible(&base));
+
+   struct hk_cs cs;
+   cs = base; cs.compute_pair = NULL;
+   T("compute_pair rejects NULL metadata", !hk_compute_pair_stream_eligible(&cs));
+
+   /* [producer, barrier, X] or [consumer, Y]: multiple commands in one stream */
+   cs = base; cs.stats.cmds = 2; cs.stats.calls = 2; cs.pack_dispatches = 2;
+   T("compute_pair rejects multi-dispatch stream", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.stats.cmds = 2;
+   T("compute_pair rejects extra non-call cmd", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.pack_dispatches = 2;
+   T("compute_pair rejects pack_dispatches != 1", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.stream_linked = true;
+   T("compute_pair rejects stream_linked", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.calls_stream = true;
+   T("compute_pair rejects calls_stream", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.sib_indirect = true;
+   T("compute_pair rejects sib_indirect", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.uses_global_atomics = true;
+   T("compute_pair rejects global atomics", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.query_access = true;
+   T("compute_pair rejects query_access", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.query_reset_pending = true;
+   T("compute_pair rejects query_reset_pending", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.timestamp.start.handle = 1;
+   T("compute_pair rejects start timestamp", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.timestamp.end.handle = 1;
+   T("compute_pair rejects end timestamp", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.g17p_timestamp_query = true;
+   T("compute_pair rejects g17p_timestamp_query", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.gen1_native_rq = true;
+   T("compute_pair rejects gen1_native_rq", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.as_build = true;
+   T("compute_pair rejects as_build", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.alias_sites = 1;
+   T("compute_pair accepts single tail alias_site", hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.alias_sites = 2;
+   T("compute_pair rejects multiple alias_sites", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.g18_dispatch_sealed = true;
+   T("compute_pair rejects g18_dispatch_sealed", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.imm_writes.size = 16;
+   T("compute_pair rejects imm_writes", !hk_compute_pair_stream_eligible(&cs));
+
+   cs = base; cs.type = HK_CS_VDM;
+   T("compute_pair rejects non-CDM stream", !hk_compute_pair_stream_eligible(&cs));
+
+   /* Self-copy & shifted-overlap safety checks for identity_copy4 kinds. */
+   struct hk_storage_backing b_same[3] = {
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+      {0},
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+   };
+   bool same = false;
+   /* LINEAR_OFFSET shifted overlap on same BO (so != doff) must be rejected. */
+   T("copy4 rejects LINEAR_OFFSET shifted overlap",
+     !hk_copy4_classify_intervals(false, 1, b_same, 0, 64, 256, &same));
+   /* Same BO offset with aliased/mismatched VA must be rejected. */
+   struct hk_storage_backing b_va_diff[3] = {
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+      {0},
+      {.handle = 7, .offset = 0x1000, .address = 0x200000},
+   };
+   T("copy4 rejects same-BO aliased VA self-copy",
+     !hk_copy4_classify_intervals(false, 1, b_va_diff, 0, 0, 256, &same));
+   /* IM2COL_1X1 in-place (stride=1, kw==channels identity) classifies as self-copy. */
+   same = false;
+   T("copy4 accepts IM2COL_1X1 exact in-place as self-copy",
+     hk_copy4_classify_intervals(false, 1, b_same, 0, 0, 256, &same) && same);
+   /* IM2COL_1X1 shifted overlap on same BO must be rejected. */
+   T("copy4 rejects IM2COL_1X1 shifted overlap",
+     !hk_copy4_classify_intervals(false, 1, b_same, 0, 64, 256, &same));
+   /* LINEAR_FADD (nsrc==2) in-place is allowed but NEVER classified as self-copy. */
+   struct hk_storage_backing b_fadd[3] = {
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+      {.handle = 8, .offset = 0x2000, .address = 0x200000},
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+   };
+   same = true;
+   T("copy4 accepts LINEAR_FADD in-place without self-copy",
+     hk_copy4_classify_intervals(true, 2, b_fadd, 0, 0, 256, &same) && !same);
+   /* LINEAR_FADD shifted overlap on same BO must be rejected. */
+   T("copy4 rejects LINEAR_FADD shifted overlap",
+     !hk_copy4_classify_intervals(true, 2, b_fadd, 0, 64, 256, &same));
+}
+
+static struct hk_storage_backing
+fadd_backing(uint32_t handle, uint64_t offset, uint32_t size)
+{
+   return (struct hk_storage_backing){
+      .address = ((uint64_t)handle << 24) + offset,
+      .offset = offset,
+      .size = size,
+      .handle = handle,
+   };
+}
+
+/* Submit-time FADD + copy4 dual-write fusion gate: the fused shader writes the
+ * copy4 destination (dst2) while it still reads both FADD sources, so any
+ * overlap between dst2 and the FADD output or reads must keep the two
+ * dispatches separate. Overlap is decided on BO intervals, so a second
+ * descriptor with a different buffer offset that reaches the same bytes
+ * counts as an overlap. */
+static void
+test_fadd_copy4_fusion_gate(void)
+{
+   enum { SRC0 = 1, SRC1 = 2, OUT = 3, OTHER = 4 };
+   const uint32_t bytes = 1024, size = 4096;
+
+   struct hk_compute_pair_dispatch fadd = {0};
+   fadd.info.role = HK_COMPUTE_PAIR_FADD;
+   fadd.info.fadd.push_bytes = 4;
+   fadd.alt_kind = HK_COMPUTE_PAIR_ALT_LINEAR_FADD;
+   fadd.extra.copy4 = (struct hk_compute_pair_copy4){0, 0, bytes};
+   fadd.bindings[0] = fadd_backing(SRC0, 0, size);
+   fadd.bindings[1] = fadd_backing(SRC1, 0, size);
+   fadd.bindings[2] = fadd_backing(OUT, 0, size);
+
+   struct hk_compute_pair_dispatch copy = {0};
+   copy.info.role = HK_COMPUTE_PAIR_COPY4;
+   copy.extra.copy4 = (struct hk_compute_pair_copy4){0, 0, bytes};
+   copy.bindings[0] = fadd.bindings[2];
+   copy.bindings[1] = fadd_backing(OTHER, 0, size);
+
+   struct hk_compute_pair_dispatch f, c;
+   T("fadd+copy4 fuses with dst2 in another BO",
+     hk_compute_pair_fadd_copy4_match(&fadd, &copy));
+
+   /* dst2 in the output's BO, through the output's own descriptor. */
+   c = copy; c.bindings[1] = fadd.bindings[2]; c.extra.copy4.dst_start = bytes;
+   T("fadd+copy4 fuses with dst2 right after the output",
+     hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c.extra.copy4.dst_start = bytes / 2;
+   T("fadd+copy4 rejects dst2 half over the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c.extra.copy4.dst_start = bytes - 16;
+   T("fadd+copy4 rejects dst2 sharing the last vec4 of the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+
+   /* dst2 through a second descriptor on the output's BO: offsets differ but
+    * the GPU ranges intersect. */
+   c = copy; c.bindings[1] = fadd_backing(OUT, 768, bytes);
+   T("fadd+copy4 rejects another descriptor overlapping the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(OUT, 0, size);
+   c.extra.copy4.dst_start = 0;
+   T("fadd+copy4 rejects dst2 equal to the output via a second descriptor",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(OUT, 512, size - 512);
+   c.extra.copy4.dst_start = 1024;
+   T("fadd+copy4 fuses with a second descriptor past the output",
+     hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c.extra.copy4.dst_start = 256;
+   T("fadd+copy4 rejects a second descriptor ending inside the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(OUT, 0, size);
+   f = fadd; f.extra.copy4.dst_start = 2048;
+   f.extra.copy4.src_start = 2048;
+   c.extra.copy4.src_start = 2048;
+   c.extra.copy4.dst_start = 1536;
+   T("fadd+copy4 rejects dst2 covering the start of an offset output",
+     !hk_compute_pair_fadd_copy4_match(&f, &c));
+
+   /* dst2 over either FADD source, which the fused shader still reads. */
+   c = copy; c.bindings[1] = fadd_backing(SRC1, 512, size - 512);
+   T("fadd+copy4 rejects dst2 overlapping src1 via another descriptor",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(SRC0, bytes - 16, size - bytes);
+   T("fadd+copy4 rejects dst2 sharing the last vec4 of src0",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(SRC0, bytes, size - bytes);
+   T("fadd+copy4 fuses with dst2 right after src0",
+     hk_compute_pair_fadd_copy4_match(&fadd, &c));
+
+   /* In-place FADD (src0 == output). */
+   f = fadd; f.bindings[0] = fadd.bindings[2];
+   T("in-place fadd+copy4 fuses with disjoint dst2",
+     hk_compute_pair_fadd_copy4_match(&f, &copy));
+   c = copy; c.bindings[1] = fadd_backing(OUT, 512, size - 512);
+   T("in-place fadd+copy4 rejects dst2 over the in-place range",
+     !hk_compute_pair_fadd_copy4_match(&f, &c));
+
+   /* The copy must read exactly what the FADD wrote. */
+   c = copy; c.extra.copy4.src_start = 16;
+   T("fadd+copy4 rejects a shifted copy source",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.extra.copy4.bytes = bytes / 2;
+   T("fadd+copy4 rejects a partial copy of the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[0] = fadd_backing(OUT, 16, size - 16);
+   T("fadd+copy4 rejects a copy source through a shifted descriptor",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(OTHER, 4, size - 4);
+   T("fadd+copy4 rejects an unaligned dst2",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   f = fadd; f.alt_kind = HK_COMPUTE_PAIR_ALT_NONE;
+   T("fadd+copy4 requires the linear FADD alternate",
+     !hk_compute_pair_fadd_copy4_match(&f, &copy));
+}
+
+/* A packet that carried a fused compute-pair dispatch is reused like any
+ * other: the state the fused emitter sets (matrix ops, M5 resource
+ * profiles) starts the next submission clear, and a packet never holds a
+ * compute-pair record of its own. */
+static void
+test_fused_packet_reuse(bool negctl)
+{
+   struct hk_device *dev = dev_with(AGX_CHIP_G17P, 0);
+   struct hk_cmd_buffer *cmd = test_alloc(sizeof(*cmd));
+   struct hk_cs *cs = test_alloc(sizeof(*cs));
+   uint8_t buf[256] = {0};
+   struct hk_compute_pair_dispatch stale = {0};
+
+   hk_pack_init_packet(cmd, cs, dev, buf, 0x10000, sizeof(buf), true);
+   const uint32_t profile = 0xfeedu;
+   util_dynarray_append(&cs->compute_resources, profile);
+   cs->m5_matrix_ops = true;
+   cs->compute_pair = &stale;
+
+   if (!negctl)
+      hk_pack_init_packet(cmd, cs, dev, buf, 0x10000, sizeof(buf), true);
+
+   T("fused packet reuse clears matrix ops", !cs->m5_matrix_ops);
+   T("fused packet reuse clears resource profiles",
+     cs->compute_resources.size == 0);
+   T("reused packet holds no compute-pair record", cs->compute_pair == NULL);
+}
+
+/* The buffers a packed submission pins: each once, none for NULL. */
+static void
+test_pack_add_bo(void)
+{
+   struct util_dynarray bos;
+   util_dynarray_init(&bos, NULL);
+   struct agx_bo *a = (struct agx_bo *)(uintptr_t)0x1000;
+   struct agx_bo *b = (struct agx_bo *)(uintptr_t)0x2000;
+
+   T("add_bo accepts NULL", hk_pack_add_bo(&bos, NULL));
+   T("add_bo adds nothing for NULL",
+     util_dynarray_num_elements(&bos, struct agx_bo *) == 0);
+   T("add_bo appends", hk_pack_add_bo(&bos, a) && hk_pack_add_bo(&bos, b));
+   T("add_bo keeps a duplicate once", hk_pack_add_bo(&bos, a) &&
+     util_dynarray_num_elements(&bos, struct agx_bo *) == 2 &&
+     *util_dynarray_element(&bos, struct agx_bo *, 0) == a &&
+     *util_dynarray_element(&bos, struct agx_bo *, 1) == b);
+   util_dynarray_fini(&bos);
+}
+
+static struct hk_pack_footprint
+make_fp(uint32_t r_handle, uint64_t r0, uint64_t r1,
+        uint32_t w_handle, uint64_t w0, uint64_t w1)
+{
+   struct hk_pack_footprint fp = {.known = true};
+   if (r_handle) {
+      fp.reads[0] = (struct hk_pack_interval){.start = r0, .end = r1, .handle = r_handle};
+      fp.num_reads = 1;
+   }
+   if (w_handle) {
+      fp.writes[0] = (struct hk_pack_interval){.start = w0, .end = w1, .handle = w_handle};
+      fp.num_writes = 1;
+   }
+   return fp;
+}
+
+static void
+test_hazard_tracker(void)
+{
+   struct hk_pack_hazard_state st = {0};
+
+   /* Disjoint dispatches: elide weak barrier when overlap is allowed. */
+   struct hk_pack_footprint a = make_fp(1, 0, 1024, 2, 0, 1024);
+   struct hk_pack_footprint b = make_fp(3, 0, 1024, 4, 0, 1024);
+   hk_pack_hazard_record(&st, &a, false);
+   T("hazard: disjoint pair elides barrier when overlap allowed",
+     hk_pack_hazard_decide(&st, &b, true) == HK_PACK_BOUNDARY_ELIDE_BARRIER &&
+     st.num_dirty_writes == 1 && st.num_dirty_reads == 1);
+
+   /* Disjoint pair with !can_elide_weak keeps weak barrier and clears dirty_reads
+    * while preserving dirty_writes for subsequent RAW detection. */
+   hk_pack_hazard_record(&st, &b, false);
+   struct hk_pack_footprint c = make_fp(5, 0, 1024, 6, 0, 1024);
+   T("hazard: !can_elide_weak keeps weak barrier and retains dirty_writes",
+     hk_pack_hazard_decide(&st, &c, false) == HK_PACK_BOUNDARY_KEEP_WEAK &&
+     st.num_dirty_writes == 2 && st.num_dirty_reads == 0);
+
+   /* Delayed RAW against earlier member `a` (bo 2) triggers STRONG and resets. */
+   hk_pack_hazard_record(&st, &c, false);
+   struct hk_pack_footprint raw_a = make_fp(2, 512, 1024, 7, 0, 1024);
+   T("hazard: delayed RAW triggers strong flush and resets state",
+     hk_pack_hazard_decide(&st, &raw_a, true) == HK_PACK_BOUNDARY_STRONG &&
+     st.num_dirty_writes == 0 && st.num_dirty_reads == 0 &&
+     !st.write_unknown && !st.read_unknown);
+
+   /* WAW against dirty write triggers STRONG. */
+   hk_pack_hazard_record(&st, &a, false);
+   struct hk_pack_footprint waw_a = make_fp(9, 0, 512, 2, 0, 256);
+   T("hazard: WAW triggers strong flush",
+     hk_pack_hazard_decide(&st, &waw_a, true) == HK_PACK_BOUNDARY_STRONG &&
+     st.num_dirty_writes == 0);
+
+   /* WAR against dirty read keeps weak barrier (does not need strong flush). */
+   hk_pack_hazard_record(&st, &a, false);
+   struct hk_pack_footprint war_a = make_fp(9, 0, 512, 1, 256, 512);
+   T("hazard: WAR keeps weak barrier and retains dirty_writes",
+     hk_pack_hazard_decide(&st, &war_a, true) == HK_PACK_BOUNDARY_KEEP_WEAK &&
+     st.num_dirty_writes == 1 && st.num_dirty_reads == 0);
+
+   /* Touching ranges on same handle [0,1024) vs [1024,2048) are disjoint. */
+   hk_pack_hazard_reset_all(&st);
+   struct hk_pack_footprint sub0 = make_fp(1, 0, 1024, 1, 1024, 2048);
+   struct hk_pack_footprint sub1 = make_fp(1, 2048, 3072, 1, 3072, 4096);
+   hk_pack_hazard_record(&st, &sub0, false);
+   T("hazard: non-overlapping subranges on same BO elide barrier",
+     hk_pack_hazard_decide(&st, &sub1, true) == HK_PACK_BOUNDARY_ELIDE_BARRIER);
+
+   /* strong_flushed=true clears all accumulated state even for unknown fp. */
+   hk_pack_hazard_record(&st, NULL, true);
+   T("hazard: strong_flushed clears state",
+     st.num_dirty_writes == 0 && st.num_dirty_reads == 0 &&
+     !st.write_unknown && !st.read_unknown);
+
+   /* Unknown producer fails closed to STRONG. */
+   struct hk_pack_footprint unk = {.known = false};
+   hk_pack_hazard_record(&st, &unk, false);
+   T("hazard: unknown producer fails closed to strong",
+     hk_pack_hazard_decide(&st, &b, true) == HK_PACK_BOUNDARY_STRONG &&
+     !st.write_unknown && !st.read_unknown);
+
+   /* Unknown consumer fails closed to STRONG. */
+   hk_pack_hazard_record(&st, &a, false);
+   T("hazard: unknown consumer fails closed to strong",
+     hk_pack_hazard_decide(&st, &unk, true) == HK_PACK_BOUNDARY_STRONG &&
+     st.num_dirty_writes == 0);
+
+   /* Duplicate interval dedup avoids spurious overflow. */
+   hk_pack_hazard_reset_all(&st);
+   for (unsigned i = 0; i < HK_PACK_HAZARD_MAX_INTERVALS + 16; ++i)
+      hk_pack_hazard_record(&st, &a, false);
+   T("hazard: duplicate intervals deduplicate without overflow",
+     !st.write_unknown && !st.read_unknown &&
+     st.num_dirty_writes == 1 && st.num_dirty_reads == 1 &&
+     hk_pack_hazard_decide(&st, &b, true) == HK_PACK_BOUNDARY_ELIDE_BARRIER);
+
+   /* Distinct write intervals exceeding capacity fail closed to STRONG. */
+   hk_pack_hazard_reset_all(&st);
+   for (unsigned i = 0; i <= HK_PACK_HAZARD_MAX_INTERVALS; ++i) {
+      struct hk_pack_footprint fi = make_fp(100, 0, 64, 200 + i, 0, 64);
+      hk_pack_hazard_record(&st, &fi, false);
+   }
+   T("hazard: dirty_writes overflow fails closed to strong",
+     st.write_unknown &&
+     hk_pack_hazard_decide(&st, &b, true) == HK_PACK_BOUNDARY_STRONG);
+
+   /* Distinct read intervals exceeding capacity fail closed to KEEP_WEAK. */
+   hk_pack_hazard_reset_all(&st);
+   for (unsigned i = 0; i <= HK_PACK_HAZARD_MAX_INTERVALS; ++i) {
+      struct hk_pack_footprint fi = make_fp(300 + i, 0, 64, 400, 0, 64);
+      hk_pack_hazard_record(&st, &fi, false);
+   }
+   T("hazard: dirty_reads overflow fails closed to keep weak",
+     !st.write_unknown && st.read_unknown &&
+     hk_pack_hazard_decide(&st, &b, true) == HK_PACK_BOUNDARY_KEEP_WEAK &&
+     !st.read_unknown && st.num_dirty_reads == 0 && st.num_dirty_writes == 1);
+}
+
+static void
+test_liveness_tracker(void)
+{
+   struct hk_pack_liveness_state st;
+   hk_pack_liveness_reset(&st);
+
+   const struct hk_pack_interval h1_0_64 = { .start = 0, .end = 64, .handle = 1 };
+   const struct hk_pack_interval h1_64_128 = { .start = 64, .end = 128, .handle = 1 };
+   const struct hk_pack_interval h1_0_128 = { .start = 0, .end = 128, .handle = 1 };
+   const struct hk_pack_interval h1_16_48 = { .start = 16, .end = 48, .handle = 1 };
+   const struct hk_pack_interval h1_0_16 = { .start = 0, .end = 16, .handle = 1 };
+   const struct hk_pack_interval h1_48_128 = { .start = 48, .end = 128, .handle = 1 };
+   const struct hk_pack_interval h2_0_64 = { .start = 0, .end = 64, .handle = 2 };
+
+   T("liveness: empty state covers nothing", !hk_pack_liveness_covers(&st, &h1_0_64));
+
+   hk_pack_liveness_add_overwrite(&st, &h1_0_64);
+   T("liveness: exact and sub-interval covered after overwrite",
+     hk_pack_liveness_covers(&st, &h1_0_64) &&
+     hk_pack_liveness_covers(&st, &h1_16_48) &&
+     !hk_pack_liveness_covers(&st, &h1_0_128) &&
+     !hk_pack_liveness_covers(&st, &h2_0_64));
+
+   /* Adjacent overwrite coalesces into single [0, 128) interval. */
+   hk_pack_liveness_add_overwrite(&st, &h1_64_128);
+   T("liveness: adjacent overwrites coalesce",
+     st.num_dead == 1 && hk_pack_liveness_covers(&st, &h1_0_128));
+
+   /* Interior read splits [0, 128) into [0, 16) and [48, 128). */
+   hk_pack_liveness_kill_read(&st, &h1_16_48);
+   T("liveness: interior read splits dead interval",
+     st.num_dead == 2 &&
+     hk_pack_liveness_covers(&st, &h1_0_16) &&
+     hk_pack_liveness_covers(&st, &h1_48_128) &&
+     !hk_pack_liveness_covers(&st, &h1_16_48) &&
+     !hk_pack_liveness_covers(&st, &h1_0_64));
+
+   /* Left and right trims + exact kill. */
+   const struct hk_pack_interval h1_0_8 = { .start = 0, .end = 8, .handle = 1 };
+   const struct hk_pack_interval h1_8_16 = { .start = 8, .end = 16, .handle = 1 };
+   const struct hk_pack_interval h1_96_128 = { .start = 96, .end = 128, .handle = 1 };
+   const struct hk_pack_interval h1_48_96 = { .start = 48, .end = 96, .handle = 1 };
+   hk_pack_liveness_kill_read(&st, &h1_0_8);
+   hk_pack_liveness_kill_read(&st, &h1_96_128);
+   T("liveness: left/right trims preserve remaining dead ranges",
+     hk_pack_liveness_covers(&st, &h1_8_16) &&
+     !hk_pack_liveness_covers(&st, &h1_0_8) &&
+     hk_pack_liveness_covers(&st, &h1_48_96) &&
+     !hk_pack_liveness_covers(&st, &h1_96_128));
+   hk_pack_liveness_kill_read(&st, &h1_0_128);
+   T("liveness: covering read kills all overlapping intervals", st.num_dead == 0);
+
+   /* Backward step: in-place read+write leaves interval LIVE before op. */
+   struct hk_pack_footprint inplace = make_fp(1, 0, 64, 1, 0, 64);
+   hk_pack_liveness_add_overwrite(&st, &h1_0_64);
+   hk_pack_liveness_step_backward(&st, &inplace);
+   T("liveness: in-place read+write kills deadness before op",
+     !hk_pack_liveness_covers(&st, &h1_0_64));
+
+   /* Backward step: pure overwrite marks dead, unknown op fails closed. */
+   struct hk_pack_footprint wr1 = make_fp(2, 0, 64, 1, 0, 64);
+   hk_pack_liveness_step_backward(&st, &wr1);
+   T("liveness: pure overwrite marks target dead",
+     hk_pack_liveness_covers(&st, &h1_0_64) &&
+     !hk_pack_liveness_covers(&st, &h2_0_64));
+
+   struct hk_pack_footprint unk = { .known = false };
+   hk_pack_liveness_step_backward(&st, &unk);
+   T("liveness: unknown footprint resets all dead intervals", st.num_dead == 0);
+
+   /* Invalid read fails closed (resets). */
+   hk_pack_liveness_add_overwrite(&st, &h1_0_64);
+   const struct hk_pack_interval bad_iv = { .start = 64, .end = 64, .handle = 1 };
+   hk_pack_liveness_kill_read(&st, &bad_iv);
+   T("liveness: invalid read interval fails closed", st.num_dead == 0);
+
+   /* Capacity overflow drops extra intervals soundly (never over-approximates). */
+   for (unsigned i = 0; i < HK_PACK_LIVENESS_MAX_INTERVALS + 8; ++i) {
+      struct hk_pack_interval iv = { .start = 0, .end = 64, .handle = 100 + i };
+      hk_pack_liveness_add_overwrite(&st, &iv);
+   }
+   const struct hk_pack_interval overflow_iv = {
+      .start = 0, .end = 64, .handle = 100 + HK_PACK_LIVENESS_MAX_INTERVALS + 4,
+   };
+   T("liveness: capacity overflow drops conservatively",
+     st.num_dead == HK_PACK_LIVENESS_MAX_INTERVALS &&
+     !hk_pack_liveness_covers(&st, &overflow_iv));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1461,6 +1951,7 @@ main(int argc, char **argv)
       return EXIT_FAILURE;
    if (negctl) {
       test_packet_reuse(true);
+      test_fused_packet_reuse(true);
       printf("%u tests, %u failures\n", tests, failures);
       ralloc_free(test_context);
       return failures ? EXIT_FAILURE : EXIT_SUCCESS;
@@ -1480,6 +1971,107 @@ main(int argc, char **argv)
    test_full_classes();
    test_random();
    test_history();
+   test_compute_pair_stream_safety();
+   test_fadd_copy4_fusion_gate();
+   test_fused_packet_reuse(false);
+   test_pack_add_bo();
+   test_hazard_tracker();
+   test_liveness_tracker();
+
+   /* Bounded-loop accounting, NIR-bound expression eval, and post-fusion budget checks. */
+   {
+      uint64_t w = 0;
+      T("unbounded looping dispatch sets pack_loops",
+        hk_pack_account_dispatch_work(1024, 64, true, 0, &w) && w == 65536);
+      T("bounded looping dispatch scales work and clears pack_loops",
+        !hk_pack_account_dispatch_work(1024, 64, true, 13, &w) && w == 1024ull * 64 * 13);
+      T("bounded looping dispatch over work limit sets pack_loops and saturates",
+        hk_pack_account_dispatch_work(1ull << 24, 256, true, 16, &w) && w == UINT64_MAX);
+      T("overflowing bounded loop sets pack_loops and saturates",
+        hk_pack_account_dispatch_work(UINT64_MAX / 2, 4, true, 4, &w) && w == UINT64_MAX);
+      T("effective-instr bounded looping dispatch scales work directly",
+        !hk_pack_account_dispatch_work_eff(1024, 500, true, 800, &w) && w == 1024ull * 800);
+      T("effective-instr zero fails closed to pack_loops",
+        hk_pack_account_dispatch_work_eff(1024, 500, true, 0, &w) && w == 1024ull * 500);
+
+      /* Expression evaluator: max(3, kh * (1 + kw)) */
+      struct hk_pack_loop_bound lb = {
+         .valid = true,
+         .work_valid = true,
+         .count = 7,
+         .work_count = 3,
+         .static_nir_ops = 400,
+         .ops = {
+            [0] = { .kind = HK_PACK_LOOP_OP_CONST, .imm = 3 },
+            [1] = { .kind = HK_PACK_LOOP_OP_PARAM, .imm = HK_PACK_LOOP_PARAM_DW_KH },
+            [2] = { .kind = HK_PACK_LOOP_OP_CONST, .imm = 1 },
+            [3] = { .kind = HK_PACK_LOOP_OP_PARAM, .imm = HK_PACK_LOOP_PARAM_DW_KW },
+            [4] = { .kind = HK_PACK_LOOP_OP_ADD, .lhs = 2, .rhs = 3 },
+            [5] = { .kind = HK_PACK_LOOP_OP_MUL, .lhs = 1, .rhs = 4 },
+            [6] = { .kind = HK_PACK_LOOP_OP_MAX, .lhs = 0, .rhs = 5 },
+         },
+         .work_ops = {
+            [0] = { .kind = HK_PACK_LOOP_OP_PARAM, .imm = HK_PACK_LOOP_PARAM_DW_KH },
+            [1] = { .kind = HK_PACK_LOOP_OP_CONST, .imm = 100 },
+            [2] = { .kind = HK_PACK_LOOP_OP_MUL, .lhs = 0, .rhs = 1 },
+         },
+      };
+      uint64_t params[HK_PACK_LOOP_PARAM_COUNT] = {0};
+      params[HK_PACK_LOOP_PARAM_DW_KH] = 3;
+      params[HK_PACK_LOOP_PARAM_DW_KW] = 3;
+      uint64_t bval = 0, eff = 0;
+      T("eval nested depthwise back-edges expression",
+        hk_pack_eval_loop_bound(&lb, params, &bval) && bval == 12);
+      T("eval CF-weighted effective instrs tightens multi-branch bound",
+        hk_pack_eval_effective_instrs(&lb, 400, params, &eff) &&
+        eff == 600 && eff < 400 * bval);
+      lb.work_valid = false;
+      T("eval effective instrs falls back to agx_instrs * loop_bound without work_ops",
+        hk_pack_eval_effective_instrs(&lb, 400, params, &eff) &&
+        eff == 400 * bval);
+      lb.work_valid = true;
+      params[HK_PACK_LOOP_PARAM_DW_KH] = UINT64_MAX;
+      params[HK_PACK_LOOP_PARAM_DW_KW] = 2;
+      T("eval rejects overflow cleanly",
+        !hk_pack_eval_loop_bound(&lb, params, &bval) && bval == 0);
+      T("eval effective instrs rejects overflow cleanly",
+        !hk_pack_eval_effective_instrs(&lb, 400, params, &eff) && eff == 0);
+      lb.valid = false;
+      T("eval rejects invalid loop bound",
+        !hk_pack_eval_loop_bound(&lb, params, &bval) && bval == 0);
+      T("eval effective instrs rejects invalid loop bound",
+        !hk_pack_eval_effective_instrs(&lb, 400, params, &eff) && eff == 0);
+
+      /* Post-fusion run re-accounting (e.g. DUAL_PAD4 zero-fill loop). */
+      uint64_t nw = 0;
+      unsigned nl = 0;
+      T("fusion fits when post-fusion work stays within HK_PACK_MAX_STATIC_WORK",
+        hk_pack_fusion_fits_run(10000, 0, 3000, 0, 4500, false, &nw, &nl) &&
+        nw == 11500 && nl == 0);
+      T("fusion rejected when DUAL_PAD4 zero-fill blows HK_PACK_MAX_STATIC_WORK",
+        !hk_pack_fusion_fits_run(HK_PACK_MAX_STATIC_WORK - 1000, 0, 500, 0,
+                                 5000, false, &nw, &nl));
+      T("fusion rejected when adding a second unbounded loop to a packed run",
+        !hk_pack_fusion_fits_run(10000, 1, 2000, 0, 2000, true, &nw, &nl));
+      T("fusion accepted when replacing the run's only unbounded loop",
+        hk_pack_fusion_fits_run(10000, 1, 2000, 1, 2500, true, &nw, &nl) &&
+        nw == 10500 && nl == 1);
+
+      /* Two bounded-loop members pack into one packet. */
+      struct hk_cmd_buffer *cbs[2] = { plain(1), plain(1) };
+      for (unsigned i = 0; i < 2; ++i) {
+         struct hk_cs *cs = first_cs(cbs[i]);
+         cs->pack_loops = hk_pack_account_dispatch_work(
+            4096, 128, true, 13, &w);
+         cs->pack_static_work = w;
+      }
+      struct hk_pack_run runs[2];
+      unsigned rc = 0;
+      plan_on(cbs, 2, 0, false, runs, &rc);
+      T("two bounded looping members pack into one packet",
+        rc == 1 && runs[0].count == 2);
+   }
+
    test_packet_reuse(false);
    test_span_pool_policy();
    printf("%u tests, %u failures\n", tests, failures);

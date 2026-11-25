@@ -5029,6 +5029,97 @@ test_g17p_projected_2d_runtime_offset_scope(void)
    return ok;
 }
 
+static bool
+test_agx3d_texture_early_lowering(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options,
+      "AGX3D early texture lowering");
+
+   nir_def *coord2 = nir_load_input(&b, 2, 32, nir_imm_int(&b, 0));
+   nir_def *coord3 = nir_load_input(&b, 3, 32, nir_imm_int(&b, 1));
+   nir_def *lod = nir_load_input(&b, 1, 32, nir_imm_int(&b, 2));
+   nir_def *min_lod = nir_load_input(&b, 1, 32, nir_imm_int(&b, 3));
+   nir_def *offset = nir_load_constant_agx(
+      &b, 2, 32, nir_imm_int64(&b, 0), nir_imm_int(&b, 0),
+      .format = PIPE_FORMAT_R32_UINT, .sign_extend = true);
+
+   /* 1. txb with min_lod -> txl without bias or min_lod. */
+   nir_tex_instr *txb = nir_tex_instr_create(b.shader, 3);
+   txb->op = nir_texop_txb;
+   txb->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   txb->dest_type = nir_type_float32;
+   txb->coord_components = 2;
+   txb->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord2);
+   txb->src[1] = nir_tex_src_for_ssa(nir_tex_src_bias, lod);
+   txb->src[2] = nir_tex_src_for_ssa(nir_tex_src_min_lod, min_lod);
+   nir_def_init(&txb->instr, &txb->def, 4, 32);
+   nir_builder_instr_insert(&b, &txb->instr);
+
+   /* 2. 3D txd -> txl. */
+   nir_tex_instr *txd = nir_tex_instr_create(b.shader, 3);
+   txd->op = nir_texop_txd;
+   txd->sampler_dim = GLSL_SAMPLER_DIM_3D;
+   txd->dest_type = nir_type_float32;
+   txd->coord_components = 3;
+   txd->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord3);
+   txd->src[1] = nir_tex_src_for_ssa(nir_tex_src_ddx, nir_imm_vec3(&b, 0.1f, 0.0f, 0.0f));
+   txd->src[2] = nir_tex_src_for_ssa(nir_tex_src_ddy, nir_imm_vec3(&b, 0.0f, 0.1f, 0.0f));
+   nir_def_init(&txd->instr, &txd->def, 4, 32);
+   nir_builder_instr_insert(&b, &txd->instr);
+
+   /* 3. 2D_ARRAY txl with runtime offset -> offset lowered with txs + query_levels. */
+   nir_tex_instr *txl = nir_tex_instr_create(b.shader, 3);
+   txl->op = nir_texop_txl;
+   txl->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   txl->is_array = true;
+   txl->dest_type = nir_type_float32;
+   txl->coord_components = 3;
+   txl->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord3);
+   txl->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, lod);
+   txl->src[2] = nir_tex_src_for_ssa(nir_tex_src_offset, offset);
+   nir_def_init(&txl->instr, &txl->def, 4, 32);
+   nir_builder_instr_insert(&b, &txl->instr);
+
+   /* 4. tg4 with runtime offset -> offset preserved for native PACK_SMPIR. */
+   nir_tex_instr *tg4 = nir_tex_instr_create(b.shader, 2);
+   tg4->op = nir_texop_tg4;
+   tg4->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tg4->dest_type = nir_type_float32;
+   tg4->coord_components = 2;
+   tg4->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord2);
+   tg4->src[1] = nir_tex_src_for_ssa(nir_tex_src_offset, offset);
+   nir_def_init(&tg4->instr, &tg4->def, 4, 32);
+   nir_builder_instr_insert(&b, &tg4->instr);
+
+   const bool progress = agx_nir_lower_agx3d_texture_early(b.shader, false, true);
+   nir_validate_shader(b.shader, "after agx_nir_lower_agx3d_texture_early");
+
+   unsigned level_queries = 0;
+   nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_tex &&
+             nir_instr_as_tex(instr)->op == nir_texop_query_levels)
+            level_queries++;
+      }
+   }
+
+   const bool ok =
+      progress &&
+      txb->op == nir_texop_txl &&
+      nir_tex_instr_src_index(txb, nir_tex_src_min_lod) < 0 &&
+      nir_tex_instr_src_index(txb, nir_tex_src_bias) < 0 &&
+      nir_tex_instr_src_index(txb, nir_tex_src_lod) >= 0 &&
+      txd->op == nir_texop_txl &&
+      nir_tex_instr_src_index(txd, nir_tex_src_ddx) < 0 &&
+      nir_tex_instr_src_index(txd, nir_tex_src_lod) >= 0 &&
+      nir_tex_instr_src_index(txl, nir_tex_src_offset) < 0 &&
+      level_queries == 1 &&
+      nir_tex_instr_src_index(tg4, nir_tex_src_offset) >= 0;
+   ralloc_free(b.shader);
+   return ok;
+}
+
 /* A runtime offset loaded as one vector has no allocated_vec entry. Combining
  * it with a shadow comparator used to call agx_emit_extract() anyway and abort
  * while compiling the pcOffset sampler2DShadow bias fragment. Keep the same
@@ -9244,6 +9335,232 @@ test_agx3_heavy_branch_loop_unroll_limit(void)
    return kept_unrollable;
 }
 
+static bool
+test_agx3_tiny_push_vertex_preamble_inlined(void)
+{
+   /* 1. Tiny push-only vertex shader (bubo.vert shape: loads 4-byte draw_id
+    * from root+768, computes tile x/y and NDC offset in ~8 fast 1-cycle ALU
+    * ops). Uniform DMA must replace the root load, inline the preamble away
+    * (has_preamble == false), and record !agx3_main_uses_root_uniform. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "agx3-tiny-push-vs");
+   b.shader->info.io_lowered = true;
+   b.shader->info.outputs_written = VARYING_BIT_POS;
+
+   nir_def *root = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *draw_id = nir_load_global_constant(
+      &b, 1, 32, nir_iadd_imm(&b, root, 768), .align_mul = 4);
+   nir_def *tx = nir_iand_imm(&b, draw_id, 63);
+   nir_def *ty = nir_ushr_imm(&b, draw_id, 6);
+   nir_def *fx = nir_ffma(&b, nir_u2f32(&b, tx), nir_imm_float(&b, 0.03125f),
+                          nir_imm_float(&b, -1.0f));
+   nir_def *fy = nir_ffma(&b, nir_u2f32(&b, ty), nir_imm_float(&b, 0.03125f),
+                          nir_imm_float(&b, -1.0f));
+   /* A hardware vertex shader reads its index as load_vertex_id;
+    * load_vertex_id_zero_base is the software (compute) VS form. */
+   nir_def *vid = nir_load_vertex_id(&b);
+   nir_def *vx = nir_fadd(&b, fx, nir_u2f32(&b, nir_iand_imm(&b, vid, 1)));
+   nir_def *vy = nir_fadd(&b, fy, nir_u2f32(&b, nir_ushr_imm(&b, vid, 1)));
+   nir_def *pos[4] = {vx, vy, nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f)};
+   for (unsigned c = 0; c < 4; ++c)
+      nir_store_uvs_agx(&b, pos[c], nir_imm_intN_t(&b, c, 16));
+   agx_preprocess_nir(b.shader);
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.reserved_preamble = 4;
+   key.agx3_native_cprog = true;
+   key.g17p_native_uniforms = true;
+   key.g17p_uniform_dma = true;
+   key.g17p_dma_root = 0;
+
+   struct agx_shader_part part = {0};
+   bool ok = agx_compile_shader_nir(b.shader, &key, &part);
+   bool tiny_ok = ok && !part.info.has_preamble &&
+                  part.info.agx3_uniform_dma_count == 1 &&
+                  part.info.agx3_uniform_dma[0].offset_B == 768 &&
+                  part.info.agx3_uniform_dma[0].halfs == 2 &&
+                  part.info.agx3_root_uniform_usage_valid &&
+                  !part.info.agx3_main_uses_root_uniform &&
+                  !part.info.agx3_preamble_uses_root_uniform;
+   free(part.binary);
+   ralloc_free(b.shader);
+   if (!tiny_ok)
+      return false;
+
+   /* 2. Negative control: a vertex preamble doing slow ops (frcp) or heavy
+    * multi-word root math (>16 bytes loaded) must NOT be inlined away. */
+   nir_builder b2 = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "agx3-heavy-root-vs");
+   b2.shader->info.io_lowered = true;
+   b2.shader->info.outputs_written = VARYING_BIT_POS;
+
+   nir_def *root2 = nir_load_preamble(&b2, 1, 64, .base = 0);
+   nir_def *acc = nir_imm_float(&b2, 1.0f);
+   for (unsigned k = 0; k < 8; ++k) {
+      nir_def *w = nir_load_global_constant(
+         &b2, 1, 32, nir_iadd_imm(&b2, root2, 768 + k * 4), .align_mul = 4);
+      acc = nir_ffma(&b2, acc, w, nir_frcp(&b2, nir_fadd_imm(&b2, w, 2.0f)));
+   }
+   nir_def *vid2 = nir_load_vertex_id(&b2);
+   nir_def *vx2 = nir_fadd(&b2, acc, nir_u2f32(&b2, vid2));
+   nir_def *pos2[4] = {vx2, acc, nir_imm_float(&b2, 0.0f),
+                       nir_imm_float(&b2, 1.0f)};
+   for (unsigned c = 0; c < 4; ++c)
+      nir_store_uvs_agx(&b2, pos2[c], nir_imm_intN_t(&b2, c, 16));
+   agx_preprocess_nir(b2.shader);
+
+   struct agx_shader_part part2 = {0};
+   bool ok2 = agx_compile_shader_nir(b2.shader, &key, &part2);
+   bool heavy_kept = ok2 && part2.info.has_preamble &&
+                     part2.info.agx3_root_uniform_usage_valid &&
+                     !part2.info.agx3_main_uses_root_uniform &&
+                     part2.info.agx3_preamble_uses_root_uniform;
+   free(part2.binary);
+   ralloc_free(b2.shader);
+   return heavy_kept;
+}
+
+/* A vertex shader with nothing to hoist has no constant program. Looking
+ * for a hoistable vertex preamble must not create an empty one. */
+static bool
+test_agx3_vertex_without_preamble_has_none(void)
+{
+   nir_shader *nir = build_vs_flat();
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.reserved_preamble = 4;
+   key.agx3_native_cprog = true;
+   key.g17p_native_uniforms = true;
+
+   struct agx_shader_part part = {0};
+   bool ok = agx_compile_shader_nir(nir, &key, &part);
+   ok = ok && !part.info.has_preamble && part.info.nr_preamble_gprs == 0 &&
+        part.info.preamble_size == 0;
+   free(part.binary);
+   ralloc_free(nir);
+   return ok;
+}
+
+/* The driver keeps a vertex shader's descriptor-set pointers only when its
+ * uniform-half record names one (hk_agx3_g17p_graphics_live_set_count()).
+ * Firefox's vertex texel fetch through set 3 reads that set's pointer, halves
+ * 12..15 under lower_test_descriptor_set(), and not set 1's, halves 4..7.
+ */
+static bool
+test_agx3_vertex_set_pointer_uniform_halfs(void)
+{
+   nir_shader *nir = build_vs_indexed_texture_fetch();
+   if (!nir)
+      return false;
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.no_preamble = true;
+   key.reserved_preamble = 64;
+
+   struct agx_shader_part part = {0};
+   const bool ok = agx_compile_shader_nir(nir, &key, &part);
+   const uint64_t halfs = part.info.agx3_uniform_halfs[0];
+   const uint64_t set1 = BITFIELD64_RANGE(4, 4), set3 = BITFIELD64_RANGE(12, 4);
+   const bool named = ok && part.info.agx3_uniform_halfs_valid &&
+                      (halfs & set3) == set3 && !(halfs & set1);
+   if (!named) {
+      fprintf(stderr, "vertex set-pointer halves: ok=%d valid=%d "
+              "halfs0=0x%llx\n", ok, part.info.agx3_uniform_halfs_valid,
+              (unsigned long long)halfs);
+   }
+   free(part.binary);
+   ralloc_free(nir);
+   return named;
+}
+
+/* Unpacking a 32-bit word into four bytes, clamping to 255, narrowing to u16,
+ * and storing to an R8G8B8A8_UINT tilebuffer (vk_meta's compressed
+ * buffer-to-image upload shape) must fold away the unpack/clamp/repack chain
+ * while leaving non-identity byte permutations on the explicit packing path. */
+static bool
+test_agx3_packed_byte_word_tile_store(void)
+{
+   const enum agx_isa_encoding encs[] = {
+      AGX_ISA_ENCODING_AGX3B,
+      AGX_ISA_ENCODING_AGX3C,
+   };
+
+   for (unsigned e = 0; e < ARRAY_SIZE(encs); ++e) {
+      unsigned sizes[4] = {0, 0, 0, 0};
+      for (unsigned mode = 0; mode < 4; ++mode) {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_FRAGMENT, &agx_nir_options, "packed-i8-tile");
+         b.shader->info.io_lowered = true;
+         nir_def *addr = nir_load_preamble(&b, 1, 64, .base = 0);
+         nir_def *word = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+         nir_def *ch[4];
+         if (mode == 2) {
+            /* Exact half-bitfield-extract lowered shape produced for vk_meta
+             * R32_UINT -> R8G8B8A8_UINT uploads (shared shift + unpack_y). */
+            nir_def *q = nir_ushr_imm(&b, word, 8);
+            nir_def *raw[4] = {
+               nir_iand_imm(&b, word, 0xff),
+               nir_u2u32(&b, nir_iand_imm(&b, nir_unpack_32_2x16_split_x(&b, q), 0xff)),
+               nir_u2u32(&b, nir_iand_imm(&b, nir_unpack_32_2x16_split_y(&b, word), 0xff)),
+               nir_u2u32(&b, nir_unpack_32_2x16_split_y(&b, q)),
+            };
+            for (unsigned i = 0; i < 4; ++i)
+               ch[i] = nir_u2u16(&b, nir_umin(&b, raw[i], nir_imm_int(&b, 255)));
+         } else if (mode == 3) {
+            /* Exact nir_format_unpack_int() shift-left/shift-right shape
+             * emitted by vk_meta_copy_buffer_to_image for R32_UINT ->
+             * R8G8B8A8_UINT compressed uploads. */
+            for (unsigned i = 0; i < 4; ++i) {
+               nir_def *ext = nir_ushr_imm(&b, nir_ishl_imm(&b, word, 24 - i * 8), 24);
+               nir_def *clamped = nir_umin(&b, ext, nir_imm_int(&b, 255));
+               ch[i] = nir_u2u16(&b, clamped);
+            }
+         } else {
+            for (unsigned i = 0; i < 4; ++i) {
+               unsigned src_byte = mode ? (3 - i) : i;
+               nir_def *ext = nir_ubitfield_extract_imm(&b, word, src_byte * 8, 8);
+               nir_def *clamped = nir_umin(&b, ext, nir_imm_int(&b, 255));
+               ch[i] = nir_u2u16(&b, clamped);
+            }
+         }
+         nir_store_local_pixel_agx(
+            &b, nir_vec(&b, ch, 4), nir_imm_intN_t(&b, 0xff, 16),
+            nir_undef(&b, 2, 16), .base = 0, .write_mask = 0xf,
+            .format = PIPE_FORMAT_R8_UINT, .target = 0);
+
+         struct agx_shader_key key = {0};
+         key.dev.encoding = encs[e];
+         key.no_preamble = true;
+         key.reserved_preamble = 8;
+         key.fs.nr_samples = 1;
+
+         struct agx_shader_part part = {0};
+         const bool ok = agx_compile_shader_nir(b.shader, &key, &part);
+         sizes[mode] = part.info.binary_size;
+         free(part.binary);
+         ralloc_free(b.shader);
+         if (!ok || !sizes[mode]) {
+            fprintf(stderr, "packed byte-word tile store failed enc=%u mode=%u\n",
+                    e, mode);
+            return false;
+         }
+      }
+      if (sizes[0] + 48 > sizes[1] || sizes[2] + 48 > sizes[1] ||
+          sizes[3] + 48 > sizes[1]) {
+         fprintf(stderr,
+                 "packed byte-word tile store did not fold enc=%u: id=%u half=%u shift=%u perm=%u\n",
+                 e, sizes[0], sizes[2], sizes[3], sizes[1]);
+         return false;
+      }
+   }
+   return true;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -9689,6 +10006,7 @@ main(int argc, char **argv)
    RUN(test_g17g_array_fetch);
    RUN(test_g17g_cube_shadow_lod);
    RUN(test_g17g_xfb_add);
+   RUN(test_agx3_vertex_without_preamble_has_none);
    RUN(test_g17p_eot_block_store);
    RUN(test_indexed_sampler_sets);
    RUN(test_g17p_layered_eot_block_store);
@@ -9721,6 +10039,10 @@ main(int argc, char **argv)
    RUN(test_g17p_frag_sidefx_late_depth_once);
    RUN(test_agx3_heavy_branch_loop_unroll_limit);
    RUN(test_g17c_txf_layer_saturation);
+   RUN(test_agx3_tiny_push_vertex_preamble_inlined);
+   RUN(test_agx3_vertex_set_pointer_uniform_halfs);
+   RUN(test_agx3_packed_byte_word_tile_store);
+   RUN(test_agx3d_texture_early_lowering);
 #undef RUN
 
    for (unsigned e = 0; e < ARRAY_SIZE(encodings); ++e) {

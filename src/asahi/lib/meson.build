@@ -352,6 +352,18 @@ if with_tests
     suite : ['asahi'],
   )
   test(
+    'asahi-agx-cdm-barrier-word',
+    executable(
+      'asahi-agx-cdm-barrier-word',
+      files('tests/test-agx-cdm-barrier-word.c'),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      link_with : [libasahi_lib],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
     'asahi-agx-chip-caps',
     executable(
       'asahi-agx-chip-caps',

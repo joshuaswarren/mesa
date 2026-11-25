@@ -155,7 +155,7 @@ static unsigned checks;
    ROW(agx_chip_tri_merge_across_side_effects(c), "0000 00000 0000 10000 0 0") \
    ROW(agx_chip_image_load_misses_own_store(c), "0000 00000 0000 10000 0 0")   \
    ROW(agx_chip_exact_fma32(c), "1111 11111 1111 11111 1 1")                   \
-   ROW(agx_chip_sampler_has_lod_bias(c), "0000 00000 1111 11000 0 0")          \
+   ROW(agx_chip_sampler_has_lod_bias(c), "0000 00000 1111 11111 1 0")          \
    ROW(agx_chip_native_preamble(c), "0000 00000 0100 10000 0 0")               \
    ROW(agx_chip_query_ti_spill(c), "0000 00000 0100 10000 0 0")                \
    ROW(agx_chip_has_hardware_ray_tracing(c), "0000 01111 1111 11111 1 0")      \
@@ -171,8 +171,8 @@ static unsigned checks;
    ROW(agx_vdm_barrier_core_supported(c), "0000 01111 0111 10111 1 0")         \
    ROW(agx_vdm_barrier_core_word(c, false) == AGX_VDM_BARRIER_CORE_PLAIN,      \
        "0000 00110 0100 00000 0 0")                                            \
-   ROW(agx_vdm_stream_link_core_supported(c), "0000 01111 0111 10111 0 0")     \
-   ROW(agx_chip_vdm_stream_link_supported(c), "1111 01111 0111 10111 0 0")     \
+   ROW(agx_vdm_stream_link_core_supported(c), "0000 01111 0111 10111 1 0")     \
+   ROW(agx_chip_vdm_stream_link_supported(c), "1111 01111 0111 10111 1 0")     \
    ROW(agx_vdm_stream_terminate_core_supported(c),                             \
        "0000 01111 0111 10111 1 0")                                            \
    ROW(agx_vdm_tessellate_direct_target_supported(c),                          \
@@ -405,6 +405,7 @@ test_chip_sets(void)
       const bool m5 = agx_chip_g17_m5(c);
 
       CHECK(agx_chip_hal300_path(c) == (m5 || c == AGX_CHIP_G18G));
+      CHECK(agx_chip_uses_shade_model_5(c) == (m5 || c == AGX_CHIP_G18G));
       CHECK(agx_chip_agx3_path(c) == (native || m5 || c == AGX_CHIP_G18G));
       CHECK(agx_chip_native_or_m5(c) == (native || m5));
       CHECK(agx_chip_native_or_g18g(c) == (native || c == AGX_CHIP_G18G));

@@ -12,6 +12,7 @@
 
 #include "hk_buffer_view.h"
 #include "hk_entrypoints.h"
+#include "hk_g17p_compression.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
 
@@ -46,9 +47,9 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
       if (!hk_can_compress_format(dev, vk_format))
          return 0;
 
-      /* G17P and M5 share compressed images without storage or host-copy
+      /* HAL200 and M5 share compressed images without storage or host-copy
        * access (hk_g17p_shared_compression_shape()). */
-      if (agx_chip_g17p_or_m5(dev->chip))
+      if (hk_chip_shared_compression_supported(dev->chip))
          return props->optimalTilingFeatures &
                 ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
                   VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
@@ -59,8 +60,9 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
              ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
    }
 
-   /* Interchange: the 32-bit RGBA formats on G17P; never storage or host
-    * copies (compressed). */
+   /* Interchange: the 32-bit 8-bit and 10-bit RGB/RGBA formats on chips with
+    * AGX_CAP_GEN9_2D_COMPRESSION; never storage or host copies
+    * (compressed). */
    if (mod == DRM_FORMAT_MOD_APPLE_INTERCHANGE) {
       if (!hk_interchange_format(dev, vk_format))
          return 0;

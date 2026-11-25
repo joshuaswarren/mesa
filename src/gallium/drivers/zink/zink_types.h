@@ -1396,6 +1396,10 @@ struct zink_screen {
    VkSemaphore sem;
    VkFence fence;
    struct util_queue flush_queue;
+   /* jobs added to flush_queue that have not finished yet */
+   uint32_t flush_queue_jobs;
+   /* orders batch ids with their vkQueueSubmit when a submission bypasses an idle flush_queue */
+   simple_mtx_t submit_lock;
    simple_mtx_t copy_context_lock;
    struct zink_context *copy_context;
 

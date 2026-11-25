@@ -354,11 +354,17 @@ struct hk_device {
    } vdm;
 
    bool cmd_pending_ready;
+   /* Number of queues currently linked into cmd_pending_queues. */
+   int cmd_pending_active;
    simple_mtx_t cmd_pending_lock;
    /* Queues with pending submissions (hk_queue::cmd_link). */
    struct list_head cmd_pending_queues;
    /* Submissions that completed with an error: kept until destruction. */
    struct list_head cmd_pending_failed;
+   /* Recording memory quarantined after device loss. */
+   struct list_head cmd_lost_bos;
+   struct list_head cmd_lost_spans;
+   struct list_head cmd_lost_large_bos;
    /* Completion syncobjs of retired submissions, for reuse. */
    uint32_t cmd_syncobjs[HK_CMD_SYNCOBJ_POOL];
    unsigned cmd_syncobj_count;
@@ -416,10 +422,18 @@ struct hk_device {
       simple_mtx_t lock;
    } scratch;
 
+   /* Set once the device creates a sparse buffer or image; the CDM barrier
+    * then keeps the full word (hk_cdm_cache_flush). */
+   uint32_t sparse_used;
+
    uint32_t perftest;
    /* drirc hk_submit_batch_size: at most this many commands per kernel
     * submission (0: the kernel and batching limits alone). */
    unsigned submit_batch_size;
+   /* The AGX2 CDM_BARRIER flag word emitted at a tracked dependency on
+    * this chip (agx2_cdm_barrier_default_word()): the reduced word on the
+    * dies it was measured on, the full word elsewhere. */
+   uint32_t cdm_barrier_default_mask;
 
    struct {
       struct u_rwlock lock;
@@ -446,6 +460,12 @@ enum hk_perftest {
     * upgrading it to a strong cache flush, when memory is unaliased and no
     * host or pending graphics transfer dependency is involved. */
    HK_PERF_WEAKBARRIER = BITFIELD_BIT(5),
+   /* Unconditional per-launch CDM barrier (disables tracking). */
+   HK_PERF_ALWAYSCDMBARRIER = BITFIELD_BIT(9),
+   /* Opt into dependency tracking on chips where it is not the default. */
+   HK_PERF_TRACKCDMBARRIER = BITFIELD_BIT(10),
+   /* Force the full CDM barrier word on every chip (perftest only). */
+   HK_PERF_FULLCDMBARRIER = BITFIELD_BIT(11),
 };
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)

@@ -9,6 +9,7 @@
 #include "agx_compiler.h"
 #include "agx_nir.h"
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_worklist.h"
 
 /*
@@ -328,10 +329,19 @@ block_peak_instrs(struct licm_estimate *est, nir_block *block,
    return peak;
 }
 
+enum licm_spec_mode {
+   LICM_SPEC_NONE = 0,
+   LICM_SPEC_ALL,
+   LICM_SPEC_SFU_CHAIN,
+};
+
 struct licm_sim {
    struct sim_block *blocks;
    unsigned *def_block;
    nir_loop *loop;
+   enum licm_spec_mode spec_mode;
+   bool hoisted_non_const;
+   bool hoisted_sfu;
 };
 
 static bool
@@ -342,9 +352,251 @@ sim_defined_before_loop(nir_src *src, void *data)
           nir_loop_predecessor_block(sim->loop)->index;
 }
 
-/* Mirror nir_opt_licm's invariance predicate when filter == NULL */
+/* Pure, non-faulting instructions safe to hoist out of unconditional direct
+ * loop-body blocks that do not dominate the loop exit (such as the body of a
+ * top-tested loop after `if (exit) break`). Never hoists regular memory loads,
+ * textures, derefs, integer divisions, or subgroup/lane-dependent ops. */
 static bool
-sim_instr_invariant(nir_instr *instr, struct licm_sim *sim)
+agx_licm_can_speculate(nir_instr *instr)
+{
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+   case nir_instr_type_undef:
+      return true;
+
+   case nir_instr_type_alu: {
+      const nir_alu_instr *alu = nir_instr_as_alu(instr);
+      switch (alu->op) {
+      case nir_op_idiv:
+      case nir_op_udiv:
+      case nir_op_imod:
+      case nir_op_umod:
+      case nir_op_irem:
+         return false;
+      default:
+         return true;
+      }
+   }
+
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      const nir_intrinsic_info *info = &nir_intrinsic_infos[intr->intrinsic];
+      if (!info->has_dest || !nir_intrinsic_can_reorder(intr) ||
+          (info->flags & (NIR_INTRINSIC_SUBGROUP | NIR_INTRINSIC_QUADGROUP)))
+         return false;
+      switch (intr->intrinsic) {
+      case nir_intrinsic_load_preamble:
+      case nir_intrinsic_load_push_constant:
+      case nir_intrinsic_load_global_invocation_id:
+      case nir_intrinsic_load_local_invocation_id:
+      case nir_intrinsic_load_local_invocation_index:
+      case nir_intrinsic_load_workgroup_id:
+      case nir_intrinsic_load_num_workgroups:
+         return true;
+      default:
+         return nir_intrinsic_has_access(intr) &&
+                (nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE);
+      }
+   }
+
+   default:
+      return false;
+   }
+}
+
+static bool
+block_is_direct_loop_body(const nir_block *block, const nir_loop *loop)
+{
+   return block->cf_node.parent == &loop->cf_node;
+}
+
+static nir_block *
+instr_current_block(nir_instr *instr, const struct licm_sim *sim)
+{
+   if (!sim)
+      return instr->block;
+   nir_def *def = nir_instr_def(instr);
+   return def ? sim->blocks[sim->def_block[def->index]].block : instr->block;
+}
+
+static bool
+loop_has_terminate(nir_loop *loop)
+{
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             (nir_instr_as_intrinsic(instr)->intrinsic ==
+                 nir_intrinsic_terminate ||
+              nir_instr_as_intrinsic(instr)->intrinsic ==
+                 nir_intrinsic_terminate_if))
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+alu_is_expensive_sfu(nir_op op)
+{
+   switch (op) {
+   case nir_op_fsinc_agx3:
+   case nir_op_fsin_agx:
+   case nir_op_fsin:
+   case nir_op_fcos:
+   case nir_op_frcp:
+   case nir_op_frsq:
+   case nir_op_fsqrt:
+   case nir_op_fexp2:
+   case nir_op_flog2:
+   case nir_op_fpow:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Scalar FP / range-reduction / select ops that participate in finishing a
+ * lowered transcendental (such as sin/cos range reduction and small-angle
+ * clamp). Excluding integer address math prevents unrelated offset chains from
+ * being pulled into the SFU subgraph. */
+static bool
+alu_is_sfu_consumer_op(nir_op op)
+{
+   if (alu_is_expensive_sfu(op))
+      return true;
+   switch (op) {
+   case nir_op_fmul:
+   case nir_op_fadd:
+   case nir_op_fsub:
+   case nir_op_ffma:
+   case nir_op_fneg:
+   case nir_op_fabs:
+   case nir_op_fmin:
+   case nir_op_fmax:
+   case nir_op_flt:
+   case nir_op_fge:
+   case nir_op_feq:
+   case nir_op_fneu:
+   case nir_op_bcsel:
+   case nir_op_ixor:
+   case nir_op_iand:
+   case nir_op_ior:
+   case nir_op_inot:
+   case nir_op_ieq:
+   case nir_op_ine:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+instr_fed_by_sfu(nir_instr *instr, nir_loop *loop, nir_block *pre,
+                 const struct licm_sim *sim, unsigned depth)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu_is_expensive_sfu(alu->op))
+      return true;
+   if (depth == 0 || !alu_is_sfu_consumer_op(alu->op))
+      return false;
+
+   for (unsigned s = 0; s < nir_op_infos[alu->op].num_inputs; ++s) {
+      nir_instr *si = nir_def_instr(alu->src[s].src.ssa);
+      nir_block *sb = instr_current_block(si, sim);
+      if ((block_is_direct_loop_body(sb, loop) || sb == pre) &&
+          instr_fed_by_sfu(si, loop, pre, sim, depth - 1))
+         return true;
+   }
+   return false;
+}
+
+static bool
+def_feeds_sfu_chain(nir_def *def, nir_loop *loop, nir_block *pre,
+                    const struct licm_sim *sim, unsigned depth)
+{
+   if (depth == 0)
+      return false;
+
+   nir_foreach_use(u, def) {
+      nir_instr *ui = nir_src_use_instr(u);
+      nir_block *ub = instr_current_block(ui, sim);
+      if (!block_is_direct_loop_body(ub, loop) || ui->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *ualu = nir_instr_as_alu(ui);
+      if (alu_is_expensive_sfu(ualu->op))
+         return true;
+      if (alu_is_sfu_consumer_op(ualu->op) &&
+          instr_fed_by_sfu(ui, loop, pre, sim, 6))
+         return true;
+      if (agx_licm_can_speculate(ui) &&
+          def_feeds_sfu_chain(&ualu->def, loop, pre, sim, depth - 1))
+         return true;
+   }
+   return false;
+}
+
+/* True if `instr` belongs to a loop-invariant transcendental (SFU) subgraph in
+ * a direct body block of `loop` (either an SFU op, its backward operand slice,
+ * or its scalar FP / range-reduction consumers and their sibling predicates). */
+static bool
+instr_in_direct_sfu_chain(nir_instr *instr, nir_loop *loop,
+                          const struct licm_sim *sim)
+{
+   nir_block *blk = instr_current_block(instr, sim);
+   if (!block_is_direct_loop_body(blk, loop) ||
+       !agx_licm_can_speculate(instr) || loop_has_terminate(loop))
+      return false;
+
+   if (instr->type == nir_instr_type_alu &&
+       alu_is_expensive_sfu(nir_instr_as_alu(instr)->op))
+      return true;
+
+   nir_block *pre = nir_loop_predecessor_block(loop);
+   if (instr_fed_by_sfu(instr, loop, pre, sim, 6))
+      return true;
+
+   nir_def *def = nir_instr_def(instr);
+   return def && def_feeds_sfu_chain(def, loop, pre, sim, 16);
+}
+
+static bool
+loop_has_direct_body_sfu(nir_loop *loop)
+{
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      if (block->cf_node.parent->type != nir_cf_node_loop)
+         continue;
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_alu &&
+             alu_is_expensive_sfu(nir_instr_as_alu(instr)->op))
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+agx_licm_filter_all(nir_instr *instr, nir_loop *loop, bool dominates_exit)
+{
+   if (dominates_exit)
+      return true;
+   return block_is_direct_loop_body(instr->block, loop) &&
+          agx_licm_can_speculate(instr) && !loop_has_terminate(loop);
+}
+
+static bool
+agx_licm_filter_sfu(nir_instr *instr, nir_loop *loop, bool dominates_exit)
+{
+   if (dominates_exit)
+      return true;
+   return instr_in_direct_sfu_chain(instr, loop, NULL);
+}
+
+/* Mirror nir_opt_licm's invariance predicate for the selected spec_mode */
+static bool
+sim_instr_invariant(nir_instr *instr, struct licm_sim *sim, bool dom_exit,
+                    bool direct_body)
 {
    switch (instr->type) {
    case nir_instr_type_load_const:
@@ -359,7 +611,15 @@ sim_instr_invariant(nir_instr *instr, struct licm_sim *sim)
    case nir_instr_type_alu:
    case nir_instr_type_tex:
    case nir_instr_type_deref:
-      return nir_foreach_src(instr, sim_defined_before_loop, sim);
+      if (!nir_foreach_src(instr, sim_defined_before_loop, sim))
+         return false;
+      if (dom_exit)
+         return true;
+      if (sim->spec_mode == LICM_SPEC_ALL)
+         return direct_body && agx_licm_can_speculate(instr);
+      if (sim->spec_mode == LICM_SPEC_SFU_CHAIN)
+         return direct_body && instr_in_direct_sfu_chain(instr, sim->loop, sim);
+      return false;
 
    default:
       return false;
@@ -390,7 +650,8 @@ loop_hoists(nir_loop *loop)
 }
 
 static bool
-sim_visit_block(nir_block *block, struct licm_sim *sim)
+sim_visit_block(nir_block *block, struct licm_sim *sim, bool dom_exit,
+                bool direct_body)
 {
    struct sim_block *src = &sim->blocks[block->index];
    struct sim_block *dst =
@@ -402,11 +663,18 @@ sim_visit_block(nir_block *block, struct licm_sim *sim)
 
    for (unsigned i = 0; i < nr; ++i) {
       nir_instr *instr = data[i];
-      if (sim_instr_invariant(instr, sim)) {
+      if (sim_instr_invariant(instr, sim, dom_exit, direct_body)) {
          util_dynarray_append(&dst->instrs, instr);
          nir_def *def = nir_instr_def(instr);
          if (def)
             sim->def_block[def->index] = dst->block->index;
+         if (instr->type != nir_instr_type_load_const &&
+             instr->type != nir_instr_type_undef) {
+            sim->hoisted_non_const = true;
+            if (instr->type == nir_instr_type_alu &&
+                alu_is_expensive_sfu(nir_instr_as_alu(instr)->op))
+               sim->hoisted_sfu = true;
+         }
          progress = true;
       } else {
          data[kept++] = instr;
@@ -442,9 +710,16 @@ sim_visit_cf_list(struct exec_list *list, struct licm_sim *sim)
          }
 
          nir_block *block = nir_cf_node_as_block(node);
-         if (sim->loop &&
-             nir_block_dominates(block, nir_loop_successor_block(sim->loop)))
-            progress |= sim_visit_block(block, sim);
+         if (sim->loop) {
+            const bool dom_exit =
+               nir_block_dominates(block, nir_loop_successor_block(sim->loop));
+            if (dom_exit || sim->spec_mode != LICM_SPEC_NONE) {
+               const bool direct_body =
+                  block_is_direct_loop_body(block, sim->loop);
+               progress |=
+                  sim_visit_block(block, sim, dom_exit, direct_body);
+            }
+         }
 
          if (next && next->type == nir_cf_node_loop && !optimize_loop) {
             nir_loop *loop = nir_cf_node_as_loop(next);
@@ -618,14 +893,183 @@ cf_list_has_loop(struct exec_list *list)
    return false;
 }
 
+static bool
+def_outside_loop(nir_def *def, const nir_loop *loop)
+{
+   for (const nir_cf_node *node = nir_def_block(def)->cf_node.parent; node;
+        node = node->parent) {
+      if (node == &loop->cf_node)
+         return false;
+   }
+   return true;
+}
+
+#define AGX_MAX_REASSOC_EQ_HOISTS_PER_LOOP 4
+
+static bool
+reassociate_eq_in_block(nir_builder *b, nir_block *block,
+                        nir_loop *loop, unsigned *hoisted_in_loop)
+{
+   bool progress = false;
+   nir_block *pre = nir_loop_predecessor_block(loop);
+   const bool top_level = block->cf_node.parent == &loop->cf_node;
+
+   nir_foreach_instr_safe(instr, block) {
+      if (*hoisted_in_loop >= AGX_MAX_REASSOC_EQ_HOISTS_PER_LOOP)
+         break;
+      if (instr->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if ((alu->op != nir_op_ieq && alu->op != nir_op_ine) ||
+          alu->def.num_components != 1)
+         continue;
+
+      const unsigned bit_size = alu->src[0].src.ssa->bit_size;
+      if (bit_size != 16 && bit_size != 32)
+         continue;
+
+      for (unsigned s = 0; s < 2; ++s) {
+         nir_def *lhs = alu->src[s].src.ssa;
+         nir_def *inv = alu->src[1 - s].src.ssa;
+         if (lhs->num_components != 1 || alu->src[s].swizzle[0] != 0 ||
+             inv->num_components != 1 || alu->src[1 - s].swizzle[0] != 0 ||
+             nir_def_is_const(inv) || !def_outside_loop(inv, loop) ||
+             def_outside_loop(lhs, loop) || !list_is_singular(&lhs->uses))
+            continue;
+
+         nir_instr *lhs_instr = nir_def_instr(lhs);
+         if (lhs_instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *add = nir_instr_as_alu(lhs_instr);
+         if (add->op != nir_op_iadd || add->def.num_components != 1 ||
+             add->def.bit_size != bit_size)
+            continue;
+
+         int const_idx = -1;
+         if (nir_src_is_const(add->src[0].src) &&
+             !nir_src_is_const(add->src[1].src))
+            const_idx = 0;
+         else if (nir_src_is_const(add->src[1].src) &&
+                  !nir_src_is_const(add->src[0].src))
+            const_idx = 1;
+         if (const_idx < 0)
+            continue;
+
+         const uint64_t c = nir_src_comp_as_uint(add->src[const_idx].src,
+                                                 add->src[const_idx].swizzle[0]);
+         if (c == 0)
+            continue;
+
+         const uint64_t neg_c =
+            (uint64_t)(-(int64_t)c) & BITFIELD64_MASK(bit_size);
+         /* Top-tested loops place their body after `if (exit) break`, so the
+          * body block does not dominate the loop successor and nir_opt_licm
+          * will not visit it. Integer addition cannot trap and `inv` is
+          * defined outside the loop, so materialize `inv - C` directly in the
+          * preheader for unconditional loop-body blocks (bounded per loop to
+          * keep live-through register demand small). */
+         if (top_level && pre) {
+            b->cursor = nir_after_block_before_jump(pre);
+            (*hoisted_in_loop)++;
+         } else {
+            b->cursor = nir_before_instr(&alu->instr);
+         }
+         nir_def *adj = nir_iadd_imm(b, inv, neg_c);
+
+         nir_src_rewrite(&alu->src[s].src, add->src[1 - const_idx].src.ssa);
+         alu->src[s].swizzle[0] = add->src[1 - const_idx].swizzle[0];
+         nir_src_rewrite(&alu->src[1 - s].src, adj);
+         alu->src[1 - s].swizzle[0] = 0;
+         nir_instr_remove(&add->instr);
+         progress = true;
+         break;
+      }
+   }
+
+   return progress;
+}
+
+static bool
+reassociate_eq_in_cf_list(nir_builder *b, struct exec_list *list,
+                          nir_loop *loop, unsigned *hoisted_in_loop)
+{
+   bool progress = false;
+
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_block:
+         if (loop)
+            progress |= reassociate_eq_in_block(b, nir_cf_node_as_block(node),
+                                                loop, hoisted_in_loop);
+         break;
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= reassociate_eq_in_cf_list(b, &nif->then_list, loop,
+                                               hoisted_in_loop);
+         progress |= reassociate_eq_in_cf_list(b, &nif->else_list, loop,
+                                               hoisted_in_loop);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *inner = nir_cf_node_as_loop(node);
+         unsigned inner_hoists = 0;
+         progress |=
+            reassociate_eq_in_cf_list(b, &inner->body, inner, &inner_hoists);
+         progress |= reassociate_eq_in_cf_list(b, &inner->continue_list, inner,
+                                               &inner_hoists);
+         break;
+      }
+      default:
+         break;
+      }
+   }
+
+   return progress;
+}
+
 /*
- * Run nir_opt_licm if no loop or shader peak's estimated register demand would
- * exceed budget halves or cross an occupancy step with the invariants hoisted.
+ * Reassociate loop-variant constant-offset equality comparisons against a
+ * loop-invariant value so the constant adjustment becomes loop-invariant:
+ *
+ *    (x + C) == inv  <==>  x == (inv - C)
+ *    (x + C) != inv  <==>  x != (inv - C)
+ *
+ * Modular two's-complement equality holds for all bit patterns with no
+ * overflow preconditions. For unconditional loop-body blocks the pure integer
+ * adjustment `inv - C` is placed directly in the loop preheader (bounded per
+ * loop), since top-tested loop bodies sit after `if (exit) break` and do not
+ * dominate the loop successor visited by nir_opt_licm.
  */
 bool
-agx_nir_opt_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute)
+agx_nir_reassociate_loop_invariant_eq(nir_shader *shader)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, shader) {
+      if (impl->function->is_preamble || !cf_list_has_loop(&impl->body)) {
+         nir_no_progress(impl);
+         continue;
+      }
+
+      nir_builder b = nir_builder_create(impl);
+      unsigned top_hoists = 0;
+      if (reassociate_eq_in_cf_list(&b, &impl->body, NULL, &top_hoists)) {
+         nir_progress(true, impl, nir_metadata_control_flow);
+         progress = true;
+      } else {
+         nir_no_progress(impl);
+      }
+   }
+
+   return progress;
+}
+
+static bool
+simulate_shader_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute,
+                     enum licm_spec_mode spec_mode, bool *any_hoist_out)
 {
    bool any_hoist = false;
+   bool any_useful = false;
 
    nir_foreach_function_impl(impl, shader) {
       if (!cf_list_has_loop(&impl->body))
@@ -646,12 +1090,22 @@ agx_nir_opt_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute)
          impl_limit = MIN2(impl_limit, AGX_M5_RT_REGISTER_BUDGET);
       scan_shader_ra_props(&est, impl, &impl_limit);
 
+      /* Speculative direct-body hoisting leaves explicit backend RA headroom
+       * below the 64-half max-occupancy cliff: <=48 NIR halves for general
+       * pure ALU hoisting and <=56 NIR halves for targeted SFU-chain hoisting. */
+      const unsigned effective_limit =
+         spec_mode == LICM_SPEC_ALL
+            ? MIN2(impl_limit, 48u)
+            : (spec_mode == LICM_SPEC_SFU_CHAIN ? MIN2(impl_limit, 56u)
+                                                : impl_limit);
+
       struct sim_block *blocks =
          rzalloc_array(mem_ctx, struct sim_block, impl->num_blocks);
       unsigned *def_block = rzalloc_array(mem_ctx, unsigned, impl->ssa_alloc);
       unsigned *base_peaks = rzalloc_array(mem_ctx, unsigned, impl->num_blocks);
       unsigned *post_peaks = rzalloc_array(mem_ctx, unsigned, impl->num_blocks);
 
+      unsigned func_base_pre = 0;
       nir_foreach_block(block, impl) {
          struct sim_block *sb = &blocks[block->index];
          sb->block = block;
@@ -668,17 +1122,33 @@ agx_nir_opt_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute)
          base_peaks[block->index] = block_peak_instrs(
             &est, block, &block->live_out, util_dynarray_begin(&sb->instrs),
             util_dynarray_num_elements(&sb->instrs, nir_instr *));
+         func_base_pre = MAX2(func_base_pre, base_peaks[block->index]);
+      }
+
+      if (spec_mode != LICM_SPEC_NONE &&
+          ALIGN_POT(func_base_pre + est.reserve, est.align) >
+             ROUND_DOWN_TO(MIN2(effective_limit, 256u), est.align)) {
+         ralloc_free(mem_ctx);
+         *any_hoist_out = false;
+         return false;
       }
 
       struct licm_sim sim = {
          .blocks = blocks,
          .def_block = def_block,
+         .spec_mode = spec_mode,
       };
       bool hoisted = sim_visit_cf_list(&impl->body, &sim);
       bool fits = true;
 
       if (hoisted) {
          any_hoist = true;
+         if (spec_mode == LICM_SPEC_ALL)
+            any_useful |= sim.hoisted_non_const;
+         else if (spec_mode == LICM_SPEC_SFU_CHAIN)
+            any_useful |= sim.hoisted_sfu;
+         else
+            any_useful = true;
          compute_sim_liveness(impl, blocks, mem_ctx);
 
          unsigned func_base = 0, func_post = 0;
@@ -691,18 +1161,118 @@ agx_nir_opt_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute)
             func_post = MAX2(func_post, post_peaks[block->index]);
          }
 
-         fits = demand_fits(&est, func_base, func_post, impl_limit) &&
-                loops_fit(&est, base_peaks, post_peaks, &impl->body, impl_limit);
+         /* Speculative modes must keep even unchanged functions strictly
+          * inside effective_limit so high-pressure loops never incur
+          * non-NULL-filter load_const hoisting. */
+         if (spec_mode != LICM_SPEC_NONE &&
+             ALIGN_POT(func_post + est.reserve, est.align) >
+                ROUND_DOWN_TO(MIN2(effective_limit, 256u), est.align)) {
+            fits = false;
+         } else {
+            fits = demand_fits(&est, func_base, func_post, effective_limit) &&
+                   loops_fit(&est, base_peaks, post_peaks, &impl->body,
+                             effective_limit);
+         }
       }
 
       ralloc_free(mem_ctx);
 
-      if (!fits)
+      if (!fits) {
+         *any_hoist_out = false;
          return false;
+      }
    }
 
-   if (!any_hoist)
+   /* Non-NULL nir_opt_licm filters bypass the filter for load_const. Do not
+    * enter a speculative mode when only constants would be hoisted (e.g. a
+    * loop-varying SFU op in a direct loop body), or loop constants get pulled
+    * into outer-block registers for zero ALU savings. */
+   if (spec_mode != LICM_SPEC_NONE && !any_useful) {
+      *any_hoist_out = false;
+      return false;
+   }
+
+   *any_hoist_out = any_hoist;
+   return true;
+}
+
+static bool
+cf_list_has_direct_body_sfu(struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_loop) {
+         if (loop_has_direct_body_sfu(nir_cf_node_as_loop(node)))
+            return true;
+      } else if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (cf_list_has_direct_body_sfu(&nif->then_list) ||
+             cf_list_has_direct_body_sfu(&nif->else_list))
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+shader_has_direct_body_sfu(nir_shader *shader)
+{
+   nir_foreach_function_impl(impl, shader) {
+      if (cf_list_has_direct_body_sfu(&impl->body))
+         return true;
+   }
+   return false;
+}
+
+/*
+ * Run nir_opt_licm if no loop or shader peak's estimated register demand would
+ * exceed budget halves or cross an occupancy step with the invariants hoisted.
+ * Low-pressure loops (<=48 NIR halves post-LICM) allow general speculative
+ * hoisting of pure non-trapping ALU from direct loop bodies; medium-pressure
+ * loops containing direct-body transcendentals (<=56 NIR halves post-LICM)
+ * hoist only the invariant SFU chain so unrelated address math stays unhoisted
+ * and full 1024-thread occupancy is preserved. All higher-pressure shaders
+ * use exit-dominating blocks only (NULL filter).
+ */
+bool
+agx_nir_opt_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute)
+{
+   bool any_hoist = false;
+   if (simulate_shader_licm(shader, budget, cap_rt_compute, LICM_SPEC_ALL,
+                            &any_hoist)) {
+      if (!any_hoist)
+         return false;
+      return nir_opt_licm(shader, agx_licm_filter_all);
+   }
+
+   if (shader_has_direct_body_sfu(shader) &&
+       simulate_shader_licm(shader, budget, cap_rt_compute, LICM_SPEC_SFU_CHAIN,
+                            &any_hoist)) {
+      if (!any_hoist)
+         return false;
+      return nir_opt_licm(shader, agx_licm_filter_sfu);
+   }
+
+   if (simulate_shader_licm(shader, budget, cap_rt_compute, LICM_SPEC_NONE,
+                            &any_hoist)) {
+      if (!any_hoist)
+         return false;
+      return nir_opt_licm(shader, NULL);
+   }
+
+   return false;
+}
+
+bool
+agx_nir_opt_licm_direct_sfu(nir_shader *shader, unsigned budget)
+{
+   if (!shader_has_direct_body_sfu(shader))
       return false;
 
-   return nir_opt_licm(shader, NULL);
+   bool any_hoist = false;
+   if (!simulate_shader_licm(shader, budget, false, LICM_SPEC_SFU_CHAIN,
+                             &any_hoist) ||
+       !any_hoist)
+      return false;
+
+   return nir_opt_licm(shader, agx_licm_filter_sfu);
 }

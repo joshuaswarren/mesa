@@ -141,10 +141,9 @@ hk_cmd_upload_constants(struct hk_cmd_buffer *cmd, const struct hk_shader *s,
       return 0;
 
    assert(stage < MESA_SHADER_STAGES);
-   const bool native =
-      agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip);
-   if (native && s->constant_data_id &&
-       cmd->state.constant_data[stage].id == s->constant_data_id) {
+   if (s->constant_data_id &&
+       cmd->state.constant_data[stage].id == s->constant_data_id &&
+       agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip)) {
       hk_upload_stat(cmd, constant_reuses, 1);
       return cmd->state.constant_data[stage].addr;
    }
@@ -168,7 +167,7 @@ hk_cmd_upload_draw_params(struct hk_cmd_buffer *cmd, uint32_t first,
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    uint32_t params[] = {first, first_instance};
-   if (agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) &&
+   if (agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
        gfx->g17p_draw_params_host_valid && gfx->draw_params &&
        memcmp(gfx->g17p_draw_params_value, params, sizeof(params)) == 0) {
       hk_upload_stat(cmd, draw_param_reuses, 1);
@@ -189,9 +188,9 @@ void
 hk_cmd_upload_draw_id(struct hk_cmd_buffer *cmd, uint32_t draw_id)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   if (agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) &&
+   if (gfx->g17p_draw_id_value == draw_id &&
        gfx->g17p_draw_id_host_valid && gfx->draw_id_ptr &&
-       gfx->g17p_draw_id_value == draw_id) {
+       agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip)) {
       hk_upload_stat(cmd, draw_id_reuses, 1);
       return;
    }
@@ -214,10 +213,10 @@ hk_cmd_upload_group_count(struct hk_cmd_buffer *cmd,
       ((group_count.x * 2654435761u) ^ (group_count.y * 2246822519u) ^
        (group_count.z * 3266489917u)) >>
       28;
-   struct hk_group_count_cache_entry *entry =
-      &cmd->state.group_count_cache[hash];
-   if (likely(entry->valid && entry->x == group_count.x &&
-              entry->y == group_count.y && entry->z == group_count.z))
+   struct hk_group_count_cache_entry *entry = &cmd->group_count_cache[hash];
+   if (likely(cmd->used_group_count_cache && entry->valid &&
+              entry->x == group_count.x && entry->y == group_count.y &&
+              entry->z == group_count.z))
       return entry->addr;
 
    const uint64_t addr =
@@ -232,6 +231,7 @@ hk_cmd_upload_group_count(struct hk_cmd_buffer *cmd,
    entry->z = group_count.z;
    entry->valid = 1;
    entry->addr = addr;
+   cmd->used_group_count_cache = true;
    return addr;
 }
 

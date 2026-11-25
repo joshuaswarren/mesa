@@ -100,7 +100,6 @@ hk_cmd_bo_create(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
    if (bo == NULL)
       return vk_error(pool, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   bo->refcount = 1;
 
    static const char *labels[HK_CMD_BO_TYPE_COUNT] = {
       [HK_CMD_BO_MAIN] = "Main command pool",
@@ -146,8 +145,6 @@ static void
 hk_cmd_bo_destroy(struct hk_device *dev, UNUSED const VkAllocationCallbacks *alloc,
                    struct hk_cmd_bo *bo)
 {
-   if (!p_atomic_dec_zero(&bo->refcount))
-      return;
    if (bo->span) {
       hk_device_free_span(dev, bo->span);
       vk_free(&dev->vk.alloc, bo);
@@ -321,7 +318,6 @@ hk_cmd_pool_alloc_span(struct hk_cmd_pool *pool, enum hk_cmd_slab_class class,
 
    owner->spans++;
    *lease = (struct hk_vdm_allocation){
-      .refcount = 1,
       .slab = owner,
       .addr = addr,
       .alias = owner->alias ? owner->alias + (addr - owner->bo->va->addr) : 0,
@@ -368,7 +364,6 @@ hk_cmd_pool_alloc_bo_span(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
       return result;
    }
 
-   bo->refcount = 1;
    bo->bo = bo->span->slab->bo;
    bo->map = ptr.cpu;
    bo->addr = ptr.gpu;
@@ -408,10 +403,56 @@ hk_cmd_pool_free_ioto_span(struct hk_cmd_pool *pool,
 
    struct hk_device *dev = hk_cmd_pool_device(pool);
    const unsigned max_free = hk_cmd_pool_ioto_span_cache_max(&dev->dev);
-   if (p_atomic_read(&allocation->refcount) == 1 &&
-       pool->num_free_ioto_spans < max_free) {
+   if (pool->num_free_ioto_spans < max_free) {
       list_add(&allocation->link, &pool->free_ioto_spans);
       pool->num_free_ioto_spans++;
+      return;
+   }
+
+   hk_device_free_span(dev, allocation);
+}
+
+VkResult
+hk_cmd_pool_alloc_vdm_span(struct hk_cmd_pool *pool, uint64_t size,
+                           uint64_t alignment, struct agx_ptr *ptr,
+                           struct hk_vdm_allocation **allocation)
+{
+   if (size == HK_G17P_VDM_UPLOAD_CHUNK_SIZE &&
+       alignment <= HK_G17P_VDM_UPLOAD_CHUNK_SIZE &&
+       !list_is_empty(&pool->free_vdm_spans)) {
+      struct hk_vdm_allocation *span = list_first_entry(
+         &pool->free_vdm_spans, struct hk_vdm_allocation, link);
+      list_del(&span->link);
+      pool->num_free_vdm_spans--;
+      *ptr = (struct agx_ptr){
+         .gpu = span->addr,
+         .cpu = span->slab->map
+                   ? (uint8_t *)span->slab->map +
+                        (span->addr - span->slab->bo->va->addr)
+                   : NULL,
+      };
+      *allocation = span;
+      return VK_SUCCESS;
+   }
+
+   return hk_cmd_pool_alloc_span(pool, HK_CMD_SLAB_VDM, size, alignment, ptr,
+                                 allocation);
+}
+
+void
+hk_cmd_pool_free_vdm_span(struct hk_cmd_pool *pool,
+                          struct hk_vdm_allocation *allocation)
+{
+   if (!allocation)
+      return;
+
+   struct hk_device *dev = hk_cmd_pool_device(pool);
+   const unsigned max_free = hk_cmd_pool_vdm_span_cache_max(&dev->dev);
+   if (allocation->slab->class == HK_CMD_SLAB_VDM &&
+       allocation->size == HK_G17P_VDM_UPLOAD_CHUNK_SIZE &&
+       pool->num_free_vdm_spans < max_free) {
+      list_add(&allocation->link, &pool->free_vdm_spans);
+      pool->num_free_vdm_spans++;
       return;
    }
 
@@ -421,7 +462,7 @@ hk_cmd_pool_free_ioto_span(struct hk_cmd_pool *pool,
 void
 hk_device_free_span(struct hk_device *dev, struct hk_vdm_allocation *allocation)
 {
-   if (!allocation || !p_atomic_dec_zero(&allocation->refcount))
+   if (!allocation)
       return;
 
    struct hk_vdm_slab *slab = allocation->slab;
@@ -485,6 +526,10 @@ hk_CreateCommandPool(VkDevice _device,
    }
    list_inithead(&pool->free_ioto_spans);
    pool->num_free_ioto_spans = 0;
+   list_inithead(&pool->free_vdm_spans);
+   pool->num_free_vdm_spans = 0;
+   list_inithead(&pool->free_cs);
+   pool->num_free_cs = 0;
 
    *pCmdPool = hk_cmd_pool_to_handle(pool);
 
@@ -518,6 +563,21 @@ hk_cmd_pool_destroy_bos(struct hk_cmd_pool *pool)
    }
    list_inithead(&pool->free_ioto_spans);
    pool->num_free_ioto_spans = 0;
+
+   list_for_each_entry_safe(struct hk_vdm_allocation, span,
+                            &pool->free_vdm_spans, link) {
+      list_del(&span->link);
+      hk_device_free_span(dev, span);
+   }
+   list_inithead(&pool->free_vdm_spans);
+   pool->num_free_vdm_spans = 0;
+
+   list_for_each_entry_safe(struct hk_cs, cs, &pool->free_cs, node) {
+      list_del(&cs->node);
+      hk_cs_destroy(cs);
+   }
+   list_inithead(&pool->free_cs);
+   pool->num_free_cs = 0;
 }
 
 VkResult
@@ -556,11 +616,7 @@ hk_cmd_pool_free_bo_list(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
 
    list_for_each_entry_safe(struct hk_cmd_bo, bo, bos, link) {
       list_del(&bo->link);
-      if (p_atomic_read(&bo->refcount) != 1) {
-         /* Drop recording ownership, but never put pending bytes in either
-          * pool reuse list. Submission pins also retain aliases and spans. */
-         hk_cmd_bo_destroy(hk_cmd_pool_device(pool), &pool->vk.alloc, bo);
-      } else if (bo->span) {
+      if (bo->span) {
          const enum hk_cmd_span_bucket bucket =
             hk_cmd_span_bucket_for_size(bo->size);
          if (pool->num_free_spans[type][bucket] < max_free_spans) {
@@ -615,20 +671,7 @@ hk_cmd_pool_clean_vdm(const struct hk_vdm_allocation *allocation)
       allocation->size);
 }
 
-/* One immutable resource snapshot per driver submission. An occurrence on
- * another queue takes independent pins; no scalar "last reader" is used.
- */
-enum hk_cmd_pin_kind {
-   HK_PIN_BO,
-   HK_PIN_SPAN,
-   HK_PIN_LARGE,
-};
-
-struct hk_cmd_pin {
-   enum hk_cmd_pin_kind kind;
-   void *object;
-};
-
+/* Driver-owned buffers are pinned independently by each submission. */
 struct hk_cmd_pending {
    struct list_head link;
 
@@ -647,84 +690,19 @@ struct hk_cmd_pending {
    uint64_t point;
 
    unsigned count;
-   struct hk_cmd_pin pins[];
+   struct agx_bo *bos[];
 };
 
-static void
-hk_cmd_add_pin(struct hk_cmd_pin *pins, size_t *count,
-               enum hk_cmd_pin_kind kind, void *object)
+void
+hk_cmd_pending_init(struct hk_device *dev)
 {
-   if (pins)
-      pins[*count] = (struct hk_cmd_pin){kind, object};
-   ++*count;
-}
-
-/* Count first, then fill a preallocated array. No fallible allocation may
- * happen after acquiring only a subset of the references. Repeated command
- * buffers are intentional: each occurrence gets balanced references.
- */
-static size_t
-hk_cmd_collect_pins(const struct vk_queue_submit *submit,
-                    struct hk_cmd_pin *pins)
-{
-   size_t count = 0;
-
-   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
-      struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[i];
-      struct list_head *lists[] = {
-         &cmd->uploader.main.bos,
-         &cmd->uploader.usc.bos,
-         &cmd->uploader.root.bos,
-      };
-
-      /* uploader.streams uses main.bos; uploader.vdm owns the leases below. */
-      for (unsigned l = 0; l < ARRAY_SIZE(lists); ++l) {
-         list_for_each_entry(struct hk_cmd_bo, bo, lists[l], link)
-            hk_cmd_add_pin(pins, &count, HK_PIN_BO, bo);
-      }
-
-      list_for_each_entry(struct hk_vdm_allocation, span,
-                          &cmd->vdm_allocations, link)
-         hk_cmd_add_pin(pins, &count, HK_PIN_SPAN, span);
-
-      if (cmd->ioto.span)
-         hk_cmd_add_pin(pins, &count, HK_PIN_SPAN, cmd->ioto.span);
-
-      util_dynarray_foreach(&cmd->large_bos, struct agx_bo *, bo)
-         hk_cmd_add_pin(pins, &count, HK_PIN_LARGE, *bo);
-   }
-
-   return count;
-}
-
-static void
-hk_cmd_pin_ref(struct hk_cmd_pin pin)
-{
-   switch (pin.kind) {
-   case HK_PIN_BO:
-      p_atomic_inc(&((struct hk_cmd_bo *)pin.object)->refcount);
-      break;
-   case HK_PIN_SPAN:
-      p_atomic_inc(&((struct hk_vdm_allocation *)pin.object)->refcount);
-      break;
-   case HK_PIN_LARGE:
-      agx_bo_reference(pin.object);
-      break;
-   }
-}
-
-static struct agx_bo *
-hk_cmd_pin_backing(struct hk_cmd_pin pin)
-{
-   switch (pin.kind) {
-   case HK_PIN_BO:
-      return ((struct hk_cmd_bo *)pin.object)->bo;
-   case HK_PIN_SPAN:
-      return ((struct hk_vdm_allocation *)pin.object)->slab->bo;
-   case HK_PIN_LARGE:
-      return pin.object;
-   }
-   UNREACHABLE("command pin kind");
+   simple_mtx_init(&dev->cmd_pending_lock, mtx_plain);
+   list_inithead(&dev->cmd_pending_queues);
+   list_inithead(&dev->cmd_pending_failed);
+   list_inithead(&dev->cmd_lost_bos);
+   list_inithead(&dev->cmd_lost_spans);
+   list_inithead(&dev->cmd_lost_large_bos);
+   dev->cmd_pending_ready = true;
 }
 
 static void
@@ -732,27 +710,14 @@ hk_cmd_pending_release(struct hk_device *dev, struct hk_cmd_pending *p,
                        bool teardown)
 {
    for (unsigned i = 0; i < p->count; ++i) {
-      struct hk_cmd_pin pin = p->pins[i];
+      struct agx_bo *bo = p->bos[i];
 
-      /* Teardown is not a success witness. Do not make uncertain backing
-       * available to the BO cache, even briefly while other objects die.
-       * Kernel-owned mapping pins, not an error fence, protect GPU accesses
-       * after the final userspace reference is dropped.
-       */
+      /* Only successful completion allows reuse. Kernel mapping pins cover
+       * outstanding GPU accesses once userspace closes the handle. */
       if (teardown)
-         hk_cmd_pin_backing(pin)->flags |= AGX_BO_NO_CACHE;
+         bo->flags |= AGX_BO_NO_CACHE;
 
-      switch (pin.kind) {
-      case HK_PIN_BO:
-         hk_cmd_bo_destroy(dev, &dev->vk.alloc, pin.object);
-         break;
-      case HK_PIN_SPAN:
-         hk_device_free_span(dev, pin.object);
-         break;
-      case HK_PIN_LARGE:
-         agx_bo_unreference(&dev->dev, pin.object);
-         break;
-      }
+      agx_bo_unreference(&dev->dev, bo);
    }
 
    for (unsigned i = 0; i < p->chunks; ++i)
@@ -889,6 +854,7 @@ hk_cmd_pending_reap_queue(struct hk_device *dev, struct hk_queue *queue,
 
    if (list_is_empty(&queue->cmd_pending)) {
       list_del(&queue->cmd_link);
+      p_atomic_dec(&dev->cmd_pending_active);
       queue->cmd_stalled = 0;
    }
 }
@@ -896,8 +862,9 @@ hk_cmd_pending_reap_queue(struct hk_device *dev, struct hk_queue *queue,
 void
 hk_cmd_pending_reap(struct hk_device *dev)
 {
-   /* Meta command pools can be destroyed during device-init failure. */
-   if (!dev->cmd_pending_ready)
+   /* Meta command pools can be destroyed during device-init failure. Skip the
+    * device lock when no driver-owned pending submissions are active. */
+   if (!dev->cmd_pending_ready || !p_atomic_read(&dev->cmd_pending_active))
       return;
 
    struct list_head ready;
@@ -917,21 +884,20 @@ hk_cmd_pending_reap(struct hk_device *dev)
 }
 
 VkResult
-hk_cmd_pending_begin(struct hk_device *dev,
-                     const struct vk_queue_submit *submit, unsigned chunks,
-                     struct agx_bo *extra_bo, struct hk_cmd_pending **out)
+hk_cmd_pending_begin(struct hk_device *dev, unsigned chunks,
+                     struct agx_bo *const *extra_bos, unsigned extra_bo_count,
+                     struct hk_cmd_pending **out)
 {
    *out = NULL;
    hk_cmd_pending_reap(dev);
 
-   size_t count = hk_cmd_collect_pins(submit, NULL) + (extra_bo != NULL);
-   if (count > UINT32_MAX ||
-       count > (SIZE_MAX - sizeof(struct hk_cmd_pending)) /
-                  sizeof(struct hk_cmd_pin))
+   size_t count = extra_bo_count;
+   if (count > (SIZE_MAX - sizeof(struct hk_cmd_pending)) /
+                  sizeof(struct agx_bo *))
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    struct hk_cmd_pending *p =
-      vk_zalloc(&dev->vk.alloc, sizeof(*p) + count * sizeof(p->pins[0]), 8,
+      vk_zalloc(&dev->vk.alloc, sizeof(*p) + count * sizeof(p->bos[0]), 8,
                 VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!p)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -962,13 +928,12 @@ hk_cmd_pending_begin(struct hk_device *dev,
       }
    }
 
-   size_t used = hk_cmd_collect_pins(submit, p->pins);
-   if (extra_bo)
-      hk_cmd_add_pin(p->pins, &used, HK_PIN_LARGE, extra_bo);
-   assert(used == count);
-   p->count = used;
-   for (unsigned i = 0; i < p->count; ++i)
-      hk_cmd_pin_ref(p->pins[i]);
+   for (unsigned i = 0; i < extra_bo_count; ++i) {
+      if (extra_bos[i]) {
+         agx_bo_reference(extra_bos[i]);
+         p->bos[p->count++] = extra_bos[i];
+      }
+   }
 
    *out = p;
    return VK_SUCCESS;
@@ -1012,6 +977,7 @@ hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *p,
       p->point = queue->drm.timeline_value;
       if (list_is_empty(&queue->cmd_pending)) {
          list_addtail(&queue->cmd_link, &dev->cmd_pending_queues);
+         p_atomic_inc(&dev->cmd_pending_active);
       } else {
          assert(list_last_entry(&queue->cmd_pending, struct hk_cmd_pending,
                                 link)->point < p->point);
@@ -1022,6 +988,60 @@ hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *p,
 
    if (release)
       hk_cmd_pending_release(dev, p, false);
+}
+
+static bool
+hk_device_lost_or_vm_error(struct hk_device *dev)
+{
+   if (unlikely(vk_device_is_lost_no_report(&dev->vk)))
+      return true;
+
+   return unlikely(dev->vm_status_mirror.word &&
+                   __atomic_load_n(dev->vm_status_mirror.word,
+                                   __ATOMIC_ACQUIRE) != 0);
+}
+
+/* Transfer recording ownership to the device if Vulkan or the kernel reports
+ * loss. Jobs may still read these bytes while the application resets or frees
+ * its recordings. Use the existing list links so loss cleanup cannot fail
+ * while the system is out of memory. */
+void
+hk_cmd_pending_retain_lost(struct hk_device *dev, struct hk_cmd_buffer *cmd)
+{
+   if (!dev->cmd_pending_ready || !hk_device_lost_or_vm_error(dev))
+      return;
+
+   struct list_head *lists[] = {
+      &cmd->uploader.main.bos,
+      &cmd->uploader.usc.bos,
+      &cmd->uploader.root.bos,
+   };
+
+   simple_mtx_lock(&dev->cmd_pending_lock);
+   for (unsigned i = 0; i < ARRAY_SIZE(lists); ++i) {
+      list_splicetail(lists[i], &dev->cmd_lost_bos);
+      list_inithead(lists[i]);
+   }
+
+   list_splicetail(&cmd->vdm_allocations, &dev->cmd_lost_spans);
+   list_inithead(&cmd->vdm_allocations);
+   if (cmd->ioto.span) {
+      list_addtail(&cmd->ioto.span->link, &dev->cmd_lost_spans);
+      cmd->ioto.span = NULL;
+   }
+
+   util_dynarray_foreach(&cmd->large_bos, struct agx_bo *, entry) {
+      struct agx_bo *bo = *entry;
+
+      /* An active BO cannot be on the cache LRU. Keep a device reference
+       * until teardown, once per BO regardless of how many recordings use
+       * it. The recording drops its own reference during normal cleanup. */
+      if (!list_is_linked(&bo->lru_link)) {
+         agx_bo_reference(bo);
+         list_addtail(&bo->lru_link, &dev->cmd_lost_large_bos);
+      }
+   }
+   simple_mtx_unlock(&dev->cmd_pending_lock);
 }
 
 /* The queue's timeline goes away with it. As at device destruction, its
@@ -1037,6 +1057,7 @@ hk_cmd_pending_finish_queue(struct hk_device *dev, struct hk_queue *queue)
    simple_mtx_lock(&dev->cmd_pending_lock);
    if (!list_is_empty(&queue->cmd_pending)) {
       list_del(&queue->cmd_link);
+      p_atomic_dec(&dev->cmd_pending_active);
       list_splicetail(&queue->cmd_pending, &dev->cmd_pending_failed);
       list_inithead(&queue->cmd_pending);
    }
@@ -1058,6 +1079,26 @@ hk_cmd_pending_finish(struct hk_device *dev)
                             &dev->cmd_pending_failed, link) {
       list_del(&p->link);
       hk_cmd_pending_release(dev, p, true);
+   }
+
+   list_for_each_entry_safe(struct hk_cmd_bo, bo, &dev->cmd_lost_bos, link) {
+      list_del(&bo->link);
+      bo->bo->flags |= AGX_BO_NO_CACHE;
+      hk_cmd_bo_destroy(dev, &dev->vk.alloc, bo);
+   }
+
+   list_for_each_entry_safe(struct hk_vdm_allocation, span,
+                            &dev->cmd_lost_spans, link) {
+      list_del(&span->link);
+      span->slab->bo->flags |= AGX_BO_NO_CACHE;
+      hk_device_free_span(dev, span);
+   }
+
+   list_for_each_entry_safe(struct agx_bo, bo, &dev->cmd_lost_large_bos,
+                            lru_link) {
+      list_del(&bo->lru_link);
+      bo->flags |= AGX_BO_NO_CACHE;
+      agx_bo_unreference(&dev->dev, bo);
    }
 
    for (unsigned i = 0; i < dev->cmd_syncobj_count; ++i)

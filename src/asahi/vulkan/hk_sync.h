@@ -273,8 +273,11 @@ struct hk_sync_xfer_dst {
 struct hk_sync_stream {
    /* Recording order. Equal to list order for every pair the tracking
     * compares: a pre-graphics stream takes the number reserved just below
-    * its render so it sorts before it, where the list places it. */
+    * its render so it sorts before it, where the list places it. Multiple
+    * pre-graphics streams ahead of the same render break ties by pre_seq. */
    uint32_t seq;
+   uint32_t pre_seq;
+   uint32_t pre_count;
 
    /* The latest HK_SYNC_GFX_MEM stream on this stream's subqueue recorded
     * before it. */
@@ -298,9 +301,10 @@ struct hk_sync_stream {
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
 
    /* For a render: what its vertex (tiling) half needs, a subset of dep
-    * without the fragment-only requirements (HK_SYNC_GFX_FRAG) and tile
-    * hazards. Resolved like dep into barrier_ta/prior_ta; ta_split when
-    * they differ from barrier/prior. */
+    * without the fragment-only requirements (HK_SYNC_GFX_FRAG). Tile
+    * hazards stay in it: starting tiling ahead of them corrupts the shared
+    * tile. Resolved like dep into barrier_ta/prior_ta; ta_split when they
+    * differ from barrier/prior. */
    struct hk_sync_dep dep_ta[HK_SYNC_NUM_SQ];
    uint16_t barrier_ta[HK_SYNC_NUM_SQ];
    uint64_t prior_ta[HK_SYNC_NUM_SQ];
@@ -392,13 +396,20 @@ struct hk_sync_state {
    struct hk_cs *xfer_any;
    uint32_t xfer_version;
 
-   /* The draw state the last draw-time check found no noted write in: valid
-    * while xfer_version, the descriptor and vertex buffer generations and the
-    * index buffer are unchanged (hk_cmd_draw.c). */
+   /* Draw-state slices the last draw-time check found no noted write in:
+    * each slice stays valid independently while xfer_version and that
+    * slice's resource identity are unchanged (hk_cmd_draw.c). */
    struct {
-      bool valid;
-      uint32_t version;
-      uint64_t descriptors, vertex_buffers, index;
+      uint32_t desc_version;
+      uint32_t vb_version;
+      uint32_t index_version;
+      bool desc_valid;
+      bool vb_valid;
+      bool index_valid;
+      uint64_t descriptors;
+      uint64_t vertex_buffers;
+      uint64_t index_addr;
+      uint64_t index_range;
    } xfer_clean;
 
    /* A top-of-pipe timestamp waiting for the next stream to carry it as its
@@ -604,6 +615,9 @@ void hk_sync_pass_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
 void hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                      struct hk_cs *self, struct hk_sync_dep dep[HK_SYNC_NUM_SQ]);
 
+/* A compute stream for a query command, ordered after earlier query work. */
+struct hk_cs *hk_query_command_cs(struct hk_cmd_buffer *cmd);
+
 /* The render stream draws with a pre-rasterization shader that reads images:
  * its vertex half joins the image-barrier requirements (HK_SYNC_GFX_IMG). */
 void hk_sync_vertex_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
@@ -730,6 +744,12 @@ void hk_sync_resolve_end(struct hk_cmd_buffer *cmd);
  * into its stream (hk_sync_load_resolved()) before emitting it. The streams
  * keep the fields of their last occurrence.
  */
+bool hk_sync_resolve_submit_ex(struct hk_queue *queue,
+                               struct hk_cmd_buffer *const *cmdbufs,
+                               unsigned count, bool first_cdm_is_flush,
+                               bool chain_first, uint64_t completed,
+                               struct hk_sync_resolved *out,
+                               bool *tail_raised_out);
 bool hk_sync_resolve_submit(struct hk_queue *queue,
                             struct hk_cmd_buffer *const *cmdbufs,
                             unsigned count, bool first_cdm_is_flush,

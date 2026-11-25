@@ -60,6 +60,21 @@ main(void)
    assert(!agx_chip_elide_app_dispatch_barrier(AGX_CHIP_G15P));
    assert(!agx_chip_elide_app_dispatch_barrier(AGX_CHIP_G18G));
 
+   /* Dynamic attachment feedback loop state tracks the shared depth/stencil
+    * twin and draw-time selection across native AGX3 and M5. */
+   for (unsigned i = 0; i < ARRAY_SIZE(elide_chips); ++i)
+      assert(agx_chip_has_feedback_loop_dynamic_state(elide_chips[i]));
+   assert(!agx_chip_has_feedback_loop_dynamic_state(AGX_CHIP_G13G));
+   assert(!agx_chip_has_feedback_loop_dynamic_state(AGX_CHIP_G14X));
+   assert(!agx_chip_has_feedback_loop_dynamic_state(AGX_CHIP_G18G));
+
+   /* NIR-lowered VK_EXT_depth_clip_control stays on across AGX2, native AGX3,
+    * and AGX3C/HAL300 (M5), and fails closed on AGX3D (G18G). */
+   assert(agx_chip_has_depth_clip_control(AGX_CHIP_G13G));
+   assert(agx_chip_has_depth_clip_control(AGX_CHIP_G14X));
+   for (unsigned i = 0; i < ARRAY_SIZE(elide_chips); ++i)
+      assert(agx_chip_has_depth_clip_control(elide_chips[i]));
+   assert(!agx_chip_has_depth_clip_control(AGX_CHIP_G18G));
 
    /* Kernel-feature-gated cumulative signals and sibling compute queues apply
     * uniformly across G16G, G17P, and M5 (G17G/G17S/G17C) without chip forks. */
@@ -84,6 +99,10 @@ main(void)
       qdev.is_virtio = true;
       assert(!hk_queue_sibling_compute_supported(&qdev, true));
       qdev.is_virtio = false;
+
+      qdev.debug = AGX_DBG_1QUEUE;
+      assert(!hk_queue_sibling_compute_supported(&qdev, true));
+      qdev.debug = 0;
 
       /* A kernel that fans compute out itself gets no sibling queues. */
       qdev.params.features =

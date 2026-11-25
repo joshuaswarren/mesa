@@ -16,11 +16,17 @@ struct hk_descriptor_state;
 struct hk_device;
 struct vk_descriptor_set_layout;
 
-/* Maximum supported stencil diameter (2 * 28 + 1 = 57). Keeps shared memory
- * staging compact (<= 7.75 KiB vertical, <= 3.0 KiB horizontal) so threadgroup
- * occupancy stays full. */
-#define HK_BYTE_STENCIL_MAX_DIAMETER 57u
-#define HK_BYTE_STENCIL_MAX_RADIUS   28u
+/* Maximum supported 1-byte stencil diameter (2 * 28 + 1 = 57). Keeps shared
+ * memory staging compact (<= 7.75 KiB vertical, <= 3.0 KiB horizontal) so
+ * threadgroup occupancy stays full. */
+#define HK_BYTE_STENCIL_MAX_DIAMETER  57u
+#define HK_BYTE_STENCIL_MAX_RADIUS    28u
+
+/* The RGBA tiles include a halo of up to 64 pixels on either side.
+ * Decoded horizontal rows need 8 KiB. Packed vertical columns need 12.25 KiB.
+ */
+#define HK_RGBA8_STENCIL_MAX_DIAMETER 129u
+#define HK_RGBA8_STENCIL_MAX_RADIUS   64u
 
 enum hk_byte_stencil_axis {
    HK_BYTE_STENCIL_HORIZ = 0,
@@ -30,6 +36,11 @@ enum hk_byte_stencil_axis {
 enum hk_byte_stencil_store_conv {
    HK_BYTE_STENCIL_CONV_F2I32 = 0,
    HK_BYTE_STENCIL_CONV_F2U32 = 1,
+};
+
+enum hk_byte_stencil_elem_kind {
+   HK_BYTE_STENCIL_ELEM_U8 = 0,
+   HK_BYTE_STENCIL_ELEM_RGBA8_CLAMPED = 1,
 };
 
 struct hk_byte_stencil_binding {
@@ -43,7 +54,7 @@ struct hk_byte_stencil_plan {
    uint8_t axis;
    uint8_t store_conv;
    uint8_t is_grid_stride;
-   uint8_t pad;
+   uint8_t elem_kind;
    uint16_t tile_w;
    uint16_t tile_h;
    uint32_t orig_wg_size[3];
