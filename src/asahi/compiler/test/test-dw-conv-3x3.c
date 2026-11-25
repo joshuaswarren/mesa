@@ -37,6 +37,13 @@ struct dw_test_opts {
    bool divergent_bound;
    bool vector_swizzled_bounds;
    bool add_preamble_func;
+   bool early_inner_break;
+   bool inner_header_live_out;
+   enum {
+      PREAMBLE_BOUNDS,
+      DOMINATING_MEMORY_BOUNDS,
+      CONDITIONAL_MEMORY_BOUNDS,
+   } bounds;
 };
 
 static nir_shader *
@@ -76,10 +83,18 @@ build_dw_conv_shader(const struct dw_test_opts *opts)
       : (opts->vector_swizzled_bounds
             ? nir_channel(&b, kvec, 0)
             : nir_load_preamble(&b, 1, 32, .base = 22));
+   if (opts->bounds != PREAMBLE_BOUNDS) {
+      nir_def *params = nir_load_preamble(&b, 1, 64, .base = 24);
+      kh_bound = nir_load_global_constant(&b, 1, 32, params, .align_mul = 4);
+      kw_bound = nir_load_constant_agx(&b, 1, 32, params, nir_imm_int(&b, 1),
+                                       .format = PIPE_FORMAT_R32_UINT);
+   }
    nir_def *step_x = nir_load_preamble(&b, 1, 32, .base = 28);
    nir_def *step_y = nir_load_preamble(&b, 1, 32, .base = 30);
    nir_def *w_step_y = nir_load_preamble(&b, 1, 32, .base = 32);
-   nir_def *kw_gt_0 = nir_ilt(&b, nir_imm_int(&b, 0), kw_bound);
+   nir_def *kw_gt_0 = opts->sliding_window_2px
+      ? nir_ilt(&b, nir_imm_int(&b, 0), kw_bound)
+      : NULL;
 
    unsigned ld_access = opts->non_readonly_load ? 0 : ACCESS_NON_WRITEABLE;
    nir_def *zero_i = nir_imm_int(&b, 0);
@@ -114,6 +129,10 @@ build_dw_conv_shader(const struct dw_test_opts *opts)
    nir_if *outer_exit = nir_push_if(&b, nir_ige(&b, &kh_phi->def, kh_bound));
    nir_jump(&b, nir_jump_break);
    nir_pop_if(&b, outer_exit);
+   if (opts->bounds == CONDITIONAL_MEMORY_BOUNDS) {
+      nir_instr_move(b.cursor, nir_def_instr(kw_bound));
+      b.cursor = nir_after_instr(nir_def_instr(kw_bound));
+   }
 
    nir_if *guard_if = NULL;
    nir_def *acc_after_inner[8];
@@ -241,6 +260,9 @@ build_dw_conv_shader(const struct dw_test_opts *opts)
          nir_builder_instr_insert(&b, &acc_x[c]->instr);
       }
 
+      nir_def *row_step = opts->inner_header_live_out
+         ? nir_iadd(&b, &kw_phi->def, step_y)
+         : step_y;
       nir_if *in_exit = nir_push_if(&b, nir_ige(&b, &kw_phi->def, kw_bound));
       nir_jump(&b, nir_jump_break);
       nir_pop_if(&b, in_exit);
@@ -263,6 +285,12 @@ build_dw_conv_shader(const struct dw_test_opts *opts)
                        .access = ACCESS_NON_READABLE, .base = 2,
                        .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
 
+      if (opts->early_inner_break) {
+         nir_if *tap = nir_push_if(&b, nir_ilt(&b, &kw_phi->def, step_x));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, tap);
+      }
+
       nir_def *kw_next = nir_iadd_imm(&b, &kw_phi->def, 1);
       nir_def *in_x_next = nir_iadd(&b, &in_x_phi->def, step_x);
       nir_def *w_x_next = nir_iadd(&b, &w_x_phi->def, step_x);
@@ -274,6 +302,7 @@ build_dw_conv_shader(const struct dw_test_opts *opts)
       for (unsigned c = 0; c < 4; ++c)
          add_latch_phi_src(acc_x[c], in_latch, acc_next[c]);
       nir_pop_loop(&b, inner);
+      step_y = row_step;
 
       for (unsigned c = 0; c < 4; ++c)
          acc_after_inner[c] = &acc_x[c]->def;
@@ -568,6 +597,39 @@ main(void)
       check_compiles_both_agx3(raw);
       ralloc_free(raw);
       ralloc_free(b.shader);
+   }
+
+   /* An early break in the tap branch cannot be discarded. */
+   {
+      struct dw_test_opts opts = {.early_inner_break = true};
+      nir_shader *s = build_dw_conv_shader(&opts);
+      CHECK(!agx_nir_opt_dw_conv_3x3(s));
+      nir_validate_shader(s, "after rejecting early inner break");
+      ralloc_free(s);
+   }
+
+   /* KW may only be loaded once the outer loop enters its body. */
+   {
+      struct dw_test_opts opts = {.bounds = CONDITIONAL_MEMORY_BOUNDS};
+      nir_shader *s = build_dw_conv_shader(&opts);
+      CHECK(!agx_nir_opt_dw_conv_3x3(s));
+      nir_validate_shader(s, "after rejecting conditional memory bound");
+      ralloc_free(s);
+
+      opts.bounds = DOMINATING_MEMORY_BOUNDS;
+      s = build_dw_conv_shader(&opts);
+      CHECK(agx_nir_opt_dw_conv_3x3(s));
+      nir_validate_shader(s, "after specializing dominating memory bounds");
+      ralloc_free(s);
+   }
+
+   /* The next row uses a value evaluated on the final inner header visit. */
+   {
+      struct dw_test_opts opts = {.inner_header_live_out = true};
+      nir_shader *s = build_dw_conv_shader(&opts);
+      CHECK(!agx_nir_opt_dw_conv_3x3(s));
+      nir_validate_shader(s, "after rejecting top-tested inner live-out");
+      ralloc_free(s);
    }
 
    return failures ? 1 : 0;

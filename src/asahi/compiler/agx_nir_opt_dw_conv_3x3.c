@@ -57,36 +57,22 @@ def_dominates_loop(nir_def *def, nir_loop *loop)
 }
 
 static bool
-is_inv_bound_def(nir_def *def, nir_loop *loop, unsigned depth)
+is_inv_bound_def(nir_def *def, nir_loop *loop)
 {
-   if (depth > 6 || !def)
-      return false;
    if (def_dominates_loop(def, loop))
       return true;
+
+   /* Only speculate loads that cannot fault on paths that skip the loop. */
    nir_instr *instr = nir_def_instr(def);
-   if (instr->type == nir_instr_type_load_const)
-      return true;
-   if (instr->type == nir_instr_type_intrinsic) {
-      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-      if (intr->intrinsic != nir_intrinsic_load_preamble &&
-          intr->intrinsic != nir_intrinsic_load_constant_agx &&
-          intr->intrinsic != nir_intrinsic_load_global_constant)
-         return false;
-      unsigned n = nir_intrinsic_infos[intr->intrinsic].num_srcs;
-      for (unsigned i = 0; i < n; ++i) {
-         if (!is_inv_bound_def(intr->src[i].ssa, loop, depth + 1))
-            return false;
-      }
-      return true;
-   }
-   return false;
+   return instr->type == nir_instr_type_load_const ||
+          (instr->type == nir_instr_type_intrinsic &&
+           nir_instr_as_intrinsic(instr)->intrinsic ==
+              nir_intrinsic_load_preamble);
 }
 
 static nir_def *
-materialize_inv_bound(nir_builder *b, nir_def *def, nir_loop *loop,
-                      unsigned depth)
+materialize_inv_bound(nir_builder *b, nir_def *def, nir_loop *loop)
 {
-   assert(depth <= 6);
    if (def_dominates_loop(def, loop))
       return def;
    nir_instr *instr = nir_def_instr(def);
@@ -94,16 +80,10 @@ materialize_inv_bound(nir_builder *b, nir_def *def, nir_loop *loop,
       nir_load_const_instr *lc = nir_instr_as_load_const(instr);
       return nir_build_imm(b, def->num_components, def->bit_size, lc->value);
    }
-   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-   unsigned n = nir_intrinsic_infos[intr->intrinsic].num_srcs;
-   nir_def *mat[4] = {NULL};
-   for (unsigned i = 0; i < n; ++i)
-      mat[i] = materialize_inv_bound(b, intr->src[i].ssa, loop, depth + 1);
+   assert(nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_preamble);
    nir_intrinsic_instr *clone =
       nir_instr_as_intrinsic(nir_instr_clone(b->shader, instr));
    nir_builder_instr_insert(b, &clone->instr);
-   for (unsigned i = 0; i < n; ++i)
-      nir_src_rewrite(&clone->src[i], mat[i]);
    return &clone->def;
 }
 
@@ -139,7 +119,6 @@ instr_is_pure_read(nir_instr *instr, bool *saw_load, bool *saw_fma)
    case nir_instr_type_phi:
    case nir_instr_type_load_const:
    case nir_instr_type_undef:
-   case nir_instr_type_jump:
       return true;
    case nir_instr_type_alu: {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
@@ -225,7 +204,7 @@ match_counted_unit_loop(nir_loop *loop, nir_loop *dom_loop,
    nir_scalar bound = nir_scalar_chase_movs(
       nir_get_scalar(cmp->src[1].src.ssa, cmp->src[1].swizzle[0]));
    if (bound.def->bit_size != 32 || bound.def->divergent ||
-       !is_inv_bound_def(bound.def, dom_loop, 0))
+       !is_inv_bound_def(bound.def, dom_loop))
       return false;
    /* Already-constant bounds are left to generic unrolling. */
    if (nir_def_instr(bound.def)->type == nir_instr_type_load_const)
@@ -485,9 +464,17 @@ match_dw3x3_nest(nir_loop *outer_loop, struct dw3x3_match *m)
    unsigned total_instrs = 0;
    bool saw_load = false;
    bool saw_fma = false;
+   nir_block *outer_break = nir_if_first_then_block(m->outer.exit_if);
+   nir_block *inner_break = nir_if_first_then_block(m->inner.exit_if);
    nir_foreach_block_in_cf_node(blk, &outer_loop->cf_node) {
+      bool in_inner = block_in_cf_node(blk, &inner_loop->cf_node);
       nir_foreach_instr(instr, blk) {
-         bool in_inner = block_in_cf_node(blk, &inner_loop->cf_node);
+         if (instr->type == nir_instr_type_jump) {
+            if ((blk != outer_break && blk != inner_break) ||
+                nir_instr_as_jump(instr)->type != nir_jump_break)
+               return false;
+            continue;
+         }
          bool blk_load = false, blk_fma = false;
          if (!instr_is_pure_read(instr, &blk_load, &blk_fma))
             return false;
@@ -496,7 +483,6 @@ match_dw3x3_nest(nir_loop *outer_loop, struct dw3x3_match *m)
             saw_fma |= blk_fma;
          }
          if (instr->type != nir_instr_type_phi &&
-             instr->type != nir_instr_type_jump &&
              instr->type != nir_instr_type_load_const) {
             if (++total_instrs > DW3X3_MAX_OUTER_INSTRS)
                return false;
@@ -512,12 +498,19 @@ match_dw3x3_nest(nir_loop *outer_loop, struct dw3x3_match *m)
          nir_def *def = nir_instr_def(instr);
          if (!def)
             continue;
+         /* The unrolled inner loop omits the final top-tested header visit. */
+         bool check_inner_live_out = !m->inner.bottom_tested &&
+                                     blk == m->inner.hdr &&
+                                     instr->type != nir_instr_type_phi;
          bool used_outside = false;
          nir_foreach_use_including_if(src, def) {
             nir_block *ublk = nir_src_is_if(src)
                ? nir_cf_node_as_block(
                     nir_cf_node_prev(&nir_src_use_if(src)->cf_node))
                : nir_src_use_instr(src)->block;
+            if (check_inner_live_out &&
+                !block_in_cf_node(ublk, &inner_loop->cf_node))
+               return false;
             if (!block_in_cf_node(ublk, &outer_loop->cf_node)) {
                used_outside = true;
                break;
@@ -782,12 +775,12 @@ transform_dw3x3_nest(const struct dw3x3_match *m)
    nir_builder b = nir_builder_at(nir_before_cf_node(&m->outer.loop->cf_node));
 
    nir_def *ob_def =
-      materialize_inv_bound(&b, m->outer.bound.def, m->outer.loop, 0);
+      materialize_inv_bound(&b, m->outer.bound.def, m->outer.loop);
    nir_def *outer_bound = ob_def->num_components == 1
       ? ob_def
       : nir_channel(&b, ob_def, m->outer.bound.comp);
    nir_def *ib_def =
-      materialize_inv_bound(&b, m->inner.bound.def, m->outer.loop, 0);
+      materialize_inv_bound(&b, m->inner.bound.def, m->outer.loop);
    nir_def *inner_bound = ib_def->num_components == 1
       ? ib_def
       : nir_channel(&b, ib_def, m->inner.bound.comp);
