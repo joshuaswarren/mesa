@@ -733,17 +733,13 @@ encode_reduce(enum agx_isa_encoding enc,
        * which adds the source back afterwards, is bf01560403001609 (f25)
        * next to the exclusive bf0156020204100b (f27). */
       if (g18g && is_c(enc)) {
-         /* AGX3c's SIMD integer add does the same: metal-nt
-          * applegpu_g17g/g18g give the inclusive sum f25 and the exclusive
-          * one f27 (m6-libagx-forms lk_prefix_incl_load /
-          * lk_prefix_excl_load). */
-         const bool c_simd_iadd = !d->quad && !d->half &&
-                                  d->op == AGX3_SUBGROUP_REDUCE_IADD;
-         /* Native999's live/dead pairs on both G17G and G18G use no
-          * source hint for a live full-width min/max/bitwise operand. In
-          * particular, f27 is a final-read hint, not the generic AGX3c
-          * reduction default. Preserve the existing IADD/quad/half paths. */
-         const bool c_keep_source = !d->quad && !d->half && d->src_live &&
+         /* AGX3c's integer add marks a live source with f25 and a final read
+          * with f27 (m6-libagx-forms lk_prefix_incl_load /
+          * lk_prefix_excl_load). Native999's live/dead pairs on both G17G and
+          * G18G use no source hint for a live min/max/bitwise operand, and f27
+          * only on the final read. Never emit f27 (discard) while src_live is
+          * set, including for 16-bit and quad reductions. */
+         const bool c_keep_source = d->src_live &&
             (d->op == AGX3_SUBGROUP_REDUCE_SMIN ||
              d->op == AGX3_SUBGROUP_REDUCE_SMAX ||
              d->op == AGX3_SUBGROUP_REDUCE_AND ||
@@ -752,7 +748,7 @@ encode_reduce(enum agx_isa_encoding enc,
              d->op == AGX3_SUBGROUP_REDUCE_UMIN ||
              d->op == AGX3_SUBGROUP_REDUCE_UMAX);
          if (!c_keep_source)
-            ADD_FIELD(c_simd_iadd && d->src_live ? 25 : 27, 1);
+            ADD_FIELD(d->src_live ? 25 : 27, 1);
       } else {
          ADD_FIELD(d->src_live ? 25 : 27, 1);
       }

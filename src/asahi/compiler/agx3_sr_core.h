@@ -2,17 +2,10 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * AGX3 special-register read encoder (get_sr -> rld, source-kind f23=7).
- *
- * A special-register read is an async producer: it signals a scoreboard slot
- * (f12) and its consumers carry wait bits, exactly like a device load. The SR
- * number goes in f21; the width class (16- or 32-bit destination) in f10,
- * mirrored in f24. The compact 4-byte form (ep0) cannot carry wait bits or a
- * wide destination; the encoder escalates to the 8-byte form (ep1) when the
- * composer refuses ep0 -- the same mechanical escalation visible in Apple's
- * own emissions. Only (SR, width) pairs witnessed in the corpus encode; the
- * rest fail closed. Grade A: reproduces all 306 clean Apple SR-read witnesses
- * byte-exactly via the composer.
+ * AGX3 special-register read encoder (`get_sr` -> `rld`, f23=7, SR in f21,
+ * width in f10/f24, async scoreboard slot in f12). Escalates from 4-byte ep0
+ * to 8-byte ep1 when wait bits or wide destinations require it; unsupported
+ * (SR, width) pairs fail closed.
  */
 
 #pragma once

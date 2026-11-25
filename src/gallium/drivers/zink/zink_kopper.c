@@ -1007,8 +1007,8 @@ zink_kopper_present_queue(struct zink_screen *screen, struct zink_resource *res,
       p_atomic_inc(&cpi->swapchain->async_presents);
       struct pipe_resource *pres = NULL;
       pipe_resource_reference(&pres, &res->base.b);
-      util_queue_add_job(&screen->flush_queue, cpi, &cdt->swapchain->present_fence,
-                         kopper_present, NULL, 0);
+      zink_flush_queue_add_job(screen, cpi, &cdt->swapchain->present_fence,
+                               kopper_present);
    } else {
       if (screen->threaded_submit)
          util_queue_finish(&screen->flush_queue);

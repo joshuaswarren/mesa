@@ -8,6 +8,8 @@
 #include "util/ralloc.h"
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
+#include "hk_entrypoints.h"
+#include "hk_event.h"
 #include "hk_query_oq.h"
 #include "asahi/libagx/query.h"
 
@@ -32,6 +34,7 @@ static struct {
    unsigned writes;
 } dispatched[MAX_DISPATCH];
 static unsigned ndispatched;
+static unsigned cs_allocs;
 
 void
 hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
@@ -43,6 +46,35 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    dispatched[ndispatched].writes =
       util_dynarray_num_elements(&cs->imm_writes, struct libagx_imm_write);
    ndispatched++;
+}
+
+/* hk_cmd_buffer_get_cs_general() serves every stream slot; fixtures never
+ * open a graphics or pre-graphics stream through it. */
+void
+hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
+bool
+hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+   abort();
+}
+
+/* Fixtures never copy timestamps. Emitting a copy is a bug. */
+void
+hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                       const struct hk_stamp_copy *copies, unsigned count)
+{
+   (void)cmd;
+   (void)cs;
+   (void)copies;
+   (void)count;
+   abort();
 }
 
 /* These devices never map memory at a second address, so the real
@@ -84,22 +116,82 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd, struct hk_uploader *uploader,
 struct agx_ptr
 hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 {
-   (void)cmd; (void)size; (void)alignment;
-   abort();
+   (void)cmd;
+   return (struct agx_ptr){
+      .cpu = rzalloc_size(test_context, size),
+      .gpu = (uint64_t)++cs_allocs * alignment,
+   };
 }
 
 void
 hk_drm_attachment_set_init(struct hk_drm_attachment_set *set)
 {
    (void)set;
-   abort();
 }
 
 void
 hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
 {
-   (void)cmd;
    (void)why;
+   if (cmd->state.deferred_clear_count)
+      abort();
+}
+
+/* Event stream commands are represented by their dispatch count. */
+void
+hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
+               bool after_gfx)
+{
+   (void)address;
+   (void)value;
+   if (after_gfx || !cmd->current_cs.cs)
+      abort();
+   cmd->current_cs.cs->stats.cmds++;
+}
+
+void
+hk_g17p_meta_wait_addr(struct hk_cmd_buffer *cmd, uint64_t address,
+                      uint32_t value)
+{
+   hk_queue_write(cmd, address, value, false);
+}
+
+bool
+brl_discard_init_prepare(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
+                         uint8_t *dst_kinds)
+{
+   (void)cmd;
+   (void)dst_kinds;
+   if (info->imageMemoryBarrierCount)
+      abort();
+   return false;
+}
+
+void
+brl_discard_init_record(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info,
+                        uint8_t dst_kinds)
+{
+   (void)cmd;
+   (void)info;
+   (void)dst_kinds;
+   abort();
+}
+
+void
+hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs, size_t space)
+{
+   (void)cmd;
+   (void)cs;
+   (void)space;
+   abort();
+}
+
+void
+hk_cdm_visibility_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
+{
+   (void)dev;
+   (void)cs;
+   (void)memory;
    abort();
 }
 
@@ -124,9 +216,11 @@ new_cmd(void)
       abort();
    dev->dev.chip = test_chip;
    c->vk.base.device = &dev->vk;
+   c->vk.base.type = VK_OBJECT_TYPE_COMMAND_BUFFER;
    list_inithead(&c->control_streams);
    util_dynarray_init(&c->sync_pass_records, NULL);
    ndispatched = 0;
+   cs_allocs = 0;
    return c;
 }
 
@@ -194,6 +288,171 @@ slot_is(const struct hk_cs *render, unsigned slot, uint32_t handle)
 {
    return render->oq_stamp[slot].handle == handle &&
           render->oq_stamp[slot].offset_B == 8 * handle;
+}
+
+/* A finalized render with queries still staged inline, as after
+ * vkCmdEndRendering with no post-graphics stream. */
+static struct hk_cs *
+add_inline_render(struct hk_cmd_buffer *cmd, unsigned count)
+{
+   struct hk_cs *render = add(cmd, false);
+   for (unsigned i = 0; i < count; ++i) {
+      const uint32_t offset = 8 * (i + 1);
+      render->oq_pending[i] = (struct hk_oq_pending){
+         .avail_addr = 0x10000 + offset,
+         .handle = i + 1,
+         .offset_B = offset,
+         .avail_size = 8,
+      };
+   }
+   render->oq_pending_count = count;
+   cmd->state.oq_pending_render = render;
+   return render;
+}
+
+static struct hk_cs *
+last_cs(struct hk_cmd_buffer *cmd)
+{
+   return list_last_entry(&cmd->control_streams, struct hk_cs, node);
+}
+
+static void
+test_inline_stamps(void)
+{
+   const unsigned order[] = {1, 2, 0};
+   for (unsigned count = 1; count <= ARRAY_SIZE(order); ++count) {
+      struct hk_cmd_buffer *cmd = new_cmd();
+      struct hk_cs *render = add_inline_render(cmd, count);
+      hk_resolve_pending_oq_available(cmd);
+
+      for (unsigned i = 0; i < count; ++i)
+         T("inline query uses the next free stamp", slot_is(render, order[i], i + 1));
+      T("inline stamping allocates no post-graphics stream",
+        cs_allocs == 0 && nstreams(cmd) == 1 && ndispatched == 0 &&
+           !cmd->current_cs.post_gfx);
+      T("inline staging is cleared", !cmd->state.oq_pending_render &&
+                                        render->oq_pending_count == 0);
+   }
+}
+
+static void
+test_inline_fallback(bool start_timestamp)
+{
+   struct hk_cmd_buffer *cmd = new_cmd();
+   const unsigned count = start_timestamp ? 3 : 1;
+   struct hk_cs *render = add_inline_render(cmd, count);
+   if (start_timestamp)
+      render->timestamp.start.handle = 9;
+   else
+      cmd->sync.req[util_logbase2(HK_SYNC_COMPUTE)][HK_SYNC_VDM].cut = render;
+
+   hk_resolve_pending_oq_available(cmd);
+   struct hk_cs *post = last_cs(cmd);
+   T("blocked inline stamping stages a post-graphics stream",
+     cs_allocs == 1 && post != render && post->oq_avail_deferred &&
+        post->sync.dep[HK_SYNC_VDM].cut == render &&
+        !cmd->state.oq_pending_render && render->oq_pending_count == 0);
+
+   hk_resolve_deferred_oq_available(cmd);
+   T("blocked inline stamping dispatches all stores after the render",
+     ndispatched == 1 && dispatched[0].cs == post &&
+        dispatched[0].writes == count && nstreams(cmd) == 2);
+}
+
+static void
+test_inline_copy(void)
+{
+   struct hk_cmd_buffer *cmd = new_cmd();
+   struct hk_cs *render1 = add_inline_render(cmd, 1);
+   cmd->sync.kind_override = HK_SYNC_ALL;
+   struct hk_cs *copy = hk_query_command_cs(cmd);
+   if (!copy)
+      abort();
+   copy->stats.cmds++;
+   cmd->sync.kind_override = 0;
+   hk_cmd_buffer_end_compute(cmd);
+
+   struct hk_cs *post1 = list_first_entry(&render1->node, struct hk_cs, node);
+   T("query copy waits for post1", post1 != copy && post1->oq_avail_deferred &&
+                                     copy->sync.dep[HK_SYNC_CDM].cut == post1);
+
+   struct hk_cs *render2 = add(cmd, false);
+   struct hk_cs *post2 = add_post(cmd, render2, 4, 2);
+   T("second render's four queries are deferred", deferred(cmd, post2));
+   hk_resolve_deferred_oq_available(cmd);
+
+   T("reverse resolution preserves post1 before the copy",
+     listed(cmd, post1) && post1->node.next == &copy->node &&
+        copy->sync.dep[HK_SYNC_CDM].cut == post1);
+   T("reverse resolution keeps the stores of each render in its own dispatch",
+     ndispatched == 2 && dispatched[0].cs == post1 && dispatched[0].writes == 1 &&
+        dispatched[1].cs == post2 && dispatched[1].writes == 4);
+}
+
+static void
+test_inline_transition(void)
+{
+   struct hk_cmd_buffer *cmd = new_cmd();
+   struct hk_cs *render = add_inline_render(cmd, 1);
+   brl_sync_transition_prepare(cmd, HK_SYNC_GFX);
+   struct hk_cs *post = last_cs(cmd);
+   T("layout transition captures the post-graphics dependency",
+     post != render && post->oq_avail_deferred &&
+        cmd->sync.brl_transition_dep[HK_SYNC_CDM].cut == post);
+}
+
+static void
+test_inline_event(bool wait)
+{
+   struct hk_cmd_buffer *cmd = new_cmd();
+   struct hk_cs *render = add_inline_render(cmd, 1);
+   struct agx_va va = {.addr = 0x20000};
+   struct agx_bo bo = {.va = &va};
+   struct hk_event event = {
+      .base.type = VK_OBJECT_TYPE_EVENT,
+      .bo = &bo,
+      .addr = va.addr,
+   };
+   const VkEvent handle = hk_event_to_handle(&event);
+   const VkMemoryBarrier2 barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+   };
+   const VkDependencyInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &barrier,
+   };
+   if (wait)
+      hk_CmdWaitEvents2(hk_cmd_buffer_to_handle(cmd), 1, &handle, &info);
+   else
+      hk_CmdResetEvent2(hk_cmd_buffer_to_handle(cmd), handle, barrier.srcStageMask);
+
+   struct hk_cs *post = list_first_entry(&render->node, struct hk_cs, node);
+   struct hk_cs *event_cs = last_cs(cmd);
+   T(wait ? "event wait waits for post-graphics availability"
+          : "event write waits for post-graphics availability",
+     post != render && post != event_cs && post->oq_avail_deferred &&
+        event_cs->sync.dep[HK_SYNC_CDM].cut == post);
+}
+
+static void
+test_inline_pending_timestamp(void)
+{
+   struct hk_cmd_buffer *cmd = new_cmd();
+   struct hk_cs *render = add_inline_render(cmd, 1);
+   cmd->sync.pending_start_ts = (struct agx_timestamp_req){.handle = 9, .offset_B = 16};
+   cmd->sync.pending_start_ts_unordered = true;
+   hk_sync_flush_pending_timestamp(cmd);
+
+   struct hk_cs *post = last_cs(cmd);
+   T("flushed timestamp reaches the end of the post-graphics stream",
+     post != render && !post->timestamp.start.handle &&
+        post->timestamp.end.handle == 9 && post->timestamp.end.offset_B == 16);
+   T("flushing clears the pending timestamp and its unordered flag",
+     !cmd->sync.pending_start_ts.handle && !cmd->sync.pending_start_ts_unordered &&
+        !cmd->sync.has_unordered_start_ts);
 }
 
 static void
@@ -536,7 +795,7 @@ test_order(void)
 static void
 test_order_forward(void)
 {
-   test_chip = AGX_CHIP_G16G;
+   test_chip = AGX_CHIP_G15G;
    struct hk_cmd_buffer *c = new_cmd();
    struct hk_cs *r[3], *p[3];
    for (unsigned i = 0; i < 3; ++i) {
@@ -553,23 +812,22 @@ test_order_forward(void)
    test_chip = AGX_CHIP_G17P;
 }
 
-/* Only the G17 runtime (G17P and M5) publishes render timestamps at
- * retirement. G15 firmware writes the vertex-end slot when tiling finishes,
- * before the fragment work writes the counts: such a stamp is not
- * availability. */
+/* Native HAL200 (G16G/G17P) and M5 (G17G/G17S/G17C) runtimes publish render
+ * timestamps at full retirement. G15 firmware writes the vertex-end slot when
+ * tiling finishes, before the fragment work writes the counts: such a stamp is
+ * not availability. */
 static void
 test_stamp_chips(void)
 {
-   T("chips: G17P and M5 renders carry availability",
-     hk_oq_render_stamps_supported(AGX_CHIP_G17P) &&
+   T("chips: native HAL200 and M5 renders carry availability",
+     hk_oq_render_stamps_supported(AGX_CHIP_G16G) &&
+        hk_oq_render_stamps_supported(AGX_CHIP_G17P) &&
         hk_oq_render_stamps_supported(AGX_CHIP_G17G) &&
         hk_oq_render_stamps_supported(AGX_CHIP_G17S));
    T("chips: G15 renders keep the queued store",
      !hk_oq_render_stamps_supported(AGX_CHIP_G15G) &&
         !hk_oq_render_stamps_supported(AGX_CHIP_G15S) &&
         !hk_oq_render_stamps_supported(AGX_CHIP_G15C));
-   T("chips: other native chips keep the queued store",
-     !hk_oq_render_stamps_supported(AGX_CHIP_G16G));
 }
 
 static void
@@ -634,6 +892,14 @@ int
 main(void)
 {
    test_context = ralloc_context(NULL);
+   test_inline_stamps();
+   test_inline_fallback(true);
+   test_inline_fallback(false);
+   test_inline_copy();
+   test_inline_transition();
+   test_inline_event(false);
+   test_inline_event(true);
+   test_inline_pending_timestamp();
    test_defer();
    test_stamped();
    test_keep();

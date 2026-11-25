@@ -18,9 +18,7 @@
 extern "C" {
 #endif
 
-/* Exact, whole-payload forms which may safely be followed from a native AGX3
- * VDM PPP State Update.  Mixed and extended PPP updates remain unsupported
- * until their complete selector grammar is recovered. */
+/* Supported whole-payload AGX3 VDM PPP State Update forms. */
 enum agx_ppp_decoded_record_kind {
    AGX_PPP_DECODED_RECORD_INVALID = 0,
    AGX_PPP_DECODED_RECORD_W_CLAMP_CULL2,
