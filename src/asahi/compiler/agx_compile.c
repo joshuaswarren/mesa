@@ -11843,8 +11843,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       }
    }
 
-   if (runtime_loop_opts)
-      NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
+   NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
 
    /* Bit-exact FP32-blocked u8 absolute-difference sums when u8 operands are
     * reused across terms, followed by 16-bit integer narrowing for the rest. */
@@ -16402,6 +16401,10 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 
    if (!post_lower) {
       NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+      /* Match written-out population counts before loop optimizations
+       * reassociate the final addition into its user. */
+      NIR_PASS(_, nir, nir_opt_copy_prop);
+      NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
 
       /* Lower large arrays to scratch and small arrays to csel */
       NIR_PASS(_, nir, nir_lower_vars_to_scratch, AGX_SCRATCH_ARRAY_THRESHOLD_B,
@@ -16599,20 +16602,9 @@ agx_preprocess_nir(nir_shader *nir)
    agx_preprocess_nir_for_encoding(nir, AGX_ISA_ENCODING_UNKNOWN);
 }
 
-/* Before the main optimization loop reassociates the last addition of a
- * written-out population count into its user. */
-static void
-agx_preprocess_popcount_idiom(nir_shader *nir)
-{
-   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
-   NIR_PASS(_, nir, nir_opt_copy_prop);
-   NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
-}
-
 void
 agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip)
 {
-   agx_preprocess_popcount_idiom(nir);
    agx_preprocess_nir_internal(
       nir, true, true, false, false, chip == AGX_CHIP_G17P, false, false,
       agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B);
@@ -16621,7 +16613,6 @@ agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip)
 void
 agx_preprocess_nir_native_defer_idiv(nir_shader *nir, enum agx_chip chip)
 {
-   agx_preprocess_popcount_idiom(nir);
    agx_preprocess_nir_internal(
       nir, true, true, false, false, chip == AGX_CHIP_G17P, false, true,
       agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B);
@@ -19668,7 +19659,6 @@ agx_compile_shader_nir_preoptimized(nir_shader *nir, struct agx_shader_key *key,
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
-   agx_preprocess_popcount_idiom(nir);
    agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
                                false, false);
 }
@@ -19676,7 +19666,6 @@ agx_preprocess_nir_m5(nir_shader *nir)
 void
 agx_preprocess_nir_m5_defer_idiv(nir_shader *nir)
 {
-   agx_preprocess_popcount_idiom(nir);
    agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
                                true, false);
 }

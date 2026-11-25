@@ -854,6 +854,7 @@ if with_tests
          'test/test-preamble-flag-branches.cpp',
          'test/test-factor-const-mul.cpp',
          'test/test-nonneg-idiv.cpp',
+         'test/test-popcount-idiom.cpp',
          'test/test-half-bitfield-extract.cpp',
          'test/test-flatten-loads.cpp',
          'test/test-narrow-subword-loads.cpp',
