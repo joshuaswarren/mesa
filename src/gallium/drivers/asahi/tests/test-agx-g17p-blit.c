@@ -2177,6 +2177,11 @@ check_agx3_compute_mipmap(struct pipe_screen *screen, struct pipe_context *pctx,
                           bool check_pixels)
 {
    struct agx_device *mdev = agx_device(screen);
+   if (agx_chip_descriptor_generation(mdev->chip) == AGX_DESCRIPTOR_GENERATION_10)
+      return check_agx3_compute_mipmap_case(screen, pctx, "sampled_65x33",
+                                            PIPE_TEXTURE_2D, 65, 33, 1, 6,
+                                            false, check_pixels);
+
    if (!agx_chip_native_agx3(mdev->chip))
       return true;
 
