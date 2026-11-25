@@ -7584,6 +7584,7 @@ static bool
 hk_g17p_mono_resolve_exports(nir_shader *nir)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_metadata_require(impl, nir_metadata_dominance);
    nir_scalar slot[256];
    uint8_t slot_bits[256] = {0};
 
@@ -7619,7 +7620,8 @@ hk_g17p_mono_resolve_exports(nir_shader *nir)
                if (!slot_bits[h]) {
                   /* Never exported: the register was undefined too. */
                   comps[c] = nir_undef(&b, 1, d->bit_size);
-               } else if (slot_bits[h] != d->bit_size) {
+               } else if (slot_bits[h] != d->bit_size ||
+                          !nir_block_dominates(nir_def_instr(slot[h].def)->block, block)) {
                   return false;
                } else {
                   comps[c] = nir_mov_scalar(&b, slot[h]);
@@ -8109,12 +8111,17 @@ hk_g17p_local_read_part_refusal(const struct hk_shader *shader,
    const struct agx_shader_info *info = &part->info;
    if (info->stage != MESA_SHADER_FRAGMENT)
       return "wrong stage";
-   if (!info->agx3_colour_link.entry_emitted ||
-       info->agx3_colour_link.colour_classes == 0 ||
-       info->agx3_colour_link.rt_query_write_acquired)
-      return "pixel protocol not proven";
-   if (info->has_preamble && !hk_g17p_native_cprog_qualified(info))
-      return "constant program outside the native protocol";
+   if (shader->local_read_key.dev.encoding == AGX_ISA_ENCODING_AGX2) {
+      if (!info->reads_tib)
+         return "no tilebuffer read";
+   } else {
+      if (!info->agx3_colour_link.entry_emitted ||
+          info->agx3_colour_link.colour_classes == 0 ||
+          info->agx3_colour_link.rt_query_write_acquired)
+         return "pixel protocol not proven";
+      if (info->has_preamble && !hk_g17p_native_cprog_qualified(info))
+         return "constant program outside the native protocol";
+   }
    if (info->early_fragment_tests != shader->local_read_meta.early_fragment_tests ||
        info->uses_draw_id || info->uses_base_param)
       return "launch contract mismatch";
@@ -8195,9 +8202,13 @@ hk_g17p_local_read_inline_epilog_part(
    if (!mem)
       return NULL;
 
-   const unsigned main_samples = MAX2(shader->local_read_key.fs.nr_samples, 1);
+   const unsigned main_samples = shader->local_read_key.fs.nr_samples;
    const unsigned samples = MAX2(ekey->nr_samples, 1);
-   if (ekey->native_spills || samples != main_samples)
+   const bool agx2 = shader->local_read_key.dev.encoding == AGX_ISA_ENCODING_AGX2;
+   const bool dynamic_samples = agx2 && !main_samples;
+   const bool sample_count_supported = dynamic_samples
+      ? (samples == 2 || samples == 4) : samples == MAX2(main_samples, 1);
+   if (ekey->native_spills || !sample_count_supported)
       HK_LR_REFUSE("epilog shape");
 
    disk = hk_g17p_local_read_disk_key(dev, shader, ekey, local_read, partitions,
@@ -8319,7 +8330,8 @@ hk_g17p_local_read_inline_epilog_part(
       pixel.link.sample_shading = false;
       pixel.defer_monolithic_msaa = true;
       agx_nir_fs_epilog(&eb, &pixel);
-      agx_nir_lower_sample_exports_to_end(nir);
+      if (!agx2)
+         agx_nir_lower_sample_exports_to_end(nir);
    } else if (agx_chip_native_agx3(dev->dev.chip)) {
       build_g17p_fs_epilog(&eb, &lr_ekey);
    } else {
@@ -8367,7 +8379,11 @@ hk_g17p_local_read_inline_epilog_part(
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
 
-   if (inline_samples) {
+   if (dynamic_samples) {
+      NIR_PASS(_, nir, agx_nir_specialize_sample_count, samples);
+      NIR_PASS(_, nir, agx_nir_lower_monolithic_msaa_agx2, samples);
+      nir->info.fs.uses_sample_shading = false;
+   } else if (inline_samples) {
       struct agx_g17p_colour_layout layout;
       agx_g17p_colour_layout_init(&layout, lr_ekey.link.loc_written,
                                   lr_ekey.link.size_32,
@@ -8393,7 +8409,7 @@ hk_g17p_local_read_inline_epilog_part(
    struct agx_shader_key key = shader->local_read_key;
    key.no_stop = false;
    key.secondary = false;
-   key.agx3_local_read = true;
+   key.agx3_local_read = key.dev.encoding != AGX_ISA_ENCODING_AGX2;
    key.fs.inside_sample_loop = false;
    key.fs.nr_samples = samples;
    if (partitions)
@@ -8504,8 +8520,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
    /* On-chip tile-memory local_read: compile a monolithic fragment program
     * reading eligible color input attachments directly from the tilebuffer.
     * Any refusal falls through to the split DRAM path below. */
-   if (key->local_read.enabled && !prolog && key->nr_samples_shaded == 0 &&
-       shader->local_read_nir) {
+   if (key->local_read.enabled && !prolog && shader->local_read_nir) {
       struct agx_shader_part *mono = hk_g17p_local_read_inline_epilog_part(
          dev, shader, &key->epilog, &key->local_read, g17p_tile_partitions);
       if (mono) {
@@ -12093,15 +12108,20 @@ hk_local_read_descriptors_match(const struct hk_cmd_buffer *cmd,
 
       const uint64_t offset = (uint64_t)bl->offset +
                               (uint64_t)b->elem * (uint64_t)bl->stride;
-      if (offset + sizeof(struct hk_sampled_image_descriptor) >
-          desc->set_sizes[b->set])
+      const unsigned generation = set->layout->descriptor_generation;
+      const struct hk_sampled_image_descriptor_layout layout =
+         hk_sampled_image_descriptor_layout(generation);
+      if (!layout.stride || offset + layout.stride > desc->set_sizes[b->set])
          return false;
 
-      const struct hk_sampled_image_descriptor *d =
-         (const struct hk_sampled_image_descriptor *)((const uint8_t *)set->mapped_ptr +
-                                                      offset);
-      if (memcmp(&d->tex, &iview->planes[0].ia, sizeof(d->tex)) != 0 ||
-          d->sw.sampled_heap_index != iview->planes[0].input_heap_index)
+      const uint8_t *record = (const uint8_t *)set->mapped_ptr + offset;
+      const uint8_t *sw = record + layout.sampler;
+      uint32_t index;
+      memcpy(&index, sw + offsetof(struct hk_sampled_image_descriptor_sw,
+                                   sampled_heap_index), sizeof(index));
+      if (index != iview->planes[0].input_heap_index ||
+          memcmp(record + layout.texture, &iview->planes[0].ia,
+                 hk_texture_descriptor_size(generation)) != 0)
          return false;
    }
 
@@ -12328,7 +12348,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
        (has_masked_rt && agx_g18g_word_mrt_mask(in->tib) != 0 &&
         agx_g18g_native_mixed_epilog_mask(in->tib) != 0));
 
-   if (fs && fs->local_read_nir && agx_chip_local_read_tilebuffer(dev->dev.chip) &&
+   if (fs && fs->local_read_nir && hk_local_read_tilebuffer(dev->dev.chip) &&
        !key->epilog.native_spills && !key->epilog.blend.logicop_enable &&
        !key->epilog.blend.alpha_to_coverage &&
        !key->epilog.blend.alpha_to_one && !key->epilog.defer_api_sample_mask &&
@@ -12336,7 +12356,9 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
        !key->prolog.cull_distance_size && key->prolog.api_sample_mask == 0xff &&
        !key->epilog.link.write_z && !key->epilog.link.write_s &&
        !agx_tilebuffer_spills(in->tib) && in->view_mask == 0 &&
-       key->nr_samples_shaded == 0 &&
+       (key->nr_samples_shaded == 0 ||
+        (fs->local_read_key.dev.encoding == AGX_ISA_ENCODING_AGX2 &&
+         (samples == 2 || samples == 4))) &&
        (samples == 1 ||
         ((fs->local_read.ia_mask & ~fs->local_read.ms_mask) == 0 &&
          fs->local_read.uses_sample_shading))) {
