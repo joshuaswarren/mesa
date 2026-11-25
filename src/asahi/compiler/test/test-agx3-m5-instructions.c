@@ -1742,6 +1742,46 @@ int main(void)
       free(part.binary);
       ralloc_free(b.shader);
    }
+   /* G18G single-RT MSAA STORE_OP_STORE + RESOLVE_MODE_AVERAGE_BIT must emit
+    * the paired sample-store + resolve IMGWBLK sequence and re-encode cleanly
+    * to AGX3D rather than dropping the resolve write on the single-store path. */
+   {
+      struct agx_shader_part single = {0}, paired = {0};
+      for (unsigned pair = 0; pair < 2; ++pair) {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "G18G RT0 EOT pair");
+         nir_image_store_block_agx(&b, nir_imm_intN_t(&b, 0, 16),
+            nir_imm_int(&b, 0),
+            nir_trim_vector(&b, nir_load_global_invocation_id(&b, 32), 2),
+            .format = PIPE_FORMAT_R8_UNORM,
+            .image_dim = GLSL_SAMPLER_DIM_2D,
+            .image_array = false, .explicit_coord = true);
+         agx_preprocess_nir(b.shader);
+         struct agx_shader_key key = {
+            .dev.chip = AGX_CHIP_G18G,
+            .dev.encoding = AGX_ISA_ENCODING_AGX3C,
+            .dev.emit_agx3d = true,
+            .no_preamble = true,
+            .g17g_rt0_eot = true,
+            .g17p_rt0_eot_multisample = true,
+            .m5_rt0_eot_store_and_resolve = pair != 0,
+         };
+         agx_g17p_configure_rt0_eot_key(PIPE_FORMAT_R8G8B8A8_UNORM, &key);
+         struct agx_shader_part *out = pair ? &paired : &single;
+         const bool compiled = agx_compile_shader_nir(b.shader, &key, out);
+         ok &= compiled && out->info.binary_size > 0 &&
+               out->info.nr_gprs == 8 && out->info.agx3_staging_known &&
+               out->info.agx3_staging_halfs == 8;
+         ralloc_free(b.shader);
+      }
+      const bool pair_ok = paired.info.binary_size > single.info.binary_size;
+      printf("G18G_RT0_EOT_STORE_AND_RESOLVE_%s single=%u paired=%u\n",
+             pair_ok ? "PASS" : "FAIL", single.info.binary_size,
+             paired.info.binary_size);
+      ok &= pair_ok;
+      free(single.binary);
+      free(paired.binary);
+   }
    {
       nir_builder b = nir_builder_init_simple_shader(
          MESA_SHADER_COMPUTE, &agx_nir_options, "M5 robust UBO end offset");

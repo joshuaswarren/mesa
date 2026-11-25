@@ -585,7 +585,8 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
       m5_stores += key->op[rt] == AGX_EOT_STORE;
    const bool m5_layered_pair = agx_chip_hal300_path(cache->dev->chip) &&
       key->tib.layered && key->m5_store_and_resolve;
-   if ((agx_chip_g17_m5(cache->dev->chip) || (g18g && key->mixed_mrt)) &&
+   if ((agx_chip_g17_m5(cache->dev->chip) ||
+        (g18g && (key->mixed_mrt || m5_layered_pair))) &&
        m5_stores &&
        (m5_stores > 1 || key->op[0] != AGX_EOT_STORE || m5_layered_pair)) {
       if (agx_tilebuffer_spills(&key->tib))
