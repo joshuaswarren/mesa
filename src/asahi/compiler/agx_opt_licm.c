@@ -66,6 +66,22 @@ plain_use(const agx_instr *I)
    }
 }
 
+/* M5 unpacked 2D/3D scalar LOD/bias samples require their half-float source to
+ * be discarded at the sample (agx3_pack_binary.c). Hoisting a loop-local copy
+ * into the preheader makes it live across the back-edge and strips discard. */
+static bool
+m5_unpacked_scalar_lod(const agx_context *ctx, const agx_instr *I)
+{
+   return ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !agx_is_g18g(&ctx->key->dev) &&
+          I->op == AGX_OPCODE_TEXTURE_SAMPLE && !I->memory_is_packed &&
+          (I->dim == AGX_DIM_2D || I->dim == AGX_DIM_3D) &&
+          (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
+           I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
+          I->src[1].type == AGX_INDEX_NORMAL &&
+          I->src[1].size == AGX_SIZE_16;
+}
+
 static bool
 hoistable(const agx_context *ctx, const agx_instr *I, const BITSET_WORD *pinned)
 {
@@ -164,6 +180,8 @@ agx_opt_licm(agx_context *ctx, unsigned max_demand, unsigned file_regs)
       if (!plain_use(I)) {
          agx_foreach_ssa_src(I, s)
             BITSET_SET(pinned, I->src[s].value);
+      } else if (m5_unpacked_scalar_lod(ctx, I)) {
+         BITSET_SET(pinned, I->src[1].value);
       }
    }
    struct util_dynarray hoisted, moves, rewrites, merged;
