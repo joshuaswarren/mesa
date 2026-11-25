@@ -1544,6 +1544,43 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
    return vk_common_QueueBindSparse(_queue, bindInfoCount, pBindInfo, fence);
 }
 
+/* Wait directly on the queue's DRM timeline syncobj at its latest submitted
+ * point instead of creating a temporary binary syncobj, issuing an empty
+ * transfer submit, waiting on the copy, and destroying it. Threaded,
+ * deferred, and emulated queues fall back to the common implementation. */
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_QueueWaitIdle(VkQueue _queue)
+{
+   VK_FROM_HANDLE(vk_queue, vk_queue, _queue);
+   struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
+   struct hk_device *dev = hk_queue_device(queue);
+
+   if (vk_device_is_lost(&dev->vk))
+      return VK_ERROR_DEVICE_LOST;
+
+   if (queue->vk.submit.mode != VK_QUEUE_SUBMIT_MODE_IMMEDIATE ||
+       vk_queue_is_emulated(&queue->vk) || !queue->drm.syncobj)
+      return vk_common_QueueWaitIdle(_queue);
+
+   uint64_t target = queue->drm.timeline_value;
+   if (target > p_atomic_read(&queue->drm.signalled_value)) {
+      int err;
+      do {
+         err = drmSyncobjTimelineWait(
+            dev->dev.fd, &queue->drm.syncobj, &target, 1, INT64_MAX,
+            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+      } while (err == -EINTR || (err < 0 && errno == EINTR));
+
+      if (err)
+         return vk_queue_set_lost(
+            &queue->vk, "DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT failed: %m");
+
+      hk_queue_note_signalled(queue, target);
+   }
+
+   return vk_device_check_status(&dev->vk);
+}
+
 /* Sibling kernel queues (hk_queue::sib) on G17P: kernel queues per VkQueue,
  * the primary included. macOS spreads one Metal queue over up to three
  * firmware compute queues of one context and runs two kicks at once

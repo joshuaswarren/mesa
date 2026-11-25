@@ -321,8 +321,25 @@ drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points,
    (void)fd;
    (void)first_signaled;
    CHECK(num_handles == 1);
-   CHECK(flags == 0);
    CHECK(timeout_nsec > 0);
+   if (handles[0] == 50 || handles[0] == 60) {
+      CHECK(flags == DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT);
+      CHECK(timeout_nsec == INT64_MAX);
+      ++mock_wait_calls;
+      if (handles[0] == 50) {
+         if (mock_eintr_remaining > 0) {
+            --mock_eintr_remaining;
+            return -EINTR;
+         }
+         CHECK(mock_waited_count < ARRAY_SIZE(mock_waited_handles));
+         mock_waited_handles[mock_waited_count] = handles[0];
+         mock_waited_points[mock_waited_count++] = points[0];
+         return 0;
+      }
+      errno = EIO;
+      return -EIO;
+   }
+   CHECK(flags == 0);
    if (mock_wait_calls == 0)
       mock_last_timeout = timeout_nsec;
    else
@@ -383,6 +400,59 @@ test_wait_submitted(void)
    printf("wait_submitted: PASS\n");
 }
 
+static void
+test_queue_wait_idle(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
+   CHECK(dev && pdev);
+   dev->dev.fd = -1;
+   vk_object_base_init(&dev->vk, &dev->vk.base, VK_OBJECT_TYPE_DEVICE);
+   dev->vk.physical = &pdev->vk;
+   dev->vk._lost.reported = true;
+
+   struct hk_queue queue = {0};
+   vk_object_base_init(&dev->vk, &queue.vk.base, VK_OBJECT_TYPE_QUEUE);
+   queue.vk.submit.mode = VK_QUEUE_SUBMIT_MODE_IMMEDIATE;
+   queue.drm.syncobj = 50;
+   queue.drm.timeline_value = 1;
+   queue.drm.signalled_value = 1;
+
+   mock_wait_calls = 0;
+   mock_eintr_remaining = 2;
+   mock_waited_count = 0;
+
+   /* Already-signalled idle queue takes zero wait ioctls. */
+   CHECK(hk_QueueWaitIdle(vk_queue_to_handle(&queue.vk)) == VK_SUCCESS);
+   CHECK(mock_wait_calls == 0);
+
+   /* Pending timeline point waits once (retrying -EINTR) and advances
+    * signalled_value so a subsequent wait needs zero ioctls. */
+   queue.drm.timeline_value = 5;
+   CHECK(hk_QueueWaitIdle(vk_queue_to_handle(&queue.vk)) == VK_SUCCESS);
+   CHECK(mock_wait_calls == 3);
+   CHECK(mock_eintr_remaining == 0);
+   CHECK(mock_waited_count == 1 && mock_waited_handles[0] == 50 &&
+         mock_waited_points[0] == 5);
+   CHECK(p_atomic_read(&queue.drm.signalled_value) == 5);
+
+   CHECK(hk_QueueWaitIdle(vk_queue_to_handle(&queue.vk)) == VK_SUCCESS);
+   CHECK(mock_wait_calls == 3);
+
+   /* Wait failure loses the device, and later calls short-circuit. */
+   queue.drm.syncobj = 60;
+   queue.drm.timeline_value = 6;
+   CHECK(hk_QueueWaitIdle(vk_queue_to_handle(&queue.vk)) == VK_ERROR_DEVICE_LOST);
+   CHECK(mock_wait_calls == 4);
+   CHECK(vk_device_is_lost(&dev->vk));
+   CHECK(hk_QueueWaitIdle(vk_queue_to_handle(&queue.vk)) == VK_ERROR_DEVICE_LOST);
+   CHECK(mock_wait_calls == 4);
+
+   free(pdev);
+   free(dev);
+   printf("queue_wait_idle: PASS\n");
+}
+
 int
 main(void)
 {
@@ -395,6 +465,7 @@ main(void)
       run(chips[c], 3, true);
    }
    test_wait_submitted();
+   test_queue_wait_idle();
    cnd_destroy(&cond);
    mtx_destroy(&lock);
    return 0;
