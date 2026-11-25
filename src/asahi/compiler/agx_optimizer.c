@@ -2395,7 +2395,7 @@ agx_compute_reach_avoiding(agx_context *ctx, agx_block *start,
                            agx_block **queue)
 {
    memset(reach, 0, BITSET_WORDS(ctx->num_blocks) * sizeof(*reach));
-   if (!start || start == avoid)
+   if (!start || start == avoid || start->index >= ctx->num_blocks)
       return;
 
    unsigned head = 0, tail = 0;
@@ -2414,15 +2414,39 @@ agx_compute_reach_avoiding(agx_context *ctx, agx_block *start,
    }
 }
 
+/*
+ * Move I to the start of dest's body: after the preload, else_icmp/else_fcmp
+ * and phi instructions that agx_validate_block_form() requires at the head of
+ * a block. An else block must start with its else_* so the sunk instruction
+ * runs under the else execution mask.
+ */
 static void
 agx_sink_instr_to_block_head(agx_instr *I, agx_block *dest)
 {
    struct list_head *after = &dest->instructions;
-   agx_foreach_phi_in_block(dest, phi) {
-      after = &phi->link;
+   agx_foreach_instr_in_block(dest, head) {
+      if (head->op != AGX_OPCODE_PRELOAD && head->op != AGX_OPCODE_ELSE_ICMP &&
+          head->op != AGX_OPCODE_ELSE_FCMP && head->op != AGX_OPCODE_PHI)
+         break;
+      after = &head->link;
    }
    list_del(&I->link);
    list_add(&I->link, after);
+}
+
+/*
+ * A sunk compare must read only SSA values, uniforms and immediates. A
+ * pre-coloured register or memory operand could be overwritten between the
+ * original position and the head of the successor.
+ */
+static bool
+agx_cold_cmp_srcs_sinkable(const agx_instr *I)
+{
+   agx_foreach_src(I, s) {
+      if (I->src[s].type == AGX_INDEX_REGISTER || I->src[s].memory)
+         return false;
+   }
+   return true;
 }
 
 /*
@@ -2448,7 +2472,7 @@ agx_opt_sink_cold_cmp(agx_context *ctx)
          if ((I->op != AGX_OPCODE_FCMP && I->op != AGX_OPCODE_ICMP) ||
              I->nr_dests != 1 || I->saturate ||
              I->dest[0].type != AGX_INDEX_NORMAL || I->dest[0].memory ||
-             I->dest[0].value >= alloc)
+             I->dest[0].value >= alloc || !agx_cold_cmp_srcs_sinkable(I))
             continue;
          cand_def_block[I->dest[0].value] = block;
          any_cand = true;

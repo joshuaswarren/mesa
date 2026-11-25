@@ -2378,10 +2378,16 @@ TEST_F(Optimizer, SinkColdCompareIntoSinglePredSucc)
       agx_block_add_successor(nested, merge);
 
       b->cursor = agx_after_block(entry);
-      agx_index cold_direct = agx_fcmp(b, wx, wy, AGX_FCOND_GE, false);
-      agx_index cold_nested = agx_icmp(b, wx, wz, AGX_ICOND_UEQ, true);
-      agx_index hot_use = agx_fcmp(b, wy, wz, AGX_FCOND_LT, false);
-      agx_index merge_use = agx_fcmp(b, wx, wz, AGX_FCOND_GT, false);
+      agx_index x = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index y = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index z = agx_temp(b->shader, AGX_SIZE_32);
+      agx_mov_to(b, x, wx);
+      agx_mov_to(b, y, wy);
+      agx_mov_to(b, z, wz);
+      agx_index cold_direct = agx_fcmp(b, x, y, AGX_FCOND_GE, false);
+      agx_index cold_nested = agx_icmp(b, x, z, AGX_ICOND_UEQ, true);
+      agx_index hot_use = agx_fcmp(b, y, z, AGX_FCOND_LT, false);
+      agx_index merge_use = agx_fcmp(b, x, z, AGX_FCOND_GT, false);
       agx_unit_test(b, hot_use);
       agx_if_icmp(b, wx, agx_zero(), 1, AGX_ICOND_UEQ, true, merge);
 
@@ -2416,7 +2422,11 @@ TEST_F(Optimizer, SinkColdCompareIntoSinglePredSucc)
       agx_block_add_successor(loop_hdr, exit_blk);
 
       b->cursor = agx_after_block(entry);
-      agx_index cmp = agx_fcmp(b, wx, wy, AGX_FCOND_GE, false);
+      agx_index x = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index y = agx_temp(b->shader, AGX_SIZE_32);
+      agx_mov_to(b, x, wx);
+      agx_mov_to(b, y, wy);
+      agx_index cmp = agx_fcmp(b, x, y, AGX_FCOND_GE, false);
       agx_if_icmp(b, wx, agx_zero(), 1, AGX_ICOND_UEQ, true, exit_blk);
 
       b->cursor = agx_after_block(loop_hdr);
@@ -2426,5 +2436,103 @@ TEST_F(Optimizer, SinkColdCompareIntoSinglePredSucc)
 
       EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_FCMP), 1u);
       EXPECT_EQ(count_ops_in_block(loop_hdr, AGX_OPCODE_FCMP), 0u);
+   }
+
+   /* Negative: a compare reading a pre-coloured register must not sink, since
+    * the register could be overwritten before the successor runs. */
+   {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *then_blk = agx_test_block(b->shader);
+      agx_block *merge = agx_test_block(b->shader);
+
+      agx_block_add_successor(entry, then_blk);
+      agx_block_add_successor(entry, merge);
+      agx_block_add_successor(then_blk, merge);
+
+      b->cursor = agx_after_block(entry);
+      agx_index cmp = agx_fcmp(b, wx, wy, AGX_FCOND_GE, false);
+      agx_if_icmp(b, wz, agx_zero(), 1, AGX_ICOND_UEQ, true, merge);
+
+      b->cursor = agx_after_block(then_blk);
+      agx_unit_test(b, cmp);
+
+      agx_opt_sink_cold_cmp(b->shader);
+
+      EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_FCMP), 1u);
+      EXPECT_EQ(count_ops_in_block(then_blk, AGX_OPCODE_FCMP), 0u);
+   }
+}
+
+TEST_F(Optimizer, SinkColdCompareIntoElseBlockAfterElse)
+{
+   /* An else block has one predecessor and no phis but starts with
+    * else_fcmp/else_icmp. Compares used only in the else arm must sink after
+    * that instruction so they run under the else execution mask and the block
+    * keeps the form agx_validate_block_form() requires. */
+   for (bool else_icmp : {false, true}) {
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G17S;
+
+      agx_builder *b = agx_test_builder(mem_ctx);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *then_blk = agx_test_block(b->shader);
+      agx_block *else_blk = agx_test_block(b->shader);
+      agx_block *merge = agx_test_block(b->shader);
+
+      agx_block_add_successor(entry, then_blk);
+      agx_block_add_successor(entry, else_blk);
+      agx_block_add_successor(then_blk, merge);
+      agx_block_add_successor(else_blk, merge);
+
+      b->cursor = agx_after_block(entry);
+      agx_index x = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index y = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index f = agx_temp(b->shader, AGX_SIZE_16);
+      agx_mov_to(b, x, wx);
+      agx_mov_to(b, y, wy);
+      agx_mov_to(b, f, hz);
+      agx_index cold_f = agx_fcmp(b, x, y, AGX_FCOND_GE, false);
+      agx_index cold_i = agx_icmp(b, x, y, AGX_ICOND_UEQ, true);
+      agx_if_icmp(b, f, agx_zero(), 1, AGX_ICOND_UEQ, true, else_blk);
+
+      b->cursor = agx_after_block(then_blk);
+      agx_unit_test(b, f);
+
+      b->cursor = agx_after_block(else_blk);
+      agx_instr *else_ =
+         else_icmp
+            ? agx_else_icmp(b, agx_zero(), agx_zero(), 1, AGX_ICOND_UEQ, false,
+                            else_blk)
+            : agx_else_fcmp(b, agx_zero(), agx_zero(), 1, AGX_FCOND_EQ, false,
+                            else_blk);
+      agx_unit_test(b, cold_f);
+      agx_unit_test(b, cold_i);
+
+      b->cursor = agx_after_block(merge);
+      agx_pop_exec(b, 1);
+
+      agx_opt_sink_cold_cmp(b->shader);
+
+      EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_FCMP), 0u);
+      EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_ICMP), 0u);
+      EXPECT_EQ(count_ops_in_block(else_blk, AGX_OPCODE_FCMP), 1u);
+      EXPECT_EQ(count_ops_in_block(else_blk, AGX_OPCODE_ICMP), 1u);
+
+      /* else_* stays first, both compares follow it before their uses. */
+      agx_instr *first = agx_first_instr(else_blk);
+      ASSERT_EQ(first, else_);
+      agx_instr *second = list_entry(first->link.next, agx_instr, link);
+      agx_instr *third = list_entry(second->link.next, agx_instr, link);
+      EXPECT_TRUE(second->op == AGX_OPCODE_FCMP ||
+                  second->op == AGX_OPCODE_ICMP);
+      EXPECT_TRUE(third->op == AGX_OPCODE_FCMP || third->op == AGX_OPCODE_ICMP);
+      EXPECT_NE(second->op, third->op);
+
+      /* Assert builds check the whole block form, including the else head. */
+      agx_validate(b->shader, "agx_opt_sink_cold_cmp else block");
    }
 }
