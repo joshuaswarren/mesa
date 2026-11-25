@@ -769,6 +769,11 @@ extern "C" {
 uint64_t agx_gather_texcoords(nir_shader *nir);
 
 void agx_preprocess_nir(nir_shader *nir);
+/* Generic preprocessing with an explicit ISA encoding so frontends that keep
+ * the generic lowering mode (such as Gallium on AGX3B) still inherit AGX3B's
+ * early branch-preservation and conditional-load-sinking policy. */
+void agx_preprocess_nir_for_encoding(nir_shader *nir,
+                                     enum agx_isa_encoding encoding);
 void agx_preprocess_nir_g17p(nir_shader *nir);
 /* For any native AGX3 chip (agx_chip_native_agx3); passes validated on G17P
  * alone check chip. */

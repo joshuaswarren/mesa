@@ -25,6 +25,7 @@ enum hk_compute_pair_alt_kind {
    HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 = 2,
    HK_COMPUTE_PAIR_ALT_GEMM_CMAT64 = 3,
    HK_COMPUTE_PAIR_ALT_GEMM_CMAT16 = 4,
+   HK_COMPUTE_PAIR_ALT_LINEAR_FADD = 5,
 };
 
 struct hk_compute_pair_variant {

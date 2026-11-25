@@ -13,6 +13,7 @@
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "hk_identity_copy4.h"
+#include "hk_nir_match_pointwise_clamp.h"
 #include "hk_nir_eval_test.h"
 #include "hk_nir_wgid.h"
 
@@ -1034,6 +1035,83 @@ test_permuted_layout_im2col_bit_exact(void)
 }
 
 static void
+test_fadd_dual_bit_exact(void)
+{
+   struct hk_identity_copy4 info = {0};
+   nir_shader *copy_orig = build_linear_shader(
+      HK_IDENTITY_COPY4_LINEAR_COPY, glsl_float_type(),
+      ACCESS_NON_WRITEABLE, false, false, 0, 0, 0, 4);
+   HK_EVAL_CHECK(hk_nir_copy_identity4_fadd_dual(copy_orig, &info) == NULL);
+   ralloc_free(copy_orig);
+
+   nir_shader *orig = build_linear_shader(
+      HK_IDENTITY_COPY4_LINEAR_FADD, glsl_float_type(),
+      ACCESS_NON_WRITEABLE, false, false, 0, 0, 0, 4);
+   nir_shader *dual = hk_nir_copy_identity4_fadd_dual(orig, &info);
+   HK_EVAL_CHECK(dual != NULL);
+   HK_EVAL_CHECK(info.kind == HK_IDENTITY_COPY4_LINEAR_FADD);
+   HK_EVAL_CHECK(info.src_count == 2);
+
+   const uint32_t dual_off = hk_dual_write_push_offset(info.push_bytes);
+   const uint32_t counts[] = {16, 2048, 2064, 4112};
+   for (unsigned ci = 0; ci < ARRAY_SIZE(counts); ++ci) {
+      const uint32_t n = counts[ci];
+      float *a = malloc(n * sizeof(float));
+      float *b = malloc(n * sizeof(float));
+      float *ref = calloc(n, sizeof(float));
+      float *dst1 = calloc(n, sizeof(float));
+      float *dst2 = calloc(n, sizeof(float));
+      for (uint32_t i = 0; i < n; ++i) {
+         a[i] = (float)((int32_t)(i * 17u % 97u) - 48) * 0.25f;
+         b[i] = (float)((int32_t)(i * 31u % 89u) - 44) * 0.125f;
+      }
+
+      uint8_t push[32] = {0};
+      memcpy(push, &n, sizeof(n));
+      uint64_t dst2_va = hk_eval_make_vaddr(3, 0);
+      struct hk_dual_copy_push dp = {
+         .dst2_va_lo = (uint32_t)dst2_va,
+         .dst2_va_hi = (uint32_t)(dst2_va >> 32),
+      };
+      memcpy(push + dual_off, &dp, sizeof(dp));
+
+      struct hk_eval_ssbo s0[3] = {
+         {0, 0, a, n * 4}, {0, 1, b, n * 4}, {0, 2, ref, n * 4},
+      };
+      struct hk_eval_ssbo s1[4] = {
+         {0, 0, a, n * 4}, {0, 1, b, n * 4}, {0, 2, dst1, n * 4},
+         {99, 0, dst2, n * 4},
+      };
+      uint32_t g0[3] = {DIV_ROUND_UP(n, 64), 1, 1};
+      uint32_t g1[3] = {
+         DIV_ROUND_UP(n / 4, dual->info.workgroup_size[0] * 4), 1, 1,
+      };
+      hk_eval_dispatch(orig, g0, s0, 3, push, 4);
+      hk_eval_dispatch(dual, g1, s1, 4, push, dual_off + sizeof(dp));
+      HK_EVAL_CHECK(memcmp(ref, dst1, n * 4) == 0);
+      HK_EVAL_CHECK(memcmp(ref, dst2, n * 4) == 0);
+
+      /* Also test exact in-place src0 == dst1 with disjoint dst2. */
+      float *inplace = malloc(n * sizeof(float));
+      memcpy(inplace, a, n * 4);
+      memset(dst2, 0, n * 4);
+      struct hk_eval_ssbo s2[4] = {
+         {0, 0, inplace, n * 4}, {0, 1, b, n * 4}, {0, 2, inplace, n * 4},
+         {99, 0, dst2, n * 4},
+      };
+      hk_eval_dispatch(dual, g1, s2, 4, push, dual_off + sizeof(dp));
+      HK_EVAL_CHECK(memcmp(ref, inplace, n * 4) == 0);
+      HK_EVAL_CHECK(memcmp(ref, dst2, n * 4) == 0);
+
+      free(inplace);
+      free(a); free(b); free(ref); free(dst1); free(dst2);
+   }
+
+   ralloc_free(dual);
+   ralloc_free(orig);
+}
+
+static void
 rewrite_gid_axis_to_wgid(nir_shader *s, unsigned target_axis, unsigned wg_axis,
                          bool add_base, unsigned base_axis, uint32_t base_scale)
 {
@@ -1336,6 +1414,7 @@ main(void)
    glsl_type_singleton_init_or_ref();
 
    test_linear_bit_exact();
+   test_fadd_dual_bit_exact();
    test_pad4d_bit_exact();
    test_im2col_bit_exact();
    test_borderless_im2col_bit_exact();

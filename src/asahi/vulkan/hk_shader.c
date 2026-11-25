@@ -247,7 +247,7 @@ hk_get_spirv_options(struct vk_physical_device *vk_pdev,
    return (struct spirv_to_nir_options){
       .ssbo_addr_format = hk_buffer_addr_format(
          rs->storage_buffers, rs->null_storage_buffer_descriptor,
-         agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip)),
+         hk_ssbo_addr_has_map(((struct hk_physical_device *)vk_pdev)->dev.chip)),
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
       .ubo_addr_format = hk_ubo_addr_format(rs->uniform_buffers),
       .shared_addr_format = nir_address_format_32bit_offset,
@@ -619,7 +619,7 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
          agx_preprocess_nir_m5(nir);
    }
    else
-      agx_preprocess_nir(nir);
+      agx_preprocess_nir_for_encoding(nir, agx_chip_isa_encoding(pre_chip));
 
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, nir_lower_var_copies);
@@ -3875,7 +3875,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
             hk_buffer_addr_format(rs->storage_buffers,
                                   rs->null_storage_buffer_descriptor,
-                                  agx_chip_g17_m5(dev->dev.chip)));
+                                  hk_ssbo_addr_has_map(dev->dev.chip)));
    if (rs->uniform_buffers ==
        VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT) {
       uint8_t static_set_mask =
@@ -4154,7 +4154,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       else if (agx_chip_g17_m5(dev->dev.chip))
          agx_preprocess_nir_m5(nir);
       else
-         agx_preprocess_nir(nir);
+         agx_preprocess_nir_for_encoding(nir, agx_chip_isa_encoding(dev->dev.chip));
    }
 
    nir_opt_peephole_select_options peephole_select_options = {
@@ -8634,7 +8634,7 @@ hk_maybe_build_byte_stencil(struct hk_device *dev, const nir_shader *nir,
    const nir_address_format ssbo_addr_format = hk_buffer_addr_format(
       info->robustness->storage_buffers,
       info->robustness->null_storage_buffer_descriptor,
-      agx_chip_g17_m5(dev->dev.chip));
+      hk_ssbo_addr_has_map(dev->dev.chip));
    out->tiled_nir = hk_nir_build_tiled_byte_stencil(NULL, nir, &out->plan,
                                                     ssbo_addr_format);
    return out->tiled_nir != NULL;
@@ -9430,9 +9430,11 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                           "Gen1 native GS ray query lowering failed");
       }
 
-      agx_preprocess_nir(count);
-      agx_preprocess_nir(rast);
-      agx_preprocess_nir(pre_gs);
+      const enum agx_isa_encoding gs_encoding =
+         agx_chip_isa_encoding(dev->dev.chip);
+      agx_preprocess_nir_for_encoding(count, gs_encoding);
+      agx_preprocess_nir_for_encoding(rast, gs_encoding);
+      agx_preprocess_nir_for_encoding(pre_gs, gs_encoding);
 
       /* The raster variant is a hardware vertex shader. On M5, match the
        * ordinary VS/TES default when the geometry producer has no point-size
@@ -10228,6 +10230,29 @@ hk_compute_pair_producer_deserialize(struct hk_device *dev,
    return p;
 }
 
+static struct hk_compute_pair_producer *
+hk_compute_pair_fadd_producer_create(struct hk_device *dev,
+                                     struct hk_shader *fadd_dual,
+                                     uint32_t push_bytes)
+{
+   struct hk_compute_pair_producer *p = calloc(1, sizeof(*p));
+   if (!p)
+      return NULL;
+   pipe_reference_init(&p->ref, 1);
+   p->destroy = hk_compute_pair_producer_destroy;
+   p->dev = dev;
+   simple_mtx_init(&p->lock, mtx_plain);
+   p->info.role = HK_COMPUTE_PAIR_FADD;
+   p->info.fadd_push_bytes = push_bytes;
+   p->variants[0] = (struct hk_compute_pair_variant){
+      .shader = fadd_dual,
+      .alt_kind = HK_COMPUTE_PAIR_ALT_LINEAR_FADD,
+      .dual_write = HK_COMPUTE_PAIR_DUAL_COPY,
+   };
+   p->variant_count = 1;
+   return p;
+}
+
 struct hk_shader *
 hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
                                      struct hk_compute_pair_producer *prod,
@@ -10235,7 +10260,15 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
                                      enum hk_compute_pair_alt_kind alt_kind,
                                      enum hk_compute_pair_dual_write dual_write)
 {
-   if (!dev || !prod || !prod->nir)
+   if (!dev || !prod)
+      return NULL;
+   if (prod->info.role == HK_COMPUTE_PAIR_FADD) {
+      if (epilogue || alt_kind != HK_COMPUTE_PAIR_ALT_LINEAR_FADD ||
+          dual_write != HK_COMPUTE_PAIR_DUAL_COPY)
+         return NULL;
+      return prod->variant_count ? prod->variants[0].shader : NULL;
+   }
+   if (!prod->nir)
       return NULL;
    if (!epilogue && dual_write == HK_COMPUTE_PAIR_DUAL_NONE)
       return NULL;
@@ -10330,9 +10363,11 @@ hk_compile_identity_copy4(struct hk_device *dev,
                           const VkAllocationCallbacks *allocator,
                           enum hk_feature_key features,
                           struct hk_identity_copy4 *path_out,
-                          struct hk_shader **im2col_vec4_out)
+                          struct hk_shader **im2col_vec4_out,
+                          struct hk_shader **fadd_dual_out)
 {
    *im2col_vec4_out = NULL;
+   *fadd_dual_out = NULL;
    if (!agx_chip_native_or_m5(dev->dev.chip) ||
        info->stage != MESA_SHADER_COMPUTE || info->nir->info.internal ||
        hk_set_layouts_use_buffers(info->set_layout_count, info->set_layouts))
@@ -10350,11 +10385,19 @@ hk_compile_identity_copy4(struct hk_device *dev,
    struct hk_identity_copy4 path = {0};
    nir_shader *copy = hk_nir_copy_identity4(candidate, &path);
    nir_shader *im2col4 = NULL;
+   nir_shader *fadd_dual_nir = NULL;
    if (copy && path.kind == HK_IDENTITY_COPY4_IM2COL_1X1 && path.im2col_vec4_ok)
       im2col4 = hk_nir_im2col_vec4(candidate);
+   if (copy && path.kind == HK_IDENTITY_COPY4_LINEAR_FADD &&
+       hk_dual_write_push_offset(path.push_bytes) +
+          sizeof(struct hk_dual_copy_push) <= HK_MAX_PUSH_SIZE) {
+      struct hk_identity_copy4 dual_path = {0};
+      fadd_dual_nir = hk_nir_copy_identity4_fadd_dual(candidate, &dual_path);
+   }
    ralloc_free(candidate);
    if (!copy) {
       ralloc_free(im2col4);
+      ralloc_free(fadd_dual_nir);
       return NULL;
    }
 
@@ -10362,12 +10405,16 @@ hk_compile_identity_copy4(struct hk_device *dev,
       hk_compile_compute_alt_nir(dev, info, allocator, features, copy);
    if (!alternate) {
       ralloc_free(im2col4);
+      ralloc_free(fadd_dual_nir);
       return NULL;
    }
 
    if (im2col4)
       *im2col_vec4_out =
          hk_compile_compute_alt_nir(dev, info, allocator, features, im2col4);
+   if (fadd_dual_nir)
+      *fadd_dual_out =
+         hk_compile_compute_alt_nir(dev, info, allocator, features, fadd_dual_nir);
 
    *path_out = path;
    return alternate;
@@ -10391,6 +10438,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    nir_shader *gemm_cmat64_nir = NULL;
    struct hk_shader *identity_copy4 = NULL;
    struct hk_shader *im2col_vec4 = NULL;
+   struct hk_shader *fadd_dual = NULL;
    struct hk_identity_copy4 identity_copy4_info = {0};
    nir_shader *shaders[shader_count];
    nir_shader *lr_nirs[shader_count];
@@ -10503,7 +10551,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       if (shader_count == 1)
          identity_copy4 = hk_compile_identity_copy4(dev, info, pAllocator,
                                                     hk_features, &identity_copy4_info,
-                                                    &im2col_vec4);
+                                                    &im2col_vec4, &fadd_dual);
 
       if (shader_count == 1 && info->stage == MESA_SHADER_COMPUTE &&
           !nir->info.internal && agx_chip_native_or_m5(dev->dev.chip)) {
@@ -10761,6 +10809,10 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
             hk_shader_destroy(dev, im2col_vec4, true);
             free(im2col_vec4);
          }
+         if (fadd_dual) {
+            hk_shader_destroy(dev, fadd_dual, true);
+            free(fadd_dual);
+         }
          /* Clean up all the shaders before this point */
          for (uint32_t j = 0; j < i; j++)
             hk_api_shader_destroy(&dev->vk, shaders_out[j], pAllocator);
@@ -10786,6 +10838,19 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       obj->identity_copy4 = identity_copy4;
       obj->identity_copy4_info = identity_copy4_info;
       obj->im2col_vec4 = im2col_vec4;
+      if (fadd_dual && !has_compute_pair) {
+         obj->compute_pair_producer = hk_compute_pair_fadd_producer_create(
+            dev, fadd_dual, identity_copy4_info.push_bytes);
+         if (!obj->compute_pair_producer) {
+            hk_shader_destroy(dev, fadd_dual, true);
+            free(fadd_dual);
+         }
+         fadd_dual = NULL;
+      }
+   }
+   if (fadd_dual) {
+      hk_shader_destroy(dev, fadd_dual, true);
+      free(fadd_dual);
    }
 
    if (has_compute_pair) {
@@ -11237,7 +11302,8 @@ hk_compute_pair_info_deserialize(struct blob_reader *blob,
 
 static void
 hk_identity_copy4_serialize(struct blob *blob,
-                            const struct hk_identity_copy4 *info)
+                            const struct hk_identity_copy4 *info,
+                            bool has_fadd_dual)
 {
    blob_write_uint8(blob, info->kind);
    blob_write_uint8(blob, info->src_count);
@@ -11271,12 +11337,14 @@ hk_identity_copy4_serialize(struct blob *blob,
       blob_write_uint32(blob, info->pad_idx[i]);
    for (unsigned i = 0; i < 3; ++i)
       blob_write_uint16(blob, info->local[i]);
-   blob_write_uint8(blob, info->im2col_vec4_ok ? 1 : 0);
+   blob_write_uint8(blob, (info->im2col_vec4_ok ? 1 : 0) |
+                             (has_fadd_dual ? 2 : 0));
 }
 
 static void
 hk_identity_copy4_deserialize(struct blob_reader *blob,
-                              struct hk_identity_copy4 *info)
+                              struct hk_identity_copy4 *info,
+                              bool *has_fadd_dual_out)
 {
    *info = (struct hk_identity_copy4){0};
    info->kind = blob_read_uint8(blob);
@@ -11311,7 +11379,9 @@ hk_identity_copy4_deserialize(struct blob_reader *blob,
       info->pad_idx[i] = blob_read_uint32(blob);
    for (unsigned i = 0; i < 3; ++i)
       info->local[i] = blob_read_uint16(blob);
-   info->im2col_vec4_ok = blob_read_uint8(blob) != 0;
+   const uint8_t flags = blob_read_uint8(blob);
+   info->im2col_vec4_ok = (flags & 1) != 0;
+   *has_fadd_dual_out = (flags & 2) != 0;
 }
 
 static VkResult
@@ -11474,9 +11544,15 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
       }
    }
 
+   bool has_fadd_dual = false;
    if (has_identity_copy4) {
-      hk_identity_copy4_deserialize(blob, &obj->identity_copy4_info);
-      if (blob->overrun || !hk_identity_copy4_supported_local(obj->identity_copy4_info.local)) {
+      hk_identity_copy4_deserialize(blob, &obj->identity_copy4_info,
+                                    &has_fadd_dual);
+      if (blob->overrun ||
+          !hk_identity_copy4_supported_local(obj->identity_copy4_info.local) ||
+          (has_fadd_dual &&
+           (has_compute_pair ||
+            obj->identity_copy4_info.kind != HK_IDENTITY_COPY4_LINEAR_FADD))) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       }
@@ -11506,6 +11582,24 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
       if (result != VK_SUCCESS) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return result;
+      }
+   }
+
+   if (has_fadd_dual) {
+      struct hk_shader *fadd_dual = NULL;
+      VkResult result = hk_deserialize_optional_compute_alt(
+         dev, blob, &fadd_dual);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return result;
+      }
+      obj->compute_pair_producer = hk_compute_pair_fadd_producer_create(
+         dev, fadd_dual, obj->identity_copy4_info.push_bytes);
+      if (!obj->compute_pair_producer) {
+         hk_shader_destroy(dev, fadd_dual, true);
+         free(fadd_dual);
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       }
    }
 
@@ -12212,8 +12306,17 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
       if (!hk_write_compute_pair_producer(blob, obj->compute_pair_producer))
          return false;
    }
+   struct hk_shader *fadd_dual =
+      (obj->identity_copy4 &&
+       obj->identity_copy4_info.kind == HK_IDENTITY_COPY4_LINEAR_FADD &&
+       obj->compute_pair_producer &&
+       obj->compute_pair_producer->info.role == HK_COMPUTE_PAIR_FADD &&
+       obj->compute_pair_producer->variant_count == 1)
+         ? obj->compute_pair_producer->variants[0].shader
+         : NULL;
    if (obj->identity_copy4)
-      hk_identity_copy4_serialize(blob, &obj->identity_copy4_info);
+      hk_identity_copy4_serialize(blob, &obj->identity_copy4_info,
+                                  fadd_dual != NULL);
 
    hk_foreach_variant(obj, shader) {
       const unsigned i = shader - obj->variants;
@@ -12264,8 +12367,9 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
       }
    }
 
-   const struct hk_shader *compute_alts[6] = {
+   const struct hk_shader *compute_alts[7] = {
       obj->identity_copy4,
+      fadd_dual,
       obj->im2col_vec4,
       obj->depthwise_vec4,
       obj->gemm_cmat16,

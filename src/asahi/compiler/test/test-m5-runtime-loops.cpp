@@ -576,7 +576,7 @@ TEST(M5FoldOffsets, ByteSiblings)
    }
    nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
    NIR_PASS(_, b.shader, nir_opt_cse);
-   EXPECT_TRUE(agx_nir_fold_m5_offsets(b.shader));
+   EXPECT_TRUE(agx_nir_fold_m5_offsets(b.shader, false));
    nir_validate_shader(b.shader, "byte siblings");
    nir_def *index = NULL;
    for (unsigned k = 0; k < 3; ++k) {
@@ -584,6 +584,39 @@ TEST(M5FoldOffsets, ByteSiblings)
       ASSERT_NE(load, nullptr);
       EXPECT_EQ(nir_intrinsic_base(load) >> AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT, k);
       EXPECT_FALSE(nir_intrinsic_sign_extend(load));
+      if (index)
+         EXPECT_EQ(load->src[1].ssa, index);
+      index = load->src[1].ssa;
+   }
+   ralloc_free(b.shader);
+}
+
+/* Speculative byte siblings are refused without soft faults, and folded with
+ * sign-extended shared indices under soft faults so an executed lane cannot
+ * wrap past 2^32 even if an earlier sibling was hoisted from a guard. */
+TEST(M5FoldOffsets, SoftFaultSpeculativeByteSiblings)
+{
+   nir_builder b = compute_shader("byte-siblings-spec");
+   nir_def *x = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+   nir_def *sum = nir_imm_int(&b, 0);
+   for (unsigned k = 0; k < 3; ++k) {
+      nir_def *v = nir_load_global(
+         &b, 1, 8, buffer_address(&b, nir_iadd_imm(&b, x, k)),
+         .access = (gl_access_qualifier)ACCESS_CAN_SPECULATE, .align_mul = 1);
+      sum = nir_iadd(&b, sum, nir_u2u32(&b, v));
+   }
+   nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+
+   EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader, false));
+   EXPECT_TRUE(agx_nir_fold_m5_offsets(b.shader, true));
+   nir_validate_shader(b.shader, "soft-fault byte siblings");
+   nir_def *index = NULL;
+   for (unsigned k = 0; k < 3; ++k) {
+      nir_intrinsic_instr *load = first_intrinsic(b.shader, nir_intrinsic_load_agx, k);
+      ASSERT_NE(load, nullptr);
+      EXPECT_EQ(nir_intrinsic_base(load) >> AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT, k);
+      EXPECT_TRUE(nir_intrinsic_sign_extend(load));
       if (index)
          EXPECT_EQ(load->src[1].ssa, index);
       index = load->src[1].ssa;
@@ -601,7 +634,7 @@ TEST(M5FoldOffsets, LoneByteKept)
    nir_store_global(&b, nir_u2u32(&b, v), buffer_address(&b, nir_imm_int(&b, 64)),
                     .align_mul = 4);
    NIR_PASS(_, b.shader, nir_opt_cse);
-   EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader));
+   EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader, false));
    ralloc_free(b.shader);
 }
 
@@ -620,7 +653,7 @@ TEST(M5FoldOffsets, PhysicalPointerRefused)
    }
    nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
    NIR_PASS(_, b.shader, nir_opt_cse);
-   EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader));
+   EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader, false));
    ralloc_free(b.shader);
 }
 
@@ -644,7 +677,7 @@ TEST(M5FoldOffsets, PackedUvec4Refused)
             }
             nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
             NIR_PASS(_, b.shader, nir_opt_cse);
-            EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader))
+            EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader, false))
                << "bytes src " << src << " vec_pack " << vec_pack;
             ralloc_free(b.shader);
          }
@@ -657,7 +690,7 @@ TEST(M5FoldOffsets, PackedUvec4Refused)
             nir_def *v = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
             nir_store_global(&b, v, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
             NIR_PASS(_, b.shader, nir_opt_cse);
-            EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader))
+            EXPECT_FALSE(agx_nir_fold_m5_offsets(b.shader, false))
                << "array src " << src << " vec_pack " << vec_pack;
             ralloc_free(b.shader);
          }
@@ -675,7 +708,7 @@ TEST(M5FoldOffsets, ArrayElement)
                                 .align_mul = 4);
    nir_store_global(&b, v, buffer_address(&b, nir_imm_int(&b, 64)), .align_mul = 4);
    NIR_PASS(_, b.shader, nir_opt_cse);
-   EXPECT_TRUE(agx_nir_fold_m5_offsets(b.shader));
+   EXPECT_TRUE(agx_nir_fold_m5_offsets(b.shader, false));
    nir_validate_shader(b.shader, "array element");
    nir_intrinsic_instr *load = first_intrinsic(b.shader, nir_intrinsic_load_agx, 0);
    ASSERT_NE(load, nullptr);
@@ -1298,4 +1331,65 @@ TEST(M5RuntimeLoops, NestedWindowUnswitches)
       expect_no_undef_header_phis(s);
       ralloc_free(s);
    }
+}
+
+/* Under soft_fault on AGX3C, non-robust shaders (checked_offsets == false)
+ * merge consecutive buffer words into a single vector load and fold constant
+ * byte offsets, while robust shaders (checked_offsets == true) leave wrapping
+ * reads separate. */
+TEST(M5MergeWords, SoftFaultRespectsCheckedOffsets)
+{
+   auto compile_and_count_loads = [](bool checked_offsets, unsigned &num_loads,
+                                     unsigned &max_comps) {
+      nir_builder b = compute_shader(checked_offsets ? "sf-checked" : "sf-unchecked");
+      nir_def *idx = nir_load_preamble(&b, 1, 32, .base = 2);
+      nir_def *off = nir_ishl_imm(&b, idx, 2);
+      nir_def *sum = nir_imm_int(&b, 0);
+      for (unsigned k = 0; k < 4; ++k) {
+         nir_def *v = nir_load_global(
+            &b, 1, 32, buffer_address(&b, nir_iadd_imm(&b, off, 4 * k)),
+            .access = RO_ACCESS, .align_mul = 4);
+         sum = nir_iadd(&b, sum, v);
+      }
+      nir_store_global(&b, sum, buffer_address(&b, nir_imm_int(&b, 64)),
+                       .align_mul = 4);
+      agx_preprocess_nir(b.shader);
+      struct agx_shader_key key = {};
+      key.dev.chip = AGX_CHIP_G17S;
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.soft_fault = true;
+      key.checked_offsets = checked_offsets;
+      key.reserved_preamble = 8;
+      key.no_preamble = true;
+      struct agx_shader_part out = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &out));
+      num_loads = 0;
+      max_comps = 0;
+      nir_foreach_function_impl(impl, b.shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_agx &&
+                   !(nir_intrinsic_access(intr) & ACCESS_BUFFER_BINDING_AGX)) {
+                  num_loads++;
+                  max_comps = MAX2(max_comps, intr->def.num_components);
+               }
+            }
+         }
+      }
+      free(out.binary);
+      ralloc_free(b.shader);
+   };
+
+   unsigned unchecked_loads = 0, unchecked_comps = 0;
+   compile_and_count_loads(false, unchecked_loads, unchecked_comps);
+   EXPECT_EQ(unchecked_loads, 1u);
+   EXPECT_EQ(unchecked_comps, 4u);
+
+   unsigned checked_loads = 0, checked_comps = 0;
+   compile_and_count_loads(true, checked_loads, checked_comps);
+   EXPECT_EQ(checked_loads, 4u);
+   EXPECT_EQ(checked_comps, 1u);
 }

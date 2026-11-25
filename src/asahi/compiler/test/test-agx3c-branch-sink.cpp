@@ -20,6 +20,16 @@ agx3c_key(bool emit_agx3d = false)
    return key;
 }
 
+static struct agx_shader_key
+agx3b_key(enum agx_chip chip)
+{
+   struct agx_shader_key key = {};
+   key.dev.chip = chip;
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.reserved_preamble = 16;
+   return key;
+}
+
 static nir_def *
 make_load_global(nir_builder *b, unsigned comps, unsigned bits, nir_def *addr,
                  unsigned align_mul, gl_access_qualifier access)
@@ -60,6 +70,21 @@ instr_inside_if(const nir_instr *instr)
    for (nir_cf_node *p = instr->block->cf_node.parent; p; p = p->parent) {
       if (p->type == nir_cf_node_if)
          return true;
+   }
+   return false;
+}
+
+static bool
+has_op(const nir_shader *nir, nir_op op)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_alu &&
+                nir_instr_as_alu(instr)->op == op)
+               return true;
+         }
+      }
    }
    return false;
 }
@@ -353,6 +378,201 @@ TEST(Agx3cBranchSink, JmpNoneWeightsSfuWithoutJumpingCheapBoundsChecks)
    EXPECT_EQ(count_jmps(false, 2, 5), 0u);
 
    ralloc_free(mem_ctx);
+}
+
+TEST(Agx3cBranchSink, Agx3bEndToEndParticleShapePreservesIfAndSinksLoad)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G15G, AGX_CHIP_G16G, AGX_CHIP_G17P}) {
+      nir_shader *large = build_frsq_branch_shader(26);
+      agx_preprocess_nir_native(large, chip);
+      EXPECT_GE(count_ifs(large), 1u);
+      EXPECT_TRUE(has_op_inside_if(large, nir_op_frsq));
+
+      struct agx_shader_key key = agx3b_key(chip);
+      struct agx_shader_part out = {};
+      ASSERT_TRUE(agx_compile_shader_nir(large, &key, &out));
+      EXPECT_GE(count_ifs(large), 1u);
+      EXPECT_TRUE(has_op_inside_if(large, nir_op_frsq));
+      free(out.binary);
+      ralloc_free(large);
+
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "agx3b-particle-shape");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *pos_base = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *vel_base = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *out_base = agx_test_load_preamble(&b, 1, 64, 8);
+      nir_def *r2 = agx_test_load_preamble(&b, 1, 32, 12);
+
+      nir_def *off = nir_u2u64(&b, nir_ishl_imm(&b, tid, 3));
+      nir_def *pos = make_load_global(&b, 2, 32, nir_iadd(&b, pos_base, off), 8,
+                                      (gl_access_qualifier)0);
+      nir_def *vel = make_load_global(&b, 2, 32, nir_iadd(&b, vel_base, off), 8,
+                                      (gl_access_qualifier)0);
+
+      nir_def *dx = nir_channel(&b, pos, 0);
+      nir_def *dy = nir_channel(&b, pos, 1);
+      nir_def *dist2 = nir_fadd(&b, nir_fmul(&b, dx, dx), nir_fmul(&b, dy, dy));
+      nir_def *sep = nir_fsub(&b, dist2, r2);
+      nir_def *zero = nir_imm_float(&b, 0.0f);
+      nir_def *collide = nir_flt(&b, sep, zero);
+
+      nir_push_if(&b, collide);
+      nir_def *inv_len = nir_frsq(&b, dist2);
+      nir_def *nx = nir_fmul(&b, dx, inv_len);
+      nir_def *ny = nir_fmul(&b, dy, inv_len);
+      nir_def *dot_v = nir_fadd(&b, nir_fmul(&b, nir_channel(&b, vel, 0), nx),
+                                nir_fmul(&b, nir_channel(&b, vel, 1), ny));
+      nir_def *imp = nir_fmul(&b, dot_v, nir_imm_float(&b, -0.312f));
+      nir_def *fx = nir_fmul(&b, imp, nx);
+      nir_def *fy = nir_fmul(&b, imp, ny);
+      nir_pop_if(&b, NULL);
+
+      nir_def *out_x = nir_if_phi(&b, fx, zero);
+      nir_def *out_y = nir_if_phi(&b, fy, zero);
+      make_store_global(&b, nir_vec2(&b, out_x, out_y),
+                        nir_iadd(&b, out_base, off), 8);
+
+      agx_preprocess_nir_native(b.shader, chip);
+
+      struct agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_EQ(part.info.stats.spills, 0u);
+      EXPECT_GE(count_ifs(b.shader), 1u);
+      EXPECT_TRUE(has_op_inside_if(b.shader, nir_op_frsq));
+      EXPECT_EQ(count_load_agx_inside_if(b.shader), 1u);
+
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(Agx3cBranchSink, GalliumPreprocessPreservesAgx3bAndFlattensAgx2)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G15G, AGX_CHIP_G16G, AGX_CHIP_G17P}) {
+      const enum agx_isa_encoding encoding = agx_chip_isa_encoding(chip);
+      nir_shader *large = build_frsq_branch_shader(26);
+      agx_preprocess_nir_for_encoding(large, encoding);
+      EXPECT_GE(count_ifs(large), 1u);
+      EXPECT_TRUE(has_op_inside_if(large, nir_op_frsq));
+
+      struct agx_shader_key key = agx3b_key(chip);
+      struct agx_shader_part out = {};
+      ASSERT_TRUE(agx_compile_shader_nir(large, &key, &out));
+      EXPECT_GE(count_ifs(large), 1u);
+      EXPECT_TRUE(has_op_inside_if(large, nir_op_frsq));
+      free(out.binary);
+      ralloc_free(large);
+
+      nir_shader *small = build_frsq_branch_shader(4);
+      agx_preprocess_nir_for_encoding(small, encoding);
+      EXPECT_EQ(count_ifs(small), 0u);
+      ralloc_free(small);
+
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "gallium-agx3b-particle-shape");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *pos_base = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *vel_base = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *out_base = agx_test_load_preamble(&b, 1, 64, 8);
+      nir_def *r2 = agx_test_load_preamble(&b, 1, 32, 12);
+
+      nir_def *off = nir_u2u64(&b, nir_ishl_imm(&b, tid, 3));
+      nir_def *pos = make_load_global(&b, 2, 32, nir_iadd(&b, pos_base, off), 8,
+                                      (gl_access_qualifier)0);
+      nir_def *vel = make_load_global(&b, 2, 32, nir_iadd(&b, vel_base, off), 8,
+                                      (gl_access_qualifier)0);
+
+      nir_def *dx = nir_channel(&b, pos, 0);
+      nir_def *dy = nir_channel(&b, pos, 1);
+      nir_def *dist2 = nir_fadd(&b, nir_fmul(&b, dx, dx), nir_fmul(&b, dy, dy));
+      nir_def *sep = nir_fsub(&b, dist2, r2);
+      nir_def *zero = nir_imm_float(&b, 0.0f);
+      nir_def *collide = nir_flt(&b, sep, zero);
+
+      nir_push_if(&b, collide);
+      nir_def *inv_len = nir_frsq(&b, dist2);
+      nir_def *nx = nir_fmul(&b, dx, inv_len);
+      nir_def *ny = nir_fmul(&b, dy, inv_len);
+      nir_def *dot_v = nir_fadd(&b, nir_fmul(&b, nir_channel(&b, vel, 0), nx),
+                                nir_fmul(&b, nir_channel(&b, vel, 1), ny));
+      nir_def *imp = nir_fmul(&b, dot_v, nir_imm_float(&b, -0.312f));
+      nir_def *fx = nir_fmul(&b, imp, nx);
+      nir_def *fy = nir_fmul(&b, imp, ny);
+      nir_pop_if(&b, NULL);
+
+      nir_def *out_x = nir_if_phi(&b, fx, zero);
+      nir_def *out_y = nir_if_phi(&b, fy, zero);
+      make_store_global(&b, nir_vec2(&b, out_x, out_y),
+                        nir_iadd(&b, out_base, off), 8);
+
+      agx_preprocess_nir_for_encoding(b.shader, encoding);
+
+      struct agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_EQ(part.info.stats.spills, 0u);
+      EXPECT_GE(count_ifs(b.shader), 1u);
+      EXPECT_TRUE(has_op_inside_if(b.shader, nir_op_frsq));
+      EXPECT_EQ(count_load_agx_inside_if(b.shader), 1u);
+
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+
+   for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G15P}) {
+      nir_shader *large = build_frsq_branch_shader(26);
+      agx_preprocess_nir_for_encoding(large, agx_chip_isa_encoding(chip));
+      EXPECT_EQ(count_ifs(large), 0u);
+      ralloc_free(large);
+   }
+
+   nir_shader *generic = build_frsq_branch_shader(26);
+   agx_preprocess_nir(generic);
+   EXPECT_EQ(count_ifs(generic), 0u);
+   ralloc_free(generic);
+
+   auto build_d3d_f2i_shader = []() {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "d3d-f2i-gate");
+      b.shader->info.workgroup_size[0] = 1;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+      nir_def *out = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *a = agx_test_load_preamble(&b, 1, 32, 4);
+      nir_def *nan = nir_fneu(&b, a, a);
+      nir_def *lo = nir_flt(&b, a, nir_imm_float(&b, -2147483648.0f));
+      nir_def *hi = nir_flt(&b, nir_imm_float(&b, 2147483520.0f), a);
+      nir_def *val = nir_bcsel(
+         &b, nan, nir_imm_int(&b, 0),
+         nir_bcsel(&b, lo, nir_imm_int(&b, INT32_MIN),
+                   nir_bcsel(&b, hi, nir_imm_int(&b, INT32_MAX),
+                             nir_f2i32(&b, a))));
+      make_store_global(&b, val, out, 4);
+      return b.shader;
+   };
+
+   nir_shader *gallium_d3d = build_d3d_f2i_shader();
+   agx_preprocess_nir_for_encoding(gallium_d3d, AGX_ISA_ENCODING_AGX3B);
+   EXPECT_FALSE(has_op(gallium_d3d, nir_op_f2i32_sat));
+   ralloc_free(gallium_d3d);
+
+   nir_shader *native_d3d = build_d3d_f2i_shader();
+   agx_preprocess_nir_native(native_d3d, AGX_CHIP_G16G);
+   EXPECT_TRUE(has_op(native_d3d, nir_op_f2i32_sat));
+   ralloc_free(native_d3d);
+
+   nir_shader *m5_d3d = build_d3d_f2i_shader();
+   agx_preprocess_nir_m5(m5_d3d);
+   EXPECT_TRUE(has_op(m5_d3d, nir_op_f2i32_sat));
+   ralloc_free(m5_d3d);
 }
 
 } /* namespace */
