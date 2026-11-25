@@ -11523,6 +11523,9 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * Pro). Lowerings that depend on the instruction set, rather than on one
     * part's measured tuning, key on it instead of on the G17P part. */
    const bool agx3b = byte_indices;
+   const bool agx3_compute_opts = (agx3b || m5) && !g18_scans &&
+                                  mesa_shader_stage_is_compute(nir->info.stage);
+   const bool runtime_loop_opts = agx3_compute_opts || (m5 && !g18_scans);
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 64,
       .expensive_alu_ok = true,
@@ -11600,11 +11603,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * distance does; SPIR-V carries no such hint), up to 80 run 4, up to 160
     * run 2. agx_compile_shader_nir compiles again with 4 if 8 costs
     * occupancy (AGX3C) or Dynamic Caching register pressure (AGX3B). */
-   const bool agx3_compute_opts = (agx3b || m5) && !g18_scans;
-   if (agx3_compute_opts) {
+   if (runtime_loop_opts) {
       bool jammed = false;
-      NIR_PASS(jammed, nir, agx_nir_unroll_and_jam, m5_unroll_factor,
-               m5_unroll_widest);
+      if (agx3_compute_opts)
+         NIR_PASS(jammed, nir, agx_nir_unroll_and_jam, m5_unroll_factor,
+                  m5_unroll_widest);
       if (jammed)
          agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
 
@@ -11613,7 +11616,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                320, m5_unroll_widest);
       if (unrolled)
          agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
-      if (jammed || unrolled) {
+      if (agx3_compute_opts && (jammed || unrolled)) {
          bool reassoc = false;
          NIR_PASS(reassoc, nir, agx_nir_reassoc_const_offsets);
          if (reassoc) {
@@ -11625,14 +11628,15 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       }
    }
 
-   if (agx3_compute_opts)
+   if (runtime_loop_opts)
       NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
 
    /* Bit-exact FP32-blocked u8 absolute-difference sums when u8 operands are
     * reused across terms, followed by 16-bit integer narrowing for the rest. */
-   if (agx3_compute_opts) {
+   if (runtime_loop_opts) {
       bool fp_absdiff = false;
-      NIR_PASS(fp_absdiff, nir, agx_nir_opt_u8_absdiff_fp);
+      if (agx3_compute_opts)
+         NIR_PASS(fp_absdiff, nir, agx_nir_opt_u8_absdiff_fp);
       if (fp_absdiff) {
          NIR_PASS(_, nir, nir_opt_cse);
          NIR_PASS(_, nir, nir_opt_dce);
@@ -11647,7 +11651,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    }
 
    /* Zero-extended bytes and halves convert to f32 from their half register. */
-   if (agx3_compute_opts)
+   if (runtime_loop_opts)
       NIR_PASS(_, nir, agx_nir_opt_m5_narrow_to_float);
 
    /* Consecutive words read together, such as the unrolled iterations' reads
@@ -11656,7 +11660,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * followed by a bounds select, so a read past the end is defined rather
     * than undefined behaviour. Non-robust shaders remain safe even when soft
     * faults are active because set_speculate() has not run yet. */
-   if (agx3_compute_opts && !checked_offsets) {
+   if (runtime_loop_opts && !checked_offsets) {
       bool merged = false;
       NIR_PASS(merged, nir, agx_nir_merge_global_words);
       if (merged) {
@@ -11819,7 +11823,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
 
    /* Rows at (x + c) * uniform stride: one shared multiply-add, then an add
     * of a preamble-uniform c * stride per row. */
-   if (agx3_compute_opts)
+   if (runtime_loop_opts)
       NIR_PASS(_, nir, agx_nir_opt_uniform_stride);
 
    /* Now that loads carry an index, a select between two of them can choose
@@ -19327,7 +19331,8 @@ agx_compile_shader_nir_unrolled(nir_shader *nir, struct agx_shader_key *key,
 {
    const unsigned factor = 8;
    const bool agx3_native =
-      (key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+      ((key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+        mesa_shader_stage_is_compute(nir->info.stage)) ||
        key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
       !key->dev.emit_agx3d;
    if (!agx3_native)
