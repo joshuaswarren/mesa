@@ -640,6 +640,8 @@ struct agx_shader_key {
     * g17p_dma_static_set_mask. !g17p_uniform_dma leaves code unchanged. */
    bool g17p_uniform_dma;
    uint16_t g17p_dma_root;
+   /* Guaranteed resident prefix at g17p_dma_root for speculative VS loads. */
+   uint16_t preamble_root_size_B;
    uint8_t g17p_dma_set_mask;
    uint8_t g17p_dma_static_set_mask;
    uint8_t g17p_dma_buffer_count;
