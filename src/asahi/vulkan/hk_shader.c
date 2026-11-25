@@ -3729,7 +3729,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       agx_chip_hw_texel_fetch_bounds(dev->dev.chip) &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
    const bool lower_agx3_robust_fetches =
-      agx_chip_g17p_or_m5(dev->dev.chip) &&
+      agx_chip_agx3_path(dev->dev.chip) &&
       !hw_txf_bounds &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
    const bool native_robust_images =
@@ -4102,10 +4102,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    }
 
    bool lowered_tex = false;
-   if (agx_chip_native_or_m5(dev->dev.chip)) {
+   if (agx_chip_agx3_path(dev->dev.chip)) {
       /* hk_nir_lower_robust_image_access() leaves formatless loads to this
        * pass. */
       unsigned tex_gen = agx_chip_descriptor_generation(dev->dev.chip);
+      if (dev->dev.chip == AGX_CHIP_G18G)
+         tex_gen |= AGX_NIR_TEXTURE_IMAGE_SIDEBAND;
       if (agx_chip_texture_descriptor_spare_word(dev->dev.chip) &&
           !nir->info.internal)
          tex_gen |= AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT;
