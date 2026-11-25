@@ -3963,10 +3963,17 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
    /* A program that fits can keep loop-invariant operands out of its loops,
     * as long as its demand, and so every decision below, stays the same and
-    * the registers assignment will use keep room for each loop's values. */
+    * the registers assignment will use keep room for each loop's values.
+    * Encodings without a static register split (AGX3B/AGX3C) incur no fixed
+    * occupancy cliff, so allow a small 4-half headroom when hoisting invariant
+    * uniform/immediate materializations out of hot loops. */
+   const unsigned licm_demand =
+      agx_has_static_register_split(ctx)
+         ? effective_demand
+         : MIN2(max_possible_regs, effective_demand + 4);
    if (!spilling && !(agx_compiler_debug & AGX_DBG_NOOPT) &&
-       agx_opt_licm(ctx, effective_demand,
-                    assignment_file(ctx, effective_demand,
+       agx_opt_licm(ctx, licm_demand,
+                    assignment_file(ctx, licm_demand,
                                     ra_file_alignment(ctx), max_possible_regs,
                                     force_spilling)))
       effective_demand = agx_calc_register_demand(ctx, false);
