@@ -225,7 +225,7 @@ hk_queue_sibling_compute_supported(const struct agx_device *dev,
 {
    const uint64_t required = DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS |
                              DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
-   return !dev->is_virtio && exact_prior &&
+   return !dev->is_virtio && !(dev->debug & AGX_DBG_1QUEUE) && exact_prior &&
           hk_queue_uses_cumulative_signals(dev) &&
           (dev->params.features & required) == required &&
           !(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL);
@@ -242,6 +242,7 @@ VkResult hk_queue_init_kick(struct hk_device *dev,
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_device_quiesce_lost_submissions(struct hk_device *dev);
+void hk_device_wait_submitted(struct hk_device *dev, uint64_t timeout_ns);
 
 /* The first command buffer of the submission whose recording failed, or NULL.
  * Such a command buffer is not executable (vkEndCommandBuffer returned its
@@ -253,5 +254,7 @@ VkResult hk_queue_submit_bind_sparse_memory(struct hk_device *device,
                                             struct vk_queue_submit *submission);
 
 uint32_t hk_queue_independent_budget(struct hk_device *dev);
+
+bool hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_queue_share(struct hk_device *dev, struct hk_queue *queue);

@@ -514,6 +514,11 @@ void
 hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                 struct hk_cs *self, struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
 {
+   /* Graphics scope includes availability writes staged on the render.
+    * Materialize their post-graphics stream before taking the CDM cut. */
+   if ((src_kinds & HK_SYNC_GFX) && unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
+
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
       dep[sq] = (struct hk_sync_dep){.prior = src_kinds};
       u_foreach_bit(k, src_kinds)
@@ -668,6 +673,8 @@ void
 hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                 uint8_t dst_kinds)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    cmd->sync.epoch++;
 
    /* The dependencies an acceleration-structure build records between its
@@ -726,6 +733,8 @@ void
 hk_sync_pass_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                      uint8_t dst_kinds)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    struct hk_sync_state *st = &cmd->sync;
    assert(st->in_pass);
    st->epoch++;
@@ -902,6 +911,8 @@ void
 hk_sync_after_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                      uint8_t dst_kinds)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    const unsigned sq = hk_sync_sq(cs);
    const struct hk_sync_dep dep = {.cut = cs};
 
@@ -1288,6 +1299,35 @@ hk_sync_get_cs_after(struct hk_cmd_buffer *cmd,
    cs = hk_cmd_buffer_get_cs(cmd, true);
    if (cs)
       hk_sync_stream_wait(cs, full);
+   return cs;
+}
+
+/*
+ * Prepare the compute stream a query command (reset, result copy) records
+ * into. Query state is updated in submission order without application
+ * barriers (Vulkan 1.3, 17 "Queries": vkCmdCopyQueryPoolResults sees every
+ * earlier vkCmdResetQueryPool on the queue, and vkCmdBeginQuery requires the
+ * query to be unavailable, which an earlier reset in the same command buffer
+ * provides). The stream therefore waits on every earlier stream, and it is
+ * never the stream carrying a pending end timestamp. On G17P, both start
+ * and end timestamps reach query memory at command retirement, so neither
+ * producer may contain the query command or be merged back into it. The caller
+ * marks later streams as ordered after it where the command's semantics require
+ * that.
+ */
+struct hk_cs *
+hk_query_command_cs(struct hk_cmd_buffer *cmd)
+{
+   hk_sync_flush_pending_timestamp(cmd);
+   /* Timestamps written as copies of earlier ones are query results too. */
+   hk_sync_flush_stamp_copies(cmd);
+   hk_sync_end_cs_if_timestamped(cmd);
+
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+   hk_sync_src_dep(cmd, HK_SYNC_QUERY_SCOPE, cmd->current_cs.cs, dep);
+   struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
+   if (cs && agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+      cs->g17p_timestamp_query = true;
    return cs;
 }
 
@@ -1772,6 +1812,9 @@ hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
    const bool unordered = st->pending_start_ts_unordered;
    st->pending_start_ts = (struct agx_timestamp_req){0};
    st->pending_start_ts_unordered = false;
+   /* Creating post_gfx must not take this request as its start timestamp. */
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    st->epoch++;
 
    struct hk_cs *tail = last_stream(cmd);
@@ -1810,6 +1853,8 @@ void
 hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
                         struct agx_timestamp_req req)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    struct hk_sync_state *st = &cmd->sync;
    const uint8_t src_kinds = hk_sync_kinds_src(stage);
    struct hk_cs *gfx = cmd->current_cs.gfx;
@@ -2033,6 +2078,8 @@ hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 void
 hk_sync_heap_used(struct hk_cmd_buffer *cmd)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    struct hk_sync_state *st = &cmd->sync;
    st->heap_pass = true;
    st->epoch++;
@@ -2050,6 +2097,8 @@ hk_sync_heap_used(struct hk_cmd_buffer *cmd)
 void
 hk_sync_resolve_begin(struct hk_cmd_buffer *cmd)
 {
+   if (unlikely(cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
    struct hk_sync_state *st = &cmd->sync;
    st->epoch++;
    st->internal[HK_SYNC_VDM] = (struct hk_sync_dep){

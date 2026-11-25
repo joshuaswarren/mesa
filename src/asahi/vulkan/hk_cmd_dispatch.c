@@ -759,6 +759,17 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
+   /* A dependency declared but not yet emitted on AGX2 lands on the
+    * trailing edge of the closing compute stream. Every stream close
+    * funnels here, so no caller can end the compute stream with a declared
+    * dependency left unemitted. This also keeps the drain out of
+    * hk_cmd_buffer.h: standalone test binaries stub this function. */
+   if (cs == cmd->current_cs.cs && cmd->state.cs.cdm_barrier_pending) {
+      cmd->state.cs.cdm_barrier_pending = false;
+      hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
+      hk_cdm_cache_flush(dev, cs);
+   }
+
    /* A dependency recorded while no compute stream holding work is open
     * records no flush: the first barrier of a command buffer, or one after a
     * timestamp closed the stream. The writes of this stream may then be read
@@ -817,10 +828,22 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
 
    hk_ensure_cs_has_space(cs->cmd, cs, 0x2000 /* TODO */);
    cs->stats.cmds++;
+
+   if (!HK_PERF(dev, ALWAYSCDMBARRIER) &&
+       cs->cmd->state.cs.cdm_barrier_pending) {
+      /* The app declared a memory dependency since the last launch: carry
+       * the full barrier ahead of this launch and clear it. Launches the
+       * app left unordered have no Vulkan-defined ordering to enforce, so
+       * their drain is skipped. */
+      cs->cmd->state.cs.cdm_barrier_pending = false;
+      hk_cdm_cache_flush(dev, cs);
+   }
+
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
 
-   hk_cdm_cache_flush(dev, cs);
+   if (HK_PERF(dev, ALWAYSCDMBARRIER))
+      hk_cdm_cache_flush(dev, cs);
 }
 
 void
@@ -838,6 +861,17 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
    }
 
    hk_dispatch_with_usc_launch(dev, cs, launch, usc, grid, local_size);
+
+   /* Software graphics stages communicate through memory: VS outputs,
+    * geometry counts and XFB bases are consumed by the next dispatch, and
+    * the application cannot supply barriers between these internal
+    * stages. Keep the flush-after-launch contract for them (as
+    * hk_dispatch_with_local_size does on AGX3); compute launches stay
+    * dependency-tracked. */
+   if (info->stage != MESA_SHADER_COMPUTE) {
+      hk_ensure_cs_has_space(cs->cmd, cs, AGX_CDM_BARRIER_LENGTH);
+      hk_cdm_cache_flush(dev, cs);
+   }
 }
 
 static bool
@@ -3182,6 +3216,8 @@ hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    memcpy(record.push, desc->root.push, sizeof(record.push));
    if (selected == api->depthwise_vec4)
       record.alt_kind = HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4;
+   else if (selected == api->gemm_cmat16)
+      record.alt_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT16;
    else if (selected == api->gemm_cmat32)
       record.alt_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT32;
    else if (selected == api->gemm_cmat64)
@@ -3485,11 +3521,13 @@ hk_identity_copy4_required_bytes(const struct hk_descriptor_state *desc,
                                  struct agx_grid grid, const uint16_t local[3],
                                  uint64_t *bytes, uint32_t *k_out)
 {
+   const bool has_border = info->border_width_offset != UINT16_MAX;
    int32_t bw = 0, bh = 0, iw = 0, ih = 0, kw = 0, k = 0, m = 0, sw = 0, sh = 0, channels = 0;
-   if (!hk_read_push_i32(desc, info->border_width_offset, &bw) ||
-       !hk_read_push_i32(desc, info->border_height_offset, &bh) ||
+   if ((has_border &&
+        (!hk_read_push_i32(desc, info->border_width_offset, &bw) ||
+         !hk_read_push_i32(desc, info->border_height_offset, &bh) ||
+         !hk_read_push_i32(desc, info->input_height_offset, &ih))) ||
        !hk_read_push_i32(desc, info->input_width_offset, &iw) ||
-       !hk_read_push_i32(desc, info->input_height_offset, &ih) ||
        !hk_read_push_i32(desc, info->kernel_width_offset, &kw) ||
        !hk_read_push_i32(desc, info->patches_width_offset, &k) ||
        !hk_read_push_i32(desc, info->patches_height_offset, &m) ||
@@ -3499,8 +3537,9 @@ hk_identity_copy4_required_bytes(const struct hk_descriptor_state *desc,
       return false;
 
    if (bw || bh || sw != 1 || sh != 1 ||
-       iw <= 0 || ih <= 0 || channels <= 0 || kw != channels || k != channels ||
-       k % 4 || iw % channels || m <= 0 || (uint64_t)(iw / channels) * ih != (uint64_t)m)
+       iw <= 0 || channels <= 0 || kw != channels || k != channels ||
+       k % 4 || iw % channels || m <= 0 ||
+       (has_border && (ih <= 0 || (uint64_t)(iw / channels) * ih != (uint64_t)m)))
       return false;
 
    if (grid.count[0] != DIV_ROUND_UP((uint32_t)k, local[0]) ||
@@ -3584,14 +3623,16 @@ hk_select_im2col_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
    if (!alt || !info->im2col_vec4_ok ||
        !hk_g17p_compute_shader_supported(dev->dev.chip, alt, alt->only_linked, 1u << 16) ||
        alt->b.info.workgroup_size[0] == 0 || alt->b.info.workgroup_size[1] == 0 ||
-       alt->b.info.workgroup_size[2] != 1)
+       alt->b.info.workgroup_size[2] == 0)
       return normal;
 
+   const bool has_border = info->border_width_offset != UINT16_MAX;
    int32_t bw = 0, bh = 0, iw = 0, ih = 0, kw = 0, pw = 0, ph = 0, sw = 0, sh = 0, ch = 0;
-   if (!hk_read_push_i32(desc, info->border_width_offset, &bw) ||
-       !hk_read_push_i32(desc, info->border_height_offset, &bh) ||
+   if ((has_border &&
+        (!hk_read_push_i32(desc, info->border_width_offset, &bw) ||
+         !hk_read_push_i32(desc, info->border_height_offset, &bh) ||
+         !hk_read_push_i32(desc, info->input_height_offset, &ih))) ||
        !hk_read_push_i32(desc, info->input_width_offset, &iw) ||
-       !hk_read_push_i32(desc, info->input_height_offset, &ih) ||
        !hk_read_push_i32(desc, info->kernel_width_offset, &kw) ||
        !hk_read_push_i32(desc, info->patches_width_offset, &pw) ||
        !hk_read_push_i32(desc, info->patches_height_offset, &ph) ||
@@ -3599,22 +3640,39 @@ hk_select_im2col_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
        !hk_read_push_i32(desc, info->stride_height_offset, &sh) ||
        !hk_read_push_i32(desc, info->channels_offset, &ch))
       return normal;
-   if (bw < 0 || bh < 0 || iw <= 0 || ih <= 0 || kw <= 0 ||
-       pw <= 0 || ph <= 0 || sw <= 0 || sh <= 0 || ch <= 0)
+   if ((has_border && (bw < 0 || bh < 0 || ih <= 0)) ||
+       iw <= 0 || kw <= 0 || pw <= 0 || ph <= 0 || sw <= 0 || sh <= 0 || ch <= 0)
       return normal;
-   if ((ch % 4) != 0 || (iw % 4) != 0 || (kw % 4) != 0 || (pw % 4) != 0)
+   if ((iw % ch) != 0 || (kw % ch) != 0 || (pw % kw) != 0)
       return normal;
-   if ((iw % ch) != 0 || (kw % ch) != 0)
-      return normal;
-   const bool unit = (sw == 1 && sh == 1);
-   const uint64_t pad_x = (uint64_t)(uint32_t)bw * (uint32_t)ch;
-   const uint64_t pad_x_tot = unit ? pad_x * 2 : pad_x;
-   if (pad_x_tot > (uint64_t)INT32_MAX - (uint32_t)iw ||
-       (uint32_t)bh > 0x3fffffffu || (pad_x / 4) > 0x3fffffffu)
-      return normal;
-   const uint64_t bordered_iw = (uint32_t)iw + pad_x_tot;
+   const bool use_vec4 =
+      ((ch % 4) == 0 && (iw % 4) == 0 && (kw % 4) == 0 && (pw % 4) == 0);
+   uint64_t bordered_iw = (uint32_t)iw;
+   if (has_border) {
+      const bool unit = (sw == 1 && sh == 1);
+      const uint64_t pad_x = (uint64_t)(uint32_t)bw * (uint32_t)ch;
+      const uint64_t pad_x_tot = unit ? pad_x * 2 : pad_x;
+      if (pad_x_tot > (uint64_t)INT32_MAX - (uint32_t)iw ||
+          (uint32_t)bh > 0x3fffffffu || pad_x > 0x3fffffffu)
+         return normal;
+      bordered_iw = (uint32_t)iw + pad_x_tot;
+   }
    if (bordered_iw < (uint32_t)kw)
       return normal;
+   const uint64_t diff =
+      bordered_iw / (uint32_t)ch - (uint32_t)kw / (uint32_t)ch;
+   const uint64_t cols = diff / (uint32_t)sw + 1;
+   if (cols == 0 || ((uint32_t)ph % cols) != 0)
+      return normal;
+   const uint64_t rows_y = (uint32_t)ph / cols;
+   const uint64_t kh = (uint32_t)pw / (uint32_t)kw;
+   const uint64_t step_x = (uint64_t)(uint32_t)sw * (uint32_t)ch;
+   if (rows_y == 0 || kh == 0 || step_x == 0 || step_x > (uint64_t)INT32_MAX ||
+       (cols - 1) > ((uint64_t)INT32_MAX - (uint32_t)kw) / step_x ||
+       (rows_y - 1) > ((uint64_t)INT32_MAX - kh) / (uint32_t)sh)
+      return normal;
+   const uint64_t max_x = (cols - 1) * step_x + (uint32_t)kw;
+   const uint64_t req_ih = (rows_y - 1) * (uint32_t)sh + kh;
 
    if (grid->count[2] != 1 ||
        grid->count[0] < DIV_ROUND_UP((uint32_t)pw, info->local[0]) ||
@@ -3623,23 +3681,38 @@ hk_select_im2col_vec4(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
        (uint64_t)grid->count[1] * info->local[1] > (uint64_t)INT32_MAX)
       return normal;
 
-   const uint64_t src_bytes = (uint64_t)(uint32_t)iw * (uint32_t)ih * sizeof(uint32_t);
+   uint64_t src_bytes = 0;
+   if (has_border) {
+      src_bytes = (uint64_t)(uint32_t)iw * (uint32_t)ih * sizeof(uint32_t);
+   } else {
+      if (max_x > (uint64_t)(uint32_t)iw)
+         return normal;
+      src_bytes = req_ih * (uint32_t)iw * sizeof(uint32_t);
+   }
    const uint64_t dst_bytes = (uint64_t)(uint32_t)pw * (uint32_t)ph * sizeof(uint32_t);
    if (src_bytes > (uint64_t)INT32_MAX + 1 || dst_bytes > (uint64_t)INT32_MAX + 1)
       return normal;
 
+   const uint32_t align_B = use_vec4 ? 16 : 4;
    struct hk_storage_backing src_b, dst_b;
-   if (!hk_check_storage_backing(desc, info->src_set, info->src_binding, 0, src_bytes, 16, &src_b) ||
-       !hk_check_storage_backing(desc, info->dst_set, info->dst_binding, 0, dst_bytes, 16, &dst_b))
+   if (!hk_check_storage_backing(desc, info->src_set, info->src_binding, 0, src_bytes, align_B, &src_b) ||
+       !hk_check_storage_backing(desc, info->dst_set, info->dst_binding, 0, dst_bytes, align_B, &dst_b))
       return normal;
 
    /* Reject overlap between source and destination buffers. */
    if (!hk_intervals_disjoint(&src_b, 0, src_bytes, &dst_b, 0, dst_bytes))
       return normal;
 
-   grid->count[0] = DIV_ROUND_UP((uint32_t)pw / 4, alt->b.info.workgroup_size[0]);
-   grid->count[1] = DIV_ROUND_UP((uint32_t)ph, alt->b.info.workgroup_size[1]);
-   grid->count[2] = 1;
+   const uint32_t x_units = use_vec4 ? ((uint32_t)kw / 4) : (uint32_t)kw;
+   const uint64_t gx = DIV_ROUND_UP(x_units, alt->b.info.workgroup_size[0]);
+   const uint64_t gy = DIV_ROUND_UP(cols, alt->b.info.workgroup_size[1]);
+   const uint64_t gz = DIV_ROUND_UP(rows_y, alt->b.info.workgroup_size[2]);
+   if (gx > 65535 || gy > 65535 || gz > 65535)
+      return normal;
+
+   grid->count[0] = (uint32_t)gx;
+   grid->count[1] = (uint32_t)gy;
+   grid->count[2] = (uint32_t)gz;
    return alt;
 }
 
@@ -3917,7 +3990,8 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
 {
    const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if ((!api->gemm_cmat32 && !api->gemm_cmat64) || !api->compute_pair ||
+   if ((!api->gemm_cmat16 && !api->gemm_cmat32 && !api->gemm_cmat64) ||
+       !api->compute_pair ||
        api->compute_pair->role != HK_COMPUTE_PAIR_GEMM)
       return normal;
    if (!agx_chip_native_or_m5(dev->dev.chip) ||
@@ -3981,12 +4055,33 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
          tile_n = 32;
       }
    } else {
-      if ((uint32_t)n_i > 32 && api->gemm_cmat64) {
+      /* Guarded tile-width selection:
+       * - N <= 16: cmat16 (32x16, K_step=32) avoids 50-75% N-lane waste.
+       * - N > 32 with N % 64 == 0 or N % 32 != 0: cmat64 (32x64, K_step=32)
+       *   doubles M-parallelism and halves K-loop barriers. When N % 32 != 0
+       *   (e.g. N=48 or N=144), both cmat64 and cmat32 incur N-tail waste (for
+       *   N=48 both pad to 64 with 25% waste), so cmat64 wins via fewer N WGs
+       *   and K_step=32. When N % 32 == 0 && N % 64 != 0 (e.g. N=96), cmat32
+       *   (64x32, K_step=16) has 0% N-tail waste vs cmat64's 50% last-tile
+       *   waste and is selected instead.
+       * - 16 < N <= 32: cmat32 (64x32, K_step=16) fits in one N tile. */
+      if ((uint32_t)n_i <= 16 && api->gemm_cmat16) {
+         alt = api->gemm_cmat16;
+         tile_n = 16;
+      } else if ((uint32_t)n_i > 32 &&
+                 (((uint32_t)n_i % 64) == 0 || ((uint32_t)n_i % 32) != 0) &&
+                 api->gemm_cmat64) {
          alt = api->gemm_cmat64;
          tile_n = 64;
       } else if (api->gemm_cmat32) {
          alt = api->gemm_cmat32;
          tile_n = 32;
+      } else if (api->gemm_cmat64) {
+         alt = api->gemm_cmat64;
+         tile_n = 64;
+      } else if (api->gemm_cmat16) {
+         alt = api->gemm_cmat16;
+         tile_n = 16;
       }
    }
    if (!alt ||
@@ -4039,8 +4134,9 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
                                &c_b, gemm->output.offset_B, c_bytes)))
       return normal;
 
+   const uint32_t tile_m = hk_gemm_cmat_tile_m(tile_n);
    const uint64_t gx = DIV_ROUND_UP(n_u, tile_n);
-   const uint64_t gy = DIV_ROUND_UP(m_u, 64);
+   const uint64_t gy = DIV_ROUND_UP(m_u, tile_m);
    if (gx > 65535 || gy > 65535)
       return normal;
    grid->count[0] = (uint32_t)gx;
@@ -4118,7 +4214,8 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       local_size = agx_workgroup(selected->b.info.workgroup_size[0],
                                  selected->b.info.workgroup_size[1],
                                  selected->b.info.workgroup_size[2]);
-   } else if (api && (api->gemm_cmat32 || api->gemm_cmat64) && api->compute_pair &&
+   } else if (api && (api->gemm_cmat16 || api->gemm_cmat32 || api->gemm_cmat64) &&
+              api->compute_pair &&
               api->compute_pair->role == HK_COMPUTE_PAIR_GEMM &&
               !in_threads && !invocation_stat) {
       selected = hk_select_gemm_cmat(cmd, api, s, &grid);
@@ -4193,7 +4290,8 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    hk_dispatch_with_local_size(cmd, cs, selected, grid, local_size);
    if (!in_threads && !invocation_stat && api && api->compute_pair &&
        (selected == s || selected == api->depthwise_vec4 ||
-        selected == api->gemm_cmat32 || selected == api->gemm_cmat64))
+        selected == api->gemm_cmat16 || selected == api->gemm_cmat32 ||
+        selected == api->gemm_cmat64))
       hk_record_compute_pair(cmd, cs, api, selected, orig_groups, grid);
    cs->uses_global_atomics |= selected->b.info.uses_global_atomics;
    cs->pack_loops |= selected->b.info.has_loops;

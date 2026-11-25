@@ -526,6 +526,7 @@ struct hk_api_shader {
    struct hk_shader *identity_copy4;
    struct hk_shader *im2col_vec4;
    struct hk_shader *depthwise_vec4;
+   struct hk_shader *gemm_cmat16;
    struct hk_shader *gemm_cmat32;
    struct hk_shader *gemm_cmat64;
    struct hk_identity_copy4 identity_copy4_info;
@@ -1071,6 +1072,12 @@ bool hk_tes_ray_queries_in_compute(const struct hk_device *dev);
 /* Lower a G17P task shader, after hk_lower_nir(), to the compute kernel of
  * the software task stage. */
 void hk_g17p_lower_task_kernel(nir_shader *nir);
+
+/* Lower provably non-overflowing 32-bit scalar uadd_sat(term, k) to iadd.nuw. */
+bool hk_nir_lower_aligned_uadd_sat(nir_shader *nir);
+
+/* Merge adjacent reorderable 32-bit buffer word reads into vector loads. */
+bool hk_nir_merge_buffer_words(nir_shader *nir);
 
 /* Lazily compile and cache the 1-thread compute shader for a hoistable AGX3
  * vertex preamble. Returns NULL if the vertex shader has no hoistable preamble

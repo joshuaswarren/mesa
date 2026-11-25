@@ -24,6 +24,7 @@ enum hk_compute_pair_alt_kind {
    HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4 = 1,
    HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 = 2,
    HK_COMPUTE_PAIR_ALT_GEMM_CMAT64 = 3,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT16 = 4,
 };
 
 struct hk_compute_pair_variant {

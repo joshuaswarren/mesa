@@ -232,7 +232,12 @@ hk_gen1_sparse_entry(struct hk_device *dev, struct hk_gen1_sparse_table *t,
                                       t->label);
       if (!bo)
          return NULL;
-      memset(agx_bo_map(bo), 0, HK_GEN1_SPARSE_PAGE_BYTES);
+      void *map = agx_bo_map(bo);
+      if (!map) {
+         agx_bo_unreference(&dev->dev, bo);
+         return NULL;
+      }
+      memset(map, 0, HK_GEN1_SPARSE_PAGE_BYTES);
       util_post_flush_fence();
       struct agx_bo **slot = util_dynarray_grow(&t->pages, struct agx_bo *, 1);
       if (!slot) {
@@ -249,7 +254,8 @@ hk_gen1_sparse_entry(struct hk_device *dev, struct hk_gen1_sparse_table *t,
       *slot = bo;
    }
    struct agx_bo *bo = *util_dynarray_element(&t->pages, struct agx_bo *, page);
-   return (uint8_t *)agx_bo_map(bo) + (uint64_t)(id % per_page) * t->entry_bytes;
+   uint8_t *map = agx_bo_map(bo);
+   return map ? map + (uint64_t)(id % per_page) * t->entry_bytes : NULL;
 }
 
 static uint32_t
@@ -374,6 +380,10 @@ hk_gen1_as_window_roots(struct hk_device *dev)
    if (!bo)
       return NULL;
    uint8_t *map = agx_bo_map(bo);
+   if (!map) {
+      agx_bo_unreference(&dev->dev, bo);
+      return NULL;
+   }
    memset(map, 0, bytes);
    for (uint32_t j = 0; j < HK_GEN1_AS_WINDOW_BASES; ++j)
       hk_gen1_as_forward_node((uint32_t *)(map + j * HK_GEN1_AS_WINDOW_PAGE),
@@ -416,7 +426,12 @@ hk_gen1_as_window_create(struct hk_device *dev)
       hk_gen1_as_window_destroy(dev, va, trampolines);
       return UINT32_MAX;
    }
-   memset(agx_bo_map(trampolines), 0, HK_GEN1_AS_WINDOW_PAGE);
+   void *tramp_map = agx_bo_map(trampolines);
+   if (!tramp_map) {
+      hk_gen1_as_window_destroy(dev, va, trampolines);
+      return UINT32_MAX;
+   }
+   memset(tramp_map, 0, HK_GEN1_AS_WINDOW_PAGE);
    util_post_flush_fence();
    struct hk_gen1_as_window *window =
       util_dynarray_grow(&dev->gen1_as_windows, struct hk_gen1_as_window, 1);

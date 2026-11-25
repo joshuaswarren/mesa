@@ -670,6 +670,11 @@ struct agx_batch {
 
    uint64_t uploaded_clear_color[PIPE_MAX_COLOR_BUFS];
    union pipe_color_union clear_color[PIPE_MAX_COLOR_BUFS];
+
+   /* Zeroes that constant and storage buffers with nothing in range point at,
+    * 0 until the first one (agx_uniforms.c).
+    */
+   uint64_t zero_sink;
    double clear_depth;
    unsigned clear_stencil;
 
@@ -1297,6 +1302,25 @@ void agx_xfb_cpu_draw(struct agx_context *ctx,
                       const struct pipe_draw_start_count_bias *draw);
 void agx_xfb_cpu_destroy(struct agx_context *ctx);
 
+/* A buffer range is bound as the application gave it and can extend past the
+ * end of its resource, for example when the buffer's data store is later
+ * replaced by a smaller one. Returns the bytes of the range inside the
+ * resource: 0 when it starts at or past the end. */
+static inline unsigned
+agx_buffer_range_in_resource(const struct pipe_resource *prsc, unsigned offset,
+                             unsigned size)
+{
+   if (offset >= prsc->width0)
+      return 0;
+
+   return MIN2(size, prsc->width0 - offset);
+}
+
+bool agx_cpu_bind_constant_buffer(struct agx_context *ctx,
+                                  struct draw_context *draw,
+                                  mesa_shader_stage s, unsigned i,
+                                  struct pipe_transfer **transfer);
+
 bool agx_swtnl_lower_for_draw(nir_shader *nir);
 bool agx_m5_gpu_tess(struct agx_context *ctx);
 bool agx_swtnl_applies(struct agx_context *ctx);
@@ -1533,6 +1557,30 @@ agx_valid_buffer_range_intersects(struct agx_resource *rsrc, unsigned start,
    bool intersects = util_ranges_intersect(range, start, end);
    simple_mtx_unlock(&range->write_mutex);
    return intersects;
+}
+
+/* Whether the resource is, or may be, shared with another process or the
+ * display controller. Its backing BO must never be replaced via
+ * transition_resource() or agx_shadow().
+ */
+static inline bool
+agx_resource_is_shared(const struct agx_resource *rsrc)
+{
+   return (rsrc->base.b.bind &
+           (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET)) ||
+          (rsrc->bo &&
+           (rsrc->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)));
+}
+
+/* Whether the resource is a shared/shareable compressed Interchange surface.
+ * Its backing BO cannot be reallocated uncompressed in agx_decompress(), and
+ * pixel-granular writable storage-image bindings must fail closed.
+ */
+static inline bool
+agx_resource_is_shared_interchange(const struct agx_resource *rsrc)
+{
+   return agx_resource_is_shared(rsrc) && rsrc->layout.compressed &&
+          rsrc->layout.tiling == AIL_TILING_INTERCHANGE;
 }
 
 static inline bool

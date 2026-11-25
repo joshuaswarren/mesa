@@ -48,6 +48,7 @@
 #include <xf86drm.h>
 #include "util/cache_ops.h"
 #include "util/list.h"
+#include "util/log.h"
 #include "util/macros.h"
 #include "util/os_time.h"
 #include "util/u_atomic.h"
@@ -2945,22 +2946,26 @@ hk_pack_attachment_limit(const struct hk_device *dev)
  * ASAHI_M5_PACK_ATOMICS=1 (or HK_PACK_ATOMICS=1) and the device has a
  * single active kernel queue, which runs its commands in order. On G17P,
  * packed atomics are enabled by default (disable with HK_PACK_ATOMICS=0)
- * whenever the single-active-kernel-queue invariant holds: no sibling kernel
- * queue is in flight (hk_sibling_in_flight()), sibling routing stays off
- * until any packed atomic submission completes (packed_atomic_point), and no
- * other VkQueue or host-AS queue on the device has a kernel queue. A second
- * kernel queue created while a packet runs is not covered; unpacked atomic
- * work has the same exposure. The G16 kernel puts every compute command of a
- * VM on its one firmware compute queue and never runs one beside another
- * VM's: several commands of one VM may be in flight there, but the firmware
- * runs them one after another, never beside a packet. G16G packs them unless
- * HK_PACK_ATOMICS=0. That is a property of the G16 kernel, the only one for
- * G16G, which no uAPI feature reports yet; the chip stands for it until one
- * does (hk_pack_atomics_choice()). */
+ * whenever the single-kernel-queue invariant holds for the lifetime of the
+ * device: no sibling kernel queue is in flight (hk_sibling_in_flight()),
+ * sibling routing stays off until any packed atomic submission completes
+ * (packed_atomic_point), and no other non-emulated VkQueue, host-AS queue,
+ * or compute-kick queue exists on the device. Because kernel queues are
+ * admitted lazily on first submission, checking only whether another queue
+ * already has a kernel queue ID leaves a race where a second queue admits
+ * and submits concurrently before an in-flight packed atomic chain finishes
+ * (and waiting for packed_atomic_point at admission would deadlock valid
+ * wait-before-signal timeline semaphore submits). The G16 kernel puts every
+ * compute command of a VM on its one firmware compute queue and never runs
+ * one beside another VM's: several commands of one VM may be in flight there,
+ * but the firmware runs them one after another, never beside a packet. G16G
+ * packs them unless HK_PACK_ATOMICS=0. That is a property of the G16 kernel,
+ * the only one for G16G, which no uAPI feature reports yet; the chip stands
+ * for it until one does (hk_pack_atomics_choice()). */
 DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
 DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
 
-static bool
+bool
 hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue)
 {
    const char *opt = debug_get_option_hk_pack_atomics_opt();
@@ -2968,7 +2973,7 @@ hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue)
       opt = debug_get_option_m5_pack_atomics_opt();
 
    const struct hk_queue *as = dev->host_as.queue;
-   if (as && as != queue && p_atomic_read(&as->drm.id) != UINT32_MAX)
+   if (as && as != queue && !vk_queue_is_emulated(&as->vk))
       return false;
 
    if (dev->dev.chip == AGX_CHIP_G16G)
@@ -2979,14 +2984,14 @@ hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue)
    const bool default_on = dev->dev.chip == AGX_CHIP_G17P;
    if (!hk_pack_atomics_choice(default_on, opt, 1))
       return false;
-   if (hk_sibling_in_flight(dev, queue))
+   if (queue->kick.watched || hk_sibling_in_flight(dev, queue))
       return false;
 
    vk_foreach_queue(iter, &dev->vk) {
       if (vk_queue_is_emulated(iter))
          continue;
       const struct hk_queue *other = container_of(iter, struct hk_queue, vk);
-      if (other != queue && p_atomic_read(&other->drm.id) != UINT32_MAX)
+      if (other != queue)
          return false;
    }
    return true;
@@ -3654,11 +3659,49 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    return result;
 }
 
+/* Wait, up to timeout_ns in all, for the GPU to finish everything the
+ * application's queues have handed to the kernel, also when the device is
+ * lost: its earlier submissions may still run. Work still queued in the
+ * runtime's submit thread has not reached the kernel and is not waited for.
+ */
+void
+hk_device_wait_submitted(struct hk_device *dev, uint64_t timeout_ns)
+{
+   const uint64_t deadline = os_time_get_absolute_timeout(timeout_ns);
+   const int64_t abs_timeout = (int64_t)MIN2(deadline, (uint64_t)INT64_MAX);
+   bool warned = false;
+
+   list_for_each_entry(struct vk_queue, iter, &dev->vk.queues, link) {
+      struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
+      uint64_t point = 0;
+
+      if (!queue->drm.syncobj)
+         continue;
+
+      /* The last point the kernel accepted, which has a fence: the cursor
+       * may sit past it on a point a failed submission skipped. Failed work
+       * carries an error fence and does not delay this. */
+      if (drmSyncobjQuery2(dev->dev.fd, &queue->drm.syncobj, &point, 1,
+                           DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED) ||
+          !point)
+         continue;
+
+      int ret;
+      do {
+         ret = drmSyncobjTimelineWait(dev->dev.fd, &queue->drm.syncobj, &point,
+                                      1, abs_timeout, 0, NULL);
+      } while (ret == -EINTR);
+      if (ret == -ETIME && !warned) {
+         mesa_logw("hk: device destroyed while its GPU work was still running");
+         warned = true;
+      }
+   }
+}
+
 void
 hk_device_quiesce_lost_submissions(struct hk_device *dev)
 {
-   if (!agx_chip_g17_m5(dev->dev.chip) ||
-       !vk_device_is_lost_no_report(&dev->vk))
+   if (!vk_device_is_lost_no_report(&dev->vk))
       return;
 
    /* GPU storage remains pinned separately. This protects host object data
@@ -3728,7 +3771,7 @@ uint32_t
 hk_queue_independent_budget(struct hk_device *dev)
 {
    if (!(dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) ||
-       dev->dev.is_virtio)
+       dev->dev.is_virtio || (dev->dev.debug & AGX_DBG_1QUEUE))
       return 1;
 
    const uint32_t max_queues = hk_device_physical(dev)->queue_limits.max_queues;
@@ -3771,6 +3814,7 @@ hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
    if (independent < hk_queue_independent_budget(dev))
       return;
 
+   const bool single_kernel_queue = (dev->dev.debug & AGX_DBG_1QUEUE) != 0;
    struct vk_queue *backing = NULL;
    unsigned backing_sharers = 0;
    vk_foreach_queue(iter, &dev->vk) {
@@ -3779,8 +3823,9 @@ hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
       if (vk_queue_is_emulated(iter))
          continue;
       const struct hk_queue *real = container_of(iter, struct hk_queue, vk);
-      if (real->drm.virt_ring_idx != queue->drm.virt_ring_idx ||
-          real->vk.flags != queue->vk.flags)
+      if (!single_kernel_queue &&
+          (real->drm.virt_ring_idx != queue->drm.virt_ring_idx ||
+           real->vk.flags != queue->vk.flags))
          continue;
       const unsigned sharers = hk_queue_sharers(dev, iter);
       if (!backing || sharers < backing_sharers) {
