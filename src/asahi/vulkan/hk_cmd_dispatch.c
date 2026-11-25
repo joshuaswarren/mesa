@@ -4477,33 +4477,14 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
                                       (uint32_t)k_i, grid->count))
       return normal;
 
-   struct hk_shader *alt = NULL;
-   uint32_t tile_n = 0;
-   if (!gemm->is_guarded) {
-      if (((uint32_t)n_i % 64) == 0 && api->gemm_cmat64) {
-         alt = api->gemm_cmat64;
-         tile_n = 64;
-      } else if (api->gemm_cmat32) {
-         alt = api->gemm_cmat32;
-         tile_n = 32;
-      }
-   } else {
-      /* Guarded tile-width selection:
-       * - N <= 16: cmat16 (32x16, K_step=32) avoids 50-75% N-lane waste.
-       * - N > 32 with even ceil(N/32) and K >= 32: cmat64 (32x64, K_step=32)
-       *   matches cmat32's padded N-tile footprint while halving K-loop
-       *   barriers and doubling M-parallelism. When ceil(N/32) is odd or
-       *   K < 32, cmat32 (64x32, K_step=16) avoids extra N-padding waste and
-       *   keeps full K-steps on the fast path.
-       * - Otherwise: cmat32 (64x32, K_step=16). */
-      tile_n = hk_gemm_cmat_select_tile_n((uint32_t)n_i, (uint32_t)k_i,
-                                          api->gemm_cmat16 != NULL,
-                                          api->gemm_cmat32 != NULL,
-                                          api->gemm_cmat64 != NULL);
-      alt = tile_n == 16 ? api->gemm_cmat16 :
-            tile_n == 32 ? api->gemm_cmat32 :
-            tile_n == 64 ? api->gemm_cmat64 : NULL;
-   }
+   const uint32_t tile_n = hk_gemm_cmat_select_tile_n(
+      m_u, (uint32_t)n_i, (uint32_t)k_i,
+      api->gemm_cmat16 != NULL, api->gemm_cmat32 != NULL,
+      api->gemm_cmat64 != NULL);
+   struct hk_shader *alt =
+      tile_n == 16 ? api->gemm_cmat16 :
+      tile_n == 32 ? api->gemm_cmat32 :
+      tile_n == 64 ? api->gemm_cmat64 : NULL;
    if (!alt ||
        !hk_g17p_compute_shader_supported(dev->dev.chip, alt, alt->only_linked, 1u << 16))
       return normal;

@@ -10741,10 +10741,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                } else if (pair.role == HK_COMPUTE_PAIR_GEMM &&
                           pair.gemm.cmat_valid &&
                           agx_chip_cooperative_matrix_supported(dev->dev.chip)) {
-                  if (pair.gemm.is_guarded) {
-                     gemm_cmat16_nir =
-                        hk_nir_build_gemm_cmat(nir, &pair.gemm, 16, NULL, HK_COMPUTE_PAIR_DUAL_NONE);
-                  }
+                  gemm_cmat16_nir =
+                     hk_nir_build_gemm_cmat(nir, &pair.gemm, 16, NULL, HK_COMPUTE_PAIR_DUAL_NONE);
                   gemm_cmat32_nir =
                      hk_nir_build_gemm_cmat(nir, &pair.gemm, 32, NULL, HK_COMPUTE_PAIR_DUAL_NONE);
                   gemm_cmat64_nir =

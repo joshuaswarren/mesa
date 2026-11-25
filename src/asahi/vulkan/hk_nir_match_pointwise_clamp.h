@@ -275,22 +275,34 @@ hk_gemm_cmat_k_step(uint32_t tile_n)
    return tile_n == 32u ? 16u : 32u;
 }
 
-/* Choose cooperative-matrix tile_n (16, 32, or 64) for a guarded GEMM dispatch.
+/* Choose cooperative-matrix tile_n (16, 32, or 64) for a GEMM dispatch.
  * - N <= 16: cmat16 (32x16, K_step=32) avoids empty N-columns.
+ * - Small-grid high-K GEMMs where cmat64 (g64 <= 16 with K >= 64, or
+ *   g64 <= 28 with K >= 128) or cmat32 (g32 <= 32 with K >= 64) would
+ *   under-fill shader cores: cmat16 (32x16, K_step=32) multiplies workgroup
+ *   count by up to 4x and halves K-loop barriers vs cmat32.
  * - N > 32 with even ceil(N/32) and K >= 32: cmat64 (32x64, K_step=32) halves
  *   workgroup barriers and doubles M-parallelism without extra N-padding waste.
  * - Otherwise: cmat32 (64x32, K_step=16). */
 static inline uint32_t
-hk_gemm_cmat_select_tile_n(uint32_t n_u, uint32_t k_u,
+hk_gemm_cmat_select_tile_n(uint64_t m_u, uint32_t n_u, uint32_t k_u,
                            bool has16, bool has32, bool has64)
 {
    const uint32_t n_tiles32 = (n_u + 31u) / 32u;
    if (n_u <= 16u && has16)
       return 16u;
-   if (n_u > 32u && (n_tiles32 % 2u) == 0u && k_u >= 32u && has64)
+   if (n_u > 32u && (n_tiles32 % 2u) == 0u && k_u >= 32u && has64) {
+      const uint64_t g64 = ((m_u + 31ull) / 32ull) * ((uint64_t)(n_u + 63u) / 64ull);
+      if (has16 && ((g64 <= 16ull && k_u >= 64u) || (g64 <= 28ull && k_u >= 128u)))
+         return 16u;
       return 64u;
-   if (has32)
+   }
+   if (has32) {
+      const uint64_t g32 = ((m_u + 63ull) / 64ull) * (uint64_t)n_tiles32;
+      if (has16 && g32 <= 32ull && k_u >= 64u)
+         return 16u;
       return 32u;
+   }
    if (has64)
       return 64u;
    if (has16)
