@@ -293,7 +293,7 @@ hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
     * hk_set_view_index will dirty the root each draw.
     */
    cmd->state.gfx.descriptors.root.draw.view_index = 0;
-   cmd->state.gfx.descriptors.root_dirty = true;
+   hk_root_mark_dirty(&cmd->state.gfx.descriptors);
 }
 
 void
@@ -4622,7 +4622,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
 
    if (cmd->state.gfx.descriptors.root.draw.view_index != 0) {
       cmd->state.gfx.descriptors.root.draw.view_index = 0;
-      cmd->state.gfx.descriptors.root_dirty = true;
+      hk_root_mark_dirty(&cmd->state.gfx.descriptors);
    }
 
    hk_frame_anatomy_note(dev, "pass-merge continue: %ux%u draws_before=%u%s",
@@ -4795,7 +4795,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    render->no_attachments = no_attachments;
    if (cmd->state.gfx.descriptors.root.draw.no_attachments != no_attachments) {
       cmd->state.gfx.descriptors.root.draw.no_attachments = no_attachments;
-      cmd->state.gfx.descriptors.root_dirty = true;
+      hk_root_mark_dirty(&cmd->state.gfx.descriptors);
    }
 
    if (unlikely(dev->frame_anatomy)) {
@@ -5246,7 +5246,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
     */
    if (cmd->state.gfx.descriptors.root.draw.view_index != 0) {
       cmd->state.gfx.descriptors.root.draw.view_index = 0;
-      cmd->state.gfx.descriptors.root_dirty = true;
+      hk_root_mark_dirty(&cmd->state.gfx.descriptors);
    }
 
    render->bg_live_mask = 0;
@@ -6881,7 +6881,7 @@ hk_flush_shaders(struct hk_cmd_buffer *cmd)
       const bool api_gs = gs && !gs->is_passthrough;
       if (desc->root.draw.api_gs != api_gs) {
          desc->root.draw.api_gs = api_gs;
-         desc->root_dirty = true;
+         hk_root_mark_dirty(desc);
       }
       BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_RS_RASTERIZER_DISCARD_ENABLE);
    }
@@ -6911,7 +6911,7 @@ hk_flush_shaders(struct hk_cmd_buffer *cmd)
       desc->root.draw.uvs_index[i] = slot;
    }
    if (uvs_index_changed)
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
 
    /* Shader replacement changes the logical root only if the selected
     * immutable data address actually changes.  In particular, equivalent
@@ -6923,11 +6923,11 @@ hk_flush_shaders(struct hk_cmd_buffer *cmd)
       hk_cmd_upload_constants(cmd, fs, MESA_SHADER_FRAGMENT);
    if (desc->root.draw.vs_constant_data_addr != vs_constant_data_addr) {
       desc->root.draw.vs_constant_data_addr = vs_constant_data_addr;
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
    }
    if (desc->root.draw.fs_constant_data_addr != fs_constant_data_addr) {
       desc->root.draw.fs_constant_data_addr = fs_constant_data_addr;
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
    }
 }
 
@@ -10825,7 +10825,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       .cull_2 = varyings_dirty,
 
       .fragment_shader = fs_dirty || linked_fs_dirty || varyings_dirty ||
-                         gfx->descriptors.root_dirty,
+                         hk_root_dirty(&gfx->descriptors),
 
       .occlusion_query = gfx->dirty & HK_DIRTY_OCCLUSION,
       .output_size = hw_vs_dirty,
@@ -11977,7 +11977,7 @@ hk_gfx_republishes_render_state(struct hk_cmd_buffer *cmd)
    struct hk_shader *sw_vs = hk_bound_sw_vs(gfx);
 
    return vk_dynamic_graphics_state_any_dirty(dyn) || gfx->dirty ||
-          gfx->descriptors.root_dirty || gfx->shaders_dirty ||
+          hk_root_dirty(&gfx->descriptors) || gfx->shaders_dirty ||
           hk_fs_clear_fill_stale(cmd, cmd->current_cs.gfx) ||
           sw_vs->b.info.uses_draw_id || sw_vs->b.info.uses_base_param ||
           (gfx->linked[MESA_SHADER_VERTEX] &&
@@ -12277,7 +12277,8 @@ hk_flush_vertex_attribs_root(struct hk_cmd_buffer *cmd,
       ++slot;
    }
 
-   desc->root_dirty |= vertex_root_changed;
+   if (vertex_root_changed)
+      hk_root_mark_dirty(desc);
    gfx->root_vertex_buffer_generation = gfx->vertex_buffer_generation;
 }
 
@@ -12425,14 +12426,14 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
       memcpy(desc->root.draw.blend_constant, dyn->cb.blend_constants,
              sizeof(dyn->cb.blend_constants));
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
    }
 
    if (IS_DIRTY(MS_SAMPLE_MASK)) {
       const uint16_t sample_mask = dyn->ms.sample_mask;
       if (desc->root.draw.api_sample_mask != sample_mask) {
          desc->root.draw.api_sample_mask = sample_mask;
-         desc->root_dirty = true;
+         hk_root_mark_dirty(desc);
       }
    }
 
@@ -12442,7 +12443,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       const float bias = height != 0.0f ? 1.0f / (32.0f * height) : 0.0f;
       if (desc->root.line_y_bias != bias) {
          desc->root.line_y_bias = bias;
-         desc->root_dirty = true;
+         hk_root_mark_dirty(desc);
       }
    }
 
@@ -12451,7 +12452,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          dyn->vp.depth_clip_negative_one_to_one ? 0.5f : 0.0f;
       if (desc->root.clip_z_coeff != clip_z_coeff) {
          desc->root.clip_z_coeff = clip_z_coeff;
-         desc->root_dirty = true;
+         hk_root_mark_dirty(desc);
       }
    }
 
@@ -12459,7 +12460,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       const uint16_t stream = dyn->rs.rasterization_stream;
       if (desc->root.draw.rasterization_stream != stream) {
          desc->root.draw.rasterization_stream = stream;
-         desc->root_dirty = true;
+         hk_root_mark_dirty(desc);
       }
 
       BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_RS_RASTERIZER_DISCARD_ENABLE);
@@ -12478,7 +12479,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
       if (desc->root.draw.force_never_in_shader != force_never_in_shader) {
          desc->root.draw.force_never_in_shader = force_never_in_shader;
-         desc->root_dirty = true;
+         hk_root_mark_dirty(desc);
       }
    }
 
@@ -12514,7 +12515,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        IS_DIRTY(DS_DEPTH_COMPARE_OP) ||
        IS_DIRTY(DS_DEPTH_BOUNDS_TEST_ENABLE) ||
        IS_DIRTY(DS_STENCIL_TEST_ENABLE) ||
-       (gfx->dirty & HK_DIRTY_OCCLUSION) || desc->root_dirty) {
+       (gfx->dirty & HK_DIRTY_OCCLUSION) || hk_root_dirty(desc)) {
       const uint16_t no_epilog_discard =
          !epilog_discards && !read_only_early_reject ? UINT16_MAX : 0;
       /* A main part compiled with the selector folded (AGX3 static state)
@@ -12526,7 +12527,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
           desc->root.draw.alpha_to_coverage != alpha_to_coverage) {
          desc->root.draw.no_epilog_discard = no_epilog_discard;
          desc->root.draw.alpha_to_coverage = alpha_to_coverage;
-         desc->root_dirty = true;
+         hk_root_mark_dirty(desc);
       }
    }
 
@@ -12641,7 +12642,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          gfx->dirty |= HK_DIRTY_PROVOKING;
 
          gfx->descriptors.root.draw.provoking = provoking;
-         gfx->descriptors.root_dirty = true;
+         hk_root_mark_dirty(&gfx->descriptors);
       }
    }
 
@@ -12699,7 +12700,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
           gfx->descriptors.root.ppp_multisamplectl_hi != (ctrl >> 32)) {
          gfx->descriptors.root.draw.ppp_multisamplectl = (uint32_t)ctrl;
          gfx->descriptors.root.ppp_multisamplectl_hi = ctrl >> 32;
-         gfx->descriptors.root_dirty = true;
+         hk_root_mark_dirty(&gfx->descriptors);
       }
    }
 
@@ -12759,7 +12760,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       if (desc->root.draw.vertex_params != vertex_params ||
           desc->root.draw.vertex_outputs != old_outputs) {
          desc->root.draw.vertex_params = vertex_params;
-         desc->root_dirty = true;
+         hk_root_mark_dirty(desc);
       }
    }
 
@@ -12768,7 +12769,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       tess_args = hk_pool_alloc(cmd, sizeof(struct poly_tess_params), 4);
       if (gfx->descriptors.root.draw.tess_params != tess_args.gpu) {
          gfx->descriptors.root.draw.tess_params = tess_args.gpu;
-         gfx->descriptors.root_dirty = true;
+         hk_root_mark_dirty(&gfx->descriptors);
       }
    }
 
@@ -12776,7 +12777,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       const uint64_t geometry_params = hk_upload_geometry_params(cmd, draw);
       if (gfx->descriptors.root.draw.geometry_params != geometry_params) {
          gfx->descriptors.root.draw.geometry_params = geometry_params;
-         gfx->descriptors.root_dirty = true;
+         hk_root_mark_dirty(&gfx->descriptors);
       }
    }
 
@@ -12791,7 +12792,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          gfx->render.no_attachments && !fs_reads_hw_layer;
       if (gfx->descriptors.root.draw.no_attachments != no_attachments) {
          gfx->descriptors.root.draw.no_attachments = no_attachments;
-         gfx->descriptors.root_dirty = true;
+         hk_root_mark_dirty(&gfx->descriptors);
       }
    }
 
@@ -12799,8 +12800,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (agx_chip_native_hal200(dev->dev.chip) &&
        hk_root_upload_needs_growth(gfx->descriptors.uploaded_root_size,
                                    hk_gfx_root_descriptor_size(cmd)))
-      gfx->descriptors.root_dirty = true;
-   if (gfx->descriptors.root_dirty) {
+      hk_root_mark_dirty(&gfx->descriptors);
+   if (hk_root_dirty(&gfx->descriptors)) {
       gfx->root =
          hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
    }
@@ -12829,7 +12830,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (agx_chip_native_agx3(dev->dev.chip) ||
       (gfx->dirty & (HK_DIRTY_PROVOKING | HK_DIRTY_VARYINGS)) ||
       IS_DIRTY(RS_RASTERIZER_DISCARD_ENABLE) || linked_vs_dirty || vgt_dirty ||
-      gfx->descriptors.root_dirty || gfx->draw_id_ptr || gfx->draw_params ||
+      hk_root_dirty(&gfx->descriptors) || gfx->draw_id_ptr || gfx->draw_params ||
       IS_DIRTY(RS_DEPTH_BIAS_ENABLE) || IS_DIRTY(RS_DEPTH_BIAS_FACTORS) ||
       IS_DIRTY(VP_SCISSORS) || IS_DIRTY(VP_SCISSOR_COUNT) ||
       IS_DIRTY(VP_VIEWPORTS) || IS_DIRTY(VP_VIEWPORT_COUNT) ||
@@ -13099,7 +13100,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    gfx->shaders_dirty = 0;
    gfx->linked_dirty = 0;
    gfx->dirty = 0;
-   gfx->descriptors.root_dirty = false;
+   hk_root_mark_clean(&gfx->descriptors);
 
 }
 
@@ -13172,7 +13173,7 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        gfx->g17p_bind_tail.render_view_mask != gfx->render.view_mask)
       return false;
 
-   if (!desc->root_dirty && agx_chip_native_hal200(dev->dev.chip) &&
+   if (!hk_root_dirty(desc) && agx_chip_native_hal200(dev->dev.chip) &&
        hk_root_upload_needs_growth(desc->uploaded_root_size,
                                    hk_gfx_root_descriptor_size(cmd)))
       return false;
@@ -13182,11 +13183,26 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    *g17p_native_bind_tail_emitted_out = false;
 
+   /* Only push constants changed since the root was uploaded, and the
+    * fragment program, which keeps following the uploaded root
+    * (hk_agx3_fragment_root()), cannot read them: the vertex program can be
+    * launched over a copy of the push constants it reads, keeping the
+    * uploaded root (hk_agx3_try_push_only_vs_program()). Once it has been,
+    * a draw that changes nothing keeps that launch as a clean root would
+    * keep its own. */
+   const bool push_launch_fits =
+      hk_root_push_only_dirty(desc) && !agx_is_indirect(draw.b) &&
+      !hw_vs->b.info.has_preamble &&
+      !(fs->info.agx3_root_reads &
+        (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_PUSH)) &&
+      !hk_root_upload_needs_growth(desc->uploaded_root_size,
+                                   hk_gfx_root_descriptor_size(cmd));
+
    const bool republishes_base_param =
       sw_vs->b.info.uses_base_param || linked_vs->b.uses_base_param;
    const bool uses_draw_id = sw_vs->b.info.uses_draw_id;
-   if (!gfx->dirty && !desc->root_dirty && !republishes_base_param &&
-       !uses_draw_id)
+   if (!gfx->dirty && hk_root_launch_current(desc, push_launch_fits) &&
+       !republishes_base_param && !uses_draw_id)
       return true;
 
    if (unlikely(dev->frame_anatomy))
@@ -13200,7 +13216,17 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    hk_flush_draw_params_and_id(cmd, sw_vs, linked_vs, draw_id, draw);
 
-   if (desc->root_dirty) {
+   /* hk_flush_vertex_attribs_root() may have changed more of the root since
+    * push_launch_fits was decided. The root stays dirty after a push-only
+    * launch, so the next draw that needs all of it, through any path,
+    * uploads it. */
+   uint64_t pipeline_program = 0;
+   if (push_launch_fits && hk_root_push_only_dirty(desc))
+      pipeline_program =
+         hk_agx3_try_push_only_vs_program(cmd, hw_vs, linked_vs);
+   const bool push_only = pipeline_program != 0;
+
+   if (!push_only && hk_root_dirty(desc)) {
       gfx->root =
          hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
    }
@@ -13209,8 +13235,8 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    uint8_t *out = cs->current;
 
    hk_reserve_scratch(cmd, cs, hw_vs);
-   const uint64_t pipeline_program =
-      hk_upload_usc_words(cmd, hw_vs, linked_vs);
+   if (!push_only)
+      pipeline_program = hk_upload_usc_words(cmd, hw_vs, linked_vs);
    bool tail_emitted = false;
    if (!hk_agx3_publish_vertex_state(cmd, cs, &out, hw_vs, pipeline_program,
                                      draw, true, false, &tail_emitted))
@@ -13223,7 +13249,10 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return true;
 
    gfx->dirty = 0;
-   desc->root_dirty = false;
+   if (push_only)
+      hk_root_mark_push_launched(desc);
+   else
+      hk_root_mark_clean(desc);
    return true;
 }
 
@@ -13269,7 +13298,7 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
              cmd,
              VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)) ==
              gfx->fast_link_fs.key.prolog.statistics) {
-         if (!gfx->descriptors.root_dirty && !hw_vs->b.info.uses_draw_id &&
+         if (!hk_root_dirty(&gfx->descriptors) && !hw_vs->b.info.uses_draw_id &&
              !linked_vs->b.uses_base_param)
             return;
 
@@ -13324,7 +13353,7 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             }
 
             cs->current = out;
-            gfx->descriptors.root_dirty = false;
+            hk_root_mark_clean(&gfx->descriptors);
             return;
          }
       }
@@ -13956,7 +13985,7 @@ hk_set_view_index(struct hk_cmd_buffer *cmd, uint32_t view_idx)
 {
    if (cmd->state.gfx.render.view_mask) {
       cmd->state.gfx.descriptors.root.draw.view_index = view_idx;
-      cmd->state.gfx.descriptors.root_dirty = true;
+      hk_root_mark_dirty(&cmd->state.gfx.descriptors);
    }
 
    return true;
@@ -14903,7 +14932,7 @@ hk_record_mesh_launch(struct hk_cmd_buffer *cmd, uint32_t draw_id)
    cs->stats.cmds++;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
    gfx->dirty = gfx->shaders_dirty = gfx->linked_dirty = 0;
-   gfx->descriptors.root_dirty = false;
+   hk_root_mark_clean(&gfx->descriptors);
 }
 
 /* A known grid's entries are allocated at recording (a large allocation gets
@@ -15011,7 +15040,7 @@ hk_draw_mesh_sw_task(struct hk_cmd_buffer *cmd, uint64_t grid,
    desc->root.mesh_grid_addr = grid;
    desc->root.mesh_draw_id = draw_id;
    desc->root.mesh_launch = 0;
-   desc->root_dirty = true;
+   hk_root_mark_dirty(desc);
    gfx->mesh.grid = grid;
 
    /* The children are known only on the GPU: record the launches for up to
@@ -15026,7 +15055,7 @@ hk_draw_mesh_sw_task(struct hk_cmd_buffer *cmd, uint64_t grid,
       gfx->mesh.object_params = hk_pool_upload(cmd, &params, sizeof(params), 8);
       if (desc->root.mesh_launch != launch) {
          desc->root.mesh_launch = launch;
-         desc->root_dirty = true;
+         hk_root_mark_dirty(desc);
       }
       hk_record_mesh_launch(cmd, draw_id);
       if (vk_command_buffer_has_error(&cmd->vk))
@@ -15058,7 +15087,7 @@ hk_draw_mesh_g17p(struct hk_cmd_buffer *cmd, uint64_t grid,
    if (desc->root.mesh_grid_addr != grid || desc->root.mesh_draw_id != draw_id) {
       desc->root.mesh_grid_addr = grid;
       desc->root.mesh_draw_id = draw_id;
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
    }
    /* A grid that fits one launch goes out as it is (hk_mesh_launch_whole()). */
    const bool whole = cpu_grid &&
@@ -15066,7 +15095,7 @@ hk_draw_mesh_g17p(struct hk_cmd_buffer *cmd, uint64_t grid,
       cpu_grid[1] <= HK_MESH_LAUNCH_MAX_Y;
    if (desc->root.mesh_whole != whole) {
       desc->root.mesh_whole = whole;
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
    }
    const uint32_t launches = !cpu_grid ? HK_MESH_LAUNCHES_MAX
       : whole ? 1
@@ -15082,7 +15111,7 @@ hk_draw_mesh_g17p(struct hk_cmd_buffer *cmd, uint64_t grid,
       gfx->mesh.object_params = hk_pool_upload(cmd, &params, sizeof(params), 8);
       if (desc->root.mesh_launch != launch) {
          desc->root.mesh_launch = launch;
-         desc->root_dirty = true;
+         hk_root_mark_dirty(desc);
       }
       hk_record_mesh_launch(cmd, draw_id);
       if (vk_command_buffer_has_error(&cmd->vk))
@@ -15162,18 +15191,18 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    struct hk_descriptor_state *desc = &gfx->descriptors;
    if (task && desc->root.mesh_task_flag != task_flag) {
       desc->root.mesh_task_flag = task_flag;
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
    }
    if ((mesh_info->reads_num_workgroups ||
         (task && task->info.mesh.reads_num_workgroups)) &&
        desc->root.mesh_grid_addr != grid) {
       desc->root.mesh_grid_addr = grid;
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
    }
    if ((mesh_info->reads_draw_id || (task && task->info.mesh.reads_draw_id)) &&
        desc->root.mesh_draw_id != draw_id) {
       desc->root.mesh_draw_id = draw_id;
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
    }
    gfx->mesh.object_params = 0;
    if (!task && (dev->dev.chip == AGX_CHIP_G17P || count_address || conditional)) {
@@ -15254,7 +15283,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    cs->stats.cmds++;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
    gfx->dirty = gfx->shaders_dirty = gfx->linked_dirty = 0;
-   gfx->descriptors.root_dirty = false;
+   hk_root_mark_clean(&gfx->descriptors);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -15457,7 +15486,7 @@ hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
    /* Nothing dirty: every state-derivation block of the general path is
     * then a no-op, and hk_flush_shaders() returns before doing anything. */
    if (gfx->shaders_dirty || gfx->linked_dirty || gfx->dirty ||
-       desc->root_dirty || desc->push_dirty ||
+       hk_root_dirty(desc) || desc->push_dirty ||
        vk_dynamic_graphics_state_any_dirty(dyn) ||
        !gfx->fast_link_vs.valid || !gfx->fast_link_fs.valid ||
        hk_fs_clear_fill_stale(cmd, cmd->current_cs.gfx))
@@ -15602,7 +15631,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       gfx->shaders_dirty = 0;
       gfx->linked_dirty = 0;
       gfx->dirty = 0;
-      desc->root_dirty = false;
+      hk_root_mark_clean(desc);
    }
 
    if (vk_command_buffer_has_error(&cmd->vk))

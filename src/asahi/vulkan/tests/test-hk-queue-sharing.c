@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include "c11/threads.h"
 #include "util/simple_mtx.h"
+#include "hk_compute_kick.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_physical_device.h"
@@ -49,6 +50,7 @@ set_kernel(uint64_t features, bool virtio, uint32_t max_queues,
 {
    dev->dev.params.features = features;
    dev->dev.is_virtio = virtio;
+   dev->dev.debug = 0;
    pdev->queue_limits = (struct drm_asahi_queue_limits){
       .max_queues = max_queues,
       .max_in_flight_per_queue = max_in_flight_per_queue,
@@ -58,14 +60,19 @@ set_kernel(uint64_t features, bool virtio, uint32_t max_queues,
 static void
 test_budget(void)
 {
-   /* One kernel queue per class without independent kernel queues, or under
-    * virtio where the limits cannot be queried, whatever the limits hold. */
+   /* One kernel queue per class without independent kernel queues, under
+    * virtio where the limits cannot be queried, or under AGX_DBG_1QUEUE,
+    * whatever the limits hold. */
    set_kernel(0, false, 58, 2);
    CHECK(hk_queue_independent_budget(dev) == 1);
    set_kernel(0, false, 0, 0);
    CHECK(hk_queue_independent_budget(dev) == 1);
    set_kernel(IQ, true, 58, 2);
    CHECK(hk_queue_independent_budget(dev) == 1);
+   set_kernel(IQ, false, 58, 2);
+   dev->dev.debug = AGX_DBG_1QUEUE;
+   CHECK(hk_queue_independent_budget(dev) == 1);
+   dev->dev.debug = 0;
 
    /* A pool of 58 or 42 kernel queues allows 11 or 8 Vulkan queues, one per
     * 1 + HK_QUEUE_SIBLINGS_MAX kernel queues, capped at the advertised count.
@@ -144,9 +151,12 @@ backing(unsigned i)
       container_of(queue->vk.real_queue, struct hk_queue, vk);
    CHECK(real >= pool && real < pool + pool_count);
    CHECK(!vk_queue_is_emulated(&real->vk));
-   /* Sharing never crosses a priority class or creation flags. */
-   CHECK(real->drm.virt_ring_idx == queue->drm.virt_ring_idx);
-   CHECK(real->vk.flags == queue->vk.flags);
+   /* Sharing never crosses a priority class or creation flags, except under
+    * AGX_DBG_1QUEUE where every queue maps to the single shared kernel queue. */
+   if (!(dev->dev.debug & AGX_DBG_1QUEUE)) {
+      CHECK(real->drm.virt_ring_idx == queue->drm.virt_ring_idx);
+      CHECK(real->vk.flags == queue->vk.flags);
+   }
    return real - pool;
 }
 
@@ -245,7 +255,8 @@ test_advertised(void)
    finish_all();
 }
 
-/* Without independent kernel queues, every queue of a class shares one. */
+/* Without independent kernel queues (or under AGX_DBG_1QUEUE), every queue of
+ * a class shares one. */
 static void
 test_single(void)
 {
@@ -257,6 +268,20 @@ test_single(void)
    CHECK(backing(m0) == m0);
    CHECK(backing(m1) == m0 && backing(m2) == m0);
    CHECK(backing(l0) == l0);
+   finish_all();
+
+   set_kernel(IQ, false, 58, 2);
+   dev->dev.debug = AGX_DBG_1QUEUE;
+   const unsigned d0 = add(MEDIUM, 0);
+   const unsigned d1 = add(MEDIUM, 0);
+   const unsigned d2 = add(LOW, 0);
+   const unsigned d3 = add(HIGH, PROTECTED);
+   CHECK(backing(d0) == d0 && backing(d1) == d0 &&
+         backing(d2) == d0 && backing(d3) == d0);
+   CHECK(independent() == 1);
+   hk_compute_kick_init(dev, 10);
+   CHECK(dev->compute_kick == NULL);
+   CHECK(!pool[d0].kick.watched);
    finish_all();
 }
 

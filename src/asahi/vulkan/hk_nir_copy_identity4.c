@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "hk_identity_copy4.h"
+#include "hk_nir_wgid.h"
 #include "compiler/nir/nir_builder.h"
 
 static nir_scalar
@@ -280,23 +281,39 @@ bind_im2col_mul(struct im2col_params *p, enum im2col_param_id id,
    return false;
 }
 
+/* Accept load_workgroup_id[axis] as GlobalInvocationID[axis] when
+ * local_size[axis] == 1 (so LocalInvocationID[axis] == 0).
+ *
+ * NOTE: The bare load_workgroup_id[axis] form (without + load_base_workgroup_id)
+ * equals GlobalInvocationID[axis] ONLY when base_group[axis] == 0. This matcher
+ * is sound only together with the dispatch-time nonzero-base refusal gate
+ * (hk_nir_dispatch_zero_base() in hk_cmd_dispatch.c:hk_select_identity_copy4()),
+ * which falls back to the original shader whenever any vkCmdDispatchBase offset
+ * is nonzero. */
+static bool
+is_coord_id(nir_scalar s, unsigned axis, unsigned local_size)
+{
+   s = nir_scalar_chase_movs(s);
+   return s.def && s.def->bit_size == 32 && s.comp == axis &&
+          (intr(s.def, nir_intrinsic_load_global_invocation_id) ||
+           (local_size == 1 && intr(s.def, nir_intrinsic_load_workgroup_id)));
+}
+
 static bool
 coord(nir_scalar s, unsigned axis, unsigned local_size)
 {
    s = strip_zero_add(s);
-   if (s.comp == axis && intr(s.def, nir_intrinsic_load_global_invocation_id))
+   if (is_coord_id(s, axis, local_size))
       return true;
    if (!alu(s, nir_op_iadd))
       return false;
 
    nir_scalar g = arg(s, 0), base = arg(s, 1);
-   if (g.comp == axis && intr(g.def, nir_intrinsic_load_global_invocation_id) &&
-       const_arg(base, nir_op_imul, 1, local_size) && arg(base, 0).comp == axis &&
-       intr(arg(base, 0).def, nir_intrinsic_load_base_workgroup_id))
+   if (is_coord_id(g, axis, local_size) &&
+       hk_nir_match_base_wg_scaled(base, axis, local_size))
       return true;
-   if (base.comp == axis && intr(base.def, nir_intrinsic_load_global_invocation_id) &&
-       const_arg(g, nir_op_imul, 1, local_size) && arg(g, 0).comp == axis &&
-       intr(arg(g, 0).def, nir_intrinsic_load_base_workgroup_id))
+   if (is_coord_id(base, axis, local_size) &&
+       hk_nir_match_base_wg_scaled(g, axis, local_size))
       return true;
    return false;
 }
@@ -894,6 +911,7 @@ collect_accesses(nir_function_impl *impl, struct access_set *accesses)
          nir_intrinsic_instr *op = nir_instr_as_intrinsic(instr);
          switch (op->intrinsic) {
          case nir_intrinsic_load_global_invocation_id:
+         case nir_intrinsic_load_workgroup_id:
          case nir_intrinsic_load_base_workgroup_id:
          case nir_intrinsic_load_push_constant:
          case nir_intrinsic_vulkan_resource_index:
@@ -1156,6 +1174,7 @@ match_linear_1d(nir_shader *nir, enum hk_identity_copy4_kind *kind_out,
          nir_intrinsic_instr *op = nir_instr_as_intrinsic(instr);
          switch (op->intrinsic) {
          case nir_intrinsic_load_global_invocation_id:
+         case nir_intrinsic_load_workgroup_id:
          case nir_intrinsic_load_base_workgroup_id:
          case nir_intrinsic_load_push_constant:
          case nir_intrinsic_vulkan_resource_index:
@@ -1547,6 +1566,7 @@ match_pad4d(nir_shader *nir, struct pad4d_match *out)
          nir_intrinsic_instr *op = nir_instr_as_intrinsic(instr);
          switch (op->intrinsic) {
          case nir_intrinsic_load_global_invocation_id:
+         case nir_intrinsic_load_workgroup_id:
          case nir_intrinsic_load_base_workgroup_id:
          case nir_intrinsic_load_push_constant:
          case nir_intrinsic_vulkan_resource_index:

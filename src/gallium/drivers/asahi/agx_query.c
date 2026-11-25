@@ -239,7 +239,6 @@ static bool
 is_query_busy(struct agx_context *ctx, struct agx_query *query, bool submit)
 {
    bool busy = false;
-   bool need_submit = false;
    for (unsigned i = 0; i < AGX_MAX_BATCHES; ++i) {
       if (query->writer_generation[i] == ctx->batches.generation[i] &&
           !agx_poll_batch(ctx, &ctx->batches.slots[i])) {
@@ -247,20 +246,15 @@ is_query_busy(struct agx_context *ctx, struct agx_query *query, bool submit)
             return true;
 
          /* GL availability polling must eventually finish without an app
-          * flush. Submit only still-active or queued writers, once; never wait
-          * for them here. Already submitted writers need only the zero-timeout
+          * flush. Submit only still-active writers, once; never wait for
+          * them here. Already submitted writers need only the zero-timeout
           * poll above. Return not-ready even if submission retires inline. */
          busy = true;
          if (agx_batch_is_active(&ctx->batches.slots[i]))
             agx_flush_batch_for_reason(ctx, &ctx->batches.slots[i],
                                        "Query result availability");
-         if (agx_batch_is_queued(&ctx->batches.slots[i]))
-            need_submit = true;
       }
    }
-
-   if (need_submit)
-      agx_submit_pending(ctx);
 
    return busy;
 }
@@ -674,7 +668,6 @@ agx_get_query_result_resource_gpu(struct agx_context *ctx,
    enum query_copy_type copy_type = classify_query_type(query->type);
 
    struct agx_batch *batch = agx_get_compute_batch(ctx);
-   batch->query_access = true;
    agx_batch_init_state(batch);
    agx_dirty_all(ctx);
 
@@ -725,7 +718,6 @@ agx_add_query_to_batch(struct agx_batch *batch, struct agx_query *query)
    struct agx_bo *bo = is_occlusion(query) ? batch->ctx->oq->bo : query->bo;
 
    agx_batch_add_bo(batch, bo);
-   batch->barrier_untracked = true;
    query->writer_generation[idx] = batch->ctx->batches.generation[idx];
 }
 

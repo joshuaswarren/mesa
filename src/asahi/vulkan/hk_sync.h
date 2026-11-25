@@ -298,9 +298,10 @@ struct hk_sync_stream {
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
 
    /* For a render: what its vertex (tiling) half needs, a subset of dep
-    * without the fragment-only requirements (HK_SYNC_GFX_FRAG) and tile
-    * hazards. Resolved like dep into barrier_ta/prior_ta; ta_split when
-    * they differ from barrier/prior. */
+    * without the fragment-only requirements (HK_SYNC_GFX_FRAG). Tile
+    * hazards stay in it: starting tiling ahead of them corrupts the shared
+    * tile. Resolved like dep into barrier_ta/prior_ta; ta_split when they
+    * differ from barrier/prior. */
    struct hk_sync_dep dep_ta[HK_SYNC_NUM_SQ];
    uint16_t barrier_ta[HK_SYNC_NUM_SQ];
    uint64_t prior_ta[HK_SYNC_NUM_SQ];
@@ -730,6 +731,12 @@ void hk_sync_resolve_end(struct hk_cmd_buffer *cmd);
  * into its stream (hk_sync_load_resolved()) before emitting it. The streams
  * keep the fields of their last occurrence.
  */
+bool hk_sync_resolve_submit_ex(struct hk_queue *queue,
+                               struct hk_cmd_buffer *const *cmdbufs,
+                               unsigned count, bool first_cdm_is_flush,
+                               bool chain_first, uint64_t completed,
+                               struct hk_sync_resolved *out,
+                               bool *tail_raised_out);
 bool hk_sync_resolve_submit(struct hk_queue *queue,
                             struct hk_cmd_buffer *const *cmdbufs,
                             unsigned count, bool first_cdm_is_flush,

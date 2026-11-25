@@ -2632,8 +2632,8 @@ tc_make_image_handle_resident(struct pipe_context *_pipe, uint64_t handle,
  */
 
 static void
-tc_flush(struct pipe_context *_pipe, struct pipe_fence_handle **fence,
-         unsigned flags);
+tc_flush_impl(struct pipe_context *_pipe, struct pipe_fence_handle **fence,
+              unsigned flags, bool frontend);
 
 struct tc_replace_buffer_storage {
    struct tc_call_base base;
@@ -2687,7 +2687,7 @@ tc_invalidate_buffer(struct threaded_context *tc,
    tc->bytes_replaced_estimate += tbuf->b.width0;
 
    if (tc->bytes_replaced_limit && (tc->bytes_replaced_estimate > tc->bytes_replaced_limit)) {
-      tc_flush(&tc->base, NULL, PIPE_FLUSH_ASYNC);
+      tc_flush_impl(&tc->base, NULL, PIPE_FLUSH_ASYNC, false);
    }
 
    /* Allocate a new one. */
@@ -3194,7 +3194,7 @@ tc_buffer_unmap(struct pipe_context *_pipe, struct pipe_transfer *transfer)
     * to reclaim some RAM. */
    if (!ttrans->staging && tc->bytes_mapped_limit &&
        tc->bytes_mapped_estimate > tc->bytes_mapped_limit) {
-      tc_flush(_pipe, NULL, PIPE_FLUSH_ASYNC);
+      tc_flush_impl(_pipe, NULL, PIPE_FLUSH_ASYNC, false);
    }
 }
 
@@ -3230,7 +3230,7 @@ tc_texture_unmap(struct pipe_context *_pipe, struct pipe_transfer *transfer)
     * to reclaim some RAM. */
    if (!ttrans->staging && tc->bytes_mapped_limit &&
        tc->bytes_mapped_estimate > tc->bytes_mapped_limit) {
-      tc_flush(_pipe, NULL, PIPE_FLUSH_ASYNC);
+      tc_flush_impl(_pipe, NULL, PIPE_FLUSH_ASYNC, false);
    }
 }
 
@@ -3788,8 +3788,8 @@ tc_call_flush(struct pipe_context *pipe, void *call)
 }
 
 static void
-tc_flush(struct pipe_context *_pipe, struct pipe_fence_handle **fence,
-         unsigned flags)
+tc_flush_impl(struct pipe_context *_pipe, struct pipe_fence_handle **fence,
+              unsigned flags, bool frontend)
 {
    struct threaded_context *tc = threaded_context(_pipe);
    struct pipe_context *pipe = tc->pipe;
@@ -3797,6 +3797,20 @@ tc_flush(struct pipe_context *_pipe, struct pipe_fence_handle **fence,
    bool async = flags & (PIPE_FLUSH_DEFERRED | PIPE_FLUSH_ASYNC);
    bool deferred = (flags & PIPE_FLUSH_DEFERRED) > 0;
    bool ended = tc->renderpass_info_recording && tc->renderpass_info_recording->ended;
+
+   /* A frontend flush that is not deferred (glFlush, glFinish) asks for the
+    * recorded work to reach the GPU now. Handing it to a driver thread that
+    * has already executed every flushed batch only adds that thread's wakeup
+    * to the submission, and a caller that waits on the work next
+    * (glFlush + glClientWaitSync, glFinish) pays it on every round trip.
+    * Drivers that opt in execute the unflushed calls here instead, as a
+    * synchronous flush does; a busy driver thread still gets the batch queued
+    * behind its own work. The memory-limit flushes issued while recording
+    * stay asynchronous.
+    */
+   if (frontend && tc->options.inline_idle_flush && async && !deferred &&
+       util_queue_fence_is_signalled(&tc->batch_slots[tc->last].fence))
+      async = false;
 
    if (!deferred || !fence) {
       tc->in_renderpass = false;
@@ -3863,6 +3877,13 @@ out_of_memory:
    pipe->flush(pipe, fence, flags);
    tc_clear_driver_thread(tc);
    tc->flushing = false;
+}
+
+static void
+tc_flush(struct pipe_context *_pipe, struct pipe_fence_handle **fence,
+         unsigned flags)
+{
+   tc_flush_impl(_pipe, fence, flags, true);
 }
 
 struct tc_draw_single_drawid {

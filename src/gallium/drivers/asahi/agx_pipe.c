@@ -343,10 +343,6 @@ agx_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *ctx,
    handle->format = rsrc->layout.format;
    handle->modifier = rsrc->modifier;
 
-   /* The frontend passes its context, which may be a u_threaded_context. */
-   if (ctx)
-      agx_submit_pending(agx_context(threaded_context_unwrap_sync(ctx)));
-
    return true;
 }
 
@@ -1782,11 +1778,16 @@ agx_flush_resource(struct pipe_context *pctx, struct pipe_resource *pres)
       agx_flush_writer(agx_context(pctx), rsrc, "flush_resource");
    }
    rsrc->base.is_shared = true;
-
-   agx_submit_pending(agx_context(pctx));
-   agx_context(pctx)->batches.barrier_seqnum =
-      agx_context(pctx)->batches.seqnum;
 }
+
+static unsigned
+build_timestamp_offset(struct agx_batch *batch, unsigned offset)
+{
+   return (agx_batch_idx(batch) * sizeof(struct agx_timestamps)) + offset;
+}
+
+#define timestamp_offset(batch, offs)                                          \
+   build_timestamp_offset(batch, offsetof(struct agx_timestamps, offs))
 
 /* Native G18 ZLS arrays use either 16-KiB pages (bit 0) or 128-byte
  * cachelines. The upper field stores units minus one. In particular, a
@@ -1979,11 +1980,6 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    if ((dev->debug & AGX_DBG_NOCLUSTER) && !agx_chip_native_hal200(dev->chip))
       c->flags |= DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING;
 
-   if (agx_chip_native_or_m5(dev->chip) &&
-       (dev->params.features & DRM_ASAHI_FEATURE_FEW_PRIMITIVES) &&
-       !batch->prims_unknown && batch->known_prims <= 4)
-      c->flags |= DRM_ASAHI_RENDER_FEW_PRIMITIVES;
-
    c->bg.rsrc_spec = (uint32_t)pipeline_clear.rsrc_spec;
    c->eot.rsrc_spec = (uint32_t)pipeline_store.rsrc_spec;
    c->partial_bg.rsrc_spec = (uint32_t)pipeline_load.rsrc_spec;
@@ -2077,8 +2073,8 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
         batch->ctx->timestamps)) {
       c->ts_vtx.start.handle = batch->ctx->timestamp_handle;
       c->ts_frag.end.handle = batch->ctx->timestamp_handle;
-      c->ts_vtx.start.offset = agx_timestamp_offset(batch, vtx_start);
-      c->ts_frag.end.offset = agx_timestamp_offset(batch, frag_end);
+      c->ts_vtx.start.offset = timestamp_offset(batch, vtx_start);
+      c->ts_frag.end.offset = timestamp_offset(batch, frag_end);
    }
 }
 
@@ -2232,11 +2228,11 @@ agx_flush_compute(struct agx_context *ctx, struct agx_batch *batch,
    if (batch->timestamps.size > 0 || stats) {
       cmdbuf->ts.start.handle = ctx->timestamp_handle;
       cmdbuf->ts.end.handle = ctx->timestamp_handle;
-      cmdbuf->ts.start.offset = agx_timestamp_offset(batch, comp_start);
+      cmdbuf->ts.start.offset = timestamp_offset(batch, comp_start);
       /* Always write comp_end so GL_TIME_ELAPSED queries on compute-only
        * batches observe the real completion timestamp even without
        * AGX_DBG_STATS (agx_batch_submit/retire reads ts->comp_end). */
-      cmdbuf->ts.end.offset = agx_timestamp_offset(batch, comp_end);
+      cmdbuf->ts.end.offset = timestamp_offset(batch, comp_end);
    }
 }
 
@@ -2414,8 +2410,7 @@ agx_try_fast_clear_batch(struct agx_context *ctx, struct agx_batch *batch)
     * overwritten by its clear, matching agx_flush_render()'s
     * `batch->load & ~batch->clear`. */
    if (batch->cdm.bo || !batch->vdm.bo || !batch->initialized ||
-       batch->draws || batch->draw || batch->known_prims ||
-       batch->prims_unknown || !batch->clear ||
+       batch->draws || batch->draw || !batch->clear ||
        batch->resolve != batch->clear ||
        batch->key.resolve || batch->feedback || batch->native_rejected)
       return false;
@@ -2560,8 +2555,8 @@ agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch)
       return;
    }
 
-   agx_batch_queue_or_submit(ctx, batch, has_cdm ? &compute : NULL,
-                             has_vdm ? &render : NULL);
+   agx_batch_submit(ctx, batch, has_cdm ? &compute : NULL,
+                    has_vdm ? &render : NULL);
 }
 
 static void
@@ -2801,7 +2796,6 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 
    util_dynarray_init(&ctx->writer, ctx);
    util_dynarray_init(&ctx->global_buffers, ctx);
-   util_dynarray_init(&ctx->pending.batches, ctx);
 
    pctx->stream_uploader = u_upload_create_default(pctx);
    if (!pctx->stream_uploader) {
@@ -2943,6 +2937,7 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
       &(struct threaded_context_options){
          .create_fence = agx_fence_create_unflushed,
          .unsynchronized_get_device_reset_status = true,
+         .inline_idle_flush = true,
       },
       &ctx->tc);
 

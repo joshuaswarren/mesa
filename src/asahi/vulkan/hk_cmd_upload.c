@@ -214,10 +214,10 @@ hk_cmd_upload_group_count(struct hk_cmd_buffer *cmd,
       ((group_count.x * 2654435761u) ^ (group_count.y * 2246822519u) ^
        (group_count.z * 3266489917u)) >>
       28;
-   struct hk_group_count_cache_entry *entry =
-      &cmd->state.group_count_cache[hash];
-   if (likely(entry->valid && entry->x == group_count.x &&
-              entry->y == group_count.y && entry->z == group_count.z))
+   struct hk_group_count_cache_entry *entry = &cmd->group_count_cache[hash];
+   if (likely(cmd->used_group_count_cache && entry->valid &&
+              entry->x == group_count.x && entry->y == group_count.y &&
+              entry->z == group_count.z))
       return entry->addr;
 
    const uint64_t addr =
@@ -232,6 +232,7 @@ hk_cmd_upload_group_count(struct hk_cmd_buffer *cmd,
    entry->z = group_count.z;
    entry->valid = 1;
    entry->addr = addr;
+   cmd->used_group_count_cache = true;
    return addr;
 }
 
