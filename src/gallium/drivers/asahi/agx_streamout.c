@@ -18,8 +18,7 @@ agx_create_stream_output_target(struct pipe_context *pctx,
                                 struct pipe_resource *prsc,
                                 unsigned buffer_offset, unsigned buffer_size)
 {
-   struct agx_streamout_target *target =
-      rzalloc(pctx, struct agx_streamout_target);
+   struct agx_streamout_target *target = CALLOC_STRUCT(agx_streamout_target);
 
    if (!target)
       return NULL;
@@ -29,11 +28,27 @@ agx_create_stream_output_target(struct pipe_context *pctx,
 
    target->base.context = pctx;
    target->base.buffer_offset = buffer_offset;
-   target->base.buffer_size = buffer_size;
+   target->base.buffer_size =
+      agx_buffer_range_in_resource(prsc, buffer_offset, buffer_size);
 
-   uint32_t zero = 0;
-   target->offset = pipe_buffer_create_with_data(pctx, PIPE_BIND_GLOBAL,
-                                                 PIPE_USAGE_DEFAULT, 4, &zero);
+   /* Called directly on the frontend thread under u_threaded_context: allocate
+    * the offset buffer via screen and initialize its fresh BO map directly
+    * without touching pctx.
+    */
+   target->offset = pipe_buffer_create(pctx->screen, PIPE_BIND_GLOBAL,
+                                       PIPE_USAGE_DEFAULT, 4);
+   if (!target->offset) {
+      pipe_resource_reference(&target->base.buffer, NULL);
+      FREE(target);
+      return NULL;
+   }
+
+   struct agx_resource *offset_rsrc = agx_resource(target->offset);
+   uint32_t *offset_map = agx_bo_map(offset_rsrc->bo);
+   if (offset_map)
+      *offset_map = 0;
+   BITSET_SET(offset_rsrc->data_valid, 0);
+   agx_valid_buffer_range_add(offset_rsrc, 0, 4);
 
    return &target->base;
 }
@@ -46,7 +61,7 @@ agx_stream_output_target_destroy(struct pipe_context *pctx,
 
    pipe_resource_reference(&tgt->base.buffer, NULL);
    pipe_resource_reference(&tgt->offset, NULL);
-   ralloc_free(target);
+   FREE(target);
 }
 
 static void
@@ -72,8 +87,8 @@ agx_set_stream_output_targets(struct pipe_context *pctx, unsigned num_targets,
        * redefined to be ~0 instead of -1 but it doesn't really matter.
        */
       if (offsets[i] != -1 && targets[i] != NULL) {
-         pipe_buffer_write(pctx, agx_so_target(targets[i])->offset, 0, 4,
-                           &offsets[i]);
+         tc_buffer_write(pctx, agx_so_target(targets[i])->offset, 0, 4,
+                         &offsets[i]);
       }
 
       pipe_so_target_reference(&so->targets[i], targets[i]);

@@ -146,6 +146,32 @@ test_g17p_graphics_root_requirement(void)
    CHECK(hk_agx3_g17p_graphics_needs_root(true, false, 0));
    CHECK(hk_agx3_g17p_graphics_needs_root(false, true, 0));
    CHECK(hk_agx3_g17p_graphics_needs_root(false, false, 1));
+
+   /* Set pointers after a root pointer at half 12: set k at 16 + 4k. */
+   uint64_t halfs[8] = {0};
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 2) == 0);
+   CHECK(!hk_agx3_g17p_graphics_needs_root(false, false, 0));
+   /* Unknown reads, or no sets: the layout's count. */
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, false, 12, 2) == 2);
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 0) == 0);
+   /* The root pointer itself (halves 12..15) is not a set pointer. */
+   halfs[0] = BITFIELD64_RANGE(12, 4);
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 2) == 0);
+   /* Any half of any set pointer keeps all of them. */
+   for (unsigned h = 16; h < 24; ++h) {
+      halfs[0] = BITFIELD64_BIT(h);
+      CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 2) == 2);
+   }
+   halfs[0] = BITFIELD64_BIT(24);
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 12, 2) == 0);
+   /* Across a word boundary: root at 56, sets at 60..67. */
+   halfs[0] = 0;
+   halfs[1] = BITFIELD64_BIT(65 - 64);
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 56, 2) == 2);
+   halfs[1] = 0;
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 8, true, 56, 2) == 0);
+   /* A window past the recorded halves is not known to be dead. */
+   CHECK(hk_agx3_g17p_graphics_live_set_count(halfs, 1, true, 56, 2) == 2);
    return 0;
 }
 
@@ -2363,6 +2389,128 @@ test_stk_advanced_pipeline_framebuffers(void)
    return 0;
 }
 
+/* The fused end-of-tile store + resolve admits exactly the single-target
+ * final pass that stores its multisample samples and AVERAGE-resolves them
+ * over the whole attachment; every other shape keeps the after-pass resolve. */
+static int
+test_g17p_store_and_resolve(void)
+{
+   const enum pipe_format rgba[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   struct agx_tilebuffer_layout tib =
+      agx_build_tilebuffer_layout(rgba, 1, 4, false);
+   CHECK(tib.nr_samples == 4 && !tib.layered && !agx_tilebuffer_spills(&tib));
+
+   const struct hk_agx3_g17p_store_and_resolve_target ok = {
+      .color_attachment_count = 1,
+      .final_store = true,
+      .whole_attachments = true,
+      .store_source = true,
+      .has_resolve_target = true,
+      .average_resolve = true,
+      .source_samples = 4,
+      .resolve_samples = 1,
+      .resolve_format_matches = true,
+      .source_pbe_valid = true,
+      .resolve_pbe_valid = true,
+   };
+   CHECK(hk_agx3_g17p_store_and_resolve_supported(&tib, &ok));
+   /* The stored half is the admitted multisample store, and the shape is
+    * outside the resolve-only program, which needs storeOp != STORE. */
+   CHECK(hk_agx3_g17p_multisample_store_supported(&tib, 1, true, 4));
+   CHECK(!hk_agx3_g17p_direct_color_resolve_supported(&tib, 1, true, true,
+                                                     true));
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(NULL, &ok));
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, NULL));
+
+   /* Every requirement on its own. */
+   struct hk_agx3_g17p_store_and_resolve_target t;
+#define REFUSED_WITH(field, value)                                             \
+   do {                                                                        \
+      t = ok;                                                                  \
+      t.field = value;                                                         \
+      CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &t));              \
+   } while (0)
+   REFUSED_WITH(color_attachment_count, 2);
+   REFUSED_WITH(color_attachment_count, 0);
+   /* A partial render keeps its samples for the reload. */
+   REFUSED_WITH(final_store, false);
+   /* No background merge outside a partial render area. */
+   REFUSED_WITH(whole_attachments, false);
+   /* Not stored: the resolve-only program's shape. */
+   REFUSED_WITH(store_source, false);
+   REFUSED_WITH(has_resolve_target, false);
+   /* SAMPLE_ZERO, MIN and MAX resolve after the pass. */
+   REFUSED_WITH(average_resolve, false);
+   REFUSED_WITH(source_samples, 2);
+   REFUSED_WITH(source_samples, 1);
+   REFUSED_WITH(resolve_samples, 4);
+   REFUSED_WITH(resolve_samples, 0);
+   REFUSED_WITH(resolve_format_matches, false);
+   REFUSED_WITH(source_pbe_valid, false);
+   REFUSED_WITH(resolve_pbe_valid, false);
+#undef REFUSED_WITH
+
+   /* 2x is admitted; 1x and 8x are not. */
+   tib = agx_build_tilebuffer_layout(rgba, 1, 2, false);
+   t = ok;
+   t.source_samples = 2;
+   CHECK(hk_agx3_g17p_store_and_resolve_supported(&tib, &t));
+   tib = agx_build_tilebuffer_layout(rgba, 1, 1, false);
+   t.source_samples = 1;
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &t));
+   tib = agx_build_tilebuffer_layout(rgba, 1, 8, false);
+   t.source_samples = 8;
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &t));
+
+   /* No layered or spilled two-output program is built. */
+   tib = agx_build_tilebuffer_layout(rgba, 1, 4, true);
+   CHECK(tib.layered);
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &ok));
+   tib = agx_build_tilebuffer_layout(rgba, 1, 4, false);
+   tib.spilled[0] = true;
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &ok));
+
+   /* Formats: those whose lanes the end-of-tile resolve averages. */
+   const struct {
+      enum pipe_format format;
+      bool admitted;
+   } formats[] = {
+      {PIPE_FORMAT_R8G8B8A8_UNORM, true},
+      {PIPE_FORMAT_B8G8R8A8_UNORM, true},
+      /* The caller sets the PBE's linear-resolve transfer bit. */
+      {PIPE_FORMAT_B8G8R8A8_SRGB, true},
+      {PIPE_FORMAT_R8G8B8A8_SRGB, true},
+      {PIPE_FORMAT_R16G16B16A16_FLOAT, true},
+      {PIPE_FORMAT_R10G10B10A2_UNORM, true},
+      /* Raw words: their averages are not the mean of the samples. */
+      {PIPE_FORMAT_R32_FLOAT, false},
+      {PIPE_FORMAT_R9G9B9E5_FLOAT, false},
+      {PIPE_FORMAT_R11G11B10_FLOAT, false},
+      /* Integer formats never AVERAGE. */
+      {PIPE_FORMAT_R8G8B8A8_UINT, false},
+      {PIPE_FORMAT_R16G16_SINT, false},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(formats); ++i) {
+      const enum pipe_format f[AGX_MAX_RENDER_TARGETS] = {formats[i].format};
+      tib = agx_build_tilebuffer_layout(f, 1, 4, false);
+      if (formats[i].admitted) {
+         /* Admitted formats keep a supported multisample tile. */
+         CHECK(hk_agx3_g17p_rt0_tile_layout_supported(&tib));
+         CHECK(hk_agx3_g17p_store_and_resolve_supported(&tib, &ok));
+      } else {
+         CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &ok));
+      }
+   }
+
+   /* A colourless tile has nothing to resolve. */
+   const enum pipe_format none[AGX_MAX_RENDER_TARGETS] = {PIPE_FORMAT_NONE};
+   tib = agx_build_tilebuffer_layout(none, 1, 4, false);
+   CHECK(!hk_agx3_g17p_store_and_resolve_supported(&tib, &ok));
+   return 0;
+}
+
 int
 main(void)
 {
@@ -2379,7 +2527,8 @@ main(void)
        test_g17p_combined_sampler_pointers() ||
        test_g17p_root_range() ||
        test_g17p_single_layer_rt0_layout() ||
-       test_stk_advanced_pipeline_framebuffers() || test_alias())
+       test_stk_advanced_pipeline_framebuffers() ||
+       test_g17p_store_and_resolve() || test_alias())
       return 1;
 
    printf("Honeykrisp AGX3 Ioto program core: %u checks passed\n", checks);

@@ -2,20 +2,11 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * Write a small blob of push-constant data to a device address.
- *
- * This backs vk_device::write_buffer_cp, which the common acceleration
- * structure builder uses to seed the intermediate header before any build
- * shader runs.  Drivers whose command processor can write memory directly do
- * this without a dispatch; AGX has no such path, and the obvious
- * alternative -- upload to the command pool and copy -- goes through libagx
- * precomputed kernels that the G17P dispatch path fail-closes on.  So the
- * copy is a shader.
- *
- * The blob is bounded by the guaranteed 128-byte push constant block minus
- * the destination address and count, which is comfortably more than the
- * 104-byte vk_ir_header this exists for.  The C side asserts the bound
- * rather than silently truncating.
+ * Write a push-constant blob to a device address (backs vk_device::write_buffer_cp
+ * to seed the common AS builder's vk_ir_header). Uses a shader because AGX has
+ * no CP memory-write path and G17P dispatch fail-closes on libagx precomputed
+ * copy kernels. Payload fits in the 128-byte push constant block minus
+ * dst/count; callers assert the bound.
  */
 
 #version 460

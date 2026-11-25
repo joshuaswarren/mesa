@@ -9,14 +9,8 @@
 
 #define KV(f, v) {(uint16_t)(f), (uint64_t)(v)}
 
-static bool
-encoding_ok(enum agx_isa_encoding enc)
-{
-   return enc == AGX_ISA_ENCODING_AGX3B ||
-          enc == AGX_ISA_ENCODING_AGX3C;
-}
 /* Scoreboard slots are machine behaviour: eight on every G17-class part.
- * Device atomics retain the agx3b/agx3c encoding_ok boundary. */
+ * Device atomics retain the agx3b/agx3c boundary. */
 static unsigned
 slot_count(enum agx_isa_encoding enc)
 {
@@ -77,8 +71,15 @@ agx3_atomic_encode_device(enum agx_isa_encoding enc,
                           const struct agx3_device_atomic_desc *d,
                           uint8_t out[AGX3_ATOMIC_MAX_LENGTH], uint8_t *len)
 {
-   if (!encoding_ok(enc) || d == NULL || out == NULL || len == NULL ||
-       !op_ok(d->op) || d->value > 191 || d->result > 191 ||
+   /* AGX3b has a 192-half GPR file; AGX3c/AGX3d address the full 256-half file
+    * (matching agx3_mem_core.c). */
+   const bool wide = agx_encoding_is_g17_class(enc);
+   const unsigned reg_max = wide ? 255 : 191;
+   const unsigned base_max = wide ? 252 : 188;
+   const unsigned idx_max = wide ? 254 : 190;
+
+   if (!agx_isa_is_agx3(enc) || d == NULL || out == NULL || len == NULL ||
+       !op_ok(d->op) || d->value > reg_max || d->result > reg_max ||
        d->index_shift > 4 || d->byte_offset < -32768 ||
        d->byte_offset > 32767 ||
        (d->wait_mask & ~((1u << slot_count(enc)) - 1u)))
@@ -100,7 +101,7 @@ agx3_atomic_encode_device(enum agx_isa_encoding enc,
       if ((d->base & 3) != 0 || d->base > 508)
          return false;
    } else if (d->base_kind == AGX3_ATOMIC_BASE_REGISTER) {
-      if ((d->base & 1) != 0 || d->base > 188)
+      if ((d->base & 1) != 0 || d->base > base_max)
          return false;
    } else {
       return false;
@@ -110,9 +111,7 @@ agx3_atomic_encode_device(enum agx_isa_encoding enc,
    case AGX3_ATOMIC_INDEX_IMMEDIATE:
       break;
    case AGX3_ATOMIC_INDEX_REGISTER:
-      if ((d->index & 1) != 0 ||
-          d->index >
-             (enc == AGX_ISA_ENCODING_AGX3C ? 254 : 190))
+      if ((d->index & 1) != 0 || d->index > idx_max)
          return false;
       break;
    case AGX3_ATOMIC_INDEX_UNIFORM:
@@ -207,20 +206,22 @@ encode_local(enum agx_isa_encoding enc, const struct agx3_local_atomic_desc *d,
              bool g18g, uint8_t out[AGX3_ATOMIC_MAX_LENGTH], uint8_t *len)
 {
    g18g = g18g || enc == AGX_ISA_ENCODING_AGX3D;
+   const unsigned reg_max = agx_encoding_is_g17_class(enc) ? 255 : 191;
 
-   if ((!encoding_ok(enc) && enc != AGX_ISA_ENCODING_AGX3D) ||
+   if ((!agx_isa_is_agx3(enc) && enc != AGX_ISA_ENCODING_AGX3D) ||
        d == NULL || out == NULL || len == NULL ||
-       !op_ok(d->op) || d->op == AGX3_ATOMIC_FADD || d->value > 191 ||
+       !op_ok(d->op) || d->op == AGX3_ATOMIC_FADD || d->value > reg_max ||
        (d->wait_mask & ~((1u << slot_count(enc)) - 1u)))
       return false;
 
    if (d->returns_value) {
-      if (d->result > 191 || d->slot < 1 || d->slot > slot_count(enc) ||
+      if (d->result > reg_max || d->slot < 1 || d->slot > slot_count(enc) ||
           (d->address_kind != AGX3_ATOMIC_INDEX_IMMEDIATE &&
            d->address_kind != AGX3_ATOMIC_INDEX_REGISTER) ||
           (d->address_kind == AGX3_ATOMIC_INDEX_IMMEDIATE &&
            (d->address & 3) != 0) ||
-          (d->address_kind == AGX3_ATOMIC_INDEX_REGISTER && d->address > 191) ||
+          (d->address_kind == AGX3_ATOMIC_INDEX_REGISTER &&
+           d->address > reg_max) ||
           (d->address_kill &&
            (!g18g || enc == AGX_ISA_ENCODING_AGX3B ||
             d->address_kind != AGX3_ATOMIC_INDEX_REGISTER)))
@@ -238,7 +239,7 @@ encode_local(enum agx_isa_encoding enc, const struct agx3_local_atomic_desc *d,
          if (d->address_kill || (d->address & 3) != 0)
             return false;
       } else if (d->address_kind == AGX3_ATOMIC_INDEX_REGISTER) {
-         if (d->address > 191)
+         if (d->address > reg_max)
             return false;
       } else {
          return false;

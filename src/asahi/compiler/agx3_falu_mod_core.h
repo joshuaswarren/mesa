@@ -29,27 +29,8 @@ extern "C" {
 #endif
 
 /*
- * A slot's WIDTH is a field of the same encoding point as its modifier bits,
- * not a different instruction: f43 belongs to the f35 slot exactly as f47 and
- * f48 do, f26 to the f18 slot alongside f30 and f31, and f60 to the ffma
- * addend alongside f64 and f65. Apple composes every combination. One kernel
- * per cell, `float a`, `half b`, recovered through tools/decomp.c:
- *
- *    a + b        09011c0400c0   f35=4 f43=1  f18=0 f26=2
- *    a - b        09011c0400c8   the same, plus f48
- *    b - a        09041c0100c8   f35=0 f43=2  f18=4 f26=1, plus f48
- *    a + fabs(b)  09011c04020000800200   f47
- *    fabs(a) + b  09011c04020000800100   f30
- *    b - fabs(a)  09041c01020800800200   f47 and f48 together
- *   -a - b        09041c0101080280       f48 and f31 together
- *    b * -a       09041d0100c8           the same pair on f32mul
- *    fma(a,c,h)   09011e05810800c0       f52=8 f60=1, the addend narrow
- *    fma(a,c,-h)  09011e05910800c0       the same, plus f65
- *    fma(h,c,a)   09081e01810402c0       f18=8 f26=1, the multiplicand narrow
- *
- * so the width axis and the modifier axis are independent. Keeping them in
- * separate encoders is what refused `half + (-float)`: it is on both axes and
- * had no home in either.
+ * Operand widths (f43 for f35, f26 for f18, f60 for f52) compose orthogonally
+ * with source modifiers (abs/neg) on the same encoding point.
  */
 struct agx3_falu_mods {
    bool src0_abs; /* f47 on the f35 slot */
@@ -94,18 +75,8 @@ bool agx3_falu_add_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
                               uint8_t out[AGX3_FALU_MOD_MAX_LENGTH],
                               uint8_t *len);
 
-/* G17G only: dest = srcmods(src0) + minifloat. The same long form with the
- * immediate-operand alternative (f25=1, the constant in f17). Witnessed
- * byte-exactly against applegpu_g17g (gpu/m5-xfb-alu4-reference.metal):
- *
- *   a + 2.0         29 00 04 0a 22 20 ac 02 01 08 11 00   f17 = 0x40
- *   fabs(a) + 0.5   29 00 04 4a 22 20 ac 02 01 08 10 40   f17 = 0x20, f47
- *   0.5 - a         29 00 24 4a 22 20 ac 02 01 08 10 00   f48
- *   -fabs(a) + 0.5  29 00 24 4a 22 20 ac 02 01 08 10 40   f47, f48
- *
- * all with a dead source waiting for the load in slot 8. These are the forms
- * Mesa's fabs and fneg take (fmov.abs/neg lower to `fadd mod(x), -0.0`). A
- * saturated variant has no witness and fails closed. */
+/* G17G only: dest = srcmods(src0) + minifloat (f25=1, constant in f17; used
+ * for fmov.abs/neg via `fadd mod(x), -0.0`). Saturate is refused. */
 bool agx3_falu_add_imm_runtime(uint16_t dest, uint16_t src0,
                                uint8_t minifloat,
                                const struct agx3_falu_mods *m,
@@ -199,32 +170,9 @@ bool agx3_falu_fma_two_imm_narrow_m5(
    uint8_t out[AGX3_FALU_MOD_MAX_LENGTH], uint8_t *len);
 
 /*
- * FMA whose MULTIPLIER is a minifloat immediate while the multiplicand and the
- * addend stay registers that carry their own modifiers and widths.
- *
- * Operand KIND is a field of the same encoding point as the modifier bits,
- * exactly as width is: f42 selects between "the f35 register slot" (2) and
- * "the f34 immediate" (1), and it sits alongside f30/f31 on the f18 slot and
- * f64/f65 on the f52 addend without disturbing either.  Modelling kind and
- * modifier as separate encoders is what refused `k * fabs(a) + fabs(b)` --
- * glmark2's terrain noise kernel, `1.0 - abs(x) - abs(y)` -- which stands on
- * both axes at once and had no home in either.  Apple composes the cells, one
- * kernel per cell (`fmaimm.metal`, decoded with tools/decomp.c):
- *
- *    fma(a,b,c)            09011e05810802c0      f42=2 f35=4
- *    fma(0.5,b,c)          09010ea1810402c2      f42=1 f34=32
- *    fma(0.5,fabs(b),c)    09010ea18304020200800100   plus f30
- *    fma(0.5,fabs(b),      09010ea18b04020200800100   plus f30 and f64
- *        fabs(c))
- *    fma(0.5,-b,c)         09011ea1810402c2      f34=160: a negated
- *                                                immediate multiplier is the
- *                                                minifloat's own sign bit,
- *                                                not a modifier bit
- *    fma(0.5,fabs(b),      09010ea19b04020200800100   plus f30, f64 and f65
- *        -fabs(c))
- *
- * `m->src0_*` are therefore not accepted here: fold the multiplier's sign into
- * `multiplier` the way Apple does.
+ * FMA with a minifloat immediate multiplier (f42=1, f34=imm) and register
+ * multiplicand/addend carrying independent widths and modifiers. `m->src0_*`
+ * are rejected; fold sign into `multiplier` directly.
  */
 bool agx3_falu_fma_mul_imm_mod(enum agx_isa_encoding enc, uint16_t dest,
                               uint8_t multiplier, uint16_t src1,
