@@ -679,6 +679,22 @@ if with_tests
   )
 
   test(
+    'hk_agx3_compressed_buf2img',
+    executable(
+      'hk_agx3_compressed_buf2img_test',
+      files('tests/test-hk-agx3-compressed-buf2img.c',
+            'hk_g17p_meta_copy_core.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src,
+                             inc_asahi],
+      dependencies : [idep_mesautil, idep_vulkan_util,
+                      idep_vulkan_runtime_headers],
+      link_with : [libasahi_layout],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'hk_image_layout_core',
     executable(
       'hk_image_layout_core_test',
