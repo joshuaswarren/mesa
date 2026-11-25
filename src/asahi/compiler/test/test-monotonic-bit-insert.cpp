@@ -220,19 +220,12 @@ TEST(MonotonicBitInsert, RunsBeforeRuntimeUnroll)
    nir_def *set = nir_bcsel(&b, nir_ilt_imm(&b, v, 0), cand, &acc_phi->def);
    nir_pop_if(&b, nif);
 
-   nir_block *then_blk = nir_if_last_then_block(nif);
-   nir_block *else_blk = nir_if_last_else_block(nif);
-   nir_phi_instr *merge = nir_phi_instr_create(b.shader);
-   nir_def_init(&merge->instr, &merge->def, 1, 32);
-   nir_phi_instr_add_src(merge, then_blk, set);
-   nir_phi_instr_add_src(merge, else_blk, &acc_phi->def);
-   nir_instr_insert(nir_before_block(nir_cursor_current_block(b.cursor)),
-                    &merge->instr);
+   nir_def *merge = nir_if_phi(&b, set, &acc_phi->def);
 
    nir_def *iv_next = nir_iadd_imm(&b, &iv_phi->def, 1);
    nir_block *latch = nir_loop_last_block(loop);
    nir_phi_instr_add_src(iv_phi, latch, iv_next);
-   nir_phi_instr_add_src(acc_phi, latch, &merge->def);
+   nir_phi_instr_add_src(acc_phi, latch, merge);
    nir_instr_insert(nir_before_block(header), &iv_phi->instr);
    nir_instr_insert(nir_before_block(header), &acc_phi->instr);
    nir_pop_loop(&b, loop);
