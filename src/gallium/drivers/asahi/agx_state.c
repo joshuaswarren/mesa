@@ -3195,7 +3195,7 @@ agx_gallium_preprocess_nir(struct agx_device *dev, nir_shader *nir)
    if (dev->chip == AGX_CHIP_G18G)
       agx_preprocess_nir_g18g(nir);
    else
-      agx_preprocess_nir(nir);
+      agx_preprocess_nir_for_encoding(nir, agx_chip_isa_encoding(dev->chip));
 }
 
 /* M5 draws a patch draw too large for one render in parts
