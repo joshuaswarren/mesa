@@ -2211,7 +2211,7 @@ hk_g17p_compute_blit_supported(const struct hk_device *dev,
 }
 
 /*
- * G17P downsample into or out of a compressed image, in compute.
+ * Compute downsample into or out of a GPU-tiled image with compression.
  *
  * A compressed G17P colour image is otherwise written only through the PBE,
  * so a linear blit into one is a render pass per region: a GL
@@ -2235,12 +2235,18 @@ hk_g17p_compute_blit_supported(const struct hk_device *dev,
  * directly instead of from a table.
  */
 static bool
-hk_g17p_compressed_blit_supported(const struct hk_device *dev,
+hk_compressed_mip_blit_supported(const struct hk_device *dev,
                                   const struct hk_image *src,
                                   const struct hk_image *dst,
                                   const VkBlitImageInfo2 *info)
 {
-   if (!agx_chip_has_cap(dev->dev.chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ||
+   /* AGX2 uses the same rectangular Morton metadata indexing and replicated
+    * uncompressed tile mode as libagx_fast_clear and libagx_decompress. */
+   const enum agx_chip chip = dev->dev.chip;
+   const bool agx2 =
+      agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX2 &&
+      agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_AGX2;
+   if ((!agx2 && !agx_chip_has_cap(chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION)) ||
        info->regionCount == 0 ||
        !(src->planes[0].layout.compressed || dst->planes[0].layout.compressed))
       return false;
@@ -2266,7 +2272,7 @@ hk_g17p_compressed_blit_supported(const struct hk_device *dev,
       if (ail_is_level_logically_compressed(&dst->planes[0].layout, level) &&
           ((uint32_t)region->dstOffsets[1].x != width ||
            (uint32_t)region->dstOffsets[1].y != height ||
-           hk_mip_level_through_pbe(dev->dev.chip, width, height)))
+           hk_mip_level_through_pbe(chip, width, height)))
          return false;
    }
    return true;
@@ -2610,7 +2616,7 @@ hk_g17p_mip_pipeline(struct hk_device *dev, const struct hk_g17p_mip_key *key,
 }
 
 static void
-hk_g17p_compressed_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
+hk_compressed_mip_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
                         struct hk_image *dst, const VkBlitImageInfo2 *info)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -3280,11 +3286,11 @@ hk_xfer_blitimage2(VkCommandBuffer commandBuffer,
       return;
    }
 
-   if (hk_g17p_compressed_blit_supported(dev, src_image, dst_image,
+   if (hk_compressed_mip_blit_supported(dev, src_image, dst_image,
                                          pBlitImageInfo)) {
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
-      hk_g17p_compressed_blit(cmd, src_image, dst_image, pBlitImageInfo);
+      hk_compressed_mip_blit(cmd, src_image, dst_image, pBlitImageInfo);
       hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       return;
    }
