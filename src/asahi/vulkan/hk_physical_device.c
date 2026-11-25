@@ -272,9 +272,10 @@ hk_get_device_extensions(const struct agx_device *dev,
       .KHR_zero_initialize_workgroup_memory = true,
       .EXT_4444_formats = true,
       .EXT_attachment_feedback_loop_layout = true,
-      /* Qualified on G17P; the draw-time selection is shared with M5. */
+      /* Requires EXT_attachment_feedback_loop_layout plus the depth/stencil
+       * shader twin (hk_fbl_twin()) and draw-time selection (hk_select_fbl_fs()). */
       .EXT_attachment_feedback_loop_dynamic_state =
-         dev->chip == AGX_CHIP_G17P,
+         agx_chip_has_feedback_loop_dynamic_state(dev->chip),
       .EXT_blend_operation_advanced = true,
       .EXT_border_color_swizzle = true,
       .EXT_buffer_device_address = true,
