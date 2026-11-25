@@ -11837,6 +11837,34 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
    }
 
+   /* Factor loop-invariant MAC reductions and strength-reduce linear-IV MACs
+    * before runtime-loop unrolling so the unrolled main loop (not just its
+    * scalar remainder) inherits the multiply-free reduction and hoisted
+    * invariant row addresses. */
+   if (runtime_loop_opts && m5_unroll_factor >= 2 && !nir->info.internal)
+      agx_factor_loop_mac(nir);
+
+   /* Exact-divisor partial unrolling for compile-time constant-trip counted
+    * loops that full unrolling skipped due to body size, plus monotonic 32-bit
+    * bit-pack accumulator strength reduction (zero runtime guard or dead tail
+    * loop). */
+   if (agx3_compute_opts && m5_unroll_factor >= 4 && !nir->info.internal) {
+      bool const_unrolled = false;
+      NIR_PASS(const_unrolled, nir, agx_nir_opt_const_loop_unroll,
+               m5_unroll_factor, m5_unroll_widest);
+      if (const_unrolled) {
+         agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
+         bool reassoc = false;
+         NIR_PASS(reassoc, nir, agx_nir_reassoc_const_offsets);
+         if (reassoc) {
+            NIR_PASS(_, nir, nir_opt_constant_folding);
+            NIR_PASS(_, nir, nir_opt_algebraic);
+            NIR_PASS(_, nir, nir_opt_cse);
+            NIR_PASS(_, nir, nir_opt_dce);
+         }
+      }
+   }
+
    /* Counted loops whose trip count is only known at run time: run several
     * iterations per loop test where the bound allows it. On AGX3 the loop
     * control of a short body costs about as much as the body, and the
