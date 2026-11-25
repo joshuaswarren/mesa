@@ -27,6 +27,15 @@
 #include <stdio.h>
 #include <string.h>
 
+/* A texture packet's defaults, filled in field by field below (designated
+ * initializers after the header would override its fields). */
+static struct AGX_TEXTURE
+texture_header(void)
+{
+   struct AGX_TEXTURE cfg = {AGX_TEXTURE_header};
+   return cfg;
+}
+
 static void
 check_kernel(const uint32_t *bin, const char *name)
 {
@@ -114,25 +123,23 @@ main(void)
       assert(hk_g17p_decompress_pack_mode(channels, &pack_mode));
       assert(pack_mode == LIBAGX_AGX3_DECOMPRESS_R32G32B32A32);
 
-      struct AGX_TEXTURE cfg = {
-         AGX_TEXTURE_header,
-         .dimension = AGX_TEXTURE_DIMENSION_2D,
-         .layout = AGX_LAYOUT_GPU,
-         .channels = channels,
-         .type = AGX_TEXTURE_TYPE_UINT,
-         .swizzle_r = AGX_CHANNEL_R,
-         .swizzle_g = AGX_CHANNEL_G,
-         .swizzle_b = AGX_CHANNEL_B,
-         .swizzle_a = AGX_CHANNEL_A,
-         .address = 0x100000,
-         .width = m5.width_px,
-         .height = m5.height_px,
-         .compressed = true,
-         .extended = true,
-         .acceleration_buffer = 0x100000 + m5.metadata_offset_B,
-         .depth = 1,
-         .page_aligned_layers = m5.page_aligned_layers,
-      };
+      struct AGX_TEXTURE cfg = texture_header();
+      cfg.dimension = AGX_TEXTURE_DIMENSION_2D;
+      cfg.layout = AGX_LAYOUT_GPU;
+      cfg.channels = channels;
+      cfg.type = AGX_TEXTURE_TYPE_UINT;
+      cfg.swizzle_r = AGX_CHANNEL_R;
+      cfg.swizzle_g = AGX_CHANNEL_G;
+      cfg.swizzle_b = AGX_CHANNEL_B;
+      cfg.swizzle_a = AGX_CHANNEL_A;
+      cfg.address = 0x100000;
+      cfg.width = m5.width_px;
+      cfg.height = m5.height_px;
+      cfg.compressed = true;
+      cfg.extended = true;
+      cfg.acceleration_buffer = 0x100000 + m5.metadata_offset_B;
+      cfg.depth = 1;
+      cfg.page_aligned_layers = m5.page_aligned_layers;
       struct hk_native_texture_descriptor packed;
       assert(hk_pack_native_texture(10, &packed, &cfg));
    }
@@ -162,31 +169,29 @@ main(void)
       for (unsigned samples = 1; samples <= 4; samples *= 2) {
          for (unsigned layered = 0; layered < 2; ++layered) {
             const bool msaa = samples > 1;
-            struct AGX_TEXTURE cfg = {
-               AGX_TEXTURE_header,
-               .dimension =
-                  msaa ? (layered ? AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED
-                                  : AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED)
-                       : (layered ? AGX_TEXTURE_DIMENSION_2D_ARRAY
-                                  : AGX_TEXTURE_DIMENSION_2D),
-               .layout = AGX_LAYOUT_GPU,
-               .channels = channels,
-               .type = type,
-               .swizzle_r = AGX_CHANNEL_R,
-               .swizzle_g = AGX_CHANNEL_G,
-               .swizzle_b = AGX_CHANNEL_B,
-               .swizzle_a = AGX_CHANNEL_A,
-               .address = 0x100000,
-               .width = 256,
-               .height = 128,
-               .first_level = 0,
-               .last_level = 0,
-               .compressed = true,
-               .extended = true,
-               .acceleration_buffer = 0x200000,
-               .depth = layered ? 6 : 1,
-               .page_aligned_layers = layered != 0,
-            };
+            struct AGX_TEXTURE cfg = texture_header();
+            cfg.dimension =
+               msaa ? (layered ? AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED
+                               : AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED)
+                    : (layered ? AGX_TEXTURE_DIMENSION_2D_ARRAY
+                               : AGX_TEXTURE_DIMENSION_2D);
+            cfg.layout = AGX_LAYOUT_GPU;
+            cfg.channels = channels;
+            cfg.type = type;
+            cfg.swizzle_r = AGX_CHANNEL_R;
+            cfg.swizzle_g = AGX_CHANNEL_G;
+            cfg.swizzle_b = AGX_CHANNEL_B;
+            cfg.swizzle_a = AGX_CHANNEL_A;
+            cfg.address = 0x100000;
+            cfg.width = 256;
+            cfg.height = 128;
+            cfg.first_level = 0;
+            cfg.last_level = 0;
+            cfg.compressed = true;
+            cfg.extended = true;
+            cfg.acceleration_buffer = 0x200000;
+            cfg.depth = layered ? 6 : 1;
+            cfg.page_aligned_layers = layered != 0;
             if (msaa)
                cfg.samples =
                   samples == 4 ? AGX_SAMPLE_COUNT_4 : AGX_SAMPLE_COUNT_2;
