@@ -145,7 +145,7 @@ enum agx_chip_cap {
     * min/max, with an integer min/max of the bits when the operands compare
     * equal (agx_nir_lower_fminmax_signed_zero). That needs the fp32 compares
     * to order denormals exactly whenever the shader preserves them. Measured
-    * on G17P. */
+    * on G17P and on M5 (G17S); the M5 parts share one instruction set. */
    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT = 1u << 20,
 };
 
@@ -174,7 +174,8 @@ enum agx_chip_cap {
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
     AGX_CAP_SPARSE_BINDING | AGX_CAP_DESCRIPTOR_BUFFER |                       \
-    AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN10_2D_COMPRESSION)
+    AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN10_2D_COMPRESSION |              \
+    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT)
 
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.
