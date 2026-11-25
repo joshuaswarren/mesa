@@ -4433,7 +4433,7 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                 program.bytes, program.length);
          const struct agx3_transcode_ioto ioto = {
             .api_program = true,
-            .shader_gprs = s->b.info.nr_gprs,
+            .shader_gprs = desc.nr_gprs,
          };
          const char *why = NULL;
          unsigned at = 0;
