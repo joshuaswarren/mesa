@@ -566,7 +566,7 @@ hk_g17p_sparse_buffer_copy(struct hk_cmd_buffer *cmd,
          .src_addr = src_addr,
          .src_nonresident_addr = src_nonresident_addr,
          .dst_addr = dst_addr,
-         .map_addr = src_buffer->sparse_map->va->addr +
+         .map_addr = hk_buffer_sparse_map_addr(src_buffer) +
                      sizeof(struct hk_sparse_buffer_map_header),
          .resource_base = src_buffer->va->addr,
          .size = MIN2(size, max_dispatch_size),

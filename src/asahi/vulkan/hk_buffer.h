@@ -30,14 +30,25 @@ struct hk_buffer {
 
    /** One residency bit per sparse-buffer page on Gen9/Gen10 AGX3. */
    struct agx_bo *sparse_map;
+   /** Capture/replay VA bound to sparse_map, NULL when not capture/replay. */
+   struct agx_va *sparse_map_va;
    uint32_t sparse_map_entries;
    /** Link in hk_device::sparse_buffers while sparse_map is set. */
    struct list_head sparse_link;
 };
 
+static inline uint64_t
+hk_buffer_sparse_map_addr(const struct hk_buffer *buffer)
+{
+   if (buffer->sparse_map_va)
+      return buffer->sparse_map_va->addr;
+   return buffer->sparse_map ? buffer->sparse_map->va->addr : 0;
+}
+
 /* VK_EXT_descriptor_buffer capture/replay data of a buffer */
 struct hk_buffer_capture {
    uint64_t va;
+   uint64_t sparse_map_va;
 };
 
 struct hk_sparse_buffer_map_header {
