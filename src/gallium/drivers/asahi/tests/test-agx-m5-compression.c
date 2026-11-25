@@ -4,8 +4,9 @@
 
 /* Under the no-op DRM shim with the M5 kernel's submission checks
  * (ASAHI_SHIM_CHIP=g17s-kernel, ASAHI_SHIM_M5_EXPECT_VALID=1), check which
- * private 2D colour and depth images Gallium compresses on M5, and that the
- * renders it makes of them at 1x, 2x and 4x are ones the kernel admits.
+ * private 2D colour and depth images Gallium compresses on M5
+ * (AGX_CAP_GEN10_2D_COMPRESSION), and that the renders it makes of them at
+ * 1x, 2x and 4x are ones the kernel admits.
  *
  * 2x/4x Z32_FLOAT depth compresses only where the kernel reports
  * DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION. With
@@ -21,6 +22,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "asahi/lib/agx_chip_caps.h"
 #include "drm-uapi/asahi_drm.h"
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
@@ -121,7 +123,7 @@ main(void)
    struct pipe_screen *screen = agx_screen_create(fd, NULL, &config);
    CHECK(screen);
    const struct agx_device *dev = agx_device(screen);
-   CHECK(agx_chip_g17_m5(dev->chip));
+   CHECK(agx_chip_has_cap(dev->chip, AGX_CAP_GEN10_2D_COMPRESSION));
    const bool msaa_zls =
       dev->params.features & DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION;
    CHECK(msaa_zls == msaa_zls_expected);

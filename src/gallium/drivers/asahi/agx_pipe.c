@@ -588,9 +588,9 @@ agx_gen10_msaa_compression_color_format(enum pipe_format format)
    }
 }
 
-/* M5 (Gen10) colour: a private, single-level, single-layer 2D image, at 1x
- * of agx_g17p_compression_color_format() and at 2x/4x of
- * agx_gen10_msaa_compression_color_format(). It is written by the
+/* AGX_CAP_GEN10_2D_COMPRESSION colour: a private, single-level,
+ * single-layer 2D image, at 1x of agx_g17p_compression_color_format() and at
+ * 2x/4x of agx_gen10_msaa_compression_color_format(). It is written by the
  * compressed Gen10 2D or 2x/4x multisample PBE (end-of-tile stores, blits,
  * staging uploads) and read by the compressed texture descriptor. As on
  * Gen9, nothing decompresses it in place: a spilling MRT framebuffer,
@@ -603,7 +603,7 @@ agx_gen10_private_compression_allowed(const struct agx_device *dev,
 {
    const bool msaa = templ->nr_samples > 1;
 
-   return agx_chip_g17_m5(dev->chip) &&
+   return agx_chip_has_cap(dev->chip, AGX_CAP_GEN10_2D_COMPRESSION) &&
           templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
           templ->array_size <= 1 && templ->last_level == 0 &&
           (!msaa || templ->nr_samples == 2 || templ->nr_samples == 4) &&
@@ -614,9 +614,9 @@ agx_gen10_private_compression_allowed(const struct agx_device *dev,
                 : agx_g17p_compression_color_format(templ->format));
 }
 
-/* M5 (Gen10) depth: a private, single-level, single-layer 2D depth buffer
- * (including the separated Z32_FLOAT plane of Z32F_S8 and Z24S8),
- * Z32_FLOAT or Z16_UNORM at 1x and Z32_FLOAT at 2x/4x.
+/* AGX_CAP_GEN10_2D_COMPRESSION depth: a private, single-level, single-layer
+ * 2D depth buffer (including the separated Z32_FLOAT plane of Z32F_S8 and
+ * Z24S8), Z32_FLOAT or Z16_UNORM at 1x and Z32_FLOAT at 2x/4x.
  *
  * The M5 kernel validates every render's ZLS form. It admits compressed
  * depth on a single-layer 2x/4x render only when it reports
@@ -638,7 +638,7 @@ agx_gen10_private_depth_compression_allowed(const struct agx_device *dev,
               (dev->params.features &
                DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION);
 
-   return agx_chip_g17_m5(dev->chip) &&
+   return agx_chip_has_cap(dev->chip, AGX_CAP_GEN10_2D_COMPRESSION) &&
           templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
           templ->array_size <= 1 && templ->last_level == 0 && format_ok &&
           templ->width0 >= 16 && templ->height0 >= 16 &&
@@ -663,8 +663,8 @@ agx_compression_allowed(const struct agx_resource *pres)
     * place where needed (agx_gallium_shared_compression_supported()). AGX3
     * has no in-place decompression, so it compresses only the private images
     * that never need it: those admitted by agx_chip_gen9_color_compression()
-    * (G16G/G17P colour) and AGX_CAP_GEN9_2D_COMPRESSION (G17P depth), and on
-    * M5 its Gen10 colour and depth shapes.
+    * (G16G/G17P colour) and AGX_CAP_GEN9_2D_COMPRESSION (G17P depth), and by
+    * AGX_CAP_GEN10_2D_COMPRESSION (M5 colour and depth).
     */
    if (agx_gallium_descriptor_generation_is_agx3(generation)) {
       if (!agx_g17p_private_compression_allowed(dev, &pres->base.b) &&
