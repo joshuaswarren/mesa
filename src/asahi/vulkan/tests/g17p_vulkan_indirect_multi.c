@@ -371,6 +371,10 @@ static void
 run_suite(VkPhysicalDevice pdev, uint32_t qf, bool robust_buffer_access,
           bool shim, bool non_indexed_only)
 {
+   /* The static stream check follows VDM links, but the no-op shim cannot
+    * execute the compute kernel that fills their targets for count draws.
+    */
+   const bool test_non_indexed_count = !(shim && non_indexed_only);
    float prio = 1.0f;
    VkDeviceQueueCreateInfo qci = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -572,6 +576,9 @@ run_suite(VkPhysicalDevice pdev, uint32_t qf, bool robust_buffer_access,
          .indexed = false,
       };
       for (unsigned counted = 0; counted <= 1; ++counted) {
+         if (counted && !test_non_indexed_count)
+            continue;
+
          ctx.use_count = counted;
          begin_pass_and_submit(queue, cmd, rp, fb, img, readback.buf,
                                record_draws, &ctx);
@@ -680,17 +687,19 @@ run_suite(VkPhysicalDevice pdev, uint32_t qf, bool robust_buffer_access,
          verify_pixels("draw_id non-indexed", readback.map, DRAW_COUNT, 200u,
                        5u, 0u, 3u);
 
-      ctx.use_count = true;
-      ctx.count_buf = count_buf.buf;
-      begin_pass_and_submit(queue, cmd, rp, fb, img, readback.buf,
-                            record_draws, &ctx);
-      if (!shim) {
-         verify_pixels("draw_id non-indexed count", readback.map,
-                       INDIRECT_COUNT_ACTUAL, 200u, 5u, 0u, 3u);
-         verify_count_replay(queue, cmd, count_buf.map, readback.map, 5u,
-                             "non-indexed count replay");
+      if (test_non_indexed_count) {
+         ctx.use_count = true;
+         ctx.count_buf = count_buf.buf;
+         begin_pass_and_submit(queue, cmd, rp, fb, img, readback.buf,
+                               record_draws, &ctx);
+         if (!shim) {
+            verify_pixels("draw_id non-indexed count", readback.map,
+                          INDIRECT_COUNT_ACTUAL, 200u, 5u, 0u, 3u);
+            verify_count_replay(queue, cmd, count_buf.map, readback.map, 5u,
+                                "non-indexed count replay");
+         }
+         ctx.use_count = false;
       }
-      ctx.use_count = false;
 
       /* Edge drawCounts 0, 1, 2, 3 (non-indexed). */
       ctx.edge_counts = true;
