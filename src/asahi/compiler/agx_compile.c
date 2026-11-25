@@ -3598,9 +3598,13 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
       if (b->shader->key->dev.emit_agx3d &&
           (g18_samples == 2 || g18_samples == 4) &&
           !b->shader->key->fs.inside_sample_loop &&
-          !b->shader->force_early_tests_pending && !no_tests &&
+          !no_tests &&
           (agx_g18_all_sample_targets(instr->src[0]) ||
            nir_intrinsic_flags(instr) == AGX_SAMPLE_MASK_FULL_OR_KILL)) {
+         const bool force_early = b->shader->force_early_tests_pending;
+         b->shader->force_early_tests_pending = false;
+         if (force_early)
+            agx_wait_pixel_mask(b, 0x1);
          b->shader->out->g18_sample_mask_forms |= AGX_G18_SAMPLE_MASK_FULL;
          agx_index coverage = agx_temp(b->shader, AGX_SIZE_16);
          agx_get_sr_coverage_to(b, coverage, AGX_SR_INPUT_SAMPLE_MASK);
@@ -3634,7 +3638,8 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
                            AGX_ICOND_UEQ);
             word = selected;
          }
-         return agx_sample_mask_agx3(b, agx_mov_imm(b, 16, 1), word, 2);
+         return agx_sample_mask_agx3(b, agx_mov_imm(b, 16, 1), word,
+                                     2 | (force_early ? 1 : 0));
       }
 
       /* Native1121 psdiscard (Apple M6, verified capture 1121, run 1128):
