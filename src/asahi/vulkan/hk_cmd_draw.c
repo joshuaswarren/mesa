@@ -11335,9 +11335,10 @@ hk_vs_link_key_build(struct hk_device *dev, struct hk_shader *sw_vs, bool hw,
       if (restart)
          prim = u_decomposed_prim(prim);
 
-      /* G17P materialises adjacency into an index buffer before the hardware
-       * vertex program. Applying the remap again in the prolog is wrong. */
-      if (!agx_chip_native_or_m5(dev->dev.chip))
+      /* AGX3 paths materialise adjacency into an index buffer before the
+       * hardware vertex program. Applying the remap again in the prolog is
+       * wrong. */
+      if (!agx_chip_agx3_path(dev->dev.chip))
          key->prolog.adjacency = prim;
    }
 
