@@ -597,7 +597,8 @@ hk_cdm_pack_visibility_flush(const struct hk_device *dev, bool memory,
 }
 
 static void
-hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
+hk_cdm_flush_impl(struct hk_device *dev, struct hk_cs *cs, bool memory,
+                  bool pure_ssbo)
 {
    assert(cs->type == HK_CS_CDM);
    assert(cs->current + AGX_CDM_BARRIER_LENGTH < cs->end &&
@@ -609,21 +610,25 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
          return;
 
       {
-         /* The only Borealis AGX2 barrier-word path: the reduced word on
-          * the dies it was measured on (hk_device::cdm_barrier_default_mask,
-          * agx2_cdm_barrier_default_word()), the full word on every other
-          * chip, under fullcdmbarrier, and once the device holds a sparse
-          * resource -- the reduced set leaves page remappings behind the
-          * launches unordered. Gallium keeps agx_cdm_barrier()'s full
-          * record. */
+         /* The only Borealis AGX2 barrier-word path: pure compute-to-compute
+          * SSBO dependencies inside an open stream drop bit 3 (USC cache
+          * inval) and PBE/texture bits on measured dies (0x160); all other
+          * barriers use the chip default word (0x1ff on G13X/G14X). Sparse
+          * resources and fullcdmbarrier upgrade to the full word (0xfffff). */
+         const uint32_t base_word =
+            pure_ssbo ? agx2_cdm_barrier_ssbo_word(
+                           dev->dev.chip, dev->dev.params.gpu_generation)
+                      : dev->cdm_barrier_default_mask;
          const uint32_t mask = agx2_cdm_barrier_emit_word(
-            dev->cdm_barrier_default_mask, p_atomic_read(&dev->sparse_used),
+            base_word, p_atomic_read(&dev->sparse_used),
             HK_PERF(dev, FULLCDMBARRIER));
 
          uint32_t *word = cs->current;
          *word = mask | (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
          cs->current = word + 1;
-         cs->strong_flush_end = cs->current;
+         if (!pure_ssbo || mask == dev->cdm_barrier_default_mask ||
+             mask == AGX_CDM_BARRIER_FULL_WORD)
+            cs->strong_flush_end = cs->current;
 
          /* A sparse resource created between recording and submission
           * still upgrades this record at submit. */
@@ -711,6 +716,12 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
    cs->stats.flushes++;
 }
 
+static void
+hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
+{
+   hk_cdm_flush_impl(dev, cs, memory, false);
+}
+
 void
 hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
 {
@@ -786,10 +797,14 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
     * funnels here, so no caller can end the compute stream with a declared
     * dependency left unemitted. This also keeps the drain out of
     * hk_cmd_buffer.h: standalone test binaries stub this function. */
-   if (cs == cmd->current_cs.cs && cmd->state.cs.cdm_barrier_pending) {
-      cmd->state.cs.cdm_barrier_pending = false;
-      hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
-      hk_cdm_cache_flush(dev, cs);
+   if (cs == cmd->current_cs.cs) {
+      cmd->state.cs.cdm_stream_has_images = false;
+      if (cmd->state.cs.cdm_barrier_pending) {
+         cmd->state.cs.cdm_barrier_pending = false;
+         cmd->state.cs.cdm_barrier_full_needed = false;
+         hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
+         hk_cdm_cache_flush(dev, cs);
+      }
    }
 
    /* A dependency recorded while no compute stream holding work is open
@@ -853,11 +868,14 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
    if (!HK_PERF(dev, ALWAYSCDMBARRIER) &&
        cs->cmd->state.cs.cdm_barrier_pending) {
       /* The app declared a memory dependency since the last launch: carry
-       * the full barrier ahead of this launch and clear it. Launches the
-       * app left unordered have no Vulkan-defined ordering to enforce, so
-       * their drain is skipped. */
+       * the barrier ahead of this launch and clear it. Pure compute-to-compute
+       * SSBO barriers inside an open stream emit the narrower SSBO word
+       * (0x160 on G14X); all others keep the default word. */
+      const bool pure_ssbo =
+         !cs->cmd->state.cs.cdm_barrier_full_needed && cs->stats.cmds > 1;
       cs->cmd->state.cs.cdm_barrier_pending = false;
-      hk_cdm_cache_flush(dev, cs);
+      cs->cmd->state.cs.cdm_barrier_full_needed = false;
+      hk_cdm_flush_impl(dev, cs, agx_chip_g17_m5(dev->dev.chip), pure_ssbo);
    }
 
    cs->current =
@@ -881,6 +899,12 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
       cfg.preshader_register_count = info->nr_preamble_gprs;
    }
 
+   if (info->stage != MESA_SHADER_COMPUTE || info->texture_state_count != 0 ||
+       info->sampler_state_count != 0 || info->uses_sampler_heap ||
+       info->uses_txf) {
+      cs->cmd->state.cs.cdm_barrier_full_needed = true;
+      cs->cmd->state.cs.cdm_stream_has_images = true;
+   }
    hk_dispatch_with_usc_launch(dev, cs, launch, usc, grid, local_size);
 
    /* Software graphics stages communicate through memory: VS outputs,
