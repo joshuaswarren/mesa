@@ -786,6 +786,7 @@ if with_tests
          'test/test-lower-divmod64.cpp',
          'test/test-spill-fallback.cpp',
          'test/test-agx-register-cache.cpp',
+         'test/test-agx3c-collect-split.cpp',
          'test/test-opt-licm.cpp',
          'test/test-g17p-mod3-ra.cpp',
          'test/test-ra-early-kill.cpp',
