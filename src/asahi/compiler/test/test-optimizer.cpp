@@ -2088,16 +2088,26 @@ TEST_F(Optimizer, AGX3BFoldsAlignedUniformDeviceLoadBase)
    };
 
    const load_case cases[] = {
-      /* Compute I8 scalar & packed, aligned low uniform -> fold */
+      /* Compute I8 scalar (16/32) & packed (partial/full), aligned low uniform -> fold */
       {"compute-i8-scalar", MESA_SHADER_COMPUTE, AGX_FORMAT_I8, AGX_SIZE_32, 1,
        0x1, false, false, false, false, false, 4u, true},
+      {"compute-i8-scalar16", MESA_SHADER_COMPUTE, AGX_FORMAT_I8, AGX_SIZE_16, 1,
+       0x1, false, false, false, false, false, 252u, true},
       {"compute-i8-packed", MESA_SHADER_COMPUTE, AGX_FORMAT_I8, AGX_SIZE_32, 1,
        0xf, true, false, false, false, false, 8u, true},
-      /* Compute I16/I32 scalar & vector masks -> fold */
+      {"compute-i8-packed-partial", MESA_SHADER_COMPUTE, AGX_FORMAT_I8, AGX_SIZE_32, 1,
+       0x3, true, false, false, false, false, 252u, true},
+      /* Compute I16/F16/I32 scalar & vector masks -> fold */
       {"compute-i16-scalar", MESA_SHADER_COMPUTE, AGX_FORMAT_I16, AGX_SIZE_16,
        1, 0x1, false, false, false, false, false, 4u, true},
       {"compute-i16-vec4", MESA_SHADER_COMPUTE, AGX_FORMAT_I16, AGX_SIZE_16, 4,
        0xf, false, false, false, false, false, 8u, true},
+      {"compute-f16-scalar", MESA_SHADER_COMPUTE, AGX_FORMAT_F16, AGX_SIZE_16,
+       1, 0x1, false, false, false, false, false, 4u, true},
+      {"compute-f16-vec4", MESA_SHADER_COMPUTE, AGX_FORMAT_F16, AGX_SIZE_16, 4,
+       0xf, false, false, false, false, false, 252u, true},
+      {"compute-f16-vec4-32", MESA_SHADER_COMPUTE, AGX_FORMAT_F16, AGX_SIZE_32, 4,
+       0xf, false, false, false, false, false, 16u, true},
       {"compute-i32-scalar", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32,
        1, 0x1, false, false, false, false, false, 4u, true},
       {"compute-i32-vec4", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 4,
@@ -2105,9 +2115,11 @@ TEST_F(Optimizer, AGX3BFoldsAlignedUniformDeviceLoadBase)
       /* Unaligned or high uniform file -> refuse */
       {"unaligned-u2", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1,
        0x1, false, false, false, false, false, 2u, false},
+      {"unaligned-f16-u2", MESA_SHADER_COMPUTE, AGX_FORMAT_F16, AGX_SIZE_16, 1,
+       0x1, false, false, false, false, false, 2u, false},
       {"high-file-u256", MESA_SHADER_COMPUTE, AGX_FORMAT_I16, AGX_SIZE_16, 4,
        0xf, false, false, false, false, false, 256u, false},
-      /* Non-compute, coherent, internal, secondary, preamble, 64-bit -> refuse */
+      /* Non-compute, coherent, internal, secondary, preamble, invalid shape -> refuse */
       {"vertex-i32", MESA_SHADER_VERTEX, AGX_FORMAT_I32, AGX_SIZE_32, 1, 0x1,
        false, false, false, false, false, 4u, false},
       {"fragment-i32", MESA_SHADER_FRAGMENT, AGX_FORMAT_I32, AGX_SIZE_32, 1,
@@ -2122,6 +2134,12 @@ TEST_F(Optimizer, AGX3BFoldsAlignedUniformDeviceLoadBase)
        0x1, false, false, false, false, true, 4u, false},
       {"dest-64bit", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_64, 1, 0x1,
        false, false, false, false, false, 4u, false},
+      {"packed-i32", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_32, 1, 0xf,
+       true, false, false, false, false, 4u, false},
+      {"i32-dst16", MESA_SHADER_COMPUTE, AGX_FORMAT_I32, AGX_SIZE_16, 1, 0x1,
+       false, false, false, false, false, 4u, false},
+      {"mask-exceeds-ch", MESA_SHADER_COMPUTE, AGX_FORMAT_F16, AGX_SIZE_16, 1,
+       0xf, false, false, false, false, false, 4u, false},
    };
 
    for (const load_case &c : cases) {
