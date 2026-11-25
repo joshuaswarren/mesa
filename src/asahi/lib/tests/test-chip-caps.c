@@ -145,6 +145,22 @@ test_mod3_reg_bank_ra(void)
    }
 }
 
+/* G17D partitions AGX_CAPS_M5 into measured and excluded capabilities so any
+ * new M5 capability fails this test until assigned to one set. */
+static void
+test_g17d_partitions_m5(void)
+{
+   CHECK((AGX_CAPS_G17D_MEASURED & AGX_CAPS_G17D_EXCLUDED) == 0);
+   CHECK((AGX_CAPS_G17D_MEASURED | AGX_CAPS_G17D_EXCLUDED) == AGX_CAPS_M5);
+   for (unsigned bit = 1; bit; bit <<= 1) {
+      if (!(all_caps & bit))
+         continue;
+      CHECK_CHIP(agx_chip_has_cap(AGX_CHIP_G17D, bit) ==
+                    ((AGX_CAPS_G17D_MEASURED & bit) != 0),
+                 AGX_CHIP_G17D);
+   }
+}
+
 int
 main(void)
 {
@@ -154,6 +170,7 @@ main(void)
    test_coalesce_pure_global_workgroups();
    test_cdm_war_weak_barrier();
    test_mod3_reg_bank_ra();
+   test_g17d_partitions_m5();
 
    if (failures) {
       fprintf(stderr, "agx_chip_caps: %u of %u checks failed\n", failures,

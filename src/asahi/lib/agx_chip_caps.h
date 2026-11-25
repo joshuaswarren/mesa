@@ -111,12 +111,24 @@ enum agx_chip_cap {
     AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
     AGX_CAP_GEN9_2D_COMPRESSION | AGX_CAP_MOD3_REG_BANK_RA)
 
-/* What the single-die M5 parts (G17G, G17S, G17C) share. G17D keeps
- * VDM_INDIRECT_INDEX_BOUNDS and HW_TXF_BOUNDS off until measured on J775D. */
+/* What the single-die M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
     AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_CDM_WAR_WEAK_BARRIER)
+
+/* G17D partitions AGX_CAPS_M5 into measured capabilities (enabled) and
+ * unmeasured exclusions (kept off until measured on J775D). test-chip-caps.c
+ * asserts the two sets are disjoint and cover AGX_CAPS_M5, so adding a new
+ * capability to AGX_CAPS_M5 forces an explicit decision for G17D. */
+#define AGX_CAPS_G17D_MEASURED                                                 \
+   (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX)
+
+#define AGX_CAPS_G17D_EXCLUDED                                                 \
+   (AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS | AGX_CAP_HW_TXF_BOUNDS |                \
+    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_CDM_WAR_WEAK_BARRIER)
+
+#define AGX_CAPS_G17D AGX_CAPS_G17D_MEASURED
 
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.
@@ -144,8 +156,7 @@ enum agx_chip_cap {
    X(G17G, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17S, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17C, AGX_CAPS_M5, __VA_ARGS__)                                           \
-   X(G17D, AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX,    \
-     __VA_ARGS__)                                                              \
+   X(G17D, AGX_CAPS_G17D, __VA_ARGS__)                                         \
    X(G18G, 0, __VA_ARGS__)
 
 /* Like agx_chip_has_record(), a test of the table expands to comparisons, so
