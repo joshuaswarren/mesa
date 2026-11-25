@@ -10271,7 +10271,8 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
    }
    if (!prod->nir)
       return NULL;
-   if (!epilogue && dual_write == HK_COMPUTE_PAIR_DUAL_NONE)
+   if (!epilogue && dual_write == HK_COMPUTE_PAIR_DUAL_NONE &&
+       !hk_compute_pair_alt_is_gemm_unguarded(alt_kind))
       return NULL;
    if (epilogue && !hk_nir_clamp_epilogue_valid(epilogue))
       return NULL;
@@ -10282,9 +10283,7 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
        (prod->info.role != HK_COMPUTE_PAIR_DEPTHWISE ||
         !prod->info.depthwise.vec4_valid))
       return NULL;
-   if ((alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16 ||
-        alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 ||
-        alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64) &&
+   if (hk_compute_pair_alt_is_gemm_cmat(alt_kind) &&
        (prod->info.role != HK_COMPUTE_PAIR_GEMM ||
         !prod->info.gemm.cmat_valid ||
         !agx_chip_cooperative_matrix_supported(dev->dev.chip)))
@@ -10315,14 +10314,12 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
    if (alt_kind == HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4) {
       fused_nir = hk_nir_build_depthwise_vec4(prod->nir, &prod->info.depthwise,
                                               epilogue, dual_write);
-   } else if (alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16) {
-      fused_nir = hk_nir_build_gemm_cmat(prod->nir, &prod->info.gemm, 16,
-                                         epilogue, dual_write);
-   } else if (alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32) {
-      fused_nir = hk_nir_build_gemm_cmat(prod->nir, &prod->info.gemm, 32,
-                                         epilogue, dual_write);
-   } else if (alt_kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64) {
-      fused_nir = hk_nir_build_gemm_cmat(prod->nir, &prod->info.gemm, 64,
+   } else if (hk_compute_pair_alt_is_gemm_cmat(alt_kind)) {
+      struct hk_nir_gemm_output gemm_info = prod->info.gemm;
+      if (hk_compute_pair_alt_is_gemm_unguarded(alt_kind))
+         gemm_info.is_guarded = false;
+      fused_nir = hk_nir_build_gemm_cmat(prod->nir, &gemm_info,
+                                         hk_compute_pair_alt_gemm_tile_n(alt_kind),
                                          epilogue, dual_write);
    } else if (has_ep) {
       const struct hk_nir_clamp_buffer out_buf =

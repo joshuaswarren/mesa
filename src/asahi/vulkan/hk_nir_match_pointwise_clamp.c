@@ -5862,9 +5862,10 @@ hk_nir_build_gemm_cmat(const nir_shader *producer,
    const char *dual_sfx =
       dual_write == HK_COMPUTE_PAIR_DUAL_COPY ? "_dcopy"
       : (dual_write == HK_COMPUTE_PAIR_DUAL_PAD4 ? "_dpad4" : "");
-   nir->info.name = ralloc_asprintf(nir, "%s_gemm_cmat%u%s%s",
+   nir->info.name = ralloc_asprintf(nir, "%s_gemm_cmat%u%s%s%s",
                                     producer->info.name ? producer->info.name : "cs",
-                                    tile_n, epilogue ? "_clamp" : "", dual_sfx);
+                                    tile_n, info->is_guarded ? "" : "_ug",
+                                    epilogue ? "_clamp" : "", dual_sfx);
 
    /* All three variants use 128 threads (4 subgroups) and 4 KiB XOR-swizzled
     * shared A while loading B directly from global memory:
@@ -5878,7 +5879,6 @@ hk_nir_build_gemm_cmat(const nir_shader *producer,
    const unsigned k_step = k32 ? 32 : 16;
    const unsigned k_step_shift = k32 ? 5 : 4;
    const unsigned n_k_slices = k32 ? 4 : 2;
-   const unsigned a_half_rows = tile_m / 2;
    const unsigned a_half_shift = k32 ? 4 : 5;
    const unsigned a_c4_mask = k32 ? 7 : 3;
    const unsigned a_c4_shift = k32 ? 3 : 2;
@@ -5964,10 +5964,13 @@ hk_nir_build_gemm_cmat(const nir_shader *producer,
                                   nir_ishl_imm(&b, a_rd_c4, 1)),
                       nir_iand_imm(&b, nir_ushr_imm(&b, col_in_8, 1), 1)));
 
-   nir_def *k4 = nir_ushr_imm(&b, k, 2);
-   nir_def *a_g_base4_0 = nir_iadd(&b, nir_imul(&b, nir_iadd(&b, wg_row, a_r0_pre), k4),
-                                       a_c4_pre);
-   nir_def *a_row_half_stride4 = nir_ishl_imm(&b, k4, a_half_shift);
+   nir_def *k4 = NULL, *a_g_base4_0 = NULL, *a_row_half_stride4 = NULL;
+   if (!info->is_guarded) {
+      k4 = nir_ushr_imm(&b, k, 2);
+      a_g_base4_0 = nir_iadd(&b, nir_imul(&b, nir_iadd(&b, wg_row, a_r0_pre), k4),
+                                 a_c4_pre);
+      a_row_half_stride4 = nir_ishl_imm(&b, k4, a_half_shift);
+   }
 
    nir_def *b_col0 = nir_iadd(&b, nir_iadd(&b, wg_col, sg_col), col_in_8);
    nir_def *b_k0_base = nir_iadd(&b, nir_imul(&b, row_in_8, n), b_col0);
@@ -5975,13 +5978,11 @@ hk_nir_build_gemm_cmat(const nir_shader *producer,
    nir_def *b_stride_kstep = nir_ishl_imm(&b, n, k_step_shift);
 
    nir_def *tile_m_full = NULL, *tile_n_full = NULL;
-   nir_def *k_aligned4 = NULL;
    if (info->is_guarded) {
       tile_m_full = nir_iand(&b, nir_uge_imm(&b, m, tile_m),
                                  nir_uge(&b, nir_iadd_imm(&b, m, -(int32_t)tile_m), wg_row));
       tile_n_full = nir_iand(&b, nir_uge_imm(&b, n, tile_n),
                                  nir_uge(&b, nir_iadd_imm(&b, n, -(int32_t)tile_n), wg_col));
-      k_aligned4 = nir_ieq_imm(&b, nir_iand_imm(&b, k, 3), 0);
    }
 
    nir_def *zero_i = nir_imm_int(&b, 0);
@@ -6022,12 +6023,12 @@ hk_nir_build_gemm_cmat(const nir_shader *producer,
    nir_pop_if(&b, k_done);
 
    nir_def *a_sh_idx4_0 = nir_u2u32(&b, a_sh_idx4_0_16);
-   nir_def *kb4 = nir_ushr_imm(&b, k_base, 2);
    nir_def *k_full = NULL;
 
    /* Phase 1: Stage tile_m x k_step tile of A into 4 KiB XOR-swizzled shared
     * memory (128 threads x 2 vec4s = 256 vec4s = 1024 floats). */
    if (!info->is_guarded) {
+      nir_def *kb4 = nir_ushr_imm(&b, k_base, 2);
       nir_def *a_idx4 = nir_iadd(&b, a_g_base4_0, kb4);
       nir_def *va0 = nir_load_global(
          &b, 4, 32,
@@ -6045,23 +6046,26 @@ hk_nir_build_gemm_cmat(const nir_shader *producer,
    } else {
       k_full = nir_iand(&b, nir_uge_imm(&b, k, k_step),
                             nir_uge(&b, nir_iadd_imm(&b, k, -(int32_t)k_step), k_base));
-      nir_def *fast_a = nir_iand(&b, nir_iand(&b, tile_m_full, k_full), k_aligned4);
+      nir_def *fast_a = nir_iand(&b, tile_m_full, k_full);
       nir_if *fa_if = nir_push_if(&b, fast_a);
       {
-         nir_def *a_idx4 = nir_iadd(&b, a_g_base4_0, kb4);
-         /* Guarded dispatch only enforces 4-byte alignment on A (minimum SSBO
-          * offset alignment is 4B), so address via gemm_f32_addr and declare
-          * align_mul = 4 on these vec4 loads. */
+         /* Float-indexed addressing works for any K (including K % 4 != 0)
+          * because every element of A is 4-byte aligned. Recompute row/col
+          * from lid inside fast_a to keep K-loop live GPRs <= 103. */
+         nir_def *lid_f = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+         nir_def *a_r0_f = nir_ushr_imm(&b, lid_f, a_c4_shift);
+         nir_def *a_c0_f = nir_ishl_imm(&b, nir_iand_imm(&b, lid_f, a_c4_mask), 2);
+         nir_def *a_idx = nir_iadd(&b, nir_imul(&b, nir_iadd(&b, wg_row, a_r0_f), k),
+                                       nir_iadd(&b, k_base, a_c0_f));
          nir_def *va0 = nir_load_global(
             &b, 4, 32,
             gemm_f32_addr(&b, info->reads[0], info->desc_comps, info->read_res_type[0],
-                          nir_ishl_imm(&b, a_idx4, 2), read),
+                          a_idx, read),
             .align_mul = 4, .access = read);
          nir_def *va1 = nir_load_global(
             &b, 4, 32,
             gemm_f32_addr(&b, info->reads[0], info->desc_comps, info->read_res_type[0],
-                          nir_ishl_imm(&b, nir_iadd(&b, a_idx4, a_row_half_stride4), 2),
-                          read),
+                          nir_iadd(&b, a_idx, nir_ishl_imm(&b, k, a_half_shift)), read),
             .align_mul = 4, .access = read);
          nir_store_deref(&b, nir_build_deref_array(&b, a_sh_v4, a_sh_idx4_0), va0, 0xf);
          nir_store_deref(&b, nir_build_deref_array(&b, a_sh_v4,
@@ -6069,47 +6073,46 @@ hk_nir_build_gemm_cmat(const nir_shader *producer,
       }
       nir_push_else(&b, fa_if);
       {
-         nir_if *k4_if = nir_push_if(&b, k_aligned4);
-         {
-            nir_def *lid_e = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
-            nir_def *a_r0 = nir_ushr_imm(&b, lid_e, a_c4_shift);
-            nir_def *a_c4 = nir_iand_imm(&b, lid_e, a_c4_mask);
-            nir_def *kc4 = nir_iadd(&b, kb4, a_c4);
-            nir_def *k_ok = nir_ult(&b, kc4, k4);
-            for (unsigned rr = 0; rr < 2; ++rr) {
-               nir_def *ar = rr ? nir_iadd_imm(&b, a_r0, a_half_rows) : a_r0;
-               nir_def *gr = nir_iadd(&b, wg_row, ar);
-               nir_def *va_ld = NULL;
-               nir_if *a_ok = nir_push_if(&b, nir_iand(&b, nir_ult(&b, gr, m), k_ok));
-               {
-                  nir_def *idx4 = nir_iadd(&b, nir_imul(&b, gr, k4), kc4);
-                  va_ld = nir_load_global(
-                     &b, 4, 32,
-                     gemm_f32_addr(&b, info->reads[0], info->desc_comps,
-                                   info->read_res_type[0],
-                                   nir_ishl_imm(&b, idx4, 2), read),
-                     .align_mul = 4, .access = read);
-               }
-               nir_push_else(&b, a_ok);
-               nir_pop_if(&b, a_ok);
-               nir_def *va_v = nir_if_phi(&b, va_ld, zero_v4);
-               nir_def *sh_i = rr ? nir_iadd_imm(&b, a_sh_idx4_0, 128) : a_sh_idx4_0;
-               nir_store_deref(&b, nir_build_deref_array(&b, a_sh_v4, sh_i), va_v, 0xf);
-            }
-         }
-         nir_push_else(&b, k4_if);
-         {
-            nir_def *lid_s = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
-            nir_def *a_r0 = nir_ushr_imm(&b, lid_s, a_c4_shift);
-            nir_def *a_c0 = nir_ishl_imm(&b, nir_iand_imm(&b, lid_s, a_c4_mask), 2);
-            for (unsigned rr = 0; rr < 2; ++rr) {
-               nir_def *ar = rr ? nir_iadd_imm(&b, a_r0, a_half_rows) : a_r0;
-               nir_def *gr = nir_iadd(&b, wg_row, ar);
-               nir_def *r_ok = nir_ult(&b, gr, m);
-               nir_def *sh_base = nir_ishl_imm(&b, rr ? nir_iadd_imm(&b, a_sh_idx4_0, 128) : a_sh_idx4_0, 2);
-               nir_def *gk_base = nir_iadd(&b, k_base, a_c0);
-               nir_def *g_row_base = nir_iadd(&b, nir_imul(&b, gr, k), gk_base);
+         nir_def *lid_s = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+         nir_def *a_r0 = nir_ushr_imm(&b, lid_s, a_c4_shift);
+         nir_def *a_c0 = nir_ishl_imm(&b, nir_iand_imm(&b, lid_s, a_c4_mask), 2);
+         nir_def *gk_base = nir_iadd(&b, k_base, a_c0);
+         nir_def *k_vec4_ok = nir_iand(&b, nir_uge_imm(&b, k, 4),
+                                           nir_uge(&b, nir_iadd_imm(&b, k, -4), gk_base));
+         nir_def *k_any_ok = nir_ult(&b, gk_base, k);
 
+         nir_loop *rr_lp = nir_push_loop(&b);
+         rr_lp->control = nir_loop_control_dont_unroll;
+         nir_block *rr_pre = nir_cf_node_as_block(nir_cf_node_prev(&rr_lp->cf_node));
+         nir_block *rr_hdr = nir_loop_first_block(rr_lp);
+         nir_phi_instr *rr_phi = nir_phi_instr_create(b.shader);
+         nir_def_init(&rr_phi->instr, &rr_phi->def, 1, 32);
+         nir_phi_instr_add_src(rr_phi, rr_pre, zero_i);
+         nir_def *rr_v = &rr_phi->def;
+         nir_if *rr_done = nir_push_if(&b, nir_ige_imm(&b, rr_v, 2));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, rr_done);
+
+         nir_def *ar = nir_iadd(&b, a_r0, nir_ishl_imm(&b, rr_v, a_half_shift));
+         nir_def *gr = nir_iadd(&b, wg_row, ar);
+         nir_def *r_ok = nir_ult(&b, gr, m);
+         nir_def *sh_i = nir_iadd(&b, a_sh_idx4_0, nir_ishl_imm(&b, rr_v, 7));
+         nir_if *v4_if = nir_push_if(&b, nir_iand(&b, r_ok, k_vec4_ok));
+         {
+            nir_def *g_idx = nir_iadd(&b, nir_imul(&b, gr, k), gk_base);
+            nir_def *va_ld = nir_load_global(
+               &b, 4, 32,
+               gemm_f32_addr(&b, info->reads[0], info->desc_comps,
+                             info->read_res_type[0], g_idx, read),
+               .align_mul = 4, .access = read);
+            nir_store_deref(&b, nir_build_deref_array(&b, a_sh_v4, sh_i), va_ld, 0xf);
+         }
+         nir_push_else(&b, v4_if);
+         {
+            nir_if *tail_if = nir_push_if(&b, nir_iand(&b, r_ok, k_any_ok));
+            {
+               nir_def *g_row_base = nir_iadd(&b, nir_imul(&b, gr, k), gk_base);
+               nir_def *sh_base = nir_ishl_imm(&b, sh_i, 2);
                nir_loop *cc_lp = nir_push_loop(&b);
                cc_lp->control = nir_loop_control_dont_unroll;
                nir_block *cc_pre = nir_cf_node_as_block(nir_cf_node_prev(&cc_lp->cf_node));
@@ -6123,7 +6126,7 @@ hk_nir_build_gemm_cmat(const nir_shader *producer,
 
                nir_def *gk = nir_iadd(&b, gk_base, &cc_phi->def);
                nir_def *v_ld = NULL;
-               nir_if *ok_if = nir_push_if(&b, nir_iand(&b, r_ok, nir_ult(&b, gk, k)));
+               nir_if *ok_if = nir_push_if(&b, nir_ult(&b, gk, k));
                {
                   v_ld = nir_load_global(&b, 1, 32,
                      gemm_f32_addr(&b, info->reads[0], info->desc_comps,
@@ -6134,15 +6137,26 @@ hk_nir_build_gemm_cmat(const nir_shader *producer,
                nir_push_else(&b, ok_if);
                nir_pop_if(&b, ok_if);
                nir_def *av = nir_if_phi(&b, v_ld, zero_f);
-               nir_store_deref(&b, nir_build_deref_array(&b, a_sh_f32, nir_iadd(&b, sh_base, &cc_phi->def)), av, 1);
+               nir_store_deref(&b, nir_build_deref_array(&b, a_sh_f32,
+                               nir_iadd(&b, sh_base, &cc_phi->def)), av, 1);
 
                nir_block *cc_back = nir_loop_last_block(cc_lp);
                nir_phi_instr_add_src(cc_phi, cc_back, nir_iadd_imm(&b, &cc_phi->def, 1));
                nir_instr_insert(nir_before_block(cc_hdr), &cc_phi->instr);
                nir_pop_loop(&b, cc_lp);
             }
+            nir_push_else(&b, tail_if);
+            {
+               nir_store_deref(&b, nir_build_deref_array(&b, a_sh_v4, sh_i), zero_v4, 0xf);
+            }
+            nir_pop_if(&b, tail_if);
          }
-         nir_pop_if(&b, k4_if);
+         nir_pop_if(&b, v4_if);
+
+         nir_block *rr_back = nir_cursor_current_block(b.cursor);
+         nir_phi_instr_add_src(rr_phi, rr_back, nir_iadd_imm(&b, rr_v, 1));
+         nir_instr_insert(nir_before_block(rr_hdr), &rr_phi->instr);
+         nir_pop_loop(&b, rr_lp);
       }
       nir_pop_if(&b, fa_if);
    }
@@ -6574,11 +6588,11 @@ hk_nir_build_gemm_cmat(const nir_shader *producer,
       }
       nir_push_else(&b, cf_if);
       {
-         emit_gemm_cmat_store_guarded_row(&b, info, epilogue, dual_ptr, n_n_tiles, m, n,
-                                          bias_mode, c_row0, c_col0, acc0);
+         emit_gemm_cmat_store_guarded_row(&b, info, epilogue, dual_ptr, n_n_tiles,
+                                          m, n, bias_mode, c_row0, c_col0, acc0);
          if (n_m_tiles == 2) {
-            emit_gemm_cmat_store_guarded_row(&b, info, epilogue, dual_ptr, n_n_tiles, m, n,
-                                             bias_mode, c_row1, c_col0, acc1);
+            emit_gemm_cmat_store_guarded_row(&b, info, epilogue, dual_ptr, n_n_tiles,
+                                             m, n, bias_mode, c_row1, c_col0, acc1);
          }
       }
       nir_pop_if(&b, cf_if);
@@ -6587,7 +6601,8 @@ hk_nir_build_gemm_cmat(const nir_shader *producer,
    if (dual_write == HK_COMPUTE_PAIR_DUAL_PAD4) {
       /* Emit PAD4 border zeroing (simple_pad) and rare general scatter fallback
        * ONCE after all accumulators are dead, avoiding per-tile code duplication
-       * and register-pressure bloat across the store loops. */
+       * and register-pressure bloat across the store loops. Recompute output
+       * coordinates here so they stay dead across the store loops. */
       nir_def *wg_p = nir_load_workgroup_id(&b);
       nir_def *sg_p = nir_load_subgroup_id(&b);
       nir_def *lane_p = nir_load_subgroup_invocation(&b);
@@ -6768,6 +6783,7 @@ hk_nir_build_gemm_cmat(const nir_shader *producer,
             nir_instr_insert(nir_before_block(mi_hdr), &mi_phi->instr);
             nir_pop_loop(&b, mi_lp);
          }
+
          nir_def *m_eff = info->is_guarded ? m : nir_imul(&b, dual.in_h, dual.in_w);
          nir_def *gx = nir_ushr_imm(&b, nir_iadd_imm(&b, n, (int32_t)tile_n - 1), tile_n_shift);
          nir_def *gy = nir_ushr_imm(&b, nir_iadd_imm(&b, m_eff, (int32_t)tile_m - 1), tile_m_shift);
