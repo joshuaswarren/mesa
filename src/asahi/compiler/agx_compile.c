@@ -3074,13 +3074,16 @@ agx_emit_store_scratch(agx_builder *b, nir_intrinsic_instr *instr)
 }
 
 static unsigned
-agx_expand_tex_to(agx_builder *b, nir_def *def, agx_index src, bool masked)
+agx_expand_tex_to(agx_builder *b, nir_def *def, agx_index src, bool masked,
+                  bool widen_g18g_rgba)
 {
    unsigned nr_channels = def->num_components;
    nir_component_mask_t mask = nir_def_components_read(def);
 
    if (!masked)
       mask = (nir_component_mask_t)BITFIELD_MASK(nr_channels);
+   if (widen_g18g_rgba)
+      mask = 0xf;
 
    agx_index packed_channels[8] = {agx_null()};
    agx_index unpacked_channels[8] = {agx_null()};
@@ -3242,8 +3245,11 @@ agx_emit_image_load(agx_builder *b, agx_index dst, nir_intrinsic_instr *intr)
       agx_isa_is_agx3(b->shader->key->dev.encoding) &&
       (access & ACCESS_CAN_REORDER) && (access & ACCESS_RESTRICT) &&
       !nir_is_coherent(intr);
-   I->mask = agx_expand_tex_to(b, &intr->def, tmp,
-                               agx_fetch_masked(b, &intr->def, !sparse));
+   const bool masked = agx_fetch_masked(b, &intr->def, !sparse);
+   const bool widen_g18g_rgba =
+      agx_is_g18g(&b->shader->key->dev) && !sparse && !masked &&
+      intr->def.num_components < 4;
+   I->mask = agx_expand_tex_to(b, &intr->def, tmp, masked, widen_g18g_rgba);
 
    b->shader->out->uses_txf = true;
    b->shader->out->sampler_state_count =
@@ -10024,9 +10030,27 @@ agx_emit_tex(agx_builder *b, nir_tex_instr *instr)
     * TODO: Check if it works with sparse.
     */
    bool masked = (instr->op != nir_texop_tg4) && !instr->is_sparse;
-   if (I->op == AGX_OPCODE_TEXTURE_LOAD)
+   bool widen_g18g_rgba = false;
+   if (I->op == AGX_OPCODE_TEXTURE_LOAD) {
       masked = agx_fetch_masked(b, &instr->def, masked);
-   I->mask = agx_expand_tex_to(b, &instr->def, tmp, masked);
+      widen_g18g_rgba =
+         agx_is_g18g(&b->shader->key->dev) && !instr->is_sparse && !masked &&
+         instr->def.num_components < 4;
+   } else if (agx_is_g18g(&b->shader->key->dev) && !I->shadow &&
+              !I->query_lod && !instr->is_sparse) {
+      /* G18G colour texture samples are witnessed with one channel (mask 1)
+       * or all four (mask 15, required for cubes). Like fetches, they already
+       * allocate a four-channel destination, so widen other partial masks to
+       * RGBA and leave the unused channels dead. */
+      const bool cube =
+         I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY;
+      const nir_component_mask_t read =
+         masked ? nir_def_components_read(&instr->def)
+                : (nir_component_mask_t)BITFIELD_MASK(instr->def.num_components);
+      if (cube || (read != 1 && read != 0xf))
+         widen_g18g_rgba = true;
+   }
+   I->mask = agx_expand_tex_to(b, &instr->def, tmp, masked, widen_g18g_rgba);
 }
 
 static void
