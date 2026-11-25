@@ -48,7 +48,8 @@ static const unsigned all_caps =
    AGX_CAP_GEN9_2D_COMPRESSION | AGX_CAP_MOD3_REG_BANK_RA |
    AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SPARSE_BINDING |
    AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG |
-   AGX_CAP_HAL200_LOSSLESS_COMPRESSION | AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION;
+   AGX_CAP_HAL200_LOSSLESS_COMPRESSION | AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION |
+   AGX_CAP_SIGNED_ZERO_MINMAX_SELECT;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its
@@ -241,6 +242,21 @@ test_hal200_msaa_color_compression(void)
    }
 }
 
+/* AGX_CAP_SIGNED_ZERO_MINMAX_SELECT is enabled on G17P and the M5 parts
+ * only. */
+static void
+test_signed_zero_minmax_select(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
+                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_SIGNED_ZERO_MINMAX_SELECT) ==
+                    expected,
+                 c);
+   }
+}
+
 int
 main(void)
 {
@@ -256,6 +272,7 @@ main(void)
    test_native_mixed_epilog();
    test_hal200_lossless_compression();
    test_hal200_msaa_color_compression();
+   test_signed_zero_minmax_select();
 
    if (failures) {
       fprintf(stderr, "agx_chip_caps: %u of %u checks failed\n", failures,
