@@ -103,12 +103,18 @@ enum agx_chip_cap {
     * (libagx_agx3_decompress); measured on G17S. Off on G18G until measured
     * there. */
    AGX_CAP_GEN10_2D_COMPRESSION = 1u << 14,
+
+   /* Sparse resource binding, aliased residency, 2D sparse images, sparse
+    * buffers, and shaderResourceResidency are qualified on this chip.
+    * Qualified on AGX2, G17P, and M5; off on G15, G16, and G18G (no SSTT
+    * flush record or sparse texture ISA). */
+   AGX_CAP_SPARSE_BINDING = 1u << 15,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
 #define AGX_CAPS_AGX2                                                          \
-   (AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_DESCRIPTOR_BUFFER |                  \
-    AGX_CAP_COOPERATIVE_MATRIX)
+   (AGX_CAP_SPARSE_BINDING | AGX_CAP_SPARSE_RESIDENCY_3D |                     \
+    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COOPERATIVE_MATRIX)
 
 /* What the five native AGX3 chips (G15G, G15S, G15C, G16G, G17P) share. */
 #define AGX_CAPS_NATIVE                                                        \
@@ -119,16 +125,17 @@ enum agx_chip_cap {
 #define AGX_CAPS_G17P                                                          \
    (AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                                \
     AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |                                        \
-    AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_RESIDENCY_3D |      \
-    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
-    AGX_CAP_GEN9_2D_COMPRESSION | AGX_CAP_MOD3_REG_BANK_RA)
+    AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_BINDING |           \
+    AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS |    \
+    AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN9_2D_COMPRESSION |               \
+    AGX_CAP_MOD3_REG_BANK_RA)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
-    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_CDM_WAR_WEAK_BARRIER |                 \
-    AGX_CAP_GEN10_2D_COMPRESSION)
+    AGX_CAP_SPARSE_BINDING | AGX_CAP_DESCRIPTOR_BUFFER |                       \
+    AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN10_2D_COMPRESSION)
 
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.
