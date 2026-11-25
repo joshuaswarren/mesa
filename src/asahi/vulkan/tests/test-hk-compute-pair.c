@@ -1305,6 +1305,7 @@ ssbo_elem_deref_off(nir_builder *b, unsigned set, unsigned binding,
 }
 
 struct gemm_test_opts {
+   uint32_t a_extra_offset_B;
    bool guarded;
    bool has_bias_buf;
    bool has_bias_mode;
@@ -1387,6 +1388,7 @@ build_tiled_gemm_nir_opts(const struct gemm_test_opts *o)
    const bool has_bias_buf = o->has_bias_buf;
    const bool has_bias_mode = o->has_bias_mode;
    const uint32_t offset_B = o->offset_B;
+   const uint32_t a_offset_B = offset_B + o->a_extra_offset_B;
    const unsigned fp_math_ctrl = o->fp_math_ctrl;
    const uint32_t inner_bound = o->inner_bound ? o->inner_bound : 32;
    const bool transpose_b = o->transpose_b;
@@ -1454,7 +1456,7 @@ build_tiled_gemm_nir_opts(const struct gemm_test_opts *o)
             nir_push_if(&b, nir_iand(&b, nir_ilt(&b, a_row, M), nir_ilt(&b, a_col, K)));
             nir_def *a_idx = nir_iadd(&b, nir_imul(&b, a_row, K), a_col);
             nir_def *ld = nir_load_deref(&b, nir_def_as_deref(
-               ssbo_elem_deref_off(&b, 0, 0, offset_B, a_idx)));
+               ssbo_elem_deref_off(&b, 0, 0, a_offset_B, a_idx)));
             if (o->a_store_inner_if)
                nir_push_if(&b, nir_ine_imm(&b, a_row, 0));
             nir_store_deref(&b, da, ld, 1);
@@ -1469,7 +1471,7 @@ build_tiled_gemm_nir_opts(const struct gemm_test_opts *o)
             nir_def *a_idx = nir_iadd(&b, nir_imul(&b, a_row, K), a_col);
             nir_store_var(&b, av,
                           nir_load_deref(&b, nir_def_as_deref(
-                             ssbo_elem_deref_off(&b, 0, 0, offset_B, a_idx))), 1);
+                             ssbo_elem_deref_off(&b, 0, 0, a_offset_B, a_idx))), 1);
             nir_push_else(&b, NULL);
             nir_store_var(&b, av, nir_imm_float(&b, 0.0f), 1);
             nir_pop_if(&b, NULL);
@@ -1477,7 +1479,7 @@ build_tiled_gemm_nir_opts(const struct gemm_test_opts *o)
          } else {
             nir_def *a_idx = nir_iadd(&b, nir_imul(&b, a_row, K), a_col);
             a_val = nir_load_deref(&b, nir_def_as_deref(
-               ssbo_elem_deref_off(&b, 0, 0, offset_B, a_idx)));
+               ssbo_elem_deref_off(&b, 0, 0, a_offset_B, a_idx)));
          }
          if (a_val) {
             nir_deref_instr *da =
@@ -2444,11 +2446,12 @@ eval_compare_gemm_dual_pad4(const struct gemm_test_opts *opts,
 static void
 eval_compare_gemm_cpu_and_guarded_specialize(uint32_t M, uint32_t N, uint32_t K,
                                              int32_t bias_mode, uint32_t tile_n,
-                                             bool specialize_unguarded,
+                                             bool expect_unguarded, uint32_t a_offset_B,
                                              const struct hk_nir_clamp_epilogue *epilogue,
                                              uint32_t seed)
 {
    const struct gemm_test_opts opts = {
+      .a_extra_offset_B = a_offset_B,
       .guarded = true, .has_bias_buf = true, .has_bias_mode = true, .use_ffma = true,
    };
    nir_shader *orig = build_tiled_gemm_nir_opts(&opts);
@@ -2460,12 +2463,16 @@ eval_compare_gemm_cpu_and_guarded_specialize(uint32_t M, uint32_t N, uint32_t K,
       pre, nir_address_format_64bit_global_32bit_offset, &m));
    HK_EVAL_CHECK(m.cmat_valid && m.is_guarded);
 
+   /* The evaluator gets a pointer to the descriptor range and uses
+    * base_offset separately to check the alignment of memory accesses. */
+   const uint32_t descriptor_offset_B = a_offset_B ? 32 : 0;
+   HK_EVAL_CHECK(m.reads[0].offset_B == a_offset_B);
+   const bool unguarded = hk_gemm_cmat_can_specialize_unguarded(
+      m.is_guarded, M, N, K, tile_n, m.reads[0].offset_B,
+      descriptor_offset_B, descriptor_offset_B);
+   HK_EVAL_CHECK(unguarded == expect_unguarded);
    struct hk_nir_gemm_output build_info = m;
-   if (specialize_unguarded) {
-      HK_EVAL_CHECK(hk_gemm_cmat_can_specialize_unguarded(
-         m.is_guarded, M, N, K, tile_n, m.reads[0].offset_B, 0, 0));
-      build_info.is_guarded = false;
-   }
+   build_info.is_guarded = !unguarded;
 
    nir_shader *alt = hk_nir_build_gemm_cmat(
       pre, &build_info, tile_n, epilogue, HK_COMPUTE_PAIR_DUAL_NONE);
@@ -2473,10 +2480,11 @@ eval_compare_gemm_cpu_and_guarded_specialize(uint32_t M, uint32_t N, uint32_t K,
    nir_validate_shader(alt, "gemm_cmat_specialize_or_sweep");
 
    const size_t a_elems = (size_t)M * K;
+   const size_t a_range = a_offset_B + a_elems * sizeof(float);
    const size_t b_elems = (size_t)K * N;
    const size_t bias_elems = (size_t)(M > N ? M : N);
    const size_t c_elems = (size_t)M * N;
-   float *a_buf = calloc(a_elems, sizeof(float));
+   float *a_buf = calloc(1, descriptor_offset_B + a_range);
    float *b_buf = calloc(b_elems, sizeof(float));
    float *bias_buf = calloc(bias_elems, sizeof(float));
    float *c_orig = calloc(c_elems, sizeof(float));
@@ -2484,9 +2492,11 @@ eval_compare_gemm_cpu_and_guarded_specialize(uint32_t M, uint32_t N, uint32_t K,
    float *c_cpu = calloc(c_elems, sizeof(float));
    HK_EVAL_CHECK(a_buf && b_buf && bias_buf && c_orig && c_alt && c_cpu);
 
+   float *a_descriptor = a_buf + descriptor_offset_B / sizeof(float);
+   float *a_matrix = a_descriptor + a_offset_B / sizeof(float);
    uint32_t rng = seed;
    for (size_t i = 0; i < a_elems; ++i)
-      a_buf[i] = gemm_test_rand_f32(&rng);
+      a_matrix[i] = gemm_test_rand_f32(&rng);
    for (size_t i = 0; i < b_elems; ++i)
       b_buf[i] = gemm_test_rand_f32(&rng);
    for (size_t i = 0; i < bias_elems; ++i)
@@ -2497,7 +2507,7 @@ eval_compare_gemm_cpu_and_guarded_specialize(uint32_t M, uint32_t N, uint32_t K,
       for (uint32_t c = 0; c < N; ++c) {
          float acc = 0.0f;
          for (uint32_t k = 0; k < K; ++k)
-            acc = fmaf(a_buf[(size_t)r * K + k], b_buf[(size_t)k * N + c], acc);
+            acc = fmaf(a_matrix[(size_t)r * K + k], b_buf[(size_t)k * N + c], acc);
          if (bias_mode == 0)
             acc += bias_buf[r];
          else if (bias_mode == 1)
@@ -2517,7 +2527,7 @@ eval_compare_gemm_cpu_and_guarded_specialize(uint32_t M, uint32_t N, uint32_t K,
    };
    const uint32_t orig_grid[3] = { (N + 31u) / 32u, (M + 31u) / 32u, 1u };
    struct hk_eval_ssbo ssbos_orig[4] = {
-      { 0, 0, a_buf, a_elems * sizeof(float), 0 },
+      { 0, 0, a_descriptor, a_range, descriptor_offset_B },
       { 0, 1, b_buf, b_elems * sizeof(float), 0 },
       { 0, 2, bias_buf, bias_elems * sizeof(float), 0 },
       { 0, 3, c_orig, c_elems * sizeof(float), 0 },
@@ -2539,7 +2549,7 @@ eval_compare_gemm_cpu_and_guarded_specialize(uint32_t M, uint32_t N, uint32_t K,
       (N + tile_n - 1u) / tile_n, (M + tile_m - 1u) / tile_m, 1u,
    };
    struct hk_eval_ssbo ssbos_alt[4] = {
-      { 0, 0, a_buf, a_elems * sizeof(float), 0 },
+      { 0, 0, a_descriptor, a_range, descriptor_offset_B },
       { 0, 1, b_buf, b_elems * sizeof(float), 0 },
       { 0, 2, bias_buf, bias_elems * sizeof(float), 0 },
       { 0, 3, c_alt, c_elems * sizeof(float), 0 },
@@ -2602,14 +2612,19 @@ test_gemm_cmat_guarded_specialize_and_shape_sweep(void)
       HK_EVAL_CHECK(!hk_gemm_cmat_can_specialize_unguarded(true, 2 * tm,     2 * tn,     2 * ks - 1, tn, 0, 0, 0));
 
       /* Guarded producer specialized to *_UNGUARDED at exact multiples. */
-      eval_compare_gemm_cpu_and_guarded_specialize(tm, tn, ks, 1, tn, true, NULL, 1100u + ti * 10u);
-      eval_compare_gemm_cpu_and_guarded_specialize(tm, tn, ks, 0, tn, true, &ep,  1101u + ti * 10u);
-      eval_compare_gemm_cpu_and_guarded_specialize(2 * tm, 2 * tn, 2 * ks, 2, tn, true, &ep, 1102u + ti * 10u);
+      eval_compare_gemm_cpu_and_guarded_specialize(tm, tn, ks, 1, tn, true, 0, NULL, 1100u + ti * 10u);
+      eval_compare_gemm_cpu_and_guarded_specialize(tm, tn, ks, 0, tn, true, 0, &ep,  1101u + ti * 10u);
+      eval_compare_gemm_cpu_and_guarded_specialize(2 * tm, 2 * tn, 2 * ks, 2, tn, true, 0, &ep, 1102u + ti * 10u);
 
       /* Guarded fallback at multiple-minus-1 for M, N, and K. */
-      eval_compare_gemm_cpu_and_guarded_specialize(tm - 1, tn,     ks,     1, tn, false, &ep,  1103u + ti * 10u);
-      eval_compare_gemm_cpu_and_guarded_specialize(tm,     tn - 1, ks,     0, tn, false, NULL, 1104u + ti * 10u);
-      eval_compare_gemm_cpu_and_guarded_specialize(tm,     tn,     ks - 1, 1, tn, false, &ep,  1105u + ti * 10u);
+      eval_compare_gemm_cpu_and_guarded_specialize(tm - 1, tn,     ks,     1, tn, false, 0, &ep,  1103u + ti * 10u);
+      eval_compare_gemm_cpu_and_guarded_specialize(tm,     tn - 1, ks,     0, tn, false, 0, NULL, 1104u + ti * 10u);
+      eval_compare_gemm_cpu_and_guarded_specialize(tm,     tn,     ks - 1, 1, tn, false, 0, &ep,  1105u + ti * 10u);
+      /* Nonzero A descriptor and member offsets on either side of a K tile. */
+      eval_compare_gemm_cpu_and_guarded_specialize(
+         tm, tn, ks, 1, tn, true, 16, NULL, 1106u + ti * 10u);
+      eval_compare_gemm_cpu_and_guarded_specialize(
+         tm, tn, ks - 1, 1, tn, false, 16, NULL, 1107u + ti * 10u);
    }
 
    /* Broad shape sweep against CPU FP32 reference: odd N, K%4!=0, K<32, edge M. */
@@ -2637,7 +2652,7 @@ test_gemm_cmat_guarded_specialize_and_shape_sweep(void)
       const bool ug = hk_gemm_cmat_can_specialize_unguarded(
          true, sweep[i].m, sweep[i].n, sweep[i].k, tn, 0, 0, 0);
       eval_compare_gemm_cpu_and_guarded_specialize(
-         sweep[i].m, sweep[i].n, sweep[i].k, sweep[i].bias_mode, tn, ug,
+         sweep[i].m, sweep[i].n, sweep[i].k, sweep[i].bias_mode, tn, ug, 0,
          sweep[i].clamp ? &ep : NULL, 1200u + i);
    }
 }

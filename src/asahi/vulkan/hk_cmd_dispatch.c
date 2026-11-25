@@ -4231,7 +4231,8 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
       struct hk_shader *ug = hk_compute_pair_get_or_compile_fused(
          dev, api->compute_pair_producer, NULL, ug_kind,
          HK_COMPUTE_PAIR_DUAL_NONE);
-      if (ug) {
+      if (ug && hk_g17p_compute_shader_supported(dev->dev.chip, ug,
+                                                 ug->only_linked, 1u << 16)) {
          alt = ug;
          chosen_kind = ug_kind;
       }
