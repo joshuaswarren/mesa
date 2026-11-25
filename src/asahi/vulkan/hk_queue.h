@@ -242,6 +242,7 @@ VkResult hk_queue_init_kick(struct hk_device *dev,
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_device_quiesce_lost_submissions(struct hk_device *dev);
+void hk_device_wait_submitted(struct hk_device *dev, uint64_t timeout_ns);
 
 /* The first command buffer of the submission whose recording failed, or NULL.
  * Such a command buffer is not executable (vkEndCommandBuffer returned its

@@ -2,6 +2,9 @@
  * SPDX-License-Identifier: MIT
  */
 #undef NDEBUG
+#include "hk_cmd_buffer.h"
+#include "hk_cmd_pool.h"
+#include "hk_descriptor_set.h"
 #include "hk_device.h"
 #include "hk_device_memory.h"
 #include "hk_entrypoints.h"
@@ -114,6 +117,17 @@ mock_bo_free(struct agx_device *dev, uint32_t handle)
       fake_available += bo_sizes[handle];
    free(live_bos[handle]);
    live_bos[handle] = NULL;
+}
+
+static void
+mock_bo_mmap_fail(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
+                  size_t length)
+{
+   (void)dev;
+   (void)fixed_addr;
+   (void)length;
+   bo->_map = NULL;
+   bo->_map_size = 0;
 }
 
 int
@@ -393,6 +407,7 @@ main(void)
    pdev->mem_heaps[0].used = &heap_usage.used[0];
    pdev->mem_heaps[0].cached = &heap_usage.cached[0];
    simple_mtx_init(&dev->dev.bo_map_lock, mtx_plain);
+   simple_mtx_init(&dev->dev.bo_mmap_lock, mtx_plain);
    simple_mtx_init(&dev->dev.bo_cache.lock, mtx_plain);
    simple_mtx_init(&dev->dev.vma_lock, mtx_plain);
    list_inithead(&dev->dev.bo_cache.lru);
@@ -401,6 +416,7 @@ main(void)
    util_vma_heap_init(&dev->dev.main_heap, UINT64_C(0x1000000000), UINT64_C(1) << 40);
    dev->dev.ops.bo_alloc = mock_bo_alloc;
    dev->dev.ops.bo_free = mock_bo_free;
+   dev->dev.ops.bo_mmap = mock_bo_mmap_fail;
    init_wsi(dev);
 
    /* The CTS tries callback limits 0..1024, including an extent requiring
@@ -487,6 +503,26 @@ main(void)
    get_fd.memory = memory;
    assert(hk_GetMemoryFdKHR(hk_device_to_handle(dev), &get_fd, &fd) ==
           VK_ERROR_OUT_OF_HOST_MEMORY);
+   /* Verify export error handling holds on non-G17P chips and virtio too. */
+   dev->dev.chip = AGX_CHIP_G17C;
+   assert(hk_GetMemoryFdKHR(hk_device_to_handle(dev), &get_fd, &fd) ==
+          VK_ERROR_OUT_OF_HOST_MEMORY);
+   dev->dev.chip = AGX_CHIP_G13G;
+   assert(hk_GetMemoryFdKHR(hk_device_to_handle(dev), &get_fd, &fd) ==
+          VK_ERROR_OUT_OF_HOST_MEMORY);
+   dev->dev.is_virtio = true;
+   assert(hk_GetMemoryFdKHR(hk_device_to_handle(dev), &get_fd, &fd) ==
+          VK_ERROR_OUT_OF_HOST_MEMORY);
+   dev->dev.is_virtio = false;
+   dev->dev.chip = AGX_CHIP_G17P;
+   /* Reserve-unmap with a NULL BO map must succeed without calling MAP_FIXED. */
+   const VkMemoryUnmapInfoKHR reserve_unmap = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR,
+      .memory = memory,
+      .flags = VK_MEMORY_UNMAP_RESERVE_BIT_EXT,
+   };
+   assert(hk_UnmapMemory2KHR(hk_device_to_handle(dev), &reserve_unmap) ==
+          VK_SUCCESS);
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    assert(!pinned && !host_live && !dev->dev.bo_cache.size);
 
@@ -687,6 +723,63 @@ main(void)
    }
    close(import_info.fd);
 
+   /* Map-OOM in hk_CreateDescriptorPool must release its BO and host object. */
+   const VkDescriptorPoolSize pool_size = {
+      .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+      .descriptorCount = 16,
+   };
+   const VkDescriptorPoolCreateInfo dp_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      .maxSets = 4,
+      .poolSizeCount = 1,
+      .pPoolSizes = &pool_size,
+   };
+   VkDescriptorPool dpool = VK_NULL_HANDLE;
+   passing = 16;
+   assert(hk_CreateDescriptorPool(hk_device_to_handle(dev), &dp_info,
+                                  &allocator, &dpool) ==
+          VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   assert(dpool == VK_NULL_HANDLE);
+   agx_bo_cache_evict_all(&dev->dev);
+   assert(!pinned && !host_live && !dev->dev.bo_cache.size);
+
+   /* Map-OOM in hk_pool_alloc_from_slow large-BO path must not leak or append. */
+   struct hk_cmd_pool cmd_pool = {0};
+   cmd_pool.vk.base.device = &dev->vk;
+   struct hk_cmd_buffer cmd = {0};
+   vk_object_base_init(&dev->vk, &cmd.vk.base, VK_OBJECT_TYPE_COMMAND_BUFFER);
+   cmd.vk.pool = &cmd_pool.vk;
+   util_dynarray_init(&cmd.large_bos, NULL);
+   struct agx_ptr slow = hk_pool_alloc_from_slow(
+      &cmd, &cmd.uploader.main, HK_CMD_BO_SIZE + 4096, 16, HK_CMD_BO_MAIN);
+   assert(slow.cpu == NULL && slow.gpu == 0);
+   assert(cmd.vk.record_result == VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   assert(util_dynarray_num_elements(&cmd.large_bos, struct agx_bo *) == 0);
+   util_dynarray_fini(&cmd.large_bos);
+   agx_bo_cache_evict_all(&dev->dev);
+   assert(!pinned && !dev->dev.bo_cache.size);
+
+   /* Empty-region hk_CmdCopyBuffer2 and nested empty xfer ranges must not wrap
+    * or widen an active transfer range to 0. */
+   const VkCopyBufferInfo2 empty_copy = {
+      .sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2,
+      .regionCount = 0,
+   };
+   hk_CmdCopyBuffer2(hk_cmd_buffer_to_handle(&cmd), &empty_copy);
+   assert(!cmd.sync.xfer_depth && !cmd.sync.xfer_dst.valid);
+   hk_sync_xfer_begin_dst(&cmd, 0, 0, false);
+   assert(cmd.sync.xfer_depth == 1 && !cmd.sync.xfer_dst.valid);
+   hk_sync_xfer_end(&cmd);
+   assert(cmd.sync.xfer_depth == 0);
+   hk_sync_xfer_begin_dst(&cmd, 0x20000, 0x21000, false);
+   hk_sync_xfer_begin_dst(&cmd, 0, 0, true);
+   assert(cmd.sync.xfer_depth == 2 && cmd.sync.xfer_dst.valid);
+   assert(cmd.sync.xfer_dst.lo == 0x20000 && cmd.sync.xfer_dst.hi == 0x21000);
+   assert(!cmd.sync.xfer_dst.device_address);
+   hk_sync_xfer_end(&cmd);
+   hk_sync_xfer_end(&cmd);
+   vk_object_base_finish(&cmd.vk.base);
+
    assert(!pinned && !host_live && !kernel_oom_attempts);
    wsi_headless_finish_wsi(&pdev->wsi_device, vk_default_allocator());
    vk_object_base_finish(&dev->vk.base);
@@ -694,6 +787,7 @@ main(void)
    util_vma_heap_finish(&dev->dev.main_heap);
    simple_mtx_destroy(&dev->dev.vma_lock);
    simple_mtx_destroy(&dev->dev.bo_cache.lock);
+   simple_mtx_destroy(&dev->dev.bo_mmap_lock);
    simple_mtx_destroy(&dev->dev.bo_map_lock);
    free(dev);
    free(pdev);

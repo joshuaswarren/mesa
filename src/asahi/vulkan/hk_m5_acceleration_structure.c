@@ -112,7 +112,12 @@ hk_m5_as_table_entry(struct hk_device *dev, unsigned id)
                                       "Native AS address table");
       if (!bo)
          return NULL;
-      memset(agx_bo_map(bo), 0, HK_M5_AS_TABLE_PAGE_SIZE);
+      void *map = agx_bo_map(bo);
+      if (!map) {
+         agx_bo_unreference(&dev->dev, bo);
+         return NULL;
+      }
+      memset(map, 0, HK_M5_AS_TABLE_PAGE_SIZE);
       struct agx_bo **slot = util_dynarray_grow(&dev->m5_as_table_pages,
                                                struct agx_bo *, 1);
       if (!slot) {
@@ -132,8 +137,8 @@ hk_m5_as_table_entry(struct hk_device *dev, unsigned id)
    }
    struct agx_bo *bo = util_dynarray_element(&dev->m5_as_table_pages,
                                              struct agx_bo *, page)[0];
-   return (uint64_t *)agx_bo_map(bo) +
-          2 * (id % (HK_M5_AS_TABLE_PAGE_SIZE / 16));
+   uint64_t *map = agx_bo_map(bo);
+   return map ? map + 2 * (id % (HK_M5_AS_TABLE_PAGE_SIZE / 16)) : NULL;
 }
 
 /* Native instance records and the AS header name entries in the same table.

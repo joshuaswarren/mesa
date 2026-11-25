@@ -8611,14 +8611,14 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
          fresh.length == program.length &&
          !memcmp(fresh.bytes, program.bytes, program.length);
       desc.patchable = false;
-      static unsigned checked, differed;
-      ++checked;
-      if (!same && differed++ < 8)
+      static uint32_t checked, differed;
+      const uint32_t c = p_atomic_inc_return(&checked);
+      if (!same && p_atomic_fetch_add(&differed, 1) < 8)
          fprintf(stderr, "M5_PROGRAM_CACHE differs from a fresh composition "
                          "(stage %u, %zu ranges)\n", stage, count);
-      if (!(checked & (checked - 1)))
+      if (!(c & (c - 1)))
          fprintf(stderr, "M5_PROGRAM_CACHE verified %u programs, %u differed\n",
-                 checked, differed);
+                 c, p_atomic_read(&differed));
    }
    const bool generated = cached ||
       (agx_chip_g17_m5(dev->chip)
