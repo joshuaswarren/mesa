@@ -3216,6 +3216,8 @@ hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    memcpy(record.push, desc->root.push, sizeof(record.push));
    if (selected == api->depthwise_vec4)
       record.alt_kind = HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4;
+   else if (selected == api->gemm_cmat16)
+      record.alt_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT16;
    else if (selected == api->gemm_cmat32)
       record.alt_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT32;
    else if (selected == api->gemm_cmat64)
@@ -3988,7 +3990,8 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
 {
    const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if ((!api->gemm_cmat32 && !api->gemm_cmat64) || !api->compute_pair ||
+   if ((!api->gemm_cmat16 && !api->gemm_cmat32 && !api->gemm_cmat64) ||
+       !api->compute_pair ||
        api->compute_pair->role != HK_COMPUTE_PAIR_GEMM)
       return normal;
    if (!agx_chip_native_or_m5(dev->dev.chip) ||
@@ -4052,12 +4055,33 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
          tile_n = 32;
       }
    } else {
-      if ((uint32_t)n_i > 32 && api->gemm_cmat64) {
+      /* Guarded tile-width selection:
+       * - N <= 16: cmat16 (32x16, K_step=32) avoids 50-75% N-lane waste.
+       * - N > 32 with N % 64 == 0 or N % 32 != 0: cmat64 (32x64, K_step=32)
+       *   doubles M-parallelism and halves K-loop barriers. When N % 32 != 0
+       *   (e.g. N=48 or N=144), both cmat64 and cmat32 incur N-tail waste (for
+       *   N=48 both pad to 64 with 25% waste), so cmat64 wins via fewer N WGs
+       *   and K_step=32. When N % 32 == 0 && N % 64 != 0 (e.g. N=96), cmat32
+       *   (64x32, K_step=16) has 0% N-tail waste vs cmat64's 50% last-tile
+       *   waste and is selected instead.
+       * - 16 < N <= 32: cmat32 (64x32, K_step=16) fits in one N tile. */
+      if ((uint32_t)n_i <= 16 && api->gemm_cmat16) {
+         alt = api->gemm_cmat16;
+         tile_n = 16;
+      } else if ((uint32_t)n_i > 32 &&
+                 (((uint32_t)n_i % 64) == 0 || ((uint32_t)n_i % 32) != 0) &&
+                 api->gemm_cmat64) {
          alt = api->gemm_cmat64;
          tile_n = 64;
       } else if (api->gemm_cmat32) {
          alt = api->gemm_cmat32;
          tile_n = 32;
+      } else if (api->gemm_cmat64) {
+         alt = api->gemm_cmat64;
+         tile_n = 64;
+      } else if (api->gemm_cmat16) {
+         alt = api->gemm_cmat16;
+         tile_n = 16;
       }
    }
    if (!alt ||
@@ -4110,8 +4134,9 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
                                &c_b, gemm->output.offset_B, c_bytes)))
       return normal;
 
+   const uint32_t tile_m = hk_gemm_cmat_tile_m(tile_n);
    const uint64_t gx = DIV_ROUND_UP(n_u, tile_n);
-   const uint64_t gy = DIV_ROUND_UP(m_u, 64);
+   const uint64_t gy = DIV_ROUND_UP(m_u, tile_m);
    if (gx > 65535 || gy > 65535)
       return normal;
    grid->count[0] = (uint32_t)gx;
@@ -4189,7 +4214,8 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       local_size = agx_workgroup(selected->b.info.workgroup_size[0],
                                  selected->b.info.workgroup_size[1],
                                  selected->b.info.workgroup_size[2]);
-   } else if (api && (api->gemm_cmat32 || api->gemm_cmat64) && api->compute_pair &&
+   } else if (api && (api->gemm_cmat16 || api->gemm_cmat32 || api->gemm_cmat64) &&
+              api->compute_pair &&
               api->compute_pair->role == HK_COMPUTE_PAIR_GEMM &&
               !in_threads && !invocation_stat) {
       selected = hk_select_gemm_cmat(cmd, api, s, &grid);
@@ -4264,7 +4290,8 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    hk_dispatch_with_local_size(cmd, cs, selected, grid, local_size);
    if (!in_threads && !invocation_stat && api && api->compute_pair &&
        (selected == s || selected == api->depthwise_vec4 ||
-        selected == api->gemm_cmat32 || selected == api->gemm_cmat64))
+        selected == api->gemm_cmat16 || selected == api->gemm_cmat32 ||
+        selected == api->gemm_cmat64))
       hk_record_compute_pair(cmd, cs, api, selected, orig_groups, grid);
    cs->uses_global_atomics |= selected->b.info.uses_global_atomics;
    cs->pack_loops |= selected->b.info.has_loops;
