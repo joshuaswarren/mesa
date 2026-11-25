@@ -1452,6 +1452,12 @@ if with_tests
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk]),
     timeout : 30, suite : ['asahi'])
+  test('hk_pack_atomics', executable('hk_pack_atomics_test',
+    files('tests/test-hk-pack-atomics.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk]),
+    timeout : 30, suite : ['asahi'])
 endif
 
 if with_tests
