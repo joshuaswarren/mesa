@@ -34,7 +34,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "agx_builder.h"
 #include "agx_compile.h"
+#include "agx_compiler.h"
 #include "agx3_iadd_core.h"
 #include "nir_builder.h"
 
@@ -371,7 +373,8 @@ test_domain_is_closed(void)
  * fail-closed error.
  */
 static bool
-compile_compute(nir_shader *nir, const char *what)
+compile_compute_keep(nir_shader *nir, const char *what,
+                     struct agx_shader_part *part)
 {
    static const uint8_t end[] = {0x0e, 0x00, 0x00, 0x00};
 
@@ -380,13 +383,13 @@ compile_compute(nir_shader *nir, const char *what)
       .reserved_preamble = 8,
       .no_preamble = true,
    };
-   struct agx_shader_part part = {0};
+   memset(part, 0, sizeof(*part));
 
    ++checks;
-   const bool compiled = agx_compile_shader_nir(nir, &key, &part);
+   const bool compiled = agx_compile_shader_nir(nir, &key, part);
    const bool valid =
-      compiled && part.binary != NULL && part.info.binary_size > sizeof(end) &&
-      !memcmp((uint8_t *)part.binary + part.info.binary_size - sizeof(end),
+      compiled && part->binary != NULL && part->info.binary_size > sizeof(end) &&
+      !memcmp((uint8_t *)part->binary + part->info.binary_size - sizeof(end),
               end, sizeof(end));
 
    if (!valid) {
@@ -394,11 +397,210 @@ compile_compute(nir_shader *nir, const char *what)
       fprintf(stderr, "FAIL %s: %s\n", what,
               compiled ? "compiled but produced no terminated binary"
                        : "the AGX3 backend refused the shader");
+      free(part->binary);
+      part->binary = NULL;
    }
 
-   free(part.binary);
    ralloc_free(nir);
    return valid;
+}
+
+static bool
+compile_compute(nir_shader *nir, const char *what)
+{
+   struct agx_shader_part part;
+   const bool valid = compile_compute_keep(nir, what, &part);
+   free(part.binary);
+   return valid;
+}
+
+/* Scan an AGX3B shader binary for a 12-byte `imadd` (opcode 9f 00 56) whose
+ * width/form byte (b[8]) and sign-extension/addend byte (b[10]) match a
+ * witnessed form, optionally also checking the 8-bit immediate bytes (b[6..7])
+ * when check_imm is true. */
+static bool
+binary_contains_imad_form(const struct agx_shader_part *part, uint8_t want_b8,
+                          uint8_t want_b10, bool check_imm, uint8_t want_b6,
+                          uint8_t want_b7)
+{
+   const uint8_t *bin = (const uint8_t *)part->binary;
+   if (!bin || part->info.binary_size < 12)
+      return false;
+
+   /* AGX3B `imadd` places opcode 0x009f in bits 0..10 (b[0]=0x9f, b[1]&0x07=0),
+    * scoreboard waits w1..w6 in bits 12..17 (b[1]&0xf0 and b[2]&0x03), and the
+    * fixed bits in b[2]&0xfc (0x54). Check b[8], b[10], b[11] and optional
+    * immediate b[6..7] independently of any scoreboard wait mask. */
+   for (size_t i = 0; i + 12 <= part->info.binary_size; i += 2) {
+      if (bin[i] == 0x9f && (bin[i + 1] & 0x07) == 0x00 &&
+          (bin[i + 2] & 0xfc) == 0x54 && bin[i + 8] == want_b8 &&
+          bin[i + 10] == want_b10 && bin[i + 11] == 0x00 &&
+          (!check_imm || (bin[i + 6] == want_b6 && bin[i + 7] == want_b7)))
+         return true;
+   }
+   return false;
+}
+
+/* Create a minimal single-block AGX3B IR context, lower one wide `imad` via
+ * agx_lower_agx3_widening_int(), bind deterministic physical registers, pack
+ * the resulting `imad` through agx_pack_binary(), and verify its exact 12 bytes
+ * against an Apple witness. */
+static void
+check_widening_int_case(const char *name, agx_index s0, agx_index s1,
+                        bool expect_imm_mult, unsigned expect_mov_op,
+                        bool expect_s0_abs, const uint8_t want[12])
+{
+   void *mem = ralloc_context(NULL);
+   agx_context *ctx = rzalloc(mem, agx_context);
+   struct agx_shader_key key = {
+      .dev.encoding = AGX_ISA_ENCODING_AGX3B,
+      .dev.chip = AGX_CHIP_G17P,
+   };
+   ctx->key = &key;
+   ctx->stage = MESA_SHADER_COMPUTE;
+   ctx->alloc = 8;
+   list_inithead(&ctx->blocks);
+
+   agx_block *blk = rzalloc(ctx, agx_block);
+   list_inithead(&blk->instructions);
+   list_addtail(&blk->link, &ctx->blocks);
+
+   agx_builder b = agx_init_builder(ctx, agx_after_block(blk));
+   agx_index dst = agx_temp(ctx, AGX_SIZE_64);
+   agx_instr *imad = agx_imad_to(&b, dst, s0, s1, agx_immediate(0), 0);
+
+   CHECK(agx_lower_agx3_widening_int(ctx));
+
+   /* Verify the inserted legalization op before `imad`, if any. */
+   if (expect_mov_op != 0) {
+      agx_instr *prev = list_entry(imad->link.prev, agx_instr, link);
+      CHECK(&prev->link != &blk->instructions);
+      CHECK(prev->op == expect_mov_op);
+   }
+
+   CHECK(imad->src[0].type == AGX_INDEX_NORMAL &&
+         imad->src[0].size == AGX_SIZE_32 &&
+         imad->src[0].abs == expect_s0_abs);
+   if (expect_imm_mult) {
+      CHECK(imad->src[1].type == AGX_INDEX_IMMEDIATE && !imad->src[1].abs &&
+            !imad->src[1].neg && imad->src[1].value <= 0xff);
+   } else {
+      CHECK(imad->src[1].type == AGX_INDEX_NORMAL &&
+            imad->src[1].size == AGX_SIZE_32);
+   }
+
+   /* Pack just the lowered `imad` with deterministic registers (d=r0..r3,
+    * src0=r0.discard, src1=r2.discard or imm) and assert all 12 bytes. */
+   agx_context *pack_ctx = rzalloc(mem, agx_context);
+   pack_ctx->key = &key;
+   pack_ctx->stage = MESA_SHADER_COMPUTE;
+   pack_ctx->out = rzalloc(mem, struct agx_shader_info);
+   list_inithead(&pack_ctx->blocks);
+   agx_block *pblk = rzalloc(pack_ctx, agx_block);
+   list_inithead(&pblk->instructions);
+   list_addtail(&pblk->link, &pack_ctx->blocks);
+
+   agx_builder pb = agx_init_builder(pack_ctx, agx_after_block(pblk));
+   agx_index p0 = agx_register(0, AGX_SIZE_32);
+   p0.abs = imad->src[0].abs;
+   p0.discard = true;
+   agx_index p1 = imad->src[1];
+   if (!expect_imm_mult) {
+      p1 = agx_register(2, AGX_SIZE_32);
+      p1.abs = imad->src[1].abs;
+      p1.discard = true;
+   }
+   agx_imad_to(&pb, agx_register(0, AGX_SIZE_64), p0, p1, agx_immediate(0), 0);
+   agx_stop(&pb);
+
+   struct util_dynarray emission;
+   util_dynarray_init(&emission, mem);
+   CHECK(agx3_pack_binary(pack_ctx, &emission));
+
+   ++checks;
+   if (emission.size < 12 || memcmp(emission.data, want, 12) != 0) {
+      ++failures;
+      fprintf(stderr, "FAIL widening_int %s:\n  got  ", name);
+      const uint8_t *got = (const uint8_t *)emission.data;
+      for (size_t i = 0; i < (emission.size < 12 ? emission.size : 12); ++i)
+         fprintf(stderr, "%02x", got[i]);
+      fprintf(stderr, "\n  want ");
+      for (unsigned i = 0; i < 12; ++i)
+         fprintf(stderr, "%02x", want[i]);
+      fprintf(stderr, "\n");
+   }
+
+   ralloc_free(mem);
+}
+
+static void
+test_agx3b_widening_int_legalization(void)
+{
+   /* Exact 12-byte Apple witnesses with wait_mask=0 (f65/w6 is byte 2 bit 1,
+    * so byte 2 drops 0x56 -> 0x54):
+    *   umul_wide:     9f 00 54 00 02 00 08 00 e0 26 0a 00
+    *   imul_wide:     9f 00 54 00 02 00 08 00 e0 26 1e 00
+    *   umul_wide_imm: 9f 00 54 00 02 00 f4 03 60 22 02 00  (mult = 253)
+    *   imul_wide_imm: 9f 00 54 00 02 00 f4 03 60 22 06 00  (mult = 253)
+    */
+   static const uint8_t want_umul_wide[12] = {
+      0x9f, 0x00, 0x54, 0x00, 0x02, 0x00, 0x08, 0x00, 0xe0, 0x26, 0x0a, 0x00,
+   };
+   static const uint8_t want_imul_wide[12] = {
+      0x9f, 0x00, 0x54, 0x00, 0x02, 0x00, 0x08, 0x00, 0xe0, 0x26, 0x1e, 0x00,
+   };
+   static const uint8_t want_umul_wide_imm_253[12] = {
+      0x9f, 0x00, 0x54, 0x00, 0x02, 0x00, 0xf4, 0x03, 0x60, 0x22, 0x02, 0x00,
+   };
+   static const uint8_t want_imul_wide_imm_253[12] = {
+      0x9f, 0x00, 0x54, 0x00, 0x02, 0x00, 0xf4, 0x03, 0x60, 0x22, 0x06, 0x00,
+   };
+
+   /* 16-bit unsigned register widened via mov with .abs preserved -> umul_wide. */
+   check_widening_int_case(
+      "u16_reg_widens_to_umul_wide",
+      agx_abs(agx_get_index(1, AGX_SIZE_16)),
+      agx_abs(agx_get_index(2, AGX_SIZE_32)),
+      false, AGX_OPCODE_MOV, true, want_umul_wide);
+
+   /* 16-bit signed register widened via signext -> imul_wide. */
+   check_widening_int_case(
+      "s16_reg_widens_to_imul_wide",
+      agx_get_index(1, AGX_SIZE_16),
+      agx_get_index(2, AGX_SIZE_32),
+      false, AGX_OPCODE_SIGNEXT, false, want_imul_wide);
+
+   /* Both multiplicands immediates (#7.abs * #253.abs) -> materialize src[0]
+    * and keep #253 as 8-bit immediate multiplier -> umul_wide_imm. */
+   check_widening_int_case(
+      "both_imm_to_umul_wide_imm",
+      agx_abs(agx_immediate(7)),
+      agx_abs(agx_immediate(253)),
+      true, AGX_OPCODE_MOV_IMM, true, want_umul_wide_imm_253);
+
+   /* Lone src[0] immediate (#253.abs * x.abs) -> commuted into slot B ->
+    * umul_wide_imm. */
+   check_widening_int_case(
+      "lone_src0_imm_unsigned",
+      agx_abs(agx_immediate(253)),
+      agx_abs(agx_get_index(2, AGX_SIZE_32)),
+      true, 0, true, want_umul_wide_imm_253);
+
+   /* Lone src[0] immediate signed (#253 * x) -> commuted into slot B ->
+    * imul_wide_imm. */
+   check_widening_int_case(
+      "lone_src0_imm_signed",
+      agx_immediate(253),
+      agx_get_index(2, AGX_SIZE_32),
+      true, 0, false, want_imul_wide_imm_253);
+
+   /* 16-bit .abs immediate (agx_optimizer.c:648 shape: x.abs * #0x1234.abs) ->
+    * materialized to 32-bit register with .abs -> umul_wide. */
+   check_widening_int_case(
+      "imm16_abs_to_umul_wide",
+      agx_abs(agx_get_index(1, AGX_SIZE_32)),
+      agx_abs(agx_immediate(0x1234)),
+      false, AGX_OPCODE_MOV_IMM, true, want_umul_wide);
 }
 
 static nir_builder
@@ -491,6 +693,94 @@ test_wide_multiply_shaders(void)
       free(part.binary);
       ralloc_free(b.shader);
    }
+
+   /* Lowered 64x64->64 multiply must keep xl * yl on native AGX3B dest_64
+    * umul_wide (b[8]=0xe0, b[10]=0x0a) instead of expanding 32x32->64 in SW. */
+   {
+      nir_builder b = begin_compute("G17P lowered 64x64->64 multiply");
+      nir_def *in = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+      nir_def *x = nir_load_global(&b, 1, 64, in, .align_mul = 8);
+      nir_def *y =
+         nir_load_global(&b, 1, 64, nir_iadd_imm(&b, in, 8), .align_mul = 8);
+      nir_store_global(&b, nir_imul(&b, x, y), out, .align_mul = 8);
+      agx_preprocess_nir_g17p(b.shader);
+
+      struct agx_shader_part part;
+      if (compile_compute_keep(b.shader, "lowered 64x64->64 multiply", &part)) {
+         CHECK(binary_contains_imad_form(&part, 0xe0, 0x0a, false, 0, 0));
+         free(part.binary);
+      }
+   }
+
+   /* Lone src[0] immediate: umul_2x32_64(253, x) and imul_2x32_64(253, x) must
+    * commute into slot B and emit the exact witnessed umul_wide_imm /
+    * imul_wide_imm encodings (b[6..7]=f4 03, b[8]=60, b[10]=02 / 06). */
+   {
+      nir_builder b = begin_compute("G17P wide multiply lone src0 imm");
+      nir_def *in = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+      nir_def *x = nir_load_global(&b, 1, 32, in, .align_mul = 4);
+      nir_def *y =
+         nir_load_global(&b, 1, 32, nir_iadd_imm(&b, in, 4), .align_mul = 4);
+      nir_store_global(&b, nir_umul_2x32_64(&b, nir_imm_int(&b, 253), x), out,
+                       .align_mul = 8);
+      nir_store_global(&b, nir_imul_2x32_64(&b, nir_imm_int(&b, 253), y),
+                       nir_iadd_imm(&b, out, 8), .align_mul = 8);
+      agx_preprocess_nir_g17p(b.shader);
+
+      struct agx_shader_part part;
+      if (compile_compute_keep(b.shader, "wide multiply lone src0 imm", &part)) {
+         CHECK(binary_contains_imad_form(&part, 0x60, 0x02, true, 0xf4, 0x03));
+         CHECK(binary_contains_imad_form(&part, 0x60, 0x06, true, 0xf4, 0x03));
+         free(part.binary);
+      }
+   }
+
+   /* 16-bit immediate: umul_2x32_64(x, 0x1234) and umul_2x32_64(0x1234, x) must
+    * materialize the constant and emit register-register umul_wide (b[8]=0xe0,
+    * b[10]=0x0a), never refusing on mult_imm. */
+   {
+      nir_builder b = begin_compute("G17P wide multiply 16-bit imm");
+      nir_def *in = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+      nir_def *x = nir_load_global(&b, 1, 32, in, .align_mul = 4);
+      nir_store_global(&b, nir_umul_2x32_64(&b, x, nir_imm_int(&b, 0x1234)),
+                       out, .align_mul = 8);
+      nir_store_global(&b, nir_umul_2x32_64(&b, nir_imm_int(&b, 0x1234), x),
+                       nir_iadd_imm(&b, out, 8), .align_mul = 8);
+      agx_preprocess_nir_g17p(b.shader);
+
+      struct agx_shader_part part;
+      if (compile_compute_keep(b.shader, "wide multiply 16-bit imm", &part)) {
+         CHECK(binary_contains_imad_form(&part, 0xe0, 0x0a, false, 0, 0));
+         free(part.binary);
+      }
+   }
+
+   /* 16-bit unsigned and signed sources widened into wide imad must emit
+    * 32x32->64 umul_wide / imul_wide (b[8]=0xe0, b[10]=0x0a / 0x1e). */
+   {
+      nir_builder b = begin_compute("G17P wide multiply from 16-bit sources");
+      nir_def *in = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+      nir_def *h = nir_load_global(&b, 1, 16, in, .align_mul = 2);
+      nir_def *y =
+         nir_load_global(&b, 1, 32, nir_iadd_imm(&b, in, 4), .align_mul = 4);
+      nir_store_global(&b, nir_umul_2x32_64(&b, nir_u2u32(&b, h), y), out,
+                       .align_mul = 8);
+      nir_store_global(&b, nir_imul_2x32_64(&b, nir_i2i32(&b, h), y),
+                       nir_iadd_imm(&b, out, 8), .align_mul = 8);
+      agx_preprocess_nir_g17p(b.shader);
+
+      struct agx_shader_part part;
+      if (compile_compute_keep(b.shader, "wide multiply from 16-bit sources",
+                               &part)) {
+         CHECK(binary_contains_imad_form(&part, 0xe0, 0x0a, false, 0, 0));
+         CHECK(binary_contains_imad_form(&part, 0xe0, 0x1e, false, 0, 0));
+         free(part.binary);
+      }
+   }
 }
 
 int
@@ -498,6 +788,7 @@ main(void)
 {
    test_apple_wide_witnesses();
    test_domain_is_closed();
+   test_agx3b_widening_int_legalization();
    test_wide_multiply_shaders();
 
    printf("agx3_wide_imad: %u checks, %u failures\n", checks, failures);

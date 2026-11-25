@@ -149,6 +149,7 @@ uint32_t hk_buffer_sparse_texel_word(const struct hk_buffer *buffer,
                                      unsigned blocksize_B);
 uint32_t hk_sparse_texel_word_at(struct hk_device *dev, uint64_t address,
                                  unsigned blocksize_B);
+bool hk_sparse_address_is_sparse(struct hk_device *dev, uint64_t address);
 
 /* Publish a bound/unbound sparse buffer range to physical pointer reads. */
 VkResult hk_update_physical_sparse_map(struct hk_device *dev, uint64_t address,

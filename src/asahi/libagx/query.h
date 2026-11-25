@@ -23,6 +23,14 @@ struct libagx_imm_write {
 static_assert(sizeof(struct libagx_imm_write) == 16,
               "struct libagx_imm_write must match the device layout");
 
+/* One timestamp libagx_copy_timestamps copies into another query. */
+struct libagx_timestamp_copy {
+   DEVICE(uint64_t) dest;
+   DEVICE(uint64_t) src;
+};
+static_assert(sizeof(struct libagx_timestamp_copy) == 16,
+              "struct libagx_timestamp_copy must match the device layout");
+
 #define LIBAGX_QUERY_UNAVAILABLE (uint64_t)((int64_t)-1)
 
 #define LIBAGX_QUERY_INDEX_UNUSED ((uint16_t)0xffff)

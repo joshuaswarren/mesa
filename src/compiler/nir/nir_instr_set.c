@@ -26,9 +26,6 @@
 #include "nir.h"
 #include "nir_vla.h"
 
-#define XXH_INLINE_ALL
-#include "util/xxhash.h"
-
 static bool
 intrin_cb_true(const nir_intrinsic_instr *intr, const void *data)
 {
@@ -88,124 +85,139 @@ instr_can_rewrite(const nir_instr *instr, nir_intrin_filter_cb allow_additional_
    return false;
 }
 
-#define HASH(hash, data) XXH32(&(data), sizeof(data), hash)
-
-static uint32_t
-hash_src(uint32_t hash, const nir_src *src)
+static inline uint64_t
+hash_mix64(uint64_t h, uint64_t x)
 {
-   hash = HASH(hash, src->ssa);
-   return hash;
+   h ^= x * 0x9e3779b97f4a7c15ull;
+   return (h ^ (h >> 27)) * 0xbf58476d1ce4e5b9ull;
 }
 
-static uint32_t
-hash_alu_src(uint32_t hash, const nir_alu_src *src, unsigned num_components)
+static inline uint32_t
+hash_finalize(uint64_t h)
 {
+   h ^= h >> 31;
+   h *= 0x94d049bb133111ebull;
+   return (uint32_t)(h ^ (h >> 32));
+}
+
+static inline uint64_t
+hash_src(uint64_t hash, const nir_src *src)
+{
+   return hash_mix64(hash, (uint64_t)(uintptr_t)src->ssa);
+}
+
+static inline uint64_t
+hash_alu_src(uint64_t hash, const nir_alu_src *src, unsigned num_components)
+{
+   STATIC_ASSERT(NIR_MAX_VEC_COMPONENTS <= 16);
+   uint64_t swiz = 0;
    for (unsigned i = 0; i < num_components; i++)
-      hash = HASH(hash, src->swizzle[i]);
+      swiz |= (uint64_t)src->swizzle[i] << (4 * i);
 
-   hash = hash_src(hash, &src->src);
-   return hash;
+   hash = hash_mix64(hash, swiz);
+   return hash_src(hash, &src->src);
 }
 
 static uint32_t
-hash_alu(uint32_t hash, const nir_alu_instr *instr)
+hash_alu(uint64_t hash, const nir_alu_instr *instr)
 {
    /* We explicitly don't hash instr->fp_math_ctrl. */
    uint8_t flags = instr->no_signed_wrap |
                    instr->no_unsigned_wrap << 1;
-   uint8_t v[8];
-   v[0] = flags;
-   v[1] = instr->def.num_components;
-   v[2] = instr->def.bit_size;
-   v[3] = 0;
-   uint32_t op = instr->op;
-   memcpy(v + 4, &op, sizeof(op));
    const nir_op_info *info = &nir_op_infos[instr->op];
-   if (sizeof(uintptr_t) == 8 && instr->def.num_components == 1 &&
-       info->num_inputs == 2 && info->input_sizes[0] <= 1 &&
-       info->input_sizes[1] <= 1) {
-      STATIC_ASSERT(NIR_MAX_VEC_COMPONENTS <= 16);
-      uint64_t a = (uint64_t)(uintptr_t)instr->src[0].src.ssa;
-      uint64_t b = (uint64_t)(uintptr_t)instr->src[1].src.ssa;
-      uint8_t sa = instr->src[0].swizzle[0];
-      uint8_t sb = instr->src[1].swizzle[0];
-      if ((info->algebraic_properties & NIR_OP_IS_2SRC_COMMUTATIVE) &&
-          (a > b || (a == b && sa > sb))) {
-         uint64_t tmp = a;
-         a = b;
-         b = tmp;
-         uint8_t ts = sa;
-         sa = sb;
-         sb = ts;
+   if (instr->def.num_components == 1) {
+      if (info->num_inputs == 2 && info->input_sizes[0] <= 1 &&
+          info->input_sizes[1] <= 1) {
+         STATIC_ASSERT(NIR_MAX_VEC_COMPONENTS <= 16);
+         uint64_t a = (uint64_t)(uintptr_t)instr->src[0].src.ssa;
+         uint64_t b = (uint64_t)(uintptr_t)instr->src[1].src.ssa;
+         uint8_t sa = instr->src[0].swizzle[0];
+         uint8_t sb = instr->src[1].swizzle[0];
+         if ((info->algebraic_properties & NIR_OP_IS_2SRC_COMMUTATIVE) &&
+             (a > b || (a == b && sa > sb))) {
+            uint64_t tmp = a;
+            a = b;
+            b = tmp;
+            uint8_t ts = sa;
+            sa = sb;
+            sb = ts;
+         }
+         uint64_t hdr = ((uint64_t)instr->op << 32) |
+                        ((uint64_t)(sa | (sb << 4)) << 24) |
+                        ((uint64_t)instr->def.bit_size << 16) |
+                        ((uint64_t)1u << 8) | flags;
+         hash = hash_mix64(hash, hdr);
+         hash = hash_mix64(hash, a);
+         hash = hash_mix64(hash, b);
+         return hash_finalize(hash);
       }
-      uint8_t key[24];
-      memcpy(key, v, sizeof(v));
-      key[3] = sa | (sb << 4);
-      memcpy(key + 8, &a, 8);
-      memcpy(key + 16, &b, 8);
-      return XXH32(key, sizeof(key), hash);
+      if (info->num_inputs == 1 && info->input_sizes[0] <= 1) {
+         uint64_t hdr = ((uint64_t)instr->op << 32) |
+                        ((uint64_t)instr->src[0].swizzle[0] << 24) |
+                        ((uint64_t)instr->def.bit_size << 16) |
+                        ((uint64_t)1u << 8) | flags;
+         hash = hash_mix64(hash, hdr);
+         hash = hash_mix64(hash, (uint64_t)(uintptr_t)instr->src[0].src.ssa);
+         return hash_finalize(hash);
+      }
    }
-   hash = XXH32(v, sizeof(v), hash);
 
-   if (nir_op_infos[instr->op].algebraic_properties & NIR_OP_IS_2SRC_COMMUTATIVE) {
-      assert(nir_op_infos[instr->op].num_inputs >= 2);
+   uint64_t hdr = ((uint64_t)instr->op << 32) |
+                  ((uint64_t)instr->def.bit_size << 16) |
+                  ((uint64_t)instr->def.num_components << 8) | flags;
+   hash = hash_mix64(hash, hdr);
 
-      uint32_t hash0 = hash_alu_src(hash, &instr->src[0],
+   if (info->algebraic_properties & NIR_OP_IS_2SRC_COMMUTATIVE) {
+      assert(info->num_inputs >= 2);
+
+      uint64_t hash0 = hash_alu_src(0, &instr->src[0],
                                     nir_ssa_alu_instr_src_components(instr, 0));
-      uint32_t hash1 = hash_alu_src(hash, &instr->src[1],
+      uint64_t hash1 = hash_alu_src(0, &instr->src[1],
                                     nir_ssa_alu_instr_src_components(instr, 1));
-      /* For commutative operations, we need some commutative way of
-       * combining the hashes.  One option would be to XOR them but that
-       * means that anything with two identical sources will hash to 0 and
-       * that's common enough we probably don't want the guaranteed
-       * collision.  Either addition or multiplication will also work.
-       */
-      hash = hash0 * hash1;
+      /* Combine commutatively without collapsing identical sources to 0. */
+      hash = hash_mix64(hash, hash0 + hash1);
+      hash = hash_mix64(hash, (hash0 | 1ull) * (hash1 | 1ull));
 
-      for (unsigned i = 2; i < nir_op_infos[instr->op].num_inputs; i++) {
+      for (unsigned i = 2; i < info->num_inputs; i++) {
          hash = hash_alu_src(hash, &instr->src[i],
                              nir_ssa_alu_instr_src_components(instr, i));
       }
    } else {
-      for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
+      for (unsigned i = 0; i < info->num_inputs; i++) {
          hash = hash_alu_src(hash, &instr->src[i],
                              nir_ssa_alu_instr_src_components(instr, i));
       }
    }
 
-   return hash;
+   return hash_finalize(hash);
 }
 
 static uint32_t
-hash_deref(uint32_t hash, const nir_deref_instr *instr)
+hash_deref(uint64_t hash, const nir_deref_instr *instr)
 {
-   uint32_t v[4];
-   v[0] = instr->deref_type;
-   v[1] = instr->modes;
-   uint64_t type = (uintptr_t)instr->type;
-   memcpy(v + 2, &type, sizeof(type));
-   hash = XXH32(v, sizeof(v), hash);
+   hash = hash_mix64(hash, ((uint64_t)instr->deref_type << 32) | instr->modes);
+   hash = hash_mix64(hash, (uint64_t)(uintptr_t)instr->type);
 
    if (instr->deref_type == nir_deref_type_var)
-      return HASH(hash, instr->var);
+      return hash_finalize(hash_mix64(hash, (uint64_t)(uintptr_t)instr->var));
 
    hash = hash_src(hash, &instr->parent);
 
    switch (instr->deref_type) {
    case nir_deref_type_struct:
-      hash = HASH(hash, instr->strct.index);
+      hash = hash_mix64(hash, instr->strct.index);
       break;
 
    case nir_deref_type_array:
    case nir_deref_type_ptr_as_array:
       hash = hash_src(hash, &instr->arr.index);
-      hash = HASH(hash, instr->arr.in_bounds);
+      hash = hash_mix64(hash, instr->arr.in_bounds);
       break;
 
    case nir_deref_type_cast:
-      hash = HASH(hash, instr->cast.ptr_stride);
-      hash = HASH(hash, instr->cast.align_mul);
-      hash = HASH(hash, instr->cast.align_offset);
+      hash = hash_mix64(hash, ((uint64_t)instr->cast.ptr_stride << 32) |
+                              instr->cast.align_mul);
+      hash = hash_mix64(hash, instr->cast.align_offset);
       break;
 
    case nir_deref_type_var:
@@ -217,25 +229,26 @@ hash_deref(uint32_t hash, const nir_deref_instr *instr)
       UNREACHABLE("Invalid instruction deref type");
    }
 
-   return hash;
+   return hash_finalize(hash);
 }
 
 static uint32_t
-hash_load_const(uint32_t hash, const nir_load_const_instr *instr)
+hash_load_const(uint64_t hash, const nir_load_const_instr *instr)
 {
-   hash = HASH(hash, instr->def.num_components);
+   hash = hash_mix64(hash, ((uint64_t)instr->def.num_components << 8) |
+                           instr->def.bit_size);
 
    if (instr->def.bit_size == 1) {
-      for (unsigned i = 0; i < instr->def.num_components; i++) {
-         uint8_t b = instr->value[i].b;
-         hash = HASH(hash, b);
-      }
+      uint64_t bits = 0;
+      for (unsigned i = 0; i < instr->def.num_components; i++)
+         bits |= (uint64_t)(instr->value[i].b ? 1 : 0) << i;
+      hash = hash_mix64(hash, bits);
    } else {
-      unsigned size = instr->def.num_components * sizeof(*instr->value);
-      hash = XXH32(instr->value, size, hash);
+      for (unsigned i = 0; i < instr->def.num_components; i++)
+         hash = hash_mix64(hash, instr->value[i].u64);
    }
 
-   return hash;
+   return hash_finalize(hash);
 }
 
 static int
@@ -247,15 +260,23 @@ cmp_phi_src(const void *data1, const void *data2)
 }
 
 static uint32_t
-hash_phi(uint32_t hash, const nir_phi_instr *instr)
+hash_phi(uint64_t hash, const nir_phi_instr *instr)
 {
-   hash = HASH(hash, instr->instr.block);
+   hash = hash_mix64(hash, (uint64_t)(uintptr_t)instr->instr.block);
 
    /* Similar to hash_alu(), combine the hashes commutatively. */
-   nir_foreach_phi_src(src, instr)
-      hash *= HASH(hash_src(0, &src->src), src->pred);
+   uint64_t sum = 0;
+   uint64_t prod = 1;
+   nir_foreach_phi_src(src, instr) {
+      uint64_t sh = hash_mix64((uint64_t)(uintptr_t)src->src.ssa,
+                               (uint64_t)(uintptr_t)src->pred);
+      sum += sh;
+      prod *= (sh | 1ull);
+   }
+   hash = hash_mix64(hash, sum);
+   hash = hash_mix64(hash, prod);
 
-   return hash;
+   return hash_finalize(hash);
 }
 
 /* Returns either the original indices or the provided buffer, if some
@@ -291,25 +312,31 @@ normalized_intrinsic_const_indices(const nir_intrinsic_instr *instr,
 }
 
 static uint32_t
-hash_intrinsic(uint32_t hash, const nir_intrinsic_instr *instr)
+hash_intrinsic(uint64_t hash, const nir_intrinsic_instr *instr)
 {
    const nir_intrinsic_info *info = &nir_intrinsic_infos[instr->intrinsic];
-   hash = HASH(hash, instr->intrinsic);
-
-   if (info->has_dest) {
-      uint8_t v[4] = { instr->def.num_components, instr->def.bit_size, 0, 0 };
-      hash = XXH32(v, sizeof(v), hash);
-   }
+   uint64_t hdr = (uint64_t)instr->intrinsic << 32;
+   if (info->has_dest)
+      hdr |= ((uint64_t)instr->def.bit_size << 8) | instr->def.num_components;
+   hash = hash_mix64(hash, hdr);
 
    int const_index[NIR_INTRINSIC_MAX_CONST_INDEX];
    const int *normalized =
       normalized_intrinsic_const_indices(instr, const_index);
-   hash = XXH32(normalized, info->num_index_slots * sizeof(normalized[0]), hash);
+   unsigned nslots = info->num_index_slots;
+   unsigned i = 0;
+   for (; i + 1 < nslots; i += 2) {
+      uint64_t pair = ((uint64_t)(uint32_t)normalized[i] << 32) |
+                      (uint32_t)normalized[i + 1];
+      hash = hash_mix64(hash, pair);
+   }
+   if (i < nslots)
+      hash = hash_mix64(hash, (uint32_t)normalized[i]);
 
-   for (unsigned i = 0; i < nir_intrinsic_infos[instr->intrinsic].num_srcs; i++)
-      hash = hash_src(hash, &instr->src[i]);
+   for (unsigned s = 0; s < info->num_srcs; s++)
+      hash = hash_src(hash, &instr->src[s]);
 
-   return hash;
+   return hash_finalize(hash);
 }
 
 /* Gathers all the small bits of nir_instr_tex as a uint32_t */
@@ -348,25 +375,28 @@ pack_tex(const nir_tex_instr *instr)
 }
 
 static uint32_t
-hash_tex(uint32_t hash, const nir_tex_instr *instr)
+hash_tex(uint64_t hash, const nir_tex_instr *instr)
 {
-   uint8_t v[24];
-   uint32_t packed = pack_tex(instr);
-   memcpy(v, &packed, 4);
+   uint64_t tg4;
    STATIC_ASSERT(sizeof(instr->tg4_offsets) == 8);
-   memcpy(v + 4, instr->tg4_offsets, 8);
-   uint32_t texture_index = instr->texture_index;
-   uint32_t sampler_index = instr->sampler_index;
-   uint32_t backend_flags = instr->backend_flags;
-   memcpy(v + 12, &texture_index, 4);
-   memcpy(v + 16, &sampler_index, 4);
-   memcpy(v + 20, &backend_flags, 4);
-   hash = XXH32(v, sizeof(v), hash);
+   memcpy(&tg4, instr->tg4_offsets, 8);
+   hash = hash_mix64(hash, ((uint64_t)pack_tex(instr) << 32) |
+                           instr->texture_index);
+   hash = hash_mix64(hash, tg4);
+   hash = hash_mix64(hash, ((uint64_t)instr->sampler_index << 32) |
+                           instr->backend_flags);
 
-   for (unsigned i = 0; i < instr->num_srcs; i++)
-      hash *= hash_src(0, &instr->src[i].src);
+   uint64_t sum = 0;
+   uint64_t prod = 1;
+   for (unsigned i = 0; i < instr->num_srcs; i++) {
+      uint64_t sh = hash_mix64(0, (uint64_t)(uintptr_t)instr->src[i].src.ssa);
+      sum += sh;
+      prod *= (sh | 1ull);
+   }
+   hash = hash_mix64(hash, sum);
+   hash = hash_mix64(hash, prod);
 
-   return hash;
+   return hash_finalize(hash);
 }
 
 /* Computes a hash of an instruction for use in a hash table. Note that this
@@ -379,32 +409,24 @@ static uint32_t
 hash_instr(const void *data)
 {
    const nir_instr *instr = data;
-   uint32_t hash = 0;
+   uint64_t hash = (uint64_t)instr->type + 1;
 
    switch (instr->type) {
    case nir_instr_type_alu:
-      hash = hash_alu(hash, nir_instr_as_alu(instr));
-      break;
+      return hash_alu(hash, nir_instr_as_alu(instr));
    case nir_instr_type_deref:
-      hash = hash_deref(hash, nir_instr_as_deref(instr));
-      break;
+      return hash_deref(hash, nir_instr_as_deref(instr));
    case nir_instr_type_load_const:
-      hash = hash_load_const(hash, nir_instr_as_load_const(instr));
-      break;
+      return hash_load_const(hash, nir_instr_as_load_const(instr));
    case nir_instr_type_phi:
-      hash = hash_phi(hash, nir_instr_as_phi(instr));
-      break;
+      return hash_phi(hash, nir_instr_as_phi(instr));
    case nir_instr_type_intrinsic:
-      hash = hash_intrinsic(hash, nir_instr_as_intrinsic(instr));
-      break;
+      return hash_intrinsic(hash, nir_instr_as_intrinsic(instr));
    case nir_instr_type_tex:
-      hash = hash_tex(hash, nir_instr_as_tex(instr));
-      break;
+      return hash_tex(hash, nir_instr_as_tex(instr));
    default:
       UNREACHABLE("Invalid instruction type");
    }
-
-   return hash;
 }
 
 bool
@@ -597,12 +619,19 @@ bool
 nir_alu_srcs_equal(const nir_alu_instr *alu1, const nir_alu_instr *alu2,
                    unsigned src1, unsigned src2)
 {
-   for (unsigned i = 0; i < nir_ssa_alu_instr_src_components(alu1, src1); i++) {
+   if (!nir_srcs_equal(alu1->src[src1].src, alu2->src[src2].src))
+      return false;
+
+   const unsigned num_components = nir_ssa_alu_instr_src_components(alu1, src1);
+   if (num_components == 1)
+      return alu1->src[src1].swizzle[0] == alu2->src[src2].swizzle[0];
+
+   for (unsigned i = 0; i < num_components; i++) {
       if (alu1->src[src1].swizzle[i] != alu2->src[src2].swizzle[i])
          return false;
    }
 
-   return nir_srcs_equal(alu1->src[src1].src, alu2->src[src2].src);
+   return true;
 }
 
 /* Returns "true" if two instructions are equal. Note that this will only
@@ -852,6 +881,38 @@ nir_instr_set_fini(struct set *instr_set)
    _mesa_set_fini(instr_set, NULL);
 }
 
+static void
+rewrite_matched_instr(nir_instr *instr, nir_instr *match)
+{
+   nir_def *def = nir_instr_def(instr);
+   nir_def *new_def = nir_instr_def(match);
+
+   /* It's safe to replace an instruction with an one with different fp_math_ctrl as
+    * long as we take the fp_math_ctrl union. If we got here, the two instructions are
+    * exactly identical in every other way.
+    */
+   if (instr->type == nir_instr_type_alu) {
+      nir_instr_as_alu(match)->fp_math_ctrl |= nir_instr_as_alu(instr)->fp_math_ctrl;
+   } else if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      nir_intrinsic_instr *match_intr = nir_instr_as_intrinsic(match);
+      if (nir_intrinsic_has_io_semantics(intr) &&
+          !nir_intrinsic_io_semantics(intr).no_signed_zero) {
+         nir_io_semantics sem = nir_intrinsic_io_semantics(match_intr);
+         sem.no_signed_zero = false;
+         nir_intrinsic_set_io_semantics(match_intr, sem);
+      } else if (nir_intrinsic_has_fp_math_ctrl(intr)) {
+         unsigned fp_math_ctrl = nir_intrinsic_fp_math_ctrl(match_intr);
+         fp_math_ctrl |= nir_intrinsic_fp_math_ctrl(intr);
+         nir_intrinsic_set_fp_math_ctrl(match_intr, fp_math_ctrl);
+      }
+   }
+
+   assert(!def == !new_def);
+   if (def)
+      nir_def_rewrite_uses(def, new_def);
+}
+
 nir_instr *
 nir_instr_set_add_or_rewrite(struct set *instr_set, nir_instr *instr,
                              nir_intrin_filter_cb allow_additional_intrin,
@@ -869,34 +930,7 @@ nir_instr_set_add_or_rewrite(struct set *instr_set, nir_instr *instr,
 
    if (!cond_function || cond_function(match, instr)) {
       /* rewrite instruction if condition is matched */
-      nir_def *def = nir_instr_def(instr);
-      nir_def *new_def = nir_instr_def(match);
-
-      /* It's safe to replace an instruction with an one with different fp_math_ctrl as
-       * long as we take the fp_math_ctrl union. If we got here, the two instructions are
-       * exactly identical in every other way.
-       */
-      if (instr->type == nir_instr_type_alu) {
-         nir_instr_as_alu(match)->fp_math_ctrl |= nir_instr_as_alu(instr)->fp_math_ctrl;
-      } else if (instr->type == nir_instr_type_intrinsic) {
-         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         nir_intrinsic_instr *match_intr = nir_instr_as_intrinsic(match);
-         if (nir_intrinsic_has_io_semantics(intr) &&
-             !nir_intrinsic_io_semantics(intr).no_signed_zero) {
-            nir_io_semantics sem = nir_intrinsic_io_semantics(match_intr);
-            sem.no_signed_zero = false;
-            nir_intrinsic_set_io_semantics(match_intr, sem);
-         } else if (nir_intrinsic_has_fp_math_ctrl(intr)) {
-            unsigned fp_math_ctrl = nir_intrinsic_fp_math_ctrl(match_intr);
-            fp_math_ctrl |= nir_intrinsic_fp_math_ctrl(intr);
-            nir_intrinsic_set_fp_math_ctrl(match_intr, fp_math_ctrl);
-         }
-      }
-
-      assert(!def == !new_def);
-      if (def)
-         nir_def_rewrite_uses(def, new_def);
-
+      rewrite_matched_instr(instr, match);
       return match;
    } else {
       /* otherwise, replace hashed instruction */
@@ -914,4 +948,159 @@ nir_instr_set_remove(struct set *instr_set, nir_instr *instr)
    struct set_entry *entry = _mesa_set_search(instr_set, instr);
    if (entry)
       _mesa_set_remove(instr_set, entry);
+}
+
+static inline uint32_t
+nir_cse_instr_set_max_entries(uint32_t capacity)
+{
+   return (capacity * 2u) / 3u;
+}
+
+void
+nir_cse_instr_set_init(struct nir_cse_instr_set *set,
+                       uint32_t expected_entries)
+{
+   set->count = 0;
+   if (expected_entries <= NIR_CSE_INSTR_SET_INLINE_CAP) {
+      set->capacity = NIR_CSE_INSTR_SET_INLINE_CAP;
+      set->max_entries = nir_cse_instr_set_max_entries(set->capacity);
+      set->hashes = set->inline_hashes;
+      set->instrs = set->inline_instrs;
+      memset(set->inline_hashes, 0, sizeof(set->inline_hashes));
+      return;
+   }
+
+   uint32_t cap = util_next_power_of_two(MAX2(256u, expected_entries));
+   size_t hashes_bytes = (size_t)cap * sizeof(uint32_t);
+   size_t instrs_bytes = (size_t)cap * sizeof(nir_instr *);
+   void *buf = malloc(hashes_bytes + instrs_bytes);
+   if (!buf) {
+      set->capacity = 0;
+      set->max_entries = 0;
+      set->hashes = NULL;
+      set->instrs = NULL;
+      return;
+   }
+
+   set->capacity = cap;
+   set->max_entries = nir_cse_instr_set_max_entries(cap);
+   set->hashes = (uint32_t *)buf;
+   set->instrs = (nir_instr **)((char *)buf + hashes_bytes);
+   memset(set->hashes, 0, hashes_bytes);
+}
+
+void
+nir_cse_instr_set_fini(struct nir_cse_instr_set *set)
+{
+   if (set->hashes && set->hashes != set->inline_hashes)
+      free(set->hashes);
+   set->hashes = NULL;
+   set->instrs = NULL;
+   set->capacity = 0;
+   set->count = 0;
+   set->max_entries = 0;
+}
+
+void
+nir_cse_instr_set_clear(struct nir_cse_instr_set *set)
+{
+   if (set->count) {
+      memset(set->hashes, 0, (size_t)set->capacity * sizeof(uint32_t));
+      set->count = 0;
+   }
+}
+
+static bool
+nir_cse_instr_set_grow(struct nir_cse_instr_set *set)
+{
+   uint32_t old_cap = set->capacity;
+   uint32_t new_cap = old_cap * 2u;
+   size_t hashes_bytes = (size_t)new_cap * sizeof(uint32_t);
+   size_t instrs_bytes = (size_t)new_cap * sizeof(nir_instr *);
+   void *buf = malloc(hashes_bytes + instrs_bytes);
+   if (!buf)
+      return false;
+
+   uint32_t *new_hashes = (uint32_t *)buf;
+   nir_instr **new_instrs = (nir_instr **)((char *)buf + hashes_bytes);
+   memset(new_hashes, 0, hashes_bytes);
+
+   uint32_t mask = new_cap - 1u;
+   uint32_t *old_hashes = set->hashes;
+   nir_instr **old_instrs = set->instrs;
+   for (uint32_t i = 0; i < old_cap; i++) {
+      uint32_t h = old_hashes[i];
+      if (!h)
+         continue;
+      uint32_t idx = h & mask;
+      while (new_hashes[idx])
+         idx = (idx + 1u) & mask;
+      new_hashes[idx] = h;
+      new_instrs[idx] = old_instrs[i];
+   }
+
+   if (old_hashes != set->inline_hashes)
+      free(old_hashes);
+
+   set->hashes = new_hashes;
+   set->instrs = new_instrs;
+   set->capacity = new_cap;
+   set->max_entries = nir_cse_instr_set_max_entries(new_cap);
+   return true;
+}
+
+nir_instr *
+nir_cse_instr_set_add_or_rewrite(struct nir_cse_instr_set *set,
+                                 nir_instr *instr,
+                                 nir_intrin_filter_cb allow_additional_intrin,
+                                 const void *intrin_data,
+                                 bool (*cond_function)(const nir_instr *a,
+                                                       const nir_instr *b))
+{
+   if (!instr_can_rewrite(instr, allow_additional_intrin, intrin_data))
+      return NULL;
+
+   if (unlikely(!set->capacity))
+      return NULL;
+
+   uint32_t h = hash_instr(instr);
+   if (unlikely(h == 0))
+      h = 1;
+
+   uint32_t mask = set->capacity - 1u;
+   uint32_t idx = h & mask;
+   uint32_t *hashes = set->hashes;
+   nir_instr **instrs = set->instrs;
+
+   for (;;) {
+      uint32_t eh = hashes[idx];
+      if (eh == 0) {
+         if (unlikely(set->count >= set->max_entries)) {
+            if (!nir_cse_instr_set_grow(set))
+               return NULL;
+            mask = set->capacity - 1u;
+            hashes = set->hashes;
+            instrs = set->instrs;
+            idx = h & mask;
+            while (hashes[idx] != 0)
+               idx = (idx + 1u) & mask;
+         }
+         hashes[idx] = h;
+         instrs[idx] = instr;
+         set->count++;
+         return NULL;
+      }
+      if (eh == h) {
+         nir_instr *match = instrs[idx];
+         if (nir_instrs_equal(match, instr)) {
+            if (!cond_function || cond_function(match, instr)) {
+               rewrite_matched_instr(instr, match);
+               return match;
+            }
+            instrs[idx] = instr;
+            return NULL;
+         }
+      }
+      idx = (idx + 1u) & mask;
+   }
 }

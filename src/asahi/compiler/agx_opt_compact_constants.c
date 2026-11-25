@@ -25,9 +25,9 @@ agx_opt_compact_constants(agx_context *ctx)
    BITSET_WORD *src_wide = calloc(ctx->alloc, sizeof(BITSET_WORD));
    BITSET_WORD *replaced = calloc(ctx->alloc, sizeof(BITSET_WORD));
 
-   /* M5's f32 add takes at most one half register, so a constant added to a
-    * half in an f32 add must stay 32-bit. */
-   const bool agx3c = ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
+   /* An AGX3 f32 add takes at most one half register, so a constant added to
+    * a half in an f32 add must stay 32-bit. */
+   const bool agx3 = ctx->key && agx_isa_is_agx3(ctx->key->dev.encoding);
 
    /* G18G has no generally grounded f32 arithmetic over an f16 register, so
     * narrowing a constant that feeds a full-width add, multiply or FMA hands
@@ -42,13 +42,15 @@ agx_opt_compact_constants(agx_context *ctx)
    /* Analyze the types that we read constants as */
    agx_foreach_instr_global(ctx, I) {
       const bool wide_float_op =
-         g18g && I->nr_dests >= 1 && I->dest[0].size == AGX_SIZE_32 &&
-         (I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL ||
-          I->op == AGX_OPCODE_FFMA);
+         (g18g && I->nr_dests >= 1 && I->dest[0].size == AGX_SIZE_32 &&
+          (I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL ||
+           I->op == AGX_OPCODE_FFMA)) ||
+         (agx3 && (I->op == AGX_OPCODE_FLTNORM_AGX3 ||
+                   I->op == AGX_OPCODE_PACK_RGB10A2_AGX3));
 
       agx_foreach_ssa_src(I, s) {
          const bool half_pair =
-            agx3c && I->op == AGX_OPCODE_FADD && I->nr_srcs == 2 &&
+            agx3 && I->op == AGX_OPCODE_FADD && I->nr_srcs == 2 &&
             I->dest[0].size == AGX_SIZE_32 && s < 2 &&
             I->src[1 - s].type == AGX_INDEX_NORMAL &&
             I->src[1 - s].size == AGX_SIZE_16;

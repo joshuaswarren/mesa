@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "agx3_binder.h"
+#include "agx3_native_stats.h"
 #include "agx3_tex_core.h"
 
 #define KV(f, v) {(uint16_t)(f), (uint64_t)(v)}
@@ -186,7 +187,7 @@ agx3_stage_copy_liveness(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
 {
    const unsigned slots = agx_encoding_is_g17_class(enc) ? 8 : 6;
    if (!out || !len ||
-       (enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+       !agx_isa_is_agx3(enc) ||
        (stage_kill && enc != AGX_ISA_ENCODING_AGX3B) ||
        (dest & 1) || (src & 1) || dest >= 256 || src >= 256 ||
        slot < 1 || slot > slots || (wait_mask & ~((1u << slots) - 1)))
@@ -210,8 +211,10 @@ agx3_stage_copy_liveness(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
    }
 
    for (int ep = 0; ep <= 1; ++ep) {
-      if (agx3_bind_compose(enc, AGX3_MN_copy, ep, base, nb, ov, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_copy, ep, base, nb, ov, n, out, len)) {
+         agx3_native_stats.staging_copies++;
          return true;
+      }
    }
    return false;
 }
@@ -248,10 +251,11 @@ agx3_stage_copy_kill(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
 
    /* The kill bit does not fit the compact form, so Apple escalates to ep1;
     * the composer's first-success order reproduces that. */
-   if (agx3_bind_compose(enc, AGX3_MN_copy, 0, base, 4, ov, n, out, len))
+   if (agx3_bind_compose(enc, AGX3_MN_copy, 0, base, 4, ov, n, out, len) ||
+       agx3_bind_compose(enc, AGX3_MN_copy, 1, base, 4, ov, n, out, len)) {
+      agx3_native_stats.staging_copies++;
       return true;
-   if (agx3_bind_compose(enc, AGX3_MN_copy, 1, base, 4, ov, n, out, len))
-      return true;
+   }
 
    memset(out, 0, AGX3_STAGE_MAX_LENGTH);
    *len = 0;

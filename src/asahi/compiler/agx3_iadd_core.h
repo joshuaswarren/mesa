@@ -107,6 +107,7 @@ struct agx3_iadd_desc {
     *   addsat(int, int)       9f 01 56 00 02 00 10 e8 17 0f  f28 f43 f53
     *   addsat(uint, uint)     9f 01 56 00 02 00 10 e8 17 05  f53
     *   subsat(int, int)       1f 01 56 00 02 00 10 e8 17 0f
+    *   subsat(uint, uint)     1f 01 56 00 02 00 10 e8 17 05  f53
     *
     * G17G, both slots 32-bit registers, no shift. `subtract` is Apple's
     * `isub32` (root f45=100 instead of 80): slot B is subtracted. `saturate`

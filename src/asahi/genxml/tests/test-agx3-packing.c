@@ -528,6 +528,46 @@ test_agx3_live_vdm_draw(void)
       exit(1);
    }
 
+   /* Legacy AGX2 INDEX_LIST_BUFFER_SIZE encodes 32-bit dword counts, so a full
+    * 4 GiB (0x40000000-index U32) draw must preserve all 0x40000000 dwords
+    * rather than clamping at UINT32_MAX bytes (0x3fffffff dwords). */
+   const struct agx_draw four_gib_u32 =
+      agx_draw_indexed(UINT32_C(0x40000000), 1, 0, 0, 0,
+                       UINT64_C(0x100000000), UINT64_C(1) << 32,
+                       AGX_INDEX_SIZE_U32, false);
+   memset(agx2_expected, 0, sizeof(agx2_expected));
+   memset(agx2_robust, 0, sizeof(agx2_robust));
+   agx_vdm_draw(agx2_expected, AGX_CHIP_G13G, four_gib_u32,
+                (enum agx_primitive)9, UINT32_MAX);
+   agx_vdm_draw_robust_index(agx2_robust, AGX_CHIP_G13G, four_gib_u32,
+                             (enum agx_primitive)9, UINT32_MAX, 0, false, 0);
+   CHECK_EQ(agx2_expected[5], UINT32_C(0x40000000));
+   CHECK_EQ(agx2_robust[5], UINT32_C(0x40000000));
+
+   /* A rewrite direct draw whose started window begins mid-dword (4 GiB + 2
+    * U16 binding with firstIndex = 0x7fffffff, indexCount = 2 -> ib & 3 == 2,
+    * range_B == 4) spans two dwords and must match agx_vdm_draw(). */
+   const struct agx_draw mid_dword_u16 =
+      agx_draw_indexed(2, 1, UINT32_C(0x7fffffff), 0, 0,
+                       UINT64_C(0x100000000), (UINT64_C(1) << 32) + 2,
+                       AGX_INDEX_SIZE_U16, false);
+   memset(agx2_expected, 0, sizeof(agx2_expected));
+   memset(agx2_robust, 0, sizeof(agx2_robust));
+   agx_vdm_draw(agx2_expected, AGX_CHIP_G13G, mid_dword_u16,
+                (enum agx_primitive)9, UINT32_MAX);
+   agx_vdm_draw_robust_index(agx2_robust, AGX_CHIP_G13G, mid_dword_u16,
+                             (enum agx_primitive)9, UINT32_MAX, 0, false, 0);
+   CHECK_EQ(agx2_expected[5], 2u);
+   CHECK_EQ(agx2_robust[5], 2u);
+
+   uint32_t g17c_direct[10] = {0}, g17c_robust[10] = {0};
+   agx_vdm_draw(g17c_direct, AGX_CHIP_G17C, mid_dword_u16,
+                (enum agx_primitive)9, UINT32_MAX);
+   agx_vdm_draw_robust_index(g17c_robust, AGX_CHIP_G17C, mid_dword_u16,
+                             (enum agx_primitive)9, UINT32_MAX, 0, false, 0);
+   CHECK_EQ(g17c_direct[6], 2u);
+   CHECK_EQ(g17c_robust[6], 2u);
+
    /* Indirect-count predication zeros every record above the runtime count.
     * A G17P direct indexed packet cannot encode either zero count, so the
     * device-side builder must skip its fixed reservation with the grounded
@@ -1162,6 +1202,39 @@ test_robust_index_shadow(void)
       CHECK_EQ(agx_robust_index_available(3, 3 * width, size), 0);
       CHECK_EQ(agx_robust_index_available(3, 4 * width - 1, size), 0);
       CHECK_EQ(agx_robust_index_available(3, 5 * width - 1, size), 1);
+
+      /* 4 GiB and 4 GiB + 4 bindings must preserve their full 64-bit byte
+       * range without wrapping to 0 or 4. */
+      const uint64_t four_gib = UINT64_C(1) << 32;
+      CHECK_EQ(agx_robust_index_available(0, four_gib, size),
+               size == AGX_INDEX_SIZE_U8 ? UINT32_MAX : (uint32_t)(four_gib >> size));
+      CHECK_EQ(agx_robust_index_available(0, four_gib + 4, size),
+               size == AGX_INDEX_SIZE_U8 ? UINT32_MAX : (uint32_t)((four_gib + 4) >> size));
+      if (size == AGX_INDEX_SIZE_U32) {
+         CHECK_EQ(agx_robust_index_available(0x40000000u, four_gib, size), 0);
+         CHECK_EQ(agx_robust_index_available(0x40000000u, four_gib + 4, size), 1);
+      }
+
+      struct agx_draw large_draw =
+         agx_draw_indexed(4, 1, 0, 0, 0, UINT64_C(0x10000), four_gib + 4, size, false);
+      CHECK_EQ(large_draw.index_buffer_range_B, four_gib + 4);
+      CHECK_EQ(agx_direct_draw_overreads_indices(large_draw), false);
+      uint32_t large_vdm[16] = {0};
+      uint32_t *large_end = agx_vdm_draw_robust_index(
+         large_vdm, AGX_CHIP_G17P, large_draw, AGX_PRIMITIVE_TRIANGLES,
+         0xffff, 0, false, UINT64_C(0x4000));
+      CHECK_EQ((size_t)(large_end - large_vdm) * 4,
+               libagx_draw_robust_index_vdm_size(AGX_CHIP_G17P, false));
+
+      /* 16 GiB direct binding clamps the 32-bit dword count instead of
+       * wrapping to 0. */
+      const uint64_t sixteen_gib = UINT64_C(1) << 34;
+      struct agx_draw huge_draw =
+         agx_draw_indexed(4, 1, 0, 0, 0, UINT64_C(0x10000), sixteen_gib, size, false);
+      CHECK_EQ(agx_draw_direct_index_buffer_size_dwords(huge_draw, UINT64_C(0x10000)),
+               UINT32_MAX);
+      CHECK_EQ(agx_vdm_draw_supported(AGX_CHIP_G17C, huge_draw, AGX_PRIMITIVE_TRIANGLES),
+               true);
 
       struct agx_draw wrapped =
          agx_draw_indexed(UINT32_MAX, 1, 1, 0, 0, 0x1000, 128, size, false);

@@ -45,6 +45,35 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    ndispatched++;
 }
 
+/* hk_cmd_buffer_get_cs_general() serves every stream slot; fixtures never
+ * open a graphics or pre-graphics stream through it. */
+void
+hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
+bool
+hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+   abort();
+}
+
+/* Fixtures never copy timestamps. Emitting a copy is a bug. */
+void
+hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                       const struct hk_stamp_copy *copies, unsigned count)
+{
+   (void)cmd;
+   (void)cs;
+   (void)copies;
+   (void)count;
+   abort();
+}
+
 /* These devices never map memory at a second address, so the real
  * function adds no flush either.
  */
@@ -536,7 +565,7 @@ test_order(void)
 static void
 test_order_forward(void)
 {
-   test_chip = AGX_CHIP_G16G;
+   test_chip = AGX_CHIP_G15G;
    struct hk_cmd_buffer *c = new_cmd();
    struct hk_cs *r[3], *p[3];
    for (unsigned i = 0; i < 3; ++i) {
@@ -553,23 +582,22 @@ test_order_forward(void)
    test_chip = AGX_CHIP_G17P;
 }
 
-/* Only the G17 runtime (G17P and M5) publishes render timestamps at
- * retirement. G15 firmware writes the vertex-end slot when tiling finishes,
- * before the fragment work writes the counts: such a stamp is not
- * availability. */
+/* Native HAL200 (G16G/G17P) and M5 (G17G/G17S/G17C) runtimes publish render
+ * timestamps at full retirement. G15 firmware writes the vertex-end slot when
+ * tiling finishes, before the fragment work writes the counts: such a stamp is
+ * not availability. */
 static void
 test_stamp_chips(void)
 {
-   T("chips: G17P and M5 renders carry availability",
-     hk_oq_render_stamps_supported(AGX_CHIP_G17P) &&
+   T("chips: native HAL200 and M5 renders carry availability",
+     hk_oq_render_stamps_supported(AGX_CHIP_G16G) &&
+        hk_oq_render_stamps_supported(AGX_CHIP_G17P) &&
         hk_oq_render_stamps_supported(AGX_CHIP_G17G) &&
         hk_oq_render_stamps_supported(AGX_CHIP_G17S));
    T("chips: G15 renders keep the queued store",
      !hk_oq_render_stamps_supported(AGX_CHIP_G15G) &&
         !hk_oq_render_stamps_supported(AGX_CHIP_G15S) &&
         !hk_oq_render_stamps_supported(AGX_CHIP_G15C));
-   T("chips: other native chips keep the queued store",
-     !hk_oq_render_stamps_supported(AGX_CHIP_G16G));
 }
 
 static void

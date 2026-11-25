@@ -118,3 +118,10 @@ void agx_link_varyings_vs_fs(void *out, struct agx_varyings_vs *vs,
                              unsigned provoking_vertex,
                              uint8_t sprite_coord_enable,
                              bool *generate_primitive_id);
+
+/* For a GPU whose varying table selects perspective-correct coefficients with
+ * shade model 5, rewrite the smooth perspective bindings of a table that
+ * agx_link_varyings_vs_fs() linked into out.
+ */
+void agx_cf_bindings_select_perspective(void *out,
+                                        const struct agx_varyings_fs *fs);

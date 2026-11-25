@@ -584,7 +584,7 @@ int main(void)
       const uint8_t signed_half[] = {
          0x27,0x00,0x04,0x1a,0x29,0x00,0xa3,0x02,0x20,0x00,0x4b,0x00};
       CHECK_NATIVE(agx3_alu_hmul_abs(AGX_ISA_ENCODING_AGX3C,0,half_pair,
-                   dead,both_abs,true,1,b,&n), abs_product);
+                   dead,both_abs,false,true,1,b,&n), abs_product);
       const struct agx3_isub_imm_desc sign_extend = {
          .dest = 0, .src = 0, .src_16 = true, .sign_extend = true,
          .dest_cache = true, .src_kill = true,

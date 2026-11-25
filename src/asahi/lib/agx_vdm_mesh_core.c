@@ -43,6 +43,18 @@ agx_vdm_m5_mesh_set_output_limits(struct agx_vdm_mesh_state_info *info,
 }
 
 bool
+agx_vdm_m5_mesh_set_task_payload(struct agx_vdm_mesh_state_info *info,
+                                 uint32_t payload_size_B)
+{
+   if (!info || payload_size_B > AGX_VDM_M5_MESH_MAX_TASK_PAYLOAD_BYTES)
+      return false;
+
+   info->raw_tail[0] =
+      payload_size_B ? (payload_size_B + 1023u) / 1024u : 1u;
+   return true;
+}
+
+bool
 agx_vdm_mesh_state_pack(enum agx_chip chip,
                         const struct agx_vdm_mesh_state_info *info,
                         uint8_t out[AGX_VDM_MESH_STATE_LENGTH])

@@ -128,6 +128,9 @@ extern const agx3_table agx3b_table;
 extern const agx3_table agx3c_table;
 extern const agx3_table agx3d_table;
 
+/* Whether predicate p of t holds for its field's value v */
+bool agx3_pred_holds(const agx3_table *t, const agx3_pred *p, uint64_t v);
+
 /* Pack forms[form] from fields[0..159].  On success writes size bytes into
  * out and returns true; any violation of the contract returns false with out
  * untouched. */
