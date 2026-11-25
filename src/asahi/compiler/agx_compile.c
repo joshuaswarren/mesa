@@ -14996,6 +14996,9 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       } else {
          AGX_PASS(ctx, agx_opt_cse);
       }
+      /* Post-legalization CSE can merge two single-use scalar LOD copies into
+       * one live SSA; pack any M5 sample whose scalar LOD is no longer dead. */
+      AGX_PASS(ctx, agx3_lower_m5_live_scalar_lods);
    }
 
    if (native_cprog && ctx->is_preamble &&

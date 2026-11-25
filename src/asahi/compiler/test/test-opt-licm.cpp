@@ -123,7 +123,7 @@ TEST(OptLicm, HoistsAndMergesLoopImmediates)
    agx_unit_test(b, use1->dest[0]);
    agx_unit_test(b, use2->dest[0]);
 
-   EXPECT_TRUE(licm(b->shader));
+   EXPECT_TRUE(licm(b->shader, 64));
    EXPECT_EQ(count(l.body, AGX_OPCODE_MOV_IMM), 0u);
    EXPECT_EQ(count(l.entry, AGX_OPCODE_MOV_IMM), 5u);
    EXPECT_EQ(use1->src[0].value, k1.value);
@@ -299,4 +299,46 @@ TEST(OptLicm, NoLoopNoChange)
    agx_unit_test(b, agx_mov_imm(b, 32, 7));
    EXPECT_FALSE(licm(b->shader));
    ralloc_free(mem);
+}
+
+/* An M5 unpacked 2D/3D scalar LOD copy must stay inside its loop so its
+ * consumer keeps a killed half-float source. */
+TEST(OptLicm, KeepsM5UnpackedScalarLodInLoop)
+{
+   Loop l;
+   agx_builder *b = l.b;
+   l.key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   l.key.dev.chip = AGX_CHIP_G17C;
+   b->cursor = agx_after_block(l.entry);
+   agx_index coords = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+   agx_preload_to(b, coords, agx_register(8, AGX_SIZE_32));
+   agx_index p[8];
+   for (unsigned i = 0; i < 8; ++i)
+      p[i] = agx_mov_imm(b, 32, i + 1);
+   agx_index keep = agx_iadd(b, agx_iadd(b, p[0], p[1], 0),
+                             agx_iadd(b, p[2], p[3], 0), 0);
+   keep = agx_iadd(b, keep,
+                   agx_iadd(b, agx_iadd(b, p[4], p[5], 0),
+                            agx_iadd(b, p[6], p[7], 0), 0),
+                   0);
+
+   b->cursor = agx_after_block(l.body);
+   agx_index lod = agx_mov(b, agx_uniform(14, AGX_SIZE_16));
+   agx_index plain = agx_mov(b, agx_uniform(8, AGX_SIZE_32));
+   agx_index sum = agx_iadd(b, keep, plain, 0);
+   agx_index sample = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_instr *tex = agx_texture_sample_to(
+      b, sample, coords, lod, agx_zero(), agx_immediate(0), agx_zero(),
+      agx_null(), AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0, false, false, false,
+      AGX_GATHER_NONE, false);
+   tex->mask = 15;
+
+   b->cursor = agx_after_block(l.exit);
+   agx_unit_test(b, sum);
+   agx_unit_test(b, sample);
+
+   /* The plain ALU uniform copy hoists while the scalar LOD copy stays in body. */
+   EXPECT_TRUE(licm(b->shader));
+   EXPECT_EQ(count(l.body, AGX_OPCODE_MOV), 1u);
+   EXPECT_EQ(count(l.entry, AGX_OPCODE_MOV), 1u);
 }
