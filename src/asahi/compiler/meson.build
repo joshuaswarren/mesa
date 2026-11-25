@@ -783,6 +783,7 @@ if with_tests
          'test/test-flrp-contract.cpp',
          'test/test-monotonic-bit-insert.cpp',
          'test/test-agx3-feature-matching-opts.cpp',
+         'test/test-agx3-byte-lut-extract.cpp',
          'test/test-iv-divmod.cpp',
          'test/test-agx3-fm-wave2.cpp',
          'test/test-buffer-format-groups.cpp',
