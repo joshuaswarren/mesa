@@ -136,6 +136,29 @@ count_loops(nir_shader *shader)
 
 /* --- Commit 1: agx_nir_merge_global_words --- */
 
+TEST(AGX3VisionOpts, RuntimeUnrollWorkgroupStride)
+{
+   for (int step : {1, 32, -32}) {
+      nir_builder b = make_compute_shader("workgroup-stride");
+      nir_def *bound = load_push_word(&b, 0, 16);
+      nir_def *lane = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_variable *iv = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+      nir_store_var(&b, iv, step > 0 ? lane : nir_isub(&b, bound, lane), 1);
+      nir_def *base = make_desc_base(&b, 4);
+      nir_loop *loop = nir_push_loop(&b);
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, step > 0 ? nir_ige(&b, i, bound)
+                                : nir_ilt(&b, i, nir_imm_int(&b, 0)));
+      nir_store_global(&b, i, make_buffer_addr(&b, base, nir_ishl_imm(&b, i, 2)));
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, step), 1);
+      nir_pop_loop(&b, loop);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      EXPECT_EQ(agx_nir_unroll_runtime_loops(b.shader, 8, 320, NULL), step == 1);
+      nir_validate_shader(b.shader, "workgroup-stride");
+      ralloc_free(b.shader);
+   }
+}
+
 TEST(AGX3VisionOpts, MergeGlobalWordsNarrowU8AndSignedDuplicates)
 {
    nir_builder b = make_compute_shader("merge-u8-signed");

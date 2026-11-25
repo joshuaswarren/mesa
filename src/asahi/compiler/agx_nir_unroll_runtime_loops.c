@@ -827,11 +827,39 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
 
 static void collect_loops(struct exec_list *list, struct util_dynarray *loops);
 
+/* A workgroup-striped loop already issues adjacent elements together. The
+ * extra copies access different stripes and each lane may only have one
+ * stripe to process, leaving the large main loop unused. */
+static bool
+workgroup_striped(const nir_shader *shader, const struct counted_loop *cl)
+{
+   if (shader->info.stage != MESA_SHADER_COMPUTE ||
+       shader->info.workgroup_size_variable)
+      return false;
+
+   nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&cl->loop->cf_node));
+   nir_phi_src *init = nir_phi_get_src_from_block(cl->iv, pre);
+   nir_scalar start = nir_scalar_resolved(init->src.ssa, 0);
+   /* A backwards stripe starts at the far end minus the local ID. */
+   if (nir_scalar_is_alu(start) && nir_scalar_alu_op(start) == nir_op_isub)
+      start = nir_scalar_chase_alu_src(start, 1);
+
+   nir_intrinsic_instr *intr = nir_def_as_intrinsic(start.def);
+   if (!intr || intr->intrinsic != nir_intrinsic_load_local_invocation_id)
+      return false;
+
+   unsigned width = shader->info.workgroup_size[start.comp];
+   return width > 1 && (cl->step == width || cl->step == -(int64_t)width);
+}
+
 /* The iterations per test for a counted loop, or 0 when it is not unrolled. */
 static unsigned
 choose_factor(nir_function_impl *impl, nir_loop *loop, struct counted_loop *cl,
               unsigned factor, unsigned max_instrs)
 {
+   if (workgroup_striped(impl->function->shader, cl))
+      return 0;
+
    int size = count_unrollable(loop, cl->nif);
    if (size < 0)
       return 0;
