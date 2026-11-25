@@ -15,6 +15,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "hk_nir_eval_test.h"
 #include "hk_nir_match_pointwise_clamp.h"
+#include "hk_nir_fast_udiv.h"
 #include "hk_nir_wgid.h"
 
 static nir_shader *
@@ -858,6 +859,48 @@ test_depthwise_vec4_and_fusion(void)
 
    /* Unconditional bias buffer (no has_bias push flag). */
    run_depthwise_case(true, false, &cfg2, &relu);
+
+   /* 3x3 stride 1, even interior + borders (exercises 1x2 unrolled s=1 fast path). */
+   struct dw_push_layout cfg3 = {
+      .channels = 16, .out_w = 8, .out_h = 8, .in_w = 8, .in_h = 8,
+      .ker_w = 3, .ker_h = 3, .pad_x = -1, .pad_y = -1,
+      .str_x = 1, .str_y = 1, .dil_x = 1, .dil_y = 1, .has_bias = 1,
+   };
+   run_depthwise_case(true, true, &cfg3, NULL);
+   run_depthwise_case(true, true, &cfg3, &relu6);
+
+   /* 3x3 stride 1, odd ow=7, oh=7 (both interior 1x2 pairs and odd X/Y tails). */
+   struct dw_push_layout cfg4 = {
+      .channels = 8, .out_w = 7, .out_h = 7, .in_w = 7, .in_h = 7,
+      .ker_w = 3, .ker_h = 3, .pad_x = -1, .pad_y = -1,
+      .str_x = 1, .str_y = 1, .dil_x = 1, .dil_y = 1, .has_bias = 1,
+   };
+   run_depthwise_case(true, true, &cfg4, &relu6);
+
+   /* 3x3 stride 2, even interior + borders (exercises 1x2 unrolled s=2 fast path). */
+   struct dw_push_layout cfg5 = {
+      .channels = 12, .out_w = 6, .out_h = 6, .in_w = 12, .in_h = 12,
+      .ker_w = 3, .ker_h = 3, .pad_x = 0, .pad_y = 0,
+      .str_x = 2, .str_y = 2, .dil_x = 1, .dil_y = 1, .has_bias = 1,
+   };
+   run_depthwise_case(true, true, &cfg5, NULL);
+   run_depthwise_case(true, true, &cfg5, &relu6);
+
+   /* 3x3 stride 2, odd ow=5, oh=5 with -1 padding. */
+   struct dw_push_layout cfg6 = {
+      .channels = 8, .out_w = 5, .out_h = 5, .in_w = 10, .in_h = 10,
+      .ker_w = 3, .ker_h = 3, .pad_x = -1, .pad_y = -1,
+      .str_x = 2, .str_y = 2, .dil_x = 1, .dil_y = 1, .has_bias = 1,
+   };
+   run_depthwise_case(true, true, &cfg6, &relu6);
+
+   /* 3x3 dilated (dx=2, dy=2), interior + borders (generic 1x2 interior loop). */
+   struct dw_push_layout cfg7 = {
+      .channels = 8, .out_w = 8, .out_h = 8, .in_w = 8, .in_h = 8,
+      .ker_w = 3, .ker_h = 3, .pad_x = -2, .pad_y = -2,
+      .str_x = 1, .str_y = 1, .dil_x = 2, .dil_y = 2, .has_bias = 1,
+   };
+   run_depthwise_case(true, true, &cfg7, &relu6);
 }
 
 static void
@@ -2516,6 +2559,243 @@ test_dual_write_fusion(void)
    ralloc_free(orig);
 }
 
+static void
+test_fast_udivmod_general(void)
+{
+   /* Build a compute shader evaluating hk_nir_fast_udiv_prepare +
+    * hk_nir_fast_udivmod across arbitrary 32-bit unsigned (num, den) pairs. */
+   nir_shader *s = new_compute_shader("fast_udivmod_test", 1, 1, 1);
+   s->info.num_ssbos = 2;
+   nir_builder b = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(s)));
+   nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *den = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                         .base = 0, .range = 4);
+   nir_def *num = nir_load_deref(&b, nir_instr_as_deref(nir_def_instr(ssbo_elem_deref(&b, 0, 0, gid))));
+   struct hk_nir_fast_udiv fd = hk_nir_fast_udiv_prepare(&b, den);
+   nir_def *q = NULL, *r = NULL;
+   hk_nir_fast_udivmod(&b, &fd, num, &q, &r);
+   nir_store_deref(&b, nir_instr_as_deref(nir_def_instr(ssbo_elem_deref(&b, 0, 1, nir_ishl_imm(&b, gid, 1)))), q, 1);
+   nir_store_deref(&b, nir_instr_as_deref(nir_def_instr(ssbo_elem_deref(&b, 0, 1, nir_iadd_imm(&b, nir_ishl_imm(&b, gid, 1), 1)))), r, 1);
+   nir_shader_gather_info(s, nir_shader_get_entrypoint(s));
+   nir_validate_shader(s, "fast_udivmod_test");
+
+   static const uint32_t divisors[] = {
+      1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 13u, 15u, 16u, 17u,
+      24u, 31u, 32u, 33u, 48u, 63u, 64u, 80u, 96u, 127u, 128u, 144u,
+      255u, 256u, 1000u, 65535u, 65536u,
+      0x7fffffffu, 0x80000000u, 0x80000001u, 0xfffffffeu, 0xffffffffu,
+   };
+
+   uint32_t nums[64];
+   uint32_t out_qr[128];
+   for (unsigned di = 0; di < ARRAY_SIZE(divisors); ++di) {
+      const uint32_t d = divisors[di];
+      unsigned ncnt = 0;
+      nums[ncnt++] = 0u;
+      nums[ncnt++] = 1u;
+      nums[ncnt++] = 2u;
+      nums[ncnt++] = d - 1u;
+      nums[ncnt++] = d;
+      nums[ncnt++] = d + 1u;
+      nums[ncnt++] = d * 2u - 1u;
+      nums[ncnt++] = d * 2u;
+      nums[ncnt++] = d * 2u + 1u;
+      nums[ncnt++] = 0x7fffffffu;
+      nums[ncnt++] = 0x80000000u;
+      nums[ncnt++] = 0xfffffffeu;
+      nums[ncnt++] = 0xffffffffu;
+      uint32_t rng = 0x9e3779b9u ^ (d * 2654435761u);
+      while (ncnt < ARRAY_SIZE(nums)) {
+         rng ^= rng << 13;
+         rng ^= rng >> 17;
+         rng ^= rng << 5;
+         nums[ncnt++] = rng;
+      }
+
+      struct hk_eval_ssbo ssbos[2] = {
+         { 0, 0, nums, sizeof(nums), 0 },
+         { 0, 1, out_qr, sizeof(out_qr), 0 },
+      };
+      const uint32_t g[3] = { ncnt, 1, 1 };
+      hk_eval_dispatch(s, g, ssbos, 2, &d, sizeof(d));
+      for (unsigned i = 0; i < ncnt; ++i) {
+         const uint32_t exp_q = nums[i] / d;
+         const uint32_t exp_r = nums[i] % d;
+         HK_EVAL_CHECK(out_qr[2 * i] == exp_q);
+         HK_EVAL_CHECK(out_qr[2 * i + 1] == exp_r);
+      }
+   }
+   ralloc_free(s);
+}
+
+static void
+test_depthwise_shape_sweep_cpu_ref(void)
+{
+   /* Broad shape sweep verifying depthwise_vec4 (including rolled-ky 3x3 s1/s2
+    * fast paths, odd out_w/out_h, asymmetric padding, 1x1/5x5/dilated kernels,
+    * varied channels, bias/clamp/DUAL_COPY) against an independent scalar CPU
+    * FP32 reference. */
+   static const struct {
+      struct dw_push_layout cfg;
+      bool has_bias_buf;
+      bool with_clamp;
+      bool with_dual_copy;
+   } cases[] = {
+      /* 1x1 spatial (pure single-pixel edge) */
+      { { .channels = 4, .out_w = 1, .out_h = 1, .in_w = 1, .in_h = 1,
+          .ker_w = 3, .ker_h = 3, .pad_x = -1, .pad_y = -1,
+          .str_x = 1, .str_y = 1, .dil_x = 1, .dil_y = 1, .has_bias = 1 },
+        true, true, false },
+      /* Odd 3x5, 3x3 s1 */
+      { { .channels = 12, .out_w = 3, .out_h = 5, .in_w = 3, .in_h = 5,
+          .ker_w = 3, .ker_h = 3, .pad_x = -1, .pad_y = -1,
+          .str_x = 1, .str_y = 1, .dil_x = 1, .dil_y = 1, .has_bias = 1 },
+        true, false, true },
+      /* Odd 9x7, 3x3 s1, asymmetric pad, 24 channels */
+      { { .channels = 24, .out_w = 9, .out_h = 7, .in_w = 10, .in_h = 8,
+          .ker_w = 3, .ker_h = 3, .pad_x = 0, .pad_y = -1,
+          .str_x = 1, .str_y = 1, .dil_x = 1, .dil_y = 1, .has_bias = 1 },
+        true, true, true },
+      /* Even 10x6, 3x3 s2, asymmetric pad */
+      { { .channels = 16, .out_w = 10, .out_h = 6, .in_w = 21, .in_h = 13,
+          .ker_w = 3, .ker_h = 3, .pad_x = -1, .pad_y = 0,
+          .str_x = 2, .str_y = 2, .dil_x = 1, .dil_y = 1, .has_bias = 1 },
+        true, true, false },
+      /* Odd 7x5, 3x3 s2, no bias buffer */
+      { { .channels = 8, .out_w = 7, .out_h = 5, .in_w = 14, .in_h = 10,
+          .ker_w = 3, .ker_h = 3, .pad_x = -1, .pad_y = -1,
+          .str_x = 2, .str_y = 2, .dil_x = 1, .dil_y = 1, .has_bias = 0 },
+        false, false, false },
+      /* 5x5 s1, odd 7x5 */
+      { { .channels = 8, .out_w = 7, .out_h = 5, .in_w = 7, .in_h = 5,
+          .ker_w = 5, .ker_h = 5, .pad_x = -2, .pad_y = -2,
+          .str_x = 1, .str_y = 1, .dil_x = 1, .dil_y = 1, .has_bias = 1 },
+        true, true, false },
+      /* 5x5 s2, even 4x4 */
+      { { .channels = 32, .out_w = 4, .out_h = 4, .in_w = 9, .in_h = 9,
+          .ker_w = 5, .ker_h = 5, .pad_x = -1, .pad_y = -1,
+          .str_x = 2, .str_y = 2, .dil_x = 1, .dil_y = 1, .has_bias = 1 },
+        true, false, true },
+      /* 1x1 s1, odd 5x3 */
+      { { .channels = 16, .out_w = 5, .out_h = 3, .in_w = 5, .in_h = 3,
+          .ker_w = 1, .ker_h = 1, .pad_x = 0, .pad_y = 0,
+          .str_x = 1, .str_y = 1, .dil_x = 1, .dil_y = 1, .has_bias = 1 },
+        true, true, false },
+      /* 3x3 dil=2, odd 7x7 */
+      { { .channels = 12, .out_w = 7, .out_h = 7, .in_w = 7, .in_h = 7,
+          .ker_w = 3, .ker_h = 3, .pad_x = -2, .pad_y = -2,
+          .str_x = 1, .str_y = 1, .dil_x = 2, .dil_y = 2, .has_bias = 1 },
+        true, true, false },
+   };
+
+   const struct hk_nir_clamp_epilogue relu6 = {
+      .has_lower = true, .has_upper = true, .upper_first = false,
+      .lower_bits = 0x00000000u, .upper_bits = 0x40c00000u,
+      .max_fp_math_ctrl = nir_fp_preserve_inf,
+      .min_fp_math_ctrl = nir_fp_preserve_inf,
+   };
+
+   for (unsigned ci = 0; ci < ARRAY_SIZE(cases); ++ci) {
+      const struct dw_push_layout *cfg = &cases[ci].cfg;
+      const struct hk_nir_clamp_epilogue *ep = cases[ci].with_clamp ? &relu6 : NULL;
+      const enum hk_compute_pair_dual_write dw_mode =
+         cases[ci].with_dual_copy ? HK_COMPUTE_PAIR_DUAL_COPY : HK_COMPUTE_PAIR_DUAL_NONE;
+
+      nir_shader *orig = build_depthwise_nir(cases[ci].has_bias_buf, true, 0, 0, 1, 2, 3);
+      struct hk_nir_depthwise_output info = {0};
+      HK_EVAL_CHECK(hk_nir_match_depthwise_output(
+         orig, nir_address_format_64bit_global_32bit_offset, &info));
+      nir_shader *alt = hk_nir_build_depthwise_vec4(orig, &info, ep, dw_mode);
+      HK_EVAL_CHECK(alt != NULL);
+      nir_validate_shader(alt, "dw_shape_sweep");
+
+      const size_t in_n = (size_t)cfg->in_h * cfg->in_w * cfg->channels;
+      const size_t wt_n = (size_t)cfg->ker_h * cfg->ker_w * cfg->channels;
+      const size_t out_n = (size_t)cfg->out_h * cfg->out_w * cfg->channels;
+      float *in_b = calloc(in_n, sizeof(float));
+      float *wt_b = calloc(wt_n, sizeof(float));
+      float *bi_b = calloc(cfg->channels, sizeof(float));
+      float *out_alt = calloc(out_n, sizeof(float));
+      float *out_dup = calloc(out_n, sizeof(float));
+      float *out_ref = calloc(out_n, sizeof(float));
+
+      for (size_t i = 0; i < in_n; ++i)
+         in_b[i] = ((float)((int)((i * 37 + ci * 13) % 29) - 14)) * 0.25f;
+      for (size_t i = 0; i < wt_n; ++i)
+         wt_b[i] = ((float)((int)((i * 19 + ci * 7) % 17) - 8)) * 0.125f;
+      for (int i = 0; i < cfg->channels; ++i)
+         bi_b[i] = ((float)((i % 11) - 5)) * 0.5f;
+
+      /* Independent scalar CPU FP32 reference. */
+      for (int y = 0; y < cfg->out_h; ++y) {
+         for (int x = 0; x < cfg->out_w; ++x) {
+            for (int c = 0; c < cfg->channels; ++c) {
+               float acc = 0.0f;
+               for (int ky = 0; ky < cfg->ker_h; ++ky) {
+                  int iy = y * cfg->str_y + cfg->pad_y + ky * cfg->dil_y;
+                  if (iy < 0 || iy >= cfg->in_h)
+                     continue;
+                  for (int kx = 0; kx < cfg->ker_w; ++kx) {
+                     int ix = x * cfg->str_x + cfg->pad_x + kx * cfg->dil_x;
+                     if (ix < 0 || ix >= cfg->in_w)
+                        continue;
+                     float iv = in_b[((size_t)iy * cfg->in_w + ix) * cfg->channels + c];
+                     float wv = wt_b[((size_t)ky * cfg->ker_w + kx) * cfg->channels + c];
+                     acc = iv * wv + acc;
+                  }
+               }
+               if (cases[ci].has_bias_buf && cfg->has_bias)
+                  acc += bi_b[c];
+               if (ep) {
+                  if (acc < 0.0f) acc = 0.0f;
+                  if (acc > 6.0f) acc = 6.0f;
+               }
+               out_ref[((size_t)y * cfg->out_w + x) * cfg->channels + c] = acc;
+            }
+         }
+      }
+
+      uint8_t push_buf[128] = {0};
+      memcpy(push_buf, cfg, sizeof(*cfg));
+      size_t push_sz = sizeof(*cfg);
+      struct hk_eval_ssbo ssbos[5];
+      unsigned n_ssbos = 0;
+      ssbos[n_ssbos++] = (struct hk_eval_ssbo){ 0, 0, in_b, in_n * 4, 0 };
+      ssbos[n_ssbos++] = (struct hk_eval_ssbo){ 0, 1, wt_b, wt_n * 4, 0 };
+      if (cases[ci].has_bias_buf)
+         ssbos[n_ssbos++] = (struct hk_eval_ssbo){ 0, 2, bi_b, (size_t)cfg->channels * 4, 0 };
+      ssbos[n_ssbos++] = (struct hk_eval_ssbo){ 0, 3, out_alt, out_n * 4, 0 };
+      if (cases[ci].with_dual_copy) {
+         const uint32_t dual_off = hk_dual_write_push_offset(info.push_bytes);
+         const uint64_t dst2_va = hk_eval_make_vaddr(n_ssbos, 0);
+         struct hk_dual_copy_push dp = {
+            .dst2_va_lo = (uint32_t)dst2_va,
+            .dst2_va_hi = (uint32_t)(dst2_va >> 32),
+         };
+         memcpy(push_buf + dual_off, &dp, sizeof(dp));
+         push_sz = dual_off + sizeof(dp);
+         ssbos[n_ssbos++] = (struct hk_eval_ssbo){ 0, 9, out_dup, out_n * 4, 0 };
+      }
+
+      const uint32_t g[3] = {
+         DIV_ROUND_UP(cfg->channels / 4, alt->info.workgroup_size[0]),
+         DIV_ROUND_UP((cfg->out_w + 1) / 2, alt->info.workgroup_size[1]),
+         DIV_ROUND_UP(cfg->out_h, alt->info.workgroup_size[2]),
+      };
+      hk_eval_dispatch(alt, g, ssbos, n_ssbos, push_buf, push_sz);
+
+      for (size_t i = 0; i < out_n; ++i) {
+         HK_EVAL_CHECK(memcmp(&out_alt[i], &out_ref[i], sizeof(float)) == 0);
+         if (cases[ci].with_dual_copy)
+            HK_EVAL_CHECK(memcmp(&out_dup[i], &out_ref[i], sizeof(float)) == 0);
+      }
+
+      free(in_b); free(wt_b); free(bi_b);
+      free(out_alt); free(out_dup); free(out_ref);
+      ralloc_free(alt); ralloc_free(orig);
+   }
+}
+
 int
 main(void)
 {
@@ -2528,6 +2808,8 @@ main(void)
    test_unit_axis_wgid_compute_pair();
    test_gemm_cmat_certify_and_build();
    test_dual_write_fusion();
+   test_fast_udivmod_general();
+   test_depthwise_shape_sweep_cpu_ref();
    glsl_type_singleton_decref();
    printf("test-hk-compute-pair: PASS\n");
    return 0;

@@ -172,9 +172,14 @@ hk_eval_alu(struct hk_eval_env *env, const nir_alu_instr *alu)
             break;
          }
          case nir_op_udiv: {
-            uint32_t a = (uint32_t)s0, b = (uint32_t)s1;
-            HK_EVAL_CHECK(b != 0);
-            r = a / b;
+            if (bs == 64) {
+               HK_EVAL_CHECK(s1 != 0);
+               r = s0 / s1;
+            } else {
+               uint32_t a = (uint32_t)s0, b = (uint32_t)s1;
+               HK_EVAL_CHECK(b != 0);
+               r = a / b;
+            }
             break;
          }
          case nir_op_irem: {
@@ -258,6 +263,22 @@ hk_eval_alu(struct hk_eval_env *env, const nir_alu_instr *alu)
          case nir_op_b2i32:
             r = (s0 & 1) ? 1u : 0u;
             break;
+         case nir_op_find_lsb: {
+            uint32_t v = (uint32_t)s0;
+            r = v ? (uint32_t)__builtin_ctz(v) : 0xffffffffu;
+            break;
+         }
+         case nir_op_ufind_msb: {
+            uint32_t v = (uint32_t)s0;
+            r = v ? (uint32_t)(31 - __builtin_clz(v)) : 0xffffffffu;
+            break;
+         }
+         case nir_op_umul_high:
+            r = (uint32_t)(((uint64_t)(uint32_t)s0 * (uint64_t)(uint32_t)s1) >> 32);
+            break;
+         case nir_op_umul_2x32_64:
+            r = (uint64_t)(uint32_t)s0 * (uint64_t)(uint32_t)s1;
+            break;
          case nir_op_u2u64:
             r = (uint64_t)(uint32_t)s0;
             break;
@@ -319,6 +340,9 @@ hk_eval_alu(struct hk_eval_env *env, const nir_alu_instr *alu)
             break;
          case nir_op_f2i32:
             r = (uint32_t)(int32_t)hk_eval_u2f((uint32_t)s0);
+            break;
+         case nir_op_frcp:
+            r = hk_eval_f2u(1.0f / hk_eval_u2f((uint32_t)s0));
             break;
          case nir_op_f2u32:
             r = (uint32_t)hk_eval_u2f((uint32_t)s0);
