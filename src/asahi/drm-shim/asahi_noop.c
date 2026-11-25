@@ -1533,6 +1533,13 @@ shim_features(void)
       features |= DRM_ASAHI_FEATURE_VM_STATUS;
    if (shim_env_on("ASAHI_SHIM_VM_STATUS_MIRROR"))
       features |= DRM_ASAHI_FEATURE_VM_STATUS_MIRROR;
+   /* An M5 kernel without the compressed multisample ZLS opt-in, as the
+    * M5 Max (J775c) kernel reports its features: its render validation, and
+    * so the M5 submission gate, then refuses a single-layer multisample
+    * render with compressed depth or stencil. */
+   if (shim_env_on("ASAHI_SHIM_NO_M5_MSAA_ZLS_COMPRESSION"))
+      features &= ~(uint64_t)(DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION |
+                              DRM_ASAHI_FEATURE_M5_STENCIL_MSAA_COMPRESSION);
    /* The M6 (G18G) features (bits 31 and 32); only the G18G identity
     * reports them. */
    if (g18g_profile()) {

@@ -617,6 +617,13 @@ agx_gen10_private_compression_allowed(const struct agx_device *dev,
 /* M5 (Gen10) depth: a private, single-level, single-layer 2D depth buffer
  * (including the separated Z32_FLOAT plane of Z32F_S8 and Z24S8),
  * Z32_FLOAT or Z16_UNORM at 1x and Z32_FLOAT at 2x/4x.
+ *
+ * The M5 kernel validates every render's ZLS form. It admits compressed
+ * depth on a single-layer 2x/4x render only when it reports
+ * DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION, and refuses the submission
+ * with EOPNOTSUPP otherwise, so without that bit a multisample depth buffer
+ * stays plain. Borealis checks the same bit
+ * (hk_m5_depth_msaa_compression_eligible()).
  */
 static bool
 agx_gen10_private_depth_compression_allowed(const struct agx_device *dev,
@@ -627,7 +634,9 @@ agx_gen10_private_depth_compression_allowed(const struct agx_device *dev,
          ? templ->format == PIPE_FORMAT_Z32_FLOAT ||
               templ->format == PIPE_FORMAT_Z16_UNORM
          : (templ->nr_samples == 2 || templ->nr_samples == 4) &&
-              templ->format == PIPE_FORMAT_Z32_FLOAT;
+              templ->format == PIPE_FORMAT_Z32_FLOAT &&
+              (dev->params.features &
+               DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION);
 
    return agx_chip_g17_m5(dev->chip) &&
           templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
