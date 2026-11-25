@@ -8681,67 +8681,117 @@ TEST_F(AGX3PackBinary, NegatedHalfZeroCompareCanonicalizes)
 
 TEST_F(AGX3PackBinary, FirefoxFloatIfMinifloatsMaterializeToGroundedRegisters)
 {
-   for (float constant : {1.0f, -10.0f}) {
-      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
-      b->shader->stage = MESA_SHADER_FRAGMENT;
-      b->shader->nir = rzalloc(mem_ctx, nir_shader);
-      b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+   for (enum agx_isa_encoding enc :
+        {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      for (float constant : {1.0f, -10.0f}) {
+         agx_builder *b = builder(enc);
+         b->shader->stage = MESA_SHADER_FRAGMENT;
+         b->shader->nir = rzalloc(mem_ctx, nir_shader);
+         b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
 
-      agx_index source = agx_mov_imm(b, 32, 0x40000000);
-      agx_if_fcmp(b, source, agx_immediate_f(constant), 1, AGX_FCOND_EQ,
-                  false, NULL);
-      agx_stop(b);
+         agx_index source = agx_mov_imm(b, 32, 0x40000000);
+         agx_if_fcmp(b, source, agx_immediate_f(constant), 1, AGX_FCOND_EQ,
+                     false, NULL);
+         agx_stop(b);
 
-      agx_materialize_agx3_cf_constants(b->shader);
+         EXPECT_TRUE(agx_lower_agx3_cf_constants(b->shader));
 
-      uint32_t expected;
-      memcpy(&expected, &constant, sizeof(expected));
-      unsigned matching_constant = 0, compares = 0;
-      agx_foreach_instr_global(b->shader, I) {
-         matching_constant +=
-            I->op == AGX_OPCODE_MOV_IMM && I->imm == expected;
-         if (I->op == AGX_OPCODE_IF_FCMP) {
-            ++compares;
-            EXPECT_EQ(I->src[0].type, AGX_INDEX_NORMAL);
-            EXPECT_EQ(I->src[1].type, AGX_INDEX_NORMAL);
-            EXPECT_EQ(I->src[0].size, AGX_SIZE_32);
-            EXPECT_EQ(I->src[1].size, AGX_SIZE_32);
+         uint32_t expected;
+         memcpy(&expected, &constant, sizeof(expected));
+         unsigned matching_constant = 0, compares = 0;
+         agx_foreach_instr_global(b->shader, I) {
+            matching_constant +=
+               I->op == AGX_OPCODE_MOV_IMM && I->imm == expected;
+            if (I->op == AGX_OPCODE_IF_FCMP) {
+               ++compares;
+               EXPECT_EQ(I->src[0].type, AGX_INDEX_NORMAL);
+               EXPECT_EQ(I->src[1].type, AGX_INDEX_NORMAL);
+               EXPECT_EQ(I->src[0].size, AGX_SIZE_32);
+               EXPECT_EQ(I->src[1].size, AGX_SIZE_32);
+            }
          }
-      }
-      EXPECT_EQ(matching_constant, 1u);
-      EXPECT_EQ(compares, 1u);
+         EXPECT_EQ(matching_constant, 1u);
+         EXPECT_EQ(compares, 1u);
 
-      agx_ra(b->shader);
-      agx_lower_pseudo(b->shader);
-      agx_opt_register_cache(b->shader);
-      EXPECT_FALSE(pack(b).empty());
+         agx_ra(b->shader);
+         agx_lower_pseudo(b->shader);
+         agx_opt_register_cache(b->shader);
+         EXPECT_FALSE(pack(b).empty());
+      }
    }
 }
 
 TEST_F(AGX3PackBinary, NegatedFloatRelationsMaterializeUnsupportedSigns)
 {
-   for (enum agx_fcond cond : {AGX_FCOND_EQ, AGX_FCOND_LTN, AGX_FCOND_GTN,
-                               AGX_FCOND_GE, AGX_FCOND_LE, AGX_FCOND_LT}) {
-      for (unsigned negated : {1u, 2u, 3u}) {
-         agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
-         b->shader->stage = MESA_SHADER_FRAGMENT;
-         b->shader->nir = rzalloc(mem_ctx, nir_shader);
-         b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
-         agx_index a = agx_mov_imm(b, 32, 0x40000000);
-         agx_index c = agx_mov_imm(b, 32, 0x40400000);
-         a.neg = negated & 1;
-         c.neg = negated & 2;
-         agx_instr *cmp = agx_if_fcmp(b, a, c, 1, cond, false, NULL);
-         agx_stop(b);
-         agx_materialize_agx3_cf_constants(b->shader);
+   for (enum agx_isa_encoding enc :
+        {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      for (enum agx_fcond cond : {AGX_FCOND_EQ, AGX_FCOND_LTN, AGX_FCOND_GTN,
+                                  AGX_FCOND_GE, AGX_FCOND_LE, AGX_FCOND_LT}) {
+         for (unsigned negated : {1u, 2u, 3u}) {
+            agx_builder *b = builder(enc);
+            b->shader->stage = MESA_SHADER_FRAGMENT;
+            b->shader->nir = rzalloc(mem_ctx, nir_shader);
+            b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+            agx_index a = agx_mov_imm(b, 32, 0x40000000);
+            agx_index c = agx_mov_imm(b, 32, 0x40400000);
+            a.neg = negated & 1;
+            c.neg = negated & 2;
+            agx_instr *cmp = agx_if_fcmp(b, a, c, 1, cond, false, NULL);
+            agx_stop(b);
+            agx_lower_agx3_cf_constants(b->shader);
 
-         const bool native_negate = cond == AGX_FCOND_LT && negated != 3;
-         EXPECT_EQ(bool(cmp->src[0].neg), native_negate && bool(negated & 1));
-         EXPECT_EQ(bool(cmp->src[1].neg), native_negate && bool(negated & 2));
-         agx_ra(b->shader);
-         agx_lower_pseudo(b->shader);
-         agx_opt_register_cache(b->shader);
-         EXPECT_FALSE(pack(b).empty());
+            EXPECT_FALSE(cmp->src[0].neg && cmp->src[1].neg);
+            if (cond == AGX_FCOND_LT) {
+               /* Single-negate LT stays native; double-negate materializes
+                * src[0] and keeps src[1] negated natively. */
+               EXPECT_EQ(bool(cmp->src[0].neg), negated == 1);
+               EXPECT_EQ(bool(cmp->src[1].neg), negated != 1);
+            } else {
+               EXPECT_FALSE(cmp->src[0].neg);
+               EXPECT_FALSE(cmp->src[1].neg);
+            }
+            agx_ra(b->shader);
+            agx_lower_pseudo(b->shader);
+            agx_opt_register_cache(b->shader);
+            EXPECT_FALSE(pack(b).empty());
+         }
+      }
+   }
+}
+
+TEST_F(AGX3PackBinary, AGX3CPreserveUnarySourceClearsLastUseBit)
+{
+   for (enum agx3_sel_op op :
+        {AGX3_SEL_OP_F_TO_I32, AGX3_SEL_OP_F_TO_U32, AGX3_SEL_OP_I32_TO_F,
+         AGX3_SEL_OP_U32_TO_F, AGX3_SEL_OP_F_RCP}) {
+      struct agx3_sel_instr ins = {};
+      ins.op = op;
+      ins.has_dest = true;
+      ins.dest = 2;
+      ins.dest_size = AGX3_SEL_SIZE_32;
+      ins.nr_srcs = 1;
+      ins.src[0].is_reg = true;
+      ins.src[0].reg = 0;
+      ins.src[0].size = AGX3_SEL_SIZE_32;
+
+      uint8_t dead_bytes[AGX3_SEL_MAX_LENGTH] = {}, live_bytes[AGX3_SEL_MAX_LENGTH] = {};
+      uint8_t dead_len = 0, live_len = 0;
+
+      ins.src[0].live = false;
+      ASSERT_TRUE(agx3_select_encode(AGX_ISA_ENCODING_AGX3C, &ins, dead_bytes, &dead_len));
+      ASSERT_GE(dead_len, 10u);
+
+      ins.src[0].live = true;
+      ASSERT_TRUE(agx3_select_encode(AGX_ISA_ENCODING_AGX3C, &ins, live_bytes, &live_len));
+      ASSERT_EQ(live_len, dead_len);
+
+      /* Live source clears byte 8 bit 5 (last-use) and preserves every other bit. */
+      EXPECT_NE(dead_bytes[8] & 0x20, 0);
+      EXPECT_EQ(live_bytes[8] & 0x20, 0);
+      EXPECT_EQ(live_bytes[8], dead_bytes[8] & ~0x20);
+      for (unsigned i = 0; i < dead_len; ++i) {
+         if (i != 8)
+            EXPECT_EQ(live_bytes[i], dead_bytes[i]);
       }
    }
 }

@@ -1157,7 +1157,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * (agx_gather_device_key). */
    const bool g18g_bringup =
       agx_params_g18g_bringup_supported(&dev->params);
-   if (g18g_bringup)
+   if (g18g_bringup && (dev->debug & AGX_DBG_FAULTTRACE))
       fprintf(stderr, "Experimental M6 G18G integration enabled (M5 paths, agx3d code); rendering is unqualified\n");
    if (!agx_params_driver_supported(&dev->params) && !m5 && !g18g_bringup) {
       if (dev->chip == AGX_CHIP_UNKNOWN) {

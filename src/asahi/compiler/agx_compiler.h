@@ -1329,7 +1329,7 @@ bool agx3_reserve_cube_scratch(agx_context *ctx);
 void agx_lower_uniform_sources(agx_context *ctx);
 void agx_lower_agx3_fma_sources(agx_context *ctx);
 void agx_lower_agx3_immediates(agx_context *ctx);
-void agx_materialize_agx3_cf_constants(agx_context *ctx);
+bool agx_lower_agx3_cf_constants(agx_context *ctx);
 void agx_opt_cse(agx_context *ctx);
 bool agx_opt_collect_split(agx_context *ctx);
 void agx_opt_cse_pressure(agx_context *ctx);

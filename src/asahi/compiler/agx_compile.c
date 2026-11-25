@@ -6583,7 +6583,7 @@ agx_lower_g17g_retry_float_operands(agx_context *ctx)
 /* The native half-width branch encoder supports register/register and
  * register/zero comparisons. Materialize other constants while SSA temporaries
  * can still be allocated; never invent a scratch register in the packer. */
-static bool
+bool
 agx_lower_agx3_cf_constants(agx_context *ctx)
 {
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
@@ -8665,124 +8665,6 @@ agx_lower_agx3_immediates(agx_context *ctx)
       split->dest[0] = I->dest[0];
       split->dest[1] = agx_temp(ctx, AGX_SIZE_16);
       agx_remove_instruction(I);
-   }
-}
-
-void
-agx_materialize_agx3_cf_constants(agx_context *ctx)
-{
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B)
-      return;
-
-   agx_foreach_instr_global_safe(ctx, I) {
-      if ((I->op != AGX_OPCODE_IF_FCMP &&
-           I->op != AGX_OPCODE_WHILE_FCMP &&
-           I->op != AGX_OPCODE_BREAK_IF_FCMP) ||
-          I->nr_srcs != 2)
-         continue;
-
-      /* A half operand compared against a float one reaches here once the
-       * optimizer has propagated the widening into the comparison. Apple's
-       * G17P compiler has no mixed-width control-flow compare: for
-       * `if (f < h)` it widens h with an explicit conversion first, then
-       * compares the f32 pair. Do the same.
-       */
-      for (unsigned s = 0; s < 2; ++s) {
-         if (I->src[s].type != AGX_INDEX_NORMAL ||
-             I->src[s].size != AGX_SIZE_16 ||
-             I->src[s ^ 1].size != AGX_SIZE_32)
-            continue;
-
-         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-         agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-         agx_fmov_to(&b, wide, I->src[s]);
-         I->src[s] = wide;
-      }
-
-      /* The long native ABS compare has no grounded unordered selector.
-       * Ordered GE/LE are represented as an inverted unordered LT/GT, so an
-       * ABS modifier on either input cannot use that encoding point.  Keep
-       * the direct ABS form for EQ/LT/GT, and materialize only the otherwise
-       * unencodable modifier combination as exact IEEE sign-bit operations
-       * before register allocation.  This is also the safe path when ABS and
-       * NEG occur together, since the native modifier forms are disjoint. */
-      const bool unordered_relation =
-         I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN ||
-         I->fcond == AGX_FCOND_GE || I->fcond == AGX_FCOND_LE;
-      const bool has_abs = I->src[0].abs || I->src[1].abs;
-      const bool has_neg = I->src[0].neg || I->src[1].neg;
-      /* Register/register negate is grounded only for strict LT/GT with
-       * one negated source. Keep that form and the independently supported
-       * register/zero comparisons; materialize signs for the remaining
-       * equality, unordered and doubly-negated register predicates. */
-      const bool plain_register_pair =
-         I->src[0].type == AGX_INDEX_NORMAL &&
-         I->src[1].type == AGX_INDEX_NORMAL &&
-         I->src[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_32;
-      const bool native_neg =
-         (I->fcond == AGX_FCOND_LT || I->fcond == AGX_FCOND_GT) &&
-         (I->src[0].neg != I->src[1].neg);
-      if ((has_abs && (unordered_relation || has_neg)) ||
-          (plain_register_pair && has_neg && !native_neg)) {
-         for (unsigned s = 0; s < 2; ++s) {
-            if (I->src[s].type != AGX_INDEX_NORMAL ||
-                I->src[s].size != AGX_SIZE_32 ||
-                (!I->src[s].abs && !I->src[s].neg))
-               continue;
-
-            const bool absolute = I->src[s].abs;
-            const bool negate = I->src[s].neg;
-            agx_index value = I->src[s];
-            value.abs = false;
-            value.neg = false;
-            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-
-            if (absolute) {
-               agx_index mask =
-                  agx_mov_imm(&b, 32, UINT32_C(0x7fffffff));
-               agx_index result = agx_temp(ctx, AGX_SIZE_32);
-               agx_bitop_to(&b, result, value, mask, 0x8 /* AND */);
-               value = result;
-            }
-
-            if (negate) {
-               agx_index sign =
-                  agx_mov_imm(&b, 32, UINT32_C(0x80000000));
-               agx_index result = agx_temp(ctx, AGX_SIZE_32);
-               agx_bitop_to(&b, result, value, sign, 0x6 /* XOR */);
-               value = result;
-            }
-
-            I->src[s] = value;
-         }
-      }
-
-      /* G17P's structured float-CF path is grounded for f32 register pairs
-       * and for literal zero. Firefox's WebRender fragment compares a live
-       * f32 against 1.0 (and later -10.0), which reaches AIR as a nonzero
-       * minifloat. Materialize only that missing register/minifloat axis into
-       * an exact f32 LDIMM before RA; this adds no speculative CF encoding and
-       * leaves the shorter native zero form byte-identical. */
-      for (unsigned s = 0; s < 2; ++s) {
-         const unsigned other = s ^ 1;
-         if (I->src[s].type != AGX_INDEX_IMMEDIATE ||
-             I->src[s].value == 0 ||
-             I->src[other].type == AGX_INDEX_IMMEDIATE ||
-             I->src[other].size != AGX_SIZE_32 || I->src[other].memory ||
-             I->src[other].abs || I->src[other].neg)
-            continue;
-
-         float value = agx_minifloat_decode(I->src[s].value);
-         if (I->src[s].abs)
-            value = fabsf(value);
-         if (I->src[s].neg)
-            value = -value;
-
-         uint32_t bits;
-         memcpy(&bits, &value, sizeof(bits));
-         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-         I->src[s] = agx_mov_imm(&b, 32, bits);
-      }
    }
 }
 

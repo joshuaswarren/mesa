@@ -1070,13 +1070,8 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key,
    image->data.descriptor_set = 0;
    image->data.binding = BINDING_OUTPUT;
    /* Partial tile copies read the destination before preserving its pixels.
-    *
-    * The block-based variant reads the destination back (the else branch's
-    * nir_image_deref_load). Declaring the image write-only makes nir_opt_access
-    * stamp ACCESS_NON_READABLE on that load, which the G17P/G18G indexed-image
-    * lowering declines by design (agx_nir_lower_g17p_combined_sampler.c,
-    * g17p_indexed_image_fetch_shape); the pass is all-or-nothing per shader, so
-    * the load kept its AGX2 bindless handle and the packer refused it. */
+    * The block-based variant issues a nir_image_deref_load on the destination,
+    * so leave it readable; the non-block-based variant only writes to it. */
    image->data.access = key->block_based ? 0 : ACCESS_NON_READABLE;
 
    /* Multisampled stores use a linear PBE view. AGX2's address lowering
