@@ -8371,3 +8371,51 @@ TEST(NativeForms, Agx3bCanonicalMinmaxSkipsFlushUnlessDenormPreserve)
    EXPECT_GT(ftz_instrs, 0u);
    EXPECT_LT(ftz_instrs, preserve_instrs);
 }
+
+TEST(NativeForms, BoundsPassesClearMetadataAcrossPreambleAndMain)
+{
+   /* Both agx_nir_share_bounds (transforms main) and agx_nir_lower_word_bounds
+    * (transforms preamble) run via NIR_PASS after agx_nir_opt_preamble creates
+    * a preamble function. When either pass reports progress, NIR debug
+    * validation checks that every nir_function_impl in shader->functions
+    * cleared its metadata validation flag. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "bounds passes metadata");
+
+   /* Populate the preamble with >= 2 word-aligned constant bounds past 255B so
+    * agx_nir_lower_word_bounds makes progress. */
+   nir_function_impl *pre_impl = nir_shader_get_preamble(b.shader);
+   nir_builder pb = nir_builder_at(nir_before_impl(pre_impl));
+   nir_def *paddr = nir_load_preamble(&pb, 1, 64, .base = 0);
+   nir_def *psize = nir_load_preamble(&pb, 1, 32, .base = 4);
+   nir_def *p0 = nir_load_global(&pb, 1, 32, paddr, .align_mul = 4);
+   nir_def *p1 = nir_load_global(&pb, 1, 32, nir_iadd_imm(&pb, paddr, 4),
+                                 .align_mul = 4);
+   nir_def *c0 = nir_bounds_agx(&pb, p0, nir_imm_int(&pb, 260), psize);
+   nir_def *c1 = nir_bounds_agx(&pb, p1, nir_imm_int(&pb, 264), psize);
+   nir_store_preamble(&pb, nir_iadd(&pb, c0, c1), .base = 8);
+
+   /* Populate main with two aligned robust reads sharing a base offset so
+    * agx_nir_share_bounds makes progress. */
+   nir_def *addr = agx_test_load_preamble(&b, 1, 64, 0);
+   nir_def *size = agx_test_load_preamble(&b, 1, 32, 4);
+   nir_def *raw = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+   nir_def *idx = nir_ishl_imm(&b, raw, 4);
+   nir_def *end0 = nir_uadd_sat(&b, idx, nir_imm_int(&b, 4));
+   nir_def *end1 = nir_uadd_sat(&b, nir_uadd_sat(&b, idx, nir_imm_int(&b, 8)),
+                                nir_imm_int(&b, 4));
+   nir_def *v0 = nir_bounds_agx(&b, raw, end0, size);
+   nir_def *v1 = nir_bounds_agx(&b, raw, end1, size);
+   nir_store_global(&b, nir_iadd(&b, v0, v1), nir_iadd_imm(&b, addr, 16),
+                    .write_mask = 1, .align_mul = 4);
+
+   bool word_progress = false;
+   NIR_PASS(word_progress, b.shader, agx_nir_lower_word_bounds);
+   EXPECT_TRUE(word_progress);
+
+   bool share_progress = false;
+   NIR_PASS(share_progress, b.shader, agx_nir_share_bounds, true);
+   EXPECT_TRUE(share_progress);
+
+   ralloc_free(b.shader);
+}

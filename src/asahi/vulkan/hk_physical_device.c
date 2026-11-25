@@ -247,7 +247,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .KHR_shader_integer_dot_product = true,
       .KHR_shader_maximal_reconvergence = true,
       .KHR_shader_non_semantic_info = true,
-      .KHR_shader_quad_control = true,
+      .KHR_shader_quad_control = agx_chip_has_shader_quad_control(dev->chip),
       .KHR_shader_relaxed_extended_instruction = true,
       .KHR_shader_subgroup_extended_types = true,
       .KHR_shader_subgroup_rotate = true,
@@ -661,7 +661,6 @@ hk_get_device_features(
 
       /* VK_KHR_maintenance9 */
       .maintenance9 = true,
-      .maintenance10 = true,
 
       /* VK_KHR_maintenance10 */
       .maintenance10 = true,
@@ -703,7 +702,7 @@ hk_get_device_features(
       .shaderMaximalReconvergence = true,
 
       /* VK_KHR_shader_quad_control */
-      .shaderQuadControl = true,
+      .shaderQuadControl = supported_extensions->KHR_shader_quad_control,
 
       /* VK_KHR_shader_subgroup_rotate */
       .shaderSubgroupRotate = true,
@@ -1072,11 +1071,6 @@ hk_get_device_features(
        * layer/viewport UVS scalar.  The public bit is backed by the exact
        * two-instance/two-layer image qualification. */
       features->shaderOutputLayer = true;
-      /* G17P uses the common reconvergence and subgroup lowering with AGX3
-       * quad encodings. The execution modes also select helper-capable
-       * fragment entry and prevent merging triangles across derivative quads.
-       */
-      features->shaderQuadControl = dev->chip == AGX_CHIP_G17P;
    }
 
    /* Compute derivatives lower in NIR to quad swaps and explicit-gradient
@@ -2258,11 +2252,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    /* Gen5 adds native component-wise minimum/maximum sampler reduction. */
    supported_extensions.EXT_sampler_filter_minmax =
       agx_chip_sampler_generation(pdev->dev.chip) == AGX_SAMPLER_GENERATION_GEN5;
-
-   if (agx_chip_native_agx3(pdev->dev.chip)) {
-      supported_extensions.KHR_shader_quad_control =
-         pdev->dev.chip == AGX_CHIP_G17P;
-   }
 
    struct vk_features supported_features;
    /* G17P runs mesh shaders natively and task shaders in software. */

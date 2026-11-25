@@ -115,6 +115,33 @@ enum agx_chip_cap {
     * a depth or stencil attachment is bound, so render bounds must be at
     * least the ZLS surface dimensions even for sub-rectangle render areas. */
    AGX_CAP_ZLS_FULL_RENDER_BOUNDS = 1u << 16,
+
+   /* The render ABI supports the native1130 mixed-format single-sample
+    * fragment epilog encoding (skipping empty-mask targets and encoding
+    * per-format partial channel masks natively). Verified on G18G. */
+   AGX_CAP_NATIVE_MIXED_EPILOG = 1u << 17,
+
+   /* HAL200/Gen9 lossless colour and depth/stencil compression in Borealis:
+    * single-sample 1-8B colour (2D, arrays, cubemaps, single-mip 3D), 16B
+    * colour (single-sample 2D, arrays, cubemaps), single-level 1x/2x/4x depth
+    * and 1x stencil, shared DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED colour
+    * images, in-place spill decompression via libagx_agx3_decompress, and Gen9
+    * compressed compute mip blits. Enabled across native HAL200 AGX3B parts
+    * (G16G and G17P), which share the Gen9 PBE/texture/ZLS/AIL metadata
+    * contract; off on G15* (M3, G15/RTKit 2419 CS generation), M5 HAL300
+    * (Gen10, gated separately), G18G, and AGX2. 2x/4x MSAA colour compression
+    * on these parts is gated separately by AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION
+    * so a measurement on one AGX3B part does not imply the other. */
+   AGX_CAP_HAL200_LOSSLESS_COMPRESSION = 1u << 18,
+
+   /* HAL200/Gen9 lossless 2x/4x MSAA colour compression in Borealis: 1-8B
+    * colour attachments (including arrays, input attachments, multiview, and
+    * MRT spills decompressed in place by libagx_agx3_decompress). Qualified on
+    * G17P (A18 Pro, M4 Pro, M4 Max) by the --jobs 4 full-case resolve_image
+    * run; off on G16G until its remaining diff_layout_copy_before_resolving
+    * variants are triaged and qualified. Off on every chip without
+    * AGX_CAP_HAL200_LOSSLESS_COMPRESSION. */
+   AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION = 1u << 19,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -134,7 +161,8 @@ enum agx_chip_cap {
     AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_BINDING |           \
     AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS |    \
     AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN9_2D_COMPRESSION |               \
-    AGX_CAP_MOD3_REG_BANK_RA)
+    AGX_CAP_MOD3_REG_BANK_RA | AGX_CAP_HAL200_LOSSLESS_COMPRESSION |           \
+    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
@@ -161,7 +189,10 @@ enum agx_chip_cap {
    X(G15C, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
    X(G15D, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G16P, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
-   X(G16G, AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE, __VA_ARGS__)             \
+   X(G16G,                                                                     \
+     AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                               \
+        AGX_CAP_HAL200_LOSSLESS_COMPRESSION,                                   \
+     __VA_ARGS__)                                                              \
    X(G16S, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G16C, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G17P, AGX_CAPS_G17P, __VA_ARGS__)                                         \
@@ -169,7 +200,8 @@ enum agx_chip_cap {
    X(G17G, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17S, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17C, AGX_CAPS_M5, __VA_ARGS__)                                           \
-   X(G18G, AGX_CAP_ZLS_FULL_RENDER_BOUNDS, __VA_ARGS__)
+   X(G18G, AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG,       \
+     __VA_ARGS__)
 
 /* Like agx_chip_has_record(), a test of the table expands to comparisons, so
  * the precompiled OpenCL kernels can call it and the C units run the same

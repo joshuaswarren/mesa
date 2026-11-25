@@ -2647,8 +2647,9 @@ agx_get_sr_coverage_native_width_to(agx_builder *b, agx_index dst,
 {
    if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
        sr == AGX_SR_TOTAL_ACTIVE_THREADS_IN_SUBGROUP) {
-      return agx_simd_reduce_to(b, dst,
-                               agx_mov_imm(b, 32, 1), AGX_SIMD_OP_IADD);
+      const unsigned bits = dst.size == AGX_SIZE_16 ? 16 : 32;
+      return agx_simd_reduce_to(b, dst, agx_mov_imm(b, bits, 1),
+                                AGX_SIMD_OP_IADD);
    }
    if (b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
        dst.size == AGX_SIZE_32 &&
@@ -11846,6 +11847,13 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * run 2. agx_compile_shader_nir compiles again with 4 if 8 costs
     * occupancy (AGX3C) or Dynamic Caching register pressure (AGX3B). */
    if (runtime_loop_opts && m5_unroll_factor >= 2) {
+      /* Hoist loop-invariant transcendental (SFU) chains from direct loop
+       * bodies before unrolling so body-size budgets see the true
+       * per-iteration cost while staying strictly inside the 64-half
+       * max-occupancy tier (56-half NIR cap leaves RA headroom). */
+      if (agx3_compute_opts)
+         NIR_PASS(_, nir, agx_nir_opt_licm_direct_sfu, 56);
+
       bool jammed = false;
       if (agx3_compute_opts)
          NIR_PASS(jammed, nir, agx_nir_unroll_and_jam, m5_unroll_factor,
@@ -11904,6 +11912,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (runtime_loop_opts && !checked_offsets) {
       bool merged = false;
       NIR_PASS(merged, nir, agx_nir_merge_global_words);
+      NIR_PASS(merged, nir, agx_nir_hoist_readonly_loop_loads);
       if (merged) {
          NIR_PASS(_, nir, nir_opt_algebraic);
          NIR_PASS(_, nir, nir_opt_cse);
@@ -12426,6 +12435,16 @@ pre_preamble:
       NIR_PASS(late_progress, nir, agx_nir_fold_const_select_alu);
       if (fused_selects)
          NIR_PASS(_, nir, nir_opt_remove_phis);
+      NIR_PASS(_, nir, nir_opt_dce);
+      bool packed_lut = false;
+      NIR_PASS(packed_lut, nir, agx_nir_opt_pack_byte_lut_select);
+      if (packed_lut) {
+         late_progress = true;
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
+         NIR_PASS(_, nir, nir_opt_copy_prop);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
    } else {
       NIR_PASS(late_progress, nir, agx_nir_fuse_selects);
    }
@@ -15114,6 +15133,9 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       agx_print_shader(ctx, stdout);
 
+   if (likely(!(agx_compiler_debug & AGX_DBG_NOOPT)))
+      AGX_PASS(ctx, agx_opt_sink_immediates);
+
    if (likely(!(agx_compiler_debug & AGX_DBG_NOSCHED))) {
       AGX_PASS(ctx, agx_pressure_schedule);
       AGX_PASS(ctx, agx_ilp_schedule);
@@ -16414,7 +16436,8 @@ agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p, bool m5,
 
 static void
 agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_depth,
-                            bool g18g, bool m5, bool chip_g17p, bool post_lower,
+                            bool g18g, bool m5, bool chip_g17p, bool shader_quad_control,
+                            bool post_lower,
                             bool defer_idiv, bool preserve_branches)
 {
    if (!nir)
@@ -16423,7 +16446,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    if (post_lower && agx_nir_has_temp_vars(nir))
       post_lower = false;
 
-   if (g17p)
+   if (shader_quad_control)
       agx_preserve_quad_control(nir);
 
    if (!post_lower) {
@@ -16619,7 +16642,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 void
 agx_preprocess_nir_for_encoding(nir_shader *nir, enum agx_isa_encoding encoding)
 {
-   agx_preprocess_nir_internal(nir, false, false, false, false, false, false,
+   agx_preprocess_nir_internal(nir, false, false, false, false, false, false, false,
                                false, encoding == AGX_ISA_ENCODING_AGX3B);
 }
 
@@ -16633,7 +16656,8 @@ void
 agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip)
 {
    agx_preprocess_nir_internal(
-      nir, true, true, false, false, chip == AGX_CHIP_G17P, false, false,
+      nir, true, true, false, false, chip == AGX_CHIP_G17P,
+      agx_chip_agx3_shader_quad_control(chip), false, false,
       agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B);
 }
 
@@ -16641,7 +16665,8 @@ void
 agx_preprocess_nir_native_defer_idiv(nir_shader *nir, enum agx_chip chip)
 {
    agx_preprocess_nir_internal(
-      nir, true, true, false, false, chip == AGX_CHIP_G17P, false, true,
+      nir, true, true, false, false, chip == AGX_CHIP_G17P,
+      agx_chip_agx3_shader_quad_control(chip), false, true,
       agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B);
 }
 
@@ -16655,7 +16680,7 @@ void
 agx_preprocess_nir_g18g(nir_shader *nir)
 {
    /* Select G18 trig without inheriting G17P subgroup/shared-memory rules. */
-   agx_preprocess_nir_internal(nir, false, false, true, false, false, false,
+   agx_preprocess_nir_internal(nir, false, false, true, false, false, false, false,
                                false, false);
 }
 
@@ -16671,7 +16696,8 @@ agx_preprocess_nir_post_lower(nir_shader *nir, enum agx_chip chip)
       agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B;
 
    agx_preprocess_nir_internal(nir, g17p, native_fragment_depth, g18g, m5,
-                               chip_g17p, true, false, preserve_branches);
+                               chip_g17p, agx_chip_agx3_shader_quad_control(chip),
+                               true, false, preserve_branches);
 }
 
 static bool
@@ -18646,7 +18672,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
     * modes survive that gather and must still reach the AGX3 entry protocol
     * and the draw-time triangle-merge control, even without a surviving quad
     * intrinsic. Keep the AGX2 compilation path unchanged. */
-   if (key->dev.chip == AGX_CHIP_G17P && key->dev.shader_quad_control)
+   if (key->dev.shader_quad_control)
       agx_preserve_quad_control(nir);
 
    agx_compiler_debug = agx_get_compiler_debug();
@@ -18868,9 +18894,10 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       nir->options = &agx3_options;
    }
 
-   /* The AGX3 packer admits SR 34/36 only on AGX3B and in these stages
-    * (agx3_pack_binary.c, GET_SR_COVERAGE); a geometry or tessellation
-    * evaluation shader with a uniform-address atomic would fail to compile.
+   /* The AGX3B packer admits SR 34/36 in the stages below; AGX3C admits SR 34
+    * across non-fragment subgroup stages and lowers TOTAL_ACTIVE_THREADS via
+    * simd_reduce (fragment stays excluded because simd_reduce includes helper
+    * lanes after discard).
     */
    const mesa_shader_stage stage = nir->info.stage;
    const bool uniform_atomics =
@@ -18878,7 +18905,15 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       (is_agx3b && (stage == MESA_SHADER_COMPUTE ||
                    stage == MESA_SHADER_VERTEX ||
                    stage == MESA_SHADER_TESS_CTRL ||
-                   stage == MESA_SHADER_FRAGMENT));
+                   stage == MESA_SHADER_FRAGMENT)) ||
+      (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !key->dev.emit_agx3d &&
+       (stage == MESA_SHADER_COMPUTE ||
+        stage == MESA_SHADER_VERTEX ||
+        stage == MESA_SHADER_TESS_CTRL ||
+        stage == MESA_SHADER_GEOMETRY ||
+        stage == MESA_SHADER_MESH ||
+        stage == MESA_SHADER_TASK));
 
    if (!pre_preamble_optimized) {
       /* Apple's G17P loops are a
@@ -19686,13 +19721,13 @@ agx_compile_shader_nir_preoptimized(nir_shader *nir, struct agx_shader_key *key,
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
+   agx_preprocess_nir_internal(nir, false, true, false, true, false, true, false,
                                false, false);
 }
 
 void
 agx_preprocess_nir_m5_defer_idiv(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
+   agx_preprocess_nir_internal(nir, false, true, false, true, false, true, false,
                                true, false);
 }

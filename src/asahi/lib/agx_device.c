@@ -2085,6 +2085,6 @@ agx_gather_device_key(struct agx_device *dev)
       .needs_g13x_coherency = u_tristate_make(g13x_coh),
       .soft_fault = agx_has_soft_fault(dev),
       .emit_agx3d = g18g,
-      .shader_quad_control = dev->chip == AGX_CHIP_G17P,
+      .shader_quad_control = agx_chip_agx3_shader_quad_control(chip),
    };
 }

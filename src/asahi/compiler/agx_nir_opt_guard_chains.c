@@ -1011,11 +1011,28 @@ hoist_independent_blocks_in_list(struct exec_list *list)
 }
 
 static bool
+cf_list_has_no_loops(const struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_loop)
+         return false;
+      if (node->type == nir_cf_node_if) {
+         const nir_if *nif = nir_cf_node_as_if(node);
+         if (!cf_list_has_no_loops(&nif->then_list) ||
+             !cf_list_has_no_loops(&nif->else_list))
+            return false;
+      }
+   }
+   return true;
+}
+
+static bool
 if_body_is_coalesce_candidate(nir_if *nif)
 {
    if (nif->control == nir_selection_control_dont_flatten ||
-       !exec_list_is_singular(&nif->then_list) ||
+       list_is_single_empty_block(&nif->then_list) ||
        !list_is_single_empty_block(&nif->else_list) ||
+       !cf_list_has_no_loops(&nif->then_list) ||
        !nir_src_is_divergent(&nif->condition))
       return false;
 
@@ -1111,11 +1128,88 @@ trace_all_false_value(nir_def *def, nir_if *const *ifs,
    return NULL;
 }
 
-/* Wrap adjacent expensive one-sided divergent `if`s (with only phis between
- * them and all conditions defined before the first `if`) in a combined guard
- * `if (c0 | c1 | ... | c_{k-1})`. */
 static bool
-coalesce_adjacent_ifs_in_list(nir_builder *b, struct exec_list *list)
+instr_is_pure_mid_cond_prep(const nir_instr *instr)
+{
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+   case nir_instr_type_undef:
+      return true;
+   case nir_instr_type_alu: {
+      const nir_op op = nir_instr_as_alu(instr)->op;
+      switch (op) {
+      case nir_op_idiv:
+      case nir_op_udiv:
+      case nir_op_imod:
+      case nir_op_umod:
+      case nir_op_irem:
+         return false;
+      default:
+         return true;
+      }
+   }
+   case nir_instr_type_intrinsic: {
+      const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      return intr->intrinsic == nir_intrinsic_load_preamble ||
+             intr->intrinsic == nir_intrinsic_load_push_constant;
+   }
+   default:
+      return false;
+   }
+}
+
+struct mid_src_check {
+   nir_block *prev_block;
+   struct set *hoisted_defs;
+   bool ok;
+};
+
+static bool
+check_mid_src_dominates(nir_src *src, void *data)
+{
+   struct mid_src_check *st = data;
+   nir_def *def = src->ssa;
+   if (_mesa_set_search(st->hoisted_defs, def))
+      return true;
+   if (nir_block_dominates(nir_def_block(def), st->prev_block))
+      return true;
+   st->ok = false;
+   return false;
+}
+
+/* Check whether all non-phi instructions in `mid` are pure condition-prep ops
+ * whose sources dominate `prev_block` (or earlier hoisted mid instructions),
+ * appending them to `hoist_instrs` and their defs to `hoisted_defs`. */
+static bool
+collect_pure_mid_instrs(nir_block *mid, nir_block *prev_block,
+                        struct set *hoisted_defs,
+                        struct util_dynarray *hoist_instrs)
+{
+   unsigned non_phi = 0;
+   nir_foreach_instr(instr, mid) {
+      if (instr->type == nir_instr_type_phi)
+         continue;
+      if (++non_phi > 16 || !instr_is_pure_mid_cond_prep(instr))
+         return false;
+      struct mid_src_check sc = {prev_block, hoisted_defs, true};
+      nir_foreach_src(instr, check_mid_src_dominates, &sc);
+      if (!sc.ok)
+         return false;
+      nir_def *def = nir_instr_def(instr);
+      if (!def)
+         return false;
+      _mesa_set_add(hoisted_defs, def);
+      util_dynarray_append(hoist_instrs, instr);
+   }
+   return true;
+}
+
+/* Wrap adjacent expensive one-sided divergent `if`s (with only phis and pure
+ * condition-prep ops between them and all conditions computable before the
+ * first `if`) in a combined guard `if (c0 | c1 | ... | c_{k-1})`. */
+static bool
+coalesce_adjacent_ifs_in_list(nir_function_impl *impl, nir_builder *b,
+                              struct exec_list *list)
 {
    bool progress = false;
 
@@ -1123,11 +1217,11 @@ coalesce_adjacent_ifs_in_list(nir_builder *b, struct exec_list *list)
    foreach_list_typed(nir_cf_node, node, node, list) {
       if (node->type == nir_cf_node_if) {
          nir_if *nif = nir_cf_node_as_if(node);
-         progress |= coalesce_adjacent_ifs_in_list(b, &nif->then_list);
-         progress |= coalesce_adjacent_ifs_in_list(b, &nif->else_list);
+         progress |= coalesce_adjacent_ifs_in_list(impl, b, &nif->then_list);
+         progress |= coalesce_adjacent_ifs_in_list(impl, b, &nif->else_list);
       } else if (node->type == nir_cf_node_loop) {
          nir_loop *loop = nir_cf_node_as_loop(node);
-         progress |= coalesce_adjacent_ifs_in_list(b, &loop->body);
+         progress |= coalesce_adjacent_ifs_in_list(impl, b, &loop->body);
       }
    }
 
@@ -1155,28 +1249,44 @@ coalesce_adjacent_ifs_in_list(nir_builder *b, struct exec_list *list)
       mids[0] = nir_cf_node_as_block(nir_cf_node_next(&first_if->cf_node));
       k = 1;
 
+      struct set *hoisted_defs = _mesa_pointer_set_create(NULL);
+      struct util_dynarray hoist_instrs = UTIL_DYNARRAY_INIT;
+
       while (k < MAX_GROUP_IFS) {
          nir_block *mid = mids[k - 1];
-         if (!block_is_phis_only(mid))
-            break;
          nir_cf_node *next_node = nir_cf_node_next(&mid->cf_node);
          if (!next_node || next_node->type != nir_cf_node_if)
             break;
          nir_if *next_if = nir_cf_node_as_if(next_node);
          if (!if_body_is_coalesce_candidate(next_if))
             break;
-         /* Condition must be defined before first_if (not a phi in mids[]). */
-         nir_block *cond_blk = nir_def_block(next_if->condition.ssa);
-         bool cond_in_chain = false;
-         for (unsigned j = 0; j < k; ++j) {
-            if (cond_blk == mids[j] ||
-                block_inside_cf_node(cond_blk, &ifs[j]->cf_node)) {
-               cond_in_chain = true;
-               break;
-            }
-         }
-         if (cond_in_chain)
+
+         const unsigned saved_hoist =
+            util_dynarray_num_elements(&hoist_instrs, nir_instr *);
+         if (!block_is_phis_only(mid) &&
+             !collect_pure_mid_instrs(mid, prev_block, hoisted_defs,
+                                      &hoist_instrs)) {
+            nir_instr **arr = util_dynarray_begin(&hoist_instrs);
+            const unsigned cur_n =
+               util_dynarray_num_elements(&hoist_instrs, nir_instr *);
+            for (unsigned j = saved_hoist; j < cur_n; ++j)
+               _mesa_set_remove_key(hoisted_defs, nir_instr_def(arr[j]));
+            hoist_instrs.size = saved_hoist * sizeof(nir_instr *);
             break;
+         }
+
+         /* Condition must dominate `prev_block` or be hoisted into it. */
+         nir_def *cond_def = next_if->condition.ssa;
+         if (!_mesa_set_search(hoisted_defs, cond_def) &&
+             !nir_block_dominates(nir_def_block(cond_def), prev_block)) {
+            nir_instr **arr = util_dynarray_begin(&hoist_instrs);
+            const unsigned cur_n =
+               util_dynarray_num_elements(&hoist_instrs, nir_instr *);
+            for (unsigned j = saved_hoist; j < cur_n; ++j)
+               _mesa_set_remove_key(hoisted_defs, nir_instr_def(arr[j]));
+            hoist_instrs.size = saved_hoist * sizeof(nir_instr *);
+            break;
+         }
 
          ifs[k] = next_if;
          mids[k] = nir_cf_node_as_block(nir_cf_node_next(&next_if->cf_node));
@@ -1184,6 +1294,8 @@ coalesce_adjacent_ifs_in_list(nir_builder *b, struct exec_list *list)
       }
 
       if (k < 2) {
+         _mesa_set_destroy(hoisted_defs, NULL);
+         util_dynarray_fini(&hoist_instrs);
          node = nir_cf_node_next(node);
          continue;
       }
@@ -1244,11 +1356,25 @@ coalesce_adjacent_ifs_in_list(nir_builder *b, struct exec_list *list)
       }
 
       if (!ok) {
+         _mesa_set_destroy(hoisted_defs, NULL);
+         util_dynarray_fini(&hoist_instrs);
          util_dynarray_fini(&esc_phis);
          util_dynarray_fini(&esc_inits);
          node = &mids[k - 1]->cf_node;
          continue;
       }
+
+      /* Hoist pure condition-prep instructions from mids[0..k-2] into
+       * prev_block so all `ifs[0..k-1]` conditions are ready before `outer`
+       * and every intermediate block is phis-only. */
+      util_dynarray_foreach(&hoist_instrs, nir_instr *, ip) {
+         nir_instr *instr = *ip;
+         exec_node_remove(&instr->node);
+         instr->block = prev_block;
+         exec_list_push_tail(&prev_block->instr_list, &instr->node);
+      }
+      _mesa_set_destroy(hoisted_defs, NULL);
+      util_dynarray_fini(&hoist_instrs);
 
       /* Build combined condition `c0 | c1 | ... | c_{k-1}` at end of prev_block. */
       b->cursor = nir_after_block(prev_block);
@@ -1301,6 +1427,9 @@ coalesce_adjacent_ifs_in_list(nir_builder *b, struct exec_list *list)
       util_dynarray_fini(&esc_inits);
 
       progress = true;
+      nir_progress(true, impl, nir_metadata_none);
+      nir_metadata_require(impl, nir_metadata_dominance |
+                                    nir_metadata_divergence);
       node = &outer_merge->cf_node;
    }
 
@@ -1327,8 +1456,9 @@ agx_nir_opt_guard_chains(nir_shader *shader)
          nir_progress(true, impl, nir_metadata_none);
       }
 
-      nir_metadata_require(impl, nir_metadata_divergence);
-      if (coalesce_adjacent_ifs_in_list(&b, &impl->body)) {
+      nir_metadata_require(impl, nir_metadata_dominance |
+                                    nir_metadata_divergence);
+      if (coalesce_adjacent_ifs_in_list(impl, &b, &impl->body)) {
          impl_progress = true;
          nir_progress(true, impl, nir_metadata_none);
       }
