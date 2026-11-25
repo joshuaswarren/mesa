@@ -17849,7 +17849,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * imageBuffer read). Retire the live generations on the grounded
              * identity carrier before issuing the existing barrier pair. */
             const bool g18g_texture_barrier = ctx->key->dev.emit_agx3d &&
-               I->imm == AGX3_BARRIER_SCOPE_TEXTURE;
+               (I->imm == AGX3_BARRIER_SCOPE_TEXTURE ||
+                I->imm == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT ||
+                I->imm == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP);
             /* Image-write slots are assigned by the staging allocator after
              * the general scheduler. A device fence must also complete these
              * issued writes, which the scheduler's drain cannot see. */

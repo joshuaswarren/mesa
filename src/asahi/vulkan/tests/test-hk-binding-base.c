@@ -65,7 +65,8 @@ lower_for_agx_passes(nir_shader *s, struct hk_descriptor_set_layout *layout)
 {
    struct vk_descriptor_set_layout *layouts[1] = {&layout->vk};
    CHECK(hk_nir_lower_descriptors(s, &vk_robustness_disabled, 1, layouts, false,
-                                  false, 0, false, false, false, false, false));
+                                  false, 0, false, false, false, false, false,
+                                  false));
    NIR_PASS(_, s, nir_lower_explicit_io, nir_var_mem_ssbo,
             hk_buffer_addr_format(
                VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT, false,

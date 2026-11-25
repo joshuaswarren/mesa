@@ -199,14 +199,15 @@ enum agx_chip_record {
     AGX_RECORD_PPP_HAL300_DEPTH_BIAS_SCISSOR |                                 \
     AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY | AGX_RECORD_CDM_SECONDARY_BARRIER)
 
-/* G18G has the records its J873 native captures contain. The codecs of the
- * other G15-G17 records refuse it: the VDM stream link and tessellate codecs
- * because no capture contains the record, the rest as their lists stood
- * before this table (see each codec). */
+/* G18G has the records its J873 native captures contain plus the direct 8-byte
+ * HAL300 VDM stream link verified on J873g hardware. The tessellate codec
+ * still refuses it because no capture contains that record, and the rest stay
+ * as their lists stood before this table (see each codec). */
 #define AGX_RECORDS_G18G                                                       \
    (AGX_RECORD_VDM_STATE | AGX_RECORD_VDM_PPP_STATE | AGX_RECORD_VDM_BARRIER | \
-    AGX_RECORD_VDM_STREAM_TERMINATE | AGX_RECORD_PPP_VIEWPORT |                \
-    AGX_RECORD_PPP_W_CLAMP_CULL2 | AGX_RECORD_PPP_HAL300_DEPTH_STENCIL |       \
+    AGX_RECORD_VDM_STREAM_LINK | AGX_RECORD_VDM_STREAM_TERMINATE |             \
+    AGX_RECORD_PPP_VIEWPORT | AGX_RECORD_PPP_W_CLAMP_CULL2 |                   \
+    AGX_RECORD_PPP_HAL300_DEPTH_STENCIL |                                      \
     AGX_RECORD_PPP_HAL300_DEPTH_BIAS_SCISSOR | AGX_RECORD_CDM_LAUNCH |         \
     AGX_RECORD_CDM_INDIRECT_LAUNCH | AGX_RECORD_CDM_INDIRECT_LAUNCH_36 |       \
     AGX_RECORD_CDM_BARRIER | AGX_RECORD_HAL300_NATIVE_CAPTURE)
@@ -986,6 +987,16 @@ agx_chip_start_stamps_ordered(enum agx_chip chip)
  * threadgroups of consecutive launches run side by side. */
 static inline bool
 agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
+{
+   return agx_chip_native_or_m5(chip);
+}
+
+/* Whether the Borealis graphics path supplies the depth/stencil feedback-loop
+ * shader twin (hk_fbl_twin()) and draw-time dynamic transition
+ * (hk_select_fbl_fs()) required for VK_EXT_attachment_feedback_loop_dynamic_state.
+ * Shared across native AGX3 (G15/G16/G17P) and M5 (G17G/G17S/G17C). */
+static inline bool
+agx_chip_has_feedback_loop_dynamic_state(enum agx_chip chip)
 {
    return agx_chip_native_or_m5(chip);
 }

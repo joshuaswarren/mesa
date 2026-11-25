@@ -171,8 +171,8 @@ static unsigned checks;
    ROW(agx_vdm_barrier_core_supported(c), "0000 01111 0111 10111 1 0")         \
    ROW(agx_vdm_barrier_core_word(c, false) == AGX_VDM_BARRIER_CORE_PLAIN,      \
        "0000 00110 0100 00000 0 0")                                            \
-   ROW(agx_vdm_stream_link_core_supported(c), "0000 01111 0111 10111 0 0")     \
-   ROW(agx_chip_vdm_stream_link_supported(c), "1111 01111 0111 10111 0 0")     \
+   ROW(agx_vdm_stream_link_core_supported(c), "0000 01111 0111 10111 1 0")     \
+   ROW(agx_chip_vdm_stream_link_supported(c), "1111 01111 0111 10111 1 0")     \
    ROW(agx_vdm_stream_terminate_core_supported(c),                             \
        "0000 01111 0111 10111 1 0")                                            \
    ROW(agx_vdm_tessellate_direct_target_supported(c),                          \

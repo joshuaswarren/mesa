@@ -2620,15 +2620,25 @@ test_gemm_cmat_guarded_specialize_and_shape_sweep(void)
    };
 
    /* Tile selection unit coverage. */
-   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(1,   1,  true, true, true) == 16);
-   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(16,  64, true, true, true) == 16);
-   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(17,  64, true, true, true) == 32);
-   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(32,  64, true, true, true) == 32);
-   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(33,  64, true, true, true) == 64);
-   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(64,  31, true, true, true) == 32);
-   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(64,  32, true, true, true) == 64);
-   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(96,  64, true, true, true) == 32);
-   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(128, 32, true, true, true) == 64);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(4096, 1,   1,   true, true, true) == 16);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(4096, 16,  64,  true, true, true) == 16);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(4096, 17,  64,  true, true, true) == 32);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(4096, 32,  64,  true, true, true) == 32);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(4096, 33,  64,  true, true, true) == 64);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(4096, 64,  31,  true, true, true) == 32);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(4096, 64,  32,  true, true, true) == 64);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(4096, 96,  64,  true, true, true) == 32);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(4096, 128, 32,  true, true, true) == 64);
+   /* Small-grid high-K selection favors cmat16 for higher workgroup occupancy. */
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(400,  32,  576, true, true, true) == 16);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(400,  64,  576, true, true, true) == 16);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(800,  64,  128, true, true, true) == 16);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(800,  64,  96,  true, true, true) == 64);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(864,  64,  128, true, true, true) == 16);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(928,  64,  576, true, true, true) == 64);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(1600, 32,  576, true, true, true) == 16);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(1600, 64,  576, true, true, true) == 64);
+   HK_EVAL_CHECK(hk_gemm_cmat_select_tile_n(400,  32,  32,  true, true, true) == 32);
 
    /* Guarded producer -> *_UNGUARDED specialization predicate and NIR-eval at
     * exact multiples and multiple-minus-1 for M, N, and K across all tiles. */
@@ -2690,8 +2700,8 @@ test_gemm_cmat_guarded_specialize_and_shape_sweep(void)
       { 64, 96, 32, 0, true  },
    };
    for (unsigned i = 0; i < ARRAY_SIZE(sweep); ++i) {
-      const uint32_t tn = hk_gemm_cmat_select_tile_n(sweep[i].n, sweep[i].k,
-                                                     true, true, true);
+      const uint32_t tn = hk_gemm_cmat_select_tile_n(sweep[i].m, sweep[i].n,
+                                                     sweep[i].k, true, true, true);
       const bool ug = hk_gemm_cmat_can_specialize_unguarded(
          true, sweep[i].m, sweep[i].n, sweep[i].k, tn, 0, 0, 0);
       eval_compare_gemm_cpu_and_guarded_specialize(

@@ -2510,8 +2510,10 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                                          cs->render_resources.data,
                                          cs->render_resources.size);
             }
-            struct drm_asahi_cmd_render_with_prior cmd = {0};
+            struct drm_asahi_cmd_render_with_prior cmd;
             asahi_fill_vdm_command(dev, cs, &cmd.legacy);
+            cmd.prior_vdm = 0;
+            cmd.prior_cdm = 0;
             if (ts_carrier && cs == uts_cs) {
                cmd.legacy.ts_vtx.start.handle = 0;
                cmd.legacy.ts_vtx.start.offset = 0;
@@ -3011,6 +3013,8 @@ struct hk_pack_fuse_plan {
    enum hk_compute_pair_dual_write dual_write;
    uint8_t span;
    uint8_t dual_idx_off;
+   uint8_t copy_idx_off;
+   uint8_t fadd_res_idx;
    bool is_self_copy;
    bool suppressed;
 };
@@ -3321,6 +3325,108 @@ compute_pair_pad4_match(const struct hk_compute_pair_dispatch *producer,
    return true;
 }
 
+static bool
+compute_pair_gemm_fadd_match(const struct hk_compute_pair_dispatch *producer,
+                             const struct hk_compute_pair_dispatch *fadd,
+                             const struct hk_compute_pair_dispatch *copy4,
+                             uint8_t *res_idx_out, bool *inplace_out)
+{
+   if (!producer || !fadd || !producer->producer || !producer->root_va ||
+       producer->info.role != HK_COMPUTE_PAIR_GEMM ||
+       !hk_compute_pair_alt_is_gemm_cmat(producer->alt_kind) ||
+       fadd->info.role != HK_COMPUTE_PAIR_FADD)
+      return false;
+
+   const struct hk_compute_pair_copy4 *fc = &fadd->extra.copy4;
+   if (fc->src_start != 0 || fc->dst_start != 0 || !fc->bytes ||
+       !fadd->bindings[0].address || !fadd->bindings[1].address ||
+       !fadd->bindings[2].address)
+      return false;
+
+   const struct hk_nir_gemm_output *p = &producer->info.gemm;
+   struct hk_nir_direct_shape ps = {producer->push, sizeof(producer->push)};
+   memcpy(ps.groups, producer->groups, sizeof(ps.groups));
+   uint64_t p_end[4] = {0};
+   if (!hk_nir_gemm_producer_footprint(p, &ps, p_end, NULL, NULL))
+      return false;
+
+   struct hk_compute_pair_interval output, src0, src1, fadd_dst;
+   if (!compute_pair_interval(&producer->bindings[3], p->output.offset_B, p_end[3], &output) ||
+       !compute_pair_interval(&fadd->bindings[0], 0, fc->bytes, &src0) ||
+       !compute_pair_interval(&fadd->bindings[1], 0, fc->bytes, &src1) ||
+       !compute_pair_interval(&fadd->bindings[2], 0, fc->bytes, &fadd_dst))
+      return false;
+
+   uint8_t res_idx = 0;
+   struct hk_compute_pair_interval res;
+   if (compute_pair_same_interval(&output, &src0) &&
+       compute_pair_intervals_disjoint(&output, &src1)) {
+      res_idx = 1;
+      res = src1;
+   } else if (compute_pair_same_interval(&output, &src1) &&
+              compute_pair_intervals_disjoint(&output, &src0)) {
+      res_idx = 0;
+      res = src0;
+   } else {
+      return false;
+   }
+
+   const bool inplace = compute_pair_same_interval(&output, &fadd_dst);
+   const bool res_inplace = compute_pair_same_interval(&res, &fadd_dst);
+   if (!inplace && !res_inplace &&
+       (!compute_pair_intervals_disjoint(&output, &fadd_dst) ||
+        !compute_pair_intervals_disjoint(&res, &fadd_dst)))
+      return false;
+
+   if ((fadd->bindings[res_idx].address % 4) != 0 ||
+       (fadd->bindings[2].address % 4) != 0)
+      return false;
+
+   const uint32_t need_extra = copy4 ? sizeof(struct hk_dual_fadd_push)
+                                     : (inplace ? 8u : 16u);
+   if (hk_dual_write_push_offset(p->push_bytes) + need_extra > HK_MAX_PUSH_SIZE)
+      return false;
+
+   struct hk_compute_pair_interval copy_dst = {0};
+   if (copy4) {
+      if (copy4->info.role != HK_COMPUTE_PAIR_COPY4)
+         return false;
+      const struct hk_compute_pair_copy4 *cp = &copy4->extra.copy4;
+      if (!copy4->bindings[1].address ||
+          copy4->bindings[1].address > UINT64_MAX - cp->dst_start ||
+          cp->src_start > UINT64_MAX - cp->bytes ||
+          cp->dst_start > UINT64_MAX - cp->bytes ||
+          ((copy4->bindings[1].address + cp->dst_start) % 4) != 0)
+         return false;
+      struct hk_compute_pair_interval copy_src;
+      if (!compute_pair_interval(&copy4->bindings[0], cp->src_start,
+                                 cp->src_start + cp->bytes, &copy_src) ||
+          !compute_pair_interval(&copy4->bindings[1], cp->dst_start,
+                                 cp->dst_start + cp->bytes, &copy_dst) ||
+          !compute_pair_same_interval(&fadd_dst, &copy_src) ||
+          !compute_pair_intervals_disjoint(&output, &copy_dst) ||
+          !compute_pair_intervals_disjoint(&res, &copy_dst) ||
+          !compute_pair_intervals_disjoint(&fadd_dst, &copy_dst))
+         return false;
+   }
+
+   for (unsigned i = 0; i < 3; ++i) {
+      if (i == 2 && p_end[2] == 0)
+         continue;
+      struct hk_compute_pair_interval read;
+      if (!compute_pair_interval(&producer->bindings[i], p->reads[i].offset_B,
+                                 p_end[i], &read) ||
+          !compute_pair_intervals_disjoint(&read, &output) ||
+          !compute_pair_intervals_disjoint(&read, &fadd_dst) ||
+          (copy4 && !compute_pair_intervals_disjoint(&read, &copy_dst)))
+         return false;
+   }
+
+   *res_idx_out = res_idx;
+   *inplace_out = inplace;
+   return true;
+}
+
 static void
 hk_pack_fold_attachments(struct hk_cs *cs, const struct hk_cs *item)
 {
@@ -3443,6 +3549,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
 
             enum hk_compute_pair_dual_write dual = HK_COMPUTE_PAIR_DUAL_NONE;
             unsigned dual_idx = 0;
+            unsigned copy_idx = 0;
+            uint8_t fadd_res_idx = 0;
             if (k_after_self < end && members[k_after_self].cs &&
                 hk_compute_pair_stream_eligible(members[k_after_self].cs)) {
                const struct hk_compute_pair_dispatch *d =
@@ -3455,6 +3563,33 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                           compute_pair_pad4_match(p, d)) {
                   dual = HK_COMPUTE_PAIR_DUAL_PAD4;
                   dual_idx = k_after_self;
+               } else if (d->info.role == HK_COMPUTE_PAIR_FADD) {
+                  bool inplace = false;
+                  unsigned k_after_fadd = k_after_self + 1;
+                  while (k_after_fadd < end && k_after_fadd - k_after_self < 8 &&
+                         members[k_after_fadd].cs &&
+                         hk_compute_pair_stream_eligible(members[k_after_fadd].cs) &&
+                         members[k_after_fadd].cs->compute_pair->info.role ==
+                            HK_COMPUTE_PAIR_SELF_COPY) {
+                     k_after_fadd++;
+                  }
+                  const struct hk_compute_pair_dispatch *d2 =
+                     (k_after_fadd < end && members[k_after_fadd].cs &&
+                      hk_compute_pair_stream_eligible(members[k_after_fadd].cs) &&
+                      members[k_after_fadd].cs->compute_pair->info.role ==
+                         HK_COMPUTE_PAIR_COPY4)
+                        ? members[k_after_fadd].cs->compute_pair
+                        : NULL;
+                  if (d2 && compute_pair_gemm_fadd_match(p, d, d2, &fadd_res_idx, &inplace)) {
+                     dual = inplace ? HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE
+                                    : HK_COMPUTE_PAIR_DUAL_FADD_COPY_OUT;
+                     dual_idx = k_after_self;
+                     copy_idx = k_after_fadd;
+                  } else if (compute_pair_gemm_fadd_match(p, d, NULL, &fadd_res_idx, &inplace)) {
+                     dual = inplace ? HK_COMPUTE_PAIR_DUAL_FADD_INPLACE
+                                    : HK_COMPUTE_PAIR_DUAL_FADD_OUT;
+                     dual_idx = k_after_self;
+                  }
                }
             }
 
@@ -3469,6 +3604,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                if (ep && dual != HK_COMPUTE_PAIR_DUAL_NONE) {
                   dual = HK_COMPUTE_PAIR_DUAL_NONE;
                   dual_idx = 0;
+                  copy_idx = 0;
                   fused = hk_compute_pair_get_or_compile_fused(
                      dev, p->producer, ep, p->alt_kind, HK_COMPUTE_PAIR_DUAL_NONE);
                   if (!fused || !hk_fused_compute_shader_eligible(dev, fused, p))
@@ -3478,14 +3614,17 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                }
             }
 
+            const unsigned end_idx = copy_idx ? copy_idx : dual_idx;
             const unsigned span =
-               dual != HK_COMPUTE_PAIR_DUAL_NONE ? (dual_idx - i + 1) : 2u;
+               dual != HK_COMPUTE_PAIR_DUAL_NONE ? (end_idx - i + 1) : 2u;
             plans[i] = (struct hk_pack_fuse_plan){
                .shader = fused,
                .dual_write = dual,
                .span = (uint8_t)span,
                .dual_idx_off = dual != HK_COMPUTE_PAIR_DUAL_NONE
                                   ? (uint8_t)(dual_idx - i) : 0,
+               .copy_idx_off = copy_idx ? (uint8_t)(copy_idx - i) : 0,
+               .fadd_res_idx = fadd_res_idx,
             };
             fused_cand_count++;
             if (dual != HK_COMPUTE_PAIR_DUAL_NONE)
@@ -3666,6 +3805,39 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                                     pd->pad_idx[2], pd->pad_idx[3]},
                      };
                      memcpy(rt->push + dual_off, &dp, sizeof(dp));
+                  } else if (hk_compute_pair_dual_is_fadd(pl->dual_write)) {
+                     const uint64_t out_va =
+                        p_disp->bindings[3].address + p_disp->info.gemm.output.offset_B;
+                     const uint64_t res_va =
+                        d_disp->bindings[pl->fadd_res_idx].address + d_disp->extra.copy4.src_start;
+                     const uint64_t dst1_va =
+                        d_disp->bindings[2].address + d_disp->extra.copy4.dst_start;
+                     const uint64_t res_delta = res_va - out_va;
+                     const uint64_t dst1_delta = dst1_va - out_va;
+                     uint64_t dst2_delta = 0;
+                     if (pl->copy_idx_off) {
+                        const struct hk_cmd_buffer *c_src =
+                           (const void *)submit->command_buffers[idx + pl->copy_idx_off];
+                        const struct hk_cs *c_cs =
+                           list_first_entry(&c_src->control_streams, struct hk_cs, node);
+                        const struct hk_compute_pair_dispatch *c_disp = c_cs->compute_pair;
+                        const uint64_t dst2_va =
+                           c_disp->bindings[1].address + c_disp->extra.copy4.dst_start;
+                        dst2_delta = dst2_va - out_va;
+                     }
+                     const bool inplace =
+                        pl->dual_write == HK_COMPUTE_PAIR_DUAL_FADD_INPLACE ||
+                        pl->dual_write == HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE;
+                     struct hk_dual_fadd_push dp = {
+                        .res_delta_lo = (uint32_t)res_delta,
+                        .res_delta_hi = (uint32_t)(res_delta >> 32),
+                        .dst1_delta_lo = (uint32_t)dst1_delta,
+                        .dst1_delta_hi = (uint32_t)(dst1_delta >> 32),
+                        .dst2_delta_lo = (uint32_t)dst2_delta,
+                        .dst2_delta_hi = (uint32_t)(dst2_delta >> 32),
+                     };
+                     const size_t dp_sz = pl->copy_idx_off ? sizeof(dp) : (inplace ? 8u : 16u);
+                     memcpy(rt->push + dual_off, &dp, dp_sz);
                   } else {
                      root_ok = false;
                   }

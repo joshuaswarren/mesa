@@ -21,6 +21,15 @@ libagx_copy_uint4(global uint4 *dest, global uint4 *src)
    dest[cl_global_id.x] = src[cl_global_id.x];
 }
 
+KERNEL(32)
+libagx_copy_uint(global uint32_t *dest, global uint32_t *src)
+{
+   assert((((uintptr_t)dest) & 0x3) == 0);
+   assert((((uintptr_t)src) & 0x3) == 0);
+
+   dest[cl_global_id.x] = src[cl_global_id.x];
+}
+
 KERNEL(16)
 libagx_copy_uchar(global uint8_t *dest, global uint8_t *src)
 {
@@ -126,8 +135,39 @@ libagx_copy_image(global uint8_t *dest, global uint8_t *src,
       src_x_el + x, src_y_el + y, src_pitch_B, src_tiles_per_row,
       src_tile_width_log2, src_tile_height_log2, blocksize_B, src_tiled);
 
-   for (uint b = 0; b < blocksize_B; ++b)
-      dest[dest_offset_B + b] = src[src_offset_B + b];
+   global uint8_t *d = dest + dest_offset_B;
+   global uint8_t *s = src + src_offset_B;
+   uintptr_t align = (uintptr_t)d | (uintptr_t)s;
+
+   if (blocksize_B == 16 && (align & 15) == 0) {
+      *(global uint4 *)d = *(global uint4 *)s;
+   } else if (blocksize_B == 8 && (align & 7) == 0) {
+      *(global uint2 *)d = *(global uint2 *)s;
+   } else if (blocksize_B == 4 && (align & 3) == 0) {
+      *(global uint32_t *)d = *(global uint32_t *)s;
+   } else if (blocksize_B == 2 && (align & 1) == 0) {
+      *(global uint16_t *)d = *(global uint16_t *)s;
+   } else if (blocksize_B == 1) {
+      *d = *s;
+   } else if ((blocksize_B & 15) == 0 && (align & 15) == 0) {
+      global uint4 *d4 = (global uint4 *)d;
+      global uint4 *s4 = (global uint4 *)s;
+      for (uint i = 0; i < (blocksize_B >> 4); ++i)
+         d4[i] = s4[i];
+   } else if ((blocksize_B & 3) == 0 && (align & 3) == 0) {
+      global uint32_t *d1 = (global uint32_t *)d;
+      global uint32_t *s1 = (global uint32_t *)s;
+      for (uint i = 0; i < (blocksize_B >> 2); ++i)
+         d1[i] = s1[i];
+   } else if ((blocksize_B & 1) == 0 && (align & 1) == 0) {
+      global uint16_t *d2 = (global uint16_t *)d;
+      global uint16_t *s2 = (global uint16_t *)s;
+      for (uint i = 0; i < (blocksize_B >> 1); ++i)
+         d2[i] = s2[i];
+   } else {
+      for (uint b = 0; b < blocksize_B; ++b)
+         d[b] = s[b];
+   }
 }
 
 /* Round an unsigned four-sample average like G17P's linear sampler followed
