@@ -242,6 +242,13 @@ check_draw_elision(void)
    };
    void *fs_disc = pctx->create_fs_state(pctx, &fs_disc_cso);
 
+   /* The fullscreen triangle has no vertex inputs, but the driver links the
+    * VS prolog from the bound vertex elements state on every draw, as any
+    * Gallium frontend guarantees one is bound. */
+   void *ve = pctx->create_vertex_elements_state(pctx, 0, NULL);
+   CHECK(ve);
+   pctx->bind_vertex_elements_state(pctx, ve);
+
    struct pipe_resource *rt0 = create_rt(screen, 128, 64, 1);
    struct pipe_resource *rt1 = create_rt(screen, 128, 64, 1);
    struct pipe_resource *rt_ms = create_rt(screen, 128, 64, 4);
@@ -304,6 +311,12 @@ check_draw_elision(void)
    /* Negative: blending enabled keeps reload. */
    struct pipe_blend_state blend_on = base_bl;
    blend_on.rt[0].blend_enable = true;
+   blend_on.rt[0].rgb_func = PIPE_BLEND_ADD;
+   blend_on.rt[0].rgb_src_factor = PIPE_BLENDFACTOR_SRC_ALPHA;
+   blend_on.rt[0].rgb_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
+   blend_on.rt[0].alpha_func = PIPE_BLEND_ADD;
+   blend_on.rt[0].alpha_src_factor = PIPE_BLENDFACTOR_SRC_ALPHA;
+   blend_on.rt[0].alpha_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
    CHECK((run_first_draw_case(pctx, rt0, NULL, vs, fs0, &base_rs, &blend_on,
                               &base_zs, &base_vp, &full_ss, 0xf, 3) &
           PIPE_CLEAR_COLOR0) != 0);
@@ -333,6 +346,8 @@ check_draw_elision(void)
                               &base_zs, &base_vp, &full_ss, 0x3, 3) &
           PIPE_CLEAR_COLOR0) != 0);
 
+   pctx->bind_vertex_elements_state(pctx, NULL);
+   pctx->delete_vertex_elements_state(pctx, ve);
    pctx->bind_vs_state(pctx, NULL);
    pctx->bind_fs_state(pctx, NULL);
    pctx->delete_vs_state(pctx, vs);
