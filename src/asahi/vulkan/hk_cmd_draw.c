@@ -6323,6 +6323,14 @@ hk_draw_without_restart(struct hk_cmd_buffer *cmd, struct agx_draw draw,
                                     false /* restart */);
 }
 
+static struct hk_cs *
+hk_refresh_pre_gfx_cs(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   if (hk_cmd_buffer_device(cmd)->dev.chip != AGX_CHIP_G18G)
+      return cs;
+   return hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+}
+
 static __attribute__((hot)) struct agx_draw
 hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                      struct agx_draw draw)
@@ -6399,11 +6407,9 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    /* Launch the vertex shader first */
    if (agx_chip_agx3_path(dev->dev.chip)) {
-      if (cs->g18_dispatch_sealed) {
-         cs = hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
-         if (!cs)
-            return (struct agx_draw){0};
-      }
+      cs = hk_refresh_pre_gfx_cs(cmd, cs);
+      if (!cs)
+         return (struct agx_draw){0};
       hk_dispatch_with_local_size(cmd, cs, vs, grid_vs, wg);
    } else {
       hk_reserve_scratch(cmd, cs, vs);
@@ -6434,11 +6440,9 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       /* If we need counts, launch the count shader and prefix sum the results. */
       if (count_words) {
          perf_debug(dev, "Geometry shader count");
-         if (cs->g18_dispatch_sealed) {
-            cs = hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
-            if (!cs)
-               return (struct agx_draw){0};
-         }
+         cs = hk_refresh_pre_gfx_cs(cmd, cs);
+         if (!cs)
+            return (struct agx_draw){0};
          hk_dispatch_with_local_size(cmd, cs, count, grid_gs, wg);
       }
 
@@ -6450,21 +6454,17 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
       /* Transform feedback / query program */
       perf_debug(dev, "Transform feedback / geometry query");
-      if (cs->g18_dispatch_sealed) {
-         cs = hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
-         if (!cs)
-            return (struct agx_draw){0};
-      }
+      cs = hk_refresh_pre_gfx_cs(cmd, cs);
+      if (!cs)
+         return (struct agx_draw){0};
       hk_dispatch_with_local_size(cmd, cs, pre_gs, agx_1d(1),
                                   agx_workgroup(1, 1, 1));
    }
 
    /* Pre-rast geometry shader */
-   if (cs->g18_dispatch_sealed) {
-      cs = hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
-      if (!cs)
-         return (struct agx_draw){0};
-   }
+   cs = hk_refresh_pre_gfx_cs(cmd, cs);
+   if (!cs)
+      return (struct agx_draw){0};
    hk_dispatch_with_local_size(cmd, cs, main, grid_gs, wg);
 
    if (poly_gs_indexed(count->info.gs.shape)) {
@@ -6594,18 +6594,14 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       hk_launch_tess_batched(cmd, vs, tcs, grid_vs, grid_tcs, grid_tess, info,
                              state);
    } else if (agx_chip_agx3_path(dev->dev.chip)) {
-      if (cs->g18_dispatch_sealed) {
-         cs = hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
-         if (!cs)
-            return (struct agx_draw){0};
-      }
+      cs = hk_refresh_pre_gfx_cs(cmd, cs);
+      if (!cs)
+         return (struct agx_draw){0};
       hk_dispatch_with_local_size(cmd, cs, vs, grid_vs,
                                   agx_workgroup(64, 1, 1));
-      if (cs->g18_dispatch_sealed) {
-         cs = hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
-         if (!cs)
-            return (struct agx_draw){0};
-      }
+      cs = hk_refresh_pre_gfx_cs(cmd, cs);
+      if (!cs)
+         return (struct agx_draw){0};
       hk_dispatch_with_local_size(
          cmd, cs, tcs, grid_tcs,
          agx_workgroup(tcs->info.tess.tcs_output_patch_size, 1, 1));
@@ -14967,6 +14963,9 @@ hk_dispatch_task_kernel(struct hk_cmd_buffer *cmd, struct hk_shader *task,
                         pool_entries ? 0 : hk_heap(cmd), draw_id,
                         conditional && cmd->state.conditional.inverted);
    }
+   ccs = hk_refresh_pre_gfx_cs(cmd, ccs);
+   if (!ccs)
+      return;
    const uint16_t *wg = task->b.info.workgroup_size;
    struct agx_grid task_grid = gpu_setup
       ? agx_grid_indirect(record + offsetof(struct libagx_task_record, dispatch))
@@ -14980,7 +14979,8 @@ hk_dispatch_task_kernel(struct hk_cmd_buffer *cmd, struct hk_shader *task,
     * (hk_cdm_alias_scope_unpatched()). */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const bool alias_scope = hk_cdm_alias_scope_unpatched(dev);
-   if (hk_cdm_visibility_flush_needed(dev, ccs, alias_scope)) {
+   if (!ccs->g18_dispatch_sealed &&
+       hk_cdm_visibility_flush_needed(dev, ccs, alias_scope)) {
       hk_ensure_cs_has_space(cmd, ccs, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_visibility_flush(dev, ccs, alias_scope);
    }

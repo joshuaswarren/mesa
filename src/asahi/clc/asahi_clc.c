@@ -423,6 +423,9 @@ target_supports_program(const char *target, const nir_function *func)
            * heap allocation and global stores into the task record. */
           (!strcmp(target, "g17p") &&
            !strcmp(func->name, "libagx_task_setup")) ||
+          (!strcmp(target, "g18g") &&
+           (!strcmp(func->name, "libagx_g18_noop") ||
+            !strcmp(func->name, "libagx_g18_indirect_launch"))) ||
           !strcmp(func->name, "libagx_draw_robust_index") ||
           !strcmp(func->name, "libagx_draw_robust_index_batch") ||
           !strcmp(func->name, "libagx_unroll_restart") ||

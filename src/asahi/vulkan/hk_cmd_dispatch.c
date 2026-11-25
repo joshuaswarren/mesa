@@ -2817,12 +2817,17 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                      linked->b.agx3_spectpr_scratch_size))
          : 0;
    const uint32_t max_spill = g18 ? (1u << 16) : AGX3_G17P_MAX_SPILL_B;
+   const bool g18_indirect = g18 && agx_is_indirect(grid);
+   const bool sparse_indirect =
+      g18_indirect && !internal &&
+      cmd->state.cs.descriptors.root.cs.grid_helper_sparse_map_addr != 0;
    if ((!g18 && dev->dev.chip != AGX_CHIP_G17G) || cs->type != HK_CS_CDM ||
        (g18 && cs->g18_dispatch_sealed) ||
        !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked, max_spill) ||
        (!g18 && (internal || s->b.info.local_size)) ||
        (internal && s->info.stage != MESA_SHADER_VERTEX && s->data_size) ||
-       agx_is_indirect(grid) ||
+       (!g18 && agx_is_indirect(grid)) ||
+       (g18_indirect && (!grid.ptr || sparse_indirect)) ||
        s->b.info.uses_ray_traversal ||
        (g18 && (s->b.info.nr_preamble_gprs ||
                 scratch_bytes > max_spill ||
@@ -2831,8 +2836,9 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        s->info.agx3_txf_texture_valid ||
        (s->info.agx3_storage_image_valid && !g18) ||
        s->info.agx3_sampled_storage_valid || s->info.agx3_indexed_storage_valid ||
-       !local_size.x || !local_size.y || !local_size.z ||
-       (uint64_t)local_size.x * local_size.y * local_size.z > 1024) {
+       (grid.mode != AGX_CDM_MODE_INDIRECT_LOCAL &&
+        (!local_size.x || !local_size.y || !local_size.z ||
+         (uint64_t)local_size.x * local_size.y * local_size.z > 1024))) {
       mesa_loge(
          "AGX3 native compute: unsupported shader or indirect/shared-memory launch"
          " (stage=%u indirect=%u scratch %u/%u, spectpr scratch %u, preamble GPRs %u,"
@@ -2845,7 +2851,8 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   if (!grid.count[0] || !grid.count[1] || !grid.count[2])
+   if (!agx_is_indirect(grid) &&
+       (!grid.count[0] || !grid.count[1] || !grid.count[2]))
       return;
 
    struct hk_descriptor_state *descriptors =
@@ -3083,6 +3090,34 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    hk_cmd_buffer_retain_bo(cmd, linked->b.bo);
    if (s->b.info.rodata.size_16)
       hk_cmd_buffer_retain_bo(cmd, s->bo);
+
+   if (g18_indirect) {
+      if (s->b.info.local_size)
+         launch.launch_template.word0 |= UINT32_C(1) << 23;
+      const uint32_t main_scratch =
+         MAX2(s->b.info.scratch_size, linked->b.scratch_size);
+      const uint32_t spectpr_scratch =
+         MAX2(s->b.info.agx3_spectpr_scratch_size,
+              linked->b.agx3_spectpr_scratch_size);
+      const struct drm_asahi_g18_compute_resources target_res = {
+         .version = 2,
+         .flags = 1u,
+         .registers_16 = linked->b.nr_gprs,
+         .scratch_bytes = main_scratch,
+         .spectpr_scratch_bytes = spectpr_scratch,
+         .staging_16 = s->b.info.agx3_staging_halfs,
+         .local_bytes = s->b.info.local_size,
+         .imageblock_stride = s->b.info.imageblock_stride,
+         .local_size = {local_size.x, local_size.y, local_size.z},
+      };
+      struct hk_cs **target =
+         cs == cmd->current_cs.pre_gfx    ? &cmd->current_cs.pre_gfx
+         : cs == cmd->current_cs.post_gfx ? &cmd->current_cs.post_gfx
+                                          : &cmd->current_cs.cs;
+      hk_g18_emit_indirect_launch(cmd, target, &launch, grid, local_size,
+                                  &target_res);
+      return;
+   }
 
    /* (rel28b: the native-path homogeneity seal is REVERTED — batching mixed
  * descriptors is where the 3.4x came from; only the precomp helper is

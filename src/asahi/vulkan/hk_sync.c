@@ -977,6 +977,7 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       cs->sync.seq = st->next_seq;
    } else if (pre_gfx) {
       cs->sync.seq = gfx->sync.seq - 1;
+      cs->sync.pre_seq = ++gfx->sync.pre_count;
    } else {
       cs->sync.seq = ++st->next_seq;
    }
