@@ -1239,3 +1239,50 @@ TEST(Interchange, ModifierSupport)
       }
    }
 }
+
+TEST(Tilebuffer, G18GNativeMixedEpilogMask)
+{
+   enum pipe_format rgba8[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+   };
+   struct agx_tilebuffer_layout tib =
+      agx_build_tilebuffer_layout_resident(rgba8, 3, 1, false, 64, 65536, 2048,
+                                           0);
+   EXPECT_EQ(agx_g18g_word_mrt_mask(&tib), 0x7u);
+   EXPECT_EQ(agx_g18g_native_mixed_mask(&tib), 0u);
+   EXPECT_EQ(agx_g18g_native_mixed_epilog_mask(&tib), 0x7u);
+
+   /* Non-native1130 formats (e.g. sRGB) stay excluded. */
+   enum pipe_format srgb[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R8G8B8A8_SRGB,
+      PIPE_FORMAT_R8G8B8A8_SRGB,
+      PIPE_FORMAT_R8G8B8A8_SRGB,
+   };
+   struct agx_tilebuffer_layout srgb_tib =
+      agx_build_tilebuffer_layout_resident(srgb, 3, 1, false, 64, 65536, 2048,
+                                           0);
+   EXPECT_EQ(agx_g18g_native_mixed_epilog_mask(&srgb_tib), 0u);
+
+   /* Layered and multisample layouts stay excluded. */
+   struct agx_tilebuffer_layout layered_tib =
+      agx_build_tilebuffer_layout_resident(rgba8, 3, 1, true, 32, 32768, 2048,
+                                           0);
+   EXPECT_EQ(agx_g18g_native_mixed_epilog_mask(&layered_tib), 0u);
+
+   struct agx_tilebuffer_layout msaa_tib =
+      agx_build_tilebuffer_layout_resident(rgba8, 3, 4, false, 64, 65536, 2048,
+                                           0);
+   EXPECT_EQ(agx_g18g_native_mixed_epilog_mask(&msaa_tib), 0u);
+
+   /* Genuine mixed layouts match both masks. */
+   enum pipe_format mixed[AGX_MAX_RENDER_TARGETS] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R16G16B16A16_FLOAT,
+   };
+   struct agx_tilebuffer_layout mixed_tib =
+      agx_build_tilebuffer_layout_g18_mixed(mixed, 2);
+   EXPECT_EQ(agx_g18g_native_mixed_mask(&mixed_tib), 0x3u);
+   EXPECT_EQ(agx_g18g_native_mixed_epilog_mask(&mixed_tib), 0x3u);
+}

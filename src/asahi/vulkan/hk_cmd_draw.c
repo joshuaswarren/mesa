@@ -12112,10 +12112,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    key->epilog.first_mask = in->tib->first_mask;
    key->epilog.max_bytes_per_tile = in->tib->max_bytes_per_tile;
    key->epilog.max_samples_per_tile = in->tib->max_samples_per_tile;
-   key->epilog.g18_native_mixed =
-      dev->dev.chip == AGX_CHIP_G18G &&
-      agx_g18g_native_mixed_mask(in->tib) != 0;
-
+   bool has_masked_rt = false;
    for (uint32_t i = 0; i < in->color_att_count; i++) {
       const VkFormat format = *(const VkFormat *)(
          (const uint8_t *)in->color_formats + i * in->color_formats_stride);
@@ -12137,6 +12134,8 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
          &dyn->cb.attachments[i];
       bool write_enable = dyn->cb.color_write_enables & BITFIELD_BIT(i);
       unsigned write_mask = write_enable ? cb->write_mask : 0;
+      if (format != VK_FORMAT_UNDEFINED && write_mask != BITFIELD_MASK(4))
+         has_masked_rt = true;
 
       if (agx_chip_native_agx3(dev->dev.chip) && !write_enable) {
          key->epilog.preserve_rt |= BITFIELD_BIT(i);
@@ -12177,6 +12176,19 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
          };
       }
    }
+
+   /* Single-sample G18 word-MRT layouts whose formats all belong to the
+    * native1130 set share the exact same tile layout (offsets and sample size)
+    * as native1130. When a draw carries a partial or empty write mask (for
+    * example dynamic colorWriteEnable=false alongside a partial channel mask),
+    * use the native1130 epilog path so empty-mask targets are skipped instead
+    * of emitting preserve_zero_mask reloads that mix loads with partial
+    * stores on 3+ targets. */
+   key->epilog.g18_native_mixed =
+      dev->dev.chip == AGX_CHIP_G18G &&
+      (agx_g18g_native_mixed_mask(in->tib) != 0 ||
+       (has_masked_rt && agx_g18g_word_mrt_mask(in->tib) != 0 &&
+        agx_g18g_native_mixed_epilog_mask(in->tib) != 0));
 
    if (fs && fs->local_read_nir && agx_chip_local_read_tilebuffer(dev->dev.chip) &&
        !key->epilog.native_spills && !key->epilog.blend.logicop_enable &&
