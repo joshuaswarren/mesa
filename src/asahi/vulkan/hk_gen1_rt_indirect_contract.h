@@ -21,11 +21,10 @@ struct hk_gen1_rt_indirect_contract {
    uint32_t as_table_bytes;
 };
 
-/* Same resident-window contract as the direct Gen1 candidate-query path.
- * This deliberately does not equate logical launch invocations with physical
- * SCS slots. Firmware's Gen1 window word carries96 cliques; shaders address
- * SR59-resident slots through warp/lane, irrespective of indirect dimensions.
- * Indirect RT remains a default-off hardware diagnostic, not qualification.
+/* Same resident-window contract as the direct Gen1 candidate-query path:
+ * firmware's Gen1 window word carries 96 cliques and shaders address
+ * SR59-resident slots by warp/lane, independent of logical launch dimensions.
+ * Indirect RT remains default-off.
  */
 static inline bool
 hk_gen1_rt_indirect_contract_init(uint64_t packed,

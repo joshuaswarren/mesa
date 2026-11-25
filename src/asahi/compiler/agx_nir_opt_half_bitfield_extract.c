@@ -28,6 +28,11 @@
  * Keeping the mask at 16 bits avoids agx_nir_fold_extract16_bfe turning it
  * back into an IC-pipe bfeil while preserving single-instruction bfeil when
  * the result feeds non-widening consumers.
+ *
+ * p is one 32-bit component, of a scalar or of a vector: once
+ * nir_opt_load_store_vectorize has merged a run of word loads (a row of
+ * packed RGBA8 texels read from shared memory, say), each word is a channel
+ * of one vec4 load and every extract reads it through a swizzle.
  */
 
 static bool
@@ -101,7 +106,13 @@ all_uses_fold_u16_zext(const nir_def *def)
 }
 
 static bool
-match_lo_shifted_extract(nir_instr *instr, nir_def **src_out,
+is_word(nir_scalar s)
+{
+   return s.def->bit_size == 32;
+}
+
+static bool
+match_lo_shifted_extract(nir_instr *instr, nir_scalar *src_out,
                          unsigned *shift_out, unsigned *bits_out)
 {
    if (instr->type != nir_instr_type_alu)
@@ -115,13 +126,13 @@ match_lo_shifted_extract(nir_instr *instr, nir_def **src_out,
       nir_scalar s0 = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), 0);
       nir_scalar s1 = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), 1);
       nir_scalar s2 = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), 2);
-      if (s0.def->num_components != 1 || s0.def->bit_size != 32 ||
-          !nir_scalar_is_const(s1) || !nir_scalar_is_const(s2))
+      if (!is_word(s0) || !nir_scalar_is_const(s1) ||
+          !nir_scalar_is_const(s2))
          return false;
       unsigned k = nir_scalar_as_uint(s1);
       unsigned w = nir_scalar_as_uint(s2);
       if (k >= 1 && k <= 15 && w >= 1 && w <= 8) {
-         *src_out = s0.def;
+         *src_out = s0;
          *shift_out = k;
          *bits_out = w;
          return true;
@@ -132,9 +143,9 @@ match_lo_shifted_extract(nir_instr *instr, nir_def **src_out,
    if (alu->op == nir_op_extract_u8) {
       nir_scalar s0 = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), 0);
       nir_scalar s1 = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), 1);
-      if (s0.def->num_components == 1 && s0.def->bit_size == 32 &&
-          nir_scalar_is_const(s1) && nir_scalar_as_uint(s1) == 1) {
-         *src_out = s0.def;
+      if (is_word(s0) && nir_scalar_is_const(s1) &&
+          nir_scalar_as_uint(s1) == 1) {
+         *src_out = s0;
          *shift_out = 8;
          *bits_out = 8;
          return true;
@@ -158,13 +169,12 @@ match_lo_shifted_extract(nir_instr *instr, nir_def **src_out,
 
          nir_scalar p = nir_scalar_chase_alu_src(sh, 0);
          nir_scalar ks = nir_scalar_chase_alu_src(sh, 1);
-         if (p.def->num_components != 1 || p.def->bit_size != 32 ||
-             !nir_scalar_is_const(ks))
+         if (!is_word(p) || !nir_scalar_is_const(ks))
             continue;
 
          unsigned k = nir_scalar_as_uint(ks) & 31u;
          if (k >= 1 && k <= 15) {
-            *src_out = p.def;
+            *src_out = p;
             *shift_out = k;
             *bits_out = w;
             return true;
@@ -176,7 +186,14 @@ match_lo_shifted_extract(nir_instr *instr, nir_def **src_out,
 }
 
 static bool
-match_hi_extract(nir_instr *instr, nir_def *p, unsigned k, unsigned *bits_out)
+same_scalar(nir_scalar a, nir_scalar b)
+{
+   return a.def == b.def && a.comp == b.comp;
+}
+
+static bool
+match_hi_extract(nir_instr *instr, nir_scalar p, unsigned k,
+                 unsigned *bits_out)
 {
    if (instr->type != nir_instr_type_alu)
       return false;
@@ -191,7 +208,7 @@ match_hi_extract(nir_instr *instr, nir_def *p, unsigned k, unsigned *bits_out)
    if (alu->op == nir_op_ushr) {
       nir_scalar s0 = nir_scalar_chase_alu_src(root, 0);
       nir_scalar s1 = nir_scalar_chase_alu_src(root, 1);
-      if (s0.def == p && s0.comp == 0 && nir_scalar_is_const(s1) &&
+      if (same_scalar(s0, p) && nir_scalar_is_const(s1) &&
           (nir_scalar_as_uint(s1) & 31u) == k + 16u) {
          *bits_out = rem;
          return true;
@@ -203,7 +220,7 @@ match_hi_extract(nir_instr *instr, nir_def *p, unsigned k, unsigned *bits_out)
       nir_scalar s0 = nir_scalar_chase_alu_src(root, 0);
       nir_scalar s1 = nir_scalar_chase_alu_src(root, 1);
       nir_scalar s2 = nir_scalar_chase_alu_src(root, 2);
-      if (s0.def != p || s0.comp != 0 || !nir_scalar_is_const(s1) ||
+      if (!same_scalar(s0, p) || !nir_scalar_is_const(s1) ||
           !nir_scalar_is_const(s2))
          return false;
       if (nir_scalar_as_uint(s1) != k + 16u)
@@ -223,7 +240,7 @@ match_hi_extract(nir_instr *instr, nir_def *p, unsigned k, unsigned *bits_out)
    if (k == 8 && alu->op == nir_op_extract_u8) {
       nir_scalar s0 = nir_scalar_chase_alu_src(root, 0);
       nir_scalar s1 = nir_scalar_chase_alu_src(root, 1);
-      if (s0.def == p && s0.comp == 0 && nir_scalar_is_const(s1) &&
+      if (same_scalar(s0, p) && nir_scalar_is_const(s1) &&
           nir_scalar_as_uint(s1) == 3) {
          *bits_out = 8;
          return true;
@@ -235,7 +252,7 @@ match_hi_extract(nir_instr *instr, nir_def *p, unsigned k, unsigned *bits_out)
 }
 
 static bool
-match_hi16_masked_extract(nir_instr *instr, nir_def **src_out,
+match_hi16_masked_extract(nir_instr *instr, nir_scalar *src_out,
                           unsigned *bits_out)
 {
    if (instr->type != nir_instr_type_alu)
@@ -251,12 +268,11 @@ match_hi16_masked_extract(nir_instr *instr, nir_def **src_out,
       nir_scalar s0 = nir_scalar_chase_alu_src(root, 0);
       nir_scalar s1 = nir_scalar_chase_alu_src(root, 1);
       nir_scalar s2 = nir_scalar_chase_alu_src(root, 2);
-      if (s0.def->num_components == 1 && s0.def->bit_size == 32 &&
-          nir_scalar_is_const(s1) && nir_scalar_is_const(s2) &&
+      if (is_word(s0) && nir_scalar_is_const(s1) && nir_scalar_is_const(s2) &&
           nir_scalar_as_uint(s1) == 16) {
          unsigned w = nir_scalar_as_uint(s2);
          if (w >= 1 && w <= 8) {
-            *src_out = s0.def;
+            *src_out = s0;
             *bits_out = w;
             return true;
          }
@@ -267,9 +283,9 @@ match_hi16_masked_extract(nir_instr *instr, nir_def **src_out,
    if (alu->op == nir_op_extract_u8) {
       nir_scalar s0 = nir_scalar_chase_alu_src(root, 0);
       nir_scalar s1 = nir_scalar_chase_alu_src(root, 1);
-      if (s0.def->num_components == 1 && s0.def->bit_size == 32 &&
-          nir_scalar_is_const(s1) && nir_scalar_as_uint(s1) == 2) {
-         *src_out = s0.def;
+      if (is_word(s0) && nir_scalar_is_const(s1) &&
+          nir_scalar_as_uint(s1) == 2) {
+         *src_out = s0;
          *bits_out = 8;
          return true;
       }
@@ -292,9 +308,9 @@ match_hi16_masked_extract(nir_instr *instr, nir_def **src_out,
          if (op == nir_op_extract_u16) {
             nir_scalar p = nir_scalar_chase_alu_src(hi, 0);
             nir_scalar idx = nir_scalar_chase_alu_src(hi, 1);
-            if (p.def->num_components == 1 && p.def->bit_size == 32 &&
-                nir_scalar_is_const(idx) && nir_scalar_as_uint(idx) == 1) {
-               *src_out = p.def;
+            if (is_word(p) && nir_scalar_is_const(idx) &&
+                nir_scalar_as_uint(idx) == 1) {
+               *src_out = p;
                *bits_out = w;
                return true;
             }
@@ -303,8 +319,8 @@ match_hi16_masked_extract(nir_instr *instr, nir_def **src_out,
             if (nir_scalar_is_alu(unp) &&
                 nir_scalar_alu_op(unp) == nir_op_unpack_32_2x16_split_y) {
                nir_scalar p = nir_scalar_chase_alu_src(unp, 0);
-               if (p.def->num_components == 1 && p.def->bit_size == 32) {
-                  *src_out = p.def;
+               if (is_word(p)) {
+                  *src_out = p;
                   *bits_out = w;
                   return true;
                }
@@ -312,9 +328,9 @@ match_hi16_masked_extract(nir_instr *instr, nir_def **src_out,
          } else if (op == nir_op_ushr) {
             nir_scalar p = nir_scalar_chase_alu_src(hi, 0);
             nir_scalar ks = nir_scalar_chase_alu_src(hi, 1);
-            if (p.def->num_components == 1 && p.def->bit_size == 32 &&
-                nir_scalar_is_const(ks) && (nir_scalar_as_uint(ks) & 31u) == 16) {
-               *src_out = p.def;
+            if (is_word(p) && nir_scalar_is_const(ks) &&
+                (nir_scalar_as_uint(ks) & 31u) == 16) {
+               *src_out = p;
                *bits_out = w;
                return true;
             }
@@ -339,7 +355,7 @@ agx_nir_opt_half_bitfield_extract(nir_shader *shader)
          /* Pass 1: share q = ushr(p, k) across paired low- and high-half
           * extracts at bit offsets k and k + 16 in the same block. */
          nir_foreach_instr_safe(instr, block) {
-            nir_def *p = NULL;
+            nir_scalar p;
             unsigned k = 0, w1 = 0;
             if (!match_lo_shifted_extract(instr, &p, &k, &w1))
                continue;
@@ -350,7 +366,7 @@ agx_nir_opt_half_bitfield_extract(nir_shader *shader)
 
             nir_instr *earliest = instr;
             bool found_hi = false;
-            nir_foreach_use(use, p) {
+            nir_foreach_use(use, p.def) {
                if (nir_src_is_if(use))
                   continue;
                nir_instr *cand = nir_src_use_instr(use);
@@ -370,7 +386,7 @@ agx_nir_opt_half_bitfield_extract(nir_shader *shader)
                continue;
 
             b.cursor = nir_before_instr(earliest);
-            nir_def *q = nir_ushr_imm(&b, p, k);
+            nir_def *q = nir_ushr_imm(&b, nir_channel(&b, p.def, p.comp), k);
             nir_def *q_lo = nir_unpack_32_2x16_split_x(&b, q);
             nir_def *q_hi = nir_unpack_32_2x16_split_y(&b, q);
 
@@ -380,7 +396,7 @@ agx_nir_opt_half_bitfield_extract(nir_shader *shader)
             nir_def_rewrite_uses(&lo_alu->def, lo_rep);
 
             const unsigned rem = 16u - k;
-            nir_foreach_use_safe(use, p) {
+            nir_foreach_use_safe(use, p.def) {
                if (nir_src_is_if(use))
                   continue;
                nir_instr *cand = nir_src_use_instr(use);
@@ -407,7 +423,7 @@ agx_nir_opt_half_bitfield_extract(nir_shader *shader)
           * ((p >> 16) & mask, mask <= 0xff) to 16-bit SCIB AND + u2u32 when
           * all consumers fold zero-extended halves natively. */
          nir_foreach_instr_safe(instr, block) {
-            nir_def *p = NULL;
+            nir_scalar p;
             unsigned w = 0;
             if (!match_hi16_masked_extract(instr, &p, &w))
                continue;
@@ -417,7 +433,8 @@ agx_nir_opt_half_bitfield_extract(nir_shader *shader)
                continue;
 
             b.cursor = nir_before_instr(instr);
-            nir_def *hi = nir_unpack_32_2x16_split_y(&b, p);
+            nir_def *hi =
+               nir_unpack_32_2x16_split_y(&b, nir_channel(&b, p.def, p.comp));
             nir_def *rep = nir_u2u32(&b, nir_iand_imm(&b, hi, (1u << w) - 1));
             nir_def_replace(&alu->def, rep);
             impl_progress = true;

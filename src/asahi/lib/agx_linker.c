@@ -331,6 +331,39 @@ agx3_relocate_main_uvs(const struct agx_device *dev,
    return true;
 }
 
+/*
+ * The packer emits the AGX3b pixel transaction protocol only for fragment
+ * shapes it has proven. It returns any other shape without the protocol
+ * instead of failing, so a program that blends inline is checked by its bytes,
+ * as Borealis checks its own (hk_g17p_mono_part_refusal()). The program must
+ * contain the colour entry gate (agx3_pixel_colour_entry()) and end with a
+ * final release: a pixrel whose descriptor carries the 0x200 end-of-sequence
+ * bit (agx3_pixel_release() with last set) directly ahead of the 4-byte END.
+ * The release's writeout and scoreboard fields depend on the program, so only
+ * its fixed bytes are compared.
+ */
+bool
+agx3_fragment_pixel_protocol_proven(const struct agx_shader_part *part)
+{
+   uint8_t gate[AGX3_PIXEL_MAX_LENGTH], gate_len;
+   if (!part || !part->binary ||
+       !agx3_pixel_colour_entry(AGX_ISA_ENCODING_AGX3B, gate, &gate_len))
+      return false;
+
+   const uint8_t *code = (const uint8_t *)part->binary + part->info.main_offset;
+   const size_t n = part->info.main_size;
+   bool has_gate = false;
+   for (size_t o = 0; o + gate_len <= n && !has_gate; o += 2)
+      has_gate = !memcmp(code + o, gate, gate_len);
+
+   const bool final_release =
+      n >= 10 && code[n - 4] == 0x0e && code[n - 10] == 0x07 &&
+      code[n - 9] == 0x02 && code[n - 8] == 0x54 && (code[n - 6] & 0x02) &&
+      code[n - 5] == 0x00;
+
+   return has_gate && final_release;
+}
+
 bool
 agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
               bool fragment, struct agx_shader_part *main,
@@ -740,6 +773,17 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
          writes_sample_mask = false;
          linked->no_op = true;
       }
+
+      const struct agx_shader_part *colour_part = epilog ? epilog : main;
+      const bool non_colour_reads_tib =
+         (prolog && prolog->info.reads_tib) ||
+         (epilog && main && main->info.reads_tib);
+      linked->translucent_only_for_unwritten_rts =
+         !tag_write_disable && colour_part &&
+         colour_part->info.translucent_only_for_unwritten_rts &&
+         !non_colour_reads_tib;
+      linked->color_rts_written =
+         colour_part ? colour_part->info.color_rts_written : 0;
 
       agx_pack(&linked->fragment_control, FRAGMENT_CONTROL, cfg) {
          cfg.tag_write_disable = tag_write_disable;

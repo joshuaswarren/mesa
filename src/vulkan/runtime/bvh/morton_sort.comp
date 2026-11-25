@@ -572,7 +572,8 @@ main()
 
       store_keyvals_to_global(local_kvs, KEY_REF(args.ids_odd), wg_base, kv_count - wg_base);
 
-      barrier();
+      if (!phase_dispatch)
+         barrier();
       ++num_wgs_done;
    }
 
