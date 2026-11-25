@@ -4021,10 +4021,14 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
    const bool ssa_renumbered = spilling || remat;
    if (spilling || remat) {
-      assert((remat || ctx->key->has_scratch) &&
-             "internal shaders are unspillable");
+      if (!remat && !ctx->key->has_scratch) {
+         ctx->ra_failed = true;
+         return;
+      }
 
       agx_spill(ctx, max_possible_regs, remat);
+      if (ctx->ra_failed)
+         return;
 
       if (agx_is_g18g(&ctx->key->dev)) {
          /* Rematerialization changes instruction lifetimes. Measure the
@@ -4047,7 +4051,13 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
             spilling = ctx->remat_fallback_spilled ||
                        effective_demand > max_possible_regs;
             if (effective_demand > max_possible_regs) {
+               if (!ctx->key->has_scratch) {
+                  ctx->ra_failed = true;
+                  return;
+               }
                agx_spill(ctx, max_possible_regs, false);
+               if (ctx->ra_failed)
+                  return;
                agx_compute_liveness(ctx);
                effective_demand = agx_calc_register_demand(ctx, false);
             }
@@ -4060,8 +4070,15 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
             remat = false;
             spilling = true;
             agx_compute_liveness(ctx);
-            if (agx_calc_register_demand(ctx, false) > max_possible_regs)
+            if (agx_calc_register_demand(ctx, false) > max_possible_regs) {
+               if (!ctx->key->has_scratch) {
+                  ctx->ra_failed = true;
+                  return;
+               }
                agx_spill(ctx, max_possible_regs, false);
+               if (ctx->ra_failed)
+                  return;
+            }
          }
 
          /* After spilling, recalculate liveness and demand */

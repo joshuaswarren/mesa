@@ -407,6 +407,10 @@ agx_compact_kernel_info(struct agx_shader_info *info)
 {
    assert(info->has_preamble == (info->nr_preamble_gprs > 0));
    assert(info->texture_state_count <= 8 && "static maximum, no need to plumb");
+   assert(info->scratch_size <= UINT16_MAX &&
+          "precompiled kernel scratch_size overflows uint16_t");
+   assert(info->agx3_spectpr_scratch_size <= UINT16_MAX &&
+          "precompiled kernel agx3_spectpr_scratch_size overflows uint16_t");
 
    return (struct agx_precompiled_kernel_info){
       .preamble_offset = info->preamble_offset,

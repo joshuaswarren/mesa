@@ -269,10 +269,18 @@ compile(void *memctx, const uint32_t *spirv, size_t spirv_size)
    return nir;
 }
 
-static void
+static bool
 print_shader(FILE *fp, const char *name, const char *suffix, uint32_t variant,
              struct agx_shader_part *p, uint16_t printf_uniform)
 {
+   if (p->info.scratch_size > UINT16_MAX ||
+       p->info.agx3_spectpr_scratch_size > UINT16_MAX) {
+      fprintf(stderr,
+              "Failed to compact %s for %s: scratch size (%u/%u B) exceeds uint16_t\n",
+              name, suffix, p->info.scratch_size,
+              p->info.agx3_spectpr_scratch_size);
+      return false;
+   }
    struct agx_precompiled_kernel_info info = agx_compact_kernel_info(&p->info);
    info.printf_uniform = printf_uniform;
    size_t sz_B = sizeof(info) + p->info.binary_size;
@@ -284,6 +292,7 @@ print_shader(FILE *fp, const char *name, const char *suffix, uint32_t variant,
 
    nir_precomp_print_blob(fp, name, suffix, variant, mem, sz_B, true);
    free(mem);
+   return true;
 }
 
 static bool
@@ -815,8 +824,12 @@ main(int argc, char **argv)
             }
             if (!strcmp(*target, "g18g"))
                nr_compiled++;
-            print_shader(fp_c, libfunc->name, *target, v, &compiled,
-                         printf_uniform);
+            if (!print_shader(fp_c, libfunc->name, *target, v, &compiled,
+                              printf_uniform)) {
+               free(compiled.binary);
+               ralloc_free(clone);
+               return 1;
+            }
             free(compiled.binary);
             ralloc_free(clone);
 
