@@ -955,11 +955,12 @@ agx3_emit_funop(struct util_dynarray *emission, enum agx_isa_encoding enc,
                 const agx_instr *I, enum agx3_funop op, uint16_t wait_mask,
                 bool g18g)
 {
-   /* G18G (agx3d) keeps j873's G17G-family unary encoder for its rounding,
-    * log/exp, rsqrt and sqrt-step forms. */
-   if (g18g && enc == AGX_ISA_ENCODING_AGX3C && op != AGX3_FUNOP_RINT &&
-       (op <= AGX3_FUNOP_EXP2 || op == AGX3_FUNOP_RSQRT ||
-        op == AGX3_FUNOP_SQRT_STEP)) {
+   /* G18G (agx3d) keeps j873's G17G-family unary encoder for log/exp, rsqrt
+    * and sqrt-step; rounding ops (floor/ceil/trunc/rint) use the shared
+    * AGX3c unary encoder below so 16-bit and high-register forms encode too. */
+   if (g18g && enc == AGX_ISA_ENCODING_AGX3C &&
+       ((op > AGX3_FUNOP_RINT && op <= AGX3_FUNOP_EXP2) ||
+        op == AGX3_FUNOP_RSQRT || op == AGX3_FUNOP_SQRT_STEP)) {
       if (I->nr_dests != 1 || I->nr_srcs != 1 ||
           I->dest[0].type == AGX_INDEX_NULL ||
           !agx3_src_is_register(I->dest[0]) || I->dest[0].memory ||
