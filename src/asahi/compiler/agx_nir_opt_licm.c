@@ -620,7 +620,7 @@ cf_list_has_loop(struct exec_list *list)
 }
 
 static bool
-def_outside_loop(const nir_def *def, const nir_loop *loop)
+def_outside_loop(nir_def *def, const nir_loop *loop)
 {
    for (const nir_cf_node *node = nir_def_block(def)->cf_node.parent; node;
         node = node->parent) {
