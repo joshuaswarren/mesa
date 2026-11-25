@@ -2290,7 +2290,8 @@ struct hk_g17p_mip_key {
    bool metadata;
    bool aligned_16;
    bool tile_64x64;
-   uint8_t pad[3];
+   bool pairs;
+   uint8_t pad[2];
 };
 static_assert(sizeof(struct hk_g17p_mip_key) == 12,
               "G17P mip pipeline key must have no implicit padding");
@@ -2337,16 +2338,132 @@ hk_nir_compact_bits_8(nir_builder *b, nir_def *v)
    return nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 2)), 0x0f);
 }
 
+/* One destination texel at (x, y), packed as four 8-bit channels */
+static nir_def *
+hk_g17p_mip_texel(nir_builder *b, const struct hk_g17p_mip_key *key,
+                  nir_variable *texture, nir_def *x, nir_def *y,
+                  nir_def *width)
+{
+   nir_def *x0, *y0, *x1, *y1;
+   nir_def *weights[4] = {NULL};
+
+   if (key->exact_2x2) {
+      x0 = nir_ishl_imm(b, x, 1);
+      y0 = nir_ishl_imm(b, y, 1);
+      x1 = nir_ior_imm(b, x0, 1);
+      y1 = nir_ior_imm(b, y0, 1);
+   } else {
+      nir_def *wx, *wy;
+      if (key->odd) {
+         nir_def *axis = mip_push(b, axis);
+         nir_def *x_entry = nir_load_global(
+            b, 1, 32, nir_iadd(b, axis, nir_u2u64(b, nir_imul_imm(b, x, 4))),
+            .align_mul = 4);
+         nir_def *y_entry = nir_load_global(
+            b, 1, 32,
+            nir_iadd(b, axis,
+                     nir_u2u64(b, nir_imul_imm(b, nir_iadd(b, width, y), 4))),
+            .align_mul = 4);
+         x0 = nir_iand_imm(b, x_entry, 0xffff);
+         y0 = nir_iand_imm(b, y_entry, 0xffff);
+         wx = nir_iand_imm(b, nir_ushr_imm(b, x_entry, 16), 0xff);
+         wy = nir_iand_imm(b, nir_ushr_imm(b, y_entry, 16), 0xff);
+      } else {
+         nir_def *scale_x = mip_push(b, scale_x);
+         nir_def *scale_y = mip_push(b, scale_y);
+         x0 = nir_imul(b, x, scale_x);
+         y0 = nir_imul(b, y, scale_y);
+         wx = nir_ishl_imm(b, nir_iadd_imm(b, scale_x, -1), 7);
+         wy = nir_ishl_imm(b, nir_iadd_imm(b, scale_y, -1), 7);
+      }
+
+      x1 = nir_iadd(b, x0, nir_b2i32(b, nir_ine_imm(b, wx, 0)));
+      y1 = nir_iadd(b, y0, nir_b2i32(b, nir_ine_imm(b, wy, 0)));
+      nir_def *ix = nir_isub(b, nir_imm_int(b, 256), wx);
+      nir_def *iy = nir_isub(b, nir_imm_int(b, 256), wy);
+
+      weights[0] = nir_imul(b, ix, iy);
+      weights[1] = nir_imul(b, wx, iy);
+      weights[2] = nir_imul(b, ix, wy);
+      weights[3] = nir_imul(b, wx, wy);
+   }
+
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_def *coords[4] = {
+      nir_vec3(b, x0, y0, zero),
+      nir_vec3(b, x1, y0, zero),
+      nir_vec3(b, x0, y1, zero),
+      nir_vec3(b, x1, y1, zero),
+   };
+   nir_def *texels[4];
+   for (unsigned i = 0; i < 4; ++i) {
+      texels[i] = nir_txf(b, coords[i],
+                          .texture_deref = nir_build_deref_var(b, texture));
+      nir_def_as_tex(texels[i])->backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP;
+   }
+
+   nir_def *packed = NULL;
+   for (unsigned c = 0; c < 4; ++c) {
+      nir_def *out;
+      if (key->exact_2x2) {
+         nir_def *sum = nir_iadd(
+            b,
+            nir_iadd(b, nir_channel(b, texels[0], c),
+                     nir_channel(b, texels[1], c)),
+            nir_iadd(b, nir_channel(b, texels[2], c),
+                     nir_channel(b, texels[3], c)));
+         /* Bit-exact match for the general fixed4 ties-toward-128 rounding
+          * when all four weights are 16384 (sum in 0..1020):
+          *   sum <= 511 -> (sum + 2) >> 2 (0.5 ties round up toward 128)
+          *   sum >= 512 -> (sum + 1) >> 2 (0.5 ties round down toward 128) */
+         out = nir_ushr_imm(
+            b, nir_isub(b, nir_iadd_imm(b, sum, 2), nir_ushr_imm(b, sum, 9)),
+            2);
+      } else {
+         nir_def *value = NULL;
+         for (unsigned i = 0; i < 4; ++i) {
+            nir_def *term =
+               nir_imul(b, nir_channel(b, texels[i], c), weights[i]);
+            value = value ? nir_iadd(b, value, term) : term;
+         }
+
+         /* Rounded to four fractional bits, then to the nearest code with
+          * exact ties toward 128, as libagx_mipmap_unorm8x4_odd */
+         nir_def *fixed4 = nir_ushr_imm(b, nir_iadd_imm(b, value, 2048), 12);
+         out = nir_ushr_imm(b, fixed4, 4);
+         nir_def *rem = nir_iand_imm(b, fixed4, 15);
+         nir_def *up = nir_ior(b, nir_ugt_imm(b, rem, 8),
+                               nir_iand(b, nir_ieq_imm(b, rem, 8),
+                                        nir_ult_imm(b, out, 128)));
+         out = nir_iadd(b, out, nir_b2i32(b, up));
+      }
+
+      nir_def *byte = nir_ishl_imm(b, out, 8 * c);
+      packed = packed ? nir_ior(b, packed, byte) : byte;
+   }
+
+   return packed;
+}
+
 static nir_shader *
 build_g17p_mip_shader(const struct hk_g17p_mip_key *key)
 {
    assert(!(key->exact_2x2 && key->odd));
+   assert(!key->pairs || key->exact_2x2);
+
+   /* An exact 2x2 downsample is bound by the latency of its texture loads,
+    * not by its stores or its launches. With pairs, each invocation produces
+    * two horizontally adjacent texels, consecutive in Morton order: one
+    * 8-byte store writes both, and the invocation has eight loads in flight
+    * instead of four. A workgroup still covers one 16x16 tile.
+    */
+   const unsigned texels = key->pairs ? 2 : 1;
 
    nir_builder build =
       nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL, "hk-g17p-mip");
    nir_builder *b = &build;
    b->shader->info.workgroup_size[0] = HK_G17P_MIP_WG_SIZE;
-   b->shader->info.workgroup_size[1] = HK_G17P_MIP_WG_SIZE;
+   b->shader->info.workgroup_size[1] = HK_G17P_MIP_WG_SIZE / texels;
 
    nir_variable *texture = nir_variable_create(
       b->shader, nir_var_uniform,
@@ -2355,15 +2472,19 @@ build_g17p_mip_shader(const struct hk_g17p_mip_key *key)
    texture->data.descriptor_set = 0;
    texture->data.binding = 0;
 
-   /* Lay the 16x16 invocations of a workgroup out in Morton order, matching
-    * both one 16x16 compression metadata tile and the GPU-tiled texel layout:
+   /* Lay the 16x16 texels of a workgroup out in Morton order, matching both
+    * one 16x16 compression metadata tile and the GPU-tiled texel layout:
     * each 32-invocation subgroup covers an 8x4 block (128 contiguous bytes),
-    * while 256-thread workgroups allow up to 4 concurrent groups per core.
+    * or an 8x8 block (256 bytes) with pairs, while 256-thread workgroups
+    * allow up to 4 concurrent groups per core.
     */
    nir_def *lid = nir_load_local_invocation_id(b);
-   nir_def *index =
+   nir_def *invocation =
       nir_ior(b, nir_channel(b, lid, 0),
               nir_ishl_imm(b, nir_channel(b, lid, 1), 4));
+   /* The Morton index in the tile of the invocation's (first) texel */
+   nir_def *index =
+      key->pairs ? nir_ishl_imm(b, invocation, 1) : invocation;
    nir_def *wg = nir_load_workgroup_id(b);
    nir_def *wg_x = nir_channel(b, wg, 0);
    nir_def *wg_y = nir_channel(b, wg, 1);
@@ -2387,102 +2508,11 @@ build_g17p_mip_shader(const struct hk_g17p_mip_key *key)
    }
 
    {
-      nir_def *x0, *y0, *x1, *y1;
-      nir_def *weights[4] = {NULL};
-
-      if (key->exact_2x2) {
-         x0 = nir_ishl_imm(b, x, 1);
-         y0 = nir_ishl_imm(b, y, 1);
-         x1 = nir_ior_imm(b, x0, 1);
-         y1 = nir_ior_imm(b, y0, 1);
-      } else {
-         nir_def *wx, *wy;
-         if (key->odd) {
-            nir_def *axis = mip_push(b, axis);
-            nir_def *x_entry = nir_load_global(
-               b, 1, 32, nir_iadd(b, axis, nir_u2u64(b, nir_imul_imm(b, x, 4))),
-               .align_mul = 4);
-            nir_def *y_entry = nir_load_global(
-               b, 1, 32,
-               nir_iadd(b, axis,
-                        nir_u2u64(b, nir_imul_imm(b, nir_iadd(b, width, y), 4))),
-               .align_mul = 4);
-            x0 = nir_iand_imm(b, x_entry, 0xffff);
-            y0 = nir_iand_imm(b, y_entry, 0xffff);
-            wx = nir_iand_imm(b, nir_ushr_imm(b, x_entry, 16), 0xff);
-            wy = nir_iand_imm(b, nir_ushr_imm(b, y_entry, 16), 0xff);
-         } else {
-            nir_def *scale_x = mip_push(b, scale_x);
-            nir_def *scale_y = mip_push(b, scale_y);
-            x0 = nir_imul(b, x, scale_x);
-            y0 = nir_imul(b, y, scale_y);
-            wx = nir_ishl_imm(b, nir_iadd_imm(b, scale_x, -1), 7);
-            wy = nir_ishl_imm(b, nir_iadd_imm(b, scale_y, -1), 7);
-         }
-
-         x1 = nir_iadd(b, x0, nir_b2i32(b, nir_ine_imm(b, wx, 0)));
-         y1 = nir_iadd(b, y0, nir_b2i32(b, nir_ine_imm(b, wy, 0)));
-         nir_def *ix = nir_isub(b, nir_imm_int(b, 256), wx);
-         nir_def *iy = nir_isub(b, nir_imm_int(b, 256), wy);
-
-         weights[0] = nir_imul(b, ix, iy);
-         weights[1] = nir_imul(b, wx, iy);
-         weights[2] = nir_imul(b, ix, wy);
-         weights[3] = nir_imul(b, wx, wy);
-      }
-
-      nir_def *zero = nir_imm_int(b, 0);
-      nir_def *coords[4] = {
-         nir_vec3(b, x0, y0, zero),
-         nir_vec3(b, x1, y0, zero),
-         nir_vec3(b, x0, y1, zero),
-         nir_vec3(b, x1, y1, zero),
-      };
-      nir_def *texels[4];
-      for (unsigned i = 0; i < 4; ++i) {
-         texels[i] = nir_txf(b, coords[i],
-                             .texture_deref = nir_build_deref_var(b, texture));
-         nir_def_as_tex(texels[i])->backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP;
-      }
-
-      nir_def *packed = NULL;
-      for (unsigned c = 0; c < 4; ++c) {
-         nir_def *out;
-         if (key->exact_2x2) {
-            nir_def *sum = nir_iadd(
-               b,
-               nir_iadd(b, nir_channel(b, texels[0], c),
-                        nir_channel(b, texels[1], c)),
-               nir_iadd(b, nir_channel(b, texels[2], c),
-                        nir_channel(b, texels[3], c)));
-            /* Bit-exact match for the general fixed4 ties-toward-128 rounding
-             * when all four weights are 16384 (sum in 0..1020):
-             *   sum <= 511 -> (sum + 2) >> 2 (0.5 ties round up toward 128)
-             *   sum >= 512 -> (sum + 1) >> 2 (0.5 ties round down toward 128) */
-            out = nir_ushr_imm(
-               b, nir_isub(b, nir_iadd_imm(b, sum, 2), nir_ushr_imm(b, sum, 9)),
-               2);
-         } else {
-            nir_def *value = NULL;
-            for (unsigned i = 0; i < 4; ++i) {
-               nir_def *term =
-                  nir_imul(b, nir_channel(b, texels[i], c), weights[i]);
-               value = value ? nir_iadd(b, value, term) : term;
-            }
-
-            /* Rounded to four fractional bits, then to the nearest code with
-             * exact ties toward 128, as libagx_mipmap_unorm8x4_odd */
-            nir_def *fixed4 = nir_ushr_imm(b, nir_iadd_imm(b, value, 2048), 12);
-            out = nir_ushr_imm(b, fixed4, 4);
-            nir_def *rem = nir_iand_imm(b, fixed4, 15);
-            nir_def *up = nir_ior(b, nir_ugt_imm(b, rem, 8),
-                                  nir_iand(b, nir_ieq_imm(b, rem, 8),
-                                           nir_ult_imm(b, out, 128)));
-            out = nir_iadd(b, out, nir_b2i32(b, up));
-         }
-
-         nir_def *byte = nir_ishl_imm(b, out, 8 * c);
-         packed = packed ? nir_ior(b, packed, byte) : byte;
+      /* x is even with pairs: the second texel is the next column. */
+      nir_def *packed[2];
+      for (unsigned q = 0; q < texels; ++q) {
+         packed[q] = hk_g17p_mip_texel(b, key, texture,
+                                       q ? nir_ior_imm(b, x, 1) : x, y, width);
       }
 
       nir_def *element;
@@ -2522,10 +2552,10 @@ build_g17p_mip_shader(const struct hk_g17p_mip_key *key)
             morton);
       }
 
-      nir_store_global(b, packed,
+      nir_store_global(b, nir_vec(b, packed, texels),
                        nir_iadd(b, mip_push(b, dst),
                                 nir_u2u64(b, nir_imul_imm(b, element, 4))),
-                       .align_mul = 4);
+                       .align_mul = 4 * texels);
    }
 
    if (!key->aligned_16) {
@@ -2666,6 +2696,13 @@ hk_compressed_mip_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
                               groups_y * HK_G17P_MIP_WG_SIZE == height;
       const bool tile_64x64 =
          tiles.tile_width_log2 == 6 && tiles.tile_height_log2 == 6;
+      /* A pair never straddles the right edge of an even-width level, and
+       * tiles at least two texels wide keep it consecutive in memory. Pairs
+       * are measured on HAL200 only; AGX2 keeps one texel per invocation. */
+      const bool pairs =
+         agx_chip_has_cap(dev->dev.chip,
+                          AGX_CAP_HAL200_LOSSLESS_COMPRESSION) &&
+         exact_2x2 && width % 2 == 0 && tiles.tile_width_log2 >= 1;
 
       const struct hk_g17p_mip_key key = {
          .key_type = HK_META_OBJECT_KEY_G17P_MIP,
@@ -2674,6 +2711,7 @@ hk_compressed_mip_blit(struct hk_cmd_buffer *cmd, struct hk_image *src,
          .metadata = metadata,
          .aligned_16 = aligned_16,
          .tile_64x64 = tile_64x64,
+         .pairs = pairs,
       };
       VkPipelineLayout layout;
       VkPipeline pipeline;
