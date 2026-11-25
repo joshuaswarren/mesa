@@ -119,11 +119,10 @@ struct hk_queue {
       struct util_dynarray members;
       struct util_dynarray runs;
       struct util_dynarray commands;
-      /* Per member: the fused compute-pair shader that replaces it and its
-       * consumer, and whether the replacement was emitted. */
+      /* Per member: the fused compute-pair plan and its elision state. */
       struct util_dynarray fused;
       /* Buffers the packets read until they complete: their streams, the
-       * fused shaders' code and the fused programs' uniform loaders. */
+       * fused shaders' code, uniform loaders and root tables. */
       struct util_dynarray extra_bos;
       struct hk_packed_submit *packets;
       unsigned packets_cap;
