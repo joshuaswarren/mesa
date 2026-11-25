@@ -597,4 +597,309 @@ TEST(GuardChains, HoistPreservesDominanceAcrossUnhoistedMidBlock)
    ralloc_free(b.shader);
 }
 
+static unsigned
+count_alu_op_in_block(const nir_block *block, nir_op op)
+{
+   unsigned n = 0;
+   nir_foreach_instr(instr, block) {
+      if (instr->type == nir_instr_type_alu && nir_instr_as_alu(instr)->op == op)
+         n++;
+   }
+   return n;
+}
+
+TEST(GuardChains, CoalesceRelaxesIneAndBuildsFloatThreshTree)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "coalesce-fthresh");
+   b.shader->info.workgroup_size[0] = 32;
+
+   nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+   nir_def *wid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+   nir_def *base = agx_test_load_preamble(&b, 1, 64, 0);
+   nir_def *out_base = agx_test_load_preamble(&b, 1, 64, 4);
+   nir_def *thr = agx_test_load_preamble(&b, 1, 32, 8);
+
+   nir_def *acc = nir_imm_float(&b, 0.0f);
+   nir_def *vals[4];
+   nir_def *conds[4];
+   for (unsigned k = 0; k < 4; ++k) {
+      nir_def *idx = k == 0 ? tid : nir_iadd_imm(&b, tid, 32 * k);
+      nir_def *addr = nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, idx), 2));
+      vals[k] = make_load_global(&b, 1, 32, addr, 4, (gl_access_qualifier)0);
+      nir_def *neq = nir_ine(&b, idx, wid);
+      nir_def *lt = nir_inot(&b, nir_fge(&b, vals[k], thr));
+      conds[k] = nir_iand(&b, neq, lt);
+   }
+
+   for (unsigned k = 0; k < 4; ++k) {
+      nir_push_if(&b, conds[k]);
+      nir_def *r = nir_fadd(&b, acc, nir_frsq(&b, vals[k]));
+      nir_pop_if(&b, NULL);
+      acc = nir_if_phi(&b, r, acc);
+   }
+
+   make_store_global(
+      &b, acc, nir_iadd(&b, out_base, nir_ishl_imm(&b, nir_u2u64(&b, tid), 2)), 4);
+
+   EXPECT_TRUE(agx_nir_opt_guard_chains(b.shader));
+   nir_validate_shader(b.shader, "after coalesce-fthresh");
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(b.shader);
+   nir_block *entry = nir_start_block(impl);
+   /* Outer guard uses 3 bcsels (balanced selection tree over 4 floats), and all
+    * 4 ine/iand instructions were sunk out of the hot entry block. */
+   EXPECT_EQ(count_alu_op_in_block(entry, nir_op_bcsel), 3u);
+   EXPECT_EQ(count_alu_op_in_block(entry, nir_op_ine), 0u);
+   EXPECT_EQ(count_alu_op_in_block(entry, nir_op_iand), 0u);
+   EXPECT_EQ(count_alu_op_in_block(entry, nir_op_ior), 0u);
+
+   nir_cf_node *next = nir_cf_node_next(&entry->cf_node);
+   ASSERT_NE(next, nullptr);
+   ASSERT_EQ(next->type, nir_cf_node_if);
+   nir_block *then_first = nir_if_first_then_block(nir_cf_node_as_if(next));
+   EXPECT_EQ(count_alu_op_in_block(then_first, nir_op_ine), 4u);
+   EXPECT_EQ(count_alu_op_in_block(then_first, nir_op_iand), 4u);
+
+   /* End-to-end compile on G17P (AGX3B) and G17S (AGX3C) with zero spills. */
+   nir_shader *copy = nir_shader_clone(NULL, b.shader);
+   agx_preprocess_nir_g17p(b.shader);
+   struct agx_shader_key k17p = g17p_key();
+   struct agx_shader_part out17p = {};
+   ASSERT_TRUE(agx_compile_shader_nir(b.shader, &k17p, &out17p));
+   EXPECT_EQ(out17p.info.stats.spills, 0u);
+   free(out17p.binary);
+
+   agx_preprocess_nir_m5(copy);
+   struct agx_shader_key k3c = agx3c_key();
+   struct agx_shader_part out3c = {};
+   ASSERT_TRUE(agx_compile_shader_nir(copy, &k3c, &out3c));
+   EXPECT_EQ(out3c.info.stats.spills, 0u);
+   free(out3c.binary);
+
+   ralloc_free(copy);
+   ralloc_free(b.shader);
+}
+
+TEST(GuardChains, CoalesceFloatThreshTreeVariantsAndRefusals)
+{
+   /* Positive variants: flt(x, T) with k=3, and fge(T, x) (T on LHS) with k=4. */
+   for (unsigned mode = 0; mode < 2; ++mode) {
+      const unsigned k_ifs = mode == 0 ? 3u : 4u;
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "fthresh-variant");
+      b.shader->info.workgroup_size[0] = 32;
+
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *base = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *thr = agx_test_load_preamble(&b, 1, 32, 4);
+
+      nir_def *vals[4];
+      nir_def *conds[4];
+      for (unsigned k = 0; k < k_ifs; ++k) {
+         nir_def *idx = nir_iadd_imm(&b, tid, 32 * k);
+         nir_def *addr = nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, idx), 2));
+         vals[k] = make_load_global(&b, 1, 32, addr, 4, (gl_access_qualifier)0);
+         conds[k] = mode == 0 ? nir_flt(&b, vals[k], thr)
+                              : nir_fge(&b, thr, vals[k]);
+      }
+
+      nir_def *acc = nir_imm_float(&b, 0.0f);
+      for (unsigned k = 0; k < k_ifs; ++k) {
+         nir_push_if(&b, conds[k]);
+         nir_def *r = nir_fadd(&b, acc, nir_frsq(&b, vals[k]));
+         nir_pop_if(&b, NULL);
+         acc = nir_if_phi(&b, r, acc);
+      }
+      make_store_global(
+         &b, acc, nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, tid), 2)), 4);
+
+      EXPECT_TRUE(agx_nir_opt_guard_chains(b.shader));
+      nir_validate_shader(b.shader, "after fthresh-variant");
+      nir_block *entry = nir_start_block(nir_shader_get_entrypoint(b.shader));
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_bcsel), k_ifs - 1u);
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_ior), 0u);
+      ralloc_free(b.shader);
+   }
+
+   /* Negative controls: (0) different thresholds, (1) mixed cmp ops, (2) k == 2.
+    * Coalescing still runs, but must fall back to ior without emitting bcsel. */
+   for (unsigned neg = 0; neg < 3; ++neg) {
+      const unsigned k_ifs = neg == 2 ? 2u : 4u;
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "fthresh-refusal");
+      b.shader->info.workgroup_size[0] = 32;
+
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *base = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *thr0 = agx_test_load_preamble(&b, 1, 32, 4);
+      nir_def *thr1 = agx_test_load_preamble(&b, 1, 32, 8);
+
+      nir_def *vals[4];
+      nir_def *conds[4];
+      for (unsigned k = 0; k < k_ifs; ++k) {
+         nir_def *idx = nir_iadd_imm(&b, tid, 32 * k);
+         nir_def *addr = nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, idx), 2));
+         vals[k] = make_load_global(&b, 1, 32, addr, 4, (gl_access_qualifier)0);
+         nir_def *t = (neg == 0 && k == 3) ? thr1 : thr0;
+         conds[k] = (neg == 1 && k == 3) ? nir_fge(&b, vals[k], t)
+                                         : nir_flt(&b, vals[k], t);
+      }
+
+      nir_def *acc = nir_imm_float(&b, 0.0f);
+      for (unsigned k = 0; k < k_ifs; ++k) {
+         nir_push_if(&b, conds[k]);
+         nir_def *r = nir_fadd(&b, acc, nir_frsq(&b, vals[k]));
+         nir_pop_if(&b, NULL);
+         acc = nir_if_phi(&b, r, acc);
+      }
+      make_store_global(
+         &b, acc, nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, tid), 2)), 4);
+
+      EXPECT_TRUE(agx_nir_opt_guard_chains(b.shader));
+      nir_validate_shader(b.shader, "after fthresh-refusal");
+      nir_block *entry = nir_start_block(nir_shader_get_entrypoint(b.shader));
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_bcsel), 0u);
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_ior), k_ifs - 1u);
+      ralloc_free(b.shader);
+   }
+
+   /* Negative control for sinking: an `ine` term with a use after `outer` must
+    * stay in `entry` rather than sinking into `outer->then_list`. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "fthresh-liveout-cond");
+      b.shader->info.workgroup_size[0] = 32;
+
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *wid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+      nir_def *base = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *thr = agx_test_load_preamble(&b, 1, 32, 4);
+
+      nir_def *vals[4];
+      nir_def *neqs[4];
+      nir_def *conds[4];
+      for (unsigned k = 0; k < 4; ++k) {
+         nir_def *idx = nir_iadd_imm(&b, tid, 32 * k);
+         nir_def *addr = nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, idx), 2));
+         vals[k] = make_load_global(&b, 1, 32, addr, 4, (gl_access_qualifier)0);
+         neqs[k] = nir_ine(&b, idx, wid);
+         conds[k] = nir_iand(&b, neqs[k], nir_flt(&b, vals[k], thr));
+      }
+
+      nir_def *acc = nir_imm_float(&b, 0.0f);
+      for (unsigned k = 0; k < 4; ++k) {
+         nir_push_if(&b, conds[k]);
+         nir_def *r = nir_fadd(&b, acc, nir_frsq(&b, vals[k]));
+         nir_pop_if(&b, NULL);
+         acc = nir_if_phi(&b, r, acc);
+      }
+      nir_def *final_v = nir_bcsel(&b, neqs[0], acc, nir_imm_float(&b, 1.0f));
+      make_store_global(
+         &b, final_v, nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, tid), 2)), 4);
+
+      EXPECT_TRUE(agx_nir_opt_guard_chains(b.shader));
+      nir_validate_shader(b.shader, "after fthresh-liveout-cond");
+      nir_block *entry = nir_start_block(nir_shader_get_entrypoint(b.shader));
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_ine), 1u);
+      ralloc_free(b.shader);
+   }
+
+   /* Unwrap fge(fadd(x_m, bias), 0.0) -> fge(x_m, -bias) when fadd allows ninf
+    * and is single-use, sinking the fadds out of the hot entry block. When
+    * preserve_inf is set on fadd, keep the fadds in entry instead. */
+   for (bool preserve_inf : {false, true}) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "fthresh-zero-fadd");
+      b.shader->info.workgroup_size[0] = 32;
+
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *base = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *neg_thr = agx_test_load_preamble(&b, 1, 32, 4);
+      nir_def *zero = nir_imm_float(&b, 0.0f);
+
+      nir_def *vals[4];
+      nir_def *conds[4];
+      for (unsigned k = 0; k < 4; ++k) {
+         nir_def *idx = nir_iadd_imm(&b, tid, 32 * k);
+         nir_def *addr = nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, idx), 2));
+         vals[k] = make_load_global(&b, 1, 32, addr, 4, (gl_access_qualifier)0);
+         b.fp_math_ctrl = preserve_inf ? nir_fp_preserve_inf : nir_fp_fast_math;
+         nir_def *diff = nir_fadd(&b, vals[k], neg_thr);
+         b.fp_math_ctrl = nir_fp_preserve_inf | nir_fp_preserve_nan;
+         conds[k] = nir_inot(&b, nir_fge(&b, diff, zero));
+      }
+      b.fp_math_ctrl = nir_fp_fast_math;
+
+      nir_def *acc = nir_imm_float(&b, 0.0f);
+      for (unsigned k = 0; k < 4; ++k) {
+         nir_push_if(&b, conds[k]);
+         nir_def *r = nir_fadd(&b, acc, nir_frsq(&b, vals[k]));
+         nir_pop_if(&b, NULL);
+         acc = nir_if_phi(&b, r, acc);
+      }
+      make_store_global(
+         &b, acc, nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, tid), 2)), 4);
+
+      EXPECT_TRUE(agx_nir_opt_guard_chains(b.shader));
+      nir_validate_shader(b.shader, "after fthresh-zero-fadd");
+      nir_block *entry = nir_start_block(nir_shader_get_entrypoint(b.shader));
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_bcsel), 3u);
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_fadd),
+                preserve_inf ? 4u : 0u);
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_fneg),
+                preserve_inf ? 0u : 1u);
+      ralloc_free(b.shader);
+   }
+
+   /* Un-CSE'd per-if threshold expressions pulled out of separate nested ifs
+    * by fusion+hoisting must be CSE'd before coalescing so try_unwrap_zero_fadd_bias
+    * still matches the shared bias across all 4 guards. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "fthresh-hoisted-cse-fadd");
+      b.shader->info.workgroup_size[0] = 32;
+
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *wid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+      nir_def *base = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *radius = agx_test_load_preamble(&b, 1, 32, 4);
+      nir_def *zero = nir_imm_float(&b, 0.0f);
+
+      /* Dominating unconditional load of pos[wid] so nested loads fuse without
+       * zero-page redirect. */
+      nir_def *self_addr =
+         nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, wid), 2));
+      nir_def *self_v =
+         make_load_global(&b, 1, 32, self_addr, 4, (gl_access_qualifier)0);
+
+      nir_def *acc = self_v;
+      for (unsigned k = 0; k < 4; ++k) {
+         nir_def *idx = k == 0 ? tid : nir_iadd_imm(&b, tid, 32 * k);
+         nir_push_if(&b, nir_ine(&b, idx, wid));
+         nir_def *addr =
+            nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, idx), 2));
+         nir_def *v =
+            make_load_global(&b, 1, 32, addr, 4, (gl_access_qualifier)0);
+         nir_def *neg_thr = nir_fneg(&b, nir_fmul(&b, radius, radius));
+         nir_def *diff = nir_fadd(&b, v, neg_thr);
+         nir_push_if(&b, nir_inot(&b, nir_fge(&b, diff, zero)));
+         nir_def *r = nir_fadd(&b, acc, nir_frsq(&b, v));
+         nir_pop_if(&b, NULL);
+         nir_def *inner_phi = nir_if_phi(&b, r, acc);
+         nir_pop_if(&b, NULL);
+         acc = nir_if_phi(&b, inner_phi, acc);
+      }
+      make_store_global(
+         &b, acc, nir_iadd(&b, base, nir_ishl_imm(&b, nir_u2u64(&b, tid), 2)), 4);
+
+      EXPECT_TRUE(agx_nir_opt_guard_chains(b.shader));
+      nir_validate_shader(b.shader, "after fthresh-hoisted-cse-fadd");
+      nir_block *entry = nir_start_block(nir_shader_get_entrypoint(b.shader));
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_bcsel), 3u);
+      EXPECT_EQ(count_alu_op_in_block(entry, nir_op_fadd), 0u);
+      ralloc_free(b.shader);
+   }
+}
+
 } // namespace

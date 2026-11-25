@@ -1204,6 +1204,359 @@ collect_pure_mid_instrs(nir_block *mid, nir_block *prev_block,
    return true;
 }
 
+/* Match a scalar 1-bit conjunction `a && b` where exactly one side is an
+ * integer inequality `u != v`. For the outer fast-path guard, dropping the
+ * rare-false `u != v` term is sound because `cond => other`, while each inner
+ * `if (cond)` still checks the exact conjunction. */
+static nir_def *
+relax_ine_conjunction(nir_def *cond, nir_block *prev_block)
+{
+   nir_alu_instr *alu = nir_def_as_alu_or_null(cond);
+   if (!alu || alu->op != nir_op_iand || alu->def.num_components != 1 ||
+       alu->def.bit_size != 1 || alu->src[0].swizzle[0] != 0 ||
+       alu->src[1].swizzle[0] != 0)
+      return cond;
+
+   nir_def *s0 = alu->src[0].src.ssa;
+   nir_def *s1 = alu->src[1].src.ssa;
+   if (s0->num_components != 1 || s1->num_components != 1)
+      return cond;
+
+   nir_def *u = NULL, *v = NULL;
+   const bool s0_ine = match_ine(s0, &u, &v);
+   const bool s1_ine = match_ine(s1, &u, &v);
+   if (s0_ine == s1_ine)
+      return cond;
+
+   nir_def *kept = s0_ine ? s1 : s0;
+   return nir_block_dominates(nir_def_block(kept), prev_block) ? kept : cond;
+}
+
+struct float_thresh_cmp {
+   nir_op base_op;
+   bool negated;
+   nir_def *src[2];
+   uint32_t fp_math_ctrl;
+};
+
+static bool
+match_float_thresh_cmp(nir_def *cond, struct float_thresh_cmp *out)
+{
+   if (cond->num_components != 1 || cond->bit_size != 1)
+      return false;
+
+   bool negated = false;
+   nir_alu_instr *alu = nir_def_as_alu_or_null(cond);
+   if (!alu)
+      return false;
+   if (alu->op == nir_op_inot) {
+      if (alu->src[0].swizzle[0] != 0)
+         return false;
+      negated = true;
+      alu = nir_def_as_alu_or_null(alu->src[0].src.ssa);
+      if (!alu)
+         return false;
+   }
+
+   if ((alu->op != nir_op_fge && alu->op != nir_op_flt) ||
+       alu->def.num_components != 1 ||
+       alu->src[0].swizzle[0] != 0 || alu->src[1].swizzle[0] != 0)
+      return false;
+
+   nir_def *s0 = alu->src[0].src.ssa;
+   nir_def *s1 = alu->src[1].src.ssa;
+   if (s0->bit_size != 32 || s1->bit_size != 32 ||
+       s0->num_components != 1 || s1->num_components != 1)
+      return false;
+
+   out->base_op = alu->op;
+   out->negated = negated;
+   out->src[0] = s0;
+   out->src[1] = s1;
+   out->fp_math_ctrl = alu->fp_math_ctrl;
+   return true;
+}
+
+static bool
+same_float_thresh_def(const nir_def *a, const nir_def *b)
+{
+   if (a == b)
+      return true;
+   return nir_def_is_const(a) && nir_def_is_const(b) &&
+          nir_scalar_as_uint(nir_get_scalar((nir_def *)a, 0)) ==
+             nir_scalar_as_uint(nir_get_scalar((nir_def *)b, 0));
+}
+
+static bool
+def_is_float_zero(const nir_def *def)
+{
+   return def->num_components == 1 && def->bit_size == 32 &&
+          nir_def_is_const(def) &&
+          nir_scalar_as_float(nir_get_scalar((nir_def *)def, 0)) == 0.0f;
+}
+
+/* When all `k` compare inputs are single-use `fadd(x_m, shared_bias)` compared
+ * against `0.0`, unwrap to `x_m` against `-shared_bias` (matching
+ * `nir_opt_algebraic_late`'s `fge/flt(fadd(a, b), 0.0) -> fge/flt(a, -b)`
+ * rule before our selection tree adds a second use to the `fadd`). */
+static bool
+try_unwrap_zero_fadd_bias(nir_builder *b, nir_block *prev_block,
+                          nir_op base_op, nir_def **vals, unsigned k,
+                          nir_def **thresh_inout)
+{
+   if (!def_is_float_zero(*thresh_inout))
+      return false;
+
+   nir_alu_instr *fadds[MAX_GROUP_IFS];
+   for (unsigned m = 0; m < k; ++m) {
+      nir_alu_instr *fa = nir_def_as_alu_or_null(vals[m]);
+      if (!fa || fa->op != nir_op_fadd || fa->def.num_components != 1 ||
+          fa->def.bit_size != 32 || !list_is_singular(&fa->def.uses) ||
+          fa->src[0].swizzle[0] != 0 || fa->src[1].swizzle[0] != 0)
+         return false;
+      if (base_op == nir_op_fge && (fa->fp_math_ctrl & nir_fp_preserve_inf))
+         return false;
+      fadds[m] = fa;
+   }
+
+   /* Find an additive operand shared across all `k` fadds. */
+   nir_def *bias = NULL;
+   nir_def *unwrapped[MAX_GROUP_IFS];
+   for (unsigned s0 = 0; s0 < 2 && !bias; ++s0) {
+      nir_def *cand = fadds[0]->src[s0].src.ssa;
+      if (cand->num_components != 1 || cand->bit_size != 32 ||
+          !nir_block_dominates(nir_def_block(cand), prev_block))
+         continue;
+      unwrapped[0] = fadds[0]->src[1 - s0].src.ssa;
+      bool all_match = true;
+      for (unsigned m = 1; m < k; ++m) {
+         if (same_float_thresh_def(fadds[m]->src[0].src.ssa, cand)) {
+            unwrapped[m] = fadds[m]->src[1].src.ssa;
+         } else if (same_float_thresh_def(fadds[m]->src[1].src.ssa, cand)) {
+            unwrapped[m] = fadds[m]->src[0].src.ssa;
+         } else {
+            all_match = false;
+            break;
+         }
+      }
+      if (!all_match)
+         continue;
+      for (unsigned m = 0; m < k; ++m) {
+         if (unwrapped[m]->num_components != 1 ||
+             unwrapped[m]->bit_size != 32 ||
+             !nir_block_dominates(nir_def_block(unwrapped[m]), prev_block)) {
+            all_match = false;
+            break;
+         }
+      }
+      if (all_match)
+         bias = cand;
+   }
+
+   if (!bias)
+      return false;
+
+   for (unsigned m = 0; m < k; ++m)
+      vals[m] = unwrapped[m];
+   *thresh_inout = nir_fneg(b, bias);
+   return true;
+}
+
+/* When `k >= 3` outer terms test `k` 32-bit floats against the same threshold
+ * `T` with the same ordered or negated-ordered comparison `P(x)`, reduce
+ * `P(x_0) | ... | P(x_{k-1})` via a balanced binary selection tree:
+ *
+ *   For negated `P(x) = !cmp(x, T)`:   pick(a, b) = bcsel(cmp(a, T), b, a)
+ *   For ordered `P(x) =  cmp(x, T)`:   pick(a, b) = bcsel(cmp(a, T), a, b)
+ *
+ * This is IEEE-754 bit-exact including NaN (unlike fmin/fmax, which drop NaN):
+ * whenever `P(a)` holds (including NaN for `!cmp`), `pick(a, b)` returns `a`;
+ * otherwise it returns `b`, so `P(pick(a, b)) == P(a) | P(b)`.
+ *
+ * The backend fuses each `cmp + bcsel` into a single `FCMPSEL` and the final
+ * compare into `IF_FCMP`, replacing `k` boolean compares plus `k - 1` ORs with
+ * `k - 1` `FCMPSEL`s plus one fused branch compare. */
+static nir_def *
+try_build_float_thresh_tree(nir_builder *b, nir_block *prev_block,
+                            nir_def *const *terms, unsigned k)
+{
+   if (k < 3)
+      return NULL;
+
+   struct float_thresh_cmp cmps[MAX_GROUP_IFS];
+   for (unsigned m = 0; m < k; ++m) {
+      if (!match_float_thresh_cmp(terms[m], &cmps[m]))
+         return NULL;
+      if (m > 0 && (cmps[m].base_op != cmps[0].base_op ||
+                    cmps[m].negated != cmps[0].negated))
+         return NULL;
+   }
+
+   int thresh_side = -1;
+   for (unsigned side = 2; side-- > 0;) {
+      bool shared = true;
+      for (unsigned m = 1; m < k; ++m) {
+         if (!same_float_thresh_def(cmps[m].src[side], cmps[0].src[side])) {
+            shared = false;
+            break;
+         }
+      }
+      if (shared) {
+         thresh_side = (int)side;
+         break;
+      }
+   }
+   if (thresh_side < 0)
+      return NULL;
+
+   nir_def *thresh = cmps[0].src[thresh_side];
+   if (!nir_block_dominates(nir_def_block(thresh), prev_block))
+      return NULL;
+
+   nir_def *vals[MAX_GROUP_IFS];
+   uint32_t fp_ctrl = 0;
+   for (unsigned m = 0; m < k; ++m) {
+      vals[m] = cmps[m].src[1 - thresh_side];
+      if (!nir_block_dominates(nir_def_block(vals[m]), prev_block))
+         return NULL;
+      fp_ctrl |= cmps[m].fp_math_ctrl;
+   }
+
+   const nir_op base_op = cmps[0].base_op;
+   const bool negated = cmps[0].negated;
+   try_unwrap_zero_fadd_bias(b, prev_block, base_op, vals, k, &thresh);
+
+   const uint32_t saved_fp_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl = fp_ctrl;
+
+   unsigned n = k;
+   while (n > 1) {
+      unsigned out = 0;
+      for (unsigned i = 0; i + 1 < n; i += 2) {
+         nir_def *va = vals[i];
+         nir_def *vb = vals[i + 1];
+         nir_def *c = thresh_side == 1 ? nir_build_alu2(b, base_op, va, thresh)
+                                       : nir_build_alu2(b, base_op, thresh, va);
+         vals[out++] = negated ? nir_bcsel(b, c, vb, va)
+                               : nir_bcsel(b, c, va, vb);
+      }
+      if (n & 1)
+         vals[out++] = vals[n - 1];
+      n = out;
+   }
+
+   nir_def *final_cmp =
+      thresh_side == 1 ? nir_build_alu2(b, base_op, vals[0], thresh)
+                       : nir_build_alu2(b, base_op, thresh, vals[0]);
+   b->fp_math_ctrl = saved_fp_ctrl;
+
+   return negated ? nir_inot(b, final_cmp) : final_cmp;
+}
+
+static bool
+alu_is_sinkable_cond_op(nir_op op)
+{
+   switch (op) {
+   case nir_op_iand:
+   case nir_op_ior:
+   case nir_op_ixor:
+   case nir_op_inot:
+   case nir_op_bcsel:
+   case nir_op_ine:
+   case nir_op_ieq:
+   case nir_op_ilt:
+   case nir_op_ige:
+   case nir_op_ult:
+   case nir_op_uge:
+   case nir_op_fge:
+   case nir_op_flt:
+   case nir_op_feq:
+   case nir_op_fneu:
+   case nir_op_fadd:
+   case nir_op_iadd:
+   case nir_op_isub:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static void
+collect_prev_cond_dag(nir_def *def, nir_block *prev_block,
+                      struct set *cond_instrs)
+{
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->block != prev_block || instr->type != nir_instr_type_alu)
+      return;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (!alu_is_sinkable_cond_op(alu->op) ||
+       _mesa_set_search(cond_instrs, instr))
+      return;
+
+   _mesa_set_add(cond_instrs, instr);
+   const unsigned n = nir_op_infos[alu->op].num_inputs;
+   for (unsigned i = 0; i < n; ++i)
+      collect_prev_cond_dag(alu->src[i].src.ssa, prev_block, cond_instrs);
+}
+
+static bool
+cf_node_strictly_inside(const nir_cf_node *node, const nir_cf_node *ancestor)
+{
+   for (const nir_cf_node *n = node->parent; n; n = n->parent) {
+      if (n == ancestor)
+         return true;
+   }
+   return false;
+}
+
+/* Sink condition-DAG ALU instructions in `prev_block` whose every use now lies
+ * strictly inside `outer` (because the outer fast-path guard relaxed or
+ * replaced the individual `if` conditions) to the entry of `outer->then_list`. */
+static void
+sink_superseded_cond_alu(nir_block *prev_block, nir_if *outer,
+                         nir_if *const *ifs, unsigned k)
+{
+   struct set *cond_instrs = _mesa_pointer_set_create(NULL);
+   for (unsigned m = 0; m < k; ++m)
+      collect_prev_cond_dag(ifs[m]->condition.ssa, prev_block, cond_instrs);
+
+   nir_block *then_first = nir_if_first_then_block(outer);
+   nir_foreach_instr_reverse_safe(instr, prev_block) {
+      if (!_mesa_set_search(cond_instrs, instr))
+         continue;
+      nir_def *def = nir_instr_def(instr);
+      if (!def)
+         continue;
+
+      bool any_use = false;
+      bool all_inside = true;
+      nir_foreach_use_including_if(use, def) {
+         any_use = true;
+         if (nir_src_is_if(use)) {
+            if (!cf_node_strictly_inside(&nir_src_use_if(use)->cf_node,
+                                         &outer->cf_node)) {
+               all_inside = false;
+               break;
+            }
+         } else {
+            nir_block *ub = nir_src_use_instr(use)->block;
+            if (!block_inside_cf_node(ub, &outer->cf_node)) {
+               all_inside = false;
+               break;
+            }
+         }
+      }
+
+      if (any_use && all_inside) {
+         exec_node_remove(&instr->node);
+         instr->block = then_first;
+         exec_list_push_head(&then_first->instr_list, &instr->node);
+      }
+   }
+
+   _mesa_set_destroy(cond_instrs, NULL);
+}
+
 /* Wrap adjacent expensive one-sided divergent `if`s (with only phis and pure
  * condition-prep ops between them and all conditions computable before the
  * first `if`) in a combined guard `if (c0 | c1 | ... | c_{k-1})`. */
@@ -1376,11 +1729,28 @@ coalesce_adjacent_ifs_in_list(nir_function_impl *impl, nir_builder *b,
       _mesa_set_destroy(hoisted_defs, NULL);
       util_dynarray_fini(&hoist_instrs);
 
-      /* Build combined condition `c0 | c1 | ... | c_{k-1}` at end of prev_block. */
+      /* Build combined condition at end of prev_block. Relax conjunctive
+       * `a != b && pred` terms for the outer fast-path guard and, when `k >= 3`
+       * terms compare floats against the same threshold, reduce them via a
+       * NaN-exact FCMPSEL selection tree instead of materializing `k` booleans. */
       b->cursor = nir_after_block(prev_block);
-      nir_def *any = ifs[0]->condition.ssa;
-      for (unsigned m = 1; m < k; ++m)
-         any = nir_ior(b, any, ifs[m]->condition.ssa);
+      nir_def *outer_terms[MAX_GROUP_IFS];
+      bool simplified_outer = false;
+      for (unsigned m = 0; m < k; ++m) {
+         outer_terms[m] =
+            relax_ine_conjunction(ifs[m]->condition.ssa, prev_block);
+         if (outer_terms[m] != ifs[m]->condition.ssa)
+            simplified_outer = true;
+      }
+
+      nir_def *any = try_build_float_thresh_tree(b, prev_block, outer_terms, k);
+      if (any) {
+         simplified_outer = true;
+      } else {
+         any = outer_terms[0];
+         for (unsigned m = 1; m < k; ++m)
+            any = nir_ior(b, any, outer_terms[m]);
+      }
 
       /* Insert outer `if (any)` right before `ifs[0]`, then extract
        * `[ifs[0] .. mids[k-1] phis]` and move it into `outer->then_list`. */
@@ -1392,6 +1762,9 @@ coalesce_adjacent_ifs_in_list(nir_function_impl *impl, nir_builder *b,
       nir_cf_extract(&chain, nir_before_cf_node(&ifs[0]->cf_node),
                      nir_after_phis(mids[k - 1]));
       nir_cf_reinsert(&chain, nir_before_cf_list(&outer->then_list));
+
+      if (simplified_outer)
+         sink_superseded_cond_alu(prev_block, outer, ifs, k);
 
       nir_block *outer_then_last = nir_if_last_then_block(outer);
       nir_block *outer_else = nir_if_first_else_block(outer);
@@ -1439,7 +1812,7 @@ coalesce_adjacent_ifs_in_list(nir_function_impl *impl, nir_builder *b,
 bool
 agx_nir_opt_guard_chains(nir_shader *shader)
 {
-   bool progress = false;
+   bool pre_progress = false;
 
    nir_foreach_function_impl(impl, shader) {
       nir_builder b = nir_builder_create(impl);
@@ -1456,17 +1829,29 @@ agx_nir_opt_guard_chains(nir_shader *shader)
          nir_progress(true, impl, nir_metadata_none);
       }
 
+      if (!impl_progress)
+         nir_no_progress(impl);
+      pre_progress |= impl_progress;
+   }
+
+   /* CSE values that fusion/hoisting just pulled out of separate `if`s into a
+    * common block so coalescing sees shared float thresholds and biases. */
+   if (pre_progress)
+      nir_opt_cse(shader);
+
+   bool coalesce_progress = false;
+   nir_foreach_function_impl(impl, shader) {
+      nir_builder b = nir_builder_create(impl);
+
       nir_metadata_require(impl, nir_metadata_dominance |
                                     nir_metadata_divergence);
       if (coalesce_adjacent_ifs_in_list(impl, &b, &impl->body)) {
-         impl_progress = true;
+         coalesce_progress = true;
          nir_progress(true, impl, nir_metadata_none);
-      }
-
-      if (!impl_progress)
+      } else {
          nir_no_progress(impl);
-      progress |= impl_progress;
+      }
    }
 
-   return progress;
+   return pre_progress || coalesce_progress;
 }

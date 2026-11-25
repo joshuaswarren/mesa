@@ -2347,3 +2347,84 @@ TEST_F(Optimizer, PackFourWayBoolOrBranch)
 
    EXPECT_EQ(br->src[0].size, AGX_SIZE_16);
 }
+
+static unsigned
+count_ops_in_block(const agx_block *blk, enum agx_opcode op)
+{
+   unsigned n = 0;
+   agx_foreach_instr_in_block(blk, I) {
+      if (I->op == op)
+         n++;
+   }
+   return n;
+}
+
+TEST_F(Optimizer, SinkColdCompareIntoSinglePredSucc)
+{
+   /* Positive: FCMP in entry used only inside then (and a nested block under
+    * then) sinks to the head of then; another FCMP used in entry or in merge
+    * stays in entry. */
+   {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *then_blk = agx_test_block(b->shader);
+      agx_block *nested = agx_test_block(b->shader);
+      agx_block *merge = agx_test_block(b->shader);
+
+      agx_block_add_successor(entry, then_blk);
+      agx_block_add_successor(entry, merge);
+      agx_block_add_successor(then_blk, nested);
+      agx_block_add_successor(then_blk, merge);
+      agx_block_add_successor(nested, merge);
+
+      b->cursor = agx_after_block(entry);
+      agx_index cold_direct = agx_fcmp(b, wx, wy, AGX_FCOND_GE, false);
+      agx_index cold_nested = agx_icmp(b, wx, wz, AGX_ICOND_UEQ, true);
+      agx_index hot_use = agx_fcmp(b, wy, wz, AGX_FCOND_LT, false);
+      agx_index merge_use = agx_fcmp(b, wx, wz, AGX_FCOND_GT, false);
+      agx_unit_test(b, hot_use);
+      agx_if_icmp(b, wx, agx_zero(), 1, AGX_ICOND_UEQ, true, merge);
+
+      b->cursor = agx_after_block(then_blk);
+      agx_unit_test(b, cold_direct);
+      agx_if_icmp(b, wy, agx_zero(), 1, AGX_ICOND_UEQ, true, merge);
+
+      b->cursor = agx_after_block(nested);
+      agx_unit_test(b, cold_nested);
+
+      b->cursor = agx_after_block(merge);
+      agx_unit_test(b, merge_use);
+
+      agx_opt_sink_cold_cmp(b->shader);
+
+      EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_FCMP), 2u);
+      EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_ICMP), 0u);
+      EXPECT_EQ(count_ops_in_block(then_blk, AGX_OPCODE_FCMP), 1u);
+      EXPECT_EQ(count_ops_in_block(then_blk, AGX_OPCODE_ICMP), 1u);
+   }
+
+   /* Negative: must not sink into a loop header or a multi-predecessor block. */
+   {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *loop_hdr = agx_test_block(b->shader);
+      agx_block *exit_blk = agx_test_block(b->shader);
+      loop_hdr->loop_header = true;
+
+      agx_block_add_successor(entry, loop_hdr);
+      agx_block_add_successor(entry, exit_blk);
+      agx_block_add_successor(loop_hdr, exit_blk);
+
+      b->cursor = agx_after_block(entry);
+      agx_index cmp = agx_fcmp(b, wx, wy, AGX_FCOND_GE, false);
+      agx_if_icmp(b, wx, agx_zero(), 1, AGX_ICOND_UEQ, true, exit_blk);
+
+      b->cursor = agx_after_block(loop_hdr);
+      agx_unit_test(b, cmp);
+
+      agx_opt_sink_cold_cmp(b->shader);
+
+      EXPECT_EQ(count_ops_in_block(entry, AGX_OPCODE_FCMP), 1u);
+      EXPECT_EQ(count_ops_in_block(loop_hdr, AGX_OPCODE_FCMP), 0u);
+   }
+}

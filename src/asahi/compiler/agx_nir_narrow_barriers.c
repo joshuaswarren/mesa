@@ -6,12 +6,14 @@
 /*
  * A compute workgroup of at most 32 invocations is one AGX subgroup, so its
  * workgroup scope and subgroup scope name the same invocations. Narrow its
- * workgroup execution and workgroup memory scopes to subgroup scope on
- * barriers that order only shared memory (or nothing): the backend then
- * emits the SIMD-group shared-memory fence instead of the threadgroup
- * rendezvous. Barriers that order device memory or images keep their
- * scopes. Metal's compiler removes these barriers from 32-wide variants of
- * the same kernels on M5 (Geekbench's particle kernel).
+ * workgroup execution scope and workgroup-or-wider memory scope to subgroup
+ * scope on barriers that order only shared memory (or nothing): shared memory
+ * is private to one workgroup, so a wider memory scope such as DEVICE adds no
+ * cross-workgroup visibility, and the backend then emits the SIMD-group
+ * shared-memory fence instead of the threadgroup rendezvous. Barriers that
+ * order device memory or images keep their scopes. Metal's compiler removes
+ * these barriers from 32-wide variants of the same kernels on M5 (Geekbench's
+ * particle kernel).
  */
 
 #include "agx_nir.h"
@@ -29,7 +31,7 @@ narrow(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_intrinsic_set_execution_scope(intr, SCOPE_SUBGROUP);
       progress = true;
    }
-   if (nir_intrinsic_memory_scope(intr) == SCOPE_WORKGROUP) {
+   if (nir_intrinsic_memory_scope(intr) >= SCOPE_WORKGROUP) {
       nir_intrinsic_set_memory_scope(intr, SCOPE_SUBGROUP);
       progress = true;
    }

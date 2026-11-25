@@ -1312,6 +1312,7 @@ void agx_print_instr(const agx_instr *I, FILE *fp);
 void agx_print_block(const agx_block *block, FILE *fp);
 void agx_print_shader(const agx_context *ctx, FILE *fp);
 void agx_optimizer_forward(agx_context *ctx);
+void agx_opt_sink_cold_cmp(agx_context *ctx);
 void agx_opt_pack_bool_or_branch(agx_context *ctx);
 bool agx_eval_immediate_icond(agx_context *ctx, enum agx_icond icond,
                               agx_index x, agx_index y, bool *result);
