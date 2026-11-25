@@ -99,7 +99,7 @@ hk_descriptor_stride_align_for_type(
        * heap indices and 24 bytes of buffer size/offset/address metadata.
        * The shader must never decode AGX2 software fields from Gen9 bytes.
        */
-      if (agx_chip_native_or_m5(pdev->dev.chip)) {
+      if (agx_chip_agx3_path(pdev->dev.chip)) {
          *stride = AGX_G17P_BUFFER_TEXTURE_DESCRIPTOR_SIZE;
          /* Texel-buffer stores address the PBE through the set's PBE heap,
           * like storage images. */
@@ -139,7 +139,7 @@ hk_descriptor_stride_align_for_type(
                hk_sampled_image_descriptor_layout(generation).stride;
          } else {
             *stride = HK_MAX_DESCRIPTOR_SIZE;
-            *alignment = agx_chip_native_or_m5(pdev->dev.chip)
+            *alignment = agx_chip_agx3_path(pdev->dev.chip)
                             ? HK_G17P_STORAGE_ALIGNMENT
                             : 8;
          }

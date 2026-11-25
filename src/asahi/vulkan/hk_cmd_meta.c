@@ -1415,7 +1415,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
          const enum agx_chip chip =
             container_of(device, struct hk_device, vk)->dev.chip;
          const bool g17p_color =
-            agx_chip_native_or_m5(chip) &&
+            agx_chip_agx3_path(chip) &&
             !vk_format_is_depth_or_stencil(image->format);
          const struct hk_image *hk_image =
             container_of(image, struct hk_image, vk);

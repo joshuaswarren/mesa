@@ -4223,6 +4223,54 @@ TEST(NativeForms, M5ImageFenceWaitsWriteSlotInBarrier)
    ralloc_free(mem);
 }
 
+/* On G18G, non-rendezvous texture fences must also wait on the preceding
+ * image write's result slot in the barrier word so a subsequent image load
+ * cannot overtake the write. */
+TEST(NativeForms, G18GImageFenceWaitsWriteSlotInBarrier)
+{
+   const enum agx3_barrier_scope scopes[] = {
+      AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT,
+      AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP,
+   };
+   for (enum agx3_barrier_scope scope : scopes) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G18G;
+      key.dev.emit_agx3d = true;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      agx_index data = agx_register(16, AGX_SIZE_32);
+      data.channels_m1 = 3;
+      agx_index coord = agx_register(24, AGX_SIZE_32);
+      coord.channels_m1 = 1;
+      agx_instr *w = agx_image_write(b, data, coord, agx_zero(), agx_zero(),
+                                     agx_immediate(1), AGX_DIM_2D, false);
+      w->format = AGX_FORMAT_I8;
+      agx_scoped_barrier_agx3(b, scope);
+      agx_stop(b);
+      util_dynarray binary;
+      util_dynarray_init(&binary, mem);
+      ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+
+      agx3_encoded_scoped_barrier expected = {};
+      ASSERT_TRUE(agx3_pack_scoped_barrier_wait(
+         AGX_ISA_ENCODING_AGX3C, scope, 0x1, &expected));
+      bool found = false;
+      const uint8_t *bytes = (const uint8_t *)binary.data;
+      for (unsigned i = 0; i + expected.length <= binary.size; ++i) {
+         if (memcmp(bytes + i, expected.bytes, expected.length) == 0) {
+            found = true;
+            break;
+         }
+      }
+      EXPECT_TRUE(found) << scope;
+      util_dynarray_fini(&binary);
+      ralloc_free(mem);
+   }
+}
+
 /* G17G 2D-MS texel fetches staged through PACK_SMPIR: the vertex form
  * (port/vmswit v_ms_f) is the fragment form (f_ms_f) with sampler index 0. */
 TEST(NativeForms, M5VertexMultisampleFetchWitness)

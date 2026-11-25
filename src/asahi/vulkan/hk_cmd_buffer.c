@@ -353,12 +353,12 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    list_for_each_entry_safe(struct hk_vdm_allocation, allocation,
                             &cmd->vdm_allocations, link) {
       list_del(&allocation->link);
-      hk_device_free_span(dev, allocation);
+      hk_cmd_pool_free_vdm_span(pool, allocation);
    }
 
    list_for_each_entry_safe(struct hk_cs, it, &cmd->control_streams, node) {
       list_del(&it->node);
-      hk_cs_destroy(it);
+      hk_cs_recycle(pool, it);
    }
    hk_tess_batch_reset(cmd);
 
@@ -484,22 +484,38 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       _mesa_set_clear(cmd->m5_pushed_images, NULL);
    util_dynarray_clear(&cmd->oq_ends);
 
-   if (!cmd->g17p_gfx_caches_used) {
-      /* These native graphics caches are zero-initialized at allocation and
-       * untouched on AGX2 or compute-only recordings. Reset the common state
-       * on either side without clearing their 8.5 KiB again for every
-       * recording. */
-      const size_t first =
-         offsetof(struct hk_cmd_buffer, state.gfx.g17p_ioto) -
-         offsetof(struct hk_cmd_buffer, state);
-      const size_t end =
-         offsetof(struct hk_cmd_buffer, state.gfx.g17p_spilled_rt_descs) +
-         sizeof(cmd->state.gfx.g17p_spilled_rt_descs) -
-         offsetof(struct hk_cmd_buffer, state);
-      memset(&cmd->state, 0, first);
-      memset((char *)&cmd->state + end, 0, sizeof(cmd->state) - end);
-   } else {
-      memset(&cmd->state, 0, sizeof(cmd->state));
+   /* Reset the common state on either side of the four contiguous native
+    * graphics caches (g17p_ioto..g17p_spilled_rt_descs, ~8.5 KiB) without
+    * zeroing their whole payload on every reset. When populated, clear only
+    * their validity/identity tags. */
+   const size_t first =
+      offsetof(struct hk_cmd_buffer, state.gfx.g17p_ioto) -
+      offsetof(struct hk_cmd_buffer, state);
+   const size_t end =
+      offsetof(struct hk_cmd_buffer, state.gfx.g17p_spilled_rt_descs) +
+      sizeof(cmd->state.gfx.g17p_spilled_rt_descs) -
+      offsetof(struct hk_cmd_buffer, state);
+   memset(&cmd->state, 0, first);
+   memset((char *)&cmd->state + end, 0, sizeof(cmd->state) - end);
+   if (cmd->g17p_gfx_caches_used) {
+      for (unsigned stage = 0; stage < ARRAY_SIZE(cmd->state.gfx.g17p_ioto);
+           ++stage) {
+         cmd->state.gfx.g17p_ioto[stage].loader = NULL;
+         cmd->state.gfx.g17p_ioto[stage].loader_linked = NULL;
+         cmd->state.gfx.g17p_ioto[stage].loader_program = 0;
+         cmd->state.gfx.g17p_ioto[stage].admit.s = NULL;
+         cmd->state.gfx.g17p_ioto[stage].admit.linked = NULL;
+      }
+      for (unsigned stage = 0; stage < ARRAY_SIZE(cmd->state.gfx.g17p_launch);
+           ++stage) {
+         for (unsigned i = 0; i < ARRAY_SIZE(cmd->state.gfx.g17p_launch[stage]);
+              ++i)
+            cmd->state.gfx.g17p_launch[stage][i].valid = false;
+      }
+      for (unsigned i = 0;
+           i < ARRAY_SIZE(cmd->state.gfx.g17p_combined_sampler_pointers); ++i)
+         cmd->state.gfx.g17p_combined_sampler_pointers[i].valid = false;
+      cmd->state.gfx.g17p_spilled_rt_descs.valid = false;
       cmd->g17p_gfx_caches_used = false;
    }
    if (cmd->g17p_bg_eot_cache_used) {
@@ -734,9 +750,9 @@ hk_pool_vdm_primary_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
       MAX2(alignment, HK_G17P_VDM_UPLOAD_CHUNK_SIZE);
    struct agx_ptr chunk = {0};
    struct hk_vdm_allocation *allocation = NULL;
-   const VkResult result = hk_cmd_pool_alloc_span(
-      hk_cmd_buffer_pool(cmd), HK_CMD_SLAB_VDM, chunk_size, chunk_alignment,
-      &chunk, &allocation);
+   const VkResult result = hk_cmd_pool_alloc_vdm_span(
+      hk_cmd_buffer_pool(cmd), chunk_size, chunk_alignment, &chunk,
+      &allocation);
    if (unlikely(result != VK_SUCCESS)) {
       vk_command_buffer_set_error(&cmd->vk, result);
       return (struct agx_ptr){0};
@@ -1727,6 +1743,7 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
    if (root_changed || !retain_root)
       hk_root_mark_dirty(desc);
    desc->generation++;
+   desc->non_push_generation++;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1784,6 +1801,7 @@ hk_push_constants(struct hk_cmd_buffer *cmd,
 
    memcpy(desc->root.push + info->offset, info->pValues, info->size);
    hk_root_mark_push_dirty(desc);
+   /* non_push_generation intentionally does not advance on push constants. */
    desc->generation++;
 }
 
@@ -1864,6 +1882,7 @@ hk_set_descriptor_buffer_offsets(struct hk_cmd_buffer *cmd,
 
    hk_root_mark_dirty(desc);
    desc->generation++;
+   desc->non_push_generation++;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1909,6 +1928,7 @@ hk_bind_embedded_samplers(struct hk_cmd_buffer *cmd,
    hk_bind_buffer_set(desc, pipeline_layout, info->set, addr, size);
    hk_root_mark_dirty(desc);
    desc->generation++;
+   desc->non_push_generation++;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1955,6 +1975,7 @@ hk_cmd_push_descriptors(struct hk_cmd_buffer *cmd,
    desc->push_dirty |= BITFIELD_BIT(set);
    desc->push_active |= BITFIELD_BIT(set);
    desc->generation++;
+   desc->non_push_generation++;
 
    return desc->push[set];
 }
@@ -2651,12 +2672,13 @@ hk_g17p_graphics_ranges_refused(size_t *range_count, size_t count)
  * Return that value (0 when the span is root-relative or absent) so every
  * reuse path can require it to be unchanged.
  */
-uint64_t
-hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,
-                     const struct hk_shader *s)
+int8_t
+hk_g17p_dma_set_index(const struct hk_shader *s)
 {
+   static_assert(HK_MAX_SETS <= INT8_MAX,
+                 "descriptor set index fits in int8_t");
    if (!s)
-      return 0;
+      return -1;
 
    const unsigned root_uniform = s->info.agx3_root_uniform;
    for (unsigned i = 0; i < s->b.info.agx3_uniform_dma_count; ++i) {
@@ -2670,13 +2692,16 @@ hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,
          continue;
 
       /* The compiler copies through at most one set pointer. */
-      const uint64_t base =
-         cmd->state.gfx.descriptors.root.sets[(pointer - root_uniform - 4) / 4];
-      /* Distinguish "set pointer, currently unbound" (zero page) from "no set
-       * span" so that binding a set later still invalidates. */
-      return base ? base : AGX_ZERO_PAGE_ADDRESS;
+      return (int8_t)((pointer - root_uniform - 4) / 4);
    }
-   return 0;
+   return -1;
+}
+
+uint64_t
+hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,
+                     const struct hk_shader *s)
+{
+   return hk_g17p_dma_set_base_from_index(cmd, hk_g17p_dma_set_index(s));
 }
 
 /* The buffer descriptor an AGX3_UNIFORM_DMA_BUFFER span names, as the root
@@ -3374,6 +3399,20 @@ hk_g17p_graphics_program_desc_init(
    struct hk_linked_shader *linked, const struct agx3_ioto_uniform_range *ranges,
    size_t range_count, struct hk_agx3_g17p_graphics_program_desc *desc);
 
+static inline bool
+hk_g17p_gfx_loader_ranges_equal(const struct agx3_ioto_uniform_range *a,
+                                const struct agx3_ioto_uniform_range *b,
+                                size_t range_count)
+{
+   for (size_t i = 0; i < range_count; ++i) {
+      if (a[i].address != b[i].address ||
+          a[i].start_halfs != b[i].start_halfs ||
+          a[i].size_halfs != b[i].size_halfs)
+         return false;
+   }
+   return true;
+}
+
 /* Publish l with the draw's range addresses, or the last program when they
  * are the addresses it was published with. */
 static uint64_t
@@ -3384,10 +3423,14 @@ hk_g17p_gfx_loader_publish(struct hk_cmd_buffer *cmd,
                            const struct agx3_ioto_uniform_range *ranges,
                            size_t range_count)
 {
-   /* The program is a function of the loader and the range addresses. */
+   /* The program is a function of the loader and the range addresses.
+    * Compare fields explicitly rather than with memcmp():
+    * struct agx3_ioto_uniform_range has 4 bytes of internal padding that
+    * compilers leave indeterminate on struct assignment. */
    if (cached->loader == l && cached->loader_linked == linked &&
        cached->loader_program &&
-       !memcmp(cached->loader_ranges, ranges, range_count * sizeof(ranges[0])))
+       hk_g17p_gfx_loader_ranges_equal(cached->loader_ranges, ranges,
+                                       range_count))
       return cached->loader_program;
 
    const uint64_t published = hk_g17p_gfx_loader_emit(cmd, l, ranges);
@@ -5519,8 +5562,8 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    }
    cs->current = map;
 
-   cs->scissor = UTIL_DYNARRAY_INIT;
-   cs->depth_bias = UTIL_DYNARRAY_INIT;
+   util_dynarray_clear(&cs->scissor);
+   util_dynarray_clear(&cs->depth_bias);
    if (!util_dynarray_ensure_cap(&cs->scissor,
                                  HK_MAX_VIEWPORTS * AGX_SCISSOR_LENGTH) ||
        !util_dynarray_ensure_cap(&cs->depth_bias,
