@@ -2198,7 +2198,7 @@ hk_nir_lower_descriptors(nir_shader *nir,
 
    ctx.ssbo_addr_format = hk_buffer_addr_format(
       rs->storage_buffers, rs->null_storage_buffer_descriptor,
-      ctx.descriptor_generation == 10);
+      ctx.descriptor_generation == AGX_DESCRIPTOR_GENERATION_10);
 
    /* First lower everything but complex SSBOs, then lower complex SSBOs.
     *

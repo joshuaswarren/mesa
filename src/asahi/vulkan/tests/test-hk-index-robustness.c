@@ -79,8 +79,9 @@ main(void)
       assert(hk_needs_index_robustness(&cmd, &ind_16gib, NULL));
    }
 
-   /* Every other generation (including G18G, which lacks an empty-draw
-    * continuation) keeps the software rewrite for robust indirect draws. */
+   /* Every other generation (including G18G, whose out-of-range hardware
+    * index bounds are unmeasured) keeps the software rewrite for robust
+    * indirect draws. */
    static const enum agx_chip rewrite_chips[] = {
       AGX_CHIP_G13G, AGX_CHIP_G14X, AGX_CHIP_G15G, AGX_CHIP_G15S,
       AGX_CHIP_G15C, AGX_CHIP_G16G, AGX_CHIP_G18G,
@@ -95,25 +96,23 @@ main(void)
       assert(hk_needs_index_robustness(&cmd, &ind_u32, NULL));
    }
 
-   /* G18G has no continuation for an empty rewritten draw, so an oversized
-    * binding without robustness is not sent to the rewrite (it is refused at
-    * admission instead), including an empty record. */
+   /* G18G has the HAL300 stream-link continuation for empty rewritten draws,
+    * so oversized bindings without robustness route to the rewrite just like
+    * M5, including an empty conditional direct record. */
    init_cmd(&dev, &cmd, AGX_CHIP_G18G, false);
    {
       struct agx_draw ind_16gib_p4 = agx_draw_indexed_indirect(
          UINT64_C(0x200000000), UINT64_C(0x100000000),
          (UINT64_C(1) << 34) + 4, AGX_INDEX_SIZE_U32, false);
-      assert(!hk_needs_index_robustness(&cmd, &ind_16gib_p4, NULL));
+      assert(hk_needs_index_robustness(&cmd, &ind_16gib_p4, NULL));
       struct agx_draw empty_direct = agx_draw_indexed(
          0, 1, 0, 0, 0, UINT64_C(0x100000000), (UINT64_C(1) << 34) + 4,
          AGX_INDEX_SIZE_U32, false);
-      assert(!hk_needs_index_robustness(&cmd, &ind_16gib_p4, &empty_direct));
+      assert(hk_needs_index_robustness(&cmd, &ind_16gib_p4, &empty_direct));
    }
 
-   /* With robustness enabled G18G is refused at rewrite admission, as it
-    * was before the rewrite admitted the record chip: representable and
-    * oversized bindings alike, since an empty rewritten draw has no
-    * continuation there. The chips that have one admit both. */
+   /* All AGX3 path chips with stream-link continuations admit both
+    * representable and oversized bindings into the rewrite. */
    {
       struct agx_draw representable = agx_draw_indexed_indirect(
          UINT64_C(0x200000000), UINT64_C(0x100000000), 0x1000,
@@ -122,15 +121,9 @@ main(void)
          UINT64_C(0x200000000), UINT64_C(0x100000000),
          (UINT64_C(1) << 34) + 4, AGX_INDEX_SIZE_U32, false);
 
-      init_cmd(&dev, &cmd, AGX_CHIP_G18G, true);
-      assert(hk_needs_index_robustness(&cmd, &representable, NULL));
-      assert(!hk_robust_index_rewrite_admitted(&dev, representable,
-                                               AGX_PRIMITIVE_TRIANGLES));
-      assert(!hk_robust_index_rewrite_admitted(&dev, oversized,
-                                               AGX_PRIMITIVE_TRIANGLES));
-
       static const enum agx_chip admitted[] = {
          AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+         AGX_CHIP_G18G,
       };
       for (unsigned i = 0; i < sizeof(admitted) / sizeof(admitted[0]); ++i) {
          init_cmd(&dev, &cmd, admitted[i], true);

@@ -12551,6 +12551,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    const enum agx3_g17p_rt0_eot_kind layered_eot =
       agx3_g17p_layered_eot_kind(ctx, enc);
    if (enc == AGX_ISA_ENCODING_AGX3C && agx_is_g18g(&ctx->key->dev) &&
+       !ctx->key->m5_rt0_eot_store_and_resolve &&
        layered_eot != AGX3_G17P_RT0_EOT_NONE) {
       /* Original BTNF kind5 array and multisample-array builtins, swept
        * across eight formats and 1..4 components on G17G and G18G. Layer
@@ -12593,6 +12594,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    const enum agx3_g17p_rt0_eot_kind rt0_eot =
       agx3_g17p_rt0_eot_kind(ctx, enc);
    if (enc == AGX_ISA_ENCODING_AGX3C && agx_is_g18g(&ctx->key->dev) &&
+       !ctx->key->m5_rt0_eot_store_and_resolve &&
        rt0_eot != AGX3_G17P_RT0_EOT_NONE) {
       /* Genuine applegpu_g17g BTNF kind5 programs. The same architecture
        * independent builtin request that produced the G17P tables produces

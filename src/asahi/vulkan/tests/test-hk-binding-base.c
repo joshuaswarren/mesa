@@ -268,10 +268,31 @@ check_packed_uvec4_refused(bool from_ubo)
    free(layout);
 }
 
+static void
+check_ssbo_addr_format_matches_descriptor_gen(void)
+{
+   /* Gen10 parts (M5 and G18G) all use the 5-component SSBO address format
+    * with the map slot, matching hk_nir_lower_descriptors(). */
+   CHECK(hk_ssbo_addr_has_map(AGX_CHIP_G17G));
+   CHECK(hk_ssbo_addr_has_map(AGX_CHIP_G17S));
+   CHECK(hk_ssbo_addr_has_map(AGX_CHIP_G17C));
+   CHECK(hk_ssbo_addr_has_map(AGX_CHIP_G18G));
+   CHECK(!hk_ssbo_addr_has_map(AGX_CHIP_G17P));
+   CHECK(!hk_ssbo_addr_has_map(AGX_CHIP_G16G));
+   CHECK(!hk_ssbo_addr_has_map(AGX_CHIP_G13G));
+
+   const nir_address_format g18_fmt = hk_buffer_addr_format(
+      VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT, false,
+      hk_ssbo_addr_has_map(AGX_CHIP_G18G));
+   CHECK(g18_fmt == nir_address_format_64bit_global_32bit_offset_map);
+   CHECK(nir_address_format_num_components(g18_fmt) == 5);
+}
+
 int
 main(void)
 {
    glsl_type_singleton_init_or_ref();
+   check_ssbo_addr_format_matches_descriptor_gen();
    check_binding_accepted(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, true, false);
    check_binding_accepted(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, false, false);
    check_binding_accepted(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, true, false);

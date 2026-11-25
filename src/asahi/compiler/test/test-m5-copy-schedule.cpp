@@ -245,6 +245,21 @@ TEST(M5CopySchedule, G18GComputeDeviceLoadsKeepTheirOrder)
    ralloc_free(s.mem);
 }
 
+/* G18G compute blocks taking the sample-hoist path still need size16 allocated
+ * for ilp_block_peak() even when shared_compute_loads is disabled. */
+TEST(M5CopySchedule, G18GComputeCopyLoopMeasuresPeakWithoutCrash)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, true);
+   s.key.dev.chip = AGX_CHIP_G17G;
+   s.key.dev.emit_agx3d = true;
+   emit_copies(&s, 4, true);
+   agx_ilp_schedule(s.b->shader);
+   unsigned first_write = 0;
+   EXPECT_GT(max_reads_in_flight(s.body, &first_write), 1u);
+   ralloc_free(s.mem);
+}
+
 namespace {
 
 /* n device loads of `channels` words, each consumed right after it, with
