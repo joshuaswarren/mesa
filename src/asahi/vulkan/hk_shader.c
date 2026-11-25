@@ -3786,11 +3786,11 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * an encoder with no offset field at all. */
    /* M5 keeps a depth comparison's bias in the sampler descriptor, as the
     * M5 path always has; only a Gen4 sampler moves it into the shader. */
-   if (agx_chip_native_or_m5(dev->dev.chip))
+   if (agx_chip_agx3_path(dev->dev.chip))
       NIR_PASS(lowered_complex, nir, agx_nir_lower_g17p_texture_early,
                support_lod_bias,
                agx_chip_sampler_has_lod_bias(dev->dev.chip) ||
-                  agx_chip_g17_m5(dev->dev.chip));
+                  agx_chip_hal300_path(dev->dev.chip));
    else
       NIR_PASS(lowered_complex, nir, agx_nir_lower_texture_early,
                support_lod_bias);
