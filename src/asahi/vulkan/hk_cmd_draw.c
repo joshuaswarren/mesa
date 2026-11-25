@@ -427,21 +427,21 @@ hk_g17p_bg_eot_shader_supported(const struct agx_bg_eot_shader *shader)
 static struct hk_bg_eot
 hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
                            const struct agx_bg_eot_key *framebuffer_key,
-                           const VkRenderingInfo *info, bool store)
+                           const VkRenderingInfo *info, bool store,
+                           bool partial_render, bool incomplete_render_area)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
    struct agx_bg_eot_key key = *framebuffer_key;
    memset(key.tib.logical_format, 0, sizeof(key.tib.logical_format));
    memset(key.tib.spilled, 0, sizeof(key.tib.spilled));
    memset(key.tib._offset_B, 0, sizeof(key.tib._offset_B));
    memset(key.op, 0, sizeof(key.op));
    key.mixed_mrt = true;
-   /* Multisample targets are stored unresolved: a multi-target pass
-    * resolves afterwards, from the multisample images. */
-   key.multisample_store = store && key.tib.nr_samples > 1;
 
    const VkRenderingAttachmentInfo *atts[HK_MAX_RTS];
    struct hk_image_view *views[HK_MAX_RTS];
+   unsigned logical_rts[HK_MAX_RTS];
    static const enum agx_bg_eot_op order[] = {AGX_BG_LOAD, AGX_BG_CLEAR,
                                               AGX_EOT_STORE};
    unsigned count = 0, reloads = 0;
@@ -450,7 +450,7 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
          if (framebuffer_key->op[rt] != order[i])
             continue;
 
-         struct hk_image_view *view = cmd->state.gfx.render.color_att[rt].iview;
+         struct hk_image_view *view = render->color_att[rt].iview;
          if (count == ARRAY_SIZE(views) || rt >= info->colorAttachmentCount ||
              !view ||
              view->vk.image->samples != MAX2(key.tib.nr_samples, 1) ||
@@ -464,10 +464,71 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
          key.tib._offset_B[count] = framebuffer_key->tib._offset_B[rt];
          key.op[count] = order[i];
          atts[count] = &info->pColorAttachments[rt];
+         logical_rts[count] = rt;
          views[count++] = view;
          reloads += order[i] == AGX_BG_LOAD;
       }
    }
+
+   /* Resolve-only final EOTs on mixed/subset MRT passes (such as a 5-RT
+    * deferred local-read pass with 4 DONT_CARE G-buffers and 1 resolved color
+    * target) can resolve directly through single-sample PBE descriptors in EOT
+    * instead of storing unresolved MSAA samples and running a post-pass meta
+    * resolve. Partial renders and non-eligible passes keep unresolved MSAA
+    * stores. */
+   bool direct_resolve = false;
+   if (store && count > 0) {
+      struct hk_agx3_g17p_mixed_resolve_target resolve_targets[HK_MAX_RTS] = {0};
+      for (unsigned i = 0; i < count; ++i) {
+         const struct hk_image_view *resolve_view =
+            render->color_att[logical_rts[i]].resolve_iview;
+         const bool resolve_pbe_valid =
+            resolve_view && (key.tib.layered
+                                ? resolve_view->planes[0].layered_eot_pbe_valid
+                                : resolve_view->planes[0].eot_pbe_valid);
+         resolve_targets[i] = (struct hk_agx3_g17p_mixed_resolve_target){
+            .format = key.tib.logical_format[i],
+            .view_format = hk_format_to_pipe_format(views[i]->vk.format),
+            .has_resolve_target =
+               atts[i]->resolveImageView != VK_NULL_HANDLE &&
+               atts[i]->resolveMode != VK_RESOLVE_MODE_NONE &&
+               resolve_view != NULL,
+            .average_resolve =
+               atts[i]->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT,
+            .store_source = atts[i]->storeOp == VK_ATTACHMENT_STORE_OP_STORE,
+            .resolve_pbe_valid = resolve_pbe_valid,
+            .resolve_format_matches =
+               resolve_view && resolve_view->vk.format == views[i]->vk.format,
+            .resolve_samples =
+               resolve_view ? resolve_view->vk.image->samples : 0,
+         };
+      }
+
+      const bool suspend_resume =
+         (render->flags &
+          (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) != 0;
+      bool any_unstored_resolve = false;
+      unsigned color_and_resolve_views = 0;
+      for (unsigned rt = 0; rt < info->colorAttachmentCount; ++rt) {
+         const VkRenderingAttachmentInfo *att = &info->pColorAttachments[rt];
+         if (att->imageView == VK_NULL_HANDLE)
+            continue;
+         if (rt < render->color_att_count) {
+            color_and_resolve_views += render->color_att[rt].iview != NULL;
+            color_and_resolve_views +=
+               render->color_att[rt].resolve_iview != NULL;
+         }
+         if (att->resolveMode != VK_RESOLVE_MODE_NONE &&
+             (rt >= HK_MAX_RTS || framebuffer_key->op[rt] != AGX_EOT_STORE))
+            any_unstored_resolve = true;
+      }
+
+      direct_resolve = hk_agx3_g17p_mixed_direct_color_resolve_supported(
+         &framebuffer_key->tib, resolve_targets, count, partial_render,
+         incomplete_render_area, suspend_resume, any_unstored_resolve,
+         color_and_resolve_views);
+   }
+   key.multisample_store = store && !direct_resolve && key.tib.nr_samples > 1;
 
    const unsigned descriptor_generation =
       agx_chip_descriptor_generation(dev->dev.chip);
@@ -565,14 +626,18 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
        */
       struct hk_native_pbe_descriptor pbe_arguments[HK_MAX_RTS] = {0};
       for (unsigned rt = 0; rt < count; ++rt) {
-         if (!(key.tib.layered ? views[rt]->planes[0].layered_eot_pbe_valid
-                               : views[rt]->planes[0].eot_pbe_valid)) {
+         struct hk_image_view *target =
+            direct_resolve ? render->color_att[logical_rts[rt]].resolve_iview
+                           : views[rt];
+         if (!target ||
+             !(key.tib.layered ? target->planes[0].layered_eot_pbe_valid
+                               : target->planes[0].eot_pbe_valid)) {
             vk_command_buffer_set_error(&cmd->vk,
                                         VK_ERROR_FORMAT_NOT_SUPPORTED);
             return (struct hk_bg_eot){0};
          }
-         pbe_arguments[rt] = key.tib.layered ? views[rt]->planes[0].layered_eot
-                                             : views[rt]->planes[0].eot;
+         pbe_arguments[rt] = key.tib.layered ? target->planes[0].layered_eot
+                                             : target->planes[0].eot;
       }
 
       const uint64_t pbe_argument_va = hk_pool_upload(
@@ -679,6 +744,9 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
       hk_cmd_publish_ioto_program(cmd, &reservation, program_length);
    if (!published)
       return (struct hk_bg_eot){0};
+
+   if (direct_resolve)
+      render->g17p_direct_color_resolve = true;
 
    return (struct hk_bg_eot){
       .usc = published,
@@ -1022,7 +1090,7 @@ static struct hk_bg_eot
 hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
                      struct agx_bg_eot_key *key,
                      const VkRenderingInfo *info, bool store,
-                     bool partial_render,
+                     bool partial_render, bool incomplete_render_area,
                      struct hk_g17p_bg_eot_dev_cache *dc, bool *in_device)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -1039,7 +1107,8 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
       assert(!dc);
       if (dc)
          return (struct hk_bg_eot){0};
-      return hk_build_g17p_mixed_bg_eot(cmd, key, info, store);
+      return hk_build_g17p_mixed_bg_eot(cmd, key, info, store, partial_render,
+                                        incomplete_render_area);
    }
 
    /* Vulkan keeps unused colour attachments as holes in the logical array.
@@ -1066,20 +1135,35 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
    compact_info.pColorAttachments = attachments;
    key = &compact_key;
    info = &compact_info;
+   const struct hk_rendering_state *render = &cmd->state.gfx.render;
+   const bool r11g11b10_own_class = hk_eot_r11g11b10_own_class(&dev->dev);
+   const bool suspend_resume =
+      (render->flags &
+       (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) != 0;
+   /* Single-target direct resolve supports partial renderArea via
+    * preserve_resolve_outside, while refusing sparse multiview viewMask.
+    * Both are false whenever incomplete_render_area is false. */
+   const bool sparse_view_mask =
+      incomplete_render_area && render->view_mask &&
+      render->view_mask != BITFIELD64_MASK(render->cr.layers);
    if (!store && !partial_render && active_count == 1) {
       const VkRenderingAttachmentInfo *att = &attachments[0];
-      const struct hk_rendering_state *render = &cmd->state.gfx.render;
-      const bool partial_area = render->area.offset.x || render->area.offset.y ||
-         render->area.extent.width < render->cr.width ||
-         render->area.extent.height < render->cr.height;
+      const bool partial_area = incomplete_render_area &&
+         (render->area.offset.x || render->area.offset.y ||
+          render->area.extent.width < render->cr.width ||
+          render->area.extent.height < render->cr.height);
       /* The EOT resolve writes full tiles. Merge the destination outside the
-       * API rectangle before that store, retaining native MSAA resolution. */
-      key->preserve_resolve_outside = partial_area &&
+       * API rectangle before that store, retaining native MSAA resolution.
+       * Suspended/resumed passes and sparse multiview masks must not
+       * direct-resolve. */
+      key->preserve_resolve_outside = partial_area && !suspend_resume &&
+         !sparse_view_mask &&
          hk_agx3_g17p_direct_color_resolve_supported(
             &key->tib, active_count,
             att->resolveImageView != VK_NULL_HANDLE,
             att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT,
-            att->storeOp == VK_ATTACHMENT_STORE_OP_STORE);
+            att->storeOp == VK_ATTACHMENT_STORE_OP_STORE,
+            r11g11b10_own_class);
    }
    if (!hk_agx3_g17p_rt0_tile_layout_supported(&key->tib)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -1097,8 +1181,9 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
     * leave holes before the sole live color attachment; selecting from
     * logical slot0 and colorAttachmentCount before compaction loses its
     * STORE requirement and selects a single-sample EOT for an MS surface.
-    * Keep samples for partial renders, explicit STORE, and resolves that
-    * execute after the pass. Final direct resolves remain single-sampled. */
+    * Keep samples for partial renders, suspended/resumed passes, sparse
+    * multiview masks, explicit STORE, and resolves that execute after the
+    * pass. Final direct resolves remain single-sampled. */
    if (store && active_count == 1) {
       const VkRenderingAttachmentInfo *att = &attachments[0];
       const struct hk_image_view *iview = color_att[0].iview;
@@ -1106,9 +1191,11 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
       const bool has_resolve = att->resolveImageView != VK_NULL_HANDLE &&
                                att->resolveMode != VK_RESOLVE_MODE_NONE;
       const bool resolved_after_pass = has_resolve &&
-         !hk_agx3_g17p_direct_color_resolve_supported(
-            &key->tib, active_count, has_resolve,
-            att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT, store_source);
+         (suspend_resume || sparse_view_mask ||
+          !hk_agx3_g17p_direct_color_resolve_supported(
+             &key->tib, active_count, has_resolve,
+             att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT, store_source,
+             r11g11b10_own_class));
       key->multisample_store = hk_agx3_g17p_multisample_store_supported(
          &key->tib, active_count,
          partial_render || store_source || resolved_after_pass,
@@ -1133,7 +1220,8 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
          .source_pbe_valid = iview && iview->planes[0].eot_pbe_valid,
          .resolve_pbe_valid = resolve && resolve->planes[0].eot_pbe_valid,
       };
-      key->store_and_resolve = key->multisample_store &&
+      key->store_and_resolve = key->multisample_store && !suspend_resume &&
+         !sparse_view_mask &&
          hk_agx3_g17p_store_and_resolve_supported(&key->tib, &fused);
    }
 
@@ -1313,12 +1401,13 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
        * which is what key->multisample_store selects below.
        */
       const bool direct_resolve =
-         !partial_render &&
+         !partial_render && !suspend_resume && !sparse_view_mask &&
          hk_agx3_g17p_direct_color_resolve_supported(
             &key->tib, info->colorAttachmentCount,
             att->resolveImageView != VK_NULL_HANDLE,
             att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT,
-            att->storeOp == VK_ATTACHMENT_STORE_OP_STORE);
+            att->storeOp == VK_ATTACHMENT_STORE_OP_STORE,
+            r11g11b10_own_class);
       struct hk_image_view *target = direct_resolve
          ? color_att[0].resolve_iview : iview;
       struct hk_image_view *iview1 = dual_mrt_active
@@ -1395,8 +1484,10 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
       struct hk_native_pbe_descriptor pbe_arguments[4] = {target_pbe};
       /* The native resolve averages in linear space when its PBE requests
        * the sRGB transfer. Ordinary stores already have encoded tile bytes
-       * and retain the unmodified end-of-tile descriptor. */
-      if (direct_resolve && util_format_is_srgb(key->tib.logical_format[0]) &&
+       * and retain the unmodified end-of-tile descriptor. Check the unmapped
+       * view format so this never depends on hk_eot_key_format(). */
+      if (direct_resolve &&
+          util_format_is_srgb(hk_format_to_pipe_format(iview->vk.format)) &&
           !(color_att[0].flags &
             VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR))
          ((uint8_t *)&pbe_arguments[0])[15] |= 0x20;
@@ -1684,6 +1775,7 @@ struct hk_g17p_bg_eot_cache_key {
    uint32_t layers;
    uint8_t color_attachment_count;
    bool incomplete_render_area;
+   bool suspend_resume;
 };
 
 static uint64_t
@@ -1721,6 +1813,9 @@ hk_g17p_bg_eot_cache_get(struct hk_cmd_buffer *cmd,
       .layers = cmd->state.gfx.render.cr.layers,
       .color_attachment_count = info->colorAttachmentCount,
       .incomplete_render_area = incomplete_render_area,
+      .suspend_resume =
+         (cmd->state.gfx.render.flags &
+          (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) != 0,
    };
    for (unsigned i = 0; i < info->colorAttachmentCount; ++i) {
       const VkRenderingAttachmentInfo *att = &info->pColorAttachments[i];
@@ -2835,7 +2930,9 @@ hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
                        HK_G17P_BG_EOT_DEV_DATA_MAX, 32)) {
             bool in_device = false;
             program = hk_build_g17p_bg_eot(cmd, &key, info, store,
-                                           partial_render, dc, &in_device);
+                                           partial_render,
+                                           incomplete_render_area, dc,
+                                           &in_device);
             built = true;
             if (program.usc && in_device &&
                 !vk_command_buffer_has_error(&cmd->vk)) {
@@ -2852,7 +2949,8 @@ hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
       }
       if (!built)
          program = hk_build_g17p_bg_eot(cmd, &key, info, store,
-                                        partial_render, NULL, NULL);
+                                        partial_render,
+                                        incomplete_render_area, NULL, NULL);
       if (cache && program.usc && !vk_command_buffer_has_error(&cmd->vk)) {
          cache->program[variant] = program;
          cache->valid_variants |= BITFIELD_BIT(variant);
@@ -5550,9 +5648,19 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       clear_draw_skips_zs = true;
    }
    /* Resolves of loaded samples write the destination even without geometry. */
-   const bool loaded_resolve =
-      render->g17p_direct_color_resolve &&
-      pRenderingInfo->pColorAttachments[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
+   bool loaded_resolve = false;
+   if (render->g17p_direct_color_resolve) {
+      for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; ++i) {
+         const VkRenderingAttachmentInfo *att =
+            &pRenderingInfo->pColorAttachments[i];
+         if (att->imageView != VK_NULL_HANDLE &&
+             att->resolveMode != VK_RESOLVE_MODE_NONE &&
+             att->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+            loaded_resolve = true;
+            break;
+         }
+      }
+   }
    const bool process_empty_tiles =
       resolved_clear || resolved_clear_z || resolved_clear_s || loaded_resolve;
    render->process_empty_tiles_without_z =
