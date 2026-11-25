@@ -63,7 +63,8 @@ check_descriptor(bool push, unsigned set, unsigned binding, bool hardware)
    nir_pop_loop(&b, NULL);
    nir_shader_gather_info(b.shader, b.impl);
    CHECK(hk_nir_lower_descriptors(b.shader, &vk_robustness_disabled,
-      set + 1, layouts, false, false, 0, false, false, false, false, false));
+      set + 1, layouts, false, false, 0, false, false, false, false, false,
+      false));
    const struct agx_gen1_ray_query_layout rq_layout = {
       .payload_uniform = 118, .bvh_uniform = 96, .status_uniform = 128,
       .context_uniform = 160, .as_table_uniform = 164, .as_table_first = 1,

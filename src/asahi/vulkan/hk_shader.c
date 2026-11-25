@@ -3848,7 +3848,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             agx_chip_sampler_has_lod_bias(dev->dev.chip),
             instance->drirc.misc.d3d_nearest_mip,
             hk_coherent_images_in_memory(&dev->dev),
-            agx_chip_g17_m5(dev->dev.chip));
+            agx_chip_g17_m5(dev->dev.chip),
+            agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3D);
    bool lowered_global_io = false;
    NIR_PASS(lowered_global_io, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);

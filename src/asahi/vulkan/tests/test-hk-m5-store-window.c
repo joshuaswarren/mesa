@@ -161,7 +161,7 @@ check_lowering(enum glsl_sampler_dim dim, bool array, bool window)
       .align_mul = 4, .write_mask = 1);
 
    CHECK(hk_nir_lower_descriptors(b.shader, &vk_robustness_disabled, 1,
-      layouts, false, false, 0, false, false, false, false, window));
+      layouts, false, false, 0, false, false, false, false, window, false));
    nir_validate_shader(b.shader, "after hk_nir_lower_descriptors");
 
    const bool layered = dim == GLSL_SAMPLER_DIM_CUBE || array;
