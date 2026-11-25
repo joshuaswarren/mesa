@@ -69,6 +69,43 @@ licm(agx_context *ctx, unsigned file_regs = 0)
 
 } // namespace
 
+/* Without a static register split (AGX3B/AGX3C), loop-invariant motion may
+ * use the halves below the next file alignment boundary and no more: the
+ * assignment file is sized from the aligned demand. */
+TEST(OptLicm, DemandBoundStopsAtTheAlignedFile)
+{
+   Loop l;
+   agx_builder *b = l.b;
+   l.key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   b->cursor = agx_after_block(l.entry);
+   agx_index w = busy_preheader(b);
+   b->cursor = agx_after_block(l.body);
+   agx_index out = agx_iadd(b, agx_mov_imm(b, 32, 0x1234), w, 0);
+   b->cursor = agx_after_block(l.exit);
+   agx_unit_test(b, out);
+
+   /* 32-bit values only: the file aligns to 8 halves. */
+   EXPECT_EQ(agx_licm_demand_bound(b->shader, 21, 256), 24u);
+   EXPECT_EQ(agx_licm_demand_bound(b->shader, 24, 256), 24u);
+   EXPECT_EQ(agx_licm_demand_bound(b->shader, 250, 248), 248u);
+}
+
+/* With a static register split the bound is the demand itself, so hoisting
+ * keeps the occupancy step. */
+TEST(OptLicm, DemandBoundKeepsStaticSplitDemand)
+{
+   Loop l;
+   agx_builder *b = l.b;
+   l.key.dev.encoding = AGX_ISA_ENCODING_AGX2;
+   b->cursor = agx_after_block(l.entry);
+   agx_index w = busy_preheader(b);
+   b->cursor = agx_after_block(l.exit);
+   agx_unit_test(b, w);
+
+   EXPECT_EQ(agx_licm_demand_bound(b->shader, 21, 256), 21u);
+   EXPECT_EQ(agx_licm_demand_bound(b->shader, 24, 256), 24u);
+}
+
 /* Two equal immediates materialized in the loop become one definition in the
  * preheader, and every use reads it. */
 TEST(OptLicm, HoistsAndMergesLoopImmediates)
