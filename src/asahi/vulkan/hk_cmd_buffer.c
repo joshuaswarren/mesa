@@ -337,6 +337,7 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    struct hk_device *dev = hk_cmd_pool_device(pool);
    hk_cmd_buffer_reset_alias_sites(cmd);
    hk_cmd_pending_reap(dev);
+   hk_cmd_pending_retain_lost(dev, cmd);
 
    /* The cached span is only valid while this recording owns its leases. */
    cmd->g17p_vdm_last_allocation = NULL;
@@ -1111,6 +1112,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_cmd_buffer_end_compute(cmd);
    cmd->state.cs.cdm_barrier_pending = false;
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
+   hk_resolve_pending_oq_available(cmd);
    hk_resolve_deferred_oq_available(cmd);
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -1242,7 +1244,8 @@ hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info
    struct hk_barrier_state state = {
       .shader_writes = render->barrier_shader_writes,
       .pre_graphics = cmd->current_cs.pre_gfx != NULL,
-      .post_graphics = cmd->current_cs.post_gfx != NULL,
+      .post_graphics = cmd->current_cs.post_gfx != NULL ||
+                       cmd->state.oq_pending_render != NULL,
       .tilebuffer_spilled = agx_tilebuffer_spills(&render->tilebuffer),
       .attachments = images,
    };
@@ -1597,20 +1600,21 @@ hk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
 
 }
 
-/* Only ordinary G17P graphics programs whose descriptor values are fetched
- * through the root/table in GPU memory qualify.  CPU-decoded combined sampler
- * programs and variant selection retain the existing publication path.
+/* Only ordinary graphics programs whose descriptor values are fetched through
+ * the root/table in GPU memory qualify.  CPU-decoded combined sampler programs
+ * and variant selection retain the existing publication path.
  */
 static bool
-hk_g17p_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
-                                  const struct hk_descriptor_state *desc)
+hk_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
+                              const struct hk_descriptor_state *desc)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   if (!agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) ||
-       desc != &gfx->descriptors ||
+   if (desc != &gfx->descriptors ||
        gfx->shaders[MESA_SHADER_GEOMETRY] ||
        gfx->shaders[MESA_SHADER_TESS_CTRL] ||
-       gfx->shaders[MESA_SHADER_TESS_EVAL])
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_MESH] ||
+       gfx->shaders[MESA_SHADER_TASK])
       return false;
 
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
@@ -1712,7 +1716,7 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
    desc->dynamic_buffer_end = MAX2(desc->dynamic_buffer_end, dyn_buffer_start);
 
    hk_upload_stat(cmd, descriptor_binds, 1);
-   const bool retain_root = hk_g17p_can_retain_descriptor_root(cmd, desc);
+   const bool retain_root = hk_can_retain_descriptor_root(cmd, desc);
    if (!root_changed && !binding_changed && retain_root) {
       hk_upload_stat(cmd, descriptor_noops, 1);
       return;
@@ -2473,13 +2477,15 @@ hk_g17p_basic_graphics_program_supported(struct hk_cmd_buffer *cmd,
       (s->b.info.stage == MESA_SHADER_VERTEX ||
        s->info.stage == MESA_SHADER_FRAGMENT) &&
       hk_g17p_native_cprog_qualified(&s->b.info);
+   const uint32_t max_scratch_B = hk_graphics_max_scratch_B(
+      &hk_cmd_buffer_device(cmd)->dev, s->b.info.stage);
    if (!linked || !linked->b.bo || !linked->b.bo->va || linked->b.size == 0 ||
        linked->b.size > UINT32_MAX || (s->b.info.has_preamble && !native_preamble) ||
        MAX2(s->b.info.scratch_size, s->b.info.agx3_spectpr_scratch_size) >
-          AGX3_G17P_MAX_SPILL_B ||
+          max_scratch_B ||
        (s->b.info.preamble_scratch_size != 0 && !native_preamble) ||
        MAX2(linked->b.scratch_size, linked->b.agx3_spectpr_scratch_size) >
-          AGX3_G17P_MAX_SPILL_B ||
+          max_scratch_B ||
        s->b.info.texture_state_count != 0 ||
        (s->b.info.sampler_state_count != 0 &&
         !(s->info.agx3_indexed_sampler_valid &&
@@ -5119,7 +5125,7 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    /* Attachmentless rendering defers its API sample count. Publish the
     * native one-sample no-imageblock profile in this control stream while
     * preserving the deferred count in render state. */
-   if (agx_chip_g17_m5(dev->dev.chip) && !cs->tib.sample_size_B &&
+   if (agx_chip_hal300_path(dev->dev.chip) && !cs->tib.sample_size_B &&
        !cs->tib.nr_samples && !render->color_att_count &&
        !render->depth_att.iview && !render->stencil_att.iview)
       cs->tib.nr_samples = 1;
@@ -5390,10 +5396,10 @@ hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->end = cs->current + size;
    cs->chunk = T;
    cs->stream_linked |= linked;
-   /* Conservative: G17P and the M5 re-emit their restart state after a
+   /* Conservative: AGX3 path chips re-emit their restart state after a
     * link, and HAL200 re-publishes its full bind tail before relying on
     * incremental FS PPP updates or tail elision in the new chunk. */
-   if (vdm && agx_chip_g17p_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+   if (vdm && agx_chip_agx3_path(hk_cmd_buffer_device(cmd)->dev.chip))
       cs->restart_index_set = false;
    if (vdm && agx_chip_native_hal200(hk_cmd_buffer_device(cmd)->dev.chip))
       cs->g17p_bind_tail.valid = false;
@@ -5537,6 +5543,10 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
 
       return false;
    }
+
+   /* Flush inline occlusion availability before replacing and destroying cs. */
+   if (unlikely(cmd->state.oq_pending_render == cs))
+      hk_flush_oq_pending(cmd);
 
    /* The clears stand in for the render: they are graphics work for every
     * later dependency, and they were recorded under the same requirements

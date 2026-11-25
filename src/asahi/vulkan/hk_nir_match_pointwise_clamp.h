@@ -117,6 +117,7 @@ enum hk_compute_pair_role {
    HK_COMPUTE_PAIR_COPY4 = 4,
    HK_COMPUTE_PAIR_SELF_COPY = 5,
    HK_COMPUTE_PAIR_PAD4 = 6,
+   HK_COMPUTE_PAIR_FADD = 7,
 };
 
 enum hk_compute_pair_dual_write {
@@ -157,6 +158,7 @@ struct hk_compute_pair_info {
       struct hk_nir_depthwise_output depthwise;
       struct hk_nir_gemm_output gemm;
       struct hk_nir_pointwise_clamp clamp;
+      uint32_t fadd_push_bytes;
    };
 };
 

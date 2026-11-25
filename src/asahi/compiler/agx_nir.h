@@ -56,6 +56,9 @@ bool agx_nir_lower_g17p_tile_samples(struct nir_shader *s, unsigned nr_samples);
 bool agx_nir_lower_g18_tile_samples(struct nir_shader *s, unsigned nr_samples);
 bool agx_nir_lower_g17p_1x_tile_samples(struct nir_shader *s);
 bool agx_nir_fold_d3d_float_to_int(struct nir_shader *shader);
+bool agx_nir_opt_u8_absdiff(struct nir_shader *shader);
+bool agx_nir_opt_m5_narrow_to_float(struct nir_shader *shader);
+bool agx_nir_opt_popcount_idiom(struct nir_shader *shader);
 bool agx_nir_fold_pixel_coord(struct nir_shader *shader);
 bool agx_nir_fold_extract16_bfe(struct nir_shader *shader);
 bool agx_nir_opt_half_bitfield_extract(struct nir_shader *shader);
@@ -113,6 +116,7 @@ bool agx_nir_lower_shared_element_index(struct nir_shader *s);
 bool agx_nir_opt_shared_byte_offsets(struct nir_shader *s);
 bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget,
                       bool cap_rt_compute);
+bool agx_nir_opt_dw_conv_3x3(struct nir_shader *shader);
 bool agx_nir_opt_monotonic_bit_insert(struct nir_shader *shader);
 bool agx_nir_opt_iv_divmod(struct nir_shader *shader);
 bool agx_nir_lower_fminmax(struct nir_shader *s, bool ftz_only);
@@ -411,3 +415,15 @@ bool agx_nir_uniform_unit_global_id(struct nir_shader *nir);
 bool agx_nir_opt_uniform_stride_chains(struct nir_shader *shader,
                                        bool no_textures);
 bool agx_nir_opt_unswitch_affine_bounds(struct nir_shader *shader);
+
+bool agx_nir_merge_global_words(struct nir_shader *shader);
+bool agx_nir_narrow_single_subgroup_barriers(struct nir_shader *shader);
+bool agx_nir_narrow_subgroup0_barriers(struct nir_shader *shader);
+bool agx_nir_opt_uniform_stride(struct nir_shader *shader);
+bool agx_nir_fold_m5_offsets(struct nir_shader *shader, bool soft_fault);
+bool agx_nir_unroll_runtime_loops(struct nir_shader *shader, unsigned factor,
+                                  unsigned max_instrs, unsigned *widest);
+
+bool agx_nir_is_shared_phase_barrier(struct nir_instr *instr);
+bool agx_nir_opt_shared_flat_phase_cse(struct nir_shader *shader);
+bool agx_nir_opt_shared_vec2(struct nir_shader *shader);

@@ -1122,6 +1122,12 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    dev->dev.compute_timeout_ms = instance->drirc.misc.compute_timeout_ms;
 
+   /* Bounded poll before blocking syncobj waits (see vk_device.sync_wait_poll_us).
+    * Off by default; pays CPU to skip wake-up latency on short submit->signal
+    * round trips. */
+   dev->vk.sync_wait_poll_us =
+      CLAMP(debug_get_num_option("HK_SUBMIT_POLL_US", 0), 0, 1000000);
+
    /* Native graphics compiles the emulation in only once a custom border
     * sampler exists, and most samples then pay one branch, so D3D content keeps
     * its correct borders there. */
@@ -1325,10 +1331,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    *pDevice = hk_device_to_handle(dev);
 
-   simple_mtx_init(&dev->cmd_pending_lock, mtx_plain);
-   list_inithead(&dev->cmd_pending_queues);
-   list_inithead(&dev->cmd_pending_failed);
-   dev->cmd_pending_ready = true;
+   hk_cmd_pending_init(dev);
    hk_query_stamps_init(dev);
    simple_mtx_init(&dev->vdm.lock, mtx_plain);
    for (unsigned class = 0; class < HK_CMD_SLAB_COUNT; ++class) {

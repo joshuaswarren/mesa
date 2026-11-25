@@ -640,6 +640,8 @@ struct agx_shader_key {
     * g17p_dma_static_set_mask. !g17p_uniform_dma leaves code unchanged. */
    bool g17p_uniform_dma;
    uint16_t g17p_dma_root;
+   /* Guaranteed resident prefix at g17p_dma_root for speculative VS loads. */
+   uint16_t preamble_root_size_B;
    uint8_t g17p_dma_set_mask;
    uint8_t g17p_dma_static_set_mask;
    uint8_t g17p_dma_buffer_count;
@@ -767,6 +769,11 @@ extern "C" {
 uint64_t agx_gather_texcoords(nir_shader *nir);
 
 void agx_preprocess_nir(nir_shader *nir);
+/* Generic preprocessing with an explicit ISA encoding so frontends that keep
+ * the generic lowering mode (such as Gallium on AGX3B) still inherit AGX3B's
+ * early branch-preservation and conditional-load-sinking policy. */
+void agx_preprocess_nir_for_encoding(nir_shader *nir,
+                                     enum agx_isa_encoding encoding);
 void agx_preprocess_nir_g17p(nir_shader *nir);
 /* For any native AGX3 chip (agx_chip_native_agx3); passes validated on G17P
  * alone check chip. */

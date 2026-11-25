@@ -29,6 +29,8 @@
 #include "asahi/lib/agx_ppp_viewport_payload_core.h"
 #include "asahi/lib/agx_vdm_hal200_bind_tail_core.h"
 #include "asahi/lib/agx_va_runtime_hole.h"
+#include "asahi/libagx/query.h"
+#include "hk_query_oq.h"
 
 #include "hk_private.h"
 #include "hk_barrier.h"
@@ -1379,6 +1381,9 @@ struct hk_cs {
     * (struct hk_alias_site) does not move it. */
    void *memory_flush_end;
 
+   /* The vertex stages read the hoisted preamble after this stream. */
+   bool pre_gfx_writes_preamble;
+
    /* M5: patch sites recorded in this stream (hk_cmd_buffer::alias_sites),
     * which a merge moves with its bytes. */
    uint32_t alias_sites;
@@ -1524,6 +1529,19 @@ struct hk_cs {
     * (hk_resolve_deferred_oq_available()). Implies CDM. */
    struct util_dynarray oq_stamps;
    bool oq_avail_deferred;
+
+   /* Native AGX3: occlusion availability writes staged inline on a render
+    * stream so single-render command buffers stamp availability directly at
+    * EndCommandBuffer without allocating and discarding a post_gfx CDM stream
+    * and its GPU control-stream root. Materialized into post_gfx on demand by
+    * hk_flush_oq_pending() before any later stream or sync record. */
+   struct hk_oq_pending {
+      uint64_t avail_addr;
+      uint32_t handle;
+      uint32_t offset_B;
+      uint8_t avail_size;
+   } oq_pending[3];
+   uint8_t oq_pending_count;
 
    /* Number of successfully emitted draws whose last raster producer is
     * positively known to target only hardware Layer=0, without multiview.
@@ -2184,6 +2202,11 @@ struct hk_cmd_buffer {
       /* Scoped around direct/indirect AS builds, including their meta blits. */
       bool as_build_recording;
 
+      /* Render stream holding unstamped inline occlusion availability records
+       * (cs->oq_pending). Cleared by hk_flush_oq_pending() or
+       * hk_resolve_pending_oq_available(). */
+      struct hk_cs *oq_pending_render;
+
       /* AGX3: the last render pass instance stored a whole depth-only image
        * that nothing recorded since may have read. A later instance that
        * clears the whole image, or does not care about its contents, makes
@@ -2786,6 +2809,8 @@ hk_cs_create(struct hk_cmd_buffer *cmd, bool compute)
    return root.cpu ? hk_cs_create_at(cmd, compute, root) : NULL;
 }
 
+static inline void hk_flush_oq_pending(struct hk_cmd_buffer *cmd);
+
 static inline struct hk_cs *
 hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
                              bool compute)
@@ -2798,6 +2823,10 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
    if (unlikely(cmd->state.pending_z_store.cs) &&
        !cmd->state.deferred_clear_hold)
       cmd->state.pending_z_store.cs = NULL;
+   if (unlikely(cmd->state.oq_pending_render) &&
+       (ptr == &cmd->current_cs.post_gfx ||
+        cmd->current_cs.gfx != cmd->state.oq_pending_render))
+      hk_flush_oq_pending(cmd);
 
    if (vk_command_buffer_has_error(&cmd->vk))
       return NULL;
@@ -3052,6 +3081,7 @@ hk_cs_destroy(struct hk_cs *cs)
 
 void hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 bool hk_defer_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_resolve_pending_oq_available(struct hk_cmd_buffer *cmd);
 void hk_resolve_deferred_oq_available(struct hk_cmd_buffer *cmd);
 
 bool hk_g17p_smooth_varyings_supported(
@@ -3102,6 +3132,50 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
    }
 
    *ptr = NULL;
+}
+
+static inline void
+hk_flush_oq_pending(struct hk_cmd_buffer *cmd)
+{
+   struct hk_cs *render = cmd->state.oq_pending_render;
+   if (!render)
+      return;
+
+   cmd->state.oq_pending_render = NULL;
+   const uint8_t count = render->oq_pending_count;
+   render->oq_pending_count = 0;
+   if (!count)
+      return;
+
+   struct hk_cs *cs =
+      hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.post_gfx, true);
+   if (!cs || vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+   if (!cs->imm_writes.data)
+      cs->imm_writes = UTIL_DYNARRAY_INIT;
+   if (!cs->oq_stamps.data)
+      cs->oq_stamps = UTIL_DYNARRAY_INIT;
+
+   for (unsigned i = 0; i < count; ++i) {
+      const struct hk_oq_pending *p = &render->oq_pending[i];
+      const struct libagx_imm_write imm = {
+         .address = p->avail_addr,
+         .value = 1,
+      };
+      util_dynarray_append(&cs->imm_writes, imm);
+      hk_cmd_note_imm_write_query_range(cmd, cs, p->handle, p->offset_B,
+                                        p->avail_size);
+      const struct hk_oq_stamp stamp = {
+         .handle = p->handle,
+         .offset_B = p->offset_B,
+         .render_seq = render->sync.seq,
+      };
+      util_dynarray_append(&cs->oq_stamps, stamp);
+   }
+
+   if (cmd->current_cs.gfx != render)
+      hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
 }
 
 static void

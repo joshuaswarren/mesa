@@ -254,4 +254,6 @@ VkResult hk_queue_submit_bind_sparse_memory(struct hk_device *device,
 
 uint32_t hk_queue_independent_budget(struct hk_device *dev);
 
+bool hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue);
+
 void hk_queue_share(struct hk_device *dev, struct hk_queue *queue);

@@ -605,6 +605,9 @@ void hk_sync_pass_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
 void hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                      struct hk_cs *self, struct hk_sync_dep dep[HK_SYNC_NUM_SQ]);
 
+/* A compute stream for a query command, ordered after earlier query work. */
+struct hk_cs *hk_query_command_cs(struct hk_cmd_buffer *cmd);
+
 /* The render stream draws with a pre-rasterization shader that reads images:
  * its vertex half joins the image-barrier requirements (HK_SYNC_GFX_IMG). */
 void hk_sync_vertex_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs);

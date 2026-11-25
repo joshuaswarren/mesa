@@ -217,7 +217,7 @@ build_live_rcp_chain(agx_builder *b, unsigned count)
       agx_unit_test(b, vals[i]);
 }
 
-TEST(SpillSlots, LargeSpillFrameExceeds4KiBOnCdmOnly)
+TEST(SpillSlots, LargeSpillFrameHonorsLaunchCeiling)
 {
    struct Case {
       enum agx_isa_encoding enc;
@@ -231,11 +231,15 @@ TEST(SpillSlots, LargeSpillFrameExceeds4KiBOnCdmOnly)
       /* AGX2 stays strictly capped at AGX2_MAX_SPILL_SLOTS (4096 B). */
       {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, MESA_SHADER_COMPUTE,
        AGX3_G17P_MAX_COMPUTE_SPILL_B, false},
-      /* AGX3 graphics / default (max_scratch_B == 0) stays capped at 4096 B. */
+      /* Graphics with the default or legacy launch limits is capped at 4 KiB. */
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, MESA_SHADER_VERTEX, 0, false},
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, MESA_SHADER_FRAGMENT,
        AGX3_G17P_MAX_SPILL_B, false},
       {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, MESA_SHADER_VERTEX, 0, false},
+      /* HAL300 hardware vertex launches can publish the full linked TPS
+       * frame through render resources, including for a GS raster replay. */
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, MESA_SHADER_VERTEX,
+       2u * AGX_NUM_MODELED_REGS, true},
       /* AGX3 CDM stages (compute / GS) admit > 4 KiB up to 16 KiB in RA. */
       {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, MESA_SHADER_GEOMETRY,
        AGX3_G17P_MAX_COMPUTE_SPILL_B, true},

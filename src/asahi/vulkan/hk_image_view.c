@@ -876,58 +876,68 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
       }
    }
 
-   /* A driver-internal view made only to be sampled, as meta operations
-    * make for their sources, is only ever written to sampled-image
-    * descriptors: skip the storage, attachment and end-of-tile packets.
+   /* Driver-internal views made only to be sampled or only for storage, as
+    * meta operations make for their sources and destinations, only write the
+    * descriptor kind their usage names: skip unused texture, heap and PBE
+    * packets.
     */
    const bool sampled_only =
       (pCreateInfo->flags & VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA) &&
       view->vk.usage == VK_IMAGE_USAGE_SAMPLED_BIT;
+   const bool storage_only =
+      (pCreateInfo->flags & VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA) &&
+      view->vk.usage == VK_IMAGE_USAGE_STORAGE_BIT;
 
    /* Fill in each view plane separately */
    for (unsigned p = 0; p < view->plane_count; p++) {
       const bool textures_valid =
-         pack_texture(dev, view, p, HK_DESC_USAGE_SAMPLED,
-                      &view->planes[p].sampled) &&
-         (sampled_only ||
-          (pack_texture(dev, view, p, HK_DESC_USAGE_STORAGE,
-                        &view->planes[p].ro_storage) &&
-         pack_texture(dev, view, p, HK_DESC_USAGE_INPUT,
-                      &view->planes[p].ia) &&
-         pack_texture(dev, view, p, HK_DESC_USAGE_EMRT,
-                      &view->planes[p].emrt_texture) &&
-         pack_texture(dev, view, p, HK_DESC_USAGE_BG_EOT,
-                      &view->planes[p].background) &&
-         pack_texture(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
-                      &view->planes[p].layered_background)));
+         storage_only
+            ? pack_texture(dev, view, p, HK_DESC_USAGE_STORAGE,
+                           &view->planes[p].ro_storage)
+            : (pack_texture(dev, view, p, HK_DESC_USAGE_SAMPLED,
+                            &view->planes[p].sampled) &&
+               (sampled_only ||
+                (pack_texture(dev, view, p, HK_DESC_USAGE_STORAGE,
+                              &view->planes[p].ro_storage) &&
+                 pack_texture(dev, view, p, HK_DESC_USAGE_INPUT,
+                              &view->planes[p].ia) &&
+                 pack_texture(dev, view, p, HK_DESC_USAGE_EMRT,
+                              &view->planes[p].emrt_texture) &&
+                 pack_texture(dev, view, p, HK_DESC_USAGE_BG_EOT,
+                              &view->planes[p].background) &&
+                 pack_texture(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
+                              &view->planes[p].layered_background))));
       if (!textures_valid)
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
       if (agx_chip_agx3_path(dev->dev.chip)) {
-         VkResult result = hk_image_view_heap_add(
-            dev, view, replay, p, HK_VIEW_HEAP_SAMPLED, &view->planes[p].sampled,
-            &view->planes[p].sampled_heap_index);
-         if (result != VK_SUCCESS)
-            return result;
-         view->planes[p].filterable_valid =
-            hk_uscaled_normalized_format(hk_padded_image_format(
-               hk_format_to_pipe_format(view->vk.format))) != PIPE_FORMAT_NONE &&
-            pack_texture(dev, view, p, HK_DESC_USAGE_SAMPLED_FILTERABLE,
-                         &view->planes[p].sampled_filterable);
-         if (view->planes[p].filterable_valid) {
-            result = hk_image_view_heap_add(
-               dev, view, replay, p, HK_VIEW_HEAP_FILTERABLE,
-               &view->planes[p].sampled_filterable,
-               &view->planes[p].filterable_heap_index);
-            if (result != VK_SUCCESS) {
-               /* Nothing was reserved, so the destroy path must not try to
-                * release an index we do not own. */
-               view->planes[p].filterable_valid = false;
+         if (!storage_only) {
+            VkResult result = hk_image_view_heap_add(
+               dev, view, replay, p, HK_VIEW_HEAP_SAMPLED,
+               &view->planes[p].sampled, &view->planes[p].sampled_heap_index);
+            if (result != VK_SUCCESS)
                return result;
+            view->planes[p].filterable_valid =
+               hk_uscaled_normalized_format(hk_padded_image_format(
+                  hk_format_to_pipe_format(view->vk.format))) !=
+                  PIPE_FORMAT_NONE &&
+               pack_texture(dev, view, p, HK_DESC_USAGE_SAMPLED_FILTERABLE,
+                            &view->planes[p].sampled_filterable);
+            if (view->planes[p].filterable_valid) {
+               result = hk_image_view_heap_add(
+                  dev, view, replay, p, HK_VIEW_HEAP_FILTERABLE,
+                  &view->planes[p].sampled_filterable,
+                  &view->planes[p].filterable_heap_index);
+               if (result != VK_SUCCESS) {
+                  /* Nothing was reserved, so the destroy path must not try to
+                   * release an index we do not own. */
+                  view->planes[p].filterable_valid = false;
+                  return result;
+               }
             }
          }
          if (view->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
-            result = hk_image_view_heap_add(
+            VkResult result = hk_image_view_heap_add(
                dev, view, replay, p, HK_VIEW_HEAP_STORAGE,
                &view->planes[p].ro_storage,
                &view->planes[p].storage_heap_index);
@@ -937,8 +947,9 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
          /* Input attachments use an array-shaped descriptor independently
           * of the application sampled view. Keep the exact native bytes in
           * the indexed heap rather than sampling through the wrong shape. */
-         if (view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) {
-            result = hk_image_view_heap_add(
+         if (!storage_only &&
+             (view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) {
+            VkResult result = hk_image_view_heap_add(
                dev, view, replay, p, HK_VIEW_HEAP_INPUT, &view->planes[p].ia,
                &view->planes[p].input_heap_index);
             if (result != VK_SUCCESS)
@@ -951,31 +962,33 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
             dev, view, p, HK_DESC_USAGE_STORAGE, &view->planes[p].storage,
             &view->planes[p].storage_atomic_sw,
             view->planes[p].storage_window);
-         view->planes[p].eot_pbe_valid =
-            pack_pbe(dev, view, p, HK_DESC_USAGE_BG_EOT, &view->planes[p].eot,
-                     NULL, NULL);
-         view->planes[p].emrt_pbe_valid = pack_pbe(
-            dev, view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_pbe,
-            &view->planes[p].emrt_atomic_sw, NULL);
-         if (agx_chip_native_or_m5(dev->dev.chip) &&
-             (view->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
-             view->planes[p].emrt_pbe_valid) {
-            const struct ail_layout *layout =
-               &image->planes[view->planes[p].image_plane].layout;
-            const unsigned level = view->vk.base_mip_level;
-            view->planes[p].emrt_aligned_width =
-               align(u_minify(layout->width_px, level),
-                     layout->tilesize_el[level].width_el);
-            VkResult result = hk_image_view_heap_add(
-               dev, view, replay, p, HK_VIEW_HEAP_EMRT_READ,
-               &view->planes[p].emrt_texture,
-               &view->planes[p].emrt_read_heap_index);
-            if (result != VK_SUCCESS)
-               return result;
+         if (!storage_only) {
+            view->planes[p].eot_pbe_valid =
+               pack_pbe(dev, view, p, HK_DESC_USAGE_BG_EOT,
+                        &view->planes[p].eot, NULL, NULL);
+            view->planes[p].emrt_pbe_valid = pack_pbe(
+               dev, view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_pbe,
+               &view->planes[p].emrt_atomic_sw, NULL);
+            if (agx_chip_native_or_m5(dev->dev.chip) &&
+                (view->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+                view->planes[p].emrt_pbe_valid) {
+               const struct ail_layout *layout =
+                  &image->planes[view->planes[p].image_plane].layout;
+               const unsigned level = view->vk.base_mip_level;
+               view->planes[p].emrt_aligned_width =
+                  align(u_minify(layout->width_px, level),
+                        layout->tilesize_el[level].width_el);
+               VkResult result = hk_image_view_heap_add(
+                  dev, view, replay, p, HK_VIEW_HEAP_EMRT_READ,
+                  &view->planes[p].emrt_texture,
+                  &view->planes[p].emrt_read_heap_index);
+               if (result != VK_SUCCESS)
+                  return result;
+            }
+            view->planes[p].layered_eot_pbe_valid =
+               pack_pbe(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
+                        &view->planes[p].layered_eot, NULL, NULL);
          }
-         view->planes[p].layered_eot_pbe_valid =
-            pack_pbe(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
-                     &view->planes[p].layered_eot, NULL, NULL);
       }
    }
 

@@ -4650,6 +4650,9 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
        m5_fragment_3d);
    const bool combined_array_lod = array && !cube && !staged_offset &&
       ((explicit_lod && !immediate_lod) || register_bias || min_lod);
+   const bool banked_shadow_array = enc == AGX_ISA_ENCODING_AGX3C &&
+      compute_stage && array && !cube && shadow && explicit_lod && !offset &&
+      !query_lod && !I->sparse && (bank_base & 7) == 0;
    const bool relocatable_array = array && !cube && !register_operands &&
       !query_lod && !staged_offset && !register_offset &&
       !combined_array_lod && !gradient_lod && !bias_min && !gradient_min &&
@@ -4657,7 +4660,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
    if (bank_base != 0 &&
        ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
         native_staged_coords ||
-        (array && !relocatable_array &&
+        (array && !relocatable_array && !banked_shadow_array &&
          !(enc == AGX_ISA_ENCODING_AGX3B && vertex_stage &&
            explicit_lod && immediate_lod && !shadow && !offset)) ||
         (three_d && !m5_banked_3d &&
@@ -4797,8 +4800,9 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
          return agx3_tex_decline(I, __LINE__);
       wait_mask = 0;
    } else if (combined_array_lod) {
-      if (!agx3_tex_stage_array_lod(
-             enc, I->src[0].value + 4, I->src[1].value, stage_slot, wait_mask,
+      if (!agx3_tex_stage_array_lod_at(
+             enc, bank_base, I->src[0].value + 4, I->src[1].value, stage_slot,
+             wait_mask,
              enc == AGX_ISA_ENCODING_AGX3C ? !I->src[0].discard
                                            : I->src[0].cache,
              I->src[0].discard,
@@ -12547,6 +12551,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    const enum agx3_g17p_rt0_eot_kind layered_eot =
       agx3_g17p_layered_eot_kind(ctx, enc);
    if (enc == AGX_ISA_ENCODING_AGX3C && agx_is_g18g(&ctx->key->dev) &&
+       !ctx->key->m5_rt0_eot_store_and_resolve &&
        layered_eot != AGX3_G17P_RT0_EOT_NONE) {
       /* Original BTNF kind5 array and multisample-array builtins, swept
        * across eight formats and 1..4 components on G17G and G18G. Layer
@@ -12589,6 +12594,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    const enum agx3_g17p_rt0_eot_kind rt0_eot =
       agx3_g17p_rt0_eot_kind(ctx, enc);
    if (enc == AGX_ISA_ENCODING_AGX3C && agx_is_g18g(&ctx->key->dev) &&
+       !ctx->key->m5_rt0_eot_store_and_resolve &&
        rt0_eot != AGX3_G17P_RT0_EOT_NONE) {
       /* Genuine applegpu_g17g BTNF kind5 programs. The same architecture
        * independent builtin request that produced the G17P tables produces
@@ -15908,11 +15914,18 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
                   I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
                  I->src[1].type == AGX_INDEX_IMMEDIATE));
+            const bool banked_shadow_array =
+               enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
+               ctx->stage == MESA_SHADER_COMPUTE && I->dim == AGX_DIM_2D_ARRAY &&
+               I->shadow && !I->offset && !I->query_lod && !I->sparse &&
+               I->gather == AGX_GATHER_NONE &&
+               I->lod_mode == AGX_LOD_MODE_LOD_MIN;
             const bool relocatable_coordinates =
                (enc == AGX_ISA_ENCODING_AGX3B ||
                 enc == AGX_ISA_ENCODING_AGX3C) && slot != 0 &&
                !native_staged_coords &&
-               (m5_banked_3d || relocatable_2d_array || I->dim == AGX_DIM_2D ||
+               (m5_banked_3d || relocatable_2d_array || banked_shadow_array ||
+                I->dim == AGX_DIM_2D ||
                 (enc == AGX_ISA_ENCODING_AGX3B &&
                  (I->dim == AGX_DIM_3D ||
                   (I->dim == AGX_DIM_2D_ARRAY && !I->shadow && !I->offset)) &&
@@ -15921,7 +15934,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                  I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
                  I->src[1].type == AGX_INDEX_IMMEDIATE)) &&
                !I->query_lod && !(I->offset && !I->offset_xyz) &&
-               (m5_banked_3d || relocatable_2d_array ||
+               (m5_banked_3d || relocatable_2d_array || banked_shadow_array ||
                 I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
                 ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
                   I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
@@ -15976,6 +15989,22 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                agx3_staging_release(&staging_banks, outstanding_here);
                if (relocatable_coordinates) {
                   assert(staged_sample);
+                  /* A 2D-array sample with register descriptors stages on
+                   * fixed slot 6 (agx3_emit_texture_sample). Retire any live
+                   * slot-6 result before staging so reissuing slot 6 cannot
+                   * satisfy an older consumer early. */
+                  const bool register_operands =
+                     I->src[3].type == AGX_INDEX_REGISTER ||
+                     I->src[4].type == AGX_INDEX_REGISTER;
+                  if (banked_shadow_array && register_operands &&
+                      (outstanding_here & (1u << 5))) {
+                     if (!agx3_retire_result_wait(emission, enc, I, 1u << 5))
+                        AGX3_REFUSE(I);
+                     outstanding &= (uint16_t)~(1u << 5);
+                     if (slot)
+                        outstanding |= (uint16_t)(1u << (slot - 1));
+                     agx3_staging_forget(&staging_banks, 1u << 5);
+                  }
                   if (!agx3_allocate_staging(emission, enc, I, &staging_banks,
                                              &outstanding, slot, sample_span,
                                              fixed_gradient_staging,

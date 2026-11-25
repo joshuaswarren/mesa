@@ -24,6 +24,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_agx3_ioto_program_core.h"
 #include "hk_compute_pair.h"
+#include "hk_compute_pair_interval.h"
 #include "hk_compute_kick.h"
 #include "hk_frame_anatomy.h"
 #include "hk_device.h"
@@ -1951,20 +1952,18 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
-   /* Native M5 keeps the memory of every submitted recording until the
-    * submission retires. Elsewhere the application keeps its recordings
-    * alive, and only the packets' buffer needs it: the BO cache would hand
-    * it out again without waiting for the GPU. Pin before anything below
-    * changes queue or synchronization state, so that a failed allocation
-    * leaves nothing to roll back. */
+   /* Driver-owned buffers used by packed submissions have no application handle to
+    * keep them alive: the BO cache would hand them out again without waiting
+    * for the GPU. Application recordings follow Vulkan lifetime rules while
+    * the device is healthy and are retained during device-loss unwinding in
+    * hk_free_resettable_cmd_buffer(). Pin before anything below changes queue
+    * or synchronization state, so a failed allocation leaves nothing to roll
+    * back. */
    struct hk_cmd_pending *pending = NULL;
-   const bool pin_recordings = agx_chip_g17_m5(dev->dev.chip);
-   if ((pin_recordings || extra_bo_count) && !dev->dev.is_virtio) {
-      const struct vk_queue_submit no_recordings = {0};
+   if (extra_bo_count && !dev->dev.is_virtio) {
       unsigned chunks = 1 + (command_count - 1) / max_commands_per_submit(dev);
-      VkResult pin_result = hk_cmd_pending_begin(
-         dev, pin_recordings ? original : &no_recordings, chunks,
-         extra_bos, extra_bo_count, &pending);
+      VkResult pin_result =
+         hk_cmd_pending_begin(dev, chunks, extra_bos, extra_bo_count, &pending);
       if (pin_result != VK_SUCCESS) {
          *untouched = !bound;
          return vk_error(queue, pin_result);
@@ -2946,22 +2945,26 @@ hk_pack_attachment_limit(const struct hk_device *dev)
  * ASAHI_M5_PACK_ATOMICS=1 (or HK_PACK_ATOMICS=1) and the device has a
  * single active kernel queue, which runs its commands in order. On G17P,
  * packed atomics are enabled by default (disable with HK_PACK_ATOMICS=0)
- * whenever the single-active-kernel-queue invariant holds: no sibling kernel
- * queue is in flight (hk_sibling_in_flight()), sibling routing stays off
- * until any packed atomic submission completes (packed_atomic_point), and no
- * other VkQueue or host-AS queue on the device has a kernel queue. A second
- * kernel queue created while a packet runs is not covered; unpacked atomic
- * work has the same exposure. The G16 kernel puts every compute command of a
- * VM on its one firmware compute queue and never runs one beside another
- * VM's: several commands of one VM may be in flight there, but the firmware
- * runs them one after another, never beside a packet. G16G packs them unless
- * HK_PACK_ATOMICS=0. That is a property of the G16 kernel, the only one for
- * G16G, which no uAPI feature reports yet; the chip stands for it until one
- * does (hk_pack_atomics_choice()). */
+ * whenever the single-kernel-queue invariant holds for the lifetime of the
+ * device: no sibling kernel queue is in flight (hk_sibling_in_flight()),
+ * sibling routing stays off until any packed atomic submission completes
+ * (packed_atomic_point), and no other non-emulated VkQueue, host-AS queue,
+ * or compute-kick queue exists on the device. Because kernel queues are
+ * admitted lazily on first submission, checking only whether another queue
+ * already has a kernel queue ID leaves a race where a second queue admits
+ * and submits concurrently before an in-flight packed atomic chain finishes
+ * (and waiting for packed_atomic_point at admission would deadlock valid
+ * wait-before-signal timeline semaphore submits). The G16 kernel puts every
+ * compute command of a VM on its one firmware compute queue and never runs
+ * one beside another VM's: several commands of one VM may be in flight there,
+ * but the firmware runs them one after another, never beside a packet. G16G
+ * packs them unless HK_PACK_ATOMICS=0. That is a property of the G16 kernel,
+ * the only one for G16G, which no uAPI feature reports yet; the chip stands
+ * for it until one does (hk_pack_atomics_choice()). */
 DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
 DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
 
-static bool
+bool
 hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue)
 {
    const char *opt = debug_get_option_hk_pack_atomics_opt();
@@ -2969,7 +2972,7 @@ hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue)
       opt = debug_get_option_m5_pack_atomics_opt();
 
    const struct hk_queue *as = dev->host_as.queue;
-   if (as && as != queue && p_atomic_read(&as->drm.id) != UINT32_MAX)
+   if (as && as != queue && !vk_queue_is_emulated(&as->vk))
       return false;
 
    if (dev->dev.chip == AGX_CHIP_G16G)
@@ -2980,14 +2983,14 @@ hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue)
    const bool default_on = dev->dev.chip == AGX_CHIP_G17P;
    if (!hk_pack_atomics_choice(default_on, opt, 1))
       return false;
-   if (hk_sibling_in_flight(dev, queue))
+   if (queue->kick.watched || hk_sibling_in_flight(dev, queue))
       return false;
 
    vk_foreach_queue(iter, &dev->vk) {
       if (vk_queue_is_emulated(iter))
          continue;
       const struct hk_queue *other = container_of(iter, struct hk_queue, vk);
-      if (other != queue && p_atomic_read(&other->drm.id) != UINT32_MAX)
+      if (other != queue)
          return false;
    }
    return true;
@@ -3099,31 +3102,6 @@ hk_pack_dedup_resources(struct util_dynarray *list, size_t unique)
    list->size = kept;
 }
 
-struct hk_compute_pair_interval {
-   uint64_t start, end;
-   uint32_t handle;
-};
-
-static bool
-compute_pair_interval(const struct hk_storage_backing *backing,
-                      uint64_t start, uint64_t end, struct hk_compute_pair_interval *out)
-{
-   if (!backing->handle || start >= end || end > backing->size ||
-       backing->offset > UINT64_MAX - end)
-      return false;
-   *out = (struct hk_compute_pair_interval){
-      backing->offset + start, backing->offset + end, backing->handle,
-   };
-   return true;
-}
-
-static bool
-compute_pair_same_interval(const struct hk_compute_pair_interval *a,
-                           const struct hk_compute_pair_interval *b)
-{
-   return a->handle == b->handle && a->start == b->start && a->end == b->end;
-}
-
 static bool
 compute_pair_buffers_match(const struct hk_compute_pair_dispatch *producer,
                            const struct hk_compute_pair_dispatch *clamp)
@@ -3213,13 +3191,6 @@ compute_pair_can_replace(const struct hk_cs *producer, const struct hk_cs *consu
 }
 
 static bool
-compute_pair_intervals_disjoint(const struct hk_compute_pair_interval *a,
-                                const struct hk_compute_pair_interval *b)
-{
-   return a->handle != b->handle || a->end <= b->start || b->end <= a->start;
-}
-
-static bool
 compute_pair_copy4_match(const struct hk_compute_pair_dispatch *producer,
                          const struct hk_compute_pair_dispatch *copy4)
 {
@@ -3227,6 +3198,16 @@ compute_pair_copy4_match(const struct hk_compute_pair_dispatch *producer,
        producer->alt_kind == HK_COMPUTE_PAIR_ALT_NONE ||
        copy4->info.role != HK_COMPUTE_PAIR_COPY4)
       return false;
+
+   const struct hk_compute_pair_copy4 *cp = &copy4->extra.copy4;
+   if (!copy4->bindings[1].address ||
+       copy4->bindings[1].address > UINT64_MAX - cp->dst_start ||
+       cp->src_start > UINT64_MAX - cp->bytes ||
+       cp->dst_start > UINT64_MAX - cp->bytes)
+      return false;
+
+   if (producer->info.role == HK_COMPUTE_PAIR_FADD)
+      return hk_compute_pair_fadd_copy4_match(producer, copy4);
 
    struct hk_nir_direct_shape ps = {producer->push, sizeof(producer->push)};
    memcpy(ps.groups, producer->groups, sizeof(ps.groups));
@@ -3258,15 +3239,8 @@ compute_pair_copy4_match(const struct hk_compute_pair_dispatch *producer,
    }
 
    if (hk_dual_write_push_offset(push_bytes) + sizeof(struct hk_dual_copy_push) >
-       HK_MAX_PUSH_SIZE)
-      return false;
-
-   const struct hk_compute_pair_copy4 *cp = &copy4->extra.copy4;
-   if (!copy4->bindings[1].address ||
-       copy4->bindings[1].address > UINT64_MAX - cp->dst_start ||
-       ((copy4->bindings[1].address + cp->dst_start) % dst_align) != 0 ||
-       cp->src_start > UINT64_MAX - cp->bytes ||
-       cp->dst_start > UINT64_MAX - cp->bytes)
+       HK_MAX_PUSH_SIZE ||
+       ((copy4->bindings[1].address + cp->dst_start) % dst_align) != 0)
       return false;
 
    struct hk_compute_pair_interval output, src, dst;
@@ -3406,7 +3380,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          if (members[i].cs && hk_compute_pair_stream_eligible(members[i].cs)) {
             const struct hk_compute_pair_dispatch *p = members[i].cs->compute_pair;
             if ((p->info.role == HK_COMPUTE_PAIR_DEPTHWISE ||
-                 p->info.role == HK_COMPUTE_PAIR_GEMM) &&
+                 p->info.role == HK_COMPUTE_PAIR_GEMM ||
+                 p->info.role == HK_COMPUTE_PAIR_FADD) &&
                 AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE > members[i].bytes) {
                members[i].bytes = AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE;
             }
@@ -3443,7 +3418,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                continue;
             }
             if ((p->info.role != HK_COMPUTE_PAIR_DEPTHWISE &&
-                 p->info.role != HK_COMPUTE_PAIR_GEMM) ||
+                 p->info.role != HK_COMPUTE_PAIR_GEMM &&
+                 p->info.role != HK_COMPUTE_PAIR_FADD) ||
                 !p->producer || !p->root_va)
                continue;
 
@@ -3660,7 +3636,9 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   const uint32_t prod_pb =
                      p_disp->info.role == HK_COMPUTE_PAIR_DEPTHWISE
                         ? p_disp->info.depthwise.push_bytes
-                        : p_disp->info.gemm.push_bytes;
+                        : p_disp->info.role == HK_COMPUTE_PAIR_FADD
+                             ? p_disp->info.fadd_push_bytes
+                             : p_disp->info.gemm.push_bytes;
                   const uint32_t dual_off = hk_dual_write_push_offset(prod_pb);
                   if (pl->dual_write == HK_COMPUTE_PAIR_DUAL_COPY) {
                      const uint64_t dst2_va =

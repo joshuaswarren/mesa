@@ -220,7 +220,8 @@ load_dynamic_buffer_start(nir_builder *b, uint32_t set,
 static nir_def *
 load_descriptor(nir_builder *b, unsigned num_components, unsigned bit_size,
                 uint32_t set, uint32_t binding, nir_def *index,
-                unsigned offset_B, const struct lower_descriptors_ctx *ctx)
+                unsigned offset_B, bool buffer_binding,
+                const struct lower_descriptors_ctx *ctx)
 {
    const struct hk_descriptor_set_binding_layout *binding_layout =
       get_binding_layout(set, binding, ctx);
@@ -254,6 +255,11 @@ load_descriptor(nir_builder *b, unsigned num_components, unsigned bit_size,
 
       assert(num_components == (map_address ? 5 : 4) && bit_size == 32);
       nir_def *desc = load_root(b, 4, 32, root_desc_offset, 16);
+      if (buffer_binding) {
+         nir_intrinsic_instr *desc_intr = nir_def_as_intrinsic(desc);
+         nir_intrinsic_set_access(desc_intr, nir_intrinsic_access(desc_intr) |
+                                                ACCESS_BUFFER_BINDING_AGX);
+      }
 
       if (map_address)
          return storage_address(b, desc, ctx);
@@ -311,7 +317,8 @@ load_descriptor(nir_builder *b, unsigned num_components, unsigned bit_size,
          b, load_components, bit_size, set_addr, desc_ubo_offset,
          .align_mul = desc_align_mul, .align_offset = desc_align_offset,
          .access = ACCESS_CAN_SPECULATE |
-                   (always_valid ? ACCESS_BUFFER_DESCRIPTOR_AGX : 0));
+                   (always_valid ? ACCESS_BUFFER_DESCRIPTOR_AGX : 0) |
+                   (buffer_binding ? ACCESS_BUFFER_BINDING_AGX : 0));
 
       if (binding_layout->type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT &&
           map_address)
@@ -367,18 +374,27 @@ load_descriptor_for_idx_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    index = nir_iadd(b, index, intrin->src[0].ssa);
    b->constant_fold_alu = false;
 
+   const nir_descriptor_type desc_type = nir_intrinsic_desc_type(intrin);
+
    /* A buffer descriptor is a vec4 (address, size, ...); an acceleration
     * structure is a bare 64-bit BVH address, and rq_initialize consumes it
     * as one.  Loading it as a vec4 would both read past the descriptor and
     * hand the ray-query lowering the wrong-shaped value. */
-   if (nir_intrinsic_desc_type(intrin) ==
-       nir_descriptor_type_acceleration_structure)
-      return load_descriptor(b, 1, 64, set, binding, index, 0, ctx);
+   if (desc_type == nir_descriptor_type_acceleration_structure)
+      return load_descriptor(b, 1, 64, set, binding, index, 0, false, ctx);
 
    const unsigned components =
-      nir_intrinsic_desc_type(intrin) == nir_descriptor_type_storage_buffer &&
+      desc_type == nir_descriptor_type_storage_buffer &&
       storage_address_has_map(ctx) ? 5 : 4;
-   return load_descriptor(b, components, 32, set, binding, index, 0, ctx);
+   nir_def *desc =
+      load_descriptor(b, components, 32, set, binding, index, 0, true, ctx);
+   if (desc_type == nir_descriptor_type_uniform_buffer &&
+       !nir_scalar_is_const(nir_scalar_resolved(desc, 3))) {
+      /* Every uniform buffer descriptor (including mutable slots written as
+       * VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) leaves the .w offset word zero. */
+      desc = nir_vector_insert_imm(b, desc, nir_imm_int(b, 0), 3);
+   }
+   return desc;
 }
 
 static bool
@@ -468,7 +484,7 @@ load_resource_deref_desc(nir_builder *b, unsigned num_components,
    nir_def *index;
    get_resource_deref_binding(b, deref, &set, &binding, &index);
    return load_descriptor(b, num_components, bit_size, set, binding, index,
-                          offset_B, ctx);
+                          offset_B, false, ctx);
 }
 
 static nir_def *
@@ -1798,9 +1814,9 @@ lower_load_ssbo_descriptor(nir_builder *b, nir_intrinsic_instr *intrin,
       nir_def *offset = nir_channel(b, addr, 3);
       /* Mask off the binding stride */
       base = nir_iand_imm(b, base, BITFIELD64_MASK(56));
-      desc = nir_load_global_constant_offset(b, 4, 32, base, offset,
-                                             .align_mul = 16, .align_offset = 0,
-                                             .access = ACCESS_CAN_SPECULATE);
+      desc = nir_load_global_constant_offset(
+         b, 4, 32, base, offset, .align_mul = 16, .align_offset = 0,
+         .access = ACCESS_CAN_SPECULATE | ACCESS_BUFFER_BINDING_AGX);
       break;
    }
 
@@ -1813,7 +1829,7 @@ lower_load_ssbo_descriptor(nir_builder *b, nir_intrinsic_instr *intrin,
       base = nir_iand_imm(b, base, BITFIELD64_MASK(56));
       desc = nir_load_global_constant_bounded(
          b, 4, 32, base, offset, size, .align_mul = 16, .align_offset = 0,
-         .access = ACCESS_CAN_SPECULATE);
+         .access = ACCESS_CAN_SPECULATE | ACCESS_BUFFER_BINDING_AGX);
       break;
    }
 
@@ -2182,7 +2198,7 @@ hk_nir_lower_descriptors(nir_shader *nir,
 
    ctx.ssbo_addr_format = hk_buffer_addr_format(
       rs->storage_buffers, rs->null_storage_buffer_descriptor,
-      ctx.descriptor_generation == 10);
+      ctx.descriptor_generation == AGX_DESCRIPTOR_GENERATION_10);
 
    /* First lower everything but complex SSBOs, then lower complex SSBOs.
     *

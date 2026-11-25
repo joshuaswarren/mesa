@@ -6,6 +6,7 @@ libasahi_agx_files = files(
   'agx_compile.c',
   'agx_nir_lower_cmat.c',
   'agx_nir_lower_cmat_sw.c',
+  'agx_nir_match_gemm.c',
   'agx_dce.c',
   'agx_liveness.c',
   'agx_insert_waits.c',
@@ -19,6 +20,13 @@ libasahi_agx_files = files(
   'agx_nir_opt_nonneg_idiv.c',
   'agx_nir_opt_half_bitfield_extract.c',
   'agx_nir_opt_flatten_loads.c',
+  'agx_nir_opt_shared_vec2.c',
+  'agx_nir_unroll_runtime_loops.c',
+  'agx_nir_narrow_barriers.c',
+  'agx_nir_opt_uniform_stride.c',
+  'agx_nir_merge_global_words.c',
+  'agx_nir_fold_m5_offsets.c',
+  'agx_nir_opt_popcount_idiom.c',
   'agx_nir_opt_factor_loop_mac.c',
   'agx_nir_opt_merge_nested_early_exits.c',
   'agx_nir_opt_narrow_subword_loads.c',
@@ -26,6 +34,7 @@ libasahi_agx_files = files(
   'agx_nir_opt_select_load.c',
   'agx_nir_opt_u8x4_hsum.c',
   'agx_nir_opt_licm.c',
+  'agx_nir_opt_dw_conv_3x3.c',
   'agx_nir_opt_uniform_idiv.c',
   'agx_nir_opt_monotonic_bit_insert.c',
   'agx_nir_opt_iv_divmod.c',
@@ -226,6 +235,17 @@ libasahi_compiler = static_library(
 )
 
 if with_tests
+  test(
+    'agx_nir_opt_dw_conv_3x3',
+    executable(
+      'agx_nir_opt_dw_conv_3x3_test',
+      files('test/test-dw-conv-3x3.c'),
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+      include_directories : [inc_include, inc_src],
+    ),
+    suite : ['asahi'],
+  )
   # The generated tables hold exactly the rows of the tables their
   # descriptions were made from.
   foreach t : ['agx3b', 'agx3c', 'agx3d']
@@ -765,6 +785,7 @@ if with_tests
          'test/test-spill-fallback.cpp',
          'test/test-agx-register-cache.cpp',
          'test/test-opt-licm.cpp',
+         'test/test-g17p-mod3-ra.cpp',
          'test/test-ra-early-kill.cpp',
          'test/test-ra-uniform-phi.cpp',
          'test/test-rt-register-pressure.cpp',
@@ -812,6 +833,7 @@ if with_tests
          'test/test-denorm-preserve-fma.cpp',
          'test/test-fminmax-signed-zero.cpp',
          'test/test-shared-byte-offsets.cpp',
+         'test/test-m5-runtime-loops.cpp',
          'test/test-device-load-batches.cpp',
          'test/test-fuse-lea-constants.cpp',
          'test/test-agx3c-branch-sink.cpp',

@@ -505,10 +505,16 @@ hk_g17p_sparse_vertex_outputs(const struct shader_info *info,
  * multiple hardware hk_shader's, built at shader compile time. This complexity
  * implements the legacy geometry pipeline and native sample-count variants.
  */
+#include "hk_2d_stencil.h"
 #include "hk_byte_stencil.h"
 
 struct hk_byte_stencil_variant {
    struct hk_byte_stencil_plan plan;
+   struct hk_shader shader;
+};
+
+struct hk_2d_stencil_variant {
+   struct hk_2d_stencil_plan plan;
    struct hk_shader shader;
 };
 
@@ -572,6 +578,10 @@ struct hk_api_shader {
    /* Non-NULL for a compute shader matched as a separable 1D byte-image
     * stencil: holds the dispatch validation plan and compiled tiled variant. */
    struct hk_byte_stencil_variant *byte_stencil;
+
+   /* Non-NULL for a compute shader matched as a 2D neighborhood / block
+    * stencil: holds the dispatch validation plan and compiled tiled variant. */
+   struct hk_2d_stencil_variant *stencil_2d;
 
    struct hk_shader variants[];
 };
@@ -860,6 +870,9 @@ extern const struct vk_device_shader_ops hk_device_shader_ops;
 uint64_t
 hk_physical_device_compiler_flags(const struct hk_physical_device *pdev);
 
+uint32_t
+hk_graphics_max_scratch_B(const struct agx_device *dev, mesa_shader_stage stage);
+
 /* The bounded native CProg shape both graphics stages admit: imported
  * uniform inputs stored in, and exactly filling, the preamble's TPS frame,
  * with a known staging footprint. */
@@ -996,6 +1009,14 @@ hk_ubo_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
              : nir_address_format_64bit_bounded_global;
 }
 
+/* Gen10 descriptor sets carry the 5-component SSBO address format with the
+ * sparse residency map slot (matching hk_nir_lower_descriptors()). */
+static inline bool
+hk_ssbo_addr_has_map(enum agx_chip chip)
+{
+   return agx_chip_descriptor_generation(chip) == AGX_DESCRIPTOR_GENERATION_10;
+}
+
 static inline nir_address_format
 hk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness,
                       bool null_descriptor, bool map_metadata)
@@ -1072,6 +1093,12 @@ bool hk_tes_ray_queries_in_compute(const struct hk_device *dev);
 /* Lower a G17P task shader, after hk_lower_nir(), to the compute kernel of
  * the software task stage. */
 void hk_g17p_lower_task_kernel(nir_shader *nir);
+
+/* Lower provably non-overflowing 32-bit scalar uadd_sat(term, k) to iadd.nuw. */
+bool hk_nir_lower_aligned_uadd_sat(nir_shader *nir);
+
+/* Merge adjacent reorderable 32-bit buffer word reads into vector loads. */
+bool hk_nir_merge_buffer_words(nir_shader *nir);
 
 /* Lazily compile and cache the 1-thread compute shader for a hoistable AGX3
  * vertex preamble. Returns NULL if the vertex shader has no hoistable preamble

@@ -557,6 +557,14 @@ if with_tests and with_tools.contains('drm-shim')
     )
   endforeach
 
+  test(
+    'asahi-g17s-gallium-mipmap',
+    prog_python,
+    args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_g17p_blit_test],
+    env : ['ASAHI_SHIM_CHIP=g17s', 'AGX_TEST_MIPMAP_HW=1'],
+    suite : ['asahi'],
+  )
+
   foreach chip : ['g17p', 't6041']
     test(
       'asahi-' + chip + '-gallium-blit',
