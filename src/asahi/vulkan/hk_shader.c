@@ -619,7 +619,7 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
          agx_preprocess_nir_m5(nir);
    }
    else
-      agx_preprocess_nir(nir);
+      agx_preprocess_nir_for_encoding(nir, agx_chip_isa_encoding(pre_chip));
 
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, nir_lower_var_copies);
@@ -4154,7 +4154,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       else if (agx_chip_g17_m5(dev->dev.chip))
          agx_preprocess_nir_m5(nir);
       else
-         agx_preprocess_nir(nir);
+         agx_preprocess_nir_for_encoding(nir, agx_chip_isa_encoding(dev->dev.chip));
    }
 
    nir_opt_peephole_select_options peephole_select_options = {
@@ -9398,9 +9398,11 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                           "Gen1 native GS ray query lowering failed");
       }
 
-      agx_preprocess_nir(count);
-      agx_preprocess_nir(rast);
-      agx_preprocess_nir(pre_gs);
+      const enum agx_isa_encoding gs_encoding =
+         agx_chip_isa_encoding(dev->dev.chip);
+      agx_preprocess_nir_for_encoding(count, gs_encoding);
+      agx_preprocess_nir_for_encoding(rast, gs_encoding);
+      agx_preprocess_nir_for_encoding(pre_gs, gs_encoding);
 
       /* The raster variant is a hardware vertex shader. On M5, match the
        * ordinary VS/TES default when the geometry producer has no point-size
