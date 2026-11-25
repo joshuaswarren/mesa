@@ -19318,7 +19318,7 @@ TEST_F(AGX3PackBinary, TrimmedF16Vec3MemoryLoadsPack)
          nir_builder b = nir_builder_init_simple_shader(
             MESA_SHADER_COMPUTE, &agx_nir_options, "f16_vec3_shrink");
          nir_def *base = agx_test_load_preamble(&b, 1, 64, 0);
-         nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+         nir_def *gid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
          nir_def *addr = nir_iadd(&b, base, nir_u2u64(&b, nir_ishl_imm(&b, gid, 3)));
          nir_def *loaded =
             is_ubo

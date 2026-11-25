@@ -11585,7 +11585,7 @@ agx_def_only_scalar_alu_uses(nir_def *def, unsigned depth)
 }
 
 static bool
-agx_nir_shrink_memory_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+agx_intrinsic_is_memory_load(const nir_intrinsic_instr *intr)
 {
    switch (intr->intrinsic) {
    case nir_intrinsic_load_ubo:
@@ -11594,45 +11594,195 @@ agx_nir_shrink_memory_load(nir_builder *b, nir_intrinsic_instr *intr, void *data
    case nir_intrinsic_load_global_constant:
    case nir_intrinsic_load_constant:
    case nir_intrinsic_load_push_constant:
-      break;
+   case nir_intrinsic_load_agx:
+   case nir_intrinsic_load_constant_agx:
+      return true;
    default:
       return false;
    }
+}
 
-   if (intr->def.num_components <= 1)
+static bool
+agx_memory_load_format_shrinkable(const nir_intrinsic_instr *intr)
+{
+   if (intr->intrinsic != nir_intrinsic_load_agx &&
+       intr->intrinsic != nir_intrinsic_load_constant_agx)
+      return true;
+
+   /* Keep packed subword loads and W8-word unpacks at their encoded width. */
+   if (nir_intrinsic_base(intr) &
+       (AGX_NIR_MEMORY_PACKED_COUNT_MASK | AGX_NIR_MEMORY_UNPACK_W8_WORD))
       return false;
+
+   enum pipe_format fmt = nir_intrinsic_format(intr);
+   return fmt == PIPE_FORMAT_R8_UINT || fmt == PIPE_FORMAT_R16_UINT ||
+          fmt == PIPE_FORMAT_R32_UINT;
+}
+
+static bool
+agx_memory_loads_match(const nir_intrinsic_instr *a,
+                       const nir_intrinsic_instr *b)
+{
+   if (a->intrinsic != b->intrinsic || a->def.bit_size != b->def.bit_size)
+      return false;
+
+   unsigned num_srcs = nir_intrinsic_infos[a->intrinsic].num_srcs;
+   assert(num_srcs == nir_intrinsic_infos[b->intrinsic].num_srcs);
+   for (unsigned i = 0; i < num_srcs; ++i) {
+      if (nir_srcs_equal(a->src[i], b->src[i]))
+         continue;
+      if (!nir_src_is_const(a->src[i]) || !nir_src_is_const(b->src[i]) ||
+          nir_src_bit_size(a->src[i]) != nir_src_bit_size(b->src[i]) ||
+          nir_src_num_components(a->src[i]) != 1 ||
+          nir_src_num_components(b->src[i]) != 1 ||
+          nir_src_as_uint(a->src[i]) != nir_src_as_uint(b->src[i]))
+         return false;
+   }
+
+   if (nir_intrinsic_has_base(a) != nir_intrinsic_has_base(b) ||
+       (nir_intrinsic_has_base(a) &&
+        nir_intrinsic_base(a) != nir_intrinsic_base(b)))
+      return false;
+
+   if (nir_intrinsic_has_format(a) != nir_intrinsic_has_format(b) ||
+       (nir_intrinsic_has_format(a) &&
+        nir_intrinsic_format(a) != nir_intrinsic_format(b)))
+      return false;
+
+   if (nir_intrinsic_has_sign_extend(a) != nir_intrinsic_has_sign_extend(b) ||
+       (nir_intrinsic_has_sign_extend(a) &&
+        nir_intrinsic_sign_extend(a) != nir_intrinsic_sign_extend(b)))
+      return false;
+
+   if (nir_intrinsic_has_range_base(a) != nir_intrinsic_has_range_base(b) ||
+       (nir_intrinsic_has_range_base(a) &&
+        nir_intrinsic_range_base(a) != nir_intrinsic_range_base(b)))
+      return false;
+
+   if (nir_intrinsic_has_range(a) != nir_intrinsic_has_range(b) ||
+       (nir_intrinsic_has_range(a) &&
+        nir_intrinsic_range(a) != nir_intrinsic_range(b)))
+      return false;
+
+   return true;
+}
+
+static unsigned
+agx_shrink_memory_load_target_comps(nir_intrinsic_instr *intr)
+{
+   unsigned orig = intr->def.num_components;
+   if (orig <= 1 || !agx_memory_load_format_shrinkable(intr))
+      return orig;
 
    /* Keep 4-component buffer descriptors intact for preamble speculation and
     * never drop volatile memory reads. */
    if (nir_intrinsic_has_access(intr) &&
        (nir_intrinsic_access(intr) &
         (ACCESS_BUFFER_DESCRIPTOR_AGX | ACCESS_VOLATILE)))
-      return false;
+      return orig;
 
    /* Leave non-ALU uses (intrinsics, phis, texture ops, ifs) and vector
     * constructors/packers untouched so vector register affinity stays intact. */
    if (!agx_def_only_scalar_alu_uses(&intr->def, 0))
-      return false;
+      return orig;
 
    unsigned mask = nir_def_components_read(&intr->def);
    if (!mask)
-      return false;
+      return orig;
 
    unsigned comps = util_last_bit(mask);
    unsigned rounded = comps > 4 ? util_next_power_of_two(comps) : comps;
-   if (rounded >= intr->def.num_components)
-      return false;
+   if (rounded >= orig)
+      return orig;
 
-   intr->def.num_components = rounded;
-   intr->num_components = rounded;
-   return true;
+   /* Divergent loads stay in GPRs whose register allocation rounds vector
+    * width up to a power of two. Skip shrinking e.g. vec4 -> vec3 when it
+    * saves no GPRs, while keeping uniform vec4 -> vec3 shrinking for
+    * preamble uniform slots and divergent vec4 -> vec1/vec2 shrinking. */
+   if (intr->def.divergent &&
+       util_next_power_of_two(rounded) >= util_next_power_of_two(orig))
+      return orig;
+
+   return rounded;
+}
+
+struct agx_shrink_load_cand {
+   nir_intrinsic_instr *intr;
+   unsigned candidate_comps;
+};
+
+static bool
+agx_nir_shrink_memory_loads_impl(nir_function_impl *impl)
+{
+   struct util_dynarray cands;
+   util_dynarray_init(&cands, NULL);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (!agx_intrinsic_is_memory_load(intr) ||
+             intr->def.num_components <= 1)
+            continue;
+
+         struct agx_shrink_load_cand cand = {
+            .intr = intr,
+            .candidate_comps = agx_shrink_memory_load_target_comps(intr),
+         };
+         util_dynarray_append(&cands, cand);
+      }
+   }
+
+   bool progress = false;
+   unsigned count =
+      util_dynarray_num_elements(&cands, struct agx_shrink_load_cand);
+   struct agx_shrink_load_cand *items =
+      (struct agx_shrink_load_cand *)cands.data;
+
+   for (unsigned i = 0; i < count; ++i) {
+      unsigned target = items[i].candidate_comps;
+      nir_intrinsic_instr *intr = items[i].intr;
+      if (target >= intr->def.num_components)
+         continue;
+
+      /* Keep matching sibling loads at the same component count so post-LICM
+       * CSE and select_load continue to merge identical loads across blocks. */
+      for (unsigned j = 0; j < count; ++j) {
+         if (i == j)
+            continue;
+         if (items[j].candidate_comps > target &&
+             agx_memory_loads_match(intr, items[j].intr)) {
+            target = items[j].candidate_comps;
+            if (target >= intr->def.num_components)
+               break;
+         }
+      }
+
+      if (target < intr->def.num_components) {
+         intr->def.num_components = target;
+         intr->num_components = target;
+         progress = true;
+      }
+   }
+
+   util_dynarray_fini(&cands);
+
+   return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
 bool
 agx_nir_shrink_memory_loads(nir_shader *nir)
 {
-   return nir_shader_intrinsics_pass(nir, agx_nir_shrink_memory_load,
-                                     nir_metadata_control_flow, NULL);
+   nir_divergence_analysis(nir);
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      progress |= agx_nir_shrink_memory_loads_impl(impl);
+   }
+
+   return progress;
 }
 
 /* Whether a compile with a preamble size forms its preamble. Internal shaders
@@ -12065,12 +12215,6 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       addr_progress |= uatom;
    }
 
-   /* Trim unused trailing vector load channels (e.g. vec4 UBO/SSBO/global loads
-    * reading only .xyz) before lowering addressing so dead channels do not hold
-    * GPRs or uniform slots, without introducing address-offset arithmetic or
-    * narrowing scratch loads / marked buffer descriptors. */
-   NIR_PASS(_, nir, agx_nir_shrink_memory_loads);
-
    /* Constant index addends that agx_nir_lower_address cannot see through
     * its LEA fusion go to M5's byte offsets first. Skip when offsets are
     * bounds-checked (robustness); with soft faults on non-robust shaders,
@@ -12110,10 +12254,14 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * varying, which overflowed the AGX3B register file and spilled.
     */
    NIR_PASS(addr_progress, nir, agx_nir_opt_select_load);
-   if (addr_progress || pre_alg_progress) {
-      NIR_PASS(_, nir, nir_opt_cse);
-      NIR_PASS(_, nir, nir_opt_dce);
-   }
+   NIR_PASS(_, nir, nir_opt_cse);
+   NIR_PASS(_, nir, nir_opt_dce);
+
+   /* Trim unused trailing vector load channels after address lowering,
+    * select_load, and CSE so identical-address loads merge before trimming and
+    * uniform vec4->vec3 / divergent power-of-two shrinking saves uniform slots
+    * or GPRs without breaking vector register affinity. */
+   NIR_PASS(_, nir, agx_nir_shrink_memory_loads);
 
    NIR_PASS(sub_progress, nir, nir_opt_uniform_subgroup, &subgroups_options);
    if (g18_scans)
