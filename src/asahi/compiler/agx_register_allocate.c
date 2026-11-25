@@ -3279,6 +3279,47 @@ ra_file_alignment(agx_context *ctx)
    return alignment;
 }
 
+/* Physical allocation limits shared with the ILP scheduler. */
+unsigned
+agx3_register_budget(agx_context *ctx)
+{
+   const bool narrow_file = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+   unsigned budget = narrow_file
+      ? agx3_cube_register_budget(ctx)
+      : ROUND_DOWN_TO(ctx->key->dev.emit_agx3d ? AGX3D_NUM_REGS : AGX3C_NUM_REGS,
+                      ra_file_alignment(ctx));
+
+   /* A multisample-array read packs its normalized layer beside another
+    * operand, and the packer reserves one transient word for it immediately
+    * above every register this allocation used -- the same "reserve above the
+    * allocation" shape as the CEM scratch, and the same failure: a fragment
+    * that reaches half 190 leaves nowhere to put the word and agx3_pack_binary
+    * refuses the whole shader. Measured on
+    * dEQP-VK.rasterization.rasterization_order_attachment_access.format_float.
+    * attachments_8_samples_4.*, whose eight input attachments at four samples
+    * allocate the entire file: observed=191 max_reg=191 base=192.
+    *
+    * Budget the word inside the file. ROUND_DOWN_TO(reg_file_alignment) below
+    * only lowers this further, so 184 leaves the word at half 186 at the very
+    * highest under either 8- or 16-half alignment. A fragment of this shape
+    * that used halves 184..191 now spills them instead; one that did not, and
+    * every fragment without such a read, keeps the whole file.
+    */
+   if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
+       ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble) {
+      agx_foreach_instr_global(ctx, I) {
+         if ((I->op == AGX_OPCODE_TEXTURE_LOAD ||
+              I->op == AGX_OPCODE_IMAGE_LOAD) &&
+             I->dim == AGX_DIM_2D_MS_ARRAY) {
+            budget = MIN2(budget, 184);
+            break;
+         }
+      }
+   }
+
+   return budget;
+}
+
 /* The registers assignment uses for a program with the given demand: as many
  * as it can without affecting occupancy, which reduces live range splitting.
  */
@@ -3449,42 +3490,8 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          agx_max_registers_for_occupancy(threads_per_workgroup);
    }
 
-   /* G17P's register file is 192 halves. Halves 192..255 still fit its
-    * 8-bit register fields but are not general registers: a copy into half
-    * 204 crashed the GPU co-processor. applegpu_g17p holding 60 live float4
-    * or uint4 temporaries never names a register above half 191 and spills
-    * the rest to thread-private storage, so bound the file there and spill
-    * the same way.
-    */
-   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
-      max_possible_regs = MIN2(max_possible_regs, AGX3B_NUM_REGS);
-
-   /* G18G's eight-bit operand fields also encode r126/r127, but those names
-    * do not behave as ordinary data registers. Physical scalar readbacks
-    * from r124/r125 succeed while stores from r126/r127 leave their output
-    * untouched; a vec4 spanning them loses the entire store. Native G18G
-    * pressure kernels reach r125 and spill the remaining live values.
-    * Keep the unavailable halves out of allocation, including spill temps.
-    * G18G uses the G17G allocator before the final AGX3D transcode.
-    */
-   if (ctx->key->dev.emit_agx3d) {
-      /* Round before deciding whether to spill. Rounding only at assignment
-       * could leave demand above the aligned file after the spill pass. */
-      max_possible_regs = MIN2(max_possible_regs,
-                               ROUND_DOWN_TO(AGX3D_NUM_REGS,
-                                             ra_file_alignment(ctx)));
-   }
-
-   /* Native G17G pressure shaders spill at 126 dwords. Direct M5 tests of
-    * IADD/EXTR followed by STDEV agree: pair 250 works, pair 252 does not.
-    * Align the usable file before spilling as live-range splitting requires
-    * whole vector slots; rounding only at final assignment is too late.
-    */
-   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
-      max_possible_regs = MIN2(max_possible_regs,
-                               ROUND_DOWN_TO(AGX3C_NUM_REGS,
-                                             ra_file_alignment(ctx)));
-   }
+   if (agx_isa_is_agx3(ctx->key->dev.encoding))
+      max_possible_regs = MIN2(max_possible_regs, agx3_register_budget(ctx));
 
    /* Large native-query kernels benefit from leaving registers available for
     * more resident work, even when this introduces ordinary scratch spills.
@@ -3495,39 +3502,6 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
        ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
        !ctx->key->is_helper && ctx->out->uses_ray_traversal) {
       max_possible_regs = MIN2(max_possible_regs, AGX_M5_RT_REGISTER_BUDGET);
-   }
-
-   /* Match the CEM scratch extent reserved by agx3_pack_binary. */
-   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
-      max_possible_regs = MIN2(max_possible_regs,
-                               agx3_cube_register_budget(ctx));
-
-   /* A multisample-array read packs its normalized layer beside another
-    * operand, and the packer reserves one transient word for it immediately
-    * above every register this allocation used -- the same "reserve above the
-    * allocation" shape as the CEM scratch, and the same failure: a fragment
-    * that reaches half 190 leaves nowhere to put the word and agx3_pack_binary
-    * refuses the whole shader. Measured on
-    * dEQP-VK.rasterization.rasterization_order_attachment_access.format_float.
-    * attachments_8_samples_4.*, whose eight input attachments at four samples
-    * allocate the entire file: observed=191 max_reg=191 base=192.
-    *
-    * Budget the word inside the file. ROUND_DOWN_TO(reg_file_alignment) below
-    * only lowers this further, so 184 leaves the word at half 186 at the very
-    * highest under either 8- or 16-half alignment. A fragment of this shape
-    * that used halves 184..191 now spills them instead; one that did not, and
-    * every fragment without such a read, keeps the whole file.
-    */
-   if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
-       ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble) {
-      agx_foreach_instr_global(ctx, I) {
-         if ((I->op == AGX_OPCODE_TEXTURE_LOAD ||
-              I->op == AGX_OPCODE_IMAGE_LOAD) &&
-             I->dim == AGX_DIM_2D_MS_ARRAY) {
-            max_possible_regs = MIN2(max_possible_regs, 184);
-            break;
-         }
-      }
    }
 
    if (force_spilling) {
