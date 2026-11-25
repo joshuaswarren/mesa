@@ -597,6 +597,7 @@ struct hk_descriptor_state {
    uint32_t uploaded_root_size;
    uint64_t uploaded_root_generation;
    uint8_t uploaded_dynamic_buffer_end;
+   bool uploaded_root_cpu_cached;
 
    /* One past the highest root.dynamic_buffers entry any bind wrote. Later
     * entries are unread by every bound layout and stay out of uploads. */
@@ -1031,6 +1032,10 @@ struct hk_graphics_state {
    struct hk_root_fragment_snapshot fs_root_fragment_snapshot;
    const struct hk_root_descriptor_table *root_fragment_snapshot_cpu;
    const struct hk_root_descriptor_table *fs_root_fragment_snapshot_cpu;
+   /* Whether root_cpu / fs_root_cpu point into CPU write-back (AGX_BO_WRITEBACK)
+    * command-pool BOs that can be compared directly without shadow snapshots. */
+   bool root_cpu_cached;
+   bool fs_root_cpu_cached;
 
    uint64_t draw_params;
    uint64_t draw_id_ptr;
@@ -1360,6 +1365,7 @@ hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
    gfx->fs_root = gfx->root;
    gfx->fs_root_cpu = gfx->root_cpu;
    gfx->fs_root_size = gfx->root_size;
+   gfx->fs_root_cpu_cached = gfx->root_cpu_cached;
    return gfx->root;
 }
 
@@ -2732,6 +2738,12 @@ struct agx_ptr hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
                                        uint32_t size, uint32_t alignment,
                                        enum hk_cmd_bo_type type);
 
+struct agx_ptr hk_pool_alloc_from_slow_cached(struct hk_cmd_buffer *cmd,
+                                              struct hk_uploader *uploader,
+                                              uint32_t size, uint32_t alignment,
+                                              enum hk_cmd_bo_type type,
+                                              bool *cpu_cached_out);
+
 /* Bump allocation from the uploader's current BO; a new BO or a large
  * allocation takes hk_pool_alloc_from_slow(). */
 static inline struct agx_ptr
@@ -2751,6 +2763,28 @@ hk_pool_alloc_from(struct hk_cmd_buffer *cmd, struct hk_uploader *uploader,
    }
 
    return hk_pool_alloc_from_slow(cmd, uploader, size, alignment, type);
+}
+
+static inline struct agx_ptr
+hk_pool_alloc_from_cached(struct hk_cmd_buffer *cmd,
+                          struct hk_uploader *uploader, uint32_t size,
+                          uint32_t alignment, enum hk_cmd_bo_type type,
+                          bool *cpu_cached_out)
+{
+   assert(alignment > 0);
+   const uint32_t offset = align(uploader->offset, alignment);
+   if (likely(uploader->map != NULL && offset <= uploader->capacity &&
+              size <= uploader->capacity - offset)) {
+      uploader->offset = offset + size;
+      *cpu_cached_out = uploader->cpu_cached;
+      return (struct agx_ptr){
+         .gpu = uploader->base + offset,
+         .cpu = uploader->map + offset,
+      };
+   }
+
+   return hk_pool_alloc_from_slow_cached(cmd, uploader, size, alignment, type,
+                                         cpu_cached_out);
 }
 
 struct agx_ptr hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size,

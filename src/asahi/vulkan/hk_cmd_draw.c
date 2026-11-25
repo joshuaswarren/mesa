@@ -13568,7 +13568,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    /* Root must be uploaded after the above, which touch the root. */
-   if (agx_chip_native_hal200(dev->dev.chip) &&
+   if ((agx_chip_native_hal200(dev->dev.chip) ||
+        agx_chip_g17_m5(dev->dev.chip)) &&
        hk_root_upload_needs_growth(gfx->descriptors.uploaded_root_size,
                                    hk_gfx_root_descriptor_size(cmd)))
       hk_root_mark_dirty(&gfx->descriptors);
@@ -13966,7 +13967,9 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
-   if (!hk_root_dirty(desc) && agx_chip_native_hal200(dev->dev.chip) &&
+   if (!hk_root_dirty(desc) &&
+       (agx_chip_native_hal200(dev->dev.chip) ||
+        agx_chip_g17_m5(dev->dev.chip)) &&
        hk_root_upload_needs_growth(desc->uploaded_root_size,
                                    hk_gfx_root_descriptor_size(cmd)))
       return false;
@@ -14174,9 +14177,12 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             *g17p_native_bind_tail_emitted_out =
                hk_vertex_state_bind_tail(dev->dev.chip, tail_emitted);
 
+            const bool verify = unlikely(dev->dev.debug & AGX_DBG_VERIFY);
+            const bool use_shadow =
+               verify || !gfx->root_cpu_cached || !gfx->fs_root_cpu_cached;
             const uint64_t fs_root = hk_agx3_fragment_root_select(
                gfx, fs_src->info.agx3_root_reads, fs_src->root_descriptor_size,
-               true, true);
+               true, use_shadow);
             if (fs_root != prev_fs_root) {
                const uint64_t fragment_program =
                   hk_upload_usc_words(cmd, fs, linked_fs);

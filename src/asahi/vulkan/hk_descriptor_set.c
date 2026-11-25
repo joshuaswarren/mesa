@@ -1187,10 +1187,8 @@ hk_CreateDescriptorPool(VkDevice _device,
        * the recording core. */
       pool->cpu_cached = hk_g17p_cached_cmd_memory(&dev->dev);
       const enum agx_bo_flags pool_flags =
-         agx_chip_native_agx3(dev->dev.chip)
-            ? AGX_BO_ZERO_ON_REUSE |
-                 (pool->cpu_cached ? AGX_BO_WRITEBACK : 0)
-            : 0;
+         (agx_chip_native_agx3(dev->dev.chip) ? AGX_BO_ZERO_ON_REUSE : 0) |
+         (pool->cpu_cached ? AGX_BO_WRITEBACK : 0);
       pool->bo =
          agx_bo_create(&dev->dev, bo_size, 0, pool_flags, "Descriptor pool");
       if (!pool->bo) {

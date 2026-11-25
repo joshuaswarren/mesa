@@ -184,10 +184,9 @@ hk_descriptor_state_fini(struct hk_cmd_buffer *cmd,
    }
 }
 
-/* Writes the stream words of the patch sites. M5 command memory is mapped
- * uncached (hk_g17p_cached_cmd_memory() is G17P-only), so the words need no
- * cache maintenance, only to be stored whole (the GPU may read the stream
- * meanwhile when the alias count leaves 0) and made visible before the
+/* Writes the stream words of the patch sites. Store whole words (the GPU may
+ * read the stream meanwhile when the alias count leaves 0), clean each patched
+ * cache line when command memory is CPU-cached, and fence before the
  * submission or host signal that lets the GPU run them. */
 void
 hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
@@ -195,8 +194,13 @@ hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
    if (p_atomic_read(&cmd->alias_patched) || !cmd->alias_sites.size)
       return;
 
-   util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site)
+   const bool cached =
+      hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev);
+   util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site) {
       __atomic_store_n(site->word, site->value, __ATOMIC_RELAXED);
+      if (cached)
+         util_flush_range_no_fence(site->word, sizeof(*site->word));
+   }
 
    __sync_synchronize();
    if (util_has_cache_ops())
@@ -683,7 +687,7 @@ hk_cmd_buffer_alloc_bo(struct hk_cmd_buffer *cmd,
    return VK_SUCCESS;
 }
 
-static struct agx_ptr
+struct agx_ptr
 hk_pool_alloc_from_slow_cached(struct hk_cmd_buffer *cmd,
                                struct hk_uploader *uploader, uint32_t size,
                                uint32_t alignment, enum hk_cmd_bo_type type,
@@ -1123,9 +1127,7 @@ static void
 hk_cmd_buffer_publish_root_uploads(struct hk_cmd_buffer *cmd,
                                    bool already_fenced)
 {
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_chip_native_agx3(dev->dev.chip) ||
-       list_is_empty(&cmd->uploader.root.bos))
+   if (list_is_empty(&cmd->uploader.root.bos))
       return;
 
    if (util_has_cache_ops()) {
@@ -4219,12 +4221,16 @@ hk_agx3_fragment_root(struct hk_cmd_buffer *cmd, const struct hk_shader *s)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
+   const bool verify = unlikely(dev->dev.debug & AGX_DBG_VERIFY);
 
-   if (unlikely(dev->dev.debug & AGX_DBG_VERIFY))
+   if (verify)
       hk_agx3_verify_fragment_root_shadow(gfx);
 
+   const bool use_shadow =
+      verify || !gfx->root_cpu_cached || !gfx->fs_root_cpu_cached;
    return hk_agx3_fragment_root_select(gfx, s->info.agx3_root_reads,
-                                       s->root_descriptor_size, true, true);
+                                       s->root_descriptor_size, true,
+                                       use_shadow);
 }
 
 static inline uint64_t
