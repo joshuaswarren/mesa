@@ -10,7 +10,7 @@
 
 #include "compiler/nir/nir.h"
 
-#define MAX_TERMS 4
+#define MAX_TERMS 8
 
 struct lin {
    unsigned n;

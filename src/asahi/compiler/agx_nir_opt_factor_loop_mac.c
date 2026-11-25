@@ -822,6 +822,230 @@ factor_loop_mac_reductions(nir_shader *shader, nir_loop *loop)
    return progress;
 }
 
+/*
+ * After an Abel prefix-sum loop (`w += s; s += v`) is unrolled by N in {4, 8},
+ * the unrolled body contains a 2N-deep serial `iadd` recurrence:
+ *   w_{k+1} = w_k + s_k, s_{k+1} = s_k + v_k   (k = 0 .. N - 1)
+ *
+ * Rewrite this exact modular (mod 2^32) chain into a balanced tree:
+ *   s_N = s_0 + sum_{k=0}^{N-1} v_k
+ *   w_N = w_0 + N * s_0 + sum_{k=0}^{N-1} (N - 1 - k) * v_k
+ *
+ * This reduces the loop-carried critical path from 9 serial adds to 1 add on
+ * `s` and 2 adds on `w` (using single-instruction shifted adds on AGX/AGX3).
+ */
+static bool
+is_scalar_iadd32_in_block(nir_def *def, nir_block *blk, nir_def **s0,
+                          nir_def **s1)
+{
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->block != blk || instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_iadd || alu->def.num_components != 1 ||
+       alu->def.bit_size != 32)
+      return false;
+   if (alu->src[0].swizzle[0] != 0 || alu->src[1].swizzle[0] != 0)
+      return false;
+   *s0 = alu->src[0].src.ssa;
+   *s1 = alu->src[1].src.ssa;
+   return true;
+}
+
+static bool
+def_used_only_by(nir_def *def, nir_instr *u0, nir_instr *u1)
+{
+   nir_foreach_use_including_if(u, def) {
+      if (nir_src_is_if(u))
+         return false;
+      nir_instr *ui = nir_src_use_instr(u);
+      if (ui != u0 && ui != u1)
+         return false;
+   }
+   return true;
+}
+
+static bool
+def_in_loop_used_only_by(nir_def *def, nir_loop *loop, nir_instr *allowed)
+{
+   nir_foreach_use_including_if(u, def) {
+      nir_block *ub = nir_src_is_if(u)
+                         ? nir_cf_node_as_block(
+                              nir_cf_node_prev(&nir_src_use_if(u)->cf_node))
+                         : nir_src_use_instr(u)->block;
+      bool in_loop = false;
+      for (nir_cf_node *n = ub->cf_node.parent; n; n = n->parent) {
+         if (n == &loop->cf_node) {
+            in_loop = true;
+            break;
+         }
+      }
+      if (!in_loop)
+         continue;
+      if (nir_src_is_if(u) || nir_src_use_instr(u) != allowed)
+         return false;
+   }
+   return true;
+}
+
+static bool
+reassoc_unrolled_abel_chain(nir_loop *loop)
+{
+   if (!nir_loop_has_back_edge(loop) || nir_loop_has_continue_construct(loop))
+      return false;
+
+   nir_block *header = nir_loop_first_block(loop);
+   nir_block *latch = nir_loop_last_block(loop);
+   if (nir_block_num_preds(header) != 2 || nir_block_ends_in_jump(latch))
+      return false;
+
+   bool progress = false;
+   nir_builder b = nir_builder_create(nir_cf_node_get_function(&loop->cf_node));
+
+   nir_foreach_phi(w_phi, header) {
+      if (w_phi->def.num_components != 1 || w_phi->def.bit_size != 32)
+         continue;
+      nir_phi_src *w_bs = nir_phi_get_src_from_block(w_phi, latch);
+      if (!w_bs)
+         continue;
+      nir_def *w_back = w_bs->src.ssa;
+      nir_block *blk = nir_def_block(w_back);
+      if (blk != latch)
+         continue;
+
+      nir_def *wa = NULL, *wb = NULL;
+      if (!is_scalar_iadd32_in_block(w_back, blk, &wa, &wb))
+         continue;
+
+      /* Find companion `s_phi` whose back-edge `s_back` shares `s_{N-1}` with
+       * `w_back`. */
+      nir_phi_instr *matched_s = NULL;
+      nir_def *s_back = NULL;
+      nir_def *vals[8];
+      unsigned steps = 0;
+
+      nir_foreach_phi(s_phi, header) {
+         if (s_phi == w_phi || s_phi->def.num_components != 1 ||
+             s_phi->def.bit_size != 32)
+            continue;
+         nir_phi_src *s_bs = nir_phi_get_src_from_block(s_phi, latch);
+         if (!s_bs)
+            continue;
+         nir_def *sb = s_bs->src.ssa;
+         if (nir_def_block(sb) != blk)
+            continue;
+
+         nir_def *cur_w = w_back;
+         nir_def *cur_s = sb;
+         nir_def *rev_vals[8];
+         unsigned n = 0;
+         bool ok = true;
+
+         while (n < 8 && (cur_w != &w_phi->def || cur_s != &s_phi->def)) {
+            nir_def *w0 = NULL, *w1 = NULL, *s0 = NULL, *s1 = NULL;
+            if (!is_scalar_iadd32_in_block(cur_w, blk, &w0, &w1) ||
+                !is_scalar_iadd32_in_block(cur_s, blk, &s0, &s1)) {
+               ok = false;
+               break;
+            }
+            /* Identify the shared `prev_s` operand between cur_w and cur_s. */
+            nir_def *prev_w = NULL, *prev_s = NULL, *v = NULL;
+            if (w1 == s0) {
+               prev_w = w0;
+               prev_s = s0;
+               v = s1;
+            } else if (w1 == s1) {
+               prev_w = w0;
+               prev_s = s1;
+               v = s0;
+            } else if (w0 == s0) {
+               prev_w = w1;
+               prev_s = s0;
+               v = s1;
+            } else if (w0 == s1) {
+               prev_w = w1;
+               prev_s = s1;
+               v = s0;
+            } else {
+               ok = false;
+               break;
+            }
+
+            /* Intermediate `prev_w` and `prev_s` must not escape unless they
+             * are the header phis themselves. */
+            if (prev_w != &w_phi->def &&
+                !def_used_only_by(prev_w, nir_def_instr(cur_w), NULL)) {
+               ok = false;
+               break;
+            }
+            if (prev_s != &s_phi->def &&
+                !def_used_only_by(prev_s, nir_def_instr(cur_w),
+                                  nir_def_instr(cur_s))) {
+               ok = false;
+               break;
+            }
+
+            rev_vals[n++] = v;
+            cur_w = prev_w;
+            cur_s = prev_s;
+         }
+
+         if (ok && (n == 4 || n == 8) && cur_w == &w_phi->def &&
+             cur_s == &s_phi->def &&
+             def_in_loop_used_only_by(w_back, loop, &w_phi->instr) &&
+             def_in_loop_used_only_by(sb, loop, &s_phi->instr)) {
+            for (unsigned k = 0; k < n; ++k)
+               vals[k] = rev_vals[n - 1 - k];
+            matched_s = s_phi;
+            s_back = sb;
+            steps = n;
+            break;
+         }
+      }
+
+      if (!matched_s)
+         continue;
+
+      /* Place balanced tree at the end of `blk` (dominated by all vals[]). */
+      b.cursor = nir_after_block_before_jump(blk);
+
+      nir_def *a01 = nir_iadd(&b, vals[0], vals[1]);
+      nir_def *a23 = nir_iadd(&b, vals[2], vals[3]);
+      nir_def *sa = nir_iadd(&b, a01, a23);
+      nir_def *w_a =
+         nir_iadd(&b, nir_iadd(&b, vals[0], vals[2]), nir_ishl_imm(&b, a01, 1));
+
+      nir_def *s_chunk, *w_chunk;
+      unsigned shift;
+      if (steps == 4) {
+         s_chunk = sa;
+         w_chunk = w_a;
+         shift = 2;
+      } else {
+         nir_def *b45 = nir_iadd(&b, vals[4], vals[5]);
+         nir_def *b67 = nir_iadd(&b, vals[6], vals[7]);
+         nir_def *sb = nir_iadd(&b, b45, b67);
+         nir_def *w_b = nir_iadd(&b, nir_iadd(&b, vals[4], vals[6]),
+                                 nir_ishl_imm(&b, b45, 1));
+         s_chunk = nir_iadd(&b, sa, sb);
+         w_chunk =
+            nir_iadd(&b, nir_iadd(&b, w_a, w_b), nir_ishl_imm(&b, sa, 2));
+         shift = 3;
+      }
+
+      nir_def *w_new = nir_iadd(
+         &b, nir_iadd(&b, &w_phi->def, nir_ishl_imm(&b, &matched_s->def, shift)),
+         w_chunk);
+      nir_def *s_new = nir_iadd(&b, &matched_s->def, s_chunk);
+
+      nir_def_replace(w_back, w_new);
+      nir_def_replace(s_back, s_new);
+      progress = true;
+   }
+
+   return progress;
+}
+
 static bool
 process_cf_list(nir_shader *shader, struct exec_list *list)
 {
@@ -841,6 +1065,7 @@ process_cf_list(nir_shader *shader, struct exec_list *list)
          progress |= process_cf_list(shader, &loop->body);
          progress |= hoist_loop_invariant_iadd_terms(loop);
          progress |= factor_loop_mac_reductions(shader, loop);
+         progress |= reassoc_unrolled_abel_chain(loop);
          break;
       }
       default:
