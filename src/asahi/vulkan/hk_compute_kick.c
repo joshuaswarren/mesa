@@ -384,7 +384,8 @@ hk_compute_kick_init(struct hk_device *dev, unsigned period_ms)
     *    M4 Pro (G17P): the job does not wait (10-12 ms median, 69 ms worst
     *       beside 1.5 s commands), so there is nothing to kick.
     */
-   if (dev->dev.chip != AGX_CHIP_G17C || !period_ms)
+   if (dev->dev.chip != AGX_CHIP_G17C || !period_ms ||
+       (dev->dev.debug & AGX_DBG_1QUEUE))
       return;
 
    unsigned count = 0;

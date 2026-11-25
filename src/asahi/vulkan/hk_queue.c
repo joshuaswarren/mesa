@@ -3767,7 +3767,7 @@ uint32_t
 hk_queue_independent_budget(struct hk_device *dev)
 {
    if (!(dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) ||
-       dev->dev.is_virtio)
+       dev->dev.is_virtio || (dev->dev.debug & AGX_DBG_1QUEUE))
       return 1;
 
    const uint32_t max_queues = hk_device_physical(dev)->queue_limits.max_queues;
@@ -3810,6 +3810,7 @@ hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
    if (independent < hk_queue_independent_budget(dev))
       return;
 
+   const bool single_kernel_queue = (dev->dev.debug & AGX_DBG_1QUEUE) != 0;
    struct vk_queue *backing = NULL;
    unsigned backing_sharers = 0;
    vk_foreach_queue(iter, &dev->vk) {
@@ -3818,8 +3819,9 @@ hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
       if (vk_queue_is_emulated(iter))
          continue;
       const struct hk_queue *real = container_of(iter, struct hk_queue, vk);
-      if (real->drm.virt_ring_idx != queue->drm.virt_ring_idx ||
-          real->vk.flags != queue->vk.flags)
+      if (!single_kernel_queue &&
+          (real->drm.virt_ring_idx != queue->drm.virt_ring_idx ||
+           real->vk.flags != queue->vk.flags))
          continue;
       const unsigned sharers = hk_queue_sharers(dev, iter);
       if (!backing || sharers < backing_sharers) {

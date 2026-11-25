@@ -225,7 +225,7 @@ hk_queue_sibling_compute_supported(const struct agx_device *dev,
 {
    const uint64_t required = DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS |
                              DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
-   return !dev->is_virtio && exact_prior &&
+   return !dev->is_virtio && !(dev->debug & AGX_DBG_1QUEUE) && exact_prior &&
           hk_queue_uses_cumulative_signals(dev) &&
           (dev->params.features & required) == required &&
           !(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL);
