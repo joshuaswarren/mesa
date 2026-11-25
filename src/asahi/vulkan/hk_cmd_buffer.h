@@ -2777,10 +2777,25 @@ static inline struct hk_cs *
 hk_cs_create_at(struct hk_cmd_buffer *cmd, bool compute, struct agx_ptr root)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_cmd_pool *pool = cmd->vk.pool ? hk_cmd_buffer_pool(cmd) : NULL;
    size_t initial_size = hk_cs_root_size(dev->dev.chip, compute);
 
-   /* Allocate hk_cs for the new stream */
-   struct hk_cs *cs = malloc(sizeof(*cs));
+   /* Recycle a pool-owned hk_cs (keeping scissor/depth_bias storage warm)
+    * when available to avoid per-pass heap traffic on steady-state recordings. */
+   struct hk_cs *cs;
+   struct util_dynarray scissor = UTIL_DYNARRAY_INIT;
+   struct util_dynarray depth_bias = UTIL_DYNARRAY_INIT;
+   if (pool && !list_is_empty(&pool->free_cs)) {
+      cs = list_first_entry(&pool->free_cs, struct hk_cs, node);
+      list_del(&cs->node);
+      pool->num_free_cs--;
+      scissor = cs->scissor;
+      depth_bias = cs->depth_bias;
+   } else {
+      cs = malloc(sizeof(*cs));
+      if (!cs)
+         return NULL;
+   }
    *cs = (struct hk_cs){
       .cmd = cmd,
       .type = compute ? HK_CS_CDM : HK_CS_VDM,
@@ -2790,6 +2805,8 @@ hk_cs_create_at(struct hk_cmd_buffer *cmd, bool compute, struct agx_ptr root)
       .chunk = root,
       .current = root.cpu,
       .end = root.cpu + initial_size,
+      .scissor = scissor,
+      .depth_bias = depth_bias,
    };
 
    util_dynarray_init(&cs->compute_resources, NULL);
@@ -2812,6 +2829,7 @@ hk_cs_create(struct hk_cmd_buffer *cmd, bool compute)
 }
 
 static inline void hk_flush_oq_pending(struct hk_cmd_buffer *cmd);
+static inline void hk_cs_destroy(struct hk_cs *cs);
 
 static inline struct hk_cs *
 hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
@@ -2865,7 +2883,7 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
          if (!hk_graphics_cs_publishable(
                 dev->dev.chip, initialized,
                 cs->agx3_active_context_selector_valid)) {
-            free(cs);
+            hk_cs_destroy(cs);
             return NULL;
          }
       }
@@ -3068,17 +3086,37 @@ hk_cs_destroy(struct hk_cs *cs)
    hk_cs_invalidate_compute_pair(cs);
    util_dynarray_fini(&cs->compute_resources);
    util_dynarray_fini(&cs->render_resources);
-   if (cs->type == HK_CS_VDM) {
-      util_dynarray_fini(&cs->scissor);
-      util_dynarray_fini(&cs->depth_bias);
-   } else {
-      util_dynarray_fini(&cs->imm_writes);
-      util_dynarray_fini(&cs->imm_write_query_ranges);
-      util_dynarray_fini(&cs->oq_stamps);
-      util_dynarray_fini(&cs->query_access_ranges);
-   }
+   util_dynarray_fini(&cs->scissor);
+   util_dynarray_fini(&cs->depth_bias);
+   util_dynarray_fini(&cs->imm_writes);
+   util_dynarray_fini(&cs->imm_write_query_ranges);
+   util_dynarray_fini(&cs->oq_stamps);
+   util_dynarray_fini(&cs->query_access_ranges);
 
    free(cs);
+}
+
+#define HK_CMD_POOL_CS_CACHE_MAX 4u
+
+static inline void
+hk_cs_recycle(struct hk_cmd_pool *pool, struct hk_cs *cs)
+{
+   if (!pool || pool->num_free_cs >= HK_CMD_POOL_CS_CACHE_MAX) {
+      hk_cs_destroy(cs);
+      return;
+   }
+
+   hk_cs_invalidate_compute_pair(cs);
+   util_dynarray_fini(&cs->compute_resources);
+   util_dynarray_fini(&cs->render_resources);
+   util_dynarray_fini(&cs->imm_writes);
+   util_dynarray_fini(&cs->imm_write_query_ranges);
+   util_dynarray_fini(&cs->oq_stamps);
+   util_dynarray_fini(&cs->query_access_ranges);
+   util_dynarray_clear(&cs->scissor);
+   util_dynarray_clear(&cs->depth_bias);
+   list_add(&cs->node, &pool->free_cs);
+   pool->num_free_cs++;
 }
 
 void hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs);

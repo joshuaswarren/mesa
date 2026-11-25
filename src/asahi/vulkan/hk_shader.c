@@ -6455,7 +6455,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       !preserve_raw_mono && agx_chip_native_agx3(dev->dev.chip) &&
       (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
       sw_stage == MESA_SHADER_FRAGMENT &&
-      nir->info.stage == MESA_SHADER_FRAGMENT && !nir->info.internal &&
+      nir->info.stage == MESA_SHADER_FRAGMENT &&
       !nir->info.fs.uses_sample_shading;
 
    if (preserve_raw_mono) {

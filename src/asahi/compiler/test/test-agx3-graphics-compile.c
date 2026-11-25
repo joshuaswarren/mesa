@@ -9387,6 +9387,89 @@ test_agx3_vertex_set_pointer_uniform_halfs(void)
    return named;
 }
 
+/* Unpacking a 32-bit word into four bytes, clamping to 255, narrowing to u16,
+ * and storing to an R8G8B8A8_UINT tilebuffer (vk_meta's compressed
+ * buffer-to-image upload shape) must fold away the unpack/clamp/repack chain
+ * while leaving non-identity byte permutations on the explicit packing path. */
+static bool
+test_agx3_packed_byte_word_tile_store(void)
+{
+   const enum agx_isa_encoding encs[] = {
+      AGX_ISA_ENCODING_AGX3B,
+      AGX_ISA_ENCODING_AGX3C,
+   };
+
+   for (unsigned e = 0; e < ARRAY_SIZE(encs); ++e) {
+      unsigned sizes[4] = {0, 0, 0, 0};
+      for (unsigned mode = 0; mode < 4; ++mode) {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_FRAGMENT, &agx_nir_options, "packed-i8-tile");
+         b.shader->info.io_lowered = true;
+         nir_def *addr = nir_load_preamble(&b, 1, 64, .base = 0);
+         nir_def *word = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+         nir_def *ch[4];
+         if (mode == 2) {
+            /* Exact half-bitfield-extract lowered shape produced for vk_meta
+             * R32_UINT -> R8G8B8A8_UINT uploads (shared shift + unpack_y). */
+            nir_def *q = nir_ushr_imm(&b, word, 8);
+            nir_def *raw[4] = {
+               nir_iand_imm(&b, word, 0xff),
+               nir_u2u32(&b, nir_iand_imm(&b, nir_unpack_32_2x16_split_x(&b, q), 0xff)),
+               nir_u2u32(&b, nir_iand_imm(&b, nir_unpack_32_2x16_split_y(&b, word), 0xff)),
+               nir_u2u32(&b, nir_unpack_32_2x16_split_y(&b, q)),
+            };
+            for (unsigned i = 0; i < 4; ++i)
+               ch[i] = nir_u2u16(&b, nir_umin(&b, raw[i], nir_imm_int(&b, 255)));
+         } else if (mode == 3) {
+            /* Exact nir_format_unpack_int() shift-left/shift-right shape
+             * emitted by vk_meta_copy_buffer_to_image for R32_UINT ->
+             * R8G8B8A8_UINT compressed uploads. */
+            for (unsigned i = 0; i < 4; ++i) {
+               nir_def *ext = nir_ushr_imm(&b, nir_ishl_imm(&b, word, 24 - i * 8), 24);
+               nir_def *clamped = nir_umin(&b, ext, nir_imm_int(&b, 255));
+               ch[i] = nir_u2u16(&b, clamped);
+            }
+         } else {
+            for (unsigned i = 0; i < 4; ++i) {
+               unsigned src_byte = mode ? (3 - i) : i;
+               nir_def *ext = nir_ubitfield_extract_imm(&b, word, src_byte * 8, 8);
+               nir_def *clamped = nir_umin(&b, ext, nir_imm_int(&b, 255));
+               ch[i] = nir_u2u16(&b, clamped);
+            }
+         }
+         nir_store_local_pixel_agx(
+            &b, nir_vec(&b, ch, 4), nir_imm_intN_t(&b, 0xff, 16),
+            nir_undef(&b, 2, 16), .base = 0, .write_mask = 0xf,
+            .format = PIPE_FORMAT_R8_UINT, .target = 0);
+
+         struct agx_shader_key key = {0};
+         key.dev.encoding = encs[e];
+         key.no_preamble = true;
+         key.reserved_preamble = 8;
+         key.fs.nr_samples = 1;
+
+         struct agx_shader_part part = {0};
+         const bool ok = agx_compile_shader_nir(b.shader, &key, &part);
+         sizes[mode] = part.info.binary_size;
+         free(part.binary);
+         ralloc_free(b.shader);
+         if (!ok || !sizes[mode]) {
+            fprintf(stderr, "packed byte-word tile store failed enc=%u mode=%u\n",
+                    e, mode);
+            return false;
+         }
+      }
+      if (sizes[0] + 48 > sizes[1] || sizes[2] + 48 > sizes[1] ||
+          sizes[3] + 48 > sizes[1]) {
+         fprintf(stderr,
+                 "packed byte-word tile store did not fold enc=%u: id=%u half=%u shift=%u perm=%u\n",
+                 e, sizes[0], sizes[2], sizes[3], sizes[1]);
+         return false;
+      }
+   }
+   return true;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -9867,6 +9950,7 @@ main(int argc, char **argv)
    RUN(test_g17c_txf_layer_saturation);
    RUN(test_agx3_tiny_push_vertex_preamble_inlined);
    RUN(test_agx3_vertex_set_pointer_uniform_halfs);
+   RUN(test_agx3_packed_byte_word_tile_store);
 #undef RUN
 
    for (unsigned e = 0; e < ARRAY_SIZE(encodings); ++e) {

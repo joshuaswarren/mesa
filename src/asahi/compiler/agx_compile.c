@@ -1188,6 +1188,213 @@ agx_store_mask_already_applied(nir_intrinsic_instr *store)
    return false;
 }
 
+/* Match a channel carrying byte `byte_idx` of a packed 16- or 32-bit word,
+ * tolerating the umin(..., >=0xff) clamp and u2u16 narrowing emitted by
+ * agx_nir_lower_tilebuffer as well as the shared-shift / half-word unpacks
+ * emitted by agx_nir_opt_half_bitfield_extract. */
+static bool
+agx_match_unpacked_byte_channel(nir_scalar ch, unsigned byte_idx,
+                                nir_scalar *word_out)
+{
+   ch = nir_scalar_chase_movs(ch);
+   if (ch.def->bit_size == 16 && nir_scalar_is_alu(ch) &&
+       nir_scalar_alu_op(ch) == nir_op_u2u16)
+      ch = nir_scalar_chase_alu_src(ch, 0);
+
+   if (nir_scalar_is_alu(ch) && nir_scalar_alu_op(ch) == nir_op_umin) {
+      for (unsigned i = 0; i < 2; ++i) {
+         nir_scalar k = nir_scalar_chase_alu_src(ch, i);
+         if (nir_scalar_is_const(k) && nir_scalar_as_uint(k) >= 0xffu) {
+            ch = nir_scalar_chase_alu_src(ch, 1 - i);
+            break;
+         }
+      }
+   }
+
+   unsigned bit_offset = 0;
+   bool proven_u8 = false;
+   nir_scalar s = ch;
+
+   for (unsigned depth = 0; depth < 8; ++depth) {
+      s = nir_scalar_chase_movs(s);
+      if (!nir_scalar_is_alu(s))
+         break;
+
+      const nir_op op = nir_scalar_alu_op(s);
+      if (op == nir_op_u2u32 || op == nir_op_u2u16) {
+         nir_scalar src = nir_scalar_chase_alu_src(s, 0);
+         if (src.def->bit_size < s.def->bit_size) {
+            /* Zero-extension never alters bits below src.bit_size; if the
+             * desired byte sits at the top of src, upper bits are zero. */
+            if (bit_offset + 8u > src.def->bit_size)
+               break;
+            if (bit_offset + 8u == src.def->bit_size)
+               proven_u8 = true;
+            s = src;
+            continue;
+         }
+         /* Truncation is only valid once bits above bit_offset+7 are dead. */
+         if (proven_u8 && bit_offset + 8u <= s.def->bit_size) {
+            s = src;
+            continue;
+         }
+         break;
+      }
+
+      if (op == nir_op_ubitfield_extract || op == nir_op_ubfe) {
+         nir_scalar off = nir_scalar_chase_alu_src(s, 1);
+         nir_scalar bits = nir_scalar_chase_alu_src(s, 2);
+         if (bit_offset == 0 && nir_scalar_is_const(off) &&
+             nir_scalar_is_const(bits) && nir_scalar_as_uint(bits) == 8 &&
+             (nir_scalar_as_uint(off) & 7u) == 0 &&
+             nir_scalar_as_uint(off) < s.def->bit_size) {
+            proven_u8 = true;
+            bit_offset += nir_scalar_as_uint(off);
+            s = nir_scalar_chase_alu_src(s, 0);
+            continue;
+         }
+         break;
+      }
+
+      if (op == nir_op_extract_u8) {
+         nir_scalar idx = nir_scalar_chase_alu_src(s, 1);
+         if (bit_offset == 0 && nir_scalar_is_const(idx) &&
+             nir_scalar_as_uint(idx) < s.def->bit_size / 8u) {
+            proven_u8 = true;
+            bit_offset += nir_scalar_as_uint(idx) * 8u;
+            s = nir_scalar_chase_alu_src(s, 0);
+            continue;
+         }
+         break;
+      }
+
+      if (op == nir_op_iand) {
+         if (bit_offset + 8u > s.def->bit_size)
+            break;
+         const uint64_t want = UINT64_C(0xff) << bit_offset;
+         nir_scalar other = {0};
+         for (unsigned i = 0; i < 2; ++i) {
+            nir_scalar k = nir_scalar_chase_alu_src(s, i);
+            if (nir_scalar_is_const(k) && nir_scalar_as_uint(k) == want) {
+               other = nir_scalar_chase_alu_src(s, 1 - i);
+               break;
+            }
+         }
+         if (other.def) {
+            proven_u8 = true;
+            s = other;
+            continue;
+         }
+         break;
+      }
+
+      if (op == nir_op_unpack_32_2x16_split_x) {
+         if (!proven_u8 || bit_offset + 8u > 16u)
+            break;
+         s = nir_scalar_chase_alu_src(s, 0);
+         continue;
+      }
+
+      if (op == nir_op_unpack_32_2x16_split_y) {
+         if (bit_offset + 8u > 16u)
+            break;
+         bit_offset += 16u;
+         s = nir_scalar_chase_alu_src(s, 0);
+         continue;
+      }
+
+      if (op == nir_op_ushr) {
+         nir_scalar src0 = nir_scalar_chase_alu_src(s, 0);
+         nir_scalar k = nir_scalar_chase_alu_src(s, 1);
+         if (!nir_scalar_is_const(k))
+            break;
+         const unsigned sh = nir_scalar_as_uint(k) & (s.def->bit_size - 1u);
+         if ((sh & 7u) != 0 || bit_offset + sh + 8u > src0.def->bit_size)
+            break;
+         if (bit_offset + sh + 8u == src0.def->bit_size)
+            proven_u8 = true;
+         bit_offset += sh;
+         s = src0;
+         continue;
+      }
+
+      if (op == nir_op_ishl) {
+         nir_scalar src0 = nir_scalar_chase_alu_src(s, 0);
+         nir_scalar k = nir_scalar_chase_alu_src(s, 1);
+         if (!proven_u8 || !nir_scalar_is_const(k))
+            break;
+         const unsigned sh = nir_scalar_as_uint(k) & (s.def->bit_size - 1u);
+         if ((sh & 7u) != 0 || sh > bit_offset)
+            break;
+         bit_offset -= sh;
+         s = src0;
+         continue;
+      }
+
+      break;
+   }
+
+   if (!proven_u8 || bit_offset != byte_idx * 8u)
+      return false;
+
+   *word_out = s;
+   return true;
+}
+
+/* When an AGX3 8-bit integer tile store writes 2 or 4 consecutive bytes
+ * unpacked from a single packed word (such as vk_meta's R32_UINT ->
+ * R8G8B8A8_UINT buffer-to-image upload), feed the word's 16-bit halves
+ * directly to st_tile.i8 so DCE eliminates the unpack, clamp, and repack. */
+static unsigned
+agx_pack_integer_8_word_agx3(agx_builder *b, nir_intrinsic_instr *instr,
+                             enum agx_format format, agx_index *packed)
+{
+   if ((b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX3B &&
+        b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX3C) ||
+       format != AGX_FORMAT_I8 || nir_src_bit_size(instr->src[0]) != 16)
+      return 0;
+
+   const unsigned write_mask = nir_intrinsic_write_mask(instr);
+   if (write_mask != 0xf && write_mask != 0x3)
+      return 0;
+
+   const unsigned nr = write_mask == 0xf ? 4 : 2;
+   nir_scalar word = {0};
+   for (unsigned i = 0; i < nr; ++i) {
+      nir_scalar ch = nir_get_scalar(instr->src[0].ssa, i);
+      nir_scalar cur = {0};
+      if (!agx_match_unpacked_byte_channel(ch, i, &cur))
+         return 0;
+      if (i == 0)
+         word = cur;
+      else if (!nir_scalar_equal(word, cur))
+         return 0;
+   }
+
+   if (nr == 4) {
+      if (word.def->bit_size != 32)
+         return 0;
+      agx_index w = agx_extract_nir_src(b, nir_src_for_ssa(word.def), word.comp);
+      packed[0] = agx_temp(b->shader, AGX_SIZE_16);
+      packed[1] = agx_temp(b->shader, AGX_SIZE_16);
+      agx_subdivide_to(b, packed[0], w, 0);
+      agx_subdivide_to(b, packed[1], w, 1);
+      return 2;
+   }
+
+   if (word.def->bit_size == 16) {
+      packed[0] = agx_extract_nir_src(b, nir_src_for_ssa(word.def), word.comp);
+      return 1;
+   }
+   if (word.def->bit_size == 32) {
+      agx_index w = agx_extract_nir_src(b, nir_src_for_ssa(word.def), word.comp);
+      packed[0] = agx_temp(b->shader, AGX_SIZE_16);
+      agx_subdivide_to(b, packed[0], w, 0);
+      return 1;
+   }
+   return 0;
+}
+
 static agx_instr *
 agx_emit_local_store_pixel(agx_builder *b, nir_intrinsic_instr *instr)
 {
@@ -1198,39 +1405,42 @@ agx_emit_local_store_pixel(agx_builder *b, nir_intrinsic_instr *instr)
       agx_wait_pixel_mask(b, 0xC);
    }
 
-   /* Compact the registers according to the mask */
-   agx_index compacted[4] = {agx_null()};
-
-   unsigned compact_count = 0;
-   u_foreach_bit(i, nir_intrinsic_write_mask(instr)) {
-      compacted[compact_count++] = agx_extract_nir_src(b, instr->src[0], i);
-   }
-
    enum agx_format format = agx_format_for_pipe(nir_intrinsic_format(instr));
 
-   /* The colour channels of an sRGB target are encoded, its alpha (the
-    * fourth channel) is linear. Name them in compacted order. */
-   unsigned srgb_lanes = 0;
-   {
-      unsigned k = 0;
-      u_foreach_bit(i, nir_intrinsic_write_mask(instr)) {
-         if (i < 3)
-            srgb_lanes |= BITFIELD_BIT(k);
-         ++k;
-      }
-   }
-
    agx_index packed[4] = {agx_null()};
-   unsigned nr_packed = agx_pack_normalized_agx3(
-      b, compacted, compact_count, format, srgb_lanes, packed);
+   agx_index compacted[4] = {agx_null()};
+   unsigned compact_count = 0;
+   unsigned nr_packed = agx_pack_integer_8_word_agx3(b, instr, format, packed);
 
-   /* The packed sRGB bytes are stored through the U8NORM width. */
-   if (nr_packed && format == AGX_FORMAT_SRGBA8)
-      format = AGX_FORMAT_U8NORM;
+   if (nr_packed == 0) {
+      /* Compact the registers according to the mask */
+      u_foreach_bit(i, nir_intrinsic_write_mask(instr)) {
+         compacted[compact_count++] = agx_extract_nir_src(b, instr->src[0], i);
+      }
 
-   if (nr_packed == 0)
-      nr_packed = agx_pack_integer_8_agx3(
-         b, compacted, compact_count, format, packed);
+      /* The colour channels of an sRGB target are encoded, its alpha (the
+       * fourth channel) is linear. Name them in compacted order. */
+      unsigned srgb_lanes = 0;
+      {
+         unsigned k = 0;
+         u_foreach_bit(i, nir_intrinsic_write_mask(instr)) {
+            if (i < 3)
+               srgb_lanes |= BITFIELD_BIT(k);
+            ++k;
+         }
+      }
+
+      nr_packed = agx_pack_normalized_agx3(
+         b, compacted, compact_count, format, srgb_lanes, packed);
+
+      /* The packed sRGB bytes are stored through the U8NORM width. */
+      if (nr_packed && format == AGX_FORMAT_SRGBA8)
+         format = AGX_FORMAT_U8NORM;
+
+      if (nr_packed == 0)
+         nr_packed = agx_pack_integer_8_agx3(
+            b, compacted, compact_count, format, packed);
+   }
 
    /* Native AGX3 tile stores carry a lane width, with the f32-to-f16
     * conversion in the shader. Both encodings have the narrowing FMUL form.

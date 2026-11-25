@@ -353,12 +353,12 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    list_for_each_entry_safe(struct hk_vdm_allocation, allocation,
                             &cmd->vdm_allocations, link) {
       list_del(&allocation->link);
-      hk_device_free_span(dev, allocation);
+      hk_cmd_pool_free_vdm_span(pool, allocation);
    }
 
    list_for_each_entry_safe(struct hk_cs, it, &cmd->control_streams, node) {
       list_del(&it->node);
-      hk_cs_destroy(it);
+      hk_cs_recycle(pool, it);
    }
    hk_tess_batch_reset(cmd);
 
@@ -484,22 +484,38 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       _mesa_set_clear(cmd->m5_pushed_images, NULL);
    util_dynarray_clear(&cmd->oq_ends);
 
-   if (!cmd->g17p_gfx_caches_used) {
-      /* These native graphics caches are zero-initialized at allocation and
-       * untouched on AGX2 or compute-only recordings. Reset the common state
-       * on either side without clearing their 8.5 KiB again for every
-       * recording. */
-      const size_t first =
-         offsetof(struct hk_cmd_buffer, state.gfx.g17p_ioto) -
-         offsetof(struct hk_cmd_buffer, state);
-      const size_t end =
-         offsetof(struct hk_cmd_buffer, state.gfx.g17p_spilled_rt_descs) +
-         sizeof(cmd->state.gfx.g17p_spilled_rt_descs) -
-         offsetof(struct hk_cmd_buffer, state);
-      memset(&cmd->state, 0, first);
-      memset((char *)&cmd->state + end, 0, sizeof(cmd->state) - end);
-   } else {
-      memset(&cmd->state, 0, sizeof(cmd->state));
+   /* Reset the common state on either side of the four contiguous native
+    * graphics caches (g17p_ioto..g17p_spilled_rt_descs, ~8.5 KiB) without
+    * zeroing their whole payload on every reset. When populated, clear only
+    * their validity/identity tags. */
+   const size_t first =
+      offsetof(struct hk_cmd_buffer, state.gfx.g17p_ioto) -
+      offsetof(struct hk_cmd_buffer, state);
+   const size_t end =
+      offsetof(struct hk_cmd_buffer, state.gfx.g17p_spilled_rt_descs) +
+      sizeof(cmd->state.gfx.g17p_spilled_rt_descs) -
+      offsetof(struct hk_cmd_buffer, state);
+   memset(&cmd->state, 0, first);
+   memset((char *)&cmd->state + end, 0, sizeof(cmd->state) - end);
+   if (cmd->g17p_gfx_caches_used) {
+      for (unsigned stage = 0; stage < ARRAY_SIZE(cmd->state.gfx.g17p_ioto);
+           ++stage) {
+         cmd->state.gfx.g17p_ioto[stage].loader = NULL;
+         cmd->state.gfx.g17p_ioto[stage].loader_linked = NULL;
+         cmd->state.gfx.g17p_ioto[stage].loader_program = 0;
+         cmd->state.gfx.g17p_ioto[stage].admit.s = NULL;
+         cmd->state.gfx.g17p_ioto[stage].admit.linked = NULL;
+      }
+      for (unsigned stage = 0; stage < ARRAY_SIZE(cmd->state.gfx.g17p_launch);
+           ++stage) {
+         for (unsigned i = 0; i < ARRAY_SIZE(cmd->state.gfx.g17p_launch[stage]);
+              ++i)
+            cmd->state.gfx.g17p_launch[stage][i].valid = false;
+      }
+      for (unsigned i = 0;
+           i < ARRAY_SIZE(cmd->state.gfx.g17p_combined_sampler_pointers); ++i)
+         cmd->state.gfx.g17p_combined_sampler_pointers[i].valid = false;
+      cmd->state.gfx.g17p_spilled_rt_descs.valid = false;
       cmd->g17p_gfx_caches_used = false;
    }
    if (cmd->g17p_bg_eot_cache_used) {
@@ -734,9 +750,9 @@ hk_pool_vdm_primary_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
       MAX2(alignment, HK_G17P_VDM_UPLOAD_CHUNK_SIZE);
    struct agx_ptr chunk = {0};
    struct hk_vdm_allocation *allocation = NULL;
-   const VkResult result = hk_cmd_pool_alloc_span(
-      hk_cmd_buffer_pool(cmd), HK_CMD_SLAB_VDM, chunk_size, chunk_alignment,
-      &chunk, &allocation);
+   const VkResult result = hk_cmd_pool_alloc_vdm_span(
+      hk_cmd_buffer_pool(cmd), chunk_size, chunk_alignment, &chunk,
+      &allocation);
    if (unlikely(result != VK_SUCCESS)) {
       vk_command_buffer_set_error(&cmd->vk, result);
       return (struct agx_ptr){0};
@@ -5519,8 +5535,8 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    }
    cs->current = map;
 
-   cs->scissor = UTIL_DYNARRAY_INIT;
-   cs->depth_bias = UTIL_DYNARRAY_INIT;
+   util_dynarray_clear(&cs->scissor);
+   util_dynarray_clear(&cs->depth_bias);
    if (!util_dynarray_ensure_cap(&cs->scissor,
                                  HK_MAX_VIEWPORTS * AGX_SCISSOR_LENGTH) ||
        !util_dynarray_ensure_cap(&cs->depth_bias,

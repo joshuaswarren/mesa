@@ -1414,7 +1414,7 @@ test_span_pool_policy(void)
    struct agx_device g17s = {.chip = AGX_CHIP_G17S, .is_virtio = false};
    struct agx_device g13g = {.chip = AGX_CHIP_G13G, .is_virtio = false};
 
-   T("native AGX3 caches up to 256 main/root/ioto spans",
+   T("native AGX3 caches up to 256 main/root/ioto/vdm spans",
      hk_cmd_pool_span_cache_max(&g17p, HK_CMD_BO_MAIN) ==
         HK_G17P_CMD_POOL_MAIN_BO_MAX &&
         hk_cmd_pool_span_cache_max(&g17p, HK_CMD_BO_ROOT) ==
@@ -1423,9 +1423,13 @@ test_span_pool_policy(void)
            HK_CMD_POOL_BO_MAX &&
         hk_cmd_pool_ioto_span_cache_max(&g17p) ==
            HK_G17P_CMD_POOL_MAIN_BO_MAX &&
+        hk_cmd_pool_vdm_span_cache_max(&g17p) ==
+           HK_G17P_CMD_POOL_MAIN_BO_MAX &&
         hk_cmd_pool_span_cache_max(&g17s, HK_CMD_BO_MAIN) ==
            HK_G17P_CMD_POOL_MAIN_BO_MAX &&
         hk_cmd_pool_ioto_span_cache_max(&g17s) ==
+           HK_G17P_CMD_POOL_MAIN_BO_MAX &&
+        hk_cmd_pool_vdm_span_cache_max(&g17s) ==
            HK_G17P_CMD_POOL_MAIN_BO_MAX);
    T("virtio and AGX2 keep default span cache cap",
      hk_cmd_pool_span_cache_max(&g17p_virtio, HK_CMD_BO_MAIN) ==
@@ -1433,9 +1437,11 @@ test_span_pool_policy(void)
         hk_cmd_pool_span_cache_max(&g17p_virtio, HK_CMD_BO_ROOT) ==
            HK_CMD_POOL_BO_MAX &&
         hk_cmd_pool_ioto_span_cache_max(&g17p_virtio) == HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_vdm_span_cache_max(&g17p_virtio) == HK_CMD_POOL_BO_MAX &&
         hk_cmd_pool_span_cache_max(&g13g, HK_CMD_BO_MAIN) ==
            HK_CMD_POOL_BO_MAX &&
-        hk_cmd_pool_ioto_span_cache_max(&g13g) == HK_CMD_POOL_BO_MAX);
+        hk_cmd_pool_ioto_span_cache_max(&g13g) == HK_CMD_POOL_BO_MAX &&
+        hk_cmd_pool_vdm_span_cache_max(&g13g) == HK_CMD_POOL_BO_MAX);
 }
 
 void

@@ -326,6 +326,10 @@ struct hk_shader {
       simple_mtx_t lock;
       struct hash_table *ht;
       bool lazy_ht;
+      /* Lock-free fast path for the first linked variant (first_key is
+       * write-once under lock before release-storing first). */
+      struct hk_linked_shader *first;
+      const void *first_key;
    } linked;
 
    /* The variant was compiled (hk_compile_nir) or deserialized from a
