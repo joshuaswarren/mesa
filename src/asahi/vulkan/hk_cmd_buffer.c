@@ -5125,7 +5125,7 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    /* Attachmentless rendering defers its API sample count. Publish the
     * native one-sample no-imageblock profile in this control stream while
     * preserving the deferred count in render state. */
-   if (agx_chip_g17_m5(dev->dev.chip) && !cs->tib.sample_size_B &&
+   if (agx_chip_hal300_path(dev->dev.chip) && !cs->tib.sample_size_B &&
        !cs->tib.nr_samples && !render->color_att_count &&
        !render->depth_att.iview && !render->stencil_att.iview)
       cs->tib.nr_samples = 1;
