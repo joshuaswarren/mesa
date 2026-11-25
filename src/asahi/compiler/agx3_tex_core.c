@@ -2234,6 +2234,19 @@ agx3_tex_normalize_cube_array_layer(enum agx_isa_encoding enc, uint16_t dest,
 }
 
 bool
+agx3_tex_stage_array_lod_at(enum agx_isa_encoding enc, uint16_t bank,
+                            uint16_t layer, uint16_t lod, uint8_t slot,
+                            uint16_t wait_mask, bool layer_cache,
+                            bool layer_discard, bool lod_cache,
+                            bool lod_discard, uint8_t out[AGX3_TEX_MAX_LENGTH],
+                            uint8_t *len)
+{
+   return agx3_tex_stage_array_typed_lod(
+      enc, bank, layer, lod, slot, wait_mask, layer_cache, layer_discard,
+      lod_cache, lod_discard, AGX3_TEX_LEVEL_FLOAT, out, len);
+}
+
+bool
 agx3_tex_stage_array_lod(enum agx_isa_encoding enc, uint16_t layer,
                          uint16_t lod, uint8_t slot, uint16_t wait_mask,
                          bool layer_cache, bool layer_discard,
