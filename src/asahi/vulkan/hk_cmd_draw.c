@@ -7672,7 +7672,7 @@ hk_g17p_mono_part_refusal(const struct hk_shader *shader,
  * the colour epilog key and the tile partitions (the build is part of the
  * cache's own identity). */
 static bool
-hk_m5_uniform_blend_key(const struct agx_fs_epilog_key *key)
+hk_uniform_blend_key(const struct agx_fs_epilog_key *key)
 {
    const unsigned mode = agx_pack_blend_standard(
       PIPE_BLEND_ADD, PIPE_BLENDFACTOR_SRC_ALPHA, PIPE_BLENDFACTOR_INV_SRC_ALPHA,
@@ -7697,9 +7697,14 @@ hk_m5_uniform_blend_key(const struct agx_fs_epilog_key *key)
 }
 
 static bool
-hk_m5_uniform_blend_part(const struct hk_shader *shader,
-                         const struct agx_shader_part *part)
+hk_uniform_blend_part(const struct hk_shader *shader,
+                      const struct agx_shader_part *part)
 {
+   /* The classic stream launches the variant's own preamble and uniforms.
+    * The resources and varyings still come from the API shader. */
+   if (shader->g17p_mono_key.dev.encoding == AGX_ISA_ENCODING_AGX2)
+      return !hk_g17p_mono_layout_mismatch(&shader->b, part, true);
+
    const struct agx_shader_info *info = &part->info;
    return info->stage == MESA_SHADER_FRAGMENT &&
           hk_g17p_native_cprog_qualified(info) &&
@@ -7791,8 +7796,11 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       return NULL;
    const unsigned main_samples = MAX2(shader->g17p_mono_key.fs.nr_samples, 1);
    const bool inline_samples = shader->info.fs.m5_inline_sample_shading;
-   const bool uniform_blend = agx_chip_g17_m5(dev->dev.chip) && !inline_samples;
-   if (uniform_blend && !hk_m5_uniform_blend_key(ekey))
+   const bool agx2 =
+      agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2;
+   const bool uniform_blend = (agx2 || agx_chip_g17_m5(dev->dev.chip)) &&
+                              !inline_samples;
+   if (uniform_blend && !hk_uniform_blend_key(ekey))
       HK_MONO_REFUSE("uniform blend shape");
    if ((ekey->native_spills && !inline_samples) ||
        (ekey->link.sample_shading && !inline_samples) ||
@@ -7817,7 +7825,7 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
                expected.info.push_count = MAX2(expected.info.push_count,
                                                ekey->emrt_heap_base + 4);
             if (uniform_blend
-                   ? !hk_m5_uniform_blend_part(shader, part)
+                   ? !hk_uniform_blend_part(shader, part)
                    : inline_samples
                    ? hk_g17p_mono_layout_mismatch(&expected, part, false) != NULL
                    : hk_g17p_mono_part_refusal(shader, part) != NULL)
@@ -7995,10 +8003,12 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
    key.no_stop = false;
    key.secondary = false;
    if (uniform_blend) {
-      key.m5_uniform_blend = true;
       key.no_preamble = false;
-      key.g17p_native_uniforms = true;
-      key.g17p_uniform_dma = false;
+      if (!agx2) {
+         key.m5_uniform_blend = true;
+         key.g17p_native_uniforms = true;
+         key.g17p_uniform_dma = false;
+      }
    }
    key.g17p_emrt = inline_samples && ekey->native_spills;
    if (shader->b.info.rodata.size_16 && shader->b.binary) {
@@ -8048,7 +8058,7 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       nir = NULL; /* consumed */
       why = !compiled ? "backend refused the monolithic program"
             : uniform_blend
-               ? (hk_m5_uniform_blend_part(shader, part) ? NULL
+               ? (hk_uniform_blend_part(shader, part) ? NULL
                                                          : "uniform blend launch")
             : inline_samples ? hk_g17p_mono_layout_mismatch(&expected, part, false)
                              : hk_g17p_mono_part_refusal(shader, part);
@@ -8532,9 +8542,11 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
 
    /* Inline blend: try one monolithic fragment program first;
     * any refusal falls through to the split link below, unchanged. */
-   const bool uniform_blend = agx_chip_g17_m5(dev->dev.chip) &&
+   const bool agx2 =
+      agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2;
+   const bool uniform_blend = (agx2 || agx_chip_g17_m5(dev->dev.chip)) &&
                               !shader->info.fs.m5_inline_sample_shading &&
-                              hk_m5_uniform_blend_key(&key->epilog);
+                              hk_uniform_blend_key(&key->epilog);
    if ((uniform_blend || shader->info.fs.m5_inline_sample_shading ||
         (agx_chip_native_agx3(dev->dev.chip) &&
          (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND))) &&
@@ -8548,19 +8560,21 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
           * source. Any other program with its own constant program brings
           * its own uniform layout; link it as the main of a shader
           * describing that layout. */
+         const bool m5_blend = uniform_blend && !agx2;
+         const bool own_layout =
+            !m5_blend && (agx2 || hk_g17p_mono_own_layout(shader, mono));
          struct hk_shader *layout =
-            !uniform_blend && mono_key_clone &&
-                  hk_g17p_mono_own_layout(shader, mono)
+            mono_key_clone && own_layout
                ? hk_g17p_layout_shader_create(dev, shader, mono)
                : NULL;
          struct hk_linked_shader *mono_linked = NULL;
-         if (mono_key_clone && uniform_blend)
+         if (mono_key_clone && m5_blend)
             mono_linked = hk_fast_link_fragment_variant(dev, shader, mono,
                                                         &key->epilog);
          else if (layout)
             mono_linked = hk_fast_link_part(dev, true, layout, NULL, NULL,
                                             NULL, 0, NULL);
-         else if (mono_key_clone && !hk_g17p_mono_own_layout(shader, mono))
+         else if (mono_key_clone && !own_layout)
             mono_linked = hk_fast_link_part(dev, true, shader, mono, NULL,
                                             NULL, 0, NULL);
          free(mono->binary);

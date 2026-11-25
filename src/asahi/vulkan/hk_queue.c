@@ -1544,6 +1544,43 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
    return vk_common_QueueBindSparse(_queue, bindInfoCount, pBindInfo, fence);
 }
 
+/* Wait directly on the queue's DRM timeline syncobj at its latest submitted
+ * point instead of creating a temporary binary syncobj, issuing an empty
+ * transfer submit, waiting on the copy, and destroying it. Threaded,
+ * deferred, and emulated queues fall back to the common implementation. */
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_QueueWaitIdle(VkQueue _queue)
+{
+   VK_FROM_HANDLE(vk_queue, vk_queue, _queue);
+   struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
+   struct hk_device *dev = hk_queue_device(queue);
+
+   if (vk_device_is_lost(&dev->vk))
+      return VK_ERROR_DEVICE_LOST;
+
+   if (queue->vk.submit.mode != VK_QUEUE_SUBMIT_MODE_IMMEDIATE ||
+       vk_queue_is_emulated(&queue->vk) || !queue->drm.syncobj)
+      return vk_common_QueueWaitIdle(_queue);
+
+   uint64_t target = queue->drm.timeline_value;
+   if (target > p_atomic_read(&queue->drm.signalled_value)) {
+      int err;
+      do {
+         err = drmSyncobjTimelineWait(
+            dev->dev.fd, &queue->drm.syncobj, &target, 1, INT64_MAX,
+            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+      } while (err == -EINTR || (err < 0 && errno == EINTR));
+
+      if (err)
+         return vk_queue_set_lost(
+            &queue->vk, "DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT failed: %m");
+
+      hk_queue_note_signalled(queue, target);
+   }
+
+   return vk_device_check_status(&dev->vk);
+}
+
 /* Sibling kernel queues (hk_queue::sib) on G17P: kernel queues per VkQueue,
  * the primary included. macOS spreads one Metal queue over up to three
  * firmware compute queues of one context and runs two kicks at once
@@ -2009,7 +2046,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    const bool cumulative_signals = hk_queue_uses_cumulative_signals(&dev->dev);
    const bool chunk_timelines = cumulative_signals &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS) &&
-      agx_chip_g17_m5(dev->dev.chip) &&
+      agx_chip_has_cap(dev->dev.chip, AGX_CAP_CDM_OVERLAP_SPLIT) &&
       command_count > max_commands_per_submit(dev);
    const bool kernel_cumulative = hk_queue_kernel_cumulative_supported(
       &dev->dev, cumulative_signals, chunk_timelines, submit->signal_count);
@@ -2559,7 +2596,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
              * work that only its fragment half waits for. Every other render
              * keeps the forms below, which the kernel can publish directly.
              */
-            const bool g17p_staged =
+            bool g17p_staged =
                agx_chip_native_hal200(dev->dev.chip) &&
                !queue->sync.serialize && queue->sync.exact_prior &&
                (dev->dev.params.features &
@@ -2568,10 +2605,6 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                (cs->sync.barrier_ta[HK_SYNC_CDM] !=
                    cs->sync.barrier[HK_SYNC_CDM] ||
                 ta_command_prior[HK_SYNC_CDM] != command_prior[HK_SYNC_CDM]);
-            if (g17p_staged) {
-               cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
-               perf_debug_dev(&dev->dev, "HAL200 staged render");
-            }
 
             /* The render's vertex half depends on no earlier render while its
              * fragment half does (hk_sync: every render dependency targets
@@ -2605,9 +2638,11 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
             /* Native HAL200: a vertex half that still names earlier renders
              * can use the fragment-only barriers too when the order of tiling
-             * kicks already covers what it names. A staged render takes
-             * neither the flag nor part in ta_cover: its tiling waits only
-             * for its narrower tiling prefix. */
+             * kicks already covers what it names. Otherwise, when the vertex
+             * half still depends on an earlier render than the fragment half,
+             * send the narrower tiling prefix via a staged render instead of
+             * stalling tiling on the whole prefix. A staged render takes
+             * neither FRAGMENT_BARRIERS nor part in ta_cover. */
             if (agx_chip_native_hal200(dev->dev.chip) && !g17p_staged &&
                 !queue->sync.serialize && queue->sync.exact_prior &&
                 (dev->dev.params.features &
@@ -2619,11 +2654,26 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                const uint64_t vertex = hk_drm_render_prefix(
                   base, cs->sync.barrier_ta[HK_SYNC_VDM],
                   cs->sync.prior_ta[HK_SYNC_VDM]);
+               uint64_t next_cover = queue->sync.ta_cover;
                if (hk_drm_g17p_tiling_ordered(
                       base, nr_vdm, whole, vertex,
                       cmd.legacy.flags & DRM_ASAHI_RENDER_FRAGMENT_BARRIERS,
-                      &queue->sync.ta_cover))
+                      &next_cover)) {
                   cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+                  queue->sync.ta_cover = next_cover;
+               } else if (agx_chip_has_cap(dev->dev.chip,
+                                           AGX_CAP_CDM_OVERLAP_SPLIT) &&
+                          (dev->dev.params.features &
+                           DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
+                          cs->sync.ta_split && vertex < whole) {
+                  g17p_staged = true;
+               } else {
+                  queue->sync.ta_cover = next_cover;
+               }
+            }
+            if (g17p_staged) {
+               cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
+               perf_debug_dev(&dev->dev, "HAL200 staged render");
             }
 
             /* Likewise for compute: when the vertex half depends on less

@@ -2414,6 +2414,175 @@ test_draw_indirect_scope(void)
    }
 }
 
+/* U1/U2: chips with AGX_CAP_CDM_OVERLAP_SPLIT (G17P and M5) keep independent
+ * compute streams split so later barriers do not retroactively stall earlier
+ * compute behind a render or delay a graphics consumer behind independent
+ * post-barrier compute, while pure compute ALL->ALL chains stay coalesced. */
+static void
+test_cdm_overlap_splits(void)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(end_stamp_chips); ++i) {
+      const enum agx_chip chip = end_stamp_chips[i];
+
+      /* U1 same-CB: R1 -> C1(indep) -> barrier(GFX->COMPUTE) -> C2 */
+      {
+         struct hk_queue *q = new_queue(true);
+         struct hk_cmd_buffer *cmd = timestamp_cmd(chip, true);
+         struct hk_cs *r1 = add(cmd, false);
+         r1->stats.cmds = 1;
+         struct hk_cs *c1 = add(cmd, true);
+         cmd->current_cs.cs = c1;
+         c1->stats.cmds = 1;
+         hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_COMPUTE);
+         hk_sync_check_cs(cmd);
+         T("U1 same-CB closes C1 before render-dependent C2",
+           cmd->current_cs.cs == NULL);
+         T("U1 same-CB C1 keeps no VDM wait",
+           c1->sync.dep[HK_SYNC_VDM].cut == NULL &&
+           c1->sync.dep[HK_SYNC_VDM].prior == 0);
+         struct hk_cs *c2 = add(cmd, true);
+         c2->stats.cmds = 1;
+         T("U1 same-CB C2 waits for R1", c2->sync.dep[HK_SYNC_VDM].cut == r1);
+         T("U1 same-CB merge_delays preserves split",
+           hk_sync_merge_delays(cmd, c1, c2));
+         T("U1 same-CB resolves", submit(q, cmd));
+         T("U1 same-CB C1 has no VDM barrier, C2 waits for R1",
+           c1->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+           c1->sync.prior[HK_SYNC_VDM] == 0 &&
+           c2->sync.barrier[HK_SYNC_VDM] == 1);
+      }
+
+      /* U1 cross-CB prior: CB1(R1), CB2(C1 -> barrier(GFX->COMPUTE) -> C2) */
+      {
+         struct hk_queue *q = new_queue(true);
+         struct hk_cmd_buffer *cb1 = timestamp_cmd(chip, true);
+         struct hk_cs *r1 = add(cb1, false);
+         r1->stats.cmds = 1;
+         T("U1 cross-CB CB1 resolves", submit(q, cb1));
+
+         struct hk_cmd_buffer *cb2 = timestamp_cmd(chip, true);
+         struct hk_cs *c1 = add(cb2, true);
+         cb2->current_cs.cs = c1;
+         c1->stats.cmds = 1;
+         hk_sync_barrier(cb2, HK_SYNC_GFX, HK_SYNC_COMPUTE);
+         hk_sync_check_cs(cb2);
+         T("U1 cross-CB closes C1 before prior-VDM-dependent C2",
+           cb2->current_cs.cs == NULL);
+         T("U1 cross-CB C1 keeps no prior VDM wait",
+           c1->sync.dep[HK_SYNC_VDM].prior == 0);
+         struct hk_cs *c2 = add(cb2, true);
+         c2->stats.cmds = 1;
+         T("U1 cross-CB C2 carries prior VDM wait",
+           c2->sync.dep[HK_SYNC_VDM].prior != 0);
+         T("U1 cross-CB merge_delays preserves split",
+           hk_sync_merge_delays(cb2, c1, c2));
+         T("U1 cross-CB CB2 resolves", submit(q, cb2));
+         T("U1 cross-CB C1 prior_vdm=0, C2 prior_vdm=1",
+           c1->sync.prior[HK_SYNC_VDM] == 0 &&
+           c2->sync.prior[HK_SYNC_VDM] == 1);
+      }
+
+      /* U2 same-CB: C1 -> barrier(COMPUTE->GFX) -> C2(indep) -> R1 */
+      {
+         struct hk_queue *q = new_queue(true);
+         struct hk_cmd_buffer *cmd = timestamp_cmd(chip, true);
+         struct hk_cs *c1 = add(cmd, true);
+         cmd->current_cs.cs = c1;
+         c1->stats.cmds = 1;
+         hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+         hk_sync_check_cs(cmd);
+         T("U2 same-CB closes C1 after COMPUTE->GFX barrier",
+           cmd->current_cs.cs == NULL);
+         struct hk_cs *c2 = add(cmd, true);
+         cmd->current_cs.cs = c2;
+         c2->stats.cmds = 1;
+         struct hk_cs *r1 = add(cmd, false);
+         r1->stats.cmds = 1;
+         T("U2 same-CB R1 waits on C1 not C2",
+           r1->sync.dep[HK_SYNC_CDM].cut == c1);
+         T("U2 same-CB merge_delays preserves C1/C2 split",
+           hk_sync_merge_delays(cmd, c1, c2));
+         T("U2 same-CB resolves", submit(q, cmd));
+         T("U2 same-CB R1 barrier_cdm=1 while C2 index=2",
+           r1->sync.barrier[HK_SYNC_CDM] == 1 && c2->sync.index == 2);
+      }
+
+      /* U2 cross-CB: CB1(C1 -> barrier(COMPUTE->GFX) -> C2), CB2(R1) */
+      {
+         struct hk_queue *q = new_queue(true);
+         struct hk_cmd_buffer *cb1 = timestamp_cmd(chip, true);
+         struct hk_cs *c1 = add(cb1, true);
+         cb1->current_cs.cs = c1;
+         c1->stats.cmds = 1;
+         hk_sync_barrier(cb1, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+         hk_sync_check_cs(cb1);
+         T("U2 cross-CB closes C1", cb1->current_cs.cs == NULL);
+         struct hk_cs *c2 = add(cb1, true);
+         c2->stats.cmds = 1;
+         T("U2 cross-CB merge_delays preserves C1/C2 split for tail GFX req",
+           hk_sync_merge_delays(cb1, c1, c2));
+         T("U2 cross-CB CB1 resolves", submit(q, cb1));
+
+         struct hk_cmd_buffer *cb2 = timestamp_cmd(chip, true);
+         struct hk_cs *r1 = add(cb2, false);
+         r1->stats.cmds = 1;
+         T("U2 cross-CB CB2 resolves", submit(q, cb2));
+         T("U2 cross-CB R1 prior_cdm=1 (C1) not 2 (C2)",
+           r1->sync.prior[HK_SYNC_CDM] == 1 && q->sync.submitted[HK_SYNC_CDM] == 2);
+      }
+
+      /* Pure compute chain with ALL_COMMANDS -> ALL_COMMANDS must NOT split C1
+       * when no render stream waits on C1 (preserves stream coalescing & CDM
+       * multi-CB packing). Once an actual render waits on C1, later compute
+       * still splits so the render does not wait on it. */
+      {
+         struct hk_cmd_buffer *cmd = timestamp_cmd(chip, true);
+         struct hk_cs *c1 = add(cmd, true);
+         cmd->current_cs.cs = c1;
+         c1->stats.cmds = 1;
+         hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+         hk_sync_check_cs(cmd);
+         T("ALL->ALL pure compute chain keeps C1 open (no spurious CDM split)",
+           cmd->current_cs.cs == c1);
+
+         struct hk_cs *r1 = add(cmd, false);
+         r1->stats.cmds = 1;
+         hk_sync_check_cs(cmd);
+         T("ALL->ALL followed by actual render R1 still splits C1 before later compute",
+           cmd->current_cs.cs == NULL);
+      }
+
+      /* U2 re-merge: C1 -> bar(C->G) -> C2 -> bar(C->G) allows merging C1+C2 */
+      {
+         struct hk_cmd_buffer *cmd = timestamp_cmd(chip, true);
+         struct hk_cs *c1 = add(cmd, true);
+         cmd->current_cs.cs = c1;
+         c1->stats.cmds = 1;
+         hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+         hk_sync_check_cs(cmd);
+         struct hk_cs *c2 = add(cmd, true);
+         cmd->current_cs.cs = c2;
+         c2->stats.cmds = 1;
+         hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+         T("U2 later COMPUTE->GFX barrier lets C1 and C2 merge",
+           !hk_sync_merge_delays(cmd, c1, c2));
+      }
+   }
+
+   /* Unmeasured chips (G15, G16G) do not enable compute overlap splits yet. */
+   const enum agx_chip excluded[] = {AGX_CHIP_G15G, AGX_CHIP_G16G};
+   for (unsigned i = 0; i < ARRAY_SIZE(excluded); ++i) {
+      struct hk_cmd_buffer *cmd = timestamp_cmd(excluded[i], true);
+      struct hk_cs *c1 = add(cmd, true);
+      cmd->current_cs.cs = c1;
+      c1->stats.cmds = 1;
+      hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+      hk_sync_check_cs(cmd);
+      T("unmeasured chip keeps C1 open (no extra CDM split)",
+        cmd->current_cs.cs == c1);
+   }
+}
+
 int
 main(void)
 {
@@ -2446,6 +2615,7 @@ main(void)
    test_timestamp_top_in_pass();
    test_timestamp_leading_top();
    test_stamp_kind_isolation();
+   test_cdm_overlap_splits();
    {
       /* A submission longer than the 16-bit barrier field: a wait on a
        * command past it is named by its ordinal (that command went in an
