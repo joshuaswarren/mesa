@@ -6877,22 +6877,33 @@ TEST(NativeForms, G17PSignExtendRetainsZeroExtendedWord)
  * section, so it survives in a fragment shader with no tile access. */
 TEST(NativeForms, InterlockWaitSurvivesUnreadPixelWaitMerge)
 {
-   void *mem = ralloc_context(NULL);
-   agx_shader_key key = {};
-   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-   key.dev.chip = AGX_CHIP_G17P;
-   agx_builder *b = agx_test_builder(mem);
-   b->shader->key = &key;
-   b->shader->stage = MESA_SHADER_FRAGMENT;
-   b->shader->any_interlock = true;
-   agx_instr *wait = agx_wait_pix(b, 0xc);
-   agx_stop(b);
-   EXPECT_FALSE(agx3_merge_unread_pixel_waits(b->shader));
-   unsigned waits = 0;
-   agx_foreach_instr_global(b->shader, I)
-      waits += I == wait && I->writeout == 0xc;
-   EXPECT_EQ(waits, 1u);
-   ralloc_free(mem);
+   struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+   } cases[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C},
+   };
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE(c.chip);
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = c.encoding;
+      key.dev.chip = c.chip;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->any_interlock = true;
+      agx_instr *wait = agx_wait_pix(b, 0xc);
+      agx_stop(b);
+      EXPECT_FALSE(agx3_merge_unread_pixel_waits(b->shader));
+      unsigned waits = 0;
+      agx_foreach_instr_global(b->shader, I)
+         waits += I == wait && I->writeout == 0xc;
+      EXPECT_EQ(waits, 1u);
+      ralloc_free(mem);
+   }
 }
 
 /* G13 and G14 hit the same fold: before #232 an abs (zero-extend) source on a
