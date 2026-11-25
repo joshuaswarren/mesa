@@ -422,3 +422,7 @@ bool agx_nir_opt_uniform_stride(struct nir_shader *shader);
 bool agx_nir_fold_m5_offsets(struct nir_shader *shader);
 bool agx_nir_unroll_runtime_loops(struct nir_shader *shader, unsigned factor,
                                   unsigned max_instrs, unsigned *widest);
+
+bool agx_nir_is_shared_phase_barrier(struct nir_instr *instr);
+bool agx_nir_opt_shared_flat_phase_cse(struct nir_shader *shader);
+bool agx_nir_opt_shared_vec2(struct nir_shader *shader);
