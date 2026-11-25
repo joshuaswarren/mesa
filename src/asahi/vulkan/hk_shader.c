@@ -8656,7 +8656,7 @@ hk_maybe_build_2d_stencil(struct hk_device *dev, const nir_shader *nir,
    const nir_address_format ssbo_addr_format = hk_buffer_addr_format(
       info->robustness->storage_buffers,
       info->robustness->null_storage_buffer_descriptor,
-      agx_chip_g17_m5(dev->dev.chip));
+      hk_ssbo_addr_has_map(dev->dev.chip));
    out->tiled_nir = hk_nir_build_tiled_2d_stencil(NULL, nir, &out->plan,
                                                   ssbo_addr_format);
    return out->tiled_nir != NULL;
