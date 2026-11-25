@@ -185,9 +185,18 @@ for T, sizes, one in [('f', [16, 32], 1.0),
 # pick up patterns like b2f32(iand(...))
 opt_selects = [
         # Direct condition dominance in nested selects (only when the
-        # inner select becomes dead, avoiding live-range extension).
+        # rewritten intermediate select becomes dead, avoiding live-range
+        # extension).
         (('bcsel', a, ('bcsel(is_used_once)', a, b, c), d), ('bcsel', a, b, d)),
         (('bcsel', a, b, ('bcsel(is_used_once)', a, c, d)), ('bcsel', a, b, d)),
+        (('bcsel', a, c, ('bcsel(is_used_once)', b, ('bcsel', a, 'x', d), e)),
+         ('bcsel', a, c, ('bcsel', b, d, e))),
+        (('bcsel', a, c, ('bcsel(is_used_once)', b, d, ('bcsel', a, 'x', e))),
+         ('bcsel', a, c, ('bcsel', b, d, e))),
+        (('bcsel', a, ('bcsel(is_used_once)', b, ('bcsel', a, c, 'x'), d), e),
+         ('bcsel', a, ('bcsel', b, c, d), e)),
+        (('bcsel', a, ('bcsel(is_used_once)', b, d, ('bcsel', a, c, 'x')), e),
+         ('bcsel', a, ('bcsel', b, d, c), e)),
 
         # Collapse selects whose boolean condition (ior/iand or boolean bcsel)
         # shares a predicate with an arm select, provided every use of the
