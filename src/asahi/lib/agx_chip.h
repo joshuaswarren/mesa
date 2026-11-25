@@ -1036,6 +1036,17 @@ agx_chip_has_feedback_loop_dynamic_state(enum agx_chip chip)
    return agx_chip_native_or_m5(chip);
 }
 
+/* Whether VK_EXT_depth_clip_control (and
+ * extendedDynamicState3DepthClipNegativeOneToOne) is qualified on this chip.
+ * Lowered in NIR (agx_nir_lower_clip_m1_1) via the shared root table across
+ * AGX2, native AGX3, and AGX3C/HAL300 (M5: G17G/G17S/G17C). Other HAL300
+ * encodings such as AGX3D (G18G) stay off until qualified on their hardware. */
+static inline bool
+agx_chip_has_depth_clip_control(enum agx_chip chip)
+{
+   return !agx_chip_hal300_path(chip) || agx_chip_g17_m5(chip);
+}
+
 /* Number of helper-table slots in the USC code-container lead block.  G15
  * and G16 parts have ten; with six their fragment programs of 256x256 and
  * larger walk past the lead into the guard page.  On G17P the state loader's
