@@ -16,6 +16,7 @@
 
 #include "agx_bg_eot.h"
 #include "agx_bo.h"
+#include "agx_chip_caps.h"
 #include "agx_device.h"
 #include "agx_pack.h"
 #include "asahi/genxml/agx3_cmdstream.h"
@@ -291,11 +292,12 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
 
    uint32_t width_px = 0, height_px = 0, layers = 0;
    hk_attachmentless_vdm_bounds(cs, &width_px, &height_px, &layers);
-   const bool g18g = dev->dev.chip == AGX_CHIP_G18G;
-   /* The G18 kernel validates depth_dimensions == (width-1)|((height-1)<<16)
-    * when a depth or stencil attachment is bound; keep render bounds at least
-    * as large as the ZLS surface when the render area is a sub-rectangle. */
-   if (g18g && (cs->cr.depth.buffer || cs->cr.stencil.buffer)) {
+   /* Render-submit ABIs with AGX_CAP_ZLS_FULL_RENDER_BOUNDS validate
+    * depth_dimensions == (width-1)|((height-1)<<16) when a depth or stencil
+    * attachment is bound; keep render bounds at least as large as the ZLS
+    * surface when the render area is a sub-rectangle. */
+   if (agx_chip_has_cap(dev->dev.chip, AGX_CAP_ZLS_FULL_RENDER_BOUNDS) &&
+       (cs->cr.depth.buffer || cs->cr.stencil.buffer)) {
       width_px = MAX2(width_px, cs->cr.zls_width);
       height_px = MAX2(height_px, cs->cr.zls_height);
    }
@@ -307,6 +309,8 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
 
    static_assert(sizeof(c->zls_ctrl) == sizeof(cs->cr.zls_control));
    memcpy(&c->zls_ctrl, &cs->cr.zls_control, sizeof(cs->cr.zls_control));
+
+   const bool g18g = dev->dev.chip == AGX_CHIP_G18G;
 
    if (agx_chip_native_or_m5(dev->dev.chip) ||
        g18g) {

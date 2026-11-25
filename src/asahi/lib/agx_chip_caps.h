@@ -103,6 +103,12 @@ enum agx_chip_cap {
     * (libagx_agx3_decompress); measured on G17S. Off on G18G until measured
     * there. */
    AGX_CAP_GEN10_2D_COMPRESSION = 1u << 14,
+
+   /* The render-submit ABI validates that packed ZLS depth_dimensions match
+    * the render command's (width_px - 1) | ((height_px - 1) << 16) whenever
+    * a depth or stencil attachment is bound, so render bounds must be at
+    * least the ZLS surface dimensions even for sub-rectangle render areas. */
+   AGX_CAP_ZLS_FULL_RENDER_BOUNDS = 1u << 15,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -156,7 +162,7 @@ enum agx_chip_cap {
    X(G17G, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17S, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17C, AGX_CAPS_M5, __VA_ARGS__)                                           \
-   X(G18G, 0, __VA_ARGS__)
+   X(G18G, AGX_CAP_ZLS_FULL_RENDER_BOUNDS, __VA_ARGS__)
 
 /* Like agx_chip_has_record(), a test of the table expands to comparisons, so
  * the precompiled OpenCL kernels can call it and the C units run the same
