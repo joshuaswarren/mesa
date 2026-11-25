@@ -466,3 +466,39 @@ TEST_F(M5DepthExport, UniformBlendRejectsOtherTransactions)
       ralloc_free(s);
    }
 }
+
+TEST_F(M5DepthExport, PackedRgba8BackgroundClearSkipsFltnorm)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "M5 packed RGBA8 clear");
+   nir_def *packed = nir_load_preamble(&b, 1, 32, 4);
+   nir_store_local_pixel_agx(&b, packed, nir_imm_intN_t(&b, 0xFF, 16),
+                             nir_undef(&b, 2, 16), .base = 0,
+                             .write_mask = 0x1, .format = PIPE_FORMAT_R32_UINT,
+                             .target = 0);
+   agx_preprocess_nir(b.shader);
+
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   key.fs.ignore_tib_dependencies = true;
+   key.fs.background = true;
+   key.fs.nr_samples = 1;
+   key.reserved_preamble = 12;
+   key.no_preamble = true;
+
+   agx_shader_part part = {};
+   ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+      << agx_last_compile_refusal();
+   EXPECT_TRUE(part.info.agx3_staging_known);
+   EXPECT_GT(part.info.nr_gprs, 0u);
+   EXPECT_EQ(part.info.push_count, 12u);
+   EXPECT_FALSE(part.info.uses_txf);
+   EXPECT_FALSE(part.info.has_preamble);
+   EXPECT_EQ(part.info.scratch_size, 0u);
+   auto ops = mnemonics(part);
+   EXPECT_EQ(count_of(ops, "fltnorm"), 0u);
+   EXPECT_EQ(count_of(ops, "lstcol"), 1u);
+   free(part.binary);
+   ralloc_free(b.shader);
+}

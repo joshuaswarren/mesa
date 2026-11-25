@@ -1456,10 +1456,12 @@ agx3_alu_fmul_mixed(enum agx_isa_encoding enc, uint16_t dest,
    };
    unsigned n = 8;
    for (unsigned bit = 0; bit < 6; ++bit)
-      if (wait_mask & (1u << bit))
-         fields[n++] = (struct agx3_field_kv){80 + bit, 1};
-   return agx3_bind_compose(enc, AGX3_MN_f32mul, 0, base, 8, fields, n, out, len) ||
-          agx3_bind_compose(enc, AGX3_MN_f32mul, 1, base, 8, fields, n, out, len);
+      fields[n++] = (struct agx3_field_kv){80 + bit, !!(wait_mask & (1u << bit))};
+   for (unsigned ep = 0; ep < 4; ++ep)
+      if (agx3_bind_compose(enc, AGX3_MN_f32mul, ep, base, 8, fields, n, out,
+                            len))
+         return true;
+   return false;
 }
 
 bool
@@ -1569,8 +1571,13 @@ agx3_alu_fadd_mixed_half(
       fields[8 + i] = (struct agx3_field_kv){52 + i,
                                             !!(wait_mask & (1u << i))};
 
-   return agx3_bind_compose(enc, AGX3_MN_f32add, 1, base, 6, fields, 14, out,
-                            len);
+   for (unsigned ep = 1; ep <= 2; ++ep) {
+      if (agx3_bind_compose(enc, AGX3_MN_f32add, ep, base, 6, fields, 14, out,
+                            len))
+         return true;
+   }
+
+   return false;
 }
 
 bool
@@ -1649,7 +1656,7 @@ agx3_alu_fmul_mixed_half(enum agx_isa_encoding enc, uint16_t dest, uint16_t f32,
       fields[16] = (struct agx3_field_kv){86, !!(wait_mask & 64)};
       fields[17] = (struct agx3_field_kv){87, !!(wait_mask & 128)};
    }
-   for (unsigned ep = 0; ep < (m5 ? 4 : 2); ++ep)
+   for (unsigned ep = 0; ep < 4; ++ep)
       if (agx3_bind_compose(enc, AGX3_MN_f32mul, ep, base, 8, fields, m5 ? 18 : 14,
                             out, len))
          return true;
@@ -2868,6 +2875,12 @@ agx3_alu_fcmp_select(enum agx_isa_encoding enc, const struct agx3_fsel_desc *in,
    const bool integer_select =
       (d.sel0_kind == AGX3_FSEL_SEL_IMMEDIATE && d.sel0 != 0) ||
       (d.sel1_kind == AGX3_FSEL_SEL_IMMEDIATE && d.sel1 != 0);
+   /* Native AGX3B uniform-comparand witnesses only select registers or an
+    * immediate zero (never a non-zero integer immediate like #1/#0 from
+    * lowered FCMP). Refuse unwitnessed combinations here so the packer
+    * never emits them. */
+   if ((d.cmp0_uniform || d.cmp1_uniform) && integer_select)
+      return false;
    struct agx3_field_kv alt_base[9];
    unsigned nab = 0;
    alt_base[nab++] = (struct agx3_field_kv){0, 1};
@@ -5524,7 +5537,7 @@ agx3_alu_fmul_narrow(enum agx_isa_encoding enc, uint16_t dest,
       fields[16] = (struct agx3_field_kv){86, !!(wait_mask & 64)};
       fields[17] = (struct agx3_field_kv){87, !!(wait_mask & 128)};
    }
-   for (unsigned ep = 0; ep < (m5 ? 4 : 2); ep++)
+   for (unsigned ep = 0; ep < 4; ep++)
       if (agx3_bind_compose(enc, AGX3_MN_f32mul, ep, base, 8, fields, m5 ? 18 : 14,
                             out, len))
          return true;
@@ -5618,16 +5631,20 @@ agx3_alu_hmul(enum agx_isa_encoding enc, uint16_t dest,
                            false, src_abs, NULL, wait_mask, out, len);
 }
 
+/* An absolute source needs the ten-byte ep3 point, which carries the f29/f46
+ * absolute bits and the f14 saturate bit independently, so |a| * b and
+ * saturate(|a| * b) share one form, as agx3_alu_hadd_mod_m5() does for the
+ * add. */
 bool
 agx3_alu_hmul_abs(enum agx_isa_encoding enc, uint16_t dest,
                   const uint16_t src[2],
                   const enum agx3_alu_hint hints[2],
-                  const bool src_abs[2], bool dest_cache,
+                  const bool src_abs[2], bool saturate, bool dest_cache,
                   uint16_t wait_mask,
                   uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
    return agx3_alu_h_binop(enc, AGX3_MN_f16mul, 4, dest, src, hints, dest_cache,
-                           false, src_abs, NULL, wait_mask, out, len);
+                           saturate, src_abs, NULL, wait_mask, out, len);
 }
 
 bool
@@ -5679,7 +5696,7 @@ agx3_alu_hmul_minifloat(enum agx_isa_encoding enc, uint16_t dest,
       fields[n++] = (struct agx3_field_kv){51 + i,
                                             !!(wait_mask & (1u << i))};
 
-   for (unsigned ep = 0; ep < (m5 ? 4 : 2); ++ep)
+   for (unsigned ep = 0; ep < 4; ++ep)
       if (agx3_bind_compose(enc, AGX3_MN_f16mul, ep, base, 6, fields, n, out,
                             len))
          return true;

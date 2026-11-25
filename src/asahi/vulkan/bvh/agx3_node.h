@@ -28,6 +28,14 @@ step(uint exponent)
    return uintBitsToFloat(exponent << 23);
 }
 
+float
+inv_step(uint exponent)
+{
+   /* Exact reciprocal of step(exponent) = 2^(exponent - 127) for 1 <= exponent <= 254. */
+   float s = uintBitsToFloat((254u - min(exponent, 253u)) << 23);
+   return exponent == 254u ? s * 0.5 : s;
+}
+
 bool
 fit_root(vec3 lo, vec3 hi, out vec3 base, out uvec3 exponent)
 {
@@ -36,13 +44,15 @@ fit_root(vec3 lo, vec3 hi, out vec3 base, out uvec3 exponent)
       precise float extent = hi[a] - base[a];
       if (!finite(base[a]) || !finite(extent))
          return false;
-      precise float unit = extent / 127.0;
+      precise float unit = extent * (1.0 / 127.0);
       uint bits = floatBitsToUint(unit);
       uint e = (bits >> 23) & 255u;
       if (e != 0 && (bits & 0x7fffffu) != 0)
          ++e;
       e = max(e, 1u);
-      while (e < 255u && ceil(extent / step(e)) > 127.0)
+      /* step(e) is an exact power of two, so 127.0 * step(e) is exact in f32
+       * (or +inf for e >= 249, where any finite extent satisfies <= 127 * step(e)). */
+      while (e < 255u && extent > 127.0 * step(e))
          ++e;
       if (e == 255u)
          return false;
@@ -115,8 +125,9 @@ root_word(uint t, uint count, uint kind, uint triangle_type0, uint child_slot,
          word |= uint64_t((t << 16) | (1u << 20));
       for (uint a = 0; a < 3; ++a) {
          float s = step(exponent[a]);
-         uint qlo = uint(clamp(floor((lo[a] - base[a]) / s), 0.0, 127.0));
-         uint qhi = uint(clamp(ceil((hi[a] - base[a]) / s), 0.0, 127.0));
+         float inv_s = inv_step(exponent[a]);
+         uint qlo = uint(clamp(floor((lo[a] - base[a]) * inv_s), 0.0, 127.0));
+         uint qhi = uint(clamp(ceil((hi[a] - base[a]) * inv_s), 0.0, 127.0));
          precise float rlo = base[a] + float(qlo) * s;
          precise float rhi = base[a] + float(qhi) * s;
          while (rlo > lo[a] && qlo > 0u) {

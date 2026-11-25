@@ -187,10 +187,9 @@ check_tiles_and_tails(void)
                                    layout->level_offsets_B[l] +
                                    (w + 1) * AIL_PAGESIZE;
                assert(actual == expected);
-               if (f < 5)
-                  assert(hk_sparse_image_tile_offset_B(
-                            AGX_CHIP_G13G, layout, l, tile.width_el,
-                            tile.height_el, z) == expected);
+               assert(hk_sparse_image_tile_offset_B(
+                         AGX_CHIP_G13G, layout, l, tile.width_el,
+                         tile.height_el, z) == expected);
             }
          }
          VkImageSparseMemoryRequirementsInfo2 info = {

@@ -1136,6 +1136,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_fd;
    }
 
+   /* Splitting a long submission lets the GPU start work from the first ioctl
+    * while the kernel validates later ioctls, so a profile may cap batch size. */
+   dev->submit_batch_size = instance->drirc.performance.submit_batch_size;
+
    vk_device_set_drm_fd(&dev->vk, dev->dev.fd);
    dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
    dev->vk.command_buffer_ops = &hk_cmd_buffer_ops;
@@ -1391,6 +1395,9 @@ fail_alloc:
    return result;
 }
 
+/* At most this long, for all queues together, at vkDestroyDevice. */
+#define HK_DESTROY_WAIT_NS (5ull * 1000000000ull)
+
 VKAPI_ATTR void VKAPI_CALL
 hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 {
@@ -1401,6 +1408,12 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    /* Its thread and kicks use the queues and the device's kernels. */
    hk_compute_kick_stop(dev);
+
+   /* Freeing the device's memory below unmaps it from the GPU at once, so let
+    * the GPU finish what the queues submitted first, including work the
+    * application did not wait for. Bounded, so a submission that cannot
+    * complete does not hang teardown. */
+   hk_device_wait_submitted(dev, HK_DESTROY_WAIT_NS);
 
    util_dynarray_fini(&dev->external_bos.counts);
    util_dynarray_fini(&dev->external_bos.list);

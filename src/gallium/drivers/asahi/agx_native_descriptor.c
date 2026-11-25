@@ -481,6 +481,10 @@ agx_gallium_pack_native_pbe_impl(
       legacy->compressed && gen9 &&
       legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED &&
       legacy->layout == AGX_LAYOUT_GPU;
+   const bool compressed_layered =
+      legacy->compressed && gen9 && (array || three_d) &&
+      legacy->layout == AGX_LAYOUT_GPU &&
+      legacy->level == 0 && legacy->levels == 1 && !legacy->unk_mipmapped;
    if ((!layered && !multisample && !g18_layered &&
         legacy->dimension != AGX_TEXTURE_DIMENSION_2D) ||
        /* Gen10 linear 2D is agx_pbe_agx3_2d_pack()'s layout exactly. The
@@ -508,7 +512,7 @@ agx_gallium_pack_native_pbe_impl(
                        legacy->samples != AGX_SAMPLE_COUNT_4)
                     : legacy->samples != AGX_SAMPLE_COUNT_2) ||
        (legacy->compressed && !compressed_2d && !compressed_2d_ms &&
-        !gen10_multisample) ||
+        !compressed_layered && !gen10_multisample) ||
        legacy->mode != AGX_IMAGE_MODE_NORMAL ||
        (!layered && !g18_layered && legacy->layers != 1) ||
        (g18_layered && legacy->layout == AGX_LAYOUT_LINEAR) ||

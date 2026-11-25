@@ -22,6 +22,10 @@
  */
 
 #version 460
+#ifdef HPLOC_SHUFFLE_SEARCH
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_EXT_control_flow_attributes : require
+#endif
 
 #include "vk_bvh_defines.h"
 #define VK_USED_BUILD_FLAGS VK_HPLOC_BUILD_FLAGS
@@ -197,11 +201,12 @@ main(void)
              * shuffle, so no shared atomics order the steps. Uniform control
              * flow; past node_count - 1 steps no candidate exists. */
             uint32_t best_candidate = 0xffffffff;
-            const uint32_t steps = min(uint32_t(SEARCH_RADIUS), node_count - 1);
-            for (uint32_t i = 1; i <= steps; i++) {
+            [[unroll]]
+            for (uint32_t i = 1u; i <= SEARCH_RADIUS; i++) {
+               if (i >= node_count)
+                  break;
                int32_t index = int32_t(gl_SubgroupInvocationID) - int(i);
-               vk_aabb other;
-               other = node_aabbs[max(index, 0)];
+               vk_aabb other = node_aabbs[max(index, 0)];
                vk_aabb shared_bounds;
                shared_bounds.min = min(other.min, node_aabb.min);
                shared_bounds.max = max(other.max, node_aabb.max);
@@ -210,7 +215,7 @@ main(void)
                   best_candidate = min(best_candidate, shared_sa | uint32_t(index));
                /* The invocation i to the right computed this pair's area. */
                uint32_t right = gl_SubgroupInvocationID + i;
-               uint32_t right_sa = subgroupShuffle(shared_sa, right);
+               uint32_t right_sa = subgroupShuffleDown(shared_sa, i);
                if (right < node_count)
                   best_candidate = min(best_candidate, right_sa | right);
             }
