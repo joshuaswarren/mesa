@@ -12,6 +12,7 @@
 #include "agx3_transcode.h"
 #include "asahi/layout/layout.h"
 #include "asahi/lib/agx_abi.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/lib/agx_nir_lower_vbo.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_range_analysis.h"
@@ -16347,7 +16348,8 @@ agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p, bool m5,
 
 static void
 agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_depth,
-                            bool g18g, bool m5, bool chip_g17p, bool shader_quad_control,
+                            bool g18g, bool m5, bool signed_zero_select,
+                            bool shader_quad_control,
                             bool post_lower,
                             bool defer_idiv, bool preserve_branches)
 {
@@ -16412,10 +16414,10 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
       }
       NIR_PASS(_, nir, nir_lower_frexp);
    }
-   /* Before nir_lower_alu's generic lower_fminmax_signed_zero. Validated on
-    * G17P only (`g17p` above means any native AGX3 chip); other chips keep
-    * the generic lowering. The flush policy is agx_nir_lower_fminmax's. */
-   if (chip_g17p) {
+   /* Before nir_lower_alu's generic lower_fminmax_signed_zero, on chips with
+    * AGX_CAP_SIGNED_ZERO_MINMAX_SELECT; other chips keep the generic
+    * lowering. The flush policy is agx_nir_lower_fminmax's. */
+   if (signed_zero_select) {
       /* DXVK and vkd3d-proton mark every float op signed-zero preserving.
        * Drop the flag where no use can tell -0 from +0, before the min/max
        * lowering pays for it. */
@@ -16567,7 +16569,8 @@ void
 agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip)
 {
    agx_preprocess_nir_internal(
-      nir, true, true, false, false, chip == AGX_CHIP_G17P,
+      nir, true, true, false, false,
+      agx_chip_has_cap(chip, AGX_CAP_SIGNED_ZERO_MINMAX_SELECT),
       agx_chip_agx3_shader_quad_control(chip), false, false,
       agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B);
 }
@@ -16576,7 +16579,8 @@ void
 agx_preprocess_nir_native_defer_idiv(nir_shader *nir, enum agx_chip chip)
 {
    agx_preprocess_nir_internal(
-      nir, true, true, false, false, chip == AGX_CHIP_G17P,
+      nir, true, true, false, false,
+      agx_chip_has_cap(chip, AGX_CAP_SIGNED_ZERO_MINMAX_SELECT),
       agx_chip_agx3_shader_quad_control(chip), false, true,
       agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B);
 }
@@ -16602,12 +16606,14 @@ agx_preprocess_nir_post_lower(nir_shader *nir, enum agx_chip chip)
    const bool g18g = !g17p && chip == AGX_CHIP_G18G;
    const bool m5 = !g17p && !g18g && agx_chip_g17_m5(chip);
    const bool native_fragment_depth = g17p || m5;
-   const bool chip_g17p = chip == AGX_CHIP_G17P;
+   const bool signed_zero_select =
+      agx_chip_has_cap(chip, AGX_CAP_SIGNED_ZERO_MINMAX_SELECT);
    const bool preserve_branches =
       agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B;
 
    agx_preprocess_nir_internal(nir, g17p, native_fragment_depth, g18g, m5,
-                               chip_g17p, agx_chip_agx3_shader_quad_control(chip),
+                               signed_zero_select,
+                               agx_chip_agx3_shader_quad_control(chip),
                                true, false, preserve_branches);
 }
 
@@ -19629,16 +19635,23 @@ agx_compile_shader_nir_preoptimized(nir_shader *nir, struct agx_shader_key *key,
                                           preamble_newly_enabled, 4, NULL);
 }
 
+/* The M5 helpers serve G17G, G17S and G17C, which share one row of the
+ * capability table. */
+#define AGX_M5_SIGNED_ZERO_SELECT                                              \
+   ((AGX_CAPS_M5 & AGX_CAP_SIGNED_ZERO_MINMAX_SELECT) != 0)
+
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true, false, true, false,
-                               false, false);
+   agx_preprocess_nir_internal(nir, false, true, false, true,
+                               AGX_M5_SIGNED_ZERO_SELECT, true, false, false,
+                               false);
 }
 
 void
 agx_preprocess_nir_m5_defer_idiv(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true, false, true, false,
-                               true, false);
+   agx_preprocess_nir_internal(nir, false, true, false, true,
+                               AGX_M5_SIGNED_ZERO_SELECT, true, false, true,
+                               false);
 }

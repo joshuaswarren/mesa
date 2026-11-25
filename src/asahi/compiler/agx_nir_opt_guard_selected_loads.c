@@ -984,8 +984,10 @@ agx_nir_opt_narrow_u8_fadd_tree(nir_shader *shader)
    nir_foreach_function_impl(impl, shader) {
       nir_index_ssa_defs(impl);
       unsigned n_defs = impl->ssa_alloc;
-      if (!n_defs)
+      if (!n_defs) {
+         nir_no_progress(impl);
          continue;
+      }
 
       struct u8_int_node *nodes = rzalloc_array(NULL, struct u8_int_node, n_defs);
       nir_def **defs_by_idx = rzalloc_array(NULL, nir_def *, n_defs);
