@@ -1301,8 +1301,11 @@ graphics_launch_replay_correctness(struct fixture *f)
    list_inithead(&inst.debug_utils.callbacks);
    list_inithead(&inst.debug_utils.instance_callbacks);
    mtx_init(&inst.debug_utils.callbacks_mutex, mtx_plain);
-   struct vk_physical_device phys = {.instance = &inst};
-   f->dev.vk.physical = &phys;
+   /* Errors raised below log through the physical device's instance. Keep
+    * the fixture's physical device, which the later tests use as well. */
+   CHECK(f->dev.vk.physical == &f->pdev.vk);
+   struct vk_instance *const saved_instance = f->pdev.vk.instance;
+   f->pdev.vk.instance = &inst;
    f->dev.dev.shader_base = shader_base;
    util_dynarray_init(&cmd->large_bos, NULL);
 
@@ -1447,7 +1450,7 @@ graphics_launch_replay_correctness(struct fixture *f)
    *hw_fs = saved_fs;
    f->dev.dev.chip = AGX_CHIP_G17P;
    f->dev.dev.shader_base = 0;
-   f->dev.vk.physical = NULL;
+   f->pdev.vk.instance = saved_instance;
    mtx_destroy(&inst.debug_utils.callbacks_mutex);
    cmd->vk.record_result = VK_SUCCESS;
    free(mesh_api);
