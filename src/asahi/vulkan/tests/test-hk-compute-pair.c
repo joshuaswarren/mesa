@@ -1750,6 +1750,20 @@ shader_has_cmat_muladd(const nir_shader *s)
    return false;
 }
 
+/* CPU reference for a shader fmul followed by fadd, each rounded on its own.
+ * On targets with FMA (aarch64, x86-64-v3) the compiler may contract
+ * `a * b + acc` into one fused multiply-add (clang's default
+ * -ffp-contract=on within an expression, GCC's -ffp-contract=fast even
+ * across statements), which rounds once and no longer matches the evaluated
+ * shader bit for bit. Storing the product through a volatile forces it to be
+ * rounded to float first under every compiler and contraction mode. */
+static float
+ref_mul_add_unfused(float a, float b, float acc)
+{
+   volatile float prod = a * b;
+   return prod + acc;
+}
+
 static uint32_t
 gemm_test_lcg(uint32_t *state)
 {
@@ -3241,7 +3255,7 @@ test_depthwise_shape_sweep_cpu_ref(void)
                         continue;
                      float iv = in_b[((size_t)iy * cfg->in_w + ix) * cfg->channels + c];
                      float wv = wt_b[((size_t)ky * cfg->ker_w + kx) * cfg->channels + c];
-                     acc = iv * wv + acc;
+                     acc = ref_mul_add_unfused(iv, wv, acc);
                   }
                }
                if (cases[ci].has_bias_buf && cfg->has_bias)
@@ -4187,7 +4201,7 @@ test_gemm_dw_a_fusion(void)
                      if (ix < 0 || ix >= (int32_t)in_w) continue;
                      const float iv = in_buf[((size_t)iy * in_w + ix) * K + c];
                      const float wv = wt_buf[(size_t)(ky * 3 + kx) * K + c];
-                     acc = (iv * wv) + acc;
+                     acc = ref_mul_add_unfused(iv, wv, acc);
                   }
                }
                if (cases[ci].has_bias) acc += dw_bias[c];
@@ -4444,7 +4458,7 @@ test_gemm_dw_fusion(void)
                   for (uint32_t kx = 0; kx < 3; ++kx) {
                      const float iv = pad_ref[((size_t)(oy * 2u + ky) * out_w + (ox * 2u + kx)) * N + c];
                      const float wv = dw_wt[(size_t)(ky * 3u + kx) * N + c];
-                     acc = (iv * wv) + acc;
+                     acc = ref_mul_add_unfused(iv, wv, acc);
                   }
                }
                if (cases[ci].dw_bias)
