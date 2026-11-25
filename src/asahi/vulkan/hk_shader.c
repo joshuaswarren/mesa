@@ -9000,7 +9000,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * Canonicalization is exact only at one sample; keep the draw-time
        * refusal for unsupported fixed-count export footprints.
        */
-      if (agx_chip_native_or_m5(dev->dev.chip) &&
+      if (agx_chip_agx3_path(dev->dev.chip) &&
           nir->info.fs.uses_sample_shading &&
           !sample_variants &&
           !hk_native_sample_shading_supported(nir, &key->fs, dev->dev.chip)) {
