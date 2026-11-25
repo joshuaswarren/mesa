@@ -1951,20 +1951,18 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
-   /* Native M5 keeps the memory of every submitted recording until the
-    * submission retires. Elsewhere the application keeps its recordings
-    * alive, and only the packets' buffer needs it: the BO cache would hand
-    * it out again without waiting for the GPU. Pin before anything below
-    * changes queue or synchronization state, so that a failed allocation
-    * leaves nothing to roll back. */
+   /* Driver-owned buffers used by packed submissions have no application handle to
+    * keep them alive: the BO cache would hand them out again without waiting
+    * for the GPU. Application recordings follow Vulkan lifetime rules while
+    * the device is healthy and are retained during device-loss unwinding in
+    * hk_free_resettable_cmd_buffer(). Pin before anything below changes queue
+    * or synchronization state, so a failed allocation leaves nothing to roll
+    * back. */
    struct hk_cmd_pending *pending = NULL;
-   const bool pin_recordings = agx_chip_g17_m5(dev->dev.chip);
-   if ((pin_recordings || extra_bo_count) && !dev->dev.is_virtio) {
-      const struct vk_queue_submit no_recordings = {0};
+   if (extra_bo_count && !dev->dev.is_virtio) {
       unsigned chunks = 1 + (command_count - 1) / max_commands_per_submit(dev);
-      VkResult pin_result = hk_cmd_pending_begin(
-         dev, pin_recordings ? original : &no_recordings, chunks,
-         extra_bos, extra_bo_count, &pending);
+      VkResult pin_result =
+         hk_cmd_pending_begin(dev, chunks, extra_bos, extra_bo_count, &pending);
       if (pin_result != VK_SUCCESS) {
          *untouched = !bound;
          return vk_error(queue, pin_result);

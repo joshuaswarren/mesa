@@ -354,11 +354,17 @@ struct hk_device {
    } vdm;
 
    bool cmd_pending_ready;
+   /* Number of queues currently linked into cmd_pending_queues. */
+   int cmd_pending_active;
    simple_mtx_t cmd_pending_lock;
    /* Queues with pending submissions (hk_queue::cmd_link). */
    struct list_head cmd_pending_queues;
    /* Submissions that completed with an error: kept until destruction. */
    struct list_head cmd_pending_failed;
+   /* Recording memory quarantined after device loss. */
+   struct list_head cmd_lost_bos;
+   struct list_head cmd_lost_spans;
+   struct list_head cmd_lost_large_bos;
    /* Completion syncobjs of retired submissions, for reuse. */
    uint32_t cmd_syncobjs[HK_CMD_SYNCOBJ_POOL];
    unsigned cmd_syncobj_count;
