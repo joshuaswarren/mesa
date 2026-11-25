@@ -398,4 +398,83 @@ TEST(M5ByteToFloat, AGX3NormfltBytePairsSelectPath)
    }
 }
 
+TEST(M5ByteToFloat, AGX3NormfltHalfBitopAndDedupScale)
+{
+   /* Match 16-bit BITOP(AND, h, 0xff) + BFEIL(0, h, 8) feeding U16_TO_F
+    * (the unpack emitted for packed r8_uint vector loads) across AGX3B and
+    * AGX3C, and emit at most one 255.0h scale immediate per block. */
+   const struct {
+      agx_isa_encoding encoding;
+      agx_chip chip;
+      bool emit_agx3d;
+      bool expect_normflt;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C, false, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true,  false},
+   };
+   for (auto t : targets) {
+      SCOPED_TRACE(t.chip);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = t.encoding;
+      key.dev.chip = t.chip;
+      key.dev.emit_agx3d = t.emit_agx3d;
+      b->shader->key = &key;
+
+      agx_index h0 = agx_preload(b, agx_register(0, AGX_SIZE_16));
+      agx_index h1 = agx_preload(b, agx_register(1, AGX_SIZE_16));
+      agx_index weight = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_index acc = agx_preload(b, agx_register(4, AGX_SIZE_32));
+      agx_index mask = agx_mov_imm(b, 16, 0xff);
+      agx_index zero = agx_mov_imm(b, 16, 0);
+      agx_index sh8 = agx_mov_imm(b, 16, 8);
+
+      agx_index b0 = agx_and(b, h0, mask);
+      agx_index b1 = agx_bfeil(b, zero, h0, sh8, 0);
+      agx_index b2 = agx_and(b, h1, mask);
+      agx_index b3 = agx_bfeil(b, zero, h1, sh8, 0);
+
+      agx_index f[4];
+      agx_index bytes[4] = {b0, b1, b2, b3};
+      for (unsigned i = 0; i < 4; ++i) {
+         f[i] = agx_temp(b->shader, AGX_SIZE_32);
+         agx_convert_to(b, f[i], agx_immediate(AGX_CONVERT_U16_TO_F),
+                        bytes[i], AGX_ROUND_RTE);
+         acc = agx_ffma(b, f[i], weight, acc);
+      }
+      agx_unit_test(b, acc);
+
+      agx_opt_agx3_normflt_byte_pairs(b->shader);
+
+      unsigned normflt_f16 = 0, hmul = 0, scale_imm_255h = 0, converts = 0;
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_NORMFLT_AGX3 &&
+             I->dest[0].size == AGX_SIZE_16)
+            normflt_f16++;
+         else if (I->op == AGX_OPCODE_HMUL)
+            hmul++;
+         else if (I->op == AGX_OPCODE_MOV_IMM &&
+                  I->dest[0].size == AGX_SIZE_16 && I->imm == 0x5bf8)
+            scale_imm_255h++;
+         else if (I->op == AGX_OPCODE_CONVERT)
+            converts++;
+      }
+
+      if (t.expect_normflt) {
+         EXPECT_EQ(normflt_f16, 2u);
+         EXPECT_EQ(hmul, 4u);
+         EXPECT_EQ(scale_imm_255h, 1u);
+         EXPECT_EQ(converts, 0u);
+      } else {
+         EXPECT_EQ(normflt_f16, 0u);
+         EXPECT_EQ(hmul, 0u);
+         EXPECT_EQ(scale_imm_255h, 0u);
+         EXPECT_EQ(converts, 4u);
+      }
+      ralloc_free(mem);
+   }
+}
+
 } // namespace

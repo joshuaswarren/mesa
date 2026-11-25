@@ -179,3 +179,74 @@ TEST(MonotonicBitInsert, MonotonicBitInsertBranchFold)
       ralloc_free(b.shader);
    }
 }
+
+TEST(MonotonicBitInsert, RunsBeforeRuntimeUnroll)
+{
+   /* Verify the pass folds the tautological guard before runtime-loop
+    * unrolling converts the 32-trip loop from unit-stepped to multi-stepped. */
+   nir_builder b = make_compute_shader("bit-before-unroll");
+   nir_def *base = make_desc_base(&b, 4);
+   nir_def *out = make_desc_base(&b, 8);
+
+   nir_def *iv_init = nir_imm_int(&b, 0);
+   nir_def *acc_init = nir_imm_int(&b, 0);
+
+   nir_loop *loop = nir_push_loop(&b);
+   nir_block *pre = nir_loop_predecessor_block(loop);
+   nir_block *header = nir_loop_first_block(loop);
+
+   nir_phi_instr *iv_phi = nir_phi_instr_create(b.shader);
+   nir_def_init(&iv_phi->instr, &iv_phi->def, 1, 32);
+   nir_phi_instr_add_src(iv_phi, pre, iv_init);
+
+   nir_phi_instr *acc_phi = nir_phi_instr_create(b.shader);
+   nir_def_init(&acc_phi->instr, &acc_phi->def, 1, 32);
+   nir_phi_instr_add_src(acc_phi, pre, acc_init);
+
+   b.cursor = nir_after_block(header);
+
+   nir_push_if(&b, nir_ige_imm(&b, &iv_phi->def, 32));
+   nir_jump(&b, nir_jump_break);
+   nir_pop_if(&b, NULL);
+
+   nir_def *bit = nir_ishl(&b, nir_imm_int(&b, 1),
+                           nir_iand_imm(&b, &iv_phi->def, 31));
+   nir_def *cand = nir_ior(&b, &acc_phi->def, bit);
+   nir_def *guard = nir_ine(&b, cand, &acc_phi->def);
+
+   nir_if *nif = nir_push_if(&b, guard);
+   nir_def *addr = make_buffer_addr(&b, base, nir_ishl_imm(&b, &iv_phi->def, 2));
+   nir_def *v = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+   nir_def *set = nir_bcsel(&b, nir_ilt_imm(&b, v, 0), cand, &acc_phi->def);
+   nir_pop_if(&b, nif);
+
+   nir_block *then_blk = nir_if_last_then_block(nif);
+   nir_block *else_blk = nir_if_last_else_block(nif);
+   nir_phi_instr *merge = nir_phi_instr_create(b.shader);
+   nir_def_init(&merge->instr, &merge->def, 1, 32);
+   nir_phi_instr_add_src(merge, then_blk, set);
+   nir_phi_instr_add_src(merge, else_blk, &acc_phi->def);
+   nir_instr_insert(nir_before_block(nir_cursor_current_block(b.cursor)),
+                    &merge->instr);
+
+   nir_def *iv_next = nir_iadd_imm(&b, &iv_phi->def, 1);
+   nir_block *latch = nir_loop_last_block(loop);
+   nir_phi_instr_add_src(iv_phi, latch, iv_next);
+   nir_phi_instr_add_src(acc_phi, latch, &merge->def);
+   nir_instr_insert(nir_before_block(header), &iv_phi->instr);
+   nir_instr_insert(nir_before_block(header), &acc_phi->instr);
+   nir_pop_loop(&b, loop);
+
+   nir_store_global(&b, &acc_phi->def, out, .align_mul = 4);
+   nir_validate_shader(b.shader, "bit-before-unroll setup");
+
+   /* Running monotonic bit-insert before runtime unroll eliminates the inner
+    * guard so unrolling produces a branch-free loop body. */
+   EXPECT_TRUE(agx_nir_opt_monotonic_bit_insert(b.shader));
+   EXPECT_EQ(count_ifs(b.shader), 1u);
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(b.shader, 8, 320, NULL));
+   nir_validate_shader(b.shader, "bit-before-unroll unrolled");
+   /* No inner body guards remain (only loop exit tests and guarded tail steps). */
+   EXPECT_EQ(count_alu_op(b.shader, nir_op_ine), 0u);
+   ralloc_free(b.shader);
+}

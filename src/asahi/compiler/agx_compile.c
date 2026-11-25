@@ -11580,6 +11580,16 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          agx_optimize_loop_nir(nir, m5, agx3b, g17p, agx3b || m5);
    }
 
+   /* Eliminate tautological monotonic bit-insert guards inside <=32-trip loops
+    * before runtime-loop unrolling and vectorization, while the loop induction
+    * variable is still unit-stepped. */
+   {
+      bool folded_bits = false;
+      NIR_PASS(folded_bits, nir, agx_nir_opt_monotonic_bit_insert);
+      if (folded_bits)
+         agx_optimize_loop_nir(nir, m5, agx3b, g17p, agx3b || m5);
+   }
+
    /* Counted loops whose trip count is only known at run time: run several
     * iterations per loop test where the bound allows it. On M5 the loop
     * control of a short body costs about as much as the body, and the
@@ -11616,10 +11626,12 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       NIR_PASS(_, nir, agx_nir_opt_m5_narrow_to_float);
 
    /* Consecutive words read together, such as the unrolled iterations' reads
-    * of one array, become one vector load. */
-   /* With soft faults, robust buffer reads are plain reads followed by a
-    * bounds select, so a read past the end is not undefined: leave them. */
-   if (m5 && !g18_scans && !soft_fault) {
+    * of one array, become one vector load. Leave bounds-checked (robust)
+    * shaders alone: with soft faults, robust buffer reads are plain reads
+    * followed by a bounds select, so a read past the end is defined rather
+    * than undefined behaviour. Non-robust shaders remain safe even when soft
+    * faults are active because set_speculate() has not run yet. */
+   if (m5 && !g18_scans && !checked_offsets) {
       bool merged = false;
       NIR_PASS(merged, nir, agx_nir_merge_global_words);
       if (merged) {
@@ -11675,15 +11687,6 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          NIR_PASS(_, nir, nir_opt_cse);
          NIR_PASS(_, nir, nir_opt_dce);
       }
-   }
-
-   /* Eliminate tautological monotonic bit-insert guards inside <=32-trip loops
-    * so affected loops become straight-line before vectorization and unrolling. */
-   {
-      bool folded_bits = false;
-      NIR_PASS(folded_bits, nir, agx_nir_opt_monotonic_bit_insert);
-      if (folded_bits)
-         agx_optimize_loop_nir(nir, m5, agx3b, g17p, agx3b || m5);
    }
 
    /* Fuse nested guards, hoist independent load/test prefixes across pure
@@ -11763,10 +11766,13 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    }
 
    /* Constant index addends that agx_nir_lower_address cannot see through
-    * its LEA fusion go to M5's byte offsets first. */
-   if (m5 && !g18_scans && !soft_fault) {
+    * its LEA fusion go to M5's byte offsets first. Skip when offsets are
+    * bounds-checked (robustness); with soft faults on non-robust shaders,
+    * agx_nir_fold_m5_offsets() sign-extends speculative byte-sibling indices
+    * so wrapping past 2^32 cannot shift an executed lane. */
+   if (m5 && !g18_scans && !checked_offsets) {
       bool folded = false;
-      NIR_PASS(folded, nir, agx_nir_fold_m5_offsets);
+      NIR_PASS(folded, nir, agx_nir_fold_m5_offsets, soft_fault);
       if (folded)
          NIR_PASS(_, nir, nir_opt_dce);
    }
@@ -15301,9 +15307,22 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
  * byte unpacks so the source half is guaranteed dead at `normflt`, matching
  * the witnessed `f29 = 1` source-discard encoding.
  */
+static bool
+agx_normflt_pair_use_f16(const agx_instr *lo, const agx_instr *hi,
+                         const uint32_t *uses, const bool *narrow_bad,
+                         unsigned nalloc)
+{
+   const unsigned lo_v = lo->dest[0].value;
+   const unsigned hi_v = hi->dest[0].value;
+   return lo_v < nalloc && hi_v < nalloc &&
+          uses[lo_v] > 0 && uses[hi_v] > 0 &&
+          !narrow_bad[lo_v] && !narrow_bad[hi_v];
+}
+
 static void
 agx_emit_normflt_u8_pair(agx_context *ctx, agx_index half_src,
                          agx_instr *lo, agx_instr *hi, agx_instr *anchor,
+                         agx_index scale_f16, agx_index scale_f32,
                          const uint32_t *uses, const bool *narrow_bad,
                          agx_index *narrow_remap, unsigned nalloc,
                          bool *any_narrow)
@@ -15312,9 +15331,7 @@ agx_emit_normflt_u8_pair(agx_context *ctx, agx_index half_src,
    const unsigned lo_v = lo->dest[0].value;
    const unsigned hi_v = hi->dest[0].value;
    const bool use_f16 =
-      lo_v < nalloc && hi_v < nalloc &&
-      uses[lo_v] > 0 && uses[hi_v] > 0 &&
-      !narrow_bad[lo_v] && !narrow_bad[hi_v];
+      agx_normflt_pair_use_f16(lo, hi, uses, narrow_bad, nalloc);
 
    if (use_f16) {
       agx_index pair = agx_temp(ctx, AGX_SIZE_16);
@@ -15325,7 +15342,9 @@ agx_emit_normflt_u8_pair(agx_context *ctx, agx_index half_src,
 
       agx_index lanes[2] = {agx_null()};
       agx_emit_split(&b, lanes, pair, 2);
-      agx_index scale = agx_mov_imm(&b, 16, 0x5bf8); /* 255.0h */
+      agx_index scale = scale_f16.type == AGX_INDEX_NORMAL
+                           ? scale_f16
+                           : agx_mov_imm(&b, 16, 0x5bf8); /* 255.0h */
 
       agx_builder blo = agx_init_builder(ctx, agx_before_instr(lo));
       narrow_remap[lo_v] = agx_hmul(&blo, lanes[0], scale);
@@ -15345,7 +15364,9 @@ agx_emit_normflt_u8_pair(agx_context *ctx, agx_index half_src,
 
       agx_index lanes[2] = {agx_null()};
       agx_emit_split(&b, lanes, pair, 2);
-      agx_index scale = agx_mov_imm(&b, 32, fui(255.0f));
+      agx_index scale = scale_f32.type == AGX_INDEX_NORMAL
+                           ? scale_f32
+                           : agx_mov_imm(&b, 32, fui(255.0f));
 
       agx_builder blo = agx_init_builder(ctx, agx_before_instr(lo));
       agx_fmul_to(&blo, lo->dest[0], lanes[0], scale);
@@ -15394,6 +15415,9 @@ agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
    bool *narrow_bad = rzalloc_array(memctx, bool, nalloc);
    agx_instr **bfeil_def = rzalloc_array(memctx, agx_instr *, nalloc);
    agx_block **bfeil_blk = rzalloc_array(memctx, agx_block *, nalloc);
+   agx_instr **and16_def = rzalloc_array(memctx, agx_instr *, nalloc);
+   agx_block **and16_blk = rzalloc_array(memctx, agx_block *, nalloc);
+   agx_index *and16_src = rzalloc_array(memctx, agx_index, nalloc);
    agx_instr **word_ext_def = rzalloc_array(memctx, agx_instr *, nalloc);
    agx_block **word_ext_blk = rzalloc_array(memctx, agx_block *, nalloc);
    agx_index *word_ext_src = rzalloc_array(memctx, agx_index, nalloc);
@@ -15429,6 +15453,27 @@ agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
              I->dest[0].value < nalloc) {
             bfeil_def[I->dest[0].value] = I;
             bfeil_blk[I->dest[0].value] = block;
+         } else if (I->op == AGX_OPCODE_BITOP && I->truth_table == 8 &&
+                    I->nr_dests == 1 && I->nr_srcs == 2 &&
+                    I->dest[0].type == AGX_INDEX_NORMAL &&
+                    I->dest[0].size == AGX_SIZE_16 &&
+                    agx_channels(I->dest[0]) == 1 &&
+                    I->dest[0].value < nalloc) {
+            for (unsigned s = 0; s < 2; ++s) {
+               const agx_index a = I->src[s];
+               const agx_index b = I->src[1 - s];
+               uint32_t mask = 0;
+               if (a.type == AGX_INDEX_NORMAL && a.size == AGX_SIZE_16 &&
+                   agx_channels(a) == 1 && !a.abs && !a.neg &&
+                   a.value < nalloc && !is_mov_imm[a.value] &&
+                   agx_normflt_imm_u32(b, is_mov_imm, mov_imm_val, nalloc, &mask) &&
+                   mask == 0xff) {
+                  and16_def[I->dest[0].value] = I;
+                  and16_blk[I->dest[0].value] = block;
+                  and16_src[I->dest[0].value] = a;
+                  break;
+               }
+            }
          } else if (I->op == AGX_OPCODE_BITOP && I->truth_table == 8 &&
                     I->nr_dests == 1 && I->nr_srcs == 2 &&
                     I->dest[0].type == AGX_INDEX_NORMAL &&
@@ -15569,6 +15614,15 @@ agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
                      hi_conv[h] = I;
                      hi_pos[h] = pos;
                   }
+               } else if (and16_def[s] && and16_blk[s] == block &&
+                          uses[s] == 1 && and16_src[s].value < nalloc) {
+                  const unsigned h = and16_src[s].value;
+                  if (!lo_conv[h]) {
+                     if (!hi_conv[h])
+                        candidates[ncands++] = h;
+                     lo_conv[h] = I;
+                     lo_pos[h] = pos;
+                  }
                }
             }
          } else if (I->src[1].size == AGX_SIZE_32 &&
@@ -15590,6 +15644,83 @@ agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
          }
       }
 
+      /* Emit at most one 255.0h and one 255.0f scale immediate per block, right
+       * before the earliest matched byte-pair conversion so it dominates every
+       * rewritten pair without extending live ranges across earlier loads. */
+      agx_instr *scale_anchor = NULL;
+      uint32_t scale_anchor_pos = UINT32_MAX;
+      bool need_f16_scale = false;
+      bool need_f32_scale = false;
+
+      for (unsigned ci = 0; ci < ncands; ++ci) {
+         const unsigned h = candidates[ci];
+         agx_instr *lo = lo_conv[h];
+         agx_instr *hi = hi_conv[h];
+         if (!lo || !hi || uses[h] != 2)
+            continue;
+         agx_instr *anchor = lo_pos[h] < hi_pos[h] ? lo : hi;
+         uint32_t apos = MIN2(lo_pos[h], hi_pos[h]);
+         if (apos < scale_anchor_pos) {
+            scale_anchor_pos = apos;
+            scale_anchor = anchor;
+         }
+         if (agx_normflt_pair_use_f16(lo, hi, uses, narrow_bad, nalloc))
+            need_f16_scale = true;
+         else
+            need_f32_scale = true;
+      }
+
+      for (unsigned ci = 0; ci < nword_cands; ++ci) {
+         const unsigned w = word_cands[ci];
+         agx_instr *c[4] = {
+            word_st[w].conv[0], word_st[w].conv[1],
+            word_st[w].conv[2], word_st[w].conv[3],
+         };
+         uint32_t p[4] = {
+            word_st[w].pos[0], word_st[w].pos[1],
+            word_st[w].pos[2], word_st[w].pos[3],
+         };
+         const bool has_lo = c[0] && c[1];
+         const bool has_hi = c[2] && c[3];
+         const unsigned need = (has_lo ? 2u : 0u) + (has_hi ? 2u : 0u);
+         if (!need || uses[w] != need)
+            continue;
+         if (has_lo) {
+            agx_instr *anchor = p[0] < p[1] ? c[0] : c[1];
+            uint32_t apos = MIN2(p[0], p[1]);
+            if (apos < scale_anchor_pos) {
+               scale_anchor_pos = apos;
+               scale_anchor = anchor;
+            }
+            if (agx_normflt_pair_use_f16(c[0], c[1], uses, narrow_bad, nalloc))
+               need_f16_scale = true;
+            else
+               need_f32_scale = true;
+         }
+         if (has_hi) {
+            agx_instr *anchor = p[2] < p[3] ? c[2] : c[3];
+            uint32_t apos = MIN2(p[2], p[3]);
+            if (apos < scale_anchor_pos) {
+               scale_anchor_pos = apos;
+               scale_anchor = anchor;
+            }
+            if (agx_normflt_pair_use_f16(c[2], c[3], uses, narrow_bad, nalloc))
+               need_f16_scale = true;
+            else
+               need_f32_scale = true;
+         }
+      }
+
+      agx_index scale_f16 = agx_null();
+      agx_index scale_f32 = agx_null();
+      if (scale_anchor) {
+         agx_builder bscale = agx_init_builder(ctx, agx_before_instr(scale_anchor));
+         if (need_f16_scale)
+            scale_f16 = agx_mov_imm(&bscale, 16, 0x5bf8); /* 255.0h */
+         if (need_f32_scale)
+            scale_f32 = agx_mov_imm(&bscale, 32, fui(255.0f));
+      }
+
       for (unsigned ci = 0; ci < ncands; ++ci) {
          const unsigned h = candidates[ci];
          agx_instr *lo = lo_conv[h];
@@ -15600,10 +15731,19 @@ agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
             continue;
 
          agx_instr *sh = bfeil_def[hi->src[1].value];
+         const bool lo_is_and16 =
+            lo->src[0].value == AGX_CONVERT_U16_TO_F &&
+            and16_def[lo->src[1].value] != NULL;
+         agx_instr *lo_and = lo_is_and16 ? and16_def[lo->src[1].value] : NULL;
+         agx_index half_src =
+            lo_is_and16 ? and16_src[lo->src[1].value] : lo->src[1];
          agx_instr *anchor = lo_pos[h] < hi_pos[h] ? lo : hi;
-         agx_emit_normflt_u8_pair(ctx, lo->src[1], lo, hi, anchor,
+         agx_emit_normflt_u8_pair(ctx, half_src, lo, hi, anchor,
+                                  scale_f16, scale_f32,
                                   uses, narrow_bad, narrow_remap, nalloc,
                                   &any_narrow);
+         if (lo_and)
+            agx_remove_instruction(lo_and);
          agx_remove_instruction(sh);
       }
 
@@ -15652,6 +15792,7 @@ agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
          if (has_lo) {
             agx_instr *anchor = p[0] < p[1] ? c[0] : c[1];
             agx_emit_normflt_u8_pair(ctx, h0, c[0], c[1], anchor,
+                                     scale_f16, scale_f32,
                                      uses, narrow_bad, narrow_remap, nalloc,
                                      &any_narrow);
             agx_remove_instruction(ext[0]);
@@ -15660,6 +15801,7 @@ agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
          if (has_hi) {
             agx_instr *anchor = p[2] < p[3] ? c[2] : c[3];
             agx_emit_normflt_u8_pair(ctx, h1, c[2], c[3], anchor,
+                                     scale_f16, scale_f32,
                                      uses, narrow_bad, narrow_remap, nalloc,
                                      &any_narrow);
             agx_remove_instruction(ext[2]);
