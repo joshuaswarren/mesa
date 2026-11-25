@@ -95,35 +95,6 @@ hk_reports_per_query(struct hk_query_pool *pool)
    }
 }
 
-/*
- * Prepare the compute stream a query command (reset, result copy) records
- * into. Query state is updated in submission order without application
- * barriers (Vulkan 1.3, 17 "Queries": vkCmdCopyQueryPoolResults sees every
- * earlier vkCmdResetQueryPool on the queue, and vkCmdBeginQuery requires the
- * query to be unavailable, which an earlier reset in the same command buffer
- * provides). The stream therefore waits on every earlier stream, and it is
- * never the stream carrying a pending end timestamp. On G17P, both start
- * and end timestamps reach query memory at command retirement, so neither
- * producer may contain the query command or be merged back into it. The caller
- * marks later streams as ordered after it where the command's semantics require
- * that.
- */
-static struct hk_cs *
-hk_query_command_cs(struct hk_cmd_buffer *cmd)
-{
-   hk_sync_flush_pending_timestamp(cmd);
-   /* Timestamps written as copies of earlier ones are query results too. */
-   hk_sync_flush_stamp_copies(cmd);
-   hk_sync_end_cs_if_timestamped(cmd);
-
-   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, HK_SYNC_QUERY_SCOPE, cmd->current_cs.cs, dep);
-   struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
-   if (cs && agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
-      cs->g17p_timestamp_query = true;
-   return cs;
-}
-
 static uint64_t
 hk_query_available_size(const struct hk_query_pool *pool)
 {
@@ -497,50 +468,6 @@ hk_cmd_end_query_stamped(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
       .render_seq = render_seq,
    };
    util_dynarray_append(&cs->oq_stamps, stamp);
-}
-
-void
-hk_resolve_pending_oq_available(struct hk_cmd_buffer *cmd)
-{
-   struct hk_cs *render = cmd->state.oq_pending_render;
-   if (!render)
-      return;
-
-   /* Any later stream or sync record flushed oq_pending_render into post_gfx,
-    * so nothing depends on this render. Verify no tail requirement names it,
-    * then stamp its free retirement slots directly (same slot order as
-    * hk_stamp_oq_available()). */
-   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
-      const struct hk_cs *cut = cmd->sync.req[k][HK_SYNC_VDM].cut;
-      if (cut && cut->sync.seq >= render->sync.seq) {
-         hk_flush_oq_pending(cmd);
-         return;
-      }
-   }
-
-   const unsigned order[] = {1, 2, 0};
-   unsigned free_slots[ARRAY_SIZE(order)], nfree = 0;
-   for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
-      const unsigned slot = order[i];
-      if ((slot == 0 && render->timestamp.start.handle) ||
-          render->oq_stamp[slot].handle)
-         continue;
-      free_slots[nfree++] = slot;
-   }
-
-   if (nfree < render->oq_pending_count) {
-      hk_flush_oq_pending(cmd);
-      return;
-   }
-
-   for (unsigned i = 0; i < render->oq_pending_count; ++i) {
-      render->oq_stamp[free_slots[i]] = (struct agx_timestamp_req){
-         .handle = render->oq_pending[i].handle,
-         .offset_B = render->oq_pending[i].offset_B,
-      };
-   }
-   render->oq_pending_count = 0;
-   cmd->state.oq_pending_render = NULL;
 }
 
 /* Mark the stream that received a query copy or reset (query_access), and
