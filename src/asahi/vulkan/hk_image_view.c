@@ -503,7 +503,7 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
    if (eot)
       p_format = util_format_linear(p_format);
 
-   if (eot && agx_chip_native_or_m5(dev->dev.chip))
+   if (eot && agx_chip_agx3_path(dev->dev.chip))
       p_format = hk_eot_pbe_format(&dev->dev, p_format);
 
    const struct util_format_description *desc =
