@@ -115,6 +115,11 @@ enum agx_chip_cap {
     * a depth or stencil attachment is bound, so render bounds must be at
     * least the ZLS surface dimensions even for sub-rectangle render areas. */
    AGX_CAP_ZLS_FULL_RENDER_BOUNDS = 1u << 16,
+
+   /* The render ABI supports the native1130 mixed-format single-sample
+    * fragment epilog encoding (skipping empty-mask targets and encoding
+    * per-format partial channel masks natively). Verified on G18G. */
+   AGX_CAP_NATIVE_MIXED_EPILOG = 1u << 17,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -169,7 +174,8 @@ enum agx_chip_cap {
    X(G17G, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17S, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17C, AGX_CAPS_M5, __VA_ARGS__)                                           \
-   X(G18G, AGX_CAP_ZLS_FULL_RENDER_BOUNDS, __VA_ARGS__)
+   X(G18G, AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG,       \
+     __VA_ARGS__)
 
 /* Like agx_chip_has_record(), a test of the table expands to comparisons, so
  * the precompiled OpenCL kernels can call it and the C units run the same

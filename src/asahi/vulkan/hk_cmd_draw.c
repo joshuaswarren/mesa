@@ -7157,7 +7157,7 @@ hk_get_prolog_epilog_locked(struct hk_device *dev, struct hk_internal_key *key,
    if (builder == build_g17p_fs_epilog)
       backend_key.g17p_emrt =
          ((const struct agx_fs_epilog_key *)key->key)->native_spills;
-   if (dev->dev.chip == AGX_CHIP_G18G &&
+   if (agx_chip_has_cap(dev->dev.chip, AGX_CAP_NATIVE_MIXED_EPILOG) &&
        (builder == agx_nir_fs_epilog || builder == build_g17p_fs_epilog ||
         builder == build_g18_msaa4_fs_epilog))
       backend_key.g18_native_mixed =
@@ -12211,7 +12211,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
     * of emitting preserve_zero_mask reloads that mix loads with partial
     * stores on 3+ targets. */
    key->epilog.g18_native_mixed =
-      dev->dev.chip == AGX_CHIP_G18G &&
+      agx_chip_has_cap(dev->dev.chip, AGX_CAP_NATIVE_MIXED_EPILOG) &&
       (agx_g18g_native_mixed_mask(in->tib) != 0 ||
        (has_masked_rt && agx_g18g_word_mrt_mask(in->tib) != 0 &&
         agx_g18g_native_mixed_epilog_mask(in->tib) != 0));
