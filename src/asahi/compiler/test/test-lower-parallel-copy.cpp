@@ -385,3 +385,52 @@ TEST_F(LowerParallelCopy, IndependentClassesWithSameIndices)
                  agx_register(2, AGX_SIZE_32));
    });
 }
+
+TEST_F(LowerParallelCopy, HighSlotMemoryAt8191)
+{
+   struct agx_copy copies[] = {
+      {.dest = AGX_NUM_MODELED_REGS - 1,
+       .dest_mem = true,
+       .src = agx_memory_register(AGX_NUM_MODELED_REGS - 3, AGX_SIZE_16)},
+   };
+
+   CASE(copies, {
+      agx_mov_to(b, agx_register(2, AGX_SIZE_16),
+                 agx_memory_register(AGX_NUM_MODELED_REGS - 3, AGX_SIZE_16));
+      agx_mov_to(b, agx_memory_register(AGX_NUM_MODELED_REGS - 1, AGX_SIZE_16),
+                 agx_register(2, AGX_SIZE_16));
+   });
+}
+
+TEST_F(LowerParallelCopy, HighSlotMemory64AndSwap)
+{
+   struct agx_copy copies[] = {
+      {.dest = AGX_NUM_MODELED_REGS - 4,
+       .dest_mem = true,
+       .src = agx_memory_register(AGX_NUM_MODELED_REGS - 8, AGX_SIZE_64)},
+      {.dest = 4096,
+       .dest_mem = true,
+       .src = agx_memory_register(6000, AGX_SIZE_32)},
+      {.dest = 6000,
+       .dest_mem = true,
+       .src = agx_memory_register(4096, AGX_SIZE_32)},
+   };
+
+   CASE(copies, {
+      agx_mov_to(b, agx_register(2, AGX_SIZE_32),
+                 agx_memory_register(AGX_NUM_MODELED_REGS - 8, AGX_SIZE_32));
+      agx_mov_to(b, agx_memory_register(AGX_NUM_MODELED_REGS - 4, AGX_SIZE_32),
+                 agx_register(2, AGX_SIZE_32));
+      agx_mov_to(b, agx_register(2, AGX_SIZE_32),
+                 agx_memory_register(AGX_NUM_MODELED_REGS - 6, AGX_SIZE_32));
+      agx_mov_to(b, agx_memory_register(AGX_NUM_MODELED_REGS - 2, AGX_SIZE_32),
+                 agx_register(2, AGX_SIZE_32));
+
+      agx_index temp1 = agx_register(4, AGX_SIZE_32);
+      agx_index temp2 = agx_register(6, AGX_SIZE_32);
+      agx_mov_to(b, temp1, agx_memory_register(4096, AGX_SIZE_32));
+      agx_mov_to(b, temp2, agx_memory_register(6000, AGX_SIZE_32));
+      agx_mov_to(b, agx_memory_register(6000, AGX_SIZE_32), temp1);
+      agx_mov_to(b, agx_memory_register(4096, AGX_SIZE_32), temp2);
+   });
+}

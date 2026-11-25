@@ -86,8 +86,12 @@ copy_propagate_alu(nir_alu_src *use_of_copy, nir_alu_instr *copy)
       new_use_src = copy->src[0].src.ssa;
 
       /* Propagate the mov swizzle to the use. */
-      for (unsigned i = 0; i < num_use_components; i++)
-         use_of_copy->swizzle[i] = copy->src[0].swizzle[use_of_copy->swizzle[i]];
+      if (num_use_components == 1) {
+         use_of_copy->swizzle[0] = copy->src[0].swizzle[use_of_copy->swizzle[0]];
+      } else {
+         for (unsigned i = 0; i < num_use_components; i++)
+            use_of_copy->swizzle[i] = copy->src[0].swizzle[use_of_copy->swizzle[i]];
+      }
    } else {
       /* "copy" is vecN. */
       new_use_src = copy->src[use_of_copy->swizzle[0]].src.ssa;
@@ -149,6 +153,9 @@ copy_prop_instr(nir_instr *instr)
    nir_alu_instr *copy = nir_instr_as_alu(instr);
 
    if (!nir_op_is_vec_or_mov(copy->op))
+      return false;
+
+   if (nir_def_is_unused(&copy->def))
       return false;
 
    bool progress = false;

@@ -287,7 +287,6 @@ can_sink_instr(nir_instr *instr, nir_move_options options, bool *can_mov_out_of_
          return options & nir_move_copies;
 
       case nir_intrinsic_load_constant_agx:
-      case nir_intrinsic_load_local_pixel_agx:
       case nir_intrinsic_load_back_face_agx:
       case nir_intrinsic_load_shader_output_pan:
          *can_mov_out_of_loop = true;
@@ -404,6 +403,11 @@ nir_opt_sink(nir_shader *shader, nir_move_options options)
    bool progress = false;
 
    nir_foreach_function_impl(impl, shader) {
+      if (exec_list_is_singular(&impl->body)) {
+         nir_no_progress(impl);
+         continue;
+      }
+
       nir_metadata required = nir_metadata_block_index |
                               nir_metadata_dominance |
                               nir_metadata_dominance_lca;
@@ -411,6 +415,7 @@ nir_opt_sink(nir_shader *shader, nir_move_options options)
          required |= nir_metadata_divergence;
       nir_metadata_require(impl, required);
 
+      bool impl_progress = false;
       nir_foreach_block_reverse(block, impl) {
          nir_foreach_instr_reverse_safe(instr, block) {
             bool sink_out_of_loops;
@@ -428,11 +433,12 @@ nir_opt_sink(nir_shader *shader, nir_move_options options)
             nir_instr_remove(instr);
             nir_instr_insert(nir_after_phis(use_block), instr);
 
-            progress = true;
+            impl_progress = true;
          }
       }
 
-      nir_progress(true, impl, nir_metadata_control_flow);
+      nir_progress(impl_progress, impl, nir_metadata_control_flow);
+      progress |= impl_progress;
    }
 
    return progress;

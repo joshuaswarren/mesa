@@ -119,3 +119,66 @@ agx3_staging_plan(const struct agx3_staging_banks *banks, unsigned span,
    }
    return best_count != 17;
 }
+
+/* What emission knows about the generations in flight: the outstanding
+ * slots, which of them are image writes, which write r0, which belong to
+ * load-only local-read tile loads, and the staging halves their consumers
+ * still read. At the arms of an if it joins as slot assignment does
+ * (agx3_slot_core.h). */
+struct agx3_emit_slots {
+   uint16_t outstanding, image_writes, r0_inflight, local_read_load_only;
+   struct agx3_staging_banks staging;
+};
+
+static inline void
+agx3_emit_slots_capture(struct agx3_emit_slots *to, uint16_t outstanding,
+                        uint16_t image_writes, uint16_t r0_inflight,
+                        uint16_t local_read_load_only,
+                        const struct agx3_staging_banks *staging)
+{
+   to->outstanding = outstanding;
+   to->image_writes = image_writes & outstanding;
+   to->r0_inflight = r0_inflight & outstanding;
+   to->local_read_load_only = local_read_load_only & outstanding;
+   to->staging = *staging;
+   agx3_staging_release(&to->staging, outstanding);
+}
+
+static inline void
+agx3_emit_slots_join(const struct agx3_emit_slots *from, uint16_t *outstanding,
+                     uint16_t *image_writes, uint16_t *r0_inflight,
+                     uint16_t *local_read_load_only,
+                     struct agx3_staging_banks *staging)
+{
+   *outstanding |= from->outstanding;
+   *image_writes |= from->image_writes;
+   *r0_inflight |= from->r0_inflight;
+   *local_read_load_only |= from->local_read_load_only;
+   for (unsigned i = 0; i < from->staging.end; ++i)
+      staging->readers[i] |= from->staging.readers[i];
+   if (from->staging.end > staging->end)
+      staging->end = from->staging.end;
+}
+
+/* A break joins what is in flight into the state its loop's pop resumes. */
+static inline void
+agx3_emit_slots_add(struct agx3_emit_slots *to, bool *has, uint16_t outstanding,
+                    uint16_t image_writes, uint16_t r0_inflight,
+                    uint16_t local_read_load_only,
+                    const struct agx3_staging_banks *staging)
+{
+   if (!*has) {
+      agx3_emit_slots_capture(to, outstanding, image_writes, r0_inflight,
+                              local_read_load_only, staging);
+      *has = true;
+      return;
+   }
+   to->outstanding |= outstanding;
+   to->image_writes |= image_writes & outstanding;
+   to->r0_inflight |= r0_inflight & outstanding;
+   to->local_read_load_only |= local_read_load_only & outstanding;
+   for (unsigned i = 0; i < staging->end; ++i)
+      to->staging.readers[i] |= staging->readers[i] & outstanding;
+   if (staging->end > to->staging.end)
+      to->staging.end = staging->end;
+}

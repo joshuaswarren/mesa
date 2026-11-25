@@ -280,31 +280,14 @@ replace_ssa_undef(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
-static bool
-opt_undef_uses(nir_builder *b, nir_instr *instr, void *data)
+static void
+init_undef_options(nir_shader *shader, struct undef_options *options)
 {
-   if (instr->type == nir_instr_type_alu) {
-      nir_alu_instr *alu = nir_instr_as_alu(instr);
-      return opt_undef_csel(b, alu) ||
-             opt_undef_vecN(b, alu);
-   } else if (instr->type == nir_instr_type_intrinsic) {
-      nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
-      return opt_undef_store(intrin);
-   }
-
-   return false;
-}
-
-bool
-nir_opt_undef(nir_shader *shader)
-{
-   struct undef_options options = { 0 };
-
    /* Disallow the undef->NaN transformation only for those shaders where
     * it's known to break rendering. These are shader source BLAKE3s printed by
     * nir_print_shader().
     */
-   uint32_t shader_blake3s[][BLAKE3_OUT_LEN32] = {
+   static const uint32_t shader_blake3s[][BLAKE3_OUT_LEN32] = {
       /* gputest/gimark */
       { 0x582c214b, 0x25478275, 0xc9a835d2, 0x95c9b643, 0x69deae47, 0x213c7427, 0xa9da66a5, 0xac254ed2 },
 
@@ -322,24 +305,84 @@ nir_opt_undef(nir_shader *shader)
       { 0x47a3eb4b, 0x136f676d, 0x94045ed3, 0x57b00972, 0x8cda7550, 0x88327fda, 0x37f7cf37, 0x66db05e3 }, /* Body */
    };
 
+   if (shader->info.use_legacy_math_rules) {
+      options->disallow_undef_to_nan = true;
+      return;
+   }
+
    for (unsigned i = 0; i < ARRAY_SIZE(shader_blake3s); i++) {
       if (_mesa_printed_blake3_equal(shader->info.source_blake3, shader_blake3s[i])) {
-         options.disallow_undef_to_nan = true;
+         options->disallow_undef_to_nan = true;
          break;
       }
    }
+}
 
-   if (shader->info.use_legacy_math_rules)
-      options.disallow_undef_to_nan = true;
+static bool
+opt_undef_impl(nir_function_impl *impl, struct undef_options *options,
+               bool *options_inited)
+{
+   nir_builder b = nir_builder_create(impl);
+   bool progress = false;
+   bool has_undef = false;
 
-   bool progress = nir_shader_instructions_pass(shader,
-                                                opt_undef_uses,
-                                                nir_metadata_control_flow,
-                                                &options);
-   progress |= nir_shader_instructions_pass(shader,
-                                            replace_ssa_undef,
-                                            nir_metadata_control_flow,
-                                            &options);
+   const bool skip_before_undef = impl->structured;
+
+   /* In structured NIR SSA, every non-phi use is dominated by its definition,
+    * and nir_foreach_block visits dominators before dominated blocks. Until we
+    * have seen at least one nir_instr_type_undef in this function, no ALU or
+    * store intrinsic can reference an undef. Unstructured impls keep the plain
+    * walk because block order may not match dominance.
+    */
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (unlikely(instr->type == nir_instr_type_undef)) {
+            has_undef = true;
+            continue;
+         }
+
+         if (skip_before_undef && likely(!has_undef))
+            continue;
+
+         if (instr->type == nir_instr_type_alu) {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            progress |= opt_undef_csel(&b, alu) || opt_undef_vecN(&b, alu);
+         } else if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            progress |= opt_undef_store(intrin);
+         }
+      }
+   }
+
+   if (likely(!has_undef))
+      return nir_no_progress(impl);
+
+   if (!*options_inited) {
+      init_undef_options(impl->function->shader, options);
+      *options_inited = true;
+   }
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type == nir_instr_type_undef)
+            progress |= replace_ssa_undef(&b, instr, options);
+      }
+   }
+
+   return nir_progress(progress, impl, nir_metadata_control_flow);
+}
+
+bool
+nir_opt_undef(nir_shader *shader)
+{
+   struct undef_options options = { 0 };
+   bool options_inited = false;
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, shader) {
+      if (opt_undef_impl(impl, &options, &options_inited))
+         progress = true;
+   }
 
    return progress;
 }

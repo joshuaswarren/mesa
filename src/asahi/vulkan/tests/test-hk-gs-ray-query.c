@@ -538,14 +538,28 @@ check_independent_fallback_mutable_read(unsigned kind)
    return true;
 }
 
-/* Under POLY_GS_SIDE_EFFECTS_MAIN (M5), an unused atomic alongside a separate
- * SSBO read controlling emission keeps executing once in main, never repeated
- * in count or per-vertex rast. */
+/* Under explicit POLY_GS_SIDE_EFFECTS_MAIN, an unused atomic alongside a
+ * separate SSBO read controlling emission keeps executing once in main, never
+ * repeated in count or per-vertex rast. Also verify chip policy selection
+ * routes M5 (G17G/G17S/G17C), native AGX3, and AGX2 to MAIN_IF_INDEPENDENT,
+ * while G18G stays on REPLAY. */
 static bool
-check_m5_unused_atomic_with_ssbo_read(void)
+check_main_mode_unused_atomic_with_ssbo_read(void)
 {
+   CHECK(hk_gs_side_effects_mode(AGX_CHIP_G17G) ==
+         POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT);
+   CHECK(hk_gs_side_effects_mode(AGX_CHIP_G17S) ==
+         POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT);
+   CHECK(hk_gs_side_effects_mode(AGX_CHIP_G17C) ==
+         POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT);
+   CHECK(hk_gs_side_effects_mode(AGX_CHIP_G17P) ==
+         POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT);
+   CHECK(hk_gs_side_effects_mode(AGX_CHIP_G13G) ==
+         POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT);
+   CHECK(hk_gs_side_effects_mode(AGX_CHIP_G18G) == POLY_GS_SIDE_EFFECTS_REPLAY);
+
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_GEOMETRY, &agx_nir_options, "GS M5 atomic plus SSBO read");
+      MESA_SHADER_GEOMETRY, &agx_nir_options, "GS MAIN atomic plus SSBO read");
    b.shader->info.io_lowered = true;
    b.shader->info.gs.input_primitive = MESA_PRIM_TRIANGLES;
    b.shader->info.gs.output_primitive = MESA_PRIM_TRIANGLE_STRIP;
@@ -611,12 +625,17 @@ check_main_side_effects_fence_strip(void)
    b.shader->info.outputs_written = VARYING_BIT_POS;
 
    const uint64_t atomic_addr = 0x10009000000ull;
+   const uint64_t count_addr = 0x1000a000000ull;
+   /* A run-time trip count, so no unroll limit can remove the loop before
+    * the GS lowering sees it. */
+   nir_def *trips = nir_load_global(&b, 1, 32, nir_imm_int64(&b, count_addr),
+                                    .align_mul = 4);
    nir_variable *iter = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
    nir_store_var(&b, iter, nir_imm_int(&b, 0), 1);
    nir_push_loop(&b);
    {
       nir_def *i = nir_load_var(&b, iter);
-      nir_break_if(&b, nir_uge_imm(&b, i, 64));
+      nir_break_if(&b, nir_uge(&b, i, trips));
       nir_global_atomic(&b, 32, nir_imm_int64(&b, atomic_addr),
                         nir_imm_int(&b, 1), .atomic_op = nir_atomic_op_iadd);
       nir_fence_mem_to_tex_agx(&b);
@@ -920,7 +939,7 @@ main(void)
    valid &= check_independent_fallback_atomic_reorder();
    for (unsigned kind = 0; kind < 4; ++kind)
       valid &= check_independent_fallback_mutable_read(kind);
-   valid &= check_m5_unused_atomic_with_ssbo_read();
+   valid &= check_main_mode_unused_atomic_with_ssbo_read();
    valid &= check_main_side_effects_fence_strip();
    valid &= check_independent_fallback_subgroup();
    valid &= check_independent_fallback_barrier();

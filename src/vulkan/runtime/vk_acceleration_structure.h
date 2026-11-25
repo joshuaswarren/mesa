@@ -137,6 +137,8 @@ struct vk_acceleration_structure_build_state {
    /* Internal state of vk_acceleration_structure.c */
    uint32_t scratch_offset;
    bool processed;
+   bool fused_leaf_morton;
+   uint32_t fused_geom_index;
 
    uint32_t morton_sort_dispatch_size;
    uint32_t morton_sort_passes;

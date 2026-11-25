@@ -364,18 +364,8 @@ agx3_tile_load(enum agx_isa_encoding enc, uint16_t dest,
          (chan_mask != 15 || (tile_off % (4u << width))))))
       return false;
 
-   /* G17G R8/RG8 framebuffer-fetch witnesses carry f26=1/3 with the
-    * same native load fields as RGBA8. G17P additionally has RGB565.
-    * Fresh applegpu_g17p RG8, RG16{Float,Unorm,Snorm,Uint,Sint}, and
-    * RG32{Float,Uint,Sint} render-pipeline witnesses isolate mask3 in f26 at
-    * every width. A B5G6R5Unorm framebuffer-fetch witness independently
-    * isolates mask7 in f26 for W16:
-    *
-    *    670e54000000019a02000000
-    *
-    * G17G's B5G6R5Unorm framebuffer fetch takes the same mask7 at W16
-    * (port/fbwit: 270105000187bc02000040d82000).
-    *
+   /* Framebuffer-fetch channel masks in f26: mask 1 (R8), mask 3 (RG8/RG16/
+    * RG32 at all widths), and mask 7 (RGB565/B5G6R5 at W16 on G17P and G17G).
     * None carries an incoming wait. */
    if (!common_ok(dest, width, chan_mask, sample, enc, wait_mask, tile_off) ||
        (chan_mask != 15 && chan_mask != 1 && chan_mask != 3 &&

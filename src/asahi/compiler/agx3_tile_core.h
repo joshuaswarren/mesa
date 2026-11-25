@@ -43,30 +43,10 @@ enum agx3_tile_width {
 };
 
 /*
- * The sample-mask operand of lstcol/lldcol. It is an ordinary source, not a
- * "coverage selector": the form's choice group is either an 8-bit immediate
- * (f51=1, f43) or a 16-bit register naming a half register (f51=2, f44, with
- * f53 carrying register bit 8 -- never needed below 192 -- and f55 an extra
- * bit that is set in every store witness and clear in the one load witness,
- * consistent with a last-use hint, so it is driven from the IR's kill flag
- * rather than pinned to a constant).
- *
- * Grounded against Apple's own applegpu_g17p output (MetalToolchain
- * 27.1.5194.15):
- *
- *   1x, any format          lstcol ... f51=1 f43=1
- *   2x/4x per-pixel         rld h10 <- SR39 ; lstcol ... f51=2 f44=10 f55=1
- *   4x per-sample (unrolled)  rld h16 <- SR39
- *                             bit_and h11 = h16 & 1   ... & 2, & 4, & 8
- *                             lstcol ... f44=11 / 9 / 10 / 8, f51=2, f55=1
- *   2x/4x framebuffer fetch lldcol ... f51=2 f44=19  (f55 clear: not a last use)
- *
- * The per-sample `& 1/2/4/8` sequence is what pins the meaning: the register
- * holds a plain sample bitmask in bits 0..3, and SR39's low nibble is the
- * live coverage. A per-pixel store therefore passes SR39 straight through --
- * "every sample this fragment covers" -- which is precisely what a
- * multisample store has to do. There is no all-sample immediate in any
- * witness; Apple always materialises the mask into a register at 2x and 4x.
+ * Sample-mask operand of `lstcol`/`lldcol`: either an 8-bit immediate
+ * (f51=1, f43; used at 1x) or a 16-bit half-register holding the sample
+ * bitmask in bits 0..3 (f51=2, f44, bit 8 in f53, kill hint in f55; used at
+ * 2x/4x from SR39 or per-sample masked SR39).
  */
 struct agx3_tile_sample {
    /* false: `value` is an 8-bit immediate sample mask.

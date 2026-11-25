@@ -36,8 +36,7 @@ bool
 agx3_lower_cprog_inputs(agx_context *ctx)
 {
    if (!ctx->is_preamble || !ctx->out || ctx->agx3_cprog_inputs_lowered ||
-       (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B &&
-        ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C))
+       !agx_isa_is_agx3(ctx->key->dev.encoding))
       return false;
 
    uint64_t reads[8] = {0}, writes[8] = {0};

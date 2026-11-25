@@ -6,19 +6,15 @@
 
 /* Sparse binds have already converted texel coordinates to format elements.
  * Do not divide block-compressed coordinates by the block extent again.
- * Other chips keep the twiddled-block path.
  */
 static inline uint64_t
 hk_sparse_image_tile_offset_B(enum agx_chip chip, const struct ail_layout *layout,
                               unsigned level, unsigned x_el, unsigned y_el,
                               unsigned z)
 {
-   if (chip == AGX_CHIP_G17P) {
-      assert(x_el % layout->tilesize_el[level].width_el == 0);
-      assert(y_el % layout->tilesize_el[level].height_el == 0);
-      return z * layout->layer_stride_B +
-             ail_get_tiled_element_B(layout, level, x_el, y_el, 0);
-   }
-
-   return ail_get_twiddled_block_B(layout, level, x_el, y_el, z);
+   (void)chip;
+   assert(x_el % layout->tilesize_el[level].width_el == 0);
+   assert(y_el % layout->tilesize_el[level].height_el == 0);
+   return z * layout->layer_stride_B +
+          ail_get_tiled_element_B(layout, level, x_el, y_el, 0);
 }
