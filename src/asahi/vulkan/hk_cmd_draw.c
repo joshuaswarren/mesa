@@ -5505,7 +5505,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
        * RGBA8 3024x1964 target, for a clear of a small HUD rectangle. Only
        * a resolve of loaded samples (or Z/S clears left to ZLS when the clear
        * draw is colour-only) still writes its destination from empty tiles. */
-      if (agx_chip_native_or_m5(dev->dev.chip)) {
+      if (agx_chip_agx3_path(dev->dev.chip)) {
          render->process_empty_tiles_without_z =
             loaded_resolve || (clear_draw_skips_zs && resolved_clear_s);
          cs->cr.process_empty_tiles =
