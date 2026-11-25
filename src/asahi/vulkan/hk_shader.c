@@ -5570,6 +5570,12 @@ hk_g18g_has_unlowered_image(nir_shader *nir, bool indexed_reads_ok)
                 (op == nir_intrinsic_bindless_image_load ||
                  op == nir_intrinsic_bindless_image_sparse_load))
                continue;
+            /* Bindless image stores are lowered by hk_g17p_lower_storage_records()
+             * to a descriptor-set heap uniform + 32-byte PBE record index and
+             * encoded (or refused at compile time) by
+             * agx3_emit_storage_image_write_g18g(). */
+            if (op == nir_intrinsic_bindless_image_store)
+               continue;
             const char *name = nir_intrinsic_infos[op].name;
             if ((!strncmp(name, "bindless_image_", 15) &&
                  strcmp(name, "bindless_image_agx")) ||
