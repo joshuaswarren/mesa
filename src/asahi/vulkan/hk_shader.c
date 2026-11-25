@@ -6262,7 +6262,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_uniforms,
             nir_metadata_control_flow, &root);
 
-   if (agx_chip_native_or_m5(dev->dev.chip)) {
+   if (agx_chip_agx3_path(dev->dev.chip)) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                hk_g17p_lower_storage_records, nir_metadata_control_flow,
                NULL);
