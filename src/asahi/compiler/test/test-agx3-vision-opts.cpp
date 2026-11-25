@@ -740,3 +740,94 @@ TEST(AGX3VisionOpts, FuseSelectsEvaluatesExactOnAllBooleanInputs)
       ralloc_free(b.shader);
    }
 }
+
+static unsigned
+compute_loads_before_first_use(enum agx_chip chip, unsigned extra_live_32,
+                               bool allocate = false)
+{
+   void *mem = ralloc_context(NULL);
+   struct agx_shader_key key = {};
+   key.dev.encoding = agx_chip_isa_encoding(chip);
+   key.dev.chip = chip;
+
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->out = rzalloc(mem, agx_shader_info);
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *body = agx_test_block(b->shader);
+   agx_block *latch = agx_test_block(b->shader);
+   agx_block *exit = agx_test_block(b->shader);
+   body->loop_header = true;
+   agx_block_add_successor(entry, body);
+   agx_block_add_successor(body, latch);
+   agx_block_add_successor(latch, body);
+   agx_block_add_successor(body, exit);
+
+   agx_index base = agx_uniform(4, AGX_SIZE_64);
+   agx_index off = agx_preload(b, agx_register(2, AGX_SIZE_32));
+   agx_index acc = agx_preload(b, agx_register(4, AGX_SIZE_32));
+   agx_index held[AGX3B_NUM_REGS / 2];
+   assert(extra_live_32 <= ARRAY_SIZE(held));
+   for (unsigned i = 0; i < extra_live_32; ++i)
+      held[i] = agx_mov_imm(b, 32, 100 + i);
+
+   /* Emit 8 independent device_loads in pressure order (load, immediate use). */
+   b->cursor = agx_after_block(body);
+   for (unsigned i = 0; i < 8; ++i) {
+      agx_index addr_off = agx_iadd(b, off, agx_immediate(i * 4), 0);
+      agx_index val = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *ld = agx_device_load_to(
+         b, val, base, addr_off, AGX_FORMAT_I32, 0x1, 0, 0);
+      ld->memory_can_reorder = true;
+      acc = agx_fadd(b, acc, val);
+   }
+   for (unsigned i = 0; i < extra_live_32; ++i)
+      acc = agx_iadd(b, acc, held[i], 0);
+   agx_device_store(b, acc, agx_uniform(8, AGX_SIZE_64), off, AGX_FORMAT_I32,
+                    0x1, 0, 0);
+
+   agx_ilp_schedule(b->shader);
+
+   if (allocate) {
+      agx_ra(b->shader);
+      EXPECT_FALSE(b->shader->ra_failed);
+      EXPECT_EQ(b->shader->scratch_size_B, 0u);
+      EXPECT_EQ(agx_occupancy_for_register_count(b->shader->max_reg + 1)
+                   .max_threads, 1024u);
+   }
+   unsigned loads_before_first_fadd = 0;
+   agx_foreach_instr_in_block(body, I) {
+      if (I->op == AGX_OPCODE_FADD)
+         break;
+      if (I->op == AGX_OPCODE_DEVICE_LOAD) {
+         if (allocate)
+            EXPECT_EQ(I->dest[0].type, AGX_INDEX_REGISTER);
+         ++loads_before_first_fadd;
+      }
+   }
+   ralloc_free(mem);
+   return loads_before_first_fadd;
+}
+
+TEST(AGX3VisionOpts, Agx3bComputeDeviceLoadIlpWideWindow)
+{
+   EXPECT_EQ(compute_loads_before_first_use(AGX_CHIP_G17P, 0), 8u);
+   EXPECT_EQ(compute_loads_before_first_use(AGX_CHIP_G17P, AGX3B_NUM_REGS / 2),
+             1u);
+   const unsigned m5_loads = compute_loads_before_first_use(AGX_CHIP_G17S, 0);
+   EXPECT_GE(m5_loads, 2u);
+   EXPECT_LE(m5_loads, 4u);
+}
+
+TEST(AGX3VisionOpts, Agx3bDeviceLoadWindowAfterRegisterAllocation)
+{
+   /* Holding one more 32-bit value across the same eight loads leaves room
+    * for six ahead of the first use. Check both allocated schedules, including
+    * their scratch usage and register-count tier. */
+   EXPECT_EQ(compute_loads_before_first_use(AGX_CHIP_G16G, 38, true), 8u);
+   EXPECT_EQ(compute_loads_before_first_use(AGX_CHIP_G16G, 39, true), 6u);
+}

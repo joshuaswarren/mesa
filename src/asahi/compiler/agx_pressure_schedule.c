@@ -1533,13 +1533,15 @@ ilp_block_samples(const agx_context *ctx, const agx_block *block)
 }
 
 static unsigned
-ilp_block_compute_loads(const agx_block *block)
+ilp_block_compute_loads(const agx_block *block, unsigned *device_loads)
 {
-   unsigned loads = 0;
-   agx_foreach_instr_in_block(block, I)
-      loads += I->op == AGX_OPCODE_DEVICE_LOAD ||
-               I->op == AGX_OPCODE_LOCAL_LOAD;
-   return loads;
+   unsigned local_loads = 0;
+   *device_loads = 0;
+   agx_foreach_instr_in_block(block, I) {
+      *device_loads += I->op == AGX_OPCODE_DEVICE_LOAD;
+      local_loads += I->op == AGX_OPCODE_LOCAL_LOAD;
+   }
+   return *device_loads + local_loads;
 }
 
 /* True when a compute block contains a two-level indirect load chain where a
@@ -2077,6 +2079,8 @@ agx_ilp_schedule(agx_context *ctx)
    }
 
    const unsigned budget = dynamic ? agx3_register_budget(ctx) : 0;
+   const signed device_load_cap =
+      shared_compute_loads ? agx_ilp_m5_device_load_cap(program_peak) : 0;
 
    agx_foreach_block(ctx, block) {
       if (block->index >= nr_blocks)
@@ -2092,13 +2096,15 @@ agx_ilp_schedule(agx_context *ctx)
        * load at a time, as it would for samples. A copy block keeps its own
        * schedule. Exclude G18G (AGX3C with emit_agx3d). */
       const bool compute_loads = shared_compute_loads && !copy;
-      const unsigned loads = compute_loads ? ilp_block_compute_loads(block) : 0;
+      unsigned device_loads = 0;
+      const unsigned loads =
+         compute_loads ? ilp_block_compute_loads(block, &device_loads) : 0;
       const unsigned samples = ilp_block_samples(ctx, block);
       const bool small_loop_loads =
          compute_loads && in_loop[block->index] &&
          loads >= AGX_ILP_M5_LOOP_MIN_SAMPLES &&
          samples + loads < AGX_ILP_FS_MIN_SAMPLES &&
-         agx_ilp_m5_device_load_cap(program_peak) > 0 &&
+         device_load_cap > 0 &&
          (!ctx->nir || !ctx->nir->info.cs.has_cooperative_matrix);
       const bool take_compute_hoist =
          (m5_compute || copy || loop_samples) ||
@@ -2144,11 +2150,9 @@ agx_ilp_schedule(agx_context *ctx)
                 * one no instruction has read yet, whichever first fits the
                 * register budget. This ranks candidates; register
                 * pressure and scoreboard waits remain what keeps the schedule
-                * safe. Flat loads keep {4, 2, 1}; two-level indirect load
-                * chains may try wider windows (12, 8) strictly capped to the
-                * program's current occupancy step so wider load overlap never
-                * costs occupancy. */
-               static const unsigned flat_windows[] = {4, 2, 1};
+                * safe. Wider windows for indirect chains and AGX3B device
+                * loads must fit inside the program's current occupancy step. */
+               static const unsigned flat_windows[] = {8, 6, 4, 2, 1};
                static const unsigned chained_windows[] = {12, 8, 4, 2, 1};
                const bool chained =
                   ctx->key->has_scratch &&
@@ -2172,15 +2176,19 @@ agx_ilp_schedule(agx_context *ctx)
                              .max_registers -
                           AGX_ILP_M5_OCCUPANCY_MARGIN
                      : 0;
-               const signed small_cap =
-                  small_loop_loads ? agx_ilp_m5_device_load_cap(program_peak) : 0;
+               const bool wide_flat =
+                  ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                  device_loads == loads && loads > 4 && device_load_cap > peak;
+               const signed step_cap = small_loop_loads || !chained
+                                          ? device_load_cap : occ_step_cap;
                /* Each window first tries interleaving independent ALU chains
                 * while loads are in flight, then the source order. */
                bool scheduled = false;
                for (unsigned w = 0; w < nwindows && !scheduled; ++w) {
+                  if (!chained && windows[w] > 4 && !wide_flat)
+                     continue;
+
                   const bool occ_cap = windows[w] > 4 || small_loop_loads;
-                  const signed step_cap =
-                     small_loop_loads ? small_cap : occ_step_cap;
                   const signed w_growth =
                      occ_cap ? MIN2(load_growth, MAX2(step_cap - peak, 0))
                              : load_growth;
