@@ -8524,18 +8524,21 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
           I->src[2].value == 0 && !I->src[2].abs && !I->src[2].neg)
          I->src[1] = agx_mov_imm(&b, 16, I->src[1].value);
 
-      /* The established 32x32->64 multiply uses register multiplicands.
-       * An unsigned byte immediate has the same value as a zero-extended
-       * dword register. Materialize it before RA instead of asking the
-       * packer for an unsupported wide immediate form. Keep its zero case
-       * available for the existing multiply-by-zero fold. G18G only. */
+      /* The established 32x32->64 multiply uses register multiplicands and
+       * requires both factors to share the same sign extension. A byte
+       * immediate in 1..255 has the same 64-bit value whether sign- or
+       * zero-extended from 32 bits, so match src[0]'s sign extension instead
+       * of forcing unsigned extension. Keep its zero case available for the
+       * existing multiply-by-zero fold. G18G only. */
       if (agx_is_g18g(&ctx->key->dev) &&
           I->op == AGX_OPCODE_IMAD && I->nr_dests == 1 && I->nr_srcs == 3 &&
           I->dest[0].size == AGX_SIZE_64 && I->shift == 0 &&
           I->src[1].type == AGX_INDEX_IMMEDIATE &&
           I->src[1].value > 0 && I->src[1].value <= UINT8_MAX &&
           !I->src[1].abs && !I->src[1].neg) {
-         I->src[1] = agx_abs(agx_mov_imm(&b, 32, I->src[1].value));
+         agx_index imm = agx_mov_imm(&b, 32, I->src[1].value);
+         imm.abs = I->src[0].abs;
+         I->src[1] = imm;
       }
 
       /* Neither register nor immediate multiplication has a grounded
