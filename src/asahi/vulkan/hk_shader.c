@@ -4033,7 +4033,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       lower_indirect_modes |= nir_var_shader_out;
 
-      if (agx_chip_native_or_m5(dev->dev.chip))
+      if (agx_chip_agx3_path(dev->dev.chip))
          lower_indirect_modes |= nir_var_shader_in;
    } else if (nir->info.stage == MESA_SHADER_VERTEX) {
       lower_indirect_modes |= nir_var_shader_in | nir_var_shader_out;
@@ -4049,7 +4049,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * shader input here, after the generic system-value lowering but before IO
     * lowering, so the regular varying linker builds the coefficient binding. */
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
-       agx_chip_native_or_m5(dev->dev.chip)) {
+       agx_chip_agx3_path(dev->dev.chip)) {
       const nir_lower_sysvals_to_varyings_options sysvals_to_varyings = {
          .layer_id = true,
       };
@@ -4063,7 +4063,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * writing gl_TessLevelOuter[gl_InvocationID] therefore stored levels 1/2
     * into other slots, left them zero and culled every patch. Make the
     * levels vectors so indexed accesses become per-component accesses. */
-   if (agx_chip_g17_m5(dev->dev.chip) &&
+   if (agx_chip_hal300_path(dev->dev.chip) &&
        (nir->info.stage == MESA_SHADER_TESS_CTRL ||
         nir->info.stage == MESA_SHADER_TESS_EVAL))
       NIR_PASS(lowered_complex, nir, nir_lower_tess_level_array_vars_to_vec);
@@ -6094,7 +6094,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * SR28 is the compute grid-Z register and does not hold a fragment
        * layer on this generation. */
       NIR_PASS(_, nir, agx_nir_lower_interpolation,
-               agx_chip_native_or_m5(dev->dev.chip));
+               agx_chip_agx3_path(dev->dev.chip));
       if (agx_chip_native_agx3(dev->dev.chip)) {
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   hk_g17p_lower_is_first_fan,
@@ -6160,7 +6160,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
               agx_chip_g17_m5(dev->dev.chip)))
             NIR_PASS(_, nir, agx_nir_preserve_position_order);
          hk_lower_hw_vs(dev, nir, shader, kill_psiz,
-                        agx_chip_native_or_m5(dev->dev.chip),
+                        agx_chip_agx3_path(dev->dev.chip),
                         default_layer, hk_clip_m1_1(dev, features),
                         hk_root_descriptor_offset(draw.no_attachments));
          outputs = nir->info.outputs_written;
@@ -9441,7 +9441,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * output, including a producer that emits no vertices. Other chips keep
        * agx3b's raster variant, which writes no default point size.
        */
-      if (agx_chip_g17_m5(dev->dev.chip))
+      if (agx_chip_hal300_path(dev->dev.chip))
          NIR_PASS(_, rast, nir_lower_default_point_size);
 
       struct hk_shader *shader = &obj->variants[HK_GS_VARIANT_RAST];
@@ -9451,7 +9451,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   NULL);
       }
       hk_lower_hw_vs(dev, rast, shader, false,
-                     agx_chip_native_or_m5(dev->dev.chip),
+                     agx_chip_agx3_path(dev->dev.chip),
                      true, hk_clip_m1_1(dev, features),
                      hk_root_descriptor_offset(draw.no_attachments));
       shader->info.gs = count_variant->info.gs;

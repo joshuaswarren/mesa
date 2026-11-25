@@ -12697,7 +12697,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    {
       const struct hk_shader *fs = hk_bound_fs(cmd);
       const bool fs_reads_hw_layer =
-         !agx_chip_native_or_m5(dev->dev.chip) && fs && fs->info.fs.reads_layer;
+         !agx_chip_agx3_path(dev->dev.chip) && fs && fs->info.fs.reads_layer;
       const uint16_t no_attachments =
          gfx->render.no_attachments && !fs_reads_hw_layer;
       if (gfx->descriptors.root.draw.no_attachments != no_attachments) {
