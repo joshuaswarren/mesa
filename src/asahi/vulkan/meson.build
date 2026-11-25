@@ -12,6 +12,7 @@ hk_files = files(
   'hk_buffer_view.c',
   'hk_bvh_depth_core.c',
   'hk_bvh_depth_core.h',
+  'hk_2d_stencil.h',
   'hk_byte_stencil.h',
   'hk_buffer_view.h',
   'hk_bvh.h',
@@ -80,6 +81,7 @@ hk_files = files(
   'hk_nir_vertex_preamble.c',
   'hk_nir_vertex_preamble.h',
   'hk_nir_root_size.c',
+  'hk_nir_tile_2d_stencil.c',
   'hk_nir_tile_byte_stencil.c',
   'hk_nir_lower_ray_queries.c',
   'hk_nir_lower_robust_image.c',
@@ -667,6 +669,22 @@ if with_tests
     executable(
       'hk_g17p_metadata_grid_test',
       files('tests/test-hk-g17p-metadata-grid.c',
+            'hk_g17p_meta_copy_core.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src,
+                             inc_asahi],
+      dependencies : [idep_mesautil, idep_vulkan_util,
+                      idep_vulkan_runtime_headers],
+      link_with : [libasahi_layout],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'hk_agx3_compressed_buf2img',
+    executable(
+      'hk_agx3_compressed_buf2img_test',
+      files('tests/test-hk-agx3-compressed-buf2img.c',
             'hk_g17p_meta_copy_core.c'),
       include_directories : [include_directories('.'), inc_include, inc_src,
                              inc_asahi],
@@ -1503,6 +1521,12 @@ if with_tests
     timeout : 30, suite : ['asahi'])
   test('hk_byte_stencil', executable('hk_byte_stencil_test',
     files('tests/test-hk-byte-stencil.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk, libasahi_compiler]),
+    timeout : 30, suite : ['asahi'])
+  test('hk_2d_stencil', executable('hk_2d_stencil_test',
+    files('tests/test-hk-2d-stencil.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk, libasahi_compiler]),

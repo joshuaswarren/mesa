@@ -745,3 +745,50 @@ hk_g17p_metadata_tile_index(const struct hk_g17p_metadata_grid *grid,
            (hk_g17p_spread_bits(y_tl & mask) << 1)) +
           ((major & ~mask) << grid->interleave_bits);
 }
+
+bool
+hk_agx3_compressed_buf2img_view_format_supported(VkFormat view_format)
+{
+   switch (view_format) {
+   case VK_FORMAT_R16_UINT:
+   case VK_FORMAT_R8G8B8A8_UINT:
+   case VK_FORMAT_R16G16_UINT:
+   case VK_FORMAT_R32_UINT:
+   case VK_FORMAT_R16G16B16A16_UINT:
+   case VK_FORMAT_R32G32_UINT:
+   case VK_FORMAT_R32G32B32A32_UINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+bool
+hk_agx3_compressed_buf2img_grid_init(
+   uint32_t x0, uint32_t y0, uint32_t width, uint32_t height,
+   uint32_t max_groups_x, uint32_t max_groups_y,
+   struct hk_agx3_compressed_buf2img_grid *grid)
+{
+   if (grid)
+      memset(grid, 0, sizeof(*grid));
+   if (!grid || !width || !height || width - 1 > UINT32_MAX - x0 ||
+       height - 1 > UINT32_MAX - y0)
+      return false;
+
+   const uint32_t tile_x0 = x0 & ~15u;
+   const uint32_t tile_y0 = y0 & ~15u;
+   const uint32_t x1 = x0 + width - 1;
+   const uint32_t y1 = y0 + height - 1;
+   const uint64_t groups_x = ((uint64_t)x1 - tile_x0) / 32 + 1;
+   const uint64_t groups_y = ((uint64_t)y1 - tile_y0) / 16 + 1;
+   if (groups_x > max_groups_x || groups_y > max_groups_y)
+      return false;
+
+   *grid = (struct hk_agx3_compressed_buf2img_grid){
+      .tile_x0 = tile_x0,
+      .tile_y0 = tile_y0,
+      .groups_x = (uint32_t)groups_x,
+      .groups_y = (uint32_t)groups_y,
+   };
+   return true;
+}

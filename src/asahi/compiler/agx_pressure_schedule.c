@@ -1966,7 +1966,7 @@ agx_ilp_schedule(agx_context *ctx)
    uint8_t *size16 = NULL;
    signed occupancy_cap = 0, load_cap = 0, program_peak = 0;
    const bool measure_peak =
-      shared_compute_loads || geometry_copy || m5_fragment;
+      m5_compute || shared_compute_loads || geometry_copy || m5_fragment;
    if (measure_peak || ctx->is_preamble) {
       size16 = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
       if (!size16) {
