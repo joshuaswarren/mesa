@@ -2383,3 +2383,241 @@ agx_opt_pack_bool_or_branch(agx_context *ctx)
    free(def_blocks);
    free(use_count);
 }
+
+struct cold_cmp_use {
+   uint32_t ssa;
+   agx_block *block;
+};
+
+static bool
+agx_block_has_cold_sink_succ(agx_block *block)
+{
+   if (!block->successors[0] || !block->successors[1] ||
+       block->successors[0] == block->successors[1])
+      return false;
+
+   for (unsigned s = 0; s < 2; ++s) {
+      agx_block *succ = block->successors[s];
+      if (succ != block && !succ->loop_header &&
+          agx_num_predecessors(succ) == 1)
+         return true;
+   }
+   return false;
+}
+
+static void
+agx_compute_reach_avoiding(agx_context *ctx, agx_block *start,
+                           agx_block *avoid, BITSET_WORD *reach,
+                           agx_block **queue)
+{
+   memset(reach, 0, BITSET_WORDS(ctx->num_blocks) * sizeof(*reach));
+   if (!start || start == avoid || start->index >= ctx->num_blocks)
+      return;
+
+   unsigned head = 0, tail = 0;
+   BITSET_SET(reach, start->index);
+   queue[tail++] = start;
+
+   while (head < tail) {
+      agx_block *cur = queue[head++];
+      agx_foreach_successor(cur, succ) {
+         if (succ == avoid || succ->index >= ctx->num_blocks ||
+             BITSET_TEST(reach, succ->index))
+            continue;
+         BITSET_SET(reach, succ->index);
+         queue[tail++] = succ;
+      }
+   }
+}
+
+/*
+ * Move I to the start of dest's body: after the preload, else_icmp/else_fcmp
+ * and phi instructions that agx_validate_block_form() requires at the head of
+ * a block. An else block must start with its else_* so the sunk instruction
+ * runs under the else execution mask.
+ */
+static void
+agx_sink_instr_to_block_head(agx_instr *I, agx_block *dest)
+{
+   struct list_head *after = &dest->instructions;
+   agx_foreach_instr_in_block(dest, head) {
+      if (head->op != AGX_OPCODE_PRELOAD && head->op != AGX_OPCODE_ELSE_ICMP &&
+          head->op != AGX_OPCODE_ELSE_FCMP && head->op != AGX_OPCODE_PHI)
+         break;
+      after = &head->link;
+   }
+   list_del(&I->link);
+   list_add(&I->link, after);
+}
+
+/*
+ * A sunk compare must read only SSA values, uniforms and immediates. A
+ * pre-coloured register or memory operand could be overwritten between the
+ * original position and the head of the successor.
+ */
+static bool
+agx_cold_cmp_srcs_sinkable(const agx_instr *I)
+{
+   agx_foreach_src(I, s) {
+      if (I->src[s].type == AGX_INDEX_REGISTER || I->src[s].memory)
+         return false;
+   }
+   return true;
+}
+
+/*
+ * Sink pure FCMP/ICMP instructions whose remaining SSA uses all lie inside a
+ * single-predecessor conditional branch successor (for example, compares that
+ * CSE shared between a hot FCMPSEL selection tree and a cold branch body after
+ * agx_optimizer_forward fused the hot-path select).
+ */
+void
+agx_opt_sink_cold_cmp(agx_context *ctx)
+{
+   const unsigned alloc = ctx->alloc;
+   if (!alloc || ctx->num_blocks < 2)
+      return;
+
+   agx_block **cand_def_block = calloc(alloc, sizeof(*cand_def_block));
+   bool any_cand = false;
+
+   agx_foreach_block(ctx, block) {
+      if (!agx_block_has_cold_sink_succ(block))
+         continue;
+      agx_foreach_instr_in_block(block, I) {
+         if ((I->op != AGX_OPCODE_FCMP && I->op != AGX_OPCODE_ICMP) ||
+             I->nr_dests != 1 || I->saturate ||
+             I->dest[0].type != AGX_INDEX_NORMAL || I->dest[0].memory ||
+             I->dest[0].value >= alloc || !agx_cold_cmp_srcs_sinkable(I))
+            continue;
+         cand_def_block[I->dest[0].value] = block;
+         any_cand = true;
+      }
+   }
+
+   if (!any_cand) {
+      free(cand_def_block);
+      return;
+   }
+
+   uint32_t *use_count = calloc(alloc, sizeof(*use_count));
+   agx_block **single_use_blk = calloc(alloc, sizeof(*single_use_blk));
+   BITSET_WORD *multi_use_blk = BITSET_CALLOC(alloc);
+   struct util_dynarray cand_uses = UTIL_DYNARRAY_INIT;
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_PHI) {
+            agx_foreach_predecessor(block, pred) {
+               unsigned s = agx_predecessor_index(block, *pred);
+               if (s >= I->nr_srcs || I->src[s].type != AGX_INDEX_NORMAL)
+                  continue;
+               unsigned v = I->src[s].value;
+               if (v >= alloc || !cand_def_block[v])
+                  continue;
+               agx_block *ub = *pred;
+               if (ub == cand_def_block[v]) {
+                  cand_def_block[v] = NULL;
+                  continue;
+               }
+               use_count[v]++;
+               if (!single_use_blk[v])
+                  single_use_blk[v] = ub;
+               else if (single_use_blk[v] != ub)
+                  BITSET_SET(multi_use_blk, v);
+               struct cold_cmp_use u = {v, ub};
+               util_dynarray_append(&cand_uses, u);
+            }
+            continue;
+         }
+
+         agx_foreach_ssa_src(I, s) {
+            unsigned v = I->src[s].value;
+            if (v >= alloc || !cand_def_block[v])
+               continue;
+            if (block == cand_def_block[v]) {
+               cand_def_block[v] = NULL;
+               continue;
+            }
+            use_count[v]++;
+            if (!single_use_blk[v])
+               single_use_blk[v] = block;
+            else if (single_use_blk[v] != block)
+               BITSET_SET(multi_use_blk, v);
+            struct cold_cmp_use u = {v, block};
+            util_dynarray_append(&cand_uses, u);
+         }
+      }
+   }
+
+   BITSET_WORD *reach[2] = {NULL, NULL};
+   agx_block **queue = NULL;
+
+   agx_foreach_block(ctx, block) {
+      if (!agx_block_has_cold_sink_succ(block))
+         continue;
+
+      bool reach_valid[2] = {false, false};
+
+      list_for_each_entry_safe_rev(agx_instr, I, &block->instructions, link) {
+         if ((I->op != AGX_OPCODE_FCMP && I->op != AGX_OPCODE_ICMP) ||
+             I->nr_dests != 1 || I->dest[0].type != AGX_INDEX_NORMAL ||
+             I->dest[0].value >= alloc)
+            continue;
+
+         unsigned v = I->dest[0].value;
+         if (cand_def_block[v] != block || use_count[v] == 0)
+            continue;
+
+         agx_block *target = NULL;
+         for (unsigned s = 0; s < 2; ++s) {
+            agx_block *succ = block->successors[s];
+            if (succ == block || succ->loop_header ||
+                agx_num_predecessors(succ) != 1)
+               continue;
+
+            if (!BITSET_TEST(multi_use_blk, v) && single_use_blk[v] == succ) {
+               target = succ;
+               break;
+            }
+
+            if (!reach_valid[s]) {
+               if (!reach[s])
+                  reach[s] = BITSET_CALLOC(ctx->num_blocks);
+               if (!queue)
+                  queue = malloc(ctx->num_blocks * sizeof(*queue));
+               agx_compute_reach_avoiding(ctx, block->successors[1 - s], block,
+                                          reach[s], queue);
+               reach_valid[s] = true;
+            }
+
+            bool all_dominated = true;
+            util_dynarray_foreach(&cand_uses, struct cold_cmp_use, u) {
+               if (u->ssa != v)
+                  continue;
+               if (u->block->index >= ctx->num_blocks ||
+                   BITSET_TEST(reach[s], u->block->index)) {
+                  all_dominated = false;
+                  break;
+               }
+            }
+            if (all_dominated) {
+               target = succ;
+               break;
+            }
+         }
+
+         if (target)
+            agx_sink_instr_to_block_head(I, target);
+      }
+   }
+
+   free(reach[0]);
+   free(reach[1]);
+   free(queue);
+   util_dynarray_fini(&cand_uses);
+   free(multi_use_blk);
+   free(single_use_blk);
+   free(use_count);
+   free(cand_def_block);
+}
