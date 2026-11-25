@@ -10245,27 +10245,48 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
          (dyn->rs.depth_bias.constant_factor != 0.0f ||
           dyn->rs.depth_bias.slope_factor != 0.0f);
       agx_unpack(NULL, &linked->b.fragment_control, FRAGMENT_CONTROL, fc);
+      bool front_face_ccw =
+         dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
+      if (gfx->shaders[MESA_SHADER_TESS_CTRL] &&
+          !gfx->shaders[MESA_SHADER_GEOMETRY]) {
+         front_face_ccw ^= gfx->tess.info.ccw;
+         front_face_ccw ^= dyn->ts.domain_origin ==
+                           VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
+      }
+      const bool is_line = gfx->object_type == AGX_OBJECT_TYPE_LINE;
       const struct agx_ppp_hal300_graphics_fields fields = {
          .fragment_program = fragment_program,
          .varying_table = gfx->varyings,
          .cf_binding_count = cf->nr_bindings,
+         .viewport_count = hk_effective_viewport_count(cmd),
          .cull_mode = (unsigned)dyn->rs.cull_mode,
          .scissor_enable = true,
          .depth_bias_enable = bias_active,
+         .depth_clip_disable = !vk_rasterization_state_depth_clip_enable(&dyn->rs),
+         .polygon_mode = translate_polygon_mode(dyn->rs.polygon_mode),
+         .line_width_valid = is_line,
+         .line_width = is_line ? agx_pack_line_width(dyn->rs.line.width) : 0,
+         .primitive_msaa = is_line &&
+            dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR,
          .occlusion_query_mode = gfx->occlusion.mode,
          .occlusion_query_index = gfx->occlusion.index,
-         .no_color_attachment = render->color_att_count == 0,
+         .no_color_attachment = !hk_m5_has_color(&render->tilebuffer),
+         .no_color_writes = linked->b.g17p_colour_classes == 0,
+         .tag_write_disable =
+            (linked->b.fragment_control.opaque[0] & BITFIELD_BIT(21)) != 0,
+         .fragment_writes_depth = fs->info.fs.epilog_key.write_z,
          .fragment_pass = gfx->effective_fragment_pass_type,
          .disable_tri_merging = fc.disable_tri_merging,
-         .front_face_ccw =
-            dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE,
+         .front_face_ccw = front_face_ccw,
          .point_size_output =
             (hw_vs->info.uvs.osel.opaque[0] & 0x40000) != 0,
+         .layer_output =
+            (hw_vs->info.uvs.osel.opaque[0] & 0x180000) != 0,
          .clip_distance_words = clip_dist_words,
          .object_type =
             gfx->object_type == AGX_OBJECT_TYPE_POINT_SPRITE_UV01
                ? AGX_PPP_HAL300_POINTS
-               : gfx->object_type == AGX_OBJECT_TYPE_LINE
+               : is_line
                   ? AGX_PPP_HAL300_LINES
                   : AGX_PPP_HAL300_TRIANGLES,
          .vertex_varying_components = hw_vs->info.uvs.user_size,
@@ -10298,8 +10319,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
                           linked->b.osel.opaque[0],
          .uvs_words = hw_vs->info.uvs.size,
          .needs_primitive_id = general_varyings && gfx->generate_primitive_id,
-         .flat_shading_vertex =
-            gfx->provoking != 0 ? 2 : 0,
+         .flat_shading_vertex = gfx->provoking,
       };
       struct agx_ppp_hal300_graphics_core state;
       if (!agx_ppp_hal300_graphics_core_pack(dev->dev.chip, &fields, &state)) {
