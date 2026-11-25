@@ -3085,11 +3085,10 @@ hk_g17p_graphics_uniform_ranges(
              (const uint8_t *)set_map +
                 binding->sampler_index_offset_B,
              sizeof(sampler_index));
-      /* G18G publishes AGX2-biased sampler indices (native_sampler_indices
-       * in hk_descriptor_set_layout.c); the combined-sampler pointer path
-       * needs the heap index. */
-      if (dev->dev.chip == AGX_CHIP_G18G)
-         sampler_index = hk_sampler_heap_index(false, sampler_index);
+      sampler_index = hk_sampler_heap_index(
+         set ? set->layout->native_sampler_indices
+             : agx_chip_agx3_path(dev->dev.chip),
+         sampler_index);
 
       const unsigned sampler_element_size =
          agx_chip_sampler_heap_element_size(dev->dev.chip);
