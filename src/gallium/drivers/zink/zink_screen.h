@@ -37,6 +37,24 @@ void
 zink_init_screen_pipeline_libs(struct zink_screen *screen);
 
 
+static inline void
+zink_flush_queue_job_done(void *job, void *gdata, int thread_index)
+{
+   struct zink_screen *screen = (struct zink_screen *)gdata;
+   p_atomic_dec(&screen->flush_queue_jobs);
+}
+
+/* Queue a job on flush_queue, counting it in flush_queue_jobs until it finishes. */
+static inline void
+zink_flush_queue_add_job(struct zink_screen *screen, void *job,
+                         struct util_queue_fence *fence,
+                         util_queue_execute_func execute)
+{
+   p_atomic_inc(&screen->flush_queue_jobs);
+   util_queue_add_job(&screen->flush_queue, job, fence, execute,
+                      zink_flush_queue_job_done, 0);
+}
+
 /* update last_finished to account for batch_id wrapping */
 static inline void
 zink_screen_update_last_finished(struct zink_screen *screen, uint64_t batch_id)

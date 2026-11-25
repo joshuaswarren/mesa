@@ -18956,3 +18956,220 @@ TEST_F(AGX3PackBinary, AGX3CMixedWidthIaddAndByteOffsetEndToEnd)
       ralloc_free(b.shader);
    }
 }
+
+/* On AGX3C (non-G18G), consecutive compute 2D-array shadow samples with
+ * explicit LOD (both register and immediate zero, and both immediate and
+ * register descriptors) allocate disjoint 8-half staging banks (0, 8, 16)
+ * instead of stalling on bank 0, staging each sample's comparison reference at
+ * bank + 4 and its layer or layer/LOD word at bank + 6. */
+TEST_F(AGX3PackBinary, ComputeShadow2DArrayUsesDisjointBanksOnAGX3C)
+{
+   for (bool reg_desc : {false, true}) {
+      for (bool reg_lod : {false, true}) {
+         SCOPED_TRACE(std::string(reg_desc ? "reg-desc/" : "imm-desc/") +
+                      (reg_lod ? "reg-lod" : "imm0-lod"));
+         const auto enc = AGX_ISA_ENCODING_AGX3C;
+         agx_builder *b = builder(enc);
+         key.dev.chip = AGX_CHIP_G17C;
+         key.dev.emit_agx3d = false;
+         b->shader->stage = MESA_SHADER_COMPUTE;
+         b->shader->max_reg = 127;
+
+         const agx_index tex =
+            reg_desc ? agx_register(40, AGX_SIZE_64) : agx_immediate(0);
+         const agx_index smp =
+            reg_desc ? agx_register(44, AGX_SIZE_64) : agx_immediate(0);
+
+         for (unsigned i = 0; i < 3; ++i) {
+            agx_index dest = agx_register(60 + 8 * i, AGX_SIZE_32);
+            dest.channels_m1 = 3;
+            agx_index coord = agx_register(8 + 8 * i, AGX_SIZE_32);
+            coord.channels_m1 = 2;
+            coord.discard = true;
+            agx_index lod = reg_lod ? agx_register(24 + 2 * i, AGX_SIZE_16)
+                                    : agx_immediate(0);
+            if (reg_lod)
+               lod.discard = true;
+            agx_index ref = agx_register(32 + 2 * i, AGX_SIZE_32);
+            ref.discard = true;
+            auto *I = agx_texture_sample_to(
+               b, dest, coord, lod, agx_immediate(0), tex, smp, ref,
+               AGX_DIM_2D_ARRAY, AGX_LOD_MODE_LOD_MIN, 0,
+               false, true, false, AGX_GATHER_NONE, false);
+            I->mask = 1;
+         }
+         agx_stop(b);
+
+         const auto code = pack(b);
+         ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+         EXPECT_TRUE(b->shader->agx3_staging_known);
+         EXPECT_EQ(b->shader->agx3_staging_halfs, 24u);
+
+         for (unsigned i = 0; i < 3; ++i) {
+            const uint16_t bank = 8 * i;
+            const uint8_t stage_slot = reg_desc ? 6 : (1 + i);
+            uint8_t bytes[AGX3_TEX_MAX_LENGTH], len = 0;
+
+            if (reg_lod) {
+               ASSERT_TRUE(agx3_tex_stage_array_lod_at(
+                  enc, bank, (8 + 8 * i) + 4, 24 + 2 * i, stage_slot, 0,
+                  false, true, false, true, bytes, &len));
+            } else {
+               ASSERT_TRUE(agx3_tex_stage_array_layer_at(
+                  enc, bank, (8 + 8 * i) + 4, stage_slot, 0, false, true,
+                  bytes, &len));
+            }
+            EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
+                      code.end())
+               << "missing array staging at bank " << bank;
+
+            ASSERT_TRUE(agx3_tex_stage_copy_hints(
+               enc, bank + 4, 32 + 2 * i, stage_slot, 0, false, true,
+               bytes, &len));
+            EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
+                      code.end())
+               << "missing shadow compare ref staging at bank " << (bank + 4);
+         }
+
+         /* Sample 1 (dest r68) and sample 2 (dest r76) must not retire slot 1
+          * early to reclaim bank 0. */
+         for (uint16_t dst : {68u, 76u}) {
+            uint8_t retire_s1[AGX3_ALU_MAX_LENGTH], rlen = 0;
+            ASSERT_TRUE(agx3_alu_band_identity_wait(enc, dst, 0x1, retire_s1,
+                                                    &rlen));
+            EXPECT_EQ(std::search(code.begin(), code.end(), retire_s1,
+                                  retire_s1 + rlen),
+                      code.end())
+               << "unexpected early slot-1 retirement on dest r" << dst;
+         }
+      }
+   }
+}
+
+/* When a compute 2D-array shadow sample with register descriptors runs while a
+ * prior result is live on slot 6, it must retire slot 6 before staging through
+ * fixed slot 6 (and then reuses slot 6's freed bank). */
+TEST_F(AGX3PackBinary, ComputeShadow2DArrayRegisterDescRetiresLiveSlot6OnAGX3C)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3C;
+   agx_builder *b = builder(enc);
+   key.dev.chip = AGX_CHIP_G17C;
+   key.dev.emit_agx3d = false;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 127;
+
+   /* Five independent 2D samples occupy slots 1..5 (banks 0, 4, 8, 12, 16). */
+   for (unsigned i = 0; i < 5; ++i) {
+      agx_index dest = agx_register(48 + 8 * i, AGX_SIZE_32);
+      dest.channels_m1 = 3;
+      agx_index coord = agx_register(8, AGX_SIZE_32);
+      coord.channels_m1 = 1;
+      auto *I = agx_texture_sample_to(
+         b, dest, coord, agx_immediate(0), agx_immediate(0),
+         agx_immediate(0), agx_immediate(0), agx_null(),
+         AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0,
+         false, false, false, AGX_GATHER_NONE, false);
+      I->mask = 1;
+   }
+
+   /* Sample A (register descriptors, shadow 2D-array, register LOD) takes
+    * result slot 6 and allocates bank 24 (aligned to 8 above bank 16..19). */
+   const agx_index tex = agx_register(40, AGX_SIZE_64);
+   const agx_index smp = agx_register(44, AGX_SIZE_64);
+   for (unsigned i = 0; i < 2; ++i) {
+      agx_index dest = agx_register(96 + 8 * i, AGX_SIZE_32);
+      dest.channels_m1 = 3;
+      agx_index coord = agx_register(16 + 8 * i, AGX_SIZE_32);
+      coord.channels_m1 = 2;
+      coord.discard = true;
+      agx_index lod = agx_register(32 + 2 * i, AGX_SIZE_16);
+      lod.discard = true;
+      agx_index ref = agx_register(36 + 2 * i, AGX_SIZE_32);
+      ref.discard = true;
+      auto *I = agx_texture_sample_to(
+         b, dest, coord, lod, agx_immediate(0), tex, smp, ref,
+         AGX_DIM_2D_ARRAY, AGX_LOD_MODE_LOD_MIN, 0,
+         false, true, false, AGX_GATHER_NONE, false);
+      I->mask = 1;
+   }
+   agx_stop(b);
+
+   const auto code = pack(b);
+   ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+
+   /* Sample B (dest r104, result slot 7) must retire slot 6 (mask 0x20) before
+    * staging on slot 6, and then reuse bank 24 freed by sample A. */
+   uint8_t retire_s6[AGX3_ALU_MAX_LENGTH], rlen = 0;
+   ASSERT_TRUE(agx3_alu_band_identity_wait(enc, 104, 1u << 5, retire_s6, &rlen));
+   auto retire_pos = std::search(code.begin(), code.end(), retire_s6,
+                                 retire_s6 + rlen);
+   ASSERT_NE(retire_pos, code.end())
+      << "missing live slot-6 retirement before second register-desc shadow sample";
+
+   uint8_t stage_b[AGX3_TEX_MAX_LENGTH], slen = 0;
+   ASSERT_TRUE(agx3_tex_stage_array_lod_at(
+      enc, 24, 24 + 4, 34, 6, 0, false, true, false, true, stage_b, &slen));
+   auto stage_pos = std::search(code.begin(), code.end(), stage_b,
+                                stage_b + slen);
+   ASSERT_NE(stage_pos, code.end())
+      << "expected sample B to reuse freed bank 24 after retiring slot 6";
+   EXPECT_LT(retire_pos, stage_pos);
+   EXPECT_EQ(b->shader->agx3_staging_halfs, 32u);
+}
+
+/* Negative cases: compute 2D-array shadow samples with register LOD stay on
+ * bank 0 for AGX3B, for AGX3D (emit_agx3d), and for non-compute stages. */
+TEST_F(AGX3PackBinary, Shadow2DArrayRegisterLodBankZeroOutsideAGX3CCompute)
+{
+   const struct {
+      const char *name;
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      bool agx3d;
+      mesa_shader_stage stage;
+   } cases[] = {
+      {"agx3b-compute", AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false,
+       MESA_SHADER_COMPUTE},
+      {"agx3c-fragment", AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C, false,
+       MESA_SHADER_FRAGMENT},
+      {"agx3d-compute", AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true,
+       MESA_SHADER_COMPUTE},
+   };
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE(c.name);
+      agx_builder *b = builder(c.enc);
+      key.dev.chip = c.chip;
+      key.dev.emit_agx3d = c.agx3d;
+      b->shader->stage = c.stage;
+      b->shader->max_reg = 127;
+
+      for (unsigned i = 0; i < 2; ++i) {
+         agx_index dest = agx_register(60 + 8 * i, AGX_SIZE_32);
+         dest.channels_m1 = 3;
+         agx_index coord = agx_register(8 + 8 * i, AGX_SIZE_32);
+         coord.channels_m1 = 2;
+         coord.discard = true;
+         agx_index lod = agx_register(24 + 2 * i, AGX_SIZE_16);
+         lod.discard = true;
+         agx_index ref = agx_register(32 + 2 * i, AGX_SIZE_32);
+         ref.discard = true;
+         auto *I = agx_texture_sample_to(
+            b, dest, coord, lod, agx_immediate(0),
+            agx_immediate(0), agx_immediate(0), ref,
+            AGX_DIM_2D_ARRAY, AGX_LOD_MODE_LOD_MIN, 0,
+            false, true, false, AGX_GATHER_NONE, false);
+         I->mask = 1;
+      }
+      agx_stop(b);
+
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+      EXPECT_TRUE(b->shader->agx3_staging_known);
+      /* On G18G (emit_agx3d) slot-keyed blocks place slot 2 at 8*(2-1)=8, so
+       * only non-G18G cases keep staging_halfs == 8. */
+      if (!c.agx3d) {
+         EXPECT_EQ(b->shader->agx3_staging_halfs, 8u);
+      }
+   }
+}

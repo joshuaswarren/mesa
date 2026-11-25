@@ -1688,19 +1688,28 @@ agx_g17p_plan_mip_level(const struct agx_resource *rsrc, unsigned level,
 }
 
 static bool
-agx_generate_mipmap_compressed(struct pipe_context *pctx,
-                               struct agx_resource *rsrc,
-                               enum pipe_format format, unsigned base_level,
-                               unsigned last_level, unsigned first_layer,
-                               unsigned last_layer)
+agx_generate_mipmap_sampled(struct pipe_context *pctx,
+                            struct agx_resource *rsrc,
+                            enum pipe_format format, unsigned base_level,
+                            unsigned last_level, unsigned first_layer,
+                            unsigned last_layer)
 {
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(pctx->screen);
    const struct pipe_resource *prsc = &rsrc->base.b;
    const struct ail_layout *layout = &rsrc->layout;
 
-   if (!agx_chip_gen9_color_compression(dev->chip) || !layout->compressed ||
-       layout->policy == AIL_LAYOUT_POLICY_M5 ||
+   /* The shader samples the source and stores Morton-ordered texels directly.
+    * Only the Gen9 compressed layout has a metadata writer here. Gen10 plain
+    * tiles need no metadata and use the same address calculation.
+    */
+   const bool supported_layout =
+      layout->compressed ? agx_chip_gen9_color_compression(dev->chip) &&
+                           layout->policy != AIL_LAYOUT_POLICY_M5
+                         : agx_chip_descriptor_generation(dev->chip) ==
+                              AGX_DESCRIPTOR_GENERATION_10;
+   if (!supported_layout || prsc->width0 > UINT16_MAX + 1u ||
+       prsc->height0 > UINT16_MAX + 1u ||
        prsc->target != PIPE_TEXTURE_2D || prsc->nr_samples > 1 ||
        layout->sample_count_sa != 1 || layout->tiling != AIL_TILING_GPU ||
        layout->format != format || !agx_agx3_mipmap_format_supported(format) ||
@@ -1809,11 +1818,6 @@ agx_generate_mipmap_agx3(struct pipe_context *pctx, struct pipe_resource *prsc,
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(pctx->screen);
    struct agx_resource *rsrc = agx_resource(prsc);
-
-   if (rsrc->layout.compressed)
-      return agx_generate_mipmap_compressed(pctx, rsrc, format, base_level,
-                                            last_level, first_layer,
-                                            last_layer);
 
    if (!agx_generate_mipmap_agx3_supported(dev, rsrc, format, base_level,
                                            last_level, first_layer, last_layer))
@@ -1987,6 +1991,10 @@ agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
                     unsigned last_layer)
 {
    const enum agx_chip chip = agx_device(pctx->screen)->chip;
+   if (agx_generate_mipmap_sampled(pctx, agx_resource(prsc), format, base_level,
+                                   last_level, first_layer, last_layer))
+      return true;
+
    const bool native =
       agx_chip_g17_m5(chip)
          ? agx_generate_mipmap_g17g(pctx, prsc, format, base_level,

@@ -239,20 +239,36 @@ agx_set_shader_images(struct pipe_context *pctx, mesa_shader_stage shader,
          agx_legalize_compression(ctx, rsrc, image->format);
 
          if (image->shader_access & PIPE_IMAGE_ACCESS_WRITE)
-            assert(rsrc->layout.writeable_image);
+            assert(rsrc->layout.writeable_image ||
+                   agx_resource_is_shared_interchange(rsrc));
       }
    }
 
    /* Bind start_slot...start_slot+count */
    for (int i = 0; i < count; i++) {
       const struct pipe_image_view *image = &iviews[i];
+      struct pipe_image_view *dst = &ctx->stage[shader].images[start_slot + i];
 
       if (!image->resource) {
-         util_copy_image_view(&ctx->stage[shader].images[start_slot + i], NULL);
+         util_copy_image_view(dst, NULL);
          ctx->stage[shader].image_mask &= ~BITFIELD64_BIT(start_slot + i);
+      } else if (image->resource->target == PIPE_BUFFER) {
+         unsigned clamped_size = agx_buffer_range_in_resource(
+            image->resource, image->u.buf.offset, image->u.buf.size);
+
+         /* Unbind a buffer image view with no whole elements inside the BO so
+          * neither descriptor packing nor batch tracking addresses past it. */
+         if (!clamped_size ||
+             !agx_texture_buffer_size_el(image->format, clamped_size)) {
+            util_copy_image_view(dst, NULL);
+            ctx->stage[shader].image_mask &= ~BITFIELD64_BIT(start_slot + i);
+         } else {
+            util_copy_image_view(dst, image);
+            dst->u.buf.size = clamped_size;
+            ctx->stage[shader].image_mask |= BITFIELD64_BIT(start_slot + i);
+         }
       } else {
-         util_copy_image_view(&ctx->stage[shader].images[start_slot + i],
-                              image);
+         util_copy_image_view(dst, image);
          ctx->stage[shader].image_mask |= BITFIELD64_BIT(start_slot + i);
       }
    }
@@ -276,6 +292,17 @@ agx_set_shader_buffers(struct pipe_context *pctx, mesa_shader_stage shader,
    util_set_shader_buffers_mask(ctx->stage[shader].ssbo,
                                 &ctx->stage[shader].ssbo_mask, buffers, start,
                                 count);
+
+   /* Every reader of the binding (the shader's bounds, the batch's resource
+    * tracking, the CPU vertex stages) sees only the part inside the buffer. */
+   for (unsigned i = start; i < start + count; ++i) {
+      struct pipe_shader_buffer *sb = &ctx->stage[shader].ssbo[i];
+
+      if (sb->buffer) {
+         sb->buffer_size = agx_buffer_range_in_resource(
+            sb->buffer, sb->buffer_offset, sb->buffer_size);
+      }
+   }
 
    ctx->stage[shader].dirty |= AGX_STAGE_DIRTY_SSBO;
    ctx->stage[shader].ssbo_writable_mask &= ~(BITFIELD_MASK(count) << start);
@@ -1061,6 +1088,10 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
       cfg.unk_mipmapped = rsrc->mipmapped;
       cfg.srgb_2_channel = cfg.srgb && util_format_colormask(desc) == 0x3;
 
+      if (rsrc->layout.compressed &&
+          !ail_is_view_compatible(&rsrc->layout, format))
+         return false;
+
       cfg.compressed = rsrc->layout.compressed;
       cfg.extended = cfg.compressed;
 
@@ -1121,6 +1152,9 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
          cfg.stride = (cfg.width * util_format_get_blocksize(format)) - 16;
       } else if (rsrc->layout.tiling == AIL_TILING_LINEAR) {
          cfg.stride = ail_get_linear_stride_B(&rsrc->layout, 0) - 16;
+      } else if (rsrc->layout.tiling == AIL_TILING_INTERCHANGE) {
+         /* Macroblocks per row minus one in the linear stride field. */
+         cfg.stride = (rsrc->layout.stride_el[0] / 16 - 1) << 4;
       } else {
          cfg.page_aligned_layers = rsrc->layout.page_aligned_layers;
       }
@@ -1737,7 +1771,7 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
                   continue;
 
                struct agx_resource *rsrc = agx_resource(state->cbufs[i].texture);
-               if (!(rsrc->base.b.bind & PIPE_BIND_SHARED) &&
+               if (!agx_resource_is_shared(rsrc) &&
                    rsrc->layout.compressed)
                   agx_decompress(ctx, rsrc, "Render target spilled");
             }
@@ -2247,11 +2281,16 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
       }
 
       /* RGBX/BGRX: the fourth memory channel is void, so the loop leaves
-       * swizzle_a at 0 and the byte takes tile channel 0 (red).  Point it at
+       * swizzle_a at 0 and the channel takes tile channel 0 (red).  Point it at
        * the tile's alpha instead, which agx_nir_lower_tilebuffer fills with
-       * 1.0 for these formats, so X scans out as 0xff.
+       * 1.0 for these formats, so X scans out as opaque all-ones. On G17P/M5
+       * this covers 10-bit RGB10X2/BGR10X2 whose packed RGB10A2 tile word
+       * always carries 1.0 in channel 3.
        */
-      if (dev->chip == AGX_CHIP_G18G && desc->nr_channels == 4 &&
+      if ((dev->chip == AGX_CHIP_G18G ||
+           (agx_chip_native_or_m5(dev->chip) &&
+            cfg.channels == AGX_CHANNELS_R10G10B10A2)) &&
+          desc->nr_channels == 4 &&
           desc->channel[3].type == UTIL_FORMAT_TYPE_VOID)
          cfg.swizzle_a = 3;
 
@@ -2316,6 +2355,10 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
          if (tex->layout.tiling == AIL_TILING_LINEAR) {
             cfg.stride = ail_get_linear_stride_B(&tex->layout, level) - 4;
             cfg.levels = 1;
+         } else if (tex->layout.tiling == AIL_TILING_INTERCHANGE) {
+            /* The field encodes stride_B / 16 - 1, in macroblocks. */
+            cfg.stride = (tex->layout.stride_el[0] / 16) * 16 - 4;
+            cfg.levels = 1;
          } else {
             cfg.page_aligned_layers = tex->layout.page_aligned_layers;
             cfg.levels = tex->base.b.last_level + 1;
@@ -2367,6 +2410,9 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
       }
 
       if (tex->layout.compressed && !emrt) {
+         if (!ail_is_view_compatible(&tex->layout, view->format))
+            return false;
+
          cfg.compressed = true;
          cfg.extended = true;
 
@@ -2566,6 +2612,12 @@ agx_set_constant_buffer(struct pipe_context *pctx, mesa_shader_stage shader,
       u_upload_data_ref(ctx->base.const_uploader, 0, constants->buffer_size, 64,
                         constants->user_buffer, &constants->buffer_offset,
                         &constants->buffer);
+   }
+
+   /* As for shader buffers: only the part of the range inside the buffer. */
+   if (constants->buffer) {
+      constants->buffer_size = agx_buffer_range_in_resource(
+         constants->buffer, constants->buffer_offset, constants->buffer_size);
    }
 
    unsigned mask = (1 << index);
@@ -3892,6 +3944,7 @@ agx_compile_variant(struct agx_device *dev,
    ralloc_free(nir);
    ralloc_free(pre_gs);
    ralloc_free(gs_count);
+   ralloc_free(gs_copy);
    return compiled;
 }
 
@@ -6730,8 +6783,6 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
       struct agx_resource *rsrc = tex->rsrc;
       agx_batch_reads(batch, tex->rsrc);
-      if (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE)
-         agx_batch_note_vs_read(batch, rsrc);
 
       /* Admit only resources covered by the native-backed stored path. */
       if (dev->chip == AGX_CHIP_G18G && rsrc->base.b.nr_samples > 1 &&
@@ -6811,13 +6862,6 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
       struct pipe_image_view *view = &ctx->stage[stage].images[i];
       agx_batch_track_image(batch, view);
-      if (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE) {
-         if ((view->access & PIPE_IMAGE_ACCESS_WRITE) ||
-             (cs->so->info.image_pbe_mask & BITFIELD64_BIT(i)))
-            batch->vs_needs_render_barrier = true;
-         else
-            agx_batch_note_vs_read(batch, agx_resource(view->resource));
-      }
       if (agx_chip_native_or_g18g(dev->chip) &&
           view->resource->target == PIPE_BUFFER)
          batch->stage_uniforms[stage].image_buffer_size[i] =
@@ -6895,6 +6939,19 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
             return;
          }
          continue;
+      }
+
+      /* A shared compressed Interchange image cannot be reallocated with
+       * PIPE_BIND_SHADER_IMAGE in agx_set_shader_images(), leaving
+       * layout.writeable_image false and layout.compressed true. Fail closed
+       * on writable storage-image bindings instead of writing through a
+       * compressed Interchange PBE. */
+      if (!internal && (view->shader_access & PIPE_IMAGE_ACCESS_WRITE) &&
+          view->resource->target != PIPE_BUFFER &&
+          agx_resource_is_shared_interchange(agx_resource(view->resource))) {
+         agx_native_descriptor_reject_batch(
+            batch, "writable interchange storage image");
+         return;
       }
 
       /* The lowered state-0 write, and every G18G image written by native
@@ -8590,14 +8647,14 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
          fresh.length == program.length &&
          !memcmp(fresh.bytes, program.bytes, program.length);
       desc.patchable = false;
-      static unsigned checked, differed;
-      ++checked;
-      if (!same && differed++ < 8)
+      static uint32_t checked, differed;
+      const uint32_t c = p_atomic_inc_return(&checked);
+      if (!same && p_atomic_fetch_add(&differed, 1) < 8)
          fprintf(stderr, "M5_PROGRAM_CACHE differs from a fresh composition "
                          "(stage %u, %zu ranges)\n", stage, count);
-      if (!(checked & (checked - 1)))
+      if (!(c & (c - 1)))
          fprintf(stderr, "M5_PROGRAM_CACHE verified %u programs, %u differed\n",
-                 checked, differed);
+                 c, p_atomic_read(&differed));
    }
    const bool generated = cached ||
       (agx_chip_g17_m5(dev->chip)
@@ -10927,7 +10984,7 @@ agx_g17p_build_mixed_bg_eot(struct agx_batch *batch,
          if (!agx_batch_upload_pbe(
                 batch, agx_pbe_descriptor_at(pbe.cpu, descriptor_size, i),
                 &view, true, true, false, no_compress))
-            agx_native_descriptor_rejected(dev, "mixed MRT end-of-tile PBE");
+            return agx_reject_g17g_tile(batch, "mixed MRT end-of-tile PBE");
       }
 
       const struct agx3_g17p_rt0_eot_program_desc desc = {
@@ -11004,7 +11061,7 @@ agx_g17p_build_mixed_bg_eot(struct agx_batch *batch,
                                              2 * i),
                    agx_resource(surfs[i]->texture), surfs[i]->format,
                    &sampler_view))
-               agx_native_descriptor_rejected(dev, "mixed MRT texture");
+               return agx_reject_g17g_tile(batch, "mixed MRT texture");
          }
 
          const unsigned sampler_size =
@@ -11477,6 +11534,18 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
    if (!descriptor_size)
       return agx_reject_g17g_tile(batch, "background heap geometry");
 
+   if (batch->native_rejected)
+      return (struct asahi_bg_eot){0};
+
+   for (unsigned rt = 0; rt < batch->key.nr_cbufs; ++rt) {
+      const struct pipe_surface *surf = &batch->key.cbufs[rt];
+      if (surf->texture &&
+          !ail_is_view_compatible(&agx_resource(surf->texture)->layout,
+                                  surf->format))
+         return agx_reject_g17g_tile(batch,
+                                     "incompatible compressed render target");
+   }
+
    if (agx_g18_layered_d16_outside_native(dev, batch)) {
       if ((dev->debug & AGX_DBG_FAULTTRACE) && !batch->native_rejected) {
          const struct pipe_surface *zs = &batch->key.zsbuf;
@@ -11772,7 +11841,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
                agx_pbe_descriptor_at(pbe.cpu, descriptor_size, pbe_index++);
             if (!agx_batch_upload_pbe(batch, argument, &view, true, true,
                                       false, no_compress))
-               agx_native_descriptor_rejected(dev, "end-of-tile PBE");
+               return agx_reject_g17g_tile(batch, "end-of-tile PBE");
          }
 
          if (key.store_and_resolve) {
@@ -11784,7 +11853,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
                agx_pbe_descriptor_at(pbe.cpu, descriptor_size, pbe_index++);
             if (!agx_batch_upload_pbe(batch, argument, &view, true, true,
                                       false, false))
-               agx_native_descriptor_rejected(dev, "resolve destination PBE");
+               return agx_reject_g17g_tile(batch, "resolve destination PBE");
          }
 
          struct agx3_g17p_rt0_eot_program_desc desc = {
@@ -11926,7 +11995,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
                if (!agx_pack_texture(descriptor_generation, texture,
                                      agx_resource(attachment->texture),
                                      attachment->format, &sampler_view))
-                  agx_native_descriptor_rejected(dev, "background texture");
+                  return agx_reject_g17g_tile(batch, "background texture");
             }
 
             const unsigned sampler_size =
@@ -12001,7 +12070,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
 
          if (!agx_pack_texture(descriptor_generation, texture.cpu, rsrc,
                                surf->format, &sampler_view))
-            agx_native_descriptor_rejected(dev, "background texture");
+            return agx_reject_g17g_tile(batch, "background texture");
 
          agx_usc_pack(&b, TEXTURE, cfg) {
             /* Shifted to match eMRT indexing, could be optimized */
@@ -12027,7 +12096,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
          bool no_compress = batch->feedback & (PIPE_CLEAR_COLOR0 << rt);
          if (!agx_batch_upload_pbe(batch, pbe.cpu, &view, true, true, false,
                                    no_compress))
-            agx_native_descriptor_rejected(dev, "end-of-tile PBE");
+            return agx_reject_g17g_tile(batch, "end-of-tile PBE");
 
          agx_usc_pack(&b, TEXTURE, cfg) {
             cfg.start = rt;
@@ -12380,7 +12449,7 @@ agx_batch_init_state(struct agx_batch *batch)
 
          if (agx_gallium_shared_compression_supported(
                 agx_chip_descriptor_generation(dev->chip)) ||
-             (rsrc->base.b.bind & PIPE_BIND_SHARED)) {
+             agx_resource_is_shared(rsrc)) {
             agx_decompress_inplace(batch, surf, "Render target spilled");
          } else {
             /* agx_set_framebuffer_state() pre-decompresses spilling private
@@ -12407,6 +12476,10 @@ agx_batch_init_state(struct agx_batch *batch)
       if (batch->key.cbufs[i].texture) {
          struct agx_resource *rsrc = agx_resource(batch->key.cbufs[i].texture);
          unsigned level = batch->key.cbufs[i].level;
+
+         if (!ail_is_view_compatible(&rsrc->layout, batch->key.cbufs[i].format))
+            agx_native_descriptor_reject_batch(
+               batch, "incompatible compressed render target");
 
          if (agx_resource_valid(rsrc, level))
             batch->load |= PIPE_CLEAR_COLOR0 << i;
@@ -14942,7 +15015,6 @@ agx_index_buffer_rsrc_ptr(struct agx_batch *batch,
 
    struct agx_resource *rsrc = agx_resource(info->index.resource);
    agx_batch_reads(batch, rsrc);
-   agx_batch_note_vs_read(batch, rsrc);
 
    *extent =
       ALIGN_POT(rsrc->layout.size_B - rsrc->layout.level_offsets_B[0], 4);
@@ -15299,7 +15371,6 @@ agx_indirect_buffer_ptr(struct agx_batch *batch,
 
    struct agx_resource *rsrc = agx_resource(indirect->buffer);
    agx_batch_reads(batch, rsrc);
-   agx_batch_note_vs_read(batch, rsrc);
    return agx_map_gpu(rsrc) + indirect->offset;
 }
 
@@ -16110,7 +16181,7 @@ agx_legalize_feedback_loop_surf(struct agx_context *ctx,
       return;
 
    /* Decompress if we can and shadow if we can't. */
-   if (rsrc->base.b.bind & PIPE_BIND_SHARED) {
+   if (agx_resource_is_shared(rsrc)) {
       struct agx_batch *batch = agx_get_batch(ctx);
 
       /* If we already did in-place decompression for this one */
@@ -16791,28 +16862,6 @@ agx_multidraw_can_skip_common(struct agx_context *ctx,
    return !agx_needs_passthrough_gs(ctx, info, NULL, &xfb_passthrough, false);
 }
 
-static inline void
-agx_batch_note_draw_prims(struct agx_batch *batch,
-                          const struct pipe_draw_info *info,
-                          const struct pipe_draw_start_count_bias *draw)
-{
-   if (batch->prims_unknown)
-      return;
-
-   if (info->primitive_restart || info->instance_count > 4) {
-      batch->prims_unknown = true;
-      return;
-   }
-
-   uint64_t p = (uint64_t)u_decomposed_prims_for_vertices(info->mode,
-                                                          draw->count) *
-                info->instance_count;
-   if (p > 4 || batch->known_prims + p > 4)
-      batch->known_prims = 5;
-   else
-      batch->known_prims += p;
-}
-
 static bool
 agx_multidraw_can_skip(struct agx_context *ctx,
                        const struct pipe_draw_info *info)
@@ -16827,8 +16876,6 @@ agx_multidraw_emit_body(struct agx_context *ctx, struct agx_batch *batch,
                         uint64_t ib, size_t ib_extent)
 {
    struct agx_device *dev = agx_device(ctx->base.screen);
-
-   agx_batch_note_draw_prims(batch, info, d);
 
    if (ctx->time_elapsed)
       agx_batch_add_timestamp_query(batch, ctx->time_elapsed);
@@ -17314,7 +17361,6 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
       if (clean) {
          struct agx_resource *indirect_rsrc = agx_resource(indirect->buffer);
          agx_batch_reads(clean, indirect_rsrc);
-         agx_batch_note_vs_read(clean, indirect_rsrc);
          indirect_rsrc_base = agx_map_gpu(indirect_rsrc);
          if (info->index_size)
             ib_base = agx_index_buffer_rsrc_ptr(clean, info, &ib_size);
@@ -17672,22 +17718,6 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    struct agx_batch *batch = agx_get_batch(ctx);
    batch->g17g_prims += prims;
    batch->g17g_small_budget |= g17g_budget && g17g_small;
-
-   if (indirect || ctx->cond_query ||
-       ctx->stage[MESA_SHADER_GEOMETRY].shader ||
-       ctx->stage[MESA_SHADER_TESS_EVAL].shader || ctx->in_tess ||
-       ctx->streamout.num_targets ||
-       (ctx->stage[MESA_SHADER_VERTEX].shader &&
-        ctx->stage[MESA_SHADER_VERTEX].shader->info.writes_memory))
-      batch->vs_needs_render_barrier = true;
-
-   if (indirect || info->mode == MESA_PRIM_PATCHES ||
-       ctx->stage[MESA_SHADER_GEOMETRY].shader ||
-       ctx->stage[MESA_SHADER_TESS_EVAL].shader || ctx->in_tess ||
-       ctx->streamout.num_targets)
-      batch->prims_unknown = true;
-   else
-      agx_batch_note_draw_prims(batch, info, draws);
    uint64_t ib = 0;
    size_t ib_extent = 0;
 
@@ -17793,8 +17823,6 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       return;
 
    if (ctx->gs) {
-      batch->vs_needs_render_barrier = true;
-      batch->prims_unknown = true;
       batch->uniforms.geometry_params =
          agx_batch_geometry_params(batch, ib, ib_extent, info, draws, indirect);
 
@@ -17852,6 +17880,8 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    agx_update_descriptors(batch, ctx->vs);
    agx_update_descriptors(batch, ctx->gs);
    agx_update_descriptors(batch, ctx->fs);
+   if (batch->native_rejected)
+      return;
 
    if (IS_DIRTY(VS) || IS_DIRTY(FS) || ctx->gs || IS_DIRTY(VERTEX) ||
        IS_DIRTY(BLEND_COLOR) || IS_DIRTY(QUERY) || IS_DIRTY(POLY_STIPPLE) ||
@@ -18184,7 +18214,6 @@ agx_texture_barrier(struct pipe_context *pipe, unsigned flags)
       return;
 
    agx_flush_all(ctx, "Texture barrier");
-   ctx->batches.barrier_seqnum = ctx->batches.seqnum;
 }
 
 void
@@ -18241,6 +18270,8 @@ agx_launch(struct agx_batch *batch, struct agx_grid grid,
    }
 
    agx_update_descriptors(batch, cs);
+   if (batch->native_rejected)
+      return;
    agx_upload_uniforms(batch, NULL);
 
    struct agx_device *dev = agx_device(ctx->base.screen);

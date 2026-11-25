@@ -4650,6 +4650,9 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
        m5_fragment_3d);
    const bool combined_array_lod = array && !cube && !staged_offset &&
       ((explicit_lod && !immediate_lod) || register_bias || min_lod);
+   const bool banked_shadow_array = enc == AGX_ISA_ENCODING_AGX3C &&
+      compute_stage && array && !cube && shadow && explicit_lod && !offset &&
+      !query_lod && !I->sparse && (bank_base & 7) == 0;
    const bool relocatable_array = array && !cube && !register_operands &&
       !query_lod && !staged_offset && !register_offset &&
       !combined_array_lod && !gradient_lod && !bias_min && !gradient_min &&
@@ -4657,7 +4660,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
    if (bank_base != 0 &&
        ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
         native_staged_coords ||
-        (array && !relocatable_array &&
+        (array && !relocatable_array && !banked_shadow_array &&
          !(enc == AGX_ISA_ENCODING_AGX3B && vertex_stage &&
            explicit_lod && immediate_lod && !shadow && !offset)) ||
         (three_d && !m5_banked_3d &&
@@ -4797,8 +4800,9 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
          return agx3_tex_decline(I, __LINE__);
       wait_mask = 0;
    } else if (combined_array_lod) {
-      if (!agx3_tex_stage_array_lod(
-             enc, I->src[0].value + 4, I->src[1].value, stage_slot, wait_mask,
+      if (!agx3_tex_stage_array_lod_at(
+             enc, bank_base, I->src[0].value + 4, I->src[1].value, stage_slot,
+             wait_mask,
              enc == AGX_ISA_ENCODING_AGX3C ? !I->src[0].discard
                                            : I->src[0].cache,
              I->src[0].discard,
@@ -8751,62 +8755,10 @@ agx3_slot_live_before(const struct agx3_slot_instr *sl,
    }
 }
 
-/* What emission knows about the generations in flight: the outstanding
- * slots, which of them are image writes and which write r0, and the staging
- * halves their consumers still read. At the arms of an if it joins as slot
- * assignment does (agx3_slot_core.h). */
-struct agx3_emit_slots {
-   uint16_t outstanding, image_writes, r0_inflight;
-   struct agx3_staging_banks staging;
-};
-
 struct agx3_emit_level {
    bool arm, has_else, loop, has_break;
    struct agx3_emit_slots at_if, then_end, breaks;
 };
-
-static void
-agx3_emit_slots_capture(struct agx3_emit_slots *to, uint16_t outstanding,
-                        uint16_t image_writes,
-                        const struct agx3_staging_banks *staging)
-{
-   to->outstanding = outstanding;
-   to->image_writes = image_writes;
-   to->r0_inflight = agx3_r0_inflight;
-   to->staging = *staging;
-}
-
-static void
-agx3_emit_slots_join(const struct agx3_emit_slots *from, uint16_t *outstanding,
-                     uint16_t *image_writes,
-                     struct agx3_staging_banks *staging)
-{
-   *outstanding |= from->outstanding;
-   *image_writes |= from->image_writes;
-   agx3_r0_inflight |= from->r0_inflight;
-   for (unsigned i = 0; i < from->staging.end; ++i)
-      staging->readers[i] |= from->staging.readers[i];
-   staging->end = MAX2(staging->end, from->staging.end);
-}
-
-/* A break joins what is in flight into the state its loop's pop resumes. */
-static void
-agx3_emit_slots_add(struct agx3_emit_slots *to, bool *has, uint16_t outstanding,
-                    uint16_t image_writes,
-                    const struct agx3_staging_banks *staging)
-{
-   if (!*has) {
-      agx3_emit_slots_capture(to, outstanding, image_writes, staging);
-      *has = true;
-      return;
-   }
-   to->outstanding |= outstanding;
-   to->image_writes |= image_writes;
-   to->r0_inflight |= agx3_r0_inflight;
-   for (unsigned i = 0; i < staging->end; ++i)
-      to->staging.readers[i] |= staging->readers[i];
-   to->staging.end = MAX2(to->staging.end, staging->end);
-}
 
 static int
 agx3_try_control_flow(struct util_dynarray *emission,
@@ -14712,7 +14664,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 !agx3_append(emission, bytes, len))
                AGX3_REFUSE(I);
             outstanding = 0;
+            agx3_r0_inflight &= (uint16_t)~retire;
             image_write_slots &= (uint16_t)~retire;
+            local_read_load_only_slots &= (uint16_t)~retire;
             agx3_staging_forget(&staging_banks, retire);
             mesh_exports_pending = false;
             if (I->imm == AGX_MESH_EXPORT_FENCE_INDICES)
@@ -14821,6 +14775,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                cf_wait = 0;
                cf_outstanding = 0;
                outstanding = 0;
+               agx3_r0_inflight &= (uint16_t)~retire;
+               image_write_slots &= (uint16_t)~retire;
+               local_read_load_only_slots &= (uint16_t)~retire;
+               agx3_staging_release(&staging_banks, 0);
             }
          }
 
@@ -14903,25 +14861,34 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             if (cf_e->cf_else && cf_depth && cf_level[cf_depth - 1].arm) {
                struct agx3_emit_level *L = &cf_level[cf_depth - 1];
                agx3_emit_slots_capture(&L->then_end, outstanding,
-                                       image_write_slots, &staging_banks);
+                                       image_write_slots, agx3_r0_inflight,
+                                       local_read_load_only_slots,
+                                       &staging_banks);
                L->has_else = true;
                agx3_emit_slots_join(&L->at_if, &outstanding,
-                                    &image_write_slots, &staging_banks);
+                                    &image_write_slots, &agx3_r0_inflight,
+                                    &local_read_load_only_slots,
+                                    &staging_banks);
             }
             if (cf_e->cf_break && cf_e->cf_break <= cf_depth) {
                struct agx3_emit_level *L = &cf_level[cf_depth - cf_e->cf_break];
                agx3_emit_slots_add(&L->breaks, &L->has_break, outstanding,
-                                   image_write_slots, &staging_banks);
+                                   image_write_slots, agx3_r0_inflight,
+                                   local_read_load_only_slots, &staging_banks);
             }
             for (unsigned p = 0; p < cf_e->cf_pop && cf_depth; ++p) {
                const struct agx3_emit_level *L = &cf_level[--cf_depth];
                if (L->arm)
                   agx3_emit_slots_join(L->has_else ? &L->then_end : &L->at_if,
                                        &outstanding, &image_write_slots,
+                                       &agx3_r0_inflight,
+                                       &local_read_load_only_slots,
                                        &staging_banks);
                if (L->loop && L->has_break)
                   agx3_emit_slots_join(&L->breaks, &outstanding,
-                                       &image_write_slots, &staging_banks);
+                                       &image_write_slots, &agx3_r0_inflight,
+                                       &local_read_load_only_slots,
+                                       &staging_banks);
             }
             for (unsigned p = 0; p < cf_e->cf_push && cf_depth < cf_levels;
                  ++p) {
@@ -14932,7 +14899,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                L->has_break = false;
                if (L->arm)
                   agx3_emit_slots_capture(&L->at_if, outstanding,
-                                          image_write_slots, &staging_banks);
+                                          image_write_slots, agx3_r0_inflight,
+                                          local_read_load_only_slots,
+                                          &staging_banks);
             }
             if (loop_entry_push)
                loop_depth++;
@@ -15943,11 +15912,18 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
                   I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
                  I->src[1].type == AGX_INDEX_IMMEDIATE));
+            const bool banked_shadow_array =
+               enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
+               ctx->stage == MESA_SHADER_COMPUTE && I->dim == AGX_DIM_2D_ARRAY &&
+               I->shadow && !I->offset && !I->query_lod && !I->sparse &&
+               I->gather == AGX_GATHER_NONE &&
+               I->lod_mode == AGX_LOD_MODE_LOD_MIN;
             const bool relocatable_coordinates =
                (enc == AGX_ISA_ENCODING_AGX3B ||
                 enc == AGX_ISA_ENCODING_AGX3C) && slot != 0 &&
                !native_staged_coords &&
-               (m5_banked_3d || relocatable_2d_array || I->dim == AGX_DIM_2D ||
+               (m5_banked_3d || relocatable_2d_array || banked_shadow_array ||
+                I->dim == AGX_DIM_2D ||
                 (enc == AGX_ISA_ENCODING_AGX3B &&
                  (I->dim == AGX_DIM_3D ||
                   (I->dim == AGX_DIM_2D_ARRAY && !I->shadow && !I->offset)) &&
@@ -15956,7 +15932,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                  I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
                  I->src[1].type == AGX_INDEX_IMMEDIATE)) &&
                !I->query_lod && !(I->offset && !I->offset_xyz) &&
-               (m5_banked_3d || relocatable_2d_array ||
+               (m5_banked_3d || relocatable_2d_array || banked_shadow_array ||
                 I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
                 ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
                   I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
@@ -16011,6 +15987,22 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                agx3_staging_release(&staging_banks, outstanding_here);
                if (relocatable_coordinates) {
                   assert(staged_sample);
+                  /* A 2D-array sample with register descriptors stages on
+                   * fixed slot 6 (agx3_emit_texture_sample). Retire any live
+                   * slot-6 result before staging so reissuing slot 6 cannot
+                   * satisfy an older consumer early. */
+                  const bool register_operands =
+                     I->src[3].type == AGX_INDEX_REGISTER ||
+                     I->src[4].type == AGX_INDEX_REGISTER;
+                  if (banked_shadow_array && register_operands &&
+                      (outstanding_here & (1u << 5))) {
+                     if (!agx3_retire_result_wait(emission, enc, I, 1u << 5))
+                        AGX3_REFUSE(I);
+                     outstanding &= (uint16_t)~(1u << 5);
+                     if (slot)
+                        outstanding |= (uint16_t)(1u << (slot - 1));
+                     agx3_staging_forget(&staging_banks, 1u << 5);
+                  }
                   if (!agx3_allocate_staging(emission, enc, I, &staging_banks,
                                              &outstanding, slot, sample_span,
                                              fixed_gradient_staging,
@@ -17443,7 +17435,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 !agx3_append(emission, fence, fence_len))
                AGX3_REFUSE(I);
             outstanding &= (uint16_t)~retire;
+            agx3_r0_inflight &= (uint16_t)~retire;
             image_write_slots &= (uint16_t)~retire;
+            local_read_load_only_slots &= (uint16_t)~retire;
             agx3_staging_forget(&staging_banks, retire);
             continue;
          }
@@ -17861,7 +17855,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             const uint16_t completed =
                retire | (texture_wait && !m5_texture ? 1u : 0);
             outstanding &= (uint16_t)~completed;
+            agx3_r0_inflight &= (uint16_t)~completed;
             image_write_slots &= (uint16_t)~completed;
+            local_read_load_only_slots &= (uint16_t)~completed;
             agx3_staging_forget(&staging_banks, completed);
             continue;
          }

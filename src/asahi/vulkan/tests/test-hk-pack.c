@@ -9,6 +9,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
 #include "hk_compute_pair.h"
+#include "hk_compute_pair_interval.h"
 #include "hk_pack.h"
 #include "hk_queue.h"
 
@@ -1527,6 +1528,158 @@ test_compute_pair_stream_safety(void)
 
    cs = base; cs.type = HK_CS_VDM;
    T("compute_pair rejects non-CDM stream", !hk_compute_pair_stream_eligible(&cs));
+
+   /* Self-copy & shifted-overlap safety checks for identity_copy4 kinds. */
+   struct hk_storage_backing b_same[3] = {
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+      {0},
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+   };
+   bool same = false;
+   /* LINEAR_OFFSET shifted overlap on same BO (so != doff) must be rejected. */
+   T("copy4 rejects LINEAR_OFFSET shifted overlap",
+     !hk_copy4_classify_intervals(false, 1, b_same, 0, 64, 256, &same));
+   /* Same BO offset with aliased/mismatched VA must be rejected. */
+   struct hk_storage_backing b_va_diff[3] = {
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+      {0},
+      {.handle = 7, .offset = 0x1000, .address = 0x200000},
+   };
+   T("copy4 rejects same-BO aliased VA self-copy",
+     !hk_copy4_classify_intervals(false, 1, b_va_diff, 0, 0, 256, &same));
+   /* IM2COL_1X1 in-place (stride=1, kw==channels identity) classifies as self-copy. */
+   same = false;
+   T("copy4 accepts IM2COL_1X1 exact in-place as self-copy",
+     hk_copy4_classify_intervals(false, 1, b_same, 0, 0, 256, &same) && same);
+   /* IM2COL_1X1 shifted overlap on same BO must be rejected. */
+   T("copy4 rejects IM2COL_1X1 shifted overlap",
+     !hk_copy4_classify_intervals(false, 1, b_same, 0, 64, 256, &same));
+   /* LINEAR_FADD (nsrc==2) in-place is allowed but NEVER classified as self-copy. */
+   struct hk_storage_backing b_fadd[3] = {
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+      {.handle = 8, .offset = 0x2000, .address = 0x200000},
+      {.handle = 7, .offset = 0x1000, .address = 0x100000},
+   };
+   same = true;
+   T("copy4 accepts LINEAR_FADD in-place without self-copy",
+     hk_copy4_classify_intervals(true, 2, b_fadd, 0, 0, 256, &same) && !same);
+   /* LINEAR_FADD shifted overlap on same BO must be rejected. */
+   T("copy4 rejects LINEAR_FADD shifted overlap",
+     !hk_copy4_classify_intervals(true, 2, b_fadd, 0, 64, 256, &same));
+}
+
+static struct hk_storage_backing
+fadd_backing(uint32_t handle, uint64_t offset, uint32_t size)
+{
+   return (struct hk_storage_backing){
+      .address = ((uint64_t)handle << 24) + offset,
+      .offset = offset,
+      .size = size,
+      .handle = handle,
+   };
+}
+
+/* Submit-time FADD + copy4 dual-write fusion gate: the fused shader writes the
+ * copy4 destination (dst2) while it still reads both FADD sources, so any
+ * overlap between dst2 and the FADD output or reads must keep the two
+ * dispatches separate. Overlap is decided on BO intervals, so a second
+ * descriptor with a different buffer offset that reaches the same bytes
+ * counts as an overlap. */
+static void
+test_fadd_copy4_fusion_gate(void)
+{
+   enum { SRC0 = 1, SRC1 = 2, OUT = 3, OTHER = 4 };
+   const uint32_t bytes = 1024, size = 4096;
+
+   struct hk_compute_pair_dispatch fadd = {0};
+   fadd.info.role = HK_COMPUTE_PAIR_FADD;
+   fadd.info.fadd_push_bytes = 4;
+   fadd.alt_kind = HK_COMPUTE_PAIR_ALT_LINEAR_FADD;
+   fadd.extra.copy4 = (struct hk_compute_pair_copy4){0, 0, bytes};
+   fadd.bindings[0] = fadd_backing(SRC0, 0, size);
+   fadd.bindings[1] = fadd_backing(SRC1, 0, size);
+   fadd.bindings[2] = fadd_backing(OUT, 0, size);
+
+   struct hk_compute_pair_dispatch copy = {0};
+   copy.info.role = HK_COMPUTE_PAIR_COPY4;
+   copy.extra.copy4 = (struct hk_compute_pair_copy4){0, 0, bytes};
+   copy.bindings[0] = fadd.bindings[2];
+   copy.bindings[1] = fadd_backing(OTHER, 0, size);
+
+   struct hk_compute_pair_dispatch f, c;
+   T("fadd+copy4 fuses with dst2 in another BO",
+     hk_compute_pair_fadd_copy4_match(&fadd, &copy));
+
+   /* dst2 in the output's BO, through the output's own descriptor. */
+   c = copy; c.bindings[1] = fadd.bindings[2]; c.extra.copy4.dst_start = bytes;
+   T("fadd+copy4 fuses with dst2 right after the output",
+     hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c.extra.copy4.dst_start = bytes / 2;
+   T("fadd+copy4 rejects dst2 half over the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c.extra.copy4.dst_start = bytes - 16;
+   T("fadd+copy4 rejects dst2 sharing the last vec4 of the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+
+   /* dst2 through a second descriptor on the output's BO: offsets differ but
+    * the GPU ranges intersect. */
+   c = copy; c.bindings[1] = fadd_backing(OUT, 768, bytes);
+   T("fadd+copy4 rejects another descriptor overlapping the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(OUT, 0, size);
+   c.extra.copy4.dst_start = 0;
+   T("fadd+copy4 rejects dst2 equal to the output via a second descriptor",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(OUT, 512, size - 512);
+   c.extra.copy4.dst_start = 1024;
+   T("fadd+copy4 fuses with a second descriptor past the output",
+     hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c.extra.copy4.dst_start = 256;
+   T("fadd+copy4 rejects a second descriptor ending inside the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(OUT, 0, size);
+   f = fadd; f.extra.copy4.dst_start = 2048;
+   f.extra.copy4.src_start = 2048;
+   c.extra.copy4.src_start = 2048;
+   c.extra.copy4.dst_start = 1536;
+   T("fadd+copy4 rejects dst2 covering the start of an offset output",
+     !hk_compute_pair_fadd_copy4_match(&f, &c));
+
+   /* dst2 over either FADD source, which the fused shader still reads. */
+   c = copy; c.bindings[1] = fadd_backing(SRC1, 512, size - 512);
+   T("fadd+copy4 rejects dst2 overlapping src1 via another descriptor",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(SRC0, bytes - 16, size - bytes);
+   T("fadd+copy4 rejects dst2 sharing the last vec4 of src0",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(SRC0, bytes, size - bytes);
+   T("fadd+copy4 fuses with dst2 right after src0",
+     hk_compute_pair_fadd_copy4_match(&fadd, &c));
+
+   /* In-place FADD (src0 == output). */
+   f = fadd; f.bindings[0] = fadd.bindings[2];
+   T("in-place fadd+copy4 fuses with disjoint dst2",
+     hk_compute_pair_fadd_copy4_match(&f, &copy));
+   c = copy; c.bindings[1] = fadd_backing(OUT, 512, size - 512);
+   T("in-place fadd+copy4 rejects dst2 over the in-place range",
+     !hk_compute_pair_fadd_copy4_match(&f, &c));
+
+   /* The copy must read exactly what the FADD wrote. */
+   c = copy; c.extra.copy4.src_start = 16;
+   T("fadd+copy4 rejects a shifted copy source",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.extra.copy4.bytes = bytes / 2;
+   T("fadd+copy4 rejects a partial copy of the output",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[0] = fadd_backing(OUT, 16, size - 16);
+   T("fadd+copy4 rejects a copy source through a shifted descriptor",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   c = copy; c.bindings[1] = fadd_backing(OTHER, 4, size - 4);
+   T("fadd+copy4 rejects an unaligned dst2",
+     !hk_compute_pair_fadd_copy4_match(&fadd, &c));
+   f = fadd; f.alt_kind = HK_COMPUTE_PAIR_ALT_NONE;
+   T("fadd+copy4 requires the linear FADD alternate",
+     !hk_compute_pair_fadd_copy4_match(&f, &copy));
 }
 
 /* A packet that carried a fused compute-pair dispatch is reused like any
@@ -1609,6 +1762,7 @@ main(int argc, char **argv)
    test_packet_reuse(false);
    test_span_pool_policy();
    test_compute_pair_stream_safety();
+   test_fadd_copy4_fusion_gate();
    test_fused_packet_reuse(false);
    test_pack_add_bo();
    printf("%u tests, %u failures\n", tests, failures);

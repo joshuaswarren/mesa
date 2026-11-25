@@ -55,6 +55,7 @@ struct swtnl_texture {
    uint32_t img_stride[PIPE_MAX_TEXTURE_LEVELS];
    uint32_t mip_offsets[PIPE_MAX_TEXTURE_LEVELS];
    uint8_t swizzle[4];
+   bool bound;
 };
 
 struct swtnl_tgsi_buffer {
@@ -1763,6 +1764,11 @@ agx_swtnl_applies(struct agx_context *ctx)
 }
 
 
+/* The draw module takes 32-bit strides and offsets, and samples with signed
+ * 32-bit offsets: a copy or buffer texture larger than llvmpipe's limit for
+ * the same sampling code (2 GiB) does not fit, so the draw goes without it. */
+#define AGX_SWTNL_MAX_TEXTURE_BYTES (1ull << 31)
+
 static bool
 swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
                   struct pipe_sampler_view *view, struct swtnl_texture *out)
@@ -1773,6 +1779,7 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
    uint32_t img_stride[PIPE_MAX_TEXTURE_LEVELS] = {0};
    uint32_t mip_offsets[PIPE_MAX_TEXTURE_LEVELS] = {0};
 
+   /* Multisampled views are not copied: the draw goes without them. */
    if (tex->nr_samples > 1)
       return false;
 
@@ -1782,16 +1789,23 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
    if (tex->target == PIPE_BUFFER || view->target == PIPE_BUFFER) {
       if (!bs)
          return false;
-      const unsigned off = MIN2(view->u.buf.offset, tex->width0);
-      const unsigned avail = tex->width0 - off;
-      const unsigned copy_size = MIN2(view->u.buf.size, avail);
-      uint8_t *data = calloc(1, copy_size + 64);
+      const unsigned avail =
+         agx_buffer_range_in_resource(tex, view->u.buf.offset, view->u.buf.size);
+      /* In elements, clamped to the GPU path's texture-buffer limit so
+       * textureSize() matches across CPU and GPU paths, and sized by what the
+       * shader can sample rather than the whole backing buffer. */
+      const unsigned elems = agx_texture_buffer_size_el(format, avail);
+      const uint64_t copy_size = (uint64_t)elems * bs;
+      if (copy_size > AGX_SWTNL_MAX_TEXTURE_BYTES)
+         return false;
+      uint8_t *data = calloc(1, (size_t)copy_size + 64);
       if (!data)
          return false;
       if (copy_size) {
          struct pipe_transfer *xfer = NULL;
          const void *map =
-            pipe_buffer_map_range(pctx, tex, off, copy_size, PIPE_MAP_READ, &xfer);
+            pipe_buffer_map_range(pctx, tex, view->u.buf.offset, copy_size,
+                                  PIPE_MAP_READ, &xfer);
          if (!map) {
             free(data);
             return false;
@@ -1799,7 +1813,6 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
          memcpy(data, map, copy_size);
          pipe_buffer_unmap(pctx, xfer);
       }
-      const unsigned elems = copy_size / bs;
       row_stride[0] = copy_size;
       img_stride[0] = copy_size;
       draw_set_mapped_texture(ctx->swtnl_draw, s, i, elems, 1, 1, 0, 0, 1, 0,
@@ -1812,6 +1825,7 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
       out->swizzle[1] = view->swizzle_g;
       out->swizzle[2] = view->swizzle_b;
       out->swizzle[3] = view->swizzle_a;
+      out->bound = true;
       return true;
    }
 
@@ -1825,15 +1839,21 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
    const unsigned layers =
       array ? view->u.tex.last_layer - view->u.tex.first_layer + 1 : 1;
 
-   size_t size = 0;
+   uint64_t size = 0;
    for (unsigned l = first_level; l <= last_level; ++l) {
       const unsigned w = u_minify(tex->width0, l), h = u_minify(tex->height0, l);
       const unsigned d = tex->target == PIPE_TEXTURE_3D ? u_minify(tex->depth0, l)
                                                          : layers;
-      mip_offsets[l] = size;
-      row_stride[l] = util_format_get_stride(format, w);
-      img_stride[l] = row_stride[l] * util_format_get_nblocksy(format, h);
-      size += (size_t)img_stride[l] * d;
+      const uint64_t row_B = util_format_get_stride(format, w);
+      const uint64_t img_B = row_B * util_format_get_nblocksy(format, h);
+
+      size += img_B * d;
+      if (size > AGX_SWTNL_MAX_TEXTURE_BYTES)
+         return false;
+
+      mip_offsets[l] = size - img_B * d;
+      row_stride[l] = row_B;
+      img_stride[l] = img_B;
    }
 
    uint8_t *data = calloc(1, size + 64);
@@ -1889,6 +1909,7 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
    out->swizzle[1] = view->swizzle_g;
    out->swizzle[2] = view->swizzle_b;
    out->swizzle[3] = view->swizzle_a;
+   out->bound = true;
    return true;
 }
 
@@ -1931,11 +1952,13 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    uint8_t *ssbo_shadow[MESA_SHADER_FRAGMENT][PIPE_MAX_SHADER_BUFFERS] = {0};
    uint8_t *ssbo_mapped[MESA_SHADER_FRAGMENT][PIPE_MAX_SHADER_BUFFERS] = {0};
    unsigned ssbo_size[MESA_SHADER_FRAGMENT][PIPE_MAX_SHADER_BUFFERS] = {0};
+   unsigned cb_masks[MESA_SHADER_FRAGMENT] = {0};
    struct pipe_transfer *vb_transfers[PIPE_MAX_ATTRIBS] = {0};
    struct pipe_transfer *so_transfers[PIPE_MAX_SO_BUFFERS] = {0};
    struct pipe_transfer *ib_transfer = NULL;
    struct draw_so_target targets[PIPE_MAX_SO_BUFFERS];
    struct draw_so_target *target_ptrs[PIPE_MAX_SO_BUFFERS] = {0};
+   bool mapped = true;
 
    struct agx_uncompiled_shader *vs = ctx->stage[MESA_SHADER_VERTEX].shader;
    struct agx_uncompiled_shader *tcs = ctx->stage[MESA_SHADER_TESS_CTRL].shader;
@@ -2029,7 +2052,8 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       } else if (vb->buffer.resource) {
          ptr = map_buffer(ctx, vb->buffer.resource, PIPE_MAP_READ,
                           &vb_transfers[i]);
-         size = vb->buffer.resource->width0;
+         size = ptr ? vb->buffer.resource->width0 : 0;
+         mapped &= ptr != NULL;
       }
       draw_set_mapped_vertex_buffer(draw, i, ptr, size);
    }
@@ -2042,7 +2066,8 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       } else {
          indices = map_buffer(ctx, info->index.resource, PIPE_MAP_READ,
                               &ib_transfer);
-         available = info->index.resource->width0;
+         available = indices ? info->index.resource->width0 : 0;
+         mapped &= indices != NULL;
       }
       draw_set_indexes(draw, indices, info->index_size, available);
    }
@@ -2067,28 +2092,26 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       const int tgsi_idx = s == MESA_SHADER_VERTEX ? 0
                          : s == MESA_SHADER_GEOMETRY ? 1 : -1;
 
-      u_foreach_bit(i, stage->cb_mask) {
-         const struct pipe_constant_buffer *cb = &stage->cb[i];
-         const uint8_t *ptr = cb->user_buffer;
-
-         if (!ptr && cb->buffer) {
-            ptr = map_buffer(ctx, cb->buffer, PIPE_MAP_READ, &transfers[s][i]);
-            if (ptr)
-               ptr += cb->buffer_offset;
-         }
-         draw_set_mapped_constant_buffer(draw, s, i, ptr, cb->buffer_size);
+      cb_masks[s] = stage->cb_mask;
+      u_foreach_bit(i, cb_masks[s]) {
+         mapped &= agx_cpu_bind_constant_buffer(ctx, draw, s, i,
+                                                &transfers[s][i]);
       }
 
       /* Storage buffers: the executor's tessellation and geometry stages
        * read their inputs and write their results through them. */
       u_foreach_bit(i, stage->ssbo_mask) {
+         /* The range bound, clamped to the buffer by
+          * agx_set_shader_buffers(). */
          const struct pipe_shader_buffer *sb = &stage->ssbo[i];
+         const unsigned size = sb->buffer ? sb->buffer_size : 0;
          uint8_t *ptr = NULL;
 
-         if (sb->buffer) {
+         if (size) {
             ptr = (uint8_t *)map_buffer(ctx, sb->buffer,
                                         PIPE_MAP_READ | PIPE_MAP_WRITE,
                                         &ssbo_transfers[s][i]);
+            mapped &= ptr != NULL;
             if (ptr)
                ptr += sb->buffer_offset;
          }
@@ -2096,19 +2119,21 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
           * cacheable memory: on the write-combined BO mapping they raised
           * SIGBUS (GLES31 opaque_type_indexing.atomic_counter.*_geometry).
           * Run the stages on a shadow copy and write it back after. */
-         if (ptr && sb->buffer_size) {
-            ssbo_shadow[s][i] = malloc(sb->buffer_size);
+         if (ptr) {
+            ssbo_shadow[s][i] = malloc(size);
             if (ssbo_shadow[s][i]) {
-               memcpy(ssbo_shadow[s][i], ptr, sb->buffer_size);
+               memcpy(ssbo_shadow[s][i], ptr, size);
                ssbo_mapped[s][i] = ptr;
-               ssbo_size[s][i] = sb->buffer_size;
-               ptr = ssbo_shadow[s][i];
+               ssbo_size[s][i] = size;
+            } else {
+               mapped = false;
             }
+            ptr = ssbo_shadow[s][i];
          }
-         draw_set_mapped_shader_buffer(draw, s, i, ptr, sb->buffer_size);
+         draw_set_mapped_shader_buffer(draw, s, i, ptr, ptr ? size : 0);
          if (!draw->llvm && tgsi_idx >= 0) {
             r->tgsi_buffers[tgsi_idx].ptrs[i] = ptr;
-            r->tgsi_buffers[tgsi_idx].sizes[i] = ptr ? sb->buffer_size : 0;
+            r->tgsi_buffers[tgsi_idx].sizes[i] = ptr ? size : 0;
          }
       }
    }
@@ -2121,8 +2146,12 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
 
       struct pipe_sampler_view *views[PIPE_MAX_SHADER_SAMPLER_VIEWS] = {0};
       struct pipe_sampler_state *samplers[PIPE_MAX_SAMPLERS] = {0};
+      /* Only the views the shader can sample, as the GPU path binds them: a
+       * view left bound beyond those is neither copied nor able to leave
+       * the draw out. */
       const unsigned nr_views =
-         MIN2(stage->texture_count, PIPE_MAX_SHADER_SAMPLER_VIEWS);
+         MIN3(stage->texture_count, stage->shader->info.nr_bindful_textures,
+              PIPE_MAX_SHADER_SAMPLER_VIEWS);
       const unsigned nr_samplers = MIN2(stage->sampler_count, PIPE_MAX_SAMPLERS);
       mapped_views[st] = nr_views;
       if (nr_views)
@@ -2136,7 +2165,7 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       draw_set_samplers(draw, st, samplers, nr_samplers);
       for (unsigned i = 0; i < nr_views; ++i) {
          if (views[i])
-            swtnl_map_texture(ctx, st, i, views[i], &r->textures[st][i]);
+            mapped &= swtnl_map_texture(ctx, st, i, views[i], &r->textures[st][i]);
       }
 
       const int tgsi_idx = st == MESA_SHADER_VERTEX ? 0
@@ -2168,6 +2197,7 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
                                        &so_transfers[i]),
          .internal_offset = offset_B,
       };
+      mapped &= targets[i].mapping != NULL;
       atgt->stride = last->xfb_strides[i] * 4;
       target_ptrs[i] = &targets[i];
    }
@@ -2182,9 +2212,16 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    util_dynarray_clear(&r->acc_indices);
    r->acc_count = r->cur_base = 0;
 
-   draw_vbo(draw, info, 0, NULL, draw_info, 1, ctx->patch_vertices);
-   draw_flush(draw);
-   agx_swtnl_flush(r);
+   /* A buffer or texture that could not be mapped or copied leaves the draw
+    * out. */
+   if (mapped) {
+      draw_vbo(draw, info, 0, NULL, draw_info, 1, ctx->patch_vertices);
+      draw_flush(draw);
+      agx_swtnl_flush(r);
+   } else {
+      mesa_loge_once("asahi: CPU vertex stages: a buffer or texture could "
+                     "not be mapped, draw skipped");
+   }
 
    for (unsigned i = 0; i < num_targets; ++i) {
       if (!target_ptrs[i])
@@ -2212,8 +2249,16 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       draw_set_sampler_views(draw, st, NULL, 0);
       draw_set_samplers(draw, st, NULL, 0);
       for (unsigned i = 0; i < mapped_views[st]; ++i) {
-         free(r->textures[st][i].data);
-         r->textures[st][i].data = NULL;
+         struct swtnl_texture *t = &r->textures[st][i];
+         uint32_t strides[PIPE_MAX_TEXTURE_LEVELS] = {0};
+
+         if (t->bound) {
+            draw_set_mapped_texture(draw, st, i, 0, 0, 0, 0, 0, 0, 0, NULL,
+                                    strides, strides, strides);
+         }
+         free(t->data);
+         t->data = NULL;
+         t->bound = false;
       }
    }
    for (unsigned i = 0; i < nr_vbs; ++i)
@@ -2221,6 +2266,8 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    if (indices)
       draw_set_indexes(draw, NULL, 0, 0);
    for (unsigned s = 0; s < MESA_SHADER_FRAGMENT; ++s) {
+      u_foreach_bit(i, cb_masks[s])
+         draw_set_mapped_constant_buffer(draw, s, i, NULL, 0);
       for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; ++i) {
          if (transfers[s][i])
             pipe_buffer_unmap(&ctx->base, transfers[s][i]);

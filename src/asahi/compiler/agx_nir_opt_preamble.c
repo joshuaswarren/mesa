@@ -210,9 +210,11 @@ alu_cost(nir_alu_instr *alu)
    case nir_op_f2i8:
    case nir_op_f2i16:
    case nir_op_f2i32:
+   case nir_op_f2i32_sat:
    case nir_op_f2u8:
    case nir_op_f2u16:
    case nir_op_f2u32:
+   case nir_op_f2u32_sat:
    case nir_op_i2fmp:
    case nir_op_i2f16:
    case nir_op_i2f32:

@@ -151,8 +151,8 @@ struct agx_shader_info {
    /* Number of uniforms */
    uint16_t push_count;
 
-   /* G17P load_preamble declarations after NIR optimization, in native
-    * half-register units. This is a publication contract, not a CProg TPS
+   /* G17P load_preamble declarations and bindless texture/sampler heap bases
+    * after NIR optimization, in native half-register units. This is a publication contract, not a CProg TPS
     * import layout. Consumers must also publish compiler rodata separately. */
    uint64_t agx3_uniform_halfs[AGX3_CPROG_INPUT_WORDS];
    bool agx3_uniform_halfs_valid;
@@ -214,6 +214,16 @@ struct agx_shader_info {
     * +agx3_preamble_out_size_halfs). The driver may execute @preamble once as a
     * 1-thread compute shader and bind the output buffer as a vertex uniform
     * range instead of re-running the per-draw vertex constant program. */
+   /* Post-DMA root-uniform liveness for AGX3 shaders compiled with
+    * g17p_uniform_dma: distinguishes whether the main shader and/or its
+    * @preamble still load the 64-bit root pointer uniform at g17p_dma_root.
+    * When false, uniform DMA and/or preamble hoisting retired every root load
+    * so the driver can omit the dead root-pointer range (when set_count == 0
+    * and no prolog reads the root). */
+   bool agx3_root_uniform_usage_valid;
+   bool agx3_main_uses_root_uniform;
+   bool agx3_preamble_uses_root_uniform;
+
    bool agx3_preamble_hoistable;
    uint16_t agx3_preamble_in_base_half;
    uint16_t agx3_preamble_in_size_halfs;
@@ -630,6 +640,8 @@ struct agx_shader_key {
     * g17p_dma_static_set_mask. !g17p_uniform_dma leaves code unchanged. */
    bool g17p_uniform_dma;
    uint16_t g17p_dma_root;
+   /* Guaranteed resident prefix at g17p_dma_root for speculative VS loads. */
+   uint16_t preamble_root_size_B;
    uint8_t g17p_dma_set_mask;
    uint8_t g17p_dma_static_set_mask;
    uint8_t g17p_dma_buffer_count;

@@ -150,7 +150,7 @@ hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
 
       save->pipeline_stats_flags = desc->root.draw.pipeline_stats_flags;
       desc->root.draw.pipeline_stats_flags = 0;
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
    } else {
       save->shaders[MESA_SHADER_COMPUTE] = cmd->state.cs.shader;
    }
@@ -220,7 +220,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
             VkPipelineBindPoint bind_point)
 {
    struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
-   desc->root_dirty = true;
+   hk_root_mark_dirty(desc);
 
    desc->buffer_active &= ~BITFIELD_BIT(0);
    if (save->buffer_active0) {
@@ -294,7 +294,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       cmd->state.gfx.dirty |= HK_DIRTY_OCCLUSION;
 
       desc->root.draw.pipeline_stats_flags = save->pipeline_stats_flags;
-      desc->root_dirty = true;
+      hk_root_mark_dirty(desc);
    } else {
       hk_cmd_bind_compute_shader(cmd, save->shaders[MESA_SHADER_COMPUTE]);
    }
@@ -5729,6 +5729,10 @@ hk_xfer_begin_buffer(struct hk_cmd_buffer *cmd, VkBuffer _buffer,
    const bool device_address =
       (buffer->vk.usage & VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT) ||
       buffer->va;
+   if (lo_B >= hi_B || lo_B >= buffer->vk.size) {
+      hk_sync_xfer_begin_dst(cmd, 0, 0, device_address);
+      return;
+   }
    hk_sync_xfer_begin_dst(cmd, base + lo_B, base + MIN2(hi_B, buffer->vk.size),
                           device_address);
 }
@@ -5763,6 +5767,9 @@ VKAPI_ATTR void VKAPI_CALL
 hk_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   if (!info->regionCount)
+      return;
 
    if (cmd->state.deferred_clear_count) {
       VK_FROM_HANDLE(hk_buffer, src, info->srcBuffer);

@@ -34,7 +34,7 @@
 #define COST_JMP_AGX3 (5)
 
 static uint32_t
-cost_instr(agx_instr *I)
+cost_instr(const agx_context *ctx, agx_instr *I)
 {
    /* TODO: Better heuristic */
    switch (I->op) {
@@ -43,6 +43,26 @@ cost_instr(agx_instr *I)
    case AGX_OPCODE_TEXTURE_LOAD:
    case AGX_OPCODE_TEXTURE_SAMPLE:
       return 50;
+   case AGX_OPCODE_RSQRT:
+   case AGX_OPCODE_SRSQRT:
+   case AGX_OPCODE_RCP:
+   case AGX_OPCODE_LOG2:
+   case AGX_OPCODE_EXP2:
+   case AGX_OPCODE_SIN_PT_1:
+   case AGX_OPCODE_SINC_AGX3:
+      /* AGX3C SFU transcendentals are much slower than regular FP32 ALU.
+       * Against COST_JMP (19) * inverse_probability (2) = 38, device load
+       * cost 10, and ALU cost 1, weighting SFU ops at 16 lets a guarded body
+       * with an SFU op plus a load and ~12+ ALU clear 38 and emit
+       * jmp_exec_none, while short bounds checks (e.g. 2 loads + 5 ALU = 25)
+       * and standalone SFU ops stay jump-free. Checked across all 8 Geekbench
+       * 6.7.1 Vulkan workloads on M5 Pro (Particle Physics -13.26% GPU busy,
+       * 67/70 other shaders unchanged, 0 regressions) and gpubench-vk
+       * (neutral). */
+      return (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+              !ctx->key->dev.emit_agx3d)
+                ? 16
+                : 1;
    default:
       return 1;
    }
@@ -83,7 +103,7 @@ cost_between(agx_context *ctx, agx_block *from, agx_instr *from_I,
             break;
 
          *must_skip |= testing_coverage_update(ctx, J);
-         cost += cost_instr(J);
+         cost += cost_instr(ctx, J);
       }
    }
 
@@ -103,7 +123,7 @@ cost_between(agx_context *ctx, agx_block *from, agx_instr *from_I,
             break;
 
          *must_skip |= testing_coverage_update(ctx, I);
-         cost += cost_instr(I);
+         cost += cost_instr(ctx, I);
       }
 
       if (block == target) {

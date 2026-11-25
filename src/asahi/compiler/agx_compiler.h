@@ -1343,6 +1343,7 @@ void agx_dce(agx_context *ctx, bool partial);
 void agx_pressure_schedule(agx_context *ctx);
 void agx_ilp_schedule(agx_context *ctx);
 int agx_ilp_m5_device_load_cap(int program_peak);
+unsigned agx3_register_budget(agx_context *ctx);
 bool agx3_lower_uniform_program(agx_context *ctx);
 /* Success/refusal, not a progress flag. Call only for AGX3B preambles. */
 bool agx3_lower_cprog_inputs(agx_context *ctx);
@@ -1410,7 +1411,7 @@ agx_reserved_registers(const agx_context *ctx)
 }
 
 void agx_spill(agx_context *ctx, unsigned k, bool remat_only);
-bool agx_fold_m5_spill_constant_phis(agx_context *ctx);
+bool agx_fold_agx3_spill_constant_phis(agx_context *ctx);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
@@ -1423,6 +1424,7 @@ unsigned agx_calc_register_demand(agx_context *ctx, bool remat);
 unsigned agx3_tile_store_bank(agx_context *ctx);
 
 void agx_lower_64bit_postra(agx_context *ctx);
+bool agx_lower_agx3_widening_int(agx_context *ctx);
 void agx_insert_waits(agx_context *ctx);
 void agx_opt_empty_else(agx_context *ctx);
 void agx_opt_register_cache(agx_context *ctx);

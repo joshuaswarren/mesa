@@ -467,7 +467,7 @@ if with_tests and with_tools.contains('drm-shim')
     suite : ['asahi'],
   )
 
-  foreach chip : ['g13g', 'g16g', 'g17p', 't6041']
+  foreach chip : ['g13g', 'g17p', 't6041']
     test(
       'asahi-' + chip + '-gallium-submit',
       prog_python,
@@ -539,6 +539,31 @@ if with_tests and with_tools.contains('drm-shim')
       suite : ['asahi'],
     )
   endforeach
+
+  foreach chip : ['g13g', 'g15g', 'g16g', 'g17p', 't6041']
+    test(
+      'asahi-' + chip + '-gallium-interchange-shared-bo',
+      prog_python,
+      args : [
+        files('tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        asahi_g17p_blit_test,
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'AGX_TEST_INTERCHANGE_SHARED_BO=1',
+      ],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  test(
+    'asahi-g17s-gallium-mipmap',
+    prog_python,
+    args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_g17p_blit_test],
+    env : ['ASAHI_SHIM_CHIP=g17s', 'AGX_TEST_MIPMAP_HW=1'],
+    suite : ['asahi'],
+  )
 
   foreach chip : ['g17p', 't6041']
     test(

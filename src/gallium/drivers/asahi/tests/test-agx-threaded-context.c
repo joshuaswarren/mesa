@@ -287,6 +287,19 @@ test_threaded_context(struct pipe_screen *screen)
    screen->fence_reference(screen, &fence, NULL);
    CHECK(fence == NULL);
 
+   /* An async frontend flush (glFlush) reaching an idle driver thread runs
+    * the recorded calls on the calling thread instead of waking the driver
+    * thread, so a following fence wait does not pay that wakeup. */
+   pctx->flush(pctx, NULL, 0);
+   pctx->buffer_subdata(pctx, buf, PIPE_MAP_WRITE, 0, sizeof(data), data);
+   CHECK(tc->batch_slots[tc->next].num_total_slots > 0);
+   const unsigned offloaded = p_atomic_read(&tc->num_offloaded_slots);
+   const unsigned direct = p_atomic_read(&tc->num_direct_slots);
+   pctx->flush(pctx, NULL, PIPE_FLUSH_ASYNC);
+   CHECK(p_atomic_read(&tc->num_offloaded_slots) == offloaded);
+   CHECK(p_atomic_read(&tc->num_direct_slots) > direct);
+   CHECK(tc->batch_slots[tc->next].num_total_slots == 0);
+
    /* Deferred fence flush (glFenceSync) followed by synchronous flush
     * (glFinish) and zero-timeout fence_finish
     * (dEQP-GLES3.functional.fence_sync.client_wait_sync_finish). */

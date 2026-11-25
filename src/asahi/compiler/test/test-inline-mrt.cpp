@@ -6,10 +6,12 @@
 extern "C" {
 #include "compiler/nir/nir_builder.h"
 #include "agx3_pixel_core.h"
+#include "agx3_staging.h"
 #include "agx_nir.h"
 }
 #include <vector>
 #include <algorithm>
+#include <cstring>
 
 static std::vector<uint8_t>
 compile_mrt(bool secondary, unsigned targets, bool *ok, bool no_stop = false)
@@ -649,5 +651,191 @@ TEST(LocalRead, CrossRtSwapPreservesLoadBeforeStore)
          EXPECT_EQ(part.info.agx3_colour_link.colour_classes, 0x7u);
          free(part.binary);
       }
+   }
+}
+
+TEST(LocalRead, CfJoinPreservesLoadOnlySlotsAndDrainsCleanly)
+{
+   const uint16_t slot6 = 1u << 5;
+
+   /* Case 1: if-then retires load-only slot 6; else and pop must retain it so
+    * pixel_release waits on the in-flight load-only slot. */
+   {
+      struct agx3_emit_slots at_if = {}, then_end = {};
+      struct agx3_staging_banks staging = {};
+      uint16_t outstanding = slot6;
+      uint16_t image_writes = 0;
+      uint16_t r0_inflight = 0;
+      uint16_t load_only = slot6;
+
+      agx3_emit_slots_capture(&at_if, outstanding, image_writes, r0_inflight,
+                              load_only, &staging);
+
+      /* then-arm drains/retires slot 6. */
+      outstanding = 0;
+      load_only &= outstanding;
+      EXPECT_EQ(load_only, 0u);
+
+      /* else captures then_end (empty) and joins at_if. */
+      agx3_emit_slots_capture(&then_end, outstanding, image_writes, r0_inflight,
+                              load_only, &staging);
+      agx3_emit_slots_join(&at_if, &outstanding, &image_writes, &r0_inflight,
+                           &load_only, &staging);
+      EXPECT_EQ(outstanding, slot6);
+      EXPECT_EQ(load_only, slot6);
+
+      const uint16_t retire = load_only & outstanding;
+      EXPECT_EQ(retire, slot6);
+
+      uint8_t rel_wait[AGX3_PIXEL_MAX_LENGTH], rel_wait_len = 0;
+      uint8_t rel_nowait[AGX3_PIXEL_MAX_LENGTH], rel_nowait_len = 0;
+      ASSERT_TRUE(agx3_pixel_release(AGX_ISA_ENCODING_AGX3B, 0xf0, false,
+                                     retire, rel_wait, &rel_wait_len));
+      ASSERT_TRUE(agx3_pixel_release(AGX_ISA_ENCODING_AGX3B, 0xf0, false,
+                                     0, rel_nowait, &rel_nowait_len));
+      EXPECT_TRUE(rel_wait_len != rel_nowait_len ||
+                  memcmp(rel_wait, rel_nowait, rel_wait_len) != 0);
+
+      /* if-without-else pop: then retired slot 6, untaken path still has it. */
+      outstanding = 0;
+      load_only = 0;
+      agx3_emit_slots_join(&at_if, &outstanding, &image_writes, &r0_inflight,
+                           &load_only, &staging);
+      EXPECT_EQ(load_only & outstanding, slot6);
+
+      /* if-with-else pop: then kept slot 6, else retired it. */
+      agx3_emit_slots_capture(&then_end, slot6, 0, 0, slot6, &staging);
+      outstanding = 0;
+      load_only = 0;
+      agx3_emit_slots_join(&then_end, &outstanding, &image_writes, &r0_inflight,
+                           &load_only, &staging);
+      EXPECT_EQ(load_only & outstanding, slot6);
+   }
+
+   /* Case 2: break joins a live load-only slot into the loop's pop state even
+    * when a later break or the fallthrough retired it. */
+   {
+      struct agx3_emit_slots breaks = {};
+      struct agx3_staging_banks staging = {};
+      bool has_break = false;
+
+      agx3_emit_slots_add(&breaks, &has_break, slot6, 0, 0, slot6, &staging);
+      agx3_emit_slots_add(&breaks, &has_break, 0, 0, 0, 0, &staging);
+      EXPECT_TRUE(has_break);
+
+      uint16_t outstanding = 0, image_writes = 0, r0_inflight = 0, load_only = 0;
+      agx3_emit_slots_join(&breaks, &outstanding, &image_writes, &r0_inflight,
+                           &load_only, &staging);
+      EXPECT_EQ(load_only & outstanding, slot6);
+   }
+
+   /* Case 3: draining CF boundary clears all per-slot masks and staging
+    * readers; capturing with outstanding == 0 never leaks stale state across
+    * the join into a newly issued generation on the same slot. */
+   {
+      struct agx3_emit_slots at_if = {};
+      struct agx3_staging_banks staging = {};
+      ASSERT_TRUE(agx3_staging_hold(&staging, 0, 16, 1));
+      uint16_t outstanding = 0;
+      uint16_t image_writes = 1u;
+      uint16_t r0_inflight = 1u;
+      uint16_t load_only = slot6;
+
+      agx3_emit_slots_capture(&at_if, outstanding, image_writes, r0_inflight,
+                              load_only, &staging);
+      EXPECT_EQ(at_if.outstanding, 0u);
+      EXPECT_EQ(at_if.image_writes, 0u);
+      EXPECT_EQ(at_if.r0_inflight, 0u);
+      EXPECT_EQ(at_if.local_read_load_only, 0u);
+      EXPECT_EQ(agx3_staging_conflicts(&at_if.staging, 0, 16), 0u);
+
+      /* Reissue slot 1 inside the arm and join at_if at pop: stale pre-drain
+       * image-write/r0/staging/load-only bits must stay clear. */
+      struct agx3_staging_banks live_staging = {};
+      outstanding = 1u;
+      image_writes = 0;
+      r0_inflight = 0;
+      load_only = 0;
+      agx3_emit_slots_join(&at_if, &outstanding, &image_writes, &r0_inflight,
+                           &load_only, &live_staging);
+      EXPECT_EQ(outstanding, 1u);
+      EXPECT_EQ(image_writes, 0u);
+      EXPECT_EQ(r0_inflight, 0u);
+      EXPECT_EQ(load_only, 0u);
+      EXPECT_EQ(agx3_staging_conflicts(&live_staging, 0, 16), 0u);
+   }
+
+   /* Case 4: end-to-end phase-split local_read shader with an if/else between
+    * the load phase and the exit-block store still waits on slot 6 at the
+    * early load-only PIXREL. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "local_read phase_split cf");
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.reserved_preamble = 8;
+      key.agx3_local_read = true;
+      key.fs.nr_samples = 1;
+
+      const unsigned offsets[5] = {0, 4, 12, 16, 20};
+      for (unsigned i = 0; i < 5; ++i)
+         BITSET_SET(key.g17p_tile_partitions, offsets[i]);
+
+      nir_def *smask = nir_imm_intN_t(&b, 0xff, 16);
+      nir_def *g0 = nir_load_local_pixel_agx(
+         &b, 4, 32, smask, .base = static_cast<int>(offsets[0]),
+         .format = PIPE_FORMAT_R8_UNORM, .target = 0);
+      nir_def *g1 = nir_f2f32(
+         &b, nir_load_local_pixel_agx(
+                &b, 4, 16, smask, .base = static_cast<int>(offsets[1]),
+                .format = PIPE_FORMAT_R16_UINT, .target = 1));
+      nir_def *g2 = nir_load_local_pixel_agx(
+         &b, 4, 32, smask, .base = static_cast<int>(offsets[2]),
+         .format = PIPE_FORMAT_R8_UNORM, .target = 2);
+      nir_def *g3 = nir_load_local_pixel_agx(
+         &b, 1, 32, smask, .base = static_cast<int>(offsets[3]),
+         .format = PIPE_FORMAT_R32_UINT, .target = 3);
+
+      nir_def *base = nir_fadd(&b, nir_fadd(&b, g0, g1), g2);
+      nir_def *cond = nir_fgt_imm(&b, g3, 0.5f);
+      nir_variable *res =
+         nir_local_variable_create(b.impl, glsl_vec4_type(), "res");
+      nir_push_if(&b, cond);
+      nir_store_var(&b, res, nir_fmul_imm(&b, base, 0.5f), 0xf);
+      nir_push_else(&b, NULL);
+      nir_store_var(&b, res, nir_fmul(&b, base, g3), 0xf);
+      nir_pop_if(&b, NULL);
+
+      nir_store_local_pixel_agx(&b, nir_fsat(&b, nir_load_var(&b, res)), smask,
+                                nir_undef(&b, 2, 16),
+                                .base = static_cast<int>(offsets[4]),
+                                .write_mask = 0xf,
+                                .format = PIPE_FORMAT_R8_UNORM, .target = 4);
+
+      b.shader->info.outputs_read = BITFIELD64_RANGE(FRAG_RESULT_DATA0, 4);
+      b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA4);
+      b.shader->info.fs.uses_fbfetch_output = true;
+
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+         << agx3_last_pack_refusal();
+
+      const uint8_t *begin = (uint8_t *)part.binary + part.info.main_offset;
+      const uint8_t *end = begin + part.info.main_size;
+      uint8_t rel_nowait[AGX3_PIXEL_MAX_LENGTH], rel_nowait_len = 0;
+      uint8_t rel_slot6[AGX3_PIXEL_MAX_LENGTH], rel_slot6_len = 0;
+      ASSERT_TRUE(agx3_pixel_release(AGX_ISA_ENCODING_AGX3B, 0xf0, false, 0,
+                                     rel_nowait, &rel_nowait_len));
+      ASSERT_TRUE(agx3_pixel_release(AGX_ISA_ENCODING_AGX3B, 0xf0, false,
+                                     slot6, rel_slot6, &rel_slot6_len));
+      EXPECT_EQ(std::search(begin, end, rel_nowait,
+                            rel_nowait + rel_nowait_len),
+                end);
+      EXPECT_NE(std::search(begin, end, rel_slot6, rel_slot6 + rel_slot6_len),
+                end);
+      free(part.binary);
    }
 }

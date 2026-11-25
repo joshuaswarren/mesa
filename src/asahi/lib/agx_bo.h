@@ -84,7 +84,8 @@ struct agx_bo {
    /* Must be first for casting */
    struct list_head bucket_link;
 
-   /* Used to link the BO to the BO cache LRU list. */
+   /* BO-cache LRU link while unreferenced. Borealis reuses it to quarantine
+    * a BO after device loss while holding a reference. */
    struct list_head lru_link;
 
    /* Convenience */

@@ -67,8 +67,6 @@ hk_cmd_pool_ioto_span_cache_max(const struct agx_device *dev)
 
 /* Recyclable command buffer BO, used for both push buffers and upload */
 struct hk_cmd_bo {
-   /* Recording/pool ownership plus immutable in-flight submission pins. */
-   int refcount;
    struct agx_bo *bo;
 
    void *map;
@@ -91,7 +89,6 @@ struct hk_cmd_bo {
 struct hk_vdm_slab;
 
 struct hk_vdm_allocation {
-   int refcount;
    struct list_head link;
    struct hk_vdm_slab *slab;
    uint64_t addr;
@@ -179,24 +176,28 @@ void hk_device_free_span(struct hk_device *dev,
                          struct hk_vdm_allocation *allocation);
 void hk_device_finish_vdm_slabs(struct hk_device *dev);
 
-/* Command-memory retirement, independent of API semaphores: on native M5
- * for the memory of every submitted recording, elsewhere only for a
- * driver-owned buffer a submission reads (extra_bo, a packed compute
- * stream), which goes back to the BO cache only once the submission
- * retired. */
+/* Command-memory retirement, independent of API semaphores:
+ * - Driver-owned packed compute stream buffers (extra_bo) have no application
+ *   handle to keep them alive, so submissions pin them until their completion
+ *   syncobj retires.
+ * - Application command recordings follow Vulkan lifetime rules while the
+ *   device is healthy; when a device is lost (or its VM reports a kernel
+ *   error), hk_cmd_pending_retain_lost() keeps their BOs and spans out of
+ *   reuse lists and BO caches until device destruction. */
 struct agx_bo;
+struct hk_cmd_buffer;
 struct hk_cmd_pending;
 struct hk_queue;
-struct vk_queue_submit;
-VkResult hk_cmd_pending_begin(struct hk_device *dev,
-                               const struct vk_queue_submit *submit,
-                               unsigned chunks,
+void hk_cmd_pending_init(struct hk_device *dev);
+VkResult hk_cmd_pending_begin(struct hk_device *dev, unsigned chunks,
                                struct agx_bo *const *extra_bos,
                                unsigned extra_bo_count,
                                struct hk_cmd_pending **out);
 uint32_t hk_cmd_pending_signal(struct hk_cmd_pending *pending);
 void hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *pending,
                         struct hk_queue *queue, VkResult result);
+void hk_cmd_pending_retain_lost(struct hk_device *dev,
+                                struct hk_cmd_buffer *cmd);
 void hk_cmd_pending_reap(struct hk_device *dev);
 void hk_cmd_pending_finish_queue(struct hk_device *dev, struct hk_queue *queue);
 void hk_cmd_pending_finish(struct hk_device *dev);
