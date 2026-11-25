@@ -661,8 +661,10 @@ test_batched_copies(void)
 static void
 test_in_pass_copies(void)
 {
+   const unsigned counts[] = {1, HK_SYNC_STAMP_COPIES + 8};
    for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
-      for (unsigned n = 1; n <= 40; n += 39) {
+      for (unsigned ci = 0; ci < ARRAY_SIZE(counts); ++ci) {
+         const unsigned n = counts[ci];
          record_count = 0;
          struct hk_cmd_buffer *cmd = new_cmd(chips[c], false);
          struct hk_cs *r = begin_render(cmd);
@@ -872,6 +874,66 @@ test_copy_consumers_wait(void)
    }
 }
 
+/* An end timestamp attached to a render pass-merge candidate (or a covered
+ * copy of it) keeps pass_merge.sync_epoch current so the next compatible
+ * render pass instance can still merge into the same render stream, and a
+ * merged pass that already carries an end stamp never lets an in-pass
+ * TOP_OF_PIPE stamp take start on a start-stamp-ordered chip. */
+static void
+test_pass_merge_end_stamp(void)
+{
+   const enum agx_chip merge_chips[] = {
+      AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C};
+   for (unsigned c = 0; c < ARRAY_SIZE(merge_chips); ++c) {
+      for (unsigned exact = 0; exact < 2; ++exact) {
+         record_count = 0;
+         struct hk_cmd_buffer *cmd = new_cmd(merge_chips[c], exact);
+         struct hk_cs *r = render(cmd);
+
+         cmd->pass_merge.valid = true;
+         cmd->pass_merge.cs = r;
+         cmd->pass_merge.next_seq = cmd->sync.next_seq;
+         cmd->pass_merge.sync_epoch = cmd->sync.epoch;
+
+         stamp_all(cmd, 0);
+         T("post-pass end stamp preserves pass_merge epoch",
+           is_end(r, 0) && list_length(&cmd->control_streams) == 1 &&
+           cmd->pass_merge.sync_epoch == cmd->sync.epoch);
+
+         stamp_all(cmd, 1);
+         T("covered copy after end stamp preserves pass_merge epoch",
+           list_length(&cmd->control_streams) == 1 &&
+           cmd->sync.stamp_copy_count == 1 &&
+           copy_is(&cmd->sync.stamp_copies[0], 1, query(0)) &&
+           cmd->pass_merge.sync_epoch == cmd->sync.epoch);
+
+         /* Merge the next pass instance onto the same render stream. */
+         cmd->pass_merge.valid = false;
+         cmd->current_cs.gfx = r;
+         hk_sync_merge_rendering(cmd, r);
+         stamp(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 2);
+         T("in-pass TOP_OF_PIPE on end-stamped merged pass never takes start",
+           !r->timestamp.start.handle && is_end(r, 0) &&
+           cmd->sync.stamp_copy_count == 2 &&
+           copy_is(&cmd->sync.stamp_copies[1], 2, query(0)));
+         stamp_all(cmd, 3);
+         T("second pass end stamp queues as a copy of the merged end stamp",
+           cmd->sync.stamp_copy_count == 3 &&
+           copy_is(&cmd->sync.stamp_copies[2], 3, query(0)) &&
+           list_length(&cmd->control_streams) == 1 && !record_count);
+         end_render(cmd);
+
+         hk_sync_flush_stamp_copies(cmd);
+         T("all merged pass copies flush in one timestamp-only stream",
+           record_count == 1 && records[0].count == 3 &&
+           records[0].cs->sync.dep[HK_SYNC_VDM].cut == r &&
+           (records[0].cs->sync.kind & HK_SYNC_STREAM_KINDS) == HK_SYNC_STAMP);
+         T("merged end-stamped pass resolves",
+           submit(new_queue(exact), &cmd, 1));
+      }
+   }
+}
+
 int
 main(void)
 {
@@ -887,6 +949,7 @@ main(void)
    test_in_pass_copies();
    test_copies_order_no_application_work();
    test_copy_consumers_wait();
+   test_pass_merge_end_stamp();
 
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);

@@ -4076,19 +4076,20 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
                                            render->tilebuffer.sample_size_B);
 
    /* The instance is one ordinary render stream with draws, with no
-    * pre/post-graphics streams, heap use or timestamps attached. */
+    * pre/post-graphics streams, heap use or start timestamps attached. An end
+    * timestamp stays on the merged stream and latches when the merged pass
+    * finishes, which still satisfies Vulkan's after-all-prior-commands rule. */
    if (!agx_chip_native_or_m5(dev->dev.chip) ||
        cmd->in_meta || cs->stats.cmds == 0 || cmd->sync.pass_vdm != cs ||
        cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx ||
        cmd->state.oq_pending_render ||
-       cmd->uses_heap || cs->timestamp.start.handle ||
-       cs->timestamp.end.handle) {
+       cmd->uses_heap || cs->timestamp.start.handle) {
       if (msaa_enabled)
          hk_frame_anatomy_note(dev,
             "MSAA pass merge refused: pre=%u post=%u heap=%u draws=%u timestamp=%u",
             cmd->current_cs.pre_gfx != NULL, cmd->current_cs.post_gfx != NULL,
             cmd->uses_heap, cs->stats.cmds,
-            cs->timestamp.start.handle != 0 || cs->timestamp.end.handle != 0);
+            cs->timestamp.start.handle != 0);
       return false;
    }
 
@@ -4588,7 +4589,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
             (m->open_cs && m->open_cs->current != m->open_cs_current))
       why = "compute";
    else if (cs->current != m->after_current || cs->end != m->end ||
-            cs->timestamp.start.handle || cs->timestamp.end.handle)
+            cs->timestamp.start.handle)
       why = "stream";
    else if (info->flags & (VK_RENDERING_SUSPENDING_BIT |
                            VK_RENDERING_RESUMING_BIT |

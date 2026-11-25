@@ -1978,7 +1978,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
        * (start_stamps_ordered()), fragment end otherwise; a second end
        * stamp is copied from the first after the render. */
       if (!src_kinds && !gfx->timestamp.start.handle &&
-          start_stamps_ordered(cmd)) {
+          !gfx->timestamp.end.handle && start_stamps_ordered(cmd)) {
          gfx->timestamp.start = req;
          return;
       }
@@ -2061,6 +2061,13 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       if (tail == cmd->current_cs.cs) {
          stamp_carrier_launch(cmd);
          hk_cmd_buffer_end_compute(cmd);
+      } else if (unlikely(cmd->pass_merge.valid) &&
+                 cmd->pass_merge.cs == tail && last_stream(cmd) == tail &&
+                 cmd->sync.next_seq == cmd->pass_merge.next_seq) {
+         /* Attaching an end timestamp to the open pass-merge candidate
+          * preserves candidacy: a merged render latches it when the merged
+          * pass finishes, still after every prior command. */
+         cmd->pass_merge.sync_epoch = cmd->sync.epoch;
       }
       return;
    }
@@ -2076,6 +2083,10 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
          .src = tail->timestamp.end,
       };
       st->stamp_copy_after[sq] = hk_sync_later(st->stamp_copy_after[sq], tail);
+      if (unlikely(cmd->pass_merge.valid) && cmd->pass_merge.cs == tail &&
+          last_stream(cmd) == tail &&
+          cmd->sync.next_seq == cmd->pass_merge.next_seq)
+         cmd->pass_merge.sync_epoch = cmd->sync.epoch;
       return;
    }
 
