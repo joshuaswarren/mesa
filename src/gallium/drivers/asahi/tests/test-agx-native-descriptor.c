@@ -722,20 +722,32 @@ test_g17p_compressed_render_target(void)
                       sizeof(expected_layered)) == 0);
       }
 
-      /* Gen10 (M5) also packs single-sample and 2x/4x multisample compressed
-       * RGBA8 render targets (metadata bit moves to word0[61], sample selector
-       * to word0[59:58], while G18G remains off). */
-      rt = original;
-      memset(&native, 0xa5, sizeof(native));
-      CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
-                                        &rt));
-      for (unsigned s = 0; s < ARRAY_SIZE(ms_counts); ++s) {
+      /* Gen10 (M5) packs the same compressed single-sample and 2x/4x
+       * multisample RGBA8 render targets: compression at word0[61] instead of
+       * word0[59], word1[63] and the metadata address >> 4 in word2, and the
+       * 2x/4x selector at word0[59:58]. The allocator's page_aligned_layers
+       * flag of the single layer is dropped, since the Gen10 codec refuses
+       * it on a compressed packet. G18G stays off. */
+      for (unsigned s = 0; s <= ARRAY_SIZE(ms_counts); ++s) {
          rt = original;
-         rt.dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED;
-         rt.samples = ms_counts[s];
+         rt.page_aligned_layers = true;
+         if (s) {
+            rt.dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED;
+            rt.samples = ms_counts[s - 1];
+         }
          memset(&native, 0xa5, sizeof(native));
          CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
                                            &rt));
+         uint64_t words[4];
+         memcpy(words, native.opaque, sizeof(words));
+         CHECK((words[0] & 0xf) == (s ? 4u : 2u));
+         CHECK(words[0] & (UINT64_C(1) << 61));
+         CHECK(!(words[0] & (UINT64_C(1) << 59)));
+         CHECK(!!(words[0] & (UINT64_C(1) << 58)) == (s == 2));
+         CHECK(words[1] & (UINT64_C(1) << 63));
+         CHECK(!(words[1] & (UINT64_C(1) << 60)));
+         CHECK(words[2] == targets[i].metadata >> 4);
+         CHECK(words[3] == 0);
       }
       rt = original;
       CHECK(!agx_gallium_pack_g18_native_pbe(&native, &rt));
