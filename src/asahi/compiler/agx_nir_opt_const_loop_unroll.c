@@ -686,10 +686,17 @@ match_ior_bit(nir_scalar s, nir_def *iv_def, int64_t expected_off,
 /* After unrolling a [0, 32) unit-stepped loop by an exact divisor F of 32,
  * rewrite any 0-initialized 32-bit bit-pack accumulator phi `d` whose F steps
  * each conditionally OR `1u << (iv + k)` into an F-bit constant-mask chunk
- * merged with one funnel shift `(d >> F) | (chunk << (32 - F))`. */
+ * merged with one funnel shift `(d >> F) | (chunk << (32 - F))`.
+ *
+ * On every outer iteration but the first, the rewritten `d_phi` holds the
+ * partial word funnel-shifted to the top instead of in its low bits, so inside
+ * the loop only the select chain may read `d_phi` or the values it builds.
+ * After the loop `d_back` is exact, and so is `d_phi` for top-tested loops,
+ * which exit at the header. `bottom` marks bottom-tested loops, which exit
+ * after the last step, when `d_phi` is still one iteration behind. */
 static bool
 strength_reduce_unrolled_bitpack(nir_function_impl *impl, nir_loop *loop,
-                                 unsigned factor)
+                                 unsigned factor, bool bottom)
 {
    if (factor < 2 || factor > 16 || (32u % factor) != 0)
       return false;
@@ -787,6 +794,16 @@ strength_reduce_unrolled_bitpack(nir_function_impl *impl, nir_loop *loop,
             break;
          }
 
+         /* `prev | (1u << (iv + k))` must feed only this select. */
+         nir_foreach_use_including_if(u, &ior->def) {
+            if (nir_src_is_if(u) || nir_src_use_instr(u) != &sel->instr) {
+               ok = false;
+               break;
+            }
+         }
+         if (!ok)
+            break;
+
          /* Intermediate results must not escape the chain. */
          if (k < (int)factor - 1) {
             nir_foreach_use_including_if(u, cur) {
@@ -814,18 +831,20 @@ strength_reduce_unrolled_bitpack(nir_function_impl *impl, nir_loop *loop,
       if (!ok || cur != &d_phi->def)
          continue;
 
-      /* `d_phi` itself must not be read inside the loop outside step 0. */
+      /* `d_phi` itself must not be read inside the loop outside step 0.
+       * After the loop it is the final value only for top-tested loops; a
+       * bottom-tested loop exits with `d_phi` holding the previous word
+       * shifted left by `factor`. */
       nir_foreach_use_including_if(u, &d_phi->def) {
-         if (nir_src_is_if(u)) {
-            if (block_in_loop(src_use_block(u), loop)) {
+         if (!block_in_loop(src_use_block(u), loop)) {
+            if (bottom) {
                ok = false;
                break;
             }
             continue;
          }
-         nir_instr *ui = nir_src_use_instr(u);
-         if (block_in_loop(ui->block, loop) &&
-             ui != &sels[0]->instr && ui != &iors[0]->instr) {
+         if (nir_src_is_if(u) || (nir_src_use_instr(u) != &sels[0]->instr &&
+                                  nir_src_use_instr(u) != &iors[0]->instr)) {
             ok = false;
             break;
          }
@@ -943,7 +962,7 @@ agx_nir_opt_const_loop_unroll(nir_shader *shader, unsigned max_factor,
          nir_index_ssa_defs(impl);
 
          if (maybe_bitpack)
-            strength_reduce_unrolled_bitpack(impl, cl.loop, f);
+            strength_reduce_unrolled_bitpack(impl, cl.loop, f, cl.bottom);
 
          n++;
       }

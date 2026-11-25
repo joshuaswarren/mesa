@@ -138,11 +138,23 @@ count_intrinsics(nir_shader *shader, nir_intrinsic_op op)
    return n;
 }
 
+/* Extra reads of the bit-pack accumulator `d` outside its select chain. */
+enum bitpack_extra_use {
+   BITPACK_CHAIN_ONLY,
+   /* `extra += d` inside the loop. */
+   BITPACK_D_IN_LOOP,
+   /* `with_bit = d | (1u << i); extra += with_bit; d = cond ? with_bit : d`. */
+   BITPACK_IOR_IN_LOOP,
+   /* `extra = d` before the update, read after the loop. */
+   BITPACK_D_AFTER_LOOP,
+};
+
 /* Helper building a counted [0, trips) loop with >= 20 body instructions,
  * global loads, and an optional monotonic 32-bit bit-pack accumulator. */
 nir_shader *
 build_const_bitpack_loop(unsigned trips, bool bottom_tested, bool with_load,
-                         bool with_barrier, bool read_d_in_loop)
+                         bool with_barrier,
+                         bitpack_extra_use use = BITPACK_CHAIN_ONLY)
 {
    nir_builder b = make_compute_shader("const-bitpack-loop");
    nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "iv");
@@ -199,13 +211,18 @@ build_const_bitpack_loop(unsigned trips, bool bottom_tested, bool with_load,
          emit_workgroup_barrier(&b);
 
       nir_def *d = nir_load_var(&b, acc);
-      if (read_d_in_loop)
+      if (use == BITPACK_D_IN_LOOP)
          nir_store_var(&b, extra, nir_iadd(&b, nir_load_var(&b, extra), d), 1);
+      else if (use == BITPACK_D_AFTER_LOOP)
+         nir_store_var(&b, extra, d, 1);
 
       nir_def *mask =
          nir_ishl(&b, nir_imm_int(&b, 1), nir_iand_imm(&b, i, 31));
-      nir_def *d_next =
-         nir_bcsel(&b, nir_ilt(&b, a, bv), nir_ior(&b, d, mask), d);
+      nir_def *with_bit = nir_ior(&b, d, mask);
+      if (use == BITPACK_IOR_IN_LOOP)
+         nir_store_var(&b, extra,
+                       nir_iadd(&b, nir_load_var(&b, extra), with_bit), 1);
+      nir_def *d_next = nir_bcsel(&b, nir_ilt(&b, a, bv), with_bit, d);
       nir_store_var(&b, acc, d_next, 1);
 
       nir_def *next = nir_iadd_imm(&b, i, 1);
@@ -360,7 +377,7 @@ TEST(FmWave2IvDivMod, InLoopPushConstantDivisorAndBound)
 
 TEST(FmWave2ConstLoopUnroll, TopTested32TripBitpack8x)
 {
-   nir_shader *s = build_const_bitpack_loop(32, false, true, false, false);
+   nir_shader *s = build_const_bitpack_loop(32, false, true, false);
    ASSERT_EQ(count_loops(s), 1u);
    unsigned widest = 0;
    EXPECT_TRUE(agx_nir_opt_const_loop_unroll(s, 8, &widest));
@@ -381,7 +398,7 @@ TEST(FmWave2ConstLoopUnroll, TopTested32TripBitpack8x)
 
 TEST(FmWave2ConstLoopUnroll, BottomTested32TripBitpack4x)
 {
-   nir_shader *s = build_const_bitpack_loop(32, true, true, false, false);
+   nir_shader *s = build_const_bitpack_loop(32, true, true, false);
    ASSERT_EQ(count_loops(s), 1u);
    unsigned widest = 0;
    EXPECT_TRUE(agx_nir_opt_const_loop_unroll(s, 4, &widest));
@@ -399,7 +416,7 @@ TEST(FmWave2ConstLoopUnroll, RefusalsAndEscapingAccumulator)
 {
    /* Non-divisible trip count (30 is divisible by neither 8 nor 4). */
    {
-      nir_shader *s = build_const_bitpack_loop(30, false, true, false, false);
+      nir_shader *s = build_const_bitpack_loop(30, false, true, false);
       unsigned widest = 0;
       EXPECT_FALSE(agx_nir_opt_const_loop_unroll(s, 8, &widest));
       EXPECT_EQ(widest, 0u);
@@ -408,14 +425,14 @@ TEST(FmWave2ConstLoopUnroll, RefusalsAndEscapingAccumulator)
 
    /* Pure-ALU loop without memory loads is left alone. */
    {
-      nir_shader *s = build_const_bitpack_loop(32, false, false, false, false);
+      nir_shader *s = build_const_bitpack_loop(32, false, false, false);
       EXPECT_FALSE(agx_nir_opt_const_loop_unroll(s, 8, NULL));
       ralloc_free(s);
    }
 
    /* Loop with a workgroup barrier is refused. */
    {
-      nir_shader *s = build_const_bitpack_loop(32, false, true, true, false);
+      nir_shader *s = build_const_bitpack_loop(32, false, true, true);
       EXPECT_FALSE(agx_nir_opt_const_loop_unroll(s, 8, NULL));
       ralloc_free(s);
    }
@@ -424,13 +441,57 @@ TEST(FmWave2ConstLoopUnroll, RefusalsAndEscapingAccumulator)
     * still succeeds, but bit-pack funnel-shift strength reduction is skipped
     * so intermediate values of `d` stay exact. */
    {
-      nir_shader *s = build_const_bitpack_loop(32, false, true, false, true);
+      nir_shader *s = build_const_bitpack_loop(32, false, true, false,
+                                               BITPACK_D_IN_LOOP);
       unsigned widest = 0;
       EXPECT_TRUE(agx_nir_opt_const_loop_unroll(s, 8, &widest));
       NIR_PASS(_, s, nir_opt_dce);
       nir_validate_shader(s, "const-bitpack escaping d");
       EXPECT_EQ(widest, 8u);
       EXPECT_EQ(count_alu_op(s, nir_op_ushr), 0u);
+      ralloc_free(s);
+   }
+}
+
+/* `with_bit = d | (1u << i)` read outside the select: after the funnel-shift
+ * rewrite `d` carries the shifted partial word on every outer iteration but
+ * the first, so that reader would see wrong bits. Unrolling still happens;
+ * the bit-pack rewrite must not. Same shapes as the 8x and bottom 4x tests
+ * above apart from the extra reader. */
+TEST(FmWave2ConstLoopUnroll, EscapingOrKeepsExactBitpack)
+{
+   for (unsigned bottom = 0; bottom < 2; ++bottom) {
+      const unsigned factor = bottom ? 4 : 8;
+      nir_shader *s = build_const_bitpack_loop(32, bottom, true, false,
+                                               BITPACK_IOR_IN_LOOP);
+      unsigned widest = 0;
+      EXPECT_TRUE(agx_nir_opt_const_loop_unroll(s, factor, &widest));
+      NIR_PASS(_, s, nir_opt_copy_prop);
+      NIR_PASS(_, s, nir_opt_dce);
+      nir_validate_shader(s, "const-bitpack escaping ior");
+      EXPECT_EQ(count_loops(s), 1u);
+      EXPECT_EQ(widest, factor);
+      EXPECT_EQ(count_alu_op(s, nir_op_ushr), 0u) << "bottom=" << bottom;
+      ralloc_free(s);
+   }
+}
+
+/* Bottom-tested loop whose `d` from before the last update is read after the
+ * loop: that exit value is the previous word, which the funnel-shift form
+ * holds shifted left by the factor, so the bit-pack rewrite must not run. */
+TEST(FmWave2ConstLoopUnroll, BottomTestedDAfterLoopKeepsExactBitpack)
+{
+   for (unsigned factor = 4; factor <= 8; factor *= 2) {
+      nir_shader *s = build_const_bitpack_loop(32, true, true, false,
+                                               BITPACK_D_AFTER_LOOP);
+      unsigned widest = 0;
+      EXPECT_TRUE(agx_nir_opt_const_loop_unroll(s, factor, &widest));
+      NIR_PASS(_, s, nir_opt_copy_prop);
+      NIR_PASS(_, s, nir_opt_dce);
+      nir_validate_shader(s, "const-bitpack bottom d after loop");
+      EXPECT_EQ(count_loops(s), 1u);
+      EXPECT_EQ(widest, factor);
+      EXPECT_EQ(count_alu_op(s, nir_op_ushr), 0u) << "factor=" << factor;
       ralloc_free(s);
    }
 }
