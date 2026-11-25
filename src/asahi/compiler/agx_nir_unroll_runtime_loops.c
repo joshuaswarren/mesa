@@ -844,7 +844,7 @@ workgroup_striped(const nir_shader *shader, const struct counted_loop *cl)
    if (nir_scalar_is_alu(start) && nir_scalar_alu_op(start) == nir_op_isub)
       start = nir_scalar_chase_alu_src(start, 1);
 
-   nir_intrinsic_instr *intr = nir_def_as_intrinsic(start.def);
+   nir_intrinsic_instr *intr = nir_def_as_intrinsic_or_null(start.def);
    if (!intr || intr->intrinsic != nir_intrinsic_load_local_invocation_id)
       return false;
 
