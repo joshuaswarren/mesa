@@ -264,12 +264,12 @@ signed_division_shader(nir_op op, bool preamble_divisor)
    return b.shader;
 }
 
-/* Compile-time lowering picks the magic multipliers only when the compile forms
- * a preamble to compute them in. Without one, the multiplier calculation
- * would run in every invocation (vertex shaders without a preamble grew by
- * hundreds of instructions), so nir_lower_idiv handles the division as before.
- * imul_high marks the signed multiplier sequence; nir_lower_idiv does not use
- * it. Both lowerings must stay exact. */
+/* Compile-time lowering picks the exact reciprocal only when the compile forms
+ * a preamble to compute it in. Without one, the reciprocal calculation would
+ * run in every invocation, so nir_lower_idiv handles the division as before.
+ * umax marks the exact-reciprocal sequence (it clamps the divisor and the
+ * first estimate); nir_lower_idiv does not use it. Both lowerings must stay
+ * exact. */
 static void
 check_lowering_follows_preamble(void)
 {
@@ -281,12 +281,12 @@ check_lowering_follows_preamble(void)
          nir_validate_shader(s, "after agx_nir_lower_integer_division");
          const unsigned left = count_op(s, nir_op_idiv) + count_op(s, nir_op_imod) +
                                count_op(s, nir_op_irem);
-         const unsigned magic = count_op(s, nir_op_imul_high);
-         if (left || (forms ? magic == 0 : magic != 0)) {
+         const unsigned exact = count_op(s, nir_op_umax);
+         if (left || (forms ? exact == 0 : exact != 0)) {
             fprintf(stderr, "FAIL: %s with%s a preamble: %u divisions left, "
-                            "%u imul_high (expected %s)\n",
-                    nir_op_infos[ops[i]].name, forms ? "" : "out", left, magic,
-                    forms ? "the magic-multiplier sequence" : "nir_lower_idiv");
+                            "%u umax (expected %s)\n",
+                    nir_op_infos[ops[i]].name, forms ? "" : "out", left, exact,
+                    forms ? "the exact reciprocal" : "nir_lower_idiv");
             exit(1);
          }
          check_exact(s, ops[i], forms ? "with a preamble" : "without a preamble");
@@ -325,9 +325,9 @@ check_push_constant_survives_preprocess(void)
             nir_address_format_32bit_offset);
    agx_nir_lower_integer_division(b.shader, true);
    if (count_op(b.shader, nir_op_idiv) != 0 ||
-       count_op(b.shader, nir_op_imul_high) == 0) {
+       count_op(b.shader, nir_op_umax) == 0) {
       fprintf(stderr, "FAIL: the lowered push-constant divisor did not get "
-                      "magic multipliers\n");
+                      "the exact reciprocal\n");
       exit(1);
    }
    ralloc_free(b.shader);

@@ -9,197 +9,84 @@
 
 /*
  * Lower 32-bit integer division and modulo with a divergent dividend and a
- * non-constant uniform divisor using branchfree Granlund-Montgomery magic
- * multipliers.
+ * non-constant uniform divisor d through the exact reciprocal
+ * M = floor(2^32 / d) (M = UINT32_MAX for d == 1).
  *
- * The magic-multiplier calculation depends only on the uniform divisor and
- * uses pure 32-bit straight-line ALU (no control flow, no 64-bit integer
- * types), so agx_nir_opt_preamble hoists it cleanly into @preamble. The
- * per-invocation hot path drops from nir_lower_idiv's ~14-30 instructions
- * (two sequential correction chains + sign fixups) to:
- *   - udiv: 5 ALU ops (umul_high, isub, ushr, iadd, ushr)
- *   - idiv: 7 ALU ops (imul_high, iadd, ishr, ushr, iadd, ixor, isub)
- *   - umod/irem: +1 imad (-d * q + n)
- *   - imod: +4 ALU ops (floored adjustment when r != 0 && (r ^ d) < 0)
+ * This is nir_lower_idiv's algorithm with the reciprocal made exact. M depends
+ * only on d and is straight-line 32-bit ALU, so agx_nir_opt_preamble hoists it
+ * into @preamble, and it costs one uniform, like nir_lower_idiv's reciprocal.
+ * Because 2^32 / d - 1 < M <= 2^32 / d, the quotient estimate umul_high(n, M)
+ * is the quotient or one below it for every n, so the main shader needs one
+ * correction step where nir_lower_idiv needs two:
+ *   - udiv/umod: umul_high, imul, isub, uge, bcsel (+ iadd or isub)
+ *   - signed: the same on |n| and |d|, then nir_lower_idiv's sign fixups
  *
- * Division by zero is undefined in GLSL/SPIR-V; nothing hangs or faults, and
- * umod/irem/imod(n, 0) return n while udiv(n, 0) returns n >> 1 and
- * idiv(n, 0) returns n / 2 (differing from nir_lower_idiv's n + 1 for udiv).
+ * Division by zero is undefined in GLSL/SPIR-V; nothing hangs or faults:
+ * udiv(n, 0) returns (n >> 1) + 1 and umod(n, 0) returns n.
  */
 
-struct u64_pair {
-   nir_def *hi;
-   nir_def *lo;
-};
-
-static struct u64_pair
-sub64(nir_builder *b, struct u64_pair a, struct u64_pair c)
-{
-   nir_def *borrow = nir_b2i32(b, nir_ult(b, a.lo, c.lo));
-   return (struct u64_pair){
-      .hi = nir_isub(b, nir_isub(b, a.hi, c.hi), borrow),
-      .lo = nir_isub(b, a.lo, c.lo),
-   };
-}
-
+/* M = floor(2^32 / d) for d >= 2, UINT32_MAX for d == 1:
+ *
+ *  1. q0 from a float reciprocal scaled by 2^32 - 2^14, so it stays below
+ *     2^32 / d even with the reciprocal 16 ULP high: 1 <= q0 and
+ *     q0 * d <= 2^32, so the exact error e = 2^32 - q0 * d is -(q0 * d) in
+ *     32-bit arithmetic. The hardware reciprocal is within 2.5 ULP, so the
+ *     correctly rounded one is not needed.
+ *  2. One integer Newton-Raphson step, q1 = q0 + umul_high(q0, e), leaves q1
+ *     at M or M - 1.
+ *  3. One exact step up when the remainder 2^32 - q1 * d is still >= d.
+ *
+ * Checked exhaustively on the CPU, mirroring these operations in float32 with
+ * round-to-nearest and truncating conversions: every d in [1, 2^32) with the
+ * reciprocal off by up to 16 ULP either way, 1.4e11 cases, all exact, with
+ * the invariants above holding throughout.
+ */
 static nir_def *
-gt64(nir_builder *b, struct u64_pair a, struct u64_pair c)
+uniform_reciprocal(nir_builder *b, nir_def *d)
 {
-   return nir_ior(b, nir_ult(b, c.hi, a.hi),
-                  nir_iand(b, nir_ieq(b, a.hi, c.hi), nir_ult(b, c.lo, a.lo)));
-}
-
-static nir_def *
-ge64(nir_builder *b, struct u64_pair a, struct u64_pair c)
-{
-   return nir_ior(b, nir_ult(b, c.hi, a.hi),
-                  nir_iand(b, nir_ieq(b, a.hi, c.hi), nir_uge(b, a.lo, c.lo)));
-}
-
-static struct u64_pair
-mul64(nir_builder *b, nir_def *x, nir_def *y)
-{
-   return (struct u64_pair){
-      .hi = nir_umul_high(b, x, y),
-      .lo = nir_imul(b, x, y),
-   };
-}
-
-/* Compute exact floor((hi * 2^32) / d) for all 2 <= d <= UINT32_MAX and
- * 0 <= hi < d using only pure 32-bit branchfree ALU. */
-static nir_def *
-udiv64_hi_exact(nir_builder *b, nir_def *hi, nir_def *d)
-{
-   nir_def *zero = nir_imm_int(b, 0);
-   nir_def *one = nir_imm_int(b, 1);
-   struct u64_pair num = { .hi = hi, .lo = zero };
-
-   unsigned prev_ctrl = b->fp_math_ctrl;
-   b->fp_math_ctrl = nir_fp_exact;
-
-   nir_def *df = nir_u2f32(b, d);
-   nir_def *r0 = nir_frcp(b, df);
-   /* One Newton-Raphson step: r1 = r0 * (2 - df * r0). */
-   nir_def *r1 = nir_fmul(b, r0, nir_ffma(b, nir_fneg(b, df), r0, nir_imm_float(b, 2.0f)));
-
-   /* Slightly conservative initial estimate so f2u32 never overflows 2^32. */
-   nir_def *qf = nir_fmul(b, nir_u2f32(b, hi),
-                          nir_fmul(b, r1, nir_imm_float(b, 4294963200.0f)));
-   nir_def *q = nir_f2u32(b, qf);
-
-   /* Handle rare tiny overshoot when u2f32(d) rounded down. */
-   struct u64_pair prod = mul64(b, q, d);
-   nir_def *over = gt64(b, prod, num);
-   struct u64_pair ov_diff = sub64(b, prod, num);
-   nir_def *ohi = nir_bcsel(b, over, ov_diff.hi, zero);
-   nir_def *olo = nir_bcsel(b, over, ov_diff.lo, zero);
-   nir_def *of = nir_ffma(b, nir_u2f32(b, ohi), nir_imm_float(b, 4294967296.0f),
-                          nir_u2f32(b, olo));
-   nir_def *dq_down = nir_iadd_imm(b, nir_f2u32(b, nir_fmul(b, of, r1)), 1);
-   q = nir_bcsel(b, over, nir_isub(b, q, dq_down), q);
-
-   prod = mul64(b, q, d);
-   nir_def *over2 = gt64(b, prod, num);
-   q = nir_bcsel(b, over2, nir_isub(b, q, one), q);
-   prod = mul64(b, q, d);
-
-   /* Non-negative 64-bit remainder: refine upward once. */
-   struct u64_pair rem = sub64(b, num, prod);
-   nir_def *rf = nir_ffma(b, nir_u2f32(b, rem.hi), nir_imm_float(b, 4294967296.0f),
-                          nir_u2f32(b, rem.lo));
-   nir_def *dq_up_raw = nir_f2u32(b, nir_fmul(b, rf, nir_fmul(b, r1, nir_imm_float(b, 0.999999f))));
-   nir_def *dq_up = nir_umin(b, nir_isub(b, nir_imm_int(b, 0xffffffff), q), dq_up_raw);
-   q = nir_iadd(b, q, dq_up);
-
-   b->fp_math_ctrl = prev_ctrl;
-
-   /* Exact +/-3 conditional fixup steps guarantee zero ULP error for all d. */
-   prod = mul64(b, q, d);
-   struct u64_pair d64 = { .hi = zero, .lo = d };
-   for (unsigned i = 0; i < 3; ++i) {
-      nir_def *ov = gt64(b, prod, num);
-      q = nir_bcsel(b, ov, nir_isub(b, q, one), q);
-      struct u64_pair np = sub64(b, prod, d64);
-      prod.hi = nir_bcsel(b, ov, np.hi, prod.hi);
-      prod.lo = nir_bcsel(b, ov, np.lo, prod.lo);
-   }
-
-   rem = sub64(b, num, prod);
-   for (unsigned i = 0; i < 3; ++i) {
-      nir_def *un = ge64(b, rem, d64);
-      q = nir_bcsel(b, un, nir_iadd(b, q, one), q);
-      struct u64_pair nr = sub64(b, rem, d64);
-      rem.hi = nir_bcsel(b, un, nr.hi, rem.hi);
-      rem.lo = nir_bcsel(b, un, nr.lo, rem.lo);
-   }
-
-   return q;
-}
-
-static nir_def *
-lower_unsigned_div_scalar(nir_builder *b, nir_def *n, nir_def *d)
-{
-   nir_def *is_one = nir_ieq_imm(b, d, 1);
    nir_def *d_safe = nir_umax(b, d, nir_imm_int(b, 2));
-   nir_def *l = nir_iadd_imm(b, nir_ufind_msb(b, nir_iadd_imm(b, d_safe, -1)), 1);
-   nir_def *pow2 = nir_bcsel(b, nir_ieq_imm(b, l, 32), nir_imm_int(b, 0),
-                             nir_ishl(b, nir_imm_int(b, 1), l));
-   nir_def *hi = nir_isub(b, pow2, d_safe);
-   nir_def *m = nir_bcsel(b, is_one, nir_imm_int(b, 1),
-                          nir_iadd_imm(b, udiv64_hi_exact(b, hi, d_safe), 1));
-   nir_def *sh1 = nir_bcsel(b, is_one, nir_imm_int(b, 0), nir_imm_int(b, 1));
-   nir_def *sh2 = nir_bcsel(b, is_one, nir_imm_int(b, 0), nir_iadd_imm(b, l, -1));
+   nir_def *q0 = nir_f2u32(
+      b, nir_fmul_imm(b, nir_frcp(b, nir_u2f32(b, d_safe)), 4294950912.0));
+   q0 = nir_umax(b, q0, nir_imm_int(b, 1));
 
-   nir_def *t1 = nir_umul_high(b, n, m);
-   nir_def *t2 = nir_isub(b, n, t1);
-   nir_def *t3 = nir_ushr(b, t2, sh1);
-   nir_def *t4 = nir_iadd(b, t1, t3);
-   return nir_ushr(b, t4, sh2);
+   nir_def *q1 =
+      nir_iadd(b, q0, nir_umul_high(b, q0, nir_ineg(b, nir_imul(b, q0, d_safe))));
+   nir_def *rem = nir_ineg(b, nir_imul(b, q1, d_safe));
+   nir_def *q2 = nir_bcsel(b, nir_uge(b, rem, d_safe), nir_iadd_imm(b, q1, 1), q1);
+
+   return nir_bcsel(b, nir_ieq_imm(b, d, 1), nir_imm_int(b, UINT32_MAX), q2);
 }
 
+/* n / d or n % d from the quotient estimate umul_high(n, M), which is exact or
+ * one low. */
 static nir_def *
-lower_signed_div_scalar(nir_builder *b, nir_def *n, nir_def *d)
+udivmod(nir_builder *b, nir_def *n, nir_def *d, bool modulo)
 {
-   nir_def *ad = nir_iabs(b, d);
-   nir_def *is_one = nir_ieq_imm(b, ad, 1);
-   nir_def *d_safe = nir_umax(b, ad, nir_imm_int(b, 2));
-   nir_def *l = nir_iadd_imm(b, nir_ufind_msb(b, nir_iadd_imm(b, d_safe, -1)), 1);
-   nir_def *hi = nir_ishl(b, nir_imm_int(b, 1), nir_iadd_imm(b, l, -1));
-   nir_def *m_u = nir_iadd_imm(b, udiv64_hi_exact(b, hi, d_safe), 1);
-
-   nir_def *d_pos = nir_ige_imm(b, d, 0);
-   nir_def *m = nir_bcsel(b, is_one, nir_imm_int(b, 0),
-                          nir_bcsel(b, d_pos, m_u, nir_ineg(b, m_u)));
-   nir_def *sh = nir_bcsel(b, is_one, nir_imm_int(b, 0), nir_iadd_imm(b, l, -1));
-   nir_def *add_coeff = nir_bcsel(b, d_pos, nir_imm_int(b, 1), nir_imm_int(b, -1));
-   nir_def *add_sign = nir_bcsel(b, is_one, nir_imm_int(b, 0), nir_imm_int(b, 1));
-
-   nir_def *h = nir_imul_high(b, n, m);
-   nir_def *t = nir_iadd(b, h, nir_imul(b, n, add_coeff));
-   nir_def *q0 = nir_ishr(b, t, sh);
-   nir_def *sg = nir_ushr_imm(b, t, 31);
-   return nir_iadd(b, q0, nir_imul(b, sg, add_sign));
+   nir_def *q = nir_umul_high(b, n, uniform_reciprocal(b, d));
+   nir_def *r = nir_isub(b, n, nir_imul(b, q, d));
+   nir_def *ge = nir_uge(b, r, d);
+   return modulo ? nir_bcsel(b, ge, nir_isub(b, r, d), r)
+                 : nir_bcsel(b, ge, nir_iadd_imm(b, q, 1), q);
 }
 
 static nir_def *
 lower_divmod_scalar(nir_builder *b, nir_op op, nir_def *n, nir_def *d)
 {
+   if (op == nir_op_udiv || op == nir_op_umod)
+      return udivmod(b, n, d, op == nir_op_umod);
+
+   /* Signed, as nir_lower_idiv: divide magnitudes, then fix the signs. */
+   nir_def *n_neg = nir_ilt_imm(b, n, 0);
+   nir_def *res = udivmod(b, nir_iabs(b, n), nir_iabs(b, d), op != nir_op_idiv);
+
    switch (op) {
-   case nir_op_udiv:
-      return lower_unsigned_div_scalar(b, n, d);
-   case nir_op_umod: {
-      nir_def *q = lower_unsigned_div_scalar(b, n, d);
-      return nir_iadd(b, n, nir_imul(b, q, nir_ineg(b, d)));
-   }
    case nir_op_idiv:
-      return lower_signed_div_scalar(b, n, d);
-   case nir_op_irem: {
-      nir_def *q = lower_signed_div_scalar(b, n, d);
-      return nir_iadd(b, n, nir_imul(b, q, nir_ineg(b, d)));
-   }
+      return nir_bcsel(b, nir_ine(b, n_neg, nir_ilt_imm(b, d, 0)),
+                       nir_ineg(b, res), res);
+   case nir_op_irem:
+      return nir_bcsel(b, n_neg, nir_ineg(b, res), res);
    case nir_op_imod: {
-      nir_def *q = lower_signed_div_scalar(b, n, d);
-      nir_def *r = nir_iadd(b, n, nir_imul(b, q, nir_ineg(b, d)));
+      nir_def *r = nir_bcsel(b, n_neg, nir_ineg(b, res), res);
       nir_def *need_adj = nir_iand(b, nir_ine_imm(b, r, 0),
                                    nir_ilt_imm(b, nir_ixor(b, r, d), 0));
       return nir_bcsel(b, need_adj, nir_iadd(b, r, d), r);
@@ -214,8 +101,8 @@ lower_divmod_scalar(nir_builder *b, nir_op op, nir_def *n, nir_def *d)
  * (push constants, UBOs, constant globals, uniforms, num_workgroups, image
  * sizes) qualify. Subgroup-uniform values that cannot hoist to @preamble
  * (e.g. load_workgroup_id, non-readonly SSBOs, shared loads, subgroup ops,
- * loop phis) return false so we never leave udiv64_hi_exact in the main
- * shader body. Checking movability directly also avoids calling
+ * loop phis) return false so we never leave the reciprocal calculation in
+ * the main shader body. Checking movability directly also avoids calling
  * nir_divergence_analysis before backend/poly intrinsics are lowered.
  *
  * Before shader I/O lowering, push constants and UBOs are still deref loads.
