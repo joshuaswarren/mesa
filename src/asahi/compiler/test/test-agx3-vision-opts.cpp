@@ -138,12 +138,24 @@ count_loops(nir_shader *shader)
 
 TEST(AGX3VisionOpts, RuntimeUnrollWorkgroupStride)
 {
-   for (int step : {1, 32, -32}) {
+   struct {
+      int step;
+      bool nested;
+      bool negated_add;
+   } cases[] = {{1, true, false}, {32, false, false}, {32, true, false},
+                {-32, true, false}, {-32, true, true}};
+   for (auto c : cases) {
+      int step = c.step;
       nir_builder b = make_compute_shader("workgroup-stride");
       nir_def *bound = load_push_word(&b, 0, 16);
       nir_def *lane = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
       nir_variable *iv = nir_local_variable_create(b.impl, glsl_int_type(), "i");
-      nir_store_var(&b, iv, step > 0 ? lane : nir_isub(&b, bound, lane), 1);
+      nir_loop *outer = c.nested ? nir_push_loop(&b) : NULL;
+      nir_def *start = lane;
+      if (step < 0)
+         start = c.negated_add ? nir_iadd(&b, bound, nir_ineg(&b, lane))
+                               : nir_isub(&b, bound, lane);
+      nir_store_var(&b, iv, start, 1);
       nir_def *base = make_desc_base(&b, 4);
       nir_loop *loop = nir_push_loop(&b);
       nir_def *i = nir_load_var(&b, iv);
@@ -152,8 +164,12 @@ TEST(AGX3VisionOpts, RuntimeUnrollWorkgroupStride)
       nir_store_global(&b, i, make_buffer_addr(&b, base, nir_ishl_imm(&b, i, 2)));
       nir_store_var(&b, iv, nir_iadd_imm(&b, i, step), 1);
       nir_pop_loop(&b, loop);
+      if (outer) {
+         nir_break_if(&b, nir_ieq_imm(&b, bound, 0));
+         nir_pop_loop(&b, outer);
+      }
       NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
-      EXPECT_EQ(agx_nir_unroll_runtime_loops(b.shader, 8, 320, NULL), step == 1);
+      EXPECT_EQ(agx_nir_unroll_runtime_loops(b.shader, 8, 320, NULL), step == 1 || !c.nested);
       nir_validate_shader(b.shader, "workgroup-stride");
       ralloc_free(b.shader);
    }
