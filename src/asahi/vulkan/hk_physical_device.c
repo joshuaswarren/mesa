@@ -370,8 +370,9 @@ hk_get_device_extensions(const struct agx_device *dev,
 #endif
       .EXT_texel_buffer_alignment = true,
       /* Hardware ASTC HDR decode is supported across AGX2, native AGX3, and
-       * M5 (G13-G17C); keep G18G off until qualified on M6 hardware. */
-      .EXT_texture_compression_astc_hdr = dev->chip != AGX_CHIP_G18G,
+       * AGX3C/HAL300 (M5: G17G/G17S/G17C). Other HAL300 encodings such as
+       * AGX3D (G18G) stay off until qualified on their hardware. */
+      .EXT_texture_compression_astc_hdr = agx_chip_has_astc_hdr(dev->chip),
       .EXT_tooling_info = true,
       .EXT_transform_feedback = true,
       

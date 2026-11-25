@@ -1036,6 +1036,15 @@ agx_chip_has_feedback_loop_dynamic_state(enum agx_chip chip)
    return agx_chip_native_or_m5(chip);
 }
 
+/* Whether hardware ASTC HDR decode is qualified on this chip: AGX2, native
+ * AGX3, and M5 (AGX3C/HAL300: G17G/G17S/G17C). Other HAL300 encodings such as
+ * AGX3D (G18G) stay off until qualified on their hardware. */
+static inline bool
+agx_chip_has_astc_hdr(enum agx_chip chip)
+{
+   return !agx_chip_hal300_path(chip) || agx_chip_g17_m5(chip);
+}
+
 /* Number of helper-table slots in the USC code-container lead block.  G15
  * and G16 parts have ten; with six their fragment programs of 256x256 and
  * larger walk past the lead into the guard page.  On G17P the state loader's
