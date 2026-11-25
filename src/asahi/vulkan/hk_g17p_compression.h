@@ -4,6 +4,7 @@
  */
 #pragma once
 #include "asahi/lib/agx_chip.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "hk_g17p_meta_copy_core.h"
 #include "drm-uapi/asahi_drm.h"
 #include "vulkan/vulkan_core.h"
@@ -495,7 +496,8 @@ static inline bool
 hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
                                  const VkImageCreateInfo *info)
 {
-   if (!agx_chip_g17_m5(chip) || plane != 0 || !info)
+   if (!agx_chip_has_cap(chip, AGX_CAP_GEN10_2D_COMPRESSION) || plane != 0 ||
+       !info)
       return false;
 
    /* Read the chain as hk_g17p_compression_eligible() does. */

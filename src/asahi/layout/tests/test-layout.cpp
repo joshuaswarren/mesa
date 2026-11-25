@@ -451,8 +451,8 @@ TEST(M5Layout, CompressedOneByteMipAlignment)
       .height_px = 128,
       .depth_px = 1,
       .sample_count_sa = 1,
-      .levels = 8,
       .policy = AIL_LAYOUT_POLICY_M5,
+      .levels = 8,
       .tiling = AIL_TILING_GPU,
       .compressed = true,
       .format = PIPE_FORMAT_R8_UNORM,
@@ -477,8 +477,8 @@ TEST(M5Layout, CompressedOneByteMipAlignment)
       .height_px = 255,
       .depth_px = 1,
       .sample_count_sa = 1,
-      .levels = 9,
       .policy = AIL_LAYOUT_POLICY_M5,
+      .levels = 9,
       .tiling = AIL_TILING_GPU,
       .compressed = true,
       .format = PIPE_FORMAT_R8G8B8A8_UNORM,
@@ -487,4 +487,57 @@ TEST(M5Layout, CompressedOneByteMipAlignment)
    ail_make_miptree(&m5_rgba8);
    /* Level 4 is 16x15 (1 KiB of texels), followed by uncompressed level 5. */
    EXPECT_EQ(m5_rgba8.level_offsets_B[5] - m5_rgba8.level_offsets_B[4], 1024u);
+}
+
+TEST(M5Layout, CompressedOneByteMipAlignmentArray)
+{
+   /* A mipmapped one-byte 2D array keeps the 2 KiB compressed-level
+    * placement in every layer: each level that a compressed level follows
+    * starts the next one on a 2 KiB boundary, and the tail after the last
+    * compressed level keeps the cache-line spacing. */
+   struct ail_layout m5_r8 = {
+      .width_px = 256,
+      .height_px = 256,
+      .depth_px = 4,
+      .sample_count_sa = 1,
+      .policy = AIL_LAYOUT_POLICY_M5,
+      .levels = 9,
+      .tiling = AIL_TILING_GPU,
+      .compressed = true,
+      .format = PIPE_FORMAT_R8_UINT,
+      .renderable = true,
+   };
+   ail_make_miptree(&m5_r8);
+
+   for (unsigned l = 0; l + 1 < m5_r8.levels; ++l) {
+      if (ail_is_level_logically_compressed(&m5_r8, l + 1)) {
+         EXPECT_EQ(m5_r8.level_offsets_B[l + 1] % 2048, 0u) << "level " << l + 1;
+      }
+   }
+   /* Level 3 is 32x32 (1 KiB), level 4 (16x16) is the last compressed one. */
+   EXPECT_TRUE(ail_is_level_logically_compressed(&m5_r8, 4));
+   EXPECT_FALSE(ail_is_level_logically_compressed(&m5_r8, 5));
+   EXPECT_EQ(m5_r8.level_offsets_B[4] - m5_r8.level_offsets_B[3], 2048u);
+   EXPECT_EQ(m5_r8.level_offsets_B[5] - m5_r8.level_offsets_B[4], 256u);
+
+   /* Every layer starts on a page and sees the same level placement. */
+   EXPECT_TRUE(m5_r8.page_aligned_layers);
+   EXPECT_EQ(m5_r8.layer_stride_B % AIL_PAGESIZE, 0u);
+   for (unsigned layer = 1; layer < m5_r8.depth_px; ++layer) {
+      EXPECT_EQ(ail_get_layer_level_B(&m5_r8, layer, 4) -
+                   ail_get_layer_level_B(&m5_r8, layer, 3),
+                2048u);
+   }
+
+   /* A 3D volume (mipmapped_z) has no compressed mip chain on M5 and keeps
+    * the legacy spacing. */
+   struct ail_layout m5_r8_3d = m5_r8;
+   memset(m5_r8_3d.level_offsets_B, 0, sizeof(m5_r8_3d.level_offsets_B));
+   m5_r8_3d.mipmapped_z = true;
+   struct ail_layout legacy_3d = m5_r8_3d;
+   legacy_3d.policy = AIL_LAYOUT_POLICY_LEGACY;
+   ail_make_miptree(&m5_r8_3d);
+   ail_make_miptree(&legacy_3d);
+   for (unsigned l = 0; l < m5_r8_3d.levels; ++l)
+      EXPECT_EQ(m5_r8_3d.level_offsets_B[l], legacy_3d.level_offsets_B[l]);
 }

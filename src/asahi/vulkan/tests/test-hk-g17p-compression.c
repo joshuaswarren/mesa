@@ -642,18 +642,29 @@ check_m5_color(void)
    VkImageCreateInfo i = image(VK_FORMAT_R8G8B8A8_UNORM, 2048, 2048, 5, usage);
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
       CHECK(hk_m5_color_compression_eligible((enum agx_chip)chip, 0, &i) ==
-            agx_chip_g17_m5((enum agx_chip)chip));
+            agx_chip_has_cap((enum agx_chip)chip,
+                             AGX_CAP_GEN10_2D_COMPRESSION));
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G18G, 0, &i));
    i.mipLevels = 1;
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &i));
    i.mipLevels = 12;
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &i));
    /* 2D arrays (single-level and mipmapped), cubes, and single-level 3D are
-    * admitted for 1-8 byte and B10G11R11 colour formats. */
+    * admitted for 1-8 byte colour formats, on every chip with Gen10 private
+    * compression and on no other (G18G included). */
    VkImageCreateInfo c = i;
    c.arrayLayers = 2;
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
+      CHECK(hk_m5_color_compression_eligible((enum agx_chip)chip, 0, &c) ==
+            agx_chip_has_cap((enum agx_chip)chip,
+                             AGX_CAP_GEN10_2D_COMPRESSION));
    c.mipLevels = 1;
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G18G, 0, &c));
+   /* 2D_ARRAY_COMPATIBLE belongs to 3D images only. */
+   c.flags = VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
    c = i;
    c.mipLevels = 1;
    c.extent.width = 128;
@@ -661,6 +672,16 @@ check_m5_color(void)
    c.arrayLayers = 6;
    c.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17C, 0, &c));
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G18G, 0, &c));
+   /* Cube arrays and mipmapped cubes too; a layer count that is not a whole
+    * number of faces, or non-square faces, are not cubes. */
+   c.arrayLayers = 12;
+   c.mipLevels = 8;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.arrayLayers = 7;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.arrayLayers = 6;
    c.extent.width = 129;
    CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
    c = i;
@@ -671,7 +692,22 @@ check_m5_color(void)
    c.arrayLayers = 1;
    c.mipLevels = 1;
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G18G, 0, &c));
+   /* Slices rendered through 2D array or 2D views keep the 3D layout. */
+   c.flags = VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
+             VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.flags = 0;
    c.mipLevels = 2;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.mipLevels = 1;
+   c.extent.depth = 0;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   /* A 2D image keeps one depth slice. */
+   c = i;
+   c.extent.depth = 2;
    CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
    /* A transfer destination is made renderable like an attachment; an
     * image that is neither is not compressed. */
@@ -680,13 +716,43 @@ check_m5_color(void)
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
    c.usage &= ~VK_IMAGE_USAGE_TRANSFER_DST_BIT;
    CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
-   /* 16-byte formats compress as single-sample, single-layer 2D only. */
+   /* 16-byte formats compress as single-sample, single-layer 2D only (a
+    * spilled one is decompressed in place by libagx_agx3_decompress). */
+   static const VkFormat sixteen_byte[] = {
+      VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT,
+      VK_FORMAT_R32G32B32A32_SINT,
+   };
+   for (unsigned f = 0; f < sizeof(sixteen_byte) / sizeof(sixteen_byte[0]);
+        ++f) {
+      c = i;
+      c.format = sixteen_byte[f];
+      CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
+         CHECK(hk_m5_color_compression_eligible((enum agx_chip)chip, 0, &c) ==
+               agx_chip_has_cap((enum agx_chip)chip,
+                                AGX_CAP_GEN10_2D_COMPRESSION));
+      c.mipLevels = 1;
+      CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c.arrayLayers = 2;
+      CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c.arrayLayers = 6;
+      c.extent.height = c.extent.width;
+      c.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+      CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c.flags = 0;
+      c.arrayLayers = 1;
+      c.imageType = VK_IMAGE_TYPE_3D;
+      c.extent.depth = 4;
+      CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.format = sixteen_byte[f];
+      c.mipLevels = 1;
+      c.samples = VK_SAMPLE_COUNT_2_BIT;
+      CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   }
+   /* Twelve-byte RGB32 texels are not a compression format. */
    c = i;
-   c.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
-   c.format = VK_FORMAT_R32G32B32A32_UINT;
-   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
-   c.arrayLayers = 2;
+   c.format = VK_FORMAT_R32G32B32_SFLOAT;
    CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
    c = i;
    c.samples = VK_SAMPLE_COUNT_4_BIT;
@@ -701,6 +767,10 @@ check_m5_color(void)
       c = i;
       c.format = one_byte[f];
       CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G18G, 0, &c));
+      c.arrayLayers = 4;
+      CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c.arrayLayers = 1;
       c.mipLevels = 1;
       CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
    }
@@ -720,7 +790,8 @@ check_m5_color(void)
    c.flags = VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
       CHECK(hk_m5_color_compression_eligible((enum agx_chip)chip, 0, &c) ==
-            agx_chip_g17_m5((enum agx_chip)chip));
+            agx_chip_has_cap((enum agx_chip)chip,
+                             AGX_CAP_GEN10_2D_COMPRESSION));
    c.format = VK_FORMAT_R8_UNORM;
    c.mipLevels = 1;
    c.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
