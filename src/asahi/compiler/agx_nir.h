@@ -11,6 +11,7 @@
 
 struct nir_shader;
 struct nir_instr;
+struct nir_intrinsic_instr;
 struct nir_builder;
 struct nir_def;
 struct nir_alu_instr;
