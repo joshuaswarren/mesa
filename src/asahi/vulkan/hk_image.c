@@ -11,6 +11,7 @@
 #include "agx_bg_eot_key.h"
 #include "hk_native_descriptor.h"
 #include "asahi/layout/layout.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "util/bitscan.h"
 #include "util/format/u_format.h"
@@ -71,7 +72,8 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
     * of code inspection alone.  COSITED_EVEN is kept because it is what this
     * driver actually implements and passes.
     */
-   if (agx_native_graphics(&pdev->dev) && hk_packed_ycbcr_bits(vk_format)) {
+   if (agx_chip_native_agx3(pdev->dev.chip) &&
+       hk_packed_ycbcr_bits(vk_format)) {
       if (tiling != VK_IMAGE_TILING_OPTIMAL && tiling != VK_IMAGE_TILING_LINEAR)
          return 0;
       return VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
@@ -90,17 +92,15 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
 
    enum pipe_format p_format = hk_format_to_pipe_format(vk_format);
    /* D16S8 uses the existing independent D16 and S8 planes, as D32S8 does
-    * on G17P and M5. */
+    * across all generations. */
    if (vk_format == VK_FORMAT_D16_UNORM_S8_UINT) {
-      if (pdev->dev.chip != AGX_CHIP_G17P && !agx_chip_g17_m5(pdev->dev.chip))
-         return 0;
       p_format = PIPE_FORMAT_Z16_UNORM;
    }
    if (p_format == PIPE_FORMAT_NONE)
       return 0;
 
    enum pipe_format padded = hk_padded_image_format(p_format);
-   if ((agx_native_graphics(&pdev->dev) || agx_chip_g17_m5(pdev->dev.chip)) &&
+   if (agx_chip_native_or_m5(pdev->dev.chip) &&
        padded != p_format) {
       /* Linear and external modifier layouts must retain the API's packed
        * texel stride. This path is restricted to driver-owned optimal images. */
@@ -153,7 +153,7 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
    /* Keep compressed-family reporting atomic with the corresponding Vulkan
     * feature. The complete BC, ETC2/EAC and ASTC LDR format matrices are
     * hardware-qualified through the native G17P sampled/upload path. */
-   if (agx_native_graphics(&pdev->dev) &&
+   if (agx_chip_native_agx3(pdev->dev.chip) &&
        util_format_is_compressed(p_format) &&
        !hk_g17p_bc_format_supported(vk_format)) {
       const enum util_format_layout layout =
@@ -229,11 +229,11 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
                   VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
    }
 
-   /* Our image atomic lowering doesn't bother to handle linear */
+   /* Our image atomic lowering doesn't bother to handle linear. R32_SFLOAT
+    * atomics are required wherever shaderImageFloat32Atomics is advertised. */
    if ((p_format == PIPE_FORMAT_R32_UINT || p_format == PIPE_FORMAT_R32_SINT ||
         (p_format == PIPE_FORMAT_R32_FLOAT &&
-         (pdev->dev.chip == AGX_CHIP_G17P ||
-          agx_chip_g17_m5(pdev->dev.chip)))) &&
+         pdev->vk.supported_features.shaderImageFloat32Atomics)) &&
        tiling == VK_IMAGE_TILING_OPTIMAL) {
 
       features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
@@ -320,7 +320,7 @@ hk_get_image_format_features(struct hk_physical_device *pdev,
    }
 
    /* G17P used to add CHROMA_RECONSTRUCTION_EXPLICIT_FORCEABLE here, and only
-    * G17P: agx_native_graphics() is G16G/G17P, so M1/M2 reach these formats
+    * G17P: agx_chip_native_agx3() is G16G/G17P, so M1/M2 reach these formats
     * without it and every explicit_* conformance case is NotSupported there.
     *
     * That bit is the sole route into VK-GL-CTS's explicit reconstruction
@@ -448,15 +448,16 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
     * Feedback loops are problematic with compression. The GL driver bans them.
     * Interestingly, the relevant CTS tests pass on G13G and G14C, but not on
     * G13D. Keep that restriction except for depth images already admitted by
-    * the G17P or M5 policy. Rejecting those here contradicts the depth policy and
-    * makes the host-copy performance query report a plain device layout;
-    * Zink then retains HOST_TRANSFER and never compresses its depth images.
+    * the HAL200 (G16G, G17P) or M5 policy. Rejecting those here contradicts the
+    * depth policy and makes the host-copy performance query report a plain
+    * device layout; Zink then retains HOST_TRANSFER and never compresses its
+    * depth images.
     */
    /* Decided on the API format: the stencil plane of D32_SFLOAT_S8_UINT is
     * S8_UINT here, and zink gives its depth/stencil images feedback-loop
     * usage. */
    const bool depth_feedback =
-      (dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip)) &&
+      (agx_chip_native_hal200(dev->chip) || agx_chip_g17_m5(dev->chip)) &&
       allow_agx3 && hk_g17p_compression_depth_format(api_format);
    if ((usage & (VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT |
                  VK_IMAGE_USAGE_STORAGE_BIT)) ||
@@ -577,7 +578,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    if (dev->chip == AGX_CHIP_G17P)
       return false;
 
-   if (dev->chip != AGX_CHIP_G17S || plane ||
+   if (!hk_chip_supports_compressed_storage_pbe(dev->chip) || plane ||
        (info->pNext && !format_list_only) ||
        (info->flags & ~allowed_flags) ||
        info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
@@ -627,7 +628,6 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    case VK_FORMAT_R16_SNORM:
    case VK_FORMAT_R16_UINT:
    case VK_FORMAT_R16_SINT: bit = 1024; break;
-   case VK_FORMAT_B10G11R11_UFLOAT_PACK32: bit = 2048; break;
    default: return false;
    }
    /* A mutable image's views may be FLOAT when the image is not: the list
@@ -640,8 +640,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
 static bool
 hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                             const VkImageCreateInfo *info,
-                            bool float_image_atomics, bool srgb_pair_views,
-                            bool multiview);
+                            bool float_image_atomics, bool srgb_pair_views);
 
 /* Whether shaders of this device may use atomics on R32_SFLOAT images. */
 static bool
@@ -728,7 +727,8 @@ hk_can_compress_format(const struct agx_device *dev, VkFormat format)
 bool
 hk_interchange_format(const struct agx_device *dev, VkFormat format)
 {
-   if (dev->chip != AGX_CHIP_G17P || (dev->debug & AGX_DBG_NOCOMPRESS))
+   if (!agx_chip_has_cap(dev->chip, AGX_CAP_GEN9_2D_COMPRESSION) ||
+       (dev->debug & AGX_DBG_NOCOMPRESS))
       return false;
 
    switch (format) {
@@ -736,6 +736,8 @@ hk_interchange_format(const struct agx_device *dev, VkFormat format)
    case VK_FORMAT_B8G8R8A8_SRGB:
    case VK_FORMAT_R8G8B8A8_UNORM:
    case VK_FORMAT_R8G8B8A8_SRGB:
+   case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
       return true;
    default:
       return false;
@@ -838,8 +840,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       if (!pdev->vk.supported_features.sparseBinding)
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-      if (pdev->dev.chip == AGX_CHIP_G17P &&
-          (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)) {
+      if (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) {
          const struct vk_features *supported = &pdev->vk.supported_features;
          if (pImageFormatInfo->tiling != VK_IMAGE_TILING_OPTIMAL ||
              (pImageFormatInfo->type == VK_IMAGE_TYPE_2D &&
@@ -957,7 +958,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    const bool g17p_compressed =
-      (pdev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(pdev->dev.chip)) &&
+      agx_chip_g17p_or_m5(pdev->dev.chip) &&
       pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
       drm_mod_info &&
       drm_mod_info->drmFormatModifier ==
@@ -1030,8 +1031,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
     * particular, exposing ordinary 2x/4x attachments does not enable sparse
     * multisampling. The sparse format query delegates to this query too.
     */
-   if (pdev->dev.chip == AGX_CHIP_G17P &&
-       (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT))
+   if (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)
       sampleCounts &= VK_SAMPLE_COUNT_1_BIT;
 
    /* From the Vulkan 1.2.199 spec:
@@ -1186,14 +1186,17 @@ hk_GetPhysicalDeviceImageFormatProperties2(
           *
           * The query omits dimensions, levels, layers and samples. Choose a
           * shape that permits compression: if any such image can compress,
-          * host-transfer images cannot promise the same layout.
+          * host-transfer images cannot promise the same layout. Probe every
+          * supported sample count, since a policy may compress only the
+          * multisampled images of a format (G16G compresses 2x/4x depth but
+          * not single-sample depth).
           */
          const VkExternalMemoryImageCreateInfo external_create_info = {
             .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
             .pNext = pImageFormatInfo->pNext,
             .handleTypes = external_info ? external_info->handleType : 0,
          };
-         const VkImageCreateInfo device_copy_info = {
+         VkImageCreateInfo device_copy_info = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = &external_create_info,
             .flags = pImageFormatInfo->flags,
@@ -1201,7 +1204,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
             .format = pImageFormatInfo->format,
             .extent = {64, 64, 1},
             .mipLevels = 1,
-            .arrayLayers = agx_is_m4_pro(&pdev->dev) &&
+            .arrayLayers = pdev->dev.chip == AGX_CHIP_G17P &&
                                  (pImageFormatInfo->flags &
                                   VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)
                               ? 6 : 1,
@@ -1214,9 +1217,12 @@ hk_GetPhysicalDeviceImageFormatProperties2(
          };
          bool can_compress = false;
          if (pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL) {
-            for (unsigned plane = 0; plane < plane_count; ++plane) {
-               can_compress |= hk_can_compress_create_info(
-                  &pdev->dev, plane, &device_copy_info, false, false, false);
+            u_foreach_bit(s, sampleCounts) {
+               device_copy_info.samples = (VkSampleCountFlagBits)BITFIELD_BIT(s);
+               for (unsigned plane = 0; plane < plane_count; ++plane) {
+                  can_compress |= hk_can_compress_create_info(
+                     &pdev->dev, plane, &device_copy_info, false, false);
+               }
             }
          }
 
@@ -1310,31 +1316,18 @@ hk_GetPhysicalDeviceSparseImageFormatProperties2(
    {
       props->properties = hk_fill_sparse_image_fmt_props(
          vk_format_to_pipe_format(pFormatInfo->format), pFormatInfo->samples,
-         aspects, pdev->dev.chip == AGX_CHIP_G17P &&
-                     pFormatInfo->type == VK_IMAGE_TYPE_3D);
+         aspects, pFormatInfo->type == VK_IMAGE_TYPE_3D);
    }
-}
-
-/* A multiview pass keeps multisample colour to an eight-byte budget in the
- * tilebuffer (the uncovered-tile defect), and G17P cannot spill a compressed
- * target: with more compressed 2x colour than that, the pass could only fail.
- * A 2x colour image cannot know whether it will meet such a pass, so it stays
- * plain on a device that enabled multiview. Depth is not in that budget. */
-static bool
-hk_g17p_multiview_spill_risk(const VkImageCreateInfo *info, bool multiview)
-{
-   return multiview && info->samples != VK_SAMPLE_COUNT_1_BIT &&
-          !vk_format_is_depth_or_stencil(info->format);
 }
 
 static bool
 hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                             const VkImageCreateInfo *info,
-                            bool float_image_atomics, bool srgb_pair_views,
-                            bool multiview)
+                            bool float_image_atomics, bool srgb_pair_views)
 {
-   /* AGX3: G17P compresses every image hk_g17p_compression.h admits. Other
-    * AGX3 chips stay plain until their packets are recovered. */
+   /* AGX3: HAL200 (G17P and, for 2x/4x MSAA depth, G16G) and M5 compress every
+    * image hk_g17p_compression.h admits. Other AGX3 chips stay plain until
+    * their packets are recovered. */
    const bool m5_storage =
       hk_m5_storage_compression_eligible(dev, plane, info, float_image_atomics);
    bool allow_agx3 =
@@ -1344,9 +1337,8 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
       hk_m5_depth_msaa_transfer_eligible(dev->chip, plane, info,
                                          dev->params.features) ||
       m5_storage ||
-      (hk_hal200_compression_eligible(dev->chip, dev->params.chip_id, plane,
-                                      info, agx_is_m4_pro(dev)) &&
-       !hk_g17p_multiview_spill_risk(info, multiview)) ||
+      hk_hal200_compression_eligible(dev->chip, dev->params.chip_id, plane,
+                                     info) ||
       hk_g17p_shared_compression_eligible(dev->chip, plane, info) ||
       hk_m5_color_compression_eligible(dev->chip, plane, info) ||
       hk_m5_depth_compression_eligible(dev->chip, plane, info);
@@ -1393,8 +1385,7 @@ hk_map_compression(struct hk_device *dev, const VkImageCreateInfo *info,
       return hk_can_compress_create_info(
          &dev->dev, plane, info, hk_float_image_atomics(dev),
          hk_physical_device_instance(hk_device_physical(dev))
-            ->drirc.misc.mutable_format_srgb_pair,
-         dev->vk.enabled_features.multiview);
+            ->drirc.misc.mutable_format_srgb_pair);
 
    case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT:
       return ail_is_drm_modifier_compressed(modifier);
@@ -1445,8 +1436,7 @@ choose_drm_format_mod(struct hk_device *dev, uint8_t plane_count,
 
    for (uint8_t plane = 0; plane < plane_count; plane++) {
       if (!hk_can_compress_create_info(&dev->dev, plane, info,
-                                       hk_float_image_atomics(dev), false,
-                                       dev->vk.enabled_features.multiview))
+                                       hk_float_image_atomics(dev), false))
          can_compress = false;
    }
 
@@ -1560,9 +1550,11 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
          return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
                           "interchange modifier on an ineligible image");
 
-      /* The row pitch is part of the modifier's contract with appledrm. */
+      /* Per pixel row: matches ail_get_wsi_stride_B() (1/16 of the 16x16
+       * macroblock row pitch) so DRM core's pitch * height check and
+       * vkGetImageSubresourceLayout() agree with explicit modifier imports. */
       const uint64_t pitch_B = DIV_ROUND_UP(pCreateInfo->extent.width, 16) *
-                               256 * vk_format_get_blocksize(pCreateInfo->format);
+                               16 * vk_format_get_blocksize(pCreateInfo->format);
       if (mod_explicit_info &&
           mod_explicit_info->pPlaneLayouts[0].rowPitch != pitch_B)
          return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
@@ -1573,7 +1565,7 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
    /* G17P and M5 share compressed colour images only in the shape both sides
     * allocate identically (hk_g17p_shared_compression_eligible()). */
    if (image->vk.drm_format_mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
-       (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
+       agx_chip_g17p_or_m5(dev->dev.chip) &&
        !(hk_g17p_shared_compression_supported(
             &dev->dev, pCreateInfo->format, pCreateInfo->imageType,
             pCreateInfo->flags, pCreateInfo->usage, pCreateInfo->pNext) &&
@@ -1598,7 +1590,7 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
 
       const enum pipe_format p_format = hk_format_to_pipe_format(format);
       const enum pipe_format layout_format =
-         (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
+         agx_chip_native_or_m5(dev->dev.chip) &&
                pCreateInfo->tiling == VK_IMAGE_TILING_OPTIMAL
             ? hk_padded_image_format(p_format)
             : p_format;
@@ -2121,8 +2113,7 @@ hk_get_image_sparse_memory_requirements(
       reqs->memoryRequirements =
          hk_fill_sparse_image_memory_reqs(
             &image->planes[0].layout, aspects,
-            dev->dev.chip == AGX_CHIP_G17P &&
-               image->vk.image_type == VK_IMAGE_TYPE_3D);
+            image->vk.image_type == VK_IMAGE_TYPE_3D);
    };
 }
 

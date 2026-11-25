@@ -17,6 +17,7 @@
 #include "hk_descriptor_set.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_sampler.h"
+#include "hk_sampler_index.h"
 #include "hk_native_descriptor.h"
 #include "hk_shader.h"
 #include "hk_nir_sampler_bias.h"
@@ -373,18 +374,27 @@ load_descriptor_for_idx_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    index = nir_iadd(b, index, intrin->src[0].ssa);
    b->constant_fold_alu = false;
 
+   const nir_descriptor_type desc_type = nir_intrinsic_desc_type(intrin);
+
    /* A buffer descriptor is a vec4 (address, size, ...); an acceleration
     * structure is a bare 64-bit BVH address, and rq_initialize consumes it
     * as one.  Loading it as a vec4 would both read past the descriptor and
     * hand the ray-query lowering the wrong-shaped value. */
-   if (nir_intrinsic_desc_type(intrin) ==
-       nir_descriptor_type_acceleration_structure)
+   if (desc_type == nir_descriptor_type_acceleration_structure)
       return load_descriptor(b, 1, 64, set, binding, index, 0, false, ctx);
 
    const unsigned components =
-      nir_intrinsic_desc_type(intrin) == nir_descriptor_type_storage_buffer &&
+      desc_type == nir_descriptor_type_storage_buffer &&
       storage_address_has_map(ctx) ? 5 : 4;
-   return load_descriptor(b, components, 32, set, binding, index, 0, true, ctx);
+   nir_def *desc =
+      load_descriptor(b, components, 32, set, binding, index, 0, true, ctx);
+   if (desc_type == nir_descriptor_type_uniform_buffer &&
+       !nir_scalar_is_const(nir_scalar_resolved(desc, 3))) {
+      /* Every uniform buffer descriptor (including mutable slots written as
+       * VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) leaves the .w offset word zero. */
+      desc = nir_vector_insert_imm(b, desc, nir_imm_int(b, 0), 3);
+   }
+   return desc;
 }
 
 static bool
@@ -1248,7 +1258,8 @@ lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
    /* Task and mesh shaders with a derivative group take the compute
     * derivatives (meshAndTaskShaderDerivatives). */
    if (tex->op != nir_texop_lod ||
-       (ctx->descriptor_generation != 9 && ctx->descriptor_generation != 10) ||
+       (!hk_descriptor_generation_is_agx2(ctx->descriptor_generation) &&
+        ctx->descriptor_generation != 9 && ctx->descriptor_generation != 10) ||
        !mesa_shader_stage_uses_workgroup(b->shader->info.stage) ||
        b->shader->info.derivative_group == DERIVATIVE_GROUP_NONE)
       return false;
@@ -1281,7 +1292,26 @@ lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
    const uint64_t plane_offset_B = plane * native.stride;
 
    nir_def *word, *api_bias;
-   if (ctx->descriptor_generation == 9) {
+   if (hk_descriptor_generation_is_agx2(ctx->descriptor_generation)) {
+      nir_def *published = load_resource_deref_desc(
+         b, 1, 16, sampler, plane_offset_B + native.sampler_index, ctx);
+      nir_def *published32 = nir_u2u32(b, published);
+      nir_def *index = nir_bcsel(
+         b, nir_uge_imm(b, published32, HK_SAMPLER_AGX2_BIAS),
+         nir_iadd_imm(b, published32, -(int)HK_SAMPLER_AGX2_BIAS),
+         nir_imm_int(b, 0));
+      api_bias = nir_f2f32(
+         b, load_resource_deref_desc(b, 1, 16, sampler,
+                                     plane_offset_B + native.lod_bias, ctx));
+      nir_def *heap = load_root(
+         b, 1, 64,
+         nir_imm_int(b, hk_root_descriptor_offset(sampler_heap_address)), 8);
+      nir_def *addr = nir_iadd(
+         b, heap,
+         nir_imul_imm(b, nir_u2u64(b, index),
+                      agx_chip_sampler_heap_element_size(AGX_CHIP_G13G)));
+      word = load_speculatable(b, 1, 32, addr, 8);
+   } else if (ctx->descriptor_generation == 9) {
       nir_def *index = load_resource_deref_desc(
          b, 1, 16, sampler, plane_offset_B + native.sampler_index, ctx);
       api_bias = load_resource_deref_desc(

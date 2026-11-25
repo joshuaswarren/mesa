@@ -64,7 +64,7 @@ agx3_bittest_encode(enum agx_isa_encoding enc,
       if (d->wait_mask & (1u << slot))
          ov[n++] = (struct agx3_field_kv)KV(98 + slot, 1);
    }
-   return agx3_bind_compose(enc, "isel", negate ? 22 : 27, base,
+   return agx3_bind_compose(enc, AGX3_MN_isel, negate ? 22 : 27, base,
                            sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
 
@@ -151,12 +151,8 @@ static const struct agx3_isel_form form_16_reg_reg = {
     KV(90, 1), KV(93, 1)}};
 
 /*
- * A 16-bit result in an odd half is a different encoding point, not a field:
- * Apple emits ep25 for an even half and ep26 for an odd one, with an
- * otherwise identical field layout. Witnessed by ushort2/ushort4 kernels,
- * whose components must land in adjacent halves, so the compiler had to
- * produce both. (Scalar code never does -- Apple's allocator always picks an
- * even half, which is why the first pass here saw only ep25.)
+ * 16-bit results use ep25 for even destination halves and ep26 for odd
+ * halves, with the same field layout.
  */
 static const struct agx3_isel_form *
 pick_form(bool dest_16, enum agx3_isel_operand t, enum agx3_isel_operand f)
@@ -208,22 +204,18 @@ encode_explicit(const struct agx3_isel_desc *d,
 {
    const bool tu = d->true_kind == AGX3_ISEL_UNIFORM;
    const bool fu = d->false_kind == AGX3_ISEL_UNIFORM;
+   const bool ti = d->true_kind == AGX3_ISEL_IMMEDIATE;
+   const bool fi = d->false_kind == AGX3_ISEL_IMMEDIATE;
    const bool any_uniform = d->cmp0_uniform || d->cmp1_uniform || tu || fu;
 
-   /* Native G17P (metal-nt -arch applegpu_g17p) uniform isel witnesses:
-    *   (u < r) ? r : r      02091701020285c00004   cmp0 f36, f42 = 3
-    *   (r < u) ? r : r      02010f09020205c20004   cmp1 f51, f57 = 3
-    *   (r == 7) ? u : r     02010f86260a17c20002   true f66, f72 = 3
-    *   (r == 7) ? r : u     02010f86060217c2200c   false f83, f89 = 3
-    *   (r == 7) ? u : u     02010f86260a17c2200c
-    *   (r < r) ? u : 3      02010f03220a05c02083
-    * Keep to those shapes: one uniform comparand beside a 32-bit register,
-    * or uniform selects beside register/immediate comparands, 32-bit result. */
+   /* Admitted G17P uniform isel shapes (32-bit result): one uniform comparand
+    * (cmp0 f36/f42=3 or cmp1 f51/f57=3) beside a 32-bit register, or uniform
+    * selects (true f66/f72=3, false f83/f89=3) beside register/imm comparands. */
    if (any_uniform) {
       if (d->dest_16 || d->cmp_16 ||
           (d->cmp0_uniform && d->cmp1_uniform) ||
           ((d->cmp0_uniform || d->cmp1_uniform) &&
-           (d->cmp1_immediate || tu || fu)) ||
+           (d->cmp1_immediate || tu || fu || ti || fi)) ||
           (d->cmp0_uniform && !uniform32_ok(d->cmp0)) ||
           (d->cmp1_uniform && !uniform32_ok(d->cmp1)) ||
           (tu && !uniform32_ok(d->sel_true)) ||
@@ -249,8 +241,6 @@ encode_explicit(const struct agx3_isel_desc *d,
          return false;
    }
 
-   const bool ti = d->true_kind == AGX3_ISEL_IMMEDIATE;
-   const bool fi = d->false_kind == AGX3_ISEL_IMMEDIATE;
    if ((d->cmp1_immediate && (d->cache[1] || d->discard[1])) ||
        (ti && (d->cache[2] || d->discard[2])) ||
        (fi && (d->cache[3] || d->discard[3])))
@@ -298,7 +288,7 @@ encode_explicit(const struct agx3_isel_desc *d,
       ov[n++] = (struct agx3_field_kv)KV(98 + i, (d->wait_mask >> i) & 1);
 
    const unsigned ep = d->dest_16 ? 25 + (d->dest & 1) : 27;
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "isel", ep,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, AGX3_MN_isel, ep,
                            base, sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
 
@@ -366,16 +356,8 @@ encode_gpu1(const struct agx3_isel_desc *d,
       return false;
    if (d->cmp1_sign_extend && !d->cmp1_16)
       return false;
-   /* A signed relation with a 16-bit result is the same instruction with
-    * f82 = 5/6, on a full-width comparand: applegpu_g17g kernels in
-    * test/native/g17g/m5-compare-select-reference.metal, which is also the
-    * shape glamor's gradient stop search reaches --
-    *
-    *   (i > 1) ? 0 : 1       02010d82228107022080   slt 2, constants exchanged
-    *   (i < 1) ? 0 : 1       02010d80228106022080   sgt 0
-    *   (i < j) ? 0 : 1       02011d03228007002081   slt, register comparand
-    *
-    * A narrow comparand with a signed relation stays unwitnessed. */
+   /* AGX3C 16-bit-result signed relations (f82=5/6) require full-width
+    * comparands; narrow comparands with signed relations stay closed. */
    if (d->dest_16 &&
        (d->cond != AGX3_ISEL_ICOND_ULT && d->cond != AGX3_ISEL_ICOND_UGT &&
         d->cond != AGX3_ISEL_ICOND_EQ) &&
@@ -392,14 +374,8 @@ encode_gpu1(const struct agx3_isel_desc *d,
 
    const struct agx3_field_kv base[] = {
       KV(9, 2), KV(10, d->dest_16 ? 1 : 2),
-      /* f11 is the destination-cache hint, as in every other GPU1 form
-       * sharing this f9/f10/f2/f11 header (iadd32's `16 + 16` witness
-       * carries f11=1 with a live result; cbs, copies and funops write it
-       * from dest_cache too). The three m5-xfb-alu8 selects store their
-       * result directly and carry f11=0 whatever the selected-operand mix,
-       * including the word-comparand register/zero shape the earlier
-       * "mixed selection" reading of this field set to 1 -- the same
-       * correction GPU0's f12 received. */
+      /* On AGX3C, f11 is the destination-cache hint (shared across the
+       * f9/f10/f2/f11 header family, matching AGX3B's f12). */
       KV(11, d->dest_cache),
       KV(23, 2), KV(24, d->cmp_16 ? 1 : 2),
       /* Native ushort equality sets f28 with its half comparator. */
@@ -433,7 +409,7 @@ encode_gpu1(const struct agx3_isel_desc *d,
    const unsigned last = d->dest_16 ? 8 : 4;
    for (unsigned ep = first; ep <= last; ++ep)
       if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,
-                            d->dest_16 ? "iseli16" : "iseli32", ep,
+                            d->dest_16 ? AGX3_MN_iseli16 : AGX3_MN_iseli32, ep,
                             base, sizeof(base) / sizeof(base[0]), ov, n, out, len))
          return true;
    return false;
@@ -502,7 +478,7 @@ encode_agx3c(const struct agx3_isel_desc *d,
    for (unsigned i = 0; i < 8; ++i)
       ov[n++] = (struct agx3_field_kv)KV(74 + i, (d->wait_mask >> i) & 1);
 
-   const char *mnemonic = d->dest_16 ? "iseli16" : "iseli32";
+   enum agx3_mnemonic mnemonic = d->dest_16 ? AGX3_MN_iseli16 : AGX3_MN_iseli32;
    for (unsigned ep = 0; ep < 16; ++ep) {
       if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, mnemonic, ep, base,
                             sizeof(base) / sizeof(base[0]), ov, n, out, len))
@@ -593,7 +569,7 @@ agx3_isel_encode(enum agx_isa_encoding encoding,
          ov[n++] = (struct agx3_field_kv)KV(98 + i, 1);
    }
 
-   return agx3_bind_compose(encoding, "isel", ep, form->base, form->nbase, ov,
+   return agx3_bind_compose(encoding, AGX3_MN_isel, ep, form->base, form->nbase, ov,
                             n, out, len);
 }
 

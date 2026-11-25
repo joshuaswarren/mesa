@@ -8,6 +8,7 @@
 
 #include "agx3_alu_core.h"
 #include "agx3_binder.h"
+#include "agx3_native_stats.h"
 
 #include <string.h>
 
@@ -48,8 +49,7 @@ one_or_zero(uint16_t value)
 static bool
 fetch_ok(enum agx_isa_encoding enc, const struct agx3_tex_fetch_desc *d)
 {
-   if (d == NULL || (enc != AGX_ISA_ENCODING_AGX3B &&
-                     enc != AGX_ISA_ENCODING_AGX3C))
+   if (d == NULL || !agx_isa_is_agx3(enc))
       return false;
 
    if ((d->width != AGX3_TEX_W16 && d->width != AGX3_TEX_W32) ||
@@ -246,13 +246,13 @@ agx3_tex_encode_fetch(enum agx_isa_encoding enc,
    const int ep = enc == AGX_ISA_ENCODING_AGX3B
                      ? (immediate_operands && !d->sparse && !d->heap_uniform_base ? 3 : 4)
                      : d->sparse ? 3 : 0;
-   bool composed = agx3_bind_compose(enc, "smp", ep, base, nb, ov, n, out, len);
+   bool composed = agx3_bind_compose(enc, AGX3_MN_smp, ep, base, nb, ov, n, out, len);
    if (!composed && enc == AGX_ISA_ENCODING_AGX3C)
-      composed = agx3_bind_compose(enc, "smp", 1, base, nb, ov, n, out, len);
+      composed = agx3_bind_compose(enc, AGX3_MN_smp, 1, base, nb, ov, n, out, len);
    if (!composed && enc == AGX_ISA_ENCODING_AGX3C)
-      composed = agx3_bind_compose(enc, "smp", 2, base, nb, ov, n, out, len);
+      composed = agx3_bind_compose(enc, AGX3_MN_smp, 2, base, nb, ov, n, out, len);
    if (!composed && enc == AGX_ISA_ENCODING_AGX3C && d->heap_uniform_base)
-      composed = agx3_bind_compose(enc, "smp", 3, base, nb, ov, n, out, len);
+      composed = agx3_bind_compose(enc, AGX3_MN_smp, 3, base, nb, ov, n, out, len);
    if (!composed) {
       memset(out, 0, AGX3_TEX_MAX_LENGTH);
       *len = 0;
@@ -283,8 +283,7 @@ mask_witnessed(uint8_t mask)
 static bool
 sample_ok(enum agx_isa_encoding enc, const struct agx3_tex_sample_desc *d)
 {
-   if (d == NULL || (enc != AGX_ISA_ENCODING_AGX3B &&
-                     enc != AGX_ISA_ENCODING_AGX3C))
+   if (d == NULL || !agx_isa_is_agx3(enc))
       return false;
 
    if (d->sample_abi > AGX3_TEX_SAMPLE_ABI_APPLE_FRAGMENT ||
@@ -996,13 +995,13 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
       const int first_ep = d->query_lod ? (d->cube && !d->array ? 2 : 1)
                            : d->gather != AGX3_TEX_GATHER_NONE ? 2 : 0;
       for (int query_ep = first_ep; query_ep <= 3; ++query_ep)
-         if (agx3_bind_compose(enc, "smp", query_ep, base, nb, ov, n, out, len))
+         if (agx3_bind_compose(enc, AGX3_MN_smp, query_ep, base, nb, ov, n, out, len))
             return true;
       memset(out, 0, AGX3_TEX_MAX_LENGTH);
       *len = 0;
       return false;
    }
-   if (!agx3_bind_compose(enc, "smp", ep, base, nb, ov, n, out, len)) {
+   if (!agx3_bind_compose(enc, AGX3_MN_smp, ep, base, nb, ov, n, out, len)) {
       memset(out, 0, AGX3_TEX_MAX_LENGTH);
       *len = 0;
       return false;
@@ -1012,7 +1011,7 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
 }
 
 static bool
-agx3_tex_stage_copy_hints_impl(enum agx_isa_encoding enc, bool wide_source,
+agx3_tex_stage_copy_hints_encode(enum agx_isa_encoding enc, bool wide_source,
                     uint16_t dest, uint16_t src,
                     uint8_t slot, uint16_t wait_mask,
                           bool src_cache, bool src_discard,
@@ -1026,7 +1025,7 @@ agx3_tex_stage_copy_hints_impl(enum agx_isa_encoding enc, bool wide_source,
        (enc == AGX_ISA_ENCODING_AGX3C && src_cache == src_discard))
       return false;
 
-   if (enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C)
+   if (!agx_isa_is_agx3(enc))
       return false;
 
    /* High source registers require the extended M5 encoding. Keep the
@@ -1069,12 +1068,27 @@ agx3_tex_stage_copy_hints_impl(enum agx_isa_encoding enc, bool wide_source,
     * or wait bit does not fit, and the composer's first-success order
     * reproduces that choice on every witness. */
    for (int ep = wide_source && src >= 128 ? 1 : 0; ep <= 1; ++ep) {
-      if (agx3_bind_compose(enc, "copy", ep, base, nb, ov, n, out, len))
+      if (agx3_bind_compose(enc, AGX3_MN_copy, ep, base, nb, ov, n, out, len))
          return true;
    }
    memset(out, 0, AGX3_TEX_COPY_MAX_LENGTH);
    *len = 0;
    return false;
+}
+
+static bool
+agx3_tex_stage_copy_hints_impl(enum agx_isa_encoding enc, bool wide_source,
+                               uint16_t dest, uint16_t src, uint8_t slot,
+                               uint16_t wait_mask, bool src_cache,
+                               bool src_discard,
+                               uint8_t out[AGX3_TEX_COPY_MAX_LENGTH],
+                               uint8_t *len)
+{
+   const bool ok = agx3_tex_stage_copy_hints_encode(
+      enc, wide_source, dest, src, slot, wait_mask, src_cache, src_discard, out,
+      len);
+   agx3_native_stats.staging_copies += ok;
+   return ok;
 }
 
 bool
@@ -1208,7 +1222,7 @@ agx3_tex_encode_image_write_2d(
       fields[n++] = (struct agx3_field_kv)KV(100, 2);
    }
 
-   if (!agx3_bind_compose(enc, "imgwci", 0, fields,
+   if (!agx3_bind_compose(enc, AGX3_MN_imgwci, 0, fields,
                           n,
                           NULL, 0, out, len) ||
        *len != AGX3_IMAGE_WRITE_LENGTH) {
@@ -1333,7 +1347,7 @@ agx3_tex_encode_image_write_g18g(enum agx_isa_encoding enc,
       fields[n++] = (struct agx3_field_kv)KV(90 + kind, d->image_index);
    if (d->image_kill)
       fields[n++] = (struct agx3_field_kv)KV(103, 1);
-   if (!agx3_bind_compose(enc, "imgwci", 0, fields, n, NULL, 0, out, len)) {
+   if (!agx3_bind_compose(enc, AGX3_MN_imgwci, 0, fields, n, NULL, 0, out, len)) {
       memset(out, 0, AGX3_TEX_MAX_LENGTH);
       *len = 0;
       return false;
@@ -1422,7 +1436,7 @@ agx3_tex_decode_fetch(enum agx_isa_encoding enc, const void *instruction,
    if (out == NULL)
       return false;
    memset(out, 0, sizeof(*out));
-   if (enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C)
+   if (!agx_isa_is_agx3(enc))
       return false;
    if (enc == AGX_ISA_ENCODING_AGX3B && instruction && instruction_size == 20) {
       const uint8_t *p = instruction;
@@ -1566,7 +1580,7 @@ stage_typed_lod_half(enum agx_isa_encoding enc, uint16_t half, uint16_t src,
    for (unsigned i = 0; i < slots; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   if (!agx3_bind_compose(enc, "pack_smpir", 0, base,
+   if (!agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
                          gpu1 ? 12 : 10, ov, n, out, len))
       return false;
 
@@ -1693,7 +1707,7 @@ agx3_tex_pack_lod_word(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
    const struct agx3_field_kv ov[] = {
       KV(2, dest), KV(16, src), KV(25, src_cache), KV(27, src_discard),
    };
-   return agx3_bind_compose(enc, "pack_smpir", 0, base,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
                             sizeof(base) / sizeof(base[0]), ov,
                             sizeof(ov) / sizeof(ov[0]), out, len);
 }
@@ -1741,7 +1755,7 @@ agx3_tex_stage_bias_min(enum agx_isa_encoding enc, uint16_t bias,
    for (unsigned i = 0; i < slots; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   return agx3_bind_compose(enc, "pack_smpir", 0, base,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
                             sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
 
@@ -1786,7 +1800,7 @@ agx3_tex_stage_gather_offset_at(enum agx_isa_encoding enc, uint16_t dest,
       KV(74, 5), KV(75, 12), KV(76, 5), KV(77, 28),
       KV(56, 1), KV(57, 119),
    };
-   return agx3_bind_compose(enc, "pack_smpir", 0, fields,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, fields,
                             sizeof(fields) / sizeof(fields[0]) - (m5 ? 0 : 2),
                             NULL, 0, out, len);
 }
@@ -1838,7 +1852,7 @@ agx3_tex_stage_array_layer_at(enum agx_isa_encoding enc, uint16_t bank,
    for (unsigned i = 0; i < slots; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   if (!agx3_bind_compose(enc, "pack_smpir", 0, base,
+   if (!agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
                          gpu1 ? 11 : 9, ov, n, out, len))
       return false;
 
@@ -1896,7 +1910,7 @@ agx3_tex_stage_array_layer_g18g(uint16_t src, uint8_t slot,
    for (unsigned i = 0; i < 8; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "pack_smpir", 0, base,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_pack_smpir, 0, base,
                             11, ov, n, out, len);
 }
 
@@ -1957,7 +1971,7 @@ agx3_tex_stage_array_typed_lod_g18g(uint16_t layer, uint16_t lod,
    for (unsigned i = 0; i < 8; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "pack_smpir", 0, base,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_pack_smpir, 0, base,
                             14, ov, n, out, len);
 }
 
@@ -1990,7 +2004,7 @@ agx3_tex_stage_image_write_layer(enum agx_isa_encoding enc, uint16_t src,
          KV(23, 2), KV(24, 1), KV(25, src_cache), KV(27, src_discard),
          KV(38, 1), KV(51, 1), KV(52, 2), KV(56, 1), KV(57, 118), KV(74, 4),
       };
-      return agx3_bind_compose(enc, "pack_imgwir", 0, fields,
+      return agx3_bind_compose(enc, AGX3_MN_pack_imgwir, 0, fields,
                                sizeof(fields) / sizeof(fields[0]),
                                NULL, 0, out, len);
    }
@@ -2014,7 +2028,7 @@ agx3_tex_stage_image_write_layer(enum agx_isa_encoding enc, uint16_t src,
    for (unsigned i = 0; i < 6; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   if (!agx3_bind_compose(enc, "pack_imgwir", 0, base,
+   if (!agx3_bind_compose(enc, AGX3_MN_pack_imgwir, 0, base,
                           sizeof(base) / sizeof(base[0]), ov, n, out, len))
       return false;
 
@@ -2074,7 +2088,7 @@ agx3_tex_stage_array_typed_lod(enum agx_isa_encoding enc, uint16_t bank,
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
 
-   return agx3_bind_compose(enc, "pack_smpir", 0, base, gpu1 ? 14 : 12,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base, gpu1 ? 14 : 12,
                             ov, n, out, len);
 }
 
@@ -2144,7 +2158,7 @@ agx3_tex_stage_cube_z_lod_at(enum agx_isa_encoding enc, bool cube_array,
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
 
-   return agx3_bind_compose(enc, "pack_smpir", 0, base, cube_array ? 17 : 14,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base, cube_array ? 17 : 14,
                             ov, n, out, len);
 }
 
@@ -2216,7 +2230,20 @@ agx3_tex_normalize_cube_array_layer(enum agx_isa_encoding enc, uint16_t dest,
    ov[n++] = (struct agx3_field_kv)KV(25, layer_cache);
    ov[n++] = (struct agx3_field_kv)KV(27, layer_discard);
 
-   return agx3_bind_compose(enc, "pack_smpir", 0, base, 11, ov, n, out, len);
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base, 11, ov, n, out, len);
+}
+
+bool
+agx3_tex_stage_array_lod_at(enum agx_isa_encoding enc, uint16_t bank,
+                            uint16_t layer, uint16_t lod, uint8_t slot,
+                            uint16_t wait_mask, bool layer_cache,
+                            bool layer_discard, bool lod_cache,
+                            bool lod_discard, uint8_t out[AGX3_TEX_MAX_LENGTH],
+                            uint8_t *len)
+{
+   return agx3_tex_stage_array_typed_lod(
+      enc, bank, layer, lod, slot, wait_mask, layer_cache, layer_discard,
+      lod_cache, lod_discard, AGX3_TEX_LEVEL_FLOAT, out, len);
 }
 
 bool
@@ -2312,7 +2339,7 @@ agx3_tex_stage_offset_2d(enum agx_isa_encoding enc, uint16_t x, uint16_t y,
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
 
-   if (!agx3_bind_compose(enc, "pack_smpir", 0, base,
+   if (!agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
                           sizeof(base) / sizeof(base[0]) - (m5 ? 0 : 2),
                           ov, n, out, len))
       return false;
@@ -2345,7 +2372,7 @@ cube_cem_calc_to(enum agx_isa_encoding enc, uint16_t x, uint16_t y,
       return false;
    memset(out, 0, AGX3_TEX_MAX_LENGTH);
    *len = 0;
-   if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+   if (!agx_isa_is_agx3(enc) ||
        x >= 128 || y >= 128 || z >= 128 || (dest & 1) ||
        dest > 190 || axis > 2 ||
        ((discard[0] || discard[1] || discard[2]) && axis != 2) ||
@@ -2384,7 +2411,7 @@ cube_cem_calc_to(enum agx_isa_encoding enc, uint16_t x, uint16_t y,
          ov[n++] = (struct agx3_field_kv)KV(cache_field[i], 1);
    }
 
-   return agx3_bind_compose(enc, "cem_calc", 0, base,
+   return agx3_bind_compose(enc, AGX3_MN_cem_calc, 0, base,
                             sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
 
@@ -2471,7 +2498,7 @@ agx3_tex_cube_cem_finalize_at(enum agx_isa_encoding enc, uint8_t component,
    *len = 0;
    /* `bank` is f5: agx3_tex_cube_cem_finalize_to() keeps component * 2 (the
     * second component's baseline), the G18G layer names its own block. */
-   if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+   if (!agx_isa_is_agx3(enc) ||
        component > 1 || bank > 6 || (bank & 1) ||
        (reciprocal & 1) || reciprocal > 190 ||
        (axis_value & 1) || axis_value > 190 || slot < 1 ||
@@ -2494,7 +2521,7 @@ agx3_tex_cube_cem_finalize_at(enum agx_isa_encoding enc, uint8_t component,
       KV(95, 1), KV(96, 55),
    };
    return agx3_bind_compose(
-      enc, "f32fma", 5, component ? base1 : base0,
+      enc, AGX3_MN_f32fma, 5, component ? base1 : base0,
       component ? sizeof(base1) / sizeof(base1[0])
                 : sizeof(base0) / sizeof(base0[0]),
       ov, enc == AGX_ISA_ENCODING_AGX3C ? 6 : 4, out, len);
@@ -2576,7 +2603,7 @@ agx3_tex_stage_cube_z_at(enum agx_isa_encoding enc, uint8_t bank, uint16_t src,
    for (unsigned i = 0; i < slots; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   if (!agx3_bind_compose(enc, "pack_smpir", 0, base,
+   if (!agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
                          gpu1 ? 11 : 9, ov, n, out, len))
       return false;
 
@@ -2658,7 +2685,7 @@ agx3_tex_stage_cube_array_layer(enum agx_isa_encoding enc, uint16_t face,
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
 
-   return agx3_bind_compose(enc, "pack_smpir", 0, base,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
                             sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
 
@@ -2712,7 +2739,7 @@ agx3_tex_stage_cube_lod(enum agx_isa_encoding enc, uint16_t face,
    for (unsigned i = 0; i < slots; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   if (!agx3_bind_compose(enc, "pack_smpir", 0, base,
+   if (!agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
                          gpu1 ? 15 : 13, ov, n, out, len))
       return false;
 
@@ -2753,7 +2780,7 @@ agx3_tex_pack_cube_face(enum agx_isa_encoding enc, uint16_t face,
       KV(74, 10), KV(75, 12),
    };
    const struct agx3_field_kv c_fields[] = {KV(56, 3), KV(57, 119)};
-   if (!agx3_bind_compose(enc, "pack_smpir", 0, fields,
+   if (!agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, fields,
                           sizeof(fields) / sizeof(fields[0]), c_fields,
                           gpu1 ? 2 : 0, out, len))
       return false;
@@ -2807,7 +2834,7 @@ agx3_tex_stage_cube_bias_min(enum agx_isa_encoding enc, uint16_t bias,
    for (unsigned i = 0; i < slots; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   return agx3_bind_compose(enc, "pack_smpir", 0, base,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
                             sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
 
@@ -2873,7 +2900,7 @@ agx3_tex_stage_cube_array_lod(enum agx_isa_encoding enc, uint16_t face,
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
 
-   return agx3_bind_compose(enc, "pack_smpir", 0, base,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
                             sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
 
@@ -2920,7 +2947,7 @@ agx3_tex_pack_float_lod_m5(uint16_t src, uint16_t dest,
    for (unsigned i = 0; i < 8; ++i)
       if (wait_mask & (1u << i))
          waits[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "pack_smpir", 0,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_pack_smpir, 0,
                             fields, sizeof(fields) / sizeof(fields[0]),
                             waits, n, out, len);
 }
@@ -2943,7 +2970,7 @@ agx3_tex_pack_minimum(enum agx_isa_encoding enc, uint16_t src, uint16_t dest,
       KV(52, 2), KV(74, (unsigned)AGX3_TEX_LEVEL_MINIMUM),
       KV(76, (unsigned)AGX3_TEX_LEVEL_INTEGER), KV(77, 16),
    };
-   return agx3_bind_compose(enc, "pack_smpir", 0, fields,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, fields,
                            sizeof(fields) / sizeof(fields[0]), NULL, 0, out, len);
 }
 
@@ -2978,7 +3005,7 @@ agx3_tex_stage_minimum_bank8_m5(uint16_t src, uint8_t slot, uint16_t wait_mask,
    for (unsigned i = 0; i < 8; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "pack_smpir", 0, base,
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_pack_smpir, 0, base,
                             sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
 
@@ -2991,7 +3018,7 @@ agx3_tex_pack_ms_array_layer(enum agx_isa_encoding enc, uint16_t src,
       return false;
    memset(out, 0, AGX3_TEX_MAX_LENGTH);
    *len = 0;
-   if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
+   if (!agx_isa_is_agx3(enc) ||
        src >= 128 || dest > (enc == AGX_ISA_ENCODING_AGX3C ? 254 : 190) ||
        (dest & 1) || (cache && discard))
       return false;
@@ -3001,7 +3028,7 @@ agx3_tex_pack_ms_array_layer(enum agx_isa_encoding enc, uint16_t src,
       KV(38, 1), KV(51, 1), KV(52, 2), KV(74, 4),
    };
    const struct agx3_field_kv c_fields[] = {KV(56, 3), KV(57, 119)};
-   return agx3_bind_compose(enc, "pack_smpir", 0, fields,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, fields,
                            sizeof(fields) / sizeof(fields[0]), c_fields,
                            enc == AGX_ISA_ENCODING_AGX3C ? 2 : 0, out, len);
 }
@@ -3024,7 +3051,7 @@ agx3_tex_stage_ms_array_sample(enum agx_isa_encoding enc, uint16_t sample,
       KV(37, 1), KV(38, 1), KV(44, packed_layer), KV(51, 2),
       KV(52, 2), KV(55, 1), KV(74, 9), KV(75, 12), KV(76, 1), KV(77, 16),
    };
-   return agx3_bind_compose(enc, "pack_smpir", 0, fields,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, fields,
                            sizeof(fields) / sizeof(fields[0]), NULL, 0, out, len);
 }
 
@@ -3055,7 +3082,7 @@ agx3_tex_stage_ms_array_sample_at(
       KV(52, 2), KV(55, 1), KV(56, 1), KV(57, 119),
       KV(74, 9), KV(75, 12), KV(76, 1), KV(77, 16),
    };
-   return agx3_bind_compose(enc, "pack_smpir", 0, fields,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, fields,
                             sizeof(fields) / sizeof(fields[0]), NULL, 0, out, len);
 }
 
@@ -3089,7 +3116,7 @@ agx3_tex_stage_ms_g18g(enum agx_isa_encoding enc, uint16_t sample,
       KV(51, array ? 2 : 1), KV(52, 2), KV(55, array), KV(56, 1), KV(57, 119),
       KV(74, 9), KV(75, 12), KV(76, 1), KV(77, 16),
    };
-   return agx3_bind_compose(enc, "pack_smpir", 0, fields,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, fields,
       sizeof(fields) / sizeof(fields[0]), NULL, 0, out, len);
 }
 
@@ -3121,7 +3148,7 @@ agx3_tex_stage_ms_sample(enum agx_isa_encoding enc, uint16_t src,
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
 
-   return agx3_bind_compose(enc, "pack_smpir", 0, base,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
                             sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
 
@@ -3158,7 +3185,7 @@ agx3_tex_stage_ms_sample_at(enum agx_isa_encoding enc, uint16_t bank,
    for (unsigned i = 0; i < 8; ++i)
       if (wait_mask & (1u << i))
          waits[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   return agx3_bind_compose(enc, "pack_smpir", 0, fields,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, fields,
                             sizeof(fields) / sizeof(fields[0]), waits, n,
                             out, len);
 }
@@ -3198,7 +3225,7 @@ agx3_tex_stage_typed_lod_bank(enum agx_isa_encoding enc, uint16_t bank,
    for (unsigned i = 0; i < 6; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
-   if (!agx3_bind_compose(enc, "pack_smpir", 0, base,
+   if (!agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
                          sizeof(base) / sizeof(base[0]), ov, n, out, len))
       return false;
 
@@ -3255,7 +3282,7 @@ agx3_tex_stage_cube_array_shadow_at(enum agx_isa_encoding enc, uint8_t bank,
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
 
-   return agx3_bind_compose(enc, "pack_smpir", 0, base, gpu1 ? 16 : 14,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base, gpu1 ? 16 : 14,
                             ov, n, out, len);
 }
 
@@ -3318,7 +3345,7 @@ agx3_tex_stage_cube_array_g18g(enum agx_isa_encoding enc,
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(58 + i, 1);
 
-   return agx3_bind_compose(enc, "pack_smpir", 0, base,
+   return agx3_bind_compose(enc, AGX3_MN_pack_smpir, 0, base,
       sizeof(base) / sizeof(base[0]), ov, n, out, len);
 }
 
@@ -3379,7 +3406,7 @@ agx3_tex_encode_image_write_agx3c(
       KV(99, immediate ? 1 : reg ? 2 : 3), KV(100, immediate ? 1 : 2),
       KV(103, d->image_kill), KV(113, 1),
    };
-   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "imgwci", 0,
+   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_imgwci, 0,
                           fields, sizeof(fields) / sizeof(fields[0]),
                           NULL, 0, out, len) || *len != 18) {
       memset(out, 0, AGX3_TEX_MAX_LENGTH);

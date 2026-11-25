@@ -134,7 +134,8 @@ get_pair_key(nir_op op, nir_scalar a, nir_scalar b)
  * without an extra indirection.
  */
 static void
-increment_pair_freq(struct hash_table *ht, struct pair_key key)
+increment_pair_freq(struct hash_table *ht, linear_ctx *key_lin,
+                    struct pair_key key)
 {
    uint32_t hash = pair_key_hash(&key);
    struct hash_entry *ent = _mesa_hash_table_search_pre_hashed(ht, hash, &key);
@@ -142,7 +143,8 @@ increment_pair_freq(struct hash_table *ht, struct pair_key key)
    if (ent) {
       ent->data = (void *)(((uintptr_t)ent->data) + 1);
    } else {
-      struct pair_key *clone = ralloc_memdup(ht, &key, sizeof(key));
+      struct pair_key *clone = linear_alloc_child(key_lin, sizeof(key));
+      *clone = key;
 
       _mesa_hash_table_insert_pre_hashed(ht, hash, clone, (void *)(uintptr_t)1);
    }
@@ -361,7 +363,7 @@ build_chain(struct chain *c, nir_scalar def, unsigned reserved_count)
       for (unsigned j = i + 1; j < (chain)->length; ++j)
 
 static void
-record_pairs(struct chain *c, struct hash_table *pair_freq)
+record_pairs(struct chain *c, struct hash_table *pair_freq, linear_ctx *key_lin)
 {
    struct pair_key keys[MAX_CHAIN_LENGTH * MAX_CHAIN_LENGTH];
    unsigned key_count = 0;
@@ -380,7 +382,7 @@ record_pairs(struct chain *c, struct hash_table *pair_freq)
 
       /* Increment for unique keys */
       if (unique) {
-         increment_pair_freq(pair_freq, key);
+         increment_pair_freq(pair_freq, key_lin, key);
          keys[key_count++] = key;
       }
    }
@@ -395,7 +397,8 @@ record_pairs(struct chain *c, struct hash_table *pair_freq)
  */
 static void
 find_chains(nir_function_impl *impl, struct reassociate_state *state,
-            struct hash_table *pair_freq, struct util_dynarray *chains)
+            struct hash_table *pair_freq, linear_ctx *key_lin,
+            struct util_dynarray *chains)
 {
    nir_foreach_block_reverse(block, impl) {
       nir_foreach_instr_reverse(instr, block) {
@@ -415,7 +418,7 @@ find_chains(nir_function_impl *impl, struct reassociate_state *state,
           * better CSE behaviour globally with other chains.
           */
          if (pair_freq && c.length <= 8)
-            record_pairs(&c, pair_freq);
+            record_pairs(&c, pair_freq, key_lin);
 
          /* We need at least 3 sources to reassociate anything */
          if (c.length < 3)
@@ -590,9 +593,6 @@ sort_by_rank(struct chain *c, unsigned first)
 static bool
 reassociate_chain(struct chain *c, void *pair_freq)
 {
-   nir_builder b = nir_builder_at(nir_before_instr(&c->root->instr));
-   b.fp_math_ctrl = c->fp_math_ctrl;
-
    /* Pick a new order using sort-by-rank and possibly the CSE heuristics */
    unsigned pinned = 0;
 
@@ -608,6 +608,9 @@ reassociate_chain(struct chain *c, void *pair_freq)
    }
 
    sort_by_rank(c, pinned);
+
+   nir_builder b = nir_builder_at(nir_before_instr(&c->root->instr));
+   b.fp_math_ctrl = c->fp_math_ctrl;
 
    /* Reassociate according to the new order */
    nir_def *new_root = nir_mov_scalar(&b, c->srcs[0]);
@@ -652,9 +655,12 @@ nir_opt_reassociate(nir_shader *nir, nir_reassociate_options opts)
    bool cse_heuristic = opts & nir_reassociate_cse_heuristic;
    struct hash_table *pair_freq =
       cse_heuristic ? pair_key_table_create(NULL) : NULL;
+   linear_ctx *key_lin = pair_freq ? linear_context(pair_freq) : NULL;
    struct reassociate_state state = {
       .opts = opts,
-      .invariant = _mesa_pointer_hash_table_create(NULL),
+      .invariant = (opts & nir_reassociate_loop_invariant)
+                      ? _mesa_pointer_hash_table_create(NULL)
+                      : NULL,
    };
    struct util_dynarray chains;
    bool progress = false;
@@ -675,12 +681,14 @@ nir_opt_reassociate(nir_shader *nir, nir_reassociate_options opts)
       nir_index_ssa_defs(impl);
 
       bool impl_progress = false;
-      _mesa_hash_table_clear(pair_freq, NULL);
-      _mesa_hash_table_clear(state.invariant, NULL);
+      if (pair_freq)
+         _mesa_hash_table_clear(pair_freq, NULL);
+      if (state.invariant)
+         _mesa_hash_table_clear(state.invariant, NULL);
       util_dynarray_clear(&chains);
 
       /* Step 1: find all chains in the function */
-      find_chains(impl, &state, pair_freq, &chains);
+      find_chains(impl, &state, pair_freq, key_lin, &chains);
 
       /* Step 2: reassociate all chains */
       util_dynarray_foreach(&chains, struct chain, chain) {

@@ -12,10 +12,34 @@
 #include "agx_state.h"
 #include "pool.h"
 
+/* 32 zero bytes, uploaded once per batch, for a constant or storage buffer
+ * binding with nothing in range. Robust access redirects an out-of-bounds
+ * load to offset 0 instead of dropping it, so the sink must hold the widest
+ * load, a dvec4.
+ */
+static uint64_t
+agx_batch_zero_sink(struct agx_batch *batch)
+{
+   if (!batch->zero_sink) {
+      static const uint32_t zeroes[8] = {0};
+      batch->zero_sink =
+         agx_pool_upload_aligned(&batch->pool, zeroes, sizeof(zeroes), 16);
+   }
+
+   return batch->zero_sink;
+}
+
 static uint64_t
 agx_const_buffer_ptr(struct agx_batch *batch, struct pipe_constant_buffer *cb)
 {
    if (cb->buffer) {
+      /* Nothing of the range is inside the buffer (agx_set_constant_buffer()
+       * clamps it), so every load is out of bounds: read the sink, not past
+       * the end of the BO.
+       */
+      if (cb->buffer_size == 0)
+         return agx_batch_zero_sink(batch);
+
       struct agx_resource *rsrc = agx_resource(cb->buffer);
       agx_batch_reads_range(batch, rsrc, cb->buffer_offset, cb->buffer_size);
       return agx_map_gpu(rsrc) + cb->buffer_offset;
@@ -79,7 +103,7 @@ agx_upload_uniforms(struct agx_batch *batch,
          ? ctx->rast->base.sprite_coord_enable
          : 0;
 
-   if (hw_vs && agx_native_graphics(agx_device(ctx->base.screen))) {
+   if (hw_vs && agx_chip_native_agx3(agx_device(ctx->base.screen)->chip)) {
       /* Keep the old immutable upload for unchanged vertex inputs, including
        * fragment-only root updates. The unconditional native VS update used
        * to cover root inputs not represented by VS dirty bits. Compare the
@@ -117,8 +141,7 @@ agx_set_sampler_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
    struct agx_stage_uniforms *unif = &batch->stage_uniforms[stage];
    struct agx_device *dev = agx_device(ctx->base.screen);
 
-   const bool custom_border = agx_native_graphics(dev) ||
-                              dev->chip == AGX_CHIP_G18G || agx_chip_g17_m5(dev->chip);
+   const bool custom_border = agx_chip_agx3_path(dev->chip);
    if (custom_border) {
       for (unsigned s = 0; s < PIPE_MAX_SAMPLERS; ++s) {
          unif->custom_border_sampler_handle[s] = -1;
@@ -169,7 +192,7 @@ agx_set_sampler_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
     * GLES3 texture.units.all_units). */
    if (st->shader && st->shader->uses_bindless_samplers) {
       u_foreach_bit(s, st->valid_samplers) {
-         if (agx_native_graphics(dev) || dev->chip == AGX_CHIP_G18G || agx_chip_g17_m5(dev->chip)) {
+         if (agx_chip_agx3_path(dev->chip)) {
             /* The G17P graphics Ioto program publishes the per-stage HAL200
              * table directly. Indirect operands therefore name the same
              * i+1 entries as immediate operands; the old 28+index handle
@@ -208,9 +231,8 @@ agx_set_ssbo_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
    struct agx_stage *st = &batch->ctx->stage[stage];
    struct agx_stage_uniforms *unif = &batch->stage_uniforms[stage];
 
-   /* Single element sink. TODO: Optimize with soft fault. */
-   uint32_t zeroes[4] = {0};
-   uint64_t sink = agx_pool_upload_aligned(&batch->pool, &zeroes, 16, 16);
+   /* TODO: Optimize the sink with soft fault. */
+   uint64_t sink = agx_batch_zero_sink(batch);
 
    /* Consider all shader buffers, needed to avoid faults with
     * e.g. arb_shader_storage_buffer_object-array-ssbo-binding.

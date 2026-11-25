@@ -189,7 +189,7 @@ check_binding_accepted(VkDescriptorType type, bool is_ssbo, bool complex)
       nir_store_global(&b, sum, nir_imm_int64(&b, 0x100000), .align_mul = 4);
       lower_for_agx_passes(b.shader, layout);
       NIR_PASS(_, b.shader, nir_lower_pack);
-      CHECK(agx_nir_fold_m5_offsets(b.shader));
+      CHECK(agx_nir_fold_m5_offsets(b.shader, false));
       nir_validate_shader(b.shader, "after hk binding fold");
       ralloc_free(b.shader);
    }
@@ -261,7 +261,7 @@ check_packed_uvec4_refused(bool from_ubo)
       nir_store_global(&b, sum, nir_imm_int64(&b, 0x100000), .align_mul = 4);
       lower_for_agx_passes(b.shader, layout);
       NIR_PASS(_, b.shader, nir_lower_pack);
-      CHECK(!agx_nir_fold_m5_offsets(b.shader));
+      CHECK(!agx_nir_fold_m5_offsets(b.shader, false));
       ralloc_free(b.shader);
    }
 

@@ -55,7 +55,7 @@ check_table(const char *name, const struct agx3_rt_gen1_native_op *ops,
    unsigned touches = 0;
    for (unsigned i = 0; i < count; ++i) {
       const struct agx3_rt_gen1_native_op *op = &ops[i];
-      if (strcmp(op->name, "ldscs") && strcmp(op->name, "stscs"))
+      if (op->name != AGX3_MN_ldscs && op->name != AGX3_MN_stscs)
          continue;
 
       uint8_t bytes[AGX3_SCS_MAX_LENGTH] = {0}, length = 0;
@@ -68,12 +68,12 @@ check_table(const char *name, const struct agx3_rt_gen1_native_op *ops,
 
       struct agx3_scs_touch_desc touch;
       struct agx3_scs_desc load;
-      const bool is_touch = !strcmp(op->name, "ldscs") &&
+      const bool is_touch = op->name == AGX3_MN_ldscs &&
                             field(op, 9) == 0 && field(op, 12) == 0;
       const bool decoded = agx3_scs_decode_touch(ENC, bytes, length, &touch);
       if (!is_touch) {
          expect(!decoded, "ordinary access decodes as a touch", name, i);
-         *ordinary += !strcmp(op->name, "ldscs");
+         *ordinary += op->name == AGX3_MN_ldscs;
          continue;
       }
 
@@ -158,7 +158,7 @@ check_indexed(void)
          {70, d->address_selector}, {71, (uint16_t)d->byte_offset}, {80, 1},
       };
       uint8_t direct[AGX3_SCS_MAX_LENGTH] = {0}, direct_length = 0;
-      expect(agx3_bind_compose(ENC, "ldscs", 0, fields, COUNT(fields), NULL,
+      expect(agx3_bind_compose(ENC, AGX3_MN_ldscs, 0, fields, COUNT(fields), NULL,
                                0, direct, &direct_length) &&
                 direct_length == length && !memcmp(direct, bytes, length),
              "bytes differ from the field list", "indexed", i);

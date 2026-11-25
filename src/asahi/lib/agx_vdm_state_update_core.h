@@ -45,17 +45,8 @@ enum agx_vdm_state_update_template_variant {
    AGX_VDM_STATE_UPDATE_TEMPLATE_21 = 5,
 };
 
-/*
- * Source-layout and draw-path admission for the native renderer template
- * producer.  The inspected Apple direct, indexed, indirect, and indexed-
- * indirect entry points all invoke the same state producer before emitting
- * their Index List record.  Tessellation and mesh paths are intentionally not
- * represented here.
- *
- * AGX2 Counts/UVS state is not byte-compatible with this producer.  Callers
- * must therefore name the exact AGX3 VertexProgramVariant layout explicitly;
- * zero/legacy/unknown values fail closed.
- */
+/* Callers must explicitly select the AGX3 VertexProgramVariant layout;
+ * zero, legacy AGX2, and unknown values fail closed. */
 enum agx_vdm_state_update_source_layout {
    AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_UNSPECIFIED = 0,
    AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_AGX2_LEGACY = 1,
@@ -69,14 +60,7 @@ enum agx_vdm_state_update_draw_path {
    AGX_VDM_STATE_UPDATE_DRAW_INDIRECT_INDEXED = 3,
 };
 
-/*
- * Structural inputs used by Apple's VertexProgramVariant template builder.
- *
- * The two state-load counts and the VsStateConfig fields are deliberately
- * named after their proven producer/position.  Their higher-level compiler
- * meanings are not yet grounded, and they are not interchangeable with the
- * AGX2 Counts, VDM_STATE_VERTEX_OUTPUTS, or VDM_STATE_VERTEX_UNKNOWN words.
- */
+/* Template inputs for the AGX3 28-byte VDM State Update record. */
 struct agx_vdm_state_update_template_info {
    uint64_t pipeline;
 
@@ -98,11 +82,8 @@ struct agx_vdm_state_update_template_info {
 
    enum agx_vdm_state_update_template_variant variant;
 
-   /* Raw u32 loaded from the live RenderContext before emission.  The pinned
-    * G15X_M1/G16X/G17P/G17G/G17X paths compare it with UINT32_MAX: that
-    * sentinel preserves the template's zero final word, while every other
-    * value emits `(raw_active_context_selector - 1) & 7`.  No narrower
-    * producer domain is assumed here. */
+   /* UINT32_MAX preserves a zero final word; any other value encodes
+    * `(raw_active_context_selector - 1) & 7`. */
    uint32_t raw_active_context_selector;
 };
 
@@ -135,27 +116,8 @@ struct agx_vdm_state_update_draw_info {
    struct agx_vdm_state_update_template_info template_info;
 };
 
-/*
- * Pack/unpack the complete seven-word AGX3 VDM State Update emitted by the
- * inspected Apple VDMEncoderGen5 and VDMEncoderGen6 paths:
- *
- *   word 0: exact 0x4000002e header
- *   word 1: raw vertex-shader word 0
- *   words 2..3: widened 48-bit vertex-pipeline pair
- *   words 4..5: raw two-word vertex-output payload
- *   word 6: raw vertex-unknown payload
- *
- * Only the pipeline field's 64-byte alignment and 48-bit address range are
- * fully named.  The remaining payloads are preserved losslessly because their
- * complete AGX3 bit semantics are not independently grounded.
- *
- * The target allowlist contains only identities directly served by the
- * inspected Apple Metal plugins, plus G18G, whose J873 native renders emit
- * the G17G HAL300 form byte for byte.  G16P and G17A remain closed despite
- * sharing neighboring command-stream generations.  This helper does not emit
- * a live command or enable lowering, scheduling, submission, or device
- * admission.
- */
+/* Pack/unpack the 7-word AGX3 VDM State Update (header 0x4000002e, 64B-aligned
+ * 48-bit vertex pipeline pair, and raw vertex-shader/output/unknown words). */
 bool agx_vdm_state_update_supported(enum agx_chip chip);
 
 bool agx_vdm_state_update_pack(enum agx_chip chip,
@@ -178,13 +140,8 @@ bool agx_vdm_state_update_vertex_ti_resources(
    enum agx_chip chip, uint32_t spill_bytes, uint32_t largest_ipr_bytes,
    struct agx_vdm_state_update_template_info *info);
 
-/*
- * Select and pack the State Update prefix used by the four native draw paths.
- * This emits only the 28-byte State Update record: dirty restart/index state
- * may legally intervene before the Index List record, so this helper does not
- * claim byte adjacency or append a draw.  The output is cleared on every
- * failure.
- */
+/* Select and pack the 28-byte VDM State Update prefix for a draw.
+ * Clears `out` on failure. */
 bool agx_vdm_state_update_draw_pack(
    enum agx_chip chip, const struct agx_vdm_state_update_draw_info *info,
    struct agx_vdm_state_update *out);

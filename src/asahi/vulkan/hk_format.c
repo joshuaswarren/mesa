@@ -48,7 +48,7 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
 
       /* G17P and M5 share compressed images without storage or host-copy
        * access (hk_g17p_shared_compression_shape()). */
-      if (dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip))
+      if (agx_chip_g17p_or_m5(dev->chip))
          return props->optimalTilingFeatures &
                 ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
                   VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
@@ -59,8 +59,9 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
              ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
    }
 
-   /* Interchange: the 32-bit RGBA formats on G17P; never storage or host
-    * copies (compressed). */
+   /* Interchange: the 32-bit 8-bit and 10-bit RGB/RGBA formats on chips with
+    * AGX_CAP_GEN9_2D_COMPRESSION; never storage or host copies
+    * (compressed). */
    if (mod == DRM_FORMAT_MOD_APPLE_INTERCHANGE) {
       if (!hk_interchange_format(dev, vk_format))
          return 0;

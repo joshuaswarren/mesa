@@ -36,6 +36,11 @@ static void
 reset(struct fixture *f)
 {
    memset(&f->cmd.state, 0, sizeof(f->cmd.state));
+   if (f->cmd.used_group_count_cache) {
+      for (unsigned i = 0; i < ARRAY_SIZE(f->cmd.group_count_cache); ++i)
+         f->cmd.group_count_cache[i].valid = 0;
+      f->cmd.used_group_count_cache = false;
+   }
    f->cmd.uploader.main.offset = f->cmd.uploader.root.offset = 0;
    f->cmd.state.gfx.shaders[MESA_SHADER_VERTEX] = f->vs_api;
    f->cmd.state.gfx.shaders[MESA_SHADER_FRAGMENT] = f->fs_api;
@@ -158,12 +163,12 @@ reuse_correctness(struct fixture *f)
    struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
    bind(f, 16, VK_SHADER_STAGE_ALL_GRAPHICS);
    const uint64_t generation = desc->generation;
-   desc->root_dirty = false;
+   hk_root_mark_clean(desc);
    desc->sets_dirty = 0;
    bind(f, 16, VK_SHADER_STAGE_ALL_GRAPHICS);
-   CHECK(desc->generation == generation && !desc->root_dirty && !desc->sets_dirty);
+   CHECK(desc->generation == generation && !hk_root_dirty(desc) && !desc->sets_dirty);
    bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
-   CHECK(desc->generation == generation + 1 && desc->root_dirty);
+   CHECK(desc->generation == generation + 1 && hk_root_dirty(desc));
 
    uint64_t root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) == root);
@@ -207,17 +212,63 @@ reuse_correctness(struct fixture *f)
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) != full);
    CHECK(cd->uploaded_root_size == small_B);
    /* A retained or adversarial short-prefix value must have no effect on
-    * any other chip, including the native-encoding M3 path. */
+    * any non-HAL200 chip, including the native-encoding M3 (G15) path. */
    for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip) {
-      if (chip == AGX_CHIP_G17P)
+      if (agx_chip_native_hal200(chip))
          continue;
       f->dev.dev.chip = chip;
       CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE));
       CHECK(cd->uploaded_root_size == sizeof(cd->root));
    }
+   const enum agx_chip hal200_chips[] = {AGX_CHIP_G17P, AGX_CHIP_G16G};
+   const size_t gfx_small_B =
+      ALIGN_POT(hk_root_descriptor_offset(push) + 16, 16);
+   const size_t gfx_large_B =
+      ALIGN_POT(hk_root_descriptor_offset(push) + 64, 16);
+   for (unsigned i = 0; i < ARRAY_SIZE(hal200_chips); ++i) {
+      f->dev.dev.chip = hal200_chips[i];
+      CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE));
+      CHECK(cd->uploaded_root_size == small_B);
+
+      /* Graphics root trimming + growth detection on both G17P and G16G. */
+      f->vs_api->variants[HK_VS_VARIANT_HW].root_descriptor_size = gfx_small_B;
+      f->fs_api->variants[0].root_descriptor_size =
+         ALIGN_POT(hk_root_descriptor_offset(push), 16);
+      CHECK(hk_gfx_root_descriptor_size(cmd) == gfx_small_B);
+      uint64_t gsmall =
+         hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      CHECK(gsmall && desc->uploaded_root_size == gfx_small_B);
+      CHECK(!hk_root_upload_needs_growth(desc->uploaded_root_size,
+                                         hk_gfx_root_descriptor_size(cmd)));
+
+      /* Binding a shader with a larger root forces a re-upload. */
+      f->fs_api->variants[0].root_descriptor_size = gfx_large_B;
+      CHECK(hk_gfx_root_descriptor_size(cmd) == gfx_large_B);
+      CHECK(hk_root_upload_needs_growth(desc->uploaded_root_size,
+                                        hk_gfx_root_descriptor_size(cmd)));
+      uint64_t glarge =
+         hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      CHECK(glarge && glarge != gsmall &&
+            desc->uploaded_root_size == gfx_large_B);
+
+      /* Missing FS trimmed footprint falls back to full root table. */
+      f->fs_api->variants[0].root_descriptor_size = 0;
+      CHECK(hk_gfx_root_descriptor_size(cmd) == sizeof(desc->root));
+      CHECK(hk_root_upload_needs_growth(desc->uploaded_root_size,
+                                        hk_gfx_root_descriptor_size(cmd)));
+   }
+   /* Non-HAL200 chips (including M3 G15G) keep full graphics root uploads. */
+   f->vs_api->variants[HK_VS_VARIANT_HW].root_descriptor_size = gfx_small_B;
+   f->fs_api->variants[0].root_descriptor_size = gfx_small_B;
+   f->dev.dev.chip = AGX_CHIP_G15G;
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS));
+   CHECK(desc->uploaded_root_size == sizeof(desc->root));
+
    f->dev.dev.chip = AGX_CHIP_G17P;
-   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE));
-   CHECK(cd->uploaded_root_size == small_B);
+   f->vs_api->variants[HK_VS_VARIANT_HW].root_descriptor_size = 0;
+   f->fs_api->variants[0].root_descriptor_size = 0;
+   root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   CHECK(root && desc->uploaded_root_size == sizeof(desc->root));
    cmd->state.cs.shader = NULL;
    free(cs);
    /* Test both sides of the omitted dynamic-buffer region. */
@@ -235,13 +286,33 @@ reuse_correctness(struct fixture *f)
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) != root);
    f->dev.dev.printf_buffer_address = 0;
 
+   /* Redundant graphics descriptor binds retain the uploaded root across all
+    * GPU generations, not only native AGX3. */
+   const enum agx_chip retain_chips[] = {
+      AGX_CHIP_G13G, AGX_CHIP_G14G, AGX_CHIP_G16G,
+      AGX_CHIP_G17P, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(retain_chips); ++i) {
+      f->dev.dev.chip = retain_chips[i];
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      const uint64_t gen = desc->generation;
+      hk_root_mark_clean(desc);
+      desc->sets_dirty = 0;
+      bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(desc->generation == gen && !hk_root_dirty(desc) && !desc->sets_dirty);
+      bind(f, 64, VK_SHADER_STAGE_ALL_GRAPHICS);
+      CHECK(desc->generation == gen + 1 && hk_root_dirty(desc));
+   }
+   f->dev.dev.chip = AGX_CHIP_G17P;
+   bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+
    /* CPU-decoded descriptors deliberately keep their publication path. */
    f->fs_api->variants[0].info.agx3_combined_sampler_valid = true;
    root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
    const uint64_t before = desc->generation;
-   desc->root_dirty = false;
+   hk_root_mark_clean(desc);
    bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
-   CHECK(desc->generation == before + 1 && desc->root_dirty);
+   CHECK(desc->generation == before + 1 && hk_root_dirty(desc));
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) != root);
    f->fs_api->variants[0].info.agx3_combined_sampler_valid = false;
 
@@ -278,7 +349,30 @@ reuse_correctness(struct fixture *f)
    hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX);
    CHECK(cmd->state.upload_stats.draw_param_uploads == 1);
    CHECK(cmd->state.upload_stats.constant_uploads == 1);
+
+   const VkDispatchIndirectCommand gc_a = {32, 4, 1};
+   const VkDispatchIndirectCommand gc_b = {64, 1, 1};
+   CHECK(!cmd->used_group_count_cache);
+   const uint64_t gc_addr_a = hk_cmd_upload_group_count(cmd, gc_a);
+   CHECK(gc_addr_a != 0);
+   CHECK(cmd->used_group_count_cache);
+   const uint32_t main_off_after_a = cmd->uploader.main.offset;
+   CHECK(hk_cmd_upload_group_count(cmd, gc_a) == gc_addr_a);
+   CHECK(cmd->uploader.main.offset == main_off_after_a);
+   const uint64_t gc_addr_b = hk_cmd_upload_group_count(cmd, gc_b);
+   CHECK(gc_addr_b != 0 && gc_addr_b != gc_addr_a);
+   CHECK(hk_cmd_upload_group_count(cmd, gc_a) == gc_addr_a);
    reset(f);
+   CHECK(!cmd->used_group_count_cache);
+   for (unsigned i = 0; i < ARRAY_SIZE(cmd->group_count_cache); ++i)
+      CHECK(!cmd->group_count_cache[i].valid);
+   /* After reset, uploading gc_a again must not return a stale address from
+    * the previous recording even when the bump allocator rewinds to 0. */
+   const uint64_t gc_addr_a2 = hk_cmd_upload_group_count(cmd, gc_a);
+   CHECK(gc_addr_a2 != 0 && cmd->used_group_count_cache);
+   CHECK(cmd->uploader.main.offset > 0);
+   reset(f);
+   CHECK(!cmd->used_group_count_cache);
 }
 
 static uint64_t

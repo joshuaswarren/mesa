@@ -83,6 +83,19 @@ hk_buffer_sparse_texel_word(const struct hk_buffer *buffer,
           (uint32_t)util_logbase2(blocksize_B);
 }
 
+/* The sparse buffer that holds address. Call with hk_device::sparse_buffers.lock
+ * held. */
+static const struct hk_buffer *
+hk_sparse_buffer_at_locked(struct hk_device *dev, uint64_t address)
+{
+   list_for_each_entry(struct hk_buffer, buffer, &dev->sparse_buffers.list,
+                       sparse_link) {
+      if (address - buffer->va->addr < buffer->vk.size)
+         return buffer;
+   }
+   return NULL;
+}
+
 uint32_t
 hk_sparse_texel_word_at(struct hk_device *dev, uint64_t address,
                         unsigned blocksize_B)
@@ -93,17 +106,53 @@ hk_sparse_texel_word_at(struct hk_device *dev, uint64_t address,
    if (!p_atomic_read(&dev->sparse_buffers.count))
       return 0;
 
-   uint32_t word = 0;
    simple_mtx_lock(&dev->sparse_buffers.lock);
-   list_for_each_entry(struct hk_buffer, buffer, &dev->sparse_buffers.list,
-                       sparse_link) {
-      if (address - buffer->va->addr < buffer->vk.size) {
-         word = hk_buffer_sparse_texel_word(buffer, blocksize_B);
-         break;
-      }
-   }
+   const uint32_t word = hk_buffer_sparse_texel_word(
+      hk_sparse_buffer_at_locked(dev, address), blocksize_B);
    simple_mtx_unlock(&dev->sparse_buffers.lock);
    return word;
+}
+
+uint32_t
+hk_sparse_map_page_at(struct hk_device *dev, uint64_t address)
+{
+   /* Only M5 lowers storage loads through this word (get_buffer_address()).
+    * Elsewhere it is the address format's byte offset and must stay zero. */
+   if (!agx_chip_g17_m5(dev->dev.chip) ||
+       !p_atomic_read(&dev->sparse_buffers.count))
+      return 0;
+
+   uint32_t page = 0;
+   simple_mtx_lock(&dev->sparse_buffers.lock);
+   const struct hk_buffer *buffer = hk_sparse_buffer_at_locked(dev, address);
+   if (buffer && buffer->sparse_map) {
+      const uint64_t map_addr = buffer->sparse_map->va->addr;
+      assert((map_addr % AIL_PAGESIZE) == 0);
+      assert((map_addr / AIL_PAGESIZE) <= UINT32_MAX);
+      page = map_addr / AIL_PAGESIZE;
+   }
+   simple_mtx_unlock(&dev->sparse_buffers.lock);
+   return page;
+}
+
+bool
+hk_sparse_address_is_sparse(struct hk_device *dev, uint64_t address)
+{
+   if (!p_atomic_read(&dev->sparse_buffers.count))
+      return false;
+
+   simple_mtx_lock(&dev->sparse_buffers.lock);
+   const bool sparse = hk_sparse_buffer_at_locked(dev, address) != NULL;
+   simple_mtx_unlock(&dev->sparse_buffers.lock);
+   return sparse;
+}
+
+static bool
+hk_buffer_in_sparse_list(const struct hk_buffer *buffer)
+{
+   return buffer->sparse_map != NULL ||
+          (buffer->va != NULL &&
+           (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT));
 }
 
 static uint32_t
@@ -350,8 +399,7 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
          }
       }
 
-      if ((dev->dev.chip == AGX_CHIP_G17P ||
-           agx_chip_g17_m5(dev->dev.chip)) &&
+      if (agx_chip_g17p_or_m5(dev->dev.chip) &&
           (buffer->vk.create_flags &
            VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT)) {
          const uint64_t entries = DIV_ROUND_UP(vma_size_B, AIL_PAGESIZE);
@@ -422,7 +470,7 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
                                      ? HK_ALIAS_CAUSE_SPARSE
                                      : HK_ALIAS_CAUSE_CAPTURE_REPLAY);
 
-   if (buffer->sparse_map) {
+   if (hk_buffer_in_sparse_list(buffer)) {
       simple_mtx_lock(&dev->sparse_buffers.lock);
       list_addtail(&buffer->sparse_link, &dev->sparse_buffers.list);
       p_atomic_inc(&dev->sparse_buffers.count);
@@ -446,7 +494,7 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
 
    hk_device_quiesce_lost_submissions(dev);
 
-   if (buffer->sparse_map) {
+   if (hk_buffer_in_sparse_list(buffer)) {
       simple_mtx_lock(&dev->sparse_buffers.lock);
       list_del(&buffer->sparse_link);
       p_atomic_dec(&dev->sparse_buffers.count);
@@ -592,6 +640,11 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
          assert(buffer->vk.device_address == 0);
          buffer->vk.device_address =
             hk_device_memory_addr(mem) + pBindInfos[i].memoryOffset;
+         if (!mem->replay_va &&
+             !(mem->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE | AGX_BO_HOST_PTR))) {
+            buffer->storage_backing_handle = mem->bo->handle;
+            buffer->storage_backing_offset = pBindInfos[i].memoryOffset;
+         }
       }
 
       VK_FROM_HANDLE(hk_device, dev, device);

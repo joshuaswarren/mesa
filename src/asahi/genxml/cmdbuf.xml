@@ -440,6 +440,11 @@
     <field name="Last level" size="4" start="176" type="uint"/>
     <field name="Unk word 3 bits 0-1" size="2" start="192" type="hex"/>
     <field name="Unk word 3 bits 8-10" size="3" start="200" type="hex"/>
+    <!-- No hardware field: the M5 texture unit ignores this word, and the
+         drivers keep software data in it (Gallium's buffer element count,
+         Honeykrisp's level-zero extent of a 2D view; see
+         agx_chip_texture_descriptor_spare_word). -->
+    <field name="Software word" size="32" start="224" type="hex"/>
   </struct>
 
   <!-- Gen9 PBE descriptor, byte-identical on G15 and HAL200. -->

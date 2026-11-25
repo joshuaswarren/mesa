@@ -14,7 +14,7 @@ static inline bool
 hk_ppp_emit_state(enum agx_chip chip, uint8_t **out, uint64_t gpu_base,
                    size_t size)
 {
-   if (agx_chip_g17_m5(chip) || chip == AGX_CHIP_G18G) {
+   if (agx_chip_hal300_path(chip)) {
       if (!agx_m5_vdm_compact(gpu_base, &gpu_base))
          return false;
    }

@@ -186,32 +186,28 @@ check_merge_memory_scope(void)
 static void
 check_as_contracts(void)
 {
-   struct agx_device dev = {
-      .chip = AGX_CHIP_G17P,
-      .params = {.chip_id = 0x6040, .gpu_generation = 16, .gpu_variant = 'S'},
-   };
-   /* Exercise every combination: AS construction cannot imply traversal,
-    * and bounded execution alone cannot select the extended-prior ABI. */
-   for (unsigned bits = 0; bits < 8; ++bits) {
-      dev.params.features =
-         ((bits & 1) ? DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS : 0) |
-         ((bits & 2) ? DRM_ASAHI_FEATURE_RENDER_RAY_QUERY : 0) |
-         ((bits & 4) ? DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD : 0);
-      assert(hk_g16s_as_enabled(&dev) == ((bits & 5) == 5));
-      assert(hk_g17p_rt_enabled(&dev) == ((bits & 3) == 3));
-      assert(hk_gen1_as_enabled(&dev) ==
-             (((bits & 5) == 5) || ((bits & 3) == 3)));
+   static const uint32_t g17p_chip_ids[] = {0x6040, 0x6041, 0x8140};
+   for (unsigned i = 0; i < ARRAY_SIZE(g17p_chip_ids); ++i) {
+      struct agx_device dev = {
+         .chip = AGX_CHIP_G17P,
+         .params = {.chip_id = g17p_chip_ids[i]},
+      };
+      /* Exercise every combination: AS construction cannot imply traversal,
+       * and bounded execution alone cannot select the extended-prior ABI. */
+      for (unsigned bits = 0; bits < 8; ++bits) {
+         dev.params.features =
+            ((bits & 1) ? DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS : 0) |
+            ((bits & 2) ? DRM_ASAHI_FEATURE_RENDER_RAY_QUERY : 0) |
+            ((bits & 4) ? DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD : 0);
+         assert(hk_g16s_as_enabled(&dev) == ((bits & 5) == 5));
+         assert(hk_g17p_rt_enabled(&dev) == ((bits & 3) == 3));
+         assert(hk_gen1_as_enabled(&dev) ==
+                (((bits & 5) == 5) || ((bits & 3) == 3)));
+      }
    }
-   dev.params.features = UINT64_MAX;
-   dev.params.chip_id = 0x8140;
-   assert(!hk_g16s_as_enabled(&dev) && hk_g17p_rt_enabled(&dev));
-   dev.params.chip_id = 0x6040;
-   dev.params.gpu_variant = 'G';
-   assert(!hk_g16s_as_enabled(&dev));
-   dev.params.gpu_variant = 'S';
-   dev.params.gpu_generation = 17;
-   assert(!hk_g16s_as_enabled(&dev));
-   dev.params.gpu_generation = 16;
+   struct agx_device dev = {
+      .params = {.chip_id = 0x6040, .features = UINT64_MAX},
+   };
    for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip) {
       dev.chip = chip;
       if (chip != AGX_CHIP_G17P)
@@ -225,8 +221,8 @@ int main(void)
    for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip)
       assert(hk_shader_binary_version(chip) ==
              (chip == AGX_CHIP_G17P || chip == AGX_CHIP_G17G ||
-              chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C ? 43 :
-              chip <= AGX_CHIP_G15P ? 36 : 34));
+              chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C ? 51 :
+              chip <= AGX_CHIP_G15P ? 38 : 39));
    assert(hk_as_build_flags(AGX_CHIP_G17P, 0, true) == 0);
    assert(hk_as_build_flags(AGX_CHIP_G17P, DRM_ASAHI_FEATURE_RENDER_RAY_QUERY, true) == 0);
    assert(hk_as_build_flags(AGX_CHIP_G17P, DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD, false) == 0);

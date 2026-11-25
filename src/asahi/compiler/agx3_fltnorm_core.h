@@ -340,7 +340,8 @@ bool agx3_persp_mul_encode(enum agx_isa_encoding enc,
                            uint8_t out[AGX3_FLTNORM_MAX_LENGTH], uint8_t *len);
 
 struct agx3_normflt_desc {
-   uint16_t dest;      /* 32-bit register pair receiving the unpacked floats */
+   uint16_t dest;      /* register receiving the unpacked floats */
+   bool dest_16;       /* f10 = 1: unpack into f16 lanes instead of f32 */
    bool dest_hint;     /* f11; set in every witness */
    uint16_t src;       /* 16-bit register holding the packed lanes */
    bool two_lanes;     /* unpack both bytes; false = one lane */

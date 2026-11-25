@@ -643,11 +643,9 @@ latch_register(nir_loop *loop, nir_def *value)
    return NULL;
 }
 
-/* later_bounds: the bounds computed for the loops unrolled after this one,
- * which may name a value this loop leaves (plain pointers, not uses). */
 static void
 unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
-            unsigned factor, nir_def **later_bounds, unsigned nlater)
+            unsigned factor)
 {
    nir_loop *loop = cl->loop;
    nir_builder b = nir_builder_create(impl);
@@ -817,10 +815,6 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
       nir_foreach_use_including_if_safe(src, outs[i].def) {
          if (!block_in_loop(use_block(src), loop))
             nir_src_rewrite(src, value);
-      }
-      for (unsigned j = 0; j < nlater; ++j) {
-         if (later_bounds[j] == outs[i].def)
-            later_bounds[j] = value;
       }
    }
    _mesa_hash_table_destroy(again, NULL);
@@ -1180,52 +1174,54 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
          any = true;
       }
 
-      struct util_dynarray loops;
-      util_dynarray_init(&loops, NULL);
-      collect_loops(&impl->body, &loops);
-
-      struct counted_loop candidates[64];
-      nir_def *bounds[64];
-      unsigned factors[64];
+      /* One loop at a time, each analyzed on the shader the unrolls before it
+       * left, back in SSA form: an unroll turns its loop's header phis into
+       * registers, and a later loop's bound can be one of those phis (such as
+       * a count the loop before leaves). */
       unsigned n = 0;
-      util_dynarray_foreach(&loops, nir_loop *, lp) {
+      while (n < 64) {
+         struct util_dynarray loops;
+         util_dynarray_init(&loops, NULL);
+         collect_loops(&impl->body, &loops);
+
          struct counted_loop cl;
-         if (n == ARRAY_SIZE(candidates) || !analyze_loop(*lp, &cl))
-            continue;
-         const unsigned f = choose_factor(impl, *lp, &cl, factor, max_instrs);
+         unsigned f = 0;
+         util_dynarray_foreach(&loops, nir_loop *, lp) {
+            if (analyze_loop(*lp, &cl) &&
+                (f = choose_factor(impl, *lp, &cl, factor, max_instrs)))
+               break;
+         }
+         util_dynarray_fini(&loops);
          if (!f)
-            continue;
+            break;
 
          /* The bound as seen from the preheader. */
-         nir_scalar bound = cl.bound;
-         nir_block *pre =
-            nir_cf_node_as_block(nir_cf_node_prev(&(*lp)->cf_node));
+         nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&cl.loop->cf_node));
          nir_builder b = nir_builder_at(nir_after_block_before_jump(pre));
-         if (nir_scalar_is_const(bound)) {
-            bounds[n] = nir_imm_int(&b, (uint32_t)nir_scalar_as_uint(bound));
+         nir_def *bound;
+         if (nir_scalar_is_const(cl.bound)) {
+            bound = nir_imm_int(&b, (uint32_t)nir_scalar_as_uint(cl.bound));
          } else {
             /* Defined outside the loop and read in it, so it dominates the
              * preheader's end, or computed alike by every iteration: then
              * computed once there. */
             struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
-            nir_def *def = rematerialize(&b, bound.def, *lp, remap);
+            nir_def *def = rematerialize(&b, cl.bound.def, cl.loop, remap);
             _mesa_hash_table_destroy(remap, NULL);
-            bounds[n] = nir_channel(&b, def, bound.comp);
+            bound = nir_channel(&b, def, cl.bound.comp);
          }
-         factors[n] = f;
          if (widest)
             *widest = MAX2(*widest, f);
-         candidates[n++] = cl;
-      }
-      util_dynarray_fini(&loops);
+         unroll_loop(impl, &cl, bound, f);
 
-      for (unsigned i = 0; i < n; ++i)
-         unroll_loop(impl, &candidates[i], bounds[i], factors[i], &bounds[i + 1],
-                     n - i - 1);
-
-      if (n) {
          nir_progress(true, impl, nir_metadata_none);
          nir_lower_reg_intrinsics_to_ssa_impl(impl);
+         nir_metadata_require(impl, nir_metadata_block_index);
+         nir_index_ssa_defs(impl);
+         n++;
+      }
+
+      if (n) {
          any = true;
       } else if (unswitched) {
          nir_progress(true, impl, nir_metadata_none);

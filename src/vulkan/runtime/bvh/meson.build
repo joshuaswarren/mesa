@@ -37,6 +37,10 @@ bvh_shaders = [
     'leaf',
   ],
   [
+    'leaf_morton.comp',
+    'leaf_morton_32',
+  ],
+  [
     'morton_sort.comp',
     'morton_sort_64',
     [ 'MORTON_SORT_KEY64=1' ]

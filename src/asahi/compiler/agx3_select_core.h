@@ -2,23 +2,10 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * AGX3 instruction selection core: the grade-A subset of AGX IR operations
- * that maps 1:1 onto a grounded AGX3 encoding, expressed over normalized
- * operands so it is free of the Mesa compiler's generated headers and testable
- * on its own.
- *
- * The full backend (agx3_pack_binary) is a thin shim that walks the scheduled
- * agx_instr IR, translates each instruction into the struct below, and calls
- * agx3_select_encode. Everything that can be wrong -- which IR op maps to which
- * AGX3 form, the domain each form is valid over, how IR operands bind to the
- * form's fields -- lives here where it can be exercised exhaustively, byte for
- * byte, against the hand-written agx3_pack.c encoders.
- *
- * This is milestone one: the no-modifier 32-bit ALU / move / immediate core
- * plus the two nullary terminators. It fails closed on everything else --
- * modifiers, non-32-bit sizes, immediate/uniform sources, shifts, and every
- * unmapped opcode -- because emitting a plausible-but-wrong AGX3 stream is a
- * silent mis-execution, not a fault.
+ * Standalone AGX3 instruction-selection core for the no-modifier 32-bit ALU,
+ * move, immediate, and nullary terminator subset over normalized operands.
+ * Unmapped opcodes, modifiers, non-32-bit sizes, and unsupported operand kinds
+ * fail closed.
  */
 
 #pragma once

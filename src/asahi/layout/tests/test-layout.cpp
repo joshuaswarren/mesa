@@ -288,13 +288,19 @@ TEST(Linear, Packed422Rows)
 }
 
 /*
- * G17P Interchange (DRM_FORMAT_MOD_APPLE_INTERCHANGE).  The row
- * pitch, data size and header offset are the contract with appledrm, which
- * requires pitch == ceil(w/16)*1024, header offset == data size and a buffer
+ * Compressed Interchange (DRM_FORMAT_MOD_APPLE_INTERCHANGE; gated per chip by
+ * AGX_CAP_GEN9_2D_COMPRESSION).  The macroblock row pitch, data size
+ * and header offset are the contract with appledrm, which lays out
+ * pitch == ceil(w/16)*1024, header offset == data size and a buffer
  * of at least data + (8 << (log2ceil(tiles_x) + log2ceil(tiles_y))) bytes.
+ * appledrm derives that layout itself and ignores the framebuffer pitch, but
+ * DRM core checks (height - 1) * pitch + width * cpp against the buffer, so
+ * the pitch handed to the window system is per pixel row: a sixteenth of the
+ * macroblock row.
  */
 static void
-check_interchange(unsigned w, unsigned h)
+check_interchange(unsigned w, unsigned h,
+                  enum pipe_format format = PIPE_FORMAT_B8G8R8A8_UNORM)
 {
    struct ail_layout layout = {
       .width_px = w,
@@ -304,12 +310,13 @@ check_interchange(unsigned w, unsigned h)
       .levels = 1,
       .tiling = AIL_TILING_INTERCHANGE,
       .compressed = true,
-      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+      .format = format,
       .renderable = true,
    };
 
    ail_make_miptree(&layout);
 
+   EXPECT_EQ(util_format_get_blocksize(format), 4u);
    const unsigned tx = DIV_ROUND_UP(w, 16), ty = DIV_ROUND_UP(h, 16);
    const uint64_t pitch = tx * 1024;
    const uint64_t data = ty * pitch;
@@ -317,7 +324,8 @@ check_interchange(unsigned w, unsigned h)
       8ull << (util_logbase2_ceil(tx) + util_logbase2_ceil(ty));
 
    EXPECT_EQ(ail_get_interchange_stride_B(&layout), pitch);
-   EXPECT_EQ(ail_get_wsi_stride_B(&layout, 0), pitch);
+   EXPECT_EQ(ail_get_wsi_stride_B(&layout, 0), pitch / 16);
+   EXPECT_LE((h - 1) * (pitch / 16) + w * 4, layout.size_B);
    EXPECT_EQ(layout.level_offsets_B[0], 0u);
    EXPECT_EQ(ail_get_level_size_B(&layout, 0), data);
    EXPECT_EQ(layout.layer_stride_B, data);
@@ -348,6 +356,32 @@ TEST(Interchange, OddSizes)
    check_interchange(16384, 16);
 }
 
+TEST(Interchange, TenBitFormats)
+{
+   static const enum pipe_format formats[] = {
+      PIPE_FORMAT_B8G8R8A8_UNORM,
+      PIPE_FORMAT_B8G8R8X8_UNORM,
+      PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R8G8B8X8_UNORM,
+      PIPE_FORMAT_B10G10R10A2_UNORM,
+      PIPE_FORMAT_B10G10R10X2_UNORM,
+      PIPE_FORMAT_R10G10B10A2_UNORM,
+      PIPE_FORMAT_R10G10B10X2_UNORM,
+   };
+   static const unsigned dims[][2] = {
+      {2408, 1506},
+      {3456, 2234},
+      {256, 128},
+      {33, 17},
+      {1920, 1080},
+      {16384, 16},
+   };
+   for (enum pipe_format fmt : formats) {
+      for (const auto &d : dims)
+         check_interchange(d[0], d[1], fmt);
+   }
+}
+
 TEST(Interchange, Modifier)
 {
    EXPECT_EQ(DRM_FORMAT_MOD_APPLE_GPU_TILED, 0x0c00000000000001ull);
@@ -356,4 +390,56 @@ TEST(Interchange, Modifier)
    EXPECT_EQ(ail_drm_modifier_to_tiling(DRM_FORMAT_MOD_APPLE_INTERCHANGE),
              AIL_TILING_INTERCHANGE);
    EXPECT_TRUE(ail_is_drm_modifier_compressed(DRM_FORMAT_MOD_APPLE_INTERCHANGE));
+}
+
+TEST(G17PLayout, CompressedMipmapped2DArray)
+{
+   struct ail_layout layout = {
+      .width_px = 128,
+      .height_px = 128,
+      .depth_px = 4,
+      .sample_count_sa = 1,
+      .policy = AIL_LAYOUT_POLICY_LEGACY,
+      .levels = 8,
+      .tiling = AIL_TILING_GPU,
+      .compressed = true,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .renderable = true,
+   };
+   ail_make_miptree(&layout);
+
+   EXPECT_TRUE(layout.page_aligned_layers);
+   EXPECT_EQ(layout.layer_stride_B % AIL_PAGESIZE, 0u);
+   EXPECT_EQ(layout.metadata_offset_B,
+             (uint64_t)layout.layer_stride_B * layout.depth_px);
+   EXPECT_GT(layout.compression_layer_stride_B, 0u);
+   EXPECT_EQ(layout.compression_layer_stride_B % AIL_CACHELINE, 0u);
+   EXPECT_EQ(layout.size_B,
+             layout.metadata_offset_B +
+                (uint64_t)layout.compression_layer_stride_B * layout.depth_px);
+
+   /* Levels 0..3 (128x128 down to 16x16) are compressed; tail levels 4..7
+    * (< 16x16) are logically uncompressed. */
+   for (unsigned l = 0; l < layout.levels; ++l) {
+      const bool expect_comp = l < 4;
+      EXPECT_EQ(ail_is_level_logically_compressed(&layout, l), expect_comp);
+      if (expect_comp && l > 0) {
+         EXPECT_GT(layout.level_offsets_compressed_B[l],
+                   layout.level_offsets_compressed_B[l - 1]);
+      }
+      if (expect_comp) {
+         EXPECT_EQ(layout.level_offsets_compressed_B[l] % AIL_CACHELINE, 0u);
+         for (unsigned layer = 0; layer < layout.depth_px; ++layer) {
+            const uint64_t meta =
+               layout.metadata_offset_B +
+               (uint64_t)layer * layout.compression_layer_stride_B +
+               layout.level_offsets_compressed_B[l];
+            EXPECT_LT(meta, layout.size_B);
+         }
+      }
+      for (unsigned layer = 0; layer < layout.depth_px; ++layer) {
+         const uint64_t body = ail_get_layer_level_B(&layout, layer, l);
+         EXPECT_LT(body, layout.metadata_offset_B);
+      }
+   }
 }

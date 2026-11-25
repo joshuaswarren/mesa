@@ -28,31 +28,32 @@ extern "C" {
  * blended fragment shaders, to 38 when agx_shader_info gains
  * needs_full_quads, to 39 when G17P payloads record the fragment
  * twins of unlinked mesh shaders, to 42 when unlinked G17P vertex
- * shaders over the canonical size carry relocatable varying writes, and to 43
- * when agx_shader_info gains launch_size. */
-#define HK_AGX3_SHADER_BINARY_VERSION 43u
-#define HK_CLASSIC_SHADER_BINARY_VERSION 34u
-/* AGX2 image-acquire binaries now include memory-to-texture visibility. */
-#define HK_AGX2_SHADER_BINARY_VERSION 36u
+ * shaders over the canonical size carry relocatable varying writes, to 43
+ * when agx_shader_info gains launch_size, to 44 when unlinked G17P vertex
+ * shaders drop the canonical layout for the relocatable one, to 45 for
+ * attachmentless layer-zero root lowering and fs.reads_layer, to 46 when
+ * AGX3 fragment binaries carry on-chip local_read NIR payloads, to 47
+ * when agx_shader_info gains AGX3 vertex preamble hoist metadata and
+ * vertex binaries may carry extracted preamble NIR, to 48 when
+ * hk_shader_info.vs records per-pipeline vertex input robustness, to 49
+ * when compute shaders carry packed vec4 alternates, and to 50 when they
+ * carry compute-pair state in a third variant byte. AGX3 moves to 51 and
+ * classic to 39 when compute-pair binaries also carry the producer state
+ * needed to compile fused variants. */
+#define HK_AGX3_SHADER_BINARY_VERSION 51u
+#define HK_CLASSIC_SHADER_BINARY_VERSION 39u
+/* AGX2 binaries include attachmentless layer-zero root lowering, fs.reads_layer,
+ * and per-pipeline vertex input robustness in hk_shader_info.vs. */
+#define HK_AGX2_SHADER_BINARY_VERSION 38u
 
 static inline uint32_t
 hk_shader_binary_version(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G13G:
-   case AGX_CHIP_G13X:
-   case AGX_CHIP_G14G:
-   case AGX_CHIP_G14X:
-   case AGX_CHIP_G15P:
+   if (agx_chip_isa(chip) == AGX_ISA_AGX2)
       return HK_AGX2_SHADER_BINARY_VERSION;
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
+   if (agx_chip_g17p_or_m5(chip))
       return HK_AGX3_SHADER_BINARY_VERSION;
-   default:
-      return HK_CLASSIC_SHADER_BINARY_VERSION;
-   }
+   return HK_CLASSIC_SHADER_BINARY_VERSION;
 }
 
 /* API outputs include position. Unlinked shaders additionally reserve a

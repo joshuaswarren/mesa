@@ -45,7 +45,7 @@ reference_reg_to_uniform(uint16_t uniform_half, uint16_t src_half, bool kill,
    };
    const bool wide = uniform_half >= 128;
    return agx3_bind_compose(
-      AGX_ISA_ENCODING_AGX3B, "copy", wide ? 1 : 0,
+      AGX_ISA_ENCODING_AGX3B, AGX3_MN_copy, wide ? 1 : 0,
       wide ? extended : compact,
       wide ? ARRAY_SIZE(extended) : ARRAY_SIZE(compact), overrides,
       ARRAY_SIZE(overrides), out, len);

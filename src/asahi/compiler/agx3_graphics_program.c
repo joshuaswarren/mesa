@@ -239,7 +239,7 @@ agx3_g17p_graphics_external_setup_suffix_generate(
    enum agx_chip chip, const struct agx3_g17p_graphics_program_desc *desc,
    void *output, size_t capacity, size_t *written)
 {
-   if (chip != AGX_CHIP_G17P || !desc || !output || !written ||
+   if (!agx_chip_native_hal200(chip) || !desc || !output || !written ||
        !desc->preloaded_root ||
        (desc->writes_sample_mask && !desc->fragment) ||
        (!desc->fragment && desc->colour_classes) ||
@@ -272,7 +272,7 @@ agx3_g17p_graphics_external_launcher_generate(
    uint64_t program_va, uint64_t root_va, uint64_t setup_va, void *output,
    size_t capacity, size_t *written)
 {
-   if (chip != AGX_CHIP_G17P || !desc || !output || !written ||
+   if (!agx_chip_native_hal200(chip) || !desc || !output || !written ||
        !desc->preloaded_root || !graphics_external_root_uniform_free(desc))
       return false;
 
@@ -343,7 +343,7 @@ agx3_g17p_graphics_external_launcher_template_relocate(
    uint64_t program_va, uint64_t root_va, uint64_t setup_va, void *output,
    size_t capacity, size_t *written)
 {
-   if (chip != AGX_CHIP_G17P || !launcher || !output || !written ||
+   if (!agx_chip_native_hal200(chip) || !launcher || !output || !written ||
        launcher->length > sizeof(launcher->bytes) ||
        launcher->length > capacity ||
        launcher->branch_offset + AGX_IOTO_PRESHADER_BRANCH_SIZE !=
@@ -842,7 +842,8 @@ static bool
 g18g_graphics_program_generate(
    enum agx_chip chip, const struct agx3_g17p_graphics_program_desc *desc,
    enum agx_ioto_g17g_program_stage stage,
-   bool g18_tps, struct agx3_g17p_graphics_program *program)
+   bool g18_tps, struct agx3_g17p_graphics_program *program,
+   struct agx3_g17p_graphics_program_template *template)
 {
    /* G18 consumes this canonical GPU1 form through the caller's agx3d
     * re-encoder. Retain the target for imageblock admission before selecting
@@ -871,15 +872,9 @@ g18g_graphics_program_generate(
          (desc->threadgroup_memory_size_B & 63))) ||
        desc->colour_classes > 7 ||
        (!desc->fragment && desc->colour_classes) ||
-       /* A render with no colour attachment has an empty imageblock. Apple's
-        * own colour-free render emits the same fragment SPECLM spelling as a
-        * colour one -- both carry 1700002c00001808 -- so the sample size may
-        * be zero as well as the witnessed eight bytes. Other tile sizes and
-        * sample counts still need their own native evidence.
-        *
-        * msaa163: plus exactly one multisample imageblock, eight-byte samples
-        * at 4x in a 32x16 tile -- what Apple's M5 and G18 4x renders select
-        * for one RGBA8 target (MSAA notes s2.4). */
+       /* Admitted imageblock shapes: 32x32 1x with 0 (depth-only) or 8-byte
+        * samples, plus 32x16 4x MSAA with 8-byte samples. Other tile sizes
+        * and sample counts stay closed. */
        (desc->fragment &&
         !((desc->imageblock.sample_size_B == 8 ||
            (target_chip == AGX_CHIP_G18G &&
@@ -917,16 +912,9 @@ g18g_graphics_program_generate(
                                           desc->uniform_range_count, &bound))
       return false;
 
-   /* The captured M5 physical imageblock spelling. Byte 7 is the imageblock
-    * sample size in bytes: three native fragment renders taken in one session
-    * publish 1700002c00001808 for one RGBA8 attachment and 1700002c00001820
-    * for eight, and nothing else in the record moves. Bytes 0..6 -- which are
-    * the per-tile-shape seed in HAL200's spelling -- are identical across
-    * both, so Apple keeps the 32x32 tile for 32-byte samples rather than
-    * halving it, landing on exactly the 32 KiB structural bound. The byte is
-    * therefore a plain byte count, and sixteen-byte samples (RGBA32 and RGB32
-    * attachments) use it as such. Other tile sizes and sample counts still
-    * need their own native evidence. */
+   /* M5 physical imageblock record: bytes 0..6 encode the tile shape (32x32
+    * up to the 32 KiB bound) and byte 7 is the per-sample byte count (0, 8,
+    * 16, or 32 bytes). Other tile sizes and sample counts stay closed. */
    static const uint8_t speclm[2][AGX_IOTO_SPECLM_SIZE] = {
       {0x07,0x00,0x00,0x0c,0x00,0x00,0x00,0x00},
       {0x17,0x00,0x00,0x2c,0x00,0x00,0x18,0x08},
@@ -1005,16 +993,21 @@ g18g_graphics_program_generate(
    struct agx_ioto_inflight_load loads[AGX3_G17P_GRAPHICS_MAX_LOAD_CHUNKS];
    struct agx_ioto_inflight_load sort[AGX3_G17P_GRAPHICS_MAX_LOAD_CHUNKS];
    struct agx_ioto_load_cache_entry cache[AGX3_G17P_GRAPHICS_MAX_LOAD_CHUNKS];
+   size_t relocation_count = 0;
    const struct agx3_ioto_uniform_program_desc load_desc = {
       .program_va = desc->program_va,
       .ranges = desc->uniform_ranges,
       .range_count = desc->uniform_range_count,
+      .patchable = desc->patchable,
    };
    const struct agx3_ioto_uniform_program_workspace workspace = {
       .body = body, .body_capacity = sizeof(body),
       .loads = loads, .load_capacity = ARRAY_SIZE(loads),
       .sort = sort, .sort_capacity = ARRAY_SIZE(sort),
       .cache = cache, .cache_capacity = ARRAY_SIZE(cache),
+      .relocations = template ? template->relocations : NULL,
+      .relocation_capacity = template ? ARRAY_SIZE(template->relocations) : 0,
+      .relocation_count = &relocation_count,
    };
    size_t body_size, copy_offset, written;
    struct agx3_g17p_graphics_program staged = {0};
@@ -1026,6 +1019,25 @@ g18g_graphics_program_generate(
           staged.bytes, sizeof(staged.bytes), &written) ||
        written > bound || written > UINT16_MAX)
       return false;
+   if (template) {
+      /* The composer inserts the state prefix where the body's COPY suffix
+       * starts (agx_ioto_g17g_resource_program_compose_classes()): move the
+       * address materializations after it past the prefix. */
+      size_t suffix;
+      if (!agx_ioto_program_copy_suffix_offset(chip, body, body_size, &suffix))
+         return false;
+      const size_t prefix = AGX_IOTO_STATE_TAIL_TYPE0_SIZE +
+                            AGX_IOTO_G17S_MINIMAL_PROFILE_LOADER_SIZE;
+      for (size_t i = 0; i < relocation_count; ++i) {
+         struct agx_ioto_load_relocation *r = &template->relocations[i];
+         if (r->offset >= suffix)
+            r->offset += prefix;
+         else if (r->offset + r->low_length + r->high_length > suffix)
+            return false;
+      }
+      template->relocation_count = relocation_count;
+      template->constant_suffix_offset = written - AGX_IOTO_PROGRAM_TERMINATE_SIZE;
+   }
    staged.length = written;
    *program = staged;
    return true;
@@ -1064,7 +1076,7 @@ agx3_g17p_graphics_program_desc_bound(
    size_t *size)
 {
    size_t base, input_body, chunks;
-   if (!desc || !size || chip != AGX_CHIP_G17P ||
+   if (!desc || !size || !agx_chip_native_hal200(chip) ||
        desc->uniform_range_count > AGX3_G17P_GRAPHICS_MAX_RANGES ||
        (desc->uniform_range_count && !desc->uniform_ranges) ||
        (desc->constant_program.code_size & 1) ||
@@ -1121,7 +1133,7 @@ agx3_g17p_graphics_root_prefix_generate(
    enum agx_chip chip, uint64_t root_va,
    struct agx3_g17p_graphics_root_prefix *prefix)
 {
-   if (!prefix || chip != AGX_CHIP_G17P || !root_va)
+   if (!prefix || !agx_chip_native_hal200(chip) || !root_va)
       return false;
 
    struct agx3_g17p_graphics_root_prefix staged = {0};
@@ -1158,7 +1170,23 @@ agx3_g18g_graphics_program_generate(
                                  : AGX_IOTO_G17G_PROGRAM_FRAGMENT;
    /* Canonical GPU1 record; the G18 caller must re-encode it as agx3d. */
    return desc && g18g_graphics_program_generate(AGX_CHIP_G18G, desc, stage,
-                                                 false, program);
+                                                 false, program, NULL);
+}
+
+bool
+agx3_g18g_graphics_program_template_generate(
+   const struct agx3_g17p_graphics_program_desc *desc,
+   struct agx3_g17p_graphics_program_template *program)
+{
+   const enum agx_ioto_g17g_program_stage stage =
+      !desc                      ? AGX_IOTO_G17G_PROGRAM_VERTEX
+      : !desc->fragment          ? AGX_IOTO_G17G_PROGRAM_VERTEX
+      : desc->writes_sample_mask ? AGX_IOTO_G17G_PROGRAM_COVERAGE_FRAGMENT
+                                 : AGX_IOTO_G17G_PROGRAM_FRAGMENT;
+   /* A static TPS frame takes the _tps program, as for one generated whole */
+   return desc && program && g18g_graphics_program_generate(
+      AGX_CHIP_G18G, desc, stage, desc->scratch_size != 0, &program->program,
+      program);
 }
 
 bool
@@ -1168,7 +1196,8 @@ agx3_g18g_compute_program_generate(
 {
    /* Canonical GPU1 record; the G18 caller must re-encode it as agx3d. */
    return desc && !desc->fragment && g18g_graphics_program_generate(
-      AGX_CHIP_G17G, desc, AGX_IOTO_G17G_PROGRAM_COMPUTE, true, program);
+      AGX_CHIP_G17G, desc, AGX_IOTO_G17G_PROGRAM_COMPUTE, true, program,
+      NULL);
 }
 
 bool
@@ -1183,7 +1212,7 @@ agx3_g18g_graphics_program_generate_tps(
                                  : AGX_IOTO_G17G_PROGRAM_FRAGMENT;
    /* Canonical GPU1 record; the G18 caller must re-encode it as agx3d. */
    return desc && desc->scratch_size && g18g_graphics_program_generate(
-      AGX_CHIP_G18G, desc, stage, true, program);
+      AGX_CHIP_G18G, desc, stage, true, program, NULL);
 }
 
 bool
@@ -1195,7 +1224,7 @@ agx3_g18g_tile_program_generate(
    return desc && desc->fragment && g18g_graphics_program_generate(
       AGX_CHIP_G18G, desc, store ? AGX_IOTO_G17G_PROGRAM_EOT
                                  : AGX_IOTO_G17G_PROGRAM_BACKGROUND, false,
-      program);
+      program, NULL);
 }
 
 bool
@@ -1203,7 +1232,7 @@ agx3_g17p_fragment_blend_constant_base(enum agx_chip chip,
                                         unsigned occupied_halfs,
                                         uint16_t *base)
 {
-   if ((!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip)) || !base)
+   if (!agx_chip_native_or_m5(chip) || !base)
       return false;
 
    const unsigned start = ALIGN_POT(MAX2(occupied_halfs, 8), 2);

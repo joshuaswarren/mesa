@@ -120,7 +120,7 @@ local_form(enum agx_isa_encoding enc, const struct agx3_local_desc *d,
    const unsigned nbase = local_baseline(enc, is_load, base);
    struct agx3_field_kv ov[32];
    const unsigned n = local_overrides(d, is_load, ov);
-   return agx3_bind_compose(enc, is_load ? "ldtg" : "sttg", ep, base,
+   return agx3_bind_compose(enc, is_load ? AGX3_MN_ldtg : AGX3_MN_sttg, ep, base,
                             nbase, ov, n, out, len);
 }
 
@@ -223,7 +223,7 @@ tps_form(enum agx_isa_encoding enc, const struct agx3_tps_desc *d,
    const unsigned nbase = tps_baseline(enc, is_load, d->retain_tps, base);
    struct agx3_field_kv ov[32];
    const unsigned n = tps_overrides(d, is_load, ov);
-   return agx3_bind_compose(enc, is_load ? "ldtps" : "sttps", ep, base,
+   return agx3_bind_compose(enc, is_load ? AGX3_MN_ldtps : AGX3_MN_sttps, ep, base,
                             nbase, ov, n, out, len);
 }
 
