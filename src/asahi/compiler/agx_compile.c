@@ -16436,7 +16436,8 @@ agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p, bool m5,
 
 static void
 agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_depth,
-                            bool g18g, bool m5, bool chip_g17p, bool post_lower,
+                            bool g18g, bool m5, bool chip_g17p, bool shader_quad_control,
+                            bool post_lower,
                             bool defer_idiv, bool preserve_branches)
 {
    if (!nir)
@@ -16445,7 +16446,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    if (post_lower && agx_nir_has_temp_vars(nir))
       post_lower = false;
 
-   if (g17p)
+   if (shader_quad_control)
       agx_preserve_quad_control(nir);
 
    if (!post_lower) {
@@ -16641,7 +16642,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 void
 agx_preprocess_nir_for_encoding(nir_shader *nir, enum agx_isa_encoding encoding)
 {
-   agx_preprocess_nir_internal(nir, false, false, false, false, false, false,
+   agx_preprocess_nir_internal(nir, false, false, false, false, false, false, false,
                                false, encoding == AGX_ISA_ENCODING_AGX3B);
 }
 
@@ -16655,7 +16656,8 @@ void
 agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip)
 {
    agx_preprocess_nir_internal(
-      nir, true, true, false, false, chip == AGX_CHIP_G17P, false, false,
+      nir, true, true, false, false, chip == AGX_CHIP_G17P,
+      agx_chip_agx3_shader_quad_control(chip), false, false,
       agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B);
 }
 
@@ -16663,7 +16665,8 @@ void
 agx_preprocess_nir_native_defer_idiv(nir_shader *nir, enum agx_chip chip)
 {
    agx_preprocess_nir_internal(
-      nir, true, true, false, false, chip == AGX_CHIP_G17P, false, true,
+      nir, true, true, false, false, chip == AGX_CHIP_G17P,
+      agx_chip_agx3_shader_quad_control(chip), false, true,
       agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B);
 }
 
@@ -16677,7 +16680,7 @@ void
 agx_preprocess_nir_g18g(nir_shader *nir)
 {
    /* Select G18 trig without inheriting G17P subgroup/shared-memory rules. */
-   agx_preprocess_nir_internal(nir, false, false, true, false, false, false,
+   agx_preprocess_nir_internal(nir, false, false, true, false, false, false, false,
                                false, false);
 }
 
@@ -16693,7 +16696,8 @@ agx_preprocess_nir_post_lower(nir_shader *nir, enum agx_chip chip)
       agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B;
 
    agx_preprocess_nir_internal(nir, g17p, native_fragment_depth, g18g, m5,
-                               chip_g17p, true, false, preserve_branches);
+                               chip_g17p, agx_chip_agx3_shader_quad_control(chip),
+                               true, false, preserve_branches);
 }
 
 static bool
@@ -18668,7 +18672,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
     * modes survive that gather and must still reach the AGX3 entry protocol
     * and the draw-time triangle-merge control, even without a surviving quad
     * intrinsic. Keep the AGX2 compilation path unchanged. */
-   if (key->dev.chip == AGX_CHIP_G17P && key->dev.shader_quad_control)
+   if (key->dev.shader_quad_control)
       agx_preserve_quad_control(nir);
 
    agx_compiler_debug = agx_get_compiler_debug();
@@ -19717,13 +19721,13 @@ agx_compile_shader_nir_preoptimized(nir_shader *nir, struct agx_shader_key *key,
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
+   agx_preprocess_nir_internal(nir, false, true, false, true, false, true, false,
                                false, false);
 }
 
 void
 agx_preprocess_nir_m5_defer_idiv(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
+   agx_preprocess_nir_internal(nir, false, true, false, true, false, true, false,
                                true, false);
 }

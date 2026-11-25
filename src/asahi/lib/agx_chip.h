@@ -1192,6 +1192,26 @@ agx_chip_tri_merge_across_side_effects(enum agx_chip chip)
    return agx_chip_info(chip)->quirks & AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS;
 }
 
+/* Whether an AGX3 chip supplies the quad ballot/shuffle encodings and
+ * draw-time triangle-merge control required by VK_KHR_shader_quad_control.
+ * Native AGX3B (G15/G16/G17P) and M5 AGX3C (G17G/G17S/G17C) share both;
+ * AGX2 uses its legacy path and bring-up G18G stays off. */
+static inline bool
+agx_chip_agx3_shader_quad_control(enum agx_chip chip)
+{
+   return agx_chip_native_or_m5(chip);
+}
+
+/* Whether Vulkan VK_KHR_shader_quad_control / shaderQuadControl is supported
+ * on this chip (AGX2 native support, or AGX3 with quad encodings and
+ * draw-time triangle-merge control). */
+static inline bool
+agx_chip_has_shader_quad_control(enum agx_chip chip)
+{
+   return agx_chip_isa(chip) == AGX_ISA_AGX2 ||
+          agx_chip_agx3_shader_quad_control(chip);
+}
+
 /* Whether an image load misses a store made earlier in the same invocation,
  * so Honeykrisp forwards the stored value to the load. A18 Pro's loads
  * behave this way; G15 loads observe the invocation's own stores. */
