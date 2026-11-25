@@ -397,6 +397,8 @@ hk_get_device_features(
    const struct vk_device_extension_table *supported_extensions,
    struct vk_features *features)
 {
+   const bool sparse = agx_chip_has_cap(dev->chip, AGX_CAP_SPARSE_BINDING);
+
    *features = (struct vk_features){
       /* Vulkan 1.0 */
       .robustBufferAccess = true,
@@ -457,9 +459,9 @@ hk_get_device_features(
       .shaderFloat64 = false,
       .shaderInt64 = true,
       .shaderInt16 = true,
-      .shaderResourceResidency = true,
+      .shaderResourceResidency = sparse,
       .shaderResourceMinLod = true,
-      .sparseBinding = true,
+      .sparseBinding = sparse,
 
       /* We probably could advertise multisampled sparse but we don't have a use
        * case yet and it isn't trivial.
@@ -467,9 +469,9 @@ hk_get_device_features(
       .sparseResidency2Samples = false,
       .sparseResidency4Samples = false,
       .sparseResidency8Samples = false,
-      .sparseResidencyAliased = true,
-      .sparseResidencyImage2D = true,
-      .sparseResidencyBuffer = true,
+      .sparseResidencyAliased = sparse,
+      .sparseResidencyImage2D = sparse,
+      .sparseResidencyBuffer = sparse,
 
       /* The sparse binder and SSTT use the same slice layout for 3D images
        * as for 2D arrays (nonstandard, one-slice block shape). */
@@ -1054,31 +1056,6 @@ hk_get_device_features(
        * falls back to SwiftShader. */
       features->fragmentStoresAndAtomics = true;
       features->advancedBlendCoherentOperations = true;
-      /* Sparse binding and residency reuse the AGX2 architecture wholesale:
-       * per-page VM_BIND with unbound pages mapped to the scratch/zero page,
-       * a read-only shadow at +sparse_ro_offset, and a userspace sparse map
-       * that the G17P texture descriptor points at in Sparse mode. The kernel
-       * already accepts DRM_ASAHI_BIND_SINGLE_PAGE binds, and the G17P user VA
-       * window is split for the RO alias exactly as AGX2 is. Sparse texture
-       * updates flush the SSTT with a HAL200 CDM record, so other native
-       * chips do not advertise it. */
-      const bool sparse = dev->chip == AGX_CHIP_G17P;
-      features->shaderResourceResidency = sparse;
-      features->sparseBinding = sparse;
-      /* A memory range may back several sparse VAs, including several
-       * locations within one resource. The common binder preserves the BO
-       * offset for each mapping and its RO shadow; G17P's transactional
-       * VM_BIND path retains each mapping independently. Residency metadata
-       * is per resource VA, not per backing allocation. */
-      features->sparseResidencyAliased = sparse;
-      features->sparseResidencyImage2D = sparse;
-      /* The sparse binder and SSTT use the same slice layout for 3D images
-       * as for 2D arrays. Report the nonstandard, one-slice block shape rather
-       * than requiring the standard 3D block shape.
-       */
-      features->sparseResidencyImage3D =
-         agx_chip_has_cap(dev->chip, AGX_CAP_SPARSE_RESIDENCY_3D);
-      features->sparseResidencyBuffer = sparse;
       /* The common Honeykrisp lowering duplicates a draw per view, writes
        * ViewIndex through the draw root and routes it through the packed
        * layer/viewport UVS output.  G17P now also has exact array BG/EOT
