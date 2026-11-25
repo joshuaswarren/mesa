@@ -63,35 +63,12 @@ struct agx_ppp_hal300_depth_bias_scissor_bases {
 };
 
 /*
- * The G17G/G17X render-state handlers preserve the G15/G16 record geometry:
+ * HAL300 PPP depth-bias (3 x f32) and scissor (4 x u16, 2 x f32) records plus
+ * the 5-word base-address reference block (header 0x300, followed by 48-bit
+ * 4-byte-aligned depth-bias and scissor bases).
  *
- *   depth bias: f32 depth bias, f32 slope scale, f32 clamp
- *   scissor:    u16 max X, u16 min X, u16 max Y, u16 min Y,
- *               f32 min Z, f32 max Z
- *
- * The PPP reference block is new.  Both initial render-state emission and a
- * later pipeline-state update emit these five words in exactly this order:
- *
- *   u32 header = bits 8 | 9
- *   u32 depth bias base bits 32..47 in bits 16..31
- *   u32 depth bias base bits 0..31
- *   u32 scissor base bits 32..47 in bits 16..31
- *   u32 scissor base bits 0..31
- *
- * On G17X a render starts with header 0x300 and all 20 bytes of the block;
- * G17G has the same geometry.  A pipeline-state update handles selector
- * bit 8 before bit 9 and writes the two base pairs in that order.  In
- * contrast, G15G_B0 and G16G carry scissor and depth-bias indices rather
- * than base addresses.
- *
- * G18G is admitted too: every J873 native render points its VDM at this
- * five-word block, e.g. 00000300 01000000 002d0000 0 0 in the colour mode.
- *
- * Bases are 48-bit and four-byte aligned.  G15/G16 use header bit 8 followed
- * by one packed index word (depth bias in high 16, scissor in low 16); that
- * legacy form is intentionally not accepted here.  These codecs do not emit
- * a VDM pointer, alter a command buffer, submit work, admit a device, or
- * advertise a feature.
+ * Admitted: G17G/X (HAL300) and G18G (J873 native renders); closed: G15/G16
+ * (legacy packed-index form) and G17P/G17A.
  */
 bool agx_ppp_hal300_depth_bias_scissor_core_supported(enum agx_chip chip);
 

@@ -136,7 +136,7 @@ static unsigned checks;
    ROW(agx_chip_usc_base_page_fill_returns_for(c, 4),                          \
        "0000 01110 0100 10000 0 0")                                            \
    ROW(agx_chip_explicit_robust_image_bounds(c), "0000 01110 0100 00000 0 0")  \
-   ROW(agx_chip_vdm_indirect_index_bounds(c), "0000 00000 0000 00111 0 0")     \
+   ROW(agx_chip_vdm_indirect_index_bounds(c), "0000 00000 0000 10111 0 0")     \
    ROW(agx_chip_hw_texel_fetch_bounds(c), "0000 00000 0000 00111 0 0")         \
    ROW(agx_chip_native_imageblock(c), "0000 01110 0100 10000 0 0")             \
    ROW(agx_chip_uncovered_tile_ms_defect(c), "0000 01110 0100 10000 0 0")      \
@@ -154,13 +154,15 @@ static unsigned checks;
        "0000 01110 0100 10000 0 0")                                            \
    ROW(agx_chip_tri_merge_across_side_effects(c), "0000 00000 0000 10000 0 0") \
    ROW(agx_chip_image_load_misses_own_store(c), "0000 00000 0000 10000 0 0")   \
-   ROW(agx_chip_exact_fma32(c), "1111 10001 1011 11111 1 1")                   \
+   ROW(agx_chip_exact_fma32(c), "1111 11111 1111 11111 1 1")                   \
    ROW(agx_chip_sampler_has_lod_bias(c), "0000 00000 1111 11000 0 0")          \
-   ROW(agx_chip_native_preamble(c), "0000 00000 0000 10000 0 0")               \
-   ROW(agx_chip_query_ti_spill(c), "0000 00000 0000 10000 0 0")                \
+   ROW(agx_chip_native_preamble(c), "0000 00000 0100 10000 0 0")               \
+   ROW(agx_chip_query_ti_spill(c), "0000 00000 0100 10000 0 0")                \
    ROW(agx_chip_has_hardware_ray_tracing(c), "0000 01111 1111 11111 1 0")      \
+   ROW(agx_chip_has_agx3_ray_opcodes(c), "0000 01111 1111 11111 0 0")          \
    ROW(agx_chip_needs_scheduling_stalls(c), "0000 01000 0000 00000 0 0")       \
-   ROW(agx_chip_cooperative_matrix_supported(c), "0000 01111 1111 11111 0 0")  \
+   ROW(agx_chip_cooperative_matrix_supported(c), "1111 01111 1111 11111 0 0")  \
+   ROW(agx_chip_local_read_tilebuffer(c), "0000 00000 1111 11111 0 0")         \
    /* Per-record allowlists: VDM. */                                           \
    ROW(agx_vdm_state_vertex_pipeline_pair_supported(c),                        \
        "0000 01111 0111 10111 1 0")                                            \
@@ -170,6 +172,7 @@ static unsigned checks;
    ROW(agx_vdm_barrier_core_word(c, false) == AGX_VDM_BARRIER_CORE_PLAIN,      \
        "0000 00110 0100 00000 0 0")                                            \
    ROW(agx_vdm_stream_link_core_supported(c), "0000 01111 0111 10111 0 0")     \
+   ROW(agx_chip_vdm_stream_link_supported(c), "1111 01111 0111 10111 0 0")     \
    ROW(agx_vdm_stream_terminate_core_supported(c),                             \
        "0000 01111 0111 10111 1 0")                                            \
    ROW(agx_vdm_tessellate_direct_target_supported(c),                          \

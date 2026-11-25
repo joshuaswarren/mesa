@@ -26,11 +26,7 @@ struct agx_vdm_tessellate_direct_info {
    uint32_t base_patch;
    uint32_t base_instance;
 
-   /*
-    * These are the exact values written by Apple's direct-draw emitter after
-    * its context-side calculations.  This helper deliberately does not
-    * invent byte scaling or reconstruct the surrounding tessellation state.
-    */
+   /* Raw tessellation draw fields; no implicit scaling. */
    uint32_t instance_stride_word;
    uint32_t factor_buffer_size_minus_one;
 };

@@ -210,9 +210,11 @@ alu_cost(nir_alu_instr *alu)
    case nir_op_f2i8:
    case nir_op_f2i16:
    case nir_op_f2i32:
+   case nir_op_f2i32_sat:
    case nir_op_f2u8:
    case nir_op_f2u16:
    case nir_op_f2u32:
+   case nir_op_f2u32_sat:
    case nir_op_i2fmp:
    case nir_op_i2f16:
    case nir_op_i2f32:
@@ -372,14 +374,17 @@ surviving_branches(nir_shader *nir, const nir_opt_preamble_options *options,
                    const unsigned *sizes,
                    const nir_opt_peephole_select_options *flatten)
 {
-   struct set *branches = _mesa_pointer_set_create(NULL);
-   struct util_dynarray ifs, clone_ifs, left;
-   util_dynarray_init(&ifs, NULL);
-   util_dynarray_init(&clone_ifs, NULL);
-   util_dynarray_init(&left, NULL);
+   struct util_dynarray ifs = UTIL_DYNARRAY_INIT;
    collect_ifs(&nir_shader_get_entrypoint(nir)->body, &ifs);
+   if (!ifs.size) {
+      util_dynarray_fini(&ifs);
+      return NULL;
+   }
 
-   if (flatten && ifs.size) {
+   struct set *branches = NULL;
+   if (flatten) {
+      struct util_dynarray clone_ifs = UTIL_DYNARRAY_INIT;
+      struct util_dynarray left = UTIL_DYNARRAY_INIT;
       unsigned used[nir_preamble_num_classes];
       memcpy(used, sizes, sizeof(used));
 
@@ -389,28 +394,32 @@ surviving_branches(nir_shader *nir, const nir_opt_preamble_options *options,
       nir_opt_peephole_select(clone, flatten);
       collect_ifs(&nir_shader_get_entrypoint(clone)->body, &left);
 
-      /* Both walks see the same ifs in the same order, and the select pass
-       * creates no ifs. */
-      struct set *standing = _mesa_pointer_set_create(NULL);
-      util_dynarray_foreach(&left, nir_if *, nif)
-         _mesa_set_add(standing, *nif);
-      for (unsigned i = 0; i < util_dynarray_num_elements(&ifs, nir_if *);
-           ++i) {
-         if (_mesa_set_search(standing, *util_dynarray_element(
-                                           &clone_ifs, nir_if *, i)))
-            _mesa_set_add(branches,
-                          *util_dynarray_element(&ifs, nir_if *, i));
+      if (left.size) {
+         branches = _mesa_pointer_set_create(NULL);
+         /* Both walks see the same ifs in the same order, and the select pass
+          * creates no ifs. */
+         struct set *standing = _mesa_pointer_set_create(NULL);
+         util_dynarray_foreach(&left, nir_if *, nif)
+            _mesa_set_add(standing, *nif);
+         for (unsigned i = 0; i < util_dynarray_num_elements(&ifs, nir_if *);
+              ++i) {
+            if (_mesa_set_search(standing, *util_dynarray_element(
+                                              &clone_ifs, nir_if *, i)))
+               _mesa_set_add(branches,
+                             *util_dynarray_element(&ifs, nir_if *, i));
+         }
+         _mesa_set_destroy(standing, NULL);
       }
-      _mesa_set_destroy(standing, NULL);
       ralloc_free(clone);
+      util_dynarray_fini(&clone_ifs);
+      util_dynarray_fini(&left);
    } else {
+      branches = _mesa_pointer_set_create(NULL);
       util_dynarray_foreach(&ifs, nir_if *, nif)
          _mesa_set_add(branches, *nif);
    }
 
    util_dynarray_fini(&ifs);
-   util_dynarray_fini(&clone_ifs);
-   util_dynarray_fini(&left);
    return branches;
 }
 
@@ -920,6 +929,11 @@ speculative_descriptor(const nir_intrinsic_instr *load, unsigned *end)
    return bytes <= AGX_ZERO_PAGE_SIZE ? desc : NULL;
 }
 
+struct speculative_load_state {
+   unsigned free_halves;
+   struct set *promoted;
+};
+
 /* A load that moves takes its pointer with it, so one that then finds no slot
  * leaves the main program rebuilding that pointer from the descriptor. Allow
  * only what fits in the storage left free by everything that moves anyway.
@@ -927,17 +941,41 @@ speculative_descriptor(const nir_intrinsic_instr *load, unsigned *end)
 static bool
 allow_speculative_load(nir_builder *b, nir_intrinsic_instr *load, void *data)
 {
-   unsigned *free_halves = data;
+   struct speculative_load_state *state = data;
    const unsigned halves = load->def.num_components * 2;
    unsigned end;
    if (load->instr.block->cf_node.parent->type == nir_cf_node_function ||
-       !speculative_descriptor(load, &end) || halves > *free_halves)
+       !speculative_descriptor(load, &end) ||
+       (nir_intrinsic_access(load) & ACCESS_CAN_SPECULATE) ||
+       halves > state->free_halves)
       return false;
 
-   *free_halves -= halves;
+   state->free_halves -= halves;
    nir_intrinsic_set_access(
       load, nir_intrinsic_access(load) | ACCESS_CAN_SPECULATE);
+   _mesa_set_add(state->promoted, load);
    return true;
+}
+
+static bool
+has_speculative_load_candidate(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         if (block->cf_node.parent->type == nir_cf_node_function)
+            continue;
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            unsigned end;
+            if (speculative_descriptor(intr, &end) &&
+                !(nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE))
+               return true;
+         }
+      }
+   }
+   return false;
 }
 
 static unsigned
@@ -959,13 +997,16 @@ free_preamble_halves(const nir_shader *nir,
              : 0;
 }
 
-/* What stayed in the main program must not be flattened past its branch now. */
+/* What stayed in the main program must not be flattened past its branch now.
+ * Only clear ACCESS_CAN_SPECULATE from loads that allow_speculative_load()
+ * temporarily promoted, leaving pre-existing speculatable loads intact. */
 static bool
 disallow_speculative_load(nir_builder *b, nir_intrinsic_instr *load, void *data)
 {
+   struct set *promoted = data;
    if ((load->intrinsic != nir_intrinsic_load_agx &&
         load->intrinsic != nir_intrinsic_load_constant_agx) ||
-       !(nir_intrinsic_access(load) & ACCESS_CAN_REORDER))
+       !_mesa_set_search(promoted, load))
       return false;
 
    nir_intrinsic_set_access(
@@ -1052,10 +1093,18 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
       options.cb_data = branches;
    }
    bool speculative = false;
-   if (g17p && !agx3c && nir->info.stage == MESA_SHADER_FRAGMENT) {
-      unsigned free_halves = free_preamble_halves(nir, &options, sizes);
+   struct set *promoted_speculative = NULL;
+   if (!agx3c &&
+       (nir->info.stage == MESA_SHADER_FRAGMENT ||
+        nir->info.stage == MESA_SHADER_COMPUTE) &&
+       has_speculative_load_candidate(nir)) {
+      promoted_speculative = _mesa_pointer_set_create(NULL);
+      struct speculative_load_state spec_state = {
+         .free_halves = free_preamble_halves(nir, &options, sizes),
+         .promoted = promoted_speculative,
+      };
       NIR_PASS(speculative, nir, nir_shader_intrinsics_pass,
-               allow_speculative_load, nir_metadata_all, &free_halves);
+               allow_speculative_load, nir_metadata_all, &spec_state);
    }
 
    NIR_PASS(progress, nir, nir_opt_preamble, &options, sizes);
@@ -1063,13 +1112,14 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
    if (speculative) {
       nir_function_intrinsics_pass(nir_shader_get_entrypoint(nir),
                                    disallow_speculative_load, nir_metadata_all,
-                                   NULL);
+                                   promoted_speculative);
       if (progress) {
          nir_function_intrinsics_pass(nir_shader_get_preamble(nir),
                                       guard_speculative_load,
                                       nir_metadata_control_flow, NULL);
       }
    }
+   _mesa_set_destroy(promoted_speculative, NULL);
 
    if (progress && g17p)
       NIR_PASS(_, nir, agx_nir_export_select_flags_as_halves, false);
@@ -1096,6 +1146,215 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
  * the base of a bindless image/sampler token. Image/sampler-class exports use
  * separate native state and are deliberately left alone.
  */
+/*
+ * Cancel double sign flips across the preamble boundary: if the constant
+ * program stores `fneg(x)` into a general scalar uniform slot and every read
+ * of that slot only negates (or takes `fabs` of) it, store `x` directly and
+ * drop the main-program `fneg`s. Sign-bit negation is exact in IEEE-754 for
+ * all bit patterns including signed zeros, infinities, and NaNs.
+ */
+bool
+agx_nir_cancel_preamble_fneg(nir_shader *nir, unsigned reserved)
+{
+   if (!nir_shader_get_entrypoint(nir)->preamble)
+      return false;
+
+   nir_function_impl *pre = nir_shader_get_preamble(nir);
+   if (exec_list_length(&pre->body) != 1)
+      return false;
+
+   nir_intrinsic_instr *stores[512] = {NULL};
+   uint8_t store_count[512] = {0};
+   nir_block *pre_block = nir_start_block(pre);
+
+   nir_foreach_instr(instr, pre_block) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic != nir_intrinsic_store_preamble ||
+          nir_intrinsic_preamble_class(intr) != nir_preamble_class_general)
+         continue;
+
+      const unsigned base = nir_intrinsic_base(intr);
+      const nir_def *val = intr->src[0].ssa;
+      const unsigned size = MAX2(val->bit_size, 16) * val->num_components / 16;
+      if (base >= ARRAY_SIZE(stores) || size > ARRAY_SIZE(stores) - base)
+         return false;
+      for (unsigned h = 0; h < size; ++h) {
+         if (store_count[base + h] < UINT8_MAX)
+            store_count[base + h]++;
+         stores[base + h] = intr;
+      }
+   }
+
+   bool candidate[512] = {false};
+   bool any_candidate = false;
+   nir_foreach_instr(instr, pre_block) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic != nir_intrinsic_store_preamble ||
+          nir_intrinsic_preamble_class(intr) != nir_preamble_class_general)
+         continue;
+
+      const unsigned base = nir_intrinsic_base(intr);
+      nir_def *val = intr->src[0].ssa;
+      if (base < reserved || val->num_components != 1 ||
+          (val->bit_size != 16 && val->bit_size != 32))
+         continue;
+
+      const unsigned size = val->bit_size / 16;
+      if (base + size > ARRAY_SIZE(stores))
+         continue;
+
+      bool unique = true;
+      for (unsigned h = 0; h < size; ++h) {
+         if (store_count[base + h] != 1)
+            unique = false;
+      }
+      if (!unique)
+         continue;
+
+      nir_instr *val_instr = nir_def_instr(val);
+      if (val_instr->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *fneg = nir_instr_as_alu(val_instr);
+      if (fneg->op != nir_op_fneg || fneg->src[0].src.ssa->num_components != 1 ||
+          fneg->src[0].src.ssa->bit_size != val->bit_size ||
+          fneg->src[0].swizzle[0] != 0)
+         continue;
+
+      candidate[base] = true;
+      any_candidate = true;
+   }
+
+   if (!any_candidate)
+      return false;
+
+   unsigned fneg_uses[512] = {0};
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_bindless_image_agx ||
+                intr->intrinsic == nir_intrinsic_bindless_sampler_agx) {
+               const unsigned base = nir_intrinsic_desc_set(intr);
+               for (unsigned h = 0; h < 4 && base + h < ARRAY_SIZE(stores); ++h) {
+                  if (stores[base + h])
+                     candidate[nir_intrinsic_base(stores[base + h])] = false;
+               }
+               continue;
+            }
+            if (intr->intrinsic != nir_intrinsic_load_preamble ||
+                nir_intrinsic_preamble_class(intr) != nir_preamble_class_general)
+               continue;
+
+            const unsigned base = nir_intrinsic_base(intr);
+            const unsigned size =
+               MAX2(intr->def.bit_size, 16) * intr->def.num_components / 16;
+            if (base >= ARRAY_SIZE(stores) || size > ARRAY_SIZE(stores) - base)
+               return false;
+
+            nir_intrinsic_instr *st = stores[base];
+            bool exact_match = st != NULL && nir_intrinsic_base(st) == base &&
+                               intr->def.num_components == 1 &&
+                               intr->def.bit_size == st->src[0].ssa->bit_size &&
+                               size == st->src[0].ssa->bit_size / 16;
+
+            if (!exact_match) {
+               for (unsigned h = 0; h < size; ++h) {
+                  if (stores[base + h])
+                     candidate[nir_intrinsic_base(stores[base + h])] = false;
+               }
+               continue;
+            }
+
+            if (!candidate[base])
+               continue;
+
+            if (impl == pre) {
+               candidate[base] = false;
+               continue;
+            }
+
+            nir_foreach_use_including_if(use, &intr->def) {
+               if (nir_src_is_if(use) ||
+                   nir_src_use_instr(use)->type != nir_instr_type_alu) {
+                  candidate[base] = false;
+                  break;
+               }
+               nir_alu_instr *use_alu = nir_instr_as_alu(nir_src_use_instr(use));
+               if ((use_alu->op != nir_op_fneg && use_alu->op != nir_op_fabs) ||
+                   use_alu->def.num_components != 1 ||
+                   use_alu->def.bit_size != intr->def.bit_size ||
+                   use_alu->src[0].swizzle[0] != 0) {
+                  candidate[base] = false;
+                  break;
+               }
+               if (use_alu->op == nir_op_fneg)
+                  fneg_uses[base]++;
+            }
+         }
+      }
+   }
+
+   bool progress = false;
+   for (unsigned base = reserved; base < ARRAY_SIZE(stores); ++base) {
+      if (!candidate[base] || !fneg_uses[base])
+         continue;
+      nir_intrinsic_instr *st = stores[base];
+      nir_alu_instr *pre_fneg = nir_instr_as_alu(nir_def_instr(st->src[0].ssa));
+      nir_src_rewrite(&st->src[0], pre_fneg->src[0].src.ssa);
+      progress = true;
+   }
+
+   if (!progress)
+      return false;
+
+   nir_progress(true, pre, nir_metadata_control_flow);
+
+   nir_foreach_function_impl(impl, nir) {
+      if (impl == pre)
+         continue;
+
+      bool impl_progress = false;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *use_alu = nir_instr_as_alu(instr);
+            if (use_alu->op != nir_op_fneg)
+               continue;
+            nir_instr *src_instr = nir_def_instr(use_alu->src[0].src.ssa);
+            if (src_instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(src_instr);
+            if (intr->intrinsic != nir_intrinsic_load_preamble ||
+                nir_intrinsic_preamble_class(intr) != nir_preamble_class_general)
+               continue;
+
+            const unsigned base = nir_intrinsic_base(intr);
+            if (base < reserved || base >= ARRAY_SIZE(stores) ||
+                !candidate[base] || !fneg_uses[base])
+               continue;
+
+            nir_def_rewrite_uses(&use_alu->def, &intr->def);
+            nir_instr_remove(&use_alu->instr);
+            impl_progress = true;
+         }
+      }
+
+      if (impl_progress)
+         nir_progress(true, impl, nir_metadata_control_flow);
+      else
+         nir_no_progress(impl);
+   }
+
+   return true;
+}
+
 bool
 agx_nir_remove_unused_preamble_exports(nir_shader *nir, unsigned reserved)
 {

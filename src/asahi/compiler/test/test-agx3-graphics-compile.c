@@ -842,6 +842,7 @@ test_g17p_background_clear(void)
 
 static nir_shader *build_fs_alpha_discard_word(void);
 static nir_shader *build_fs_kill_then_alpha_discard_word(void);
+static nir_shader *build_fs_constant_target_alpha_discard(uint16_t target);
 
 /* At one sample both non-constant coverage sources
  * are reduced to bit 0 (FLAGS = 3); at four samples the whole masks are kept
@@ -891,9 +892,51 @@ static bool
 test_g17p_discard_word(void)
 {
    static const unsigned one[] = {3}, two[] = {1, 3};
-   return g17p_discard_word_case(build_fs_alpha_discard_word, 1, one, 1) &&
-          g17p_discard_word_case(build_fs_kill_then_alpha_discard_word, 1,
-                                 two, 2);
+   if (!g17p_discard_word_case(build_fs_alpha_discard_word, 1, one, 1) ||
+       !g17p_discard_word_case(build_fs_kill_then_alpha_discard_word, 1, two, 2))
+      return false;
+
+   /* Constant target 0xffff at one sample passes immediate 1 directly and
+    * zero-extends the coverage word instead of materializing 0xffff and
+    * multiplying by a dynamic target. Verify it compiles cleanly and emits
+    * fewer instructions than the dynamic-target form, while target 0 and
+    * multisample forms still compile. */
+   nir_shader *const_nir = build_fs_constant_target_alpha_discard(0xffff);
+   nir_shader *dyn_nir = build_fs_alpha_discard_word();
+   nir_shader *zero_nir = build_fs_constant_target_alpha_discard(0);
+   nir_shader *msaa_nir = build_fs_constant_target_alpha_discard(0xffff);
+   struct agx_shader_key key = {
+      .dev.encoding = AGX_ISA_ENCODING_AGX3B,
+      .no_preamble = true,
+      .fs.nr_samples = 1,
+   };
+   struct agx_shader_key msaa_key = key;
+   msaa_key.fs.nr_samples = 4;
+
+   struct agx_shader_part const_part = {0}, dyn_part = {0}, zero_part = {0},
+      msaa_part = {0};
+   bool ok = agx_compile_shader_nir(const_nir, &key, &const_part) &&
+             agx_compile_shader_nir(dyn_nir, &key, &dyn_part) &&
+             agx_compile_shader_nir(zero_nir, &key, &zero_part) &&
+             agx_compile_shader_nir(msaa_nir, &msaa_key, &msaa_part) &&
+             const_part.info.stats.instrs + 3 <= dyn_part.info.stats.instrs &&
+             const_part.info.binary_size < dyn_part.info.binary_size;
+   if (!ok) {
+      fprintf(stderr,
+              "AGX3b constant-target discard mismatch: const=%u instrs/%u B "
+              "dyn=%u instrs/%u B\n",
+              const_part.info.stats.instrs, const_part.info.binary_size,
+              dyn_part.info.stats.instrs, dyn_part.info.binary_size);
+   }
+   free(const_part.binary);
+   free(dyn_part.binary);
+   free(zero_part.binary);
+   free(msaa_part.binary);
+   ralloc_free(const_nir);
+   ralloc_free(dyn_nir);
+   ralloc_free(zero_nir);
+   ralloc_free(msaa_nir);
+   return ok;
 }
 
 static bool
@@ -1508,6 +1551,28 @@ build_fs_alpha_discard_word(void)
    return fs_finish(&b);
 }
 
+static nir_shader *
+build_fs_constant_target_alpha_discard(uint16_t target)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options,
+      "G17P constant-target alpha discard FS");
+   nir_def *bary = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *colour = nir_load_interpolated_input(
+      &b, 4, 32, bary, nir_imm_int(&b, 0), .base = 0, .component = 0,
+      .io_semantics.location = VARYING_SLOT_VAR0, .io_semantics.num_slots = 1);
+   nir_def *c = nir_feq(&b, nir_channel(&b, colour, 3), nir_imm_float(&b, 0));
+   nir_def *killed = nir_bcsel(&b, c, nir_imm_intN_t(&b, 0xff, 16),
+                               nir_imm_intN_t(&b, 0, 16));
+   nir_sample_mask_agx(&b, nir_imm_intN_t(&b, target, 16),
+                       nir_ixor(&b, killed, nir_imm_intN_t(&b, 0xff, 16)));
+   fs_store_colour(&b, colour);
+   b.shader->info.fs.uses_discard = true;
+   b.shader->info.inputs_read = BITFIELD64_BIT(VARYING_SLOT_VAR0);
+   return fs_finish(&b);
+}
+
 /* A dynamic no-tests kill (killed | 0 target, constant live 0) followed by
  * the testing update with a dynamic live set: only the second owns class 1,
  * and reducing the first's target must not turn it into a testing update. */
@@ -1777,6 +1842,125 @@ g17p_count_bytes(const struct agx_shader_part *part, const uint8_t *needle,
         ++off)
       count += !memcmp((const uint8_t *)part->binary + off, needle, length);
    return count;
+}
+
+static bool
+test_agx3_native_relative_shuffles(void)
+{
+   static const nir_intrinsic_op ops[] = {
+      nir_intrinsic_shuffle_xor,
+      nir_intrinsic_shuffle_up,
+      nir_intrinsic_shuffle_down,
+   };
+
+   for (unsigned oi = 0; oi < ARRAY_SIZE(ops); ++oi) {
+      /* Constant deltas in 1..31 stay native on G17P and M5 compute and compile
+       * end-to-end on AGX3B and AGX3C. */
+      static const uint32_t valid_deltas[] = {1, 4, 16, 31};
+      for (unsigned di = 0; di < ARRAY_SIZE(valid_deltas); ++di) {
+         for (unsigned m5 = 0; m5 < 2; ++m5) {
+            nir_builder b = nir_builder_init_simple_shader(
+               MESA_SHADER_COMPUTE, &agx_nir_options,
+               "native relative shuffle");
+            b.shader->info.workgroup_size[0] = 32;
+            b.shader->info.workgroup_size[1] = 1;
+            b.shader->info.workgroup_size[2] = 1;
+            nir_def *addr = nir_load_preamble(&b, 1, 64, .base = 0);
+            nir_def *val = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+            nir_def *delta = nir_imm_int(&b, valid_deltas[di]);
+            nir_def *res = ops[oi] == nir_intrinsic_shuffle_xor
+                              ? nir_shuffle_xor(&b, val, delta)
+                           : ops[oi] == nir_intrinsic_shuffle_up
+                              ? nir_shuffle_up(&b, val, delta)
+                              : nir_shuffle_down(&b, val, delta);
+            nir_store_global(&b, res, nir_iadd_imm(&b, addr, 64),
+                             .align_mul = 4);
+
+            if (m5)
+               agx_nir_lower_subgroups_m5(b.shader, true, true);
+            else
+               agx_nir_lower_subgroups_g17p(b.shader);
+
+            unsigned kept = 0;
+            nir_foreach_function_impl(impl, b.shader) {
+               nir_foreach_block(block, impl) {
+                  nir_foreach_instr(instr, block) {
+                     kept += instr->type == nir_instr_type_intrinsic &&
+                             nir_instr_as_intrinsic(instr)->intrinsic == ops[oi];
+                  }
+               }
+            }
+            if (kept != 1) {
+               fprintf(stderr,
+                       "relative shuffle op=%u delta=%u m5=%u kept=%u\n", oi,
+                       valid_deltas[di], m5, kept);
+               ralloc_free(b.shader);
+               return false;
+            }
+
+            b.shader->info.io_lowered = true;
+            struct agx_shader_key key = {
+               .dev.encoding =
+                  m5 ? AGX_ISA_ENCODING_AGX3C : AGX_ISA_ENCODING_AGX3B,
+               .no_preamble = true,
+            };
+            struct agx_shader_part part = {0};
+            const bool compiled = agx_compile_shader_nir(b.shader, &key, &part);
+            free(part.binary);
+            ralloc_free(b.shader);
+            if (!compiled) {
+               fprintf(stderr,
+                       "relative shuffle compile failed op=%u delta=%u m5=%u\n",
+                       oi, valid_deltas[di], m5);
+               return false;
+            }
+         }
+      }
+
+      /* Dynamic, zero, and out-of-range deltas must be lowered before backend
+       * emission. */
+      static const int invalid_deltas[] = {-1, 0, 32};
+      for (unsigned di = 0; di < ARRAY_SIZE(invalid_deltas); ++di) {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options,
+            "lowered relative shuffle");
+         nir_def *addr = nir_load_preamble(&b, 1, 64, .base = 0);
+         nir_def *val = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+         nir_def *delta = invalid_deltas[di] < 0
+                             ? nir_load_global(&b, 1, 32,
+                                               nir_iadd_imm(&b, addr, 4),
+                                               .align_mul = 4)
+                             : nir_imm_int(&b, invalid_deltas[di]);
+         nir_def *res = ops[oi] == nir_intrinsic_shuffle_xor
+                           ? nir_shuffle_xor(&b, val, delta)
+                        : ops[oi] == nir_intrinsic_shuffle_up
+                           ? nir_shuffle_up(&b, val, delta)
+                           : nir_shuffle_down(&b, val, delta);
+         nir_store_global(&b, res, nir_iadd_imm(&b, addr, 64), .align_mul = 4);
+
+         agx_nir_lower_subgroups_g17p(b.shader);
+         agx_nir_lower_dynamic_shuffle_xor(b.shader);
+
+         unsigned remaining = 0;
+         nir_foreach_function_impl(impl, b.shader) {
+            nir_foreach_block(block, impl) {
+               nir_foreach_instr(instr, block) {
+                  remaining += instr->type == nir_instr_type_intrinsic &&
+                               nir_instr_as_intrinsic(instr)->intrinsic ==
+                                  ops[oi];
+               }
+            }
+         }
+         ralloc_free(b.shader);
+         if (remaining != 0) {
+            fprintf(stderr,
+                    "invalid relative shuffle not lowered op=%u delta=%d\n", oi,
+                    invalid_deltas[di]);
+            return false;
+         }
+      }
+   }
+   return true;
 }
 
 static bool
@@ -8427,13 +8611,15 @@ g17p_stencil_protocol(const struct agx_shader_part *part, bool depth)
    bool upper_half = false, writeout = false;
    for (unsigned word = 0; word < 126; word += 2) {
       for (unsigned src = 0; src < 128; ++src) {
-         for (unsigned cache = 0; cache < 2; ++cache) {
-            for (unsigned discard = 0; discard < 2 - cache; ++discard) {
-               uint8_t copy[AGX3_COPY_MAX_LENGTH], length;
-               if (agx3_copy_encode_reg16(AGX_ISA_ENCODING_AGX3B, word + 1,
-                                          src, false, cache, discard, 0,
-                                          copy, &length))
-                  upper_half |= binary_contains(part, copy, length);
+         for (unsigned dest_cache = 0; dest_cache < 2; ++dest_cache) {
+            for (unsigned cache = 0; cache < 2; ++cache) {
+               for (unsigned discard = 0; discard < 2 - cache; ++discard) {
+                  uint8_t copy[AGX3_COPY_MAX_LENGTH], length;
+                  if (agx3_copy_encode_reg16(AGX_ISA_ENCODING_AGX3B, word + 1,
+                                             src, dest_cache, cache, discard, 0,
+                                             copy, &length))
+                     upper_half |= binary_contains(part, copy, length);
+               }
             }
          }
       }
@@ -8952,6 +9138,255 @@ test_g17p_gallium_vertex_param_abi(void)
           AGX_ABI_VUNI_VERTEX_PARAMS(2) == 20;
 }
 
+static bool
+test_agx3_heavy_branch_loop_unroll_limit(void)
+{
+   /* 1. Loop-free shader reports !agx_nir_has_loop(). */
+   nir_builder b0 = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "loop-free-check");
+   nir_def *gid0 = nir_channel(&b0, nir_load_global_invocation_id(&b0, 32), 0);
+   nir_store_global(&b0, nir_iadd_imm(&b0, gid0, 1), nir_imm_int64(&b0, 0x1000));
+   if (agx_nir_has_loop(b0.shader)) {
+      ralloc_free(b0.shader);
+      return false;
+   }
+   ralloc_free(b0.shader);
+
+   /* 2. Multi-branch pure-ALU vector loop (pso_uber shape: 12 iterations,
+    * 2+ nested ifs, >512 scalarized ops total, zero memory loads) must be
+    * marked nir_loop_control_dont_unroll so pre-scalarization unrolling does
+    * not explode compile time. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "heavy-branch-unroll-limit");
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *acc =
+      nir_local_variable_create(b.impl, glsl_vector_type(GLSL_TYPE_UINT, 4), "v");
+   nir_def *id = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_vec4(&b, id, nir_iadd_imm(&b, id, 1),
+                                   nir_iadd_imm(&b, id, 2),
+                                   nir_iadd_imm(&b, id, 3)), 0xf);
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_push_if(&b, nir_uge_imm(&b, i, 12));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, NULL);
+
+      nir_def *sel = nir_iand_imm(&b, nir_iadd(&b, id, i), 3);
+      nir_def *v = nir_load_var(&b, acc);
+      nir_push_if(&b, nir_ieq_imm(&b, sel, 0));
+      {
+         nir_def *t = v;
+         for (unsigned k = 0; k < 8; ++k)
+            t = nir_ixor(&b, nir_imul_imm(&b, t, 16777619u + k),
+                         nir_ushr_imm(&b, t, 3));
+         nir_store_var(&b, acc, t, 0xf);
+      }
+      nir_push_else(&b, NULL);
+      {
+         nir_push_if(&b, nir_ieq_imm(&b, sel, 1));
+         {
+            nir_def *t = v;
+            for (unsigned k = 0; k < 8; ++k)
+               t = nir_iadd(&b, nir_imul_imm(&b, t, 747796405u + k),
+                            nir_ishl_imm(&b, t, 5));
+            nir_store_var(&b, acc, t, 0xf);
+         }
+         nir_pop_if(&b, NULL);
+      }
+      nir_pop_if(&b, NULL);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, loop);
+   nir_def *fin = nir_load_var(&b, acc);
+   nir_store_global(&b, nir_channel(&b, fin, 0), nir_imm_int64(&b, 0x2000));
+   nir_lower_vars_to_ssa(b.shader);
+   nir_opt_copy_prop(b.shader);
+   nir_opt_dce(b.shader);
+   nir_remove_dead_variables(b.shader, nir_var_function_temp, NULL);
+
+   if (!agx_nir_has_loop(b.shader)) {
+      ralloc_free(b.shader);
+      return false;
+   }
+   agx_nir_limit_heavy_branch_unroll(b.shader);
+   bool marked_dont_unroll = (loop->control == nir_loop_control_dont_unroll);
+   ralloc_free(b.shader);
+   if (!marked_dont_unroll)
+      return false;
+
+   /* 3. Negative control: a short 4-iteration loop must remain unrollable. */
+   nir_builder b2 = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "short-loop-unroll-ok");
+   nir_variable *iv2 = nir_local_variable_create(b2.impl, glsl_uint_type(), "i");
+   nir_variable *acc2 = nir_local_variable_create(b2.impl, glsl_uint_type(), "a");
+   nir_store_var(&b2, iv2, nir_imm_int(&b2, 0), 1);
+   nir_store_var(&b2, acc2, nir_imm_int(&b2, 1), 1);
+   nir_loop *loop2 = nir_push_loop(&b2);
+   {
+      nir_def *i = nir_load_var(&b2, iv2);
+      nir_push_if(&b2, nir_uge_imm(&b2, i, 4));
+      nir_jump(&b2, nir_jump_break);
+      nir_pop_if(&b2, NULL);
+      nir_store_var(&b2, acc2, nir_iadd(&b2, nir_load_var(&b2, acc2), i), 1);
+      nir_store_var(&b2, iv2, nir_iadd_imm(&b2, i, 1), 1);
+   }
+   nir_pop_loop(&b2, loop2);
+   nir_store_global(&b2, nir_load_var(&b2, acc2), nir_imm_int64(&b2, 0x3000));
+   nir_lower_vars_to_ssa(b2.shader);
+   nir_opt_copy_prop(b2.shader);
+   nir_opt_dce(b2.shader);
+   nir_remove_dead_variables(b2.shader, nir_var_function_temp, NULL);
+   agx_nir_limit_heavy_branch_unroll(b2.shader);
+   bool kept_unrollable = (loop2->control == nir_loop_control_none);
+   ralloc_free(b2.shader);
+   return kept_unrollable;
+}
+
+static bool
+test_agx3_tiny_push_vertex_preamble_inlined(void)
+{
+   /* 1. Tiny push-only vertex shader (bubo.vert shape: loads 4-byte draw_id
+    * from root+768, computes tile x/y and NDC offset in ~8 fast 1-cycle ALU
+    * ops). Uniform DMA must replace the root load, inline the preamble away
+    * (has_preamble == false), and record !agx3_main_uses_root_uniform. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "agx3-tiny-push-vs");
+   b.shader->info.io_lowered = true;
+   b.shader->info.outputs_written = VARYING_BIT_POS;
+
+   nir_def *root = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *draw_id = nir_load_global_constant(
+      &b, 1, 32, nir_iadd_imm(&b, root, 768), .align_mul = 4);
+   nir_def *tx = nir_iand_imm(&b, draw_id, 63);
+   nir_def *ty = nir_ushr_imm(&b, draw_id, 6);
+   nir_def *fx = nir_ffma(&b, nir_u2f32(&b, tx), nir_imm_float(&b, 0.03125f),
+                          nir_imm_float(&b, -1.0f));
+   nir_def *fy = nir_ffma(&b, nir_u2f32(&b, ty), nir_imm_float(&b, 0.03125f),
+                          nir_imm_float(&b, -1.0f));
+   /* A hardware vertex shader reads its index as load_vertex_id;
+    * load_vertex_id_zero_base is the software (compute) VS form. */
+   nir_def *vid = nir_load_vertex_id(&b);
+   nir_def *vx = nir_fadd(&b, fx, nir_u2f32(&b, nir_iand_imm(&b, vid, 1)));
+   nir_def *vy = nir_fadd(&b, fy, nir_u2f32(&b, nir_ushr_imm(&b, vid, 1)));
+   nir_def *pos[4] = {vx, vy, nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f)};
+   for (unsigned c = 0; c < 4; ++c)
+      nir_store_uvs_agx(&b, pos[c], nir_imm_intN_t(&b, c, 16));
+   agx_preprocess_nir(b.shader);
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.reserved_preamble = 4;
+   key.agx3_native_cprog = true;
+   key.g17p_native_uniforms = true;
+   key.g17p_uniform_dma = true;
+   key.g17p_dma_root = 0;
+
+   struct agx_shader_part part = {0};
+   bool ok = agx_compile_shader_nir(b.shader, &key, &part);
+   bool tiny_ok = ok && !part.info.has_preamble &&
+                  part.info.agx3_uniform_dma_count == 1 &&
+                  part.info.agx3_uniform_dma[0].offset_B == 768 &&
+                  part.info.agx3_uniform_dma[0].halfs == 2 &&
+                  part.info.agx3_root_uniform_usage_valid &&
+                  !part.info.agx3_main_uses_root_uniform &&
+                  !part.info.agx3_preamble_uses_root_uniform;
+   free(part.binary);
+   ralloc_free(b.shader);
+   if (!tiny_ok)
+      return false;
+
+   /* 2. Negative control: a vertex preamble doing slow ops (frcp) or heavy
+    * multi-word root math (>16 bytes loaded) must NOT be inlined away. */
+   nir_builder b2 = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "agx3-heavy-root-vs");
+   b2.shader->info.io_lowered = true;
+   b2.shader->info.outputs_written = VARYING_BIT_POS;
+
+   nir_def *root2 = nir_load_preamble(&b2, 1, 64, .base = 0);
+   nir_def *acc = nir_imm_float(&b2, 1.0f);
+   for (unsigned k = 0; k < 8; ++k) {
+      nir_def *w = nir_load_global_constant(
+         &b2, 1, 32, nir_iadd_imm(&b2, root2, 768 + k * 4), .align_mul = 4);
+      acc = nir_ffma(&b2, acc, w, nir_frcp(&b2, nir_fadd_imm(&b2, w, 2.0f)));
+   }
+   nir_def *vid2 = nir_load_vertex_id(&b2);
+   nir_def *vx2 = nir_fadd(&b2, acc, nir_u2f32(&b2, vid2));
+   nir_def *pos2[4] = {vx2, acc, nir_imm_float(&b2, 0.0f),
+                       nir_imm_float(&b2, 1.0f)};
+   for (unsigned c = 0; c < 4; ++c)
+      nir_store_uvs_agx(&b2, pos2[c], nir_imm_intN_t(&b2, c, 16));
+   agx_preprocess_nir(b2.shader);
+
+   struct agx_shader_part part2 = {0};
+   bool ok2 = agx_compile_shader_nir(b2.shader, &key, &part2);
+   bool heavy_kept = ok2 && part2.info.has_preamble &&
+                     part2.info.agx3_root_uniform_usage_valid &&
+                     !part2.info.agx3_main_uses_root_uniform &&
+                     part2.info.agx3_preamble_uses_root_uniform;
+   free(part2.binary);
+   ralloc_free(b2.shader);
+   return heavy_kept;
+}
+
+/* A vertex shader with nothing to hoist has no constant program. Looking
+ * for a hoistable vertex preamble must not create an empty one. */
+static bool
+test_agx3_vertex_without_preamble_has_none(void)
+{
+   nir_shader *nir = build_vs_flat();
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.reserved_preamble = 4;
+   key.agx3_native_cprog = true;
+   key.g17p_native_uniforms = true;
+
+   struct agx_shader_part part = {0};
+   bool ok = agx_compile_shader_nir(nir, &key, &part);
+   ok = ok && !part.info.has_preamble && part.info.nr_preamble_gprs == 0 &&
+        part.info.preamble_size == 0;
+   free(part.binary);
+   ralloc_free(nir);
+   return ok;
+}
+
+/* The driver keeps a vertex shader's descriptor-set pointers only when its
+ * uniform-half record names one (hk_agx3_g17p_graphics_live_set_count()).
+ * Firefox's vertex texel fetch through set 3 reads that set's pointer, halves
+ * 12..15 under lower_test_descriptor_set(), and not set 1's, halves 4..7.
+ */
+static bool
+test_agx3_vertex_set_pointer_uniform_halfs(void)
+{
+   nir_shader *nir = build_vs_indexed_texture_fetch();
+   if (!nir)
+      return false;
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.no_preamble = true;
+   key.reserved_preamble = 64;
+
+   struct agx_shader_part part = {0};
+   const bool ok = agx_compile_shader_nir(nir, &key, &part);
+   const uint64_t halfs = part.info.agx3_uniform_halfs[0];
+   const uint64_t set1 = BITFIELD64_RANGE(4, 4), set3 = BITFIELD64_RANGE(12, 4);
+   const bool named = ok && part.info.agx3_uniform_halfs_valid &&
+                      (halfs & set3) == set3 && !(halfs & set1);
+   if (!named) {
+      fprintf(stderr, "vertex set-pointer halves: ok=%d valid=%d "
+              "halfs0=0x%llx\n", ok, part.info.agx3_uniform_halfs_valid,
+              (unsigned long long)halfs);
+   }
+   free(part.binary);
+   ralloc_free(nir);
+   return named;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -9397,6 +9832,7 @@ main(int argc, char **argv)
    RUN(test_g17g_array_fetch);
    RUN(test_g17g_cube_shadow_lod);
    RUN(test_g17g_xfb_add);
+   RUN(test_agx3_vertex_without_preamble_has_none);
    RUN(test_g17p_eot_block_store);
    RUN(test_indexed_sampler_sets);
    RUN(test_g17p_layered_eot_block_store);
@@ -9424,9 +9860,13 @@ main(int argc, char **argv)
    RUN(test_g17p_blended_payloads_beyond_bank);
    RUN(test_g17p_pbe_to_texture_fence);
    RUN(test_g17p_clustered_minmax_width);
+   RUN(test_agx3_native_relative_shuffles);
    RUN(test_g17p_half_rgb10_epilog);
    RUN(test_g17p_frag_sidefx_late_depth_once);
+   RUN(test_agx3_heavy_branch_loop_unroll_limit);
    RUN(test_g17c_txf_layer_saturation);
+   RUN(test_agx3_tiny_push_vertex_preamble_inlined);
+   RUN(test_agx3_vertex_set_pointer_uniform_halfs);
 #undef RUN
 
    for (unsigned e = 0; e < ARRAY_SIZE(encodings); ++e) {

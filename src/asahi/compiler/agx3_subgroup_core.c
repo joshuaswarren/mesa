@@ -70,18 +70,9 @@ agx3_subgroup_encode_active_mask(uint16_t dest, bool dest_cache,
 }
 
 /*
- * The 16-bit quad ballot of a boolean immediate against zero. Native
- * native G17G (lane-mesh/cwit-quad, cwit-quad2) keeps a quad vote whose
- * operand is a constant as a real ballot rather than folding it:
- *
- *   quad_any(false), result into a store    370020182d00a61a30000840  (r7l)
- *   ballot(1 != 0) in q_vote (quad votes)    370120182d00a60230000840  (r1l)
- *
- * f23/f24 = 1/1 name an immediate 16-bit source whose value is f15, f38/f39
- * = 1/1 the immediate zero it is compared with, f54 = 0 the equality and f55
- * its inversion: the quad counterpart of agx3_subgroup_encode_active_mask().
- * Apple adds f64 only when the result reaches nothing but the colour output;
- * it stays clear, as on the register-source quad ballots.
+ * 16-bit quad ballot of a boolean immediate against zero (f15=imm, f23/f24=1/1,
+ * f38/f39=1/1, f54=0, f55=invert): quad counterpart of
+ * agx3_subgroup_encode_active_mask().
  */
 bool
 agx3_subgroup_encode_quad_ballot_imm(uint16_t dest, bool dest_cache,
@@ -113,23 +104,9 @@ encode_shuffle(enum agx_isa_encoding enc,
 {
    if (d == NULL || out == NULL || length == NULL)
       return false;
-   /*
-    * 16-bit data narrows the width pair, and the quad selector is a different
-    * field of the same immediate-lane encoding point, so the two compose.
-    * metal-nt -arch applegpu_g17p, one kernel per operation on `ushort`,
-    * lane immediate, same registers, nothing else moving:
-    *
-    *   quad_broadcast(a, 3)      47005602020406200400   quadshfl
-    *   simd_broadcast(a, 3)      47045602020406200400   simdbcast
-    *   quad_shuffle_xor(a, 1)    c7005602020402200400   quadbfly
-    *   simd_shuffle_xor(a, 1)    c7045602020402200400   simdbfly
-    *
-    * Only byte 1 moves between a quad word and its SIMD control, which is the
-    * same selector the 32-bit words in the immediate-lane block below carry.
-    * The shifts are NOT admitted here: Apple's 16-bit simd_shuffle_up is
-    * 47055603030402200200, whose f9/f10 pair is 3/3 rather than the 2/1 this
-    * composition would deposit, so that form needs its own mapping.
-    */
+   /* 16-bit immediate-lane broadcast/xor (quad and SIMD share the encoding
+    * point with narrow widths; shifts use a distinct f9/f10 mapping and are
+    * not admitted here). */
    const bool half_shuffle_op = d->op == AGX3_SUBGROUP_SHUFFLE_BROADCAST ||
                                 d->op == AGX3_SUBGROUP_SHUFFLE_XOR;
    if (d->half ? (enc != AGX_ISA_ENCODING_AGX3B && !is_c(enc)) ||
@@ -145,26 +122,10 @@ encode_shuffle(enum agx_isa_encoding enc,
    if (mnemonic == AGX3_MN_NONE)
       return false;
 
-   /*
-    * The SIMD shuffles from a register lane on G17P. metal-nt -arch
-    * applegpu_g17p, `simd_broadcast(ushort d, ushort lane)` with d and lane
-    * each either read again later or not:
-    *
-    *   d dead, lane dead    47145402020604201c00   f27 f41
-    *   d live, lane live    4714540702100c201000
-    *   d dead, lane live    47145405020008201400   f27
-    *   d live, lane dead    47145405020800201800   f41
-    *
-    * simd_shuffle(), whose broadcasts reuse both soon, adds f25 (source) and
-    * f39 (lane) next to f11 (destination). So f25/f27 are the source's
-    * cache/discard hints and f39/f41 the lane's, with the lane in f30 and the
-    * source wait in the f44 bank. The same topology holds for 32-bit data
-    * (f10 = f24 = 2; a broadcast reading its lane twice is 471454040204142e1400
-    * then 472454000200142c1c00) and for simd_shuffle_xor/_up/_down at both
-    * widths, so the lifetime bits follow the operands rather than being
-    * pinned: a pinned f41 claimed the lane was dead even when the vote and
-    * shuffle lowerings read it again for the next component.
-    */
+   /* G17P register-lane SIMD shuffles (16- and 32-bit): lane in f30, source
+    * cache/discard in f25/f27, lane cache/discard in f39/f41, dest cache in
+    * f11, and waits in the f44 bank. Lifetime bits must track each operand so
+    * multi-component lowerings do not prematurely kill the lane register. */
    if ((enc == AGX_ISA_ENCODING_AGX3B || is_c(enc)) &&
        (!d->quad || (g18g && is_c(enc))) &&
        d->lane_kind == AGX3_SUBGROUP_LANE_REGISTER) {
@@ -221,36 +182,8 @@ encode_shuffle(enum agx_isa_encoding enc,
     */
    if (d->lane_kind == AGX3_SUBGROUP_LANE_IMMEDIATE) {
       const unsigned slots = is_c(enc) ? 8 : 6;
-      /*
-       * f29 IS the lane, for every immediate-lane shuffle and for every lane
-       * the seven-bit field holds.  This used to admit three SIMD broadcast
-       * lanes (0, 3, 5) and the quad family only, so `subgroupBroadcast(v,
-       * 31)` -- the last-lane read that every subgroup scan ends with, Mesa's
-       * own radix sort included -- had no encoding at all and the shader had
-       * to pay a materialising `mov` to reach the register-lane form instead.
-       *
-       * Apple's applegpu_g17p output, one kernel per lane, is a single
-       * field sweep with nothing else moving:
-       *
-       *   simd_broadcast(a, 0)      470456000200002c0400   f29 = 0
-       *   simd_broadcast(a, 1)      470456000200022c0400   f29 = 1
-       *   simd_broadcast(a, 5)      4704560002000a2c0400   f29 = 5
-       *   simd_broadcast(a, 31)     4704560002003e2c0400   f29 = 31
-       *   simd_broadcast(a, 32)     470456000200402c0400   f29 = 32
-       *   simd_broadcast(a, 63)     4704560002007e2c0400   f29 = 63
-       *   simd_shuffle_xor(a, 63)   c704560002007e2c0400   simdbfly, same f29
-       *   simd_shuffle_up(a, 31)    4705560403003e2c0200   simdshftup
-       *   simd_shuffle_down(a, 31)  c705560403003e2c0200   simdshftdn
-       *   quad_broadcast(a, 3)      470056000200062c0400   quadshfl
-       *   quad_shuffle_xor(a, 3)    c70056000200062c0400   quadbfly
-       *
-       * Every one of those also sets f49, the slot-6 wait for the device load
-       * that feeds it -- including the quad butterfly, which this encoder
-       * previously refused to give a wait at all.
-       *
-       * The field is seven bits (half 0xff spills the eighth into f16, the
-       * source register), so lanes 0..127 encode and 128 up do not.
-       */
+      /* Immediate lane lives in 7-bit f29 (0..127; bit 7 would overlap f16)
+       * across all SIMD/quad immediate-lane shuffles, with waits in f44..f49. */
       if (enc != AGX_ISA_ENCODING_AGX3B && !is_c(enc))
          return false;
       if (d->lane > 0x7f || (d->wait_mask >> slots) != 0)
@@ -435,19 +368,8 @@ encode_ballot(enum agx_isa_encoding enc,
                                out, length);
    }
 
-   /*
-    * The 16-bit quad ballot of a register against zero. metal-nt -arch
-    * applegpu_g17p, quad_any(x != 0) and quad_all(x == 0) of a buffer-loaded
-    * ushort, with the result fed on to dfdx():
-    *
-    *   x != 0, x dead   17025600030000402212
-    *   x == 0, x dead   17025601030200402202
-    *   x != 0, x live   17025600030202002212
-    *
-    * f25/f27 carry the source's liveness, f11 the destination hint and f46
-    * the source wait. Apple adds f64 when the result goes nowhere but the
-    * colour output; like f62 on the quad reductions, that stays clear.
-    */
+   /* 16-bit quad ballot of a register against zero: source cache/discard in
+    * f25/f27, dest hint in f11, and producer waits starting at f41/f46. */
    if (d->quad && d->dest_half) {
       const unsigned slots = is_c(enc) ? 8 : 6;
       if ((enc != AGX_ISA_ENCODING_AGX3B && !is_c(enc)) ||
@@ -757,18 +679,9 @@ encode_reduce(enum agx_isa_encoding enc,
    }
    if (mnemonic == AGX3_MN_NONE)
       return false;
-   /*
-    * Metal has scans for sums and products only, so those are the witnessed
-    * prefix forms: f53 on the integer add, f57 on the f32 and f56 on the f16
-    * instructions. The bitwise and min/max instructions carry the same
-    * operand in the encoder tables -- f53 on signed min/max, whose fields
-    * are numbered like the integer add, and f52 on the bitwise and unsigned
-    * forms, which lack the signedness field f28 and number everything above
-    * it one lower -- exactly as the AGX2 SIMD instructions take every
-    * reduction as a scan. Apple's compiler has no source-level scan to emit
-    * them from (it reports air.simd_prefix_*_min and friends as unlowered on
-    * every applegpu target), so those follow the tables.
-    */
+   /* Prefix-mode bit per reduction family: f57 (f32), f56 (f16), f53 (iadd
+    * and signed min/max), and f52 (bitwise and unsigned min/max, shifted down
+    * by one without the signedness bit f28). */
    if (d->prefix && d->quad)
       return false;
    if (d->prefix && f->is_float && d->op != AGX3_SUBGROUP_REDUCE_FADD &&
@@ -820,17 +733,13 @@ encode_reduce(enum agx_isa_encoding enc,
        * which adds the source back afterwards, is bf01560403001609 (f25)
        * next to the exclusive bf0156020204100b (f27). */
       if (g18g && is_c(enc)) {
-         /* AGX3c's SIMD integer add does the same: metal-nt
-          * applegpu_g17g/g18g give the inclusive sum f25 and the exclusive
-          * one f27 (m6-libagx-forms lk_prefix_incl_load /
-          * lk_prefix_excl_load). */
-         const bool c_simd_iadd = !d->quad && !d->half &&
-                                  d->op == AGX3_SUBGROUP_REDUCE_IADD;
-         /* Native999's live/dead pairs on both G17G and G18G use no
-          * source hint for a live full-width min/max/bitwise operand. In
-          * particular, f27 is a final-read hint, not the generic AGX3c
-          * reduction default. Preserve the existing IADD/quad/half paths. */
-         const bool c_keep_source = !d->quad && !d->half && d->src_live &&
+         /* AGX3c's integer add marks a live source with f25 and a final read
+          * with f27 (m6-libagx-forms lk_prefix_incl_load /
+          * lk_prefix_excl_load). Native999's live/dead pairs on both G17G and
+          * G18G use no source hint for a live min/max/bitwise operand, and f27
+          * only on the final read. Never emit f27 (discard) while src_live is
+          * set, including for 16-bit and quad reductions. */
+         const bool c_keep_source = d->src_live &&
             (d->op == AGX3_SUBGROUP_REDUCE_SMIN ||
              d->op == AGX3_SUBGROUP_REDUCE_SMAX ||
              d->op == AGX3_SUBGROUP_REDUCE_AND ||
@@ -839,7 +748,7 @@ encode_reduce(enum agx_isa_encoding enc,
              d->op == AGX3_SUBGROUP_REDUCE_UMIN ||
              d->op == AGX3_SUBGROUP_REDUCE_UMAX);
          if (!c_keep_source)
-            ADD_FIELD(c_simd_iadd && d->src_live ? 25 : 27, 1);
+            ADD_FIELD(d->src_live ? 25 : 27, 1);
       } else {
          ADD_FIELD(d->src_live ? 25 : 27, 1);
       }
@@ -870,19 +779,8 @@ encode_reduce(enum agx_isa_encoding enc,
    if (d->prefix)
       ADD_FIELD(prefix_field, 1);
 
-   /*
-    * Per-slot wait bits. Their base differs by operand family, each pinned by
-    * a g17p probe whose source arrives on scoreboard slot 6:
-    *   float reductions            f49 + (slot - 1)   (sRedf32add, sRedfmax)
-    *   half add / multiply         f48 + (slot - 1)   (qRedf16add, sRedf16mul)
-    *   integer add / signed min-max
-    *                               f45 + (slot - 1)   (sRediadd, sRedimin,
-    *                                                   sRedimax; also catomic
-    *                                                   at slot 1)
-    *   bitwise / unsigned min-max  f44 + (slot - 1)   (sRedAND, sRedumax)
-    * Own-shader A18 Pro captures pin slot-6 signed min/max to this family:
-    *   sRedimin 3f02560002001407, sRedimax bf02560002001407.
-    */
+   /* Per-slot wait base by reduction family: f49 (f32), f48 (f16 add/mul),
+    * f45 (iadd / signed min-max), f44 (bitwise / unsigned min-max). */
    /* AGX3c: the SIMD integer add waits at f45 + (slot - 1) on all eight
     * slots, as on AGX3b. metal-nt applegpu_g17g puts a load on slot 8 and
     * waits with f52; applegpu_g18g puts it on slot 1 and waits with f45

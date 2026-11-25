@@ -71,11 +71,8 @@ struct agx_ioto_g17p_imageblock {
 #define AGX_IOTO_G17P_IMAGEBLOCK_8B_1X_32X32                                \
    { .sample_size_B = 8, .nr_samples = 1, .tile_size_px = 32 * 32 }
 
-/* Build the exact fragment SPECLM record emitted by HAL200's
- * LdShdrTransformFragment for the supplied physical imageblock.  Unlike the
- * generic anonymous-field packer, this retains the recovered dimension bits
- * which are still opaque to the field graph.  `output` is unchanged on every
- * failure. */
+/* Build the HAL200 fragment SPECLM record for `imageblock`, preserving opaque
+ * tile-geometry bits. Leaves `output` unchanged on failure. */
 bool agx_ioto_g17p_fragment_speclm_build(
    const struct agx_ioto_g17p_imageblock *imageblock, void *output,
    size_t capacity);

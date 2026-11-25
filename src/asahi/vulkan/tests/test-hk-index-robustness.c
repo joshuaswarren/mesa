@@ -30,12 +30,12 @@ main(void)
    struct hk_device dev;
    struct hk_cmd_buffer cmd;
 
-   /* With robustness enabled, M5 HAL300 parts (G17G/G17S/G17C) bound aligned
-    * 16/32-bit indirect draws within 32-bit byte bounds in hardware;
+   /* With robustness enabled, G17P (HAL200) and M5 (G17G/G17S/G17C) bound
+    * aligned 16/32-bit indirect draws within 32-bit byte bounds in hardware;
     * oversized, unaligned, and 8-bit indirect draws take the software rewrite
     * path. */
-   static const enum agx_chip native_chips[] = {AGX_CHIP_G17G, AGX_CHIP_G17S,
-                                                AGX_CHIP_G17C};
+   static const enum agx_chip native_chips[] = {AGX_CHIP_G17P, AGX_CHIP_G17G,
+                                                AGX_CHIP_G17S, AGX_CHIP_G17C};
    for (unsigned i = 0; i < sizeof(native_chips) / sizeof(native_chips[0]);
         ++i) {
       assert(agx_chip_vdm_indirect_index_bounds(native_chips[i]));
@@ -79,11 +79,12 @@ main(void)
       assert(hk_needs_index_robustness(&cmd, &ind_16gib, NULL));
    }
 
-   /* Every other generation (including G18G, which lacks an empty-draw
-    * continuation) keeps the software rewrite for robust indirect draws. */
+   /* Every other generation (including G18G, whose out-of-range hardware
+    * index bounds are unmeasured) keeps the software rewrite for robust
+    * indirect draws. */
    static const enum agx_chip rewrite_chips[] = {
       AGX_CHIP_G13G, AGX_CHIP_G14X, AGX_CHIP_G15G, AGX_CHIP_G15S,
-      AGX_CHIP_G15C, AGX_CHIP_G16G, AGX_CHIP_G17P, AGX_CHIP_G18G,
+      AGX_CHIP_G15C, AGX_CHIP_G16G, AGX_CHIP_G18G,
    };
    for (unsigned i = 0; i < sizeof(rewrite_chips) / sizeof(rewrite_chips[0]);
         ++i) {
@@ -95,25 +96,23 @@ main(void)
       assert(hk_needs_index_robustness(&cmd, &ind_u32, NULL));
    }
 
-   /* G18G has no continuation for an empty rewritten draw, so an oversized
-    * binding without robustness is not sent to the rewrite (it is refused at
-    * admission instead), including an empty record. */
+   /* G18G has the HAL300 stream-link continuation for empty rewritten draws,
+    * so oversized bindings without robustness route to the rewrite just like
+    * M5, including an empty conditional direct record. */
    init_cmd(&dev, &cmd, AGX_CHIP_G18G, false);
    {
       struct agx_draw ind_16gib_p4 = agx_draw_indexed_indirect(
          UINT64_C(0x200000000), UINT64_C(0x100000000),
          (UINT64_C(1) << 34) + 4, AGX_INDEX_SIZE_U32, false);
-      assert(!hk_needs_index_robustness(&cmd, &ind_16gib_p4, NULL));
+      assert(hk_needs_index_robustness(&cmd, &ind_16gib_p4, NULL));
       struct agx_draw empty_direct = agx_draw_indexed(
          0, 1, 0, 0, 0, UINT64_C(0x100000000), (UINT64_C(1) << 34) + 4,
          AGX_INDEX_SIZE_U32, false);
-      assert(!hk_needs_index_robustness(&cmd, &ind_16gib_p4, &empty_direct));
+      assert(hk_needs_index_robustness(&cmd, &ind_16gib_p4, &empty_direct));
    }
 
-   /* With robustness enabled G18G is refused at rewrite admission, as it
-    * was before the rewrite admitted the record chip: representable and
-    * oversized bindings alike, since an empty rewritten draw has no
-    * continuation there. The chips that have one admit both. */
+   /* All AGX3 path chips with stream-link continuations admit both
+    * representable and oversized bindings into the rewrite. */
    {
       struct agx_draw representable = agx_draw_indexed_indirect(
          UINT64_C(0x200000000), UINT64_C(0x100000000), 0x1000,
@@ -122,15 +121,9 @@ main(void)
          UINT64_C(0x200000000), UINT64_C(0x100000000),
          (UINT64_C(1) << 34) + 4, AGX_INDEX_SIZE_U32, false);
 
-      init_cmd(&dev, &cmd, AGX_CHIP_G18G, true);
-      assert(hk_needs_index_robustness(&cmd, &representable, NULL));
-      assert(!hk_robust_index_rewrite_admitted(&dev, representable,
-                                               AGX_PRIMITIVE_TRIANGLES));
-      assert(!hk_robust_index_rewrite_admitted(&dev, oversized,
-                                               AGX_PRIMITIVE_TRIANGLES));
-
       static const enum agx_chip admitted[] = {
          AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+         AGX_CHIP_G18G,
       };
       for (unsigned i = 0; i < sizeof(admitted) / sizeof(admitted[0]); ++i) {
          init_cmd(&dev, &cmd, admitted[i], true);
@@ -237,6 +230,116 @@ main(void)
          assert(hk_needs_index_robustness(&cmd, &cond_indirect_4g_hi,
                                           &cond_direct_4g_hi));
       }
+   }
+
+   /* With VK_EXT_pipeline_robustness enabled on the device, index robustness
+    * follows the bound vertex shader's per-pipeline vertex_inputs level
+    * rather than pessimistically forcing robustness on every draw. */
+   {
+      struct hk_api_shader api_vs;
+      struct agx_draw ind_u32 = agx_draw_indexed_indirect(
+         UINT64_C(0x200000000), UINT64_C(0x100000000), 0x1000,
+         AGX_INDEX_SIZE_U32, false);
+      struct agx_draw direct_oob = agx_draw_indexed(
+         6, 1, 0, 0, 0, UINT64_C(0x100000000), 8, AGX_INDEX_SIZE_U32, false);
+      struct agx_draw oversized = agx_draw_indexed_indirect(
+         UINT64_C(0x200000000), UINT64_C(0x100000000),
+         (UINT64_C(1) << 34) + 4, AGX_INDEX_SIZE_U32, false);
+
+      init_cmd(&dev, &cmd, AGX_CHIP_G17P, false);
+      dev.vk.enabled_features.pipelineRobustness = true;
+
+      /* Where the VDM bounds indirect index fetches in hardware, an aligned
+       * indirect draw never needs the software rewrite, robust or not; the
+       * direct draw below still follows the robustness level. */
+      const bool hw_index_bounds =
+         agx_chip_vdm_indirect_index_bounds(AGX_CHIP_G17P);
+
+      memset(&api_vs, 0, sizeof(api_vs));
+      api_vs.vk.stage = MESA_SHADER_VERTEX;
+      api_vs.variants[HK_VS_VARIANT_HW].info.stage = MESA_SHADER_VERTEX;
+      api_vs.variants[HK_VS_VARIANT_HW].info.vs.has_vertex_robustness = true;
+      api_vs.variants[HK_VS_VARIANT_HW].info.vs.vertex_robustness =
+         AGX_ROBUSTNESS_DISABLED;
+      cmd.state.gfx.shaders[MESA_SHADER_VERTEX] = &api_vs;
+
+      assert(hk_vertex_robustness_level(
+                &dev, &api_vs.variants[HK_VS_VARIANT_HW],
+                VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT) ==
+             AGX_ROBUSTNESS_DISABLED);
+      assert(!hk_needs_index_robustness(&cmd, &ind_u32, NULL));
+      assert(!hk_needs_index_robustness(&cmd, &direct_oob, NULL));
+      /* Oversized (> 16 GiB) bindings still require the software rewrite. */
+      assert(hk_needs_index_robustness(&cmd, &oversized, NULL));
+
+      /* Fast-linked GPL vertex input library robustness overrides the
+       * pre-rasterization library's vertex shader default. */
+      cmd.vk.dynamic_graphics_state.vertex_input_robustness =
+         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT;
+      assert(hk_vertex_robustness_level(
+                &dev, &api_vs.variants[HK_VS_VARIANT_HW],
+                cmd.vk.dynamic_graphics_state.vertex_input_robustness) ==
+             AGX_ROBUSTNESS_D3D);
+      assert(hk_needs_index_robustness(&cmd, &ind_u32, NULL) ==
+             !hw_index_bounds);
+      assert(hk_needs_index_robustness(&cmd, &direct_oob, NULL));
+      cmd.vk.dynamic_graphics_state.vertex_input_robustness =
+         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT;
+
+      /* Per-pipeline ROBUST_BUFFER_ACCESS / ROBUST_BUFFER_ACCESS_2 re-enables
+       * index robustness even when device-wide robustness features are off. */
+      api_vs.variants[HK_VS_VARIANT_HW].info.vs.vertex_robustness =
+         AGX_ROBUSTNESS_GL;
+      assert(hk_vertex_robustness_level(
+                &dev, &api_vs.variants[HK_VS_VARIANT_HW],
+                VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT) ==
+             AGX_ROBUSTNESS_GL);
+      assert(hk_needs_index_robustness(&cmd, &ind_u32, NULL) ==
+             !hw_index_bounds);
+      assert(hk_needs_index_robustness(&cmd, &direct_oob, NULL));
+
+      api_vs.variants[HK_VS_VARIANT_HW].info.vs.vertex_robustness =
+         AGX_ROBUSTNESS_D3D;
+      assert(hk_vertex_robustness_level(
+                &dev, &api_vs.variants[HK_VS_VARIANT_HW],
+                VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT) ==
+             AGX_ROBUSTNESS_D3D);
+      assert(hk_needs_index_robustness(&cmd, &ind_u32, NULL) ==
+             !hw_index_bounds);
+      assert(hk_needs_index_robustness(&cmd, &direct_oob, NULL));
+
+      /* Shader objects (has_vertex_robustness == false) derive robustness from
+       * device-level robustBufferAccess/robustBufferAccess2, ignoring both
+       * pipelineRobustness and any previously bound pipeline's VI robustness. */
+      api_vs.variants[HK_VS_VARIANT_HW].info.vs.has_vertex_robustness = false;
+      api_vs.variants[HK_VS_VARIANT_HW].info.vs.vertex_robustness =
+         AGX_ROBUSTNESS_DISABLED;
+      cmd.vk.dynamic_graphics_state.vertex_input_robustness =
+         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT;
+      assert(hk_vertex_robustness_level(
+                &dev, &api_vs.variants[HK_VS_VARIANT_HW],
+                cmd.vk.dynamic_graphics_state.vertex_input_robustness) ==
+             AGX_ROBUSTNESS_DISABLED);
+      assert(!hk_needs_index_robustness(&cmd, &ind_u32, NULL));
+      assert(!hk_needs_index_robustness(&cmd, &direct_oob, NULL));
+
+      dev.vk.enabled_features.robustBufferAccess = true;
+      assert(hk_vertex_robustness_level(
+                &dev, &api_vs.variants[HK_VS_VARIANT_HW],
+                cmd.vk.dynamic_graphics_state.vertex_input_robustness) ==
+             AGX_ROBUSTNESS_GL);
+      assert(hk_needs_index_robustness(&cmd, &ind_u32, NULL) ==
+             !hw_index_bounds);
+      assert(hk_needs_index_robustness(&cmd, &direct_oob, NULL));
+
+      dev.vk.enabled_features.robustBufferAccess2 = true;
+      assert(hk_vertex_robustness_level(
+                &dev, &api_vs.variants[HK_VS_VARIANT_HW],
+                cmd.vk.dynamic_graphics_state.vertex_input_robustness) ==
+             AGX_ROBUSTNESS_D3D);
+      assert(hk_needs_index_robustness(&cmd, &ind_u32, NULL) ==
+             !hw_index_bounds);
+      assert(hk_needs_index_robustness(&cmd, &direct_oob, NULL));
    }
 
    puts("hk_index_robustness: ok");
