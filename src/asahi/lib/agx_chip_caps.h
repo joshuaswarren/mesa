@@ -78,6 +78,12 @@ enum agx_chip_cap {
     * has finished, without the strong cache flush. Measured on G17P and M5
     * (G17G, G17S, G17C); G15 and G16G keep the flush until measured there. */
    AGX_CAP_CDM_WAR_WEAK_BARRIER = 1u << 11,
+
+   /* Gen9 2D depth compression and compressed DRM_FORMAT_MOD_APPLE_INTERCHANGE
+    * scanout (in both Gallium and Borealis) are enabled on this chip. Private
+    * Gen9 colour compression is gated separately by
+    * agx_chip_gen9_color_compression() (G16G and G17P). */
+   AGX_CAP_GEN9_2D_COMPRESSION = 1u << 12,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -95,7 +101,8 @@ enum agx_chip_cap {
    (AGX_CAPS_NATIVE | AGX_CAP_NATIVE_PREAMBLE |                                \
     AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |                                        \
     AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS | AGX_CAP_SPARSE_RESIDENCY_3D |      \
-    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER)
+    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
+    AGX_CAP_GEN9_2D_COMPRESSION)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \

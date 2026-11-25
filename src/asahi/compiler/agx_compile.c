@@ -944,10 +944,10 @@ agx_pack_normalized_agx3(agx_builder *b, const agx_index *channels,
       return 0;
 
    if (format == AGX_FORMAT_RGB10A2) {
-      if (nr_channels != 4)
+      if (nr_channels != 3 && nr_channels != 4)
          return 0;
       agx_index pack_sources[4];
-      for (unsigned i = 0; i < 4; ++i) {
+      for (unsigned i = 0; i < nr_channels; ++i) {
          if (channels[i].size == AGX_SIZE_32) {
             pack_sources[i] = channels[i];
          } else if (channels[i].size == AGX_SIZE_16) {
@@ -961,6 +961,8 @@ agx_pack_normalized_agx3(agx_builder *b, const agx_index *channels,
             return 0;
          }
       }
+      if (nr_channels == 3)
+         pack_sources[3] = agx_mov_imm(b, 32, fui(1.0f));
       packed[0] = agx_pack_rgb10a2_agx3(b, pack_sources[0], pack_sources[1],
                                       pack_sources[2], pack_sources[3]);
       return 1;
@@ -1757,14 +1759,22 @@ agx_unpack_normalized_agx3(agx_builder *b, agx_index dest,
    if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX2)
       return false;
    if (format == AGX_FORMAT_RGB10A2) {
-      if (nr_comps != 4 || dest.size != AGX_SIZE_32)
+      if (nr_comps < 1 || nr_comps > 4 || dest.size != AGX_SIZE_32)
          return false;
       agx_index packed = agx_temp(b->shader, AGX_SIZE_32);
       agx_ld_tile_to(b, packed, agx_src_index(&instr->src[0]), agx_null(),
                     format, 1, nir_intrinsic_base(instr), false,
                     nir_intrinsic_target(instr));
-      agx_unpack_rgb10a2_agx3_to(b, dest, packed);
-      agx_emit_cached_split(b, dest, 4);
+      if (nr_comps == 4) {
+         agx_unpack_rgb10a2_agx3_to(b, dest, packed);
+         agx_emit_cached_split(b, dest, 4);
+      } else {
+         agx_index rgba = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+         agx_unpack_rgb10a2_agx3_to(b, rgba, packed);
+         agx_index channels[4] = {agx_null()};
+         agx_emit_split(b, channels, rgba, 4);
+         agx_emit_collect_to(b, dest, nr_comps, channels);
+      }
       return true;
    }
    /* Apple reads an RGB9E5 or RG11B10 target's three float lanes back with

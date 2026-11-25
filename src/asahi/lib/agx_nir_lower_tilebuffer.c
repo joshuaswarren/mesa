@@ -468,15 +468,20 @@ pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
       /* An RGBX/BGRX target lives in a 4-channel tile whose fourth channel
        * reaches memory (the PBE has no constant swizzle source).  Write 1.0
-       * there so the X byte is 0xff rather than whatever the tile held: a
-       * display firmware that blends the byte as alpha (Apple H17P) otherwise
-       * shows the frame scaled by it. Requested by G18G, whose PBE points
-       * swizzle_a at this channel.
+       * there so the X channel is all-ones rather than whatever the tile held:
+       * a display firmware that blends the channel as alpha (Apple H17P, or
+       * DCP L10R on 10-bit RGBX) otherwise shows the frame scaled by it.
+       * Requested by G18G for all RGBX/BGRX formats, and required on G17P/M5
+       * for RGB10X2/BGR10X2 because AGX3's packed RGB10A2 tile store always
+       * encodes all four channels into one 32-bit word.
        */
       const struct util_format_description *ldesc =
          util_format_description(logical_format);
       const bool x_alpha =
-         ctx->x_alpha_one && comps == 3 && ldesc->nr_channels == 4 &&
+         (ctx->x_alpha_one ||
+          (ctx->lower_g17p_formats &&
+           (enum ail_isa_format)format == AIL_ISA_FORMAT_RGB10A2)) &&
+         comps == 3 && ldesc->nr_channels == 4 &&
          ldesc->channel[3].type == UTIL_FORMAT_TYPE_VOID &&
          util_format_get_nr_components(format) == 4 &&
          !util_format_is_pure_integer(logical_format) && !lower_r11g11b10;

@@ -239,7 +239,8 @@ agx_set_shader_images(struct pipe_context *pctx, mesa_shader_stage shader,
          agx_legalize_compression(ctx, rsrc, image->format);
 
          if (image->shader_access & PIPE_IMAGE_ACCESS_WRITE)
-            assert(rsrc->layout.writeable_image);
+            assert(rsrc->layout.writeable_image ||
+                   agx_resource_is_shared_interchange(rsrc));
       }
    }
 
@@ -1087,6 +1088,10 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
       cfg.unk_mipmapped = rsrc->mipmapped;
       cfg.srgb_2_channel = cfg.srgb && util_format_colormask(desc) == 0x3;
 
+      if (rsrc->layout.compressed &&
+          !ail_is_view_compatible(&rsrc->layout, format))
+         return false;
+
       cfg.compressed = rsrc->layout.compressed;
       cfg.extended = cfg.compressed;
 
@@ -1147,6 +1152,9 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
          cfg.stride = (cfg.width * util_format_get_blocksize(format)) - 16;
       } else if (rsrc->layout.tiling == AIL_TILING_LINEAR) {
          cfg.stride = ail_get_linear_stride_B(&rsrc->layout, 0) - 16;
+      } else if (rsrc->layout.tiling == AIL_TILING_INTERCHANGE) {
+         /* Macroblocks per row minus one in the linear stride field. */
+         cfg.stride = (rsrc->layout.stride_el[0] / 16 - 1) << 4;
       } else {
          cfg.page_aligned_layers = rsrc->layout.page_aligned_layers;
       }
@@ -1763,7 +1771,7 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
                   continue;
 
                struct agx_resource *rsrc = agx_resource(state->cbufs[i].texture);
-               if (!(rsrc->base.b.bind & PIPE_BIND_SHARED) &&
+               if (!agx_resource_is_shared(rsrc) &&
                    rsrc->layout.compressed)
                   agx_decompress(ctx, rsrc, "Render target spilled");
             }
@@ -2273,11 +2281,16 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
       }
 
       /* RGBX/BGRX: the fourth memory channel is void, so the loop leaves
-       * swizzle_a at 0 and the byte takes tile channel 0 (red).  Point it at
+       * swizzle_a at 0 and the channel takes tile channel 0 (red).  Point it at
        * the tile's alpha instead, which agx_nir_lower_tilebuffer fills with
-       * 1.0 for these formats, so X scans out as 0xff.
+       * 1.0 for these formats, so X scans out as opaque all-ones. On G17P/M5
+       * this covers 10-bit RGB10X2/BGR10X2 whose packed RGB10A2 tile word
+       * always carries 1.0 in channel 3.
        */
-      if (dev->chip == AGX_CHIP_G18G && desc->nr_channels == 4 &&
+      if ((dev->chip == AGX_CHIP_G18G ||
+           (agx_chip_native_or_m5(dev->chip) &&
+            cfg.channels == AGX_CHANNELS_R10G10B10A2)) &&
+          desc->nr_channels == 4 &&
           desc->channel[3].type == UTIL_FORMAT_TYPE_VOID)
          cfg.swizzle_a = 3;
 
@@ -2342,6 +2355,10 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
          if (tex->layout.tiling == AIL_TILING_LINEAR) {
             cfg.stride = ail_get_linear_stride_B(&tex->layout, level) - 4;
             cfg.levels = 1;
+         } else if (tex->layout.tiling == AIL_TILING_INTERCHANGE) {
+            /* The field encodes stride_B / 16 - 1, in macroblocks. */
+            cfg.stride = (tex->layout.stride_el[0] / 16) * 16 - 4;
+            cfg.levels = 1;
          } else {
             cfg.page_aligned_layers = tex->layout.page_aligned_layers;
             cfg.levels = tex->base.b.last_level + 1;
@@ -2393,6 +2410,9 @@ agx_batch_upload_pbe_internal(struct agx_batch *batch,
       }
 
       if (tex->layout.compressed && !emrt) {
+         if (!ail_is_view_compatible(&tex->layout, view->format))
+            return false;
+
          cfg.compressed = true;
          cfg.extended = true;
 
@@ -6921,6 +6941,19 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
          continue;
       }
 
+      /* A shared compressed Interchange image cannot be reallocated with
+       * PIPE_BIND_SHADER_IMAGE in agx_set_shader_images(), leaving
+       * layout.writeable_image false and layout.compressed true. Fail closed
+       * on writable storage-image bindings instead of writing through a
+       * compressed Interchange PBE. */
+      if (!internal && (view->shader_access & PIPE_IMAGE_ACCESS_WRITE) &&
+          view->resource->target != PIPE_BUFFER &&
+          agx_resource_is_shared_interchange(agx_resource(view->resource))) {
+         agx_native_descriptor_reject_batch(
+            batch, "writable interchange storage image");
+         return;
+      }
+
       /* The lowered state-0 write, and every G18G image written by native
        * stores only (agx3_emit_storage_image_write_g18g: imgwci addresses
        * the texel from the PBE alone), leave the AGX2 software sideband
@@ -10943,7 +10976,7 @@ agx_g17p_build_mixed_bg_eot(struct agx_batch *batch,
          if (!agx_batch_upload_pbe(
                 batch, agx_pbe_descriptor_at(pbe.cpu, descriptor_size, i),
                 &view, true, true, false, no_compress))
-            agx_native_descriptor_rejected(dev, "mixed MRT end-of-tile PBE");
+            return agx_reject_g17g_tile(batch, "mixed MRT end-of-tile PBE");
       }
 
       const struct agx3_g17p_rt0_eot_program_desc desc = {
@@ -11020,7 +11053,7 @@ agx_g17p_build_mixed_bg_eot(struct agx_batch *batch,
                                              2 * i),
                    agx_resource(surfs[i]->texture), surfs[i]->format,
                    &sampler_view))
-               agx_native_descriptor_rejected(dev, "mixed MRT texture");
+               return agx_reject_g17g_tile(batch, "mixed MRT texture");
          }
 
          const unsigned sampler_size =
@@ -11492,6 +11525,18 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
    if (!descriptor_size)
       return agx_reject_g17g_tile(batch, "background heap geometry");
 
+   if (batch->native_rejected)
+      return (struct asahi_bg_eot){0};
+
+   for (unsigned rt = 0; rt < batch->key.nr_cbufs; ++rt) {
+      const struct pipe_surface *surf = &batch->key.cbufs[rt];
+      if (surf->texture &&
+          !ail_is_view_compatible(&agx_resource(surf->texture)->layout,
+                                  surf->format))
+         return agx_reject_g17g_tile(batch,
+                                     "incompatible compressed render target");
+   }
+
    if (agx_g18_layered_d16_outside_native(dev, batch)) {
       if ((dev->debug & AGX_DBG_FAULTTRACE) && !batch->native_rejected) {
          const struct pipe_surface *zs = &batch->key.zsbuf;
@@ -11787,7 +11832,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
                agx_pbe_descriptor_at(pbe.cpu, descriptor_size, pbe_index++);
             if (!agx_batch_upload_pbe(batch, argument, &view, true, true,
                                       false, no_compress))
-               agx_native_descriptor_rejected(dev, "end-of-tile PBE");
+               return agx_reject_g17g_tile(batch, "end-of-tile PBE");
          }
 
          if (key.store_and_resolve) {
@@ -11799,7 +11844,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
                agx_pbe_descriptor_at(pbe.cpu, descriptor_size, pbe_index++);
             if (!agx_batch_upload_pbe(batch, argument, &view, true, true,
                                       false, false))
-               agx_native_descriptor_rejected(dev, "resolve destination PBE");
+               return agx_reject_g17g_tile(batch, "resolve destination PBE");
          }
 
          struct agx3_g17p_rt0_eot_program_desc desc = {
@@ -11940,7 +11985,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
                if (!agx_pack_texture(descriptor_generation, texture,
                                      agx_resource(attachment->texture),
                                      attachment->format, &sampler_view))
-                  agx_native_descriptor_rejected(dev, "background texture");
+                  return agx_reject_g17g_tile(batch, "background texture");
             }
 
             const unsigned sampler_size =
@@ -12015,7 +12060,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
 
          if (!agx_pack_texture(descriptor_generation, texture.cpu, rsrc,
                                surf->format, &sampler_view))
-            agx_native_descriptor_rejected(dev, "background texture");
+            return agx_reject_g17g_tile(batch, "background texture");
 
          agx_usc_pack(&b, TEXTURE, cfg) {
             /* Shifted to match eMRT indexing, could be optimized */
@@ -12041,7 +12086,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
          bool no_compress = batch->feedback & (PIPE_CLEAR_COLOR0 << rt);
          if (!agx_batch_upload_pbe(batch, pbe.cpu, &view, true, true, false,
                                    no_compress))
-            agx_native_descriptor_rejected(dev, "end-of-tile PBE");
+            return agx_reject_g17g_tile(batch, "end-of-tile PBE");
 
          agx_usc_pack(&b, TEXTURE, cfg) {
             cfg.start = rt;
@@ -12394,7 +12439,7 @@ agx_batch_init_state(struct agx_batch *batch)
 
          if (agx_gallium_shared_compression_supported(
                 agx_chip_descriptor_generation(dev->chip)) ||
-             (rsrc->base.b.bind & PIPE_BIND_SHARED)) {
+             agx_resource_is_shared(rsrc)) {
             agx_decompress_inplace(batch, surf, "Render target spilled");
          } else {
             /* agx_set_framebuffer_state() pre-decompresses spilling private
@@ -12421,6 +12466,10 @@ agx_batch_init_state(struct agx_batch *batch)
       if (batch->key.cbufs[i].texture) {
          struct agx_resource *rsrc = agx_resource(batch->key.cbufs[i].texture);
          unsigned level = batch->key.cbufs[i].level;
+
+         if (!ail_is_view_compatible(&rsrc->layout, batch->key.cbufs[i].format))
+            agx_native_descriptor_reject_batch(
+               batch, "incompatible compressed render target");
 
          if (agx_resource_valid(rsrc, level))
             batch->load |= PIPE_CLEAR_COLOR0 << i;
@@ -16122,7 +16171,7 @@ agx_legalize_feedback_loop_surf(struct agx_context *ctx,
       return;
 
    /* Decompress if we can and shadow if we can't. */
-   if (rsrc->base.b.bind & PIPE_BIND_SHARED) {
+   if (agx_resource_is_shared(rsrc)) {
       struct agx_batch *batch = agx_get_batch(ctx);
 
       /* If we already did in-place decompression for this one */
@@ -17821,6 +17870,8 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    agx_update_descriptors(batch, ctx->vs);
    agx_update_descriptors(batch, ctx->gs);
    agx_update_descriptors(batch, ctx->fs);
+   if (batch->native_rejected)
+      return;
 
    if (IS_DIRTY(VS) || IS_DIRTY(FS) || ctx->gs || IS_DIRTY(VERTEX) ||
        IS_DIRTY(BLEND_COLOR) || IS_DIRTY(QUERY) || IS_DIRTY(POLY_STIPPLE) ||
@@ -18209,6 +18260,8 @@ agx_launch(struct agx_batch *batch, struct agx_grid grid,
    }
 
    agx_update_descriptors(batch, cs);
+   if (batch->native_rejected)
+      return;
    agx_upload_uniforms(batch, NULL);
 
    struct agx_device *dev = agx_device(ctx->base.screen);
