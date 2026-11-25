@@ -273,3 +273,22 @@ bool hk_g17p_metadata_grid_init(uint32_t width_tl, uint32_t height_tl,
 /* The 64-bit metadata word index of tile (x_tl, y_tl). */
 uint32_t hk_g17p_metadata_tile_index(const struct hk_g17p_metadata_grid *grid,
                                      uint32_t x_tl, uint32_t y_tl);
+
+/* Dispatch grid for the AGX3 Gen10 compressed buffer-to-image compute upload.
+ * Each 64-thread workgroup covers 32x16 texels (two adjacent 16x16 compression
+ * blocks aligned to 16-texel boundaries, one block per 32-lane warp). */
+struct hk_agx3_compressed_buf2img_grid {
+   uint32_t tile_x0;
+   uint32_t tile_y0;
+   uint32_t groups_x;
+   uint32_t groups_y;
+};
+
+/* Whether a canonical integer storage-PBE view format is supported by the
+ * AGX3 Gen10 compressed buffer-to-image compute upload. */
+bool hk_agx3_compressed_buf2img_view_format_supported(VkFormat view_format);
+
+bool hk_agx3_compressed_buf2img_grid_init(
+   uint32_t x0, uint32_t y0, uint32_t width, uint32_t height,
+   uint32_t max_groups_x, uint32_t max_groups_y,
+   struct hk_agx3_compressed_buf2img_grid *grid);

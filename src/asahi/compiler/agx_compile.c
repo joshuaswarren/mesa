@@ -10422,13 +10422,12 @@ agx_lower_front_face(struct nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
-/* Lanes of a G17P or M5 SIMD group mostly agree on a rare guard, so an
- * expensive arm under a type/collision test is skipped whole. Flattened, its
- * rcp and rsq run every loop iteration and every load it reads stays above the
- * test. 24 was chosen on G17P (best of 12, 16, 24, 32 and 48 on TF3's light
- * loop; smaller arms pay for a branch) and validated on M5 (G17S, Geekbench
- * 6.7.1 Vulkan + gpubench-vk: +15.29% on Particle Physics, 0 regressions
- * across the other 7 workloads, 67/70 shaders unchanged).
+/* Lanes of an AGX3 (AGX3B or AGX3C) SIMD group mostly agree on a rare guard,
+ * so an expensive arm under a type/collision test is skipped whole. Flattened,
+ * its rcp and rsq run every loop iteration and every load it reads stays above
+ * the test. 24 was chosen on AGX3B (best of 12, 16, 24, 32 and 48 on TF3's
+ * light loop; smaller arms pay for a branch) and validated across AGX3B and
+ * AGX3C.
  */
 #define AGX_EXPENSIVE_FLATTEN_LIMIT 24
 
@@ -10632,8 +10631,8 @@ agx_nir_limit_heavy_branch_unroll(nir_shader *nir)
  * the latter run should be almost a no-op.
  */
 static void
-agx_optimize_loop_nir(nir_shader *nir, bool m5, bool agx3b, bool g17p,
-                      bool unroll_64)
+agx_optimize_loop_nir(nir_shader *nir, bool fold_d3d,
+                      bool preserve_expensive_branches, bool unroll_64)
 {
    const nir_shader_compiler_options *saved_options = nir->options;
    nir_shader_compiler_options options;
@@ -10648,7 +10647,8 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool agx3b, bool g17p,
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 64,
       .expensive_alu_ok = true,
-      .expensive_limit = (g17p || m5) ? AGX_EXPENSIVE_FLATTEN_LIMIT : 0,
+      .expensive_limit =
+         preserve_expensive_branches ? AGX_EXPENSIVE_FLATTEN_LIMIT : 0,
    };
 
    /* Track which passes may still find work via a bitmask. Skip passes that
@@ -10706,7 +10706,7 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool agx3b, bool g17p,
    };
 
    uint32_t active = (1u << NUM_PASSES) - 1u;
-   if (!m5 && !agx3b)
+   if (!fold_d3d)
       active &= ~(1u << OPT_FOLD_D3D);
    if (!has_loops)
       active &= ~(1u << OPT_LOOP_UNROLL);
@@ -11509,7 +11509,7 @@ agx_factor_loop_mac(nir_shader *nir)
 
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
-                 bool byte_indices, bool discard_word, bool g17p, bool m5,
+                 bool byte_indices, bool discard_word, bool m5,
                  bool g18_scans, bool checked_offsets,
                  uint16_t *preamble_size, uint8_t *ts_count, uint8_t *ss_count,
                  const struct agx_shader_key *dma_key,
@@ -11525,7 +11525,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 64,
       .expensive_alu_ok = true,
-      .expensive_limit = (g17p || m5) ? AGX_EXPENSIVE_FLATTEN_LIMIT : 0,
+      .expensive_limit = (agx3b || m5) ? AGX_EXPENSIVE_FLATTEN_LIMIT : 0,
    };
    bool progress = false;
    bool pre_fuse_dirty = false;
@@ -11567,7 +11567,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * global_invocation_id[c] to workgroup_id[c] corrupts coalesced dispatches.
     */
 
-   agx_optimize_loop_nir(nir, m5, agx3b, g17p, agx3b || m5);
+   agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
 
    /* Loops are unrolled now: a subgroup relative shuffle whose mask/delta is
     * still not a constant in 1..31 takes the general lowering
@@ -11577,7 +11577,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       bool lowered = false;
       NIR_PASS(lowered, nir, agx_nir_lower_dynamic_shuffle_xor);
       if (lowered)
-         agx_optimize_loop_nir(nir, m5, agx3b, g17p, agx3b || m5);
+         agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
    }
 
    /* Eliminate tautological monotonic bit-insert guards inside <=32-trip loops
@@ -11587,7 +11587,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       bool folded_bits = false;
       NIR_PASS(folded_bits, nir, agx_nir_opt_monotonic_bit_insert);
       if (folded_bits)
-         agx_optimize_loop_nir(nir, m5, agx3b, g17p, agx3b || m5);
+         agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
    }
 
    /* Counted loops whose trip count is only known at run time: run several
@@ -11604,7 +11604,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       NIR_PASS(unrolled, nir, agx_nir_unroll_runtime_loops, m5_unroll_factor,
                320, m5_unroll_widest);
       if (unrolled)
-         agx_optimize_loop_nir(nir, m5, agx3b, g17p, agx3b || m5);
+         agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
    }
 
    if (m5 && !g18_scans)
@@ -11719,7 +11719,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       bool unswitched = false;
       NIR_PASS(unswitched, nir, agx_nir_opt_unswitch_affine_bounds);
       if (unswitched)
-         agx_optimize_loop_nir(nir, m5, agx3b, g17p, agx3b || m5);
+         agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
    }
 
    NIR_PASS(pre_alg_progress, nir, nir_opt_load_store_vectorize,
@@ -12160,18 +12160,13 @@ pre_preamble:
       move_all &= ~(nir_move_load_input | nir_move_load_frag_coord |
                     nir_move_alu);
 
-   /* Sinking a G17P or M5 buffer load into the arm that reads it saves the
-    * load when the arm is skipped. Sink leaves it at the top of that block;
-    * moving it on to its use would make each load wait alone instead of
-    * overlapping.
+   /* Sinking an AGX3 buffer load into the arm that reads it saves the load when
+    * the arm is skipped. Sink leaves it at the top of that block; moving it on
+    * to its use would make each load wait alone instead of overlapping.
     */
    NIR_PASS(_, nir, nir_opt_sink,
-            (g17p || m5) ? move_all : move_all & ~nir_move_load_ssbo);
-   /* Scope conditional load sinking to G17P (chip == AGX_CHIP_G17P) and M5
-    * (AGX3C && !g18_scans) to match AGX_EXPENSIVE_FLATTEN_LIMIT and
-    * nir_move_load_ssbo above; M3/M4 AGX3B parts keep expensive_limit = 0 and
-    * nir_move_load_ssbo off until benchmarked on M3/M4 hardware. */
-   if ((g17p || m5) && !g18_scans)
+            (agx3b || m5) ? move_all : move_all & ~nir_move_load_ssbo);
+   if ((agx3b || m5) && !g18_scans)
       NIR_PASS(_, nir, agx_nir_opt_sink_conditional_loads);
    NIR_PASS(_, nir, nir_opt_move, move_all & ~nir_move_load_ssbo);
    NIR_PASS(progress, nir, nir_lower_all_phis_to_scalar);
@@ -16131,7 +16126,7 @@ agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p, bool m5,
 static void
 agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_depth,
                             bool g18g, bool m5, bool chip_g17p, bool post_lower,
-                            bool defer_idiv)
+                            bool defer_idiv, bool preserve_branches)
 {
    if (!nir)
       return;
@@ -16221,13 +16216,14 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
        * will run through the loop later, once we have the shader key, but if we
        * run now, that run will ideally be almost a no-op.
        */
-      /* Match agx_optimize_nir()'s G17P/M5 scope (chip_g17p || m5, leaving
-       * M3/M4 AGX3B parts untouched until expensive_limit and load sinking
-       * are measured on M3/M4 hardware). */
-      if (chip_g17p || m5)
+      /* Match agx_optimize_nir()'s AGX3B/AGX3C scope (excluding G18G) for
+       * branch preservation and conditional load sinking, while keeping
+       * OPT_FOLD_D3D on the existing native/M5 predicate. */
+      const bool preserve_agx3_branches = preserve_branches || m5;
+      if (preserve_agx3_branches)
          NIR_PASS(_, nir, agx_nir_opt_sink_conditional_loads);
-      agx_optimize_loop_nir(nir, !g17p && native_fragment_depth, g17p, g17p,
-                            g17p || m5);
+      agx_optimize_loop_nir(nir, g17p || native_fragment_depth,
+                            preserve_agx3_branches, g17p || m5);
    } else {
       NIR_PASS(_, nir, nir_opt_copy_prop);
       NIR_PASS(_, nir, nir_opt_constant_folding);
@@ -16328,24 +16324,32 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 }
 
 void
-agx_preprocess_nir(nir_shader *nir)
+agx_preprocess_nir_for_encoding(nir_shader *nir, enum agx_isa_encoding encoding)
 {
    agx_preprocess_nir_internal(nir, false, false, false, false, false, false,
-                               false);
+                               false, encoding == AGX_ISA_ENCODING_AGX3B);
+}
+
+void
+agx_preprocess_nir(nir_shader *nir)
+{
+   agx_preprocess_nir_for_encoding(nir, AGX_ISA_ENCODING_UNKNOWN);
 }
 
 void
 agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip)
 {
-   agx_preprocess_nir_internal(nir, true, true, false, false,
-                               chip == AGX_CHIP_G17P, false, false);
+   agx_preprocess_nir_internal(
+      nir, true, true, false, false, chip == AGX_CHIP_G17P, false, false,
+      agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B);
 }
 
 void
 agx_preprocess_nir_native_defer_idiv(nir_shader *nir, enum agx_chip chip)
 {
-   agx_preprocess_nir_internal(nir, true, true, false, false,
-                               chip == AGX_CHIP_G17P, false, true);
+   agx_preprocess_nir_internal(
+      nir, true, true, false, false, chip == AGX_CHIP_G17P, false, true,
+      agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B);
 }
 
 void
@@ -16359,7 +16363,7 @@ agx_preprocess_nir_g18g(nir_shader *nir)
 {
    /* Select G18 trig without inheriting G17P subgroup/shared-memory rules. */
    agx_preprocess_nir_internal(nir, false, false, true, false, false, false,
-                               false);
+                               false, false);
 }
 
 void
@@ -16370,9 +16374,11 @@ agx_preprocess_nir_post_lower(nir_shader *nir, enum agx_chip chip)
    const bool m5 = !g17p && !g18g && agx_chip_g17_m5(chip);
    const bool native_fragment_depth = g17p || m5;
    const bool chip_g17p = chip == AGX_CHIP_G17P;
+   const bool preserve_branches =
+      agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B;
 
    agx_preprocess_nir_internal(nir, g17p, native_fragment_depth, g18g, m5,
-                               chip_g17p, true, false);
+                               chip_g17p, true, false, preserve_branches);
 }
 
 static bool
@@ -18619,7 +18625,6 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
    agx_optimize_nir(
       nir, key->dev.soft_fault, uniform_atomics,
       key->dev.encoding == AGX_ISA_ENCODING_AGX3B, discard_word,
-      key->dev.chip == AGX_CHIP_G17P,
       key->dev.encoding == AGX_ISA_ENCODING_AGX3C,
       key->dev.emit_agx3d, key->checked_offsets,
       form_preamble ? &info->push_count : NULL,
@@ -19339,7 +19344,7 @@ agx_preprocess_nir_m5(nir_shader *nir)
 {
    agx_preprocess_m5_popcount_idiom(nir);
    agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
-                               false);
+                               false, false);
 }
 
 void
@@ -19347,5 +19352,5 @@ agx_preprocess_nir_m5_defer_idiv(nir_shader *nir)
 {
    agx_preprocess_m5_popcount_idiom(nir);
    agx_preprocess_nir_internal(nir, false, true, false, true, false, false,
-                               true);
+                               true, false);
 }
