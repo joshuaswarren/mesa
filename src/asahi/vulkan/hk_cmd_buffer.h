@@ -598,6 +598,7 @@ struct hk_descriptor_state {
 
    uint32_t set_sizes[HK_MAX_SETS];
    struct hk_descriptor_set *sets[HK_MAX_SETS];
+   uint32_t set_update_seq[HK_MAX_SETS];
    uint32_t sets_dirty;
 
    struct hk_push_descriptor_set *push[HK_MAX_SETS];
@@ -3688,6 +3689,7 @@ struct hk_meta_save {
    struct hk_api_shader *shaders[MESA_SHADER_MESH + 1];
    struct hk_addr_range vb0;
    struct hk_descriptor_set *desc0;
+   uint32_t desc0_update_seq;
    /* Nested meta must retain the outer query/conditional-rendering scope. */
    bool in_meta;
    bool has_push_desc0;

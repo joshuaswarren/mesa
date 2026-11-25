@@ -13,6 +13,8 @@
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
+#include "hk_physical_device.h"
+#include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
 #include "vk_pipeline_layout.h"
 
@@ -22,6 +24,7 @@
 
 struct fixture {
    struct hk_cmd_buffer cmd;
+   struct hk_physical_device pdev;
    struct hk_device dev;
    struct vk_pipeline_layout layout;
    struct hk_descriptor_set_layout set_layout;
@@ -56,6 +59,11 @@ fixture(void)
    f->root_map = calloc(1, HK_CMD_BO_SIZE);
    f->set = calloc(1, sizeof(*f->set) + sizeof(f->set->dynamic_buffers[0]));
    CHECK(f->main_map && f->root_map && f->set);
+   f->pdev.dev.chip = AGX_CHIP_G17P;
+   vk_object_base_init(NULL, &f->pdev.vk.base, VK_OBJECT_TYPE_PHYSICAL_DEVICE);
+   f->dev.vk.physical = &f->pdev.vk;
+   f->dev.vk.alloc = *vk_default_allocator();
+   vk_object_base_init(&f->dev.vk, &f->dev.vk.base, VK_OBJECT_TYPE_DEVICE);
    f->dev.dev.chip = AGX_CHIP_G17P;
    f->dev.dev.debug = AGX_DBG_PERF;
    f->cmd.vk.base.device = &f->dev.vk;
@@ -307,11 +315,17 @@ reuse_correctness(struct fixture *f)
    f->dev.dev.chip = AGX_CHIP_G17P;
    bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
 
-   /* CPU-decoded descriptors deliberately keep their publication path. */
+   /* CPU-decoded combined-sampler shaders retain the root when the bound
+    * non-update-after-bind descriptor sets are unchanged, and invalidate once
+    * a set's update_seq advances (covered in detail below). */
    f->fs_api->variants[0].info.agx3_combined_sampler_valid = true;
    root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
    const uint64_t before = desc->generation;
    hk_root_mark_clean(desc);
+   bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+   CHECK(desc->generation == before && !hk_root_dirty(desc));
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) == root);
+   p_atomic_inc(&f->set->update_seq);
    bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
    CHECK(desc->generation == before + 1 && hk_root_dirty(desc));
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) != root);
@@ -794,6 +808,322 @@ xfer_clean_isolation_correctness(struct fixture *f)
    reset(f);
 }
 
+static void
+combined_sampler_retention_correctness(struct fixture *f)
+{
+   struct hk_cmd_buffer *cmd = &f->cmd;
+   struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+   VkCommandBuffer vk_cb = hk_cmd_buffer_to_handle(cmd);
+   VkDevice vk_dev = hk_device_to_handle(&f->dev);
+
+   reset(f);
+   f->fs_api->variants[0].info.agx3_combined_sampler_valid = true;
+
+   /* Two static Gen9 UBO descriptor sets (set 0 and set 1) with real mapped
+    * storage so hk_UpdateDescriptorSets / copy / template paths run verbatim. */
+   union {
+      struct hk_descriptor_set_layout layout;
+      uint8_t storage[sizeof(struct hk_descriptor_set_layout) +
+                      sizeof(struct hk_descriptor_set_binding_layout)];
+   } layout_mem;
+   memset(&layout_mem, 0, sizeof(layout_mem));
+   struct hk_descriptor_set_layout *set_layout = &layout_mem.layout;
+   set_layout->vk.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT;
+   set_layout->descriptor_generation = 9;
+   set_layout->binding_count = 1;
+   set_layout->binding[0] = (struct hk_descriptor_set_binding_layout){
+      .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+      .array_size = 2,
+      .offset = 0,
+      .stride = sizeof(struct hk_buffer_address),
+   };
+
+   struct hk_buffer_address storage0[2] = {{0}}, storage1[2] = {{0}};
+   struct hk_descriptor_set set0 = {
+      .base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET,
+      .layout = set_layout,
+      .mapped_ptr = storage0,
+      .addr = 0x390000,
+      .size = sizeof(storage0),
+   };
+   struct hk_descriptor_set set1 = {
+      .base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET,
+      .layout = set_layout,
+      .mapped_ptr = storage1,
+      .addr = 0x391000,
+      .size = sizeof(storage1),
+   };
+   struct vk_pipeline_layout pipe_layout = {
+      .base.type = VK_OBJECT_TYPE_PIPELINE_LAYOUT,
+      .set_layouts = { &set_layout->vk, &set_layout->vk },
+   };
+   VkDescriptorSet vk_sets[2] = {
+      hk_descriptor_set_to_handle(&set0),
+      hk_descriptor_set_to_handle(&set1),
+   };
+   VkBindDescriptorSetsInfoKHR bind_both = {
+      .sType = VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO_KHR,
+      .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+      .layout = vk_pipeline_layout_to_handle(&pipe_layout),
+      .firstSet = 0,
+      .descriptorSetCount = 2,
+      .pDescriptorSets = vk_sets,
+   };
+
+   /* Initial bind populates set_update_seq[] and uploads root. */
+   hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_both);
+   uint64_t root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   CHECK(root != 0);
+   hk_root_mark_clean(desc);
+   desc->sets_dirty = 0;
+
+   /* Rebinding unchanged sets on a combined-sampler FS must retain the root. */
+   uint64_t gen = desc->generation;
+   uint64_t rgen = desc->non_push_generation;
+   uint64_t noops = cmd->state.upload_stats.descriptor_noops;
+   hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_both);
+   CHECK(desc->generation == gen);
+   CHECK(desc->non_push_generation == rgen);
+   CHECK(!hk_root_dirty(desc) && !desc->sets_dirty);
+   CHECK(cmd->state.upload_stats.descriptor_noops == noops + 1);
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) == root);
+
+   /* Updating set 0 via vkUpdateDescriptorSets (even across multiple writes
+    * and elements) must advance update_seq once for the set and force root
+    * invalidation on the next bind, even with the same set handle. */
+   const VkDescriptorBufferInfo buf_infos[2] = {
+      {
+         .buffer = VK_NULL_HANDLE,
+         .offset = 0,
+         .range = VK_WHOLE_SIZE,
+      },
+      {
+         .buffer = VK_NULL_HANDLE,
+         .offset = 0,
+         .range = VK_WHOLE_SIZE,
+      },
+   };
+   const VkWriteDescriptorSet writes[2] = {
+      {
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = vk_sets[0],
+         .dstBinding = 0,
+         .dstArrayElement = 0,
+         .descriptorCount = 2,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .pBufferInfo = buf_infos,
+      },
+      {
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = vk_sets[0],
+         .dstBinding = 0,
+         .dstArrayElement = 1,
+         .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .pBufferInfo = &buf_infos[1],
+      },
+   };
+   const uint32_t seq_before = p_atomic_read(&set0.update_seq);
+   hk_UpdateDescriptorSets(vk_dev, ARRAY_SIZE(writes), writes, 0, NULL);
+   CHECK(p_atomic_read(&set0.update_seq) == seq_before + 1);
+
+   /* Rebinding only set 1 while set 0 was modified must still fail closed. */
+   VkBindDescriptorSetsInfoKHR bind_set1 = {
+      .sType = VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO_KHR,
+      .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+      .layout = vk_pipeline_layout_to_handle(&pipe_layout),
+      .firstSet = 1,
+      .descriptorSetCount = 1,
+      .pDescriptorSets = &vk_sets[1],
+   };
+   hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_set1);
+   CHECK(desc->generation == gen + 1);
+   CHECK(desc->non_push_generation == rgen + 1);
+   CHECK(hk_root_dirty(desc));
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) != root);
+
+   /* Rebinding set 0 picks up the new update_seq, invalidating once, after
+    * which an identical rebind retains the newly uploaded root again. */
+   hk_root_mark_clean(desc);
+   gen = desc->generation;
+   hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_both);
+   CHECK(desc->generation == gen + 1 && hk_root_dirty(desc));
+   root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   hk_root_mark_clean(desc);
+   desc->sets_dirty = 0;
+   gen = desc->generation;
+   hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_both);
+   CHECK(desc->generation == gen && !hk_root_dirty(desc));
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) == root);
+
+   /* Copy-update path must also bump update_seq once per set and invalidate
+    * retention. */
+   const VkCopyDescriptorSet copies[2] = {
+      {
+         .sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET,
+         .srcSet = vk_sets[1],
+         .srcBinding = 0,
+         .srcArrayElement = 0,
+         .dstSet = vk_sets[0],
+         .dstBinding = 0,
+         .dstArrayElement = 0,
+         .descriptorCount = 1,
+      },
+      {
+         .sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET,
+         .srcSet = vk_sets[1],
+         .srcBinding = 0,
+         .srcArrayElement = 1,
+         .dstSet = vk_sets[0],
+         .dstBinding = 0,
+         .dstArrayElement = 1,
+         .descriptorCount = 1,
+      },
+   };
+   const uint32_t seq_before_copy = p_atomic_read(&set0.update_seq);
+   hk_UpdateDescriptorSets(vk_dev, 0, NULL, ARRAY_SIZE(copies), copies);
+   CHECK(p_atomic_read(&set0.update_seq) == seq_before_copy + 1);
+   hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_both);
+   CHECK(desc->generation == gen + 1 && hk_root_dirty(desc));
+   root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   hk_root_mark_clean(desc);
+
+   /* Template-update path must also bump update_seq once and invalidate
+    * retention. */
+   union {
+      struct vk_descriptor_update_template tpl;
+      uint8_t storage[sizeof(struct vk_descriptor_update_template) +
+                      sizeof(struct vk_descriptor_template_entry)];
+   } tpl_mem;
+   memset(&tpl_mem, 0, sizeof(tpl_mem));
+   tpl_mem.tpl.base.type = VK_OBJECT_TYPE_DESCRIPTOR_UPDATE_TEMPLATE;
+   tpl_mem.tpl.entry_count = 1;
+   tpl_mem.tpl.entries[0] = (struct vk_descriptor_template_entry){
+      .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+      .binding = 0,
+      .array_element = 0,
+      .array_count = 2,
+      .offset = 0,
+      .stride = sizeof(buf_infos[0]),
+   };
+   gen = desc->generation;
+   const uint32_t seq_before_tpl = p_atomic_read(&set0.update_seq);
+   hk_UpdateDescriptorSetWithTemplate(
+      vk_dev, vk_sets[0],
+      vk_descriptor_update_template_to_handle(&tpl_mem.tpl), buf_infos);
+   CHECK(p_atomic_read(&set0.update_seq) == seq_before_tpl + 1);
+   hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_both);
+   CHECK(desc->generation == gen + 1 && hk_root_dirty(desc));
+   root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   hk_root_mark_clean(desc);
+
+   /* hk_CreateDescriptorSetLayout() precomputes has_update_after_bind; layouts
+    * permitting UPDATE_AFTER_BIND or UPDATE_UNUSED_WHILE_PENDING must fail
+    * closed and never retain roots even when update_seq has not changed. */
+   const VkDescriptorSetLayoutBinding ubo_binding = {
+      .binding = 0,
+      .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+      .descriptorCount = 2,
+      .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+   };
+   const struct {
+      VkDescriptorSetLayoutCreateFlags layout_flags;
+      VkDescriptorBindingFlags binding_flags;
+      bool expect_late;
+   } uab_cases[] = {
+      { 0, 0, false },
+      { VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT, 0, true },
+      { 0, VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT, true },
+      { 0, VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT, true },
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(uab_cases); ++i) {
+      const VkDescriptorSetLayoutBindingFlagsCreateInfo bf_info = {
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+         .bindingCount = 1,
+         .pBindingFlags = &uab_cases[i].binding_flags,
+      };
+      const VkDescriptorSetLayoutCreateInfo create_info = {
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+         .pNext = uab_cases[i].binding_flags ? &bf_info : NULL,
+         .flags = uab_cases[i].layout_flags,
+         .bindingCount = 1,
+         .pBindings = &ubo_binding,
+      };
+      VkDescriptorSetLayout vk_uab_layout = VK_NULL_HANDLE;
+      CHECK(hk_CreateDescriptorSetLayout(vk_dev, &create_info, NULL,
+                                         &vk_uab_layout) == VK_SUCCESS);
+      struct hk_descriptor_set_layout *uab_layout =
+         hk_descriptor_set_layout_from_handle(vk_uab_layout);
+      CHECK(uab_layout->has_update_after_bind == uab_cases[i].expect_late);
+      CHECK(hk_descriptor_set_layout_allows_update_after_bind(uab_layout) ==
+            uab_cases[i].expect_late);
+
+      set0.layout = uab_layout;
+      pipe_layout.set_layouts[0] = &uab_layout->vk;
+      hk_root_mark_clean(desc);
+      desc->sets_dirty = 0;
+      gen = desc->generation;
+      hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_both);
+      if (uab_cases[i].expect_late) {
+         CHECK(desc->generation == gen + 1 && hk_root_dirty(desc));
+      } else {
+         CHECK(desc->generation == gen && !hk_root_dirty(desc));
+      }
+      set0.layout = set_layout;
+      pipe_layout.set_layouts[0] = &set_layout->vk;
+      vk_descriptor_set_layout_unref(&f->dev.vk, &uab_layout->vk);
+   }
+
+   /* Meta begin/end must save and restore set 0's recorded set_update_seq[0]
+    * alongside desc->sets[0]: unchanged set 0 retains roots after meta end,
+    * while an update to set 0 during/after meta fails closed. */
+   vk_dynamic_graphics_state_init(&cmd->vk.dynamic_graphics_state);
+   cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
+   cmd->vk.dynamic_graphics_state.ms.sample_locations =
+      &cmd->state.gfx._dynamic_sl;
+   hk_root_mark_clean(desc);
+   desc->sets_dirty = 0;
+   struct hk_meta_save meta_save;
+   hk_meta_begin(cmd, &meta_save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   VkBindDescriptorSetsInfoKHR bind_meta_set0 = {
+      .sType = VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO_KHR,
+      .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+      .layout = vk_pipeline_layout_to_handle(&pipe_layout),
+      .firstSet = 0,
+      .descriptorSetCount = 1,
+      .pDescriptorSets = &vk_sets[1],
+   };
+   hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_meta_set0);
+   CHECK(desc->sets[0] == &set1);
+   hk_meta_end(cmd, &meta_save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   CHECK(desc->sets[0] == &set0);
+   CHECK(desc->set_update_seq[0] == p_atomic_read(&set0.update_seq));
+   root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   hk_root_mark_clean(desc);
+   desc->sets_dirty = 0;
+   gen = desc->generation;
+   hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_both);
+   CHECK(desc->generation == gen && !hk_root_dirty(desc));
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) == root);
+
+   const uint32_t seq_before_meta = p_atomic_read(&set0.update_seq);
+   hk_meta_begin(cmd, &meta_save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_meta_set0);
+   hk_UpdateDescriptorSets(vk_dev, 1, &writes[0], 0, NULL);
+   CHECK(p_atomic_read(&set0.update_seq) == seq_before_meta + 1);
+   hk_meta_end(cmd, &meta_save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   CHECK(desc->sets[0] == &set0);
+   CHECK(desc->set_update_seq[0] == seq_before_meta);
+   hk_root_mark_clean(desc);
+   desc->sets_dirty = 0;
+   gen = desc->generation;
+   hk_CmdBindDescriptorSets2KHR(vk_cb, &bind_set1);
+   CHECK(desc->generation == gen + 1 && hk_root_dirty(desc));
+
+   f->fs_api->variants[0].info.agx3_combined_sampler_valid = false;
+   reset(f);
+}
+
 static uint64_t
 now_ns(void)
 {
@@ -865,6 +1195,7 @@ main(int argc, char **argv)
    reuse_correctness(f);
    vertex_input_elision_correctness(f);
    xfer_clean_isolation_correctness(f);
+   combined_sampler_retention_correctness(f);
    run(f, "identical", 16, batches);
    run(f, "change_every_4", 4, batches);
    run(f, "change_every_draw", 1, batches);
