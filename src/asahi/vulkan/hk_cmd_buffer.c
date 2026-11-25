@@ -2476,13 +2476,15 @@ hk_g17p_basic_graphics_program_supported(struct hk_cmd_buffer *cmd,
       (s->b.info.stage == MESA_SHADER_VERTEX ||
        s->info.stage == MESA_SHADER_FRAGMENT) &&
       hk_g17p_native_cprog_qualified(&s->b.info);
+   const uint32_t max_scratch_B = hk_graphics_max_scratch_B(
+      &hk_cmd_buffer_device(cmd)->dev, s->b.info.stage);
    if (!linked || !linked->b.bo || !linked->b.bo->va || linked->b.size == 0 ||
        linked->b.size > UINT32_MAX || (s->b.info.has_preamble && !native_preamble) ||
        MAX2(s->b.info.scratch_size, s->b.info.agx3_spectpr_scratch_size) >
-          AGX3_G17P_MAX_SPILL_B ||
+          max_scratch_B ||
        (s->b.info.preamble_scratch_size != 0 && !native_preamble) ||
        MAX2(linked->b.scratch_size, linked->b.agx3_spectpr_scratch_size) >
-          AGX3_G17P_MAX_SPILL_B ||
+          max_scratch_B ||
        s->b.info.texture_state_count != 0 ||
        (s->b.info.sampler_state_count != 0 &&
         !(s->info.agx3_indexed_sampler_valid &&

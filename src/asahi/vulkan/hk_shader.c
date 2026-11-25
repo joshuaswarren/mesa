@@ -219,6 +219,19 @@ hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
           hk_fs_structure_key_bits();
 }
 
+uint32_t
+hk_graphics_max_scratch_B(const struct agx_device *dev, mesa_shader_stage stage)
+{
+   /* HAL300 hardware vertex programs publish their linked TPS footprint in
+    * render resources. This includes the vertex replay of a geometry shader.
+    */
+   if (stage == MESA_SHADER_VERTEX && agx_chip_g17_m5(dev->chip) &&
+       (dev->params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES))
+      return 2u * AGX_NUM_MODELED_REGS;
+
+   return AGX3_G17P_MAX_SPILL_B;
+}
+
 const nir_shader_compiler_options *
 hk_get_nir_options(struct vk_physical_device *vk_pdev, mesa_shader_stage stage,
                    UNUSED const struct vk_pipeline_robustness_state *rs)
@@ -6252,21 +6265,21 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    const bool relocatable_uvs = hw && nir->info.stage == MESA_SHADER_VERTEX &&
                                 shader->info.uvs.relocatable;
-   /* Match the driver's real CDM vs graphics TPS spill admission ceiling so
-    * RA only expands beyond 4 KiB on stages/chips whose dispatch path can
-    * admit the resulting frame (G15/G16/G17P CDM up to 256 KiB, M5 CDM up to
-    * 64 KiB; graphics VDM/PPP and internal helpers remain capped at 4 KiB). */
+   /* CDM has its own TPS admission limits. Hardware graphics programs
+    * use the same ceiling here and when the linked shader is launched. */
    const bool cdm_stage =
       nir->info.stage == MESA_SHADER_COMPUTE ||
       nir->info.stage == MESA_SHADER_GEOMETRY ||
       nir->info.stage == MESA_SHADER_TESS_CTRL;
-   const uint32_t max_scratch_B =
-      (!cdm_stage || nir->info.internal)
-         ? AGX3_G17P_MAX_SPILL_B
-         : (agx_chip_native_agx3(dev->dev.chip)
-               ? AGX3_G17P_MAX_COMPUTE_SPILL_B
-               : (agx_chip_g17_m5(dev->dev.chip) ? (1u << 16)
-                                                 : AGX3_G17P_MAX_SPILL_B));
+   uint32_t max_scratch_B = AGX3_G17P_MAX_SPILL_B;
+   if (!nir->info.internal) {
+      if (cdm_stage && agx_chip_native_agx3(dev->dev.chip))
+         max_scratch_B = AGX3_G17P_MAX_COMPUTE_SPILL_B;
+      else if (cdm_stage && agx_chip_g17_m5(dev->dev.chip))
+         max_scratch_B = 1u << 16;
+      else if (hw)
+         max_scratch_B = hk_graphics_max_scratch_B(&dev->dev, nir->info.stage);
+   }
    struct agx_shader_key backend_key = {
       .reserved_preamble = root + (4 * (1 + set_count)),
       .g17p_texture_uniform_base = texture_uniform_base,

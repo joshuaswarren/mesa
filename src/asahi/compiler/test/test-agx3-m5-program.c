@@ -78,10 +78,10 @@ test_g17g_programs(enum agx_chip chip)
             CHECK(memcmp(wide_output.bytes + 18, expected_spectpr[i], 10) == 0);
          }
       }
-      const uint32_t scratch_bytes[] = {4, 272, 400, 528, 1040, 262140};
+      const uint32_t scratch_bytes[] = {4, 272, 400, 528, 1040, 8192, 262140};
       const uint8_t scratch_fields[][4] = {
          {1, 0, 1, 0}, {68, 0, 68, 0}, {100, 0, 100, 0},
-         {132, 0, 132, 0}, {4, 1, 4, 1}, {255, 255, 255, 255},
+         {132, 0, 132, 0}, {4, 1, 4, 1}, {0, 8, 0, 8}, {255, 255, 255, 255},
       };
       for (unsigned i = 0; i < ARRAY_SIZE(scratch_bytes); ++i) {
          struct agx3_g17p_graphics_program_desc spill = desc;
