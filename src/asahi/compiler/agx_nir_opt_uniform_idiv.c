@@ -103,11 +103,7 @@ lower_divmod_scalar(nir_builder *b, nir_op op, nir_def *n, nir_def *d)
  * (e.g. load_workgroup_id, non-readonly SSBOs, shared loads, subgroup ops,
  * loop phis) return false so we never leave the reciprocal calculation in
  * the main shader body. Checking movability directly also avoids calling
- * nir_divergence_analysis before backend/poly intrinsics are lowered.
- *
- * Before shader I/O lowering, push constants and UBOs are still deref loads.
- * They count as the load_push_constant and load_ubo they lower to, so
- * preprocessing can predict which divisions this pass will take. */
+ * nir_divergence_analysis before backend/poly intrinsics are lowered. */
 static bool
 is_preamble_movable(nir_def *def, struct hash_table *cache, unsigned depth)
 {
@@ -163,19 +159,6 @@ is_preamble_movable(nir_def *def, struct hash_table *cache, unsigned depth)
          }
          break;
       }
-      case nir_intrinsic_load_deref: {
-         nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
-         ok = nir_deref_mode_must_be(deref, nir_var_mem_push_const |
-                                               nir_var_mem_ubo);
-         for (; ok && deref->deref_type != nir_deref_type_var;
-              deref = nir_deref_instr_parent(deref)) {
-            if (deref->deref_type == nir_deref_type_array)
-               ok = is_preamble_movable(deref->arr.index.ssa, cache, depth - 1);
-            else
-               ok = deref->deref_type == nir_deref_type_struct;
-         }
-         break;
-      }
       default:
          ok = false;
          break;
@@ -195,8 +178,8 @@ is_preamble_movable(nir_def *def, struct hash_table *cache, unsigned depth)
  * divisor. Constant divisors are handled by nir_opt_idiv_const, and
  * preamble-movable/preamble-movable divisions hoist directly to @preamble.
  * The cache must be private to a single shader. */
-bool
-agx_nir_uniform_idiv_applies(nir_alu_instr *alu, struct hash_table *cache)
+static bool
+uniform_idiv_applies(nir_alu_instr *alu, struct hash_table *cache)
 {
    return !nir_src_is_const(alu->src[1].src) &&
           is_preamble_movable(alu->src[1].src.ssa, cache, 32) &&
@@ -222,7 +205,7 @@ lower_uniform_idiv_instr(nir_builder *b, nir_alu_instr *alu, void *data)
       return false;
    }
 
-   if (!agx_nir_uniform_idiv_applies(alu, cache))
+   if (!uniform_idiv_applies(alu, cache))
       return false;
 
    b->cursor = nir_before_instr(&alu->instr);

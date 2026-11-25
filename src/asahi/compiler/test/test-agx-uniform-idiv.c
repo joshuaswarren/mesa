@@ -296,8 +296,9 @@ check_lowering_follows_preamble(void)
 }
 
 /* Borealis loads push constants through a push-constant variable until it
- * lowers shader I/O, after preprocessing: preprocessing must leave such a
- * division for the compile step, which then sees load_push_constant. */
+ * lowers shader I/O, after preprocessing. Preprocessing rewrites a signed
+ * division with a nonnegative dividend to udiv; the compile step, which then
+ * sees load_push_constant, must give it the exact reciprocal. */
 static void
 check_push_constant_survives_preprocess(void)
 {
@@ -314,9 +315,10 @@ check_push_constant_survives_preprocess(void)
    nir_store_global(&b, nir_idiv(&b, lid, div), nir_imm_int64(&b, 0x1000));
 
    agx_preprocess_nir_native(b.shader, AGX_CHIP_G17P);
-   if (count_op(b.shader, nir_op_idiv) != 1) {
-      fprintf(stderr, "FAIL: preprocessing lowered a push-constant division "
-                      "before the key could choose its lowering\n");
+   if (count_op(b.shader, nir_op_idiv) != 0 ||
+       count_op(b.shader, nir_op_udiv) != 1) {
+      fprintf(stderr, "FAIL: preprocessing did not leave one udiv by the "
+                      "push constant for the key to lower\n");
       exit(1);
    }
 
@@ -324,7 +326,7 @@ check_push_constant_survives_preprocess(void)
    NIR_PASS(_, b.shader, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
    agx_nir_lower_integer_division(b.shader, true);
-   if (count_op(b.shader, nir_op_idiv) != 0 ||
+   if (count_op(b.shader, nir_op_udiv) != 0 ||
        count_op(b.shader, nir_op_umax) == 0) {
       fprintf(stderr, "FAIL: the lowered push-constant divisor did not get "
                       "the exact reciprocal\n");
