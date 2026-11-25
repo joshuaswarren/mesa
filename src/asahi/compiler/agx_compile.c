@@ -14765,12 +14765,11 @@ m5_lower_predicated_load(nir_builder *b, nir_intrinsic_instr *intr,
 
 
 static bool
-agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
+agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
                          struct agx_shader_key *key,
                          struct util_dynarray *binary,
                          struct agx_shader_info *out, unsigned *offset_out,
-                         unsigned ra_budget_cut, bool disable_remat, bool *retry_without_remat,
-                         bool agx3_reg_float_consts)
+                         unsigned ra_budget_cut, bool agx3_reg_float_consts)
 {
    const unsigned initial_binary_size = binary->size;
    const struct agx_shader_info initial_out = *out;
@@ -15126,24 +15125,13 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
    /* Record provenance before RA can create stack instructions. */
    const bool imports_only_before_ra = agx3_cprog_spill_provenance(ctx);
-   if (disable_remat)
-      agx_ra_without_remat(ctx);
-   else
-      agx_ra(ctx);
+   agx_ra(ctx);
 
    /* A failed allocation is refused and retried below; its AIR is not a
     * program to validate (agx_validate exits on it). */
    if (!ctx->ra_failed)
-      agx_validate(ctx, disable_remat ? "agx_ra_without_remat" : "agx_ra");
+      agx_validate(ctx, "agx_ra");
 
-   /* The occupancy rematerialization attempt has already modified AIR.
-    * Discard the entire context; changing its budget cannot undo spills. */
-   if (retry_without_remat && ctx->remat_fallback_spilled) {
-      *retry_without_remat = true;
-      binary->size = initial_binary_size;
-      ralloc_free(ctx);
-      return false;
-   }
    if (ctx->ra_failed) {
       /* Spilling only targets total demand; pinned values can still leave the
        * shuffle no room. Recompile with an ever smaller spill budget unless
@@ -15155,10 +15143,9 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
          binary->size = initial_binary_size;
          /* Constant promotion and others accumulate into out. */
          *out = initial_out;
-         return agx_compile_function_nir_attempt(
+         return agx_compile_function_nir(
             nir, impl, key, binary, out, offset_out,
-            ra_budget_cut ? ra_budget_cut * 2 : 16, disable_remat,
-            retry_without_remat, agx3_reg_float_consts);
+            ra_budget_cut ? ra_budget_cut * 2 : 16, agx3_reg_float_consts);
       }
       agx_set_refusal(ctx, "register allocation found no legal placement",
                       __LINE__);
@@ -16055,61 +16042,6 @@ agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
    }
 
    ralloc_free(memctx);
-}
-
-/* Retry eligible preambles without changing scratch admission or launch rules. */
-static bool
-agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
-                         struct agx_shader_key *key,
-                         struct util_dynarray *binary,
-                         struct agx_shader_info *out, unsigned *offset_out,
-                         bool agx3_reg_float_consts)
-{
-   const bool eligible =
-      impl->function->is_preamble && nir->info.stage == MESA_SHADER_FRAGMENT &&
-      key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-      (key->g17p_native_uniforms || key->agx3_native_cprog) &&
-      debug_get_bool_option("ASAHI_M5_CPROG_REMAT_RETRY", true);
-   if (!eligible)
-      return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                             offset_out, 0, false, NULL,
-                                             agx3_reg_float_consts);
-
-   /* Preserve all compiler-owned state, including earlier main code/rodata.
-    * The first attempt owns a deep NIR clone and a fresh AIR context. */
-   nir_shader *attempt = nir_shader_clone(NULL, nir);
-   if (!attempt)
-      return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                             offset_out, 0, false, NULL,
-                                             agx3_reg_float_consts);
-
-   nir_function_impl *attempt_impl = NULL;
-   nir_foreach_function_with_impl(func, candidate, attempt) {
-      if (func->is_preamble) {
-         assert(attempt_impl == NULL);
-         attempt_impl = candidate;
-      }
-   }
-   assert(attempt_impl != NULL);
-   const struct agx_shader_info saved_info = *out;
-   const struct agx_shader_key saved_key = *key;
-   const size_t saved_size = binary->size;
-   bool retry = false;
-   bool success = agx_compile_function_nir_attempt(
-      attempt, attempt_impl, key, binary, out, offset_out, 0, false, &retry,
-      agx3_reg_float_consts);
-   ralloc_free(attempt);
-   if (!retry)
-      return success;
-
-   assert(!success && binary->size == saved_size);
-   *out = saved_info;
-   *key = saved_key;
-   binary->size = saved_size;
-   /* Exactly one retry. Real full-budget spills retain the old refusal. */
-   return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                          offset_out, 0, true, NULL,
-                                          agx3_reg_float_consts);
 }
 
 /*
@@ -19363,7 +19295,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       const struct agx_shader_key saved_key = *key;
       const unsigned saved_size = binary.size;
       bool compiled = agx_compile_function_nir(nir, impl, key, &binary,
-                                               &out->info, &offset, false);
+                                               &out->info, &offset, 0, false);
 
       /* The G17G packer refuses shapes it has no grounded encoding for and
        * rolls the binary back. Most refusals in real clients (Skia/ANGLE)
@@ -19376,7 +19308,7 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          *key = saved_key;
          binary.size = saved_size;
          compiled = agx_compile_function_nir(nir, impl, key, &binary,
-                                             &out->info, &offset, true);
+                                             &out->info, &offset, 0, true);
       }
 
       if (!compiled) {
