@@ -16501,6 +16501,23 @@ agx3_uniform_dma_offset(nir_intrinsic_instr *intr, unsigned *size_B)
    return offset_B;
 }
 
+/* A PREGFX dispatch can run even if every indirect draw is empty. The
+ * root table itself is resident then, but addresses obtained from it can
+ * name unused descriptors or application memory. Prove each load directly
+ * against the root allocation, including the last byte of a vector load. */
+static bool
+agx3_preamble_load_within_root(const struct agx_shader_key *key,
+                               nir_intrinsic_instr *intr)
+{
+   if (agx3_uniform_dma_pointer(key, intr->src[0].ssa, 0) != key->g17p_dma_root ||
+       nir_is_coherent(intr))
+      return false;
+
+   unsigned size_B;
+   const int64_t offset_B = agx3_uniform_dma_offset(intr, &size_B);
+   return offset_B >= 0 && offset_B + size_B <= key->preamble_root_size_B;
+}
+
 /* Fill in a candidate whose address is a buffer descriptor's: the 64-bit
  * pack of two adjacent words of one constant-offset load through the root
  * table (a dynamic buffer descriptor) or a static set. */
@@ -18864,11 +18881,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
                      break;
                   }
                   case nir_intrinsic_load_constant_agx:
-                  case nir_intrinsic_load_agx:
-                  case nir_intrinsic_load_global:
-                  case nir_intrinsic_load_global_constant:
-                  case nir_intrinsic_load_global_constant_offset:
-                  case nir_intrinsic_load_global_constant_bounded:
+                     ok = agx3_preamble_load_within_root(key, intr);
+                     break;
                   case nir_intrinsic_as_uniform:
                   case nir_intrinsic_convert_alu_types:
                      break;

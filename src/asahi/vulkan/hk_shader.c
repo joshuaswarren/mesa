@@ -6400,6 +6400,9 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
         (fs_dma || vs_dma || (cs_dma && m5_compute_cprog)))) {
       backend_key.g17p_uniform_dma = true;
       backend_key.g17p_dma_root = root;
+      if (vs_dma)
+         backend_key.preamble_root_size_B = shader->root_descriptor_size
+            ? shader->root_descriptor_size : sizeof(struct hk_root_descriptor_table);
       backend_key.g17p_dma_set_mask =
          (uint8_t)BITFIELD_MASK(MIN2(set_count, 8));
       backend_key.g17p_dma_static_set_mask =

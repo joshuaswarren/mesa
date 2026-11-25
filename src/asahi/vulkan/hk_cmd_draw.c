@@ -16430,9 +16430,10 @@ hk_agx3_draw_indirect_gpu(struct hk_cmd_buffer *cmd, uint64_t in,
 
       const struct agx_vdm_state_update *upd =
          &gfx->g17p_vdm_update_memo.encoded;
+      const struct agx_vdm_state_update_program_info *program =
+         hk_hw_vs_vdm_state_update(hw_vs, memo->hoisted_preamble);
       vdm_pipeline_raw_template =
-         hw_vs->agx3_vdm_state_update.template_info.raw_state_load_count_18
-         << 3;
+         program->template_info.raw_state_load_count_18 << 3;
       struct agx_vdm_state_vertex_pipeline_pair expected_pair;
       if (upd->length != AGX_VDM_STATE_UPDATE_LENGTH ||
           vdm_pos + upd->length > sizeof(vdm_tmpl) ||
@@ -17371,8 +17372,19 @@ hk_draw_indirect_count(VkCommandBuffer commandBuffer, VkBuffer _buffer,
                                   out_stride);
    hk_xfer_check_draw(cmd, count_addr, count_addr + sizeof(uint32_t));
 
-   if (hk_agx3_draw_indirect_gpu(cmd, in, count_addr, maxDrawCount, stride,
-                                 indexed))
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   const bool saved_hoist = gfx->g17p_hoist_preamble_requested;
+   const uint64_t saved_preamble = gfx->g17p_hoisted_preamble_va;
+   if (agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) &&
+       maxDrawCount >= HK_PREAMBLE_HOIST_MIN_DRAWS)
+      gfx->g17p_hoist_preamble_requested = true;
+
+   const bool built_on_gpu =
+      hk_agx3_draw_indirect_gpu(cmd, in, count_addr, maxDrawCount, stride,
+                               indexed);
+   gfx->g17p_hoist_preamble_requested = saved_hoist;
+   gfx->g17p_hoisted_preamble_va = saved_preamble;
+   if (built_on_gpu)
       return;
 
    /* Draws the GPU builder does not take, and every chip it does not cover,
