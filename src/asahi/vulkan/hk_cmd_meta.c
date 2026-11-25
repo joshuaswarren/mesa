@@ -96,12 +96,12 @@ hk_device_init_meta(struct hk_device *dev)
    dev->meta.use_combined_blit_descriptors =
       agx_chip_native_agx3(dev->dev.chip);
    dev->meta.use_masked_rgba8_buffer_unpack =
-      agx_chip_native_or_m5(dev->dev.chip);
+      agx_chip_agx3_path(dev->dev.chip);
    dev->meta.use_rect_list_pipeline = true;
    dev->meta.cmd_bind_map_buffer = hk_cmd_bind_map_buffer;
    dev->meta.max_bind_map_buffer_size_B = 64 * 1024;
    dev->meta.buffer_access.max_fill_chunk_size =
-      agx_chip_native_or_m5(dev->dev.chip) ? 16 : 0;
+      agx_chip_agx3_path(dev->dev.chip) ? 16 : 0;
 
    for (unsigned i = 0; i < VK_META_BUFFER_CHUNK_SIZE_COUNT; ++i) {
       dev->meta.buffer_access.optimal_wg_size[i] = 64;
@@ -3877,7 +3877,7 @@ hk_g17p_copy_buffer_to_image_supported(
 static bool
 hk_g17p_block_copy_format(struct hk_device *dev, VkFormat format)
 {
-   if (!dev || !agx_chip_native_or_m5(dev->dev.chip))
+   if (!dev || !agx_chip_agx3_path(dev->dev.chip))
       return false;
 
    switch (hk_g17p_block_format_family(format)) {
@@ -4157,7 +4157,7 @@ hk_g17p_copy_padded_rgb_buffer_image(
    VkImageLayout image_layout, bool to_image)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_chip_native_or_m5(dev->dev.chip) ||
+   if (!agx_chip_agx3_path(dev->dev.chip) ||
        region_count == 0 ||
        image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
        (image_layout != (to_image ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
@@ -4452,7 +4452,7 @@ hk_g17p_tiled_upload_shape(const struct hk_device *dev, bool dest_tiled,
                            struct hk_g17p_tiled_upload_key *key,
                            uint32_t groups[3])
 {
-   if (!agx_chip_g17p_or_m5(dev->dev.chip) || !dest_tiled || !plan->width_el ||
+   if (!agx_chip_agx3_path(dev->dev.chip) || !dest_tiled || !plan->width_el ||
        !plan->height_el)
       return false;
 
@@ -4553,7 +4553,7 @@ hk_g17p_copy_uncompressed_buffer_to_image_supported(
    struct hk_device *dev, const struct hk_buffer *buffer,
    const struct hk_image *image, const VkCopyBufferToImageInfo2 *info)
 {
-   if (!agx_chip_native_or_m5(dev->dev.chip) || info->regionCount == 0)
+   if (!agx_chip_agx3_path(dev->dev.chip) || info->regionCount == 0)
       return false;
 
    for (uint32_t r = 0; r < info->regionCount; ++r) {
@@ -5367,7 +5367,7 @@ hk_g17p_raw_image_copy_supported(struct hk_device *dev,
                                  const struct hk_image *dst,
                                  const VkCopyImageInfo2 *info)
 {
-   if (!agx_chip_native_or_m5(dev->dev.chip) ||
+   if (!agx_chip_agx3_path(dev->dev.chip) ||
        info->regionCount == 0 ||
        src->vk.samples != dst->vk.samples ||
        (src->vk.samples != VK_SAMPLE_COUNT_1_BIT &&
@@ -5596,9 +5596,9 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_image, dst_image, pCopyBufferToImageInfo->dstImage);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   /* Share the native raw tiled upload with M5. It preserves partial
-    * rectangles without an imageblock round trip or extra firmware job. */
-   if (agx_chip_g17_m5(dev->dev.chip) &&
+   /* Share the native raw tiled upload across HAL300 chips. It preserves
+    * partial rectangles without an imageblock round trip or extra firmware job. */
+   if (agx_chip_hal300_path(dev->dev.chip) &&
        hk_g17p_copy_uncompressed_buffer_to_image_supported(
           dev, src_buffer, dst_image, pCopyBufferToImageInfo)) {
       struct hk_meta_save save;
@@ -5621,12 +5621,8 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
       return;
    }
 
-   /* On G18G the compute upload's bindless image store compiled but wrote
-    * nothing when tested (with the 64-byte storage-image descriptor; the
-    * cause was not isolated). Its draws work, so upload through the common
-    * graphics copy. */
-   bool gfx = hk_copy_requires_gfx(dst_image) || dev->dev.chip == AGX_CHIP_G18G;
-   if (agx_chip_native_or_m5(dev->dev.chip)) {
+   bool gfx = hk_copy_requires_gfx(dst_image);
+   if (agx_chip_agx3_path(dev->dev.chip)) {
       uint8_t plane;
       VkFormat format;
       uint32_t api_block_B, physical_block_B;
@@ -5705,7 +5701,7 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
        * integer alias image copies and readbacks use: through its own
        * format, a normalized view would canonicalize the bits it copies
        * (SNORM -1.0 has two encodings). */
-      const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+      const bool m5 = agx_chip_hal300_path(dev->dev.chip);
       const bool m5_split_zs =
          m5 && hk_split_depth_stencil(dst_image->vk.format);
       const bool m5_color =
@@ -5801,7 +5797,7 @@ hk_xfer_copyimagetobuffer2(VkCommandBuffer commandBuffer,
    VkFormat format;
    uint32_t api_block_B, physical_block_B;
    const bool padded_rgb =
-      agx_chip_native_or_m5(dev->dev.chip) &&
+      agx_chip_agx3_path(dev->dev.chip) &&
       pCopyImageToBufferInfo->regionCount > 0 &&
       hk_g17p_buffer_upload_plane(
          src_image,
@@ -5862,11 +5858,11 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    hk_meta_begin(cmd, &save, bind_point);
 
    if (gfx) {
-      const bool native = agx_chip_native_or_m5(dev->dev.chip);
+      const bool native = agx_chip_agx3_path(dev->dev.chip);
       /* Both sides of a depth/stencil copy use the same views: per-plane
        * aliases when either depth plane is compressed. */
       const bool zs_planes =
-         agx_chip_g17_m5(dev->dev.chip) ||
+         agx_chip_hal300_path(dev->dev.chip) ||
          (hk_split_depth_stencil(src_image->vk.format) &&
           (src_image->planes[0].layout.compressed ||
            dst_image->planes[0].layout.compressed));
@@ -5875,7 +5871,7 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
       struct vk_meta_copy_image_properties dst_props =
          hk_meta_copy_get_image_properties(dst_image, dev, native, zs_planes);
 
-      const bool compressed_depth_array = agx_chip_g17_m5(dev->dev.chip) &&
+      const bool compressed_depth_array = agx_chip_hal300_path(dev->dev.chip) &&
          vk_format_is_depth_or_stencil(dst_image->vk.format) &&
          dst_image->vk.array_layers > 1 && dst_image->planes[0].layout.compressed;
       if (agx_chip_native_agx3(dev->dev.chip) || compressed_depth_array) {

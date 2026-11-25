@@ -197,7 +197,7 @@ hk_g17p_compressed_copy_plan(
       memset(plan, 0, sizeof(*plan));
 
    if (!copy || !plan ||
-       !agx_chip_native_or_m5(copy->chip) ||
+       !agx_chip_agx3_path(copy->chip) ||
        hk_g17p_block_format_family(copy->format) ==
           HK_G17P_BLOCK_FORMAT_NONE ||
        !(image_is_source
@@ -471,7 +471,7 @@ hk_g17p_buffer_to_image_copy_supported(
    const bool one_dimensional =
       copy && copy->image_type == VK_IMAGE_TYPE_1D;
    const bool volume = copy && copy->image_type == VK_IMAGE_TYPE_3D;
-   if (!copy || !agx_chip_native_or_m5(copy->chip) ||
+   if (!copy || !agx_chip_agx3_path(copy->chip) ||
        !hk_g17p_transfer_dst_layout_supported(copy->layout) ||
        (!one_dimensional && copy->image_type != VK_IMAGE_TYPE_2D && !volume) ||
        copy->samples != VK_SAMPLE_COUNT_1_BIT ||
@@ -548,7 +548,7 @@ hk_g17p_buffer_to_image_copy_supported(
                          copy->format == VK_FORMAT_D16_UNORM_S8_UINT;
       if (copy->plane_count != (split ? 2 : 1) ||
           copy->image_type != VK_IMAGE_TYPE_2D || copy->mip_levels != 1 ||
-          (copy->array_layers != 1 && !agx_chip_native_or_m5(copy->chip)))
+          (copy->array_layers != 1 && !agx_chip_agx3_path(copy->chip)))
          return false;
       plane_format = (copy->format == VK_FORMAT_D32_SFLOAT ||
                       copy->format == VK_FORMAT_D32_SFLOAT_S8_UINT)
@@ -561,7 +561,7 @@ hk_g17p_buffer_to_image_copy_supported(
        * bit-compatible R8_UINT view, in the same single-level 2D shapes. */
       if (copy->plane_count != 2 || copy->image_type != VK_IMAGE_TYPE_2D ||
           copy->mip_levels != 1 ||
-          (copy->array_layers != 1 && !agx_chip_native_or_m5(copy->chip)))
+          (copy->array_layers != 1 && !agx_chip_agx3_path(copy->chip)))
          return false;
       plane_format = VK_FORMAT_R8_UINT;
    } else if (copy->plane_count != 1 ||
@@ -644,7 +644,7 @@ hk_g17p_image_copy_slice(enum agx_chip chip, VkImageType src_type,
    const bool two_d_three_d = (src_1d_or_2d && dst_3d) ||
                               (dst_1d_or_2d && src_3d);
    const bool valid_pair = same_type || one_d_two_d || two_d_three_d;
-   if (!agx_chip_native_or_m5(chip) ||
+   if (!agx_chip_agx3_path(chip) ||
        !region || !out || !valid_types ||
        !valid_pair || src_layers == 0 ||
        src_layers != dst_layers || slice >= src_layers ||
