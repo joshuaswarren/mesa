@@ -207,6 +207,18 @@ bool hk_g17p_image_blit_slice(enum agx_chip chip, VkImageType src_type,
                               const VkImageBlit2 *region, uint32_t slice,
                               VkImageBlit2 *out);
 
+/* Convert one 2D array slice of a valid resolve region into a single-layer
+ * region. HAL200 writes compressed arrays one layer at a time (the BG/EOT
+ * contract is single-layer), and the generic vk_meta_resolve_image path
+ * otherwise reaches a compressed array through a layered render pass. The
+ * resolved source/destination layer counts must match, and the layer count
+ * must be at least one. */
+bool hk_g17p_image_resolve_slice(enum agx_chip chip, VkImageType src_type,
+                                 VkImageType dst_type, uint32_t src_layers,
+                                 uint32_t dst_layers,
+                                 const VkImageResolve2 *region, uint32_t slice,
+                                 VkImageResolve2 *out);
+
 /* One destination coordinate's exact G17P linear-filter footprint.  The low
  * half is the lower source coordinate and bits 16..23 are the Q8 upper-texel
  * weight.  A carried weight of 256 is normalized to the following source
