@@ -13,6 +13,7 @@
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
+#include "vk_common_entrypoints.h"
 #include "vk_pipeline_layout.h"
 
 #define CHECK(c) do { if (!(c)) { \
@@ -375,6 +376,219 @@ reuse_correctness(struct fixture *f)
    CHECK(!cmd->used_group_count_cache);
 }
 
+static void
+vertex_input_elision_correctness(struct fixture *f)
+{
+   struct hk_cmd_buffer *cmd = &f->cmd;
+   VkCommandBuffer vk_cb = hk_cmd_buffer_to_handle(cmd);
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+
+   reset(f);
+   vk_dynamic_graphics_state_init(dyn);
+   dyn->vi = &cmd->state.gfx._dynamic_vi;
+   memset(dyn->vi, 0, sizeof(*dyn->vi));
+
+   /* First-time empty call must not elide even though _dynamic_vi is zeroed. */
+   vk_common_CmdSetVertexInputEXT(vk_cb, 0, NULL, 0, NULL);
+   CHECK(BITSET_TEST(dyn->set, MESA_VK_DYNAMIC_VI));
+   CHECK(BITSET_TEST(dyn->set, MESA_VK_DYNAMIC_VI_BINDINGS_VALID));
+   CHECK(BITSET_TEST(dyn->set, MESA_VK_DYNAMIC_VI_BINDING_STRIDES));
+   CHECK(BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI));
+   CHECK(BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDING_STRIDES));
+   CHECK(dyn->generation > 0);
+
+   /* Identical empty call after clearing dirty must elide cleanly. */
+   vk_dynamic_graphics_state_clear_dirty(dyn);
+   BITSET_ZERO(dyn->changed_since_pipeline_bind);
+   uint64_t gen = dyn->generation;
+   vk_common_CmdSetVertexInputEXT(vk_cb, 0, NULL, 0, NULL);
+   CHECK(dyn->generation == gen);
+   CHECK(!BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI));
+   CHECK(!BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDING_STRIDES));
+   CHECK(!BITSET_TEST(dyn->changed_since_pipeline_bind, MESA_VK_DYNAMIC_VI));
+
+   const VkVertexInputBindingDescription2EXT bindings[2] = {
+      {
+         .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+         .binding = 0,
+         .stride = 16,
+         .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+         .divisor = 1,
+      },
+      {
+         .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+         .binding = 2,
+         .stride = 32,
+         .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE,
+         .divisor = 4,
+      },
+   };
+   const VkVertexInputAttributeDescription2EXT attrs[2] = {
+      {
+         .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+         .location = 0,
+         .binding = 0,
+         .format = VK_FORMAT_R32G32B32_SFLOAT,
+         .offset = 0,
+      },
+      {
+         .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+         .location = 3,
+         .binding = 2,
+         .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+         .offset = 16,
+      },
+   };
+
+   vk_common_CmdSetVertexInputEXT(vk_cb, 2, bindings, 2, attrs);
+   CHECK(dyn->generation > gen);
+   CHECK(BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI));
+   CHECK(BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDING_STRIDES));
+   CHECK(dyn->vi->bindings_valid == (BITFIELD_BIT(0) | BITFIELD_BIT(2)));
+   CHECK(dyn->vi->attributes_valid == (BITFIELD_BIT(0) | BITFIELD_BIT(3)));
+   CHECK(dyn->vi_binding_strides[0] == 16 && dyn->vi_binding_strides[2] == 32);
+
+   /* Identical state in reversed array order must also elide. */
+   const VkVertexInputBindingDescription2EXT bindings_rev[2] = {
+      bindings[1], bindings[0],
+   };
+   const VkVertexInputAttributeDescription2EXT attrs_rev[2] = {
+      attrs[1], attrs[0],
+   };
+   vk_dynamic_graphics_state_clear_dirty(dyn);
+   BITSET_ZERO(dyn->changed_since_pipeline_bind);
+   gen = dyn->generation;
+   vk_common_CmdSetVertexInputEXT(vk_cb, 2, bindings_rev, 2, attrs_rev);
+   CHECK(dyn->generation == gen);
+   CHECK(!BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI));
+   CHECK(!BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDING_STRIDES));
+   CHECK(!BITSET_TEST(dyn->changed_since_pipeline_bind, MESA_VK_DYNAMIC_VI));
+
+   /* A dynamic stride override via CmdBindVertexBuffers2 must not be elided
+    * when CmdSetVertexInputEXT restores the original stride. */
+   const VkDeviceSize new_stride = 64;
+   vk_cmd_set_vertex_binding_strides(&cmd->vk, 0, 1, &new_stride);
+   CHECK(dyn->vi_binding_strides[0] == 64);
+   vk_dynamic_graphics_state_clear_dirty(dyn);
+   gen = dyn->generation;
+   vk_common_CmdSetVertexInputEXT(vk_cb, 2, bindings, 2, attrs);
+   CHECK(dyn->generation > gen);
+   CHECK(dyn->vi_binding_strides[0] == 16);
+   CHECK(BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDING_STRIDES));
+
+   /* Dirty VI state (e.g. after dirty_all) must not elide even if equal. */
+   vk_dynamic_graphics_state_dirty_all(dyn);
+   gen = dyn->generation;
+   vk_common_CmdSetVertexInputEXT(vk_cb, 2, bindings, 2, attrs);
+   CHECK(dyn->generation > gen);
+
+   /* Differing divisor, attribute offset, or binding count must invalidate. */
+   vk_dynamic_graphics_state_clear_dirty(dyn);
+   gen = dyn->generation;
+   VkVertexInputBindingDescription2EXT diff_bindings[2] = {
+      bindings[0], bindings[1],
+   };
+   diff_bindings[1].divisor = 2;
+   vk_common_CmdSetVertexInputEXT(vk_cb, 2, diff_bindings, 2, attrs);
+   CHECK(dyn->generation > gen && dyn->vi->bindings[2].divisor == 2);
+
+   vk_dynamic_graphics_state_clear_dirty(dyn);
+   gen = dyn->generation;
+   VkVertexInputAttributeDescription2EXT diff_attrs[2] = {
+      attrs[0], attrs[1],
+   };
+   diff_attrs[1].offset = 8;
+   vk_common_CmdSetVertexInputEXT(vk_cb, 2, diff_bindings, 2, diff_attrs);
+   CHECK(dyn->generation > gen && dyn->vi->attributes[3].offset == 8);
+
+   vk_dynamic_graphics_state_clear_dirty(dyn);
+   gen = dyn->generation;
+   vk_common_CmdSetVertexInputEXT(vk_cb, 1, diff_bindings, 1, diff_attrs);
+   CHECK(dyn->generation > gen);
+   CHECK(dyn->vi->bindings_valid == BITFIELD_BIT(0));
+   CHECK(dyn->vi->attributes_valid == BITFIELD_BIT(0));
+
+   /* Static->dynamic VI pipeline transition: binding a static-VI pipeline
+    * copies VI state into dyn and marks it dirty. Before a draw clears dirty,
+    * transitioning to a dynamic-VI pipeline and calling CmdSetVertexInputEXT
+    * with matching state must not elide. Once dirty is cleared, calling
+    * CmdSetVertexInputEXT with the static pipeline's exact VI elides, while
+    * differing VI updates and marks dirty. */
+   struct vk_vertex_input_state static_vi;
+   memset(&static_vi, 0, sizeof(static_vi));
+   static_vi.bindings_valid = BITFIELD_BIT(0) | BITFIELD_BIT(2);
+   static_vi.bindings[0] = (struct vk_vertex_binding_state){
+      .stride = 16,
+      .input_rate = VK_VERTEX_INPUT_RATE_VERTEX,
+      .divisor = 1,
+   };
+   static_vi.bindings[2] = (struct vk_vertex_binding_state){
+      .stride = 32,
+      .input_rate = VK_VERTEX_INPUT_RATE_INSTANCE,
+      .divisor = 4,
+   };
+   static_vi.attributes_valid = BITFIELD_BIT(0) | BITFIELD_BIT(3);
+   static_vi.attributes[0] = (struct vk_vertex_attribute_state){
+      .binding = 0,
+      .format = VK_FORMAT_R32G32B32_SFLOAT,
+      .offset = 0,
+   };
+   static_vi.attributes[3] = (struct vk_vertex_attribute_state){
+      .binding = 2,
+      .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+      .offset = 16,
+   };
+
+   struct vk_dynamic_graphics_state static_pipe_dyn;
+   vk_dynamic_graphics_state_init(&static_pipe_dyn);
+   static_pipe_dyn.vi = &static_vi;
+   static_pipe_dyn.vi_bindings_valid = static_vi.bindings_valid;
+   static_pipe_dyn.vi_binding_strides[0] = 16;
+   static_pipe_dyn.vi_binding_strides[2] = 32;
+   BITSET_SET(static_pipe_dyn.set, MESA_VK_DYNAMIC_VI);
+   BITSET_SET(static_pipe_dyn.set, MESA_VK_DYNAMIC_VI_BINDINGS_VALID);
+   BITSET_SET(static_pipe_dyn.set, MESA_VK_DYNAMIC_VI_BINDING_STRIDES);
+
+   vk_dynamic_graphics_state_clear_dirty(dyn);
+   vk_cmd_set_dynamic_graphics_state(&cmd->vk, &static_pipe_dyn);
+   CHECK(BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI));
+
+   /* Still dirty from static pipeline bind -> must not elide. */
+   gen = dyn->generation;
+   vk_common_CmdSetVertexInputEXT(vk_cb, 2, bindings, 2, attrs);
+   CHECK(dyn->generation > gen);
+
+   /* After draw clears dirty and a dynamic-VI pipeline is bound (leaves VI
+    * untouched in dyn), matching CmdSetVertexInputEXT elides cleanly. */
+   vk_dynamic_graphics_state_clear_dirty(dyn);
+   BITSET_ZERO(dyn->changed_since_pipeline_bind);
+   struct vk_dynamic_graphics_state dyn_pipe_dyn;
+   vk_dynamic_graphics_state_init(&dyn_pipe_dyn);
+   vk_cmd_set_dynamic_graphics_state(&cmd->vk, &dyn_pipe_dyn);
+   gen = dyn->generation;
+   vk_common_CmdSetVertexInputEXT(vk_cb, 2, bindings, 2, attrs);
+   CHECK(dyn->generation == gen);
+   CHECK(!BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI));
+   CHECK(!BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDING_STRIDES));
+   CHECK(!BITSET_TEST(dyn->changed_since_pipeline_bind, MESA_VK_DYNAMIC_VI));
+
+   /* Static pipeline with a different stride followed by dynamic-VI pipeline
+    * must still invalidate when CmdSetVertexInputEXT restores bindings[]. */
+   static_vi.bindings[0].stride = 48;
+   static_pipe_dyn.vi_binding_strides[0] = 48;
+   vk_cmd_set_dynamic_graphics_state(&cmd->vk, &static_pipe_dyn);
+   vk_dynamic_graphics_state_clear_dirty(dyn);
+   vk_cmd_set_dynamic_graphics_state(&cmd->vk, &dyn_pipe_dyn);
+   gen = dyn->generation;
+   vk_common_CmdSetVertexInputEXT(vk_cb, 2, bindings, 2, attrs);
+   CHECK(dyn->generation > gen);
+   CHECK(dyn->vi->bindings[0].stride == 16 && dyn->vi_binding_strides[0] == 16);
+   CHECK(BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI));
+   CHECK(BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDING_STRIDES));
+
+   reset(f);
+}
+
 static uint64_t
 now_ns(void)
 {
@@ -444,6 +658,7 @@ main(int argc, char **argv)
    struct fixture *f = fixture();
    correctness(f);
    reuse_correctness(f);
+   vertex_input_elision_correctness(f);
    run(f, "identical", 16, batches);
    run(f, "change_every_4", 4, batches);
    run(f, "change_every_draw", 1, batches);
