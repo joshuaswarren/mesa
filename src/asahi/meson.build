@@ -133,7 +133,8 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
         files('../gallium/drivers/asahi/tests/run-shim.py'),
         libasahi_noop_drm_shim,
         hal200_vulkan_msaa_depth_compression,
-      ] + (chip == 'g17p' ? ['--expect-1x-compressed'] : []),
+        '--expect-1x-compressed',
+      ],
       env : [
         'ASAHI_SHIM_CHIP=' + chip,
         'VK_DRIVER_FILES=' + _dev_icd.full_path(),

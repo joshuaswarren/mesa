@@ -706,6 +706,33 @@ hk_g17p_image_blit_slice(enum agx_chip chip, VkImageType src_type,
 }
 
 bool
+hk_g17p_image_resolve_slice(enum agx_chip chip, VkImageType src_type,
+                            VkImageType dst_type, uint32_t src_layers,
+                            uint32_t dst_layers,
+                            const VkImageResolve2 *region, uint32_t slice,
+                            VkImageResolve2 *out)
+{
+   if (out)
+      *out = (VkImageResolve2){0};
+
+   if (!agx_chip_native_agx3(chip) || !region || !out ||
+       src_type != VK_IMAGE_TYPE_2D || dst_type != VK_IMAGE_TYPE_2D ||
+       src_layers == 0 || src_layers != dst_layers || slice >= src_layers ||
+       region->srcOffset.z != 0 || region->dstOffset.z != 0 ||
+       region->extent.depth != 1 ||
+       slice > UINT32_MAX - region->srcSubresource.baseArrayLayer ||
+       slice > UINT32_MAX - region->dstSubresource.baseArrayLayer)
+      return false;
+
+   *out = *region;
+   out->srcSubresource.baseArrayLayer += slice;
+   out->srcSubresource.layerCount = 1;
+   out->dstSubresource.baseArrayLayer += slice;
+   out->dstSubresource.layerCount = 1;
+   return true;
+}
+
+bool
 hk_g17p_metadata_grid_init(uint32_t width_tl, uint32_t height_tl,
                            struct hk_g17p_metadata_grid *grid)
 {

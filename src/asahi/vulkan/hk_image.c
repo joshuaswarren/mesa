@@ -558,8 +558,8 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
       ext->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO &&
       !ext->pNext;
 
-   /* G17P storage images stay uncompressed: a shader image store through
-    * the G17P PBE does not merge into a compressed block or update its
+   /* HAL200/Gen9 storage images stay uncompressed: a shader image store through
+    * the Gen9 PBE does not merge into a compressed block or update its
     * metadata. It writes the block as the block's existing metadata says,
     * so the image decodes wrong whatever that metadata is:
     *  - tiles a render pass or fast clear left compressed: with this rule
@@ -575,7 +575,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
     * correct once any other writer compresses its tiles. The storage PBE
     * descriptor is byte-identical to the end-of-tile one, so there is no
     * descriptor bit to fix this with. */
-   if (dev->chip == AGX_CHIP_G17P)
+   if (agx_chip_has_cap(dev->chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION))
       return false;
 
    if (!hk_chip_supports_compressed_storage_pbe(dev->chip) || plane ||
@@ -958,17 +958,30 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    const bool g17p_compressed =
-      agx_chip_g17p_or_m5(pdev->dev.chip) &&
+      hk_chip_shared_compression_supported(pdev->dev.chip) &&
       pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
       drm_mod_info &&
       drm_mod_info->drmFormatModifier ==
          DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED;
-   if (g17p_compressed &&
-       !hk_g17p_shared_compression_supported(
-          &pdev->dev, pImageFormatInfo->format, pImageFormatInfo->type,
-          pImageFormatInfo->flags, pImageFormatInfo->usage,
-          pImageFormatInfo->pNext))
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (g17p_compressed) {
+      /* Modifier queries have no extent. Use an eligible extent and the
+       * same creation policy as modifier-list selection. */
+      const VkImageCreateInfo probe = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .pNext = pImageFormatInfo->pNext,
+         .flags = pImageFormatInfo->flags,
+         .imageType = pImageFormatInfo->type,
+         .format = pImageFormatInfo->format,
+         .extent = {16, 16, 1},
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .tiling = pImageFormatInfo->tiling,
+         .usage = pImageFormatInfo->usage,
+      };
+      if (!hk_can_compress_create_info(&pdev->dev, 0, &probe, false, false))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
 
    const uint32_t max_dim = pImageFormatInfo->type == VK_IMAGE_TYPE_3D
                                ? pdev->vk.properties.maxImageDimension3D
@@ -1188,8 +1201,8 @@ hk_GetPhysicalDeviceImageFormatProperties2(
           * shape that permits compression: if any such image can compress,
           * host-transfer images cannot promise the same layout. Probe every
           * supported sample count, since a policy may compress only the
-          * multisampled images of a format (G16G compresses 2x/4x depth but
-          * not single-sample depth).
+          * multisampled images of a format. Use the largest supported width
+          * and height to reach size-dependent compression crossovers.
           */
          const VkExternalMemoryImageCreateInfo external_create_info = {
             .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -1202,12 +1215,16 @@ hk_GetPhysicalDeviceImageFormatProperties2(
             .flags = pImageFormatInfo->flags,
             .imageType = pImageFormatInfo->type,
             .format = pImageFormatInfo->format,
-            .extent = {64, 64, 1},
+            .extent = {maxExtent.width, maxExtent.height, 1},
             .mipLevels = 1,
-            .arrayLayers = pdev->dev.chip == AGX_CHIP_G17P &&
-                                 (pImageFormatInfo->flags &
-                                  VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)
-                              ? 6 : 1,
+            .arrayLayers =
+               (agx_chip_has_cap(pdev->dev.chip,
+                                 AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ||
+                agx_chip_g17_m5(pdev->dev.chip)) &&
+                     (pImageFormatInfo->flags &
+                      VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)
+                  ? 6
+                  : 1,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = pImageFormatInfo->tiling,
             .usage = (pImageFormatInfo->usage &
@@ -1325,9 +1342,9 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                             const VkImageCreateInfo *info,
                             bool float_image_atomics, bool srgb_pair_views)
 {
-   /* AGX3: HAL200 (G17P and, for 2x/4x MSAA depth, G16G) and M5 compress every
-    * image hk_g17p_compression.h admits. Other AGX3 chips stay plain until
-    * their packets are recovered. */
+   /* AGX3: native HAL200 (AGX_CAP_HAL200_LOSSLESS_COMPRESSION: G16G, G17P)
+    * and M5 compress every image hk_g17p_compression.h admits. Other AGX3
+    * chips stay plain until their packets are recovered. */
    const bool m5_storage =
       hk_m5_storage_compression_eligible(dev, plane, info, float_image_atomics);
    bool allow_agx3 =
@@ -1531,7 +1548,9 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
 
       }
 
-      assert(modifier != DRM_FORMAT_MOD_INVALID);
+      if (modifier == DRM_FORMAT_MOD_INVALID)
+         return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                          "no compatible DRM format modifier for image");
       assert(image->vk.drm_format_mod == DRM_FORMAT_MOD_INVALID);
       image->vk.drm_format_mod = modifier;
    }
@@ -1562,10 +1581,10 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
                           mod_explicit_info->pPlaneLayouts[0].rowPitch, pitch_B);
    }
 
-   /* G17P and M5 share compressed colour images only in the shape both sides
+   /* HAL200 and M5 share compressed colour images only in the shape both sides
     * allocate identically (hk_g17p_shared_compression_eligible()). */
    if (image->vk.drm_format_mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
-       agx_chip_g17p_or_m5(dev->dev.chip) &&
+       hk_chip_shared_compression_supported(dev->dev.chip) &&
        !(hk_g17p_shared_compression_supported(
             &dev->dev, pCreateInfo->format, pCreateInfo->imageType,
             pCreateInfo->flags, pCreateInfo->usage, pCreateInfo->pNext) &&
@@ -1609,8 +1628,12 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
          }
       }
 
+      VkImageCreateInfo plane_info = *pCreateInfo;
+      if (plane == 1 && hk_split_depth_stencil(image->vk.format))
+         plane_info.usage = image->vk.stencil_usage;
+
       bool compressed =
-         hk_map_compression(dev, pCreateInfo, plane, image->vk.drm_format_mod);
+         hk_map_compression(dev, &plane_info, plane, image->vk.drm_format_mod);
 
       image->planes[plane].layout = (struct ail_layout){
          .policy = ail_layout_policy_for_descriptor_generation(
@@ -1640,6 +1663,13 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
 
       uint64_t plane_end_B;
       if (mod_explicit_info) {
+         if (image->vk.drm_format_mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
+             mod_explicit_info->pPlaneLayouts[plane].rowPitch !=
+                ail_get_wsi_stride_B(&image->planes[plane].layout, 0))
+            return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                             "invalid compressed DRM plane %u row pitch 0x%" PRIx64,
+                             plane, mod_explicit_info->pPlaneLayouts[plane].rowPitch);
+
          const uint64_t plane_offset_B =
             mod_explicit_info->pPlaneLayouts[plane].offset;
          if (!hk_image_explicit_plane_range(plane_offset_B,

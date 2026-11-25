@@ -13,8 +13,8 @@
  * HAL200 part and checks that baseline.
  *
  * usage: hal200-vulkan-msaa-depth-compression [--expect-1x-compressed]
- *   --expect-1x-compressed  single-sample depth compresses too (G17P); without
- *                           it, single-sample depth must stay plain (G16G)
+ *   --expect-1x-compressed  single-sample depth compresses too (G16G, G17P); without
+ *                           it, single-sample depth must stay plain
  */
 #include <stdbool.h>
 #include <stdint.h>
