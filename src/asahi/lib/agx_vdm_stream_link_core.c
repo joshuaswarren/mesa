@@ -9,27 +9,13 @@
 #include <string.h>
 
 /*
- * Pack/unpack the exact direct (non-returning) eight-byte VDM Stream Link
- * emitted by the inspected Apple VDMEncoderGen5 and VDMEncoderGen6 paths:
- *
- *   word 0 bits  0..7: target address bits 32..39
- *   word 0 bits  8..28: zero
- *   word 0 bits 29..31: VDM block type 4 (Stream Link)
- *   word 1 bits  0..31: target address bits 0..31
- *
- * Unlike other AGX3 command-stream pointers, this target deliberately remains
- * 40-bit through HAL300. On G17P the encoded value is a render-context-relative
- * offset, while the neighboring generations use the address domain selected
- * by their own command-stream ABI. This byte packer preserves the supplied
- * value; the caller owns that generation-specific translation. The
- * returning-call form at word 0 bit 28 is not present in the pinned AGX3
- * emitters and therefore fails closed here.
- *
- * The target allowlist contains only identities directly served by the
- * inspected G15G/G15X, G16G/G16X, G17P, and G17G/G17X Apple Metal plugins.
- * G16P and G17A remain closed despite sharing neighboring command-stream
- * generations.  This helper does not emit a live command or enable command
- * allocation, submission, or device admission.
+ * Direct (non-returning) 8-byte VDM Stream Link:
+ *   word 0[7:0]:   target[39:32]
+ *   word 0[28:8]:  0 (returning-call bit 28 fails closed)
+ *   word 0[31:29]: VDM block type 4
+ *   word 1[31:0]:  target[31:0]
+ * Target remains 40-bit through HAL300; callers own address-domain
+ * translation (e.g. render-context-relative offset on G17P vs absolute).
  */
 bool
 agx_vdm_stream_link_core_supported(enum agx_chip chip)

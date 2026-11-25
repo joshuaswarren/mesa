@@ -258,14 +258,14 @@ main(void)
 
    /* Implemented matrix paths are available without process flags. */
    const enum agx_chip matrix_chips[] = {
+      AGX_CHIP_G13G, AGX_CHIP_G13X, AGX_CHIP_G14G, AGX_CHIP_G14X,
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
       AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(matrix_chips); ++i)
       assert(agx_chip_cooperative_matrix_supported(matrix_chips[i]));
-   assert(!agx_chip_cooperative_matrix_supported(AGX_CHIP_G13G));
-   assert(!agx_chip_cooperative_matrix_supported(AGX_CHIP_G14X));
+   assert(!agx_chip_cooperative_matrix_supported(AGX_CHIP_G18G));
 
    /* The M5 Max (T6050, G17C) is admitted with its four clusters only, by
     * default and on the M5 bring-up path. */

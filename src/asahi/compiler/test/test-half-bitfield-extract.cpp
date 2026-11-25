@@ -137,7 +137,17 @@ eval_global_u32(const nir_shader *orig, uint32_t p0, uint32_t p1,
                continue;
             uint64_t addr = nir_src_as_uint(intr->src[0]);
             b.cursor = nir_before_instr(instr);
-            nir_def_replace(&intr->def, nir_imm_int(&b, addr == 0 ? p0 : p1));
+            /* A vector load reads p0, p1 and two words derived from them. */
+            uint32_t words[4] = {p0, p1, p0 ^ 0x13579bdfu, p1 ^ 0xeca86420u};
+            nir_def *v = intr->def.num_components == 1
+                            ? nir_imm_int(&b, addr == 0 ? p0 : p1)
+                            : nir_build_imm(&b, intr->def.num_components, 32,
+                                            (nir_const_value[4]){
+                                               nir_const_value_for_uint(words[0], 32),
+                                               nir_const_value_for_uint(words[1], 32),
+                                               nir_const_value_for_uint(words[2], 32),
+                                               nir_const_value_for_uint(words[3], 32)});
+            nir_def_replace(&intr->def, v);
          }
       }
    }
@@ -349,4 +359,157 @@ TEST(HalfBitfieldExtract, ValueEquivalenceRGBA8AndStandaloneByte2)
    nir_validate_shader(b.shader, "rgba8-unpack-val");
    ralloc_free(orig);
    ralloc_free(b.shader);
+}
+
+/* The words of a vectorized load are channels of one vector def: with the
+ * shared-memory row of a separable RGBA8 filter, nir_opt_load_store_vectorize
+ * merges four adjacent word loads into one vec4 load, and every byte extract
+ * then reads its word through a swizzle. Those must take the same shared
+ * shift and 16-bit masks as scalar words. */
+TEST(HalfBitfieldExtract, VectorLoadComponents)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "rgba8-vec4-unpack");
+
+   nir_def *v = nir_load_global(&b, 4, 32, nir_imm_int64(&b, 0), .align_mul = 16);
+   const uint32_t w[4] = {86, 342, 1052, 2554};
+   nir_def *acc = nir_imm_int(&b, 32768);
+   for (unsigned c = 0; c < 4; ++c) {
+      nir_def *p = nir_channel(&b, v, c);
+      nir_def *g = nir_ubitfield_extract(&b, p, nir_imm_int(&b, 8), nir_imm_int(&b, 8));
+      nir_def *bl = nir_ubitfield_extract(&b, p, nir_imm_int(&b, 16), nir_imm_int(&b, 8));
+      nir_def *a = nir_ushr_imm(&b, p, 24);
+      acc = nir_iadd(&b, acc, nir_imul_imm(&b, nir_iadd(&b, g, a), w[c]));
+      acc = nir_iadd(&b, acc, nir_imul_imm(&b, nir_iadd(&b, bl, g), w[3 - c]));
+   }
+   nir_store_global(&b, acc, nir_imm_int64(&b, 64), .align_mul = 4);
+
+   /* Read each channel straight from the load, as the vectorizer leaves it. */
+   nir_opt_copy_prop(b.shader);
+   nir_opt_dce(b.shader);
+   nir_shader *orig = nir_shader_clone(NULL, b.shader);
+
+   EXPECT_TRUE(agx_nir_opt_half_bitfield_extract(b.shader));
+   nir_opt_dce(b.shader);
+
+   /* One shift per word (p >> 8) and no IC-pipe bitfield extract. */
+   EXPECT_EQ(count_alu(b.shader, nir_op_ubitfield_extract), 0u);
+   EXPECT_EQ(count_alu(b.shader, nir_op_ushr), 4u);
+   EXPECT_EQ(count_alu(b.shader, nir_op_unpack_32_2x16_split_x), 4u);
+   EXPECT_EQ(count_alu(b.shader, nir_op_unpack_32_2x16_split_y), 8u);
+
+   const uint32_t pairs[][2] = {
+      {0x00000000u, 0x00000000u},
+      {0xffffffffu, 0xffffffffu},
+      {0xfedcba98u, 0x12345678u},
+      {0x8001ff00u, 0x00ff0180u},
+   };
+   for (const auto &pr : pairs) {
+      EXPECT_EQ(eval_global_u32(b.shader, pr[0], pr[1]),
+                eval_global_u32(orig, pr[0], pr[1]));
+   }
+
+   nir_validate_shader(b.shader, "rgba8-vec4-unpack");
+   ralloc_free(orig);
+   ralloc_free(b.shader);
+}
+
+/* The extracts of one component never borrow another component's shift: a
+ * byte-1 extract of channel 0 pairs with a byte-3 extract of channel 0 only. */
+TEST(HalfBitfieldExtract, VectorComponentsDoNotPairAcrossChannels)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "rgba8-vec2-cross");
+
+   nir_def *v = nir_load_global(&b, 2, 32, nir_imm_int64(&b, 0), .align_mul = 8);
+   nir_def *g0 = nir_ubitfield_extract(&b, nir_channel(&b, v, 0), nir_imm_int(&b, 8),
+                                       nir_imm_int(&b, 8));
+   nir_def *a1 = nir_ushr_imm(&b, nir_channel(&b, v, 1), 24);
+   nir_def *sum = nir_iadd(&b, nir_imul_imm(&b, g0, 86), nir_imul_imm(&b, a1, 342));
+   nir_store_global(&b, sum, nir_imm_int64(&b, 64), .align_mul = 4);
+   nir_opt_copy_prop(b.shader);
+   nir_opt_dce(b.shader);
+   nir_shader *orig = nir_shader_clone(NULL, b.shader);
+
+   /* No pair exists; nothing about channel 0 may be rewritten from channel 1. */
+   agx_nir_opt_half_bitfield_extract(b.shader);
+   nir_opt_dce(b.shader);
+   EXPECT_EQ(count_alu(b.shader, nir_op_ubitfield_extract), 1u);
+
+   const uint32_t pairs[][2] = {
+      {0xfedcba98u, 0x12345678u},
+      {0x00ff00ffu, 0xff00ff00u},
+   };
+   for (const auto &pr : pairs) {
+      EXPECT_EQ(eval_global_u32(b.shader, pr[0], pr[1]),
+                eval_global_u32(orig, pr[0], pr[1]));
+   }
+
+   nir_validate_shader(b.shader, "rgba8-vec2-cross");
+   ralloc_free(orig);
+   ralloc_free(b.shader);
+}
+
+/* End to end on G16G (AGX3B): a separable filter's shared-memory row. Adjacent
+ * words are merged into vector loads and words 32 bytes apart are not (and
+ * keep their offsets within the local load's immediate); the byte unpack must
+ * cost the same integer-pipe work either way. */
+static unsigned
+g16g_shared_unpack_ic(unsigned stride_B)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "rgba8-shared-row");
+   b.shader->info.internal = false;
+   b.shader->info.workgroup_size[0] = 16;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.shared_size = 4096;
+
+   nir_def *lid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+   nir_def *offs = nir_u2u16(&b, nir_imul_imm(&b, lid, 4));
+   nir_def *out_base = nir_load_preamble(&b, 1, 64, .base = 0);
+
+   const uint32_t w[8] = {16, 86, 342, 1052, 2554, 4996, 7914, 10242};
+   nir_def *acc[4];
+   for (unsigned c = 0; c < 4; ++c)
+      acc[c] = nir_imm_int(&b, 32768);
+   for (unsigned t = 0; t < 8; ++t) {
+      nir_def *p = nir_load_shared(&b, 1, 32, offs, .base = (int)(t * stride_B),
+                                   .align_mul = 4);
+      nir_def *ch[4] = {
+         nir_iand_imm(&b, p, 0xff),
+         nir_ubitfield_extract(&b, p, nir_imm_int(&b, 8), nir_imm_int(&b, 8)),
+         nir_ubitfield_extract(&b, p, nir_imm_int(&b, 16), nir_imm_int(&b, 8)),
+         nir_ushr_imm(&b, p, 24),
+      };
+      for (unsigned c = 0; c < 4; ++c)
+         acc[c] = nir_iadd(&b, acc[c], nir_imul_imm(&b, ch[c], w[t]));
+   }
+   nir_def *res = nir_ior(&b, nir_ior(&b, nir_ushr_imm(&b, acc[0], 16),
+                                      nir_ishl_imm(&b, nir_ushr_imm(&b, acc[1], 16), 8)),
+                          nir_ior(&b, nir_ishl_imm(&b, nir_ushr_imm(&b, acc[2], 16), 16),
+                                  nir_ishl_imm(&b, nir_ushr_imm(&b, acc[3], 16), 24)));
+   nir_store_global(&b, res, nir_iadd(&b, out_base, nir_u2u64(&b, nir_imul_imm(&b, lid, 4))),
+                    .align_mul = 4);
+
+   struct agx_shader_key key = {};
+   key.dev.chip = AGX_CHIP_G16G;
+   key.dev.encoding = agx_chip_isa_encoding(AGX_CHIP_G16G);
+   key.reserved_preamble = 4;
+   key.no_preamble = true;
+   agx_preprocess_nir_native(b.shader, AGX_CHIP_G16G);
+   struct agx_shader_part part = {};
+   EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+   const unsigned ic = part.info.stats.ic;
+   free(part.binary);
+   ralloc_free(b.shader);
+   return ic;
+}
+
+TEST(HalfBitfieldExtract, G16GVectorizedRowMatchesStridedRow)
+{
+   const unsigned vectorized = g16g_shared_unpack_ic(4);
+   const unsigned strided = g16g_shared_unpack_ic(32);
+   EXPECT_GT(strided, 0u);
+   EXPECT_EQ(vectorized, strided);
 }

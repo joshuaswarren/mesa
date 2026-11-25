@@ -42,11 +42,12 @@ hk_wsi_can_present_on_device(VkPhysicalDevice physicalDevice, int fd)
    return match;
 }
 
-/* WSI allocates all images during swapchain creation. On native G17P each
- * VM_BIND pins UMA backing, so even a single maximum-extent attempt can exceed
- * a small process limit before the kernel can return OOM. This WSI callback
- * bounds that creation peak only; application/AS allocations never consult a
- * cgroup snapshot. Imports and other generations keep the ordinary allocator.
+/* WSI allocates all images during swapchain creation. On non-virtio UMA
+ * devices each VM_BIND pins UMA backing, so even a single maximum-extent
+ * attempt can exceed a small process limit before the kernel can return OOM.
+ * This WSI callback bounds that creation peak only; application/AS allocations
+ * never consult a cgroup snapshot. Imports and virtio keep the ordinary
+ * allocator.
  */
 VkResult
 hk_wsi_allocate_memory(VkDevice device, const VkMemoryAllocateInfo *info,
@@ -55,7 +56,7 @@ hk_wsi_allocate_memory(VkDevice device, const VkMemoryAllocateInfo *info,
    VK_FROM_HANDLE(hk_device, dev, device);
    const VkImportMemoryFdInfoKHR *import =
       vk_find_struct_const(info->pNext, IMPORT_MEMORY_FD_INFO_KHR);
-   if (dev->dev.chip == AGX_CHIP_G17P && !dev->dev.is_virtio &&
+   if (!dev->dev.is_virtio &&
        !(import && import->handleType)) {
       uint64_t available;
       if (hk_get_cgroup_memory_available("/proc/self/cgroup",
@@ -79,7 +80,7 @@ hk_wsi_allocate_memory(VkDevice device, const VkMemoryAllocateInfo *info,
       .pNext = info->pNext,
    };
    VkMemoryAllocateInfo tagged_info = *info;
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if (!dev->dev.is_virtio &&
        !vk_find_struct_const(info->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA))
       tagged_info.pNext = &wsi_info;
    return hk_AllocateMemory(device, &tagged_info, alloc, out);
