@@ -11228,8 +11228,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
                 render->tilebuffer.max_bytes_per_tile &&
              (!has_zs_attachment || plain_ms_zs))) ||
           fragment_pass > AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH ||
-          (!discard && (dyn->vp.depth_clip_negative_one_to_one ||
-          dyn->ds.depth.bounds_test.enable ||
+          (!discard && (dyn->ds.depth.bounds_test.enable ||
           !bounded_viewport || !bounded_depth_range))) {
          {
             fprintf(stderr, "M5 PPP profile: uvs=%u osel=%#x provoking=%u object=%u "
