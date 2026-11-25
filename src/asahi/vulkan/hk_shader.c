@@ -247,7 +247,7 @@ hk_get_spirv_options(struct vk_physical_device *vk_pdev,
    return (struct spirv_to_nir_options){
       .ssbo_addr_format = hk_buffer_addr_format(
          rs->storage_buffers, rs->null_storage_buffer_descriptor,
-         agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip)),
+         hk_ssbo_addr_has_map(((struct hk_physical_device *)vk_pdev)->dev.chip)),
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
       .ubo_addr_format = hk_ubo_addr_format(rs->uniform_buffers),
       .shared_addr_format = nir_address_format_32bit_offset,
@@ -3875,7 +3875,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
             hk_buffer_addr_format(rs->storage_buffers,
                                   rs->null_storage_buffer_descriptor,
-                                  agx_chip_g17_m5(dev->dev.chip)));
+                                  hk_ssbo_addr_has_map(dev->dev.chip)));
    if (rs->uniform_buffers ==
        VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT) {
       uint8_t static_set_mask =
@@ -8625,7 +8625,7 @@ hk_maybe_build_byte_stencil(struct hk_device *dev, const nir_shader *nir,
    const nir_address_format ssbo_addr_format = hk_buffer_addr_format(
       info->robustness->storage_buffers,
       info->robustness->null_storage_buffer_descriptor,
-      agx_chip_g17_m5(dev->dev.chip));
+      hk_ssbo_addr_has_map(dev->dev.chip));
    out->tiled_nir = hk_nir_build_tiled_byte_stencil(NULL, nir, &out->plan,
                                                     ssbo_addr_format);
    return out->tiled_nir != NULL;

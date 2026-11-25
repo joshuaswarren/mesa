@@ -999,6 +999,14 @@ hk_ubo_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
              : nir_address_format_64bit_bounded_global;
 }
 
+/* Gen10 descriptor sets carry the 5-component SSBO address format with the
+ * sparse residency map slot (matching hk_nir_lower_descriptors()). */
+static inline bool
+hk_ssbo_addr_has_map(enum agx_chip chip)
+{
+   return agx_chip_descriptor_generation(chip) == AGX_DESCRIPTOR_GENERATION_10;
+}
+
 static inline nir_address_format
 hk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness,
                       bool null_descriptor, bool map_metadata)
