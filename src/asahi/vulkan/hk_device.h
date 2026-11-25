@@ -430,11 +430,9 @@ struct hk_device {
    /* drirc hk_submit_batch_size: at most this many commands per kernel
     * submission (0: the kernel and batching limits alone). */
    unsigned submit_batch_size;
-   /* HK_CDM_BARRIER_MASK=<hex>: perftest-only override of the AGX2
-    * CDM_BARRIER flag word (bits 0..26). 0 = unset. */
-   uint32_t cdm_barrier_mask;
-   /* Reduced CDM_BARRIER word used by default on G14X generation 14 (see
-    * hk_device.c). 0 = the full barrier. */
+   /* The AGX2 CDM_BARRIER flag word emitted at a tracked dependency on
+    * this chip (agx2_cdm_barrier_default_word()): the reduced word on the
+    * dies it was measured on, the full word elsewhere. */
    uint32_t cdm_barrier_default_mask;
 
    struct {
@@ -462,12 +460,6 @@ enum hk_perftest {
     * upgrading it to a strong cache flush, when memory is unaliased and no
     * host or pending graphics transfer dependency is involved. */
    HK_PERF_WEAKBARRIER = BITFIELD_BIT(5),
-   /* Omit the AGX2 CDM barrier (perftest only). */
-   HK_PERF_NOCDMBARRIER = BITFIELD_BIT(6),
-   /* Reduce the AGX2 CDM barrier to a USC cache invalidate (perftest only). */
-   HK_PERF_USCCDMBARRIER = BITFIELD_BIT(7),
-   /* G13X designed barrier set {0,1,2,4,5,6,8} + USC invalidate (perftest). */
-   HK_PERF_DESIGNEDUSCCDMBARRIER = BITFIELD_BIT(8),
    /* Unconditional per-launch CDM barrier (disables tracking). */
    HK_PERF_ALWAYSCDMBARRIER = BITFIELD_BIT(9),
    /* Opt into dependency tracking on chips where it is not the default. */

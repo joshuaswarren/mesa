@@ -608,42 +608,27 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
       if (cs->current == cs->strong_flush_end)
          return;
 
-      if (unlikely(dev->cdm_barrier_mask)) {
-         /* Perftest only: exact CDM_BARRIER flag word from the environment. */
+      {
+         /* The only Borealis AGX2 barrier-word path: the reduced word on
+          * the dies it was measured on (hk_device::cdm_barrier_default_mask,
+          * agx2_cdm_barrier_default_word()), the full word on every other
+          * chip, under fullcdmbarrier, and once the device holds a sparse
+          * resource -- the reduced set leaves page remappings behind the
+          * launches unordered. Gallium keeps agx_cdm_barrier()'s full
+          * record. */
+         const uint32_t mask = agx2_cdm_barrier_emit_word(
+            dev->cdm_barrier_default_mask, p_atomic_read(&dev->sparse_used),
+            HK_PERF(dev, FULLCDMBARRIER));
+
          uint32_t *word = cs->current;
-         *word = dev->cdm_barrier_mask | (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
-         cs->current = word + 1;
-      } else if (HK_PERF(dev, NOCDMBARRIER)) {
-         /* Perftest only: no cache maintenance at all. */
-      } else if (HK_PERF(dev, DESIGNEDUSCCDMBARRIER)) {
-         /* Perftest only: designed set {0,1,2,4,5,6,8} + USC invalidate. */
-         cs->current = agx_cdm_barrier_designed_usc(cs->current);
-      } else if (HK_PERF(dev, USCCDMBARRIER)) {
-         /* Perftest only: keep the USC cache invalidate, drop the rest. */
-         cs->current = agx_cdm_barrier_usc(cs->current);
-      } else if (HK_PERF(dev, FULLCDMBARRIER)) {
-         /* Perftest only: force the full barrier word on every chip. */
-         cs->current = agx_cdm_barrier(cs->current, AGX_CHIP_G13G);
-         cs->strong_flush_end = cs->current;
-      } else if (unlikely(p_atomic_read(&dev->sparse_used))) {
-         /* Sparse resources change page mappings behind the launches. The
-          * reduced G13X word leaves sparse-image atomics wrong and the GPU
-          * faulting, so a device that created one keeps the full word
-          * (bits 0-19, the barrier before the reduction).
-          */
-         uint32_t *word = cs->current;
-         *word = 0xfffff | (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
+         *word = mask | (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
          cs->current = word + 1;
          cs->strong_flush_end = cs->current;
-      } else if (dev->cdm_barrier_default_mask) {
-         uint32_t *word = cs->current;
-         *word = dev->cdm_barrier_default_mask |
-                 (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
-         cs->current = word + 1;
-         cs->strong_flush_end = cs->current;
-      } else {
-         cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
-         cs->strong_flush_end = cs->current;
+
+         /* A sparse resource created between recording and submission
+          * still upgrades this record at submit. */
+         if (mask != AGX_CDM_BARRIER_FULL_WORD)
+            hk_cdm_note_sparse_site(cs, word);
       }
       break;
 

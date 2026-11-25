@@ -97,12 +97,6 @@ static const struct debug_named_value hk_perf_options[] = {
    {"nobatch",   HK_PERF_NOBATCH,  "Disable submission batching"},
    {"norobust",  HK_PERF_NOROBUST, "Disable robustness"},
    {"weakbarrier", HK_PERF_WEAKBARRIER, "Keep ordering-only barriers between compute dispatches"},
-   {"nocdmbarrier", HK_PERF_NOCDMBARRIER,
-    "Omit the AGX2 CDM barrier entirely"},
-   {"usccdmbarrier", HK_PERF_USCCDMBARRIER,
-    "Reduce the AGX2 CDM barrier to a USC cache invalidate"},
-   {"designedusccdmbarrier", HK_PERF_DESIGNEDUSCCDMBARRIER,
-    "G13X designed set {0,1,2,4,5,6,8} plus USC cache invalidate (0x17f)"},
    {"alwayscdmbarrier", HK_PERF_ALWAYSCDMBARRIER,
     "Unconditional per-launch CDM barrier (disable dependency tracking)"},
    {"trackcdmbarrier", HK_PERF_TRACKCDMBARRIER,
@@ -1129,28 +1123,20 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       dev->perftest |= HK_PERF_ALWAYSCDMBARRIER;
 
    dev->dev.compute_timeout_ms = instance->drirc.misc.compute_timeout_ms;
-   dev->cdm_barrier_mask =
-      debug_get_num_option("HK_CDM_BARRIER_MASK", 0) & 0x07ffffff;
-
    /* Bounded poll before blocking syncobj waits (see vk_device.sync_wait_poll_us).
     * Off by default; pays CPU to skip wake-up latency on short submit->signal
     * round trips. */
    dev->vk.sync_wait_poll_us =
       CLAMP(debug_get_num_option("HK_SUBMIT_POLL_US", 0), 0, 1000000);
 
-   /* G14X of generation 14 launches with the reduced CDM_BARRIER word 0x1FF
-    * unless HK_CDM_BARRIER_MASK is set in any form (=0 keeps the full word).
-    * M2 Max Qwen3-4B decode at 2048 tokens saves 0.54 ms per token with
-    * identical tokens and logprobs. hk_cdm_cache_flush applies it only after
-    * the perftest overrides and the sparse guard.
+   /* The default AGX2 CDM barrier word on this chip: the reduced 0x1ff on
+    * the dies it was measured on (agx2_cdm_barrier_default_word()), the
+    * full word elsewhere. fullcdmbarrier and a device that created a sparse
+    * resource upgrade to the full word in hk_cdm_flush().
     */
    dev->cdm_barrier_default_mask =
-      pdev->dev.chip == AGX_CHIP_G14X &&
-            pdev->dev.params.gpu_generation == 14 &&
-            !HK_PERF(dev, ALWAYSCDMBARRIER) &&
-            !debug_get_option("HK_CDM_BARRIER_MASK", NULL)
-         ? 0x1FF
-         : 0;
+      agx2_cdm_barrier_default_word(pdev->dev.chip,
+                                    pdev->dev.params.gpu_generation);
 
    /* Native graphics compiles the emulation in only once a custom border
     * sampler exists, and most samples then pay one branch, so D3D content keeps

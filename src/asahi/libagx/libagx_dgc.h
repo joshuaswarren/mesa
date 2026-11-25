@@ -728,18 +728,7 @@ agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
       // cfg.unk_20 = true;
       // cfg.unk_24 = true; if clustered?
       if (chip == AGX_CHIP_G13X) {
-         /* G13X (t600x, M1 Pro/Max, G13C cores): the measured designed set
-          * {0,1,2,4,5,6,8} plus USC cache invalidate (0x17f). Bits 0-2 are
-          * required for cross-launch coherency when control streams are not
-          * split and across dependency-skipped launches; bit bisection
-          * showed every one of the designed bits is required for bit-exact
-          * results.
-          */
-         cfg.unk_0 = true;
-         cfg.unk_1 = true;
-         cfg.unk_2 = true;
          cfg.unk_4 = true;
-         cfg.usc_cache_inval = true;
          // cfg.unk_26 = true;
       }
 
@@ -750,8 +739,7 @@ agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
        * let's just set these after every launch to be safe. We can revisit in
        * the future when we figure out what the bits mean.
        */
-      if (chip != AGX_CHIP_G13X) {
-         cfg.unk_0 = true;
+      cfg.unk_0 = true;
       cfg.unk_1 = true;
       cfg.unk_2 = true;
       cfg.usc_cache_inval = true;
@@ -771,44 +759,6 @@ agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
       cfg.unk_17 = true;
       cfg.unk_18 = true;
       cfg.unk_19 = true;
-      }
-   }
-
-   return out;
-}
-
-/*
- * Minimal variant of agx_cdm_barrier: invalidate the USC cache only. Perftest
- * arm for launches whose results are consumed by another compute launch
- * through the same (L2-backed) storage path, where the PBE/texture cache
- * maintenance of the full barrier is not required.
- */
-static inline GLOBAL uint32_t *
-agx_cdm_barrier_usc(GLOBAL uint32_t *out)
-{
-   agx_push(out, CDM_BARRIER, cfg) {
-      cfg.usc_cache_inval = true;
-   }
-
-   return out;
-}
-
-/*
- * G13X designed set for bisection: {unk_0..2, unk_4..6, unk_8} plus the USC
- * cache invalidate (0x17f). Perftest arm designedusccdmbarrier.
- */
-static inline GLOBAL uint32_t *
-agx_cdm_barrier_designed_usc(GLOBAL uint32_t *out)
-{
-   agx_push(out, CDM_BARRIER, cfg) {
-      cfg.unk_0 = true;
-      cfg.unk_1 = true;
-      cfg.unk_2 = true;
-      cfg.unk_4 = true;
-      cfg.unk_5 = true;
-      cfg.unk_6 = true;
-      cfg.unk_8 = true;
-      cfg.usc_cache_inval = true;
    }
 
    return out;
