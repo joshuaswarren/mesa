@@ -226,9 +226,9 @@ g17p_sample_shape(const nir_tex_instr *tex, bool m5, bool g17p)
             * handle, which has no AGX3 encoding, and the pipeline failed
             * with VK_ERROR_UNKNOWN. */
            !register_level && !register_bias &&
-           /* G17P also takes a constant level or bias: the backend keeps
-            * it in a register (agx_optimizer_inline_imm), so it is staged
-            * beside the layer like a per-lane one. */
+           /* AGX3B native backends also take a constant level or bias: the
+            * backend keeps it in a register (agx_optimizer_inline_imm), so it
+            * is staged beside the layer like a per-lane one. */
            !(g17p && !cube &&
              ((tex->op == nir_texop_txl && level_src >= 0) ||
               (tex->op == nir_texop_txb && bias_src >= 0))) &&
