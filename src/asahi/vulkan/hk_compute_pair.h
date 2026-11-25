@@ -3,6 +3,7 @@
 
 #include "hk_descriptor_set.h"
 #include "hk_nir_match_pointwise_clamp.h"
+#include "hk_pack_loop_bound.h"
 #include "hk_private.h"
 #include "hk_shader.h"
 #include "util/simple_mtx.h"
@@ -17,7 +18,7 @@ struct hk_shader;
 struct nir_shader;
 struct vk_descriptor_set_layout;
 
-#define HK_COMPUTE_PAIR_MAX_VARIANTS 48u
+#define HK_COMPUTE_PAIR_MAX_VARIANTS 64u
 
 enum hk_compute_pair_alt_kind {
    HK_COMPUTE_PAIR_ALT_NONE = 0,
@@ -29,6 +30,10 @@ enum hk_compute_pair_alt_kind {
    HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED = 6,
    HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED = 7,
    HK_COMPUTE_PAIR_ALT_LINEAR_FADD = 8,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED = 9,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED = 10,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64 = 11,
+   HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED = 12,
 };
 
 static inline bool
@@ -37,9 +42,13 @@ hk_compute_pair_alt_is_gemm_cmat(enum hk_compute_pair_alt_kind kind)
    return kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16 ||
           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32 ||
           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64 ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64 ||
           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED ||
           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED ||
-          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED;
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED;
 }
 
 static inline uint32_t
@@ -49,28 +58,82 @@ hk_compute_pair_alt_gemm_tile_n(enum hk_compute_pair_alt_kind kind)
    case HK_COMPUTE_PAIR_ALT_GEMM_CMAT16:
    case HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED:
       return 16;
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED:
+      return 24;
    case HK_COMPUTE_PAIR_ALT_GEMM_CMAT32:
    case HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED:
       return 32;
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED:
+      return 48;
    case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64:
    case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED:
       return 64;
    default:
       return 0;
    }
 }
 
+static inline uint32_t
+hk_compute_pair_alt_gemm_tile_m(enum hk_compute_pair_alt_kind kind)
+{
+   switch (kind) {
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED:
+      return 32;
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT16:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT32:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64:
+   case HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED:
+      return 64;
+   default:
+      return 0;
+   }
+}
+
+static inline uint32_t
+hk_compute_pair_alt_gemm_k_step(enum hk_compute_pair_alt_kind kind)
+{
+   return (kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64 ||
+           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED)
+             ? 32u : 16u;
+}
+
 static inline bool
 hk_compute_pair_alt_is_gemm_unguarded(enum hk_compute_pair_alt_kind kind)
 {
    return kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT16_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT24_UNGUARDED ||
           kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT32_UNGUARDED ||
-          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED;
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64_UNGUARDED ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64 ||
+          kind == HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED;
+}
+
+static inline bool
+hk_compute_pair_alt_is_gemm_unguarded_for(enum hk_compute_pair_alt_kind kind,
+                                          bool producer_is_guarded)
+{
+   return hk_compute_pair_alt_is_gemm_unguarded(kind) ||
+          (!producer_is_guarded && hk_compute_pair_alt_is_gemm_cmat(kind));
 }
 
 struct hk_compute_pair_variant {
    bool has_epilogue;
    struct hk_nir_clamp_epilogue epilogue;
+   bool has_fadd;
+   struct hk_nir_fadd_epilogue fadd;
+   bool im2col_a;
+   bool has_dw_a;
+   struct hk_nir_dw_a_cfg dw_a;
+   bool has_gemm_dw;
+   struct hk_nir_dw_a_cfg gemm_dw;
    enum hk_compute_pair_alt_kind alt_kind;
    enum hk_compute_pair_dual_write dual_write;
    struct hk_shader *shader;
@@ -143,7 +206,11 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
                                      struct hk_compute_pair_producer *prod,
                                      const struct hk_nir_clamp_epilogue *epilogue,
                                      enum hk_compute_pair_alt_kind alt_kind,
-                                     enum hk_compute_pair_dual_write dual_write);
+                                     enum hk_compute_pair_dual_write dual_write,
+                                     const struct hk_nir_fadd_epilogue *fadd_ep,
+                                     bool im2col_a,
+                                     const struct hk_nir_dw_a_cfg *dw_a,
+                                     const struct hk_nir_dw_a_cfg *gemm_dw);
 
 void hk_compute_pair_info_serialize(struct blob *blob,
                                     const struct hk_compute_pair_info *info);
@@ -170,11 +237,27 @@ struct hk_compute_pair_pad4 {
    uint64_t pad_bytes;
 };
 
+struct hk_compute_pair_im2col {
+   uint64_t src_bytes;
+   uint64_t dst_bytes;
+   uint32_t iw;
+   uint32_t ih;
+   uint32_t kw;
+   uint32_t cols;
+   uint32_t step_x;
+   uint32_t sh;
+   uint32_t pad_x;
+   uint32_t pad_y;
+   uint32_t pw;
+   uint32_t ph;
+};
+
 struct hk_compute_pair_dispatch {
    struct hk_compute_pair_info info;
    union {
       struct hk_compute_pair_copy4 copy4;
       struct hk_compute_pair_pad4 pad4;
+      struct hk_compute_pair_im2col im2col;
    } extra;
    struct hk_storage_backing bindings[4];
    uint32_t groups[3];       /* Original API workgroup counts (for footprint) */
@@ -187,12 +270,18 @@ struct hk_compute_pair_dispatch {
    uint32_t cs_base_group[3];
    uint64_t printf_buffer_address;
    enum hk_compute_pair_alt_kind alt_kind;
+   bool overlap_safe;
+   uint64_t pack_loop_params[HK_PACK_LOOP_PARAM_COUNT];
    struct hk_compute_pair_producer *producer;
 };
 
 bool hk_fused_compute_shader_eligible(const struct hk_device *dev,
                                       struct hk_shader *s,
                                       const struct hk_compute_pair_dispatch *p);
+
+size_t hk_fused_compute_ioto_bound(const struct hk_device *dev,
+                                   struct hk_shader *s,
+                                   const struct hk_compute_pair_dispatch *p);
 
 bool hk_emit_fused_compute_dispatch(struct hk_device *dev, struct hk_cs *cs,
                                     struct hk_shader *s,

@@ -121,6 +121,10 @@ struct hk_queue {
       struct util_dynarray commands;
       /* Per member: the fused compute-pair plan and its elision state. */
       struct util_dynarray fused;
+      struct util_dynarray plans;
+      struct util_dynarray planned_suppressed;
+      struct util_dynarray suppressed_arr;
+      struct util_dynarray run_sup;
       /* Buffers the packets read until they complete: their streams, the
        * fused shaders' code, uniform loaders and root tables. */
       struct util_dynarray extra_bos;

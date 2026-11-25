@@ -1599,7 +1599,7 @@ test_fadd_copy4_fusion_gate(void)
 
    struct hk_compute_pair_dispatch fadd = {0};
    fadd.info.role = HK_COMPUTE_PAIR_FADD;
-   fadd.info.fadd_push_bytes = 4;
+   fadd.info.fadd.push_bytes = 4;
    fadd.alt_kind = HK_COMPUTE_PAIR_ALT_LINEAR_FADD;
    fadd.extra.copy4 = (struct hk_compute_pair_copy4){0, 0, bytes};
    fadd.bindings[0] = fadd_backing(SRC0, 0, size);
@@ -1736,6 +1736,212 @@ test_pack_add_bo(void)
    util_dynarray_fini(&bos);
 }
 
+static struct hk_pack_footprint
+make_fp(uint32_t r_handle, uint64_t r0, uint64_t r1,
+        uint32_t w_handle, uint64_t w0, uint64_t w1)
+{
+   struct hk_pack_footprint fp = {.known = true};
+   if (r_handle) {
+      fp.reads[0] = (struct hk_pack_interval){.start = r0, .end = r1, .handle = r_handle};
+      fp.num_reads = 1;
+   }
+   if (w_handle) {
+      fp.writes[0] = (struct hk_pack_interval){.start = w0, .end = w1, .handle = w_handle};
+      fp.num_writes = 1;
+   }
+   return fp;
+}
+
+static void
+test_hazard_tracker(void)
+{
+   struct hk_pack_hazard_state st = {0};
+
+   /* Disjoint dispatches: elide weak barrier when overlap is allowed. */
+   struct hk_pack_footprint a = make_fp(1, 0, 1024, 2, 0, 1024);
+   struct hk_pack_footprint b = make_fp(3, 0, 1024, 4, 0, 1024);
+   hk_pack_hazard_record(&st, &a, false);
+   T("hazard: disjoint pair elides barrier when overlap allowed",
+     hk_pack_hazard_decide(&st, &b, true) == HK_PACK_BOUNDARY_ELIDE_BARRIER &&
+     st.num_dirty_writes == 1 && st.num_dirty_reads == 1);
+
+   /* Disjoint pair with !can_elide_weak keeps weak barrier and clears dirty_reads
+    * while preserving dirty_writes for subsequent RAW detection. */
+   hk_pack_hazard_record(&st, &b, false);
+   struct hk_pack_footprint c = make_fp(5, 0, 1024, 6, 0, 1024);
+   T("hazard: !can_elide_weak keeps weak barrier and retains dirty_writes",
+     hk_pack_hazard_decide(&st, &c, false) == HK_PACK_BOUNDARY_KEEP_WEAK &&
+     st.num_dirty_writes == 2 && st.num_dirty_reads == 0);
+
+   /* Delayed RAW against earlier member `a` (bo 2) triggers STRONG and resets. */
+   hk_pack_hazard_record(&st, &c, false);
+   struct hk_pack_footprint raw_a = make_fp(2, 512, 1024, 7, 0, 1024);
+   T("hazard: delayed RAW triggers strong flush and resets state",
+     hk_pack_hazard_decide(&st, &raw_a, true) == HK_PACK_BOUNDARY_STRONG &&
+     st.num_dirty_writes == 0 && st.num_dirty_reads == 0 &&
+     !st.write_unknown && !st.read_unknown);
+
+   /* WAW against dirty write triggers STRONG. */
+   hk_pack_hazard_record(&st, &a, false);
+   struct hk_pack_footprint waw_a = make_fp(9, 0, 512, 2, 0, 256);
+   T("hazard: WAW triggers strong flush",
+     hk_pack_hazard_decide(&st, &waw_a, true) == HK_PACK_BOUNDARY_STRONG &&
+     st.num_dirty_writes == 0);
+
+   /* WAR against dirty read keeps weak barrier (does not need strong flush). */
+   hk_pack_hazard_record(&st, &a, false);
+   struct hk_pack_footprint war_a = make_fp(9, 0, 512, 1, 256, 512);
+   T("hazard: WAR keeps weak barrier and retains dirty_writes",
+     hk_pack_hazard_decide(&st, &war_a, true) == HK_PACK_BOUNDARY_KEEP_WEAK &&
+     st.num_dirty_writes == 1 && st.num_dirty_reads == 0);
+
+   /* Touching ranges on same handle [0,1024) vs [1024,2048) are disjoint. */
+   hk_pack_hazard_reset_all(&st);
+   struct hk_pack_footprint sub0 = make_fp(1, 0, 1024, 1, 1024, 2048);
+   struct hk_pack_footprint sub1 = make_fp(1, 2048, 3072, 1, 3072, 4096);
+   hk_pack_hazard_record(&st, &sub0, false);
+   T("hazard: non-overlapping subranges on same BO elide barrier",
+     hk_pack_hazard_decide(&st, &sub1, true) == HK_PACK_BOUNDARY_ELIDE_BARRIER);
+
+   /* strong_flushed=true clears all accumulated state even for unknown fp. */
+   hk_pack_hazard_record(&st, NULL, true);
+   T("hazard: strong_flushed clears state",
+     st.num_dirty_writes == 0 && st.num_dirty_reads == 0 &&
+     !st.write_unknown && !st.read_unknown);
+
+   /* Unknown producer fails closed to STRONG. */
+   struct hk_pack_footprint unk = {.known = false};
+   hk_pack_hazard_record(&st, &unk, false);
+   T("hazard: unknown producer fails closed to strong",
+     hk_pack_hazard_decide(&st, &b, true) == HK_PACK_BOUNDARY_STRONG &&
+     !st.write_unknown && !st.read_unknown);
+
+   /* Unknown consumer fails closed to STRONG. */
+   hk_pack_hazard_record(&st, &a, false);
+   T("hazard: unknown consumer fails closed to strong",
+     hk_pack_hazard_decide(&st, &unk, true) == HK_PACK_BOUNDARY_STRONG &&
+     st.num_dirty_writes == 0);
+
+   /* Duplicate interval dedup avoids spurious overflow. */
+   hk_pack_hazard_reset_all(&st);
+   for (unsigned i = 0; i < HK_PACK_HAZARD_MAX_INTERVALS + 16; ++i)
+      hk_pack_hazard_record(&st, &a, false);
+   T("hazard: duplicate intervals deduplicate without overflow",
+     !st.write_unknown && !st.read_unknown &&
+     st.num_dirty_writes == 1 && st.num_dirty_reads == 1 &&
+     hk_pack_hazard_decide(&st, &b, true) == HK_PACK_BOUNDARY_ELIDE_BARRIER);
+
+   /* Distinct write intervals exceeding capacity fail closed to STRONG. */
+   hk_pack_hazard_reset_all(&st);
+   for (unsigned i = 0; i <= HK_PACK_HAZARD_MAX_INTERVALS; ++i) {
+      struct hk_pack_footprint fi = make_fp(100, 0, 64, 200 + i, 0, 64);
+      hk_pack_hazard_record(&st, &fi, false);
+   }
+   T("hazard: dirty_writes overflow fails closed to strong",
+     st.write_unknown &&
+     hk_pack_hazard_decide(&st, &b, true) == HK_PACK_BOUNDARY_STRONG);
+
+   /* Distinct read intervals exceeding capacity fail closed to KEEP_WEAK. */
+   hk_pack_hazard_reset_all(&st);
+   for (unsigned i = 0; i <= HK_PACK_HAZARD_MAX_INTERVALS; ++i) {
+      struct hk_pack_footprint fi = make_fp(300 + i, 0, 64, 400, 0, 64);
+      hk_pack_hazard_record(&st, &fi, false);
+   }
+   T("hazard: dirty_reads overflow fails closed to keep weak",
+     !st.write_unknown && st.read_unknown &&
+     hk_pack_hazard_decide(&st, &b, true) == HK_PACK_BOUNDARY_KEEP_WEAK &&
+     !st.read_unknown && st.num_dirty_reads == 0 && st.num_dirty_writes == 1);
+}
+
+static void
+test_liveness_tracker(void)
+{
+   struct hk_pack_liveness_state st;
+   hk_pack_liveness_reset(&st);
+
+   const struct hk_pack_interval h1_0_64 = { .start = 0, .end = 64, .handle = 1 };
+   const struct hk_pack_interval h1_64_128 = { .start = 64, .end = 128, .handle = 1 };
+   const struct hk_pack_interval h1_0_128 = { .start = 0, .end = 128, .handle = 1 };
+   const struct hk_pack_interval h1_16_48 = { .start = 16, .end = 48, .handle = 1 };
+   const struct hk_pack_interval h1_0_16 = { .start = 0, .end = 16, .handle = 1 };
+   const struct hk_pack_interval h1_48_128 = { .start = 48, .end = 128, .handle = 1 };
+   const struct hk_pack_interval h2_0_64 = { .start = 0, .end = 64, .handle = 2 };
+
+   T("liveness: empty state covers nothing", !hk_pack_liveness_covers(&st, &h1_0_64));
+
+   hk_pack_liveness_add_overwrite(&st, &h1_0_64);
+   T("liveness: exact and sub-interval covered after overwrite",
+     hk_pack_liveness_covers(&st, &h1_0_64) &&
+     hk_pack_liveness_covers(&st, &h1_16_48) &&
+     !hk_pack_liveness_covers(&st, &h1_0_128) &&
+     !hk_pack_liveness_covers(&st, &h2_0_64));
+
+   /* Adjacent overwrite coalesces into single [0, 128) interval. */
+   hk_pack_liveness_add_overwrite(&st, &h1_64_128);
+   T("liveness: adjacent overwrites coalesce",
+     st.num_dead == 1 && hk_pack_liveness_covers(&st, &h1_0_128));
+
+   /* Interior read splits [0, 128) into [0, 16) and [48, 128). */
+   hk_pack_liveness_kill_read(&st, &h1_16_48);
+   T("liveness: interior read splits dead interval",
+     st.num_dead == 2 &&
+     hk_pack_liveness_covers(&st, &h1_0_16) &&
+     hk_pack_liveness_covers(&st, &h1_48_128) &&
+     !hk_pack_liveness_covers(&st, &h1_16_48) &&
+     !hk_pack_liveness_covers(&st, &h1_0_64));
+
+   /* Left and right trims + exact kill. */
+   const struct hk_pack_interval h1_0_8 = { .start = 0, .end = 8, .handle = 1 };
+   const struct hk_pack_interval h1_8_16 = { .start = 8, .end = 16, .handle = 1 };
+   const struct hk_pack_interval h1_96_128 = { .start = 96, .end = 128, .handle = 1 };
+   const struct hk_pack_interval h1_48_96 = { .start = 48, .end = 96, .handle = 1 };
+   hk_pack_liveness_kill_read(&st, &h1_0_8);
+   hk_pack_liveness_kill_read(&st, &h1_96_128);
+   T("liveness: left/right trims preserve remaining dead ranges",
+     hk_pack_liveness_covers(&st, &h1_8_16) &&
+     !hk_pack_liveness_covers(&st, &h1_0_8) &&
+     hk_pack_liveness_covers(&st, &h1_48_96) &&
+     !hk_pack_liveness_covers(&st, &h1_96_128));
+   hk_pack_liveness_kill_read(&st, &h1_0_128);
+   T("liveness: covering read kills all overlapping intervals", st.num_dead == 0);
+
+   /* Backward step: in-place read+write leaves interval LIVE before op. */
+   struct hk_pack_footprint inplace = make_fp(1, 0, 64, 1, 0, 64);
+   hk_pack_liveness_add_overwrite(&st, &h1_0_64);
+   hk_pack_liveness_step_backward(&st, &inplace);
+   T("liveness: in-place read+write kills deadness before op",
+     !hk_pack_liveness_covers(&st, &h1_0_64));
+
+   /* Backward step: pure overwrite marks dead, unknown op fails closed. */
+   struct hk_pack_footprint wr1 = make_fp(2, 0, 64, 1, 0, 64);
+   hk_pack_liveness_step_backward(&st, &wr1);
+   T("liveness: pure overwrite marks target dead",
+     hk_pack_liveness_covers(&st, &h1_0_64) &&
+     !hk_pack_liveness_covers(&st, &h2_0_64));
+
+   struct hk_pack_footprint unk = { .known = false };
+   hk_pack_liveness_step_backward(&st, &unk);
+   T("liveness: unknown footprint resets all dead intervals", st.num_dead == 0);
+
+   /* Invalid read fails closed (resets). */
+   hk_pack_liveness_add_overwrite(&st, &h1_0_64);
+   const struct hk_pack_interval bad_iv = { .start = 64, .end = 64, .handle = 1 };
+   hk_pack_liveness_kill_read(&st, &bad_iv);
+   T("liveness: invalid read interval fails closed", st.num_dead == 0);
+
+   /* Capacity overflow drops extra intervals soundly (never over-approximates). */
+   for (unsigned i = 0; i < HK_PACK_LIVENESS_MAX_INTERVALS + 8; ++i) {
+      struct hk_pack_interval iv = { .start = 0, .end = 64, .handle = 100 + i };
+      hk_pack_liveness_add_overwrite(&st, &iv);
+   }
+   const struct hk_pack_interval overflow_iv = {
+      .start = 0, .end = 64, .handle = 100 + HK_PACK_LIVENESS_MAX_INTERVALS + 4,
+   };
+   T("liveness: capacity overflow drops conservatively",
+     st.num_dead == HK_PACK_LIVENESS_MAX_INTERVALS &&
+     !hk_pack_liveness_covers(&st, &overflow_iv));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1765,12 +1971,109 @@ main(int argc, char **argv)
    test_full_classes();
    test_random();
    test_history();
-   test_packet_reuse(false);
-   test_span_pool_policy();
    test_compute_pair_stream_safety();
    test_fadd_copy4_fusion_gate();
    test_fused_packet_reuse(false);
    test_pack_add_bo();
+   test_hazard_tracker();
+   test_liveness_tracker();
+
+   /* Bounded-loop accounting, NIR-bound expression eval, and post-fusion budget checks. */
+   {
+      uint64_t w = 0;
+      T("unbounded looping dispatch sets pack_loops",
+        hk_pack_account_dispatch_work(1024, 64, true, 0, &w) && w == 65536);
+      T("bounded looping dispatch scales work and clears pack_loops",
+        !hk_pack_account_dispatch_work(1024, 64, true, 13, &w) && w == 1024ull * 64 * 13);
+      T("bounded looping dispatch over work limit sets pack_loops and saturates",
+        hk_pack_account_dispatch_work(1ull << 24, 256, true, 16, &w) && w == UINT64_MAX);
+      T("overflowing bounded loop sets pack_loops and saturates",
+        hk_pack_account_dispatch_work(UINT64_MAX / 2, 4, true, 4, &w) && w == UINT64_MAX);
+      T("effective-instr bounded looping dispatch scales work directly",
+        !hk_pack_account_dispatch_work_eff(1024, 500, true, 800, &w) && w == 1024ull * 800);
+      T("effective-instr zero fails closed to pack_loops",
+        hk_pack_account_dispatch_work_eff(1024, 500, true, 0, &w) && w == 1024ull * 500);
+
+      /* Expression evaluator: max(3, kh * (1 + kw)) */
+      struct hk_pack_loop_bound lb = {
+         .valid = true,
+         .work_valid = true,
+         .count = 7,
+         .work_count = 3,
+         .static_nir_ops = 400,
+         .ops = {
+            [0] = { .kind = HK_PACK_LOOP_OP_CONST, .imm = 3 },
+            [1] = { .kind = HK_PACK_LOOP_OP_PARAM, .imm = HK_PACK_LOOP_PARAM_DW_KH },
+            [2] = { .kind = HK_PACK_LOOP_OP_CONST, .imm = 1 },
+            [3] = { .kind = HK_PACK_LOOP_OP_PARAM, .imm = HK_PACK_LOOP_PARAM_DW_KW },
+            [4] = { .kind = HK_PACK_LOOP_OP_ADD, .lhs = 2, .rhs = 3 },
+            [5] = { .kind = HK_PACK_LOOP_OP_MUL, .lhs = 1, .rhs = 4 },
+            [6] = { .kind = HK_PACK_LOOP_OP_MAX, .lhs = 0, .rhs = 5 },
+         },
+         .work_ops = {
+            [0] = { .kind = HK_PACK_LOOP_OP_PARAM, .imm = HK_PACK_LOOP_PARAM_DW_KH },
+            [1] = { .kind = HK_PACK_LOOP_OP_CONST, .imm = 100 },
+            [2] = { .kind = HK_PACK_LOOP_OP_MUL, .lhs = 0, .rhs = 1 },
+         },
+      };
+      uint64_t params[HK_PACK_LOOP_PARAM_COUNT] = {0};
+      params[HK_PACK_LOOP_PARAM_DW_KH] = 3;
+      params[HK_PACK_LOOP_PARAM_DW_KW] = 3;
+      uint64_t bval = 0, eff = 0;
+      T("eval nested depthwise back-edges expression",
+        hk_pack_eval_loop_bound(&lb, params, &bval) && bval == 12);
+      T("eval CF-weighted effective instrs tightens multi-branch bound",
+        hk_pack_eval_effective_instrs(&lb, 400, params, &eff) &&
+        eff == 600 && eff < 400 * bval);
+      lb.work_valid = false;
+      T("eval effective instrs falls back to agx_instrs * loop_bound without work_ops",
+        hk_pack_eval_effective_instrs(&lb, 400, params, &eff) &&
+        eff == 400 * bval);
+      lb.work_valid = true;
+      params[HK_PACK_LOOP_PARAM_DW_KH] = UINT64_MAX;
+      params[HK_PACK_LOOP_PARAM_DW_KW] = 2;
+      T("eval rejects overflow cleanly",
+        !hk_pack_eval_loop_bound(&lb, params, &bval) && bval == 0);
+      T("eval effective instrs rejects overflow cleanly",
+        !hk_pack_eval_effective_instrs(&lb, 400, params, &eff) && eff == 0);
+      lb.valid = false;
+      T("eval rejects invalid loop bound",
+        !hk_pack_eval_loop_bound(&lb, params, &bval) && bval == 0);
+      T("eval effective instrs rejects invalid loop bound",
+        !hk_pack_eval_effective_instrs(&lb, 400, params, &eff) && eff == 0);
+
+      /* Post-fusion run re-accounting (e.g. DUAL_PAD4 zero-fill loop). */
+      uint64_t nw = 0;
+      unsigned nl = 0;
+      T("fusion fits when post-fusion work stays within HK_PACK_MAX_STATIC_WORK",
+        hk_pack_fusion_fits_run(10000, 0, 3000, 0, 4500, false, &nw, &nl) &&
+        nw == 11500 && nl == 0);
+      T("fusion rejected when DUAL_PAD4 zero-fill blows HK_PACK_MAX_STATIC_WORK",
+        !hk_pack_fusion_fits_run(HK_PACK_MAX_STATIC_WORK - 1000, 0, 500, 0,
+                                 5000, false, &nw, &nl));
+      T("fusion rejected when adding a second unbounded loop to a packed run",
+        !hk_pack_fusion_fits_run(10000, 1, 2000, 0, 2000, true, &nw, &nl));
+      T("fusion accepted when replacing the run's only unbounded loop",
+        hk_pack_fusion_fits_run(10000, 1, 2000, 1, 2500, true, &nw, &nl) &&
+        nw == 10500 && nl == 1);
+
+      /* Two bounded-loop members pack into one packet. */
+      struct hk_cmd_buffer *cbs[2] = { plain(1), plain(1) };
+      for (unsigned i = 0; i < 2; ++i) {
+         struct hk_cs *cs = first_cs(cbs[i]);
+         cs->pack_loops = hk_pack_account_dispatch_work(
+            4096, 128, true, 13, &w);
+         cs->pack_static_work = w;
+      }
+      struct hk_pack_run runs[2];
+      unsigned rc = 0;
+      plan_on(cbs, 2, 0, false, runs, &rc);
+      T("two bounded looping members pack into one packet",
+        rc == 1 && runs[0].count == 2);
+   }
+
+   test_packet_reuse(false);
+   test_span_pool_policy();
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
