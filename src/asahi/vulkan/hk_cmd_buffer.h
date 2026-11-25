@@ -2158,6 +2158,9 @@ struct hk_uploader {
 
    /* VDM uploader only: low alias of base (its hk_vdm_allocation's alias). */
    uint64_t vdm_alias;
+
+   /* Current backing BO is mapped CPU write-back (AGX_BO_WRITEBACK). */
+   bool cpu_cached;
 };
 
 /*
@@ -3043,6 +3046,21 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    gfx->g17p_bind_tail_memo.viewport_valid = false;
    if (cmd->current_cs.gfx)
       cmd->current_cs.gfx->g17p_bind_tail.valid = false;
+}
+
+static inline struct hk_api_shader *
+hk_bound_fs_obj(struct hk_graphics_state *gfx)
+{
+   if (gfx->mesh_fs)
+      return gfx->mesh_fs;
+   return gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
+}
+
+static inline struct hk_shader *
+hk_bound_fs(struct hk_cmd_buffer *cmd)
+{
+   return hk_fs_variant(hk_bound_fs_obj(&cmd->state.gfx),
+                        cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
 }
 
 static inline size_t

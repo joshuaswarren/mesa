@@ -7815,6 +7815,21 @@ hk_fs_sample_variant_store(struct hk_device *dev,
    blob_finish(&blob);
 }
 
+bool
+hk_fs_sample_variant_ready(const struct hk_api_shader *obj, unsigned idx)
+{
+   if (!obj || idx >= hk_api_num_variants(obj))
+      return false;
+
+   const struct hk_fs_sample_source *src = obj->sample_source;
+   if (src) {
+      if (!(p_atomic_read(&src->ready_mask) & BITFIELD_BIT(idx)))
+         return false;
+   }
+
+   return obj->variants[idx].compiled;
+}
+
 VkResult
 hk_fs_build_sample_variant(struct hk_device *dev, struct hk_api_shader *obj,
                            unsigned samples)

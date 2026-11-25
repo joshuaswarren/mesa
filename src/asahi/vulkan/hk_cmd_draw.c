@@ -116,7 +116,6 @@
    (cmd->state.gfx.linked_dirty & BITFIELD_BIT(MESA_SHADER_##bit))
 
 static void hk_flush_shaders(struct hk_cmd_buffer *cmd);
-static struct hk_shader *hk_bound_fs(struct hk_cmd_buffer *cmd);
 static uint64_t hk_heap(struct hk_cmd_buffer *cmd);
 static bool hk_cmd_ensure_geometry_heap(struct hk_cmd_buffer *cmd);
 static enum mesa_prim hk_gs_in_prim(struct hk_cmd_buffer *cmd);
@@ -336,6 +335,10 @@ hk_cmd_invalidate_graphics_state(struct hk_cmd_buffer *cmd)
    memset(&cmd->sync.xfer_clean, 0, sizeof(cmd->sync.xfer_clean));
    gfx->render = render_save;
    memcpy(gfx->descriptors.push, push, sizeof(push));
+   for (unsigned i = 0; i < HK_MAX_SETS; i++) {
+      if (gfx->descriptors.push[i])
+         hk_push_descriptor_set_reset_upload(gfx->descriptors.push[i]);
+   }
    gfx->descriptors.root.draw.pipeline_stats = pipeline_stats;
    gfx->descriptors.root.draw.pipeline_stats_flags = pipeline_stats_flags;
    gfx->descriptors.root.mesh_prims_query = mesh_prims_query;
@@ -3969,11 +3972,13 @@ hk_xfer_check_draw_slow(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
    const bool desc_clean =
       st->xfer_clean.desc_valid &&
       st->xfer_clean.desc_version == st->xfer_version &&
+      !gfx->descriptors.push_dirty &&
       st->xfer_clean.descriptors == gfx->descriptors.non_push_generation;
    if (!desc_clean) {
       hk_upload_stat(cmd, xfer_desc_walks, 1);
       struct hk_cs *desc_match = hk_xfer_match_descriptors(cmd, NULL);
-      st->xfer_clean.desc_valid = desc_match == NULL;
+      st->xfer_clean.desc_valid =
+         desc_match == NULL && !gfx->descriptors.push_dirty;
       st->xfer_clean.desc_version = st->xfer_version;
       st->xfer_clean.descriptors = gfx->descriptors.non_push_generation;
       best = hk_sync_later(best, desc_match);
@@ -6166,21 +6171,6 @@ hk_rast_prim(struct hk_cmd_buffer *cmd)
          return hk_gs_in_prim(cmd);
       }
    }
-}
-
-static struct hk_api_shader *
-hk_bound_fs_obj(struct hk_graphics_state *gfx)
-{
-   if (gfx->mesh_fs)
-      return gfx->mesh_fs;
-   return gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
-}
-
-static struct hk_shader *
-hk_bound_fs(struct hk_cmd_buffer *cmd)
-{
-   return hk_fs_variant(hk_bound_fs_obj(&cmd->state.gfx),
-                        cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
 }
 
 static uint64_t
@@ -10357,9 +10347,10 @@ hk_g17p_prepared_bind_tail_matches_impl(
 
    /* The tail launches a fragment program whose UNIFORM_DMA span, when it is
     * set-sourced, names the set address the root held when the program was
-    * built (hk_g17p_dma_set_base()). A push descriptor set gets its address
-    * when it is flushed, which moves that address without a new descriptor
-    * generation or root identity. */
+    * built (hk_g17p_dma_set_base()). Flushing a changed push descriptor set
+    * updates that address and advances descriptor generation; checking
+    * fragment_dma_set_base directly also guards against any cached-root or
+    * descriptor-buffer set-base mismatch. */
    const bool desc_gen_match =
       check_push
          ? prepared->descriptor_generation == gfx->descriptors.generation
