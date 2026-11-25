@@ -356,6 +356,7 @@ bool agx_nir_lower_g18g_storage_images(
 #define AGX_G18G_TABLE_MAX_SAMPLERS 8
 struct agx_g18g_table_entry {
    uint8_t set;
+   bool clamp_0;
    uint32_t offset_B;
 };
 struct agx_g18g_table_binding {

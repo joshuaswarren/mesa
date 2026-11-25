@@ -2922,6 +2922,11 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          }
          memcpy(&published, (const uint8_t *)set->mapped_ptr + e->offset_B,
                 sizeof(published));
+         if (e->clamp_0) {
+            if ((int16_t)published < 0)
+               continue;
+            published &= HK_BORDER_IS_INT_BIT - 1;
+         }
          const uint16_t native = hk_sampler_heap_index(
             set->layout->native_sampler_indices, published);
          if (native >= dev->samplers.table.alloc) {
