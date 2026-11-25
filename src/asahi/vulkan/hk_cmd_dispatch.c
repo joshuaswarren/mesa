@@ -2492,10 +2492,8 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                 (const uint8_t *)texture_set->mapped_ptr +
                    binding->sampler_index_offset_B,
                 sizeof(sampler_index));
-         /* G18G publishes AGX2-biased sampler indices (native_sampler_indices
-          * in hk_descriptor_set_layout.c). */
-         if (dev->dev.chip == AGX_CHIP_G18G)
-            sampler_index = hk_sampler_heap_index(false, sampler_index);
+         sampler_index = hk_sampler_heap_index(
+            texture_set->layout->native_sampler_indices, sampler_index);
          const uint64_t write_control = hk_pool_upload(
             cmd, hk_g17p_native_write_control,
             sizeof(hk_g17p_native_write_control), 32);
@@ -2575,10 +2573,8 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                 (const uint8_t *)set->mapped_ptr +
                    binding->sampler_index_offset_B,
                 sizeof(sampler_index));
-         /* G18G publishes AGX2-biased sampler indices (native_sampler_indices
-          * in hk_descriptor_set_layout.c). */
-         if (dev->dev.chip == AGX_CHIP_G18G)
-            sampler_index = hk_sampler_heap_index(false, sampler_index);
+         sampler_index = hk_sampler_heap_index(
+            set->layout->native_sampler_indices, sampler_index);
          if (!dev->samplers.table.bo || !dev->samplers.table.bo->va) {
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
             return;

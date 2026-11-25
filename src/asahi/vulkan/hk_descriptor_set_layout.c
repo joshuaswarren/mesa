@@ -330,7 +330,7 @@ hk_CreateDescriptorSetLayout(VkDevice device,
    layout->binding_count = num_bindings;
    layout->descriptor_generation =
       agx_chip_descriptor_generation(pdev->dev.chip);
-   layout->native_sampler_indices = agx_chip_native_or_m5(pdev->dev.chip);
+   layout->native_sampler_indices = agx_chip_agx3_path(pdev->dev.chip);
 
    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
       const VkDescriptorSetLayoutBinding *binding = &pCreateInfo->pBindings[j];
@@ -660,7 +660,7 @@ hk_descriptor_set_layout_deserialize(struct hk_device *dev,
     * blob cannot hold was not written by the serializer. */
    if (blob->overrun ||
        descriptor_generation != agx_chip_descriptor_generation(chip) ||
-       native_sampler_indices != agx_chip_native_or_m5(chip) ||
+       native_sampler_indices != agx_chip_agx3_path(chip) ||
        binding_count > (size_t)(blob->end - blob->current) /
                           HK_SERIALIZED_BINDING_MIN_SIZE)
       return NULL;
