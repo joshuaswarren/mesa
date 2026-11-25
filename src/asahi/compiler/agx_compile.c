@@ -12178,6 +12178,20 @@ pre_preamble:
       NIR_PASS(progress, nir, nir_opt_dce);
       progress = false;
    } while (progress);
+
+   if ((byte_indices || m5) && nir->info.stage == MESA_SHADER_COMPUTE) {
+      bool conv_opt = false;
+      NIR_PASS(conv_opt, nir, agx_nir_opt_dw_conv_3x3);
+      if (conv_opt) {
+         NIR_PASS(_, nir, nir_opt_copy_prop);
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+         NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+         nir_divergence_analysis(nir);
+      }
+   }
 }
 
 /*

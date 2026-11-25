@@ -34,6 +34,7 @@ libasahi_agx_files = files(
   'agx_nir_opt_select_load.c',
   'agx_nir_opt_u8x4_hsum.c',
   'agx_nir_opt_licm.c',
+  'agx_nir_opt_dw_conv_3x3.c',
   'agx_nir_opt_uniform_idiv.c',
   'agx_nir_opt_monotonic_bit_insert.c',
   'agx_nir_opt_iv_divmod.c',
@@ -234,6 +235,17 @@ libasahi_compiler = static_library(
 )
 
 if with_tests
+  test(
+    'agx_nir_opt_dw_conv_3x3',
+    executable(
+      'agx_nir_opt_dw_conv_3x3_test',
+      files('test/test-dw-conv-3x3.c'),
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+      include_directories : [inc_include, inc_src],
+    ),
+    suite : ['asahi'],
+  )
   # The generated tables hold exactly the rows of the tables their
   # descriptions were made from.
   foreach t : ['agx3b', 'agx3c', 'agx3d']
