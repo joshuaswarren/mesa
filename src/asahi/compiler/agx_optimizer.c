@@ -546,9 +546,11 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
           ((s == 0 && I->src[1].neg) || (s == 1 && I->src[0].neg)))
          continue;
 
-      /* G17P has no iadd of two immediates. The ushr count copy
-       * `iadd #0, count` must keep its register count. */
-      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+      /* No AGX3 encoding has an iadd of two immediates: the G17P, M5 and
+       * G18G packers all refuse it. The ushr count copy `iadd #0, count`
+       * must keep its register count, and so must the sign extension
+       * `iadd d32, h16, #0` of a compare that folded to a constant. */
+      if (ctx->key && agx_isa_is_agx3(ctx->key->dev.encoding) &&
           I->op == AGX_OPCODE_IADD && I->nr_srcs == 2 &&
           I->src[1 - s].type == AGX_INDEX_IMMEDIATE)
          continue;
@@ -1402,7 +1404,7 @@ bool
 agx_eval_immediate_icond(agx_context *ctx, enum agx_icond icond, agx_index x,
                          agx_index y, bool *result)
 {
-   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
        x.type != AGX_INDEX_IMMEDIATE || y.type != AGX_INDEX_IMMEDIATE ||
        x.neg || y.neg)
       return false;
@@ -1598,7 +1600,7 @@ agx_select_compare_cut(const void *a, const void *b)
 static void
 agx_optimizer_select_guard(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
-   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
        I->op != AGX_OPCODE_ICMPSEL || I->saturate || I->invert_cond ||
        agx_channels(I->dest[0]) != 1)
       return;
