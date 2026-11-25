@@ -233,6 +233,40 @@ if with_tests and with_tools.contains('drm-shim')
     )
   endforeach
 
+  asahi_m5_compression_test = executable(
+    'asahi-m5-compression',
+    files('tests/test-agx-m5-compression.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+    build_by_default : false,
+  )
+  # Every submission passes the M5 kernel's checks, with and without the
+  # compressed multisample ZLS feature bits, and a refused one fails the run.
+  foreach msaa_zls : ['on', 'off']
+    test(
+      'asahi-g17s-kernel-m5-compression-msaa-zls-' + msaa_zls,
+      prog_python,
+      args : [
+        files('tests/run-shim.py'), libasahi_noop_drm_shim,
+        asahi_m5_compression_test,
+      ],
+      env : ['ASAHI_SHIM_CHIP=g17s-kernel', 'ASAHI_SHIM_M5_EXPECT_VALID=1',
+             'MESA_SHADER_CACHE_DISABLE=true'] +
+            (msaa_zls == 'off' ? ['ASAHI_SHIM_NO_M5_MSAA_ZLS_COMPRESSION=1'] : []),
+      suite : ['asahi'],
+    )
+  endforeach
+
   test(
     'asahi-g17p-texture-crawl',
     executable(

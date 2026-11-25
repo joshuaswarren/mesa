@@ -1421,6 +1421,46 @@ vk_common_QueueSubmit2(VkQueue _queue,
       }
    }
 
+   /* Fast path for a single immediate submit without wait semaphores: keep
+    * the submission descriptor and small arrays on the stack instead of
+    * hitting the device allocator on every queue submission. */
+   if (submitCount == 1 &&
+       queue->submit.mode == VK_QUEUE_SUBMIT_MODE_IMMEDIATE &&
+       queue->base.device->timeline_mode != VK_DEVICE_TIMELINE_MODE_EMULATED &&
+       pSubmits[0].waitSemaphoreInfoCount == 0 &&
+       pSubmits[0].commandBufferInfoCount <= 4 &&
+       pSubmits[0].signalSemaphoreInfoCount <= 4u - (fence != NULL)) {
+      struct vk_command_buffer *cmd_bufs[4];
+      struct vk_sync_signal signals[4];
+      struct vk_queue_submit stack_submit = {
+         .command_buffers = cmd_bufs,
+         .signals = signals,
+         .is_protected = !!(pSubmits[0].flags & VK_SUBMIT_PROTECTED_BIT),
+      };
+      const VkPerformanceQuerySubmitInfoKHR *perf_info =
+         vk_find_struct_const(pSubmits[0].pNext,
+                              PERFORMANCE_QUERY_SUBMIT_INFO_KHR);
+      stack_submit.perf_pass_index =
+         perf_info ? perf_info->counterPassIndex : 0;
+
+      for (uint32_t j = 0; j < pSubmits[0].commandBufferInfoCount; j++) {
+         vk_queue_submit_add_command_buffer(queue, &stack_submit,
+                                            &pSubmits[0].pCommandBufferInfos[j]);
+      }
+
+      for (uint32_t j = 0; j < pSubmits[0].signalSemaphoreInfoCount; j++) {
+         result = vk_queue_submit_add_semaphore_signal(
+            queue, &stack_submit, &pSubmits[0].pSignalSemaphoreInfos[j]);
+         if (unlikely(result != VK_SUCCESS))
+            return result;
+      }
+
+      if (fence != NULL)
+         vk_queue_submit_add_fence_signal(queue, &stack_submit, fence);
+
+      return vk_queue_submit_final(queue, &stack_submit);
+   }
+
    struct vk_queue_submit *last_submit = NULL;
    for (uint32_t i = 0; i < submitCount; i++) {
       struct vulkan_submit_info info = {

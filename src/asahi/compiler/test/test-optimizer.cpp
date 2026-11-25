@@ -2159,3 +2159,191 @@ TEST_F(Optimizer, AGX3BFoldsAlignedUniformDeviceLoadBase)
       }
    }
 }
+
+TEST_F(Optimizer, FoldXorBoolInvertIntoCompare)
+{
+   CASE16(
+      {
+         agx_index cmp = agx_temp(b->shader, AGX_SIZE_16);
+         agx_fcmp_to(b, cmp, wx, wy, AGX_FCOND_GE, false);
+         agx_xor_to(b, out, cmp, agx_immediate(1));
+      },
+      agx_fcmp_to(b, out, wx, wy, AGX_FCOND_GE, true));
+
+   CASE16(
+      {
+         agx_index cmp = agx_temp(b->shader, AGX_SIZE_16);
+         agx_fcmp_to(b, cmp, wx, wy, AGX_FCOND_LT, true);
+         agx_xor_to(b, out, cmp, agx_immediate(1));
+      },
+      agx_fcmp_to(b, out, wx, wy, AGX_FCOND_LT, false));
+
+   CASE16(
+      {
+         agx_index cmp = agx_temp(b->shader, AGX_SIZE_16);
+         agx_icmp_to(b, cmp, wx, wy, AGX_ICOND_UEQ, false);
+         agx_xor_to(b, out, cmp, agx_immediate(1));
+      },
+      agx_icmp_to(b, out, wx, wy, AGX_ICOND_UEQ, true));
+
+   CASE16(
+      {
+         agx_index cmp = agx_temp(b->shader, AGX_SIZE_16);
+         agx_icmp_to(b, cmp, wx, wy, AGX_ICOND_ULT, true);
+         agx_xor_to(b, out, agx_immediate(1), cmp);
+      },
+      agx_icmp_to(b, out, wx, wy, AGX_ICOND_ULT, false));
+
+   /* Multi-use compare must stay untouched so the other user keeps its sense. */
+   agx_builder *b = agx_test_builder(mem_ctx);
+   agx_index cmp = agx_temp(b->shader, AGX_SIZE_16);
+   agx_fcmp_to(b, cmp, wx, wy, AGX_FCOND_GE, false);
+   agx_index inv = agx_temp(b->shader, AGX_SIZE_16);
+   agx_xor_to(b, inv, cmp, agx_immediate(1));
+   agx_unit_test(b, cmp);
+   agx_unit_test(b, inv);
+   agx_optimize_and_dce(b->shader);
+
+   unsigned fcmps = 0, xors = 0;
+   agx_foreach_instr_global(b->shader, I) {
+      if (I->op == AGX_OPCODE_FCMP) {
+         fcmps++;
+         EXPECT_FALSE(I->invert_cond);
+      } else if (I->op == AGX_OPCODE_BITOP &&
+                 I->truth_table == UTIL_LUT2(a ^ b)) {
+         xors++;
+      }
+   }
+   EXPECT_EQ(fcmps, 1u);
+   EXPECT_EQ(xors, 1u);
+}
+
+TEST_F(Optimizer, PackFourWayBoolOrBranch)
+{
+   for (bool invert : {false, true}) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *target = agx_test_block(b->shader);
+      agx_block_add_successor(entry, target);
+
+      agx_index c0 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index c1 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index c2 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index c3 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_icmp_to(b, c0, wx, wy, AGX_ICOND_UEQ, false);
+      agx_icmp_to(b, c1, wx, wz, AGX_ICOND_UEQ, false);
+      agx_icmp_to(b, c2, wy, wz, AGX_ICOND_UEQ, false);
+      agx_fcmp_to(b, c3, wx, wy, AGX_FCOND_GE, true);
+
+      agx_index or01 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index or012 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index any = agx_temp(b->shader, AGX_SIZE_16);
+      agx_icmpsel_to(b, or01, c0, agx_zero(), c1, agx_immediate(1),
+                     AGX_ICOND_UEQ);
+      agx_icmpsel_to(b, or012, or01, agx_zero(), c2, agx_immediate(1),
+                     AGX_ICOND_UEQ);
+      agx_icmpsel_to(b, any, c3, agx_zero(), or012, agx_immediate(1),
+                     AGX_ICOND_UEQ);
+      agx_instr *br =
+         agx_if_icmp(b, any, agx_zero(), 1, AGX_ICOND_UEQ, invert, target);
+
+      agx_opt_pack_bool_or_branch(b->shader);
+
+      unsigned icmpsels = 0, collects = 0, ors32 = 0;
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_ICMPSEL)
+            icmpsels++;
+         else if (I->op == AGX_OPCODE_COLLECT)
+            collects++;
+         else if (I->op == AGX_OPCODE_BITOP &&
+                  I->truth_table == UTIL_LUT2(a | b) &&
+                  I->dest[0].size == AGX_SIZE_32)
+            ors32++;
+      }
+      EXPECT_EQ(icmpsels, 0u);
+      EXPECT_EQ(collects, 2u);
+      EXPECT_EQ(ors32, 1u);
+      EXPECT_EQ(br->src[0].size, AGX_SIZE_32);
+      EXPECT_EQ(br->invert_cond, invert);
+   }
+
+   /* When leaves stay live into nested branches, rewrite the serial icmpsel
+    * chain into a balanced 16-bit bitwise OR tree without collects. */
+   {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *target = agx_test_block(b->shader);
+      agx_block_add_successor(entry, target);
+
+      agx_index c0 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index c1 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index c2 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index c3 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_icmp_to(b, c0, wx, wy, AGX_ICOND_UEQ, false);
+      agx_icmp_to(b, c1, wx, wz, AGX_ICOND_UEQ, false);
+      agx_icmp_to(b, c2, wy, wz, AGX_ICOND_UEQ, false);
+      agx_fcmp_to(b, c3, wx, wy, AGX_FCOND_GE, true);
+
+      agx_index or01 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index or012 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_index any = agx_temp(b->shader, AGX_SIZE_16);
+      agx_icmpsel_to(b, or01, c0, agx_zero(), c1, agx_immediate(1),
+                     AGX_ICOND_UEQ);
+      agx_icmpsel_to(b, or012, or01, agx_zero(), c2, agx_immediate(1),
+                     AGX_ICOND_UEQ);
+      agx_icmpsel_to(b, any, c3, agx_zero(), or012, agx_immediate(1),
+                     AGX_ICOND_UEQ);
+      agx_unit_test(b, c0);
+      agx_instr *br =
+         agx_if_icmp(b, any, agx_zero(), 1, AGX_ICOND_UEQ, true, target);
+
+      agx_opt_pack_bool_or_branch(b->shader);
+
+      unsigned icmpsels = 0, collects = 0, ors16 = 0;
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_ICMPSEL)
+            icmpsels++;
+         else if (I->op == AGX_OPCODE_COLLECT)
+            collects++;
+         else if (I->op == AGX_OPCODE_BITOP &&
+                  I->truth_table == UTIL_LUT2(a | b) &&
+                  I->dest[0].size == AGX_SIZE_16)
+            ors16++;
+      }
+      EXPECT_EQ(icmpsels, 0u);
+      EXPECT_EQ(collects, 0u);
+      EXPECT_EQ(ors16, 3u);
+      EXPECT_EQ(br->src[0].size, AGX_SIZE_16);
+   }
+
+   /* An intermediate OR node with an extra user must not be folded away. */
+   agx_builder *b = agx_test_builder(mem_ctx);
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *target = agx_test_block(b->shader);
+   agx_block_add_successor(entry, target);
+
+   agx_index c0 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_index c1 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_index c2 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_index c3 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_icmp_to(b, c0, wx, wy, AGX_ICOND_UEQ, false);
+   agx_icmp_to(b, c1, wx, wz, AGX_ICOND_UEQ, false);
+   agx_icmp_to(b, c2, wy, wz, AGX_ICOND_UEQ, false);
+   agx_fcmp_to(b, c3, wx, wy, AGX_FCOND_GE, true);
+   agx_index or01 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_index or012 = agx_temp(b->shader, AGX_SIZE_16);
+   agx_index any = agx_temp(b->shader, AGX_SIZE_16);
+   agx_icmpsel_to(b, or01, c0, agx_zero(), c1, agx_immediate(1),
+                  AGX_ICOND_UEQ);
+   agx_icmpsel_to(b, or012, or01, agx_zero(), c2, agx_immediate(1),
+                  AGX_ICOND_UEQ);
+   agx_icmpsel_to(b, any, c3, agx_zero(), or012, agx_immediate(1),
+                  AGX_ICOND_UEQ);
+   agx_unit_test(b, or01);
+   agx_instr *br =
+      agx_if_icmp(b, any, agx_zero(), 1, AGX_ICOND_UEQ, true, target);
+
+   agx_opt_pack_bool_or_branch(b->shader);
+
+   EXPECT_EQ(br->src[0].size, AGX_SIZE_16);
+}

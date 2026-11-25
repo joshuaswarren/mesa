@@ -124,7 +124,18 @@ enum hk_compute_pair_dual_write {
    HK_COMPUTE_PAIR_DUAL_NONE = 0,
    HK_COMPUTE_PAIR_DUAL_COPY = 1,
    HK_COMPUTE_PAIR_DUAL_PAD4 = 2,
+   HK_COMPUTE_PAIR_DUAL_FADD_INPLACE = 3,
+   HK_COMPUTE_PAIR_DUAL_FADD_OUT = 4,
+   HK_COMPUTE_PAIR_DUAL_FADD_COPY_INPLACE = 5,
+   HK_COMPUTE_PAIR_DUAL_FADD_COPY_OUT = 6,
 };
+
+static inline bool
+hk_compute_pair_dual_is_fadd(enum hk_compute_pair_dual_write dual)
+{
+   return dual >= HK_COMPUTE_PAIR_DUAL_FADD_INPLACE &&
+          dual <= HK_COMPUTE_PAIR_DUAL_FADD_COPY_OUT;
+}
 
 static inline uint32_t
 hk_dual_write_push_offset(uint32_t push_bytes)
@@ -135,6 +146,15 @@ hk_dual_write_push_offset(uint32_t push_bytes)
 struct hk_dual_copy_push {
    uint32_t dst2_va_lo;
    uint32_t dst2_va_hi;
+};
+
+struct hk_dual_fadd_push {
+   uint32_t res_delta_lo;
+   uint32_t res_delta_hi;
+   uint32_t dst1_delta_lo;
+   uint32_t dst1_delta_hi;
+   uint32_t dst2_delta_lo;
+   uint32_t dst2_delta_hi;
 };
 
 struct hk_dual_pad4_push {
@@ -247,6 +267,66 @@ static inline uint32_t
 hk_gemm_cmat_tile_m(uint32_t tile_n)
 {
    return tile_n == 32u ? 64u : 32u;
+}
+
+static inline uint32_t
+hk_gemm_cmat_k_step(uint32_t tile_n)
+{
+   return tile_n == 32u ? 16u : 32u;
+}
+
+/* Choose cooperative-matrix tile_n (16, 32, or 64) for a GEMM dispatch.
+ * - N <= 16: cmat16 (32x16, K_step=32) avoids empty N-columns.
+ * - Small-grid high-K GEMMs where cmat64 (g64 <= 16 with K >= 64, or
+ *   g64 <= 28 with K >= 128) or cmat32 (g32 <= 32 with K >= 64) would
+ *   under-fill shader cores: cmat16 (32x16, K_step=32) multiplies workgroup
+ *   count by up to 4x and halves K-loop barriers vs cmat32.
+ * - N > 32 with even ceil(N/32) and K >= 32: cmat64 (32x64, K_step=32) halves
+ *   workgroup barriers and doubles M-parallelism without extra N-padding waste.
+ * - Otherwise: cmat32 (64x32, K_step=16). */
+static inline uint32_t
+hk_gemm_cmat_select_tile_n(uint64_t m_u, uint32_t n_u, uint32_t k_u,
+                           bool has16, bool has32, bool has64)
+{
+   const uint32_t n_tiles32 = (n_u + 31u) / 32u;
+   if (n_u <= 16u && has16)
+      return 16u;
+   if (n_u > 32u && (n_tiles32 % 2u) == 0u && k_u >= 32u && has64) {
+      const uint64_t g64 = ((m_u + 31ull) / 32ull) * ((uint64_t)(n_u + 63u) / 64ull);
+      if (has16 && ((g64 <= 16ull && k_u >= 64u) || (g64 <= 28ull && k_u >= 128u)))
+         return 16u;
+      return 64u;
+   }
+   if (has32) {
+      const uint64_t g32 = ((m_u + 63ull) / 64ull) * (uint64_t)n_tiles32;
+      if (has16 && g32 <= 32ull && k_u >= 64u)
+         return 16u;
+      return 32u;
+   }
+   if (has64)
+      return 64u;
+   if (has16)
+      return 16u;
+   return 0u;
+}
+
+/* Return true when a guarded GEMM dispatch with validated descriptor ranges
+ * may safely specialize to the unguarded cooperative-matrix variant. */
+static inline bool
+hk_gemm_cmat_can_specialize_unguarded(bool is_guarded, uint64_t m_u,
+                                      uint64_t n_u, uint64_t k_u,
+                                      uint32_t tile_n, uint32_t a_offset_B,
+                                      uint64_t a_base_addr,
+                                      uint64_t a_base_offset)
+{
+   if (!is_guarded || m_u == 0 || n_u == 0 || k_u == 0)
+      return false;
+   if (tile_n != 16u && tile_n != 32u && tile_n != 64u)
+      return false;
+   const uint32_t tile_m = hk_gemm_cmat_tile_m(tile_n);
+   const uint32_t k_step = hk_gemm_cmat_k_step(tile_n);
+   return (m_u % tile_m) == 0 && (n_u % tile_n) == 0 && (k_u % k_step) == 0 &&
+          (a_offset_B % 16u) == 0 && ((a_base_addr | a_base_offset) % 16ull) == 0;
 }
 
 /* Validate dispatch dimensions for cooperative-matrix GEMM replacement.

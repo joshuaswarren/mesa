@@ -18,6 +18,9 @@ extern "C" {
 
 #define AIL_CACHELINE      0x80
 #define AIL_PAGESIZE       0x4000
+/* Under AIL_LAYOUT_POLICY_M5, a compressed mip level of the power-of-two tail
+ * starts on this boundary, as the M5 hardware places it. */
+#define AIL_M5_COMPRESSED_LEVEL_ALIGN_B 0x800
 #define AIL_MAX_MIP_LEVELS 16
 
 enum ail_tiling {

@@ -503,7 +503,7 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
    if (eot)
       p_format = util_format_linear(p_format);
 
-   if (eot && agx_chip_native_or_m5(dev->dev.chip))
+   if (eot && agx_chip_agx3_path(dev->dev.chip))
       p_format = hk_eot_pbe_format(&dev->dev, p_format);
 
    const struct util_format_description *desc =
@@ -876,10 +876,10 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
       }
    }
 
-   /* Driver-internal views made only to be sampled or only for storage, as
-    * meta operations make for their sources and destinations, only write the
-    * descriptor kind their usage names: skip unused texture, heap and PBE
-    * packets.
+   /* Driver-internal views made only to be sampled, only for storage, or only
+    * as a single colour render target (as meta clears, blits, and copies make)
+    * only write the descriptor kind their usage names: skip unused texture,
+    * heap and PBE packets. Single-attachment meta passes never spill to eMRT.
     */
    const bool sampled_only =
       (pCreateInfo->flags & VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA) &&
@@ -887,6 +887,12 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
    const bool storage_only =
       (pCreateInfo->flags & VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA) &&
       view->vk.usage == VK_IMAGE_USAGE_STORAGE_BIT;
+   const bool color_att_only =
+      (pCreateInfo->flags & VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA) &&
+      !(pCreateInfo->flags &
+        VK_IMAGE_VIEW_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT) &&
+      view->vk.usage == VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT &&
+      (image->vk.aspects & VK_IMAGE_ASPECT_COLOR_BIT);
 
    /* Fill in each view plane separately */
    for (unsigned p = 0; p < view->plane_count; p++) {
@@ -894,6 +900,11 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
          storage_only
             ? pack_texture(dev, view, p, HK_DESC_USAGE_STORAGE,
                            &view->planes[p].ro_storage)
+         : color_att_only
+            ? (pack_texture(dev, view, p, HK_DESC_USAGE_BG_EOT,
+                            &view->planes[p].background) &&
+               pack_texture(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
+                            &view->planes[p].layered_background))
             : (pack_texture(dev, view, p, HK_DESC_USAGE_SAMPLED,
                             &view->planes[p].sampled) &&
                (sampled_only ||
@@ -910,7 +921,7 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
       if (!textures_valid)
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-      if (agx_chip_agx3_path(dev->dev.chip)) {
+      if (agx_chip_agx3_path(dev->dev.chip) && !color_att_only) {
          if (!storage_only) {
             VkResult result = hk_image_view_heap_add(
                dev, view, replay, p, HK_VIEW_HEAP_SAMPLED,
@@ -958,36 +969,45 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
       }
 
       if (!sampled_only) {
-         view->planes[p].storage_pbe_valid = pack_pbe(
-            dev, view, p, HK_DESC_USAGE_STORAGE, &view->planes[p].storage,
-            &view->planes[p].storage_atomic_sw,
-            view->planes[p].storage_window);
-         if (!storage_only) {
+         if (color_att_only) {
             view->planes[p].eot_pbe_valid =
                pack_pbe(dev, view, p, HK_DESC_USAGE_BG_EOT,
                         &view->planes[p].eot, NULL, NULL);
-            view->planes[p].emrt_pbe_valid = pack_pbe(
-               dev, view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_pbe,
-               &view->planes[p].emrt_atomic_sw, NULL);
-            if (agx_chip_native_or_m5(dev->dev.chip) &&
-                (view->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
-                view->planes[p].emrt_pbe_valid) {
-               const struct ail_layout *layout =
-                  &image->planes[view->planes[p].image_plane].layout;
-               const unsigned level = view->vk.base_mip_level;
-               view->planes[p].emrt_aligned_width =
-                  align(u_minify(layout->width_px, level),
-                        layout->tilesize_el[level].width_el);
-               VkResult result = hk_image_view_heap_add(
-                  dev, view, replay, p, HK_VIEW_HEAP_EMRT_READ,
-                  &view->planes[p].emrt_texture,
-                  &view->planes[p].emrt_read_heap_index);
-               if (result != VK_SUCCESS)
-                  return result;
-            }
             view->planes[p].layered_eot_pbe_valid =
                pack_pbe(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
                         &view->planes[p].layered_eot, NULL, NULL);
+         } else {
+            view->planes[p].storage_pbe_valid = pack_pbe(
+               dev, view, p, HK_DESC_USAGE_STORAGE, &view->planes[p].storage,
+               &view->planes[p].storage_atomic_sw,
+               view->planes[p].storage_window);
+            if (!storage_only) {
+               view->planes[p].eot_pbe_valid =
+                  pack_pbe(dev, view, p, HK_DESC_USAGE_BG_EOT,
+                           &view->planes[p].eot, NULL, NULL);
+               view->planes[p].emrt_pbe_valid = pack_pbe(
+                  dev, view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_pbe,
+                  &view->planes[p].emrt_atomic_sw, NULL);
+               if (agx_chip_native_or_m5(dev->dev.chip) &&
+                   (view->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+                   view->planes[p].emrt_pbe_valid) {
+                  const struct ail_layout *layout =
+                     &image->planes[view->planes[p].image_plane].layout;
+                  const unsigned level = view->vk.base_mip_level;
+                  view->planes[p].emrt_aligned_width =
+                     align(u_minify(layout->width_px, level),
+                           layout->tilesize_el[level].width_el);
+                  VkResult result = hk_image_view_heap_add(
+                     dev, view, replay, p, HK_VIEW_HEAP_EMRT_READ,
+                     &view->planes[p].emrt_texture,
+                     &view->planes[p].emrt_read_heap_index);
+                  if (result != VK_SUCCESS)
+                     return result;
+               }
+               view->planes[p].layered_eot_pbe_valid =
+                  pack_pbe(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
+                           &view->planes[p].layered_eot, NULL, NULL);
+            }
          }
       }
    }

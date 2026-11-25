@@ -22,9 +22,9 @@ struct vk_descriptor_set_layout;
 #define HK_BYTE_STENCIL_MAX_DIAMETER  57u
 #define HK_BYTE_STENCIL_MAX_RADIUS    28u
 
-/* Maximum supported packed-RGBA8 stencil diameter (2 * 64 + 1 = 129). Keeps
- * shared-memory staging compact (4.0 KiB horizontal at 128x4, 12.25 KiB
- * vertical at 16x64) with conflict-free uvec4 loads. */
+/* The RGBA tiles include a halo of up to 64 pixels on either side.
+ * Decoded horizontal rows need 8 KiB. Packed vertical columns need 12.25 KiB.
+ */
 #define HK_RGBA8_STENCIL_MAX_DIAMETER 129u
 #define HK_RGBA8_STENCIL_MAX_RADIUS   64u
 

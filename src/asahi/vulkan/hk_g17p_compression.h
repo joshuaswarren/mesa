@@ -4,6 +4,7 @@
  */
 #pragma once
 #include "asahi/lib/agx_chip.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "hk_g17p_meta_copy_core.h"
 #include "drm-uapi/asahi_drm.h"
 #include "vulkan/vulkan_core.h"
@@ -437,24 +438,44 @@ hk_g17p_shared_compression_eligible(enum agx_chip chip, unsigned plane,
           info->extent.width >= 16 && info->extent.height >= 16;
 }
 
+/* Whether shader storage-image stores through a Gen10 compressed PBE
+ * descriptor are qualified to merge into compressed tiles and maintain
+ * compression metadata. Keep image creation (hk_m5_storage_compression_eligible)
+ * and compute meta blits (hk_agx3_gen10_mip_blit_supported) on this single
+ * gate so they cannot drift apart. */
+static inline bool
+hk_chip_supports_compressed_storage_pbe(enum agx_chip chip)
+{
+   return agx_chip_g17_m5(chip);
+}
+
 /* M5 lossless compression of colour render targets.
  *
  * The Gen10 compressed PBE (write) packet and texture (read) descriptor are
  * native-verified for GPU-tiled one-layer 2D images (byte-identical to
- * the native M5 PBE and texture descriptor encoders), and the allocation is
- * the measured M5 layout with its metadata (AIL_LAYOUT_POLICY_M5). Every
- * write of such an image then goes through the PBE: end-of-tile stores,
- * and the graphics meta paths hk_xfer_copyimage2() and the buffer uploads
- * take for a compressed destination (the raw tiled copiers refuse one).
+ * the native M5 PBE and texture descriptor encoders); the layered forms (2D
+ * arrays, cube maps and single-level 3D) set the array or 3D dimension and
+ * the page-aligned layers bit on the same packet (agx_pbe_agx3_core.c). The
+ * allocation is the measured M5 layout with its metadata
+ * (AIL_LAYOUT_POLICY_M5). Every write of such an image then goes through the
+ * PBE: end-of-tile stores, and the graphics meta paths hk_xfer_copyimage2()
+ * and the buffer uploads take for a compressed destination (the raw tiled
+ * copiers refuse one).
  *
- * Admitted: the G17P colour formats (1-8 byte texels, so a single-sample
- * tilebuffer never spills a compressed target), one layer, any mip count
- * (one level for one-byte texels, see hk_m5_compression_one_byte()),
- * one sample, a colour attachment or a transfer destination (which
- * hk_image_init() makes renderable, so its uploads take the PBE path like
- * an attachment's: sampled textures, as native compresses them), and
- * otherwise only sampled, input-attachment and transfer usages. Shared
- * images (external memory, WSI) stay plain.
+ * Admitted, at one sample:
+ *  - the G17P colour formats (1-8 byte texels) as 2D images of any mip count
+ *    (one-byte mip chains on the 2 KiB compressed-level alignment of
+ *    AIL_LAYOUT_POLICY_M5), 2D arrays of any mip count, cube maps, and
+ *    single-level 3D volumes;
+ *  - the 16-byte formats (R32G32B32A32_{UINT,SINT,SFLOAT}) as one-layer 2D
+ *    images. An eight-target pass spills some of them, and
+ *    hk_begin_rendering() decompresses a spilled one in place with
+ *    libagx_agx3_decompress at its 16x8 metadata tile (ail_metadata_tile()).
+ * Each needs a colour attachment or a transfer destination (which
+ * hk_image_init() makes renderable, so its uploads take the PBE path like an
+ * attachment's: sampled textures, as native compresses them), and otherwise
+ * only sampled, input-attachment and transfer usages. Shared images (external
+ * memory, WSI) stay plain.
  *
  * VK_IMAGE_CREATE_ALIAS_BIT is admitted here and by the depth policy below.
  * Vulkan defines aliased contents only between images of identical creation
@@ -471,34 +492,12 @@ hk_g17p_shared_compression_eligible(enum agx_chip chip, unsigned plane,
  * level, so AIL_LAYOUT_POLICY_M5's per-level metadata placement must be the
  * hardware's.
  */
-/* One-byte texels. The M5 hardware places a compressed level after a 32x32
- * one-byte level 2 KiB on, where AIL_LAYOUT_POLICY_M5 puts it 1 KiB on: the
- * end-of-tile store and texture reads use the hardware's offset, AIL-addressed
- * writes (fast clears, copies) the other. Two- to eight-byte texels agree with
- * the hardware at every level tested (64x64 to 2976x1872, odd sizes). */
-static inline bool
-hk_m5_compression_one_byte(VkFormat format)
-{
-   return format == VK_FORMAT_R8_UNORM || format == VK_FORMAT_R8_SNORM ||
-          format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_SINT;
-}
-
-/* Whether shader storage-image stores through a Gen10 compressed PBE
- * descriptor are qualified to merge into compressed tiles and maintain
- * compression metadata. Keep image creation (hk_m5_storage_compression_eligible)
- * and compute meta blits (hk_agx3_gen10_mip_blit_supported) on this single
- * gate so they cannot drift apart. */
-static inline bool
-hk_chip_supports_compressed_storage_pbe(enum agx_chip chip)
-{
-   return agx_chip_g17_m5(chip);
-}
-
 static inline bool
 hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
                                  const VkImageCreateInfo *info)
 {
-   if (!agx_chip_g17_m5(chip) || plane != 0 || !info)
+   if (!agx_chip_has_cap(chip, AGX_CAP_GEN10_2D_COMPRESSION) || plane != 0 ||
+       !info)
       return false;
 
    /* Read the chain as hk_g17p_compression_eligible() does. */
@@ -519,28 +518,47 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
       next = following;
    }
 
-   const VkImageCreateFlags allowed_flags =
+   /* Not B10G11R11_UFLOAT_PACK32, just like G17P: compressed tiles of its
+    * class corrupt NaN payloads on M5 hardware too. */
+   const bool color_1_8b = hk_g17p_compression_color_format(info->format);
+   const bool color_16b = hk_g17p_compression_color_format_16b(info->format);
+   if (!color_1_8b && !color_16b)
+      return false;
+
+   const bool three_d = info->imageType == VK_IMAGE_TYPE_3D;
+   if (color_16b && (three_d || info->arrayLayers != 1))
+      return false;
+
+   VkImageCreateFlags allowed_flags =
       VK_IMAGE_CREATE_ALIAS_BIT |
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+   if (color_1_8b && info->imageType == VK_IMAGE_TYPE_2D)
+      allowed_flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   if (color_1_8b && three_d)
+      allowed_flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
+                       VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
    const VkImageUsageFlags allowed_usage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 
-   return info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
-          info->arrayLayers == 1 &&
-          (info->mipLevels == 1 || !hk_m5_compression_one_byte(info->format)) &&
-          info->samples == VK_SAMPLE_COUNT_1_BIT &&
+   if ((info->imageType != VK_IMAGE_TYPE_2D && !three_d) ||
+       !info->extent.depth || !info->arrayLayers || !info->mipLevels ||
+       (three_d ? (info->arrayLayers != 1 || info->mipLevels != 1)
+                : info->extent.depth != 1) ||
+       ((info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+        (info->extent.width != info->extent.height ||
+         info->arrayLayers % 6)))
+      return false;
+
+   return info->samples == VK_SAMPLE_COUNT_1_BIT &&
           info->tiling == VK_IMAGE_TILING_OPTIMAL &&
           !(info->flags & ~allowed_flags) &&
           (info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                           VK_IMAGE_USAGE_TRANSFER_DST_BIT)) &&
           !(info->usage & ~allowed_usage) && info->extent.width >= 16 &&
-          info->extent.height >= 16 &&
-          /* Exclude B10G11R11_UFLOAT_PACK32 just like G17P: compressed tiles
-           * of its class corrupt NaN payloads on M5 hardware too. */
-          hk_g17p_compression_color_format(info->format);
+          info->extent.height >= 16;
 }
 
 /* Multisample colour formats with a qualified compressed metadata shape:

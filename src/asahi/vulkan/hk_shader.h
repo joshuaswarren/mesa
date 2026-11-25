@@ -21,6 +21,7 @@
 #include "hk_device.h"
 #include "hk_device_memory.h"
 #include "hk_identity_copy4.h"
+#include "hk_nir_tensor_ops.h"
 #include "hk_private.h"
 #include "hk_nir_lower_mesh.h"
 
@@ -325,6 +326,10 @@ struct hk_shader {
       simple_mtx_t lock;
       struct hash_table *ht;
       bool lazy_ht;
+      /* Lock-free fast path for the first linked variant (first_key is
+       * write-once under lock before release-storing first). */
+      struct hk_linked_shader *first;
+      const void *first_key;
    } linked;
 
    /* The variant was compiled (hk_compile_nir) or deserialized from a
@@ -507,6 +512,7 @@ hk_g17p_sparse_vertex_outputs(const struct shader_info *info,
  */
 #include "hk_2d_stencil.h"
 #include "hk_byte_stencil.h"
+#include "hk_compute_opt.h"
 
 struct hk_byte_stencil_variant {
    struct hk_byte_stencil_plan plan;
@@ -515,6 +521,11 @@ struct hk_byte_stencil_variant {
 
 struct hk_2d_stencil_variant {
    struct hk_2d_stencil_plan plan;
+   struct hk_shader shader;
+};
+
+struct hk_compute_opt_variant {
+   struct hk_compute_opt_plan plan;
    struct hk_shader shader;
 };
 
@@ -582,6 +593,16 @@ struct hk_api_shader {
    /* Non-NULL for a compute shader matched as a 2D neighborhood / block
     * stencil: holds the dispatch validation plan and compiled tiled variant. */
    struct hk_2d_stencil_variant *stencil_2d;
+
+   /* Non-NULL for a compute shader matched by hk_compute_opt: holds the
+    * dispatch validation plan and compiled vectorized/tiled variant. */
+   struct hk_compute_opt_variant *compute_opt;
+
+   /* Non-NULL for a compute shader matched as a 3D tensor concat or
+    * nearest-neighbor resample: holds zero-division vectorized alternate(s). */
+   struct hk_shader *tensor_op_primary;
+   struct hk_shader *tensor_op_secondary;
+   struct hk_tensor_op_info tensor_op_info;
 
    struct hk_shader variants[];
 };

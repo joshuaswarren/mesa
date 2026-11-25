@@ -2150,8 +2150,14 @@ main(void)
       array_expected[0] |= 1;
       assert(!memcmp(&packed, array_expected, sizeof(array_expected)));
       semantic.layers = 2;
-      assert(!hk_pack_native_pbe(10, &packed, &semantic));
+      assert(hk_pack_native_pbe(10, &packed, &semantic));
       semantic.layers = 1;
+      semantic.levels = 2;
+      assert(hk_pack_native_pbe(10, &packed, &semantic));
+      semantic.dimension = AGX_TEXTURE_DIMENSION_3D;
+      semantic.layers = 4;
+      semantic.levels = 1;
+      assert(hk_pack_native_pbe(10, &packed, &semantic));
       semantic.levels = 2;
       assert(!hk_pack_native_pbe(10, &packed, &semantic));
    }

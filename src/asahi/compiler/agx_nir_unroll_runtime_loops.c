@@ -827,11 +827,65 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
 
 static void collect_loops(struct exec_list *list, struct util_dynarray *loops);
 
+static nir_loop *
+enclosing_loop(nir_cf_node *node)
+{
+   for (nir_cf_node *p = node->parent; p; p = p->parent) {
+      if (p->type == nir_cf_node_loop)
+         return nir_cf_node_as_loop(p);
+   }
+   return NULL;
+}
+
+/* A nested workgroup-striped loop issues adjacent elements together; later
+ * iterations access other stripes. When a tile gives each lane only a few
+ * elements, the replicated main loop is skipped on every outer iteration. */
+static bool
+local_id_stride(const nir_shader *shader, nir_scalar id, int64_t step)
+{
+   nir_intrinsic_instr *intr = nir_def_as_intrinsic_or_null(id.def);
+   if (!intr || intr->intrinsic != nir_intrinsic_load_local_invocation_id)
+      return false;
+
+   unsigned width = shader->info.workgroup_size[id.comp];
+   return width > 1 && (step == width || step == -(int64_t)width);
+}
+
+static bool
+nested_workgroup_stripe(const nir_shader *shader, const struct counted_loop *cl)
+{
+   if (shader->info.stage != MESA_SHADER_COMPUTE ||
+       shader->info.workgroup_size_variable || !enclosing_loop(&cl->loop->cf_node))
+      return false;
+
+   nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&cl->loop->cf_node));
+   nir_phi_src *init = nir_phi_get_src_from_block(cl->iv, pre);
+   nir_scalar start = nir_scalar_resolved(init->src.ssa, 0);
+   if (!nir_scalar_is_alu(start))
+      return local_id_stride(shader, start, cl->step);
+
+   /* A backwards stripe starts at end - id, also emitted as end + (-id). */
+   if (nir_scalar_alu_op(start) == nir_op_isub)
+      return local_id_stride(shader, nir_scalar_chase_alu_src(start, 1), cl->step);
+   if (nir_scalar_alu_op(start) == nir_op_iadd) {
+      for (unsigned i = 0; i < 2; i++) {
+         nir_scalar term = nir_scalar_chase_alu_src(start, i);
+         if (nir_scalar_is_alu(term) && nir_scalar_alu_op(term) == nir_op_ineg &&
+             local_id_stride(shader, nir_scalar_chase_alu_src(term, 0), cl->step))
+            return true;
+      }
+   }
+   return false;
+}
+
 /* The iterations per test for a counted loop, or 0 when it is not unrolled. */
 static unsigned
 choose_factor(nir_function_impl *impl, nir_loop *loop, struct counted_loop *cl,
               unsigned factor, unsigned max_instrs)
 {
+   if (nested_workgroup_stripe(impl->function->shader, cl))
+      return 0;
+
    int size = count_unrollable(loop, cl->nif);
    if (size < 0)
       return 0;
@@ -849,16 +903,6 @@ choose_factor(nir_function_impl *impl, nir_loop *loop, struct counted_loop *cl,
          f /= 2;
    }
    return (unsigned)size * f > max_instrs ? 0 : f;
-}
-
-static nir_loop *
-enclosing_loop(nir_cf_node *node)
-{
-   for (nir_cf_node *p = node->parent; p; p = p->parent) {
-      if (p->type == nir_cf_node_loop)
-         return nir_cf_node_as_loop(p);
-   }
-   return NULL;
 }
 
 /* Computable before `outer` from values defined before it, without memory

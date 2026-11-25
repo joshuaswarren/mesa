@@ -128,7 +128,8 @@ local_uint(nir_scalar scalar, unsigned x, unsigned y, unsigned depth,
 }
 
 static bool
-shared_word(nir_intrinsic_instr *intr, unsigned x, unsigned y, unsigned *address)
+shared_word(nir_intrinsic_instr *intr, unsigned comp, unsigned x, unsigned y,
+            unsigned *address)
 {
    const bool is_load = intr->intrinsic == nir_intrinsic_load_shared;
    if (!is_load && intr->intrinsic != nir_intrinsic_store_shared)
@@ -137,23 +138,30 @@ shared_word(nir_intrinsic_instr *intr, unsigned x, unsigned y, unsigned *address
    nir_def *data = is_load ? &intr->def : intr->src[0].ssa;
    nir_def *offset = intr->src[is_load ? 0 : 1].ssa;
    const int base = nir_intrinsic_base(intr);
-   if (data->bit_size != 32 || data->num_components != 1 ||
+   const unsigned allowed_access = ACCESS_CAN_SPECULATE | ACCESS_CAN_REORDER;
+   if (data->bit_size != 32 ||
+       (is_load ? (data->num_components < 1 || data->num_components > 4 ||
+                   comp >= data->num_components)
+                : (data->num_components != 1 || comp != 0 ||
+                   nir_intrinsic_write_mask(intr) != 1)) ||
        offset->bit_size != 16 || offset->num_components != 1 ||
-       nir_intrinsic_access(intr) != 0 || nir_intrinsic_align_mul(intr) < 4 ||
-       nir_intrinsic_align_offset(intr) % 4 || base < 0 || base % 4 ||
-       (!is_load && nir_intrinsic_write_mask(intr) != 1))
+       (nir_intrinsic_access(intr) & ~allowed_access) != 0 ||
+       nir_intrinsic_align_mul(intr) < 4 ||
+       nir_intrinsic_align_offset(intr) % 4 || base < 0 || base % 4)
       return false;
 
    uint32_t index;
    if (!local_uint(nir_scalar_resolved(offset, 0), x, y, 12, &index))
       return false;
-   *address = (unsigned)base + 4 * index;
+   *address = (unsigned)base + 4 * (index + comp);
    return true;
 }
 
 struct operands {
    nir_intrinsic_instr *a;
    nir_intrinsic_instr *b;
+   unsigned a_comp;
+   unsigned b_comp;
    unsigned a0;
    unsigned b0;
 };
@@ -169,8 +177,7 @@ fma_operands(nir_alu_instr *math, nir_instr *begin, nir_instr *end,
       return false;
    nir_intrinsic_instr *left = nir_scalar_as_intrinsic(lhs);
    nir_intrinsic_instr *right = nir_scalar_as_intrinsic(rhs);
-   if (lhs.comp != 0 || rhs.comp != 0 ||
-       left->intrinsic != nir_intrinsic_load_shared ||
+   if (left->intrinsic != nir_intrinsic_load_shared ||
        right->intrinsic != nir_intrinsic_load_shared)
       return false;
 
@@ -187,15 +194,17 @@ fma_operands(nir_alu_instr *math, nir_instr *begin, nir_instr *end,
       return false;
 
    unsigned l0, r0, lx, rx;
-   if (!shared_word(left, 0, 0, &l0) || !shared_word(right, 0, 0, &r0) ||
-       !shared_word(left, 1, 0, &lx) || !shared_word(right, 1, 0, &rx))
+   if (!shared_word(left, lhs.comp, 0, 0, &l0) ||
+       !shared_word(right, rhs.comp, 0, 0, &r0) ||
+       !shared_word(left, lhs.comp, 1, 0, &lx) ||
+       !shared_word(right, rhs.comp, 1, 0, &rx))
       return false;
    if (lx == l0 && rx == r0 + 4) {
-      *out = (struct operands){ left, right, l0, r0 };
+      *out = (struct operands){ left, right, lhs.comp, rhs.comp, l0, r0 };
       return true;
    }
    if (rx == r0 && lx == l0 + 4) {
-      *out = (struct operands){ right, left, r0, l0 };
+      *out = (struct operands){ right, left, rhs.comp, lhs.comp, r0, l0 };
       return true;
    }
    return false;
@@ -218,7 +227,7 @@ collect_phase(nir_shader *shader, struct agx_gemm_match *m)
       if (ins->type == nir_instr_type_intrinsic) {
          unsigned address;
          if (nir_instr_as_intrinsic(ins)->intrinsic != nir_intrinsic_load_shared ||
-             !shared_word(nir_instr_as_intrinsic(ins), 0, 0, &address))
+             !shared_word(nir_instr_as_intrinsic(ins), 0, 0, 0, &address))
             return false;
          continue;
       }
@@ -259,9 +268,9 @@ collect_phase(nir_shader *shader, struct agx_gemm_match *m)
       for (unsigned y = 0; y < AGX_GEMM_SUBGROUPS; ++y) {
          for (unsigned x = 0; x < W; ++x) {
             unsigned actual_a, actual_b;
-            if (!shared_word(f->a, x, y, &actual_a) ||
+            if (!shared_word(f->a, f->a_comp, x, y, &actual_a) ||
                 actual_a != m->a_bytes + 4 * ((8 * y + row) * W + k) ||
-                !shared_word(f->b, x, y, &actual_b) ||
+                !shared_word(f->b, f->b_comp, x, y, &actual_b) ||
                 actual_b != m->b_bytes + 4 * (k * W + x))
                return false;
          }
@@ -398,7 +407,7 @@ producer_slot(const struct agx_gemm_match *m, nir_intrinsic_instr *store,
               uint16_t *slot)
 {
    unsigned first;
-   if (!shared_word(store, 0, 0, &first))
+   if (!shared_word(store, 0, 0, 0, &first))
       return false;
 
    const bool a = first >= m->a_bytes && first - m->a_bytes < TILE_BYTES;
@@ -414,7 +423,7 @@ producer_slot(const struct agx_gemm_match *m, nir_intrinsic_instr *store,
       for (unsigned x = 0; x < AGX_GEMM_WIDTH; ++x) {
          unsigned address;
          const unsigned i = (8 * y + row) * AGX_GEMM_WIDTH + x;
-         if (!shared_word(store, x, y, &address) || address != base + 4 * i)
+         if (!shared_word(store, 0, x, y, &address) || address != base + 4 * i)
             return false;
       }
    }

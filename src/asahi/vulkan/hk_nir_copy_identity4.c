@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "hk_identity_copy4.h"
+#include "hk_nir_fast_udiv.h"
 #include "hk_nir_match_pointwise_clamp.h"
 #include "hk_nir_wgid.h"
 #include "compiler/nir/nir_builder.h"
@@ -1863,14 +1864,15 @@ build_pad4d_vec4(nir_shader *nir, const struct pad4d_match *m,
       }
       nir_push_else(&b, n1_if);
       {
-         n_div = nir_udiv(&b, gy, out_h);
-         h_div = nir_umod(&b, gy, out_h);
+         struct hk_nir_fast_udiv h_fd = hk_nir_fast_udiv_prepare(&b, out_h);
+         hk_nir_fast_udivmod(&b, &h_fd, gy, &n_div, &h_div);
       }
       nir_pop_if(&b, n1_if);
       nir_def *n = nir_if_phi(&b, zero_n, n_div);
       nir_def *h = nir_if_phi(&b, gy, h_div);
-      nir_def *w = nir_udiv(&b, gx, out_c4);
-      nir_def *c4 = nir_umod(&b, gx, out_c4);
+      struct hk_nir_fast_udiv c4_fd = hk_nir_fast_udiv_prepare(&b, out_c4);
+      nir_def *w = NULL, *c4 = NULL;
+      hk_nir_fast_udivmod(&b, &c4_fd, gx, &w, &c4);
 
       nir_def *in_n_i = nir_isub(&b, n, p[0]);
       nir_def *in_h_i = nir_isub(&b, h, p[1]);

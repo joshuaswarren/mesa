@@ -322,7 +322,7 @@ hk_g17p_meta_fill_addr(struct hk_cmd_buffer *cmd, struct hk_cs **target,
                        uint64_t address, uint64_t size, uint32_t value)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_chip_native_agx3(dev->dev.chip) || !target || !address ||
+   if (!agx_chip_native_or_g18g(dev->dev.chip) || !target || !address ||
        ((address | size) & 3)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -1422,7 +1422,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
          const enum agx_chip chip =
             container_of(device, struct hk_device, vk)->dev.chip;
          const bool g17p_color =
-            agx_chip_native_or_m5(chip) &&
+            agx_chip_agx3_path(chip) &&
             !vk_format_is_depth_or_stencil(image->format);
          const struct hk_image *hk_image =
             container_of(image, struct hk_image, vk);
@@ -3512,6 +3512,7 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
     * that dst, src, and size are all properly aligned. Failing to check for
     * alignment on the buffers causes subtle and hard-to-debug issues!
     */
+   bool ran_uint4 = false;
    if (size >= 16 && (dst & 0xf) == 0 && (src & 0xf) == 0) {
       unsigned uint4s = size / 16;
       unsigned bytes = uint4s * 16;
@@ -3521,6 +3522,25 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
       dst += bytes;
       src += bytes;
       size -= bytes;
+      ran_uint4 = true;
+   }
+
+   /* Use 32-bit copies when 16-byte alignment was unavailable, or when the
+    * remaining tail is a clean 4-byte multiple (avoiding an extra dispatch
+    * before a trailing byte copy). */
+   if (size >= 4 && (dst & 0x3) == 0 && (src & 0x3) == 0 &&
+       (!ran_uint4 || (size & 0x3) == 0)) {
+      size_t uints = size / 4;
+      if (uints <= UINT32_MAX) {
+         size_t bytes = uints * 4;
+
+         libagx_copy_uint(cmd, agx_1d((uint32_t)uints), AGX_BARRIER_ALL, dst,
+                          src);
+
+         dst += bytes;
+         src += bytes;
+         size -= bytes;
+      }
    }
 
    if (size) {
@@ -5533,6 +5553,60 @@ hk_g17p_copy_raw_image(struct hk_cmd_buffer *cmd, struct hk_image *src,
                                &dst_tile_config));
          assert(addressed);
 
+         const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+         const uint64_t linear_slice_B =
+            (src_level < src_layout->levels && dst_level < dst_layout->levels &&
+             src_level + 1 < ARRAY_SIZE(src_layout->level_offsets_B) &&
+             dst_level + 1 < ARRAY_SIZE(dst_layout->level_offsets_B))
+               ? hk_g17p_linear_tiled_slice_bytes(
+                    &(struct hk_g17p_linear_tiled_slice_copy){
+                       .src_tiled = src_tiled,
+                       .dst_tiled = dst_tiled,
+                       .src_compressed = src_layout->compressed,
+                       .dst_compressed = dst_layout->compressed,
+                       .src_sparse =
+                          (src->vk.create_flags &
+                           VK_IMAGE_CREATE_SPARSE_BINDING_BIT) != 0,
+                       .dst_sparse =
+                          (dst->vk.create_flags &
+                           VK_IMAGE_CREATE_SPARSE_BINDING_BIT) != 0,
+                       .src_type = src->vk.image_type,
+                       .dst_type = dst->vk.image_type,
+                       .src_samples = src->vk.samples,
+                       .dst_samples = dst->vk.samples,
+                       .src_w_el = DIV_ROUND_UP(
+                          u_minify(src_layout->width_px, src_level),
+                          util_format_get_blockwidth(src_layout->format)),
+                       .src_h_el = DIV_ROUND_UP(
+                          u_minify(src_layout->height_px, src_level),
+                          util_format_get_blockheight(src_layout->format)),
+                       .dst_w_el = DIV_ROUND_UP(
+                          u_minify(dst_layout->width_px, dst_level),
+                          util_format_get_blockwidth(dst_layout->format)),
+                       .dst_h_el = DIV_ROUND_UP(
+                          u_minify(dst_layout->height_px, dst_level),
+                          util_format_get_blockheight(dst_layout->format)),
+                       .src_tile_w_el = src_tile.width_el,
+                       .src_tile_h_el = src_tile.height_el,
+                       .dst_tile_w_el = dst_tile.width_el,
+                       .dst_tile_h_el = dst_tile.height_el,
+                       .src_tiles_per_row = src_tile_config.tiles_per_row,
+                       .dst_tiles_per_row = dst_tile_config.tiles_per_row,
+                       .raw_block_size_B = raw_block_size_B,
+                       .src_level = src_level,
+                       .src_levels = src_layout->levels,
+                       .dst_level = dst_level,
+                       .dst_levels = dst_layout->levels,
+                       .src_level_size_B =
+                          ail_get_level_size_B(src_layout, src_level),
+                       .dst_level_size_B =
+                          ail_get_level_size_B(dst_layout, dst_level),
+                       .max_groups_x =
+                          dev->vk.physical->properties.maxComputeWorkGroupCount[0],
+                       .plan = plan,
+                    })
+               : 0;
+
          for (uint32_t slice = 0; slice < src_slices; ++slice) {
             VkImageCopy2 one;
             const bool sliced = hk_g17p_image_copy_slice(
@@ -5547,11 +5621,25 @@ hk_g17p_copy_raw_image(struct hk_cmd_buffer *cmd, struct hk_image *src,
                dst->vk.image_type == VK_IMAGE_TYPE_3D
                   ? one.dstOffset.z
                   : one.dstSubresource.baseArrayLayer;
+            const uint64_t dst_off =
+               ail_get_layer_level_B(dst_layout, dst_slice, dst_level);
+            const uint64_t src_off =
+               ail_get_layer_level_B(src_layout, src_slice, src_level);
+            const uint64_t dst_addr = hk_image_base_address(dst, dst_plane) + dst_off;
+            const uint64_t src_addr = hk_image_base_address(src, src_plane) + src_off;
+            if (linear_slice_B &&
+                hk_g17p_linear_tiled_slice_addrs_valid(
+                   dst_addr, dst_off, dst_layout->size_B, src_addr, src_off,
+                   src_layout->size_B, linear_slice_B)) {
+               libagx_copy_uint4(cmd, agx_1d((uint32_t)(linear_slice_B >> 4)),
+                                 AGX_BARRIER_NONE, dst_addr, src_addr);
+               if (vk_command_buffer_has_error(&cmd->vk))
+                  return;
+               continue;
+            }
             const struct libagx_copy_image_args args = {
-               .dest = hk_image_base_address(dst, dst_plane) +
-                       ail_get_layer_level_B(dst_layout, dst_slice, dst_level),
-               .src = hk_image_base_address(src, src_plane) +
-                      ail_get_layer_level_B(src_layout, src_slice, src_level),
+               .dest = dst_addr,
+               .src = src_addr,
                .width_el = plan.width_el,
                .height_el = plan.height_el,
                .dest_x_el = plan.dst_x_el,
@@ -5881,7 +5969,16 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
       const bool compressed_depth_array = agx_chip_hal300_path(dev->dev.chip) &&
          vk_format_is_depth_or_stencil(dst_image->vk.format) &&
          dst_image->vk.array_layers > 1 && dst_image->planes[0].layout.compressed;
-      if (agx_chip_native_agx3(dev->dev.chip) || compressed_depth_array) {
+      /* A region between a 2D array and a 3D image (the copier above takes
+       * neither when one of them is compressed) is one layered meta draw
+       * otherwise, which on M5 returns every layer past the first wrong
+       * (dEQP-VK.api.copy_and_blit.core.image_to_image.3d_images.2d_to_3d_whole);
+       * one draw per slice is exact. */
+      const bool array_to_volume = agx_chip_agx3_path(dev->dev.chip) &&
+         (src_image->vk.image_type == VK_IMAGE_TYPE_3D) !=
+            (dst_image->vk.image_type == VK_IMAGE_TYPE_3D);
+      if (agx_chip_native_agx3(dev->dev.chip) || compressed_depth_array ||
+          array_to_volume) {
          /* The qualified HAL200 BG/EOT contract is single-layer.  Preserve
           * arbitrary mip and rectangle selection while expanding array and
           * 3D regions into per-slice native meta draws. */

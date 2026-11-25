@@ -1312,6 +1312,7 @@ void agx_print_instr(const agx_instr *I, FILE *fp);
 void agx_print_block(const agx_block *block, FILE *fp);
 void agx_print_shader(const agx_context *ctx, FILE *fp);
 void agx_optimizer_forward(agx_context *ctx);
+void agx_opt_pack_bool_or_branch(agx_context *ctx);
 bool agx_eval_immediate_icond(agx_context *ctx, enum agx_icond icond,
                               agx_index x, agx_index y, bool *result);
 void agx_optimizer_backward(agx_context *ctx);
@@ -1644,6 +1645,7 @@ bool agx_nir_opt_preamble(nir_shader *s, unsigned *sizes, bool g17p,
                           bool agx3c,
                           const nir_opt_peephole_select_options *flatten);
 bool agx_nir_export_select_flags_as_halves(nir_shader *s, bool branches);
+bool agx_nir_cancel_preamble_fneg(nir_shader *s, unsigned reserved);
 bool agx_nir_remove_unused_preamble_exports(nir_shader *s, unsigned reserved);
 bool agx_nir_coalesce_preamble_half_exports(nir_shader *s, unsigned reserved,
                                           unsigned allocated);

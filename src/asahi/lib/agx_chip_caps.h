@@ -91,6 +91,18 @@ enum agx_chip_cap {
     * on M5 (G17G/G17S/G17C), G15, G16, G18G, and AGX2 until per-generation
     * hardware A/B and CTS rows are collected. */
    AGX_CAP_MOD3_REG_BANK_RA = 1u << 13,
+
+   /* Private Gen10 colour and depth compression. In Gallium: single-level,
+    * single-layer 2D colour at 1x and 2x/4x, and Z32_FLOAT/Z16_UNORM depth at
+    * 1x through the compressed Gen10 PBE, texture and ZLS forms. 2x/4x
+    * Z32_FLOAT depth additionally needs the kernel to report
+    * DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION. Measured on M5 (G17S,
+    * G17C). In Borealis also single-sample colour 2D arrays, cube maps and
+    * single-level 3D (1-8 byte texels), mipmapped one-byte 2D, and 16-byte
+    * single-layer 2D, whose spilled attachments decompress in place
+    * (libagx_agx3_decompress); measured on G17S. Off on G18G until measured
+    * there. */
+   AGX_CAP_GEN10_2D_COMPRESSION = 1u << 14,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -115,7 +127,8 @@ enum agx_chip_cap {
 #define AGX_CAPS_M5                                                            \
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
-    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_CDM_WAR_WEAK_BARRIER)
+    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_CDM_WAR_WEAK_BARRIER |                 \
+    AGX_CAP_GEN10_2D_COMPRESSION)
 
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.
