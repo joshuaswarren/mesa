@@ -1111,6 +1111,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_cmd_buffer_end_compute(cmd);
    cmd->state.cs.cdm_barrier_pending = false;
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
+   hk_resolve_pending_oq_available(cmd);
    hk_resolve_deferred_oq_available(cmd);
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -1242,7 +1243,8 @@ hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info
    struct hk_barrier_state state = {
       .shader_writes = render->barrier_shader_writes,
       .pre_graphics = cmd->current_cs.pre_gfx != NULL,
-      .post_graphics = cmd->current_cs.post_gfx != NULL,
+      .post_graphics = cmd->current_cs.post_gfx != NULL ||
+                       cmd->state.oq_pending_render != NULL,
       .tilebuffer_spilled = agx_tilebuffer_spills(&render->tilebuffer),
       .attachments = images,
    };
@@ -5537,6 +5539,10 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
 
       return false;
    }
+
+   /* Flush inline occlusion availability before replacing and destroying cs. */
+   if (unlikely(cmd->state.oq_pending_render == cs))
+      hk_flush_oq_pending(cmd);
 
    /* The clears stand in for the render: they are graphics work for every
     * later dependency, and they were recorded under the same requirements

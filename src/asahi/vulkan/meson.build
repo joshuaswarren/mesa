@@ -146,6 +146,17 @@ hk_drirc = custom_target(
   ],
 )
 
+hk_entrypoints = custom_target(
+  input : [vk_entrypoints_gen, vk_api_xml],
+  output : ['hk_entrypoints.h', 'hk_entrypoints.c'],
+  command : [
+    prog_python, '@INPUT0@', '--xml', '@INPUT1@', '--proto', '--weak',
+    '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@', '--prefix', 'hk',
+    '--beta', with_vulkan_beta.to_string(),
+  ],
+  depend_files : vk_entrypoints_gen_depend_files,
+)
+
 if with_tests
   test('hk_execution_allowance',
     executable('hk_execution_allowance_test',
@@ -397,7 +408,9 @@ if with_tests
       'hk_query_oq',
       executable(
         'hk_query_oq_test',
-        files('tests/test-hk-query-oq.c', 'hk_query_oq.c', 'hk_sync.c'),
+        files('tests/test-hk-query-oq.c', 'hk_query_oq.c', 'hk_sync.c',
+              'hk_event.c'),
+        hk_entrypoints[0],
         include_directories : [
           include_directories('.'),
           inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
@@ -742,17 +755,6 @@ if with_tests
   )
 
 endif
-
-hk_entrypoints = custom_target(
-  input : [vk_entrypoints_gen, vk_api_xml],
-  output : ['hk_entrypoints.h', 'hk_entrypoints.c'],
-  command : [
-    prog_python, '@INPUT0@', '--xml', '@INPUT1@', '--proto', '--weak',
-    '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@', '--prefix', 'hk',
-    '--beta', with_vulkan_beta.to_string(),
-  ],
-  depend_files : vk_entrypoints_gen_depend_files,
-)
 
 subdir('bvh')
 
