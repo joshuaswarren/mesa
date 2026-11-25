@@ -523,8 +523,10 @@ test_deferred_behind_render(void)
 }
 
 /* A render before the open compute stream, then COLOR_WRITE -> HOST_READ:
- * the stream takes the flush and waits for the render, unless on M5 that
- * would make the work it holds wait for a render it did not wait for. */
+ * the stream takes the flush and waits for the render on chips without CDM
+ * overlap splitting (G15/G16), while on chips with AGX_CAP_CDM_OVERLAP_SPLIT
+ * (G17P and M5) it defers instead of delaying the work the open stream already
+ * holds behind an unrelated render. */
 static void
 test_render_scope_in_stream(void)
 {
@@ -533,22 +535,25 @@ test_render_scope_in_stream(void)
 
    struct hk_queue *q = new_queue(true);
    struct hk_cmd_buffer *c = new_cmd();
-   set_chip(c, AGX_CHIP_G17P);
+   set_chip(c, AGX_CHIP_G16G);
    struct hk_cs *r = add(c, false);
    struct hk_cs *s = open_compute(c);
-   T("G17P: the open stream takes the flush", pipeline_barrier(c, &d) == s);
+   T("G16G: the open stream takes the flush", pipeline_barrier(c, &d) == s);
    T("and waits for the render", s->sync.dep[HK_SYNC_VDM].cut == r);
    struct hk_cmd_buffer *cmds[] = {c};
    const struct flush f = submit(q, cmds, 1, false);
-   T("G17P: no flush command",
+   T("G16G: no flush command",
      f.ok && f.kinds == 0 && s->sync.barrier[HK_SYNC_VDM] == 1);
 
-   c = new_cmd();
-   set_chip(c, AGX_CHIP_G17G);
-   add(c, false);
-   open_compute(c);
-   T("M5: deferred instead of delaying the stream's work",
-     !pipeline_barrier(c, &d) && c->sync.host_flush_kinds == HK_SYNC_GFX);
+   const enum agx_chip split_chips[] = { AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17C };
+   for (unsigned i = 0; i < ARRAY_SIZE(split_chips); ++i) {
+      c = new_cmd();
+      set_chip(c, split_chips[i]);
+      add(c, false);
+      open_compute(c);
+      T("G17P/M5: deferred instead of delaying the stream's work",
+        !pipeline_barrier(c, &d) && c->sync.host_flush_kinds == HK_SYNC_GFX);
+   }
 }
 
 /* MEMORY_WRITE -> HOST_READ in a command buffer of its own, after a render

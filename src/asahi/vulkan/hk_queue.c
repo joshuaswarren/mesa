@@ -2046,7 +2046,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    const bool cumulative_signals = hk_queue_uses_cumulative_signals(&dev->dev);
    const bool chunk_timelines = cumulative_signals &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS) &&
-      agx_chip_g17_m5(dev->dev.chip) &&
+      agx_chip_has_cap(dev->dev.chip, AGX_CAP_CDM_OVERLAP_SPLIT) &&
       command_count > max_commands_per_submit(dev);
    const bool kernel_cumulative = hk_queue_kernel_cumulative_supported(
       &dev->dev, cumulative_signals, chunk_timelines, submit->signal_count);
@@ -2596,7 +2596,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
              * work that only its fragment half waits for. Every other render
              * keeps the forms below, which the kernel can publish directly.
              */
-            const bool g17p_staged =
+            bool g17p_staged =
                agx_chip_native_hal200(dev->dev.chip) &&
                !queue->sync.serialize && queue->sync.exact_prior &&
                (dev->dev.params.features &
@@ -2605,10 +2605,6 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                (cs->sync.barrier_ta[HK_SYNC_CDM] !=
                    cs->sync.barrier[HK_SYNC_CDM] ||
                 ta_command_prior[HK_SYNC_CDM] != command_prior[HK_SYNC_CDM]);
-            if (g17p_staged) {
-               cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
-               perf_debug_dev(&dev->dev, "HAL200 staged render");
-            }
 
             /* The render's vertex half depends on no earlier render while its
              * fragment half does (hk_sync: every render dependency targets
@@ -2642,9 +2638,11 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
             /* Native HAL200: a vertex half that still names earlier renders
              * can use the fragment-only barriers too when the order of tiling
-             * kicks already covers what it names. A staged render takes
-             * neither the flag nor part in ta_cover: its tiling waits only
-             * for its narrower tiling prefix. */
+             * kicks already covers what it names. Otherwise, when the vertex
+             * half still depends on an earlier render than the fragment half,
+             * send the narrower tiling prefix via a staged render instead of
+             * stalling tiling on the whole prefix. A staged render takes
+             * neither FRAGMENT_BARRIERS nor part in ta_cover. */
             if (agx_chip_native_hal200(dev->dev.chip) && !g17p_staged &&
                 !queue->sync.serialize && queue->sync.exact_prior &&
                 (dev->dev.params.features &
@@ -2656,11 +2654,26 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                const uint64_t vertex = hk_drm_render_prefix(
                   base, cs->sync.barrier_ta[HK_SYNC_VDM],
                   cs->sync.prior_ta[HK_SYNC_VDM]);
+               uint64_t next_cover = queue->sync.ta_cover;
                if (hk_drm_g17p_tiling_ordered(
                       base, nr_vdm, whole, vertex,
                       cmd.legacy.flags & DRM_ASAHI_RENDER_FRAGMENT_BARRIERS,
-                      &queue->sync.ta_cover))
+                      &next_cover)) {
                   cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+                  queue->sync.ta_cover = next_cover;
+               } else if (agx_chip_has_cap(dev->dev.chip,
+                                           AGX_CAP_CDM_OVERLAP_SPLIT) &&
+                          (dev->dev.params.features &
+                           DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
+                          cs->sync.ta_split && vertex < whole) {
+                  g17p_staged = true;
+               } else {
+                  queue->sync.ta_cover = next_cover;
+               }
+            }
+            if (g17p_staged) {
+               cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
+               perf_debug_dev(&dev->dev, "HAL200 staged render");
             }
 
             /* Likewise for compute: when the vertex half depends on less
