@@ -8,6 +8,7 @@
 
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "agx_compiler.h"
 #include "agx_nir.h"
 #include "asahi/layout/layout.h"
 #include "asahi/lib/agx_abi.h"
@@ -19,6 +20,7 @@
 #include "nir_intrinsics.h"
 #include "nir_intrinsics_indices.h"
 #include "shader_enums.h"
+#include "util/format/u_format.h"
 
 struct agx_texture_lower_options {
    bool gen9;
@@ -1736,6 +1738,25 @@ lower_g17p_formatless_image_load(nir_builder *b, nir_intrinsic_instr *intr)
                               nir_bcsel(b, oob, oob_value, &intr->def));
 }
 
+nir_alu_type
+agx_image_store_base_type(const nir_intrinsic_instr *intr)
+{
+   nir_alu_type base =
+      nir_alu_type_get_base_type(nir_intrinsic_src_type(intr));
+   if (base != nir_type_invalid)
+      return base;
+
+   enum pipe_format fmt = nir_intrinsic_format(intr);
+   if (fmt == PIPE_FORMAT_NONE)
+      return nir_type_invalid;
+
+   if (util_format_is_pure_sint(fmt))
+      return nir_type_int;
+   if (util_format_is_pure_uint(fmt))
+      return nir_type_uint;
+   return nir_type_float;
+}
+
 static bool
 lower_images(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -1752,6 +1773,28 @@ lower_images(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_bindless_image_store: {
       /* Legalize MSAA index */
       nir_src_rewrite(&intr->src[2], nir_u2u16(b, intr->src[2].ssa));
+
+      /* AGX3's imgwci storage image store encoding requires 32-bit data
+       * channels. Widen sub-32-bit values (such as lowp/mediump spilled MRT
+       * epilog outputs on M5 or mediump imageStore() calls) here so every
+       * AGX3 image store path gets 32-bit data uniformly. */
+      if ((gen9 || (options && options->gen10)) &&
+          (intr->intrinsic == nir_intrinsic_image_store ||
+           intr->intrinsic == nir_intrinsic_bindless_image_store) &&
+          intr->src[3].ssa->bit_size < 32) {
+         nir_alu_type base = agx_image_store_base_type(intr);
+         /* Every valid NIR image_store producer either sets src_type (SPIR-V,
+          * GLSL, tilebuffer lowering) or supplies a non-NONE pipe_format. */
+         assert(base == nir_type_float || base == nir_type_int ||
+                base == nir_type_uint);
+         if (base == nir_type_float || base == nir_type_int ||
+             base == nir_type_uint) {
+            nir_def *value =
+               nir_convert_to_bit_size(b, intr->src[3].ssa, base, 32);
+            nir_src_rewrite(&intr->src[3], value);
+            nir_intrinsic_set_src_type(intr, base | 32);
+         }
+      }
 
       if (gen9 && options->robust_formatless_images &&
           intr->intrinsic == nir_intrinsic_bindless_image_load &&

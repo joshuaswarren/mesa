@@ -30,6 +30,13 @@ extern "C" {
 /* G18G's ordinary register file ends at r125 (half 251). */
 #define AGX3D_NUM_REGS (252)
 
+/* Register budget, in halves, of M5 compute kernels that use native ray
+ * traversal. Value from 7c91dddf53f (the M5 userspace snapshot), measured on
+ * M5 hardware with the full-resolution RT workload: 160 halves was faster
+ * than 128 and 192. Not derived; the snapshot records no numbers.
+ */
+#define AGX_M5_RT_REGISTER_BUDGET 160u
+
 /* u0-u255 inclusive, as pairs of 16-bits */
 #define AGX_NUM_UNIFORMS (512)
 
@@ -486,8 +493,8 @@ typedef struct {
    /* NIR permits either sign for a zero result of this floating add. */
    bool no_signed_zero : 1;
 
-   /* M5 FCMPSEL: a selected immediate is a minifloat (native fself32), not
-    * raw integer bits. */
+   /* FCMPSEL: a selected immediate was folded as a minifloat by the optimizer
+    * (AGX3C 32-bit fself or AGX3B tied min/max), rather than raw integer bits. */
    bool fcmpsel_minifloat_select : 1;
 
    /* Output modifiers */
@@ -601,6 +608,15 @@ typedef struct agx_block {
    /** Available for passes to use for metadata */
    uint8_t pass_flags;
 } agx_block;
+
+/* How the AGX3 packer lets a loop's breaks leave it (agx3_slot_core.h). */
+enum agx3_break_joins {
+   /* Join a break's state into its loop's pop where that gains something
+    * (agx3_break_keeps_state()), drain it otherwise. */
+   AGX3_BREAKS_JOIN_GAINFUL = 0,
+   AGX3_BREAKS_JOIN_ALL,
+   AGX3_BREAKS_DRAIN,
+};
 
 typedef struct {
    nir_shader *nir;
@@ -722,6 +738,11 @@ typedef struct {
    unsigned loop_count;
    unsigned max_reg;
 
+   /* Immediate moves and uniform-file copies inside loops after register
+    * allocation, for shader statistics. */
+   unsigned loop_immediates;
+   unsigned loop_uniform_copies;
+
    /* Half of the AGX3 compiler staging footprint. Unlike max_reg, this
     * describes the separate file consumed by UVSW and texture inputs. */
    unsigned agx3_staging_halfs;
@@ -730,11 +751,35 @@ typedef struct {
     * how far its texture reads reached and how many halves the outputs and
     * any image-write bank need above them. */
    unsigned agx3_g18g_output_staging_floor;
+
+   /* Pack with a scoreboard drain at every control-flow boundary, as the
+    * retry when keeping results in flight into if arms leaves a wait no
+    * instruction form can carry (agx3_pack_program()). */
+   bool agx3_cf_drain_all;
+   /* Pack with a drain at every loop entry, and what the last pack did:
+    * how many loop entries kept results in flight, and how many wait
+    * carriers it emitted inside loops (agx3_pack_program()). */
+   bool agx3_loop_entry_drain_all;
+   unsigned agx3_kept_loop_entries;
+   unsigned agx3_loop_carriers;
+   /* Pack with an if's arms draining at their ends instead of joining, and
+    * how many arm ends of the last pack the join kept from draining
+    * (agx3_pack_program()). */
+   bool agx3_arm_join_off;
+   unsigned agx3_joined_arm_drains;
+   /* How a pack's breaks leave their loops (enum agx3_break_joins), and of
+    * the last pack how many breaks a join kept from draining something and
+    * how many joining breaks drain because joining gained nothing
+    * (agx3_pack_program()). */
+   uint8_t agx3_break_joins;
+   unsigned agx3_joined_breaks;
+   unsigned agx3_refused_breaks;
    unsigned agx3_g18g_read_staging_end;
    unsigned agx3_g18g_output_staging_span;
    bool agx3_staging_known;
    bool agx3_fltnorm_start;
    bool agx3_mrt_tile_ops_ordered;
+   bool agx3_local_read_tile_ops;
    /* The packer emitted this fragment's tile accesses through the native1130
     * mixed-format protocol, inside its 0x200 entry and final release (run
     * 1139); its reads then take the long LLDCol form. */
@@ -1267,6 +1312,7 @@ void agx_print_instr(const agx_instr *I, FILE *fp);
 void agx_print_block(const agx_block *block, FILE *fp);
 void agx_print_shader(const agx_context *ctx, FILE *fp);
 void agx_optimizer_forward(agx_context *ctx);
+void agx_opt_pack_bool_or_branch(agx_context *ctx);
 bool agx_eval_immediate_icond(agx_context *ctx, enum agx_icond icond,
                               agx_index x, agx_index y, bool *result);
 void agx_optimizer_backward(agx_context *ctx);
@@ -1287,6 +1333,7 @@ void agx_materialize_agx3_cf_constants(agx_context *ctx);
 void agx_opt_cse(agx_context *ctx);
 bool agx_opt_collect_split(agx_context *ctx);
 void agx_opt_cse_pressure(agx_context *ctx);
+bool agx_opt_licm(agx_context *ctx, unsigned max_demand, unsigned file_regs);
 void agx_opt_cse_bounded(agx_context *ctx);
 bool agx_can_rematerialize_uniform(const agx_context *ctx, const agx_instr *I);
 bool agx_has_uniform_store(const agx_context *ctx);
@@ -1297,6 +1344,7 @@ void agx_dce(agx_context *ctx, bool partial);
 void agx_pressure_schedule(agx_context *ctx);
 void agx_ilp_schedule(agx_context *ctx);
 int agx_ilp_m5_device_load_cap(int program_peak);
+unsigned agx3_register_budget(agx_context *ctx);
 bool agx3_lower_uniform_program(agx_context *ctx);
 /* Success/refusal, not a progress flag. Call only for AGX3B preambles. */
 bool agx3_lower_cprog_inputs(agx_context *ctx);
@@ -1364,7 +1412,7 @@ agx_reserved_registers(const agx_context *ctx)
 }
 
 void agx_spill(agx_context *ctx, unsigned k, bool remat_only);
-bool agx_fold_m5_spill_constant_phis(agx_context *ctx);
+bool agx_fold_agx3_spill_constant_phis(agx_context *ctx);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
@@ -1377,6 +1425,7 @@ unsigned agx_calc_register_demand(agx_context *ctx, bool remat);
 unsigned agx3_tile_store_bank(agx_context *ctx);
 
 void agx_lower_64bit_postra(agx_context *ctx);
+bool agx_lower_agx3_widening_int(agx_context *ctx);
 void agx_insert_waits(agx_context *ctx);
 void agx_opt_empty_else(agx_context *ctx);
 void agx_opt_register_cache(agx_context *ctx);
@@ -1455,6 +1504,29 @@ agx_is_float_src(const agx_instr *I, unsigned s)
 
    /* fcmp takes first 2 as floats but returns an integer */
    return info.is_float || (s < 2 && fcmp);
+}
+
+/* Whether an FCMPSEL is a fully tied minNum/maxNum pattern:
+ * (a LTN b) ? a : b or (a GTN b) ? a : b, with identical sizes, modifiers,
+ * and memory flags on each compare/select pair. */
+static inline bool
+agx_fcmpsel_is_tied_minmax(const agx_instr *I)
+{
+   if (I->op != AGX_OPCODE_FCMPSEL || I->nr_srcs != 4 || I->invert_cond ||
+       I->saturate ||
+       (I->fcond != AGX_FCOND_GTN && I->fcond != AGX_FCOND_LTN))
+      return false;
+
+   /* agx_is_equiv() ignores modifiers, and a modifier on one half of a tie
+    * would make the two operands different values. Require them identical. */
+   for (unsigned i = 0; i < 2; ++i) {
+      const agx_index a = I->src[i], b = I->src[i + 2];
+      if (!agx_is_equiv(a, b) || a.size != b.size || a.abs != b.abs ||
+          a.neg != b.neg || a.memory != b.memory)
+         return false;
+   }
+
+   return true;
 }
 
 /* The M5 select with a uniform first comparand that native G17G
@@ -1573,6 +1645,7 @@ bool agx_nir_opt_preamble(nir_shader *s, unsigned *sizes, bool g17p,
                           bool agx3c,
                           const nir_opt_peephole_select_options *flatten);
 bool agx_nir_export_select_flags_as_halves(nir_shader *s, bool branches);
+bool agx_nir_cancel_preamble_fneg(nir_shader *s, unsigned reserved);
 bool agx_nir_remove_unused_preamble_exports(nir_shader *s, unsigned reserved);
 bool agx_nir_coalesce_preamble_half_exports(nir_shader *s, unsigned reserved,
                                           unsigned allocated);
@@ -1592,6 +1665,8 @@ bool agx_nir_lower_ubo(nir_shader *shader);
 bool agx_nir_lower_shared_bitsize(nir_shader *shader, bool element_indices);
 bool agx_nir_lower_frag_sidefx(nir_shader *s, bool g17p);
 void agx_lower_agx3_fma_sources(agx_context *ctx);
+void agx_lower_agx3_half_converts(agx_context *ctx);
+void agx_opt_agx3_normflt_byte_pairs(agx_context *ctx);
 void agx_materialize_agx3_alu_constants(agx_context *ctx);
 void agx_lower_agx3_mixed_width_unary(agx_context *ctx);
 bool agx_lower_g17g_retry_float_operands(agx_context *ctx);
@@ -1622,6 +1697,7 @@ bool agx3_sink_vertex_outputs(agx_context *ctx);
 bool agx3_coalesce_uniform_half_stores(agx_context *ctx);
 
 bool agx_lower_agx3_device_atomic_sources(agx_context *ctx);
+nir_alu_type agx_image_store_base_type(const nir_intrinsic_instr *intr);
 
 #ifdef __cplusplus
 } /* extern C */

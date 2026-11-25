@@ -23,7 +23,8 @@ TEST(PopcountIdiom, TreeAndMultiplyForms)
    for (unsigned form = 0; form < 3; ++form) {
       nir_builder b = nir_builder_init_simple_shader(
          MESA_SHADER_COMPUTE, &agx_nir_options, "popcount-idiom");
-      nir_def *x = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 4);
+      nir_def *x = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0));
+      nir_intrinsic_set_range(nir_def_as_intrinsic(x), 4);
       nir_def *r;
       if (form == 0) {
          /* Full 5-level SWAR tree with final mask on both halves. */
@@ -47,7 +48,8 @@ TEST(PopcountIdiom, TreeAndMultiplyForms)
          r = nir_ushr_imm(&b, nir_imul_imm(&b, v, 0x01010101), 24);
       }
       nir_intrinsic_instr *store =
-         nir_store_global(&b, r, nir_imm_int64(&b, 0), .align_mul = 4);
+         nir_store_global(&b, r, nir_imm_int64(&b, 0));
+      nir_intrinsic_set_align(store, 4, 0);
 
       EXPECT_TRUE(agx_nir_opt_popcount_idiom(b.shader));
       NIR_PASS(_, b.shader, nir_opt_dce);
@@ -75,7 +77,8 @@ TEST(PopcountIdiom, RejectsMismatchedMaskOrShift)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, &agx_nir_options, "popcount-negative");
-   nir_def *x = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 4);
+   nir_def *x = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0));
+   nir_intrinsic_set_range(nir_def_as_intrinsic(x), 4);
 
    /* Wrong mask at first level (0x55555554 instead of 0x55555555). */
    nir_def *v = pc_level(&b, x, 0x55555554, 1);
@@ -90,7 +93,8 @@ TEST(PopcountIdiom, RejectsMismatchedMaskOrShift)
    u = nir_iand_imm(&b, nir_iadd(&b, u, nir_ushr_imm(&b, u, 4)), 0x0f0f0f0f);
    nir_def *r2 = nir_ushr_imm(&b, nir_imul_imm(&b, u, 0x01010101), 25);
 
-   nir_store_global(&b, nir_iadd(&b, r1, r2), nir_imm_int64(&b, 0), .align_mul = 4);
+   nir_intrinsic_set_align(
+      nir_store_global(&b, nir_iadd(&b, r1, r2), nir_imm_int64(&b, 0)), 4, 0);
 
    EXPECT_FALSE(agx_nir_opt_popcount_idiom(b.shader));
    nir_validate_shader(b.shader, "popcount-negative");

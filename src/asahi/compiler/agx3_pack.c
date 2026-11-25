@@ -1436,6 +1436,33 @@ agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
       memset(out, 0, sizeof(*out));
       return true;
    }
+   /*
+    * The barrier's fields mean the same on both encodings: the memory class
+    * (f24 device, f26 threadgroup, f28 texture), f29 the threadgroup
+    * rendezvous, f39 the threadgroup memory scope. Each witnessed
+    * memory-only fence is its barrier with f29 cleared and f40 set: the
+    * device fence (device barrier f24 f29 f39 -> f24 f39 f40) and, on AGX3C,
+    * atomic_thread_fence(mem_texture, thread_scope_threadgroup) (texture
+    * barrier f28 f29 f39 f40 f41 -> f28 f39 f40 f41). The threadgroup-memory
+    * fence is the threadgroup barrier (f26 f29 f39) with the same rule
+    * applied. A rendezvous in its place would count arrivals that a fence
+    * in divergent control flow never gets from the rest of the workgroup.
+    */
+   if (scope == AGX3_BARRIER_SCOPE_THREADGROUP_FENCE) {
+      if (out == NULL || (encoding != AGX_ISA_ENCODING_AGX3B &&
+                          encoding != AGX_ISA_ENCODING_AGX3C))
+         return false;
+      const struct agx3_field_kv fields[] = {
+         {14, 3}, {15, 9}, {26, 1}, {30, 2}, {39, 1}, {40, 1},
+      };
+      const bool agx3c = encoding == AGX_ISA_ENCODING_AGX3C;
+      memset(out, 0, sizeof(*out));
+      /* f14/f15 are fixed fields of the AGX3C form only. */
+      return agx3_bind_compose(encoding, AGX3_MN_barrier, 0,
+                               fields + (agx3c ? 0 : 2),
+                               agx3c ? 6 : 4, NULL, 0, out->bytes,
+                               &out->length);
+   }
    if (scope == AGX3_BARRIER_SCOPE_MESH_PAYLOAD_ENTRY ||
        scope == AGX3_BARRIER_SCOPE_OBJECT_PAYLOAD_EXIT) {
       if (encoding != AGX_ISA_ENCODING_AGX3C || out == NULL) return false;
@@ -1750,23 +1777,17 @@ agx3_pack_intersect_ray(enum agx_isa_encoding encoding,
    return true;
 }
 
+static enum agx_isa_encoding
+agx3_ray_opcode_chip_encoding(enum agx_chip chip)
+{
+   return agx_chip_has_agx3_ray_opcodes(chip) ? agx_chip_isa_encoding(chip)
+                                              : AGX_ISA_ENCODING_UNKNOWN;
+}
+
 enum agx_isa_encoding
 agx3_intersect_ray_witnessed_chip_encoding(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G17P:
-      return AGX_ISA_ENCODING_AGX3B;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-      return AGX_ISA_ENCODING_AGX3C;
-   default:
-      return AGX_ISA_ENCODING_UNKNOWN;
-   }
+   return agx3_ray_opcode_chip_encoding(chip);
 }
 
 static const uint8_t continue_ray_canonical_agx3b[] = {
@@ -1861,21 +1882,7 @@ agx3_pack_continue_ray(enum agx_isa_encoding encoding,
 enum agx_isa_encoding
 agx3_continue_ray_witnessed_chip_encoding(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G17P:
-      return AGX_ISA_ENCODING_AGX3B;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-      return AGX_ISA_ENCODING_AGX3C;
-   default:
-      return AGX_ISA_ENCODING_UNKNOWN;
-   }
+   return agx3_ray_opcode_chip_encoding(chip);
 }
 
 bool
@@ -1937,18 +1944,5 @@ agx3_pack_inc_stk_fixed_witness(
 enum agx_isa_encoding
 agx3_inc_stk_witnessed_chip_encoding(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G17P:
-      return AGX_ISA_ENCODING_AGX3B;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-      return AGX_ISA_ENCODING_AGX3C;
-   default:
-      return AGX_ISA_ENCODING_UNKNOWN;
-   }
+   return agx3_ray_opcode_chip_encoding(chip);
 }

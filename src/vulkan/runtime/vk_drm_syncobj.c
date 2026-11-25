@@ -332,40 +332,68 @@ vk_drm_syncobj_wait_many(struct vk_device *device,
    VkResult result = VK_SUCCESS;
    if (wait_count == 0) {
       err = 0;
-   } else if (wait_flags & VK_SYNC_WAIT_PENDING) {
-      /* We always use a timeline wait for WAIT_PENDING, even for binary
-       * syncobjs because the non-timeline wait doesn't support
-       * DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE.
-       */
-      while (true) {
-         /* A submit thread may lose the device without ever publishing this
-          * payload. Periodically check device loss while retaining the
-          * caller's deadline; a healthy pending wait must not be shortened. */
-         if (vk_device_is_lost(device)) {
-            result = VK_ERROR_DEVICE_LOST;
+   } else {
+      const uint64_t poll_budget_ns =
+         (uint64_t)device->sync_wait_poll_us * 1000;
+      uint64_t poll_deadline_ns = 0;
+      if (poll_budget_ns &&
+          os_time_get_nano() >=
+          p_atomic_read(&device->sync_poll_miss_expire_ns))
+         poll_deadline_ns = MIN2(os_time_get_nano() + poll_budget_ns,
+                                 abs_timeout_ns);
+      while (wait_count > 0) {
+         const bool poll =
+            poll_deadline_ns && os_time_get_nano() < poll_deadline_ns;
+         uint64_t timeout_ns = poll ? 0 : abs_timeout_ns;
+         if (wait_flags & VK_SYNC_WAIT_PENDING) {
+            if (vk_device_is_lost(device)) {
+               result = VK_ERROR_DEVICE_LOST;
+               break;
+            }
+            if (!poll) {
+               timeout_ns = MIN2(abs_timeout_ns,
+                  os_time_get_absolute_timeout(100000000));
+            }
+            err = device->sync->timeline_wait(device->sync, handles, wait_values,
+                                              wait_count, timeout_ns,
+                                              syncobj_wait_flags |
+                                              DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
+                                              NULL /* first_signaled */);
+         } else if (has_timeline) {
+            err = device->sync->timeline_wait(device->sync, handles, wait_values,
+                                              wait_count, timeout_ns,
+                                              syncobj_wait_flags,
+                                              NULL /* first_signaled */);
+         } else {
+            err = device->sync->wait(device->sync, handles,
+                                     wait_count, timeout_ns,
+                                     syncobj_wait_flags,
+                                     NULL /* first_signaled */);
+         }
+         if (err == 0) {
+            if (poll) {
+               p_atomic_set(&device->sync_poll_misses, 0);
+               p_atomic_set(&device->sync_poll_miss_expire_ns, 0);
+            }
             break;
          }
-
-         uint64_t wait_timeout_ns = MIN2(abs_timeout_ns,
-            os_time_get_absolute_timeout(100000000));
-         err = device->sync->timeline_wait(device->sync, handles, wait_values,
-                                           wait_count, wait_timeout_ns,
-                                           syncobj_wait_flags |
-                                           DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
-                                           NULL /* first_signaled */);
-         if (!err || errno != ETIME || wait_timeout_ns == abs_timeout_ns)
+         if (!poll) {
+            if (!(wait_flags & VK_SYNC_WAIT_PENDING) || errno != ETIME ||
+                timeout_ns == abs_timeout_ns)
+               break;
+            continue;
+         }
+         if (errno != ETIME)
             break;
+         if (os_time_get_nano() >= poll_deadline_ns) {
+            const uint32_t misses =
+               (uint32_t)p_atomic_inc_return(&device->sync_poll_misses);
+            const uint64_t backoff_ns =
+               poll_budget_ns << MIN2(misses, 10);
+            p_atomic_set(&device->sync_poll_miss_expire_ns,
+                         os_time_get_nano() + backoff_ns);
+         }
       }
-   } else if (has_timeline) {
-      err = device->sync->timeline_wait(device->sync, handles, wait_values,
-                                        wait_count, abs_timeout_ns,
-                                        syncobj_wait_flags,
-                                        NULL /* first_signaled */);
-   } else {
-      err = device->sync->wait(device->sync, handles,
-                               wait_count, abs_timeout_ns,
-                               syncobj_wait_flags,
-                               NULL /* first_signaled */);
    }
 
    STACK_ARRAY_FINISH(handles);

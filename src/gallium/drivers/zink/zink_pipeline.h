@@ -52,11 +52,16 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
 VkPipeline
 zink_create_compute_pipeline(struct zink_screen *screen, struct zink_compute_program *comp, struct zink_compute_pipeline_state *state);
 
+void
+zink_fill_pipeline_robustness(struct zink_screen *screen, bool is_robust,
+                              VkPipelineRobustnessCreateInfoEXT *prci);
+
 VkPipeline
 zink_create_gfx_pipeline_input(struct zink_screen *screen,
                                struct zink_gfx_pipeline_state *state,
                                const uint8_t *binding_map,
-                               VkPrimitiveTopology primitive_topology);
+                               VkPrimitiveTopology primitive_topology,
+                               bool is_robust);
 VkPipeline
 zink_create_gfx_pipeline_library(struct zink_screen *screen, struct zink_gfx_program *prog);
 VkPipeline

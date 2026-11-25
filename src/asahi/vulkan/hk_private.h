@@ -71,6 +71,13 @@ enum hk_cmd_slab_class {
    HK_CMD_SLAB_MAIN,
    HK_CMD_SLAB_USC,
    HK_CMD_SLAB_IOTO,
+   /* Unmapped, non-writeback slabs for GPU-written indirect command streams,
+    * Ioto vertex programs, and draw-ID tables. Keeping GPU-written spans out of
+    * CPU-cached slabs prevents shared-cacheline writebacks from clobbering
+    * pre-graphics compute output. */
+   HK_CMD_SLAB_VDM_GPU,
+   HK_CMD_SLAB_IOTO_GPU,
+   HK_CMD_SLAB_DATA_GPU,
    HK_CMD_SLAB_COUNT,
 };
 
