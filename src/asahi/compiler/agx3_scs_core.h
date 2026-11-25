@@ -2,19 +2,10 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * AGX3 scalar SCS load/store encoders and decoders.
- *
- * The supported address-space(5) forms were recovered with controlled Apple
- * G17P/G17S compiler probes.  Four address kinds are represented, spanning
- * every combination Apple's G17P ray-query setup emits: direct-absolute, a
- * scalar register index plus a uniform-register base, a scalar register index
- * plus a register base, and a register base with no index -- each with a
- * signed 16-bit byte displacement.  Loads and stores may move one through four
- * 32-bit components.
- *
- * AGX3c supports W32 vectors and direct, uniform-indexed, and register-base
- * addressing witnessed in Apple's ray setup. Its destination-less traversal
- * epilogue has a separate descriptor and API below.
+ * AGX3 scalar SCS (address-space 5) load/store encoders and decoders.
+ * Supports 1..4 32-bit components across direct, uniform-indexed,
+ * register-indexed, and register-base addressing with signed 16-bit byte
+ * displacement (AGX3C also provides a destination-less traversal epilogue).
  */
 
 #pragma once

@@ -48,6 +48,7 @@
 #include <xf86drm.h>
 #include "util/cache_ops.h"
 #include "util/list.h"
+#include "util/log.h"
 #include "util/macros.h"
 #include "util/os_time.h"
 #include "util/u_atomic.h"
@@ -1279,8 +1280,12 @@ hk_cmd_buffer_needs_render_rq(struct hk_cmd_buffer *cmdbuf)
 }
 
 static unsigned
-hk_submit_needs_render_rq(const struct vk_queue_submit *submit)
+hk_submit_needs_render_rq(const struct hk_device *dev,
+                          const struct vk_queue_submit *submit)
 {
+   if (!dev->gen1_native_graphics_rq && !dev->gen1_native_fragment_rq)
+      return 0;
+
    unsigned stages = 0;
 
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
@@ -1332,6 +1337,7 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
          return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
                           "Waiting for the replaced kernel queue failed: %s",
                           strerror(errno));
+      hk_queue_note_signalled(queue, queue->drm.timeline_value);
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
       p_atomic_set(&queue->drm.id, UINT32_MAX);
    }
@@ -1608,27 +1614,51 @@ hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
  * (a depth-2 compute stream ran 19% slower with siblings on the M4 Pro).
  * With work queued behind them, the overlap fills the launch and drain gaps
  * between kicks instead. */
+/* Query the queue timeline's signalled point, short-circuiting through the
+ * cached monotonic lower bound whenever it already covers `target`. */
+static bool
+hk_queue_query_progress(struct hk_device *dev, struct hk_queue *queue,
+                        uint64_t target, uint64_t *done_out)
+{
+   uint64_t done = p_atomic_read(&queue->drm.signalled_value);
+   if (done >= target) {
+      *done_out = done;
+      return true;
+   }
+
+   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1) != 0)
+      return false;
+
+   hk_queue_note_signalled(queue, done);
+   *done_out = done;
+   return true;
+}
+
 static bool
 hk_sibling_deep(struct hk_device *dev, struct hk_queue *queue,
                 uint64_t submitted_point)
 {
-   uint64_t done = 0;
+   uint64_t done = p_atomic_read(&queue->drm.signalled_value);
+   if (submitted_point <= done ||
+       submitted_point - done < HK_G17P_SIBLING_MIN_IN_FLIGHT)
+      return false;
 
    if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1))
       return false;
-   return submitted_point >= done + HK_G17P_SIBLING_MIN_IN_FLIGHT;
+   hk_queue_note_signalled(queue, done);
+   return submitted_point > done &&
+          submitted_point - done >= HK_G17P_SIBLING_MIN_IN_FLIGHT;
 }
 
 /* Whether any sibling kernel queue may still be executing work. */
 static bool
-hk_sibling_in_flight(struct hk_device *dev, const struct hk_queue *queue)
+hk_sibling_in_flight(struct hk_device *dev, struct hk_queue *queue)
 {
    if (queue->sib.count <= 1 || !queue->sib.used || !queue->sib.last_point)
       return false;
 
-   uint32_t handle = queue->drm.syncobj;
    uint64_t done = 0;
-   if (drmSyncobjQuery(dev->dev.fd, &handle, &done, 1))
+   if (!hk_queue_query_progress(dev, queue, queue->sib.last_point, &done))
       return true;
    return done < queue->sib.last_point;
 }
@@ -1643,7 +1673,8 @@ hk_sibling_packed_atomic_busy(struct hk_device *dev, struct hk_queue *queue)
       return false;
 
    uint64_t done = 0;
-   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1))
+   if (!hk_queue_query_progress(dev, queue, queue->sib.packed_atomic_point,
+                                &done))
       return true;
    if (done >= queue->sib.packed_atomic_point) {
       queue->sib.packed_atomic_point = 0;
@@ -1773,8 +1804,61 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                    hk_sparse_submission_updates_sstt(submit);
    }
 
+   /* Gather recorded control streams, deferred host flushes, query resets, and
+    * barrier epochs up front so empty submissions take the fast path without
+    * scanning timestamps or ray-query stages. */
+   uint32_t sq_count[HK_SYNC_NUM_SQ] = {0, 0};
+   bool any_sync_epoch = false;
+   bool has_query_reset = false;
+   uint8_t host_flush_kinds = 0;
+   const bool same_submit = submit == original;
+   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+      struct hk_cmd_buffer *cmdbuf =
+         (struct hk_cmd_buffer *)submit->command_buffers[i];
+
+      list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node)
+         sq_count[hk_sync_sq(cs)]++;
+      any_sync_epoch |= cmdbuf->sync.epoch != 0;
+      if (same_submit) {
+         has_query_reset |= cmdbuf->sync.has_gpu_query_reset;
+         host_flush_kinds |= cmdbuf->sync.host_flush_kinds;
+      }
+   }
+   if (!same_submit) {
+      for (unsigned i = 0; i < original->command_buffer_count; ++i) {
+         const struct hk_cmd_buffer *cmdbuf =
+            (const struct hk_cmd_buffer *)original->command_buffers[i];
+         has_query_reset |= cmdbuf->sync.has_gpu_query_reset;
+         host_flush_kinds |= cmdbuf->sync.host_flush_kinds;
+      }
+   }
+   const bool host_flush = host_flush_kinds != 0;
+   const unsigned stream_count = sq_count[HK_SYNC_VDM] + sq_count[HK_SYNC_CDM];
+
+   if (!flush_sstt && !host_flush && stream_count == 0) {
+      /* A barrier-only command buffer still has a second scope in later
+       * submissions, while a barrier-free empty submission (sync.epoch == 0)
+       * cannot change queue->sync.tail and skips the resolver completely. */
+      if (queue->sync.exact_prior && any_sync_epoch) {
+         bool tail_raised = false;
+         if (!hk_sync_resolve_submit_ex(
+                queue, (struct hk_cmd_buffer *const *)submit->command_buffers,
+                submit->command_buffer_count, false, false, 0, NULL,
+                &tail_raised))
+            return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
+         if (tail_raised) {
+            uint64_t sq_pt = MAX2(queue->drm.last_sq_point[HK_SYNC_VDM],
+                                  queue->drm.last_sq_point[HK_SYNC_CDM]);
+            if (queue->sib.used)
+               sq_pt = MAX2(sq_pt, queue->sib.last_point);
+            queue->drm.last_tail_point = MAX2(queue->drm.last_tail_point, sq_pt);
+         }
+      }
+      return queue_submit_empty(dev, queue, submit);
+   }
+
    struct hk_cs *uts_cs = hk_submit_unordered_start_ts(submit);
-   const unsigned render_rq = hk_submit_needs_render_rq(submit);
+   const unsigned render_rq = hk_submit_needs_render_rq(dev, submit);
    /* VDM and CDM subqueues (and sibling kernel queues) can start commands
     * independently. If the opposite subqueue, a sibling kernel queue, an
     * earlier GPU query reset submission, or an earlier submission that raised
@@ -1807,7 +1891,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       if (check_point > 0) {
          uint64_t done = 0;
          const bool ok =
-            drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1) == 0;
+            hk_queue_query_progress(dev, queue, check_point, &done);
          prior_busy = !ok || done < check_point;
          if (ok) {
             if (queue->drm.last_sq_point[other_sq] > 0 &&
@@ -1830,64 +1914,14 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
        queue->sync.serialize || !queue->sync.exact_prior);
    const bool prepend_cdm = flush_sstt || ts_carrier;
 
-   bool has_query_reset = false;
-   for (unsigned i = 0; i < original->command_buffer_count; ++i) {
-      const struct hk_cmd_buffer *cmdbuf =
-         (const struct hk_cmd_buffer *)original->command_buffers[i];
-      if (cmdbuf->sync.has_gpu_query_reset) {
-         has_query_reset = true;
-         break;
-      }
-   }
-
-   /* Host availability the command buffers deferred (secondaries replay
-    * into their primary): one memory-scoped flush ends the submission, after
-    * the first scopes of those dependencies. */
-   uint8_t host_flush_kinds = 0;
-   for (unsigned i = 0; i < original->command_buffer_count; ++i) {
-      const struct hk_cmd_buffer *cmdbuf =
-         (const struct hk_cmd_buffer *)original->command_buffers[i];
-      host_flush_kinds |= cmdbuf->sync.host_flush_kinds;
-   }
-   const bool host_flush = host_flush_kinds != 0;
-
-   uint32_t sq_count[HK_SYNC_NUM_SQ] = {0, prepend_cdm ? 1 : 0};
-
-   /* Gather the number of individual commands to submit up front */
-   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
-      struct hk_cmd_buffer *cmdbuf =
-         (struct hk_cmd_buffer *)submit->command_buffers[i];
-
-      list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node)
-         sq_count[hk_sync_sq(cs)]++;
-   }
+   if (prepend_cdm)
+      sq_count[HK_SYNC_CDM]++;
    const unsigned command_count =
       sq_count[HK_SYNC_VDM] + sq_count[HK_SYNC_CDM] + (host_flush ? 1 : 0);
 
    perf_debug_dev(&dev->dev,
                   "Submitting %u control streams (%u command buffers)",
                   command_count, submit->command_buffer_count);
-
-   if (command_count == 0) {
-      /* A barrier-only command buffer still has a second scope in later
-       * submissions. Unsupported kernels retain their existing path. */
-      if (queue->sync.exact_prior) {
-         uint64_t prev_tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
-         memcpy(prev_tail, queue->sync.tail, sizeof(prev_tail));
-         if (!hk_sync_resolve_submit(
-                queue, (struct hk_cmd_buffer *const *)submit->command_buffers,
-                submit->command_buffer_count, false, false, 0, NULL))
-            return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
-         if (memcmp(prev_tail, queue->sync.tail, sizeof(prev_tail)) != 0) {
-            uint64_t sq_pt = MAX2(queue->drm.last_sq_point[HK_SYNC_VDM],
-                                  queue->drm.last_sq_point[HK_SYNC_CDM]);
-            if (queue->sib.used)
-               sq_pt = MAX2(sq_pt, queue->sib.last_point);
-            queue->drm.last_tail_point = MAX2(queue->drm.last_tail_point, sq_pt);
-         }
-      }
-      return queue_submit_empty(dev, queue, submit);
-   }
 
    if (ts_carrier) {
       VkResult carrier_result = hk_queue_ensure_ts_carrier(dev, queue);
@@ -1999,7 +2033,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    if (queue->drm.empty_wait_point) {
       uint64_t done = 0;
       const bool queried =
-         drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1) == 0;
+         hk_queue_query_progress(dev, queue, queue->drm.empty_wait_point,
+                                 &done);
       if (hk_drm_empty_wait_pending(queue->drm.empty_wait_point, queried,
                                     done)) {
          hk_drm_wait_own_timeline(syncs, &wait_count, 0, &own_wait,
@@ -2018,8 +2053,9 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
        *
        * XXX: This is quadratic time.
        */
-      bool skip = false;
-      if (submit->waits[i].sync->flags & VK_SYNC_IS_TIMELINE) {
+      if (submit->wait_count > 1 &&
+          (submit->waits[i].sync->flags & VK_SYNC_IS_TIMELINE)) {
+         bool skip = false;
          const uint64_t v1 = submit->waits[i].wait_value;
          for (unsigned j = 0; j < submit->wait_count; ++j) {
             const uint64_t v2 = submit->waits[j].wait_value;
@@ -2136,8 +2172,10 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
           queue, (struct hk_cmd_buffer *const *)submit->command_buffers,
           submit->command_buffer_count)) {
       uint64_t point = 0;
-      if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &point, 1) == 0)
+      if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &point, 1) == 0) {
+         hk_queue_note_signalled(queue, point);
          completed = point;
+      }
    }
 
    /* Every command's barrier fields come from recorded dependencies. Legacy
@@ -2149,25 +2187,21 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                         queue->sync.stage_overlap;
    const struct hk_sync_resolved *resolved =
       resolve ? queue->sync_resolved.data : NULL;
-   uint64_t prev_tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
-   if (resolve && queue->sync.exact_prior)
-      memcpy(prev_tail, queue->sync.tail, sizeof(prev_tail));
    const bool chain_first =
       wait_count > 0 &&
       !(dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS);
-   if (resolve && !hk_sync_resolve_submit(queue,
+   bool tail_raised = false;
+   if (resolve && !hk_sync_resolve_submit_ex(queue,
                           (struct hk_cmd_buffer *const *)submit->command_buffers,
                           submit->command_buffer_count, prepend_cdm,
-                          chain_first, completed, queue->sync_resolved.data)) {
+                          chain_first, completed, queue->sync_resolved.data,
+                          &tail_raised)) {
       util_dynarray_fini(&payload);
       if (unlikely(anatomy))
          hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
       hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
       return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
    }
-   const bool tail_raised =
-      resolve && queue->sync.exact_prior &&
-      memcmp(prev_tail, queue->sync.tail, sizeof(prev_tail)) != 0;
 
    /* The deferred host flush follows the first scopes of the dependencies
     * that asked for it, as resolved for the whole submission, and the
@@ -2928,7 +2962,7 @@ DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
 DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
 
 static bool
-hk_pack_atomics_allowed(struct hk_device *dev, const struct hk_queue *queue)
+hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue)
 {
    const char *opt = debug_get_option_hk_pack_atomics_opt();
    if (!opt)
@@ -3173,7 +3207,7 @@ compute_pair_can_replace(const struct hk_cs *producer, const struct hk_cs *consu
    return compute_pair_buffers_match(p, c);
 }
 
-static bool
+static ATTRIBUTE_NOINLINE bool
 hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
              const struct vk_queue_submit *submit, struct hk_packed_runs *out)
 {
@@ -3223,7 +3257,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             const struct hk_compute_pair_dispatch *p = members[i].cs->compute_pair;
             const struct hk_compute_pair_dispatch *c = members[i + 1].cs->compute_pair;
             struct hk_shader *shader = hk_compute_pair_get_or_compile_fused(
-               dev, p->producer, &c->info.clamp.epilogue, p->is_depthwise_vec4);
+               dev, p->producer, &c->info.clamp.epilogue, p->alt_kind);
             if (shader && hk_fused_compute_shader_eligible(dev, shader, p)) {
                if (AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE > members[i].bytes)
                   members[i].bytes = AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE;
@@ -3443,6 +3477,15 @@ static VkResult
 queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
                      struct vk_queue_submit *submit, bool *untouched)
 {
+   /* Fast-path single-CB and sparse-bind submits before taking the alias
+    * patch rwlock or calling into submit packing (which carries stack buffers
+    * for multi-CB runs). */
+   if (submit->command_buffer_count < 2 || submit->buffer_bind_count ||
+       submit->image_bind_count || submit->image_opaque_bind_count ||
+       !hk_pack_runs_enabled(dev))
+      return queue_submit_recordings(dev, queue, submit, submit, NULL, 0,
+                                     untouched);
+
    /* Packing copies the command buffers' streams: no patch site may be
     * written meanwhile (host_alias.patch_lock). The copies are the only CPU
     * reads of stream words at submission; the GPU reads each word whole. */
@@ -3474,6 +3517,8 @@ static VkResult
 queue_submit(struct hk_device *dev, struct hk_queue *queue,
              struct vk_queue_submit *submit, bool *untouched)
 {
+   if (submit->command_buffer_count <= 1)
+      return queue_submit_segment(dev, queue, submit, untouched);
    bool needs_split = false;
    for (unsigned i = 1; i < submit->command_buffer_count; ++i) {
       const struct hk_cmd_buffer *cmd =
@@ -3600,6 +3645,7 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       if (err) {
          result = vk_queue_set_lost(&queue->vk, "Wait failed");
       } else {
+         hk_queue_note_signalled(queue, queue->drm.timeline_value);
          VkResult res = dev->vk.check_status(&dev->vk);
          if (result == VK_SUCCESS)
             result = res;
@@ -3609,11 +3655,49 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    return result;
 }
 
+/* Wait, up to timeout_ns in all, for the GPU to finish everything the
+ * application's queues have handed to the kernel, also when the device is
+ * lost: its earlier submissions may still run. Work still queued in the
+ * runtime's submit thread has not reached the kernel and is not waited for.
+ */
+void
+hk_device_wait_submitted(struct hk_device *dev, uint64_t timeout_ns)
+{
+   const uint64_t deadline = os_time_get_absolute_timeout(timeout_ns);
+   const int64_t abs_timeout = (int64_t)MIN2(deadline, (uint64_t)INT64_MAX);
+   bool warned = false;
+
+   list_for_each_entry(struct vk_queue, iter, &dev->vk.queues, link) {
+      struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
+      uint64_t point = 0;
+
+      if (!queue->drm.syncobj)
+         continue;
+
+      /* The last point the kernel accepted, which has a fence: the cursor
+       * may sit past it on a point a failed submission skipped. Failed work
+       * carries an error fence and does not delay this. */
+      if (drmSyncobjQuery2(dev->dev.fd, &queue->drm.syncobj, &point, 1,
+                           DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED) ||
+          !point)
+         continue;
+
+      int ret;
+      do {
+         ret = drmSyncobjTimelineWait(dev->dev.fd, &queue->drm.syncobj, &point,
+                                      1, abs_timeout, 0, NULL);
+      } while (ret == -EINTR);
+      if (ret == -ETIME && !warned) {
+         mesa_logw("hk: device destroyed while its GPU work was still running");
+         warned = true;
+      }
+   }
+}
+
 void
 hk_device_quiesce_lost_submissions(struct hk_device *dev)
 {
-   if (!agx_chip_g17_m5(dev->dev.chip) ||
-       !vk_device_is_lost_no_report(&dev->vk))
+   if (!vk_device_is_lost_no_report(&dev->vk))
       return;
 
    /* GPU storage remains pinned separately. This protects host object data
@@ -3683,7 +3767,7 @@ uint32_t
 hk_queue_independent_budget(struct hk_device *dev)
 {
    if (!(dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) ||
-       dev->dev.is_virtio)
+       dev->dev.is_virtio || (dev->dev.debug & AGX_DBG_1QUEUE))
       return 1;
 
    const uint32_t max_queues = hk_device_physical(dev)->queue_limits.max_queues;
@@ -3726,6 +3810,7 @@ hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
    if (independent < hk_queue_independent_budget(dev))
       return;
 
+   const bool single_kernel_queue = (dev->dev.debug & AGX_DBG_1QUEUE) != 0;
    struct vk_queue *backing = NULL;
    unsigned backing_sharers = 0;
    vk_foreach_queue(iter, &dev->vk) {
@@ -3734,8 +3819,9 @@ hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
       if (vk_queue_is_emulated(iter))
          continue;
       const struct hk_queue *real = container_of(iter, struct hk_queue, vk);
-      if (real->drm.virt_ring_idx != queue->drm.virt_ring_idx ||
-          real->vk.flags != queue->vk.flags)
+      if (!single_kernel_queue &&
+          (real->drm.virt_ring_idx != queue->drm.virt_ring_idx ||
+           real->vk.flags != queue->vk.flags))
          continue;
       const unsigned sharers = hk_queue_sharers(dev, iter);
       if (!backing || sharers < backing_sharers) {

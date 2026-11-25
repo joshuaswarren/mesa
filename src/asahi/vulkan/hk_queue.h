@@ -9,6 +9,7 @@
 
 #include "hk_private.h"
 #include "hk_sync.h"
+#include "util/u_atomic.h"
 #include "vk_queue.h"
 
 struct hk_device;
@@ -54,9 +55,9 @@ struct hk_queue {
        */
       uint64_t timeline_value;
 
-      /* The highest timeline value a host wait has seen signalled, for
-       * occlusion query reads (hk_oq_submission_done()). Every value at or
-       * below it is complete. */
+      /* The highest timeline value a host wait or syncobj query has seen
+       * signalled, updated monotonically via hk_queue_note_signalled(). Every
+       * value at or below it is complete. */
       uint64_t signalled_value;
 
       /* Latest timeline point that received the waits of a submission
@@ -178,6 +179,19 @@ hk_queue_device(struct hk_queue *queue)
    return (struct hk_device *)queue->vk.base.device;
 }
 
+static inline void
+hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
+{
+   uint64_t seen = p_atomic_read(&queue->drm.signalled_value);
+   while (seen < point) {
+      const uint64_t prev =
+         p_atomic_cmpxchg(&queue->drm.signalled_value, seen, point);
+      if (prev == seen)
+         break;
+      seen = prev;
+   }
+}
+
 
 /* Whether a queue publishes API signals from its cumulative queue timeline
  * because independent engines or sibling kernel queues may finish out of
@@ -211,7 +225,7 @@ hk_queue_sibling_compute_supported(const struct agx_device *dev,
 {
    const uint64_t required = DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS |
                              DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
-   return !dev->is_virtio && exact_prior &&
+   return !dev->is_virtio && !(dev->debug & AGX_DBG_1QUEUE) && exact_prior &&
           hk_queue_uses_cumulative_signals(dev) &&
           (dev->params.features & required) == required &&
           !(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL);
@@ -228,6 +242,7 @@ VkResult hk_queue_init_kick(struct hk_device *dev,
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_device_quiesce_lost_submissions(struct hk_device *dev);
+void hk_device_wait_submitted(struct hk_device *dev, uint64_t timeout_ns);
 
 /* The first command buffer of the submission whose recording failed, or NULL.
  * Such a command buffer is not executable (vkEndCommandBuffer returned its

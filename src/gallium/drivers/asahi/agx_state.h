@@ -591,7 +591,6 @@ struct agx_batch {
    struct agx_context *ctx;
    struct pipe_framebuffer_state key;
    uint64_t seqnum;
-   uint64_t submit_seq;
    uint32_t syncobj;
    /* Failed waits retain these fences and all batch resources until exit. */
    uint32_t failed_syncobjs[2];
@@ -669,14 +668,13 @@ struct agx_batch {
     * class, DRM_ASAHI_RENDER_SHADER_WRITES). */
    bool m5_shader_writes;
 
-   /* Conservative vertex-stage dependency and primitive-count tracking for
-    * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS and DRM_ASAHI_RENDER_FEW_PRIMITIVES. */
-   bool vs_needs_render_barrier;
-   bool prims_unknown;
-   uint32_t known_prims;
-
    uint64_t uploaded_clear_color[PIPE_MAX_COLOR_BUFS];
    union pipe_color_union clear_color[PIPE_MAX_COLOR_BUFS];
+
+   /* Zeroes that constant and storage buffers with nothing in range point at,
+    * 0 until the first one (agx_uniforms.c).
+    */
+   uint64_t zero_sink;
    double clear_depth;
    unsigned clear_stencil;
 
@@ -716,8 +714,6 @@ struct agx_batch {
    struct {
       struct set *set;
       struct util_dynarray list; /* struct agx_bo * */
-      /* Subset of BOs written by this batch (subset of list; borrows its ref). */
-      struct util_dynarray written; /* struct agx_bo * */
       /* Byte ranges of buffer BOs this batch reads or writes, for buffers
        * accessed only through ranged bindings. A BO in the set without an
        * entry here counts as accessed in full. */
@@ -725,18 +721,10 @@ struct agx_batch {
       struct util_dynarray range_list; /* struct agx_bo_range */
    } bo_list;
 
-   /* Per-batch subqueue and barrier-tracking state retained while submitted. */
-   bool submitted_has_vdm;
-   bool submitted_has_cdm;
-   bool barrier_untracked;
-
    /* If true, this batch contains a shader with a potentially incoherent write
     * (e.g. image_write), needing a barrier later to access.
     */
    bool incoherent_writes;
-
-   /* If true, a compute dispatch in this batch accesses a query BO. */
-   bool query_access;
 
    struct agx_pool pool, pipeline_pool;
    struct util_dynarray g17p_vdm_aliases;
@@ -970,15 +958,6 @@ struct asahi_blitter {
    void *saved_cs;
 };
 
-struct agx_pending_batch {
-   struct agx_batch *batch;
-   struct drm_asahi_cmd_compute compute;
-   struct drm_asahi_cmd_render render;
-   bool has_compute;
-   bool has_render;
-   bool untracked;
-};
-
 struct agx_oq_heap;
 
 struct agx_context {
@@ -1035,17 +1014,10 @@ struct agx_context {
     */
    struct {
       uint64_t seqnum;
-      /* Batches with seqnum <= barrier_seqnum must be waited on by later
-       * submissions until they retire (explicit memory/texture/resource
-       * barriers). */
-      uint64_t barrier_seqnum;
       struct agx_batch slots[AGX_MAX_BATCHES];
 
       /** Set of active batches for faster traversal */
       BITSET_DECLARE(active, AGX_MAX_BATCHES);
-
-      /** Set of flushed batches queued for a coalesced multi-command submit */
-      BITSET_DECLARE(queued, AGX_MAX_BATCHES);
 
       /** Set of submitted batches for faster traversal */
       BITSET_DECLARE(submitted, AGX_MAX_BATCHES);
@@ -1068,12 +1040,6 @@ struct agx_context {
          bool has_vdm;
       } query_state[AGX_MAX_BATCHES];
    } batches;
-
-   /* Hazard-flushed batches awaiting a coalesced multi-command submit. */
-   struct {
-      struct util_dynarray batches; /* struct agx_pending_batch */
-      unsigned hw_cmds;
-   } pending;
 
    /* Queue handle */
    uint32_t queue_id, virt_ring_idx;
@@ -1336,6 +1302,25 @@ void agx_xfb_cpu_draw(struct agx_context *ctx,
                       const struct pipe_draw_start_count_bias *draw);
 void agx_xfb_cpu_destroy(struct agx_context *ctx);
 
+/* A buffer range is bound as the application gave it and can extend past the
+ * end of its resource, for example when the buffer's data store is later
+ * replaced by a smaller one. Returns the bytes of the range inside the
+ * resource: 0 when it starts at or past the end. */
+static inline unsigned
+agx_buffer_range_in_resource(const struct pipe_resource *prsc, unsigned offset,
+                             unsigned size)
+{
+   if (offset >= prsc->width0)
+      return 0;
+
+   return MIN2(size, prsc->width0 - offset);
+}
+
+bool agx_cpu_bind_constant_buffer(struct agx_context *ctx,
+                                  struct draw_context *draw,
+                                  mesa_shader_stage s, unsigned i,
+                                  struct pipe_transfer **transfer);
+
 bool agx_swtnl_lower_for_draw(nir_shader *nir);
 bool agx_m5_gpu_tess(struct agx_context *ctx);
 bool agx_swtnl_applies(struct agx_context *ctx);
@@ -1526,40 +1511,7 @@ struct agx_resource {
     * times multiplied by the resource size.
     */
    size_t shadowed_bytes;
-
-   /* Set once any render batch in this context writes this resource (as a
-    * render target or via fragment shader image/SSBO stores). Used to avoid
-    * overlapping a later batch's vertex stage ahead of a render it reads. */
-   bool render_written;
 };
-
-static inline void
-agx_batch_note_vs_read(struct agx_batch *batch, struct agx_resource *rsrc)
-{
-   if (!rsrc || batch->vs_needs_render_barrier)
-      return;
-
-   if (rsrc->render_written) {
-      batch->vs_needs_render_barrier = true;
-      return;
-   }
-
-   if (rsrc->bo) {
-      if (rsrc->bo->flags & AGX_BO_SHARED) {
-         batch->vs_needs_render_barrier = true;
-         return;
-      }
-
-      uint64_t writer = p_atomic_read_relaxed(&rsrc->bo->writer);
-      if (writer && agx_bo_writer_queue(writer) != batch->ctx->queue_id) {
-         batch->vs_needs_render_barrier = true;
-         return;
-      }
-   }
-
-   if (rsrc->separate_stencil)
-      agx_batch_note_vs_read(batch, rsrc->separate_stencil);
-}
 
 static inline struct agx_resource *
 agx_resource(struct pipe_resource *pctx)
@@ -1787,17 +1739,7 @@ struct agx_bo_range {
    uint64_t start, end;
 };
 
-static inline unsigned
-agx_build_timestamp_offset(struct agx_batch *batch, unsigned offset)
-{
-   return (agx_batch_idx(batch) * sizeof(struct agx_timestamps)) + offset;
-}
-
-#define agx_timestamp_offset(batch, offs)                                      \
-   agx_build_timestamp_offset(batch, offsetof(struct agx_timestamps, offs))
-
 bool agx_batch_is_active(struct agx_batch *batch);
-bool agx_batch_is_queued(struct agx_batch *batch);
 bool agx_batch_is_submitted(struct agx_batch *batch);
 
 /* BO pointers remain stable while the batch holds its reference. */
@@ -1836,10 +1778,6 @@ struct drm_asahi_cmd_render;
 void agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
                       struct drm_asahi_cmd_compute *compute,
                       struct drm_asahi_cmd_render *render);
-void agx_batch_queue_or_submit(struct agx_context *ctx, struct agx_batch *batch,
-                               struct drm_asahi_cmd_compute *compute,
-                               struct drm_asahi_cmd_render *render);
-void agx_submit_pending(struct agx_context *ctx);
 
 void agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch);
 bool agx_try_fast_clear_batch(struct agx_context *ctx, struct agx_batch *batch);

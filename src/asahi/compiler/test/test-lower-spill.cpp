@@ -588,16 +588,16 @@ TEST(SpillSlots, RaMemBoundReservesAtomicReturnAndG18GAlignment)
    }
 }
 
-class M5SpillConstantPhi : public testing::Test {
+class Agx3SpillConstantPhi : public testing::Test {
 protected:
    void *mem = ralloc_context(NULL);
    agx_builder *b = agx_test_builder(mem);
    agx_shader_key key = {};
-   M5SpillConstantPhi() {
+   Agx3SpillConstantPhi() {
       key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
       b->shader->key = &key;
    }
-   ~M5SpillConstantPhi() { ralloc_free(mem); }
+   ~Agx3SpillConstantPhi() { ralloc_free(mem); }
    agx_index literal(uint64_t bits, enum agx_size size = AGX_SIZE_32) {
       agx_index x = agx_temp(b->shader, size);
       agx_mov_imm_to(b, x, bits);
@@ -617,45 +617,45 @@ protected:
    }
 };
 
-TEST_F(M5SpillConstantPhi, SameLiteralCopiesJoin)
+TEST_F(Agx3SpillConstantPhi, SameLiteralCopiesJoin)
 {
    agx_index x = literal(0x3f800000), y = literal(0x3f800000);
    agx_index copy = agx_mov(b, x);
    join();
    agx_index out = agx_temp(b->shader, AGX_SIZE_32);
    phi(copy, y, out);
-   ASSERT_TRUE(agx_fold_m5_spill_constant_phis(b->shader));
+   ASSERT_TRUE(agx_fold_agx3_spill_constant_phis(b->shader));
    ASSERT_EQ(definition(out)->op, AGX_OPCODE_MOV_IMM);
    EXPECT_EQ(definition(out)->imm, 0x3f800000u);
 }
 
-TEST_F(M5SpillConstantPhi, GroundedLoopWebPreservesLiteralPayload)
+TEST_F(Agx3SpillConstantPhi, GroundedLoopWebPreservesLiteralPayload)
 {
    agx_index root = literal(0x7fc01234);
    join();
    agx_index a = agx_temp(b->shader, AGX_SIZE_32);
    agx_index c = agx_temp(b->shader, AGX_SIZE_32);
    phi(root, c, a); phi(root, a, c);
-   ASSERT_TRUE(agx_fold_m5_spill_constant_phis(b->shader));
+   ASSERT_TRUE(agx_fold_agx3_spill_constant_phis(b->shader));
    EXPECT_EQ(definition(a)->op, AGX_OPCODE_MOV_IMM);
    EXPECT_EQ(definition(c)->op, AGX_OPCODE_MOV_IMM);
    EXPECT_EQ(definition(a)->imm, 0x7fc01234u);
    EXPECT_EQ(definition(c)->imm, 0x7fc01234u);
 }
 
-TEST_F(M5SpillConstantPhi, ChangingLoopInputRemainsPhi)
+TEST_F(Agx3SpillConstantPhi, ChangingLoopInputRemainsPhi)
 {
    agx_index zero = literal(0), one = literal(1);
    join();
    agx_index a = agx_temp(b->shader, AGX_SIZE_32);
    agx_index c = agx_temp(b->shader, AGX_SIZE_32);
    phi(zero, c, a); phi(one, a, c);
-   EXPECT_FALSE(agx_fold_m5_spill_constant_phis(b->shader));
+   EXPECT_FALSE(agx_fold_agx3_spill_constant_phis(b->shader));
    EXPECT_EQ(definition(a)->op, AGX_OPCODE_PHI);
    EXPECT_EQ(definition(c)->op, AGX_OPCODE_PHI);
 }
 
-TEST_F(M5SpillConstantPhi, RootFreeCycleCannotBorrowAnotherRootsValue)
+TEST_F(Agx3SpillConstantPhi, RootFreeCycleCannotBorrowAnotherRootsValue)
 {
    agx_index root = literal(1);
    join();
@@ -663,11 +663,11 @@ TEST_F(M5SpillConstantPhi, RootFreeCycleCannotBorrowAnotherRootsValue)
    agx_index c = agx_temp(b->shader, AGX_SIZE_32);
    agx_index out = agx_temp(b->shader, AGX_SIZE_32);
    phi(c, c, a); phi(a, a, c); phi(root, a, out);
-   EXPECT_FALSE(agx_fold_m5_spill_constant_phis(b->shader));
+   EXPECT_FALSE(agx_fold_agx3_spill_constant_phis(b->shader));
    EXPECT_EQ(definition(out)->op, AGX_OPCODE_PHI);
 }
 
-TEST_F(M5SpillConstantPhi, RejectsUnprovenOrModifiedSources)
+TEST_F(Agx3SpillConstantPhi, RejectsUnprovenOrModifiedSources)
 {
    for (unsigned mode = 0; mode < 9; ++mode) {
       agx_builder *old = b;
@@ -687,13 +687,13 @@ TEST_F(M5SpillConstantPhi, RejectsUnprovenOrModifiedSources)
       join();
       agx_index out = agx_temp(b->shader, AGX_SIZE_32);
       phi(root, other, out);
-      EXPECT_FALSE(agx_fold_m5_spill_constant_phis(b->shader));
+      EXPECT_FALSE(agx_fold_agx3_spill_constant_phis(b->shader));
       EXPECT_EQ(definition(out)->op, AGX_OPCODE_PHI);
       b = old;
    }
 }
 
-TEST_F(M5SpillConstantPhi, LiteralWidthsAndSignedZeroBits)
+TEST_F(Agx3SpillConstantPhi, LiteralWidthsAndSignedZeroBits)
 {
    agx_index zero = literal(0), negzero = literal(0x80000000);
    agx_index short1 = literal(0x10001, AGX_SIZE_16);
@@ -702,13 +702,13 @@ TEST_F(M5SpillConstantPhi, LiteralWidthsAndSignedZeroBits)
    agx_index wide = agx_temp(b->shader, AGX_SIZE_32);
    agx_index narrow = agx_temp(b->shader, AGX_SIZE_16);
    phi(zero, negzero, wide); phi(short1, short2, narrow);
-   ASSERT_TRUE(agx_fold_m5_spill_constant_phis(b->shader));
+   ASSERT_TRUE(agx_fold_agx3_spill_constant_phis(b->shader));
    EXPECT_EQ(definition(wide)->op, AGX_OPCODE_PHI);
    EXPECT_EQ(definition(narrow)->op, AGX_OPCODE_MOV_IMM);
    EXPECT_EQ(definition(narrow)->imm, 1u);
 }
 
-TEST_F(M5SpillConstantPhi, PreservesParallelPhiPrefix)
+TEST_F(Agx3SpillConstantPhi, PreservesParallelPhiPrefix)
 {
    agx_index zero = literal(0), one = literal(1);
    join();
@@ -716,7 +716,7 @@ TEST_F(M5SpillConstantPhi, PreservesParallelPhiPrefix)
    agx_index varying = agx_temp(b->shader, AGX_SIZE_32);
    phi(zero, zero, folded); phi(zero, one, varying);
    agx_index result = agx_iadd(b, folded, varying, 0);
-   ASSERT_TRUE(agx_fold_m5_spill_constant_phis(b->shader));
+   ASSERT_TRUE(agx_fold_agx3_spill_constant_phis(b->shader));
    EXPECT_EQ(definition(varying)->op, AGX_OPCODE_PHI);
    EXPECT_EQ(definition(folded)->op, AGX_OPCODE_MOV_IMM);
    EXPECT_EQ(definition(result)->op, AGX_OPCODE_IADD);
@@ -730,21 +730,25 @@ TEST_F(M5SpillConstantPhi, PreservesParallelPhiPrefix)
    }
 }
 
-TEST_F(M5SpillConstantPhi, AGX2AndConstantProgramsRemainUnchanged)
+TEST_F(Agx3SpillConstantPhi, Agx3bFoldsAndAgx2OrPreambleUnchanged)
 {
    agx_index root = literal(1); join();
    agx_index out = agx_temp(b->shader, AGX_SIZE_32);
    phi(root, root, out);
    key.dev.encoding = AGX_ISA_ENCODING_AGX2;
-   EXPECT_FALSE(agx_fold_m5_spill_constant_phis(b->shader));
+   EXPECT_FALSE(agx_fold_agx3_spill_constant_phis(b->shader));
+   EXPECT_EQ(definition(out)->op, AGX_OPCODE_PHI);
+
    key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
    b->shader->is_preamble = true;
-   EXPECT_FALSE(agx_fold_m5_spill_constant_phis(b->shader));
+   EXPECT_FALSE(agx_fold_agx3_spill_constant_phis(b->shader));
    key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
-   EXPECT_FALSE(agx_fold_m5_spill_constant_phis(b->shader));
+   EXPECT_FALSE(agx_fold_agx3_spill_constant_phis(b->shader));
    EXPECT_EQ(definition(out)->op, AGX_OPCODE_PHI);
+
    b->shader->is_preamble = false;
    key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-   EXPECT_TRUE(agx_fold_m5_spill_constant_phis(b->shader));
+   ASSERT_TRUE(agx_fold_agx3_spill_constant_phis(b->shader));
    EXPECT_EQ(definition(out)->op, AGX_OPCODE_MOV_IMM);
+   EXPECT_EQ(definition(out)->imm, 1u);
 }

@@ -9244,6 +9244,93 @@ test_agx3_heavy_branch_loop_unroll_limit(void)
    return kept_unrollable;
 }
 
+static bool
+test_agx3_tiny_push_vertex_preamble_inlined(void)
+{
+   /* 1. Tiny push-only vertex shader (bubo.vert shape: loads 4-byte draw_id
+    * from root+768, computes tile x/y and NDC offset in ~8 fast 1-cycle ALU
+    * ops). Uniform DMA must replace the root load, inline the preamble away
+    * (has_preamble == false), and record !agx3_main_uses_root_uniform. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "agx3-tiny-push-vs");
+   b.shader->info.io_lowered = true;
+   b.shader->info.outputs_written = VARYING_BIT_POS;
+
+   nir_def *root = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *draw_id = nir_load_global_constant(
+      &b, 1, 32, nir_iadd_imm(&b, root, 768), .align_mul = 4);
+   nir_def *tx = nir_iand_imm(&b, draw_id, 63);
+   nir_def *ty = nir_ushr_imm(&b, draw_id, 6);
+   nir_def *fx = nir_ffma(&b, nir_u2f32(&b, tx), nir_imm_float(&b, 0.03125f),
+                          nir_imm_float(&b, -1.0f));
+   nir_def *fy = nir_ffma(&b, nir_u2f32(&b, ty), nir_imm_float(&b, 0.03125f),
+                          nir_imm_float(&b, -1.0f));
+   /* A hardware vertex shader reads its index as load_vertex_id;
+    * load_vertex_id_zero_base is the software (compute) VS form. */
+   nir_def *vid = nir_load_vertex_id(&b);
+   nir_def *vx = nir_fadd(&b, fx, nir_u2f32(&b, nir_iand_imm(&b, vid, 1)));
+   nir_def *vy = nir_fadd(&b, fy, nir_u2f32(&b, nir_ushr_imm(&b, vid, 1)));
+   nir_def *pos[4] = {vx, vy, nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f)};
+   for (unsigned c = 0; c < 4; ++c)
+      nir_store_uvs_agx(&b, pos[c], nir_imm_intN_t(&b, c, 16));
+   agx_preprocess_nir(b.shader);
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.reserved_preamble = 4;
+   key.agx3_native_cprog = true;
+   key.g17p_native_uniforms = true;
+   key.g17p_uniform_dma = true;
+   key.g17p_dma_root = 0;
+
+   struct agx_shader_part part = {0};
+   bool ok = agx_compile_shader_nir(b.shader, &key, &part);
+   bool tiny_ok = ok && !part.info.has_preamble &&
+                  part.info.agx3_uniform_dma_count == 1 &&
+                  part.info.agx3_uniform_dma[0].offset_B == 768 &&
+                  part.info.agx3_uniform_dma[0].halfs == 2 &&
+                  part.info.agx3_root_uniform_usage_valid &&
+                  !part.info.agx3_main_uses_root_uniform &&
+                  !part.info.agx3_preamble_uses_root_uniform;
+   free(part.binary);
+   ralloc_free(b.shader);
+   if (!tiny_ok)
+      return false;
+
+   /* 2. Negative control: a vertex preamble doing slow ops (frcp) or heavy
+    * multi-word root math (>16 bytes loaded) must NOT be inlined away. */
+   nir_builder b2 = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "agx3-heavy-root-vs");
+   b2.shader->info.io_lowered = true;
+   b2.shader->info.outputs_written = VARYING_BIT_POS;
+
+   nir_def *root2 = nir_load_preamble(&b2, 1, 64, .base = 0);
+   nir_def *acc = nir_imm_float(&b2, 1.0f);
+   for (unsigned k = 0; k < 8; ++k) {
+      nir_def *w = nir_load_global_constant(
+         &b2, 1, 32, nir_iadd_imm(&b2, root2, 768 + k * 4), .align_mul = 4);
+      acc = nir_ffma(&b2, acc, w, nir_frcp(&b2, nir_fadd_imm(&b2, w, 2.0f)));
+   }
+   nir_def *vid2 = nir_load_vertex_id(&b2);
+   nir_def *vx2 = nir_fadd(&b2, acc, nir_u2f32(&b2, vid2));
+   nir_def *pos2[4] = {vx2, acc, nir_imm_float(&b2, 0.0f),
+                       nir_imm_float(&b2, 1.0f)};
+   for (unsigned c = 0; c < 4; ++c)
+      nir_store_uvs_agx(&b2, pos2[c], nir_imm_intN_t(&b2, c, 16));
+   agx_preprocess_nir(b2.shader);
+
+   struct agx_shader_part part2 = {0};
+   bool ok2 = agx_compile_shader_nir(b2.shader, &key, &part2);
+   bool heavy_kept = ok2 && part2.info.has_preamble &&
+                     part2.info.agx3_root_uniform_usage_valid &&
+                     !part2.info.agx3_main_uses_root_uniform &&
+                     part2.info.agx3_preamble_uses_root_uniform;
+   free(part2.binary);
+   ralloc_free(b2.shader);
+   return heavy_kept;
+}
+
 /* A vertex shader with nothing to hoist has no constant program. Looking
  * for a hoistable vertex preamble must not create an empty one. */
 static bool
@@ -9265,6 +9352,39 @@ test_agx3_vertex_without_preamble_has_none(void)
    free(part.binary);
    ralloc_free(nir);
    return ok;
+}
+
+/* The driver keeps a vertex shader's descriptor-set pointers only when its
+ * uniform-half record names one (hk_agx3_g17p_graphics_live_set_count()).
+ * Firefox's vertex texel fetch through set 3 reads that set's pointer, halves
+ * 12..15 under lower_test_descriptor_set(), and not set 1's, halves 4..7.
+ */
+static bool
+test_agx3_vertex_set_pointer_uniform_halfs(void)
+{
+   nir_shader *nir = build_vs_indexed_texture_fetch();
+   if (!nir)
+      return false;
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.no_preamble = true;
+   key.reserved_preamble = 64;
+
+   struct agx_shader_part part = {0};
+   const bool ok = agx_compile_shader_nir(nir, &key, &part);
+   const uint64_t halfs = part.info.agx3_uniform_halfs[0];
+   const uint64_t set1 = BITFIELD64_RANGE(4, 4), set3 = BITFIELD64_RANGE(12, 4);
+   const bool named = ok && part.info.agx3_uniform_halfs_valid &&
+                      (halfs & set3) == set3 && !(halfs & set1);
+   if (!named) {
+      fprintf(stderr, "vertex set-pointer halves: ok=%d valid=%d "
+              "halfs0=0x%llx\n", ok, part.info.agx3_uniform_halfs_valid,
+              (unsigned long long)halfs);
+   }
+   free(part.binary);
+   ralloc_free(nir);
+   return named;
 }
 
 int
@@ -9745,6 +9865,8 @@ main(int argc, char **argv)
    RUN(test_g17p_frag_sidefx_late_depth_once);
    RUN(test_agx3_heavy_branch_loop_unroll_limit);
    RUN(test_g17c_txf_layer_saturation);
+   RUN(test_agx3_tiny_push_vertex_preamble_inlined);
+   RUN(test_agx3_vertex_set_pointer_uniform_halfs);
 #undef RUN
 
    for (unsigned e = 0; e < ARRAY_SIZE(encodings); ++e) {
