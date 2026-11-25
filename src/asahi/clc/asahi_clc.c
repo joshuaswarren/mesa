@@ -7,6 +7,7 @@
 #include "asahi_clc.h"
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/lib/agx_abi.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/compiler/agx_nir.h"
 #include "compiler/glsl_types.h"
 #include "compiler/spirv/nir_spirv.h"
@@ -86,6 +87,13 @@ target_is_native_agx3(const char *target)
    return agx_chip_native_agx3(target_chip(target));
 }
 
+/* Whether a target runs the native AGX3 path with the HAL200 command stream. */
+static bool
+target_is_native_hal200(const char *target)
+{
+   return agx_chip_native_hal200(target_chip(target));
+}
+
 /* Whether a target executes AGX3 code: the native AGX3B path or the M5 AGX3C
  * one. */
 static bool
@@ -93,6 +101,21 @@ target_is_agx3(const char *target)
 {
    const enum agx_chip chip = target_chip(target);
    return agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip);
+}
+
+/* Whether a target decompresses spilled compressed colour attachments in place
+ * (libagx_agx3_decompress, and libagx_reset_compression_metadata for the
+ * attachments a pass discards): native HAL200, and the chips with private
+ * Gen10 compression (AGX_CAP_GEN10_2D_COMPRESSION). g18g compiles as G17G
+ * (target_chip()) but is asked about as itself, which has no Gen10
+ * compression. */
+static bool
+target_has_spill_decompress(const char *target)
+{
+   const enum agx_chip chip =
+      !strcmp(target, "g18g") ? AGX_CHIP_G18G : target_chip(target);
+   return agx_chip_native_hal200(chip) ||
+          agx_chip_has_cap(chip, AGX_CAP_GEN10_2D_COMPRESSION);
 }
 
 static const struct spirv_to_nir_options spirv_options = {
@@ -327,8 +350,8 @@ target_supports_program(const char *target, const nir_function *func)
 {
    if (!strcmp(func->name, "libagx_m5_decompress_rgba16f"))
       return !strcmp(target, "g17g");
-   if (!strcmp(func->name, "libagx_g17p_decompress_16b"))
-      return !strcmp(target, "g17p");
+   if (!strcmp(func->name, "libagx_agx3_decompress"))
+      return target_has_spill_decompress(target);
 
    if (!strcmp(target, "g17g") &&
        !strncmp(func->name, "libagx_d3d12_", strlen("libagx_d3d12_")))
@@ -360,9 +383,9 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_fill_uint4") ||
           !strcmp(func->name, "libagx_gen1_as_property") ||
           !strcmp(func->name, "libagx_gen1_as_copy") ||
-          /* Native G17P AS copies relocate child slots and then restore the
-           * instance-record slots which can resemble node markers. */
-          (!strcmp(target, "g17p") &&
+          /* Native HAL200 Gen1 AS copies relocate child slots and then
+           * restore the instance-record slots which can resemble node markers. */
+          (target_is_native_hal200(target) &&
            (!strcmp(func->name, "libagx_gen1_as_rebase") ||
             !strcmp(func->name, "libagx_gen1_as_restore_records"))) ||
           !strcmp(func->name, "libagx_gen1_as_serialize") ||
@@ -371,13 +394,19 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_gen1_as_empty") ||
           (strcmp(target, "g18g") &&
            !strcmp(func->name, "libagx_fast_clear")) ||
-          (!strcmp(target, "g17p") &&
+          (target_has_spill_decompress(target) &&
            !strcmp(func->name, "libagx_reset_compression_metadata")) ||
           !strcmp(func->name, "libagx_copy_image") ||
           !strcmp(func->name, "libagx_mipmap_unorm8x4") ||
+          !strcmp(func->name, "libagx_mipmap_unorm8x4_2level") ||
           !strcmp(func->name, "libagx_mipmap_unorm8x4_odd") ||
           !strcmp(func->name, "libagx_resolve_unorm8x4") ||
           !strcmp(func->name, "libagx_predicate_indirect") ||
+          !strcmp(func->name, "libagx_build_indirect_vdm") ||
+          /* Runtime VDM stream truncation for drawIndirectCount: one
+           * invocation, binary search over constant spans, save/restore of one
+           * 8-byte VDM record header with a pre-packed VDM_STREAM_LINK. */
+          !strcmp(func->name, "libagx_patch_vdm_indirect_count") ||
           /* VK_KHR_ray_tracing_pipeline's indirect trace-rays setup.  One
            * invocation, three constant loads, three global stores and a shift
            * -- no atomics, no barriers, no printf, no scratch.  Its ARITHMETIC
@@ -410,6 +439,9 @@ target_supports_program(const char *target, const nir_function *func)
            * heap allocation and global stores into the task record. */
           (!strcmp(target, "g17p") &&
            !strcmp(func->name, "libagx_task_setup")) ||
+          (!strcmp(target, "g18g") &&
+           (!strcmp(func->name, "libagx_g18_noop") ||
+            !strcmp(func->name, "libagx_g18_indirect_launch"))) ||
           !strcmp(func->name, "libagx_draw_robust_index") ||
           !strcmp(func->name, "libagx_draw_robust_index_batch") ||
           !strcmp(func->name, "libagx_unroll_restart") ||
@@ -421,6 +453,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_write_u32s") ||
           !strcmp(func->name, "libagx_reset_query") ||
           !strcmp(func->name, "libagx_copy_uchar") ||
+          !strcmp(func->name, "libagx_copy_uint") ||
           !strcmp(func->name, "libagx_copy_uint4") ||
           !strcmp(func->name, "libagx_fill") ||
           !strcmp(func->name, "libagx_copy_xfb_counters") ||
@@ -431,7 +464,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_copy_query_gl") ||
           !strcmp(func->name, "libagx_increment_cs_invocations") ||
           !strcmp(func->name, "libagx_setup_indirect_dispatch") ||
-          !strcmp(func->name, "libagx_copy_timestamp") ||
+          !strcmp(func->name, "libagx_copy_timestamps") ||
           !strcmp(func->name, "libagx_increment_statistic") ||
           /* Software tessellation */
           !strcmp(func->name, "libagx_tess_setup_indirect") ||
@@ -724,7 +757,7 @@ main(int argc, char **argv)
             }
 
             if (!strcmp(libfunc->name, "libagx_m5_decompress_rgba16f") ||
-                !strcmp(libfunc->name, "libagx_g17p_decompress_16b")) {
+                !strcmp(libfunc->name, "libagx_agx3_decompress")) {
                key.g17p_texture_uniform_base = AGX_ABI_AGX3_PRECOMP_ARG_HALFS;
                NIR_PASS(_, clone, nir_shader_intrinsics_pass,
                         lower_m5_decompress_load, nir_metadata_none, NULL);

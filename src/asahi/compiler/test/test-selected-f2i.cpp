@@ -181,3 +181,130 @@ TEST(SelectedF2I, LeavesSharedMixedAndOtherWidthsUnchanged)
       ralloc_free(nb.shader);
    }
 }
+
+static nir_def *
+build_d3d_f2i_chain(nir_builder *b, nir_def *a)
+{
+   nir_def *nan = nir_fneu(b, a, a);
+   nir_def *lo = nir_flt(b, a, nir_imm_float(b, -2147483648.0f));
+   nir_def *hi = nir_flt(b, nir_imm_float(b, 2147483520.0f), a);
+   return nir_bcsel(
+      b, nan, nir_imm_int(b, 0),
+      nir_bcsel(b, lo, nir_imm_int(b, INT32_MIN),
+                nir_bcsel(b, hi, nir_imm_int(b, INT32_MAX), nir_f2i32(b, a))));
+}
+
+static nir_def *
+build_d3d_f2u_chain(nir_builder *b, nir_def *a, bool explicit_nan)
+{
+   nir_def *clamped = nir_fmax(b, a, nir_imm_float(b, 0.0f));
+   if (explicit_nan)
+      clamped = nir_bcsel(b, nir_fneu(b, a, a), nir_imm_float(b, 0.0f), clamped);
+   return nir_bcsel(b, nir_flt(b, nir_imm_float(b, 4294967040.0f), a),
+                    nir_imm_int(b, 0xffffffffu), nir_f2u32(b, clamped));
+}
+
+TEST(D3DFloatToInt, FoldsDynamicClampsToSaturatingOpsAndCompilesOnAgx3)
+{
+   const enum agx_isa_encoding encodings[] = {
+      AGX_ISA_ENCODING_AGX3B,
+      AGX_ISA_ENCODING_AGX3C,
+   };
+   for (enum agx_isa_encoding enc : encodings) {
+      SCOPED_TRACE(enc);
+      nir_builder nb = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "d3d f2i/f2u dynamic");
+      nb.shader->info.workgroup_size[0] = 1;
+      nb.shader->info.workgroup_size[1] = 1;
+      nb.shader->info.workgroup_size[2] = 1;
+      nir_def *out = nir_load_preamble(&nb, 1, 64, .base = 0);
+      nir_def *a = agx_test_load_preamble(&nb, 1, 32, 4);
+      nir_def *s = nir_mov(&nb, build_d3d_f2i_chain(&nb, a));
+      nir_def *u0 = nir_mov(&nb, build_d3d_f2u_chain(&nb, a, true));
+      nir_def *u1 = nir_mov(&nb, build_d3d_f2u_chain(&nb, a, false));
+      nir_store_global(&nb, s, out, .align_mul = 4);
+      nir_store_global(&nb, u0, nir_iadd_imm(&nb, out, 4), .align_mul = 4);
+      nir_store_global(&nb, u1, nir_iadd_imm(&nb, out, 8), .align_mul = 4);
+
+      ASSERT_TRUE(agx_nir_fold_d3d_float_to_int(nb.shader));
+      EXPECT_EQ(nir_scalar_alu_op(nir_scalar_chase_alu_src(nir_get_scalar(s, 0), 0)),
+                nir_op_f2i32_sat);
+      EXPECT_EQ(nir_scalar_alu_op(nir_scalar_chase_alu_src(nir_get_scalar(u0, 0), 0)),
+                nir_op_f2u32_sat);
+      EXPECT_EQ(nir_scalar_alu_op(nir_scalar_chase_alu_src(nir_get_scalar(u1, 0), 0)),
+                nir_op_f2u32_sat);
+      nir_validate_shader(nb.shader, "d3d f2i/f2u dynamic folded");
+
+      if (enc == AGX_ISA_ENCODING_AGX3B)
+         agx_preprocess_nir_native(nb.shader, AGX_CHIP_G16G);
+      else
+         agx_preprocess_nir_m5(nb.shader);
+
+      struct agx_shader_key key = {};
+      key.dev.encoding = enc;
+      key.dev.chip = enc == AGX_ISA_ENCODING_AGX3B ? AGX_CHIP_G16G : AGX_CHIP_G17S;
+      key.reserved_preamble = 8;
+      key.no_preamble = true;
+      struct agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(nb.shader, &key, &part));
+      EXPECT_NE(part.binary, nullptr);
+      EXPECT_GT(part.info.binary_size, 0u);
+      free(part.binary);
+      ralloc_free(nb.shader);
+   }
+}
+
+TEST(D3DFloatToInt, ConstantFoldingPreservesSaturationAndNaNToZero)
+{
+   struct Case {
+      uint32_t fbits;
+      uint32_t want_i32;
+      uint32_t want_u32;
+   };
+   const Case cases[] = {
+      /* Out-of-range positive / negative floats that bare f2i32/f2u32 poison-fold to 0 */
+      {0x4f32d05eu, 0x7fffffffu, 3000000000u}, /* +3e9f */
+      {0xcf32d05eu, 0x80000000u, 0x00000000u}, /* -3e9f */
+      {0x4f9502f9u, 0x7fffffffu, 0xffffffffu}, /* +5e9f */
+      {0xbf800000u, 0xffffffffu, 0x00000000u}, /* -1.0f */
+      /* Exact saturation boundaries, infinities, and both signs of NaN */
+      {0x4effffffu, 2147483520u, 2147483520u}, /* max float < 2^31 */
+      {0x4f000000u, 0x7fffffffu, 0x80000000u}, /* 2^31 */
+      {0xcf000000u, 0x80000000u, 0x00000000u}, /* -2^31 */
+      {0x4f7fffffu, 0x7fffffffu, 4294967040u}, /* max float < 2^32 */
+      {0x4f800000u, 0x7fffffffu, 0xffffffffu}, /* 2^32 */
+      {0x7f800000u, 0x7fffffffu, 0xffffffffu}, /* +inf */
+      {0xff800000u, 0x80000000u, 0x00000000u}, /* -inf */
+      {0x7fc00000u, 0x00000000u, 0x00000000u}, /* +qNaN */
+      {0xffc00000u, 0x00000000u, 0x00000000u}, /* -qNaN */
+      {0x422b999au, 42u, 42u},                 /* 42.9f -> 42 */
+      {0xbfe00000u, 0xffffffffu, 0x00000000u}, /* -1.75f -> -1 / 0 */
+   };
+
+   for (const Case &c : cases) {
+      SCOPED_TRACE(c.fbits);
+      nir_builder nb = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "d3d f2i/f2u const");
+      nir_def *a = nir_imm_int(&nb, c.fbits);
+      nir_intrinsic_instr *st_s =
+         agx_test_store_preamble(&nb, build_d3d_f2i_chain(&nb, a), 0);
+      nir_intrinsic_instr *st_u0 =
+         agx_test_store_preamble(&nb, build_d3d_f2u_chain(&nb, a, true), 4);
+      nir_intrinsic_instr *st_u1 =
+         agx_test_store_preamble(&nb, build_d3d_f2u_chain(&nb, a, false), 8);
+
+      ASSERT_TRUE(agx_nir_fold_d3d_float_to_int(nb.shader));
+      EXPECT_TRUE(nir_opt_constant_folding(nb.shader));
+      nir_opt_dce(nb.shader);
+
+      ASSERT_TRUE(nir_src_is_const(st_s->src[0]));
+      ASSERT_TRUE(nir_src_is_const(st_u0->src[0]));
+      ASSERT_TRUE(nir_src_is_const(st_u1->src[0]));
+      EXPECT_EQ(nir_src_as_uint(st_s->src[0]), c.want_i32);
+      EXPECT_EQ(nir_src_as_uint(st_u0->src[0]), c.want_u32);
+      EXPECT_EQ(nir_src_as_uint(st_u1->src[0]), c.want_u32);
+
+      nir_validate_shader(nb.shader, "d3d f2i/f2u const folded");
+      ralloc_free(nb.shader);
+   }
+}

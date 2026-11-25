@@ -1412,7 +1412,16 @@ zink_descriptors_update(struct zink_context *ctx, enum zink_pipeline_idx pidx)
                            bs->dd.cur_db_offset[ZINK_DESCRIPTOR_TYPE_UNIFORMS];
          if (ctx->dd.push_state_changed[pidx]) {
             assert(bs->dd.db->base.b.width0 > bs->dd.db_offset + ctx->dd.db_size[pidx]);
-            for (unsigned i = 0; i < (is_compute ? 1 : ZINK_GFX_SHADER_COUNT); i++) {
+            uint32_t stage_mask;
+            if (is_compute) {
+               stage_mask = 1;
+            } else if (is_mesh) {
+               stage_mask = ((pg->dd.push_usage >> MESA_SHADER_TASK) & BITFIELD_MASK(2)) |
+                            (pg->dd.push_usage & BITFIELD_BIT(MESA_SHADER_FRAGMENT));
+            } else {
+               stage_mask = pg->dd.push_usage & BITFIELD_MASK(ZINK_GFX_SHADER_COUNT);
+            }
+            u_foreach_bit(i, stage_mask) {
                VkDescriptorGetInfoEXT info;
                info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
                info.pNext = NULL;

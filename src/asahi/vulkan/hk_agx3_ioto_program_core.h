@@ -177,6 +177,29 @@ hk_agx3_g17p_graphics_needs_root(bool shader_uses_root,
    return shader_uses_root || prolog_uses_root || set_count != 0;
 }
 
+/* The descriptor-set pointers a shader reads after its root descriptor: a
+ * shader's set_count is its pipeline layout's, so a vertex shader of a
+ * pipeline whose fragment shader alone uses a set still names that set. When
+ * the compiler recorded every uniform half the shader reads (halfs, valid) and
+ * none of the set pointers' halves -- four per set, after the four-half root
+ * pointer at root_uniform -- is among them, the shader needs none (0);
+ * otherwise it needs all of them (set_count). */
+static inline uint8_t
+hk_agx3_g17p_graphics_live_set_count(const uint64_t *halfs, unsigned words,
+                                     bool valid, unsigned root_uniform,
+                                     uint8_t set_count)
+{
+   const unsigned first = root_uniform + 4;
+   const unsigned end = first + 4u * set_count;
+   if (!valid || !set_count || end > 64u * words)
+      return set_count;
+   for (unsigned h = first; h < end; ++h) {
+      if (halfs[h / 64] & (UINT64_C(1) << (h % 64)))
+         return set_count;
+   }
+   return 0;
+}
+
 /* Load one root descriptor followed by every descriptor-set pointer named by
  * the shader's pipeline layout. */
 bool hk_agx3_g17p_root_range(uint16_t start_halfs, uint8_t set_count,
@@ -229,6 +252,32 @@ bool hk_agx3_g17p_multisample_store_supported(struct agx_tilebuffer_layout *tib,
 bool hk_agx3_g17p_direct_color_resolve_supported(
    struct agx_tilebuffer_layout *tib, unsigned color_attachment_count,
    bool has_resolve_target, bool average_resolve, bool store_source);
+
+/* The single colour attachment of a pass whose final end-of-tile program
+ * would both store the multisample samples and resolve them. */
+struct hk_agx3_g17p_store_and_resolve_target {
+   unsigned color_attachment_count;
+   /* The pass's own final end-of-tile program, not a partial render. */
+   bool final_store;
+   /* The render area covers every attachment, each of which is exactly the
+    * framebuffer size (hk_rendering_state::cr.whole_attachments). */
+   bool whole_attachments;
+   bool store_source;
+   bool has_resolve_target;
+   bool average_resolve;
+   unsigned source_samples;
+   unsigned resolve_samples;
+   bool resolve_format_matches;
+   bool source_pbe_valid;
+   bool resolve_pbe_valid;
+};
+
+/* Admit one end-of-tile program that stores a multisample tile unresolved
+ * (storeOp = STORE) and also resolves it into a single-sample attachment,
+ * instead of storing it and resolving it in a meta pass after the render. */
+bool hk_agx3_g17p_store_and_resolve_supported(
+   const struct agx_tilebuffer_layout *tib,
+   const struct hk_agx3_g17p_store_and_resolve_target *target);
 
 #define HK_AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE 6144u
 

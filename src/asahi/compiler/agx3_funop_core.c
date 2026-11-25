@@ -113,7 +113,7 @@ is_b(enum agx_isa_encoding e)
 bool
 agx3_funop_carries_wait(enum agx_isa_encoding enc, enum agx3_funop op)
 {
-   return (enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C) &&
+   return agx_isa_is_agx3(enc) &&
           op < AGX3_FUNOP_COUNT && forms[op].wait_ok;
 }
 

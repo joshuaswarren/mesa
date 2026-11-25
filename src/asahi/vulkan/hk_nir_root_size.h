@@ -8,6 +8,47 @@
 /* Required prefix of the root table. Unknown/escaping accesses require full_size. */
 unsigned hk_nir_root_size(const nir_shader *nir, unsigned full_size);
 
+/* True when the shader may read any byte in [start_B, end_B) of the root
+ * table. Unknown, dynamic, or escaping root uses return true (fail closed). */
+bool hk_nir_root_reads_range(const nir_shader *nir, uint64_t start_B,
+                             uint64_t end_B, unsigned full_size);
+
+/* True when a compute NIR shader with API workgroup size <= 256 (multiple of
+ * 32) observes only global invocation ID / base_group (no shared memory,
+ * barriers, local/workgroup/subgroup/quad/tile/ray/cmat intrinsics, calls, or
+ * implicit derivatives), so direct zero-base dispatches may coalesce adjacent
+ * workgroups without altering invocation coordinates or semantics.
+ * Callers must also verify the shader never reads root.cs.group_count_addr via
+ * hk_nir_root_reads_range(). */
+bool hk_nir_can_coalesce_workgroup(const nir_shader *nir);
+
+/* Coalesce a pure-global API workgroup shape (<= 256, multiple of 32) up to
+ * MIN2(MIN2(target_wg_threads, 512), max_wg_threads), bounded per axis by
+ * max_wg_size[], while preserving exact divisibility on every grid axis (zero
+ * partial workgroups), at least MAX2(min_workgroups, 256) workgroups up to 256
+ * threads, and at least MAX2(min_workgroups, 1024) workgroups above 256
+ * threads. Returns true if out_local differs from api_local. */
+bool hk_coalesce_workgroup_size_ex(const uint16_t api_local[3],
+                                   const uint32_t grid_threads[3],
+                                   const uint32_t max_wg_size[3],
+                                   uint32_t max_wg_threads,
+                                   uint32_t target_wg_threads,
+                                   uint64_t min_workgroups,
+                                   uint16_t out_local[3]);
+
+/* Default coalescing target: up to 256 threads with at least 256 workgroups
+ * and standard {1024, 1024, 64} per-axis bounds. */
+bool hk_coalesce_workgroup_size(const uint16_t api_local[3],
+                                const uint32_t grid_threads[3],
+                                uint32_t max_wg_threads,
+                                uint16_t out_local[3]);
+
+static inline bool
+hk_nir_dispatch_zero_base(const uint32_t base_group[3])
+{
+   return base_group[0] == 0 && base_group[1] == 0 && base_group[2] == 0;
+}
+
 /* Compute the trimmed root descriptor upload size for a shader stage.
  * Uniform lowering loads the root pointer and set bases separately, so retain
  * that prefix.  Hardware VS and FS prologs/epilogs access only the draw arm

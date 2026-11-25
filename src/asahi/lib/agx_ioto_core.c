@@ -419,19 +419,10 @@ agx_ioto_decode_program_record(enum agx_chip chip, const void *stream,
       return true;
    }
 
-   /* G17P's ordinary, coverage and background fragment releases are GPU0-only
-    * six-byte encodings emitted by the bounded program composers. They are
-    * not the GPU1 PIXREL form in the public record table, so the boundary is
-    * carried by the exact descriptor family rather than a mask.
-    *
-    * Bytes three and four hold the release descriptor. 0x200 is the bounded
-    * clear/reload background release. A fragment release starts from 0x2ff
-    * and clears the 0x0c, 0x30 or 0xc0 field of each colour class it consumes,
-    * and coverage additionally clears bit 0. applegpu_g17p fragments writing
-    * each subset of two to four colour targets, with and without a sample
-    * mask, carry exactly these descriptors, 0x2f3 through 0x202. Accepting
-    * only the all-partition forms left subset fragments undecodable, so a
-    * program walk lost its boundary there. */
+   /* Six-byte GPU0 fragment/background release records (bytes 3..4 hold the
+    * release descriptor): 0x200 for background clear/reload, or 0x2ff with
+    * the 0x0c/0x30/0xc0 field cleared per consumed colour class (and bit 0
+    * cleared for coverage). */
    if (agx_chip_native_agx3(chip) && available >= 6 && bytes[0] == 0x07 &&
        bytes[1] == 0x02 && bytes[2] == 0x54 &&
        (bytes[3] == 0x00 || agx_ioto_g17p_fragment_release(bytes[3])) &&

@@ -962,12 +962,17 @@ check_compute_coverage(void)
        (getenv("ASAHI_SHIM_G17P_EXPECT_STRONG_COMPUTE_BARRIER") &&
         !compute_stats.strong_barriers) ||
        (getenv("ASAHI_SHIM_G17P_EXPECT_BACK_TO_BACK") &&
-        !compute_stats.unbarriered_launches)) {
+        !compute_stats.unbarriered_launches) ||
+       (getenv("ASAHI_SHIM_G17P_EXPECT_STRONG_INDIRECT_COMPUTE_BARRIER") &&
+        !compute_stats.indirect_strong_barriers)) {
       fprintf(stderr,
               "shim: incomplete G17P compute coverage: launches=%u "
-              "back-to-back=%u barriers=%u strong=%u terminated=%u\n",
+              "back-to-back=%u barriers=%u strong=%u indirect=%u "
+              "indirect-strong=%u terminated=%u\n",
               compute_stats.launches, compute_stats.unbarriered_launches,
               compute_stats.barriers, compute_stats.strong_barriers,
+              compute_stats.indirect_launches,
+              compute_stats.indirect_strong_barriers,
               compute_stats.terminated);
       _Exit(EXIT_FAILURE);
    }
@@ -1528,6 +1533,13 @@ shim_features(void)
       features |= DRM_ASAHI_FEATURE_VM_STATUS;
    if (shim_env_on("ASAHI_SHIM_VM_STATUS_MIRROR"))
       features |= DRM_ASAHI_FEATURE_VM_STATUS_MIRROR;
+   /* An M5 kernel without the compressed multisample ZLS opt-in, as the
+    * M5 Max (J775c) kernel reports its features: its render validation, and
+    * so the M5 submission gate, then refuses a single-layer multisample
+    * render with compressed depth or stencil. */
+   if (shim_env_on("ASAHI_SHIM_NO_M5_MSAA_ZLS_COMPRESSION"))
+      features &= ~(uint64_t)(DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION |
+                              DRM_ASAHI_FEATURE_M5_STENCIL_MSAA_COMPRESSION);
    /* The M6 (G18G) features (bits 31 and 32); only the G18G identity
     * reports them. */
    if (g18g_profile()) {
@@ -2141,7 +2153,8 @@ asahi_ioctl_submit_unlocked(int fd, unsigned long request, void *arg)
    }
 
    const char *validate = getenv("ASAHI_SHIM_VALIDATE_G17P_STREAM");
-   if (!validate || !strcmp(validate, "0") || !shim_g17_runtime())
+   if (!validate || !strcmp(validate, "0") ||
+       (!shim_g17_runtime() && shim_params() != &params_g16g))
       return 0;
 
    const uint8_t *cmdbuf = (const void *)(uintptr_t)submit->cmdbuf;
@@ -2170,13 +2183,15 @@ asahi_ioctl_submit_unlocked(int fd, unsigned long request, void *arg)
           * private VM.  Mirror that kernel requirement so a private context
           * allocation fails on the host with the same ENOENT class instead
           * of reaching hardware first. */
-         const struct asahi_vm_mapping *context =
-            find_mapping(fd, UINT64_C(0x1000000000), UINT64_C(0x10000));
-         if (!context ||
-             (asahi_bo(context->bo)->gem_flags & DRM_ASAHI_GEM_VM_PRIVATE)) {
-            fprintf(stderr,
-                    "shim: G17P render context is absent from shared job view\n");
-            return -ENOENT;
+         if (shim_g17_runtime()) {
+            const struct asahi_vm_mapping *context =
+               find_mapping(fd, UINT64_C(0x1000000000), UINT64_C(0x10000));
+            if (!context ||
+                (asahi_bo(context->bo)->gem_flags & DRM_ASAHI_GEM_VM_PRIVATE)) {
+               fprintf(stderr,
+                       "shim: G17P render context is absent from shared job view\n");
+               return -ENOENT;
+            }
          }
 
          /* A private publication fence may follow the batch outputs. */
@@ -2247,6 +2262,9 @@ asahi_ioctl_submit_unlocked(int fd, unsigned long request, void *arg)
          compute_stats.barriers += stats.barriers;
          compute_stats.prologue_barriers += stats.prologue_barriers;
          compute_stats.strong_barriers += stats.strong_barriers;
+         compute_stats.indirect_launches += stats.indirect_launches;
+         compute_stats.indirect_strong_barriers +=
+            stats.indirect_strong_barriers;
          compute_stats.sstt_flushes += stats.sstt_flushes;
          compute_stats.terminated |= stats.terminated;
          g17p_streams_validated++;

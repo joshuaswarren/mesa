@@ -9,9 +9,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Native M5 leading block, including both complete GPU1 helper tables. */
-bool agx3_build_g17g_container_lead(void *image, size_t capacity);
-
 /* G18 uses four AGX3D helper tables in a larger leading block. */
 #define AGX3_G18G_CONTAINER_LEAD_SIZE 0x640u
 bool agx3_build_g18g_container_lead(void *image, size_t capacity);

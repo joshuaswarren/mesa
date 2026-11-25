@@ -120,15 +120,8 @@ agx3_pixel_colour_entry_zs_unreleased(enum agx_isa_encoding enc,
    return true;
 }
 
-/* metal-nt -arch applegpu_g17p, a fragment function with no colour writes
- * storing the result of atomic_fetch_add_explicit():
- *
- *   870254040000                  pixwait, class 4
- *   6721540000810000004600002000  atomicdev
- *   2c80192160800000              rld of the returned value
- *   070454c40800                  barrier
- *
- * The same function discarding the result emits the atomicdev alone. */
+/* Colourless fragment returning atomic: pixwait(class 4, no f34) ->
+ * atomicdev -> rld -> barrier; non-returning atomics emit atomicdev alone. */
 bool
 agx3_pixel_atomic_acquire(enum agx_isa_encoding enc,
                           uint8_t out[AGX3_PIXEL_MAX_LENGTH], uint8_t *len)

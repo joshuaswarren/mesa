@@ -578,6 +578,7 @@ zink_clear_buffer(struct pipe_context *pctx,
       VkCommandBuffer cmdbuf = zink_get_cmdbuf(ctx, NULL, res);
       zink_batch_reference_resource_rw(ctx, res, true);
       VKCTX(CmdFillBuffer)(cmdbuf, res->obj->buffer, offset, size, *(uint32_t*)clear_value);
+      zink_batch_mark_host_transfer_write(ctx->bs, res);
       return;
    }
    struct pipe_transfer *xfer;
