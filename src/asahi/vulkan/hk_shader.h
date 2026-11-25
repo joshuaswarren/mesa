@@ -507,6 +507,7 @@ hk_g17p_sparse_vertex_outputs(const struct shader_info *info,
  */
 #include "hk_2d_stencil.h"
 #include "hk_byte_stencil.h"
+#include "hk_compute_opt.h"
 
 struct hk_byte_stencil_variant {
    struct hk_byte_stencil_plan plan;
@@ -515,6 +516,11 @@ struct hk_byte_stencil_variant {
 
 struct hk_2d_stencil_variant {
    struct hk_2d_stencil_plan plan;
+   struct hk_shader shader;
+};
+
+struct hk_compute_opt_variant {
+   struct hk_compute_opt_plan plan;
    struct hk_shader shader;
 };
 
@@ -582,6 +588,10 @@ struct hk_api_shader {
    /* Non-NULL for a compute shader matched as a 2D neighborhood / block
     * stencil: holds the dispatch validation plan and compiled tiled variant. */
    struct hk_2d_stencil_variant *stencil_2d;
+
+   /* Non-NULL for a compute shader matched by hk_compute_opt: holds the
+    * dispatch validation plan and compiled vectorized/tiled variant. */
+   struct hk_compute_opt_variant *compute_opt;
 
    struct hk_shader variants[];
 };
