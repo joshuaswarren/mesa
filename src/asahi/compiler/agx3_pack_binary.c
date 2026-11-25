@@ -2271,7 +2271,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
                         uint16_t ms_array_scratch,
                         struct agx3_staging_banks *banks,
                         uint16_t outstanding,
-                        uint16_t *staged_end, bool fragment, bool pixel_entry,
+                        uint16_t *staged_end, bool pixel_entry,
                         uint32_t *pixel_entry_offset, uint16_t heap_uniform_base,
                         struct agx3_fetch_group *group)
 {
@@ -2649,9 +2649,12 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       .array = I->dim == AGX_DIM_2D_ARRAY || ms_array,
       .multisample = ms_2d || ms_array,
       .staged_sample = (ms_2d || ms_array) && stage_coordinates,
-      /* M5 raw reads use sampler selector1 in fragment programs and0 in
-       * compute programs, for both ordinary and multisampled images. */
-      .sampler_value = m5 ? (fragment ? 1 : 0) :
+      /* AGX3c (M5) reserves the texel-fetch sampler at heap index 0 across all
+       * stages; slot 1 holds the first application or meta VkSampler. Using
+       * selector 1 in fragment fetches read whatever sampler occupied slot 1
+       * (e.g. a meta blit sampler with maxLod = 0, breaking mipmapped
+       * texelFetch). */
+      .sampler_value = m5 ? 0 :
          ((ms_2d || ms_array) && stage_coordinates ? 1 : 0),
       .three_d = three_d,
       .lod_x64 = immediate_lod ? I->src[1].value * 64 : 0,
@@ -15702,7 +15705,6 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                          staged_bank_reads ? &staging_banks
                                                            : NULL,
                                          outstanding_here, &staged_end,
-                                         ctx->stage == MESA_SHADER_FRAGMENT,
                                          open_pixel_fetch,
                                          &ctx->agx3_colour_link.entry_offset,
                                          ctx->key->g17p_texture_uniform_base,

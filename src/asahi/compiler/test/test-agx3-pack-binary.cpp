@@ -18253,8 +18253,7 @@ TEST_F(AGX3PackBinary, TextureFetch2DArrayUsesDisjointBanksAndWraps)
             .coord_kill = true,
             .final = i == ops - 1,
             .array = true,
-            .sampler_value =
-               (uint16_t)(enc == AGX_ISA_ENCODING_AGX3C ? 1 : 0),
+            .sampler_value = 0,
          };
          ASSERT_TRUE(agx3_tex_encode_fetch(enc, &want, bytes, &len));
          EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
@@ -19171,5 +19170,80 @@ TEST_F(AGX3PackBinary, Shadow2DArrayRegisterLodBankZeroOutsideAGX3CCompute)
       if (!c.agx3d) {
          EXPECT_EQ(b->shader->agx3_staging_halfs, 8u);
       }
+   }
+}
+
+TEST_F(AGX3PackBinary, FragmentTexelFetchUsesReservedSamplerZeroOnAgx3c)
+{
+   /* AGX3c fragment texel fetches must target reserved texel-fetch sampler 0
+    * rather than slot 1 (which belongs to the first application/meta VkSampler
+    * in the shared sampler heap). */
+   const struct {
+      const char *name;
+      enum agx_dim dim;
+      bool register_lod;
+      unsigned coord_channels;
+   } cases[] = {
+      {"2d-reg-lod", AGX_DIM_2D, true, 2},
+      {"2d-array", AGX_DIM_2D_ARRAY, false, 3},
+      {"3d-imm-lod", AGX_DIM_3D, false, 3},
+   };
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE(c.name);
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3C);
+      key.dev.chip = AGX_CHIP_G17G;
+      key.dev.emit_agx3d = false;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->max_reg = 127;
+
+      agx_index dest = agx_register(8, AGX_SIZE_32);
+      dest.channels_m1 = 3;
+      agx_index coord = agx_register(0, AGX_SIZE_32);
+      coord.channels_m1 = c.coord_channels - 1;
+      coord.discard = true;
+      agx_index lod = c.register_lod ? agx_register(6, AGX_SIZE_32)
+                                     : agx_immediate(0);
+      if (c.register_lod)
+         lod.discard = true;
+      agx_index tex = agx_uniform(24, AGX_SIZE_64);
+      auto *I = agx_texture_sample_to(
+         b, dest, coord, lod, agx_immediate(0), tex, agx_immediate(0),
+         agx_null(), c.dim, AGX_LOD_MODE_LOD_MIN, 0, false, false, false,
+         AGX_GATHER_NONE, false);
+      I->op = AGX_OPCODE_TEXTURE_LOAD;
+      I->mask = 15;
+      agx_stop(b);
+
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+
+      struct agx3_tex_fetch_desc want = {};
+      want.dest = 8;
+      want.coord = 0;
+      want.width = AGX3_TEX_W32;
+      want.mask = 15;
+      want.texture_kind = AGX3_TEX_OPERAND_UNIFORM;
+      want.texture_value = 24;
+      want.slot = 1;
+      want.wait_mask = 1;
+      want.coord_kill = true;
+      want.final = true;
+      want.array = c.dim == AGX_DIM_2D_ARRAY;
+      want.three_d = c.dim == AGX_DIM_3D;
+      want.register_lod = c.register_lod;
+      want.sampler_value = 0;
+
+      uint8_t bytes[AGX3_TEX_MAX_LENGTH], len = 0;
+      ASSERT_TRUE(agx3_tex_encode_fetch(AGX_ISA_ENCODING_AGX3C, &want, bytes, &len));
+      EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
+                code.end())
+         << "missing AGX3c fragment fetch with sampler_value=0";
+
+      want.sampler_value = 1;
+      ASSERT_TRUE(agx3_tex_encode_fetch(AGX_ISA_ENCODING_AGX3C, &want, bytes, &len));
+      EXPECT_EQ(std::search(code.begin(), code.end(), bytes, bytes + len),
+                code.end())
+         << "unexpected AGX3c fragment fetch with sampler_value=1";
    }
 }
