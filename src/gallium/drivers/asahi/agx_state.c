@@ -12921,7 +12921,8 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
       agx_link_varyings_vs_fs(t.cpu, &batch->linked_varyings, vs->uvs.user_size,
                               cf, rast->base.flatshade_first ? 0 : 2, 0,
                               &batch->generate_primitive_id);
-      agx_cf_bindings_select_perspective(t.cpu, cf);
+      if (agx_chip_uses_shade_model_5(dev->chip))
+         agx_cf_bindings_select_perspective(t.cpu, cf);
       /* Varying Counts packs smooth at bit 0, flat at bit 8 and linear
        * (noperspective) at bit 16; the record below uses the same layout. */
       const unsigned interpolation_shift =
@@ -14278,7 +14279,8 @@ agx_encode_g17g_state(struct agx_batch *batch, uint8_t *out)
                                  ? rast->base.sprite_coord_enable
                                  : 0,
                               &batch->generate_primitive_id);
-      agx_cf_bindings_select_perspective(t.cpu, cf);
+      if (agx_chip_uses_shade_model_5(dev->chip))
+         agx_cf_bindings_select_perspective(t.cpu, cf);
       if (!general_varyings) {
          /* Varying Counts packs smooth at bit 0, flat at bit 8 and linear
           * (noperspective) at bit 16; the record below uses the same
