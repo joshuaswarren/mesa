@@ -865,7 +865,7 @@ hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
 
    if (vdm && hk_g17p_vdm_low_window_enabled(&dev->dev))
       target = hk_g17p_vdm_compact(cmd, target);
-   else if (vdm && agx_chip_g17_m5(dev->dev.chip)) {
+   else if (vdm && agx_chip_hal300_path(dev->dev.chip)) {
       if (!agx_m5_vdm_compact(target, &target)) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          return current;
@@ -1665,9 +1665,29 @@ hk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
 
 }
 
-/* Only ordinary graphics programs whose descriptor values are fetched through
- * the root/table in GPU memory qualify.  CPU-decoded combined sampler programs
- * retain the existing publication path.
+static bool
+hk_descriptor_sets_unchanged(const struct hk_descriptor_state *desc)
+{
+   if (desc->push_active || desc->buffer_active)
+      return false;
+
+   for (unsigned s = 0; s < HK_MAX_SETS; ++s) {
+      const struct hk_descriptor_set *set = desc->sets[s];
+      if (!set)
+         continue;
+      if (hk_descriptor_set_layout_allows_update_after_bind(set->layout))
+         return false;
+      if (p_atomic_read(&set->update_seq) != desc->set_update_seq[s])
+         return false;
+   }
+
+   return true;
+}
+
+/* Ordinary graphics programs whose descriptor values are fetched through the
+ * root/table in GPU memory qualify, as do CPU-decoded combined-sampler
+ * programs while every bound set uses a static (non-update-after-bind) layout
+ * and has not been modified since it was bound.
  */
 static bool
 hk_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
@@ -1701,19 +1721,26 @@ hk_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
 
    const struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
    const struct hk_shader *hw_fs = &fs->variants[fs_idx];
-   if (!hw_vs || !hw_vs->compiled ||
-       hw_fs->info.agx3_combined_sampler_valid)
+   if (!hw_vs || !hw_vs->compiled || !hw_fs->compiled)
       return false;
 
-   /* If another published sample variant of the same API shader uses
-    * CPU-decoded combined samplers, keep the conservative invalidation path
-    * in case rasterization_samples switches before the next descriptor bind. */
-   for (unsigned i = 0; i < fs->g17p_sample_variants; ++i) {
-      if (i == fs_idx || !hk_fs_sample_variant_ready(fs, i))
-         continue;
-      if (fs->variants[i].info.agx3_combined_sampler_valid)
-         return false;
+   bool uses_combined_sampler = hw_fs->info.agx3_combined_sampler_valid;
+   if (!uses_combined_sampler) {
+      /* If another published sample variant of the same API shader uses
+       * CPU-decoded combined samplers, require unchanged static sets in case
+       * rasterization_samples switches before the next descriptor bind. */
+      for (unsigned i = 0; i < fs->g17p_sample_variants; ++i) {
+         if (i == fs_idx || !hk_fs_sample_variant_ready(fs, i))
+            continue;
+         if (fs->variants[i].info.agx3_combined_sampler_valid) {
+            uses_combined_sampler = true;
+            break;
+         }
+      }
    }
+
+   if (uses_combined_sampler)
+      return hk_descriptor_sets_unchanged(desc);
 
    return true;
 }
@@ -1744,10 +1771,12 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
 
    bool root_changed = false;
    bool binding_changed = false;
+   bool set_updated = false;
    uint32_t next_dyn_offset = 0;
    for (uint32_t i = 0; i < info->descriptorSetCount; ++i) {
       unsigned s = i + info->firstSet;
       VK_FROM_HANDLE(hk_descriptor_set, set, info->pDescriptorSets[i]);
+      const uint32_t seq = set != NULL ? p_atomic_read(&set->update_seq) : 0;
 
       if (desc->sets[s] != set ||
           ((desc->push_active | desc->buffer_active) & BITFIELD_BIT(s))) {
@@ -1762,9 +1791,14 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
             desc->set_sizes[s] = 0;
          }
          desc->sets[s] = set;
+         desc->set_update_seq[s] = seq;
          desc->sets_dirty |= BITFIELD_BIT(s);
 
          /* Binding descriptors invalidates push descriptors */
+      } else if (set != NULL && desc->set_update_seq[s] != seq) {
+         set_updated = true;
+         desc->set_update_seq[s] = seq;
+         desc->sets_dirty |= BITFIELD_BIT(s);
       }
       desc->push_active &= ~BITFIELD_BIT(s);
       desc->push_dirty &= ~BITFIELD_BIT(s);
@@ -1808,14 +1842,14 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
 
    hk_upload_stat(cmd, descriptor_binds, 1);
    const bool retain_root = hk_can_retain_descriptor_root(cmd, desc);
-   if (!root_changed && !binding_changed && retain_root) {
+   if (!root_changed && !binding_changed && !set_updated && retain_root) {
       hk_upload_stat(cmd, descriptor_noops, 1);
       return;
    }
 
    /* CPU-decoded descriptor programs retain their conservative invalidation:
     * their inputs can change in set memory without changing its address. */
-   if (root_changed || !retain_root)
+   if (root_changed || set_updated || !retain_root)
       hk_root_mark_dirty(desc);
    desc->generation++;
    desc->non_push_generation++;
@@ -1876,7 +1910,9 @@ hk_push_constants(struct hk_cmd_buffer *cmd,
 
    memcpy(desc->root.push + info->offset, info->pValues, info->size);
    hk_root_mark_push_dirty(desc);
-   /* non_push_generation intentionally does not advance on push constants. */
+   /* non_push_generation intentionally does not advance on push constants
+    * (push constants carry no tracked resource addresses; BDA transfers
+    * already set sync.xfer_any). */
    desc->generation++;
 }
 
@@ -1923,6 +1959,7 @@ hk_bind_buffer_set(struct hk_descriptor_state *desc,
    desc->root.sets[s] = addr;
    desc->set_sizes[s] = size;
    desc->sets[s] = NULL;
+   desc->set_update_seq[s] = 0;
    desc->sets_dirty |= BITFIELD_BIT(s);
    desc->push_active &= ~BITFIELD_BIT(s);
    desc->push_dirty &= ~BITFIELD_BIT(s);
@@ -2048,6 +2085,7 @@ hk_cmd_push_descriptors(struct hk_cmd_buffer *cmd,
 
    /* Pushing descriptors replaces whatever sets are bound */
    desc->sets[set] = NULL;
+   desc->set_update_seq[set] = 0;
    desc->buffer_active &= ~BITFIELD_BIT(set);
    desc->push_dirty |= BITFIELD_BIT(set);
    desc->push_active |= BITFIELD_BIT(set);
@@ -4545,7 +4583,7 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                 program.bytes, program.length);
          const struct agx3_transcode_ioto ioto = {
             .api_program = true,
-            .shader_gprs = s->b.info.nr_gprs,
+            .shader_gprs = desc.nr_gprs,
          };
          const char *why = NULL;
          unsigned at = 0;

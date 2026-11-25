@@ -2480,6 +2480,65 @@ vk_common_CmdSetVertexInputEXT(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(vk_command_buffer, cmd, commandBuffer);
    struct vk_dynamic_graphics_state *dyn = &cmd->dynamic_graphics_state;
 
+   if (dyn->vi != NULL &&
+       BITSET_TEST(dyn->set, MESA_VK_DYNAMIC_VI) &&
+       BITSET_TEST(dyn->set, MESA_VK_DYNAMIC_VI_BINDINGS_VALID) &&
+       BITSET_TEST(dyn->set, MESA_VK_DYNAMIC_VI_BINDING_STRIDES) &&
+       !BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI) &&
+       !BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDINGS_VALID) &&
+       !BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDING_STRIDES)) {
+      bool same = true;
+      uint32_t bindings_valid = 0;
+      for (uint32_t i = 0; i < vertexBindingDescriptionCount; i++) {
+         const VkVertexInputBindingDescription2EXT *desc =
+            &pVertexBindingDescriptions[i];
+
+         assert(desc->binding < MESA_VK_MAX_VERTEX_BINDINGS);
+         assert(desc->stride <= MESA_VK_MAX_VERTEX_BINDING_STRIDE);
+         assert(desc->inputRate <= UINT8_MAX);
+
+         const uint32_t b = desc->binding;
+         bindings_valid |= BITFIELD_BIT(b);
+         if (!(dyn->vi->bindings_valid & BITFIELD_BIT(b)) ||
+             dyn->vi->bindings[b].stride != desc->stride ||
+             dyn->vi->bindings[b].input_rate != desc->inputRate ||
+             dyn->vi->bindings[b].divisor != desc->divisor ||
+             dyn->vi_binding_strides[b] != desc->stride) {
+            same = false;
+            break;
+         }
+      }
+
+      if (same && (bindings_valid != dyn->vi->bindings_valid ||
+                   bindings_valid != dyn->vi_bindings_valid))
+         same = false;
+
+      if (same) {
+         uint32_t attributes_valid = 0;
+         for (uint32_t i = 0; i < vertexAttributeDescriptionCount; i++) {
+            const VkVertexInputAttributeDescription2EXT *desc =
+               &pVertexAttributeDescriptions[i];
+
+            assert(desc->location < MESA_VK_MAX_VERTEX_ATTRIBUTES);
+            assert(desc->binding < MESA_VK_MAX_VERTEX_BINDINGS);
+            assert(bindings_valid & BITFIELD_BIT(desc->binding));
+
+            const uint32_t a = desc->location;
+            attributes_valid |= BITFIELD_BIT(a);
+            if (!(dyn->vi->attributes_valid & BITFIELD_BIT(a)) ||
+                dyn->vi->attributes[a].binding != desc->binding ||
+                dyn->vi->attributes[a].format != desc->format ||
+                dyn->vi->attributes[a].offset != desc->offset) {
+               same = false;
+               break;
+            }
+         }
+
+         if (same && attributes_valid == dyn->vi->attributes_valid)
+            return;
+      }
+   }
+
    uint32_t bindings_valid = 0;
    for (uint32_t i = 0; i < vertexBindingDescriptionCount; i++) {
       const VkVertexInputBindingDescription2EXT *desc =

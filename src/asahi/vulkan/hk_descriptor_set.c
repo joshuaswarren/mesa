@@ -765,6 +765,7 @@ static ATTRIBUTE_NOINLINE void
 hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
                         const VkCopyDescriptorSet *pDescriptorCopies)
 {
+   struct hk_descriptor_set *last_dst = NULL;
    for (uint32_t i = 0; i < descriptorCopyCount; i++) {
       const VkCopyDescriptorSet *copy = &pDescriptorCopies[i];
       VK_FROM_HANDLE(hk_descriptor_set, src, copy->srcSet);
@@ -786,6 +787,8 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
          dst->storage_backings[copy->dstBinding] = backing;
       }
 
+      bool updated = false;
+
       /* Equal strides make the existing per-record copies contiguous. Vulkan
        * requires source and destination descriptor ranges not to overlap,
        * including when they belong to the same descriptor set.
@@ -806,6 +809,7 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
             else
                memcpy(dst_map, src_map, size);
             hk_descriptor_set_publish(dst, dst_map, size);
+            updated = copy->descriptorCount > 0;
          }
       } else if (dst_binding_layout->stride > 0 && src_binding_layout->stride > 0) {
          for (uint32_t j = 0; j < copy->descriptorCount; j++) {
@@ -821,6 +825,7 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
 
             memcpy(dst_map, src_map, copy_size);
             hk_descriptor_set_publish(dst, dst_map, copy_size);
+            updated = true;
          }
       }
 
@@ -832,8 +837,17 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
          typed_memcpy(&dst->dynamic_buffers[dst_dyn_start],
                       &src->dynamic_buffers[src_dyn_start],
                       copy->descriptorCount);
+         updated |= copy->descriptorCount > 0;
+      }
+
+      if (updated) {
+         if (last_dst != NULL && last_dst != dst)
+            p_atomic_inc(&last_dst->update_seq);
+         last_dst = dst;
       }
    }
+   if (last_dst != NULL)
+      p_atomic_inc(&last_dst->update_seq);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -842,9 +856,18 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
                         uint32_t descriptorCopyCount,
                         const VkCopyDescriptorSet *pDescriptorCopies)
 {
+   struct hk_descriptor_set *last_set = NULL;
    for (uint32_t w = 0; w < descriptorWriteCount; w++) {
       const VkWriteDescriptorSet *write = &pDescriptorWrites[w];
       VK_FROM_HANDLE(hk_descriptor_set, set, write->dstSet);
+
+      if (write->descriptorCount == 0)
+         continue;
+
+      if (last_set != NULL && last_set != set) {
+         p_atomic_inc(&last_set->update_seq);
+         last_set = NULL;
+      }
 
       switch (write->descriptorType) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -926,9 +949,13 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
       }
 
       default:
-         break;
+         continue;
       }
+
+      last_set = set;
    }
+   if (last_set != NULL)
+      p_atomic_inc(&last_set->update_seq);
 
    if (descriptorCopyCount)
       hk_copy_descriptor_sets(descriptorCopyCount, pDescriptorCopies);
@@ -1405,13 +1432,16 @@ hk_ResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool,
    return VK_SUCCESS;
 }
 
-static void
+static bool
 hk_descriptor_set_write_template(
    struct hk_descriptor_set *set,
    const struct vk_descriptor_update_template *template, const void *data)
 {
+   bool updated = false;
    for (uint32_t i = 0; i < template->entry_count; i++) {
       const struct vk_descriptor_template_entry *entry = &template->entries[i];
+      if (entry->array_count == 0)
+         continue;
 
       switch (entry->type) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -1492,9 +1522,12 @@ hk_descriptor_set_write_template(
          break;
 
       default:
-         break;
+         continue;
       }
+
+      updated = true;
    }
+   return updated;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1506,7 +1539,8 @@ hk_UpdateDescriptorSetWithTemplate(
    VK_FROM_HANDLE(vk_descriptor_update_template, template,
                   descriptorUpdateTemplate);
 
-   hk_descriptor_set_write_template(set, template, pData);
+   if (hk_descriptor_set_write_template(set, template, pData))
+      p_atomic_inc(&set->update_seq);
 }
 
 bool

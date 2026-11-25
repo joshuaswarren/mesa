@@ -2130,6 +2130,246 @@ agx_nir_lower_g17p_texture_early(nir_shader *s, bool support_lod_bias,
 }
 
 static bool
+lower_agx3d_implicit_min_lod(nir_builder *b, nir_tex_instr *tex,
+                             UNUSED void *data)
+{
+   if ((tex->op != nir_texop_tex && tex->op != nir_texop_txb) ||
+       !nir_shader_supports_implicit_lod(b->shader))
+      return false;
+
+   if (nir_tex_instr_src_index(tex, nir_tex_src_min_lod) < 0)
+      return false;
+
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   assert(coord_idx >= 0);
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *lod;
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_RECT) {
+      lod = nir_imm_float(b, 0.0f);
+   } else {
+      nir_def *coord = tex->src[coord_idx].src.ssa;
+      unsigned spatial_components =
+         tex->coord_components - (tex->is_array ? 1 : 0);
+      nir_def *spatial = nir_trim_vector(b, coord, spatial_components);
+      nir_def *dPdx = nir_ddx(b, spatial);
+      nir_def *dPdy = nir_ddy(b, spatial);
+
+      if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
+         nir_def *size = nir_i2f32(b, nir_get_texture_size(b, tex));
+         nir_def *abs_p = nir_fabs(b, spatial);
+         nir_def *abs_x = nir_channel(b, abs_p, 0);
+         nir_def *abs_y = nir_channel(b, abs_p, 1);
+         nir_def *abs_z = nir_channel(b, abs_p, 2);
+
+         nir_def *cond_z = nir_fge(b, abs_z, nir_fmax(b, abs_x, abs_y));
+         nir_def *cond_y = nir_fge(b, abs_y, nir_fmax(b, abs_x, abs_z));
+
+         unsigned yzx[3] = {1, 2, 0};
+         unsigned xzy[3] = {0, 2, 1};
+
+         nir_def *Q = nir_bcsel(
+            b, cond_z, spatial,
+            nir_bcsel(b, cond_y, nir_swizzle(b, spatial, xzy, 3),
+                      nir_swizzle(b, spatial, yzx, 3)));
+         nir_def *dQdx = nir_bcsel(
+            b, cond_z, dPdx,
+            nir_bcsel(b, cond_y, nir_swizzle(b, dPdx, xzy, 3),
+                      nir_swizzle(b, dPdx, yzx, 3)));
+         nir_def *dQdy = nir_bcsel(
+            b, cond_z, dPdy,
+            nir_bcsel(b, cond_y, nir_swizzle(b, dPdy, xzy, 3),
+                      nir_swizzle(b, dPdy, yzx, 3)));
+
+         nir_def *rcp_Q_z = nir_frcp(b, nir_channel(b, Q, 2));
+         nir_def *tmp = nir_fmul(b, nir_trim_vector(b, Q, 2), rcp_Q_z);
+         nir_def *dx = nir_fmul(
+            b, rcp_Q_z,
+            nir_fsub(b, nir_trim_vector(b, dQdx, 2),
+                     nir_fmul(b, tmp, nir_channel(b, dQdx, 2))));
+         nir_def *dy = nir_fmul(
+            b, rcp_Q_z,
+            nir_fsub(b, nir_trim_vector(b, dQdy, 2),
+                     nir_fmul(b, tmp, nir_channel(b, dQdy, 2))));
+
+         nir_def *M = nir_fmax(b, nir_fdot(b, dx, dx), nir_fdot(b, dy, dy));
+         nir_def *L = nir_channel(b, size, 0);
+         lod = nir_fadd_imm(
+            b,
+            nir_fmul_imm(b, nir_flog2(b, nir_fmul(b, L, nir_fmul(b, L, M))),
+                         0.5f),
+            -1.0f);
+      } else {
+         unsigned component_mask =
+            tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 7 : 3;
+         nir_def *size = nir_channels(
+            b, nir_i2f32(b, nir_get_texture_size(b, tex)), component_mask);
+         nir_def *scaled_dx = nir_fmul(b, dPdx, size);
+         nir_def *scaled_dy = nir_fmul(b, dPdy, size);
+         nir_def *rho = nir_fmax(
+            b, nir_fsqrt(b, nir_fdot(b, scaled_dx, scaled_dx)),
+            nir_fsqrt(b, nir_fdot(b, scaled_dy, scaled_dy)));
+         lod = nir_flog2(b, rho);
+      }
+   }
+
+   if (tex->op == nir_texop_txb) {
+      nir_def *bias = nir_steal_tex_src(tex, nir_tex_src_bias);
+      assert(bias != NULL);
+      lod = nir_fadd(b, lod, nir_f2f32(b, bias));
+   }
+
+   nir_def *min_lod = nir_steal_tex_src(tex, nir_tex_src_min_lod);
+   assert(min_lod != NULL);
+   lod = nir_fmax(b, lod, nir_f2f32(b, min_lod));
+
+   tex->op = nir_texop_txl;
+   nir_tex_instr_add_src(tex, nir_tex_src_lod, lod);
+   return true;
+}
+
+static nir_def *
+agx3d_get_texture_levels(nir_builder *b, nir_tex_instr *tex)
+{
+   unsigned num_srcs = 0;
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      if (tex->src[i].src_type == nir_tex_src_texture_deref ||
+          tex->src[i].src_type == nir_tex_src_texture_offset ||
+          tex->src[i].src_type == nir_tex_src_texture_handle)
+         num_srcs++;
+   }
+
+   nir_tex_instr *query = nir_tex_instr_create(b->shader, num_srcs);
+   query->op = nir_texop_query_levels;
+   query->sampler_dim = tex->sampler_dim;
+   query->is_array = tex->is_array;
+   query->texture_index = tex->texture_index;
+   query->texture_non_uniform = tex->texture_non_uniform;
+   query->dest_type = nir_type_int32;
+
+   unsigned dst = 0;
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      if (tex->src[i].src_type == nir_tex_src_texture_deref ||
+          tex->src[i].src_type == nir_tex_src_texture_offset ||
+          tex->src[i].src_type == nir_tex_src_texture_handle) {
+         query->src[dst].src_type = tex->src[i].src_type;
+         query->src[dst].src = nir_src_for_ssa(tex->src[i].src.ssa);
+         dst++;
+      }
+   }
+
+   nir_def_init(&query->instr, &query->def, 1, 32);
+   nir_builder_instr_insert(b, &query->instr);
+   return &query->def;
+}
+
+static bool
+lower_agx3d_txl_runtime_offset(nir_builder *b, nir_tex_instr *tex,
+                               UNUSED void *data)
+{
+   if (tex->op != nir_texop_txl || tex->sampler_dim == GLSL_SAMPLER_DIM_RECT)
+      return false;
+
+   const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   if (offset_idx < 0 || g17p_offset_is_constant(tex->src[offset_idx].src.ssa))
+      return false;
+
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   if (coord_idx < 0 || lod_idx < 0)
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   nir_def *lod = nir_f2f32(b, tex->src[lod_idx].src.ssa);
+   nir_def *offset = nir_steal_tex_src(tex, nir_tex_src_offset);
+
+   unsigned spatial_components =
+      tex->coord_components - (tex->is_array ? 1 : 0);
+   nir_def *txs0 =
+      nir_trim_vector(b, nir_get_texture_size(b, tex), spatial_components);
+   nir_def *levels = agx3d_get_texture_levels(b, tex);
+   nir_def *max_level = nir_imax(b, nir_iadd_imm(b, levels, -1), nir_imm_int(b, 0));
+
+   /* Vulkan mip level selection for nearest-mipmap: clamp(ceil(lod + 0.5) - 1, 0, max_level). */
+   nir_def *level = nir_f2i32(
+      b, nir_fmax(b, nir_fadd_imm(b, nir_fceil(b, nir_fadd_imm(b, lod, 0.5f)), -1.0f),
+                  nir_imm_float(b, 0.0f)));
+   level = nir_imin(b, level, max_level);
+
+   nir_def *size = nir_imax(b, nir_ushr(b, txs0, level), nir_imm_int(b, 1));
+   nir_def *scale = nir_frcp(b, nir_i2f32(b, size));
+   nir_def *spatial = nir_trim_vector(b, coord, spatial_components);
+   nir_def *offset_spatial =
+      nir_fadd(b, spatial, nir_fmul(b, nir_i2f32(b, offset), scale));
+
+   nir_def *new_coord = offset_spatial;
+   if (tex->is_array) {
+      unsigned a = tex->coord_components - 1;
+      new_coord = nir_pad_vector(b, offset_spatial, tex->coord_components);
+      new_coord =
+         nir_vector_insert_imm(b, new_coord, nir_channel(b, coord, a), a);
+   }
+
+   nir_src_rewrite(&tex->src[coord_idx].src, new_coord);
+   return true;
+}
+
+static bool
+lower_agx3d_runtime_offset(const nir_instr *instr, UNUSED const void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+
+   const nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->op == nir_texop_tg4 || tex->op == nir_texop_txf)
+      return false;
+
+   const int offset = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   return offset >= 0 && !g17p_offset_is_constant(tex->src[offset].src.ssa);
+}
+
+/*
+ * AGX3D early texture lowering: runs the common AGX3 early pass, then lowers
+ * texture forms that AGX3D does not encode directly in hardware SMP:
+ *  - min_lod on implicit/biased/gradient samples (lowered to explicit LOD)
+ *  - 3D and shadow gradient samples (lowered to explicit LOD)
+ *  - non-gather runtime texel offsets (folded into normalized coordinates,
+ *    scaled by the sampled mip level for explicit LOD)
+ */
+bool
+agx_nir_lower_agx3d_texture_early(nir_shader *s, bool support_lod_bias,
+                                  bool sampler_has_lod_bias)
+{
+   bool progress =
+      agx_nir_lower_g17p_texture_early(s, support_lod_bias,
+                                       sampler_has_lod_bias);
+
+   NIR_PASS(progress, s, nir_shader_tex_pass, lower_agx3d_implicit_min_lod,
+            nir_metadata_control_flow, NULL);
+
+   NIR_PASS(progress, s, nir_lower_tex,
+            &(nir_lower_tex_options){
+               .lower_txd_clamp = true,
+               .lower_txd_3d = true,
+               .lower_txd_shadow = true,
+               .lower_txd_cube_map = true,
+            });
+
+   NIR_PASS(progress, s, nir_shader_tex_pass, lower_agx3d_txl_runtime_offset,
+            nir_metadata_control_flow, NULL);
+
+   NIR_PASS(progress, s, nir_lower_tex,
+            &(nir_lower_tex_options){
+               .lower_offset_filter = lower_agx3d_runtime_offset,
+            });
+
+   return progress;
+}
+
+static bool
 lower_texture_early(nir_shader *s, bool support_lod_bias,
                     bool lower_2d_robustness, bool shadow_keeps_sampler_bias)
 {

@@ -5029,6 +5029,97 @@ test_g17p_projected_2d_runtime_offset_scope(void)
    return ok;
 }
 
+static bool
+test_agx3d_texture_early_lowering(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options,
+      "AGX3D early texture lowering");
+
+   nir_def *coord2 = nir_load_input(&b, 2, 32, nir_imm_int(&b, 0));
+   nir_def *coord3 = nir_load_input(&b, 3, 32, nir_imm_int(&b, 1));
+   nir_def *lod = nir_load_input(&b, 1, 32, nir_imm_int(&b, 2));
+   nir_def *min_lod = nir_load_input(&b, 1, 32, nir_imm_int(&b, 3));
+   nir_def *offset = nir_load_constant_agx(
+      &b, 2, 32, nir_imm_int64(&b, 0), nir_imm_int(&b, 0),
+      .format = PIPE_FORMAT_R32_UINT, .sign_extend = true);
+
+   /* 1. txb with min_lod -> txl without bias or min_lod. */
+   nir_tex_instr *txb = nir_tex_instr_create(b.shader, 3);
+   txb->op = nir_texop_txb;
+   txb->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   txb->dest_type = nir_type_float32;
+   txb->coord_components = 2;
+   txb->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord2);
+   txb->src[1] = nir_tex_src_for_ssa(nir_tex_src_bias, lod);
+   txb->src[2] = nir_tex_src_for_ssa(nir_tex_src_min_lod, min_lod);
+   nir_def_init(&txb->instr, &txb->def, 4, 32);
+   nir_builder_instr_insert(&b, &txb->instr);
+
+   /* 2. 3D txd -> txl. */
+   nir_tex_instr *txd = nir_tex_instr_create(b.shader, 3);
+   txd->op = nir_texop_txd;
+   txd->sampler_dim = GLSL_SAMPLER_DIM_3D;
+   txd->dest_type = nir_type_float32;
+   txd->coord_components = 3;
+   txd->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord3);
+   txd->src[1] = nir_tex_src_for_ssa(nir_tex_src_ddx, nir_imm_vec3(&b, 0.1f, 0.0f, 0.0f));
+   txd->src[2] = nir_tex_src_for_ssa(nir_tex_src_ddy, nir_imm_vec3(&b, 0.0f, 0.1f, 0.0f));
+   nir_def_init(&txd->instr, &txd->def, 4, 32);
+   nir_builder_instr_insert(&b, &txd->instr);
+
+   /* 3. 2D_ARRAY txl with runtime offset -> offset lowered with txs + query_levels. */
+   nir_tex_instr *txl = nir_tex_instr_create(b.shader, 3);
+   txl->op = nir_texop_txl;
+   txl->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   txl->is_array = true;
+   txl->dest_type = nir_type_float32;
+   txl->coord_components = 3;
+   txl->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord3);
+   txl->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, lod);
+   txl->src[2] = nir_tex_src_for_ssa(nir_tex_src_offset, offset);
+   nir_def_init(&txl->instr, &txl->def, 4, 32);
+   nir_builder_instr_insert(&b, &txl->instr);
+
+   /* 4. tg4 with runtime offset -> offset preserved for native PACK_SMPIR. */
+   nir_tex_instr *tg4 = nir_tex_instr_create(b.shader, 2);
+   tg4->op = nir_texop_tg4;
+   tg4->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tg4->dest_type = nir_type_float32;
+   tg4->coord_components = 2;
+   tg4->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord2);
+   tg4->src[1] = nir_tex_src_for_ssa(nir_tex_src_offset, offset);
+   nir_def_init(&tg4->instr, &tg4->def, 4, 32);
+   nir_builder_instr_insert(&b, &tg4->instr);
+
+   const bool progress = agx_nir_lower_agx3d_texture_early(b.shader, false, true);
+   nir_validate_shader(b.shader, "after agx_nir_lower_agx3d_texture_early");
+
+   unsigned level_queries = 0;
+   nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_tex &&
+             nir_instr_as_tex(instr)->op == nir_texop_query_levels)
+            level_queries++;
+      }
+   }
+
+   const bool ok =
+      progress &&
+      txb->op == nir_texop_txl &&
+      nir_tex_instr_src_index(txb, nir_tex_src_min_lod) < 0 &&
+      nir_tex_instr_src_index(txb, nir_tex_src_bias) < 0 &&
+      nir_tex_instr_src_index(txb, nir_tex_src_lod) >= 0 &&
+      txd->op == nir_texop_txl &&
+      nir_tex_instr_src_index(txd, nir_tex_src_ddx) < 0 &&
+      nir_tex_instr_src_index(txd, nir_tex_src_lod) >= 0 &&
+      nir_tex_instr_src_index(txl, nir_tex_src_offset) < 0 &&
+      level_queries == 1 &&
+      nir_tex_instr_src_index(tg4, nir_tex_src_offset) >= 0;
+   ralloc_free(b.shader);
+   return ok;
+}
+
 /* A runtime offset loaded as one vector has no allocated_vec entry. Combining
  * it with a shadow comparator used to call agx_emit_extract() anyway and abort
  * while compiling the pcOffset sampler2DShadow bias fragment. Keep the same
@@ -9951,6 +10042,7 @@ main(int argc, char **argv)
    RUN(test_agx3_tiny_push_vertex_preamble_inlined);
    RUN(test_agx3_vertex_set_pointer_uniform_halfs);
    RUN(test_agx3_packed_byte_word_tile_store);
+   RUN(test_agx3d_texture_early_lowering);
 #undef RUN
 
    for (unsigned e = 0; e < ARRAY_SIZE(encodings); ++e) {

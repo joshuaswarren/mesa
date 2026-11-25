@@ -159,6 +159,7 @@ hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
    save->vb0 = cmd->state.gfx.vb[0];
 
    save->desc0 = desc->sets[0];
+   save->desc0_update_seq = desc->set_update_seq[0];
    save->has_push_desc0 = desc->push[0];
    save->push_active0 = !!(desc->push_active & BITFIELD_BIT(0));
    save->buffer_active0 = !!(desc->buffer_active & BITFIELD_BIT(0));
@@ -233,6 +234,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       else if (desc->push[0])
          hk_push_descriptor_set_reset_upload(desc->push[0]);
       desc->sets[0] = NULL;
+      desc->set_update_seq[0] = 0;
       desc->root.sets[0] = save->buffer_set0;
       desc->set_sizes[0] = save->buffer_set_size0;
       desc->sets_dirty |= BITFIELD_BIT(0);
@@ -243,6 +245,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       if (desc->push[0])
          hk_push_descriptor_set_reset_upload(desc->push[0]);
       desc->sets[0] = save->desc0;
+      desc->set_update_seq[0] = save->desc0_update_seq;
       desc->root.sets[0] = hk_descriptor_set_addr(save->desc0);
       desc->sets_dirty |= BITFIELD_BIT(0);
       desc->push_dirty &= ~BITFIELD_BIT(0);
@@ -260,6 +263,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
          hk_push_descriptor_set_reset_upload(desc->push[0]);
       desc->push_active &= ~BITFIELD_BIT(0);
    }
+   desc->non_push_generation++;
 
    /* Nested meta operations end in the reverse order they begin, so this
     * save is the last one stacked. */

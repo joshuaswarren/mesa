@@ -3794,7 +3794,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * an encoder with no offset field at all. */
    /* M5 keeps a depth comparison's bias in the sampler descriptor, as the
     * M5 path always has; only a Gen4 sampler moves it into the shader. */
-   if (agx_chip_agx3_path(dev->dev.chip))
+   if (agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3D)
+      NIR_PASS(lowered_complex, nir, agx_nir_lower_agx3d_texture_early,
+               support_lod_bias,
+               agx_chip_sampler_has_lod_bias(dev->dev.chip) ||
+                  agx_chip_hal300_path(dev->dev.chip));
+   else if (agx_chip_agx3_path(dev->dev.chip))
       NIR_PASS(lowered_complex, nir, agx_nir_lower_g17p_texture_early,
                support_lod_bias,
                agx_chip_sampler_has_lod_bias(dev->dev.chip) ||
@@ -3843,7 +3848,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             agx_chip_sampler_has_lod_bias(dev->dev.chip),
             instance->drirc.misc.d3d_nearest_mip,
             hk_coherent_images_in_memory(&dev->dev),
-            agx_chip_g17_m5(dev->dev.chip));
+            agx_chip_g17_m5(dev->dev.chip),
+            agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3D);
    bool lowered_global_io = false;
    NIR_PASS(lowered_global_io, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);

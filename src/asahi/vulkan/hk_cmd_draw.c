@@ -332,6 +332,7 @@ hk_cmd_invalidate_graphics_state(struct hk_cmd_buffer *cmd)
    const uint32_t occlusion_pending_query = gfx->occlusion.pending_query;
 
    memset(gfx, 0, sizeof(*gfx));
+   memset(&cmd->sync.xfer_clean, 0, sizeof(cmd->sync.xfer_clean));
    gfx->render = render_save;
    memcpy(gfx->descriptors.push, push, sizeof(push));
    for (unsigned i = 0; i < HK_MAX_SETS; i++) {
@@ -3852,14 +3853,16 @@ hk_xfer_match_descriptors(const struct hk_cmd_buffer *cmd, struct hk_cs *best)
  * noted transfer write, through the bound descriptors, vertex and index
  * buffers, [extra_lo, extra_hi) (indirect parameters) or the conditional
  * rendering predicate. Shader stores to transform feedback buffers are
- * matched against everything. */
+ * matched against everything. Non-static for unit tests (hk_cpu_upload_bench). */
 void
 hk_xfer_check_draw_slow(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
                         uint64_t extra_hi)
 {
    struct hk_sync_state *st = &cmd->sync;
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
-   struct hk_cs *best = NULL;
+   /* Transfers reachable via device addresses (including through push
+    * constants) must always be ordered before graphics. */
+   struct hk_cs *best = st->xfer_any;
 
    if (extra_lo < extra_hi)
       best = hk_sync_xfer_match(cmd, extra_lo, extra_hi, best);
@@ -3868,32 +3871,56 @@ hk_xfer_check_draw_slow(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
    if (gfx->xfb_enabled)
       best = hk_sync_xfer_match_all(cmd, best);
 
-   const bool clean =
-      st->xfer_clean.valid && st->xfer_clean.version == st->xfer_version &&
+   const bool desc_clean =
+      st->xfer_clean.desc_valid &&
+      st->xfer_clean.desc_version == st->xfer_version &&
       !gfx->descriptors.push_dirty &&
-      st->xfer_clean.descriptors == gfx->descriptors.generation &&
-      st->xfer_clean.vertex_buffers == gfx->vertex_buffer_generation &&
-      st->xfer_clean.index == gfx->index.buffer.addr;
+      st->xfer_clean.descriptors == gfx->descriptors.non_push_generation;
+   if (!desc_clean) {
+      hk_upload_stat(cmd, xfer_desc_walks, 1);
+      struct hk_cs *desc_match = hk_xfer_match_descriptors(cmd, NULL);
+      st->xfer_clean.desc_valid =
+         desc_match == NULL && !gfx->descriptors.push_dirty;
+      st->xfer_clean.desc_version = st->xfer_version;
+      st->xfer_clean.descriptors = gfx->descriptors.non_push_generation;
+      best = hk_sync_later(best, desc_match);
+   }
 
-   if (!clean) {
-      struct hk_cs *state = hk_xfer_match_descriptors(cmd, NULL);
-      for (unsigned i = 0; i < ARRAY_SIZE(gfx->vb); ++i) {
-         if (gfx->vb[i].range)
-            state = hk_sync_xfer_match(cmd, gfx->vb[i].addr,
+   const bool vb_clean =
+      st->xfer_clean.vb_valid &&
+      st->xfer_clean.vb_version == st->xfer_version &&
+      st->xfer_clean.vertex_buffers == gfx->vertex_buffer_generation;
+   if (!vb_clean) {
+      struct hk_cs *vb_match = NULL;
+      u_foreach_bit(i, gfx->bound_vb_mask) {
+         assert(gfx->vb[i].range > 0);
+         vb_match = hk_sync_xfer_match(cmd, gfx->vb[i].addr,
                                        gfx->vb[i].addr + gfx->vb[i].range,
-                                       state);
+                                       vb_match);
       }
-      if (gfx->index.buffer.range)
-         state = hk_sync_xfer_match(
-            cmd, gfx->index.buffer.addr,
-            gfx->index.buffer.addr + gfx->index.buffer.range, state);
-
-      st->xfer_clean.valid = state == NULL && !gfx->descriptors.push_dirty;
-      st->xfer_clean.version = st->xfer_version;
-      st->xfer_clean.descriptors = gfx->descriptors.generation;
+      st->xfer_clean.vb_valid = vb_match == NULL;
+      st->xfer_clean.vb_version = st->xfer_version;
       st->xfer_clean.vertex_buffers = gfx->vertex_buffer_generation;
-      st->xfer_clean.index = gfx->index.buffer.addr;
-      best = hk_sync_later(best, state);
+      best = hk_sync_later(best, vb_match);
+   }
+
+   const bool index_clean =
+      st->xfer_clean.index_valid &&
+      st->xfer_clean.index_version == st->xfer_version &&
+      st->xfer_clean.index_addr == gfx->index.buffer.addr &&
+      st->xfer_clean.index_range == gfx->index.buffer.range;
+   if (!index_clean) {
+      struct hk_cs *index_match = NULL;
+      if (gfx->index.buffer.range) {
+         index_match = hk_sync_xfer_match(
+            cmd, gfx->index.buffer.addr,
+            gfx->index.buffer.addr + gfx->index.buffer.range, NULL);
+      }
+      st->xfer_clean.index_valid = index_match == NULL;
+      st->xfer_clean.index_version = st->xfer_version;
+      st->xfer_clean.index_addr = gfx->index.buffer.addr;
+      st->xfer_clean.index_range = gfx->index.buffer.range;
+      best = hk_sync_later(best, index_match);
    }
 
    if (best)
@@ -14592,6 +14619,9 @@ void
 hk_cmd_bind_vertex_buffer(struct hk_cmd_buffer *cmd, uint32_t vb_idx,
                           struct hk_addr_range addr_range)
 {
+   static_assert(AGX_MAX_VBUFS <= 32, "bound_vb_mask is a 32-bit mask");
+   assert(vb_idx < ARRAY_SIZE(cmd->state.gfx.vb));
+
    /* An identical rebind leaves every consumer's input unchanged. Dirtiness
     * already pending (e.g. after state invalidation) is kept as it is. */
    if (cmd->state.gfx.vb[vb_idx].addr == addr_range.addr &&
@@ -14599,6 +14629,10 @@ hk_cmd_bind_vertex_buffer(struct hk_cmd_buffer *cmd, uint32_t vb_idx,
       return;
 
    cmd->state.gfx.vb[vb_idx] = addr_range;
+   if (addr_range.range)
+      cmd->state.gfx.bound_vb_mask |= BITFIELD_BIT(vb_idx);
+   else
+      cmd->state.gfx.bound_vb_mask &= ~BITFIELD_BIT(vb_idx);
    cmd->state.gfx.dirty |= HK_DIRTY_VB;
    cmd->state.gfx.vertex_buffer_generation++;
 }
