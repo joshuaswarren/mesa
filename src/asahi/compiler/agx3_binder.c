@@ -29,13 +29,12 @@ agx3_bind_form_size(enum agx_isa_encoding encoding,
    return form < 0 ? 0 : t->forms[form].size;
 }
 
+#include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 
-#include <stdatomic.h>
-
+#include "c11/threads.h"
 #include "util/bitscan.h"
-#define XXH_INLINE_ALL
-#include "util/xxhash.h"
 
 /*
  * Only the builds that encode G18G define AGX3_HAVE_AGX3D_TABLE and so link
@@ -51,21 +50,91 @@ agx3d_table_or_null(void)
 #endif
 }
 
-static bool
-agx3_bind_fields(const struct agx3_field_kv *baseline, unsigned nbaseline,
-                 const struct agx3_field_kv *overrides, unsigned noverrides,
-                 uint64_t fields[AGX3_MAX_FIELDS])
+/* Per-thread zeroed scratch vector: only the fields touched by baseline and
+ * overrides are written and cleared back to zero before returning, avoiding
+ * a 1.5 KiB memset on every composed instruction.
+ *
+ * Thread-specific storage rather than a _Thread_local array: libgallium and
+ * libvulkan_asahi build with the initial-exec TLS model, and a dlopen() of
+ * either only gets glibc's small static TLS surplus, which a 1280-byte
+ * static TLS array exhausts (EGL then fails to load with "cannot allocate
+ * memory in static TLS block"). */
+static tss_t agx3_bind_scratch_key;
+static once_flag agx3_bind_scratch_once = ONCE_FLAG_INIT;
+static bool agx3_bind_scratch_key_valid;
+
+static void
+agx3_bind_scratch_key_init(void)
 {
-   memset(fields, 0, sizeof(uint64_t) * AGX3_MAX_FIELDS);
+   agx3_bind_scratch_key_valid =
+      tss_create(&agx3_bind_scratch_key, free) == thrd_success;
+}
+
+static uint64_t *
+agx3_bind_scratch_buffer(void)
+{
+   call_once(&agx3_bind_scratch_once, agx3_bind_scratch_key_init);
+   if (!agx3_bind_scratch_key_valid)
+      return NULL;
+   uint64_t *buf = tss_get(agx3_bind_scratch_key);
+   if (!buf) {
+      buf = calloc(AGX3_MAX_FIELDS, sizeof(uint64_t));
+      if (buf && tss_set(agx3_bind_scratch_key, buf) != thrd_success) {
+         free(buf);
+         buf = NULL;
+      }
+   }
+   return buf;
+}
+
+static void
+agx3_bind_fields_clear_nonzero(uint64_t fields[AGX3_MAX_FIELDS],
+                               const uint64_t nonzero[3])
+{
+   for (unsigned w = 0; w < 3; ++w) {
+      uint64_t bits = nonzero[w];
+      while (bits) {
+         const unsigned field = w * 64 + u_bit_scan64(&bits);
+         fields[field] = 0;
+      }
+   }
+}
+
+static bool
+agx3_bind_fields_populate(const struct agx3_field_kv *baseline,
+                          unsigned nbaseline,
+                          const struct agx3_field_kv *overrides,
+                          unsigned noverrides,
+                          uint64_t fields[AGX3_MAX_FIELDS],
+                          uint64_t nonzero[3])
+{
    for (unsigned i = 0; i < nbaseline; ++i) {
-      if (baseline[i].field >= AGX3_MAX_FIELDS)
+      const unsigned field = baseline[i].field;
+      if (field >= AGX3_MAX_FIELDS) {
+         agx3_bind_fields_clear_nonzero(fields, nonzero);
          return false;
-      fields[baseline[i].field] = baseline[i].value;
+      }
+      const uint64_t val = baseline[i].value;
+      fields[field] = val;
+      const uint64_t bit = UINT64_C(1) << (field & 63);
+      if (val)
+         nonzero[field >> 6] |= bit;
+      else
+         nonzero[field >> 6] &= ~bit;
    }
    for (unsigned i = 0; i < noverrides; ++i) {
-      if (overrides[i].field >= AGX3_MAX_FIELDS)
+      const unsigned field = overrides[i].field;
+      if (field >= AGX3_MAX_FIELDS) {
+         agx3_bind_fields_clear_nonzero(fields, nonzero);
          return false;
-      fields[overrides[i].field] = overrides[i].value;
+      }
+      const uint64_t val = overrides[i].value;
+      fields[field] = val;
+      const uint64_t bit = UINT64_C(1) << (field & 63);
+      if (val)
+         nonzero[field >> 6] |= bit;
+      else
+         nonzero[field >> 6] &= ~bit;
    }
    return true;
 }
@@ -77,10 +146,10 @@ agx3_bind_fields(const struct agx3_field_kv *baseline, unsigned nbaseline,
  * the Ioto program generators compose the same instructions for every draw:
  * on the M6 the table walk was about half of Chromium's GPU-process time
  * while dragging Google Maps. Remember recent compositions, keyed by exactly
- * those inputs. Only nonzero fields enter the vector (agx3_bind_fields() zero
- * fills it), so the key is the nonzero fields in field order. Only successful
- * compositions are kept; a hit returns the bytes the table walk returned for
- * the same inputs.
+ * those inputs. Only nonzero fields enter the vector (the scratch vector is
+ * kept zero-filled), so the key is the nonzero fields in field order. Only
+ * successful compositions are kept; a hit returns the bytes the table walk
+ * returned for the same inputs.
  */
 #define AGX3_BIND_MEMO_SLOTS  1024
 #define AGX3_BIND_MEMO_FIELDS 24
@@ -126,19 +195,25 @@ agx3_bind_memo_key(const agx3_table *t, enum agx3_mnemonic mnemonic, int ep,
    key->mnemonic = mnemonic;
    key->ep = ep;
    key->nfields = 0;
-   uint64_t hash = XXH64(&key->table, sizeof(key->table), 0) ^
-                   XXH64(&key->mnemonic, sizeof(key->mnemonic), (uint64_t)ep);
+   uint64_t hash = ((uint64_t)(uintptr_t)t) * UINT64_C(0x9e3779b97f4a7c15);
+   hash ^= ((uint64_t)(uint32_t)mnemonic << 32) | (uint32_t)ep;
+   hash *= UINT64_C(0xbf58476d1ce4e5b9);
    for (unsigned w = 0; w < 3; ++w) {
       uint64_t bits = nonzero[w];
       while (bits) {
          const unsigned field = w * 64 + u_bit_scan64(&bits);
          if (key->nfields == AGX3_BIND_MEMO_FIELDS)
             return false;
+         const uint64_t val = fields[field];
          key->field[key->nfields] = field;
-         key->value[key->nfields++] = fields[field];
-         hash = XXH64(&fields[field], sizeof(fields[field]), hash ^ field);
+         key->value[key->nfields++] = val;
+         hash = (hash ^ ((uint64_t)field << 48) ^ val) *
+                UINT64_C(0x9e3779b97f4a7c15);
       }
    }
+   hash ^= hash >> 33;
+   hash *= UINT64_C(0xff51afd7ed558ccd);
+   hash ^= hash >> 33;
    key->hash = hash;
    return true;
 }
@@ -146,7 +221,7 @@ agx3_bind_memo_key(const agx3_table *t, enum agx3_mnemonic mnemonic, int ep,
 static struct agx3_bind_memo *
 agx3_bind_memo_slot(const struct agx3_bind_memo *key)
 {
-   return &agx3_bind_memo[key->hash % AGX3_BIND_MEMO_SLOTS];
+   return &agx3_bind_memo[key->hash & (AGX3_BIND_MEMO_SLOTS - 1)];
 }
 
 static bool
@@ -177,7 +252,15 @@ agx3_bind_memo_put(const struct agx3_bind_memo *key, const uint8_t *out,
    if (len == 0 || len > sizeof(key->out) || !agx3_bind_memo_lock())
       return;
    struct agx3_bind_memo *e = agx3_bind_memo_slot(key);
-   *e = *key;
+   e->hash = key->hash;
+   e->table = key->table;
+   e->mnemonic = key->mnemonic;
+   e->ep = key->ep;
+   e->nfields = key->nfields;
+   if (key->nfields) {
+      memcpy(e->field, key->field, key->nfields * sizeof(key->field[0]));
+      memcpy(e->value, key->value, key->nfields * sizeof(key->value[0]));
+   }
    memcpy(e->out, out, len);
    e->len = len;
    agx3_bind_memo_unlock();
@@ -219,39 +302,39 @@ agx3_bind_compose(enum agx_isa_encoding encoding, enum agx3_mnemonic mnemonic,
          return false;
    }
 
-   uint64_t fields[AGX3_MAX_FIELDS];
-   if (!agx3_bind_fields(baseline, nbaseline, overrides, noverrides, fields))
-      return false;
-
-   /* Only the listed fields can be nonzero. */
+   uint64_t stack_fields[AGX3_MAX_FIELDS];
+   uint64_t *fields = agx3_bind_scratch_buffer();
+   if (!fields) {
+      memset(stack_fields, 0, sizeof(stack_fields));
+      fields = stack_fields;
+   }
    uint64_t nonzero[3] = {0};
-   for (unsigned i = 0; i < nbaseline; ++i) {
-      const unsigned field = baseline[i].field;
-      if (fields[field])
-         nonzero[field / 64] |= UINT64_C(1) << (field % 64);
-   }
-   for (unsigned i = 0; i < noverrides; ++i) {
-      const unsigned field = overrides[i].field;
-      if (fields[field])
-         nonzero[field / 64] |= UINT64_C(1) << (field % 64);
-   }
+   if (!agx3_bind_fields_populate(baseline, nbaseline, overrides, noverrides,
+                                  fields, nonzero))
+      return false;
 
    struct agx3_bind_memo key;
    const bool memo = agx3_bind_memo_key(t, mnemonic, ep, fields, nonzero, &key);
-   if (memo && agx3_bind_memo_get(&key, out, len))
+   if (memo && agx3_bind_memo_get(&key, out, len)) {
+      agx3_bind_fields_clear_nonzero(fields, nonzero);
       return true;
+   }
 
+   bool ok = true;
    if (ep == AGX3_BIND_APPLE_ORDER) {
-      form = agx3_compose_apple_order_known(t, mnemonic, fields, nonzero,
-                                            out);
+      form = agx3_compose_apple_order_known(t, mnemonic, fields, nonzero, out);
       if (form < 0)
-         return false;
+         ok = false;
    } else if (!agx3_compose_known(t, (uint32_t)form, fields, nonzero, out)) {
       /* agx3_compose keeps its words invocation-local and does not touch
        * out until every predicate, deposit and field-consumption check
        * succeeds, so it encodes directly into the caller's buffer. */
-      return false;
+      ok = false;
    }
+
+   agx3_bind_fields_clear_nonzero(fields, nonzero);
+   if (!ok)
+      return false;
 
    *len = t->forms[form].size;
    if (memo)

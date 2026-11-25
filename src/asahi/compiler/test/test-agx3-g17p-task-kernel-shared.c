@@ -239,14 +239,13 @@ check_g17p_task_kernel_shared(void)
    return valid;
 }
 
-/* AGX2 (M1/M2) never sets shared_element_index_agx and must keep its scalar
- * byte-addressed shared lowering without enabling nir_var_mem_shared
- * vectorization by default. */
+/* AGX2 (M1/M2) never sets shared_element_index_agx, keeps 16-bit byte-addressed
+ * shared offsets, and vectorizes adjacent compute shared loads and stores. */
 static bool
-check_agx2_compute_shared_not_vectorized(void)
+check_agx2_compute_shared_vectorized(void)
 {
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_COMPUTE, &agx_nir_options, "agx2 compute shared scalar");
+      MESA_SHADER_COMPUTE, &agx_nir_options, "agx2 compute shared vec2");
    b.shader->info.workgroup_size[0] = 32;
    b.shader->info.workgroup_size[1] = 1;
    b.shader->info.workgroup_size[2] = 1;
@@ -284,7 +283,7 @@ check_agx2_compute_shared_not_vectorized(void)
    const bool ok = agx_compile_shader_nir(b.shader, &key, &part);
 
    unsigned store_count = 0, load_count = 0;
-   bool all_scalar = true;
+   bool all_vec2 = true;
    nir_foreach_function_impl(impl, b.shader) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -293,10 +292,12 @@ check_agx2_compute_shared_not_vectorized(void)
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
             if (intr->intrinsic == nir_intrinsic_store_shared) {
                store_count++;
-               all_scalar &= intr->num_components == 1;
+               all_vec2 &= intr->num_components == 2 &&
+                           intr->src[1].ssa->bit_size == 16;
             } else if (intr->intrinsic == nir_intrinsic_load_shared) {
                load_count++;
-               all_scalar &= intr->def.num_components == 1;
+               all_vec2 &= intr->def.num_components == 2 &&
+                           intr->src[0].ssa->bit_size == 16;
             }
          }
       }
@@ -304,13 +305,13 @@ check_agx2_compute_shared_not_vectorized(void)
 
    const bool valid = ok && part.binary != NULL && part.info.binary_size > 0 &&
                       !b.shader->info.shared_element_index_agx &&
-                      store_count == 2 && load_count == 2 && all_scalar;
+                      store_count == 1 && load_count == 1 && all_vec2;
    if (!valid) {
       fprintf(stderr,
               "AGX2 compute shared check failed: ok=%d elem=%d stores=%u "
-              "loads=%u scalar=%d\n",
+              "loads=%u vec2=%d\n",
               ok, b.shader->info.shared_element_index_agx, store_count,
-              load_count, all_scalar);
+              load_count, all_vec2);
       nir_print_shader(b.shader, stderr);
    }
 
@@ -419,7 +420,7 @@ int
 main(void)
 {
    if (!check_g17p_task_kernel_shared() ||
-       !check_agx2_compute_shared_not_vectorized() ||
+       !check_agx2_compute_shared_vectorized() ||
        !check_agx3_generic_preprocess_shared_byte_offsets(AGX_CHIP_G17P) ||
        !check_agx3_generic_preprocess_shared_byte_offsets(AGX_CHIP_G17G) ||
        !check_agx3_generic_preprocess_shared_byte_offsets(AGX_CHIP_G18G))
